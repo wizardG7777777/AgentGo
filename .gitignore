@@ -27,6 +27,9 @@ go.work.sum
 # env file
 .env
 
+# MCP config (contains API keys)
+.mcp.json
+
 # Editor/IDE
 # .idea/
 # .vscode/
