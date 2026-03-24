@@ -16,16 +16,16 @@
 | 并发模型 | asyncio + Semaphore + create_task | goroutine + channel（语言原语） |
 | 同步/异步 | 每个 tool 写两遍（sync + async） | 不存在此问题 |
 | 超时/取消 | 手动 Task.cancel() | `context.Context` 一路传播 |
-| 框架代码 | ~40-50% 是 LangGraph/LangChain 适配 | 无框架依赖 |
+| 框架代码 | ~40-50% 是 LangGraph/LangChain 适配 | ADK 原生支持，无额外适配层 |
 | 部署 | Python runtime + 依赖管理 | 单二进制 |
 | 类型安全 | TypedDict + runtime check | 编译期保证 |
 
 ### 1.2 放弃什么
 
-- LangGraph 的 state graph / checkpointer / store 抽象
-- LangChain 的 middleware 链 / StructuredTool / init_chat_model
-- LangSmith tracing（用 OpenTelemetry 替代）
-- Python 生态的 LLM 库（用原生 API + Google ADK 补充）
+- LangGraph 的 state graph / checkpointer / store 抽象（由 ADK Runner + Session 替代）
+- LangChain 的 middleware 链 / StructuredTool / init_chat_model（由 ADK Plugin + functiontool 替代）
+- LangSmith tracing（由 ADK Telemetry / OpenTelemetry 替代）
+- Python 生态的 LLM 库（Gemini 由 ADK model 层提供；OpenAI/Anthropic 自建 adapter）
 
 ### 1.3 保留什么（功能层面）
 
@@ -42,28 +42,58 @@
 
 ## 2. 架构总览
 
+> **修订说明（2026-03-24）**：架构从"全自建核心引擎"调整为"以 ADK 为核心运行时 + 自建扩展"。
+> 下图中标注 `[ADK]` 的组件直接使用 ADK 提供的实现，标注 `[自建]` 的为 ADK 不覆盖的扩展。
+
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                         deepagents (Go)                       │
-│                                                                │
-│  ┌──────────┐  ┌──────────────────────────────────────────┐  │
-│  │  LLM     │  │              Core Engine                  │  │
-│  │  Adapter  │  │                                          │  │
-│  │          │  │  ┌──────────┐  ┌──────┐  ┌───────────┐  │  │
-│  │ OpenAI   │←→│  │Scheduler │←→│Event │←→│  Agent    │  │  │
-│  │ Anthropic│  │  │          │  │ Bus  │  │  Registry │  │  │
-│  │ Gemini   │  │  │TaskQueue │  │      │  │           │  │  │
-│  │ (ADK)    │  │  │WorkerPool│  │Rules │  │  Tools    │  │  │
-│  └──────────┘  │  └──────────┘  └──────┘  └───────────┘  │  │
-│                │                                          │  │
-│  ┌──────────┐  │  ┌──────────────────────────────────────┐│  │
-│  │ Backend  │  │  │           Template Engine             ││  │
-│  │          │  │  │  Direct | Pipeline | FanOut           ││  │
-│  │ LocalFS  │←→│  │  Iterative | Hierarchical            ││  │
-│  │ Shell    │  │  └──────────────────────────────────────┘│  │
-│  │ Sandbox  │  └──────────────────────────────────────────┘  │
-│  └──────────┘                                                │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                         deepagents (Go)                           │
+│                                                                    │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │                   ADK Core Runtime                          │  │
+│  │                                                              │  │
+│  │  ┌────────────┐  ┌──────────────────────────────────────┐  │  │
+│  │  │   Runner    │  │           Agent System               │  │  │
+│  │  │  [ADK]     │  │                                      │  │  │
+│  │  │            │  │  LlmAgent      [ADK] — LLM 驱动     │  │  │
+│  │  │ Event Loop │←→│  Sequential    [ADK] — 顺序流水线   │  │  │
+│  │  │ Session    │  │  Parallel      [ADK] — 并发扇出     │  │  │
+│  │  │ State Mgmt │  │  Loop          [ADK] — 迭代循环     │  │  │
+│  │  └────────────┘  │  Custom Agent  [ADK] — 任意编排     │  │  │
+│  │                   └──────────────────────────────────────┘  │  │
+│  │  ┌────────────┐  ┌──────────────────────────────────────┐  │  │
+│  │  │  Plugin    │  │           Tool System                 │  │  │
+│  │  │  [ADK]     │  │                                      │  │  │
+│  │  │ Callbacks  │  │  functiontool  [ADK]                 │  │  │
+│  │  │ Lifecycle  │  │  agenttool     [ADK]                 │  │  │
+│  │  │ OnEvent    │  │  mcptoolset    [ADK]                 │  │  │
+│  │  └────────────┘  │  confirmation  [ADK] — HITL          │  │  │
+│  │                   └──────────────────────────────────────┘  │  │
+│  │  ┌────────────┐  ┌──────────────────────────────────────┐  │  │
+│  │  │  Model     │  │           Services                    │  │  │
+│  │  │            │  │                                      │  │  │
+│  │  │ Gemini     │  │  Session   [ADK] — 状态持久化        │  │  │
+│  │  │   [ADK]    │  │  Memory    [ADK] — 跨会话语义记忆    │  │  │
+│  │  │ OpenAI     │  │  Artifact  [ADK] — 制品存储          │  │  │
+│  │  │   [自建]   │  │  Telemetry [ADK] — OpenTelemetry     │  │  │
+│  │  │ Anthropic  │  └──────────────────────────────────────┘  │  │
+│  │  │   [自建]   │                                            │  │
+│  │  └────────────┘                                            │  │
+│  └────────────────────────────────────────────────────────────┘  │
+│                                                                    │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │                   自建扩展层                                │  │
+│  │                                                              │  │
+│  │  ┌────────────────┐  ┌──────────┐  ┌────────────────────┐│  │
+│  │  │ Priority Sched │  │ Trigger  │  │    Backend         ││  │
+│  │  │ [自建]         │  │ [自建]   │  │    [自建]          ││  │
+│  │  │                │  │          │  │                    ││  │
+│  │  │ TaskQueue      │  │ Cron     │  │ LocalFS            ││  │
+│  │  │ WorkerPool     │  │ Webhook  │  │ Shell              ││  │
+│  │  │ (Custom Agent) │  │ → Runner │  │ Sandbox            ││  │
+│  │  └────────────────┘  └──────────┘  └────────────────────┘│  │
+│  └────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.1 核心设计原则
@@ -72,1301 +102,521 @@
 2. **goroutine-per-agent**：每个 agent 运行在独立 goroutine 中，通过 channel 通信
 3. **context.Context 贯穿全链路**：超时、取消、tracing 信息一路传播
 4. **组合优于继承**：用 struct embedding 和 functional options 替代 middleware 链
-5. **零框架依赖**：核心引擎不依赖 ADK 或任何 agent 框架；ADK 仅用于 LLM adapter 层
+5. **ADK 为核心运行时**：以 Google ADK 作为 agent 编排的核心运行时（Runner 事件循环、Workflow Agents、Callback/Plugin 系统、Session 状态管理），仅在 ADK 不覆盖的领域自建扩展（优先级调度、外部触发、持久化执行）
 
 ---
 
 ## 3. 包结构
 
+> 采用 ADK 为核心运行时后，包结构分为两层：ADK 提供的核心能力（通过依赖引入）
+> 和自建的扩展代码。自建包仅覆盖 ADK 不提供的功能。
+
 ```
 deepagents/
 ├── cmd/
-│   └── deepagents/          # CLI 入口
+│   └── deepagents/            # CLI 入口
 │       └── main.go
 │
 ├── pkg/
-│   ├── agent/               # Agent 抽象和注册
-│   │   ├── agent.go         # Agent interface
-│   │   ├── registry.go      # AgentRegistry
-│   │   └── config.go        # AgentConfig（声明式 spec）
+│   ├── agent/                 # 自建 Agent（Custom Agent 实现）
+│   │   └── hierarchical.go   # Hierarchical 模板的 Custom Agent
 │   │
-│   ├── scheduler/           # ★ 核心：调度器
-│   │   ├── scheduler.go     # Scheduler 主循环
-│   │   ├── queue.go         # TaskQueue（优先级+依赖）
-│   │   ├── pool.go          # WorkerPool（goroutine 池）
-│   │   └── task.go          # TaskRecord 定义
+│   ├── scheduler/             # ★ 自建扩展：优先级调度器
+│   │   ├── scheduler.go       # Scheduler 主循环
+│   │   ├── queue.go           # TaskQueue（优先级+依赖）
+│   │   ├── pool.go            # WorkerPool（goroutine 池）
+│   │   └── task.go            # TaskRecord 定义
 │   │
-│   ├── event/               # ★ 核心：事件系统
-│   │   ├── bus.go           # EventBus
-│   │   ├── event.go         # AgentEvent 类型定义
-│   │   ├── rule.go          # EventRule + 条件匹配
-│   │   └── builtin.go       # 内置事件类型
+│   ├── plugin/                # 自建 ADK Plugin
+│   │   ├── eventrules.go      # 事件规则匹配 Plugin（替代原 EventBus）
+│   │   └── guardrails.go      # 安全guardrails Plugin
 │   │
-│   ├── llm/                 # LLM 抽象层
-│   │   ├── llm.go           # LLM interface
-│   │   ├── message.go       # 统一消息类型
-│   │   ├── tool_call.go     # Tool calling 协议
-│   │   ├── openai/          # OpenAI adapter
-│   │   ├── anthropic/       # Anthropic adapter
-│   │   └── gemini/          # Gemini adapter（可选，via ADK）
+│   ├── model/                 # 非 Gemini LLM adapter
+│   │   ├── openai/            # OpenAI adapter
+│   │   └── anthropic/         # Anthropic adapter
 │   │
-│   ├── tool/                # Tool 系统
-│   │   ├── tool.go          # Tool interface
-│   │   ├── registry.go      # ToolRegistry
-│   │   ├── builtin/         # 内置 tools
-│   │   │   ├── filesystem.go  # ls, read, write, edit, glob, grep
-│   │   │   ├── execute.go     # shell execution
-│   │   │   ├── submit.go      # submit_task, await_tasks
-│   │   │   └── todo.go        # write_todos
-│   │   └── mcp/             # MCP tool 集成（可选，via ADK mcptoolset）
+│   ├── tool/                  # 自建内置 tools（通过 ADK functiontool 注册）
+│   │   ├── filesystem.go      # ls, read, write, edit, glob, grep
+│   │   ├── execute.go         # shell execution
+│   │   └── submit.go          # submit_task, await_tasks（调度器前端）
 │   │
-│   ├── backend/             # 执行后端
-│   │   ├── backend.go       # Backend interface
-│   │   ├── localfs.go       # 本地文件系统
-│   │   ├── shell.go         # 本地 shell 执行
-│   │   ├── memory.go        # 内存后端（替代 StateBackend）
-│   │   └── composite.go     # 组合后端（路径路由）
+│   ├── backend/               # 执行后端
+│   │   ├── backend.go         # Backend interface
+│   │   ├── localfs.go         # 本地文件系统
+│   │   ├── shell.go           # 本地 shell 执行
+│   │   └── composite.go       # 组合后端（路径路由）
 │   │
-│   ├── template/            # 执行模板
-│   │   ├── router.go        # 模板分类器
-│   │   ├── direct.go
-│   │   ├── pipeline.go
-│   │   ├── fanout.go
-│   │   ├── iterative.go
-│   │   └── hierarchical.go
+│   ├── trigger/               # ★ 自建扩展：外部触发层
+│   │   ├── cron.go            # 定时触发 → Runner
+│   │   └── webhook.go         # Webhook 触发 → Runner
 │   │
-│   ├── skill/               # Skills 加载
+│   ├── skill/                 # Skills 加载
 │   │   └── loader.go
 │   │
-│   ├── memory/              # Agent memory（AGENTS.md 加载）
-│   │   └── loader.go
-│   │
-│   └── engine/              # 顶层编排
-│       ├── engine.go        # Engine（组装所有组件）
-│       └── options.go       # Functional options
+│   └── setup/                 # 顶层组装（构建 Agent 树、注册 Tools、配置 Plugins → Runner）
+│       └── setup.go
 │
 ├── internal/
-│   ├── expr/                # 安全表达式求值（EventRule condition）
-│   └── prompt/              # System prompt 构建
+│   ├── expr/                  # 安全表达式求值（EventRule condition）
+│   └── prompt/                # System prompt 构建
 │
-├── go.mod
+├── go.mod                     # 依赖：google.golang.org/adk + 各 LLM SDK
 └── go.sum
 ```
 
+**ADK 提供的能力（通过 `google.golang.org/adk` 依赖引入，不在本仓库中）：**
+- `runner/` — Runner 事件循环
+- `agent/llmagent/` — LlmAgent
+- `agent/workflowagents/` — SequentialAgent, ParallelAgent, LoopAgent
+- `session/` — SessionService, State
+- `tool/functiontool/`, `tool/agenttool/`, `tool/mcptoolset/` — Tool 系统
+- `plugin/` — Plugin 框架
+- `model/gemini/` — Gemini adapter
+- `memory/`, `artifact/`, `telemetry/` — 辅助服务
+
 ---
 
-## 4. 核心接口定义
+## 4. 核心接口设计
+
+> 本节仅描述各组件的职责和接口契约，具体实现留待编码阶段。
+> 采用 ADK 为核心运行时后，大部分接口直接复用 ADK 定义，仅在扩展层定义自有接口。
 
 ### 4.1 Agent
 
-```go
-package agent
+直接使用 ADK 的 Agent 接口。核心契约：
 
-import "context"
+- **Name()** — 唯一标识符，用于 agent 树查找和 `transfer_to_agent` 委派
+- **Description()** — 功能描述，供 LLM 做 delegation 决策时参考
+- **Run(InvocationContext)** — 执行入口，返回 Event 迭代器（yield/pause/resume 语义）
+- **SubAgents()** — 子 agent 列表，构成 agent 树
 
-// Agent 是可以被调度器执行的最小工作单元。
-type Agent interface {
-    // Name 返回 agent 的唯一标识符。
-    Name() string
+Agent 类型：
 
-    // Description 返回 agent 的功能描述，用于调度决策。
-    Description() string
+| 类型 | 来源 | 职责 |
+|---|---|---|
+| LlmAgent | ADK | LLM 驱动决策，内置 tool-calling loop |
+| SequentialAgent | ADK | 顺序执行子 agent |
+| ParallelAgent | ADK | 并发执行子 agent（分支隔离） |
+| LoopAgent | ADK | 迭代执行直到 Escalate |
+| Custom Agent | 自建 | 实现 `Run()` 接口，任意编排逻辑（如 Hierarchical 模板、优先级调度） |
 
-    // Run 执行 agent。
-    //
-    // prompt 是本次执行的任务描述。
-    // state 是从父 agent 继承的共享状态（排除 messages 等隔离字段）。
-    // 返回执行结果文本和可能的错误。
-    //
-    // context 携带超时、取消信号和 tracing 信息。
-    Run(ctx context.Context, prompt string, state State) (Result, error)
-}
+### 4.2 Model（LLM 抽象）
 
-// State 是 agent 之间传递的共享状态。
-type State map[string]any
-
-// Result 是 agent 执行的返回值。
-type Result struct {
-    Text     string            // 主要输出文本
-    Metadata map[string]any    // 可选的结构化元数据
-    Files    map[string]string // agent 创建/修改的文件 (path → content)
-}
-
-// Config 是声明式 agent 配置，对应 Python 中的 SubAgent TypedDict。
-type Config struct {
-    Name         string
-    Description  string
-    SystemPrompt string
-    Model        string            // "openai:gpt-4o", "anthropic:claude-sonnet-4-6", etc.
-    Tools        []string          // tool 名称列表，从 ToolRegistry 解析
-    Skills       []string          // skill 源路径
-    Memory       []string          // memory 文件路径
-}
-```
-
-### 4.2 LLM
-
-```go
-package llm
-
-import "context"
-
-// LLM 是大语言模型的统一接口。
-type LLM interface {
-    // Chat 发送消息并获得响应。
-    // 实现负责处理 tool calling loop。
-    Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error)
-
-    // ChatStream 流式返回响应。
-    ChatStream(ctx context.Context, req *ChatRequest) (<-chan StreamEvent, error)
-}
-
-// ChatRequest 是发送给 LLM 的请求。
-type ChatRequest struct {
-    SystemPrompt string
-    Messages     []Message
-    Tools        []ToolDef       // 可用的 tool 定义
-    Temperature  float64
-    MaxTokens    int
-    OutputSchema *JSONSchema     // 可选：结构化输出
-}
-
-// ChatResponse 是 LLM 的响应。
-type ChatResponse struct {
-    Message   Message
-    ToolCalls []ToolCall        // 如果有 tool call 请求
-    Usage     Usage
-}
-
-// Message 是统一的消息类型，屏蔽 OpenAI/Anthropic/Gemini 的格式差异。
-type Message struct {
-    Role    Role    // System, User, Assistant, Tool
-    Content string
-    Name    string  // tool name (when Role == Tool)
-}
-
-type Role string
-const (
-    RoleSystem    Role = "system"
-    RoleUser      Role = "user"
-    RoleAssistant Role = "assistant"
-    RoleTool      Role = "tool"
-)
-
-// ToolCall 表示 LLM 请求调用一个 tool。
-type ToolCall struct {
-    ID        string
-    Name      string
-    Arguments string // JSON string
-}
-
-// ToolDef 是 tool 的 JSON Schema 描述，传给 LLM。
-type ToolDef struct {
-    Name        string
-    Description string
-    Parameters  JSONSchema
-}
-```
+- **Gemini**：直接使用 ADK `model/gemini` 包
+- **OpenAI / Anthropic**：自建 adapter，有两种接入路径（见第 13 节开放问题 #3）：
+  - (a) 实现 ADK 的 model 接口，作为 ADK 原生 model
+  - (b) 在 Custom Agent 内部独立调用，绕过 ADK model 层
 
 ### 4.3 Tool
 
-```go
-package tool
+直接使用 ADK Tool 系统：
 
-import "context"
+| Tool 类型 | 来源 | 说明 |
+|---|---|---|
+| functiontool | ADK | 包装 Go 函数，自动从 struct tag 生成 JSON schema |
+| agenttool | ADK | 将 agent 包装为 tool，供父 agent 同步调用 |
+| mcptoolset | ADK | 桥接 MCP server 的工具集 |
+| toolconfirmation | ADK | Human-in-the-loop 审批包装 |
+| long-running tool | ADK | 异步工具（返回初始结果，等待外部进度更新） |
 
-// Tool 是 agent 可以调用的工具。
-type Tool interface {
-    // Name 返回 tool 名称（对应 function calling 中的 function name）。
-    Name() string
-
-    // Description 返回 tool 描述。
-    Description() string
-
-    // Schema 返回参数的 JSON Schema。
-    Schema() llm.JSONSchema
-
-    // Execute 执行 tool。
-    // args 是 LLM 传来的 JSON 参数字符串。
-    // 返回结果字符串（会作为 tool message 回传给 LLM）。
-    Execute(ctx context.Context, args string) (string, error)
-}
-
-// Registry 管理所有可用的 tools。
-type Registry struct {
-    tools map[string]Tool
-}
-
-func (r *Registry) Register(t Tool)          { r.tools[t.Name()] = t }
-func (r *Registry) Get(name string) Tool     { return r.tools[name] }
-func (r *Registry) List() []Tool             { /* ... */ }
-func (r *Registry) Resolve(names []string) []Tool { /* ... */ }
-```
+自建的内置 tool 通过 `functiontool` 注册：
+- **filesystem** — ls, read, write, edit, glob, grep（底层调用 Backend）
+- **execute** — shell 命令执行（底层调用 Backend）
+- **submit_task / await_tasks** — 优先级调度器的前端（底层调用自建 Scheduler）
 
 ### 4.4 Backend
 
-```go
-package backend
+自建接口，提供文件操作和命令执行能力：
 
-import "context"
+- **FileBackend** — Ls, Read, Write, Edit, Glob, Grep
+- **SandboxBackend** — FileBackend + Execute（shell 命令）
 
-// Backend 是文件和执行操作的统一接口。
-type Backend interface {
-    FileBackend
-}
+实现：LocalFS（本地文件系统）、Shell（本地 shell）、Composite（路径路由组合）。
 
-// FileBackend 提供文件操作。
-type FileBackend interface {
-    Ls(ctx context.Context, path string) ([]DirEntry, error)
-    Read(ctx context.Context, path string, opts ReadOpts) (string, error)
-    Write(ctx context.Context, path string, content string) error
-    Edit(ctx context.Context, path string, old, new string, replaceAll bool) error
-    Glob(ctx context.Context, pattern string, root string) ([]string, error)
-    Grep(ctx context.Context, pattern string, opts GrepOpts) ([]GrepMatch, error)
-}
-
-// SandboxBackend 在 FileBackend 基础上增加命令执行。
-type SandboxBackend interface {
-    FileBackend
-    Execute(ctx context.Context, command string, timeout time.Duration) (*ExecResult, error)
-}
-
-type ExecResult struct {
-    Output   string
-    ExitCode int
-}
-```
+Backend 不直接暴露给 agent，而是通过 functiontool 包装后注册到 ADK 的 tool 系统中。
 
 ---
 
-## 5. 调度器（Scheduler）
+## 5. 优先级调度器（自建扩展）
 
-这是整个系统的核心。与 Python RFC 中的设计意图相同，但用 Go 原语实现。
+> 这是 ADK 不覆盖的领域。ADK 的 Workflow Agents 提供了 Sequential/Parallel/Loop 编排，
+> 但缺少优先级队列和 worker 并发控制。优先级调度器作为 Custom Agent 接入 ADK 体系。
 
-### 5.1 TaskRecord
+### 5.1 设计概要
 
-```go
-package scheduler
+调度器由三个组件构成：
 
-type Priority int
+| 组件 | 职责 |
+|---|---|
+| **TaskQueue** | 优先级 + 依赖感知的任务队列。内部维护 `tasks`（全量）和 `ready`（基于 heap 的优先级队列）。任务完成时自动检查依赖解锁。 |
+| **WorkerPool** | goroutine 池，使用 buffered channel 作为令牌桶控制并发。支持按 taskID 取消。 |
+| **Scheduler** | 主循环：从 TaskQueue 取 ready 任务 → 分配到 WorkerPool → 完成后通知 TaskQueue 解锁依赖。 |
 
-const (
-    PriorityCritical   Priority = 0
-    PriorityHigh       Priority = 1
-    PriorityNormal     Priority = 2
-    PriorityLow        Priority = 3
-    PriorityBackground Priority = 4
-)
+### 5.2 任务生命周期
 
-type Status string
-
-const (
-    StatusPending   Status = "pending"
-    StatusReady     Status = "ready"
-    StatusRunning   Status = "running"
-    StatusSuccess   Status = "success"
-    StatusError     Status = "error"
-    StatusCancelled Status = "cancelled"
-)
-
-type TaskRecord struct {
-    ID           string
-    Description  string
-    AgentName    string       // 对应 agent.Config.Name
-    Priority     Priority
-    Dependencies []string     // 依赖的 task IDs
-    Status       Status
-    Result       string       // 成功时的结果
-    Error        error        // 失败时的错误
-    CreatedAt    time.Time
-    StartedAt    time.Time
-    CompletedAt  time.Time
-    Metadata     map[string]any
-
-    // 内部使用
-    done chan struct{}         // 完成信号，用于 await
-    mu   sync.Mutex
-}
-
-// Wait 阻塞直到任务完成（success / error / cancelled）。
-func (t *TaskRecord) Wait(ctx context.Context) error {
-    select {
-    case <-t.done:
-        return nil
-    case <-ctx.Done():
-        return ctx.Err()
-    }
-}
+```
+Submit → Pending → (依赖满足) → Ready → (Worker 取出) → Running → Success / Error / Cancelled
 ```
 
-### 5.2 TaskQueue
+- **优先级**：Critical(0) > High(1) > Normal(2) > Low(3) > Background(4)
+- **依赖**：任务可声明依赖其他 task ID，所有依赖 Success 后才进入 Ready
+- **超时**：每个任务通过 `context.WithTimeout` 控制
+- **取消**：通过 `context.CancelFunc` 传播，WorkerPool 支持按 taskID 取消
 
-```go
-package scheduler
+### 5.3 与 ADK 的整合方式
 
-// TaskQueue 是优先级+依赖感知的任务队列。
-//
-// 它内部维护两个结构：
-// - tasks: 所有已提交的任务（用于依赖查询）
-// - ready: 一个基于 heap 的优先级队列（仅包含 ready 状态的任务）
-//
-// 当一个任务完成时，TaskQueue 自动检查是否有 pending 任务的依赖被满足，
-// 如果是，将其状态提升为 ready 并放入优先级队列。
-type TaskQueue struct {
-    mu    sync.Mutex
-    tasks map[string]*TaskRecord
-    ready priorityHeap          // container/heap 实现
-    cond  *sync.Cond            // 通知等待者有新的 ready 任务
-}
+优先级调度器包装为一个 **Custom Agent**，实现 ADK 的 `Agent` 接口：
 
-func NewTaskQueue() *TaskQueue {
-    q := &TaskQueue{
-        tasks: make(map[string]*TaskRecord),
-    }
-    q.cond = sync.NewCond(&q.mu)
-    return q
-}
-
-// Submit 提交一个任务。如果依赖已满足则立即进入 ready 队列。
-func (q *TaskQueue) Submit(task *TaskRecord) {
-    q.mu.Lock()
-    defer q.mu.Unlock()
-
-    task.done = make(chan struct{})
-    q.tasks[task.ID] = task
-
-    if q.dependenciesMet(task) {
-        task.Status = StatusReady
-        heap.Push(&q.ready, task)
-        q.cond.Signal() // 唤醒等待的 worker
-    }
-}
-
-// Next 获取下一个 ready 任务。如果没有可用任务则阻塞。
-// ctx 取消时返回 nil。
-func (q *TaskQueue) Next(ctx context.Context) *TaskRecord {
-    q.mu.Lock()
-    defer q.mu.Unlock()
-
-    for q.ready.Len() == 0 {
-        // 在 cond.Wait 和 ctx.Done 之间协调
-        // 使用 goroutine 监听 ctx 取消
-        done := make(chan struct{})
-        go func() {
-            select {
-            case <-ctx.Done():
-                q.cond.Broadcast() // 唤醒所有等待者
-            case <-done:
-            }
-        }()
-
-        q.cond.Wait()
-        close(done)
-
-        if ctx.Err() != nil {
-            return nil
-        }
-    }
-
-    task := heap.Pop(&q.ready).(*TaskRecord)
-    task.Status = StatusRunning
-    task.StartedAt = time.Now()
-    return task
-}
-
-// Complete 标记任务完成，检查依赖解锁。
-func (q *TaskQueue) Complete(taskID string, result string, err error) {
-    q.mu.Lock()
-    defer q.mu.Unlock()
-
-    task := q.tasks[taskID]
-    if task == nil {
-        return
-    }
-
-    if err != nil {
-        task.Status = StatusError
-        task.Error = err
-    } else {
-        task.Status = StatusSuccess
-        task.Result = result
-    }
-    task.CompletedAt = time.Now()
-    close(task.done) // 通知所有 Wait() 调用者
-
-    // 检查是否有任务的依赖被解锁
-    for _, t := range q.tasks {
-        if t.Status == StatusPending && q.dependenciesMet(t) {
-            t.Status = StatusReady
-            heap.Push(&q.ready, t)
-            q.cond.Signal()
-        }
-    }
-}
-
-func (q *TaskQueue) dependenciesMet(task *TaskRecord) bool {
-    for _, depID := range task.Dependencies {
-        dep := q.tasks[depID]
-        if dep == nil || dep.Status != StatusSuccess {
-            return false
-        }
-    }
-    return true
-}
+```
+ADK Runner
+  └─ root LlmAgent
+       └─ (通过 agenttool 调用) → PrioritySchedulerAgent [Custom Agent]
+            └─ 内部维护 TaskQueue + WorkerPool
+            └─ 将子任务分配给其他 ADK agent 执行
 ```
 
-### 5.3 WorkerPool
-
-```go
-package scheduler
-
-// WorkerPool 管理一组并发 worker goroutine。
-//
-// 与 Python 版使用 asyncio.Semaphore 不同，Go 版使用 buffered channel
-// 作为令牌桶——获取令牌才能启动 goroutine，执行完归还令牌。
-type WorkerPool struct {
-    sem    chan struct{}           // buffered channel, cap = maxWorkers
-    active sync.Map               // taskID → context.CancelFunc
-}
-
-func NewWorkerPool(maxWorkers int) *WorkerPool {
-    return &WorkerPool{
-        sem: make(chan struct{}, maxWorkers),
-    }
-}
-
-// Spawn 启动一个 worker goroutine 执行任务。
-// 不阻塞——立即返回。任务完成后调用 onDone 回调。
-func (p *WorkerPool) Spawn(
-    ctx context.Context,
-    task *TaskRecord,
-    agent agent.Agent,
-    state agent.State,
-    onDone func(taskID string, result string, err error),
-) {
-    // 获取令牌（如果池满则阻塞）
-    p.sem <- struct{}{}
-
-    taskCtx, cancel := context.WithCancel(ctx)
-    p.active.Store(task.ID, cancel)
-
-    go func() {
-        defer func() {
-            <-p.sem // 归还令牌
-            p.active.Delete(task.ID)
-        }()
-
-        result, err := agent.Run(taskCtx, task.Description, state)
-        if err != nil {
-            onDone(task.ID, "", err)
-        } else {
-            onDone(task.ID, result.Text, nil)
-        }
-    }()
-}
-
-// Cancel 取消一个正在运行的任务。
-func (p *WorkerPool) Cancel(taskID string) bool {
-    if cancel, ok := p.active.LoadAndDelete(taskID); ok {
-        cancel.(context.CancelFunc)()
-        return true
-    }
-    return false
-}
-
-// ActiveCount 返回当前正在运行的任务数。
-func (p *WorkerPool) ActiveCount() int {
-    count := 0
-    p.active.Range(func(_, _ any) bool { count++; return true })
-    return count
-}
-```
-
-### 5.4 Scheduler
-
-```go
-package scheduler
-
-// Scheduler 是调度器主循环。
-//
-// 它从 TaskQueue 取出 ready 任务，分配到 WorkerPool 执行，
-// 任务完成后通知 TaskQueue 检查依赖解锁，并向 EventBus 发布事件。
-type Scheduler struct {
-    queue    *TaskQueue
-    pool     *WorkerPool
-    agents   *agent.Registry
-    eventBus *event.Bus       // 可选
-    config   Config
-
-    ctx    context.Context
-    cancel context.CancelFunc
-}
-
-type Config struct {
-    MaxWorkers        int           // 默认 4
-    MaxChainDepth     int           // 事件链最大深度，默认 5
-    MaxEventTasks     int           // 事件触发的最大任务数，默认 20
-    TaskTimeout       time.Duration // 默认 5 分钟
-}
-
-func New(queue *TaskQueue, pool *WorkerPool, agents *agent.Registry, opts ...Option) *Scheduler {
-    s := &Scheduler{
-        queue:  queue,
-        pool:   pool,
-        agents: agents,
-        config: defaultConfig(),
-    }
-    for _, opt := range opts {
-        opt(s)
-    }
-    return s
-}
-
-// Start 启动调度循环。阻塞直到 ctx 取消。
-func (s *Scheduler) Start(ctx context.Context) {
-    s.ctx, s.cancel = context.WithCancel(ctx)
-
-    for {
-        task := s.queue.Next(s.ctx)
-        if task == nil {
-            return // ctx cancelled
-        }
-
-        ag := s.agents.Get(task.AgentName)
-        if ag == nil {
-            s.queue.Complete(task.ID, "", fmt.Errorf("unknown agent: %s", task.AgentName))
-            continue
-        }
-
-        // 为每个任务设置超时
-        taskCtx, _ := context.WithTimeout(s.ctx, s.config.TaskTimeout)
-
-        // 构建隔离的 agent state
-        state := s.buildAgentState(task)
-
-        s.pool.Spawn(taskCtx, task, ag, state, func(taskID, result string, err error) {
-            s.queue.Complete(taskID, result, err)
-
-            // 发布事件
-            if s.eventBus != nil {
-                s.eventBus.Emit(s.ctx, event.TaskCompleted{
-                    TaskID:    taskID,
-                    AgentName: task.AgentName,
-                    Status:    task.Status,
-                    Result:    result,
-                    Error:     err,
-                })
-            }
-        })
-    }
-}
-
-// Submit 提交一个任务。对外的主要入口。
-func (s *Scheduler) Submit(task *TaskRecord) string {
-    s.queue.Submit(task)
-    return task.ID
-}
-
-// Await 等待一组任务完成。
-func (s *Scheduler) Await(ctx context.Context, taskIDs ...string) map[string]*TaskRecord {
-    var wg sync.WaitGroup
-    results := make(map[string]*TaskRecord)
-    var mu sync.Mutex
-
-    for _, id := range taskIDs {
-        task := s.queue.tasks[id]
-        if task == nil {
-            continue
-        }
-        wg.Add(1)
-        go func(t *TaskRecord) {
-            defer wg.Done()
-            t.Wait(ctx)
-            mu.Lock()
-            results[t.ID] = t
-            mu.Unlock()
-        }(task)
-    }
-
-    wg.Wait()
-    return results
-}
-
-// Stop 优雅停止调度器。
-func (s *Scheduler) Stop() {
-    s.cancel()
-}
-```
+这样优先级调度器既能享受 ADK Runner 的事件循环和状态管理，又能提供 ADK 没有的优先级和并发控制。
 
 ---
 
-## 6. 事件系统（EventBus）
+## 6. 事件处理（ADK Plugin 层）
 
-### 6.1 事件类型
+> 原 RFC 的 EventBus 设计已被 ADK 的 Plugin 系统大部分覆盖。
+> 本节描述如何用 ADK Plugin 替代自建 EventBus 的功能。
 
-```go
-package event
+### 6.1 ADK 事件机制 vs 原 EventBus
 
-// Event 是系统中传播的事件接口。
-type Event interface {
-    Type() string
-    Source() string
-    Timestamp() time.Time
-    Payload() map[string]any
-}
+| 原 EventBus 功能 | ADK 替代方案 |
+|---|---|
+| 事件类型定义 | ADK `session.Event`（含 Content、Actions、StateDelta 等） |
+| 事件发布/订阅 | Plugin `OnEventCallback` 拦截所有流经 Runner 的事件 |
+| 规则匹配 → 触发 agent | Plugin 内部实现规则匹配逻辑，通过 `TransferToAgent` 或状态写入触发 |
+| 防抖 / 并发限制 | 在 Plugin 内部维护计时器和计数器 |
+| 事件链深度控制 | 在 Plugin 内部维护深度计数 |
 
-// BaseEvent 提供 Event 的通用实现。
-type BaseEvent struct {
-    EventType   string
-    EventSource string
-    Time        time.Time
-    Data        map[string]any
-}
+### 6.2 内置事件类型
 
-func (e BaseEvent) Type() string            { return e.EventType }
-func (e BaseEvent) Source() string           { return e.EventSource }
-func (e BaseEvent) Timestamp() time.Time    { return e.Time }
-func (e BaseEvent) Payload() map[string]any { return e.Data }
+通过 ADK Plugin 的 `OnEventCallback` 监听并分类处理：
 
-// ── 内置具体事件类型 ──
+- **task_completed** — 任务完成（来自优先级调度器）
+- **file_changed** — 文件写入/编辑（来自 AfterTool 回调监听 filesystem tools）
+- **execution_completed** — Shell 命令执行完成（来自 AfterTool 回调监听 execute tool）
 
-type TaskCompleted struct {
-    TaskID    string
-    AgentName string
-    Status    scheduler.Status
-    Result    string
-    Error     error
-}
+### 6.3 EventRule
 
-func (e TaskCompleted) Type() string { return "task_completed" }
-func (e TaskCompleted) Payload() map[string]any {
-    return map[string]any{
-        "task_id":    e.TaskID,
-        "agent_name": e.AgentName,
-        "status":     string(e.Status),
-        "result":     truncate(e.Result, 500),
-    }
-}
+规则定义保持声明式配置，但执行方式从自建 EventBus 改为 ADK Plugin：
 
-type FileChanged struct {
-    Path      string
-    Operation string // "write" | "edit" | "create"
-    AgentName string
-}
-
-func (e FileChanged) Type() string { return "file_changed" }
-
-type ExecutionCompleted struct {
-    Command   string
-    ExitCode  int
-    AgentName string
-}
-
-func (e ExecutionCompleted) Type() string { return "execution_completed" }
-```
-
-### 6.2 EventRule
-
-```go
-package event
-
-// Rule 定义了事件到 agent 的映射规则。
-type Rule struct {
-    Name            string
-    EventType       string
-    Condition       string        // 安全表达式，可选
-    ActivateAgent   string        // agent name
-    PromptTemplate  string        // 支持 {field} 占位符
-    Priority        scheduler.Priority
-    DebounceSeconds float64
-    MaxConcurrent   int           // 0 = 无限制
-    Enabled         bool
-}
-```
-
-### 6.3 EventBus
-
-```go
-package event
-
-// Bus 是事件总线。
-//
-// 它接收事件，匹配规则，将触发的任务提交到 Scheduler。
-// Bus 本身不执行 agent——它只是事件到任务的转换器。
-//
-// 内部使用一个 goroutine 从 channel 消费事件，避免 Emit 调用者阻塞。
-type Bus struct {
-    rules       []Rule
-    submitFunc  func(*scheduler.TaskRecord)  // 注入 Scheduler.Submit
-    eventCh     chan Event                    // buffered channel
-    config      BusConfig
-
-    // 防抖和并发控制
-    mu            sync.Mutex
-    lastTriggered map[string]time.Time        // rule name → last trigger time
-    activeCounts  map[string]int              // rule name → running count
-
-    // 额外监听器（用于日志、metrics）
-    listeners []func(Event)
-}
-
-type BusConfig struct {
-    MaxChainDepth int  // 默认 5，防止事件无限循环
-    MaxEventTasks int  // 默认 20，事件触发的任务总数上限
-    BufferSize    int  // 事件 channel 缓冲大小，默认 100
-}
-
-func NewBus(rules []Rule, submitFunc func(*scheduler.TaskRecord), cfg BusConfig) *Bus {
-    b := &Bus{
-        rules:         filterEnabled(rules),
-        submitFunc:    submitFunc,
-        eventCh:       make(chan Event, cfg.BufferSize),
-        config:        cfg,
-        lastTriggered: make(map[string]time.Time),
-        activeCounts:  make(map[string]int),
-    }
-    return b
-}
-
-// Start 启动事件处理循环。
-func (b *Bus) Start(ctx context.Context) {
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        case evt := <-b.eventCh:
-            b.process(evt)
-        }
-    }
-}
-
-// Emit 发布一个事件。非阻塞（写入 buffered channel）。
-func (b *Bus) Emit(ctx context.Context, evt Event) {
-    select {
-    case b.eventCh <- evt:
-    default:
-        // channel 满，丢弃事件（生产环境应记录 metric）
-        log.Warn("event bus buffer full, dropping event", "type", evt.Type())
-    }
-}
-
-func (b *Bus) process(evt Event) {
-    b.mu.Lock()
-    defer b.mu.Unlock()
-
-    for _, rule := range b.rules {
-        if rule.EventType != evt.Type() {
-            continue
-        }
-
-        // 条件匹配
-        if rule.Condition != "" && !expr.Eval(rule.Condition, evt.Payload()) {
-            continue
-        }
-
-        // 防抖
-        if rule.DebounceSeconds > 0 {
-            if last, ok := b.lastTriggered[rule.Name]; ok {
-                if time.Since(last).Seconds() < rule.DebounceSeconds {
-                    continue
-                }
-            }
-        }
-
-        // 并发限制
-        if rule.MaxConcurrent > 0 && b.activeCounts[rule.Name] >= rule.MaxConcurrent {
-            continue
-        }
-
-        // 总数限制
-        // ...
-
-        // 构建任务
-        prompt := renderTemplate(rule.PromptTemplate, evt.Payload())
-        task := &scheduler.TaskRecord{
-            ID:          uuid.New().String(),
-            Description: prompt,
-            AgentName:   rule.ActivateAgent,
-            Priority:    rule.Priority,
-            Status:      scheduler.StatusPending,
-            CreatedAt:   time.Now(),
-            Metadata: map[string]any{
-                "triggered_by_event": evt.Type(),
-                "triggered_by_rule":  rule.Name,
-                "event_source":       evt.Source(),
-            },
-        }
-
-        b.submitFunc(task)
-        b.lastTriggered[rule.Name] = time.Now()
-        b.activeCounts[rule.Name]++
-    }
-
-    // 通知监听器
-    for _, listener := range b.listeners {
-        listener(evt)
-    }
-}
-```
+- 规则结构：事件类型 + 条件表达式 + 目标 agent + prompt 模板 + 优先级 + 防抖 + 并发限制
+- 规则在 Plugin 初始化时加载
+- 匹配到规则后，Plugin 通过 `Actions.TransferToAgent` 或写入 Session State 来触发目标 agent
 
 ---
 
 ## 7. LLM Agent 执行循环
 
-这是替代 LangGraph agent loop 的核心逻辑。每个 agent 内部运行一个 tool-calling loop。
+> 采用 ADK 后，LLM Agent 执行循环由 ADK `LlmAgent` + `Runner` 原生提供，无需自建。
 
-```go
-package agent
+### 7.1 执行流程
 
-// LLMAgent 是基于 LLM 的 agent 实现。
-// 它运行一个 tool-calling loop：发送消息 → 收到 tool calls → 执行 tools → 回传结果 → 重复。
-type LLMAgent struct {
-    name         string
-    description  string
-    systemPrompt string
-    model        llm.LLM
-    tools        *tool.Registry
-    maxTurns     int // 防止无限循环，默认 100
-}
-
-func (a *LLMAgent) Name() string        { return a.name }
-func (a *LLMAgent) Description() string { return a.description }
-
-func (a *LLMAgent) Run(ctx context.Context, prompt string, state State) (Result, error) {
-    messages := []llm.Message{
-        {Role: llm.RoleUser, Content: prompt},
-    }
-
-    toolDefs := a.tools.Definitions()
-
-    for turn := 0; turn < a.maxTurns; turn++ {
-        // 1. 调用 LLM
-        resp, err := a.model.Chat(ctx, &llm.ChatRequest{
-            SystemPrompt: a.systemPrompt,
-            Messages:     messages,
-            Tools:        toolDefs,
-        })
-        if err != nil {
-            return Result{}, fmt.Errorf("llm chat error: %w", err)
-        }
-
-        // 2. 如果没有 tool calls，返回最终响应
-        if len(resp.ToolCalls) == 0 {
-            return Result{Text: resp.Message.Content}, nil
-        }
-
-        // 3. 追加 assistant 消息（含 tool calls）
-        messages = append(messages, resp.Message)
-
-        // 4. 并发执行所有 tool calls
-        toolResults := a.executeToolCalls(ctx, resp.ToolCalls)
-
-        // 5. 追加 tool results
-        for _, tr := range toolResults {
-            messages = append(messages, llm.Message{
-                Role:    llm.RoleTool,
-                Content: tr.Result,
-                Name:    tr.Name,
-            })
-        }
-
-        // 继续下一轮
-    }
-
-    return Result{}, fmt.Errorf("agent exceeded max turns (%d)", a.maxTurns)
-}
-
-// executeToolCalls 并发执行一批 tool calls。
-// 这是 Go 版本相比 Python 的关键优势：无需额外抽象，goroutine 天然并发。
-func (a *LLMAgent) executeToolCalls(ctx context.Context, calls []llm.ToolCall) []toolResult {
-    results := make([]toolResult, len(calls))
-    var wg sync.WaitGroup
-
-    for i, call := range calls {
-        wg.Add(1)
-        go func(idx int, tc llm.ToolCall) {
-            defer wg.Done()
-
-            t := a.tools.Get(tc.Name)
-            if t == nil {
-                results[idx] = toolResult{
-                    Name:   tc.Name,
-                    Result: fmt.Sprintf("error: unknown tool %q", tc.Name),
-                }
-                return
-            }
-
-            result, err := t.Execute(ctx, tc.Arguments)
-            if err != nil {
-                results[idx] = toolResult{Name: tc.Name, Result: "error: " + err.Error()}
-            } else {
-                results[idx] = toolResult{Name: tc.Name, Result: result}
-            }
-        }(i, call)
-    }
-
-    wg.Wait()
-    return results
-}
 ```
+Runner 调用 LlmAgent.Run(ctx)
+  │
+  ├─ 组装 system prompt（支持 {state_var} 模板）+ 用户消息
+  ├─ 调用 Model 层（Gemini/OpenAI/Anthropic）
+  │
+  ├─ LLM 返回纯文本 → yield FinalEvent → 结束
+  │
+  └─ LLM 返回 ToolCall(s)
+       ├─ 并发执行 tools（ADK 内部使用 goroutine）
+       ├─ 收集 tool results
+       ├─ yield Event（含 tool results + StateDelta）
+       ├─ Runner 持久化状态
+       └─ 继续下一轮（回到"调用 Model 层"）
+```
+
+### 7.2 ADK 提供的关键能力
+
+- **tool-calling loop**：自动处理 LLM ↔ Tool 的多轮交互，直到 LLM 不再请求 tool call
+- **streaming**：`Partial=true` 的 Event 实时转发到 UI，不触发状态持久化
+- **generation config**：temperature、top_p、max_tokens、output schema（结构化输出）
+- **instruction 模板**：prompt 中可使用 `{state_var}` 引用 Session State
+- **delegation 控制**：`DisallowTransferToParent` / `DisallowTransferToPeers` 限制控制转移范围
 
 ---
 
 ## 8. 执行模板
 
-模板在 Go 中不再需要 LangGraph StateGraph 的抽象——它们只是不同的编排函数，
-直接调用 Scheduler 的 Submit/Await。
+> 采用 ADK 后，模板不再需要自建编排函数。大部分模板直接映射到 ADK Workflow Agents，
+> 仅 Hierarchical 需要 Custom Agent。
 
-### 8.1 Router
+### 8.1 模板与 ADK 组件的映射
 
-```go
-package template
-
-type TemplateType string
-
-const (
-    Direct       TemplateType = "direct"
-    Pipeline     TemplateType = "pipeline"
-    FanOut       TemplateType = "fan_out"
-    Iterative    TemplateType = "iterative"
-    Hierarchical TemplateType = "hierarchical"
-)
-
-// Classify 使用 LLM 对任务进行分类，选择合适的模板。
-func Classify(ctx context.Context, model llm.LLM, task string) (TemplateType, []string, error) {
-    // 结构化输出：要求 LLM 返回 template type + subtasks（如果适用）
-    resp, err := model.Chat(ctx, &llm.ChatRequest{
-        SystemPrompt: classifyPrompt,
-        Messages:     []llm.Message{{Role: llm.RoleUser, Content: task}},
-        OutputSchema: &classifySchema,
-    })
-    // 解析 resp...
-    return templateType, subtasks, nil
-}
-```
-
-### 8.2 FanOut（示例——直接用 Scheduler）
-
-```go
-package template
-
-// FanOut 将任务分解为多个子任务，并行执行，然后合成结果。
-func FanOut(
-    ctx context.Context,
-    sched *scheduler.Scheduler,
-    model llm.LLM,
-    subtasks []string,
-    synthAgent agent.Agent,
-) (string, error) {
-
-    // 1. 提交所有子任务
-    taskIDs := make([]string, len(subtasks))
-    for i, st := range subtasks {
-        task := &scheduler.TaskRecord{
-            ID:          uuid.New().String(),
-            Description: st,
-            AgentName:   "general-purpose",
-            Priority:    scheduler.PriorityNormal,
-            CreatedAt:   time.Now(),
-        }
-        taskIDs[i] = sched.Submit(task)
-    }
-
-    // 2. 等待所有子任务完成（期间它们并行执行）
-    results := sched.Await(ctx, taskIDs...)
-
-    // 3. 合成
-    var parts []string
-    for i, st := range subtasks {
-        r := results[taskIDs[i]]
-        parts = append(parts, fmt.Sprintf("## Subtask: %s\n\n%s", st, r.Result))
-    }
-    combined := strings.Join(parts, "\n\n---\n\n")
-
-    // 调用合成 agent 整合结果
-    synthesis, err := synthAgent.Run(ctx,
-        fmt.Sprintf("Synthesize these results:\n\n%s", combined),
-        nil,
-    )
-    return synthesis.Text, err
-}
-```
-
-对比 Python 版本的 Fan-Out 需要 `StateGraph` + `Send` + state reducers + 多个 node 函数，
-Go 版本就是一个普通函数，直接调用 `sched.Submit` + `sched.Await`。
-
-### 8.3 Hierarchical（示例——调度器+事件组合）
-
-```go
-func Hierarchical(
-    ctx context.Context,
-    sched *scheduler.Scheduler,
-    model llm.LLM,
-    task string,
-    maxRetries int,
-) (string, error) {
-
-    for attempt := 0; attempt < maxRetries; attempt++ {
-        // 1. Plan
-        _, subtasks, _ := Classify(ctx, model, task)
-
-        // 2. 并行执行子任务
-        taskIDs := submitAll(sched, subtasks)
-        results := sched.Await(ctx, taskIDs...)
-
-        // 3. 整合
-        integrated := integrate(ctx, model, task, results)
-
-        // 4. 验证
-        passed, feedback := verify(ctx, model, task, integrated)
-        if passed {
-            return integrated, nil
-        }
-
-        // 5. 未通过，带反馈重新规划
-        task = task + "\n\nPrevious feedback:\n" + feedback
-    }
-
-    return "", fmt.Errorf("hierarchical: exceeded max retries")
-}
-```
-
----
-
-## 9. Engine — 顶层组装
-
-```go
-package engine
-
-// Engine 是 deepagents 的顶层入口，负责组装所有组件。
-// 对应 Python 中的 create_deep_agent()。
-type Engine struct {
-    scheduler *scheduler.Scheduler
-    eventBus  *event.Bus
-    agents    *agent.Registry
-    tools     *tool.Registry
-    backend   backend.Backend
-    config    EngineConfig
-}
-
-type EngineConfig struct {
-    Model          string             // "openai:gpt-4o"
-    SystemPrompt   string
-    Tools          []tool.Tool
-    Agents         []agent.Config
-    EventRules     []event.Rule
-    Skills         []string
-    Memory         []string
-    Backend        backend.Backend
-    Scheduler      scheduler.Config
-}
-
-func New(cfg EngineConfig) (*Engine, error) {
-    // 1. 解析 LLM
-    model, err := llm.Resolve(cfg.Model)
-
-    // 2. 注册 tools
-    toolReg := tool.NewRegistry()
-    registerBuiltinTools(toolReg, cfg.Backend)
-    for _, t := range cfg.Tools {
-        toolReg.Register(t)
-    }
-
-    // 3. 注册 agents
-    agentReg := agent.NewRegistry()
-    for _, ac := range cfg.Agents {
-        ag := buildAgent(ac, model, toolReg)
-        agentReg.Register(ag)
-    }
-    // 自动添加 general-purpose agent
-    if agentReg.Get("general-purpose") == nil {
-        agentReg.Register(newGeneralPurposeAgent(model, toolReg))
-    }
-
-    // 4. 创建调度器
-    queue := scheduler.NewTaskQueue()
-    pool := scheduler.NewWorkerPool(cfg.Scheduler.MaxWorkers)
-    sched := scheduler.New(queue, pool, agentReg)
-
-    // 5. 创建 EventBus（如果有规则）
-    var bus *event.Bus
-    if len(cfg.EventRules) > 0 {
-        bus = event.NewBus(cfg.EventRules, sched.Submit, event.BusConfig{
-            MaxChainDepth: cfg.Scheduler.MaxChainDepth,
-            MaxEventTasks: cfg.Scheduler.MaxEventTasks,
-        })
-        sched.SetEventBus(bus)
-    }
-
-    // 6. 注册 scheduler tools（submit_task, await_tasks, etc.）
-    registerSchedulerTools(toolReg, sched)
-
-    return &Engine{
-        scheduler: sched,
-        eventBus:  bus,
-        agents:    agentReg,
-        tools:     toolReg,
-        backend:   cfg.Backend,
-    }, nil
-}
-
-// Run 启动引擎，执行用户任务。
-func (e *Engine) Run(ctx context.Context, task string) (string, error) {
-    // 启动 scheduler 和 eventBus 的后台循环
-    g, ctx := errgroup.WithContext(ctx)
-
-    g.Go(func() error {
-        e.scheduler.Start(ctx)
-        return nil
-    })
-
-    if e.eventBus != nil {
-        g.Go(func() error {
-            e.eventBus.Start(ctx)
-            return nil
-        })
-    }
-
-    // 用主 agent 处理用户请求
-    mainAgent := e.agents.Get("general-purpose")
-    result, err := mainAgent.Run(ctx, task, nil)
-
-    e.scheduler.Stop()
-    return result.Text, err
-}
-```
-
----
-
-## 10. Google ADK 的集成点
-
-ADK 不作为核心依赖，而是作为**可选的插件层**，在以下几个点接入：
-
-### 10.1 Gemini LLM Adapter
-
-```go
-// pkg/llm/gemini/adapter.go
-// 使用 ADK 的 model/gemini 包，实现 llm.LLM 接口
-
-import (
-    "google.golang.org/adk/model/gemini"
-    "google.golang.org/genai"
-)
-
-type GeminiAdapter struct {
-    model *gemini.Model
-}
-
-func (a *GeminiAdapter) Chat(ctx context.Context, req *llm.ChatRequest) (*llm.ChatResponse, error) {
-    // 将 llm.ChatRequest 转换为 genai.GenerateContentConfig
-    // 调用 ADK gemini model
-    // 将 genai response 转换回 llm.ChatResponse
-}
-```
-
-### 10.2 MCP Tool 集成
-
-```go
-// pkg/tool/mcp/bridge.go
-// 使用 ADK 的 tool/mcptoolset 包，将 MCP tools 桥接到 tool.Tool 接口
-
-import "google.golang.org/adk/tool/mcptoolset"
-
-func LoadMCPTools(serverURL string) ([]tool.Tool, error) {
-    mcpTools, _ := mcptoolset.New(serverURL)
-    // 将 ADK tools 包装为 tool.Tool 接口
-}
-```
-
-### 10.3 Agent Memory
-
-```go
-// 可选：使用 ADK 的 memory 包替代自行实现
-import "google.golang.org/adk/memory"
-```
-
-### 10.4 不使用 ADK 的部分
-
-| ADK 能力 | 是否使用 | 原因 |
+| 模板 | ADK 实现 | 说明 |
 |---|---|---|
-| `agent/workflowagents/parallelagent` | 否 | 我们有自己的 Scheduler，更强大 |
-| `agent/workflowagents/sequentialagent` | 否 | Pipeline 模板替代 |
-| `agent/workflowagents/loopagent` | 否 | Iterative 模板替代 |
-| `runner` | 否 | 我们有 Engine |
-| `session` | 视情况 | 如果需要持久化 session 可以考虑 |
-| `tool/functiontool` | 否 | 我们有自己的 tool.Tool 接口 |
-| `model/gemini` | 是 | 作为 Gemini adapter |
-| `tool/mcptoolset` | 是 | MCP 集成 |
-| `memory` | 可选 | 看是否比自行实现更好 |
-| `telemetry` | 可选 | 可以复用 ADK 的 OpenTelemetry 集成 |
+| **Direct** | 单个 `LlmAgent` | 最简单的情况，一个 agent 直接处理 |
+| **Pipeline** | `SequentialAgent` | 子 agent 按序执行，通过 `output_key` → Session State 传递数据 |
+| **FanOut** | `ParallelAgent` + 聚合 `LlmAgent` | 子 agent 并发执行（分支隔离），最后由聚合 agent 整合结果 |
+| **Iterative** | `LoopAgent` | 子 agent 反复执行，直到某次执行返回 `Escalate=true` |
+| **Hierarchical** | Custom Agent | plan → parallel execute → integrate → verify → retry 循环，需要自定义控制流 |
+
+### 8.2 模板分类
+
+使用一个 `LlmAgent` 作为 Router：接收用户任务，通过结构化输出（output schema）返回模板类型和子任务拆分方案，然后将控制权转移到对应的 Workflow Agent。
+
+### 8.3 Hierarchical 模板流程
+
+这是唯一需要 Custom Agent 的模板：
+
+```
+Custom Agent: HierarchicalAgent.Run(ctx)
+  │
+  ├─ 1. Plan: 调用 LlmAgent 分解任务为子任务列表
+  ├─ 2. Execute: 构建 ParallelAgent 并发执行子任务
+  ├─ 3. Integrate: 调用 LlmAgent 整合所有子任务结果
+  ├─ 4. Verify: 调用 LlmAgent 验证整合结果是否满足原始需求
+  │
+  ├─ 验证通过 → yield FinalEvent → 结束
+  └─ 验证未通过 → 带反馈回到 Step 1（最多 N 次重试）
+```
+
+---
+
+## 9. 顶层组装
+
+> 采用 ADK 后，顶层组装由 ADK Runner 承担，不再需要自建 Engine。
+
+### 9.1 组装流程
+
+1. **创建 Model** — Gemini（ADK 原生）/ OpenAI / Anthropic（自建 adapter）
+2. **注册 Tools** — 用 `functiontool` 包装 Backend 操作，注册 MCP tools
+3. **构建 Agent 树** — root LlmAgent + Workflow Agents + Custom Agents
+4. **配置 Plugins** — logging、retry、event rules、guardrails
+5. **创建 Session Service** — InMemory（开发）/ Database（生产）
+6. **启动 Runner** — `runner.New(rootAgent, sessionService, plugins...)`
+
+### 9.2 请求处理流程
+
+```
+用户输入 → Runner.Run(ctx, userMessage, sessionID)
+         → Runner 从 SessionService 加载/创建 Session
+         → Runner 调用 rootAgent.Run(invocationCtx)
+         → Agent 树内部执行（可能涉及多个 Workflow Agents、tool 调用、agent 委派）
+         → Runner 逐个处理 yield 的 Event，持久化状态
+         → 最终 Event（IsFinalResponse=true）→ 返回给用户
+```
+
+---
+
+## 10. Google ADK 的角色：核心运行时
+
+> **重要修订（2026-03-24）**：经过对 ADK Go SDK（`adk-go` v0.2.0+）文档的深入调查，
+> 此前将 ADK 定位为"仅 LLM adapter"的判断是不准确的。ADK 是一个**完整的 agent 编排框架**，
+> 其 Runner 事件循环、Workflow Agents、Callback/Plugin 系统、Session 状态管理等能力
+> 可以覆盖本 RFC 中自建核心引擎的大部分需求。本节重新定义 ADK 的角色。
+
+### 10.1 ADK 实际架构（远不止 LLM adapter）
+
+ADK Go SDK 的包结构：
+
+| 包 | 职责 |
+|---|---|
+| `agent/` | 核心 Agent 接口、InvocationContext、回调 |
+| `agent/llmagent/` | LLM 驱动的 agent 实现 |
+| `agent/workflowagents/` | `sequentialagent`、`parallelagent`、`loopagent`（**确定性编排，无需 LLM**） |
+| `runner/` | **事件循环引擎**（yield/pause/resume 语义、Session 管理） |
+| `session/` | Session、State（带作用域）、Event、SessionService 接口 |
+| `tool/` | Tool 接口、functiontool、agenttool、mcptoolset、toolconfirmation |
+| `plugin/` | **运行时插件系统**（生命周期钩子、事件拦截） |
+| `model/` | Model 抽象层（Gemini 优化，可扩展） |
+| `memory/` | 跨会话语义记忆 |
+| `artifact/` | 二进制制品存储 |
+| `telemetry/` | OpenTelemetry 集成 |
+
+### 10.2 ADK 能力与 RFC 自建组件的对照
+
+| RFC 自建组件 | ADK 对应能力 | 覆盖度 | 说明 |
+|---|---|---|---|
+| **Scheduler (TaskQueue + WorkerPool)** | `ParallelAgent`（并发扇出）、`SequentialAgent`（流水线）、`LoopAgent`（迭代） | **部分** | ADK 缺少优先级队列和 worker 池，但大多数编排场景已够用 |
+| **EventBus + Rules** | Runner 事件循环 + Plugin `OnEventCallback` + 6 个回调钩子（BeforeAgent/AfterAgent、BeforeModel/AfterModel、BeforeTool/AfterTool） | **大部分** | 没有独立 pub/sub 总线，但 Plugin 可拦截/变换所有流经 Runner 的事件 |
+| **Agent Registry** | Agent 树结构 + `find_agent()` 遍历 | **完全** | 天然支持 |
+| **Tool Registry** | `functiontool`、`agenttool`、`mcptoolset`、`Toolset`（动态解析） | **完全** | 比 RFC 设计更丰富（支持 long-running tool、human-in-the-loop、动态 toolset） |
+| **Template Engine** | Workflow Agents + Custom Agent + LLM-driven delegation | **大部分** | 见下表 |
+| **LLM Agent Loop** | `LlmAgent` + Runner 事件循环 | **完全** | 包含 tool-calling loop、streaming、content generation config |
+| **Engine** | `Runner` | **完全** | Runner 负责事件循环、Session 持久化、状态提交 |
+
+### 10.3 执行模板的 ADK 实现方式
+
+| 模板 | ADK 实现 |
+|---|---|
+| Direct | 单个 `LlmAgent` |
+| Pipeline | `SequentialAgent` + 子 agent 通过 `output_key` 共享状态 |
+| FanOut | `ParallelAgent` + 聚合 `LlmAgent`（分支隔离但状态共享） |
+| Iterative | `LoopAgent` + `Escalate=true` 退出条件 |
+| Hierarchical | 嵌套 agent 树 + `transfer_to_agent` LLM 委派 + Custom Agent 实现 plan→execute→verify→retry |
+
+### 10.4 ADK 的关键能力详解
+
+**Agent 类型系统：**
+
+- **LlmAgent**：LLM 驱动决策，支持 tool calling、instruction 模板（`{state_var}`）、输出 schema、generation config
+- **Workflow Agents**：确定性编排（Sequential、Parallel、Loop），**不需要 LLM 参与控制流**
+- **Custom Agent**：实现 `Run()` 接口即可自定义任意编排逻辑——条件分支、外部 API 调用、动态 agent 选择
+
+ADK Agent 接口核心契约：`Name()` + `Description()` + `Run(InvocationContext) → Event 迭代器` + `SubAgents()`
+
+**Runner 事件循环：**
+
+```
+用户消息 → Runner 追加到 Session
+         → 调用 agent.Run(ctx)
+         → agent yield Event（含 StateDelta、ArtifactDelta、TransferToAgent 等动作）
+         → Runner 处理 Event：提交状态变更到 SessionService
+         → agent 从 yield 点恢复，已提交状态保证可见
+         → 循环直到 agent 完成
+```
+
+**6 个回调钩子：**
+
+| 钩子 | 触发时机 | 可以做什么 |
+|---|---|---|
+| `BeforeAgent` / `AfterAgent` | agent 执行前后 | 短路（返回内容跳过 agent）、审计 |
+| `BeforeModel` / `AfterModel` | LLM 调用前后 | 返回 LlmResponse 跳过实际调用（缓存、mock） |
+| `BeforeTool` / `AfterTool` | tool 执行前后 | 返回结果跳过 tool（验证、guardrails） |
+
+**Plugin 系统（框架级生命周期钩子）：**
+
+- `OnUserMessageCallback`：变换传入的用户消息
+- `BeforeRunCallback` / `AfterRunCallback`：整个 run 生命周期前后
+- `OnEventCallback`：拦截/变换所有流经 Runner 的事件
+- 内置 plugins：`loggingplugin`、`retryandreflect`、`functioncallmodifier`
+
+**Agent 间通信（3 种机制）：**
+
+1. **Shared Session State**：agents 读写 `session.State`（`temp:`/`app:`/`user:` 作用域），`output_key` 自动保存 agent 输出
+2. **LLM-Driven Delegation**：LLM 生成 `transfer_to_agent(agent_name)` 调用，框架 AutoFlow 拦截并转移控制
+3. **AgentTool**：将 agent 包装为 tool 同步调用，父 agent 像调用函数一样调用子 agent
+
+**Session State 作用域：**
+
+| 前缀 | 作用域 | 用途 |
+|---|---|---|
+| `temp:` | 单次调用 | 临时数据，调用结束清除 |
+| `app:` | 全应用 | 所有用户/会话共享 |
+| `user:` | 用户级 | 同一用户跨会话共享 |
+| 无前缀 | 会话级 | 当前会话内共享 |
+
+### 10.5 ADK 不覆盖的领域（仍需自建）
+
+| 需求 | ADK 现状 | 自建方案 |
+|---|---|---|
+| **优先级调度** | 无内置优先级队列 | 保留 `pkg/scheduler/queue.go` 的 priority heap，包装为 Custom Agent 接入 ADK |
+| **外部触发（Cron/Webhook）** | Runner 是请求驱动的，无定时/事件触发 | 自建外部触发层，调用 ADK Runner |
+| **持久化执行** | 无 Temporal 式 workflow replay/recovery | 结合 SessionService 持久化后端 + 自建 checkpoint |
+| **跨进程 agent 通信** | 仅进程内（除 `remoteagent`） | 评估 ADK `remoteagent` 或自建 gRPC 层 |
+| **Worker 并发控制** | 无内置 worker pool | 保留 `pkg/scheduler/pool.go`，作为 Custom Agent 的底层实现 |
+
+### 10.6 修订后的集成策略
+
+**原则：以 ADK 为核心运行时，只在 ADK 不足的地方做扩展。**
+
+| ADK 能力 | 是否使用 | 角色 |
+|---|---|---|
+| `runner` | **是** | 核心事件循环引擎，替代自建 Engine |
+| `agent/llmagent` | **是** | LLM agent 实现，替代自建 LLMAgent |
+| `agent/workflowagents/*` | **是** | 确定性编排（Sequential、Parallel、Loop），覆盖大部分模板场景 |
+| Custom Agent（实现 `Run()`） | **是** | 复杂编排模式（Hierarchical + priority scheduling） |
+| `session` | **是** | 状态管理和持久化 |
+| `plugin` | **是** | 运行时扩展（日志、retry、事件拦截） |
+| `tool/functiontool` | **是** | 工具注册，替代自建 tool.Tool |
+| `tool/agenttool` | **是** | agent 间同步调用 |
+| `tool/mcptoolset` | **是** | MCP 集成 |
+| `model/gemini` | **是** | Gemini adapter |
+| `memory` | **是** | 跨会话语义记忆 |
+| `artifact` | **是** | 二进制制品存储 |
+| `telemetry` | **是** | OpenTelemetry 集成 |
+
+自建部分仅保留：
+- `pkg/scheduler/` — 优先级队列 + Worker Pool（作为 Custom Agent 的底层，而非替代 ADK）
+- `pkg/trigger/` — 外部触发层（Cron、Webhook → 调用 ADK Runner）
+- `pkg/llm/openai/` + `pkg/llm/anthropic/` — 非 Gemini 的 LLM adapter（ADK model 层当前优化为 Gemini）
 
 ---
 
 ## 11. 与 Python 版本的代码量对比
 
-| 组件 | Python（当前） | Go（预估） | 减少原因 |
-|---|---|---|---|
-| Scheduler | 不存在 | ~300 行 | 新功能 |
-| EventBus | 不存在 | ~200 行 | 新功能 |
-| SubAgent Middleware | 693 行 | ~0 行 | 被 Scheduler 替代 |
-| AsyncSubAgent Middleware | 899 行 | ~0 行 | 被 Scheduler 替代 |
-| LangGraph graph.py | 333 行 | ~150 行（Engine） | 无框架样板 |
-| Template graph | 441 行 | ~200 行 | 直接函数调用，无 StateGraph |
-| Template state | 101 行 | ~30 行 | Go struct 替代 TypedDict + reducers |
-| Tool 定义 | 分散在 middleware 中 | ~300 行（builtin/） | 独立包，无 StructuredTool 包装 |
-| LLM Agent Loop | LangGraph 内部 | ~100 行 | 显式循环，无框架 |
-| sync/async 重复代码 | ~500 行（估） | 0 行 | Go 无此问题 |
-| **合计** | **~3000+ 行** | **~1300 行** | **减少 ~55%** |
+> **修订说明**：采用 ADK 为核心运行时后，自建代码量进一步大幅下降。
+> 大量组件由 ADK 提供，自建代码集中在 ADK 不覆盖的扩展领域。
 
-加上 Scheduler + EventBus 的 ~500 行新代码，总量仍然更少，但功能更强。
+| 组件 | Python（当前） | Go（预估） | 说明 |
+|---|---|---|---|
+| Runner / Engine | LangGraph 内部 | **ADK 提供** | `runner.Runner` 事件循环 |
+| LLM Agent Loop | LangGraph 内部 | **ADK 提供** | `llmagent.New()` 含 tool-calling loop |
+| SubAgent Middleware | 693 行 | **ADK 提供** | Workflow Agents + AgentTool + LLM delegation |
+| AsyncSubAgent Middleware | 899 行 | **ADK 提供** | `ParallelAgent` + goroutine 天然并发 |
+| LangGraph graph.py | 333 行 | **ADK 提供** | Runner 替代 |
+| Template graph | 441 行 | ~100 行 | Workflow Agents 覆盖大部分，仅 Hierarchical 需 Custom Agent |
+| Template state | 101 行 | **ADK 提供** | Session State 带作用域 |
+| Tool 定义 | 分散在 middleware 中 | ~150 行 | `functiontool` 自动生成 JSON schema，仅需定义 struct + 函数 |
+| sync/async 重复代码 | ~500 行（估） | 0 行 | Go 无此问题 |
+| 优先级调度器 | 不存在 | ~200 行 | 新功能：priority heap + worker pool（Custom Agent 底层） |
+| 外部触发层 | 不存在 | ~100 行 | 新功能：Cron/Webhook → Runner |
+| OpenAI/Anthropic adapter | 不存在（LangChain 内部） | ~200 行 | ADK model 层当前优化为 Gemini，非 Gemini 需自建 adapter |
+| **合计** | **~3000+ 行** | **~750 行自建** | **减少 ~75%**，其余由 ADK 提供 |
 
 ---
 
 ## 12. 迁移策略
 
-### Phase 1: 基础设施
-1. `pkg/llm/` — LLM 接口 + OpenAI adapter
-2. `pkg/tool/` — Tool 接口 + 内置 filesystem/execute tools
-3. `pkg/backend/` — Backend 接口 + localfs/shell 实现
-4. `pkg/agent/` — Agent 接口 + LLMAgent（tool-calling loop）
+> **修订说明**：采用 ADK 为核心运行时后，迁移路径以 ADK 集成为主线，
+> 自建工作集中在 ADK 不覆盖的扩展领域和非 Gemini LLM adapter。
 
-→ 此阶段结束时：单个 agent 可以接收 prompt、调用 tools、返回结果。
+### Phase 1: ADK 核心集成
+1. 引入 `adk-go` 依赖，搭建基础 Runner + LlmAgent + Gemini model
+2. 用 `functiontool` 注册内置 tools（filesystem、shell execution）
+3. 用 ADK Session（InMemory）管理状态
 
-### Phase 2: 调度器
-5. `pkg/scheduler/` — TaskQueue + WorkerPool + Scheduler
-6. `pkg/tool/builtin/submit.go` — submit_task / await_tasks tools
+→ 此阶段结束时：单个 LlmAgent 可以通过 ADK Runner 接收 prompt、调用 tools、返回结果。
 
-→ 此阶段结束时：主 agent 可以并行调度多个子 agent。
+### Phase 2: 多 Agent 编排
+4. 用 Workflow Agents（Sequential、Parallel、Loop）实现 Pipeline / FanOut / Iterative 模板
+5. 用 Custom Agent 实现 Hierarchical 模板（plan → execute → verify → retry）
+6. 用 AgentTool + LLM delegation 实现 agent 间通信
 
-### Phase 3: 事件系统
-7. `pkg/event/` — EventBus + EventRule
-8. Scheduler ↔ EventBus 集成
-9. Backend 事件埋点
+→ 此阶段结束时：5 种执行模板均可运行。
 
-→ 此阶段结束时：任务完成自动触发后续 agent。
+### Phase 3: 扩展能力
+7. `pkg/llm/openai/` + `pkg/llm/anthropic/` — 非 Gemini LLM adapter（包装为 ADK model 接口或独立调用）
+8. `pkg/scheduler/` — 优先级队列 + Worker Pool（作为 Custom Agent 底层，处理大量并发任务场景）
+9. ADK Plugin 集成（logging、retry、guardrails）
+10. ADK `mcptoolset` 集成 MCP tools
 
-### Phase 4: 模板和高级功能
-10. `pkg/template/` — 5 种执行模板
-11. `pkg/skill/` + `pkg/memory/` — Skills/Memory 加载
-12. `pkg/engine/` — 顶层组装
+→ 此阶段结束时：支持多 LLM 后端，优先级调度和 MCP 工具可用。
 
-### Phase 5: 扩展
-13. Anthropic / Gemini LLM adapters
-14. ADK MCP 集成
+### Phase 4: 持久化和高级功能
+11. ADK Session 切换到持久化后端（database / 自建）
+12. ADK Memory 集成（跨会话语义记忆）
+13. `pkg/skill/` — Skills 加载
+14. `pkg/trigger/` — 外部触发层（Cron、Webhook → Runner）
+
+### Phase 5: 产品化
 15. CLI (`cmd/deepagents/`)
+16. ADK Telemetry（OpenTelemetry）集成
+17. Human-in-the-loop（ADK `toolconfirmation` + long-running tool）
 
 ---
 
 ## 13. 开放问题
 
-1. **状态持久化**：Python 版用 LangGraph checkpointer。Go 版需要自行实现吗？还是用 SQLite/Redis？
+1. **状态持久化**：ADK 提供 `SessionService` 接口（InMemory / database / VertexAI 后端）。是否直接用 ADK database 后端，还是自建 SQLite/Redis 实现？
 
-2. **流式输出**：LLMAgent.Run 当前返回完整结果。是否需要支持 streaming（`<-chan string`）？如果需要，如何在 Scheduler 层面暴露？
+2. **流式输出**：ADK Runner 原生支持 streaming（`Partial=true` 的 Event 转发给 UI 但不提交状态）。是否需要在此基础上增加自定义的流式处理？
 
-3. **模块边界**：是单一 Go module（`deepagents`）还是拆分为多个（`deepagents/scheduler`、`deepagents/event` 等）？
+3. **非 Gemini LLM 的接入方式**：ADK 的 model 层当前优化为 Gemini。OpenAI/Anthropic 有两种接入路径：(a) 实现 ADK 的 model 接口让它们作为 ADK 原生 model；(b) 在 Custom Agent 内部独立调用，绕过 ADK model 层。哪种更合适？
 
-4. **CLI 框架**：Python 版用 Textual（TUI）。Go 版用什么？Bubble Tea？Cobra + 简单 REPL？
+4. **ADK 版本锁定**：`adk-go` 当前为 v0.2.0+，API 可能尚未稳定。是否需要 vendor 或 pin 版本？如何跟进 ADK 的 breaking changes？
 
-5. **ADK 的 genai 类型污染**：如果引入 ADK 作为 Gemini adapter，`google.golang.org/genai` 会被拉入依赖。是否接受？还是把 Gemini adapter 放在独立的 build tag 后面？
+5. **优先级调度与 ADK 的整合**：自建的优先级队列 + Worker Pool 如何与 ADK Runner 协作？是作为 Custom Agent 包装，还是在 Runner 外层做一层调度？
 
-6. **向后兼容**：Python CLI（`libs/cli/`）是否继续维护？还是也用 Go 重写？过渡期如何处理？
+6. **CLI 框架**：Python 版用 Textual（TUI）。Go 版用什么？Bubble Tea？Cobra + 简单 REPL？
+
+7. **向后兼容**：Python CLI（`libs/cli/`）是否继续维护？还是也用 Go 重写？过渡期如何处理？
