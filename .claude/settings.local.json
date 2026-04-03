@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find . -not -path ./.git/* -type f -o -type d)",
+      "Bash(grep -E \"go\\\\.\\(mod|sum\\)|\\\\.go$\")",
+      "Bash(go mod:*)",
+      "Bash(go get:*)",
+      "Bash(go build:*)",
+      "Bash(go test:*)"
+    ]
+  }
+}
