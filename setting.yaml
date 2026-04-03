@@ -1,0 +1,9 @@
+max_retry: 3
+default_concurrency: 2
+fifo_limit: 100
+watchdog_interval_sec: 30
+scheduler_ticker_sec: 10
+scheduler_max_loops: 10
+agent_max_loops: 50
+event_channel_buffer: 64
+default_timeout_sec: 300
