@@ -30,6 +30,13 @@ go.work.sum
 # MCP config (contains API keys)
 .mcp.json
 
+# Kiro IDE
+.kiro/
+
 # Editor/IDE
 # .idea/
 # .vscode/
+CLAUDE.md
+AGENT.md
+settings.json
+.mcp.json

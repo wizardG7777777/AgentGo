@@ -6,7 +6,14 @@
       "Bash(go mod:*)",
       "Bash(go get:*)",
       "Bash(go build:*)",
-      "Bash(go test:*)"
+      "Bash(go test:*)",
+      "Bash(wc:*)",
+      "Bash(xargs grep:*)",
+      "Bash(find:*)"
     ]
-  }
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "postgres"
+  ]
 }

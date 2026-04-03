@@ -20,17 +20,23 @@ type ErrRecoverable struct {
 func (e *ErrRecoverable) Error() string { return e.Err.Error() }
 func (e *ErrRecoverable) Unwrap() error { return e.Err }
 
+// ExecuteResult holds the result of a single TaskExecutor invocation.
+type ExecuteResult struct {
+	Output     string
+	ToolCalled bool
+}
+
 // TaskExecutor is a pluggable function that executes a task.
 // For MVP this is injected as a mock; in production it will call the LLM.
-type TaskExecutor func(ctx context.Context, task *model.Task, depResults map[string]string) (string, error)
+type TaskExecutor func(ctx context.Context, task *model.Task, depResults map[string]string) (ExecuteResult, error)
 
 type Agent struct {
-	ID        string
-	EventType string
-	Store     store.TaskStore
-	Roster    roster.Roster
-	Execute   TaskExecutor
-	MaxLoops  int
+	ID           string
+	EventType    string
+	Store        store.TaskStore
+	Roster       roster.Roster
+	Execute      TaskExecutor
+	MaxLoops     int
 	PollInterval time.Duration
 }
 
@@ -85,23 +91,40 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		return
 	}
 
-	// Read dependency results
 	depResults, err := a.Store.GetDependencyResults(taskID)
 	if err != nil {
 		log.Printf("[agent %s] GetDependencyResults error: %v", a.ID, err)
 	}
 
-	// Execute the task
-	result, execErr := a.Execute(ctx, task, depResults)
+	var lastOutput string
 
-	if execErr != nil {
-		a.handleFailure(taskID, execErr)
-		return
+	for i := 0; i < a.MaxLoops; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		result, execErr := a.Execute(ctx, task, depResults)
+
+		if execErr != nil {
+			a.handleFailure(taskID, execErr)
+			return
+		}
+
+		lastOutput = result.Output
+
+		if !result.ToolCalled {
+			if err := a.Store.SubmitResult(a.ID, taskID, lastOutput); err != nil {
+				log.Printf("[agent %s] SubmitResult error: %v", a.ID, err)
+			}
+			return
+		}
 	}
 
-	// Submit result
-	if err := a.Store.SubmitResult(a.ID, taskID, result); err != nil {
-		log.Printf("[agent %s] SubmitResult error: %v", a.ID, err)
+	reason := fmt.Sprintf("因循环上限终止: 已执行 %d 轮，部分结果: %s", a.MaxLoops, lastOutput)
+	if err := a.Store.RetryRollback(a.ID, taskID, reason); err != nil {
+		log.Printf("[agent %s] RetryRollback (max loops) error: %v", a.ID, err)
 	}
 }
 
@@ -139,12 +162,12 @@ func (a *Agent) sleep(ctx context.Context) {
 // NewAgent creates a new agent with the given configuration.
 func NewAgent(id, eventType string, s store.TaskStore, r roster.Roster, exec TaskExecutor, maxLoops int) *Agent {
 	return &Agent{
-		ID:        id,
-		EventType: eventType,
-		Store:     s,
-		Roster:    r,
-		Execute:   exec,
-		MaxLoops:  maxLoops,
+		ID:           id,
+		EventType:    eventType,
+		Store:        s,
+		Roster:       r,
+		Execute:      exec,
+		MaxLoops:     maxLoops,
 		PollInterval: 500 * time.Millisecond,
 	}
 }
