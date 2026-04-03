@@ -97,6 +97,19 @@ func (r *MemoryRoster) ListByAgent(agentID string) ([]model.Claim, error) {
 	return result, nil
 }
 
+func (r *MemoryRoster) ListAllAgents() ([]string, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	agents := make([]string, 0, len(r.agentFiles))
+	for agentID, files := range r.agentFiles {
+		if len(files) > 0 {
+			agents = append(agents, agentID)
+		}
+	}
+	return agents, nil
+}
+
 func (r *MemoryRoster) removeAgentFile(agentID string, filePath string) {
 	files := r.agentFiles[agentID]
 	for i, fp := range files {

@@ -34,10 +34,10 @@ func TestBootstrap_StartAndShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx := context.Background()
-	sys.Start(ctx)
+	ctx, cancel := context.WithCancel(context.Background())
+	sys.Start(ctx, cancel)
 
-	// Give watchdog goroutine time to start
+	// Give goroutines time to start
 	time.Sleep(50 * time.Millisecond)
 
 	done := make(chan struct{})
@@ -50,5 +50,21 @@ func TestBootstrap_StartAndShutdown(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Shutdown did not complete in time")
+	}
+}
+
+func TestBootstrap_NewComponents(t *testing.T) {
+	sys, err := Bootstrap("nonexistent.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sys.Scheduler == nil {
+		t.Error("Scheduler should not be nil")
+	}
+	if sys.Explorer == nil {
+		t.Error("Explorer should not be nil")
+	}
+	if sys.CancelRegistry == nil {
+		t.Error("CancelRegistry should not be nil")
 	}
 }

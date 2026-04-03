@@ -7,6 +7,7 @@ import (
 
 	"agentgo/internal/config"
 	"agentgo/internal/model"
+	"agentgo/internal/roster"
 	"agentgo/internal/store"
 )
 
@@ -16,7 +17,8 @@ func newTestWatchdog() (*Watchdog, store.TaskStore, chan model.Event) {
 	cfg.MaxRetry = 3
 	cfg.DefaultTimeoutSec = 300
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	w := New(s, cfg, ch)
+	r := roster.NewMemoryRoster()
+	w := New(s, cfg, ch, r)
 	return w, s, ch
 }
 
@@ -167,6 +169,92 @@ func TestWatchdog_ContextCancellation(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("watchdog did not stop")
+	}
+}
+
+func TestWatchdog_RosterCleanup(t *testing.T) {
+	w, s, _ := newTestWatchdog()
+	r := w.Roster.(*roster.MemoryRoster)
+
+	// 创建一个已完成的任务，代理仍有花名册声明（模拟 defer 未执行）
+	task := &model.Task{Description: "done task"}
+	s.PublishTask(task)
+	s.ClaimTask("agent-stale", task.ID)
+	s.SubmitResult("agent-stale", task.ID, "result")
+
+	// 代理残留花名册声明
+	r.TryClaim("agent-stale", "/path/to/file.go")
+
+	// 确认声明存在
+	claims, _ := r.ListByAgent("agent-stale")
+	if len(claims) != 1 {
+		t.Fatalf("expected 1 claim before cleanup, got %d", len(claims))
+	}
+
+	// 运行巡检
+	w.RunOnce()
+
+	// 声明应被清理（agent-stale 不在任何 processing 任务中）
+	claims, _ = r.ListByAgent("agent-stale")
+	if len(claims) != 0 {
+		t.Errorf("expected 0 claims after cleanup, got %d", len(claims))
+	}
+}
+
+func TestWatchdog_RosterCleanup_ActiveAgentPreserved(t *testing.T) {
+	w, s, _ := newTestWatchdog()
+	r := w.Roster.(*roster.MemoryRoster)
+
+	// 创建一个正在执行的任务
+	task := &model.Task{Description: "active task", TimeoutSeconds: 300}
+	s.PublishTask(task)
+	s.ClaimTask("agent-active", task.ID)
+
+	// 代理有花名册声明
+	r.TryClaim("agent-active", "/path/to/file.go")
+
+	w.RunOnce()
+
+	// 活跃代理的声明应保留
+	claims, _ := r.ListByAgent("agent-active")
+	if len(claims) != 1 {
+		t.Errorf("expected 1 claim preserved for active agent, got %d", len(claims))
+	}
+}
+
+func TestWatchdog_CascadeCancellation_Processing(t *testing.T) {
+	w, s, _ := newTestWatchdog()
+
+	// 创建依赖任务，先让它 completed 以便后续任务能 ClaimTask
+	dep := &model.Task{Description: "dep task"}
+	s.PublishTask(dep)
+	s.ClaimTask("setup", dep.ID)
+	s.SubmitResult("setup", dep.ID, "done")
+
+	// 创建并领取依赖 dep 的任务
+	task := &model.Task{
+		Description:    "processing depends on dep",
+		Dependencies:   []string{dep.ID},
+		TimeoutSeconds: 300,
+	}
+	s.PublishTask(task)
+	s.ClaimTask("agent-1", task.ID)
+
+	// 确认任务在 processing 状态
+	got, _ := s.GetTask(task.ID)
+	if got.Status != model.TaskStatusProcessing {
+		t.Fatalf("precondition: status = %s, want processing", got.Status)
+	}
+
+	// 现在将依赖任务的状态直接改为 failed（模拟依赖后续被判定失败的场景）
+	depTask, _ := s.GetTask(dep.ID)
+	depTask.Status = model.TaskStatusFailed
+
+	inspectAll(w)
+
+	got, _ = s.GetTask(task.ID)
+	if got.Status != model.TaskStatusCancelled {
+		t.Errorf("status = %s, want cancelled (cascade from processing)", got.Status)
 	}
 }
 

@@ -13,6 +13,7 @@ const (
 )
 
 type Event struct {
-	Type   EventType
-	TaskID string
+	Type    EventType
+	TaskID  string
+	Payload map[string]string // 用于 EventUserInput 传递用户文本，其他事件为 nil
 }
