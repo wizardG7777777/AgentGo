@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
 
 	"agentgo/internal/bootstrap"
 )
@@ -20,13 +18,12 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sys.Start(ctx)
+	// 启动后台服务（调度器、看门狗、调查代理）
+	sys.Start(ctx, cancel)
 
-	// Wait for interrupt signal
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
+	// CLI 阻塞 main goroutine，/quit 或 stdin 关闭时返回
+	sys.RunCLI(ctx, os.Stdin, os.Stdout)
 
-	fmt.Println("\n[关闭] 收到停止信号，正在关闭...")
+	// CLI 退出后关闭所有服务
 	sys.Shutdown()
 }

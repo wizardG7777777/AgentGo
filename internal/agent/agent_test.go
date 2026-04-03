@@ -25,7 +25,7 @@ func TestAgent_SuccessfulExecution(t *testing.T) {
 	task := &model.Task{Description: "test task", EventType: "code"}
 	s.PublishTask(task)
 
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 		return ExecuteResult{Output: "executed successfully", ToolCalled: false}, nil
 	}
 
@@ -66,7 +66,7 @@ func TestAgent_RecoverableError(t *testing.T) {
 	s.PublishTask(task)
 
 	callCount := 0
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 		callCount++
 		if callCount == 1 {
 			return ExecuteResult{}, &ErrRecoverable{Err: errors.New("temporary failure")}
@@ -106,7 +106,7 @@ func TestAgent_UnrecoverableError(t *testing.T) {
 	task := &model.Task{Description: "fail task", EventType: "code"}
 	s.PublishTask(task)
 
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 		return ExecuteResult{}, errors.New("permanent failure")
 	}
 
@@ -136,7 +136,7 @@ func TestAgent_UnrecoverableError(t *testing.T) {
 func TestAgent_ContextCancellation(t *testing.T) {
 	s, r, _ := setup()
 
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 		<-ctx.Done()
 		return ExecuteResult{}, ctx.Err()
 	}
@@ -169,7 +169,7 @@ func TestAgent_SkipsWrongEventType(t *testing.T) {
 	s.PublishTask(task)
 
 	executed := false
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 		executed = true
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
@@ -210,7 +210,7 @@ func TestAgent_ReadsDependencyResults(t *testing.T) {
 	s.PublishTask(task)
 
 	var receivedDeps map[string]string
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 		receivedDeps = depResults
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
@@ -270,7 +270,7 @@ func TestBugCondition_MultiRoundTaskExecutorCallCount(t *testing.T) {
 	callCount := 0
 	totalRoundsNeeded := 3
 
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 		callCount++
 		if callCount < totalRoundsNeeded {
 			// Rounds 1 and 2: simulate "tool was called, need to continue"
@@ -313,7 +313,7 @@ func TestBugCondition_MaxLoopsHasNoEffect(t *testing.T) {
 			}
 
 			callCount := 0
-			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string) (ExecuteResult, error) {
+			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 				callCount++
 				return ExecuteResult{Output: "result", ToolCalled: true}, nil
 			}
@@ -372,7 +372,7 @@ func TestPreservation_SingleRoundCompletion(t *testing.T) {
 				t.Fatalf("ClaimTask failed: %v", err)
 			}
 
-			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string) (ExecuteResult, error) {
+			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 				return ExecuteResult{Output: tc.result, ToolCalled: false}, nil
 			}
 
@@ -419,7 +419,7 @@ func TestPreservation_UnrecoverableError(t *testing.T) {
 				t.Fatalf("ClaimTask failed: %v", err)
 			}
 
-			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string) (ExecuteResult, error) {
+			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 				return ExecuteResult{}, errors.New(tc.errMsg)
 			}
 
@@ -464,7 +464,7 @@ func TestPreservation_RecoverableError(t *testing.T) {
 				t.Fatalf("ClaimTask failed: %v", err)
 			}
 
-			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string) (ExecuteResult, error) {
+			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 				return ExecuteResult{}, &ErrRecoverable{Err: errors.New(tc.errMsg)}
 			}
 
@@ -513,7 +513,7 @@ func TestPreservation_DependencyResults(t *testing.T) {
 		s.ClaimTask("agent-1", task.ID)
 
 		var receivedDeps map[string]string
-		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string) (ExecuteResult, error) {
+		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 			receivedDeps = depResults
 			return ExecuteResult{Output: "done", ToolCalled: false}, nil
 		}
@@ -551,7 +551,7 @@ func TestPreservation_DependencyResults(t *testing.T) {
 		s.ClaimTask("agent-1", task.ID)
 
 		var receivedDeps map[string]string
-		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string) (ExecuteResult, error) {
+		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 			receivedDeps = depResults
 			return ExecuteResult{Output: "done", ToolCalled: false}, nil
 		}
@@ -575,7 +575,7 @@ func TestPreservation_DependencyResults(t *testing.T) {
 		s.ClaimTask("agent-1", task.ID)
 
 		var receivedDeps map[string]string
-		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string) (ExecuteResult, error) {
+		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 			receivedDeps = depResults
 			return ExecuteResult{Output: "done", ToolCalled: false}, nil
 		}
@@ -597,7 +597,7 @@ func TestPreservation_ContextCancellation(t *testing.T) {
 	t.Run("idle agent exits on cancel", func(t *testing.T) {
 		s, r, _ := setup()
 
-		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string) (ExecuteResult, error) {
+		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 			return ExecuteResult{Output: "done", ToolCalled: false}, nil
 		}
 
@@ -634,7 +634,7 @@ func TestPreservation_ContextCancellation(t *testing.T) {
 	t.Run("cancel during poll with no tasks", func(t *testing.T) {
 		s, r, _ := setup()
 
-		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string) (ExecuteResult, error) {
+		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 			return ExecuteResult{Output: "done", ToolCalled: false}, nil
 		}
 
@@ -675,7 +675,7 @@ func TestPreservation_ExecutorReceivesCorrectTask(t *testing.T) {
 	s.ClaimTask("agent-1", task.ID)
 
 	var receivedTask *model.Task
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 		receivedTask = tk
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
@@ -713,7 +713,7 @@ func TestPreservation_SingleRoundCompletion_Quick(t *testing.T) {
 		s.PublishTask(task)
 		s.ClaimTask("agent-1", task.ID)
 
-		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string) (ExecuteResult, error) {
+		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 			return ExecuteResult{Output: result, ToolCalled: false}, nil
 		}
 
@@ -759,7 +759,7 @@ func TestPreservation_ErrorHandling_Quick(t *testing.T) {
 			s.PublishTask(task)
 			s.ClaimTask("agent-1", task.ID)
 
-			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string) (ExecuteResult, error) {
+			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 				if ec.recoverable {
 					return ExecuteResult{}, &ErrRecoverable{Err: errors.New(ec.errMsg)}
 				}
@@ -783,5 +783,703 @@ func TestPreservation_ErrorHandling_Quick(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// =============================================================================
+// Property Tests — Correctness Invariants
+// =============================================================================
+
+// TestProperty_RoundTripConsistency verifies Property 1: Round-trip consistency.
+// ExecuteResult → HistoryEntry → reading back yields values equal to the original.
+// For each round k, the history[k].Output received by subsequent rounds must equal
+// the Output returned by round k's ExecuteResult.
+//
+// **Validates: Requirements 5.1, 5.2**
+func TestProperty_RoundTripConsistency(t *testing.T) {
+	roundCounts := []int{2, 3, 5, 10}
+
+	for _, totalRounds := range roundCounts {
+		t.Run(fmt.Sprintf("rounds=%d", totalRounds), func(t *testing.T) {
+			s, r, _ := setup()
+
+			task := &model.Task{Description: fmt.Sprintf("roundtrip-%d", totalRounds), EventType: "code"}
+			s.PublishTask(task)
+			if err := s.ClaimTask("agent-1", task.ID); err != nil {
+				t.Fatalf("ClaimTask failed: %v", err)
+			}
+
+			// Each round produces a unique output string
+			expectedOutputs := make([]string, totalRounds)
+			for i := range expectedOutputs {
+				expectedOutputs[i] = fmt.Sprintf("output-round-%d-%x", i, i*17+3)
+			}
+
+			// Capture the history parameter received by each round
+			capturedHistories := make([][]HistoryEntry, 0, totalRounds)
+			callCount := 0
+
+			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+				round := callCount
+				callCount++
+
+				// Capture a copy of the history slice received this round
+				hCopy := make([]HistoryEntry, len(history))
+				copy(hCopy, history)
+				capturedHistories = append(capturedHistories, hCopy)
+
+				if round < totalRounds-1 {
+					// Intermediate rounds: return ToolCalled=true to continue
+					return ExecuteResult{Output: expectedOutputs[round], ToolCalled: true}, nil
+				}
+				// Final round: return ToolCalled=false to terminate
+				return ExecuteResult{Output: expectedOutputs[round], ToolCalled: false}, nil
+			}
+
+			ag := NewAgent("agent-1", "code", s, r, executor, totalRounds+10)
+			ag.processTask(context.Background(), task.ID)
+
+			// Verify executor was called the expected number of times
+			if callCount != totalRounds {
+				t.Fatalf("executor called %d times, want %d", callCount, totalRounds)
+			}
+
+			// Verify round-trip consistency: for each round k > 0,
+			// history[j].Output (j < k) must equal expectedOutputs[j]
+			for k := 1; k < totalRounds; k++ {
+				hist := capturedHistories[k]
+				for j := 0; j < k; j++ {
+					if hist[j].Output != expectedOutputs[j] {
+						t.Errorf("round %d: history[%d].Output = %q, want %q",
+							k, j, hist[j].Output, expectedOutputs[j])
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestProperty_HistoryLengthInvariant verifies Property 2: History length invariant.
+// At round i (0-indexed), len(history) == i.
+// This ensures processTask correctly accumulates one HistoryEntry per completed round.
+//
+// **Validates: Requirements 3.5, 5.2**
+func TestProperty_HistoryLengthInvariant(t *testing.T) {
+	roundCounts := []int{1, 2, 3, 5, 10}
+
+	for _, totalRounds := range roundCounts {
+		t.Run(fmt.Sprintf("rounds=%d", totalRounds), func(t *testing.T) {
+			s, r, _ := setup()
+
+			task := &model.Task{Description: fmt.Sprintf("histlen-%d", totalRounds), EventType: "code"}
+			s.PublishTask(task)
+			if err := s.ClaimTask("agent-1", task.ID); err != nil {
+				t.Fatalf("ClaimTask failed: %v", err)
+			}
+
+			// Record the len(history) received at each round
+			historyLengths := make([]int, 0, totalRounds)
+			callCount := 0
+
+			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+				round := callCount
+				callCount++
+
+				historyLengths = append(historyLengths, len(history))
+
+				if round < totalRounds-1 {
+					return ExecuteResult{Output: fmt.Sprintf("round-%d", round), ToolCalled: true}, nil
+				}
+				return ExecuteResult{Output: fmt.Sprintf("round-%d-final", round), ToolCalled: false}, nil
+			}
+
+			ag := NewAgent("agent-1", "code", s, r, executor, totalRounds+10)
+			ag.processTask(context.Background(), task.ID)
+
+			// Verify executor was called the expected number of times
+			if callCount != totalRounds {
+				t.Fatalf("executor called %d times, want %d", callCount, totalRounds)
+			}
+
+			// Verify the invariant: round i received len(history) == i
+			for i, length := range historyLengths {
+				if length != i {
+					t.Errorf("round %d: len(history) = %d, want %d", i, length, i)
+				}
+			}
+		})
+	}
+}
+
+// TestProperty_HistoryToolCalledAlwaysTrue verifies Property 3: All history entries
+// have ToolCalled == true. Since only rounds with ToolCalled == true continue the
+// ReAct loop and get recorded, every entry in the history slice must have ToolCalled
+// set to true.
+//
+// **Validates: Requirements 5.3**
+func TestProperty_HistoryToolCalledAlwaysTrue(t *testing.T) {
+	roundCounts := []int{2, 3, 5, 10}
+
+	for _, totalRounds := range roundCounts {
+		t.Run(fmt.Sprintf("rounds=%d", totalRounds), func(t *testing.T) {
+			s, r, _ := setup()
+
+			task := &model.Task{Description: fmt.Sprintf("toolcalled-%d", totalRounds), EventType: "code"}
+			s.PublishTask(task)
+			if err := s.ClaimTask("agent-1", task.ID); err != nil {
+				t.Fatalf("ClaimTask failed: %v", err)
+			}
+
+			callCount := 0
+			// Track any violation found across all rounds
+			var violation string
+
+			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+				round := callCount
+				callCount++
+
+				// Verify every entry in the received history has ToolCalled == true
+				for idx, entry := range history {
+					if !entry.ToolCalled {
+						violation = fmt.Sprintf("round %d: history[%d].ToolCalled = false, want true", round, idx)
+					}
+				}
+
+				if round < totalRounds-1 {
+					// Intermediate rounds: ToolCalled=true to continue the loop
+					return ExecuteResult{Output: fmt.Sprintf("round-%d", round), ToolCalled: true}, nil
+				}
+				// Final round: ToolCalled=false to terminate
+				return ExecuteResult{Output: fmt.Sprintf("round-%d-final", round), ToolCalled: false}, nil
+			}
+
+			ag := NewAgent("agent-1", "code", s, r, executor, totalRounds+10)
+			ag.processTask(context.Background(), task.ID)
+
+			// Verify executor was called the expected number of times
+			if callCount != totalRounds {
+				t.Fatalf("executor called %d times, want %d", callCount, totalRounds)
+			}
+
+			// Verify no violations were found
+			if violation != "" {
+				t.Errorf("ToolCalled invariant violated: %s", violation)
+			}
+		})
+	}
+}
+
+// TestProperty_ReadOnlySemantics verifies Property 4: Read-only semantics.
+// Executor modifying the passed-in history slice does NOT affect processTask's
+// internal state. This proves the copy semantics work correctly — mutations
+// (appending extra elements, modifying existing Output values) in one round
+// do not leak into subsequent rounds.
+//
+// **Validates: Requirements 2.4**
+func TestProperty_ReadOnlySemantics(t *testing.T) {
+	totalRounds := 5 // first 4 return ToolCalled=true, last returns ToolCalled=false
+
+	s, r, _ := setup()
+
+	task := &model.Task{Description: "readonly-semantics", EventType: "code"}
+	s.PublishTask(task)
+	if err := s.ClaimTask("agent-1", task.ID); err != nil {
+		t.Fatalf("ClaimTask failed: %v", err)
+	}
+
+	// Each round produces a unique, deterministic output
+	expectedOutputs := make([]string, totalRounds)
+	for i := range expectedOutputs {
+		expectedOutputs[i] = fmt.Sprintf("output-round-%d-%x", i, i*13+7)
+	}
+
+	// Capture the history received by each round (after copying, before mutation)
+	capturedHistories := make([][]HistoryEntry, 0, totalRounds)
+	callCount := 0
+
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		round := callCount
+		callCount++
+
+		// Capture a pristine copy of the history we received BEFORE mutating
+		pristine := make([]HistoryEntry, len(history))
+		copy(pristine, history)
+		capturedHistories = append(capturedHistories, pristine)
+
+		// --- Deliberately mutate the received history slice ---
+
+		// Mutation 1: Modify existing entries' Output values
+		for idx := range history {
+			history[idx].Output = "CORRUPTED-BY-EXECUTOR"
+			history[idx].ToolCalled = false
+		}
+
+		// Mutation 2: Append extra garbage elements
+		history = append(history, HistoryEntry{Output: "INJECTED-GARBAGE-1", ToolCalled: false})
+		history = append(history, HistoryEntry{Output: "INJECTED-GARBAGE-2", ToolCalled: true})
+
+		if round < totalRounds-1 {
+			return ExecuteResult{Output: expectedOutputs[round], ToolCalled: true}, nil
+		}
+		return ExecuteResult{Output: expectedOutputs[round], ToolCalled: false}, nil
+	}
+
+	ag := NewAgent("agent-1", "code", s, r, executor, totalRounds+10)
+	ag.processTask(context.Background(), task.ID)
+
+	// Verify executor was called the expected number of times
+	if callCount != totalRounds {
+		t.Fatalf("executor called %d times, want %d", callCount, totalRounds)
+	}
+
+	// Verify that despite mutations, each round received the correct, unmodified history
+	for round := 0; round < totalRounds; round++ {
+		hist := capturedHistories[round]
+
+		// Length check: round i should receive exactly i history entries
+		if len(hist) != round {
+			t.Errorf("round %d: len(history) = %d, want %d", round, len(hist), round)
+			continue
+		}
+
+		// Content check: each entry should have the original Output, not "CORRUPTED-BY-EXECUTOR"
+		for j := 0; j < round; j++ {
+			if hist[j].Output != expectedOutputs[j] {
+				t.Errorf("round %d: history[%d].Output = %q, want %q (mutation leaked!)",
+					round, j, hist[j].Output, expectedOutputs[j])
+			}
+			if !hist[j].ToolCalled {
+				t.Errorf("round %d: history[%d].ToolCalled = false, want true (mutation leaked!)",
+					round, j)
+			}
+		}
+	}
+
+	// Extra: verify no "INJECTED-GARBAGE" entries appeared in any round's history
+	for round := 0; round < totalRounds; round++ {
+		for j, entry := range capturedHistories[round] {
+			if entry.Output == "INJECTED-GARBAGE-1" || entry.Output == "INJECTED-GARBAGE-2" {
+				t.Errorf("round %d: history[%d] contains injected garbage entry (append leaked!)", round, j)
+			}
+		}
+	}
+}
+
+// =============================================================================
+// Behavior Preservation Tests — Tasks 4.1–4.4
+// These tests verify that existing behaviors (single-round completion, error
+// handling, MaxLoops cap, context cancellation) remain correct after the
+// history-passing changes.
+// =============================================================================
+
+// TestBehavior_SingleRoundEmptyHistory verifies that when the executor returns
+// ToolCalled: false on the very first round, it receives an empty history slice
+// and the task completes normally.
+//
+// **Validates: Requirements 4.1, 2.2**
+func TestBehavior_SingleRoundEmptyHistory(t *testing.T) {
+	s, r, _ := setup()
+
+	task := &model.Task{Description: "single-round empty history", EventType: "code"}
+	s.PublishTask(task)
+	if err := s.ClaimTask("agent-1", task.ID); err != nil {
+		t.Fatalf("ClaimTask failed: %v", err)
+	}
+
+	var receivedHistory []HistoryEntry
+	callCount := 0
+
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		callCount++
+		receivedHistory = history
+		return ExecuteResult{Output: "done-first-round", ToolCalled: false}, nil
+	}
+
+	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag.processTask(context.Background(), task.ID)
+
+	// Executor should be called exactly once
+	if callCount != 1 {
+		t.Errorf("executor call count = %d, want 1", callCount)
+	}
+
+	// History received on the first round must be empty (not nil)
+	if receivedHistory == nil {
+		t.Fatal("history should not be nil, expected empty slice")
+	}
+	if len(receivedHistory) != 0 {
+		t.Errorf("len(history) = %d, want 0 on first round", len(receivedHistory))
+	}
+
+	// Task should complete normally
+	got, err := s.GetTask(task.ID)
+	if err != nil {
+		t.Fatalf("GetTask failed: %v", err)
+	}
+	if got.Status != model.TaskStatusCompleted {
+		t.Errorf("status = %s, want completed", got.Status)
+	}
+	if got.Results["agent-1"] != "done-first-round" {
+		t.Errorf("result = %q, want %q", got.Results["agent-1"], "done-first-round")
+	}
+}
+
+// TestBehavior_ErrorDoesNotAppendHistory verifies that when the executor returns
+// an error, that round's result is NOT appended to history. Since errors cause
+// processTask to exit, we test that after a successful round followed by an
+// error round, the history length at the error round is 1 (from the first
+// successful round), and processTask exits without appending.
+//
+// **Validates: Requirements 3.3, 4.2, 4.3**
+func TestBehavior_ErrorDoesNotAppendHistory(t *testing.T) {
+	s, r, _ := setup()
+
+	task := &model.Task{Description: "error-no-append", EventType: "code"}
+	s.PublishTask(task)
+	if err := s.ClaimTask("agent-1", task.ID); err != nil {
+		t.Fatalf("ClaimTask failed: %v", err)
+	}
+
+	historyLengths := make([]int, 0, 3)
+	callCount := 0
+
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		round := callCount
+		callCount++
+		historyLengths = append(historyLengths, len(history))
+
+		switch round {
+		case 0:
+			// Round 0: success with ToolCalled=true → gets appended to history
+			return ExecuteResult{Output: "round-0-ok", ToolCalled: true}, nil
+		case 1:
+			// Round 1: returns an error → should NOT be appended; processTask exits
+			return ExecuteResult{}, errors.New("round-1-failure")
+		default:
+			t.Errorf("unexpected round %d — processTask should have exited after error", round)
+			return ExecuteResult{}, nil
+		}
+	}
+
+	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag.processTask(context.Background(), task.ID)
+
+	// Executor should be called exactly 2 times (round 0 success, round 1 error)
+	if callCount != 2 {
+		t.Fatalf("executor call count = %d, want 2", callCount)
+	}
+
+	// Round 0 should have received empty history
+	if historyLengths[0] != 0 {
+		t.Errorf("round 0: len(history) = %d, want 0", historyLengths[0])
+	}
+
+	// Round 1 should have received history of length 1 (from round 0's success)
+	if historyLengths[1] != 1 {
+		t.Errorf("round 1: len(history) = %d, want 1", historyLengths[1])
+	}
+
+	// Task should be failed (unrecoverable error)
+	got, err := s.GetTask(task.ID)
+	if err != nil {
+		t.Fatalf("GetTask failed: %v", err)
+	}
+	if got.Status != model.TaskStatusFailed {
+		t.Errorf("status = %s, want failed", got.Status)
+	}
+}
+
+// TestBehavior_MaxLoopsHistoryLength verifies that when all rounds return
+// ToolCalled: true, the last round's executor receives history of length
+// MaxLoops-1, and RetryRollback is triggered. Tests with MaxLoops = 2, 3, 5.
+//
+// **Validates: Requirements 3.5, 4.4**
+func TestBehavior_MaxLoopsHistoryLength(t *testing.T) {
+	maxLoopsValues := []int{2, 3, 5}
+
+	for _, maxLoops := range maxLoopsValues {
+		t.Run(fmt.Sprintf("MaxLoops=%d", maxLoops), func(t *testing.T) {
+			s, r, _ := setup()
+
+			task := &model.Task{Description: "maxloops-history", EventType: "code"}
+			s.PublishTask(task)
+			if err := s.ClaimTask("agent-1", task.ID); err != nil {
+				t.Fatalf("ClaimTask failed: %v", err)
+			}
+
+			historyLengths := make([]int, 0, maxLoops)
+			callCount := 0
+
+			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+				callCount++
+				historyLengths = append(historyLengths, len(history))
+				return ExecuteResult{Output: fmt.Sprintf("round-%d", callCount-1), ToolCalled: true}, nil
+			}
+
+			ag := NewAgent("agent-1", "code", s, r, executor, maxLoops)
+			ag.processTask(context.Background(), task.ID)
+
+			// Executor should be called exactly MaxLoops times
+			if callCount != maxLoops {
+				t.Fatalf("executor call count = %d, want %d", callCount, maxLoops)
+			}
+
+			// Verify history length at each round: round i gets len(history) == i
+			for i, length := range historyLengths {
+				if length != i {
+					t.Errorf("round %d: len(history) = %d, want %d", i, length, i)
+				}
+			}
+
+			// The last round should have received history of length MaxLoops-1
+			lastHistLen := historyLengths[len(historyLengths)-1]
+			if lastHistLen != maxLoops-1 {
+				t.Errorf("last round: len(history) = %d, want %d", lastHistLen, maxLoops-1)
+			}
+
+			// RetryRollback should have been triggered: task goes back to pending
+			got, err := s.GetTask(task.ID)
+			if err != nil {
+				t.Fatalf("GetTask failed: %v", err)
+			}
+			if got.Status != model.TaskStatusPending {
+				t.Errorf("status = %s, want pending (RetryRollback)", got.Status)
+			}
+			if got.RetryCount != 1 {
+				t.Errorf("RetryCount = %d, want 1", got.RetryCount)
+			}
+		})
+	}
+}
+
+// TestBehavior_ContextCancelExitsLoop verifies that when context is cancelled,
+// processTask exits immediately without continuing to call the executor.
+// An executor that cancels the context after the first round should result in
+// the executor being called at most 2 times.
+//
+// **Validates: Requirements 4.5**
+func TestBehavior_ContextCancelExitsLoop(t *testing.T) {
+	s, r, _ := setup()
+
+	task := &model.Task{Description: "ctx-cancel-exit", EventType: "code"}
+	s.PublishTask(task)
+	if err := s.ClaimTask("agent-1", task.ID); err != nil {
+		t.Fatalf("ClaimTask failed: %v", err)
+	}
+
+	callCount := 0
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	executor := func(execCtx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		callCount++
+		if callCount == 1 {
+			// Cancel the context after the first round
+			cancel()
+		}
+		return ExecuteResult{Output: fmt.Sprintf("round-%d", callCount-1), ToolCalled: true}, nil
+	}
+
+	ag := NewAgent("agent-1", "code", s, r, executor, 100)
+	ag.processTask(ctx, task.ID)
+
+	// The executor should be called at most 2 times:
+	// Round 0: succeeds, cancels context, ToolCalled=true → appended to history
+	// Round 1: may or may not execute depending on when ctx.Done() is checked
+	// But it should NOT continue beyond that.
+	if callCount > 2 {
+		t.Errorf("executor call count = %d, want at most 2 (context should stop the loop)", callCount)
+	}
+}
+
+// =============================================================================
+// Idle Retirement Tests
+// =============================================================================
+
+func TestAgent_IdleRetire_ExitsAfterThreshold(t *testing.T) {
+	s, r, _ := setup()
+	// 不发布任何任务
+
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		return ExecuteResult{Output: "done", ToolCalled: false}, nil
+	}
+
+	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag.PollInterval = 10 * time.Millisecond
+	ag.IdleThreshold = 3
+
+	done := make(chan struct{})
+	go func() {
+		ag.Run(context.Background()) // 不用 cancel，应该自行退出
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// 代理因空闲回收退出
+	case <-time.After(2 * time.Second):
+		t.Fatal("agent did not retire after idle threshold")
+	}
+}
+
+func TestAgent_IdleRetire_ResetsOnClaim(t *testing.T) {
+	s, r, _ := setup()
+
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		return ExecuteResult{Output: "done", ToolCalled: false}, nil
+	}
+
+	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag.PollInterval = 10 * time.Millisecond
+	ag.IdleThreshold = 5
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	// 在代理空转一段时间后发布任务，重置计数器
+	go func() {
+		time.Sleep(30 * time.Millisecond) // 让代理空转几轮
+		task := &model.Task{Description: "test task", EventType: "code"}
+		s.PublishTask(task)
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		ag.Run(ctx)
+		close(done)
+	}()
+
+	<-done
+
+	// 验证任务被执行完成（说明代理没有因空闲退出，而是因为 ctx timeout）
+	tasks, _ := s.ScanAll()
+	completedCount := 0
+	for _, task := range tasks {
+		if task.Status == model.TaskStatusCompleted {
+			completedCount++
+		}
+	}
+	if completedCount != 1 {
+		t.Errorf("completed tasks = %d, want 1", completedCount)
+	}
+}
+
+func TestAgent_IdleRetire_DisabledByDefault(t *testing.T) {
+	s, r, _ := setup()
+
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		return ExecuteResult{Output: "done", ToolCalled: false}, nil
+	}
+
+	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag.PollInterval = 10 * time.Millisecond
+	// IdleThreshold 默认为 0，不启用
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		ag.Run(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// 应该是因为 ctx timeout 退出，不是因为空闲回收
+	case <-time.After(2 * time.Second):
+		t.Fatal("agent did not stop")
+	}
+}
+
+// =============================================================================
+// Per-task Cancel Context Tests
+// =============================================================================
+
+func TestAgent_PerTaskCancel_StopsExecution(t *testing.T) {
+	s, r, _ := setup()
+	registry := store.NewTaskCancelRegistry()
+
+	task := &model.Task{Description: "long task", EventType: "code"}
+	s.PublishTask(task)
+
+	executorStarted := make(chan struct{})
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		close(executorStarted)
+		// 模拟长时间执行，等待 context 取消
+		<-ctx.Done()
+		return ExecuteResult{}, ctx.Err()
+	}
+
+	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag.PollInterval = 10 * time.Millisecond
+	ag.CancelRegistry = registry
+	ag.IdleThreshold = 3 // 任务取消后代理回到轮询，很快因空闲退出
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		ag.Run(ctx)
+		close(done)
+	}()
+
+	// 等待 executor 开始执行
+	select {
+	case <-executorStarted:
+	case <-time.After(1 * time.Second):
+		t.Fatal("executor did not start")
+	}
+
+	// 外部取消该任务的 context
+	registry.Cancel(task.ID)
+
+	// 代理应该：processTask 因 taskCtx 取消退出 → 回到轮询 → 因空闲回收退出
+	select {
+	case <-done:
+		// 代理退出
+	case <-time.After(2 * time.Second):
+		t.Fatal("agent did not stop after task cancel")
+	}
+
+	// 验证任务被标记为 failed（executor 返回 ctx.Err() 是不可恢复错误）
+	got, _ := s.GetTask(task.ID)
+	if got.Status != model.TaskStatusFailed {
+		t.Errorf("task status = %s, want failed", got.Status)
+	}
+}
+
+func TestAgent_PerTaskCancel_NilRegistryFallback(t *testing.T) {
+	s, r, _ := setup()
+
+	task := &model.Task{Description: "test task", EventType: "code"}
+	s.PublishTask(task)
+
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		return ExecuteResult{Output: "done", ToolCalled: false}, nil
+	}
+
+	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag.PollInterval = 10 * time.Millisecond
+	// CancelRegistry 默认 nil
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	go ag.Run(ctx)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timeout")
+		default:
+		}
+		got, _ := s.GetTask(task.ID)
+		if got.Status == model.TaskStatusCompleted {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

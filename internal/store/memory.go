@@ -31,6 +31,12 @@ type MemoryTaskStore struct {
 	fifoLimit          int
 	defaultConcurrency int
 	defaultTimeoutSec  int
+	cancelRegistry     *TaskCancelRegistry
+}
+
+// SetCancelRegistry 注入 per-task cancel context 管理器。
+func (s *MemoryTaskStore) SetCancelRegistry(r *TaskCancelRegistry) {
+	s.cancelRegistry = r
 }
 
 func NewMemoryTaskStore(eventCh chan<- model.Event, fifoLimit, defaultConcurrency, defaultTimeoutSec int) *MemoryTaskStore {
@@ -136,6 +142,9 @@ func (s *MemoryTaskStore) SubmitResult(agentID string, taskID string, result str
 		task.Status = model.TaskStatusCompleted
 		task.CompletedAt = time.Now()
 		s.addTerminal(taskID)
+		if s.cancelRegistry != nil {
+			s.cancelRegistry.Remove(taskID)
+		}
 		s.sendEvent(model.Event{Type: model.EventTaskCompleted, TaskID: taskID})
 	}
 
@@ -161,7 +170,11 @@ func (s *MemoryTaskStore) TransitionState(taskID string, from, to model.TaskStat
 
 	if model.IsTerminal(to) {
 		task.CompletedAt = time.Now()
+		task.Agents = make([]string, 0) // 清理残留代理，防止已取消任务中的代理数据残留
 		s.addTerminal(taskID)
+		if s.cancelRegistry != nil {
+			s.cancelRegistry.Cancel(taskID)
+		}
 	}
 
 	switch to {
@@ -199,6 +212,9 @@ func (s *MemoryTaskStore) RetryRollback(agentID string, taskID string, reason st
 
 	if len(task.Agents) == 0 {
 		task.Status = model.TaskStatusPending
+		if s.cancelRegistry != nil {
+			s.cancelRegistry.Cancel(taskID)
+		}
 		s.sendEvent(model.Event{Type: model.EventTaskRetry, TaskID: taskID})
 	}
 

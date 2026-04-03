@@ -534,3 +534,45 @@ func TestEventNonBlocking(t *testing.T) {
 		}
 	}
 }
+
+func TestTransitionState_ClearsAgentsOnTerminal(t *testing.T) {
+	s, _ := newTestStore(64, 100)
+
+	task := publishTestTask(t, s, "multi-agent task")
+	s.ClaimTask("agent-1", task.ID)
+	s.ClaimTask("agent-2", task.ID)
+
+	// 确认有 2 个代理
+	got, _ := s.GetTask(task.ID)
+	if len(got.Agents) != 2 {
+		t.Fatalf("precondition: agents = %d, want 2", len(got.Agents))
+	}
+
+	// 外部取消任务（如看门狗超时）
+	err := s.TransitionState(task.ID, model.TaskStatusProcessing, model.TaskStatusCancelled)
+	if err != nil {
+		t.Fatalf("TransitionState error: %v", err)
+	}
+
+	got, _ = s.GetTask(task.ID)
+	if len(got.Agents) != 0 {
+		t.Errorf("agents after cancel = %d, want 0 (should be cleared)", len(got.Agents))
+	}
+}
+
+func TestTransitionState_ClearsAgentsOnFailed(t *testing.T) {
+	s, _ := newTestStore(64, 100)
+
+	task := publishTestTask(t, s, "failing task")
+	s.ClaimTask("agent-1", task.ID)
+
+	err := s.TransitionState(task.ID, model.TaskStatusProcessing, model.TaskStatusFailed)
+	if err != nil {
+		t.Fatalf("TransitionState error: %v", err)
+	}
+
+	got, _ := s.GetTask(task.ID)
+	if len(got.Agents) != 0 {
+		t.Errorf("agents after failed = %d, want 0", len(got.Agents))
+	}
+}

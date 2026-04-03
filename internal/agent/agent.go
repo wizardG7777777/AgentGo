@@ -26,9 +26,16 @@ type ExecuteResult struct {
 	ToolCalled bool
 }
 
+// HistoryEntry 记录 ReAct 循环中单轮 TaskExecutor 调用的结果。
+// 字段与 ExecuteResult 一致，确保无损转换。
+type HistoryEntry struct {
+	Output     string
+	ToolCalled bool
+}
+
 // TaskExecutor is a pluggable function that executes a task.
 // For MVP this is injected as a mock; in production it will call the LLM.
-type TaskExecutor func(ctx context.Context, task *model.Task, depResults map[string]string) (ExecuteResult, error)
+type TaskExecutor func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error)
 
 type Agent struct {
 	ID           string
@@ -36,8 +43,10 @@ type Agent struct {
 	Store        store.TaskStore
 	Roster       roster.Roster
 	Execute      TaskExecutor
-	MaxLoops     int
-	PollInterval time.Duration
+	MaxLoops       int
+	PollInterval   time.Duration
+	IdleThreshold  int // 连续空轮询退出阈值，0 表示禁用
+	CancelRegistry *store.TaskCancelRegistry
 }
 
 // Run starts the agent's main loop. It polls for available tasks and processes them.
@@ -49,6 +58,8 @@ func (a *Agent) Run(ctx context.Context) {
 		}
 	}()
 
+	idleCount := 0
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -59,11 +70,21 @@ func (a *Agent) Run(ctx context.Context) {
 		tasks, err := a.Store.QueryAvailable(a.EventType)
 		if err != nil {
 			log.Printf("[agent %s] QueryAvailable error: %v", a.ID, err)
+			idleCount++
+			if a.shouldRetire(idleCount) {
+				log.Printf("[agent %s] 空闲回收：连续空轮询 %d 次，退出", a.ID, idleCount)
+				return
+			}
 			a.sleep(ctx)
 			continue
 		}
 
 		if len(tasks) == 0 {
+			idleCount++
+			if a.shouldRetire(idleCount) {
+				log.Printf("[agent %s] 空闲回收：连续空轮询 %d 次，退出", a.ID, idleCount)
+				return
+			}
 			a.sleep(ctx)
 			continue
 		}
@@ -72,13 +93,23 @@ func (a *Agent) Run(ctx context.Context) {
 		claimed := false
 		for _, task := range tasks {
 			if err := a.Store.ClaimTask(a.ID, task.ID); err == nil {
-				a.processTask(ctx, task.ID)
+				idleCount = 0
+				taskCtx := ctx
+				if a.CancelRegistry != nil {
+					taskCtx = a.CancelRegistry.GetOrCreate(ctx, task.ID)
+				}
+				a.processTask(taskCtx, task.ID)
 				claimed = true
 				break
 			}
 		}
 
 		if !claimed {
+			idleCount++
+			if a.shouldRetire(idleCount) {
+				log.Printf("[agent %s] 空闲回收：连续空轮询 %d 次，退出", a.ID, idleCount)
+				return
+			}
 			a.sleep(ctx)
 		}
 	}
@@ -97,6 +128,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	}
 
 	var lastOutput string
+	history := make([]HistoryEntry, 0)
 
 	for i := 0; i < a.MaxLoops; i++ {
 		select {
@@ -105,7 +137,11 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		default:
 		}
 
-		result, execErr := a.Execute(ctx, task, depResults)
+		// 构建只读副本传入 executor
+		histCopy := make([]HistoryEntry, len(history))
+		copy(histCopy, history)
+
+		result, execErr := a.Execute(ctx, task, depResults, histCopy)
 
 		if execErr != nil {
 			a.handleFailure(taskID, execErr)
@@ -120,6 +156,12 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			}
 			return
 		}
+
+		// ToolCalled == true：追加到历史，继续循环
+		history = append(history, HistoryEntry{
+			Output:     result.Output,
+			ToolCalled: result.ToolCalled,
+		})
 	}
 
 	reason := fmt.Sprintf("因循环上限终止: 已执行 %d 轮，部分结果: %s", a.MaxLoops, lastOutput)
@@ -146,6 +188,10 @@ func (a *Agent) handleFailure(taskID string, execErr error) {
 			log.Printf("[agent %s] TransitionState to failed: %v", a.ID, err)
 		}
 	}
+}
+
+func (a *Agent) shouldRetire(idleCount int) bool {
+	return a.IdleThreshold > 0 && idleCount >= a.IdleThreshold
 }
 
 func (a *Agent) sleep(ctx context.Context) {

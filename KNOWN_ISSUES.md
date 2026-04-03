@@ -2,27 +2,15 @@
 
 本文档记录 MVP 阶段已知的设计缺陷和未实现的功能，供调试和后续迭代参考。
 
-## 代理空闲回收未实现
+## ~~代理空闲回收未实现~~ （已修复，简化 MVP）
 
-**位置**: `internal/agent/agent.go` Run 方法
-
-**现象**: 当所有任务并发数已满时，代理会以 500ms 间隔持续空转轮询 QueryAvailable，不会自行退出。
-
-**影响**: 大量空闲代理浪费 goroutine 资源，违反架构文档中"长时间空闲且系统代理数超过最低保留数量时销毁"的设计（Archtechture.md 第 44 行）。
-
-**建议修复**: 加入空闲计数器，连续空轮询超过阈值后代理自行退出 goroutine。
+Agent 结构体新增 `IdleThreshold` 字段，Run 方法中加入空闲计数器，连续空轮询（无任务、claim 失败、查询出错）达到阈值后自行退出。`IdleThreshold=0` 时禁用（向后兼容）。Config 新增 `agent_idle_threshold` 配置项。注意：架构要求的"系统代理数超过最低保留数量"条件未实现，留待后续迭代。
 
 ---
 
-## 代理间无实时事件感知
+## ~~代理间无实时事件感知~~ （已修复，方案 C）
 
-**位置**: `internal/store/memory.go` sendEvent 方法
-
-**现象**: 事件 channel 只有调度器持有读端，执行代理无法实时感知公告板变化（如任务被取消）。代理在执行途中只能依赖 context 取消来停止。
-
-**影响**: 如果任务被看门狗取消但 context 未被取消，代理可能继续执行已取消的任务，浪费资源。
-
-**建议修复**: 将 sendEvent 改为广播模式，代理可订阅事件 channel。改动范围小，只需修改 sendEvent 方法和 Agent 结构体。
+采用 per-task cancel context 方案替代广播模式。新增 `TaskCancelRegistry` 组件管理 taskID→CancelFunc 映射。代理 ClaimTask 成功后通过 registry 获取 per-task context 传入 processTask。看门狗/调度器调用 TransitionState 到 terminal 状态时，Store 内部自动调用 `Registry.Cancel(taskID)`，正在执行该任务的代理通过 `ctx.Done()` 立即感知。不修改 TaskStore 接口签名，registry 通过 setter 注入，nil 时无影响。
 
 ---
 
@@ -38,15 +26,9 @@
 
 ---
 
-## 代理 ReAct 循环未实现
+## ~~代理 ReAct 循环未实现~~ （已修复）
 
-**位置**: `internal/agent/agent.go` Run / processTask 方法
-
-**现象**: `MaxLoops` 字段在 Agent 结构体中已定义并在 NewAgent 中初始化，但从未被使用。代理只调用一次 `TaskExecutor` 就结束，缺少架构文档描述的多轮 LLM ReAct 循环结构（观察→思考→行动→循环判定）。
-
-**影响**: 代理无法进行多步推理和多次工具调用，无法完成需要迭代的复杂任务。同时，达到循环上限时的重试回退路径（processing→pending，写入"因循环上限终止"标注）也未实现。
-
-**建议修复**: 在 processTask 中实现 for 循环，每轮调用 LLM/TaskExecutor，检查是否需要继续（LLM 是否调用了工具），并在达到 MaxLoops 时触发 RetryRollback。
+已通过引入 `ExecuteResult` 结构体和 `processTask` 循环修复。循环上限触发 RetryRollback 并写入"因循环上限终止"标注。后续增强：executor 已支持接收 `[]HistoryEntry` 历史步骤。
 
 ---
 
@@ -62,48 +44,24 @@
 
 ---
 
-## 看门狗缺少花名册兜底清理职责
+## ~~看门狗缺少花名册兜底清理职责~~ （已修复）
 
-**位置**: `internal/watchdog/watchdog.go` Watchdog 结构体 / inspect 方法
-
-**现象**: 架构文档要求看门狗作为 defer 机制的最后一道防线，定期清理因极端情况（如进程级崩溃）残留的花名册声明。但 Watchdog 结构体中没有 Roster 字段，inspect 方法中也没有任何花名册清理逻辑。
-
-**影响**: 如果代理因极端情况退出且 defer 未执行，其花名册声明将永久残留，导致对应文件被永久锁定。
-
-**建议修复**: 在 Watchdog 结构体中添加 `Roster roster.Roster` 字段，在 inspect 方法中对比公告板中活跃代理列表与花名册声明，清理不属于任何活跃代理的残留声明。
+Watchdog 结构体已添加 `Roster` 字段，`inspect` 方法末尾调用 `cleanupStaleClaims`，通过 `Roster.ListAllAgents()` 获取所有持有声明的代理，与 processing 任务中的活跃代理对比，清理残留声明。Roster 接口新增 `ListAllAgents()` 方法。
 
 ---
 
-## 配置加载不支持 JSON 格式
+## ~~配置加载不支持 JSON 格式~~ （已修复）
 
-**位置**: `internal/config/config.go` LoadConfig 方法
-
-**现象**: 架构文档声明支持 `setting.yaml` 或 `setting.json`，但 LoadConfig 硬编码使用 `yaml.Unmarshal`，不判断文件扩展名，JSON 文件会解析失败。
-
-**影响**: 用户无法使用 JSON 格式的配置文件。
-
-**建议修复**: 根据文件扩展名判断格式，`.json` 使用 `encoding/json`，`.yaml`/`.yml` 使用 `gopkg.in/yaml.v3`。
+`LoadConfig` 已根据文件扩展名判断格式：`.json` 使用 `encoding/json`，其他使用 `gopkg.in/yaml.v3`。Config 结构体已添加 `json` tag。
 
 ---
 
-## 看门狗重启循环缺少延迟控制
+## ~~看门狗重启循环缺少延迟控制~~ （已修复）
 
-**位置**: `internal/bootstrap/bootstrap.go` runWatchdogWithRecover 方法
-
-**现象**: 当 `Watchdog.Run()` 因 `ctx.Done()` 正常返回后，外层 for 循环会立即再次调用 `Run()`，在 ctx 已取消的情况下形成空转热循环。
-
-**影响**: 系统关闭时可能短暂占用 CPU 资源。
-
-**建议修复**: 在循环体开头优先检查 `ctx.Done()`，或在 panic 恢复后添加短暂延迟（如 1 秒），避免频繁重启。
+`runWatchdogWithRecover` 循环体末尾添加了 1 秒延迟和 `ctx.Done()` 检查，防止 panic 恢复后热循环和 ctx 取消后空转。
 
 ---
 
-## 启动完成提示信息不完整
+## ~~启动完成提示信息不完整~~ （已修复）
 
-**位置**: `internal/bootstrap/bootstrap.go` Start 方法
-
-**现象**: 架构文档要求最终打印 `[启动] 系统就绪，等待用户输入`，实际只打印 `[启动] 系统就绪`。
-
-**影响**: 与架构文档描述不一致，但功能无影响。
-
-**建议修复**: 将提示修改为 `[启动] 系统就绪，等待用户输入`。
+提示已修改为 `[启动] 系统就绪，等待用户输入`。
