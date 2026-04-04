@@ -1,4 +1,9 @@
 max_retry: 3
+llm_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+llm_api_key: sk-59c38569633348b1a906e46a63b600de
+llm_timeout_sec: 300
+llm_model: qwen3.6-plus
+explorer_model: qwen3.6-plus
 default_concurrency: 2
 fifo_limit: 100
 watchdog_interval_sec: 30

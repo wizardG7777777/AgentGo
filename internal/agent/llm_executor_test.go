@@ -59,14 +59,14 @@ func TestLLMExecutor_WithToolCalls(t *testing.T) {
 			{
 				Content: "",
 				ToolCalls: []llm.ToolCall{
-					{ID: "call_1", Name: "read_file", Arguments: map[string]string{"path": "/tmp/a.txt"}},
+					{ID: "call_1", Name: "read_file", Arguments: map[string]any{"path": "/tmp/a.txt"}},
 				},
 			},
 		},
 	}
 
 	tools := NewToolRegistry()
-	tools.Register("read_file", "读取文件", nil, func(ctx context.Context, args map[string]string) (string, error) {
+	tools.Register("read_file", "读取文件", nil, func(ctx context.Context, args map[string]any) (string, error) {
 		return "file content: hello", nil
 	})
 
@@ -83,6 +83,17 @@ func TestLLMExecutor_WithToolCalls(t *testing.T) {
 	if result.Output == "" {
 		t.Error("expected non-empty output from tool dispatch")
 	}
+	// 验证新增字段：ToolCalls 和 ToolResults 被正确填充
+	if len(result.ToolCalls) != 1 {
+		t.Errorf("ToolCalls count = %d, want 1", len(result.ToolCalls))
+	}
+	if len(result.ToolResults) != 1 {
+		t.Errorf("ToolResults count = %d, want 1", len(result.ToolResults))
+	} else {
+		if result.ToolResults[0].ToolCallID != "call_1" {
+			t.Errorf("ToolResults[0].ToolCallID = %q, want %q", result.ToolResults[0].ToolCallID, "call_1")
+		}
+	}
 }
 
 func TestLLMExecutor_ToolError_IncludedInOutput(t *testing.T) {
@@ -97,7 +108,7 @@ func TestLLMExecutor_ToolError_IncludedInOutput(t *testing.T) {
 	}
 
 	tools := NewToolRegistry()
-	tools.Register("bad_tool", "会失败的工具", nil, func(ctx context.Context, args map[string]string) (string, error) {
+	tools.Register("bad_tool", "会失败的工具", nil, func(ctx context.Context, args map[string]any) (string, error) {
 		return "", errors.New("读取失败")
 	})
 
@@ -195,15 +206,53 @@ func TestLLMExecutor_HistoryPassedToLLM(t *testing.T) {
 	executor := NewLLMExecutor(mock, tools)
 	task := &model.Task{Description: "多轮任务"}
 	history := []HistoryEntry{
-		{Output: "第一轮结果", ToolCalled: true},
-		{Output: "第二轮结果", ToolCalled: true},
+		{
+			Output:           "[read_file] hello\n",
+			ToolCalled:       true,
+			AssistantContent: "我来读取文件",
+			ToolCalls: []llm.ToolCall{
+				{ID: "call_1", Name: "read_file", Arguments: map[string]any{"path": "/tmp/a.txt"}},
+			},
+			ToolResults: []ToolResult{
+				{ToolCallID: "call_1", Content: "hello"},
+			},
+		},
+		{
+			Output:           "[write_file] ok\n",
+			ToolCalled:       true,
+			AssistantContent: "我来写入文件",
+			ToolCalls: []llm.ToolCall{
+				{ID: "call_2", Name: "write_file", Arguments: map[string]any{"path": "/tmp/b.txt"}},
+			},
+			ToolResults: []ToolResult{
+				{ToolCallID: "call_2", Content: "ok"},
+			},
+		},
 	}
 
 	executor(context.Background(), task, nil, history)
 
 	msgs := mock.captured[0]
-	// user message + 2 history entries = 3 messages
-	if len(msgs) != 3 {
-		t.Errorf("messages count = %d, want 3 (1 user + 2 history)", len(msgs))
+	// user(1) + [assistant+tool](2) + [assistant+tool](2) = 5 messages
+	if len(msgs) != 5 {
+		t.Errorf("messages count = %d, want 5 (1 user + 2*(assistant+tool))", len(msgs))
+	}
+
+	// 验证消息角色序列
+	expectedRoles := []string{"user", "assistant", "tool", "assistant", "tool"}
+	for i, exp := range expectedRoles {
+		if msgs[i].Role != exp {
+			t.Errorf("msgs[%d].Role = %q, want %q", i, msgs[i].Role, exp)
+		}
+	}
+
+	// 验证 assistant 消息携带 ToolCalls
+	if len(msgs[1].ToolCalls) != 1 {
+		t.Errorf("msgs[1].ToolCalls count = %d, want 1", len(msgs[1].ToolCalls))
+	}
+
+	// 验证 tool 消息携带 ToolCallID
+	if msgs[2].ToolCallID != "call_1" {
+		t.Errorf("msgs[2].ToolCallID = %q, want %q", msgs[2].ToolCallID, "call_1")
 	}
 }

@@ -50,7 +50,7 @@ func TestScheduler_UserInput_PublishesTask(t *testing.T) {
 					{
 						ID:   "call_1",
 						Name: "publish_task",
-						Arguments: map[string]string{
+						Arguments: map[string]any{
 							"description": "分析 auth 模块",
 							"event_type":  "explore",
 							"priority":    "5",
@@ -100,7 +100,7 @@ func TestScheduler_CancelTask(t *testing.T) {
 		responses: []llm.Response{
 			{
 				ToolCalls: []llm.ToolCall{
-					{ID: "call_1", Name: "cancel_task", Arguments: map[string]string{"task_id": "", "reason": "不需要"}},
+					{ID: "call_1", Name: "cancel_task", Arguments: map[string]any{"task_id": "", "reason": "不需要"}},
 				},
 			},
 			{Content: "done"},
@@ -130,7 +130,7 @@ func TestScheduler_ReportDone(t *testing.T) {
 		responses: []llm.Response{
 			{
 				ToolCalls: []llm.ToolCall{
-					{ID: "call_1", Name: "report_done", Arguments: map[string]string{"summary": "全部完成"}},
+					{ID: "call_1", Name: "report_done", Arguments: map[string]any{"summary": "全部完成"}},
 				},
 			},
 			{Content: ""},
@@ -160,12 +160,12 @@ func TestScheduler_MaxLoops(t *testing.T) {
 	// LLM 持续返回工具调用，应在 MaxLoops 后停止
 	mock := &mockLLMClient{
 		responses: []llm.Response{
-			{ToolCalls: []llm.ToolCall{{ID: "1", Name: "publish_task", Arguments: map[string]string{"description": "task1"}}}},
-			{ToolCalls: []llm.ToolCall{{ID: "2", Name: "publish_task", Arguments: map[string]string{"description": "task2"}}}},
-			{ToolCalls: []llm.ToolCall{{ID: "3", Name: "publish_task", Arguments: map[string]string{"description": "task3"}}}},
-			{ToolCalls: []llm.ToolCall{{ID: "4", Name: "publish_task", Arguments: map[string]string{"description": "task4"}}}},
-			{ToolCalls: []llm.ToolCall{{ID: "5", Name: "publish_task", Arguments: map[string]string{"description": "task5"}}}},
-			{ToolCalls: []llm.ToolCall{{ID: "6", Name: "publish_task", Arguments: map[string]string{"description": "should not reach"}}}},
+			{ToolCalls: []llm.ToolCall{{ID: "1", Name: "publish_task", Arguments: map[string]any{"description": "task1"}}}},
+			{ToolCalls: []llm.ToolCall{{ID: "2", Name: "publish_task", Arguments: map[string]any{"description": "task2"}}}},
+			{ToolCalls: []llm.ToolCall{{ID: "3", Name: "publish_task", Arguments: map[string]any{"description": "task3"}}}},
+			{ToolCalls: []llm.ToolCall{{ID: "4", Name: "publish_task", Arguments: map[string]any{"description": "task4"}}}},
+			{ToolCalls: []llm.ToolCall{{ID: "5", Name: "publish_task", Arguments: map[string]any{"description": "task5"}}}},
+			{ToolCalls: []llm.ToolCall{{ID: "6", Name: "publish_task", Arguments: map[string]any{"description": "should not reach"}}}},
 		},
 	}
 
@@ -268,7 +268,7 @@ func TestScheduler_PublishTaskWithDependencies(t *testing.T) {
 					{
 						ID:   "call_1",
 						Name: "publish_task",
-						Arguments: map[string]string{
+						Arguments: map[string]any{
 							"description":  "依赖任务",
 							"dependencies": "task-a, task-b",
 						},

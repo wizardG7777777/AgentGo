@@ -16,7 +16,7 @@ func TestToolRegistry_Register_And_Defs(t *testing.T) {
 		"properties": map[string]any{
 			"path": map[string]any{"type": "string"},
 		},
-	}, func(ctx context.Context, args map[string]string) (string, error) {
+	}, func(ctx context.Context, args map[string]any) (string, error) {
 		return "", nil
 	})
 
@@ -25,7 +25,7 @@ func TestToolRegistry_Register_And_Defs(t *testing.T) {
 		"properties": map[string]any{
 			"pattern": map[string]any{"type": "string"},
 		},
-	}, func(ctx context.Context, args map[string]string) (string, error) {
+	}, func(ctx context.Context, args map[string]any) (string, error) {
 		return "", nil
 	})
 
@@ -43,14 +43,15 @@ func TestToolRegistry_Register_And_Defs(t *testing.T) {
 
 func TestToolRegistry_Dispatch_Success(t *testing.T) {
 	r := NewToolRegistry()
-	r.Register("echo", "回显", nil, func(ctx context.Context, args map[string]string) (string, error) {
-		return "echo: " + args["text"], nil
+	r.Register("echo", "回显", nil, func(ctx context.Context, args map[string]any) (string, error) {
+		text, _ := args["text"].(string)
+		return "echo: " + text, nil
 	})
 
 	result, err := r.Dispatch(context.Background(), llm.ToolCall{
 		ID:        "call_1",
 		Name:      "echo",
-		Arguments: map[string]string{"text": "hello"},
+		Arguments: map[string]any{"text": "hello"},
 	})
 
 	if err != nil {
@@ -76,7 +77,7 @@ func TestToolRegistry_Dispatch_UnknownTool(t *testing.T) {
 
 func TestToolRegistry_Dispatch_ToolError(t *testing.T) {
 	r := NewToolRegistry()
-	r.Register("fail_tool", "总是失败", nil, func(ctx context.Context, args map[string]string) (string, error) {
+	r.Register("fail_tool", "总是失败", nil, func(ctx context.Context, args map[string]any) (string, error) {
 		return "", errors.New("tool failed")
 	})
 
@@ -94,7 +95,7 @@ func TestToolRegistry_Dispatch_Context(t *testing.T) {
 	r := NewToolRegistry()
 
 	var receivedCtx context.Context
-	r.Register("ctx_tool", "检查 context", nil, func(ctx context.Context, args map[string]string) (string, error) {
+	r.Register("ctx_tool", "检查 context", nil, func(ctx context.Context, args map[string]any) (string, error) {
 		receivedCtx = ctx
 		return "ok", nil
 	})

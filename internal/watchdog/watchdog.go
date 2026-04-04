@@ -2,6 +2,7 @@ package watchdog
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math/rand"
 	"time"
@@ -76,43 +77,39 @@ func (w *Watchdog) checkTask(task *model.Task) {
 }
 
 func (w *Watchdog) checkProcessingTask(task *model.Task) {
-	// Timeout detection: processing time > timeout * 1.1
+	// 超时检测：processing 时间 > timeout * 1.1
 	if task.TimeoutSeconds > 0 && !task.StartedAt.IsZero() {
 		threshold := time.Duration(float64(task.TimeoutSeconds)*1.1) * time.Second
 		if time.Since(task.StartedAt) > threshold {
 			log.Printf("[watchdog] task %s timeout detected (elapsed: %v, threshold: %v)", task.ID, time.Since(task.StartedAt), threshold)
-			if err := w.Store.TransitionState(task.ID, model.TaskStatusProcessing, model.TaskStatusFailed); err != nil {
-				log.Printf("[watchdog] failed to transition task %s to failed: %v", task.ID, err)
+			reason := fmt.Sprintf("任务超时：已运行 %v，阈值 %v", time.Since(task.StartedAt).Round(time.Second), threshold)
+			if err := w.Store.FailTaskBySystem(task.ID, reason); err != nil {
+				log.Printf("[watchdog] FailTaskBySystem task %s failed: %v", task.ID, err)
 			}
 			w.sendAlert(task.ID)
 			return
 		}
 	}
 
-	// Cascade cancellation: dependency failed or cancelled while processing
+	// 级联取消：依赖任务失败或被取消
 	for _, depID := range task.Dependencies {
 		dep, err := w.Store.GetTask(depID)
 		if err != nil {
 			log.Printf("[watchdog] task %s dependency %s not found (processing), cancelling", task.ID, depID)
-			w.Store.TransitionState(task.ID, model.TaskStatusProcessing, model.TaskStatusCancelled)
+			if err := w.Store.TransitionState(task.ID, model.TaskStatusProcessing, model.TaskStatusCancelled); err != nil {
+				log.Printf("[watchdog] 级联取消 task %s 失败: %v", task.ID, err)
+			}
 			w.sendAlert(task.ID)
 			return
 		}
 		if dep.Status == model.TaskStatusFailed || dep.Status == model.TaskStatusCancelled {
 			log.Printf("[watchdog] task %s dependency %s is %s (processing), cascade cancelling", task.ID, depID, dep.Status)
-			w.Store.TransitionState(task.ID, model.TaskStatusProcessing, model.TaskStatusCancelled)
+			if err := w.Store.TransitionState(task.ID, model.TaskStatusProcessing, model.TaskStatusCancelled); err != nil {
+				log.Printf("[watchdog] 级联取消 task %s 失败: %v", task.ID, err)
+			}
 			w.sendAlert(task.ID)
 			return
 		}
-	}
-
-	// Retry exhaustion: retryCount >= maxRetry while processing
-	if task.RetryCount >= w.Config.MaxRetry {
-		log.Printf("[watchdog] task %s retry exhausted (%d >= %d)", task.ID, task.RetryCount, w.Config.MaxRetry)
-		if err := w.Store.TransitionState(task.ID, model.TaskStatusProcessing, model.TaskStatusCancelled); err != nil {
-			log.Printf("[watchdog] failed to cancel task %s: %v", task.ID, err)
-		}
-		w.sendAlert(task.ID)
 	}
 }
 
@@ -130,31 +127,26 @@ func (w *Watchdog) checkPendingTask(task *model.Task) {
 		}
 	}
 
-	// Cascade cancellation: dependency failed or cancelled
+	// 级联取消：依赖任务失败或被取消
 	for _, depID := range task.Dependencies {
 		dep, err := w.Store.GetTask(depID)
 		if err != nil {
-			// Dependency missing, treat as failed
+			// 依赖缺失，视为失败
 			log.Printf("[watchdog] task %s dependency %s not found, cancelling", task.ID, depID)
-			w.Store.TransitionState(task.ID, model.TaskStatusPending, model.TaskStatusCancelled)
+			if err := w.Store.TransitionState(task.ID, model.TaskStatusPending, model.TaskStatusCancelled); err != nil {
+				log.Printf("[watchdog] 级联取消 task %s 失败: %v", task.ID, err)
+			}
 			w.sendAlert(task.ID)
 			return
 		}
 		if dep.Status == model.TaskStatusFailed || dep.Status == model.TaskStatusCancelled {
 			log.Printf("[watchdog] task %s dependency %s is %s, cascade cancelling", task.ID, depID, dep.Status)
-			w.Store.TransitionState(task.ID, model.TaskStatusPending, model.TaskStatusCancelled)
+			if err := w.Store.TransitionState(task.ID, model.TaskStatusPending, model.TaskStatusCancelled); err != nil {
+				log.Printf("[watchdog] 级联取消 task %s 失败: %v", task.ID, err)
+			}
 			w.sendAlert(task.ID)
 			return
 		}
-	}
-
-	// Retry exhaustion for pending tasks
-	if task.RetryCount >= w.Config.MaxRetry {
-		log.Printf("[watchdog] task %s retry exhausted in pending (%d >= %d)", task.ID, task.RetryCount, w.Config.MaxRetry)
-		if err := w.Store.TransitionState(task.ID, model.TaskStatusPending, model.TaskStatusCancelled); err != nil {
-			log.Printf("[watchdog] failed to cancel task %s: %v", task.ID, err)
-		}
-		w.sendAlert(task.ID)
 	}
 }
 

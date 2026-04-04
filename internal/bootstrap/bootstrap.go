@@ -17,6 +17,7 @@ import (
 	"agentgo/internal/scheduler"
 	"agentgo/internal/store"
 	"agentgo/internal/watchdog"
+	"agentgo/internal/worker"
 )
 
 type System struct {
@@ -28,14 +29,15 @@ type System struct {
 	CancelRegistry *store.TaskCancelRegistry
 	Scheduler      *scheduler.Scheduler
 	Explorer       *explorer.Explorer
+	Worker         *worker.Worker
 	CLI            *cli.CLI
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
 }
 
-func Bootstrap(configPath string) (*System, error) {
+func Bootstrap(configPath string, explicit bool) (*System, error) {
 	// Step 1: 加载配置
-	cfg, err := config.LoadConfig(configPath)
+	cfg, err := config.LoadConfig(configPath, explicit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
@@ -73,6 +75,14 @@ func Bootstrap(configPath string) (*System, error) {
 	// Step 7: 创建调查代理
 	exp := explorer.New(taskStore, r, explorerLLM, cfg, cancelRegistry)
 
+	// Step 8: 创建执行代理（使用主 LLM，认领 event_type="" 的执行任务）
+	workerLLM := llm.NewSDKClient(
+		cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel,
+		"", // system prompt 由 worker 内部管理
+		time.Duration(cfg.LLMTimeoutSec)*time.Second,
+	)
+	wk := worker.New(taskStore, r, workerLLM, cfg, cancelRegistry)
+
 	sys := &System{
 		Config:         cfg,
 		Store:          taskStore,
@@ -82,6 +92,7 @@ func Bootstrap(configPath string) (*System, error) {
 		CancelRegistry: cancelRegistry,
 		Scheduler:      sched,
 		Explorer:       exp,
+		Worker:         wk,
 	}
 
 	return sys, nil
@@ -114,6 +125,14 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
 		s.Explorer.Run(ctx)
 	}()
 	fmt.Println("[启动] 调查代理已启动")
+
+	// Step 8: 启动执行代理
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.Worker.Run(ctx)
+	}()
+	fmt.Println("[启动] 执行代理已启动")
 
 	fmt.Println("[启动] 系统就绪，等待用户输入")
 }

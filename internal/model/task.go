@@ -49,6 +49,7 @@ type Task struct {
 	Error          string
 	RetryCount     int
 	RetryReasons   []string
+	LastHistory    []byte // JSON 序列化的历史记录，重试时恢复上下文
 	TimeoutSeconds int
 	EventSource    string
 	EventType      string

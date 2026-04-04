@@ -7,10 +7,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // openaiResponse 构造 OpenAI 格式的响应 JSON。
 func openaiResponse(content string, toolCalls []map[string]any) map[string]any {
+	return openaiResponseWithFinish(content, toolCalls, "stop")
+}
+
+func openaiResponseWithFinish(content string, toolCalls []map[string]any, finishReason string) map[string]any {
 	msg := map[string]any{
 		"role":    "assistant",
 		"content": content,
@@ -25,7 +30,7 @@ func openaiResponse(content string, toolCalls []map[string]any) map[string]any {
 			{
 				"index":         0,
 				"message":       msg,
-				"finish_reason": "stop",
+				"finish_reason": finishReason,
 			},
 		},
 		"usage": map[string]any{
@@ -43,7 +48,7 @@ func TestSDKClient_Chat_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL, "test-key", "gpt-4o", "", 0)
+	client := NewSDKClient(server.URL, "test-key", "gpt-4o", "", 30*time.Second)
 	resp, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "hello"}}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -54,11 +59,14 @@ func TestSDKClient_Chat_Success(t *testing.T) {
 	if len(resp.ToolCalls) != 0 {
 		t.Errorf("tool calls = %d, want 0", len(resp.ToolCalls))
 	}
+	if resp.FinishReason != FinishReasonStop {
+		t.Errorf("finish_reason = %q, want %q", resp.FinishReason, FinishReasonStop)
+	}
 }
 
 func TestSDKClient_Chat_WithToolCalls(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		resp := openaiResponse("", []map[string]any{
+		resp := openaiResponseWithFinish("", []map[string]any{
 			{
 				"id":   "call_abc",
 				"type": "function",
@@ -67,13 +75,13 @@ func TestSDKClient_Chat_WithToolCalls(t *testing.T) {
 					"arguments": `{"path":"/tmp/a.txt"}`,
 				},
 			},
-		})
+		}, "tool_calls")
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL, "test-key", "gpt-4o", "", 0)
+	client := NewSDKClient(server.URL, "test-key", "gpt-4o", "", 30*time.Second)
 	resp, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "read file"}}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -89,7 +97,10 @@ func TestSDKClient_Chat_WithToolCalls(t *testing.T) {
 		t.Errorf("tool call name = %q, want %q", tc.Name, "read_file")
 	}
 	if tc.Arguments["path"] != "/tmp/a.txt" {
-		t.Errorf("tool call args[path] = %q, want %q", tc.Arguments["path"], "/tmp/a.txt")
+		t.Errorf("tool call args[path] = %v, want %q", tc.Arguments["path"], "/tmp/a.txt")
+	}
+	if resp.FinishReason != FinishReasonToolCalls {
+		t.Errorf("finish_reason = %q, want %q", resp.FinishReason, FinishReasonToolCalls)
 	}
 }
 
@@ -102,7 +113,7 @@ func TestSDKClient_Chat_SystemPrompt(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL, "key", "gpt-4o", "你是任务调度器", 0)
+	client := NewSDKClient(server.URL, "key", "gpt-4o", "你是任务调度器", 30*time.Second)
 	client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
 
 	messages, ok := capturedBody["messages"].([]any)
@@ -110,7 +121,6 @@ func TestSDKClient_Chat_SystemPrompt(t *testing.T) {
 		t.Fatalf("messages count insufficient: %v", capturedBody["messages"])
 	}
 	firstMsg := messages[0].(map[string]any)
-	// SDK 用 "developer" role 发送 system prompt
 	role := firstMsg["role"].(string)
 	if role != "developer" && role != "system" {
 		t.Errorf("first message role = %q, want 'developer' or 'system'", role)
@@ -130,8 +140,7 @@ func TestSDKClient_Chat_401_Unrecoverable(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// SDK 默认重试 2 次，401 不在重试范围内，应立即返回
-	client := NewSDKClient(server.URL, "bad-key", "gpt-4o", "", 0)
+	client := NewSDKClient(server.URL, "bad-key", "gpt-4o", "", 30*time.Second)
 	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
 
 	var unrecoverable *ErrUnrecoverable
@@ -153,11 +162,7 @@ func TestSDKClient_Chat_429_Recoverable(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// 禁用重试以加快测试
-	client := NewSDKClient(server.URL+"/v1", "key", "gpt-4o", "", 0)
-	// 直接用 SDK 的 client 覆盖，设置 0 重试
-	// 由于我们无法直接修改已创建的 client 的重试次数，
-	// 我们接受 SDK 会重试 2 次后返回错误
+	client := NewSDKClient(server.URL+"/v1", "key", "gpt-4o", "", 30*time.Second)
 	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
 
 	var recoverable *ErrRecoverable
@@ -172,12 +177,92 @@ func TestSDKClient_Chat_ContextCancel(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL, "key", "gpt-4o", "", 0)
+	client := NewSDKClient(server.URL, "key", "gpt-4o", "", 30*time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // 立即取消
 
 	_, err := client.Chat(ctx, []Message{{Role: "user", Content: "test"}}, nil)
 	if err == nil {
 		t.Fatal("expected error from cancelled context")
+	}
+}
+
+func TestSDKClient_Chat_FinishReasonLength_ReturnsBadResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openaiResponseWithFinish("partial...", nil, "length"))
+	}))
+	defer server.Close()
+
+	client := NewSDKClient(server.URL, "key", "gpt-4o", "", 30*time.Second)
+	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
+
+	var badResp *ErrBadResponse
+	if !errors.As(err, &badResp) {
+		t.Errorf("expected ErrBadResponse for length truncation, got %T: %v", err, err)
+	}
+}
+
+func TestSDKClient_Chat_FinishReasonContentFilter_ReturnsUnrecoverable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openaiResponseWithFinish("", nil, "content_filter"))
+	}))
+	defer server.Close()
+
+	client := NewSDKClient(server.URL, "key", "gpt-4o", "", 30*time.Second)
+	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
+
+	var unrecov *ErrUnrecoverable
+	if !errors.As(err, &unrecov) {
+		t.Errorf("expected ErrUnrecoverable for content_filter, got %T: %v", err, err)
+	}
+}
+
+func TestSDKClient_Chat_BadToolCallJSON_ReturnsBadResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := openaiResponseWithFinish("", []map[string]any{
+			{
+				"id":   "call_bad",
+				"type": "function",
+				"function": map[string]any{
+					"name":      "some_tool",
+					"arguments": `{invalid json`,
+				},
+			},
+		}, "tool_calls")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewSDKClient(server.URL, "key", "gpt-4o", "", 30*time.Second)
+	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
+
+	var badResp *ErrBadResponse
+	if !errors.As(err, &badResp) {
+		t.Errorf("expected ErrBadResponse for bad JSON, got %T: %v", err, err)
+	}
+}
+
+func TestConvertMessage_UnknownRole_ReturnsError(t *testing.T) {
+	_, err := convertMessage(Message{Role: "bogus", Content: "test"})
+	if err == nil {
+		t.Fatal("expected error for unknown role")
+	}
+	var unknownRole *ErrUnknownRole
+	if !errors.As(err, &unknownRole) {
+		t.Errorf("expected ErrUnknownRole, got %T: %v", err, err)
+	}
+	if unknownRole.Role != "bogus" {
+		t.Errorf("role = %q, want %q", unknownRole.Role, "bogus")
+	}
+}
+
+func TestDefaultTimeout_Applied(t *testing.T) {
+	// timeout=0 应使用默认值，不应 panic
+	client := NewSDKClient("http://localhost:1", "key", "gpt-4o", "", 0)
+	if client == nil {
+		t.Fatal("expected non-nil client with default timeout")
 	}
 }
