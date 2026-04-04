@@ -1,4 +1,4 @@
-package explorer
+package worker
 
 import (
 	"context"
@@ -14,34 +14,37 @@ import (
 	"agentgo/internal/store"
 )
 
-const systemPrompt = `你是一个调查代理（Explorer），专门执行只读的信息检索和验证任务。
+const systemPrompt = `你是一个执行代理（Worker），负责执行具体的编码和文件操作任务。
 
 你的职责：
-- 读取项目文件，了解代码结构和内容
+- 读取项目文件，理解现有代码结构
 - 搜索项目中的关键字和模式
-- 验证历史结论是否仍然成立
-- 返回简洁明确的调查结果
+- 根据任务描述修改或创建文件
+- 完成后返回简洁的执行结果摘要
 
-你的限制：
-- 只能执行只读操作，不能修改任何文件
-- 结果应简短明确：结论成立/结论已过时（附当前状态摘要）
-- 不要猜测，只报告你实际观察到的内容`
+你的工作方式：
+- 先用 read_file 和 grep_search 了解相关代码
+- 确认修改方案后用 write_file 写入文件
+- 每次只修改与任务直接相关的文件
+- 结果应简明扼要：说明做了什么修改，涉及哪些文件`
 
-// Explorer 是轻量级只读调查代理，内部组合 agent.Agent。
-type Explorer struct {
+// Worker 是执行代理，负责认领和执行 scheduler 发布的执行任务。
+type Worker struct {
 	agent *agent.Agent
 }
 
-// New 创建调查代理。使用低成本 LLM 和只读工具集。
-func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry) *Explorer {
+// New 创建执行代理。使用主 LLM 和读写工具集。
+func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry) *Worker {
+	const agentID = "worker-1"
+
 	tools := agent.NewToolRegistry()
-	registerReadOnlyTools(tools)
+	registerWorkerTools(tools, r, agentID)
 
 	executor := agent.NewLLMExecutor(llmClient, tools)
 
 	a := agent.NewAgent(
-		"explorer-1",
-		cfg.ExplorerEventType, // "explore"
+		agentID,
+		"",   // 空字符串，匹配 scheduler 发布的执行任务
 		s, r, executor,
 		cfg.AgentMaxLoops,
 	)
@@ -49,16 +52,18 @@ func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.C
 	a.MaxRetries = cfg.MaxRetry
 	a.IdleThreshold = 0 // 预制代理不因空闲退出
 
-	return &Explorer{agent: a}
+	return &Worker{agent: a}
 }
 
-// Run 启动调查代理的轮询循环，阻塞直到 ctx 取消。
-func (e *Explorer) Run(ctx context.Context) {
-	e.agent.Run(ctx)
+// Run 启动执行代理的轮询循环，阻塞直到 ctx 取消。
+func (w *Worker) Run(ctx context.Context) {
+	w.agent.Run(ctx)
 }
 
-// registerReadOnlyTools 注册只读工具集。
-func registerReadOnlyTools(tools *agent.ToolRegistry) {
+// registerWorkerTools 注册执行代理的工具集（只读工具 + 写文件工具）。
+// write_file 通过闭包捕获 roster 和 agentID，写入前声明文件锁，写入后释放。
+func registerWorkerTools(tools *agent.ToolRegistry, r roster.Roster, agentID string) {
+	// 只读工具
 	tools.Register("read_file", "读取指定文件的内容", map[string]any{
 		"type": "object",
 		"properties": map[string]any{
@@ -84,7 +89,19 @@ func registerReadOnlyTools(tools *agent.ToolRegistry) {
 		},
 		"required": []any{"pattern", "path"},
 	}, toolGrepSearch)
+
+	// 写文件工具（通过闭包接入 Roster 文件锁）
+	tools.Register("write_file", "将内容写入指定文件（创建或覆盖）", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"path":    map[string]any{"type": "string", "description": "文件路径"},
+			"content": map[string]any{"type": "string", "description": "要写入的文件内容"},
+		},
+		"required": []any{"path", "content"},
+	}, makeWriteFileTool(r, agentID))
 }
+
+// --- 工具实现 ---
 
 func toolReadFile(ctx context.Context, args map[string]any) (string, error) {
 	path, _ := args["path"].(string)
@@ -95,7 +112,6 @@ func toolReadFile(ctx context.Context, args map[string]any) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("读取文件失败: %w", err)
 	}
-	// 限制返回大小，避免超出 LLM 上下文
 	content := string(data)
 	if len(content) > 10000 {
 		content = content[:10000] + "\n... (截断，文件过大)"
@@ -137,7 +153,6 @@ func toolGrepSearch(ctx context.Context, args map[string]any) (string, error) {
 		if err != nil || info.IsDir() {
 			return nil
 		}
-		// 跳过二进制和隐藏文件
 		if strings.HasPrefix(info.Name(), ".") || info.Size() > 1<<20 {
 			return nil
 		}
@@ -161,4 +176,40 @@ func toolGrepSearch(ctx context.Context, args map[string]any) (string, error) {
 		return "未找到匹配项", nil
 	}
 	return strings.Join(results, "\n"), nil
+}
+
+// makeWriteFileTool 返回一个接入 Roster 的 write_file 工具函数。
+// 写入前通过 TryClaim 声明文件锁，写入完成后 Release 释放。
+// 如果文件已被其他代理占用，返回错误提示 LLM 稍后重试或换一个文件。
+func makeWriteFileTool(r roster.Roster, agentID string) agent.ToolFunc {
+	return func(ctx context.Context, args map[string]any) (string, error) {
+		path, _ := args["path"].(string)
+		content, _ := args["content"].(string)
+		if path == "" {
+			return "", fmt.Errorf("缺少 path 参数")
+		}
+
+		// 通过 Roster 声明文件写入权
+		claimed, err := r.TryClaim(agentID, path)
+		if err != nil {
+			return "", fmt.Errorf("文件锁声明失败: %w", err)
+		}
+		if !claimed {
+			occupiedBy, _, _ := r.IsOccupied(path)
+			return "", fmt.Errorf("文件 %s 正被代理 %s 占用，无法写入", path, occupiedBy)
+		}
+		defer r.Release(agentID, path)
+
+		// 确保父目录存在
+		dir := filepath.Dir(path)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return "", fmt.Errorf("创建目录失败: %w", err)
+		}
+
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			return "", fmt.Errorf("写入文件失败: %w", err)
+		}
+
+		return fmt.Sprintf("文件已写入: %s (%d 字节)", path, len(content)), nil
+	}
 }

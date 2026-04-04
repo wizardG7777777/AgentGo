@@ -191,6 +191,62 @@ func (s *MemoryTaskStore) TransitionState(taskID string, from, to model.TaskStat
 	return nil
 }
 
+// FailTask 原子地将任务标记为失败，同时写入错误信息并移除代理。
+// 与 TransitionState 不同，此方法会设置 task.Error 字段，确保错误信息持久化到 Store。
+func (s *MemoryTaskStore) FailTask(agentID string, taskID string, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return ErrTaskNotFound
+	}
+	if task.Status != model.TaskStatusProcessing {
+		return ErrTaskNotProcessing
+	}
+
+	s.removeAgent(task, agentID)
+
+	task.Error = reason
+	task.Status = model.TaskStatusFailed
+	task.CompletedAt = time.Now()
+	task.Agents = make([]string, 0)
+	s.addTerminal(taskID)
+	if s.cancelRegistry != nil {
+		s.cancelRegistry.Cancel(taskID)
+	}
+	s.sendEvent(model.Event{Type: model.EventTaskFailed, TaskID: taskID})
+
+	return nil
+}
+
+// FailTaskBySystem 由系统组件（如 Watchdog）调用，将任务标记为失败并写入原因。
+// 与 FailTask 不同，此方法不需要 agentID 参数，直接清空所有代理。
+func (s *MemoryTaskStore) FailTaskBySystem(taskID string, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return ErrTaskNotFound
+	}
+	if task.Status != model.TaskStatusProcessing {
+		return ErrTaskNotProcessing
+	}
+
+	task.Error = reason
+	task.Status = model.TaskStatusFailed
+	task.CompletedAt = time.Now()
+	task.Agents = make([]string, 0)
+	s.addTerminal(taskID)
+	if s.cancelRegistry != nil {
+		s.cancelRegistry.Cancel(taskID)
+	}
+	s.sendEvent(model.Event{Type: model.EventTaskFailed, TaskID: taskID})
+
+	return nil
+}
+
 func (s *MemoryTaskStore) RetryRollback(agentID string, taskID string, reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

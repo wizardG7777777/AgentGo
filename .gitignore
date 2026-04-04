@@ -39,4 +39,5 @@ go.work.sum
 CLAUDE.md
 AGENT.md
 settings.json
+setting.yaml
 .mcp.json

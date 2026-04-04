@@ -27,18 +27,32 @@ func NewLLMExecutor(client llm.Client, tools *ToolRegistry) TaskExecutor {
 			return ExecuteResult{Output: resp.Content, ToolCalled: false}, nil
 		}
 
-		// 有 tool calls → 逐一执行，拼接结果
+		// 有 tool calls → 逐一执行，记录每个 tool call 的结果
 		var output strings.Builder
+		var toolResults []ToolResult
 		for _, call := range resp.ToolCalls {
 			result, toolErr := tools.Dispatch(ctx, call)
+			var content string
 			if toolErr != nil {
-				output.WriteString(fmt.Sprintf("[%s] 错误: %v\n", call.Name, toolErr))
+				content = fmt.Sprintf("错误: %v", toolErr)
+				output.WriteString(fmt.Sprintf("[%s] %s\n", call.Name, content))
 			} else {
+				content = result
 				output.WriteString(fmt.Sprintf("[%s] %s\n", call.Name, result))
 			}
+			toolResults = append(toolResults, ToolResult{
+				ToolCallID: call.ID,
+				Content:    content,
+			})
 		}
 
-		return ExecuteResult{Output: output.String(), ToolCalled: true}, nil
+		return ExecuteResult{
+			Output:           output.String(),
+			ToolCalled:       true,
+			AssistantContent: resp.Content,
+			ToolCalls:        resp.ToolCalls,
+			ToolResults:      toolResults,
+		}, nil
 	}
 }
 
@@ -59,22 +73,44 @@ func buildMessages(task *model.Task, depResults map[string]string, history []His
 
 	messages = append(messages, llm.Message{Role: "user", Content: prompt.String()})
 
-	// 将历史步骤转换为 assistant + tool 消息对
+	// 将历史步骤按 OpenAI tool calling 协议重建为 assistant + tool 消息序列
 	for _, entry := range history {
-		// 每个历史步骤是一次 assistant 返回（含 tool 调用结果）
-		messages = append(messages, llm.Message{
-			Role:    "assistant",
-			Content: entry.Output,
-		})
+		if entry.ToolCalled && len(entry.ToolCalls) > 0 {
+			// assistant 消息：携带 ToolCalls（LLM 请求调用工具）
+			messages = append(messages, llm.Message{
+				Role:      "assistant",
+				Content:   entry.AssistantContent,
+				ToolCalls: entry.ToolCalls,
+			})
+			// 每个 tool call 对应一条 tool role 消息（执行结果）
+			for _, tr := range entry.ToolResults {
+				messages = append(messages, llm.Message{
+					Role:       "tool",
+					Content:    tr.Content,
+					ToolCallID: tr.ToolCallID,
+				})
+			}
+		} else {
+			// 无 tool call 的历史步骤（兼容旧数据），作为纯 assistant 消息
+			messages = append(messages, llm.Message{
+				Role:    "assistant",
+				Content: entry.Output,
+			})
+		}
 	}
 
 	return messages
 }
 
 // classifyError 将 llm 包的错误类型桥接为 agent 包的错误类型。
+// ErrRecoverable 和 ErrBadResponse 均视为可恢复，触发重试。
 func classifyError(err error) error {
 	var llmRecov *llm.ErrRecoverable
 	if errors.As(err, &llmRecov) {
+		return &ErrRecoverable{Err: err}
+	}
+	var llmBad *llm.ErrBadResponse
+	if errors.As(err, &llmBad) {
 		return &ErrRecoverable{Err: err}
 	}
 	// llm.ErrUnrecoverable 和其他错误 → 不可恢复

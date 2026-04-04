@@ -83,7 +83,7 @@ func TestExplorer_UsesReadOnlyTools(t *testing.T) {
 		responses: []llm.Response{
 			{
 				ToolCalls: []llm.ToolCall{
-					{ID: "call_1", Name: "read_file", Arguments: map[string]string{"path": "nonexistent.txt"}},
+					{ID: "call_1", Name: "read_file", Arguments: map[string]any{"path": "nonexistent.txt"}},
 				},
 			},
 			{Content: "文件不存在"},
@@ -140,7 +140,7 @@ func TestToolReadFile(t *testing.T) {
 	path := filepath.Join(dir, "test.txt")
 	os.WriteFile(path, []byte("hello world"), 0644)
 
-	content, err := toolReadFile(context.Background(), map[string]string{"path": path})
+	content, err := toolReadFile(context.Background(), map[string]any{"path": path})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -150,14 +150,14 @@ func TestToolReadFile(t *testing.T) {
 }
 
 func TestToolReadFile_NotFound(t *testing.T) {
-	_, err := toolReadFile(context.Background(), map[string]string{"path": "/nonexistent/file.txt"})
+	_, err := toolReadFile(context.Background(), map[string]any{"path": "/nonexistent/file.txt"})
 	if err == nil {
 		t.Fatal("expected error for nonexistent file")
 	}
 }
 
 func TestToolReadFile_MissingArg(t *testing.T) {
-	_, err := toolReadFile(context.Background(), map[string]string{})
+	_, err := toolReadFile(context.Background(), map[string]any{})
 	if err == nil {
 		t.Fatal("expected error for missing path")
 	}
@@ -168,7 +168,7 @@ func TestToolListFiles(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "a.txt"), []byte(""), 0644)
 	os.Mkdir(filepath.Join(dir, "subdir"), 0755)
 
-	result, err := toolListFiles(context.Background(), map[string]string{"path": dir})
+	result, err := toolListFiles(context.Background(), map[string]any{"path": dir})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestToolGrepSearch(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "code.go"), []byte("func main() {\n\tfmt.Println(\"hello\")\n}"), 0644)
 
-	result, err := toolGrepSearch(context.Background(), map[string]string{
+	result, err := toolGrepSearch(context.Background(), map[string]any{
 		"pattern": "Println",
 		"path":    dir,
 	})
@@ -200,7 +200,7 @@ func TestToolGrepSearch_NoMatch(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "empty.txt"), []byte("nothing here"), 0644)
 
-	result, err := toolGrepSearch(context.Background(), map[string]string{
+	result, err := toolGrepSearch(context.Background(), map[string]any{
 		"pattern": "nonexistent_pattern_xyz",
 		"path":    dir,
 	})

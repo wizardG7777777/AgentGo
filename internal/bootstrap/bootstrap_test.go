@@ -7,7 +7,7 @@ import (
 )
 
 func TestBootstrap_DefaultConfig(t *testing.T) {
-	sys, err := Bootstrap("nonexistent.yaml")
+	sys, err := Bootstrap("nonexistent.yaml", false)
 	if err != nil {
 		t.Fatalf("Bootstrap failed: %v", err)
 	}
@@ -29,7 +29,7 @@ func TestBootstrap_DefaultConfig(t *testing.T) {
 }
 
 func TestBootstrap_StartAndShutdown(t *testing.T) {
-	sys, err := Bootstrap("nonexistent.yaml")
+	sys, err := Bootstrap("nonexistent.yaml", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestBootstrap_StartAndShutdown(t *testing.T) {
 }
 
 func TestBootstrap_NewComponents(t *testing.T) {
-	sys, err := Bootstrap("nonexistent.yaml")
+	sys, err := Bootstrap("nonexistent.yaml", false)
 	if err != nil {
 		t.Fatal(err)
 	}

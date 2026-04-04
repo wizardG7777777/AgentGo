@@ -26,7 +26,7 @@ func TestDefaultConfig(t *testing.T) {
 }
 
 func TestLoadConfig_FileNotExist(t *testing.T) {
-	cfg, err := LoadConfig("/nonexistent/path/setting.yaml")
+	cfg, err := LoadConfig("/nonexistent/path/setting.yaml", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestLoadConfig_PartialYAML(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg, err := LoadConfig(path)
+	cfg, err := LoadConfig(path, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestLoadConfig_JSON(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg, err := LoadConfig(path)
+	cfg, err := LoadConfig(path, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -106,7 +106,7 @@ default_timeout_sec: 600
 		t.Fatal(err)
 	}
 
-	cfg, err := LoadConfig(path)
+	cfg, err := LoadConfig(path, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -163,7 +163,7 @@ explorer_event_type: "investigate"
 		t.Fatal(err)
 	}
 
-	cfg, err := LoadConfig(path)
+	cfg, err := LoadConfig(path, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -188,5 +188,53 @@ explorer_event_type: "investigate"
 	// 未设置的字段保持默认值
 	if cfg.MaxRetry != 3 {
 		t.Errorf("MaxRetry = %d, want default 3", cfg.MaxRetry)
+	}
+}
+
+// === explicit=true 场景测试 ===
+
+func TestLoadConfig_Explicit_FileNotExist_Error(t *testing.T) {
+	_, err := LoadConfig("/nonexistent/setting.yaml", true)
+	if err == nil {
+		t.Fatal("expected error when explicit=true and file not found")
+	}
+}
+
+func TestLoadConfig_Explicit_UnsupportedFormat_Error(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "setting.toml")
+	os.WriteFile(path, []byte("key = 'value'"), 0644)
+
+	_, err := LoadConfig(path, true)
+	if err == nil {
+		t.Fatal("expected error for unsupported format with explicit=true")
+	}
+}
+
+func TestLoadConfig_NonExplicit_UnsupportedFormat_DefaultConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "setting.toml")
+	os.WriteFile(path, []byte("key = 'value'"), 0644)
+
+	cfg, err := LoadConfig(path, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MaxRetry != 3 {
+		t.Errorf("MaxRetry = %d, want default 3", cfg.MaxRetry)
+	}
+}
+
+func TestLoadConfig_Explicit_ValidYML_OK(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "custom.yml")
+	os.WriteFile(path, []byte("max_retry: 10"), 0644)
+
+	cfg, err := LoadConfig(path, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MaxRetry != 10 {
+		t.Errorf("MaxRetry = %d, want 10", cfg.MaxRetry)
 	}
 }

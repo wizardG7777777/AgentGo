@@ -9,6 +9,8 @@ type TaskStore interface {
 	ClaimTask(agentID string, taskID string) error
 	SubmitResult(agentID string, taskID string, result string) error
 	TransitionState(taskID string, from, to model.TaskStatus) error
+	FailTask(agentID string, taskID string, reason string) error
+	FailTaskBySystem(taskID string, reason string) error
 	RetryRollback(agentID string, taskID string, reason string) error
 
 	// Non-atomic read operations (snapshot, no lock required)

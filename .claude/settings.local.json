@@ -13,7 +13,10 @@
       "Bash(grep:*)",
       "Bash(xargs ls:*)",
       "mcp__context7__resolve-library-id",
-      "mcp__context7__query-docs"
+      "mcp__context7__query-docs",
+      "Bash(go clean:*)",
+      "Bash(gopls version:*)",
+      "Bash(go vet:*)"
     ]
   },
   "enableAllProjectMcpServers": true,

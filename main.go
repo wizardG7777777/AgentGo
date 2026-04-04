@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 
@@ -9,7 +10,18 @@ import (
 )
 
 func main() {
-	sys, err := bootstrap.Bootstrap("setting.yaml")
+	configPath := flag.String("config", "setting.yaml", "配置文件路径")
+	flag.Parse()
+
+	// 判断用户是否显式指定了 -config
+	explicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "config" {
+			explicit = true
+		}
+	})
+
+	sys, err := bootstrap.Bootstrap(*configPath, explicit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[错误] 启动失败: %v\n", err)
 		os.Exit(1)

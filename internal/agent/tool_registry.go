@@ -8,7 +8,7 @@ import (
 )
 
 // ToolFunc 是工具的执行函数签名。
-type ToolFunc func(ctx context.Context, args map[string]string) (string, error)
+type ToolFunc func(ctx context.Context, args map[string]any) (string, error)
 
 // ToolRegistry 管理代理可用的工具集。构造后只读，无需并发保护。
 type ToolRegistry struct {

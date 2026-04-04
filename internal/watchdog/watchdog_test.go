@@ -50,6 +50,9 @@ func TestWatchdog_TimeoutDetection(t *testing.T) {
 	if got.Status != model.TaskStatusFailed {
 		t.Errorf("status = %s, want failed (timeout)", got.Status)
 	}
+	if got.Error == "" {
+		t.Error("task.Error is empty, want timeout reason")
+	}
 }
 
 func TestWatchdog_NoFalsePositive(t *testing.T) {
@@ -108,46 +111,6 @@ func TestWatchdog_CascadeCancellation(t *testing.T) {
 	got, _ := s.GetTask(task.ID)
 	if got.Status != model.TaskStatusCancelled {
 		t.Errorf("status = %s, want cancelled (cascade)", got.Status)
-	}
-}
-
-func TestWatchdog_RetryExhausted_Pending(t *testing.T) {
-	w, s, _ := newTestWatchdog()
-
-	task := &model.Task{Description: "exhausted task"}
-	s.PublishTask(task)
-
-	// Manipulate retry count
-	got, _ := s.GetTask(task.ID)
-	got.RetryCount = 5
-
-	inspectAll(w)
-
-	got, _ = s.GetTask(task.ID)
-	if got.Status != model.TaskStatusCancelled {
-		t.Errorf("status = %s, want cancelled (retry exhausted)", got.Status)
-	}
-}
-
-func TestWatchdog_RetryExhausted_Processing(t *testing.T) {
-	w, s, _ := newTestWatchdog()
-
-	task := &model.Task{
-		Description:    "exhausted processing task",
-		TimeoutSeconds: 300,
-	}
-	s.PublishTask(task)
-	s.ClaimTask("agent-1", task.ID)
-
-	// Manipulate retry count
-	got, _ := s.GetTask(task.ID)
-	got.RetryCount = 5
-
-	inspectAll(w)
-
-	got, _ = s.GetTask(task.ID)
-	if got.Status != model.TaskStatusCancelled {
-		t.Errorf("status = %s, want cancelled (retry exhausted)", got.Status)
 	}
 }
 

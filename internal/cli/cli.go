@@ -7,6 +7,8 @@ import (
 	"io"
 	"strings"
 
+	"time"
+
 	"agentgo/internal/model"
 	"agentgo/internal/scheduler"
 	"agentgo/internal/store"
@@ -35,23 +37,21 @@ func New(s store.TaskStore, eventCh chan<- model.Event, cancelFn context.CancelF
 }
 
 // Run 启动 CLI 主循环，阻塞直到 ctx 取消、用户输入 /quit、或 stdin 关闭。
+// scanner 读取在单独 goroutine 中进行，整个生命周期只启动一次，避免泄漏。
 func (c *CLI) Run(ctx context.Context) {
-	scanner := bufio.NewScanner(c.reader)
+	lineCh := make(chan string)
+	eofCh := make(chan struct{})
+
+	go func() {
+		scanner := bufio.NewScanner(c.reader)
+		for scanner.Scan() {
+			lineCh <- scanner.Text()
+		}
+		close(eofCh)
+	}()
+
 	fmt.Fprint(c.writer, "> ")
-
 	for {
-		// 用 channel 让阻塞的 Scan 可以被 ctx 取消
-		lineCh := make(chan string, 1)
-		eofCh := make(chan struct{}, 1)
-
-		go func() {
-			if scanner.Scan() {
-				lineCh <- scanner.Text()
-			} else {
-				eofCh <- struct{}{}
-			}
-		}()
-
 		select {
 		case <-ctx.Done():
 			return
@@ -99,10 +99,15 @@ func (c *CLI) handleLine(line string) bool {
 		fmt.Fprintf(c.writer, "[错误] 未知命令: %s，输入 /help 查看帮助\n", line)
 
 	default:
-		// 用户自由文本 → 发送 EventUserInput
-		c.eventCh <- model.Event{
+		// 用户自由文本 → 发送 EventUserInput（带超时，防止 eventCh 满时卡死）
+		evt := model.Event{
 			Type:    model.EventUserInput,
 			Payload: map[string]string{"text": line},
+		}
+		select {
+		case c.eventCh <- evt:
+		case <-time.After(5 * time.Second):
+			fmt.Fprintln(c.writer, "[警告] 系统繁忙，请稍后重试")
 		}
 	}
 
