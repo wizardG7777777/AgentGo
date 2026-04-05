@@ -16,7 +16,8 @@
       "mcp__context7__query-docs",
       "Bash(go clean:*)",
       "Bash(gopls version:*)",
-      "Bash(go vet:*)"
+      "Bash(go vet:*)",
+      "Bash(xargs -I {} basename {})"
     ]
   },
   "enableAllProjectMcpServers": true,
