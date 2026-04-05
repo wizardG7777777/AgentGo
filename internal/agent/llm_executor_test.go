@@ -256,3 +256,55 @@ func TestLLMExecutor_HistoryPassedToLLM(t *testing.T) {
 		t.Errorf("msgs[2].ToolCallID = %q, want %q", msgs[2].ToolCallID, "call_1")
 	}
 }
+
+func TestLLMExecutor_SystemPromptInjected(t *testing.T) {
+	mock := &mockLLMClient{
+		responses: []llm.Response{{Content: "done"}},
+	}
+
+	tools := NewToolRegistry()
+	sysPrompt := "你是一个执行代理"
+	executor := NewLLMExecutor(mock, tools, sysPrompt)
+
+	task := &model.Task{Description: "测试任务"}
+	executor(context.Background(), task, nil, nil)
+
+	if len(mock.captured) != 1 {
+		t.Fatalf("captured calls = %d, want 1", len(mock.captured))
+	}
+	msgs := mock.captured[0]
+
+	// 第一条消息应为 system prompt
+	if len(msgs) < 2 {
+		t.Fatalf("messages count = %d, want >= 2 (system + user)", len(msgs))
+	}
+	if msgs[0].Role != "system" {
+		t.Errorf("msgs[0].Role = %q, want %q", msgs[0].Role, "system")
+	}
+	if msgs[0].Content != sysPrompt {
+		t.Errorf("msgs[0].Content = %q, want %q", msgs[0].Content, sysPrompt)
+	}
+	// 第二条消息应为 user
+	if msgs[1].Role != "user" {
+		t.Errorf("msgs[1].Role = %q, want %q", msgs[1].Role, "user")
+	}
+}
+
+func TestLLMExecutor_NoSystemPrompt_NoSystemMessage(t *testing.T) {
+	mock := &mockLLMClient{
+		responses: []llm.Response{{Content: "done"}},
+	}
+
+	tools := NewToolRegistry()
+	// 不传 system prompt（向后兼容）
+	executor := NewLLMExecutor(mock, tools)
+
+	task := &model.Task{Description: "测试任务"}
+	executor(context.Background(), task, nil, nil)
+
+	msgs := mock.captured[0]
+	// 第一条消息应直接是 user，不应有 system 消息
+	if msgs[0].Role != "user" {
+		t.Errorf("msgs[0].Role = %q, want %q (no system prompt should be injected)", msgs[0].Role, "user")
+	}
+}

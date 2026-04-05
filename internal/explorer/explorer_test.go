@@ -218,15 +218,15 @@ func TestRegisterReadOnlyTools(t *testing.T) {
 	registerReadOnlyTools(tools)
 
 	defs := tools.Defs()
-	if len(defs) != 3 {
-		t.Fatalf("tool count = %d, want 3", len(defs))
+	if len(defs) != 4 {
+		t.Fatalf("tool count = %d, want 4", len(defs))
 	}
 
 	names := make(map[string]bool)
 	for _, d := range defs {
 		names[d.Name] = true
 	}
-	for _, expected := range []string{"read_file", "list_files", "grep_search"} {
+	for _, expected := range []string{"read_file", "list_files", "grep_search", "glob_search"} {
 		if !names[expected] {
 			t.Errorf("missing tool: %s", expected)
 		}

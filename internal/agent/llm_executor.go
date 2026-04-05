@@ -13,9 +13,14 @@ import (
 // NewLLMExecutor 创建一个基于 LLM 的 TaskExecutor。
 // 每次调用对应 ReAct 循环中的一步：调用 LLM → 如果有 tool calls 则执行并返回 ToolCalled=true，
 // 否则返回 ToolCalled=false 表示任务完成。
-func NewLLMExecutor(client llm.Client, tools *ToolRegistry) TaskExecutor {
+// systemPrompt 为可选参数，非空时作为 system/developer 消息注入到对话开头。
+func NewLLMExecutor(client llm.Client, tools *ToolRegistry, systemPrompt ...string) TaskExecutor {
+	var sysPrompt string
+	if len(systemPrompt) > 0 {
+		sysPrompt = systemPrompt[0]
+	}
 	return func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
-		messages := buildMessages(task, depResults, history)
+		messages := buildMessages(sysPrompt, task, depResults, history)
 
 		resp, err := client.Chat(ctx, messages, tools.Defs())
 		if err != nil {
@@ -57,8 +62,14 @@ func NewLLMExecutor(client llm.Client, tools *ToolRegistry) TaskExecutor {
 }
 
 // buildMessages 将任务信息和执行历史转换为 LLM 对话消息。
-func buildMessages(task *model.Task, depResults map[string]string, history []HistoryEntry) []llm.Message {
+// systemPrompt 非空时作为 system 消息插入到对话开头。
+func buildMessages(systemPrompt string, task *model.Task, depResults map[string]string, history []HistoryEntry) []llm.Message {
 	var messages []llm.Message
+
+	// 注入 system prompt（如果提供）
+	if systemPrompt != "" {
+		messages = append(messages, llm.Message{Role: "system", Content: systemPrompt})
+	}
 
 	// 构建用户消息：任务描述 + 依赖结果
 	var prompt strings.Builder

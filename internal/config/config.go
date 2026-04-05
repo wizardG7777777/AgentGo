@@ -27,6 +27,7 @@ type Config struct {
 	LLMTimeoutSec       int    `yaml:"llm_timeout_sec" json:"llm_timeout_sec"`
 	ExplorerModel       string `yaml:"explorer_model" json:"explorer_model"`
 	ExplorerEventType   string `yaml:"explorer_event_type" json:"explorer_event_type"`
+	ShellTimeoutSec     int    `yaml:"shell_timeout_sec" json:"shell_timeout_sec"`
 }
 
 func DefaultConfig() *Config {
@@ -45,6 +46,7 @@ func DefaultConfig() *Config {
 		LLMTimeoutSec:       60,
 		ExplorerModel:       "gpt-4o-mini",
 		ExplorerEventType:   "explore",
+		ShellTimeoutSec:     30,
 	}
 }
 

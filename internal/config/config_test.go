@@ -127,6 +127,34 @@ default_timeout_sec: 600
 	}
 }
 
+func TestDefaultConfig_ShellTimeoutSec(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.ShellTimeoutSec != 30 {
+		t.Errorf("ShellTimeoutSec = %d, want 30", cfg.ShellTimeoutSec)
+	}
+}
+
+func TestLoadConfig_ShellTimeoutSec_YAMLOverride(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "setting.yaml")
+	content := []byte("shell_timeout_sec: 60\n")
+	if err := os.WriteFile(path, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadConfig(path, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ShellTimeoutSec != 60 {
+		t.Errorf("ShellTimeoutSec = %d, want 60", cfg.ShellTimeoutSec)
+	}
+	// unspecified fields keep defaults
+	if cfg.MaxRetry != 3 {
+		t.Errorf("MaxRetry = %d, want default 3", cfg.MaxRetry)
+	}
+}
+
 func TestDefaultConfig_LLMFields(t *testing.T) {
 	cfg := DefaultConfig()
 	if cfg.LLMModel != "gpt-4o" {
