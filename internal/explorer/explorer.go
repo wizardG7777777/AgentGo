@@ -12,6 +12,7 @@ import (
 	"agentgo/internal/llm"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
+	"agentgo/internal/worker"
 )
 
 const systemPrompt = `你是一个调查代理（Explorer），专门执行只读的信息检索和验证任务。
@@ -37,7 +38,7 @@ func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.C
 	tools := agent.NewToolRegistry()
 	registerReadOnlyTools(tools)
 
-	executor := agent.NewLLMExecutor(llmClient, tools)
+	executor := agent.NewLLMExecutor(llmClient, tools, systemPrompt)
 
 	a := agent.NewAgent(
 		"explorer-1",
@@ -84,6 +85,15 @@ func registerReadOnlyTools(tools *agent.ToolRegistry) {
 		},
 		"required": []any{"pattern", "path"},
 	}, toolGrepSearch)
+
+	tools.Register("glob_search", "递归搜索匹配 glob 模式的文件路径，支持 ** 递归通配符", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"pattern":  map[string]any{"type": "string", "description": "glob 模式，如 **/*_test.go"},
+			"root_dir": map[string]any{"type": "string", "description": "搜索根目录，默认当前目录"},
+		},
+		"required": []any{"pattern"},
+	}, worker.ToolGlobSearch)
 }
 
 func toolReadFile(ctx context.Context, args map[string]any) (string, error) {
