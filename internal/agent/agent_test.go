@@ -1483,3 +1483,132 @@ func TestAgent_PerTaskCancel_NilRegistryFallback(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+func TestAgent_AppendOutput_CalledDuringExecution(t *testing.T) {
+	s, r, _ := setup()
+
+	task := &model.Task{Description: "streaming test", EventType: "code"}
+	s.PublishTask(task)
+
+	step := 0
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		step++
+		if step <= 2 {
+			return ExecuteResult{Output: fmt.Sprintf("step-%d output\n", step), ToolCalled: true}, nil
+		}
+		return ExecuteResult{Output: "final", ToolCalled: false}, nil
+	}
+
+	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag.PollInterval = 10 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go ag.Run(ctx)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timeout waiting for task completion")
+		default:
+		}
+		got, err := s.GetTask(task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status == model.TaskStatusCompleted {
+			// 验证 PartialOutput 包含两步的中间输出
+			if got.PartialOutput == "" {
+				t.Error("PartialOutput should not be empty after multi-step execution")
+			}
+			if !containsSubstring(got.PartialOutput, "step-1 output") {
+				t.Errorf("PartialOutput should contain step-1 output, got: %q", got.PartialOutput)
+			}
+			if !containsSubstring(got.PartialOutput, "step-2 output") {
+				t.Errorf("PartialOutput should contain step-2 output, got: %q", got.PartialOutput)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func containsSubstring(s, sub string) bool {
+	return len(s) >= len(sub) && (s == sub || len(s) > 0 && findSubstring(s, sub))
+}
+
+func findSubstring(s, sub string) bool {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+// TestAgent_OnTaskStart_Called 验证 OnTaskStart 回调在任务处理开始时被正确调用。
+func TestAgent_OnTaskStart_Called(t *testing.T) {
+	s, r, _ := setup()
+
+	task := &model.Task{Description: "hook test", EventType: "code"}
+	s.PublishTask(task)
+
+	var capturedTaskID string
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		return ExecuteResult{Output: "done", ToolCalled: false}, nil
+	}
+
+	ag := NewAgent("agent-hook", "code", s, r, executor, 50)
+	ag.PollInterval = 10 * time.Millisecond
+	ag.OnTaskStart = func(taskID string) {
+		capturedTaskID = taskID
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go ag.Run(ctx)
+
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timeout waiting for task completion")
+		default:
+		}
+		got, _ := s.GetTask(task.ID)
+		if got.Status == model.TaskStatusCompleted {
+			if capturedTaskID != task.ID {
+				t.Errorf("OnTaskStart captured taskID = %q, want %q", capturedTaskID, task.ID)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestAgent_FileCache_ClearedOnTaskStart 验证 FileCache 在任务处理开始时被清空。
+func TestAgent_FileCache_ClearedOnTaskStart(t *testing.T) {
+	s, r, _ := setup()
+
+	task := &model.Task{Description: "cache test", EventType: "code"}
+	s.PublishTask(task)
+	s.ClaimTask("agent-1", task.ID)
+
+	cache := NewFileStateCache(50)
+	cache.Put("/tmp/stale.go", "old content", "old_hash")
+
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		// 验证缓存已被清空
+		if cache.Len() != 0 {
+			t.Errorf("FileCache should be cleared at task start, got Len()=%d", cache.Len())
+		}
+		return ExecuteResult{Output: "done", ToolCalled: false}, nil
+	}
+
+	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag.FileCache = cache
+	ag.processTask(context.Background(), task.ID)
+}

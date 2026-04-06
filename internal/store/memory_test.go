@@ -576,3 +576,121 @@ func TestTransitionState_ClearsAgentsOnFailed(t *testing.T) {
 		t.Errorf("agents after failed = %d, want 0", len(got.Agents))
 	}
 }
+
+// --- AppendOutput ---
+
+func TestAppendOutput_Basic(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	task := publishTestTask(t, s, "streaming task")
+	s.ClaimTask("agent-1", task.ID)
+
+	if err := s.AppendOutput("agent-1", task.ID, "chunk1"); err != nil {
+		t.Fatalf("first AppendOutput failed: %v", err)
+	}
+	if err := s.AppendOutput("agent-1", task.ID, "chunk2"); err != nil {
+		t.Fatalf("second AppendOutput failed: %v", err)
+	}
+
+	got, _ := s.GetTask(task.ID)
+	if got.PartialOutput != "chunk1chunk2" {
+		t.Errorf("PartialOutput = %q, want %q", got.PartialOutput, "chunk1chunk2")
+	}
+}
+
+func TestAppendOutput_WrongAgent(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	task := publishTestTask(t, s, "wrong agent test")
+	s.ClaimTask("agent-1", task.ID)
+
+	err := s.AppendOutput("agent-99", task.ID, "data")
+	if err != ErrAgentNotInTask {
+		t.Errorf("err = %v, want ErrAgentNotInTask", err)
+	}
+}
+
+func TestAppendOutput_WrongState(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	task := publishTestTask(t, s, "wrong state test")
+
+	err := s.AppendOutput("agent-1", task.ID, "data")
+	if err != ErrTaskNotProcessing {
+		t.Errorf("err = %v, want ErrTaskNotProcessing", err)
+	}
+}
+
+// --- Dependency-Aware FIFO Eviction ---
+
+func TestFIFOEviction_DependencyProtection(t *testing.T) {
+	s, _ := newTestStore(10, 3) // fifoLimit=3
+
+	var taskIDs []string
+	for i := 0; i < 5; i++ {
+		task := &model.Task{Description: fmt.Sprintf("task-%d", i)}
+		if err := s.PublishTask(task); err != nil {
+			t.Fatalf("PublishTask failed: %v", err)
+		}
+		taskIDs = append(taskIDs, task.ID)
+	}
+
+	// 任务4依赖任务0
+	s.mu.Lock()
+	s.tasks[taskIDs[4]].Dependencies = []string{taskIDs[0]}
+	s.mu.Unlock()
+
+	// 完成任务0-3
+	for i := 0; i < 4; i++ {
+		s.ClaimTask("agent", taskIDs[i])
+		s.SubmitResult("agent", taskIDs[i], "done")
+	}
+
+	// 任务0应受保护（被任务4依赖）
+	_, err := s.GetTask(taskIDs[0])
+	if err != nil {
+		t.Errorf("task 0 should be protected by dependency, got err: %v", err)
+	}
+
+	// 任务1应被驱逐
+	_, err = s.GetTask(taskIDs[1])
+	if err != ErrTaskNotFound {
+		t.Errorf("task 1 should be evicted, got err: %v", err)
+	}
+}
+
+func TestFIFOEviction_ProtectedTaskEventuallyEvicted(t *testing.T) {
+	s, _ := newTestStore(10, 2) // fifoLimit=2
+
+	var taskIDs []string
+	for i := 0; i < 3; i++ {
+		task := &model.Task{Description: fmt.Sprintf("task-%d", i)}
+		if err := s.PublishTask(task); err != nil {
+			t.Fatalf("PublishTask failed: %v", err)
+		}
+		taskIDs = append(taskIDs, task.ID)
+	}
+
+	s.mu.Lock()
+	s.tasks[taskIDs[2]].Dependencies = []string{taskIDs[0]}
+	s.mu.Unlock()
+
+	// 完成任务0和1
+	for i := 0; i < 2; i++ {
+		s.ClaimTask("agent", taskIDs[i])
+		s.SubmitResult("agent", taskIDs[i], "done")
+	}
+
+	// 任务0应受保护
+	_, err := s.GetTask(taskIDs[0])
+	if err != nil {
+		t.Errorf("task 0 should be protected: %v", err)
+	}
+
+	// 完成任务2，解除依赖
+	s.ClaimTask("agent", taskIDs[2])
+	s.SubmitResult("agent", taskIDs[2], "done")
+
+	// 任务0不再受保护，应被驱逐
+	_, err = s.GetTask(taskIDs[0])
+	if err != ErrTaskNotFound {
+		t.Errorf("task 0 should be evicted after dependent task completed, got err: %v", err)
+	}
+}

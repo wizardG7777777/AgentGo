@@ -11,28 +11,36 @@ import (
 	"agentgo/internal/cli"
 	"agentgo/internal/config"
 	"agentgo/internal/explorer"
+	"agentgo/internal/isolation"
 	"agentgo/internal/llm"
+	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/roster"
 	"agentgo/internal/scheduler"
+	"agentgo/internal/shell"
 	"agentgo/internal/store"
 	"agentgo/internal/watchdog"
 	"agentgo/internal/worker"
 )
 
 type System struct {
-	Config         *config.Config
-	Store          *store.MemoryTaskStore
-	Roster         roster.Roster
-	EventCh        chan model.Event
-	Watchdog       *watchdog.Watchdog
-	CancelRegistry *store.TaskCancelRegistry
-	Scheduler      *scheduler.Scheduler
-	Explorer       *explorer.Explorer
-	Worker         *worker.Worker
-	CLI            *cli.CLI
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
+	Config           *config.Config
+	Store            store.TaskStore
+	Roster           roster.Roster
+	EventCh          chan model.Event
+	Watchdog         *watchdog.Watchdog
+	CancelRegistry   *store.TaskCancelRegistry
+	MailboxRegistry  *mailbox.Registry
+	MailNotifier     *mailbox.MailNotifier
+	Scheduler        *scheduler.Scheduler
+	Explorer         *explorer.Explorer
+	Workers          []*worker.Worker
+	ApprovalCh       chan shell.ApprovalRequest // 命令审批通道，Worker→CLI
+	WorktreeManager  *isolation.WorktreeManager
+	ConflictResolver *isolation.ConflictResolver
+	CLI              *cli.CLI
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
 }
 
 func Bootstrap(configPath string, explicit bool) (*System, error) {
@@ -54,6 +62,10 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	r := roster.NewMemoryRoster()
 	fmt.Println("[启动] 花名册初始化完成")
 
+	// Step 3.5: 初始化邮箱注册表
+	mbRegistry := mailbox.NewRegistry(cfg.MailboxBufferSize)
+	fmt.Println("[启动] 邮箱注册表初始化完成")
+
 	// Step 4: 创建 LLM 客户端
 	schedulerLLM := llm.NewSDKClient(
 		cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel,
@@ -67,32 +79,66 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	)
 
 	// Step 5: 创建调度器（eventCh 消费者，必须先于生产者启动）
-	sched := scheduler.New(taskStore, schedulerLLM, eventCh, cfg)
+	sched := scheduler.New(taskStore, schedulerLLM, eventCh, cfg, mbRegistry)
 
 	// Step 6: 创建看门狗
 	w := watchdog.New(taskStore, cfg, eventCh, r)
 
+	// Step 6.5: 创建 worktree 管理器和冲突解决代理（可选）
+	var wtManager *isolation.WorktreeManager
+	var resolver *isolation.ConflictResolver
+	if cfg.WorktreeEnabled {
+		wtManager = isolation.NewWorktreeManager(cfg.ProjectRoot)
+		resolverLLM := llm.NewSDKClient(
+			cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.ExplorerModel,
+			"", // system prompt 由 resolver 内部管理
+			time.Duration(cfg.LLMTimeoutSec)*time.Second,
+		)
+		resolver = isolation.NewConflictResolver(cfg.ProjectRoot, resolverLLM, taskStore)
+		fmt.Println("[启动] Worktree 隔离已启用")
+	}
+
 	// Step 7: 创建调查代理
-	exp := explorer.New(taskStore, r, explorerLLM, cfg, cancelRegistry)
+	exp := explorer.New(taskStore, r, explorerLLM, cfg, cancelRegistry, mbRegistry, wtManager)
+
+	// Step 7.5: 创建命令审批通道（Worker→CLI）
+	approvalCh := make(chan shell.ApprovalRequest, 8)
 
 	// Step 8: 创建执行代理（使用主 LLM，认领 event_type="" 的执行任务）
-	workerLLM := llm.NewSDKClient(
-		cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel,
-		"", // system prompt 由 worker 内部管理
-		time.Duration(cfg.LLMTimeoutSec)*time.Second,
-	)
-	wk := worker.New(taskStore, r, workerLLM, cfg, cancelRegistry)
+	workerCount := cfg.WorkerCount
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+	var workers []*worker.Worker
+	for i := 1; i <= workerCount; i++ {
+		workerLLM := llm.NewSDKClient(
+			cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel,
+			"", // system prompt 由 worker 内部管理
+			time.Duration(cfg.LLMTimeoutSec)*time.Second,
+		)
+		wk := worker.NewWithID(fmt.Sprintf("worker-%d", i), taskStore, r, workerLLM, cfg, cancelRegistry, mbRegistry, approvalCh, wtManager, resolver)
+		workers = append(workers, wk)
+	}
+
+	// Step 9: 创建邮差通知器
+	notifierInterval := time.Duration(cfg.MailNotifierIntervalSec) * time.Second
+	mailNotifier := mailbox.NewMailNotifier(mbRegistry, taskStore, notifierInterval)
 
 	sys := &System{
-		Config:         cfg,
-		Store:          taskStore,
-		Roster:         r,
-		EventCh:        eventCh,
-		Watchdog:       w,
-		CancelRegistry: cancelRegistry,
-		Scheduler:      sched,
-		Explorer:       exp,
-		Worker:         wk,
+		Config:           cfg,
+		Store:            taskStore,
+		Roster:           r,
+		EventCh:          eventCh,
+		Watchdog:         w,
+		CancelRegistry:   cancelRegistry,
+		MailboxRegistry:  mbRegistry,
+		MailNotifier:     mailNotifier,
+		Scheduler:        sched,
+		Explorer:         exp,
+		Workers:          workers,
+		ApprovalCh:       approvalCh,
+		WorktreeManager:  wtManager,
+		ConflictResolver: resolver,
 	}
 
 	return sys, nil
@@ -118,6 +164,24 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
 	}()
 	fmt.Println("[启动] 看门狗已启动")
 
+	// Step 6.5: 启动邮差通知器
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.MailNotifier.Run(ctx)
+	}()
+	fmt.Println("[启动] 邮差通知器已启动")
+
+	// Step 6.8: 启动冲突解决代理（可选）
+	if s.ConflictResolver != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.ConflictResolver.Run(ctx)
+		}()
+		fmt.Println("[启动] 冲突解决代理已启动")
+	}
+
 	// Step 7: 启动调查代理
 	s.wg.Add(1)
 	go func() {
@@ -127,19 +191,22 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
 	fmt.Println("[启动] 调查代理已启动")
 
 	// Step 8: 启动执行代理
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.Worker.Run(ctx)
-	}()
-	fmt.Println("[启动] 执行代理已启动")
+	for _, wk := range s.Workers {
+		wk := wk // 闭包捕获
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			wk.Run(ctx)
+		}()
+	}
+	fmt.Printf("[启动] 执行代理已启动 (%d 个)\n", len(s.Workers))
 
 	fmt.Println("[启动] 系统就绪，等待用户输入")
 }
 
 // RunCLI 启动 CLI 主循环，阻塞直到用户退出或 ctx 取消。
 func (s *System) RunCLI(ctx context.Context, reader io.Reader, writer io.Writer) {
-	s.CLI = cli.New(s.Store, s.EventCh, s.cancel, s.Scheduler, reader, writer)
+	s.CLI = cli.New(s.Store, s.EventCh, s.cancel, s.Scheduler, s.MailboxRegistry, s.ApprovalCh, reader, writer)
 	s.CLI.Run(ctx)
 }
 
@@ -149,6 +216,9 @@ func (s *System) Shutdown() {
 		s.cancel()
 	}
 	s.wg.Wait()
+	if s.WorktreeManager != nil {
+		s.WorktreeManager.CleanupAll()
+	}
 	fmt.Println("[关闭] 系统已停止")
 }
 

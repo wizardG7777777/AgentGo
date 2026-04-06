@@ -2,6 +2,8 @@ package bootstrap
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -66,5 +68,45 @@ func TestBootstrap_NewComponents(t *testing.T) {
 	}
 	if sys.CancelRegistry == nil {
 		t.Error("CancelRegistry should not be nil")
+	}
+}
+
+func TestBootstrap_MultipleWorkers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "setting.yaml")
+	content := []byte("worker_count: 3\n")
+	if err := os.WriteFile(path, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	sys, err := Bootstrap(path, true)
+	if err != nil {
+		t.Fatalf("Bootstrap failed: %v", err)
+	}
+	if len(sys.Workers) != 3 {
+		t.Errorf("Workers count = %d, want 3", len(sys.Workers))
+	}
+}
+
+func TestBootstrap_DefaultSingleWorker(t *testing.T) {
+	sys, err := Bootstrap("nonexistent.yaml", false)
+	if err != nil {
+		t.Fatalf("Bootstrap failed: %v", err)
+	}
+	if len(sys.Workers) != 1 {
+		t.Errorf("Workers count = %d, want 1", len(sys.Workers))
+	}
+}
+
+func TestBootstrap_MailboxComponentsInitialized(t *testing.T) {
+	sys, err := Bootstrap("nonexistent.yaml", false)
+	if err != nil {
+		t.Fatalf("Bootstrap failed: %v", err)
+	}
+	if sys.MailboxRegistry == nil {
+		t.Fatal("MailboxRegistry should not be nil")
+	}
+	if sys.MailNotifier == nil {
+		t.Fatal("MailNotifier should not be nil")
 	}
 }

@@ -257,6 +257,59 @@ func TestLLMExecutor_HistoryPassedToLLM(t *testing.T) {
 	}
 }
 
+func TestLLMExecutor_IncomingMailInjectedAsUserMessage(t *testing.T) {
+	mock := &mockLLMClient{
+		responses: []llm.Response{{Content: "final"}},
+	}
+
+	tools := NewToolRegistry()
+	executor := NewLLMExecutor(mock, tools)
+	task := &model.Task{Description: "处理任务"}
+	history := []HistoryEntry{
+		{
+			IncomingMail: "<agent-mail>\n[from user @ 12:00:00] 请先补测试\n</agent-mail>",
+		},
+		{
+			Output:           "[read_file] ok\n",
+			ToolCalled:       true,
+			AssistantContent: "先读取文件",
+			ToolCalls: []llm.ToolCall{
+				{ID: "call_1", Name: "read_file", Arguments: map[string]any{"path": "a.go"}},
+			},
+			ToolResults: []ToolResult{
+				{ToolCallID: "call_1", Content: "ok"},
+			},
+		},
+	}
+
+	_, _ = executor(context.Background(), task, nil, history)
+
+	if len(mock.captured) != 1 {
+		t.Fatalf("captured calls = %d, want 1", len(mock.captured))
+	}
+	msgs := mock.captured[0]
+
+	// user(task) + user(incoming_mail) + assistant(tool call) + tool(result)
+	if len(msgs) != 4 {
+		t.Fatalf("messages count = %d, want 4", len(msgs))
+	}
+	if msgs[0].Role != "user" {
+		t.Errorf("msgs[0].Role = %q, want user", msgs[0].Role)
+	}
+	if msgs[1].Role != "user" {
+		t.Errorf("incoming mail message role = %q, want user", msgs[1].Role)
+	}
+	if msgs[1].Content != history[0].IncomingMail {
+		t.Errorf("incoming mail content mismatch, got: %q", msgs[1].Content)
+	}
+	if msgs[2].Role != "assistant" || len(msgs[2].ToolCalls) != 1 {
+		t.Errorf("msgs[2] should be assistant with tool call, got role=%q toolCalls=%d", msgs[2].Role, len(msgs[2].ToolCalls))
+	}
+	if msgs[3].Role != "tool" || msgs[3].ToolCallID != "call_1" {
+		t.Errorf("msgs[3] should be tool response for call_1, got role=%q id=%q", msgs[3].Role, msgs[3].ToolCallID)
+	}
+}
+
 func TestLLMExecutor_SystemPromptInjected(t *testing.T) {
 	mock := &mockLLMClient{
 		responses: []llm.Response{{Content: "done"}},
@@ -306,5 +359,123 @@ func TestLLMExecutor_NoSystemPrompt_NoSystemMessage(t *testing.T) {
 	// 第一条消息应直接是 user，不应有 system 消息
 	if msgs[0].Role != "user" {
 		t.Errorf("msgs[0].Role = %q, want %q (no system prompt should be injected)", msgs[0].Role, "user")
+	}
+}
+
+func TestLLMExecutor_ParallelToolExecution(t *testing.T) {
+	mock := &mockLLMClient{
+		responses: []llm.Response{
+			{
+				ToolCalls: []llm.ToolCall{
+					{ID: "call_1", Name: "tool_a", Arguments: map[string]any{"key": "1"}},
+					{ID: "call_2", Name: "tool_b", Arguments: map[string]any{"key": "2"}},
+					{ID: "call_3", Name: "tool_c", Arguments: map[string]any{"key": "3"}},
+				},
+			},
+		},
+	}
+
+	tools := NewToolRegistry()
+	tools.Register("tool_a", "工具A", nil, func(ctx context.Context, args map[string]any) (string, error) {
+		return "result_a", nil
+	})
+	tools.Register("tool_b", "工具B", nil, func(ctx context.Context, args map[string]any) (string, error) {
+		return "result_b", nil
+	})
+	tools.Register("tool_c", "工具C", nil, func(ctx context.Context, args map[string]any) (string, error) {
+		return "result_c", nil
+	})
+
+	executor := NewLLMExecutor(mock, tools)
+	task := &model.Task{Description: "并行测试"}
+	result, err := executor(context.Background(), task, nil, nil)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.ToolCalled {
+		t.Error("expected ToolCalled=true")
+	}
+	if len(result.ToolResults) != 3 {
+		t.Fatalf("ToolResults count = %d, want 3", len(result.ToolResults))
+	}
+	// 验证顺序保持
+	if result.ToolResults[0].ToolCallID != "call_1" {
+		t.Errorf("ToolResults[0].ToolCallID = %q, want call_1", result.ToolResults[0].ToolCallID)
+	}
+	if result.ToolResults[1].ToolCallID != "call_2" {
+		t.Errorf("ToolResults[1].ToolCallID = %q, want call_2", result.ToolResults[1].ToolCallID)
+	}
+	if result.ToolResults[2].ToolCallID != "call_3" {
+		t.Errorf("ToolResults[2].ToolCallID = %q, want call_3", result.ToolResults[2].ToolCallID)
+	}
+}
+
+func TestLLMExecutor_UsagePassthrough(t *testing.T) {
+	mock := &mockLLMClient{
+		responses: []llm.Response{
+			{
+				Content: "done",
+				Usage:   struct{ PromptTokens, CompletionTokens int }{PromptTokens: 100, CompletionTokens: 50},
+			},
+		},
+	}
+
+	tools := NewToolRegistry()
+	executor := NewLLMExecutor(mock, tools)
+	task := &model.Task{Description: "usage test"}
+	result, err := executor(context.Background(), task, nil, nil)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.PromptTokens != 100 {
+		t.Errorf("PromptTokens = %d, want 100", result.PromptTokens)
+	}
+	if result.CompletionTokens != 50 {
+		t.Errorf("CompletionTokens = %d, want 50", result.CompletionTokens)
+	}
+}
+
+func TestLLMExecutor_TaskSystemPromptOverridesDefault(t *testing.T) {
+	mock := &mockLLMClient{
+		responses: []llm.Response{{Content: "done"}},
+	}
+
+	tools := NewToolRegistry()
+	executor := NewLLMExecutor(mock, tools, "默认提示")
+
+	task := &model.Task{Description: "测试任务", SystemPrompt: "任务专用提示"}
+	executor(context.Background(), task, nil, nil)
+
+	msgs := mock.captured[0]
+	if len(msgs) < 2 {
+		t.Fatalf("messages count = %d, want >= 2", len(msgs))
+	}
+	if msgs[0].Role != "system" {
+		t.Errorf("msgs[0].Role = %q, want system", msgs[0].Role)
+	}
+	if msgs[0].Content != "任务专用提示" {
+		t.Errorf("msgs[0].Content = %q, want %q", msgs[0].Content, "任务专用提示")
+	}
+}
+
+func TestLLMExecutor_TaskEmptySystemPrompt_UsesDefault(t *testing.T) {
+	mock := &mockLLMClient{
+		responses: []llm.Response{{Content: "done"}},
+	}
+
+	tools := NewToolRegistry()
+	executor := NewLLMExecutor(mock, tools, "默认提示")
+
+	task := &model.Task{Description: "测试任务"}
+	executor(context.Background(), task, nil, nil)
+
+	msgs := mock.captured[0]
+	if msgs[0].Role != "system" {
+		t.Errorf("msgs[0].Role = %q, want system", msgs[0].Role)
+	}
+	if msgs[0].Content != "默认提示" {
+		t.Errorf("msgs[0].Content = %q, want %q", msgs[0].Content, "默认提示")
 	}
 }

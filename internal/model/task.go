@@ -54,6 +54,10 @@ type Task struct {
 	EventSource    string
 	EventType      string
 	TriggerRule    string
+	SystemPrompt   string // 可选的自定义 system prompt，非空时覆盖 Worker 默认 prompt
+	PartialOutput  string // 执行中的部分输出，用于流式进度展示
+	Depth          int    // 子任务嵌套深度，根任务为 0
+	WorktreePath   string // 任务关联的 worktree 路径，空表示未启用隔离
 	CreatedAt      time.Time
 	StartedAt      time.Time
 	CompletedAt    time.Time

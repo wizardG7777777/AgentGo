@@ -14,12 +14,12 @@ import (
 )
 
 var (
-	ErrTaskNotFound     = errors.New("task not found")
+	ErrTaskNotFound      = errors.New("task not found")
 	ErrInvalidTransition = errors.New("invalid state transition")
-	ErrConcurrencyFull  = errors.New("task concurrency limit reached")
-	ErrDependencyNotMet = errors.New("dependency not met")
-	ErrAgentNotInTask   = errors.New("agent not in task's agent list")
-	ErrTaskNotPending   = errors.New("task is not in pending state")
+	ErrConcurrencyFull   = errors.New("task concurrency limit reached")
+	ErrDependencyNotMet  = errors.New("dependency not met")
+	ErrAgentNotInTask    = errors.New("agent not in task's agent list")
+	ErrTaskNotPending    = errors.New("task is not in pending state")
 	ErrTaskNotProcessing = errors.New("task is not in processing state")
 )
 
@@ -277,6 +277,35 @@ func (s *MemoryTaskStore) RetryRollback(agentID string, taskID string, reason st
 	return nil
 }
 
+// AppendOutput 追加部分输出到正在执行的任务。
+func (s *MemoryTaskStore) AppendOutput(agentID, taskID, chunk string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return ErrTaskNotFound
+	}
+	if task.Status != model.TaskStatusProcessing {
+		return ErrTaskNotProcessing
+	}
+
+	// 验证代理已分配到此任务
+	found := false
+	for _, a := range task.Agents {
+		if a == agentID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return ErrAgentNotInTask
+	}
+
+	task.PartialOutput += chunk
+	return nil
+}
+
 func (s *MemoryTaskStore) QueryAvailable(eventType string) ([]*model.Task, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -364,14 +393,46 @@ func (s *MemoryTaskStore) removeAgent(task *model.Task, agentID string) bool {
 	return false
 }
 
-// addTerminal adds a task ID to the terminal list and performs FIFO eviction if needed.
+// addTerminal adds a task ID to the terminal list and performs dependency-aware FIFO eviction.
 func (s *MemoryTaskStore) addTerminal(taskID string) {
 	s.completed = append(s.completed, taskID)
-	for len(s.completed) > s.fifoLimit {
-		oldest := s.completed[0]
-		s.completed = s.completed[1:]
-		delete(s.tasks, oldest)
+	s.evictSafe()
+}
+
+// evictSafe 移除超出 fifoLimit 的终态任务，但跳过仍被非终态任务依赖的任务。
+func (s *MemoryTaskStore) evictSafe() {
+	need := len(s.completed) - s.fifoLimit
+	if need <= 0 {
+		return
 	}
+
+	newCompleted := make([]string, 0, len(s.completed))
+	evicted := 0
+
+	for _, id := range s.completed {
+		if evicted < need && !s.isDependedUpon(id) {
+			delete(s.tasks, id)
+			evicted++
+		} else {
+			newCompleted = append(newCompleted, id)
+		}
+	}
+	s.completed = newCompleted
+}
+
+// isDependedUpon 检���是否有非终态任务依赖指定 taskID。
+func (s *MemoryTaskStore) isDependedUpon(taskID string) bool {
+	for _, task := range s.tasks {
+		if model.IsTerminal(task.Status) {
+			continue
+		}
+		for _, dep := range task.Dependencies {
+			if dep == taskID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // sendEvent sends an event to the channel without blocking.
