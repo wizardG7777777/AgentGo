@@ -3,14 +3,17 @@ package cli
 import (
 	"bytes"
 	"context"
+	"io"
 	"strings"
 	"testing"
 	"time"
 
 	"agentgo/internal/config"
 	"agentgo/internal/llm"
+	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/scheduler"
+	"agentgo/internal/shell"
 	"agentgo/internal/store"
 )
 
@@ -25,7 +28,7 @@ func setup() (store.TaskStore, *scheduler.Scheduler, chan model.Event) {
 	cfg := config.DefaultConfig()
 	cfg.SchedulerTickerSec = 100 // 避免 ticker 干扰
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	sched := scheduler.New(s, &mockLLM{}, ch, cfg)
+	sched := scheduler.New(s, &mockLLM{}, ch, cfg, nil)
 	return s, sched, ch
 }
 
@@ -37,7 +40,7 @@ func TestCLI_QuitCommand(t *testing.T) {
 	cancelled := false
 	cancelFn := func() { cancelled = true }
 
-	c := New(s, ch, cancelFn, sched, input, output)
+	c := New(s, ch, cancelFn, sched, nil, nil, input, output)
 	c.Run(context.Background())
 
 	if !cancelled {
@@ -53,7 +56,7 @@ func TestCLI_StatusCommand_NoTasks(t *testing.T) {
 	input := strings.NewReader("/status\n/quit\n")
 	output := &bytes.Buffer{}
 
-	c := New(s, ch, func() {}, sched, input, output)
+	c := New(s, ch, func() {}, sched, nil, nil, input, output)
 	c.Run(context.Background())
 
 	if !strings.Contains(output.String(), "无活跃任务") {
@@ -70,7 +73,7 @@ func TestCLI_StatusCommand_WithTasks(t *testing.T) {
 	input := strings.NewReader("/status\n/quit\n")
 	output := &bytes.Buffer{}
 
-	c := New(s, ch, func() {}, sched, input, output)
+	c := New(s, ch, func() {}, sched, nil, nil, input, output)
 	c.Run(context.Background())
 
 	if !strings.Contains(output.String(), "pending") {
@@ -87,7 +90,7 @@ func TestCLI_CancelCommand(t *testing.T) {
 	input := strings.NewReader("/cancel " + task.ID + "\n/quit\n")
 	output := &bytes.Buffer{}
 
-	c := New(s, ch, func() {}, sched, input, output)
+	c := New(s, ch, func() {}, sched, nil, nil, input, output)
 	c.Run(context.Background())
 
 	got, _ := s.GetTask(task.ID)
@@ -102,7 +105,7 @@ func TestCLI_ModeToggle(t *testing.T) {
 	input := strings.NewReader("/mode\n/mode\n/quit\n")
 	output := &bytes.Buffer{}
 
-	c := New(s, ch, func() {}, sched, input, output)
+	c := New(s, ch, func() {}, sched, nil, nil, input, output)
 	c.Run(context.Background())
 
 	out := output.String()
@@ -120,7 +123,7 @@ func TestCLI_FreeText_SendsEvent(t *testing.T) {
 	input := strings.NewReader("分析 auth 模块\n/quit\n")
 	output := &bytes.Buffer{}
 
-	c := New(s, ch, func() {}, sched, input, output)
+	c := New(s, ch, func() {}, sched, nil, nil, input, output)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
@@ -147,7 +150,7 @@ func TestCLI_EmptyLine_Ignored(t *testing.T) {
 	input := strings.NewReader("\n\n/quit\n")
 	output := &bytes.Buffer{}
 
-	c := New(s, ch, func() {}, sched, input, output)
+	c := New(s, ch, func() {}, sched, nil, nil, input, output)
 	c.Run(context.Background())
 
 	// channel 应该是空的（空行不发事件）
@@ -165,7 +168,7 @@ func TestCLI_UnknownCommand(t *testing.T) {
 	input := strings.NewReader("/unknown\n/quit\n")
 	output := &bytes.Buffer{}
 
-	c := New(s, ch, func() {}, sched, input, output)
+	c := New(s, ch, func() {}, sched, nil, nil, input, output)
 	c.Run(context.Background())
 
 	if !strings.Contains(output.String(), "未知命令") {
@@ -179,12 +182,84 @@ func TestCLI_HelpCommand(t *testing.T) {
 	input := strings.NewReader("/help\n/quit\n")
 	output := &bytes.Buffer{}
 
-	c := New(s, ch, func() {}, sched, input, output)
+	c := New(s, ch, func() {}, sched, nil, nil, input, output)
 	c.Run(context.Background())
 
 	out := output.String()
 	if !strings.Contains(out, "/status") || !strings.Contains(out, "/quit") {
 		t.Errorf("help output should list commands, got: %s", out)
+	}
+}
+
+func TestCLI_HelpCommand_IncludesSteer(t *testing.T) {
+	s, sched, ch := setup()
+
+	input := strings.NewReader("/help\n/quit\n")
+	output := &bytes.Buffer{}
+
+	c := New(s, ch, func() {}, sched, nil, nil, input, output)
+	c.Run(context.Background())
+
+	if !strings.Contains(output.String(), "/steer") {
+		t.Errorf("help output should include /steer, got: %s", output.String())
+	}
+}
+
+func TestCLI_SteerCommand_SendsUserMessage(t *testing.T) {
+	s, sched, ch := setup()
+	reg := mailbox.NewRegistry(4)
+	mb := reg.Register("worker-1", "")
+
+	output := &bytes.Buffer{}
+	c := New(s, ch, func() {}, sched, reg, nil, strings.NewReader(""), output)
+
+	c.handleLine("/steer worker-1 请改用 JSON 格式")
+
+	msgs := mb.Drain()
+	if len(msgs) != 1 {
+		t.Fatalf("worker-1 mailbox message count = %d, want 1", len(msgs))
+	}
+	if msgs[0].From != "user" {
+		t.Errorf("message.From = %q, want %q", msgs[0].From, "user")
+	}
+	if msgs[0].To != "worker-1" {
+		t.Errorf("message.To = %q, want %q", msgs[0].To, "worker-1")
+	}
+	if msgs[0].Content != "请改用 JSON 格式" {
+		t.Errorf("message.Content = %q, want %q", msgs[0].Content, "请改用 JSON 格式")
+	}
+	if msgs[0].SentAt.IsZero() {
+		t.Error("message.SentAt should be set")
+	}
+	if !strings.Contains(output.String(), "[steer] 已向 worker-1 发送用户消息") {
+		t.Errorf("output should contain steer success message, got: %s", output.String())
+	}
+}
+
+func TestCLI_SteerCommand_InvalidUsage(t *testing.T) {
+	s, sched, ch := setup()
+	reg := mailbox.NewRegistry(4)
+	reg.Register("worker-1", "")
+
+	output := &bytes.Buffer{}
+	c := New(s, ch, func() {}, sched, reg, nil, strings.NewReader(""), output)
+
+	c.handleLine("/steer worker-1")
+
+	if !strings.Contains(output.String(), "用法: /steer <agentID> <消息内容>") {
+		t.Errorf("output should contain usage message, got: %s", output.String())
+	}
+}
+
+func TestCLI_SteerCommand_MailboxDisabled(t *testing.T) {
+	s, sched, ch := setup()
+	output := &bytes.Buffer{}
+
+	c := New(s, ch, func() {}, sched, nil, nil, strings.NewReader(""), output)
+	c.handleLine("/steer worker-1 hello")
+
+	if !strings.Contains(output.String(), "邮箱系统未启用") {
+		t.Errorf("output should contain mailbox disabled message, got: %s", output.String())
 	}
 }
 
@@ -197,10 +272,244 @@ func TestCLI_EOF_TriggersShutdown(t *testing.T) {
 	cancelled := false
 	cancelFn := func() { cancelled = true }
 
-	c := New(s, ch, cancelFn, sched, input, output)
+	c := New(s, ch, cancelFn, sched, nil, nil, input, output)
 	c.Run(context.Background())
 
 	if !cancelled {
 		t.Error("cancelFn should have been called on EOF")
 	}
+}
+
+func TestCLI_Approval_Granted(t *testing.T) {
+	s, sched, ch := setup()
+	approvalCh := make(chan shell.ApprovalRequest, 1)
+	output := &bytes.Buffer{}
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	c := New(s, ch, func() {}, sched, nil, approvalCh, pr, output)
+
+	replyCh := make(chan shell.ApprovalReply, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go c.Run(ctx)
+
+	// Send approval request after Run starts, so it lands in the select loop
+	time.Sleep(50 * time.Millisecond)
+	approvalCh <- shell.ApprovalRequest{
+		AgentID: "worker-1",
+		Command: "git push origin main",
+		ReplyCh: replyCh,
+	}
+
+	// Wait for handleApproval to be reading from lineCh, then write the answer
+	time.Sleep(50 * time.Millisecond)
+	pw.Write([]byte("y\n"))
+
+	select {
+	case reply := <-replyCh:
+		if !reply.Approved {
+			t.Error("expected Approved=true, got false")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for approval reply")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if !strings.Contains(output.String(), "已放行") {
+		t.Errorf("output should contain '已放行', got: %s", output.String())
+	}
+
+	pw.Write([]byte("/quit\n"))
+}
+
+func TestCLI_Approval_Denied(t *testing.T) {
+	s, sched, ch := setup()
+	approvalCh := make(chan shell.ApprovalRequest, 1)
+	output := &bytes.Buffer{}
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	c := New(s, ch, func() {}, sched, nil, approvalCh, pr, output)
+
+	replyCh := make(chan shell.ApprovalReply, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go c.Run(ctx)
+
+	time.Sleep(50 * time.Millisecond)
+	approvalCh <- shell.ApprovalRequest{
+		AgentID: "worker-2",
+		Command: "chmod 777 /tmp/secret",
+		ReplyCh: replyCh,
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	pw.Write([]byte("n\n"))
+
+	select {
+	case reply := <-replyCh:
+		if reply.Approved {
+			t.Error("expected Approved=false, got true")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for approval reply")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if !strings.Contains(output.String(), "已拒绝") {
+		t.Errorf("output should contain '已拒绝', got: %s", output.String())
+	}
+
+	pw.Write([]byte("/quit\n"))
+}
+
+func TestCLI_Approval_UserGuidance(t *testing.T) {
+	s, sched, ch := setup()
+	approvalCh := make(chan shell.ApprovalRequest, 1)
+	output := &bytes.Buffer{}
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	c := New(s, ch, func() {}, sched, nil, approvalCh, pr, output)
+
+	replyCh := make(chan shell.ApprovalReply, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go c.Run(ctx)
+
+	time.Sleep(50 * time.Millisecond)
+	approvalCh <- shell.ApprovalRequest{
+		AgentID: "worker-3",
+		Command: "git push origin main",
+		ReplyCh: replyCh,
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	pw.Write([]byte("请改用 dry-run\n"))
+
+	select {
+	case reply := <-replyCh:
+		if reply.Approved {
+			t.Error("expected Approved=false, got true")
+		}
+		if reply.Message != "请改用 dry-run" {
+			t.Errorf("expected Message=%q, got %q", "请改用 dry-run", reply.Message)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for approval reply")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if !strings.Contains(output.String(), "已将指导发送给") {
+		t.Errorf("output should contain '已将指导发送给', got: %s", output.String())
+	}
+
+	pw.Write([]byte("/quit\n"))
+}
+
+func TestCLI_Approval_ContextCancel(t *testing.T) {
+	s, sched, ch := setup()
+	approvalCh := make(chan shell.ApprovalRequest, 1)
+	output := &bytes.Buffer{}
+
+	// Use a pipe so stdin blocks forever (no input available)
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	c := New(s, ch, func() {}, sched, nil, approvalCh, pr, output)
+
+	replyCh := make(chan shell.ApprovalReply, 1)
+	approvalCh <- shell.ApprovalRequest{
+		AgentID: "worker-4",
+		Command: "git reset --hard",
+		ReplyCh: replyCh,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go c.Run(ctx)
+
+	// Give Run time to start and pick up the approval request
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case reply := <-replyCh:
+		if reply.Approved {
+			t.Error("expected Approved=false on context cancel, got true")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for approval reply after context cancel")
+	}
+}
+
+func TestCLI_Approval_Multiple_Queued(t *testing.T) {
+	s, sched, ch := setup()
+	approvalCh := make(chan shell.ApprovalRequest, 2)
+	output := &bytes.Buffer{}
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	c := New(s, ch, func() {}, sched, nil, approvalCh, pr, output)
+
+	replyCh1 := make(chan shell.ApprovalReply, 1)
+	replyCh2 := make(chan shell.ApprovalReply, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go c.Run(ctx)
+
+	// Send first approval request
+	time.Sleep(50 * time.Millisecond)
+	approvalCh <- shell.ApprovalRequest{
+		AgentID: "worker-a",
+		Command: "git push",
+		ReplyCh: replyCh1,
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	pw.Write([]byte("y\n"))
+
+	select {
+	case reply := <-replyCh1:
+		if !reply.Approved {
+			t.Error("first request: expected Approved=true, got false")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for first approval reply")
+	}
+
+	// Send second approval request
+	time.Sleep(50 * time.Millisecond)
+	approvalCh <- shell.ApprovalRequest{
+		AgentID: "worker-b",
+		Command: "chmod 755 deploy.sh",
+		ReplyCh: replyCh2,
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	pw.Write([]byte("n\n"))
+
+	select {
+	case reply := <-replyCh2:
+		if reply.Approved {
+			t.Error("second request: expected Approved=false, got true")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for second approval reply")
+	}
+
+	pw.Write([]byte("/quit\n"))
 }

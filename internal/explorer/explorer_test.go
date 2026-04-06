@@ -11,6 +11,7 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
 	"agentgo/internal/llm"
+	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
@@ -38,6 +39,13 @@ func setup() (store.TaskStore, roster.Roster, chan model.Event) {
 	return s, r, ch
 }
 
+// setupTools 创建注册了只读工具的 ToolRegistry，用于工具函数单元测试。
+func setupTools() *agent.ToolRegistry {
+	tools := agent.NewToolRegistry()
+	registerExplorerTools(tools, &explorerWorkdirHolder{}, nil, nil, "test-explorer") // 空 projectRoot = 不限制, nil mbRegistry
+	return tools
+}
+
 func TestExplorer_OnlyClaimsExploreEvents(t *testing.T) {
 	s, r, _ := setup()
 	cfg := config.DefaultConfig()
@@ -46,28 +54,25 @@ func TestExplorer_OnlyClaimsExploreEvents(t *testing.T) {
 		responses: []llm.Response{{Content: "调查结果"}},
 	}
 
-	// 发布一个 explore 任务和一个 code 任务
 	exploreTask := &model.Task{Description: "调查文件结构", EventType: "explore"}
 	s.PublishTask(exploreTask)
 	codeTask := &model.Task{Description: "写代码", EventType: "code"}
 	s.PublishTask(codeTask)
 
-	exp := New(s, r, mock, cfg, nil)
+	exp := New(s, r, mock, cfg, nil, nil, nil)
 	exp.agent.PollInterval = 10 * time.Millisecond
-	exp.agent.IdleThreshold = 5 // 测试中启用空闲退出
+	exp.agent.IdleThreshold = 5
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
 	exp.Run(ctx)
 
-	// explore 任务应被完成
 	got, _ := s.GetTask(exploreTask.ID)
 	if got.Status != model.TaskStatusCompleted {
 		t.Errorf("explore task status = %s, want completed", got.Status)
 	}
 
-	// code 任务应仍然 pending
 	got2, _ := s.GetTask(codeTask.ID)
 	if got2.Status != model.TaskStatusPending {
 		t.Errorf("code task status = %s, want pending", got2.Status)
@@ -78,7 +83,6 @@ func TestExplorer_UsesReadOnlyTools(t *testing.T) {
 	s, r, _ := setup()
 	cfg := config.DefaultConfig()
 
-	// LLM 返回一个 read_file 工具调用，然后完成
 	mock := &mockLLMClient{
 		responses: []llm.Response{
 			{
@@ -93,7 +97,7 @@ func TestExplorer_UsesReadOnlyTools(t *testing.T) {
 	task := &model.Task{Description: "检查文件", EventType: "explore"}
 	s.PublishTask(task)
 
-	exp := New(s, r, mock, cfg, nil)
+	exp := New(s, r, mock, cfg, nil, nil, nil)
 	exp.agent.PollInterval = 10 * time.Millisecond
 	exp.agent.IdleThreshold = 3
 
@@ -113,7 +117,7 @@ func TestExplorer_ContextCancellation(t *testing.T) {
 	cfg := config.DefaultConfig()
 	mock := &mockLLMClient{}
 
-	exp := New(s, r, mock, cfg, nil)
+	exp := New(s, r, mock, cfg, nil, nil, nil)
 	exp.agent.PollInterval = 10 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -133,42 +137,54 @@ func TestExplorer_ContextCancellation(t *testing.T) {
 	}
 }
 
-// 工具函数单元测试
+// 工具函数单元测试 — 通过 ToolRegistry.Dispatch 调用
 
 func TestToolReadFile(t *testing.T) {
+	tools := setupTools()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.txt")
 	os.WriteFile(path, []byte("hello world"), 0644)
 
-	content, err := toolReadFile(context.Background(), map[string]any{"path": path})
+	content, err := tools.Dispatch(context.Background(), llm.ToolCall{
+		ID: "test", Name: "read_file", Arguments: map[string]any{"path": path},
+	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if content != "hello world" {
-		t.Errorf("content = %q, want %q", content, "hello world")
+	if !strings.Contains(content, "hello world") {
+		t.Errorf("content should contain 'hello world': %q", content)
 	}
 }
 
 func TestToolReadFile_NotFound(t *testing.T) {
-	_, err := toolReadFile(context.Background(), map[string]any{"path": "/nonexistent/file.txt"})
+	tools := setupTools()
+	_, err := tools.Dispatch(context.Background(), llm.ToolCall{
+		ID: "test", Name: "read_file", Arguments: map[string]any{"path": "/nonexistent/file.txt"},
+	})
 	if err == nil {
 		t.Fatal("expected error for nonexistent file")
 	}
 }
 
 func TestToolReadFile_MissingArg(t *testing.T) {
-	_, err := toolReadFile(context.Background(), map[string]any{})
+	tools := setupTools()
+	_, err := tools.Dispatch(context.Background(), llm.ToolCall{
+		ID: "test", Name: "read_file", Arguments: map[string]any{},
+	})
 	if err == nil {
 		t.Fatal("expected error for missing path")
 	}
 }
 
 func TestToolListFiles(t *testing.T) {
+	tools := setupTools()
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "a.txt"), []byte(""), 0644)
 	os.Mkdir(filepath.Join(dir, "subdir"), 0755)
 
-	result, err := toolListFiles(context.Background(), map[string]any{"path": dir})
+	result, err := tools.Dispatch(context.Background(), llm.ToolCall{
+		ID: "test", Name: "list_files", Arguments: map[string]any{"path": dir},
+	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -181,12 +197,12 @@ func TestToolListFiles(t *testing.T) {
 }
 
 func TestToolGrepSearch(t *testing.T) {
+	tools := setupTools()
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "code.go"), []byte("func main() {\n\tfmt.Println(\"hello\")\n}"), 0644)
 
-	result, err := toolGrepSearch(context.Background(), map[string]any{
-		"pattern": "Println",
-		"path":    dir,
+	result, err := tools.Dispatch(context.Background(), llm.ToolCall{
+		ID: "test", Name: "grep_search", Arguments: map[string]any{"pattern": "Println", "path": dir},
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -197,12 +213,12 @@ func TestToolGrepSearch(t *testing.T) {
 }
 
 func TestToolGrepSearch_NoMatch(t *testing.T) {
+	tools := setupTools()
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "empty.txt"), []byte("nothing here"), 0644)
 
-	result, err := toolGrepSearch(context.Background(), map[string]any{
-		"pattern": "nonexistent_pattern_xyz",
-		"path":    dir,
+	result, err := tools.Dispatch(context.Background(), llm.ToolCall{
+		ID: "test", Name: "grep_search", Arguments: map[string]any{"pattern": "nonexistent_xyz", "path": dir},
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -212,14 +228,13 @@ func TestToolGrepSearch_NoMatch(t *testing.T) {
 	}
 }
 
-// 验证 registerReadOnlyTools 注册了预期的工具
-func TestRegisterReadOnlyTools(t *testing.T) {
+func TestRegisterExplorerTools(t *testing.T) {
 	tools := agent.NewToolRegistry()
-	registerReadOnlyTools(tools)
+	registerExplorerTools(tools, &explorerWorkdirHolder{}, nil, nil, "test-explorer") // nil mbRegistry = no send_message
 
 	defs := tools.Defs()
 	if len(defs) != 4 {
-		t.Fatalf("tool count = %d, want 4", len(defs))
+		t.Fatalf("tool count = %d, want 4 (no mbRegistry)", len(defs))
 	}
 
 	names := make(map[string]bool)
@@ -230,5 +245,27 @@ func TestRegisterReadOnlyTools(t *testing.T) {
 		if !names[expected] {
 			t.Errorf("missing tool: %s", expected)
 		}
+	}
+}
+
+func TestRegisterExplorerTools_WithMailbox_IncludesSendMessage(t *testing.T) {
+	reg := mailbox.NewRegistry(4)
+	reg.Register("explorer-1", "explore")
+	reg.Register("worker-1", "")
+
+	tools := agent.NewToolRegistry()
+	registerExplorerTools(tools, &explorerWorkdirHolder{}, nil, reg, "explorer-1")
+
+	defs := tools.Defs()
+	if len(defs) != 5 {
+		t.Fatalf("tool count = %d, want 5 (with mbRegistry)", len(defs))
+	}
+
+	names := make(map[string]bool)
+	for _, d := range defs {
+		names[d.Name] = true
+	}
+	if !names["send_message"] {
+		t.Fatal("send_message tool should be registered when mbRegistry is provided")
 	}
 }

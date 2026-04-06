@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math/rand"
 	"time"
 
 	"agentgo/internal/config"
@@ -56,10 +55,7 @@ func (w *Watchdog) inspect() {
 		return
 	}
 
-	// Random sample ~50% of tasks
-	sampled := sampleTasks(tasks)
-
-	for _, task := range sampled {
+	for _, task := range tasks {
 		w.checkTask(task)
 	}
 
@@ -184,22 +180,4 @@ func (w *Watchdog) cleanupStaleClaims(tasks []*model.Task) {
 			w.Roster.ReleaseAll(agentID)
 		}
 	}
-}
-
-// sampleTasks randomly samples approximately 50% of the tasks.
-func sampleTasks(tasks []*model.Task) []*model.Task {
-	if len(tasks) <= 1 {
-		return tasks
-	}
-	result := make([]*model.Task, 0, len(tasks)/2+1)
-	for _, task := range tasks {
-		if rand.Float64() < 0.5 {
-			result = append(result, task)
-		}
-	}
-	// Ensure at least one task is checked
-	if len(result) == 0 && len(tasks) > 0 {
-		result = append(result, tasks[0])
-	}
-	return result
 }

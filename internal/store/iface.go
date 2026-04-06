@@ -12,6 +12,7 @@ type TaskStore interface {
 	FailTask(agentID string, taskID string, reason string) error
 	FailTaskBySystem(taskID string, reason string) error
 	RetryRollback(agentID string, taskID string, reason string) error
+	AppendOutput(agentID string, taskID string, chunk string) error
 
 	// Non-atomic read operations (snapshot, no lock required)
 

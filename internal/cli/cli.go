@@ -9,30 +9,36 @@ import (
 
 	"time"
 
+	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/scheduler"
+	"agentgo/internal/shell"
 	"agentgo/internal/store"
 )
 
 // CLI 处理用户输入，分发命令，发送事件到调度器。
 type CLI struct {
-	store     store.TaskStore
-	eventCh   chan<- model.Event
-	cancelFn  context.CancelFunc
-	scheduler *scheduler.Scheduler
-	reader    io.Reader
-	writer    io.Writer
+	store      store.TaskStore
+	eventCh    chan<- model.Event
+	cancelFn   context.CancelFunc
+	scheduler  *scheduler.Scheduler
+	mbRegistry *mailbox.Registry            // 邮箱注册表，用于 /steer 命令
+	approvalCh <-chan shell.ApprovalRequest // 命令审批请求通道，由 Worker 发送
+	reader     io.Reader
+	writer     io.Writer
 }
 
 // New 创建 CLI 实例。reader/writer 用于输入输出，方便测试注入。
-func New(s store.TaskStore, eventCh chan<- model.Event, cancelFn context.CancelFunc, sched *scheduler.Scheduler, reader io.Reader, writer io.Writer) *CLI {
+func New(s store.TaskStore, eventCh chan<- model.Event, cancelFn context.CancelFunc, sched *scheduler.Scheduler, mbRegistry *mailbox.Registry, approvalCh <-chan shell.ApprovalRequest, reader io.Reader, writer io.Writer) *CLI {
 	return &CLI{
-		store:     s,
-		eventCh:   eventCh,
-		cancelFn:  cancelFn,
-		scheduler: sched,
-		reader:    reader,
-		writer:    writer,
+		store:      s,
+		eventCh:    eventCh,
+		cancelFn:   cancelFn,
+		scheduler:  sched,
+		mbRegistry: mbRegistry,
+		approvalCh: approvalCh,
+		reader:     reader,
+		writer:     writer,
 	}
 }
 
@@ -55,6 +61,9 @@ func (c *CLI) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case req := <-c.approvalCh:
+			c.handleApproval(req, lineCh, ctx)
+			fmt.Fprint(c.writer, "> ")
 		case line := <-lineCh:
 			shouldQuit := c.handleLine(strings.TrimSpace(line))
 			if shouldQuit {
@@ -91,6 +100,9 @@ func (c *CLI) handleLine(line string) bool {
 	case strings.HasPrefix(line, "/cancel "):
 		taskID := strings.TrimSpace(strings.TrimPrefix(line, "/cancel "))
 		c.cancelTask(taskID)
+
+	case strings.HasPrefix(line, "/steer "):
+		c.steer(strings.TrimPrefix(line, "/steer "))
 
 	case line == "/help":
 		c.printHelp()
@@ -165,12 +177,77 @@ func (c *CLI) cancelTask(taskID string) {
 	}
 }
 
+func (c *CLI) steer(args string) {
+	// 格式: /steer <agentID> <message>
+	parts := strings.SplitN(strings.TrimSpace(args), " ", 2)
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		fmt.Fprintln(c.writer, "[错误] 用法: /steer <agentID> <消息内容>")
+		fmt.Fprintln(c.writer, "  示例: /steer worker-1 请改用 JSON 格式")
+		return
+	}
+	agentID := parts[0]
+	content := parts[1]
+
+	if c.mbRegistry == nil {
+		fmt.Fprintln(c.writer, "[错误] 邮箱系统未启用")
+		return
+	}
+
+	msg := mailbox.Message{
+		From:     "user",
+		To:       agentID,
+		Content:  content,
+		Summary:  content, // 用户纠偏消息通常简短，summary 直接用原文
+		Type:     mailbox.MsgTypeSteer,
+		Priority: mailbox.PriorityHigh,
+		SentAt:   time.Now(),
+	}
+	if err := c.mbRegistry.Send(msg); err != nil {
+		fmt.Fprintf(c.writer, "[错误] 发送失败: %v\n", err)
+		return
+	}
+	fmt.Fprintf(c.writer, "[steer] 已向 %s 发送用户消息\n", agentID)
+}
+
 func (c *CLI) printHelp() {
 	fmt.Fprintln(c.writer, "可用命令:")
-	fmt.Fprintln(c.writer, "  /status       — 查看活跃任务")
-	fmt.Fprintln(c.writer, "  /cancel <id>  — 取消指定任务")
-	fmt.Fprintln(c.writer, "  /mode         — 切换即时/计划模式")
-	fmt.Fprintln(c.writer, "  /quit         — 退出程序")
-	fmt.Fprintln(c.writer, "  /help         — 显示此帮助")
-	fmt.Fprintln(c.writer, "  其他文本      — 作为用户请求发送给调度器")
+	fmt.Fprintln(c.writer, "  /status              — 查看活跃任务")
+	fmt.Fprintln(c.writer, "  /cancel <id>         — 取消指定任务")
+	fmt.Fprintln(c.writer, "  /steer <agent> <msg> — 向指定代理发送用户纠偏消息")
+	fmt.Fprintln(c.writer, "  /mode                — 切换即时/计划模式")
+	fmt.Fprintln(c.writer, "  /quit                — 退出程序")
+	fmt.Fprintln(c.writer, "  /help                — 显示此帮助")
+	fmt.Fprintln(c.writer, "  其他文本             — 作为用户请求发送给调度器")
+}
+
+// handleApproval 处理来自 Worker 的命令审批请求，阻塞等待用户输入。
+func (c *CLI) handleApproval(req shell.ApprovalRequest, lineCh <-chan string, ctx context.Context) {
+	fmt.Fprintf(c.writer, "\n╔══════════════════════════════════════╗\n")
+	fmt.Fprintf(c.writer, "║  ⚠ 命令审批请求                      ║\n")
+	fmt.Fprintf(c.writer, "╠══════════════════════════════════════╣\n")
+	fmt.Fprintf(c.writer, "  代理: %s\n", req.AgentID)
+	fmt.Fprintf(c.writer, "  命令: %s\n", req.Command)
+	fmt.Fprintf(c.writer, "╠══════════════════════════════════════╣\n")
+	fmt.Fprintf(c.writer, "  y = 允许一次  n = 禁止\n")
+	fmt.Fprintf(c.writer, "  或直接输入文字作为指导发送给代理\n")
+	fmt.Fprintf(c.writer, "╚══════════════════════════════════════╝\n")
+	fmt.Fprint(c.writer, "[审批] > ")
+
+	select {
+	case <-ctx.Done():
+		req.ReplyCh <- shell.ApprovalReply{Approved: false}
+	case answer := <-lineCh:
+		answer = strings.TrimSpace(answer)
+		switch strings.ToLower(answer) {
+		case "y", "yes":
+			req.ReplyCh <- shell.ApprovalReply{Approved: true}
+			fmt.Fprintln(c.writer, "[审批] 已放行")
+		case "n", "no", "":
+			req.ReplyCh <- shell.ApprovalReply{Approved: false}
+			fmt.Fprintln(c.writer, "[审批] 已拒绝")
+		default:
+			req.ReplyCh <- shell.ApprovalReply{Approved: false, Message: answer}
+			fmt.Fprintf(c.writer, "[审批] 已将指导发送给 %s\n", req.AgentID)
+		}
+	}
 }

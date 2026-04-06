@@ -1,7 +1,9 @@
 package worker
 
 import (
+	"agentgo/internal/model"
 	"agentgo/internal/roster"
+	"agentgo/internal/store"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -452,7 +454,7 @@ func TestProperty_NonSingleMatchReject(t *testing.T) {
 // Works on both Windows (cmd /C) and Unix (sh -c).
 // Validates: Requirements 1.1, 1.2, 1.3
 func TestRunShell_EchoHello(t *testing.T) {
-	toolFn := makeRunShellTool(30)
+	toolFn := makeRunShellTool(30, &currentWorkdirHolder{})
 	result, err := toolFn(context.Background(), map[string]any{
 		"command": "echo hello",
 	})
@@ -479,7 +481,7 @@ func TestRunShell_NonZeroExitCode(t *testing.T) {
 		command = "exit 1"
 	}
 
-	toolFn := makeRunShellTool(30)
+	toolFn := makeRunShellTool(30, &currentWorkdirHolder{})
 	result, err := toolFn(context.Background(), map[string]any{
 		"command": command,
 	})
@@ -494,7 +496,7 @@ func TestRunShell_NonZeroExitCode(t *testing.T) {
 // TestRunShell_EmptyCommand verifies that an empty command returns a parameter error.
 // Validates: Requirements 1.5
 func TestRunShell_EmptyCommand(t *testing.T) {
-	toolFn := makeRunShellTool(30)
+	toolFn := makeRunShellTool(30, &currentWorkdirHolder{})
 	_, err := toolFn(context.Background(), map[string]any{
 		"command": "",
 	})
@@ -507,7 +509,7 @@ func TestRunShell_EmptyCommand(t *testing.T) {
 }
 
 // TestRunShell_Timeout verifies that a long-running command is killed after the timeout and returns a timeout error.
-// Uses makeRunShellTool(1) with a long-running command to trigger a 1-second timeout.
+// Uses makeRunShellTool(1, &currentWorkdirHolder{}) with a long-running command to trigger a 1-second timeout.
 // Validates: Requirements 1.6
 func TestRunShell_Timeout(t *testing.T) {
 	// Use a cross-platform long-running command
@@ -518,7 +520,7 @@ func TestRunShell_Timeout(t *testing.T) {
 		command = "sleep 60"
 	}
 
-	toolFn := makeRunShellTool(1) // 1 second timeout
+	toolFn := makeRunShellTool(1, &currentWorkdirHolder{}) // 1 second timeout
 	_, err := toolFn(context.Background(), map[string]any{
 		"command": command,
 	})
@@ -545,7 +547,7 @@ func TestEditFile_RosterLockFlow(t *testing.T) {
 
 	r := roster.NewMemoryRoster()
 	agentID := "test-agent"
-	toolFn := makeEditFileTool(r, agentID)
+	toolFn := makeEditFileTool(r, agentID, &currentWorkdirHolder{}, nil)
 
 	result, err := toolFn(context.Background(), map[string]any{
 		"path":    filePath,
@@ -599,7 +601,7 @@ func TestEditFile_RosterConflict(t *testing.T) {
 	}
 
 	// Now try to edit with a different agent
-	toolFn := makeEditFileTool(r, "test-agent")
+	toolFn := makeEditFileTool(r, "test-agent", &currentWorkdirHolder{}, nil)
 	_, err = toolFn(context.Background(), map[string]any{
 		"path":    filePath,
 		"old_str": "content",
@@ -629,7 +631,7 @@ func TestEditFile_RosterConflict(t *testing.T) {
 // Validates: Requirements 2.7
 func TestEditFile_MissingParams(t *testing.T) {
 	r := roster.NewMemoryRoster()
-	toolFn := makeEditFileTool(r, "test-agent")
+	toolFn := makeEditFileTool(r, "test-agent", &currentWorkdirHolder{}, nil)
 
 	t.Run("empty_path", func(t *testing.T) {
 		_, err := toolFn(context.Background(), map[string]any{
@@ -664,7 +666,7 @@ func TestEditFile_MissingParams(t *testing.T) {
 // Validates: Requirements 2.8
 func TestEditFile_FileNotFound(t *testing.T) {
 	r := roster.NewMemoryRoster()
-	toolFn := makeEditFileTool(r, "test-agent")
+	toolFn := makeEditFileTool(r, "test-agent", &currentWorkdirHolder{}, nil)
 
 	nonExistentPath := filepath.Join(t.TempDir(), "does_not_exist.txt")
 
@@ -930,7 +932,7 @@ func computeTestSHA256(data []byte) string {
 func TestProperty_BugCondition_WriteFile(t *testing.T) {
 	r := roster.NewMemoryRoster()
 	agentID := "test-agent"
-	writeTool := makeWriteFileTool(r, agentID)
+	writeTool := makeWriteFileTool(r, agentID, &currentWorkdirHolder{}, nil)
 
 	f := func(seed int64) bool {
 		rng := rand.New(rand.NewSource(seed))
@@ -1017,7 +1019,7 @@ func TestProperty_BugCondition_WriteFile(t *testing.T) {
 func TestProperty_BugCondition_EditFile(t *testing.T) {
 	r := roster.NewMemoryRoster()
 	agentID := "test-agent"
-	editTool := makeEditFileTool(r, agentID)
+	editTool := makeEditFileTool(r, agentID, &currentWorkdirHolder{}, nil)
 
 	f := func(seed int64) bool {
 		rng := rand.New(rand.NewSource(seed))
@@ -1108,7 +1110,7 @@ func TestProperty_BugCondition_EditFile(t *testing.T) {
 func TestProperty_Preservation_WriteWithoutHash(t *testing.T) {
 	r := roster.NewMemoryRoster()
 	agentID := "test-agent"
-	writeTool := makeWriteFileTool(r, agentID)
+	writeTool := makeWriteFileTool(r, agentID, &currentWorkdirHolder{}, nil)
 
 	f := func(seed int64) bool {
 		rng := rand.New(rand.NewSource(seed))
@@ -1170,7 +1172,7 @@ func TestProperty_Preservation_WriteWithoutHash(t *testing.T) {
 func TestProperty_Preservation_EditWithoutHash(t *testing.T) {
 	r := roster.NewMemoryRoster()
 	agentID := "test-agent"
-	editTool := makeEditFileTool(r, agentID)
+	editTool := makeEditFileTool(r, agentID, &currentWorkdirHolder{}, nil)
 
 	f := func(seed int64) bool {
 		rng := rand.New(rand.NewSource(seed))
@@ -1254,7 +1256,7 @@ func TestProperty_Preservation_RosterLockConflict(t *testing.T) {
 			r := roster.NewMemoryRoster()
 			myAgentID := "my-agent"
 			otherAgentID := fmt.Sprintf("other-agent-%d", rng.Int63())
-			writeTool := makeWriteFileTool(r, myAgentID)
+			writeTool := makeWriteFileTool(r, myAgentID, &currentWorkdirHolder{}, nil)
 
 			// Create a temp file
 			tmpDir := t.TempDir()
@@ -1312,7 +1314,7 @@ func TestProperty_Preservation_RosterLockConflict(t *testing.T) {
 			r := roster.NewMemoryRoster()
 			myAgentID := "my-agent"
 			otherAgentID := fmt.Sprintf("other-agent-%d", rng.Int63())
-			editTool := makeEditFileTool(r, myAgentID)
+			editTool := makeEditFileTool(r, myAgentID, &currentWorkdirHolder{}, nil)
 
 			// Create a temp file with content containing a unique marker
 			tmpDir := t.TempDir()
@@ -1364,4 +1366,205 @@ func TestProperty_Preservation_RosterLockConflict(t *testing.T) {
 			t.Errorf("Property 2 (Preservation - EditFile RosterConflict) failed: %v", err)
 		}
 	})
+}
+
+// --- publish_subtask 深度控制测试 ---
+
+func setupTestStore() (store.TaskStore, chan model.Event) {
+	ch := make(chan model.Event, 64)
+	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
+	return s, ch
+}
+
+// TestPublishSubtask_Basic 验证基本子任务发布：父任务 Depth=0，子任务应为 Depth=1。
+func TestPublishSubtask_Basic(t *testing.T) {
+	s, _ := setupTestStore()
+
+	parentTask := &model.Task{Description: "root task", Depth: 0}
+	if err := s.PublishTask(parentTask); err != nil {
+		t.Fatal(err)
+	}
+
+	holder := &currentTaskHolder{}
+	holder.Set(parentTask.ID)
+
+	toolFn := makePublishSubtaskTool(s, 1, holder)
+
+	result, err := toolFn(context.Background(), map[string]any{
+		"description": "子任务描述",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(result, "depth=1") {
+		t.Errorf("expected depth=1 in result, got: %s", result)
+	}
+	if !strings.Contains(result, "子任务已发布") {
+		t.Errorf("expected success message, got: %s", result)
+	}
+
+	// 验证子任务确实被发布到了 store 中
+	allTasks, _ := s.ScanAll()
+	found := false
+	for _, task := range allTasks {
+		if task.Description == "子任务描述" {
+			found = true
+			if task.Depth != 1 {
+				t.Errorf("child task Depth = %d, want 1", task.Depth)
+			}
+			if task.EventSource != parentTask.ID {
+				t.Errorf("child task EventSource = %s, want %s", task.EventSource, parentTask.ID)
+			}
+		}
+	}
+	if !found {
+		t.Error("child task not found in store")
+	}
+}
+
+// TestPublishSubtask_DepthLimit 验证深度限制：父任务 Depth=1，maxDepth=1 时应被拒绝。
+func TestPublishSubtask_DepthLimit(t *testing.T) {
+	s, _ := setupTestStore()
+
+	parentTask := &model.Task{Description: "level 1 task", Depth: 1}
+	if err := s.PublishTask(parentTask); err != nil {
+		t.Fatal(err)
+	}
+
+	holder := &currentTaskHolder{}
+	holder.Set(parentTask.ID)
+
+	toolFn := makePublishSubtaskTool(s, 1, holder)
+
+	_, err := toolFn(context.Background(), map[string]any{
+		"description": "不应该成功的子任务",
+	})
+	if err == nil {
+		t.Fatal("expected error for depth limit, got nil")
+	}
+	if !strings.Contains(err.Error(), "已达最大允许深度") {
+		t.Errorf("error message should contain depth limit message, got: %v", err)
+	}
+}
+
+// TestPublishSubtask_MissingDescription 验证缺少 description 参数时返回错误。
+func TestPublishSubtask_MissingDescription(t *testing.T) {
+	s, _ := setupTestStore()
+	holder := &currentTaskHolder{}
+
+	toolFn := makePublishSubtaskTool(s, 1, holder)
+
+	_, err := toolFn(context.Background(), map[string]any{})
+	if err == nil {
+		t.Fatal("expected error for missing description, got nil")
+	}
+	if !strings.Contains(err.Error(), "缺少 description 参数") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestPublishSubtask_DepthZeroLimit 验证 maxDepth=0 时表示不限制，任何深度都可以发布子任务。
+func TestPublishSubtask_DepthZeroLimit(t *testing.T) {
+	s, _ := setupTestStore()
+
+	parentTask := &model.Task{Description: "deep task", Depth: 10}
+	if err := s.PublishTask(parentTask); err != nil {
+		t.Fatal(err)
+	}
+
+	holder := &currentTaskHolder{}
+	holder.Set(parentTask.ID)
+
+	toolFn := makePublishSubtaskTool(s, 0, holder) // maxDepth=0 表示不限制
+
+	result, err := toolFn(context.Background(), map[string]any{
+		"description": "应该成功的深层子任务",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error with maxDepth=0: %v", err)
+	}
+	if !strings.Contains(result, "depth=11") {
+		t.Errorf("expected depth=11 in result, got: %s", result)
+	}
+}
+
+// TestPublishSubtask_WithEventType 验证 event_type 参数正确传递到子任务。
+func TestPublishSubtask_WithEventType(t *testing.T) {
+	s, _ := setupTestStore()
+
+	parentTask := &model.Task{Description: "root task", Depth: 0}
+	if err := s.PublishTask(parentTask); err != nil {
+		t.Fatal(err)
+	}
+
+	holder := &currentTaskHolder{}
+	holder.Set(parentTask.ID)
+
+	toolFn := makePublishSubtaskTool(s, 2, holder)
+
+	_, err := toolFn(context.Background(), map[string]any{
+		"description": "调查子任务",
+		"event_type":  "explore",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	allTasks, _ := s.ScanAll()
+	for _, task := range allTasks {
+		if task.Description == "调查子任务" {
+			if task.EventType != "explore" {
+				t.Errorf("child task EventType = %s, want 'explore'", task.EventType)
+			}
+			return
+		}
+	}
+	t.Error("child task with event_type not found")
+}
+
+// TestGlobSearch_PathSecurity 验证 makeGlobSearchTool 在 root_dir 超出项目根目录时拒绝访问。
+func TestGlobSearch_PathSecurity(t *testing.T) {
+	// 创建临时目录作为项目根目录
+	projectRoot := t.TempDir()
+
+	// 在项目根目录内创建一个文件用于正常匹配
+	innerDir := filepath.Join(projectRoot, "src")
+	os.MkdirAll(innerDir, 0755)
+	os.WriteFile(filepath.Join(innerDir, "main.go"), []byte("package main"), 0644)
+
+	toolFn := makeGlobSearchTool(&currentWorkdirHolder{fallback: projectRoot})
+
+	// 测试1：root_dir 指向项目外部目录，应被拒绝
+	outsideDir := t.TempDir() // 不同的临时目录，在 projectRoot 之外
+	_, err := toolFn(context.Background(), map[string]any{
+		"pattern":  "*.go",
+		"root_dir": outsideDir,
+	})
+	if err == nil {
+		t.Error("期望 root_dir 超出项目根目录时返回错误")
+	}
+	if !strings.Contains(err.Error(), "超出项目根目录") {
+		t.Errorf("错误信息应包含 '超出项目根目录', 实际: %s", err.Error())
+	}
+
+	// 测试2：root_dir 在项目内部，应正常工作
+	result, err := toolFn(context.Background(), map[string]any{
+		"pattern":  "*.go",
+		"root_dir": innerDir,
+	})
+	if err != nil {
+		t.Errorf("项目内部目录不应报错: %v", err)
+	}
+	if !strings.Contains(result, "main.go") {
+		t.Errorf("期望结果包含 main.go, 实际: %s", result)
+	}
+
+	// 测试3：root_dir 为空时不进行校验（使用默认 "."）
+	_, err = toolFn(context.Background(), map[string]any{
+		"pattern": "*.go",
+	})
+	if err != nil {
+		t.Errorf("空 root_dir 不应报错: %v", err)
+	}
 }
