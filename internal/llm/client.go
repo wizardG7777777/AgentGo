@@ -108,9 +108,9 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 		Model: c.model,
 	}
 
-	// 插入 system prompt
+	// 插入 system prompt（使用 system 角色以兼容 Dashscope 等非 OpenAI 后端）
 	if c.systemPrompt != "" {
-		params.Messages = append(params.Messages, openai.DeveloperMessage(c.systemPrompt))
+		params.Messages = append(params.Messages, openai.SystemMessage(c.systemPrompt))
 	}
 
 	// 转换消息
@@ -202,7 +202,7 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 func convertMessage(m Message) (openai.ChatCompletionMessageParamUnion, error) {
 	switch m.Role {
 	case "system":
-		return openai.DeveloperMessage(m.Content), nil
+		return openai.SystemMessage(m.Content), nil
 	case "user":
 		return openai.UserMessage(m.Content), nil
 	case "assistant":

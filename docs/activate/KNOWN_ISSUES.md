@@ -101,6 +101,27 @@ Watchdog 结构体已添加 `Roster` 字段，`inspect` 方法末尾调用 `clea
 
 ---
 
+## Scheduler 提前 report_done 导致任务结果丢失（已临时缓解）
+
+**位置**: `internal/scheduler/scheduler.go`（`handleEvent`、`toolReportDone`、`schedulerSystemPrompt`）
+
+**现象**: Scheduler 在发布任务后，LLM 在任务仍为 pending/processing 状态时就调用 `report_done`（例如回复"任务已发布，请稍候"后直接 report_done）。`report_done` 清空 `currentBatch`，导致后续 `task_completed` 事件到达时 `batchComplete()` 返回 false（batch 为空），不再触发 reactLoop。任务结果无法汇报给用户。
+
+**根因**: Scheduler 的 reactLoop 是"发布任务 → LLM 决定下一步"的单次循环。LLM 如果在同一轮 reactLoop 中发布任务又调用 report_done，batch 就被提前清空。这是 Scheduler 架构的内在缺陷——它依赖 LLM 正确判断"何时该等待、何时该汇报"，但 LLM 不一定遵从 prompt 约束。
+
+**当前缓解措施**:
+1. **Prompt 层（软性）**: system prompt 新增"如果任务仍为 pending/processing，绝对不要调用 report_done"
+2. **代码层（硬性）**: `toolReportDone` 执行前扫描 `currentBatch`，存在未到终态的任务时拒绝执行并返回错误消息
+
+**局限性**: 硬性拦截可以防止 batch 被错误清空，但 LLM 可能在被拒绝后进入无效循环（反复尝试 report_done 被反复拒绝），直到 `SchedulerMaxLoops` 耗尽。此时 batch 仍在，后续 `task_completed` 事件可正常触发 reactLoop，但用户体验不佳（有延迟且可能看到无意义的中间输出）。
+
+**根治方向**:
+- 将 Scheduler 从"单次 reactLoop 发布+汇报"改为"发布后挂起，事件驱动唤醒后再汇报"的两阶段模式
+- 或在 `reactLoop` 中检测到"已发布任务但均未到终态"时，主动退出循环并保留 batch，等事件驱动回来
+- 详见 `nextUpgrade_v2.md` 后续架构改进
+
+---
+
 ## 总览
 
 | 缺陷 | 状态 |
@@ -117,5 +138,6 @@ Watchdog 结构体已添加 `Roster` 字段，`inspect` 方法末尾调用 `clea
 | 看门狗重启循环延迟控制 | ✅ 已修复 |
 | 启动完成提示信息 | ✅ 已修复 |
 | Shell 拦截 E2E 测试缺口 | ⏳ 本轮不实施（见 nextUpgrade_v2.md） |
+| Scheduler 提前 report_done | ⚠️ 已临时缓解（prompt + 硬性拦截），根因未解决 |
 
-**11/12 项已修复，1 项为质量保障任务留待后续迭代。**
+**11/12 项已修复，1 项为质量保障任务留待后续迭代，1 项已临时缓解。**
