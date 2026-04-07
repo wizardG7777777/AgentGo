@@ -45,6 +45,8 @@ const schedulerSystemPrompt = `你是一个任务编排调度器（Task Schedule
   4. 探索结果应指导后续执行任务的拆分方式和具体描述
 - 发布任务时，event_type 留空表示由执行代理处理，"explore" 表示由调查代理处理
 - 当所有任务完成且无需后续操作时，调用 report_done 汇总结果
+- 重要：只有当公告板上你发布的所有任务状态均为 completed/failed/cancelled 时，才可以调用 report_done
+- 如果任务状态仍为 pending 或 processing，绝对不要调用 report_done，而应该等待（不调用任何工具，直接返回文本说明正在等待）
 - report_done 只需调用一次，调用后不要再执行任何操作
 - 不要编造任务结果，只根据公告板上的实际数据汇报
 - 公告板快照中的 resources 字段显示了当前可用的执行代理数量，请据此合理拆分任务粒度
@@ -497,6 +499,26 @@ func (s *Scheduler) toolCancelTask(args map[string]any) string {
 }
 
 func (s *Scheduler) toolReportDone(args map[string]any) string {
+	// 硬性保护：检查 batch 中是否还有未完成任务
+	s.mu.Lock()
+	batch := make([]string, len(s.currentBatch))
+	copy(batch, s.currentBatch)
+	s.mu.Unlock()
+
+	var pendingTasks []string
+	for _, id := range batch {
+		task, err := s.store.GetTask(id)
+		if err != nil {
+			continue
+		}
+		if !model.IsTerminal(task.Status) {
+			pendingTasks = append(pendingTasks, fmt.Sprintf("%s(%s)", id[:8], task.Status))
+		}
+	}
+	if len(pendingTasks) > 0 {
+		return fmt.Sprintf("report_done 被拒绝：以下任务尚未完成: %s。请等待所有任务到达终态后再调用 report_done。", strings.Join(pendingTasks, ", "))
+	}
+
 	summary := argString(args, "summary")
 	fmt.Printf("\n=== 任务完成 ===\n%s\n================\n\n", summary)
 

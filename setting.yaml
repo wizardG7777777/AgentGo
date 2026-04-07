@@ -12,3 +12,4 @@ scheduler_max_loops: 10
 agent_max_loops: 50
 event_channel_buffer: 64
 default_timeout_sec: 300
+worker_count: 3
