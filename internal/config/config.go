@@ -38,7 +38,6 @@ type Config struct {
 	SearchAPIProvider       string `yaml:"search_api_provider" json:"search_api_provider"`
 	SearchAPIURL            string `yaml:"search_api_url" json:"search_api_url"`
 	SearchAPIKey            string `yaml:"search_api_key" json:"search_api_key"`
-	WorktreeEnabled         bool   `yaml:"worktree_enabled" json:"worktree_enabled"`
 }
 
 func DefaultConfig() *Config {

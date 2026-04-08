@@ -306,6 +306,21 @@ func (s *MemoryTaskStore) AppendOutput(agentID, taskID, chunk string) error {
 	return nil
 }
 
+// RecordLastResponse 持久化 agent 的最后一次非工具响应文本。
+// 与 SubmitResult 不同，它不改变任务状态，也不要求 agent 已认领任务——
+// 即使后续校验失败回滚，这条文本仍然保留在 task 上供 scheduler 观察。
+func (s *MemoryTaskStore) RecordLastResponse(taskID, content string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return ErrTaskNotFound
+	}
+	task.LastResponse = content
+	return nil
+}
+
 func (s *MemoryTaskStore) QueryAvailable(eventType string) ([]*model.Task, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -318,7 +333,11 @@ func (s *MemoryTaskStore) QueryAvailable(eventType string) ([]*model.Task, error
 		if len(task.Agents) >= task.MaxConcurrency {
 			continue
 		}
-		if eventType != "" && task.EventType != eventType {
+		// 严格匹配 EventType：worker (eventType="") 只接执行任务，
+		// explorer (eventType="explore") 只接调查任务。
+		// 此前用 `eventType != "" && ...` 导致 worker 会顺手接走 explore 任务，
+		// 在 explore 任务因 expected_artifacts 失败重试时引发跨代理类型迁移。
+		if task.EventType != eventType {
 			continue
 		}
 		result = append(result, task)
@@ -369,6 +388,55 @@ func (s *MemoryTaskStore) GetDependencyResults(taskID string) (map[string]string
 	}
 
 	return results, nil
+}
+
+// AppendArtifact 把一个文件路径追加到指定任务的 Artifacts 列表，自动去重。
+// path 应当是相对项目根的相对路径（调用方在 LocalWriteGroup 中已经标准化）。
+// 写入路径已存在时直接返回，不报错——多次写同一个文件是合法的。
+func (s *MemoryTaskStore) AppendArtifact(taskID string, path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return ErrTaskNotFound
+	}
+	// 去重检查
+	for _, existing := range task.Artifacts {
+		if existing == path {
+			return nil // 已存在，无操作
+		}
+	}
+	task.Artifacts = append(task.Artifacts, path)
+	return nil
+}
+
+// GetDependencyArtifacts 返回 taskID 的所有依赖任务实际写入的文件路径，
+// 按依赖任务的 ID 分组。供 agent.processTask 在任务启动时注入到下游 worker prompt。
+//
+// 如果某个依赖任务的 Artifacts 为空，仍然会出现在返回 map 中（值为空 slice），
+// 这样下游可以判断"有依赖但依赖没产出文件"——可能是 report-only 失败。
+func (s *MemoryTaskStore) GetDependencyArtifacts(taskID string) (map[string][]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return nil, ErrTaskNotFound
+	}
+
+	out := make(map[string][]string)
+	for _, depID := range task.Dependencies {
+		dep, exists := s.tasks[depID]
+		if !exists {
+			continue
+		}
+		// 拷贝一份，避免外部修改影响内部状态
+		artifacts := make([]string, len(dep.Artifacts))
+		copy(artifacts, dep.Artifacts)
+		out[depID] = artifacts
+	}
+	return out, nil
 }
 
 func (s *MemoryTaskStore) ScanAll() ([]*model.Task, error) {

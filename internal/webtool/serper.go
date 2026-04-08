@@ -17,15 +17,28 @@ type SerperProvider struct {
 
 func (s *SerperProvider) Name() string { return "serper" }
 
-func (s *SerperProvider) Search(ctx context.Context, query string) ([]SearchResult, error) {
+func (s *SerperProvider) Search(ctx context.Context, query string, opts *SearchOptions) ([]SearchResult, error) {
 	if query == "" {
 		return nil, fmt.Errorf("缺少 query 参数")
 	}
 
 	// Serper API: POST https://google.serper.dev/search
-	reqBody, err := json.Marshal(map[string]string{
+	payload := map[string]any{
 		"q": query,
-	})
+	}
+	if opts != nil {
+		if opts.NumResults > 0 {
+			payload["num"] = opts.NumResults
+		}
+		// Serper 使用 tbs 参数实现时间过滤
+		if opts.TimeRange != "" && opts.TimeRange != "any" {
+			tbsMap := map[string]string{"day": "qdr:d", "week": "qdr:w", "month": "qdr:m", "year": "qdr:y"}
+			if tbs, ok := tbsMap[opts.TimeRange]; ok {
+				payload["tbs"] = tbs
+			}
+		}
+	}
+	reqBody, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("构建 Serper 请求体失败: %w", err)
 	}
@@ -72,6 +85,7 @@ func (s *SerperProvider) Search(ctx context.Context, query string) ([]SearchResu
 			Title:   r.Title,
 			URL:     r.Link,
 			Snippet: r.Snippet,
+			Source:  extractDomain(r.Link),
 		})
 	}
 	return results, nil

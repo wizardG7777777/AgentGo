@@ -5,11 +5,29 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"agentgo/internal/bootstrap"
+	"agentgo/internal/trace"
 )
 
 func main() {
+	// 子命令路由：第一个非 flag 参数若是 "trace"，进入 trace CLI 而不启动主系统
+	if len(os.Args) >= 2 && os.Args[1] == "trace" {
+		// 默认 trace 目录：当前工作目录下的 .agentgo/traces
+		cwd, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[错误] 无法获取当前工作目录: %v\n", err)
+			os.Exit(1)
+		}
+		traceDir := filepath.Join(cwd, ".agentgo", "traces")
+		if err := trace.CLI(os.Args[2:], traceDir, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "[错误] %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	configPath := flag.String("config", "setting.yaml", "配置文件路径")
 	flag.Parse()
 

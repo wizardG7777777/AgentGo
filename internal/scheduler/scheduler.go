@@ -15,6 +15,7 @@ import (
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
+	"agentgo/internal/trace"
 
 	"github.com/google/uuid"
 )
@@ -35,15 +36,67 @@ const schedulerSystemPrompt = `你是一个任务编排调度器（Task Schedule
 - report_done：向用户报告最终结果，表示当前请求处理完毕（调用后流程立即结束）
 - send_message：向指定代理发送结构化消息（用于转发用户纠偏指令、协调代理间协作）。必须填写 summary 摘要
 
+预制代理能力清单（决定 publish_task 时如何选择 event_type）：
+- **Worker（执行代理）**：event_type=""（留空）。能力：read_file/grep_search/glob_search/list_dir、write_file/edit_file、run_shell、web_search/web_fetch、send_message、publish_task。**这是唯一可以落盘文件、运行命令的代理类型**。所有需要"写入/创建/修改文件"、"运行测试/编译"、"git 操作"的任务都必须用 Worker。
+- **Explorer（调查代理）**：event_type="explore"。能力：**只读** read_file/grep_search/glob_search/list_dir、web_search/web_fetch、send_message。**没有 write_file、edit_file、run_shell、publish_task**。Explorer 只能产出文本结论（通过 SubmitResult 返回），**不能产出任何文件**。
+- **Scheduler（你自己）**：负责拆分、编排、跟踪、汇总。不直接执行任务。
+
+能力边界硬规则（违反会被程序拒绝发布）：
+- **禁止给 explore 任务声明 expected_artifacts**——Explorer 无写权限，永远满足不了文件契约，会陷入重试地狱。如果任务需要"把调查结果写入 xxx.md"，必须用 event_type=""（Worker）而不是 explore。
+- 如果一个调查类需求最终需要落盘报告，正确做法是：**先发 explore 任务收集材料 → Worker 任务依赖该 explore 任务、声明 expected_artifacts 写入文件**。不要把"调查 + 落盘"塞进同一个 explore 任务。
+
+正例 1（纯调查，不落盘）：
+  publish_task(description="探索 docs/activate 目录，列出文件并总结主题", event_type="explore")
+  ↑ 不带 expected_artifacts，结论通过 SubmitResult 文本返回
+
+正例 2（调查 → 落盘，拆成两步）：
+  A = publish_task(description="探索 docs/activate 目录的内容并总结", event_type="explore")
+  B = publish_task(description="基于上游调查结果，将分析写入 docs_investigation_activate.md",
+                    event_type="", dependencies="<A 的 task_id>",
+                    expected_artifacts="docs_investigation_activate.md")
+
+反例（已被程序拦截）：
+  publish_task(description="调查 docs/activate 并产出 xxx.md", event_type="explore",
+                expected_artifacts="xxx.md")
+  ↑ Explorer 无 write_file 工具，永远写不出来这个文件
+
 行为准则：
 - 如果用户输入只是闲聊、问候或简单提问，不需要执行任何任务，直接调用 report_done 回复即可
-- 即时模式：收到用户输入后，将需求拆解为可独立执行的子任务，尽量减少依赖链
+- **系统自检/状态查询类请求**（如"X 是否启动/运行"、"系统状态"、"代理是否在线"、"日志是否正常"、"trace 是否开"），直接根据公告板快照中的 resources（活跃代理列表）和你启动时的初始化信息回答，**不要发布"测试通信"或"验证日志"类任务**——你看到这条 system prompt 本身就证明 LLM 通道、调度器、邮箱、trace 系统都在运行。盲发"通信测试"任务会让 worker 互发消息形成邮件级联爆炸（参考 KNOWN_ISSUES）
+- 即时模式：收到用户输入后，将需求拆解为可独立执行的子任务；调查/研究类请求应按子方向并行拆分（如：事件背景、内容确认、来源传播、官方回应各发布一个独立任务），充分利用可用 Worker 数量实现并行执行
+
+任务发布合约（防止下游 worker 凭空捏造 + report-only 失败）：
+- **依赖声明**：当任务 B 需要使用任务 A 的产出（描述含"基于/整合/汇总/前序/前一个/对比/合并以下"等词），**必须**在 publish_task 调用中传 dependencies="<A 的 task_id>"。
+  系统会把 A 的实际产出文件路径自动注入到 B 的 user prompt 中，让 B 知道该 read_file 哪些文件。
+  漏填 dependencies 会导致 B 拿不到上下文，凭空编造下游内容——这是最严重的数据正确性事故。
+
+  正例：先发布任务 A 拿到 task_id，再发布任务 B 时传 dependencies="<task_id_a>"
+  反例：description="整合前两个任务的总结"，但 dependencies 字段为空
+
+- **预期产出声明**：发布任务时，如果任务的产出是"报告/总结/文档/分析"等持久化产物，
+  **必须**填写 expected_artifacts 字段，列出该任务应当产出的文件相对路径（逗号分隔）。
+  系统会在任务结束时校验这些文件是否真的写入；缺失则任务失败重试。
+  超过 max_retry 次仍无法满足契约，任务会被强制终止并向你发送崩溃通知（mail），不会再无限重试烧钱。
+
+- **expected_artifacts 路径必须可被字面执行**：
+  - 路径就是 worker 应当 write_file 的字符串，不要带占位符（如 "<name>.md"），不要让 worker 自己猜根目录。
+  - 如果你希望文件落在项目根，写 "report.md"；希望落在子目录就写 "output/report.md"。
+  - 同一句话同时出现在 description 里："产出文件: report.md（位于项目根目录）"——避免 worker 把它放进 docs/ 之类的相邻目录。
+  - 系统对路径漂移有 basename 兜底（worker 写到 docs/report.md 也算命中 report.md），但会记 warning，请尽量一次写对。
+
+  正例：publish_task(description="读取 docs/foo.md 并把摘要写到项目根目录的 output/foo_summary.md",
+                     expected_artifacts="output/foo_summary.md")
+  反例：publish_task(description="总结 docs 文件夹的内容") ← 路径模糊，必失败
+
+- **任务描述要点明文件路径**：description 里要写清楚"输入文件在哪里"和"输出文件写到哪里"，
+  不要用模糊的"汇总一下"、"分析这些"。Worker 没有读心术，模糊的指令会被自由发挥
 - 计划模式：
   1. 第一步必须发布 event_type="explore" 的探索任务来了解项目结构和相关代码
   2. 必须等待所有探索任务完成并查看结果后，才能发布执行任务（event_type=""）
   3. 在探索任务尚未完成期间，禁止发布任何执行任务
   4. 探索结果应指导后续执行任务的拆分方式和具体描述
 - 发布任务时，event_type 留空表示由执行代理处理，"explore" 表示由调查代理处理
+- 调查/研究类任务的所有子任务完成后，先评估各任务结果是否有明显信息缺口或未覆盖的子问题；若有，追加新任务补充调查，而非直接 report_done
 - 当所有任务完成且无需后续操作时，调用 report_done 汇总结果
 - 重要：只有当公告板上你发布的所有任务状态均为 completed/failed/cancelled 时，才可以调用 report_done
 - 如果任务状态仍为 pending 或 processing，绝对不要调用 report_done，而应该等待（不调用任何工具，直接返回文本说明正在等待）
@@ -304,6 +357,15 @@ type taskSnapshot struct {
 	Error         string            `json:"error,omitempty"`
 	Dependencies  []string          `json:"dependencies,omitempty"`
 	PartialOutput string            `json:"partial_output,omitempty"`
+	// Artifacts 是任务实际写入磁盘的文件路径列表（相对项目根）。
+	// 暴露这一字段后，scheduler 在任务失败时能看到 worker 实际写过哪些文件——
+	// 即便路径漂移、命名不符 expected_artifacts，scheduler 也能据此判断
+	// 是 fall back 接收漂移产物，还是重新发布修正任务。
+	Artifacts []string `json:"artifacts,omitempty"`
+	// LastResponse 是 worker 最后一次 LLM 非工具响应的原始文本。
+	// 即使任务因校验失败回滚或最终崩溃，这条文本仍然保留，让 scheduler
+	// 看到 worker 自述了什么（例如"我已经把报告写到 docs/foo.md"）。
+	LastResponse string `json:"last_response,omitempty"`
 }
 
 func (s *Scheduler) buildBoardJSON(tasks []*model.Task, trigger model.Event) string {
@@ -336,6 +398,14 @@ func (s *Scheduler) buildBoardJSON(tasks []*model.Task, trigger model.Event) str
 		}
 		if t.Status == model.TaskStatusProcessing && t.PartialOutput != "" {
 			snap.PartialOutput = t.PartialOutput
+		}
+		if len(t.Artifacts) > 0 {
+			snap.Artifacts = t.Artifacts
+		}
+		// 失败/重试中的任务尤其需要 LastResponse 帮助 scheduler 判断 worker 干了什么；
+		// 已 completed 的任务用 Results 即可，无需重复展开 LastResponse 占用 token。
+		if t.LastResponse != "" && t.Status != model.TaskStatusCompleted {
+			snap.LastResponse = t.LastResponse
 		}
 		taskSnaps = append(taskSnaps, snap)
 	}
@@ -384,7 +454,11 @@ func (s *Scheduler) schedulerTools() []llm.ToolDef {
 					"priority":    map[string]any{"type": "string", "description": "优先级数字，越大越优先"},
 					"dependencies": map[string]any{
 						"type":        "string",
-						"description": "依赖的任务 ID，多个用逗号分隔",
+						"description": "依赖的任务 ID，多个用逗号分隔。当任务 B 需要使用任务 A 的产出时必须填写，否则下游 worker 拿不到上游上下文会凭空编造",
+					},
+					"expected_artifacts": map[string]any{
+						"type":        "string",
+						"description": "逗号分隔的预期产出文件路径（相对项目根的相对路径）。任务结束时系统会校验这些文件是否真的写入；缺失则任务失败重试。强烈建议为'报告/总结/文档'类任务填写此字段",
 					},
 					"system_prompt": map[string]any{"type": "string", "description": "可选，为该任务指定专门的 system prompt（如：你是代码审查专家）"},
 				},
@@ -467,6 +541,21 @@ func (s *Scheduler) toolPublishTask(args map[string]any) string {
 			}
 		}
 	}
+	if exp := argString(args, "expected_artifacts"); exp != "" {
+		for _, p := range splitAndTrim(exp) {
+			if p != "" {
+				task.ExpectedArtifacts = append(task.ExpectedArtifacts, p)
+			}
+		}
+	}
+
+	// 能力边界硬校验：explore 任务由只读的 Explorer 执行，无写权限，
+	// 不可声明 expected_artifacts（否则任务永远满足不了契约，陷入重试地狱）
+	if task.EventType == s.cfg.ExplorerEventType && len(task.ExpectedArtifacts) > 0 {
+		log.Printf("[scheduler] 拒绝越权发布: explore 任务声明了 expected_artifacts=%v", task.ExpectedArtifacts)
+		return fmt.Sprintf("发布任务被拒绝: explore 类型任务由只读 Explorer 执行，不能声明 expected_artifacts。"+
+			"如需产出文件，请将 event_type 留空改用执行代理（Worker）。当前传入: %v", task.ExpectedArtifacts)
+	}
 
 	if err := s.store.PublishTask(task); err != nil {
 		log.Printf("[scheduler] 发布任务失败: %v", err)
@@ -478,6 +567,19 @@ func (s *Scheduler) toolPublishTask(args map[string]any) string {
 	s.mu.Unlock()
 
 	log.Printf("[scheduler] 发布任务: %s (type=%s, id=%s)", task.Description, task.EventType, task.ID)
+
+	// Trace：记录任务发布事件，含 dependencies 字段（排查"凭空捏造"幻觉的关键观测点）
+	trace.Emit(trace.Event{
+		Kind:         trace.KindTaskPublished,
+		TaskID:       task.ID,
+		PublishedBy:  s.id,
+		Description:  task.Description,
+		Dependencies: task.Dependencies,
+		EventType:    task.EventType,
+		Priority:     fmt.Sprintf("%d", task.Priority),
+		Depth:        task.Depth,
+	})
+
 	return fmt.Sprintf("任务已发布: id=%s, description=%s", task.ID, task.Description)
 }
 

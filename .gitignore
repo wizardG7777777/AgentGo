@@ -33,6 +33,12 @@ go.work.sum
 # Kiro IDE
 .kiro/
 
+# AgentGo runtime artifacts
+# - .agentgo/traces/    JSONL 任务追踪文件（每任务一份，含完整工具调用 args 等可能敏感的数据）
+# - .worktrees/         Git worktree 隔离目录
+.agentgo/
+.worktrees/
+
 # Editor/IDE
 # .idea/
 # .vscode/

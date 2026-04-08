@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"agentgo/internal/model"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
+	"agentgo/internal/trace"
 )
 
 // ErrRecoverable wraps an error to indicate it is recoverable (should trigger retry rollback).
@@ -150,12 +152,24 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		return
 	}
 
-	// 任务开始回调（用于 publish_subtask 跟踪当前任务 ID + worktree 创建）
+	// Trace：记录任务被代理认领
+	trace.Emit(trace.Event{
+		Kind:    trace.KindTaskClaimed,
+		TaskID:  taskID,
+		AgentID: a.ID,
+	})
+
+	// Trace：CloseTask 必须在 OnTaskEnd 之后执行，以便后者发出的
+	// 收尾事件（如 file_written）仍然写入同一 trace 文件。
+	// Go defer 是 LIFO，所以这条 defer 必须**先注册**才能**最后执行**。
+	defer trace.CloseTask(taskID)
+
+	// 任务开始回调（用于 publish_subtask 跟踪当前任务 ID 等扩展点）
 	if a.OnTaskStart != nil {
 		a.OnTaskStart(taskID)
 	}
 
-	// 任务结束回调（defer 确保所有退出路径都触发，用于 worktree commit/merge/cleanup）
+	// 任务结束回调（defer 确保所有退出路径都触发；目前仅 holder 清理使用）
 	taskSuccess := false
 	if a.OnTaskEnd != nil {
 		defer func() {
@@ -171,6 +185,16 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	depResults, err := a.Store.GetDependencyResults(taskID)
 	if err != nil {
 		log.Printf("[agent %s] GetDependencyResults error: %v", a.ID, err)
+	}
+
+	// 拉取依赖任务的 Artifacts（实际写入的文件路径），与 SubmitResult 文本合并
+	// 注入到 user prompt 中，让下游 worker 知道上游具体写了哪些文件，避免凭空捏造
+	depArtifacts, artErr := a.Store.GetDependencyArtifacts(taskID)
+	if artErr != nil {
+		log.Printf("[agent %s] GetDependencyArtifacts error: %v", a.ID, artErr)
+	}
+	if len(depArtifacts) > 0 {
+		depResults = mergeArtifactsIntoDeps(depResults, depArtifacts)
 	}
 
 	var lastOutput string
@@ -228,7 +252,9 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		histCopy := make([]HistoryEntry, len(history))
 		copy(histCopy, history)
 
-		result, execErr := a.Execute(ctx, task, depResults, histCopy)
+		// 注入 agentID、taskID、循环轮次到 context，供 llm_executor 和工具层日志/trace 使用
+		execCtx := WithAgentContext(ctx, a.ID, taskID, i)
+		result, execErr := a.Execute(execCtx, task, depResults, histCopy)
 
 		if execErr != nil {
 			a.handleFailure(task, taskID, execErr, history)
@@ -239,10 +265,64 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		totalPromptTokens += result.PromptTokens
 
 		if !result.ToolCalled {
+			// 持久化 worker 的最终响应文本——无论后续校验是否通过，scheduler 都能看到
+			// worker 自述了什么。这是修复"失败路径上 lastOutput 被静默丢弃"的关键一环。
+			if lastOutput != "" {
+				if err := a.Store.RecordLastResponse(taskID, lastOutput); err != nil {
+					log.Printf("[agent %s] RecordLastResponse error: %v", a.ID, err)
+				}
+			}
+
+			// 校验 ExpectedArtifacts：如果发布者声明了预期产出文件，
+			// 但任务结束时这些文件没有出现在 task.Artifacts 中，则任务失败重试。
+			// 这是 Level 3 的硬性合约校验，防止 worker 在没有真正写文件的情况下"假装完成"。
+			//
+			// 三种结果：
+			//   - Missing 非空：完全没写，必须重试
+			//   - Drifted 非空但 Missing 空：basename 命中但路径漂移，视作成功，记 warning
+			//   - 两者都空：完美通过
+			check := checkExpectedArtifacts(a.Store, taskID)
+			if len(check.Missing) > 0 {
+				reason := buildArtifactFailureReason(check)
+				log.Printf("[agent %s] 任务 %s 缺少预期产出文件: %v (实际写入: %v)",
+					a.ID, taskID, check.Missing, check.Actual)
+				trace.Emit(trace.Event{
+					Kind:    trace.KindError,
+					TaskID:  taskID,
+					AgentID: a.ID,
+					Error:   reason,
+				})
+				// 把校验反馈作为 IncomingMail 注入历史，让下一次重试 LLM 能看见原因
+				history = appendValidationFeedback(history, check)
+				a.handleFailure(task, taskID, &ErrRecoverable{Err: fmt.Errorf("%s", reason)}, history)
+				return
+			}
+			if len(check.Drifted) > 0 {
+				log.Printf("[agent %s] 任务 %s 路径漂移已容忍: %v", a.ID, taskID, check.Drifted)
+			}
+
 			if err := a.Store.SubmitResult(a.ID, taskID, lastOutput); err != nil {
 				log.Printf("[agent %s] SubmitResult error: %v", a.ID, err)
+				trace.Emit(trace.Event{
+					Kind:    trace.KindError,
+					TaskID:  taskID,
+					AgentID: a.ID,
+					Error:   "SubmitResult failed: " + err.Error(),
+				})
 			} else {
 				taskSuccess = true
+				trace.Emit(trace.Event{
+					Kind:      trace.KindTaskSubmitted,
+					TaskID:    taskID,
+					AgentID:   a.ID,
+					OutputLen: len(lastOutput),
+					LoopsUsed: i + 1,
+				})
+				trace.Emit(trace.Event{
+					Kind:    trace.KindTaskCompleted,
+					TaskID:  taskID,
+					AgentID: a.ID,
+				})
 			}
 			return
 		}
@@ -266,9 +346,21 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 
 		// Layer 2: token 累计超过阈值时触发摘要压缩（每次任务最多一次）
 		if !summarized && totalPromptTokens > compactThreshold {
+			tokensBefore := totalPromptTokens
+			entriesBefore := len(history)
 			history = compressHistory(history, keepRecent)
 			summarized = true
 			log.Printf("[agent %s] 任务 %s 触发历史摘要压缩，当前 prompt tokens: %d", a.ID, taskID, totalPromptTokens)
+			trace.Emit(trace.Event{
+				Kind:               trace.KindHistoryCompaction,
+				TaskID:             taskID,
+				AgentID:            a.ID,
+				Loop:               i,
+				PromptTokensBefore: tokensBefore,
+				PromptTokensAfter:  0, // 实际值要等下次 LLM 调用才能拿到，这里只记录"压缩前"信号
+				Strategy:           fmt.Sprintf("summary+keep_recent=%d", keepRecent),
+				KeptEntries:        entriesBefore,
+			})
 		}
 	}
 
@@ -280,14 +372,16 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// 检查重试次数是否已耗尽，避免无限重试
 	if a.MaxRetries > 0 && task.RetryCount >= a.MaxRetries {
 		failReason := fmt.Sprintf("重试次数耗尽 (%d/%d): %s", task.RetryCount, a.MaxRetries, reason)
-		if err := a.Store.FailTask(a.ID, taskID, failReason); err != nil {
-			log.Printf("[agent %s] FailTask (retries exhausted) error: %v", a.ID, err)
-		}
+		a.terminateTask(task, taskID, failReason)
 		return
 	}
 
 	if err := a.Store.RetryRollback(a.ID, taskID, reason); err != nil {
-		log.Printf("[agent %s] RetryRollback (max loops) error: %v", a.ID, err)
+		if errors.Is(err, store.ErrTaskNotProcessing) {
+			log.Printf("[agent %s] 任务 %s RetryRollback (max loops) 跳过：状态已被外部转换", a.ID, taskID)
+		} else {
+			log.Printf("[agent %s] RetryRollback (max loops) error: %v", a.ID, err)
+		}
 	}
 }
 
@@ -300,17 +394,153 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 			snipOldToolResults(history, 1)        // 激进清理：只保留最近 1 条
 			history = compressHistory(history, 1) // 激进压缩：只保留最近 1 条
 		}
+
+		// 全局重试上限：可恢复错误也要受 MaxRetries 约束，避免无限重试。
+		// 此前只有 handleMaxLoops 路径检查 MaxRetries，导致 ExpectedArtifacts 校验
+		// 失败、tool 错误等可恢复故障可以无限循环（实战中观察到 24+ 次重试，烧 2 小时）。
+		if a.MaxRetries > 0 && task.RetryCount >= a.MaxRetries {
+			failReason := fmt.Sprintf("重试次数耗尽 (%d/%d): %s",
+				task.RetryCount, a.MaxRetries, execErr.Error())
+			log.Printf("[agent %s] 任务 %s 终止：%s", a.ID, taskID, failReason)
+			a.terminateTask(task, taskID, failReason)
+			return
+		}
+
 		// 可恢复错误：保存历史上下文后重试
 		a.saveHistory(task, history)
 		if err := a.Store.RetryRollback(a.ID, taskID, execErr.Error()); err != nil {
-			log.Printf("[agent %s] RetryRollback error: %v", a.ID, err)
+			// "task is not in processing state" 通常意味着 watchdog 已经接管，
+			// 不算 agent 自身的故障，降级为 warning。
+			if errors.Is(err, store.ErrTaskNotProcessing) {
+				log.Printf("[agent %s] 任务 %s RetryRollback 跳过：状态已被外部转换 (可能 watchdog 接管)", a.ID, taskID)
+			} else {
+				log.Printf("[agent %s] RetryRollback error: %v", a.ID, err)
+			}
 		}
 	} else {
-		// 不可恢复错误：通过 FailTask 原子地设置错误信息并转换状态
-		if err := a.Store.FailTask(a.ID, taskID, execErr.Error()); err != nil {
-			log.Printf("[agent %s] FailTask error: %v", a.ID, err)
-		}
+		// 不可恢复错误：终止 + 崩溃汇报
+		log.Printf("[agent %s] 任务 %s 不可恢复错误：%v", a.ID, taskID, execErr)
+		a.terminateTask(task, taskID, execErr.Error())
 	}
+}
+
+// terminateTask 是任务最终失败的统一收口：
+//  1. 通过 FailTask 把任务状态原子转换到 failed
+//  2. 向任务的 EventSource（发布者，通常是 scheduler 或父代理）发送一条结构化崩溃邮件，
+//     避免上游静默等待。崩溃邮件遵循固定格式："代理 X 在执行任务 Y 时崩溃，原因 Z"。
+func (a *Agent) terminateTask(task *model.Task, taskID string, reason string) {
+	if err := a.Store.FailTask(a.ID, taskID, reason); err != nil {
+		log.Printf("[agent %s] FailTask error: %v", a.ID, err)
+	}
+	a.sendCrashReport(task, taskID, reason)
+}
+
+// sendCrashReport 向 task.EventSource 发送结构化崩溃通知。
+// 没有 EventSource 或没有邮箱注册表时静默跳过（避免在测试场景报错）。
+//
+// 邮件正文不仅包含失败原因，还会附上：
+//   - 任务实际写入的文件清单（task.Artifacts）—— 让 scheduler 立刻知道
+//     "worker 不是没干活，是写到了别处"，可以决定是否接收漂移产物
+//   - worker 最后一次 LLM 响应的原文（task.LastResponse）—— 让 scheduler
+//     看到 worker 自述了什么，理解失败语境
+//
+// 重新读取一次 task 是因为 reason 路径里 task 指针可能已陈旧，
+// 没拿到 RecordLastResponse / AppendArtifact 的最新写入。
+func (a *Agent) sendCrashReport(task *model.Task, taskID string, reason string) {
+	if a.MailRegistry == nil || task == nil || task.EventSource == "" {
+		return
+	}
+	// 重读 task 以拿到最新的 Artifacts / LastResponse
+	if fresh, err := a.Store.GetTask(taskID); err == nil && fresh != nil {
+		task = fresh
+	}
+	desc := task.Description
+	if len([]rune(desc)) > 100 {
+		desc = string([]rune(desc)[:100]) + "..."
+	}
+	summary := fmt.Sprintf("代理 %s 在执行任务 %s 时崩溃", a.ID, taskID[:8])
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "代理 %s 在执行任务 %s 时崩溃。\n", a.ID, taskID)
+	fmt.Fprintf(&sb, "任务描述: %s\n", desc)
+	fmt.Fprintf(&sb, "重试次数: %d\n", task.RetryCount)
+	fmt.Fprintf(&sb, "失败原因: %s\n", reason)
+
+	if len(task.ExpectedArtifacts) > 0 {
+		fmt.Fprintf(&sb, "\n预期产出 (expected_artifacts): %v\n", task.ExpectedArtifacts)
+	}
+	if len(task.Artifacts) > 0 {
+		sb.WriteString("\n实际写入的文件 (按字面路径列出):\n")
+		for _, p := range task.Artifacts {
+			fmt.Fprintf(&sb, "  - %s\n", p)
+		}
+		sb.WriteString("（如果上述文件已经满足任务意图但路径名不同，可考虑直接接收，或重新发布修正路径的任务。）\n")
+	} else {
+		sb.WriteString("\n实际写入的文件: 无（worker 完全没有产出文件）\n")
+	}
+	if task.LastResponse != "" {
+		// 截断防止超长
+		resp := task.LastResponse
+		if len([]rune(resp)) > 500 {
+			resp = string([]rune(resp)[:500]) + "...[已截断]"
+		}
+		fmt.Fprintf(&sb, "\nworker 最后一次响应原文:\n%s\n", resp)
+	}
+	body := sb.String()
+
+	msg := mailbox.Message{
+		From:     a.ID,
+		To:       task.EventSource,
+		Type:     mailbox.MsgTypeInfo,
+		Priority: mailbox.PriorityHigh,
+		Summary:  summary,
+		Content:  body,
+		SentAt:   time.Now(),
+	}
+	if err := a.MailRegistry.Send(msg); err != nil {
+		log.Printf("[agent %s] 发送崩溃汇报失败: %v", a.ID, err)
+	} else {
+		log.Printf("[agent %s] 已向 %s 汇报任务 %s 崩溃", a.ID, task.EventSource, taskID[:8])
+	}
+}
+
+// buildArtifactFailureReason 把校验结果格式化为返给 ErrRecoverable 的失败原因。
+func buildArtifactFailureReason(check ArtifactCheckResult) string {
+	var sb strings.Builder
+	sb.WriteString("任务声称完成但 expected_artifacts 校验失败。\n")
+	if len(check.Missing) > 0 {
+		fmt.Fprintf(&sb, "缺失的预期文件: %v\n", check.Missing)
+	}
+	if len(check.Actual) > 0 {
+		fmt.Fprintf(&sb, "你实际写入的文件: %v\n", check.Actual)
+	} else {
+		sb.WriteString("你实际没有写入任何文件。\n")
+	}
+	sb.WriteString("请按 expected_artifacts 字面给出的相对路径写入文件——不要自作主张加 docs/ 前缀，也不要改名。")
+	return sb.String()
+}
+
+// appendValidationFeedback 把校验失败的诊断信息追加为一条 IncomingMail 历史条目。
+// 重试时这条会作为 user 角色消息进入下一轮 LLM 上下文，让 LLM 看见自己上次为什么被打回。
+func appendValidationFeedback(history []HistoryEntry, check ArtifactCheckResult) []HistoryEntry {
+	var sb strings.Builder
+	sb.WriteString("<validation-feedback>\n")
+	sb.WriteString("  上一次 LLM 响应被系统拦截：你声称任务完成，但 expected_artifacts 校验未通过。\n")
+	if len(check.Missing) > 0 {
+		fmt.Fprintf(&sb, "  缺失的预期文件: %v\n", check.Missing)
+	}
+	if len(check.Drifted) > 0 {
+		fmt.Fprintf(&sb, "  路径漂移（basename 匹配但路径不一致）: %v\n", check.Drifted)
+	}
+	if len(check.Actual) > 0 {
+		fmt.Fprintf(&sb, "  你实际写入的文件: %v\n", check.Actual)
+	} else {
+		sb.WriteString("  你实际没有写入任何文件。\n")
+	}
+	sb.WriteString("  纠正策略：使用 write_file 工具，path 参数严格按 expected_artifacts 字面给出的相对路径。\n")
+	sb.WriteString("  不要把文件写到 docs/ 子目录除非 expected 路径就是 docs/xxx。\n")
+	sb.WriteString("</validation-feedback>")
+	return append(history, HistoryEntry{IncomingMail: sb.String()})
 }
 
 // saveHistory 将当前历史序列化并保存到任务中，供重试时恢复。
@@ -439,6 +669,104 @@ func compressHistory(history []HistoryEntry, keepRecent int) []HistoryEntry {
 func isContextOverflow(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "length") || strings.Contains(msg, "截断") || strings.Contains(msg, "context")
+}
+
+// ArtifactCheckResult 描述 ExpectedArtifacts 校验的结果。
+type ArtifactCheckResult struct {
+	Missing []string // 完全找不到的预期路径（精确匹配 + basename 兜底都失败）
+	Drifted []string // basename 兜底命中但路径不一致的预期项（"expected: X, actual: docs/X" 形式）
+	Actual  []string // 任务实际写入的全部 artifacts，便于注入到反馈消息
+}
+
+// checkExpectedArtifacts 校验任务的 ExpectedArtifacts 是否全部出现在 Artifacts 中。
+//
+// 这是 Level 3 的硬性合约校验：如果发布者明确声明"任务必须产出文件 X.md"，
+// 但任务结束时 X.md 没有被任何 write_file/edit_file 调用记录到 Artifacts 中，
+// 则认定任务"假完成"，触发失败重试。
+//
+// 匹配策略（按顺序尝试，命中即停）：
+//  1. 精确匹配：expected == artifact 字符串完全相等
+//  2. basename 兜底：filepath.Base(artifact) == filepath.Base(expected)
+//     命中后视为契约满足，但记录 drift（路径漂移）以便提示 LLM 修正
+//
+// basename 兜底的动机：LLM 经常把 expected="foo.md" 写到 "docs/foo.md"。这种"差点对了"
+// 的情况硬卡校验只会陷入死循环，而正确的重试反馈又让 LLM 困惑。允许 basename 命中，
+// 同时把漂移信息注入下次重试历史，比强制精确匹配更鲁棒。
+func checkExpectedArtifacts(store storeReader, taskID string) ArtifactCheckResult {
+	var res ArtifactCheckResult
+	task, err := store.GetTask(taskID)
+	if err != nil || task == nil {
+		return res // 拿不到任务无法校验，视作通过
+	}
+	if len(task.ExpectedArtifacts) == 0 {
+		return res // 无声明，无校验
+	}
+	res.Actual = append(res.Actual, task.Artifacts...)
+
+	// 建立精确匹配集合 + basename → 完整路径 索引
+	exact := make(map[string]bool)
+	byBase := make(map[string]string)
+	for _, p := range task.Artifacts {
+		exact[p] = true
+		byBase[filepath.Base(p)] = p
+	}
+
+	for _, expected := range task.ExpectedArtifacts {
+		if exact[expected] {
+			continue
+		}
+		expectedBase := filepath.Base(expected)
+		if actual, ok := byBase[expectedBase]; ok {
+			// basename 命中，记 drift
+			res.Drifted = append(res.Drifted, fmt.Sprintf("expected=%s, actual=%s", expected, actual))
+			continue
+		}
+		res.Missing = append(res.Missing, expected)
+	}
+	return res
+}
+
+// storeReader 是 checkExpectedArtifacts 需要的最小 Store 接口子集，方便测试。
+type storeReader interface {
+	GetTask(taskID string) (*model.Task, error)
+}
+
+// mergeArtifactsIntoDeps 把每个依赖任务的 Artifacts 文件路径列表追加到对应的 SubmitResult 文本后面。
+// 合并后的字符串作为 depResults map 的值，由 buildMessages 注入到 user prompt 的"前置任务结果"段。
+//
+// 输出格式（每个依赖任务，仅当 Artifacts 非空时追加）：
+//
+//	<原 SubmitResult 文本>
+//
+//	【该任务实际写入的文件】
+//	  - docs/output/foo.md
+//	  - docs/output/bar.md
+//	（你必须 read_file 这些文件来获取一手数据，不要凭空总结）
+//
+// 如果某依赖任务的 Artifacts 为空（任务未写文件或 report-only 模式），保持原 depResults 不变，
+// 不追加任何内容——无信息可注入。Worker 仍能从原文本看到上游的 SubmitResult。
+func mergeArtifactsIntoDeps(depResults map[string]string, depArtifacts map[string][]string) map[string]string {
+	if depResults == nil {
+		depResults = make(map[string]string)
+	}
+	for depID, artifacts := range depArtifacts {
+		if len(artifacts) == 0 {
+			continue // 上游未产出文件，无信息可注入
+		}
+		base := depResults[depID]
+		var sb strings.Builder
+		sb.WriteString(base)
+		if base != "" {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString("【该任务实际写入的文件】\n")
+		for _, p := range artifacts {
+			fmt.Fprintf(&sb, "  - %s\n", p)
+		}
+		sb.WriteString("（你必须 read_file 这些文件来获取一手数据，不要仅凭上面的总结文本就凭空生成下游产出）")
+		depResults[depID] = sb.String()
+	}
+	return depResults
 }
 
 // formatMailMessages 将邮箱消息格式化为带类型/优先级子标签的 XML，注入 LLM 上下文。

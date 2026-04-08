@@ -98,7 +98,7 @@ func TestWorkerE2E_TeamSnapshotInjectedOnceOnFirstExecution(t *testing.T) {
 		responses: []llm.Response{{Content: "done"}},
 	}
 
-	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil, nil, nil)
+	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil)
 	w.agent.PollInterval = 10 * time.Millisecond
 	w.agent.IdleThreshold = 3
 
@@ -173,7 +173,7 @@ func TestWorkerE2E_TeamSnapshotNotInjectedWhenRetrying(t *testing.T) {
 	mock := &e2eLLMClient{
 		responses: []llm.Response{{Content: "done"}},
 	}
-	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil, nil, nil)
+	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil)
 	w.agent.PollInterval = 10 * time.Millisecond
 	w.agent.IdleThreshold = 3
 
@@ -228,7 +228,7 @@ func TestWorkerE2E_TeamSnapshotTruncatesLongBusyDescription(t *testing.T) {
 	mock := &e2eLLMClient{
 		responses: []llm.Response{{Content: "done"}},
 	}
-	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil, nil, nil)
+	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil)
 	w.agent.PollInterval = 10 * time.Millisecond
 	w.agent.IdleThreshold = 3
 
