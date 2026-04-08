@@ -170,6 +170,84 @@ func TestScheduler_ReportDone(t *testing.T) {
 	}
 }
 
+// TestScheduler_BuildArtifactsReport 验证 report_done 的事实校对块：
+// 强制扫描 task.Artifacts，把"系统校验过的实际产出清单"附加到输出末尾，
+// 防止 LLM 在 summary 中编造不存在的产物。
+// 详见 KNOWN_ISSUES.md "Scheduler report_done 不基于 task.Artifacts 真实清单"。
+func TestScheduler_BuildArtifactsReport(t *testing.T) {
+	sched, s, _ := setupScheduler(&mockLLMClient{})
+
+	// 任务 A：有 2 个 artifacts（已完成）
+	taskA := &model.Task{Description: "写两个文件"}
+	if err := s.PublishTask(taskA); err != nil {
+		t.Fatalf("PublishTask A: %v", err)
+	}
+	if err := s.ClaimTask("worker-1", taskA.ID); err != nil {
+		t.Fatalf("ClaimTask A: %v", err)
+	}
+	if err := s.AppendArtifact(taskA.ID, "docs/foo.md"); err != nil {
+		t.Fatalf("AppendArtifact A foo: %v", err)
+	}
+	if err := s.AppendArtifact(taskA.ID, "docs/bar.md"); err != nil {
+		t.Fatalf("AppendArtifact A bar: %v", err)
+	}
+	if err := s.SubmitResult("worker-1", taskA.ID, "done"); err != nil {
+		t.Fatalf("SubmitResult A: %v", err)
+	}
+
+	// 任务 B：无任何 artifacts（已完成但啥也没写）
+	taskB := &model.Task{Description: "本应写文件但 LLM 偷懒"}
+	if err := s.PublishTask(taskB); err != nil {
+		t.Fatalf("PublishTask B: %v", err)
+	}
+	if err := s.ClaimTask("worker-2", taskB.ID); err != nil {
+		t.Fatalf("ClaimTask B: %v", err)
+	}
+	if err := s.SubmitResult("worker-2", taskB.ID, "done"); err != nil {
+		t.Fatalf("SubmitResult B: %v", err)
+	}
+
+	// 任务 C：不存在的 ID，触发 GetTask 失败的容错路径
+	bogusID := "nonexistent-task-id"
+
+	report := sched.buildArtifactsReport([]string{taskA.ID, taskB.ID, bogusID})
+
+	// 必须有标题
+	if !strings.Contains(report, "实际产出（系统校验") {
+		t.Errorf("缺少标题，report=\n%s", report)
+	}
+	// 任务 A 的两个文件都要列出
+	if !strings.Contains(report, "docs/foo.md") || !strings.Contains(report, "docs/bar.md") {
+		t.Errorf("任务 A 的 artifacts 缺失，report=\n%s", report)
+	}
+	// 任务 B 必须显示"无文件产出"，让矛盾响亮
+	if !strings.Contains(report, "无文件产出") {
+		t.Errorf("任务 B 应显示无文件产出，report=\n%s", report)
+	}
+	// 任务 C 走容错路径，不应中断输出
+	if !strings.Contains(report, "读取失败") {
+		t.Errorf("任务 C 应触发读取失败标记，report=\n%s", report)
+	}
+	// 三个任务的短 ID 都应出现
+	if !strings.Contains(report, taskA.ID[:8]) || !strings.Contains(report, taskB.ID[:8]) {
+		t.Errorf("缺少任务短 ID，report=\n%s", report)
+	}
+}
+
+// TestScheduler_BuildArtifactsReport_EmptyBatch 验证空 batch 返回空字符串，
+// 不会污染 report_done 的输出。
+func TestScheduler_BuildArtifactsReport_EmptyBatch(t *testing.T) {
+	sched, _, _ := setupScheduler(&mockLLMClient{})
+	got := sched.buildArtifactsReport(nil)
+	if got != "" {
+		t.Errorf("空 batch 应返回空字符串, got=%q", got)
+	}
+	got = sched.buildArtifactsReport([]string{})
+	if got != "" {
+		t.Errorf("空 slice 应返回空字符串, got=%q", got)
+	}
+}
+
 func TestScheduler_MaxLoops(t *testing.T) {
 	// LLM 持续返回工具调用，应在 MaxLoops 后停止
 	mock := &mockLLMClient{
