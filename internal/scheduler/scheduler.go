@@ -621,8 +621,13 @@ func (s *Scheduler) toolReportDone(args map[string]any) string {
 		return fmt.Sprintf("report_done 被拒绝：以下任务尚未完成: %s。请等待所有任务到达终态后再调用 report_done。", strings.Join(pendingTasks, ", "))
 	}
 
+	// 事实校对：从 task.Artifacts 直接读出系统校验过的"实际写入文件清单"，
+	// 与 LLM 的 summary 并列展示。即使 LLM 在 summary 里编造产物，用户也能
+	// 一眼看出与系统校验结果的矛盾。详见 KNOWN_ISSUES.md
+	// "Scheduler report_done 不基于 task.Artifacts 真实清单"。
 	summary := argString(args, "summary")
-	fmt.Printf("\n=== 任务完成 ===\n%s\n================\n\n", summary)
+	artifactsReport := s.buildArtifactsReport(batch)
+	fmt.Printf("\n=== 任务完成 ===\n%s\n%s================\n\n", summary, artifactsReport)
 
 	// 清空批次
 	s.mu.Lock()
@@ -630,6 +635,43 @@ func (s *Scheduler) toolReportDone(args map[string]any) string {
 	s.mu.Unlock()
 
 	return "已向用户报告完成"
+}
+
+// buildArtifactsReport 扫描指定任务列表，从 task.Artifacts 构造一段"系统校验"
+// 文本块，附加到 report_done 输出末尾。
+//
+// 这是 LLM 自由发挥的硬约束兜底——LLM 生成的 summary 可能编造不存在的产物，
+// 但本函数只读 task.Artifacts（由 write_file/edit_file 工具层硬连线追加），
+// 任何由 LLM 编造的文件都不会出现在这里；任何 LLM 没提的真实文件也会被列出。
+//
+// taskIDs 通常是 currentBatch 的快照副本（已在调用方的锁内拷贝）。
+// 单个任务 GetTask 失败不影响整体输出，只在该行打印错误标记。
+func (s *Scheduler) buildArtifactsReport(taskIDs []string) string {
+	if len(taskIDs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("=== 实际产出（系统校验，来自 task.Artifacts）===\n")
+	for _, id := range taskIDs {
+		shortID := id
+		if len(shortID) >= 8 {
+			shortID = shortID[:8]
+		}
+		task, err := s.store.GetTask(id)
+		if err != nil || task == nil {
+			fmt.Fprintf(&b, "任务 %s: <读取失败: %v>\n", shortID, err)
+			continue
+		}
+		fmt.Fprintf(&b, "任务 %s [%s]:\n", shortID, task.Status)
+		if len(task.Artifacts) == 0 {
+			b.WriteString("  └─ 无文件产出\n")
+		} else {
+			for _, p := range task.Artifacts {
+				fmt.Fprintf(&b, "  └─ %s\n", p)
+			}
+		}
+	}
+	return b.String()
 }
 
 func (s *Scheduler) toolSendMessage(args map[string]any) string {

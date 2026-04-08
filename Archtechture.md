@@ -1,3 +1,33 @@
+# 现状速览（2026-04-09）
+
+> 本文档原本是设计稿，部分章节早于实现。本节为升级工作提供快速对齐入口，列出**与设计文档不一致的关键实现事实**。后续章节如有冲突，以本节和源代码为准。
+
+**已实现的核心包**（`internal/` 下）：
+`agent`（ReAct 循环 + 三层历史压缩 + FileStateCache）、`bootstrap`、`cli`、`config`、`explorer`（只读调查代理）、`llm`、`mailbox`（异步信箱 + Notifier）、`model`、`pathutil`、`roster`（文件级 TryClaim/Release）、`scheduler`（事件驱动 + 公告板快照 + Artifacts/ExpectedArtifacts 注入）、`shell`（命令审批/拦截）、`store`（公告板 + TaskCancelRegistry）、`tools`、`trace`（每任务一份 JSONL）、`watchdog`、`webtool`、`worker`（10 个工具的执行代理，可配置 N 个实例）。
+
+**关键实现事实，与原设计文档的差异**：
+
+- **执行代理 = `worker.Worker`**：原文档统称"执行代理"，实际是 `internal/worker` 包，可通过 `cfg.WorkerCount` 配置 N 个实例。每个 worker 拥有 10 个工具（read/write/edit/list/grep/glob/run_shell/publish_subtask/web_search/web_fetch）。
+- **Roster 仅做文件级锁，不是团队花名册**：`Roster` 接口的 `TryClaim/Release/ReleaseAll/ListAllAgents` 全部围绕"防文件并发写"。它**不**承担团队成员注册或角色描述功能（设计文档中的"团队花名册"语义未实现，改由 mailbox `TeamSnapshot` 提供轻量替代）。
+- **Mailbox 子系统**（设计文档完全未提及）：`internal/mailbox` 提供基于 Go channel 的异步信箱、`send_message` 工具、ack 自动回执、`TeamSnapshot` 团队感知。详见 §"邮箱与异步通讯"。
+- **MailNotifier 当前默认禁用**（2026-04-09）：为防止"邮件级联爆炸"P0 缺陷，`config.MailNotifierEnabled` 默认为 `false`，bootstrap 跳过 `MailNotifier.Run`。退化：空闲 agent 不会被自动唤醒读邮件。详见 `docs/activate/KNOWN_ISSUES.md`。
+- **架构决策：无 git 依赖**（2026-04-09）：曾经的 `internal/isolation`（git worktree 隔离）整体删除。**AgentGo 代码本体不调用 git**。所有 Worker 共享 `ProjectRoot`。当前并发写文件**唯一防线**是 `Roster` 文件锁 + `expected_hash` TOCTOU 检查 + `pathutil.ValidatePath` 路径越界防护。删 git 后**故意暴露**的 4 项退化（并发写覆盖、半成品回滚、跨任务可见性、杀任务清理）正在等待"多代理协同重建"阶段按真实失败模式驱动设计。
+- **任务数据流**（设计文档未提及，2026-04-08 落地）：`Task.Artifacts`（实际写入文件清单，`write_file`/`edit_file` 自动追加）、`Task.ExpectedArtifacts`（发布者声明的硬合约，任务结束前由 `agent.checkExpectedArtifacts` 校验，缺失则触发重试）、`Task.LastResponse`（worker 最后一次 LLM 响应，无条件持久化用于失败诊断）。详见 §"产物契约与失败汇报"。
+- **TaskCancelRegistry**：per-task cancel context，看门狗/调度器把任务转为 terminal 状态时自动取消正在执行的代理（通过 `ctx.Done()` 即时感知），不依赖广播。
+- **崩溃汇报**：任务最终失败时 agent 自动调用 `sendCrashReport`，向 `task.EventSource` 发送 `priority=high` 邮件，附 expected vs actual artifacts、worker 最后响应原文。
+- **三层历史压缩**：Layer 1 `snipOldToolResults`（无 LLM 开销，逐轮清理旧工具输出）；Layer 2 `compressHistory`（超过 `CompactTokenThreshold` 时摘要）；Layer 3 context overflow 时 `keepRecent=1` 激进压缩 + RetryRollback。
+- **Trace 系统**：`internal/trace` 每任务一份 JSONL 文件，落盘到 `.agentgo/traces/`，保留最近 100 个任务。可通过 `AGENTGO_DUMP_PROMPTS=1` 环境变量额外启用 prompt dump。
+
+**未启动 / 待设计**：
+- 多代理协同重建（4 项退化的针对性修复）
+- 邮件级联爆炸 4 根因修复（chain_depth、notifier 按 agentID 去重、唤醒任务携带上下文、reply 抑制）
+- Scheduler `report_done` 基于 `Artifacts` 的事实校对
+- Scheduler 事件响应延迟 ~3 分钟根因排查
+
+详细缺陷与状态见 `docs/activate/KNOWN_ISSUES.md`（30/35 已修复）。
+
+---
+
 # 代理
 代理是最为基础的运行单元，尽管我在后文会频繁提及调度器，但是调度器本身就是一个代理，它也可以回答用户的问题，并且操作有限度的工具。
 ## 代理工具
@@ -255,7 +285,9 @@
 - 事件 channel 应设置合理的缓冲区大小，防止公告板写操作因 channel 满而阻塞
 
 # 子代理交互
-执行代理之间不进行点对点通信，所有协调通过两个共享状态组件中介：**公告板**负责任务级协调，**花名册**负责资源级协调。代理之间不需要知道对方的存在，也不需要直接连接，天然解耦。
+执行代理之间的协调通过三个共享状态组件中介：**公告板**负责任务级协调，**花名册**负责文件级资源协调，**邮箱**负责异步消息传递（点对点 + 广播）。代理之间不需要知道对方的存在，也不需要直接连接，天然解耦。
+
+> 注：原设计文档把"花名册"描述为团队成员注册表（含角色描述）。当前实现的 `Roster` 仅做文件级 TryClaim/Release，团队成员感知由 mailbox 的 `TeamSnapshot` 提供（详见 §"邮箱与异步通讯"）。
 
 ## 公告板协调
 公告板是任务级协调的核心，代理通过它感知整体进度：
@@ -288,36 +320,141 @@
 3. 代理 A 完成修改，释放 `auth.py` 的声明
 4. 若代理 B 仍需修改 `auth.py`，此时可重新尝试声明
 
+> **当前局限**：Roster 只防"同一时刻两 agent 同时打开同一文件写"，**不防**"agent A 读 → agent B 写 → agent A 写覆盖 B"序列竞争。对后者由 `expected_hash` TOCTOU 检查兜底（`read_file` 返回 SHA256，`write_file`/`edit_file` 可携带 `expected_hash`，写入前校验，不一致则返回"冲突"错误）。
+
+## 邮箱与异步通讯
+**`internal/mailbox`** 提供基于 Go channel 的异步信箱系统，支持点对点投递与广播。原设计文档未提及，是 2026-04 实现的能力。
+
+### 组件
+- **`mailbox.Registry`**：所有代理信箱的注册中心。每个代理通过 `Register(agentID, eventType, aliases...)` 申请信箱，可注册别名（如 `"scheduler"`、`"explorer-1"`）。
+- **`mailbox.Mailbox`**：单个代理的收件箱，内部是带缓冲的 Go channel（容量 = `cfg.MailboxBufferSize`）。
+- **`mailbox.MailNotifier`**：独立 goroutine，定期扫描非空信箱，为有未读邮件的空闲代理发布"唤醒任务"。**当前默认禁用**（`cfg.MailNotifierEnabled=false`），因存在邮件级联爆炸 P0 缺陷。
+
+### 消息结构（`mailbox.Message`）
+- `From` / `To` / `Content` / `Summary` / `SentAt`
+- `Type`：`info` / `question` / `reply` / `steer` / `ack`
+- `Priority`：`low` / `normal` / `high`
+
+`DrainWithAck` 在代理消费消息时自动向发送方回送 `type=ack` 已读回执。
+
+### 工具与代理集成
+- `send_message` 工具注册在 worker / explorer / scheduler 三类代理上，支持 `to=<agentID>` 点对点或 `to=*` 广播（自动跳过自己）。
+- 代理任务开始时，`buildMessages` 从 `Registry` 拉取 `TeamSnapshot`，把队友 ID + 忙碌/空闲状态 + 当前任务摘要注入为首条 `<team-snapshot>` 系统消息，让 LLM 知道"此刻谁在做什么"。
+- 邮件以 `<agent-mail type=... priority=...>` XML 子标签形式注入 LLM 上下文，prompt 引导代理根据 type 做差异化响应。
+
+### Scheduler 自驱 drain
+Scheduler 不依赖 MailNotifier。它有自己的 ticker（`scheduler_ticker_sec`），每次唤醒时主动 drain 自己的信箱，因此 `/steer` 投到 scheduler 始终生效，与 MailNotifier 是否启用无关。
+
+### 当前禁用状态（2026-04-09）
+`config.MailNotifierEnabled` 默认 `false`。bootstrap 不启动 `MailNotifier.Run` goroutine。**保留能力**：mailbox 投递、`send_message` 工具、scheduler 自驱 drain、ack 回执。**唯一退化**：空闲 worker/explorer 不会被自动叫起来读邮件 — 邮件仅在 agent 因 scheduler 派发别的任务而恰好运行时被被动 drain。恢复条件见 `KNOWN_ISSUES.md` 邮件级联爆炸条目。
+
+## 产物契约与失败汇报
+2026-04-08 落地的硬约束机制，用于解决 worker 凭空捏造任务结果 / 任务无文件产出两个 P0 缺陷。
+
+### `Task.Artifacts`（实际产出清单）
+- `write_file` / `edit_file` 成功后自动调用 `Store.AppendArtifact(taskID, path)`，路径经 `normalizeArtifactPath` 标准化为相对项目根的相对路径。
+- 下游任务通过 `Store.GetDependencyArtifacts(taskID)` 获取所有上游任务的实际产出清单，由 `agent.processTask` 注入到 user prompt 的"前置任务结果"段，文案明确告知"必须 read_file 这些文件，不要凭空生成"。
+
+### `Task.ExpectedArtifacts`（发布者声明的硬合约）
+- Scheduler 通过 `publish_task` 工具的 `expected_artifacts` 参数声明任务必须产出哪些文件。
+- 任务结束前 `agent.checkExpectedArtifacts` 扫描 `task.Artifacts`，缺失任何 expected 文件则触发 `handleFailure` 重试，错误消息明确告知"缺失 X，已写入 Y"。
+- 路径精确匹配失败时按 `filepath.Base` 兜底命中并记 `Drifted` warning，避免硬卡。
+- Explorer 是只读代理，scheduler 和 meta 工具双端硬拒绝 `event_type=explore && expected_artifacts != nil`。
+
+### `Task.LastResponse`（失败诊断锚点）
+- Worker 每次 non-tool LLM 响应都通过 `Store.RecordLastResponse(taskID, content)` 无条件持久化，无论后续校验成败。
+- 任务最终崩溃时 `sendCrashReport` 把 LastResponse 原文附在邮件正文里发给 `task.EventSource`，scheduler 不再只看到一个干瘪的"重试次数耗尽"。
+
+### 校验反馈进入历史
+`appendValidationFeedback` 把 ExpectedArtifacts 校验失败的诊断（缺失文件、实际写入文件、纠正策略）作为 `<validation-feedback>` 段以 `IncomingMail` 形式注入历史，重试时 LLM 能直接看见自己为何被打回，避免"重试还是同样输出"的死循环。
+
+### 终态崩溃汇报
+`agent.terminateTask` 在 RetryCount >= MaxRetry 时调用 `sendCrashReport`，向 `task.EventSource` 发送 `priority=high` 邮件，正文格式："代理 X 在执行任务 Y 时崩溃，原因 Z；任务描述、重试次数、expected vs actual artifacts、worker 最后一次响应原文"。
+
 # 系统启动流程
-系统由 main goroutine 统一引导，按以下顺序完成初始化。每一步完成后在终端打印提示信息，方便早期开发阶段的调试和问题定位。
-1. **加载全局配置**：读取配置文件，初始化全局阈值（最大重试次数、默认并发数、FIFO 淘汰上限、巡检频率等）。打印：`[启动] 全局配置加载完成`
-2. **初始化公告板**：创建公告板实例，初始化内存数据结构。打印：`[启动] 公告板初始化完成`
-3. **初始化花名册**：创建花名册管理组件实例。打印：`[启动] 花名册初始化完成`
-4. **启动看门狗**：由 main goroutine 拉起看门狗 goroutine，注册自动重启监控。打印：`[启动] 看门狗已启动`
-5. **启动调查代理**：创建调查代理实例，进入空闲等待状态。打印：`[启动] 调查代理已启动`
-6. **启动调度器**：创建调度器实例，开始监听事件 channel 和 ticker。打印：`[启动] 调度器已启动`
-7. **开始接受用户输入**：打开命令行或控制面板接口，系统进入就绪状态。打印：`[启动] 系统就绪，等待用户输入`
-- 启动顺序不可调换：公告板和花名册是基础设施，必须先于所有代理初始化；看门狗先于调度器启动，确保调度器发布的第一批任务就处于监控之下
-- 任一步骤失败时，打印错误信息并终止启动，不进入半初始化状态
+系统由 `main.go` → `bootstrap.Bootstrap(configPath, explicit)` 完成初始化，再由 `System.Start(ctx, cancel)` 拉起所有 goroutine，最后 `System.RunCLI(ctx, stdin, stdout)` 阻塞主线程。
+
+## Bootstrap 阶段（构造对象图）
+1. **加载配置**：`config.LoadConfig`，YAML/JSON 自动判别，文件不存在时回退默认值。打印：`[启动] 全局配置加载完成`
+2. **初始化 Trace 系统**：`trace.NewWriter(.agentgo/traces, 100)` + 可选 `PromptDumper`（`AGENTGO_DUMP_PROMPTS=1` 启用）。失败仅 warning，不中断主流程。打印：`[启动] Trace 系统已启动` 或 warning
+3. **初始化公告板**：`store.NewMemoryTaskStore` + `store.NewTaskCancelRegistry`，把 cancelRegistry 注入 store（terminal 状态转换时自动取消正在执行的代理）。打印：`[启动] 公告板初始化完成`
+4. **初始化花名册**：`roster.NewMemoryRoster`。打印：`[启动] 花名册初始化完成`
+5. **初始化邮箱注册表**：`mailbox.NewRegistry(cfg.MailboxBufferSize)`。打印：`[启动] 邮箱注册表初始化完成`
+6. **创建 LLM 客户端**：scheduler / explorer / worker × N 各自创建 `llm.NewSDKClient`（OpenAI 兼容 SDK）
+7. **创建调度器**：`scheduler.New(store, llm, eventCh, cfg, mbRegistry)`
+8. **创建看门狗**：`watchdog.New(store, cfg, eventCh, roster)`
+9. **创建调查代理**：`explorer.New(store, roster, llm, cfg, cancelRegistry, mbRegistry, searchProvider)`
+10. **创建命令审批通道**：`approvalCh := make(chan shell.ApprovalRequest, 8)`，Worker→CLI 通道
+11. **创建执行代理**：`worker.NewWithID("worker-N", ...)` × `cfg.WorkerCount`，每个 worker 持有独立 LLM client
+12. **创建邮差通知器**：`mailbox.NewMailNotifier(...)` 对象（**不立即启动**）
+
+## Start 阶段（拉起 goroutine）
+- **Step 5**：`Scheduler.Run(ctx)` — 事件驱动 + ticker 兜底，消费 eventCh。打印：`[启动] 调度器已启动`
+- **Step 6**：`runWatchdogWithRecover(ctx)` — for 循环 + recover，panic 后 1 秒延迟重启。打印：`[启动] 看门狗已启动`
+- **Step 6.5**：**条件启动** `MailNotifier.Run(ctx)`：仅当 `cfg.MailNotifierEnabled=true` 时启动 goroutine。默认 `false`（防止邮件级联爆炸）。禁用时打印：`[启动] 邮差通知器已禁用 (mail_notifier_enabled=false) — 邮件不会自动唤醒空闲代理`
+- **Step 7**：`Explorer.Run(ctx)`。打印：`[启动] 调查代理已启动`
+- **Step 8**：`Worker[1..N].Run(ctx)` × `cfg.WorkerCount` 并行 goroutine。打印：`[启动] 执行代理已启动 (N 个)`
+- 最后打印：`[启动] 系统就绪，等待用户输入`
+
+## RunCLI 阶段
+- `cli.New(...).Run(ctx)` 阻塞主线程，处理用户输入与命令（`/quit` `/mode` `/status` `/cancel` `/help` `/steer`）
+- 用户输入以 `mailbox.Message` 形式投递到 scheduler 信箱，scheduler 自驱 drain 消费
+
+## 启动顺序约束
+- 公告板和花名册是基础设施，必须先于所有代理初始化
+- Scheduler 先于其他代理 goroutine 启动（消费者先就绪，避免事件丢失）
+- 看门狗先于 explorer/worker 启动，确保第一批任务就处于监控之下
+- 任一步骤失败时返回 error 终止启动，不进入半初始化状态
 
 # 全局配置
-系统运行所需的全局参数，从配置文件（setting.yaml 或 setting.json）中读取，也可通过命令行参数覆盖。命令行参数优先级高于配置文件。
+系统运行所需的全局参数，从 `setting.yaml` 或 `setting.json` 读取，文件不存在时使用内置默认值。当前仅支持 `-config <path>` 命令行参数指定文件路径，**单字段命令行覆盖未实现**。配置定义在 `internal/config/config.go`。
 
-## 配置项
+## 配置项（与 `Config` 结构体一一对应）
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
-| max_retry | 任务级重试上限，超过则由看门狗取消 | 3 |
+| **任务调度与并发** | | |
+| max_retry | 任务级重试上限，超过则由看门狗/agent 取消 | 3 |
 | default_concurrency | 单个任务的默认最大执行代理数 | 2 |
-| fifo_limit | 公告板保留已完成任务的数量上限 | 100 |
-| watchdog_interval_sec | 看门狗巡检间隔（秒） | 30 |
+| fifo_limit | 公告板保留已完成任务的数量上限（依赖感知淘汰） | 100 |
+| event_channel_buffer | 事件 channel 缓冲区大小 | 64 |
+| default_timeout_sec | 任务默认超时阈值（秒） | 300 |
+| worker_count | 启动的 Worker 实例数 | 1 |
+| **代理 ReAct 循环** | | |
+| agent_max_loops | 执行代理内部 ReAct 最大循环次数 | 50 |
+| agent_idle_threshold | agent 连续空轮询次数达到阈值后退出 goroutine（0 = 禁用） | 0 |
+| compact_token_threshold | Layer 2 历史压缩触发阈值（prompt tokens） | 80000 |
+| compact_keep_recent | 历史压缩时保留最近 N 条消息 | 3 |
+| max_subtask_depth | `publish_subtask` 工具允许的最大子任务深度 | 1 |
+| **调度器** | | |
 | scheduler_ticker_sec | 调度器轮询兜底唤醒间隔（秒） | 10 |
 | scheduler_max_loops | 调度器单次唤醒的 ReAct 最大循环次数 | 10 |
-| agent_max_loops | 执行代理内部 ReAct 最大循环次数 | 50 |
-| event_channel_buffer | 事件 channel 缓冲区大小 | 64 |
-| default_timeout_sec | 任务未单独设置超时时的默认超时阈值（秒） | 300 |
+| **看门狗** | | |
+| watchdog_interval_sec | 看门狗巡检间隔（秒） | 30 |
+| **LLM 后端** | | |
+| llm_base_url | OpenAI 兼容 API 端点 | （无） |
+| llm_api_key | API 密钥 | （无） |
+| llm_model | 主模型名称（用于 scheduler 和 worker） | gpt-4o |
+| llm_timeout_sec | 单次 LLM 调用超时（秒） | 60 |
+| explorer_model | 调查代理使用的轻量模型 | gpt-4o-mini |
+| explorer_event_type | 调查代理监听的事件类型 | explore |
+| **Shell 与文件** | | |
+| shell_timeout_sec | `run_shell` 命令默认超时（秒） | 30 |
+| project_root | 项目根目录（路径越界检查基准） | （无，由 main 设置） |
+| **邮箱与代理通讯** | | |
+| mailbox_buffer_size | 单个代理信箱的 channel 缓冲容量 | 32 |
+| mail_notifier_interval_sec | 邮差扫描间隔（秒） | 5 |
+| **mail_notifier_enabled** | **邮差是否启动**（默认禁用，防邮件级联爆炸） | **false** |
+| **Web 检索** | | |
+| search_api_provider | 搜索 provider 名称 | duckduckgo_html |
+| search_api_url | 搜索 API URL（如 provider 需要） | （无） |
+| search_api_key | 搜索 API 密钥（如 provider 需要） | （无） |
 
 ## 配置加载顺序
-1. 读取配置文件（setting.yaml 或 setting.json），若文件不存在则使用全部默认值
-2. 解析命令行参数，覆盖配置文件中的同名项
-3. 对未指定的项填充默认值
+1. 通过 `-config <path>` 命令行参数获取配置文件路径（默认 `setting.yaml`）
+2. `LoadConfig` 按文件后缀（`.yaml`/`.yml`/`.json`）选择解析器
+3. 文件不存在时：
+   - 显式指定（`-config explicit`）→ 报错终止
+   - 默认路径 → 打印 warning 后使用内置默认配置
+4. 解析后字段以文件值为准，未指定字段保持 `DefaultConfig()` 默认值
+5. **单字段命令行覆盖（如 `-worker_count=3`）暂未实现**
 

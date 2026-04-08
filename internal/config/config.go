@@ -35,6 +35,9 @@ type Config struct {
 	WorkerCount             int    `yaml:"worker_count" json:"worker_count"`
 	MailboxBufferSize       int    `yaml:"mailbox_buffer_size" json:"mailbox_buffer_size"`
 	MailNotifierIntervalSec int    `yaml:"mail_notifier_interval_sec" json:"mail_notifier_interval_sec"`
+	// MailNotifierEnabled 控制邮差通知器是否启动。默认 false（一刀切禁用），用于防止邮件级联爆炸（见 KNOWN_ISSUES.md）。
+	// 等"chain_depth + 去重 + 上下文展开 + reply 抑制" 4 项修复落地后再恢复为 true。
+	MailNotifierEnabled bool `yaml:"mail_notifier_enabled" json:"mail_notifier_enabled"`
 	SearchAPIProvider       string `yaml:"search_api_provider" json:"search_api_provider"`
 	SearchAPIURL            string `yaml:"search_api_url" json:"search_api_url"`
 	SearchAPIKey            string `yaml:"search_api_key" json:"search_api_key"`
@@ -63,6 +66,7 @@ func DefaultConfig() *Config {
 		WorkerCount:             1,
 		MailboxBufferSize:       32,
 		MailNotifierIntervalSec: 5,
+		MailNotifierEnabled:     false, // 默认禁用，防止邮件级联爆炸
 		SearchAPIProvider:       "duckduckgo_html",
 	}
 }

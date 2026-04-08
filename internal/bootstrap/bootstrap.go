@@ -171,13 +171,17 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
 	}()
 	fmt.Println("[启动] 看门狗已启动")
 
-	// Step 6.5: 启动邮差通知器
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.MailNotifier.Run(ctx)
-	}()
-	fmt.Println("[启动] 邮差通知器已启动")
+	// Step 6.5: 启动邮差通知器（默认禁用，防止邮件级联爆炸 — 见 KNOWN_ISSUES.md）
+	if s.Config.MailNotifierEnabled {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.MailNotifier.Run(ctx)
+		}()
+		fmt.Println("[启动] 邮差通知器已启动")
+	} else {
+		fmt.Println("[启动] 邮差通知器已禁用 (mail_notifier_enabled=false) — 邮件不会自动唤醒空闲代理")
+	}
 
 	// Step 7: 启动调查代理
 	s.wg.Add(1)
