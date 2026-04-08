@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -1611,4 +1612,165 @@ func TestAgent_FileCache_ClearedOnTaskStart(t *testing.T) {
 	ag := NewAgent("agent-1", "code", s, r, executor, 50)
 	ag.FileCache = cache
 	ag.processTask(context.Background(), task.ID)
+}
+
+// TestMergeArtifactsIntoDeps_NonEmpty 验证当上游任务有 artifacts 时，
+// 它们会以可读格式追加到 depResults 中对应的条目。
+func TestMergeArtifactsIntoDeps_NonEmpty(t *testing.T) {
+	depResults := map[string]string{
+		"task-a": "上游 A 的总结文本",
+	}
+	depArtifacts := map[string][]string{
+		"task-a": {"docs/output/a1.md", "docs/output/a2.md"},
+	}
+	merged := mergeArtifactsIntoDeps(depResults, depArtifacts)
+
+	got := merged["task-a"]
+	if !strings.Contains(got, "上游 A 的总结文本") {
+		t.Errorf("merged 应保留原 SubmitResult 文本，实际: %s", got)
+	}
+	if !strings.Contains(got, "docs/output/a1.md") {
+		t.Errorf("merged 应包含 a1.md 路径，实际: %s", got)
+	}
+	if !strings.Contains(got, "docs/output/a2.md") {
+		t.Errorf("merged 应包含 a2.md 路径，实际: %s", got)
+	}
+	if !strings.Contains(got, "read_file") {
+		t.Errorf("merged 应含强引导措辞 'read_file'，实际: %s", got)
+	}
+}
+
+// TestMergeArtifactsIntoDeps_EmptyArtifacts 验证上游 artifacts 为空时，
+// depResults 不被改动（保持原 SubmitResult 文本）。
+func TestMergeArtifactsIntoDeps_EmptyArtifacts(t *testing.T) {
+	depResults := map[string]string{
+		"task-a": "原文本",
+	}
+	depArtifacts := map[string][]string{
+		"task-a": {}, // 空 artifacts
+	}
+	merged := mergeArtifactsIntoDeps(depResults, depArtifacts)
+	if merged["task-a"] != "原文本" {
+		t.Errorf("空 artifacts 时不应改动 depResults，实际: %s", merged["task-a"])
+	}
+}
+
+// TestMergeArtifactsIntoDeps_MultipleDeps 验证多个依赖任务各自正确合并。
+func TestMergeArtifactsIntoDeps_MultipleDeps(t *testing.T) {
+	depResults := map[string]string{
+		"task-a": "A 文本",
+		"task-b": "B 文本",
+	}
+	depArtifacts := map[string][]string{
+		"task-a": {"a.md"},
+		"task-b": {"b1.md", "b2.md"},
+	}
+	merged := mergeArtifactsIntoDeps(depResults, depArtifacts)
+	if !strings.Contains(merged["task-a"], "a.md") {
+		t.Errorf("task-a 应包含 a.md")
+	}
+	if !strings.Contains(merged["task-b"], "b1.md") || !strings.Contains(merged["task-b"], "b2.md") {
+		t.Errorf("task-b 应包含 b1.md 和 b2.md")
+	}
+}
+
+// fakeStoreReader 是 checkExpectedArtifacts 的最小测试桩。
+type fakeStoreReader struct {
+	task *model.Task
+	err  error
+}
+
+func (f *fakeStoreReader) GetTask(taskID string) (*model.Task, error) {
+	return f.task, f.err
+}
+
+func TestCheckExpectedArtifacts_AllPresent(t *testing.T) {
+	r := &fakeStoreReader{
+		task: &model.Task{
+			ExpectedArtifacts: []string{"docs/a.md", "docs/b.md"},
+			Artifacts:         []string{"docs/a.md", "docs/b.md", "docs/extra.md"},
+		},
+	}
+	res := checkExpectedArtifacts(r, "any-id")
+	if len(res.Missing) != 0 || len(res.Drifted) != 0 {
+		t.Errorf("expected no missing/drift, got: %+v", res)
+	}
+}
+
+func TestCheckExpectedArtifacts_OneMissing(t *testing.T) {
+	r := &fakeStoreReader{
+		task: &model.Task{
+			ExpectedArtifacts: []string{"docs/a.md", "other/totally_unrelated.md"},
+			Artifacts:         []string{"docs/a.md"},
+		},
+	}
+	res := checkExpectedArtifacts(r, "any-id")
+	if len(res.Missing) != 1 || res.Missing[0] != "other/totally_unrelated.md" {
+		t.Errorf("expected ['other/totally_unrelated.md'] missing, got: %+v", res)
+	}
+}
+
+func TestCheckExpectedArtifacts_NoExpected(t *testing.T) {
+	r := &fakeStoreReader{
+		task: &model.Task{
+			ExpectedArtifacts: nil,
+			Artifacts:         nil,
+		},
+	}
+	res := checkExpectedArtifacts(r, "any-id")
+	if len(res.Missing) != 0 {
+		t.Errorf("无声明应跳过校验，得到: %+v", res)
+	}
+}
+
+func TestCheckExpectedArtifacts_AllMissing(t *testing.T) {
+	r := &fakeStoreReader{
+		task: &model.Task{
+			ExpectedArtifacts: []string{"a.md", "b.md"},
+			Artifacts:         []string{},
+		},
+	}
+	res := checkExpectedArtifacts(r, "any-id")
+	if len(res.Missing) != 2 {
+		t.Errorf("expected 2 missing, got: %+v", res)
+	}
+}
+
+func TestCheckExpectedArtifacts_TaskNotFound(t *testing.T) {
+	r := &fakeStoreReader{err: errors.New("not found")}
+	res := checkExpectedArtifacts(r, "ghost")
+	if len(res.Missing) != 0 {
+		t.Errorf("拿不到任务时应跳过校验（避免阻塞），得到: %+v", res)
+	}
+}
+
+// 路径漂移：worker 把文件写到了相邻目录，basename 命中即视为契约满足，但记 drift。
+func TestCheckExpectedArtifacts_BasenameDriftToleratedAsSuccess(t *testing.T) {
+	r := &fakeStoreReader{
+		task: &model.Task{
+			ExpectedArtifacts: []string{"report.md"},
+			Artifacts:         []string{"docs/report.md"}, // 实际写到了 docs/ 下
+		},
+	}
+	res := checkExpectedArtifacts(r, "any-id")
+	if len(res.Missing) != 0 {
+		t.Errorf("basename 兜底应将其视为命中，但 Missing=%v", res.Missing)
+	}
+	if len(res.Drifted) != 1 {
+		t.Errorf("应当记 1 条 drift，但 Drifted=%v", res.Drifted)
+	}
+}
+
+// basename 不同 → 完全 missing
+func TestCheckExpectedArtifacts_DifferentBasenameStillMissing(t *testing.T) {
+	r := &fakeStoreReader{
+		task: &model.Task{
+			ExpectedArtifacts: []string{"report.md"},
+			Artifacts:         []string{"docs/summary.md"}, // 完全不同的名字
+		},
+	}
+	res := checkExpectedArtifacts(r, "any-id")
+	if len(res.Missing) != 1 || res.Missing[0] != "report.md" {
+		t.Errorf("expected ['report.md'] missing, got: %+v", res)
+	}
 }

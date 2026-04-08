@@ -20,7 +20,7 @@ func TestDuckDuckGoProvider_Name(t *testing.T) {
 
 func TestDuckDuckGoProvider_EmptyQuery(t *testing.T) {
 	p := &DuckDuckGoProvider{}
-	_, err := p.Search(context.Background(), "")
+	_, err := p.Search(context.Background(), "", nil)
 	if err == nil {
 		t.Error("期望空 query 返回错误")
 	}
@@ -35,7 +35,7 @@ func TestSearXNGProvider_Name(t *testing.T) {
 
 func TestSearXNGProvider_EmptyQuery(t *testing.T) {
 	p := &SearXNGProvider{BaseURL: "http://localhost:8080"}
-	_, err := p.Search(context.Background(), "")
+	_, err := p.Search(context.Background(), "", nil)
 	if err == nil {
 		t.Error("期望空 query 返回错误")
 	}
@@ -67,7 +67,7 @@ func TestSearXNGProvider_Search(t *testing.T) {
 	defer srv.Close()
 
 	p := &SearXNGProvider{BaseURL: srv.URL}
-	results, err := p.Search(context.Background(), "test query")
+	results, err := p.Search(context.Background(), "test query", nil)
 	if err != nil {
 		t.Fatalf("搜索失败: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestTavilyProvider_Name(t *testing.T) {
 
 func TestTavilyProvider_EmptyQuery(t *testing.T) {
 	p := &TavilyProvider{APIKey: "test-key"}
-	_, err := p.Search(context.Background(), "")
+	_, err := p.Search(context.Background(), "", nil)
 	if err == nil {
 		t.Error("期望空 query 返回错误")
 	}
@@ -129,7 +129,7 @@ func TestTavilyProvider_Search(t *testing.T) {
 	// 为了测试，我们跳过实际 HTTP 调用，仅验证基本逻辑。
 	p := &TavilyProvider{APIKey: "test-key"}
 	// 空查询应报错
-	_, err := p.Search(context.Background(), "")
+	_, err := p.Search(context.Background(), "", nil)
 	if err == nil {
 		t.Error("空查询应返回错误")
 	}
@@ -144,7 +144,7 @@ func TestSerperProvider_Name(t *testing.T) {
 
 func TestSerperProvider_EmptyQuery(t *testing.T) {
 	p := &SerperProvider{APIKey: "test-key"}
-	_, err := p.Search(context.Background(), "")
+	_, err := p.Search(context.Background(), "", nil)
 	if err == nil {
 		t.Error("期望空 query 返回错误")
 	}

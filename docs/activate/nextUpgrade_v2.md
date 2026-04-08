@@ -1,40 +1,540 @@
 # 下一阶段升级计划 v2
 
-## 1. 工具层升级
+---
 
-### 1.1 Web 搜索工具重构
+## 1. 工具系统（Tool System）
 
-当前 `web_search` 实现直接爬取 DuckDuckGo 的 HTML 页面端点（`https://html.duckduckgo.com/html/`），通过正则匹配 CSS 类名（`result__a`、`result__snippet`）提取搜索结果。该方案存在以下问题：
+> 本章节汇总所有与工具相关的设计与升级计划，涵盖架构重构、核心工具标准化、各类工具的具体改进，以及工具集的管理与治理机制。
 
-| 问题 | 影响 |
-|------|------|
-| 非正式 API，爬取 HTML 页面违反 DuckDuckGo ToS | 法律与合规风险 |
-| 正则解析依赖特定 CSS 类名，页面改版即静默失效 | 功能可靠性 |
-| 无 rate limit 处理，高频调用会被封 IP | 可用性 |
-| 无法获取结构化元数据（发布日期、来源评级等） | 结果质量 |
+---
 
-#### 升级方向
+### 1.1 架构重构前置：ToolGroup 与 11 核心工具标准化
 
-改为**可配置的搜索 API 后端**，在 `Config` 中新增：
+#### 背景：当前工具系统的问题
 
-```yaml
-search_api_provider: "searxng"          # 可选: searxng / tavily / serper / google_custom
-search_api_url: "http://localhost:8888" # SearXNG 自建实例地址，或商业 API 端点
-search_api_key: ""                      # 商业 API 所需的密钥
+代码审计发现工具实现存在以下系统性问题：
+
+- Worker 和 Explorer 对 `read_file / list_files / grep_search` 各自维护一份实现，已出现功能漂移（Explorer 的 `read_file` 缺少 `content_hash`）
+- 工具注册逻辑零散分布在 `worker.go` 和 `explorer.go`，没有共享复用机制
+- `ToolRegistry` 是纯平铺 `map[string]ToolFunc`，无工具分组、无能力标记，无法按组批量注册或过滤
+- 工具 JSON Schema 全部是内联 `map[string]any` 裸字面量，每个工具重复着同样的样板
+- 依赖通过闭包随机注入，每个 `make*Tool` 函数签名各不相同
+
+#### ToolGroup 接口
+
+引入 `ToolGroup` 概念，每组工具封装自己的依赖和注册逻辑，代理通过组合 Group 构建工具集，彻底消除当前的复制-粘贴式注册：
+
+```go
+// internal/tools/group.go
+type ToolGroup interface {
+    Register(r *agent.ToolRegistry)
+}
+
+func RegisterGroups(r *agent.ToolRegistry, groups ...ToolGroup) {
+    for _, g := range groups {
+        g.Register(r)
+    }
+}
 ```
 
-**推荐的后端选项（按优先级）：**
+#### 五个标准 Group
 
-1. **SearXNG 自建实例**（零成本，隐私友好）：Docker 一键部署，返回标准 JSON，支持多引擎聚合，无 API key 要求
-2. **Tavily API**（搜索质量最优）：专为 AI Agent 设计的搜索 API，返回结构化摘要，免费层 1000 次/月
-3. **Serper API**（Google 结果）：Google 搜索结果的 JSON API，免费层 2500 次/月
-4. **Google Custom Search JSON API**（官方）：每天 100 次免费额度，需配置自定义搜索引擎
+```go
+// LocalReadGroup — Worker 和 Explorer 共享，消除当前重复实现
+type LocalReadGroup struct {
+    Workdir WorkdirProvider
+    Cache   *agent.FileStateCache
+}
+// 包含：read_file（+行范围）、list_dir、grep_search、glob_search
 
-实现时保留当前 `web_fetch`（URL 抓取）不变，仅重构 `web_search` 的后端调用逻辑。通过 `SearchProvider` 接口抽象不同后端，运行时按 `search_api_provider` 配置动态选择实现。
+// LocalWriteGroup — 仅 Worker，嵌入 LocalReadGroup 复用依赖
+type LocalWriteGroup struct {
+    LocalReadGroup
+    Roster  roster.Roster
+    AgentID string
+}
+// 包含：write_file、edit_file（含 Roster 文件锁和 hash 校验）
 
-当前 DuckDuckGo HTML 爬取方案可保留为 `duckduckgo_html` provider 作为零配置降级方案，但应在启动时打印警告提示用户其局限性。
+// WebGroup — Worker 和 Explorer 共享（§1.2 重构后）
+type WebGroup struct {
+    Provider webtool.SearchProvider
+}
+// 包含：web_search（+SearchOptions）、web_fetch（+extract_mode）
 
-> **状态：已实现** ✅ — SearchProvider 接口 + 4 个后端（duckduckgo_html / searxng / tavily / serper）
+// ShellGroup — 仅 Worker
+type ShellGroup struct {
+    TimeoutSec int
+    Workdir    WorkdirProvider
+    ApprovalCh chan<- shell.ApprovalRequest
+    AgentID    string
+}
+// 包含：run_shell（含黑名单/灰名单拦截）
+
+// MetaGroup — Worker、Explorer 各有变体，Holder=nil 时退化为仅 send_message
+type MetaGroup struct {
+    Store      store.TaskStore   // publish_task 需要，nil 时不注册
+    Holder     TaskHolder        // 深度控制；nil = 无限制（Scheduler 语义）
+    MBRegistry *mailbox.Registry
+    AgentID    string
+}
+// 包含：publish_task（统一后）、send_message
+```
+
+#### 代理组合示例
+
+```go
+// Worker：全量工具集
+RegisterGroups(tools,
+    LocalReadGroup{workdir, cache},
+    LocalWriteGroup{..., roster, agentID},
+    WebGroup{searchProvider},
+    ShellGroup{cfg.ShellTimeoutSec, workdir, approvalCh, agentID},
+    MetaGroup{store, holder, mbRegistry, agentID},
+)
+
+// Explorer（全能调查）：只读 + 网络，无写入和 shell
+RegisterGroups(tools,
+    LocalReadGroup{workdir, cache},
+    WebGroup{searchProvider},
+    MetaGroup{store, nil, mbRegistry, agentID},
+)
+
+// Explorer（纯代码库调查）：仅本地只读
+RegisterGroups(tools,
+    LocalReadGroup{workdir, cache},
+    MetaGroup{nil, nil, mbRegistry, agentID},
+)
+```
+
+Scheduler 的 `publish_task / cancel_task / report_done / send_message` 继续在 `scheduler.go` 的 `schedulerTools()` 中自行维护，不走 ToolGroup 体系——Scheduler 本身不是任务执行代理，其工具由 `dispatchTool` 直接 switch 处理。
+
+---
+
+#### 11 核心工具标准化定义
+
+经代码审计和需求评估，V2 阶段的核心工具集共 11 个：
+
+| 层 | 工具名 | 归属 Group | V2 变化 |
+|----|--------|-----------|---------|
+| 文件系统 | `read_file` | LocalReadGroup | 新增 `offset` / `limit` 行范围参数，解决大文件截断问题 |
+| 文件系统 | `list_dir` | LocalReadGroup | 重命名自 `list_files`，新增可选 `depth` 参数（树形输出） |
+| 文件系统 | `grep_search` | LocalReadGroup | 无变化 |
+| 文件系统 | `glob_search` | LocalReadGroup | 无变化 |
+| 文件系统 | `edit_file` | LocalWriteGroup | 无变化 |
+| 文件系统 | `write_file` | LocalWriteGroup | 无变化 |
+| 网络 | `web_search` | WebGroup | SearchOptions 升级，见 §1.2 |
+| 网络 | `web_fetch` | WebGroup | extract_mode 升级，见 §1.2 |
+| 协作 | `publish_task` | MetaGroup | Worker 的 `publish_subtask` 与 Scheduler 的 `publish_task` **正式合并**，统一工具名 |
+| 协作 | `send_message` | MetaGroup | 无变化 |
+| 执行 | `run_shell` | ShellGroup | 名称保留，功能无变化 |
+
+**关于 `publish_task` 合并**
+
+原设计 Scheduler 用 `publish_task`、Worker 用 `publish_subtask` 是上一阶段的权宜之策。V2 正式统一：
+- LLM 视角：Worker 和 Scheduler 看到相同的工具名，行为描述一致
+- 实现视角：深度限制（`MaxSubtaskDepth`）保留在 `MetaGroup.Holder` 逻辑里，`Holder == nil` 时退化为 Scheduler 语义（无深度限制）
+- 注册视角：两者注册在各自独立的 `ToolRegistry` 实例上，同名不冲突
+
+**关于特殊代理工具**
+
+Scheduler 探针工具（§1.9）及未来特定代理的专属工具，不计入 11 个核心工具，不走 ToolGroup 体系，由各代理在自身工具注册方法中自行维护。
+
+---
+
+### 1.2 Web 工具重构与 Explorer 网络调查能力补全
+
+> **注**：SearchProvider 接口 + 4 个后端（duckduckgo_html / searxng / tavily / serper）已在上一阶段实现 ✅。本节为 V2 阶段的进一步升级。
+
+#### 现状诊断
+
+当前 `web_search` 和 `web_fetch` 的实现存在四个结构性缺陷，直接导致了网络调查中的幻觉问题：
+
+| 缺陷 | 位置 | 影响 |
+|------|------|------|
+| `SearchResult` 缺少时效性元数据 | `webtool/webtool.go` | LLM 无法判断信息新旧，用"听起来合理"的旧信息填补空白 |
+| `SearchProvider.Search()` 只接受 `query` 字符串 | `webtool/provider.go` | 参数扩展被截断在注册层，无法传递给后端 API |
+| `web_fetch` 使用正则剥离 HTML | `webtool/webtool.go ExtractText` | 导航栏、广告、页脚噪音混入正文，10000 字符预算快速消耗 |
+| web 工具注册耦合在 `worker.go` | `worker.go registerWorkerTools` | Explorer 无法复用，强行复制会带来同样的缺陷 |
+
+---
+
+**改动一：扩展 `SearchResult` 结构体**
+
+```go
+// webtool/webtool.go
+type SearchResult struct {
+    Title       string
+    URL         string
+    Snippet     string
+    PublishedAt string  // 新增：发布时间（RFC3339 或空串，后端不支持时留空）
+    Source      string  // 新增：来源域名（如 "techcrunch.com"）
+    Score       float64 // 新增：相关性分数（0~1，后端不支持时为 0）
+}
+```
+
+`FormatResults` 同步更新，当 `PublishedAt` 或 `Source` 非空时在输出中追加：
+
+```
+1. Claude Code 源代码泄漏事件分析
+   https://example.com/article
+   [来源: example.com | 2026-03-31]
+   约 512,000 行 TypeScript 代码通过 npm source map 泄漏...
+```
+
+各后端按能力填充：Tavily / Serper 可返回发布日期，DuckDuckGo / SearXNG 通常返回空串。
+
+---
+
+**改动二：`SearchProvider` 接口升级 + `web_search` 工具参数扩展**
+
+当前接口只接受 `query` 字符串，即使注册层加了参数也无法传递给后端。升级后：
+
+```go
+// webtool/provider.go
+type SearchOptions struct {
+    NumResults int            // 返回结果数，默认 5，最大 10
+    TimeRange  string         // "any" | "day" | "week" | "month" | "year"，默认 "any"
+    Extra      map[string]any // 后端特定扩展参数，向前兼容
+}
+
+type SearchProvider interface {
+    Search(ctx context.Context, query string, opts *SearchOptions) ([]SearchResult, error)
+    Name() string
+}
+```
+
+`opts` 传 `nil` 时各后端使用自身默认值，保持向后兼容。
+
+各后端参数映射：
+
+| 后端 | NumResults | TimeRange |
+|------|-----------|-----------|
+| Tavily | `max_results` | `days`（day=1, week=7, month=30, year=365） |
+| Serper | `num` | `tbs=qdr:d/w/m/y` |
+| SearXNG | `pageno` 控制深度 | `time_range` |
+| DuckDuckGo HTML | 截断结果列表 | 不支持（忽略并记录警告） |
+
+`web_search` 工具参数同步扩展：
+
+```go
+"max_results": {"type": "integer", "description": "返回结果数量，默认 5，最大 10"}
+"time_range":  {"type": "string", "enum": ["any", "day", "week", "month", "year"],
+                "description": "时间范围过滤，默认 any。调查近期事件时建议设为 week 或 month"}
+```
+
+---
+
+**改动三：`web_fetch` 提升内容提取质量**
+
+新增 `extract_mode` 参数（可选，默认 `"auto"`）：
+
+```go
+"extract_mode": {"type": "string", "enum": ["auto", "article", "full"],
+                 "description": "auto=智能判断；article=只提取正文（过滤导航/页脚噪音）；full=全页面文本"}
+```
+
+`article` 模式实现：优先提取 `<article>`、`<main>`、`role="main"` 区域内的文本；找不到语义标签时回退到 `full` 模式。同时返回结构化前缀：
+
+```
+[标题] Claude Code Source Code Leaked via npm
+[发布] 2026-03-31
+[来源] techcrunch.com
+---
+正文内容...
+```
+
+---
+
+**改动四：提取 `RegisterWebTools` 为包级共享函数（对应 §1.1 WebGroup）**
+
+将 `worker.go` 中内嵌的 web 工具注册逻辑提取到 `webtool` 包，作为 `WebGroup.Register()` 的实现基础：
+
+```go
+// webtool/register.go（新文件）
+func RegisterWebTools(tools ToolRegistry, provider SearchProvider) {
+    // 注册 web_search（含 SearchOptions 参数）
+    // 注册 web_fetch（含 extract_mode）
+}
+```
+
+Explorer system prompt 同步补充网络调查约束：
+- 调查结论必须标注来源 URL `[来源: URL | 日期]`
+- 无法找到来源的 claim 显式标注 `[未验证]`，不以确定口吻呈现
+- 优先使用 `time_range: "week"` 或 `"month"` 搜索近期事件
+- 至少执行 3 次不同关键词的独立 `web_search` 后再汇总
+
+**注意**：Explorer 注册 web 工具后仍保持只读约束——不注册 `write_file / edit_file / run_shell`。
+
+---
+
+**远景备注：FileProvider 统一抽象**
+
+未来可引入 `FileProvider` 接口，将本地文件系统实现为 `LocalFileProvider`，为 S3、SFTP 等远程存储留出扩展点。**暂不实施**：当前无远程文件存储需求，为单一实现做接口抽象是过度设计，待出现第二种文件后端时再引入。
+
+---
+
+### 1.3 工具集分层配置（Tool Set Profiles）
+
+**现状**：工具集与代理类型硬绑定，无法按任务场景裁剪。
+
+**改进方向**：
+
+在 `Config` 中引入具名工具集配置，Bootstrap 按配置文件初始化各代理的 ToolRegistry：
+
+```yaml
+tool_profiles:
+  worker_standard:        # 标准执行代理：代码修改 + 网络
+    - read_file
+    - list_dir
+    - grep_search
+    - glob_search
+    - write_file
+    - edit_file
+    - run_shell
+    - web_search
+    - web_fetch
+    - publish_task
+    - send_message
+  explorer_codebase:      # 代码库调查：本地只读
+    - read_file
+    - list_dir
+    - grep_search
+    - glob_search
+    - send_message
+  explorer_web:           # 网络调查：网络只读
+    - web_search
+    - web_fetch
+    - send_message
+  explorer_full:          # 全能调查：本地 + 网络只读
+    - read_file
+    - list_dir
+    - grep_search
+    - glob_search
+    - web_search
+    - web_fetch
+    - send_message
+```
+
+**与 §1.4 分级权限模型的关系**：工具集配置文件是 PermissionMode 的前置基础设施——运行时动态裁剪需要先有静态的命名工具集，才能做"降级到 readonly profile"等操作。建议先实现工具集配置文件，再在此基础上实现 §1.4 的动态权限提升。
+
+---
+
+### 1.4 分级权限模型（PermissionMode）
+
+**Why：** 对标 Claude Code 的 `permissionMode` 机制——不同任务的风险等级不同，"搜索调研"任务不应持有 `write_file / run_shell`，"代码修改"任务不应持有 `web_fetch`。工具集与任务风险不匹配会放大 LLM 幻觉导致的破坏面。
+
+**改进方向**：
+- **任务级工具裁剪**：`Task` 结构体新增 `AllowedTools []string` 和/或 `DisallowedTools []string` 字段，Scheduler 在 `publish_task` 时指定。Agent 在 `processTask` 开始时根据任务声明动态过滤 ToolRegistry
+- **预设权限模板**：定义命名权限等级（如 `readonly`、`standard`、`privileged`），Scheduler 通过模板名快速指定，无需逐个列举工具
+- **运行时权限提升**：Agent 执行中发现需要额外工具时，通过 `permission_request` 协议向 Scheduler 申请临时提权，Scheduler 审批后动态注入工具
+
+**暂不实施的原因**：MVP 阶段 Worker 数量少，任务由 Scheduler 中心化分配，风险可控。Shell 命令拦截已提供基础安全屏障。依赖 §1.3 工具集配置化先落地。
+
+---
+
+### 1.5 Shell 命令拦截配置化
+
+**现状**：使用硬编码的 `DefaultBlacklist` 和 `DefaultGreylist`（`internal/shell/intercept.go`）。
+
+**改进方向**：
+- **配置化名单**：在 `Config` 中新增 `ShellBlacklist []string` 和 `ShellGreylist []string`，用户可在 `setting.yaml` 中自定义规则
+- **项目级规则覆盖**：支持 `.agentgo/shell_rules.yaml` 文件，项目维护者可定义项目专属的危险命令规则，与全局配置合并
+- **会话级放行记忆**：新增"允许本次会话"选项，用户批准某个命令模式后，同一会话内相同模式不再重复询问（存储在内存中，重启清空）
+- **命令白名单模式**：高安全场景下，反转为白名单模式——只允许预定义的命令前缀，其余一律走审批
+
+---
+
+### 1.6 管理员信赖标记（SourceAdminTrusted）
+
+**Why：** 对标 Claude Code 的 `isSourceAdminTrusted` 机制——当系统未来支持用户自定义代理或外部插件代理时，需要区分"可信来源"和"不可信来源"，限制不可信代理的工具访问范围。
+
+**改进方向**：
+- **代理来源标记**：Agent 结构体新增 `Source string`（如 `"system"`、`"user"`、`"plugin"`）和 `Trusted bool` 字段
+- **信任级别与工具映射**：不可信代理自动降级为只读工具集，且不注入 mailbox 的 `send_message` 工具（防止向其他代理注入恶意指令）
+- **配合分级权限模型**：信任标记作为权限模板选择的输入之一
+
+**暂不实施的原因**：当前无外部代理接入机制，所有代理由 Bootstrap 内建创建。待引入插件体系或用户自定义 Agent 后再实施。
+
+---
+
+### 1.7 代理能力声明与 Scheduler 路由感知
+
+**现状**：Scheduler 的 `publish_task` 工具只有 `event_type` 字段区分代理类型，无法知道"当前 Explorer 是否有 web 工具"、"Worker 是否适合某类任务"。
+
+**阶段一：静态能力声明**
+
+在 `boardSnapshot` 的 `resources` 字段中追加每类代理的能力标签：
+
+```json
+"resources": {
+  "worker_count": 2,
+  "busy_workers": 1,
+  "available_workers": 1,
+  "agent_capabilities": {
+    "worker": ["code_edit", "shell_exec", "web_search", "subtask_publish"],
+    "explorer": ["codebase_read", "web_search"]
+  }
+}
+```
+
+Scheduler system prompt 更新路由指引：发布任务时参考 `agent_capabilities`，按实际能力而非约定俗成的 `event_type` 语义做决策。
+
+**阶段二：任务级能力需求声明**
+
+`publish_task` 工具新增 `required_capabilities` 参数，由 `ClaimTask` 逻辑在代理认领时做能力匹配校验，不满足的代理无法认领该任务：
+
+```go
+if !agent.HasCapabilities(task.RequiredCapabilities) {
+    return ErrCapabilityMismatch
+}
+```
+
+---
+
+### 1.8 工具可用性探针（Tool Health Check）
+
+**现状**：系统启动时不验证工具是否可用。若 `search_api_provider` 配置为 `searxng` 但实例未启动，Worker 在执行 `web_search` 时才会报错，已经消耗了一轮 LLM 调用。
+
+**改进方向**：
+
+Bootstrap 阶段新增工具可用性探针，在代理启动前主动检测，失败时降级运行而非崩溃：
+
+```go
+checks := []ToolHealthCheck{
+    {Name: "web_search", Check: probeSearchProvider(cfg)},
+    {Name: "web_fetch",  Check: probeHTTPReachability()},
+}
+for _, c := range checks {
+    if err := c.Check(); err != nil {
+        log.Printf("[警告] 工具 %s 不可用: %v，相关代理将降级运行", c.Name, err)
+        // 从对应工具集中移除该工具，而非直接启动失败
+    }
+}
+```
+
+探针结果写入 `boardSnapshot`，让 Scheduler 知道"当前 `web_search` 不可用，不要发布依赖网络搜索的任务"。
+
+---
+
+### 1.9 调度器专属探针工具（Scheduler Probe Tools）
+
+**Why：** Scheduler 目前只有 4 个工具，对外部环境完全不可见。做任务分解时，依据的只有用户的自然语言描述——目标目录有多少个文件、规模有多大，一概不知。即便 system prompt 要求并行拆分，Scheduler 也因缺乏结构性信息而保守地发布一个覆盖全部的单任务。
+
+这些工具属于 Scheduler 专属，不计入 §1.1 的 11 个核心工具，不走 ToolGroup 体系。
+
+#### 轻量探针工具集
+
+```go
+// 仅在 Scheduler.schedulerTools() 中注册
+{
+    Name: "list_directory",
+    Description: "列出指定目录下的文件和子目录，返回名称、类型、大小",
+}
+{
+    Name: "count_files",
+    Description: "统计指定目录中匹配 glob 模式的文件数量",
+}
+{
+    Name: "file_summary",
+    Description: "返回文件的元数据：大小、行数、最后修改时间",
+}
+```
+
+**实现要点**：
+- 所有工具严格只读，路径安全校验复用 `pathutil.ValidatePath`，限制在 `cfg.ProjectRoot` 内
+- 工具调用结果只注入 Scheduler 的 `history`，不发布到公告板
+
+#### "先侦查后分配"的调度模式
+
+在 Scheduler system prompt 中追加：
+
+> 在分配涉及文件/目录的任务前，优先使用 `list_directory` 或 `count_files` 工具感知目标规模：
+> - 目标目录中有 N 个文件 → 发布 N 个并行 explore 任务，每个任务负责一个文件
+> - 单个文件超过 500 行 → 考虑按章节/模块拆分为多个子任务
+> - 目标不涉及本地文件（如纯网络调查）→ 跳过侦查，直接按语义子方向拆分
+
+这与 §1.7 能力声明形成互补：能力声明解决"**知道谁能做**"，探针工具解决"**知道要做多少**"。
+
+#### 实施优先级
+
+| 优先级 | 内容 |
+|--------|------|
+| P0 | `list_directory`（最高频使用场景） |
+| P1 | `count_files` |
+| P2 | `file_summary` + "先侦查后分配"调度模式 |
+
+**暂不实施的原因**：需先验证现有 prompt 修改的基线效果，再叠加探针工具，便于隔离变量判断每项改动的实际贡献。
+
+---
+
+### 工具系统实施优先级汇总
+
+| 优先级 | 子项 | 依赖 |
+|--------|------|------|
+| P0 | §1.1 ToolGroup 架构重构 | 无（其他所有工具改进的前提） |
+| P0 | §1.2 Web 工具重构 + Explorer 补全 web 工具 | §1.1 |
+| P0 | §1.9 `list_directory` 探针工具 | 无 |
+| P1 | §1.3 工具集分层配置（YAML profiles） | §1.1 |
+| P1 | §1.9 `count_files` 探针工具 | 无 |
+| P2 | §1.8 工具可用性探针 | §1.3 |
+| P2 | §1.7 能力声明阶段一（静态） | §1.3 |
+| P2 | §1.9 `file_summary` + 调度模式 | §1.9 P0/P1 |
+| P3 | §1.5 Shell 命令拦截配置化 | 无 |
+| P3 | §1.4 分级权限模型 | §1.3 |
+| P4 | §1.7 能力声明阶段二（任务级匹配） | §1.7 阶段一 + §1.4 |
+| P4 | §1.6 管理员信赖标记 | 待引入外部代理后 |
+
+---
+
+### 1.10 任务产出物（Artifacts）持久化（近期改造）
+
+> 本节于 2026-04-08 系统测试后新增。基础设施（Task.Artifacts、ExpectedArtifacts、Store.AppendArtifact、自动注入下游 prompt、ExpectedArtifacts 校验）已经在 KNOWN_ISSUES 中"Worker 凭空捏造"和"Worker 任务无文件产出"的修复中落地。本节记录**仍未完成的持久化工作**。
+
+**当前状态（in-memory）**：
+- `model.Task.Artifacts []string`：任务执行期间所有 `write_file` / `edit_file` 写入的文件路径（去重，相对项目根）
+- `model.Task.ExpectedArtifacts []string`：发布者声明的预期产出清单（任务结束时校验）
+- 由 `MemoryTaskStore` 在内存里维护
+- 进程重启后 artifacts 信息全部丢失
+
+**为什么需要持久化**：
+- 故障恢复：进程崩溃重启后，无法判断"上一次任务实际产出了什么文件"，依赖关系断裂
+- 历史审计：长期运行系统需要查询"任务 X 在 N 天前产出了什么"
+- 跨会话引用：用户在新会话中希望基于历史任务的产出做后续工作
+- 与 trace 系统的关系：trace 已经记录了 `file_written` 事件，但 trace 是观察通道，不是权威状态
+
+**实施方向**：
+
+1. **方案 A：与 TaskStore 整体持久化绑定**
+   - 当前 TaskStore 是纯 in-memory（`NewMemoryTaskStore`）
+   - 引入 `PersistentTaskStore`（基于 SQLite 或 BoltDB），把所有 Task 字段（含 Artifacts、ExpectedArtifacts）一起持久化
+   - 优点：架构干净，artifacts 跟随任务自然持久化
+   - 缺点：需要先做 TaskStore 持久化整体改造，工作量大
+
+2. **方案 B：Artifacts 单独持久化（轻量过渡）**
+   - 在 `.agentgo/artifacts.jsonl` 写入 append-only 日志
+   - 每次 `AppendArtifact` 同步写入一行 `{task_id, path, hash, ts}`
+   - 启动时回放重建内存索引
+   - 优点：实现简单、不依赖 TaskStore 改造
+   - 缺点：与 Task 主存储分离，可能不一致
+
+3. **方案 C：复用 trace 系统**
+   - trace 已经持久化了 `file_written` 事件
+   - 启动时扫描 `.agentgo/traces/*.jsonl` 重建 artifacts 索引
+   - 优点：零新增基础设施
+   - 缺点：trace 是 100 个任务滚动 GC 的，老任务的 artifacts 会丢失；语义混乱（trace 兼任了状态存储）
+
+**推荐**：方案 A，与 TaskStore 整体持久化一并做。在那之前，方案 C 作为临时兜底（如果故障恢复需求紧急）。
+
+**优先级**：P1。当前 in-memory 已经能解决"凭空捏造"和"report-only 失败"两大 P0 问题，持久化是体验优化层面的需求。
+
+**关联工作**：TaskStore 持久化是更大的话题，应当统一考虑：
+- Task 状态（pending/processing/completed/failed）
+- Task 历史（含 RetryCount、LastHistory）
+- Mailbox 邮件
+- Roster 文件锁
+- Artifacts（本节）
+
+建议作为下一阶段的"持久化与故障恢复"专题统一规划。
 
 ---
 
@@ -69,7 +569,7 @@ search_api_key: ""                      # 商业 API 所需的密钥
 
 ---
 
-## 3. 未来改进（待实现）
+## 3. 代理系统与稳定性改进
 
 ### 3.1 ConflictResolver 崩溃恢复
 
@@ -104,7 +604,7 @@ search_api_key: ""                      # 商业 API 所需的密钥
 
 当前 ConflictResolver 使用 `cfg.ExplorerModel`。未来应新增独立配置项：
 ```yaml
-resolver_model: "qwen3.6-plus"  # 冲突处理代理专用模型
+resolver_model: "gpt-4o"  # 冲突处理代理专用模型
 ```
 冲突解决需要理解两方代码意图并做出正确取舍，可能需要比 Explorer 更强的推理能力。
 
@@ -112,152 +612,136 @@ resolver_model: "qwen3.6-plus"  # 冲突处理代理专用模型
 
 **当前状态**：已由现有机制部分覆盖，不构成当前规模下的实际问题。
 
-**现有机制**：
-- Agent 的 `Run` 循环每 500ms 执行一次 `QueryAvailable` → 遍历任务 → 尝试 claim → 失败则 sleep
-- `IdleThreshold` 可配置连续空轮询后退出（当前 Worker/Explorer 设为 0，永不退出）
-- MailNotifier 为有未读消息的空闲代理发布唤醒任务
-- 任务依赖通过 `ClaimTask` 校验，依赖未完成时自动跳过
-
 **现有机制的局限**：
 - Agent 空闲时仍在忙等待（每 500ms 扫描一次 store），在 1-3 个 Worker 的 MVP 规模下 CPU 开销可忽略
 - 如果扩展到 20+ Worker，每个每 500ms 都扫描 store 并竞争 claim，会成为不必要的开销
-- Agent 无法感知"有新任务发布"事件——只能靠下一轮轮询发现
 
 **未来改进方向**（待规模增长后实施）：
 - 用 `sync.Cond` 或专用 channel 替代定时轮询：TaskStore 在 `PublishTask` 时 broadcast 通知，空闲 Agent 立即唤醒
-- 或采用 `select` 多路监听：同时等待 `time.After(PollInterval)` 和 `taskAvailableCh`，有新任务时提前唤醒
 - 动态调整 PollInterval：空闲时逐步增大间隔（1s → 2s → 5s），有任务时重置为 500ms
 
-**暂不实施的原因**：当前 WorkerCount 默认为 1，最多配置到个位数。500ms 轮询的 CPU 和内存开销在微秒级，远不构成瓶颈。优先处理功能完整性和安全性。
+**暂不实施的原因**：当前 WorkerCount 默认为 1，500ms 轮询的 CPU 开销在微秒级，远不构成瓶颈。
 
-### 3.6 Shell 命令拦截配置化
+### 3.6 代理间通信防循环机制（Anti-Loop Guard）
 
-当前 MVP 使用硬编码的 `DefaultBlacklist` 和 `DefaultGreylist`（`internal/shell/intercept.go`）。
-
-**未来改进方向**：
-- **配置化名单**：在 `Config` 中新增 `ShellBlacklist []string` 和 `ShellGreylist []string`，用户可在 `setting.yaml` 中自定义规则
-- **项目级规则覆盖**：支持 `.agentgo/shell_rules.yaml` 文件，项目维护者可定义项目专属的危险命令规则，与全局配置合并
-- **会话级放行记忆**：新增"允许本次会话"选项，用户批准某个命令模式后，同一会话内相同模式不再重复询问（存储在内存中，重启清空）
-- **命令白名单模式**：高安全场景下，反转为白名单模式——只允许预定义的命令前缀（如 `go build`、`go test`、`ls`），其余一律走审批
-
-### 3.7 分级权限模型（PermissionMode）
-
-当前 MVP 所有 Worker 拥有相同的完整工具集（10 个），所有 Explorer 拥有相同的只读工具集（4+1 个）。无运行时权限提升/降级机制。
-
-**Why：** 对标 Claude Code 的 `permissionMode` 机制——不同任务的风险等级不同，"搜索调研"任务不应持有 write_file/run_shell，"代码修改"任务不应持有 web_fetch。工具集与任务风险不匹配会放大 LLM 幻觉导致的破坏面。
-
-**未来改进方向**：
-- **任务级工具裁剪**：`Task` 结构体新增 `AllowedTools []string` 和/或 `DisallowedTools []string` 字段，Scheduler 在 `publish_task` 时指定。Agent 在 `processTask` 开始时根据任务声明动态过滤 ToolRegistry
-- **预设权限模板**：定义命名权限等级（如 `readonly`、`standard`、`privileged`），Scheduler 通过模板名快速指定，无需逐个列举工具
-- **运行时权限提升**：Agent 执行中发现需要额外工具时，通过 `permission_request` 协议向 Scheduler 申请临时提权，Scheduler 审批后动态注入工具
-
-**暂不实施的原因**：MVP 阶段 Worker 数量少（默认 1），任务由同一个 Scheduler 中心化分配，风险可控。Shell 命令拦截（黑名单+灰名单）已提供基础安全屏障。优先验证多代理协作的功能正确性。
-
-### 3.8 管理员信赖标记（SourceAdminTrusted）
-
-当前系统所有代理均为内建代理，无"外部代理"概念。
-
-**Why：** 对标 Claude Code 的 `isSourceAdminTrusted` 机制——当系统未来支持用户自定义代理或外部插件代理时，需要区分"可信来源"和"不可信来源"，限制不可信代理的工具访问和资源获取范围。
-
-**未来改进方向**：
-- **代理来源标记**：Agent 结构体新增 `Source string`（如 `"system"`、`"user"`、`"plugin"`）和 `Trusted bool` 字段
-- **信任级别与工具映射**：不可信代理自动降级为只读工具集，且不注入 mailbox 的 send_message 工具（防止向其他代理注入恶意指令）
-- **配合分级权限模型**：信任标记作为权限模板选择的输入之一
-
-**暂不实施的原因**：当前无外部代理接入机制，所有代理由 Bootstrap 内建创建。待引入插件体系或用户自定义 Agent 后再实施。
-
-### 3.9 代理间通信防循环机制（Anti-Loop Guard）
-
-当前邮箱系统允许代理之间无限来回通信。当代理 A 发送含幻觉/错误的请求给代理 B，B 发回质疑，A 再次回复仍有问题，B 再次质疑……形成无意义循环，消耗大量 token 且无法收敛。
-
-**问题场景**：
-```
-代理A → 代理B: [请求] 含错误/幻觉信息
-代理B → 代理A: [question] 要求澄清
-代理A → 代理B: [reply] 仍有问题的澄清
-代理B → 代理A: [question] 再次要求澄清
-... 无限循环 ...
-```
-
-**Why：** `question → reply → question → reply` 循环是引入反问机制后的必然副作用。反问机制提升了可靠性，但缺少收敛保障会将 token 浪费在无法解决的分歧上。
+当前邮箱系统允许代理之间无限来回通信，`question → reply → question → reply` 循环是引入反问机制后的必然副作用。
 
 **解决方案（分两个阶段）**：
 
-#### 阶段一：硬性来回上限（简单版本）
+#### 阶段一：硬性来回上限
 
-在邮箱系统中引入 **会话追踪**（conversation tracking），按 `(agentA, agentB)` 配对记录来回次数。
+在邮箱系统中引入会话追踪，按 `(agentA, agentB)` 配对记录来回次数，最多允许 2 个来回（共 4 条消息）。超限后强制收敛：代理 B 直接拒绝执行，向代理 A 发送拒绝原因，邮箱系统在代码层阻止后续消息（非 prompt 依赖）。
 
-- **最多允许 2 个来回**：即 A→B, B→A, A→B, B→A 共 4 条消息
-- **超限后强制收敛**：代理 B 在第二次收到代理 A 的回复后，如仍认为存在问题，则：
-  1. 直接拒绝执行，不再继续对话
-  2. 向代理 A 发送 `type="reply"` 消息，内容为拒绝原因
-  3. 代理 A 收到拒绝消息后不再发起新一轮对话（由邮箱系统在代码层阻止，非 prompt 依赖）
-- **实现要点**：
-  - `Registry` 维护 `conversationCount map[[2]string]int`，按发送方+接收方排序的配对键计数
-  - `Send()` 中检查计数，超限时返回错误（如 `"对话轮次超限，请直接执行或拒绝"`）
-  - 计数在任务边界重置（或定时清零）
+**实现要点**：
+- `Registry` 维护 `conversationCount map[[2]string]int`，按发送方+接收方排序的配对键计数
+- `Send()` 中检查计数，超限时返回错误
+- 计数在任务边界重置
 
 #### 阶段二：仲裁代理（进阶版本）
 
-对于超过 2 个来回仍无法达成一致的通信，引入 **仲裁代理（Arbitrator）** 进行裁决。
+对于超过 2 个来回仍无法达成一致的通信，引入仲裁代理（Arbitrator）进行裁决：
+1. 邮箱系统自动收集对话全文和双方任务描述
+2. 仲裁代理（独立 LLM 调用，复用 ConflictResolver 模式）给出最终裁决
+3. 裁决以 `type="steer", from="arbitrator"` 送达，不可递归，仲裁流程不超过 1 轮 LLM 调用
 
-- **触发条件**：`conversationCount` 达到阈值时，不直接阻止，而是将对话升级到仲裁流程
-- **仲裁流程**：
-  1. 邮箱系统自动收集代理 A 和代理 B 的对话全文
-  2. 从公告板获取双方各自正在执行的任务描述作为上下文
-  3. 仲裁代理（独立 LLM 调用，类似 ConflictResolver）分析分歧，给出最终裁决
-  4. 裁决结果以 `type="steer"`, `from="arbitrator"` 送达代理 B 的信箱
-  5. 代理 B 只能选择接受（执行裁决）或拒绝（放弃执行）
-  6. 无论代理 B 做出何种选择，结果都通过 `type="reply"` 送达代理 A
-  7. 整个仲裁流程不超过 1 轮 LLM 调用，不可递归
-- **实现要点**：
-  - 新增 `Arbitrator` 组件（复用 `isolation.ConflictResolver` 的 ReAct 模式，但上下文不同）
-  - `Registry` 在超限时自动触发仲裁，而非简单阻止
-  - 仲裁代理的 system prompt 强调中立性和一次性裁决
-  - 仲裁结果带有特殊标记，收信代理的 prompt 引导其尊重仲裁
+**暂不实施的原因**：当前代理间通信频率低，反问机制刚引入，尚未观测到实际循环问题。阶段一可作为快速止血方案，阶段二在多代理自组织落地后更有价值。
 
-**暂不实施的原因**：当前 MVP 阶段代理间通信频率低，反问机制刚引入，尚未观测到实际循环问题。待实际运行中确认循环频发后再实施。阶段一可作为快速止血方案，阶段二在多代理自组织（P2-1）落地后更有价值。
+### 3.7 团队感知系统（Team Awareness）
 
-### 3.10 团队感知系统（Team Awareness）
-
-与邮箱系统（通信通道）平级的独立子系统，解决的是"代理知道队友是谁、在做什么"的感知问题。邮箱解决"怎么说"，团队感知解决"对谁说、为什么说"。
-
-**当前已实现（MVP 基线）**：
-- `BuildTeamSnapshot` 函数：任务开始时调用 `ScanAll()` + `Registry.AllIDs()` 构建 `<team-snapshot>` XML，注入为 LLM 上下文首条消息
-- 内容包括：队友 ID、忙碌/空闲状态、正在执行的任务描述（截断 80 字）
-- Worker/Explorer system prompt 引导代理根据快照主动通知队友变更、遇到阻塞时直接联系
+**当前已实现（MVP 基线）**：`BuildTeamSnapshot` 在任务开始时注入 `<team-snapshot>` XML，包含队友 ID、忙碌/空闲状态、正在执行的任务描述（截断 80 字）。
 
 **未来升级方向**：
 
-#### 3.10.1 动态刷新
+#### 3.7.1 动态刷新
 
-当前快照仅在任务开始时注入一次。对于长时间运行的任务，团队状态可能已经发生变化（新代理加入、其他代理完成任务）。
+当前快照仅在任务开始时注入一次。改进：
+- **定期刷新**：每 N 轮 ReAct 循环重新生成快照并注入（如每 10 轮或 5 分钟）
+- **事件驱动刷新**：收到 `type="ack"` 或 `type="info"` 消息时，下一轮自动刷新
 
-- **定期刷新**：每 N 轮 ReAct 循环重新生成快照并作为新的 `HistoryEntry` 注入（需控制频率避免上下文膨胀，如每 10 轮或 5 分钟）
-- **事件驱动刷新**：当收到 `type="ack"` 或 `type="info"` 消息时，在下一轮自动刷新快照（队友状态可能已变）
+#### 3.7.2 角色与技能描述
 
-#### 3.10.2 角色与技能描述
-
-当前快照只包含代理 ID 和任务描述，代理无法判断"谁擅长什么"。
-
-- **Agent 角色标签**：Agent 结构体新增 `Role string`（如 `"code-writer"`、`"test-runner"`、`"investigator"`），在 Bootstrap 时配置
+- **Agent 角色标签**：Agent 结构体新增 `Role string`（如 `"code-writer"`、`"investigator"`），在 Bootstrap 时配置
 - **快照渲染角色**：`<team-snapshot>` 中展示角色标签，帮助代理判断该联系谁
-- **Scheduler 发布任务时标注**：任务可携带 `PreferredRole` 字段，优先匹配对应角色的空闲代理
 
-#### 3.10.3 任务关联感知
+#### 3.7.3 任务关联感知
 
-当前代理只能看到队友"在做什么"，不知道队友的任务和自己的任务是否存在关联（如修改同一模块、有依赖关系）。
+- **文件级关联**：快照中标注队友正在修改的文件列表（来自 Roster）
+- **依赖关联**：队友任务是当前任务的前置或后置依赖时特别标记
+- **共享上下文**：队友任务的 `PartialOutput` 摘要纳入快照
 
-- **文件级关联**：在快照中标注队友正在修改的文件列表（来自 Roster），代理可判断是否存在潜在冲突
-- **依赖关联**：如果队友的任务是当前任务的前置或后置依赖，在快照中特别标记
-- **共享上下文**：队友任务的 `PartialOutput` 摘要可纳入快照，让代理了解队友的进展而非仅知道任务标题
+#### 3.7.4 从感知到自治
 
-#### 3.10.4 从感知到自治
-
-团队感知是跨代理自组织的基础设施。当感知足够丰富时，代理可以做出更自主的协作决策：
-
-- **自发任务分流**：Worker 发现自己的任务过大，主动联系空闲队友请求协助（通过 `send_message type="question"`），而非经由 Scheduler 的 `publish_subtask`
+- **自发任务分流**：Worker 发现任务过大，主动联系空闲队友请求协助
 - **冲突预防**：Worker 看到队友正在修改同一文件，主动协商分工顺序
-- **进度同步**：长任务中周期性向相关队友广播进展，减少 Scheduler 的信息中转负担
+- **进度同步**：长任务中周期性向相关队友广播进展
 
-**这些改进依赖**：结构化消息类型（已实现）、防循环机制（§3.9，待实现）、分级权限模型（§3.7，待实现）。建议按 3.10.1 → 3.10.2 → 3.10.3 → 3.10.4 的顺序逐步推进。
+**这些改进依赖**：结构化消息类型（已实现）、防循环机制（§3.6，待实现）、分级权限模型（§1.4，待实现）。建议按 3.7.1 → 3.7.2 → 3.7.3 → 3.7.4 的顺序逐步推进。
+
+### 3.8 Session 化日志与状态持久化
+
+**Why：** 当前日志输出到控制台且无持久化归档，任务历史随进程结束而丢失。用户无法中断工作后恢复上下文，也无法在多个项目间切换。
+
+**存储架构**：
+
+```
+~/.agentgo/sessions/
+├── active-session              # 当前激活的 Session ID
+├── sessions.db                 # 元数据索引（SQLite 或 JSON Lines）
+│
+├── sess-{uuid}/
+│   ├── metadata.json           # {id, name, project_root, created_at, updated_at}
+│   ├── snapshot.json           # 完整系统状态快照（可选）
+│   ├── history.jsonl           # 操作历史事件流（可回放重建状态）
+│   └── logs/agentgo.log        # 该 Session 的专属日志
+│
+└── archive/                    # 归档的已完成 Session
+```
+
+**Session 生命周期 CLI**：
+
+```bash
+./agentgo session new "fix-auth-bug" --root ~/projects/myapp
+./agentgo session list
+./agentgo session switch sess-a1b2c3d4
+./agentgo session archive sess-x9y8z7w6
+./agentgo session restore sess-x9y8z7w6
+```
+
+**状态持久化分阶段实施**：
+
+| 阶段 | 内容 |
+|------|------|
+| 阶段一 | 仅日志隔离（最小可行）：Session 切换 = 切换日志文件 + 新建空白状态 |
+| 阶段二 | 快照持久化：TaskStore、Roster、Mailbox 序列化到 `snapshot.json`，支持暂停-恢复 |
+| 阶段三 | 事件溯源：记录所有操作事件到 `history.jsonl`，恢复时重放重建状态，支持时间旅行调试 |
+
+**与工具系统的关联**：
+- §1.5 Shell 命令拦截：Session 级别的拦截规则可随 Session 持久化
+- §1.4 分级权限模型：Session 可绑定特定的权限模板
+- §2.1 Git Worktree：Session 天然与 worktree 绑定，每个 Session 拥有一组独立 worktree
+
+**暂不实施的原因**：当前阶段优先级在于功能正确性和安全性。Session 化管理属于体验优化，待核心架构稳定后再实施。日志隔离（阶段一）可作为近期改善。
+
+---
+
+## 附录：已实现功能
+
+本文档中标记为 **"状态：已实现"** 的升级项，以及之前 `nextUpgrade.md` 中记录的所有升级项，均已完成实现并合并到主分支。包括但不限于：
+
+- 多 Worker 横向扩展
+- Scheduler 资源感知
+- Worker 子任务发布（`publish_subtask`，V2 将统一为 `publish_task`）
+- FileStateCache
+- 路径安全加固
+- Web SSRF 防护
+- 邮箱系统
+- Git Worktree 隔离
+- 用户中途干预（`/steer`）
+- 团队感知快照
+- Shell 命令拦截
+- SearchProvider 多后端支持（duckduckgo_html / searxng / tavily / serper）
+
+---
+
+*文档版本：v2.1*
+*最后更新：2026-04-08*

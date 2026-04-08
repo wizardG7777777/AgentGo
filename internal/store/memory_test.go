@@ -382,23 +382,36 @@ func TestQueryAvailable_FilterAndSort(t *testing.T) {
 	t1 := &model.Task{Description: "low", Priority: 1, EventType: "code"}
 	t2 := &model.Task{Description: "high", Priority: 10, EventType: "code"}
 	t3 := &model.Task{Description: "other", Priority: 5, EventType: "search"}
+	t4 := &model.Task{Description: "untyped", Priority: 3, EventType: ""}
 	s.PublishTask(t1)
 	s.PublishTask(t2)
 	s.PublishTask(t3)
+	s.PublishTask(t4)
 
 	// Filter by event type
 	tasks, _ := s.QueryAvailable("code")
 	if len(tasks) != 2 {
-		t.Fatalf("got %d tasks, want 2", len(tasks))
+		t.Fatalf("got %d code tasks, want 2", len(tasks))
 	}
 	if tasks[0].Priority != 10 {
 		t.Error("should be sorted by priority descending")
 	}
 
-	// Empty filter returns all
-	all, _ := s.QueryAvailable("")
-	if len(all) != 3 {
-		t.Fatalf("got %d tasks, want 3", len(all))
+	// 严格匹配：空 EventType 过滤器只返回 EventType="" 的任务（Worker 语义），
+	// 不再像旧实现那样作为通配符返回所有任务。这个修复防止 Worker 顺手抢走
+	// explore 类型任务，避免跨代理类型迁移引发的契约违约。
+	untyped, _ := s.QueryAvailable("")
+	if len(untyped) != 1 {
+		t.Fatalf("empty filter should match only EventType=\"\" tasks, got %d, want 1", len(untyped))
+	}
+	if untyped[0].Description != "untyped" {
+		t.Errorf("got %q, want \"untyped\"", untyped[0].Description)
+	}
+
+	// 严格匹配：search 过滤器只返回 search 任务
+	search, _ := s.QueryAvailable("search")
+	if len(search) != 1 {
+		t.Fatalf("got %d search tasks, want 1", len(search))
 	}
 }
 
@@ -692,5 +705,160 @@ func TestFIFOEviction_ProtectedTaskEventuallyEvicted(t *testing.T) {
 	_, err = s.GetTask(taskIDs[0])
 	if err != ErrTaskNotFound {
 		t.Errorf("task 0 should be evicted after dependent task completed, got err: %v", err)
+	}
+}
+
+func TestAppendArtifact_Basic(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	task := &model.Task{Description: "test"}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	if err := s.AppendArtifact(task.ID, "docs/foo.md"); err != nil {
+		t.Fatalf("AppendArtifact: %v", err)
+	}
+	if err := s.AppendArtifact(task.ID, "docs/bar.md"); err != nil {
+		t.Fatalf("AppendArtifact: %v", err)
+	}
+
+	got, _ := s.GetTask(task.ID)
+	if len(got.Artifacts) != 2 {
+		t.Errorf("expected 2 artifacts, got %d: %v", len(got.Artifacts), got.Artifacts)
+	}
+	if got.Artifacts[0] != "docs/foo.md" || got.Artifacts[1] != "docs/bar.md" {
+		t.Errorf("artifacts order or content wrong: %v", got.Artifacts)
+	}
+}
+
+func TestAppendArtifact_Dedup(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	task := &model.Task{Description: "test"}
+	s.PublishTask(task)
+
+	// 同一文件追加 5 次
+	for i := 0; i < 5; i++ {
+		if err := s.AppendArtifact(task.ID, "docs/same.md"); err != nil {
+			t.Fatalf("AppendArtifact: %v", err)
+		}
+	}
+
+	got, _ := s.GetTask(task.ID)
+	if len(got.Artifacts) != 1 {
+		t.Errorf("expected dedup to 1 entry, got %d: %v", len(got.Artifacts), got.Artifacts)
+	}
+}
+
+func TestAppendArtifact_TaskNotFound(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	err := s.AppendArtifact("nonexistent-id", "docs/foo.md")
+	if err == nil {
+		t.Error("expected error for nonexistent task")
+	}
+}
+
+func TestGetDependencyArtifacts_Basic(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+
+	// 创建上游任务 A，写入两个 artifact
+	taskA := &model.Task{Description: "upstream A"}
+	s.PublishTask(taskA)
+	s.AppendArtifact(taskA.ID, "docs/a1.md")
+	s.AppendArtifact(taskA.ID, "docs/a2.md")
+
+	// 创建上游任务 B，写入一个 artifact
+	taskB := &model.Task{Description: "upstream B"}
+	s.PublishTask(taskB)
+	s.AppendArtifact(taskB.ID, "docs/b1.md")
+
+	// 创建下游任务 C，依赖 A 和 B
+	taskC := &model.Task{
+		Description:  "downstream C",
+		Dependencies: []string{taskA.ID, taskB.ID},
+	}
+	s.PublishTask(taskC)
+
+	// 查询 C 的依赖 artifacts
+	deps, err := s.GetDependencyArtifacts(taskC.ID)
+	if err != nil {
+		t.Fatalf("GetDependencyArtifacts: %v", err)
+	}
+	if len(deps) != 2 {
+		t.Fatalf("expected 2 dep entries, got %d", len(deps))
+	}
+	if len(deps[taskA.ID]) != 2 || deps[taskA.ID][0] != "docs/a1.md" {
+		t.Errorf("taskA artifacts wrong: %v", deps[taskA.ID])
+	}
+	if len(deps[taskB.ID]) != 1 || deps[taskB.ID][0] != "docs/b1.md" {
+		t.Errorf("taskB artifacts wrong: %v", deps[taskB.ID])
+	}
+}
+
+func TestGetDependencyArtifacts_EmptyArtifacts(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	// 上游任务没有任何 artifacts（report-only 失败模式）
+	taskA := &model.Task{Description: "upstream A"}
+	s.PublishTask(taskA)
+
+	taskB := &model.Task{
+		Description:  "downstream B",
+		Dependencies: []string{taskA.ID},
+	}
+	s.PublishTask(taskB)
+
+	deps, err := s.GetDependencyArtifacts(taskB.ID)
+	if err != nil {
+		t.Fatalf("GetDependencyArtifacts: %v", err)
+	}
+	// 上游应当出现在 map 中，值为空 slice，让下游能识别"依赖存在但产出为空"
+	if _, ok := deps[taskA.ID]; !ok {
+		t.Errorf("expected taskA in deps map even with empty artifacts")
+	}
+	if len(deps[taskA.ID]) != 0 {
+		t.Errorf("expected empty artifacts for taskA, got: %v", deps[taskA.ID])
+	}
+}
+
+func TestGetDependencyArtifacts_NoDependencies(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	task := &model.Task{Description: "independent"}
+	s.PublishTask(task)
+
+	deps, err := s.GetDependencyArtifacts(task.ID)
+	if err != nil {
+		t.Fatalf("GetDependencyArtifacts: %v", err)
+	}
+	if len(deps) != 0 {
+		t.Errorf("expected empty deps map, got: %v", deps)
+	}
+}
+
+func TestGetDependencyArtifacts_TaskNotFound(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	_, err := s.GetDependencyArtifacts("nonexistent-id")
+	if err == nil {
+		t.Error("expected error for nonexistent task")
+	}
+}
+
+func TestAppendArtifact_ConcurrentSameTask(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	task := &model.Task{Description: "concurrent test"}
+	s.PublishTask(task)
+
+	// 100 goroutine 并发追加 100 个不同 artifact
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			s.AppendArtifact(task.ID, fmt.Sprintf("docs/file_%03d.md", idx))
+		}(i)
+	}
+	wg.Wait()
+
+	got, _ := s.GetTask(task.ID)
+	if len(got.Artifacts) != 100 {
+		t.Errorf("expected 100 unique artifacts, got %d", len(got.Artifacts))
 	}
 }

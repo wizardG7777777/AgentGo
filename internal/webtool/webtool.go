@@ -12,6 +12,21 @@ import (
 	"time"
 )
 
+// extractDomain 从 URL 中提取域名部分（如 "techcrunch.com"）。
+// 解析失败时返回空串。
+func extractDomain(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	host := u.Hostname()
+	// 去掉 "www." 前缀
+	if strings.HasPrefix(host, "www.") {
+		host = host[4:]
+	}
+	return host
+}
+
 const (
 	defaultTimeout   = 30 * time.Second
 	maxResponseBytes = 1 << 20 // 1MB
@@ -33,6 +48,14 @@ func isPrivateOrLoopback(ip net.IP) bool {
 	return false
 }
 
+// allowLoopbackForTests 是仅供测试使用的开关。
+// 当为 true 时，validateURL 不再拒绝 loopback / private / link-local 地址。
+// 生产代码绝不应直接修改此变量；测试通过 AllowLoopbackForTests(t) 临时启用。
+//
+// 注意：该变量在并行测试中是全局共享的——避免对相同进程内的多个测试同时启用。
+// AllowLoopbackForTests 通过 t.Cleanup 在测试结束时自动复位为 false。
+var allowLoopbackForTests bool
+
 // validateURL 解析 URL 并校验目标地址不是内网，防止 SSRF 攻击。
 func validateURL(rawURL string) error {
 	u, err := url.Parse(rawURL)
@@ -43,7 +66,7 @@ func validateURL(rawURL string) error {
 
 	// 直接 IP
 	if ip := net.ParseIP(host); ip != nil {
-		if isPrivateOrLoopback(ip) {
+		if isPrivateOrLoopback(ip) && !allowLoopbackForTests {
 			return fmt.Errorf("拒绝访问内网地址: %s", rawURL)
 		}
 		return nil
@@ -55,15 +78,24 @@ func validateURL(rawURL string) error {
 		return nil // DNS 解析失败时放行，让 HTTP 请求自己报错
 	}
 	for _, ip := range ips {
-		if isPrivateOrLoopback(ip) {
+		if isPrivateOrLoopback(ip) && !allowLoopbackForTests {
 			return fmt.Errorf("拒绝访问内网地址: %s (解析到 %s)", rawURL, ip)
 		}
 	}
 	return nil
 }
 
-// FetchURL 获取指定 URL 的页面文本内容。
+// FetchURL 获取指定 URL 的页面文本内容（使用默认 auto 模式）。
 func FetchURL(ctx context.Context, rawURL string) (string, error) {
+	return FetchURLWithMode(ctx, rawURL, "auto")
+}
+
+// FetchURLWithMode 获取指定 URL 的页面文本内容，支持可选的内容提取模式。
+// mode 可选值：
+//   - "auto"（默认）：智能判断，有 <article>/<main> 则提取正文，否则全页面
+//   - "article"：只提取正文区域（过滤导航/页脚噪音）
+//   - "full"：全页面文本
+func FetchURLWithMode(ctx context.Context, rawURL string, mode string) (string, error) {
 	if rawURL == "" {
 		return "", fmt.Errorf("缺少 url 参数")
 	}
@@ -100,11 +132,80 @@ func FetchURL(ctx context.Context, rawURL string) (string, error) {
 		return "", fmt.Errorf("读取响应失败: %w", err)
 	}
 
-	text := ExtractText(string(body))
+	htmlStr := string(body)
+
+	// 提取页面元数据（标题、发布时间）
+	prefix := extractPageMeta(htmlStr, rawURL)
+
+	var text string
+	switch mode {
+	case "article":
+		text = ExtractArticle(htmlStr)
+	case "full":
+		text = ExtractText(htmlStr)
+	default: // "auto"
+		text = ExtractArticle(htmlStr)
+	}
+
 	if len(text) > maxOutputChars {
 		text = text[:maxOutputChars] + "\n... (截断)"
 	}
+	if prefix != "" {
+		return prefix + text, nil
+	}
 	return text, nil
+}
+
+// extractPageMeta 从 HTML 中提取结构化前缀（标题、发布时间、来源域名）。
+func extractPageMeta(htmlStr, rawURL string) string {
+	var sb strings.Builder
+
+	// 提取 <title>
+	titleRe := regexp.MustCompile(`(?i)<title[^>]*>(.*?)</title>`)
+	if m := titleRe.FindStringSubmatch(htmlStr); len(m) > 1 {
+		title := StripTags(m[1])
+		if title != "" {
+			sb.WriteString("[标题] " + title + "\n")
+		}
+	}
+
+	// 尝试提取 og:article:published_time 或 datePublished
+	pubRe := regexp.MustCompile(`(?i)(?:article:published_time|datePublished)[^>]*content="([^"]+)"`)
+	if m := pubRe.FindStringSubmatch(htmlStr); len(m) > 1 {
+		sb.WriteString("[发布] " + m[1] + "\n")
+	}
+
+	// 来源域名
+	if domain := extractDomain(rawURL); domain != "" {
+		sb.WriteString("[来源] " + domain + "\n")
+	}
+
+	if sb.Len() > 0 {
+		return sb.String() + "---\n"
+	}
+	return ""
+}
+
+// ExtractArticle 从 HTML 中提取正文区域（<article>、<main>、role="main"）。
+// 找不到语义标签时回退到全页面 ExtractText。
+func ExtractArticle(htmlStr string) string {
+	// 优先查找 <article> 标签
+	articleRe := regexp.MustCompile(`(?is)<article[^>]*>(.*?)</article>`)
+	if m := articleRe.FindStringSubmatch(htmlStr); len(m) > 1 {
+		return ExtractText(m[1])
+	}
+	// 查找 <main> 标签
+	mainRe := regexp.MustCompile(`(?is)<main[^>]*>(.*?)</main>`)
+	if m := mainRe.FindStringSubmatch(htmlStr); len(m) > 1 {
+		return ExtractText(m[1])
+	}
+	// 查找 role="main"
+	roleRe := regexp.MustCompile(`(?is)<[^>]+role="main"[^>]*>(.*?)</(div|section|main)>`)
+	if m := roleRe.FindStringSubmatch(htmlStr); len(m) > 1 {
+		return ExtractText(m[1])
+	}
+	// 回退到全页面
+	return ExtractText(htmlStr)
 }
 
 // SearchWeb 使用 DuckDuckGo HTML 搜索并返回格式化结果。
@@ -112,7 +213,7 @@ func FetchURL(ctx context.Context, rawURL string) (string, error) {
 // 新代码建议通过 SearchProvider 接口调用。
 func SearchWeb(ctx context.Context, query string) (string, error) {
 	provider := &DuckDuckGoProvider{}
-	results, err := provider.Search(ctx, query)
+	results, err := provider.Search(ctx, query, nil)
 	if err != nil {
 		return "", err
 	}
@@ -121,9 +222,12 @@ func SearchWeb(ctx context.Context, query string) (string, error) {
 
 // SearchResult 表示一条搜索结果。
 type SearchResult struct {
-	Title   string
-	URL     string
-	Snippet string
+	Title       string
+	URL         string
+	Snippet     string
+	PublishedAt string  // 发布时间（RFC3339 或近似字符串，后端不支持时为空串）
+	Source      string  // 来源域名（如 "techcrunch.com"，后端不支持时为空串）
+	Score       float64 // 相关性分数（0~1，后端不支持时为 0）
 }
 
 // ParseSearchResults 从 DuckDuckGo HTML 响应中提取搜索结果。

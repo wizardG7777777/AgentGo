@@ -17,16 +17,30 @@ type TavilyProvider struct {
 
 func (t *TavilyProvider) Name() string { return "tavily" }
 
-func (t *TavilyProvider) Search(ctx context.Context, query string) ([]SearchResult, error) {
+func (t *TavilyProvider) Search(ctx context.Context, query string, opts *SearchOptions) ([]SearchResult, error) {
 	if query == "" {
 		return nil, fmt.Errorf("缺少 query 参数")
 	}
 
 	// Tavily API: POST https://api.tavily.com/search
-	reqBody, err := json.Marshal(map[string]string{
-		"query":   query,
-		"api_key": t.APIKey,
-	})
+	payload := map[string]any{
+		"query":       query,
+		"api_key":     t.APIKey,
+		"max_results": 5,
+	}
+	if opts != nil {
+		if opts.NumResults > 0 {
+			payload["max_results"] = opts.NumResults
+		}
+		// Tavily 使用 days 参数：day=1, week=7, month=30, year=365
+		if opts.TimeRange != "" && opts.TimeRange != "any" {
+			days := map[string]int{"day": 1, "week": 7, "month": 30, "year": 365}
+			if d, ok := days[opts.TimeRange]; ok {
+				payload["days"] = d
+			}
+		}
+	}
+	reqBody, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("构建 Tavily 请求体失败: %w", err)
 	}
@@ -57,9 +71,11 @@ func (t *TavilyProvider) Search(ctx context.Context, query string) ([]SearchResu
 	// 解析 Tavily JSON 响应
 	var apiResp struct {
 		Results []struct {
-			Title   string `json:"title"`
-			URL     string `json:"url"`
-			Content string `json:"content"`
+			Title         string  `json:"title"`
+			URL           string  `json:"url"`
+			Content       string  `json:"content"`
+			PublishedDate string  `json:"published_date"`
+			Score         float64 `json:"score"`
 		} `json:"results"`
 	}
 	if err := json.Unmarshal(body, &apiResp); err != nil {
@@ -68,10 +84,15 @@ func (t *TavilyProvider) Search(ctx context.Context, query string) ([]SearchResu
 
 	var results []SearchResult
 	for _, r := range apiResp.Results {
+		// 从 URL 提取域名作为 Source
+		source := extractDomain(r.URL)
 		results = append(results, SearchResult{
-			Title:   r.Title,
-			URL:     r.URL,
-			Snippet: r.Content,
+			Title:       r.Title,
+			URL:         r.URL,
+			Snippet:     r.Content,
+			PublishedAt: r.PublishedDate,
+			Source:      source,
+			Score:       r.Score,
 		})
 	}
 	return results, nil

@@ -33,7 +33,12 @@
       "Bash(git -C \"C:/Users/73524/Documents/GolangProjects/AgentGo\" cherry-pick --abort)",
       "Bash(git -C \"C:/Users/73524/Documents/GolangProjects/AgentGo\" branch --show-current)",
       "Bash(git:*)",
-      "Bash(sed:*)"
+      "Bash(sed:*)",
+      "Read(//private/tmp/trace_smoke/**)",
+      "Bash(/tmp/agentgo_test trace:*)",
+      "Bash(./agentgo trace:*)",
+      "Bash(python3 -c \"import sys, json; [print\\(json.dumps\\(json.loads\\(l\\), indent=2, ensure_ascii=False\\)\\) for l in sys.stdin if l.strip\\(\\)]\")",
+      "Bash(python3 -c ':*)"
     ]
   },
   "enableAllProjectMcpServers": true,

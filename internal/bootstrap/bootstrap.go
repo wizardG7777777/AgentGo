@@ -5,13 +5,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"agentgo/internal/cli"
 	"agentgo/internal/config"
 	"agentgo/internal/explorer"
-	"agentgo/internal/isolation"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
@@ -19,28 +20,28 @@ import (
 	"agentgo/internal/scheduler"
 	"agentgo/internal/shell"
 	"agentgo/internal/store"
+	"agentgo/internal/trace"
 	"agentgo/internal/watchdog"
+	"agentgo/internal/webtool"
 	"agentgo/internal/worker"
 )
 
 type System struct {
-	Config           *config.Config
-	Store            store.TaskStore
-	Roster           roster.Roster
-	EventCh          chan model.Event
-	Watchdog         *watchdog.Watchdog
-	CancelRegistry   *store.TaskCancelRegistry
-	MailboxRegistry  *mailbox.Registry
-	MailNotifier     *mailbox.MailNotifier
-	Scheduler        *scheduler.Scheduler
-	Explorer         *explorer.Explorer
-	Workers          []*worker.Worker
-	ApprovalCh       chan shell.ApprovalRequest // 命令审批通道，Worker→CLI
-	WorktreeManager  *isolation.WorktreeManager
-	ConflictResolver *isolation.ConflictResolver
-	CLI              *cli.CLI
-	cancel           context.CancelFunc
-	wg               sync.WaitGroup
+	Config          *config.Config
+	Store           store.TaskStore
+	Roster          roster.Roster
+	EventCh         chan model.Event
+	Watchdog        *watchdog.Watchdog
+	CancelRegistry  *store.TaskCancelRegistry
+	MailboxRegistry *mailbox.Registry
+	MailNotifier    *mailbox.MailNotifier
+	Scheduler       *scheduler.Scheduler
+	Explorer        *explorer.Explorer
+	Workers         []*worker.Worker
+	ApprovalCh      chan shell.ApprovalRequest // 命令审批通道，Worker→CLI
+	CLI             *cli.CLI
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
 }
 
 func Bootstrap(configPath string, explicit bool) (*System, error) {
@@ -50,6 +51,27 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
 	fmt.Println("[启动] 全局配置加载完成")
+
+	// Step 1.5: 初始化 trace 系统（每任务一份 JSONL 文件，保留最近 100 个）
+	// trace 写入失败仅打印 warning，不中断主流程
+	traceDir := filepath.Join(cfg.ProjectRoot, ".agentgo", "traces")
+	traceWriter, traceErr := trace.NewWriter(traceDir, 100)
+	if traceErr != nil {
+		fmt.Printf("[启动] WARNING: trace 系统初始化失败 (dir=%s): %v\n", traceDir, traceErr)
+	} else {
+		trace.SetDefault(traceWriter)
+		fmt.Printf("[启动] Trace 系统已启动 (dir=%s, 保留最近 100 个任务)\n", traceDir)
+	}
+
+	// Step 1.6: 初始化 prompt dumper（仅在 AGENTGO_DUMP_PROMPTS=1 时启用）
+	dumpEnabled := os.Getenv("AGENTGO_DUMP_PROMPTS") == "1"
+	dumper, dumperErr := trace.NewPromptDumper(traceDir, dumpEnabled)
+	if dumperErr != nil {
+		fmt.Printf("[启动] WARNING: prompt dumper 初始化失败: %v\n", dumperErr)
+	} else if dumpEnabled {
+		trace.SetDefaultDumper(dumper)
+		fmt.Println("[启动] Prompt dump 已启用 (AGENTGO_DUMP_PROMPTS=1)")
+	}
 
 	// Step 2: 初始化公告板
 	eventCh := make(chan model.Event, cfg.EventChannelBuffer)
@@ -84,22 +106,9 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	// Step 6: 创建看门狗
 	w := watchdog.New(taskStore, cfg, eventCh, r)
 
-	// Step 6.5: 创建 worktree 管理器和冲突解决代理（可选）
-	var wtManager *isolation.WorktreeManager
-	var resolver *isolation.ConflictResolver
-	if cfg.WorktreeEnabled {
-		wtManager = isolation.NewWorktreeManager(cfg.ProjectRoot)
-		resolverLLM := llm.NewSDKClient(
-			cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.ExplorerModel,
-			"", // system prompt 由 resolver 内部管理
-			time.Duration(cfg.LLMTimeoutSec)*time.Second,
-		)
-		resolver = isolation.NewConflictResolver(cfg.ProjectRoot, resolverLLM, taskStore)
-		fmt.Println("[启动] Worktree 隔离已启用")
-	}
-
-	// Step 7: 创建调查代理
-	exp := explorer.New(taskStore, r, explorerLLM, cfg, cancelRegistry, mbRegistry, wtManager)
+	// Step 7: 创建调查代理（复用与 Worker 相同的 SearchProvider 配置）
+	explorerSearchProvider := webtool.NewProvider(cfg.SearchAPIProvider, cfg.SearchAPIURL, cfg.SearchAPIKey)
+	exp := explorer.New(taskStore, r, explorerLLM, cfg, cancelRegistry, mbRegistry, explorerSearchProvider)
 
 	// Step 7.5: 创建命令审批通道（Worker→CLI）
 	approvalCh := make(chan shell.ApprovalRequest, 8)
@@ -116,7 +125,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 			"", // system prompt 由 worker 内部管理
 			time.Duration(cfg.LLMTimeoutSec)*time.Second,
 		)
-		wk := worker.NewWithID(fmt.Sprintf("worker-%d", i), taskStore, r, workerLLM, cfg, cancelRegistry, mbRegistry, approvalCh, wtManager, resolver)
+		wk := worker.NewWithID(fmt.Sprintf("worker-%d", i), taskStore, r, workerLLM, cfg, cancelRegistry, mbRegistry, approvalCh)
 		workers = append(workers, wk)
 	}
 
@@ -125,20 +134,18 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	mailNotifier := mailbox.NewMailNotifier(mbRegistry, taskStore, notifierInterval)
 
 	sys := &System{
-		Config:           cfg,
-		Store:            taskStore,
-		Roster:           r,
-		EventCh:          eventCh,
-		Watchdog:         w,
-		CancelRegistry:   cancelRegistry,
-		MailboxRegistry:  mbRegistry,
-		MailNotifier:     mailNotifier,
-		Scheduler:        sched,
-		Explorer:         exp,
-		Workers:          workers,
-		ApprovalCh:       approvalCh,
-		WorktreeManager:  wtManager,
-		ConflictResolver: resolver,
+		Config:          cfg,
+		Store:           taskStore,
+		Roster:          r,
+		EventCh:         eventCh,
+		Watchdog:        w,
+		CancelRegistry:  cancelRegistry,
+		MailboxRegistry: mbRegistry,
+		MailNotifier:    mailNotifier,
+		Scheduler:       sched,
+		Explorer:        exp,
+		Workers:         workers,
+		ApprovalCh:      approvalCh,
 	}
 
 	return sys, nil
@@ -171,16 +178,6 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
 		s.MailNotifier.Run(ctx)
 	}()
 	fmt.Println("[启动] 邮差通知器已启动")
-
-	// Step 6.8: 启动冲突解决代理（可选）
-	if s.ConflictResolver != nil {
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			s.ConflictResolver.Run(ctx)
-		}()
-		fmt.Println("[启动] 冲突解决代理已启动")
-	}
 
 	// Step 7: 启动调查代理
 	s.wg.Add(1)
@@ -216,8 +213,12 @@ func (s *System) Shutdown() {
 		s.cancel()
 	}
 	s.wg.Wait()
-	if s.WorktreeManager != nil {
-		s.WorktreeManager.CleanupAll()
+	// 关闭 trace 写入器，flush 所有打开的文件句柄
+	if w := trace.Default(); w != nil {
+		w.Close()
+	}
+	if d := trace.DefaultDumper(); d != nil {
+		d.Close()
 	}
 	fmt.Println("[关闭] 系统已停止")
 }

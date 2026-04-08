@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 )
@@ -14,9 +15,17 @@ type DuckDuckGoProvider struct{}
 
 func (d *DuckDuckGoProvider) Name() string { return "duckduckgo_html" }
 
-func (d *DuckDuckGoProvider) Search(ctx context.Context, query string) ([]SearchResult, error) {
+func (d *DuckDuckGoProvider) Search(ctx context.Context, query string, opts *SearchOptions) ([]SearchResult, error) {
 	if query == "" {
 		return nil, fmt.Errorf("缺少 query 参数")
+	}
+	// DuckDuckGo HTML 模式不支持 time_range 过滤；NumResults 通过截断结果列表实现
+	numResults := 5
+	if opts != nil && opts.NumResults > 0 {
+		numResults = opts.NumResults
+	}
+	if opts != nil && opts.TimeRange != "" && opts.TimeRange != "any" {
+		log.Printf("[webtool] duckduckgo_html 不支持 time_range=%q 过滤，忽略", opts.TimeRange)
 	}
 
 	searchURL := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(query)
@@ -40,5 +49,8 @@ func (d *DuckDuckGoProvider) Search(ctx context.Context, query string) ([]Search
 	}
 
 	results := ParseSearchResults(string(body))
+	if len(results) > numResults {
+		results = results[:numResults]
+	}
 	return results, nil
 }

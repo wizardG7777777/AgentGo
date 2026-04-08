@@ -9,14 +9,14 @@ import (
 )
 
 var (
-	ErrClaimNotFound   = errors.New("claim not found")
-	ErrNotClaimOwner   = errors.New("agent does not own this claim")
+	ErrClaimNotFound = errors.New("claim not found")
+	ErrNotClaimOwner = errors.New("agent does not own this claim")
 )
 
 type MemoryRoster struct {
 	mu         sync.RWMutex
-	claims     map[string]model.Claim  // filePath -> Claim
-	agentFiles map[string][]string     // agentID -> []filePath
+	claims     map[string]model.Claim // filePath -> Claim
+	agentFiles map[string][]string    // agentID -> []filePath
 }
 
 func NewMemoryRoster() *MemoryRoster {
