@@ -20,6 +20,22 @@ type TaskHolder interface {
 	Get() string
 }
 
+// BatchTracker 是 publish_task 工具发布子任务后的副作用回调（Phase 3 引入）。
+//
+// scheduler 通过这个接口把每个新发布的子任务 ID 追加到 scheduler task 自身的
+// SchedulerBatch 字段，使 SchedulerExecutor 后续能等待这一批 task 全部进入终态。
+// worker / explorer bootstrap 时不传 BatchTracker（nil），publish_task 行为不变。
+//
+// 之所以是接口而不是直接传 store + currentTaskID：scheduler 内部由 holder 闭包
+// 提供 currentTaskID，外面看不到；接口让 scheduler 把这个闭包能力注入 MetaGroup
+// 而无需暴露 holder 实现细节。
+type BatchTracker interface {
+	// AppendBatch 在 publish_task 工具成功创建 task 后被调用一次。
+	// 返回错误时 publish_task 工具记录日志但不失败（batch 跟踪是辅助能力，
+	// 失败不应阻塞用户的任务发布）。
+	AppendBatch(childTaskID string) error
+}
+
 // MetaGroup 注册任务发布与代理间通信工具。
 //
 // 字段说明：
@@ -28,12 +44,15 @@ type TaskHolder interface {
 //   - MaxDepth：仅 Holder != nil 时生效；publish_task 创建的子任务深度超过该值时拒绝
 //   - MBRegistry：邮箱注册表；nil 时不注册 send_message
 //   - AgentID：当前代理 ID（send_message 的发件人）
+//   - BatchTracker：（可选，Phase 3）publish_task 成功后追加子任务 ID 到此 tracker；
+//     scheduler 注入时把 ID 写入 scheduler task.SchedulerBatch；worker 不注入则无副作用
 type MetaGroup struct {
-	Store      store.TaskStore
-	Holder     TaskHolder
-	MaxDepth   int
-	MBRegistry *mailbox.Registry
-	AgentID    string
+	Store        store.TaskStore
+	Holder       TaskHolder
+	MaxDepth     int
+	MBRegistry   *mailbox.Registry
+	AgentID      string
+	BatchTracker BatchTracker
 }
 
 // Register 把 publish_task / send_message 注册到 r。
@@ -153,6 +172,15 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 
 	if err := g.Store.PublishTask(task); err != nil {
 		return "", fmt.Errorf("发布任务失败: %w", err)
+	}
+
+	// Phase 3：scheduler 注入了 BatchTracker 时，把新 task ID 追加到
+	// scheduler task.SchedulerBatch。worker / explorer 不注入则跳过。
+	// 失败仅记日志，不阻塞用户的任务发布——batch 跟踪是辅助能力。
+	if g.BatchTracker != nil {
+		if err := g.BatchTracker.AppendBatch(task.ID); err != nil {
+			fmt.Printf("[meta] BatchTracker.AppendBatch 失败 (task=%s): %v\n", task.ID, err)
+		}
 	}
 
 	return fmt.Sprintf("已创建任务: id=%s, depth=%d, description=%s", task.ID, childDepth, desc), nil
