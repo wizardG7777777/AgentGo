@@ -14,6 +14,7 @@ import (
 	"agentgo/internal/config"
 	"agentgo/internal/explorer"
 	"agentgo/internal/hook"
+	"agentgo/internal/hook/builtin"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
@@ -81,7 +82,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	taskStore.SetCancelRegistry(cancelRegistry)
 	fmt.Println("[启动] 公告板初始化完成")
 
-	// Step 2.5: 初始化 Hook 系统（阶段 1 — 铺管道，不注册任何具体 hook）
+	// Step 2.5: 初始化 Hook 系统（阶段 1）
 	// hookReg 以单例方式被所有 worker/explorer 共享。recordToolCall 闭包
 	// 是 llm_executor.go 自动写入 ToolCallRecord 的通道 —— 独立于 StoreHookView，
 	// 避免 hook 通过接口写入任务历史（C4.3 方案 A，详见 hookSystem.md §11.1）。
@@ -90,7 +91,11 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	recordToolCall := func(taskID string, rec store.ToolCallRecord) {
 		_ = taskStore.AppendToolCall(taskID, rec)
 	}
-	fmt.Println("[启动] Hook 系统初始化完成（阶段 1 — 未注册具体 hook）")
+	// 注册具体 hook（按 commit 渐进式增加）
+	if err := hookReg.Register(builtin.NewRecordArtifactHook(storeView, cfg.ProjectRoot)); err != nil {
+		return nil, fmt.Errorf("注册 RecordArtifactHook 失败: %w", err)
+	}
+	fmt.Println("[启动] Hook 系统初始化完成（已注册：record-artifact）")
 
 	// Step 3: 初始化花名册
 	r := roster.NewMemoryRoster()

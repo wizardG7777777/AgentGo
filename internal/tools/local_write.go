@@ -10,7 +10,6 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/pathutil"
 	"agentgo/internal/roster"
-	"agentgo/internal/store"
 	"agentgo/internal/tools/schema"
 	"agentgo/internal/trace"
 )
@@ -24,40 +23,14 @@ import (
 //
 // 两个工具都在调用 Roster.TryClaim 获取文件写入权之后才读取文件内容，
 // 严格遵循「先锁后读」的顺序，避免 TOCTOU 竞态。
-type LocalWriteGroup struct {
-	LocalReadGroup                 // embed: 继承 Workdir + Cache
-	Roster         roster.Roster   // required
-	AgentID        string          // required
-	Store          store.TaskStore // optional: 写文件成功后追加到 task.Artifacts，nil 时跳过
-	ProjectRoot    string          // optional: 用于把绝对路径标准化为项目相对路径，空时直接使用绝对路径
-}
-
-// recordArtifact 把 path 标准化为相对项目根的相对路径，
-// 然后通过 Store.AppendArtifact 写入当前任务的 Artifacts 列表。
 //
-// 失败（taskID 取不到、Store 为 nil、AppendArtifact 出错）静默吞掉，
-// 不影响主流程——artifact 跟踪是观察特性，不应阻塞写入。
-func (g LocalWriteGroup) recordArtifact(ctx context.Context, absPath string) {
-	if g.Store == nil {
-		return
-	}
-	taskID := agent.TaskIDFromContext(ctx)
-	if taskID == "" {
-		return
-	}
-	relPath := normalizeArtifactPath(absPath, g.ProjectRoot)
-	_ = g.Store.AppendArtifact(taskID, relPath)
-}
-
-// normalizeArtifactPath 把绝对路径转换为相对项目根的路径。失败则原样返回。
-func normalizeArtifactPath(absPath, projectRoot string) string {
-	cleaned := filepath.Clean(absPath)
-	if projectRoot != "" {
-		if rel, err := filepath.Rel(projectRoot, cleaned); err == nil && !strings.HasPrefix(rel, "..") {
-			return rel
-		}
-	}
-	return cleaned
+// C5 迁移：原 Store / ProjectRoot 字段以及 recordArtifact 方法已删除。
+// 写入产物事实流的登记由 Hook System 的 RecordArtifactHook 在 PostCall
+// 阶段接管，详见 internal/hook/builtin/record_artifact.go。
+type LocalWriteGroup struct {
+	LocalReadGroup               // embed: 继承 Workdir + Cache
+	Roster         roster.Roster // required
+	AgentID        string        // required
 }
 
 // Register 把 write_file / edit_file 注册到 r。
@@ -153,9 +126,8 @@ func (g LocalWriteGroup) writeFile(ctx context.Context, args map[string]any) (st
 		Hash:    computeSHA256([]byte(content)),
 	})
 
-	// Artifacts：把本次写入的文件追加到当前任务的 Artifacts 列表（自动去重）
-	// 这样下游依赖任务可以通过 GetDependencyArtifacts 看到本任务实际产出了什么
-	g.recordArtifact(ctx, path)
+	// Artifacts：C5 迁移后由 RecordArtifactHook（PostCall）记录到 task.Artifacts。
+	// 详见 internal/hook/builtin/record_artifact.go。
 
 	return fmt.Sprintf("文件已写入: %s (%d 字节)", path, len(content)), nil
 }
@@ -246,8 +218,7 @@ func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (str
 		Hash:    computeSHA256([]byte(newContent)),
 	})
 
-	// Artifacts：把本次编辑的文件追加到当前任务（自动去重）
-	g.recordArtifact(ctx, path)
+	// Artifacts：C5 迁移后由 RecordArtifactHook（PostCall）记录到 task.Artifacts。
 
 	oldLen := len(content)
 	newLen := len(newContent)
