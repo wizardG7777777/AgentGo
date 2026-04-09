@@ -37,6 +37,18 @@ type TaskStore interface {
 	// path 应当是相对项目根目录的相对路径（调用方负责标准化）。
 	AppendArtifact(taskID string, path string) error
 
+	// AppendSchedulerBatch 把一个子任务 ID 追加到 task.SchedulerBatch，自动去重。
+	// 由 SchedulerGroup 在 scheduler 通过 publish_task 发布子任务时调用，
+	// 让 SchedulerExecutor 之后能等待这一批 task 全部进入终态。
+	// 仅对 EventType="__scheduler__" 任务有意义。
+	// Phase 3 引入。
+	AppendSchedulerBatch(taskID string, childTaskID string) error
+
+	// ClearSchedulerBatch 清空 task.SchedulerBatch。
+	// 由 SchedulerGroup.report_done 在汇报完成时调用。
+	// Phase 3 引入。
+	ClearSchedulerBatch(taskID string) error
+
 	// AppendToolCall 追加一条工具调用记录到指定任务的历史。
 	// 由 llm_executor.go 在每次 tools.Dispatch 之后自动写入（包括被 hook Abort 的调用）。
 	// hook 系统通过 StoreHookView.GetToolCallHistory 查询这些记录做事实校对。
