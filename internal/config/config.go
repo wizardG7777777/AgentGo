@@ -35,8 +35,11 @@ type Config struct {
 	WorkerCount             int    `yaml:"worker_count" json:"worker_count"`
 	MailboxBufferSize       int    `yaml:"mailbox_buffer_size" json:"mailbox_buffer_size"`
 	MailNotifierIntervalSec int    `yaml:"mail_notifier_interval_sec" json:"mail_notifier_interval_sec"`
-	// MailNotifierEnabled 控制邮差通知器是否启动。默认 false（一刀切禁用），用于防止邮件级联爆炸（见 KNOWN_ISSUES.md）。
-	// 等"chain_depth + 去重 + 上下文展开 + reply 抑制" 4 项修复落地后再恢复为 true。
+	// MailNotifierEnabled 控制邮差通知器是否启动。Phase 2 完成后默认 true：
+	// 4 项防御已经全部到位（ChainDepthLimitHook 截断深链 + PerAgentDedupHook
+	// 镜像去重 + WakeContextExpandHook 上下文注入 + worker/explorer 提示词
+	// 弱化"必回复"），邮件级联爆炸的根因都被堵住了。如有需要可用 yaml 强制
+	// 关闭。详见 KNOWN_ISSUES.md。
 	MailNotifierEnabled bool `yaml:"mail_notifier_enabled" json:"mail_notifier_enabled"`
 	// MailChainMaxDepth 是邮件链跳数上限。worker 通过 send_message 触发的邮件
 	// 继承"自己当前任务的 MailChainDepth + 1"；超过此阈值的消息仍然会投递到
@@ -71,8 +74,8 @@ func DefaultConfig() *Config {
 		WorkerCount:             1,
 		MailboxBufferSize:       32,
 		MailNotifierIntervalSec: 5,
-		MailNotifierEnabled:     false, // Phase 2 完成后在 B9 改为 true（默认启用）
-		MailChainMaxDepth:       3,     // Phase 2 新增；与 hookSystem.md §3.2 一致
+		MailNotifierEnabled:     true, // Phase 2 完成；4 项防御已就绪，恢复默认启用
+		MailChainMaxDepth:       3,    // Phase 2 新增；与 hookSystem.md §3.2 一致
 		SearchAPIProvider:       "duckduckgo_html",
 	}
 }
