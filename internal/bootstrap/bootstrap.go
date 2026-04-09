@@ -121,11 +121,16 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	// Step 3.6: 初始化 Mailbox Hook 系统（Phase 2）
 	// 与 ToolHookRegistry 并列共存、独立。registry 创建后立即通过
 	// AsMailboxRunner 适配器挂接到 mbRegistry，使后续的 mailbox.Send 路径
-	// 走 BeforeSend / BeforeDeliver 决策。具体的 mailbox hook 在后续 commit
-	// (B6/B7/B8) 注册；本 commit 创建一个空 registry 即可，等同于 noop 防御层。
+	// 走 BeforeSend / BeforeDeliver 决策。
+	//
+	// V9 回归验证（B9 步骤）：注释掉以下所有 Register 调用之后，整个测试套
+	// 仍然全绿且 mailbox 行为字节级一致 — 这是 Phase 2 可逆性的硬证明。
 	mailboxHookReg := hook.NewMailboxHookRegistry()
+	if err := mailboxHookReg.Register(builtin.NewChainDepthLimitHook(cfg.MailChainMaxDepth)); err != nil {
+		return nil, fmt.Errorf("注册 ChainDepthLimitHook 失败: %w", err)
+	}
 	mbRegistry.AttachHookRunner(hook.AsMailboxRunner(mailboxHookReg))
-	fmt.Println("[启动] Mailbox Hook 系统初始化完成（暂未注册具体 hook）")
+	fmt.Printf("[启动] Mailbox Hook 系统初始化完成（已注册：chain-depth-limit, max=%d）\n", cfg.MailChainMaxDepth)
 
 	// Step 4: 创建 LLM 客户端
 	schedulerLLM := llm.NewSDKClient(
