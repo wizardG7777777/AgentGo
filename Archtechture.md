@@ -1,18 +1,20 @@
-# 现状速览（2026-04-09）
+# 现状速览（2026-04-10）
 
 > 本文档原本是设计稿，部分章节早于实现。本节为升级工作提供快速对齐入口，列出**与设计文档不一致的关键实现事实**。后续章节如有冲突，以本节和源代码为准。
 
 **已实现的核心包**（`internal/` 下）：
-`agent`（ReAct 循环 + 三层历史压缩 + FileStateCache）、`bootstrap`、`cli`、`config`、`explorer`（只读调查代理）、`llm`、`mailbox`（异步信箱 + Notifier）、`model`、`pathutil`、`roster`（文件级 TryClaim/Release）、`scheduler`（事件驱动 + 公告板快照 + Artifacts/ExpectedArtifacts 注入）、`shell`（命令审批/拦截）、`store`（公告板 + TaskCancelRegistry）、`tools`、`trace`（每任务一份 JSONL）、`watchdog`、`webtool`、`worker`（10 个工具的执行代理，可配置 N 个实例）。
+`agent`（ReAct 循环 + 三层历史压缩 + FileStateCache）、`bootstrap`、`cli`、`config`、`explorer`（只读调查代理）、`hook` + `hook/builtin`（Tool Hook + Mailbox Hook 双框架，4 + 3 个内置 hook）、`llm`、`mailbox`（异步信箱 + Notifier + ring-buffer peek）、`model`、`pathutil`、`roster`（文件级 TryClaim/Release）、`scheduler`（**Phase 3：agent.Agent 实例 + Activator 事件桥 + SchedulerExecutor**，详见后文章节）、`shell`（命令审批/拦截）、`store`（公告板 + TaskCancelRegistry + ToolCallRecord 历史）、`tools`、`trace`（每任务一份 JSONL）、`watchdog`、`webtool`、`worker`（10 个工具的执行代理，可配置 N 个实例）。
 
 **关键实现事实，与原设计文档的差异**：
 
-- **执行代理 = `worker.Worker`**：原文档统称"执行代理"，实际是 `internal/worker` 包，可通过 `cfg.WorkerCount` 配置 N 个实例。每个 worker 拥有 10 个工具（read/write/edit/list/grep/glob/run_shell/publish_subtask/web_search/web_fetch）。
+- **执行代理 = `worker.Worker`**：原文档统称"执行代理"，实际是 `internal/worker` 包，可通过 `cfg.WorkerCount` 配置 N 个实例。每个 worker 拥有 10 个工具（read/write/edit/list/grep/glob/run_shell/publish_task/web_search/web_fetch）。
+- **Scheduler = `agent.Agent` 一等代理实例**（2026-04-10 Phase 3 重构）：Scheduler 不再是独立写的 ReAct 循环，而是 `agent.NewAgent(EventType="__scheduler__")` 的实例，工具集 = Worker 全集 + SchedulerGroup（cancel_task + report_done）。它能直接 `read_file`/`grep_search`/`web_search`，自动获得 Tool Hook、3 层历史压缩、FileStateCache、Trace、per-task cancel ctx 等所有 worker 拥有的能力。`scheduler.New` 返回 `*Bundle{Agent, Activator, Mode}`。详见 §"Scheduler 一等代理重构"。
 - **Roster 仅做文件级锁，不是团队花名册**：`Roster` 接口的 `TryClaim/Release/ReleaseAll/ListAllAgents` 全部围绕"防文件并发写"。它**不**承担团队成员注册或角色描述功能（设计文档中的"团队花名册"语义未实现，改由 mailbox `TeamSnapshot` 提供轻量替代）。
 - **Mailbox 子系统**（设计文档完全未提及）：`internal/mailbox` 提供基于 Go channel 的异步信箱、`send_message` 工具、ack 自动回执、`TeamSnapshot` 团队感知。详见 §"邮箱与异步通讯"。
-- **MailNotifier 当前默认禁用**（2026-04-09）：为防止"邮件级联爆炸"P0 缺陷，`config.MailNotifierEnabled` 默认为 `false`，bootstrap 跳过 `MailNotifier.Run`。退化：空闲 agent 不会被自动唤醒读邮件。详见 `docs/activate/KNOWN_ISSUES.md`。
+- **Hook 系统**（2026-04-09 落地）：Tool Hook + Mailbox Hook 两套并列的拦截框架。Tool Hook 在 `agent.NewLLMExecutor` 内部 dispatch 工具调用前后触发（4 个内置 hook：record-artifact / path-boundary / validate-expected-hash / require-read-before-write）；Mailbox Hook 在 `mailbox.Registry.Send` 和 `MailNotifier.scan` 触发（3 个内置 hook：chain-depth-limit / per-agent-dedup / wake-context-expand）。Phase 3 重构后 scheduler 也走 Tool Hook。详见 §"Hook System"。
+- **MailNotifier 默认启用**（2026-04-09 Phase 2 完成后恢复）：邮件级联爆炸 P0 的 4 项根因全部修复后，`config.MailNotifierEnabled` 默认为 `true`，空闲 agent 会被自动唤醒读邮件。`ChainDepthLimitHook` (max=3) 在 BeforeSend 阶段截断超深邮件链，杜绝 cascade。
 - **架构决策：无 git 依赖**（2026-04-09）：曾经的 `internal/isolation`（git worktree 隔离）整体删除。**AgentGo 代码本体不调用 git**。所有 Worker 共享 `ProjectRoot`。当前并发写文件**唯一防线**是 `Roster` 文件锁 + `expected_hash` TOCTOU 检查 + `pathutil.ValidatePath` 路径越界防护。删 git 后**故意暴露**的 4 项退化（并发写覆盖、半成品回滚、跨任务可见性、杀任务清理）正在等待"多代理协同重建"阶段按真实失败模式驱动设计。
-- **任务数据流**（设计文档未提及，2026-04-08 落地）：`Task.Artifacts`（实际写入文件清单，`write_file`/`edit_file` 自动追加）、`Task.ExpectedArtifacts`（发布者声明的硬合约，任务结束前由 `agent.checkExpectedArtifacts` 校验，缺失则触发重试）、`Task.LastResponse`（worker 最后一次 LLM 响应，无条件持久化用于失败诊断）。详见 §"产物契约与失败汇报"。
+- **任务数据流**（设计文档未提及，2026-04-08 落地 + Phase 3 扩展）：`Task.Artifacts`（实际写入文件清单，`write_file`/`edit_file` 自动追加）、`Task.ExpectedArtifacts`（发布者声明的硬合约，任务结束前由 `agent.checkExpectedArtifacts` 校验，缺失则触发重试）、`Task.LastResponse`（worker 最后一次 LLM 响应，无条件持久化用于失败诊断）、`Task.MailChainDepth`（邮件链跳数，Phase 2 引入）、`Task.SchedulerBatch`（scheduler 当前 reactLoop 跟踪的子任务 ID 列表，Phase 3 引入）。详见 §"产物契约与失败汇报"。
 - **TaskCancelRegistry**：per-task cancel context，看门狗/调度器把任务转为 terminal 状态时自动取消正在执行的代理（通过 `ctx.Done()` 即时感知），不依赖广播。
 - **崩溃汇报**：任务最终失败时 agent 自动调用 `sendCrashReport`，向 `task.EventSource` 发送 `priority=high` 邮件，附 expected vs actual artifacts、worker 最后响应原文。
 - **三层历史压缩**：Layer 1 `snipOldToolResults`（无 LLM 开销，逐轮清理旧工具输出）；Layer 2 `compressHistory`（超过 `CompactTokenThreshold` 时摘要）；Layer 3 context overflow 时 `keepRecent=1` 激进压缩 + RetryRollback。
@@ -20,11 +22,10 @@
 
 **未启动 / 待设计**：
 - 多代理协同重建（4 项退化的针对性修复）
-- 邮件级联爆炸 4 根因修复（chain_depth、notifier 按 agentID 去重、唤醒任务携带上下文、reply 抑制）
-- Scheduler `report_done` 基于 `Artifacts` 的事实校对
-- Scheduler 事件响应延迟 ~3 分钟根因排查
+- Scheduler 事件响应延迟 ~3 分钟根因排查（Phase 3 重构后旧根因路径已不存在，需要重新观察是否仍出现）
+- Trace 多 goroutine 写入竞争（P1 复核）
 
-详细缺陷与状态见 `docs/activate/KNOWN_ISSUES.md`（30/35 已修复）。
+详细缺陷与状态见 `docs/activate/KNOWN_ISSUES.md`（28/29 已修复）。
 
 ---
 
@@ -384,18 +385,19 @@ Scheduler 在最初的设计里是一个**独立写的事件驱动 ReAct 循环*
 系统启动时内置的特殊代理，各自承担不同的架构职责。
 
 ## 调度器（Scheduler）
-调度器本身是一个特殊的代理，它既能回答用户问题、操作有限度的工具，又承担任务编排的职责。
+**Phase 3 重构后**：调度器是一个**真正的一等代理**（`agent.Agent` 实例，`EventType="__scheduler__"`），与 Worker / Explorer 共享同一套底层框架，只是工具集和触发方式不同。详见 §"Scheduler 一等代理重构"。
 ### 调度器的核心职责
-- **接收用户输入**：解析用户意图，将自然语言转化为一个或多个任务发布到公告板
-- **动态任务拆分**：调度器不需要一次性规划出所有任务，而是根据当前进展逐步拆分。前一批任务完成后，调度器根据其结果决定是否需要后续任务
+- **接收用户输入**：通过 `Activator` goroutine 把 `EventUserInput` 翻译成 `EventType="__scheduler__"` 任务发布到公告板，scheduler agent 在下次 poll 时认领
+- **动态任务拆分**：调度器不需要一次性规划出所有任务，而是根据当前进展逐步拆分。前一批任务完成后，`SchedulerExecutor.waitForBatchTerminal` 唤醒 LLM 进入下一轮决策
 - **设置任务依赖**：在发布任务时声明前置依赖（任务 ID 列表），公告板在代理领取时检查前置是否已完成，但不做全局建图或拓扑排序
 - **设置任务并发数**：可以为单个任务覆盖全局并发阈值
-- **结果汇总**：当一组协作任务全部完成后，调度器读取各任务的部分结果，合并为最终输出返回给用户
+- **结果汇总**：通过 `SchedulerGroup.report_done` 工具向用户汇报；该工具内部硬性校验 `task.SchedulerBatch` 全部到终态、自动附加 `task.Artifacts` 事实校对块
+- **直接执行简单查询**：拥有 worker 全部工具，简单的"读个文件"、"搜下代码"可以自己做，无需 publish 子任务
 ### 调度器何时直接回答，何时发布任务
-- **直接回答**：用户的问题属于系统状态查询（读公告板即可）、调度器自身 LLM 能力范围内的常识性问答、或闲聊与意图澄清
-- **发布任务**：需要调用调度器不具备的工具、信息量超出单次 LLM 调用能处理的范围、或涉及多个独立子问题适合并行调查
+- **直接回答**：用户的问题属于系统状态查询、闲聊、意图澄清；或者只需 1-2 次 read_file/grep_search/web_search 就能解决的简单查询
+- **发布任务**：信息量超出单次 LLM 调用能处理的范围、或涉及多个独立子问题适合并行调查、或需要持续多步骤的写文件 / 跑命令任务
 ### 调度器不负责什么
-- 不负责执行具体任务——交给执行代理
+- 不负责长任务的具体执行——通常交给执行代理（Worker），保留自己的上下文容量给规划决策
 - 不负责异常检测与任务回收——交给看门狗
 - 不负责维护全局任务图——任务之间仅通过依赖字段表达先后关系，无全局 DAG
 
@@ -440,7 +442,7 @@ Scheduler 在最初的设计里是一个**独立写的事件驱动 ReAct 循环*
 - 前置任务 failed 或 cancelled 时，看门狗巡检发现后连锁取消依赖它的后继任务
 - 不做环检测——由调度器在发布任务时自行保证不产生循环依赖，这是调度器作为 LLM 代理的责任
 ## 工作模式
-系统支持两种工作模式，默认启动时为即时模式，用户可在终端中通过 `Shift+Tab` 组合键切换模式。
+系统支持两种工作模式，默认启动时为即时模式。CLI 通过 `/mode` 命令切换（**Phase 3 改动**：旧设计提到的 `Shift+Tab` 快捷键未实现，实际是 `/mode` slash command；切换通过 `Bundle.Mode` (`*scheduler.ModeStore`)，scheduler agent 在每次 reactLoop 注入 board snapshot 时实时读取最新 mode）。
 ### 即时模式（默认）
 - 调度器不预先规划完整的任务链，而是作为**"下一步决策者"**被反复唤醒
 - 每次唤醒时，调度器只读取公告板的当前状态，然后决定生成 0 个或多个**立即可执行**的下一步任务
@@ -454,44 +456,44 @@ Scheduler 在最初的设计里是一个**独立写的事件驱动 ReAct 循环*
 - 适用于大规模重构、多文件联动修改等需要全局视角的复杂任务
 ### 模式切换
 - 系统启动时默认进入即时模式
-- 用户在终端按 `Shift+Tab` 切换模式，切换后终端打印当前模式提示
-- 模式切换仅影响调度器的规划策略，不影响公告板、花名册、看门狗等基础设施的行为
-- 切换模式时，已发布的任务不受影响，继续按原模式执行
+- 用户在 CLI 输入 `/mode` 切换模式，切换后终端打印当前模式提示
+- 模式切换仅影响调度器的规划策略（通过 system prompt 表达），不影响公告板、花名册、看门狗等基础设施的行为
+- 切换模式时，scheduler 当前正在 reactLoop 内的决策不受影响（mode 字段在下次 board snapshot 注入时生效）；已发布的子任务也不受影响
 ## 与 DAG 的区别
 - 无全局拓扑排序，无建图开销
 - 依赖关系可以随任务动态追加，不需要预先确定
 - 代价是失去了全局死锁检测能力，依赖看门狗的超时机制兜底
 
 # 事件驱动
-系统以事件驱动为主、轮询兜底为辅的方式运作。
+系统以事件驱动为主、poll 兜底为辅的方式运作。**Phase 3 重构后**，事件 → scheduler 的路径由 `Activator` 桥承担，scheduler agent 本身是 poll-based。
 ## 事件类型
 - **任务状态变更**：任务从一个状态转换到另一个状态时触发（如 processing→completed、processing→failed）
 - **用户输入**：用户通过命令行或控制面板提交新请求
 - **看门狗告警**：看门狗巡检发现异常（超时、前置失败等）
-## 事件如何驱动调度器
-- 公告板在执行原子操作（状态转换、提交结果等）时，向调度器的 channel 发送事件信号
-- 调度器通过 Go select 监听事件 channel，收到信号后唤醒，读取公告板当前状态，执行一轮增量规划
-- 轮询兜底：调度器同时监听一个定时 ticker，即使事件通知丢失，也能在固定间隔后被唤醒检查公告板
+## 事件如何驱动调度器（Phase 3 新架构）
+事件 channel 由 `scheduler.Activator` goroutine 消费，转换为对 store / scheduler agent 的副作用：
+- **`EventUserInput`** → `Activator` 调 `store.PublishTask({EventType: "__scheduler__", Description: 用户文本})`，scheduler agent 在下次 poll（默认 1 秒间隔）认领该任务
+- **`EventTaskCompleted` / `Failed` / `Cancelled` / `WatchdogAlert`** → `Activator` 向 `BatchUpdateCh`（容量 1，select default 防阻塞）发送一个信号；任何正在 `SchedulerExecutor.waitForBatchTerminal` 中阻塞等待 batch 完成的 scheduler 实例会被唤醒重新检查
+- **其他事件类型**（如 `EventTaskRetry`、`EventTickerWakeup`）：Activator 忽略
 ### 事件与调度器决策映射
-- **任务 completed**：检查是否有后继任务需要发布；若当前阶段任务全部完成，进入下一阶段规划
-- **任务 failed（不可恢复）**：判断是否影响整体目标，决定取消后继任务、发布替代任务、或向用户报告失败
-- **任务 cancelled**：与 failed 类似，检查连锁影响，决定后继任务的处置
-- **任务 processing→pending（重试回退）**：无需动作，任务会被代理重新认领
-- **用户新输入**：解析用户意图，发布第一批任务
-- **看门狗告警**：根据告警类型决策——超时任务可能需要重新拆分，无人认领任务可能需要降低难度或换一种描述重新发布
-- **ticker 兜底唤醒**：扫描公告板全局状态，处理可能遗漏的事件
-### 调度器 ReAct 循环
-调度器被事件唤醒后，不是执行单次决策就休眠，而是进入一个多轮 ReAct 循环，直到没有新动作可做才退出循环进入等待：
-1. **观察**：读取公告板当前全局状态（所有任务的状态、结果、依赖关系、历史记录）
-2. **思考**：调度器 LLM 根据观察到的状态进行推理——是否有任务完成需要进入下一阶段？是否有失败需要处置？是否需要发布调查任务验证历史结论？
-3. **行动**：根据推理结果执行操作——发布新任务、取消后继任务、向用户返回结果、或不做任何操作
-4. **循环判定**：行动完成后，回到第 1 步重新观察公告板状态。如果第 3 步产生了新的公告板变更（如发布了新任务），则继续循环；如果第 3 步判定无需任何操作，则退出循环，进入休眠等待下一个事件
-- 设置单次唤醒的最大循环次数上限，防止调度器陷入无限循环
-- 每轮循环都是一次完整的 LLM 调用，因此循环次数直接影响成本，需要在决策质量和开销之间权衡
+事件 → Activator → store/Channel 之后，scheduler agent 读到的是 `BuildBoardJSON` 注入的全局任务板快照（含所有 task 状态、Artifacts、依赖、resources），LLM 据此做决策：
+- **任务 completed/failed/cancelled**：通过 board snapshot 看到，结合 SchedulerBatch 决定是否进入下一阶段
+- **用户新输入**：scheduler task 的 `Description` 字段就是用户文本
+- **看门狗告警**：board snapshot 显示该 task 状态变更（通常进入 failed），scheduler 据此决策
+### 调度器 ReAct 循环（Phase 3 新架构）
+scheduler agent 与 worker / explorer 共享同一套 `agent.Agent.processTask` 实现，区别仅在于 `TaskExecutor` 是 `SchedulerExecutor`（包装 `NewLLMExecutor`）：
+1. **认领**：`agent.Agent.Run` poll 到 `__scheduler__` 任务，`ClaimTask` + `processTask`
+2. **等待 batch**：`SchedulerExecutor.Execute` 进入前先 `waitForBatchTerminal`——如果 `task.SchedulerBatch` 中还有非终态任务，select 在 `BatchUpdateCh` / 30s 兜底 / `ctx.Done()` 之间循环等待
+3. **观察**：调用 `BuildBoardJSON` 生成全局任务板快照，注入到 history 末尾（`IncomingMail` 类型，与 mailbox 注入对称）
+4. **思考**：调底层 `NewLLMExecutor` 实际调用 LLM
+5. **行动**：LLM 调用 `publish_task`（追加到 `task.SchedulerBatch`）/ `cancel_task` / `report_done`（清空 batch + 打印事实校对块）/ `send_message` / `read_file` / `grep_search` / 等等
+6. **循环**：LLM 还有 tool call 则下一轮 reactLoop（`agent.Agent.processTask` 内部 for 循环）；LLM 给文本响应（无 tool call）则任务完成
+- `cfg.SchedulerMaxLoops` 控制单次 reactLoop 上限
 ## 实现机制
 - 使用 Go channel 作为事件通道，公告板写操作完成后向 channel 发送事件
-- 调度器 goroutine 以 select 同时监听事件 channel 和定时 ticker
-- 事件 channel 应设置合理的缓冲区大小，防止公告板写操作因 channel 满而阻塞
+- `scheduler.Activator` goroutine 以 select 监听事件 channel，转换为 store/BatchUpdateCh 副作用
+- scheduler agent 是普通 poll-based agent，不直接读 eventCh
+- 事件 channel 应设置合理的缓冲区大小（默认 64），防止公告板写操作因 channel 满而阻塞
 
 # 子代理交互
 执行代理之间的协调通过三个共享状态组件中介：**公告板**负责任务级协调，**花名册**负责文件级资源协调，**邮箱**负责异步消息传递（点对点 + 广播）。代理之间不需要知道对方的存在，也不需要直接连接，天然解耦。
@@ -536,26 +538,24 @@ Scheduler 在最初的设计里是一个**独立写的事件驱动 ReAct 循环*
 
 ### 组件
 - **`mailbox.Registry`**：所有代理信箱的注册中心。每个代理通过 `Register(agentID, eventType, aliases...)` 申请信箱，可注册别名（如 `"scheduler"`、`"explorer-1"`）。
-- **`mailbox.Mailbox`**：单个代理的收件箱，内部是带缓冲的 Go channel（容量 = `cfg.MailboxBufferSize`）。
-- **`mailbox.MailNotifier`**：独立 goroutine，定期扫描非空信箱，为有未读邮件的空闲代理发布"唤醒任务"。**当前默认禁用**（`cfg.MailNotifierEnabled=false`），因存在邮件级联爆炸 P0 缺陷。
+- **`mailbox.Mailbox`**：单个代理的收件箱，内部是带缓冲的 Go channel（容量 = `cfg.MailboxBufferSize`）+ 容量 16 的 ring buffer（Phase 2 引入，用于 hook 系统的 peek-without-consume）。
+- **`mailbox.MailNotifier`**：独立 goroutine，定期扫描非空信箱，为有未读邮件的空闲代理发布"唤醒任务"。**默认启用**（`cfg.MailNotifierEnabled=true`，2026-04-09 Phase 2 完成后恢复）。Phase 2 的 `ChainDepthLimitHook` (max=3) + `PerAgentDedupHook` + `WakeContextExpandHook` 三层防御彻底关闭了邮件级联爆炸 P0。
 
 ### 消息结构（`mailbox.Message`）
 - `From` / `To` / `Content` / `Summary` / `SentAt`
 - `Type`：`info` / `question` / `reply` / `steer` / `ack`
 - `Priority`：`low` / `normal` / `high`
+- `ChainDepth`：邮件链跳数（Phase 2 引入），由 `MetaGroup.sendMessage` 自动写入 `parent.MailChainDepth + 1`，超过 `cfg.MailChainMaxDepth`（默认 3）时被 `ChainDepthLimitHook` 在 `BeforeSend` 阶段拒绝
 
 `DrainWithAck` 在代理消费消息时自动向发送方回送 `type=ack` 已读回执。
 
 ### 工具与代理集成
-- `send_message` 工具注册在 worker / explorer / scheduler 三类代理上，支持 `to=<agentID>` 点对点或 `to=*` 广播（自动跳过自己）。
-- 代理任务开始时，`buildMessages` 从 `Registry` 拉取 `TeamSnapshot`，把队友 ID + 忙碌/空闲状态 + 当前任务摘要注入为首条 `<team-snapshot>` 系统消息，让 LLM 知道"此刻谁在做什么"。
+- `send_message` 工具注册在 worker / explorer / scheduler 三类代理上（**Phase 3 后**：scheduler 也通过共享的 `MetaGroup.sendMessage` 注册，消除了之前的双写实现），支持 `to=<agentID>` 点对点或 `to=*` 广播（自动跳过自己）。
+- 代理任务开始时，从 `Registry` 拉取 `TeamSnapshot`，把队友 ID + 忙碌/空闲状态 + 当前任务摘要注入为首条 `<team-snapshot>` 系统消息，让 LLM 知道"此刻谁在做什么"。
 - 邮件以 `<agent-mail type=... priority=...>` XML 子标签形式注入 LLM 上下文，prompt 引导代理根据 type 做差异化响应。
 
-### Scheduler 自驱 drain
-Scheduler 不依赖 MailNotifier。它有自己的 ticker（`scheduler_ticker_sec`），每次唤醒时主动 drain 自己的信箱，因此 `/steer` 投到 scheduler 始终生效，与 MailNotifier 是否启用无关。
-
-### 当前禁用状态（2026-04-09）
-`config.MailNotifierEnabled` 默认 `false`。bootstrap 不启动 `MailNotifier.Run` goroutine。**保留能力**：mailbox 投递、`send_message` 工具、scheduler 自驱 drain、ack 回执。**唯一退化**：空闲 worker/explorer 不会被自动叫起来读邮件 — 邮件仅在 agent 因 scheduler 派发别的任务而恰好运行时被被动 drain。恢复条件见 `KNOWN_ISSUES.md` 邮件级联爆炸条目。
+### Scheduler 接收邮件
+Scheduler agent (Phase 3 后) 与 worker / explorer 共享同一套 `Mailbox.DrainWithAck` 机制——`agent.Agent.processTask` 在每轮 reactLoop 开始时自动 drain 收件箱，把消息以 `IncomingMail` history entry 形式注入 LLM 上下文。`/steer` 命令投递的用户消息以及其他代理通过 `to="scheduler"` 别名发来的消息都走这条路径。
 
 ## 产物契约与失败汇报
 2026-04-08 落地的硬约束机制，用于解决 worker 凭空捏造任务结果 / 任务无文件产出两个 P0 缺陷。
@@ -587,27 +587,29 @@ Scheduler 不依赖 MailNotifier。它有自己的 ticker（`scheduler_ticker_se
 1. **加载配置**：`config.LoadConfig`，YAML/JSON 自动判别，文件不存在时回退默认值。打印：`[启动] 全局配置加载完成`
 2. **初始化 Trace 系统**：`trace.NewWriter(.agentgo/traces, 100)` + 可选 `PromptDumper`（`AGENTGO_DUMP_PROMPTS=1` 启用）。失败仅 warning，不中断主流程。打印：`[启动] Trace 系统已启动` 或 warning
 3. **初始化公告板**：`store.NewMemoryTaskStore` + `store.NewTaskCancelRegistry`，把 cancelRegistry 注入 store（terminal 状态转换时自动取消正在执行的代理）。打印：`[启动] 公告板初始化完成`
-4. **初始化花名册**：`roster.NewMemoryRoster`。打印：`[启动] 花名册初始化完成`
-5. **初始化邮箱注册表**：`mailbox.NewRegistry(cfg.MailboxBufferSize)`。打印：`[启动] 邮箱注册表初始化完成`
-6. **创建 LLM 客户端**：scheduler / explorer / worker × N 各自创建 `llm.NewSDKClient`（OpenAI 兼容 SDK）
-7. **创建调度器**：`scheduler.New(store, llm, eventCh, cfg, mbRegistry)`
-8. **创建看门狗**：`watchdog.New(store, cfg, eventCh, roster)`
-9. **创建调查代理**：`explorer.New(store, roster, llm, cfg, cancelRegistry, mbRegistry, searchProvider)`
-10. **创建命令审批通道**：`approvalCh := make(chan shell.ApprovalRequest, 8)`，Worker→CLI 通道
-11. **创建执行代理**：`worker.NewWithID("worker-N", ...)` × `cfg.WorkerCount`，每个 worker 持有独立 LLM client
-12. **创建邮差通知器**：`mailbox.NewMailNotifier(...)` 对象（**不立即启动**）
+4. **初始化 Tool Hook 系统**：`hook.NewToolHookRegistry()` + 注册 4 个内置 hook（record-artifact / path-boundary / validate-expected-hash / require-read-before-write）。打印：`[启动] Hook 系统初始化完成（已注册：...）`
+5. **初始化花名册**：`roster.NewMemoryRoster`。打印：`[启动] 花名册初始化完成`
+6. **初始化邮箱注册表**：`mailbox.NewRegistry(cfg.MailboxBufferSize)`。打印：`[启动] 邮箱注册表初始化完成`
+7. **初始化 Mailbox Hook 系统**：`hook.NewMailboxHookRegistry()` + 注册 3 个内置 hook（chain-depth-limit / per-agent-dedup / wake-context-expand）+ `mbRegistry.AttachHookRunner(hook.AsMailboxRunner(mailboxHookReg))`。打印：`[启动] Mailbox Hook 系统初始化完成（已注册：...）`
+8. **创建 LLM 客户端**：scheduler / explorer / worker × N 各自创建 `llm.NewSDKClient`（OpenAI 兼容 SDK）
+9. **创建看门狗**：`watchdog.New(store, cfg, eventCh, roster)`
+10. **创建调查代理**：`explorer.New(store, roster, llm, cfg, cancelRegistry, mbRegistry, hookReg, storeView, recordToolCall, searchProvider)`
+11. **创建命令审批通道**：`approvalCh := make(chan shell.ApprovalRequest, 8)`，Worker→CLI 通道
+12. **创建调度器**（Phase 3 重构）：`scheduler.New(store, roster, schedulerLLM, eventCh, cfg, cancelRegistry, mbRegistry, approvalCh, hookReg, storeView, recordToolCall)` 返回 `*scheduler.Bundle{Agent, Activator, Mode}`。**注意**：scheduler 现在需要 roster + approvalCh + hook 三件套，与 worker 一致；构造在 explorer / worker 之后，因为它依赖 approvalCh
+13. **创建执行代理**：`worker.NewWithID("worker-N", ...)` × `cfg.WorkerCount`，每个 worker 持有独立 LLM client
+14. **创建邮差通知器**：`mailbox.NewMailNotifier(...)` 对象
 
 ## Start 阶段（拉起 goroutine）
-- **Step 5**：`Scheduler.Run(ctx)` — 事件驱动 + ticker 兜底，消费 eventCh。打印：`[启动] 调度器已启动`
-- **Step 6**：`runWatchdogWithRecover(ctx)` — for 循环 + recover，panic 后 1 秒延迟重启。打印：`[启动] 看门狗已启动`
-- **Step 6.5**：**条件启动** `MailNotifier.Run(ctx)`：仅当 `cfg.MailNotifierEnabled=true` 时启动 goroutine。默认 `false`（防止邮件级联爆炸）。禁用时打印：`[启动] 邮差通知器已禁用 (mail_notifier_enabled=false) — 邮件不会自动唤醒空闲代理`
-- **Step 7**：`Explorer.Run(ctx)`。打印：`[启动] 调查代理已启动`
-- **Step 8**：`Worker[1..N].Run(ctx)` × `cfg.WorkerCount` 并行 goroutine。打印：`[启动] 执行代理已启动 (N 个)`
+- **Scheduler 双 goroutine**（Phase 3）：先启 `Scheduler.Activator.Run(ctx)`（事件桥），再启 `Scheduler.Agent.Run(ctx)`（poll-based agent）。Activator 必须先就绪，否则 `EventUserInput` 在 Agent 未启动时到达可能丢失。打印：`[启动] 调度器已启动 (agent + activator)`
+- **看门狗**：`runWatchdogWithRecover(ctx)` — for 循环 + recover，panic 后 1 秒延迟重启。打印：`[启动] 看门狗已启动`
+- **邮差通知器**：`MailNotifier.Run(ctx)`，仅当 `cfg.MailNotifierEnabled=true` 时启动（**默认启用**）。打印：`[启动] 邮差通知器已启动`
+- **调查代理**：`Explorer.Run(ctx)`。打印：`[启动] 调查代理已启动`
+- **执行代理**：`Worker[1..N].Run(ctx)` × `cfg.WorkerCount` 并行 goroutine。打印：`[启动] 执行代理已启动 (N 个)`
 - 最后打印：`[启动] 系统就绪，等待用户输入`
 
 ## RunCLI 阶段
 - `cli.New(...).Run(ctx)` 阻塞主线程，处理用户输入与命令（`/quit` `/mode` `/status` `/cancel` `/help` `/steer`）
-- 用户输入以 `mailbox.Message` 形式投递到 scheduler 信箱，scheduler 自驱 drain 消费
+- 用户输入由 CLI 通过 `eventCh` 发送 `EventUserInput`，`scheduler.Activator` 翻译为 `EventType="__scheduler__"` 任务，scheduler agent 在下次 poll 时认领并 reactLoop（详见 §"Scheduler 一等代理重构"）
 
 ## 启动顺序约束
 - 公告板和花名册是基础设施，必须先于所有代理初始化
@@ -633,10 +635,10 @@ Scheduler 不依赖 MailNotifier。它有自己的 ticker（`scheduler_ticker_se
 | agent_idle_threshold | agent 连续空轮询次数达到阈值后退出 goroutine（0 = 禁用） | 0 |
 | compact_token_threshold | Layer 2 历史压缩触发阈值（prompt tokens） | 80000 |
 | compact_keep_recent | 历史压缩时保留最近 N 条消息 | 3 |
-| max_subtask_depth | `publish_subtask` 工具允许的最大子任务深度 | 1 |
+| max_subtask_depth | worker 通过 `publish_task` 发布的子任务允许的最大深度（scheduler 模式无此限制） | 1 |
 | **调度器** | | |
-| scheduler_ticker_sec | 调度器轮询兜底唤醒间隔（秒） | 10 |
-| scheduler_max_loops | 调度器单次唤醒的 ReAct 最大循环次数 | 10 |
+| scheduler_ticker_sec | _（Phase 3 后已不使用，仅保留向后兼容）_ 旧 scheduler 事件循环 ticker 兜底间隔 | 10 |
+| scheduler_max_loops | scheduler agent 单次 `processTask` 内 ReAct 循环次数上限（与 `agent_max_loops` 平行） | 10 |
 | **看门狗** | | |
 | watchdog_interval_sec | 看门狗巡检间隔（秒） | 30 |
 | **LLM 后端** | | |
@@ -652,7 +654,8 @@ Scheduler 不依赖 MailNotifier。它有自己的 ticker（`scheduler_ticker_se
 | **邮箱与代理通讯** | | |
 | mailbox_buffer_size | 单个代理信箱的 channel 缓冲容量 | 32 |
 | mail_notifier_interval_sec | 邮差扫描间隔（秒） | 5 |
-| **mail_notifier_enabled** | **邮差是否启动**（默认禁用，防邮件级联爆炸） | **false** |
+| mail_notifier_enabled | 邮差是否启动（Phase 2 完成后默认启用，cascade P0 已被 hook 系统关闭） | true |
+| mail_chain_max_depth | 邮件链跳数上限（Phase 2 引入）。`MetaGroup.sendMessage` 写入 `parent.MailChainDepth+1`，超过此阈值的邮件被 `ChainDepthLimitHook` 在 BeforeSend 拒绝 | 3 |
 | **Web 检索** | | |
 | search_api_provider | 搜索 provider 名称 | duckduckgo_html |
 | search_api_url | 搜索 API URL（如 provider 需要） | （无） |
