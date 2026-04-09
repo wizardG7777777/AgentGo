@@ -153,6 +153,49 @@ func TestRegistry_AllIDs(t *testing.T) {
 	}
 }
 
+func TestRegistry_ScanAll_IncludesEmptyMailboxes(t *testing.T) {
+	reg := NewRegistry(4)
+	reg.Register("worker-1", "")
+	mb2 := reg.Register("worker-2", "")
+	reg.Register("explorer-1", "explore")
+	reg.Register("scheduler-1", "__scheduler__")
+
+	// 只有 worker-2 有消息；其他三个邮箱为空
+	mb2.TrySend(Message{From: "x", Content: "hi"})
+
+	result := reg.ScanAll()
+	if len(result) != 4 {
+		t.Fatalf("ScanAll 期望返回全部 4 个邮箱（含空），实际: %d", len(result))
+	}
+
+	// 转 map 便于断言
+	byID := make(map[string]MailboxStatus, len(result))
+	for _, st := range result {
+		byID[st.AgentID] = st
+	}
+
+	if byID["worker-2"].Count != 1 {
+		t.Errorf("worker-2 期望 Count=1，实际: %d", byID["worker-2"].Count)
+	}
+	if byID["worker-1"].Count != 0 {
+		t.Errorf("worker-1 期望 Count=0，实际: %d", byID["worker-1"].Count)
+	}
+	if byID["explorer-1"].EventType != "explore" {
+		t.Errorf("explorer-1 期望 EventType=explore，实际: %q", byID["explorer-1"].EventType)
+	}
+	if byID["scheduler-1"].EventType != "__scheduler__" {
+		t.Errorf("scheduler-1 期望 EventType=__scheduler__，实际: %q", byID["scheduler-1"].EventType)
+	}
+}
+
+func TestRegistry_ScanAll_EmptyRegistry(t *testing.T) {
+	reg := NewRegistry(4)
+	result := reg.ScanAll()
+	if len(result) != 0 {
+		t.Fatalf("空注册表 ScanAll 期望 0，实际: %d", len(result))
+	}
+}
+
 func TestScanNonEmpty(t *testing.T) {
 	reg := NewRegistry(4)
 	reg.Register("worker-1", "")

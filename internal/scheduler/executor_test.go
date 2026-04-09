@@ -337,6 +337,153 @@ func TestSchedulerExecutor_BatchAllTerminalSkipsWait(t *testing.T) {
 	}
 }
 
+// ---- DoneChecker 短路（修复"幻觉心跳循环"）----
+
+// fakeDoneChecker 是单测用的最小 SchedulerDoneChecker。
+type fakeDoneChecker struct {
+	done bool
+}
+
+func (f *fakeDoneChecker) IsDone() bool { return f.done }
+
+func TestSchedulerExecutor_DoneChecker_ShortCircuitsExecute(t *testing.T) {
+	ch := make(chan model.Event, 64)
+	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
+	cfg := &config.Config{WorkerCount: 1}
+
+	schedTask := &model.Task{Description: "sched", EventType: "__scheduler__"}
+	s.PublishTask(schedTask)
+	s.ClaimTask("scheduler-1", schedTask.ID)
+
+	var calls int32
+	var capturedHistory []agent.HistoryEntry
+	checker := &fakeDoneChecker{done: true} // 已经 report_done
+
+	exec := &SchedulerExecutor{
+		Inner:         makeInnerExecutor(&calls, &capturedHistory),
+		Store:         s,
+		Cfg:           cfg,
+		BatchUpdateCh: make(chan struct{}),
+		WaitTimeout:   100 * time.Millisecond,
+		DoneChecker:   checker,
+	}
+
+	result, err := exec.Execute(context.Background(), schedTask, nil, nil)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	// 关键断言：Inner 不应被调用（短路了）
+	if atomic.LoadInt32(&calls) != 0 {
+		t.Errorf("Inner should NOT be called when DoneChecker.IsDone()=true, got %d calls", calls)
+	}
+
+	// 短路返回必须 ToolCalled=false，让 agent.Run 走"任务完成"路径
+	if result.ToolCalled {
+		t.Errorf("ToolCalled should be false when short-circuited, got true")
+	}
+}
+
+func TestSchedulerExecutor_DoneChecker_NotDone_NormalExecution(t *testing.T) {
+	ch := make(chan model.Event, 64)
+	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
+	cfg := &config.Config{WorkerCount: 1}
+
+	schedTask := &model.Task{Description: "sched", EventType: "__scheduler__"}
+	s.PublishTask(schedTask)
+	s.ClaimTask("scheduler-1", schedTask.ID)
+
+	var calls int32
+	var capturedHistory []agent.HistoryEntry
+	checker := &fakeDoneChecker{done: false} // 未 report_done
+
+	exec := &SchedulerExecutor{
+		Inner:         makeInnerExecutor(&calls, &capturedHistory),
+		Store:         s,
+		Cfg:           cfg,
+		BatchUpdateCh: make(chan struct{}),
+		WaitTimeout:   100 * time.Millisecond,
+		DoneChecker:   checker,
+	}
+
+	_, err := exec.Execute(context.Background(), schedTask, nil, nil)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	// IsDone()=false 时 Inner 应当正常被调用一次
+	if atomic.LoadInt32(&calls) != 1 {
+		t.Errorf("Inner should be called once when not done, got %d", calls)
+	}
+}
+
+func TestSchedulerExecutor_DoneChecker_NilNoEffect(t *testing.T) {
+	ch := make(chan model.Event, 64)
+	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
+	cfg := &config.Config{WorkerCount: 1}
+
+	schedTask := &model.Task{Description: "sched", EventType: "__scheduler__"}
+	s.PublishTask(schedTask)
+	s.ClaimTask("scheduler-1", schedTask.ID)
+
+	var calls int32
+	var capturedHistory []agent.HistoryEntry
+	exec := &SchedulerExecutor{
+		Inner:         makeInnerExecutor(&calls, &capturedHistory),
+		Store:         s,
+		Cfg:           cfg,
+		BatchUpdateCh: make(chan struct{}),
+		WaitTimeout:   100 * time.Millisecond,
+		// DoneChecker: nil
+	}
+
+	_, err := exec.Execute(context.Background(), schedTask, nil, nil)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	// nil DoneChecker 不应影响正常执行
+	if atomic.LoadInt32(&calls) != 1 {
+		t.Errorf("Inner should be called once with nil DoneChecker, got %d", calls)
+	}
+}
+
+// ---- currentSchedulerTaskHolder 的 done 标志 ----
+
+func TestCurrentSchedulerTaskHolder_DoneFlagLifecycle(t *testing.T) {
+	h := &currentSchedulerTaskHolder{}
+
+	// 新建：done=false
+	if h.IsDone() {
+		t.Error("new holder should have done=false")
+	}
+
+	// 设置 task ID 不影响 done
+	h.Set("task-1")
+	if h.IsDone() {
+		t.Error("Set should not change done flag when transitioning from new")
+	}
+
+	// MarkSchedulerDone 后 IsDone=true
+	h.MarkSchedulerDone()
+	if !h.IsDone() {
+		t.Error("MarkSchedulerDone should make IsDone return true")
+	}
+
+	// Set 新任务时清空 done
+	h.Set("task-2")
+	if h.IsDone() {
+		t.Error("Set with new task ID should clear done flag")
+	}
+
+	// Set("") 也清空（OnTaskEnd 路径）
+	h.MarkSchedulerDone()
+	h.Set("")
+	if h.IsDone() {
+		t.Error("Set with empty ID should clear done flag")
+	}
+}
+
 // ---- filterNonTerminalChildren ----
 
 func TestFilterNonTerminalChildren(t *testing.T) {

@@ -7,7 +7,9 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
+	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
+	"agentgo/internal/roster"
 	"agentgo/internal/store"
 )
 
@@ -56,6 +58,41 @@ type SchedulerExecutor struct {
 	// 非 nil 时优先于 Mode 字段；让 CLI 在运行期通过 /mode 命令切换 mode 后，
 	// 下一次 reactLoop 注入 board snapshot 时立即生效。
 	ModeStore *ModeStore
+
+	// MBRegistry（可选）：scheduler agent 与所有 worker/explorer 共享的邮箱注册表。
+	// 用于 BuildBoardJSON 在 board snapshot 中生成 Resources.Agents 段
+	// （展示每个活跃代理的 mailbox 待处理数 + 当前认领任务）。
+	// nil 时 board snapshot 不输出 agents 字段。
+	MBRegistry *mailbox.Registry
+
+	// Roster（可选）：花名册，用于在 agents 段附加每个代理当前持有的文件 claim。
+	// nil 时 agents 段不会出现 LockedFiles 字段。
+	Roster roster.Roster
+
+	// History（可选）：本会话用户输入历史，由 Activator 写入。
+	// SchedulerExecutor 在每次 Execute 注入 board snapshot 时取最近 N 条
+	// 作为 LLM 的"对话历史"上下文。nil 时不输出 SessionHistory 字段。
+	History *SessionHistory
+
+	// DoneChecker（可选）：如果非 nil，每轮 Execute 入口会先调 IsDone()，
+	// 返回 true 时短路返回 ToolCalled=false，让 agent.Run 的 reactLoop
+	// 走"任务完成"路径终止当前 scheduler task。
+	//
+	// 这是修复"report_done 后 reactLoop 不终止 → LLM 幻觉心跳"的关键：
+	// SchedulerGroup.reportDone 在工具执行成功时通过 SchedulerDoneNotifier
+	// 设置 done=true，下一轮 reactLoop 进入 Execute 时立即被这里拦截。
+	//
+	// nil 时跳过检查（向后兼容旧测试 + 不需要终止信号的场景）。
+	DoneChecker SchedulerDoneChecker
+}
+
+// SchedulerDoneChecker 是 SchedulerExecutor 用来查询"当前任务是否已经
+// report_done"的最小接口。由 scheduler 包的 currentSchedulerTaskHolder 实现。
+//
+// 与 tools.SchedulerDoneNotifier 是同一个 holder 的两个面 ——
+// notifier 写入、checker 读取。Phase 3.1 引入。
+type SchedulerDoneChecker interface {
+	IsDone() bool
 }
 
 // Execute 实现 agent.TaskExecutor 接口。
@@ -65,6 +102,18 @@ func (e *SchedulerExecutor) Execute(
 	depResults map[string]string,
 	history []agent.HistoryEntry,
 ) (agent.ExecuteResult, error) {
+	// 0. 短路检查：如果上一轮 reactLoop 已经调过 report_done，立即返回
+	//    ToolCalled=false 让 agent.Run 走"任务完成"路径终止当前 task。
+	//    这是修复"幻觉心跳无限循环"的关键 —— 没有这一步，agent reactLoop 会
+	//    因为 report_done 是 tool call 而继续迭代，让 LLM 不停生成新的 report_done。
+	if e.DoneChecker != nil && e.DoneChecker.IsDone() {
+		log.Printf("[scheduler-exec] DoneChecker.IsDone()=true，短路终止 reactLoop (task=%s)", task.ID)
+		return agent.ExecuteResult{
+			Output:     "scheduler task 已通过 report_done 完成",
+			ToolCalled: false,
+		}, nil
+	}
+
 	// 1. 等待 batch 中所有任务到达终态（completed/failed/cancelled）
 	if err := e.waitForBatchTerminal(ctx, task.ID); err != nil {
 		return agent.ExecuteResult{}, err
@@ -81,7 +130,11 @@ func (e *SchedulerExecutor) Execute(
 	// 构造一个简单的 trigger 事件——SchedulerExecutor 不知道具体触发原因，
 	// 用通用的 ticker_wakeup 类型，让 LLM 知道这是一次"重新观察板子"
 	trigger := model.Event{Type: model.EventTickerWakeup}
-	snapshot := BuildBoardJSON(e.Store, e.Cfg, mode, trigger)
+	snapshot := BuildBoardJSON(e.Store, e.Cfg, mode, trigger, SnapshotSources{
+		MBRegistry: e.MBRegistry,
+		Roster:     e.Roster,
+		History:    e.History,
+	})
 
 	// 注入为 IncomingMail 风格的 history entry，与 mailbox 注入对称
 	historyWithSnap := make([]agent.HistoryEntry, 0, len(history)+1)

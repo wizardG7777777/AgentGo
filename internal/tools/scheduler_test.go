@@ -185,6 +185,93 @@ func TestSchedulerGroup_ReportDone_NoHolderError(t *testing.T) {
 	}
 }
 
+// fakeDoneNotifier 是单测用的 SchedulerDoneNotifier 实现，记录 MarkSchedulerDone
+// 是否被调用过，让测试断言 reportDone 真的触发了"终止 reactLoop"信号。
+type fakeDoneNotifier struct {
+	marked bool
+}
+
+func (f *fakeDoneNotifier) MarkSchedulerDone() { f.marked = true }
+
+func TestSchedulerGroup_ReportDone_NotifiesDoneOnSuccess(t *testing.T) {
+	s := newSchedTestStore()
+	schedTask := &model.Task{Description: "user request"}
+	s.PublishTask(schedTask)
+	// 一个 completed 子任务，让 report_done 通过硬拦截
+	child := &model.Task{ID: "c1", Status: model.TaskStatusCompleted}
+	s.tasks["c1"] = child
+	s.AppendSchedulerBatch(schedTask.ID, "c1")
+
+	notifier := &fakeDoneNotifier{}
+	g := SchedulerGroup{
+		Store:        s,
+		Holder:       &fakeHolder{id: schedTask.ID},
+		DoneNotifier: notifier,
+	}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("report_done", map[string]any{
+		"summary": "done",
+	}))
+	if err != nil {
+		t.Fatalf("report_done: %v", err)
+	}
+
+	if !notifier.marked {
+		t.Error("DoneNotifier.MarkSchedulerDone should be called after successful report_done")
+	}
+}
+
+func TestSchedulerGroup_ReportDone_DoesNotNotifyOnRejection(t *testing.T) {
+	s := newSchedTestStore()
+	schedTask := &model.Task{Description: "user request"}
+	s.PublishTask(schedTask)
+	// 一个 pending 子任务 → report_done 应当被硬拦截
+	child := &model.Task{ID: "c1", Status: model.TaskStatusPending}
+	s.tasks["c1"] = child
+	s.AppendSchedulerBatch(schedTask.ID, "c1")
+
+	notifier := &fakeDoneNotifier{}
+	g := SchedulerGroup{
+		Store:        s,
+		Holder:       &fakeHolder{id: schedTask.ID},
+		DoneNotifier: notifier,
+	}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("report_done", map[string]any{
+		"summary": "premature",
+	}))
+	if err == nil {
+		t.Fatal("expected report_done to be rejected (batch has pending child)")
+	}
+
+	if notifier.marked {
+		t.Error("DoneNotifier.MarkSchedulerDone should NOT be called when report_done is rejected")
+	}
+}
+
+func TestSchedulerGroup_ReportDone_NilNotifierNoEffect(t *testing.T) {
+	s := newSchedTestStore()
+	schedTask := &model.Task{Description: "user request"}
+	s.PublishTask(schedTask)
+
+	// 不设置 DoneNotifier
+	g := SchedulerGroup{Store: s, Holder: &fakeHolder{id: schedTask.ID}}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	// 不应 panic
+	_, err := reg.Dispatch(context.Background(), mkCall("report_done", map[string]any{
+		"summary": "done",
+	}))
+	if err != nil {
+		t.Fatalf("report_done with nil notifier should not error: %v", err)
+	}
+}
+
 func TestSchedulerGroup_ReportDone_ClearsBatch(t *testing.T) {
 	s := newSchedTestStore()
 	schedTask := &model.Task{Description: "user request"}

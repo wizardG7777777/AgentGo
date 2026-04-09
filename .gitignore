@@ -48,3 +48,4 @@ settings.json
 setting.yaml
 .mcp.json
 .idea
+.claude/settings.local.json
