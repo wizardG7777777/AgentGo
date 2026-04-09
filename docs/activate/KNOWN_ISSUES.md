@@ -2,6 +2,25 @@
 
 本文档记录 MVP 阶段已知的设计缺陷和未实现的功能，供调试和后续迭代参考。
 
+## Hook System 阶段 1 完成（2026-04-09）
+
+详见 `docs/activate/hookSystem.md`。阶段 1 实施 8 个 commit 落地：
+
+- **C1** — `store.ToolCallRecord` + `AppendToolCall/QueryToolCalls`
+- **C2** — `internal/hook/` 包骨架（值传递 ToolHookContext + nil 安全 Registry，100% 单测覆盖）
+- **C3** — `StoreHookView` 只读接口（hook 不能写入历史，写入路径走独立闭包）
+- **C4** — `agent.NewLLMExecutor` 接入点（hookReg + storeView + recordToolCall 三参数，nil 时退化为 noop）
+- **C5** — `RecordArtifactHook`（迁移自 `LocalWriteGroup.recordArtifact`，删除 `Store/ProjectRoot` 字段；附带修复 normalizeArtifactPath 在 Windows 上的路径分隔符 bug）
+- **C6** — `PathBoundaryHook`（决策 A1：双重校验，工具内 `pathutil.ValidatePath` 仍保留作路径标准化）
+- **C7** — `ValidateExpectedHashHook`（决策 B1：接受微秒级 TOCTOU 窗口，hash 校验从 Roster 锁内移到 PreCall）
+- **C8** — `RequireReadBeforeWriteHook`（**新增**硬约束，阶段 1 内唯一非迁移 hook，验证整条 store→hook 查询链路）
+
+**V6 关键回归验证已通过**（2026-04-09）：注释 bootstrap 中所有 4 处 `Register(...)` 调用之后，全测试套行为字节级一致。这是阶段 1 可逆性的硬证明。
+
+阶段 2（Mailbox Hook）等阶段 1 退出验收完成后再启动。
+
+---
+
 ## ~~代理空闲回收未实现~~ （已修复，简化 MVP）
 
 Agent 结构体新增 `IdleThreshold` 字段，Run 方法中加入空闲计数器，连续空轮询（无任务、claim 失败、查询出错）达到阈值后自行退出。`IdleThreshold=0` 时禁用（向后兼容）。Config 新增 `agent_idle_threshold` 配置项。注意：架构要求的"系统代理数超过最低保留数量"条件未实现，留待后续迭代。

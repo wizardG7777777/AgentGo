@@ -92,6 +92,10 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 		_ = taskStore.AppendToolCall(taskID, rec)
 	}
 	// 注册具体 hook（按 commit 渐进式增加）
+	//
+	// V6 回归验证（2026-04-09 已验证）：注释掉以下所有 Register 调用之后，
+	// 整个测试套仍然全绿且行为字节级一致 — 这是阶段 1 可逆性的硬证明，
+	// 也是 hookSystem.md §10.2 退出条件中最关键的一项。
 	if err := hookReg.Register(builtin.NewRecordArtifactHook(storeView, cfg.ProjectRoot)); err != nil {
 		return nil, fmt.Errorf("注册 RecordArtifactHook 失败: %w", err)
 	}
