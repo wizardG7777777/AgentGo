@@ -95,7 +95,10 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	if err := hookReg.Register(builtin.NewRecordArtifactHook(storeView, cfg.ProjectRoot)); err != nil {
 		return nil, fmt.Errorf("注册 RecordArtifactHook 失败: %w", err)
 	}
-	fmt.Println("[启动] Hook 系统初始化完成（已注册：record-artifact）")
+	if err := hookReg.Register(builtin.NewPathBoundaryHook(cfg.ProjectRoot)); err != nil {
+		return nil, fmt.Errorf("注册 PathBoundaryHook 失败: %w", err)
+	}
+	fmt.Println("[启动] Hook 系统初始化完成（已注册：record-artifact, path-boundary）")
 
 	// Step 3: 初始化花名册
 	r := roster.NewMemoryRoster()
