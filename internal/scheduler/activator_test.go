@@ -15,7 +15,7 @@ func TestActivator_EventUserInput_PublishesSchedulerTask(t *testing.T) {
 	ch := make(chan model.Event, 4)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	batchCh := make(chan struct{}, 1)
-	a := NewActivator(s, ch, batchCh)
+	a := NewActivator(s, ch, batchCh, nil)
 
 	a.handleEvent(model.Event{
 		Type:    model.EventUserInput,
@@ -49,7 +49,7 @@ func TestActivator_EventUserInput_NoPayload(t *testing.T) {
 	ch := make(chan model.Event, 4)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	batchCh := make(chan struct{}, 1)
-	a := NewActivator(s, ch, batchCh)
+	a := NewActivator(s, ch, batchCh, nil)
 
 	a.handleEvent(model.Event{Type: model.EventUserInput})
 
@@ -66,7 +66,7 @@ func TestActivator_EventTaskCompleted_BroadcastsBatchUpdate(t *testing.T) {
 	ch := make(chan model.Event, 4)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	batchCh := make(chan struct{}, 1)
-	a := NewActivator(s, ch, batchCh)
+	a := NewActivator(s, ch, batchCh, nil)
 
 	a.handleEvent(model.Event{Type: model.EventTaskCompleted, TaskID: "x"})
 
@@ -88,7 +88,7 @@ func TestActivator_EventTaskFailed_BroadcastsBatchUpdate(t *testing.T) {
 	ch := make(chan model.Event, 4)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	batchCh := make(chan struct{}, 1)
-	a := NewActivator(s, ch, batchCh)
+	a := NewActivator(s, ch, batchCh, nil)
 
 	a.handleEvent(model.Event{Type: model.EventTaskFailed, TaskID: "x"})
 
@@ -103,7 +103,7 @@ func TestActivator_EventTaskCancelled_BroadcastsBatchUpdate(t *testing.T) {
 	ch := make(chan model.Event, 4)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	batchCh := make(chan struct{}, 1)
-	a := NewActivator(s, ch, batchCh)
+	a := NewActivator(s, ch, batchCh, nil)
 
 	a.handleEvent(model.Event{Type: model.EventTaskCancelled, TaskID: "x"})
 
@@ -118,7 +118,7 @@ func TestActivator_EventWatchdogAlert_BroadcastsBatchUpdate(t *testing.T) {
 	ch := make(chan model.Event, 4)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	batchCh := make(chan struct{}, 1)
-	a := NewActivator(s, ch, batchCh)
+	a := NewActivator(s, ch, batchCh, nil)
 
 	a.handleEvent(model.Event{Type: model.EventWatchdogAlert, TaskID: "x"})
 
@@ -135,7 +135,7 @@ func TestActivator_BatchUpdateChannelDoesNotBlock(t *testing.T) {
 	// 容量 1 的 channel，先填满
 	batchCh := make(chan struct{}, 1)
 	batchCh <- struct{}{}
-	a := NewActivator(s, ch, batchCh)
+	a := NewActivator(s, ch, batchCh, nil)
 
 	// 多次发送 batch 事件，handleEvent 不应阻塞
 	done := make(chan struct{})
@@ -157,7 +157,7 @@ func TestActivator_OtherEvents_NoEffect(t *testing.T) {
 	ch := make(chan model.Event, 4)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	batchCh := make(chan struct{}, 1)
-	a := NewActivator(s, ch, batchCh)
+	a := NewActivator(s, ch, batchCh, nil)
 
 	// EventTickerWakeup / EventTaskRetry 等其他类型应当被忽略
 	a.handleEvent(model.Event{Type: model.EventTickerWakeup})
@@ -181,7 +181,7 @@ func TestActivator_Run_ContextCancellation(t *testing.T) {
 	ch := make(chan model.Event, 4)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	batchCh := make(chan struct{}, 1)
-	a := NewActivator(s, ch, batchCh)
+	a := NewActivator(s, ch, batchCh, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -203,7 +203,7 @@ func TestActivator_Run_ProcessesEventsFromChannel(t *testing.T) {
 	ch := make(chan model.Event, 4)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	batchCh := make(chan struct{}, 4)
-	a := NewActivator(s, ch, batchCh)
+	a := NewActivator(s, ch, batchCh, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -220,5 +220,136 @@ func TestActivator_Run_ProcessesEventsFromChannel(t *testing.T) {
 	tasks, _ := s.ScanAll()
 	if len(tasks) != 1 {
 		t.Errorf("expected 1 task processed, got %d", len(tasks))
+	}
+}
+
+// ---- SessionHistory 单测 ----
+
+func TestSessionHistory_AppendAndSnapshot(t *testing.T) {
+	h := NewSessionHistory(4)
+
+	if h.Len() != 0 {
+		t.Errorf("new history len=%d, want 0", h.Len())
+	}
+
+	h.Append(SessionInput{Text: "first", SchedulerTaskID: "t1", SubmittedAt: time.Now()})
+	h.Append(SessionInput{Text: "second", SchedulerTaskID: "t2", SubmittedAt: time.Now()})
+
+	snap := h.Snapshot(0)
+	if len(snap) != 2 {
+		t.Fatalf("snapshot len=%d, want 2", len(snap))
+	}
+	if snap[0].Text != "first" || snap[1].Text != "second" {
+		t.Errorf("snapshot order wrong: %+v", snap)
+	}
+}
+
+func TestSessionHistory_RingBufferOverflow(t *testing.T) {
+	h := NewSessionHistory(3)
+
+	// 加入 5 条，超出容量 2 条
+	for i := 1; i <= 5; i++ {
+		h.Append(SessionInput{
+			Text:            string(rune('a' + i - 1)),
+			SchedulerTaskID: "tid",
+			SubmittedAt:     time.Now(),
+		})
+	}
+
+	if h.Len() != 3 {
+		t.Errorf("len=%d, want 3 (cap)", h.Len())
+	}
+
+	snap := h.Snapshot(0)
+	// 期望剩下 c, d, e（最旧的两条 a, b 被覆盖）
+	want := []string{"c", "d", "e"}
+	if len(snap) != len(want) {
+		t.Fatalf("snapshot len=%d, want %d", len(snap), len(want))
+	}
+	for i, w := range want {
+		if snap[i].Text != w {
+			t.Errorf("snap[%d].Text=%q, want %q", i, snap[i].Text, w)
+		}
+	}
+}
+
+func TestSessionHistory_SnapshotWithLimit(t *testing.T) {
+	h := NewSessionHistory(10)
+	for i := 1; i <= 5; i++ {
+		h.Append(SessionInput{
+			Text:            string(rune('a' + i - 1)),
+			SchedulerTaskID: "tid",
+			SubmittedAt:     time.Now(),
+		})
+	}
+
+	// n=2 应当只返回最新的两条 d, e
+	snap := h.Snapshot(2)
+	if len(snap) != 2 {
+		t.Fatalf("snap len=%d, want 2", len(snap))
+	}
+	if snap[0].Text != "d" || snap[1].Text != "e" {
+		t.Errorf("snap[0..1]=%q,%q want d,e", snap[0].Text, snap[1].Text)
+	}
+}
+
+func TestSessionHistory_DefaultCapacity(t *testing.T) {
+	h := NewSessionHistory(0)
+	if h.cap != sessionHistoryDefaultCap {
+		t.Errorf("default cap=%d, want %d", h.cap, sessionHistoryDefaultCap)
+	}
+}
+
+// ---- Activator + SessionHistory 集成 ----
+
+func TestActivator_EventUserInput_AppendsHistory(t *testing.T) {
+	ch := make(chan model.Event, 4)
+	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
+	batchCh := make(chan struct{}, 1)
+	hist := NewSessionHistory(4)
+	a := NewActivator(s, ch, batchCh, hist)
+
+	a.handleEvent(model.Event{
+		Type:    model.EventUserInput,
+		Payload: map[string]string{"text": "你好"},
+	})
+	a.handleEvent(model.Event{
+		Type:    model.EventUserInput,
+		Payload: map[string]string{"text": "再问一遍"},
+	})
+
+	snap := hist.Snapshot(0)
+	if len(snap) != 2 {
+		t.Fatalf("history len=%d, want 2", len(snap))
+	}
+	if snap[0].Text != "你好" || snap[1].Text != "再问一遍" {
+		t.Errorf("history texts wrong: %+v", snap)
+	}
+	// SchedulerTaskID 应当与 store 中实际 publish 的 task ID 一致
+	tasks, _ := s.ScanAll()
+	if len(tasks) != 2 {
+		t.Fatalf("expected 2 tasks, got %d", len(tasks))
+	}
+	if snap[0].SchedulerTaskID == "" || snap[1].SchedulerTaskID == "" {
+		t.Error("SchedulerTaskID should not be empty")
+	}
+}
+
+func TestActivator_EventUserInput_NilHistoryNoPanic(t *testing.T) {
+	ch := make(chan model.Event, 4)
+	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
+	batchCh := make(chan struct{}, 1)
+	a := NewActivator(s, ch, batchCh, nil) // History 为 nil
+
+	// 不应 panic
+	a.handleEvent(model.Event{
+		Type:    model.EventUserInput,
+		Payload: map[string]string{"text": "test"},
+	})
+
+	// task 应正常发布
+	tasks, _ := s.ScanAll()
+	if len(tasks) != 1 {
+		t.Errorf("expected 1 task, got %d", len(tasks))
 	}
 }

@@ -3,10 +3,91 @@ package scheduler
 import (
 	"context"
 	"log"
+	"sync"
+	"time"
 
 	"agentgo/internal/model"
 	"agentgo/internal/store"
 )
+
+// sessionHistoryDefaultCap 是 SessionHistory 默认 ring buffer 容量。
+// 16 条足够覆盖一次会话的最近上下文，超出后丢弃最旧的。
+const sessionHistoryDefaultCap = 16
+
+// SessionInput 是用户在本会话中提交的一条输入记录。
+//
+// 通过 SessionHistory 维护，由 SchedulerExecutor 在注入 board snapshot
+// 时取出最近 N 条作为 LLM 的"对话历史"上下文 —— 让 scheduler 知道
+// "用户之前问过什么、最近一条对应了哪个 scheduler task"。
+type SessionInput struct {
+	Text            string    // 用户原始输入文本
+	SchedulerTaskID string    // 由 Activator publish 的 scheduler task ID
+	SubmittedAt     time.Time // 用户提交时刻（接收到 EventUserInput 的时间）
+}
+
+// SessionHistory 是本会话中用户输入的环形缓冲。
+//
+// 由 Activator 在每次收到 EventUserInput 时调用 Append 写入；
+// 由 SchedulerExecutor 在注入 board snapshot 时调用 Snapshot 读取。
+//
+// 容量满时丢弃最旧的一条（与 mailbox.recent 同语义）。线程安全。
+//
+// 之所以独立于 store：用户输入历史是"会话级状态"，不属于任何 task 字段，
+// 也不需要持久化。store 只负责 task 生命周期，会话历史归 scheduler 包管理。
+type SessionHistory struct {
+	mu      sync.RWMutex
+	entries []SessionInput
+	cap     int
+}
+
+// NewSessionHistory 创建一个 SessionHistory。capacity<=0 时使用默认值 16。
+func NewSessionHistory(capacity int) *SessionHistory {
+	if capacity <= 0 {
+		capacity = sessionHistoryDefaultCap
+	}
+	return &SessionHistory{
+		entries: make([]SessionInput, 0, capacity),
+		cap:     capacity,
+	}
+}
+
+// Append 追加一条用户输入记录。容量满时丢弃最旧的一条。
+func (h *SessionHistory) Append(in SessionInput) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.entries) >= h.cap {
+		// 满了，前移：丢弃最旧的，加新的到末尾
+		copy(h.entries, h.entries[1:])
+		h.entries[h.cap-1] = in
+		return
+	}
+	h.entries = append(h.entries, in)
+}
+
+// Snapshot 返回当前历史的副本（按时间顺序，最旧在前）。
+// n<=0 时返回全部；n 大于实际存量时返回全部。
+func (h *SessionHistory) Snapshot(n int) []SessionInput {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	count := len(h.entries)
+	if count == 0 {
+		return nil
+	}
+	if n <= 0 || n > count {
+		n = count
+	}
+	// 取最后 n 条（最新的在末尾），保持时间顺序
+	out := make([]SessionInput, n)
+	copy(out, h.entries[count-n:])
+	return out
+}
+
+// Len 返回当前 SessionHistory 中的记录数。
+func (h *SessionHistory) Len() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.entries)
+}
 
 // SchedulerTaskTimeoutSec 是 scheduler task 的超时值。
 //
@@ -41,14 +122,22 @@ type Activator struct {
 	Store         store.TaskStore
 	EventCh       <-chan model.Event
 	BatchUpdateCh chan<- struct{}
+
+	// History 是本会话用户输入的环形缓冲。
+	// 在每次 EventUserInput 触发时由 handleEvent 写入；
+	// SchedulerExecutor 注入 board snapshot 时通过它读取最近 N 条历史。
+	// nil 时跳过历史追加（向后兼容旧 NewActivator 调用方）。
+	History *SessionHistory
 }
 
-// NewActivator 创建一个 Activator。三个参数都不允许 nil。
-func NewActivator(s store.TaskStore, eventCh <-chan model.Event, batchUpdateCh chan<- struct{}) *Activator {
+// NewActivator 创建一个 Activator。前三个参数都不允许 nil；
+// history 可为 nil（旧调用方兼容）。
+func NewActivator(s store.TaskStore, eventCh <-chan model.Event, batchUpdateCh chan<- struct{}, history *SessionHistory) *Activator {
 	return &Activator{
 		Store:         s,
 		EventCh:       eventCh,
 		BatchUpdateCh: batchUpdateCh,
+		History:       history,
 	}
 }
 
@@ -97,6 +186,15 @@ func (a *Activator) handleEvent(evt model.Event) {
 			return
 		}
 		log.Printf("[scheduler-activator] 已发布 scheduler task: id=%s, desc=%q", task.ID, text)
+
+		// 追加到本会话历史，供 SchedulerExecutor 在 board snapshot 中展示
+		if a.History != nil {
+			a.History.Append(SessionInput{
+				Text:            text,
+				SchedulerTaskID: task.ID,
+				SubmittedAt:     time.Now(),
+			})
+		}
 
 	case model.EventTaskCompleted, model.EventTaskFailed, model.EventTaskCancelled, model.EventWatchdogAlert:
 		// 广播 batch 更新信号——SchedulerExecutor.waitForBatchTerminal 在 select

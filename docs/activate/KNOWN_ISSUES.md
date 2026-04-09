@@ -120,6 +120,96 @@ Watchdog 结构体已添加 `Roster` 字段，`inspect` 方法末尾调用 `clea
 
 ---
 
+## Scheduler 调用 report_done 后不终止 reactLoop，进入"幻觉心跳"无限循环（2026-04-10 Phase 3.1 发现）
+
+**位置**：
+- [internal/tools/scheduler.go](../../internal/tools/scheduler.go) `SchedulerGroup.reportDone`
+- [internal/scheduler/scheduler.go](../../internal/scheduler/scheduler.go) `currentSchedulerTaskHolder` + `New()` 中 `a.MaxRetries = 0` 设置
+- [internal/agent/agent.go:235](../../internal/agent/agent.go) `processTask` 的 reactLoop 主循环
+- [internal/scheduler/executor.go:83](../../internal/scheduler/executor.go) `SchedulerExecutor.Execute` 写死 `trigger.Type = EventTickerWakeup`
+
+**严重程度**：🔴 P0（用户体验灾难 + token 浪费 + 看起来像系统死锁）
+
+**现象**（2026-04-10 03:30 复现）：
+
+用户输入 `启动前检查，当前有多少个代理可用？`，scheduler 在 loop=0 正确调用 `report_done` 给出真正的回答。然后**不停止**，每隔 2-5 秒自动调一次新的 `report_done`：
+
+```
+03:30:02  loop=0 report_done("当前系统共有 5 个代理...")    ← 真正的回答 ✅
+03:30:06  loop=1 report_done("⏳ 系统定时唤醒，无新输入...")  ← 幻觉
+03:30:08  loop=2 report_done("⏳ 定时唤醒...")               ← 幻觉
+03:30:12  loop=3 report_done("⏳ 定时唤醒...")               ← 幻觉
+...
+03:30:37  loop=9 report_done("⏳ 定时心跳，无新指令...")
+03:30:37  重试 #1，恢复 10 条历史记录                       ← MaxLoops 触发
+03:30:39  loop=0 report_done(...)                            ← 重试后又开始
+... 直到用户 /quit
+```
+
+每条幻觉消息都会触发 `=== 任务完成 ===` 块打印到 stdout，淹没真正的回答，**让用户看不出 scheduler 是否还活着**。
+
+**4 个叠加的根因**（全部需要修复）：
+
+### 根因 1：`report_done` 不真正终止 reactLoop（核心）
+
+`SchedulerGroup.reportDone` 只做三件事：
+1. 打印 `=== 任务完成 ===` 到 stdout
+2. 清空 `task.SchedulerBatch`
+3. 返回字符串 `"已向用户报告完成"`
+
+从 [agent.go:235-365](../../internal/agent/agent.go) 的 reactLoop 视角看，report_done 跟 read_file 没有区别 —— `result.ToolCalled == true`，所以**循环继续**：
+
+```go
+for i := 0; i < a.MaxLoops; i++ {
+    result, err := a.Execute(...)
+    if !result.ToolCalled {
+        // task complete path
+        return
+    }
+    // tool called → append history → loop
+}
+```
+
+### 根因 2：SchedulerExecutor 每轮注入新 board snapshot 且 trigger 写死为 ticker_wakeup
+
+[executor.go:83](../../internal/scheduler/executor.go) 在每次 `Execute` 都构造 `trigger := model.Event{Type: model.EventTickerWakeup}`。LLM 在第二轮 reactLoop 看到：
+- 没有新 user message
+- trigger 是 `ticker_wakeup`
+- 上一轮我刚 report_done 了
+
+LLM 心想"哦看起来是定时唤醒，那我就发个心跳吧" → 又调一次 report_done。
+
+### 根因 3：scheduler agent `MaxRetries = 0`（无限重试）
+
+[scheduler.go](../../internal/scheduler/scheduler.go) 中 `a.MaxRetries = 0` 是合理设计 —— scheduler 在等待 worker 时不应被 retry 上限杀掉。但配合根因 #1 + #2 后果是：MaxLoops=10 触发后 RetryRollback → 历史保留 → LLM 又开始幻觉 → 无限循环到 ctx 取消。
+
+### 根因 4：scheduler system prompt 没有"report_done 即终止"的明确语义
+
+虽然 prompt 强调"report_done 调用后流程立即结束"，但 LLM 看到自己被再次唤醒时会自然假设"既然又有了一轮 reactLoop，那肯定有新事情要处理"，并不会主动选择"什么也不做让循环结束"。
+
+**修复方案**（计划）：
+
+主修：**让 `report_done` 实际终止当前 scheduler 任务**
+
+1. `currentSchedulerTaskHolder` 加 `done bool` 字段（Set 时清零，新增 `MarkDone()` / `IsDone()` 方法）
+2. 新增 `tools.SchedulerDoneNotifier` 接口；`SchedulerGroup` 加可选 `DoneNotifier` 字段
+3. `SchedulerGroup.reportDone` 成功返回前调 `DoneNotifier.MarkSchedulerDone()`
+4. `SchedulerExecutor.Execute` 入口检查 `holder.IsDone()`，为 true 时直接返回 `ExecuteResult{ToolCalled: false}` 让 agent reactLoop 走"任务完成"路径
+5. `OnTaskStart` 时清空 done 标志（新任务复用 holder）
+
+副修（次要，可选）：把 [executor.go:83](../../internal/scheduler/executor.go) 的 `trigger.Type` 从 `EventTickerWakeup` 改为更中性的事件类型，避免 LLM 误以为有新事件触发。
+
+**为什么把这个记下来**：
+
+- 这是 Phase 3 重构 scheduler 为 `agent.Agent` 的副作用 —— 把"事件驱动 reactLoop（每个事件触发一次循环）"改成"poll-based agent.Run（持续 reactLoop 直到 ToolCalled=false）"后，原来的"调 report_done 流程结束"语义就丢失了
+- 老版本 scheduler 的 `Run()` 是用户事件触发的，调完 report_done 函数返回，下次有事件再来一遍。现在 agent.Agent.Run 的 reactLoop 是 LLM 驱动的，工具调用本身不能终止外层循环
+- 任何把"基于事件的 LLM agent"重构为"基于 poll 的 LLM agent"都会踩这个坑：**工具的"我做完了"语义和 reactLoop 的"我做完了"语义不再自然对齐，必须显式桥接**
+- 类似的坑在其他工具上不会出现（read_file 后 LLM 自然会决定调 report_done 或停止），唯独 scheduler 因为是预制代理 + 长期常驻 + 无限重试，触发了完整的灾难路径
+
+**状态**：⏳ 待修复（紧接此条目下方修复）
+
+---
+
 ## ~~Scheduler 提前 report_done 导致任务结果丢失~~（已修复 2026-04-10 Phase 3）
 
 **位置**（旧）: `internal/scheduler/scheduler.go`（`handleEvent`、`toolReportDone`、`schedulerSystemPrompt`）
@@ -633,6 +723,7 @@ LLM 想编也编不出来。
 | Worker prompt 缺路径字面执行指引 | ✅ 已修复（第二轮） |
 | Shell 拦截 E2E 测试缺口 | ⏳ 本轮不实施（见 nextUpgrade_v2.md） |
 | Scheduler 提前 report_done | ✅ 已修复（2026-04-10 Phase 3：SchedulerExecutor.waitForBatchTerminal 在 LLM 调用之前同步等待 batch 完成，从根本上消除"LLM 看到 pending 状态而误调 report_done"的可能；SchedulerGroup.report_done 的硬拦截作为最后兜底） |
+| **Scheduler report_done 后不终止 reactLoop（幻觉心跳循环）** | 🔴 **P0 待修复**（2026-04-10 Phase 3.1 发现，4 根因：报告工具不真终止 + ticker_wakeup trigger 误导 + MaxRetries=0 + reactLoop 语义和工具语义脱钩） |
 | **Scheduler 事件响应延迟 3 分钟** | 🟡 **P1 待排查** |
 | **Trace 多 goroutine 写入竞争** | 🟡 **P1 复核**（trace 系统已实现，需确认上锁覆盖） |
 | **邮件级联爆炸**（4 根因叠加） | ✅ **已修复**（2026-04-09，Phase 2 完成；Mailbox Hook 框架 + 4 项根因全部关闭，`mail_notifier_enabled=true` 默认） |

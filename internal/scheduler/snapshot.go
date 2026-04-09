@@ -2,28 +2,55 @@ package scheduler
 
 import (
 	"encoding/json"
+	"sort"
+	"time"
 
 	"agentgo/internal/config"
+	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
+	"agentgo/internal/roster"
 	"agentgo/internal/store"
 )
 
 // boardSnapshot 是 scheduler agent 在每轮 reactLoop 看到的全局任务板 JSON 结构。
-// 包含模式、触发事件、任务列表、资源（worker 可用数）四段。
 //
-// 从 internal/scheduler/scheduler.go 的私有 boardSnapshot 类型迁移而来，
-// 保持字段顺序与 JSON tag 完全一致以确保 LLM 看到的 schema 不变。
+// Phase 3 初版只含 mode/trigger/tasks/resources 四段。Phase 3.1 扩展：
+//   - resources.Agents 改为完整代理列表（含 mailbox 待处理数 + 当前认领任务）
+//   - 新增顶层 SessionHistory 字段（本会话用户输入历史）
+//
+// 字段顺序与 JSON tag 在保持向后兼容的前提下扩展：
+//   - 新字段一律 omitempty，旧测试在传 nil 数据源时仍能通过
+//   - 既有字段顺序不变，避免 LLM 看到的 schema 漂移
 type boardSnapshot struct {
-	Mode      string         `json:"mode"`
-	Trigger   triggerInfo    `json:"trigger"`
-	Tasks     []taskSnapshot `json:"tasks"`
-	Resources resourceInfo   `json:"resources"`
+	Mode           string         `json:"mode"`
+	Trigger        triggerInfo    `json:"trigger"`
+	Tasks          []taskSnapshot `json:"tasks"`
+	Resources      resourceInfo   `json:"resources"`
+	SessionHistory []sessionEntry `json:"session_history,omitempty"`
 }
 
 type resourceInfo struct {
-	WorkerCount      int `json:"worker_count"`
-	BusyWorkers      int `json:"busy_workers"`
-	AvailableWorkers int `json:"available_workers"`
+	WorkerCount      int             `json:"worker_count"`
+	BusyWorkers      int             `json:"busy_workers"`
+	AvailableWorkers int             `json:"available_workers"`
+	Agents           []agentSnapshot `json:"agents,omitempty"`
+}
+
+// agentSnapshot 是单个活跃代理的运行时快照。
+// "活跃" = 已注册到 mailbox.Registry，包括 worker / explorer / scheduler 自己。
+//
+// 字段优先级：
+//   - ID + Type 总是出现（必填）
+//   - MailboxPending 总是出现（即使为 0，让 LLM 知道"该代理空闲")
+//   - CurrentTaskID/CurrentTaskDesc 仅在该代理正在处理某个 task 时出现
+//   - LockedFiles 仅在 roster 有文件 claim 时出现
+type agentSnapshot struct {
+	ID              string   `json:"id"`
+	Type            string   `json:"type"` // "worker" / "explorer" / "scheduler" / "unknown"
+	MailboxPending  int      `json:"mailbox_pending"`
+	CurrentTaskID   string   `json:"current_task_id,omitempty"`
+	CurrentTaskDesc string   `json:"current_task_desc,omitempty"`
+	LockedFiles     []string `json:"locked_files,omitempty"`
 }
 
 type triggerInfo struct {
@@ -45,21 +72,54 @@ type taskSnapshot struct {
 	LastResponse  string            `json:"last_response,omitempty"`
 }
 
+// sessionEntry 是 board snapshot 中"用户输入历史"段的单条记录。
+//
+// 与 SessionInput 的字段一一对应，但 SubmittedAt 用 RFC3339 字符串
+// 而非 time.Time，让 LLM 看到的 JSON 易读。
+type sessionEntry struct {
+	Text            string `json:"text"`
+	SchedulerTaskID string `json:"scheduler_task_id"`
+	SubmittedAt     string `json:"submitted_at"`
+	Outcome         string `json:"outcome,omitempty"` // "completed" / "failed" / "cancelled" / "processing" / "pending"
+}
+
+// SnapshotSources 把 BuildBoardJSON 的可选数据源打包成一个 struct，
+// 避免函数签名继续膨胀（Phase 3.1 时已经从 4 参数涨到 6 参数）。
+//
+// 所有字段都允许 nil：
+//   - MBRegistry == nil：不输出 Resources.Agents
+//   - Roster == nil：Agents 中 LockedFiles 为空
+//   - History == nil：不输出 SessionHistory
+//
+// 这种 nil-tolerant 设计让单元测试可以选择性覆盖某段而不需要构造完整依赖。
+type SnapshotSources struct {
+	MBRegistry *mailbox.Registry
+	Roster     roster.Roster
+	History    *SessionHistory
+}
+
 // BuildBoardJSON 构造 scheduler agent 在每轮 reactLoop 注入到 history 的 board 快照 JSON。
 //
 // 参数：
 //   - s: TaskStore，用于 ScanAll
 //   - cfg: 配置（读取 WorkerCount 计算可用 worker 数）
-//   - mode: "immediate" 或 "plan"，由调用方决定（旧 scheduler 通过 Scheduler.GetMode 拿）
+//   - mode: "immediate" 或 "plan"
 //   - trigger: 当前 reactLoop 的触发事件（用户输入、task completed 等）
+//   - sources: 可选数据源（mailbox / roster / session history）
 //
 // 设计原则：
 //   - 自包含 helper 函数，不依赖 *Scheduler 或 *agent.Agent，方便单测
-//   - 字段顺序与 JSON tag 与旧 scheduler.go::buildBoardJSON 完全一致
 //   - 已完成任务展开 Results；失败/重试中任务展开 LastResponse；processing 任务展开 PartialOutput
+//   - sources 任一字段为 nil 时对应段缺省（向后兼容）
 //
-// 从 internal/scheduler/scheduler.go::Scheduler.buildBoardJSON 迁移而来。
-func BuildBoardJSON(s store.TaskStore, cfg *config.Config, mode string, trigger model.Event) string {
+// Phase 3.1 改动：新增 sources 参数，扩展 Resources.Agents + SessionHistory 两段。
+func BuildBoardJSON(
+	s store.TaskStore,
+	cfg *config.Config,
+	mode string,
+	trigger model.Event,
+	sources SnapshotSources,
+) string {
 	tasks, _ := s.ScanAll()
 
 	ti := triggerInfo{Type: string(trigger.Type), TaskID: trigger.TaskID}
@@ -107,10 +167,13 @@ func BuildBoardJSON(s store.TaskStore, cfg *config.Config, mode string, trigger 
 	if workerCount <= 0 {
 		workerCount = 1
 	}
-	available := workerCount - busyWorkers
-	if available < 0 {
-		available = 0
-	}
+	available := max(workerCount-busyWorkers, 0)
+
+	// 构造 agents 列表（来自 mailbox.Registry + roster + store 的反向映射）
+	agents := buildAgentSnapshots(tasks, sources.MBRegistry, sources.Roster)
+
+	// 构造 session history（来自 SessionHistory + store 的状态查询）
+	sessionEntries := buildSessionEntries(s, sources.History)
 
 	bs := boardSnapshot{
 		Mode:    mode,
@@ -120,8 +183,128 @@ func BuildBoardJSON(s store.TaskStore, cfg *config.Config, mode string, trigger 
 			WorkerCount:      workerCount,
 			BusyWorkers:      busyWorkers,
 			AvailableWorkers: available,
+			Agents:           agents,
 		},
+		SessionHistory: sessionEntries,
 	}
 	data, _ := json.MarshalIndent(bs, "", "  ")
 	return string(data)
+}
+
+// buildAgentSnapshots 从 mailbox.Registry + roster + 当前 task 列表构造代理快照。
+//
+// mb == nil 时返回 nil（snapshot 中省略 agents 字段）。
+//
+// 算法：
+//  1. mb.ScanAll() 拿到所有已注册代理 + mailbox 状态
+//  2. 反向遍历 tasks 构造 agentID → currentTask 映射（仅 processing 状态）
+//  3. 对每个代理调 roster.ListByAgent 拿当前 file claims（roster nil 时跳过）
+//  4. 按 agentID 字典序排序确保稳定输出
+func buildAgentSnapshots(tasks []*model.Task, mb *mailbox.Registry, r roster.Roster) []agentSnapshot {
+	if mb == nil {
+		return nil
+	}
+	statuses := mb.ScanAll()
+	if len(statuses) == 0 {
+		return nil
+	}
+
+	// 反向映射：agentID → 当前正在处理的 task
+	currentTask := make(map[string]*model.Task)
+	for _, t := range tasks {
+		if t.Status != model.TaskStatusProcessing {
+			continue
+		}
+		for _, agentID := range t.Agents {
+			// 若同一代理认领了多个任务（并发处理），取第一个；
+			// 实践中 worker 一般串行，这是个保守假设
+			if _, exists := currentTask[agentID]; !exists {
+				currentTask[agentID] = t
+			}
+		}
+	}
+
+	out := make([]agentSnapshot, 0, len(statuses))
+	for _, st := range statuses {
+		snap := agentSnapshot{
+			ID:             st.AgentID,
+			Type:           agentTypeFromEventType(st.EventType),
+			MailboxPending: st.Count,
+		}
+		if cur, ok := currentTask[st.AgentID]; ok {
+			snap.CurrentTaskID = cur.ID
+			snap.CurrentTaskDesc = truncateText(cur.Description, 80)
+		}
+		if r != nil {
+			if claims, err := r.ListByAgent(st.AgentID); err == nil && len(claims) > 0 {
+				files := make([]string, 0, len(claims))
+				for _, c := range claims {
+					files = append(files, c.FilePath)
+				}
+				snap.LockedFiles = files
+			}
+		}
+		out = append(out, snap)
+	}
+
+	// 字典序排序便于测试断言 + LLM 阅读
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// agentTypeFromEventType 把 mailbox 注册时的 eventType 翻译成可读类型名。
+//
+// 与 worker/explorer/scheduler 各自的 EventType 约定保持同步：
+//   - "" → worker
+//   - "explore" → explorer
+//   - "__scheduler__" → scheduler
+func agentTypeFromEventType(eventType string) string {
+	switch eventType {
+	case "":
+		return "worker"
+	case "explore":
+		return "explorer"
+	case "__scheduler__":
+		return "scheduler"
+	default:
+		return "unknown"
+	}
+}
+
+// buildSessionEntries 把 SessionHistory 转换为 sessionEntry 切片。
+//
+// history == nil 时返回 nil。Outcome 字段从 store 当前状态查询：
+//   - GetTask 失败：留空（任务可能已被淘汰）
+//   - 其他：写入 task.Status 字符串
+func buildSessionEntries(s store.TaskStore, history *SessionHistory) []sessionEntry {
+	if history == nil {
+		return nil
+	}
+	entries := history.Snapshot(0)
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]sessionEntry, 0, len(entries))
+	for _, in := range entries {
+		e := sessionEntry{
+			Text:            in.Text,
+			SchedulerTaskID: in.SchedulerTaskID,
+			SubmittedAt:     in.SubmittedAt.Format(time.RFC3339),
+		}
+		if t, err := s.GetTask(in.SchedulerTaskID); err == nil && t != nil {
+			e.Outcome = string(t.Status)
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// truncateText 把字符串截断到最多 maxRunes 个 rune，超出部分用 "..." 代替。
+// 与 mailbox.truncate 同语义但独立实现（避免跨包依赖只为这一个 helper）。
+func truncateText(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes]) + "..."
 }

@@ -284,6 +284,29 @@ func (r *Registry) ScanNonEmpty() []MailboxStatus {
 	return result
 }
 
+// ScanAll 返回所有已注册邮箱的状态快照（包括空邮箱）。
+//
+// 与 ScanNonEmpty 区别：后者只返回 Count > 0 的；本方法返回全部。
+// 用途：scheduler agent 在每轮 reactLoop 注入 board snapshot 时需要展示
+// 系统中所有活跃代理的"邮箱负载 / 类型"，包括空邮箱（让 LLM 知道某个
+// 代理目前无积压、可分配工作）。
+//
+// 与 ScanNonEmpty 一样使用 RLock；不消费 channel；调用安全。
+func (r *Registry) ScanAll() []MailboxStatus {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]MailboxStatus, 0, len(r.boxes))
+	for id, mb := range r.boxes {
+		out = append(out, MailboxStatus{
+			AgentID:       id,
+			EventType:     mb.eventType,
+			Count:         mb.Len(),
+			MaxChainDepth: mb.MaxChainDepth(),
+		})
+	}
+	return out
+}
+
 // HookRunner 返回当前挂接的 MailboxHookRunner（可能为 nil）。
 // MailNotifier 在每次 scan 时通过此方法读取 runner，以触发 BeforeWake
 // 决策。这避免了 notifier 自己持有一份 runner 字段（保持单点真相 ——
