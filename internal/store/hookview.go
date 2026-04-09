@@ -29,6 +29,14 @@ type StoreHookView interface {
 	// 任务不存在时返回 nil（hook 需要容忍这种情形，例如任务已被淘汰）。
 	// 返回值是内部数据的浅拷贝，调用方可以安全遍历。
 	GetToolCallHistory(taskID string) []ToolCallRecord
+
+	// ScanPendingByEventSource 返回所有 EventSource == source 且
+	// EventType == eventType 且 Status == pending 的任务快照。
+	// 用于 PerAgentDedupHook 在 BeforeWake 阶段判断是否已存在同源同类型
+	// 的待处理唤醒任务，从而做镜像去重（D4 双重防御）。
+	//
+	// Phase 2 引入。返回的切片是浅拷贝，调用方可以安全遍历但不应修改任务字段。
+	ScanPendingByEventSource(source, eventType string) []*model.Task
 }
 
 // GetToolCallHistory 实现 StoreHookView 接口的简化包装——内部委托给
@@ -37,6 +45,25 @@ type StoreHookView interface {
 func (s *MemoryTaskStore) GetToolCallHistory(taskID string) []ToolCallRecord {
 	recs, _ := s.QueryToolCalls(taskID, "")
 	return recs
+}
+
+// ScanPendingByEventSource 实现 StoreHookView 接口的过滤扫描。
+// 在内部读锁下遍历所有任务，匹配 source/eventType/pending 的任务返回。
+// 返回切片是浅拷贝（指针），调用方不应修改任务字段。
+//
+// Phase 2 引入；用途详见 StoreHookView 接口注释。
+func (s *MemoryTaskStore) ScanPendingByEventSource(source, eventType string) []*model.Task {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []*model.Task
+	for _, task := range s.tasks {
+		if task.EventSource == source &&
+			task.EventType == eventType &&
+			task.Status == model.TaskStatusPending {
+			result = append(result, task)
+		}
+	}
+	return result
 }
 
 // 编译期断言：MemoryTaskStore 必须自动满足 StoreHookView 接口。

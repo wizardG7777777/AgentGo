@@ -23,6 +23,9 @@ func (m *mockHistoryStore) AppendArtifact(taskID string, path string) error { re
 func (m *mockHistoryStore) GetToolCallHistory(taskID string) []store.ToolCallRecord {
 	return m.history
 }
+func (m *mockHistoryStore) ScanPendingByEventSource(source, eventType string) []*model.Task {
+	return nil
+}
 
 // helper：在临时目录里创建一个真实存在的文件，返回路径
 func makeRealFile(t *testing.T) string {

@@ -86,6 +86,11 @@ func (r *recordingStore) GetToolCallHistory(taskID string) []store.ToolCallRecor
 	return r.history[taskID]
 }
 
+// ScanPendingByEventSource 是 Phase 2 引入的接口方法，本 mock 不用，返回 nil。
+func (r *recordingStore) ScanPendingByEventSource(source, eventType string) []*model.Task {
+	return nil
+}
+
 func (r *recordingStore) AppendToolCall(taskID string, rec store.ToolCallRecord) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
