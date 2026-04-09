@@ -133,8 +133,9 @@ func NewWithID(agentID string, s store.TaskStore, r roster.Roster, llmClient llm
 			LocalReadGroup: readGroup,
 			Roster:         r,
 			AgentID:        agentID,
-			Store:          s,               // 让 write_file/edit_file 把路径追加到 task.Artifacts
-			ProjectRoot:    cfg.ProjectRoot, // 用于把绝对路径标准化为相对项目根的路径
+			// C5 迁移：Store / ProjectRoot 字段已删除。
+			// 写文件后追加到 task.Artifacts 由 RecordArtifactHook 完成，
+			// hookReg 在 bootstrap 中注册时拿到 store 与 projectRoot。
 		},
 		tools.WebGroup{Provider: searchProvider},
 		tools.ShellGroup{Workdir: workdir, TimeoutSec: cfg.ShellTimeoutSec, ApprovalCh: approvalCh, AgentID: agentID},

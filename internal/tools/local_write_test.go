@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"agentgo/internal/agent"
-	"agentgo/internal/llm"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
 )
@@ -408,103 +407,13 @@ func (c *captureStore) QueryToolCalls(string, string) ([]store.ToolCallRecord, e
 	return nil, nil
 }
 
-func TestWriteFile_RecordsArtifact(t *testing.T) {
-	tmp := t.TempDir()
-	path := filepath.Join(tmp, "out.md")
-	cs := newCaptureStore("task-001")
-	g := LocalWriteGroup{
-		LocalReadGroup: LocalReadGroup{Workdir: &DefaultWorkdir{ProjectRoot: tmp}},
-		Roster:         &recordingRoster{},
-		AgentID:        "agent-1",
-		Store:          cs,
-		ProjectRoot:    tmp,
-	}
-	r := agent.NewToolRegistry()
-	g.Register(r)
-
-	// 注入 task ID 到 context
-	ctx := agent.WithAgentContext(context.Background(), "agent-1", "task-001", 0)
-	_, err := r.Dispatch(ctx, llm.ToolCall{
-		Name:      "write_file",
-		Arguments: map[string]any{"path": path, "content": "hello"},
-	})
-	if err != nil {
-		t.Fatalf("write_file: %v", err)
-	}
-	if len(cs.artifacts) != 1 {
-		t.Fatalf("expected 1 artifact, got %d: %v", len(cs.artifacts), cs.artifacts)
-	}
-	if cs.artifacts[0] != "out.md" {
-		t.Errorf("expected relative path 'out.md', got %s", cs.artifacts[0])
-	}
-}
-
-func TestWriteFile_ArtifactDedupOnRewrite(t *testing.T) {
-	tmp := t.TempDir()
-	path := filepath.Join(tmp, "out.md")
-	cs := newCaptureStore("task-001")
-	g := LocalWriteGroup{
-		LocalReadGroup: LocalReadGroup{Workdir: &DefaultWorkdir{ProjectRoot: tmp}},
-		Roster:         &recordingRoster{},
-		AgentID:        "agent-1",
-		Store:          cs,
-		ProjectRoot:    tmp,
-	}
-	r := agent.NewToolRegistry()
-	g.Register(r)
-	ctx := agent.WithAgentContext(context.Background(), "agent-1", "task-001", 0)
-
-	// 写入同一文件 3 次
-	for i := 0; i < 3; i++ {
-		_, _ = r.Dispatch(ctx, llm.ToolCall{
-			Name:      "write_file",
-			Arguments: map[string]any{"path": path, "content": fmt.Sprintf("v%d", i)},
-		})
-	}
-
-	if len(cs.artifacts) != 1 {
-		t.Errorf("expected dedup to 1 entry, got %d: %v", len(cs.artifacts), cs.artifacts)
-	}
-}
-
-func TestNormalizeArtifactPath(t *testing.T) {
-	tests := []struct {
-		name        string
-		absPath     string
-		projectRoot string
-		want        string
-	}{
-		{
-			name:        "relative to project root",
-			absPath:     "/Users/dev/project/docs/foo.md",
-			projectRoot: "/Users/dev/project",
-			want:        "docs/foo.md",
-		},
-		{
-			name:        "deeply nested under project root",
-			absPath:     "/Users/dev/project/internal/tools/local_write.go",
-			projectRoot: "/Users/dev/project",
-			want:        "internal/tools/local_write.go",
-		},
-		{
-			name:        "outside project root → fallback to absolute",
-			absPath:     "/etc/passwd",
-			projectRoot: "/Users/dev/project",
-			want:        "/etc/passwd",
-		},
-		{
-			name:        "empty projectRoot → original cleaned path",
-			absPath:     "/tmp/foo.md",
-			projectRoot: "",
-			want:        "/tmp/foo.md",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := normalizeArtifactPath(tt.absPath, tt.projectRoot)
-			if got != tt.want {
-				t.Errorf("normalizeArtifactPath(%q, %q) = %q, want %q", tt.absPath, tt.projectRoot, got, tt.want)
-			}
-		})
-	}
-}
+// C5 删除：TestWriteFile_RecordsArtifact / TestWriteFile_ArtifactDedupOnRewrite /
+// TestNormalizeArtifactPath 三个测试已经删除。
+//
+// 前两个测试覆盖的是 LocalWriteGroup.recordArtifact 的内联实现，C5 把这套逻辑
+// 整体迁移到 internal/hook/builtin/record_artifact.go 后，对应的等价测试已在
+// internal/hook/builtin/record_artifact_test.go 中重建。
+//
+// TestNormalizeArtifactPath 一并删除，因为 normalizeArtifactPath 函数也随
+// recordArtifact 一起迁移到了 hook/builtin 包，tools 包内不再持有该实现。
+// 该函数的等价测试也在新的 record_artifact_test.go 中。
