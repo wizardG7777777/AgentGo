@@ -58,6 +58,13 @@ type Task struct {
 	PartialOutput  string // 执行中的部分输出，用于流式进度展示
 	Depth          int    // 子任务嵌套深度，根任务为 0
 
+	// MailChainDepth 是该任务被第几层邮件唤醒。
+	// 用户 /steer 触发的初始任务为 0；被 chain_depth=N 的邮件唤醒的任务为 N。
+	// MetaGroup.sendMessage 在构造 outgoing message 时读取此值并 +1 写入 msg.ChainDepth；
+	// MailNotifier 在发布 wake task 时根据收件箱内未读邮件的最大 ChainDepth 设置该字段。
+	// Phase 2 引入；零值兼容现有任务。
+	MailChainDepth int
+
 	// Artifacts 是任务执行期间通过 write_file/edit_file 实际写入的文件路径列表，
 	// 路径为相对项目根的相对路径，自动去重。
 	// 由 Store.AppendArtifact 在工具调用成功后写入。
