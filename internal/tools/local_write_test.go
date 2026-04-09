@@ -334,6 +334,8 @@ func (c *captureStore) GetDependencyArtifacts(string) (map[string][]string, erro
 func (c *captureStore) RecordLastResponse(string, string) error                    { return nil }
 func (c *captureStore) ScanAll() ([]*model.Task, error)                            { return nil, nil }
 func (c *captureStore) AppendToolCall(string, store.ToolCallRecord) error          { return nil }
+func (c *captureStore) AppendSchedulerBatch(string, string) error                  { return nil }
+func (c *captureStore) ClearSchedulerBatch(string) error                           { return nil }
 func (c *captureStore) QueryToolCalls(string, string) ([]store.ToolCallRecord, error) {
 	return nil, nil
 }

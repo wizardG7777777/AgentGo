@@ -415,6 +415,43 @@ func (s *MemoryTaskStore) AppendArtifact(taskID string, path string) error {
 	return nil
 }
 
+// AppendSchedulerBatch 把一个子任务 ID 追加到指定 scheduler task 的 SchedulerBatch 列表，
+// 自动去重。仅在 scheduler agent 通过 SchedulerGroup.publishTask 调用时使用。
+// 任务不存在时返回 ErrTaskNotFound；childTaskID 已在列表中时无操作。
+// Phase 3 引入。
+func (s *MemoryTaskStore) AppendSchedulerBatch(taskID string, childTaskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return ErrTaskNotFound
+	}
+	for _, existing := range task.SchedulerBatch {
+		if existing == childTaskID {
+			return nil // 已存在
+		}
+	}
+	task.SchedulerBatch = append(task.SchedulerBatch, childTaskID)
+	return nil
+}
+
+// ClearSchedulerBatch 清空指定 scheduler task 的 SchedulerBatch 列表。
+// 由 SchedulerGroup.report_done 在汇报完成后调用。
+// 任务不存在时返回 ErrTaskNotFound。
+// Phase 3 引入。
+func (s *MemoryTaskStore) ClearSchedulerBatch(taskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return ErrTaskNotFound
+	}
+	task.SchedulerBatch = nil
+	return nil
+}
+
 // AppendToolCall 追加一条工具调用记录到指定任务的历史。
 // 由 llm_executor.go 在每次工具调用之后自动写入（包括被 hook Abort 的调用），
 // 供 hook 系统的 RequireReadBeforeWriteHook 等做事实查询。

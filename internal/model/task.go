@@ -85,6 +85,17 @@ type Task struct {
 	// 即便任务最终崩溃，也不至于只看到一个"重试次数耗尽"的空错误。
 	LastResponse string
 
+	// SchedulerBatch 是 scheduler agent 当前 reactLoop 跟踪的子任务 ID 列表。
+	// 由 SchedulerGroup.publishTask 在每次发布时追加；report_done 时清空。
+	// 仅在 EventType="__scheduler__" 任务上有意义；其他 task 该字段为空。
+	//
+	// 与 Dependencies 的关键差异：
+	//   - Dependencies 用于 worker 任务间的依赖（watchdog 会级联取消失败的依赖）
+	//   - SchedulerBatch 仅供 SchedulerExecutor 等待 batch 完成（终态而非严格 completed）
+	//
+	// Phase 3 引入；零值兼容现有调用方。
+	SchedulerBatch []string
+
 	CreatedAt   time.Time
 	StartedAt   time.Time
 	CompletedAt time.Time

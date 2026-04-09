@@ -68,6 +68,8 @@ func (f *fakeStore) GetDependencyArtifacts(taskID string) (map[string][]string, 
 }
 func (f *fakeStore) AppendArtifact(taskID string, path string) error        { return nil }
 func (f *fakeStore) RecordLastResponse(taskID string, content string) error { return nil }
+func (f *fakeStore) AppendSchedulerBatch(taskID, childTaskID string) error  { return nil }
+func (f *fakeStore) ClearSchedulerBatch(taskID string) error                { return nil }
 func (f *fakeStore) ScanAll() ([]*model.Task, error)                        { return nil, nil }
 func (f *fakeStore) AppendToolCall(string, store.ToolCallRecord) error      { return nil }
 func (f *fakeStore) QueryToolCalls(string, string) ([]store.ToolCallRecord, error) {

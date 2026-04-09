@@ -863,6 +863,104 @@ func TestAppendArtifact_ConcurrentSameTask(t *testing.T) {
 	}
 }
 
+// --- SchedulerBatch（S0 新增） ---
+
+func TestAppendSchedulerBatch_Basic(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	task := &model.Task{Description: "scheduler task", EventType: "__scheduler__"}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	if err := s.AppendSchedulerBatch(task.ID, "child-1"); err != nil {
+		t.Fatalf("AppendSchedulerBatch: %v", err)
+	}
+	if err := s.AppendSchedulerBatch(task.ID, "child-2"); err != nil {
+		t.Fatalf("AppendSchedulerBatch: %v", err)
+	}
+
+	got, _ := s.GetTask(task.ID)
+	if len(got.SchedulerBatch) != 2 {
+		t.Errorf("expected 2 batch entries, got %d: %v", len(got.SchedulerBatch), got.SchedulerBatch)
+	}
+	if got.SchedulerBatch[0] != "child-1" || got.SchedulerBatch[1] != "child-2" {
+		t.Errorf("batch order or content wrong: %v", got.SchedulerBatch)
+	}
+}
+
+func TestAppendSchedulerBatch_Dedup(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	task := &model.Task{Description: "scheduler task", EventType: "__scheduler__"}
+	s.PublishTask(task)
+
+	// 同一子任务 ID 追加 5 次
+	for i := 0; i < 5; i++ {
+		if err := s.AppendSchedulerBatch(task.ID, "child-same"); err != nil {
+			t.Fatalf("AppendSchedulerBatch: %v", err)
+		}
+	}
+
+	got, _ := s.GetTask(task.ID)
+	if len(got.SchedulerBatch) != 1 {
+		t.Errorf("expected dedup to 1 entry, got %d: %v", len(got.SchedulerBatch), got.SchedulerBatch)
+	}
+}
+
+func TestAppendSchedulerBatch_TaskNotFound(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	err := s.AppendSchedulerBatch("nonexistent-id", "child-1")
+	if err == nil {
+		t.Error("expected error for nonexistent task")
+	}
+}
+
+func TestClearSchedulerBatch_Basic(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	task := &model.Task{Description: "scheduler task"}
+	s.PublishTask(task)
+
+	s.AppendSchedulerBatch(task.ID, "child-1")
+	s.AppendSchedulerBatch(task.ID, "child-2")
+
+	if err := s.ClearSchedulerBatch(task.ID); err != nil {
+		t.Fatalf("ClearSchedulerBatch: %v", err)
+	}
+
+	got, _ := s.GetTask(task.ID)
+	if len(got.SchedulerBatch) != 0 {
+		t.Errorf("expected empty batch after clear, got %v", got.SchedulerBatch)
+	}
+}
+
+func TestClearSchedulerBatch_TaskNotFound(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	if err := s.ClearSchedulerBatch("nonexistent-id"); err == nil {
+		t.Error("expected error for nonexistent task")
+	}
+}
+
+func TestAppendSchedulerBatch_ConcurrentSameTask(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	task := &model.Task{Description: "scheduler concurrent"}
+	s.PublishTask(task)
+
+	// 100 goroutine 并发追加 100 个不同子任务 ID
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			s.AppendSchedulerBatch(task.ID, fmt.Sprintf("child-%03d", idx))
+		}(i)
+	}
+	wg.Wait()
+
+	got, _ := s.GetTask(task.ID)
+	if len(got.SchedulerBatch) != 100 {
+		t.Errorf("expected 100 unique batch entries, got %d", len(got.SchedulerBatch))
+	}
+}
+
 // --- ToolCallRecord 历史记录（C1 新增） ---
 
 func TestAppendToolCall_BasicWriteAndRead(t *testing.T) {
