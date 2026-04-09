@@ -28,6 +28,68 @@
 
 ---
 
+# Hook System（2026-04-09 阶段 1 完成）
+
+Hook System 是工具调用生命周期的拦截层，为"软约束 → 硬约束"提供统一的注册、组合、测试、扩展面。详细设计见 `docs/activate/hookSystem.md`。
+
+## 阶段 1 范围
+
+只覆盖 **Tool Hook**（pre-call / post-call）；Mailbox Hook 留到阶段 2。
+
+## 核心组件
+
+| 包 | 职责 |
+|---|---|
+| `internal/hook` | `ToolHook` 接口 + `ToolHookRegistry`（值传递 ToolHookContext + nil 安全 + Args 浅拷贝隔离 + panic recover） |
+| `internal/hook/builtin` | 4 个内置 hook 实现 |
+| `internal/store/hookview.go` | `StoreHookView` 只读接口（hook 通过它查询任务历史，不能写入） |
+| `internal/store` | `ToolCallRecord` + `AppendToolCall` / `QueryToolCalls` 二级索引 |
+
+## 接入点
+
+`agent.NewLLMExecutor` 在并行工具 goroutine 内按以下顺序：
+
+```
+preCtx := hook.ToolHookContext{Phase: PreCall, ...}
+preDecision := hookReg.RunPre(preCtx)        // 可 Abort
+if Abort:
+    content = "[hook 拒绝] " + reason
+    toolErr = error
+else:
+    result, toolErr = tools.Dispatch(ctx, c)
+
+recordToolCall(taskID, ToolCallRecord{...}) // 写历史（独立闭包）
+
+postCtx := hook.ToolHookContext{Phase: PostCall, Result, Err}
+hookReg.RunPost(postCtx)                     // 纯观察，不短路
+```
+
+`hookReg / storeView / recordToolCall` 三个参数都允许 nil — nil 时整段 hook 路径退化为 noop。这是 V6 回归验证的核心：禁用所有 hook 时行为字节级一致。
+
+## 4 个内置 Hook（注册顺序与优先级）
+
+| Hook | Phase | Prio | Matches | 类型 | 决策 |
+|---|---|---|---|---|---|
+| `path-boundary` | Pre | 10 | read/write/edit/list/grep/glob_file系工具 | 迁移 | A1: 双重校验（工具内仍 ValidatePath 做标准化） |
+| `validate-expected-hash` | Pre | 20 | write_file/edit_file | 迁移 | B1: 接受微秒级 TOCTOU 窗口 |
+| `require-read-before-write` | Pre | 30 | write_file/edit_file | **新增** | 新文件豁免；list_dir 不算"已读"；失败 read 不计入 |
+| `record-artifact` | Post | 950 | write_file/edit_file | 迁移 | 工具失败时不记录 |
+
+## Scheduler 工具的豁免
+
+Scheduler 的 `publish_task / cancel_task / report_done / send_message` 由 `internal/scheduler/scheduler.go` 内的 `dispatchTool` switch 直接处理，**不经过 `agent.NewLLMExecutor`**。Hook 系统对 Scheduler 工具完全不生效 — 这是有意的架构隔离。
+
+## 与现有硬约束的关系
+
+Hook System **不替换**现有的 8 处硬约束兜底（`checkExpectedArtifacts`、`Roster.TryClaim`、`pathutil.ValidatePath` 等），而是**为它们提供统一的注册、组合、测试、扩展面**。其中 3 处已经迁移到 hook 表达，5 处仍是 inline 实现（包括 Roster 锁，因为它是任务级配对操作不能简单拆成 pre/post hook）。
+
+## 阶段 2/3 占位
+
+- **阶段 2**：Mailbox Hook（关闭"邮件级联爆炸"P0），需要 `Task.MailChainDepth` 字段、`MailNotifier.scan` 暴露 hook 调用点
+- **阶段 3+**：按需扩展（Chathistory / Board / Session / Skill），触发标准是"≥ 2 个具体痛点"
+
+---
+
 # 代理
 代理是最为基础的运行单元，尽管我在后文会频繁提及调度器，但是调度器本身就是一个代理，它也可以回答用户的问题，并且操作有限度的工具。
 ## 代理工具
