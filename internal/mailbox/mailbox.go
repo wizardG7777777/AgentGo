@@ -40,11 +40,27 @@ type Message struct {
 	ChainDepth int
 }
 
+// recentBufferSize 是 Mailbox.recent 环形缓冲的容量。
+// Phase 2 引入；用于支持 MailboxHookView.GetRecentMessages（peek without consume）。
+// 16 是一个保守值：不会显著增加内存（每个 agent 多 16 个 Message 副本），
+// 同时足够给 WakeContextExpandHook 展示前几条邮件摘要。
+const recentBufferSize = 16
+
 // Mailbox 单个代理的收件箱，底层为 buffered channel。
+//
+// Phase 2 改动：新增 recent 环形缓冲，用于支持 hook 系统的 peek 语义
+// （MailboxHookView.GetRecentMessages 需要在不消费 channel 的情况下读取
+// 最近的消息摘要）。环形缓冲与 channel 是**独立的两套存储**：
+//   - channel: 真正的消息传递通道，Drain 时被消费
+//   - recent: 仅供观察，TrySend 时同步追加，永不消费（旧消息被新消息覆盖）
 type Mailbox struct {
 	ownerID   string
 	eventType string // 代理的任务类型（"" = worker, "explore" = explorer）
 	ch        chan Message
+
+	// recent 环形缓冲及其互斥锁。仅供 hook 系统的 peek 使用。
+	recentMu sync.Mutex
+	recent   []Message // 容量固定为 recentBufferSize
 }
 
 func newMailbox(ownerID, eventType string, bufSize int) *Mailbox {
@@ -52,6 +68,7 @@ func newMailbox(ownerID, eventType string, bufSize int) *Mailbox {
 		ownerID:   ownerID,
 		eventType: eventType,
 		ch:        make(chan Message, bufSize),
+		recent:    make([]Message, 0, recentBufferSize),
 	}
 }
 
@@ -61,14 +78,58 @@ func (mb *Mailbox) Len() int {
 }
 
 // TrySend 非阻塞投递一条消息。buffer 满时返回 false 并记录日志，不阻塞发送者。
+//
+// Phase 2 改动：消息成功写入 channel 后，同步追加到 recent 环形缓冲。
+// 缓冲满时丢弃最旧的一条（前移）。
+// 注意：channel 写入失败时不追加 recent —— 这确保 recent 中的消息都是
+// 真实"投递成功"的。
 func (mb *Mailbox) TrySend(msg Message) bool {
 	select {
 	case mb.ch <- msg:
+		mb.appendRecent(msg)
 		return true
 	default:
 		log.Printf("[mailbox] 信箱已满 (owner=%s, from=%s)，消息丢弃", mb.ownerID, msg.From)
 		return false
 	}
+}
+
+// appendRecent 把消息追加到 recent 环形缓冲。容量满时丢弃最旧的一条。
+func (mb *Mailbox) appendRecent(msg Message) {
+	mb.recentMu.Lock()
+	defer mb.recentMu.Unlock()
+	if len(mb.recent) >= recentBufferSize {
+		// 满了，前移：丢弃最旧的，加新的到末尾
+		copy(mb.recent, mb.recent[1:])
+		mb.recent[recentBufferSize-1] = msg
+		return
+	}
+	mb.recent = append(mb.recent, msg)
+}
+
+// Snapshot 返回 recent 环形缓冲中最近的 n 条消息（值副本，最新的在前）。
+// n <= 0 时返回空切片。n 大于实际存量时返回全部存量。
+//
+// 这是 hook 系统的 peek 入口：与 channel 完全分离，不消费消息。
+func (mb *Mailbox) Snapshot(n int) []Message {
+	if n <= 0 {
+		return nil
+	}
+	mb.recentMu.Lock()
+	defer mb.recentMu.Unlock()
+	count := len(mb.recent)
+	if count == 0 {
+		return nil
+	}
+	if n > count {
+		n = count
+	}
+	// 取最后 n 条（最新的在末尾），反转成最新的在前
+	out := make([]Message, n)
+	for i := 0; i < n; i++ {
+		out[i] = mb.recent[count-1-i]
+	}
+	return out
 }
 
 // Drain 非阻塞取出当前 buffer 中的全部消息。无消息时返回 nil。
