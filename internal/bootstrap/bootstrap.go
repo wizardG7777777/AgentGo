@@ -101,7 +101,10 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	if err := hookReg.Register(builtin.NewValidateExpectedHashHook()); err != nil {
 		return nil, fmt.Errorf("注册 ValidateExpectedHashHook 失败: %w", err)
 	}
-	fmt.Println("[启动] Hook 系统初始化完成（已注册：record-artifact, path-boundary, validate-expected-hash）")
+	if err := hookReg.Register(builtin.NewRequireReadBeforeWriteHook(storeView)); err != nil {
+		return nil, fmt.Errorf("注册 RequireReadBeforeWriteHook 失败: %w", err)
+	}
+	fmt.Println("[启动] Hook 系统初始化完成（已注册：record-artifact, path-boundary, validate-expected-hash, require-read-before-write）")
 
 	// Step 3: 初始化花名册
 	r := roster.NewMemoryRoster()
