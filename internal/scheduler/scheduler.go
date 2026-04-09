@@ -2,7 +2,6 @@ package scheduler
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"strconv"
@@ -328,115 +327,17 @@ func (s *Scheduler) hasBatch() bool {
 }
 
 // ---- 公告板快照 ----
-
-type boardSnapshot struct {
-	Mode      string         `json:"mode"`
-	Trigger   triggerInfo    `json:"trigger"`
-	Tasks     []taskSnapshot `json:"tasks"`
-	Resources resourceInfo   `json:"resources"`
-}
-
-type resourceInfo struct {
-	WorkerCount      int `json:"worker_count"`
-	BusyWorkers      int `json:"busy_workers"`
-	AvailableWorkers int `json:"available_workers"`
-}
-
-type triggerInfo struct {
-	Type   string `json:"type"`
-	TaskID string `json:"task_id,omitempty"`
-	Text   string `json:"text,omitempty"`
-}
-
-type taskSnapshot struct {
-	ID            string            `json:"id"`
-	Description   string            `json:"description"`
-	Status        string            `json:"status"`
-	EventType     string            `json:"event_type,omitempty"`
-	Results       map[string]string `json:"results,omitempty"`
-	Error         string            `json:"error,omitempty"`
-	Dependencies  []string          `json:"dependencies,omitempty"`
-	PartialOutput string            `json:"partial_output,omitempty"`
-	// Artifacts 是任务实际写入磁盘的文件路径列表（相对项目根）。
-	// 暴露这一字段后，scheduler 在任务失败时能看到 worker 实际写过哪些文件——
-	// 即便路径漂移、命名不符 expected_artifacts，scheduler 也能据此判断
-	// 是 fall back 接收漂移产物，还是重新发布修正任务。
-	Artifacts []string `json:"artifacts,omitempty"`
-	// LastResponse 是 worker 最后一次 LLM 非工具响应的原始文本。
-	// 即使任务因校验失败回滚或最终崩溃，这条文本仍然保留，让 scheduler
-	// 看到 worker 自述了什么（例如"我已经把报告写到 docs/foo.md"）。
-	LastResponse string `json:"last_response,omitempty"`
-}
+//
+// 数据类型与 BuildBoardJSON helper 已迁移到 snapshot.go（S3 commit）。
+// 本方法保留作为 *Scheduler 上的薄包装，等待 S5 commit 删除整个 Scheduler 类型。
 
 func (s *Scheduler) buildBoardJSON(tasks []*model.Task, trigger model.Event) string {
+	_ = tasks // tasks 参数不再使用，BuildBoardJSON 内部从 store 重新拉取
 	mode := "immediate"
 	if s.GetMode() == ModePlan {
 		mode = "plan"
 	}
-
-	ti := triggerInfo{Type: string(trigger.Type), TaskID: trigger.TaskID}
-	if trigger.Payload != nil {
-		ti.Text = trigger.Payload["text"]
-	}
-
-	var taskSnaps []taskSnapshot
-	for _, t := range tasks {
-		snap := taskSnapshot{
-			ID:          t.ID,
-			Description: t.Description,
-			Status:      string(t.Status),
-			EventType:   t.EventType,
-		}
-		if model.IsTerminal(t.Status) && len(t.Results) > 0 {
-			snap.Results = t.Results
-		}
-		if t.Error != "" {
-			snap.Error = t.Error
-		}
-		if len(t.Dependencies) > 0 {
-			snap.Dependencies = t.Dependencies
-		}
-		if t.Status == model.TaskStatusProcessing && t.PartialOutput != "" {
-			snap.PartialOutput = t.PartialOutput
-		}
-		if len(t.Artifacts) > 0 {
-			snap.Artifacts = t.Artifacts
-		}
-		// 失败/重试中的任务尤其需要 LastResponse 帮助 scheduler 判断 worker 干了什么；
-		// 已 completed 的任务用 Results 即可，无需重复展开 LastResponse 占用 token。
-		if t.LastResponse != "" && t.Status != model.TaskStatusCompleted {
-			snap.LastResponse = t.LastResponse
-		}
-		taskSnaps = append(taskSnaps, snap)
-	}
-
-	busyWorkers := 0
-	for _, t := range tasks {
-		if t.Status == model.TaskStatusProcessing && t.EventType == "" {
-			busyWorkers += len(t.Agents)
-		}
-	}
-	workerCount := s.cfg.WorkerCount
-	if workerCount <= 0 {
-		workerCount = 1
-	}
-	available := workerCount - busyWorkers
-	if available < 0 {
-		available = 0
-	}
-
-	bs := boardSnapshot{
-		Mode:    mode,
-		Trigger: ti,
-		Tasks:   taskSnaps,
-		Resources: resourceInfo{
-			WorkerCount:      workerCount,
-			BusyWorkers:      busyWorkers,
-			AvailableWorkers: available,
-		},
-	}
-	data, _ := json.MarshalIndent(bs, "", "  ")
-	return string(data)
+	return BuildBoardJSON(s.store, s.cfg, mode, trigger)
 }
 
 // ---- 调度器专用工具 ----
