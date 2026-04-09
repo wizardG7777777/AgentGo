@@ -37,7 +37,7 @@ type System struct {
 	CancelRegistry  *store.TaskCancelRegistry
 	MailboxRegistry *mailbox.Registry
 	MailNotifier    *mailbox.MailNotifier
-	Scheduler       *scheduler.Scheduler
+	Scheduler       *scheduler.Bundle // Phase 3：scheduler 现在是 agent.Agent + Activator + ModeStore 的复合
 	Explorer        *explorer.Explorer
 	Workers         []*worker.Worker
 	ApprovalCh      chan shell.ApprovalRequest // 命令审批通道，Worker→CLI
@@ -150,10 +150,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 		time.Duration(cfg.LLMTimeoutSec)*time.Second,
 	)
 
-	// Step 5: 创建调度器（eventCh 消费者，必须先于生产者启动）
-	sched := scheduler.New(taskStore, schedulerLLM, eventCh, cfg, mbRegistry)
-
-	// Step 6: 创建看门狗
+	// Step 6: 创建看门狗（先于 scheduler 创建——scheduler 需要 approvalCh，但 watchdog 不需要）
 	w := watchdog.New(taskStore, cfg, eventCh, r)
 
 	// Step 7: 创建调查代理（复用与 Worker 相同的 SearchProvider 配置）
@@ -162,6 +159,14 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 
 	// Step 7.5: 创建命令审批通道（Worker→CLI）
 	approvalCh := make(chan shell.ApprovalRequest, 8)
+
+	// Step 5: 创建调度器（Phase 3：scheduler 是 agent.Agent 实例 + Activator + ModeStore）
+	// 工具集 = Worker 全集 + SchedulerGroup，可以读文件 / 搜索 / 查网页 / 跑 shell。
+	// EventCh 由 Activator 监听，转换为 EventType="__scheduler__" 的 task。
+	sched := scheduler.New(
+		taskStore, r, schedulerLLM, eventCh, cfg, cancelRegistry, mbRegistry, approvalCh,
+		hookReg, storeView, recordToolCall,
+	)
 
 	// Step 8: 创建执行代理（使用主 LLM，认领 event_type="" 的执行任务）
 	workerCount := cfg.WorkerCount
@@ -205,13 +210,19 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
 	s.cancel = cancel
 
-	// Step 5: 启动调度器（消费者先就绪）
+	// Step 5: 启动调度器（Phase 3：两个 goroutine —— Agent poll + Activator 事件桥）
+	// Activator 必须先就绪，否则 EventUserInput 在 Agent 未启动时就到达可能会被丢
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.Scheduler.Run(ctx)
+		s.Scheduler.Activator.Run(ctx)
 	}()
-	fmt.Println("[启动] 调度器已启动")
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.Scheduler.Agent.Run(ctx)
+	}()
+	fmt.Println("[启动] 调度器已启动 (agent + activator)")
 
 	// Step 6: 启动看门狗
 	s.wg.Add(1)

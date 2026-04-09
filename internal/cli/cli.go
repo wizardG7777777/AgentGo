@@ -17,11 +17,15 @@ import (
 )
 
 // CLI 处理用户输入，分发命令，发送事件到调度器。
+//
+// Phase 3 改动：scheduler 不再是独立类型，而是 *scheduler.Bundle 的复合
+// （Agent + Activator + ModeStore）。CLI 只需要 ModeStore 切换 plan/immediate，
+// 不再持有 scheduler 整体。
 type CLI struct {
 	store      store.TaskStore
 	eventCh    chan<- model.Event
 	cancelFn   context.CancelFunc
-	scheduler  *scheduler.Scheduler
+	mode       *scheduler.ModeStore         // 由 scheduler.Bundle 提供，用于 /mode 命令
 	mbRegistry *mailbox.Registry            // 邮箱注册表，用于 /steer 命令
 	approvalCh <-chan shell.ApprovalRequest // 命令审批请求通道，由 Worker 发送
 	reader     io.Reader
@@ -29,12 +33,18 @@ type CLI struct {
 }
 
 // New 创建 CLI 实例。reader/writer 用于输入输出，方便测试注入。
-func New(s store.TaskStore, eventCh chan<- model.Event, cancelFn context.CancelFunc, sched *scheduler.Scheduler, mbRegistry *mailbox.Registry, approvalCh <-chan shell.ApprovalRequest, reader io.Reader, writer io.Writer) *CLI {
+//
+// Phase 3 改动：参数 sched 类型从 *scheduler.Scheduler 改为 *scheduler.Bundle。
+func New(s store.TaskStore, eventCh chan<- model.Event, cancelFn context.CancelFunc, sched *scheduler.Bundle, mbRegistry *mailbox.Registry, approvalCh <-chan shell.ApprovalRequest, reader io.Reader, writer io.Writer) *CLI {
+	var modeStore *scheduler.ModeStore
+	if sched != nil {
+		modeStore = sched.Mode
+	}
 	return &CLI{
 		store:      s,
 		eventCh:    eventCh,
 		cancelFn:   cancelFn,
-		scheduler:  sched,
+		mode:       modeStore,
 		mbRegistry: mbRegistry,
 		approvalCh: approvalCh,
 		reader:     reader,
@@ -127,14 +137,18 @@ func (c *CLI) handleLine(line string) bool {
 }
 
 func (c *CLI) toggleMode() {
-	current := c.scheduler.GetMode()
+	if c.mode == nil {
+		fmt.Fprintln(c.writer, "[模式] 模式切换不可用（scheduler 未注入 ModeStore）")
+		return
+	}
+	current := c.mode.Get()
 	var newMode scheduler.Mode
 	if current == scheduler.ModeImmediate {
 		newMode = scheduler.ModePlan
 	} else {
 		newMode = scheduler.ModeImmediate
 	}
-	c.scheduler.SetMode(newMode)
+	c.mode.Set(newMode)
 
 	if newMode == scheduler.ModeImmediate {
 		fmt.Fprintln(c.writer, "[模式] 即时模式")

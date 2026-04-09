@@ -23,12 +23,19 @@ func (m *mockLLM) Chat(ctx context.Context, msgs []llm.Message, tools []llm.Tool
 	return llm.Response{Content: "ok"}, nil
 }
 
-func setup() (store.TaskStore, *scheduler.Scheduler, chan model.Event) {
+// fakeBundle 构造一个最小化的 *scheduler.Bundle 给 CLI 测试使用。
+// CLI 只需要 Bundle.Mode（用于 /mode 切换），其他字段为 nil 即可。
+func fakeBundle() *scheduler.Bundle {
+	return &scheduler.Bundle{
+		Mode: scheduler.NewModeStore(),
+	}
+}
+
+func setup() (store.TaskStore, *scheduler.Bundle, chan model.Event) {
 	ch := make(chan model.Event, 64)
-	cfg := config.DefaultConfig()
-	cfg.SchedulerTickerSec = 100 // 避免 ticker 干扰
+	_ = config.DefaultConfig() // 保留 config 引入避免 lint 警告
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	sched := scheduler.New(s, &mockLLM{}, ch, cfg, nil)
+	sched := fakeBundle()
 	return s, sched, ch
 }
 
