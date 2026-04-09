@@ -120,7 +120,7 @@ Watchdog 结构体已添加 `Roster` 字段，`inspect` 方法末尾调用 `clea
 
 ---
 
-## Scheduler 调用 report_done 后不终止 reactLoop，进入"幻觉心跳"无限循环（2026-04-10 Phase 3.1 发现）
+## ~~Scheduler 调用 report_done 后不终止 reactLoop，进入"幻觉心跳"无限循环~~（已修复 2026-04-10 Phase 3.1）
 
 **位置**：
 - [internal/tools/scheduler.go](../../internal/tools/scheduler.go) `SchedulerGroup.reportDone`
@@ -206,7 +206,38 @@ LLM 心想"哦看起来是定时唤醒，那我就发个心跳吧" → 又调一
 - 任何把"基于事件的 LLM agent"重构为"基于 poll 的 LLM agent"都会踩这个坑：**工具的"我做完了"语义和 reactLoop 的"我做完了"语义不再自然对齐，必须显式桥接**
 - 类似的坑在其他工具上不会出现（read_file 后 LLM 自然会决定调 report_done 或停止），唯独 scheduler 因为是预制代理 + 长期常驻 + 无限重试，触发了完整的灾难路径
 
-**状态**：⏳ 待修复（紧接此条目下方修复）
+**状态**：✅ 已修复（2026-04-10 Phase 3.1）
+
+**修复实施**：
+
+1. **`currentSchedulerTaskHolder` 加 `done bool` 字段** + `MarkSchedulerDone()` / `IsDone()` 方法（[scheduler.go](../../internal/scheduler/scheduler.go)）。`Set(id)` 在新任务开始时自动清零 done，确保 holder 跨任务复用安全。
+2. **新增 `tools.SchedulerDoneNotifier` 接口**（[tools/scheduler.go](../../internal/tools/scheduler.go)）。`SchedulerGroup` 加可选 `DoneNotifier` 字段；`reportDone` 在成功汇报、清空 batch 之后调 `DoneNotifier.MarkSchedulerDone()`。被硬拦截（batch 未完成）的 reportDone 不会触发 notify，避免错误终止。
+3. **新增 `scheduler.SchedulerDoneChecker` 接口** + `SchedulerExecutor.DoneChecker` 字段（[executor.go](../../internal/scheduler/executor.go)）。`Execute` 入口（步骤 0）检查 `IsDone()`，true 时立即返回 `ExecuteResult{ToolCalled: false}` 让 agent.Run 的 reactLoop 走"任务完成"路径终止当前 task。
+4. **scheduler.New 中两端注入同一个 holder**：`SchedulerGroup{DoneNotifier: holder}` 与 `SchedulerExecutor{DoneChecker: holder}` 共享同一个 `currentSchedulerTaskHolder`，让 reportDone 写入的信号能被下一轮 Execute 立即读到。
+
+**核心设计**：同一个 holder 对外暴露两个面 —— `Notifier`（写）和 `Checker`（读）。reportDone 是写入方，Execute 是读取方，agent.Run 的 reactLoop 在中间穿梭。这把"工具完成"语义与"reactLoop 终止"语义显式桥接起来。
+
+**实测验证**（2026-04-10 03:58 复测）：
+
+```
+03:58:04 loop=0 tool=report_done args={...}
+03:58:04 [scheduler-exec] DoneChecker.IsDone()=true，短路终止 reactLoop ← 关键日志
+（无任何 loop=1 心跳）
+
+03:58:18 loop=0 tool=read_file
+03:58:29 loop=1 tool=report_done args={...}
+03:58:29 [scheduler-exec] DoneChecker.IsDone()=true，短路终止 reactLoop
+（无任何 loop=2 心跳）
+```
+
+每次 report_done 后立即出现"短路终止"日志，幻觉心跳完全消失。
+
+**回归保护**：
+- `internal/scheduler/executor_test.go`：`TestSchedulerExecutor_DoneChecker_ShortCircuitsExecute` / `_NotDone_NormalExecution` / `_NilNoEffect` / `TestCurrentSchedulerTaskHolder_DoneFlagLifecycle`
+- `internal/tools/scheduler_test.go`：`TestSchedulerGroup_ReportDone_NotifiesDoneOnSuccess` / `_DoesNotNotifyOnRejection` / `_NilNotifierNoEffect`
+
+**未做的副修**（不影响主修复，留待未来）：
+- [executor.go:83](../../internal/scheduler/executor.go) 的 `trigger.Type = EventTickerWakeup` 写死 —— 短路修复后 LLM 永远不会进入"看到 ticker_wakeup"的第二轮，所以这条次要根因失去触发场景，可继续保留也可改为更中性的事件类型
 
 ---
 
@@ -723,7 +754,7 @@ LLM 想编也编不出来。
 | Worker prompt 缺路径字面执行指引 | ✅ 已修复（第二轮） |
 | Shell 拦截 E2E 测试缺口 | ⏳ 本轮不实施（见 nextUpgrade_v2.md） |
 | Scheduler 提前 report_done | ✅ 已修复（2026-04-10 Phase 3：SchedulerExecutor.waitForBatchTerminal 在 LLM 调用之前同步等待 batch 完成，从根本上消除"LLM 看到 pending 状态而误调 report_done"的可能；SchedulerGroup.report_done 的硬拦截作为最后兜底） |
-| **Scheduler report_done 后不终止 reactLoop（幻觉心跳循环）** | 🔴 **P0 待修复**（2026-04-10 Phase 3.1 发现，4 根因：报告工具不真终止 + ticker_wakeup trigger 误导 + MaxRetries=0 + reactLoop 语义和工具语义脱钩） |
+| **Scheduler report_done 后不终止 reactLoop（幻觉心跳循环）** | ✅ **已修复**（2026-04-10 Phase 3.1：currentSchedulerTaskHolder 加 done 标志 + tools.SchedulerDoneNotifier 接口让 reportDone 通知 + scheduler.SchedulerDoneChecker 接口让 SchedulerExecutor 在下一轮 Execute 入口短路返回 ToolCalled=false） |
 | **Scheduler 事件响应延迟 3 分钟** | 🟡 **P1 待排查** |
 | **Trace 多 goroutine 写入竞争** | 🟡 **P1 复核**（trace 系统已实现，需确认上锁覆盖） |
 | **邮件级联爆炸**（4 根因叠加） | ✅ **已修复**（2026-04-09，Phase 2 完成；Mailbox Hook 框架 + 4 项根因全部关闭，`mail_notifier_enabled=true` 默认） |
