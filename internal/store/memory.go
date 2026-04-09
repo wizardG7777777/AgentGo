@@ -32,6 +32,9 @@ type MemoryTaskStore struct {
 	defaultConcurrency int
 	defaultTimeoutSec  int
 	cancelRegistry     *TaskCancelRegistry
+	// toolCalls 记录每个任务的工具调用历史。二级索引 taskID -> toolName -> records
+	// 避免 hook 在每次工具调用前做 O(N) 全量扫描。
+	toolCalls map[string]map[string][]ToolCallRecord
 }
 
 // SetCancelRegistry 注入 per-task cancel context 管理器。
@@ -47,6 +50,7 @@ func NewMemoryTaskStore(eventCh chan<- model.Event, fifoLimit, defaultConcurrenc
 		fifoLimit:          fifoLimit,
 		defaultConcurrency: defaultConcurrency,
 		defaultTimeoutSec:  defaultTimeoutSec,
+		toolCalls:          make(map[string]map[string][]ToolCallRecord),
 	}
 }
 
@@ -409,6 +413,69 @@ func (s *MemoryTaskStore) AppendArtifact(taskID string, path string) error {
 	}
 	task.Artifacts = append(task.Artifacts, path)
 	return nil
+}
+
+// AppendToolCall 追加一条工具调用记录到指定任务的历史。
+// 由 llm_executor.go 在每次工具调用之后自动写入（包括被 hook Abort 的调用），
+// 供 hook 系统的 RequireReadBeforeWriteHook 等做事实查询。
+//
+// 写入路径必须在写锁下执行——llm_executor 在并行 goroutine 中调用工具
+// （一个 LLM 响应可能同时跑多个 tool call），每个 goroutine 都会触发本方法。
+func (s *MemoryTaskStore) AppendToolCall(taskID string, rec ToolCallRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.tasks[taskID]; !ok {
+		return ErrTaskNotFound
+	}
+	byTool, ok := s.toolCalls[taskID]
+	if !ok {
+		byTool = make(map[string][]ToolCallRecord)
+		s.toolCalls[taskID] = byTool
+	}
+	byTool[rec.ToolName] = append(byTool[rec.ToolName], rec)
+	return nil
+}
+
+// QueryToolCalls 返回指定任务的工具调用历史。
+// toolName == "" 时返回该任务的全部记录（按写入顺序合并各 toolName 的切片，
+// 然后按 Timestamp 升序排序）；否则只返回匹配 toolName 的记录切片。
+//
+// 任务不存在时返回 (nil, nil)——hook 需要容忍这种情形（例如任务刚被淘汰）。
+// 返回值是内部数据的浅拷贝，调用方可以安全遍历或修改。
+func (s *MemoryTaskStore) QueryToolCalls(taskID string, toolName string) ([]ToolCallRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	byTool, ok := s.toolCalls[taskID]
+	if !ok {
+		return nil, nil
+	}
+	if toolName != "" {
+		src := byTool[toolName]
+		if len(src) == 0 {
+			return nil, nil
+		}
+		dst := make([]ToolCallRecord, len(src))
+		copy(dst, src)
+		return dst, nil
+	}
+	// 全量：合并所有 toolName 的切片
+	total := 0
+	for _, recs := range byTool {
+		total += len(recs)
+	}
+	if total == 0 {
+		return nil, nil
+	}
+	dst := make([]ToolCallRecord, 0, total)
+	for _, recs := range byTool {
+		dst = append(dst, recs...)
+	}
+	sort.Slice(dst, func(i, j int) bool {
+		return dst[i].Timestamp.Before(dst[j].Timestamp)
+	})
+	return dst, nil
 }
 
 // GetDependencyArtifacts 返回 taskID 的所有依赖任务实际写入的文件路径，

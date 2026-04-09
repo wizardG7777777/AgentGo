@@ -1,6 +1,24 @@
 package store
 
-import "agentgo/internal/model"
+import (
+	"time"
+
+	"agentgo/internal/model"
+)
+
+// ToolCallRecord 记录一次工具调用的事实快照。
+// 由 llm_executor.go 在每次工具调用之后（无论成功、失败，还是被 hook Abort）
+// 自动写入公告板，供 hook 系统的 RequireReadBeforeWriteHook 等查询任务历史。
+//
+// Args 是工具调用的原始参数；Success=false 的记录包含 hook 拒绝和工具错误两种情况，
+// 由 hook 消费者自行决定是否计入统计。
+type ToolCallRecord struct {
+	Timestamp time.Time
+	AgentID   string
+	ToolName  string
+	Args      map[string]any
+	Success   bool
+}
 
 type TaskStore interface {
 	// Atomic write operations (require lock)
@@ -18,6 +36,17 @@ type TaskStore interface {
 	// 由 LocalWriteGroup 在 write_file/edit_file 成功后调用。
 	// path 应当是相对项目根目录的相对路径（调用方负责标准化）。
 	AppendArtifact(taskID string, path string) error
+
+	// AppendToolCall 追加一条工具调用记录到指定任务的历史。
+	// 由 llm_executor.go 在每次 tools.Dispatch 之后自动写入（包括被 hook Abort 的调用）。
+	// hook 系统通过 StoreHookView.GetToolCallHistory 查询这些记录做事实校对。
+	AppendToolCall(taskID string, rec ToolCallRecord) error
+
+	// QueryToolCalls 返回指定任务的工具调用历史。
+	// toolName == "" 时返回该任务的全部记录；否则只返回匹配 toolName 的记录。
+	// 返回切片是内部数据的浅拷贝，调用方可安全遍历修改。
+	// 任务不存在时返回 (nil, nil)——hook 需要容忍这种情形。
+	QueryToolCalls(taskID string, toolName string) ([]ToolCallRecord, error)
 
 	// RecordLastResponse 持久化 agent 最近一次 LLM 非工具响应（worker 的"我做完了"那句话）。
 	// 在 SubmitResult 成功路径和 ExpectedArtifacts 校验失败路径都会调用——

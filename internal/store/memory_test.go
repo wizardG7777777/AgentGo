@@ -862,3 +862,146 @@ func TestAppendArtifact_ConcurrentSameTask(t *testing.T) {
 		t.Errorf("expected 100 unique artifacts, got %d", len(got.Artifacts))
 	}
 }
+
+// --- ToolCallRecord 历史记录（C1 新增） ---
+
+func TestAppendToolCall_BasicWriteAndRead(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	task := publishTestTask(t, s, "test")
+
+	rec := ToolCallRecord{
+		Timestamp: time.Now(),
+		AgentID:   "worker-1",
+		ToolName:  "read_file",
+		Args:      map[string]any{"path": "docs/foo.md"},
+		Success:   true,
+	}
+	if err := s.AppendToolCall(task.ID, rec); err != nil {
+		t.Fatalf("AppendToolCall: %v", err)
+	}
+
+	got, err := s.QueryToolCalls(task.ID, "read_file")
+	if err != nil {
+		t.Fatalf("QueryToolCalls: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(got))
+	}
+	if got[0].AgentID != "worker-1" || got[0].ToolName != "read_file" {
+		t.Errorf("record fields mismatch: %+v", got[0])
+	}
+	if p, _ := got[0].Args["path"].(string); p != "docs/foo.md" {
+		t.Errorf("Args[path] = %q, want docs/foo.md", p)
+	}
+}
+
+func TestAppendToolCall_TaskNotFound(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	rec := ToolCallRecord{ToolName: "read_file"}
+	err := s.AppendToolCall("nonexistent-id", rec)
+	if err != ErrTaskNotFound {
+		t.Errorf("expected ErrTaskNotFound, got %v", err)
+	}
+}
+
+func TestQueryToolCalls_FilterByToolName(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	task := publishTestTask(t, s, "test")
+
+	// 插入 3 种工具各 2 次
+	base := time.Now()
+	for i, tool := range []string{"read_file", "write_file", "grep_search"} {
+		for j := 0; j < 2; j++ {
+			s.AppendToolCall(task.ID, ToolCallRecord{
+				Timestamp: base.Add(time.Duration(i*2+j) * time.Millisecond),
+				ToolName:  tool,
+				Args:      map[string]any{"k": j},
+				Success:   true,
+			})
+		}
+	}
+
+	// 过滤 read_file
+	reads, _ := s.QueryToolCalls(task.ID, "read_file")
+	if len(reads) != 2 {
+		t.Errorf("expected 2 read_file records, got %d", len(reads))
+	}
+	// 过滤不存在的工具
+	none, _ := s.QueryToolCalls(task.ID, "list_dir")
+	if len(none) != 0 {
+		t.Errorf("expected 0 list_dir records, got %d", len(none))
+	}
+	// 全量查询 toolName == "" 返回 6 条并按时间排序
+	all, _ := s.QueryToolCalls(task.ID, "")
+	if len(all) != 6 {
+		t.Errorf("expected 6 total records, got %d", len(all))
+	}
+	for i := 1; i < len(all); i++ {
+		if all[i].Timestamp.Before(all[i-1].Timestamp) {
+			t.Errorf("records not sorted by timestamp ascending at index %d", i)
+		}
+	}
+}
+
+func TestQueryToolCalls_NonExistentTask(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	got, err := s.QueryToolCalls("nonexistent-id", "")
+	if err != nil {
+		t.Errorf("expected nil error for nonexistent task, got %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil slice, got %v", got)
+	}
+}
+
+func TestAppendToolCall_ReturnedSliceIsCopy(t *testing.T) {
+	// 验证 QueryToolCalls 返回切片的修改不影响内部存储
+	s, _ := newTestStore(10, 100)
+	task := publishTestTask(t, s, "test")
+	s.AppendToolCall(task.ID, ToolCallRecord{
+		ToolName: "read_file",
+		Args:     map[string]any{"path": "a.md"},
+		Success:  true,
+	})
+
+	got, _ := s.QueryToolCalls(task.ID, "read_file")
+	if len(got) != 1 {
+		t.Fatalf("setup: expected 1 record")
+	}
+	// 修改外部返回的切片（尝试污染内部存储）
+	got[0] = ToolCallRecord{ToolName: "tampered"}
+
+	// 再查一次，内部数据应不受影响
+	again, _ := s.QueryToolCalls(task.ID, "read_file")
+	if len(again) != 1 || again[0].ToolName != "read_file" {
+		t.Errorf("internal store was mutated: %+v", again)
+	}
+}
+
+func TestAppendToolCall_ConcurrentSameTask(t *testing.T) {
+	// 模拟 llm_executor.go 并行 goroutine 同时调用工具的场景
+	s, _ := newTestStore(10, 100)
+	task := publishTestTask(t, s, "concurrent test")
+
+	const N = 50
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			s.AppendToolCall(task.ID, ToolCallRecord{
+				Timestamp: time.Now(),
+				AgentID:   fmt.Sprintf("worker-%d", idx%3),
+				ToolName:  "read_file",
+				Args:      map[string]any{"idx": idx},
+				Success:   true,
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	got, _ := s.QueryToolCalls(task.ID, "read_file")
+	if len(got) != N {
+		t.Errorf("expected %d concurrent records, got %d", N, len(got))
+	}
+}
