@@ -297,6 +297,193 @@ func TestSendMessage_Broadcast(t *testing.T) {
 	}
 }
 
+// ---- B5: send_message 邮件链跳数继承 ----
+
+func TestSendMessage_PropagatesChainDepth(t *testing.T) {
+	mbReg := mailbox.NewRegistry(8)
+	mbReg.Register("sender", "")
+	recvBox := mbReg.Register("receiver", "")
+
+	// 当前任务 MailChainDepth=2，期望 outgoing message ChainDepth=3
+	s := newFakeStore()
+	parent := &model.Task{ID: "current", MailChainDepth: 2, Status: model.TaskStatusProcessing}
+	s.tasks[parent.ID] = parent
+
+	g := MetaGroup{
+		MBRegistry: mbReg,
+		AgentID:    "sender",
+		Holder:     &fakeHolder{id: "current"},
+		Store:      s,
+	}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("send_message", map[string]any{
+		"to":      "receiver",
+		"content": "继承链深度",
+	}))
+	if err != nil {
+		t.Fatalf("send 失败: %v", err)
+	}
+
+	msgs := recvBox.Drain()
+	if len(msgs) != 1 {
+		t.Fatalf("期望 1 条消息，实际: %d", len(msgs))
+	}
+	if msgs[0].ChainDepth != 3 {
+		t.Errorf("期望 ChainDepth=3 (parent.MailChainDepth=2 + 1)，实际: %d", msgs[0].ChainDepth)
+	}
+}
+
+func TestSendMessage_ChainDepth_ZeroParent(t *testing.T) {
+	mbReg := mailbox.NewRegistry(8)
+	mbReg.Register("sender", "")
+	recvBox := mbReg.Register("receiver", "")
+
+	// parent.MailChainDepth=0 → outgoing.ChainDepth=1
+	s := newFakeStore()
+	parent := &model.Task{ID: "current", MailChainDepth: 0}
+	s.tasks[parent.ID] = parent
+
+	g := MetaGroup{
+		MBRegistry: mbReg,
+		AgentID:    "sender",
+		Holder:     &fakeHolder{id: "current"},
+		Store:      s,
+	}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, _ = reg.Dispatch(context.Background(), mkCall("send_message", map[string]any{
+		"to":      "receiver",
+		"content": "x",
+	}))
+	msgs := recvBox.Drain()
+	if len(msgs) != 1 || msgs[0].ChainDepth != 1 {
+		t.Errorf("期望 ChainDepth=1，实际: %+v", msgs)
+	}
+}
+
+func TestSendMessage_ChainDepth_NilHolder_DefaultsToZero(t *testing.T) {
+	mbReg := mailbox.NewRegistry(8)
+	mbReg.Register("sender", "")
+	recvBox := mbReg.Register("receiver", "")
+
+	// Holder=nil → Scheduler 模式 → ChainDepth=0
+	g := MetaGroup{
+		MBRegistry: mbReg,
+		AgentID:    "sender",
+		// Holder 故意留 nil
+	}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("send_message", map[string]any{
+		"to":      "receiver",
+		"content": "x",
+	}))
+	if err != nil {
+		t.Fatalf("send 失败: %v", err)
+	}
+	msgs := recvBox.Drain()
+	if len(msgs) != 1 || msgs[0].ChainDepth != 0 {
+		t.Errorf("nil Holder 时 ChainDepth 应为 0，实际: %+v", msgs)
+	}
+}
+
+func TestSendMessage_ChainDepth_EmptyTaskID_DefaultsToZero(t *testing.T) {
+	mbReg := mailbox.NewRegistry(8)
+	mbReg.Register("sender", "")
+	recvBox := mbReg.Register("receiver", "")
+
+	// Holder.Get() 返回空字符串 → ChainDepth=0
+	g := MetaGroup{
+		MBRegistry: mbReg,
+		AgentID:    "sender",
+		Holder:     &fakeHolder{id: ""},
+		Store:      newFakeStore(),
+	}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("send_message", map[string]any{
+		"to":      "receiver",
+		"content": "x",
+	}))
+	if err != nil {
+		t.Fatalf("send 失败: %v", err)
+	}
+	msgs := recvBox.Drain()
+	if len(msgs) != 1 || msgs[0].ChainDepth != 0 {
+		t.Errorf("空 taskID 时 ChainDepth 应为 0，实际: %+v", msgs)
+	}
+}
+
+func TestSendMessage_ChainDepth_TaskNotFound_DefaultsToZero(t *testing.T) {
+	mbReg := mailbox.NewRegistry(8)
+	mbReg.Register("sender", "")
+	recvBox := mbReg.Register("receiver", "")
+
+	// Holder 指向不存在的 task → GetTask 返回 error → ChainDepth=0
+	g := MetaGroup{
+		MBRegistry: mbReg,
+		AgentID:    "sender",
+		Holder:     &fakeHolder{id: "nonexistent"},
+		Store:      newFakeStore(),
+	}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("send_message", map[string]any{
+		"to":      "receiver",
+		"content": "x",
+	}))
+	if err != nil {
+		t.Fatalf("send 不应因 GetTask 失败而中止: %v", err)
+	}
+	msgs := recvBox.Drain()
+	if len(msgs) != 1 || msgs[0].ChainDepth != 0 {
+		t.Errorf("task 不存在时 ChainDepth 应兜底为 0，实际: %+v", msgs)
+	}
+}
+
+func TestSendMessage_ChainDepth_BroadcastInherits(t *testing.T) {
+	mbReg := mailbox.NewRegistry(8)
+	mbReg.Register("sender", "")
+	boxA := mbReg.Register("a", "")
+	boxB := mbReg.Register("b", "")
+
+	s := newFakeStore()
+	parent := &model.Task{ID: "current", MailChainDepth: 5}
+	s.tasks[parent.ID] = parent
+
+	g := MetaGroup{
+		MBRegistry: mbReg,
+		AgentID:    "sender",
+		Holder:     &fakeHolder{id: "current"},
+		Store:      s,
+	}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("send_message", map[string]any{
+		"to":      "*",
+		"content": "广播",
+	}))
+	if err != nil {
+		t.Fatalf("broadcast 失败: %v", err)
+	}
+
+	msgsA := boxA.Drain()
+	msgsB := boxB.Drain()
+	if len(msgsA) != 1 || msgsA[0].ChainDepth != 6 {
+		t.Errorf("广播收件人 a 应继承 ChainDepth=6，实际: %+v", msgsA)
+	}
+	if len(msgsB) != 1 || msgsB[0].ChainDepth != 6 {
+		t.Errorf("广播收件人 b 应继承 ChainDepth=6，实际: %+v", msgsB)
+	}
+}
+
 func TestSendMessage_DefaultMsgType(t *testing.T) {
 	mbReg := mailbox.NewRegistry(8)
 	mbReg.Register("sender", "")

@@ -159,6 +159,17 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 }
 
 // sendMessage 是 worker.MakeSendMessageTool 的内联端口，避免循环依赖。
+//
+// Phase 2 改动：邮件链跳数继承（B5）。读取当前任务的 MailChainDepth，
+// 写入 outgoing message 的 ChainDepth = parent.MailChainDepth + 1。
+// 这条值随后被 ChainDepthLimitHook 在 BeforeSend 阶段校验，超过
+// cfg.MailChainMaxDepth 的消息被拒绝，从而打断邮件级联爆炸。
+//
+// 兜底语义：
+//   - g.Holder == nil（Scheduler 模式）→ chainDepth = 0
+//   - g.Store == nil（不应发生，但防御）→ chainDepth = 0
+//   - 当前任务 ID 为空 → chainDepth = 0
+//   - GetTask 失败 → chainDepth = 0（不阻断 send_message，只是失去链跟踪）
 func (g MetaGroup) sendMessage(ctx context.Context, args map[string]any) (string, error) {
 	to, _ := args["to"].(string)
 	content, _ := args["content"].(string)
@@ -179,14 +190,26 @@ func (g MetaGroup) sendMessage(ctx context.Context, args map[string]any) (string
 	}
 	summary, _ := args["summary"].(string)
 
+	// 读当前任务的 MailChainDepth 作为新邮件链深度的起点。
+	// 不存在 / 出错时退化为 0，与"用户 /steer 投递的初始邮件"等价。
+	chainDepth := 0
+	if g.Holder != nil && g.Store != nil {
+		if taskID := g.Holder.Get(); taskID != "" {
+			if task, err := g.Store.GetTask(taskID); err == nil && task != nil {
+				chainDepth = task.MailChainDepth + 1
+			}
+		}
+	}
+
 	msg := mailbox.Message{
-		From:     g.AgentID,
-		To:       to,
-		Content:  content,
-		Summary:  summary,
-		Type:     msgType,
-		Priority: priority,
-		SentAt:   time.Now(),
+		From:       g.AgentID,
+		To:         to,
+		Content:    content,
+		Summary:    summary,
+		Type:       msgType,
+		Priority:   priority,
+		SentAt:     time.Now(),
+		ChainDepth: chainDepth,
 	}
 	if err := g.MBRegistry.Send(msg); err != nil {
 		return "", err
