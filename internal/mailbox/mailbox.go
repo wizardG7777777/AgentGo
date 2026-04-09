@@ -32,6 +32,12 @@ type Message struct {
 	Type     string    // 消息类型：info / question / reply / steer / ack
 	Priority string    // 优先级：low / normal / high
 	SentAt   time.Time // 发送时间
+
+	// ChainDepth 是邮件链跳数。用户 /steer 投递的初始邮件为 0；
+	// worker 通过 send_message 触发的邮件继承"自己当前任务的 MailChainDepth + 1"。
+	// 超过 cfg.MailChainMaxDepth 的邮件由 ChainDepthLimitHook 在 BeforeSend 阶段拒绝。
+	// Phase 2 引入；零值兼容现有调用方（既有测试不需要修改）。
+	ChainDepth int
 }
 
 // Mailbox 单个代理的收件箱，底层为 buffered channel。

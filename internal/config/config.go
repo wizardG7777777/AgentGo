@@ -38,6 +38,11 @@ type Config struct {
 	// MailNotifierEnabled 控制邮差通知器是否启动。默认 false（一刀切禁用），用于防止邮件级联爆炸（见 KNOWN_ISSUES.md）。
 	// 等"chain_depth + 去重 + 上下文展开 + reply 抑制" 4 项修复落地后再恢复为 true。
 	MailNotifierEnabled bool `yaml:"mail_notifier_enabled" json:"mail_notifier_enabled"`
+	// MailChainMaxDepth 是邮件链跳数上限。worker 通过 send_message 触发的邮件
+	// 继承"自己当前任务的 MailChainDepth + 1"；超过此阈值的消息仍然会投递到
+	// 收件箱（保留可见性），但不会触发 mail-notifier 发布唤醒任务，从而打断
+	// 邮件级联爆炸链。Phase 2 引入；用户 /steer 投递的初始邮件 ChainDepth=0。
+	MailChainMaxDepth int `yaml:"mail_chain_max_depth" json:"mail_chain_max_depth"`
 	SearchAPIProvider       string `yaml:"search_api_provider" json:"search_api_provider"`
 	SearchAPIURL            string `yaml:"search_api_url" json:"search_api_url"`
 	SearchAPIKey            string `yaml:"search_api_key" json:"search_api_key"`
@@ -66,7 +71,8 @@ func DefaultConfig() *Config {
 		WorkerCount:             1,
 		MailboxBufferSize:       32,
 		MailNotifierIntervalSec: 5,
-		MailNotifierEnabled:     false, // 默认禁用，防止邮件级联爆炸
+		MailNotifierEnabled:     false, // Phase 2 完成后在 B9 改为 true（默认启用）
+		MailChainMaxDepth:       3,     // Phase 2 新增；与 hookSystem.md §3.2 一致
 		SearchAPIProvider:       "duckduckgo_html",
 	}
 }
