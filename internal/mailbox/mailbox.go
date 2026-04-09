@@ -180,11 +180,17 @@ func truncate(s string, maxRunes int) string {
 }
 
 // Registry 全局路由表，管理 agentID → Mailbox 的映射。
+//
+// hookRunner 是 mailbox hook 系统的接入点（Phase 2 引入）。它是一个最小
+// 接口（定义在 hookrunner.go），由外部 bootstrap 通过 AttachHookRunner
+// 注入。零值（未挂接）时所有 hook 调用被跳过 —— 既有测试以及不需要 hook
+// 的调用方完全不需要修改。
 type Registry struct {
-	mu      sync.RWMutex
-	boxes   map[string]*Mailbox
-	aliases map[string]string // 别名 → 实际 agentID（如 "scheduler" → "scheduler-a1b2c3d4"）
-	bufSize int
+	mu         sync.RWMutex
+	boxes      map[string]*Mailbox
+	aliases    map[string]string // 别名 → 实际 agentID（如 "scheduler" → "scheduler-a1b2c3d4"）
+	bufSize    int
+	hookRunner MailboxHookRunner // nil = 未挂接 hook 系统
 }
 
 // NewRegistry 创建邮箱注册表。bufSize 为每个 Mailbox 的 channel 缓冲区大小。
@@ -197,6 +203,18 @@ func NewRegistry(bufSize int) *Registry {
 		aliases: make(map[string]string),
 		bufSize: bufSize,
 	}
+}
+
+// AttachHookRunner 把一个 hook runner 挂接到本 Registry，使后续的 Send
+// 调用经过 BeforeSend / BeforeDeliver 决策。bootstrap 应在系统启动期
+// （任何 Send 之前）调用一次；运行期切换 hook 不被支持。
+//
+// 传 nil 等价于"卸下 hook 系统"，所有 Send 路径恢复到 hook 全部禁用的行为。
+// 这条语义让 V9 回归验证（卸掉 hook 跑一遍既有测试）天然成立。
+func (r *Registry) AttachHookRunner(runner MailboxHookRunner) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.hookRunner = runner
 }
 
 // MailboxStatus 描述一个有未读消息的邮箱状态。
@@ -245,7 +263,26 @@ func (r *Registry) RegisterAlias(alias, targetID string) {
 
 // Send 路由并投递消息。to=="*" 时广播给除发送者外的所有代理；否则点对点投递。
 // 未知收件人返回 error。
+//
+// Phase 2 改动：hook 接入。
+//   - BeforeSend 在 Send 入口被调用一次。abort=true 时整条消息被拒绝
+//     （返回 error，不进任何收件箱）。
+//   - BeforeDeliver 在每个具体收件人的 TrySend 之前被调用：
+//     · 广播路径：abort=true 仅跳过该收件人，其他收件人不受影响
+//     · 单点路径：abort=true 整条消息被拒绝（返回 error）
+//
+// 当 hookRunner 未挂接（nil）时，所有 hook 调用被跳过，行为与 Phase 1
+// 字节级一致 —— 这是 V9 回归验证的基础。
 func (r *Registry) Send(msg Message) error {
+	runner := r.snapshotHookRunner()
+
+	// BeforeSend hook 决策
+	if runner != nil {
+		if abort, reason, hookName := runner.BeforeSend(msg); abort {
+			return fmt.Errorf("mailbox hook %s 拒绝发送: %s", hookName, reason)
+		}
+	}
+
 	if msg.To == "*" {
 		r.mu.RLock()
 		ids := make([]string, 0, len(r.boxes))
@@ -257,6 +294,13 @@ func (r *Registry) Send(msg Message) error {
 		for _, id := range ids {
 			if id == msg.From {
 				continue // 跳过自己
+			}
+			// BeforeDeliver hook 决策（按收件人）
+			if runner != nil {
+				if abort, reason, hookName := runner.BeforeDeliver(msg, id); abort {
+					log.Printf("[mailbox] hook %s 拒绝向 %s 投递广播: %s", hookName, id, reason)
+					continue
+				}
 			}
 			r.mu.RLock()
 			mb := r.boxes[id]
@@ -270,8 +314,23 @@ func (r *Registry) Send(msg Message) error {
 	if !ok {
 		return fmt.Errorf("未知收件人: %s", msg.To)
 	}
+	// BeforeDeliver hook 决策（单点路径）
+	if runner != nil {
+		if abort, reason, hookName := runner.BeforeDeliver(msg, msg.To); abort {
+			return fmt.Errorf("mailbox hook %s 拒绝向 %s 投递: %s", hookName, msg.To, reason)
+		}
+	}
 	mb.TrySend(msg)
 	return nil
+}
+
+// snapshotHookRunner 在读锁下读取当前的 hookRunner 引用。
+// 单独抽出避免 Send 方法持锁过久（hookRunner 可能在运行期被替换 —— 虽然
+// 不推荐，但 AttachHookRunner 不限制调用时机）。
+func (r *Registry) snapshotHookRunner() MailboxHookRunner {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.hookRunner
 }
 
 // AllIDs 返回当前所有已注册的 agentID 快照（不含别名）。
