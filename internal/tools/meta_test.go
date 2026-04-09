@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"agentgo/internal/agent"
@@ -224,6 +225,100 @@ func TestPublishTask_MissingDescription(t *testing.T) {
 	_, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{}))
 	if err == nil || !strings.Contains(err.Error(), "description") {
 		t.Fatalf("expected missing description error, got %v", err)
+	}
+}
+
+// ---- S1: BatchTracker integration ----
+
+// recordingBatchTracker captures every AppendBatch call.
+type recordingBatchTracker struct {
+	mu      sync.Mutex
+	calls   []string
+	failNth int // 0 = never fail; n>0 = fail on n-th call (1-indexed)
+}
+
+func (r *recordingBatchTracker) AppendBatch(childTaskID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, childTaskID)
+	if r.failNth > 0 && len(r.calls) == r.failNth {
+		return fmt.Errorf("simulated tracker failure")
+	}
+	return nil
+}
+
+func TestMetaGroup_PublishTask_AppendsBatchWhenTrackerSet(t *testing.T) {
+	s := newFakeStore()
+	tracker := &recordingBatchTracker{}
+	g := MetaGroup{
+		Store:        s,
+		Holder:       nil, // scheduler mode
+		BatchTracker: tracker,
+	}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	for i := 0; i < 3; i++ {
+		_, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+			"description": fmt.Sprintf("task-%d", i),
+		}))
+		if err != nil {
+			t.Fatalf("publish #%d failed: %v", i, err)
+		}
+	}
+
+	if len(tracker.calls) != 3 {
+		t.Fatalf("expected 3 AppendBatch calls, got %d", len(tracker.calls))
+	}
+	// 顺序应当与 publish 顺序一致，且 ID 由 fakeStore 自动生成
+	for i, id := range tracker.calls {
+		expected := fmt.Sprintf("task-%d", i+1)
+		if id != expected {
+			t.Errorf("call[%d] tracker got %q, want %q", i, id, expected)
+		}
+	}
+}
+
+func TestMetaGroup_PublishTask_NoTrackerNoEffect(t *testing.T) {
+	// 既有 worker 模式：BatchTracker=nil，publish_task 行为不变
+	s := newFakeStore()
+	g := MetaGroup{Store: s, Holder: nil}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	out, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description": "no tracker",
+	}))
+	if err != nil {
+		t.Fatalf("publish failed: %v", err)
+	}
+	if !strings.Contains(out, "已创建任务") {
+		t.Errorf("expected success message, got %q", out)
+	}
+}
+
+func TestMetaGroup_PublishTask_TrackerErrorDoesNotBlock(t *testing.T) {
+	s := newFakeStore()
+	tracker := &recordingBatchTracker{failNth: 1}
+	g := MetaGroup{
+		Store:        s,
+		BatchTracker: tracker,
+	}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	out, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description": "tracker fails",
+	}))
+	if err != nil {
+		t.Fatalf("publish should not fail when tracker errors: %v", err)
+	}
+	if !strings.Contains(out, "已创建任务") {
+		t.Errorf("publish should still succeed, got %q", out)
+	}
+	// task 应当已经被 publish
+	if len(s.createCalls) != 1 {
+		t.Errorf("expected 1 published task, got %d", len(s.createCalls))
 	}
 }
 
