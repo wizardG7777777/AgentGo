@@ -118,6 +118,15 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	mbRegistry := mailbox.NewRegistry(cfg.MailboxBufferSize)
 	fmt.Println("[启动] 邮箱注册表初始化完成")
 
+	// Step 3.6: 初始化 Mailbox Hook 系统（Phase 2）
+	// 与 ToolHookRegistry 并列共存、独立。registry 创建后立即通过
+	// AsMailboxRunner 适配器挂接到 mbRegistry，使后续的 mailbox.Send 路径
+	// 走 BeforeSend / BeforeDeliver 决策。具体的 mailbox hook 在后续 commit
+	// (B6/B7/B8) 注册；本 commit 创建一个空 registry 即可，等同于 noop 防御层。
+	mailboxHookReg := hook.NewMailboxHookRegistry()
+	mbRegistry.AttachHookRunner(hook.AsMailboxRunner(mailboxHookReg))
+	fmt.Println("[启动] Mailbox Hook 系统初始化完成（暂未注册具体 hook）")
+
 	// Step 4: 创建 LLM 客户端
 	schedulerLLM := llm.NewSDKClient(
 		cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel,
