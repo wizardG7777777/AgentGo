@@ -56,11 +56,11 @@ func (g LocalWriteGroup) Register(r *agent.ToolRegistry) {
 }
 
 // writeFile 实现 write_file 工具。端口自 worker.makeWriteFileTool。
-// 严格顺序：validate → TryClaim → (defer Release) → ReadFile → hash 校验 → MkdirAll → WriteFile → 缓存失效。
+// 严格顺序：validate → TryClaim → (defer Release) → MkdirAll → WriteFile → 缓存失效。
+// 注：expected_hash 校验在 C7 后由 ValidateExpectedHashHook 接管，不再在工具内部读取。
 func (g LocalWriteGroup) writeFile(ctx context.Context, args map[string]any) (string, error) {
 	path, _ := args["path"].(string)
 	content, _ := args["content"].(string)
-	expectedHash, _ := args["expected_hash"].(string)
 	if path == "" {
 		return "", fmt.Errorf("缺少 path 参数")
 	}
@@ -88,17 +88,9 @@ func (g LocalWriteGroup) writeFile(ctx context.Context, args map[string]any) (st
 	}
 	defer g.Roster.Release(g.AgentID, path)
 
-	// 乐观并发校验：若提供了 expected_hash 且文件已存在，校验哈希一致性
-	if expectedHash != "" {
-		existing, readErr := os.ReadFile(path)
-		if readErr == nil {
-			currentHash := computeSHA256(existing)
-			if currentHash != expectedHash {
-				return "", fmt.Errorf("写入冲突：文件 %s 的内容已被其他代理修改（期望哈希 %s，当前哈希 %s）。请重新调用 read_file 获取最新内容后再试", path, expectedHash, currentHash)
-			}
-		}
-		// 若文件不存在（os.IsNotExist 或其他），跳过校验，允许新建
-	}
+	// C7 迁移：原 expected_hash 校验段已删除。
+	// 乐观并发控制由 ValidateExpectedHashHook（PreCall, prio=20）接管。
+	// 决策 B1：接受微小 TOCTOU 窗口（hook 校验在 Roster 锁外）。
 
 	// 确保父目录存在
 	dir := filepath.Dir(path)
@@ -134,11 +126,11 @@ func (g LocalWriteGroup) writeFile(ctx context.Context, args map[string]any) (st
 
 // editFile 实现 edit_file 工具。端口自 worker.makeEditFileTool。
 // 读取、匹配计数、替换写入三步在同一个 Roster 锁持有期间完成。
+// 注：expected_hash 校验在 C7 后由 ValidateExpectedHashHook 接管。
 func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (string, error) {
 	path, _ := args["path"].(string)
 	oldStr, _ := args["old_str"].(string)
 	newStr, _ := args["new_str"].(string)
-	expectedHash, _ := args["expected_hash"].(string)
 
 	if path == "" {
 		return "", fmt.Errorf("缺少 path 参数")
@@ -176,13 +168,8 @@ func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (str
 		return "", fmt.Errorf("文件不存在: %s", path)
 	}
 
-	// 乐观并发校验
-	if expectedHash != "" {
-		currentHash := computeSHA256(data)
-		if currentHash != expectedHash {
-			return "", fmt.Errorf("编辑冲突：文件 %s 的内容已被其他代理修改（期望哈希 %s，当前哈希 %s）。请重新调用 read_file 获取最新内容后再试", path, expectedHash, currentHash)
-		}
-	}
+	// C7 迁移：原 expected_hash 校验段已删除。
+	// 由 ValidateExpectedHashHook 在 PreCall 阶段接管（决策 B1：接受微小 TOCTOU）。
 
 	content := string(data)
 
