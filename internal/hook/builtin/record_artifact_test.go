@@ -26,6 +26,9 @@ func (m *mockArtifactStore) AppendArtifact(taskID string, path string) error {
 func (m *mockArtifactStore) GetToolCallHistory(taskID string) []store.ToolCallRecord {
 	return nil
 }
+func (m *mockArtifactStore) ScanPendingByEventSource(source, eventType string) []*model.Task {
+	return nil
+}
 
 // ---- Interface and metadata ----
 

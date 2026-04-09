@@ -125,6 +125,18 @@ func (m *mockHookView) GetToolCallHistory(taskID string) []ToolCallRecord {
 	return m.history[taskID]
 }
 
+func (m *mockHookView) ScanPendingByEventSource(source, eventType string) []*model.Task {
+	var result []*model.Task
+	for _, task := range m.tasks {
+		if task.EventSource == source &&
+			task.EventType == eventType &&
+			task.Status == model.TaskStatusPending {
+			result = append(result, task)
+		}
+	}
+	return result
+}
+
 func TestStoreHookView_MockReplaceable(t *testing.T) {
 	mock := &mockHookView{
 		tasks: map[string]*model.Task{
