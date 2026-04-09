@@ -28,7 +28,7 @@
 
 ---
 
-# Hook System（2026-04-09 阶段 1 完成）
+# Hook System（2026-04-09 阶段 1 + 阶段 2 完成）
 
 Hook System 是工具调用生命周期的拦截层，为"软约束 → 硬约束"提供统一的注册、组合、测试、扩展面。详细设计见 `docs/activate/hookSystem.md`。
 
@@ -83,10 +83,73 @@ Scheduler 的 `publish_task / cancel_task / report_done / send_message` 由 `int
 
 Hook System **不替换**现有的 8 处硬约束兜底（`checkExpectedArtifacts`、`Roster.TryClaim`、`pathutil.ValidatePath` 等），而是**为它们提供统一的注册、组合、测试、扩展面**。其中 3 处已经迁移到 hook 表达，5 处仍是 inline 实现（包括 Roster 锁，因为它是任务级配对操作不能简单拆成 pre/post hook）。
 
-## 阶段 2/3 占位
+## 阶段 2：Mailbox Hook（2026-04-09 完成）
 
-- **阶段 2**：Mailbox Hook（关闭"邮件级联爆炸"P0），需要 `Task.MailChainDepth` 字段、`MailNotifier.scan` 暴露 hook 调用点
-- **阶段 3+**：按需扩展（Chathistory / Board / Session / Skill），触发标准是"≥ 2 个具体痛点"
+阶段 2 把 Hook 框架扩展到 mailbox 子系统，关闭 KNOWN_ISSUES.md 描述的"邮件级联爆炸" P0。与 Tool Hook **并列共存**、独立 registry、独立接口，不耦合。
+
+### 核心组件
+
+| 包 / 文件 | 职责 |
+|---|---|
+| `internal/hook/mailbox.go` | `MailboxHook` 接口 + 3 个 `MailboxHookPhase` 常量（`PhaseBeforeSend` / `PhaseBeforeDeliver` / `PhaseBeforeWake`）+ `MailboxHookContext` / `MailboxHookDecision`（值传递） |
+| `internal/hook/mailbox_registry.go` | `MailboxHookRegistry` —— nil 安全 + panic recovery + Priority 升序，与 `ToolHookRegistry` 形态对称。`RunBeforeWake` 额外做 `WakeDescription` 累加 |
+| `internal/hook/mailbox_runner_adapter.go` | `AsMailboxRunner(*MailboxHookRegistry) mailbox.MailboxHookRunner` 适配器，把 hook 包的 registry 包成 mailbox 包内部定义的最小接口 —— 用于打破 hook ↔ mailbox 循环导入 |
+| `internal/mailbox/hookrunner.go` | `MailboxHookRunner` 接口（`BeforeSend` / `BeforeDeliver` / `BeforeWake`）—— 定义在 mailbox 包内部，让 mailbox 包**不依赖** hook 包 |
+| `internal/mailbox/hookview.go` | `MailboxHookView` 接口（`HasPendingMail` / `GetRecentMessages`）—— hook 通过它读邮件不消费 channel |
+| `internal/mailbox/mailbox.go` | `Mailbox.recent` 环形缓冲（容量 16，配合 `Snapshot` 实现 peek-without-consume）+ `Registry.AttachHookRunner` + `Registry.HookRunner` getter |
+
+### 接入点
+
+```
+mailbox.Registry.Send:
+  preCtx := MailboxHookContext{Phase: PhaseBeforeSend, Message}
+  runner.BeforeSend(msg)        // 整条消息级，Abort 直接返回 error
+  for each recipient:
+      runner.BeforeDeliver(msg, deliverTo)
+      // 广播：Abort 仅跳过该收件人；单点：Abort 返回 error
+      mb.TrySend(msg)
+
+mailbox.MailNotifier.scan:
+  for each non-empty mailbox status:
+      // 既有 inline EventType dedup（D4 双重防御内层）
+      if pendingNotifyTypes[status.EventType]: continue
+      runner.BeforeWake(agentID, eventType, unreadCount)
+      // Abort 跳过本次发布；Continue 时累加的 wakeDescription 写入 wake task
+      wakeTask := &Task{
+          Description: wakeDescription or default,
+          MailChainDepth: status.MaxChainDepth,  // 链深度继承
+      }
+      store.PublishTask(wakeTask)
+```
+
+`MailboxHookRunner` nil 时所有 hook 路径退化为 noop —— 这是 V9 回归验证的核心：禁用所有 hook 时既有 mailbox/notifier 测试**未修改通过**。
+
+### 3 个内置 Mailbox Hook
+
+| Hook | Phase | Prio | 类型 | 决策 |
+|---|---|---|---|---|
+| `chain-depth-limit` | BeforeSend | 10 | **新增** | 拦截 `ChainDepth > MaxDepth` 的消息（默认 max=3）。与 `MetaGroup.sendMessage` 内 inline `ChainDepth = parent.MailChainDepth+1` 写入构成 D3 双重防御 |
+| `per-agent-dedup` | BeforeWake | 500 | **新增** | 通过 `StoreHookView.ScanPendingByEventSource("mail-notifier", eventType)` 检查是否已有 pending 唤醒任务。与 notifier inline 的 EventType dedup 构成 D4 双重防御 |
+| `wake-context-expand` | BeforeWake | 800 | **新增** | 从 `MailboxHookView` 读最近 5 条邮件，构造人类可读的 wake task description（包含 from/type/summary）—— 这是 D2"有限 Replace 例外"：wake task 在 hook 调用时还不存在，hook 是协助构建而非修改 |
+
+### 4 项根因关闭对照
+
+| KNOWN_ISSUES 根因 | Phase 2 修复 |
+|---|---|
+| #1 mail-notifier 无去重 | `notifier.scan` inline EventType dedup（保留）+ `PerAgentDedupHook`（D4 镜像） |
+| #2 邮件链无环路检测 / 跳数限制 | `Message.ChainDepth` + `Task.MailChainDepth` + `Config.MailChainMaxDepth` + `MetaGroup.sendMessage` 写入 + `ChainDepthLimitHook` 截断 |
+| #3 唤醒任务不携带原始上下文 | `Mailbox.recent` 环形缓冲 + `MailboxHookView.GetRecentMessages` + `WakeContextExpandHook` 写 `WakeDescription` |
+| #4 worker/explorer prompt 强制回复 | 早期已修复（`worker.go:47-50` + `explorer.go:33-37` 把"应回复"弱化为"可以忽略"+反例） |
+
+### 关键回归测试
+
+- `internal/hook/builtin/cascade_e2e_test.go::TestMailCascade_TerminatesAtMaxDepth` —— 模拟 5 步 worker A↔B 邮件循环，验证第 5 步 `chain_depth=4` 被精确截断
+- `TestMailCascade_NoHook_DemonstratesCascadeWouldExplode` —— 反向证明 hook 是 cascade 的唯一防线
+- V9 验证：注释 bootstrap 中所有 mailbox hook 注册后，全部 mailbox/notifier/bootstrap/worker/explorer/cli/agent/tools 包测试**未修改通过**
+
+## 阶段 3+ 占位
+
+按需扩展（Chathistory / Board / Session / Skill），触发标准是"≥ 2 个具体痛点"。
 
 ---
 
