@@ -597,7 +597,16 @@ type Writer struct {
 
 LLM 想编也编不出来。
 
-**状态**：⏳ 待修复（独立 P0，未被 2026-04-09 删 git 架构决策解决）
+**状态**：✅ 已修复（2026-04-10 Phase 3 完成）
+
+**修复路径**：
+1. **2026-04-09 commit `54db967`**：在 `toolReportDone` 中加入 `buildArtifactsReport` 并列展示 LLM summary 与系统校验块。文档遗漏更新此条目状态。
+2. **2026-04-10 Phase 3（commits `0f2f11e..3a0256d`）**：彻底重构 scheduler 为 `agent.Agent` 实例，scheduler 现在走完整的 Tool Hook 系统：
+   - `RecordArtifactHook` 在 scheduler 调 write_file/edit_file 时自动追加 task.Artifacts
+   - `SchedulerGroup.report_done` 内的 `buildSchedulerArtifactsReport` 仍然作为最后的事实校对
+   - scheduler 的 system prompt 显式要求"写 summary 时必须基于 board snapshot 中的 task.artifacts 字段"
+   - scheduler 现在能直接 `read_file` 自己读 worker 产出的文件做交叉验证
+3. 上述三层防御共同确保 LLM 编造的 summary 一定与系统校验块矛盾，用户能立即察觉。
 
 ---
 
@@ -631,15 +640,15 @@ LLM 想编也编不出来。
 | Scheduler prompt 缺代理能力清单 | ✅ 已修复（第二轮） |
 | Worker prompt 缺路径字面执行指引 | ✅ 已修复（第二轮） |
 | Shell 拦截 E2E 测试缺口 | ⏳ 本轮不实施（见 nextUpgrade_v2.md） |
-| Scheduler 提前 report_done | ⚠️ 已临时缓解（prompt + 硬性拦截），根因未解决 |
+| Scheduler 提前 report_done | ✅ 已修复（2026-04-10 Phase 3：SchedulerExecutor.waitForBatchTerminal 在 LLM 调用之前同步等待 batch 完成，从根本上消除"LLM 看到 pending 状态而误调 report_done"的可能；SchedulerGroup.report_done 的硬拦截作为最后兜底） |
 | **Scheduler 事件响应延迟 3 分钟** | 🟡 **P1 待排查** |
 | **Trace 多 goroutine 写入竞争** | 🟡 **P1 复核**（trace 系统已实现，需确认上锁覆盖） |
 | **邮件级联爆炸**（4 根因叠加） | ✅ **已修复**（2026-04-09，Phase 2 完成；Mailbox Hook 框架 + 4 项根因全部关闭，`mail_notifier_enabled=true` 默认） |
-| **Scheduler report_done 不基于 Artifacts** | 🔴 **P0**（独立 scheduler 缺陷，未被架构决策解决） |
+| **Scheduler report_done 不基于 Artifacts** | ✅ **已修复**（2026-04-10 Phase 3 scheduler 重构为 agent.Agent 实例，自动获得 RecordArtifactHook + 事实校对块 + read_file 自查） |
 | **架构决策：删除 git 依赖** | ✅ **已执行**（2026-04-09，删除 internal/isolation/ 等全部 worktree 接线，19 包测试全绿） |
 | **多代理协同重建**（并发写 / 原子性 / 跨任务可见性 / 杀任务清理） | 🟡 **设计待启动**（4 项故意暴露的临时退化，按真实失败模式驱动设计） |
 
-**25/29 项已修复。剩余：1 项 P0（scheduler report_done 事实校对）+ 2 项 P1（Scheduler 延迟、Trace 多 goroutine）+ 1 项 E2E 测试 + 1 项设计任务（多代理协同重建）。**
+**26/29 项已修复。剩余：2 项 P1（Scheduler 延迟、Trace 多 goroutine）+ 1 项 E2E 测试 + 1 项设计任务（多代理协同重建）。**
 
 > 注：6 项 worktree 相关条目（Worktree 相对路径解析、Worktree Remove git 失忆兜底、Worktree merge 假成功、Main 工作区脏状态、Git 分支 ref 泄漏、Worktree 重试丢上下文）已于 2026-04-09 整体清出本文档 — 详细复盘随 `internal/isolation` 包一同消失。仅在"架构决策：删除 git 依赖"段保留作为历史索引。
 
