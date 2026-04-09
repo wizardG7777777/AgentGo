@@ -10,8 +10,10 @@ import (
 	"sync"
 	"time"
 
+	"agentgo/internal/hook"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
+	"agentgo/internal/store"
 	"agentgo/internal/trace"
 )
 
@@ -64,8 +66,32 @@ func truncateForLog(args map[string]any, maxLen int) string {
 // NewLLMExecutor 创建一个基于 LLM 的 TaskExecutor。
 // 每次调用对应 ReAct 循环中的一步：调用 LLM → 如果有 tool calls 则执行并返回 ToolCalled=true，
 // 否则返回 ToolCalled=false 表示任务完成。
+//
+// 新增的 3 个 hook 系统参数（C4.3 方案 A — 独立闭包）：
+//   - hookReg：工具调用 hook 注册表；nil 时所有 hook 路径短路为 no-op
+//     （ToolHookRegistry 本身支持 nil receiver，所以 nil 时 RunPre/RunPost
+//     直接返回 Continue / 无操作）
+//   - storeView：当前未在 executor 内部使用，仅透传以便未来扩展；每次
+//     工具调用的 pre/post hook 通过自己构造时注入的 StoreHookView 访问任务历史
+//   - recordToolCall：把每次工具调用（含被 hook Abort 的调用）自动写入任务
+//     历史的闭包。bootstrap 用 `func(id, rec) { taskStore.AppendToolCall(id, rec) }`
+//     注入。nil 时跳过历史记录 — 禁用 hook 场景下行为与改动前一致
+//
+// 三个参数均允许 nil，nil 时整段 hook + 历史记录路径与改动前字节级一致。
+// 这是阶段 1 回归验证（V6）的关键 — 禁用所有 hook 时系统行为不变。
+//
 // systemPrompt 为可选参数，非空时作为 system/developer 消息注入到对话开头。
-func NewLLMExecutor(client llm.Client, tools *ToolRegistry, systemPrompt ...string) TaskExecutor {
+func NewLLMExecutor(
+	client llm.Client,
+	tools *ToolRegistry,
+	hookReg *hook.ToolHookRegistry,
+	storeView store.StoreHookView,
+	recordToolCall func(string, store.ToolCallRecord),
+	systemPrompt ...string,
+) TaskExecutor {
+	// storeView 当前仅用作未来扩展位。编译器会抱怨未使用，先用 _ 绑定一下。
+	// 如未来需要在 executor 内直接查询任务状态（例如 hook 间共享），再启用。
+	_ = storeView
 	var sysPrompt string
 	if len(systemPrompt) > 0 {
 		sysPrompt = systemPrompt[0]
@@ -160,9 +186,31 @@ func NewLLMExecutor(client llm.Client, tools *ToolRegistry, systemPrompt ...stri
 					Args:    c.Arguments,
 					CallID:  c.ID,
 				})
+
+				// Hook pre-call：允许注册的 hook 拒绝本次调用。
+				// hookReg 为 nil 时 RunPre 直接返回 Continue（nil receiver 安全）。
+				preDecision := hookReg.RunPre(hook.ToolHookContext{
+					Ctx:      ctx,
+					Phase:    hook.PhasePreCall,
+					AgentID:  agentID,
+					TaskID:   task.ID,
+					ToolName: c.Name,
+					Args:     c.Arguments,
+				})
+
 				start := time.Now()
-				result, toolErr := tools.Dispatch(ctx, c)
+				var result string
+				var toolErr error
+				if preDecision.Action == hook.Abort {
+					// Pre hook 拒绝 — 跳过实际工具调用，合成错误返回值。
+					// 错误消息同时注入到 content 和 toolErr，让 LLM 和后续记录都看到。
+					result = ""
+					toolErr = fmt.Errorf("[hook 拒绝] %s: %s", preDecision.HookName, preDecision.AbortReason)
+				} else {
+					result, toolErr = tools.Dispatch(ctx, c)
+				}
 				dur := time.Since(start)
+
 				var content string
 				if toolErr != nil {
 					content = fmt.Sprintf("错误: %v", toolErr)
@@ -191,6 +239,36 @@ func NewLLMExecutor(client llm.Client, tools *ToolRegistry, systemPrompt ...stri
 						ResultLen:  len(content),
 					})
 				}
+
+				// 写入 ToolCallRecord（hookSystem.md §11.1.3）：
+				//   - 时机：Dispatch 之后、RunPost 之前 —— 让 post hook 能通过
+				//     GetToolCallHistory 看到刚刚结束的调用；pre hook 在 Dispatch
+				//     之前看，避免"自己引用自己"
+				//   - 写入范围：无论 pre hook Abort 还是真正执行都写，Success
+				//     由 toolErr == nil 决定
+				//   - Scheduler 工具不经过本路径，不被记录（hookSystem.md §11.1.3）
+				if recordToolCall != nil {
+					recordToolCall(task.ID, store.ToolCallRecord{
+						Timestamp: time.Now(),
+						AgentID:   agentID,
+						ToolName:  c.Name,
+						Args:      c.Arguments,
+						Success:   toolErr == nil,
+					})
+				}
+
+				// Hook post-call：纯观察，无返回值。hookReg 为 nil 时无操作。
+				hookReg.RunPost(hook.ToolHookContext{
+					Ctx:      ctx,
+					Phase:    hook.PhasePostCall,
+					AgentID:  agentID,
+					TaskID:   task.ID,
+					ToolName: c.Name,
+					Args:     c.Arguments,
+					Result:   content,
+					Err:      toolErr,
+				})
+
 				results[idx] = indexedResult{
 					toolResult: ToolResult{
 						ToolCallID: c.ID,

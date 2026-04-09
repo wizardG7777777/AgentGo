@@ -5,6 +5,7 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
+	"agentgo/internal/hook"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/roster"
@@ -57,7 +58,10 @@ type Explorer struct {
 //
 // 工具集组合：LocalReadGroup + WebGroup + MetaGroup（无 Holder/Store=publish_task 不注册）
 // 编译期保证 Explorer 不持有 Roster/ApprovalCh/Store，因此无法获得写入、shell、publish 能力。
-func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry, mbRegistry *mailbox.Registry, searchProvider ...webtool.SearchProvider) *Explorer {
+//
+// Hook 系统参数（hookReg / storeView / recordToolCall）均允许 nil，详见
+// agent.NewLLMExecutor 的说明。
+func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry, mbRegistry *mailbox.Registry, hookReg *hook.ToolHookRegistry, storeView store.StoreHookView, recordToolCall func(string, store.ToolCallRecord), searchProvider ...webtool.SearchProvider) *Explorer {
 	const agentID = "explorer-1"
 	fileCache := agent.NewFileStateCache(50)
 	workdir := &tools.DefaultWorkdir{ProjectRoot: cfg.ProjectRoot}
@@ -75,7 +79,7 @@ func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.C
 		tools.MetaGroup{MBRegistry: mbRegistry, AgentID: agentID}, // Store=nil → 不注册 publish_task
 	)
 
-	executor := agent.NewLLMExecutor(llmClient, toolReg, systemPrompt)
+	executor := agent.NewLLMExecutor(llmClient, toolReg, hookReg, storeView, recordToolCall, systemPrompt)
 
 	a := agent.NewAgent(
 		agentID,

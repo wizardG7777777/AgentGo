@@ -37,7 +37,7 @@ func TestLLMExecutor_NoToolCalls_Completes(t *testing.T) {
 		},
 	}
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools)
+	executor := NewLLMExecutor(mock, tools, nil, nil, nil)
 
 	task := &model.Task{Description: "测试任务"}
 	result, err := executor(context.Background(), task, nil, nil)
@@ -70,7 +70,7 @@ func TestLLMExecutor_WithToolCalls(t *testing.T) {
 		return "file content: hello", nil
 	})
 
-	executor := NewLLMExecutor(mock, tools)
+	executor := NewLLMExecutor(mock, tools, nil, nil, nil)
 	task := &model.Task{Description: "读取文件"}
 	result, err := executor(context.Background(), task, nil, nil)
 
@@ -112,7 +112,7 @@ func TestLLMExecutor_ToolError_IncludedInOutput(t *testing.T) {
 		return "", errors.New("读取失败")
 	})
 
-	executor := NewLLMExecutor(mock, tools)
+	executor := NewLLMExecutor(mock, tools, nil, nil, nil)
 	task := &model.Task{Description: "测试"}
 	result, err := executor(context.Background(), task, nil, nil)
 
@@ -134,7 +134,7 @@ func TestLLMExecutor_RecoverableError(t *testing.T) {
 	}
 
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools)
+	executor := NewLLMExecutor(mock, tools, nil, nil, nil)
 	task := &model.Task{Description: "测试"}
 	_, err := executor(context.Background(), task, nil, nil)
 
@@ -150,7 +150,7 @@ func TestLLMExecutor_UnrecoverableError(t *testing.T) {
 	}
 
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools)
+	executor := NewLLMExecutor(mock, tools, nil, nil, nil)
 	task := &model.Task{Description: "测试"}
 	_, err := executor(context.Background(), task, nil, nil)
 
@@ -170,7 +170,7 @@ func TestLLMExecutor_DependencyResults(t *testing.T) {
 	}
 
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools)
+	executor := NewLLMExecutor(mock, tools, nil, nil, nil)
 	task := &model.Task{Description: "汇总任务"}
 	depResults := map[string]string{
 		"task-1": "结果A",
@@ -203,7 +203,7 @@ func TestLLMExecutor_HistoryPassedToLLM(t *testing.T) {
 	}
 
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools)
+	executor := NewLLMExecutor(mock, tools, nil, nil, nil)
 	task := &model.Task{Description: "多轮任务"}
 	history := []HistoryEntry{
 		{
@@ -263,7 +263,7 @@ func TestLLMExecutor_IncomingMailInjectedAsUserMessage(t *testing.T) {
 	}
 
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools)
+	executor := NewLLMExecutor(mock, tools, nil, nil, nil)
 	task := &model.Task{Description: "处理任务"}
 	history := []HistoryEntry{
 		{
@@ -317,7 +317,7 @@ func TestLLMExecutor_SystemPromptInjected(t *testing.T) {
 
 	tools := NewToolRegistry()
 	sysPrompt := "你是一个执行代理"
-	executor := NewLLMExecutor(mock, tools, sysPrompt)
+	executor := NewLLMExecutor(mock, tools, nil, nil, nil, sysPrompt)
 
 	task := &model.Task{Description: "测试任务"}
 	executor(context.Background(), task, nil, nil)
@@ -350,7 +350,7 @@ func TestLLMExecutor_NoSystemPrompt_NoSystemMessage(t *testing.T) {
 
 	tools := NewToolRegistry()
 	// 不传 system prompt（向后兼容）
-	executor := NewLLMExecutor(mock, tools)
+	executor := NewLLMExecutor(mock, tools, nil, nil, nil)
 
 	task := &model.Task{Description: "测试任务"}
 	executor(context.Background(), task, nil, nil)
@@ -386,7 +386,7 @@ func TestLLMExecutor_ParallelToolExecution(t *testing.T) {
 		return "result_c", nil
 	})
 
-	executor := NewLLMExecutor(mock, tools)
+	executor := NewLLMExecutor(mock, tools, nil, nil, nil)
 	task := &model.Task{Description: "并行测试"}
 	result, err := executor(context.Background(), task, nil, nil)
 
@@ -422,7 +422,7 @@ func TestLLMExecutor_UsagePassthrough(t *testing.T) {
 	}
 
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools)
+	executor := NewLLMExecutor(mock, tools, nil, nil, nil)
 	task := &model.Task{Description: "usage test"}
 	result, err := executor(context.Background(), task, nil, nil)
 
@@ -443,7 +443,7 @@ func TestLLMExecutor_TaskSystemPromptOverridesDefault(t *testing.T) {
 	}
 
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools, "默认提示")
+	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "默认提示")
 
 	task := &model.Task{Description: "测试任务", SystemPrompt: "任务专用提示"}
 	executor(context.Background(), task, nil, nil)
@@ -466,7 +466,7 @@ func TestLLMExecutor_TaskEmptySystemPrompt_UsesDefault(t *testing.T) {
 	}
 
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools, "默认提示")
+	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "默认提示")
 
 	task := &model.Task{Description: "测试任务"}
 	executor(context.Background(), task, nil, nil)

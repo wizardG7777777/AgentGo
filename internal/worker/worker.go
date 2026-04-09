@@ -8,6 +8,7 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
+	"agentgo/internal/hook"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
@@ -107,12 +108,15 @@ type Worker struct {
 // 历史决策记录：原本使用 git worktree 子系统做物理隔离（每个任务一个独立分支），
 // 2026-04-08 决定彻底删除 git 依赖，回归"所有 worker 共享 ProjectRoot"的简单模型。
 // 多代理协同安全（并发写、原子性、回滚等）留待按真实失败模式重新设计。
-func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry, mbRegistry *mailbox.Registry, approvalCh chan<- shell.ApprovalRequest) *Worker {
-	return NewWithID("worker-1", s, r, llmClient, cfg, cancelReg, mbRegistry, approvalCh)
+func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry, mbRegistry *mailbox.Registry, approvalCh chan<- shell.ApprovalRequest, hookReg *hook.ToolHookRegistry, storeView store.StoreHookView, recordToolCall func(string, store.ToolCallRecord)) *Worker {
+	return NewWithID("worker-1", s, r, llmClient, cfg, cancelReg, mbRegistry, approvalCh, hookReg, storeView, recordToolCall)
 }
 
 // NewWithID 创建指定 ID 的执行代理，支持多 Worker 实例。
-func NewWithID(agentID string, s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry, mbRegistry *mailbox.Registry, approvalCh chan<- shell.ApprovalRequest) *Worker {
+//
+// 新增的 3 个 hook 系统参数（C4）均允许 nil，整段 hook 路径会退化为 no-op。
+// 详见 agent.NewLLMExecutor 的参数文档。
+func NewWithID(agentID string, s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry, mbRegistry *mailbox.Registry, approvalCh chan<- shell.ApprovalRequest, hookReg *hook.ToolHookRegistry, storeView store.StoreHookView, recordToolCall func(string, store.ToolCallRecord)) *Worker {
 	holder := &currentTaskHolder{}
 	fileCache := agent.NewFileStateCache(50)
 	workdir := &tools.DefaultWorkdir{ProjectRoot: cfg.ProjectRoot}
@@ -137,7 +141,7 @@ func NewWithID(agentID string, s store.TaskStore, r roster.Roster, llmClient llm
 		tools.MetaGroup{Store: s, Holder: holder, MaxDepth: cfg.MaxSubtaskDepth, MBRegistry: mbRegistry, AgentID: agentID},
 	)
 
-	executor := agent.NewLLMExecutor(llmClient, toolReg, systemPrompt)
+	executor := agent.NewLLMExecutor(llmClient, toolReg, hookReg, storeView, recordToolCall, systemPrompt)
 
 	a := agent.NewAgent(
 		agentID,

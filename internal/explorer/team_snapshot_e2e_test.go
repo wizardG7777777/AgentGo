@@ -73,7 +73,7 @@ func TestExplorerE2E_TeamSnapshotInjected(t *testing.T) {
 	mock := &explorerE2ELLMClient{
 		responses: []llm.Response{{Content: "done"}},
 	}
-	exp := New(s, r, mock, cfg, nil, reg, nil)
+	exp := New(s, r, mock, cfg, nil, reg, nil, nil, nil, nil)
 	exp.agent.PollInterval = 10 * time.Millisecond
 	exp.agent.IdleThreshold = 3
 

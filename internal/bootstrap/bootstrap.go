@@ -13,6 +13,7 @@ import (
 	"agentgo/internal/cli"
 	"agentgo/internal/config"
 	"agentgo/internal/explorer"
+	"agentgo/internal/hook"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
@@ -80,6 +81,17 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	taskStore.SetCancelRegistry(cancelRegistry)
 	fmt.Println("[启动] 公告板初始化完成")
 
+	// Step 2.5: 初始化 Hook 系统（阶段 1 — 铺管道，不注册任何具体 hook）
+	// hookReg 以单例方式被所有 worker/explorer 共享。recordToolCall 闭包
+	// 是 llm_executor.go 自动写入 ToolCallRecord 的通道 —— 独立于 StoreHookView，
+	// 避免 hook 通过接口写入任务历史（C4.3 方案 A，详见 hookSystem.md §11.1）。
+	hookReg := hook.NewToolHookRegistry()
+	var storeView store.StoreHookView = taskStore
+	recordToolCall := func(taskID string, rec store.ToolCallRecord) {
+		_ = taskStore.AppendToolCall(taskID, rec)
+	}
+	fmt.Println("[启动] Hook 系统初始化完成（阶段 1 — 未注册具体 hook）")
+
 	// Step 3: 初始化花名册
 	r := roster.NewMemoryRoster()
 	fmt.Println("[启动] 花名册初始化完成")
@@ -108,7 +120,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 
 	// Step 7: 创建调查代理（复用与 Worker 相同的 SearchProvider 配置）
 	explorerSearchProvider := webtool.NewProvider(cfg.SearchAPIProvider, cfg.SearchAPIURL, cfg.SearchAPIKey)
-	exp := explorer.New(taskStore, r, explorerLLM, cfg, cancelRegistry, mbRegistry, explorerSearchProvider)
+	exp := explorer.New(taskStore, r, explorerLLM, cfg, cancelRegistry, mbRegistry, hookReg, storeView, recordToolCall, explorerSearchProvider)
 
 	// Step 7.5: 创建命令审批通道（Worker→CLI）
 	approvalCh := make(chan shell.ApprovalRequest, 8)
@@ -125,7 +137,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 			"", // system prompt 由 worker 内部管理
 			time.Duration(cfg.LLMTimeoutSec)*time.Second,
 		)
-		wk := worker.NewWithID(fmt.Sprintf("worker-%d", i), taskStore, r, workerLLM, cfg, cancelRegistry, mbRegistry, approvalCh)
+		wk := worker.NewWithID(fmt.Sprintf("worker-%d", i), taskStore, r, workerLLM, cfg, cancelRegistry, mbRegistry, approvalCh, hookReg, storeView, recordToolCall)
 		workers = append(workers, wk)
 	}
 
