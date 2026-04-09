@@ -47,10 +47,15 @@ type SchedulerExecutor struct {
 	// 0 时使用默认值 30 秒。
 	WaitTimeout time.Duration
 
-	// Mode 是 scheduler 当前的工作模式（"immediate" / "plan"）。
-	// 由 New 构造时设置，注入 board snapshot 时使用。
+	// Mode 是 scheduler 启动时的初始 mode 字符串（"immediate" / "plan"）。
 	// 留空时默认 "immediate"。
+	// 仅在 ModeStore == nil 时使用；ModeStore 非 nil 时每次 Execute 重新读 ModeStore。
 	Mode string
+
+	// ModeStore（可选）：scheduler.Bundle 共享的 mode 持有者。
+	// 非 nil 时优先于 Mode 字段；让 CLI 在运行期通过 /mode 命令切换 mode 后，
+	// 下一次 reactLoop 注入 board snapshot 时立即生效。
+	ModeStore *ModeStore
 }
 
 // Execute 实现 agent.TaskExecutor 接口。
@@ -67,6 +72,9 @@ func (e *SchedulerExecutor) Execute(
 
 	// 2. 注入 board snapshot 到 history 末尾
 	mode := e.Mode
+	if e.ModeStore != nil {
+		mode = e.ModeStore.modeString() // 运行期 mode 切换实时生效
+	}
 	if mode == "" {
 		mode = "immediate"
 	}
