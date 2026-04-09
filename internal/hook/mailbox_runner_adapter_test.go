@@ -30,13 +30,16 @@ func (h *adapterTestHook) Run(hctx MailboxHookContext) MailboxHookDecision {
 	h.called++
 	if h.abort {
 		return MailboxHookDecision{
-			Action:          Abort,
-			AbortReason:     h.abortReason,
-			HookName:        h.hookName,
-			WakeDescription: h.wakeDesc,
+			Action:      Abort,
+			AbortReason: h.abortReason,
+			HookName:    h.hookName,
 		}
 	}
-	return MailboxHookDecision{Action: Continue, HookName: h.hookName}
+	return MailboxHookDecision{
+		Action:          Continue,
+		HookName:        h.hookName,
+		WakeDescription: h.wakeDesc,
+	}
 }
 
 // ---- AsMailboxRunner ----
@@ -232,6 +235,139 @@ func TestAdapter_BeforeSend_FirstAbortShortCircuits(t *testing.T) {
 	}
 	if second.called != 0 {
 		t.Errorf("第二个 hook 不应被调用（短路），实际: %d", second.called)
+	}
+}
+
+// ---- BeforeWake 适配 ----
+
+func TestAdapter_BeforeWake_PassesContextFields(t *testing.T) {
+	reg := NewMailboxHookRegistry()
+	hk := &adapterTestHook{
+		name:     "wake-passing",
+		phase:    PhaseBeforeWake,
+		priority: 50,
+	}
+	_ = reg.Register(hk)
+	runner := AsMailboxRunner(reg)
+
+	abort, _, _, _ := runner.BeforeWake("worker-1", "explore", 5)
+	if abort {
+		t.Error("Continue 决策时 abort 应为 false")
+	}
+	if hk.captured.AgentID != "worker-1" {
+		t.Errorf("AgentID 未传播: %q", hk.captured.AgentID)
+	}
+	if hk.captured.EventType != "explore" {
+		t.Errorf("EventType 未传播: %q", hk.captured.EventType)
+	}
+	if hk.captured.UnreadCount != 5 {
+		t.Errorf("UnreadCount 未传播: %d", hk.captured.UnreadCount)
+	}
+	if hk.captured.Phase != PhaseBeforeWake {
+		t.Errorf("Phase 错误: %s", hk.captured.Phase)
+	}
+}
+
+func TestAdapter_BeforeWake_Abort(t *testing.T) {
+	reg := NewMailboxHookRegistry()
+	hk := &adapterTestHook{
+		name:        "wake-rejecting",
+		phase:       PhaseBeforeWake,
+		priority:    50,
+		abort:       true,
+		abortReason: "no wake",
+		hookName:    "wake-rejecting",
+	}
+	_ = reg.Register(hk)
+	runner := AsMailboxRunner(reg)
+
+	abort, reason, hookName, wakeDesc := runner.BeforeWake("worker-1", "", 1)
+	if !abort {
+		t.Error("Abort 决策时 abort 应为 true")
+	}
+	if reason != "no wake" {
+		t.Errorf("reason 错误: %q", reason)
+	}
+	if hookName != "wake-rejecting" {
+		t.Errorf("hookName 错误: %q", hookName)
+	}
+	if wakeDesc != "" {
+		t.Errorf("Abort 路径下 wakeDescription 应为空，实际: %q", wakeDesc)
+	}
+}
+
+func TestAdapter_BeforeWake_WakeDescription_SingleHook(t *testing.T) {
+	reg := NewMailboxHookRegistry()
+	hk := &adapterTestHook{
+		name:     "wake-desc",
+		phase:    PhaseBeforeWake,
+		priority: 50,
+		wakeDesc: "fragment one",
+	}
+	_ = reg.Register(hk)
+	runner := AsMailboxRunner(reg)
+
+	abort, _, _, wakeDesc := runner.BeforeWake("worker-1", "", 1)
+	if abort {
+		t.Error("Continue 决策时 abort 应为 false")
+	}
+	if wakeDesc != "fragment one" {
+		t.Errorf("wakeDescription 应为 'fragment one'，实际: %q", wakeDesc)
+	}
+}
+
+func TestAdapter_BeforeWake_WakeDescription_AccumulatesAcrossHooks(t *testing.T) {
+	reg := NewMailboxHookRegistry()
+	low := &adapterTestHook{
+		name:     "low",
+		phase:    PhaseBeforeWake,
+		priority: 10,
+		wakeDesc: "first part",
+	}
+	high := &adapterTestHook{
+		name:     "high",
+		phase:    PhaseBeforeWake,
+		priority: 100,
+		wakeDesc: "second part",
+	}
+	_ = reg.Register(high) // 故意先注册 high
+	_ = reg.Register(low)
+	runner := AsMailboxRunner(reg)
+
+	abort, _, _, wakeDesc := runner.BeforeWake("worker-1", "", 1)
+	if abort {
+		t.Error("两个 Continue hook 整体应 Continue")
+	}
+	expected := "first part\n\nsecond part"
+	if wakeDesc != expected {
+		t.Errorf("wakeDescription 累加错误，期望 %q，实际: %q", expected, wakeDesc)
+	}
+	if low.called != 1 || high.called != 1 {
+		t.Errorf("两个 hook 都应被调用，实际: low=%d high=%d", low.called, high.called)
+	}
+}
+
+func TestAdapter_BeforeWake_NoMatchingHooks_EmptyDescription(t *testing.T) {
+	reg := NewMailboxHookRegistry()
+	// 只注册 BeforeSend hook，BeforeWake 调用应当 noop
+	hk := &adapterTestHook{
+		name:     "send-only",
+		phase:    PhaseBeforeSend,
+		priority: 50,
+		wakeDesc: "should be ignored",
+	}
+	_ = reg.Register(hk)
+	runner := AsMailboxRunner(reg)
+
+	abort, _, _, wakeDesc := runner.BeforeWake("worker-1", "", 1)
+	if abort {
+		t.Error("无匹配 hook 应 Continue")
+	}
+	if wakeDesc != "" {
+		t.Errorf("无匹配 hook 时 wakeDescription 应为空，实际: %q", wakeDesc)
+	}
+	if hk.called != 0 {
+		t.Errorf("BeforeSend hook 不应被 BeforeWake 调用，实际: %d", hk.called)
 	}
 }
 

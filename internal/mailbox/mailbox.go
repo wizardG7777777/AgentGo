@@ -132,6 +132,27 @@ func (mb *Mailbox) Snapshot(n int) []Message {
 	return out
 }
 
+// MaxChainDepth 返回 recent 环形缓冲中所有消息的最大 ChainDepth。
+// 用途：MailNotifier 在发布 wake task 时需要把这个值写入
+// task.MailChainDepth，让"被本次唤醒任务触发的 send_message"能继承
+// 当前邮件链的深度并 +1，从而被 ChainDepthLimitHook 截断。
+//
+// **近似性说明**：环形缓冲容量是 recentBufferSize（16），如果实际未读
+// 邮件数超过 16，最旧的会被覆盖。但是邮件链的深度通常单调递增，最新的
+// 16 条消息几乎一定包含当前最大深度，所以基于 recent 的近似在实践中
+// 等同于精确值。
+func (mb *Mailbox) MaxChainDepth() int {
+	mb.recentMu.Lock()
+	defer mb.recentMu.Unlock()
+	max := 0
+	for _, m := range mb.recent {
+		if m.ChainDepth > max {
+			max = m.ChainDepth
+		}
+	}
+	return max
+}
+
 // Drain 非阻塞取出当前 buffer 中的全部消息。无消息时返回 nil。
 func (mb *Mailbox) Drain() []Message {
 	var msgs []Message
@@ -218,10 +239,16 @@ func (r *Registry) AttachHookRunner(runner MailboxHookRunner) {
 }
 
 // MailboxStatus 描述一个有未读消息的邮箱状态。
+//
+// Phase 2 新增 MaxChainDepth：该 agent 收件箱内未读邮件中的最大邮件链深度。
+// MailNotifier 在发布唤醒任务时把这个值写入 task.MailChainDepth，使得
+// 唤醒后的 agent 通过 send_message 触发的新邮件能正确继承深度并 +1，
+// 进而被 ChainDepthLimitHook 截断。
 type MailboxStatus struct {
-	AgentID   string
-	EventType string
-	Count     int
+	AgentID       string
+	EventType     string
+	Count         int
+	MaxChainDepth int
 }
 
 // Register 为指定 agentID 创建并注册 Mailbox。eventType 为代理的任务类型（"" = worker, "explore" = explorer）。
@@ -237,7 +264,9 @@ func (r *Registry) Register(agentID, eventType string) *Mailbox {
 	return mb
 }
 
-// ScanNonEmpty 返回所有有未读消息的邮箱状态（agentID + eventType + 消息数量）。
+// ScanNonEmpty 返回所有有未读消息的邮箱状态（agentID + eventType + 消息数量
+// + 最大邮件链深度）。MaxChainDepth 在 Phase 2 加入，由 MailNotifier 用于
+// 在 wake task 上设置 task.MailChainDepth。
 func (r *Registry) ScanNonEmpty() []MailboxStatus {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -245,13 +274,22 @@ func (r *Registry) ScanNonEmpty() []MailboxStatus {
 	for id, mb := range r.boxes {
 		if n := mb.Len(); n > 0 {
 			result = append(result, MailboxStatus{
-				AgentID:   id,
-				EventType: mb.eventType,
-				Count:     n,
+				AgentID:       id,
+				EventType:     mb.eventType,
+				Count:         n,
+				MaxChainDepth: mb.MaxChainDepth(),
 			})
 		}
 	}
 	return result
+}
+
+// HookRunner 返回当前挂接的 MailboxHookRunner（可能为 nil）。
+// MailNotifier 在每次 scan 时通过此方法读取 runner，以触发 BeforeWake
+// 决策。这避免了 notifier 自己持有一份 runner 字段（保持单点真相 ——
+// 所有 hook 决策都从 Registry 出发）。
+func (r *Registry) HookRunner() MailboxHookRunner {
+	return r.snapshotHookRunner()
 }
 
 // RegisterAlias 为已注册的 agentID 添加稳定别名（如 "scheduler"）。
