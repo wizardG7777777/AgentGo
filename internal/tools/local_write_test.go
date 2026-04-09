@@ -12,6 +12,7 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
+	"agentgo/internal/store"
 )
 
 // --- recordingRoster: 模拟 roster.Roster，记录操作顺序 ---
@@ -402,6 +403,10 @@ func (c *captureStore) GetDependencyResults(string) (map[string]string, error)  
 func (c *captureStore) GetDependencyArtifacts(string) (map[string][]string, error) { return nil, nil }
 func (c *captureStore) RecordLastResponse(string, string) error                    { return nil }
 func (c *captureStore) ScanAll() ([]*model.Task, error)                            { return nil, nil }
+func (c *captureStore) AppendToolCall(string, store.ToolCallRecord) error          { return nil }
+func (c *captureStore) QueryToolCalls(string, string) ([]store.ToolCallRecord, error) {
+	return nil, nil
+}
 
 func TestWriteFile_RecordsArtifact(t *testing.T) {
 	tmp := t.TempDir()

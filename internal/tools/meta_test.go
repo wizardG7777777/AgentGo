@@ -10,6 +10,7 @@ import (
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
+	"agentgo/internal/store"
 )
 
 func mkCall(name string, args map[string]any) llm.ToolCall {
@@ -68,6 +69,10 @@ func (f *fakeStore) GetDependencyArtifacts(taskID string) (map[string][]string, 
 func (f *fakeStore) AppendArtifact(taskID string, path string) error        { return nil }
 func (f *fakeStore) RecordLastResponse(taskID string, content string) error { return nil }
 func (f *fakeStore) ScanAll() ([]*model.Task, error)                        { return nil, nil }
+func (f *fakeStore) AppendToolCall(string, store.ToolCallRecord) error      { return nil }
+func (f *fakeStore) QueryToolCalls(string, string) ([]store.ToolCallRecord, error) {
+	return nil, nil
+}
 
 type fakeHolder struct{ id string }
 
