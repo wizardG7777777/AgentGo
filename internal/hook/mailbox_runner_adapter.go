@@ -55,3 +55,21 @@ func (a *mailboxRunnerAdapter) BeforeDeliver(msg mailbox.Message, deliverTo stri
 	}
 	return false, "", ""
 }
+
+// BeforeWake 把 BeforeWake hook 决策翻译成 mailbox.MailboxHookRunner 的
+// 格式。Continue 路径下返回累加的 WakeDescription（由 hook 系统侧的
+// RunBeforeWake 自动按 priority 顺序拼接）；Abort 路径下 WakeDescription
+// 被丢弃 —— notifier 看到 abort 时根本不会发布 wake task，所以 description
+// 没有意义。
+func (a *mailboxRunnerAdapter) BeforeWake(agentID, eventType string, unreadCount int) (bool, string, string, string) {
+	decision := a.inner.RunBeforeWake(MailboxHookContext{
+		Phase:       PhaseBeforeWake,
+		AgentID:     agentID,
+		EventType:   eventType,
+		UnreadCount: unreadCount,
+	})
+	if decision.Action == Abort {
+		return true, decision.AbortReason, decision.HookName, ""
+	}
+	return false, "", decision.HookName, decision.WakeDescription
+}

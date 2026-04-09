@@ -17,6 +17,8 @@ type mockHookRunner struct {
 	beforeSendCalls []Message
 	// beforeDeliverCalls 累计每次 BeforeDeliver 收到的 (message, deliverTo)
 	beforeDeliverCalls []deliverCall
+	// beforeWakeCalls 累计每次 BeforeWake 收到的参数（B4 测试使用）
+	beforeWakeCalls []wakeCall
 
 	// 控制返回值
 	beforeSendAbort      bool
@@ -25,6 +27,16 @@ type mockHookRunner struct {
 	beforeDeliverAbort   func(deliverTo string) bool // nil = 永不 abort
 	beforeDeliverReason  string
 	beforeDeliverHookID  string
+	beforeWakeAbort      bool
+	beforeWakeReason     string
+	beforeWakeHookName   string
+	beforeWakeWakeDesc   string
+}
+
+type wakeCall struct {
+	agentID     string
+	eventType   string
+	unreadCount int
 }
 
 type deliverCall struct {
@@ -47,6 +59,20 @@ func (m *mockHookRunner) BeforeDeliver(msg Message, deliverTo string) (bool, str
 		return true, m.beforeDeliverReason, m.beforeDeliverHookID
 	}
 	return false, "", ""
+}
+
+func (m *mockHookRunner) BeforeWake(agentID, eventType string, unreadCount int) (bool, string, string, string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.beforeWakeCalls = append(m.beforeWakeCalls, wakeCall{
+		agentID:     agentID,
+		eventType:   eventType,
+		unreadCount: unreadCount,
+	})
+	if m.beforeWakeAbort {
+		return true, m.beforeWakeReason, m.beforeWakeHookName, ""
+	}
+	return false, "", m.beforeWakeHookName, m.beforeWakeWakeDesc
 }
 
 // 编译期断言：mockHookRunner 必须满足 MailboxHookRunner 接口
