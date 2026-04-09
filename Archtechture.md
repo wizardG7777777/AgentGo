@@ -153,6 +153,90 @@ mailbox.MailNotifier.scan:
 
 ---
 
+# Scheduler 一等代理重构（2026-04-10 完成）
+
+Scheduler 在最初的设计里是一个**独立写的事件驱动 ReAct 循环**，不复用任何 `agent.Agent` 基础设施。这是早期遗留——之后所有"基础设施升级"（hook 系统 / 历史压缩 / FileStateCache / Trace / ToolGroup）都没有同步给它。结果协调者比被协调者还弱：scheduler 不能直接读文件、不能搜代码、不能查网页、send_message 不带 ChainDepth 是邮件级联爆炸的隐性源头。
+
+**Phase 3 重构**把 scheduler 重写为**真正的 `agent.Agent` 实例**，同时保留它的事件驱动入口。
+
+## 新架构数据流
+
+```
+用户输入 (CLI) ─→ EventUserInput ──┐
+                                    ↓
+                            scheduler.Activator goroutine
+                                    │  PublishTask
+                                    ▼
+                            store: __scheduler__ task (pending)
+                                    │  poll
+                                    ▼
+                            scheduler agent (agent.Agent 实例)
+                            EventType = "__scheduler__"
+                                    │  ClaimTask + processTask
+                                    ▼
+                            SchedulerExecutor (TaskExecutor wrapper)
+                              ├─ 等待 task.SchedulerBatch 全部到达终态
+                              ├─ 注入 board snapshot 到 history (IncomingMail)
+                              └─ 调底层 NewLLMExecutor
+                                    │
+                                    ▼  LLM 工具调用
+                            ToolRegistry
+                              ├─ Worker 全集（read/write/edit/grep/glob/list/run_shell/web_*）
+                              ├─ MetaGroup（send_message + publish_task with BatchTracker）
+                              └─ SchedulerGroup（cancel_task + report_done）
+```
+
+## 核心组件
+
+| 包 / 文件 | 职责 |
+|---|---|
+| `internal/scheduler/scheduler.go` | `Bundle` struct（Agent + Activator + ModeStore），`New(...)` 构造一等代理及其配套部件，`schedulerSystemPrompt`，`currentSchedulerTaskHolder`，`storeBatchTracker` |
+| `internal/scheduler/executor.go` | `SchedulerExecutor` —— TaskExecutor wrapper，等 batch + 注入 snapshot |
+| `internal/scheduler/snapshot.go` | `BuildBoardJSON` —— 从 store 读全局任务板，输出 JSON |
+| `internal/scheduler/activator.go` | `Activator` goroutine，EventCh ↔ task 桥 |
+| `internal/tools/scheduler.go` | `SchedulerGroup`：`cancel_task` + `report_done` |
+| `internal/tools/meta.go` | `MetaGroup` 新增 `BatchTracker` 字段，scheduler 注入时 publish_task 追加到 `task.SchedulerBatch` |
+| `internal/model/task.go` | `Task` 新增 `SchedulerBatch []string` 字段（仅 scheduler task 使用） |
+| `internal/store/{iface,memory}.go` | `AppendSchedulerBatch` / `ClearSchedulerBatch` 方法 |
+
+## 关键设计决策
+
+| # | 决策 | 实现 |
+|---|---|---|
+| D1 | 等待 batch 完成的实现：**SchedulerExecutor 内部同步 select 阻塞** | `executor.go::waitForBatchTerminal` 在 `BatchUpdateCh` 与 30s 兜底之间循环。比 RetryRollback spin loop 干净（不堆 RetryCount，watchdog 友好），比 dependency 机制安全（不会被 worker failed 级联取消） |
+| D2 | `task.SchedulerBatch` 是新字段，不复用 Dependencies | Dependencies 严格 completed 语义，scheduler 需要"终态"语义；新字段命名清晰 |
+| D3 | `SchedulerGroup` 仅含 `cancel_task` + `report_done` | `publish_task` / `send_message` 复用 `MetaGroup`（共享 ChainDepth 继承等关键行为）；通过 `BatchTracker` 接口让 scheduler 上下文里的 publish_task 追加到 `task.SchedulerBatch` |
+| D4 | `Activator` 是 EventCh ↔ scheduler agent 的桥 | `EventUserInput` → `PublishTask`，`EventTask{Completed,Failed,Cancelled,WatchdogAlert}` → `BatchUpdateCh` 信号 |
+| D5 | board snapshot 通过 `IncomingMail` 注入 history | 复用既有的 `agent.HistoryEntry.IncomingMail` 字段，与 mailbox 注入对称 |
+| D6 | scheduler task 的 `TimeoutSeconds=86400`（1 天） | `MemoryTaskStore.PublishTask` 把 0 替换为默认值，scheduler 必须显式设大值；24h 是工程兜底 |
+
+## scheduler 重构后获得的新能力
+
+| 能力 | 旧 scheduler | 新 scheduler |
+|---|:---:|:---:|
+| Tool Hook 系统（pre/post call 拦截） | ❌ 完全豁免 | ✅ 走 NewLLMExecutor，所有 hook 自动生效 |
+| 3 层历史压缩 | ❌ | ✅ |
+| FileStateCache (LRU 50) | ❌ | ✅ |
+| Trace events（KindTaskClaimed/Submitted/Completed） | ❌ | ✅ |
+| Per-task cancel context (`CancelRegistry`) | ❌ | ✅ |
+| `read_file` / `grep_search` / `web_search` 等 worker 工具 | ❌ | ✅ |
+| `send_message` 自动写 ChainDepth（共享 MetaGroup） | ❌ ChainDepth 永 0 | ✅ 与 worker 共享同一份 |
+| `RecordArtifactHook` 在 scheduler 工具调用时生效 | ❌ | ✅（修复"P0 report_done 不基于 Artifacts"的根因之一） |
+
+## scheduler 保留的独有特征
+
+| 能力 | 实现 |
+|---|---|
+| 事件驱动入口 | `Activator` goroutine 监听 EventCh |
+| 全局任务板视角 | `BuildBoardJSON` 注入到 history，LLM 看到所有 task 的状态 |
+| `cancel_task` / `report_done` | `SchedulerGroup`，独占工具，worker 没有 |
+| 系统级 mailbox 别名 `"scheduler"` | `New` 构造时 `mbRegistry.RegisterAlias("scheduler", schedID)` |
+| 提前 `report_done` 硬拦截 | `SchedulerGroup.report_done` 内部扫描 `task.SchedulerBatch` 状态 |
+| `task.Artifacts` 事实校对 | `SchedulerGroup.report_done` 调 `buildSchedulerArtifactsReport` |
+| Plan / Immediate mode 切换 | `Bundle.Mode` (`*ModeStore`)，CLI `/mode` 命令通过 setter 切换 |
+
+---
+
 # 代理
 代理是最为基础的运行单元，尽管我在后文会频繁提及调度器，但是调度器本身就是一个代理，它也可以回答用户的问题，并且操作有限度的工具。
 ## 代理工具
