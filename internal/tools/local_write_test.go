@@ -123,37 +123,13 @@ func TestLocalWriteGroup_Register_TwoTools(t *testing.T) {
 	}
 }
 
-func TestWriteFile_LockAcquiredBeforeRead(t *testing.T) {
-	g, rr, tmp := newWriteGroup(t, nil)
-	path := filepath.Join(tmp, "foo.txt")
-	// 预写一个已知内容的文件
-	if err := os.WriteFile(path, []byte("original"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// 传入错误的 expected_hash，期待 "写入冲突" 错误
-	_, err := callWriteFile(g, path, "new content", "deadbeef")
-	if err == nil || !strings.Contains(err.Error(), "写入冲突") {
-		t.Fatalf("expected 写入冲突 error, got %v", err)
-	}
-
-	events := rr.snapshot()
-	if len(events) < 2 {
-		t.Fatalf("expected at least TryClaim+Release events, got %v", events)
-	}
-	if !strings.HasPrefix(events[0], "TryClaim:") {
-		t.Fatalf("expected TryClaim to be first event, got %v", events)
-	}
-	if !strings.HasPrefix(events[len(events)-1], "Release:") {
-		t.Fatalf("expected Release to be last event, got %v", events)
-	}
-
-	// 确认文件内容没被覆盖（lock-before-read 后 hash 校验失败应立即返回）
-	data, _ := os.ReadFile(path)
-	if string(data) != "original" {
-		t.Fatalf("file should not be modified, got %q", string(data))
-	}
-}
+// C7 删除：TestWriteFile_LockAcquiredBeforeRead
+//
+// 该测试断言的是"hash 校验在 Roster 锁内执行"的不变式。这是 C7
+// 决议 B1 明确放弃的语义：hash 校验迁移到 ValidateExpectedHashHook
+// (PreCall) 后发生在 Roster 锁外，引入微秒级 TOCTOU 窗口，已被
+// hookSystem.md §10.1 接受。等价覆盖在
+// internal/hook/builtin/validate_expected_hash_test.go 中重建。
 
 func TestWriteFile_BasicSuccess(t *testing.T) {
 	g, rr, tmp := newWriteGroup(t, nil)
@@ -178,17 +154,8 @@ func TestWriteFile_BasicSuccess(t *testing.T) {
 	}
 }
 
-func TestWriteFile_HashMismatch(t *testing.T) {
-	g, _, tmp := newWriteGroup(t, nil)
-	path := filepath.Join(tmp, "h.txt")
-	if err := os.WriteFile(path, []byte("contents"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	_, err := callWriteFile(g, path, "updated", "not-the-real-hash")
-	if err == nil || !strings.Contains(err.Error(), "写入冲突") {
-		t.Fatalf("expected 写入冲突, got %v", err)
-	}
-}
+// C7 删除：TestWriteFile_HashMismatch
+// 等价覆盖在 internal/hook/builtin/validate_expected_hash_test.go 中。
 
 func TestWriteFile_HashMatch(t *testing.T) {
 	g, _, tmp := newWriteGroup(t, nil)
@@ -252,32 +219,9 @@ func TestWriteFile_ParentDirCreated(t *testing.T) {
 	}
 }
 
-func TestEditFile_LockAcquiredBeforeRead(t *testing.T) {
-	g, rr, tmp := newWriteGroup(t, nil)
-	path := filepath.Join(tmp, "edit.txt")
-	if err := os.WriteFile(path, []byte("hello world"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	_, err := callEditFile(g, path, "world", "Go", "wrong-hash")
-	if err == nil || !strings.Contains(err.Error(), "编辑冲突") {
-		t.Fatalf("expected 编辑冲突, got %v", err)
-	}
-	events := rr.snapshot()
-	if len(events) < 2 {
-		t.Fatalf("expected TryClaim+Release events, got %v", events)
-	}
-	if !strings.HasPrefix(events[0], "TryClaim:") {
-		t.Fatalf("expected first event to be TryClaim, got %v", events)
-	}
-	if !strings.HasPrefix(events[len(events)-1], "Release:") {
-		t.Fatalf("expected last event to be Release, got %v", events)
-	}
-	// 文件未被修改
-	data, _ := os.ReadFile(path)
-	if string(data) != "hello world" {
-		t.Fatalf("file should not be modified, got %q", string(data))
-	}
-}
+// C7 删除：TestEditFile_LockAcquiredBeforeRead — 同 TestWriteFile_LockAcquiredBeforeRead，
+// hash 校验已迁移到 hook 层（决策 B1）。等价覆盖在
+// internal/hook/builtin/validate_expected_hash_test.go 中。
 
 func TestEditFile_BasicReplace(t *testing.T) {
 	g, _, tmp := newWriteGroup(t, nil)
@@ -319,21 +263,8 @@ func TestEditFile_MultipleMatches(t *testing.T) {
 	}
 }
 
-func TestEditFile_HashMismatch(t *testing.T) {
-	g, _, tmp := newWriteGroup(t, nil)
-	path := filepath.Join(tmp, "h.txt")
-	if err := os.WriteFile(path, []byte("one world"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	_, err := callEditFile(g, path, "world", "Go", "obviously-wrong")
-	if err == nil || !strings.Contains(err.Error(), "编辑冲突") {
-		t.Fatalf("expected 编辑冲突, got %v", err)
-	}
-	data, _ := os.ReadFile(path)
-	if string(data) != "one world" {
-		t.Fatalf("file should not be modified, got %q", string(data))
-	}
-}
+// C7 删除：TestEditFile_HashMismatch — 等价覆盖在
+// internal/hook/builtin/validate_expected_hash_test.go 中。
 
 func TestEditFile_CacheInvalidatedAfterEdit(t *testing.T) {
 	cache := agent.NewFileStateCache(10)
