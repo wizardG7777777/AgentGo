@@ -124,6 +124,13 @@ func NewWithID(agentID string, s store.TaskStore, r roster.Roster, llmClient llm
 	// 根据配置创建搜索提供者
 	searchProvider := webtool.NewProvider(cfg.SearchAPIProvider, cfg.SearchAPIURL, cfg.SearchAPIKey)
 
+	// 根据配置和项目规则创建 Shell 命令过滤器
+	shellFilter, err := shell.BuildFilter(cfg.ProjectRoot, cfg.ShellBlacklist, cfg.ShellGreylist)
+	if err != nil {
+		// 规则加载失败时使用默认规则（记录警告但不阻断启动）
+		shellFilter = shell.NewCommandFilter(shell.DefaultBlacklist, shell.DefaultGreylist)
+	}
+
 	// 通过 ToolGroup 组合 Worker 的全量工具集
 	readGroup := tools.LocalReadGroup{Workdir: workdir, Cache: fileCache}
 	toolReg := agent.NewToolRegistry()
@@ -138,7 +145,7 @@ func NewWithID(agentID string, s store.TaskStore, r roster.Roster, llmClient llm
 			// hookReg 在 bootstrap 中注册时拿到 store 与 projectRoot。
 		},
 		tools.WebGroup{Provider: searchProvider},
-		tools.ShellGroup{Workdir: workdir, TimeoutSec: cfg.ShellTimeoutSec, ApprovalCh: approvalCh, AgentID: agentID},
+		tools.ShellGroup{Workdir: workdir, TimeoutSec: cfg.ShellTimeoutSec, ApprovalCh: approvalCh, AgentID: agentID, Filter: shellFilter},
 		tools.MetaGroup{Store: s, Holder: holder, MaxDepth: cfg.MaxSubtaskDepth, MBRegistry: mbRegistry, AgentID: agentID},
 	)
 
