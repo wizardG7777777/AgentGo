@@ -44,6 +44,7 @@ type SchedulerGroup struct {
 	Holder       TaskHolder            // 提供"当前 scheduler task 的 ID"，report_done 用于读 SchedulerBatch
 	MBRegistry   *mailbox.Registry     // 当前未使用，留作未来扩展（例如 report_done 时通知其他代理）
 	DoneNotifier SchedulerDoneNotifier // 可选；非 nil 时 reportDone 成功后调 MarkSchedulerDone()
+	ProjectRoot  string                // 项目根目录，供 probe_directory 做路径校验
 }
 
 // Register 把 cancel_task / report_done 注册到 r。
@@ -75,6 +76,17 @@ func (g SchedulerGroup) Register(r *agent.ToolRegistry) {
 			g.reportDone,
 		)
 	}
+
+	r.Register(
+		"probe_directory",
+		"探测指定目录的完整结构，返回树状目录（含文件大小）、文件类型分布和统计综述。"+
+			"比 list_dir 更强大但输出更多 token，用于任务规划前了解工作区全貌。",
+		schema.Object().
+			String("path", "要探测的目录路径（相对项目根），默认 '.'", false).
+			Int("depth", "递归深度，默认 3，最大 10", false).
+			Build(),
+		g.probeDirectory,
+	)
 }
 
 // cancelTask 是 cancel_task 工具的实现。先尝试 pending→cancelled，

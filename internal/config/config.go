@@ -49,6 +49,10 @@ type Config struct {
 	SearchAPIProvider       string `yaml:"search_api_provider" json:"search_api_provider"`
 	SearchAPIURL            string `yaml:"search_api_url" json:"search_api_url"`
 	SearchAPIKey            string `yaml:"search_api_key" json:"search_api_key"`
+
+	// Shell 命令拦截配置（追加到默认规则）
+	ShellBlacklist []string `yaml:"shell_blacklist" json:"shell_blacklist"`
+	ShellGreylist  []string `yaml:"shell_greylist" json:"shell_greylist"`
 }
 
 func DefaultConfig() *Config {

@@ -2,6 +2,9 @@ package tools
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -11,22 +14,22 @@ import (
 
 // ---- Register 注册 ----
 
-func TestSchedulerGroup_Register_BothTools(t *testing.T) {
+func TestSchedulerGroup_Register_AllTools(t *testing.T) {
 	reg := agent.NewToolRegistry()
 	SchedulerGroup{
 		Store:  newFakeStore(),
 		Holder: &fakeHolder{id: "sched-1"},
 	}.Register(reg)
 	defs := reg.Defs()
-	if len(defs) != 2 {
-		t.Fatalf("expected 2 tools, got %d", len(defs))
+	if len(defs) != 3 {
+		t.Fatalf("expected 3 tools (cancel_task + report_done + probe_directory), got %d", len(defs))
 	}
 	names := map[string]bool{}
 	for _, d := range defs {
 		names[d.Name] = true
 	}
-	if !names["cancel_task"] || !names["report_done"] {
-		t.Errorf("expected cancel_task + report_done, got %v", names)
+	if !names["cancel_task"] || !names["report_done"] || !names["probe_directory"] {
+		t.Errorf("expected cancel_task + report_done + probe_directory, got %v", names)
 	}
 }
 
@@ -42,8 +45,12 @@ func TestSchedulerGroup_Register_NoHolderSkipsReportDone(t *testing.T) {
 	reg := agent.NewToolRegistry()
 	SchedulerGroup{Store: newFakeStore()}.Register(reg)
 	defs := reg.Defs()
-	if len(defs) != 1 || defs[0].Name != "cancel_task" {
-		t.Errorf("expected only cancel_task without Holder, got %v", defs)
+	names := map[string]bool{}
+	for _, d := range defs {
+		names[d.Name] = true
+	}
+	if len(defs) != 2 || !names["cancel_task"] || !names["probe_directory"] {
+		t.Errorf("expected cancel_task + probe_directory without Holder, got %v", names)
 	}
 }
 
@@ -346,5 +353,175 @@ func TestBuildSchedulerArtifactsReport_EmptyBatch(t *testing.T) {
 	}
 	if got := buildSchedulerArtifactsReport(s, []string{}); got != "" {
 		t.Errorf("empty batch should produce empty string, got %q", got)
+	}
+}
+
+// ---- probe_directory ----
+
+func TestProbeDirectory_BasicTree(t *testing.T) {
+	// 创建临时目录结构
+	tmp := t.TempDir()
+	os.MkdirAll(filepath.Join(tmp, "src"), 0o755)
+	os.WriteFile(filepath.Join(tmp, "main.go"), []byte("package main"), 0o644)
+	os.WriteFile(filepath.Join(tmp, "src", "app.go"), []byte("package src\n// app"), 0o644)
+	os.WriteFile(filepath.Join(tmp, "README.md"), []byte("# readme"), 0o644)
+
+	g := SchedulerGroup{Store: newFakeStore(), ProjectRoot: tmp}
+	out, err := g.probeDirectory(context.Background(), map[string]any{"path": ".", "depth": 3.0})
+	if err != nil {
+		t.Fatalf("probeDirectory: %v", err)
+	}
+
+	// 综述行
+	if !strings.Contains(out, "[综述]") {
+		t.Errorf("missing [综述] header: %s", out)
+	}
+	if !strings.Contains(out, "文件: 3") {
+		t.Errorf("expected 3 files in summary: %s", out)
+	}
+	if !strings.Contains(out, "文件夹: 1") {
+		t.Errorf("expected 1 dir in summary: %s", out)
+	}
+
+	// 类型分布
+	if !strings.Contains(out, ".go") {
+		t.Errorf("expected .go in type distribution: %s", out)
+	}
+	if !strings.Contains(out, ".md") {
+		t.Errorf("expected .md in type distribution: %s", out)
+	}
+
+	// 树形输出含文件大小
+	if !strings.Contains(out, "main.go") {
+		t.Errorf("expected main.go in tree: %s", out)
+	}
+	if !strings.Contains(out, "B") && !strings.Contains(out, "KB") {
+		t.Errorf("expected file size in tree: %s", out)
+	}
+}
+
+func TestProbeDirectory_DepthControl(t *testing.T) {
+	tmp := t.TempDir()
+	os.MkdirAll(filepath.Join(tmp, "a", "b", "c"), 0o755)
+	os.WriteFile(filepath.Join(tmp, "a", "b", "c", "deep.txt"), []byte("deep"), 0o644)
+
+	g := SchedulerGroup{Store: newFakeStore(), ProjectRoot: tmp}
+
+	// depth=1 只看顶层
+	out1, _ := g.probeDirectory(context.Background(), map[string]any{"path": ".", "depth": 1.0})
+	if strings.Contains(out1, "deep.txt") {
+		t.Errorf("depth=1 should not show deep.txt: %s", out1)
+	}
+	if !strings.Contains(out1, "a/") {
+		t.Errorf("depth=1 should show top-level dir 'a/': %s", out1)
+	}
+
+	// depth=5 看到底
+	out5, _ := g.probeDirectory(context.Background(), map[string]any{"path": ".", "depth": 5.0})
+	if !strings.Contains(out5, "deep.txt") {
+		t.Errorf("depth=5 should show deep.txt: %s", out5)
+	}
+}
+
+func TestProbeDirectory_SkipsHidden(t *testing.T) {
+	tmp := t.TempDir()
+	os.MkdirAll(filepath.Join(tmp, ".git"), 0o755)
+	os.WriteFile(filepath.Join(tmp, ".gitignore"), []byte("*.o"), 0o644)
+	os.WriteFile(filepath.Join(tmp, "visible.go"), []byte("package x"), 0o644)
+
+	g := SchedulerGroup{Store: newFakeStore(), ProjectRoot: tmp}
+	out, _ := g.probeDirectory(context.Background(), map[string]any{"path": "."})
+
+	if strings.Contains(out, ".git") {
+		t.Errorf("should skip hidden dirs/files: %s", out)
+	}
+	if !strings.Contains(out, "visible.go") {
+		t.Errorf("should show visible files: %s", out)
+	}
+	// 综述中也不该计入隐藏文件
+	if !strings.Contains(out, "文件: 1") {
+		t.Errorf("expected only 1 visible file in summary: %s", out)
+	}
+}
+
+func TestProbeDirectory_EmptyDir(t *testing.T) {
+	tmp := t.TempDir()
+
+	g := SchedulerGroup{Store: newFakeStore(), ProjectRoot: tmp}
+	out, err := g.probeDirectory(context.Background(), map[string]any{"path": "."})
+	if err != nil {
+		t.Fatalf("probeDirectory: %v", err)
+	}
+	if !strings.Contains(out, "文件: 0") {
+		t.Errorf("expected 0 files in summary for empty dir: %s", out)
+	}
+	if !strings.Contains(out, "无文件") {
+		t.Errorf("expected 无文件 in type distribution for empty dir: %s", out)
+	}
+}
+
+func TestProbeDirectory_PathValidation(t *testing.T) {
+	tmp := t.TempDir()
+	g := SchedulerGroup{Store: newFakeStore(), ProjectRoot: tmp}
+
+	_, err := g.probeDirectory(context.Background(), map[string]any{"path": "../../etc/passwd"})
+	if err == nil {
+		t.Fatal("expected path traversal error")
+	}
+}
+
+func TestProbeDirectory_Stats(t *testing.T) {
+	tmp := t.TempDir()
+	// 6 个 .go，2 个 .md，1 个 .yaml
+	for i := 0; i < 6; i++ {
+		os.WriteFile(filepath.Join(tmp, fmt.Sprintf("f%d.go", i)), []byte("go"), 0o644)
+	}
+	os.WriteFile(filepath.Join(tmp, "a.md"), []byte("md"), 0o644)
+	os.WriteFile(filepath.Join(tmp, "b.md"), []byte("md"), 0o644)
+	os.WriteFile(filepath.Join(tmp, "c.yaml"), []byte("yaml"), 0o644)
+
+	g := SchedulerGroup{Store: newFakeStore(), ProjectRoot: tmp}
+	out, _ := g.probeDirectory(context.Background(), map[string]any{"path": "."})
+
+	if !strings.Contains(out, "文件: 9") {
+		t.Errorf("expected 9 files: %s", out)
+	}
+	// .go 应排第一（数量最多）
+	distLine := ""
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "[类型分布]") {
+			distLine = line
+			break
+		}
+	}
+	if distLine == "" {
+		t.Fatalf("missing [类型分布] line: %s", out)
+	}
+	goIdx := strings.Index(distLine, ".go")
+	mdIdx := strings.Index(distLine, ".md")
+	if goIdx < 0 || mdIdx < 0 || goIdx > mdIdx {
+		t.Errorf(".go should appear before .md (higher count): %s", distLine)
+	}
+}
+
+// ---- formatSize ----
+
+func TestFormatSize(t *testing.T) {
+	cases := []struct {
+		bytes int64
+		want  string
+	}{
+		{0, "0 B"},
+		{512, "512 B"},
+		{1024, "1.0 KB"},
+		{1536, "1.5 KB"},
+		{1048576, "1.0 MB"},
+		{1572864, "1.5 MB"},
+	}
+	for _, c := range cases {
+		got := formatSize(c.bytes)
+		if got != c.want {
+			t.Errorf("formatSize(%d) = %q, want %q", c.bytes, got, c.want)
+		}
 	}
 }
