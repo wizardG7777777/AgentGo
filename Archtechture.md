@@ -31,7 +31,7 @@
 
 # Hook System（2026-04-09 阶段 1 + 阶段 2 完成）
 
-Hook System 是工具调用生命周期的拦截层，为"软约束 → 硬约束"提供统一的注册、组合、测试、扩展面。详细设计见 `docs/activate/hookSystem.md`。
+Hook System 是工具调用生命周期的拦截层，为"软约束 → 硬约束"提供统一的注册、组合、测试、扩展面。原设计规范已归档至 `docs/archived/hookSystem.md`（阶段 1+2 已全部落地，文档不再更新）。
 
 ## 阶段 1 范围
 
