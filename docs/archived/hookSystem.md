@@ -1,5 +1,7 @@
 # Hook System 架构与实现规范
 
+> **📦 归档说明（2026-04-11）**：阶段 1（Tool Hook）与阶段 2（Mailbox Hook）全部落地完成——`internal/hook` + `internal/hook/builtin` 7 个内置 hook、`StoreHookView`、`ToolCallRecord` 二级索引、`mailbox.Registry.AttachHookRunner`、`MailNotifier` BeforeWake 触发点、`MailNotifierEnabled` 默认恢复为 `true`。本文档不再更新，也不应再作为未来开发的参考依据。运行时权威信息以 `Archtechture.md` §Hook System 与源代码为准；阶段 3+ 的延期项另行规划，不从本文档续写。
+
 > 状态：✅ 设计已对齐（2026-04-09 完成）
 > 目标读者：本文是阶段 1+2 的实现规范，§9 检查清单全部对齐，可按 §10 执行
 > 范围控制：本文只覆盖**阶段 1（Tool Hook）+ 阶段 2（Mailbox Hook）**。其他类别只列出占位，详细延期项见 `nextUpgrade_v3.md` §5

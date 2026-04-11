@@ -1,5 +1,7 @@
 # 多代理协作系统架构调查报告
 
+> **📦 归档说明（2026-04-11）**：本文档所覆盖的调查/对标项目已全部完成实现或以架构决策形式明确落定，不再更新，也不应再作为未来开发的参考依据。当前项目权威信息以 `Archtechture.md` 与源代码为准。归档时同步修正了 Worktree 相关章节（§3 第 2 / 第 7 条、§1 平级协作段、§7 破坏性隔离段、总览表）——2026-04-09 已决定彻底删除 git 依赖与 `internal/isolation`，此前文档中所有 ✅ Worktree 标记均为历史残留。
+
 本报告旨在系统性地剖析claude code中多代理协作（Multi-Agent Collaboration）的系统构建，涵盖架构设计、生命周期、调度逻辑、通信机制、安全控制以及上下文管理等核心技术细节。
 
 > **AgentGo 实现状态标记说明**：
@@ -90,8 +92,8 @@
 
 1. ✅ **评估注册阶段 (Registration)**：主模型发起调用，系统进行前置合规与资源判定（如：它需要的 MCP 服务是否可用，是否突破了 Team 的边界条件权限）。
    > **AgentGo 对应**：Scheduler 通过 `publish_task` 发布任务到公告板。`ClaimTask` 时校验依赖完成状态和并发上限。`publish_subtask` 校验 `MaxSubtaskDepth`。
-2. ✅ **工作区挂载与分支创建 (Isolation / Forking)**：系统检测 `isolation` 模式。如果是 `worktree` 模式，新建物理级别隔绝的仓库克隆目录；若是 `remote`，向 CCR 服务器申请执行沙箱。
-   > **AgentGo 已实现**：`internal/isolation/worktree.go` 提供 Per-Task Git Worktree 隔离（`cfg.WorktreeEnabled` 开关）。Worker 在 `OnTaskStart` 中创建独立 worktree 分支，任务完成后自动 commit+merge 回主分支。冲突时由 `ConflictResolver`（LLM 驱动 ReAct 循环，180s 超时）自动解决。Explorer 也使用独立 worktree（只读，不 commit）。`Remote Task` 沙箱未实现。
+2. ❌ **工作区挂载与分支创建 (Isolation / Forking)**：系统检测 `isolation` 模式。如果是 `worktree` 模式，新建物理级别隔绝的仓库克隆目录；若是 `remote`，向 CCR 服务器申请执行沙箱。
+   > **AgentGo 现状（2026-04-09 架构决策：无 git 依赖）**：曾经存在的 `internal/isolation` 包（`WorktreeManager` / `ConflictResolver` / `cfg.WorktreeEnabled`）已整体删除，AgentGo 代码本体不再调用 git。所有 Worker 共享 `ProjectRoot`，并发写文件的唯一防线是 `Roster` 文件锁 + `expected_hash` TOCTOU 检查 + `pathutil.ValidatePath` 路径越界防护。删 git 后故意暴露的 4 项退化（并发写覆盖、半成品回滚、跨任务可见性、杀任务清理）等待"多代理协同重建"阶段按真实失败模式驱动设计。详见 `Archtechture.md` §关键实现事实与 `internal/worker/worker.go:108` 决策注记。
 3. 🔶 **会话流初始化 (Initialization)**：代理根据是否是”新建(Fresh)”或”分身(Fork)”分配初始消息列表（记录于其特定的存储空间，如 `subagents/<agent_id>` 内侧链，不混入主链）。
    > **AgentGo 对应**：每个 Agent 在 `processTask` 中构建独立的 `history []HistoryEntry`。重试时从 `task.LastHistory`（JSON）反序列化恢复历史上下文。各 Agent 历史天然隔离（不同 goroutine 的局部变量）。
 4. ✅ **主轮询运转 (Execution)**：进入大模型驱动反馈循环 (`query.ts` 内的 `queryLoop`)。不断地产生思考、执行工具、读取反馈。
@@ -100,8 +102,8 @@
    > **AgentGo 部分实现**：Agent 通过 500ms 轮询 `QueryAvailable` 检测可领取任务，依赖未满足时跳过。`MailNotifier` 可为有未读邮件的空闲代理发布唤醒任务，间接实现了基于消息的重激活。但无显式 suspend/resume 机制（当前 MVP 规模下轮询开销可忽略，详见 `docs/nextUpgrade_v2.md §3.5`）。
 6. ✅ **终止与总结汇报 (Termination & Summary)**：Agent 达到目标或到达最大轮次 (`maxTurns`)。它触发总结组件 `agentSummary.ts`，将所有零散日志高度概括为一份摘要，推给它的”上级”。
    > **AgentGo 对应**：当 LLM 返回 `ToolCalled=false` 时，Agent 调用 `SubmitResult` 将输出写入 Task.Results。Scheduler 通过 `boardSnapshot` 的 `results` 字段读取结果，决定下一步动作。循环耗尽时保存历史并 RetryRollback 或 FailTask。
-7. ✅ **遗迹清理 (Cleanup)**：合并带有改动的 Worktree 分支（或丢弃脏状态），卸载专属 MCP Client，销毁本地相关数据。
-   > **AgentGo 已实现**：Worker `OnTaskEnd` 自动 commit+merge worktree 分支，成功后删除 worktree；冲突时交由 ConflictResolver 处理，失败则保留 worktree 供手动检查。`Agent.Run` 退出时 defer 调用 `Roster.ReleaseAll(agentID)` 释放所有文件锁。`processTask` 开始时调用 `FileCache.Clear()` 清除文件缓存。`System.Shutdown` 调用 `WorktreeManager.CleanupAll()` 清理残留 worktree。
+7. 🔶 **遗迹清理 (Cleanup)**：合并带有改动的 Worktree 分支（或丢弃脏状态），卸载专属 MCP Client，销毁本地相关数据。
+   > **AgentGo 现状**：Worktree 相关清理路径（commit+merge / `WorktreeManager.CleanupAll`）已随 git 依赖一并删除，见本节第 2 条。当前的清理机制仅剩：`Agent.Run` 退出时 defer 调用 `Roster.ReleaseAll(agentID)` 释放所有文件锁；`processTask` 开始时调用 `FileCache.Clear()` 清除文件缓存；任务完成/失败/取消进入 FIFO 淘汰队列时 `ToolCallRecord` 一并淘汰。
 
 ---
 
@@ -182,8 +184,8 @@
   > **AgentGo 对应**：每个 Agent goroutine 维护各自的 `history []HistoryEntry` 局部变量，天然内存隔离。重试时通过 `task.LastHistory`（JSON 序列化到 Task 结构体）跨生命周期持久化。无磁盘侧链日志。
 - ✅ **独立的 FileStateCache**：主系统与子系统各自拥有已读文件缓冲区副本。
   > **AgentGo 对应**：每个 Worker 和 Explorer 在构造时创建独立的 `FileStateCache(50)` 实例，互不共享。
-- ✅ **物理系统隔离 (`Git Worktree` / `Remote Task`)**：不同工作目录和远端运行进程。
-  > **AgentGo 已实现（Worktree 部分）**：`cfg.WorktreeEnabled` 开启后，Worker/Explorer 在任务开始时获得独立 Git Worktree 工作目录，工具闭包通过 `currentWorkdirHolder` 动态切换 projectRoot。任务完成后自动 commit+merge。Remote Task 未实现。
+- ❌ **物理系统隔离 (`Git Worktree` / `Remote Task`)**：不同工作目录和远端运行进程。
+  > **AgentGo 现状（2026-04-09 架构决策：无 git 依赖）**：`internal/isolation` 包已整体删除，Worker/Explorer 一律共享 `ProjectRoot`，不再存在 Per-Task Git Worktree。Remote Task 沙箱未实现。详见 `Archtechture.md` §关键实现事实。
 
 ### 为什么要做上下文隔离？
 1. ✅ **防止系统性幻觉与污染**：如果研发代理和排障代理看同一个上下文，海量的 `git log` 和失败报错栈会严重污染主进程记忆，导致模型注意力机制越距，丢失当前宏观目的。
@@ -209,7 +211,7 @@
    在注入 MCP 或执行前端命令中验证 Agent `source`，如用户自写恶意代理若没有 `isSourceAdminTrusted` 为 true 的断言，不仅无法调用钩子甚至拿不到 MCP 危险服务的通讯句柄。
 4. 🔶 **破坏性隔离 (Sandboxing)**：
    借助于 `isolation: “worktree”` 与 `Remote Task`，即使代理”疯狂乱作”，它的脏环境也不会立刻进入主开发主干，保障工程的核心逻辑随时可以被人类安全评估后终止并扬弃。
-   > **AgentGo 部分实现**：Git Worktree 隔离已实现（`cfg.WorktreeEnabled`），代理在独立分支上工作，脏状态不影响主分支。Shell 命令拦截（`internal/shell/intercept.go`）提供黑名单硬拒绝 + 灰名单 CLI 审批。但无容器/chroot 级硬沙箱，Remote Task 未实现。其他安全机制：
+   > **AgentGo 现状**：Git Worktree 隔离已于 2026-04-09 随 git 依赖整体删除（见 §3 第 2 条）。当前仍保留的"破坏性隔离"手段只有 Shell 命令拦截（`internal/shell/intercept.go`）：黑名单硬拒绝 + 灰名单 CLI 审批。无容器/chroot 级硬沙箱，Remote Task 未实现。其他安全机制：
    > - ✅ **路径安全**：`pathutil.ValidatePath` 限制所有文件操作在 `ProjectRoot` 内，阻止 `../` 遍历和敏感文件访问
    > - ✅ **SSRF 防护**：`webtool.validateURL` + `isPrivateOrLoopback` 阻止内网/环回/链路本地地址访问
    > - ✅ **文件写冲突防护**：Roster 文件锁 + `expected_hash` 乐观并发控制
@@ -238,7 +240,7 @@
 | 依赖感知驱逐 | ✅ | evictSafe + isDependedUpon |
 | 代理间直接通信 | ✅ | mailbox.Registry + send_message 工具 + MailNotifier 唤醒 |
 | 分身机制 (Fork) | 🔶 | 远景。publish_subtask 覆盖大部分场景，完整上下文克隆技术可行但待实际需求驱动 |
-| 物理隔离 (Worktree) | ✅ | Per-Task Git Worktree + ConflictResolver 自动合并 |
+| 物理隔离 (Worktree) | ❌ | 2026-04-09 架构决策：无 git 依赖，`internal/isolation` 已整体删除；所有 Worker 共享 ProjectRoot |
 | Shell 命令拦截 | ✅ | 黑名单硬拒绝 + 灰名单 CLI 审批（internal/shell/intercept.go） |
 | 跨代理自组织 | 🔶 | TeamSnapshot 团队感知 + send_message 主动通信 + prompt 协作引导。完全去中心化调度未实现 |
 | 权限分级模型 | ❌ | 无运行时权限控制（已移至 nextUpgrade_v2.md §3.7） |

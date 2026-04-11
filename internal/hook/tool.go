@@ -1,6 +1,6 @@
 // Package hook 提供工具调用生命周期 hook 框架。
 // Phase 1 仅覆盖 Tool Hook（pre/post call），Mailbox Hook 留到 Phase 2。
-// 详细设计见 docs/activate/hookSystem.md。
+// 详细设计见 docs/archived/hookSystem.md（已归档，阶段 1+2 全部落地）。
 package hook
 
 import "context"
