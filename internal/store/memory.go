@@ -35,11 +35,56 @@ type MemoryTaskStore struct {
 	// toolCalls 记录每个任务的工具调用历史。二级索引 taskID -> toolName -> records
 	// 避免 hook 在每次工具调用前做 O(N) 全量扫描。
 	toolCalls map[string]map[string][]ToolCallRecord
+	// artifactLog 是 task.Artifacts 的追加式持久化日志。可选——nil 时整个
+	// 持久化路径退化为纯内存行为（单测默认走这条路径，bootstrap 显式注入）。
+	// 写入路径：AppendArtifact 先成功更新内存 task.Artifacts，再异步追加 log；
+	// log 写入失败只打印 warning，不回滚内存状态——这保证"内存是真相来源"，
+	// 下次启动最多丢失最后一条 record，不会出现"task 声称成功但 artifact 凭空消失"。
+	artifactLog *ArtifactLog
 }
 
 // SetCancelRegistry 注入 per-task cancel context 管理器。
 func (s *MemoryTaskStore) SetCancelRegistry(r *TaskCancelRegistry) {
 	s.cancelRegistry = r
+}
+
+// SetArtifactLog 注入 artifact 持久化 log。nil 为合法——表示禁用持久化。
+// 必须在 bootstrap 早期调用（在任何 AppendArtifact 可能发生之前），因为
+// log 写入不是事务化的——如果中途注入，启动前的 AppendArtifact 将不会
+// 出现在持久化日志里。
+func (s *MemoryTaskStore) SetArtifactLog(log *ArtifactLog) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.artifactLog = log
+}
+
+// RestoreArtifacts 从 replay 结果恢复 task.Artifacts 到内存。
+// 仅在 bootstrap 期间调用一次——它假设传入的 rebuilt 对每个 taskID
+// 都是去重后的完整 artifact 列表，直接覆盖 task.Artifacts。
+//
+// 重要语义：只对已存在的任务恢复 artifacts。如果 rebuilt 里的 taskID
+// 在当前 store 里不存在（例如任务已被 FIFO 淘汰但日志仍留着），**跳过**
+// 而不是创建幽灵任务。这保证重放永远不会让 task 凭空出现。
+//
+// 返回实际恢复的 (taskID 数, artifact 总数)，供日志打印。
+func (s *MemoryTaskStore) RestoreArtifacts(rebuilt map[string][]string) (taskCount, artifactCount int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for taskID, paths := range rebuilt {
+		task, ok := s.tasks[taskID]
+		if !ok {
+			continue // 任务不在 store 里——跳过
+		}
+		// 覆盖而非 merge——rebuilt 是 Replay 后的完整去重列表。
+		// 如果调用方在 bootstrap 里先 PublishTask 再 RestoreArtifacts，
+		// 这里会把 publish 时可能带的初始 Artifacts 覆盖掉。但 bootstrap
+		// 里 PublishTask 只发布空 artifacts 的新任务，所以覆盖是安全的。
+		task.Artifacts = make([]string, len(paths))
+		copy(task.Artifacts, paths)
+		taskCount++
+		artifactCount += len(paths)
+	}
+	return taskCount, artifactCount
 }
 
 func NewMemoryTaskStore(eventCh chan<- model.Event, fifoLimit, defaultConcurrency, defaultTimeoutSec int) *MemoryTaskStore {
@@ -397,21 +442,41 @@ func (s *MemoryTaskStore) GetDependencyResults(taskID string) (map[string]string
 // AppendArtifact 把一个文件路径追加到指定任务的 Artifacts 列表，自动去重。
 // path 应当是相对项目根的相对路径（调用方在 LocalWriteGroup 中已经标准化）。
 // 写入路径已存在时直接返回，不报错——多次写同一个文件是合法的。
+//
+// 持久化语义（2026-04-12 Artifacts 持久化专题）：
+//
+//   - 内存写入在 s.mu 写锁下完成，与其他 Store 方法保持互斥
+//   - 如果 artifactLog 非 nil 且本次是一次**新**路径（去重未命中），
+//     追加一条 JSONL record 到日志。log 写入在 Store 锁**外**进行，
+//     避免 fsync 阻塞其他 goroutine 的读写
+//   - 日志写入失败只打印 warning，不回滚内存状态——参见 artifactLog 字段
+//     的注释（内存是真相来源）
+//   - 去重命中的路径不写 log（不必要的 IO + 让 Replay 更快）
 func (s *MemoryTaskStore) AppendArtifact(taskID string, path string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	task, ok := s.tasks[taskID]
 	if !ok {
+		s.mu.Unlock()
 		return ErrTaskNotFound
 	}
 	// 去重检查
 	for _, existing := range task.Artifacts {
 		if existing == path {
-			return nil // 已存在，无操作
+			s.mu.Unlock()
+			return nil // 已存在，无操作——不写 log
 		}
 	}
 	task.Artifacts = append(task.Artifacts, path)
+	logRef := s.artifactLog
+	s.mu.Unlock()
+
+	// 锁外写日志，避免 fsync 阻塞其他 Store 操作
+	if logRef != nil {
+		if err := logRef.Append(taskID, path); err != nil {
+			// 不回滚内存状态——内存是真相来源
+			log.Printf("[store] WARN artifact log 写入失败 task=%s path=%s: %v", taskID, path, err)
+		}
+	}
 	return nil
 }
 
