@@ -231,10 +231,51 @@ Scheduler 在最初的设计里是一个**独立写的事件驱动 ReAct 循环*
 | 事件驱动入口 | `Activator` goroutine 监听 EventCh |
 | 全局任务板视角 | `BuildBoardJSON` 注入到 history，LLM 看到所有 task 的状态 |
 | `cancel_task` / `report_done` | `SchedulerGroup`，独占工具，worker 没有 |
+| **探针工具 `probe_directory`** | Scheduler 专属目录探测，用于任务规划前了解工作区全貌 |
 | 系统级 mailbox 别名 `"scheduler"` | `New` 构造时 `mbRegistry.RegisterAlias("scheduler", schedID)` |
 | 提前 `report_done` 硬拦截 | `SchedulerGroup.report_done` 内部扫描 `task.SchedulerBatch` 状态 |
 | `task.Artifacts` 事实校对 | `SchedulerGroup.report_done` 调 `buildSchedulerArtifactsReport` |
 | Plan / Immediate mode 切换 | `Bundle.Mode` (`*ModeStore`)，CLI `/mode` 命令通过 setter 切换 |
+
+### Scheduler 探针工具（`probe_directory`）
+
+**位置**: `internal/tools/scheduler_probe.go`
+
+Phase 3 重构后 scheduler 获得直接读取文件的能力，探针工具在此基础上提供更高效的任务规划前侦查：
+
+**功能**：
+- 递归遍历目录树（可配置深度，默认 3 层，最大 10 层）
+- 统计文件夹数、文件数、总大小
+- 文件类型分布（按扩展名分类，Top 5 + 其他）
+- 格式化树状输出（最多 500 个条目，防止输出过大）
+
+**使用场景**：
+```
+用户: "请分析这个项目"
+Scheduler: probe_directory(path=".") 
+→ 获得项目结构概览，决定如何拆分任务
+```
+
+**输出示例**：
+```
+[综述] 根目录: /AgentGo | 文件夹: 42 | 文件: 187 | 总大小: 2.4 MB
+[类型分布] .go: 89 (48%) | .md: 23 (12%) | .yaml: 12 (6%) | .json: 8 (4%) | .mod: 3 (2%) | 其他: 52 (28%)
+
+internal/
+  agent/
+    agent.go                                    12.5 KB
+    llm_executor.go                              8.3 KB
+    ...
+  scheduler/
+    scheduler.go                                 6.7 KB
+```
+
+**与其他工具的对比**：
+| 工具 | 用途 | 输出特点 |
+|------|------|---------|
+| `list_dir` | 查看单层目录 | 简单列表 |
+| `glob_search` | 按模式找文件 | 文件路径列表 |
+| `probe_directory` | 任务规划前侦查 | 统计 + 树状结构 + 类型分布 |
 
 ---
 
@@ -292,6 +333,53 @@ Scheduler 在最初的设计里是一个**独立写的事件驱动 ReAct 循环*
     - 不可恢复：端点不存在、认证失败、权限不足、响应格式错误——提交为 failed（processing→failed）
 - **失败信息写入**：将失败原因写入公告板的任务重试原因字段，供后续审计和调度器决策参考
 - **资源清理**：代理失败后清理本次执行中占用的临时资源（如未完成的文件写入、未关闭的连接），然后回到空闲等待状态
+
+## 三层历史压缩机制
+
+**位置**: `internal/agent/agent.go` (Layer 1), `internal/agent/history.go` (Layer 2, 3)
+
+为应对复杂任务中 LLM 上下文可能超过模型限制的问题，Agent 实现了三层递进式历史压缩策略：
+
+### Layer 1: 旧工具结果清理（`snipOldToolResults`）
+
+**触发时机**: 每轮 ReAct 循环自动执行，无 LLM 开销
+
+**策略**: 
+- 清理前序轮次中输出长度超过 1000 字符的工具结果
+- 保留 tool call 记录，但将结果替换为 `"[已清理，共 X 字符]"`
+- 最近一轮的工具结果完整保留
+
+**目的**: 控制历史累积速度，不影响 LLM 对工具调用链的感知
+
+### Layer 2: Token 阈值压缩（`compressHistory`）
+
+**触发时机**: `totalPromptTokens > CompactTokenThreshold`（默认 80000）
+
+**策略**:
+1. 保留最近 `CompactKeepRecent` 条（默认 3 条）完整历史
+2. 对更早的历史调用 LLM 生成摘要：
+   - 系统消息保留
+   - 工具调用历史摘要化为 `"第 X-Y 轮：执行了 {tool1, tool2, ...}，结果概述..."`
+3. 摘要作为系统消息插入，标记为 `[历史摘要]`
+
+### Layer 3: Context Overflow 激进压缩（`handleFailure` 内）
+
+**触发时机**: LLM 返回 413/429 等 context overflow 错误
+
+**策略**:
+- `keepRecent=1`：仅保留最后 1 条完整历史
+- 其余全部摘要化
+- 触发 `RetryRollback`，以压缩后的历史重试
+
+**目的**: 紧急止损，确保任务不因上下文超限而彻底失败
+
+### 压缩策略对比
+
+| 层级 | 触发条件 | LLM 开销 | 压缩强度 | 用户感知 |
+|------|---------|---------|---------|---------|
+| Layer 1 | 每轮自动 | 无 | 轻（仅长输出）| 无 |
+| Layer 2 | Token 阈值 | 有（摘要调用）| 中（保留最近 N 条）| 轻微（看到摘要）|
+| Layer 3 | Context 溢出 | 有（摘要调用）| 激进（仅保留 1 条）| 明显（重试提示）|
 
 # 公告板
 公告板是一个信息存储桶，主公告板在程序启动的时候就存在，并且存储调度器和执行代理，以及更多后续启动的所有的Agent传递的消息。
@@ -617,6 +705,71 @@ Scheduler agent (Phase 3 后) 与 worker / explorer 共享同一套 `Mailbox.Dra
 - 看门狗先于 explorer/worker 启动，确保第一批任务就处于监控之下
 - 任一步骤失败时返回 error 终止启动，不进入半初始化状态
 
+# Trace 系统
+
+**位置**: `internal/trace/`
+
+Trace 系统为每个任务记录完整的执行轨迹，便于问题诊断、性能分析和行为审计。
+
+## Trace 文件结构
+
+**存储位置**: `.agentgo/traces/`
+
+**文件命名**: `<UTC时间戳>_<taskID前8位>.jsonl`
+- 示例：`2026-04-08T04-17-06_321b561d.jsonl`
+
+**格式**: JSON Lines（每行一个 JSON 对象）
+
+## 事件类型
+
+| 事件类型 | 说明 | 关键字段 |
+|---------|------|---------|
+| `task_published` | 任务发布 | `task_id`, `description`, `dependencies` |
+| `task_claimed` | 任务被认领 | `task_id`, `agent_id` |
+| `task_completed` | 任务完成 | `task_id`, `agent_id` |
+| `task_failed` | 任务失败 | `task_id`, `error` |
+| `llm_call` | LLM 调用 | `prompt_tokens`, `completion_tokens`, `model` |
+| `tool_call` | 工具调用开始 | `tool`, `args` |
+| `tool_result` | 工具调用完成 | `tool`, `duration_ms`, `result_len` |
+| `history_compaction` | 历史压缩 | `layer`, `original_len`, `compacted_len` |
+
+## 使用示例
+
+### 查看最近任务的 trace
+```bash
+ls -lt .agentgo/traces/ | head -10
+```
+
+### 分析特定任务的执行流程
+```bash
+# 读取 trace 文件
+cat .agentgo/traces/2026-04-08T04-17-06_321b561d.jsonl | jq '.'
+
+# 统计工具调用次数
+cat .agentgo/traces/2026-04-08T04-17-06_321b561d.jsonl | jq 'select(.kind=="tool_call") | .tool' | sort | uniq -c
+
+# 查看 LLM token 消耗
+cat .agentgo/traces/2026-04-08T04-17-06_321b561d.jsonl | jq 'select(.kind=="llm_call") | {prompt: .prompt_tokens, completion: .completion_tokens}'
+```
+
+### Prompt Dump（调试模式）
+设置环境变量启用详细 prompt 记录：
+```bash
+AGENTGO_DUMP_PROMPTS=1 ./agentgo
+```
+
+## 并发安全
+
+- 每任务独立文件，无跨任务竞争
+- 每 Writer 实例一把互斥锁（`sync.Mutex`）
+- `Emit()` 调用串行化，保证 JSON 行不交错
+
+## GC 策略
+
+- 默认保留最近 100 个任务的 trace 文件
+- 超出限制时按修改时间删除最旧文件
+- 正在写入的文件不会被删除
+
 # 全局配置
 系统运行所需的全局参数，从 `setting.yaml` 或 `setting.json` 读取，文件不存在时使用内置默认值。当前仅支持 `-config <path>` 命令行参数指定文件路径，**单字段命令行覆盖未实现**。配置定义在 `internal/config/config.go`。
 
@@ -670,3 +823,80 @@ Scheduler agent (Phase 3 后) 与 worker / explorer 共享同一套 `Mailbox.Dra
 4. 解析后字段以文件值为准，未指定字段保持 `DefaultConfig()` 默认值
 5. **单字段命令行覆盖（如 `-worker_count=3`）暂未实现**
 
+
+---
+
+# 关键代码引用速查
+
+以下是各核心功能的关键代码位置，供开发和调试时快速定位：
+
+## Agent 核心
+
+| 功能 | 文件 | 关键函数/结构体 |
+|------|------|----------------|
+| Agent 结构体 | `internal/agent/agent.go` | `type Agent struct` (L61) |
+| ReAct 主循环 | `internal/agent/agent.go` | `processTask()` (L148) |
+| 三层历史压缩 | `internal/agent/agent.go` | `snipOldToolResults()` (L337), `compressHistory()` |
+| LLMExecutor | `internal/agent/llm_executor.go` | `NewLLMExecutor()` (L84), `Execute()` (L112) |
+| ToolRegistry | `internal/agent/registry.go` | `type ToolRegistry struct` (L14) |
+
+## Scheduler
+
+| 功能 | 文件 | 关键函数/结构体 |
+|------|------|----------------|
+| Bundle 构造 | `internal/scheduler/scheduler.go` | `New()` (L50), `type Bundle struct` (L30) |
+| Activator | `internal/scheduler/activator.go` | `Activator.Run()` (L60) |
+| Executor | `internal/scheduler/executor.go` | `SchedulerExecutor.Execute()` (L50) |
+| Board Snapshot | `internal/scheduler/snapshot.go` | `BuildBoardJSON()` (L25) |
+| DoneChecker | `internal/scheduler/scheduler.go` | `currentSchedulerTaskHolder` (L200) |
+| 探针工具 | `internal/tools/scheduler_probe.go` | `probeDirectory()` (L19) |
+
+## Tools & Hook
+
+| 功能 | 文件 | 关键函数/结构体 |
+|------|------|----------------|
+| ToolGroup 接口 | `internal/tools/group.go` | `type ToolGroup interface` (L8) |
+| LocalReadGroup | `internal/tools/local_read.go` | `type LocalReadGroup struct` (L20) |
+| LocalWriteGroup | `internal/tools/local_write.go` | `type LocalWriteGroup struct` (L38) |
+| MetaGroup | `internal/tools/meta.go` | `type MetaGroup struct` (L27) |
+| SchedulerGroup | `internal/tools/scheduler.go` | `type SchedulerGroup struct` (L20) |
+| ToolHook 接口 | `internal/hook/tool.go` | `type ToolHook interface` (L28) |
+| ToolHookRegistry | `internal/hook/registry.go` | `type ToolHookRegistry struct` (L12) |
+| PathBoundaryHook | `internal/hook/builtin/path_boundary.go` | `Run()` (L40) |
+| RequireReadBeforeWriteHook | `internal/hook/builtin/require_read_before_write.go` | `Run()` (L35) |
+
+## Mailbox
+
+| 功能 | 文件 | 关键函数/结构体 |
+|------|------|----------------|
+| Message 结构 | `internal/mailbox/mailbox.go` | `type Message struct` (L15) |
+| Mailbox | `internal/mailbox/mailbox.go` | `type Mailbox struct` (L40) |
+| Registry | `internal/mailbox/mailbox.go` | `type Registry struct` (L260) |
+| MailNotifier | `internal/mailbox/notifier.go` | `type MailNotifier struct` (L20) |
+| MailboxHook | `internal/hook/mailbox.go` | `type MailboxHook interface` (L25) |
+| ChainDepthLimitHook | `internal/hook/builtin/chain_depth_limit.go` | `Run()` (L35) |
+
+## Store & Model
+
+| 功能 | 文件 | 关键函数/结构体 |
+|------|------|----------------|
+| Task 结构体 | `internal/model/task.go` | `type Task struct` (L40) |
+| TaskStore 接口 | `internal/store/iface.go` | `type TaskStore interface` (L15) |
+| MemoryTaskStore | `internal/store/memory.go` | `type MemoryTaskStore struct` (L15) |
+| StoreHookView | `internal/store/hookview.go` | `type StoreHookView interface` (L12) |
+
+## Bootstrap & CLI
+
+| 功能 | 文件 | 关键函数/结构体 |
+|------|------|----------------|
+| Bootstrap | `internal/bootstrap/bootstrap.go` | `Bootstrap()` (L40), `System` struct (L25) |
+| Start | `internal/bootstrap/bootstrap.go` | `System.Start()` (L200) |
+| CLI | `internal/cli/cli.go` | `CLI.Run()` (L50) |
+| Config | `internal/config/config.go` | `type Config struct` (L10), `LoadConfig()` (L80) |
+
+## Trace
+
+| 功能 | 文件 | 关键函数/结构体 |
+|------|------|----------------|
+| Writer | `internal/trace/writer.go` | `type Writer struct` (L27), `Emit()` (L58) |
+| Event 结构 | `internal/trace/event.go` | `type Event struct` (L15) |
