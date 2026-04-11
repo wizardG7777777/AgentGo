@@ -332,6 +332,10 @@ func (c *captureStore) QueryAvailable(string) ([]*model.Task, error)            
 func (c *captureStore) GetTask(string) (*model.Task, error)                        { return nil, nil }
 func (c *captureStore) GetDependencyResults(string) (map[string]string, error)     { return nil, nil }
 func (c *captureStore) GetDependencyArtifacts(string) (map[string][]string, error) { return nil, nil }
+func (c *captureStore) GetDependencyTransferNotes(string) (map[string]string, error) {
+	return nil, nil
+}
+func (c *captureStore) SetTransferNote(string, string) error { return nil }
 func (c *captureStore) RecordLastResponse(string, string) error                    { return nil }
 func (c *captureStore) ScanAll() ([]*model.Task, error)                            { return nil, nil }
 func (c *captureStore) AppendToolCall(string, store.ToolCallRecord) error          { return nil }

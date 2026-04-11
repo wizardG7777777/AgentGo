@@ -120,7 +120,7 @@ func runShellApprovalCase(t *testing.T, command string, userInput *string, cance
 	w.agent.IdleThreshold = 0
 
 	// Phase 3: scheduler.New 签名扩展，CLI 此 e2e 测试只用 mode store，所以传 nil 桥接组件
-	sched := scheduler.New(s, r, &approvalE2ESchedulerLLM{}, eventCh, cfg, nil, nil, nil, nil, nil, nil)
+	sched := scheduler.New(s, r, &approvalE2ESchedulerLLM{}, eventCh, cfg, nil, nil, nil, nil, nil, nil, nil)
 
 	pr, pw := io.Pipe()
 	out := &safeWriteBuffer{}

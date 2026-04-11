@@ -480,6 +480,53 @@ func (s *MemoryTaskStore) AppendArtifact(taskID string, path string) error {
 	return nil
 }
 
+// SetTransferNote 把一份压缩的交接备忘写入任务的 TransferNote 字段。
+// 由 agent.processTask 在任务终态前调用（成功路径传 lastOutput，失败路径
+// 传 buildTransferNote L1/L3 链的输出）。
+// 任务不存在时返回 ErrTaskNotFound。
+// Sprint 3 #5 引入。
+func (s *MemoryTaskStore) SetTransferNote(taskID string, note string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return ErrTaskNotFound
+	}
+	task.TransferNote = note
+	return nil
+}
+
+// GetDependencyTransferNotes 返回 taskID 所有依赖任务的 TransferNote，
+// 按依赖任务 ID 分组。空 note 的依赖会被省略——调用方只看到有实质内容的上游备忘。
+// 任务不存在时返回 nil + nil（非错误——与 GetDependencyArtifacts 语义一致）。
+// Sprint 3 #5 引入。
+func (s *MemoryTaskStore) GetDependencyTransferNotes(taskID string) (map[string]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return nil, nil
+	}
+	if len(task.Dependencies) == 0 {
+		return nil, nil
+	}
+	result := make(map[string]string)
+	for _, depID := range task.Dependencies {
+		depTask, ok := s.tasks[depID]
+		if !ok {
+			continue
+		}
+		if depTask.TransferNote == "" {
+			continue
+		}
+		result[depID] = depTask.TransferNote
+	}
+	if len(result) == 0 {
+		return nil, nil
+	}
+	return result, nil
+}
+
 // AppendSchedulerBatch 把一个子任务 ID 追加到指定 scheduler task 的 SchedulerBatch 列表，
 // 自动去重。仅在 scheduler agent 通过 SchedulerGroup.publishTask 调用时使用。
 // 任务不存在时返回 ErrTaskNotFound；childTaskID 已在列表中时无操作。

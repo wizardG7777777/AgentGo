@@ -94,6 +94,7 @@ func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.C
 	a.IdleThreshold = 0 // 预制代理不因空闲退出
 	a.CompactTokenThreshold = cfg.CompactTokenThreshold
 	a.CompactKeepRecent = cfg.CompactKeepRecent
+	a.TransferNoteMaxTokens = cfg.TransferNoteMaxTokens
 	a.FileCache = fileCache
 	if mbRegistry != nil {
 		a.Mailbox = mbRegistry.Register(agentID, cfg.ExplorerEventType)

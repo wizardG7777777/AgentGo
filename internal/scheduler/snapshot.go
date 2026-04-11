@@ -30,10 +30,28 @@ type boardSnapshot struct {
 }
 
 type resourceInfo struct {
-	WorkerCount      int             `json:"worker_count"`
-	BusyWorkers      int             `json:"busy_workers"`
-	AvailableWorkers int             `json:"available_workers"`
-	Agents           []agentSnapshot `json:"agents,omitempty"`
+	WorkerCount       int                        `json:"worker_count"`
+	BusyWorkers       int                        `json:"busy_workers"`
+	AvailableWorkers  int                        `json:"available_workers"`
+	Agents            []agentSnapshot            `json:"agents,omitempty"`
+	SpecializedAgents []specializedAgentSnapshot `json:"specialized_agents,omitempty"`
+}
+
+// specializedAgentSnapshot 是 board snapshot 里"特化代理聚合视图"的一行。
+// 与 agentSnapshot（per-instance）互补：agentSnapshot 展示每个代理的运行时
+// 状态，specializedAgentSnapshot 展示"这一类代理的总数、忙碌数、能力描述"，
+// 让 scheduler LLM 在任务规划时能回答"我有没有资源处理这类任务"。
+//
+// 数据来源：
+//   - EventType / Count / Role 来自静态 AgentRegistry（bootstrap 注入）
+//   - Busy 来自 live task 扫描——统计 EventType 匹配且 Status=processing 的任务数
+//
+// 本结构不暴露 package 外（仅 JSON 序列化给 LLM）。
+type specializedAgentSnapshot struct {
+	EventType string `json:"event_type"`
+	Count     int    `json:"count"`
+	Busy      int    `json:"busy"`
+	Role      string `json:"role,omitempty"`
 }
 
 // agentSnapshot 是单个活跃代理的运行时快照。
@@ -90,12 +108,14 @@ type sessionEntry struct {
 //   - MBRegistry == nil：不输出 Resources.Agents
 //   - Roster == nil：Agents 中 LockedFiles 为空
 //   - History == nil：不输出 SessionHistory
+//   - AgentRegistry == nil：不输出 Resources.SpecializedAgents
 //
 // 这种 nil-tolerant 设计让单元测试可以选择性覆盖某段而不需要构造完整依赖。
 type SnapshotSources struct {
-	MBRegistry *mailbox.Registry
-	Roster     roster.Roster
-	History    *SessionHistory
+	MBRegistry    *mailbox.Registry
+	Roster        roster.Roster
+	History       *SessionHistory
+	AgentRegistry *AgentRegistry
 }
 
 // BuildBoardJSON 构造 scheduler agent 在每轮 reactLoop 注入到 history 的 board 快照 JSON。
@@ -172,6 +192,9 @@ func BuildBoardJSON(
 	// 构造 agents 列表（来自 mailbox.Registry + roster + store 的反向映射）
 	agents := buildAgentSnapshots(tasks, sources.MBRegistry, sources.Roster)
 
+	// 构造特化代理聚合视图（来自 AgentRegistry 静态声明 + live task 扫描）
+	specialized := buildSpecializedAgentSnapshots(tasks, sources.AgentRegistry)
+
 	// 构造 session history（来自 SessionHistory + store 的状态查询）
 	sessionEntries := buildSessionEntries(s, sources.History)
 
@@ -180,15 +203,48 @@ func BuildBoardJSON(
 		Trigger: ti,
 		Tasks:   taskSnaps,
 		Resources: resourceInfo{
-			WorkerCount:      workerCount,
-			BusyWorkers:      busyWorkers,
-			AvailableWorkers: available,
-			Agents:           agents,
+			WorkerCount:       workerCount,
+			BusyWorkers:       busyWorkers,
+			AvailableWorkers:  available,
+			Agents:            agents,
+			SpecializedAgents: specialized,
 		},
 		SessionHistory: sessionEntries,
 	}
 	data, _ := json.MarshalIndent(bs, "", "  ")
 	return string(data)
+}
+
+// buildSpecializedAgentSnapshots 合并静态 AgentRegistry + live task 扫描，
+// 产出 specialized_agents 聚合视图。registry 为 nil 或为空时返回 nil。
+//
+// Busy 计算：扫描所有 status=processing 的任务，按 EventType 累计实例数。
+// 一个任务如果有 2 个 agent 同时认领（Agents 列表长度 > 1），busy 计 2。
+func buildSpecializedAgentSnapshots(tasks []*model.Task, registry *AgentRegistry) []specializedAgentSnapshot {
+	entries := registry.Specialized()
+	if len(entries) == 0 {
+		return nil
+	}
+	busyByEventType := make(map[string]int)
+	for _, t := range tasks {
+		if t.Status != model.TaskStatusProcessing {
+			continue
+		}
+		if t.EventType == "" {
+			continue // 通用 worker 不计入特化代理统计
+		}
+		busyByEventType[t.EventType] += len(t.Agents)
+	}
+	out := make([]specializedAgentSnapshot, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, specializedAgentSnapshot{
+			EventType: e.EventType,
+			Count:     e.Count,
+			Busy:      busyByEventType[e.EventType],
+			Role:      e.Role,
+		})
+	}
+	return out
 }
 
 // buildAgentSnapshots 从 mailbox.Registry + roster + 当前 task 列表构造代理快照。

@@ -236,6 +236,18 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 		time.Duration(cfg.LLMTimeoutSec)*time.Second,
 	)
 
+	// Step 5.5: 构造特化代理注册表（Sprint 3 #7 Scheduler 分配感知）
+	// 当前 AgentGo 只有 Explorer 一种特化代理，静态声明即可。未来出现第二种
+	// 特化类型时，在这里追加 Register 调用；scheduler 的 board snapshot 会
+	// 自动把它渲染到 Resources.SpecializedAgents。
+	agentRegistry := scheduler.NewAgentRegistry()
+	agentRegistry.Register(scheduler.SpecializedAgent{
+		EventType: cfg.ExplorerEventType, // 通常是 "explore"
+		Count:     1,                     // 当前架构每种特化代理各一个实例
+		Role:      "只读调查代理（Explorer），能力限定为 read_file / list_dir / grep_search / glob_search / web_search / web_fetch / send_message。不能写文件、执行 shell、或发布子任务，适合承担代码库调研、网页检索、事实核验等只读任务。",
+	})
+	fmt.Printf("[启动] Agent 注册表初始化完成（%d 个特化代理）\n", len(agentRegistry.Specialized()))
+
 	// Step 6: 创建看门狗（先于 scheduler 创建——scheduler 需要 approvalCh，但 watchdog 不需要）
 	w := watchdog.New(taskStore, cfg, eventCh, r)
 
@@ -251,7 +263,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	// EventCh 由 Activator 监听，转换为 EventType="__scheduler__" 的 task。
 	sched := scheduler.New(
 		taskStore, r, schedulerLLM, eventCh, cfg, cancelRegistry, mbRegistry, approvalCh,
-		hookReg, storeView, recordToolCall,
+		hookReg, storeView, recordToolCall, agentRegistry,
 	)
 
 	// Step 8: 创建执行代理（使用主 LLM，认领 event_type="" 的执行任务）
