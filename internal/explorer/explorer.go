@@ -12,7 +12,6 @@ import (
 	"agentgo/internal/store"
 	"agentgo/internal/tools"
 	"agentgo/internal/webtool"
-	"agentgo/internal/worker"
 )
 
 const systemPrompt = `你是一个调查代理（Explorer），专门执行只读的信息检索和验证任务。
@@ -59,9 +58,12 @@ type Explorer struct {
 // 工具集组合：LocalReadGroup + WebGroup + MetaGroup（无 Holder/Store=publish_task 不注册）
 // 编译期保证 Explorer 不持有 Roster/ApprovalCh/Store，因此无法获得写入、shell、publish 能力。
 //
-// Hook 系统参数（hookReg / storeView / recordToolCall）均允许 nil，详见
-// agent.NewLLMExecutor 的说明。
-func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry, mbRegistry *mailbox.Registry, hookReg *hook.ToolHookRegistry, storeView store.StoreHookView, recordToolCall func(string, store.ToolCallRecord), searchProvider ...webtool.SearchProvider) *Explorer {
+// Hook 系统参数分为两组：
+//   - hookReg / storeView / recordToolCall: Tool Hook（Phase 1）接入点
+//   - agentHookReg / agentStoreView / agentRosterView: Agent Hook（Sprint 1）接入点
+//
+// 两组参数均允许 nil——对应 hook 路径退化为 no-op。
+func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry, mbRegistry *mailbox.Registry, hookReg *hook.ToolHookRegistry, storeView store.StoreHookView, recordToolCall func(string, store.ToolCallRecord), agentHookReg *hook.AgentHookRegistry, agentStoreView hook.AgentStoreView, agentRosterView hook.AgentRosterView, searchProvider ...webtool.SearchProvider) *Explorer {
 	const agentID = "explorer-1"
 	fileCache := agent.NewFileStateCache(50)
 	workdir := &tools.DefaultWorkdir{ProjectRoot: cfg.ProjectRoot}
@@ -97,7 +99,12 @@ func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.C
 		a.Mailbox = mbRegistry.Register(agentID, cfg.ExplorerEventType)
 		a.MailRegistry = mbRegistry
 	}
-	a.TeamSnapshot = func() string { return worker.BuildTeamSnapshot(agentID, s, mbRegistry) }
+
+	// Agent Hook 接入点（Sprint 1）——取代原来的 a.TeamSnapshot 硬编码注入。
+	// nil 时 hook 路径退化为 no-op。
+	a.AgentHookReg = agentHookReg
+	a.HookStoreView = agentStoreView
+	a.HookRosterView = agentRosterView
 
 	return &Explorer{agent: a}
 }

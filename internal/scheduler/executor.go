@@ -74,25 +74,16 @@ type SchedulerExecutor struct {
 	// 作为 LLM 的"对话历史"上下文。nil 时不输出 SessionHistory 字段。
 	History *SessionHistory
 
-	// DoneChecker（可选）：如果非 nil，每轮 Execute 入口会先调 IsDone()，
-	// 返回 true 时短路返回 ToolCalled=false，让 agent.Run 的 reactLoop
+	// FinalizationChecker（可选）：如果非 nil，每轮 Execute 入口会先调 IsFinalized()，
+	// 返回 true 时短路返回 Finalized=true，让 agent.Run 的 reactLoop
 	// 走"任务完成"路径终止当前 scheduler task。
 	//
 	// 这是修复"report_done 后 reactLoop 不终止 → LLM 幻觉心跳"的关键：
-	// SchedulerGroup.reportDone 在工具执行成功时通过 SchedulerDoneNotifier
-	// 设置 done=true，下一轮 reactLoop 进入 Execute 时立即被这里拦截。
+	// SchedulerGroup.reportDone 在工具执行成功时通过 FinalizationNotifier
+	// 设置 finalized=true，下一轮 reactLoop 进入 Execute 时立即被这里拦截。
 	//
 	// nil 时跳过检查（向后兼容旧测试 + 不需要终止信号的场景）。
-	DoneChecker SchedulerDoneChecker
-}
-
-// SchedulerDoneChecker 是 SchedulerExecutor 用来查询"当前任务是否已经
-// report_done"的最小接口。由 scheduler 包的 currentSchedulerTaskHolder 实现。
-//
-// 与 tools.SchedulerDoneNotifier 是同一个 holder 的两个面 ——
-// notifier 写入、checker 读取。Phase 3.1 引入。
-type SchedulerDoneChecker interface {
-	IsDone() bool
+	FinalizationChecker agent.FinalizationChecker
 }
 
 // Execute 实现 agent.TaskExecutor 接口。
@@ -103,14 +94,15 @@ func (e *SchedulerExecutor) Execute(
 	history []agent.HistoryEntry,
 ) (agent.ExecuteResult, error) {
 	// 0. 短路检查：如果上一轮 reactLoop 已经调过 report_done，立即返回
-	//    ToolCalled=false 让 agent.Run 走"任务完成"路径终止当前 task。
+	//    Finalized=true 让 agent.Run 走"任务完成"路径终止当前 task。
 	//    这是修复"幻觉心跳无限循环"的关键 —— 没有这一步，agent reactLoop 会
 	//    因为 report_done 是 tool call 而继续迭代，让 LLM 不停生成新的 report_done。
-	if e.DoneChecker != nil && e.DoneChecker.IsDone() {
-		log.Printf("[scheduler-exec] DoneChecker.IsDone()=true，短路终止 reactLoop (task=%s)", task.ID)
+	if e.FinalizationChecker != nil && e.FinalizationChecker.IsFinalized() {
+		log.Printf("[scheduler-exec] FinalizationChecker.IsFinalized()=true，短路终止 reactLoop (task=%s)", task.ID)
 		return agent.ExecuteResult{
 			Output:     "scheduler task 已通过 report_done 完成",
 			ToolCalled: false,
+			Finalized:  true,
 		}, nil
 	}
 

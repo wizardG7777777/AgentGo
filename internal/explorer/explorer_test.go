@@ -47,7 +47,7 @@ func TestExplorer_OnlyClaimsExploreEvents(t *testing.T) {
 	codeTask := &model.Task{Description: "写代码", EventType: "code"}
 	s.PublishTask(codeTask)
 
-	exp := New(s, r, mock, cfg, nil, nil, nil, nil, nil, nil)
+	exp := New(s, r, mock, cfg, nil, nil, nil, nil, nil, nil, nil, nil)
 	exp.agent.PollInterval = 10 * time.Millisecond
 	exp.agent.IdleThreshold = 5
 
@@ -85,7 +85,7 @@ func TestExplorer_UsesReadOnlyTools(t *testing.T) {
 	task := &model.Task{Description: "检查文件", EventType: "explore"}
 	s.PublishTask(task)
 
-	exp := New(s, r, mock, cfg, nil, nil, nil, nil, nil, nil)
+	exp := New(s, r, mock, cfg, nil, nil, nil, nil, nil, nil, nil, nil)
 	exp.agent.PollInterval = 10 * time.Millisecond
 	exp.agent.IdleThreshold = 3
 
@@ -105,7 +105,7 @@ func TestExplorer_ContextCancellation(t *testing.T) {
 	cfg := config.DefaultConfig()
 	mock := &mockLLMClient{}
 
-	exp := New(s, r, mock, cfg, nil, nil, nil, nil, nil, nil)
+	exp := New(s, r, mock, cfg, nil, nil, nil, nil, nil, nil, nil, nil)
 	exp.agent.PollInterval = 10 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())

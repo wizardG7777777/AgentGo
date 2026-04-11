@@ -339,12 +339,12 @@ func TestSchedulerExecutor_BatchAllTerminalSkipsWait(t *testing.T) {
 
 // ---- DoneChecker 短路（修复"幻觉心跳循环"）----
 
-// fakeDoneChecker 是单测用的最小 SchedulerDoneChecker。
-type fakeDoneChecker struct {
-	done bool
+// fakeFinalizationChecker 是单测用的最小 FinalizationChecker。
+type fakeFinalizationChecker struct {
+	finalized bool
 }
 
-func (f *fakeDoneChecker) IsDone() bool { return f.done }
+func (f *fakeFinalizationChecker) IsFinalized() bool { return f.finalized }
 
 func TestSchedulerExecutor_DoneChecker_ShortCircuitsExecute(t *testing.T) {
 	ch := make(chan model.Event, 64)
@@ -357,15 +357,15 @@ func TestSchedulerExecutor_DoneChecker_ShortCircuitsExecute(t *testing.T) {
 
 	var calls int32
 	var capturedHistory []agent.HistoryEntry
-	checker := &fakeDoneChecker{done: true} // 已经 report_done
+	checker := &fakeFinalizationChecker{finalized: true} // 已经 report_done
 
 	exec := &SchedulerExecutor{
-		Inner:         makeInnerExecutor(&calls, &capturedHistory),
-		Store:         s,
-		Cfg:           cfg,
-		BatchUpdateCh: make(chan struct{}),
-		WaitTimeout:   100 * time.Millisecond,
-		DoneChecker:   checker,
+		Inner:               makeInnerExecutor(&calls, &capturedHistory),
+		Store:               s,
+		Cfg:                 cfg,
+		BatchUpdateCh:       make(chan struct{}),
+		WaitTimeout:         100 * time.Millisecond,
+		FinalizationChecker: checker,
 	}
 
 	result, err := exec.Execute(context.Background(), schedTask, nil, nil)
@@ -395,15 +395,15 @@ func TestSchedulerExecutor_DoneChecker_NotDone_NormalExecution(t *testing.T) {
 
 	var calls int32
 	var capturedHistory []agent.HistoryEntry
-	checker := &fakeDoneChecker{done: false} // 未 report_done
+	checker := &fakeFinalizationChecker{finalized: false} // 未 report_done
 
 	exec := &SchedulerExecutor{
-		Inner:         makeInnerExecutor(&calls, &capturedHistory),
-		Store:         s,
-		Cfg:           cfg,
-		BatchUpdateCh: make(chan struct{}),
-		WaitTimeout:   100 * time.Millisecond,
-		DoneChecker:   checker,
+		Inner:               makeInnerExecutor(&calls, &capturedHistory),
+		Store:               s,
+		Cfg:                 cfg,
+		BatchUpdateCh:       make(chan struct{}),
+		WaitTimeout:         100 * time.Millisecond,
+		FinalizationChecker: checker,
 	}
 
 	_, err := exec.Execute(context.Background(), schedTask, nil, nil)
@@ -411,7 +411,7 @@ func TestSchedulerExecutor_DoneChecker_NotDone_NormalExecution(t *testing.T) {
 		t.Fatalf("Execute failed: %v", err)
 	}
 
-	// IsDone()=false 时 Inner 应当正常被调用一次
+	// IsFinalized()=false 时 Inner 应当正常被调用一次
 	if atomic.LoadInt32(&calls) != 1 {
 		t.Errorf("Inner should be called once when not done, got %d", calls)
 	}
@@ -434,7 +434,7 @@ func TestSchedulerExecutor_DoneChecker_NilNoEffect(t *testing.T) {
 		Cfg:           cfg,
 		BatchUpdateCh: make(chan struct{}),
 		WaitTimeout:   100 * time.Millisecond,
-		// DoneChecker: nil
+		// FinalizationChecker: nil
 	}
 
 	_, err := exec.Execute(context.Background(), schedTask, nil, nil)
@@ -442,45 +442,45 @@ func TestSchedulerExecutor_DoneChecker_NilNoEffect(t *testing.T) {
 		t.Fatalf("Execute failed: %v", err)
 	}
 
-	// nil DoneChecker 不应影响正常执行
+	// nil FinalizationChecker 不应影响正常执行
 	if atomic.LoadInt32(&calls) != 1 {
-		t.Errorf("Inner should be called once with nil DoneChecker, got %d", calls)
+		t.Errorf("Inner should be called once with nil FinalizationChecker, got %d", calls)
 	}
 }
 
-// ---- currentSchedulerTaskHolder 的 done 标志 ----
+// ---- FinalizationHolder 的生命周期 ----
 
-func TestCurrentSchedulerTaskHolder_DoneFlagLifecycle(t *testing.T) {
-	h := &currentSchedulerTaskHolder{}
+func TestFinalizationHolder_DoneFlagLifecycle(t *testing.T) {
+	h := agent.NewFinalizationHolder()
 
-	// 新建：done=false
-	if h.IsDone() {
-		t.Error("new holder should have done=false")
+	// 新建：finalized=false
+	if h.IsFinalized() {
+		t.Error("new holder should have finalized=false")
 	}
 
-	// 设置 task ID 不影响 done
+	// 设置 task ID 不影响 finalized
 	h.Set("task-1")
-	if h.IsDone() {
-		t.Error("Set should not change done flag when transitioning from new")
+	if h.IsFinalized() {
+		t.Error("Set should not change finalized flag when transitioning from new")
 	}
 
-	// MarkSchedulerDone 后 IsDone=true
-	h.MarkSchedulerDone()
-	if !h.IsDone() {
-		t.Error("MarkSchedulerDone should make IsDone return true")
+	// MarkTaskFinalized 后 IsFinalized=true
+	h.MarkTaskFinalized()
+	if !h.IsFinalized() {
+		t.Error("MarkTaskFinalized should make IsFinalized return true")
 	}
 
-	// Set 新任务时清空 done
+	// Set 新任务时清空 finalized
 	h.Set("task-2")
-	if h.IsDone() {
-		t.Error("Set with new task ID should clear done flag")
+	if h.IsFinalized() {
+		t.Error("Set with new task ID should clear finalized flag")
 	}
 
 	// Set("") 也清空（OnTaskEnd 路径）
-	h.MarkSchedulerDone()
+	h.MarkTaskFinalized()
 	h.Set("")
-	if h.IsDone() {
-		t.Error("Set with empty ID should clear done flag")
+	if h.IsFinalized() {
+		t.Error("Set with empty ID should clear finalized flag")
 	}
 }
 
