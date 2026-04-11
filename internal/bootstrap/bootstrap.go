@@ -43,6 +43,7 @@ type System struct {
 	Workers         []*worker.Worker
 	ApprovalCh      chan shell.ApprovalRequest // 命令审批通道，Worker→CLI
 	CLI             *cli.CLI
+	ArtifactLog     *store.ArtifactLog // Artifacts 持久化日志，Shutdown 时需 Close；nil 表示持久化已禁用
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
 }
@@ -82,6 +83,47 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	cancelRegistry := store.NewTaskCancelRegistry()
 	taskStore.SetCancelRegistry(cancelRegistry)
 	fmt.Println("[启动] 公告板初始化完成")
+
+	// Step 2.3: Artifacts 持久化（JSONL 追加日志，2026-04-12 持久化专题起头）
+	//
+	// 只覆盖 Task.Artifacts 字段——下次启动时重放日志让未被 FIFO 淘汰的任务
+	// 能恢复"这个任务都写过哪些文件"的记忆。其他字段（Task 状态 / Results /
+	// Mailbox / Roster）仍然是纯内存，等具体需求驱动时再扩展。
+	//
+	// 设计决策（nextUpgrade_v3.md §9.6 + 2026-04-12 讨论）：
+	//   - 选 JSONL 而不是 SQLite/BoltDB——单进程 KV 追加写没有关系库价值
+	//   - 零新依赖——仅用标准库 encoding/json + os
+	//   - 不做压缩——MVP 规模（~10 MB/年）日志增长可控
+	//   - 初始化失败只打印 warning，不中断启动——持久化不是 P0，不能让
+	//     工程上任何磁盘问题都阻塞 CLI 启动
+	artifactLogDir := filepath.Join(cfg.ProjectRoot, ".agentgo", "state")
+	artifactLog, alErr := store.OpenArtifactLog(artifactLogDir)
+	if alErr != nil {
+		fmt.Printf("[启动] WARNING: artifact log 初始化失败 (dir=%s): %v —— Artifacts 持久化已禁用\n", artifactLogDir, alErr)
+	} else {
+		// 先 replay 重建 map，然后注入 store 并恢复
+		rebuilt, repErr := artifactLog.Replay()
+		if repErr != nil {
+			fmt.Printf("[启动] WARNING: artifact log 重放失败: %v —— 以空状态启动\n", repErr)
+		}
+		taskStore.SetArtifactLog(artifactLog)
+		// RestoreArtifacts 在此刻是 no-op——store 里还没有任何任务，rebuilt 中
+		// 的 taskID 全部找不到对应 task，调用会返回 (0, 0)。这是有意为之：
+		// 本次专题的完整价值要等到"Task 状态持久化"专题落地后才能兑现——届时
+		// bootstrap 会先 restore task 元数据，再 RestoreArtifacts 把 artifacts 填
+		// 回对应 task.Artifacts 字段。当前阶段 artifact log 的作用是：
+		//   (a) 新任务运行期间的 AppendArtifact 调用被持久化到日志
+		//   (b) 日志本身作为 forensic 审计链（grep/jq 可读）
+		//   (c) 为未来的 Task 状态持久化专题提供 ready-to-go 的存储组件
+		restoredTasks, restoredArts := taskStore.RestoreArtifacts(rebuilt)
+		if restoredTasks > 0 {
+			fmt.Printf("[启动] Artifact 持久化已启用 (log=%s，恢复 %d 个任务 / %d 个 artifact)\n",
+				artifactLog.Path(), restoredTasks, restoredArts)
+		} else {
+			fmt.Printf("[启动] Artifact 持久化已启用 (log=%s，日志中 %d 行记录，当前 store 中无匹配任务可恢复)\n",
+				artifactLog.Path(), len(rebuilt))
+		}
+	}
 
 	// Step 2.5: 初始化 Hook 系统（阶段 1）
 	// hookReg 以单例方式被所有 worker/explorer 共享。recordToolCall 闭包
@@ -241,6 +283,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 		CancelRegistry:  cancelRegistry,
 		MailboxRegistry: mbRegistry,
 		MailNotifier:    mailNotifier,
+		ArtifactLog:     artifactLog, // 可能为 nil（OpenArtifactLog 失败时），Shutdown 会判空
 		Scheduler:       sched,
 		Explorer:        exp,
 		Workers:         workers,
@@ -328,6 +371,12 @@ func (s *System) Shutdown() {
 	}
 	if d := trace.DefaultDumper(); d != nil {
 		d.Close()
+	}
+	// 关闭 artifact 持久化日志——确保缓冲内容 flush 到磁盘
+	if s.ArtifactLog != nil {
+		if err := s.ArtifactLog.Close(); err != nil {
+			fmt.Printf("[关闭] WARNING: artifact log 关闭失败: %v\n", err)
+		}
 	}
 	fmt.Println("[关闭] 系统已停止")
 }
