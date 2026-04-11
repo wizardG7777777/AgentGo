@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"agentgo/internal/agent"
 	"agentgo/internal/cli"
 	"agentgo/internal/config"
 	"agentgo/internal/explorer"
@@ -138,6 +139,49 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	mbRegistry.AttachHookRunner(hook.AsMailboxRunner(mailboxHookReg))
 	fmt.Printf("[启动] Mailbox Hook 系统初始化完成（已注册：chain-depth-limit max=%d, per-agent-dedup, wake-context-expand）\n", cfg.MailChainMaxDepth)
 
+	// Step 3.7: 初始化 Agent Hook 系统（Sprint 1）
+	// 覆盖 ReactLoop 4 个生命周期事件（PhaseTaskStart / LoopPre / LoopPost / TaskEnd）。
+	// 与 ToolHookRegistry / MailboxHookRegistry 并列独立。
+	//
+	// 当前注册内容：TeamAwarenessHook（三 section 合并版）——
+	//   Section 1 TeamSnapshot：委托给 worker.BuildTeamSnapshot，每 5 轮 + ForceOnMail 刷新
+	//   Section 2 FileAwareness：读 Roster.ListClaims，与 Team 共享频率
+	//   Section 3 GoalAnchor：每 3 轮刷新，防目标漂移（ROI 最高的注入）
+	// 超预算时截断优先级：goal > team > file
+	//
+	// Scheduler **不**注册 Agent Hook —— scheduler 自带 board snapshot 机制，
+	// 与 TeamAwarenessHook 职责重叠。见 nextUpgrade_v3.md §7.10。
+	//
+	// 可逆性验证：注释掉以下 Register 调用后，既有测试套仍必须全绿且
+	// 行为与 Sprint 1 前完全一致（代码里唯一的差别是硬编码 TeamSnapshot
+	// 注入已被 PhaseTaskStart hook 取代，二者对同一输入产出相同内容）。
+	agentHookReg := hook.NewAgentHookRegistry()
+	// SnapshotFn 闭包捕获 taskStore 和 mbRegistry。BuildTeamSnapshot 的逻辑
+	// 与原 agent.go:215 硬编码调用的函数是同一个，迁移时行为字节级保留。
+	taCfg := builtin.TeamAwarenessConfig{
+		SnapshotFn: func(selfID string) string {
+			return worker.BuildTeamSnapshot(selfID, taskStore, mbRegistry)
+		},
+		SnapshotRefreshInterval: 5,
+		GoalRefreshInterval:     3,
+		ForceOnMail:             true,
+		MaxTokens:               800,
+		GoalEnabled:             true,
+		FileEnabled:             true,
+		RecentToolsWindow:       5,
+	}
+	for _, h := range builtin.NewTeamAwarenessHooks(taCfg) {
+		if err := agentHookReg.Register(h); err != nil {
+			return nil, fmt.Errorf("注册 %s 失败: %w", h.Name(), err)
+		}
+	}
+	fmt.Println("[启动] Agent Hook 系统初始化完成（已注册：team-awareness-task-start, team-awareness-loop-pre）")
+
+	// Agent Hook 所需的只读视图：StoreHookView 适配器（从已有的 storeView 构造）
+	// + Roster 本身实现了 hook.AgentRosterView（通过 roster/hookview.go 扩展）。
+	agentStoreView := agent.NewStoreHookAdapter(storeView)
+	var agentRosterView hook.AgentRosterView = r
+
 	// Step 4: 创建 LLM 客户端
 	schedulerLLM := llm.NewSDKClient(
 		cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel,
@@ -155,7 +199,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 
 	// Step 7: 创建调查代理（复用与 Worker 相同的 SearchProvider 配置）
 	explorerSearchProvider := webtool.NewProvider(cfg.SearchAPIProvider, cfg.SearchAPIURL, cfg.SearchAPIKey)
-	exp := explorer.New(taskStore, r, explorerLLM, cfg, cancelRegistry, mbRegistry, hookReg, storeView, recordToolCall, explorerSearchProvider)
+	exp := explorer.New(taskStore, r, explorerLLM, cfg, cancelRegistry, mbRegistry, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView, explorerSearchProvider)
 
 	// Step 7.5: 创建命令审批通道（Worker→CLI）
 	approvalCh := make(chan shell.ApprovalRequest, 8)
@@ -180,7 +224,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 			"", // system prompt 由 worker 内部管理
 			time.Duration(cfg.LLMTimeoutSec)*time.Second,
 		)
-		wk := worker.NewWithID(fmt.Sprintf("worker-%d", i), taskStore, r, workerLLM, cfg, cancelRegistry, mbRegistry, approvalCh, hookReg, storeView, recordToolCall)
+		wk := worker.NewWithID(fmt.Sprintf("worker-%d", i), taskStore, r, workerLLM, cfg, cancelRegistry, mbRegistry, approvalCh, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView)
 		workers = append(workers, wk)
 	}
 

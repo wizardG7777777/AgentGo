@@ -7,13 +7,22 @@ import (
 	"testing"
 	"time"
 
+	"agentgo/internal/agent"
 	"agentgo/internal/config"
+	"agentgo/internal/hook"
+	"agentgo/internal/hook/builtin"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
 )
+
+// 迁移说明（Sprint 1 C6）：
+// 原测试验证 Agent.TeamSnapshot 字段的硬编码注入行为。字段已删除，
+// 行为迁移到 TeamAwarenessHook（PhaseTaskStart）。本文件的所有测试
+// 重写为"注册 TeamAwarenessHook 后验证等价行为"——断言内容完全不变，
+// 只是接入点从硬编码字段变成 hook 注册路径。
 
 type e2eLLMClient struct {
 	mu        sync.Mutex
@@ -71,6 +80,43 @@ func findSnapshotMessages(msgs []llm.Message) []llm.Message {
 	return out
 }
 
+// buildTestAgentHookReg 构造一个已注册 TeamAwarenessHook 的 AgentHookRegistry，
+// 供 worker e2e 测试复用。只启用 team section，关掉 file/goal，保证断言面聚焦。
+func buildTestAgentHookReg(t *testing.T, s store.TaskStore, reg *mailbox.Registry) *hook.AgentHookRegistry {
+	t.Helper()
+	ahr := hook.NewAgentHookRegistry()
+	taCfg := builtin.TeamAwarenessConfig{
+		SnapshotFn: func(selfID string) string {
+			return BuildTeamSnapshot(selfID, s, reg)
+		},
+		SnapshotRefreshInterval: 5,
+		GoalRefreshInterval:     3,
+		ForceOnMail:             true,
+		MaxTokens:               800,
+		GoalEnabled:             false, // 测试只关心 team section，关闭其他
+		FileEnabled:             false,
+		RecentToolsWindow:       5,
+	}
+	for _, h := range builtin.NewTeamAwarenessHooks(taCfg) {
+		if err := ahr.Register(h); err != nil {
+			t.Fatalf("注册 TeamAwareness hook 失败: %v", err)
+		}
+	}
+	return ahr
+}
+
+// buildTestHookViews 构造 worker e2e 测试需要的 storeView/rosterView 对。
+// storeView 通过 agent.NewStoreHookAdapter 从既有的 MemoryTaskStore 构造；
+// rosterView 直接使用 MemoryRoster（已实现 hook.AgentRosterView）。
+func buildTestHookViews(s store.TaskStore, r roster.Roster) (hook.AgentStoreView, hook.AgentRosterView) {
+	sv, _ := s.(store.StoreHookView)
+	var rv hook.AgentRosterView
+	if mr, ok := r.(hook.AgentRosterView); ok {
+		rv = mr
+	}
+	return agent.NewStoreHookAdapter(sv), rv
+}
+
 func TestWorkerE2E_TeamSnapshotInjectedOnceOnFirstExecution(t *testing.T) {
 	eventCh := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(eventCh, 100, 2, 300)
@@ -98,7 +144,9 @@ func TestWorkerE2E_TeamSnapshotInjectedOnceOnFirstExecution(t *testing.T) {
 		responses: []llm.Response{{Content: "done"}},
 	}
 
-	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil, nil, nil, nil)
+	ahr := buildTestAgentHookReg(t, s, reg)
+	asv, arv := buildTestHookViews(s, r)
+	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil, nil, nil, nil, ahr, asv, arv)
 	w.agent.PollInterval = 10 * time.Millisecond
 	w.agent.IdleThreshold = 3
 
@@ -173,7 +221,9 @@ func TestWorkerE2E_TeamSnapshotNotInjectedWhenRetrying(t *testing.T) {
 	mock := &e2eLLMClient{
 		responses: []llm.Response{{Content: "done"}},
 	}
-	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil, nil, nil, nil)
+	ahr := buildTestAgentHookReg(t, s, reg)
+	asv, arv := buildTestHookViews(s, r)
+	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil, nil, nil, nil, ahr, asv, arv)
 	w.agent.PollInterval = 10 * time.Millisecond
 	w.agent.IdleThreshold = 3
 
@@ -228,7 +278,9 @@ func TestWorkerE2E_TeamSnapshotTruncatesLongBusyDescription(t *testing.T) {
 	mock := &e2eLLMClient{
 		responses: []llm.Response{{Content: "done"}},
 	}
-	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil, nil, nil, nil)
+	ahr := buildTestAgentHookReg(t, s, reg)
+	asv, arv := buildTestHookViews(s, r)
+	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil, nil, nil, nil, ahr, asv, arv)
 	w.agent.PollInterval = 10 * time.Millisecond
 	w.agent.IdleThreshold = 3
 

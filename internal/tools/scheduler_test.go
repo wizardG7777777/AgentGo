@@ -192,13 +192,13 @@ func TestSchedulerGroup_ReportDone_NoHolderError(t *testing.T) {
 	}
 }
 
-// fakeDoneNotifier 是单测用的 SchedulerDoneNotifier 实现，记录 MarkSchedulerDone
+// fakeFinalizationNotifier 是单测用的 FinalizationNotifier 实现，记录 MarkTaskFinalized
 // 是否被调用过，让测试断言 reportDone 真的触发了"终止 reactLoop"信号。
-type fakeDoneNotifier struct {
+type fakeFinalizationNotifier struct {
 	marked bool
 }
 
-func (f *fakeDoneNotifier) MarkSchedulerDone() { f.marked = true }
+func (f *fakeFinalizationNotifier) MarkTaskFinalized() { f.marked = true }
 
 func TestSchedulerGroup_ReportDone_NotifiesDoneOnSuccess(t *testing.T) {
 	s := newSchedTestStore()
@@ -209,11 +209,11 @@ func TestSchedulerGroup_ReportDone_NotifiesDoneOnSuccess(t *testing.T) {
 	s.tasks["c1"] = child
 	s.AppendSchedulerBatch(schedTask.ID, "c1")
 
-	notifier := &fakeDoneNotifier{}
+	notifier := &fakeFinalizationNotifier{}
 	g := SchedulerGroup{
-		Store:        s,
-		Holder:       &fakeHolder{id: schedTask.ID},
-		DoneNotifier: notifier,
+		Store:                s,
+		Holder:               &fakeHolder{id: schedTask.ID},
+		FinalizationNotifier: notifier,
 	}
 	reg := agent.NewToolRegistry()
 	g.Register(reg)
@@ -226,7 +226,7 @@ func TestSchedulerGroup_ReportDone_NotifiesDoneOnSuccess(t *testing.T) {
 	}
 
 	if !notifier.marked {
-		t.Error("DoneNotifier.MarkSchedulerDone should be called after successful report_done")
+		t.Error("FinalizationNotifier.MarkTaskFinalized should be called after successful report_done")
 	}
 }
 
@@ -239,11 +239,11 @@ func TestSchedulerGroup_ReportDone_DoesNotNotifyOnRejection(t *testing.T) {
 	s.tasks["c1"] = child
 	s.AppendSchedulerBatch(schedTask.ID, "c1")
 
-	notifier := &fakeDoneNotifier{}
+	notifier := &fakeFinalizationNotifier{}
 	g := SchedulerGroup{
-		Store:        s,
-		Holder:       &fakeHolder{id: schedTask.ID},
-		DoneNotifier: notifier,
+		Store:                s,
+		Holder:               &fakeHolder{id: schedTask.ID},
+		FinalizationNotifier: notifier,
 	}
 	reg := agent.NewToolRegistry()
 	g.Register(reg)
@@ -256,7 +256,7 @@ func TestSchedulerGroup_ReportDone_DoesNotNotifyOnRejection(t *testing.T) {
 	}
 
 	if notifier.marked {
-		t.Error("DoneNotifier.MarkSchedulerDone should NOT be called when report_done is rejected")
+		t.Error("FinalizationNotifier.MarkTaskFinalized should NOT be called when report_done is rejected")
 	}
 }
 
@@ -265,7 +265,7 @@ func TestSchedulerGroup_ReportDone_NilNotifierNoEffect(t *testing.T) {
 	schedTask := &model.Task{Description: "user request"}
 	s.PublishTask(schedTask)
 
-	// 不设置 DoneNotifier
+	// 不设置 FinalizationNotifier
 	g := SchedulerGroup{Store: s, Holder: &fakeHolder{id: schedTask.ID}}
 	reg := agent.NewToolRegistry()
 	g.Register(reg)

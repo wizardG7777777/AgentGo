@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"agentgo/internal/hook"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
@@ -36,6 +37,7 @@ type ToolResult struct {
 type ExecuteResult struct {
 	Output           string
 	ToolCalled       bool
+	Finalized        bool           // 由 FinalizationChecker 设置，表示任务已完成
 	AssistantContent string         // LLM 原始回复文本（assistant 消息的 content）
 	ToolCalls        []llm.ToolCall // LLM 请求的工具调用列表
 	ToolResults      []ToolResult   // 每个 tool call 对应的执行结果
@@ -76,7 +78,66 @@ type Agent struct {
 	FileCache             *FileStateCache                   // Agent 级别的文件读取缓存，可选
 	Mailbox               *mailbox.Mailbox                  // 代理间通信收件箱，可选
 	MailRegistry          *mailbox.Registry                 // 邮箱注册表，用于 DrainWithAck 自动回执
-	TeamSnapshot          func() string                     // 返回当前团队状态快照文本，可选。processTask 开始时注入 LLM 上下文
+	FinalizationChecker   FinalizationChecker               // 可选；用于 finalization tool 信号检查
+
+	// AgentHookReg 是 Agent Hook 注册表，覆盖 processTask 的 4 个生命周期事件
+	// （PhaseTaskStart / PhaseLoopPre / PhaseLoopPost / PhaseTaskEnd）。
+	// nil 时全路径退化为 no-op——这是回归验证的可逆性保证。
+	AgentHookReg *hook.AgentHookRegistry
+	// HookStoreView / HookRosterView 是 Agent Hook 的只读视图接口。
+	// AgentHookReg 非 nil 时通常同时提供这两个视图，hook 通过 AgentHookContext
+	// 访问任务/占用状态。任一为 nil 时，对应视图在 hook 里为 nil，hook 需自行判空。
+	HookStoreView  hook.AgentStoreView
+	HookRosterView hook.AgentRosterView
+}
+
+// runAgentInject 构造 AgentHookContext 并调用 Registry 的 RunInject。
+// nil Registry 安全——返回空串即可。
+// Phase 只应传入 PhaseTaskStart / PhaseLoopPre（注入类阶段）。
+func (a *Agent) runAgentInject(
+	ctx context.Context,
+	phase hook.AgentHookPhase,
+	taskID string,
+	loopIdx int,
+	hasNewMail bool,
+) string {
+	if a.AgentHookReg == nil {
+		return ""
+	}
+	results := a.AgentHookReg.RunInject(hook.AgentHookContext{
+		Ctx:        ctx,
+		Phase:      phase,
+		AgentID:    a.ID,
+		TaskID:     taskID,
+		LoopIndex:  loopIdx,
+		HasNewMail: hasNewMail,
+		Store:      a.HookStoreView,
+		Roster:     a.HookRosterView,
+	})
+	return hook.MergeInjectContents(results)
+}
+
+// runAgentObserve 构造 AgentHookContext 并调用 Registry 的 RunObserve。
+// nil Registry 安全——直接 no-op。
+// Phase 只应传入 PhaseLoopPost / PhaseTaskEnd（观察类阶段）。
+func (a *Agent) runAgentObserve(
+	ctx context.Context,
+	phase hook.AgentHookPhase,
+	taskID string,
+	loopIdx int,
+) {
+	if a.AgentHookReg == nil {
+		return
+	}
+	a.AgentHookReg.RunObserve(hook.AgentHookContext{
+		Ctx:       ctx,
+		Phase:     phase,
+		AgentID:   a.ID,
+		TaskID:    taskID,
+		LoopIndex: loopIdx,
+		Store:     a.HookStoreView,
+		Roster:    a.HookRosterView,
+	})
 }
 
 // Run starts the agent's main loop. It polls for available tasks and processes them.
@@ -177,6 +238,12 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		}()
 	}
 
+	// PhaseTaskEnd：每任务一次的观察类 hook 触发点。
+	// defer 注册顺序与 LIFO：本行在 OnTaskEnd defer 之后注册，
+	// 所以 PhaseTaskEnd 先于 OnTaskEnd 执行——hook 看到的是 task 状态
+	// 还未被 holder 清理时的"刚完成"状态。
+	defer a.runAgentObserve(ctx, hook.PhaseTaskEnd, taskID, -1)
+
 	// 清空文件缓存（任务切换时避免脏读）
 	if a.FileCache != nil {
 		a.FileCache.Clear()
@@ -210,13 +277,15 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		}
 	}
 
-	// 团队感知：在首次执行时注入当前团队状态快照（重试时已有历史，不重复注入）
-	if a.TeamSnapshot != nil && task.RetryCount == 0 {
-		if snap := a.TeamSnapshot(); snap != "" {
-			history = append(history, HistoryEntry{
-				IncomingMail: snap,
-			})
-		}
+	// PhaseTaskStart：任务级 hook 注入点。
+	// 每次 processTask 入口都触发——是否真正注入由各 hook 自行决定
+	// （如 TeamAwarenessHook 在 RetryCount > 0 时返回空，避免与 LastHistory
+	// 恢复的旧快照重复）。
+	// C6 之后，硬编码的 TeamSnapshot 注入被 TeamAwarenessHook 完全取代。
+	if injected := a.runAgentInject(ctx, hook.PhaseTaskStart, taskID, -1, false); injected != "" {
+		history = append(history, HistoryEntry{
+			IncomingMail: injected,
+		})
 	}
 
 	// Layer 2: token 累计跟踪，用于触发摘要压缩
@@ -240,12 +309,35 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		}
 
 		// 排水信箱：将收到的代理间消息注入历史，作为 user 角色消息；同时向发信方自动发送回执
+		hasNewMail := false
 		if a.Mailbox != nil {
 			if msgs := a.Mailbox.DrainWithAck(a.MailRegistry); len(msgs) > 0 {
 				history = append(history, HistoryEntry{
 					IncomingMail: formatMailMessages(msgs),
 				})
+				hasNewMail = true
 			}
+		}
+
+		// PhaseLoopPre：每轮开头的注入类 hook 触发点。
+		// 必须在 mailbox drain 之后——hook 通过 HasNewMail 决定是否强制刷新
+		// （例如 TeamAwarenessHook 在收到消息后下一轮立即重算团队快照）。
+		// 必须在 LLM 调用之前——注入内容参与本轮 LLM 决策。
+		if injected := a.runAgentInject(ctx, hook.PhaseLoopPre, taskID, i, hasNewMail); injected != "" {
+			history = append(history, HistoryEntry{
+				IncomingMail: injected,
+			})
+		}
+
+		// 前置检查：如果设置了 FinalizationChecker 且已 finalized，
+		// 说明上一轮调用了 finalization tool，立即终止 reactLoop。
+		if a.FinalizationChecker != nil && a.FinalizationChecker.IsFinalized() {
+			log.Printf("[agent %s] FinalizationChecker.IsFinalized()=true，终止 reactLoop (task=%s)", a.ID, taskID)
+			// 使用上一轮保存的 lastOutput 完成任务（不进行 ExpectedArtifacts 校验，因为 finalization tool 负责最终汇报）
+			if err := a.Store.SubmitResult(a.ID, taskID, lastOutput); err != nil {
+				log.Printf("[agent %s] SubmitResult error: %v", a.ID, err)
+			}
+			return
 		}
 
 		// 构建只读副本传入 executor
@@ -264,7 +356,8 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		lastOutput = result.Output
 		totalPromptTokens += result.PromptTokens
 
-		if !result.ToolCalled {
+		// 终止条件：LLM 没有调用工具（自然完成），或 Executor 返回 Finalized=true（finalization tool 信号）
+		if !result.ToolCalled || result.Finalized {
 			// 持久化 worker 的最终响应文本——无论后续校验是否通过，scheduler 都能看到
 			// worker 自述了什么。这是修复"失败路径上 lastOutput 被静默丢弃"的关键一环。
 			if lastOutput != "" {
@@ -340,6 +433,11 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			ToolCalls:        result.ToolCalls,
 			ToolResults:      result.ToolResults,
 		})
+
+		// PhaseLoopPost：每轮末尾的观察类 hook 触发点。
+		// 触发时机：tool results 已追加到 history、压缩策略尚未执行。
+		// hook 能看到本轮完整结果，但不会影响后续压缩逻辑。
+		a.runAgentObserve(ctx, hook.PhaseLoopPost, taskID, i)
 
 		// Layer 1: 清理旧的高输出工具结果
 		snipOldToolResults(history, keepRecent)

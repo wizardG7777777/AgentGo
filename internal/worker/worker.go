@@ -108,15 +108,18 @@ type Worker struct {
 // 历史决策记录：原本使用 git worktree 子系统做物理隔离（每个任务一个独立分支），
 // 2026-04-08 决定彻底删除 git 依赖，回归"所有 worker 共享 ProjectRoot"的简单模型。
 // 多代理协同安全（并发写、原子性、回滚等）留待按真实失败模式重新设计。
-func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry, mbRegistry *mailbox.Registry, approvalCh chan<- shell.ApprovalRequest, hookReg *hook.ToolHookRegistry, storeView store.StoreHookView, recordToolCall func(string, store.ToolCallRecord)) *Worker {
-	return NewWithID("worker-1", s, r, llmClient, cfg, cancelReg, mbRegistry, approvalCh, hookReg, storeView, recordToolCall)
+func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry, mbRegistry *mailbox.Registry, approvalCh chan<- shell.ApprovalRequest, hookReg *hook.ToolHookRegistry, storeView store.StoreHookView, recordToolCall func(string, store.ToolCallRecord), agentHookReg *hook.AgentHookRegistry, agentStoreView hook.AgentStoreView, agentRosterView hook.AgentRosterView) *Worker {
+	return NewWithID("worker-1", s, r, llmClient, cfg, cancelReg, mbRegistry, approvalCh, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView)
 }
 
 // NewWithID 创建指定 ID 的执行代理，支持多 Worker 实例。
 //
-// 新增的 3 个 hook 系统参数（C4）均允许 nil，整段 hook 路径会退化为 no-op。
-// 详见 agent.NewLLMExecutor 的参数文档。
-func NewWithID(agentID string, s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry, mbRegistry *mailbox.Registry, approvalCh chan<- shell.ApprovalRequest, hookReg *hook.ToolHookRegistry, storeView store.StoreHookView, recordToolCall func(string, store.ToolCallRecord)) *Worker {
+// Hook 系统参数分为两组：
+//   - hookReg / storeView / recordToolCall: Tool Hook（Phase 1）接入点
+//   - agentHookReg / agentStoreView / agentRosterView: Agent Hook（Sprint 1）接入点
+//
+// 两组参数均允许 nil——对应 hook 路径退化为 no-op，既有行为与改动前一致。
+func NewWithID(agentID string, s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry, mbRegistry *mailbox.Registry, approvalCh chan<- shell.ApprovalRequest, hookReg *hook.ToolHookRegistry, storeView store.StoreHookView, recordToolCall func(string, store.ToolCallRecord), agentHookReg *hook.AgentHookRegistry, agentStoreView hook.AgentStoreView, agentRosterView hook.AgentRosterView) *Worker {
 	holder := &currentTaskHolder{}
 	fileCache := agent.NewFileStateCache(50)
 	workdir := &tools.DefaultWorkdir{ProjectRoot: cfg.ProjectRoot}
@@ -173,7 +176,12 @@ func NewWithID(agentID string, s store.TaskStore, r roster.Roster, llmClient llm
 		a.Mailbox = mbRegistry.Register(agentID, "")
 		a.MailRegistry = mbRegistry
 	}
-	a.TeamSnapshot = func() string { return BuildTeamSnapshot(agentID, s, mbRegistry) }
+
+	// Agent Hook 接入点（Sprint 1）——取代原来的 a.TeamSnapshot 硬编码注入。
+	// nil 时整个 hook 路径退化为 no-op（runAgentInject / runAgentObserve 内置判空）。
+	a.AgentHookReg = agentHookReg
+	a.HookStoreView = agentStoreView
+	a.HookRosterView = agentRosterView
 
 	return &Worker{agent: a}
 }

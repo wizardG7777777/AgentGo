@@ -66,6 +66,7 @@ func (r *recordingRoster) IsOccupied(filePath string) (string, bool, error) {
 
 func (r *recordingRoster) ListByAgent(agentID string) ([]model.Claim, error) { return nil, nil }
 func (r *recordingRoster) ListAllAgents() ([]string, error)                  { return nil, nil }
+func (r *recordingRoster) ListClaims() map[string][]string                   { return nil }
 
 // --- test fixture helper ---
 

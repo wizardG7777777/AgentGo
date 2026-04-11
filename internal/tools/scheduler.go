@@ -12,19 +12,6 @@ import (
 	"agentgo/internal/tools/schema"
 )
 
-// SchedulerDoneNotifier 是一个可选接口，由 scheduler 包实现，
-// 让 SchedulerGroup.reportDone 在成功汇报后通知 scheduler agent
-// "当前任务已经报告完成，下一轮 reactLoop 应当短路终止"。
-//
-// Phase 3.1 引入，修复"report_done 后 reactLoop 不终止 → LLM 幻觉心跳"
-// 无限循环 bug。详见 KNOWN_ISSUES.md。
-//
-// SchedulerGroup 通过类型断言或显式 DoneNotifier 字段访问这个接口；
-// nil 时跳过通知（向后兼容）。
-type SchedulerDoneNotifier interface {
-	MarkSchedulerDone()
-}
-
 // SchedulerGroup 注册 scheduler 一等代理专属的两个工具：
 //   - cancel_task：取消一个未完成的任务
 //   - report_done：向用户报告最终结果（含事实校对 + 提前调用拦截 + reactLoop 终止信号）
@@ -37,14 +24,14 @@ type SchedulerDoneNotifier interface {
 // Phase 3 引入。从 internal/scheduler/scheduler.go 的 toolCancelTask / toolReportDone
 // 迁移而来，行为字节级一致 + 加入 hook 系统接入（通过 NewLLMExecutor 自动获得）。
 //
-// Phase 3.1 新增 DoneNotifier 字段，让 reportDone 能通知 scheduler agent
+// Phase 3.1 新增 FinalizationNotifier 字段（原 DoneNotifier），让 reportDone 能通知 scheduler agent
 // "终止当前 reactLoop"，避免幻觉心跳循环。
 type SchedulerGroup struct {
-	Store        store.TaskStore
-	Holder       TaskHolder            // 提供"当前 scheduler task 的 ID"，report_done 用于读 SchedulerBatch
-	MBRegistry   *mailbox.Registry     // 当前未使用，留作未来扩展（例如 report_done 时通知其他代理）
-	DoneNotifier SchedulerDoneNotifier // 可选；非 nil 时 reportDone 成功后调 MarkSchedulerDone()
-	ProjectRoot  string                // 项目根目录，供 probe_directory 做路径校验
+	Store                store.TaskStore
+	Holder               TaskHolder            // 提供"当前 scheduler task 的 ID"，report_done 用于读 SchedulerBatch
+	MBRegistry           *mailbox.Registry     // 当前未使用，留作未来扩展（例如 report_done 时通知其他代理）
+	FinalizationNotifier FinalizationNotifier  // 可选；非 nil 时 reportDone 成功后调 MarkTaskFinalized()
+	ProjectRoot          string                // 项目根目录，供 probe_directory 做路径校验
 }
 
 // Register 把 cancel_task / report_done 注册到 r。
@@ -172,9 +159,9 @@ func (g SchedulerGroup) reportDone(ctx context.Context, args map[string]any) (st
 
 	// 4. 通知 scheduler agent "当前 reactLoop 已完成报告"，让下一轮 Execute 短路终止。
 	//    这是修复"report_done 后 reactLoop 不终止 → LLM 幻觉心跳"的核心信号。
-	//    DoneNotifier 为 nil 时跳过（向后兼容 + worker 测试场景）。
-	if g.DoneNotifier != nil {
-		g.DoneNotifier.MarkSchedulerDone()
+	//    FinalizationNotifier 为 nil 时跳过（向后兼容 + worker 测试场景）。
+	if g.FinalizationNotifier != nil {
+		g.FinalizationNotifier.MarkTaskFinalized()
 	}
 
 	return "已向用户报告完成", nil

@@ -7,13 +7,21 @@ import (
 	"testing"
 	"time"
 
+	"agentgo/internal/agent"
 	"agentgo/internal/config"
+	"agentgo/internal/hook"
+	"agentgo/internal/hook/builtin"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
+	"agentgo/internal/worker"
 )
+
+// 迁移说明（Sprint 1 C6）：
+// 原测试验证 Agent.TeamSnapshot 字段的硬编码注入行为。字段已删除，
+// 行为迁移到 TeamAwarenessHook。本文件重写为"注册 hook 后验证等价行为"。
 
 type explorerE2ELLMClient struct {
 	mu        sync.Mutex
@@ -73,7 +81,28 @@ func TestExplorerE2E_TeamSnapshotInjected(t *testing.T) {
 	mock := &explorerE2ELLMClient{
 		responses: []llm.Response{{Content: "done"}},
 	}
-	exp := New(s, r, mock, cfg, nil, reg, nil, nil, nil, nil)
+
+	// 构造 AgentHookRegistry + TeamAwarenessHook（仅启用 team section）
+	ahr := hook.NewAgentHookRegistry()
+	taCfg := builtin.TeamAwarenessConfig{
+		SnapshotFn: func(selfID string) string {
+			return worker.BuildTeamSnapshot(selfID, s, reg)
+		},
+		SnapshotRefreshInterval: 5,
+		GoalRefreshInterval:     3,
+		ForceOnMail:             true,
+		MaxTokens:               800,
+	}
+	for _, h := range builtin.NewTeamAwarenessHooks(taCfg) {
+		if err := ahr.Register(h); err != nil {
+			t.Fatalf("注册 TeamAwareness hook 失败: %v", err)
+		}
+	}
+	sv, _ := store.TaskStore(s).(store.StoreHookView)
+	asv := agent.NewStoreHookAdapter(sv)
+	var arv hook.AgentRosterView = r
+
+	exp := New(s, r, mock, cfg, nil, reg, nil, nil, nil, ahr, asv, arv)
 	exp.agent.PollInterval = 10 * time.Millisecond
 	exp.agent.IdleThreshold = 3
 
