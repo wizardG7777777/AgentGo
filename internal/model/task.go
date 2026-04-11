@@ -78,6 +78,28 @@ type Task struct {
 	// 路径同样为相对项目根的相对路径。
 	ExpectedArtifacts []string
 
+	// TransferNote 是一份压缩的跨 agent 交接备忘，供下游任务或重试时恢复上下文。
+	//
+	// 生成路径（见 internal/agent/transfer_note.go）：
+	//   - 成功路径：agent 在 SubmitResult 之前把 lastOutput（LLM 最终响应）直接
+	//     写入本字段。lastOutput 本身已经是合理的自述总结，不需额外压缩
+	//   - 失败路径：agent.buildTransferNote 两级调用链
+	//       L1：生成 <transfer-request> prompt 让 LLM 做最后一次自压缩
+	//       L3：机械拼装（无 LLM 调用）——任务目标 + 工具轨迹 + Artifacts + 最后响应
+	//
+	// 读取路径：
+	//   - 依赖链场景：下游 agent 在 processTask 入口通过 Store.GetDependencyTransferNotes
+	//     读取所有上游任务的 TransferNote，以 <upstream-transfer-notes> 形式注入首条 history
+	//   - 重试换手场景：接手者通过 task.TransferNote 直接读取前任的备忘，
+	//     以 <transfer-note> 形式注入首条 history
+	//
+	// 与 LastHistory 的关系（2026-04-12 引入时保持共存）：
+	//   - LastHistory 是完整的历史序列化，重试时完整恢复上下文（可能很大）
+	//   - TransferNote 是精炼文本（默认 < 3000 tokens），跨 agent 更友好
+	//   - 两者并存，重试时优先用 TransferNote，LastHistory 作为 fallback
+	//   - 等 TransferNote 实测稳定后再决定是否删除 LastHistory
+	TransferNote string
+
 	// LastResponse 是 agent 最近一次 LLM 非工具响应的原始文本（worker 的"我做完了"那句话）。
 	// 在每次 worker 提交"无 tool call"响应时由 Store.RecordLastResponse 写入；
 	// 与 Results 不同，即使 ExpectedArtifacts 校验失败导致任务回滚重试，

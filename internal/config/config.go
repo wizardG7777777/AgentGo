@@ -46,6 +46,11 @@ type Config struct {
 	// 收件箱（保留可见性），但不会触发 mail-notifier 发布唤醒任务，从而打断
 	// 邮件级联爆炸链。Phase 2 引入；用户 /steer 投递的初始邮件 ChainDepth=0。
 	MailChainMaxDepth int `yaml:"mail_chain_max_depth" json:"mail_chain_max_depth"`
+	// TransferNoteMaxTokens 是 TransferNote 单条最大 token 预算。agent 在生成
+	// L1/L3 交接备忘时按此预算截断文本长度——按 1 token ≈ 2 runes 估算。
+	// 默认 3000 对应 ~6000 字符中文或 ~12000 字符英文。
+	// 参考 nextUpgrade_v3.md §8.4.6 的 token 预算规划。
+	TransferNoteMaxTokens int `yaml:"transfer_note_max_tokens" json:"transfer_note_max_tokens"`
 	SearchAPIProvider       string `yaml:"search_api_provider" json:"search_api_provider"`
 	SearchAPIURL            string `yaml:"search_api_url" json:"search_api_url"`
 	SearchAPIKey            string `yaml:"search_api_key" json:"search_api_key"`
@@ -80,6 +85,7 @@ func DefaultConfig() *Config {
 		MailNotifierIntervalSec: 5,
 		MailNotifierEnabled:     true, // Phase 2 完成；4 项防御已就绪，恢复默认启用
 		MailChainMaxDepth:       3,    // Phase 2 新增；与 hookSystem.md §3.2 一致
+		TransferNoteMaxTokens:   3000, // Sprint 3 #5 TransferNote 默认预算
 		SearchAPIProvider:       "duckduckgo_html",
 	}
 }

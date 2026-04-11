@@ -328,9 +328,16 @@ func TestBugCondition_MaxLoopsHasNoEffect(t *testing.T) {
 			// the loop should run exactly MaxLoops times and then trigger RetryRollback.
 			// On unfixed code, callCount is ALWAYS 1 regardless of MaxLoops,
 			// proving MaxLoops is never referenced.
-			if callCount != maxLoops {
-				t.Errorf("MaxLoops=%d but executor called %d time(s) — expected exactly MaxLoops calls",
-					maxLoops, callCount)
+			//
+			// Sprint 3 #5 调整：handleMaxLoops 路径现在会额外调一次 Execute 用于
+			// buildTransferNote L1 压缩，因此期望是 maxLoops + 1。这个额外调用
+			// 不是 ReactLoop 的一部分，而是"任务终止前生成跨 agent 交接备忘"，
+			// 属于 TransferNote 子系统。测试期望同步更新，继续守护"ReactLoop
+			// 不多跑一圈"的原始不变式。
+			expected := maxLoops + 1
+			if callCount != expected {
+				t.Errorf("MaxLoops=%d but executor called %d time(s) — expected %d (loops + 1 TransferNote L1 call)",
+					maxLoops, callCount, expected)
 			}
 		})
 	}
@@ -1220,22 +1227,35 @@ func TestBehavior_MaxLoopsHistoryLength(t *testing.T) {
 			ag := NewAgent("agent-1", "code", s, r, executor, maxLoops)
 			ag.processTask(context.Background(), task.ID)
 
-			// Executor should be called exactly MaxLoops times
-			if callCount != maxLoops {
-				t.Fatalf("executor call count = %d, want %d", callCount, maxLoops)
+			// Executor should be called MaxLoops + 1 times:
+			//   - MaxLoops: ReactLoop 迭代
+			//   - +1: handleMaxLoops 路径 buildTransferNote L1 压缩（Sprint 3 #5 新增）
+			expected := maxLoops + 1
+			if callCount != expected {
+				t.Fatalf("executor call count = %d, want %d (MaxLoops+1 含 TransferNote L1)", callCount, expected)
 			}
 
-			// Verify history length at each round: round i gets len(history) == i
-			for i, length := range historyLengths {
+			// Verify history length at the first MaxLoops rounds: round i gets len(history) == i
+			// 第 MaxLoops 次调用是 buildTransferNote 的 L1 压缩调用，不在验证范围
+			for i := 0; i < maxLoops; i++ {
+				length := historyLengths[i]
 				if length != i {
 					t.Errorf("round %d: len(history) = %d, want %d", i, length, i)
 				}
 			}
 
-			// The last round should have received history of length MaxLoops-1
-			lastHistLen := historyLengths[len(historyLengths)-1]
-			if lastHistLen != maxLoops-1 {
-				t.Errorf("last round: len(history) = %d, want %d", lastHistLen, maxLoops-1)
+			// 最后一次常规 round 应收到长度为 maxLoops-1 的 history（其自身 append 前）
+			lastRegular := historyLengths[maxLoops-1]
+			if lastRegular != maxLoops-1 {
+				t.Errorf("last regular round: len(history) = %d, want %d", lastRegular, maxLoops-1)
+			}
+
+			// TransferNote L1 压缩调用是最后一次 Execute：
+			// 它看到的 history 应是 maxLoops（所有 round 的累积）+ 1（追加的 <transfer-request> 指令）
+			l1CallIdx := maxLoops // 第 maxLoops+1 次调用，0-indexed
+			if historyLengths[l1CallIdx] != maxLoops+1 {
+				t.Errorf("L1 call: len(history) = %d, want %d (maxLoops + <transfer-request>)",
+					historyLengths[l1CallIdx], maxLoops+1)
 			}
 
 			// RetryRollback should have been triggered: task goes back to pending

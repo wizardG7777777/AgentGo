@@ -165,6 +165,7 @@ func NewWithID(agentID string, s store.TaskStore, r roster.Roster, llmClient llm
 	a.IdleThreshold = 0 // 预制代理不因空闲退出
 	a.CompactTokenThreshold = cfg.CompactTokenThreshold
 	a.CompactKeepRecent = cfg.CompactKeepRecent
+	a.TransferNoteMaxTokens = cfg.TransferNoteMaxTokens
 	a.OnTaskStart = func(taskID string) {
 		holder.Set(taskID)
 	}

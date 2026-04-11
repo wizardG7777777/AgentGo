@@ -80,6 +80,10 @@ type Agent struct {
 	MailRegistry          *mailbox.Registry                 // 邮箱注册表，用于 DrainWithAck 自动回执
 	FinalizationChecker   FinalizationChecker               // 可选；用于 finalization tool 信号检查
 
+	// TransferNoteMaxTokens 是 TransferNote 单条的 token 预算上限。0 或负数视为默认 3000。
+	// 失败路径 buildTransferNote 按此值做 L1/L3 输出截断。Sprint 3 #5 引入。
+	TransferNoteMaxTokens int
+
 	// AgentHookReg 是 Agent Hook 注册表，覆盖 processTask 的 4 个生命周期事件
 	// （PhaseTaskStart / PhaseLoopPre / PhaseLoopPost / PhaseTaskEnd）。
 	// nil 时全路径退化为 no-op——这是回归验证的可逆性保证。
@@ -89,6 +93,15 @@ type Agent struct {
 	// 访问任务/占用状态。任一为 nil 时，对应视图在 hook 里为 nil，hook 需自行判空。
 	HookStoreView  hook.AgentStoreView
 	HookRosterView hook.AgentRosterView
+}
+
+// transferNoteMaxTokens 返回实际使用的 TransferNote 预算。
+// TransferNoteMaxTokens 字段 <= 0 时使用默认值 3000。
+func (a *Agent) transferNoteMaxTokens() int {
+	if a.TransferNoteMaxTokens > 0 {
+		return a.TransferNoteMaxTokens
+	}
+	return 3000
 }
 
 // runAgentInject 构造 AgentHookContext 并调用 Registry 的 RunInject。
@@ -213,6 +226,41 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		return
 	}
 
+	// Panic 恢复（Sprint 3 #5 引入）：processTask 的任意路径 panic 都会
+	// 被这里捕获，走纯机械 L3 生成 TransferNote + 终止任务，避免"panic →
+	// 任务永久 processing 卡在花名册"的历史潜在 P0。
+	//
+	// 为什么不走 buildTransferNote(L1→L3)？
+	//   - panic 发生时 ctx 可能已取消、LLM client 状态未知
+	//   - 直接再调一次 LLM（L1）高概率二次失败
+	//   - L3 纯代码拼装够用：工具轨迹 + Artifacts + 最后响应已经构成可读的交接
+	//
+	// 注意：这条 defer 必须**最先**注册，这样它在 LIFO 的最后一层执行，
+	// 让其他 defer（trace.CloseTask / OnTaskEnd / PhaseTaskEnd）仍有机会运行。
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("[agent %s] 任务 %s processTask panic 被恢复: %v", a.ID, taskID, rec)
+			// 构造 L3 交接备忘
+			var toolHistory []store.ToolCallRecord
+			if a.Store != nil {
+				toolHistory, _ = a.Store.QueryToolCalls(taskID, "")
+			}
+			note := mechanicalTransferNote(task, nil, toolHistory, a.transferNoteMaxTokens())
+			if note != "" {
+				_ = a.Store.SetTransferNote(taskID, note)
+			}
+			// 终止任务，避免卡在 processing 状态
+			reason := fmt.Sprintf("agent panic: %v", rec)
+			if err := a.Store.FailTask(a.ID, taskID, reason); err != nil {
+				log.Printf("[agent %s] panic 恢复后 FailTask error: %v", a.ID, err)
+			}
+			// 尝试发送崩溃汇报（有 EventSource 时）
+			if task != nil {
+				a.sendCrashReport(task, taskID, reason)
+			}
+		}
+	}()
+
 	// Trace：记录任务被代理认领
 	trace.Emit(trace.Event{
 		Kind:    trace.KindTaskClaimed,
@@ -264,10 +312,23 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		depResults = mergeArtifactsIntoDeps(depResults, depArtifacts)
 	}
 
+	// 拉取依赖任务的 TransferNote（上游代理在终止前留下的压缩交接备忘），
+	// 以 <upstream-transfer-notes> 形式作为首条 user 消息注入 history。
+	// Sprint 3 #5：让下游代理既能看到上游的 Artifacts 文件清单，又能看到
+	// 上游对工作的自述总结——两层信息互补。
+	depNotes, noteErr := a.Store.GetDependencyTransferNotes(taskID)
+	if noteErr != nil {
+		log.Printf("[agent %s] GetDependencyTransferNotes error: %v", a.ID, noteErr)
+	}
+
 	var lastOutput string
 	history := make([]HistoryEntry, 0)
 
-	// 重试时恢复之前的历史上下文，避免 LLM 丢失上下文重复操作
+	// 重试时恢复之前的历史上下文，避免 LLM 丢失上下文重复操作。
+	// 本最小版 TransferNote 与 LastHistory 并存：LastHistory 作为完整的历史副本
+	// 提供原始 tool_call/tool_result 序列；TransferNote 作为精炼文本提供接手者
+	// "为什么要做这件事 + 前任遇到什么障碍"的决策上下文。两者在 Execute 调用时
+	// 都会出现在 LLM 的上下文里。未来 TransferNote 实测稳定后可考虑删除 LastHistory。
 	if task.RetryCount > 0 && len(task.LastHistory) > 0 {
 		if err := json.Unmarshal(task.LastHistory, &history); err != nil {
 			log.Printf("[agent %s] 反序列化历史记录失败，从空历史开始: %v", a.ID, err)
@@ -275,6 +336,32 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		} else {
 			log.Printf("[agent %s] 任务 %s 重试 #%d，恢复 %d 条历史记录", a.ID, taskID, task.RetryCount, len(history))
 		}
+	}
+
+	// 依赖 TransferNote 注入：依赖链场景。每条上游备忘作为单独条目，
+	// 用 XML 标签分隔便于 LLM 识别"这是其他任务的交接，不是我自己的历史"。
+	if len(depNotes) > 0 {
+		var sb strings.Builder
+		sb.WriteString("<upstream-transfer-notes>\n")
+		for depID, note := range depNotes {
+			fmt.Fprintf(&sb, "<note from=\"%s\">\n%s\n</note>\n", depID, strings.TrimSpace(note))
+		}
+		sb.WriteString("</upstream-transfer-notes>")
+		history = append(history, HistoryEntry{IncomingMail: sb.String()})
+	}
+
+	// 自身 TransferNote 注入：重试换手场景。前任留下的备忘让新 agent 知道
+	// "我为什么被叫醒 + 前任遇到了什么障碍"。即便 LastHistory 已恢复了完整
+	// 对话，TransferNote 作为"精炼提示"仍然有价值——它不会被 Layer 2 压缩吞掉。
+	if task.RetryCount > 0 && task.TransferNote != "" {
+		hint := fmt.Sprintf(
+			"<transfer-note>\n"+
+				"这是第 %d 次重试。以下是前任代理在终止前留下的交接备忘：\n\n%s\n\n"+
+				"请结合上方的 LastHistory（如有）+ 本备忘，从任务目标重新出发，避免重蹈覆辙。\n"+
+				"</transfer-note>",
+			task.RetryCount, strings.TrimSpace(task.TransferNote),
+		)
+		history = append(history, HistoryEntry{IncomingMail: hint})
 	}
 
 	// PhaseTaskStart：任务级 hook 注入点。
@@ -334,6 +421,10 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		if a.FinalizationChecker != nil && a.FinalizationChecker.IsFinalized() {
 			log.Printf("[agent %s] FinalizationChecker.IsFinalized()=true，终止 reactLoop (task=%s)", a.ID, taskID)
 			// 使用上一轮保存的 lastOutput 完成任务（不进行 ExpectedArtifacts 校验，因为 finalization tool 负责最终汇报）
+			// TransferNote：成功路径直接用 lastOutput（LLM 自述已经是合理总结，不需二次压缩）
+			if lastOutput != "" {
+				_ = a.Store.SetTransferNote(taskID, lastOutput)
+			}
 			if err := a.Store.SubmitResult(a.ID, taskID, lastOutput); err != nil {
 				log.Printf("[agent %s] SubmitResult error: %v", a.ID, err)
 			}
@@ -392,6 +483,14 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			}
 			if len(check.Drifted) > 0 {
 				log.Printf("[agent %s] 任务 %s 路径漂移已容忍: %v", a.ID, taskID, check.Drifted)
+			}
+
+			// TransferNote：成功路径把 lastOutput 直接写入 TransferNote。
+			// lastOutput 是 LLM 对任务的最终文本响应，本身就是合理的自述总结，
+			// 不需要额外的 LLM 压缩调用。下游依赖任务通过 GetDependencyTransferNotes
+			// 读取这一段作为上游交接备忘。失败路径走 handleFailure 里的 buildTransferNote。
+			if lastOutput != "" {
+				_ = a.Store.SetTransferNote(taskID, lastOutput)
 			}
 
 			if err := a.Store.SubmitResult(a.ID, taskID, lastOutput); err != nil {
@@ -467,6 +566,15 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// 保存当前历史到任务，供下次重试恢复上下文
 	a.saveHistory(task, history)
 
+	// TransferNote：MaxLoops 耗尽路径走 buildTransferNote（L1 → L3 链）。
+	// L1 会追加 <transfer-request> 指令做最后一次 LLM 压缩；失败则 L3 机械兑底。
+	// 注意：此处 history 已经是最后状态（包含所有 loop 的结果），
+	// buildTransferNote 内部对 history 只读，不修改原切片。
+	note := a.buildTransferNote(ctx, task, depResults, history, a.transferNoteMaxTokens())
+	if note != "" {
+		_ = a.Store.SetTransferNote(taskID, note)
+	}
+
 	// 检查重试次数是否已耗尽，避免无限重试
 	if a.MaxRetries > 0 && task.RetryCount >= a.MaxRetries {
 		failReason := fmt.Sprintf("重试次数耗尽 (%d/%d): %s", task.RetryCount, a.MaxRetries, reason)
@@ -493,6 +601,16 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 			history = compressHistory(history, 1) // 激进压缩：只保留最近 1 条
 		}
 
+		// TransferNote：失败路径走 buildTransferNote（L1 → L3 链）。
+		// 上面的激进压缩已经把 history 缩到最小，此时 L1 调 LLM 一般能成功；
+		// 如果 LLM 服务本身不可用或返回异常，L3 机械兑底接管。
+		// 注意：buildTransferNote 内部对 history 只读，不修改原切片。
+		// 使用 context.Background() 避免本次 execErr 所在 ctx 已被取消的情况。
+		note := a.buildTransferNote(context.Background(), task, nil, history, a.transferNoteMaxTokens())
+		if note != "" {
+			_ = a.Store.SetTransferNote(taskID, note)
+		}
+
 		// 全局重试上限：可恢复错误也要受 MaxRetries 约束，避免无限重试。
 		// 此前只有 handleMaxLoops 路径检查 MaxRetries，导致 ExpectedArtifacts 校验
 		// 失败、tool 错误等可恢复故障可以无限循环（实战中观察到 24+ 次重试，烧 2 小时）。
@@ -516,7 +634,16 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 			}
 		}
 	} else {
-		// 不可恢复错误：终止 + 崩溃汇报
+		// 不可恢复错误：先记 TransferNote（走纯机械 L3，不调 LLM——execErr 很可能是
+		// LLM 自身故障，再调一次只会失败），然后终止 + 崩溃汇报
+		var toolHistory []store.ToolCallRecord
+		if a.Store != nil && task != nil {
+			toolHistory, _ = a.Store.QueryToolCalls(task.ID, "")
+		}
+		note := mechanicalTransferNote(task, history, toolHistory, a.transferNoteMaxTokens())
+		if note != "" {
+			_ = a.Store.SetTransferNote(taskID, note)
+		}
 		log.Printf("[agent %s] 任务 %s 不可恢复错误：%v", a.ID, taskID, execErr)
 		a.terminateTask(task, taskID, execErr.Error())
 	}

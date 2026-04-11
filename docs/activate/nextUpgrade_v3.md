@@ -151,9 +151,18 @@ T2: LLM 调用 edit_file 编辑"第 2 行"，实际编辑了错误的行
 
 ## 6. Agent 运行时：Finalization Tool 终止桥（🔴 高优先级）
 
-> 状态：📝 待重构（2026-04-10 Phase 3.1 事故后记录）
+> 状态：✅ **已完成**（2026-04-12 通用化落地完毕）
 > 优先级：🔴 **高** —— 任何引入 "task-completion-semantic" 工具的 agent 都受影响
 > 触发事件：scheduler 一等代理重构后出现"幻觉心跳无限循环"，参见 KNOWN_ISSUES.md 同名条目
+
+**落地摘要**：
+`internal/tools/finalization.go` 定义 `tools.FinalizationNotifier` 接口；
+`internal/agent/finalization.go` 定义 `agent.FinalizationChecker` 接口 + 通用 `FinalizationHolder`（同一 holder 实现两个接口）；
+`agent.ExecuteResult` 新增 `Finalized bool` 字段；
+`agent.Run` reactLoop 前置检查 `FinalizationChecker.IsFinalized()` + 后置检查 `result.Finalized`；
+`scheduler.Bundle` 构造时注入同一个 `FinalizationHolder` 到 `SchedulerGroup{FinalizationNotifier}` 和 `SchedulerExecutor{FinalizationChecker}`。
+未来任何带 finalization tool 的新 agent 直接创建 holder + 注册即可，不需要重复实现三件套。
+单测：`internal/agent/finalization_test.go` + `internal/scheduler/executor_test.go`。
 
 ### 6.1 背景：Phase 3.1 事故复盘
 
@@ -748,7 +757,18 @@ nil-safe receiver（`r=nil` 时 RunInject 返回空切片），与 ToolHookRegis
 
 ### 8.1 Scheduler 分配感知（P2）
 
+> 状态：✅ **已完成**（Sprint 3 2026-04-12）
 > 关联：v2 §1.7 能力声明阶段一
+
+**落地摘要**：
+`internal/scheduler/agent_registry.go` 新建 `SpecializedAgent` + `AgentRegistry` 静态注册表（nil 安全、sync.RWMutex）；
+`bootstrap.go` Step 5.5 创建 registry 并注册 Explorer 静态声明；
+`scheduler.New` 签名扩展 `agentRegistry` 参数；
+`SchedulerExecutor.AgentRegistry` 字段 + `BuildBoardJSON` 经 `SnapshotSources.AgentRegistry` 传入；
+`buildSpecializedAgentSnapshots` 合并静态声明与 live task 的 busy 计数；
+`resourceInfo.SpecializedAgents []specializedAgentSnapshot` 渲染到 board snapshot JSON；
+`schedulerSystemPrompt` 新增"路由指引"段（3 步决策树 + busy 达满处理）。
+深度冒烟验证（2026-04-12 04:00）：scheduler 第一次 LLM 请求的 board snapshot user message 确实包含 `specialized_agents` 字段，scheduler 据此把任务发布为 `event_type="explore"` 让 Explorer 认领。
 
 **问题**：Scheduler 通过 `publish_task` 把任务发到公告板，Worker 按 priority 抢。但 scheduler 不知道哪类 agent 在线、各自的能力边界在哪里，分配是盲目的。
 
@@ -863,7 +883,30 @@ type Roster interface {
 
 ### 8.4 跨 Agent 上下文传递——TransferNote 机制（P2）
 
+> 状态：✅ **最小版已完成**（Sprint 3 2026-04-12）——L1 + L3 + `defer recover()`。L2（panic 时的独立 LLM 压缩）故意跳过，见下方"最小版范围"段。
 > 统一原 §8.4（任务交接）和 §8.5（失败恢复）为一个机制
+
+**最小版范围**（用户拍板：先做 95% 覆盖面的 L1+L3，跳过 L2 panic 独立压缩）：
+
+- ✅ **L1**：`agent.generateTransferNote` 在失败路径注入 `<transfer-request>` 指令，让 LLM 做最后一次自压缩（`internal/agent/transfer_note.go`）
+- ❌ **L2**：panic 时的独立 LLM 调用——**故意跳过**，理由见代码文件头注释（panic 时 history 可能不完整、LLM 压缩质量不可靠；L3 机械兑底足够）
+- ✅ **L3**：`agent.mechanicalTransferNote` 纯代码拼装——任务目标 + 工具轨迹（最近 20 条）+ Artifacts + 最后响应 + 失败原因
+- ✅ **`buildTransferNote` L1→L3 两级调用链**
+- ✅ **成功路径**：`lastOutput` 直接写入 `TransferNote`（不走压缩——LLM 响应本身已经是合理总结）
+- ✅ **失败路径**：`handleFailure` 可恢复分支走 L1→L3；不可恢复分支走 L3 直接（LLM 故障时不再调 LLM）
+- ✅ **MaxLoops 耗尽路径**：走 L1→L3
+- ✅ **defer recover()**：processTask 任意 panic 被捕获 → 走 L3 + FailTask + crash report，顺手修复"panic → 任务永久 processing"的潜在 P0
+- ✅ **入口读入**：`GetDependencyTransferNotes` 注入 `<upstream-transfer-notes>`；自身重试走 `<transfer-note>` 注入
+
+**未做的事**（不在最小版范围，等真实数据驱动再决定是否补）：
+- ❌ **LastHistory 删除**：LastHistory 和 TransferNote 并存，重试时两者都注入 LLM 上下文。等 TransferNote 实测稳定后再决定是否移除 LastHistory 写入路径
+- ❌ **Token 预算重算**：`CompactTokenThreshold` 仍按 80000 计算，未扣除 TransferNote/GoalAnchor/TeamSnapshot 预留。在 3000 token 的 TransferNote 规模下与 80000 阈值没有冲突
+- ❌ **多 worker 跨 agent 接手测试**：没有实测数据前无法构造有意义的场景；单测已覆盖 L1/L3/panic 三条路径，真实多 worker 验证留待未来自然场景
+
+**Sprint 3 深度冒烟验证**（2026-04-12 04:00）：
+构造依赖链任务（Explorer 调查 README → Worker 写 docs/sprint3_smoke.md）。Worker 的第一次 LLM 请求的第 2 条 user 消息是完整的 `<upstream-transfer-notes>` XML 块，含 `from="<Explorer task ID>"` + Explorer 对 README 的完整调查总结文本。Worker 据此写出的内容与 Explorer 的调查发现一致（没有幻觉）。全链路：`Explorer lastOutput → Task.TransferNote → GetDependencyTransferNotes → Worker history 注入 → 基于真实上游信息落盘`。
+
+
 
 #### 8.4.1 问题
 
@@ -1319,11 +1362,11 @@ GoalRefreshInterval int  // 配置项，默认 3 轮
 
 | 优先级 | 子项 | 依赖 | 状态 |
 |--------|------|------|------|
-| P1 | §8.2 执行孤岛消除（Agent Hook §7） | — | 📝 随 §7 一起实施 |
-| P1 | §8.7 GoalAnchor 目标锚点 | §7 TeamAwarenessHook | 📝 待实现 |
-| P2 | §8.1 Scheduler 分配感知 | boardSnapshot | 📝 待实现 |
+| P1 | §8.2 执行孤岛消除（Agent Hook §7） | — | ✅ 已完成（Sprint 1 2026-04-12，随 §7 TeamAwarenessHook 一起落地） |
+| P1 | §8.7 GoalAnchor 目标锚点 | §7 TeamAwarenessHook | ✅ 已完成（Sprint 1 2026-04-12，作为 TeamAwarenessHook 的 GoalAnchor section） |
+| P2 | §8.1 Scheduler 分配感知 | boardSnapshot | ✅ 已完成（Sprint 3 2026-04-12） |
 | P2 | §8.3 文件冲突排队 | Roster 接口扩展 | 📝 待实现（过渡方案） |
-| P2 | §8.4 TransferNote 跨 Agent 上下文传递 | Model + Store + agent.go | 📝 待实现 |
+| P2 | §8.4 TransferNote 跨 Agent 上下文传递 | Model + Store + agent.go | ✅ 最小版已完成（Sprint 3 2026-04-12，L1+L3+defer recover；L2 延期） |
 | P3 | §8.6 进度通知 | Mailbox + agent.go | 📝 待实现 |
 
 ---

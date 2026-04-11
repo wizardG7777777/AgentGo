@@ -66,6 +66,13 @@ type TaskStore interface {
 	// 而不是只看到一个干瘪的 "重试次数耗尽" 错误。
 	RecordLastResponse(taskID string, content string) error
 
+	// SetTransferNote 写入 task.TransferNote——跨 agent 交接的压缩备忘。
+	// 由 agent 在任务成功（lastOutput 直传）或失败（buildTransferNote L1/L3 链）
+	// 时调用。下游依赖任务通过 GetDependencyTransferNotes 读取；重试接手者通过
+	// GetTask 直接读 task.TransferNote。
+	// Sprint 3 #5 引入。
+	SetTransferNote(taskID string, note string) error
+
 	// Non-atomic read operations (snapshot, no lock required)
 
 	QueryAvailable(eventType string) ([]*model.Task, error)
@@ -75,5 +82,14 @@ type TaskStore interface {
 	// 按依赖任务的 ID 分组：map[parent_task_id][]artifact_path。
 	// 由 agent.processTask 在任务启动时调用，把结果注入下游 worker 的 user prompt。
 	GetDependencyArtifacts(taskID string) (map[string][]string, error)
+
+	// GetDependencyTransferNotes 返回 taskID 所有依赖任务的 TransferNote 文本，
+	// 按依赖任务的 ID 分组：map[parent_task_id]transfer_note。
+	// 依赖任务 TransferNote 为空时该条目被省略——接手者只看到非空的上游备忘。
+	// 由 agent.processTask 在任务启动时调用，把结果以 <upstream-transfer-notes>
+	// 形式注入下游 agent 的 user prompt。
+	// Sprint 3 #5 引入。
+	GetDependencyTransferNotes(taskID string) (map[string]string, error)
+
 	ScanAll() ([]*model.Task, error)
 }

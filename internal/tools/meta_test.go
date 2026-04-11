@@ -67,6 +67,10 @@ func (f *fakeStore) GetDependencyResults(taskID string) (map[string]string, erro
 func (f *fakeStore) GetDependencyArtifacts(taskID string) (map[string][]string, error) {
 	return nil, nil
 }
+func (f *fakeStore) GetDependencyTransferNotes(taskID string) (map[string]string, error) {
+	return nil, nil
+}
+func (f *fakeStore) SetTransferNote(taskID string, note string) error       { return nil }
 func (f *fakeStore) AppendArtifact(taskID string, path string) error        { return nil }
 func (f *fakeStore) RecordLastResponse(taskID string, content string) error { return nil }
 func (f *fakeStore) AppendSchedulerBatch(taskID, childTaskID string) error  { return nil }

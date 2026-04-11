@@ -74,6 +74,13 @@ type SchedulerExecutor struct {
 	// 作为 LLM 的"对话历史"上下文。nil 时不输出 SessionHistory 字段。
 	History *SessionHistory
 
+	// AgentRegistry（可选）：特化代理静态注册表。非 nil 时 board snapshot
+	// 会在 Resources 段追加 specialized_agents 聚合视图，供 scheduler LLM
+	// 在任务规划时决定是把任务发布为 event_type="explore"（让 Explorer 认领）
+	// 还是用默认 event_type（让通用 worker 认领）。
+	// nil 时 specialized_agents 字段被 omitempty 省略。
+	AgentRegistry *AgentRegistry
+
 	// FinalizationChecker（可选）：如果非 nil，每轮 Execute 入口会先调 IsFinalized()，
 	// 返回 true 时短路返回 Finalized=true，让 agent.Run 的 reactLoop
 	// 走"任务完成"路径终止当前 scheduler task。
@@ -123,9 +130,10 @@ func (e *SchedulerExecutor) Execute(
 	// 用通用的 ticker_wakeup 类型，让 LLM 知道这是一次"重新观察板子"
 	trigger := model.Event{Type: model.EventTickerWakeup}
 	snapshot := BuildBoardJSON(e.Store, e.Cfg, mode, trigger, SnapshotSources{
-		MBRegistry: e.MBRegistry,
-		Roster:     e.Roster,
-		History:    e.History,
+		MBRegistry:    e.MBRegistry,
+		Roster:        e.Roster,
+		History:       e.History,
+		AgentRegistry: e.AgentRegistry,
 	})
 
 	// 注入为 IncomingMail 风格的 history entry，与 mailbox 注入对称
