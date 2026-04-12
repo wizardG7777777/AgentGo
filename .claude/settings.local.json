@@ -42,7 +42,9 @@
       "Bash(ls -la /c/Users/73524/Documents/GolangProjects/AgentGo/internal/mailbox/*test.go)",
       "Bash(go tool:*)",
       "Bash(.\\\\agentgo.exe trace:*)",
-      "Bash(./agentgo.exe trace:*)"
+      "Bash(./agentgo.exe trace:*)",
+      "Bash(go run:*)",
+      "Bash(node -e ':*)"
     ]
   },
   "enableAllProjectMcpServers": true,
