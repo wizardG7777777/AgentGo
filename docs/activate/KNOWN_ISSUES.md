@@ -713,7 +713,7 @@ type Writer struct {
 **触发条件**（截至 2026-04-12 进度）：
 - ✅ v3 §7 Agent Hook 框架 + TeamAwarenessHook 已落地（Sprint 1 `91f9c74`）
 - ✅ v3 §8.1 Scheduler 分配感知已落地（Sprint 3 `14384e9`）
-- ⏳ v3 §8.3 Roster 写入排队**仍待实现**——最后一块拼图
+- ✅ v3 §8.3 Roster 写入排队已落地（Sprint 4 `f6552d4`）——**三项触发条件全部满足**
 
 **复盘步骤**：
 1. 在实际多 Worker 负载下运行系统测试，复现原 4 项退化
@@ -820,4 +820,5 @@ LLM 想编也编不出来。
 - **2026-04-12 Sprint 1**：v3 §7 Agent Hook 框架 + TeamAwarenessHook 落地（commit `91f9c74`），硬编码 TeamSnapshot 注入被清理，§8.2 执行孤岛消除 + §8.7 GoalAnchor 随之完成
 - **2026-04-12 Sprint 2**：v3 §9.6 Artifacts 持久化落地（commit `d0bc65e`），方案 B JSONL append-only，`.agentgo/state/artifacts.jsonl`
 - **2026-04-12 Sprint 3**：v3 §8.1 Scheduler 分配感知 + §8.4 TransferNote 最小版（L1+L3+defer recover）双落地（commit `14384e9`）
-- **下一阶段目标**：(a) 推进 v3 §8.3 Roster 写入排队——"多代理协同残留退化" ① 复盘的最后一块拼图；(b) 完成后复盘 ①②④，决定是否立"写入事务化"专项；(c) 其余 P2 候选（v3 §1-4 行哈希增强 / §9.1 工具集分层 / §9.9 Session 化日志）按需选做
+- **2026-04-12 Sprint 4**：v3 §8.3 Roster 写入排队落地（commit `f6552d4`），WaitForRelease FIFO 过渡方案 + 系统日志排队事件 + trace 事件。"多代理协同残留退化" ① 复盘触发条件已**全部满足**
+- **下一阶段目标**：(a) 复盘 ①②④，决定是否立"写入事务化"专项；(b) 其余 P2 候选（v3 §1-4 行哈希增强 / §9.1 工具集分层 / §9.9 Session 化日志）按需选做
