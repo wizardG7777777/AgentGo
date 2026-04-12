@@ -851,19 +851,26 @@ AGENTGO_DUMP_PROMPTS=1 ./agentgo
 | DoneChecker | `internal/scheduler/scheduler.go` | `currentSchedulerTaskHolder` (L200) |
 | 探针工具 | `internal/tools/scheduler_probe.go` | `probeDirectory()` (L19) |
 
-## Tools & Hook
+## Tools（业务功能工具组）
 
-| 功能 | 文件 | 关键函数/结构体 |
-|------|------|----------------|
-| ToolGroup 接口 | `internal/tools/group.go` | `type ToolGroup interface` (L8) |
-| LocalReadGroup | `internal/tools/local_read.go` | `type LocalReadGroup struct` (L20) |
-| LocalWriteGroup | `internal/tools/local_write.go` | `type LocalWriteGroup struct` (L38) |
-| MetaGroup | `internal/tools/meta.go` | `type MetaGroup struct` (L27) |
-| SchedulerGroup | `internal/tools/scheduler.go` | `type SchedulerGroup struct` (L20) |
-| ToolHook 接口 | `internal/hook/tool.go` | `type ToolHook interface` (L28) |
-| ToolHookRegistry | `internal/hook/registry.go` | `type ToolHookRegistry struct` (L12) |
-| PathBoundaryHook | `internal/hook/builtin/path_boundary.go` | `Run()` (L40) |
-| RequireReadBeforeWriteHook | `internal/hook/builtin/require_read_before_write.go` | `Run()` (L35) |
+| 工具组 | 文件 | 关键函数/结构体 | 说明 |
+|--------|------|----------------|------|
+| ToolGroup 接口 | `internal/tools/group.go` | `type ToolGroup interface` (L24) | 工具组通用接口，定义 `Register()` 方法 |
+| LocalReadGroup | `internal/tools/local_read.go` | `type LocalReadGroup struct` (L25) | 只读文件工具：read_file / list_dir / grep_search / glob_search |
+| LocalWriteGroup | `internal/tools/local_write.go` | `type LocalWriteGroup struct` (L32) | 写入文件工具：write_file / edit_file（嵌入 LocalReadGroup） |
+| MetaGroup | `internal/tools/meta.go` | `type MetaGroup struct` (L49) | 元工具：publish_task / send_message（Worker/Explorer/Scheduler 共享） |
+| SchedulerGroup | `internal/tools/scheduler.go` | `type SchedulerGroup struct` (L29) | Scheduler 专属：cancel_task / report_done / probe_directory |
+
+## Hooks（工具调用拦截机制）
+
+| 钩子/接口 | 文件 | 关键函数/结构体 | 说明 |
+|-----------|------|----------------|------|
+| ToolHook 接口 | `internal/hook/tool.go` | `type ToolHook interface` (L59) | 钩子接口，定义 PreCall/PostCall 拦截能力 |
+| ToolHookRegistry | `internal/hook/registry.go` | `type ToolHookRegistry struct` (L20) | 钩子注册与分发器，按 Priority 升序执行 |
+| PathBoundaryHook | `internal/hook/builtin/path_boundary.go` | `Run()` (L67) | 路径边界校验（PreCall, Prio=10），阻止越界访问 |
+| ValidateExpectedHashHook | `internal/hook/builtin/validate_expected_hash.go` | `Run()` | 乐观并发 hash 校验（PreCall, Prio=20） |
+| RequireReadBeforeWriteHook | `internal/hook/builtin/require_read_before_write.go` | `Run()` (L57) | 强制"先读后写"约束（PreCall, Prio=30） |
+| RecordArtifactHook | `internal/hook/builtin/record_artifact.go` | `Run()` | 记录文件产物（PostCall, Prio=950） |
 
 ## Mailbox
 
