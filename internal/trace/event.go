@@ -52,6 +52,9 @@ const (
 	// 文件操作（write_file/edit_file 成功后发出，可审计落盘动作）
 	KindFileWritten EventKind = "file_written"
 
+	// 文件写入排队（TryClaim 冲突后等待前任释放，§8.3 文件冲突排队）
+	KindFileWriteQueued EventKind = "file_write_queued"
+
 	// 通用错误事件（比 task_completed 严重的故障，但任务并未终止）
 	KindError EventKind = "error"
 )
@@ -96,6 +99,10 @@ type Event struct {
 	Path  string `json:"path,omitempty"`
 	Bytes int    `json:"bytes,omitempty"`
 	Hash  string `json:"hash,omitempty"`
+
+	// --- 文件冲突排队字段（§8.3 file_write_queued） ---
+	QueueLen int   `json:"queue_len,omitempty"` // 入队时的等待队列深度
+	WaitMS   int64 `json:"wait_ms,omitempty"`   // 排队等待实际耗时（毫秒）
 
 	// --- 历史压缩字段 ---
 	PromptTokensBefore int    `json:"prompt_tokens_before,omitempty"`

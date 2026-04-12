@@ -1,9 +1,11 @@
 package roster
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestTryClaim_Success(t *testing.T) {
@@ -164,5 +166,185 @@ func TestConcurrentTryClaim(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("expected exactly 1 successful claim, got %d", count)
+	}
+}
+
+// --- §8.3 WaitForRelease 单测 ---
+
+func TestWaitForRelease_ImmediateRelease(t *testing.T) {
+	r := NewMemoryRoster()
+	r.TryClaim("agent-A", "/file.go")
+
+	done := make(chan error, 1)
+	go func() {
+		done <- r.WaitForRelease(context.Background(), "agent-B", "/file.go", 5*time.Second)
+	}()
+
+	// 给 goroutine 一点时间注册 waiter
+	time.Sleep(20 * time.Millisecond)
+	r.Release("agent-A", "/file.go")
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitForRelease should return nil after release, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitForRelease did not return after Release")
+	}
+}
+
+func TestWaitForRelease_DoubleCheckFastPath(t *testing.T) {
+	r := NewMemoryRoster()
+	r.TryClaim("agent-A", "/file.go")
+	r.Release("agent-A", "/file.go") // 释放在 WaitForRelease 之前
+
+	err := r.WaitForRelease(context.Background(), "agent-B", "/file.go", 5*time.Second)
+	if err != nil {
+		t.Fatalf("expected nil (fast path), got %v", err)
+	}
+}
+
+func TestWaitForRelease_Timeout(t *testing.T) {
+	r := NewMemoryRoster()
+	r.TryClaim("agent-A", "/file.go")
+
+	start := time.Now()
+	err := r.WaitForRelease(context.Background(), "agent-B", "/file.go", 50*time.Millisecond)
+	elapsed := time.Since(start)
+
+	if err != ErrWaitTimeout {
+		t.Fatalf("expected ErrWaitTimeout, got %v", err)
+	}
+	if elapsed < 40*time.Millisecond {
+		t.Fatalf("returned too fast: %v", elapsed)
+	}
+}
+
+func TestWaitForRelease_ContextCancel(t *testing.T) {
+	r := NewMemoryRoster()
+	r.TryClaim("agent-A", "/file.go")
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() {
+		done <- r.WaitForRelease(ctx, "agent-B", "/file.go", 5*time.Second)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != context.Canceled {
+			t.Fatalf("expected context.Canceled, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitForRelease did not return after cancel")
+	}
+}
+
+func TestWaitForRelease_FIFOOrder(t *testing.T) {
+	r := NewMemoryRoster()
+	r.TryClaim("agent-A", "/file.go")
+
+	order := make(chan string, 3)
+
+	// B, C, D 依次排队
+	for _, id := range []string{"agent-B", "agent-C", "agent-D"} {
+		id := id
+		go func() {
+			_ = r.WaitForRelease(context.Background(), id, "/file.go", 5*time.Second)
+			// 被唤醒后立刻 claim（验证顺序）
+			if ok, _ := r.TryClaim(id, "/file.go"); ok {
+				order <- id
+				time.Sleep(10 * time.Millisecond)
+				r.Release(id, "/file.go") // 释放让下一个 waiter 被唤醒
+			}
+		}()
+		time.Sleep(10 * time.Millisecond) // 确保注册顺序 B→C→D
+	}
+
+	// A 释放 → B 应先醒
+	r.Release("agent-A", "/file.go")
+
+	var result []string
+	for i := 0; i < 3; i++ {
+		select {
+		case id := <-order:
+			result = append(result, id)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timeout waiting for agent %d, got so far: %v", i, result)
+		}
+	}
+
+	expected := []string{"agent-B", "agent-C", "agent-D"}
+	for i, id := range expected {
+		if i >= len(result) || result[i] != id {
+			t.Fatalf("expected FIFO order %v, got %v", expected, result)
+		}
+	}
+}
+
+func TestWaitForRelease_CleanupOnTimeout(t *testing.T) {
+	r := NewMemoryRoster()
+	r.TryClaim("agent-A", "/file.go")
+
+	_ = r.WaitForRelease(context.Background(), "agent-B", "/file.go", 30*time.Millisecond)
+
+	// 超时后 waiter 队列应为空
+	r.mu.RLock()
+	qLen := len(r.waiters["/file.go"])
+	r.mu.RUnlock()
+
+	if qLen != 0 {
+		t.Fatalf("expected 0 waiters after timeout, got %d", qLen)
+	}
+}
+
+func TestReleaseAll_NotifiesWaiters(t *testing.T) {
+	r := NewMemoryRoster()
+	r.TryClaim("agent-A", "/file1.go")
+	r.TryClaim("agent-A", "/file2.go")
+
+	woken := make(chan string, 2)
+	for _, pair := range []struct{ agent, file string }{
+		{"agent-B", "/file1.go"},
+		{"agent-C", "/file2.go"},
+	} {
+		pair := pair
+		go func() {
+			err := r.WaitForRelease(context.Background(), pair.agent, pair.file, 5*time.Second)
+			if err == nil {
+				woken <- pair.agent
+			}
+		}()
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	r.ReleaseAll("agent-A")
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-woken:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected 2 agents woken by ReleaseAll, got %d", i)
+		}
+	}
+}
+
+func TestWaitForRelease_DisabledWhenTimeoutZero(t *testing.T) {
+	r := NewMemoryRoster()
+	r.TryClaim("agent-A", "/file.go")
+
+	err := r.WaitForRelease(context.Background(), "agent-B", "/file.go", 0)
+	if err != ErrWaitTimeout {
+		t.Fatalf("expected ErrWaitTimeout for timeout=0, got %v", err)
+	}
+
+	err = r.WaitForRelease(context.Background(), "agent-B", "/file.go", -1*time.Second)
+	if err != ErrWaitTimeout {
+		t.Fatalf("expected ErrWaitTimeout for negative timeout, got %v", err)
 	}
 }

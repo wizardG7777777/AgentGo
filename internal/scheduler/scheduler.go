@@ -342,6 +342,7 @@ func New(
 			LocalReadGroup: readGroup,
 			Roster:         r,
 			AgentID:        schedID,
+			WaitTimeoutSec: cfg.RosterWaitTimeoutSec, // §8.3 文件冲突排队
 		},
 		tools.WebGroup{Provider: searchProvider},
 		tools.ShellGroup{
