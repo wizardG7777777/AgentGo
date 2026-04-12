@@ -143,9 +143,7 @@ func NewWithID(agentID string, s store.TaskStore, r roster.Roster, llmClient llm
 			LocalReadGroup: readGroup,
 			Roster:         r,
 			AgentID:        agentID,
-			// C5 迁移：Store / ProjectRoot 字段已删除。
-			// 写文件后追加到 task.Artifacts 由 RecordArtifactHook 完成，
-			// hookReg 在 bootstrap 中注册时拿到 store 与 projectRoot。
+			WaitTimeoutSec: cfg.RosterWaitTimeoutSec, // §8.3 文件冲突排队
 		},
 		tools.WebGroup{Provider: searchProvider},
 		tools.ShellGroup{Workdir: workdir, TimeoutSec: cfg.ShellTimeoutSec, ApprovalCh: approvalCh, AgentID: agentID, Filter: shellFilter},

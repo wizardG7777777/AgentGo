@@ -1,6 +1,11 @@
 package roster
 
-import "agentgo/internal/model"
+import (
+	"context"
+	"time"
+
+	"agentgo/internal/model"
+)
 
 type Roster interface {
 	TryClaim(agentID string, filePath string) (bool, error)
@@ -15,4 +20,10 @@ type Roster interface {
 	// 供 Agent Hook 的 FileAwareness section 查询团队文件占用状态。
 	// 参见 hookview.go 中 RosterHookView 接口与 MemoryRoster 的实现。
 	ListClaims() map[string][]string
+	// WaitForRelease 阻塞等待 filePath 被当前持有者释放（FIFO 排队）。
+	// 返回 nil 表示文件已释放，调用方应立即重试 TryClaim（可能被其他 agent 抢先）。
+	// 返回 context.Canceled / context.DeadlineExceeded 表示放弃等待。
+	// 返回 ErrWaitTimeout 表示 timeout <= 0（排队被禁用）。
+	// 参见 nextUpgrade_v3.md §8.3 文件冲突排队。
+	WaitForRelease(ctx context.Context, agentID string, filePath string, timeout time.Duration) error
 }

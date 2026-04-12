@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"agentgo/internal/agent"
 	"agentgo/internal/model"
@@ -22,6 +23,11 @@ type recordingRoster struct {
 	occupied   bool   // true → TryClaim 返回 (false, nil)
 	occupiedBy string // 提供给 IsOccupied
 	claimErr   error  // TryClaim 返回的错误
+
+	// §8.3：WaitForRelease mock 控制
+	waitErr      error // WaitForRelease 返回的错误（nil = 模拟成功唤醒）
+	claimAfterWait bool // WaitForRelease 成功后，下次 TryClaim 是否放行
+	tryClaims    int   // TryClaim 调用计数
 }
 
 func (r *recordingRoster) record(ev string) {
@@ -39,11 +45,19 @@ func (r *recordingRoster) snapshot() []string {
 }
 
 func (r *recordingRoster) TryClaim(agentID, filePath string) (bool, error) {
+	r.mu.Lock()
+	r.tryClaims++
+	callNum := r.tryClaims
+	r.mu.Unlock()
 	r.record(fmt.Sprintf("TryClaim:%s:%s", filePath, agentID))
 	if r.claimErr != nil {
 		return false, r.claimErr
 	}
+	// 首次 occupied，等待后可配置放行
 	if r.occupied {
+		if r.claimAfterWait && callNum > 1 {
+			return true, nil // 排队唤醒后的重试放行
+		}
 		return false, nil
 	}
 	return true, nil
@@ -67,6 +81,11 @@ func (r *recordingRoster) IsOccupied(filePath string) (string, bool, error) {
 func (r *recordingRoster) ListByAgent(agentID string) ([]model.Claim, error) { return nil, nil }
 func (r *recordingRoster) ListAllAgents() ([]string, error)                  { return nil, nil }
 func (r *recordingRoster) ListClaims() map[string][]string                   { return nil }
+
+func (r *recordingRoster) WaitForRelease(_ context.Context, agentID, filePath string, _ time.Duration) error {
+	r.record(fmt.Sprintf("WaitForRelease:%s:%s", filePath, agentID))
+	return r.waitErr
+}
 
 // --- test fixture helper ---
 
@@ -343,6 +362,107 @@ func (c *captureStore) AppendSchedulerBatch(string, string) error               
 func (c *captureStore) ClearSchedulerBatch(string) error                           { return nil }
 func (c *captureStore) QueryToolCalls(string, string) ([]store.ToolCallRecord, error) {
 	return nil, nil
+}
+
+// --- §8.3 claimOrWait 排队路径单测 ---
+
+func TestWriteFile_WaitAndRetrySuccess(t *testing.T) {
+	g, rr, tmp := newWriteGroup(t, nil)
+	rr.occupied = true
+	rr.occupiedBy = "worker-2"
+	rr.claimAfterWait = true // 排队唤醒后第二次 TryClaim 放行
+	g.WaitTimeoutSec = 10
+
+	path := filepath.Join(tmp, "wait-ok.txt")
+	out, err := callWriteFile(g, path, "waited-content", "")
+	if err != nil {
+		t.Fatalf("expected success after wait, got %v", err)
+	}
+	if !strings.Contains(out, "文件已写入") {
+		t.Fatalf("unexpected output: %s", out)
+	}
+
+	events := rr.snapshot()
+	// 应当是: TryClaim(fail) → WaitForRelease → TryClaim(success) → Release
+	expected := []string{"TryClaim:", "WaitForRelease:", "TryClaim:", "Release:"}
+	if len(events) != 4 {
+		t.Fatalf("expected 4 events, got %d: %v", len(events), events)
+	}
+	for i, prefix := range expected {
+		if !strings.HasPrefix(events[i], prefix) {
+			t.Errorf("event[%d] = %q, want prefix %q", i, events[i], prefix)
+		}
+	}
+}
+
+func TestWriteFile_WaitTimeoutFallback(t *testing.T) {
+	g, rr, tmp := newWriteGroup(t, nil)
+	rr.occupied = true
+	rr.occupiedBy = "worker-2"
+	rr.waitErr = context.DeadlineExceeded
+	g.WaitTimeoutSec = 10
+
+	path := filepath.Join(tmp, "wait-timeout.txt")
+	_, err := callWriteFile(g, path, "x", "")
+	if err == nil {
+		t.Fatal("expected error on timeout")
+	}
+	if !strings.Contains(err.Error(), "占用") {
+		t.Fatalf("expected 占用 in error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "超时") {
+		t.Fatalf("expected 超时 in error, got %v", err)
+	}
+}
+
+func TestWriteFile_WaitDisabledWhenZero(t *testing.T) {
+	g, rr, tmp := newWriteGroup(t, nil)
+	rr.occupied = true
+	rr.occupiedBy = "worker-2"
+	g.WaitTimeoutSec = 0 // 不排队
+
+	path := filepath.Join(tmp, "no-wait.txt")
+	_, err := callWriteFile(g, path, "x", "")
+	if err == nil {
+		t.Fatal("expected error when wait disabled")
+	}
+	if !strings.Contains(err.Error(), "占用") {
+		t.Fatalf("expected 占用 in error, got %v", err)
+	}
+
+	// 确认没有调用 WaitForRelease
+	events := rr.snapshot()
+	for _, ev := range events {
+		if strings.HasPrefix(ev, "WaitForRelease:") {
+			t.Fatalf("WaitForRelease should not be called when WaitTimeoutSec=0, got %v", events)
+		}
+	}
+}
+
+func TestEditFile_WaitAndRetrySuccess(t *testing.T) {
+	g, rr, tmp := newWriteGroup(t, nil)
+	rr.occupied = true
+	rr.occupiedBy = "worker-2"
+	rr.claimAfterWait = true
+	g.WaitTimeoutSec = 10
+
+	path := filepath.Join(tmp, "wait-edit.txt")
+	if err := os.WriteFile(path, []byte("hello world"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := callEditFile(g, path, "world", "Go", "")
+	if err != nil {
+		t.Fatalf("expected success after wait, got %v", err)
+	}
+	if !strings.Contains(out, "文件已编辑") {
+		t.Fatalf("unexpected output: %s", out)
+	}
+
+	data, _ := os.ReadFile(path)
+	if string(data) != "hello Go" {
+		t.Fatalf("expected 'hello Go', got %q", string(data))
+	}
 }
 
 // C5 删除：TestWriteFile_RecordsArtifact / TestWriteFile_ArtifactDedupOnRewrite /

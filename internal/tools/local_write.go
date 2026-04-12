@@ -3,9 +3,11 @@ package tools
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"agentgo/internal/agent"
 	"agentgo/internal/pathutil"
@@ -28,9 +30,10 @@ import (
 // 写入产物事实流的登记由 Hook System 的 RecordArtifactHook 在 PostCall
 // 阶段接管，详见 internal/hook/builtin/record_artifact.go。
 type LocalWriteGroup struct {
-	LocalReadGroup               // embed: 继承 Workdir + Cache
-	Roster         roster.Roster // required
-	AgentID        string        // required
+	LocalReadGroup                // embed: 继承 Workdir + Cache
+	Roster         roster.Roster  // required
+	AgentID        string         // required
+	WaitTimeoutSec int            // §8.3：文件冲突排队等待秒数，0 = 不排队（旧行为）
 }
 
 // Register 把 write_file / edit_file 注册到 r。
@@ -55,8 +58,73 @@ func (g LocalWriteGroup) Register(r *agent.ToolRegistry) {
 	)
 }
 
+// claimOrWait 尝试 TryClaim；失败时排队等待前任释放后重试一次。
+// 返回 nil 表示声明成功（调用方需 defer Release）。
+// 返回 error 表示最终失败（含占用者信息）。
+// LLM 感知不到排队——阻塞发生在工具函数内部，对 LLM 而言只是工具调用耗时变长。
+func (g LocalWriteGroup) claimOrWait(ctx context.Context, path, verb string) error {
+	claimed, err := g.Roster.TryClaim(g.AgentID, path)
+	if err != nil {
+		return fmt.Errorf("文件锁声明失败: %w", err)
+	}
+	if claimed {
+		return nil
+	}
+
+	// 首次声明失败——文件被占用
+	occupiedBy, _, _ := g.Roster.IsOccupied(path)
+
+	timeout := time.Duration(g.WaitTimeoutSec) * time.Second
+	if timeout <= 0 {
+		return fmt.Errorf("文件 %s 正被代理 %s 占用，无法%s", path, occupiedBy, verb)
+	}
+
+	// Trace：入队事件
+	trace.Emit(trace.Event{
+		Kind:        trace.KindFileWriteQueued,
+		TaskID:      agent.TaskIDFromContext(ctx),
+		AgentID:     g.AgentID,
+		Path:        path,
+		Description: fmt.Sprintf("等待 %s 释放文件", occupiedBy),
+	})
+
+	start := time.Now()
+	waitErr := g.Roster.WaitForRelease(ctx, g.AgentID, path, timeout)
+	waitDuration := time.Since(start)
+
+	if waitErr != nil {
+		// 超时或 ctx 取消
+		return fmt.Errorf("文件 %s 正被代理 %s 占用（等待 %dms 后超时），无法%s",
+			path, occupiedBy, waitDuration.Milliseconds(), verb)
+	}
+
+	// 被唤醒，重试一次 TryClaim
+	claimed, err = g.Roster.TryClaim(g.AgentID, path)
+	if err != nil {
+		return fmt.Errorf("文件锁声明失败: %w", err)
+	}
+	if !claimed {
+		occupiedBy, _, _ = g.Roster.IsOccupied(path)
+		return fmt.Errorf("文件 %s 正被代理 %s 占用（排队唤醒后被抢先），无法%s", path, occupiedBy, verb)
+	}
+
+	log.Printf("[roster] %s 排队等待文件 %s 成功（等待 %dms）", g.AgentID, path, waitDuration.Milliseconds())
+
+	// Trace：排队结束，记录实际等待耗时
+	trace.Emit(trace.Event{
+		Kind:    trace.KindFileWriteQueued,
+		TaskID:  agent.TaskIDFromContext(ctx),
+		AgentID: g.AgentID,
+		Path:    path,
+		WaitMS:  waitDuration.Milliseconds(),
+		Description: "排队等待结束，成功获得文件锁",
+	})
+
+	return nil
+}
+
 // writeFile 实现 write_file 工具。端口自 worker.makeWriteFileTool。
-// 严格顺序：validate → TryClaim → (defer Release) → MkdirAll → WriteFile → 缓存失效。
+// 严格顺序：validate → claimOrWait → (defer Release) → MkdirAll → WriteFile → 缓存失效。
 // 注：expected_hash 校验在 C7 后由 ValidateExpectedHashHook 接管，不再在工具内部读取。
 func (g LocalWriteGroup) writeFile(ctx context.Context, args map[string]any) (string, error) {
 	path, _ := args["path"].(string)
@@ -77,14 +145,9 @@ func (g LocalWriteGroup) writeFile(ctx context.Context, args map[string]any) (st
 		path = validPath
 	}
 
-	// 通过 Roster 声明文件写入权——必须在任何文件读取之前
-	claimed, err := g.Roster.TryClaim(g.AgentID, path)
-	if err != nil {
-		return "", fmt.Errorf("文件锁声明失败: %w", err)
-	}
-	if !claimed {
-		occupiedBy, _, _ := g.Roster.IsOccupied(path)
-		return "", fmt.Errorf("文件 %s 正被代理 %s 占用，无法写入", path, occupiedBy)
+	// §8.3：通过 claimOrWait 声明文件写入权——冲突时排队等待前任释放
+	if err := g.claimOrWait(ctx, path, "写入"); err != nil {
+		return "", err
 	}
 	defer g.Roster.Release(g.AgentID, path)
 
@@ -151,14 +214,9 @@ func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (str
 		path = validPath
 	}
 
-	// 通过 Roster 声明文件写入权——必须在任何文件读取之前
-	claimed, err := g.Roster.TryClaim(g.AgentID, path)
-	if err != nil {
-		return "", fmt.Errorf("文件锁声明失败: %w", err)
-	}
-	if !claimed {
-		occupiedBy, _, _ := g.Roster.IsOccupied(path)
-		return "", fmt.Errorf("文件 %s 正被代理 %s 占用，无法编辑", path, occupiedBy)
+	// §8.3：通过 claimOrWait 声明文件写入权——冲突时排队等待前任释放
+	if err := g.claimOrWait(ctx, path, "编辑"); err != nil {
+		return "", err
 	}
 	defer g.Roster.Release(g.AgentID, path)
 

@@ -51,6 +51,12 @@ type Config struct {
 	// 默认 3000 对应 ~6000 字符中文或 ~12000 字符英文。
 	// 参考 nextUpgrade_v3.md §8.4.6 的 token 预算规划。
 	TransferNoteMaxTokens int `yaml:"transfer_note_max_tokens" json:"transfer_note_max_tokens"`
+	// RosterWaitTimeoutSec 是文件冲突排队的最大等待时间（秒）。当 TryClaim 失败时，
+	// 工具层调用 Roster.WaitForRelease 阻塞等待前任释放，超时后放弃并返回"���用"错误。
+	// 设为 0 表示不排队（退回旧行为：立即返回错误）。
+	// 参考 nextUpgrade_v3.md §8.3 文件冲突排队设计。
+	RosterWaitTimeoutSec int `yaml:"roster_wait_timeout_sec" json:"roster_wait_timeout_sec"`
+
 	SearchAPIProvider       string `yaml:"search_api_provider" json:"search_api_provider"`
 	SearchAPIURL            string `yaml:"search_api_url" json:"search_api_url"`
 	SearchAPIKey            string `yaml:"search_api_key" json:"search_api_key"`
@@ -85,7 +91,8 @@ func DefaultConfig() *Config {
 		MailNotifierIntervalSec: 5,
 		MailNotifierEnabled:     true, // Phase 2 完成；4 项防御已就绪，恢复默认启用
 		MailChainMaxDepth:       3,    // Phase 2 新增；与 hookSystem.md §3.2 一致
-		TransferNoteMaxTokens:   3000, // Sprint 3 #5 TransferNote 默认预算
+		TransferNoteMaxTokens:   3000, // Sprint 3 #5 TransferNote ���认预算
+		RosterWaitTimeoutSec:    30,   // §8.3 文件冲突排队默认等待 30 秒
 		SearchAPIProvider:       "duckduckgo_html",
 	}
 }
