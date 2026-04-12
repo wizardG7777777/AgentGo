@@ -710,10 +710,10 @@ type Writer struct {
 
 ### 待启动专项：写入事务化（触发条件：v3 §7/§8.1/§8.3 全部落地后）
 
-**触发条件**：
-- v3 §7 Agent Hook 框架 + TeamAwarenessHook 已落地
-- v3 §8.1 Scheduler 分配感知已落地
-- v3 §8.3 Roster 写入排队已落地
+**触发条件**（截至 2026-04-12 进度）：
+- ✅ v3 §7 Agent Hook 框架 + TeamAwarenessHook 已落地（Sprint 1 `91f9c74`）
+- ✅ v3 §8.1 Scheduler 分配感知已落地（Sprint 3 `14384e9`）
+- ⏳ v3 §8.3 Roster 写入排队**仍待实现**——最后一块拼图
 
 **复盘步骤**：
 1. 在实际多 Worker 负载下运行系统测试，复现原 4 项退化
@@ -817,4 +817,7 @@ LLM 想编也编不出来。
 - **2026-04-08 第二轮**：Explorer 越权拒绝、EventType 严格匹配、可恢复错误受 MaxRetries 约束、终态崩溃汇报邮件、校验反馈注入历史、basename 兜底、Task.LastResponse 持久化
 - **2026-04-09 架构决策**：删除 git/worktree 子系统，回归"所有 worker 共享 ProjectRoot"的简单模型；6 项 worktree 相关条目（4 P0 + 2 已修复）一并清出本文档
 - **2026-04-09 邮件级联临时禁用**：`mail_notifier_enabled=false` 默认；恢复条件见对应条目
-- **下一阶段目标**：(a) 修复 scheduler report_done 事实校对（独立 P0，非架构层）；(b) 按 nextUpgrade_v3.md 顺序推进 P1-P2（§7 Agent Hook / §8.1 Scheduler 分配感知 / §8.3 Roster 排队 / §8.4 TransferNote / §9.6 Artifacts 持久化），落地后复盘"多代理协同残留退化"条目里的 ① 是否还残留、②④ 是否需要单独立"写入事务化"专项
+- **2026-04-12 Sprint 1**：v3 §7 Agent Hook 框架 + TeamAwarenessHook 落地（commit `91f9c74`），硬编码 TeamSnapshot 注入被清理，§8.2 执行孤岛消除 + §8.7 GoalAnchor 随之完成
+- **2026-04-12 Sprint 2**：v3 §9.6 Artifacts 持久化落地（commit `d0bc65e`），方案 B JSONL append-only，`.agentgo/state/artifacts.jsonl`
+- **2026-04-12 Sprint 3**：v3 §8.1 Scheduler 分配感知 + §8.4 TransferNote 最小版（L1+L3+defer recover）双落地（commit `14384e9`）
+- **下一阶段目标**：(a) 推进 v3 §8.3 Roster 写入排队——"多代理协同残留退化" ① 复盘的最后一块拼图；(b) 完成后复盘 ①②④，决定是否立"写入事务化"专项；(c) 其余 P2 候选（v3 §1-4 行哈希增强 / §9.1 工具集分层 / §9.9 Session 化日志）按需选做
