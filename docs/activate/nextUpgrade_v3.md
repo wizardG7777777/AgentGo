@@ -843,7 +843,18 @@ Agent Hook §7 已设计了四个注入点（PhaseTaskStart / PhaseLoopPre / Pha
 
 ### 8.3 文件冲突排队（P2）
 
+> 状态：✅ **已完成**（Sprint 4 2026-04-12，commit `f6552d4`）
 > 关联：v2 §3.2（冲突避免）
+
+**落地实现**：
+
+- [`internal/roster/iface.go`](../../internal/roster/iface.go) — `Roster` 接口新增 `WaitForRelease(ctx, agentID, filePath, timeout) error`
+- [`internal/roster/memory.go`](../../internal/roster/memory.go) — `MemoryRoster` 实现 FIFO 等待队列（`waiters map[string][]waiter`）；`Release` / `ReleaseAll` 释放时 `notifyFirstWaiter` 唤醒队首；`removeWaiter` 清理超时/取消的 waiter 防内存泄漏
+- [`internal/tools/local_write.go`](../../internal/tools/local_write.go) — `claimOrWait` helper 消除 writeFile / editFile 的 TryClaim 重复；冲突时排队等待 → 唤醒后重试一次 TryClaim，LLM 感知不到排队
+- [`internal/trace/event.go`](../../internal/trace/event.go) — `KindFileWriteQueued` 事件 + `QueueLen` / `WaitMS` 字段
+- [`internal/config/config.go`](../../internal/config/config.go) — `RosterWaitTimeoutSec` 默认 30 秒
+- 系统日志记录排队事件（含 waiter 队列长度 + 持有者 ID + 等待耗时），用于排查异常长等待
+- 测试覆盖：roster 8 用例（FIFO / 超时 / ctx 取消 / 快路径 / 清理 / ReleaseAll 通知）+ tools 4 用例（排队成功 / 超时回退 / 禁用兼容 / editFile 路径）
 
 **问题**：当前 `TryClaim` 返回 false 后，agent 只看到"被 worker-2 占用"的错误字符串，没有后续路径。LLM 可能空转重试、可能放弃、可能跑偏——行为不可预期。
 
@@ -1376,7 +1387,7 @@ GoalRefreshInterval int  // 配置项，默认 3 轮
 | P1 | §8.2 执行孤岛消除（Agent Hook §7） | — | ✅ 已完成（Sprint 1 2026-04-12，随 §7 TeamAwarenessHook 一起落地） |
 | P1 | §8.7 GoalAnchor 目标锚点 | §7 TeamAwarenessHook | ✅ 已完成（Sprint 1 2026-04-12，作为 TeamAwarenessHook 的 GoalAnchor section） |
 | P2 | §8.1 Scheduler 分配感知 | boardSnapshot | ✅ 已完成（Sprint 3 2026-04-12） |
-| P2 | §8.3 文件冲突排队 | Roster 接口扩展 | 📝 待实现（过渡方案） |
+| P2 | §8.3 文件冲突排队 | Roster 接口扩展 | ✅ 已完成（Sprint 4 2026-04-12，WaitForRelease FIFO 过渡方案） |
 | P2 | §8.4 TransferNote 跨 Agent 上下文传递 | Model + Store + agent.go | ✅ 最小版已完成（Sprint 3 2026-04-12，L1+L3+defer recover；L2 延期） |
 | P3 | §8.6 进度通知 | Mailbox + agent.go | 📝 待实现 |
 
