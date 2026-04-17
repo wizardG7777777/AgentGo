@@ -115,7 +115,7 @@ func runShellApprovalCase(t *testing.T, command string, userInput *string, cance
 			{Content: "done"},
 		},
 	}
-	w := NewWithID("worker-1", s, r, workerLLM, cfg, nil, nil, approvalCh, nil, nil, nil, nil, nil, nil)
+	w := NewWithID("worker-1", s, r, workerLLM, cfg, nil, nil, approvalCh, nil, nil, nil, nil, nil, nil, nil)
 	w.agent.PollInterval = 10 * time.Millisecond
 	w.agent.IdleThreshold = 0
 

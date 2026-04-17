@@ -102,7 +102,7 @@ func TestExplorerE2E_TeamSnapshotInjected(t *testing.T) {
 	asv := agent.NewStoreHookAdapter(sv)
 	var arv hook.AgentRosterView = r
 
-	exp := New(s, r, mock, cfg, nil, reg, nil, nil, nil, ahr, asv, arv)
+	exp := New(s, r, mock, cfg, nil, reg, nil, nil, nil, ahr, asv, arv, nil)
 	exp.agent.PollInterval = 10 * time.Millisecond
 	exp.agent.IdleThreshold = 3
 

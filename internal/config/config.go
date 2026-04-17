@@ -64,6 +64,43 @@ type Config struct {
 	// Shell 命令拦截配置（追加到默认规则）
 	ShellBlacklist []string `yaml:"shell_blacklist" json:"shell_blacklist"`
 	ShellGreylist  []string `yaml:"shell_greylist" json:"shell_greylist"`
+
+	// 工具集分层配置（Tool Set Profiles，nextUpgrade_v3 §9.1）。
+	// 命名工具集：profile_name → [tool_name, ...]
+	// 留空时所有 agent 使用各自代码内置的默认工具集（向后兼容）。
+	ToolProfiles map[string][]string `yaml:"tool_profiles" json:"tool_profiles"`
+	// WorkerProfile / ExplorerProfile 指定各 agent 类型使用的工具集名称。
+	// 留空 = 注册全部可用工具（向后兼容）。
+	// 值必须是 ToolProfiles 中已定义的 key，否则启动报错。
+	// Scheduler 不走 profile（其工具强耦合于一等代理角色，不开放配置）。
+	WorkerProfile   string `yaml:"worker_profile" json:"worker_profile"`
+	ExplorerProfile string `yaml:"explorer_profile" json:"explorer_profile"`
+}
+
+// ResolveProfile 根据 profile 名称从 ToolProfiles 中查找工具列表。
+//   - name 为空 → 返回 nil（意为"允许全部工具"，向后兼容）
+//   - name 不存在于 ToolProfiles → 返回 error（配置笔误应立即暴露）
+func (c *Config) ResolveProfile(name string) ([]string, error) {
+	if name == "" {
+		return nil, nil
+	}
+	if c.ToolProfiles == nil {
+		return nil, fmt.Errorf("tool profile %q 未找到：tool_profiles 未定义", name)
+	}
+	tools, ok := c.ToolProfiles[name]
+	if !ok {
+		return nil, fmt.Errorf("tool profile %q 未找到，可用的 profile: %v", name, profileKeys(c.ToolProfiles))
+	}
+	return tools, nil
+}
+
+// profileKeys 返回 map 的所有 key（用于错误消息）。
+func profileKeys(m map[string][]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func DefaultConfig() *Config {
