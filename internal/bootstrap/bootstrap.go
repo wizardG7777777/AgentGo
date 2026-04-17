@@ -23,6 +23,7 @@ import (
 	"agentgo/internal/scheduler"
 	"agentgo/internal/shell"
 	"agentgo/internal/store"
+	"agentgo/internal/tools"
 	"agentgo/internal/trace"
 	"agentgo/internal/watchdog"
 	"agentgo/internal/webtool"
@@ -151,7 +152,13 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	if err := hookReg.Register(builtin.NewRequireReadBeforeWriteHook(storeView)); err != nil {
 		return nil, fmt.Errorf("注册 RequireReadBeforeWriteHook 失败: %w", err)
 	}
-	fmt.Println("[启动] Hook 系统初始化完成（已注册：record-artifact, path-boundary, validate-expected-hash, require-read-before-write）")
+	if err := hookReg.Register(builtin.NewDependencyValidatorHook(storeView)); err != nil {
+		return nil, fmt.Errorf("注册 DependencyValidatorHook 失败: %w", err)
+	}
+	if err := hookReg.Register(builtin.NewEnforceExpectedArtifactsHook(storeView, cfg.ProjectRoot)); err != nil {
+		return nil, fmt.Errorf("注册 EnforceExpectedArtifactsHook 失败: %w", err)
+	}
+	fmt.Println("[启动] Hook 系统初始化完成（已注册：record-artifact, path-boundary, validate-expected-hash, require-read-before-write, dependency-validator, enforce-expected-artifacts）")
 
 	// Step 3: 初始化花名册
 	r := roster.NewMemoryRoster()
@@ -251,9 +258,25 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	// Step 6: 创建看门狗（先于 scheduler 创建——scheduler 需要 approvalCh，但 watchdog 不需要）
 	w := watchdog.New(taskStore, cfg, eventCh, r)
 
+	// Step 6.5: 解析工具集 profile（§9.1 Tool Set Profiles）
+	workerAllowed, err := cfg.ResolveProfile(cfg.WorkerProfile)
+	if err != nil {
+		return nil, fmt.Errorf("worker profile 解析失败: %w", err)
+	}
+	explorerAllowed, err := cfg.ResolveProfile(cfg.ExplorerProfile)
+	if err != nil {
+		return nil, fmt.Errorf("explorer profile 解析失败: %w", err)
+	}
+	// 校验 profile 中的工具名拼写
+	for profileName, toolNames := range cfg.ToolProfiles {
+		if err := tools.ValidateToolNames(toolNames); err != nil {
+			return nil, fmt.Errorf("tool_profiles.%s 校验失败: %w", profileName, err)
+		}
+	}
+
 	// Step 7: 创建调查代理（复用与 Worker 相同的 SearchProvider 配置）
 	explorerSearchProvider := webtool.NewProvider(cfg.SearchAPIProvider, cfg.SearchAPIURL, cfg.SearchAPIKey)
-	exp := explorer.New(taskStore, r, explorerLLM, cfg, cancelRegistry, mbRegistry, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView, explorerSearchProvider)
+	exp := explorer.New(taskStore, r, explorerLLM, cfg, cancelRegistry, mbRegistry, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView, explorerAllowed, explorerSearchProvider)
 
 	// Step 7.5: 创建命令审批通道（Worker→CLI）
 	approvalCh := make(chan shell.ApprovalRequest, 8)
@@ -278,7 +301,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 			"", // system prompt 由 worker 内部管理
 			time.Duration(cfg.LLMTimeoutSec)*time.Second,
 		)
-		wk := worker.NewWithID(fmt.Sprintf("worker-%d", i), taskStore, r, workerLLM, cfg, cancelRegistry, mbRegistry, approvalCh, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView)
+		wk := worker.NewWithID(fmt.Sprintf("worker-%d", i), taskStore, r, workerLLM, cfg, cancelRegistry, mbRegistry, approvalCh, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView, workerAllowed)
 		workers = append(workers, wk)
 	}
 
@@ -349,7 +372,11 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
 		defer s.wg.Done()
 		s.Explorer.Run(ctx)
 	}()
-	fmt.Println("[启动] 调查代理已启动")
+	if s.Config.ExplorerProfile != "" {
+		fmt.Printf("[启动] 调查代理已启动 [profile=%s]\n", s.Config.ExplorerProfile)
+	} else {
+		fmt.Println("[启动] 调查代理已启动")
+	}
 
 	// Step 8: 启动执行代理
 	for _, wk := range s.Workers {
@@ -360,7 +387,11 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
 			wk.Run(ctx)
 		}()
 	}
-	fmt.Printf("[启动] 执行代理已启动 (%d 个)\n", len(s.Workers))
+	if s.Config.WorkerProfile != "" {
+		fmt.Printf("[启动] 执行代理已启动 (%d 个) [profile=%s]\n", len(s.Workers), s.Config.WorkerProfile)
+	} else {
+		fmt.Printf("[启动] 执行代理已启动 (%d 个)\n", len(s.Workers))
+	}
 
 	fmt.Println("[启动] 系统就绪，等待用户输入")
 }

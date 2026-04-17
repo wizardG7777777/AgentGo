@@ -109,7 +109,7 @@ type Worker struct {
 // 2026-04-08 决定彻底删除 git 依赖，回归"所有 worker 共享 ProjectRoot"的简单模型。
 // 多代理协同安全（并发写、原子性、回滚等）留待按真实失败模式重新设计。
 func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry, mbRegistry *mailbox.Registry, approvalCh chan<- shell.ApprovalRequest, hookReg *hook.ToolHookRegistry, storeView store.StoreHookView, recordToolCall func(string, store.ToolCallRecord), agentHookReg *hook.AgentHookRegistry, agentStoreView hook.AgentStoreView, agentRosterView hook.AgentRosterView) *Worker {
-	return NewWithID("worker-1", s, r, llmClient, cfg, cancelReg, mbRegistry, approvalCh, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView)
+	return NewWithID("worker-1", s, r, llmClient, cfg, cancelReg, mbRegistry, approvalCh, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView, nil)
 }
 
 // NewWithID 创建指定 ID 的执行代理，支持多 Worker 实例。
@@ -119,7 +119,7 @@ func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.C
 //   - agentHookReg / agentStoreView / agentRosterView: Agent Hook（Sprint 1）接入点
 //
 // 两组参数均允许 nil——对应 hook 路径退化为 no-op，既有行为与改动前一致。
-func NewWithID(agentID string, s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry, mbRegistry *mailbox.Registry, approvalCh chan<- shell.ApprovalRequest, hookReg *hook.ToolHookRegistry, storeView store.StoreHookView, recordToolCall func(string, store.ToolCallRecord), agentHookReg *hook.AgentHookRegistry, agentStoreView hook.AgentStoreView, agentRosterView hook.AgentRosterView) *Worker {
+func NewWithID(agentID string, s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry, mbRegistry *mailbox.Registry, approvalCh chan<- shell.ApprovalRequest, hookReg *hook.ToolHookRegistry, storeView store.StoreHookView, recordToolCall func(string, store.ToolCallRecord), agentHookReg *hook.AgentHookRegistry, agentStoreView hook.AgentStoreView, agentRosterView hook.AgentRosterView, allowedTools []string) *Worker {
 	holder := &currentTaskHolder{}
 	fileCache := agent.NewFileStateCache(50)
 	workdir := &tools.DefaultWorkdir{ProjectRoot: cfg.ProjectRoot}
@@ -136,7 +136,7 @@ func NewWithID(agentID string, s store.TaskStore, r roster.Roster, llmClient llm
 
 	// 通过 ToolGroup 组合 Worker 的全量工具集
 	readGroup := tools.LocalReadGroup{Workdir: workdir, Cache: fileCache}
-	toolReg := agent.NewToolRegistry()
+	toolReg := agent.NewToolRegistryWithAllowlist(allowedTools)
 	tools.RegisterGroups(toolReg,
 		readGroup,
 		tools.LocalWriteGroup{

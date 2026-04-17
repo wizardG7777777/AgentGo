@@ -13,4 +13,27 @@ agent_max_loops: 50
 event_channel_buffer: 64
 default_timeout_sec: 300
 worker_count: 3
-worktree_enabled: true
+
+# 工具集分层配置（§9.1 Tool Set Profiles）
+tool_profiles:
+  worker_standard:
+    - read_file
+    - list_dir
+    - grep_search
+    - glob_search
+    - write_file
+    - edit_file
+    - run_shell
+    - web_search
+    - web_fetch
+    - publish_task
+    - send_message
+  explorer_codebase:
+    - read_file
+    - list_dir
+    - grep_search
+    - glob_search
+    - send_message
+
+worker_profile: "worker_standard"
+explorer_profile: "explorer_codebase"

@@ -49,3 +49,4 @@ setting.yaml
 .mcp.json
 .idea
 .claude/settings.local.json
+test_multi_agent.yaml

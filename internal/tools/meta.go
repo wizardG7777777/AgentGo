@@ -66,7 +66,7 @@ func (g MetaGroup) Register(r *agent.ToolRegistry) {
 				String("description", "任务的详细描述", true).
 				String("event_type", "任务类型，留空表示由 Worker 认领；填 \"explore\" 表示交给 Explorer 调查", false).
 				Enum("priority", "任务优先级，默认 normal", []string{"low", "normal", "high"}, false).
-				String("dependencies", "逗号分隔的依赖任务 ID 列表，留空表示无依赖", false).
+				String("dependencies", "逗号分隔的依赖任务 UUID 列表。每个 ID 必须是之前 publish_task 调用返回的真实 task UUID（形如 7b52b232-4e9b-4b97-8bbc-f3d5927dc814），禁止使用占位符（如 \"task-part1\"、\"A\"、\"<id>\"）或自造 ID。若被依赖任务尚未发布，请先发布被依赖任务、从返回值中读取 id 之后再发布当前任务。留空表示无依赖", false).
 				String("expected_artifacts", "逗号分隔的预期产出文件路径列表（相对项目根的相对路径）。任务结束时系统会校验这些文件是否真的写入；缺失则任务失败重试。强烈建议为'报告/总结/文档'类任务填写此字段以防止 report-only 失败", false).
 				Build(),
 			g.publishTask,
@@ -156,6 +156,18 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 			if p != "" {
 				task.ExpectedArtifacts = append(task.ExpectedArtifacts, p)
 			}
+		}
+	}
+
+	// 校验 dependencies：每个依赖任务必须真实存在于 Store 中（层 B 兜底）。
+	//
+	// 主校验已由 hook/builtin.DependencyValidatorHook 承担（层 A），它会在 PreCall
+	// 阶段做 UUID 格式前置校验 + store 存在性校验，并返回指导性错误消息。
+	// 本处保留最简兜底的原因与 PathBoundaryHook 决策 A1 一致：即使所有 hook 被
+	// 禁用（V6/V9 回归验证场景），也不能让永远无法满足的依赖进入 store。
+	for _, depID := range task.Dependencies {
+		if _, err := g.Store.GetTask(depID); err != nil {
+			return "", fmt.Errorf("依赖任务 %s 不存在（meta 层兜底校验）", depID)
 		}
 	}
 

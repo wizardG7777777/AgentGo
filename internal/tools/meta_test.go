@@ -232,6 +232,52 @@ func TestPublishTask_MissingDescription(t *testing.T) {
 	}
 }
 
+func TestPublishTask_InvalidDependency_Rejected(t *testing.T) {
+	s := newFakeStore()
+	g := MetaGroup{Store: s}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description":  "task with bad dep",
+		"dependencies": "nonexistent-task-id",
+	}))
+	if err == nil {
+		t.Fatal("expected error for nonexistent dependency, got nil")
+	}
+	if !strings.Contains(err.Error(), "依赖任务 nonexistent-task-id 不存在") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+	if len(s.createCalls) != 0 {
+		t.Fatalf("expected no task created, got %d", len(s.createCalls))
+	}
+}
+
+func TestPublishTask_ValidDependency_Accepted(t *testing.T) {
+	s := newFakeStore()
+	existing := &model.Task{ID: "real-dep", Depth: 0, Status: model.TaskStatusCompleted}
+	s.tasks[existing.ID] = existing
+
+	g := MetaGroup{Store: s}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description":  "task with valid dep",
+		"dependencies": "real-dep",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(s.createCalls) != 1 {
+		t.Fatalf("expected 1 task created, got %d", len(s.createCalls))
+	}
+	created := s.createCalls[0]
+	if len(created.Dependencies) != 1 || created.Dependencies[0] != "real-dep" {
+		t.Fatalf("expected dependencies=[real-dep], got %v", created.Dependencies)
+	}
+}
+
 // ---- S1: BatchTracker integration ----
 
 // recordingBatchTracker captures every AppendBatch call.

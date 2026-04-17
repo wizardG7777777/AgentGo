@@ -63,7 +63,7 @@ type Explorer struct {
 //   - agentHookReg / agentStoreView / agentRosterView: Agent Hook（Sprint 1）接入点
 //
 // 两组参数均允许 nil——对应 hook 路径退化为 no-op。
-func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry, mbRegistry *mailbox.Registry, hookReg *hook.ToolHookRegistry, storeView store.StoreHookView, recordToolCall func(string, store.ToolCallRecord), agentHookReg *hook.AgentHookRegistry, agentStoreView hook.AgentStoreView, agentRosterView hook.AgentRosterView, searchProvider ...webtool.SearchProvider) *Explorer {
+func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.Config, cancelReg *store.TaskCancelRegistry, mbRegistry *mailbox.Registry, hookReg *hook.ToolHookRegistry, storeView store.StoreHookView, recordToolCall func(string, store.ToolCallRecord), agentHookReg *hook.AgentHookRegistry, agentStoreView hook.AgentStoreView, agentRosterView hook.AgentRosterView, allowedTools []string, searchProvider ...webtool.SearchProvider) *Explorer {
 	const agentID = "explorer-1"
 	fileCache := agent.NewFileStateCache(50)
 	workdir := &tools.DefaultWorkdir{ProjectRoot: cfg.ProjectRoot}
@@ -74,7 +74,7 @@ func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.C
 	}
 
 	// 通过 ToolGroup 组合 Explorer 的只读 + 网络工具集
-	toolReg := agent.NewToolRegistry()
+	toolReg := agent.NewToolRegistryWithAllowlist(allowedTools)
 	tools.RegisterGroups(toolReg,
 		tools.LocalReadGroup{Workdir: workdir, Cache: fileCache},
 		tools.WebGroup{Provider: sp},

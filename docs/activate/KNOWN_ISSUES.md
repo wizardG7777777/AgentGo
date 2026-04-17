@@ -769,6 +769,307 @@ LLM 想编也编不出来。
 
 ---
 
+## 2026-04-13 多 Worker 系统测试 — 新发现（3 项）
+
+测试配置：`worker_count: 3`，1 个 explorer，1 个 scheduler。测试输入："请把 internal/config/config.go 中的所有配置项按功能分组，并将调查内容写在项目根目录中的一个 test_result.md 文件中，要求利用所有可用的 worker 去进行调查。"
+
+任务最终成功完成（`test_result.md` 103 行，内容正确），但暴露以下问题。
+
+### ~~Scheduler 首次发布使用虚假依赖 ID（LLM 幻觉）~~（已彻底修复 2026-04-14）
+
+**位置**：`internal/tools/meta.go` (`MetaGroup.publishTask`) + `internal/hook/builtin/dependency_validator.go` + `internal/scheduler/scheduler.go` system prompt
+
+**严重程度**：~~🔴 P1~~ → ✅ 已关闭
+
+**现象**（2026-04-13 15:47 复现）：
+
+Scheduler 在 loop=1 发布了一个汇总任务，声明 `dependencies: "task-part1,task-part2,task-part3"` —— 这是字符串字面量占位符，不是真实的 task UUID。此时 3 个上游探索任务**尚未被发布**。
+
+```
+15:47:46  loop=1 publish_task dependencies="task-part1,task-part2,task-part3"  ← 虚假 ID
+15:48:15  [watchdog] task 3075340e dependency task-part1 not found, cancelling  ← 正确取消
+15:48:34  loop=2 publish_task ×3（真实 explore 任务）                          ← 自我恢复
+15:51:53  loop=3 publish_task dependencies="a46d2683,66a95667,7b52b232"        ← 正确 UUID
+```
+
+**根因**：三个层面同时缺失约束，导致 LLM 幻觉无阻碍进入 store：
+1. **工具参数描述过于宽泛**：[meta.go:69](../../internal/tools/meta.go#L69) 的 `dependencies` 描述仅说"任务 ID 列表"，未说明必须是真实 UUID
+2. **Prompt 示例用了占位符写法**：[scheduler.go:194-197](../../internal/scheduler/scheduler.go#L194-L197) 的正例 2 使用 `A = ...` / `<A 的 task_id>` 人类数学符号，LLM 具象化为自造字符串
+3. **缺少时序规则**：Prompt 未显式说明 Immediate 模式必须按"bottom-up"顺序发布；LLM 天然 top-down 规划，先写最终目标再铺细节
+
+**彻底修复**（2026-04-14，四层防御）：
+
+| 层 | 文件 | 内容 |
+|----|------|------|
+| 层 1 工具描述 | [meta.go:69](../../internal/tools/meta.go#L69) | `dependencies` 参数描述升级为明确要求真实 UUID + 禁止占位符 + 先发布再引用 |
+| 层 2 prompt 示例 | [scheduler.go:193-208](../../internal/scheduler/scheduler.go#L193-L208) | 正例 2 改写为"两步发布"显式流程，展示真实 UUID 从返回值流转到 dependencies |
+| 层 3 时序规则 | [scheduler.go](../../internal/scheduler/scheduler.go) 新增"任务发布顺序规则" | 明确 Immediate 模式必须 bottom-up；禁用占位符 |
+| 层 A 主校验 hook | [hook/builtin/dependency_validator.go](../../internal/hook/builtin/dependency_validator.go) (新) | UUID 正则 + store 存在性 + 指导性错误消息（占位符/未发布分支） |
+| 层 A 注册 | [bootstrap.go:154-157](../../internal/bootstrap/bootstrap.go#L154-L157) | `hookReg.Register(NewDependencyValidatorHook(storeView))` |
+| 层 B meta 兜底 | [meta.go:162-171](../../internal/tools/meta.go#L162-L171) | 保留最简 `GetTask` 兜底，禁用所有 hook 时仍生效（参照 PathBoundaryHook 决策 A1） |
+
+**关键设计决策**：
+
+1. **把主校验放进 hook 系统**，而非 tool 内部。原因：与现有 4 个 PreCall 校验 hook（PathBoundary / ValidateExpectedHash / RequireReadBeforeWrite / RecordArtifact）模式完全对齐，可保留 V6/V9 "禁用所有 hook → 行为基本一致" 的可逆性。
+2. **双层校验**：hook 做丰富反馈（UUID 正则 + 指导性错误），meta.go 保留最简 `GetTask` 兜底。禁用 hook 时 meta.go 兜底仍阻止挂起任务进入 store。
+3. **指导性错误消息**：区分"UUID 格式错误（占位符幻觉）"和"UUID 格式对但 store 中不存在（时序错误）"两种场景，给 LLM 明确的自纠正路径。
+
+**回归保护**：
+- [hook/builtin/dependency_validator_test.go](../../internal/hook/builtin/dependency_validator_test.go)：13 个用例覆盖占位符（含 2026-04-13 实际幻觉样本 `task-part1` / `<A 的 task_id>` 等）、格式合法但 store 缺失、空/空白输入、混合合法+占位符、非 string 类型、nil store 降级
+- 全量测试（22 包）通过，无回归
+
+**2026-04-14 真实多 Worker 系统测试验证结果**：
+
+复测复用 2026-04-13 完全相同的输入（`worker_count: 3` + "请把 internal/config/config.go 中的所有配置项按功能分组..."）。关键指标：
+
+| 指标 | 修复前（2026-04-13） | 修复后（2026-04-14） |
+|------|--------------------|--------------------|
+| **总耗时**（输入→report_done） | 9 min 20 sec | **6 min 26 sec**（提速 ~31%）|
+| **占位符依赖出现次数** | 1 次 | **0 次** ✅ |
+| **DependencyValidatorHook Abort 次数** | N/A | **0 次**（LLM 根本没尝试占位符）|
+| **Watchdog 取消虚假依赖任务** | 1 次 | **0 次** ✅ |
+| **Worker 利用率** | 1/3（只 worker-3 做事） | **3/3（全部并行）** ✅ |
+
+**有意思的行为变化**：Scheduler 本次 3 次 publish_task 全部 `dependencies: (absent)`——它选择了"自己在 reactLoop 里 read_file 3 个 worker 产出并合成 test_result.md"的路径，而不是用 dependencies 委托一个第 4 个 worker 任务。这说明新 prompt 的"任务发布顺序规则"让 LLM 主动选择了更简单的路径，依赖关系被显式表达为"scheduler 自己等待 + 读取"，而非 `dependencies` 字段。这是修复的**意外收获**——LLM 不再错误地尝试使用 dependencies，也不再产生占位符，整体任务编排更健壮。
+
+**状态**：✅ **已修复并真实场景验证通过**（2026-04-14）。
+
+---
+
+### Scheduler 路由过度偏向 Explorer 导致 Worker 全程空闲
+
+**位置**：`internal/scheduler/scheduler.go`（scheduler system prompt 路由指引段）+ `internal/scheduler/agent_registry.go`（§8.1 特化代理注册表）
+
+**严重程度**：🟡 P2（功能正确但资源利用极低）
+
+**现象**（2026-04-13 15:48–15:50）：
+
+用户要求"利用所有可用的 worker 去进行调查"。Scheduler 把 3 个调查子任务全部发布为 `event_type="explore"`。系统只有 1 个 explorer 实例，3 个任务串行执行（耗时 ~2 分 20 秒）。同时 3 个 worker 全程空闲。最终只有 worker-3 执行了 1 个 write 汇总任务。
+
+```
+时间线（全部 explorer-1 串行）：
+15:48:34  explore 7b52b232 开始
+15:49:36  explore 7b52b232 完成 → a46d2683 开始
+15:50:23  explore a46d2683 完成 → 66a95667 开始
+15:50:56  explore 66a95667 完成
+15:51:53  write d11366fb 开始（worker-3）
+15:53:51  write d11366fb 完成
+
+Worker-1, Worker-2: 全程 0 个任务
+```
+
+**根因**：§8.1 Scheduler 分配感知的路由指引把"调查/分析/只读"任务一律引导到 `event_type="explore"`。但通用 worker 同样配备 `read_file` / `grep_search` / `list_dir` 等只读工具，完全有能力执行只读调查。当前路由指引没有考虑"探索任务数量 > explorer 实例数量"时的负载均衡。
+
+**修复方向**：
+- Scheduler system prompt 路由指引段增加负载感知规则："如果待发布的只读调查任务数量超过 explorer 的可用数量（board snapshot 中 `specialized_agents[explore].count - busy`），超出部分应发布为默认 event_type（由通用 worker 认领），避免 explorer 成为串行瓶颈。"
+- board snapshot 中 `specialized_agents` 已包含 `count` 和 `busy` 字段，LLM 有足够信息做此判断
+- 可选：长期方案可考虑动态 explorer 实例数（`explorer_count` 配置项），但 MVP 阶段 prompt 引导优先
+
+**2026-04-14 两轮复测观察**：同样输入下，两次 scheduler 都把调查任务**全部发布为 `event_type=""`**（通用 worker），未使用 explore 路径。可能是新加的"任务发布顺序规则"段让 LLM 对 event_type 选择也更谨慎。连续 2 次未复现后，优先级降为 P3 观察。
+
+**状态**：🟢 **P3 降级观察**。根因（prompt 路由指引缺少"explore 任务数 > explorer 实例数时的降级规则"）未消除，但自然场景下不再触发。保留条目，如未来用户明确要求"走 explorer"时再复现则升级。
+
+---
+
+### Worker 汇总任务未 read_file 上游产出文件（"先读后写"红线软性复现）
+
+**位置**：`internal/worker/worker.go`（worker system prompt "先读后写"红线段）
+
+**严重程度**：🟡 P2 观察中（本次未造成数据错误）
+
+**现象**（2026-04-13 15:51–15:53）：
+
+Worker-3 认领汇总任务 d11366fb（依赖 3 个 explorer 调查结果），全程工具调用：
+
+```
+loop=0: write_file(test_result.md)  ← 直接写，未先 read_file
+loop=1: (纯文本响应，任务完成)
+```
+
+Worker-3 没有调用 `read_file` 去读取任何上游产出文件。它完全依赖 `depResults`（依赖任务的 SubmitResult 文本注入）中的二手总结生成了报告。
+
+**为什么本次未出错**：3 个 explorer 任务没有文件产出（只有文本分析结果），`depResults` 中的文本已包含完整的配置项分析，worker-3 据此生成的报告内容正确。
+
+**为什么仍需关注**：这与 2026-04-08 "Worker 凭空捏造任务结果" P0 事件的模式相同——worker 跳过 `read_file` 直接 `write_file`。区别在于当时上游有文件产出但 worker 没读，导致内容捏造；本次上游无文件产出，`depResults` 文本足够，所以碰巧正确。如果未来汇总任务的上游有文件产出（如 explorer 把分析写入 .md），worker 仍可能跳过 read_file 而依赖二手文本。
+
+**修复方向**：
+- Worker system prompt "先读后写"红线段增加强化："即使 depResults 中已有上游文本总结，如果上游任务有文件产出（在 `<upstream-transfer-notes>` 或 `<dependency-artifacts>` 中列出），你**必须先 read_file 这些文件**，不要仅凭文本总结生成下游产出。"
+- 当前 `RequireReadBeforeWriteHook` 检查的是"本任务内是否 read 过再 write"，无法检测"是否 read 了上游的产出文件"。可考虑扩展 hook 或新增专用检查
+
+**2026-04-14 两轮复测观察**：两轮测试中上游任务都返回纯文本无文件产出（scheduler 意识到调查类任务不需要落盘），场景未触发。优先级降为 P3 观察。
+
+**状态**：🟢 **P3 降级观察**。保留条目以防未来上游任务有文件产出时回归（比如 explorer 先做调查并把分析写入 .md，worker 基于此汇总），届时若 worker 仍跳过 read_file 则升级修复优先级。
+
+---
+
+## 2026-04-14 多 Worker 系统测试复测 — 新发现（3 项）
+
+在验证 DependencyValidatorHook 修复效果的复测中，暴露以下新问题。DependencyValidatorHook 本身修复完全成功（见上方条目），以下 3 项是其他维度的观察。
+
+### ~~Expected_artifacts 路径漂移 + 二次被 require-read-before-write 拦截~~（已彻底修复 2026-04-14）
+
+**位置**：`internal/worker/worker.go`（"路径字面执行"prompt 段，曾于 2026-04-08 第二轮修复过）
+
+**严重程度**：🟡 P1（每次漂移浪费 30-50 秒，本次 3 个 worker 全部触发）
+
+**现象**（2026-04-14 16:27–16:31）：
+
+Scheduler 发布 3 个 worker 任务，每个都声明 `expected_artifacts: "config_group{N}_*.md"`。Worker 实际 write_file 时使用了**不同的文件名**（如 `config_fields_analysis.md`）。系统校验检测到漂移后触发任务重试。
+
+更麻烦的是重试路径上：worker 重试时尝试写入正确的文件名，但因为从未 `read_file` 过该文件名 → 被 `require-read-before-write` Abort → worker 先 read（读到上次重试留下的内容）再 write。每个 worker 都走了一遍这个循环：
+
+```
+worker-3: config_fields_analysis.md（错）→ 重试 → config_group1_*.md 被 hook 拒 → read → 重写
+worker-2: 初次直接被 hook 拒 config_group2_*.md → read → 重写
+worker-1: test_result.md + config_group3_*.md 漂移 → 重试 → hook 拒 → read → 重写
+```
+
+3 次 `require-read-before-write` 拒绝事件清晰可见于 trace 文件。每次漂移+重试约浪费 30-50 秒。
+
+**根因**：
+1. **Worker prompt 的"路径字面执行"段不够强**。Worker 看到 `expected_artifacts` 时，可能自由联想"什么名字更合适"而非字面使用
+2. **`RequireReadBeforeWriteHook` 在重试场景下的交互不理想**：重试时任务历史被 rollback，worker 不知道自己上次已经写过（不同名字的）文件
+
+**修复方向**：
+- Worker system prompt 加强红线："**expected_artifacts 中的字符串就是 write_file 的 path 参数的字面值**，一字不差。禁止根据任务内容自由联想文件名。"
+- 可选：在 `publishTask` 工具层加入提示，把 expected_artifacts 也塞进 description 的标准位置（如 "【产出文件】..."），提高 LLM 注意力
+
+**彻底修复**（2026-04-14）：新增 `EnforceExpectedArtifactsHook`（PreCall Priority=35），对 `write_file` / `edit_file` 做字面匹配校验：
+
+- 任务声明了 `expected_artifacts` → write_file 的 path 参数（规范化后）必须严格等于列表中任一条字符串
+- 不匹配 → Abort，指导 LLM 三种合法出路：(1) 修正为字面路径；(2) send_message 向 scheduler 请求补充声明；(3) 改为文本响应总结
+- 任务未声明 expected_artifacts → 不限制（free-form 任务保留原有自由度）
+- 规范化：用 `normalizeArtifactPath` 处理 `./foo.md` / `foo.md` 等变体
+
+**分层设计**（参照 DependencyValidatorHook / PathBoundaryHook 决策 A1）：
+- 层 A（本 hook）：PreCall 严格精确匹配，第一次 write_file 就拦下漂移，避免"漂移 → PostCall 失败 → 重试 → require-read-before-write 拦 → read → 重写"的浪费循环
+- 层 B（`agent.checkExpectedArtifacts`）：PostCall 末尾校验 + basename 容忍（2026-04-08 第二轮）保留作为禁用 hook 时的兜底，保证 V6/V9 可逆性
+
+**顺带解决**：同一 hook 也直接拦住 "Worker 越权写 test_result.md" 问题——worker-1 的 expected_artifacts 只有 `config_group3_*.md` 时，它试图写 `test_result.md` 会被同样拒绝。
+
+**回归保护**：[hook/builtin/enforce_expected_artifacts_test.go](../../internal/hook/builtin/enforce_expected_artifacts_test.go) 14 用例覆盖：精确匹配 / 多路径 / `./foo.md` 规范化 / 未声明 expected（free-form）/ 实际漂移样本（`config_group1_scheduler_agent_llm.md` vs `config_fields_analysis.md`）/ 目录前缀漂移 / 越权写 test_result.md / nil store 降级 / task 不存在 / path 缺失。全量 22 包测试通过无回归。
+
+**状态**：✅ 已修复（2026-04-14），待下一次多 Worker 系统测试验证真实场景下 wall-clock 耗时的改善幅度。
+
+---
+
+### ~~Worker 越权写上层文件 test_result.md，与 scheduler 意图冲突~~（已彻底修复 2026-04-14，随上一条一起）
+
+**位置**：worker 任务描述生成（scheduler publish_task）+ worker prompt 的"落盘契约"段
+
+**严重程度**：🟡 P2（行为正确但路径混乱；hook 挡住了实际损害）
+
+**现象**（2026-04-14 16:29:34）：
+
+Worker-1 的任务是调查 group 3 并写入 `config_group3_transfer_search_shell.md`。它在 loop=1 同时写入了两个文件：
+- `test_result.md`（7701 bytes，**本来是 scheduler 要在最后写的最终产出**）
+- `config_group3_transfer_search_shell.md`（2000 bytes，正确的分组产物）
+
+随后 scheduler 在 loop=4 也尝试写 test_result.md，**被 `require-read-before-write` 拦截**（scheduler 没 read 过），loop=5 scheduler 先 read 了 worker-1 写的版本，loop=6 才覆盖写入。
+
+最终 artifacts 记录：
+```
+任务 302040aa (worker-1) [completed]:
+  └─ test_result.md                     ← 不是它该写的
+  └─ config_group3_transfer_search_shell.md
+```
+
+**根因**：Worker 任务描述中提到了"最终会汇总到 test_result.md"这一背景信息，worker 可能把它解读为"我该写 test_result.md"。Scheduler 的 prompt 没有强制区分"每个 worker 只负责自己的分组文件"。
+
+**修复方向**：
+- Scheduler publish_task 的 description 中**明确写**："你只需要写 `{expected_artifacts}`，**不要写任何其他文件**，尤其不要写用户要求的最终产物（那是 scheduler 的职责）。"
+- 或者 worker prompt 加入"禁止写 expected_artifacts 清单之外的文件"硬规则（可能误伤合法场景，慎用）
+
+**备注**：这次 `require-read-before-write` hook 意外地成为了兜底——它让 scheduler 被迫 read 了 worker-1 的版本，避免盲写覆盖。但这是侥幸，不是设计意图。
+
+**状态**：✅ 已修复（2026-04-14 随 `EnforceExpectedArtifactsHook` 一起解决，见上条）。Hook 对 worker-1 试图写 `test_result.md` 会直接 Abort，worker 只能乖乖写 `config_group3_*.md`。
+
+---
+
+### 日志/trace 中 agent_id 为空（重试路径的 context 注入遗漏）
+
+**位置**：`internal/agent/agent.go`（`processTask` 的 retry 路径）+ `internal/agent/llm_executor.go`（`WithAgentContext`）
+
+**严重程度**：🟢 P3（日志瑕疵，不影响功能）
+
+**现象**（2026-04-14 16:28:18 / 16:30:01 / 16:30:29）：
+
+任务 rollback 重试的瞬间，终端日志中出现 agent ID 为空的行：
+
+```
+2026/04/14 16:28:18 [agent ] task=1e1fa901-... loop=0 tool=write_file ...
+2026/04/14 16:30:01 [agent ] task=e3a60d02-... loop=0 tool=write_file ...
+2026/04/14 16:30:29 [agent ] task=302040aa-... loop=0 tool=write_file ...
+```
+
+对应 trace 文件中这些 tool_call / tool_result 事件的 `agent_id` 字段也可能是空串。
+
+**根因**：`processTask` 在触发 `RetryRollback` 或重新调用 `Execute` 时，没有把 agent ID 重新写入 context。`llm_executor.go` 的日志路径从 `ctx.Value(agentIDKey)` 读取，读到空串。
+
+**修复方向**：
+- 检查 `processTask` 所有重试分支，确保每次进入循环前都调用 `WithAgentContext(ctx, a.ID, loopIdx)`
+- 或把 agent ID 注入点从 context 上移到 goroutine 启动位置，持久生效
+
+**状态**：⏳ P3 待修复（不紧急，但建议顺手修，因为调试时会误导）
+
+---
+
+## 2026-04-14 多 Worker 系统测试（二次验证）— EnforceExpectedArtifactsHook 效果
+
+测试时间：18:21:56 → 18:25:21（**3 min 25 sec**）。相同输入、相同配置（worker_count=3）。
+
+### 总耗时三连跳
+
+| 版本 | 耗时 | 相对首次提速 | 核心改动 |
+|------|------|-------------|---------|
+| 2026-04-13 坏基线 | 9 min 20 sec | — | 占位符依赖 + 虚假依赖 watchdog 取消 |
+| 2026-04-14 上午 | 6 min 26 sec | 31% | +DependencyValidatorHook |
+| 2026-04-14 下午 | **3 min 25 sec** | **63%** ✅ | +EnforceExpectedArtifactsHook |
+
+相比上次运行再次提速 47%。
+
+### Hook 效果验证
+
+**EnforceExpectedArtifactsHook 本次 0 次触发**——但这**不是 hook 无效**，而是成功改变了 LLM 行为：
+
+- Scheduler 主动采取了更优策略：**3 个调查任务无 expected_artifacts 声明**（纯文本返回），仅最终汇总任务声明 `expected_artifacts: "test_result.md"`
+- 上次运行 scheduler 对所有调查任务都塞 expected_artifacts，worker 在漂移时才被 PostCall 校验拦；本次 scheduler 精准用在了"真正需要文件产出"的场景上
+- 这是 hook 存在 + 错误消息指导 + prompt 澄清的综合效应
+
+**Dependencies 这次被正确使用**：loop 4 的 publish_task 含真实 UUID：
+```
+dependencies="89ee56c6-...,749d697f-...,5e5b8bdd-..."
+expected_artifacts="test_result.md"
+```
+
+Scheduler 按完美的 bottom-up 顺序：先发 3 个调查任务拿到 UUID，再发汇总任务引用。**零占位符，零漂移，零越权**。
+
+### 仍有的一个小瑕疵
+
+`require-read-before-write` 在 loop=0 拦了 worker-1 一次（~38 秒浪费）。根因是 `test_result.md` 因上次测试残留真实存在（7817 bytes 旧内容），hook 正确执行"先读后写"。这**不是代码 bug**——只需在每次测试前清理残留文件即可。建议在测试指南中加入：
+
+```bash
+rm -f test_result.md config_*.md && go run main.go -config test_multi_agent.yaml
+```
+
+### 未复现的问题 → 降级观察
+
+- **Scheduler 路由偏向 Explorer**：连续 2 次（16:xx、18:xx）未复现。本次 scheduler 全部用 `event_type=""` 发给 worker，未触发 explorer 瓶颈。根因 prompt 未修改，但自然场景下未再出现——可能新 prompt 规则也让 LLM 更谨慎选择 event_type
+- **Worker 汇总未 read_file 上游产出**：本次无上游文件产出，场景未触发
+- **agent_id 日志为空**：本次无任务 rollback 重试，未复现
+
+### 产出物检查
+
+```
+test_result.md   3996 bytes   ← 唯一新产物，路径字面等于 expected_artifacts
+```
+
+无漂移文件（上次遗留的 `config_fields_analysis.md` / `config_group*.md` 是 16:xx 时段的历史残留）。
+
+**总评**：多 Worker 系统测试连续两轮累计 5 项 hook 相关修复 + prompt 改造后，**总耗时压缩到原始的 ~1/3**。调度质量、并发度、路径正确性、语义正确性全面提升。
+
+---
+
 ## 总览
 
 | 缺陷 | 状态 |
@@ -802,13 +1103,19 @@ LLM 想编也编不出来。
 | Scheduler 提前 report_done | ✅ 已修复（2026-04-10 Phase 3：SchedulerExecutor.waitForBatchTerminal 在 LLM 调用之前同步等待 batch 完成，从根本上消除"LLM 看到 pending 状态而误调 report_done"的可能；SchedulerGroup.report_done 的硬拦截作为最后兜底） |
 | **Scheduler report_done 后不终止 reactLoop（幻觉心跳循环）** | ✅ **已修复**（2026-04-10 Phase 3.1：currentSchedulerTaskHolder 加 done 标志 + tools.SchedulerDoneNotifier 接口让 reportDone 通知 + scheduler.SchedulerDoneChecker 接口让 SchedulerExecutor 在下一轮 Execute 入口短路返回 ToolCalled=false） |
 | **Scheduler 事件响应延迟 3 分钟** | ✅ **已关闭**（2026-04-12 实测简单请求延迟上限 ~1 分钟，与 ticker 边界吻合；Phase 3 重构已消除旧根因） |
-| **Trace 多 goroutine 写入竞争** | 🟡 **P1 复核**（trace 系统已实现，需确认上锁覆盖） |
+| **Trace 多 goroutine 写入竞争** | ✅ **已修复**（`sync.Mutex` 全程覆盖 + 并发单测验证） |
 | **邮件级联爆炸**（4 根因叠加） | ✅ **已修复**（2026-04-09，Phase 2 完成；Mailbox Hook 框架 + 4 项根因全部关闭，`mail_notifier_enabled=true` 默认） |
 | **Scheduler report_done 不基于 Artifacts** | ✅ **已修复**（2026-04-10 Phase 3 scheduler 重构为 agent.Agent 实例，自动获得 RecordArtifactHook + 事实校对块 + read_file 自查） |
 | **架构决策：删除 git 依赖** | ✅ **已执行**（2026-04-09，删除 internal/isolation/ 等全部 worktree 接线，19 包测试全绿） |
 | **多代理协同残留退化**（并发写 ① / 回滚 ② / 跨任务可见性 ③ / 杀任务清理 ④） | 🟡 **分解跟踪**（2026-04-12 重新框定）。① 由 v3 §7 + §8.1 + §8.3 三层叠加覆盖 ~90%，随 P1-P2 自然落地；②④ 同构于"写入事务化"，待 P1-P2 落地后单独立项；③ 暂不列为退化（当前"共享 ProjectRoot"是 2026-04-09 主动架构选择，先让它以有意设计存在） |
+| **Scheduler 首次发布使用虚假依赖 ID** | ✅ **已修复并验证**（2026-04-14 彻底修复四层防御 + 真实多 Worker 系统测试验证：0 次占位符 / 0 次 hook Abort / 提速 31%） |
+| **Scheduler 路由过度偏向 Explorer 导致 Worker 空闲** | 🟢 **P3 降级观察**（连续 2 次复测（2026-04-14 上午+下午）均未复现；prompt 路由规则未改但 LLM 自然采取通用 worker 路径。根因未消除，若未来用户显式要求走 explorer 时仍可能触发） |
+| **Worker 汇总任务未 read_file 上游产出文件** | 🟢 **P3 降级观察**（2026-04-13 单次发现，2026-04-14 两轮复测均未触发场景；保留条目以防未来上游有文件产出时回归） |
+| **Expected_artifacts 路径漂移 + require-read-before-write 二次拦截** | ✅ **已修复**（2026-04-14 新增 EnforceExpectedArtifactsHook，PreCall 严格精确匹配，14 用例单测覆盖，包含 2026-04-14 实际漂移样本） |
+| **Worker 越权写 test_result.md，与 scheduler 意图冲突** | ✅ **已修复**（2026-04-14 随 EnforceExpectedArtifactsHook 一起解决，worker 不在 expected_artifacts 清单内的 path 会被 Abort） |
+| **日志/trace 中 agent_id 为空（重试路径）** | 🟢 **P3 待修复**（2026-04-14 复测发现；日志瑕疵，不影响功能） |
 
-**27/29 项已修复。剩余：1 项 E2E 测试 + 1 项"写入事务化"专项（待 v3 §7/§8.1/§8.3 落地后立项）。Trace 多 goroutine 竞争经核实已被 `internal/trace/writer.go` 的 `sync.Mutex` 全程覆盖，可在下次文档整理时一并标记为已修复。**
+**30/35 项已修复。剩余：1 项 E2E 测试 + 1 项"写入事务化"专项 + 3 项 P3 观察级（路由偏向 / Worker 未 read_file / agent_id 空）。2026-04-14 下午第二轮多 Worker 测试耗时降至 3 min 25 sec（相比 2026-04-13 坏基线提速 63%），连续 2 次复测中 P2 路由偏向 + Worker 未 read_file 两项均未复现，已降级为 P3。**
 
 > 注：6 项 worktree 相关条目（Worktree 相对路径解析、Worktree Remove git 失忆兜底、Worktree merge 假成功、Main 工作区脏状态、Git 分支 ref 泄漏、Worktree 重试丢上下文）已于 2026-04-09 整体清出本文档 — 详细复盘随 `internal/isolation` 包一同消失。仅在"架构决策：删除 git 依赖"段保留作为历史索引。
 
@@ -821,4 +1128,12 @@ LLM 想编也编不出来。
 - **2026-04-12 Sprint 2**：v3 §9.6 Artifacts 持久化落地（commit `d0bc65e`），方案 B JSONL append-only，`.agentgo/state/artifacts.jsonl`
 - **2026-04-12 Sprint 3**：v3 §8.1 Scheduler 分配感知 + §8.4 TransferNote 最小版（L1+L3+defer recover）双落地（commit `14384e9`）
 - **2026-04-12 Sprint 4**：v3 §8.3 Roster 写入排队落地（commit `f6552d4`），WaitForRelease FIFO 过渡方案 + 系统日志排队事件 + trace 事件。"多代理协同残留退化" ① 复盘触发条件已**全部满足**
-- **下一阶段目标**：(a) 复盘 ①②④，决定是否立"写入事务化"专项；(b) 其余 P2 候选（v3 §1-4 行哈希增强 / §9.1 工具集分层 / §9.9 Session 化日志）按需选做
+- **2026-04-13 多 Worker 系统测试**：3 worker + 1 explorer 配置，任务成功但暴露 3 项新问题——Scheduler 虚假依赖 ID（P1）、路由过度偏向 Explorer（P2）、Worker 汇总未 read_file 上游产出（P2 观察中）。并发写退化 ①②④ 未被本次测试覆盖（任务性质为只读调查 + 单文件写入，需设计针对性并发写测试）
+- **2026-04-13 临时修复**：Scheduler 虚假依赖 ID 已在 `meta.go` 增加 dependencies 存在性硬校验 + 单测覆盖，状态转为"待复杂真实场景验证"；路由负载感知仍为 P2 待修复。
+- **2026-04-14 Scheduler 虚假依赖 ID 彻底修复**：四层防御落地——工具描述明确 UUID + prompt 示例改写为"两步发布"+ 新增"任务发布顺序规则"段 + `DependencyValidatorHook`（UUID 正则 + store 存在性 + 指导性错误消息，挂在 PreCall Priority=25）+ meta.go 保留 `GetTask` 兜底（参照 PathBoundaryHook 决策 A1）。13 用例单测覆盖占位符幻觉样本（含 `task-part1` / `<A 的 task_id>` 等真实观察到的样本），全量 22 包测试通过无回归
+- **2026-04-14 真实场景验证通过**：复测 2026-04-13 完全相同的输入，提速 31%（9m20s → 6m26s），0 次占位符 / 0 次 hook Abort / 0 次 watchdog 取消；有意思的行为变化——scheduler 主动放弃使用 dependencies，选择自己 read 3 个 worker 产出并合成汇总文件的路径。同时发现 3 项新问题：expected_artifacts 路径漂移（P1）、worker 越权写 test_result.md（P2）、agent_id 日志为空（P3）
+- **下一阶段目标**：(a) 修复 expected_artifacts 路径漂移 P1（每次复测都触发，是耗时主要来源）；(b) 仍按原方向修复路由负载感知（本次未复现但根因未消除）；(c) 设计并发写场景测试，复盘 ①②④；(d) 其余 P2/P3 顺手修
+- **2026-04-14 Expected_artifacts 彻底修复**：新增 `EnforceExpectedArtifactsHook`（PreCall Priority=35），严格精确匹配 `write_file` / `edit_file` 的 path 与 `task.ExpectedArtifacts`；14 用例单测覆盖包括实际漂移样本（`config_group1_scheduler_agent_llm.md` vs `config_fields_analysis.md`）、越权写 test_result.md、`./foo.md` 规范化等。一个 hook 同时解决 P1（路径漂移）+ P2（越权写）两个问题。全量 22 包测试通过无回归
+- **下一阶段下一阶段目标**：(a) 重跑多 Worker 系统测试，实测 expected_artifacts 修复后的 wall-clock 改善幅度（预期节省每 worker ~90s）；(b) 修复 Scheduler 路由负载感知（仍未实施）；(c) Worker 读上游产出 prompt 强化；(d) 设计并发写测试复盘 ①②④
+- **2026-04-14 下午第二轮多 Worker 测试验证**：耗时 3 min 25 sec（相比坏基线 9 min 20 sec 提速 63%；相比上次 6 min 26 sec 再提速 47%）。`EnforceExpectedArtifactsHook` 本次 0 次触发——但这恰恰证明它改变了 LLM 行为：scheduler 改用"调查任务返回纯文本 + 汇总任务写 expected_artifacts"的清晰分工，零漂移零越权。Scheduler 这次还主动使用 dependencies 字段引用真实 UUID（零占位符）。连续 2 次复测中 P2 路由偏向 + Worker 未 read_file 两项均未复现，降级为 P3 观察
+- **下一阶段目标 (rev3)**：(a) 设计针对性的并发写场景测试，复盘退化 ①②④；(b) 处理 P3 级剩余条目（agent_id 日志瑕疵）；(c) 考虑实施 v3 §1-4 行哈希增强 / §9.1 工具集分层 / §9.9 Session 化日志等 P2 候选

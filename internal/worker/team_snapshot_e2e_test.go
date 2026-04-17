@@ -146,7 +146,7 @@ func TestWorkerE2E_TeamSnapshotInjectedOnceOnFirstExecution(t *testing.T) {
 
 	ahr := buildTestAgentHookReg(t, s, reg)
 	asv, arv := buildTestHookViews(s, r)
-	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil, nil, nil, nil, ahr, asv, arv)
+	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil, nil, nil, nil, ahr, asv, arv, nil)
 	w.agent.PollInterval = 10 * time.Millisecond
 	w.agent.IdleThreshold = 3
 
@@ -223,7 +223,7 @@ func TestWorkerE2E_TeamSnapshotNotInjectedWhenRetrying(t *testing.T) {
 	}
 	ahr := buildTestAgentHookReg(t, s, reg)
 	asv, arv := buildTestHookViews(s, r)
-	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil, nil, nil, nil, ahr, asv, arv)
+	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil, nil, nil, nil, ahr, asv, arv, nil)
 	w.agent.PollInterval = 10 * time.Millisecond
 	w.agent.IdleThreshold = 3
 
@@ -280,7 +280,7 @@ func TestWorkerE2E_TeamSnapshotTruncatesLongBusyDescription(t *testing.T) {
 	}
 	ahr := buildTestAgentHookReg(t, s, reg)
 	asv, arv := buildTestHookViews(s, r)
-	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil, nil, nil, nil, ahr, asv, arv)
+	w := NewWithID("worker-1", s, r, mock, cfg, nil, reg, nil, nil, nil, nil, ahr, asv, arv, nil)
 	w.agent.PollInterval = 10 * time.Millisecond
 	w.agent.IdleThreshold = 3
 
