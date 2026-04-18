@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"agentgo/internal/model"
+	"agentgo/internal/session"
 
 	"github.com/google/uuid"
 )
@@ -41,11 +42,22 @@ type MemoryTaskStore struct {
 	// log 写入失败只打印 warning，不回滚内存状态——这保证"内存是真相来源"，
 	// 下次启动最多丢失最后一条 record，不会出现"task 声称成功但 artifact 凭空消失"。
 	artifactLog *ArtifactLog
+	// historyEmitter 是事件溯源日志的发射接口。可选——nil 时跳过所有事件发射。
+	// 通过 SetHistoryEmitter 注入，避免对 session.HistoryLog 的硬依赖。
+	historyEmitter session.HistoryEmitter
 }
 
 // SetCancelRegistry 注入 per-task cancel context 管理器。
 func (s *MemoryTaskStore) SetCancelRegistry(r *TaskCancelRegistry) {
 	s.cancelRegistry = r
+}
+
+// SetHistoryEmitter 注入事件溯源日志发射器。nil 为合法——表示禁用事件发射。
+// 必须在 bootstrap 早期调用（在任何写操作可能发生之前）。
+func (s *MemoryTaskStore) SetHistoryEmitter(e session.HistoryEmitter) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.historyEmitter = e
 }
 
 // SetArtifactLog 注入 artifact 持久化 log。nil 为合法——表示禁用持久化。
@@ -101,7 +113,6 @@ func NewMemoryTaskStore(eventCh chan<- model.Event, fifoLimit, defaultConcurrenc
 
 func (s *MemoryTaskStore) PublishTask(task *model.Task) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	task.ID = uuid.New().String()
 	task.Status = model.TaskStatusPending
@@ -128,15 +139,25 @@ func (s *MemoryTaskStore) PublishTask(task *model.Task) error {
 	}
 
 	s.tasks[task.ID] = task
+	s.mu.Unlock()
+
+	// Emit history event outside the lock
+	s.emitHistory(session.HistEventTaskPublished, map[string]any{
+		"task_id":      task.ID,
+		"description":  task.Description,
+		"priority":     task.Priority,
+		"event_type":   task.EventType,
+		"dependencies": task.Dependencies,
+	})
 	return nil
 }
 
 func (s *MemoryTaskStore) ClaimTask(agentID string, taskID string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	task, ok := s.tasks[taskID]
 	if !ok {
+		s.mu.Unlock()
 		return ErrTaskNotFound
 	}
 
@@ -146,16 +167,19 @@ func (s *MemoryTaskStore) ClaimTask(agentID string, taskID string) error {
 		for _, depID := range task.Dependencies {
 			dep, exists := s.tasks[depID]
 			if !exists || dep.Status != model.TaskStatusCompleted {
+				s.mu.Unlock()
 				return ErrDependencyNotMet
 			}
 		}
 	} else if task.Status == model.TaskStatusProcessing {
 		// Already processing, just check concurrency
 	} else {
+		s.mu.Unlock()
 		return fmt.Errorf("cannot claim task in %s state", task.Status)
 	}
 
 	if len(task.Agents) >= task.MaxConcurrency {
+		s.mu.Unlock()
 		return ErrConcurrencyFull
 	}
 
@@ -166,26 +190,35 @@ func (s *MemoryTaskStore) ClaimTask(agentID string, taskID string) error {
 		task.StartedAt = time.Now()
 	}
 
+	s.mu.Unlock()
+
+	s.emitHistory(session.HistEventTaskClaimed, map[string]any{
+		"task_id":  taskID,
+		"agent_id": agentID,
+	})
 	return nil
 }
 
 func (s *MemoryTaskStore) SubmitResult(agentID string, taskID string, result string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	task, ok := s.tasks[taskID]
 	if !ok {
+		s.mu.Unlock()
 		return ErrTaskNotFound
 	}
 	if task.Status != model.TaskStatusProcessing {
+		s.mu.Unlock()
 		return ErrTaskNotProcessing
 	}
 
 	if !s.removeAgent(task, agentID) {
+		s.mu.Unlock()
 		return ErrAgentNotInTask
 	}
 
 	task.Results[agentID] = result
+	outputLen := len(result)
 
 	if len(task.Agents) == 0 {
 		task.Status = model.TaskStatusCompleted
@@ -197,6 +230,13 @@ func (s *MemoryTaskStore) SubmitResult(agentID string, taskID string, result str
 		s.sendEvent(model.Event{Type: model.EventTaskCompleted, TaskID: taskID})
 	}
 
+	s.mu.Unlock()
+
+	s.emitHistory(session.HistEventTaskSubmitted, map[string]any{
+		"task_id":    taskID,
+		"agent_id":   agentID,
+		"output_len": outputLen,
+	})
 	return nil
 }
 
@@ -244,13 +284,14 @@ func (s *MemoryTaskStore) TransitionState(taskID string, from, to model.TaskStat
 // 与 TransitionState 不同，此方法会设置 task.Error 字段，确保错误信息持久化到 Store。
 func (s *MemoryTaskStore) FailTask(agentID string, taskID string, reason string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	task, ok := s.tasks[taskID]
 	if !ok {
+		s.mu.Unlock()
 		return ErrTaskNotFound
 	}
 	if task.Status != model.TaskStatusProcessing {
+		s.mu.Unlock()
 		return ErrTaskNotProcessing
 	}
 
@@ -266,6 +307,12 @@ func (s *MemoryTaskStore) FailTask(agentID string, taskID string, reason string)
 	}
 	s.sendEvent(model.Event{Type: model.EventTaskFailed, TaskID: taskID})
 
+	s.mu.Unlock()
+
+	s.emitHistory(session.HistEventTaskFailed, map[string]any{
+		"task_id": taskID,
+		"error":   reason,
+	})
 	return nil
 }
 
@@ -298,22 +345,25 @@ func (s *MemoryTaskStore) FailTaskBySystem(taskID string, reason string) error {
 
 func (s *MemoryTaskStore) RetryRollback(agentID string, taskID string, reason string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	task, ok := s.tasks[taskID]
 	if !ok {
+		s.mu.Unlock()
 		return ErrTaskNotFound
 	}
 	if task.Status != model.TaskStatusProcessing {
+		s.mu.Unlock()
 		return ErrTaskNotProcessing
 	}
 
 	if !s.removeAgent(task, agentID) {
+		s.mu.Unlock()
 		return ErrAgentNotInTask
 	}
 
 	task.RetryCount++
 	task.RetryReasons = append(task.RetryReasons, reason)
+	retryCount := task.RetryCount
 
 	if len(task.Agents) == 0 {
 		task.Status = model.TaskStatusPending
@@ -323,6 +373,13 @@ func (s *MemoryTaskStore) RetryRollback(agentID string, taskID string, reason st
 		s.sendEvent(model.Event{Type: model.EventTaskRetry, TaskID: taskID})
 	}
 
+	s.mu.Unlock()
+
+	s.emitHistory(session.HistEventTaskRetry, map[string]any{
+		"task_id":     taskID,
+		"retry_count": retryCount,
+		"reason":      reason,
+	})
 	return nil
 }
 
@@ -725,4 +782,146 @@ func (s *MemoryTaskStore) sendEvent(event model.Event) {
 	case s.eventCh <- event:
 	default:
 	}
+}
+
+// emitHistory emits a history event if the emitter is set. Failures are logged
+// as warnings and never propagated — event emission must not break the main flow.
+// Must be called outside s.mu to avoid deadlock (HistoryLog.Append acquires its own lock).
+func (s *MemoryTaskStore) emitHistory(eventType string, payload map[string]any) {
+	s.mu.RLock()
+	emitter := s.historyEmitter
+	s.mu.RUnlock()
+	if emitter == nil {
+		return
+	}
+	ev := session.HistoryEvent{
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		EventType: eventType,
+		Payload:   payload,
+	}
+	if err := emitter.Append(ev); err != nil {
+		log.Printf("[store] WARN history emit %s failed: %v", eventType, err)
+	}
+}
+
+// ExportSnapshot 导出所有非终态任务为 []session.TaskSnapshot。
+// 终态任务（completed/cancelled/failed）被跳过。
+func (s *MemoryTaskStore) ExportSnapshot() []session.TaskSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var snaps []session.TaskSnapshot
+	for _, task := range s.tasks {
+		if model.IsTerminal(task.Status) {
+			continue
+		}
+		snap := session.TaskSnapshot{
+			ID:                task.ID,
+			Description:       task.Description,
+			Priority:          task.Priority,
+			Dependencies:      copyStrings(task.Dependencies),
+			Status:            string(task.Status),
+			Agents:            copyStrings(task.Agents),
+			MaxConcurrency:    task.MaxConcurrency,
+			Results:           copyStringMap(task.Results),
+			Error:             task.Error,
+			RetryCount:        task.RetryCount,
+			RetryReasons:      copyStrings(task.RetryReasons),
+			TimeoutSeconds:    task.TimeoutSeconds,
+			EventSource:       task.EventSource,
+			EventType:         task.EventType,
+			SystemPrompt:      task.SystemPrompt,
+			Depth:             task.Depth,
+			Artifacts:         copyStrings(task.Artifacts),
+			ExpectedArtifacts: copyStrings(task.ExpectedArtifacts),
+			TransferNote:      task.TransferNote,
+			MailChainDepth:    task.MailChainDepth,
+			CreatedAt:         formatTime(task.CreatedAt),
+			StartedAt:         formatTime(task.StartedAt),
+		}
+		snaps = append(snaps, snap)
+	}
+	return snaps
+}
+
+// ImportSnapshot 从 TaskSnapshot 列表恢复任务到 store。
+// 清空现有任务后，将每个 snapshot 转换为 model.Task 并写入。
+func (s *MemoryTaskStore) ImportSnapshot(tasks []session.TaskSnapshot) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 清空现有状态
+	s.tasks = make(map[string]*model.Task)
+	s.completed = make([]string, 0)
+	s.toolCalls = make(map[string]map[string][]ToolCallRecord)
+
+	for _, snap := range tasks {
+		createdAt, err := parseTime(snap.CreatedAt)
+		if err != nil {
+			return fmt.Errorf("parse created_at for task %s: %w", snap.ID, err)
+		}
+		startedAt, _ := parseTime(snap.StartedAt) // empty string → zero time
+
+		task := &model.Task{
+			ID:                snap.ID,
+			Description:       snap.Description,
+			Priority:          snap.Priority,
+			Dependencies:      copyStrings(snap.Dependencies),
+			Status:            model.TaskStatus(snap.Status),
+			Agents:            copyStrings(snap.Agents),
+			MaxConcurrency:    snap.MaxConcurrency,
+			Results:           copyStringMap(snap.Results),
+			Error:             snap.Error,
+			RetryCount:        snap.RetryCount,
+			RetryReasons:      copyStrings(snap.RetryReasons),
+			TimeoutSeconds:    snap.TimeoutSeconds,
+			EventSource:       snap.EventSource,
+			EventType:         snap.EventType,
+			SystemPrompt:      snap.SystemPrompt,
+			Depth:             snap.Depth,
+			Artifacts:         copyStrings(snap.Artifacts),
+			ExpectedArtifacts: copyStrings(snap.ExpectedArtifacts),
+			TransferNote:      snap.TransferNote,
+			MailChainDepth:    snap.MailChainDepth,
+			CreatedAt:         createdAt,
+			StartedAt:         startedAt,
+		}
+		s.tasks[task.ID] = task
+	}
+	return nil
+}
+
+// copyStrings 返回字符串切片的副本。nil 输入返回空切片。
+func copyStrings(src []string) []string {
+	if src == nil {
+		return []string{}
+	}
+	dst := make([]string, len(src))
+	copy(dst, src)
+	return dst
+}
+
+// copyStringMap 返回 map[string]string 的副本。nil 输入返回空 map。
+func copyStringMap(src map[string]string) map[string]string {
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+// formatTime 将 time.Time 格式化为 RFC3339 字符串。零值返回空字符串。
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+// parseTime 将 RFC3339 字符串解析为 time.Time。空字符串返回零值。
+func parseTime(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse(time.RFC3339, s)
 }

@@ -9,6 +9,7 @@ import (
 	"agentgo/internal/config"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
+	"agentgo/internal/probe"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
 )
@@ -81,6 +82,21 @@ type SchedulerExecutor struct {
 	// nil 时 specialized_agents 字段被 omitempty 省略。
 	AgentRegistry *AgentRegistry
 
+	// ToolHealth（可选）：Bootstrap 阶段的工具可用性探测结果。
+	// 通过 SnapshotSources 传递给 BuildBoardJSON。
+	// nil 时 board snapshot 不输出 unavailable_tools 字段。
+	ToolHealth *probe.ToolHealthStatus
+
+	// WorkerProfiles（可选）：每个 Worker 的 profile 映射（agentID → profile 名称）。
+	// 通过 SnapshotSources 传递给 BuildBoardJSON，用于在 agentSnapshot 中填充 Profile 字段。
+	// nil 时不输出 profile 字段（向后兼容）。
+	WorkerProfiles map[string]string
+
+	// WorkerCapabilitiesByProfile（可选）：按 profile 分组的 Worker 能力声明。
+	// 通过 SnapshotSources 传递给 BuildBoardJSON，替代单一 WorkerCapabilities。
+	// nil 时回退到 WorkerCapabilities 的旧行为。
+	WorkerCapabilitiesByProfile map[string]*AgentCapabilityInfo
+
 	// FinalizationChecker（可选）：如果非 nil，每轮 Execute 入口会先调 IsFinalized()，
 	// 返回 true 时短路返回 Finalized=true，让 agent.Run 的 reactLoop
 	// 走"任务完成"路径终止当前 scheduler task。
@@ -129,11 +145,19 @@ func (e *SchedulerExecutor) Execute(
 	// 构造一个简单的 trigger 事件——SchedulerExecutor 不知道具体触发原因，
 	// 用通用的 ticker_wakeup 类型，让 LLM 知道这是一次"重新观察板子"
 	trigger := model.Event{Type: model.EventTickerWakeup}
+	workerCaps, workerDesc := e.Cfg.ResolvedAgentDeclaration("worker")
 	snapshot := BuildBoardJSON(e.Store, e.Cfg, mode, trigger, SnapshotSources{
 		MBRegistry:    e.MBRegistry,
 		Roster:        e.Roster,
 		History:       e.History,
 		AgentRegistry: e.AgentRegistry,
+		WorkerCapabilities: &AgentCapabilityInfo{
+			Capabilities: workerCaps,
+			Description:  workerDesc,
+		},
+		WorkerProfiles:              e.WorkerProfiles,
+		WorkerCapabilitiesByProfile: e.WorkerCapabilitiesByProfile,
+		ToolHealth:                  e.ToolHealth,
 	})
 
 	// 注入为 IncomingMail 风格的 history entry，与 mailbox 注入对称

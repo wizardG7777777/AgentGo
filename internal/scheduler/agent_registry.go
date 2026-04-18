@@ -35,6 +35,11 @@ type SpecializedAgent struct {
 	// 这段文本会直接拼接进 scheduler system prompt 的路由指引段，所以应
 	// 当简洁、动作导向、包含能力边界。
 	Role string
+
+	// Capabilities 是该代理类型的能力标签列表。
+	// 例如 Explorer 可能有 ["codebase_read", "web_search", "message"]。
+	// 用于 board snapshot 的 agent_capabilities 段和未来的任务级能力匹配。
+	Capabilities []string
 }
 
 // AgentRegistry 是特化代理的静态注册表，由 bootstrap 在启动时填充。
@@ -66,10 +71,13 @@ func (r *AgentRegistry) Register(entry SpecializedAgent) {
 	defer r.mu.Unlock()
 	for i, existing := range r.entries {
 		if existing.EventType == entry.EventType {
-			// 合并 Count，Role 以后注册的为准（通常不会冲突）
+			// 合并 Count，Role / Capabilities 以后注册的为准（通常不会冲突）
 			r.entries[i].Count += entry.Count
 			if entry.Role != "" {
 				r.entries[i].Role = entry.Role
+			}
+			if entry.Capabilities != nil {
+				r.entries[i].Capabilities = entry.Capabilities
 			}
 			return
 		}

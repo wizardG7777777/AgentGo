@@ -164,6 +164,7 @@ func NewWithID(agentID string, s store.TaskStore, r roster.Roster, llmClient llm
 	a.CompactTokenThreshold = cfg.CompactTokenThreshold
 	a.CompactKeepRecent = cfg.CompactKeepRecent
 	a.TransferNoteMaxTokens = cfg.TransferNoteMaxTokens
+	a.ProgressNotifyEnabled = cfg.ProgressNotifyEnabled
 	a.OnTaskStart = func(taskID string) {
 		holder.Set(taskID)
 	}
@@ -183,6 +184,11 @@ func NewWithID(agentID string, s store.TaskStore, r roster.Roster, llmClient llm
 	a.HookRosterView = agentRosterView
 
 	return &Worker{agent: a}
+}
+
+// ID 返回该 Worker 的 agentID。
+func (w *Worker) ID() string {
+	return w.agent.ID
 }
 
 // Run 启动执行代理的轮询循环，阻塞直到 ctx 取消。

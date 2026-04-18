@@ -10,6 +10,7 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
 	"agentgo/internal/model"
+	"agentgo/internal/probe"
 	"agentgo/internal/store"
 )
 
@@ -512,5 +513,101 @@ func TestFilterNonTerminalChildren(t *testing.T) {
 
 	if len(pending) != 1 || pending[0] != pendingTask.ID {
 		t.Errorf("expected only pending task, got %v", pending)
+	}
+}
+
+// ---- ToolHealth 传递到 board snapshot ----
+
+func TestSchedulerExecutor_ToolHealth_PassedToSnapshot(t *testing.T) {
+	ch := make(chan model.Event, 64)
+	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
+	cfg := &config.Config{WorkerCount: 1}
+
+	schedTask := &model.Task{Description: "scheduler", EventType: "__scheduler__"}
+	s.PublishTask(schedTask)
+	s.ClaimTask("scheduler-1", schedTask.ID)
+
+	// 创建一个 ToolHealthStatus，其中 web_search 不可用
+	th := probe.NewToolHealthStatus()
+	th.Record(probe.ProbeResult{
+		Tool:      "web_search",
+		Available: false,
+		Error:     "search_api_key 未配置",
+	})
+	th.Record(probe.ProbeResult{
+		Tool:      "web_fetch",
+		Available: true,
+	})
+
+	var calls int32
+	var capturedHistory []agent.HistoryEntry
+	exec := &SchedulerExecutor{
+		Inner:         makeInnerExecutor(&calls, &capturedHistory),
+		Store:         s,
+		Cfg:           cfg,
+		BatchUpdateCh: make(chan struct{}),
+		WaitTimeout:   100 * time.Millisecond,
+		ToolHealth:    th,
+	}
+
+	_, err := exec.Execute(context.Background(), schedTask, nil, nil)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	if len(capturedHistory) != 1 {
+		t.Fatalf("expected 1 history entry, got %d", len(capturedHistory))
+	}
+	mail := capturedHistory[0].IncomingMail
+	if mail == "" {
+		t.Fatal("IncomingMail should be non-empty")
+	}
+
+	// Board snapshot should contain unavailable_tools with web_search
+	if !strings.Contains(mail, `"unavailable_tools"`) {
+		t.Errorf("snapshot should contain unavailable_tools field, got: %s", mail)
+	}
+	if !strings.Contains(mail, `"web_search"`) {
+		t.Errorf("snapshot should list web_search as unavailable, got: %s", mail)
+	}
+	// web_fetch is available, so it should NOT appear in unavailable_tools
+	if strings.Contains(mail, `"web_fetch"`) {
+		t.Errorf("snapshot should not list web_fetch (it's available), got: %s", mail)
+	}
+}
+
+func TestSchedulerExecutor_ToolHealth_Nil_NoUnavailableTools(t *testing.T) {
+	ch := make(chan model.Event, 64)
+	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
+	cfg := &config.Config{WorkerCount: 1}
+
+	schedTask := &model.Task{Description: "scheduler", EventType: "__scheduler__"}
+	s.PublishTask(schedTask)
+	s.ClaimTask("scheduler-1", schedTask.ID)
+
+	var calls int32
+	var capturedHistory []agent.HistoryEntry
+	exec := &SchedulerExecutor{
+		Inner:         makeInnerExecutor(&calls, &capturedHistory),
+		Store:         s,
+		Cfg:           cfg,
+		BatchUpdateCh: make(chan struct{}),
+		WaitTimeout:   100 * time.Millisecond,
+		// ToolHealth: nil — backward compatible
+	}
+
+	_, err := exec.Execute(context.Background(), schedTask, nil, nil)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	if len(capturedHistory) != 1 {
+		t.Fatalf("expected 1 history entry, got %d", len(capturedHistory))
+	}
+	mail := capturedHistory[0].IncomingMail
+
+	// With nil ToolHealth, unavailable_tools should be omitted (backward compat)
+	if strings.Contains(mail, `"unavailable_tools"`) {
+		t.Errorf("snapshot should NOT contain unavailable_tools when ToolHealth is nil, got: %s", mail)
 	}
 }

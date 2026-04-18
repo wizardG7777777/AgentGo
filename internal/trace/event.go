@@ -55,6 +55,9 @@ const (
 	// 文件写入排队（TryClaim 冲突后等待前任释放，§8.3 文件冲突排队）
 	KindFileWriteQueued EventKind = "file_write_queued"
 
+	// 进度通知事件（文件写入 / 子任务发布 / 任务过半）
+	KindProgressNotify EventKind = "progress_notify"
+
 	// 通用错误事件（比 task_completed 严重的故障，但任务并未终止）
 	KindError EventKind = "error"
 )
@@ -67,9 +70,10 @@ type Event struct {
 	TaskID    string    `json:"task_id"`
 
 	// --- 通用字段 ---
-	AgentID string `json:"agent_id,omitempty"`
-	Loop    int    `json:"loop,omitempty"`
-	Error   string `json:"error,omitempty"`
+	AgentID    string `json:"agent_id,omitempty"`
+	Loop       int    `json:"loop,omitempty"`
+	Error      string `json:"error,omitempty"`
+	NotifyType string `json:"notify_type,omitempty"` // 进度通知类型：file_write / subtask / halfway
 
 	// --- 任务生命周期字段（task_published / task_claimed / task_submitted / task_completed） ---
 	Description  string   `json:"description,omitempty"`

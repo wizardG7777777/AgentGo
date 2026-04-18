@@ -84,6 +84,10 @@ type Agent struct {
 	// 失败路径 buildTransferNote 按此值做 L1/L3 输出截断。Sprint 3 #5 引入。
 	TransferNoteMaxTokens int
 
+	// ProgressNotifyEnabled 控制进度通知功能是否启用。
+	// 为 true 时，Agent 在文件写入、子任务发布或任务过半时通过 mailbox 发送进度消息。
+	ProgressNotifyEnabled bool
+
 	// AgentHookReg 是 Agent Hook 注册表，覆盖 processTask 的 4 个生命周期事件
 	// （PhaseTaskStart / PhaseLoopPre / PhaseLoopPost / PhaseTaskEnd）。
 	// nil 时全路径退化为 no-op——这是回归验证的可逆性保证。
@@ -225,6 +229,9 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		log.Printf("[agent %s] GetTask error: %v", a.ID, err)
 		return
 	}
+
+	// 进度通知：每任务级别的去重标志，在 processTask 入口初始化
+	pFlags := progressFlags{}
 
 	// Panic 恢复（Sprint 3 #5 引入）：processTask 的任意路径 panic 都会
 	// 被这里捕获，走纯机械 L3 生成 TransferNote + 终止任务，避免"panic →
@@ -532,6 +539,9 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			ToolCalls:        result.ToolCalls,
 			ToolResults:      result.ToolResults,
 		})
+
+		// 进度通知：在 history append 之后、PhaseLoopPost 之前发送
+		a.progressNotify(ctx, taskID, i, result, &pFlags)
 
 		// PhaseLoopPost：每轮末尾的观察类 hook 触发点。
 		// 触发时机：tool results 已追加到 history、压缩策略尚未执行。

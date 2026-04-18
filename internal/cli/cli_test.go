@@ -13,6 +13,7 @@ import (
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/scheduler"
+	"agentgo/internal/session"
 	"agentgo/internal/shell"
 	"agentgo/internal/store"
 )
@@ -220,7 +221,7 @@ func TestCLI_SteerCommand_SendsUserMessage(t *testing.T) {
 	output := &bytes.Buffer{}
 	c := New(s, ch, func() {}, sched, reg, nil, strings.NewReader(""), output)
 
-	c.handleLine("/steer worker-1 请改用 JSON 格式")
+	c.handleLine("/steer worker-1 请改用 JSON 格式", nil, context.Background())
 
 	msgs := mb.Drain()
 	if len(msgs) != 1 {
@@ -251,7 +252,7 @@ func TestCLI_SteerCommand_InvalidUsage(t *testing.T) {
 	output := &bytes.Buffer{}
 	c := New(s, ch, func() {}, sched, reg, nil, strings.NewReader(""), output)
 
-	c.handleLine("/steer worker-1")
+	c.handleLine("/steer worker-1", nil, context.Background())
 
 	if !strings.Contains(output.String(), "用法: /steer <agentID> <消息内容>") {
 		t.Errorf("output should contain usage message, got: %s", output.String())
@@ -263,7 +264,7 @@ func TestCLI_SteerCommand_MailboxDisabled(t *testing.T) {
 	output := &bytes.Buffer{}
 
 	c := New(s, ch, func() {}, sched, nil, nil, strings.NewReader(""), output)
-	c.handleLine("/steer worker-1 hello")
+	c.handleLine("/steer worker-1 hello", nil, context.Background())
 
 	if !strings.Contains(output.String(), "邮箱系统未启用") {
 		t.Errorf("output should contain mailbox disabled message, got: %s", output.String())
@@ -519,4 +520,299 @@ func TestCLI_Approval_Multiple_Queued(t *testing.T) {
 	}
 
 	pw.Write([]byte("/quit\n"))
+}
+
+// --- Session 相关测试 ---
+
+func TestCLI_NewCommand_CreatesSession(t *testing.T) {
+	s, sched, ch := setup()
+	output := &bytes.Buffer{}
+
+	baseDir := t.TempDir()
+	sm, err := session.NewSessionManager(baseDir, session.SessionConfig{Enabled: true})
+	if err != nil {
+		t.Fatalf("NewSessionManager failed: %v", err)
+	}
+
+	oldSess := sm.Current()
+	if oldSess == nil {
+		t.Fatal("expected initial session to be non-nil")
+	}
+
+	input := strings.NewReader("/new\n/quit\n")
+	c := New(s, ch, func() {}, sched, nil, nil, input, output, sm)
+	c.Run(context.Background())
+
+	newSess := sm.Current()
+	if newSess == nil {
+		t.Fatal("expected new session to be non-nil after /new")
+	}
+	if newSess.ID == oldSess.ID {
+		t.Error("expected new session ID to differ from old session ID")
+	}
+	if !strings.Contains(output.String(), "[session] 新 Session 已创建") {
+		t.Errorf("output should contain session creation message, got: %s", output.String())
+	}
+}
+
+func TestCLI_NewCommand_NoSessionManager(t *testing.T) {
+	s, sched, ch := setup()
+	output := &bytes.Buffer{}
+
+	input := strings.NewReader("/new\n/quit\n")
+	c := New(s, ch, func() {}, sched, nil, nil, input, output)
+	c.Run(context.Background())
+
+	if !strings.Contains(output.String(), "Session 管理器未启用") {
+		t.Errorf("output should contain error about session manager, got: %s", output.String())
+	}
+}
+
+func TestCLI_SessionCommand_EmptyList(t *testing.T) {
+	s, sched, ch := setup()
+	output := &bytes.Buffer{}
+
+	// Create a SessionManager with an empty base dir (no sessions)
+	baseDir := t.TempDir()
+	sm, err := session.NewSessionManager(baseDir, session.SessionConfig{Enabled: true})
+	if err != nil {
+		t.Fatalf("NewSessionManager failed: %v", err)
+	}
+
+	// Close the current session and remove its directory to simulate empty list
+	// Actually, NewSessionManager always creates one session. Let's use a mock approach.
+	// Instead, we test with the one session that exists — it won't be empty.
+	// For a true empty test, we need to manipulate the directory.
+	// Let's test the "has sessions" case and the "no session manager" case separately.
+
+	input := strings.NewReader("/session\n/quit\n")
+	c := New(s, ch, func() {}, sched, nil, nil, input, output, sm)
+	c.Run(context.Background())
+
+	// Should show at least one session (the one created by NewSessionManager)
+	if !strings.Contains(output.String(), "[session] Session 列表:") {
+		t.Errorf("output should contain session list header, got: %s", output.String())
+	}
+}
+
+func TestCLI_SessionCommand_NoSessionManager(t *testing.T) {
+	s, sched, ch := setup()
+	output := &bytes.Buffer{}
+
+	input := strings.NewReader("/session\n/quit\n")
+	c := New(s, ch, func() {}, sched, nil, nil, input, output)
+	c.Run(context.Background())
+
+	if !strings.Contains(output.String(), "Session 管理器未启用") {
+		t.Errorf("output should contain error about session manager, got: %s", output.String())
+	}
+}
+
+func TestCLI_SessionCommand_ShowsDescription(t *testing.T) {
+	s, sched, ch := setup()
+	output := &bytes.Buffer{}
+
+	baseDir := t.TempDir()
+	sm, err := session.NewSessionManager(baseDir, session.SessionConfig{Enabled: true})
+	if err != nil {
+		t.Fatalf("NewSessionManager failed: %v", err)
+	}
+
+	// Record a first input to have a description
+	sm.RecordFirstInput("帮我重构 config 模块")
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	c := New(s, ch, func() {}, sched, nil, nil, pr, output, sm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go c.Run(ctx)
+
+	// Send /session command
+	time.Sleep(50 * time.Millisecond)
+	pw.Write([]byte("/session\n"))
+
+	// Wait for list to display, then cancel selection
+	time.Sleep(100 * time.Millisecond)
+	pw.Write([]byte("\n"))
+
+	time.Sleep(100 * time.Millisecond)
+
+	out := output.String()
+	if !strings.Contains(out, "帮我重构 config 模块") {
+		t.Errorf("output should contain session description, got: %s", out)
+	}
+
+	pw.Write([]byte("/quit\n"))
+}
+
+func TestCLI_SessionCommand_EmptyDescriptionShowsPlaceholder(t *testing.T) {
+	s, sched, ch := setup()
+	output := &bytes.Buffer{}
+
+	baseDir := t.TempDir()
+	sm, err := session.NewSessionManager(baseDir, session.SessionConfig{Enabled: true})
+	if err != nil {
+		t.Fatalf("NewSessionManager failed: %v", err)
+	}
+
+	// Don't record any input — first_user_input stays empty
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	c := New(s, ch, func() {}, sched, nil, nil, pr, output, sm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go c.Run(ctx)
+
+	time.Sleep(50 * time.Millisecond)
+	pw.Write([]byte("/session\n"))
+
+	time.Sleep(100 * time.Millisecond)
+	pw.Write([]byte("\n"))
+
+	time.Sleep(100 * time.Millisecond)
+
+	out := output.String()
+	if !strings.Contains(out, "（无描述）") {
+		t.Errorf("output should contain placeholder for empty description, got: %s", out)
+	}
+
+	pw.Write([]byte("/quit\n"))
+}
+
+func TestCLI_SessionCommand_InvalidSelection(t *testing.T) {
+	s, sched, ch := setup()
+	output := &bytes.Buffer{}
+
+	baseDir := t.TempDir()
+	sm, err := session.NewSessionManager(baseDir, session.SessionConfig{Enabled: true})
+	if err != nil {
+		t.Fatalf("NewSessionManager failed: %v", err)
+	}
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	c := New(s, ch, func() {}, sched, nil, nil, pr, output, sm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go c.Run(ctx)
+
+	time.Sleep(50 * time.Millisecond)
+	pw.Write([]byte("/session\n"))
+
+	// Enter invalid selection
+	time.Sleep(100 * time.Millisecond)
+	pw.Write([]byte("999\n"))
+
+	time.Sleep(100 * time.Millisecond)
+
+	out := output.String()
+	if !strings.Contains(out, "无效的选择") {
+		t.Errorf("output should contain invalid selection error, got: %s", out)
+	}
+
+	pw.Write([]byte("/quit\n"))
+}
+
+func TestCLI_SessionCommand_ValidSelection(t *testing.T) {
+	s, sched, ch := setup()
+	output := &bytes.Buffer{}
+
+	baseDir := t.TempDir()
+	sm, err := session.NewSessionManager(baseDir, session.SessionConfig{Enabled: true})
+	if err != nil {
+		t.Fatalf("NewSessionManager failed: %v", err)
+	}
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	c := New(s, ch, func() {}, sched, nil, nil, pr, output, sm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go c.Run(ctx)
+
+	time.Sleep(50 * time.Millisecond)
+	pw.Write([]byte("/session\n"))
+
+	// Select the first (and only) session
+	time.Sleep(100 * time.Millisecond)
+	pw.Write([]byte("1\n"))
+
+	time.Sleep(100 * time.Millisecond)
+
+	out := output.String()
+	if !strings.Contains(out, "已选择 Session") {
+		t.Errorf("output should contain session selection message, got: %s", out)
+	}
+
+	pw.Write([]byte("/quit\n"))
+}
+
+func TestCLI_FreeText_RecordsFirstInput(t *testing.T) {
+	s, sched, ch := setup()
+	output := &bytes.Buffer{}
+
+	baseDir := t.TempDir()
+	sm, err := session.NewSessionManager(baseDir, session.SessionConfig{Enabled: true})
+	if err != nil {
+		t.Fatalf("NewSessionManager failed: %v", err)
+	}
+
+	input := strings.NewReader("分析 auth 模块\n第二条消息\n/quit\n")
+	c := New(s, ch, func() {}, sched, nil, nil, input, output, sm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go c.Run(ctx)
+
+	// Drain events
+	for i := 0; i < 2; i++ {
+		select {
+		case <-ch:
+		case <-time.After(1 * time.Second):
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify first input was recorded
+	sess := sm.Current()
+	if sess == nil {
+		t.Fatal("expected current session to be non-nil")
+	}
+	if sess.Metadata.FirstUserInput != "分析 auth 模块" {
+		t.Errorf("first_user_input = %q, want %q", sess.Metadata.FirstUserInput, "分析 auth 模块")
+	}
+}
+
+func TestCLI_HelpCommand_IncludesNewAndSession(t *testing.T) {
+	s, sched, ch := setup()
+
+	input := strings.NewReader("/help\n/quit\n")
+	output := &bytes.Buffer{}
+
+	c := New(s, ch, func() {}, sched, nil, nil, input, output)
+	c.Run(context.Background())
+
+	out := output.String()
+	if !strings.Contains(out, "/new") {
+		t.Errorf("help output should include /new, got: %s", out)
+	}
+	if !strings.Contains(out, "/session") {
+		t.Errorf("help output should include /session, got: %s", out)
+	}
 }

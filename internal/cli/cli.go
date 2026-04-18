@@ -12,6 +12,7 @@ import (
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/scheduler"
+	"agentgo/internal/session"
 	"agentgo/internal/shell"
 	"agentgo/internal/store"
 )
@@ -28,6 +29,7 @@ type CLI struct {
 	mode       *scheduler.ModeStore         // 由 scheduler.Bundle 提供，用于 /mode 命令
 	mbRegistry *mailbox.Registry            // 邮箱注册表，用于 /steer 命令
 	approvalCh <-chan shell.ApprovalRequest // 命令审批请求通道，由 Worker 发送
+	sessionMgr *session.SessionManager      // Session 管理器，可选，nil 时 /new 和 /session 返回错误
 	reader     io.Reader
 	writer     io.Writer
 }
@@ -35,10 +37,14 @@ type CLI struct {
 // New 创建 CLI 实例。reader/writer 用于输入输出，方便测试注入。
 //
 // Phase 3 改动：参数 sched 类型从 *scheduler.Scheduler 改为 *scheduler.Bundle。
-func New(s store.TaskStore, eventCh chan<- model.Event, cancelFn context.CancelFunc, sched *scheduler.Bundle, mbRegistry *mailbox.Registry, approvalCh <-chan shell.ApprovalRequest, reader io.Reader, writer io.Writer) *CLI {
+func New(s store.TaskStore, eventCh chan<- model.Event, cancelFn context.CancelFunc, sched *scheduler.Bundle, mbRegistry *mailbox.Registry, approvalCh <-chan shell.ApprovalRequest, reader io.Reader, writer io.Writer, sessionMgr ...*session.SessionManager) *CLI {
 	var modeStore *scheduler.ModeStore
 	if sched != nil {
 		modeStore = sched.Mode
+	}
+	var sm *session.SessionManager
+	if len(sessionMgr) > 0 {
+		sm = sessionMgr[0]
 	}
 	return &CLI{
 		store:      s,
@@ -47,6 +53,7 @@ func New(s store.TaskStore, eventCh chan<- model.Event, cancelFn context.CancelF
 		mode:       modeStore,
 		mbRegistry: mbRegistry,
 		approvalCh: approvalCh,
+		sessionMgr: sm,
 		reader:     reader,
 		writer:     writer,
 	}
@@ -75,7 +82,7 @@ func (c *CLI) Run(ctx context.Context) {
 			c.handleApproval(req, lineCh, ctx)
 			fmt.Fprint(c.writer, "> ")
 		case line := <-lineCh:
-			shouldQuit := c.handleLine(strings.TrimSpace(line))
+			shouldQuit := c.handleLine(strings.TrimSpace(line), lineCh, ctx)
 			if shouldQuit {
 				return
 			}
@@ -90,7 +97,7 @@ func (c *CLI) Run(ctx context.Context) {
 }
 
 // handleLine 处理单行输入，返回 true 表示应退出。
-func (c *CLI) handleLine(line string) bool {
+func (c *CLI) handleLine(line string, lineCh <-chan string, ctx context.Context) bool {
 	if line == "" {
 		return false
 	}
@@ -100,6 +107,12 @@ func (c *CLI) handleLine(line string) bool {
 		fmt.Fprintln(c.writer, "[退出] 正在关闭...")
 		c.cancelFn()
 		return true
+
+	case line == "/new":
+		c.handleNewSession()
+
+	case line == "/session":
+		c.handleSessionList(lineCh, ctx)
 
 	case line == "/mode":
 		c.toggleMode()
@@ -121,6 +134,10 @@ func (c *CLI) handleLine(line string) bool {
 		fmt.Fprintf(c.writer, "[错误] 未知命令: %s，输入 /help 查看帮助\n", line)
 
 	default:
+		// 记录首条用户输入
+		if c.sessionMgr != nil {
+			c.sessionMgr.RecordFirstInput(line)
+		}
 		// 用户自由文本 → 发送 EventUserInput（带超时，防止 eventCh 满时卡死）
 		evt := model.Event{
 			Type:    model.EventUserInput,
@@ -229,6 +246,8 @@ func (c *CLI) printHelp() {
 	fmt.Fprintln(c.writer, "  /cancel <id>         — 取消指定任务")
 	fmt.Fprintln(c.writer, "  /steer <agent> <msg> — 向指定代理发送用户纠偏消息")
 	fmt.Fprintln(c.writer, "  /mode                — 切换即时/计划模式")
+	fmt.Fprintln(c.writer, "  /new                 — 创建新 Session（保存并关闭当前 Session）")
+	fmt.Fprintln(c.writer, "  /session             — 查看并切换 Session")
 	fmt.Fprintln(c.writer, "  /quit                — 退出程序")
 	fmt.Fprintln(c.writer, "  /help                — 显示此帮助")
 	fmt.Fprintln(c.writer, "  其他文本             — 作为用户请求发送给调度器")
@@ -263,5 +282,93 @@ func (c *CLI) handleApproval(req shell.ApprovalRequest, lineCh <-chan string, ct
 			req.ReplyCh <- shell.ApprovalReply{Approved: false, Message: answer}
 			fmt.Fprintf(c.writer, "[审批] 已将指导发送给 %s\n", req.AgentID)
 		}
+	}
+}
+
+// handleNewSession 处理 /new 命令：保存并关闭当前 Session，创建新 Session。
+func (c *CLI) handleNewSession() {
+	if c.sessionMgr == nil {
+		fmt.Fprintln(c.writer, "[错误] Session 管理器未启用")
+		return
+	}
+
+	// 关闭当前 Session
+	if err := c.sessionMgr.Close(); err != nil {
+		fmt.Fprintf(c.writer, "[警告] 关闭当前 Session 失败: %v\n", err)
+	}
+
+	// 创建新 Session
+	sess, err := c.sessionMgr.CreateNew()
+	if err != nil {
+		fmt.Fprintf(c.writer, "[错误] 创建新 Session 失败: %v\n", err)
+		return
+	}
+
+	fmt.Fprintf(c.writer, "[session] 新 Session 已创建: %s\n", sess.ID[:8])
+}
+
+// handleSessionList 处理 /session 命令：显示 Session 列表，等待用户选择。
+func (c *CLI) handleSessionList(lineCh <-chan string, ctx context.Context) {
+	if c.sessionMgr == nil {
+		fmt.Fprintln(c.writer, "[错误] Session 管理器未启用")
+		return
+	}
+
+	sessions, err := c.sessionMgr.List()
+	if err != nil {
+		fmt.Fprintf(c.writer, "[错误] 获取 Session 列表失败: %v\n", err)
+		return
+	}
+
+	if len(sessions) == 0 {
+		fmt.Fprintln(c.writer, "[session] Empty session list")
+		return
+	}
+
+	// 显示 Session 列表
+	fmt.Fprintln(c.writer, "[session] Session 列表:")
+	for i, meta := range sessions {
+		desc := meta.FirstUserInput
+		if desc == "" {
+			desc = "（无描述）"
+		}
+		// 截取创建时间前 16 位（yyyy-mm-ddThh:mm → yyyy-mm-dd hh:mm）
+		createdAt := meta.CreatedAt
+		if len(createdAt) >= 16 {
+			createdAt = createdAt[:10] + " " + createdAt[11:16]
+		}
+		idShort := meta.SessionID
+		if len(idShort) > 8 {
+			idShort = idShort[:8]
+		}
+		fmt.Fprintf(c.writer, "  [%d] %s | %s | %s\n", i+1, idShort, createdAt, desc)
+	}
+
+	fmt.Fprint(c.writer, "[session] 输入序号选择 Session（或按回车取消）: ")
+
+	// 等待用户输入
+	select {
+	case <-ctx.Done():
+		return
+	case answer := <-lineCh:
+		answer = strings.TrimSpace(answer)
+		if answer == "" {
+			fmt.Fprintln(c.writer, "[session] 已取消")
+			return
+		}
+
+		// 解析序号
+		var idx int
+		if _, err := fmt.Sscanf(answer, "%d", &idx); err != nil || idx < 1 || idx > len(sessions) {
+			fmt.Fprintf(c.writer, "[错误] 无效的选择: %s，请输入 1-%d 的序号\n", answer, len(sessions))
+			return
+		}
+
+		selected := sessions[idx-1]
+		idShort := selected.SessionID
+		if len(idShort) > 8 {
+			idShort = idShort[:8]
+		}
+		fmt.Fprintf(c.writer, "[session] 已选择 Session: %s（快照恢复需要阶段二支持）\n", idShort)
 	}
 }

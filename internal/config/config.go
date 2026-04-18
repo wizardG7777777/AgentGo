@@ -10,6 +10,36 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// AgentDeclaration 是单个代理类型的能力声明。
+// 使用指针字段区分"未配置"（nil）和"显式空"（非 nil 但值为零值）。
+type AgentDeclaration struct {
+	// Capabilities 是能力标签列表。
+	// nil = 未配置，使用默认值；非 nil 空切片 = 显式清空。
+	Capabilities *[]string `yaml:"capabilities" json:"capabilities"`
+
+	// Description 是人类可读的用途描述。
+	// nil = 未配置，使用默认值；非 nil 空字符串 = 显式清空。
+	Description *string `yaml:"description" json:"description"`
+}
+
+// 代理类型默认能力标签
+var defaultCapabilities = map[string][]string{
+	"explorer": {"codebase_read", "web_search", "message"},
+	"worker":   {"code_edit", "shell_exec", "web_search", "subtask_publish", "message"},
+}
+
+// 代理类型默认描述
+var defaultDescriptions = map[string]string{
+	"explorer": "只读调查代理（Explorer），能力限定为 read_file / list_dir / grep_search / glob_search / web_search / web_fetch / send_message。不能写文件、执行 shell、或发布子任务，适合承担代码库调研、网页检索、事实核验等只读任务。",
+	"worker":   "通用执行代理，拥有完整工具集，可读写文件、执行 shell 命令、发布子任务、搜索网络",
+}
+
+// WorkerDeclaration 是 workers 列表中单条 Worker 声明。
+type WorkerDeclaration struct {
+	ID      string `yaml:"id" json:"id"`
+	Profile string `yaml:"profile" json:"profile"`
+}
+
 type Config struct {
 	MaxRetry                int    `yaml:"max_retry" json:"max_retry"`
 	DefaultConcurrency      int    `yaml:"default_concurrency" json:"default_concurrency"`
@@ -56,10 +86,14 @@ type Config struct {
 	// 设为 0 表示不排队（退回旧行为：立即返回错误）。
 	// 参考 nextUpgrade_v3.md §8.3 文件冲突排队设计。
 	RosterWaitTimeoutSec int `yaml:"roster_wait_timeout_sec" json:"roster_wait_timeout_sec"`
+	// ProgressNotifyEnabled 控制进度通知功能是否启用。启用后，Worker Agent 在完成
+	// 文件写入、子任务发布或任务过半时，通过 mailbox 向相关 Agent 发送轻量级进度消息。
+	// 参考 nextUpgrade_v3.md §8.6 进度通知设计。
+	ProgressNotifyEnabled bool `yaml:"progress_notify_enabled" json:"progress_notify_enabled"`
 
-	SearchAPIProvider       string `yaml:"search_api_provider" json:"search_api_provider"`
-	SearchAPIURL            string `yaml:"search_api_url" json:"search_api_url"`
-	SearchAPIKey            string `yaml:"search_api_key" json:"search_api_key"`
+	SearchAPIProvider string `yaml:"search_api_provider" json:"search_api_provider"`
+	SearchAPIURL      string `yaml:"search_api_url" json:"search_api_url"`
+	SearchAPIKey      string `yaml:"search_api_key" json:"search_api_key"`
 
 	// Shell 命令拦截配置（追加到默认规则）
 	ShellBlacklist []string `yaml:"shell_blacklist" json:"shell_blacklist"`
@@ -75,6 +109,20 @@ type Config struct {
 	// Scheduler 不走 profile（其工具强耦合于一等代理角色，不开放配置）。
 	WorkerProfile   string `yaml:"worker_profile" json:"worker_profile"`
 	ExplorerProfile string `yaml:"explorer_profile" json:"explorer_profile"`
+
+	// Workers 是 per-worker 工具集声明列表。
+	// 非空时覆盖 WorkerCount + WorkerProfile 的旧行为。
+	// 空/nil 时回退到旧行为（向后兼容）。
+	Workers []WorkerDeclaration `yaml:"workers" json:"workers"`
+
+	// AgentDeclarations 是代理能力声明配置。key 为代理类型名称（"worker" / "explorer"），
+	// value 包含 capabilities 和 description。留空时使用内置默认值。
+	AgentDeclarations map[string]AgentDeclaration `yaml:"agent_declarations" json:"agent_declarations"`
+
+	// SessionRetentionDays 是 Session 保留天数。超过此天数的已关闭 Session 将被归档。
+	SessionRetentionDays int `yaml:"session_retention_days" json:"session_retention_days"`
+	// SessionArchiveMax 是最大归档 Session 数。超过此数量时删除最旧的归档。
+	SessionArchiveMax int `yaml:"session_archive_max" json:"session_archive_max"`
 }
 
 // ResolveProfile 根据 profile 名称从 ToolProfiles 中查找工具列表。
@@ -92,6 +140,122 @@ func (c *Config) ResolveProfile(name string) ([]string, error) {
 		return nil, fmt.Errorf("tool profile %q 未找到，可用的 profile: %v", name, profileKeys(c.ToolProfiles))
 	}
 	return tools, nil
+}
+
+// ResolvedAgentDeclaration 返回指定代理类型的最终声明（合并默认值）。
+// 未配置的字段回退到默认值；显式空值（非 nil 零值）保持原样。
+// 未知代理类型返回零值（nil capabilities, 空 description）。
+func (c *Config) ResolvedAgentDeclaration(agentType string) ([]string, string) {
+	defCaps, knownCaps := defaultCapabilities[agentType]
+	defDesc, knownDesc := defaultDescriptions[agentType]
+	if !knownCaps && !knownDesc {
+		// 未知代理类型：返回零值
+		return nil, ""
+	}
+
+	decl, exists := c.AgentDeclarations[agentType]
+	if !exists {
+		// 未配置该代理类型：返回完整默认值
+		return defCaps, defDesc
+	}
+
+	// 合并逻辑：nil 字段回退默认值，非 nil 字段原样返回
+	caps := defCaps
+	if decl.Capabilities != nil {
+		caps = *decl.Capabilities
+	}
+	desc := defDesc
+	if decl.Description != nil {
+		desc = *decl.Description
+	}
+	return caps, desc
+}
+
+// ResolvedWorkerDeclaration 返回指定 profile 的 Worker 能力声明（合并默认值）。
+// 查找顺序：
+//  1. agent_declarations["worker/<profile>"]（profile 为空时跳过）
+//  2. agent_declarations["worker"]
+//  3. 内置默认值
+//
+// 未配置的字段回退到默认值；显式空值（非 nil 零值）保持原样。
+func (c *Config) ResolvedWorkerDeclaration(profile string) ([]string, string) {
+	defCaps := defaultCapabilities["worker"]
+	defDesc := defaultDescriptions["worker"]
+
+	// 尝试 per-profile 声明：agent_declarations["worker/<profile>"]
+	if profile != "" {
+		key := "worker/" + profile
+		if decl, ok := c.AgentDeclarations[key]; ok {
+			caps := defCaps
+			if decl.Capabilities != nil {
+				caps = *decl.Capabilities
+			}
+			desc := defDesc
+			if decl.Description != nil {
+				desc = *decl.Description
+			}
+			return caps, desc
+		}
+	}
+
+	// 回退到通用 worker 声明：agent_declarations["worker"]
+	if decl, ok := c.AgentDeclarations["worker"]; ok {
+		caps := defCaps
+		if decl.Capabilities != nil {
+			caps = *decl.Capabilities
+		}
+		desc := defDesc
+		if decl.Description != nil {
+			desc = *decl.Description
+		}
+		return caps, desc
+	}
+
+	// 回退到内置默认值
+	return defCaps, defDesc
+}
+
+// ValidateWorkers 校验 workers 列表的合法性。
+// 检查项：空 ID、重复 ID、profile 引用是否存在于 ToolProfiles。
+// workers 为空/nil 时返回 nil（向后兼容路径不校验）。
+func (c *Config) ValidateWorkers() error {
+	if len(c.Workers) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(c.Workers))
+	for i, w := range c.Workers {
+		if w.ID == "" {
+			return fmt.Errorf("workers[%d] 的 id 不能为空", i)
+		}
+		if _, dup := seen[w.ID]; dup {
+			return fmt.Errorf("workers 列表中存在重复的 id: %q", w.ID)
+		}
+		seen[w.ID] = struct{}{}
+
+		if w.Profile != "" {
+			if _, err := c.ResolveProfile(w.Profile); err != nil {
+				return fmt.Errorf("workers[%d] (id=%q) 的 profile 无效: %w", i, w.ID, err)
+			}
+		}
+	}
+	return nil
+}
+
+// ValidateAgentDeclarations 校验 agent_declarations 中的代理类型名称。
+// 允许 "worker"、"explorer" 和 "worker/<profile_name>" 格式的 key。
+// 其他名称返回错误。
+func (c *Config) ValidateAgentDeclarations() error {
+	for name := range c.AgentDeclarations {
+		if name == "worker" || name == "explorer" {
+			continue
+		}
+		if strings.HasPrefix(name, "worker/") {
+			continue
+		}
+		return fmt.Errorf("agent_declarations 包含无效的代理类型名称: %q（仅允许 \"worker\"、\"explorer\" 和 \"worker/<profile_name>\"）", name)
+	}
+	return nil
 }
 
 // profileKeys 返回 map 的所有 key（用于错误消息）。
@@ -130,7 +294,10 @@ func DefaultConfig() *Config {
 		MailChainMaxDepth:       3,    // Phase 2 新增；与 hookSystem.md §3.2 一致
 		TransferNoteMaxTokens:   3000, // Sprint 3 #5 TransferNote ���认预算
 		RosterWaitTimeoutSec:    30,   // §8.3 文件冲突排队默认等待 30 秒
+		ProgressNotifyEnabled:   true, // §8.6 进度通知默认启用
 		SearchAPIProvider:       "duckduckgo_html",
+		SessionRetentionDays:    30,
+		SessionArchiveMax:       50,
 	}
 }
 
@@ -167,6 +334,16 @@ func LoadConfig(path string, explicit bool) (*Config, error) {
 			return nil, fmt.Errorf("不支持的配置文件格式: %s（仅支持 .yaml/.yml/.json）", ext)
 		}
 		return cfg, nil
+	}
+
+	// 校验 agent_declarations 中的代理类型名称
+	if err := cfg.ValidateAgentDeclarations(); err != nil {
+		return nil, err
+	}
+
+	// 校验 workers 列表（空 ID / 重复 ID / 未知 profile）
+	if err := cfg.ValidateWorkers(); err != nil {
+		return nil, err
 	}
 
 	return cfg, nil

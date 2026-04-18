@@ -1,8 +1,36 @@
 # nextUpgrade v3 — 行哈希增强（Hashline Read Enhancer）
 
 > 状态：📝 待实现（2026-04-09 记录）
-> 依赖：v2 工具系统重构稳定后实施（`read_file` 工具接口需先确定）
+> 依赖：待补充 ohmyopen-agent 项目的具体实现参考后启动（`read_file` 工具接口已稳定）
 > ⚠️ **缺少引用**：本方案灵感来源于 "ohmyopen-agent" 项目的行哈希机制，但当前文档缺少具体的代码引用和实现参考。待补充该项目的仓库地址、相关源码位置及实现细节。
+
+---
+
+## 文档状态总览（2026-04-19 更新，Per-Worker Tool Profiles 落地）
+
+| 章节 | 内容 | 状态 |
+|------|------|------|
+| §2-§5 | 行哈希增强 | 📝 待实现（待补充参考资料） |
+| §5.1 | RosterHookView 接口 | ✅ 已完成 |
+| §6 | Finalization Tool 终止桥 | ✅ 已完成 |
+| §7 | Agent Hook 系统 | ✅ 已完成 |
+| §8.1 | Scheduler 分配感知 | ✅ 已完成 |
+| §8.2 | 执行孤岛消除 | ✅ 已完成 |
+| §8.3 | 文件冲突排队 | ✅ 已完成 |
+| §8.4 | TransferNote 跨 Agent 上下文传递 | ✅ 最小版已完成 |
+| §8.6 | 进度通知 | ✅ 已完成 |
+| §8.7 | GoalAnchor 目标锚点 | ✅ 已完成 |
+| §9.1 | 工具集分层配置 | ✅ 已完成 |
+| §9.1+ | Per-Worker Tool Profiles（逐 Worker 工具集配置） | ✅ 已完成（v4 §1 提前落地） |
+| §9.2 | 分级权限模型 | ➡️ 迁移到 v4 §2 |
+| §9.3 | 管理员信赖标记 | ➡️ 迁移到 v4 §4 |
+| §9.4 | 代理能力声明阶段一 | ✅ 已完成 |
+| §9.4 | 代理能力声明阶段二 | ➡️ 迁移到 v4 §3 |
+| §9.5 | 工具可用性探针 | ✅ 已完成 |
+| §9.6 | Artifacts 持久化 | ✅ 已完成 |
+| §9.7 | 冲突避免长期方案 | ➡️ 迁移到 v4 §5 |
+| §9.8 | Agent 休眠/唤醒 | ➡️ 迁移到 v4 §6 |
+| §9.9 | Session 化日志与状态持久化 | ✅ 已完成 |
 
 ---
 
@@ -90,9 +118,11 @@ T2: LLM 调用 edit_file 编辑"第 2 行"，实际编辑了错误的行
 
 ### 5.1 Roster.HookView 接口
 
-**当前状态**：阶段 1 的 4 个迁移 hook（RecordArtifact / RequireReadBeforeWrite / ValidateExpectedHash / PathBoundary）都不依赖 roster，因此 `internal/roster/` 暂时不需要 `HookView` 子接口。
+> 状态：✅ **已完成**（2026-04-12 随 §7 Agent Hook 一起落地）
 
-**触发条件**：阶段 2 之后某个 hook 真正需要"查询某个文件当前是否被某 agent 占用"或"列出所有活跃 agent"——届时再设计 `RosterHookView` 接口，按"hook 端最小必要集"原则推导方法。
+**落地实现**：[`internal/roster/hookview.go`](../../internal/roster/hookview.go) — `RosterHookView` 接口 + `MemoryRoster.ListClaims()` 实现
+
+**原触发条件**：阶段 2 之后某个 hook 真正需要"查询某个文件当前是否被某 agent 占用"或"列出所有活跃 agent"——由 §7.4.3 `FileAwarenessHook` 触发。
 
 ### 5.2 StoreHookView 的额外方法
 
@@ -1291,6 +1321,20 @@ V1–V4 都可以在单 worker 环境下验证，不需要复杂的多 agent 编
 
 ### 8.6 进度通知（P3）
 
+> 状态：✅ **已完成**（Sprint 5 2026-04-18）
+> 优先级：P3
+
+**落地实现**：
+
+- [`internal/agent/progress_notify.go`](../../internal/agent/progress_notify.go) — `progressFlags` 去重结构体、三个纯检测函数（`detectFileWrite` / `detectSubtaskPublish` / `detectHalfway`）、三个纯消息构造函数（`buildFileWriteMsg` / `buildSubtaskMsg` / `buildHalfwayMsg`）、`Agent.progressNotify` 方法（defer/recover 故障隔离）
+- [`internal/agent/agent.go`](../../internal/agent/agent.go) — `Agent.ProgressNotifyEnabled` 字段；`processTask` 入口初始化 `progressFlags{}`；ReactLoop 中 history append 之后、PhaseLoopPost 之前调用 `progressNotify`
+- [`internal/config/config.go`](../../internal/config/config.go) — `ProgressNotifyEnabled bool` 字段（yaml: `progress_notify_enabled`，默认 `true`）
+- [`internal/trace/event.go`](../../internal/trace/event.go) — `KindProgressNotify` 事件常量 + `NotifyType` 字段
+- [`internal/worker/worker.go`](../../internal/worker/worker.go) — `NewWithID` 传递 `cfg.ProgressNotifyEnabled`
+- 测试覆盖：8 个属性测试（Property 1-8，覆盖检测正确性、消息不变量、去重、配置开关）+ 4 个单元测试（nil MailRegistry / Send error / panic recovery / trace event）
+
+**设计要点**：零 LLM 调用（`fmt.Sprintf` 机械拼装）；故障隔离（`defer/recover` + `log.Printf` 降级）；每种触发条件每任务最多一次；`ChainDepth=0` 不触发级联唤醒；配置开关可关闭。
+
 **问题**：Agent 完成关键操作（写入文件、发布子任务）后，相关队友不会被通知。队友在下次团队快照刷新前对进展一无所知。
 
 **方案：agent.go 核心循环内嵌通知**
@@ -1390,7 +1434,7 @@ GoalRefreshInterval int  // 配置项，默认 3 轮
 | P2 | §8.1 Scheduler 分配感知 | boardSnapshot | ✅ 已完成（Sprint 3 2026-04-12） |
 | P2 | §8.3 文件冲突排队 | Roster 接口扩展 | ✅ 已完成（Sprint 4 2026-04-12，WaitForRelease FIFO 过渡方案） |
 | P2 | §8.4 TransferNote 跨 Agent 上下文传递 | Model + Store + agent.go | ✅ 最小版已完成（Sprint 3 2026-04-12，L1+L3+defer recover；L2 延期） |
-| P3 | §8.6 进度通知 | Mailbox + agent.go | 📝 待实现 |
+| P3 | §8.6 进度通知 | Mailbox + agent.go | ✅ 已完成（Sprint 5 2026-04-18） |
 
 ---
 
@@ -1403,11 +1447,29 @@ GoalRefreshInterval int  // 配置项，默认 3 轮
 
 ### 9.1 工具集分层配置（Tool Set Profiles）
 
-> 原 v2 §1.3 | 状态：📝 待实现 | 优先级：P2
+> 原 v2 §1.3 | 状态：✅ **已完成**（2026-04-18 文档补充；2026-04-19 Per-Worker Tool Profiles 落地） | 优先级：P2
 > 前置依赖：无（v2 §1.1 ToolGroup 已完成）
 > 下游依赖：§9.2 分级权限模型、§9.4 能力声明阶段一 均依赖本项
 
-**现状**：工具集与代理类型硬绑定，无法按任务场景裁剪。
+**落地实现**：
+
+- [`internal/config/config.go`](../../internal/config/config.go) — `ToolProfiles map[string][]string`、`WorkerProfile`、`ExplorerProfile` 字段 + `ResolveProfile()` 方法
+- [`internal/agent/tool_registry.go`](../../internal/agent/tool_registry.go) — `NewToolRegistryWithAllowlist(allowed []string)` 白名单过滤
+- [`internal/tools/known_tools.go`](../../internal/tools/known_tools.go) — `AllToolNames` 工具名列表 + `ValidateToolNames()` 校验
+- [`internal/bootstrap/bootstrap.go`](../../internal/bootstrap/bootstrap.go) Step 6.5 — 解析 profile + 校验工具名拼写 + 传递给 worker/explorer 构造器
+- [`docs/tool-profiles.md`](../tool-profiles.md) — 完整用户文档
+- [`config.example.yaml`](../../config.example.yaml) — 示例配置文件
+
+**Per-Worker Tool Profiles 扩展**（2026-04-19，原 v4 §1 提前落地）：
+
+- [`internal/config/config.go`](../../internal/config/config.go) — `WorkerDeclaration` 结构体（`ID` + `Profile`）、`Config.Workers []WorkerDeclaration` 字段、`ValidateWorkers()` 校验（空 ID / 重复 ID / 未知 profile）、`ResolvedWorkerDeclaration(profile)` 三级回退查找（`worker/<profile>` → `worker` → 内置默认值）、`ValidateAgentDeclarations()` 扩展支持 `worker/<profile_name>` 格式 key
+- [`internal/bootstrap/bootstrap.go`](../../internal/bootstrap/bootstrap.go) Step 8 — `workers` 列表分支：逐一创建 Worker（`ValidateWorkers` → `ResolveProfile` → `ValidateToolNames` → `NewWithID`）；构建 `WorkerProfiles` + `WorkerCapabilitiesByProfile` 注入 SchedulerExecutor；启动日志逐 worker 输出 profile 信息
+- [`internal/scheduler/snapshot.go`](../../internal/scheduler/snapshot.go) — `agentSnapshot.Profile`、`agentCapabilitySnapshot.Profile` 字段（omitempty）；`SnapshotSources.WorkerProfiles` + `WorkerCapabilitiesByProfile`；`buildAgentSnapshots` / `buildAgentCapabilities` 支持 per-profile 模式
+- [`internal/scheduler/executor.go`](../../internal/scheduler/executor.go) — `SchedulerExecutor.WorkerProfiles` + `WorkerCapabilitiesByProfile` 字段，通过 `SnapshotSources` 传递给 `BuildBoardJSON`
+- Spec：[`.kiro/specs/per-worker-tool-profiles/`](../../.kiro/specs/per-worker-tool-profiles/)
+- 属性测试 7 个（ValidateWorkers 空 ID / 重复 ID / 未知 profile / 合法配置、ResolvedWorkerDeclaration 三级回退、per-profile agent_capabilities 输出、YAML/JSON round-trip）+ 单元测试 + 集成测试
+
+**现状**：工具集与代理类型解耦，支持通过配置文件定义命名工具集。
 
 **改进方向**：
 
@@ -1453,7 +1515,7 @@ tool_profiles:
 
 ### 9.2 分级权限模型（PermissionMode）
 
-> 原 v2 §1.4 | 状态：📝 待实现 | 优先级：P3
+> 原 v2 §1.4 | 状态：➡️ **已迁移到 v4 §2** | 优先级：P3
 > 前置依赖：§9.1 工具集分层配置
 
 **Why**：不同任务的风险等级不同，"搜索调研"任务不应持有 `write_file / run_shell`，"代码修改"任务不应持有 `web_fetch`。工具集与任务风险不匹配会放大 LLM 幻觉导致的破坏面。
@@ -1469,7 +1531,7 @@ tool_profiles:
 
 ### 9.3 管理员信赖标记（SourceAdminTrusted）
 
-> 原 v2 §1.6 | 状态：📝 待实现 | 优先级：P4
+> 原 v2 §1.6 | 状态：➡️ **已迁移到 v4 §4** | 优先级：P4
 > 前置依赖：待引入外部代理/插件机制后
 
 **Why**：当系统未来支持用户自定义代理或外部插件代理时，需要区分"可信来源"和"不可信来源"，限制不可信代理的工具访问范围。
@@ -1485,9 +1547,20 @@ tool_profiles:
 
 ### 9.4 代理能力声明与 Scheduler 路由感知
 
-> 原 v2 §1.7 | 状态：📝 待实现 | 优先级：P2（阶段一）/ P4（阶段二）
+> 原 v2 §1.7 | 状态：✅ **阶段一已完成**（2026-04-18） / 📝 阶段二待实现 | 优先级：P2（阶段一）/ P4（阶段二）
 > 前置依赖：§9.1 工具集分层配置
 > 关联：v3 §8.1 用特化 agent 注册表覆盖了阶段一的核心需求
+
+**阶段一落地实现**：
+
+- [`internal/config/config.go`](../../internal/config/config.go) — `AgentDeclaration` 结构体（`*[]string` Capabilities + `*string` Description 指针字段区分 nil/显式空）、`Config.AgentDeclarations map[string]AgentDeclaration`、`ResolvedAgentDeclaration()` 合并默认值方法、`ValidateAgentDeclarations()` 校验
+- [`internal/scheduler/agent_registry.go`](../../internal/scheduler/agent_registry.go) — `SpecializedAgent` 新增 `Capabilities []string` 字段，`Register` 合并逻辑支持 Capabilities 覆盖
+- [`internal/scheduler/snapshot.go`](../../internal/scheduler/snapshot.go) — `agentCapabilitySnapshot` + `AgentCapabilityInfo` 结构体、`buildAgentCapabilities()` 函数、`resourceInfo.AgentCapabilities` 字段、`SnapshotSources.WorkerCapabilities` 字段
+- [`internal/bootstrap/bootstrap.go`](../../internal/bootstrap/bootstrap.go) — Step 5.5 从 `cfg.ResolvedAgentDeclaration("explorer")` 读取 Role 和 Capabilities，替代硬编码；启动日志输出已注册特化代理信息
+- [`internal/scheduler/executor.go`](../../internal/scheduler/executor.go) — `SchedulerExecutor.Execute` 从配置读取 Worker 能力声明传入 `SnapshotSources.WorkerCapabilities`
+- [`internal/scheduler/scheduler.go`](../../internal/scheduler/scheduler.go) — `schedulerSystemPrompt` 新增 `agent_capabilities` 字段说明、基于 capabilities 的路由指引、仅路由到已存在代理类型的硬性约束
+- [`config.example.yaml`](../../config.example.yaml) — `agent_declarations` 配置段（含中文注释、默认值示例、显式空值说明）
+- 属性测试 4 个（Property 1-4，覆盖配置合并、未知类型校验、snapshot 完整性、registry 覆盖）+ 单元测试覆盖 bootstrap/scheduler prompt/config YAML 解析
 
 **阶段一：静态能力声明**
 
@@ -1507,34 +1580,31 @@ tool_profiles:
 
 v3 §8.1 已用更轻量的"特化 agent 注册表"方案覆盖了阶段一的核心需求（让 scheduler 知道谁在线、各自的 eventType）。本项在 §9.1 工具集配置化落地后可提供更丰富的能力标签。
 
-**阶段二：任务级能力需求声明**
+**阶段二：任务级能力需求声明** → ➡️ **已迁移到 v4 §3**
 
 `publish_task` 工具新增 `required_capabilities` 参数，由 `ClaimTask` 逻辑在代理认领时做能力匹配校验。
 
-**暂不实施的原因**：通用型 worker 的 capabilities 是全集，校验永远通过。等出现第二种特化型 agent 时再做。
+**暂不实施的原因**：通用型 worker 的 capabilities 是全集，校验永远通过。等 v4 §1 Per-Worker 配置落地后再做。
 
 ---
 
 ### 9.5 工具可用性探针（Tool Health Check）
 
-> 原 v2 §1.8 | 状态：📝 待实现 | 优先级：P3
+> 原 v2 §1.8 | 状态：✅ **已完成**（2026-04-19） | 优先级：P3
 > 前置依赖：§9.1 工具集分层配置
+> Spec：[`.kiro/specs/tool-health-probe/`](../../.kiro/specs/tool-health-probe/)
 
-Bootstrap 阶段新增工具可用性探针，在代理启动前主动检测，失败时降级运行而非崩溃：
+**落地实现**：
 
-```go
-checks := []ToolHealthCheck{
-    {Name: "web_search", Check: probeSearchProvider(cfg)},
-    {Name: "web_fetch",  Check: probeHTTPReachability()},
-}
-for _, c := range checks {
-    if err := c.Check(); err != nil {
-        log.Printf("[警告] 工具 %s 不可用: %v，相关代理将降级运行", c.Name, err)
-    }
-}
-```
-
-探针结果写入 `boardSnapshot`，让 Scheduler 知道"当前 `web_search` 不可用，不要发布依赖网络搜索的任务"。
+- [`internal/probe/status.go`](../../internal/probe/status.go) — `ToolHealthStatus`（sync.Mutex + map，nil-safe receiver）、`ProbeResult` 结构体、`NewToolHealthStatus()` 构造器、`Record` / `UnavailableTools` / `Results` / `IsAvailable` 方法
+- [`internal/probe/probe.go`](../../internal/probe/probe.go) — `Probe` 函数类型、`RunAll(ctx, probes, timeout)` 并发执行框架（context.WithTimeout + goroutine + defer/recover panic 安全）
+- [`internal/probe/web_search.go`](../../internal/probe/web_search.go) — `NewWebSearchProbe(providerName, apiURL, apiKey)` 按 provider 类型探测（DuckDuckGo GET / SearXNG GET / Tavily POST / Serper POST / 空 provider 快速失败）
+- [`internal/probe/web_fetch.go`](../../internal/probe/web_fetch.go) — `NewWebFetchProbe(probeURL)` HTTP HEAD→GET 回退探测 + SSRF 防护（`validateFetchURL` 镜像 webtool.validateURL）
+- [`internal/scheduler/snapshot.go`](../../internal/scheduler/snapshot.go) — `SnapshotSources.ToolHealth` 字段、`resourceInfo.UnavailableTools` 字段（omitempty 向后兼容）、`BuildBoardJSON` 读取并渲染
+- [`internal/scheduler/executor.go`](../../internal/scheduler/executor.go) — `SchedulerExecutor.ToolHealth` 字段，通过 `SnapshotSources` 传递给 `BuildBoardJSON`
+- [`internal/scheduler/scheduler.go`](../../internal/scheduler/scheduler.go) — `schedulerSystemPrompt` "你能看见什么" 段追加 `unavailable_tools` 降级指引；`Bundle.SchedulerExec` 字段暴露以便 Bootstrap 注入
+- [`internal/bootstrap/bootstrap.go`](../../internal/bootstrap/bootstrap.go) — Step 6.8 探针执行（`probe.RunAll` 10s 超时）+ 启动日志 + `sched.SchedulerExec.ToolHealth = toolHealth` 注入
+- 7 个属性测试（Property 1-7，pgregory.net/rapid 各 100 次迭代）+ ~40 个单元测试，覆盖超时、并发有界、Record/Query 不变量、空密钥快速失败、HTTP 状态码分类、Snapshot 渲染正确性、序列化 round-trip
 
 ---
 
@@ -1561,7 +1631,7 @@ Artifacts 基础设施（in-memory）已完成（2026-04-08）。持久化部分
 
 ### 9.7 冲突避免长期方案
 
-> 原 v2 §3.2 | 状态：🔄 需重新设计 | 优先级：P3
+> 原 v2 §3.2 | 状态：➡️ **已迁移到 v4 §5** | 优先级：P3
 > 关联：v3 §8.3 文件冲突排队是过渡方案，本项是长期替代
 
 v3 §8.3 的 Roster 写入等待队列是过渡方案（低效但可用）。当 worker 数量增加到 5+ 且冲突频率显著上升时，需从根源减少冲突发生：
@@ -1577,7 +1647,7 @@ v3 §8.3 的 Roster 写入等待队列是过渡方案（低效但可用）。当
 
 ### 9.8 Agent 休眠/唤醒优化（Suspend/Resume）
 
-> 原 v2 §3.5 | 状态：📝 待实现 | 优先级：P4
+> 原 v2 §3.5 | 状态：➡️ **已迁移到 v4 §6** | 优先级：P4
 > 触发条件：Worker 数量扩展到 20+ 时
 
 **现状**：Agent 空闲时每 500ms 扫描一次 store。在 1-3 个 Worker 的 MVP 规模下 CPU 开销可忽略。
@@ -1590,34 +1660,51 @@ v3 §8.3 的 Roster 写入等待队列是过渡方案（低效但可用）。当
 
 ### 9.9 Session 化日志与状态持久化
 
-> 原 v2 §3.8 | 状态：📝 待实现 | 优先级：P2
+> 原 v2 §3.8 | 状态：✅ **已完成**（2026-04-18，三阶段全部落地） | 优先级：P2
 > 关联：§9.6 Artifacts 持久化属于同一"持久化与故障恢复"专题
+> Spec：[`.kiro/specs/session-logging/`](../../.kiro/specs/session-logging/)
 
-**Why**：当前日志输出到控制台且无持久化归档，任务历史随进程结束而丢失。用户无法中断工作后恢复上下文。
+**落地实现**：
+
+- [`internal/session/types.go`](../../internal/session/types.go) — `SessionConfig`、`Session`、`Metadata` 结构体 + `NewMetadata()` + `Save`/`LoadMetadata` 原子写入
+- [`internal/session/manager.go`](../../internal/session/manager.go) — `SessionManager` 核心生命周期（`NewSessionManager` 启动恢复/降级、`CreateNew`、`Close`、`SwitchTo`、`List`、`RecordFirstInput`、`IncrementTaskCount`、`LogWriter` 双写、`SaveSnapshot`/`LoadSnapshot`、`RunArchive`）
+- [`internal/session/snapshot.go`](../../internal/session/snapshot.go) — `Snapshot`/`TaskSnapshot`/`RosterSnapshot`/`MailboxSnapshot` 结构体 + `SaveSnapshot`/`LoadSnapshot`（原子写入 + 版本兼容性检查）
+- [`internal/session/history.go`](../../internal/session/history.go) — `HistoryLog` JSONL 追加式事件溯源日志（复用 ArtifactLog 的 Mutex + bufio.Writer + fsync 模式）+ 10 个事件类型常量
+- [`internal/session/emitter.go`](../../internal/session/emitter.go) — `HistoryEmitter` 接口，供 TaskStore/Roster/Registry 通过 `SetHistoryEmitter` 注入
+- [`internal/session/replay.go`](../../internal/session/replay.go) — `ReplayToState` 事件重放引擎，从空状态重建 Task/Roster/Mailbox 状态
+- [`internal/session/prettyprint.go`](../../internal/session/prettyprint.go) — `PrettyPrint`/`ParsePrettyPrint` 人类可读格式化 + round-trip 解析
+- [`internal/session/archive.go`](../../internal/session/archive.go) — `RunArchive` 归档过期 Session + 超限清理
+- [`internal/store/memory.go`](../../internal/store/memory.go) — `ExportSnapshot`/`ImportSnapshot` 组件导出方法
+- [`internal/roster/memory.go`](../../internal/roster/memory.go) — `ExportSnapshot`/`ImportSnapshot` 组件导出方法
+- [`internal/mailbox/mailbox.go`](../../internal/mailbox/mailbox.go) — `ExportSnapshot`/`ImportSnapshot` 组件导出方法
+- [`internal/cli/cli.go`](../../internal/cli/cli.go) — `/new`、`/session` 命令 + `RecordFirstInput` 集成
+- [`internal/bootstrap/bootstrap.go`](../../internal/bootstrap/bootstrap.go) — Step 1.3 Session 初始化 + trace 目录重定向 + Shutdown 关闭
+- [`internal/config/config.go`](../../internal/config/config.go) — `SessionRetentionDays`（默认 30）、`SessionArchiveMax`（默认 50）配置项
+- 10 个属性测试（Property 1-10）覆盖 Snapshot round-trip、事件溯源一致性、Pretty Printer round-trip、Metadata 完整性、active-session 指针、首条输入幂等性、任务计数递增、Session 列表排序、HistoryEvent 结构、归档清理保留最新
+- 80+ 单元测试覆盖全部三阶段功能
 
 **存储架构**：
 
 ```
 ~/.agentgo/sessions/
 ├── active-session
-├── sessions.db
 ├── sess-{uuid}/
 │   ├── metadata.json
 │   ├── snapshot.json
 │   ├── history.jsonl
-│   └── logs/agentgo.log
+│   └── logs/
+│       ├── agentgo.log
+│       └── <trace files>.jsonl
 └── archive/
 ```
 
-**分阶段实施**：
+**三阶段实施（全部完成）**：
 
-| 阶段 | 内容 |
-|------|------|
-| 阶段一 | 仅日志隔离（最小可行）：Session 切换 = 切换日志文件 + 新建空白状态 |
-| 阶段二 | 快照持久化：TaskStore、Roster、Mailbox 序列化到 `snapshot.json` |
-| 阶段三 | 事件溯源：`history.jsonl` + 重放重建状态 |
-
-**暂不实施的原因**：当前阶段优先级在于功能正确性和安全性。Session 化管理属于体验优化，待核心架构稳定后再实施。
+| 阶段 | 内容 | 状态 |
+|------|------|------|
+| 阶段一 | Session 目录结构、日志隔离（双写）、元数据管理、CLI `/new` `/session` 命令、Bootstrap 集成 | ✅ |
+| 阶段二 | 状态快照持久化（TaskStore/Roster/Mailbox 序列化）、启动恢复、Session 切换状态重置 | ✅ |
+| 阶段三 | 事件溯源（`history.jsonl` + 重放引擎）、事件发射集成、Pretty Printer、归档与清理 | ✅ |
 
 ---
 
@@ -1626,14 +1713,15 @@ v3 §8.3 的 Roster 写入等待队列是过渡方案（低效但可用）。当
 | 优先级 | 子项 | 依赖 | 状态 |
 |--------|------|------|------|
 | P1 | §9.6 Artifacts 持久化 | TaskStore 整体持久化专题 | ✅ 已完成（Sprint 2 2026-04-12，方案 B JSONL） |
-| P2 | §9.1 工具集分层配置 | 无 | 📝 待实现 |
-| P2 | §9.4 能力声明阶段一 | §9.1 | 📝 待实现（被 §8.1 部分覆盖） |
-| P2 | §9.9 Session 化日志 | 持久化专题 | 📝 待实现 |
-| P3 | §9.2 分级权限模型 | §9.1 | 📝 待实现 |
-| P3 | §9.5 工具可用性探针 | §9.1 | 📝 待实现 |
-| P3 | §9.7 冲突避免长期方案 | §8.3 过渡方案先落地 | 🔄 需重新设计 |
-| P4 | §9.3 管理员信赖标记 | 待引入外部代理 | 📝 待实现 |
-| P4 | §9.4 能力声明阶段二 | §9.4 阶段一 + §9.2 | 📝 待实现 |
-| P4 | §9.8 Agent 休眠/唤醒 | 待 Worker 规模增长 | 📝 待实现 |
+| P2 | §9.1 工具集分层配置 | 无 | ✅ 已完成（2026-04-18 文档补充） |
+| P2 | §9.1+ Per-Worker Tool Profiles | §9.1 | ✅ 已完成（2026-04-19，v4 §1 提前落地） |
+| P2 | §9.4 能力声明阶段一 | §9.1 | ✅ 已完成（2026-04-18，config + registry + snapshot + bootstrap + scheduler prompt） |
+| P2 | §9.9 Session 化日志 | 持久化专题 | ✅ 已完成（2026-04-18，三阶段全部落地） |
+| P3 | §9.2 分级权限模型 | §9.1 | ➡️ 已迁移到 v4 §2 |
+| P3 | §9.5 工具可用性探针 | §9.1 | ✅ 已完成（2026-04-19） |
+| P3 | §9.7 冲突避免长期方案 | §8.3 过渡方案先落地 | ➡️ 已迁移到 v4 §5 |
+| P4 | §9.3 管理员信赖标记 | 待引入外部代理 | ➡️ 已迁移到 v4 §4 |
+| P4 | §9.4 能力声明阶段二 | §9.4 阶段一 + §9.2 | ➡️ 已迁移到 v4 §3 |
+| P4 | §9.8 Agent 休眠/唤醒 | 待 Worker 规模增长 | ➡️ 已迁移到 v4 §6 |
 
 ---

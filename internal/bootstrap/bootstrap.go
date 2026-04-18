@@ -19,8 +19,10 @@ import (
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
+	"agentgo/internal/probe"
 	"agentgo/internal/roster"
 	"agentgo/internal/scheduler"
+	"agentgo/internal/session"
 	"agentgo/internal/shell"
 	"agentgo/internal/store"
 	"agentgo/internal/tools"
@@ -44,7 +46,8 @@ type System struct {
 	Workers         []*worker.Worker
 	ApprovalCh      chan shell.ApprovalRequest // 命令审批通道，Worker→CLI
 	CLI             *cli.CLI
-	ArtifactLog     *store.ArtifactLog // Artifacts 持久化日志，Shutdown 时需 Close；nil 表示持久化已禁用
+	ArtifactLog     *store.ArtifactLog      // Artifacts 持久化日志，Shutdown 时需 Close；nil 表示持久化已禁用
+	SessionMgr      *session.SessionManager // Session 管理器，nil 表示无 Session 模式
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
 }
@@ -57,9 +60,28 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	}
 	fmt.Println("[启动] 全局配置加载完成")
 
+	// Step 1.3: 初始化 Session 管理器
+	homeDir := cfg.ProjectRoot
+	sessionCfg := session.SessionConfig{
+		RetentionDays: cfg.SessionRetentionDays,
+		ArchiveMax:    cfg.SessionArchiveMax,
+		Enabled:       true,
+	}
+	sessDir := filepath.Join(homeDir, ".agentgo", "sessions")
+	sessMgr, sessErr := session.NewSessionManager(sessDir, sessionCfg)
+	if sessErr != nil {
+		fmt.Printf("[启动] WARNING: Session 初始化失败: %v —— 以无 Session 模式运行\n", sessErr)
+	}
+
 	// Step 1.5: 初始化 trace 系统（每任务一份 JSONL 文件，保留最近 100 个）
 	// trace 写入失败仅打印 warning，不中断主流程
 	traceDir := filepath.Join(cfg.ProjectRoot, ".agentgo", "traces")
+
+	// 如果 Session 初始化成功，将 trace 目录重定向到 Session 的 logs/ 子目录
+	if sessMgr != nil && sessMgr.Current() != nil {
+		traceDir = sessMgr.LogDir()
+	}
+
 	traceWriter, traceErr := trace.NewWriter(traceDir, 100)
 	if traceErr != nil {
 		fmt.Printf("[启动] WARNING: trace 系统初始化失败 (dir=%s): %v\n", traceDir, traceErr)
@@ -248,11 +270,22 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	// 特化类型时，在这里追加 Register 调用；scheduler 的 board snapshot 会
 	// 自动把它渲染到 Resources.SpecializedAgents。
 	agentRegistry := scheduler.NewAgentRegistry()
+	// 从配置读取 Explorer 声明（Requirements 2.1, 2.2）
+	explorerCaps, explorerDesc := cfg.ResolvedAgentDeclaration("explorer")
 	agentRegistry.Register(scheduler.SpecializedAgent{
-		EventType: cfg.ExplorerEventType, // 通常是 "explore"
-		Count:     1,                     // 当前架构每种特化代理各一个实例
-		Role:      "只读调查代理（Explorer），能力限定为 read_file / list_dir / grep_search / glob_search / web_search / web_fetch / send_message。不能写文件、执行 shell、或发布子任务，适合承担代码库调研、网页检索、事实核验等只读任务。",
+		EventType:    cfg.ExplorerEventType, // 通常是 "explore"
+		Count:        1,                     // 当前架构每种特化代理各一个实例
+		Role:         explorerDesc,
+		Capabilities: explorerCaps,
 	})
+	// 启动日志：输出每个已注册特化代理的 EventType 和 description 摘要（Requirements 2.3）
+	for _, sa := range agentRegistry.Specialized() {
+		desc := sa.Role
+		if len(desc) > 80 {
+			desc = desc[:80] + "…"
+		}
+		fmt.Printf("[启动] 特化代理已注册: EventType=%s, description=%s\n", sa.EventType, desc)
+	}
 	fmt.Printf("[启动] Agent 注册表初始化完成（%d 个特化代理）\n", len(agentRegistry.Specialized()))
 
 	// Step 6: 创建看门狗（先于 scheduler 创建——scheduler 需要 approvalCh，但 watchdog 不需要）
@@ -274,6 +307,24 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 		}
 	}
 
+	// Step 6.8: 工具可用性探针
+	probes := []probe.Probe{
+		probe.NewWebSearchProbe(cfg.SearchAPIProvider, cfg.SearchAPIURL, cfg.SearchAPIKey),
+		probe.NewWebFetchProbe(""),
+	}
+	toolHealth := probe.RunAll(context.Background(), probes, 10*time.Second)
+
+	// 打印启动日志
+	if unavailable := toolHealth.UnavailableTools(); len(unavailable) == 0 {
+		fmt.Println("[启动] 工具可用性探测完成（全部可用）")
+	} else {
+		for _, r := range toolHealth.Results() {
+			if !r.Available {
+				fmt.Printf("[警告] 工具 %s 不可用: %s，相关代理将降级运行\n", r.Tool, r.Error)
+			}
+		}
+	}
+
 	// Step 7: 创建调查代理（复用与 Worker 相同的 SearchProvider 配置）
 	explorerSearchProvider := webtool.NewProvider(cfg.SearchAPIProvider, cfg.SearchAPIURL, cfg.SearchAPIKey)
 	exp := explorer.New(taskStore, r, explorerLLM, cfg, cancelRegistry, mbRegistry, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView, explorerAllowed, explorerSearchProvider)
@@ -288,21 +339,70 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 		taskStore, r, schedulerLLM, eventCh, cfg, cancelRegistry, mbRegistry, approvalCh,
 		hookReg, storeView, recordToolCall, agentRegistry,
 	)
+	sched.SchedulerExec.ToolHealth = toolHealth
 
 	// Step 8: 创建执行代理（使用主 LLM，认领 event_type="" 的执行任务）
-	workerCount := cfg.WorkerCount
-	if workerCount <= 0 {
-		workerCount = 1
-	}
 	var workers []*worker.Worker
-	for i := 1; i <= workerCount; i++ {
-		workerLLM := llm.NewSDKClient(
-			cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel,
-			"", // system prompt 由 worker 内部管理
-			time.Duration(cfg.LLMTimeoutSec)*time.Second,
-		)
-		wk := worker.NewWithID(fmt.Sprintf("worker-%d", i), taskStore, r, workerLLM, cfg, cancelRegistry, mbRegistry, approvalCh, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView, workerAllowed)
-		workers = append(workers, wk)
+	if len(cfg.Workers) > 0 {
+		// 新路径：按 workers 列表逐一创建 Worker
+		if err := cfg.ValidateWorkers(); err != nil {
+			return nil, fmt.Errorf("workers 列表校验失败: %w", err)
+		}
+
+		// 构建 WorkerProfiles 和 WorkerCapabilitiesByProfile 供 Scheduler board snapshot 使用
+		workerProfiles := make(map[string]string, len(cfg.Workers))
+		capsByProfile := make(map[string]*scheduler.AgentCapabilityInfo)
+		for _, decl := range cfg.Workers {
+			workerProfiles[decl.ID] = decl.Profile
+			if _, exists := capsByProfile[decl.Profile]; !exists {
+				caps, desc := cfg.ResolvedWorkerDeclaration(decl.Profile)
+				capsByProfile[decl.Profile] = &scheduler.AgentCapabilityInfo{
+					Capabilities: caps,
+					Description:  desc,
+				}
+			}
+		}
+		sched.SchedulerExec.WorkerProfiles = workerProfiles
+		sched.SchedulerExec.WorkerCapabilitiesByProfile = capsByProfile
+
+		for _, decl := range cfg.Workers {
+			allowedTools, err := cfg.ResolveProfile(decl.Profile)
+			if err != nil {
+				return nil, fmt.Errorf("worker %q profile 解析失败: %w", decl.ID, err)
+			}
+			if allowedTools != nil {
+				if err := tools.ValidateToolNames(allowedTools); err != nil {
+					return nil, fmt.Errorf("worker %q profile %q 工具名校验失败: %w", decl.ID, decl.Profile, err)
+				}
+			}
+			workerLLM := llm.NewSDKClient(
+				cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel,
+				"", // system prompt 由 worker 内部管理
+				time.Duration(cfg.LLMTimeoutSec)*time.Second,
+			)
+			wk := worker.NewWithID(decl.ID, taskStore, r, workerLLM, cfg, cancelRegistry, mbRegistry, approvalCh, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView, allowedTools)
+			workers = append(workers, wk)
+			profileLabel := decl.Profile
+			if profileLabel == "" {
+				profileLabel = "全量工具"
+			}
+			fmt.Printf("[启动] Worker %s 已启动 [profile=%s]\n", decl.ID, profileLabel)
+		}
+	} else {
+		// 旧路径：worker_count + worker_profile
+		workerCount := cfg.WorkerCount
+		if workerCount <= 0 {
+			workerCount = 1
+		}
+		for i := 1; i <= workerCount; i++ {
+			workerLLM := llm.NewSDKClient(
+				cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel,
+				"", // system prompt 由 worker 内部管理
+				time.Duration(cfg.LLMTimeoutSec)*time.Second,
+			)
+			wk := worker.NewWithID(fmt.Sprintf("worker-%d", i), taskStore, r, workerLLM, cfg, cancelRegistry, mbRegistry, approvalCh, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView, workerAllowed)
+			workers = append(workers, wk)
+		}
 	}
 
 	// Step 9: 创建邮差通知器
@@ -319,6 +419,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 		MailboxRegistry: mbRegistry,
 		MailNotifier:    mailNotifier,
 		ArtifactLog:     artifactLog, // 可能为 nil（OpenArtifactLog 失败时），Shutdown 会判空
+		SessionMgr:      sessMgr,     // 可能为 nil（Session 初始化失败时），Shutdown 会判空
 		Scheduler:       sched,
 		Explorer:        exp,
 		Workers:         workers,
@@ -398,7 +499,7 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
 
 // RunCLI 启动 CLI 主循环，阻塞直到用户退出或 ctx 取消。
 func (s *System) RunCLI(ctx context.Context, reader io.Reader, writer io.Writer) {
-	s.CLI = cli.New(s.Store, s.EventCh, s.cancel, s.Scheduler, s.MailboxRegistry, s.ApprovalCh, reader, writer)
+	s.CLI = cli.New(s.Store, s.EventCh, s.cancel, s.Scheduler, s.MailboxRegistry, s.ApprovalCh, reader, writer, s.SessionMgr)
 	s.CLI.Run(ctx)
 }
 
@@ -419,6 +520,12 @@ func (s *System) Shutdown() {
 	if s.ArtifactLog != nil {
 		if err := s.ArtifactLog.Close(); err != nil {
 			fmt.Printf("[关闭] WARNING: artifact log 关闭失败: %v\n", err)
+		}
+	}
+	// 关闭 Session 管理器——更新 metadata 并关闭日志文件句柄
+	if s.SessionMgr != nil {
+		if err := s.SessionMgr.Close(); err != nil {
+			fmt.Printf("[关闭] WARNING: Session 关闭失败: %v\n", err)
 		}
 	}
 	fmt.Println("[关闭] 系统已停止")

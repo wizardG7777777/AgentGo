@@ -3,11 +3,13 @@ package roster
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
 
 	"agentgo/internal/model"
+	"agentgo/internal/session"
 )
 
 var (
@@ -24,10 +26,11 @@ type waiter struct {
 }
 
 type MemoryRoster struct {
-	mu         sync.RWMutex
-	claims     map[string]model.Claim  // filePath -> Claim
-	agentFiles map[string][]string     // agentID -> []filePath
-	waiters    map[string][]waiter     // filePath -> FIFO 等待队列
+	mu             sync.RWMutex
+	claims         map[string]model.Claim // filePath -> Claim
+	agentFiles     map[string][]string    // agentID -> []filePath
+	waiters        map[string][]waiter    // filePath -> FIFO 等待队列
+	historyEmitter session.HistoryEmitter // nil = no-op
 }
 
 func NewMemoryRoster() *MemoryRoster {
@@ -38,11 +41,18 @@ func NewMemoryRoster() *MemoryRoster {
 	}
 }
 
-func (r *MemoryRoster) TryClaim(agentID string, filePath string) (bool, error) {
+// SetHistoryEmitter 注入事件溯源日志发射器。nil 为合法——表示禁用事件发射。
+func (r *MemoryRoster) SetHistoryEmitter(e session.HistoryEmitter) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.historyEmitter = e
+}
+
+func (r *MemoryRoster) TryClaim(agentID string, filePath string) (bool, error) {
+	r.mu.Lock()
 
 	if _, occupied := r.claims[filePath]; occupied {
+		r.mu.Unlock()
 		return false, nil
 	}
 
@@ -52,37 +62,62 @@ func (r *MemoryRoster) TryClaim(agentID string, filePath string) (bool, error) {
 		ClaimedAt: time.Now(),
 	}
 	r.agentFiles[agentID] = append(r.agentFiles[agentID], filePath)
+	r.mu.Unlock()
+
+	r.emitHistory(session.HistEventRosterClaim, map[string]any{
+		"agent_id":  agentID,
+		"file_path": filePath,
+	})
 	return true, nil
 }
 
 func (r *MemoryRoster) Release(agentID string, filePath string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	claim, ok := r.claims[filePath]
 	if !ok {
+		r.mu.Unlock()
 		return ErrClaimNotFound
 	}
 	if claim.AgentID != agentID {
+		r.mu.Unlock()
 		return ErrNotClaimOwner
 	}
 
 	delete(r.claims, filePath)
 	r.removeAgentFile(agentID, filePath)
 	r.notifyFirstWaiter(filePath) // §8.3：唤醒 FIFO 队首等待者
+	r.mu.Unlock()
+
+	r.emitHistory(session.HistEventRosterRelease, map[string]any{
+		"agent_id":  agentID,
+		"file_path": filePath,
+	})
 	return nil
 }
 
 func (r *MemoryRoster) ReleaseAll(agentID string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	files := r.agentFiles[agentID]
+	// Copy file list for event emission after unlock
+	released := make([]string, len(files))
+	copy(released, files)
+
 	for _, fp := range files {
 		delete(r.claims, fp)
 		r.notifyFirstWaiter(fp) // §8.3：每个被释放的文件都唤醒其队首等待者
 	}
 	delete(r.agentFiles, agentID)
+	r.mu.Unlock()
+
+	// Emit one roster_release event per released file
+	for _, fp := range released {
+		r.emitHistory(session.HistEventRosterRelease, map[string]any{
+			"agent_id":  agentID,
+			"file_path": fp,
+		})
+	}
 	return nil
 }
 
@@ -131,6 +166,25 @@ func (r *MemoryRoster) removeAgentFile(agentID string, filePath string) {
 			r.agentFiles[agentID] = append(files[:i], files[i+1:]...)
 			return
 		}
+	}
+}
+
+// emitHistory emits a history event if the emitter is set. Failures are logged
+// as warnings and never propagated. Must be called outside r.mu.
+func (r *MemoryRoster) emitHistory(eventType string, payload map[string]any) {
+	r.mu.RLock()
+	emitter := r.historyEmitter
+	r.mu.RUnlock()
+	if emitter == nil {
+		return
+	}
+	ev := session.HistoryEvent{
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		EventType: eventType,
+		Payload:   payload,
+	}
+	if err := emitter.Append(ev); err != nil {
+		log.Printf("[roster] WARN history emit %s failed: %v", eventType, err)
 	}
 }
 
@@ -209,4 +263,47 @@ func (r *MemoryRoster) removeWaiter(filePath string, ch chan struct{}) {
 	if len(r.waiters[filePath]) == 0 {
 		delete(r.waiters, filePath)
 	}
+}
+
+// ExportSnapshot 导出当前所有文件占用声明为 session.RosterSnapshot。
+func (r *MemoryRoster) ExportSnapshot() session.RosterSnapshot {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	claims := make([]session.ClaimSnapshot, 0, len(r.claims))
+	for _, claim := range r.claims {
+		claims = append(claims, session.ClaimSnapshot{
+			AgentID:   claim.AgentID,
+			FilePath:  claim.FilePath,
+			ClaimedAt: claim.ClaimedAt.UTC().Format(time.RFC3339),
+		})
+	}
+	return session.RosterSnapshot{Claims: claims}
+}
+
+// ImportSnapshot 从 RosterSnapshot 恢复文件占用声明。
+// 清空现有 claims 和 agentFiles 后重建。
+func (r *MemoryRoster) ImportSnapshot(snap session.RosterSnapshot) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// 清空现有状态
+	r.claims = make(map[string]model.Claim)
+	r.agentFiles = make(map[string][]string)
+	// waiters 不恢复——等待队列是运行时状态
+
+	for _, cs := range snap.Claims {
+		claimedAt, err := time.Parse(time.RFC3339, cs.ClaimedAt)
+		if err != nil {
+			return fmt.Errorf("parse claimed_at for %s: %w", cs.FilePath, err)
+		}
+		claim := model.Claim{
+			AgentID:   cs.AgentID,
+			FilePath:  cs.FilePath,
+			ClaimedAt: claimedAt,
+		}
+		r.claims[cs.FilePath] = claim
+		r.agentFiles[cs.AgentID] = append(r.agentFiles[cs.AgentID], cs.FilePath)
+	}
+	return nil
 }

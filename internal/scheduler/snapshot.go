@@ -8,6 +8,7 @@ import (
 	"agentgo/internal/config"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
+	"agentgo/internal/probe"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
 )
@@ -33,8 +34,10 @@ type resourceInfo struct {
 	WorkerCount       int                        `json:"worker_count"`
 	BusyWorkers       int                        `json:"busy_workers"`
 	AvailableWorkers  int                        `json:"available_workers"`
+	UnavailableTools  []string                   `json:"unavailable_tools,omitempty"`
 	Agents            []agentSnapshot            `json:"agents,omitempty"`
 	SpecializedAgents []specializedAgentSnapshot `json:"specialized_agents,omitempty"`
+	AgentCapabilities []agentCapabilitySnapshot  `json:"agent_capabilities,omitempty"`
 }
 
 // specializedAgentSnapshot 是 board snapshot 里"特化代理聚合视图"的一行。
@@ -54,6 +57,23 @@ type specializedAgentSnapshot struct {
 	Role      string `json:"role,omitempty"`
 }
 
+// agentCapabilitySnapshot 是 board snapshot 中"代理能力声明"的一行。
+// 每种代理类型（worker / explorer / 其他特化代理）各一条记录，
+// 让 Scheduler LLM 在路由决策时能基于结构化的能力标签选择 event_type。
+type agentCapabilitySnapshot struct {
+	AgentType    string   `json:"agent_type"`
+	Profile      string   `json:"profile,omitempty"`
+	Capabilities []string `json:"capabilities"`
+	Description  string   `json:"description"`
+}
+
+// AgentCapabilityInfo 是传入 snapshot 构建的能力信息载体。
+// Worker 不在 AgentRegistry 中注册，其能力声明通过此结构体单独传入。
+type AgentCapabilityInfo struct {
+	Capabilities []string
+	Description  string
+}
+
 // agentSnapshot 是单个活跃代理的运行时快照。
 // "活跃" = 已注册到 mailbox.Registry，包括 worker / explorer / scheduler 自己。
 //
@@ -65,6 +85,7 @@ type specializedAgentSnapshot struct {
 type agentSnapshot struct {
 	ID              string   `json:"id"`
 	Type            string   `json:"type"` // "worker" / "explorer" / "scheduler" / "unknown"
+	Profile         string   `json:"profile,omitempty"`
 	MailboxPending  int      `json:"mailbox_pending"`
 	CurrentTaskID   string   `json:"current_task_id,omitempty"`
 	CurrentTaskDesc string   `json:"current_task_desc,omitempty"`
@@ -116,6 +137,21 @@ type SnapshotSources struct {
 	Roster        roster.Roster
 	History       *SessionHistory
 	AgentRegistry *AgentRegistry
+	// WorkerCapabilities 是 Worker 代理的能力声明（从 Config 读取）。
+	// Worker 不在 AgentRegistry 中注册，需要单独传入。
+	// nil 时不输出 worker 的 agent_capabilities 记录。
+	WorkerCapabilities *AgentCapabilityInfo
+	// WorkerProfiles 是每个 Worker 的 profile 映射（agentID → profile 名称）。
+	// 用于在 agentSnapshot 中填充 Profile 字段。
+	// nil 时不输出 profile 字段（向后兼容）。
+	WorkerProfiles map[string]string
+	// WorkerCapabilitiesByProfile 是按 profile 分组的 Worker 能力声明。
+	// 替代原来的单一 WorkerCapabilities 字段。
+	// nil 时回退到 WorkerCapabilities 的旧行为。
+	WorkerCapabilitiesByProfile map[string]*AgentCapabilityInfo
+	// ToolHealth 是 Bootstrap 阶段的工具可用性探测结果。
+	// nil 时不输出 unavailable_tools 字段（向后兼容）。
+	ToolHealth *probe.ToolHealthStatus
 }
 
 // BuildBoardJSON 构造 scheduler agent 在每轮 reactLoop 注入到 history 的 board 快照 JSON。
@@ -183,17 +219,24 @@ func BuildBoardJSON(
 			busyWorkers += len(t.Agents)
 		}
 	}
-	workerCount := cfg.WorkerCount
+	workerCount := len(cfg.Workers)
 	if workerCount <= 0 {
-		workerCount = 1
+		// 旧路径：workers 列表为空，回退到 worker_count 字段
+		workerCount = cfg.WorkerCount
+		if workerCount <= 0 {
+			workerCount = 1
+		}
 	}
 	available := max(workerCount-busyWorkers, 0)
 
 	// 构造 agents 列表（来自 mailbox.Registry + roster + store 的反向映射）
-	agents := buildAgentSnapshots(tasks, sources.MBRegistry, sources.Roster)
+	agents := buildAgentSnapshots(tasks, sources.MBRegistry, sources.Roster, sources.WorkerProfiles)
 
 	// 构造特化代理聚合视图（来自 AgentRegistry 静态声明 + live task 扫描）
 	specialized := buildSpecializedAgentSnapshots(tasks, sources.AgentRegistry)
+
+	// 构造代理能力声明（来自 AgentRegistry + Worker 能力声明）
+	agentCaps := buildAgentCapabilities(sources.AgentRegistry, sources.WorkerCapabilities, sources.WorkerCapabilitiesByProfile)
 
 	// 构造 session history（来自 SessionHistory + store 的状态查询）
 	sessionEntries := buildSessionEntries(s, sources.History)
@@ -206,13 +249,96 @@ func BuildBoardJSON(
 			WorkerCount:       workerCount,
 			BusyWorkers:       busyWorkers,
 			AvailableWorkers:  available,
+			UnavailableTools:  sources.ToolHealth.UnavailableTools(),
 			Agents:            agents,
 			SpecializedAgents: specialized,
+			AgentCapabilities: agentCaps,
 		},
 		SessionHistory: sessionEntries,
 	}
 	data, _ := json.MarshalIndent(bs, "", "  ")
 	return string(data)
+}
+
+// buildAgentCapabilities 合并 AgentRegistry 中的特化代理 + Worker 的能力声明，
+// 产出 agent_capabilities 数组。
+//
+// 排序规则：
+//   - Worker 记录始终排在第一位（当 workerCaps 非 nil 时）
+//   - 当 capsByProfile 非空时，为每个不同的 profile 输出一条带 profile 字段的记录（按 profile 名字典序排列）
+//   - 特化代理按 registry.Specialized() 的注册顺序排列
+//
+// 当 workerCaps 为 nil、capsByProfile 为空且 registry 为空/nil 时返回 nil（omitempty 省略字段）。
+func buildAgentCapabilities(
+	registry *AgentRegistry,
+	workerCaps *AgentCapabilityInfo,
+	capsByProfile map[string]*AgentCapabilityInfo,
+) []agentCapabilitySnapshot {
+	entries := registry.Specialized()
+
+	// Per-profile 模式：capsByProfile 非空时，忽略 workerCaps，为每个 profile 输出一条记录
+	if len(capsByProfile) > 0 {
+		if len(entries) == 0 && len(capsByProfile) == 0 {
+			return nil
+		}
+
+		out := make([]agentCapabilitySnapshot, 0, len(capsByProfile)+len(entries))
+
+		// 按 profile 名字典序排列，确保稳定输出
+		profiles := make([]string, 0, len(capsByProfile))
+		for p := range capsByProfile {
+			profiles = append(profiles, p)
+		}
+		sort.Strings(profiles)
+
+		for _, p := range profiles {
+			info := capsByProfile[p]
+			out = append(out, agentCapabilitySnapshot{
+				AgentType:    "worker",
+				Profile:      p,
+				Capabilities: info.Capabilities,
+				Description:  info.Description,
+			})
+		}
+
+		// 特化代理从 registry 读取
+		for _, e := range entries {
+			out = append(out, agentCapabilitySnapshot{
+				AgentType:    e.EventType,
+				Capabilities: e.Capabilities,
+				Description:  e.Role,
+			})
+		}
+
+		return out
+	}
+
+	// 旧路径：单条 worker 记录（向后兼容）
+	if workerCaps == nil && len(entries) == 0 {
+		return nil
+	}
+
+	out := make([]agentCapabilitySnapshot, 0, len(entries)+1)
+
+	// Worker 始终排在第一位
+	if workerCaps != nil {
+		out = append(out, agentCapabilitySnapshot{
+			AgentType:    "worker",
+			Capabilities: workerCaps.Capabilities,
+			Description:  workerCaps.Description,
+		})
+	}
+
+	// 特化代理从 registry 读取
+	for _, e := range entries {
+		out = append(out, agentCapabilitySnapshot{
+			AgentType:    e.EventType,
+			Capabilities: e.Capabilities,
+			Description:  e.Role,
+		})
+	}
+
+	return out
 }
 
 // buildSpecializedAgentSnapshots 合并静态 AgentRegistry + live task 扫描，
@@ -256,7 +382,7 @@ func buildSpecializedAgentSnapshots(tasks []*model.Task, registry *AgentRegistry
 //  2. 反向遍历 tasks 构造 agentID → currentTask 映射（仅 processing 状态）
 //  3. 对每个代理调 roster.ListByAgent 拿当前 file claims（roster nil 时跳过）
 //  4. 按 agentID 字典序排序确保稳定输出
-func buildAgentSnapshots(tasks []*model.Task, mb *mailbox.Registry, r roster.Roster) []agentSnapshot {
+func buildAgentSnapshots(tasks []*model.Task, mb *mailbox.Registry, r roster.Roster, workerProfiles map[string]string) []agentSnapshot {
 	if mb == nil {
 		return nil
 	}
@@ -286,6 +412,11 @@ func buildAgentSnapshots(tasks []*model.Task, mb *mailbox.Registry, r roster.Ros
 			ID:             st.AgentID,
 			Type:           agentTypeFromEventType(st.EventType),
 			MailboxPending: st.Count,
+		}
+		if workerProfiles != nil {
+			if profile, ok := workerProfiles[st.AgentID]; ok {
+				snap.Profile = profile
+			}
 		}
 		if cur, ok := currentTask[st.AgentID]; ok {
 			snap.CurrentTaskID = cur.ID

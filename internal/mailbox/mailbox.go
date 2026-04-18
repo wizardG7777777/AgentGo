@@ -1,6 +1,7 @@
 package mailbox
 
 import (
+	"agentgo/internal/session"
 	"fmt"
 	"log"
 	"sync"
@@ -207,11 +208,12 @@ func truncate(s string, maxRunes int) string {
 // 注入。零值（未挂接）时所有 hook 调用被跳过 —— 既有测试以及不需要 hook
 // 的调用方完全不需要修改。
 type Registry struct {
-	mu         sync.RWMutex
-	boxes      map[string]*Mailbox
-	aliases    map[string]string // 别名 → 实际 agentID（如 "scheduler" → "scheduler-a1b2c3d4"）
-	bufSize    int
-	hookRunner MailboxHookRunner // nil = 未挂接 hook 系统
+	mu             sync.RWMutex
+	boxes          map[string]*Mailbox
+	aliases        map[string]string // 别名 → 实际 agentID（如 "scheduler" → "scheduler-a1b2c3d4"）
+	bufSize        int
+	hookRunner     MailboxHookRunner      // nil = 未挂接 hook 系统
+	historyEmitter session.HistoryEmitter // nil = no-op
 }
 
 // NewRegistry 创建邮箱注册表。bufSize 为每个 Mailbox 的 channel 缓冲区大小。
@@ -236,6 +238,13 @@ func (r *Registry) AttachHookRunner(runner MailboxHookRunner) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.hookRunner = runner
+}
+
+// SetHistoryEmitter 注入事件溯源日志发射器。nil 为合法——表示禁用事件发射。
+func (r *Registry) SetHistoryEmitter(e session.HistoryEmitter) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.historyEmitter = e
 }
 
 // MailboxStatus 描述一个有未读消息的邮箱状态。
@@ -368,6 +377,12 @@ func (r *Registry) Send(msg Message) error {
 			r.mu.RUnlock()
 			mb.TrySend(msg)
 		}
+		r.emitHistory(session.HistEventMailSent, map[string]any{
+			"from":    msg.From,
+			"to":      msg.To,
+			"type":    msg.Type,
+			"summary": msg.Summary,
+		})
 		return nil
 	}
 
@@ -382,6 +397,12 @@ func (r *Registry) Send(msg Message) error {
 		}
 	}
 	mb.TrySend(msg)
+	r.emitHistory(session.HistEventMailSent, map[string]any{
+		"from":    msg.From,
+		"to":      msg.To,
+		"type":    msg.Type,
+		"summary": msg.Summary,
+	})
 	return nil
 }
 
@@ -392,6 +413,25 @@ func (r *Registry) snapshotHookRunner() MailboxHookRunner {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.hookRunner
+}
+
+// emitHistory emits a history event if the emitter is set. Failures are logged
+// as warnings and never propagated.
+func (r *Registry) emitHistory(eventType string, payload map[string]any) {
+	r.mu.RLock()
+	emitter := r.historyEmitter
+	r.mu.RUnlock()
+	if emitter == nil {
+		return
+	}
+	ev := session.HistoryEvent{
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		EventType: eventType,
+		Payload:   payload,
+	}
+	if err := emitter.Append(ev); err != nil {
+		log.Printf("[mailbox] WARN history emit %s failed: %v", eventType, err)
+	}
 }
 
 // AllIDs 返回当前所有已注册的 agentID 快照（不含别名）。
@@ -415,4 +455,73 @@ func (r *Registry) lookup(id string) (*Mailbox, bool) {
 	}
 	mb, ok := r.boxes[id]
 	return mb, ok
+}
+
+// ExportSnapshot 导出所有已注册邮箱的快照（包括 recent 缓冲中的消息）。
+// 使用 Snapshot() 方法读取 recent 缓冲，不消费 channel 中的消息。
+func (r *Registry) ExportSnapshot() []session.MailboxSnapshot {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	snaps := make([]session.MailboxSnapshot, 0, len(r.boxes))
+	for id, mb := range r.boxes {
+		// 使用 Snapshot 读取 recent 缓冲中的消息（不消费 channel）
+		recentMsgs := mb.Snapshot(recentBufferSize)
+
+		msgSnaps := make([]session.MessageSnapshot, len(recentMsgs))
+		for i, msg := range recentMsgs {
+			msgSnaps[i] = session.MessageSnapshot{
+				From:       msg.From,
+				To:         msg.To,
+				Content:    msg.Content,
+				Summary:    msg.Summary,
+				Type:       msg.Type,
+				Priority:   msg.Priority,
+				SentAt:     msg.SentAt.UTC().Format(time.RFC3339),
+				ChainDepth: msg.ChainDepth,
+			}
+		}
+		snaps = append(snaps, session.MailboxSnapshot{
+			OwnerID:   id,
+			EventType: mb.eventType,
+			Messages:  msgSnaps,
+		})
+	}
+	return snaps
+}
+
+// ImportSnapshot 从 MailboxSnapshot 列表恢复邮箱状态。
+// 对于每个快照，如果邮箱尚未注册则注册之，然后将消息发送到邮箱。
+func (r *Registry) ImportSnapshot(snaps []session.MailboxSnapshot) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, snap := range snaps {
+		mb, exists := r.boxes[snap.OwnerID]
+		if !exists {
+			mb = newMailbox(snap.OwnerID, snap.EventType, r.bufSize)
+			r.boxes[snap.OwnerID] = mb
+		}
+
+		// 按原始顺序恢复消息（snapshot 中最新的在前，需要反转）
+		for i := len(snap.Messages) - 1; i >= 0; i-- {
+			ms := snap.Messages[i]
+			sentAt, err := time.Parse(time.RFC3339, ms.SentAt)
+			if err != nil {
+				return fmt.Errorf("parse sent_at for mailbox %s: %w", snap.OwnerID, err)
+			}
+			msg := Message{
+				From:       ms.From,
+				To:         ms.To,
+				Content:    ms.Content,
+				Summary:    ms.Summary,
+				Type:       ms.Type,
+				Priority:   ms.Priority,
+				SentAt:     sentAt,
+				ChainDepth: ms.ChainDepth,
+			}
+			mb.TrySend(msg)
+		}
+	}
+	return nil
 }

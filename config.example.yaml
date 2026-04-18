@@ -1,0 +1,300 @@
+# AgentGo 配置文件示例
+# 将此文件复制为 config.yaml 并根据需要自定义
+
+# ============================================
+# 基础配置
+# ============================================
+
+# 项目根目录（留空则使用当前工作目录）
+project_root: ""
+
+# 最大重试次数（任务级）
+max_retry: 3
+
+# Worker 数量
+worker_count: 1
+
+# ============================================
+# LLM 配置
+# ============================================
+
+# LLM 端点配置（OpenAI 兼容格式）
+llm_base_url: "https://api.openai.com/v1"
+llm_api_key: "your-api-key-here"
+llm_model: "gpt-4o"
+llm_timeout_sec: 60
+
+# Explorer 使用的模型（通常用更便宜的模型）
+explorer_model: "gpt-4o-mini"
+
+# ============================================
+# 调度器配置
+# ============================================
+
+scheduler_ticker_sec: 10      # 调度器轮询间隔（秒）
+scheduler_max_loops: 10       # 调度器单次 ReAct 循环上限
+
+# ============================================
+# 代理配置
+# ============================================
+
+agent_max_loops: 50           # 代理单次 ReAct 循环上限
+agent_idle_threshold: 0       # 代理空闲阈值（0 = 不限制）
+
+# ============================================
+# 历史压缩配置
+# ============================================
+
+compact_token_threshold: 80000  # Layer 2 压缩触发阈值
+compact_keep_recent: 3          # 压缩时保留的最近历史条数
+
+# ============================================
+# 邮箱配置
+# ============================================
+
+mailbox_buffer_size: 32           # 邮箱缓冲区大小
+mail_notifier_enabled: true       # 是否启用邮件通知器
+mail_notifier_interval_sec: 5     # 邮件通知器轮询间隔
+mail_chain_max_depth: 3           # 邮件链最大深度
+
+# ============================================
+# 工具集分层配置（Tool Set Profiles）
+# ============================================
+# 
+# 定义命名工具集，为不同类型的代理指定可用的工具。
+# 这实现了工具集与代理类型的解耦，支持按任务场景裁剪代理能力。
+#
+# 可用工具：
+#   LocalReadGroup: read_file, list_dir, grep_search, glob_search
+#   LocalWriteGroup: write_file, edit_file
+#   ShellGroup: run_shell
+#   WebGroup: web_search, web_fetch
+#   MetaGroup: publish_task, send_message
+#
+# 注意：cancel_task, report_done, probe_directory 是 Scheduler 专属工具，
+# 不走 profile 配置。
+#
+# 配置规则：
+#   - worker_profile / explorer_profile 留空 = 注册全部可用工具
+#   - profile 名称必须在 tool_profiles 中定义
+#   - 工具名拼写错误会导致启动失败
+# ============================================
+
+tool_profiles:
+  # 标准执行代理：代码修改 + 网络 + 子任务
+  worker_standard:
+    - read_file
+    - list_dir
+    - grep_search
+    - glob_search
+    - write_file
+    - edit_file
+    - run_shell
+    - web_search
+    - web_fetch
+    - publish_task
+    - send_message
+
+  # 只读执行代理：无写权限，适合审查任务
+  worker_readonly:
+    - read_file
+    - list_dir
+    - grep_search
+    - glob_search
+    - web_search
+    - web_fetch
+    - send_message
+
+  # 本地执行代理：无网络访问，适合内网环境
+  worker_local_only:
+    - read_file
+    - list_dir
+    - grep_search
+    - glob_search
+    - write_file
+    - edit_file
+    - run_shell
+    - publish_task
+    - send_message
+
+  # 最小权限代理：仅文件读写 + 消息
+  worker_minimal:
+    - read_file
+    - write_file
+    - edit_file
+    - send_message
+
+  # 代码库调查：本地只读
+  explorer_codebase:
+    - read_file
+    - list_dir
+    - grep_search
+    - glob_search
+    - send_message
+
+  # 网络调查：网络只读
+  explorer_web:
+    - web_search
+    - web_fetch
+    - send_message
+
+  # 全能调查：本地 + 网络只读
+  explorer_full:
+    - read_file
+    - list_dir
+    - grep_search
+    - glob_search
+    - web_search
+    - web_fetch
+    - send_message
+
+# 为各代理类型指定工具集
+# 留空表示使用全部可用工具（向后兼容）
+worker_profile: ""           # 使用全部工具
+explorer_profile: ""         # 使用全部工具
+
+# 示例：使用预定义的 profile
+# worker_profile: worker_standard
+# explorer_profile: explorer_full
+
+# 示例：使用只读 profile
+# worker_profile: worker_readonly
+# explorer_profile: explorer_codebase
+
+# ============================================
+# Per-Worker Tool Profiles（逐 Worker 工具集配置）
+# ============================================
+#
+# 当需要为每个 Worker 实例指定不同的 tool profile 时，使用 workers 列表。
+# workers 列表存在且非空时，会覆盖上面的 worker_count 和 worker_profile 字段。
+# workers 列表不存在或为空时，回退到 worker_count + worker_profile 的旧行为（向后兼容）。
+#
+# 每条记录包含两个字段：
+#   id:      Worker 的唯一标识符（不可为空，不可重复）
+#   profile: 引用 tool_profiles 中定义的 profile 名称
+#            空字符串 "" 表示使用全部可用工具
+#
+# 配置规则：
+#   - id 不能为空字符串，否则启动报错
+#   - id 不能重复，否则启动报错
+#   - profile 必须在 tool_profiles 中已定义（空字符串除外），否则启动报错
+#   - profile 中的工具名拼写错误会导致启动失败
+#
+# ============================================
+
+# workers:
+#   # 两个标准执行 Worker：拥有完整读写 + 网络 + 子任务能力
+#   - id: writer-1
+#     profile: worker_standard
+#   - id: writer-2
+#     profile: worker_standard
+#
+#   # 一个只读 Worker：无写权限，适合审查和调查任务
+#   - id: reader-1
+#     profile: worker_readonly
+#
+#   # 一个全量工具 Worker：profile 为空表示不做工具过滤
+#   - id: general-1
+#     profile: ""
+
+# ============================================
+# Shell 命令拦截配置
+# ============================================
+
+# 黑名单：匹配即拒绝执行（追加到默认规则）
+shell_blacklist:
+  # - "npm\\s+publish"        # 禁止直接发布到 npm
+  # - "docker\\s+push"        # 禁止推送镜像
+
+# 灰名单：匹配时需用户审批（追加到默认规则）
+shell_greylist:
+  # - "make\\s+deploy"        # 部署命令需要审批
+  # - "terraform\\s+apply"    # 基础设施变更需要审批
+
+# ============================================
+# 搜索配置
+# ============================================
+
+search_api_provider: "duckduckgo_html"
+# search_api_url: ""          # 自定义搜索 API URL
+# search_api_key: ""          # 搜索 API 密钥
+
+# ============================================
+# 其他配置
+# ============================================
+
+default_concurrency: 2       # 默认任务并发数
+fifo_limit: 100              # FIFO 队列上限
+watchdog_interval_sec: 30    # 看门狗巡检间隔
+event_channel_buffer: 64     # 事件通道缓冲区大小
+default_timeout_sec: 300     # 默认任务超时（秒）
+shell_timeout_sec: 30        # Shell 命令超时（秒）
+max_subtask_depth: 1         # 子任务最大深度
+transfer_note_max_tokens: 3000  # TransferNote 最大 token 数
+roster_wait_timeout_sec: 30  # 文件冲突排队等待超时（秒）
+
+# ============================================
+# 代理能力声明（Agent Capability Declarations）
+# ============================================
+#
+# 为每种代理类型声明能力标签（capabilities）和用途描述（description），
+# 这些信息会暴露到 board snapshot 的 resources.agent_capabilities 中，
+# 供 Scheduler LLM 在路由决策时参考。
+#
+# 配置规则：
+#   - 留空或不配置 agent_declarations 段：所有代理类型使用内置默认值
+#   - 支持只覆盖部分字段：例如只配置 explorer 的 description，
+#     其 capabilities 仍使用默认值；未提及的代理类型也使用默认值
+#   - 仅支持 "worker" 和 "explorer" 两种代理类型，
+#     配置其他名称会导致启动失败
+#
+# ⚠ 显式空值 vs 不配置的行为差异：
+#   - 不配置（字段缺失）：使用内置默认值
+#   - 显式设为空值（capabilities: [] 或 description: ""）：
+#     系统接受但不会回退到默认值，Scheduler LLM 将在无提示的情况下
+#     自行推断代理用途。此做法不推荐，仅用于调试或特殊场景。
+#
+# ============================================
+
+agent_declarations:
+  # ---------- Explorer（只读调查代理）----------
+  # event_type: explore
+  # 能力标签列表，描述该代理可执行的操作类别
+  # 默认值: ["codebase_read", "web_search", "message"]
+  explorer:
+    capabilities:
+      - codebase_read
+      - web_search
+      - message
+    # 人类可读的用途描述，会展示在 board snapshot 中供 Scheduler 参考
+    description: "只读调查代理（Explorer），能力限定为 read_file / list_dir / grep_search / glob_search / web_search / web_fetch / send_message。不能写文件、执行 shell、或发布子任务，适合承担代码库调研、网页检索、事实核验等只读任务。"
+
+  # ---------- Worker（通用执行代理）----------
+  # event_type: ""（空字符串，通用代理）
+  # 默认值: ["code_edit", "shell_exec", "web_search", "subtask_publish", "message"]
+  worker:
+    capabilities:
+      - code_edit
+      - shell_exec
+      - web_search
+      - subtask_publish
+      - message
+    description: "通用执行代理，拥有完整工具集，可读写文件、执行 shell 命令、发布子任务、搜索网络"
+
+# 示例：只覆盖 Explorer 的 description，其余保持默认
+# agent_declarations:
+#   explorer:
+#     description: "自定义的 Explorer 描述"
+
+# 示例：只覆盖 Worker 的 capabilities
+# agent_declarations:
+#   worker:
+#     capabilities:
+#       - code_edit
+#       - shell_exec
+
+# ⚠ 不推荐：显式清空能力声明（仅用于调试）
+# agent_declarations:
+#   explorer:
+#     capabilities: []
+#     description: ""
