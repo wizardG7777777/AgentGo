@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"agentgo/internal/agent"
 )
@@ -247,20 +248,26 @@ func TestReadFile_CacheHit(t *testing.T) {
 		t.Fatalf("首次读取内容错: %q", out1)
 	}
 
-	// 外部修改磁盘内容——缓存不应因此失效
-	if err := os.WriteFile(fp, []byte("MODIFIED"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
+	// 第二次同参数 read_file 应命中缓存
 	out2, err := g.readFile(context.Background(), map[string]any{"path": fp})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out2, "original") {
-		t.Errorf("缓存未命中（应返回旧内容）: %q", out2)
+		t.Errorf("缓存未命中（应返回原内容）: %q", out2)
 	}
-	if strings.Contains(out2, "MODIFIED") {
-		t.Errorf("缓存被意外绕过: %q", out2)
+
+	// 外部/他人改写文件后，stat 校验应使缓存失效并重新读盘
+	time.Sleep(20 * time.Millisecond)
+	if err := os.WriteFile(fp, []byte("MODIFIED"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out3, err := g.readFile(context.Background(), map[string]any{"path": fp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out3, "MODIFIED") {
+		t.Errorf("外部修改后仍命中陈旧缓存: %q", out3)
 	}
 }
 

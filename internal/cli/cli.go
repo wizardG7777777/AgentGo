@@ -74,24 +74,81 @@ func (c *CLI) Run(ctx context.Context) {
 	}()
 
 	fmt.Fprint(c.writer, "> ")
+	// pending 保存 collectMultiline 遗留的下一行（通常是打断多行输入的 /command）
+	var pending string
+	for {
+		var line string
+		if pending != "" {
+			line = pending
+			pending = ""
+		} else {
+			select {
+			case <-ctx.Done():
+				return
+			case req := <-c.approvalCh:
+				c.handleApproval(req, lineCh, ctx)
+				fmt.Fprint(c.writer, "> ")
+				continue
+			case l := <-lineCh:
+				line = l
+			case <-eofCh:
+				// stdin 关闭或读取错误，终止所有服务
+				fmt.Fprintln(c.writer, "[CLI] 输入流关闭，正在退出...")
+				c.cancelFn()
+				return
+			}
+		}
+
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			fmt.Fprint(c.writer, "> ")
+			continue
+		}
+
+		submission := trimmed
+		if !strings.HasPrefix(trimmed, "/") {
+			text, next, cancelled := c.collectMultiline(line, lineCh, eofCh, ctx)
+			if cancelled {
+				return
+			}
+			submission = text
+			pending = next
+		}
+
+		if submission == "" {
+			fmt.Fprint(c.writer, "> ")
+			continue
+		}
+
+		if c.handleLine(submission, lineCh, ctx) {
+			return
+		}
+		fmt.Fprint(c.writer, "> ")
+	}
+}
+
+// collectMultiline 收集自由文本多行输入。遇到空行提交，遇到 /command 打断并回传。
+// cancelled 为 true 时表示 ctx 被取消，调用方应退出 Run。
+func (c *CLI) collectMultiline(first string, lineCh <-chan string, eofCh <-chan struct{}, ctx context.Context) (text string, nextLine string, cancelled bool) {
+	buf := []string{strings.TrimRight(first, " \t\r\n")}
+	join := func() string {
+		return strings.TrimSpace(strings.Join(buf, "\n"))
+	}
 	for {
 		select {
 		case <-ctx.Done():
-			return
-		case req := <-c.approvalCh:
-			c.handleApproval(req, lineCh, ctx)
-			fmt.Fprint(c.writer, "> ")
-		case line := <-lineCh:
-			shouldQuit := c.handleLine(strings.TrimSpace(line), lineCh, ctx)
-			if shouldQuit {
-				return
-			}
-			fmt.Fprint(c.writer, "> ")
+			return "", "", true
 		case <-eofCh:
-			// stdin 关闭或读取错误，终止所有服务
-			fmt.Fprintln(c.writer, "[CLI] 输入流关闭，正在退出...")
-			c.cancelFn()
-			return
+			return join(), "", false
+		case nxt := <-lineCh:
+			trimmed := strings.TrimSpace(nxt)
+			if trimmed == "" {
+				return join(), "", false
+			}
+			if strings.HasPrefix(trimmed, "/") {
+				return join(), trimmed, false
+			}
+			buf = append(buf, strings.TrimRight(nxt, " \t\r\n"))
 		}
 	}
 }
@@ -134,9 +191,10 @@ func (c *CLI) handleLine(line string, lineCh <-chan string, ctx context.Context)
 		fmt.Fprintf(c.writer, "[错误] 未知命令: %s，输入 /help 查看帮助\n", line)
 
 	default:
-		// 记录首条用户输入
+		// 记录首条用户输入 + 递增任务计数（metadata.task_count）
 		if c.sessionMgr != nil {
 			c.sessionMgr.RecordFirstInput(line)
+			c.sessionMgr.IncrementTaskCount()
 		}
 		// 用户自由文本 → 发送 EventUserInput（带超时，防止 eventCh 满时卡死）
 		evt := model.Event{
@@ -250,7 +308,7 @@ func (c *CLI) printHelp() {
 	fmt.Fprintln(c.writer, "  /session             — 查看并切换 Session")
 	fmt.Fprintln(c.writer, "  /quit                — 退出程序")
 	fmt.Fprintln(c.writer, "  /help                — 显示此帮助")
-	fmt.Fprintln(c.writer, "  其他文本             — 作为用户请求发送给调度器")
+	fmt.Fprintln(c.writer, "  其他文本             — 作为用户请求发送给调度器（多行输入以空行提交）")
 }
 
 // handleApproval 处理来自 Worker 的命令审批请求，阻塞等待用户输入。

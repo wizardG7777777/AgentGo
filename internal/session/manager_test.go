@@ -8,6 +8,69 @@ import (
 
 // --- Task 3.6: SessionManager 创建/恢复/降级 单元测试 ---
 
+func TestEnableHistoryLog_OpensAndWrites(t *testing.T) {
+	dir := t.TempDir()
+	sm, err := NewSessionManager(dir, SessionConfig{Enabled: true})
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	// 默认：History() 为 nil
+	if sm.History() != nil {
+		t.Fatal("History() before EnableHistoryLog should be nil")
+	}
+
+	sm.EnableHistoryLog()
+	em := sm.History()
+	if em == nil {
+		t.Fatal("History() after EnableHistoryLog should be non-nil")
+	}
+
+	if err := em.Append(HistoryEvent{Timestamp: nowUTC(), EventType: HistEventTaskPublished, Payload: map[string]any{"task_id": "abc"}}); err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+
+	// 关闭以便 TempDir 清理
+	t.Cleanup(func() { _ = sm.Close() })
+
+	p := filepath.Join(sm.Current().Dir, "history.jsonl")
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read history.jsonl: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("history.jsonl is empty")
+	}
+}
+
+func TestEnableHistoryLog_ReopensOnCreateNew(t *testing.T) {
+	dir := t.TempDir()
+	sm, err := NewSessionManager(dir, SessionConfig{Enabled: true})
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	sm.EnableHistoryLog()
+	t.Cleanup(func() { _ = sm.Close() })
+
+	first := sm.Current().Dir
+	if _, err := sm.CreateNew(); err != nil {
+		t.Fatalf("CreateNew: %v", err)
+	}
+	second := sm.Current().Dir
+	if first == second {
+		t.Fatal("CreateNew should switch to a different directory")
+	}
+	if sm.History() == nil {
+		t.Fatal("History() after CreateNew should remain non-nil (historyEnabled sticky)")
+	}
+	if err := sm.History().Append(HistoryEvent{Timestamp: nowUTC(), EventType: HistEventTaskClaimed}); err != nil {
+		t.Fatalf("Append on new session: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(second, "history.jsonl")); err != nil {
+		t.Fatalf("second session history.jsonl should exist: %v", err)
+	}
+}
+
+
 func TestNewSessionManager_CreatesNewSession(t *testing.T) {
 	dir := t.TempDir()
 	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}

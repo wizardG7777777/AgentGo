@@ -72,6 +72,10 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	if sessErr != nil {
 		fmt.Printf("[启动] WARNING: Session 初始化失败: %v —— 以无 Session 模式运行\n", sessErr)
 	}
+	// 开启 history.jsonl 事件溯源（默认关闭，由 bootstrap 显式启用）
+	if sessMgr != nil && sessMgr.Current() != nil {
+		sessMgr.EnableHistoryLog()
+	}
 
 	// Step 1.5: 初始化 trace 系统（每任务一份 JSONL 文件，保留最近 100 个）
 	// trace 写入失败仅打印 warning，不中断主流程
@@ -189,6 +193,15 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	// Step 3.5: 初始化邮箱注册表
 	mbRegistry := mailbox.NewRegistry(cfg.MailboxBufferSize)
 	fmt.Println("[启动] 邮箱注册表初始化完成")
+
+	// Step 3.5.1: 将 Session 的 HistoryEmitter 注入 store/roster/mailbox，
+	// 否则 history.jsonl 永远不会被写入（v3 §9.9 阶段三装配补齐）。
+	if sessMgr != nil && sessMgr.History() != nil {
+		taskStore.SetHistoryEmitter(sessMgr.History())
+		r.SetHistoryEmitter(sessMgr.History())
+		mbRegistry.SetHistoryEmitter(sessMgr.History())
+		fmt.Println("[启动] Session history.jsonl 事件发射器已注入（store/roster/mailbox）")
+	}
 
 	// Step 3.6: 初始化 Mailbox Hook 系统（Phase 2）
 	// 与 ToolHookRegistry 并列共存、独立。registry 创建后立即通过

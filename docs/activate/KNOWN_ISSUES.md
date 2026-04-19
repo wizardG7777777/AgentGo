@@ -1070,6 +1070,349 @@ test_result.md   3996 bytes   ← 唯一新产物，路径字面等于 expected_
 
 ---
 
+## Session 化集成缺口（2026-04-19 单任务测试暴露）
+
+2026-04-19 晚进行的单任务手工测试（对比两份文档）暴露了 **3 个独立缺陷**，表面看分散，但根因同源——都是 **"两个子系统的握手位置"** 在 v3 §9.9 Session 化落地时漏接。每个子系统的单元测试都通过、每个"零件"都完工，但装配环节是手工的、没有跨子系统的端到端烟测拦截。
+
+---
+
+## Trace CLI 路径与 Session 日志目录脱钩（🔴 P0）
+
+**现象**：`agentgo trace list/show` 看不到任何 Session 化（2026-04-18）之后产生的任务 trace。
+
+**证据**（2026-04-19 17:47 手工测试）：
+- `trace list` 最新记录停留在 `2026-04-12 04:00:34`，而本次任务在 `2026-04-19 17:47:55`
+- 实际 trace 文件在 `.agentgo/sessions/sess-ad8f3120-.../logs/2026-04-19T09-47-55_ec4daaa6.jsonl`
+- `trace show ec4daaa6` → `[错误] 未找到匹配 task_id=ec4daaa6 的 trace 文件`
+
+**根因**：写入路径和读取路径在不同时期演化，脱钩：
+
+- 写入（`internal/bootstrap/bootstrap.go:78-83`）：Session 起来时 `traceDir = sessMgr.LogDir()` —— 重定向到 per-session
+- 读取（`main.go:23`）：硬编码 `traceDir := filepath.Join(cwd, ".agentgo", "traces")` —— 从未感知 Session
+
+`main.go` 的 trace 子命令分支独立运行（不走 bootstrap），改 bootstrap 时没人想起它。
+
+**影响**：Session 化上线后，`agentgo trace` 命令事实上失效——用户只能手动 `cat`/`grep` 每个 session 的 JSONL 文件。调试和排查成本显著上升。
+
+**修复方案（三选一，推荐混合）**：
+- **A. 最小改动（约 10 行）**：`main.go` 在 trace 子命令里读 `~/.agentgo/sessions/active-session` 定位 active session 的 logs 目录
+- **B. 双扫描（约 30 行）**：`trace.CLI` 接受目录列表，合并扫描所有 `sess-*/logs/` + 老 `.agentgo/traces/`
+- **C. 显式参数（约 5 行）**：`agentgo trace --session=<id> list`
+
+**推荐**：A 的路径解析 + B 的合并扫描（保留历史）。老 `.agentgo/traces/` 里还有 Session 化之前的 14 个历史任务，纯切到 A 会看不到。
+
+---
+
+## Session history.jsonl 事件溯源完全断链（🔴 P1）
+
+**现象**：session 目录下**根本没有** `history.jsonl` 文件（只有 `metadata.json` 和 `logs/`）。
+
+**证据**：
+```
+.agentgo/sessions/sess-ad8f3120-.../
+├── logs/
+│   └── 2026-04-19T09-47-55_ec4daaa6.jsonl   ← 只有 trace
+├── metadata.json
+└── (history.jsonl 根本不存在)
+```
+
+**根因**（比初诊更严重）：断链在**两层**：
+
+```
+session.HistoryLog 类型 ✅
+session.OpenHistoryLog 函数 ✅
+session.HistoryEmitter 接口 ✅
+store/roster/mailbox.SetHistoryEmitter 方法 ✅（各自有单测）
+──────── 断链层 1：SessionManager 从未调用 OpenHistoryLog ────────
+SessionManager.history 字段 ❌ 不存在
+SessionManager.History() getter ❌ 不存在
+──────── 断链层 2：bootstrap 即使想注入也没源 ────────
+bootstrap 的 SetHistoryEmitter 调用 ❌ 0 次
+```
+
+`grep OpenHistoryLog` 全仓除了 `history_test.go` 外**零次出现**——SessionManager 自己都不知道有 HistoryLog 这个东西。
+
+v3 §9.9 阶段三标记为 ✅ 已完成，实际是"自底向上写完零件 + 各自单测过 → 最后没装配"。
+
+**影响**：
+- `history.jsonl` 永远不会被写入
+- Session 事件重放（`session.ReplayToState`）、崩溃恢复都无数据源
+- **§9.9 阶段三整块是纸面功能**
+
+**修复方案**（两步，约 50 行）：
+
+**步骤 1**（`internal/session/manager.go`）：
+- `SessionManager` 加 `history *HistoryLog` 字段
+- `CreateNew` / 启动恢复时 `OpenHistoryLog(filepath.Join(sessionDir, "history.jsonl"))`
+- 暴露 `History() HistoryEmitter` getter
+- `Close` / `SwitchTo` 关闭旧 history、打开新 history
+
+**步骤 2**（`internal/bootstrap/bootstrap.go`）：
+```go
+if sessMgr != nil && sessMgr.History() != nil {
+    taskStore.SetHistoryEmitter(sessMgr.History())
+    memRoster.SetHistoryEmitter(sessMgr.History())
+    mailReg.SetHistoryEmitter(sessMgr.History())
+}
+```
+
+难点不在写代码，在于对照 §9.9 阶段三的"10 个事件类型常量"审计每个 emit 点是否真的会被触发。
+
+**连带问题**：`SessionManager.IncrementTaskCount` 同款症状——有方法、有单测、**生产代码零调用**。导致 `metadata.json` 的 `task_count` 永远是 0（本次测试实测确认）。建议在修复本问题时一并在 `cli.handleLine` 或 `agent.Run` 某处加 `sessionMgr.IncrementTaskCount()` 调用。
+
+---
+
+## Finalization 短路路径不 emit TaskSubmitted/TaskCompleted（🔴 P1）
+
+**现象**：所有经由 `report_done`（或其他 finalization tool）完成的任务——即**所有 scheduler 任务**——在 trace 展示里状态错位：
+- 显示 `running`（而非 `completed`）
+- 显示 `loops=0`（而非实际值）
+
+**证据**：2026-04-19 测试任务的 trace 文件最后一条事件是 `tool_result`（report_done 的结果），**没有 `task_submitted` 和 `task_completed`**。回看历史 `trace list` 输出里 5 个状态显示"running"的 scheduler 任务——没一个是真的 running，全是被这个 bug 错误标记的，**系统性观测错位**。
+
+**根因**：完成路径有**两条**，emit 对称性不完整：
+
+**路径 A — 自然完成 / Finalized 同轮**（`internal/agent/agent.go:458-526`）：
+```go
+if !result.ToolCalled || result.Finalized {
+    // ... checkExpectedArtifacts ...
+    // ... SubmitResult ...
+    trace.Emit(KindTaskSubmitted)  ✅
+    trace.Emit(KindTaskCompleted)  ✅
+}
+```
+
+**路径 B — Finalized 跨轮短路**（`internal/agent/agent.go:428-438`，v3 §6.5.4 引入的优化）：
+```go
+if a.FinalizationChecker != nil && a.FinalizationChecker.IsFinalized() {
+    // ... SubmitResult ...
+    return  // 没有任何 trace.Emit ❌
+}
+```
+
+路径 B 是"上一轮调了 finalization tool，这一轮在 LLM 调用之前就退出"的短路优化。复制路径 A 语义时只复制了 `SubmitResult`，漏了 trace 事件。ExpectedArtifacts 校验漏掉是有意的（finalization tool 自己负责最终汇报），但 trace 事件**没有理由**漏——它是观测/审计层，与业务语义无关。
+
+本次测试 scheduler 的控制台日志 `FinalizationChecker.IsFinalized()=true，终止 reactLoop` 来自 `agent.go:429`，证实走的正是路径 B。
+
+**影响**：
+- `agentgo trace list` 的 status / loops 列对 finalization 任务全部错位
+- `trace show` 末尾的"status=running"汇总误导用户
+- 未来基于 trace 事件做分析/监控的工具全部受影响
+
+**修复方案**（约 15 行）：把路径 A 的两次 emit 镜像到路径 B：
+
+```go
+// agent.go:435 之后
+if err := a.Store.SubmitResult(a.ID, taskID, lastOutput); err != nil {
+    log.Printf("[agent %s] SubmitResult error: %v", a.ID, err)
+    trace.Emit(trace.Event{
+        Kind: trace.KindError, TaskID: taskID, AgentID: a.ID,
+        Error: "SubmitResult failed: " + err.Error(),
+    })
+} else {
+    trace.Emit(trace.Event{
+        Kind: trace.KindTaskSubmitted, TaskID: taskID,
+        AgentID: a.ID, OutputLen: len(lastOutput), LoopsUsed: i,
+    })
+    trace.Emit(trace.Event{
+        Kind: trace.KindTaskCompleted, TaskID: taskID, AgentID: a.ID,
+    })
+}
+return
+```
+
+`LoopsUsed: i`（不是 `i+1`）——路径 B 是在第 i 轮开头就退出，第 i 轮的 LLM 调用没发生。
+
+---
+
+## 三个缺陷的共同根因与流程建议
+
+| 缺陷 | A 子系统 | B 子系统 | 握手位置 | 单测能否拦截 |
+|---|---|---|---|---|
+| Trace CLI 路径 | bootstrap | main.go trace 子命令 | 共享 traceDir 常量 | ❌ 否（跨进程入口） |
+| history.jsonl 断链 | session.HistoryLog | bootstrap + SessionManager | `SetHistoryEmitter` 调用点 | ❌ 否（bootstrap 无独立单测） |
+| Finalization emit | trace | agent.go path B | path B 内的 `trace.Emit` | ❌ 否（emit 是副作用） |
+
+**共同特征**：单元测试覆盖了"零件"，装配环节是手工的、无任何自动化护栏。
+
+**流程层面的建议**（非代码修复，用于防止同类复发）：
+
+1. **大功能落地必须有一条"端到端烟测"**——v3 §9.9 阶段三应该有：
+   ```
+   启动 SessionManager → 跑一个任务 → 关闭 → 断言 history.jsonl 存在且非空
+   ```
+   就这 5 行能拦截 history.jsonl + task_count 两个问题
+2. **"完成"的定义必须验证主干接通**——v3 把"代码写完 + 单测过"算 ✅；应该加一道门槛："实际启动跑一次，验证产物符合预期"
+3. **约定事件的对称性应有 lint 级检查**——任何"终结类" return 出口前必须 emit `KindTaskCompleted`，可以考虑用代码扫描式测试守住（扫 `agent.go` 的 return，每个都要在 M 行内看到对应 emit）
+
+---
+
+## Test 2 并发写测试暴露的新缺陷（2026-04-19）
+
+2026-04-19 晚进行的第二次手工测试（对 README.md 两处互不影响的修改）暴露了 **2 个全新的 P0 bug + 1 个 P2 + 1 个设计盲点**。其中 FileStateCache 跨 agent 陈旧是最严重的——**破坏了多 agent 协作最基本的"A 读 → B 写 → A 读"模式**。
+
+---
+
+## FileStateCache 跨 agent 陈旧缓存 → read 死循环（🔴 P0）
+
+**现象**：worker-3 19:37:46 完成 README.md 第二次编辑（文件已变 282 字节），但 11 秒后 scheduler 读同一文件连续 **7 次**返回相同的"陈旧内容"（168 字节），LLM 看到"文件没改"→ 又调 read_file → 又命中陈旧缓存 → 8 轮死循环 → 耗尽 MaxLoops → RetryRollback。重试时因 task 边界清空了 cache，首次 read_file 才读盘拿到真实内容，任务才得以完成。
+
+**证据**（Test 2 trace 关键时间线）：
+```
+19:37:50 worker-3 loop=4 read_file README.md → result_len=282 ← 真实内容
+──────── 文件已是最新 ────────
+19:38:01 scheduler loop=2 read_file → 168 ← 陈旧
+19:38:08 loop=3 → 168
+19:38:17 loop=4 → 168
+19:38:25 loop=5 → 168（此时触发 Layer 2 压缩，82924 token）
+19:38:37 loop=6 → 168
+19:38:49 loop=7 → 168
+19:38:55 loop=8 → 168
+19:39:06 loop=9 → 168 ← MaxLoops 耗尽
+──────── 重试 ────────
+19:39:32 重试 loop=0 read_file → 282 ← 终于正确
+```
+
+**根因**：`internal/agent/filecache.go` 的 `FileStateCache` 是 **per-agent** 的（CLAUDE.md 明确："Per-agent LRU cache"）。`write_file / edit_file` 在工具内调 `g.Cache.Invalidate(path)` —— **只失效调用者自己的 cache**。
+
+多 agent 场景下：
+- scheduler 在 loop=0 调 `read_file` 把 README.md 原始内容缓存（184 字节）
+- worker-3 做了 2 次 `edit_file`（文件已变为 282 字节），**只失效 worker-3 的 cache**
+- scheduler 的 cache 中仍是 184 字节原始内容，且**永远不会被失效**
+- 所有后续 `read_file` 全部命中 scheduler 自己的陈旧缓存
+
+**为什么重试后好了**：每次 retry 调用 `a.FileCache.Clear()`（task 边界清空）→ 新 reactLoop 的首次 read 直接读盘，拿到真实内容。
+
+**影响（P0）**：
+- **破坏多 agent 协作的基础模式**：任意"agent A 读 → agent B 写 → agent A 读"工作流都会触发
+- 失败模式隐蔽：工具返回"成功"、LLM 以为自己读到了最新内容、却一直在原地打转
+- 白白消耗 token（本次浪费 8 轮调用 + 1 次完整 retry，约 100k+ tokens）
+- **Test 1 没暴露是因为 scheduler 自己做事，没有跨 agent 读写；Test 2 的 scheduler→worker→scheduler 模式恰好踩中**
+
+**修复方案（四选一，推荐 A）**：
+| 方案 | 工作量 | 副作用 |
+|---|---|---|
+| **A. 缓存命中前 stat 校验** | ~30 行 | 每次命中多一次 syscall（微秒级，可忽略） |
+| B. 全局 cache + Roster 写入全局失效 | ~80 行 | 失去 per-agent 隔离的设计意图 |
+| C. 通过工具层总线广播失效给所有 agent | ~100 行 | 复杂、需新机制 |
+| D. 去掉 FileStateCache | ~50 行 | 损失优化（但 read_file 本身很快） |
+
+方案 A：cache hit 时调 `os.Stat(path)`，比对 mtime + size；不一致则 Invalidate 后走盘读路径。
+
+---
+
+## CLI 多行输入按 `\n` 拆分（含输入滞留粘连）（🔴 P0）
+
+**现象**：用户多行粘贴（或多行键入）时，每一行被当作独立的用户输入，每行触发一个独立的 scheduler task。用户的单一意图被粉碎成多个无关任务。**更糟**：最后一行如果没有 trailing newline，会"滞留"在 CLI scanner 缓冲中，与**下次输入粘连**。
+
+**证据**：
+- **Test 1（2026-04-19 18:33）**：用户 4 行 prompt 被拆成 3 个 scheduler task：
+  ```
+  task 1 desc="请调查 internal/agent/agent.go 里 reactLoop 的所有终止路径，"
+  task 2 desc="然后在 docs/agent_termination_paths.md 中整理成一张表，"
+  task 3 desc="每行包含：触发条件、是否调用 SubmitResult、是否 emit trace 事件、"
+  ```
+  第 4 行"是否做 ExpectedArtifacts 校验。" 未发布。
+- **Test 2（2026-04-19 19:36）**：Test 1 滞留的第 4 行**与 Test 2 的输入粘连**：
+  ```
+  task desc="是否做 ExpectedArtifacts 校验。对 README.md 做两件事..."
+  ```
+
+**根因**（`internal/cli/cli.go:69-74`）：
+```go
+scanner := bufio.NewScanner(c.reader)
+for scanner.Scan() {
+    lineCh <- scanner.Text()   // 默认按 \n 拆，每行独立 event
+}
+```
+
+`bufio.Scanner` 默认按 `\n` 切分。用户多行 prompt → 每行独立 `EventUserInput` → activator 每个 event 发一个 scheduler task。缺少"输入边界"概念。
+
+**为什么 Test 1 中任务还是（意外地）完成了**：scheduler agent 的 `session_history` 注入让它能看到所有历史 user input，**推断出**完整意图。这是非预期的鲁棒性副产品，**掩盖了 bug 的严重性**——没有 SessionHistory 的场景下任务会直接失败。
+
+**影响（P0）**：
+- 任何复杂 prompt（含多行说明、代码块、markdown 列表）都会被打散
+- 上下文切碎让每个 scheduler task 看不到完整意图
+- 滞留粘连让两次不相关的输入互相污染
+- **比 §9.9 集成漏洞更基础**——直接破坏主输入路径
+
+**修复方案（三选一，推荐 A）**：
+| 方案 | 工作量 | UX |
+|---|---|---|
+| **A. 空行结尾作为提交标志**（读到连续 2 个 `\n` 才 flush） | ~30 行 | 自然、可 /help 文档化 |
+| B. 显式 `/send` 命令 flush 缓冲 | ~50 行 | 用户需适应新命令 |
+| C. 短时间窗合并（200ms 内连续行合并） | ~40 行 | 仍可能误合粘贴间隙 |
+
+方案 A：维护 `inputBuffer` 缓冲，`bufio.Scanner` 读到空行时把积累的行 `strings.Join("\n")` 发送；`/quit` 等命令仍走单行路径。
+
+---
+
+## Mail-notifier Progress-Notify 寄生唤醒（⚠️ P2）
+
+**现象**：worker 写文件成功后，mail-notifier **稳定触发 5 个寄生唤醒任务**，peer agent 被唤醒后发现无事可做但仍各消耗一次 LLM 调用 + report_done。含**自我唤醒**（worker-3 给自己发消息又唤醒自己）。
+
+**证据**（Test 1 + Test 2 **两次都复现**，形态完全一致）：
+```
+Test 2 worker-3 第一次 edit_file 成功后：
+19:37:36 mail-notifier 唤醒 explorer-1
+19:37:36 mail-notifier 唤醒 worker-1
+19:37:41 mail-notifier 再唤醒 worker-1
+19:37:46 mail-notifier 唤醒 worker-3（自己给自己发）
+19:38:06 mail-notifier 再唤醒 worker-3
+```
+
+1 个有效操作 → 5 个寄生 LLM 调用。
+
+**与已修复的"邮件级联爆炸"的区别**：
+- 已修复的"邮件级联爆炸"是**链式**——mail 引发 reply 引发 reply，靠 `ChainDepthLimitHook` 拦截（已修复）
+- 本问题是**扇出式**——单个源 mail（progress notify）同时发给 N 个 peer，每个 peer 都被唤醒，**未被 chain depth 限制覆盖**
+
+**根因**：v3 §8.6 Progress Notify 设计：worker 完成关键操作后广播通知给同组 peer。实现时：
+- 未排除"发送方自己"（worker-3 给自己发）
+- 未感知"peer 当前是否忙"（peer 有任务时也被唤醒）
+- 单源消息无 dedup（同一文件的多次 edit 发多次通知，每次唤醒 5 次）
+
+**影响（P2）**：
+- token 放大效应：写一次文件 → 5× LLM 调用（估算每次 ~3000 token）
+- 多 worker 场景下放大更严重（每多一个 peer 就多一次唤醒）
+- 虽然不破坏正确性，但显著增加成本 + 拖长任务耗时
+
+**修复建议**（不阻塞，但建议迭代改善）：
+- 发送方过滤：`if recipient.AgentID == sender { skip }`
+- 忙碌 peer 过滤：查 store `QueryByAgent(peerID, processing)`，有任务时不发
+- 同文件 dedup：progress notify 对同一路径 N 秒内只发一次
+- 降噪：progress notify 消息标为"低优先级"，收件方可配置是否触发唤醒
+
+---
+
+## TransferNote 不覆盖父子任务（⚪ 设计盲点）
+
+**现象**：scheduler 通过 `publish_task` 创建的 worker 子任务，其 history 中**不会**被注入 `<upstream-transfer-notes>`。即使父 scheduler task 有 TransferNote，也不会传给子 worker。
+
+**证据**（Test 2 worker task d8e143bd 的 trace 第 2 行）：
+```
+{"kind":"llm_call_start", "agent_id":"worker-2",
+ "history_entries":1, "tool_calls_count":11}
+```
+
+`history_entries: 1` —— 只有任务描述本身，没有任何上游信息注入。
+
+**根因**：TransferNote 机制（v3 §8.4）设计的是"**兄弟任务 + 依赖链**"（task A 完成 → task B 读 A 的 TransferNote，两者通过 `task.Dependencies` 显式关联）。实际多 agent 协作中最常见的**"scheduler 父 → worker 子"模式**不在 scope 内——`GetDependencyTransferNotes` 只看 `task.Dependencies`，不看父任务。
+
+**影响（设计层面）**：
+- v3 §8.4 的实际覆盖面比设想中小很多
+- "scheduler 派发 + worker 执行"这种最常见的形态下，上下文仅靠 task.Description 字符串传递（文本化 + 可能截断）
+- TransferNote 的核心价值（压缩后的决策上下文、踩坑记录、建议）**对 scheduler-子 worker 派发模式失效**
+
+**非 bug 的理由**：TransferNote 阶段性目标确实明确限定了 scope。但本项应作为**"已知 scope 限制"**留档，未来考虑扩展时作为设计输入。
+
+**可能的扩展方向**（不立项，仅记录）：
+- `Task` 加 `ParentTaskID` 字段
+- `GetDependencyTransferNotes` 扩展为 `GetContextTransferNotes`（含 deps + parent）
+- scheduler publish_task 时可选传递"上下文 hint"（摘取自 scheduler 自己的 history）
+
+---
+
 ## 总览
 
 | 缺陷 | 状态 |
@@ -1114,8 +1457,23 @@ test_result.md   3996 bytes   ← 唯一新产物，路径字面等于 expected_
 | **Expected_artifacts 路径漂移 + require-read-before-write 二次拦截** | ✅ **已修复**（2026-04-14 新增 EnforceExpectedArtifactsHook，PreCall 严格精确匹配，14 用例单测覆盖，包含 2026-04-14 实际漂移样本） |
 | **Worker 越权写 test_result.md，与 scheduler 意图冲突** | ✅ **已修复**（2026-04-14 随 EnforceExpectedArtifactsHook 一起解决，worker 不在 expected_artifacts 清单内的 path 会被 Abort） |
 | **日志/trace 中 agent_id 为空（重试路径）** | 🟢 **P3 待修复**（2026-04-14 复测发现；日志瑕疵，不影响功能） |
+| **Trace CLI 路径与 Session 日志目录脱钩** | 🔴 **P0 待修复**（2026-04-19 单任务测试暴露；`agentgo trace list/show` 在 Session 化后事实失效——main.go 硬编码老路径，bootstrap 已重定向到 per-session） |
+| **Session history.jsonl 事件溯源完全断链** | 🔴 **P1 待修复**（2026-04-19 暴露；v3 §9.9 阶段三 OpenHistoryLog 在生产代码零调用，SessionManager 未集成、bootstrap 未注入。连带：`IncrementTaskCount` 同款零调用 → task_count 永远为 0） |
+| **Finalization 短路路径不 emit TaskSubmitted/TaskCompleted** | 🔴 **P1 待修复**（2026-04-19 暴露；agent.go:428-438 path B 跨轮短路时漏了 trace emit，导致所有 scheduler 任务在 trace list 中错标为 running/loops=0——系统性观测错位） |
+| **FileStateCache 跨 agent 陈旧缓存 → read 死循环** | 🔴 **P0 待修复**（2026-04-19 Test 2 暴露；per-agent cache 对其他 agent 的写入不敏感——scheduler→worker→scheduler 模式下，scheduler 读到陈旧缓存 8 轮死循环，靠 retry 的 `FileCache.Clear()` 才恢复。破坏"A 读 → B 写 → A 读"基础模式） |
+| **CLI 多行输入按 `\n` 拆分（含输入滞留粘连）** | 🔴 **P0 待修复**（2026-04-19 Test 1/Test 2 两次复现；bufio.Scanner 默认按行读，每行独立 EventUserInput。用户单一 prompt 被粉碎成多任务，且末行无 newline 时滞留与下次输入粘连） |
+| **Mail-notifier Progress-Notify 寄生唤醒**（扇出式，与已修复的链式级联不同） | ⚠️ **P2 待修复**（2026-04-19 Test 1/Test 2 两次稳定复现；单次写文件触发 5 个寄生唤醒任务，含发送方自我唤醒。与已修复的"邮件级联爆炸"不同——那是链式，本问题是扇出式，未被 ChainDepthLimit 覆盖） |
+| **TransferNote 不覆盖父子任务** | ⚪ **设计盲点留档**（2026-04-19 Test 1/Test 2 暴露；v3 §8.4 scope 限定为"兄弟 + Dependencies"依赖链，scheduler→worker subtask 的父子派发模式不注入 upstream-transfer-notes。非 bug，但 scope 覆盖面比设想小） |
 
-**30/35 项已修复。剩余：1 项 E2E 测试 + 1 项"写入事务化"专项 + 3 项 P3 观察级（路由偏向 / Worker 未 read_file / agent_id 空）。2026-04-14 下午第二轮多 Worker 测试耗时降至 3 min 25 sec（相比 2026-04-13 坏基线提速 63%），连续 2 次复测中 P2 路由偏向 + Worker 未 read_file 两项均未复现，已降级为 P3。**
+**30/42 项已修复。剩余：1 项 E2E 测试 + 1 项"写入事务化"专项 + 3 项 P3 观察级（路由偏向 / Worker 未 read_file / agent_id 空）+ **3 项 Session 化集成缺口**（P0×1 + P1×2）+ **3 项并发/输入路径缺陷**（FileCache 跨 agent P0、CLI 多行拆分 P0、Mail 扇出唤醒 P2）+ 1 项 TransferNote scope 留档。**
+
+> **P0 已累积到 3 项**（Trace CLI 路径 / FileCache 跨 agent / CLI 多行拆分）——任何一项都能在真实使用中频繁触发故障，建议立刻进入修复批次。
+>
+> **三项 Session 化集成缺口同根**：v3 §9.9 Session 化落地时"零件完工 + 各自单测通过"但"装配环节"无跨子系统烟测。
+>
+> **两项新 P0（FileCache + CLI 多行）同样是集成 bug**：单测都通过（`filecache_test.go` 只在单 agent 场景下测，`cli_test.go` 只测单行命令），但**跨子系统的真实协作路径无端到端覆盖**。与 Session 化三项加起来共 5 项 P0/P1 都是同一类"集成烟测缺失"的产物。
+>
+> 处理时间窗口建议：P0 三项（约 1 人/日）→ P1 两项（约半人/日）→ 同期补一套多 agent 端到端烟测（读-写-读、多行输入、Session 任务计数、finalization 全路径）防止回归。
 
 > 注：6 项 worktree 相关条目（Worktree 相对路径解析、Worktree Remove git 失忆兜底、Worktree merge 假成功、Main 工作区脏状态、Git 分支 ref 泄漏、Worktree 重试丢上下文）已于 2026-04-09 整体清出本文档 — 详细复盘随 `internal/isolation` 包一同消失。仅在"架构决策：删除 git 依赖"段保留作为历史索引。
 
@@ -1137,3 +1495,10 @@ test_result.md   3996 bytes   ← 唯一新产物，路径字面等于 expected_
 - **下一阶段下一阶段目标**：(a) 重跑多 Worker 系统测试，实测 expected_artifacts 修复后的 wall-clock 改善幅度（预期节省每 worker ~90s）；(b) 修复 Scheduler 路由负载感知（仍未实施）；(c) Worker 读上游产出 prompt 强化；(d) 设计并发写测试复盘 ①②④
 - **2026-04-14 下午第二轮多 Worker 测试验证**：耗时 3 min 25 sec（相比坏基线 9 min 20 sec 提速 63%；相比上次 6 min 26 sec 再提速 47%）。`EnforceExpectedArtifactsHook` 本次 0 次触发——但这恰恰证明它改变了 LLM 行为：scheduler 改用"调查任务返回纯文本 + 汇总任务写 expected_artifacts"的清晰分工，零漂移零越权。Scheduler 这次还主动使用 dependencies 字段引用真实 UUID（零占位符）。连续 2 次复测中 P2 路由偏向 + Worker 未 read_file 两项均未复现，降级为 P3 观察
 - **下一阶段目标 (rev3)**：(a) 设计针对性的并发写场景测试，复盘退化 ①②④；(b) 处理 P3 级剩余条目（agent_id 日志瑕疵）；(c) 考虑实施 v3 §1-4 行哈希增强 / §9.1 工具集分层 / §9.9 Session 化日志等 P2 候选
+- **2026-04-19 手工多测试（Test 1 依赖链 + Test 2 并发写）暴露 7 项新缺陷**：
+  - Session 化集成三件（Trace CLI 路径 P0 / history.jsonl 断链 P1 / Finalization emit 漏 P1）——"零件完工但装配漏接"
+  - FileStateCache 跨 agent 陈旧 P0——per-agent 缓存设计在多 agent 写入场景下破坏"A 读→B 写→A 读"基础模式
+  - CLI 多行输入按 `\n` 拆分 P0——bufio.Scanner 没有输入边界概念，用户 prompt 被粉碎
+  - Mail progress-notify 扇出唤醒 P2——与已修复的链式级联不同，是扇出式，单次写触发 5× LLM 调用
+  - TransferNote 父子任务 scope 盲点——v3 §8.4 设计范围限于兄弟依赖链，scheduler→worker 派发模式不覆盖
+- **下一阶段目标 (rev4)**：(a) **立即修 3 项 P0**（Trace CLI + FileCache + CLI 多行）——任一都可阻塞真实使用；(b) 与 v4 §7 Hashline 实施同期批量修 2 项 P1（history.jsonl + Finalization emit）；(c) 同期补一套跨子系统端到端烟测（读-写-读 / 多行输入 / Session 任务计数 / finalization 全路径），防止本轮同款"集成漏接"复发；(d) P2 Mail 扇出唤醒在 P0/P1 修完后再评估

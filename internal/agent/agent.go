@@ -434,6 +434,27 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			}
 			if err := a.Store.SubmitResult(a.ID, taskID, lastOutput); err != nil {
 				log.Printf("[agent %s] SubmitResult error: %v", a.ID, err)
+				trace.Emit(trace.Event{
+					Kind:    trace.KindError,
+					TaskID:  taskID,
+					AgentID: a.ID,
+					Error:   "SubmitResult failed: " + err.Error(),
+				})
+			} else {
+				// 跨轮短路也要 emit，否则 trace list 将任务错标为 running/loops=0。
+				// LoopsUsed=i（不是 i+1）——本轮 LLM 调用尚未发生即短路退出。
+				trace.Emit(trace.Event{
+					Kind:      trace.KindTaskSubmitted,
+					TaskID:    taskID,
+					AgentID:   a.ID,
+					OutputLen: len(lastOutput),
+					LoopsUsed: i,
+				})
+				trace.Emit(trace.Event{
+					Kind:    trace.KindTaskCompleted,
+					TaskID:  taskID,
+					AgentID: a.ID,
+				})
 			}
 			return
 		}

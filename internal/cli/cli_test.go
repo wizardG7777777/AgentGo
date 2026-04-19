@@ -170,6 +170,60 @@ func TestCLI_EmptyLine_Ignored(t *testing.T) {
 	}
 }
 
+func TestCLI_Multiline_BatchedUntilEmptyLine(t *testing.T) {
+	s, sched, ch := setup()
+
+	// 三行自由文本 + 空行提交，应聚合为单次 EventUserInput
+	input := strings.NewReader("第一行\n第二行\n第三行\n\n/quit\n")
+	output := &bytes.Buffer{}
+
+	c := New(s, ch, func() {}, sched, nil, nil, input, output)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	go c.Run(ctx)
+
+	select {
+	case evt := <-ch:
+		if evt.Type != model.EventUserInput {
+			t.Fatalf("event type = %s, want user_input", evt.Type)
+		}
+		want := "第一行\n第二行\n第三行"
+		if evt.Payload["text"] != want {
+			t.Errorf("batched text = %q, want %q", evt.Payload["text"], want)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timeout waiting for batched event")
+	}
+
+	// 应只产生一个事件
+	select {
+	case evt := <-ch:
+		t.Errorf("unexpected extra event: %v", evt)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestCLI_Multiline_SlashCommandInterrupts(t *testing.T) {
+	s, sched, ch := setup()
+
+	// 自由文本后紧跟 /quit（无空行）：应先提交文本再执行 /quit
+	input := strings.NewReader("分析 auth 模块\n/quit\n")
+	output := &bytes.Buffer{}
+
+	c := New(s, ch, func() {}, sched, nil, nil, input, output)
+	c.Run(context.Background())
+
+	select {
+	case evt := <-ch:
+		if evt.Payload["text"] != "分析 auth 模块" {
+			t.Errorf("text = %q, want %q", evt.Payload["text"], "分析 auth 模块")
+		}
+	default:
+		t.Fatal("expected one event before /quit")
+	}
+}
+
 func TestCLI_UnknownCommand(t *testing.T) {
 	s, sched, ch := setup()
 
@@ -771,7 +825,8 @@ func TestCLI_FreeText_RecordsFirstInput(t *testing.T) {
 		t.Fatalf("NewSessionManager failed: %v", err)
 	}
 
-	input := strings.NewReader("分析 auth 模块\n第二条消息\n/quit\n")
+	// 使用空行分隔两次独立的自由文本提交（第一次提交后 RecordFirstInput 生效）
+	input := strings.NewReader("分析 auth 模块\n\n第二条消息\n\n/quit\n")
 	c := New(s, ch, func() {}, sched, nil, nil, input, output, sm)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

@@ -12,11 +12,13 @@ import (
 // SessionManager 管理 Session 生命周期。
 // 所有公开方法并发安全（内部 sync.Mutex）。
 type SessionManager struct {
-	mu        sync.Mutex
-	baseDir   string         // ~/.agentgo/sessions/
-	current   *Session       // 当前活跃 Session，nil 表示无 Session 模式
-	logWriter io.WriteCloser // 当前 Session 的日志文件句柄
-	cfg       SessionConfig  // 配置项
+	mu             sync.Mutex
+	baseDir        string         // ~/.agentgo/sessions/
+	current        *Session       // 当前活跃 Session，nil 表示无 Session 模式
+	logWriter      io.WriteCloser // 当前 Session 的日志文件句柄
+	history        *HistoryLog    // 当前 Session 的 history.jsonl 句柄，nil 表示未开启
+	historyEnabled bool           // true 时切换/新建 Session 自动重开 history.jsonl
+	cfg            SessionConfig  // 配置项
 }
 
 // NewSessionManager 创建并初始化 SessionManager。
@@ -117,12 +119,16 @@ func (sm *SessionManager) CreateNew() (*Session, error) {
 
 	// 关闭旧 Session 的日志文件句柄
 	sm.closeLogWriter()
+	sm.closeHistoryLocked()
 
 	sess, err := sm.createNewInternal()
 	if err != nil {
 		return nil, err
 	}
 	sm.current = sess
+	if sm.historyEnabled {
+		sm.openHistoryLocked()
+	}
 	return sess, nil
 }
 
@@ -196,6 +202,7 @@ func (sm *SessionManager) Close() error {
 
 	// 关闭日志文件句柄
 	sm.closeLogWriter()
+	sm.closeHistoryLocked()
 
 	return nil
 }
@@ -236,6 +243,67 @@ func (sm *SessionManager) LogWriter() io.Writer {
 
 	sm.logWriter = f
 	return io.MultiWriter(f, os.Stdout)
+}
+
+// EnableHistoryLog 开启 history.jsonl 记录（立即为当前 Session 打开文件，并在
+// 后续 CreateNew / SwitchTo 时自动为新 Session 打开）。默认关闭：这是为了避免
+// 单测在 TempDir 清理时被 Windows 文件句柄持锁阻塞——生产侧由 bootstrap 显式调用。
+//
+// Windows 测试陷阱（必读）：Go 的 os.OpenFile 在 Windows 上不授予 FILE_SHARE_DELETE，
+// 只要 history 句柄还开着，t.TempDir() 的 cleanup 就会在 RemoveAll 时报
+// "The process cannot access the file because it is being used by another process"
+// 导致测试 FAIL。Linux/macOS 允许 unlink 打开的文件，这个问题看不见。
+//
+// 规则：任何调用 EnableHistoryLog 的测试必须配套 t.Cleanup(func() { _ = sm.Close() })，
+// 否则在 Windows CI 上会 flake。示例：
+//
+//	sm, _ := NewSessionManager(t.TempDir(), cfg)
+//	sm.EnableHistoryLog()
+//	t.Cleanup(func() { _ = sm.Close() })
+func (sm *SessionManager) EnableHistoryLog() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.historyEnabled = true
+	if sm.history == nil {
+		sm.openHistoryLocked()
+	}
+}
+
+// History 返回当前 Session 的 HistoryEmitter（可注入到 store/roster/mailbox）。
+// 无活跃 Session 或 history 打开失败时返回 nil。返回的是接口，nil 值不会被"有类型 nil"污染。
+func (sm *SessionManager) History() HistoryEmitter {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.history == nil {
+		return nil
+	}
+	return sm.history
+}
+
+// openHistoryLocked 为 sm.current 打开 history.jsonl。调用方必须持有 sm.mu
+// （或在 NewSessionManager 的初始化阶段，此时还无并发访问）。
+// 失败时只记录警告并保持 sm.history=nil，不影响 Session 其余功能。
+func (sm *SessionManager) openHistoryLocked() {
+	if sm.current == nil {
+		return
+	}
+	path := filepath.Join(sm.current.Dir, "history.jsonl")
+	h, err := OpenHistoryLog(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[WARNING] 打开 history.jsonl 失败: %v\n", err)
+		return
+	}
+	sm.history = h
+}
+
+// closeHistoryLocked 关闭并清空 sm.history。调用方必须持有 sm.mu。
+func (sm *SessionManager) closeHistoryLocked() {
+	if sm.history != nil {
+		if err := sm.history.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "[WARNING] 关闭 history.jsonl 失败: %v\n", err)
+		}
+		sm.history = nil
+	}
 }
 
 // closeLogWriter 关闭当前日志文件句柄（不加锁，调用方需持有 sm.mu）。
@@ -355,6 +423,7 @@ func (sm *SessionManager) SwitchTo(sessionID string) error {
 
 	// 关闭旧日志文件句柄
 	sm.closeLogWriter()
+	sm.closeHistoryLocked()
 
 	// 查找目标 Session 目录
 	targetDir := filepath.Join(sm.baseDir, "sess-"+sessionID)
@@ -387,6 +456,9 @@ func (sm *SessionManager) SwitchTo(sessionID string) error {
 		ID:       sessionID,
 		Dir:      targetDir,
 		Metadata: *meta,
+	}
+	if sm.historyEnabled {
+		sm.openHistoryLocked()
 	}
 
 	return nil
