@@ -97,16 +97,6 @@ type SchedulerExecutor struct {
 	// nil 时回退到 WorkerCapabilities 的旧行为。
 	WorkerCapabilitiesByProfile map[string]*AgentCapabilityInfo
 
-	// FinalizationChecker（可选）：如果非 nil，每轮 Execute 入口会先调 IsFinalized()，
-	// 返回 true 时短路返回 Finalized=true，让 agent.Run 的 reactLoop
-	// 走"任务完成"路径终止当前 scheduler task。
-	//
-	// 这是修复"report_done 后 reactLoop 不终止 → LLM 幻觉心跳"的关键：
-	// SchedulerGroup.reportDone 在工具执行成功时通过 FinalizationNotifier
-	// 设置 finalized=true，下一轮 reactLoop 进入 Execute 时立即被这里拦截。
-	//
-	// nil 时跳过检查（向后兼容旧测试 + 不需要终止信号的场景）。
-	FinalizationChecker agent.FinalizationChecker
 }
 
 // Execute 实现 agent.TaskExecutor 接口。
@@ -116,19 +106,6 @@ func (e *SchedulerExecutor) Execute(
 	depResults map[string]string,
 	history []agent.HistoryEntry,
 ) (agent.ExecuteResult, error) {
-	// 0. 短路检查：如果上一轮 reactLoop 已经调过 report_done，立即返回
-	//    Finalized=true 让 agent.Run 走"任务完成"路径终止当前 task。
-	//    这是修复"幻觉心跳无限循环"的关键 —— 没有这一步，agent reactLoop 会
-	//    因为 report_done 是 tool call 而继续迭代，让 LLM 不停生成新的 report_done。
-	if e.FinalizationChecker != nil && e.FinalizationChecker.IsFinalized() {
-		log.Printf("[scheduler-exec] FinalizationChecker.IsFinalized()=true，短路终止 reactLoop (task=%s)", task.ID)
-		return agent.ExecuteResult{
-			Output:     "scheduler task 已通过 report_done 完成",
-			ToolCalled: false,
-			Finalized:  true,
-		}, nil
-	}
-
 	// 1. 等待 batch 中所有任务到达终态（completed/failed/cancelled）
 	if err := e.waitForBatchTerminal(ctx, task.ID); err != nil {
 		return agent.ExecuteResult{}, err

@@ -8,8 +8,8 @@ import (
 )
 
 func TestValidatePath_WithinRoot(t *testing.T) {
-	root := filepath.Join("/", "project")
-	path := filepath.Join("/", "project", "src", "main.go")
+	root := t.TempDir()
+	path := filepath.Join(root, "src", "main.go")
 
 	result, err := ValidatePath(path, root)
 	if err != nil {
@@ -21,12 +21,13 @@ func TestValidatePath_WithinRoot(t *testing.T) {
 }
 
 func TestValidatePath_OutsideRoot(t *testing.T) {
-	root := filepath.Join("/", "project")
-	path := filepath.Join("/", "etc", "passwd")
+	root := t.TempDir()
+	parent := filepath.Dir(root)
+	path := filepath.Join(parent, "outside-root", "passwd")
 
 	_, err := ValidatePath(path, root)
 	if err == nil {
-		t.Fatal("期��返回错误，但路径被允许")
+		t.Fatal("期望返回错误，但路径被允许")
 	}
 	if !strings.Contains(err.Error(), "超出项目根目录") {
 		t.Errorf("期望包含 '超出项目根目录' 的错误，得到: %v", err)
@@ -34,8 +35,9 @@ func TestValidatePath_OutsideRoot(t *testing.T) {
 }
 
 func TestValidatePath_TraversalAttack(t *testing.T) {
-	root := filepath.Join("/", "project")
-	path := filepath.Join("/", "project", "..", "etc", "passwd")
+	root := t.TempDir()
+	// 使用相对路径逃逸 projectRoot，验证 Join+Clean 后仍会被前缀校验拦截。
+	path := filepath.Join("..", "outside-root", "passwd")
 
 	_, err := ValidatePath(path, root)
 	if err == nil {
@@ -47,8 +49,8 @@ func TestValidatePath_TraversalAttack(t *testing.T) {
 }
 
 func TestValidatePath_SensitiveFile(t *testing.T) {
-	root := filepath.Join("/", "project")
-	path := filepath.Join("/", "project", ".env")
+	root := t.TempDir()
+	path := filepath.Join(root, ".env")
 
 	_, err := ValidatePath(path, root)
 	if err == nil {
@@ -60,7 +62,7 @@ func TestValidatePath_SensitiveFile(t *testing.T) {
 }
 
 func TestValidatePath_EmptyRoot(t *testing.T) {
-	path := filepath.Join("/", "etc", "passwd")
+	path := filepath.Join("some", "relative", "path.txt")
 
 	result, err := ValidatePath(path, "")
 	if err != nil {
@@ -72,8 +74,8 @@ func TestValidatePath_EmptyRoot(t *testing.T) {
 }
 
 func TestValidatePath_SshKey(t *testing.T) {
-	root := filepath.Join("/", "project")
-	path := filepath.Join("/", "project", ".ssh", "id_rsa")
+	root := t.TempDir()
+	path := filepath.Join(root, ".ssh", "id_rsa")
 
 	_, err := ValidatePath(path, root)
 	if err == nil {
@@ -85,7 +87,7 @@ func TestValidatePath_SshKey(t *testing.T) {
 }
 
 func TestValidatePath_RootItself(t *testing.T) {
-	root := filepath.Join("/", "project")
+	root := t.TempDir()
 
 	result, err := ValidatePath(root, root)
 	if err != nil {
@@ -125,13 +127,15 @@ func TestValidatePath_RelativeJoinedAgainstProjectRoot(t *testing.T) {
 // 不会因修复相对路径解析而绕过 SSRF/sandbox 保护。
 func TestValidatePath_AbsolutePathStillChecked(t *testing.T) {
 	root := t.TempDir()
+	parent := filepath.Dir(root)
+	outsideAbs := filepath.Join(parent, "outside-abs", "passwd")
 
 	// 传入项目根目录之外的绝对路径，应被拒绝
-	_, err := ValidatePath("/etc/passwd", root)
+	_, err := ValidatePath(outsideAbs, root)
 	if err == nil {
-		t.Errorf("绝对路径 /etc/passwd 不在 projectRoot 内，应被拒绝")
+		t.Errorf("绝对路径 %s 不在 projectRoot 内，应被拒绝", outsideAbs)
 	}
-	if err != nil && !filepath.IsAbs("/etc/passwd") {
+	if err != nil && !filepath.IsAbs(outsideAbs) {
 		t.Errorf("不应只对相对路径生效")
 	}
 }

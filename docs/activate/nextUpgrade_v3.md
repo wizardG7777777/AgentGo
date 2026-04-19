@@ -1,16 +1,16 @@
 # nextUpgrade v3 — 行哈希增强（Hashline Read Enhancer）
 
-> 状态：📝 待实现（2026-04-09 记录）
-> 依赖：待补充 ohmyopen-agent 项目的具体实现参考后启动（`read_file` 工具接口已稳定）
-> ⚠️ **缺少引用**：本方案灵感来源于 "ohmyopen-agent" 项目的行哈希机制，但当前文档缺少具体的代码引用和实现参考。待补充该项目的仓库地址、相关源码位置及实现细节。
+> 状态：📝 标题主题已迁移到 v4 §7（2026-04-19 取得参考资料并完成定稿设计）
+> 依赖：~~待补充 ohmyopen-agent 项目的具体实现参考后启动~~（已取得：`HASHLINE_EDIT_INVESTIGATION.zh.md`）
+> 后续：v3 §2-§5 占位关闭。具体方案见 [`nextUpgrade_v4.md`](./nextUpgrade_v4.md) §7 Hashline 行哈希增强。
 
 ---
 
-## 文档状态总览（2026-04-19 更新，Per-Worker Tool Profiles 落地）
+## 文档状态总览（2026-04-19 更新，Hashline 设计定稿迁出至 v4 §7）
 
 | 章节 | 内容 | 状态 |
 |------|------|------|
-| §2-§5 | 行哈希增强 | 📝 待实现（待补充参考资料） |
+| §2-§5 | 行哈希增强 | ➡️ 迁移到 v4 §7（设计定稿 2026-04-19，待实施） |
 | §5.1 | RosterHookView 接口 | ✅ 已完成 |
 | §6 | Finalization Tool 终止桥 | ✅ 已完成 |
 | §7 | Agent Hook 系统 | ✅ 已完成 |

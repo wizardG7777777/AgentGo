@@ -428,18 +428,17 @@ func New(
 	modeStore := NewModeStore()
 	sessionHistory := NewSessionHistory(0) // 默认容量 16
 	schedExec := &SchedulerExecutor{
-		Inner:               innerExec,
-		Store:               s,
-		Cfg:                 cfg,
-		BatchUpdateCh:       batchUpdateCh,
-		WaitTimeout:         30 * time.Second,
-		Mode:                modeStore.modeString(), // 初始 mode；ModeStore 后续切换由 SchedulerExecutor 在 Execute 内重读
-		ModeStore:           modeStore,
-		MBRegistry:          mbRegistry,
-		Roster:              r,
-		History:             sessionHistory,
-		FinalizationChecker: holder, // 同一个 holder 也实现 FinalizationChecker
-		AgentRegistry:       agentRegistry,
+		Inner:         innerExec,
+		Store:         s,
+		Cfg:           cfg,
+		BatchUpdateCh: batchUpdateCh,
+		WaitTimeout:   30 * time.Second,
+		Mode:          modeStore.modeString(), // 初始 mode；ModeStore 后续切换由 SchedulerExecutor 在 Execute 内重读
+		ModeStore:     modeStore,
+		MBRegistry:    mbRegistry,
+		Roster:        r,
+		History:       sessionHistory,
+		AgentRegistry: agentRegistry,
 	}
 
 	// 构造 agent
