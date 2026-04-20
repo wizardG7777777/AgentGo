@@ -224,3 +224,54 @@ func TestPathBoundaryHook_ViaRegistryAbort(t *testing.T) {
 		t.Errorf("Action = %v, want Abort", d.Action)
 	}
 }
+
+// ================================================================
+// ⚠️  2026-04-20 回归锁（预期红态 —— 请勿删除断言！）
+// ================================================================
+//
+// 本节下列测试当前**故意失败**，用于锁定 P1-1 "Hook 错误消息不足以让 LLM 自愈" 缺陷：
+// 在修复完成前它们应保持红灯。如果 CI 报这两个测试失败，**不是回归**，这是提醒
+// bug 还没修。修复路径：让 PathBoundaryHook 按工具名分派参数字段（glob_search
+// 应检查 root_dir；write_file/read_file 等保持检查 path），并在缺参时把正确字段
+// 名写进错误消息。
+//
+// ❌ 错误处理：删除断言 / 改 Skip / 弱化期望 —— 这样会抹掉 bug 信号
+// ✅ 正确处理：修 path_boundary.go 让它尊重各工具的 schema，此处自动变绿
+//
+// 背景（bug 现象）：2026-04-20 并发测试中 explorer 连续 8 次调 glob_search 都传
+// root_dir（工具 schema 声明的合法字段），每次都被 hook 以"缺少 path 参数"拒绝，
+// LLM 读错误消息后无法修正，浪费 8 轮 loop + 大量 token。
+//
+// 参见：docs/activate/KNOWN_ISSUES.md "Hook 错误消息不足以让 LLM 自愈"
+// ================================================================
+
+// TestPathBoundaryHook_GlobSearch_AcceptsRootDir 断言 hook 尊重 glob_search 工具
+// schema 声明的参数名（root_dir）。修复前本测试失败（hook 硬编码 path）。
+func TestPathBoundaryHook_GlobSearch_AcceptsRootDir(t *testing.T) {
+	root := t.TempDir()
+	h := NewPathBoundaryHook(root)
+	d := h.Run(hook.ToolHookContext{
+		ToolName: "glob_search",
+		Args:     map[string]any{"root_dir": root, "pattern": "**/*.md"},
+	})
+	if d.Action == hook.Abort {
+		t.Errorf("glob_search with root_dir 应被接受（与 schema 一致），实际被拒: %s", d.AbortReason)
+	}
+}
+
+// TestPathBoundaryHook_GlobSearch_MissingAllPathArgs_ErrorHintsCorrectField 断言
+// 当 glob_search 完全缺少路径参数时，错误消息须提示正确字段名 root_dir，
+// 让 LLM 能自愈而不是陷入重复错误循环。
+func TestPathBoundaryHook_GlobSearch_MissingAllPathArgs_ErrorHintsCorrectField(t *testing.T) {
+	h := NewPathBoundaryHook(t.TempDir())
+	d := h.Run(hook.ToolHookContext{
+		ToolName: "glob_search",
+		Args:     map[string]any{"pattern": "**/*.md"},
+	})
+	if d.Action != hook.Abort {
+		t.Fatalf("glob_search 完全缺参时应 Abort, got %v", d.Action)
+	}
+	if !strings.Contains(d.AbortReason, "root_dir") {
+		t.Errorf("错误消息应提及正确字段名 root_dir 以便 LLM 自愈, 实际: %q", d.AbortReason)
+	}
+}

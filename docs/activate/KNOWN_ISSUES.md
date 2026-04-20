@@ -1413,6 +1413,216 @@ Test 2 worker-3 第一次 edit_file 成功后：
 
 ---
 
+## 2026-04-20 三场景并发读写测试暴露的新缺陷
+
+2026-04-20 执行"独立写 + shared.md FIFO + log.md 读写混合"三场景测试（total 14.5 min, 02:21:25→02:35:51）。**scheduler 最终 report_done 返回"全部成功"，但系统校验 artifacts 对照日志后发现：三个并发路径没有一条被真实验证过**，而是被串行化了。文件产出正确但测试有效性为零。额外暴露了 4 个新缺陷 + 1 个测试方法论问题。
+
+关键时间线：
+```
+02:21:58 scheduler loop=0 publish a.md → 等 a.md 完成
+02:22:41 scheduler loop=1 publish b.md → 等 b.md 完成
+02:24:30 scheduler loop=2 publish c.md → 等 c.md 完成
+02:26:18/27:54/29:59 scheduler loop=3/4/5 依次 publish shared.md (A/B/C)
+02:31:19 scheduler loop=6 publish log.md（但从未 publish B/C 的读任务）
+02:35:51 report_done 声称 "Worker-B 读取了 log.md" ← 幻觉
+```
+
+---
+
+## Scheduler publish_task 完全串行发布（🔴 P0）
+
+**现象**：scheduler 接到"并行发布 3 个子任务"的明确指令后，**逐个 loop 发布并等待完成**。6 个子任务占用 scheduler loop 0→5 共 6 轮，wall-clock 14 分钟；如果真正并行，3 个独立写应在 ~30s 内完成、3 个 shared.md 追加 ~1min 完成。
+
+**证据**：
+```
+02:21:58 loop=0 publish_task a.md → 02:22:06 worker-1 写完 (8s)
+02:22:41 loop=1 publish_task b.md ← 已等 a.md 完成
+02:23:00 worker-3 写完 b.md
+02:24:30 loop=2 publish_task c.md ← 已等 b.md 完成
+```
+每次 `scheduler-exec 等待 batch 完成: 1/N 仍在执行`，pending task 数固定为 1，说明 scheduler 的 LLM 行为是"publish → 等 → publish → 等"，没有利用单 loop 内可多次调用工具的能力。
+
+**根因（待验证）**：
+- scheduler system prompt 或 `publish_task` 工具描述中**未明确提示**"同一 loop 可多次调用 publish_task 实现并行"
+- 或 prompt 中有"依赖链串行"样例，被 LLM 泛化到了无依赖场景
+- `SchedulerExecutor.waitForBatchTerminal`（Phase 3 改动）设计本意是"scheduler 调用 LLM 前同步等 batch 完成"——但如果 scheduler 一个 loop 只 publish 一个任务，该机制会强制每个任务串行。这可能是实现预期副作用，但 LLM 没学到"单 loop 内批量 publish"的技巧
+
+**影响（P0）**：
+- **所有并发场景测试都无法真实触发** → 并发机制是否正确工作无法验证
+- wall-clock 被拉长 N 倍（N = 并行子任务数）
+- `default_concurrency=2` 配置事实失效，因为公告板上同一时刻只有 1 个 pending task
+- 测试阶段掩盖真实生产环境并发 bug（如 roster FIFO、cache 一致性）
+
+**修复方案（推荐组合 A+B）**：
+| 方案 | 工作量 | 风险 |
+|---|---|---|
+| **A. `publish_task` 工具描述加并行语义** | ~10 行 | 低 |
+| **B. scheduler system prompt 加反面/正面示例** | ~20 行 | 低 |
+| C. 加 `publish_tasks` 批量工具（list 参数） | ~60 行 | 工具表膨胀 |
+| D. finalization 检测到"scheduler 只 publish 1 个任务就等"主动 nudge | ~80 行 | 过度工程 |
+
+A+B 的核心措辞建议：
+- 工具描述："**同一 reactLoop 内可多次调用 publish_task**；若子任务**无 Dependencies 关联**，连续多次 publish 会被并行执行。"
+- prompt 示例：
+  - ❌ 反面："loop=0 publish A → 等 A → loop=1 publish B"
+  - ✅ 正面："loop=0 连续 publish A/B/C（无依赖时）→ waitForBatchTerminal 会一次等齐三者"
+
+---
+
+## Scheduler report_done 允许幻觉汇报（🔴 P0）
+
+**现象**：scheduler 在 `report_done` 的 summary 中**声称了从未发生的动作**。具体来说，声称 "Worker-B/C 读取了 log.md 并引用了其中一行"，但日志中**只有 worker-2 写了一次 log.md，没有任何 B/C 的 read_file 动作**，系统 artifacts 校验块也没有对应的读取任务。
+
+**证据**：
+- 02:31:30 worker-2 写 log.md 后，至 02:35:51 `report_done` 之间，**无任何 worker 读 log.md 的 trace 记录**
+- 02:35:09 scheduler 自己 loop=3 `read_file log.md` → scheduler 把这条自己的读取当成了"B/C 的读取"写进汇总
+- `report_done` summary 中的陈述与底部"=== 实际产出（系统校验）==="列表**矛盾**——系统校验列表仅显示 7 个任务（3 个写 a/b/c + 3 个追加 shared + 1 个写 log），没有 B/C 读 log.md 的任务
+- 系统校验本该作为"事实护栏"，但 summary 已经编造完后再叠加校验块，校验块既没阻止 report_done，也没被 LLM 用来自查
+
+**根因（推测三选一）**：
+1. scheduler 的 `report_done` 路径没把"ExpectedArtifacts / Dependencies 中声明的动作"与 summary 对照；artifacts 校验只管"文件确实写了"，不管"summary 里声称的动作是否真发生过"
+2. scheduler 自己执行 read_file 没被统计入"哪个 worker 做了什么"表（没有 agent → action 的结构化归属记录）
+3. scheduler prompt 没禁止"基于自己观察编造其他 worker 动作"；相反 team-awareness 注入的 peer 信息可能诱导它代替 peer 陈述
+
+**影响（P0）**：
+- **信息不可信**——调用方基于 summary 做的下游决策全部处于错误前提
+- 连带破坏 trace/session 事件溯源的可信度（后续 §9.9 P1 修复完也还是会被 summary 幻觉污染）
+- 特别危险：用户可能以为"并发读写已通过测试"，实际连场景 3 都没跑
+
+**修复方案（分层组合）**：
+| 层 | 方案 | 工作量 |
+|---|---|---|
+| L1：Hook | 新增 `ReportDoneFactCheckHook`（PreCall），比对 summary 中"worker-X 做了 Y"之类陈述是否有对应 task.Agent+task.Artifacts 支撑，不支撑则 Abort + 指导性错误 | ~120 行 + 单测 |
+| L2：Prompt | scheduler system prompt 加硬约束："**summary 中只能描述系统校验块中出现的 agent 动作**；未发布子任务执行的操作不得出现在 summary 中" | ~15 行 |
+| L3：结构化 | 让 scheduler 在汇总前先产生一份结构化的"动作-agent-artifact"映射（工具 `build_fact_table`），再在此基础上 narrate | ~200 行（重构） |
+
+短期 L2 先上（便宜），L1 作为护栏（中期），L3 作为长期目标。
+
+---
+
+## Hook 错误消息不足以让 LLM 自愈（🟡 P1）
+
+**现象**：explorer-1 连续 8 次调 `glob_search` 传错参数名（传 `root_dir`，应为 `path`），每次都被 `path-boundary` hook 拒绝，错误消息相同："工具 glob_search 缺少 path 参数"。LLM 读到"缺少 path"后每次都只是改动**其他**参数（如 `pattern`、加`root_dir`）而不是把 `root_dir` 改成 `path`。
+
+**证据**（时间点 + 重复错误）：
+```
+02:22:53 glob_search {root_dir:".", pattern:"**/a.md"}    → 拒
+02:23:23 glob_search {root_dir:".", pattern:"**/a.md"}    → 拒
+02:23:54 glob_search {pattern:"**/a.md"}                   → 拒（只删了 root_dir 更懵）
+02:26:47 glob_search {root_dir:"/", pattern:"**/*.md"}     → 拒
+02:27:24 glob_search {root_dir:"/tmp", pattern:"**/a.md"}  → 拒
+02:27:31 glob_search {root_dir:"/", pattern:"**/a.md"}     → 拒
+02:27:39 glob_search {root_dir:"/tmp", pattern:"**/a.md"}  → 拒
+02:27:59 glob_search {root_dir:"/tmp", pattern:"**/a.md"}  → 拒
+```
+LLM 完全没学到"用 `path` 字段"这个事实。8 次失败等于 8 次 LLM 调用 + 8 轮 loop 消耗。
+
+**根因**：
+- `path-boundary` hook 错误消息只说"缺少 path 参数"，**未声明正确字段名与错误字段名的对应关系**
+- LLM 训练集中多个生态的 glob 工具字段名不一（`path` / `root_dir` / `cwd` / `base_dir`），在歧义错误消息下它无法定位自己的错误字段
+- 更深层：tool schema 和 hook 校验在字段层面缺乏一致性保证——如果 tool schema 声明的是 `path`，LLM 本不该传 `root_dir`（这暗示 schema 生成 / prompt 渲染某处丢了参数列表）
+
+**影响（P1）**：
+- 每个"错误参数名"陷阱都会消耗 N 轮 loop（本次 8 轮，约 16 min wall-clock，含 LLM 思考时间）
+- 可能连锁触发 MaxLoops → RetryRollback → 再次触发同错误
+- 不是 P0 只是因为不会阻止 happy path，但一旦踩中就会吃掉大部分时间预算
+
+**修复方案**：
+| 方案 | 工作量 |
+|---|---|
+| **A. 错误消息升级为"参数名自助指引"**（推荐） | ~30 行 |
+| B. hook 允许参数别名（`root_dir` → `path` 软映射） | ~50 行（但破坏 schema 契约） |
+| C. 在 LLM tool schema 渲染层增加参数描述字符串 | ~检查后评估 |
+
+A 的关键改动：`path-boundary.go` 错误消息改为
+```
+缺少必需参数 'path'。
+工具 glob_search 的正确字段名是 'path'（不是 root_dir / dir / cwd / base_dir）。
+示例：{"path": "/tmp", "pattern": "**/a.md"}
+```
+
+同时建议把 A 的思路泛化为 hook 基础设施层：**所有 PreCall 参数拒绝类错误，消息必须包含"正确字段名 + 示例"**。
+
+---
+
+## Mail chain_depth 全程为 0，ChainDepthLimit 效果存疑（🟡 P1）
+
+**现象**：本次测试期间 `mail-notifier 已为 ... 发布唤醒任务` 出现 **40+ 次**，**无一例** `chain_depth` > 0。即使 explorer-1 在 02:25:46 / 02:26:18 / 02:29:27 连续发送 reply 类消息（"已收到你的进度报告..."）后触发了新一轮唤醒，唤醒任务的 `chain_depth` 仍然是 0。
+
+**证据**：
+```
+02:25:46 explorer-1 send_message (msg_type=reply)
+02:25:49 mail-notifier 已为 worker-3 (未读=1, chain_depth=0) 发布唤醒任务   ← 应为 1
+02:26:18 explorer-1 send_message (msg_type=reply)
+02:26:49 mail-notifier 已为 explorer-1 (未读=1, chain_depth=0) 发布唤醒任务 ← 仍为 0
+02:29:27 explorer-1 send_message (msg_type=info)
+02:29:29 mail-notifier 已为 worker-3 (未读=1, chain_depth=0) 发布唤醒任务   ← 仍为 0
+```
+
+所有唤醒任务 chain_depth=0 → `ChainDepthLimitHook`（max_depth=3 时）**永远不会触发 Abort**，那之前"已修复的邮件级联爆炸"的防御事实上被绕过。
+
+**根因（需验证三种假设）**：
+1. `send_message` 工具未正确读取 `current_task.MailChainDepth + 1` → 新消息 chain_depth 始终 0
+2. `mail-notifier` 在 publish 唤醒任务时，**没把邮件本身的 chain_depth 传递到新任务**（chain_depth 是存在 task 上，不是 message 上，所以每次新唤醒任务的 chain_depth 字段被默认零值覆盖）
+3. `wake-context-expand` / `per-agent-dedup` 两个 hook 里绕过了 chain_depth 设置逻辑
+
+**对比"已修复的邮件级联爆炸"条目**：之前的修复依赖 `chain_depth` 递增达到阈值拦截。如果 chain_depth 从没 > 0 过，拦截机制从未被触发验证过——上次修复可能只在单测（手工 set depth）里验证过，生产路径下实际上是**名义修复**。
+
+**影响（P1）**：
+- 本次测试中 explorer-1/worker-3 之间"已收到"回合有 3-4 轮，如果更极端场景下（更多 peer 互相 ack），链式级联可能仍会爆炸
+- 三项 Mailbox Hook 中 `ChainDepthLimitHook` 可能是 dead code（不报错但从来不生效）
+- 信号：这次没爆炸**不是因为 hook 起作用，而是因为 prompt 削弱了"必须回复每封邮件"指令**——hook 是不是第二层保险无法确认
+
+**修复方案**：
+1. **立即**：加 `DEBUG` 级别 trace 事件 `KindMailChainDepthUpdate`，每次 send_message 打印 `old_depth → new_depth`，一次测试后就能确认递增路径
+2. **短期**：写针对性集成测试——人工触发 A→B→A→B 消息链，assert 第 4 跳 chain_depth ≥ 3 且 `ChainDepthLimitHook.Decision=Abort`
+3. **长期**：根据 debug 结果修真正缺陷位——预计在 `meta.go send_message` 或 `notifier.go scan()` 构造 wake task 的那段
+
+---
+
+## 2026-04-20 回归锁索引（红态测试 = bug 仍在）
+
+为防止 2026-04-20 发现的 4 个 P0/P1 缺陷在修复过程中走样，已落地一批**预期红态**的回归测试。**这些测试在 bug 修复前故意失败**——看到它们失败不是回归，是"bug 还没修"的提醒信号。
+
+| 缺陷 | 测试位置 | 预期态 | 修复后状态 |
+|---|---|---|---|
+| P0-1 Scheduler 串行 publish | `scheduler_test.go::TestSchedulerSystemPrompt_DoesNotClaimSingleTaskPerLoop` | 🔴 RED | 修 `schedulerSystemPrompt` 第 243 行附近的误导陈述后自动变绿 |
+| P0-1 Scheduler 并行指引防回归 | `scheduler_test.go::TestSchedulerSystemPrompt_ContainsParallelIndependentPublishGuidance` | 🟢 GREEN | 保护现有并行指引不被误删 |
+| P1-1 path-boundary × glob_search schema | `path_boundary_test.go::TestPathBoundaryHook_GlobSearch_AcceptsRootDir` | 🔴 RED | 让 PathBoundaryHook 按工具名分派参数字段后自动变绿 |
+| P1-1 Hook 错误消息 UX | `path_boundary_test.go::TestPathBoundaryHook_GlobSearch_MissingAllPathArgs_ErrorHintsCorrectField` | 🔴 RED | 错误消息带上正确字段名后自动变绿 |
+| P1-2 Explorer chain_depth 继承 | `explorer/chain_depth_test.go::TestExplorerSendMessage_InheritsChainDepthFromCurrentTask` | 🔴 RED | 修 `explorer.go:81` 的 MetaGroup 构造后自动变绿 |
+
+**处理守则**：
+- ❌ **不要**用 `t.Skip` / 删除断言 / 弱化期望值来让测试变绿 —— 这会掩盖 bug 信号
+- ✅ **应当**修底层代码，让测试**自然变绿** —— 这就是回归锁的用法
+
+**P0-2 "report_done 幻觉"尚未落地回归测试**：该缺陷需要一个尚未实现的
+`ReportDoneFactCheckHook`，写测试意味着写 TDD 风格的 hook 测试，属于"修复计划"
+而非"行为观测"，放到修复批次同步起草。
+
+---
+
+## 测试方法论缺陷：read-modify-write 无法验证 FIFO 锁（⚪ 设计/测试范式留档）
+
+**现象**：shared.md 的"3 workers 并发追加"测试，实际执行模式是每个 worker：`read_file → 本地拼接已有内容 + 自己一行 → write_file`。即使三个 worker 并发执行，roster 的写独占锁只能保证**写入不互相踩踏**，但 3 个 worker 各自读到不同中间态后，最后一个写的会覆盖前面两个——**丢写**，而不是排队。
+
+**解释**：
+- 若真并发：T0 三个 worker 都 read（全空）→ T1 三个 worker 各自写 `"自己一行"` → 只剩最后一个 writer 的内容（1 行）
+- 当前"测试成功"实际是因为 **Scheduler publish_task 串行化了**（见上条 P0），每个 worker 执行时前一位已 commit，read 到的是真实最新内容
+- roster FIFO 排队机制**根本没被真实触发**过
+
+**影响（设计/测试方法论层面）**：
+- 无法用 read-modify-write 模式测试任何"写排队"场景；必须要有"原子追加"语义
+- 当前工具表里 `write_file` 是全量写，没有 `append_file`，因此**无法构造能真实验证 roster FIFO 的测试用例**（除非退化为"不同文件路径但同一锁"，该场景目前不存在）
+- 这也解释了为什么 "roster 写入排队（§8.3）"落地近一周，实际跑业务测试时看不到排队事件
+
+**建议**（非阻塞，作为后续测试基础设施）：
+1. 新增 `append_file(path, line)` 工具，**非依赖已有内容**；roster 锁内部自己做"读→追加→写"的原子操作
+2. 或保留 read-modify-write 模式，但测试场景改为"3 个 worker 并发写**不同**文件，但路径在 roster 锁的同一 key"（需要 roster 支持自定义 lock key 粒度，目前未实现）
+3. 在 scheduler 先修完串行 publish 的 P0 后，再设计新测试——**否则 P0 会继续掩盖任何并发问题**
+
+---
+
 ## 总览
 
 | 缺陷 | 状态 |
@@ -1464,16 +1674,29 @@ Test 2 worker-3 第一次 edit_file 成功后：
 | **CLI 多行输入按 `\n` 拆分（含输入滞留粘连）** | 🔴 **P0 待修复**（2026-04-19 Test 1/Test 2 两次复现；bufio.Scanner 默认按行读，每行独立 EventUserInput。用户单一 prompt 被粉碎成多任务，且末行无 newline 时滞留与下次输入粘连） |
 | **Mail-notifier Progress-Notify 寄生唤醒**（扇出式，与已修复的链式级联不同） | ⚠️ **P2 待修复**（2026-04-19 Test 1/Test 2 两次稳定复现；单次写文件触发 5 个寄生唤醒任务，含发送方自我唤醒。与已修复的"邮件级联爆炸"不同——那是链式，本问题是扇出式，未被 ChainDepthLimit 覆盖） |
 | **TransferNote 不覆盖父子任务** | ⚪ **设计盲点留档**（2026-04-19 Test 1/Test 2 暴露；v3 §8.4 scope 限定为"兄弟 + Dependencies"依赖链，scheduler→worker subtask 的父子派发模式不注入 upstream-transfer-notes。非 bug，但 scope 覆盖面比设想小） |
+| **Scheduler publish_task 完全串行发布** | 🔴 **P0 待修复**（2026-04-20 三场景并发测试暴露；scheduler 每 loop 只 publish 1 个任务然后等完再 publish 下一个，`default_concurrency` 事实失效。所有并发场景测试无法真实触发——这是测试链路上的"万能掩盖者"） |
+| **Scheduler report_done 允许幻觉汇报** | 🔴 **P0 待修复**（2026-04-20 暴露；scheduler 在 summary 中声称 "Worker-B/C 读取了 log.md" 但日志无此操作、artifacts 校验块也无对应任务。summary 与系统校验矛盾时系统不拦截，汇报可信度崩塌） |
+| **Hook 错误消息不足以让 LLM 自愈** | 🟡 **P1 待修复**（2026-04-20 暴露；explorer 连续 8 次 glob_search 传 `root_dir` 被 path-boundary 拒绝，错误消息"缺少 path 参数"未提示正确字段名，LLM 无法定位自己错在参数命名上。泛化后应为所有 PreCall 参数拒绝类 hook 的通用约束） |
+| **Mail chain_depth 全程为 0，ChainDepthLimit 效果存疑** | 🟡 **P1 待修复**（2026-04-20 暴露；40+ 次唤醒任务 chain_depth 全为 0，即使 explorer 连续发 reply 也没递增。意味着 ChainDepthLimitHook 可能是 dead code，已修复的"邮件级联爆炸"可能仅凭 prompt 削弱止血、非 hook 拦截） |
+| **Read-modify-write 测试模式无法验证 FIFO 锁** | ⚪ **测试方法论留档**（2026-04-20 暴露；shared.md 追加测试本质上是 read-modify-write，即使真并发也会丢写而非排队；当前工具集缺少原子 append_file 语义。roster §8.3 FIFO 排队落地近一周但从未被真实测试触发过） |
 
-**30/42 项已修复。剩余：1 项 E2E 测试 + 1 项"写入事务化"专项 + 3 项 P3 观察级（路由偏向 / Worker 未 read_file / agent_id 空）+ **3 项 Session 化集成缺口**（P0×1 + P1×2）+ **3 项并发/输入路径缺陷**（FileCache 跨 agent P0、CLI 多行拆分 P0、Mail 扇出唤醒 P2）+ 1 项 TransferNote scope 留档。**
+**30/47 项已修复。剩余：1 项 E2E 测试 + 1 项"写入事务化"专项 + 3 项 P3 观察级（路由偏向 / Worker 未 read_file / agent_id 空）+ **3 项 Session 化集成缺口**（P0×1 + P1×2）+ **3 项并发/输入路径缺陷**（FileCache 跨 agent P0、CLI 多行拆分 P0、Mail 扇出唤醒 P2）+ **4 项 2026-04-20 新发现**（Scheduler 串行 publish P0、report_done 幻觉 P0、Hook 错误消息 P1、chain_depth 失效 P1）+ 2 项留档（TransferNote scope / read-modify-write 测试范式）。**
 
-> **P0 已累积到 3 项**（Trace CLI 路径 / FileCache 跨 agent / CLI 多行拆分）——任何一项都能在真实使用中频繁触发故障，建议立刻进入修复批次。
+> **P0 已累积到 5 项**（Trace CLI 路径 / FileCache 跨 agent / CLI 多行拆分 / Scheduler 串行 publish / report_done 幻觉）——其中"Scheduler 串行 publish"是**测试链路上的万能掩盖者**，它不修，其他并发类 bug 都无法被后续测试真实触发；"report_done 幻觉"直接破坏汇报可信度，连带污染 trace 溯源。建议本项两者优先级高于其他 P0。
 >
 > **三项 Session 化集成缺口同根**：v3 §9.9 Session 化落地时"零件完工 + 各自单测通过"但"装配环节"无跨子系统烟测。
 >
-> **两项新 P0（FileCache + CLI 多行）同样是集成 bug**：单测都通过（`filecache_test.go` 只在单 agent 场景下测，`cli_test.go` 只测单行命令），但**跨子系统的真实协作路径无端到端覆盖**。与 Session 化三项加起来共 5 项 P0/P1 都是同一类"集成烟测缺失"的产物。
+> **两项新 P0（FileCache + CLI 多行）同样是集成 bug**：单测都通过（`filecache_test.go` 只在单 agent 场景下测，`cli_test.go` 只测单行命令），但**跨子系统的真实协作路径无端到端覆盖**。
 >
-> 处理时间窗口建议：P0 三项（约 1 人/日）→ P1 两项（约半人/日）→ 同期补一套多 agent 端到端烟测（读-写-读、多行输入、Session 任务计数、finalization 全路径）防止回归。
+> **2026-04-20 两项新 P0 揭示"行为幻觉"类缺陷**：Scheduler 串行 publish 是"LLM 对工具语义理解偏差"（prompt/工具描述问题），report_done 幻觉是"汇报与事实脱钩"（缺少对照护栏）。两者都不在"单测"的覆盖范围，只能通过**LLM 行为观测 + Hook 事实校对**发现和拦截。
+>
+> **2026-04-20 两项新 P1 揭示"修复未被验证"**：Hook 错误消息不足（hook 形同递错没纠错）、chain_depth 全程为 0（之前"已修复的邮件级联爆炸"可能只是 prompt 削弱带来的止血而非 hook 生效）。说明现有修复验证机制存在系统性缺陷——单测覆盖到代码路径 ≠ 验证到行为结果。
+>
+> 处理时间窗口建议：
+> 1. 立即修两项 2026-04-20 P0（Scheduler 串行 + report_done 幻觉）——否则之后所有并发测试都白做
+> 2. P0 剩余三项（Trace CLI 路径 / FileCache / CLI 多行）
+> 3. P1 修两项 2026-04-20（Hook 错误消息 + chain_depth 验证）+ 两项 Session 化
+> 4. 补端到端烟测（含 LLM 行为观测和 hook 事实校对）
 
 > 注：6 项 worktree 相关条目（Worktree 相对路径解析、Worktree Remove git 失忆兜底、Worktree merge 假成功、Main 工作区脏状态、Git 分支 ref 泄漏、Worktree 重试丢上下文）已于 2026-04-09 整体清出本文档 — 详细复盘随 `internal/isolation` 包一同消失。仅在"架构决策：删除 git 依赖"段保留作为历史索引。
 
@@ -1502,3 +1725,10 @@ Test 2 worker-3 第一次 edit_file 成功后：
   - Mail progress-notify 扇出唤醒 P2——与已修复的链式级联不同，是扇出式，单次写触发 5× LLM 调用
   - TransferNote 父子任务 scope 盲点——v3 §8.4 设计范围限于兄弟依赖链，scheduler→worker 派发模式不覆盖
 - **下一阶段目标 (rev4)**：(a) **立即修 3 项 P0**（Trace CLI + FileCache + CLI 多行）——任一都可阻塞真实使用；(b) 与 v4 §7 Hashline 实施同期批量修 2 项 P1（history.jsonl + Finalization emit）；(c) 同期补一套跨子系统端到端烟测（读-写-读 / 多行输入 / Session 任务计数 / finalization 全路径），防止本轮同款"集成漏接"复发；(d) P2 Mail 扇出唤醒在 P0/P1 修完后再评估
+- **2026-04-20 三场景并发读写测试暴露 4 项新缺陷 + 1 项测试方法论留档**：
+  - Scheduler publish_task 完全串行发布（P0）——每 loop 只 publish 1 个子任务并等完，所有并发测试事实上跑不出并发
+  - Scheduler report_done 幻觉汇报（P0）——summary 编造"Worker-B/C 读取 log.md"，与系统 artifacts 校验块矛盾但不被拦截
+  - Hook 错误消息不足以让 LLM 自愈（P1）——explorer 连续 8 次 glob_search 参数名错（`root_dir` vs `path`），错误消息无纠错指引
+  - Mail chain_depth 全程为 0（P1）——40+ 次唤醒任务 chain_depth 无一例 > 0，ChainDepthLimitHook 可能是 dead code
+  - Read-modify-write 无法验证 FIFO 锁（测试方法论）——shared.md 追加本质上是读改写，即使并发也会丢写而非排队；需要原子 append 工具才能测 §8.3
+- **下一阶段目标 (rev5)**：(a) **优先两项 2026-04-20 P0**（Scheduler 串行 + report_done 幻觉）——这两项不修则后续并发测试均为伪测试；(b) 其余 3 项 P0（Trace CLI + FileCache + CLI 多行）；(c) 2 项 2026-04-20 P1（Hook 错误消息 + chain_depth 验证+修复）；(d) 补齐"LLM 行为观测烟测"——针对 prompt 驱动的行为偏差引入观测点，而非只测代码路径
