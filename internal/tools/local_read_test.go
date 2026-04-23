@@ -437,6 +437,51 @@ func TestGlobSearch_Recursive(t *testing.T) {
 	}
 }
 
+// TestGrepSearch_EmptyResult_HintsDiagnostics 锁定空结果诊断消息契约。
+// 修复 2026-04-23 暴露的 "result_len=18 沉默失败" P2：LLM 看到空结果
+// 无法判断是 pattern 错还是 path 错，需要显式列出扫描统计 + 排错路径。
+func TestGrepSearch_EmptyResult_HintsDiagnostics(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "a.txt"), []byte("hello world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g := newTestGroup(tmp, nil)
+	out, err := g.grepSearch(context.Background(), map[string]any{
+		"pattern": "definitely_not_present_xyz",
+		"path":    tmp,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 关键词：扫描数量 + list_dir 指引 + 非正则提示 + 1MB 限制提示
+	for _, want := range []string{"扫描", "list_dir", "非正则", "1MB"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("空结果消息缺少 %q 诊断信息:\n%s", want, out)
+		}
+	}
+}
+
+// TestGlobSearch_EmptyResult_HintsDiagnostics 对称覆盖 glob_search 空结果契约。
+func TestGlobSearch_EmptyResult_HintsDiagnostics(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g := newTestGroup(tmp, nil)
+	out, err := g.globSearch(context.Background(), map[string]any{
+		"pattern":  "**/*.nonexistent_ext",
+		"root_dir": tmp,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"扫描", "list_dir", "glob", "相对路径"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("空结果消息缺少 %q 诊断信息:\n%s", want, out)
+		}
+	}
+}
+
 func TestGlobSearch_PathValidation(t *testing.T) {
 	tmp := t.TempDir()
 	g := newTestGroup(tmp, nil)

@@ -1076,9 +1076,11 @@ test_result.md   3996 bytes   ← 唯一新产物，路径字面等于 expected_
 
 ---
 
-## Trace CLI 路径与 Session 日志目录脱钩（🔴 P0）
+## ~~Trace CLI 路径与 Session 日志目录脱钩~~（✅ 已修复）
 
-**现象**：`agentgo trace list/show` 看不到任何 Session 化（2026-04-18）之后产生的任务 trace。
+**状态**：✅ 已修复。[main.go:22-23](../../main.go#L22-L23) 已引入 `resolveTraceDir()`，优先读 `.agentgo/sessions/active-session` 定位 active session 的 `logs/`，回退到老 `.agentgo/traces/`。[bootstrap.go:82-86](../../internal/bootstrap/bootstrap.go#L82-L86) 写入侧在 `sessMgr.Current() != nil` 时重定向到 `sessMgr.LogDir()`。读写两端已在 Session 化维度对齐，无脱钩。下方历史记录保留以便复盘。
+
+**历史现象**：`agentgo trace list/show` 看不到任何 Session 化（2026-04-18）之后产生的任务 trace。
 
 **证据**（2026-04-19 17:47 手工测试）：
 - `trace list` 最新记录停留在 `2026-04-12 04:00:34`，而本次任务在 `2026-04-19 17:47:55`
@@ -1103,9 +1105,11 @@ test_result.md   3996 bytes   ← 唯一新产物，路径字面等于 expected_
 
 ---
 
-## Session history.jsonl 事件溯源完全断链（🔴 P1）
+## ~~Session history.jsonl 事件溯源完全断链~~（✅ 已修复）
 
-**现象**：session 目录下**根本没有** `history.jsonl` 文件（只有 `metadata.json` 和 `logs/`）。
+**状态**：✅ 已修复。装配环节已补齐：[internal/session/manager.go:263](../../internal/session/manager.go#L263) `EnableHistoryLog()` + [manager.go:274-280](../../internal/session/manager.go#L274-L280) `History()` getter；[bootstrap.go:199-204](../../internal/bootstrap/bootstrap.go#L199-L204) 对 `taskStore` / `Roster` / `mailboxRegistry` 三端分别调用 `SetHistoryEmitter(sessMgr.History())`。`OpenHistoryLog` 在生产代码有明确调用链。下方历史记录保留以便复盘。
+
+**历史现象**：session 目录下**根本没有** `history.jsonl` 文件（只有 `metadata.json` 和 `logs/`）。
 
 **证据**：
 ```
@@ -1162,9 +1166,11 @@ if sessMgr != nil && sessMgr.History() != nil {
 
 ---
 
-## Finalization 短路路径不 emit TaskSubmitted/TaskCompleted（🔴 P1）
+## ~~Finalization 短路路径不 emit TaskSubmitted/TaskCompleted~~（✅ 已修复）
 
-**现象**：所有经由 `report_done`（或其他 finalization tool）完成的任务——即**所有 scheduler 任务**——在 trace 展示里状态错位：
+**状态**：✅ 已修复。[internal/agent/agent.go:428-459](../../internal/agent/agent.go#L428-L459) Path B 现已 emit `KindTaskSubmitted`（带 `LoopsUsed: i`）+ `KindTaskCompleted`，与 Path A（[agent.go:532-545](../../internal/agent/agent.go#L532-L545)）对称。Scheduler 任务在 trace list 中不再错标为 running/loops=0。下方历史记录保留以便复盘。
+
+**历史现象**：所有经由 `report_done`（或其他 finalization tool）完成的任务——即**所有 scheduler 任务**——在 trace 展示里状态错位：
 - 显示 `running`（而非 `completed`）
 - 显示 `loops=0`（而非实际值）
 
@@ -1225,25 +1231,7 @@ return
 
 ---
 
-## 三个缺陷的共同根因与流程建议
-
-| 缺陷 | A 子系统 | B 子系统 | 握手位置 | 单测能否拦截 |
-|---|---|---|---|---|
-| Trace CLI 路径 | bootstrap | main.go trace 子命令 | 共享 traceDir 常量 | ❌ 否（跨进程入口） |
-| history.jsonl 断链 | session.HistoryLog | bootstrap + SessionManager | `SetHistoryEmitter` 调用点 | ❌ 否（bootstrap 无独立单测） |
-| Finalization emit | trace | agent.go path B | path B 内的 `trace.Emit` | ❌ 否（emit 是副作用） |
-
-**共同特征**：单元测试覆盖了"零件"，装配环节是手工的、无任何自动化护栏。
-
-**流程层面的建议**（非代码修复，用于防止同类复发）：
-
-1. **大功能落地必须有一条"端到端烟测"**——v3 §9.9 阶段三应该有：
-   ```
-   启动 SessionManager → 跑一个任务 → 关闭 → 断言 history.jsonl 存在且非空
-   ```
-   就这 5 行能拦截 history.jsonl + task_count 两个问题
-2. **"完成"的定义必须验证主干接通**——v3 把"代码写完 + 单测过"算 ✅；应该加一道门槛："实际启动跑一次，验证产物符合预期"
-3. **约定事件的对称性应有 lint 级检查**——任何"终结类" return 出口前必须 emit `KindTaskCompleted`，可以考虑用代码扫描式测试守住（扫 `agent.go` 的 return，每个都要在 M 行内看到对应 emit）
+> **相关流程复盘已迁出**：2026-04-19 三件套（Trace CLI / history.jsonl / Finalization emit）的"共同根因 + 流程建议"已迁至 [nextUpgrade_v4.md §8](nextUpgrade_v4.md#8-跨子系统装配的自动化护栏流程测试基础设施)。本文档仅保留缺陷记录本身。
 
 ---
 
@@ -1253,9 +1241,11 @@ return
 
 ---
 
-## FileStateCache 跨 agent 陈旧缓存 → read 死循环（🔴 P0）
+## ~~FileStateCache 跨 agent 陈旧缓存 → read 死循环~~（✅ 已修复）
 
-**现象**：worker-3 19:37:46 完成 README.md 第二次编辑（文件已变 282 字节），但 11 秒后 scheduler 读同一文件连续 **7 次**返回相同的"陈旧内容"（168 字节），LLM 看到"文件没改"→ 又调 read_file → 又命中陈旧缓存 → 8 轮死循环 → 耗尽 MaxLoops → RetryRollback。重试时因 task 边界清空了 cache，首次 read_file 才读盘拿到真实内容，任务才得以完成。
+**状态**：✅ 已修复（方案 A 落地）。[internal/agent/filecache.go](../../internal/agent/filecache.go) 的 `Get()` 在命中前做 `os.Stat` 校验 mtime + size，若不一致则自动 Invalidate 落盘读。"A 读 → B 写 → A 读"场景不再陈旧。`write_file`/`edit_file` 仍保留 `Cache.Invalidate(path)` 作写入侧快速失效。下方历史记录保留以便复盘。
+
+**历史现象**：worker-3 19:37:46 完成 README.md 第二次编辑（文件已变 282 字节），但 11 秒后 scheduler 读同一文件连续 **7 次**返回相同的"陈旧内容"（168 字节），LLM 看到"文件没改"→ 又调 read_file → 又命中陈旧缓存 → 8 轮死循环 → 耗尽 MaxLoops → RetryRollback。重试时因 task 边界清空了 cache，首次 read_file 才读盘拿到真实内容，任务才得以完成。
 
 **证据**（Test 2 trace 关键时间线）：
 ```
@@ -1301,9 +1291,11 @@ return
 
 ---
 
-## CLI 多行输入按 `\n` 拆分（含输入滞留粘连）（🔴 P0）
+## ~~CLI 多行输入按 `\n` 拆分（含输入滞留粘连）~~（✅ 已修复）
 
-**现象**：用户多行粘贴（或多行键入）时，每一行被当作独立的用户输入，每行触发一个独立的 scheduler task。用户的单一意图被粉碎成多个无关任务。**更糟**：最后一行如果没有 trailing newline，会"滞留"在 CLI scanner 缓冲中，与**下次输入粘连**。
+**状态**：✅ 已修复。[internal/cli/cli.go](../../internal/cli/cli.go) 已引入 `collectMultiline()` + `pending` 缓冲机制：连续行拼接直至遇到空行或斜杠命令时 flush，末行无 newline 场景通过 `nextLine` 回传下轮循环直接消费，避免滞留粘连。多行 prompt 作为单一 `EventUserInput` 下发。下方历史记录保留以便复盘。
+
+**历史现象**：用户多行粘贴（或多行键入）时，每一行被当作独立的用户输入，每行触发一个独立的 scheduler task。用户的单一意图被粉碎成多个无关任务。**更糟**：最后一行如果没有 trailing newline，会"滞留"在 CLI scanner 缓冲中，与**下次输入粘连**。
 
 **证据**：
 - **Test 1（2026-04-19 18:33）**：用户 4 行 prompt 被拆成 3 个 scheduler task：
@@ -1347,9 +1339,40 @@ for scanner.Scan() {
 
 ---
 
-## Mail-notifier Progress-Notify 寄生唤醒（⚠️ P2）
+## ~~Mail-notifier Progress-Notify 寄生唤醒~~（✅ 已修复并实战验证，2026-04-23 正式关闭）
 
-**现象**：worker 写文件成功后，mail-notifier **稳定触发 5 个寄生唤醒任务**，peer agent 被唤醒后发现无事可做但仍各消耗一次 LLM 调用 + report_done。含**自我唤醒**（worker-3 给自己发消息又唤醒自己）。
+**状态**：✅ 已修复（2026-04-20 落地，2026-04-23 实战验证通过正式关闭）。**三刀**组合关闭放大路径 + 日志污染 + LLM 误用：
+
+- **路径 B 筛选**：新增 [`WakeWorthyFilterHook`](../../internal/hook/builtin/wake_worthy_filter.go)（PhaseBeforeWake, Priority=600）。发布 wake Task 前通过 `MailboxHookView.GetRecentMessages` peek 收件箱；若无 `type ∈ {question, steer}` 且无 `priority == high` 的邮件，一律 Abort——让 info / reply / ack 类邮件下沉到路径 A（peer 自然进入下一个 task 时由 `DrainWithAck` 顺手消化）。
+- **ack 回波切断**：[mailbox.go:DrainWithAck](../../internal/mailbox/mailbox.go) 的 ack 政策从"除 ack 外全回"收窄为"只对 `MsgTypeQuestion` 回 ack"。info 广播的每个收件人不再回流 ack 到发送方，切断"发送方空闲 → 自唤醒"回路。
+- **v2 清扫副作用**（2026-04-20 真实测试暴露后补强）：Hook abort 时通过 `MailboxDropView.DropMatching` 清扫邮箱内"白名单可丢弃"邮件——严格限定 `type ∈ {info, ack} && priority == low` 的广播（progress-notify + 旧版 ack）。**保留** `type=info` 但 `priority=normal` 的 LLM 主动沟通、以及 reply 类邮件不动。v1 仅拒绝唤醒会让那些邮件滞留在空闲 peer 邮箱里，mail-notifier 每 5s scan 都会再次命中并重复打印 abort 日志（功能无伤但日志污染 + `recent` ring 永久占用）；v2 从源头清除。
+- **LLM 引导增强**：[tools/meta.go](../../internal/tools/meta.go) `send_message` 工具描述加入明确指引：`msg_type=info + priority=low` 会被视为"纯广播噪音可丢"，需要对方立即响应则应选 question/steer 或 priority=high。从源头避免 LLM 误用消息类型。
+
+**v2 触发原因**（2026-04-20 实测日志）：v1 修复后 wall-clock 从 4 min 压到 69s，寄生 wake task 0 次 ✅ 但 task 完成后 mail-notifier 每 5s 重复打印同一条 abort 日志，~160 条刷屏。日志污染的根因是"邮件判定为非 wake-worthy 但继续躺在邮箱里"；v2 通过清扫彻底断环。
+
+**回归保护**：
+- [wake_worthy_filter_test.go](../../internal/hook/builtin/wake_worthy_filter_test.go)：14 用例，含 v2 新增 5 个——`isSafelyDroppable` 政策矩阵、Abort 时只 drop info+low/ack、Continue 时不 drop、nil dropper 降级、无 drop 候选时 AbortReason 不含清扫段
+- [mailbox_test.go](../../internal/mailbox/mailbox_test.go)：新增 5 个 `TestDropMatching_*` 用例覆盖 channel 回填顺序 / recent ring 清理 / nil pred / 空邮箱仅清 recent / Registry 按 agentID 路由
+- 全量 22 包测试：本次改动 **0 新增失败**，既有 4 项红态（path_boundary / scheduler 串行 / explorer chain_depth）为独立 P0/P1 条目，与本次修复无关
+
+**2026-04-23 实战验证**（task=8f97a6bb，多 Worker 协作 prompt）：
+
+| 验证维度 | 实测结果 |
+|---|---|
+| progress-notify 是否真实触发 | ✅ 2 次 `file_write` emit（worker-3 @ 15:55:09, worker-1 @ 16:00:23）—— trace `progress_notify` kind 事件 2 条可查 |
+| 是否有寄生 wake task 被发布 | ✅ 0 个（两次广播后 mail-notifier 全部 abort，无 PublishTask 调用） |
+| v2 清扫副作用是否生效 | ✅ 6 条 abort 日志 reason 末尾均出现 `；已清扫 1 条 info/ack+low 邮件`，字样来自 `WakeWorthyFilterHook.Run` v2 分支 |
+| 扇出过滤（发信方排除）是否正确 | ✅ 广播 1 命中 {explorer-1, worker-1, worker-2}（不含发信 worker-3）；广播 2 命中 {explorer-1, worker-2, worker-3}（不含发信 worker-1） |
+| log spam 是否消除 | ✅ 每次广播 3 条一次性 abort，之后邮箱清空 notifier 扫不到；对比 2026-04-20 v1 测试 "task 完成后 7+ 分钟刷 ~160 条" 的现象彻底不复现 |
+| 功能正确性 | ✅ 文件两处修改按 dependencies 顺序完成（worker-3 先、worker-1 后），artifacts 校验块双任务均记录 `dummy_readme.md` |
+
+可逆性：注释 [bootstrap.go L220](../../internal/bootstrap/bootstrap.go#L220) 的 `Register(NewWakeWorthyFilterHook(...))` 即回退到 v1 前行为（V9 回归保证不变）。
+
+**正式关闭**：本条目不再需要复查。下游若发现 LLM 主动用 `send_message(type=info, priority=normal)` 发的重要信息被意外处理，请新开独立条目，本条目已达到"P2 寄生唤醒 + 衍生 log spam"双闭环。
+
+下方历史记录保留以便复盘。
+
+**历史现象**：worker 写文件成功后，mail-notifier **稳定触发 5 个寄生唤醒任务**，peer agent 被唤醒后发现无事可做但仍各消耗一次 LLM 调用 + report_done。含**自我唤醒**（worker-3 给自己发消息又唤醒自己）。
 
 **证据**（Test 1 + Test 2 **两次都复现**，形态完全一致）：
 ```
@@ -1469,7 +1492,9 @@ A+B 的核心措辞建议：
 
 ---
 
-## Scheduler report_done 允许幻觉汇报（🔴 P0）
+## Scheduler report_done 允许幻觉汇报（🟠 P1 降级）
+
+**状态说明**：artifact 级事实校对已存在（[tools/scheduler.go:150-152](../../internal/tools/scheduler.go#L150-L152) `buildSchedulerArtifactsReport` 扫描 `task.Artifacts` 并与 LLM summary 并列展示），2026-04-09 commit `54db967` 起生效——这一层让"文件产出类"幻觉一定会与事实校验块矛盾。但 2026-04-20 观察到的是 **action 级幻觉**（"Worker-B/C 读取了 log.md"），read_file 不产生 artifact，artifact 校对块无法覆盖。因此本项从 P0 降级为 P1：**artifact 层幻觉防御已到位，action 层校对未实现**。
 
 **现象**：scheduler 在 `report_done` 的 summary 中**声称了从未发生的动作**。具体来说，声称 "Worker-B/C 读取了 log.md 并引用了其中一行"，但日志中**只有 worker-2 写了一次 log.md，没有任何 B/C 的 read_file 动作**，系统 artifacts 校验块也没有对应的读取任务。
 
@@ -1500,7 +1525,7 @@ A+B 的核心措辞建议：
 
 ---
 
-## Hook 错误消息不足以让 LLM 自愈（🟡 P1）
+## Hook 错误消息不足以让 LLM 自愈（✅ 已修复 2026-04-24）
 
 **现象**：explorer-1 连续 8 次调 `glob_search` 传错参数名（传 `root_dir`，应为 `path`），每次都被 `path-boundary` hook 拒绝，错误消息相同："工具 glob_search 缺少 path 参数"。LLM 读到"缺少 path"后每次都只是改动**其他**参数（如 `pattern`、加`root_dir`）而不是把 `root_dir` 改成 `path`。
 
@@ -1543,11 +1568,50 @@ A 的关键改动：`path-boundary.go` 错误消息改为
 
 同时建议把 A 的思路泛化为 hook 基础设施层：**所有 PreCall 参数拒绝类错误，消息必须包含"正确字段名 + 示例"**。
 
+**实际修复（2026-04-24）**：诊断方向翻了个——读 [local_read.go:61](../../internal/tools/local_read.go#L61) 后确认 glob_search 的 schema 字段**本来就是 `root_dir`**（不是 `path`），真正的错是 `path_boundary.go:68` 对所有工具硬编码 `path` 导致合法调用被误拒。修复：
+- [path_boundary.go](../../internal/hook/builtin/path_boundary.go) 引入 `pathFieldByTool` 映射表，按工具名查询正确字段名（glob_search→root_dir，其余→path）
+- 新增 `missingFieldReason` 构造自助指引错误消息：正确字段名 + 跨工具差异说明 + 当前 args keys + 示例调用
+- 两个预期红态 `TestPathBoundaryHook_GlobSearch_AcceptsRootDir` / `..._MissingAllPathArgs_ErrorHintsCorrectField` 均已自动转绿
+- 2026-04-23 实战日志复盘：Explorer 连续 2 次传 `root_dir` 被拒是 hook 的问题，而不是 LLM 的问题——这次修复后该模式消失
+
 ---
 
-## Mail chain_depth 全程为 0，ChainDepthLimit 效果存疑（🟡 P1）
+## grep_search / glob_search 空结果诊断信息不足（✅ 已修复 2026-04-24）
 
-**现象**：本次测试期间 `mail-notifier 已为 ... 发布唤醒任务` 出现 **40+ 次**，**无一例** `chain_depth` > 0。即使 explorer-1 在 02:25:46 / 02:26:18 / 02:29:27 连续发送 reply 类消息（"已收到你的进度报告..."）后触发了新一轮唤醒，唤醒任务的 `chain_depth` 仍然是 0。
+**现象**（2026-04-23 实战日志复现）：Explorer 在调查任务中连续 5 次收到 `result_len=18` 的空结果（"未找到匹配项"，恰好 6 字 × 3 bytes=18），每次只换 pattern 重试，无法判断到底是 pattern 错、path 错、还是大小写问题、还是文件超过 1MB 被跳过。
+
+**证据**（task=89602a0e-586e-4705-8d5e-8a5b8a31f3e8）：
+```
+loop=2  grep_search pattern="BulletinBoard|..." path="internal"     → result_len=18
+loop=2  grep_search pattern="MaxSubtaskDepth|..." path="internal"   → result_len=18
+loop=2  grep_search pattern="Dependencies|..." path="internal"      → result_len=18
+loop=3  grep_search pattern="BoardJSON|..." path="internal"         → result_len=18
+loop=3  grep_search pattern="SubtaskDepth|..." path="internal"      → result_len=18
+```
+实际 grep_search 的 pattern 是 `strings.Contains` 字面子串（不是正则），LLM 传 `"A|B|C"` 永远匹配不到。
+
+**根因**：[local_read.go:338](../../internal/tools/local_read.go#L338) 空结果返回死字符串 `"未找到匹配项"`，完全不透露工具行为细节（非正则、跳过 .文件、跳过 >1MB、max_lines 上限），LLM 只能瞎猜。
+
+**修复（2026-04-24）**：空结果返回诊断字符串，包含：
+- 扫描文件数量 + 跳过的 hidden / 大文件统计
+- 显式声明 "pattern 按字面子串匹配（非正则）"
+- 排错路径：先 list_dir 确认、检查大小写、确认 >1MB 限制
+- glob_search 同类修复：带扫描数量 + glob 语法提示 + 相对路径约束说明
+
+回归测试：[local_read_test.go::TestGrepSearch_EmptyResult_HintsDiagnostics](../../internal/tools/local_read_test.go) + `TestGlobSearch_EmptyResult_HintsDiagnostics` 锁定诊断消息关键字。
+
+---
+
+## Mail chain_depth 全程为 0，ChainDepthLimit 效果存疑（🟡 P1 部分修复）
+
+**状态**（2026-04-20 核查订正）：
+- ✅ **worker 路径已修复**：[internal/tools/meta.go:233-242](../../internal/tools/meta.go#L233-L242) `sendMessage` 正确读 `task.MailChainDepth + 1`；[internal/mailbox/notifier.go:117](../../internal/mailbox/notifier.go#L117) 唤醒任务继承 `status.MaxChainDepth`。
+- 🔴 **explorer 路径仍红**：回归测试 [`TestExplorerSendMessage_InheritsChainDepthFromCurrentTask`](../../internal/explorer/chain_depth_test.go) 失败（`ChainDepth = 0, want 3`），错误消息明确指出"Explorer MetaGroup 缺 Store/Holder 导致继承失败"。[internal/explorer/explorer.go](../../internal/explorer/explorer.go) 构造 MetaGroup 时未注入 `Store` / `TaskHolder`，导致 `sendMessage` 读不到 `current_task.MailChainDepth`，全部邮件以 ChainDepth=0 发出。
+- 修复方向：对照 worker.go 构造 MetaGroup 的方式（Store+Holder 传入），在 explorer 启动路径补齐注入。红态测试落地后一改代码即转绿。
+
+下方历史记录保留以便复盘。
+
+**历史现象**：本次测试期间 `mail-notifier 已为 ... 发布唤醒任务` 出现 **40+ 次**，**无一例** `chain_depth` > 0。即使 explorer-1 在 02:25:46 / 02:26:18 / 02:29:27 连续发送 reply 类消息（"已收到你的进度报告..."）后触发了新一轮唤醒，唤醒任务的 `chain_depth` 仍然是 0。
 
 **证据**：
 ```
@@ -1580,6 +1644,168 @@ A 的关键改动：`path-boundary.go` 错误消息改为
 
 ---
 
+## Scheduler LLM 连续失败时无限重试（🟡 P1 待修复，2026-04-20 发现）
+
+**位置**：[internal/agent/agent.go](../../internal/agent/agent.go) `processTask` 的 `handleFailure` / `handleMaxLoops` 路径 + [internal/scheduler/scheduler.go](../../internal/scheduler/scheduler.go) 的 `a.MaxRetries = 0` 配置
+
+**严重程度**：🟡 P1（功能正确性不受影响，但在终态不可恢复错误下会消耗 wall-clock 和日志直到手动终止）
+
+**现象**（2026-04-20 验证寄生唤醒修复时暴露）：
+
+LLM 服务器 `192.168.1.117:8080` 宕机的情况下启动 agentgo，用户提交任何 prompt 后 scheduler 进入无限重试：
+
+```
+19:34:56  scheduler task a0af6130 发布
+19:35:13  重试 #2，恢复  1 条历史
+19:35:22  重试 #3，恢复  2 条历史     ← 每次 +1 条
+...
+19:59:03  重试 #166，恢复 165 条历史   ← 仍在增长，直到 Ctrl+C
+```
+
+Trace 全量检查：99 个 retry 生成的 trace 文件中 **0 次 LLM 成功调用**，全部是 `dial tcp: connect: connection refused`。
+
+**根因**：
+
+1. `llm_call_end` 返回 error（network connection refused）
+2. `handleFailure` 把本次失败记录追加到 history
+3. `RetryRollback` 被触发，preserve 累积的 history
+4. Scheduler 的 `MaxRetries = 0` **是有意设计**（KNOWN_ISSUES 早期条目记载："scheduler 在等待 worker 时不应被 retry 上限杀掉"）
+5. 但该策略没区分两类失败：
+   - ✅ 合理无限重试：LLM 调用成功但 LLM 自己没决定 `report_done`（scheduler 需等 worker 完成）
+   - ❌ 不该无限重试：LLM 调用本身失败（network error / 401 / 5xx），重试只会烧 wall-clock
+
+**修复方向**（等寄生唤醒修复验证完后实施）：
+
+为 `handleFailure` / `llm_call_end` 失败路径增加失败分类：
+
+- **Terminal errors**（应触发有限重试或直接崩溃汇报）：
+  - `net.OpError` / `connection refused` / `connection reset`
+  - HTTP 401 / 403（鉴权失败，重试无意义）
+  - HTTP 404（endpoint 配置错）
+- **Transient errors**（应按 `MaxRetries` 限次重试，不受 scheduler 无限策略影响）：
+  - HTTP 429 rate limit
+  - HTTP 5xx
+  - timeout
+
+具体方案：scheduler 的 `MaxRetries=0` 保持不变（等 worker 场景），但新增一个 `MaxLLMFailures` 计数（比如默认 5）专门针对 LLM 调用层面的连续失败——连续 N 次 LLM 返回 terminal error 或 transient error 累计超限就走 `terminateTask + sendCrashReport` 路径，让用户知道"LLM 断了"而不是静默空转。
+
+**关联**：与 [nextUpgrade_v4.md §9 "Bootstrap LLM 连通性检查"](nextUpgrade_v4.md#9-bootstrap-阶段-llm-连通性检查快速失败) 互补——§9 是启动阶段一次性探测（防启动后才踩），本条目是运行期持续失败的兜底（防启动通过但中途断）。
+
+**为什么此前没暴露**：单测全部使用 mock LLM，不会触发真实 HTTP 调用；手工测试时 LLM 一直可达。2026-04-20 验证寄生唤醒修复时 LLM 服务器恰好未开机，才暴露此条。
+
+**状态**：⏳ 待修复，与下一轮修复批次同步起草
+
+---
+
+## 2026-04-23 随机测试暴露的 3 项新缺陷（Explorer 静默失败综合征）
+
+触发来源：用户提交开放式调查 prompt "额，我有点忘记了当前你正在的这个项目中是如何实现多Agent有序交互和工作的，你可以启动多个代理调查一下，**不用撰写文字报告**。"。52 分钟内 scheduler 连续发布 7 个子任务给 explorer-1（系统仅 1 个 explorer 实例，串行执行），**全部死于 watchdog 5m30s 超时**，0 个 report_done，用户 Ctrl+C 才终止。
+
+症状是**静默的**：日志热闹（大量 read_file）+ 无任何错误 panic + trace 文件一切正常；但用户视角是"52 分钟零产出"。这不是任一单点 bug，是三层失效叠加。
+
+### ~~Explorer 无 report_done 预算感知~~（✅ P0 Prompt 层已修复 2026-04-23，待实战验证）
+
+**位置**：`internal/explorer/explorer.go` 的 `const systemPrompt`
+
+**现象**：每个 explorer 子任务的固定剧本——
+```
+loop=0  list_dir × 2
+loop=1  read_file × 3
+loop=2  read_file × 7
+loop=3~8  read_file / grep_search 不断调用
+... 5m30s 超时 watchdog 强杀，全程从未调 report_done
+```
+Explorer LLM 的行为模式：一直找文件读，直到 context 溢出 / 时间到。没有"已经够了，该汇报"的自我判定。
+
+**根因**：explorer 的 system prompt 有"先读后报告"、"调查结果应简短明确"等规则，但**完全没有**：
+- report_done 的触发时机指引
+- loop 接近 MaxLoops 时的停止信号
+- 被 watchdog kill 会丢失全部工作的后果警示
+
+LLM 默认选择"继续探索收集更多上下文"，因为 prompt 没给它"停止"的刹车。
+
+**修复方向**（prompt 层 + 可选 hook 兜底）：
+
+**Layer A（prompt）**：explorer systemPrompt 增加一段：
+> "你的 reactLoop 有轮次上限（MaxLoops，通常 10 左右），到点会被 watchdog 强制终止且**丢失全部已做的工作**。你必须主动管理 report_done 的时机：
+> - 获得 80% 必要信息时就应该 report_done，不要追求完美
+> - 循环过半（loop >= 5）时每轮都应问自己：'我现在就汇报对调用方有价值吗？'，如果是，立即 report_done
+> - 唯一能让调用方看到你工作成果的通道是 report_done 的 summary 字段；任何没汇报的发现都等于没做过"
+
+**Layer B（可选，hook 兜底）**：新增 `AgentHook` at `PhaseLoopPre`，在 `LoopIndex >= MaxLoops * 0.7` 时注入一条 `IncomingMail`：
+> "【预算警告】本任务还剩 N 轮即会被 watchdog 杀死（预估 M 秒）。请立即 report_done 汇报当前已掌握的信息，不要继续探索。"
+
+Layer A 便宜且修一处即可；Layer B 更硬，但需要注意不污染已经打算 report_done 的 happy path。
+
+**回归锁**：`internal/explorer/explorer_test.go::TestExplorerSystemPrompt_ContainsReportDoneBudgetGuidance`（🟢 已从 RED 转 GREEN，2026-04-23 Prompt 修复后自然通过）
+
+**2026-04-23 修复落地**：
+
+核心澄清（通过代码核查确认）：**Explorer 根本没有 `report_done` 工具**。它和 worker 一样只有 `LocalReadGroup + WebGroup + MetaGroup(无 Store)`，完成机制**仅有一条路径**——[agent.go:479](../../internal/agent/agent.go#L479) 的 `!result.ToolCalled` 分支："本轮不调任何工具 → lastOutput 作为 SubmitResult"。`report_done` 是 scheduler 专属的编排工具（绑定 FinalizationNotifier + SchedulerBatch 校验 + CLI 输出通道），不适合也不应该给其他 agent。
+
+因此修复方向不是"加预算警告"或"加新工具"，而是**告诉 LLM 这条现成机制的存在**。
+
+落地改动：[explorer.go:17-48](../../internal/explorer/explorer.go#L17-L48) systemPrompt 新增"⚠️ 如何结束调查并交付结果（机制说明，必读）"完整章节，涵盖：
+1. **机制澄清**：明示 Explorer 没有 report_done，唯一完成方式是"不调任何工具 + 输出纯文本总结"
+2. **触发条件**（5 条，任一满足即应停下）：信息足够 / 再读重复 / loop 过半 / context 快满 / 用户带轻量化意图
+3. **不停下的后果**：MaxLoops 触发 RetryRollback + watchdog 超时 FailTaskBySystem，**两种都让全部工作丢失**
+4. **反面案例**：直接引用 2026-04-23 真实事故（52 分钟 7 任务 0 产出），让 LLM 看到"不停下"的后果是什么样
+
+同时顺手加固 [worker.go:35-55](../../internal/worker/worker.go#L35-L55)：Worker 有同样的机制盲点，只是因为 write_file 天然是"完成锚点"而未暴露。prompt 补入"# 如何结束任务并提交结果（机制说明）"简短版——明确 worker 也没 report_done，完成 = 不调工具 + 文本汇报；特别提示"纯调查类任务"和"loop 接近 MaxLoops"两类容易翻车场景。
+
+**为什么不上 Hook 兜底**（Layer B 暂不做的理由）：本次 prompt 改造直接教机制本身，力度已经比"预算警告"更硬——LLM 现在知道"不调工具就是完成"，而预算 hook 只是提醒"快没时间了"但不告诉它该怎么做。先用便宜方案测效果，如果实测 Explorer 仍然不停就再上 Hook。
+
+**状态**：✅ **Prompt 层已修复**（2026-04-23）。红态回归测试自然转绿（无需 t.Skip 或弱化断言）。**实战验证待做**：重跑 2026-04-23 的随机调查 prompt（"额，我有点忘记了...不用撰写文字报告"），观察 Explorer 是否能在合理轮次内停下并输出总结。
+
+### Watchdog 不向 task.EventSource 发崩溃汇报邮件（🔴 P1）
+
+**位置**：`internal/watchdog/watchdog.go` `checkProcessingTask` 超时分支
+
+**现象**：watchdog 超时杀任务的全部副作用只有：
+1. `Store.FailTaskBySystem(taskID, reason)` — 任务状态改为 failed + 写 reason 到 task 记录
+2. `sendAlert` — 往 EventCh 发一个 `model.Event{Type: EventWatchdogAlert, TaskID: id}`
+
+scheduler 的 LLM 视角：下一轮 reactLoop 看到 board snapshot 里这个任务 status=failed，但**只能看到干瘪的 status 字符串**，看不到"它是 watchdog 超时杀的、elapsed 5m52s、最后一次 tool call 是 read_file"这类决策有用的上下文。于是 scheduler 按最小阻力路径选择"再发一个类似任务试试"。
+
+2026-04-23 实测：7 个连续子任务 100% 重复同样剧本。scheduler 完全没意识到"是 watchdog 系统性在杀我的子任务，换策略吧"。
+
+**根因**：`Watchdog` 结构体只持有 `Store / Config / EventCh / Roster`，没有 `MailRegistry`——无法向 task.EventSource 发邮件。当前设计假设"EventCh 广播就够了"，但 EventCh 只有结构化 Event，无法承载人类/LLM 可读的故障诊断。
+
+**修复方向**（与 KNOWN_ISSUES 2026-04-08 第二轮 `agent.sendCrashReport` 对称）：
+1. `Watchdog` 加字段 `MailRegistry *mailbox.Registry`（或对等接口）
+2. `bootstrap.go` 在 `New Watchdog` 时注入 `mbRegistry`
+3. `checkProcessingTask` 超时分支在 `FailTaskBySystem` 之后，向 `task.EventSource` 发 `type=info, priority=high` 邮件，内容：
+   - 任务 ID、任务 description 前 100 字
+   - 超时原因 + elapsed + 阈值
+   - Last known activity：最近一次 tool call 的名字和时间（来自 `store.GetToolCallHistory`）
+   - 建议（如："考虑拆分为更小的子任务 / 增加 TimeoutSeconds / 换用不同能力的代理"）
+4. 依赖失败级联取消 / unclaimed timeout 两条路径同样覆盖
+
+**回归锁**：`internal/watchdog/watchdog_test.go::TestWatchdogStruct_HasMailRegistryForCrashReports`（🔴 RED，见下方索引表）
+
+**状态**：🔴 **P1 待修复**。与 Explorer P0 互补——explorer 自救负责减少"会触发"，watchdog 汇报负责减少"不知情重蹈"。
+
+### Scheduler 改写子任务 description 时丢失用户否定约束（🟡 P2）
+
+**位置**：`internal/scheduler/scheduler.go` `schedulerSystemPrompt`
+
+**现象**：用户明确说"**不用撰写文字报告**"。scheduler 拆分为子任务时，description 变成"调查 internal/scheduler/ 目录下的核心文件，**总结**..."——否定约束完全丢失。
+
+**根因**：scheduler prompt 没有"拆分 / 改写子任务 description 时必须逐字保留用户原始约束（特别是否定性约束：不要、禁止、避免、不用 等）"的明确规则。LLM 天然倾向"润色"用户的话为更流畅的描述，过程中否定词最容易被吞。
+
+**修复方向**：scheduler systemPrompt 加一段：
+> "在将用户请求拆分为子任务时，必须**逐字保留**用户的否定性约束（如 '不要/禁止/避免/不用/don't/avoid' 等词）到子任务 description 中。不得以 '更清晰的表述' 为由丢弃或弱化这些约束。
+>
+> 反例：用户说 '不用撰写文字报告'，子任务 description 写 '总结...' → ❌ 否定约束丢失
+>
+> 正例：用户说 '不用撰写文字报告'，子任务 description 写 '调查 X 并将结果以简短的 report_done summary 返回，**不用生成 .md 文字报告**' → ✅ 原约束保留"
+
+**回归锁**：`internal/scheduler/scheduler_test.go::TestSchedulerSystemPrompt_PreservesUserOriginalConstraints`（🔴 RED，见下方索引表）
+
+**状态**：🟡 **P2 待修复**。是这次三件套里优先级最低的，但改动量最小（只改 prompt），可能随 P0/P1 批次一并处理。
+
+---
+
 ## 2026-04-20 回归锁索引（红态测试 = bug 仍在）
 
 为防止 2026-04-20 发现的 4 个 P0/P1 缺陷在修复过程中走样，已落地一批**预期红态**的回归测试。**这些测试在 bug 修复前故意失败**——看到它们失败不是回归，是"bug 还没修"的提醒信号。
@@ -1588,9 +1814,12 @@ A 的关键改动：`path-boundary.go` 错误消息改为
 |---|---|---|---|
 | P0-1 Scheduler 串行 publish | `scheduler_test.go::TestSchedulerSystemPrompt_DoesNotClaimSingleTaskPerLoop` | 🔴 RED | 修 `schedulerSystemPrompt` 第 243 行附近的误导陈述后自动变绿 |
 | P0-1 Scheduler 并行指引防回归 | `scheduler_test.go::TestSchedulerSystemPrompt_ContainsParallelIndependentPublishGuidance` | 🟢 GREEN | 保护现有并行指引不被误删 |
-| P1-1 path-boundary × glob_search schema | `path_boundary_test.go::TestPathBoundaryHook_GlobSearch_AcceptsRootDir` | 🔴 RED | 让 PathBoundaryHook 按工具名分派参数字段后自动变绿 |
-| P1-1 Hook 错误消息 UX | `path_boundary_test.go::TestPathBoundaryHook_GlobSearch_MissingAllPathArgs_ErrorHintsCorrectField` | 🔴 RED | 错误消息带上正确字段名后自动变绿 |
+| P1-1 path-boundary × glob_search schema | `path_boundary_test.go::TestPathBoundaryHook_GlobSearch_AcceptsRootDir` | 🟢 **已转绿**（2026-04-24） | PathBoundaryHook 引入 `pathFieldByTool` 表按工具名分派（glob_search→root_dir，其余→path） |
+| P1-1 Hook 错误消息 UX | `path_boundary_test.go::TestPathBoundaryHook_GlobSearch_MissingAllPathArgs_ErrorHintsCorrectField` | 🟢 **已转绿**（2026-04-24） | `missingFieldReason` 带出正确字段名 + 跨工具差异提示 + 当前 args keys + 示例 |
 | P1-2 Explorer chain_depth 继承 | `explorer/chain_depth_test.go::TestExplorerSendMessage_InheritsChainDepthFromCurrentTask` | 🔴 RED | 修 `explorer.go:81` 的 MetaGroup 构造后自动变绿 |
+| **P0 Explorer 无 report_done 预算感知**（2026-04-23 新增，同日 prompt 修复） | `explorer/explorer_test.go::TestExplorerSystemPrompt_ContainsReportDoneBudgetGuidance` | 🟢 **已转绿**（2026-04-23） | explorer systemPrompt 已补入机制说明 + 触发条件 + 后果警示 + 反面案例；worker.go 顺手加同类段做预防 |
+| **P1 Watchdog 不发崩溃汇报邮件**（2026-04-23 新增） | `watchdog/watchdog_test.go::TestWatchdogStruct_HasMailRegistryForCrashReports` | 🔴 RED | Watchdog 加 MailRegistry 字段 + bootstrap 注入 + 超时分支发 type=info/priority=high 邮件给 task.EventSource，自动变绿 |
+| **P2 Scheduler 改写子任务时丢失用户否定约束**（2026-04-23 新增） | `scheduler/scheduler_test.go::TestSchedulerSystemPrompt_PreservesUserOriginalConstraints` | 🔴 RED | schedulerSystemPrompt 加"拆分/改写子任务 description 时必须逐字保留用户的否定性约束"规则段，自动变绿 |
 
 **处理守则**：
 - ❌ **不要**用 `t.Skip` / 删除断言 / 弱化期望值来让测试变绿 —— 这会掩盖 bug 信号
@@ -1599,6 +1828,13 @@ A 的关键改动：`path-boundary.go` 错误消息改为
 **P0-2 "report_done 幻觉"尚未落地回归测试**：该缺陷需要一个尚未实现的
 `ReportDoneFactCheckHook`，写测试意味着写 TDD 风格的 hook 测试，属于"修复计划"
 而非"行为观测"，放到修复批次同步起草。
+
+**2026-04-23 三项新红态的关系**：三条红态共同围堵 2026-04-23 随机测试暴露的
+"Explorer 在只读开放式调查任务下静默失败"场景——
+- Explorer 预算感知：LLM 侧指引（让 explorer 主动 report_done）
+- Watchdog 崩溃汇报：系统侧信号（让 scheduler 知道"为什么死"）
+- Scheduler 保留约束：prompt 层纪律（让用户的否定约束别被 LLM 润色掉）
+三者任一修复都能部分缓解，但必须合力才能真正闭环。
 
 ---
 
@@ -1667,36 +1903,47 @@ A 的关键改动：`path-boundary.go` 错误消息改为
 | **Expected_artifacts 路径漂移 + require-read-before-write 二次拦截** | ✅ **已修复**（2026-04-14 新增 EnforceExpectedArtifactsHook，PreCall 严格精确匹配，14 用例单测覆盖，包含 2026-04-14 实际漂移样本） |
 | **Worker 越权写 test_result.md，与 scheduler 意图冲突** | ✅ **已修复**（2026-04-14 随 EnforceExpectedArtifactsHook 一起解决，worker 不在 expected_artifacts 清单内的 path 会被 Abort） |
 | **日志/trace 中 agent_id 为空（重试路径）** | 🟢 **P3 待修复**（2026-04-14 复测发现；日志瑕疵，不影响功能） |
-| **Trace CLI 路径与 Session 日志目录脱钩** | 🔴 **P0 待修复**（2026-04-19 单任务测试暴露；`agentgo trace list/show` 在 Session 化后事实失效——main.go 硬编码老路径，bootstrap 已重定向到 per-session） |
-| **Session history.jsonl 事件溯源完全断链** | 🔴 **P1 待修复**（2026-04-19 暴露；v3 §9.9 阶段三 OpenHistoryLog 在生产代码零调用，SessionManager 未集成、bootstrap 未注入。连带：`IncrementTaskCount` 同款零调用 → task_count 永远为 0） |
-| **Finalization 短路路径不 emit TaskSubmitted/TaskCompleted** | 🔴 **P1 待修复**（2026-04-19 暴露；agent.go:428-438 path B 跨轮短路时漏了 trace emit，导致所有 scheduler 任务在 trace list 中错标为 running/loops=0——系统性观测错位） |
-| **FileStateCache 跨 agent 陈旧缓存 → read 死循环** | 🔴 **P0 待修复**（2026-04-19 Test 2 暴露；per-agent cache 对其他 agent 的写入不敏感——scheduler→worker→scheduler 模式下，scheduler 读到陈旧缓存 8 轮死循环，靠 retry 的 `FileCache.Clear()` 才恢复。破坏"A 读 → B 写 → A 读"基础模式） |
-| **CLI 多行输入按 `\n` 拆分（含输入滞留粘连）** | 🔴 **P0 待修复**（2026-04-19 Test 1/Test 2 两次复现；bufio.Scanner 默认按行读，每行独立 EventUserInput。用户单一 prompt 被粉碎成多任务，且末行无 newline 时滞留与下次输入粘连） |
-| **Mail-notifier Progress-Notify 寄生唤醒**（扇出式，与已修复的链式级联不同） | ⚠️ **P2 待修复**（2026-04-19 Test 1/Test 2 两次稳定复现；单次写文件触发 5 个寄生唤醒任务，含发送方自我唤醒。与已修复的"邮件级联爆炸"不同——那是链式，本问题是扇出式，未被 ChainDepthLimit 覆盖） |
+| **Trace CLI 路径与 Session 日志目录脱钩** | ✅ **已修复**（main.go:22 `resolveTraceDir()` 优先读 `active-session` 定位 logs/；bootstrap.go:82-86 写入侧重定向到 `sessMgr.LogDir()`） |
+| **Session history.jsonl 事件溯源完全断链** | ✅ **已修复**（session/manager.go `EnableHistoryLog()` + `History()` getter；bootstrap.go:199-204 对 taskStore/Roster/mailboxRegistry 三端注入 `SetHistoryEmitter(sessMgr.History())`） |
+| **Finalization 短路路径不 emit TaskSubmitted/TaskCompleted** | ✅ **已修复**（agent.go:428-459 Path B 已补 emit `KindTaskSubmitted`（`LoopsUsed: i`）+ `KindTaskCompleted`，与 Path A 对称） |
+| **FileStateCache 跨 agent 陈旧缓存 → read 死循环** | ✅ **已修复**（方案 A：agent/filecache.go `Get()` 命中前 `os.Stat` 校验 mtime+size，不一致自动 Invalidate 落盘读） |
+| **CLI 多行输入按 `\n` 拆分（含输入滞留粘连）** | ✅ **已修复**（cli.go `collectMultiline()` + `pending` 缓冲：空行/斜杠命令 flush，末行无 newline 通过 `nextLine` 回传下轮循环消费） |
+| **Mail-notifier Progress-Notify 寄生唤醒**（扇出式，与已修复的链式级联不同） | ✅ **已修复并实战验证**（2026-04-23 正式关闭。v2 三刀：WakeWorthyFilterHook 筛选 + Abort 时清扫 info/low+ack 白名单；DrainWithAck 只对 question 回 ack；send_message 工具描述加 LLM 引导。多 Worker 协作 prompt 实测 2 次 progress-notify 广播 0 个寄生 wake + 6 次清扫 + 0 次 log spam 复发） |
 | **TransferNote 不覆盖父子任务** | ⚪ **设计盲点留档**（2026-04-19 Test 1/Test 2 暴露；v3 §8.4 scope 限定为"兄弟 + Dependencies"依赖链，scheduler→worker subtask 的父子派发模式不注入 upstream-transfer-notes。非 bug，但 scope 覆盖面比设想小） |
 | **Scheduler publish_task 完全串行发布** | 🔴 **P0 待修复**（2026-04-20 三场景并发测试暴露；scheduler 每 loop 只 publish 1 个任务然后等完再 publish 下一个，`default_concurrency` 事实失效。所有并发场景测试无法真实触发——这是测试链路上的"万能掩盖者"） |
-| **Scheduler report_done 允许幻觉汇报** | 🔴 **P0 待修复**（2026-04-20 暴露；scheduler 在 summary 中声称 "Worker-B/C 读取了 log.md" 但日志无此操作、artifacts 校验块也无对应任务。summary 与系统校验矛盾时系统不拦截，汇报可信度崩塌） |
-| **Hook 错误消息不足以让 LLM 自愈** | 🟡 **P1 待修复**（2026-04-20 暴露；explorer 连续 8 次 glob_search 传 `root_dir` 被 path-boundary 拒绝，错误消息"缺少 path 参数"未提示正确字段名，LLM 无法定位自己错在参数命名上。泛化后应为所有 PreCall 参数拒绝类 hook 的通用约束） |
-| **Mail chain_depth 全程为 0，ChainDepthLimit 效果存疑** | 🟡 **P1 待修复**（2026-04-20 暴露；40+ 次唤醒任务 chain_depth 全为 0，即使 explorer 连续发 reply 也没递增。意味着 ChainDepthLimitHook 可能是 dead code，已修复的"邮件级联爆炸"可能仅凭 prompt 削弱止血、非 hook 拦截） |
+| **Scheduler report_done 允许幻觉汇报** | 🟠 **P1 待修复（降级）**（2026-04-20 暴露；artifact 层事实校对块（`buildSchedulerArtifactsReport`）2026-04-09 起已随 summary 并列展示，但仅覆盖"文件产出"类幻觉。2026-04-20 的 action 级幻觉（"Worker-B/C 读取了 log.md"）仍可绕过——需新增 `ReportDoneFactCheckHook` 覆盖 read_file 等动作归属） |
+| **Hook 错误消息不足以让 LLM 自愈** | ✅ **已修复**（2026-04-24；诊断翻转——glob_search schema 实际字段是 `root_dir`，hook 对所有工具硬编码 `path` 才是真 bug。修复：path_boundary.go 引入 `pathFieldByTool` 分派表 + `missingFieldReason` 带正确字段+跨工具差异+当前 keys+示例。两个红态测试自然转绿） |
+| **grep_search/glob_search 空结果无诊断** | ✅ **已修复**（2026-04-24；2026-04-23 实战日志暴露：Explorer 连吃 5 次 `result_len=18` "未找到匹配项" 死字符串，无法判断非正则 / 大小写 / 1MB 限制等多种可能。修复：空结果携带扫描数/跳过数/排错路径；新增 `TestGrepSearch_EmptyResult_HintsDiagnostics` + `TestGlobSearch_EmptyResult_HintsDiagnostics` 锁消息契约） |
+| **Mail chain_depth 全程为 0，ChainDepthLimit 效果存疑** | 🟡 **P1 部分修复**（worker 路径已修完：meta.go:239 + notifier.go:117 正确继承；但 explorer 路径 MetaGroup 构造缺 Store/Holder 注入导致 chain_depth 读不到 task 上下文 → 回归测试 `TestExplorerSendMessage_InheritsChainDepthFromCurrentTask` 🔴 RED 待修） |
+| **Scheduler LLM 连续失败时无限重试** | 🟡 **P1 待修复**（2026-04-20 验证寄生唤醒修复时暴露：LLM 服务器不可达时 scheduler MaxRetries=0 导致 166+ 次无限空转。需为 LLM 调用层加 `MaxLLMFailures` 软上限 + 终态错误分类；与 [nextUpgrade_v4.md §9 Bootstrap 探测](nextUpgrade_v4.md) 互补，一个管启动、一个管运行期） |
+| **Explorer 无 report_done 预算感知** | ✅ **Prompt 层已修复**（2026-04-23，同日暴露同日修）。核查确认 Explorer 根本没 report_done 工具，完成机制只有"不调工具"一条路；explorer.go systemPrompt 补入机制澄清 + 5 条触发条件 + 后果警示 + 真实事故反例；worker.go 顺手加预防段。红态测试自然转绿。**待重跑 2026-04-23 随机 prompt 实战验证"Explorer 能自觉停下"** |
+| **Watchdog 不向 task.EventSource 发崩溃汇报邮件** | 🟡 **P1 待修复**（2026-04-23 暴露：scheduler 看不到 "为什么死" 的上下文，盲目重试 7 次。与 Explorer P0 互补。修复方向参照 agent.sendCrashReport 对称实现。红态 `TestWatchdogStruct_HasMailRegistryForCrashReports` 已落地） |
+| **Scheduler 改写子任务时丢失用户否定约束** | 🟡 **P2 待修复**（2026-04-23 暴露：用户 "不用撰写文字报告" 被改写成 "总结..."，否定约束丢失。修复方向 schedulerSystemPrompt 加 "逐字保留用户否定约束" 规则段。红态 `TestSchedulerSystemPrompt_PreservesUserOriginalConstraints` 已落地） |
 | **Read-modify-write 测试模式无法验证 FIFO 锁** | ⚪ **测试方法论留档**（2026-04-20 暴露；shared.md 追加测试本质上是 read-modify-write，即使真并发也会丢写而非排队；当前工具集缺少原子 append_file 语义。roster §8.3 FIFO 排队落地近一周但从未被真实测试触发过） |
 
-**30/47 项已修复。剩余：1 项 E2E 测试 + 1 项"写入事务化"专项 + 3 项 P3 观察级（路由偏向 / Worker 未 read_file / agent_id 空）+ **3 项 Session 化集成缺口**（P0×1 + P1×2）+ **3 项并发/输入路径缺陷**（FileCache 跨 agent P0、CLI 多行拆分 P0、Mail 扇出唤醒 P2）+ **4 项 2026-04-20 新发现**（Scheduler 串行 publish P0、report_done 幻觉 P0、Hook 错误消息 P1、chain_depth 失效 P1）+ 2 项留档（TransferNote scope / read-modify-write 测试范式）。**
+**41/52 项已修复**（2026-04-24：Hook 错误消息 P1 + grep/glob 空结果诊断 P2 同日闭环；表总行数 +1 由新增 "grep/glob 空结果" 条目带来）。**剩余 11 项**：1 项 E2E 测试 + 1 项"写入事务化"专项 + 3 项 P3 观察级 + **1 项 P0**（Scheduler 串行 publish）+ **4 项 P1**（report_done action 级幻觉 + Explorer chain_depth 继承 + Scheduler LLM 失败无限重试 + Watchdog 崩溃汇报）+ **1 项 P2**（Scheduler 否定约束丢失）+ 1 项留档（TransferNote scope）+ 1 项测试方法论留档。
 
-> **P0 已累积到 5 项**（Trace CLI 路径 / FileCache 跨 agent / CLI 多行拆分 / Scheduler 串行 publish / report_done 幻觉）——其中"Scheduler 串行 publish"是**测试链路上的万能掩盖者**，它不修，其他并发类 bug 都无法被后续测试真实触发；"report_done 幻觉"直接破坏汇报可信度，连带污染 trace 溯源。建议本项两者优先级高于其他 P0。
+> **当前 P0 仅剩 1 项**：
+> - **Scheduler publish_task 完全串行发布**：**测试链路上的万能掩盖者**，不修并发类 bug 无法被后续测试真实触发
+> - ~~Explorer 无 report_done 预算感知~~ ✅ 2026-04-23 prompt 层修复（待实战验证）
 >
-> **三项 Session 化集成缺口同根**：v3 §9.9 Session 化落地时"零件完工 + 各自单测通过"但"装配环节"无跨子系统烟测。
+> **当前 P1 有 4 项**：
+> - ~~Hook 错误消息不足~~ ✅ 2026-04-24 已修复（path_boundary 按工具分派字段 + 错误消息自助指引）
+> - report_done action 级幻觉校对缺失（artifact 层已有事实校对块；action 层需新增 `ReportDoneFactCheckHook`）。
+> - Explorer MetaGroup 构造缺 Store/Holder → chain_depth 读不到当前 task，红态回归测试 `explorer/chain_depth_test.go:TestExplorerSendMessage_InheritsChainDepthFromCurrentTask` 就位。
+> - **Scheduler LLM 连续失败时无限重试**（2026-04-20 新发现）：与 [nextUpgrade_v4.md §9 Bootstrap 探测](nextUpgrade_v4.md) 互补。**用户明确指示本次验证后立即修复**。
+> - **Watchdog 不发崩溃汇报邮件**（2026-04-23 新发现）：红态 `TestWatchdogStruct_HasMailRegistryForCrashReports` 就位。
 >
-> **两项新 P0（FileCache + CLI 多行）同样是集成 bug**：单测都通过（`filecache_test.go` 只在单 agent 场景下测，`cli_test.go` 只测单行命令），但**跨子系统的真实协作路径无端到端覆盖**。
+> **2026-04-20 核查得到的经验**：
+> - 此前标记 P0/P1 的若干集成缺口（Session 化 3 项、FileStateCache、CLI 多行、Mail chain_depth worker 路径）均已在后续提交中修完但文档未同步。本次通过代码证据对齐（main.go:22 `resolveTraceDir`、manager.go:263 `EnableHistoryLog`、filecache.go Get() `os.Stat`、cli.go `collectMultiline`、meta.go:239 `ChainDepth+1`、agent.go:428-459 Path B emit 对称）。
+> - **核查教训**：单看"主路径"代码证据不足以判断整体修复——应同时跑红态测试集确认无遗漏（Mail chain_depth 这次就是因为只核查了 worker 路径、漏了 explorer 路径）。
+> - 文档延迟更新不等于缺陷未修——建议日后将"红态测试转绿"作为修复完成门槛。
 >
-> **2026-04-20 两项新 P0 揭示"行为幻觉"类缺陷**：Scheduler 串行 publish 是"LLM 对工具语义理解偏差"（prompt/工具描述问题），report_done 幻觉是"汇报与事实脱钩"（缺少对照护栏）。两者都不在"单测"的覆盖范围，只能通过**LLM 行为观测 + Hook 事实校对**发现和拦截。
->
-> **2026-04-20 两项新 P1 揭示"修复未被验证"**：Hook 错误消息不足（hook 形同递错没纠错）、chain_depth 全程为 0（之前"已修复的邮件级联爆炸"可能只是 prompt 削弱带来的止血而非 hook 生效）。说明现有修复验证机制存在系统性缺陷——单测覆盖到代码路径 ≠ 验证到行为结果。
->
-> 处理时间窗口建议：
-> 1. 立即修两项 2026-04-20 P0（Scheduler 串行 + report_done 幻觉）——否则之后所有并发测试都白做
-> 2. P0 剩余三项（Trace CLI 路径 / FileCache / CLI 多行）
-> 3. P1 修两项 2026-04-20（Hook 错误消息 + chain_depth 验证）+ 两项 Session 化
-> 4. 补端到端烟测（含 LLM 行为观测和 hook 事实校对）
+> 处理时间窗口建议（rev7）：
+> 1. **立即**：Scheduler 串行 publish P0（解锁后续所有并发测试）
+> 2. **短期**：3 项 P1（Hook 错误消息 + report_done action 级 hook + Explorer chain_depth 注入 Store/Holder）
+> 3. **中期**：剩余 P3 收尾
+> 4. **流程**：修复完成前红态测试必须转绿；本文档条目状态在 PR 内同步翻态
 
 > 注：6 项 worktree 相关条目（Worktree 相对路径解析、Worktree Remove git 失忆兜底、Worktree merge 假成功、Main 工作区脏状态、Git 分支 ref 泄漏、Worktree 重试丢上下文）已于 2026-04-09 整体清出本文档 — 详细复盘随 `internal/isolation` 包一同消失。仅在"架构决策：删除 git 依赖"段保留作为历史索引。
 
@@ -1732,3 +1979,8 @@ A 的关键改动：`path-boundary.go` 错误消息改为
   - Mail chain_depth 全程为 0（P1）——40+ 次唤醒任务 chain_depth 无一例 > 0，ChainDepthLimitHook 可能是 dead code
   - Read-modify-write 无法验证 FIFO 锁（测试方法论）——shared.md 追加本质上是读改写，即使并发也会丢写而非排队；需要原子 append 工具才能测 §8.3
 - **下一阶段目标 (rev5)**：(a) **优先两项 2026-04-20 P0**（Scheduler 串行 + report_done 幻觉）——这两项不修则后续并发测试均为伪测试；(b) 其余 3 项 P0（Trace CLI + FileCache + CLI 多行）；(c) 2 项 2026-04-20 P1（Hook 错误消息 + chain_depth 验证+修复）；(d) 补齐"LLM 行为观测烟测"——针对 prompt 驱动的行为偏差引入观测点，而非只测代码路径
+- **2026-04-20 / 23 Mail 扇出唤醒 P2 两阶段落地**：
+  - v1（2026-04-20）：WakeWorthyFilterHook 按 type/priority 筛选 + DrainWithAck 收窄到只回 question。20 用例单测全绿、全量回归 0 新增红态。首次实战跑 dummy_readme.md 编辑场景：wall-clock 从 4 min 压到 69s、0 寄生 wake 任务；但 **task 完成后出现日志污染——mail-notifier 每 5s 重复打印相同的 abort 记录 ~160 条**（邮件滞留在空闲 peer 邮箱导致）
+  - v2（2026-04-20 同日增强）：abort 时"顺手清扫" —— 新增 `Mailbox.DropMatching` + `MailboxDropView` 接口，Hook Abort 时丢弃 `type ∈ {info, ack} && priority == low` 白名单邮件（严格保守：`info+normal` 与 `reply` 不丢，保留 LLM 主动沟通）；`send_message` 工具描述加 LLM 引导避免类型误用
+  - v2 实战验证（2026-04-23，task=8f97a6bb）：多 Worker 协作 prompt 强制派发 → 2 次 progress-notify 广播（worker-3 / worker-1 各一次）→ 6 次 abort 日志 reason 均出现 "已清扫 1 条 info/ack+low 邮件" → **无任何 log spam 复发**。P2 条目 2026-04-23 正式关闭
+- **下一阶段目标 (rev6)**：(a) 修 Scheduler LLM 连续失败无限重试 P1（2026-04-20 验证 v1 寄生唤醒修复时暴露，LLM 宕机 166+ 次空转，用户已明确表态下一个修）；(b) rev5 其余未动项（Scheduler 串行 P0 / report_done 幻觉 P1 / Trace CLI / FileCache / CLI 多行）

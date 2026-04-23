@@ -46,31 +46,48 @@ func (h *PathBoundaryHook) Phase() hook.ToolHookPhase { return hook.PhasePreCall
 // Priority 返回 10（系统级最早）。
 func (h *PathBoundaryHook) Priority() int { return 10 }
 
+// pathFieldByTool 声明每个工具在其 schema 中使用的路径参数字段名。
+// 这是真相来源（single source of truth）——与 internal/tools/local_read.go
+// 等处 Register 时的 schema 声明一致。
+//
+// 历史教训：2026-04-20 事故中 hook 对所有工具硬编码 "path"，而 glob_search
+// 的 schema 实际声明的是 "root_dir"。结果 LLM 按 schema 正确传 root_dir
+// 却被 hook 以"缺少 path 参数"拒绝，连续 8 轮无法自愈。修复方式是让 hook
+// 按工具名查询正确字段名，错误消息也据此生成。
+var pathFieldByTool = map[string]string{
+	"read_file":   "path",
+	"list_dir":    "path",
+	"list_files":  "path",
+	"grep_search": "path",
+	"glob_search": "root_dir",
+	"write_file":  "path",
+	"edit_file":   "path",
+}
+
 // Matches 返回是否匹配本 hook 的工具集合。
 //
 // 注意：不包含 run_shell —— 详见类型注释中的决策。
-// 不包含 web_* / publish_task / send_message —— 它们没有 path 参数。
+// 不包含 web_* / publish_task / send_message —— 它们没有路径参数。
 func (h *PathBoundaryHook) Matches(toolName string) bool {
-	switch toolName {
-	case "read_file", "list_dir", "list_files",
-		"grep_search", "glob_search",
-		"write_file", "edit_file":
-		return true
-	}
-	return false
+	_, ok := pathFieldByTool[toolName]
+	return ok
 }
 
-// Run 执行路径校验。
-//   - args["path"] 缺失或非字符串 → Abort（用户决议：严格策略）
+// Run 执行路径校验。字段名按工具 schema 分派（见 pathFieldByTool）。
+//   - 路径参数缺失或非字符串 → Abort，错误消息带出正确字段名 + 跨工具差异提示
 //   - pathutil.ValidatePath 返回 error（越界 / 敏感文件）→ Abort
 //   - 其他情况 → Continue
 func (h *PathBoundaryHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecision {
-	rawPath, exists := hctx.Args["path"]
+	field, ok := pathFieldByTool[hctx.ToolName]
+	if !ok {
+		return hook.ToolHookDecision{Action: hook.Continue}
+	}
+	rawPath, exists := hctx.Args[field]
 	if !exists {
 		return hook.ToolHookDecision{
 			Action:      hook.Abort,
 			HookName:    h.Name(),
-			AbortReason: fmt.Sprintf("工具 %s 缺少 path 参数", hctx.ToolName),
+			AbortReason: h.missingFieldReason(hctx, field),
 		}
 	}
 	pathStr, ok := rawPath.(string)
@@ -78,14 +95,14 @@ func (h *PathBoundaryHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecision 
 		return hook.ToolHookDecision{
 			Action:      hook.Abort,
 			HookName:    h.Name(),
-			AbortReason: fmt.Sprintf("工具 %s 的 path 参数类型必须是 string，收到 %T", hctx.ToolName, rawPath),
+			AbortReason: fmt.Sprintf("工具 %s 的 %s 参数类型必须是 string，收到 %T", hctx.ToolName, field, rawPath),
 		}
 	}
 	if pathStr == "" {
 		return hook.ToolHookDecision{
 			Action:      hook.Abort,
 			HookName:    h.Name(),
-			AbortReason: fmt.Sprintf("工具 %s 的 path 参数不能为空", hctx.ToolName),
+			AbortReason: fmt.Sprintf("工具 %s 的 %s 参数不能为空", hctx.ToolName, field),
 		}
 	}
 	if _, err := pathutil.ValidatePath(pathStr, h.ProjectRoot); err != nil {
@@ -96,4 +113,20 @@ func (h *PathBoundaryHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecision 
 		}
 	}
 	return hook.ToolHookDecision{Action: hook.Continue}
+}
+
+// missingFieldReason 构造"缺少路径参数"的自助指引错误消息：
+// 带出正确字段名 + 常见别名对比 + 当前 args keys + 示例调用，
+// 让 LLM 读一次错误即可定位自己误传的字段。
+func (h *PathBoundaryHook) missingFieldReason(hctx hook.ToolHookContext, field string) string {
+	keys := make([]string, 0, len(hctx.Args))
+	for k := range hctx.Args {
+		keys = append(keys, k)
+	}
+	aliasHint := "注意：read_file/list_dir/grep_search/write_file/edit_file 用 'path'；glob_search 用 'root_dir'。常见误传：dir / cwd / base_dir 均非合法字段"
+	example := fmt.Sprintf(`{"%s": ".", ...}`, field)
+	return fmt.Sprintf(
+		"工具 %s 缺少必需参数 '%s'。当前收到的参数 keys=%v。%s。示例：%s",
+		hctx.ToolName, field, keys, aliasHint, example,
+	)
 }

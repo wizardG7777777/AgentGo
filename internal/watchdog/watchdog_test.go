@@ -2,6 +2,7 @@ package watchdog
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
@@ -236,4 +237,43 @@ func TestWatchdog_CascadeCancellation_MissingDep(t *testing.T) {
 	if got.Status != model.TaskStatusCancelled {
 		t.Errorf("status = %s, want cancelled (missing dep)", got.Status)
 	}
+}
+
+// TestWatchdogStruct_HasMailRegistryForCrashReports 是 2026-04-23 随机测试
+// 暴露的 P1 "Scheduler 对 watchdog-timeout 无感知"回归锁。
+//
+// 现象：watchdog 超时杀任务时，当前仅执行 FailTaskBySystem + sendAlert（发
+// EventWatchdogAlert 到 EventCh），但**没有**给 task.EventSource（通常是
+// scheduler）发任何邮件说明"谁死了 / 为什么死"。
+//
+// 连锁后果（2026-04-23 实测）：scheduler 的 LLM 看到子任务 status=failed，
+// 但缺失"为什么失败"的上下文（是被 watchdog 超时杀了？还是 agent 自己
+// handleFailure 失败的？），倾向于盲目重新 publish 类似任务。7 个子任务
+// 连续死于同一模式却没收到任何"换策略吧"的信号。
+//
+// 本测试在修复前 🔴 RED：断言 Watchdog 结构体含可发邮件字段，用于向
+// task.EventSource 发送 type=info, priority=high 的崩溃汇报邮件，
+// 内容应至少包含：任务 ID、超时原因、elapsed、last known activity（最后
+// 一次 tool call 的名字和时间，来自 store.GetToolCallHistory）。
+//
+// 修复方向（与 KNOWN_ISSUES 2026-04-08 第二轮的 agent.sendCrashReport 对称）：
+//  1. Watchdog 加字段 MailRegistry（或 Mailbox/Notifier 等命名）
+//  2. bootstrap.go 在 New Watchdog 时注入 mbRegistry
+//  3. checkProcessingTask 超时分支在 FailTaskBySystem 之后，用 EventSource
+//     作为收件人发 type=info/priority=high 邮件
+//  4. 类似覆盖依赖失败级联取消 / unclaimed timeout 两条路径
+func TestWatchdogStruct_HasMailRegistryForCrashReports(t *testing.T) {
+	w := &Watchdog{}
+	typ := reflect.TypeOf(*w)
+	// 可接受的字段名（命名留给实施阶段选择）
+	candidates := []string{"MailRegistry", "MailSender", "Mailbox", "Mails", "Notifier"}
+	for _, name := range candidates {
+		if _, ok := typ.FieldByName(name); ok {
+			return
+		}
+	}
+	t.Fatalf("Watchdog 应持有可发邮件的字段（候选名 %v 之一）用于超时时向 task.EventSource 发送崩溃汇报邮件。"+
+		"当前结构体仅含 %d 个字段（Store/Config/EventCh/Roster），scheduler 在子任务超时时缺失 `为什么死` 的上下文，"+
+		"会盲目重试同样策略。见 KNOWN_ISSUES.md 2026-04-23 P1",
+		candidates, typ.NumField())
 }

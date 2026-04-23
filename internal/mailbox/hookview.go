@@ -54,3 +54,29 @@ func (r *Registry) lookupLocked(id string) (*Mailbox, bool) {
 
 // 编译期断言：Registry 必须自动满足 MailboxHookView。
 var _ MailboxHookView = (*Registry)(nil)
+
+// MailboxDropView 允许 hook 清理"已判定为永不会被消费"的邮件。
+//
+// 与 MailboxHookView 分离的理由：MailboxHookView 是严格只读契约；清理
+// 邮件是状态变更操作，只应给少数明确需要"abort 时顺手打扫"的 hook 使用
+// （当前仅 WakeWorthyFilterHook）。分离两个接口让"大多数 hook 仍然无副作用"
+// 这个不变式在类型层面显式。
+type MailboxDropView interface {
+	// DropMatching 在指定 agent 的邮箱中丢弃满足 pred 的所有邮件。
+	// 返回被丢弃的邮件数；目标 agent 不存在或 pred 为 nil 时返回 0。
+	DropMatching(agentID string, pred func(Message) bool) int
+}
+
+// DropMatching 实现 MailboxDropView。委托给对应 Mailbox.DropMatching。
+func (r *Registry) DropMatching(agentID string, pred func(Message) bool) int {
+	r.mu.RLock()
+	mb, ok := r.lookupLocked(agentID)
+	r.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	return mb.DropMatching(pred)
+}
+
+// 编译期断言：Registry 自动满足 MailboxDropView。
+var _ MailboxDropView = (*Registry)(nil)

@@ -203,3 +203,75 @@ func TestSchedulerSystemPrompt_ContainsParallelIndependentPublishGuidance(t *tes
 			hasIndependence, hasParallelism)
 	}
 }
+
+// TestSchedulerSystemPrompt_PreservesUserOriginalConstraints 是 2026-04-23
+// 随机测试暴露的 P2 "Scheduler 改写子任务 description 时丢失用户原始约束"
+// 回归锁。
+//
+// 现象：用户 prompt 含明确否定约束"**不用撰写文字报告**"，但 scheduler 把
+// 用户的顶层任务拆解为子任务时，子任务 description 变成"总结 / 撰写..."
+// —— 负约束丢失，explorer/worker 按默认理解继续生成报告。
+//
+// 根因：schedulerSystemPrompt 未显式要求"拆分 / 改写子任务 description 时
+// 必须保留用户的原始约束（尤其是否定性约束：不要、禁止、避免、不用 等）"。
+// LLM 倾向于"润色"用户的话，但润色过程常丢失否定词。
+//
+// 本测试在修复前 🔴 RED：断言 schedulerSystemPrompt 含"保留用户原始约束 /
+// 否定约束"相关规则。
+//
+// 修复方向：prompt 加一段明确的规则，类似：
+//
+//	"在将用户请求拆分为子任务时，必须**逐字保留**用户的否定性约束（如
+//	'不要/禁止/避免/不用'等词）到子任务 description 中。不得以'更清晰的
+//	表述'为由丢弃或弱化这些约束。"
+func TestSchedulerSystemPrompt_PreservesUserOriginalConstraints(t *testing.T) {
+	prompt := schedulerSystemPrompt
+
+	// 一组：至少一个"保留原始意图/约束"的规则字样
+	preserveSignals := []string{
+		"保留用户",
+		"保留原始",
+		"原始约束",
+		"逐字保留",
+		"不得弱化",
+		"不得改写用户",
+		"用户的否定",
+		"否定性约束",
+		"否定约束",
+	}
+	// 二组：至少一个"否定性约束"例子，证明 prompt 作者意识到这类约束特殊
+	negationExampleSignals := []string{
+		"不要",
+		"禁止",
+		"避免",
+		"不用",
+		"don't",
+		"avoid",
+	}
+
+	hasPreserveRule := false
+	for _, k := range preserveSignals {
+		if strings.Contains(prompt, k) {
+			hasPreserveRule = true
+			break
+		}
+	}
+	// 第二组只要 prompt 里有任一否定词作为例子即可；目前 prompt 的"避免"
+	// 是用在"避免能力不足的路由"语境下，不是"约束传递"语境。所以我们不
+	// 靠第二组独立红，只用第一组作为主断言。
+	hasAnyNegationExample := false
+	for _, k := range negationExampleSignals {
+		if strings.Contains(prompt, k) {
+			hasAnyNegationExample = true
+			break
+		}
+	}
+	_ = hasAnyNegationExample // 仅作信息性 grep，不强断言
+
+	if !hasPreserveRule {
+		t.Errorf("schedulerSystemPrompt 缺少 `保留用户原始约束` 的规则段（期望含 %v 之一）—— "+
+			"2026-04-23 随机测试暴露 scheduler 把用户 `不用撰写文字报告` 改写成 `总结...`，"+
+			"否定约束丢失。见 KNOWN_ISSUES.md 2026-04-23 P2",
+			preserveSignals)
+	}
+}

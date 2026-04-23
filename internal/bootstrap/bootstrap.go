@@ -217,11 +217,14 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	if err := mailboxHookReg.Register(builtin.NewPerAgentDedupHook(storeView)); err != nil {
 		return nil, fmt.Errorf("注册 PerAgentDedupHook 失败: %w", err)
 	}
+	if err := mailboxHookReg.Register(builtin.NewWakeWorthyFilterHook(mbRegistry, mbRegistry)); err != nil {
+		return nil, fmt.Errorf("注册 WakeWorthyFilterHook 失败: %w", err)
+	}
 	if err := mailboxHookReg.Register(builtin.NewWakeContextExpandHook(mbRegistry, 5)); err != nil {
 		return nil, fmt.Errorf("注册 WakeContextExpandHook 失败: %w", err)
 	}
 	mbRegistry.AttachHookRunner(hook.AsMailboxRunner(mailboxHookReg))
-	fmt.Printf("[启动] Mailbox Hook 系统初始化完成（已注册：chain-depth-limit max=%d, per-agent-dedup, wake-context-expand）\n", cfg.MailChainMaxDepth)
+	fmt.Printf("[启动] Mailbox Hook 系统初始化完成（已注册：chain-depth-limit max=%d, per-agent-dedup, wake-worthy-filter, wake-context-expand）\n", cfg.MailChainMaxDepth)
 
 	// Step 3.7: 初始化 Agent Hook 系统（Sprint 1）
 	// 覆盖 ReactLoop 4 个生命周期事件（PhaseTaskStart / LoopPre / LoopPost / TaskEnd）。

@@ -311,17 +311,26 @@ func (g LocalReadGroup) grepSearch(ctx context.Context, args map[string]any) (st
 	}
 
 	var results []string
+	scannedFiles := 0
+	skippedHidden := 0
+	skippedLarge := 0
 	_ = filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return nil
 		}
-		if strings.HasPrefix(info.Name(), ".") || info.Size() > 1<<20 {
+		if strings.HasPrefix(info.Name(), ".") {
+			skippedHidden++
+			return nil
+		}
+		if info.Size() > 1<<20 {
+			skippedLarge++
 			return nil
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil
 		}
+		scannedFiles++
 		lines := strings.Split(string(data), "\n")
 		for i, line := range lines {
 			if len(results) >= maxLines {
@@ -335,7 +344,11 @@ func (g LocalReadGroup) grepSearch(ctx context.Context, args map[string]any) (st
 	})
 
 	if len(results) == 0 {
-		return "未找到匹配项", nil
+		return fmt.Sprintf(
+			"未找到包含 %q 的行（扫描 %d 个文件，跳过 %d 个隐藏文件和 %d 个 >1MB 文件；max_lines=%d）。"+
+				"若意外为空：1) 先用 list_dir 确认 %q 下有目标文件；2) pattern 按字面子串匹配（非正则），检查大小写；3) 目标文件若 >1MB 会被跳过",
+			pattern, scannedFiles, skippedHidden, skippedLarge, maxLines, searchPath,
+		), nil
 	}
 	return strings.Join(results, "\n"), nil
 }
@@ -380,6 +393,7 @@ func toolGlobSearch(ctx context.Context, pattern, rootDir string) (string, error
 	const resultLimit = 200
 	var matches []string
 	totalMatched := 0
+	scannedFiles := 0
 
 	_ = filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -391,6 +405,7 @@ func toolGlobSearch(ctx context.Context, pattern, rootDir string) (string, error
 		if info.IsDir() {
 			return nil
 		}
+		scannedFiles++
 		relPath, relErr := filepath.Rel(rootDir, path)
 		if relErr != nil {
 			return nil
@@ -410,7 +425,11 @@ func toolGlobSearch(ctx context.Context, pattern, rootDir string) (string, error
 	})
 
 	if totalMatched == 0 {
-		return "未找到匹配文件", nil
+		return fmt.Sprintf(
+			"未找到匹配 %q 的文件（扫描 %d 个文件，根目录=%s，隐藏目录已跳过）。"+
+				"若意外为空：1) 确认 pattern 符合 glob 语法（** 递归、* 单层、? 单字符）；2) pattern 基于 rootDir 的相对路径匹配，不要以 / 开头；3) 用 list_dir 确认 rootDir 下有目标文件",
+			pattern, scannedFiles, rootDir,
+		), nil
 	}
 	result := strings.Join(matches, "\n")
 	if totalMatched > resultLimit {

@@ -258,3 +258,213 @@ func TestConcurrentSend(t *testing.T) {
 		t.Fatalf("期望 50 条消息，实际: %d", len(msgs))
 	}
 }
+
+// ---- DrainWithAck 策略：仅对 question 类回 ack ----
+//
+// 背景（KNOWN_ISSUES.md P2 寄生唤醒修复的第二刀）：
+// 早期版本对除 ack 外所有类型都自动回 ack。新策略：只对 MsgTypeQuestion 回 ack，
+// 切断 info 广播引起的 ack 回波（发送方邮箱不再被 N 条 ack 灌满触发自唤醒）。
+
+// drainAckInbox 收集指定 registry 上某个 agent 收到的所有 ack 类邮件。
+// 它是一个便捷 helper：从对端 mailbox Drain 后过滤 Type==MsgTypeAck。
+func drainAckInbox(mb *Mailbox) []Message {
+	var out []Message
+	for _, m := range mb.Drain() {
+		if m.Type == MsgTypeAck {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func TestDrainWithAck_OnlyAcksQuestion(t *testing.T) {
+	reg := NewRegistry(16)
+	recv := reg.Register("recv", "")
+	sender := reg.Register("sender", "")
+
+	mustSend := func(m Message) {
+		if err := reg.Send(m); err != nil {
+			t.Fatalf("Send 失败: %v", err)
+		}
+	}
+	mustSend(Message{From: "sender", To: "recv", Type: MsgTypeInfo, Summary: "info1"})
+	mustSend(Message{From: "sender", To: "recv", Type: MsgTypeQuestion, Summary: "Q1?"})
+	mustSend(Message{From: "sender", To: "recv", Type: MsgTypeReply, Summary: "reply1"})
+
+	msgs := recv.DrainWithAck(reg)
+	if len(msgs) != 3 {
+		t.Fatalf("应 drain 3 条，实际: %d", len(msgs))
+	}
+
+	acks := drainAckInbox(sender)
+	if len(acks) != 1 {
+		t.Fatalf("sender 只应收到 1 条 ack（仅对 question），实际: %d", len(acks))
+	}
+	if acks[0].To != "sender" {
+		t.Errorf("ack 应回到 sender，实际 To=%q", acks[0].To)
+	}
+}
+
+func TestDrainWithAck_NoAckForInfo(t *testing.T) {
+	reg := NewRegistry(8)
+	recv := reg.Register("recv", "")
+	sender := reg.Register("sender", "")
+
+	_ = reg.Send(Message{From: "sender", To: "recv", Type: MsgTypeInfo, Summary: "progress"})
+	msgs := recv.DrainWithAck(reg)
+	if len(msgs) != 1 {
+		t.Fatalf("应 drain 1 条，实际: %d", len(msgs))
+	}
+	acks := drainAckInbox(sender)
+	if len(acks) != 0 {
+		t.Fatalf("sender 不应收到 ack，实际: %d", len(acks))
+	}
+}
+
+func TestDrainWithAck_NoAckForAck(t *testing.T) {
+	// 回归保护：ack 类邮件不触发递归 ack（即使 type != question 的判定已经覆盖了这一点，
+	// 仍显式测试以防未来重构把条件反转）。
+	reg := NewRegistry(8)
+	recv := reg.Register("recv", "")
+	sender := reg.Register("sender", "")
+
+	_ = reg.Send(Message{From: "sender", To: "recv", Type: MsgTypeAck, Summary: "ack1"})
+	_ = recv.DrainWithAck(reg)
+	acks := drainAckInbox(sender)
+	if len(acks) != 0 {
+		t.Fatalf("ack 不应触发递归 ack，实际: %d", len(acks))
+	}
+}
+
+func TestDrainWithAck_NilRegistry(t *testing.T) {
+	mb := newMailbox("solo", "", 4)
+	mb.TrySend(Message{From: "x", To: "solo", Type: MsgTypeInfo})
+	msgs := mb.DrainWithAck(nil) // registry 为 nil 时退化为普通 Drain，不应 panic
+	if len(msgs) != 1 {
+		t.Fatalf("nil registry 下应等价 Drain，实际: %d", len(msgs))
+	}
+}
+
+// ---- DropMatching 策略（v2 寄生唤醒修复的清扫副作用）----
+
+func TestDropMatching_RemovesMatchingAndPreservesOthers(t *testing.T) {
+	mb := newMailbox("agent-1", "", 16)
+	mb.TrySend(Message{From: "x", Type: MsgTypeInfo, Priority: PriorityLow, Summary: "drop-1"})
+	mb.TrySend(Message{From: "x", Type: MsgTypeInfo, Priority: PriorityNormal, Summary: "keep-1"})
+	mb.TrySend(Message{From: "x", Type: MsgTypeAck, Priority: PriorityLow, Summary: "drop-2"})
+	mb.TrySend(Message{From: "x", Type: MsgTypeReply, Priority: PriorityNormal, Summary: "keep-2"})
+
+	// 丢弃所有 summary 以 "drop-" 开头的
+	dropped := mb.DropMatching(func(m Message) bool {
+		return len(m.Summary) >= 5 && m.Summary[:5] == "drop-"
+	})
+	if dropped != 2 {
+		t.Fatalf("应丢弃 2 条，实际 %d", dropped)
+	}
+	if got := mb.Len(); got != 2 {
+		t.Fatalf("channel 应保留 2 条，实际 %d", got)
+	}
+	// 按原顺序 drain 剩余
+	msgs := mb.Drain()
+	if len(msgs) != 2 || msgs[0].Summary != "keep-1" || msgs[1].Summary != "keep-2" {
+		t.Fatalf("顺序错乱或内容丢失: %+v", msgs)
+	}
+}
+
+func TestDropMatching_UpdatesRecentRing(t *testing.T) {
+	mb := newMailbox("agent-1", "", 16)
+	mb.TrySend(Message{From: "x", Type: MsgTypeInfo, Priority: PriorityLow, Summary: "d1"})
+	mb.TrySend(Message{From: "x", Type: MsgTypeInfo, Priority: PriorityNormal, Summary: "k1"})
+
+	_ = mb.DropMatching(func(m Message) bool { return m.Priority == PriorityLow })
+
+	// recent ring 应只剩 normal 那条（peek 不消费 channel，但也不应看到已 drop 的）
+	snap := mb.Snapshot(16)
+	if len(snap) != 1 || snap[0].Summary != "k1" {
+		t.Fatalf("recent 应只剩 k1，实际 %+v", snap)
+	}
+}
+
+func TestDropMatching_NilPredReturnsZero(t *testing.T) {
+	mb := newMailbox("agent-1", "", 4)
+	mb.TrySend(Message{From: "x", Type: MsgTypeInfo, Priority: PriorityLow})
+	if got := mb.DropMatching(nil); got != 0 {
+		t.Fatalf("nil pred 应返回 0，实际 %d", got)
+	}
+	if mb.Len() != 1 {
+		t.Fatalf("nil pred 下 channel 不应受影响，实际 %d", mb.Len())
+	}
+}
+
+func TestDropMatching_EmptyMailboxButRecentCleanedUp(t *testing.T) {
+	mb := newMailbox("agent-1", "", 4)
+	// 先往 channel 和 recent 里灌入邮件
+	mb.TrySend(Message{From: "x", Type: MsgTypeInfo, Priority: PriorityLow, Summary: "old"})
+	// 手动消费 channel，让 channel 空但 recent 仍留快照
+	_ = mb.Drain()
+
+	dropped := mb.DropMatching(func(m Message) bool { return m.Priority == PriorityLow })
+	if dropped != 0 {
+		t.Errorf("channel 已空应返回 0（未从 channel 丢弃），实际 %d", dropped)
+	}
+	// 但 recent 应被清理
+	if snap := mb.Snapshot(16); len(snap) != 0 {
+		t.Errorf("recent 应被清空，实际: %+v", snap)
+	}
+}
+
+func TestRegistry_DropMatching_DelegatesToCorrectMailbox(t *testing.T) {
+	reg := NewRegistry(8)
+	mbA := reg.Register("a", "")
+	mbB := reg.Register("b", "")
+
+	mbA.TrySend(Message{From: "x", Type: MsgTypeInfo, Priority: PriorityLow, Summary: "a-drop"})
+	mbB.TrySend(Message{From: "x", Type: MsgTypeInfo, Priority: PriorityLow, Summary: "b-keep"})
+
+	n := reg.DropMatching("a", func(m Message) bool { return m.Priority == PriorityLow })
+	if n != 1 {
+		t.Fatalf("应丢弃 mbA 1 条，实际 %d", n)
+	}
+	if mbA.Len() != 0 || mbB.Len() != 1 {
+		t.Errorf("只应影响 mbA；mbA=%d, mbB=%d", mbA.Len(), mbB.Len())
+	}
+
+	// 不存在的 agent → 返回 0 且无 panic
+	if got := reg.DropMatching("nonexistent", func(m Message) bool { return true }); got != 0 {
+		t.Errorf("不存在的 agent 应返回 0，实际 %d", got)
+	}
+}
+
+func TestDrainWithAck_MixedBatch_PreservesOrder(t *testing.T) {
+	reg := NewRegistry(16)
+	recv := reg.Register("recv", "")
+	s1 := reg.Register("s1", "")
+	s2 := reg.Register("s2", "")
+
+	_ = reg.Send(Message{From: "s1", To: "recv", Type: MsgTypeInfo, Summary: "i1"})
+	_ = reg.Send(Message{From: "s2", To: "recv", Type: MsgTypeQuestion, Summary: "q1"})
+	_ = reg.Send(Message{From: "s1", To: "recv", Type: MsgTypeInfo, Summary: "i2"})
+	_ = reg.Send(Message{From: "s2", To: "recv", Type: MsgTypeQuestion, Summary: "q2"})
+
+	msgs := recv.DrainWithAck(reg)
+	if len(msgs) != 4 {
+		t.Fatalf("应 drain 4 条，实际: %d", len(msgs))
+	}
+	wantOrder := []string{"i1", "q1", "i2", "q2"}
+	for i, m := range msgs {
+		if m.Summary != wantOrder[i] {
+			t.Errorf("drain 顺序错乱 at %d: 期望 %q 实际 %q", i, wantOrder[i], m.Summary)
+		}
+	}
+
+	// ack 只发给 question 的 From（本例全部是 s2），共 2 条
+	acks1 := drainAckInbox(s1)
+	acks2 := drainAckInbox(s2)
+	if len(acks1) != 0 {
+		t.Errorf("s1 不该收到 ack（它只发了 info），实际: %d", len(acks1))
+	}
+	if len(acks2) != 2 {
+		t.Errorf("s2 应收到 2 条 ack（对 q1/q2），实际: %d", len(acks2))
+	}
+}
+

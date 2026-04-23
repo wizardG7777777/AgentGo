@@ -75,14 +75,19 @@ func (g MetaGroup) Register(r *agent.ToolRegistry) {
 	if g.MBRegistry != nil {
 		r.Register(
 			"send_message",
-			"向指定代理发送结构化消息（点对点或广播）",
+			"向指定代理发送结构化消息（点对点或广播）。"+
+				"**重要——消息类型决定收件方响应语义**：\n"+
+				"• 如果你需要对方**立即停下手头的事来响应**本消息，必须用 `msg_type=\"question\"` 或 `msg_type=\"steer\"`，或显式标注 `priority=\"high\"`；系统会为空闲的收件方发起一次唤醒任务。\n"+
+				"• 如果只是**广播通知 / 进度汇报 / 顺带提一句**，继续用默认 `msg_type=\"info\"` + `priority=\"normal\"`；收件方在其下一轮任务的 reactLoop 开头自然读取到。\n"+
+				"• **特别注意**：`msg_type=\"info\"` + `priority=\"low\"` 的组合会被系统判定为\"纯广播噪音\"，若收件方全程空闲可能被自动丢弃以避免邮箱污染——仅当你确实不在乎是否被读时才用这个组合（典型是系统自动生成的 progress-notify，LLM 通常不需要手动发 low 优先级）。\n"+
+				"**收件人必须是真实 agent ID**（如 \"worker-1\"、\"scheduler\"、\"explorer-1\"）或 \"*\" 表示广播。",
 			schema.Object().
 				String("to", "收件人代理 ID（如 \"worker-1\"、\"scheduler\"），或 \"*\" 表示广播", true).
 				String("content", "消息正文（详细内容）", true).
 				String("summary", "一句话摘要，帮助收信方快速判断消息重点（建议始终填写）", false).
-				Enum("msg_type", "消息类型：info=通知, question=提问/质疑（期望回复）, reply=回复先前消息, steer=纠偏指令。默认 info",
+				Enum("msg_type", "消息类型：info=通知（默认，不触发立即唤醒）, question=提问（期望对方立即回复，会触发唤醒）, reply=回复先前消息, steer=纠偏指令（触发唤醒）。选错 type 会让紧急消息被当作噪音或让广播消息烧掉 token——按语义选择",
 					[]string{"info", "question", "reply", "steer"}, false).
-				Enum("priority", "优先级：low/normal/high，默认 normal",
+				Enum("priority", "优先级：low=纯噪音广播可丢弃 / normal=默认 / high=立即唤醒空闲收件方。默认 normal。LLM 主动发消息通常用 normal；写 low 意味着你同意对方看不到也没关系",
 					[]string{"low", "normal", "high"}, false).
 				Build(),
 			g.sendMessage,
