@@ -312,7 +312,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	fmt.Printf("[启动] Agent 注册表初始化完成（%d 个特化代理）\n", len(agentRegistry.Specialized()))
 
 	// Step 6: 创建看门狗（先于 scheduler 创建——scheduler 需要 approvalCh，但 watchdog 不需要）
-	w := watchdog.New(taskStore, cfg, eventCh, r)
+	w := watchdog.New(taskStore, cfg, eventCh, r, mbRegistry)
 
 	// Step 6.5: 解析工具集 profile（§9.1 Tool Set Profiles）
 	workerAllowed, err := cfg.ResolveProfile(cfg.WorkerProfile)

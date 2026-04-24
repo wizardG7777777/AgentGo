@@ -19,7 +19,7 @@ func newTestWatchdog() (*Watchdog, store.TaskStore, chan model.Event) {
 	cfg.DefaultTimeoutSec = 300
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	r := roster.NewMemoryRoster()
-	w := New(s, cfg, ch, r)
+	w := New(s, cfg, ch, r, nil) // 既有测试不需要 MailRegistry；nil 让 sendCrashReport 静默跳过
 	return w, s, ch
 }
 
