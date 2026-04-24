@@ -2,6 +2,7 @@ package explorer
 
 import (
 	"context"
+	"sync"
 
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
@@ -13,6 +14,16 @@ import (
 	"agentgo/internal/tools"
 	"agentgo/internal/webtool"
 )
+
+// currentTaskHolder 线程安全地保存当前正在执行的任务 ID，实现 tools.TaskHolder。
+// 与 worker.currentTaskHolder 结构一致——send_message 通过它读 task.MailChainDepth。
+type currentTaskHolder struct {
+	mu sync.Mutex
+	id string
+}
+
+func (h *currentTaskHolder) Set(id string) { h.mu.Lock(); h.id = id; h.mu.Unlock() }
+func (h *currentTaskHolder) Get() string   { h.mu.Lock(); defer h.mu.Unlock(); return h.id }
 
 const systemPrompt = `你是一个调查代理（Explorer），专门执行只读的信息检索和验证任务。
 
@@ -98,18 +109,27 @@ func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.C
 	const agentID = "explorer-1"
 	fileCache := agent.NewFileStateCache(50)
 	workdir := &tools.DefaultWorkdir{ProjectRoot: cfg.ProjectRoot}
+	holder := &currentTaskHolder{}
 
 	var sp webtool.SearchProvider
 	if len(searchProvider) > 0 {
 		sp = searchProvider[0]
 	}
 
-	// 通过 ToolGroup 组合 Explorer 的只读 + 网络工具集
+	// 通过 ToolGroup 组合 Explorer 的只读 + 网络工具集。
+	// MetaGroup 注入 Store+Holder 让 send_message 能读当前 task.MailChainDepth；
+	// DisablePublishTask=true 保住 Explorer 的只读契约（不以 Store=nil 作为权限开关）。
 	toolReg := agent.NewToolRegistryWithAllowlist(allowedTools)
 	tools.RegisterGroups(toolReg,
 		tools.LocalReadGroup{Workdir: workdir, Cache: fileCache},
 		tools.WebGroup{Provider: sp},
-		tools.MetaGroup{MBRegistry: mbRegistry, AgentID: agentID}, // Store=nil → 不注册 publish_task
+		tools.MetaGroup{
+			Store:              s,
+			Holder:             holder,
+			MBRegistry:         mbRegistry,
+			AgentID:            agentID,
+			DisablePublishTask: true,
+		},
 	)
 
 	executor := agent.NewLLMExecutor(llmClient, toolReg, hookReg, storeView, recordToolCall, systemPrompt)
@@ -126,6 +146,8 @@ func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.C
 	a.CompactTokenThreshold = cfg.CompactTokenThreshold
 	a.CompactKeepRecent = cfg.CompactKeepRecent
 	a.TransferNoteMaxTokens = cfg.TransferNoteMaxTokens
+	a.OnTaskStart = func(taskID string) { holder.Set(taskID) }
+	a.OnTaskEnd = func(taskID string, success bool) { holder.Set("") }
 	a.FileCache = fileCache
 	if mbRegistry != nil {
 		a.Mailbox = mbRegistry.Register(agentID, cfg.ExplorerEventType)

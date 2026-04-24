@@ -46,19 +46,23 @@ type BatchTracker interface {
 //   - AgentID：当前代理 ID（send_message 的发件人）
 //   - BatchTracker：（可选，Phase 3）publish_task 成功后追加子任务 ID 到此 tracker；
 //     scheduler 注入时把 ID 写入 scheduler task.SchedulerBatch；worker 不注入则无副作用
+//   - DisablePublishTask：capability bit——true 时即便 Store 非空也不注册 publish_task。
+//     Explorer 用来在注入 Store/Holder（让 send_message 能读 MailChainDepth）的同时
+//     保住只读契约。替代了"用 Store=nil 当权限开关"的旧耦合写法。
 type MetaGroup struct {
-	Store        store.TaskStore
-	Holder       TaskHolder
-	MaxDepth     int
-	MBRegistry   *mailbox.Registry
-	AgentID      string
-	BatchTracker BatchTracker
+	Store              store.TaskStore
+	Holder             TaskHolder
+	MaxDepth           int
+	MBRegistry         *mailbox.Registry
+	AgentID            string
+	BatchTracker       BatchTracker
+	DisablePublishTask bool
 }
 
 // Register 把 publish_task / send_message 注册到 r。
 // 各自的依赖缺失时自动跳过对应工具。
 func (g MetaGroup) Register(r *agent.ToolRegistry) {
-	if g.Store != nil {
+	if g.Store != nil && !g.DisablePublishTask {
 		r.Register(
 			"publish_task",
 			"发布一个新任务到任务队列，由调度器或其他代理认领执行",
