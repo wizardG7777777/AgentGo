@@ -156,6 +156,7 @@ func NewLLMExecutor(
 				ToolCalled:       false,
 				PromptTokens:     resp.Usage.PromptTokens,
 				CompletionTokens: resp.Usage.CompletionTokens,
+				ExtraFields:      resp.ExtraFields,
 			}, nil
 		}
 
@@ -296,6 +297,7 @@ func NewLLMExecutor(
 			ToolResults:      toolResults,
 			PromptTokens:     resp.Usage.PromptTokens,
 			CompletionTokens: resp.Usage.CompletionTokens,
+			ExtraFields:      resp.ExtraFields,
 		}, nil
 	}
 }
@@ -332,9 +334,10 @@ func buildMessages(systemPrompt string, task *model.Task, depResults map[string]
 		}
 		if entry.ToolCalled && len(entry.ToolCalls) > 0 {
 			messages = append(messages, llm.Message{
-				Role:      "assistant",
-				Content:   entry.AssistantContent,
-				ToolCalls: entry.ToolCalls,
+				Role:        "assistant",
+				Content:     entry.AssistantContent,
+				ToolCalls:   entry.ToolCalls,
+				ExtraFields: entry.ExtraFields,
 			})
 			for _, tr := range entry.ToolResults {
 				messages = append(messages, llm.Message{
@@ -345,8 +348,9 @@ func buildMessages(systemPrompt string, task *model.Task, depResults map[string]
 			}
 		} else {
 			messages = append(messages, llm.Message{
-				Role:    "assistant",
-				Content: entry.Output,
+				Role:        "assistant",
+				Content:     entry.Output,
+				ExtraFields: entry.ExtraFields,
 			})
 		}
 	}

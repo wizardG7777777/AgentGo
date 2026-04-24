@@ -55,7 +55,13 @@ type Config struct {
 	LLMAPIKey               string `yaml:"llm_api_key" json:"llm_api_key"`
 	LLMModel                string `yaml:"llm_model" json:"llm_model"`
 	LLMTimeoutSec           int    `yaml:"llm_timeout_sec" json:"llm_timeout_sec"`
-	ExplorerModel           string `yaml:"explorer_model" json:"explorer_model"`
+	// LLMProvider 指定 LLM provider 适配器。空串 / 未知名称 → fallback OpenAIProvider（no-op，向后兼容）。
+	// 内置可选值："openai" / "deepseek-v4" / "deepseek-r1"。
+	// 详见 internal/llm/provider.go 的 Provider 接口与 provider_builtin.go 的内置实现。
+	LLMProvider string `yaml:"llm_provider" json:"llm_provider"`
+	// ExplorerProvider 为 explorer 代理单独指定 provider。空串则 fallback 到 LLMProvider。
+	ExplorerProvider  string `yaml:"explorer_provider" json:"explorer_provider"`
+	ExplorerModel     string `yaml:"explorer_model" json:"explorer_model"`
 	ExplorerEventType       string `yaml:"explorer_event_type" json:"explorer_event_type"`
 	ShellTimeoutSec         int    `yaml:"shell_timeout_sec" json:"shell_timeout_sec"`
 	CompactTokenThreshold   int    `yaml:"compact_token_threshold" json:"compact_token_threshold"`
@@ -281,6 +287,7 @@ func DefaultConfig() *Config {
 		AgentIdleThreshold:      0,
 		LLMModel:                "gpt-4o",
 		LLMTimeoutSec:           60,
+		LLMProvider:             "openai", // 默认走标准 OpenAI 协议；deepseek-v4-flash 等非标后端需显式指定
 		ExplorerModel:           "gpt-4o-mini",
 		ExplorerEventType:       "explore",
 		ShellTimeoutSec:         30,

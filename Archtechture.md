@@ -19,6 +19,7 @@
 - **崩溃汇报**：任务最终失败时 agent 自动调用 `sendCrashReport`，向 `task.EventSource` 发送 `priority=high` 邮件，附 expected vs actual artifacts、worker 最后响应原文。
 - **三层历史压缩**：Layer 1 `snipOldToolResults`（无 LLM 开销，逐轮清理旧工具输出）；Layer 2 `compressHistory`（超过 `CompactTokenThreshold` 时摘要）；Layer 3 context overflow 时 `keepRecent=1` 激进压缩 + RetryRollback。
 - **Trace 系统**：`internal/trace` 每任务一份 JSONL 文件，Session 活跃时落盘到 `.agentgo/sessions/sess-<id>/logs/`（bootstrap 在 `SessionManager.LogDir()` 非空时重定向），否则回退 `.agentgo/traces/`，保留最近 100 个任务。`agentgo trace list/show` 子命令读取 active-session 指针自动定向到同一目录。可通过 `AGENTGO_DUMP_PROMPTS=1` 环境变量额外启用 prompt dump。
+- **LLM Provider Adapter**（2026-04-25 落地）：`internal/llm` 的两层扩展机制，用于适配非严格 OpenAI 兼容的后端（DeepSeek V4 thinking 模式的 `reasoning_content` 往返、R1 的反向删除要求、Qwen/Kimi 自定义字段等）。层 1 通用透传通过 `llm.Message.ExtraFields` + openai-go v3 的 `JSON.ExtraFields` / `SetExtraFields` 自动保留响应里的未知字段，下一轮请求原样回写；层 2 `llm.Provider` 插件接口处理变换型差异（R1 剥离 reasoning_content、Qwen QwQ 解析 `<think>` 标签等）。配置项 `llm_provider` / `explorer_provider`（空串或未知名 fallback `openai`，即 no-op），内置 `openai` / `deepseek-v4` / `deepseek-r1`。新增模型家族 = 实现接口 + `RegisterProvider()` 一行。详见 §"LLM Provider Adapter"。
 
 **未启动 / 待设计**：
 - 多代理协同重建（4 项退化的针对性修复）
@@ -174,6 +175,82 @@ mailbox.MailNotifier.scan:
 ## 阶段 3+ 占位
 
 按需扩展（Chathistory / Board / Session / Skill），触发标准是"≥ 2 个具体痛点"。
+
+---
+
+# LLM Provider Adapter（2026-04-25 落地）
+
+## 背景
+
+`internal/llm/client.go` 用 openai-go v3 官方 SDK 作为 HTTP/认证/重试基座。openai-go 是 OpenAI 官方的**强类型** SDK——响应 struct 的字段 = OpenAI 当前 schema；第三方 provider 对 OpenAI 协议的**非兼容扩展**会被默默吞掉：
+
+- **DeepSeek V4 thinking 模式**：响应 `message` 里多一个 `reasoning_content` 字段，**并要求下一轮请求把它原样送回**，否则返回 400 `The "reasoning_content" in the thinking mode must be passed back`。openai-go 的 `ChatCompletionMessage` 没有这个字段 → 字段在接收时丢失；`ChatCompletionAssistantMessageParam` 也没有 → 回写时更不可能带上。结果第一轮成功，第二轮必崩（2026-04-24 日志）。
+- **DeepSeek R1 (deepseek-reasoner)**：要求**相反**——下一轮请求必须删除历史 assistant 消息里的 `reasoning_content`，否则同样 400。
+- **Qwen QwQ / Kimi / Claude 兼容网关**：各有各的自定义字段、`<think>` 标签、tool_use 格式差异。
+
+"每遇到一个模型加一个 if/else" 走不通。本架构用两层机制把这类差异收敛到可维护的边界上，**保留 openai-go 基座不变**。
+
+## 层 1：ExtraFields 通用透传（零预知）
+
+覆盖"保留即可"类扩展——不需要 AgentGo 理解任何字段语义。
+
+- `llm.Message` 与 `llm.Response` 新增 `ExtraFields map[string]json.RawMessage`。
+- 响应侧：`SDKClient.Chat` 遍历 openai-go 聚合好的 `choice.Message.JSON.ExtraFields`（openai-go v3 把所有未声明字段自动塞进这个 map），每个 `respjson.Field.Raw()` 的原始 JSON 字节抄进 `Response.ExtraFields`。
+- 请求侧：`convertMessage` 的 assistant 分支在构造完 `ChatCompletionAssistantMessageParam` 后，用 openai-go 的 `param.metadata.SetExtraFields(map[string]any)` 把 `Message.ExtraFields` 挂回去——openai-go 序列化时会与已声明字段合并输出。
+- Agent 侧：`ExecuteResult` 和 `HistoryEntry` 新增 `ExtraFields` 字段，`buildMessages` 重建对话时把它恢复到 `llm.Message`。通过 `json.Marshal(history)` 的持久化路径自动透传到 `task.LastHistory`。
+
+**覆盖范围**：DeepSeek V4 的 `reasoning_content`、provider 自定义元数据等所有"只要原样回传就行"的扩展。无需编写任何模型专属代码。
+
+## 层 2：Provider 插件（处理变换型/负向差异）
+
+层 1 对付不了"必须删除"或"要转换格式"的差异。层 2 给一个小接口：
+
+```go
+type Provider interface {
+    Name() string
+    PrepareMessages(history []Message) []Message           // 发请求前改造 history
+    RequestOptions() []option.RequestOption                // 追加 provider 特有的 RequestOption
+}
+```
+
+`providerRegistry` 按 name 查找。内置实现：
+
+| name | 行为 |
+|------|------|
+| `openai` | no-op；也是 `GetProvider("")` 和未知名的 fallback |
+| `deepseek-v4` | no-op（层 1 已覆盖其 reasoning_content 往返）；保留结构作为未来挂点（例如开关 `thinking:disabled`） |
+| `deepseek-r1` | `PrepareMessages` 遍历 history，对每条 assistant 消息从 `ExtraFields` 里剥离 `reasoning_content`，保留其它 extras |
+
+新增模型家族的步骤：
+
+1. 实现 `Provider` 接口（~30–50 行）
+2. 在 `init()` 里 `RegisterProvider(&XxxProvider{})`
+3. 补对应 provider 单测
+
+**`client.go` / `agent.go` 不需要任何修改**——这是"不是每遇到一个就补一块"的保障。
+
+## 配置
+
+```yaml
+llm_provider: deepseek-v4       # 默认 "openai"
+explorer_provider:              # 空则 fallback 到 llm_provider
+```
+
+`bootstrap.go` 把 `cfg.LLMProvider` 传给所有 `llm.NewSDKClient(...)` 调用点；explorer 独立使用 `cfg.ExplorerProvider`（空时回退到 `LLMProvider`）。
+
+## 为什么不直接丢弃 openai-go
+
+考虑过激进方案：改用 `net/http + encoding/json`，所有消息走 map。litellm / LangChain 走的就是这条路。但 openai-go 提供的重试、类型补全、参数校验、tool schema 组装仍然值得保留；层 1 + 层 2 已经把所有"典型非兼容扩展"类别处理掉，无须下这一刀。如果未来出现层 2 也无法优雅处理的 provider（例如完全不同的 tool 协议），再考虑把底层 HTTP 层接口化。
+
+## 关键文件
+
+- `internal/llm/client.go` —— Message/Response 结构 + SDKClient.provider + extras 抽取/回写
+- `internal/llm/provider.go` —— Provider 接口 + 注册表
+- `internal/llm/provider_builtin.go` —— OpenAI / DeepSeek V4 / DeepSeek R1 三个内置实现
+- `internal/llm/provider_test.go` + `internal/llm/client_test.go` —— 单元测试 + httptest 双轮对话集成测试（模拟 V4 / R1 严格契约，往返断言）
+- `internal/agent/agent.go` / `internal/agent/llm_executor.go` —— HistoryEntry.ExtraFields 透传
+- `internal/config/config.go` —— `LLMProvider` / `ExplorerProvider` 字段
+- `internal/bootstrap/bootstrap.go` —— 所有 `llm.NewSDKClient(...)` 调用点串联
 
 ---
 

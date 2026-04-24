@@ -31,6 +31,10 @@ type Message struct {
 	Name       string     // 工具名称，仅 role="tool" 时使用
 	ToolCallID string     // 对应的 tool_call ID，仅 role="tool" 时使用
 	ToolCalls  []ToolCall // LLM 返回的工具调用，仅 role="assistant" 时使用
+	// ExtraFields 保存响应里 openai-go 未识别的 assistant 消息字段（如 DeepSeek V4 的
+	// reasoning_content）。下一轮请求时会通过 SetExtraFields 原样回写，避免
+	// 被 openai-go 强类型 struct 默默吞掉。
+	ExtraFields map[string]json.RawMessage `json:"extra_fields,omitempty"`
 }
 
 // ToolDef 描述一个可供 LLM 调用的工具。
@@ -56,6 +60,9 @@ type Response struct {
 		PromptTokens     int
 		CompletionTokens int
 	}
+	// ExtraFields 是 assistant 消息里的非标字段（如 DeepSeek V4 的 reasoning_content）。
+	// 调用方应把这份 map 挂到随后追加进历史的 Message 上，确保下一轮请求能原样回传。
+	ExtraFields map[string]json.RawMessage
 }
 
 // Client 是 LLM 调用接口。
@@ -68,15 +75,18 @@ type SDKClient struct {
 	client       openai.Client
 	model        openai.ChatModel
 	systemPrompt string
+	provider     Provider
 }
 
 const defaultLLMTimeout = 120 * time.Second
 
 // NewSDKClient 创建基于 openai-go SDK 的客户端。
 // baseURL 为空时使用 OpenAI 官方端点。
+// providerName 指定 LLM provider 适配器（"openai"/"deepseek-v4"/"deepseek-r1"），
+// 空串或未知名称时 fallback 到 OpenAIProvider（no-op，与旧版行为一致）。
 // HTTP 层重试由 SDK 内部处理（429/5xx），此处不再额外设置 MaxRetries，
 // 避免与调用方的业务重试语义重叠。
-func NewSDKClient(baseURL, apiKey, model, systemPrompt string, timeout time.Duration) *SDKClient {
+func NewSDKClient(baseURL, apiKey, model, systemPrompt, providerName string, timeout time.Duration) *SDKClient {
 	if timeout <= 0 {
 		timeout = defaultLLMTimeout
 		log.Printf("[llm] 未指定超时，使用默认值 %v", timeout)
@@ -100,10 +110,16 @@ func NewSDKClient(baseURL, apiKey, model, systemPrompt string, timeout time.Dura
 		client:       client,
 		model:        openai.ChatModel(model),
 		systemPrompt: systemPrompt,
+		provider:     GetProvider(providerName),
 	}
 }
 
 func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDef) (Response, error) {
+	// Provider 有机会在发请求前改造 history（例如 DeepSeek R1 剥离老轮次的 reasoning_content）。
+	if c.provider != nil {
+		messages = c.provider.PrepareMessages(messages)
+	}
+
 	params := openai.ChatCompletionNewParams{
 		Model: c.model,
 	}
@@ -135,8 +151,14 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 		})
 	}
 
+	// Provider 可追加请求 RequestOption（例如 WithJSONSet 注入 body 字段）
+	var providerOpts []option.RequestOption
+	if c.provider != nil {
+		providerOpts = c.provider.RequestOptions()
+	}
+
 	// 调用 SDK — HTTP 层错误（429/5xx）由 SDK 内部重试处理
-	completion, err := c.client.Chat.Completions.New(ctx, params)
+	completion, err := c.client.Chat.Completions.New(ctx, params, providerOpts...)
 	if err != nil {
 		return Response{}, classifySDKError(err)
 	}
@@ -194,6 +216,19 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 	result.Usage.PromptTokens = int(completion.Usage.PromptTokens)
 	result.Usage.CompletionTokens = int(completion.Usage.CompletionTokens)
 
+	// 层 1：把响应里 openai-go 未识别的字段原样抽到 ExtraFields。
+	// DeepSeek V4 的 reasoning_content、其他 provider 的自定义元数据都走这条路。
+	if len(choice.Message.JSON.ExtraFields) > 0 {
+		result.ExtraFields = make(map[string]json.RawMessage, len(choice.Message.JSON.ExtraFields))
+		for k, f := range choice.Message.JSON.ExtraFields {
+			raw := f.Raw()
+			if raw == "" {
+				continue
+			}
+			result.ExtraFields[k] = json.RawMessage(raw)
+		}
+	}
+
 	return result, nil
 }
 
@@ -206,6 +241,11 @@ func convertMessage(m Message) (openai.ChatCompletionMessageParamUnion, error) {
 	case "user":
 		return openai.UserMessage(m.Content), nil
 	case "assistant":
+		// 统一构造 AssistantMessageParam：无论有无 tool calls 或 ExtraFields，
+		// 走同一路径以便在尾部挂 SetExtraFields（层 1 通用透传）。
+		assistantParam := openai.ChatCompletionAssistantMessageParam{
+			Content: openai.ChatCompletionAssistantMessageParamContentUnion{OfString: openai.String(m.Content)},
+		}
 		if len(m.ToolCalls) > 0 {
 			var sdkCalls []openai.ChatCompletionMessageToolCallUnionParam
 			for _, tc := range m.ToolCalls {
@@ -226,14 +266,17 @@ func convertMessage(m Message) (openai.ChatCompletionMessageParamUnion, error) {
 					},
 				})
 			}
-			return openai.ChatCompletionMessageParamUnion{
-				OfAssistant: &openai.ChatCompletionAssistantMessageParam{
-					Content:   openai.ChatCompletionAssistantMessageParamContentUnion{OfString: openai.String(m.Content)},
-					ToolCalls: sdkCalls,
-				},
-			}, nil
+			assistantParam.ToolCalls = sdkCalls
 		}
-		return openai.AssistantMessage(m.Content), nil
+		if len(m.ExtraFields) > 0 {
+			extras := make(map[string]any, len(m.ExtraFields))
+			for k, v := range m.ExtraFields {
+				// json.RawMessage 实现了 json.Marshaler，openai-go 会原样写出
+				extras[k] = v
+			}
+			assistantParam.SetExtraFields(extras)
+		}
+		return openai.ChatCompletionMessageParamUnion{OfAssistant: &assistantParam}, nil
 	case "tool":
 		return openai.ToolMessage(m.Content, m.ToolCallID), nil
 	default:

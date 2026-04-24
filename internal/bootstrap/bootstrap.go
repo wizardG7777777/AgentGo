@@ -270,14 +270,21 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	var agentRosterView hook.AgentRosterView = r
 
 	// Step 4: 创建 LLM 客户端
+	// ExplorerProvider 为空时 fallback 到主 LLMProvider
+	explorerProviderName := cfg.ExplorerProvider
+	if explorerProviderName == "" {
+		explorerProviderName = cfg.LLMProvider
+	}
 	schedulerLLM := llm.NewSDKClient(
 		cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel,
 		"", // system prompt 由 scheduler 内部管理
+		cfg.LLMProvider,
 		time.Duration(cfg.LLMTimeoutSec)*time.Second,
 	)
 	explorerLLM := llm.NewSDKClient(
 		cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.ExplorerModel,
 		"", // system prompt 由 explorer 内部管理
+		explorerProviderName,
 		time.Duration(cfg.LLMTimeoutSec)*time.Second,
 	)
 
@@ -394,6 +401,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 			workerLLM := llm.NewSDKClient(
 				cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel,
 				"", // system prompt 由 worker 内部管理
+				cfg.LLMProvider,
 				time.Duration(cfg.LLMTimeoutSec)*time.Second,
 			)
 			wk := worker.NewWithID(decl.ID, taskStore, r, workerLLM, cfg, cancelRegistry, mbRegistry, approvalCh, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView, allowedTools)
@@ -414,6 +422,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 			workerLLM := llm.NewSDKClient(
 				cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel,
 				"", // system prompt 由 worker 内部管理
+				cfg.LLMProvider,
 				time.Duration(cfg.LLMTimeoutSec)*time.Second,
 			)
 			wk := worker.NewWithID(fmt.Sprintf("worker-%d", i), taskStore, r, workerLLM, cfg, cancelRegistry, mbRegistry, approvalCh, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView, workerAllowed)

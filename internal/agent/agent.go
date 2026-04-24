@@ -43,17 +43,22 @@ type ExecuteResult struct {
 	ToolResults      []ToolResult   // 每个 tool call 对应的执行结果
 	PromptTokens     int            // 本次 LLM 调用消耗的 prompt tokens
 	CompletionTokens int            // 本次 LLM 调用消耗的 completion tokens
+	// ExtraFields 是 assistant 消息里 openai-go 未识别的字段（如 DeepSeek V4 的
+	// reasoning_content）。由 LLM 客户端透传上来，agent 应把它挂到 HistoryEntry
+	// 上，buildMessages 下一轮重建 assistant 消息时原样回写给 API。
+	ExtraFields map[string]json.RawMessage
 }
 
 // HistoryEntry 记录 ReAct 循环中单轮 TaskExecutor 调用的结果。
 // 包含完整的 tool calling 信息，确保历史消息能正确重建为 OpenAI 协议格式。
 type HistoryEntry struct {
-	Output           string         `json:"output"`
-	ToolCalled       bool           `json:"tool_called"`
-	AssistantContent string         `json:"assistant_content"`
-	ToolCalls        []llm.ToolCall `json:"tool_calls"`
-	ToolResults      []ToolResult   `json:"tool_results"`
-	IncomingMail     string         `json:"incoming_mail,omitempty"` // 非空时为收到的代理间邮件，注入为 user 角色消息
+	Output           string                     `json:"output"`
+	ToolCalled       bool                       `json:"tool_called"`
+	AssistantContent string                     `json:"assistant_content"`
+	ToolCalls        []llm.ToolCall             `json:"tool_calls"`
+	ToolResults      []ToolResult               `json:"tool_results"`
+	ExtraFields      map[string]json.RawMessage `json:"extra_fields,omitempty"` // 层 1 通用透传：assistant 消息的非标字段
+	IncomingMail     string                     `json:"incoming_mail,omitempty"` // 非空时为收到的代理间邮件，注入为 user 角色消息
 }
 
 // TaskExecutor is a pluggable function that executes a task.
@@ -398,6 +403,15 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	for i := 0; i < a.MaxLoops; i++ {
 		select {
 		case <-ctx.Done():
+			// 2026-04-25 P1 #2：取消类终态 trace 事件。由外部（watchdog /
+			// cancel_task / 用户 /cancel / agent 关停）触发的 ctx 取消。
+			trace.Emit(trace.Event{
+				Kind:    trace.KindTaskCancelled,
+				TaskID:  taskID,
+				AgentID: a.ID,
+				Loop:    i,
+				Reason:  ctx.Err().Error(),
+			})
 			return
 		default:
 		}
@@ -559,6 +573,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			AssistantContent: result.AssistantContent,
 			ToolCalls:        result.ToolCalls,
 			ToolResults:      result.ToolResults,
+			ExtraFields:      result.ExtraFields, // 层 1：透传 reasoning_content 等非标字段
 		})
 
 		// 进度通知：在 history append 之后、PhaseLoopPost 之前发送
@@ -601,7 +616,14 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// L1 会追加 <transfer-request> 指令做最后一次 LLM 压缩；失败则 L3 机械兑底。
 	// 注意：此处 history 已经是最后状态（包含所有 loop 的结果），
 	// buildTransferNote 内部对 history 只读，不修改原切片。
-	note := a.buildTransferNote(ctx, task, depResults, history, a.transferNoteMaxTokens())
+	//
+	// 关键：processTask 循环里用的是 `execCtx := WithAgentContext(...)`（新变量），
+	// 入参 ctx 本身从未被注入。直接传 ctx 进 buildTransferNote 会导致 L1 那次
+	// LLM 调用在 trace / log 里缺 agent_id / loop 字段（2026-04-25 P1 #1）。
+	// 此处显式补一次注入，loop=-1 标记"非 ReactLoop 的终止路径调用"，
+	// 便于 trace 工具区分主循环事件与交接备忘事件。
+	tnCtx := WithAgentContext(ctx, a.ID, taskID, -1)
+	note := a.buildTransferNote(tnCtx, task, depResults, history, a.transferNoteMaxTokens())
 	if note != "" {
 		_ = a.Store.SetTransferNote(taskID, note)
 	}
@@ -619,6 +641,16 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		} else {
 			log.Printf("[agent %s] RetryRollback (max loops) error: %v", a.ID, err)
 		}
+	} else {
+		// 2026-04-25 P1 #2：重试 trace 事件。AttemptNo 记新一轮的序号
+		// （task.RetryCount 在 RetryRollback 内部递增，读当前值即是下一次尝试号）。
+		trace.Emit(trace.Event{
+			Kind:      trace.KindTaskRetry,
+			TaskID:    taskID,
+			AgentID:   a.ID,
+			Reason:    "max_loops: " + reason,
+			AttemptNo: task.RetryCount,
+		})
 	}
 }
 
@@ -637,7 +669,12 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 		// 如果 LLM 服务本身不可用或返回异常，L3 机械兑底接管。
 		// 注意：buildTransferNote 内部对 history 只读，不修改原切片。
 		// 使用 context.Background() 避免本次 execErr 所在 ctx 已被取消的情况。
-		note := a.buildTransferNote(context.Background(), task, nil, history, a.transferNoteMaxTokens())
+		//
+		// 但 Background() 没有任何元数据——需要手动注入 agent/task 标记，
+		// 否则 L1 那次 LLM 调用在 trace/log 里缺 agent_id/loop（2026-04-25 P1 #1）。
+		// loop=-1 标记"非 ReactLoop 的终止路径调用"。
+		tnCtx := WithAgentContext(context.Background(), a.ID, taskID, -1)
+		note := a.buildTransferNote(tnCtx, task, nil, history, a.transferNoteMaxTokens())
 		if note != "" {
 			_ = a.Store.SetTransferNote(taskID, note)
 		}
@@ -663,6 +700,15 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 			} else {
 				log.Printf("[agent %s] RetryRollback error: %v", a.ID, err)
 			}
+		} else {
+			// 2026-04-25 P1 #2：重试 trace 事件（可恢复错误路径）。
+			trace.Emit(trace.Event{
+				Kind:      trace.KindTaskRetry,
+				TaskID:    taskID,
+				AgentID:   a.ID,
+				Reason:    "recoverable_error: " + execErr.Error(),
+				AttemptNo: task.RetryCount,
+			})
 		}
 	} else {
 		// 不可恢复错误：先记 TransferNote（走纯机械 L3，不调 LLM——execErr 很可能是
@@ -688,6 +734,14 @@ func (a *Agent) terminateTask(task *model.Task, taskID string, reason string) {
 	if err := a.Store.FailTask(a.ID, taskID, reason); err != nil {
 		log.Printf("[agent %s] FailTask error: %v", a.ID, err)
 	}
+	// 2026-04-25 P1 #2：失败终态 trace 事件。在此前 trace 只记 task_submitted /
+	// task_completed 两种成功终态，非成功路径对 trace reader 完全不可见。
+	trace.Emit(trace.Event{
+		Kind:    trace.KindTaskFailed,
+		TaskID:  taskID,
+		AgentID: a.ID,
+		Reason:  reason,
+	})
 	a.sendCrashReport(task, taskID, reason)
 }
 
@@ -703,7 +757,7 @@ func (a *Agent) terminateTask(task *model.Task, taskID string, reason string) {
 // 重新读取一次 task 是因为 reason 路径里 task 指针可能已陈旧，
 // 没拿到 RecordLastResponse / AppendArtifact 的最新写入。
 func (a *Agent) sendCrashReport(task *model.Task, taskID string, reason string) {
-	if a.MailRegistry == nil || task == nil || task.EventSource == "" {
+	if a.MailRegistry == nil || task == nil || task.EventSource == "" || task.EventSource == "user" {
 		return
 	}
 	// 重读 task 以拿到最新的 Artifacts / LastResponse

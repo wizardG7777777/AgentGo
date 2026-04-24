@@ -38,6 +38,12 @@ const (
 	KindTaskSubmitted EventKind = "task_submitted"
 	KindTaskCompleted EventKind = "task_completed"
 
+	// 非成功终态。2026-04-25 P1 #2 引入——此前 trace 没有 retry/failed/cancelled
+	// 事件类型，排障时看到 trace 突然中断但不知道原因；新 EventKind 补齐账本。
+	KindTaskRetry     EventKind = "task_retry"     // RetryRollback 触发（MaxLoops 耗尽或 ErrRecoverable）
+	KindTaskFailed    EventKind = "task_failed"    // terminateTask 终止（重试耗尽或不可恢复错误）
+	KindTaskCancelled EventKind = "task_cancelled" // 外部 cancel（cancel_task 工具、watchdog、用户 /cancel）
+
 	// LLM 调用
 	KindLLMCallStart EventKind = "llm_call_start"
 	KindLLMCallEnd   EventKind = "llm_call_end"
@@ -74,6 +80,8 @@ type Event struct {
 	Loop       int    `json:"loop,omitempty"`
 	Error      string `json:"error,omitempty"`
 	NotifyType string `json:"notify_type,omitempty"` // 进度通知类型：file_write / subtask / halfway
+	Reason     string `json:"reason,omitempty"`      // 非成功终态事件（task_retry/failed/cancelled）的解释
+	AttemptNo  int    `json:"attempt_no,omitempty"`  // task_retry 的第 N 次重试（1-based）；其它事件不填
 
 	// --- 任务生命周期字段（task_published / task_claimed / task_submitted / task_completed） ---
 	Description  string   `json:"description,omitempty"`
