@@ -804,3 +804,554 @@ func FormatForToolMessage(highlighted []string) string
 | §8 | 跨子系统装配护栏 | P2 | 无 | 📝 规划中（2026-04-19） |
 | §9 | Bootstrap LLM 连通性检查 | P2 | 无 | 📝 规划中（2026-04-20，方案待讨论） |
 | §10 | 检索工具主动反馈（Did-You-Mean） | P2 | 无 | 📝 设计定稿（2026-04-24），底座选定 `sahilm/fuzzy`，待实施 |
+
+---
+
+## 11. 统一 Agent 声明式配置（v4 配置格式重写）
+
+> 状态：📝 设计定稿（2026-04-24）
+> 优先级：P1
+> 触发来源：v3/v4 早期配置字段扁平分散、全局共享，无法支持 per-agent 差异化行为参数
+> 约束：**不向后兼容**——v4 配置格式为全新 schema，不保留旧字段 fallback
+
+### 11.1 背景
+
+当前 `setting.yaml` 的配置结构是**扁平全局式**的：
+
+```yaml
+# v3 现状（问题示意）
+agent_max_loops: 10                    # ← 所有 Agent 共享
+compact_token_threshold: 4000          # ← 所有 Agent 共享
+worker_count: 3                        # ← 仅 Worker 有数量概念
+worker_profile: "standard"             # ← 仅 Worker 有 Profile
+explorer_profile: "explorer_default"   # ← Explorer 单独字段
+```
+
+这导致三个结构性问题：
+
+1. **行为参数全局共享**：Scheduler 需要更多轮次做任务拆解（`max_loops: 15`），Explorer 只需要调查（`max_loops: 5`），但当前只能共用同一个 `agent_max_loops`。
+2. **提示词硬编码**：`systemPrompt` 是各 package 的 `const`，无法针对不同场景微调（如"严格代码审查者" vs "激进开发者"）。
+3. **上下文管理缺失**：没有 `context_limit` 概念，Agent 历史长度无上限，长任务会溢出模型上下文窗口导致 400/413 错误。
+
+### 11.2 设计原则
+
+1. **Agent 类型即一级公民**：Scheduler、Explorer、Worker 在配置中用统一的 schema 描述行为与部署。
+2. **模板复用 + 实例覆盖**：公共行为参数抽成 `agent_templates`，实例通过 `template` 引用 + `params_override` 局部覆盖。
+3. **上下文上限内建**：`context_limit` 不是可选装饰，而是核心运行时参数，配套 token 估算与截断策略。
+4. **不向后兼容**：v4 配置格式为全新文件，旧字段全部移除。升级时人工迁移一次即可，避免代码中充斥 fallback 逻辑。
+
+### 11.3 v4 YAML 配置格式（完整示例）
+
+```yaml
+# ============================================================
+# v4 setting.yaml — 统一 Agent 声明式配置
+# ============================================================
+
+# --- 基础设施层（全局共享，可被 per-agent 覆盖）---
+llm:
+  base_url: https://api.deepseek.com
+  api_key: ${DEEPSEEK_API_KEY}
+  default_model: deepseek-v4-flash
+  default_provider: deepseek-v4
+  default_temperature: 0.2
+  timeout_sec: 120
+
+# --- 工具集定义（命名白名单）---
+tool_profiles:
+  standard:
+    - read_file
+    - list_dir
+    - grep_search
+    - glob_search
+    - write_file
+    - edit_file
+    - run_shell
+    - web_search
+    - web_fetch
+    - publish_task
+    - send_message
+
+  readonly:
+    - read_file
+    - list_dir
+    - grep_search
+    - glob_search
+    - send_message
+
+  explorer_default:
+    - read_file
+    - list_dir
+    - grep_search
+    - glob_search
+    - web_search
+    - web_fetch
+    - send_message
+
+# --- Agent 行为模板（复用层）---
+# 模板只定义行为参数，不绑定工具集。多个 Agent 可引用同一模板。
+agent_templates:
+  scheduler_default:
+    max_loops: 15
+    compact_token_threshold: 6000
+    compact_keep_recent: 3
+    context_limit: 24000
+    temperature: 0.1
+    system_prompt: |
+      你是任务调度器，负责分析用户需求、拆解为可执行的子任务，
+      并分配给合适的执行代理。你拥有全局视角，可以查看所有代理的状态和工具集。
+
+  explorer_default:
+    max_loops: 5
+    compact_token_threshold: 3000
+    compact_keep_recent: 2
+    context_limit: 8000
+    temperature: 0.0
+    system_prompt: |
+      你是代码调查员，只能读取文件和搜索代码，绝对不能修改任何文件。
+      你的任务是通过阅读代码理解项目结构、定位相关逻辑、总结发现。
+
+  worker_standard:
+    max_loops: 10
+    compact_token_threshold: 4000
+    compact_keep_recent: 3
+    context_limit: 16000
+    temperature: 0.2
+    system_prompt: |
+      你是全能开发者，可以读写文件、执行 Shell、搜索网络、与其他代理协作。
+      遵循用户的编码规范，修改前充分理解上下文。
+
+  worker_readonly:
+    max_loops: 5
+    compact_token_threshold: 2000
+    compact_keep_recent: 2
+    context_limit: 8000
+    temperature: 0.0
+    system_prompt: |
+      你是只读调查员，只能查看代码和搜索结果，无权修改文件或执行命令。
+      你的输出应当是结构化的调查报告。
+
+# --- Agent 实例声明（核心）---
+# 每个 Agent 类型在此处声明其实例数量、引用模板、工具集，以及可选覆盖
+agents:
+  scheduler:
+    count: 1                    # Scheduler 必须为 1，Bootstrap 校验
+    template: scheduler_default
+    profile: standard           # Scheduler 也需要工具集（publish_task 等）
+    # Scheduler 通常不需要覆盖，但保留 params_override 能力
+
+  explorer:
+    count: 1                    # Explorer 当前限制为 1
+    template: explorer_default
+    profile: explorer_default
+
+  workers:
+    # Worker 支持两种声明模式（互斥）：
+    # 模式 A：同质批量（简单场景）
+    #   count: 3
+    #   template: worker_standard
+    #   profile: standard
+    # 模式 B：异质列表（精细化场景，优先）
+    instances:
+      - id: worker-1
+        template: worker_standard
+        profile: standard
+      - id: worker-2
+        template: worker_standard
+        profile: standard
+      - id: worker-3
+        template: worker_readonly
+        profile: readonly
+        params_override:
+          max_loops: 3
+          system_prompt: |
+            你是只读调查员，绝对不能修改文件。
+            当前任务涉及敏感数据库代码，请格外谨慎。
+
+# --- 运行时基础设施（非 Agent）---
+infra:
+  watchdog:
+    interval_sec: 30
+
+  mail_notifier:
+    enabled: true
+    interval_sec: 60
+
+  store:
+    event_channel_buffer: 256
+    fifo_limit: 100
+    default_concurrency: 3
+
+  roster:
+    wait_timeout_sec: 300
+
+# --- 杂项 ---
+project_root: "."
+max_subtask_depth: 3
+shell_timeout_sec: 60
+shell_blacklist: []
+shell_greylist: []
+search_api_provider: serper
+search_api_url: https://google.serper.dev/search
+search_api_key: ${SERPER_API_KEY}
+```
+
+### 11.4 Go 配置结构体
+
+```go
+package config
+
+// ============================================================
+// v4 Config — 全新结构，不兼容 v3
+// ============================================================
+
+type Config struct {
+    // --- LLM 基础设施（全局默认值）---
+    LLM LLMConfig `yaml:"llm" json:"llm"`
+
+    // --- 工具集定义 ---
+    ToolProfiles map[string][]string `yaml:"tool_profiles" json:"tool_profiles"`
+
+    // --- 行为模板（复用层）---
+    AgentTemplates map[string]AgentTemplate `yaml:"agent_templates" json:"agent_templates"`
+
+    // --- Agent 实例声明 ---
+    Agents AgentDeclarations `yaml:"agents" json:"agents"`
+
+    // --- 运行时基础设施 ---
+    Infra InfraConfig `yaml:"infra" json:"infra"`
+
+    // --- 杂项 ---
+    ProjectRoot       string `yaml:"project_root" json:"project_root"`
+    MaxSubtaskDepth   int    `yaml:"max_subtask_depth" json:"max_subtask_depth"`
+    ShellTimeoutSec   int    `yaml:"shell_timeout_sec" json:"shell_timeout_sec"`
+    ShellBlacklist    []string `yaml:"shell_blacklist" json:"shell_blacklist"`
+    ShellGreylist     []string `yaml:"shell_greylist" json:"shell_greylist"`
+    SearchAPIProvider string `yaml:"search_api_provider" json:"search_api_provider"`
+    SearchAPIURL      string `yaml:"search_api_url" json:"search_api_url"`
+    SearchAPIKey      string `yaml:"search_api_key" json:"search_api_key"`
+}
+
+// LLMConfig 全局 LLM 默认值
+ type LLMConfig struct {
+    BaseURL            string  `yaml:"base_url" json:"base_url"`
+    APIKey             string  `yaml:"api_key" json:"api_key"`
+    DefaultModel       string  `yaml:"default_model" json:"default_model"`
+    DefaultProvider    string  `yaml:"default_provider" json:"default_provider"`
+    DefaultTemperature float64 `yaml:"default_temperature" json:"default_temperature"`
+    TimeoutSec         int     `yaml:"timeout_sec" json:"timeout_sec"`
+}
+
+// AgentTemplate 行为参数模板（无 ID、无 Profile，纯行为）
+ type AgentTemplate struct {
+    MaxLoops              int     `yaml:"max_loops" json:"max_loops"`
+    CompactTokenThreshold int     `yaml:"compact_token_threshold" json:"compact_token_threshold"`
+    CompactKeepRecent     int     `yaml:"compact_keep_recent" json:"compact_keep_recent"`
+    ContextLimit          int     `yaml:"context_limit" json:"context_limit"`
+    Temperature           float64 `yaml:"temperature" json:"temperature"`
+    SystemPrompt          string  `yaml:"system_prompt" json:"system_prompt"`
+}
+
+// AgentDeclarations 各类型 Agent 的部署声明
+ type AgentDeclarations struct {
+    Scheduler SchedulerDecl `yaml:"scheduler" json:"scheduler"`
+    Explorer  ExplorerDecl  `yaml:"explorer" json:"explorer"`
+    Workers   WorkerDecl    `yaml:"workers" json:"workers"`
+}
+
+// SchedulerDecl Scheduler 只有一个实例
+ type SchedulerDecl struct {
+    Count          int            `yaml:"count" json:"count"`
+    Template       string         `yaml:"template" json:"template"`
+    Profile        string         `yaml:"profile" json:"profile"`
+    ParamsOverride AgentTemplate  `yaml:"params_override,omitempty" json:"params_override,omitempty"`
+    LLMOverride    *LLMOverride   `yaml:"llm_override,omitempty" json:"llm_override,omitempty"`
+}
+
+// ExplorerDecl Explorer 只有一个实例
+ type ExplorerDecl struct {
+    Count          int            `yaml:"count" json:"count"`
+    Template       string         `yaml:"template" json:"template"`
+    Profile        string         `yaml:"profile" json:"profile"`
+    ParamsOverride AgentTemplate  `yaml:"params_override,omitempty" json:"params_override,omitempty"`
+    LLMOverride    *LLMOverride   `yaml:"llm_override,omitempty" json:"llm_override,omitempty"`
+}
+
+// WorkerDecl Worker 支持同质批量或异质列表
+ type WorkerDecl struct {
+    // 模式 A：同质批量（instances 为空时使用）
+    Count    int    `yaml:"count,omitempty" json:"count,omitempty"`
+    Template string `yaml:"template,omitempty" json:"template,omitempty"`
+    Profile  string `yaml:"profile,omitempty" json:"profile,omitempty"`
+
+    // 模式 B：异质列表（优先）
+    Instances []WorkerInstance `yaml:"instances,omitempty" json:"instances,omitempty"`
+}
+
+// WorkerInstance 单个 Worker 实例声明
+ type WorkerInstance struct {
+    ID             string         `yaml:"id" json:"id"`
+    Template       string         `yaml:"template" json:"template"`
+    Profile        string         `yaml:"profile" json:"profile"`
+    ParamsOverride AgentTemplate  `yaml:"params_override,omitempty" json:"params_override,omitempty"`
+    LLMOverride    *LLMOverride   `yaml:"llm_override,omitempty" json:"llm_override,omitempty"`
+}
+
+// LLMOverride per-agent LLM 参数覆盖
+ type LLMOverride struct {
+    Model       *string  `yaml:"model,omitempty" json:"model,omitempty"`
+    Provider    *string  `yaml:"provider,omitempty" json:"provider,omitempty"`
+    Temperature *float64 `yaml:"temperature,omitempty" json:"temperature,omitempty"`
+}
+
+// InfraConfig 非 Agent 运行时基础设施
+ type InfraConfig struct {
+    Watchdog struct {
+        IntervalSec int `yaml:"interval_sec" json:"interval_sec"`
+    } `yaml:"watchdog" json:"watchdog"`
+
+    MailNotifier struct {
+        Enabled     bool `yaml:"enabled" json:"enabled"`
+        IntervalSec int  `yaml:"interval_sec" json:"interval_sec"`
+    } `yaml:"mail_notifier" json:"mail_notifier"`
+
+    Store struct {
+        EventChannelBuffer int `yaml:"event_channel_buffer" json:"event_channel_buffer"`
+        FIFOLimit          int `yaml:"fifo_limit" json:"fifo_limit"`
+        DefaultConcurrency int `yaml:"default_concurrency" json:"default_concurrency"`
+    } `yaml:"store" json:"store"`
+
+    Roster struct {
+        WaitTimeoutSec int `yaml:"wait_timeout_sec" json:"wait_timeout_sec"`
+    } `yaml:"roster" json:"roster"`
+}
+```
+
+### 11.5 字段语义与默认值
+
+#### 11.5.1 配置解析流程（Bootstrap）
+
+```
+1. 加载 YAML → Config 结构体
+2. 校验阶段：
+   - agent_templates 中引用的模板名必须存在
+   - tool_profiles 中引用的 profile 名必须存在
+   - tool_profiles 中的工具名必须在系统注册的全集内
+   - scheduler.count == 1，explorer.count == 1（超限报错）
+3. 实例化阶段：
+   - 对每个 Agent 实例，按以下优先级合并参数：
+     a) AgentTemplate（基础层）
+     b) ParamsOverride（覆盖层）
+     c) LLMConfig 全局默认值（LLM 参数未覆盖时）
+   - 生成最终的 AgentRuntimeConfig 注入到构造函数
+```
+
+#### 11.5.2 默认约定
+
+| 字段 | 无 Template 时 | 无 ParamsOverride 时 |
+|------|---------------|---------------------|
+| `max_loops` | 10 | 继承 Template |
+| `compact_token_threshold` | 4000 | 继承 Template |
+| `compact_keep_recent` | 3 | 继承 Template |
+| `context_limit` | **16000** | 继承 Template |
+| `temperature` | 0.2 | 继承 Template |
+| `system_prompt` | 使用内置 package 默认值 | 继承 Template |
+
+**特殊规则**：`system_prompt` 如果全部为空（无 Template、无 Override、无内置），Bootstrap 阶段报错——Agent 不能没有系统提示。
+
+#### 11.5.3 Worker 两种声明模式的互斥规则
+
+```go
+func (d WorkerDecl) ResolveInstances() ([]WorkerInstance, error) {
+    if len(d.Instances) > 0 {
+        // 模式 B 优先：按 instances 列表启动
+        return d.Instances, nil
+    }
+    if d.Count > 0 {
+        // 模式 A：按 count 生成同质实例
+        instances := make([]WorkerInstance, d.Count)
+        for i := range d.Count {
+            instances[i] = WorkerInstance{
+                ID:       fmt.Sprintf("worker-%d", i+1),
+                Template: d.Template,
+                Profile:  d.Profile,
+            }
+        }
+        return instances, nil
+    }
+    return nil, fmt.Errorf("workers 必须配置 count 或 instances")
+}
+```
+
+### 11.6 Agent 启动与配置解析流程
+
+```go
+// Bootstrap 中的新流程（伪代码）
+
+// 1. 构建 Agent 运行时配置工厂
+factory := NewAgentConfigFactory(cfg)
+
+// 2. Scheduler（单例）
+schedCfg := factory.BuildSchedulerConfig()
+sched := scheduler.New(..., schedCfg)
+
+// 3. Explorer（单例）
+expCfg := factory.BuildExplorerConfig()
+exp := explorer.New(..., expCfg)
+
+// 4. Workers（多例）
+workerInstances := cfg.Agents.Workers.ResolveInstances()
+for _, inst := range workerInstances {
+    wkCfg := factory.BuildWorkerConfig(inst)
+    wk := worker.NewWithID(inst.ID, ..., wkCfg)
+}
+```
+
+**关键改动**：`worker.NewWithID`、`explorer.New`、`scheduler.New` 的签名不再接收零散的 `int` / `string` 参数，而是接收一个**聚合的配置对象**（`AgentRuntimeConfig`），减少构造函数参数爆炸。
+
+```go
+// AgentRuntimeConfig 运行时聚合配置（内部使用，不出现在 YAML 中）
+type AgentRuntimeConfig struct {
+    ID                    string
+    EventType             string
+    MaxLoops              int
+    CompactTokenThreshold int
+    CompactKeepRecent     int
+    ContextLimit          int
+    Temperature           float64
+    SystemPrompt          string
+    AllowedTools          []string        // 从 Profile 解析
+    LLM                   LLMClientConfig // 合并后的 LLM 参数
+}
+```
+
+### 11.7 Context Limit 与 Token 估算策略
+
+`context_limit` 是 v4 配置格式的核心新增能力，但它不是简单配置项，需要配套运行时策略。
+
+#### 11.7.1 双层阈值机制
+
+```
+历史消息 Token 估算值
+       │
+       ▼
+  ┌────────────┐  context_limit（硬上限，默认 16000）
+  │  强制截断   │  ← 超过时从最老消息开始丢弃（保留 system + 最近 N 条）
+  └────────────┘
+       │
+  ┌────────────┐  compact_token_threshold（压缩阈值，默认 4000）
+  │  触发 Summary │  ← 超过时对老历史做 LLM 压缩，生成 condensed summary
+  └────────────┘
+       │
+       └─ 正常区间，不做任何处理
+```
+
+#### 11.7.2 Token 估算方案
+
+当前 AgentGo 没有 tokenizer。提供三种可选策略，按精度/成本排序：
+
+**策略 A：字符数粗略估算（MVP 推荐）**
+```go
+func EstimateTokens(messages []Message) int {
+    total := 0
+    for _, m := range messages {
+        // 内容字符数 / 4 ≈ token 数（英文近似）
+        total += len(m.Content) / 4
+        // 每条消息开销（role、格式等）
+        total += 50
+        // ExtraFields（如 reasoning_content）也计入
+        for _, v := range m.ExtraFields {
+            total += len(v) / 4
+        }
+    }
+    // System prompt 开销
+    total += 100
+    return total
+}
+```
+- **优点**：零依赖、零外部调用、CPU 开销可忽略
+- **缺点**：中文场景低估（中文 1 字 ≈ 1~2 token），代码场景波动大
+- **缓解**：对中文/代码混合场景，可把除数从 4 调为 3，或引入语言检测
+
+**策略 B：引入 tiktoken-go（精度提升）**
+依赖 `github.com/pkoukk/tiktoken-go`，用 `cl100k_base`（GPT-4/DeepSeek 通用）：
+```go
+import "github.com/pkoukk/tiktoken-go"
+
+func EstimateTokensTiktoken(messages []Message) (int, error) {
+    enc, err := tiktoken.GetEncoding("cl100k_base")
+    if err != nil { return 0, err }
+    total := 0
+    for _, m := range messages {
+        total += len(enc.Encode(m.Content, nil, nil))
+        total += 50 // per-message overhead
+    }
+    return total, nil
+}
+```
+- **优点**：精度高（与 OpenAI tokenizer 一致），DeepSeek 也是基于 GPT-4 tokenizer
+- **缺点**：新增依赖、首次调用有加载开销、对 Go 项目增加 ~500KB 二进制体积
+
+**策略 C：模型自省（最强但最慢）**
+调用 LLM API 的 `/tokenize` 端点（如果厂商支持）或发一条极短请求推算。DeepSeek 目前**无 tokenize 端点**。
+
+**建议**：MVP 阶段采用 **策略 A（字符/4 + 50 开销）**，在 Config 中暴露 `token_estimator: "char_div4"` 字段预留未来切到策略 B 的能力。
+
+#### 11.7.3 截断策略
+
+当 `EstimateTokens(history) > context_limit` 时，按以下策略截断：
+
+```go
+func TruncateHistory(msgs []Message, contextLimit int) []Message {
+    // 1. 必须保留的：System prompt（第 0 条）
+    // 2. 必须保留的：最近 compact_keep_recent 条完整消息
+    // 3. 中间部分：如果仍然超限，从老到新依次丢弃
+    
+    if EstimateTokens(msgs) <= contextLimit {
+        return msgs
+    }
+    
+    // 保护头部（system）和尾部（最近 N 条）
+    protectedHead := 1  // system prompt
+    protectedTail := cfg.CompactKeepRecent * 2  // 一对 request/response 算 2 条
+    
+    for EstimateTokens(msgs) > contextLimit && len(msgs) > protectedHead+protectedTail {
+        // 删除 protectedHead 之后最老的一条
+        msgs = append(msgs[:protectedHead], msgs[protectedHead+1:]...)
+    }
+    
+    // 如果删到只剩 protected 部分还超，说明 context_limit 设得太小或单条消息过长
+    // 此时报错，让 Agent 进入失败状态
+    if EstimateTokens(msgs) > contextLimit {
+        return msgs, ErrContextLimitTooSmall
+    }
+    return msgs, nil
+}
+```
+
+**关键约束**：
+- 截断发生在**每次 LLM 调用前**（`agent.go` 的 `processTask` → `buildMessages` 阶段）
+- 截断后必须保证 `msgs` 仍满足 OpenAI 消息格式约束（如 `assistant` 消息后必须紧跟 `tool` 消息）
+- 如果截断破坏了工具调用配对，需要连 `tool` 消息一起删除
+
+### 11.8 实施步骤
+
+| 步骤 | 内容 | 产出 |
+|------|------|------|
+| S1 | 定义 v4 Config 结构体（`config/v4/config.go`），与 v3 完全隔离 | 新包 |
+| S2 | 实现 `AgentConfigFactory`：Template 合并 + ParamsOverride 覆盖 + LLM 默认值回退 | 合并逻辑 + 单测 |
+| S3 | 重构 `worker.NewWithID` / `explorer.New` / `scheduler.New` 签名，接收 `AgentRuntimeConfig` | 构造函数简化 |
+| S4 | 改写 `bootstrap.go`：按 v4 Config 流程启动所有组件 | 新启动流程 |
+| S5 | 实现 `EstimateTokens`（字符/4 策略）+ `TruncateHistory` | token 估算 + 截断 |
+| S6 | 在 `agent.go` `buildMessages` 阶段接入截断逻辑 | 运行时保护 |
+| S7 | `config.example.yaml` 重写为 v4 格式 | 新示例配置 |
+| S8 | 启动校验：scheduler.count==1、explorer.count==1、模板名存在性 | 防御性校验 |
+| S9 | 端到端烟测：启动 → 发一个长任务 → 确认历史压缩和截断工作正常 | 回归保证 |
+
+### 11.9 不在本节范围
+
+- **v3 配置格式的自动迁移工具**：v4 不向后兼容，升级时人工迁移一次即可。不维护迁移脚本。
+- **动态模板切换**：Agent 启动后 Template 不可变。运行时行为调整靠重启或未来热重载机制。
+- **Per-tool 权限模板**：v4 §2 分级权限模型是独立功能，本节只解决"Agent 行为参数配置"，不涉及任务级权限裁剪。
+- **Tokenizer 依赖决策**：本节给出策略 A/B/C 的分析，但 MVP 只实施策略 A。策略 B（tiktoken-go）作为后续可插拔项。
+- **Explorer 多实例**：`explorer.count` 当前限制为 1，schema 预留字段但不实现多 Explorer 的路由逻辑。等 scheduler 的 `AgentRegistry` 支持多 Explorer 后再放开。
+
