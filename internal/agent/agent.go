@@ -658,23 +658,44 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 	var recoverable *ErrRecoverable
 	if errors.As(execErr, &recoverable) {
 		// Layer 3: 如果是上下文溢出错误，在重试前激进压缩历史
-		if isContextOverflow(execErr) {
+		overflow := isContextOverflow(execErr)
+		if overflow {
 			log.Printf("[agent %s] 任务 %s 检测到上下文溢出，执行激进压缩", a.ID, taskID)
 			snipOldToolResults(history, 1)        // 激进清理：只保留最近 1 条
 			history = compressHistory(history, 1) // 激进压缩：只保留最近 1 条
 		}
 
-		// TransferNote：失败路径走 buildTransferNote（L1 → L3 链）。
-		// 上面的激进压缩已经把 history 缩到最小，此时 L1 调 LLM 一般能成功；
-		// 如果 LLM 服务本身不可用或返回异常，L3 机械兑底接管。
-		// 注意：buildTransferNote 内部对 history 只读，不修改原切片。
-		// 使用 context.Background() 避免本次 execErr 所在 ctx 已被取消的情况。
+		// 预判是否即将 terminate——这个判断决定 note 的成本策略。
+		willTerminate := a.MaxRetries > 0 && task.RetryCount >= a.MaxRetries
+
+		// TransferNote 分类策略（2026-04-25 重构）：
 		//
-		// 但 Background() 没有任何元数据——需要手动注入 agent/task 标记，
-		// 否则 L1 那次 LLM 调用在 trace/log 里缺 agent_id/loop（2026-04-25 P1 #1）。
-		// loop=-1 标记"非 ReactLoop 的终止路径调用"。
+		// 旧行为：任何 recoverable 失败都调 L1（一次额外 LLM 调用），L1 失败降级 L3。
+		// 代价：LLM 服务宕机时每次 retry 都烧一次无效 dial；即使服务正常，
+		// 普通 transient 失败也调 LLM 做"信息与 history 高度重复"的总结。
+		//
+		// 新行为按场景分派：
+		//   - overflow：压缩已经把 history 缩到 1 条，L1 是唯一保住 reasoning 链的路径——调 L1
+		//   - willTerminate：任务即将进入 failed 终态，note 会被下游 + crashReport 消费——调 L1
+		//   - 其他 transient（网络 / 5xx / rate limit / ExpectedArtifacts 失败）：
+		//     LastHistory 完整保留、retry 接手者能靠 history 恢复，L1 价值低且大概率失败——
+		//     走零成本的 L3 mechanical 兜底，保留结构化交接文本，但不烧 LLM 调用
+		//
+		// 两条路径都经过 SetTransferNote；下游依赖 / retry 接手者读到的
+		// note 格式一致（都是 <transfer-note> / <transfer-note level="raw"> 包裹的文本）。
 		tnCtx := WithAgentContext(context.Background(), a.ID, taskID, -1)
-		note := a.buildTransferNote(tnCtx, task, nil, history, a.transferNoteMaxTokens())
+		var note string
+		if overflow || willTerminate {
+			// L1 高价值路径：允许一次 LLM 调用做自然语言压缩，失败自动降级 L3
+			note = a.buildTransferNote(tnCtx, task, nil, history, a.transferNoteMaxTokens())
+		} else {
+			// 普通 transient：直接 L3 机械拼装，零 LLM 调用
+			var toolHistory []store.ToolCallRecord
+			if a.Store != nil && task != nil {
+				toolHistory, _ = a.Store.QueryToolCalls(task.ID, "")
+			}
+			note = mechanicalTransferNote(task, history, toolHistory, a.transferNoteMaxTokens())
+		}
 		if note != "" {
 			_ = a.Store.SetTransferNote(taskID, note)
 		}
@@ -682,7 +703,7 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 		// 全局重试上限：可恢复错误也要受 MaxRetries 约束，避免无限重试。
 		// 此前只有 handleMaxLoops 路径检查 MaxRetries，导致 ExpectedArtifacts 校验
 		// 失败、tool 错误等可恢复故障可以无限循环（实战中观察到 24+ 次重试，烧 2 小时）。
-		if a.MaxRetries > 0 && task.RetryCount >= a.MaxRetries {
+		if willTerminate {
 			failReason := fmt.Sprintf("重试次数耗尽 (%d/%d): %s",
 				task.RetryCount, a.MaxRetries, execErr.Error())
 			log.Printf("[agent %s] 任务 %s 终止：%s", a.ID, taskID, failReason)

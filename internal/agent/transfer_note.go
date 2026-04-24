@@ -16,6 +16,15 @@ import (
 // 备忘，接手者只读这一份。
 //
 // 本最小版范围（见 docs/activate/nextUpgrade_v3.md §8.4 用户拍板）：
+//
+// 2026-04-25 重构：handleFailure 的 recoverable 分支不再无条件调 L1。
+// 改为按失败场景分派：
+//   - Context overflow：history 被激进压缩剩 1 条，L1 是唯一保住 reasoning 链的路径 → 调 L1
+//   - Terminal failure（MaxRetries 耗尽）：note 会被下游 + crashReport 消费 → 调 L1
+//   - 其他 transient（network / 5xx / rate limit / ExpectedArtifacts）：
+//     LastHistory 完整保留、retry 接手者能靠 history 恢复，L1 价值低且大概率失败 →
+//     直接走 L3 mechanical，零 LLM 调用
+//
 //   - L1（generateTransferNote）：Agent 自行压缩——在失败路径的 handleFailure
 //     之前追加一条 <transfer-request> 指令，让 LLM 做最后一次纯文本压缩
 //   - L3（mechanicalTransferNote）：纯代码机械拼装——无 LLM 调用，用于 L1

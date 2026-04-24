@@ -132,3 +132,85 @@ type Event struct {
     TaskID string    // 关联的任务ID，调度器据此精确定位任务而无需全量扫描；用户输入和 ticker 唤醒事件此字段为空
 }
 ```
+
+## CLI 交互层设计（待核心定型后实现）
+
+当前 `internal/cli` 为最小可用形态，存在三项已知的体验问题。核心未定型前不动代码，仅在此固化设计意图，等核心功能稳定后对齐实现。
+
+### 现状问题
+
+1. **单行输入需连按两次回车才提交**。`collectMultiline` 以空行作为提交信号，单行命令也走同一路径。此决策来自 CLAUDE.md「Cross-platform constraints」——PowerShell/bash/cmd 对回车语义不一致，空行提交是跨平台最稳的契约，代价是体感迟钝。
+2. **斜杠命令仅 5 个**（`/quit /mode /status /cancel /help`），未覆盖 Claude Code / Codex 中常见的会话管理、追踪查看、文件引用等命令。
+3. **多行输入能力不显性**——实际支持多行，但与「单行也必须空行提交」耦合，用户感知不到。
+
+### 输入提交语义（目标设计）
+
+将「多行」从默认路径挪到显式路径：
+
+- **默认单行回车即提交**，贴近主流 shell 直觉。
+- **显式多行语法**：
+  - 起始 `"""` 进入多行块，再次 `"""` 结束并提交。
+  - 或行尾 `\` 表示续行（参考 bash）。
+- **`/command` 开头的行**始终立即提交，不进入多行累积（当前代码已部分实现「遇到 /command 打断」逻辑，保留并明确化）。
+- 跨平台契约：CRLF 在边界归一化为 LF（与 CLAUDE.md 既有约束一致），不依赖任何 shell 特有的行结束语义。
+
+暂不引入 readline（`chzyer/readline` / `peterh/liner`）。光标编辑、历史回溯、Ctrl-上下 属于独立增强项，涉及 Windows ConPTY 行为差异，放在后续阶段单独评估。
+
+### 斜杠命令扩展（目标设计）
+
+原则：**只暴露本项目已有能力，不复刻 Claude Code 的前端语义**。以下命令在对应子模块成熟后接入：
+
+| 命令 | 作用 | 依赖的已有子系统 |
+|---|---|---|
+| `/sessions` | 列出历史会话，切换/恢复 | `internal/session`（SessionManager、retention、archive 已具备） |
+| `/replay <sessionID>` | 回放指定会话 | `internal/session` replay |
+| `/trace` | 打开 trace CLI view | `internal/trace`（writer + CLI view 已存在） |
+| `/snapshot` | 当前会话快照导出 | `internal/session` snapshot |
+
+**不引入**以下命令（与本项目架构不匹配，会越权或重复）：
+
+- `@file` 文件引用——worker 拥有 `read_file` 工具，CLI 层塞文件内容会绕过 Roster / `FileStateCache` 的边界。
+- `!bash` 直执行——会绕过 `internal/shell` 的黑白名单与审批门，破坏安全边界。
+- `/compact`——三层历史压缩已自动触发，无需手动。
+- `#memory`——本项目无对等的记忆持久化模块。
+
+### 输入接口草案
+
+实现阶段可按如下接口组织（先固化意图，签名细节实现时再敲定）：
+
+```go
+// InputReader 抽象输入来源，便于测试替换 stdin
+type InputReader interface {
+    // ReadCommand 读取一条用户命令。返回的 Input 已完成 CRLF 归一化、多行拼接、/command 打断处理。
+    ReadCommand(ctx context.Context) (Input, error)
+}
+
+type Input struct {
+    Raw       string   // 归一化后的原始文本（LF）
+    Kind      InputKind // single / multiline / slash
+    Command   string    // Kind=slash 时的命令名，不含前导 '/'
+    Args      []string  // Kind=slash 时的参数
+}
+
+type InputKind int
+
+const (
+    InputKindSingle    InputKind = iota // 单行自由文本
+    InputKindMultiline                  // """ ... """ 或 \ 续行累积而来
+    InputKindSlash                      // /command [args...]
+)
+
+// CommandRegistry 负责斜杠命令的注册与分发
+type CommandRegistry interface {
+    Register(name string, handler CommandHandler)
+    Dispatch(ctx context.Context, cmd string, args []string) error
+}
+
+type CommandHandler func(ctx context.Context, args []string) error
+```
+
+### 实现顺序（核心稳定后）
+
+1. 先落单行默认提交 + 显式多行语法（低风险、收益最大）。
+2. 再接 `/sessions` `/replay` `/trace` `/snapshot`——均是「暴露已有能力」，不新增业务逻辑。
+3. readline 类增强独立立项，不与上述耦合。

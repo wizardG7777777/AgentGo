@@ -26,6 +26,19 @@ import (
 // 在每次注入 board snapshot 时从 ModeStore 读当前 mode 并写入 JSON。
 type Mode int
 
+// schedulerMaxRetries 是 Scheduler 角色的任务级重试上限。
+//
+// 角色语义：历史上此处硬编码为 0（"等 worker 时不应被 retry 上限杀掉"），
+// 但 Phase 3 引入 SchedulerExecutor.waitForBatchTerminal 之后，等 worker 发生
+// 在单个 Execute 调用内部的同步阻塞里，不跨 retry——原始理由已过时。
+// 0 值反而让 LLM 层连续失败（network / 截断 / 5xx）走无限重试路径，
+// 2026-04-20 LLM 服务器宕机时触发 166+ 次空转。
+//
+// 当前值：健康路径 scheduler 不经 handleFailure；真出错时 5 次有限重试后
+// terminateTask + crashReport，保证用户能看到"scheduler 死了"而非静默空转。
+// 该常量故意不暴露 yaml 配置——"重试几次"是角色属性，不是用户偏好。
+const schedulerMaxRetries = 5
+
 const (
 	ModeImmediate Mode = iota // 即时模式：逐步决策
 	ModePlan                  // 计划模式：先探索再规划
@@ -458,7 +471,7 @@ func New(
 		cfg.SchedulerMaxLoops,
 	)
 	a.CancelRegistry = cancelReg
-	a.MaxRetries = 0    // 不限制——scheduler task 在等待 worker 时不应被 retry 上限杀掉
+	a.MaxRetries = schedulerMaxRetries // 有限重试——见常量注释（2026-04-25 改）
 	a.IdleThreshold = 0 // 永不空闲退出（预制代理）
 	a.CompactTokenThreshold = cfg.CompactTokenThreshold
 	a.CompactKeepRecent = cfg.CompactKeepRecent

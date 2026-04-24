@@ -112,10 +112,14 @@ func TestP1_TransferNoteCtxCarriesAgentMetadata_MaxLoopsPath(t *testing.T) {
 // TestP1_TransferNoteCtxCarriesAgentMetadata_HandleFailurePath 验证 handleFailure
 // 可恢复错误路径调 L1 TransferNote 时同样带上完整 metadata。此处用
 // context.Background() 作基底，手动注入 agent 信息。
+//
+// 2026-04-25 更新：handleFailure 的 L1 调度改为分类分派——普通 transient 走 L3
+// 不再调 executor。本测试改用 context overflow 错误（"context length exceeded"）
+// 走 L1 路径，验证 ctx 元数据在 L1 分支里仍然正确注入。
 func TestP1_TransferNoteCtxCarriesAgentMetadata_HandleFailurePath(t *testing.T) {
 	s, r, _ := setup()
 
-	task := &model.Task{Description: "force recoverable error", EventType: "code"}
+	task := &model.Task{Description: "force overflow recoverable error", EventType: "code"}
 	s.PublishTask(task)
 	if err := s.ClaimTask("agent-p1b", task.ID); err != nil {
 		t.Fatalf("ClaimTask: %v", err)
@@ -128,8 +132,8 @@ func TestP1_TransferNoteCtxCarriesAgentMetadata_HandleFailurePath(t *testing.T) 
 	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 		n := atomic.AddInt32(&callCount, 1)
 		if n == 1 {
-			// 第一轮返回 ErrRecoverable 进入 handleFailure
-			return ExecuteResult{}, &ErrRecoverable{Err: errors.New("simulated recoverable")}
+			// 第一轮返回 overflow recoverable 触发 L1 路径（isContextOverflow 识别 "length"）
+			return ExecuteResult{}, &ErrRecoverable{Err: errors.New("prompt exceeds context length")}
 		}
 		// 第二轮是 L1 TransferNote 调用
 		capturedAgentID = AgentIDFromContext(ctx)

@@ -8,8 +8,8 @@
 # 项目根目录（留空则使用当前工作目录）
 project_root: ""
 
-# 最大重试次数（任务级）
-max_retry: 3
+# 最大重试次数（任务级）已移除：改为角色语义化常量（worker/explorer/scheduler
+# 各自在壳包内声明），不再通过 yaml 配置。
 
 # Worker 数量
 worker_count: 1

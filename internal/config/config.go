@@ -41,7 +41,10 @@ type WorkerDeclaration struct {
 }
 
 type Config struct {
-	MaxRetry                int    `yaml:"max_retry" json:"max_retry"`
+	// MaxRetry 字段已于 2026-04-25 删除：重试上限改为角色语义化常量，由各壳包
+	// （worker/explorer/scheduler）各自声明。若旧 yaml 仍带 max_retry，
+	// yaml/json 的宽容解析会默默忽略，不影响启动。
+	// 参考：workerMaxRetries / explorerMaxRetries / schedulerMaxRetries
 	DefaultConcurrency      int    `yaml:"default_concurrency" json:"default_concurrency"`
 	FIFOLimit               int    `yaml:"fifo_limit" json:"fifo_limit"`
 	WatchdogIntervalSec     int    `yaml:"watchdog_interval_sec" json:"watchdog_interval_sec"`
@@ -275,7 +278,6 @@ func profileKeys(m map[string][]string) []string {
 
 func DefaultConfig() *Config {
 	return &Config{
-		MaxRetry:                3,
 		DefaultConcurrency:      2,
 		FIFOLimit:               100,
 		WatchdogIntervalSec:     30,

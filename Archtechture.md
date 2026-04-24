@@ -766,7 +766,7 @@ Scheduler agent (Phase 3 后) 与 worker / explorer 共享同一套 `Mailbox.Dra
 `appendValidationFeedback` 把 ExpectedArtifacts 校验失败的诊断（缺失文件、实际写入文件、纠正策略）作为 `<validation-feedback>` 段以 `IncomingMail` 形式注入历史，重试时 LLM 能直接看见自己为何被打回，避免"重试还是同样输出"的死循环。
 
 ### 终态崩溃汇报
-`agent.terminateTask` 在 RetryCount >= MaxRetry 时调用 `sendCrashReport`，向 `task.EventSource` 发送 `priority=high` 邮件，正文格式："代理 X 在执行任务 Y 时崩溃，原因 Z；任务描述、重试次数、expected vs actual artifacts、worker 最后一次响应原文"。
+`agent.terminateTask` 在 `RetryCount >= a.MaxRetries` 时调用 `sendCrashReport`，向 `task.EventSource` 发送 `priority=high` 邮件，正文格式："代理 X 在执行任务 Y 时崩溃，原因 Z；任务描述、重试次数、expected vs actual artifacts、worker 最后一次响应原文"。`MaxRetries` 由各壳包（worker/explorer/scheduler）的角色常量设置，不由 yaml 配置。
 
 # 系统启动流程
 系统由 `main.go` → `bootstrap.Bootstrap(configPath, explicit)` 完成初始化，再由 `System.Start(ctx, cancel)` 拉起所有 goroutine，最后 `System.RunCLI(ctx, stdin, stdout)` 阻塞主线程。
@@ -888,7 +888,7 @@ AGENTGO_DUMP_PROMPTS=1 ./agentgo
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
 | **任务调度与并发** | | |
-| max_retry | 任务级重试上限，超过则由看门狗/agent 取消 | 3 |
+| ~~max_retry~~ | 已于 2026-04-25 删除。重试上限改为角色语义化常量：`workerMaxRetries=3` / `explorerMaxRetries=3` / `schedulerMaxRetries=5`，各壳包内声明，不暴露 yaml | — |
 | default_concurrency | 单个任务的默认最大执行代理数 | 2 |
 | fifo_limit | 公告板保留已完成任务的数量上限（依赖感知淘汰） | 100 |
 | event_channel_buffer | 事件 channel 缓冲区大小 | 64 |

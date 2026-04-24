@@ -80,8 +80,16 @@ func TestSchedulerBundle_New_AgentEventTypeIsScheduler(t *testing.T) {
 	if bundle.Agent.EventType != "__scheduler__" {
 		t.Errorf("Agent.EventType = %q, want __scheduler__", bundle.Agent.EventType)
 	}
-	if bundle.Agent.MaxRetries != 0 {
-		t.Errorf("Agent.MaxRetries = %d, want 0 (unlimited for scheduler)", bundle.Agent.MaxRetries)
+	// 2026-04-25 修改：schedulerMaxRetries 从历史上的 0（无限）改为 5（有限）。
+	// Phase 3 引入 waitForBatchTerminal 后"等 worker 无限重试"语义不再依赖 MaxRetries=0。
+	// 该断言锁定 scheduler 必须拥有有限重试，防止未来回退到无限空转（2026-04-20 根因）。
+	if bundle.Agent.MaxRetries != schedulerMaxRetries {
+		t.Errorf("Agent.MaxRetries = %d, want %d (schedulerMaxRetries constant)",
+			bundle.Agent.MaxRetries, schedulerMaxRetries)
+	}
+	if bundle.Agent.MaxRetries <= 0 {
+		t.Errorf("Agent.MaxRetries = %d, must be >0 (finite retry prevents infinite loop on LLM outage)",
+			bundle.Agent.MaxRetries)
 	}
 }
 

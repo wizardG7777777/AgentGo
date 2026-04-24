@@ -25,6 +25,13 @@ type currentTaskHolder struct {
 func (h *currentTaskHolder) Set(id string) { h.mu.Lock(); h.id = id; h.mu.Unlock() }
 func (h *currentTaskHolder) Get() string   { h.mu.Lock(); defer h.mu.Unlock(); return h.id }
 
+// explorerMaxRetries 是 Explorer 角色的任务级重试上限。
+//
+// 角色语义：Explorer 执行只读调查，语义上与 Worker 同档（同样由 scheduler 发布，
+// 遇 LLM 故障应有限重试 + 崩溃汇报）。该常量故意不暴露 yaml 配置——理由同
+// workerMaxRetries。
+const explorerMaxRetries = 3
+
 const systemPrompt = `你是一个调查代理（Explorer），专门执行只读的信息检索和验证任务。
 
 你的职责：
@@ -141,7 +148,7 @@ func New(s store.TaskStore, r roster.Roster, llmClient llm.Client, cfg *config.C
 		cfg.AgentMaxLoops,
 	)
 	a.CancelRegistry = cancelReg
-	a.MaxRetries = cfg.MaxRetry
+	a.MaxRetries = explorerMaxRetries
 	a.IdleThreshold = 0 // 预制代理不因空闲退出
 	a.CompactTokenThreshold = cfg.CompactTokenThreshold
 	a.CompactKeepRecent = cfg.CompactKeepRecent

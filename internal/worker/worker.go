@@ -19,6 +19,14 @@ import (
 	"agentgo/internal/webtool"
 )
 
+// workerMaxRetries 是 Worker 角色的任务级重试上限。
+//
+// 角色语义：Worker 执行具体编码/文件操作，单个任务可恢复失败（LLM 截断、
+// ExpectedArtifacts 校验未过、LLM 网络错误）时允许重试数次；超限即 terminateTask
+// 并通过 sendCrashReport 给发布者。该常量故意不暴露 yaml 配置——"允许重试几次"
+// 是角色属性，不是用户偏好。如需改动需同时审视 handleFailure 的重试语义。
+const workerMaxRetries = 3
+
 const systemPrompt = `你是一个执行代理（Worker），负责执行具体的编码和文件操作任务。
 
 你的职责：
@@ -172,7 +180,7 @@ func NewWithID(agentID string, s store.TaskStore, r roster.Roster, llmClient llm
 		cfg.AgentMaxLoops,
 	)
 	a.CancelRegistry = cancelReg
-	a.MaxRetries = cfg.MaxRetry
+	a.MaxRetries = workerMaxRetries
 	a.IdleThreshold = 0 // 预制代理不因空闲退出
 	a.CompactTokenThreshold = cfg.CompactTokenThreshold
 	a.CompactKeepRecent = cfg.CompactKeepRecent

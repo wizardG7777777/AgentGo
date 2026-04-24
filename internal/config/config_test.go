@@ -14,9 +14,6 @@ import (
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
-	if cfg.MaxRetry != 3 {
-		t.Errorf("MaxRetry = %d, want 3", cfg.MaxRetry)
-	}
 	if cfg.DefaultConcurrency != 2 {
 		t.Errorf("DefaultConcurrency = %d, want 2", cfg.DefaultConcurrency)
 	}
@@ -32,19 +29,16 @@ func TestDefaultConfig(t *testing.T) {
 }
 
 func TestLoadConfig_FileNotExist(t *testing.T) {
-	cfg, err := LoadConfig("/nonexistent/path/setting.yaml", false)
+	_, err := LoadConfig("/nonexistent/path/setting.yaml", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.MaxRetry != 3 {
-		t.Errorf("MaxRetry = %d, want default 3", cfg.MaxRetry)
 	}
 }
 
 func TestLoadConfig_PartialYAML(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "setting.yaml")
-	content := []byte("max_retry: 5\nfifo_limit: 200\n")
+	content := []byte("fifo_limit: 200\n")
 	if err := os.WriteFile(path, content, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -52,9 +46,6 @@ func TestLoadConfig_PartialYAML(t *testing.T) {
 	cfg, err := LoadConfig(path, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.MaxRetry != 5 {
-		t.Errorf("MaxRetry = %d, want 5", cfg.MaxRetry)
 	}
 	if cfg.FIFOLimit != 200 {
 		t.Errorf("FIFOLimit = %d, want 200", cfg.FIFOLimit)
@@ -71,7 +62,7 @@ func TestLoadConfig_PartialYAML(t *testing.T) {
 func TestLoadConfig_JSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "setting.json")
-	content := []byte(`{"max_retry": 7, "fifo_limit": 50, "default_timeout_sec": 120}`)
+	content := []byte(`{"fifo_limit": 50, "default_timeout_sec": 120}`)
 	if err := os.WriteFile(path, content, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -79,9 +70,6 @@ func TestLoadConfig_JSON(t *testing.T) {
 	cfg, err := LoadConfig(path, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.MaxRetry != 7 {
-		t.Errorf("MaxRetry = %d, want 7", cfg.MaxRetry)
 	}
 	if cfg.FIFOLimit != 50 {
 		t.Errorf("FIFOLimit = %d, want 50", cfg.FIFOLimit)
@@ -98,8 +86,7 @@ func TestLoadConfig_JSON(t *testing.T) {
 func TestLoadConfig_FullYAML(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "setting.yaml")
-	content := []byte(`max_retry: 5
-default_concurrency: 4
+	content := []byte(`default_concurrency: 4
 fifo_limit: 200
 watchdog_interval_sec: 15
 scheduler_ticker_sec: 5
@@ -115,9 +102,6 @@ default_timeout_sec: 600
 	cfg, err := LoadConfig(path, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.MaxRetry != 5 {
-		t.Errorf("MaxRetry = %d, want 5", cfg.MaxRetry)
 	}
 	if cfg.DefaultConcurrency != 4 {
 		t.Errorf("DefaultConcurrency = %d, want 4", cfg.DefaultConcurrency)
@@ -161,10 +145,6 @@ func TestLoadConfig_ShellTimeoutSec_YAMLOverride(t *testing.T) {
 	}
 	if cfg.ShellTimeoutSec != 60 {
 		t.Errorf("ShellTimeoutSec = %d, want 60", cfg.ShellTimeoutSec)
-	}
-	// unspecified fields keep defaults
-	if cfg.MaxRetry != 3 {
-		t.Errorf("MaxRetry = %d, want default 3", cfg.MaxRetry)
 	}
 }
 
@@ -227,8 +207,8 @@ explorer_event_type: "investigate"
 		t.Errorf("ExplorerEventType = %q, want %q", cfg.ExplorerEventType, "investigate")
 	}
 	// 未设置的字段保持默认值
-	if cfg.MaxRetry != 3 {
-		t.Errorf("MaxRetry = %d, want default 3", cfg.MaxRetry)
+	if cfg.DefaultConcurrency != 2 {
+		t.Errorf("DefaultConcurrency = %d, want default 2", cfg.DefaultConcurrency)
 	}
 }
 
@@ -261,22 +241,22 @@ func TestLoadConfig_NonExplicit_UnsupportedFormat_DefaultConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.MaxRetry != 3 {
-		t.Errorf("MaxRetry = %d, want default 3", cfg.MaxRetry)
+	if cfg.DefaultConcurrency != 2 {
+		t.Errorf("DefaultConcurrency = %d, want default 2", cfg.DefaultConcurrency)
 	}
 }
 
 func TestLoadConfig_Explicit_ValidYML_OK(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "custom.yml")
-	os.WriteFile(path, []byte("max_retry: 10"), 0644)
+	os.WriteFile(path, []byte("fifo_limit: 99"), 0644)
 
 	cfg, err := LoadConfig(path, true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.MaxRetry != 10 {
-		t.Errorf("MaxRetry = %d, want 10", cfg.MaxRetry)
+	if cfg.FIFOLimit != 99 {
+		t.Errorf("FIFOLimit = %d, want 99", cfg.FIFOLimit)
 	}
 }
 
@@ -987,8 +967,8 @@ func TestLoadConfig_SessionFields_YAMLOverride(t *testing.T) {
 		t.Errorf("SessionArchiveMax = %d, want 100", cfg.SessionArchiveMax)
 	}
 	// unspecified fields keep defaults
-	if cfg.MaxRetry != 3 {
-		t.Errorf("MaxRetry = %d, want default 3", cfg.MaxRetry)
+	if cfg.DefaultConcurrency != 2 {
+		t.Errorf("DefaultConcurrency = %d, want default 2", cfg.DefaultConcurrency)
 	}
 }
 

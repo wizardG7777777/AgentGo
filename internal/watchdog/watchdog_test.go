@@ -15,7 +15,6 @@ import (
 func newTestWatchdog() (*Watchdog, store.TaskStore, chan model.Event) {
 	ch := make(chan model.Event, 64)
 	cfg := config.DefaultConfig()
-	cfg.MaxRetry = 3
 	cfg.DefaultTimeoutSec = 300
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	r := roster.NewMemoryRoster()

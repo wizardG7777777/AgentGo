@@ -24,7 +24,6 @@ func newWatchdogWithMailbox(t *testing.T) (*Watchdog, store.TaskStore, *mailbox.
 	t.Helper()
 	ch := make(chan model.Event, 64)
 	cfg := config.DefaultConfig()
-	cfg.MaxRetry = 3
 	cfg.DefaultTimeoutSec = 300
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	r := roster.NewMemoryRoster()

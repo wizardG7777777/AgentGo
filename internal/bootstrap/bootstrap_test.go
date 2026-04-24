@@ -27,9 +27,6 @@ func TestBootstrap_DefaultConfig(t *testing.T) {
 	if sys.Watchdog == nil {
 		t.Error("Watchdog should not be nil")
 	}
-	if sys.Config.MaxRetry != 3 {
-		t.Errorf("MaxRetry = %d, want default 3", sys.Config.MaxRetry)
-	}
 }
 
 func TestBootstrap_StartAndShutdown(t *testing.T) {
