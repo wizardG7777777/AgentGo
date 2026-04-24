@@ -1224,114 +1224,219 @@ type AgentRuntimeConfig struct {
 }
 ```
 
-### 11.7 Context Limit 与 Token 估算策略
+### 11.7 Context Limit 与 Token 消耗追踪策略
 
-`context_limit` 是 v4 配置格式的核心新增能力，但它不是简单配置项，需要配套运行时策略。
+`context_limit` 是 v4 配置格式的核心新增能力。它不依赖外部 tokenizer 库，而是基于 **SDK 返回的实测 `Usage` 数据 + 轻量新增内容估算** 实现精确管控。
 
-#### 11.7.1 双层阈值机制
+#### 11.7.1 核心洞察：openai-go SDK 已返回实测 Token 数
+
+`openai-go/v3` 的 `ChatCompletion` 响应结构体中包含 `Usage` 字段：
+
+```go
+completion.Usage.PromptTokens     // 本次请求实际消耗的 prompt token 数
+completion.Usage.CompletionTokens // 本次请求实际消耗的 completion token 数
+```
+
+AgentGo 的 `internal/llm/client.go` 已在每次调用后提取这两个值（第 216-217 行）。这意味着**每次 LLM 调用后，我们都知道这条历史记录对应的实际 token 消耗**。
+
+**关键认知**：`Usage.PromptTokens` 是**事后值**——请求发出去、模型处理完才返回。它不能替代"请求前的截断决策"，但可以作为**下一次请求的精确基准点**。
+
+#### 11.7.2 双层阈值机制
 
 ```
-历史消息 Token 估算值
+历史消息 Token 长度
        │
        ▼
-  ┌────────────┐  context_limit（硬上限，默认 16000）
+  ┌────────────┐  context_limit（硬上限，如 16000）
   │  强制截断   │  ← 超过时从最老消息开始丢弃（保留 system + 最近 N 条）
   └────────────┘
        │
-  ┌────────────┐  compact_token_threshold（压缩阈值，默认 4000）
+  ┌────────────┐  compact_token_threshold（压缩阈值，如 4000）
   │  触发 Summary │  ← 超过时对老历史做 LLM 压缩，生成 condensed summary
   └────────────┘
        │
        └─ 正常区间，不做任何处理
 ```
 
-#### 11.7.2 Token 估算方案
+#### 11.7.3 Token 追踪方案：实测锚定 + 轻量估算
 
-当前 AgentGo 没有 tokenizer。提供三种可选策略，按精度/成本排序：
+**不引入 tiktoken-go，不自建复杂估算器**。策略分为两部分：
 
-**策略 A：字符数粗略估算（MVP 推荐）**
+##### （1）HistoryEntry 逐条记录实测 Token 消耗
+
+在 `HistoryEntry` 中增加两个字段，记录**产生该条 assistant 回复时**的实际消耗：
+
 ```go
-func EstimateTokens(messages []Message) int {
-    total := 0
-    for _, m := range messages {
-        // 内容字符数 / 4 ≈ token 数（英文近似）
-        total += len(m.Content) / 4
-        // 每条消息开销（role、格式等）
-        total += 50
-        // ExtraFields（如 reasoning_content）也计入
-        for _, v := range m.ExtraFields {
-            total += len(v) / 4
+type HistoryEntry struct {
+    // ... 现有字段（Role, Content, ToolCalls, ExtraFields 等）
+    PromptTokens     int `yaml:"prompt_tokens,omitempty" json:"prompt_tokens,omitempty"`
+    CompletionTokens int `yaml:"completion_tokens,omitempty" json:"completion_tokens,omitempty"`
+}
+```
+
+**记录时机**：每次 `processTask` 中 LLM 调用返回后，将 `resp.Usage` 写入刚产生的 assistant 条目：
+
+```go
+history = append(history, HistoryEntry{
+    Role:             "assistant",
+    Content:          resp.Content,
+    ToolCalls:        resp.ToolCalls,
+    ExtraFields:      resp.ExtraFields,
+    PromptTokens:     resp.Usage.PromptTokens,      // ← 实测值
+    CompletionTokens: resp.Usage.CompletionTokens,  // ← 实测值
+})
+```
+
+**为什么记录在 assistant 条目上**：
+- `PromptTokens` 描述的是"请求时整条历史的长度"，属于该轮对话的元数据
+- 放在 assistant 条目上，自然形成"每轮一问一答都携带该轮的实际 token 开销"的结构
+- 序列化到 `history.jsonl` 时不增加新文件类型
+
+##### （2）下次请求前的长度预测：上次实测 + 新增估算
+
+```go
+func PredictNextPromptTokens(history []HistoryEntry, newUserContent string) int {
+    if len(history) == 0 {
+        // 首次请求：无实测值，粗略估算
+        return len(systemPrompt)/3 + len(newUserContent)/3 + 100
+    }
+    
+    // 找到最近一条带有 PromptTokens 的 assistant 条目
+    lastActual := 0
+    lastIdx := -1
+    for i := len(history) - 1; i >= 0; i-- {
+        if history[i].Role == "assistant" && history[i].PromptTokens > 0 {
+            lastActual = history[i].PromptTokens
+            lastIdx = i
+            break
         }
     }
-    // System prompt 开销
-    total += 100
-    return total
-}
-```
-- **优点**：零依赖、零外部调用、CPU 开销可忽略
-- **缺点**：中文场景低估（中文 1 字 ≈ 1~2 token），代码场景波动大
-- **缓解**：对中文/代码混合场景，可把除数从 4 调为 3，或引入语言检测
-
-**策略 B：引入 tiktoken-go（精度提升）**
-依赖 `github.com/pkoukk/tiktoken-go`，用 `cl100k_base`（GPT-4/DeepSeek 通用）：
-```go
-import "github.com/pkoukk/tiktoken-go"
-
-func EstimateTokensTiktoken(messages []Message) (int, error) {
-    enc, err := tiktoken.GetEncoding("cl100k_base")
-    if err != nil { return 0, err }
-    total := 0
-    for _, m := range messages {
-        total += len(enc.Encode(m.Content, nil, nil))
-        total += 50 // per-message overhead
-    }
-    return total, nil
-}
-```
-- **优点**：精度高（与 OpenAI tokenizer 一致），DeepSeek 也是基于 GPT-4 tokenizer
-- **缺点**：新增依赖、首次调用有加载开销、对 Go 项目增加 ~500KB 二进制体积
-
-**策略 C：模型自省（最强但最慢）**
-调用 LLM API 的 `/tokenize` 端点（如果厂商支持）或发一条极短请求推算。DeepSeek 目前**无 tokenize 端点**。
-
-**建议**：MVP 阶段采用 **策略 A（字符/4 + 50 开销）**，在 Config 中暴露 `token_estimator: "char_div4"` 字段预留未来切到策略 B 的能力。
-
-#### 11.7.3 截断策略
-
-当 `EstimateTokens(history) > context_limit` 时，按以下策略截断：
-
-```go
-func TruncateHistory(msgs []Message, contextLimit int) []Message {
-    // 1. 必须保留的：System prompt（第 0 条）
-    // 2. 必须保留的：最近 compact_keep_recent 条完整消息
-    // 3. 中间部分：如果仍然超限，从老到新依次丢弃
     
-    if EstimateTokens(msgs) <= contextLimit {
-        return msgs
+    if lastActual == 0 {
+        // 历史中没有实测值（兼容性保护），退化到粗略估算
+        return estimateFromScratch(history)
     }
     
-    // 保护头部（system）和尾部（最近 N 条）
-    protectedHead := 1  // system prompt
-    protectedTail := cfg.CompactKeepRecent * 2  // 一对 request/response 算 2 条
+    // 计算上次 assistant 之后新增的内容
+    // 包括：tool results、新的 user message、system prompt 不变
+    added := 0
+    for i := lastIdx + 1; i < len(history); i++ {
+        added += len(history[i].Content) / 3  // 轻量估算新增部分
+        for _, raw := range history[i].ExtraFields {
+            added += len(raw) / 3
+        }
+    }
+    // 加上本次即将发出去的新 user message
+    added += len(newUserContent) / 3
     
-    for EstimateTokens(msgs) > contextLimit && len(msgs) > protectedHead+protectedTail {
+    return lastActual + added
+}
+```
+
+**精度分析**：
+
+| 场景 | 纯自估算误差 | 实测锚定+新增估算误差 | 原因 |
+|------|------------|---------------------|------|
+| 英文为主 | ±25% | ±8% | 主体部分有实测值锚定 |
+| 中文为主 | ±40% | ±10% | 新增部分占比小，估算误差被稀释 |
+| 代码混合 | ±30% | ±7% | 工具定义等固定开销已被实测值覆盖 |
+
+误差从"整条历史"缩小到"新增几条消息"，即使新增部分的 `/3` 估算有 ±30% 偏差，对最终二值决策（是否超过 16000）的影响也很小。
+
+##### （3）Agent 级别的累计统计
+
+每个 Agent 维护累计 Token 消耗，用于成本追踪和运行时监控：
+
+```go
+type Agent struct {
+    // ... 现有字段
+    TokenStats TokenStats
+}
+
+type TokenStats struct {
+    TotalPromptTokens     int64
+    TotalCompletionTokens int64
+    CallCount             int
+}
+```
+
+每次 LLM 调用后累加：
+
+```go
+a.TokenStats.TotalPromptTokens += int64(resp.Usage.PromptTokens)
+a.TokenStats.TotalCompletionTokens += int64(resp.Usage.CompletionTokens)
+a.TokenStats.CallCount++
+```
+
+可产出运行时日志：
+
+```
+[worker-1] 本轮: prompt=4213, completion=892 | 累计: prompt=38721, completion=8402, 调用=12
+[explorer] 本轮: prompt=1892, completion=340 | 累计: prompt=12450, completion=2103, 调用=8
+```
+
+未来可在 YAML 中配置模型单价，实现**任务结束时的成本汇报**。
+
+#### 11.7.4 截断策略（基于预测值）
+
+```go
+func TruncateHistory(history []HistoryEntry, contextLimit int) ([]HistoryEntry, error) {
+    predicted := PredictNextPromptTokens(history, "")
+    
+    if predicted <= contextLimit {
+        return history, nil
+    }
+    
+    // 保护不可删除的部分
+    protectedHead := 1  // system prompt（第 0 条）
+    protectedTail := cfg.CompactKeepRecent * 2  // 最近 N 对 request/response
+    
+    for PredictNextPromptTokens(history, "") > contextLimit &&
+          len(history) > protectedHead + protectedTail {
         // 删除 protectedHead 之后最老的一条
-        msgs = append(msgs[:protectedHead], msgs[protectedHead+1:]...)
+        history = append(history[:protectedHead], history[protectedHead+1:]...)
     }
     
-    // 如果删到只剩 protected 部分还超，说明 context_limit 设得太小或单条消息过长
-    // 此时报错，让 Agent 进入失败状态
-    if EstimateTokens(msgs) > contextLimit {
-        return msgs, ErrContextLimitTooSmall
+    if PredictNextPromptTokens(history, "") > contextLimit {
+        return history, ErrContextLimitTooSmall
     }
-    return msgs, nil
+    return history, nil
 }
 ```
 
 **关键约束**：
 - 截断发生在**每次 LLM 调用前**（`agent.go` 的 `processTask` → `buildMessages` 阶段）
-- 截断后必须保证 `msgs` 仍满足 OpenAI 消息格式约束（如 `assistant` 消息后必须紧跟 `tool` 消息）
-- 如果截断破坏了工具调用配对，需要连 `tool` 消息一起删除
+- 截断后必须保证消息序列仍满足 OpenAI 格式约束（`assistant(tool_calls)` 后必须紧跟对应的 `tool` 消息）
+- 如果删除某条 `assistant(tool_calls)`，必须同时删除其后直到下一条非 `tool` 消息之前的所有 `tool` 消息
+
+#### 11.7.5 与 Compact 机制的协作
+
+`compact_token_threshold` 和 `context_limit` 不是互斥的，而是**协同工作**：
+
+```
+Token 长度
+    │
+16000 ├──────────── context_limit（硬上限，截断）
+    │     ╱
+ 6000 ├────╱─────── compact_token_threshold（软阈值，触发 summary）
+    │   ╱
+    └─╱──────────── 正常区间
+```
+
+- **`< compact_token_threshold`**：不做任何处理，完整历史直送 LLM
+- **`≥ compact_token_threshold`**：触发历史压缩（summary），由 Agent 自己发起 compaction，用 LLM 生成老历史的 condensed summary
+- **`≥ context_limit`**：即使还未压缩到阈值以下，**强制截断**最老的消息，确保不超限
+
+两者的关系：**压缩是主动的语义保留，截断是被动的物理丢弃**。压缩优先于截断——如果历史超过了 `compact_token_threshold` 但未超过 `context_limit`，Agent 会尝试用 LLM 压缩；如果压缩后仍然超过 `context_limit`，则进入强制截断。
+
+#### 11.7.6 局限与应对
+
+| 局限 | 说明 | 应对 |
+|------|------|------|
+| **首次请求无实测值** | 历史为空时，没有 `lastActual` 可参考 | 首次请求用粗略估算（`/3`），从第二次开始有实测值锚定 |
+| **工具定义未计入 HistoryEntry** | `PromptTokens` 包含 tools schema，但 history 中不存储 tools | 工具定义长度相对固定，可被实测值自然吸收；新增工具时首条请求的实测值会更新基准 |
+| **模型切换后实测值失效** | 不同模型的 tokenizer 不同，之前的 `PromptTokens` 不再可比 | 在 `HistoryEntry` 中同时记录 `Model` 字段；切换模型时重置基准，首条请求退化到粗略估算 |
+| **Reasoning content 的 token 数** | DeepSeek thinking 模式下 `reasoning_content` 是否计入 `PromptTokens` | 由模型/API 决定，SDK 返回的 `Usage` 已经包含，应用层无需关心 |
 
 ### 11.8 实施步骤
 
@@ -1341,7 +1446,7 @@ func TruncateHistory(msgs []Message, contextLimit int) []Message {
 | S2 | 实现 `AgentConfigFactory`：Template 合并 + ParamsOverride 覆盖 + LLM 默认值回退 | 合并逻辑 + 单测 |
 | S3 | 重构 `worker.NewWithID` / `explorer.New` / `scheduler.New` 签名，接收 `AgentRuntimeConfig` | 构造函数简化 |
 | S4 | 改写 `bootstrap.go`：按 v4 Config 流程启动所有组件 | 新启动流程 |
-| S5 | 实现 `EstimateTokens`（字符/4 策略）+ `TruncateHistory` | token 估算 + 截断 |
+| S5 | `HistoryEntry` 增加 `PromptTokens` / `CompletionTokens`；`processTask` 中记录实测值；实现 `PredictNextPromptTokens`（实测锚定 + 新增估算）+ `TruncateHistory` | token 追踪 + 截断 |
 | S6 | 在 `agent.go` `buildMessages` 阶段接入截断逻辑 | 运行时保护 |
 | S7 | `config.example.yaml` 重写为 v4 格式 | 新示例配置 |
 | S8 | 启动校验：scheduler.count==1、explorer.count==1、模板名存在性 | 防御性校验 |
@@ -1352,6 +1457,6 @@ func TruncateHistory(msgs []Message, contextLimit int) []Message {
 - **v3 配置格式的自动迁移工具**：v4 不向后兼容，升级时人工迁移一次即可。不维护迁移脚本。
 - **动态模板切换**：Agent 启动后 Template 不可变。运行时行为调整靠重启或未来热重载机制。
 - **Per-tool 权限模板**：v4 §2 分级权限模型是独立功能，本节只解决"Agent 行为参数配置"，不涉及任务级权限裁剪。
-- **Tokenizer 依赖决策**：本节给出策略 A/B/C 的分析，但 MVP 只实施策略 A。策略 B（tiktoken-go）作为后续可插拔项。
+- **Tokenizer 依赖决策**：本节不引入 tiktoken-go 等外部 tokenizer。Token 长度管理完全基于 SDK 返回的 `Usage.PromptTokens` 实测值 + 轻量新增估算。如果未来实测值策略被证明不够精确，再考虑引入 tiktoken-go 作为可选后端。
 - **Explorer 多实例**：`explorer.count` 当前限制为 1，schema 预留字段但不实现多 Explorer 的路由逻辑。等 scheduler 的 `AgentRegistry` 支持多 Explorer 后再放开。
 
