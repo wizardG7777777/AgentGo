@@ -1,6 +1,61 @@
 # nextUpgrade v4
 
-> 状态：📝 规划中（2026-04-15 记录）
+> 状态：🚧 实施中（2026-04-26 增量基建首批落地）
+
+## 实施进度（2026-04-26）
+
+**Phase A — 独立增量（已完成 ✅）**：
+- §10 Did-You-Mean：新增 `internal/tools/suggest/`（包装 `github.com/sahilm/fuzzy`），
+  接入 `local_read.go` 的 `glob_search` 空结果路径与 `read_file` 路径不存在路径
+- §11.7.3 HistoryEntry 实测锚定：新增 `PromptTokens` / `CompletionTokens` / `Model`
+  三字段；`agent.go` history append 处记录实测值
+- §11.7.4 截断策略：新增 `internal/agent/token_truncate.go` 实现
+  `keepRecentForTruncate=6` 包级常量、`PredictNextPromptTokens`、`TruncateHistory`
+  与 `ErrContextLimitTooSmall`
+  > 🚨 **2026-04-26 实测发现装配漏接**：函数与字段都已实现且 runner 已注入
+  > `Agent.ContextLimit`，**但 `processTask` 主循环从未调用 `TruncateHistory`**。
+  > 详见 §11.7.4 节内的状态说明 + 修复定位。属典型"零件单测过 → 装配握手位无人测"
+  > 的 CLAUDE.md "Shipping conventions" 反例。
+- `Agent` 结构体追加 `Model` / `ContextLimit` 字段（runner 注入用）
+
+**Phase B — v4 基础设施（已完成 ✅，bootstrap 切换待跟进）**：
+- §11.4 Go 配置类型：`LLMConfig` / `AgentKind` / `SchedulerKind` /
+  `InfraConfig` + 4 个子结构 / `AgentRuntimeConfig` 新增到 `internal/config/`，
+  与 v3 顶层字段并存
+- §11.5.3 启动校验：`Config.Validate()` 实现 12 条规则；当 `Agents` 为空时退化为
+  仅校验 `StartupProbe*`，与 v3 路径无冲突
+- §11.3 末尾：`LoadConfig` 在反序列化前调用 `os.ExpandEnv` 替换 `${ENV_VAR}`
+- §11.6.6 worker/explorer 折叠：`internal/runner/`（`Runner` + `CurrentTaskHolder`）
+  统一 runner 实现；`internal/agent/team_snapshot.go` 迁移 `BuildTeamSnapshot`
+  （worker 副本暂留待 bootstrap 切换后删除）
+- §11.6.1 + §9.5：`internal/bootstrap/runtime_builder.go` 提供
+  `buildKindLLMClient` / `buildAgentRuntime` / `buildSchedulerRuntime`；
+  `internal/bootstrap/probe.go` 提供 `printStartupBanner` + `startupProbe`
+- §11.8 S8：`prompts/worker.md` + `prompts/explorer.md`（从 worker.go / explorer.go
+  常量抽出）+ `setting.v4.yaml` 参考模板（与现 `setting.yaml` 并存）
+
+**Phase C — bootstrap 切换（已完成 ✅，同 session 一气呵成）**：
+- `bootstrap.go` 主流程引入 v4 kind-based 分支：`if len(cfg.Agents) > 0` 走 §11.6.1
+  step 6（按 kind × replicas 实例化统一 `runner.Runner`）；否则走原 v3 worker/explorer
+  创建逻辑（兼容现有 setting.yaml）
+- `Config.mirrorV4ToV3()` 把 v4 嵌套块字段镜像到 v3 顶层字段——让 v4 yaml 用户在
+  bootstrap 仍读 v3 字段时也拿到正确值
+- 新增 `System.Runners []*runner.Runner` 字段；`Start()` 据此分支启动 goroutine
+- `Bootstrap()` 早期插入 `cfg.Validate()` + `printStartupBanner` + `startupProbe`
+  调用，失败按 `startup_probe_failure_action` 分支
+- **端到端烟测通过**（CLAUDE.md "Shipping conventions" 规则 1）：
+  - `setting.v4.yaml`：banner 列出 3 kind + scheduler，TCP probe 到 api.deepseek.com:443
+    成功，4 个 runner 实例（worker×3 + explorer×1）启动 + /quit 干净关闭
+  - `setting.yaml`（v3）：v3 explorer + 3 worker 启动如旧；零 regression
+
+**未落地（**非阻塞**，留给后续清理 commit）**：
+- 删除 `internal/worker/` + `internal/explorer/` 两个 package（保留为孤儿包，
+  v3 兼容路径仍引用——若用户决定永久迁移到 v4 yaml，再清理）
+- 移除 `tools.MetaGroup.DisablePublishTask` 标志（allowlist filter 已等价表达，
+  当前与现有 explorer.New 调用兼容，无破坏性需求驱动清理）
+- 默认 `setting.yaml` 替换为 v4 格式（用户通过 `mv setting.yaml setting.v3.yaml.bak;
+  cp setting.v4.yaml setting.yaml` 启用 v4 路径，无需代码改动）
+- §11.8 S11 `trace.Emit` 对称扫描脚本（永久不变量回归测试）
 
 ---
 
@@ -1690,6 +1745,57 @@ a.TokenStats.CallCount++
 未来可在 YAML 中配置模型单价，实现**任务结束时的成本汇报**。
 
 #### 11.7.4 截断策略（基于预测值）
+
+> ✅ **状态：已修复（2026-04-26 同 session 接通）** — 4 步修复落地。
+>
+> **修复落地点**：
+>
+> 1. [agent.go:483-510](../../internal/agent/agent.go#L483-L510) — `processTask` 主循环 `Execute`
+>    调用前插入 `TruncateHistory` 调用，覆盖每轮 LLM 请求。`a.ContextLimit <= 0` 时整段为
+>    no-op（v3 兼容路径的零回归保险）。`ErrContextLimitTooSmall` 不 fail 任务，warn + 用
+>    截断 history 继续，让 §9.3 ErrUnrecoverable 兜底——避免在截断阶段把任务标失败。
+> 2. [internal/trace/event.go](../../internal/trace/event.go) 新增
+>    `KindHistoryTruncated EventKind = "history_truncated"`；调用截断时 emit 一条携带
+>    `PromptTokensBefore` / `PromptTokensAfter` / `KeptEntries` / `Strategy=head_keep_tail_keep`
+>    的事件——下次复盘可直接 `grep history_truncated` 验证截断生效。
+> 3. [setting.v4.yaml](../../setting.v4.yaml) explorer 的 `context_limit` 从 8000 上调至 16000
+>    （2026-04-26 实测 scheduler 首调 prompt_tokens=8525，8000 会让 explorer 一启动就触发
+>    硬截断），同时把 `enforce_compact_token_threshold` 6000，与 16000 ceil 形成合理梯度。
+> 4. 回归用例分两层（双层防护）：
+>
+>    **函数级**（[token_truncate_test.go](../../internal/agent/token_truncate_test.go)，6 条）：
+>    - `TestTruncateHistory_OverLimitGetsTruncated`：构造 `prompt_tokens > context_limit`
+>      的人造历史 → 断言截断后 `PredictNextPromptTokens(...) ≤ context_limit`、头部第 0 条
+>      不丢、尾部 `keepRecentForTruncate` 条不丢
+>    - `TestTruncateHistory_NoOpWhenUnderLimit`：history 已在限制内时不动 history
+>    - `TestTruncateHistory_ContextLimitZeroIsNoOp`：v3 兼容路径不触发截断
+>    - `TestTruncateHistory_TooSmallReturnsErr`：物理下界 `ErrContextLimitTooSmall`
+>    - `TestPredictNextPromptTokens_AnchorAndAdded`：实测锚 + 新增估算正确性
+>    - `TestPredictNextPromptTokens_ModelSwitchResetsAnchor`：模型切换后基准重置
+>
+>    **端到端**（[truncate_e2e_test.go](../../internal/agent/truncate_e2e_test.go)，1 条）：
+>    - `TestE2E_TruncateFiresOnContextLimit`：用真实 `processTask` 主循环 + fake executor
+>      驱动 ContextLimit 触发，在临时 trace 目录读回 JSONL 断言至少一条 `KindHistoryTruncated`
+>      事件且至少一条携带 `Before > After`（成功路径，非 `ErrContextLimitTooSmall` 退化）。
+>      **这条专门防"装配漏接"——即使有人误删 agent.go 中的 TruncateHistory 调用点，
+>      函数级 6 条单测仍全绿（函数没改），但本端到端测试会因 trace 里找不到事件而红**。
+>
+> 至此本节修复闭环：函数正确（函数级 6 条）+ 函数被调用（端到端 1 条 + trace 水印）+
+> 配置上下文管理合理（explorer context_limit=16000）。
+>
+> **2026-04-26 实测复现的根因（修复前）**：
+> - worker-2 task `75799b58` loop=0~9 反复 read_file 同一文件不同 offset，prompt_tokens
+>   持续增长直至 `agent_max_loops=10` 耗尽触发 RetryRollback
+> - 上一轮（v3 兼容层时代）worker-1 task `3d662b7d` 32 loops，prompt_tokens 涨到 20560
+>   仍未被截 ——同一根因
+>
+> **设计反思（CLAUDE.md "Shipping conventions" 第 1 条的反复故障模式实证）**：
+> 函数定义 + 字段定义 + 字段注入都是装配链条的"准备"，**真正生效需要主流程显式调用**。
+> 单测全绿（函数本身正确）+ 烟测能 startup（启动期不调 TruncateHistory）= 漏 S7 不会被
+> 任何已有验证捕获。今后类似多步骤特性（v4.md S6 + S7 这类）应当：
+>   - 把 wire-into-main-loop 步骤独立列为 todo 项
+>   - 加上 trace 事件作为"不变量水印"——能在 trace 复盘中肉眼断言"这个特性确实被运行时调过"
+>   - 端到端烟测除了"binary 启动 + /quit"还要包含"发一个真实任务 + 断言关键 trace 事件"
 
 ```go
 // keepRecentForTruncate 是 internal/agent 包级常量——截断时保护尾部最近的消息条数。

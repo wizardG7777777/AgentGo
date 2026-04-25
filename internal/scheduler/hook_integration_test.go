@@ -19,7 +19,7 @@ import (
 func TestSchedulerExecutor_ToolCallsGoThroughHook(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	// 发布并认领一个 scheduler task
 	schedTask := &model.Task{Description: "test", EventType: "__scheduler__"}

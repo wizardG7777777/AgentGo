@@ -55,6 +55,14 @@ const (
 	// 上下文压缩
 	KindHistoryCompaction EventKind = "history_compaction"
 
+	// 上下文硬限截断（nextUpgrade_v4.md §11.7.4）。每次 LLM 调用前触发，将
+	// PredictNextPromptTokens 超过 cfg.AgentKind.ContextLimit 的历史从最老条目开始
+	// 丢弃，保护头/尾不被破坏。事件用 PromptTokensBefore / PromptTokensAfter /
+	// KeptEntries 字段记录截断幅度；Strategy 记 "head_keep_tail_keep"。
+	// 加这条事件类型后，下次复盘可直接 grep KindHistoryTruncated 验证截断生效，
+	// 用以锁住"S7 接通"这一不变量——再有人误删调用点会立刻在 trace 上消失。
+	KindHistoryTruncated EventKind = "history_truncated"
+
 	// 文件操作（write_file/edit_file 成功后发出，可审计落盘动作）
 	KindFileWritten EventKind = "file_written"
 

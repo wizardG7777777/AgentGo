@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -122,7 +123,24 @@ func (e *SchedulerExecutor) Execute(
 	// 构造一个简单的 trigger 事件——SchedulerExecutor 不知道具体触发原因，
 	// 用通用的 ticker_wakeup 类型，让 LLM 知道这是一次"重新观察板子"
 	trigger := model.Event{Type: model.EventTickerWakeup}
-	workerCaps, workerDesc := e.Cfg.ResolvedAgentDeclaration("worker")
+	// v4：worker 能力从默认队列（event_type="")的所有 kind 聚合而来。
+	// 取第一个匹配 kind 的工具列表作为代表——同 event_type 的多 kind 异构是 v4
+	// 的合法情形，但 board snapshot 的 WorkerCapabilities 只展示一份代表样本，
+	// 详细的 per-kind 能力差异通过 AgentRegistry / Specialized 路径展示。
+	var workerCaps []string
+	workerDesc := "执行代理（默认队列）"
+	for _, k := range e.Cfg.Agents {
+		if k.EventType != "" {
+			continue
+		}
+		if len(k.Tools) > 0 {
+			workerCaps = k.Tools
+		} else if k.Profile != "" {
+			workerCaps = e.Cfg.ToolProfiles[k.Profile]
+		}
+		workerDesc = fmt.Sprintf("执行代理 kind=%s（默认队列，profile=%s）", k.Kind, k.Profile)
+		break
+	}
 	snapshot := BuildBoardJSON(e.Store, e.Cfg, mode, trigger, SnapshotSources{
 		MBRegistry:    e.MBRegistry,
 		Roster:        e.Roster,

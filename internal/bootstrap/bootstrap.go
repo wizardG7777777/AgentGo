@@ -13,14 +13,13 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/cli"
 	"agentgo/internal/config"
-	"agentgo/internal/explorer"
 	"agentgo/internal/hook"
 	"agentgo/internal/hook/builtin"
-	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/probe"
 	"agentgo/internal/roster"
+	"agentgo/internal/runner"
 	"agentgo/internal/scheduler"
 	"agentgo/internal/session"
 	"agentgo/internal/shell"
@@ -29,7 +28,6 @@ import (
 	"agentgo/internal/trace"
 	"agentgo/internal/watchdog"
 	"agentgo/internal/webtool"
-	"agentgo/internal/worker"
 )
 
 type System struct {
@@ -42,14 +40,16 @@ type System struct {
 	MailboxRegistry *mailbox.Registry
 	MailNotifier    *mailbox.MailNotifier
 	Scheduler       *scheduler.Bundle // Phase 3：scheduler 现在是 agent.Agent + Activator + ModeStore 的复合
-	Explorer        *explorer.Explorer
-	Workers         []*worker.Worker
-	ApprovalCh      chan shell.ApprovalRequest // 命令审批通道，Worker→CLI
-	CLI             *cli.CLI
-	ArtifactLog     *store.ArtifactLog      // Artifacts 持久化日志，Shutdown 时需 Close；nil 表示持久化已禁用
-	SessionMgr      *session.SessionManager // Session 管理器，nil 表示无 Session 模式
-	cancel          context.CancelFunc
-	wg              sync.WaitGroup
+	// v4：所有执行/调查代理都是 runner.Runner（取代旧 worker.Worker / explorer.Explorer
+	// 两个 package；详见 nextUpgrade_v4.md §11.6.6）。kind × replicas 实例化在 Bootstrap()
+	// 主流程展开。
+	Runners    []*runner.Runner
+	ApprovalCh chan shell.ApprovalRequest // 命令审批通道，Worker→CLI
+	CLI        *cli.CLI
+	ArtifactLog *store.ArtifactLog      // Artifacts 持久化日志，Shutdown 时需 Close；nil 表示持久化已禁用
+	SessionMgr  *session.SessionManager // Session 管理器，nil 表示无 Session 模式
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
 }
 
 func Bootstrap(configPath string, explicit bool) (*System, error) {
@@ -59,6 +59,26 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
 	fmt.Println("[启动] 全局配置加载完成")
+
+	// Step 1.05: v4 配置校验（仅 cfg.Agents 非空时执行 12 条 §11.5.3 规则；
+	//             v3 yaml 用户不受影响——cfg.Agents 为空时 Validate 退化为只校验 StartupProbe*）
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("v4 配置校验失败: %w", err)
+	}
+
+	// Step 1.1: 启动期 banner（§9.5.1）——打印逐 kind 摘要 + 脱敏 api_key，
+	//             让用户视觉核对 YAML 是否被正确读取。
+	//             configPath 单独打印，避免"测 v4 但启动了 v3 默认"之类的混淆。
+	printStartupBanner(os.Stdout, configPath, cfg)
+
+	// Step 1.2: 启动期 TCP probe（§9.5）——best-effort 连通性检查
+	//             失败行为：默认 warning + 启动继续；startup_probe_failure_action="exit" 改为硬退出
+	if probeErr := startupProbe(os.Stdout, cfg); probeErr != nil {
+		if cfg.StartupProbeFailureAction == "exit" {
+			return nil, fmt.Errorf("启动期 probe 失败（startup_probe_failure_action=exit）: %w", probeErr)
+		}
+		log.Printf("[WARN] startup probe: %v (best-effort, 启动继续)", probeErr)
+	}
 
 	// Step 1.3: 初始化 Session 管理器
 	homeDir := cfg.ProjectRoot
@@ -105,8 +125,8 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	}
 
 	// Step 2: 初始化公告板
-	eventCh := make(chan model.Event, cfg.EventChannelBuffer)
-	taskStore := store.NewMemoryTaskStore(eventCh, cfg.FIFOLimit, cfg.DefaultConcurrency, cfg.DefaultTimeoutSec)
+	eventCh := make(chan model.Event, cfg.Infra.Store.EventChannelBuffer)
+	taskStore := store.NewMemoryTaskStore(eventCh, cfg.Infra.Store.FIFOLimit, cfg.Infra.Store.DefaultConcurrency, cfg.Infra.Store.DefaultTimeoutSec)
 	cancelRegistry := store.NewTaskCancelRegistry()
 	taskStore.SetCancelRegistry(cancelRegistry)
 	fmt.Println("[启动] 公告板初始化完成")
@@ -190,8 +210,8 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	r := roster.NewMemoryRoster()
 	fmt.Println("[启动] 花名册初始化完成")
 
-	// Step 3.5: 初始化邮箱注册表
-	mbRegistry := mailbox.NewRegistry(cfg.MailboxBufferSize)
+	// Step 3.5: 初始化邮箱注册表（v4：缓冲区大小是系统级常量，不暴露 yaml）
+	mbRegistry := mailbox.NewRegistry(mailbox.DefaultInboxSize)
 	fmt.Println("[启动] 邮箱注册表初始化完成")
 
 	// Step 3.5.1: 将 Session 的 HistoryEmitter 注入 store/roster/mailbox，
@@ -211,7 +231,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	// V9 回归验证（B9 步骤）：注释掉以下所有 Register 调用之后，整个测试套
 	// 仍然全绿且 mailbox 行为字节级一致 — 这是 Phase 2 可逆性的硬证明。
 	mailboxHookReg := hook.NewMailboxHookRegistry()
-	if err := mailboxHookReg.Register(builtin.NewChainDepthLimitHook(cfg.MailChainMaxDepth)); err != nil {
+	if err := mailboxHookReg.Register(builtin.NewChainDepthLimitHook(mailbox.DefaultChainMaxDepth)); err != nil {
 		return nil, fmt.Errorf("注册 ChainDepthLimitHook 失败: %w", err)
 	}
 	if err := mailboxHookReg.Register(builtin.NewPerAgentDedupHook(storeView)); err != nil {
@@ -224,7 +244,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 		return nil, fmt.Errorf("注册 WakeContextExpandHook 失败: %w", err)
 	}
 	mbRegistry.AttachHookRunner(hook.AsMailboxRunner(mailboxHookReg))
-	fmt.Printf("[启动] Mailbox Hook 系统初始化完成（已注册：chain-depth-limit max=%d, per-agent-dedup, wake-worthy-filter, wake-context-expand）\n", cfg.MailChainMaxDepth)
+	fmt.Printf("[启动] Mailbox Hook 系统初始化完成（已注册：chain-depth-limit max=%d, per-agent-dedup, wake-worthy-filter, wake-context-expand）\n", mailbox.DefaultChainMaxDepth)
 
 	// Step 3.7: 初始化 Agent Hook 系统（Sprint 1）
 	// 覆盖 ReactLoop 4 个生命周期事件（PhaseTaskStart / LoopPre / LoopPost / TaskEnd）。
@@ -247,7 +267,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	// 与原 agent.go:215 硬编码调用的函数是同一个，迁移时行为字节级保留。
 	taCfg := builtin.TeamAwarenessConfig{
 		SnapshotFn: func(selfID string) string {
-			return worker.BuildTeamSnapshot(selfID, taskStore, mbRegistry)
+			return agent.BuildTeamSnapshot(selfID, taskStore, mbRegistry)
 		},
 		SnapshotRefreshInterval: 5,
 		GoalRefreshInterval:     3,
@@ -269,39 +289,31 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	agentStoreView := agent.NewStoreHookAdapter(storeView)
 	var agentRosterView hook.AgentRosterView = r
 
-	// Step 4: 创建 LLM 客户端
-	// ExplorerProvider 为空时 fallback 到主 LLMProvider
-	explorerProviderName := cfg.ExplorerProvider
-	if explorerProviderName == "" {
-		explorerProviderName = cfg.LLMProvider
-	}
-	schedulerLLM := llm.NewSDKClient(
-		cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel,
-		"", // system prompt 由 scheduler 内部管理
-		cfg.LLMProvider,
-		time.Duration(cfg.LLMTimeoutSec)*time.Second,
-	)
-	explorerLLM := llm.NewSDKClient(
-		cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.ExplorerModel,
-		"", // system prompt 由 explorer 内部管理
-		explorerProviderName,
-		time.Duration(cfg.LLMTimeoutSec)*time.Second,
-	)
+	// Step 4: 创建 scheduler LLM 客户端
+	// scheduler model 优先用 cfg.Scheduler.Model（§11.5.5 仅允许该字段外部覆盖），
+	// 缺省回落 cfg.LLM.DefaultModel。LLM endpoint / api_key / provider 与 worker 共享。
+	schedulerLLM := buildKindLLMClient(cfg.LLM, cfg.Scheduler.Model)
 
 	// Step 5.5: 构造特化代理注册表（Sprint 3 #7 Scheduler 分配感知）
-	// 当前 AgentGo 只有 Explorer 一种特化代理，静态声明即可。未来出现第二种
-	// 特化类型时，在这里追加 Register 调用；scheduler 的 board snapshot 会
-	// 自动把它渲染到 Resources.SpecializedAgents。
+	// v4：扫描 cfg.Agents，把所有 EventType != "" 的 kind 注册为特化代理。
+	// 这取代了 v3 时代基于 cfg.AgentDeclarations + cfg.ExplorerEventType 的硬编码逻辑——
+	// 现在用户可以声明任意命名的特化 kind（不止 explorer），event_type 字段就是分派键。
 	agentRegistry := scheduler.NewAgentRegistry()
-	// 从配置读取 Explorer 声明（Requirements 2.1, 2.2）
-	explorerCaps, explorerDesc := cfg.ResolvedAgentDeclaration("explorer")
-	agentRegistry.Register(scheduler.SpecializedAgent{
-		EventType:    cfg.ExplorerEventType, // 通常是 "explore"
-		Count:        1,                     // 当前架构每种特化代理各一个实例
-		Role:         explorerDesc,
-		Capabilities: explorerCaps,
-	})
-	// 启动日志：输出每个已注册特化代理的 EventType 和 description 摘要（Requirements 2.3）
+	for _, kind := range cfg.Agents {
+		if kind.EventType == "" {
+			continue // 默认队列（worker 类）—— 不算特化
+		}
+		caps := kind.Tools
+		if len(caps) == 0 && kind.Profile != "" {
+			caps = cfg.ToolProfiles[kind.Profile] // profile 解析失败留 nil，启动校验已保证 profile 存在
+		}
+		agentRegistry.Register(scheduler.SpecializedAgent{
+			EventType:    kind.EventType,
+			Count:        kind.Replicas,
+			Role:         fmt.Sprintf("kind=%s（监听 event_type=%q）", kind.Kind, kind.EventType),
+			Capabilities: caps,
+		})
+	}
 	for _, sa := range agentRegistry.Specialized() {
 		desc := sa.Role
 		if len(desc) > 80 {
@@ -314,16 +326,8 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	// Step 6: 创建看门狗（先于 scheduler 创建——scheduler 需要 approvalCh，但 watchdog 不需要）
 	w := watchdog.New(taskStore, cfg, eventCh, r, mbRegistry)
 
-	// Step 6.5: 解析工具集 profile（§9.1 Tool Set Profiles）
-	workerAllowed, err := cfg.ResolveProfile(cfg.WorkerProfile)
-	if err != nil {
-		return nil, fmt.Errorf("worker profile 解析失败: %w", err)
-	}
-	explorerAllowed, err := cfg.ResolveProfile(cfg.ExplorerProfile)
-	if err != nil {
-		return nil, fmt.Errorf("explorer profile 解析失败: %w", err)
-	}
-	// 校验 profile 中的工具名拼写
+	// Step 6.5: 校验 profile 中的工具名拼写（v4：不再在此预解析 worker/explorer profile，
+	//             各 kind 的 profile 解析延后到 buildAgentRuntime）
 	for profileName, toolNames := range cfg.ToolProfiles {
 		if err := tools.ValidateToolNames(toolNames); err != nil {
 			return nil, fmt.Errorf("tool_profiles.%s 校验失败: %w", profileName, err)
@@ -348,10 +352,6 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 		}
 	}
 
-	// Step 7: 创建调查代理（复用与 Worker 相同的 SearchProvider 配置）
-	explorerSearchProvider := webtool.NewProvider(cfg.SearchAPIProvider, cfg.SearchAPIURL, cfg.SearchAPIKey)
-	exp := explorer.New(taskStore, r, explorerLLM, cfg, cancelRegistry, mbRegistry, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView, explorerAllowed, explorerSearchProvider)
-
 	// Step 7.5: 创建命令审批通道（Worker→CLI）
 	approvalCh := make(chan shell.ApprovalRequest, 8)
 
@@ -364,74 +364,57 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	)
 	sched.SchedulerExec.ToolHealth = toolHealth
 
-	// Step 8: 创建执行代理（使用主 LLM，认领 event_type="" 的执行任务）
-	var workers []*worker.Worker
-	if len(cfg.Workers) > 0 {
-		// 新路径：按 workers 列表逐一创建 Worker
-		if err := cfg.ValidateWorkers(); err != nil {
-			return nil, fmt.Errorf("workers 列表校验失败: %w", err)
-		}
-
-		// 构建 WorkerProfiles 和 WorkerCapabilitiesByProfile 供 Scheduler board snapshot 使用
-		workerProfiles := make(map[string]string, len(cfg.Workers))
-		capsByProfile := make(map[string]*scheduler.AgentCapabilityInfo)
-		for _, decl := range cfg.Workers {
-			workerProfiles[decl.ID] = decl.Profile
-			if _, exists := capsByProfile[decl.Profile]; !exists {
-				caps, desc := cfg.ResolvedWorkerDeclaration(decl.Profile)
-				capsByProfile[decl.Profile] = &scheduler.AgentCapabilityInfo{
-					Capabilities: caps,
-					Description:  desc,
-				}
+	// Step 8: 创建执行代理（v4 §11.6.1 唯一路径——按 kind × replicas 实例化统一 Runner）
+	// 共享 RunnerDeps 一次构造、所有 kind/replica 共用
+	searchProvider := webtool.NewProvider(cfg.SearchAPIProvider, cfg.SearchAPIURL, cfg.SearchAPIKey)
+	shellFilter, fErr := shell.BuildFilter(cfg.ProjectRoot, cfg.ShellBlacklist, cfg.ShellGreylist)
+	if fErr != nil {
+		shellFilter = shell.NewCommandFilter(shell.DefaultBlacklist, shell.DefaultGreylist)
+		fmt.Printf("[启动] WARNING: shell 过滤器规则加载失败，使用默认规则: %v\n", fErr)
+	}
+	deps := runner.RunnerDeps{
+		Store:                 taskStore,
+		Roster:                r,
+		HookReg:               hookReg,
+		StoreView:             storeView,
+		RecordToolCall:        recordToolCall,
+		AgentHookReg:          agentHookReg,
+		AgentStoreView:        agentStoreView,
+		AgentRosterView:       agentRosterView,
+		MBRegistry:            mbRegistry,
+		CancelRegistry:        cancelRegistry,
+		SearchProvider:        searchProvider,
+		ShellFilter:           shellFilter,
+		ApprovalCh:            approvalCh,
+		ProjectRoot:           cfg.ProjectRoot,
+		RosterWaitTimeoutSec:  cfg.Infra.Roster.WaitTimeoutSec,
+		ShellTimeoutSec:       cfg.ShellTimeoutSec,
+		MaxSubtaskDepth:       cfg.MaxSubtaskDepth,
+		TransferNoteMaxTokens: cfg.TransferNoteMaxTokens,
+		ProgressNotifyEnabled: cfg.ProgressNotifyEnabled,
+	}
+	var runners []*runner.Runner
+	for _, kind := range cfg.Agents {
+		kindLLM := buildKindLLMClient(cfg.LLM, kind.Model)
+		for i := 1; i <= kind.Replicas; i++ {
+			rt, rtErr := buildAgentRuntime(kind, cfg.LLM, cfg.ToolProfiles, i)
+			if rtErr != nil {
+				return nil, fmt.Errorf("kind=%q replica=%d 运行时构造失败: %w", kind.Kind, i, rtErr)
 			}
-		}
-		sched.SchedulerExec.WorkerProfiles = workerProfiles
-		sched.SchedulerExec.WorkerCapabilitiesByProfile = capsByProfile
-
-		for _, decl := range cfg.Workers {
-			allowedTools, err := cfg.ResolveProfile(decl.Profile)
-			if err != nil {
-				return nil, fmt.Errorf("worker %q profile 解析失败: %w", decl.ID, err)
+			if err := tools.ValidateToolNames(rt.AllowedTools); err != nil {
+				return nil, fmt.Errorf("kind=%q replica=%d 工具名校验失败: %w", kind.Kind, i, err)
 			}
-			if allowedTools != nil {
-				if err := tools.ValidateToolNames(allowedTools); err != nil {
-					return nil, fmt.Errorf("worker %q profile %q 工具名校验失败: %w", decl.ID, decl.Profile, err)
-				}
-			}
-			workerLLM := llm.NewSDKClient(
-				cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel,
-				"", // system prompt 由 worker 内部管理
-				cfg.LLMProvider,
-				time.Duration(cfg.LLMTimeoutSec)*time.Second,
-			)
-			wk := worker.NewWithID(decl.ID, taskStore, r, workerLLM, cfg, cancelRegistry, mbRegistry, approvalCh, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView, allowedTools)
-			workers = append(workers, wk)
-			profileLabel := decl.Profile
-			if profileLabel == "" {
-				profileLabel = "全量工具"
-			}
-			fmt.Printf("[启动] Worker %s 已启动 [profile=%s]\n", decl.ID, profileLabel)
-		}
-	} else {
-		// 旧路径：worker_count + worker_profile
-		workerCount := cfg.WorkerCount
-		if workerCount <= 0 {
-			workerCount = 1
-		}
-		for i := 1; i <= workerCount; i++ {
-			workerLLM := llm.NewSDKClient(
-				cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel,
-				"", // system prompt 由 worker 内部管理
-				cfg.LLMProvider,
-				time.Duration(cfg.LLMTimeoutSec)*time.Second,
-			)
-			wk := worker.NewWithID(fmt.Sprintf("worker-%d", i), taskStore, r, workerLLM, cfg, cancelRegistry, mbRegistry, approvalCh, hookReg, storeView, recordToolCall, agentHookReg, agentStoreView, agentRosterView, workerAllowed)
-			workers = append(workers, wk)
+			kindDeps := deps
+			kindDeps.LLMClient = kindLLM
+			rn := runner.New(rt, kindDeps)
+			runners = append(runners, rn)
+			fmt.Printf("[启动] Runner %s 已启动 [kind=%s, model=%s]\n",
+				rt.InstanceID, kind.Kind, rt.Model)
 		}
 	}
 
 	// Step 9: 创建邮差通知器
-	notifierInterval := time.Duration(cfg.MailNotifierIntervalSec) * time.Second
+	notifierInterval := time.Duration(cfg.Infra.MailNotifier.IntervalSec) * time.Second
 	mailNotifier := mailbox.NewMailNotifier(mbRegistry, taskStore, notifierInterval)
 
 	sys := &System{
@@ -446,8 +429,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 		ArtifactLog:     artifactLog, // 可能为 nil（OpenArtifactLog 失败时），Shutdown 会判空
 		SessionMgr:      sessMgr,     // 可能为 nil（Session 初始化失败时），Shutdown 会判空
 		Scheduler:       sched,
-		Explorer:        exp,
-		Workers:         workers,
+		Runners:         runners,
 		ApprovalCh:      approvalCh,
 	}
 
@@ -480,8 +462,8 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
 	}()
 	fmt.Println("[启动] 看门狗已启动")
 
-	// Step 6.5: 启动邮差通知器（默认禁用，防止邮件级联爆炸 — 见 KNOWN_ISSUES.md）
-	if s.Config.MailNotifierEnabled {
+	// Step 6.5: 启动邮差通知器（默认开启；可通过 infra.mail_notifier.enabled=false 关闭）
+	if s.Config.Infra.MailNotifier.Enabled {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
@@ -489,35 +471,19 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
 		}()
 		fmt.Println("[启动] 邮差通知器已启动")
 	} else {
-		fmt.Println("[启动] 邮差通知器已禁用 (mail_notifier_enabled=false) — 邮件不会自动唤醒空闲代理")
+		fmt.Println("[启动] 邮差通知器已禁用 (infra.mail_notifier.enabled=false) — 邮件不会自动唤醒空闲代理")
 	}
 
-	// Step 7: 启动调查代理
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.Explorer.Run(ctx)
-	}()
-	if s.Config.ExplorerProfile != "" {
-		fmt.Printf("[启动] 调查代理已启动 [profile=%s]\n", s.Config.ExplorerProfile)
-	} else {
-		fmt.Println("[启动] 调查代理已启动")
-	}
-
-	// Step 8: 启动执行代理
-	for _, wk := range s.Workers {
-		wk := wk // 闭包捕获
+	// Step 7+8: 启动所有 v4 Runner（worker / explorer / 自定义 kind 统一走这条路径）
+	for _, rn := range s.Runners {
+		rn := rn // 闭包捕获
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			wk.Run(ctx)
+			rn.Run(ctx)
 		}()
 	}
-	if s.Config.WorkerProfile != "" {
-		fmt.Printf("[启动] 执行代理已启动 (%d 个) [profile=%s]\n", len(s.Workers), s.Config.WorkerProfile)
-	} else {
-		fmt.Printf("[启动] 执行代理已启动 (%d 个)\n", len(s.Workers))
-	}
+	fmt.Printf("[启动] kind-based agents 已启动 (%d 个 runner 实例)\n", len(s.Runners))
 
 	fmt.Println("[启动] 系统就绪，等待用户输入")
 }

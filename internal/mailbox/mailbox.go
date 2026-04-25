@@ -47,6 +47,19 @@ type Message struct {
 // 同时足够给 WakeContextExpandHook 展示前几条邮件摘要。
 const recentBufferSize = 16
 
+// 系统级常量（v4 §11.5.4：邮件级联爆炸 / 缓冲区大小是稳定性红线，不允许 yaml 调）。
+//
+// DefaultChainMaxDepth 取代旧 cfg.MailChainMaxDepth：邮件链最大跳数。
+//   超过此深度的邮件由 ChainDepthLimitHook 在 BeforeSend 阶段拒绝。
+//   值 10 来自原 DefaultConfig() 的 v3 默认。
+//
+// DefaultInboxSize 取代旧 cfg.MailboxBufferSize：每个 Mailbox 的 channel 缓冲区。
+//   值 32 来自原 DefaultConfig() 的 v3 默认（也是 NewRegistry 的 fallback）。
+const (
+	DefaultChainMaxDepth = 10
+	DefaultInboxSize     = 32
+)
+
 // Mailbox 单个代理的收件箱，底层为 buffered channel。
 //
 // Phase 2 改动：新增 recent 环形缓冲，用于支持 hook 系统的 peek 语义

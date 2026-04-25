@@ -39,6 +39,14 @@ type Mode int
 // 该常量故意不暴露 yaml 配置——"重试几次"是角色属性，不是用户偏好。
 const schedulerMaxRetries = 5
 
+// schedulerMaxLoops 是 Scheduler agent 单次任务内 ReAct 步数上限。
+//
+// 取代旧 cfg.SchedulerMaxLoops。v4 §11.5.5 把 Scheduler 行为参数全部内置——
+// 工具集 / 系统提示词 / 行为参数都是编排逻辑的内禀部分，用户改了不是调优而是
+// 破坏。值 10 来自原 DefaultConfig() 的 v3 默认，足够覆盖 Phase 3 SchedulerExecutor
+// 的 publish_task → wait_batch → report_done 典型循环。
+const schedulerMaxLoops = 10
+
 const (
 	ModeImmediate Mode = iota // 即时模式：逐步决策
 	ModePlan                  // 计划模式：先探索再规划
@@ -417,7 +425,7 @@ func New(
 			LocalReadGroup: readGroup,
 			Roster:         r,
 			AgentID:        schedID,
-			WaitTimeoutSec: cfg.RosterWaitTimeoutSec, // §8.3 文件冲突排队
+			WaitTimeoutSec: cfg.Infra.Roster.WaitTimeoutSec, // §8.3 文件冲突排队
 		},
 		tools.WebGroup{Provider: searchProvider},
 		tools.ShellGroup{
@@ -468,13 +476,13 @@ func New(
 		schedID,
 		"__scheduler__", // 仅认领 EventType=__scheduler__ 的任务（由 Activator publish）
 		s, r, schedExec.Execute,
-		cfg.SchedulerMaxLoops,
+		schedulerMaxLoops, // v4 §11.5.5：scheduler 行为参数为内置常量
 	)
 	a.CancelRegistry = cancelReg
 	a.MaxRetries = schedulerMaxRetries // 有限重试——见常量注释（2026-04-25 改）
-	a.IdleThreshold = 0 // 永不空闲退出（预制代理）
-	a.CompactTokenThreshold = cfg.CompactTokenThreshold
-	a.CompactKeepRecent = cfg.CompactKeepRecent
+	a.IdleThreshold = 0                // 永不空闲退出（预制代理）
+	// CompactTokenThreshold / CompactKeepRecent 不再从 cfg 读——v4 §11.5.5 把
+	// scheduler 行为参数全部内置；agent.processTask 自带 fallback（80000 / 3）。
 	a.TransferNoteMaxTokens = cfg.TransferNoteMaxTokens
 	a.OnTaskStart = func(taskID string) { holder.Set(taskID) }
 	a.OnTaskEnd = func(taskID string, success bool) { holder.Set("") }

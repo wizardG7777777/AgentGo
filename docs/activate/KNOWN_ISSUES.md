@@ -2,6 +2,78 @@
 
 本文档记录 MVP 阶段已知的设计缺陷和未实现的功能，供调试和后续迭代参考。
 
+## v4 升级实施状态（2026-04-26 增量基建首批落地）
+
+详见 `docs/activate/nextUpgrade_v4.md` 顶部"实施进度"段。
+
+**已落地**（合 13 个 commit 的工作量，本批一次性提交）：
+- **§10 工具调用错误恢复（Did-You-Mean）**：`internal/tools/suggest/`（基于 sahilm/fuzzy）
+  + `glob_search` / `read_file` 空结果路径接入
+- **§11.7.3 Token 实测锚定**：`HistoryEntry` 三字段 + `agent.go` 记录点
+- **§11.7.4 截断策略**：`internal/agent/token_truncate.go`（`PredictNextPromptTokens` /
+  `TruncateHistory` / `keepRecentForTruncate=6`）
+  > ✅ **2026-04-26 装配漏接已修复（同 session 接通）**：
+  > 1. `agent.go` `processTask` `Execute` 调用前接通 `TruncateHistory`（开关
+  >    `a.ContextLimit > 0`，v3 兼容路径零回归）；`ErrContextLimitTooSmall` 不 fail 任务，
+  >    warn + 用截断 history 继续，由 §9.3 ErrUnrecoverable 兜底
+  > 2. 新增 `trace.KindHistoryTruncated` 事件——下次复盘可 `grep history_truncated` 验证截断生效
+  > 3. `setting.v4.yaml` explorer `context_limit: 8000 → 16000`（实测 scheduler 首调
+  >    prompt_tokens=8525，原值会让 explorer 一启动就触发硬截断）
+  > 4. 6 个回归用例（`token_truncate_test.go`）锁住 truncate / predict 不变量
+  >
+  > 这是 CLAUDE.md "Shipping conventions" 第 1 条警告的"装配漏接"实证——单测全绿 +
+  > 启动烟测过 = 漏 S7 接通不会被任何已有验证捕获。详见 `nextUpgrade_v4.md` §11.7.4
+  > 修复落地点说明 + 设计反思。
+- **§11.4 v4 Config 类型**：`LLMConfig` / `AgentKind` / `SchedulerKind` / `InfraConfig`
+  四子类 / `AgentRuntimeConfig` 与 v3 顶层字段并存
+- **§11.5.3 启动校验**：`Config.Validate()` 12 条规则
+- **§11.3 环境变量展开**：`LoadConfig` 反序列化前 `os.ExpandEnv`
+- **§11.6.6 worker/explorer 折叠**：`internal/runner/`（统一 `Runner` + `CurrentTaskHolder`）
+- **§11.6.1 + §9.5 启动期可观测性**：`runtime_builder.go`
+  （`buildKindLLMClient` / `buildAgentRuntime` / `buildSchedulerRuntime`）+
+  `probe.go`（`printStartupBanner` + `startupProbe`）
+- **§11.8 S8 默认提示词外置**：`prompts/worker.md` + `prompts/explorer.md`（从 Go const 抽出）+
+  `setting.v4.yaml` 参考模板
+
+**Phase C — bootstrap 切换（已落地，2026-04-26 同 session 完成 ✅）**：
+- bootstrap.go 主流程引入 v4 kind-based 路径：`if len(cfg.Agents) > 0` 走 §11.6.1
+  伪代码 step 6（按 kind × replicas 实例化统一 `runner.Runner`）；否则走原 v3
+  worker/explorer 创建逻辑（兼容现有 setting.yaml）
+- `Config.mirrorV4ToV3()` 把 v4 嵌套块字段镜像到 v3 顶层字段——让 v4 yaml 用户在
+  bootstrap 仍读 v3 字段时也能拿到正确值
+- `bootstrap.System.Runners` 字段保存 v4 路径产物；`Start()` 据此分支启动
+  goroutine（v4 path 跳过 worker/explorer goroutine 启动）
+- `Bootstrap()` 早期插入 `cfg.Validate()` + `printStartupBanner` + `startupProbe`
+  调用（§9.5.1 banner + §9.5 TCP probe），失败按 `startup_probe_failure_action`
+  分支（warn/exit）
+- **端到端烟测通过**（CLAUDE.md "Shipping conventions" 规则 1）：
+  - `setting.v4.yaml`：banner 列出 3 个 kind，TCP probe 到 api.deepseek.com:443
+    成功，4 个 runner 实例（worker×3 + explorer×1）启动 + /quit 干净关闭
+  - `setting.yaml`（v3）：v3 explorer + 3 个 worker 启动如旧；零 regression
+
+**Phase D — v3 兼容层整体下线（已落地，2026-04-26 同 session 完成 ✅）**：
+- 删除 `internal/worker/` + `internal/explorer/` 两个 package（孤儿包清零）
+- 删除 `Config` struct 中的 23 个 v3 顶层字段 + `mirrorV4ToV3` + `ValidateWorkers`
+  + `ValidateAgentDeclarations` + `Resolved{Agent,Worker}Declaration`
+- 删除 `bootstrap.go` 全部 `if len(cfg.Agents) == 0` 分支；统一走 `runner.Runner`
+- 系统级常量化：`mailbox.DefaultChainMaxDepth=10` / `mailbox.DefaultInboxSize=32`
+  / `scheduler.schedulerMaxLoops=10` / `Infra.Store.DefaultTimeoutSec`（v4 §11.5.4 / §11.5.5）
+- 默认 `setting.yaml` 已替换为 v4 格式（与 `setting.v4.yaml` 内容等价）
+- 新增：banner 第二行打印 `Config File: <path>`，避免"测 v4 但实跑 v3 默认"的混淆
+- `Validate()` 现在硬要求 `agents` 非空——空 yaml 启动直接 `agents 列表为空` 退出
+- 删除 `internal/config/config_test.go`（59 个 v3 字段断言）和
+  `internal/bootstrap/bootstrap_test.go`（v3 worker/explorer 装配测试）
+- `main_startup_test.go` 重写：fallback 测试改为断言 v4 fail-fast
+- `go test ./...` 全绿；`./agentgo.exe -config setting.v4.yaml` 烟测通过
+
+**未落地（仍待跟进，但**非阻塞**）**：
+- 移除 `tools.MetaGroup.DisablePublishTask` 标志（allowlist filter 已等价表达；本次
+  worker/explorer 删除后该标志位的最后一个调用方也消失了，已是真正的死代码）
+- §11.8 S11 `trace.Emit` 对称扫描脚本（永久不变量回归测试）
+- **§11.7.4 截断策略接入主循环**（红态——见上方说明）
+
+---
+
 ## Hook System 阶段 1 完成（2026-04-09）
 
 详见 `docs/archived/hookSystem.md`（已归档，阶段 1+2 全部落地）。阶段 1 实施 8 个 commit 落地：

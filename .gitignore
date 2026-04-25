@@ -50,3 +50,4 @@ setting.yaml
 .idea
 .claude/settings.local.json
 test_multi_agent.yaml
+setting.v4.yaml

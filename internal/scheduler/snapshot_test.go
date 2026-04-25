@@ -24,7 +24,7 @@ import (
 func TestBuildBoardJSON_Resources(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 4}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 4}}}
 
 	// 一个 processing worker task，agent worker-1 持有
 	t1 := &model.Task{Description: "in flight"}
@@ -67,7 +67,7 @@ func TestBuildBoardJSON_ResourcesDefault(t *testing.T) {
 func TestBuildBoardJSON_TriggerFields(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	out := BuildBoardJSON(s, cfg, "plan", model.Event{
 		Type:    model.EventUserInput,
@@ -88,7 +88,7 @@ func TestBuildBoardJSON_TriggerFields(t *testing.T) {
 func TestBuildBoardJSON_TaskWithArtifacts(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	task := &model.Task{Description: "writes a file"}
 	s.PublishTask(task)
@@ -106,7 +106,7 @@ func TestBuildBoardJSON_TaskWithArtifacts(t *testing.T) {
 func TestBuildBoardJSON_EmptyStore(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 2}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 2}}}
 
 	out := BuildBoardJSON(s, cfg, "immediate", model.Event{Type: model.EventUserInput}, SnapshotSources{})
 
@@ -131,7 +131,7 @@ func parseSnapshot(t *testing.T, s string) boardSnapshot {
 func TestBuildBoardJSON_AgentsFromMailboxRegistry(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 2}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 2}}}
 
 	mb := mailbox.NewRegistry(8)
 	mb.Register("worker-1", "")
@@ -176,7 +176,7 @@ func TestBuildBoardJSON_AgentsFromMailboxRegistry(t *testing.T) {
 func TestBuildBoardJSON_AgentsCurrentTaskMapping(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 2}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 2}}}
 
 	mb := mailbox.NewRegistry(8)
 	mb.Register("worker-1", "")
@@ -209,7 +209,7 @@ func TestBuildBoardJSON_AgentsCurrentTaskMapping(t *testing.T) {
 func TestBuildBoardJSON_AgentsRosterLockedFiles(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	mb := mailbox.NewRegistry(8)
 	mb.Register("worker-1", "")
@@ -244,7 +244,7 @@ func TestBuildBoardJSON_AgentsRosterLockedFiles(t *testing.T) {
 func TestBuildBoardJSON_AgentsNilMBRegistry_OmitsField(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	out := BuildBoardJSON(s, cfg, "immediate", model.Event{}, SnapshotSources{})
 	if strings.Contains(out, `"agents"`) {
@@ -255,7 +255,7 @@ func TestBuildBoardJSON_AgentsNilMBRegistry_OmitsField(t *testing.T) {
 func TestBuildBoardJSON_SessionHistoryFromHistory(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	hist := NewSessionHistory(8)
 
@@ -295,7 +295,7 @@ func TestBuildBoardJSON_SessionHistoryFromHistory(t *testing.T) {
 func TestBuildBoardJSON_SessionHistoryOutcomeFromStore(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	// 真实发布一个 task 到 store，让 outcome 能被查到
 	task := &model.Task{Description: "real", EventType: "__scheduler__"}
@@ -323,7 +323,7 @@ func TestBuildBoardJSON_SessionHistoryOutcomeFromStore(t *testing.T) {
 func TestBuildBoardJSON_SessionHistoryNil_OmitsField(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	out := BuildBoardJSON(s, cfg, "immediate", model.Event{}, SnapshotSources{})
 	if strings.Contains(out, `"session_history"`) {
@@ -350,7 +350,7 @@ func TestAgentTypeFromEventType(t *testing.T) {
 func TestBuildBoardJSON_AgentCapabilities_WorkerAndSpecialized(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	reg := NewAgentRegistry()
 	reg.Register(SpecializedAgent{
@@ -389,7 +389,7 @@ func TestBuildBoardJSON_AgentCapabilities_WorkerAndSpecialized(t *testing.T) {
 func TestBuildBoardJSON_AgentCapabilities_NilWorker(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	reg := NewAgentRegistry()
 	reg.Register(SpecializedAgent{
@@ -416,7 +416,7 @@ func TestBuildBoardJSON_AgentCapabilities_NilWorker(t *testing.T) {
 func TestBuildBoardJSON_AgentCapabilities_BothNil_OmitsField(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	out := BuildBoardJSON(s, cfg, "immediate", model.Event{}, SnapshotSources{})
 	if strings.Contains(out, `"agent_capabilities"`) {
@@ -427,7 +427,7 @@ func TestBuildBoardJSON_AgentCapabilities_BothNil_OmitsField(t *testing.T) {
 func TestBuildBoardJSON_AgentCapabilities_EmptyCapsAndDesc(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	workerCaps := &AgentCapabilityInfo{
 		Capabilities: []string{},
@@ -637,7 +637,7 @@ func TestProperty_SnapshotUnavailableTools(t *testing.T) {
 		// --- Build a minimal task store + config ---
 		ch := make(chan model.Event, 64)
 		s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-		cfg := &config.Config{WorkerCount: 1}
+		cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 		// --- Generate random ToolHealthStatus: nil, empty, all-available, or mixed ---
 		choice := rapid.IntRange(0, 3).Draw(t, "toolHealthChoice")
@@ -731,7 +731,7 @@ func TestBuildBoardJSON_BackwardCompat_NilToolHealth(t *testing.T) {
 	// to the output before the tool-health-probe feature was introduced.
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	out := BuildBoardJSON(s, cfg, "immediate", model.Event{Type: model.EventUserInput}, SnapshotSources{})
 	if strings.Contains(out, "unavailable_tools") {
@@ -749,7 +749,7 @@ func TestBuildBoardJSON_BackwardCompat_AllToolsAvailable(t *testing.T) {
 	// UnavailableTools() returns nil → omitempty omits the field.
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 2}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 2}}}
 
 	th := probe.NewToolHealthStatus()
 	th.Record(probe.ProbeResult{Tool: "web_search", Available: true, Latency: 100 * time.Millisecond})
@@ -779,7 +779,7 @@ func TestProperty_PerProfileAgentCapabilitiesOutput(t *testing.T) {
 		// --- 构造最小 task store + config ---
 		ch := make(chan model.Event, 64)
 		s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-		cfg := &config.Config{WorkerCount: 1}
+		cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 		// --- 生成随机 WorkerCapabilitiesByProfile（1-5 个 profile）---
 		numProfiles := rapid.IntRange(1, 5).Draw(t, "numProfiles")
@@ -893,7 +893,7 @@ func TestBuildBoardJSON_BackwardCompat_NoProfileFields(t *testing.T) {
 	// Validates: Requirements 3.3
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 2}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 2}}}
 
 	// Set up mailbox registry so agents section is populated
 	mb := mailbox.NewRegistry(8)
@@ -972,192 +972,3 @@ func TestBuildBoardJSON_BackwardCompat_NoProfileFields(t *testing.T) {
 	}
 }
 
-// ---- Task 7.3: Integration test — workers list mode Board Snapshot contains per-profile information ----
-
-func TestBuildBoardJSON_Integration_WorkersListPerProfile(t *testing.T) {
-	// Integration test: construct a config with workers list containing different profiles,
-	// then verify BuildBoardJSON output contains per-profile information in both
-	// agents and agent_capabilities arrays.
-	//
-	// Validates: Requirements 3.1, 3.2, 5.1, 5.2
-
-	ch := make(chan model.Event, 64)
-	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-
-	// Config with workers list (3 workers, 2 distinct profiles + 1 empty profile)
-	cfg := &config.Config{
-		Workers: []config.WorkerDeclaration{
-			{ID: "writer-1", Profile: "worker_standard"},
-			{ID: "writer-2", Profile: "worker_standard"},
-			{ID: "reader-1", Profile: "worker_readonly"},
-		},
-	}
-
-	// Set up mailbox registry with all workers registered
-	mb := mailbox.NewRegistry(8)
-	mb.Register("writer-1", "")
-	mb.Register("writer-2", "")
-	mb.Register("reader-1", "")
-
-	// Publish a task and have writer-1 claim it (to verify current_task mapping still works)
-	t1 := &model.Task{Description: "refactor auth module"}
-	if err := s.PublishTask(t1); err != nil {
-		t.Fatalf("publish: %v", err)
-	}
-	if err := s.ClaimTask("writer-1", t1.ID); err != nil {
-		t.Fatalf("claim: %v", err)
-	}
-
-	// WorkerProfiles: agentID → profile name
-	workerProfiles := map[string]string{
-		"writer-1": "worker_standard",
-		"writer-2": "worker_standard",
-		"reader-1": "worker_readonly",
-	}
-
-	// WorkerCapabilitiesByProfile: per-profile capability declarations
-	capsByProfile := map[string]*AgentCapabilityInfo{
-		"worker_standard": {
-			Capabilities: []string{"code_edit", "shell_exec", "web_search", "subtask_publish", "message"},
-			Description:  "standard worker with full tool access",
-		},
-		"worker_readonly": {
-			Capabilities: []string{"codebase_read", "web_search", "message"},
-			Description:  "read-only worker for investigation tasks",
-		},
-	}
-
-	// Optional: add an explorer to verify specialized agents coexist with per-profile workers
-	reg := NewAgentRegistry()
-	reg.Register(SpecializedAgent{
-		EventType:    "explore",
-		Count:        1,
-		Role:         "read-only investigator",
-		Capabilities: []string{"codebase_read", "web_search"},
-	})
-
-	sources := SnapshotSources{
-		MBRegistry:                  mb,
-		AgentRegistry:               reg,
-		WorkerProfiles:              workerProfiles,
-		WorkerCapabilitiesByProfile: capsByProfile,
-	}
-
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{Type: model.EventUserInput}, sources)
-	bs := parseSnapshot(t, out)
-
-	// ---- Verify resources.agents contains profile fields (Req 3.1) ----
-	if len(bs.Resources.Agents) != 3 {
-		t.Fatalf("agents len=%d, want 3", len(bs.Resources.Agents))
-	}
-
-	agentByID := make(map[string]agentSnapshot)
-	for _, a := range bs.Resources.Agents {
-		agentByID[a.ID] = a
-	}
-
-	// writer-1 should have profile "worker_standard"
-	if agentByID["writer-1"].Profile != "worker_standard" {
-		t.Errorf("writer-1 profile=%q, want \"worker_standard\"", agentByID["writer-1"].Profile)
-	}
-	if agentByID["writer-1"].Type != "worker" {
-		t.Errorf("writer-1 type=%q, want \"worker\"", agentByID["writer-1"].Type)
-	}
-	// writer-1 should have current task
-	if agentByID["writer-1"].CurrentTaskID != t1.ID {
-		t.Errorf("writer-1 current_task_id=%q, want %q", agentByID["writer-1"].CurrentTaskID, t1.ID)
-	}
-
-	// writer-2 should also have profile "worker_standard"
-	if agentByID["writer-2"].Profile != "worker_standard" {
-		t.Errorf("writer-2 profile=%q, want \"worker_standard\"", agentByID["writer-2"].Profile)
-	}
-
-	// reader-1 should have profile "worker_readonly"
-	if agentByID["reader-1"].Profile != "worker_readonly" {
-		t.Errorf("reader-1 profile=%q, want \"worker_readonly\"", agentByID["reader-1"].Profile)
-	}
-
-	// ---- Verify agent_capabilities contains per-profile records (Req 3.2) ----
-	// Expected: 2 worker profiles + 1 explorer = 3 entries
-	if len(bs.Resources.AgentCapabilities) != 3 {
-		t.Fatalf("agent_capabilities len=%d, want 3 (2 worker profiles + 1 explorer)",
-			len(bs.Resources.AgentCapabilities))
-	}
-
-	capByKey := make(map[string]agentCapabilitySnapshot)
-	for _, ac := range bs.Resources.AgentCapabilities {
-		key := ac.AgentType
-		if ac.Profile != "" {
-			key = ac.AgentType + "/" + ac.Profile
-		}
-		capByKey[key] = ac
-	}
-
-	// worker_standard capabilities
-	stdCap, ok := capByKey["worker/worker_standard"]
-	if !ok {
-		t.Fatal("missing agent_capabilities record for worker/worker_standard")
-	}
-	if stdCap.AgentType != "worker" {
-		t.Errorf("worker_standard agent_type=%q, want \"worker\"", stdCap.AgentType)
-	}
-	if stdCap.Profile != "worker_standard" {
-		t.Errorf("worker_standard profile=%q, want \"worker_standard\"", stdCap.Profile)
-	}
-	if len(stdCap.Capabilities) != 5 {
-		t.Errorf("worker_standard capabilities len=%d, want 5", len(stdCap.Capabilities))
-	}
-	if stdCap.Description != "standard worker with full tool access" {
-		t.Errorf("worker_standard description=%q, want \"standard worker with full tool access\"", stdCap.Description)
-	}
-
-	// worker_readonly capabilities
-	roCap, ok := capByKey["worker/worker_readonly"]
-	if !ok {
-		t.Fatal("missing agent_capabilities record for worker/worker_readonly")
-	}
-	if roCap.AgentType != "worker" {
-		t.Errorf("worker_readonly agent_type=%q, want \"worker\"", roCap.AgentType)
-	}
-	if roCap.Profile != "worker_readonly" {
-		t.Errorf("worker_readonly profile=%q, want \"worker_readonly\"", roCap.Profile)
-	}
-	if len(roCap.Capabilities) != 3 {
-		t.Errorf("worker_readonly capabilities len=%d, want 3", len(roCap.Capabilities))
-	}
-	if roCap.Description != "read-only worker for investigation tasks" {
-		t.Errorf("worker_readonly description=%q, want \"read-only worker for investigation tasks\"", roCap.Description)
-	}
-
-	// explorer capabilities (specialized agent coexists with per-profile workers)
-	expCap, ok := capByKey["explore"]
-	if !ok {
-		t.Fatal("missing agent_capabilities record for explore")
-	}
-	if expCap.AgentType != "explore" {
-		t.Errorf("explore agent_type=%q, want \"explore\"", expCap.AgentType)
-	}
-	if expCap.Profile != "" {
-		t.Errorf("explore profile=%q, want empty", expCap.Profile)
-	}
-
-	// ---- Verify worker_count reflects workers list length (Req 5.1, 5.2) ----
-	if bs.Resources.WorkerCount != 3 {
-		t.Errorf("worker_count=%d, want 3 (from workers list length)", bs.Resources.WorkerCount)
-	}
-
-	// ---- Verify busy_workers / available_workers are correct ----
-	// writer-1 is processing a task, so busy=1, available=2
-	if bs.Resources.BusyWorkers != 1 {
-		t.Errorf("busy_workers=%d, want 1", bs.Resources.BusyWorkers)
-	}
-	if bs.Resources.AvailableWorkers != 2 {
-		t.Errorf("available_workers=%d, want 2", bs.Resources.AvailableWorkers)
-	}
-
-	// ---- Verify raw JSON contains "profile" keys (sanity check) ----
-	if !strings.Contains(out, `"profile"`) {
-		t.Errorf("raw JSON should contain \"profile\" key when WorkerProfiles is set\nJSON: %s", out)
-	}
-}

@@ -130,7 +130,9 @@ func TestSchedulerBundle_EndToEnd_UserInputToReportDone(t *testing.T) {
 	r := roster.NewMemoryRoster()
 	mb := mailbox.NewRegistry(8)
 	cfg := config.DefaultConfig()
-	cfg.SchedulerMaxLoops = 5
+	// SchedulerMaxLoops 现已是 internal/scheduler 包级常量（schedulerMaxLoops=10），不再可调。
+	// 老测试用 5 是为了缩短迭代；本测试改用脚本化 LLM 即可在 1-2 步完成，无需调 max_loops。
+	cfg.Agents = []config.AgentKind{{Kind: "worker", Replicas: 1}}
 
 	mockLLM := &scriptedLLM{
 		responses: []llm.Response{

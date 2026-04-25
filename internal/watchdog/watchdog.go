@@ -36,7 +36,7 @@ func New(s store.TaskStore, cfg *config.Config, eventCh chan<- model.Event, r ro
 
 // Run starts the watchdog's ticker-driven inspection loop.
 func (w *Watchdog) Run(ctx context.Context) {
-	ticker := time.NewTicker(time.Duration(w.Config.WatchdogIntervalSec) * time.Second)
+	ticker := time.NewTicker(time.Duration(w.Config.Infra.Watchdog.IntervalSec) * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -124,7 +124,7 @@ func (w *Watchdog) checkProcessingTask(task *model.Task) {
 func (w *Watchdog) checkPendingTask(task *model.Task) {
 	// Unclaimed detection: pending too long
 	if !task.CreatedAt.IsZero() {
-		unclaimedThreshold := time.Duration(w.Config.DefaultTimeoutSec) * time.Second
+		unclaimedThreshold := time.Duration(w.Config.Infra.Store.DefaultTimeoutSec) * time.Second
 		elapsed := time.Since(task.CreatedAt)
 		if elapsed > unclaimedThreshold {
 			log.Printf("[watchdog] task %s unclaimed for too long", task.ID)

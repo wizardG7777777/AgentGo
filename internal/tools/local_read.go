@@ -13,6 +13,7 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/pathutil"
 	"agentgo/internal/tools/schema"
+	"agentgo/internal/tools/suggest"
 )
 
 // LocalReadGroup 提供只读的本地文件系统工具集合：
@@ -130,6 +131,13 @@ func (g LocalReadGroup) readFile(ctx context.Context, args map[string]any) (stri
 
 	data, err := os.ReadFile(path)
 	if err != nil {
+		// §10 Did-You-Mean：路径不存在时，列父目录的 basename 作为候选。
+		// 不跨目录提示——避免 internal/foo/x.go 不存在时建议 cmd/bar/x.go 误导
+		// （详见 nextUpgrade_v4.md §10.4 read_file 候选构造范围）。
+		if os.IsNotExist(err) {
+			suggestion := buildPathDidYouMean(path)
+			return "", fmt.Errorf("读取文件失败: %w%s", err, suggestion)
+		}
 		return "", fmt.Errorf("读取文件失败: %w", err)
 	}
 	hash := computeSHA256(data)
@@ -384,6 +392,10 @@ func (g LocalReadGroup) globSearch(ctx context.Context, args map[string]any) (st
 
 // toolGlobSearch 递归遍历 rootDir，返回匹配 pattern 的文件相对路径列表。
 // 支持 ** 递归通配，跳过隐藏目录，结果上限 200 条。
+//
+// §10 Did-You-Mean：当 totalMatched==0 时，把本次 Walk 已扫到的所有相对路径
+// 作为候选池，对 pattern 的"文件名主干"（去掉 **/、* 等通配后的纯文件名段）做
+// 模糊匹配，给 LLM 一段 "Did you mean: X / Y / Z" 提示。详见 nextUpgrade_v4.md §10.4。
 func toolGlobSearch(ctx context.Context, pattern, rootDir string) (string, error) {
 	info, err := os.Stat(rootDir)
 	if err != nil || !info.IsDir() {
@@ -392,6 +404,7 @@ func toolGlobSearch(ctx context.Context, pattern, rootDir string) (string, error
 
 	const resultLimit = 200
 	var matches []string
+	var allPaths []string // §10 候选池——本次 Walk 已扫到的全部相对路径
 	totalMatched := 0
 	scannedFiles := 0
 
@@ -411,6 +424,7 @@ func toolGlobSearch(ctx context.Context, pattern, rootDir string) (string, error
 			return nil
 		}
 		relPath = filepath.ToSlash(relPath)
+		allPaths = append(allPaths, relPath)
 		matched, matchErr := matchGlob(pattern, relPath)
 		if matchErr != nil {
 			return nil
@@ -425,11 +439,15 @@ func toolGlobSearch(ctx context.Context, pattern, rootDir string) (string, error
 	})
 
 	if totalMatched == 0 {
-		return fmt.Sprintf(
+		base := fmt.Sprintf(
 			"未找到匹配 %q 的文件（扫描 %d 个文件，根目录=%s，隐藏目录已跳过）。"+
 				"若意外为空：1) 确认 pattern 符合 glob 语法（** 递归、* 单层、? 单字符）；2) pattern 基于 rootDir 的相对路径匹配，不要以 / 开头；3) 用 list_dir 确认 rootDir 下有目标文件",
 			pattern, scannedFiles, rootDir,
-		), nil
+		)
+		// Did-You-Mean：候选 = 本次扫描列表，pattern 用文件名主干
+		stem := globPatternStem(pattern)
+		hits := suggest.Suggest(stem, allPaths, 3)
+		return base + suggest.FormatForToolMessage(hits), nil
 	}
 	result := strings.Join(matches, "\n")
 	if totalMatched > resultLimit {
@@ -517,4 +535,49 @@ func matchGlob(pattern, relPath string) (bool, error) {
 	}
 
 	return true, nil
+}
+
+// buildPathDidYouMean 在 read_file 等以路径为参数的工具失败（路径不存在）时，
+// 返回 "\n\nDid you mean: ..." 文本段。候选 = 父目录的 ReadDir 列表（§10.4）。
+// 父目录也不存在 / 读取失败时返回空串——降级为单纯的 IsNotExist 错误，无误导。
+func buildPathDidYouMean(failedPath string) string {
+	parent := filepath.Dir(failedPath)
+	if parent == "" || parent == failedPath {
+		return ""
+	}
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return ""
+	}
+	candidates := make([]string, 0, len(entries))
+	for _, e := range entries {
+		candidates = append(candidates, e.Name())
+	}
+	hits := suggest.Suggest(filepath.Base(failedPath), candidates, 3)
+	return suggest.FormatForToolMessage(hits)
+}
+
+// globPatternStem 从 glob pattern 中抽出"文件名主干"用作 fuzzy 候选 pattern。
+// 去掉 **/、* 等递归/单层通配符，仅保留字面字符串部分；若主干为空则回退到原 pattern
+// 的最后一段。
+//
+// 示例：
+//
+//	**/Architecture.md  → "Architecture.md"
+//	**/auth*.go         → "auth.go"（保守剥离 *）
+//	*_test.go           → "_test.go"
+//	docs/**/foo.md      → "foo.md"
+func globPatternStem(pattern string) string {
+	pattern = filepath.ToSlash(pattern)
+	last := pattern
+	if idx := strings.LastIndex(pattern, "/"); idx >= 0 {
+		last = pattern[idx+1:]
+	}
+	stem := strings.ReplaceAll(last, "**", "")
+	stem = strings.ReplaceAll(stem, "*", "")
+	stem = strings.ReplaceAll(stem, "?", "")
+	if stem == "" {
+		return last // 全是通配符——退回到最后一段（含 * **），让 fuzzy 自己尽力
+	}
+	return stem
 }

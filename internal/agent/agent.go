@@ -51,14 +51,23 @@ type ExecuteResult struct {
 
 // HistoryEntry 记录 ReAct 循环中单轮 TaskExecutor 调用的结果。
 // 包含完整的 tool calling 信息，确保历史消息能正确重建为 OpenAI 协议格式。
+//
+// PromptTokens / CompletionTokens / Model 由 nextUpgrade_v4.md §11.7.3 引入，
+// 用于 PredictNextPromptTokens 的"实测锚定 + 新增估算"策略：
+//   - PromptTokens：产生该条 assistant 回复时的实测 prompt token 数（来自 SDK Usage）
+//   - CompletionTokens：同上，本轮 completion 实测值
+//   - Model：产生该回复时使用的模型名（不同模型 tokenizer 不同，跨模型实测值不可比）
 type HistoryEntry struct {
 	Output           string                     `json:"output"`
 	ToolCalled       bool                       `json:"tool_called"`
 	AssistantContent string                     `json:"assistant_content"`
 	ToolCalls        []llm.ToolCall             `json:"tool_calls"`
 	ToolResults      []ToolResult               `json:"tool_results"`
-	ExtraFields      map[string]json.RawMessage `json:"extra_fields,omitempty"` // 层 1 通用透传：assistant 消息的非标字段
-	IncomingMail     string                     `json:"incoming_mail,omitempty"` // 非空时为收到的代理间邮件，注入为 user 角色消息
+	ExtraFields      map[string]json.RawMessage `json:"extra_fields,omitempty"`     // 层 1 通用透传：assistant 消息的非标字段
+	IncomingMail     string                     `json:"incoming_mail,omitempty"`    // 非空时为收到的代理间邮件，注入为 user 角色消息
+	PromptTokens     int                        `json:"prompt_tokens,omitempty"`    // §11.7.3 实测锚定：本轮 LLM 调用的实测 prompt tokens
+	CompletionTokens int                        `json:"completion_tokens,omitempty"` // §11.7.3 实测锚定：本轮 completion tokens
+	Model            string                     `json:"model,omitempty"`            // §11.7.3 模型切换基准重置：产生该条回复时使用的模型名
 }
 
 // TaskExecutor is a pluggable function that executes a task.
@@ -78,6 +87,13 @@ type Agent struct {
 	CancelRegistry        *store.TaskCancelRegistry
 	CompactTokenThreshold int                               // Layer 2 触发阈值（prompt tokens），默认 80000
 	CompactKeepRecent     int                               // 压缩时保留最近 N 条历史，默认 3
+	// Model 是该 Agent 当前生效的模型名，用于 HistoryEntry.Model 记录。
+	// nextUpgrade_v4.md §11.7.3：跨模型实测值不可比，PredictNextPromptTokens
+	// 仅锚定当前模型一致的最近一条 PromptTokens > 0 条目。空串时退化为粗略估算。
+	Model string
+	// ContextLimit 是历史 token 硬上限（§11.7.4 截断保护）。0 表示不做硬限截断
+	// （仅 Layer 1 + Layer 2 压缩生效，与 v3 行为兼容）。详见 nextUpgrade_v4.md §11.7.5。
+	ContextLimit int
 	OnTaskStart           func(taskID string)               // 任务开始处理时的回调，可选
 	OnTaskEnd             func(taskID string, success bool) // 任务结束回调（defer 保证触发），可选
 	FileCache             *FileStateCache                   // Agent 级别的文件读取缓存，可选
@@ -473,6 +489,40 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			return
 		}
 
+		// §11.7.4 layer-3 截断保护：每轮 LLM 调用前校验预测 prompt_tokens 不超
+		// per-kind ContextLimit；超出时从最老条目（保护 head 1 + tail keepRecentForTruncate）
+		// 开始丢弃。失败模式（截断到下界后仍超）：warn + 用截断 history 继续——
+		// 让 LLM 调用真不行时由 §9.3 ErrUnrecoverable 兜底，避免在截断阶段就把
+		// 任务标失败。ContextLimit<=0（v3 兼容路径未注入此字段）时整段为 no-op。
+		//
+		// 装配漏接修复（2026-04-26）：本调用此前从未被引入主循环，导致 §11.7.5
+		// 描述的"压缩→截断"协同的截断那一支死代码——现已接通，trace 上可 grep
+		// KindHistoryTruncated 验证。
+		if a.ContextLimit > 0 {
+			before := PredictNextPromptTokens(history, a.Model, task.SystemPrompt, "")
+			truncated, terr := TruncateHistory(history, a.Model, task.SystemPrompt, a.ContextLimit)
+			if len(truncated) != len(history) || terr != nil {
+				after := PredictNextPromptTokens(truncated, a.Model, task.SystemPrompt, "")
+				log.Printf("[agent %s] task=%s loop=%d 历史截断: %d→%d entries, ~%d→~%d prompt tokens",
+					a.ID, taskID, i, len(history), len(truncated), before, after)
+				trace.Emit(trace.Event{
+					Kind:               trace.KindHistoryTruncated,
+					TaskID:             taskID,
+					AgentID:            a.ID,
+					Loop:               i,
+					PromptTokensBefore: before,
+					PromptTokensAfter:  after,
+					KeptEntries:        len(truncated),
+					Strategy:           "head_keep_tail_keep",
+				})
+				if terr != nil {
+					log.Printf("[agent %s] task=%s loop=%d 截断到 head+tail 后仍 ~%d > context_limit=%d: %v（用截断 history 继续，依赖 §9.3 错误码兜底）",
+						a.ID, taskID, i, after, a.ContextLimit, terr)
+				}
+				history = truncated
+			}
+		}
+
 		// 构建只读副本传入 executor
 		histCopy := make([]HistoryEntry, len(history))
 		copy(histCopy, history)
@@ -567,6 +617,9 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		}
 
 		// ToolCalled == true：追加到历史，继续循环
+		// PromptTokens / CompletionTokens / Model 用于 §11.7.3 实测锚定的下次预测，
+		// 详见 PredictNextPromptTokens / TruncateHistory。Model 字段为空串时（Agent
+		// 未注入模型名）退化为 v3 行为——估算时不做模型一致性筛选。
 		history = append(history, HistoryEntry{
 			Output:           result.Output,
 			ToolCalled:       result.ToolCalled,
@@ -574,6 +627,9 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			ToolCalls:        result.ToolCalls,
 			ToolResults:      result.ToolResults,
 			ExtraFields:      result.ExtraFields, // 层 1：透传 reasoning_content 等非标字段
+			PromptTokens:     result.PromptTokens,
+			CompletionTokens: result.CompletionTokens,
+			Model:            a.Model,
 		})
 
 		// 进度通知：在 history append 之后、PhaseLoopPost 之前发送

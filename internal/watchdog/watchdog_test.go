@@ -15,7 +15,7 @@ import (
 func newTestWatchdog() (*Watchdog, store.TaskStore, chan model.Event) {
 	ch := make(chan model.Event, 64)
 	cfg := config.DefaultConfig()
-	cfg.DefaultTimeoutSec = 300
+	cfg.Infra.Store.DefaultTimeoutSec = 300
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	r := roster.NewMemoryRoster()
 	w := New(s, cfg, ch, r, nil) // 既有测试不需要 MailRegistry；nil 让 sendCrashReport 静默跳过
@@ -75,7 +75,7 @@ func TestWatchdog_NoFalsePositive(t *testing.T) {
 
 func TestWatchdog_UnclaimedDetection(t *testing.T) {
 	w, s, _ := newTestWatchdog()
-	w.Config.DefaultTimeoutSec = 1 // 1 second threshold for testing
+	w.Config.Infra.Store.DefaultTimeoutSec = 1 // 1 second threshold for testing
 
 	task := &model.Task{Description: "unclaimed task"}
 	s.PublishTask(task)
@@ -116,7 +116,7 @@ func TestWatchdog_CascadeCancellation(t *testing.T) {
 
 func TestWatchdog_ContextCancellation(t *testing.T) {
 	w, _, _ := newTestWatchdog()
-	w.Config.WatchdogIntervalSec = 1
+	w.Config.Infra.Watchdog.IntervalSec = 1
 
 	ctx, cancel := context.WithCancel(context.Background())
 

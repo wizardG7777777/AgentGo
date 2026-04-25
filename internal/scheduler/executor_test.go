@@ -33,7 +33,7 @@ func makeInnerExecutor(callCount *int32, capturedHistory *[]agent.HistoryEntry) 
 func TestSchedulerExecutor_NoBatch_DirectExecute(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	schedTask := &model.Task{Description: "scheduler", EventType: "__scheduler__"}
 	s.PublishTask(schedTask)
@@ -64,7 +64,7 @@ func TestSchedulerExecutor_NoBatch_DirectExecute(t *testing.T) {
 func TestSchedulerExecutor_InjectsBoardSnapshotIntoHistory(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 2}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 2}}}
 
 	schedTask := &model.Task{Description: "scheduler", EventType: "__scheduler__"}
 	s.PublishTask(schedTask)
@@ -104,7 +104,7 @@ func TestSchedulerExecutor_InjectsBoardSnapshotIntoHistory(t *testing.T) {
 func TestSchedulerExecutor_BatchPending_WaitsUntilComplete(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	// scheduler 自身 task
 	schedTask := &model.Task{Description: "sched", EventType: "__scheduler__"}
@@ -163,7 +163,7 @@ func TestSchedulerExecutor_BatchPending_WaitsUntilComplete(t *testing.T) {
 func TestSchedulerExecutor_BatchUpdateChannelWakesWait(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	schedTask := &model.Task{Description: "sched"}
 	s.PublishTask(schedTask)
@@ -209,7 +209,7 @@ func TestSchedulerExecutor_BatchUpdateChannelWakesWait(t *testing.T) {
 func TestSchedulerExecutor_TimeoutFallback(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	schedTask := &model.Task{Description: "sched"}
 	s.PublishTask(schedTask)
@@ -255,7 +255,7 @@ func TestSchedulerExecutor_TimeoutFallback(t *testing.T) {
 func TestSchedulerExecutor_ContextCancellation(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	schedTask := &model.Task{Description: "sched"}
 	s.PublishTask(schedTask)
@@ -300,7 +300,7 @@ func TestSchedulerExecutor_ContextCancellation(t *testing.T) {
 func TestSchedulerExecutor_BatchAllTerminalSkipsWait(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	schedTask := &model.Task{Description: "sched"}
 	s.PublishTask(schedTask)
@@ -374,7 +374,7 @@ func TestFilterNonTerminalChildren(t *testing.T) {
 func TestSchedulerExecutor_ToolHealth_PassedToSnapshot(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	schedTask := &model.Task{Description: "scheduler", EventType: "__scheduler__"}
 	s.PublishTask(schedTask)
@@ -432,7 +432,7 @@ func TestSchedulerExecutor_ToolHealth_PassedToSnapshot(t *testing.T) {
 func TestSchedulerExecutor_ToolHealth_Nil_NoUnavailableTools(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{WorkerCount: 1}
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	schedTask := &model.Task{Description: "scheduler", EventType: "__scheduler__"}
 	s.PublishTask(schedTask)

@@ -219,13 +219,16 @@ func BuildBoardJSON(
 			busyWorkers += len(t.Agents)
 		}
 	}
-	workerCount := len(cfg.Workers)
-	if workerCount <= 0 {
-		// 旧路径：workers 列表为空，回退到 worker_count 字段
-		workerCount = cfg.WorkerCount
-		if workerCount <= 0 {
-			workerCount = 1
+	// v4：worker count 来自 cfg.Agents 中所有监听默认队列（event_type=""）的 kind 的 replicas 总和。
+	// 这与 busyWorkers（仅统计 EventType=="" 的 processing 任务）口径一致。
+	workerCount := 0
+	for _, k := range cfg.Agents {
+		if k.EventType == "" {
+			workerCount += k.Replicas
 		}
+	}
+	if workerCount <= 0 {
+		workerCount = 1 // safety fallback——不应触发（启动校验保证 replicas >= 1）
 	}
 	available := max(workerCount-busyWorkers, 0)
 
