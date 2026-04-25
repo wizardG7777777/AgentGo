@@ -54,7 +54,10 @@
       "PowerShell(go test -count=1 -timeout=180s ./... 2>&1)",
       "PowerShell(go test -count=1 -timeout=60s -run \"TestAgent_RecoverableError_BoundedByMaxRetries|TestAgent_RecoverableError_MaxRetriesZeroStillRetries\" ./internal/agent/ -v 2>&1)",
       "PowerShell(go test -count=1 -timeout=300s ./... 2>&1)",
-      "PowerShell(go test -count=1 -timeout=60s -run \"TestHandleFailure_|TestAgent_RecoverableError_\" ./internal/agent/ -v 2>&1)"
+      "PowerShell(go test -count=1 -timeout=60s -run \"TestHandleFailure_|TestAgent_RecoverableError_\" ./internal/agent/ -v 2>&1)",
+      "Read(//c/Users/73524/Documents/GolangProjects/**)",
+      "Read(//c/Users/73524/Documents/**)",
+      "mcp__github__search_code"
     ]
   },
   "enableAllProjectMcpServers": true,
