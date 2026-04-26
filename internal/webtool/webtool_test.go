@@ -289,6 +289,63 @@ func TestParseSearchResults_NoMatches(t *testing.T) {
 	}
 }
 
+// TestParseSearchResults_UnwrapDDGRedirect 守 2026-04-27 修复的不变量：
+// DDG HTML 把外链包成 //duckduckgo.com/l/?uddg=<encoded>&rut=... 中转链接，
+// 解析器必须解开 uddg 参数还原真实 URL，否则 LLM 拿到带 // 前缀且无法 web_fetch
+// 的 redirect URL（详见 duckduckgo.go unwrapDDGRedirect 注释）。
+//
+// 这个测试用真实 DDG HTML 片段（&amp; 实体编码 + // protocol-relative + uddg
+// 参数），fixture 来自 2026-04-27 网络冒烟测试输出。
+func TestParseSearchResults_UnwrapDDGRedirect(t *testing.T) {
+	html := `
+	<div class="result">
+		<a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgo.dev%2F&amp;rut=5e47fd7484315627">The Go Programming Language</a>
+		<a class="result__snippet">官方网站</a>
+	</div>
+	<div class="result">
+		<a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FGo_(programming_language)&amp;rut=95b65ae5">Go (programming language) - Wikipedia</a>
+		<a class="result__snippet">A statically typed compiled language...</a>
+	</div>
+	`
+	results := ParseSearchResults(html)
+	if len(results) != 2 {
+		t.Fatalf("期望 2 条结果，实际 %d", len(results))
+	}
+	if got, want := results[0].URL, "https://go.dev/"; got != want {
+		t.Errorf("结果 0 URL = %q，期望 %q", got, want)
+	}
+	if got, want := results[1].URL, "https://en.wikipedia.org/wiki/Go_(programming_language)"; got != want {
+		t.Errorf("结果 1 URL = %q，期望 %q", got, want)
+	}
+}
+
+// TestUnwrapDDGRedirect_Unit 直接覆盖 unwrap 函数的边界情况。
+func TestUnwrapDDGRedirect_Unit(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain_https_passthrough", "https://example.com/page", "https://example.com/page"},
+		{"plain_http_passthrough", "http://example.com", "http://example.com"},
+		{"ddg_redirect_basic", "//duckduckgo.com/l/?uddg=https%3A%2F%2Fgo.dev%2F", "https://go.dev/"},
+		{"ddg_redirect_with_amp_entity", "//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.com%2F&amp;rut=xxx", "https://a.com/"},
+		{"ddg_redirect_https_scheme", "https://duckduckgo.com/l/?uddg=https%3A%2F%2Fb.com%2F", "https://b.com/"},
+		{"ddg_redirect_www", "https://www.duckduckgo.com/l/?uddg=https%3A%2F%2Fc.com%2F", "https://c.com/"},
+		{"ddg_non_redirect_path", "https://duckduckgo.com/about", "https://duckduckgo.com/about"},
+		{"ddg_redirect_no_uddg", "//duckduckgo.com/l/?other=x", "https://duckduckgo.com/l/?other=x"},
+		{"empty", "", ""},
+		{"malformed_kept_as_is", "://broken url", "://broken url"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := unwrapDDGRedirect(tc.in); got != tc.want {
+				t.Errorf("unwrapDDGRedirect(%q) = %q，期望 %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestFetchURL_VerifyURL 测试 URL 处理
 func TestFetchURL_VerifyURL(t *testing.T) {
 	// 测试 https 自动添加前缀

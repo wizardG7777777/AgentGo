@@ -245,7 +245,7 @@ func ParseSearchResults(htmlStr string) []SearchResult {
 
 	for i, m := range titleMatches {
 		r := SearchResult{
-			URL:   StripTags(m[1]),
+			URL:   unwrapDDGRedirect(StripTags(m[1])),
 			Title: StripTags(m[2]),
 		}
 		if i < len(snippetMatches) {
