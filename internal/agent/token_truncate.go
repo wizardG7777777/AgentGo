@@ -1,22 +1,49 @@
 package agent
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // keepRecentForTruncate 是截断时保护尾部最近的消息条数。
 //
-// nextUpgrade_v4.md §11.7.4 / §11.5.4：这是模型 context 完整性的物理需求
-// （最近一对 request/response 不能丢，否则 LLM 失忆），不属于 per-kind 调优维度——
-// 故不进 YAML、不进 AgentKind。当前值 6 覆盖最近 ~3 对 request/response。
-// 未来若需灵活性，通过环境变量覆盖（如 AGENTGO_KEEP_RECENT_FOR_TRUNCATE=8），仍不进 YAML。
+// 2026-04-27 紧急修复：从 6 调到 3。
 //
-// 与 v3 CompactKeepRecent（YAML 可配，默认 3）的关系：v3 的"压缩保留 N=3"与本常量
-// 的"截断保护 N=6"虽数值不同但本质同源（都是"保护最近 N 条不被丢弃"），未来若拆
-// 分需求出现可分别命名，当前合并为单一常量族管理。
-const keepRecentForTruncate = 6
+// 历史背景：v4 §11.5.4 / §11.7.4 原值 6，"覆盖最近 ~3 对 request/response"。
+// 这个假设在工具调用场景失效——一个 entry 可以挂 N 个 tool_calls + N 个 tool_results，
+// "6 entry" 不等于 "6 段对话"。explorer 的 web_fetch 单条 result 上限 10000 字符
+// ≈ 3300 tokens（webtool.maxOutputChars），6 × 3300 = 20K 已经吃掉 32K 预算的 60%，
+// 加上 head + system + tools 必爆。32K 上限下实测 explorer 100% 撞 ErrContextLimitTooSmall。
+//
+// 改 3：6 × 3300 → 3 × 3300 = 10K，留给 head/system/tools/输出 22K，正常运转。
+// 同时保留"最近 1 对完整 request/response + 1 条额外 buffer"的语义安全垫。
+//
+// 不进 YAML / 不进 AgentKind——这是模型 context 完整性的物理需求。
+// 跨模型差异通过 ContextLimit 表达，本常量与之解耦。
+const keepRecentForTruncate = 3
 
-// ErrContextLimitTooSmall 表示即使删完所有可丢消息，预测值仍超 contextLimit。
-// 调用方应据此提示用户调高 context_limit 或开启更激进的压缩策略。
-var ErrContextLimitTooSmall = errors.New("context_limit 过小：截断到下界后预测 prompt tokens 仍超限")
+// fatToolResultThreshold 是单个 ToolResult.Content 触发 Layer B 内容缩减的字符阈值。
+//
+// 选 2000 字符的依据：webtool.maxOutputChars=10000 是 web_fetch 的单条上限，远超
+// 一般阅读 / decision 所需信息密度；2000 字符 ≈ 670 tokens，对绝大多数工具结果
+// 已经够保留关键信息。低于阈值的小结果完全不动（如 list_dir / grep_search 大多数
+// 输出 < 500 字符），节省无谓的复制开销。
+const fatToolResultThreshold = 2000
+
+// shrinkHeadKeep / shrinkTailKeep 是 Layer B 缩减后保留的 head / tail 字符数。
+//
+// 1500 + 200 = 1700 < threshold=2000 必然减小，不会出现"shrink 后反而更长"的 corner case。
+// 头部留 1500 是因为大多数工具结果的"答案/总结"在前部（如 web_fetch 文章正文开头、
+// run_shell 的命令输出），尾部留 200 用于保留收尾信号（如错误码、final line）。
+const (
+	shrinkHeadKeep = 1500
+	shrinkTailKeep = 200
+)
+
+// ErrContextLimitTooSmall 表示即使删完所有可丢消息 + 缩减完所有 fat tool results，
+// 预测值仍超 contextLimit。调用方应据此提示用户调高 context_limit、切到更大窗口的
+// 模型、或减少单 loop 的并发工具调用数。
+var ErrContextLimitTooSmall = errors.New("context_limit 过小：截断 + 内容缩减后预测 prompt tokens 仍超限")
 
 // PredictNextPromptTokens 在请求发出前估算下一次 LLM 调用的 prompt tokens。
 //
@@ -103,15 +130,71 @@ func historyEntryRoughTokens(e HistoryEntry) int {
 	return n
 }
 
+// shrinkLargeToolResults 是 Layer B 内容级缩减的核心函数。
+//
+// 对 entry 副本中超大的 ToolResult.Content 做 head + tail 保留 + 中间标记替换。
+// 阈值（threshold）以下的小内容完全不动；超过阈值的内容缩减为：
+//
+//	<前 headKeep 字符>...[已截断 N 字符]...<后 tailKeep 字符>
+//
+// 返回 (缩减后副本, 是否真的有 result 被缩减)。第二个返回值用于上层判断是否继续向后处理。
+//
+// 不修改 e.AssistantContent——assistant 自己的 reasoning 文本通常远小于 tool result，
+// 缩减它的 ROI 低且容易破坏 LLM 上下文连贯性。本函数只动 ToolResults。
+//
+// 不会破坏 OpenAI 协议：ToolResult.ToolCallID 保留不变，依然能与原 ToolCall 对得上。
+func shrinkLargeToolResults(e HistoryEntry, threshold, headKeep, tailKeep int) (HistoryEntry, bool) {
+	if !e.ToolCalled || len(e.ToolResults) == 0 {
+		return e, false
+	}
+	shrunk := false
+	newResults := make([]ToolResult, 0, len(e.ToolResults))
+	for _, r := range e.ToolResults {
+		if len(r.Content) <= threshold {
+			newResults = append(newResults, r)
+			continue
+		}
+		if headKeep+tailKeep >= len(r.Content) {
+			// 阈值与 keep 配置不一致的退化保护——不做 shrink，原样保留
+			newResults = append(newResults, r)
+			continue
+		}
+		elided := len(r.Content) - headKeep - tailKeep
+		nr := r
+		nr.Content = r.Content[:headKeep] +
+			fmt.Sprintf("\n...[已截断 %d 字符]...\n", elided) +
+			r.Content[len(r.Content)-tailKeep:]
+		newResults = append(newResults, nr)
+		shrunk = true
+	}
+	if !shrunk {
+		return e, false
+	}
+	out := e
+	out.ToolResults = newResults
+	return out, true
+}
+
 // TruncateHistory 在每次 LLM 调用前保护性截断，确保预测 prompt tokens 不超 contextLimit。
 //
-// nextUpgrade_v4.md §11.7.4：从最老消息开始丢弃，但保护：
-//   - 最前面 1 条作为头部（通常是 IncomingMail/transfer-note 等关键上下文）
-//   - 最后 keepRecentForTruncate 条作为尾部（最近一对 request/response）
+// 2026-04-27 重构：单层 → 双层降级 cascade（修复 §11.7.4 短路分支放弃太早）。
 //
-// OpenAI 协议约束：assistant(tool_calls) 后必须紧跟对应的 tool 消息。这里的截断单位
-// 是 HistoryEntry 而非协议消息——一个 entry 已经包含 assistant + 关联的所有 tool results
-// 在内，所以删整条 entry 不会破坏配对。
+//	Layer A（粗粒度，原有逻辑）
+//	  从最老消息开始丢弃中间条目，保护 head=1 + tail=keepRecentForTruncate(=3)
+//	  → 仍超 → 进入 Layer B
+//
+//	Layer B（内容级缩减，2026-04-27 新增）
+//	  从最老 tail entry 开始（影响最小），逐个对 fat ToolResult.Content 做
+//	  head+tail 保留 + 中间标记替换；每次 shrink 后重预测，符合即停
+//	  → 仍超 → 返回 ErrContextLimitTooSmall（上层决定 fail-fast 或继续）
+//
+// 历史问题：原算法仅 Layer A，且在 len(history) <= 1+protectedTail 时短路返回原 history
+// + ErrContextLimitTooSmall。32K 上限下，单条 web_fetch result ~3.3K tokens，6 条
+// tail 即占 20K，必撞短路；但短路后任何缩减都没尝试，trace 上看到 before==after。
+//
+// OpenAI 协议约束：assistant(tool_calls) 后必须紧跟对应的 tool 消息。Layer A 的截断
+// 单位是 HistoryEntry（已含完整 assistant + tool_results 配对），删整条不破坏配对；
+// Layer B 仅修改 ToolResult.Content 文本，ToolCallID 不变，配对依然成立。
 //
 // contextLimit <= 0 表示不做硬限截断，直接返回原 history。
 func TruncateHistory(history []HistoryEntry, currentModel, systemPrompt string, contextLimit int) ([]HistoryEntry, error) {
@@ -125,22 +208,30 @@ func TruncateHistory(history []HistoryEntry, currentModel, systemPrompt string, 
 	protectedHead := 1
 	protectedTail := keepRecentForTruncate
 
-	// 没有可删空间（history 太短）：直接返回，让上层判定是否报错
-	if len(history) <= protectedHead+protectedTail {
-		if PredictNextPromptTokens(history, currentModel, systemPrompt, "") > contextLimit {
-			return history, ErrContextLimitTooSmall
-		}
-		return history, nil
-	}
-
 	// 复制一份避免破坏调用方的 history（slice 删除会原地改写）
 	truncated := make([]HistoryEntry, len(history))
 	copy(truncated, history)
 
+	// === Layer A: 删除 middle 老条目 ===
 	for PredictNextPromptTokens(truncated, currentModel, systemPrompt, "") > contextLimit &&
 		len(truncated) > protectedHead+protectedTail {
-		// 删除 protectedHead 之后的最老条目
 		truncated = append(truncated[:protectedHead], truncated[protectedHead+1:]...)
+	}
+
+	if PredictNextPromptTokens(truncated, currentModel, systemPrompt, "") <= contextLimit {
+		return truncated, nil
+	}
+
+	// === Layer B: 内容级缩减 fat ToolResults ===
+	// 起点 = protectedHead（跳过 head[0]，head 通常是 transfer note 不应缩减）
+	// 顺序 = 旧 → 新（最新的 tool_result 留全文，因为它的信息密度最高）
+	for i := protectedHead; i < len(truncated); i++ {
+		if PredictNextPromptTokens(truncated, currentModel, systemPrompt, "") <= contextLimit {
+			break
+		}
+		if shrunkEntry, ok := shrinkLargeToolResults(truncated[i], fatToolResultThreshold, shrinkHeadKeep, shrinkTailKeep); ok {
+			truncated[i] = shrunkEntry
+		}
 	}
 
 	if PredictNextPromptTokens(truncated, currentModel, systemPrompt, "") > contextLimit {
@@ -148,4 +239,3 @@ func TruncateHistory(history []HistoryEntry, currentModel, systemPrompt string, 
 	}
 	return truncated, nil
 }
-

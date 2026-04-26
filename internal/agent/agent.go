@@ -500,34 +500,34 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		}
 
 		// §11.7.4 layer-3 截断保护：每轮 LLM 调用前校验预测 prompt_tokens 不超
-		// per-kind ContextLimit；超出时从最老条目（保护 head 1 + tail keepRecentForTruncate）
-		// 开始丢弃。失败模式（截断到下界后仍超）：warn + 用截断 history 继续——
-		// 让 LLM 调用真不行时由 §9.3 ErrUnrecoverable 兜底，避免在截断阶段就把
-		// 任务标失败。ContextLimit<=0（v3 兼容路径未注入此字段）时整段为 no-op。
-		//
-		// 装配漏接修复（2026-04-26）：本调用此前从未被引入主循环，导致 §11.7.5
-		// 描述的"压缩→截断"协同的截断那一支死代码——现已接通，trace 上可 grep
-		// KindHistoryTruncated 验证。
+		// per-kind ContextLimit。2026-04-27 升级为双层降级 cascade（详见
+		// token_truncate.go TruncateHistory）：
+		//   Layer A：从最老条目开始删 middle，保护 head=1 + tail=3
+		//   Layer B：tail 内 fat ToolResult 内容级缩减（head/tail 保留 + 中间截断标记）
+		// 失败模式（双层都跑过仍超）：warn + 用尽力截断的 history 继续——让 LLM 调用
+		// 真不行时由 §9.3 ErrUnrecoverable 兜底。ContextLimit<=0（v3 兼容路径）no-op。
 		if a.ContextLimit > 0 {
 			before := PredictNextPromptTokens(history, a.Model, task.SystemPrompt, "")
 			truncated, terr := TruncateHistory(history, a.Model, task.SystemPrompt, a.ContextLimit)
-			if len(truncated) != len(history) || terr != nil {
-				after := PredictNextPromptTokens(truncated, a.Model, task.SystemPrompt, "")
+			// "已经发生了改动"判定：长度变了或某 entry 内的 ToolResults 被 shrink 过。
+			// 仅看长度会漏掉 Layer B 的内容级缩减；用预测值差异更可靠。
+			afterPredicted := PredictNextPromptTokens(truncated, a.Model, task.SystemPrompt, "")
+			if len(truncated) != len(history) || afterPredicted != before || terr != nil {
 				log.Printf("[agent %s] task=%s loop=%d 历史截断: %d→%d entries, ~%d→~%d prompt tokens",
-					a.ID, taskID, i, len(history), len(truncated), before, after)
+					a.ID, taskID, i, len(history), len(truncated), before, afterPredicted)
 				trace.Emit(trace.Event{
 					Kind:               trace.KindHistoryTruncated,
 					TaskID:             taskID,
 					AgentID:            a.ID,
 					Loop:               i,
 					PromptTokensBefore: before,
-					PromptTokensAfter:  after,
+					PromptTokensAfter:  afterPredicted,
 					KeptEntries:        len(truncated),
-					Strategy:           "head_keep_tail_keep",
+					Strategy:           "drop_middle+shrink_tail",
 				})
 				if terr != nil {
-					log.Printf("[agent %s] task=%s loop=%d 截断到 head+tail 后仍 ~%d > context_limit=%d: %v（用截断 history 继续，依赖 §9.3 错误码兜底）",
-						a.ID, taskID, i, after, a.ContextLimit, terr)
+					log.Printf("[agent %s] task=%s loop=%d 双层截断（删 middle + 缩 tail 内容）后仍 ~%d > context_limit=%d: %v（用截断 history 继续，依赖 §9.3 错误码兜底）",
+						a.ID, taskID, i, afterPredicted, a.ContextLimit, terr)
 				}
 				history = truncated
 			}
