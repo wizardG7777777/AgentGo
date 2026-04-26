@@ -147,9 +147,10 @@ type Config struct {
 	// ============================================================
 	// 顶层杂项字段（v4 仍保留在顶层，与 setting.v4.yaml 对应）
 	// ============================================================
-	ProjectRoot     string `yaml:"project_root" json:"project_root"`
-	MaxSubtaskDepth int    `yaml:"max_subtask_depth" json:"max_subtask_depth"`
-	ShellTimeoutSec int    `yaml:"shell_timeout_sec" json:"shell_timeout_sec"`
+	HashlineEnabled       *bool `yaml:"hashline_enabled,omitempty" json:"hashline_enabled,omitempty"`
+	ProjectRoot           string `yaml:"project_root" json:"project_root"`
+	MaxSubtaskDepth       int    `yaml:"max_subtask_depth" json:"max_subtask_depth"`
+	ShellTimeoutSec       int    `yaml:"shell_timeout_sec" json:"shell_timeout_sec"`
 
 	// TransferNoteMaxTokens 是 TransferNote 单条最大 token 预算。agent 在生成
 	// L1/L3 交接备忘时按此预算截断文本长度——按 1 token ≈ 2 runes 估算。
@@ -211,6 +212,9 @@ func profileKeys(m map[string][]string) []string {
 // DefaultConfig 返回内嵌默认值（仅顶层 + Infra 嵌套块）。v4 启动校验要求
 // agents / llm 必须在 yaml 中显式声明——这里不填占位值，避免给空 yaml 制造
 // 看似能跑实则不可用的配置。
+// ptrTo 返回指向 v 的指针。用于 *bool 等指针字段的默认值构造。
+func ptrTo[T any](v T) *T { return &v }
+
 func DefaultConfig() *Config {
 	return &Config{
 		ShellTimeoutSec:       30,
@@ -282,6 +286,11 @@ func LoadConfig(path string, explicit bool) (*Config, error) {
 	// （在 Windows 上 FromSlash("prompts/worker.md") → "prompts\\worker.md"，
 	// 再被 Validate 拒绝）。Windows 的 os.ReadFile 接受 forward slash 路径，无需
 	// normalize。Validate 看到的就是用户写在 YAML 里的原始字符串。
+
+	// §7：hashline_enabled 未显式设置时默认 true
+	if cfg.HashlineEnabled == nil {
+		cfg.HashlineEnabled = ptrTo(true)
+	}
 
 	return cfg, nil
 }

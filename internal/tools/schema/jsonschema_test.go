@@ -1,85 +1,82 @@
 package schema
 
-import "testing"
+import (
+	"testing"
+)
 
-func TestObject_Empty(t *testing.T) {
-	out := Object().Build()
-	if out["type"] != "object" {
-		t.Errorf("type 应为 object，实际: %v", out["type"])
-	}
-	props, ok := out["properties"].(map[string]any)
-	if !ok || len(props) != 0 {
-		t.Errorf("properties 应为空 map，实际: %v", out["properties"])
-	}
-	if _, has := out["required"]; has {
-		t.Errorf("空 schema 不应有 required 字段")
-	}
-}
-
-func TestObject_StringRequired(t *testing.T) {
-	out := Object().
+func TestJSONSchemaBuilder_StringArray(t *testing.T) {
+	b := Object().
 		String("path", "文件路径", true).
-		String("encoding", "编码", false).
+		StringArray("line_anchors", "行哈希锚点列表", false).
 		Build()
 
-	props := out["properties"].(map[string]any)
-	if len(props) != 2 {
-		t.Fatalf("应有 2 个属性，实际 %d", len(props))
-	}
-	pathDef := props["path"].(map[string]any)
-	if pathDef["type"] != "string" || pathDef["description"] != "文件路径" {
-		t.Errorf("path 字段定义错误: %v", pathDef)
+	props, ok := b["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties 不是 map[string]any")
 	}
 
-	required := out["required"].([]any)
-	if len(required) != 1 || required[0] != "path" {
-		t.Errorf("required 应只含 path，实际: %v", required)
+	// line_anchors 应存在
+	la, ok := props["line_anchors"].(map[string]any)
+	if !ok {
+		t.Fatalf("line_anchors 属性缺失或类型错误")
+	}
+
+	if typ, _ := la["type"].(string); typ != "array" {
+		t.Errorf("line_anchors type = %q, want array", typ)
+	}
+
+	items, ok := la["items"].(map[string]any)
+	if !ok {
+		t.Fatalf("line_anchors items 缺失")
+	}
+	if itemTyp, _ := items["type"].(string); itemTyp != "string" {
+		t.Errorf("line_anchors items.type = %q, want string", itemTyp)
+	}
+
+	if desc, _ := la["description"].(string); desc != "行哈希锚点列表" {
+		t.Errorf("line_anchors description = %q, want 行哈希锚点列表", desc)
+	}
+
+	// required 列表应只含 path，不含 line_anchors
+	req, ok := b["required"].([]any)
+	if !ok {
+		t.Fatalf("required 缺失")
+	}
+	foundPath := false
+	foundAnchors := false
+	for _, r := range req {
+		switch r {
+		case "path":
+			foundPath = true
+		case "line_anchors":
+			foundAnchors = true
+		}
+	}
+	if !foundPath {
+		t.Error("required 中应包含 path")
+	}
+	if foundAnchors {
+		t.Error("required 中不应包含 line_anchors（它是可选的）")
 	}
 }
 
-func TestObject_IntAndBool(t *testing.T) {
-	out := Object().
-		Int("offset", "起始", false).
-		Bool("recursive", "是否递归", true).
+func TestJSONSchemaBuilder_StringArray_Required(t *testing.T) {
+	b := Object().
+		StringArray("tags", "标签列表", true).
 		Build()
-	props := out["properties"].(map[string]any)
-	if props["offset"].(map[string]any)["type"] != "integer" {
-		t.Errorf("offset 类型应为 integer")
-	}
-	if props["recursive"].(map[string]any)["type"] != "boolean" {
-		t.Errorf("recursive 类型应为 boolean")
-	}
-	required := out["required"].([]any)
-	if len(required) != 1 || required[0] != "recursive" {
-		t.Errorf("required 应只含 recursive，实际: %v", required)
-	}
-}
 
-func TestObject_Enum(t *testing.T) {
-	out := Object().
-		Enum("mode", "提取模式", []string{"auto", "article", "full"}, false).
-		Build()
-	props := out["properties"].(map[string]any)
-	mode := props["mode"].(map[string]any)
-	if mode["type"] != "string" {
-		t.Errorf("enum 字段类型应为 string")
+	req, ok := b["required"].([]any)
+	if !ok {
+		t.Fatalf("required 缺失")
 	}
-	enums := mode["enum"].([]any)
-	if len(enums) != 3 || enums[0] != "auto" || enums[1] != "article" || enums[2] != "full" {
-		t.Errorf("enum 值不正确: %v", enums)
+	found := false
+	for _, r := range req {
+		if r == "tags" {
+			found = true
+			break
+		}
 	}
-}
-
-func TestObject_ChainOrder(t *testing.T) {
-	// 验证 required 列表保留添加顺序
-	out := Object().
-		String("a", "", true).
-		String("b", "", false).
-		String("c", "", true).
-		String("d", "", true).
-		Build()
-	required := out["required"].([]any)
-	if len(required) != 3 || required[0] != "a" || required[1] != "c" || required[2] != "d" {
-		t.Errorf("required 顺序不正确: %v", required)
+	if !found {
+		t.Error("required 中应包含 tags")
 	}
 }

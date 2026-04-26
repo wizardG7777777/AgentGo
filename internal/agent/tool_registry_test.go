@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"agentgo/internal/llm"
@@ -105,5 +106,50 @@ func TestToolRegistry_Dispatch_Context(t *testing.T) {
 
 	if receivedCtx != ctx {
 		t.Error("tool did not receive the correct context")
+	}
+}
+
+func TestToolRegistry_Dispatch_DidYouMean(t *testing.T) {
+	r := NewToolRegistry()
+	r.Register("read_file", "读取文件", nil, func(ctx context.Context, args map[string]any) (string, error) {
+		return "", nil
+	})
+	r.Register("write_file", "写入文件", nil, func(ctx context.Context, args map[string]any) (string, error) {
+		return "", nil
+	})
+	r.Register("run_shell", "执行 shell", nil, func(ctx context.Context, args map[string]any) (string, error) {
+		return "", nil
+	})
+
+	_, err := r.Dispatch(context.Background(), llm.ToolCall{
+		ID:   "call_1",
+		Name: "readFile", // typo：骆驼拼写，缺少下划线
+	})
+	if err == nil {
+		t.Fatal("expected error for unknown tool")
+	}
+	if !strings.Contains(err.Error(), "Did you mean") {
+		t.Errorf("expected 'Did you mean' in error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "read") || !strings.Contains(err.Error(), "file") {
+		t.Errorf("expected 'read_file' (or highlighted variant) in error, got: %v", err)
+	}
+}
+
+func TestToolRegistry_Dispatch_NoDidYouMeanWhenNoCandidate(t *testing.T) {
+	r := NewToolRegistry()
+	r.Register("aaa", "工具A", nil, func(ctx context.Context, args map[string]any) (string, error) {
+		return "", nil
+	})
+
+	_, err := r.Dispatch(context.Background(), llm.ToolCall{
+		ID:   "call_1",
+		Name: "zzz_xxx_yyy", // 完全无关，无候选
+	})
+	if err == nil {
+		t.Fatal("expected error for unknown tool")
+	}
+	if strings.Contains(err.Error(), "Did you mean") {
+		t.Errorf("expected no 'Did you mean' when no candidate, got: %v", err)
 	}
 }

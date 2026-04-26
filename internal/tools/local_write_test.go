@@ -13,6 +13,7 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
+	"agentgo/internal/tools/hashline"
 )
 
 // --- recordingRoster: 模拟 roster.Roster，记录操作顺序 ---
@@ -475,3 +476,184 @@ func TestEditFile_WaitAndRetrySuccess(t *testing.T) {
 // TestNormalizeArtifactPath 一并删除，因为 normalizeArtifactPath 函数也随
 // recordArtifact 一起迁移到了 hook/builtin 包，tools 包内不再持有该实现。
 // 该函数的等价测试也在新的 record_artifact_test.go 中。
+
+
+// === §7 Hashline 行哈希增强测试 ===
+
+func TestEditFile_StripHashPrefix(t *testing.T) {
+	g, _, tmpDir := newWriteGroup(t, nil)
+	fp := filepath.Join(tmpDir, "foo.go")
+	orig := "package main\n\nfunc main() {\n}\n"
+	if err := os.WriteFile(fp, []byte(orig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// old_str 粘回带 hashline 前缀的整行，应仍能匹配
+	oldStrWithHash := "1#VK|package main"
+	out, err := callEditFile(g, fp, oldStrWithHash, "package hashline", "")
+	if err != nil {
+		t.Fatalf("edit_file 失败: %v", err)
+	}
+	if !strings.Contains(out, "已编辑") {
+		t.Errorf("输出应包含'已编辑': %q", out)
+	}
+
+	// 验证文件确实被改了
+	data, _ := os.ReadFile(fp)
+	if !strings.Contains(string(data), "package hashline") {
+		t.Errorf("文件内容未被修改: %q", string(data))
+	}
+}
+
+func TestEditFile_StripHashPrefix_MultiLine(t *testing.T) {
+	g, _, tmpDir := newWriteGroup(t, nil)
+	fp := filepath.Join(tmpDir, "bar.go")
+	orig := "func a() {}\nfunc b() {}\n"
+	if err := os.WriteFile(fp, []byte(orig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 多行 old_str，全部带 hashline 前缀
+	oldStr := "1#VK|func a() {}\n2#QZ|func b() {}"
+	out, err := callEditFile(g, fp, oldStr, "func combined() {}", "")
+	if err != nil {
+		t.Fatalf("edit_file 失败: %v", err)
+	}
+	if !strings.Contains(out, "已编辑") {
+		t.Errorf("输出应包含'已编辑': %q", out)
+	}
+}
+
+// TestEditFile_StripHashPrefix_NewStr 是 §7 P1 修复（2026-04-26）的回归护栏：
+// new_str 同样需要 StripHashPrefix。
+//
+// 修复前的失败模式：LLM 把 read_file 输出里整段 hashline 行复制进 new_str（典型误用），
+// 工具不剥前缀，结果把 "12#VK|content" 这种字面字符串写入文件——产物被前缀污染。
+//
+// 评审历史：本 case 在最初评审时被标 P1 必修；同 commit 修复 + 加测试。
+// 负向自检：临时撤回 local_write.go 中的 newStr StripHashPrefix 一行，本测试应红。
+func TestEditFile_StripHashPrefix_NewStr(t *testing.T) {
+	g, _, tmpDir := newWriteGroup(t, nil)
+	fp := filepath.Join(tmpDir, "newstr.go")
+	orig := "package main\nfunc old() {}\nfunc keep() {}\n"
+	if err := os.WriteFile(fp, []byte(orig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// new_str 整段都是带 hashline 前缀的多行——模拟 LLM 直接把 read_file 输出粘进来
+	// 阈值 50% 起作用：3 行有 2 行带前缀（含 1 个空行）→ 命中 strip 路径
+	newStrWithHash := "10#VK|func renamed() {\n11#QZ|    return 42\n12#NB|}"
+
+	out, err := callEditFile(g, fp, "func old() {}", newStrWithHash, "")
+	if err != nil {
+		t.Fatalf("edit_file 失败: %v", err)
+	}
+	if !strings.Contains(out, "已编辑") {
+		t.Errorf("输出应包含'已编辑': %q", out)
+	}
+
+	// 关键断言：文件内容不应含任何 hashline 前缀字面（"12#VK|" / "10#VK|" 等）
+	data, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatalf("读文件: %v", err)
+	}
+	got := string(data)
+	for _, leak := range []string{"10#VK|", "11#QZ|", "12#NB|"} {
+		if strings.Contains(got, leak) {
+			t.Errorf("new_str 的 hashline 前缀 %q 泄漏到文件内容中——StripHashPrefix 未对 new_str 生效:\n%s",
+				leak, got)
+		}
+	}
+	// 正向断言：剥前缀后的纯内容应当被写入
+	if !strings.Contains(got, "func renamed()") {
+		t.Errorf("剥前缀后的纯内容应写入文件，实际:\n%s", got)
+	}
+	if !strings.Contains(got, "return 42") {
+		t.Errorf("剥前缀后的纯内容应写入文件，实际:\n%s", got)
+	}
+}
+
+// TestEditFile_AcceptsLineAnchorsArg 验证 §7 schema 改动：
+// edit_file 接受 line_anchors []string 参数而不报"未知参数"。
+// 注意：本测试只验证 schema/参数透传，不验证哈希校验逻辑——后者在
+// ValidateLineAnchorsHook 里，并由 internal/hook/builtin 的测试覆盖。
+func TestEditFile_AcceptsLineAnchorsArg(t *testing.T) {
+	g, _, tmpDir := newWriteGroup(t, nil)
+	fp := filepath.Join(tmpDir, "anchored.go")
+	if err := os.WriteFile(fp, []byte("hello\nworld\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	args := map[string]any{
+		"path":         fp,
+		"old_str":      "hello",
+		"new_str":      "hi",
+		"line_anchors": []any{"1#VK"}, // 锚点不在工具层校验，只由 hook 校验
+	}
+	out, err := g.editFile(context.Background(), args)
+	if err != nil {
+		t.Fatalf("edit_file 不应因 line_anchors 参数报错: %v", err)
+	}
+	if !strings.Contains(out, "已编辑") {
+		t.Errorf("输出应包含'已编辑': %q", out)
+	}
+}
+
+// TestReadEditRoundTrip_LineAnchors 是 §7 端到端往返测试：
+// read_file（HashlineEnabled=true）的输出格式必须能被 ParseLineRef 直接消费，
+// 且重新计算的哈希与 read_file 嵌入的一致——即 read_file 与 ValidateLineAnchorsHook
+// 之间没有"格式漂移"。
+//
+// 不测 ValidateLineAnchorsHook 本身（其单元测试已覆盖），而是测两侧的"形状契约"——
+// 这是把"装配漏接"提前到 build 时发现的护栏。
+func TestReadEditRoundTrip_LineAnchors(t *testing.T) {
+	tmp := t.TempDir()
+
+	fp := filepath.Join(tmp, "roundtrip.go")
+	content := "package main\n\nfunc main() {\n\treturn\n}\n"
+	if err := os.WriteFile(fp, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. read_file with HashlineEnabled
+	rg := LocalReadGroup{
+		Workdir:         &DefaultWorkdir{ProjectRoot: tmp},
+		HashlineEnabled: true,
+	}
+	out, err := rg.readFile(context.Background(), map[string]any{"path": fp})
+	if err != nil {
+		t.Fatalf("read_file: %v", err)
+	}
+
+	// 2. 输出体内必须包含每一行的 hashline 前缀（"N#HH|content"）
+	// 不依赖 header 格式，仅扫描内容行
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if line == "" {
+			continue // 跳过空行——尾部空行的哈希前缀仍存在但内容为空
+		}
+		// 期望 read_file 输出含 "N#HH|line" 子串，其中 HH = ComputeLineHash(N, line)
+		// 由于 hash 是 2 字符的字典字符，这里宽松匹配前缀格式
+		expectedAnchor := hashline.FormatHashLine(i+1, line)
+		if !strings.Contains(out, expectedAnchor) {
+			t.Errorf("read_file 输出缺第 %d 行的 hashline %q;\n实际输出:\n%s",
+				i+1, expectedAnchor, out)
+		}
+	}
+
+	// 3. 取第 1 行的 hashline 作为 anchor 投给 ValidateLineAnchorsHook 验证
+	// （绕过 hook 直接用 ParseLineRef + ComputeLineHash 验证形状契约）
+	firstAnchor := hashline.FormatHashLine(1, "package main")
+	ref, err := hashline.ParseLineRef(firstAnchor)
+	if err != nil {
+		t.Fatalf("ParseLineRef(%q): %v", firstAnchor, err)
+	}
+	if ref.Line != 1 {
+		t.Errorf("Line = %d, want 1", ref.Line)
+	}
+	// 重算应一致——这是 §7 的核心契约
+	recomputed := hashline.ComputeLineHash(1, "package main")
+	if ref.Hash != recomputed {
+		t.Errorf("Hash mismatch: anchor=%q recomputed=%q", ref.Hash, recomputed)
+	}
+}

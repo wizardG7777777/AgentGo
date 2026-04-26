@@ -417,7 +417,11 @@ func New(
 	searchProvider := webtool.NewProvider(cfg.SearchAPIProvider, cfg.SearchAPIURL, cfg.SearchAPIKey)
 
 	// 工具集 = worker 全集 + SchedulerGroup
-	readGroup := tools.LocalReadGroup{Workdir: workdir, Cache: fileCache}
+	hlEnabled := true
+	if cfg.HashlineEnabled != nil {
+		hlEnabled = *cfg.HashlineEnabled
+	}
+	readGroup := tools.LocalReadGroup{Workdir: workdir, Cache: fileCache, HashlineEnabled: hlEnabled}
 	toolReg := agent.NewToolRegistry()
 	tools.RegisterGroups(toolReg,
 		readGroup,

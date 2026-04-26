@@ -254,3 +254,25 @@ func TestValidateExpectedHashHook_ViaRegistry(t *testing.T) {
 		t.Errorf("Action = %v, want Abort via registry", d.Action)
 	}
 }
+
+
+// TestValidateExpectedHashHook_LineAnchorsSkips 验证 §7 互斥规则：
+// 提供 line_anchors 时 expected_hash 即使存在且错误也应被跳过。
+func TestValidateExpectedHashHook_LineAnchorsSkips(t *testing.T) {
+	path, _ := makeFileWithHash(t, "original content")
+	h := NewValidateExpectedHashHook()
+
+	// expected_hash 故意给错，但同时提供 line_anchors → 应放行
+	d := h.Run(hook.ToolHookContext{
+		ToolName: "write_file",
+		Args: map[string]any{
+			"path":          path,
+			"expected_hash": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+			"content":       "new content",
+			"line_anchors":  []any{"1#VK"},
+		},
+	})
+	if d.Action != hook.Continue {
+		t.Errorf("Action = %v, want Continue when line_anchors provided (even with wrong expected_hash)", d.Action)
+	}
+}

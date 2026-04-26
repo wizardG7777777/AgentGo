@@ -59,6 +59,11 @@ func (h *ValidateExpectedHashHook) Matches(toolName string) bool {
 
 // Run 执行 hash 校验逻辑。
 func (h *ValidateExpectedHashHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecision {
+	// §7 互斥：line_anchors 提供时让行级 hook 接管，整文件 hash 退场
+	if len(stringSliceFromArg(hctx.Args["line_anchors"])) > 0 {
+		return hook.ToolHookDecision{Action: hook.Continue}
+	}
+
 	expectedHash, _ := hctx.Args["expected_hash"].(string)
 	if expectedHash == "" {
 		// 没提供 hash → 跳过校验，与原 inline 行为一致
@@ -104,3 +109,4 @@ func sha256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
+

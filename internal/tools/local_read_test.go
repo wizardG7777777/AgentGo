@@ -493,3 +493,101 @@ func TestGlobSearch_PathValidation(t *testing.T) {
 		t.Fatal("期望路径越界错误，实际 nil")
 	}
 }
+
+// §10 Did-You-Mean：list_dir 路径不存在时给出近似目录候选。
+func TestListDir_NotExist_DidYouMean(t *testing.T) {
+	tmp := t.TempDir()
+	// 创建几个目录作为候选池
+	for _, d := range []string{"docs", "internal", "cmd"} {
+		if err := os.MkdirAll(filepath.Join(tmp, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g := newTestGroup(tmp, nil)
+	_, err := g.listDir(context.Background(), map[string]any{
+		"path": filepath.Join(tmp, "doc"), // typo：少了 s
+	})
+	if err == nil {
+		t.Fatal("期望错误，实际 nil")
+	}
+	if !strings.Contains(err.Error(), "Did you mean") {
+		t.Errorf("期望 'Did you mean' 提示，实际: %v", err)
+	}
+	if !strings.Contains(err.Error(), "doc") {
+		t.Errorf("期望候选 'doc'（含高亮形式），实际: %v", err)
+	}
+}
+
+// §10 Did-You-Mean：grep_search 空结果时给出相似文件名候选。
+func TestGrepSearch_Empty_DidYouMean(t *testing.T) {
+	tmp := t.TempDir()
+	// 创建一些文件，文件名含 "auth" 关键字
+	for _, f := range []string{"auth.go", "authentication.go", "main.go"} {
+		if err := os.WriteFile(filepath.Join(tmp, f), []byte("package main\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g := newTestGroup(tmp, nil)
+	out, err := g.grepSearch(context.Background(), map[string]any{
+		"pattern": "auth", // 文件内容中不存在，但文件名含 auth
+		"path":    tmp,
+	})
+	if err != nil {
+		t.Fatalf("期望 nil 错误，实际: %v", err)
+	}
+	if !strings.Contains(out, "Did you mean") {
+		t.Errorf("期望 'Did you mean' 提示，实际: %v", out)
+	}
+	if !strings.Contains(out, "auth") {
+		t.Errorf("期望含 'auth' 的候选，实际: %v", out)
+	}
+}
+
+
+// === §7 Hashline 行哈希增强测试 ===
+
+func TestReadFile_HashlineEnabled(t *testing.T) {
+	tmp := t.TempDir()
+	fp := filepath.Join(tmp, "foo.go")
+	content := "package main\n\nfunc main() {\n}\n"
+	if err := os.WriteFile(fp, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g := newTestGroup(tmp, nil)
+	g.HashlineEnabled = true
+	out, err := g.readFile(context.Background(), map[string]any{"path": fp})
+	if err != nil {
+		t.Fatalf("读取失败: %v", err)
+	}
+	// 应包含 hashline 前缀的行
+	if !strings.Contains(out, "1#") || !strings.Contains(out, "|") {
+		t.Errorf("hashline enabled 时输出应含 N#HH| 前缀: %q", out)
+	}
+	// 原始内容应仍在
+	if !strings.Contains(out, "package main") {
+		t.Errorf("输出缺少原始内容: %q", out)
+	}
+}
+
+func TestReadFile_HashlineDisabled(t *testing.T) {
+	tmp := t.TempDir()
+	fp := filepath.Join(tmp, "bar.go")
+	content := "package main\n"
+	if err := os.WriteFile(fp, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g := newTestGroup(tmp, nil)
+	g.HashlineEnabled = false
+	out, err := g.readFile(context.Background(), map[string]any{"path": fp})
+	if err != nil {
+		t.Fatalf("读取失败: %v", err)
+	}
+	// 不应包含 hashline 前缀格式（行号#哈希|）
+	if strings.Contains(out, "1#") && strings.Contains(out, "|") {
+		t.Errorf("hashline disabled 时输出不应含 N#HH| 前缀: %q", out)
+	}
+	// 原始内容应仍在
+	if !strings.Contains(out, "package main") {
+		t.Errorf("输出缺少原始内容: %q", out)
+	}
+}

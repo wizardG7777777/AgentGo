@@ -137,3 +137,135 @@ func TestExpandEnv_EmptyKeyOnUnset(t *testing.T) {
 		t.Errorf("os.ExpandEnv 未按预期替换为空串: got %q", expanded)
 	}
 }
+
+
+// === §7 HashlineEnabled 配置测试 ===
+
+func TestLoadConfig_HashlineEnabled_DefaultTrue(t *testing.T) {
+	// 不写 hashline_enabled 时，默认值应为 true
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "cfg.yaml")
+	content := `
+llm:
+  base_url: http://example.com
+  api_key: key
+  default_model: m
+agents:
+  - kind: worker
+    replicas: 1
+    system_prompt_file: prompts/w.md
+    agent_max_loops: 10
+    task_max_retries: 3
+    enforce_compact_token_threshold: 4000
+    context_limit: 16000
+infra:
+  watchdog:
+    interval_sec: 30
+  mail_notifier:
+    enabled: true
+    interval_sec: 5
+  store:
+    event_channel_buffer: 64
+    fifo_limit: 100
+    default_concurrency: 2
+    default_timeout_sec: 300
+  roster:
+    wait_timeout_sec: 30
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path, true)
+	if err != nil {
+		t.Fatalf("LoadConfig 失败: %v", err)
+	}
+	if cfg.HashlineEnabled == nil || !*cfg.HashlineEnabled {
+		t.Errorf("HashlineEnabled 未设时应默认 true, got %v", cfg.HashlineEnabled)
+	}
+}
+
+func TestLoadConfig_HashlineEnabled_ExplicitFalse(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "cfg.yaml")
+	content := `
+hashline_enabled: false
+llm:
+  base_url: http://example.com
+  api_key: key
+  default_model: m
+agents:
+  - kind: worker
+    replicas: 1
+    system_prompt_file: prompts/w.md
+    agent_max_loops: 10
+    task_max_retries: 3
+    enforce_compact_token_threshold: 4000
+    context_limit: 16000
+infra:
+  watchdog:
+    interval_sec: 30
+  mail_notifier:
+    enabled: true
+    interval_sec: 5
+  store:
+    event_channel_buffer: 64
+    fifo_limit: 100
+    default_concurrency: 2
+    default_timeout_sec: 300
+  roster:
+    wait_timeout_sec: 30
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path, true)
+	if err != nil {
+		t.Fatalf("LoadConfig 失败: %v", err)
+	}
+	if cfg.HashlineEnabled == nil || *cfg.HashlineEnabled {
+		t.Errorf("HashlineEnabled 显式 false 时应为 false, got %v", cfg.HashlineEnabled)
+	}
+}
+
+func TestLoadConfig_HashlineEnabled_ExplicitTrue(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "cfg.yaml")
+	content := `
+hashline_enabled: true
+llm:
+  base_url: http://example.com
+  api_key: key
+  default_model: m
+agents:
+  - kind: worker
+    replicas: 1
+    system_prompt_file: prompts/w.md
+    agent_max_loops: 10
+    task_max_retries: 3
+    enforce_compact_token_threshold: 4000
+    context_limit: 16000
+infra:
+  watchdog:
+    interval_sec: 30
+  mail_notifier:
+    enabled: true
+    interval_sec: 5
+  store:
+    event_channel_buffer: 64
+    fifo_limit: 100
+    default_concurrency: 2
+    default_timeout_sec: 300
+  roster:
+    wait_timeout_sec: 30
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path, true)
+	if err != nil {
+		t.Fatalf("LoadConfig 失败: %v", err)
+	}
+	if cfg.HashlineEnabled == nil || !*cfg.HashlineEnabled {
+		t.Errorf("HashlineEnabled 显式 true 时应为 true, got %v", cfg.HashlineEnabled)
+	}
+}

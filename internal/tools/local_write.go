@@ -12,6 +12,7 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/pathutil"
 	"agentgo/internal/roster"
+	"agentgo/internal/tools/hashline"
 	"agentgo/internal/tools/schema"
 	"agentgo/internal/trace"
 )
@@ -47,12 +48,14 @@ func (g LocalWriteGroup) Register(r *agent.ToolRegistry) {
 		g.writeFile,
 	)
 
-	r.Register("edit_file", "在文件中做精准的 old_str -> new_str 单次替换",
+	r.Register("edit_file", "在文件中做精准的 old_str -> new_str 单次替换。可选提供 line_anchors 做行级哈希校验（比 expected_hash 更细粒度）；提供 line_anchors 时 expected_hash 会被忽略。",
 		schema.Object().
 			String("path", "文件路径", true).
 			String("old_str", "要替换的旧字符串（必须在文件中唯一匹配）", true).
 			String("new_str", "替换后的新字符串", true).
 			String("expected_hash", "期望的当前文件 SHA256 哈希", false).
+			StringArray("line_anchors",
+				"行哈希锚点列表，如 [\"12#VK\",\"13#QZ\"]。提供时 expected_hash 会被忽略；任一行哈希失配则拒绝并返回当前哈希。", false).
 			Build(),
 		g.editFile,
 	)
@@ -194,6 +197,13 @@ func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (str
 	path, _ := args["path"].(string)
 	oldStr, _ := args["old_str"].(string)
 	newStr, _ := args["new_str"].(string)
+
+	// §7：宽容解析——剥去可能的 hashline 前缀（LLM 经常把 read_file 输出直接粘回 old_str / new_str）。
+	// new_str 必须同样剥：否则 "12#VK|content" 这种字面前缀会被原样写入文件，把哈希前缀污染到产物里。
+	// StripHashPrefix 内置 50% 阈值，对非 hashline 内容是 no-op，HashlineEnabled=false 路径也安全。
+	// 该缺陷由首次评审发现，TestEditFile_StripHashPrefix_NewStr 是配套回归护栏。
+	oldStr = hashline.StripHashPrefix(oldStr)
+	newStr = hashline.StripHashPrefix(newStr)
 
 	if path == "" {
 		return "", fmt.Errorf("缺少 path 参数")

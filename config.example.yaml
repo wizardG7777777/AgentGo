@@ -298,3 +298,12 @@ agent_declarations:
 #   explorer:
 #     capabilities: []
 #     description: ""
+
+
+# ============================================
+# §7 Hashline 行哈希增强（默认开启）
+# ============================================
+# 控制 read_file 输出是否附加行哈希前缀（N#HH|content），
+# 以及 edit_file 是否接受 line_anchors 参数做行级校验。
+# 未设置时默认为 true；显式 false 可关闭。
+# hashline_enabled: true

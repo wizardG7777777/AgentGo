@@ -204,7 +204,10 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	if err := hookReg.Register(builtin.NewEnforceExpectedArtifactsHook(storeView, cfg.ProjectRoot)); err != nil {
 		return nil, fmt.Errorf("注册 EnforceExpectedArtifactsHook 失败: %w", err)
 	}
-	fmt.Println("[启动] Hook 系统初始化完成（已注册：record-artifact, path-boundary, validate-expected-hash, require-read-before-write, dependency-validator, enforce-expected-artifacts）")
+	if err := hookReg.Register(builtin.NewValidateLineAnchorsHook()); err != nil {
+		return nil, fmt.Errorf("注册 ValidateLineAnchorsHook 失败: %w", err)
+	}
+	fmt.Println("[启动] Hook 系统初始化完成（已注册：record-artifact, path-boundary, validate-expected-hash, validate-line-anchors, require-read-before-write, dependency-validator, enforce-expected-artifacts）")
 
 	// Step 3: 初始化花名册
 	r := roster.NewMemoryRoster()
@@ -392,6 +395,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 		MaxSubtaskDepth:       cfg.MaxSubtaskDepth,
 		TransferNoteMaxTokens: cfg.TransferNoteMaxTokens,
 		ProgressNotifyEnabled: cfg.ProgressNotifyEnabled,
+		HashlineEnabled:       *cfg.HashlineEnabled,
 	}
 	var runners []*runner.Runner
 	for _, kind := range cfg.Agents {

@@ -12,8 +12,9 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/pathutil"
+	"agentgo/internal/suggest"
+	"agentgo/internal/tools/hashline"
 	"agentgo/internal/tools/schema"
-	"agentgo/internal/tools/suggest"
 )
 
 // LocalReadGroup 提供只读的本地文件系统工具集合：
@@ -23,14 +24,16 @@ import (
 //   - glob_search：按 glob 模式（支持 **）查找文件
 //
 // Workdir 必须非空；Cache 可选——为 nil 时禁用缓存命中逻辑。
+// HashlineEnabled 控制 read_file 输出是否附加行哈希前缀（§7）。
 type LocalReadGroup struct {
-	Workdir WorkdirProvider       // required
-	Cache   *agent.FileStateCache // optional
+	Workdir         WorkdirProvider       // required
+	Cache           *agent.FileStateCache // optional
+	HashlineEnabled bool                  // §7：默认 false，启动时由 cfg 注入
 }
 
 // Register 把四个只读工具注册到 r。
 func (g LocalReadGroup) Register(r *agent.ToolRegistry) {
-	r.Register("read_file", "读取文件内容，支持按行切片",
+	r.Register("read_file", "读取文件内容，支持按行切片。默认输出每行带有行哈希前缀（如 1#VK|content），可用作 edit_file 的 line_anchors 锚点。",
 		schema.Object().
 			String("path", "文件路径", true).
 			Int("offset", "起始行号（1-based），可选；不传则从文件开头读", false).
@@ -125,6 +128,9 @@ func (g LocalReadGroup) readFile(ctx context.Context, args map[string]any) (stri
 			// 缓存中存的是已经包含 content_hash 后缀的旧格式内容；
 			// 为了头部信息一致，从缓存读出后重新构造头部。
 			// 简化处理：缓存命中直接返回旧格式 + 简单头
+			if g.HashlineEnabled {
+				content = hashline.FormatHashLines(1, content)
+			}
 			return formatReadFileResult(path, content, hash, 1, -1, -1, false), nil
 		}
 	}
@@ -188,6 +194,9 @@ func (g LocalReadGroup) readFile(ctx context.Context, args map[string]any) (stri
 		g.Cache.Put(path, content, hash)
 	}
 
+	if g.HashlineEnabled {
+		content = hashline.FormatHashLines(startLine, content)
+	}
 	return formatReadFileResult(path, content, hash, startLine, endLine, totalLines, truncated), nil
 }
 
@@ -245,6 +254,11 @@ func (g LocalReadGroup) listDir(ctx context.Context, args map[string]any) (strin
 	if depth == 1 {
 		entries, err := os.ReadDir(path)
 		if err != nil {
+			// §10 Did-You-Mean：路径不存在时，列父目录 + 祖父目录的目录名作为候选。
+			if os.IsNotExist(err) {
+				suggestion := buildListDirDidYouMean(path)
+				return "", fmt.Errorf("读取目录失败: %w%s", err, suggestion)
+			}
 			return "", fmt.Errorf("读取目录失败: %w", err)
 		}
 		var sb strings.Builder
@@ -319,6 +333,7 @@ func (g LocalReadGroup) grepSearch(ctx context.Context, args map[string]any) (st
 	}
 
 	var results []string
+	var allPaths []string // §10 候选池——本次扫描的所有文件路径（文件名层）
 	scannedFiles := 0
 	skippedHidden := 0
 	skippedLarge := 0
@@ -339,6 +354,7 @@ func (g LocalReadGroup) grepSearch(ctx context.Context, args map[string]any) (st
 			return nil
 		}
 		scannedFiles++
+		allPaths = append(allPaths, path)
 		lines := strings.Split(string(data), "\n")
 		for i, line := range lines {
 			if len(results) >= maxLines {
@@ -352,11 +368,14 @@ func (g LocalReadGroup) grepSearch(ctx context.Context, args map[string]any) (st
 	})
 
 	if len(results) == 0 {
-		return fmt.Sprintf(
+		base := fmt.Sprintf(
 			"未找到包含 %q 的行（扫描 %d 个文件，跳过 %d 个隐藏文件和 %d 个 >1MB 文件；max_lines=%d）。"+
 				"若意外为空：1) 先用 list_dir 确认 %q 下有目标文件；2) pattern 按字面子串匹配（非正则），检查大小写；3) 目标文件若 >1MB 会被跳过",
 			pattern, scannedFiles, skippedHidden, skippedLarge, maxLines, searchPath,
-		), nil
+		)
+		// §10 Did-You-Mean：文件名层候选——本次扫描的文件路径列表找相似文件名
+		hits := suggest.Suggest(pattern, allPaths, 3)
+		return base + suggest.FormatForToolMessage(hits), nil
 	}
 	return strings.Join(results, "\n"), nil
 }
@@ -552,6 +571,40 @@ func buildPathDidYouMean(failedPath string) string {
 	candidates := make([]string, 0, len(entries))
 	for _, e := range entries {
 		candidates = append(candidates, e.Name())
+	}
+	hits := suggest.Suggest(filepath.Base(failedPath), candidates, 3)
+	return suggest.FormatForToolMessage(hits)
+}
+
+// buildListDirDidYouMean 在 list_dir 路径不存在时，返回 "\n\nDid you mean: ..." 文本段。
+// 候选 = 父目录下的目录名 + 祖父目录下的目录名（覆盖"层级猜错一层"）。
+// 详见 nextUpgrade_v4.md §10.4。
+func buildListDirDidYouMean(failedPath string) string {
+	candidates := make([]string, 0, 64)
+	// 父目录
+	parent := filepath.Dir(failedPath)
+	if parent != "" && parent != failedPath {
+		if entries, err := os.ReadDir(parent); err == nil {
+			for _, e := range entries {
+				if e.IsDir() {
+					candidates = append(candidates, e.Name())
+				}
+			}
+		}
+	}
+	// 祖父目录
+	grandparent := filepath.Dir(parent)
+	if grandparent != "" && grandparent != parent {
+		if entries, err := os.ReadDir(grandparent); err == nil {
+			for _, e := range entries {
+				if e.IsDir() {
+					candidates = append(candidates, e.Name())
+				}
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return ""
 	}
 	hits := suggest.Suggest(filepath.Base(failedPath), candidates, 3)
 	return suggest.FormatForToolMessage(hits)

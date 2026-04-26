@@ -53,6 +53,7 @@ type RunnerDeps struct {
 	MaxSubtaskDepth       int
 	TransferNoteMaxTokens int
 	ProgressNotifyEnabled bool
+	HashlineEnabled       bool // §7
 }
 
 // Runner 是一个 kind 的单个实例（"worker-1"、"explorer-1"、"worker-fast-2"...）。
@@ -77,7 +78,7 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 
 	toolReg := agent.NewToolRegistryWithAllowlist(rt.AllowedTools)
 
-	readGroup := tools.LocalReadGroup{Workdir: workdir, Cache: fileCache}
+	readGroup := tools.LocalReadGroup{Workdir: workdir, Cache: fileCache, HashlineEnabled: deps.HashlineEnabled}
 	tools.RegisterGroups(toolReg,
 		readGroup,
 		tools.LocalWriteGroup{

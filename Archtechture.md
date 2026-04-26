@@ -980,6 +980,7 @@ AGENTGO_DUMP_PROMPTS=1 ./agentgo
 | ToolHookRegistry | `internal/hook/registry.go` | `type ToolHookRegistry struct` (L20) | 钩子注册与分发器，按 Priority 升序执行 |
 | PathBoundaryHook | `internal/hook/builtin/path_boundary.go` | `Run()` (L67) | 路径边界校验（PreCall, Prio=10），阻止越界访问 |
 | ValidateExpectedHashHook | `internal/hook/builtin/validate_expected_hash.go` | `Run()` | 乐观并发 hash 校验（PreCall, Prio=20） |
+| ValidateLineAnchorsHook | `internal/hook/builtin/validate_line_anchors.go` | `Run()` | §7 行级哈希锚点校验（PreCall, Prio=25）；失配时返回 ±2 上下文 + 当前哈希 |
 | RequireReadBeforeWriteHook | `internal/hook/builtin/require_read_before_write.go` | `Run()` (L57) | 强制"先读后写"约束（PreCall, Prio=30） |
 | RecordArtifactHook | `internal/hook/builtin/record_artifact.go` | `Run()` | 记录文件产物（PostCall, Prio=950） |
 

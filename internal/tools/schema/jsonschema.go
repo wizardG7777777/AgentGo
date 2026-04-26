@@ -64,6 +64,19 @@ func (b *JSONSchemaBuilder) Bool(name, description string, required bool) *JSONS
 	return b
 }
 
+// StringArray 添加一个 string 数组类型的属性。
+func (b *JSONSchemaBuilder) StringArray(name, description string, required bool) *JSONSchemaBuilder {
+	b.properties[name] = map[string]any{
+		"type":        "array",
+		"items":       map[string]any{"type": "string"},
+		"description": description,
+	}
+	if required {
+		b.required = append(b.required, name)
+	}
+	return b
+}
+
 // Enum 添加一个 string 类型的枚举属性，值必须在 values 列表中。
 func (b *JSONSchemaBuilder) Enum(name, description string, values []string, required bool) *JSONSchemaBuilder {
 	enumValues := make([]any, len(values))
