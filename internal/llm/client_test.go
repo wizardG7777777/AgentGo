@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -168,6 +169,152 @@ func TestSDKClient_Chat_429_Recoverable(t *testing.T) {
 	var recoverable *ErrRecoverable
 	if !errors.As(err, &recoverable) {
 		t.Errorf("expected ErrRecoverable, got %T: %v", err, err)
+	}
+}
+
+func TestSDKClient_Chat_500_Unrecoverable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"message": "Internal server error",
+				"type":    "internal_error",
+				"code":    "internal_error",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewSDKClient(server.URL+"/v1", "key", "gpt-4o", "", "", 30*time.Second)
+	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
+
+	var unrecoverable *ErrUnrecoverable
+	if !errors.As(err, &unrecoverable) {
+		t.Fatalf("expected ErrUnrecoverable, got %T: %v", err, err)
+	}
+	if unrecoverable.Code != "internal_error" {
+		t.Errorf("expected Code='internal_error', got %q", unrecoverable.Code)
+	}
+	if unrecoverable.Message != "Internal server error" {
+		t.Errorf("expected Message='Internal server error', got %q", unrecoverable.Message)
+	}
+}
+
+func TestSDKClient_Chat_400_ModelNotFound_Unrecoverable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"message": "The model `gpt-5` does not exist or you do not have access to it.",
+				"type":    "invalid_request_error",
+				"code":    "model_not_found",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewSDKClient(server.URL+"/v1", "key", "gpt-5", "", "", 30*time.Second)
+	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
+
+	var unrecoverable *ErrUnrecoverable
+	if !errors.As(err, &unrecoverable) {
+		t.Fatalf("expected ErrUnrecoverable, got %T: %v", err, err)
+	}
+	if unrecoverable.Code != "model_not_found" {
+		t.Errorf("expected Code='model_not_found', got %q", unrecoverable.Code)
+	}
+	if unrecoverable.Message == "" {
+		t.Error("expected non-empty Message")
+	}
+}
+
+func TestSDKClient_Chat_502_Recoverable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"message": "Bad gateway",
+				"type":    "gateway_error",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewSDKClient(server.URL+"/v1", "key", "gpt-4o", "", "", 30*time.Second)
+	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
+
+	var recoverable *ErrRecoverable
+	if !errors.As(err, &recoverable) {
+		t.Fatalf("expected ErrRecoverable, got %T: %v", err, err)
+	}
+}
+
+func TestSDKClient_Chat_503_Recoverable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"message": "Service unavailable",
+				"type":    "service_unavailable",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewSDKClient(server.URL+"/v1", "key", "gpt-4o", "", "", 30*time.Second)
+	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
+
+	var recoverable *ErrRecoverable
+	if !errors.As(err, &recoverable) {
+		t.Fatalf("expected ErrRecoverable, got %T: %v", err, err)
+	}
+}
+
+// TestSDKClient_Chat_EndpointPropagation 守的是 §9.4 一个非平凡的装配点：
+// classifySDKError 把 apiErr.Request.URL.String() 写入 ErrUnrecoverable.Endpoint
+// （client.go:313-316），diagnoseLLMError 中 404Endpoint / 404Host 两条路径需要
+// 这个字段才能给出具体诊断。
+//
+// 既有测试都手填 Endpoint，没有验证从 SDK apiErr → ErrUnrecoverable.Endpoint
+// 这条透传链路；本测试通过 httptest 模拟真实 401 响应，断言 Endpoint 字段
+// 至少含我们配置的 server URL host:port。
+//
+// 失败模式：openai-go SDK 升级时可能改 apiErr.Request 字段名/结构，那时本测试
+// 会精确暴露空 Endpoint 而非等到 diagnoseLLMError 输出"端点错误"诊断里的"空"
+// 才被发现。
+func TestSDKClient_Chat_EndpointPropagation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(401)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"message": "Incorrect API key provided",
+				"type":    "invalid_request_error",
+				"code":    "invalid_api_key",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewSDKClient(server.URL+"/v1", "bad-key", "gpt-4o", "", "", 30*time.Second)
+	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
+
+	var unrecoverable *ErrUnrecoverable
+	if !errors.As(err, &unrecoverable) {
+		t.Fatalf("expected ErrUnrecoverable, got %T: %v", err, err)
+	}
+	if unrecoverable.Endpoint == "" {
+		t.Fatalf("Endpoint 为空——apiErr.Request.URL → ErrUnrecoverable.Endpoint 透传链路断了")
+	}
+	// httptest 的 server.URL 形如 http://127.0.0.1:<port>，client 用的是 server.URL+"/v1"
+	// SDK 实际请求路径是 server.URL+"/v1/chat/completions"，Endpoint 应至少含 server.URL
+	if !strings.Contains(unrecoverable.Endpoint, server.URL) {
+		t.Errorf("Endpoint 不含预期 server URL；\n  got      = %q\n  want sub = %q",
+			unrecoverable.Endpoint, server.URL)
 	}
 }
 

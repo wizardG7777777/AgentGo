@@ -282,6 +282,16 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			if err := a.Store.FailTask(a.ID, taskID, reason); err != nil {
 				log.Printf("[agent %s] panic 恢复后 FailTask error: %v", a.ID, err)
 			}
+			// 2026-04-26 §11.8 S11：panic-recovery 路径补 KindTaskFailed emit。
+			// 此前与 terminateTask（agent.go:811）的非对称——同样调 FailTask 但 panic
+			// 路径不 emit——导致 trace 观察者对 panic 引发的任务失败完全失明。
+			// 该缺陷由 §11.8 S11 对称扫描测试首次发现并同 commit 修复。
+			trace.Emit(trace.Event{
+				Kind:    trace.KindTaskFailed,
+				TaskID:  taskID,
+				AgentID: a.ID,
+				Reason:  reason,
+			})
 			// 尝试发送崩溃汇报（有 EventSource 时）
 			if task != nil {
 				a.sendCrashReport(task, taskID, reason)
@@ -798,8 +808,9 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 		if note != "" {
 			_ = a.Store.SetTransferNote(taskID, note)
 		}
-		log.Printf("[agent %s] 任务 %s 不可恢复错误：%v", a.ID, taskID, execErr)
-		a.terminateTask(task, taskID, execErr.Error())
+		reason := diagnoseLLMError(execErr, history, a.Model)
+		log.Printf("[agent %s] 任务 %s 不可恢复错误：%s", a.ID, taskID, reason)
+		a.terminateTask(task, taskID, reason)
 	}
 }
 
@@ -888,6 +899,47 @@ func (a *Agent) sendCrashReport(task *model.Task, taskID string, reason string) 
 		log.Printf("[agent %s] 发送崩溃汇报失败: %v", a.ID, err)
 	} else {
 		log.Printf("[agent %s] 已向 %s 汇报任务 %s 崩溃", a.ID, task.EventSource, taskID[:8])
+	}
+}
+
+// diagnoseLLMError 将不可恢复 LLM 错误映射为面向用户/scheduler 的诊断提示。
+// 基于 v4.md §9.4 的诊断映射规则，从 llm.ErrUnrecoverable 中提取 Code / StatusCode /
+// Message / Endpoint 生成可操作的错误描述。非 llm 错误原样返回。
+func diagnoseLLMError(execErr error, history []HistoryEntry, model string) string {
+	var unrecov *llm.ErrUnrecoverable
+	if !errors.As(execErr, &unrecov) {
+		return execErr.Error()
+	}
+
+	// 轻量估算当前历史 token 长度（用于 context_length_exceeded 提示）
+	estTokens := 0
+	for _, h := range history {
+		estTokens += len(h.AssistantContent) / 3
+		estTokens += len(h.Output) / 3
+		for _, tr := range h.ToolResults {
+			estTokens += len(tr.Content) / 3
+		}
+	}
+
+	msgLower := strings.ToLower(unrecov.Message)
+	switch {
+	// Go 优先级 && > ||，下面两个分支等价；显式括号让"或"的两侧在视觉上对齐，
+	// 防止维护者误读为 (Code=="model_not_found" || strings.Contains(...,"model")) && strings.Contains(...,"not found")。
+	case unrecov.Code == "model_not_found" ||
+		(strings.Contains(msgLower, "model") && strings.Contains(msgLower, "not found")):
+		return fmt.Sprintf("模型名 '%s' 不存在。请检查 setting.yaml 中的 model 配置。当前使用的 endpoint: %s", model, unrecov.Endpoint)
+	case unrecov.Code == "invalid_api_key" || unrecov.StatusCode == 401:
+		return "API key 无效或已过期。请检查 setting.yaml 中的 api_key 或环境变量。"
+	case unrecov.Code == "insufficient_quota":
+		return "API 配额不足。请检查账户余额或联系 provider。"
+	case unrecov.StatusCode == 404 && strings.Contains(unrecov.Endpoint, "/chat/completions"):
+		return fmt.Sprintf("端点返回 404。请检查 setting.yaml 中的 base_url 是否包含正确的 API 路径（如 %s）。", unrecov.Endpoint)
+	case unrecov.StatusCode == 404:
+		return fmt.Sprintf("无法连接到 %s。请检查网络连通性或 base_url 配置。", unrecov.Endpoint)
+	case unrecov.Code == "context_length_exceeded":
+		return fmt.Sprintf("请求超出模型上下文上限。当前历史长度约 %d tokens，请考虑降低 context_limit 或开启更积极的历史压缩。", estTokens)
+	default:
+		return fmt.Sprintf("LLM 调用失败: %s (status=%d, code=%s)。完整响应: %s", unrecov.Message, unrecov.StatusCode, unrecov.Code, unrecov.Err.Error())
 	}
 }
 

@@ -303,16 +303,28 @@ func parseFinishReason(raw string) FinishReason {
 
 // classifySDKError 将 SDK 错误分类。
 // HTTP 层重试已由 SDK 处理，这里只做最终分类。
+// 响应体中的 code / message 被提取到 error 结构体，供上层打印诊断信息。
 func classifySDKError(err error) error {
 	var apiErr *openai.Error
 	if errors.As(err, &apiErr) {
+		code := apiErr.Code
+		message := apiErr.Message
+		statusCode := apiErr.StatusCode
+		endpoint := ""
+		if apiErr.Request != nil && apiErr.Request.URL != nil {
+			endpoint = apiErr.Request.URL.String()
+		}
 		switch {
-		case apiErr.StatusCode == 429 || apiErr.StatusCode >= 500:
-			return &ErrRecoverable{Err: err}
-		case apiErr.StatusCode == 401 || apiErr.StatusCode == 403 || apiErr.StatusCode == 404:
-			return &ErrUnrecoverable{Err: err}
+		// 可恢复：临时网络波动、限流、网关超时
+		case apiErr.StatusCode == 408 || apiErr.StatusCode == 429,
+			apiErr.StatusCode == 502 || apiErr.StatusCode == 503 || apiErr.StatusCode == 504:
+			return &ErrRecoverable{Err: err, Code: code, Message: message}
+		// 不可恢复：请求参数错误、鉴权失败、端点不存在、服务端内部错误
+		case apiErr.StatusCode == 400 || apiErr.StatusCode == 401 || apiErr.StatusCode == 403,
+			apiErr.StatusCode == 404 || apiErr.StatusCode == 405 || apiErr.StatusCode == 500:
+			return &ErrUnrecoverable{Err: err, StatusCode: statusCode, Code: code, Message: message, Endpoint: endpoint}
 		default:
-			return &ErrUnrecoverable{Err: err}
+			return &ErrUnrecoverable{Err: err, StatusCode: statusCode, Code: code, Message: message, Endpoint: endpoint}
 		}
 	}
 	// 网络错误等非 API 错误视为可恢复
