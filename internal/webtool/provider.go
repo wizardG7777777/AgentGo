@@ -3,7 +3,6 @@ package webtool
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 )
 
@@ -22,37 +21,57 @@ type SearchProvider interface {
 	Name() string
 }
 
-// NewProvider 根据配置创建对应的 SearchProvider 实例。
-// provider 为空时默认使用 DuckDuckGo HTML 抓取方式。
-func NewProvider(provider, apiURL, apiKey string) SearchProvider {
+// NewProvider 严格按 provider 名 + 配置完整性构造 SearchProvider。
+//
+// 行为约定（2026-04-27 重构，详见 docs/activate/nextUpgrade_v5.md §11.1 案例块）：
+//   - 空字符串 / "duckduckgo_html" → DuckDuckGoProvider, nil
+//   - "searxng" 缺 apiURL / "tavily"·"serper" 缺 apiKey → nil, error
+//   - 未知 provider → nil, error（不再静默回落 DDG，避免 probe/provider 决策分裂）
+//
+// 不再做静默 fallback——历史问题：probe 与 provider 各自看同一份配置（serper +
+// 空 key）得出矛盾结论（probe 报 unavailable / provider 静默切 DDG），LLM 误以为
+// web_search 不可用而拒绝调用。fallback 决策从 webtool 抽到上层（bootstrap），
+// 由 NewProviderWithDefault 统一兜底并显式告知调用方。
+//
+// 调用方需要"无论如何给我一个可用的 provider"时改用 NewProviderWithDefault。
+func NewProvider(provider, apiURL, apiKey string) (SearchProvider, error) {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "", "duckduckgo_html":
+		return &DuckDuckGoProvider{}, nil
 	case "searxng":
 		if apiURL == "" {
-			log.Println("[警告] searxng 提供者需要 search_api_url，回退到 duckduckgo_html")
-			return &DuckDuckGoProvider{}
+			return nil, fmt.Errorf("searxng 提供者需要 search_api_url")
 		}
-		return &SearXNGProvider{BaseURL: strings.TrimRight(apiURL, "/")}
+		return &SearXNGProvider{BaseURL: strings.TrimRight(apiURL, "/")}, nil
 	case "tavily":
 		if apiKey == "" {
-			log.Println("[警告] tavily 提供者需要 search_api_key，回退到 duckduckgo_html")
-			return &DuckDuckGoProvider{}
+			return nil, fmt.Errorf("tavily 提供者需要 search_api_key")
 		}
-		return &TavilyProvider{APIKey: apiKey}
+		return &TavilyProvider{APIKey: apiKey}, nil
 	case "serper":
 		if apiKey == "" {
-			log.Println("[警告] serper 提供者需要 search_api_key，回退到 duckduckgo_html")
-			return &DuckDuckGoProvider{}
+			return nil, fmt.Errorf("serper 提供者需要 search_api_key")
 		}
-		return &SerperProvider{APIKey: apiKey}
-	case "duckduckgo_html", "":
-		if provider == "" {
-			log.Println("[提示] 未配置 search_api_provider，使用默认 duckduckgo_html")
-		}
-		return &DuckDuckGoProvider{}
+		return &SerperProvider{APIKey: apiKey}, nil
 	default:
-		log.Printf("[警告] 未知的搜索提供者 %q，回退到 duckduckgo_html\n", provider)
-		return &DuckDuckGoProvider{}
+		return nil, fmt.Errorf("未知的搜索提供者: %s", provider)
 	}
+}
+
+// NewProviderWithDefault 是带兜底的 provider 构造入口：strict NewProvider 失败
+// 时回落 DuckDuckGo，并通过 fellBack/reason 显式告知调用方"用户要的不是实际跑的"。
+//
+//   - sp:        实际运行的 SearchProvider（永不返回 nil）
+//   - fellBack:  true 表示触发了兜底（调用方应当 surface 一条说明，便于排障）
+//   - reason:    人类可读的兜底原因（fellBack=false 时为空串）
+//
+// 这是 bootstrap / scheduler 推荐入口；要严格校验配置时直接用 NewProvider。
+func NewProviderWithDefault(provider, apiURL, apiKey string) (sp SearchProvider, fellBack bool, reason string) {
+	sp, err := NewProvider(provider, apiURL, apiKey)
+	if err == nil {
+		return sp, false, ""
+	}
+	return &DuckDuckGoProvider{}, true, err.Error()
 }
 
 // FormatResults 将搜索结果列表格式化为可读的文本输出，供 LLM 消费。

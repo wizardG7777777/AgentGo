@@ -338,8 +338,26 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 	}
 
 	// Step 6.8: 工具可用性探针
+	//
+	// 2026-04-27 修复：先构造 SearchProvider，再用其 Name() 派发 probe。
+	// 历史问题：probe.NewWebSearchProbe 按 cfg.SearchAPIProvider（用户配置原文）派发，
+	// 而 webtool.NewProvider 在 key/URL 缺失时静默回落 DDG——导致 probe 报
+	// "serper unavailable"，但实际跑的是 DDG，可工作。Scheduler 因 unavailable_tools
+	// 误以为 web_search 不可用，自我克制不派网络任务。修复：把 fallback 决策从
+	// webtool 抽到 bootstrap，并按实际 provider.Name() 派发 probe。
+	searchProvider, fellBack, fallbackReason := webtool.NewProviderWithDefault(
+		cfg.SearchAPIProvider, cfg.SearchAPIURL, cfg.SearchAPIKey)
+	if fellBack {
+		fmt.Printf("[启动] web_search: %s，已回落到 %s（工具仍可用，但能力可能降级）\n",
+			fallbackReason, searchProvider.Name())
+	}
+	// fallback 后 DDG 不需要 apiURL/apiKey；显式置空避免误导后续维护者。
+	probeURL, probeKey := cfg.SearchAPIURL, cfg.SearchAPIKey
+	if fellBack {
+		probeURL, probeKey = "", ""
+	}
 	probes := []probe.Probe{
-		probe.NewWebSearchProbe(cfg.SearchAPIProvider, cfg.SearchAPIURL, cfg.SearchAPIKey),
+		probe.NewWebSearchProbe(searchProvider.Name(), probeURL, probeKey),
 		probe.NewWebFetchProbe(""),
 	}
 	toolHealth := probe.RunAll(context.Background(), probes, 10*time.Second)
@@ -369,7 +387,7 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 
 	// Step 8: 创建执行代理（v4 §11.6.1 唯一路径——按 kind × replicas 实例化统一 Runner）
 	// 共享 RunnerDeps 一次构造、所有 kind/replica 共用
-	searchProvider := webtool.NewProvider(cfg.SearchAPIProvider, cfg.SearchAPIURL, cfg.SearchAPIKey)
+	// searchProvider 已在 Step 6.8 构造，复用同一实例（避免重复 fallback 日志）。
 	shellFilter, fErr := shell.BuildFilter(cfg.ProjectRoot, cfg.ShellBlacklist, cfg.ShellGreylist)
 	if fErr != nil {
 		shellFilter = shell.NewCommandFilter(shell.DefaultBlacklist, shell.DefaultGreylist)

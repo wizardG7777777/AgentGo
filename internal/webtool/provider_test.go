@@ -151,68 +151,165 @@ func TestSerperProvider_EmptyQuery(t *testing.T) {
 }
 
 // --- NewProvider 工厂函数测试 ---
+//
+// 2026-04-27 重构后语义：strict 模式——配置不完整 / provider 未知时返回 error，
+// 不再静默回落 DDG。fallback 改由 NewProviderWithDefault 显式承担。
 
 func TestNewProvider_DuckDuckGo(t *testing.T) {
-	p := NewProvider("duckduckgo_html", "", "")
+	p, err := NewProvider("duckduckgo_html", "", "")
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
 	if p.Name() != "duckduckgo_html" {
 		t.Errorf("期望 duckduckgo_html，实际: %s", p.Name())
 	}
 }
 
 func TestNewProvider_Default(t *testing.T) {
-	p := NewProvider("", "", "")
+	// 空 provider = 用户未表达偏好，DDG 是默认（不是 fallback），无 error
+	p, err := NewProvider("", "", "")
+	if err != nil {
+		t.Fatalf("空 provider 不应报错: %v", err)
+	}
 	if p.Name() != "duckduckgo_html" {
-		t.Errorf("空 provider 应回退到 duckduckgo_html，实际: %s", p.Name())
+		t.Errorf("空 provider 应默认 duckduckgo_html，实际: %s", p.Name())
 	}
 }
 
 func TestNewProvider_SearXNG(t *testing.T) {
-	p := NewProvider("searxng", "http://localhost:8080", "")
+	p, err := NewProvider("searxng", "http://localhost:8080", "")
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
 	if p.Name() != "searxng" {
 		t.Errorf("期望 searxng，实际: %s", p.Name())
 	}
 }
 
 func TestNewProvider_SearXNG_NoURL(t *testing.T) {
-	// 缺少 URL 应回退到 duckduckgo_html
-	p := NewProvider("searxng", "", "")
-	if p.Name() != "duckduckgo_html" {
-		t.Errorf("缺少 URL 时应回退到 duckduckgo_html，实际: %s", p.Name())
+	// 缺少 URL 应严格失败（不再静默回落）
+	p, err := NewProvider("searxng", "", "")
+	if err == nil {
+		t.Fatalf("缺少 URL 应返回 error，但实际成功返回 %s", p.Name())
+	}
+	if !strings.Contains(err.Error(), "search_api_url") {
+		t.Errorf("error 应说明缺哪个字段，实际: %v", err)
 	}
 }
 
 func TestNewProvider_Tavily(t *testing.T) {
-	p := NewProvider("tavily", "", "test-key")
+	p, err := NewProvider("tavily", "", "test-key")
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
 	if p.Name() != "tavily" {
 		t.Errorf("期望 tavily，实际: %s", p.Name())
 	}
 }
 
 func TestNewProvider_Tavily_NoKey(t *testing.T) {
-	p := NewProvider("tavily", "", "")
-	if p.Name() != "duckduckgo_html" {
-		t.Errorf("缺少 key 时应回退到 duckduckgo_html，实际: %s", p.Name())
+	p, err := NewProvider("tavily", "", "")
+	if err == nil {
+		t.Fatalf("缺少 key 应返回 error，但实际成功返回 %s", p.Name())
+	}
+	if !strings.Contains(err.Error(), "search_api_key") {
+		t.Errorf("error 应说明缺哪个字段，实际: %v", err)
 	}
 }
 
 func TestNewProvider_Serper(t *testing.T) {
-	p := NewProvider("serper", "", "test-key")
+	p, err := NewProvider("serper", "", "test-key")
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
 	if p.Name() != "serper" {
 		t.Errorf("期望 serper，实际: %s", p.Name())
 	}
 }
 
 func TestNewProvider_Serper_NoKey(t *testing.T) {
-	p := NewProvider("serper", "", "")
-	if p.Name() != "duckduckgo_html" {
-		t.Errorf("缺少 key 时应回退到 duckduckgo_html，实际: %s", p.Name())
+	p, err := NewProvider("serper", "", "")
+	if err == nil {
+		t.Fatalf("缺少 key 应返回 error，但实际成功返回 %s", p.Name())
+	}
+	if !strings.Contains(err.Error(), "search_api_key") {
+		t.Errorf("error 应说明缺哪个字段，实际: %v", err)
 	}
 }
 
 func TestNewProvider_Unknown(t *testing.T) {
-	p := NewProvider("unknown_provider", "", "")
-	if p.Name() != "duckduckgo_html" {
-		t.Errorf("未知 provider 应回退到 duckduckgo_html，实际: %s", p.Name())
+	p, err := NewProvider("unknown_provider", "", "")
+	if err == nil {
+		t.Fatalf("未知 provider 应返回 error，但实际成功返回 %s", p.Name())
+	}
+	if !strings.Contains(err.Error(), "未知") {
+		t.Errorf("error 应包含'未知'，实际: %v", err)
+	}
+}
+
+// --- NewProviderWithDefault 显式兜底入口测试 ---
+//
+// 2026-04-27 修复 web_search probe/provider 决策分裂时引入。这是给 bootstrap /
+// scheduler 用的"无论如何给我一个可用的 provider"入口，fallback 行为从 webtool
+// 内部抽到这里——调用方拿到 fellBack=true 时应当 surface 一条说明，让 LLM /
+// probe 知道实际跑的是 DDG 而不是用户配的那个 provider。
+
+func TestNewProviderWithDefault_NoFallback(t *testing.T) {
+	cases := []struct {
+		name         string
+		providerName string
+		apiURL       string
+		apiKey       string
+		expectedName string
+	}{
+		{"empty", "", "", "", "duckduckgo_html"},
+		{"explicit_ddg", "duckduckgo_html", "", "", "duckduckgo_html"},
+		{"searxng_complete", "searxng", "http://localhost:8080", "", "searxng"},
+		{"tavily_complete", "tavily", "", "tavily-key", "tavily"},
+		{"serper_complete", "serper", "", "serper-key", "serper"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sp, fellBack, reason := NewProviderWithDefault(tc.providerName, tc.apiURL, tc.apiKey)
+			if fellBack {
+				t.Errorf("配置完整不应触发 fallback，实际 fellBack=true reason=%q", reason)
+			}
+			if reason != "" {
+				t.Errorf("无 fallback 时 reason 应为空，实际: %q", reason)
+			}
+			if sp.Name() != tc.expectedName {
+				t.Errorf("期望 provider %s，实际 %s", tc.expectedName, sp.Name())
+			}
+		})
+	}
+}
+
+func TestNewProviderWithDefault_FallbackOnIncompleteConfig(t *testing.T) {
+	cases := []struct {
+		name           string
+		providerName   string
+		apiURL         string
+		apiKey         string
+		reasonContains string
+	}{
+		{"searxng_no_url", "searxng", "", "", "search_api_url"},
+		{"tavily_no_key", "tavily", "", "", "search_api_key"},
+		{"serper_no_key", "serper", "", "", "search_api_key"},
+		{"unknown_provider", "unknown_x", "", "", "未知"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sp, fellBack, reason := NewProviderWithDefault(tc.providerName, tc.apiURL, tc.apiKey)
+			if !fellBack {
+				t.Fatalf("配置不完整应触发 fallback，实际 fellBack=false")
+			}
+			if sp.Name() != "duckduckgo_html" {
+				t.Errorf("fallback 目标应为 DDG，实际: %s", sp.Name())
+			}
+			if !strings.Contains(reason, tc.reasonContains) {
+				t.Errorf("reason 应包含 %q，实际: %q", tc.reasonContains, reason)
+			}
+		})
 	}
 }
 

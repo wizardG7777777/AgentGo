@@ -413,8 +413,10 @@ func New(
 	// 工作目录
 	workdir := &tools.DefaultWorkdir{ProjectRoot: cfg.ProjectRoot}
 
-	// 搜索提供者
-	searchProvider := webtool.NewProvider(cfg.SearchAPIProvider, cfg.SearchAPIURL, cfg.SearchAPIKey)
+	// 搜索提供者：bootstrap 已在 Step 6.8 surface 过 fallback 通知，此处用
+	// silent 入口（NewProviderWithDefault）拿到同一份兜底逻辑得到的 provider，
+	// 避免在同一次启动里把 fallback 提示重复打印两遍。
+	searchProvider, _, _ := webtool.NewProviderWithDefault(cfg.SearchAPIProvider, cfg.SearchAPIURL, cfg.SearchAPIKey)
 
 	// 工具集 = worker 全集 + SchedulerGroup
 	hlEnabled := true
