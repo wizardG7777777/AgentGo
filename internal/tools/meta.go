@@ -46,23 +46,25 @@ type BatchTracker interface {
 //   - AgentID：当前代理 ID（send_message 的发件人）
 //   - BatchTracker：（可选，Phase 3）publish_task 成功后追加子任务 ID 到此 tracker；
 //     scheduler 注入时把 ID 写入 scheduler task.SchedulerBatch；worker 不注入则无副作用
-//   - DisablePublishTask：capability bit——true 时即便 Store 非空也不注册 publish_task。
-//     Explorer 用来在注入 Store/Holder（让 send_message 能读 MailChainDepth）的同时
-//     保住只读契约。替代了"用 Store=nil 当权限开关"的旧耦合写法。
+//
+// 注：早期曾有 `DisablePublishTask bool` capability 位，用于让 Explorer 注入 Store/Holder
+// 的同时仍然不暴露 publish_task。Phase D（2026-04-26）删除 internal/explorer 后该字段
+// 失去全部调用方；v4 的 publish_task 准入完全由 runner 的 AllowedTools allowlist 过滤
+// 控制（`tool_profiles` / `agents[].tools`），故于 2026-04-26 一并移除——见 runner.go
+// 中 ToolRegistry 的 Filter 路径。
 type MetaGroup struct {
-	Store              store.TaskStore
-	Holder             TaskHolder
-	MaxDepth           int
-	MBRegistry         *mailbox.Registry
-	AgentID            string
-	BatchTracker       BatchTracker
-	DisablePublishTask bool
+	Store        store.TaskStore
+	Holder       TaskHolder
+	MaxDepth     int
+	MBRegistry   *mailbox.Registry
+	AgentID      string
+	BatchTracker BatchTracker
 }
 
 // Register 把 publish_task / send_message 注册到 r。
 // 各自的依赖缺失时自动跳过对应工具。
 func (g MetaGroup) Register(r *agent.ToolRegistry) {
-	if g.Store != nil && !g.DisablePublishTask {
+	if g.Store != nil {
 		r.Register(
 			"publish_task",
 			"发布一个新任务到任务队列，由调度器或其他代理认领执行",
