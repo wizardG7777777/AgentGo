@@ -1,6 +1,8 @@
 # nextUpgrade v4
 
-> 状态：🚧 实施中（2026-04-26 增量基建首批落地）
+> 状态：✅ **主体已完成**（2026-04-26 Phase A/B/C/D/E 全部落地；§7 Hashline / §3
+> 能力声明阶段二 / §9 完整错误码策略 / §10 Did-You-Mean 扩展设计 是路线图上独立的
+> 后续工作项，不阻塞 v4 主体——详见下方"实施进度"块与 §状态总览）
 
 ## 实施进度（2026-04-26）
 
@@ -12,50 +14,97 @@
 - §11.7.4 截断策略：新增 `internal/agent/token_truncate.go` 实现
   `keepRecentForTruncate=6` 包级常量、`PredictNextPromptTokens`、`TruncateHistory`
   与 `ErrContextLimitTooSmall`
-  > 🚨 **2026-04-26 实测发现装配漏接**：函数与字段都已实现且 runner 已注入
-  > `Agent.ContextLimit`，**但 `processTask` 主循环从未调用 `TruncateHistory`**。
-  > 详见 §11.7.4 节内的状态说明 + 修复定位。属典型"零件单测过 → 装配握手位无人测"
-  > 的 CLAUDE.md "Shipping conventions" 反例。
+  > ✅ **装配漏接已修复**（2026-04-26 commit `6e45a73`，commit message 末段明
+  > 写"§11.7.4 truncate 接通修复"）：`processTask` 主循环现在在 `a.ContextLimit > 0`
+  > 守卫下调用 `TruncateHistory()`（`internal/agent/agent.go:501-503`）。
+  > 历史教训保留作 CLAUDE.md "Shipping conventions" 案例：函数级 6 条单测全绿，
+  > 但装配握手位（main loop ↔ TruncateHistory）无人测；端到端
+  > `TestE2E_TruncateFiresOnContextLimit`（详见 §11.7.4 验证计划）已加入作为
+  > 反退化护栏。
 - `Agent` 结构体追加 `Model` / `ContextLimit` 字段（runner 注入用）
 
-**Phase B — v4 基础设施（已完成 ✅，bootstrap 切换待跟进）**：
+**Phase B — v4 基础设施（已完成 ✅）**：
 - §11.4 Go 配置类型：`LLMConfig` / `AgentKind` / `SchedulerKind` /
-  `InfraConfig` + 4 个子结构 / `AgentRuntimeConfig` 新增到 `internal/config/`，
-  与 v3 顶层字段并存
-- §11.5.3 启动校验：`Config.Validate()` 实现 12 条规则；当 `Agents` 为空时退化为
-  仅校验 `StartupProbe*`，与 v3 路径无冲突
+  `InfraConfig` + 4 个子结构 / `AgentRuntimeConfig` 新增到 `internal/config/`
+  （Phase D 后 v3 顶层字段已整体下线，本节类型成为 `Config` 唯一字段集）
+- §11.5.3 启动校验：`Config.Validate()` 实现 12 条规则；Phase D 后硬要求
+  `agents` 非空（空列表直接 fail-fast）
 - §11.3 末尾：`LoadConfig` 在反序列化前调用 `os.ExpandEnv` 替换 `${ENV_VAR}`
 - §11.6.6 worker/explorer 折叠：`internal/runner/`（`Runner` + `CurrentTaskHolder`）
-  统一 runner 实现；`internal/agent/team_snapshot.go` 迁移 `BuildTeamSnapshot`
-  （worker 副本暂留待 bootstrap 切换后删除）
+  统一 runner 实现；`internal/agent/team_snapshot.go` 持有 `BuildTeamSnapshot`
+  （Phase D 已删除 `internal/worker/` 与 `internal/explorer/` 中的副本）
 - §11.6.1 + §9.5：`internal/bootstrap/runtime_builder.go` 提供
   `buildKindLLMClient` / `buildAgentRuntime` / `buildSchedulerRuntime`；
   `internal/bootstrap/probe.go` 提供 `printStartupBanner` + `startupProbe`
-- §11.8 S8：`prompts/worker.md` + `prompts/explorer.md`（从 worker.go / explorer.go
-  常量抽出）+ `setting.v4.yaml` 参考模板（与现 `setting.yaml` 并存）
+- §11.8 S8：`prompts/worker.md` + `prompts/explorer.md`（从原 worker.go /
+  explorer.go 常量抽出）+ `setting.v4.yaml` 参考模板（Phase D 后默认
+  `setting.yaml` 也已替换为 v4 schema，两份近似等价）
 
-**Phase C — bootstrap 切换（已完成 ✅，同 session 一气呵成）**：
-- `bootstrap.go` 主流程引入 v4 kind-based 分支：`if len(cfg.Agents) > 0` 走 §11.6.1
-  step 6（按 kind × replicas 实例化统一 `runner.Runner`）；否则走原 v3 worker/explorer
-  创建逻辑（兼容现有 setting.yaml）
-- `Config.mirrorV4ToV3()` 把 v4 嵌套块字段镜像到 v3 顶层字段——让 v4 yaml 用户在
-  bootstrap 仍读 v3 字段时也拿到正确值
-- 新增 `System.Runners []*runner.Runner` 字段；`Start()` 据此分支启动 goroutine
+**Phase C — bootstrap 切换（已完成 ✅，2026-04-26 同 session 完成）**：
+- `bootstrap.go` 主流程：v4 kind-based 路径已成为唯一启动路径，按 `cfg.Agents`
+  列表实例化 `runner.Runner`（kind × replicas），v3 旧分支与 mirror 层一并下线
+  （详见 Phase D）
+- 新增 `System.Runners []*runner.Runner` 字段；`Start()` 据此启动 goroutine
 - `Bootstrap()` 早期插入 `cfg.Validate()` + `printStartupBanner` + `startupProbe`
-  调用，失败按 `startup_probe_failure_action` 分支
+  调用，失败按 `startup_probe_failure_action` 分支（warn / exit）
 - **端到端烟测通过**（CLAUDE.md "Shipping conventions" 规则 1）：
-  - `setting.v4.yaml`：banner 列出 3 kind + scheduler，TCP probe 到 api.deepseek.com:443
-    成功，4 个 runner 实例（worker×3 + explorer×1）启动 + /quit 干净关闭
-  - `setting.yaml`（v3）：v3 explorer + 3 worker 启动如旧；零 regression
+  `setting.v4.yaml`：banner 列出 3 kind，TCP probe 到 api.deepseek.com:443 成功，
+  4 个 runner 实例（worker×3 + explorer×1）启动 + /quit 干净关闭
 
-**未落地（**非阻塞**，留给后续清理 commit）**：
-- 删除 `internal/worker/` + `internal/explorer/` 两个 package（保留为孤儿包，
-  v3 兼容路径仍引用——若用户决定永久迁移到 v4 yaml，再清理）
-- 移除 `tools.MetaGroup.DisablePublishTask` 标志（allowlist filter 已等价表达，
-  当前与现有 explorer.New 调用兼容，无破坏性需求驱动清理）
-- 默认 `setting.yaml` 替换为 v4 格式（用户通过 `mv setting.yaml setting.v3.yaml.bak;
-  cp setting.v4.yaml setting.yaml` 启用 v4 路径，无需代码改动）
-- §11.8 S11 `trace.Emit` 对称扫描脚本（永久不变量回归测试）
+**Phase D — v3 兼容层整体下线（已完成 ✅，2026-04-26 commit `6e45a73`）**：
+- 删除 `internal/worker/` + `internal/explorer/` 两个 package（孤儿包清零，共 10
+  个文件随 commit 一并删除：`worker.go` / `worker_test.go` / `team_snapshot_e2e_test.go`
+  / `shell_approval_chain_e2e_test.go` / `send_message_test.go` / `worktree_isolation_test.go`
+  + explorer 同名测试 + `chain_depth_test.go` + `explorer.go`）
+- 删除 `Config` struct 中的 23 个 v3 顶层字段 + `mirrorV4ToV3` + `ValidateWorkers`
+  + `ValidateAgentDeclarations` + `Resolved{Agent,Worker}Declaration`——v4 嵌套块
+  成为唯一受支持格式（旧字段在 yaml 解析时被默默忽略，不再产生运行时效果）
+- 删除 `bootstrap.go` 全部 `if len(cfg.Agents) == 0` v3 fallback 分支；统一走
+  `runner.Runner`
+- 系统级常量化：`mailbox.DefaultChainMaxDepth=10` / `mailbox.DefaultInboxSize=32`
+  / `scheduler.schedulerMaxLoops=10` / `Infra.Store.DefaultTimeoutSec`
+  （v4 §11.5.4 / §11.5.5）
+- 默认 `setting.yaml` 已替换为 v4 格式（与 `setting.v4.yaml` 内容等价，仅微调
+  `enforce_compact_token_threshold` 与 explorer `context_limit`：8000→16000，
+  原因写在 yaml 注释里——实测 scheduler 首调 prompt_tokens=8525，8000 会让
+  explorer 一启动就触发硬截断）
+- 新增 banner 第二行打印 `Config File: <path>`，避免"测 v4 但实跑 v3 默认"的混淆
+- `Validate()` 现在硬要求 `agents` 非空——空 yaml 启动直接 `agents 列表为空` 退出
+- 删除 `internal/config/config_test.go`（59 个 v3 字段断言）和
+  `internal/bootstrap/bootstrap_test.go`（v3 worker/explorer 装配测试）
+- `main_startup_test.go` 重写：fallback 测试改为断言 v4 fail-fast
+- `go test ./...` 全绿；`./agentgo.exe -config setting.v4.yaml` 烟测通过
+
+**Phase E — 收尾清理（已完成 ✅，2026-04-26 同 session 完成）**：
+- 删除 `tools.MetaGroup.DisablePublishTask` 字段：Phase D 删除 worker/explorer 后
+  该 capability 位失去最后调用方；v4 路径完全靠 `runner.NewToolRegistryWithAllowlist`
+  对 `AllowedTools` 做白名单过滤来收窄能力，与 capability 位等价但更内聚。同步
+  更新 `meta.go` 上方注释保留考古信息
+- §11.8 S11 终结路径 `trace.Emit` 对称扫描落地：新增
+  [internal/agent/terminal_emit_symmetry_test.go](../../internal/agent/terminal_emit_symmetry_test.go)
+  AST 静态扫描 3 条不变量（FailTask 同函数体内必有 KindTaskFailed emit /
+  processTask 内 ctx.Done 分支必有 KindTaskCancelled emit / 文件级 KindTaskCompleted ≥ 2）+
+  [panic_emit_test.go](../../internal/agent/panic_emit_test.go) 运行时双重验证
+  - 副作用：扫描立即发现一处真缺陷——`processTask` 顶部 `defer recover()` 路径
+    （[agent.go:268-296](../../internal/agent/agent.go#L268-L296)）调用 `Store.FailTask`
+    后未 emit `KindTaskFailed`（与 [terminateTask](../../internal/agent/agent.go#L811)
+    非对称），导致 panic 引发的失败对 trace 观察者完全失明。同 commit 已修复
+  - 负向自检通过：临时移除 emit 后测试精确报"agent.go:282 在函数 processTask 内
+    调用 a.Store.FailTask 但同函数体内未发现 trace.Emit{Kind: trace.KindTaskFailed}"
+- 清理 `setting.yaml` 头 4-5 行 stale 注释：原文写"此文件是 v4 格式的参考模板，与
+  现有 setting.yaml 并存 / 当前默认仍读 setting.yaml（v3）"，是从 `setting.v4.yaml`
+  复制内容时带过来的旧注释，与 Phase D 实际状态相反——已改写为 "v4 嵌套 schema
+  是唯一受支持的格式，旧 v3 顶层字段在 yaml 解析时会被默默忽略"
+
+**剩余未落地（无具体待办）**：
+- 主体 v4 路线图至此全部清空；后续工作进入路线图独立项（§7 Hashline / §3 能力声明
+  阶段二 / §9 完整错误码策略与重试预算）
+
+> **2026-04-26 验证（end-to-end 复核 + 收尾清理）**：本进度块由独立 agent 扫描
+> 代码核对——Phase A/B/C/D/E 全部声明项与代码现状一致。`go test ./...` 全绿；
+> `./agentgo.exe -config setting.v4.yaml` 端到端烟测通过（4 runner 启动 + TCP probe
+> + /quit 干净关闭）。S11 测试包含负向自检：临时撤销修复时测试精确报告漏接位置。
+> 与 `KNOWN_ISSUES.md` 同段保持一致。
 
 ---
 
@@ -96,7 +145,7 @@
 
 ## 7. Hashline 行哈希增强
 
-> 状态：📝 **设计定稿，待实施**（2026-04-19）
+> 状态：✅ **已完成**（2026-04-26）
 > 优先级：P1（解决多 agent 并发编辑的行级漂移痛点）
 > 前置依赖：无（hook 系统已稳定、tools 子包已成型）
 > 关联：v3 §2-§5 原"行哈希增强"占位（本节为其定稿方案，v3 占位关闭）
@@ -925,9 +974,9 @@ func FormatForToolMessage(highlighted []string) string
 | §3 | 能力声明阶段二 | P4 | v3 §9.4 阶段一 ✅ + 附录 A | 📝 待附录 A 完成 |
 | §7 | Hashline 行哈希增强 | **P1** | 无 | 📝 设计定稿（2026-04-19），待实施 |
 | §8 | 跨子系统装配护栏 | P2 | 无 | 📦 已拆分（2026-04-25 → CLAUDE.md "Shipping conventions" + §11.8 S11）|
-| §9 | Bootstrap LLM 连通性 + 模型名探测 | P2 | §11 kind 体系 | 📝 设计定稿（2026-04-25 重写以适配 kind 体系），待实施 |
-| §10 | 工具调用错误恢复（Did-You-Mean） | P2 | 无 | 📝 设计待重构（2026-04-25 范围扩展讨论中），底座选定 `sahilm/fuzzy` |
-| §11 | 统一 Agent 声明式配置（v4 配置格式重写）| **P1** | 无 | 📝 设计定稿（2026-04-25），取代 §1，待实施 |
+| §9 | Bootstrap LLM 连通性 + 模型名探测 | P2 | §11 kind 体系 | 🚧 §9.5 启动期可观测性已落地（2026-04-26 Phase B：`printStartupBanner` + TCP `startupProbe` + `startup_probe_failure_action` warn/exit 分支），§9.3/9.4/9.6 错误码策略与重试预算待实施 |
+| §10 | 工具调用错误恢复（Did-You-Mean） | P2 | 无 | 🚧 MVP 已落地（2026-04-26：`internal/tools/suggest/` + `glob_search` / `read_file` 两处接入），扩展设计待重构 |
+| §11 | 统一 Agent 声明式配置（v4 配置格式重写）| **P1** | 无 | ✅ **已完成**（2026-04-26 Phase A/B/C/D/E 全部落地） |
 | 附录 A | 分级权限模型 | P3 | v4 §11 | 📝 触发条件未满足（2026-04-25 由 §2 迁入附录）|
 | 附录 B | 管理员信赖标记 | P4 | 待引入外部代理 / 插件 / MCP | 📝 触发条件未满足（2026-04-25 由 §4 迁入附录）|
 | 附录 C | 冲突避免长期方案 | P3 | v3 §8.3 ✅ + v4 §11 | 📝 触发条件未满足（迄今零写冲突；2026-04-25 由 §5 迁入附录）|
@@ -937,7 +986,9 @@ func FormatForToolMessage(highlighted []string) string
 
 ## 11. 统一 Agent 声明式配置（v4 配置格式重写）
 
-> 状态：📝 设计定稿（2026-04-25，取代 2026-04-24 旧稿）
+> 状态：✅ **已完成**（2026-04-26 Phase A/B/C/D/E 全部落地；设计定稿日期 2026-04-25）
+> 实施进度详见**本文件顶部"实施进度"块**——Phase A 增量 / Phase B 基础设施 /
+> Phase C bootstrap 切换 / Phase D v3 兼容层下线 / Phase E 收尾清理全部完成。
 > 优先级：P1
 > 替代关系：取代 §1（per-worker 异质化方案）—— 改在 kind 层做差异化
 > 触发来源：内置 Worker/Explorer Go 类型与硬编码常量阻碍新增 agent 种类；行为参数全局共享无法 per-kind 调优
@@ -1886,7 +1937,7 @@ Token 长度
 | S8 | 默认 `setting.yaml` 重写：预置 `worker` + `explorer` 两个 kind 块 + 收窄后的 `scheduler` 块（仅含 `model`，详见 §11.5.5）；新增 `prompts/worker.md` / `prompts/explorer.md` 文件，内容来自原 Go 常量；**scheduler 提示词保持 Go const**（不外置文件）| 出厂配置 |
 | S9 | 启动校验：见 §11.5.3 全部 11 条 | 防御性校验 |
 | S10 | 端到端烟测：启动 → 发一个长任务 → 确认历史压缩和截断工作正常；用 `setting.yaml` 删除测试验证 fail-fast 路径 | 回归保证 |
-| S11 | **终结路径 `trace.Emit` 对称扫描**（永久不变量回归测试）：扫描 `internal/agent/runner.go` 中所有终结类 return（task 完成 / 失败 / 取消），断言每个 return 之前 M 行内存在对应 `trace.Emit(KindTaskCompleted/Failed/Cancelled)` 调用。从原 §8.2 第 3 条迁入——§11 把 worker/explorer 折叠为统一 runner 后，扫描目标定型为 `runner.go`，比原"扫 agent.go"更稳定 | 装配漏接防护 |
+| S11 | ✅ **已完成**（2026-04-26）— 实现为 [terminal_emit_symmetry_test.go](../../internal/agent/terminal_emit_symmetry_test.go) AST 静态扫描 + [panic_emit_test.go](../../internal/agent/panic_emit_test.go) 运行时双重验证。扫描目标实际为 `internal/agent/agent.go`（不是 spec 原文写的 `internal/agent/runner.go`——`internal/runner/runner.go` 仅是薄壳，终结状态转换仍位于 `agent.go` 的 `processTask` + `terminateTask` + `Run defer`）。落地时立即发现并修复一处真缺陷：panic-recovery 路径 FailTask 后未 emit KindTaskFailed | 装配漏接防护 |
 
 ### 11.9 不在本节范围
 

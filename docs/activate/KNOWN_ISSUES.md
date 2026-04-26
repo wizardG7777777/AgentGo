@@ -66,11 +66,24 @@
 - `main_startup_test.go` 重写：fallback 测试改为断言 v4 fail-fast
 - `go test ./...` 全绿；`./agentgo.exe -config setting.v4.yaml` 烟测通过
 
-**未落地（仍待跟进，但**非阻塞**）**：
-- 移除 `tools.MetaGroup.DisablePublishTask` 标志（allowlist filter 已等价表达；本次
-  worker/explorer 删除后该标志位的最后一个调用方也消失了，已是真正的死代码）
-- §11.8 S11 `trace.Emit` 对称扫描脚本（永久不变量回归测试）
-- **§11.7.4 截断策略接入主循环**（红态——见上方说明）
+**Phase E — 收尾清理（已完成 ✅，2026-04-26 同 session 完成）**：
+- 删除 `tools.MetaGroup.DisablePublishTask` 字段（Phase D 删除 worker/explorer 后
+  失去全部调用方；v4 路径完全靠 `runner.NewToolRegistryWithAllowlist` 对
+  `AllowedTools` 做白名单过滤，与 capability 位等价但更内聚）
+- §11.8 S11 终结路径 `trace.Emit` 对称扫描落地：[terminal_emit_symmetry_test.go](../../internal/agent/terminal_emit_symmetry_test.go)
+  AST 静态扫描 3 条不变量 + [panic_emit_test.go](../../internal/agent/panic_emit_test.go)
+  运行时验证。扫描首次发现一处真缺陷：`processTask` `defer recover()` 路径调用
+  `Store.FailTask` 后未 emit `KindTaskFailed`（与 `terminateTask` 非对称），同
+  commit 修复（[agent.go:284-293](../../internal/agent/agent.go#L284-L293)）
+- ✅ 清理 `setting.yaml` 头部 stale 注释（原文写"v4 参考模板，与现有 setting.yaml
+  并存 / 当前默认仍读 setting.yaml（v3）"——已从 setting.v4.yaml 复制时带来的旧
+  注释改写为"v4 是唯一受支持格式"，与 Phase D 实际状态一致）
+- §11.7.4 截断策略接入主循环：commit `6e45a73` 已修复（`processTask` 主循环现在
+  在 `a.ContextLimit > 0` 守卫下调用 `TruncateHistory()`，详见 [agent.go:501-503](../../internal/agent/agent.go#L501-L503)）
+
+**剩余未落地（无具体待办）**：
+- v4 主体路线图至此全部清空；后续工作进入路线图独立项（§7 Hashline / §3 能力声明
+  阶段二 / §9 完整错误码策略与重试预算 / §10 Did-You-Mean 扩展设计）
 
 ---
 
