@@ -972,9 +972,9 @@ func FormatForToolMessage(highlighted []string) string
 |------|------|--------|----------|------|
 | §1 | Per-Worker 工具集配置 | P2 | v3 §9.1 ✅ | ✅ 已完成（2026-04-19），但**已被 §11 取代**（2026-04-25）|
 | §3 | 能力声明阶段二 | P4 | v3 §9.4 阶段一 ✅ + 附录 A | 📝 待附录 A 完成 |
-| §7 | Hashline 行哈希增强 | **P1** | 无 | 📝 设计定稿（2026-04-19），待实施 |
+| §7 | Hashline 行哈希增强 | **P1** | 无 | ✅ **已完成**（2026-04-26）|
 | §8 | 跨子系统装配护栏 | P2 | 无 | 📦 已拆分（2026-04-25 → CLAUDE.md "Shipping conventions" + §11.8 S11）|
-| §9 | Bootstrap LLM 连通性 + 模型名探测 | P2 | §11 kind 体系 | 🚧 §9.5 启动期可观测性已落地（2026-04-26 Phase B：`printStartupBanner` + TCP `startupProbe` + `startup_probe_failure_action` warn/exit 分支），§9.3/9.4/9.6 错误码策略与重试预算待实施 |
+| §9 | Bootstrap LLM 连通性 + 模型名探测 | P2 | §11 kind 体系 | ✅ **已完成**（2026-04-26）：§9.5 启动期可观测性（banner + TCP probe + failure_action）+ §9.3 错误码分类（recoverable/unrecoverable）+ §9.4 诊断映射（model_not_found / invalid_api_key / context_length_exceeded 等）+ §9.6 重试预算上限（MaxRetries 兜底）全部落地 |
 | §10 | 工具调用错误恢复（Did-You-Mean） | P2 | 无 | 🚧 MVP 已落地（2026-04-26：`internal/tools/suggest/` + `glob_search` / `read_file` 两处接入），扩展设计待重构 |
 | §11 | 统一 Agent 声明式配置（v4 配置格式重写）| **P1** | 无 | ✅ **已完成**（2026-04-26 Phase A/B/C/D/E 全部落地） |
 | 附录 A | 分级权限模型 | P3 | v4 §11 | 📝 触发条件未满足（2026-04-25 由 §2 迁入附录）|
