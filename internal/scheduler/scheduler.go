@@ -43,9 +43,15 @@ const schedulerMaxRetries = 5
 //
 // 取代旧 cfg.SchedulerMaxLoops。v4 §11.5.5 把 Scheduler 行为参数全部内置——
 // 工具集 / 系统提示词 / 行为参数都是编排逻辑的内禀部分，用户改了不是调优而是
-// 破坏。值 10 来自原 DefaultConfig() 的 v3 默认，足够覆盖 Phase 3 SchedulerExecutor
-// 的 publish_task → wait_batch → report_done 典型循环。
-const schedulerMaxLoops = 10
+// 破坏。
+//
+// 2026-04-27 从 10 上调至 30：
+//   - 旧值 10 来自 v3 默认，假设 publish_task → wait_batch → report_done 三步收敛
+//   - Commit 1+2 把 report_done 从"必须"降级后，scheduler 可能要做"派子任务 →
+//     看结果 → 再派任务 → 再看结果 → 自然语言回答"多轮编排，10 步偏紧
+//   - 30 步给足头空间，单任务 worst case ~30 次 LLM 调用，仍然可控
+//   - 注意 MaxLoops 是 per-task 而不是进程累计——每个新任务计数从 0 开始
+const schedulerMaxLoops = 30
 
 const (
 	ModeImmediate Mode = iota // 即时模式：逐步决策

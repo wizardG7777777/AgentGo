@@ -2,6 +2,32 @@
 
 本文档记录 MVP 阶段已知的设计缺陷和未实现的功能，供调试和后续迭代参考。
 
+## ~~scheduler 自然文本完成被吞——用户措辞误导 LLM 跳过 report_done~~（已修复 2026-04-27 IsUserFacing 架构修复）
+
+实战故障：用户提示词含"不用撰写报告"被 LLM 词法匹配到工具名 `report_done` 而
+跳过该工具，自然文本回复因 CLI 仅监听 `report_done` 的打印通道而被吞掉，
+用户终端 30+ 分钟看不到任何输出。
+
+根因不在 LLM、不在 prompt 工程，而在架构：把"用户可见输出"这件事的决定权
+交给 LLM 的工具选择行为，是脆弱的——任何用户措辞包含"不用 X"且 X 跟工具名
+词法重叠的情况，都可能让 LLM 跳过该工具（同类风险还存在于 `read_file` 的
+"不用读了"、`web_search` 的"别搜了"等所有工具名跟自然语言重叠的工具）。
+
+修复（3 commit 系列）：
+1. `feat(agent): IsUserFacing 机制——scheduler 自然文本完成自动打印到终端`
+   - 新增 `Agent.IsUserFacing` 字段，scheduler agent 设为 true
+   - agent.go `!result.ToolCalled` 终止分支自动 `fmt.Printf` 打印 lastOutput
+   - 跟 OpenCode 等主流 CLI agent 对齐：no tool calls = done，让 model 决定完成时机
+2. `refactor(scheduler): 重写系统提示词——report_done 从"必须"降级为"可选格式化工具"`
+   - 删除"⚠️ 最高优先级铁律"等 ~50 行训诫文本
+   - 新增"你的最终回答如何呈现给用户"段，告诉 LLM 自然语言回答即可
+3. `tweak(scheduler): MaxLoops 数值微调`
+   - schedulerMaxLoops 10 → 30，覆盖新架构下"派子任务 → 看结果 → 再派 → 总结"多轮编排
+
+新架构下 report_done 仍然保留，但作为**可选**的"summary + artifacts 校对块"
+格式化工具——不调用它时，LLM 的自然回答仍会被自动打印给用户。
+
+
 ## v4 升级实施状态（2026-04-26 增量基建首批落地）
 
 详见 `docs/activate/nextUpgrade_v4.md` 顶部"实施进度"段。
