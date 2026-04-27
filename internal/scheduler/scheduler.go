@@ -494,6 +494,9 @@ func New(
 	a.OnTaskEnd = func(taskID string, success bool) { holder.Set("") }
 	a.FileCache = fileCache
 	a.FinalizationChecker = holder // 使用通用 FinalizationHolder
+	// scheduler 直接对话用户：自然文本完成（!result.ToolCalled）会自动打印 lastOutput，
+	// 让 LLM 不调 report_done 时用户也能看到答案。详见 Agent.IsUserFacing 字段注释。
+	a.IsUserFacing = true
 
 	if mbRegistry != nil {
 		a.Mailbox = mbRegistry.Register(schedID, "__scheduler__")

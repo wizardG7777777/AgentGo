@@ -101,6 +101,24 @@ type Agent struct {
 	MailRegistry          *mailbox.Registry                 // 邮箱注册表，用于 DrainWithAck 自动回执
 	FinalizationChecker   FinalizationChecker               // 可选；用于 finalization tool 信号检查
 
+	// IsUserFacing 标记此 agent 是否直接对话用户（典型为 scheduler）。
+	//
+	// true 时：任何"自然文本完成"路径（!result.ToolCalled）都会自动把 lastOutput
+	// 打印到 stdout，无需 LLM 显式调用 report_done。
+	//
+	// false 时（默认，worker / explorer 行为）：自然完成不打印——它们的输出由
+	// scheduler 通过 board snapshot / TransferNote 间接消费。
+	//
+	// 设计动机（2026-04-27 架构修复）：用户提示词措辞（如"不用撰写报告"）可能让
+	// LLM 词法匹配到工具名 `report_done` 而跳过该工具，导致用户终端 30+ 分钟看不到
+	// 任何输出。把"用户可见输出"从 LLM 的工具选择决策中剥离出来，由 agent 框架层
+	// 的"自然完成 = 用户回答"语义统一接管——跟 OpenCode 等主流 CLI agent 对齐，
+	// 也跟 worker/explorer 的 ReAct 终止语义对齐。
+	//
+	// report_done 工具仍然保留（作为可选的 artifacts 校对块格式化工具），但不再是
+	// 用户可见输出的唯一通道——LLM 不调它也能让用户看到内容。详见 v5 §11 设计文档。
+	IsUserFacing bool
+
 	// TransferNoteMaxTokens 是 TransferNote 单条的 token 预算上限。0 或负数视为默认 3000。
 	// 失败路径 buildTransferNote 按此值做 L1/L3 输出截断。Sprint 3 #5 引入。
 	TransferNoteMaxTokens int
@@ -551,6 +569,18 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 
 		// 终止条件：LLM 没有调用工具（自然完成），或 Executor 返回 Finalized=true（finalization tool 信号）
 		if !result.ToolCalled || result.Finalized {
+			// IsUserFacing 自然文本完成打印（2026-04-27 架构修复）：
+			//   - !result.ToolCalled：LLM 这一轮选择不调工具——result.Output 即是 LLM 的自然
+			//     文本回复（来自 llm_executor.go:155 处 resp.Content 直接落 Output）
+			//   - 仅当 IsUserFacing=true 时才打印——worker/explorer 路径保持 v3 兼容（不打印）
+			//   - 不进 result.Finalized 分支——report_done 路径有自己的 fmt.Printf（含 artifacts
+			//     校对块），且 result.Output 在该路径下是工具 ack 串而非 summary
+			//
+			// 详见 Agent.IsUserFacing 字段注释。
+			if a.IsUserFacing && !result.ToolCalled && lastOutput != "" {
+				fmt.Printf("\n=== 任务完成 ===\n%s\n================\n\n", lastOutput)
+			}
+
 			// 持久化 worker 的最终响应文本——无论后续校验是否通过，scheduler 都能看到
 			// worker 自述了什么。这是修复"失败路径上 lastOutput 被静默丢弃"的关键一环。
 			if lastOutput != "" {
