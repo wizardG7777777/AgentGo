@@ -761,7 +761,7 @@ func (s *MemoryTaskStore) evictSafe() {
 	s.completed = newCompleted
 }
 
-// isDependedUpon 检���是否有非终态任务依赖指定 taskID。
+// isDependedUpon 检查是否有非终态任务依赖指定 taskID。
 func (s *MemoryTaskStore) isDependedUpon(taskID string) bool {
 	for _, task := range s.tasks {
 		if model.IsTerminal(task.Status) {
