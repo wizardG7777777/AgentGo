@@ -51,3 +51,4 @@ setting.yaml
 .claude/settings.local.json
 test_multi_agent.yaml
 setting.v4.yaml
+setting.test-concurrent.yaml
