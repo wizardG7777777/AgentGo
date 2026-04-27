@@ -769,7 +769,7 @@ Scheduler agent (Phase 3 后) 与 worker / explorer 共享同一套 `Mailbox.Dra
 `agent.terminateTask` 在 `RetryCount >= a.MaxRetries` 时调用 `sendCrashReport`，向 `task.EventSource` 发送 `priority=high` 邮件，正文格式："代理 X 在执行任务 Y 时崩溃，原因 Z；任务描述、重试次数、expected vs actual artifacts、worker 最后一次响应原文"。`MaxRetries` 由各壳包（worker/explorer/scheduler）的角色常量设置，不由 yaml 配置。
 
 # 系统启动流程
-系统由 `main.go` → `bootstrap.Bootstrap(configPath, explicit)` 完成初始化，再由 `System.Start(ctx, cancel)` 拉起所有 goroutine，最后 `System.RunCLI(ctx, stdin, stdout)` 阻塞主线程。
+系统由 `main.go` → `bootstrap.Bootstrap(configPath, explicit, skipStartupProbe)` 完成初始化，再由 `System.Start(ctx, cancel)` 拉起所有 goroutine，最后 `System.RunCLI(ctx, stdin, stdout)` 阻塞主线程。`skipStartupProbe` 来自 `--skip-startup-probe` 命令行旗标（详见 nextUpgrade_v4.md §9.7）。
 
 ## Bootstrap 阶段（构造对象图）
 1. **加载配置**：`config.LoadConfig`，YAML/JSON 自动判别，文件不存在时回退默认值。打印：`[启动] 全局配置加载完成`

@@ -74,6 +74,14 @@ type HistoryEntry struct {
 // For MVP this is injected as a mock; in production it will call the LLM.
 type TaskExecutor func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error)
 
+// TokenStats 是 Agent 级别的累计 Token 消耗统计（nextUpgrade_v4.md §11.7.3）。
+// 每次 LLM 调用后累加，用于成本追踪和运行时监控。
+type TokenStats struct {
+	TotalPromptTokens     int64
+	TotalCompletionTokens int64
+	CallCount             int
+}
+
 type Agent struct {
 	ID                    string
 	EventType             string
@@ -94,6 +102,8 @@ type Agent struct {
 	// ContextLimit 是历史 token 硬上限（§11.7.4 截断保护）。0 表示不做硬限截断
 	// （仅 Layer 1 + Layer 2 压缩生效，与 v3 行为兼容）。详见 nextUpgrade_v4.md §11.7.5。
 	ContextLimit int
+	// TokenStats 是 Agent 级别的累计 Token 消耗（§11.7.3）。
+	TokenStats TokenStats
 	OnTaskStart           func(taskID string)               // 任务开始处理时的回调，可选
 	OnTaskEnd             func(taskID string, success bool) // 任务结束回调（defer 保证触发），可选
 	FileCache             *FileStateCache                   // Agent 级别的文件读取缓存，可选
@@ -566,6 +576,24 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 
 		lastOutput = result.Output
 		totalPromptTokens += result.PromptTokens
+
+		// §11.7.3 TokenStats 累计——仅落盘到 trace JSONL,不打 stderr。
+		// 长任务下每轮 log.Printf 会刷掉真正重要的错误/警告;排查时按需
+		// `grep token_stats .agentgo/traces/*.jsonl | jq` 即可复盘成本曲线。
+		a.TokenStats.TotalPromptTokens += int64(result.PromptTokens)
+		a.TokenStats.TotalCompletionTokens += int64(result.CompletionTokens)
+		a.TokenStats.CallCount++
+		trace.Emit(trace.Event{
+			Kind:                  trace.KindTokenStats,
+			TaskID:                taskID,
+			AgentID:               a.ID,
+			Loop:                  i,
+			PromptTokens:          result.PromptTokens,
+			CompletionTokens:      result.CompletionTokens,
+			TotalPromptTokens:     a.TokenStats.TotalPromptTokens,
+			TotalCompletionTokens: a.TokenStats.TotalCompletionTokens,
+			CallCount:             a.TokenStats.CallCount,
+		})
 
 		// 终止条件：LLM 没有调用工具（自然完成），或 Executor 返回 Finalized=true（finalization tool 信号）
 		if !result.ToolCalled || result.Finalized {
@@ -1094,10 +1122,10 @@ func buildHistorySummary(history []HistoryEntry) string {
 	var sb strings.Builder
 	sb.WriteString("=== 历史摘要 ===\n")
 	for i, entry := range history {
-		sb.WriteString(fmt.Sprintf("步骤 %d: ", i+1))
+		fmt.Fprintf(&sb, "步骤 %d: ", i+1)
 		if entry.ToolCalled && len(entry.ToolCalls) > 0 {
 			for _, tc := range entry.ToolCalls {
-				sb.WriteString(fmt.Sprintf("[%s] ", tc.Name))
+				fmt.Fprintf(&sb, "[%s] ", tc.Name)
 			}
 		}
 		// 包含 assistant 内容（LLM 推理），截断到 200 字符

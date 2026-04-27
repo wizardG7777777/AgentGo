@@ -104,30 +104,6 @@ type AgentRuntimeConfig struct {
 	ContextLimit                 int
 }
 
-// AgentDeclaration 是单个代理类型的能力声明。
-// 使用指针字段区分"未配置"（nil）和"显式空"（非 nil 但值为零值）。
-type AgentDeclaration struct {
-	// Capabilities 是能力标签列表。
-	// nil = 未配置，使用默认值；非 nil 空切片 = 显式清空。
-	Capabilities *[]string `yaml:"capabilities" json:"capabilities"`
-
-	// Description 是人类可读的用途描述。
-	// nil = 未配置，使用默认值；非 nil 空字符串 = 显式清空。
-	Description *string `yaml:"description" json:"description"`
-}
-
-// 代理类型默认能力标签
-var defaultCapabilities = map[string][]string{
-	"explorer": {"codebase_read", "web_search", "message"},
-	"worker":   {"code_edit", "shell_exec", "web_search", "subtask_publish", "message"},
-}
-
-// 代理类型默认描述
-var defaultDescriptions = map[string]string{
-	"explorer": "只读调查代理（Explorer），能力限定为 read_file / list_dir / grep_search / glob_search / web_search / web_fetch / send_message。不能写文件、执行 shell、或发布子任务，适合承担代码库调研、网页检索、事实核验等只读任务。",
-	"worker":   "通用执行代理，拥有完整工具集，可读写文件、执行 shell 命令、发布子任务、搜索网络",
-}
-
 type Config struct {
 	// ============================================================
 	// v4 配置块（nextUpgrade_v4.md §11.4）—— 唯一受支持的格式。
@@ -302,6 +278,11 @@ func LoadConfig(path string, explicit bool) (*Config, error) {
 // 这是 v3 兼容层 2026-04-26 删除后的硬约束（详见 §11 设计原则第 10 条）。
 func (c *Config) Validate() error {
 	// 规则 9：所有 v4 路径字段不含反斜杠（路径风格红线）。
+	// 覆盖范围：ProjectRoot + agents[*].system_prompt_file。
+	// LLM.BaseURL 是 URL 不是文件路径，不纳入本条。
+	if strings.Contains(c.ProjectRoot, "\\") {
+		return fmt.Errorf("project_root 包含反斜杠（v4 仅允许 forward slash）: %q", c.ProjectRoot)
+	}
 	for i, k := range c.Agents {
 		if strings.Contains(k.SystemPromptFile, "\\") {
 			return fmt.Errorf("agents[%d].system_prompt_file 包含反斜杠（v4 仅允许 forward slash）: %q",

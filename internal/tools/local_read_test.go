@@ -591,3 +591,53 @@ func TestReadFile_HashlineDisabled(t *testing.T) {
 		t.Errorf("输出缺少原始内容: %q", out)
 	}
 }
+
+
+// §10 Did-You-Mean：read_file 路径不存在时给出父目录近似文件候选。
+func TestReadFile_NotExist_DidYouMean(t *testing.T) {
+	tmp := t.TempDir()
+	// 创建几个文件作为候选池
+	for _, f := range []string{"README.md", "main.go", "go.mod"} {
+		if err := os.WriteFile(filepath.Join(tmp, f), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g := newTestGroup(tmp, nil)
+	_, err := g.readFile(context.Background(), map[string]any{
+		"path": filepath.Join(tmp, "REDME.md"), // typo：漏了 A
+	})
+	if err == nil {
+		t.Fatal("期望错误，实际 nil")
+	}
+	if !strings.Contains(err.Error(), "Did you mean") {
+		t.Errorf("期望 'Did you mean' 提示，实际: %v", err)
+	}
+	if !strings.Contains(err.Error(), "RE") || !strings.Contains(err.Error(), "DME") {
+		t.Errorf("期望含 'README' 高亮候选，实际: %v", err)
+	}
+}
+
+// §10 Did-You-Mean：glob_search 空结果时给出相似文件名候选。
+func TestGlobSearch_Empty_DidYouMean(t *testing.T) {
+	tmp := t.TempDir()
+	// 创建一些文件，文件名含 "config" 关键字
+	for _, f := range []string{"config.yaml", "main.go", "go.mod"} {
+		if err := os.WriteFile(filepath.Join(tmp, f), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g := newTestGroup(tmp, nil)
+	out, err := g.globSearch(context.Background(), map[string]any{
+		"pattern": "confg.yaml", // typo：漏了一个 i
+		"path":    tmp,
+	})
+	if err != nil {
+		t.Fatalf("期望 nil 错误，实际: %v", err)
+	}
+	if !strings.Contains(out, "Did you mean") {
+		t.Errorf("期望 'Did you mean' 提示，实际: %v", out)
+	}
+	if !strings.Contains(out, "conf") && !strings.Contains(out, "Conf") {
+		t.Errorf("期望含 'conf' 的候选，实际: %v", out)
+	}
+}

@@ -78,31 +78,9 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 
 	toolReg := agent.NewToolRegistryWithAllowlist(rt.AllowedTools)
 
-	readGroup := tools.LocalReadGroup{Workdir: workdir, Cache: fileCache, HashlineEnabled: deps.HashlineEnabled}
-	tools.RegisterGroups(toolReg,
-		readGroup,
-		tools.LocalWriteGroup{
-			LocalReadGroup: readGroup,
-			Roster:         deps.Roster,
-			AgentID:        rt.InstanceID,
-			WaitTimeoutSec: deps.RosterWaitTimeoutSec,
-		},
-		tools.WebGroup{Provider: deps.SearchProvider},
-		tools.ShellGroup{
-			Workdir:    workdir,
-			TimeoutSec: deps.ShellTimeoutSec,
-			ApprovalCh: deps.ApprovalCh,
-			AgentID:    rt.InstanceID,
-			Filter:     deps.ShellFilter,
-		},
-		tools.MetaGroup{
-			Store:      deps.Store,
-			Holder:     holder,
-			MaxDepth:   deps.MaxSubtaskDepth,
-			MBRegistry: deps.MBRegistry,
-			AgentID:    rt.InstanceID,
-		},
-	)
+	// §11.6.2 工具 → 依赖项映射由 dependency_map.go 集中管理
+	groups := resolveToolGroups(rt.InstanceID, deps, holder, fileCache, workdir)
+	tools.RegisterGroups(toolReg, groups...)
 
 	executor := agent.NewLLMExecutor(
 		deps.LLMClient,

@@ -12,10 +12,8 @@ import (
 // BuildTeamSnapshot 构建当前团队状态快照文本，注入代理的 LLM 上下文。
 // 包含：当前活跃代理列表、各代理正在执行的任务摘要。
 //
-// 该函数从 internal/worker.BuildTeamSnapshot 迁移而来（v4 §11.6.6 计划：
-// worker/explorer 折叠为统一 runner 后，此辅助函数归位 internal/agent）。
-// 当前 worker 包仍持有副本——bootstrap 完成 v4 切换 + worker/explorer 删除后，
-// worker 副本同步移除。
+// 该函数从 internal/worker.BuildTeamSnapshot 迁移而来（v4 §11.6.6）。
+// worker/explorer 包已删除，此函数是 internal/agent 中的唯一副本。
 //
 // 调用方（bootstrap.go）通过闭包包装本函数注入 TeamAwarenessHook：
 //

@@ -7,9 +7,8 @@ package bootstrap
 //   - resolveDependencies：按 AllowedTools 决定该 runner 需要哪些 deps（当前简化版
 //     由 RunnerDeps 一并提供，未来可按工具收紧）
 //
-// **当前阶段（B 期增量基建）这些函数被定义但尚未被 Bootstrap 主流程调用**——
-// bootstrap.go 仍走 v3 worker/explorer 路径。后续把 bootstrap 重写为 kind-based
-// 时这些函数将被启用，避免一次性大改风险。
+// 这些函数已被 Bootstrap 主流程调用（Phase C 切换完成后启用）。
+// v4 kind-based 路径是当前唯一启动路径。
 
 import (
 	"fmt"

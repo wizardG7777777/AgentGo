@@ -59,9 +59,17 @@ const (
 	// PredictNextPromptTokens 超过 cfg.AgentKind.ContextLimit 的历史从最老条目开始
 	// 丢弃，保护头/尾不被破坏。事件用 PromptTokensBefore / PromptTokensAfter /
 	// KeptEntries 字段记录截断幅度；Strategy 记 "head_keep_tail_keep"。
-	// 加这条事件类型后，下次复盘可直接 grep KindHistoryTruncated 验证截断生效，
+	// 加这条事件类型后,下次复盘可直接 grep KindHistoryTruncated 验证截断生效,
 	// 用以锁住"S7 接通"这一不变量——再有人误删调用点会立刻在 trace 上消失。
 	KindHistoryTruncated EventKind = "history_truncated"
+
+	// Agent 级 Token 累计统计（nextUpgrade_v4.md §11.7.3）。每轮 LLM 调用后 emit,
+	// 记录本轮消耗 + 该 agent 累计消耗。仅落盘到 trace JSONL,不打 stderr——
+	// 长任务（30+ loops × N runner）实时打印会刷掉真正重要的日志,排查时按需
+	// `grep token_stats` 即可复盘成本曲线。
+	// PromptTokens / CompletionTokens 字段载本轮消耗（复用 LLM 调用通用字段）;
+	// TotalPromptTokens / TotalCompletionTokens / CallCount 载累计值。
+	KindTokenStats EventKind = "token_stats"
 
 	// 文件操作（write_file/edit_file 成功后发出，可审计落盘动作）
 	KindFileWritten EventKind = "file_written"
@@ -108,6 +116,11 @@ type Event struct {
 	ToolCallsCount   int    `json:"tool_calls_count,omitempty"`
 	FinishReason     string `json:"finish_reason,omitempty"`
 	DurationMS       int64  `json:"duration_ms,omitempty"`
+
+	// --- Token 累计统计字段（KindTokenStats 专用，§11.7.3）---
+	TotalPromptTokens     int64 `json:"total_prompt_tokens,omitempty"`
+	TotalCompletionTokens int64 `json:"total_completion_tokens,omitempty"`
+	CallCount             int   `json:"call_count,omitempty"`
 
 	// --- 工具调用字段 ---
 	Tool      string         `json:"tool,omitempty"`

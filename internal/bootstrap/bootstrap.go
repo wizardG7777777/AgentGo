@@ -52,7 +52,7 @@ type System struct {
 	wg          sync.WaitGroup
 }
 
-func Bootstrap(configPath string, explicit bool) (*System, error) {
+func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System, error) {
 	// Step 1: 加载配置
 	cfg, err := config.LoadConfig(configPath, explicit)
 	if err != nil {
@@ -73,11 +73,14 @@ func Bootstrap(configPath string, explicit bool) (*System, error) {
 
 	// Step 1.2: 启动期 TCP probe（§9.5）——best-effort 连通性检查
 	//             失败行为：默认 warning + 启动继续；startup_probe_failure_action="exit" 改为硬退出
-	if probeErr := startupProbe(os.Stdout, cfg); probeErr != nil {
-		if cfg.StartupProbeFailureAction == "exit" {
-			return nil, fmt.Errorf("启动期 probe 失败（startup_probe_failure_action=exit）: %w", probeErr)
+	//             --skip-startup-probe 命令行旗标可整体跳过（等价于 startup_probe: off）。
+	if !skipStartupProbe {
+		if probeErr := startupProbe(os.Stdout, cfg); probeErr != nil {
+			if cfg.StartupProbeFailureAction == "exit" {
+				return nil, fmt.Errorf("启动期 probe 失败（startup_probe_failure_action=exit）: %w", probeErr)
+			}
+			log.Printf("[WARN] startup probe: %v (best-effort, 启动继续)", probeErr)
 		}
-		log.Printf("[WARN] startup probe: %v (best-effort, 启动继续)", probeErr)
 	}
 
 	// Step 1.3: 初始化 Session 管理器

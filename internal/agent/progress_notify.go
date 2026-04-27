@@ -131,7 +131,11 @@ func buildHalfwayMsg(agentID string, loopIndex, maxLoops int) mailbox.Message {
 // progressNotify 检测本轮触发条件并发送进度通知。
 // 所有错误静默降级（log.Printf），不影响 ReactLoop。
 // defer/recover 保护，panic 不会逃逸。
-func (a *Agent) progressNotify(ctx context.Context, taskID string, loopIndex int, result ExecuteResult, flags *progressFlags) {
+//
+// 形参 _ context.Context 保留类型签名作"任务级函数"的文档信号——当前函数体内
+// 不需要 ctx（MailRegistry.Send / trace.Emit / log.Printf 均不接 ctx），未来若
+// MailRegistry 升级为 context-aware，把 _ 还原为 ctx 即可，无需改动 7 个调用方。
+func (a *Agent) progressNotify(_ context.Context, taskID string, loopIndex int, result ExecuteResult, flags *progressFlags) {
 	if a.MailRegistry == nil || !a.ProgressNotifyEnabled {
 		return
 	}

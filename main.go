@@ -28,6 +28,7 @@ func main() {
 	}
 
 	configPath := flag.String("config", "setting.yaml", "配置文件路径")
+	skipStartupProbe := flag.Bool("skip-startup-probe", false, "跳过启动期 TCP probe（等价于 startup_probe: off）")
 	flag.Parse()
 
 	// 判断用户是否显式指定了 -config
@@ -38,7 +39,7 @@ func main() {
 		}
 	})
 
-	sys, err := bootstrap.Bootstrap(*configPath, explicit)
+	sys, err := bootstrap.Bootstrap(*configPath, explicit, *skipStartupProbe)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[错误] 启动失败: %v\n", err)
 		os.Exit(1)
