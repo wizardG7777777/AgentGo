@@ -1075,6 +1075,277 @@ WARNING [MailLoop] mail chain_depth 接近上限 (8/10)
 
 ---
 
+## 13. 记忆系统与触发器重构（V6 方向）
+
+> **状态**：📝 设计阶段，待后续讨论定稿
+> **影响范围**：`internal/hook/agent.go` 重构、`internal/memory/` 新建、`internal/trigger/` 新建、`internal/agent/agent.go` 注入点迁移
+> **前置阅读**：`docs/archived/rfc-go-rewrite.md` §2.1（ADK Memory / Trigger 设计意图）、`docs/archived/rfc-proactive-scheduler-and-event-system.md` §4.3（EventBus）
+
+---
+
+### 13.1 动机：当前 Agent Hook 的职责漂移
+
+`internal/hook/agent.go` 在 Sprint 1（2026-04-12）落地时，Agent Hook 被实现为**上下文注入框架**（`TeamAwarenessHook` 的 `PhaseTaskStart` / `PhaseLoopPre` 注入团队快照、文件占用、目标锚点）。这与早期 RFC 中 "Trigger" 层（事件 → 动态拉起 Agent → 工作 → 销毁）的设计意图发生了漂移。
+
+当前 Agent Hook 造成的三个架构负担：
+
+| 负担 | 表现 | 根因 |
+|------|------|------|
+| **语义错位** | `AgentHook` 名字暗示 "Agent 生命周期 hook"，实际做的是 "LLM 上下文注入" | 命名与职责不匹配 |
+| **职责过载** | `TeamAwarenessHook` 同时处理 TeamSnapshot + FileAwareness + GoalAnchor + token 预算截断 | 一个 hook 承载三种不同维度的感知信息 |
+| **记忆缺失** | 所有 "注入内容" 都是临时文本，系统重启后项目知识全部丢失 | 没有持久化的 Memory 层 |
+
+> **关键背景**：`InterfaceDesign.md` 明确标注 `#memory——本项目无对等的记忆持久化模块`。`TransferNote` 和 `LastHistory` 是任务级交接备忘，不构成真正的长期记忆。
+
+---
+
+### 13.2 核心设计决策
+
+| # | 决策 | 说明 |
+|---|---|---|
+| **D1** | **Agent Hook 重新定位为 Trigger System** | Agent Hook 从 "上下文注入框架" 变为 "事件触发器"：事件匹配 → 选择 Agent 模板 → 构建 Task → `PublishTask` → 动态拉起临时 Agent → 任务完成后销毁 |
+| **D2** | **上下文注入迁移到独立的 Memory System** | 新建 `internal/memory/` 包，负责长短期记忆的存储、检索、更新。Agent 从 Memory System 读取注入内容，而非从 Agent Hook |
+| **D3** | **TeamAwarenessHook 拆分为 Memory System 的读写对** | TeamSnapshot / FileAwareness / GoalAnchor 不再作为 hook 注入，而是作为 `MemoryEntry` 被写入 Memory Store，再由 Agent 在 `processTask` 入口按需读取 |
+| **D4** | **新增 Project Memory 持久化层** | 跨会话保留的记忆（项目约束文档、代码规范、常见错误模式），存储在 `.agentgo/memory/`；Session Memory 存储在 `.agentgo/sessions/sess-<id>/memory.jsonl`；Process Memory 保留在内存中 |
+| **D5** | **常驻 Agent 与临时 Agent 共存** | `bootstrap` 启动的 Worker/Explorer/Scheduler 为常驻 Agent（与系统同生命周期）；Trigger System 拉起的 Agent 为临时 Agent（任务完成后 `IdleThreshold` 触发销毁） |
+
+---
+
+### 13.3 Memory System 架构
+
+#### 13.3.1 作用域分层
+
+```go
+type MemoryScope int
+const (
+    ScopeProcess   MemoryScope = iota // 进程级：随系统重启清空
+    ScopeSession                      // 会话级：session 结束清空
+    ScopeProject                      // 项目级：持久化到磁盘，跨会话保留
+)
+```
+
+| 作用域 | 存储位置 | 内容示例 | 生命周期 |
+|---|---|---|---|
+| **Process** | 内存（map/slice） | 当前活跃 Agent 状态、board snapshot 缓存、实时文件占用 | 进程级 |
+| **Session** | `.agentgo/sessions/sess-<id>/memory.jsonl` | 会话内积累的项目洞察、用户偏好、已确认事实、本次会话的约束调整 | Session 级 |
+| **Project** | `.agentgo/memory/`（JSONL 或 SQLite） | 项目约束文档（"禁止直接操作 DB"）、代码规范、API 使用约定、常见错误模式 | 持久化 |
+
+#### 13.3.2 记忆种类
+
+```go
+type MemoryKind string
+const (
+    KindConstraint   MemoryKind = "constraint"   // 项目级约束文档
+    KindLearning     MemoryKind = "learning"     // 学习到的经验（失败/成功总结）
+    KindPattern      MemoryKind = "pattern"      // 代码模式/项目结构洞察
+    KindContext      MemoryKind = "context"      // 进程级上下文（TeamSnapshot 等）
+    KindAgentState   MemoryKind = "agent_state"  // Agent 级状态快照
+)
+```
+
+#### 13.3.3 存储接口
+
+```go
+type MemoryStore interface {
+    // 写入
+    Put(ctx context.Context, entry MemoryEntry) error
+    // 文本检索 + 标签过滤
+    Query(ctx context.Context, scope MemoryScope, kind MemoryKind, query string, limit int) ([]MemoryEntry, error)
+    // 向量检索（可选，未来引入）
+    QueryByVector(ctx context.Context, scope MemoryScope, embedding []float32, limit int) ([]MemoryEntry, error)
+    // 删除
+    Delete(ctx context.Context, id string) error
+    // 按作用域清空
+    Clear(ctx context.Context, scope MemoryScope) error
+}
+
+type MemoryEntry struct {
+    ID          string
+    Scope       MemoryScope
+    Kind        MemoryKind
+    Key         string      // 检索键
+    Content     string      // 文本内容（或序列化后的结构化数据）
+    Embedding   []float32   // 可选：向量嵌入
+    Tags        []string    // 标签
+    Source      string      // 来源（agentID / taskID / user）
+    CreatedAt   time.Time
+    UpdatedAt   time.Time
+    AccessCount int         // 访问频次（LRU 依据）
+}
+```
+
+#### 13.3.4 Agent 侧的读取接入点
+
+Memory System 的读取发生在 Agent 框架层，而非 Hook 层：
+
+```go
+// internal/agent/agent.go:processTask
+func (a *Agent) processTask(ctx context.Context, taskID string) {
+    // 替代原有的 runAgentInject(PhaseTaskStart)
+    if a.Memory != nil {
+        entries, _ := a.Memory.Query(ctx, memory.ScopeProcess, memory.KindContext,
+            "team_snapshot", 1)
+        if len(entries) > 0 {
+            history = append(history, HistoryEntry{IncomingMail: entries[0].Content})
+        }
+    }
+    // ... 进入 ReAct 循环
+}
+```
+
+`Agent` 结构体新增字段：
+
+```go
+type Agent struct {
+    // ... 现有字段 ...
+    Memory memory.MemoryStore // nil 时退化为 noop
+}
+```
+
+---
+
+### 13.4 Trigger System 架构
+
+#### 13.4.1 与当前 Agent Hook 的根本区别
+
+| 维度 | 当前 Agent Hook（注入器） | Trigger System（触发器） |
+|---|---|---|
+| **触发时机** | Agent 生命周期内部（TaskStart/LoopPre/LoopPost/TaskEnd） | 全局事件（EventChannel / Store 状态变更 / Cron / Webhook） |
+| **行为** | 向 LLM history 注入文本 | 发布新 Task，动态拉起临时 Agent |
+| **返回值** | `InjectContent string` | 无（副作用：`PublishTask` + `AgentPool.EnsureAgent`） |
+| **Agent 生命周期** | 观察现有 Agent | 创建临时 Agent，任务完成后销毁 |
+| **与 Memory 的关系** | 直接生成注入文本 | 读取 Memory System 辅助决策（可选） |
+
+#### 13.4.2 TriggerRule 设计
+
+```go
+// internal/trigger/trigger.go
+
+type TriggerRule struct {
+    Name           string
+    Enabled        bool
+    EventType      string                    // 匹配什么事件（如 EventTaskCompleted）
+    Condition      func(model.Event) bool    // 额外条件
+    SelectAgent    func(model.Event) string  // 返回 Agent 模板名（如 "reviewer"）
+    BuildPrompt    func(model.Event) string  // 构建任务描述
+    SystemPrompt   string                    // 可选：覆盖默认 system prompt
+    Priority       int
+    MaxConcurrent  int                       // 最大并发数（防雪崩）
+    DebounceSec    int                       // 防抖窗口
+}
+
+type Trigger struct {
+    Store     store.TaskStore
+    Rules     []TriggerRule
+    AgentPool AgentPool        // Agent 工厂 + 生命周期管理
+    Memory    memory.MemoryStore // 可选：读取记忆辅助决策
+}
+
+func (t *Trigger) HandleEvent(evt model.Event) {
+    for _, rule := range t.Rules {
+        if !rule.Enabled { continue }
+        if !t.matches(rule, evt) { continue }
+        if t.isDebounced(rule) { continue }
+        if t.exceedsMaxConcurrent(rule) { continue }
+
+        task := &model.Task{
+            Description:  rule.BuildPrompt(evt),
+            EventType:    rule.SelectAgent(evt),
+            SystemPrompt: rule.SystemPrompt,
+            EventSource:  "trigger:" + rule.Name,
+            Priority:     rule.Priority,
+        }
+        t.Store.PublishTask(task)
+        t.AgentPool.EnsureAgent(task.EventType) // 动态拉起
+    }
+}
+```
+
+#### 13.4.3 AgentPool：常驻 + 临时
+
+```go
+type AgentPool struct {
+    // 常驻 Agent（bootstrap 创建，与系统同生命周期）
+    Permanent map[string]*runner.Runner
+
+    // 临时 Agent（Trigger 动态创建，IdleThreshold 到期后销毁）
+    Ephemeral map[string]*EphemeralAgent
+}
+
+type EphemeralAgent struct {
+    Runner       *runner.Runner
+    TaskID       string
+    CreatedAt    time.Time
+    IdleThreshold int // 临时 Agent 设较小值（如 3），任务完成后自动退出
+}
+```
+
+临时 Agent 生命周期：
+```
+Trigger 发布任务 → 临时 Agent 创建 → 认领任务 → processTask → SubmitResult → 空闲轮询 → IdleThreshold 触发 → 销毁
+```
+
+---
+
+### 13.5 TeamAwarenessHook 迁移路径
+
+当前 `TeamAwarenessHook` 的三个 section 需要拆分到不同位置：
+
+| Section | 当前位置 | 迁移目标 | 理由 |
+|---|---|---|---|
+| **TeamSnapshot**（队友状态） | `PhaseTaskStart` / `PhaseLoopPre` 注入 | **Process Memory** 的定时写入 + Agent `processTask` 入口读取 | 团队状态是全局信息，不应在每个 Agent 的每轮循环里重复生成 |
+| **FileAwareness**（文件占用） | `PhaseTaskStart` / `PhaseLoopPre` 注入 | **Process Memory** 的 Roster 监听写入 + Agent 按需读取 | Roster 变更时实时更新 Memory，Agent 读取缓存而非直接调 `ListClaims` |
+| **GoalAnchor**（目标锚定） | `PhaseTaskStart` / `PhaseLoopPre` 注入 | **删除，由 Agent 自身维护** | `task.Description` 本身就是目标，不需要外部重复注入 |
+
+迁移后 Agent 的 `processTask` 入口不再调用 `runAgentInject(PhaseTaskStart)` 获取 TeamSnapshot，而是从 `a.Memory` 读取：
+
+```go
+// 旧逻辑（Agent Hook 注入）
+if injected := a.runAgentInject(ctx, hook.PhaseTaskStart, taskID, -1, false); injected != "" {
+    history = append(history, HistoryEntry{IncomingMail: injected})
+}
+
+// 新逻辑（Memory System 读取）
+if a.Memory != nil {
+    if entries, _ := a.Memory.Query(ctx, memory.ScopeProcess, memory.KindContext, "team_snapshot", 1); len(entries) > 0 {
+        history = append(history, HistoryEntry{IncomingMail: entries[0].Content})
+    }
+    if entries, _ := a.Memory.Query(ctx, memory.ScopeProcess, memory.KindContext, "file_awareness", 1); len(entries) > 0 {
+        history = append(history, HistoryEntry{IncomingMail: entries[0].Content})
+    }
+}
+```
+
+---
+
+### 13.6 当前设计对记忆扩展的约束清单
+
+基于现有代码，Memory System 落地时需要正视以下约束：
+
+| 约束 | 影响 | 缓解方案 |
+|---|---|---|
+| `AgentHookContext.Store` 是只读视图 | 旧 Agent Hook 无法写入记忆 | Memory System 独立存储，不依赖 Hook |
+| `AgentHookResult.InjectContent` 是纯文本 | 结构化记忆需序列化 | Memory System 提供 `formatForLLM(entry) string` 统一序列化 |
+| Agent 结构体无 Memory 字段 | Agent 无法直接访问记忆 | 新增 `Agent.Memory memory.MemoryStore`，nil 安全 |
+| `HistoryEntry` 只有 `IncomingMail` | 记忆载体单一 | 保持 `IncomingMail` 作为统一注入载体，Memory System 负责格式化 |
+| `TransferNote` 是任务级字符串 | 无法承载多维度跨任务记忆 | `TransferNote` 保留作为任务交接载体；跨任务记忆走 Memory System |
+| Agent Hook 的 `PhaseLoopPost` / `PhaseTaskEnd` 是 Observe 类 | 无法注入内容，但可用于触发 Memory 写入 | Observe hook 可调用 `Memory.Put()` 做总结写入 |
+| `AgentHook` 被要求无状态 | Hook 不能维护记忆缓存 | Memory System 是外部有状态服务，Hook 只持有客户端引用 |
+
+---
+
+### 13.7 与 V5 其他模块的关系
+
+| V5 模块 | 与 Memory + Trigger 的关系 |
+|---------|---------------------------|
+| **Trace 系统（§11）** | `memory_put` / `memory_query` 可作为新的 EventKind 被 trace 记录；Trigger 的每次触发产生 `trigger_fired` 事件 |
+| **Hook 系统（§6.3）** | Tool Hook 和 Mailbox Hook 保持护栏职责不变；Agent Hook 逐渐退化为 Trigger 或彻底移除 |
+| **Board Snapshot** | Snapshot 中的 `resourceInfo` 可由 Process Memory 缓存提供，减少每次 `ScanAll` 的开销 |
+| **Report Layer（§5）** | Layer 3 综合分析时，Scheduler 可读取 Project Memory 中的历史分析模式，辅助决策 |
+| **EventChannel（§事件驱动）** | Trigger System 消费 EventChannel，与 Activator 并列但职责不同：Activator 服务 Scheduler，Trigger 服务动态 Agent |
+
+---
+
 ## 12. 附录
 
 ### A. 术语表
@@ -1087,6 +1358,9 @@ WARNING [MailLoop] mail chain_depth 接近上限 (8/10)
 | **Board Snapshot** | `BuildBoardJSON()` 生成的全局任务状态 JSON |
 | **ValidateReportLayerHook** | 校验 report_done 是否符合声明层级的 Pre-call Hook |
 | **completed_results** | Board Snapshot 中扁平化的终态任务结果数组 |
+| **Memory System** | 独立于 Agent/Hook 的记忆存储与检索层，支持 Process/Session/Project 三级作用域 |
+| **Trigger System** | 事件驱动的动态 Agent 拉起机制，任务完成后自动销毁 |
+| **Project Memory** | 跨会话持久化的项目级记忆（约束文档、代码规范、学习经验） |
 
 ### B. 参考代码位置
 
@@ -1101,6 +1375,8 @@ WARNING [MailLoop] mail chain_depth 接近上限 (8/10)
 | LLM Executor | `internal/agent/llm_executor.go:99` |
 | Hook 系统 | `internal/hook/` |
 | Trace 系统 | `internal/trace/` |
+| Agent Hook 框架 | `internal/hook/agent.go` |
+| TeamAwarenessHook | `internal/hook/builtin/team_awareness.go` |
 
 ### C. 变更历史
 
@@ -1110,3 +1386,4 @@ WARNING [MailLoop] mail chain_depth 接近上限 (8/10)
 | 2026-04-26 | v0.2 | 重构：合并 Layer 1 到 Layer 2A（纯复制）；否决代码层短路；统一走 LLM 路径 |
 | 2026-04-26 | v0.3 | 追加 §11 trace 系统升级：v5 分层决策事件 + v4 历史回补（mailbox / hook abort / scheduler batch / agent 生命周期 / failure_class / cancel_source）+ CLI 子命令（tree / stats / tail）+ 跨任务异常检测器；§6.6 收窄至 v5 范围并转引 §11；附录顺延为 §12 |
 | 2026-04-27 | v0.4 | §11 增补"启动期决策盲区"：2026-04-27 排查 web_search 不可用时发现 probe（serperProbe 报 unavailable）与 webtool.NewProvider（静默回落 DDG）决策不一致，决策链全部走 fmt.Printf / log.Println，trace 完全无痕；§11.1 加表行 + 案例块；§11.2 增补 `tool_health_probe` / `provider_fallback` 两条 EventKind 与 Writer 的启动期归档约定；§11.6 P0 从 7 条 EventKind 升至 9 条 |
+| 2026-04-29 | v0.5 | 新增 §13 记忆系统与触发器重构（V6 方向）：Agent Hook 重新定位为 Trigger System、独立 Memory System（Process/Session/Project 三级作用域）、TeamAwarenessHook 迁移路径、当前设计约束清单；附录 A/B 增补 Memory System / Trigger System / Project Memory 术语与参考代码位置 |
