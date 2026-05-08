@@ -10,16 +10,21 @@ package runner
 
 import (
 	"context"
+	"io"
+	"strings"
 
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
-	"agentgo/internal/hook"
+	"agentgo/internal/gate"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
+	"agentgo/internal/memory"
+	reactorbuiltin "agentgo/internal/reactor/builtin"
 	"agentgo/internal/roster"
 	"agentgo/internal/shell"
 	"agentgo/internal/store"
 	"agentgo/internal/tools"
+	"agentgo/internal/trace"
 	"agentgo/internal/webtool"
 )
 
@@ -31,20 +36,33 @@ import (
 // 所以并非所有字段都必须填——例如某 kind 不持有 run_shell，则 ApprovalCh /
 // ShellFilter 可以为 nil。
 type RunnerDeps struct {
-	Store           store.TaskStore
-	Roster          roster.Roster
-	LLMClient       llm.Client
-	HookReg         *hook.ToolHookRegistry
-	StoreView       store.StoreHookView
-	RecordToolCall  func(string, store.ToolCallRecord)
-	AgentHookReg    *hook.AgentHookRegistry
-	AgentStoreView  hook.AgentStoreView
-	AgentRosterView hook.AgentRosterView
-	MBRegistry      *mailbox.Registry
-	CancelRegistry  *store.TaskCancelRegistry
-	SearchProvider  webtool.SearchProvider
-	ShellFilter     *shell.CommandFilter
-	ApprovalCh      chan<- shell.ApprovalRequest
+	Store     store.TaskStore
+	Roster    roster.Roster
+	LLMClient llm.Client
+	// GateReg 是 v5 Phase 1 引入的统一 Gate 注册表（取代 v4 *hook.ToolHookRegistry）。
+	// 跨 Tool / Mailbox 域复用单一 Registry，详见 ReactiveSystem.md §4.4。
+	GateReg        *gate.Registry
+	StoreView      store.StoreHookView
+	RecordToolCall func(string, store.ToolCallRecord)
+	// 注：AgentHookReg / AgentStoreView / AgentRosterView 在 v5 Phase 4 (MM7) 后整体删除——
+	// AgentHook 子系统已被 trace.Event + Reactor 取代。
+	// Memory 是 v5 Phase 1 引入的 Memory System 共享存储（MemoryManageSystem.md MM5）。
+	// 为 nil 时 Agent 退化为不读取/不写入（行为等价于 v4 无 team-awareness）。
+	Memory         memory.Store
+	MBRegistry     *mailbox.Registry
+	CancelRegistry *store.TaskCancelRegistry
+	SearchProvider webtool.SearchProvider
+	ShellFilter    *shell.CommandFilter
+	ApprovalCh     chan<- shell.ApprovalRequest
+	// UserOutput 是用户可见内容的输出目标。非 nil 时，agent 的 IsUserFacing 输出
+	// 和 scheduler 的 report_done 会写入此处，而不是直接 fmt.Printf。
+	UserOutput io.Writer
+
+	// TaskEndCallbacks 是 v5 Phase 4 task-end-callback Sync Reactor。
+	// runner.New 在此注册"清空 holder（仅 ev.AgentID 匹配本 runner 时）"回调，
+	// 取代旧的 a.OnTaskEnd 闭包路径——让任务结束副作用统一走 reactor 链路。
+	// nil 时 runner 退化到不注册回调；生产 bootstrap 总是注入该 Reactor。
+	TaskEndCallbacks *reactorbuiltin.TaskEndCallbackReactor
 
 	// 运行时常量
 	ProjectRoot           string
@@ -85,7 +103,7 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	executor := agent.NewLLMExecutor(
 		deps.LLMClient,
 		toolReg,
-		deps.HookReg,
+		deps.GateReg,
 		deps.StoreView,
 		deps.RecordToolCall,
 		rt.SystemPrompt,
@@ -109,15 +127,32 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	a.Model = rt.Model
 	a.ContextLimit = rt.ContextLimit
 	a.OnTaskStart = func(taskID string) { holder.Set(taskID) }
-	a.OnTaskEnd = func(taskID string, success bool) { holder.Set("") }
+	// v5 Phase 4：holder 清理迁移到 task-end-callback Sync Reactor。
+	// 旧路径 (a.OnTaskEnd 闭包) 在 processTask defer 链中执行；新路径在
+	// trace.KindTaskCompleted/Failed/Cancelled/Retry emit 同步阶段执行。
+	// 时序差异不影响 holder 语义——holder 仅被 LLM 工具阶段读取，task 终态事件
+	// emit 时主流程已退出 ReactLoop，无并发读取冲突。
+	if deps.TaskEndCallbacks != nil {
+		agentID := rt.InstanceID
+		oneShot := strings.HasPrefix(rt.EventType, "adhoc:")
+		var unregister func()
+		unregister = deps.TaskEndCallbacks.RegisterCallback(func(ev trace.Event) error {
+			if ev.AgentID == agentID {
+				holder.Set("")
+				if oneShot && unregister != nil {
+					unregister()
+				}
+			}
+			return nil
+		})
+	}
 	a.FileCache = fileCache
 	if deps.MBRegistry != nil {
 		a.Mailbox = deps.MBRegistry.Register(rt.InstanceID, rt.EventType)
 		a.MailRegistry = deps.MBRegistry
 	}
-	a.AgentHookReg = deps.AgentHookReg
-	a.HookStoreView = deps.AgentStoreView
-	a.HookRosterView = deps.AgentRosterView
+	a.Memory = deps.Memory
+	a.UserOutput = deps.UserOutput
 
 	return &Runner{agent: a}
 }

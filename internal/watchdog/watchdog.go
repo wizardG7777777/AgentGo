@@ -100,7 +100,7 @@ func (w *Watchdog) checkProcessingTask(task *model.Task) {
 		dep, err := w.Store.GetTask(depID)
 		if err != nil {
 			log.Printf("[watchdog] task %s dependency %s not found (processing), cancelling", task.ID, depID)
-			if err := w.Store.TransitionState(task.ID, model.TaskStatusProcessing, model.TaskStatusCancelled); err != nil {
+			if err := store.TransitionStateWithCancelSource(w.Store, task.ID, model.TaskStatusProcessing, model.TaskStatusCancelled, "dependency_failure"); err != nil {
 				log.Printf("[watchdog] 级联取消 task %s 失败: %v", task.ID, err)
 			}
 			w.sendAlert(task.ID)
@@ -110,7 +110,7 @@ func (w *Watchdog) checkProcessingTask(task *model.Task) {
 		}
 		if dep.Status == model.TaskStatusFailed || dep.Status == model.TaskStatusCancelled {
 			log.Printf("[watchdog] task %s dependency %s is %s (processing), cascade cancelling", task.ID, depID, dep.Status)
-			if err := w.Store.TransitionState(task.ID, model.TaskStatusProcessing, model.TaskStatusCancelled); err != nil {
+			if err := store.TransitionStateWithCancelSource(w.Store, task.ID, model.TaskStatusProcessing, model.TaskStatusCancelled, "dependency_failure"); err != nil {
 				log.Printf("[watchdog] 级联取消 task %s 失败: %v", task.ID, err)
 			}
 			w.sendAlert(task.ID)
@@ -144,7 +144,7 @@ func (w *Watchdog) checkPendingTask(task *model.Task) {
 		if err != nil {
 			// 依赖缺失，视为失败
 			log.Printf("[watchdog] task %s dependency %s not found, cancelling", task.ID, depID)
-			if err := w.Store.TransitionState(task.ID, model.TaskStatusPending, model.TaskStatusCancelled); err != nil {
+			if err := store.TransitionStateWithCancelSource(w.Store, task.ID, model.TaskStatusPending, model.TaskStatusCancelled, "dependency_failure"); err != nil {
 				log.Printf("[watchdog] 级联取消 task %s 失败: %v", task.ID, err)
 			}
 			w.sendAlert(task.ID)
@@ -154,7 +154,7 @@ func (w *Watchdog) checkPendingTask(task *model.Task) {
 		}
 		if dep.Status == model.TaskStatusFailed || dep.Status == model.TaskStatusCancelled {
 			log.Printf("[watchdog] task %s dependency %s is %s, cascade cancelling", task.ID, depID, dep.Status)
-			if err := w.Store.TransitionState(task.ID, model.TaskStatusPending, model.TaskStatusCancelled); err != nil {
+			if err := store.TransitionStateWithCancelSource(w.Store, task.ID, model.TaskStatusPending, model.TaskStatusCancelled, "dependency_failure"); err != nil {
 				log.Printf("[watchdog] 级联取消 task %s 失败: %v", task.ID, err)
 			}
 			w.sendAlert(task.ID)

@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"agentgo/internal/hook"
+	"agentgo/internal/gate"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
@@ -24,6 +24,12 @@ const (
 	ctxAgentID executorContextKey = iota
 	ctxLoopNum
 	ctxTaskID
+	ctxCancelSource
+	// ctxNoTools 用于在 buildTransferNote / 其它"应当只输出文字"的 LLM 调用路径上
+	// 指示 executor 不暴露工具集。这样 LLM 想调工具也无工具可调，副作用泄漏（如
+	// 多写一遍 APPROVED.md / 多发一条 send_message）被结构性地阻断。
+	// 详见 transfer_note.go L1 注释 + agent.go MaxLoops 兜底路径。
+	ctxNoTools
 )
 
 // WithAgentContext 将 agentID + taskID + loopNum 注入 context，
@@ -34,6 +40,12 @@ func WithAgentContext(ctx context.Context, agentID, taskID string, loopNum int) 
 	ctx = context.WithValue(ctx, ctxTaskID, taskID)
 	ctx = context.WithValue(ctx, ctxLoopNum, loopNum)
 	return ctx
+}
+
+// WithCancelSource 标记当前 context 的取消来源，供 processTask 在
+// KindTaskCancelled trace 事件中填充 Transition.CancelSource。
+func WithCancelSource(ctx context.Context, source string) context.Context {
+	return context.WithValue(ctx, ctxCancelSource, source)
 }
 
 // TaskIDFromContext 从 context 中提取当前任务 ID。
@@ -48,6 +60,24 @@ func TaskIDFromContext(ctx context.Context) string {
 func AgentIDFromContext(ctx context.Context) string {
 	id, _ := ctx.Value(ctxAgentID).(string)
 	return id
+}
+
+// CancelSourceFromContext 从 context 中提取取消来源。
+func CancelSourceFromContext(ctx context.Context) string {
+	source, _ := ctx.Value(ctxCancelSource).(string)
+	return source
+}
+
+// WithNoTools 标记当前 LLM 调用不应暴露任何工具。executor 看到该标记后会
+// 把传给 client.Chat 的 toolDefs 替换为空切片——LLM 物理上无工具可调，
+// 强制走"只输出文字"的路径。用于 buildTransferNote 等期望纯文本输出的场景。
+func WithNoTools(ctx context.Context) context.Context {
+	return context.WithValue(ctx, ctxNoTools, true)
+}
+
+func noToolsFromContext(ctx context.Context) bool {
+	v, _ := ctx.Value(ctxNoTools).(bool)
+	return v
 }
 
 // truncateForLog 将参数截断为日志友好的短字符串。
@@ -67,24 +97,21 @@ func truncateForLog(args map[string]any, maxLen int) string {
 // 每次调用对应 ReAct 循环中的一步：调用 LLM → 如果有 tool calls 则执行并返回 ToolCalled=true，
 // 否则返回 ToolCalled=false 表示任务完成。
 //
-// 新增的 3 个 hook 系统参数（C4.3 方案 A — 独立闭包）：
-//   - hookReg：工具调用 hook 注册表；nil 时所有 hook 路径短路为 no-op
-//     （ToolHookRegistry 本身支持 nil receiver，所以 nil 时 RunPre/RunPost
-//     直接返回 Continue / 无操作）
-//   - storeView：当前未在 executor 内部使用，仅透传以便未来扩展；每次
-//     工具调用的 pre/post hook 通过自己构造时注入的 StoreHookView 访问任务历史
-//   - recordToolCall：把每次工具调用（含被 hook Abort 的调用）自动写入任务
+// 新增的 3 个 hook 系统参数（v5 Phase 1 起改名为 gateReg，承载统一 Gate 子系统）：
+//   - gateReg：工具调用 Gate 注册表（gate.Registry，跨 Tool / Mailbox 域）；
+//     nil 时 Dispatch 路径短路为 Continue（gate.Registry 支持 nil receiver）
+//   - storeView：当前未在 executor 内部使用，仅透传以便未来扩展
+//   - recordToolCall：把每次工具调用（含被 Gate Abort 的调用）自动写入任务
 //     历史的闭包。bootstrap 用 `func(id, rec) { taskStore.AppendToolCall(id, rec) }`
-//     注入。nil 时跳过历史记录 — 禁用 hook 场景下行为与改动前一致
+//     注入。nil 时跳过历史记录
 //
-// 三个参数均允许 nil，nil 时整段 hook + 历史记录路径与改动前字节级一致。
-// 这是阶段 1 回归验证（V6）的关键 — 禁用所有 hook 时系统行为不变。
+// 三个参数均允许 nil，nil 时整段 Gate + 历史记录路径与改动前字节级一致。
 //
 // systemPrompt 为可选参数，非空时作为 system/developer 消息注入到对话开头。
 func NewLLMExecutor(
 	client llm.Client,
 	tools *ToolRegistry,
-	hookReg *hook.ToolHookRegistry,
+	gateReg *gate.Registry,
 	storeView store.StoreHookView,
 	recordToolCall func(string, store.ToolCallRecord),
 	systemPrompt ...string,
@@ -106,7 +133,10 @@ func NewLLMExecutor(
 
 		agentIDForTrace, _ := ctx.Value(ctxAgentID).(string)
 		loopForTrace, _ := ctx.Value(ctxLoopNum).(int)
-		toolDefs := tools.Defs()
+		var toolDefs []llm.ToolDef
+		if !noToolsFromContext(ctx) {
+			toolDefs = tools.Defs()
+		}
 
 		// Trace：LLM 调用开始
 		trace.Emit(trace.Event{
@@ -188,21 +218,21 @@ func NewLLMExecutor(
 					CallID:  c.ID,
 				})
 
-				// Hook pre-call：允许注册的 hook 拒绝本次调用。
-				// hookReg 为 nil 时 RunPre 直接返回 Continue（nil receiver 安全）。
-				preDecision := hookReg.RunPre(hook.ToolHookContext{
-					Ctx:      ctx,
-					Phase:    hook.PhasePreCall,
-					AgentID:  agentID,
-					TaskID:   task.ID,
-					ToolName: c.Name,
-					Args:     c.Arguments,
+				// Gate pre-call：允许注册的 Gate 拒绝本次调用。
+				// gateReg 为 nil 时 Dispatch 直接返回 Continue（nil receiver 安全）。
+				preDecision := gateReg.Dispatch(&gate.ToolContext{
+					CtxField:     ctx,
+					PhaseField:   gate.PhaseToolPreCall,
+					AgentIDField: agentID,
+					TaskIDField:  task.ID,
+					ToolName:     c.Name,
+					Args:         c.Arguments,
 				})
 
 				start := time.Now()
 				var result string
 				var toolErr error
-				if preDecision.Action == hook.Abort {
+				if preDecision.Action == gate.Abort {
 					// Pre hook 拒绝 — 跳过实际工具调用，合成错误返回值。
 					// 错误消息同时注入到 content 和 toolErr，让 LLM 和后续记录都看到。
 					result = ""
@@ -222,6 +252,7 @@ func NewLLMExecutor(
 						AgentID:    agentID,
 						Loop:       loopNum,
 						Tool:       c.Name,
+						Args:       c.Arguments, // v5 Phase 6：与 KindToolCall 对称，让 Reactor 能读 args.path
 						CallID:     c.ID,
 						DurationMS: dur.Milliseconds(),
 						Error:      toolErr.Error(),
@@ -235,6 +266,7 @@ func NewLLMExecutor(
 						AgentID:    agentID,
 						Loop:       loopNum,
 						Tool:       c.Name,
+						Args:       c.Arguments, // v5 Phase 6：read-set-write Reactor 据此 filter 并拿 path
 						CallID:     c.ID,
 						DurationMS: dur.Milliseconds(),
 						ResultLen:  len(content),
@@ -258,16 +290,16 @@ func NewLLMExecutor(
 					})
 				}
 
-				// Hook post-call：纯观察，无返回值。hookReg 为 nil 时无操作。
-				hookReg.RunPost(hook.ToolHookContext{
-					Ctx:      ctx,
-					Phase:    hook.PhasePostCall,
-					AgentID:  agentID,
-					TaskID:   task.ID,
-					ToolName: c.Name,
-					Args:     c.Arguments,
-					Result:   content,
-					Err:      toolErr,
+				// Gate post-call：纯观察，Dispatch 返回值忽略。gateReg 为 nil 时无操作。
+				_ = gateReg.Dispatch(&gate.ToolContext{
+					CtxField:     ctx,
+					PhaseField:   gate.PhaseToolPostCall,
+					AgentIDField: agentID,
+					TaskIDField:  task.ID,
+					ToolName:     c.Name,
+					Args:         c.Arguments,
+					Result:       content,
+					Err:          toolErr,
 				})
 
 				results[idx] = indexedResult{

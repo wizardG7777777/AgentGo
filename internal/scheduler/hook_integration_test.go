@@ -8,6 +8,7 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
+	"agentgo/internal/gate"
 	"agentgo/internal/hook"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
@@ -37,8 +38,8 @@ func TestSchedulerExecutor_ToolCallsGoThroughHook(t *testing.T) {
 		},
 	}
 
-	hookReg := hook.NewToolHookRegistry()
-	if err := hookReg.Register(mockHook); err != nil {
+	hookReg := gate.NewRegistry()
+	if err := hookReg.Register(gate.WrapToolHook(mockHook)); err != nil {
 		t.Fatalf("注册 hook 失败: %v", err)
 	}
 

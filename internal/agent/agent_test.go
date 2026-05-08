@@ -1235,27 +1235,40 @@ func TestBehavior_MaxLoopsHistoryLength(t *testing.T) {
 				t.Fatalf("executor call count = %d, want %d (MaxLoops+1 含 TransferNote L1)", callCount, expected)
 			}
 
-			// Verify history length at the first MaxLoops rounds: round i gets len(history) == i
-			// 第 MaxLoops 次调用是 buildTransferNote 的 L1 压缩调用，不在验证范围
+			// 90% 预算警告会在 i >= floor(maxLoops*0.9) 的那一轮一次性追加 1 条 history
+			// （详见 agent.go budgetWarningPrompt 注入点）。被警告之后所有 round 看到的
+			// history 长度都比"老语义" + 1。整数除法天然向下取整。
+			budgetWarnAt := maxLoops * 9 / 10
+			warningExtra := func(round int) int {
+				if round >= budgetWarnAt {
+					return 1
+				}
+				return 0
+			}
+
+			// Verify history length at the first MaxLoops rounds.
+			// 老语义：round i 看到 len(history) == i
+			// 新语义：round i 看到 len(history) == i + warningExtra(i)
 			for i := 0; i < maxLoops; i++ {
-				length := historyLengths[i]
-				if length != i {
-					t.Errorf("round %d: len(history) = %d, want %d", i, length, i)
+				want := i + warningExtra(i)
+				if got := historyLengths[i]; got != want {
+					t.Errorf("round %d: len(history) = %d, want %d", i, got, want)
 				}
 			}
 
-			// 最后一次常规 round 应收到长度为 maxLoops-1 的 history（其自身 append 前）
+			// 最后一次常规 round 看到的 history 长度同上规则
 			lastRegular := historyLengths[maxLoops-1]
-			if lastRegular != maxLoops-1 {
-				t.Errorf("last regular round: len(history) = %d, want %d", lastRegular, maxLoops-1)
+			lastWant := (maxLoops - 1) + warningExtra(maxLoops-1)
+			if lastRegular != lastWant {
+				t.Errorf("last regular round: len(history) = %d, want %d", lastRegular, lastWant)
 			}
 
-			// TransferNote L1 压缩调用是最后一次 Execute：
-			// 它看到的 history 应是 maxLoops（所有 round 的累积）+ 1（追加的 <transfer-request> 指令）
-			l1CallIdx := maxLoops // 第 maxLoops+1 次调用，0-indexed
-			if historyLengths[l1CallIdx] != maxLoops+1 {
-				t.Errorf("L1 call: len(history) = %d, want %d (maxLoops + <transfer-request>)",
-					historyLengths[l1CallIdx], maxLoops+1)
+			// TransferNote L1 压缩调用：history 累计 = maxLoops（每轮 append）+ warning 注入数 + 1（<transfer-request>）
+			l1CallIdx := maxLoops
+			l1Want := maxLoops + warningExtra(maxLoops-1) + 1
+			if got := historyLengths[l1CallIdx]; got != l1Want {
+				t.Errorf("L1 call: len(history) = %d, want %d (maxLoops + warning + <transfer-request>)",
+					got, l1Want)
 			}
 
 			// RetryRollback should have been triggered: task goes back to pending

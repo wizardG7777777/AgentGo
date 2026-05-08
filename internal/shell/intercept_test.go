@@ -322,6 +322,99 @@ func TestWrapShellTool_Approve_UserGuidance(t *testing.T) {
 	}
 }
 
+// ── 运行时白名单（永远允许）────────────────────────────────────────
+
+func TestCommandFilter_RuntimeWhitelist_BypassesGreylist(t *testing.T) {
+	f := NewCommandFilter(DefaultBlacklist, DefaultGreylist)
+
+	// 默认情况下 git push 进灰名单
+	if action, _ := f.Check("git push origin main"); action != "approve" {
+		t.Fatalf("default git push should approve, got %s", action)
+	}
+
+	// 加白名单后短路，直接 allow
+	if err := f.AddRuntimeWhitelist(`git\s+push`); err != nil {
+		t.Fatalf("AddRuntimeWhitelist: %v", err)
+	}
+	if action, _ := f.Check("git push origin main"); action != "allow" {
+		t.Errorf("after whitelist, git push should allow, got %s", action)
+	}
+	// 不在白名单的灰名单命令仍走审批
+	if action, _ := f.Check("chmod 777 /tmp"); action != "approve" {
+		t.Errorf("unrelated greylist command should still approve, got %s", action)
+	}
+}
+
+func TestCommandFilter_RuntimeWhitelist_BlackBeatsWhite(t *testing.T) {
+	// 黑名单优先级最高，"永远允许" 不能绕过
+	f := NewCommandFilter(DefaultBlacklist, DefaultGreylist)
+	if err := f.AddRuntimeWhitelist(`rm`); err != nil {
+		t.Fatalf("AddRuntimeWhitelist: %v", err)
+	}
+	if action, _ := f.Check("rm -rf /"); action != "block" {
+		t.Errorf("black should beat whitelist, got %s", action)
+	}
+}
+
+func TestCommandFilter_RuntimeWhitelist_Idempotent(t *testing.T) {
+	f := NewCommandFilter(nil, DefaultGreylist)
+	if err := f.AddRuntimeWhitelist(`git\s+push`); err != nil {
+		t.Fatalf("first add: %v", err)
+	}
+	if err := f.AddRuntimeWhitelist(`git\s+push`); err != nil {
+		t.Fatalf("second add (dup) should not error: %v", err)
+	}
+	if got := f.RuntimeWhitelist(); len(got) != 1 {
+		t.Errorf("duplicate add should be ignored, got %d entries: %v", len(got), got)
+	}
+}
+
+func TestCommandFilter_RuntimeWhitelist_RejectsBadInput(t *testing.T) {
+	f := NewCommandFilter(nil, nil)
+	if err := f.AddRuntimeWhitelist(""); err == nil {
+		t.Error("empty pattern should error")
+	}
+	if err := f.AddRuntimeWhitelist(`(unclosed`); err == nil {
+		t.Error("invalid regex should error")
+	}
+}
+
+func TestWrapShellTool_RememberPattern_PersistsForSession(t *testing.T) {
+	// 第一次审批用户选 "永远允许" → shell 层把模式加入运行时白名单。
+	// 第二次同模式命令应直接放行，不再发审批请求。
+	calls := 0
+	inner := func(ctx context.Context, args map[string]any) (string, error) {
+		calls++
+		return "ok", nil
+	}
+	filter := NewCommandFilter(nil, DefaultGreylist)
+	approvalCh := make(chan ApprovalRequest, 1)
+	wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1")
+
+	// 第一次：用户回复 RememberPattern
+	go func() {
+		req := <-approvalCh
+		if req.Pattern == "" {
+			t.Errorf("ApprovalRequest.Pattern should be set, got empty")
+		}
+		req.ReplyCh <- ApprovalReply{Approved: true, RememberPattern: req.Pattern}
+	}()
+	if _, err := wrapped(context.Background(), map[string]any{"command": "git push origin main"}); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+
+	// 第二次：approvalCh 不应再有请求；不监听就行——若 wrapped 阻塞发审批，会卡住测试
+	if _, err := wrapped(context.Background(), map[string]any{"command": "git push origin develop"}); err != nil {
+		t.Fatalf("second call should bypass approval: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("inner should run twice, got %d", calls)
+	}
+	if got := filter.RuntimeWhitelist(); len(got) != 1 {
+		t.Errorf("whitelist should have 1 entry, got %v", got)
+	}
+}
+
 func TestWrapShellTool_Allow(t *testing.T) {
 	executed := false
 	inner := func(ctx context.Context, args map[string]any) (string, error) {

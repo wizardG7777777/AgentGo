@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"agentgo/internal/gate"
 	"agentgo/internal/hook"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
@@ -91,6 +92,10 @@ func (r *recordingStore) ScanPendingByEventSource(source, eventType string) []*m
 	return nil
 }
 
+func (m *recordingStore) GetReadSet(taskID string) (map[string]model.ReadInfo, error) {
+	return nil, nil
+}
+
 func (r *recordingStore) AppendToolCall(taskID string, rec store.ToolCallRecord) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -126,8 +131,8 @@ func TestExecutor_CallsPreHooksBeforeTool(t *testing.T) {
 		decision: hook.ToolHookDecision{Action: hook.Continue},
 	}
 
-	hookReg := hook.NewToolHookRegistry()
-	hookReg.Register(preHook)
+	hookReg := gate.NewRegistry()
+	hookReg.Register(gate.WrapToolHook(preHook))
 
 	toolCalled := false
 	tools := NewToolRegistry()
@@ -173,8 +178,8 @@ func TestExecutor_CallsPostHooksAfterTool(t *testing.T) {
 		decision: hook.ToolHookDecision{Action: hook.Continue},
 	}
 
-	hookReg := hook.NewToolHookRegistry()
-	hookReg.Register(postHook)
+	hookReg := gate.NewRegistry()
+	hookReg.Register(gate.WrapToolHook(postHook))
 
 	toolExecuted := false
 	tools := NewToolRegistry()
@@ -225,8 +230,8 @@ func TestExecutor_PreHookAbortSkipsTool(t *testing.T) {
 		},
 	}
 
-	hookReg := hook.NewToolHookRegistry()
-	hookReg.Register(preHook)
+	hookReg := gate.NewRegistry()
+	hookReg.Register(gate.WrapToolHook(preHook))
 
 	toolCalled := false
 	tools := NewToolRegistry()
@@ -269,8 +274,8 @@ func TestExecutor_PostHookSeesToolResult(t *testing.T) {
 		decision: hook.ToolHookDecision{Action: hook.Continue},
 	}
 
-	hookReg := hook.NewToolHookRegistry()
-	hookReg.Register(postHook)
+	hookReg := gate.NewRegistry()
+	hookReg.Register(gate.WrapToolHook(postHook))
 
 	tools := NewToolRegistry()
 	tools.Register("test_tool", "测试工具", nil, func(ctx context.Context, args map[string]any) (string, error) {
@@ -314,8 +319,8 @@ func TestExecutor_PostHookSeesToolError(t *testing.T) {
 		decision: hook.ToolHookDecision{Action: hook.Continue},
 	}
 
-	hookReg := hook.NewToolHookRegistry()
-	hookReg.Register(postHook)
+	hookReg := gate.NewRegistry()
+	hookReg.Register(gate.WrapToolHook(postHook))
 
 	expectedErr := errors.New("tool execution failed")
 	tools := NewToolRegistry()
@@ -448,8 +453,8 @@ func TestExecutor_AppendsToolCallOnHookAbort(t *testing.T) {
 		decision: hook.ToolHookDecision{Action: hook.Abort, AbortReason: "拒绝"},
 	}
 
-	hookReg := hook.NewToolHookRegistry()
-	hookReg.Register(preHook)
+	hookReg := gate.NewRegistry()
+	hookReg.Register(gate.WrapToolHook(preHook))
 
 	tools := NewToolRegistry()
 	tools.Register("blocked_tool", "被阻工具", nil, func(ctx context.Context, args map[string]any) (string, error) {

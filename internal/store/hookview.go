@@ -37,6 +37,12 @@ type StoreHookView interface {
 	//
 	// Phase 2 引入。返回的切片是浅拷贝，调用方可以安全遍历但不应修改任务字段。
 	ScanPendingByEventSource(source, eventType string) []*model.Task
+
+	// GetReadSet 返回任务的"已读集合"（v5 Phase 6 引入，ReactiveSystem.md §5.2.1）。
+	// require-read-before-write Gate 通过此 API 替代 v4 的反查 GetToolCallHistory。
+	// 任务不存在返回 ErrTaskNotFound；ReadSet 为空时返回非 nil 空 map。
+	// 返回 map 是浅拷贝，调用方修改不影响内部状态。
+	GetReadSet(taskID string) (map[string]model.ReadInfo, error)
 }
 
 // GetToolCallHistory 实现 StoreHookView 接口的简化包装——内部委托给

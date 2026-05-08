@@ -93,3 +93,16 @@ type TaskStore interface {
 
 	ScanAll() ([]*model.Task, error)
 }
+
+type cancelSourceTransitioner interface {
+	TransitionStateWithCancelSource(taskID string, from, to model.TaskStatus, cancelSource string) error
+}
+
+// TransitionStateWithCancelSource keeps TaskStore compatibility while allowing
+// stores that understand cancel sources to attach structured cancellation metadata.
+func TransitionStateWithCancelSource(s TaskStore, taskID string, from, to model.TaskStatus, cancelSource string) error {
+	if st, ok := s.(cancelSourceTransitioner); ok {
+		return st.TransitionStateWithCancelSource(taskID, from, to, cancelSource)
+	}
+	return s.TransitionState(taskID, from, to)
+}

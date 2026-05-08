@@ -270,6 +270,53 @@ func TestSetDefault_PackageHelpersWork(t *testing.T) {
 	}
 }
 
+type captureDispatcher struct {
+	ev Event
+}
+
+func (d *captureDispatcher) Dispatch(ev Event) {
+	d.ev = ev
+}
+
+func TestEmit_FillsTimestampBeforeDispatch(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := NewWriter(dir, 0)
+	dispatcher := &captureDispatcher{}
+
+	originalWriter := Default()
+	originalDispatcher := DefaultDispatcher()
+	SetDefault(w)
+	SetDefaultDispatcher(dispatcher)
+	defer func() {
+		w.Close()
+		SetDefault(originalWriter)
+		SetDefaultDispatcher(originalDispatcher)
+	}()
+
+	Emit(Event{Kind: KindTaskClaimed, TaskID: "timestamp-dispatch"})
+
+	if dispatcher.ev.Timestamp.IsZero() {
+		t.Fatal("dispatcher received zero timestamp")
+	}
+
+	files := listTraceFiles(t, dir)
+	if len(files) != 1 {
+		t.Fatalf("expected 1 trace file, got %d", len(files))
+	}
+	events := readEvents(t, filepath.Join(dir, files[0]))
+	if len(events) != 1 {
+		t.Fatalf("expected 1 persisted event, got %d", len(events))
+	}
+	if events[0].Timestamp.IsZero() {
+		t.Fatal("persisted event has zero timestamp")
+	}
+	if !events[0].Timestamp.Equal(dispatcher.ev.Timestamp) {
+		t.Fatalf("dispatcher timestamp %s differs from persisted timestamp %s",
+			dispatcher.ev.Timestamp.Format(time.RFC3339Nano),
+			events[0].Timestamp.Format(time.RFC3339Nano))
+	}
+}
+
 func TestSetDefault_NilIsNoop(t *testing.T) {
 	SetDefault(nil)
 	Emit(Event{Kind: KindTaskClaimed, TaskID: "should-be-noop"}) // must not panic

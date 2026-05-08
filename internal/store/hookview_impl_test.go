@@ -137,6 +137,19 @@ func (m *mockHookView) ScanPendingByEventSource(source, eventType string) []*mod
 	return result
 }
 
+// GetReadSet 是 v5 Phase 6 引入的 StoreHookView 方法。mock 直接读 tasks[taskID].ReadSet。
+func (m *mockHookView) GetReadSet(taskID string) (map[string]model.ReadInfo, error) {
+	task, ok := m.tasks[taskID]
+	if !ok {
+		return nil, ErrTaskNotFound
+	}
+	out := make(map[string]model.ReadInfo, len(task.ReadSet))
+	for k, v := range task.ReadSet {
+		out[k] = v
+	}
+	return out, nil
+}
+
 func TestStoreHookView_MockReplaceable(t *testing.T) {
 	mock := &mockHookView{
 		tasks: map[string]*model.Task{

@@ -214,15 +214,44 @@ func SetDefault(w *Writer) { defaultWriter = w }
 // Default 返回当前的默认 Writer。可能为 nil。
 func Default() *Writer { return defaultWriter }
 
-// Emit 是包级 helper：把事件 emit 到默认 Writer。如果默认 Writer 为 nil，无操作。
-// 这是各 embed 点的标准调用方式：
+// Dispatcher 是 v5 Phase 4 引入的 Reactor 派发钩子接口（ReactiveSystem.md §6.6）。
+//
+// 实现住在 internal/reactor 包的 Registry 上——通过接口注入避免 trace → reactor
+// 反向依赖（trace 是底层模块，不能 import 业务层 reactor）。bootstrap 完成
+// reactor.NewRegistry() 后调用 trace.SetDefaultDispatcher(reg) 把 dispatcher 接进。
+//
+// nil 时 trace.Emit 不调度——保持向前兼容（任何 trace 写入路径无 reactor 时
+// 行为字节级一致 v4）。
+type Dispatcher interface {
+	Dispatch(ev Event)
+}
+
+// defaultDispatcher 是包级默认 Reactor 派发器。
+var defaultDispatcher Dispatcher
+
+// SetDefaultDispatcher 设置包级默认 Dispatcher。bootstrap 时调用一次。
+// 传入 nil 可以显式卸下 reactor 派发（测试场景常用）。
+func SetDefaultDispatcher(d Dispatcher) { defaultDispatcher = d }
+
+// DefaultDispatcher 返回当前的默认 Dispatcher。可能为 nil。
+func DefaultDispatcher() Dispatcher { return defaultDispatcher }
+
+// Emit 是包级 helper：把事件 emit 到默认 Writer，并派发到默认 Dispatcher。
+// Writer / Dispatcher 任一为 nil 时跳过对应步骤（互不依赖）。
+//
+// 派发顺序：先写盘后派发——保证 Reactor.Run 看到的事件已经持久化到 jsonl，
+// 即使 Reactor panic 或主流程崩溃也能事后从 trace 复盘。
 //
 //	trace.Emit(trace.Event{Kind: trace.KindTaskClaimed, TaskID: id, AgentID: a.ID})
-//
-// 不需要在每个 package 中注入 Writer 实例，零依赖侵入。
 func Emit(event Event) {
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Now()
+	}
 	if defaultWriter != nil {
 		defaultWriter.Emit(event)
+	}
+	if defaultDispatcher != nil {
+		defaultDispatcher.Dispatch(event)
 	}
 }
 

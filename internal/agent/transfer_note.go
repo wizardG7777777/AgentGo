@@ -57,6 +57,24 @@ const transferRequestPrompt = `<transfer-request>
 控制在 2000 字以内。直接输出备忘正文，不要加工具调用。
 </transfer-request>`
 
+// budgetWarningPrompt 在 react loop 达到 floor(MaxLoops * 0.9) 时一次性注入
+// 到 history。Sprintf 三个占位：当前轮次（i+1，人类口径从 1 起）、上限、剩余轮数。
+//
+// 设计目标：让 LLM 在剩余预算很少时主动收口，避免触发 MaxLoops 兜底路径
+// （buildTransferNote → retry，成本高且 transfer-note LLM 调用偶尔会有副作用泄漏）。
+//
+// 措辞刻意"动作导向"——告诉 LLM 现在该做哪一类动作（终结/收尾），而不是模糊的
+// "请抓紧"。LLM 对具体行动指令的遵循率显著高于抽象建议。
+const budgetWarningPrompt = `<budget-warning>
+你已经使用了 %d/%d 个执行轮次，**仅剩 %d 轮**。请立即进入收尾模式：
+
+- 如果你已经收集到足够信息或主要工作已完成，**本轮直接输出最终结果文字**（不调用任何工具），任务即告完成
+- 如果还需要一个终结性动作（write_file 写报告、send_message 通知、publish_task 派后续），**本轮就调用，不要继续探索**
+- **不要**再发起新的 read_file / web_search / web_fetch / list_dir / grep_search 等探索类工具——你已经没有时间消化更多上下文
+
+如果不收尾，下一轮预算耗尽时框架会触发任务重试，你的当前进展可能被部分丢弃。
+</budget-warning>`
+
 // generateTransferNote 实现 L1：Agent 自行压缩。
 //
 // 在 history 末尾追加一条 <transfer-request> IncomingMail，然后做最后一次

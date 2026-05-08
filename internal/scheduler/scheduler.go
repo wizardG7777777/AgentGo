@@ -1,14 +1,16 @@
 package scheduler
 
 import (
+	"io"
 	"sync"
 	"time"
 
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
-	"agentgo/internal/hook"
+	"agentgo/internal/gate"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
+	"agentgo/internal/memory"
 	"agentgo/internal/model"
 	"agentgo/internal/roster"
 	"agentgo/internal/shell"
@@ -411,10 +413,12 @@ func New(
 	cancelReg *store.TaskCancelRegistry,
 	mbRegistry *mailbox.Registry,
 	approvalCh chan<- shell.ApprovalRequest,
-	hookReg *hook.ToolHookRegistry,
+	gateReg *gate.Registry,
 	storeView store.StoreHookView,
 	recordToolCall func(string, store.ToolCallRecord),
 	agentRegistry *AgentRegistry,
+	memoryStore memory.Store,
+	userOutput io.Writer,
 ) *Bundle {
 	schedID := "scheduler-" + uuid.New().String()[:8]
 
@@ -468,11 +472,12 @@ func New(
 			MBRegistry:           mbRegistry,
 			FinalizationNotifier: holder, // 同一个 holder 也实现 FinalizationNotifier
 			ProjectRoot:          cfg.ProjectRoot,
+			UserOutput:           userOutput,
 		},
 	)
 
 	// 标准 LLM Executor（hook + storeView + recordToolCall 三件套与 worker 一致）
-	innerExec := agent.NewLLMExecutor(llmClient, toolReg, hookReg, storeView, recordToolCall, schedulerSystemPrompt)
+	innerExec := agent.NewLLMExecutor(llmClient, toolReg, gateReg, storeView, recordToolCall, schedulerSystemPrompt)
 
 	// 包装 SchedulerExecutor：等待 batch + 注入 board snapshot
 	batchUpdateCh := make(chan struct{}, 1)
@@ -518,6 +523,7 @@ func New(
 		mbRegistry.RegisterAlias("scheduler", schedID)
 		a.MailRegistry = mbRegistry
 	}
+	a.Memory = memoryStore
 
 	// Activator
 	activator := NewActivator(s, eventCh, batchUpdateCh, sessionHistory)

@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 
 	"agentgo/internal/agent"
@@ -28,10 +29,11 @@ import (
 // "终止当前 reactLoop"，避免幻觉心跳循环。
 type SchedulerGroup struct {
 	Store                store.TaskStore
-	Holder               TaskHolder            // 提供"当前 scheduler task 的 ID"，report_done 用于读 SchedulerBatch
-	MBRegistry           *mailbox.Registry     // 当前未使用，留作未来扩展（例如 report_done 时通知其他代理）
-	FinalizationNotifier FinalizationNotifier  // 可选；非 nil 时 reportDone 成功后调 MarkTaskFinalized()
-	ProjectRoot          string                // 项目根目录，供 probe_directory 做路径校验
+	Holder               TaskHolder           // 提供"当前 scheduler task 的 ID"，report_done 用于读 SchedulerBatch
+	MBRegistry           *mailbox.Registry    // 当前未使用，留作未来扩展（例如 report_done 时通知其他代理）
+	FinalizationNotifier FinalizationNotifier // 可选；非 nil 时 reportDone 成功后调 MarkTaskFinalized()
+	ProjectRoot          string               // 项目根目录，供 probe_directory 做路径校验
+	UserOutput           io.Writer            // 用户可见内容的输出目标；nil 时回退到 stdout
 }
 
 // Register 把 cancel_task / report_done 注册到 r。
@@ -86,10 +88,10 @@ func (g SchedulerGroup) cancelTask(ctx context.Context, args map[string]any) (st
 	reason, _ := args["reason"].(string)
 
 	// 尝试 pending→cancelled
-	err := g.Store.TransitionState(taskID, model.TaskStatusPending, model.TaskStatusCancelled)
+	err := store.TransitionStateWithCancelSource(g.Store, taskID, model.TaskStatusPending, model.TaskStatusCancelled, "scheduler")
 	if err != nil {
 		// 退而求其次：processing→cancelled
-		err = g.Store.TransitionState(taskID, model.TaskStatusProcessing, model.TaskStatusCancelled)
+		err = store.TransitionStateWithCancelSource(g.Store, taskID, model.TaskStatusProcessing, model.TaskStatusCancelled, "scheduler")
 	}
 	if err != nil {
 		return "", fmt.Errorf("取消任务失败 (id=%s): %w", taskID, err)
@@ -149,12 +151,20 @@ func (g SchedulerGroup) reportDone(ctx context.Context, args map[string]any) (st
 
 	// 2. 事实校对：构造 artifacts 报告并与 summary 并列打印
 	artifactsReport := buildSchedulerArtifactsReport(g.Store, batch)
-	fmt.Printf("\n=== 任务完成 ===\n%s\n%s================\n\n", summary, artifactsReport)
+	if g.UserOutput != nil {
+		fmt.Fprintf(g.UserOutput, "\n=== 任务完成 ===\n%s\n%s================\n\n", summary, artifactsReport)
+	} else {
+		fmt.Printf("\n=== 任务完成 ===\n%s\n%s================\n\n", summary, artifactsReport)
+	}
 
 	// 3. 清空 batch（让下一轮 reactLoop 看到干净状态）
 	if err := g.Store.ClearSchedulerBatch(currentID); err != nil {
 		// 清空失败仅记日志，不影响"已汇报"的语义
-		fmt.Printf("[scheduler-group] ClearSchedulerBatch 失败 (task=%s): %v\n", currentID, err)
+		if g.UserOutput != nil {
+			fmt.Fprintf(g.UserOutput, "[scheduler-group] ClearSchedulerBatch 失败 (task=%s): %v\n", currentID, err)
+		} else {
+			fmt.Printf("[scheduler-group] ClearSchedulerBatch 失败 (task=%s): %v\n", currentID, err)
+		}
 	}
 
 	// 4. 通知 scheduler agent "当前 reactLoop 已完成报告"，让下一轮 Execute 短路终止。

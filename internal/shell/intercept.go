@@ -5,21 +5,24 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"sync"
 
 	"agentgo/internal/agent"
 )
 
-// ApprovalRequest 灰名单命令的审批请求，由 Worker 发送到 CLI。
+// ApprovalRequest 灰名单命令的审批请求，由 Worker 发送到 CLI/TUI。
 type ApprovalRequest struct {
 	AgentID string             // 申请执行的代理 ID
 	Command string             // 待执行的命令
+	Pattern string             // 命中的灰名单原始正则模式，"永远允许" 选项的记忆粒度
 	ReplyCh chan ApprovalReply // 无缓冲，Worker 阻塞等待用户回复
 }
 
 // ApprovalReply 用户对审批请求的回复。
 type ApprovalReply struct {
-	Approved bool   // true=放行执行, false=拒绝
-	Message  string // 非空时为用户自由文本指导（此时 Approved 为 false）
+	Approved        bool   // true=放行执行, false=拒绝
+	Message         string // 非空时为用户自由文本指导（此时 Approved 为 false）
+	RememberPattern string // 非空时把该正则模式加入进程内白名单，本进程后续命中此模式不再询问
 }
 
 // MVP 阶段硬编码的默认黑名单（正则模式，匹配即拒绝）。
@@ -49,11 +52,23 @@ var DefaultGreylist = []string{
 }
 
 // CommandFilter 命令拦截器，通过正则模式匹配危险命令。
+//
+// runtimeWhitelist 是"永远允许"的进程内记忆：用户在审批时选择 RememberPattern，
+// 该模式被加入此白名单后，本进程后续命中同模式不再发审批请求。
+// 进程重启失效——这是有意的安全边界，避免风险随时间累积。
 type CommandFilter struct {
 	blackPatterns []*regexp.Regexp
 	greyPatterns  []*regexp.Regexp
 	blackRaw      []string // 原始模式字符串，用于错误消息
 	greyRaw       []string
+
+	wlMu             sync.RWMutex
+	runtimeWhitelist []runtimeWhitelistEntry
+}
+
+type runtimeWhitelistEntry struct {
+	raw string
+	re  *regexp.Regexp
 }
 
 // NewCommandFilter 创建命令拦截器。编译失败的正则模式会被跳过并记录警告。
@@ -82,19 +97,63 @@ func NewCommandFilter(blacklist, greylist []string) *CommandFilter {
 
 // Check 检查命令是否命中黑名单或灰名单。
 // 返回 action ("allow"/"block"/"approve") 和匹配的原始模式（block/approve 时非空）。
-// 黑名单优先于灰名单。
+//
+// 顺序：黑名单 > 运行时白名单 > 灰名单。
+// 黑名单优先级最高（无法被 "永远允许" 覆盖）；运行时白名单短路灰名单匹配。
 func (f *CommandFilter) Check(command string) (action string, pattern string) {
 	for i, re := range f.blackPatterns {
 		if re.MatchString(command) {
 			return "block", f.blackRaw[i]
 		}
 	}
+	f.wlMu.RLock()
+	for _, entry := range f.runtimeWhitelist {
+		if entry.re.MatchString(command) {
+			f.wlMu.RUnlock()
+			return "allow", ""
+		}
+	}
+	f.wlMu.RUnlock()
 	for i, re := range f.greyPatterns {
 		if re.MatchString(command) {
 			return "approve", f.greyRaw[i]
 		}
 	}
 	return "allow", ""
+}
+
+// AddRuntimeWhitelist 把一个正则模式加入运行时白名单。
+//
+// 重复添加同一模式（按原始字符串比对）会被忽略，不报错。
+// 编译失败的模式返回错误，调用方决定是否上抛。
+func (f *CommandFilter) AddRuntimeWhitelist(pattern string) error {
+	if pattern == "" {
+		return fmt.Errorf("pattern is empty")
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return fmt.Errorf("compile %q: %w", pattern, err)
+	}
+	f.wlMu.Lock()
+	defer f.wlMu.Unlock()
+	for _, entry := range f.runtimeWhitelist {
+		if entry.raw == pattern {
+			return nil
+		}
+	}
+	f.runtimeWhitelist = append(f.runtimeWhitelist, runtimeWhitelistEntry{raw: pattern, re: re})
+	return nil
+}
+
+// RuntimeWhitelist 返回运行时白名单的快照（原始模式字符串），供 TUI / 调试展示。
+func (f *CommandFilter) RuntimeWhitelist() []string {
+	f.wlMu.RLock()
+	defer f.wlMu.RUnlock()
+	out := make([]string, 0, len(f.runtimeWhitelist))
+	for _, entry := range f.runtimeWhitelist {
+		out = append(out, entry.raw)
+	}
+	return out
 }
 
 // WrapShellTool 包装原始 run_shell 工具函数，加入黑名单/灰名单拦截层。
@@ -120,9 +179,11 @@ func WrapShellTool(inner agent.ToolFunc, filter *CommandFilter,
 			log.Printf("[shell-filter] 灰名单审批: agent=%s, command=%q, pattern=%s", agentID, command, pattern)
 			replyCh := make(chan ApprovalReply)
 
-			// 向 CLI 发送审批请求
+			// 向 CLI/TUI 发送审批请求，附带命中的模式以支持"永远允许"
 			select {
-			case approvalCh <- ApprovalRequest{AgentID: agentID, Command: command, ReplyCh: replyCh}:
+			case approvalCh <- ApprovalRequest{
+				AgentID: agentID, Command: command, Pattern: pattern, ReplyCh: replyCh,
+			}:
 			case <-ctx.Done():
 				return "", fmt.Errorf("命令审批被取消")
 			}
@@ -130,6 +191,13 @@ func WrapShellTool(inner agent.ToolFunc, filter *CommandFilter,
 			// 阻塞等待用户回复
 			select {
 			case reply := <-replyCh:
+				if reply.RememberPattern != "" {
+					if err := filter.AddRuntimeWhitelist(reply.RememberPattern); err != nil {
+						log.Printf("[shell-filter] 永远允许失败: pattern=%q err=%v", reply.RememberPattern, err)
+					} else {
+						log.Printf("[shell-filter] 永远允许已生效: pattern=%q", reply.RememberPattern)
+					}
+				}
 				if reply.Message != "" {
 					// 用户输入了自由文本指导 → 返回给 Agent，不执行命令
 					return "", fmt.Errorf("用户指导: %s", reply.Message)

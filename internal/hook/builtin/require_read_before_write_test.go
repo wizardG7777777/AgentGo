@@ -11,9 +11,12 @@ import (
 	"agentgo/internal/store"
 )
 
-// mockHistoryStore 实现 store.StoreHookView，用于注入定制的工具调用历史。
+// mockHistoryStore 实现 store.StoreHookView。v5 Phase 6 起，require-read-before-write
+// Gate 通过 GetReadSet 查询；本 mock 同时保留 history（GetToolCallHistory 接口契约
+// 仍需满足）。测试构造时按需在 readset 字段填入 ReadInfo 模拟"已读"状态。
 type mockHistoryStore struct {
 	history []store.ToolCallRecord
+	readset map[string]model.ReadInfo
 }
 
 func (m *mockHistoryStore) GetTask(taskID string) (*model.Task, error) {
@@ -25,6 +28,17 @@ func (m *mockHistoryStore) GetToolCallHistory(taskID string) []store.ToolCallRec
 }
 func (m *mockHistoryStore) ScanPendingByEventSource(source, eventType string) []*model.Task {
 	return nil
+}
+
+func (m *mockHistoryStore) GetReadSet(taskID string) (map[string]model.ReadInfo, error) {
+	if m.readset == nil {
+		return map[string]model.ReadInfo{}, nil
+	}
+	out := make(map[string]model.ReadInfo, len(m.readset))
+	for k, v := range m.readset {
+		out[k] = v
+	}
+	return out, nil
 }
 
 // helper：在临时目录里创建一个真实存在的文件，返回路径
@@ -93,11 +107,11 @@ func TestRequireReadBeforeWriteHook_NewFileExempt(t *testing.T) {
 }
 
 func TestRequireReadBeforeWriteHook_PriorReadContinues(t *testing.T) {
-	// 经典场景：先 read_file 同一路径 → write_file 通过
+	// v5 Phase 6：先 read_file 写入 ReadSet → write_file 通过
 	target := makeRealFile(t)
 	st := &mockHistoryStore{
-		history: []store.ToolCallRecord{
-			{ToolName: "read_file", Args: map[string]any{"path": target}, Success: true},
+		readset: map[string]model.ReadInfo{
+			target: {FilePath: target},
 		},
 	}
 	h := NewRequireReadBeforeWriteHook(st)
@@ -112,13 +126,12 @@ func TestRequireReadBeforeWriteHook_PriorReadContinues(t *testing.T) {
 }
 
 func TestRequireReadBeforeWriteHook_MultiplePriorReads(t *testing.T) {
-	// 多次 read_file（含其他路径）应当仍然算"已读"
+	// 多个文件被读过：ReadSet 含目标文件 → 通过
 	target := makeRealFile(t)
 	st := &mockHistoryStore{
-		history: []store.ToolCallRecord{
-			{ToolName: "read_file", Args: map[string]any{"path": "/other/x.md"}, Success: true},
-			{ToolName: "read_file", Args: map[string]any{"path": target}, Success: true},
-			{ToolName: "read_file", Args: map[string]any{"path": target}, Success: true},
+		readset: map[string]model.ReadInfo{
+			"/other/x.md": {FilePath: "/other/x.md"},
+			target:        {FilePath: target},
 		},
 	}
 	h := NewRequireReadBeforeWriteHook(st)
@@ -133,11 +146,11 @@ func TestRequireReadBeforeWriteHook_MultiplePriorReads(t *testing.T) {
 }
 
 func TestRequireReadBeforeWriteHook_EditFilePriorReadContinues(t *testing.T) {
-	// edit_file 也接受先 read_file
+	// edit_file 也走相同 ReadSet 检查
 	target := makeRealFile(t)
 	st := &mockHistoryStore{
-		history: []store.ToolCallRecord{
-			{ToolName: "read_file", Args: map[string]any{"path": target}, Success: true},
+		readset: map[string]model.ReadInfo{
+			target: {FilePath: target},
 		},
 	}
 	h := NewRequireReadBeforeWriteHook(st)
@@ -174,12 +187,12 @@ func TestRequireReadBeforeWriteHook_NoHistoryAborts(t *testing.T) {
 }
 
 func TestRequireReadBeforeWriteHook_DifferentPathReadAborts(t *testing.T) {
-	// 读了别的文件不算 — 路径精确匹配
+	// 读了别的文件不算 — ReadSet key 精确匹配
 	target := makeRealFile(t)
 	other := filepath.Join(filepath.Dir(target), "other.md")
 	st := &mockHistoryStore{
-		history: []store.ToolCallRecord{
-			{ToolName: "read_file", Args: map[string]any{"path": other}, Success: true},
+		readset: map[string]model.ReadInfo{
+			other: {FilePath: other},
 		},
 	}
 	h := NewRequireReadBeforeWriteHook(st)
@@ -194,12 +207,12 @@ func TestRequireReadBeforeWriteHook_DifferentPathReadAborts(t *testing.T) {
 }
 
 func TestRequireReadBeforeWriteHook_FailedReadDoesNotCount(t *testing.T) {
-	// 决议：Success=false 的 read 不计入
+	// 决议：失败的 read_file 不写入 ReadSet（read-set-write Reactor 在 Reactor.Run
+	// 内 filter ev.Error != ""）。Gate 端只查 ReadSet，自然 Abort。
 	target := makeRealFile(t)
 	st := &mockHistoryStore{
-		history: []store.ToolCallRecord{
-			{ToolName: "read_file", Args: map[string]any{"path": target}, Success: false},
-		},
+		// 模拟"失败的 read 没有写入 ReadSet"——readset 不含 target
+		readset: map[string]model.ReadInfo{},
 	}
 	h := NewRequireReadBeforeWriteHook(st)
 	d := h.Run(hook.ToolHookContext{
@@ -208,17 +221,16 @@ func TestRequireReadBeforeWriteHook_FailedReadDoesNotCount(t *testing.T) {
 		Args:     map[string]any{"path": target},
 	})
 	if d.Action != hook.Abort {
-		t.Errorf("Action = %v, want Abort when prior read failed", d.Action)
+		t.Errorf("Action = %v, want Abort when prior read failed (not in ReadSet)", d.Action)
 	}
 }
 
 func TestRequireReadBeforeWriteHook_ListDirDoesNotCount(t *testing.T) {
-	// 决议：list_dir 不算"已读"
+	// 决议：list_dir 不写入 ReadSet（Reactor filter ev.Tool == "read_file"）
 	target := makeRealFile(t)
 	st := &mockHistoryStore{
-		history: []store.ToolCallRecord{
-			{ToolName: "list_dir", Args: map[string]any{"path": filepath.Dir(target)}, Success: true},
-		},
+		// 模拟"只 list_dir 过，没真正 read_file"——target 不在 ReadSet
+		readset: map[string]model.ReadInfo{},
 	}
 	h := NewRequireReadBeforeWriteHook(st)
 	d := h.Run(hook.ToolHookContext{
@@ -278,9 +290,9 @@ func TestRequireReadBeforeWriteHook_NonStringPathContinues(t *testing.T) {
 
 // ---- E2E：via real MemoryTaskStore round-trip ----
 //
-// 这是阶段 1 内**第一个**端到端测试 ToolCallRecord 写入 → hook 查询的链路。
-// 失败说明 C1 (AppendToolCall) + C3 (StoreHookView.GetToolCallHistory) +
-// C8 (RequireReadBeforeWriteHook.Run) 中至少一处链路断开。
+// v5 Phase 6 起验证 UpsertReadSet → GetReadSet → Gate.Run 的真实 store 链路。
+// read-set-write Reactor 在生产环境通过 trace.Emit 触发；本测试直接调
+// UpsertReadSet 模拟 Reactor 的最终落点，缩短链路只验 store↔Gate 一段。
 
 func TestRequireReadBeforeWriteHook_EndToEndWithRealStore(t *testing.T) {
 	// 创建真实的 MemoryTaskStore
@@ -292,14 +304,9 @@ func TestRequireReadBeforeWriteHook_EndToEndWithRealStore(t *testing.T) {
 
 	target := makeRealFile(t)
 
-	// 写入一条成功的 read_file 记录
-	if err := taskStore.AppendToolCall(task.ID, store.ToolCallRecord{
-		AgentID:  "worker-1",
-		ToolName: "read_file",
-		Args:     map[string]any{"path": target},
-		Success:  true,
-	}); err != nil {
-		t.Fatalf("AppendToolCall: %v", err)
+	// 模拟 read-set-write Reactor 写入 ReadSet
+	if err := taskStore.UpsertReadSet(task.ID, target, model.ReadInfo{FilePath: target}); err != nil {
+		t.Fatalf("UpsertReadSet: %v", err)
 	}
 
 	// 通过 hook 验证 write_file 应该被允许

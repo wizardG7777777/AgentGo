@@ -44,7 +44,7 @@ func TestSchedulerBundle_New_RegistersMailboxAlias(t *testing.T) {
 	mb := mailbox.NewRegistry(8)
 	cfg := config.DefaultConfig()
 
-	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, mb, nil, nil, nil, nil, nil)
+	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, mb, nil, nil, nil, nil, nil, nil, nil)
 	if bundle == nil || bundle.Agent == nil {
 		t.Fatal("New returned nil Bundle")
 	}
@@ -76,7 +76,7 @@ func TestSchedulerBundle_New_AgentEventTypeIsScheduler(t *testing.T) {
 	r := roster.NewMemoryRoster()
 	cfg := config.DefaultConfig()
 
-	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil)
+	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	if bundle.Agent.EventType != "__scheduler__" {
 		t.Errorf("Agent.EventType = %q, want __scheduler__", bundle.Agent.EventType)
 	}
@@ -100,7 +100,7 @@ func TestSchedulerBundle_New_ModeStoreIsImmediateByDefault(t *testing.T) {
 	r := roster.NewMemoryRoster()
 	cfg := config.DefaultConfig()
 
-	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil)
+	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	if bundle.Mode == nil {
 		t.Fatal("Bundle.Mode is nil")
 	}
@@ -151,7 +151,7 @@ func TestSchedulerBundle_EndToEnd_UserInputToReportDone(t *testing.T) {
 		},
 	}
 
-	bundle := New(s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil)
+	bundle := New(s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil, nil, nil)
 
 	// 启动 Activator + Agent
 	ctx, cancel := context.WithCancel(context.Background())

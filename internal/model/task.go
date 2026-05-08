@@ -118,7 +118,31 @@ type Task struct {
 	// Phase 3 引入；零值兼容现有调用方。
 	SchedulerBatch []string
 
+	// ReadSet 是 v5 Phase 6 引入的"任务级已读集合"显式状态
+	// （ReactiveSystem.md §5.2.1）。
+	//
+	// key 为文件**绝对路径**（与 path-boundary 规范化结果一致），value 为
+	// ReadInfo 元数据。由 read-set-write Reactor 在 read_file 成功事件触发时
+	// 异步写入；require-read-before-write Gate 直接读，O(1) 替代反查日志。
+	//
+	// 任务结束（completed / failed / cancelled）后 ReadSet 不主动清理——与
+	// Artifacts 同等待遇，留在任务对象中供事后查询；Store 历史压缩策略未来
+	// 由专门模块处理。
+	//
+	// 跨任务不共享：同一 agent 跨任务时，前一任务读过的文件不影响后一任务的
+	// 判定。跨任务"项目知识"由 MemoryManageSystem 的 Project Memory 承接。
+	ReadSet map[string]ReadInfo `json:"read_set,omitempty"`
+
 	CreatedAt   time.Time
 	StartedAt   time.Time
 	CompletedAt time.Time
+}
+
+// ReadInfo 是 Task.ReadSet 的 value 类型，记录单个文件被读取的元数据。
+type ReadInfo struct {
+	FilePath   string    `json:"file_path"`             // 冗余存储绝对路径（与 map key 一致），便于 list 输出
+	ReadAt     time.Time `json:"read_at"`               // 首次读取时间戳（首次写入时设定，后续不变）
+	Loop       int       `json:"loop,omitempty"`        // 触发首次读取的 ReactLoop 轮次
+	Hash       string    `json:"hash,omitempty"`        // 读取时刻的文件 SHA256（v5 Phase 6 暂不填，与 v4 §7 hashline 整合留作 v5.x 增量）
+	LastReadAt time.Time `json:"last_read_at,omitempty"` // 最近一次读取时间戳（多次读取覆盖）
 }

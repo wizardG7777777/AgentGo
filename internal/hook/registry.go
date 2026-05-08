@@ -10,6 +10,11 @@ import (
 
 // ToolHookRegistry 是 ToolHook 的注册与分发器。
 //
+// Deprecated（v5 Phase 1）：生产代码已迁移到 internal/gate 包的统一 Registry，
+// 本类型仅为 hook/builtin 包的单元测试保留——impl 仍保持 hook.ToolHook 接口，
+// bootstrap 注册时通过 gate.WrapToolHook 包装为 gate.Gate。新代码请使用
+// gate.Registry / gate.Gate。详见 ReactiveSystem.md §4.4。
+//
 // 并发模型：注册期（bootstrap 时）通过 Register 加入 hook，运行期（llm_executor
 // 并行 goroutine）通过 RunPre/RunPost 查询并调用 hook。Register 走写锁，
 // Run* 走读锁——Register 只在 bootstrap 期发生，运行期只读，读写竞争很小。

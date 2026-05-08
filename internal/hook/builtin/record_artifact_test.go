@@ -30,6 +30,10 @@ func (m *mockArtifactStore) ScanPendingByEventSource(source, eventType string) [
 	return nil
 }
 
+func (m *mockArtifactStore) GetReadSet(taskID string) (map[string]model.ReadInfo, error) {
+	return nil, nil
+}
+
 // ---- Interface and metadata ----
 
 func TestRecordArtifactHook_ImplementsToolHook(t *testing.T) {

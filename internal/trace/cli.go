@@ -382,6 +382,96 @@ func formatEventDetails(ev Event) string {
 		parts = append(parts, fmt.Sprintf("output_len=%d loops_used=%d", ev.OutputLen, ev.LoopsUsed))
 	case KindError:
 		parts = append(parts, fmt.Sprintf("error=%q", truncate(ev.Error, 200)))
+
+	// === v5 Phase 2 新增：task lifecycle 补 Transition 渲染 ===
+	case KindTaskClaimed:
+		if ev.Transition != nil {
+			parts = append(parts, fmt.Sprintf("prev=%s new=%s",
+				ev.Transition.PrevStatus, ev.Transition.NewStatus))
+		}
+	case KindTaskCompleted:
+		if ev.Transition != nil {
+			parts = append(parts, fmt.Sprintf("prev=%s new=%s",
+				ev.Transition.PrevStatus, ev.Transition.NewStatus))
+			if ev.Transition.Cause != "" {
+				parts = append(parts, fmt.Sprintf("cause=%s", ev.Transition.Cause))
+			}
+		}
+		if ev.OutputLen > 0 {
+			parts = append(parts, fmt.Sprintf("output_len=%d", ev.OutputLen))
+		}
+	case KindTaskFailed:
+		if ev.Transition != nil {
+			parts = append(parts, fmt.Sprintf("prev=%s new=%s retry=%d",
+				ev.Transition.PrevStatus, ev.Transition.NewStatus,
+				ev.Transition.RetryCount))
+			if ev.Transition.Cause != "" {
+				parts = append(parts, fmt.Sprintf("cause=%s", ev.Transition.Cause))
+			}
+		}
+		if ev.Reason != "" {
+			parts = append(parts, fmt.Sprintf("reason=%q", truncate(ev.Reason, 80)))
+		}
+	case KindTaskCancelled:
+		if ev.Transition != nil {
+			parts = append(parts, fmt.Sprintf("prev=%s new=%s",
+				ev.Transition.PrevStatus, ev.Transition.NewStatus))
+			if ev.Transition.CancelSource != "" {
+				parts = append(parts, fmt.Sprintf("source=%s", ev.Transition.CancelSource))
+			}
+		}
+		if ev.Reason != "" {
+			parts = append(parts, fmt.Sprintf("reason=%q", truncate(ev.Reason, 80)))
+		}
+	case KindTaskRetry:
+		if ev.Transition != nil {
+			parts = append(parts, fmt.Sprintf("prev=%s new=%s retry=%d",
+				ev.Transition.PrevStatus, ev.Transition.NewStatus,
+				ev.Transition.RetryCount))
+			if ev.Transition.Cause != "" {
+				parts = append(parts, fmt.Sprintf("cause=%s", ev.Transition.Cause))
+			}
+		}
+		if ev.AttemptNo > 0 {
+			parts = append(parts, fmt.Sprintf("attempt=%d", ev.AttemptNo))
+		}
+		if ev.Reason != "" {
+			parts = append(parts, fmt.Sprintf("reason=%q", truncate(ev.Reason, 80)))
+		}
+
+	// === v5 Phase 2 新增：Agent 状态机 + Shell 三事件 ===
+	case KindAgentStateChanged:
+		if ev.Transition != nil {
+			parts = append(parts, fmt.Sprintf("prev=%s new=%s",
+				ev.Transition.PrevState, ev.Transition.NewState))
+			if ev.Transition.Cause != "" {
+				parts = append(parts, fmt.Sprintf("cause=%s", ev.Transition.Cause))
+			}
+		}
+	case KindShellExecuted:
+		if ev.ShellExec != nil {
+			parts = append(parts, fmt.Sprintf("cmd=%q exit=%d duration=%dms outcome=%s",
+				truncate(ev.ShellExec.Command, 60),
+				ev.ShellExec.ExitCode,
+				ev.ShellExec.DurationMS,
+				ev.ShellExec.Outcome))
+		}
+	case KindShellTimeoutPending:
+		if ev.ShellTimeout != nil {
+			parts = append(parts, fmt.Sprintf("cmd=%q elapsed=%ds waits=%d",
+				truncate(ev.ShellTimeout.Command, 60),
+				ev.ShellTimeout.ElapsedSec,
+				ev.ShellTimeout.PreviousWaits))
+		}
+	case KindShellTimeoutResolved:
+		if ev.ShellTimeout != nil {
+			parts = append(parts, fmt.Sprintf("cmd=%q decision=%s",
+				truncate(ev.ShellTimeout.Command, 60),
+				ev.ShellTimeout.Decision))
+			if ev.ShellTimeout.Decision == "wait" && ev.ShellTimeout.ExtraSeconds > 0 {
+				parts = append(parts, fmt.Sprintf("extra=%ds", ev.ShellTimeout.ExtraSeconds))
+			}
+		}
 	}
 	return strings.Join(parts, " ")
 }
@@ -468,6 +558,72 @@ func detectAnomalies(events []Event) []string {
 		anomalies = append(anomalies, fmt.Sprintf(
 			"WARNING 工具调用错误率 %d%% (%d/%d) — 工具集或路径校验可能有问题",
 			errCalls*100/totalCalls, errCalls, totalCalls))
+	}
+
+	// === v5 Phase 2 新增（TraceUpgrade.md §6.3）===
+
+	// 6. 检测：agent 在 waiting_approval 累计时长 > 5min（用户长时间不批准）
+	{
+		var waitingApprovalEnter time.Time
+		var totalWaiting time.Duration
+		for _, ev := range events {
+			if ev.Kind != KindAgentStateChanged || ev.Transition == nil {
+				continue
+			}
+			if ev.Transition.NewState == "waiting_approval" {
+				waitingApprovalEnter = ev.Timestamp
+			}
+			if ev.Transition.PrevState == "waiting_approval" && !waitingApprovalEnter.IsZero() {
+				totalWaiting += ev.Timestamp.Sub(waitingApprovalEnter)
+				waitingApprovalEnter = time.Time{}
+			}
+		}
+		if totalWaiting > 5*time.Minute {
+			anomalies = append(anomalies, fmt.Sprintf(
+				"WARNING agent 累计在 waiting_approval 状态 %s（用户长时间未批准？）",
+				formatDuration(totalWaiting)))
+		}
+	}
+
+	// 7. 检测：shell timeout 总数异常（同 task 内 KindShellTimeoutPending 数量 > 3）
+	{
+		timeoutCount := 0
+		for _, ev := range events {
+			if ev.Kind == KindShellTimeoutPending {
+				timeoutCount++
+			}
+		}
+		if timeoutCount > 3 {
+			anomalies = append(anomalies, fmt.Sprintf(
+				"WARNING 同 task 内出现 %d 次 shell timeout（命令选择或 timeout 阈值可能不合理）",
+				timeoutCount))
+		}
+	}
+
+	// 8. 检测：task_failed 且 cause=panic（区别于业务级失败）
+	for _, ev := range events {
+		if ev.Kind == KindTaskFailed && ev.Transition != nil &&
+			strings.HasPrefix(ev.Transition.Cause, "react_loop_exit:panic") {
+			anomalies = append(anomalies, fmt.Sprintf(
+				"ERROR task 因 panic 失败：%s（程序错误而非业务错误，需查 panic 堆栈）",
+				truncate(ev.Reason, 120)))
+		}
+	}
+
+	// 9. 检测：cancel_source=watchdog 出现（兜底取消应该罕见）
+	{
+		watchdogCancels := 0
+		for _, ev := range events {
+			if ev.Kind == KindTaskCancelled && ev.Transition != nil &&
+				ev.Transition.CancelSource == "watchdog" {
+				watchdogCancels++
+			}
+		}
+		if watchdogCancels > 0 {
+			anomalies = append(anomalies, fmt.Sprintf(
+				"WARNING watchdog 兜底取消 %d 次（主流程可能存在卡死或泄漏）",
+				watchdogCancels))
+		}
 	}
 
 	return anomalies

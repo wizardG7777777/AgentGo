@@ -296,7 +296,7 @@ func TestP1_TraceEmit_TaskCancelled_OnCtxDone(t *testing.T) {
 
 	ag := NewAgent("agent-p1f", "code", s, r, executor, 5)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(WithCancelSource(context.Background(), "user"))
 	cancel() // 立即取消
 	ag.processTask(ctx, task.ID)
 
@@ -316,6 +316,60 @@ func TestP1_TraceEmit_TaskCancelled_OnCtxDone(t *testing.T) {
 	}
 	if found.Reason == "" {
 		t.Error("Reason 应包含 ctx.Err()，当前为空")
+	}
+	if found.Transition == nil {
+		t.Fatal("Transition 应填充，当前为 nil")
+	}
+	if found.Transition.CancelSource != "user" {
+		t.Errorf("CancelSource=%q, want user", found.Transition.CancelSource)
+	}
+}
+
+// TestTraceUpgrade_TaskFailedCause_OnRecoverableRetriesExhausted 验证可恢复错误
+// 重试预算耗尽时不会被误标为 max_loops_exceeded。
+func TestTraceUpgrade_TaskFailedCause_OnRecoverableRetriesExhausted(t *testing.T) {
+	traceDir := setupTraceWriter(t)
+	s, r, _ := setup()
+
+	task := &model.Task{Description: "recoverable exhausts retries", EventType: "code"}
+	s.PublishTask(task)
+
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		return ExecuteResult{}, &ErrRecoverable{Err: errors.New("persistent 429")}
+	}
+
+	ag := NewAgent("agent-trace-v5", "code", s, r, executor, 5)
+	ag.MaxRetries = 1
+
+	if err := s.ClaimTask("agent-trace-v5", task.ID); err != nil {
+		t.Fatalf("ClaimTask first: %v", err)
+	}
+	ag.processTask(context.Background(), task.ID)
+
+	if err := s.ClaimTask("agent-trace-v5", task.ID); err != nil {
+		t.Fatalf("ClaimTask second: %v", err)
+	}
+	ag.processTask(context.Background(), task.ID)
+
+	events := p1fixesReadTraceEvents(t, traceDir)
+	var found *trace.Event
+	for i := range events {
+		ev := events[i]
+		if ev.Kind == trace.KindTaskFailed && ev.TaskID == task.ID {
+			found = &events[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("未 emit KindTaskFailed，事件：%s", eventKinds(events))
+	}
+	if found.Transition == nil {
+		t.Fatal("Transition 应填充，当前为 nil")
+	}
+	if found.Transition.Cause != "recoverable_error_retries_exhausted" {
+		t.Errorf("Cause=%q, want recoverable_error_retries_exhausted", found.Transition.Cause)
+	}
+	if found.Transition.RetryCount != 1 {
+		t.Errorf("RetryCount=%d, want 1", found.Transition.RetryCount)
 	}
 }
 

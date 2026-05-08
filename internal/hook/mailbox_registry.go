@@ -8,8 +8,13 @@ import (
 	"sync"
 )
 
-// MailboxHookRegistry 是 MailboxHook 的注册与分发器，与 ToolHookRegistry
-// 完全独立、并列共存（不共享状态、不互相调用）。
+// MailboxHookRegistry 是 MailboxHook 的注册与分发器。
+//
+// Deprecated（v5 Phase 1）：生产代码已迁移到 internal/gate 包的统一 Registry，
+// 本类型仅为 hook/builtin 包的单元测试保留。新代码请使用 gate.Registry。
+// 详见 ReactiveSystem.md §4.4。
+//
+// MailboxHookRegistry 与 ToolHookRegistry 完全独立、并列共存（不共享状态、不互相调用）。
 //
 // 并发模型与 ToolHookRegistry 一致：注册期（bootstrap）走写锁，运行期
 // （Registry.Send / notifier.scan）走读锁。允许 nil receiver，nil 时所有

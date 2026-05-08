@@ -241,6 +241,16 @@ func (s *MemoryTaskStore) SubmitResult(agentID string, taskID string, result str
 }
 
 func (s *MemoryTaskStore) TransitionState(taskID string, from, to model.TaskStatus) error {
+	return s.transitionState(taskID, from, to, "")
+}
+
+// TransitionStateWithCancelSource 原子转换任务状态，并在进入 cancelled 终态时
+// 记录结构化取消来源，供正在执行该任务的 agent emit trace.KindTaskCancelled。
+func (s *MemoryTaskStore) TransitionStateWithCancelSource(taskID string, from, to model.TaskStatus, cancelSource string) error {
+	return s.transitionState(taskID, from, to, cancelSource)
+}
+
+func (s *MemoryTaskStore) transitionState(taskID string, from, to model.TaskStatus, cancelSource string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -262,7 +272,11 @@ func (s *MemoryTaskStore) TransitionState(taskID string, from, to model.TaskStat
 		task.Agents = make([]string, 0) // 清理残留代理，防止已取消任务中的代理数据残留
 		s.addTerminal(taskID)
 		if s.cancelRegistry != nil {
-			s.cancelRegistry.Cancel(taskID)
+			if to == model.TaskStatusCancelled && cancelSource != "" {
+				s.cancelRegistry.CancelWithSource(taskID, cancelSource)
+			} else {
+				s.cancelRegistry.Cancel(taskID)
+			}
 		}
 	}
 
@@ -535,6 +549,63 @@ func (s *MemoryTaskStore) AppendArtifact(taskID string, path string) error {
 		}
 	}
 	return nil
+}
+
+// UpsertReadSet 把一条 ReadInfo 写入任务的 ReadSet。同 absPath 已存在时
+// 仅刷新 LastReadAt（保留首次 ReadAt / Loop / Hash），不覆盖；不存在时
+// 完整插入。任务不存在返回 ErrTaskNotFound。
+//
+// v5 Phase 6 引入（ReactiveSystem.md §5.2.1.2）。由 read-set-write Reactor
+// 异步调用，失败仅记日志（Async 路径不能反向阻塞主流程）。
+//
+// 并发模型：单写锁串行化，与 AppendArtifact 同档保护。
+func (s *MemoryTaskStore) UpsertReadSet(taskID string, absPath string, info model.ReadInfo) error {
+	if absPath == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return ErrTaskNotFound
+	}
+	if task.ReadSet == nil {
+		task.ReadSet = make(map[string]model.ReadInfo)
+	}
+	if existing, ok := task.ReadSet[absPath]; ok {
+		// 已存在 → 只刷新 LastReadAt，保留首次 ReadAt / Loop / Hash
+		existing.LastReadAt = info.LastReadAt
+		task.ReadSet[absPath] = existing
+		return nil
+	}
+	// 首次写入 → 完整插入
+	if info.FilePath == "" {
+		info.FilePath = absPath
+	}
+	if info.LastReadAt.IsZero() {
+		info.LastReadAt = info.ReadAt
+	}
+	task.ReadSet[absPath] = info
+	return nil
+}
+
+// GetReadSet 返回任务的 ReadSet 浅拷贝。任务不存在返回 nil + ErrTaskNotFound；
+// ReadSet 为空时返回非 nil 的空 map（避免调用方反复 nil-check）。
+//
+// 浅拷贝策略：value 是 ReadInfo（值类型），map 拷贝即可保证调用方修改不污染
+// 内部状态。
+func (s *MemoryTaskStore) GetReadSet(taskID string) (map[string]model.ReadInfo, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return nil, ErrTaskNotFound
+	}
+	out := make(map[string]model.ReadInfo, len(task.ReadSet))
+	for k, v := range task.ReadSet {
+		out[k] = v
+	}
+	return out, nil
 }
 
 // SetTransferNote 把一份压缩的交接备忘写入任务的 TransferNote 字段。

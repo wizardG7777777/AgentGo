@@ -33,6 +33,10 @@ func (m *combinedMockStoreView) ScanPendingByEventSource(source, eventType strin
 	return result
 }
 
+func (m *combinedMockStoreView) GetReadSet(taskID string) (map[string]model.ReadInfo, error) {
+	return nil, nil
+}
+
 // ---- D4/D2: PerAgentDedup → WakeContextExpand 优先级链 ----
 
 // TestCombinedHooks_DedupPreventsDescriptionBuild 验证优先级 500 的 PerAgentDedupHook

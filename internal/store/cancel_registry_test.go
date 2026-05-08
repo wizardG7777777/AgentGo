@@ -57,6 +57,29 @@ func TestCancelRegistry_Cancel(t *testing.T) {
 	}
 }
 
+func TestCancelRegistry_CancelWithSource(t *testing.T) {
+	r := NewTaskCancelRegistry()
+	parent := context.Background()
+
+	ctx := r.GetOrCreate(parent, "task-1")
+	r.CancelWithSource("task-1", "scheduler")
+
+	select {
+	case <-ctx.Done():
+		// 预期行为
+	default:
+		t.Error("context should be cancelled after CancelWithSource()")
+	}
+	if got := r.Source("task-1"); got != "scheduler" {
+		t.Errorf("Source=%q, want scheduler", got)
+	}
+
+	r.Remove("task-1")
+	if got := r.Source("task-1"); got != "" {
+		t.Errorf("Source after Remove=%q, want empty", got)
+	}
+}
+
 func TestCancelRegistry_Remove(t *testing.T) {
 	r := NewTaskCancelRegistry()
 	parent := context.Background()

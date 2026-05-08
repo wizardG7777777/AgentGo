@@ -5,14 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"agentgo/internal/hook"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
+	"agentgo/internal/memory"
 	"agentgo/internal/model"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
@@ -63,11 +64,11 @@ type HistoryEntry struct {
 	AssistantContent string                     `json:"assistant_content"`
 	ToolCalls        []llm.ToolCall             `json:"tool_calls"`
 	ToolResults      []ToolResult               `json:"tool_results"`
-	ExtraFields      map[string]json.RawMessage `json:"extra_fields,omitempty"`     // 层 1 通用透传：assistant 消息的非标字段
-	IncomingMail     string                     `json:"incoming_mail,omitempty"`    // 非空时为收到的代理间邮件，注入为 user 角色消息
-	PromptTokens     int                        `json:"prompt_tokens,omitempty"`    // §11.7.3 实测锚定：本轮 LLM 调用的实测 prompt tokens
+	ExtraFields      map[string]json.RawMessage `json:"extra_fields,omitempty"`      // 层 1 通用透传：assistant 消息的非标字段
+	IncomingMail     string                     `json:"incoming_mail,omitempty"`     // 非空时为收到的代理间邮件，注入为 user 角色消息
+	PromptTokens     int                        `json:"prompt_tokens,omitempty"`     // §11.7.3 实测锚定：本轮 LLM 调用的实测 prompt tokens
 	CompletionTokens int                        `json:"completion_tokens,omitempty"` // §11.7.3 实测锚定：本轮 completion tokens
-	Model            string                     `json:"model,omitempty"`            // §11.7.3 模型切换基准重置：产生该条回复时使用的模型名
+	Model            string                     `json:"model,omitempty"`             // §11.7.3 模型切换基准重置：产生该条回复时使用的模型名
 }
 
 // TaskExecutor is a pluggable function that executes a task.
@@ -93,8 +94,8 @@ type Agent struct {
 	PollInterval          time.Duration
 	IdleThreshold         int // 连续空轮询退出阈值，0 表示禁用
 	CancelRegistry        *store.TaskCancelRegistry
-	CompactTokenThreshold int                               // Layer 2 触发阈值（prompt tokens），默认 80000
-	CompactKeepRecent     int                               // 压缩时保留最近 N 条历史，默认 3
+	CompactTokenThreshold int // Layer 2 触发阈值（prompt tokens），默认 80000
+	CompactKeepRecent     int // 压缩时保留最近 N 条历史，默认 3
 	// Model 是该 Agent 当前生效的模型名，用于 HistoryEntry.Model 记录。
 	// nextUpgrade_v4.md §11.7.3：跨模型实测值不可比，PredictNextPromptTokens
 	// 仅锚定当前模型一致的最近一条 PromptTokens > 0 条目。空串时退化为粗略估算。
@@ -103,13 +104,18 @@ type Agent struct {
 	// （仅 Layer 1 + Layer 2 压缩生效，与 v3 行为兼容）。详见 nextUpgrade_v4.md §11.7.5。
 	ContextLimit int
 	// TokenStats 是 Agent 级别的累计 Token 消耗（§11.7.3）。
-	TokenStats TokenStats
-	OnTaskStart           func(taskID string)               // 任务开始处理时的回调，可选
-	OnTaskEnd             func(taskID string, success bool) // 任务结束回调（defer 保证触发），可选
-	FileCache             *FileStateCache                   // Agent 级别的文件读取缓存，可选
-	Mailbox               *mailbox.Mailbox                  // 代理间通信收件箱，可选
-	MailRegistry          *mailbox.Registry                 // 邮箱注册表，用于 DrainWithAck 自动回执
-	FinalizationChecker   FinalizationChecker               // 可选；用于 finalization tool 信号检查
+	TokenStats          TokenStats
+	OnTaskStart         func(taskID string)               // 任务开始处理时的回调，可选
+	OnTaskEnd           func(taskID string, success bool) // 任务结束回调（defer 保证触发），可选
+	FileCache           *FileStateCache                   // Agent 级别的文件读取缓存，可选
+	Mailbox             *mailbox.Mailbox                  // 代理间通信收件箱，可选
+	MailRegistry        *mailbox.Registry                 // 邮箱注册表，用于 DrainWithAck 自动回执
+	FinalizationChecker FinalizationChecker               // 可选；用于 finalization tool 信号检查
+
+	// UserOutput 是用户可见内容的输出目标。非 nil 时，IsUserFacing 的自然文本完成
+	// 和 report_done 等输出会写入此处，而不是直接 fmt.Printf 到 stdout。
+	// TUI 模式下应设为一个把内容注入 Bubble Tea 消息流的 Writer。
+	UserOutput io.Writer
 
 	// IsUserFacing 标记此 agent 是否直接对话用户（典型为 scheduler）。
 	//
@@ -137,15 +143,19 @@ type Agent struct {
 	// 为 true 时，Agent 在文件写入、子任务发布或任务过半时通过 mailbox 发送进度消息。
 	ProgressNotifyEnabled bool
 
-	// AgentHookReg 是 Agent Hook 注册表，覆盖 processTask 的 4 个生命周期事件
-	// （PhaseTaskStart / PhaseLoopPre / PhaseLoopPost / PhaseTaskEnd）。
-	// nil 时全路径退化为 no-op——这是回归验证的可逆性保证。
-	AgentHookReg *hook.AgentHookRegistry
-	// HookStoreView / HookRosterView 是 Agent Hook 的只读视图接口。
-	// AgentHookReg 非 nil 时通常同时提供这两个视图，hook 通过 AgentHookContext
-	// 访问任务/占用状态。任一为 nil 时，对应视图在 hook 里为 nil，hook 需自行判空。
-	HookStoreView  hook.AgentStoreView
-	HookRosterView hook.AgentRosterView
+	// stateGuard 是 v5 Phase 3 引入的 Agent 运行时状态机字段
+	// （ReactiveSystem.md §7）。零值即 Idle，由 SetState/mustSetState 切换。
+	// 字段非导出避免外部直接读写——必须经 SetState 走合法性校验 + emit trace。
+	stateGuard stateGuard
+
+	// Memory 是 v5 Phase 1 Memory System 引入的记忆存储引用
+	// （MemoryManageSystem.md MM5）。当前承载 team_snapshot / file_awareness
+	// 两个 process-scope 上下文条目，取代 v4 时代的 TeamAwarenessHook 注入。
+	// nil 时退化为不读取/不写入（行为等价于 v4 无 team-awareness 配置）。
+	Memory memory.Store
+	// TeamRefreshInterval 是 team_snapshot / file_awareness 的轮数刷新间隔。
+	// <=0 时回退为默认 5。与 v4 TeamAwarenessConfig.SnapshotRefreshInterval 等价。
+	TeamRefreshInterval int
 }
 
 // transferNoteMaxTokens 返回实际使用的 TransferNote 预算。
@@ -157,52 +167,35 @@ func (a *Agent) transferNoteMaxTokens() int {
 	return 3000
 }
 
-// runAgentInject 构造 AgentHookContext 并调用 Registry 的 RunInject。
-// nil Registry 安全——返回空串即可。
-// Phase 只应传入 PhaseTaskStart / PhaseLoopPre（注入类阶段）。
-func (a *Agent) runAgentInject(
-	ctx context.Context,
-	phase hook.AgentHookPhase,
-	taskID string,
-	loopIdx int,
-	hasNewMail bool,
-) string {
-	if a.AgentHookReg == nil {
-		return ""
-	}
-	results := a.AgentHookReg.RunInject(hook.AgentHookContext{
-		Ctx:        ctx,
-		Phase:      phase,
-		AgentID:    a.ID,
-		TaskID:     taskID,
-		LoopIndex:  loopIdx,
-		HasNewMail: hasNewMail,
-		Store:      a.HookStoreView,
-		Roster:     a.HookRosterView,
-	})
-	return hook.MergeInjectContents(results)
-}
-
-// runAgentObserve 构造 AgentHookContext 并调用 Registry 的 RunObserve。
-// nil Registry 安全——直接 no-op。
-// Phase 只应传入 PhaseLoopPost / PhaseTaskEnd（观察类阶段）。
-func (a *Agent) runAgentObserve(
-	ctx context.Context,
-	phase hook.AgentHookPhase,
-	taskID string,
-	loopIdx int,
-) {
-	if a.AgentHookReg == nil {
+// emitTextOnlySubmissionIfNoArtifacts 在任务自然成功的两个出口（finalization 短路 +
+// react_loop_exit:natural）之后调用，判别本次提交是否属于"代理什么都没落盘，仅吐出
+// 一份文字汇报"——如是则 emit KindTextOnlySubmission 让用户 reactor 可见。
+//
+// 判别条件（全部满足）：
+//   - outputLen > 0（有文字产出）
+//   - task.Artifacts 为空（整个任务生命周期内 0 个 file_written → record-artifact
+//     reactor 未追加任何记录）
+//
+// Store=nil 或 GetTask 出错时跳过——只是少一次额外的可观察性事件，不影响主流程。
+// 不在 KindTaskSubmitted 同点判断（保持那段已稳定逻辑只触发 1 个事件的语义），
+// 而是单独走 KindTextOnlySubmission——便于 reactor `on:` 直接订阅，避免 when 表达式。
+func (a *Agent) emitTextOnlySubmissionIfNoArtifacts(taskID string, outputLen, loopsUsed int) {
+	if outputLen <= 0 || a.Store == nil {
 		return
 	}
-	a.AgentHookReg.RunObserve(hook.AgentHookContext{
-		Ctx:       ctx,
-		Phase:     phase,
-		AgentID:   a.ID,
+	got, err := a.Store.GetTask(taskID)
+	if err != nil || got == nil {
+		return
+	}
+	if len(got.Artifacts) > 0 {
+		return
+	}
+	trace.Emit(trace.Event{
+		Kind:      trace.KindTextOnlySubmission,
 		TaskID:    taskID,
-		LoopIndex: loopIdx,
-		Store:     a.HookStoreView,
-		Roster:    a.HookRosterView,
+		AgentID:   a.ID,
+		OutputLen: outputLen,
+		LoopsUsed: loopsUsed,
 	})
 }
 
@@ -282,20 +275,68 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// 进度通知：每任务级别的去重标志，在 processTask 入口初始化
 	pFlags := progressFlags{}
 
-	// Panic 恢复（Sprint 3 #5 引入）：processTask 的任意路径 panic 都会
-	// 被这里捕获，走纯机械 L3 生成 TransferNote + 终止任务，避免"panic →
-	// 任务永久 processing 卡在花名册"的历史潜在 P0。
+	// === v5 Phase 3：Agent 状态机切入（ReactiveSystem.md §7.3.4）===
+	// idle → processing 必须在所有 SetState(Terminating/Idle) 等 defer 注册前完成，
+	// 否则 defer 跑时 prev 还是 idle，转换表会拒绝 idle→terminating 走 panic。
+	a.mustSetState(AgentStateProcessing, "task_claimed:"+taskID, taskID)
+
+	// terminatingCause 由闭包捕获，panic 路径与显式分支会覆盖默认值。
+	// 默认 "react_loop_exit:natural" 覆盖正常完成（finalization / SubmitResult 后退出）；
+	// max_loops / handleFailure 等显式分支跑前会赋值；panic 路径在合并 defer 中覆盖。
+	terminatingCause := "react_loop_exit:natural"
+	taskSuccess := false
+	enteredTerminating := false
+	enterTerminating := func(cause string) {
+		if enteredTerminating {
+			return
+		}
+		terminatingCause = cause
+		enteredTerminating = true
+		a.mustSetState(AgentStateTerminating, cause, taskID)
+	}
+
+	// === defer 注册顺序（LIFO 反向 = 执行顺序）===
+	// 注册 1（执行最后）：trace.CloseTask 关闭 trace 文件
+	// 注册 2：SetState(Idle, "task_end_hook_done") — terminating → idle
+	// 注册 3：OnTaskEnd 回调（scheduler 单例路径仍使用）
+	// 注册 4（执行最先）：合并 defer：处理 panic（恢复 + L3 备忘 + FailTask + emit
+	//                     KindTaskFailed + crashReport），再 SetState(Terminating, cause)
+	defer trace.CloseTask(taskID)
+
+	defer func() {
+		// terminating → idle：Phase 3 第 6 个状态转换边
+		a.mustSetState(AgentStateIdle, "task_end_hook_done", taskID)
+	}()
+
+	// 任务结束回调（defer 确保所有退出路径都触发；目前仅 holder 清理使用）
+	if a.OnTaskEnd != nil {
+		defer func() {
+			a.OnTaskEnd(taskID, taskSuccess)
+		}()
+	}
+
+	// 注：v5 Phase 4 后期 (MM7) AgentHook 子系统整体删除——PhaseTaskStart /
+	// PhaseLoopPre / PhaseLoopPost / PhaseTaskEnd 调用点已移除。这些观察/注入
+	// 语义现在由 trace.Event + Reactor 承接（KindAgentStateChanged / KindLLMCallStart
+	// / KindTaskCompleted 等覆盖 phase 边界）；inject 类需求由 Memory System 承接。
+
+	// === 合并 defer：panic 恢复 + processing → terminating 切换 ===
+	//
+	// Sprint 3 #5 引入的 panic 恢复在 v5 Phase 3 与 SetState(Terminating) 合并：
+	//   - panic 路径需要把 terminatingCause 设为 "react_loop_exit:panic"，
+	//     这必须在 SetState(Terminating) 调用 *之前* 完成
+	//   - 解决办法：让二者共用同一个 defer——recover 后立即覆盖 cause，再走 SetState
+	//   - 注册顺序上本 defer 必须最后注册，才能在所有其它 defer 之前先跑
 	//
 	// 为什么不走 buildTransferNote(L1→L3)？
 	//   - panic 发生时 ctx 可能已取消、LLM client 状态未知
 	//   - 直接再调一次 LLM（L1）高概率二次失败
 	//   - L3 纯代码拼装够用：工具轨迹 + Artifacts + 最后响应已经构成可读的交接
-	//
-	// 注意：这条 defer 必须**最先**注册，这样它在 LIFO 的最后一层执行，
-	// 让其他 defer（trace.CloseTask / OnTaskEnd / PhaseTaskEnd）仍有机会运行。
 	defer func() {
 		if rec := recover(); rec != nil {
+			terminatingCause = "react_loop_exit:panic"
 			log.Printf("[agent %s] 任务 %s processTask panic 被恢复: %v", a.ID, taskID, rec)
+			enterTerminating(terminatingCause)
 			// 构造 L3 交接备忘
 			var toolHistory []store.ToolCallRecord
 			if a.Store != nil {
@@ -310,53 +351,44 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			if err := a.Store.FailTask(a.ID, taskID, reason); err != nil {
 				log.Printf("[agent %s] panic 恢复后 FailTask error: %v", a.ID, err)
 			}
-			// 2026-04-26 §11.8 S11：panic-recovery 路径补 KindTaskFailed emit。
-			// 此前与 terminateTask（agent.go:811）的非对称——同样调 FailTask 但 panic
-			// 路径不 emit——导致 trace 观察者对 panic 引发的任务失败完全失明。
-			// 该缺陷由 §11.8 S11 对称扫描测试首次发现并同 commit 修复。
+			// §11.8 S11：panic-recovery 路径补 KindTaskFailed emit。
 			trace.Emit(trace.Event{
 				Kind:    trace.KindTaskFailed,
 				TaskID:  taskID,
 				AgentID: a.ID,
 				Reason:  reason,
+				Transition: &trace.Transition{
+					PrevStatus: "processing",
+					NewStatus:  "failed",
+					Cause:      "react_loop_exit:panic",
+				},
 			})
 			// 尝试发送崩溃汇报（有 EventSource 时）
 			if task != nil {
 				a.sendCrashReport(task, taskID, reason)
 			}
 		}
+		// processing → terminating：Phase 3 第 5 个状态转换边
+		enterTerminating(terminatingCause)
 	}()
 
-	// Trace：记录任务被代理认领
+	// Trace：记录任务被代理认领（KindTaskClaimed 是 task 状态机事件，
+	// 与 SetState 触发的 KindAgentStateChanged 是两条不同事件流）。
 	trace.Emit(trace.Event{
 		Kind:    trace.KindTaskClaimed,
 		TaskID:  taskID,
 		AgentID: a.ID,
+		Transition: &trace.Transition{
+			PrevStatus: "pending",
+			NewStatus:  "processing",
+			Cause:      "task_claimed:" + taskID,
+		},
 	})
-
-	// Trace：CloseTask 必须在 OnTaskEnd 之后执行，以便后者发出的
-	// 收尾事件（如 file_written）仍然写入同一 trace 文件。
-	// Go defer 是 LIFO，所以这条 defer 必须**先注册**才能**最后执行**。
-	defer trace.CloseTask(taskID)
 
 	// 任务开始回调（用于 publish_subtask 跟踪当前任务 ID 等扩展点）
 	if a.OnTaskStart != nil {
 		a.OnTaskStart(taskID)
 	}
-
-	// 任务结束回调（defer 确保所有退出路径都触发；目前仅 holder 清理使用）
-	taskSuccess := false
-	if a.OnTaskEnd != nil {
-		defer func() {
-			a.OnTaskEnd(taskID, taskSuccess)
-		}()
-	}
-
-	// PhaseTaskEnd：每任务一次的观察类 hook 触发点。
-	// defer 注册顺序与 LIFO：本行在 OnTaskEnd defer 之后注册，
-	// 所以 PhaseTaskEnd 先于 OnTaskEnd 执行——hook 看到的是 task 状态
-	// 还未被 holder 清理时的"刚完成"状态。
-	defer a.runAgentObserve(ctx, hook.PhaseTaskEnd, taskID, -1)
 
 	// 清空文件缓存（任务切换时避免脏读）
 	if a.FileCache != nil {
@@ -430,12 +462,10 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		history = append(history, HistoryEntry{IncomingMail: hint})
 	}
 
-	// PhaseTaskStart：任务级 hook 注入点。
-	// 每次 processTask 入口都触发——是否真正注入由各 hook 自行决定
-	// （如 TeamAwarenessHook 在 RetryCount > 0 时返回空，避免与 LastHistory
-	// 恢复的旧快照重复）。
-	// C6 之后，硬编码的 TeamSnapshot 注入被 TeamAwarenessHook 完全取代。
-	if injected := a.runAgentInject(ctx, hook.PhaseTaskStart, taskID, -1, false); injected != "" {
+	// 任务级注入点：team_snapshot / file_awareness 走 Memory System
+	// （MemoryManageSystem.md MM6 取代 v4 TeamAwarenessHook）。
+	// MM7 之后 AgentHook 子系统整体删除——再无 PhaseTaskStart 注入路径。
+	if injected := a.injectMemoryContext(ctx, taskID, -1, false); injected != "" {
 		history = append(history, HistoryEntry{
 			IncomingMail: injected,
 		})
@@ -454,17 +484,42 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		keepRecent = 3
 	}
 
+	// 90% 预算警告：达到 floor(MaxLoops * 0.9) 时注入一次系统提示让 LLM 主动收尾。
+	// 避免 MaxLoops 兜底路径（buildTransferNote → retry）介入——那条路径成本高且
+	// 会出现 LLM 在 transfer-note 阶段调工具产生副作用的边界 case（详见 KNOWN_ISSUES）。
+	// 整数除法 9/10 自带向下取整：MaxLoops=8→7, =10→9, =12→10, =20→18。
+	budgetWarningInjected := false
+	budgetWarnAt := -1
+	if a.MaxLoops > 0 {
+		budgetWarnAt = a.MaxLoops * 9 / 10
+	}
+
 	for i := 0; i < a.MaxLoops; i++ {
 		select {
 		case <-ctx.Done():
 			// 2026-04-25 P1 #2：取消类终态 trace 事件。由外部（watchdog /
 			// cancel_task / 用户 /cancel / agent 关停）触发的 ctx 取消。
+			cancelSource := CancelSourceFromContext(ctx)
+			if cancelSource == "" && a.CancelRegistry != nil {
+				cancelSource = a.CancelRegistry.Source(taskID)
+			}
+			if cancelSource != "" {
+				terminatingCause = "react_loop_exit:cancel:" + cancelSource
+			} else {
+				terminatingCause = "react_loop_exit:cancel"
+			}
+			enterTerminating(terminatingCause)
 			trace.Emit(trace.Event{
 				Kind:    trace.KindTaskCancelled,
 				TaskID:  taskID,
 				AgentID: a.ID,
 				Loop:    i,
 				Reason:  ctx.Err().Error(),
+				Transition: &trace.Transition{
+					PrevStatus:   "processing",
+					NewStatus:    "cancelled",
+					CancelSource: cancelSource,
+				},
 			})
 			return
 		default:
@@ -481,20 +536,29 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			}
 		}
 
-		// PhaseLoopPre：每轮开头的注入类 hook 触发点。
-		// 必须在 mailbox drain 之后——hook 通过 HasNewMail 决定是否强制刷新
-		// （例如 TeamAwarenessHook 在收到消息后下一轮立即重算团队快照）。
-		// 必须在 LLM 调用之前——注入内容参与本轮 LLM 决策。
-		if injected := a.runAgentInject(ctx, hook.PhaseLoopPre, taskID, i, hasNewMail); injected != "" {
+		// 每轮开头的上下文注入点。v5 Phase 1 把团队快照刷新移交
+		// injectMemoryContext（参考 TeamRefreshInterval 与 hasNewMail）；
+		// MM7 后 AgentHookRegistry 已删除。
+		if injected := a.injectMemoryContext(ctx, taskID, i, hasNewMail); injected != "" {
 			history = append(history, HistoryEntry{
 				IncomingMail: injected,
 			})
+		}
+
+		// 90% 预算到达时一次性注入收尾提示。注入后 budgetWarningInjected 持久化在
+		// history 里，无需每轮重发——LLM 看到 <budget-warning> 就会知道该收口了。
+		if !budgetWarningInjected && budgetWarnAt > 0 && i >= budgetWarnAt {
+			history = append(history, HistoryEntry{
+				IncomingMail: fmt.Sprintf(budgetWarningPrompt, i+1, a.MaxLoops, a.MaxLoops-i),
+			})
+			budgetWarningInjected = true
 		}
 
 		// 前置检查：如果设置了 FinalizationChecker 且已 finalized，
 		// 说明上一轮调用了 finalization tool，立即终止 reactLoop。
 		if a.FinalizationChecker != nil && a.FinalizationChecker.IsFinalized() {
 			log.Printf("[agent %s] FinalizationChecker.IsFinalized()=true，终止 reactLoop (task=%s)", a.ID, taskID)
+			enterTerminating(terminatingCause)
 			// 使用上一轮保存的 lastOutput 完成任务（不进行 ExpectedArtifacts 校验，因为 finalization tool 负责最终汇报）
 			// TransferNote：成功路径直接用 lastOutput（LLM 自述已经是合理总结，不需二次压缩）
 			if lastOutput != "" {
@@ -518,10 +582,16 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					OutputLen: len(lastOutput),
 					LoopsUsed: i,
 				})
+				a.emitTextOnlySubmissionIfNoArtifacts(taskID, len(lastOutput), i)
 				trace.Emit(trace.Event{
 					Kind:    trace.KindTaskCompleted,
 					TaskID:  taskID,
 					AgentID: a.ID,
+					Transition: &trace.Transition{
+						PrevStatus: "processing",
+						NewStatus:  "completed",
+						Cause:      "finalization_short_circuit",
+					},
 				})
 			}
 			return
@@ -570,6 +640,8 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		result, execErr := a.Execute(execCtx, task, depResults, histCopy)
 
 		if execErr != nil {
+			terminatingCause = "react_loop_exit:error"
+			enterTerminating(terminatingCause)
 			a.handleFailure(task, taskID, execErr, history)
 			return
 		}
@@ -606,7 +678,11 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			//
 			// 详见 Agent.IsUserFacing 字段注释。
 			if a.IsUserFacing && !result.ToolCalled && lastOutput != "" {
-				fmt.Printf("\n=== 任务完成 ===\n%s\n================\n\n", lastOutput)
+				if a.UserOutput != nil {
+					fmt.Fprintf(a.UserOutput, "\n=== 任务完成 ===\n%s\n================\n\n", lastOutput)
+				} else {
+					fmt.Printf("\n=== 任务完成 ===\n%s\n================\n\n", lastOutput)
+				}
 			}
 
 			// 持久化 worker 的最终响应文本——无论后续校验是否通过，scheduler 都能看到
@@ -638,6 +714,8 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				})
 				// 把校验反馈作为 IncomingMail 注入历史，让下一次重试 LLM 能看见原因
 				history = appendValidationFeedback(history, check)
+				terminatingCause = "react_loop_exit:error"
+				enterTerminating(terminatingCause)
 				a.handleFailure(task, taskID, &ErrRecoverable{Err: fmt.Errorf("%s", reason)}, history)
 				return
 			}
@@ -653,6 +731,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				_ = a.Store.SetTransferNote(taskID, lastOutput)
 			}
 
+			enterTerminating(terminatingCause)
 			if err := a.Store.SubmitResult(a.ID, taskID, lastOutput); err != nil {
 				log.Printf("[agent %s] SubmitResult error: %v", a.ID, err)
 				trace.Emit(trace.Event{
@@ -670,10 +749,16 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					OutputLen: len(lastOutput),
 					LoopsUsed: i + 1,
 				})
+				a.emitTextOnlySubmissionIfNoArtifacts(taskID, len(lastOutput), i+1)
 				trace.Emit(trace.Event{
 					Kind:    trace.KindTaskCompleted,
 					TaskID:  taskID,
 					AgentID: a.ID,
+					Transition: &trace.Transition{
+						PrevStatus: "processing",
+						NewStatus:  "completed",
+						Cause:      "react_loop_exit:natural",
+					},
 				})
 			}
 			return
@@ -703,10 +788,8 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		// 进度通知：在 history append 之后、PhaseLoopPost 之前发送
 		a.progressNotify(ctx, taskID, i, result, &pFlags)
 
-		// PhaseLoopPost：每轮末尾的观察类 hook 触发点。
-		// 触发时机：tool results 已追加到 history、压缩策略尚未执行。
-		// hook 能看到本轮完整结果，但不会影响后续压缩逻辑。
-		a.runAgentObserve(ctx, hook.PhaseLoopPost, taskID, i)
+		// 注：MM7 之后 PhaseLoopPost AgentHook 调用点已删除——观察类需求走 trace.Emit
+		// （ReactLoop 的逐轮节奏可通过 KindLLMCallEnd / KindToolResult 等事件还原）。
 
 		// Layer 1: 清理旧的高输出工具结果
 		snipOldToolResults(history, keepRecent)
@@ -732,6 +815,8 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	}
 
 	reason := fmt.Sprintf("因循环上限终止: 已执行 %d 轮，部分结果: %s", a.MaxLoops, lastOutput)
+	terminatingCause = "react_loop_exit:max_loops"
+	enterTerminating(terminatingCause)
 
 	// 保存当前历史到任务，供下次重试恢复上下文
 	a.saveHistory(task, history)
@@ -747,6 +832,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// 此处显式补一次注入，loop=-1 标记"非 ReactLoop 的终止路径调用"，
 	// 便于 trace 工具区分主循环事件与交接备忘事件。
 	tnCtx := WithAgentContext(ctx, a.ID, taskID, -1)
+	tnCtx = WithNoTools(tnCtx) // L1 期望纯文本输出，物理屏蔽工具集避免副作用泄漏
 	note := a.buildTransferNote(tnCtx, task, depResults, history, a.transferNoteMaxTokens())
 	if note != "" {
 		_ = a.Store.SetTransferNote(taskID, note)
@@ -755,7 +841,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// 检查重试次数是否已耗尽，避免无限重试
 	if a.MaxRetries > 0 && task.RetryCount >= a.MaxRetries {
 		failReason := fmt.Sprintf("重试次数耗尽 (%d/%d): %s", task.RetryCount, a.MaxRetries, reason)
-		a.terminateTask(task, taskID, failReason)
+		a.terminateTask(task, taskID, failReason, "max_loops_exceeded")
 		return
 	}
 
@@ -774,6 +860,12 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			AgentID:   a.ID,
 			Reason:    "max_loops: " + reason,
 			AttemptNo: task.RetryCount,
+			Transition: &trace.Transition{
+				PrevStatus: "processing",
+				NewStatus:  "pending",
+				Cause:      "max_loops_exceeded",
+				RetryCount: task.RetryCount,
+			},
 		})
 	}
 }
@@ -808,6 +900,7 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 		// 两条路径都经过 SetTransferNote；下游依赖 / retry 接手者读到的
 		// note 格式一致（都是 <transfer-note> / <transfer-note level="raw"> 包裹的文本）。
 		tnCtx := WithAgentContext(context.Background(), a.ID, taskID, -1)
+		tnCtx = WithNoTools(tnCtx) // L1 期望纯文本输出，物理屏蔽工具集避免副作用泄漏
 		var note string
 		if overflow || willTerminate {
 			// L1 高价值路径：允许一次 LLM 调用做自然语言压缩，失败自动降级 L3
@@ -831,7 +924,7 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 			failReason := fmt.Sprintf("重试次数耗尽 (%d/%d): %s",
 				task.RetryCount, a.MaxRetries, execErr.Error())
 			log.Printf("[agent %s] 任务 %s 终止：%s", a.ID, taskID, failReason)
-			a.terminateTask(task, taskID, failReason)
+			a.terminateTask(task, taskID, failReason, "recoverable_error_retries_exhausted")
 			return
 		}
 
@@ -853,6 +946,12 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 				AgentID:   a.ID,
 				Reason:    "recoverable_error: " + execErr.Error(),
 				AttemptNo: task.RetryCount,
+				Transition: &trace.Transition{
+					PrevStatus: "processing",
+					NewStatus:  "pending",
+					Cause:      "recoverable_error",
+					RetryCount: task.RetryCount,
+				},
 			})
 		}
 	} else {
@@ -868,7 +967,7 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 		}
 		reason := diagnoseLLMError(execErr, history, a.Model)
 		log.Printf("[agent %s] 任务 %s 不可恢复错误：%s", a.ID, taskID, reason)
-		a.terminateTask(task, taskID, reason)
+		a.terminateTask(task, taskID, reason, "non_recoverable_error")
 	}
 }
 
@@ -876,17 +975,30 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 //  1. 通过 FailTask 把任务状态原子转换到 failed
 //  2. 向任务的 EventSource（发布者，通常是 scheduler 或父代理）发送一条结构化崩溃邮件，
 //     避免上游静默等待。崩溃邮件遵循固定格式："代理 X 在执行任务 Y 时崩溃，原因 Z"。
-func (a *Agent) terminateTask(task *model.Task, taskID string, reason string) {
+//
+// cause 是 trace.Transition.Cause 的结构化原因 enum（v5 Phase 2 引入），让 Reactor when
+// 条件能精确匹配 max_loops_exceeded / non_recoverable_error 等分支。
+func (a *Agent) terminateTask(task *model.Task, taskID string, reason string, cause string) {
 	if err := a.Store.FailTask(a.ID, taskID, reason); err != nil {
 		log.Printf("[agent %s] FailTask error: %v", a.ID, err)
 	}
 	// 2026-04-25 P1 #2：失败终态 trace 事件。在此前 trace 只记 task_submitted /
 	// task_completed 两种成功终态，非成功路径对 trace reader 完全不可见。
+	retryCount := 0
+	if task != nil {
+		retryCount = task.RetryCount
+	}
 	trace.Emit(trace.Event{
 		Kind:    trace.KindTaskFailed,
 		TaskID:  taskID,
 		AgentID: a.ID,
 		Reason:  reason,
+		Transition: &trace.Transition{
+			PrevStatus: "processing",
+			NewStatus:  "failed",
+			Cause:      cause,
+			RetryCount: retryCount,
+		},
 	})
 	a.sendCrashReport(task, taskID, reason)
 }

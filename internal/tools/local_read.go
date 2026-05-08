@@ -62,7 +62,7 @@ func (g LocalReadGroup) Register(r *agent.ToolRegistry) {
 	r.Register("glob_search", "按 glob 模式递归查找文件（支持 **/*_test.go）",
 		schema.Object().
 			String("pattern", "glob 模式，如 **/*_test.go", true).
-			String("root_dir", "搜索根目录，默认当前目录", false).
+			String("root_dir", "搜索根目录，如 . 或 ./reports", true).
 			Build(),
 		g.globSearch,
 	)

@@ -2,7 +2,10 @@ package hook
 
 import "agentgo/internal/mailbox"
 
-// AsMailboxRunner 把 *MailboxHookRegistry 包装为 mailbox.MailboxHookRunner，
+// AsMailboxRunner Deprecated（v5 Phase 1）：生产代码已迁移到 gate.AsMailboxRunner。
+// 本函数仅为 hook/builtin / tools 包的旧测试保留。
+//
+// 把 *MailboxHookRegistry 包装为 mailbox.MailboxHookRunner，
 // 让 mailbox.Registry 能在不直接 import internal/hook 包的前提下调用
 // hook 系统。这是 internal/hook ↔ internal/mailbox 的依赖反转：
 // hook 已经 import mailbox（取 Message 类型），mailbox 不能反向 import hook

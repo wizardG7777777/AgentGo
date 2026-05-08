@@ -45,6 +45,21 @@ type AgentKind struct {
 	TaskMaxRetries               int      `yaml:"task_max_retries" json:"task_max_retries"`
 	EnforceCompactTokenThreshold int      `yaml:"enforce_compact_token_threshold" json:"enforce_compact_token_threshold"`
 	ContextLimit                 int      `yaml:"context_limit" json:"context_limit"`
+
+	// Description 是给 scheduler 看的一句话角色描述（人工撰写的语义提示词）。
+	//
+	// 用途：scheduler 在派发任务时，把所有 kind 的 description 集成到 board snapshot
+	// 的 agent_capabilities 段，让 scheduler LLM 据此选择把任务派给哪个 kind。
+	//
+	// 写作建议：
+	//   - 单句话，动作导向。例：「广度优先的网络调研代理，不写文件，仅返回 Markdown 文字回复」
+	//   - 强调能力边界（"能 / 不能"）和典型工作风格（输出形态、深度倾向）
+	//   - 避免和 Tools 列表重复——后者已经是机器可读的离散信息
+	//
+	// 为空时降级到 bootstrap 自动生成的 "kind=X（监听 event_type=...）" 字符串，
+	// 保持向后兼容。未来 Capabilities 离散类型化时会与本字段并存（Description 用于
+	// 语义优选，Capabilities 用于硬性筛选）。
+	Description string `yaml:"description,omitempty" json:"description,omitempty"`
 }
 
 // SchedulerKind scheduler 独立块（v4 §11.5.5）。
@@ -152,6 +167,11 @@ type Config struct {
 	// ToolProfiles 命名工具集：profile_name → [tool_name, ...]
 	// 由 agents[*].profile 引用。直接列工具走 agents[*].tools 字段。
 	ToolProfiles map[string][]string `yaml:"tool_profiles" json:"tool_profiles"`
+
+	// ReactorsFile 是用户 YAML Reactor 配置文件路径（v5 Phase 5）。
+	// 空值时跳过加载；非空时由 internal/reactor/userdef.LoadFromFile 解析。
+	// 路径解析为相对当前工作目录或绝对路径，prompt 文件必须在 ProjectRoot 内。
+	ReactorsFile string `yaml:"reactors_file,omitempty" json:"reactors_file,omitempty"`
 
 	// SessionRetentionDays 是 Session 保留天数。超过此天数的已关闭 Session 将被归档。
 	SessionRetentionDays int `yaml:"session_retention_days" json:"session_retention_days"`

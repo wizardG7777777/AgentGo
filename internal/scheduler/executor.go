@@ -138,7 +138,12 @@ func (e *SchedulerExecutor) Execute(
 		} else if k.Profile != "" {
 			workerCaps = e.Cfg.ToolProfiles[k.Profile]
 		}
-		workerDesc = fmt.Sprintf("执行代理 kind=%s（默认队列，profile=%s）", k.Kind, k.Profile)
+		// 用户写的 description 优先；缺省则降级到自动拼接的 kind/profile 字串（保留向后兼容）
+		if k.Description != "" {
+			workerDesc = k.Description
+		} else {
+			workerDesc = fmt.Sprintf("执行代理 kind=%s（默认队列，profile=%s）", k.Kind, k.Profile)
+		}
 		break
 	}
 	snapshot := BuildBoardJSON(e.Store, e.Cfg, mode, trigger, SnapshotSources{

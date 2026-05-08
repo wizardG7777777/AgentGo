@@ -32,6 +32,10 @@ func (m *mockStoreView) ScanPendingByEventSource(source, eventType string) []*mo
 	return result
 }
 
+func (m *mockStoreView) GetReadSet(taskID string) (map[string]model.ReadInfo, error) {
+	return nil, nil
+}
+
 // ---- 元数据 ----
 
 func TestPerAgentDedupHook_Metadata(t *testing.T) {
