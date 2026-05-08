@@ -52,3 +52,17 @@ setting.yaml
 test_multi_agent.yaml
 setting.v4.yaml
 setting.test-concurrent.yaml
+
+# 本地烟测用配置（含明文 API key / search key），不入库
+test_invest.yaml
+test_invest_reactors.yaml
+
+# 调查报告输出目录——agent 生成的产物，不入库
+reports/
+
+# Agent 中间产出 + 历史归档目录
+artifacts/
+.archive/
+
+# 本地编译产物（go build ./. 默认输出到仓库根的同名二进制）
+/agentgo
