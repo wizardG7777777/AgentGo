@@ -1075,11 +1075,16 @@ WARNING [MailLoop] mail chain_depth 接近上限 (8/10)
 
 ---
 
-## 13. 记忆系统与触发器重构（V6 方向）
+## 13. 记忆系统与触发器重构
 
-> **状态**：📝 设计阶段，待后续讨论定稿
-> **影响范围**：`internal/hook/agent.go` 重构、`internal/memory/` 新建、`internal/trigger/` 新建、`internal/agent/agent.go` 注入点迁移
+> **状态（2026-04-30 重大调整）**：原标"V6 方向 / 设计阶段"，**Memory 部分已提升至 v5 主线**，详见 [MemoryManageSystem.md](MemoryManageSystem.md)。Trigger 部分仍归 V6，本节保留作为历史设计参考
+> **拆分后归属**：
+> - **Memory 子系统**（§13.1-§13.3 / §13.5-§13.7 中 Memory 相关内容）→ [MemoryManageSystem.md](MemoryManageSystem.md)（v5 P0 主线）
+> - **Trigger 子系统**（§13.4 AgentHook 重新定位为 Trigger / AgentPool 常驻+临时 Agent 共存）→ 仍归 V6 方向，留作未来独立模块（拟定文档名 `TriggerSystem.md`）
+>
+> **影响范围**：`internal/hook/agent.go` 重构、`internal/memory/` 新建（**v5**）、`internal/trigger/` 新建（**V6**）、`internal/agent/agent.go` 注入点迁移
 > **前置阅读**：`docs/archived/rfc-go-rewrite.md` §2.1（ADK Memory / Trigger 设计意图）、`docs/archived/rfc-proactive-scheduler-and-event-system.md` §4.3（EventBus）
+> **关联决议**：本节"D6 ReactiveSystem 原 Provider 抽象废弃"延伸至 [ReactiveSystem.md](ReactiveSystem.md) 4 类角色 → 3 类的连锁修改；详见 [MemoryManageSystem.md §6](MemoryManageSystem.md#6-与-reactivesystemmd-的协同)
 
 ---
 

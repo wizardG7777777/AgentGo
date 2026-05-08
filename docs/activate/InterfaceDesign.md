@@ -133,84 +133,138 @@ type Event struct {
 }
 ```
 
-## CLI 交互层设计（待核心定型后实现）
+## TUI 交互层设计
 
-当前 `internal/cli` 为最小可用形态，存在三项已知的体验问题。核心未定型前不动代码，仅在此固化设计意图，等核心功能稳定后对齐实现。
+CLI 已完整迁移至基于 [Bubble Tea](https://github.com/charmbracelet/bubbletea) 的 TUI（包路径 `internal/tui/`），旧 `internal/cli/` 行式实现已删除，不保留 fallback。本节固化 v1 范围与后续升级路线。
 
-### 现状问题
+### 选型理由
 
-1. **单行输入需连按两次回车才提交**。`collectMultiline` 以空行作为提交信号，单行命令也走同一路径。此决策来自 CLAUDE.md「Cross-platform constraints」——PowerShell/bash/cmd 对回车语义不一致，空行提交是跨平台最稳的契约，代价是体感迟钝。
-2. **斜杠命令仅 5 个**（`/quit /mode /status /cancel /help`），未覆盖 Claude Code / Codex 中常见的会话管理、追踪查看、文件引用等命令。
-3. **多行输入能力不显性**——实际支持多行，但与「单行也必须空行提交」耦合，用户感知不到。
+Bubble Tea 走 Elm 风格的 MVU 范式（`Update(msg) → (Model, Cmd)`），与本项目"事件驱动"的天然契合点：
 
-### 输入提交语义（目标设计）
+- `trace.Event` / `shell.ApprovalRequest` / mailbox 全是异步消息流，可以直接 `tea.Cmd` 桥接成 `tea.Msg` 输入 Update。
+- 单键绑定（审批面板 `1/2/3`）通过 `tea.KeyMsg` 直接 case 即可，比 raw mode 的跨平台胶水干净。
+- `bubbles` 子包提供成品 widget（textinput / textarea / list / viewport），后续多面板升级零成本。
+- `lipgloss` 样式系统可声明色彩 / 边框 / 布局，不写 ANSI 转义。
 
-将「多行」从默认路径挪到显式路径：
+替代项 tview 是 Widget OOP 范式，焦点切换式适合表单类应用，但事件流接入需手动 `QueueUpdateDraw`，与本项目的输入来源不匹配。
 
-- **默认单行回车即提交**，贴近主流 shell 直觉。
-- **显式多行语法**：
-  - 起始 `"""` 进入多行块，再次 `"""` 结束并提交。
-  - 或行尾 `\` 表示续行（参考 bash）。
-- **`/command` 开头的行**始终立即提交，不进入多行累积（当前代码已部分实现「遇到 /command 打断」逻辑，保留并明确化）。
-- 跨平台契约：CRLF 在边界归一化为 LF（与 CLAUDE.md 既有约束一致），不依赖任何 shell 特有的行结束语义。
+### v1 已实现范围
 
-暂不引入 readline（`chzyer/readline` / `peterh/liner`）。光标编辑、历史回溯、Ctrl-上下 属于独立增强项，涉及 Windows ConPTY 行为差异，放在后续阶段单独评估。
+**渲染模式**：inline（非 alt-screen）。Bubble Tea 只渲染输入栏与审批面板这两块"占用区"，bootstrap / scheduler / agent 既有的 `fmt.Println` 日志继续直出 stdout，与 TUI 帧上下交错但不互相干扰。
 
-### 斜杠命令扩展（目标设计）
+**输入栏**：单行 `textinput`，回车即提交。无 `"""` 多行语法（现阶段使用场景未出现强需求）。
 
-原则：**只暴露本项目已有能力，不复刻 Claude Code 的前端语义**。以下命令在对应子模块成熟后接入：
+**斜杠命令完整移植**（与旧 CLI 等价）：
 
-| 命令 | 作用 | 依赖的已有子系统 |
+| 命令 | 行为 |
+|---|---|
+| `/quit` | 关闭 TUI 并触发 ctx.Cancel |
+| `/help` | 显示命令列表 + 审批键位说明 |
+| `/status` | 打印当前活跃任务（非终态） |
+| `/cancel <id>` | 取消指定任务（先尝试 pending→cancelled，再尝试 processing→cancelled） |
+| `/mode` | 切换计划/即时模式 |
+| `/steer <agent> <msg>` | 经 mailbox 向指定代理发用户纠偏消息 |
+| `/new` | 关闭当前 Session 并新建一个 |
+| `/session` / `/session <n>` | 列出历史 Session；带序号则选择（v1 拆为两次命令，免去 awaiting-selection 子状态） |
+
+自由文本（非 `/` 开头）→ `EventUserInput` 写入 eventCh，同步记录 `SessionMgr.RecordFirstInput` + `IncrementTaskCount`。
+
+**审批面板**（核心新功能）：当 `ApprovalCh` 收到请求时，输入栏被替换为审批面板，键位：
+
+| 键 | 行为 | ApprovalReply |
 |---|---|---|
-| `/sessions` | 列出历史会话，切换/恢复 | `internal/session`（SessionManager、retention、archive 已具备） |
-| `/replay <sessionID>` | 回放指定会话 | `internal/session` replay |
-| `/trace` | 打开 trace CLI view | `internal/trace`（writer + CLI view 已存在） |
-| `/snapshot` | 当前会话快照导出 | `internal/session` snapshot |
+| `1` | 通过 | `{Approved: true}` |
+| `2` / `Esc` | 拒绝 | `{Approved: false}` |
+| `3` | 切到指导输入模式，下一次回车把输入文字作为指导发回代理 | `{Approved: false, Message: <文本>}` |
+| `4` | 永远允许（本进程内）：放行当前命令并把命中的灰名单模式加入运行时白名单 | `{Approved: true, RememberPattern: <pattern>}` |
+| `Ctrl+C` | 拒绝当前请求 + 退出 TUI | `{Approved: false}` + `tea.Quit` |
 
-**不引入**以下命令（与本项目架构不匹配，会越权或重复）：
+多个审批请求并发到达时进入队列，`activeApproval` 答复后自动出队下一个。
 
-- `@file` 文件引用——worker 拥有 `read_file` 工具，CLI 层塞文件内容会绕过 Roster / `FileStateCache` 的边界。
-- `!bash` 直执行——会绕过 `internal/shell` 的黑白名单与审批门，破坏安全边界。
-- `/compact`——三层历史压缩已自动触发，无需手动。
-- `#memory`——本项目无对等的记忆持久化模块。
+**永远允许的安全边界**（v1 设计决议）：
 
-### 输入接口草案
+- `shell.CommandFilter` 维护进程内 `runtimeWhitelist`（`AddRuntimeWhitelist` / `RuntimeWhitelist`），与黑/灰名单同源。
+- 匹配顺序：**黑名单 > 运行时白名单 > 灰名单**。黑名单不可被覆盖（`rm -rf /` 即使被永远允许也会被拦截）。
+- 粒度：记住命中的灰名单**正则模式**，不是命令字符串本身。例如选 "永远允许" `git push` 后，`git push origin main` 与 `git push --tags` 都会自动放行。
+- **不持久化**：进程退出即清空。这是有意为之的安全约束，避免风险跨会话累积。后续如确有需求，再讨论持久化到 `~/.agentgo/approved-patterns.yaml`。
+- `ApprovalRequest.Pattern` 为空（理论不应发生于灰名单审批）时，TUI 不显示 `[4]` 键位且降级为单次放行，防御性兜底。
 
-实现阶段可按如下接口组织（先固化意图，签名细节实现时再敲定）：
+### 后续升级（已知方向，按需排期）
 
-```go
-// InputReader 抽象输入来源，便于测试替换 stdin
-type InputReader interface {
-    // ReadCommand 读取一条用户命令。返回的 Input 已完成 CRLF 归一化、多行拼接、/command 打断处理。
-    ReadCommand(ctx context.Context) (Input, error)
-}
+#### 1. 多面板布局
 
-type Input struct {
-    Raw       string   // 归一化后的原始文本（LF）
-    Kind      InputKind // single / multiline / slash
-    Command   string    // Kind=slash 时的命令名，不含前导 '/'
-    Args      []string  // Kind=slash 时的参数
-}
+升级到全屏 alt-screen 模式后引入：
 
-type InputKind int
-
-const (
-    InputKindSingle    InputKind = iota // 单行自由文本
-    InputKindMultiline                  // """ ... """ 或 \ 续行累积而来
-    InputKindSlash                      // /command [args...]
-)
-
-// CommandRegistry 负责斜杠命令的注册与分发
-type CommandRegistry interface {
-    Register(name string, handler CommandHandler)
-    Dispatch(ctx context.Context, cmd string, args []string) error
-}
-
-type CommandHandler func(ctx context.Context, args []string) error
+```
+┌─ AgentGo TUI ───────────────────────────────┐
+│ Mode: plan   Tasks: 3   Loop: 12            │  顶部状态栏（lipgloss）
+├──────────────┬──────────────────────────────┤
+│ Tasks (左)   │ Trace Stream (右上)          │
+│  ▶ t1 plan   │  [agent-1] read_file foo.go  │
+│    t2 done   │  [reactor] read-set-write    │
+│    t3 wait   ├──────────────────────────────┤
+│              │ Approval (右下，焦点时)       │
+│              │  ...                         │
+├──────────────┴──────────────────────────────┤
+│ > _                                         │  底部输入行
+└─────────────────────────────────────────────┘
 ```
 
-### 实现顺序（核心稳定后）
+**前置条件**：bootstrap / scheduler / agent / runner 等当前直接写 stdout 的日志全部改走 `trace.Emit` 或 logger。否则切到 alt-screen 后日志被 TUI 帧吞掉。
 
-1. 先落单行默认提交 + 显式多行语法（低风险、收益最大）。
-2. 再接 `/sessions` `/replay` `/trace` `/snapshot`——均是「暴露已有能力」，不新增业务逻辑。
-3. readline 类增强独立立项，不与上述耦合。
+子 Model 拆分：
+- `tasksPanel`（list bubble，订阅 store 任务变更）
+- `tracePanel`（viewport bubble，订阅 `trace.DefaultDispatcher` 的旁路 channel）
+- `approvalPanel`（v1 已实现，迁过来即可）
+- `inputBar`（v1 已实现）
+
+#### 2. trace stream 旁路
+
+在 `internal/trace` 加一个观察者订阅接口：
+
+```go
+type Subscriber interface {
+    OnEvent(ev Event)
+}
+func Subscribe(s Subscriber) (unsubscribe func())
+```
+
+TUI 启动时订阅，把 `trace.Event` 转 `tea.Msg` 推到 trace 面板。要点是订阅是只读旁路，不改变 reactor / hook 主链路。
+
+#### 3. 输入体验增强
+
+| 项 | 说明 |
+|---|---|
+| `"""` 多行块 | 起始/结束都用 `"""`，中间累积；与 `/command` 互斥 |
+| 行尾 `\` 续行 | 参考 bash，覆盖一行临时拼接场景 |
+| 历史回溯 | 上下方向键调出最近 N 条命令；可考虑 `bubbles/list` 弹出选择器 |
+| 命令补全 | `/` + Tab 列出所有 slash 命令；`/cancel <Tab>` 列出当前任务 ID |
+| readline 类编辑 | Ctrl-A / Ctrl-E / Ctrl-W 等 emacs 键位（textinput 已支持大部分） |
+
+跨平台契约：CRLF 边界归一化为 LF（与 CLAUDE.md 既有约束一致）。
+
+#### 4. 命令扩展
+
+原则：**只暴露本项目已有能力，不复刻 Claude Code 前端语义**。
+
+| 命令 | 作用 | 依赖 |
+|---|---|---|
+| `/replay <sessionID>` | 回放指定 Session | `internal/session` replay |
+| `/trace` | 在面板内查看 trace 历史 | `internal/trace` |
+| `/snapshot` | 当前 Session 快照导出 | `internal/session` snapshot |
+| `/readset [taskID]` | 查看任务级已读集合 | `store.GetReadSet`（Phase 6 已具备） |
+| `/memory [scope]` | 查看 ScopeProcess 记忆 | `internal/memory`（Phase 1 已具备） |
+
+**明确不引入**：
+
+- `@file` 文件引用——worker 有 `read_file` 工具，CLI 注入文件内容会绕过 Roster / ReadSet 的边界。
+- `!bash` 直执行——会绕过 `internal/shell` 黑白名单与审批门。
+- `/compact`——历史压缩已自动触发。
+- `#memory` 写入——记忆写入由 Reactor / hook 决定，不暴露用户自由写入面。
+
+### 实现优先级（建议顺序）
+
+1. **trace stream 旁路 + viewport 面板**——把 stdout 日志彻底从主帧解放出来，是后续 alt-screen 的前置。
+2. **多面板 + alt-screen**——前提是上一步完成（否则 stdout 日志会丢）。
+3. **输入增强**（多行 / 历史 / 补全）——独立小项可随时穿插。
+4. **新命令**（`/replay /trace /snapshot /readset /memory`）——按需接入。
