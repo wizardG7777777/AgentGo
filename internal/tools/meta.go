@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -202,7 +203,7 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 	// 失败仅记日志，不阻塞用户的任务发布——batch 跟踪是辅助能力。
 	if g.BatchTracker != nil {
 		if err := g.BatchTracker.AppendBatch(task.ID); err != nil {
-			fmt.Printf("[meta] BatchTracker.AppendBatch 失败 (task=%s): %v\n", task.ID, err)
+			log.Printf("[meta] BatchTracker.AppendBatch 失败 (task=%s): %v", task.ID, err)
 		}
 	}
 

@@ -681,7 +681,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				if a.UserOutput != nil {
 					fmt.Fprintf(a.UserOutput, "\n=== 任务完成 ===\n%s\n================\n\n", lastOutput)
 				} else {
-					fmt.Printf("\n=== 任务完成 ===\n%s\n================\n\n", lastOutput)
+					log.Printf("=== 任务完成 ===\n%s\n================", lastOutput)
 				}
 			}
 

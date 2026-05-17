@@ -4,7 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"agentgo/internal/agent"
 	"agentgo/internal/mailbox"
@@ -149,12 +153,33 @@ func (g SchedulerGroup) reportDone(ctx context.Context, args map[string]any) (st
 		)
 	}
 
-	// 2. 事实校对：构造 artifacts 报告并与 summary 并列打印
+	// 2. 事实校对：构造 artifacts 报告
 	artifactsReport := buildSchedulerArtifactsReport(g.Store, batch)
+
+	// 3. 长内容自动落盘，TUI 只显示摘要
+	displaySummary := summary
+	reportPath := ""
+	const maxTerminalLines = 30
+	summaryLines := strings.Split(summary, "\n")
+	if len(summaryLines) > maxTerminalLines {
+		reportPath = filepath.Join(g.ProjectRoot, "reports", fmt.Sprintf("report-%s.md", time.Now().Format("20060102-150405")))
+		if err := os.MkdirAll(filepath.Dir(reportPath), 0755); err == nil {
+			if err := os.WriteFile(reportPath, []byte(summary), 0644); err == nil {
+				displaySummary = fmt.Sprintf(
+					"📄 完整报告已保存至: %s\n\n📋 摘要（前 %d 行）:\n%s\n\n[... %d 行省略，见上方文件]",
+					reportPath, maxTerminalLines,
+					strings.Join(summaryLines[:maxTerminalLines], "\n"),
+					len(summaryLines)-maxTerminalLines,
+				)
+			}
+		}
+	}
+
+	// 4. 输出到用户可见终端
 	if g.UserOutput != nil {
-		fmt.Fprintf(g.UserOutput, "\n=== 任务完成 ===\n%s\n%s================\n\n", summary, artifactsReport)
+		fmt.Fprintf(g.UserOutput, "\n=== 任务完成 ===\n%s\n%s================\n\n", displaySummary, artifactsReport)
 	} else {
-		fmt.Printf("\n=== 任务完成 ===\n%s\n%s================\n\n", summary, artifactsReport)
+		log.Printf("=== 任务完成 ===\n%s\n%s================", displaySummary, artifactsReport)
 	}
 
 	// 3. 清空 batch（让下一轮 reactLoop 看到干净状态）
@@ -163,7 +188,7 @@ func (g SchedulerGroup) reportDone(ctx context.Context, args map[string]any) (st
 		if g.UserOutput != nil {
 			fmt.Fprintf(g.UserOutput, "[scheduler-group] ClearSchedulerBatch 失败 (task=%s): %v\n", currentID, err)
 		} else {
-			fmt.Printf("[scheduler-group] ClearSchedulerBatch 失败 (task=%s): %v\n", currentID, err)
+			log.Printf("[scheduler-group] ClearSchedulerBatch 失败 (task=%s): %v", currentID, err)
 		}
 	}
 

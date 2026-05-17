@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -177,7 +178,7 @@ func (l *ArtifactLog) Replay() (map[string][]string, error) {
 		var rec artifactLogRecord
 		if err := json.Unmarshal(line, &rec); err != nil {
 			// 格式错误：跳过这一行，继续
-			fmt.Fprintf(os.Stderr, "[ArtifactLog] WARN 第 %d 行 JSON 解析失败，跳过: %v\n", lineNum, err)
+			log.Printf("[ArtifactLog] WARN 第 %d 行 JSON 解析失败，跳过: %v", lineNum, err)
 			continue
 		}
 		if rec.TaskID == "" || rec.Path == "" {

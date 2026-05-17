@@ -55,7 +55,9 @@ type System struct {
 	ArtifactLog  *store.ArtifactLog         // Artifacts 持久化日志，Shutdown 时需 Close；nil 表示持久化已禁用
 	SessionMgr   *session.SessionManager    // Session 管理器，nil 表示无 Session 模式
 	SpawnManager *spawn.Manager             // v5 Phase 5 S5+S6：ad-hoc agent 生命周期管理器
-	StatusCh     chan string                // TUI 系统消息通道；Bootstrap 创建，RunCLI 消费
+	StatusCh     chan string                // TUI 日志/进度消息通道；Bootstrap 创建，RunCLI 消费
+	OutputCh     chan string                // TUI Agent 用户可见输出通道（result 卡片），与日志分离
+	LogFile      *os.File                   // system.log 句柄，Bootstrap 打开，Shutdown 关闭
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
 }
@@ -108,6 +110,18 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 		sessMgr.EnableHistoryLog()
 	}
 
+	// 初始化 system.log，启动阶段诊断日志全部收敛到文件
+	logFilePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "system.log")
+	if sessMgr != nil && sessMgr.Current() != nil {
+		logFilePath = filepath.Join(sessMgr.LogDir(), "system.log")
+	}
+	logFile, logErr := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if logErr == nil {
+		log.SetOutput(logFile)
+	} else {
+		log.Printf("[bootstrap] 无法创建 system.log: %v", logErr)
+	}
+
 	// Step 1.5: 初始化 trace 系统（每任务一份 JSONL 文件，保留最近 100 个）
 	// trace 写入失败仅打印 warning，不中断主流程
 	traceDir := filepath.Join(cfg.ProjectRoot, ".agentgo", "traces")
@@ -122,7 +136,7 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 		fmt.Printf("[启动] WARNING: trace 系统初始化失败 (dir=%s): %v\n", traceDir, traceErr)
 	} else {
 		trace.SetDefault(traceWriter)
-		fmt.Printf("[启动] Trace 系统已启动 (dir=%s, 保留最近 100 个任务)\n", traceDir)
+		log.Printf("[启动] Trace 系统已启动 (dir=%s, 保留最近 100 个任务)", traceDir)
 	}
 
 	// Step 1.6: 初始化 prompt dumper（仅在 AGENTGO_DUMP_PROMPTS=1 时启用）
@@ -132,7 +146,7 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 		fmt.Printf("[启动] WARNING: prompt dumper 初始化失败: %v\n", dumperErr)
 	} else if dumpEnabled {
 		trace.SetDefaultDumper(dumper)
-		fmt.Println("[启动] Prompt dump 已启用 (AGENTGO_DUMP_PROMPTS=1)")
+		log.Println("[启动] Prompt dump 已启用 (AGENTGO_DUMP_PROMPTS=1)")
 	}
 
 	// Step 2: 初始化公告板
@@ -140,7 +154,7 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 	taskStore := store.NewMemoryTaskStore(eventCh, cfg.Infra.Store.FIFOLimit, cfg.Infra.Store.DefaultConcurrency, cfg.Infra.Store.DefaultTimeoutSec)
 	cancelRegistry := store.NewTaskCancelRegistry()
 	taskStore.SetCancelRegistry(cancelRegistry)
-	fmt.Println("[启动] 公告板初始化完成")
+	log.Println("[启动] 公告板初始化完成")
 
 	// Step 2.3: Artifacts 持久化（JSONL 追加日志，2026-04-12 持久化专题起头）
 	//
@@ -175,10 +189,10 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 		//   (c) 为未来的 Task 状态持久化专题提供 ready-to-go 的存储组件
 		restoredTasks, restoredArts := taskStore.RestoreArtifacts(rebuilt)
 		if restoredTasks > 0 {
-			fmt.Printf("[启动] Artifact 持久化已启用 (log=%s，恢复 %d 个任务 / %d 个 artifact)\n",
+			log.Printf("[启动] Artifact 持久化已启用 (log=%s，恢复 %d 个任务 / %d 个 artifact)",
 				artifactLog.Path(), restoredTasks, restoredArts)
 		} else {
-			fmt.Printf("[启动] Artifact 持久化已启用 (log=%s，日志中 %d 行记录，当前 store 中无匹配任务可恢复)\n",
+			log.Printf("[启动] Artifact 持久化已启用 (log=%s，日志中 %d 行记录，当前 store 中无匹配任务可恢复)",
 				artifactLog.Path(), len(rebuilt))
 		}
 	}
@@ -208,15 +222,15 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 			return nil, fmt.Errorf("注册 %s 失败: %w", h.Name(), err)
 		}
 	}
-	fmt.Println("[启动] Tool 域 Gate 注册完成（path-boundary, validate-expected-hash, validate-line-anchors, require-read-before-write, dependency-validator, enforce-expected-artifacts）")
+	log.Println("[启动] Tool 域 Gate 注册完成（path-boundary, validate-expected-hash, validate-line-anchors, require-read-before-write, dependency-validator, enforce-expected-artifacts）")
 
 	// Step 3: 初始化花名册
 	r := roster.NewMemoryRoster()
-	fmt.Println("[启动] 花名册初始化完成")
+	log.Println("[启动] 花名册初始化完成")
 
 	// Step 3.5: 初始化邮箱注册表（v4：缓冲区大小是系统级常量，不暴露 yaml）
 	mbRegistry := mailbox.NewRegistry(mailbox.DefaultInboxSize)
-	fmt.Println("[启动] 邮箱注册表初始化完成")
+	log.Println("[启动] 邮箱注册表初始化完成")
 
 	// Step 3.5.1: 将 Session 的 HistoryEmitter 注入 store/roster/mailbox，
 	// 否则 history.jsonl 永远不会被写入（v3 §9.9 阶段三装配补齐）。
@@ -224,7 +238,7 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 		taskStore.SetHistoryEmitter(sessMgr.History())
 		r.SetHistoryEmitter(sessMgr.History())
 		mbRegistry.SetHistoryEmitter(sessMgr.History())
-		fmt.Println("[启动] Session history.jsonl 事件发射器已注入（store/roster/mailbox）")
+		log.Println("[启动] Session history.jsonl 事件发射器已注入（store/roster/mailbox）")
 	}
 
 	// Step 3.6: 注册 Mailbox 域 Gate（v5 Phase 1 与 Tool 域 Gate 共用 gateReg）
@@ -240,7 +254,7 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 		}
 	}
 	mbRegistry.AttachHookRunner(gate.AsMailboxRunner(gateReg))
-	fmt.Printf("[启动] Mailbox 域 Gate 注册完成（chain-depth-limit max=%d, per-agent-dedup, wake-worthy-filter, wake-context-expand）\n", mailbox.DefaultChainMaxDepth)
+	log.Printf("[启动] Mailbox 域 Gate 注册完成（chain-depth-limit max=%d, per-agent-dedup, wake-worthy-filter, wake-context-expand)", mailbox.DefaultChainMaxDepth)
 
 	// Step 3.7: 初始化 Agent Hook 系统（v5 Phase 1 后空壳运行）。
 	//
@@ -260,7 +274,7 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 	// ScopeProcess 内存存储；所有 worker / scheduler / explorer agent 共用同一实例，
 	// 让 file_awareness 等全局共享条目能被读侧看到统一视图。
 	memoryStore := memory.NewProcessStore()
-	fmt.Println("[启动] Memory System 初始化完成（process scope 内存存储）")
+	log.Println("[启动] Memory System 初始化完成（process scope 内存存储）")
 
 	// Step 3.9: 初始化 Reactor 系统（v5 Phase 4，ReactiveSystem.md §6.6）。
 	// trace.Emit 派发到本 Registry——Reactor 在状态变化后程序化响应（不可决策）。
@@ -327,9 +341,9 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 		if len(desc) > 80 {
 			desc = desc[:80] + "…"
 		}
-		fmt.Printf("[启动] 特化代理已注册: EventType=%s, description=%s\n", sa.EventType, desc)
+		log.Printf("[启动] 特化代理已注册: EventType=%s, description=%s", sa.EventType, desc)
 	}
-	fmt.Printf("[启动] Agent 注册表初始化完成（%d 个特化代理）\n", len(agentRegistry.Specialized()))
+	log.Printf("[启动] Agent 注册表初始化完成（%d 个特化代理）", len(agentRegistry.Specialized()))
 
 	// Step 6: 创建看门狗（先于 scheduler 创建——scheduler 需要 approvalCh，但 watchdog 不需要）
 	w := watchdog.New(taskStore, cfg, eventCh, r, mbRegistry)
@@ -353,7 +367,7 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 	searchProvider, fellBack, fallbackReason := webtool.NewProviderWithDefault(
 		cfg.SearchAPIProvider, cfg.SearchAPIURL, cfg.SearchAPIKey)
 	if fellBack {
-		fmt.Printf("[启动] web_search: %s，已回落到 %s（工具仍可用，但能力可能降级）\n",
+		log.Printf("[启动] web_search: %s，已回落到 %s（工具仍可用，但能力可能降级）",
 			fallbackReason, searchProvider.Name())
 	}
 	// fallback 后 DDG 不需要 apiURL/apiKey；显式置空避免误导后续维护者。
@@ -369,7 +383,7 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 
 	// 打印启动日志
 	if unavailable := toolHealth.UnavailableTools(); len(unavailable) == 0 {
-		fmt.Println("[启动] 工具可用性探测完成（全部可用）")
+		log.Println("[启动] 工具可用性探测完成（全部可用）")
 	} else {
 		for _, r := range toolHealth.Results() {
 			if !r.Available {
@@ -381,8 +395,9 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 	// Step 7.5: 创建命令审批通道（Worker→CLI）
 	approvalCh := make(chan shell.ApprovalRequest, 8)
 
-	// Step 4.5: 创建 TUI 系统消息通道（v5 TUI 修复：统一用户可见输出到 Bubble Tea）
-	statusCh := make(chan string, 64)
+	// Step 4.5: 创建 TUI 双通道（日志与 Agent 输出分离，避免竞争）
+	statusCh := make(chan string, 1024) // 日志/进度消息
+	outputCh := make(chan string, 256)  // Agent 用户可见输出（result 卡片）
 
 	// Step 5: 创建调度器（Phase 3：scheduler 是 agent.Agent 实例 + Activator + ModeStore）
 	// 工具集 = Worker 全集 + SchedulerGroup，可以读文件 / 搜索 / 查网页 / 跑 shell。
@@ -390,7 +405,7 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 	sched := scheduler.New(
 		taskStore, r, schedulerLLM, eventCh, cfg, cancelRegistry, mbRegistry, approvalCh,
 		gateReg, storeView, recordToolCall, agentRegistry, memoryStore,
-		&chanWriter{ch: statusCh},
+		&chanWriter{ch: outputCh},
 	)
 	sched.SchedulerExec.ToolHealth = toolHealth
 
@@ -414,7 +429,7 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 		SearchProvider:        searchProvider,
 		ShellFilter:           shellFilter,
 		ApprovalCh:            approvalCh,
-		UserOutput:            &chanWriter{ch: statusCh},
+		UserOutput:            &chanWriter{ch: outputCh},
 		TaskEndCallbacks:      taskEndReactor,
 		ProjectRoot:           cfg.ProjectRoot,
 		RosterWaitTimeoutSec:  cfg.Infra.Roster.WaitTimeoutSec,
@@ -439,7 +454,7 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 			kindDeps.LLMClient = kindLLM
 			rn := runner.New(rt, kindDeps)
 			runners = append(runners, rn)
-			fmt.Printf("[启动] Runner %s 已启动 [kind=%s, model=%s]\n",
+			log.Printf("[启动] Runner %s 已启动 [kind=%s, model=%s]",
 				rt.InstanceID, kind.Kind, rt.Model)
 		}
 	}
@@ -499,11 +514,11 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 				return nil, fmt.Errorf("注册用户 Reactor %q 失败: %w", r.Name(), err)
 			}
 		}
-		fmt.Printf("[启动] 用户 Reactor 已加载（%d 个，来自 %s）\n", len(userReactors), cfg.ReactorsFile)
+		log.Printf("[启动] 用户 Reactor 已加载（%d 个，来自 %s）", len(userReactors), cfg.ReactorsFile)
 	}
 
 	trace.SetDefaultDispatcher(reactorReg)
-	fmt.Println("[启动] Reactor 系统初始化完成（record-artifact, task-end-callback, trace-history-event, read-set-write, spawn-manager）")
+	log.Println("[启动] Reactor 系统初始化完成（record-artifact, task-end-callback, trace-history-event, read-set-write, spawn-manager）")
 
 	// Step 9: 创建邮差通知器
 	notifierInterval := time.Duration(cfg.Infra.MailNotifier.IntervalSec) * time.Second
@@ -525,6 +540,8 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 		ApprovalCh:      approvalCh,
 		SpawnManager:    spawnMgr,
 		StatusCh:        statusCh,
+		OutputCh:        outputCh,
+		LogFile:         logFile,
 	}
 
 	return sys, nil
@@ -553,7 +570,7 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
 		defer s.wg.Done()
 		s.Scheduler.Agent.Run(ctx)
 	}()
-	fmt.Println("[启动] 调度器已启动 (agent + activator)")
+	log.Println("[启动] 调度器已启动 (agent + activator)")
 
 	// Step 6: 启动看门狗
 	s.wg.Add(1)
@@ -561,7 +578,7 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
 		defer s.wg.Done()
 		s.runWatchdogWithRecover(ctx)
 	}()
-	fmt.Println("[启动] 看门狗已启动")
+	log.Println("[启动] 看门狗已启动")
 
 	// Step 6.5: 启动邮差通知器（默认开启；可通过 infra.mail_notifier.enabled=false 关闭）
 	if s.Config.Infra.MailNotifier.Enabled {
@@ -570,9 +587,9 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
 			defer s.wg.Done()
 			s.MailNotifier.Run(ctx)
 		}()
-		fmt.Println("[启动] 邮差通知器已启动")
+		log.Println("[启动] 邮差通知器已启动")
 	} else {
-		fmt.Println("[启动] 邮差通知器已禁用 (infra.mail_notifier.enabled=false) — 邮件不会自动唤醒空闲代理")
+		log.Println("[启动] 邮差通知器已禁用 (infra.mail_notifier.enabled=false) — 邮件不会自动唤醒空闲代理")
 	}
 
 	// Step 7+8: 启动所有 v4 Runner（worker / explorer / 自定义 kind 统一走这条路径）
@@ -584,7 +601,7 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
 			rn.Run(ctx)
 		}()
 	}
-	fmt.Printf("[启动] kind-based agents 已启动 (%d 个 runner 实例)\n", len(s.Runners))
+	log.Printf("[启动] kind-based agents 已启动 (%d 个 runner 实例)", len(s.Runners))
 
 	fmt.Println("[启动] 系统就绪，等待用户输入")
 }
@@ -629,10 +646,7 @@ type chanWriter struct {
 }
 
 func (w *chanWriter) Write(p []byte) (int, error) {
-	select {
-	case w.ch <- string(p):
-	default:
-	}
+	w.ch <- string(p)
 	return len(p), nil
 }
 
@@ -641,18 +655,12 @@ func (w *chanWriter) Write(p []byte) (int, error) {
 // reader/writer 为兼容旧 main 签名保留；bubbletea 直接接管 stdin/stdout，
 // 这两个参数在 v1 不再被读取。
 func (s *System) RunCLI(ctx context.Context, reader io.Reader, writer io.Writer) {
-	// 将运行时 log 重定向到文件，同时通过 channel 复制到 TUI 的消息区域。
-	// 启动阶段的 fmt.Println 不受影响——它们只在系统初始化时打印一次。
-	logFilePath := filepath.Join(s.Config.ProjectRoot, ".agentgo", "system.log")
-	if s.SessionMgr != nil && s.SessionMgr.Current() != nil {
-		logFilePath = filepath.Join(s.SessionMgr.LogDir(), "system.log")
-	}
+	// 将运行时 log 重定向到文件 + TUI 消息区域。
+	// Bootstrap 期间 log 已写入同一文件；此处复用句柄，追加 channel 旁路。
 	oldLogWriter := log.Writer()
-	if logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
-		log.SetOutput(&tuiLogWriter{file: logFile, status: s.StatusCh})
+	if s.LogFile != nil {
+		log.SetOutput(&tuiLogWriter{file: s.LogFile, status: s.StatusCh})
 		defer log.SetOutput(oldLogWriter)
-	} else {
-		log.Printf("[bootstrap] 无法重定向 log 到文件 %s: %v", logFilePath, err)
 	}
 
 	deps := tui.Deps{
@@ -664,6 +672,7 @@ func (s *System) RunCLI(ctx context.Context, reader io.Reader, writer io.Writer)
 		ApprovalCh:  s.ApprovalCh,
 		SessionMgr:  s.SessionMgr,
 		SystemMsgCh: s.StatusCh,
+		OutputCh:    s.OutputCh,
 	}
 	if err := tui.Run(ctx, deps); err != nil {
 		fmt.Fprintf(os.Stderr, "[TUI] 异常退出: %v\n", err)
@@ -699,6 +708,12 @@ func (s *System) Shutdown() {
 	if s.SessionMgr != nil {
 		if err := s.SessionMgr.Close(); err != nil {
 			fmt.Printf("[关闭] WARNING: Session 关闭失败: %v\n", err)
+		}
+	}
+	// 关闭 system.log
+	if s.LogFile != nil {
+		if err := s.LogFile.Close(); err != nil {
+			fmt.Printf("[关闭] WARNING: system.log 关闭失败: %v\n", err)
 		}
 	}
 	fmt.Println("[关闭] 系统已停止")

@@ -23,13 +23,13 @@ func (m Model) updateApproval(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "1":
 		m.activeApproval.ReplyCh <- shell.ApprovalReply{Approved: true}
-		m.appendMsg(fmt.Sprintf("[审批] 已放行: %s", m.activeApproval.Command))
+		m.appendMsg(fmt.Sprintf("[审批] 已放行: %s", m.activeApproval.Command), msgInfo)
 		m.advanceApproval()
 		return m, nil
 
 	case "2", "esc":
 		m.activeApproval.ReplyCh <- shell.ApprovalReply{Approved: false}
-		m.appendMsg(fmt.Sprintf("[审批] 已拒绝: %s", m.activeApproval.Command))
+		m.appendMsg(fmt.Sprintf("[审批] 已拒绝: %s", m.activeApproval.Command), msgInfo)
 		m.advanceApproval()
 		return m, nil
 
@@ -45,16 +45,16 @@ func (m Model) updateApproval(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		pattern := m.activeApproval.Pattern
 		m.activeApproval.ReplyCh <- shell.ApprovalReply{Approved: true, RememberPattern: pattern}
 		if pattern != "" {
-			m.appendMsg(fmt.Sprintf("[审批] 已放行并记住模式: %s", pattern))
+			m.appendMsg(fmt.Sprintf("[审批] 已放行并记住模式: %s", pattern), msgInfo)
 		} else {
-			m.appendMsg(fmt.Sprintf("[审批] 已放行（无模式可记忆）: %s", m.activeApproval.Command))
+			m.appendMsg(fmt.Sprintf("[审批] 已放行（无模式可记忆）: %s", m.activeApproval.Command), msgInfo)
 		}
 		m.advanceApproval()
 		return m, nil
 
 	case "ctrl+c":
 		m.activeApproval.ReplyCh <- shell.ApprovalReply{Approved: false}
-		m.appendMsg("[退出] Ctrl-C，已拒绝待审批请求")
+		m.appendMsg("[退出] Ctrl-C，已拒绝待审批请求", msgInfo)
 		m.deps.CancelFn()
 		return m, tea.Quit
 	}

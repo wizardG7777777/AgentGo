@@ -1,24 +1,27 @@
-# AgentGo v4 配置文件示例
-# 将此文件复制为 config.yaml 并根据需要自定义
+# AgentGo v5 配置文件示例
+# 将此文件复制为 config.yaml（或任意路径，通过 -c 指定）并按需修改。
 #
-# v4 唯一受支持的格式：嵌套 schema（llm: / tool_profiles: / scheduler: / agents: / infra:）
-# 旧 v3 顶层字段（如 worker_count / llm_base_url / agent_max_loops 等）在解析时会被忽略。
-# 详见 docs/activate/nextUpgrade_v4.md §11.3
+# v5 沿用 v4 的嵌套 schema（llm: / tool_profiles: / scheduler: / agents: / infra:），
+# 新增可选的 reactors_file: 字段指向用户 reactor YAML（见文末与 docs/yaml-config-guide.md）。
+# v3 顶层旧字段（worker_count / llm_base_url / agent_max_loops 等）会被解析层静默忽略，
+# 不报错也不生效。撰写规范详见 docs/yaml-config-guide.md。
 
 # ============================================================
 # LLM 默认基础设施（per-kind 可通过 agents[*].model 覆盖）
 # ============================================================
 llm:
   base_url: https://api.openai.com/v1
-  api_key: ${OPENAI_API_KEY}       # 支持 ${ENV_VAR} 环境变量替换
+  api_key: ${OPENAI_API_KEY}       # 支持 ${ENV_VAR} 环境变量替换（os.ExpandEnv）
   default_model: gpt-4o
   timeout_sec: 120
   # provider: openai                # 可选：openai / deepseek-v4 / deepseek-r1
 
 # ============================================================
 # 工具集白名单（命名复用层）
+#
+# 每个 agent kind 二选一：profile 引用本表 / tools 直接列工具名（不能同时给）。
+# 工具名必须在 internal/tools 中已注册，否则启动报错。
 # ============================================================
-# 每个 kind 块二选一：profile 引用本表 / tools 直接列工具名。
 tool_profiles:
   worker_standard:
     - read_file
@@ -44,25 +47,30 @@ tool_profiles:
 
 # ============================================================
 # Scheduler 配置（独立块，仅允许 model 字段外部覆盖）
+# 工具集 / system prompt / replicas 等均硬编码在 internal/scheduler。
 # ============================================================
 scheduler:
   model: gpt-4o                    # 可选，缺省回落 llm.default_model
 
 # ============================================================
-# Agent kind 列表（核心：kind × replicas，完全同质）
+# Agent kind 列表（核心：kind × replicas，同 kind 内完全同质）
 # ============================================================
 agents:
   - kind: worker
     replicas: 1
     event_type: ""                 # 默认任务队列（空字符串）
     profile: worker_standard       # 引用 tool_profiles 中的白名单
-    # 或直接用 tools: [read_file, write_file, ...]  二选一，不能同时给
+    # 或直接用 tools: [read_file, write_file, ...]  二选一
     model: gpt-4o                  # 覆盖 llm.default_model
     system_prompt_file: prompts/worker.md
     agent_max_loops: 10
     task_max_retries: 3
     enforce_compact_token_threshold: 4000
     context_limit: 16000
+    # description 给 scheduler 看的一句话角色说明，影响任务派发选择
+    description: |
+      通用工作代理。能读写文件、跑 shell、检索网络；
+      适合落盘类执行任务，不擅长纯调研。
 
   - kind: explorer
     replicas: 1
@@ -74,6 +82,8 @@ agents:
     task_max_retries: 3
     enforce_compact_token_threshold: 3000
     context_limit: 8000
+    description: |
+      广度优先调研代理。不写文件，仅返回 Markdown 文字回复。
 
 # ============================================================
 # 运行时基础设施
@@ -90,19 +100,19 @@ infra:
     event_channel_buffer: 64
     fifo_limit: 100
     default_concurrency: 2
-    default_timeout_sec: 300
+    default_timeout_sec: 300       # 任务级超时（watchdog 据此判定 unclaimed）
   roster:
     wait_timeout_sec: 30
 
 # ============================================================
-# 启动期可观测性（§9.5）
+# 启动期可观测性
 # ============================================================
 startup_probe: "tcp"               # "tcp"=DialTimeout 探测; "off"=跳过
 startup_probe_timeout_sec: 5
 startup_probe_failure_action: "warn"  # "warn"=仅警告继续; "exit"=失败硬退出
 
 # ============================================================
-# 杂项
+# 杂项 / 行为开关
 # ============================================================
 max_subtask_depth: 3
 shell_timeout_sec: 60
@@ -112,8 +122,34 @@ search_api_provider: duckduckgo_html
 search_api_url: ""
 search_api_key: ""
 
-# §7 Hashline 行哈希增强（默认 true）
+# Hashline 行哈希增强（默认 true）
 # hashline_enabled: true
+
+# TransferNote 单条最大 token 预算（默认 3000 ≈ 6000 中文字符）
+transfer_note_max_tokens: 3000
+
+# 进度通知：完成文件写入 / 子任务发布等时发轻量 mailbox 消息（默认 true）
+progress_notify_enabled: true
+
+# agent runner 连续 N 次空闲轮询后退出 goroutine 的阈值
+# 默认 0 = 永不空闲退出（生产推荐）
+agent_idle_threshold: 0
+
+# ============================================================
+# Session 持久化
+# ============================================================
+session_retention_days: 30        # 已关闭 session 超过此天数则归档
+session_archive_max: 50           # 归档上限，超过删除最旧
+
+# ============================================================
+# v5 用户 Reactor 配置（可选）
+#
+# 留空 → 系统仅运行内置 reactor；
+# 指向一个 YAML 文件 → 由 internal/reactor/userdef.LoadFromFile 解析。
+# Reactor YAML 的撰写规范见 docs/yaml-config-guide.md §3，
+# 现成参考实现见 test_invest_reactors.yaml。
+# ============================================================
+# reactors_file: reactors.yaml
 
 # ============================================================
 # DRY 提示：多 kind 共享配置时使用 YAML 锚点

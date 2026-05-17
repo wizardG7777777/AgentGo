@@ -3,6 +3,7 @@ package session
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -36,14 +37,14 @@ func NewSessionManager(baseDir string, cfg SessionConfig) (*SessionManager, erro
 	// 创建 baseDir
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		// 降级：无法创建基础目录
-		fmt.Fprintf(os.Stderr, "[WARNING] Session baseDir 创建失败: %v\n", err)
+		log.Printf("[WARNING] Session baseDir 创建失败: %v", err)
 		return sm, nil
 	}
 
 	// 尝试恢复或创建 Session
 	if err := sm.initSession(); err != nil {
 		// 降级：初始化失败，以无 Session 模式运行
-		fmt.Fprintf(os.Stderr, "[WARNING] Session 初始化失败: %v\n", err)
+		log.Printf("[WARNING] Session 初始化失败: %v", err)
 		sm.current = nil
 		return sm, nil
 	}
@@ -72,7 +73,7 @@ func (sm *SessionManager) initSession() error {
 				// 尝试恢复快照（snapshot.json）
 				snap, snapErr := sm.loadSnapshotInternal()
 				if snapErr != nil {
-					fmt.Fprintf(os.Stderr, "[WARNING] snapshot 恢复失败: %v\n", snapErr)
+					log.Printf("[WARNING] snapshot 恢复失败: %v", snapErr)
 				} else if snap != nil {
 					sm.current.RecoveredSnapshot = snap
 				}
@@ -81,7 +82,7 @@ func (sm *SessionManager) initSession() error {
 			}
 		}
 		// active-session 指向无效目录，记录警告并创建新 Session
-		fmt.Fprintf(os.Stderr, "[WARNING] active-session 指向无效目录 %s，创建新 Session\n", sessDir)
+		log.Printf("[WARNING] active-session 指向无效目录 %s，创建新 Session", sessDir)
 	}
 
 	// 创建新 Session
@@ -113,7 +114,7 @@ func (sm *SessionManager) CreateNew() (*Session, error) {
 		sm.current.Metadata.Status = "closed"
 		metaPath := filepath.Join(sm.current.Dir, "metadata.json")
 		if err := sm.current.Metadata.Save(metaPath); err != nil {
-			fmt.Fprintf(os.Stderr, "[WARNING] CreateNew 关闭旧 Session metadata 失败: %v\n", err)
+			log.Printf("[WARNING] CreateNew 关闭旧 Session metadata 失败: %v", err)
 		}
 	}
 
@@ -237,7 +238,7 @@ func (sm *SessionManager) LogWriter() io.Writer {
 	logPath := filepath.Join(sm.current.Dir, "logs", "agentgo.log")
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[WARNING] 日志文件オープン失敗: %v\n", err)
+		log.Printf("[WARNING] 日志文件オープン失敗: %v", err)
 		return os.Stdout
 	}
 
@@ -290,7 +291,7 @@ func (sm *SessionManager) openHistoryLocked() {
 	path := filepath.Join(sm.current.Dir, "history.jsonl")
 	h, err := OpenHistoryLog(path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[WARNING] 打开 history.jsonl 失败: %v\n", err)
+		log.Printf("[WARNING] 打开 history.jsonl 失败: %v", err)
 		return
 	}
 	sm.history = h
@@ -300,7 +301,7 @@ func (sm *SessionManager) openHistoryLocked() {
 func (sm *SessionManager) closeHistoryLocked() {
 	if sm.history != nil {
 		if err := sm.history.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "[WARNING] 关闭 history.jsonl 失败: %v\n", err)
+			log.Printf("[WARNING] 关闭 history.jsonl 失败: %v", err)
 		}
 		sm.history = nil
 	}
@@ -310,7 +311,7 @@ func (sm *SessionManager) closeHistoryLocked() {
 func (sm *SessionManager) closeLogWriter() {
 	if sm.logWriter != nil {
 		if err := sm.logWriter.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "[WARNING] 关闭日志文件失败: %v\n", err)
+			log.Printf("[WARNING] 关闭日志文件失败: %v", err)
 		}
 		sm.logWriter = nil
 	}
@@ -333,7 +334,7 @@ func (sm *SessionManager) RecordFirstInput(input string) {
 	sm.current.Metadata.FirstUserInput = input
 	metaPath := filepath.Join(sm.current.Dir, "metadata.json")
 	if err := sm.current.Metadata.Save(metaPath); err != nil {
-		fmt.Fprintf(os.Stderr, "[WARNING] RecordFirstInput 保存 metadata 失败: %v\n", err)
+		log.Printf("[WARNING] RecordFirstInput 保存 metadata 失败: %v", err)
 	}
 }
 
@@ -350,7 +351,7 @@ func (sm *SessionManager) IncrementTaskCount() {
 	sm.current.Metadata.TaskCount++
 	metaPath := filepath.Join(sm.current.Dir, "metadata.json")
 	if err := sm.current.Metadata.Save(metaPath); err != nil {
-		fmt.Fprintf(os.Stderr, "[WARNING] IncrementTaskCount 保存 metadata 失败: %v\n", err)
+		log.Printf("[WARNING] IncrementTaskCount 保存 metadata 失败: %v", err)
 	}
 }
 
@@ -480,7 +481,7 @@ func (sm *SessionManager) List() ([]Metadata, error) {
 		meta, err := LoadMetadata(path)
 		if err != nil {
 			// スキップして続行
-			fmt.Fprintf(os.Stderr, "[WARNING] metadata 読み込み失敗 %s: %v\n", path, err)
+			log.Printf("[WARNING] metadata 読み込み失敗 %s: %v", path, err)
 			continue
 		}
 		result = append(result, *meta)

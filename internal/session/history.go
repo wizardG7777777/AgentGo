@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -129,7 +130,7 @@ func (h *HistoryLog) Replay() ([]HistoryEvent, error) {
 		}
 		var ev HistoryEvent
 		if err := json.Unmarshal(line, &ev); err != nil {
-			fmt.Fprintf(os.Stderr, "[HistoryLog] WARN line %d JSON parse failed, skipping: %v\n", lineNum, err)
+			log.Printf("[HistoryLog] WARN line %d JSON parse failed, skipping: %v", lineNum, err)
 			continue
 		}
 		events = append(events, ev)

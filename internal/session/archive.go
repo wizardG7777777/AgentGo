@@ -2,6 +2,7 @@ package session
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -32,7 +33,7 @@ func (sm *SessionManager) RunArchive() error {
 
 		meta, err := LoadMetadata(metaPath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[archive] WARN: skip %s: load metadata: %v\n", sessDir, err)
+			log.Printf("[archive] WARN: skip %s: load metadata: %v", sessDir, err)
 			continue
 		}
 
@@ -47,7 +48,7 @@ func (sm *SessionManager) RunArchive() error {
 			// Try RFC3339 as fallback
 			createdAt, err = time.Parse(time.RFC3339, meta.CreatedAt)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "[archive] WARN: skip %s: parse created_at: %v\n", sessDir, err)
+				log.Printf("[archive] WARN: skip %s: parse created_at: %v", sessDir, err)
 				continue
 			}
 		}
@@ -58,20 +59,20 @@ func (sm *SessionManager) RunArchive() error {
 
 		// Move to archive
 		if err := os.MkdirAll(archiveDir, 0755); err != nil {
-			fmt.Fprintf(os.Stderr, "[archive] WARN: create archive dir: %v\n", err)
+			log.Printf("[archive] WARN: create archive dir: %v", err)
 			continue
 		}
 
 		destDir := filepath.Join(archiveDir, filepath.Base(sessDir))
 		if err := os.Rename(sessDir, destDir); err != nil {
-			fmt.Fprintf(os.Stderr, "[archive] WARN: move %s to archive: %v\n", sessDir, err)
+			log.Printf("[archive] WARN: move %s to archive: %v", sessDir, err)
 			continue
 		}
 	}
 
 	// Step 2: Enforce archive count limit
 	if err := sm.cleanupArchives(archiveDir); err != nil {
-		fmt.Fprintf(os.Stderr, "[archive] WARN: cleanup archives: %v\n", err)
+		log.Printf("[archive] WARN: cleanup archives: %v", err)
 	}
 
 	return nil
@@ -103,14 +104,14 @@ func (sm *SessionManager) cleanupArchives(archiveDir string) error {
 	for _, metaPath := range matches {
 		meta, err := LoadMetadata(metaPath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[archive] WARN: skip cleanup %s: %v\n", metaPath, err)
+			log.Printf("[archive] WARN: skip cleanup %s: %v", metaPath, err)
 			continue
 		}
 		createdAt, err := time.Parse(time.RFC3339Nano, meta.CreatedAt)
 		if err != nil {
 			createdAt, err = time.Parse(time.RFC3339, meta.CreatedAt)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "[archive] WARN: skip cleanup %s: parse time: %v\n", metaPath, err)
+				log.Printf("[archive] WARN: skip cleanup %s: parse time: %v", metaPath, err)
 				continue
 			}
 		}
@@ -133,7 +134,7 @@ func (sm *SessionManager) cleanupArchives(archiveDir string) error {
 	toDelete := len(sessions) - sm.cfg.ArchiveMax
 	for i := 0; i < toDelete; i++ {
 		if err := os.RemoveAll(sessions[i].dir); err != nil {
-			fmt.Fprintf(os.Stderr, "[archive] WARN: delete archive %s: %v\n", sessions[i].dir, err)
+			log.Printf("[archive] WARN: delete archive %s: %v", sessions[i].dir, err)
 			continue
 		}
 	}
