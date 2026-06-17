@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"agentgo/internal/agent"
 	"agentgo/internal/config"
 	"agentgo/internal/gate"
 	"agentgo/internal/hook"
@@ -47,6 +48,7 @@ type System struct {
 	MailboxRegistry *mailbox.Registry
 	MailNotifier    *mailbox.MailNotifier
 	Scheduler       *scheduler.Bundle // Phase 3：scheduler 现在是 agent.Agent + Activator + ModeStore 的复合
+	Activity        *agent.ActivityTracker
 	// v4：所有执行/调查代理都是 runner.Runner（取代旧 worker.Worker / explorer.Explorer
 	// 两个 package；详见 nextUpgrade_v4.md §11.6.6）。kind × replicas 实例化在 Bootstrap()
 	// 主流程展开。
@@ -58,11 +60,22 @@ type System struct {
 	StatusCh     chan string                // TUI 日志/进度消息通道；Bootstrap 创建，RunCLI 消费
 	OutputCh     chan string                // TUI Agent 用户可见输出通道（result 卡片），与日志分离
 	LogFile      *os.File                   // system.log 句柄，Bootstrap 打开，Shutdown 关闭
+	resultMu     sync.Mutex
+	lastResult   *session.ResultSnapshot
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
 }
 
+type BootstrapOptions struct {
+	SkipStartupProbe bool
+	ResumeSessionID  string
+}
+
 func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System, error) {
+	return BootstrapWithOptions(configPath, explicit, BootstrapOptions{SkipStartupProbe: skipStartupProbe})
+}
+
+func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOptions) (*System, error) {
 	// Step 1: 加载配置
 	cfg, err := config.LoadConfig(configPath, explicit)
 	if err != nil {
@@ -84,7 +97,7 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 	// Step 1.2: 启动期 TCP probe（§9.5）——best-effort 连通性检查
 	//             失败行为：默认 warning + 启动继续；startup_probe_failure_action="exit" 改为硬退出
 	//             --skip-startup-probe 命令行旗标可整体跳过（等价于 startup_probe: off）。
-	if !skipStartupProbe {
+	if !opts.SkipStartupProbe {
 		if probeErr := startupProbe(os.Stdout, cfg); probeErr != nil {
 			if cfg.StartupProbeFailureAction == "exit" {
 				return nil, fmt.Errorf("启动期 probe 失败（startup_probe_failure_action=exit）: %w", probeErr)
@@ -101,14 +114,18 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 		Enabled:       true,
 	}
 	sessDir := filepath.Join(homeDir, ".agentgo", "sessions")
-	sessMgr, sessErr := session.NewSessionManager(sessDir, sessionCfg)
+	sessMgr, sessErr := session.NewSessionManagerWithResume(sessDir, sessionCfg, opts.ResumeSessionID)
 	if sessErr != nil {
+		if opts.ResumeSessionID != "" {
+			return nil, fmt.Errorf("resume session %q 失败: %w", opts.ResumeSessionID, sessErr)
+		}
 		fmt.Printf("[启动] WARNING: Session 初始化失败: %v —— 以无 Session 模式运行\n", sessErr)
 	}
 	// 开启 history.jsonl 事件溯源（默认关闭，由 bootstrap 显式启用）
 	if sessMgr != nil && sessMgr.Current() != nil {
 		sessMgr.EnableHistoryLog()
 	}
+	recoveredSnap := currentRecoveredSnapshot(sessMgr)
 
 	// 初始化 system.log，启动阶段诊断日志全部收敛到文件
 	logFilePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "system.log")
@@ -398,6 +415,16 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 	// Step 4.5: 创建 TUI 双通道（日志与 Agent 输出分离，避免竞争）
 	statusCh := make(chan string, 1024) // 日志/进度消息
 	outputCh := make(chan string, 256)  // Agent 用户可见输出（result 卡片）
+	activity := agent.NewActivityTracker()
+	var sys *System
+	outputWriter := &chanWriter{
+		ch: outputCh,
+		onWrite: func(text string) {
+			if sys != nil {
+				sys.recordResult(text)
+			}
+		},
+	}
 
 	// Step 5: 创建调度器（Phase 3：scheduler 是 agent.Agent 实例 + Activator + ModeStore）
 	// 工具集 = Worker 全集 + SchedulerGroup，可以读文件 / 搜索 / 查网页 / 跑 shell。
@@ -405,8 +432,12 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 	sched := scheduler.New(
 		taskStore, r, schedulerLLM, eventCh, cfg, cancelRegistry, mbRegistry, approvalCh,
 		gateReg, storeView, recordToolCall, agentRegistry, memoryStore,
-		&chanWriter{ch: outputCh},
+		outputWriter,
 	)
+	if sched.Agent != nil {
+		sched.Agent.Activity = activity
+		activity.RegisterAgent(sched.Agent.ID, "scheduler")
+	}
 	sched.SchedulerExec.ToolHealth = toolHealth
 
 	// Step 8: 创建执行代理（v4 §11.6.1 唯一路径——按 kind × replicas 实例化统一 Runner）
@@ -424,12 +455,13 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 		StoreView:             storeView,
 		RecordToolCall:        recordToolCall,
 		Memory:                memoryStore,
+		Activity:              activity,
 		MBRegistry:            mbRegistry,
 		CancelRegistry:        cancelRegistry,
 		SearchProvider:        searchProvider,
 		ShellFilter:           shellFilter,
 		ApprovalCh:            approvalCh,
-		UserOutput:            &chanWriter{ch: outputCh},
+		UserOutput:            outputWriter,
 		TaskEndCallbacks:      taskEndReactor,
 		ProjectRoot:           cfg.ProjectRoot,
 		RosterWaitTimeoutSec:  cfg.Infra.Roster.WaitTimeoutSec,
@@ -443,7 +475,7 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 	for _, kind := range cfg.Agents {
 		kindLLM := buildKindLLMClient(cfg.LLM, kind.Model)
 		for i := 1; i <= kind.Replicas; i++ {
-			rt, rtErr := buildAgentRuntime(kind, cfg.LLM, cfg.ToolProfiles, i)
+			rt, rtErr := buildAgentRuntime(kind, cfg.LLM, cfg.ToolProfiles, cfg.Agents, i)
 			if rtErr != nil {
 				return nil, fmt.Errorf("kind=%q replica=%d 运行时构造失败: %w", kind.Kind, i, rtErr)
 			}
@@ -524,7 +556,7 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 	notifierInterval := time.Duration(cfg.Infra.MailNotifier.IntervalSec) * time.Second
 	mailNotifier := mailbox.NewMailNotifier(mbRegistry, taskStore, notifierInterval)
 
-	sys := &System{
+	sys = &System{
 		Config:          cfg,
 		Store:           taskStore,
 		Roster:          r,
@@ -536,12 +568,23 @@ func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System
 		ArtifactLog:     artifactLog, // 可能为 nil（OpenArtifactLog 失败时），Shutdown 会判空
 		SessionMgr:      sessMgr,     // 可能为 nil（Session 初始化失败时），Shutdown 会判空
 		Scheduler:       sched,
+		Activity:        activity,
 		Runners:         runners,
 		ApprovalCh:      approvalCh,
 		SpawnManager:    spawnMgr,
 		StatusCh:        statusCh,
 		OutputCh:        outputCh,
 		LogFile:         logFile,
+	}
+	if recoveredSnap != nil {
+		if err := restoreRuntimeSnapshot(sys, recoveredSnap); err != nil {
+			return nil, fmt.Errorf("恢复 session snapshot 失败: %w", err)
+		}
+		log.Printf("[resume] 已恢复 session snapshot: tasks=%d mailboxes=%d scheduler_history=%d",
+			len(recoveredSnap.Tasks), len(recoveredSnap.Mailboxes), len(recoveredSnap.SchedulerHistory))
+	}
+	if initialResult := loadInitialResult(cfg.ProjectRoot, sessMgr, recoveredSnap); initialResult != nil {
+		sys.seedResult(initialResult)
 	}
 
 	return sys, nil
@@ -642,11 +685,16 @@ func (w *tuiLogWriter) Write(p []byte) (n int, err error) {
 // chanWriter 把写入的字节块发送到 channel，供 TUI 接收并渲染。
 // 用于 agent/scheduler 的 UserOutput，将用户可见内容注入 Bubble Tea。
 type chanWriter struct {
-	ch chan<- string
+	ch      chan<- string
+	onWrite func(string)
 }
 
 func (w *chanWriter) Write(p []byte) (int, error) {
-	w.ch <- string(p)
+	text := string(p)
+	if w.onWrite != nil {
+		w.onWrite(text)
+	}
+	w.ch <- text
 	return len(p), nil
 }
 
@@ -664,15 +712,17 @@ func (s *System) RunCLI(ctx context.Context, reader io.Reader, writer io.Writer)
 	}
 
 	deps := tui.Deps{
-		Store:       s.Store,
-		EventCh:     s.EventCh,
-		CancelFn:    s.cancel,
-		Scheduler:   s.Scheduler,
-		Mailbox:     s.MailboxRegistry,
-		ApprovalCh:  s.ApprovalCh,
-		SessionMgr:  s.SessionMgr,
-		SystemMsgCh: s.StatusCh,
-		OutputCh:    s.OutputCh,
+		Store:         s.Store,
+		EventCh:       s.EventCh,
+		CancelFn:      s.cancel,
+		Scheduler:     s.Scheduler,
+		Mailbox:       s.MailboxRegistry,
+		ApprovalCh:    s.ApprovalCh,
+		SessionMgr:    s.SessionMgr,
+		SystemMsgCh:   s.StatusCh,
+		OutputCh:      s.OutputCh,
+		InitialResult: initialResultText(s.resultSnapshot()),
+		AgentInfoFn:   s.buildAgentInfoFn(),
 	}
 	if err := tui.Run(ctx, deps); err != nil {
 		fmt.Fprintf(os.Stderr, "[TUI] 异常退出: %v\n", err)
@@ -691,6 +741,7 @@ func (s *System) Shutdown() {
 		s.SpawnManager.Shutdown()
 	}
 	s.wg.Wait()
+	s.saveRuntimeSnapshot()
 	// 关闭 trace 写入器，flush 所有打开的文件句柄
 	if w := trace.Default(); w != nil {
 		w.Close()
@@ -717,6 +768,146 @@ func (s *System) Shutdown() {
 		}
 	}
 	fmt.Println("[关闭] 系统已停止")
+}
+
+// buildAgentInfoFn creates a closure that collects agent info from all runners + scheduler.
+func (s *System) buildAgentInfoFn() func() []tui.AgentInfo {
+	return func() []tui.AgentInfo {
+		// Build agent→task lookup from store (single scan)
+		type taskRef struct {
+			id   string
+			desc string
+		}
+		agentTasks := map[string]taskRef{}
+		tasks, _ := s.Store.ScanAll()
+		for _, t := range tasks {
+			if t.Status == "processing" {
+				for _, aid := range t.Agents {
+					agentTasks[aid] = taskRef{id: t.ID, desc: t.Description}
+				}
+			}
+		}
+
+		var infos []tui.AgentInfo
+		seen := map[string]bool{}
+
+		// Scheduler agent
+		if s.Scheduler != nil && s.Scheduler.Agent != nil {
+			a := s.Scheduler.Agent
+			ref := agentTasks[a.ID]
+			info := tui.AgentInfo{
+				ID:               a.ID,
+				Type:             "scheduler",
+				State:            string(a.CurrentState()),
+				CurrentTaskID:    ref.id,
+				CurrentTaskDesc:  ref.desc,
+				PromptTokens:     a.TokenStats.TotalPromptTokens,
+				CompletionTokens: a.TokenStats.TotalCompletionTokens,
+				CallCount:        a.TokenStats.CallCount,
+			}
+			s.applyActivityInfo(&info)
+			infos = append(infos, info)
+			seen[a.ID] = true
+		}
+
+		// Runner agents
+		for _, rn := range s.Runners {
+			a := rn.Agent()
+			ref := agentTasks[a.ID]
+			var mbPending int
+			if a.Mailbox != nil {
+				mbPending = a.Mailbox.Len()
+			}
+			agentType := a.EventType
+			if agentType == "" {
+				agentType = "worker"
+			}
+			info := tui.AgentInfo{
+				ID:               a.ID,
+				Type:             agentType,
+				State:            string(a.CurrentState()),
+				CurrentTaskID:    ref.id,
+				CurrentTaskDesc:  ref.desc,
+				MailboxPending:   mbPending,
+				PromptTokens:     a.TokenStats.TotalPromptTokens,
+				CompletionTokens: a.TokenStats.TotalCompletionTokens,
+				CallCount:        a.TokenStats.CallCount,
+			}
+			s.applyActivityInfo(&info)
+			infos = append(infos, info)
+			seen[a.ID] = true
+		}
+
+		if s.Activity != nil {
+			for _, snap := range s.Activity.Snapshots() {
+				if seen[snap.AgentID] {
+					continue
+				}
+				info := tui.AgentInfo{
+					ID:              snap.AgentID,
+					Type:            snap.AgentType,
+					State:           "processing",
+					CurrentTaskID:   snap.TaskID,
+					CurrentTaskDesc: snap.TaskDesc,
+				}
+				if snap.TaskID == "" {
+					info.State = "idle"
+				}
+				s.applyActivitySnapshot(&info, snap)
+				infos = append(infos, info)
+			}
+		}
+
+		return infos
+	}
+}
+
+func (s *System) applyActivityInfo(info *tui.AgentInfo) {
+	if s.Activity == nil || info == nil {
+		return
+	}
+	snap, ok := s.Activity.Snapshot(info.ID)
+	if !ok {
+		return
+	}
+	s.applyActivitySnapshot(info, snap)
+}
+
+func (s *System) applyActivitySnapshot(info *tui.AgentInfo, snap agent.ActivitySnapshot) {
+	if info.Type == "" {
+		info.Type = snap.AgentType
+	}
+	if snap.TaskID != "" && info.CurrentTaskID == "" {
+		info.CurrentTaskID = snap.TaskID
+	}
+	if snap.TaskDesc != "" && info.CurrentTaskDesc == "" {
+		info.CurrentTaskDesc = snap.TaskDesc
+	}
+	info.Loop = snap.Loop
+	info.Phase = snap.Phase
+	info.LastModelText = snap.LastModelText
+	info.LastTool = snap.LastTool
+	info.ToolCallCount = snap.ToolCallCount
+	info.LastActivityAt = snap.LastActivityAt
+	info.ActivityAge = formatActivityAge(snap.LastActivityAt)
+	info.LastError = snap.LastError
+}
+
+func formatActivityAge(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	age := time.Since(t)
+	if age < time.Second {
+		return "now"
+	}
+	if age < time.Minute {
+		return fmt.Sprintf("%ds ago", int(age.Seconds()))
+	}
+	if age < time.Hour {
+		return fmt.Sprintf("%dm ago", int(age.Minutes()))
+	}
+	return fmt.Sprintf("%dh ago", int(age.Hours()))
 }
 
 func (s *System) runWatchdogWithRecover(ctx context.Context) {

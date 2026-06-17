@@ -12,247 +12,276 @@ import (
 	"agentgo/internal/store"
 )
 
-// handleSubmit 处理用户回车提交的一行文本。
-// 返回 quit=true 表示应退出 TUI（仅 /quit 触发）。
-//
-// 非 / 开头：作为自由文本发送 EventUserInput。
-// / 开头：解析命令名 + 参数后分发。
-func (m *Model) handleSubmit(line string) (quit bool) {
-	if !strings.HasPrefix(line, "/") {
-		m.sendUserText(line)
+// handleCommand processes slash commands. Returns true if the app should quit.
+func (m *AppModel) handleCommand(line string) bool {
+	parts := strings.Fields(line)
+	if len(parts) == 0 {
 		return false
 	}
 
-	cmd, args := splitCommand(line)
+	cmd := strings.ToLower(parts[0])
 	switch cmd {
 	case "/quit":
-		m.appendMsg("[退出] 正在关闭...", msgInfo)
+		m.appendMsg("[退出] 用户退出", MsgInfo)
 		m.deps.CancelFn()
 		return true
+
 	case "/help":
-		m.appendMsg(helpText, msgInfo)
+		m.appendMsg(helpText, MsgInfo)
+
 	case "/status":
-		m.printStatus()
+		m.showStatus()
+
 	case "/cancel":
-		m.cancelTask(strings.TrimSpace(args))
+		if len(parts) < 2 {
+			m.appendMsg("[cancel] 用法: /cancel <task-id>", MsgWarn)
+			return false
+		}
+		m.cancelTask(parts[1])
+
 	case "/mode":
 		m.toggleMode()
+
 	case "/steer":
-		m.steer(args)
+		if len(parts) < 3 {
+			m.appendMsg("[steer] 用法: /steer <agentID> <message>", MsgWarn)
+			return false
+		}
+		agentID := parts[1]
+		msg := strings.Join(parts[2:], " ")
+		m.steerAgent(agentID, msg)
+
 	case "/new":
 		m.newSession()
+
 	case "/session":
-		m.handleSessionCmd(strings.TrimSpace(args))
+		if len(parts) < 2 {
+			m.listSessions()
+		} else {
+			m.switchSession(parts[1])
+		}
+
+	case "/dashboard", "/dash":
+		m.view = ViewDashboard
+		m.appendMsg("[view] 切换到仪表板视图", MsgInfo)
+
+	case "/chat":
+		m.view = ViewChat
+		m.appendMsg("[view] 切换到消息视图", MsgInfo)
+
+	case "/detail", "/result":
+		if m.lastResult == nil {
+			m.appendMsg("[result] 暂无完整任务结果", MsgWarn)
+			return false
+		}
+		m.view = ViewResult
+		m.resultScroll = 0
+		m.appendMsg("[view] 切换到完整结果视图", MsgInfo)
+
+	case "/agent":
+		if len(parts) < 2 {
+			m.appendMsg("[agent] 用法: /agent <id> — 查看代理详情", MsgWarn)
+			return false
+		}
+		m.selectAgentByID(parts[1])
+
 	default:
-		m.appendMsg(fmt.Sprintf("[错误] 未知命令: %s（输入 /help 查看帮助）", line), msgError)
+		m.appendMsg(fmt.Sprintf("[command] 未知命令: %s (输入 /help 查看帮助)", cmd), MsgWarn)
 	}
+
 	return false
 }
 
-func splitCommand(line string) (cmd, args string) {
-	parts := strings.SplitN(line, " ", 2)
-	cmd = parts[0]
-	if len(parts) > 1 {
-		args = parts[1]
-	}
-	return
-}
-
-const helpText = `可用命令:
-  /status              — 查看活跃任务
-  /cancel <id>         — 取消指定任务
-  /steer <agent> <msg> — 向指定代理发送用户纠偏消息
-  /mode                — 切换即时/计划模式
-  /new                 — 创建新 Session
-  /session             — 列出 Session；/session <序号> 选择
-  /help                — 显示此帮助
-  /quit                — 退出程序
-  其他文本             — 作为用户请求发送给调度器
-
-审批面板键位: 1=通过  2=拒绝  3=输入指导  4=永远允许此模式（本进程内）`
-
-func (m *Model) sendUserText(text string) {
-	if m.deps.SessionMgr != nil {
-		m.deps.SessionMgr.RecordFirstInput(text)
-		m.deps.SessionMgr.IncrementTaskCount()
-	}
-	evt := model.Event{
-		Type:    model.EventUserInput,
-		Payload: map[string]string{"text": text},
-	}
-	select {
-	case m.deps.EventCh <- evt:
-		m.appendMsg("[已提交] "+truncate(text, 60), msgInfo)
-	case <-time.After(5 * time.Second):
-		m.appendMsg("[警告] 系统繁忙，请稍后重试", msgWarn)
-	}
-}
-
-func (m *Model) printStatus() {
+func (m *AppModel) showStatus() {
 	tasks, err := m.deps.Store.ScanAll()
 	if err != nil {
-		m.appendMsg(fmt.Sprintf("[错误] 读取任务列表失败: %v", err), msgError)
+		m.appendMsg(fmt.Sprintf("[status] 读取失败: %v", err), MsgError)
 		return
 	}
-	nonTerminal := 0
-	for _, task := range tasks {
-		if model.IsTerminal(task.Status) {
+
+	counts := map[model.TaskStatus]int{}
+	for _, t := range tasks {
+		counts[t.Status]++
+	}
+
+	var lines []string
+	lines = append(lines, "── 系统状态 ──")
+	lines = append(lines, fmt.Sprintf("  Agents: %d", len(m.agents)))
+	lines = append(lines, fmt.Sprintf("  Tasks: pending=%d  processing=%d  completed=%d  failed=%d",
+		counts[model.TaskStatusPending],
+		counts[model.TaskStatusProcessing],
+		counts[model.TaskStatusCompleted],
+		counts[model.TaskStatusFailed]))
+
+	mode := "Immediate"
+	if m.deps.Scheduler.Mode.Get() == scheduler.ModePlan {
+		mode = "Plan"
+	}
+	lines = append(lines, fmt.Sprintf("  Mode: %s", mode))
+
+	// Active tasks detail
+	for _, t := range tasks {
+		if t.Status != model.TaskStatusPending && t.Status != model.TaskStatusProcessing {
 			continue
 		}
-		idShort := task.ID
-		if len(idShort) > 8 {
-			idShort = idShort[:8]
+		desc := t.Description
+		if len(desc) > 60 {
+			desc = desc[:59] + "…"
 		}
-		m.appendMsg(fmt.Sprintf("  [%s] %s — %s", idShort, task.Status, task.Description), msgLog)
-		nonTerminal++
+		lines = append(lines, fmt.Sprintf("  %s [%s] %s — %s",
+			string(t.Status), t.ID[:8], desc, strings.Join(t.Agents, ",")))
 	}
-	if nonTerminal == 0 {
-		m.appendMsg("  （无活跃任务）", msgLog)
-	} else {
-		m.appendMsg(fmt.Sprintf("  共 %d 个活跃任务", nonTerminal), msgLog)
-	}
+
+	m.appendMsg(strings.Join(lines, "\n"), MsgInfo)
 }
 
-func (m *Model) cancelTask(taskID string) {
-	if taskID == "" {
-		m.appendMsg("[错误] 用法: /cancel <taskID>", msgError)
-		return
-	}
-	err := store.TransitionStateWithCancelSource(m.deps.Store, taskID, model.TaskStatusPending, model.TaskStatusCancelled, "user")
+func (m *AppModel) cancelTask(idPrefix string) {
+	tasks, err := m.deps.Store.ScanAll()
 	if err != nil {
-		err = store.TransitionStateWithCancelSource(m.deps.Store, taskID, model.TaskStatusProcessing, model.TaskStatusCancelled, "user")
+		m.appendMsg(fmt.Sprintf("[cancel] 读取失败: %v", err), MsgError)
+		return
 	}
-	if err != nil {
-		m.appendMsg(fmt.Sprintf("[错误] 取消失败: %v", err), msgError)
+	for _, t := range tasks {
+		if !strings.HasPrefix(t.ID, idPrefix) {
+			continue
+		}
+		if t.Status != model.TaskStatusPending && t.Status != model.TaskStatusProcessing {
+			m.appendMsg(fmt.Sprintf("[cancel] 任务 %s 状态为 %s，无法取消", t.ID[:8], t.Status), MsgWarn)
+			return
+		}
+		if err := store.TransitionStateWithCancelSource(m.deps.Store, t.ID, t.Status, model.TaskStatusCancelled, "user"); err != nil {
+			m.appendMsg(fmt.Sprintf("[cancel] 失败: %v", err), MsgError)
+			return
+		}
+		m.appendMsg(fmt.Sprintf("[cancel] 已取消任务 %s", t.ID[:8]), MsgInfo)
+		return
+	}
+	m.appendMsg(fmt.Sprintf("[cancel] 未找到以 %s 开头的任务", idPrefix), MsgWarn)
+}
+
+func (m *AppModel) toggleMode() {
+	curr := m.deps.Scheduler.Mode.Get()
+	if curr == scheduler.ModeImmediate {
+		m.deps.Scheduler.Mode.Set(scheduler.ModePlan)
+		m.appendMsg("[mode] 已切换到 Plan 模式", MsgInfo)
 	} else {
-		m.appendMsg(fmt.Sprintf("[取消] 任务 %s 已取消", taskID), msgInfo)
+		m.deps.Scheduler.Mode.Set(scheduler.ModeImmediate)
+		m.appendMsg("[mode] 已切换到 Immediate 模式", MsgInfo)
 	}
 }
 
-func (m *Model) toggleMode() {
-	if m.deps.Scheduler == nil || m.deps.Scheduler.Mode == nil {
-		m.appendMsg("[模式] 模式切换不可用（scheduler 未注入 ModeStore）", msgWarn)
-		return
-	}
-	mode := m.deps.Scheduler.Mode
-	current := mode.Get()
-	var next scheduler.Mode
-	if current == scheduler.ModeImmediate {
-		next = scheduler.ModePlan
-	} else {
-		next = scheduler.ModeImmediate
-	}
-	mode.Set(next)
-	if next == scheduler.ModeImmediate {
-		m.appendMsg("[模式] 即时模式", msgInfo)
-	} else {
-		m.appendMsg("[模式] 计划模式", msgInfo)
-	}
-}
-
-func (m *Model) steer(args string) {
-	parts := strings.SplitN(strings.TrimSpace(args), " ", 2)
-	if len(parts) < 2 || parts[0] == "" || strings.TrimSpace(parts[1]) == "" {
-		m.appendMsg("[错误] 用法: /steer <agentID> <消息内容>", msgError)
-		return
-	}
+func (m *AppModel) steerAgent(agentID, msg string) {
 	if m.deps.Mailbox == nil {
-		m.appendMsg("[错误] 邮箱系统未启用", msgError)
+		m.appendMsg("[steer] 邮箱未初始化", MsgError)
 		return
 	}
-	agentID := parts[0]
-	content := parts[1]
-	msg := mailbox.Message{
+	m.deps.Mailbox.Send(mailbox.Message{
 		From:     "user",
 		To:       agentID,
-		Content:  content,
-		Summary:  content,
+		Content:  msg,
+		Summary:  msg,
 		Type:     mailbox.MsgTypeSteer,
 		Priority: mailbox.PriorityHigh,
 		SentAt:   time.Now(),
-	}
-	if err := m.deps.Mailbox.Send(msg); err != nil {
-		m.appendMsg(fmt.Sprintf("[错误] 发送失败: %v", err), msgError)
-		return
-	}
-	m.appendMsg(fmt.Sprintf("[steer] 已向 %s 发送用户消息", agentID), msgInfo)
+	})
+	m.appendMsg(fmt.Sprintf("[steer] 已发送指导给 %s", agentID), MsgInfo)
 }
 
-func (m *Model) newSession() {
+func (m *AppModel) newSession() {
 	if m.deps.SessionMgr == nil {
-		m.appendMsg("[错误] Session 管理器未启用", msgError)
+		m.appendMsg("[session] Session 管理器未初始化", MsgError)
 		return
-	}
-	if err := m.deps.SessionMgr.Close(); err != nil {
-		m.appendMsg(fmt.Sprintf("[警告] 关闭当前 Session 失败: %v", err), msgWarn)
 	}
 	sess, err := m.deps.SessionMgr.CreateNew()
 	if err != nil {
-		m.appendMsg(fmt.Sprintf("[错误] 创建新 Session 失败: %v", err), msgError)
+		m.appendMsg(fmt.Sprintf("[session] 创建失败: %v", err), MsgError)
 		return
 	}
-	id := sess.ID
-	if len(id) > 8 {
-		id = id[:8]
-	}
-	m.appendMsg(fmt.Sprintf("[session] 新 Session 已创建: %s", id), msgInfo)
+	m.appendMsg(fmt.Sprintf("[session] 新 Session 已创建: %s", sess.ID), MsgInfo)
 }
 
-// handleSessionCmd 实现 /session 列表展示与 /session <序号> 切换。
-//
-// v1 把旧版"先列出再等待二次输入"的两步交互拆为两次命令，避免 bubbletea 状态机
-// 多一个 awaiting-selection 子状态。后续可在此引入交互式 list 选择器。
-func (m *Model) handleSessionCmd(arg string) {
+func (m *AppModel) listSessions() {
 	if m.deps.SessionMgr == nil {
-		m.appendMsg("[错误] Session 管理器未启用", msgError)
+		m.appendMsg("[session] Session 管理器未初始化", MsgError)
 		return
 	}
 	sessions, err := m.deps.SessionMgr.List()
 	if err != nil {
-		m.appendMsg(fmt.Sprintf("[错误] 获取 Session 列表失败: %v", err), msgError)
+		m.appendMsg(fmt.Sprintf("[session] 列表失败: %v", err), MsgError)
 		return
 	}
 	if len(sessions) == 0 {
-		m.appendMsg("[session] Empty session list", msgInfo)
+		m.appendMsg("[session] 无 Session 记录", MsgInfo)
 		return
 	}
 
-	if arg == "" {
-		m.appendMsg("[session] Session 列表（用 /session <序号> 切换）:", msgInfo)
-		for i, meta := range sessions {
-			desc := meta.FirstUserInput
-			if desc == "" {
-				desc = "（无描述）"
-			}
-			createdAt := meta.CreatedAt
-			if len(createdAt) >= 16 {
-				createdAt = createdAt[:10] + " " + createdAt[11:16]
-			}
-			idShort := meta.SessionID
-			if len(idShort) > 8 {
-				idShort = idShort[:8]
-			}
-			m.appendMsg(fmt.Sprintf("  [%d] %s | %s | %s", i+1, idShort, createdAt, desc), msgLog)
+	var lines []string
+	lines = append(lines, "── Sessions ──")
+	for i, s := range sessions {
+		first := s.FirstUserInput
+		if len(first) > 50 {
+			first = first[:49] + "…"
 		}
-		return
+		lines = append(lines, fmt.Sprintf("  %d. %s [%s] %s",
+			i+1, s.SessionID, s.CreatedAt, first))
 	}
-
-	idx, err := strconv.Atoi(arg)
-	if err != nil || idx < 1 || idx > len(sessions) {
-		m.appendMsg(fmt.Sprintf("[错误] 无效的选择: %s，请输入 1-%d 的序号", arg, len(sessions)), msgError)
-		return
-	}
-	selected := sessions[idx-1]
-	idShort := selected.SessionID
-	if len(idShort) > 8 {
-		idShort = idShort[:8]
-	}
-	m.appendMsg(fmt.Sprintf("[session] 已选择 Session: %s（快照恢复需要后续阶段支持）", idShort), msgInfo)
+	m.appendMsg(strings.Join(lines, "\n"), MsgInfo)
 }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
+func (m *AppModel) switchSession(numStr string) {
+	if m.deps.SessionMgr == nil {
+		m.appendMsg("[session] Session 管理器未初始化", MsgError)
+		return
 	}
-	return s[:n] + "..."
+	sessions, err := m.deps.SessionMgr.List()
+	if err != nil {
+		m.appendMsg(fmt.Sprintf("[session] 列表失败: %v", err), MsgError)
+		return
+	}
+	num, err := strconv.Atoi(numStr)
+	if err != nil || num < 1 || num > len(sessions) {
+		m.appendMsg(fmt.Sprintf("[session] 无效编号: %s (1-%d)", numStr, len(sessions)), MsgWarn)
+		return
+	}
+	target := sessions[num-1]
+	if err := m.deps.SessionMgr.SwitchTo(target.SessionID); err != nil {
+		m.appendMsg(fmt.Sprintf("[session] 切换失败: %v", err), MsgError)
+		return
+	}
+	m.appendMsg(fmt.Sprintf("[session] 已切换到 %s", target.SessionID), MsgInfo)
 }
+
+func (m *AppModel) selectAgentByID(id string) {
+	for i, ag := range m.agents {
+		if strings.HasPrefix(ag.ID, id) {
+			m.selectedAgent = i
+			m.view = ViewAgentDetail
+			m.appendMsg(fmt.Sprintf("[agent] 查看代理 %s", ag.ID), MsgInfo)
+			return
+		}
+	}
+	m.appendMsg(fmt.Sprintf("[agent] 未找到以 %s 开头的代理", id), MsgWarn)
+}
+
+const helpText = `── AgentGo Commands ──
+  /help              显示此帮助
+  /status            查看系统状态
+  /cancel <id>       取消任务
+  /mode              切换 Immediate/Plan 模式
+  /steer <id> <msg>  向代理发送指导
+  /new               创建新 Session
+  /session [num]     列出/切换 Session
+  /dashboard         切换到仪表板视图
+  /chat              切换到消息视图
+  /result            查看完整任务结果
+  /detail            查看完整任务结果
+  /agent <id>        查看代理详情
+  /quit              退出
+
+── Hotkeys ──
+  Tab                切换焦点 (Input → Sidebar → Main)
+  ↑/↓                侧边栏代理选择
+  j/k PgUp/PgDn      在完整结果视图中滚动
+  Enter              选中代理 / 提交输入
+  Esc                返回仪表板
+  Ctrl+C             退出`

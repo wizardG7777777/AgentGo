@@ -23,11 +23,22 @@ import (
 //   - 新字段一律 omitempty，旧测试在传 nil 数据源时仍能通过
 //   - 既有字段顺序不变，避免 LLM 看到的 schema 漂移
 type boardSnapshot struct {
-	Mode           string         `json:"mode"`
-	Trigger        triggerInfo    `json:"trigger"`
-	Tasks          []taskSnapshot `json:"tasks"`
-	Resources      resourceInfo   `json:"resources"`
-	SessionHistory []sessionEntry `json:"session_history,omitempty"`
+	Mode                   string                    `json:"mode"`
+	Trigger                triggerInfo               `json:"trigger"`
+	Tasks                  []taskSnapshot            `json:"tasks"`
+	Resources              resourceInfo              `json:"resources"`
+	SessionHistory         []sessionEntry            `json:"session_history,omitempty"`
+	PendingDownstreamTasks []pendingDownstreamSnapshot `json:"pending_downstream_tasks,omitempty"`
+}
+
+// pendingDownstreamSnapshot 是 board snapshot 中"下游待处理任务"的一行。
+// 当 reactor 触发了依赖当前 batch 的额外任务（如 verifier）时，
+// SchedulerExecutor 会把这些任务注入 snapshot，让 LLM 决定是否汇报进度。
+type pendingDownstreamSnapshot struct {
+	TaskID      string `json:"task_id"`
+	Description string `json:"description"`
+	Status      string `json:"status"`
+	AgentID     string `json:"agent_id,omitempty"`
 }
 
 type resourceInfo struct {
@@ -152,6 +163,20 @@ type SnapshotSources struct {
 	// ToolHealth 是 Bootstrap 阶段的工具可用性探测结果。
 	// nil 时不输出 unavailable_tools 字段（向后兼容）。
 	ToolHealth *probe.ToolHealthStatus
+	// PendingDownstreamTasks 是依赖于当前 SchedulerBatch 但尚未到达终态的下游任务列表。
+	// 由 SchedulerExecutor.detectDownstreamTasks 扫描生成。
+	// 非空时 BuildBoardJSON 会在 snapshot 中注入 "pending_downstream_tasks" 段，
+	// 提示 LLM 还有 reactor 触发的任务在运行。
+	// nil 或空时该段被 omitempty 省略。
+	PendingDownstreamTasks []PendingDownstreamTask
+}
+
+// PendingDownstreamTask 是下游待处理任务的描述信息。
+type PendingDownstreamTask struct {
+	TaskID      string
+	Description string
+	Status      string
+	AgentID     string
 }
 
 // BuildBoardJSON 构造 scheduler agent 在每轮 reactLoop 注入到 history 的 board 快照 JSON。
@@ -244,10 +269,21 @@ func BuildBoardJSON(
 	// 构造 session history（来自 SessionHistory + store 的状态查询）
 	sessionEntries := buildSessionEntries(s, sources.History)
 
+	// 构造下游待处理任务列表
+	var pendingDownstream []pendingDownstreamSnapshot
+	for _, pt := range sources.PendingDownstreamTasks {
+		pendingDownstream = append(pendingDownstream, pendingDownstreamSnapshot{
+			TaskID:      pt.TaskID,
+			Description: pt.Description,
+			Status:      pt.Status,
+			AgentID:     pt.AgentID,
+		})
+	}
+
 	bs := boardSnapshot{
-		Mode:    mode,
-		Trigger: ti,
-		Tasks:   taskSnaps,
+		Mode:                   mode,
+		Trigger:                ti,
+		Tasks:                  taskSnaps,
 		Resources: resourceInfo{
 			WorkerCount:       workerCount,
 			BusyWorkers:       busyWorkers,
@@ -257,7 +293,8 @@ func BuildBoardJSON(
 			SpecializedAgents: specialized,
 			AgentCapabilities: agentCaps,
 		},
-		SessionHistory: sessionEntries,
+		SessionHistory:         sessionEntries,
+		PendingDownstreamTasks: pendingDownstream,
 	}
 	data, _ := json.MarshalIndent(bs, "", "  ")
 	return string(data)

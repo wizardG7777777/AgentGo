@@ -49,6 +49,7 @@ type RunnerDeps struct {
 	// Memory 是 v5 Phase 1 引入的 Memory System 共享存储（MemoryManageSystem.md MM5）。
 	// 为 nil 时 Agent 退化为不读取/不写入（行为等价于 v4 无 team-awareness）。
 	Memory         memory.Store
+	Activity       *agent.ActivityTracker
 	MBRegistry     *mailbox.Registry
 	CancelRegistry *store.TaskCancelRegistry
 	SearchProvider webtool.SearchProvider
@@ -106,6 +107,7 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 		deps.GateReg,
 		deps.StoreView,
 		deps.RecordToolCall,
+		rt.TeamAwareness,
 		rt.SystemPrompt,
 	)
 
@@ -124,6 +126,14 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	a.CompactKeepRecent = 3 // v3 数值；与 internal/agent 包级常量 keepRecentForTruncate 同源管理（§11.5.4）
 	a.TransferNoteMaxTokens = deps.TransferNoteMaxTokens
 	a.ProgressNotifyEnabled = deps.ProgressNotifyEnabled
+	a.Activity = deps.Activity
+	if deps.Activity != nil {
+		agentType := rt.EventType
+		if agentType == "" {
+			agentType = rt.Kind
+		}
+		deps.Activity.RegisterAgent(rt.InstanceID, agentType)
+	}
 	a.Model = rt.Model
 	a.ContextLimit = rt.ContextLimit
 	a.OnTaskStart = func(taskID string) { holder.Set(taskID) }

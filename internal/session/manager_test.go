@@ -3,6 +3,7 @@ package session
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -70,7 +71,6 @@ func TestEnableHistoryLog_ReopensOnCreateNew(t *testing.T) {
 	}
 }
 
-
 func TestNewSessionManager_CreatesNewSession(t *testing.T) {
 	dir := t.TempDir()
 	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
@@ -130,6 +130,9 @@ func TestNewSessionManager_RecoverExistingSession(t *testing.T) {
 		t.Fatalf("first NewSessionManager failed: %v", err)
 	}
 	originalID := sm1.Current().ID
+	if err := sm1.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
 
 	// Create a new SessionManager — should recover the existing session
 	sm2, err := NewSessionManager(dir, cfg)
@@ -141,6 +144,9 @@ func TestNewSessionManager_RecoverExistingSession(t *testing.T) {
 	}
 	if sm2.Current().ID != originalID {
 		t.Errorf("recovered session ID = %q, want %q", sm2.Current().ID, originalID)
+	}
+	if sm2.Current().Metadata.Status != "active" {
+		t.Errorf("recovered status = %q, want active", sm2.Current().Metadata.Status)
 	}
 }
 
@@ -935,6 +941,81 @@ func TestSwitchTo_NonexistentSession_ReturnsError(t *testing.T) {
 	err = sm.SwitchTo("nonexistent-uuid")
 	if err == nil {
 		t.Fatal("expected error when switching to nonexistent session")
+	}
+}
+
+func TestNewSessionManagerWithResume_ExactID(t *testing.T) {
+	dir := t.TempDir()
+	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
+
+	sm, err := NewSessionManager(dir, cfg)
+	if err != nil {
+		t.Fatalf("NewSessionManager failed: %v", err)
+	}
+	firstID := sm.Current().ID
+	if err := sm.SaveSnapshotFull(nil, RosterSnapshot{}, nil, nil, &ResultSnapshot{Text: "done", SavedAt: nowUTC()}); err != nil {
+		t.Fatalf("SaveSnapshotFull failed: %v", err)
+	}
+	if _, err := sm.CreateNew(); err != nil {
+		t.Fatalf("CreateNew failed: %v", err)
+	}
+
+	resumed, err := NewSessionManagerWithResume(dir, cfg, firstID)
+	if err != nil {
+		t.Fatalf("NewSessionManagerWithResume failed: %v", err)
+	}
+	if resumed.Current().ID != firstID {
+		t.Fatalf("resumed ID = %s, want %s", resumed.Current().ID, firstID)
+	}
+	if resumed.Current().RecoveredSnapshot == nil || resumed.Current().RecoveredSnapshot.Result == nil {
+		t.Fatal("resume should load snapshot result")
+	}
+	if resumed.Current().RecoveredSnapshot.Result.Text != "done" {
+		t.Fatalf("snapshot result = %q, want done", resumed.Current().RecoveredSnapshot.Result.Text)
+	}
+}
+
+func TestNewSessionManagerWithResume_UniquePrefix(t *testing.T) {
+	dir := t.TempDir()
+	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
+
+	sm, err := NewSessionManager(dir, cfg)
+	if err != nil {
+		t.Fatalf("NewSessionManager failed: %v", err)
+	}
+	id := sm.Current().ID
+	prefix := id[:8]
+
+	resumed, err := NewSessionManagerWithResume(dir, cfg, prefix)
+	if err != nil {
+		t.Fatalf("resume by prefix failed: %v", err)
+	}
+	if resumed.Current().ID != id {
+		t.Fatalf("resumed ID = %s, want %s", resumed.Current().ID, id)
+	}
+}
+
+func TestNewSessionManagerWithResume_AmbiguousPrefix(t *testing.T) {
+	dir := t.TempDir()
+	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
+	for _, id := range []string{"abc-one", "abc-two"} {
+		sessDir := filepath.Join(dir, "sess-"+id)
+		if err := os.MkdirAll(filepath.Join(sessDir, "logs"), 0755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		meta := NewMetadata()
+		meta.SessionID = id
+		if err := meta.Save(filepath.Join(sessDir, "metadata.json")); err != nil {
+			t.Fatalf("Save metadata: %v", err)
+		}
+	}
+
+	_, err := NewSessionManagerWithResume(dir, cfg, "abc")
+	if err == nil {
+		t.Fatal("ambiguous prefix should fail")
+	}
+	if !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("error = %v, want ambiguous", err)
 	}
 }
 

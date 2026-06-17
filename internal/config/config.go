@@ -117,6 +117,10 @@ type AgentRuntimeConfig struct {
 	TaskMaxRetries               int
 	EnforceCompactTokenThreshold int
 	ContextLimit                 int
+	// TeamAwareness 是团队能力感知提示词，描述系统中所有 Agent 类型的能力边界。
+	// 由 Bootstrap 在启动时构建，注入到每个 Agent 的任务描述前，避免跨 kind 的
+	// 能力假设错误（如 verifier 假设 gatherer 有 write_file）。
+	TeamAwareness string
 }
 
 type Config struct {

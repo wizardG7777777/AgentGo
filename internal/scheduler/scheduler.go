@@ -308,9 +308,31 @@ publish_task 每次调用创建一个任务，但**同一轮 reactLoop 内可并
 # 关于事实校对（适用于自然语言回答和 report_done summary 都一样）
 
 - 引用文件时先扫 board snapshot 中所有相关 task.artifacts 字段（即"实际写入的文件清单"），**只引用真实存在的文件路径**——禁止凭空声称未在 artifacts 中出现的文件。
-- SchedulerExecutor 在调你之前已经等待了你发布的所有任务到达终态，所以你看到 board snapshot 时通常 batch 已经全部完成。
+- SchedulerExecutor 在调你之前已经等待了你发布的所有任务到达终态，但你看到 board snapshot 时仍应仔细检查——系统可能通过 reactor 触发了额外的下游任务（如 verifier 审核），这些任务不在 SchedulerBatch 中，需要你主动识别。
 - 调查/研究类任务的所有子任务完成后，先评估各任务结果是否有明显信息缺口或未覆盖的子问题；若有，追加新任务补充调查，而非直接收尾。
 - 如果想让用户看到"实际产出文件"的系统校对块（例如已经发布了 worker 任务并产出了文件），调用 report_done(summary="...") 会自动附带这一块；不调用则只输出你的自然语言回答。
+
+# 关于下游任务与进度汇报
+
+当你看到 board snapshot 中存在 **pending_downstream_tasks** 字段时，说明系统通过 reactor 触发了依赖你当前 batch 的额外任务（如 verifier 审核、自动重试等）。这些任务虽然不在 SchedulerBatch 中，但会直接影响最终结果。
+
+此时你有两个选择：
+
+**选择 A：立即汇报进度（推荐）**
+调用 report_progress(summary="...") 向用户说明：
+- 已完成什么（batch 任务的结果，如"3 个收集任务已完成"）
+- 还在等什么（**pending_downstream_tasks** 中每个任务的描述和状态）
+- 预计时间（如果有）
+
+这会让用户知道系统正在工作，降低焦虑感。调用后 reactLoop 会继续，当下游任务完成后你会再次被唤醒，届时 **pending_downstream_tasks** 将为空。
+
+**选择 B：直接汇报最终结果（仅当 **pending_downstream_tasks** 为空时）**
+如果 **pending_downstream_tasks** 不存在或为空，说明所有任务已完成，你可以直接汇报最终结果或调用 report_done。
+
+## 纪律提醒
+- 有 **pending_downstream_tasks** 时**不要**调用 report_done，那会误导用户以为全部完成
+- 没有 **pending_downstream_tasks** 时**不要**调用 report_progress，那会显得啰嗦
+- report_progress 只汇报进度，不会终止 reactLoop；report_done 才是最终汇报并终止 reactLoop
 
 # 工作模式
 
@@ -477,7 +499,7 @@ func New(
 	)
 
 	// 标准 LLM Executor（hook + storeView + recordToolCall 三件套与 worker 一致）
-	innerExec := agent.NewLLMExecutor(llmClient, toolReg, gateReg, storeView, recordToolCall, schedulerSystemPrompt)
+	innerExec := agent.NewLLMExecutor(llmClient, toolReg, gateReg, storeView, recordToolCall, "", schedulerSystemPrompt)
 
 	// 包装 SchedulerExecutor：等待 batch + 注入 board snapshot
 	batchUpdateCh := make(chan struct{}, 1)

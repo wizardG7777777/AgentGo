@@ -11,11 +11,13 @@ const currentSnapshotVersion = 1
 
 // Snapshot 是某一时刻的完整状态快照。
 type Snapshot struct {
-	Version   int               `json:"version"`
-	SavedAt   string            `json:"saved_at"`
-	Tasks     []TaskSnapshot    `json:"tasks"`
-	Roster    RosterSnapshot    `json:"roster"`
-	Mailboxes []MailboxSnapshot `json:"mailboxes"`
+	Version          int                    `json:"version"`
+	SavedAt          string                 `json:"saved_at"`
+	Tasks            []TaskSnapshot         `json:"tasks"`
+	Roster           RosterSnapshot         `json:"roster"`
+	Mailboxes        []MailboxSnapshot      `json:"mailboxes"`
+	SchedulerHistory []SessionInputSnapshot `json:"scheduler_history,omitempty"`
+	Result           *ResultSnapshot        `json:"result,omitempty"`
 }
 
 // TaskSnapshot 是单个 Task 的可序列化表示。
@@ -74,6 +76,21 @@ type MessageSnapshot struct {
 	Priority   string `json:"priority"`
 	SentAt     string `json:"sent_at"`
 	ChainDepth int    `json:"chain_depth,omitempty"`
+}
+
+// SessionInputSnapshot is the persistent form of scheduler.SessionInput.
+type SessionInputSnapshot struct {
+	Text            string `json:"text"`
+	SchedulerTaskID string `json:"scheduler_task_id"`
+	SubmittedAt     string `json:"submitted_at"`
+}
+
+// ResultSnapshot stores the latest user-visible task result for TUI resume.
+type ResultSnapshot struct {
+	Text     string `json:"text"`
+	Path     string `json:"path,omitempty"`
+	SavedAt  string `json:"saved_at"`
+	Restored bool   `json:"restored,omitempty"`
 }
 
 // SaveSnapshot 将 Snapshot 原子写入到指定路径（write-tmp-then-rename，UTF-8 + 2 空格缩进）。

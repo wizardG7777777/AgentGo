@@ -154,7 +154,7 @@ func TestExecutor_CallsPreHooksBeforeTool(t *testing.T) {
 		},
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, nil)
+	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, nil, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 	task := &model.Task{ID: "task-001", Description: "test"}
 
@@ -199,7 +199,7 @@ func TestExecutor_CallsPostHooksAfterTool(t *testing.T) {
 		},
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, nil)
+	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, nil, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 	task := &model.Task{ID: "task-001", Description: "test"}
 
@@ -250,7 +250,7 @@ func TestExecutor_PreHookAbortSkipsTool(t *testing.T) {
 		},
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, nil)
+	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, nil, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 	task := &model.Task{ID: "task-001", Description: "test"}
 
@@ -292,7 +292,7 @@ func TestExecutor_PostHookSeesToolResult(t *testing.T) {
 		},
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, nil)
+	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, nil, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 	task := &model.Task{ID: "task-001", Description: "test"}
 
@@ -338,7 +338,7 @@ func TestExecutor_PostHookSeesToolError(t *testing.T) {
 		},
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, nil)
+	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, nil, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 	task := &model.Task{ID: "task-001", Description: "test"}
 
@@ -380,7 +380,7 @@ func TestExecutor_AppendsToolCallOnSuccess(t *testing.T) {
 		recStore.AppendToolCall(taskID, rec)
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, nil, nil, recordFunc)
+	executor := NewLLMExecutor(mockLLM, tools, nil, nil, recordFunc, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 
 	_, _ = executor(ctx, task, nil, nil)
@@ -425,7 +425,7 @@ func TestExecutor_AppendsToolCallOnFailure(t *testing.T) {
 		recStore.AppendToolCall(taskID, rec)
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, nil, nil, recordFunc)
+	executor := NewLLMExecutor(mockLLM, tools, nil, nil, recordFunc, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 
 	_, _ = executor(ctx, task, nil, nil)
@@ -475,7 +475,7 @@ func TestExecutor_AppendsToolCallOnHookAbort(t *testing.T) {
 		recStore.AppendToolCall(taskID, rec)
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, recordFunc)
+	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, recordFunc, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 
 	_, _ = executor(ctx, task, nil, nil)
@@ -510,7 +510,7 @@ func TestExecutor_NilRecordFuncSkipsRecording(t *testing.T) {
 	}
 
 	// nil recordFunc
-	executor := NewLLMExecutor(mockLLM, tools, nil, nil, nil)
+	executor := NewLLMExecutor(mockLLM, tools, nil, nil, nil, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 	task := &model.Task{ID: "task-001", Description: "test"}
 
@@ -557,7 +557,7 @@ func TestExecutor_ConcurrentToolCallsRecordAll(t *testing.T) {
 		recStore.AppendToolCall(taskID, rec)
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, nil, nil, recordFunc)
+	executor := NewLLMExecutor(mockLLM, tools, nil, nil, recordFunc, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 
 	_, _ = executor(ctx, task, nil, nil)

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"agentgo/internal/model"
+	"agentgo/internal/session"
 	"agentgo/internal/store"
 )
 
@@ -87,6 +88,58 @@ func (h *SessionHistory) Len() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return len(h.entries)
+}
+
+// ExportSnapshot returns a serializable copy of the current session history.
+func (h *SessionHistory) ExportSnapshot() []session.SessionInputSnapshot {
+	if h == nil {
+		return nil
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make([]session.SessionInputSnapshot, 0, len(h.entries))
+	for _, entry := range h.entries {
+		out = append(out, session.SessionInputSnapshot{
+			Text:            entry.Text,
+			SchedulerTaskID: entry.SchedulerTaskID,
+			SubmittedAt:     entry.SubmittedAt.UTC().Format(time.RFC3339Nano),
+		})
+	}
+	return out
+}
+
+// ImportSnapshot replaces the current session history with persisted entries.
+func (h *SessionHistory) ImportSnapshot(entries []session.SessionInputSnapshot) error {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.entries = h.entries[:0]
+	for _, snap := range entries {
+		submittedAt, err := time.Parse(time.RFC3339Nano, snap.SubmittedAt)
+		if err != nil {
+			submittedAt, err = time.Parse(time.RFC3339, snap.SubmittedAt)
+		}
+		if err != nil {
+			return err
+		}
+		if len(h.entries) >= h.cap {
+			copy(h.entries, h.entries[1:])
+			h.entries[h.cap-1] = SessionInput{
+				Text:            snap.Text,
+				SchedulerTaskID: snap.SchedulerTaskID,
+				SubmittedAt:     submittedAt,
+			}
+			continue
+		}
+		h.entries = append(h.entries, SessionInput{
+			Text:            snap.Text,
+			SchedulerTaskID: snap.SchedulerTaskID,
+			SubmittedAt:     submittedAt,
+		})
+	}
+	return nil
 }
 
 // SchedulerTaskTimeoutSec 是 scheduler task 的超时值。

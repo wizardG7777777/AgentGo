@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -22,6 +23,38 @@ type SessionManager struct {
 	cfg            SessionConfig  // 配置项
 }
 
+// NewSessionManagerWithResume creates a SessionManager and makes resumeID the
+// active session before returning. resumeID may be a full session UUID or a
+// unique prefix.
+func NewSessionManagerWithResume(baseDir string, cfg SessionConfig, resumeID string) (*SessionManager, error) {
+	sm := &SessionManager{
+		baseDir: baseDir,
+		cfg:     cfg,
+	}
+
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		log.Printf("[WARNING] Session baseDir 创建失败: %v", err)
+		return sm, nil
+	}
+
+	if resumeID != "" {
+		if err := sm.initSessionByID(resumeID); err != nil {
+			log.Printf("[WARNING] Session resume 失败: %v", err)
+			sm.current = nil
+			return sm, err
+		}
+		return sm, nil
+	}
+
+	if err := sm.initSession(); err != nil {
+		log.Printf("[WARNING] Session 初始化失败: %v", err)
+		sm.current = nil
+		return sm, nil
+	}
+
+	return sm, nil
+}
+
 // NewSessionManager 创建并初始化 SessionManager。
 // 1. 创建 baseDir（如不存在）
 // 2. 读取 active-session 文件
@@ -29,27 +62,7 @@ type SessionManager struct {
 // 4. 否则 → 调用 CreateNew()
 // 5. 任何初始化错误 → 返回 nil current 的 SessionManager（降级模式），不返回 error
 func NewSessionManager(baseDir string, cfg SessionConfig) (*SessionManager, error) {
-	sm := &SessionManager{
-		baseDir: baseDir,
-		cfg:     cfg,
-	}
-
-	// 创建 baseDir
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
-		// 降级：无法创建基础目录
-		log.Printf("[WARNING] Session baseDir 创建失败: %v", err)
-		return sm, nil
-	}
-
-	// 尝试恢复或创建 Session
-	if err := sm.initSession(); err != nil {
-		// 降级：初始化失败，以无 Session 模式运行
-		log.Printf("[WARNING] Session 初始化失败: %v", err)
-		sm.current = nil
-		return sm, nil
-	}
-
-	return sm, nil
+	return NewSessionManagerWithResume(baseDir, cfg, "")
 }
 
 // initSession 尝试恢复已有 Session 或创建新 Session。
@@ -63,22 +76,15 @@ func (sm *SessionManager) initSession() error {
 
 		// 检查 Session 目录和 metadata.json 是否存在
 		if info, statErr := os.Stat(sessDir); statErr == nil && info.IsDir() {
-			if meta, loadErr := LoadMetadata(metaPath); loadErr == nil {
-				sm.current = &Session{
-					ID:       sessionID,
-					Dir:      sessDir,
-					Metadata: *meta,
+			if _, loadErr := os.Stat(metaPath); loadErr == nil {
+				if sess, err := sm.loadSession(sessionID, sessDir); err == nil {
+					if err := sm.activateLoadedSession(sess); err != nil {
+						return err
+					}
+					return nil
+				} else {
+					log.Printf("[WARNING] active-session metadata 加载失败: %v", err)
 				}
-
-				// 尝试恢复快照（snapshot.json）
-				snap, snapErr := sm.loadSnapshotInternal()
-				if snapErr != nil {
-					log.Printf("[WARNING] snapshot 恢复失败: %v", snapErr)
-				} else if snap != nil {
-					sm.current.RecoveredSnapshot = snap
-				}
-
-				return nil
 			}
 		}
 		// active-session 指向无效目录，记录警告并创建新 Session
@@ -92,6 +98,94 @@ func (sm *SessionManager) initSession() error {
 	}
 	sm.current = sess
 	return nil
+}
+
+func (sm *SessionManager) initSessionByID(id string) error {
+	sessionID, sessDir, err := sm.resolveSessionID(id)
+	if err != nil {
+		return err
+	}
+	sess, err := sm.loadSession(sessionID, sessDir)
+	if err != nil {
+		return err
+	}
+	if err := sm.activateLoadedSession(sess); err != nil {
+		return err
+	}
+	if err := sm.writeActiveSession(sessionID); err != nil {
+		return fmt.Errorf("write active resumed session: %w", err)
+	}
+	sm.current = sess
+	return nil
+}
+
+func (sm *SessionManager) loadSession(sessionID, sessDir string) (*Session, error) {
+	metaPath := filepath.Join(sessDir, "metadata.json")
+	meta, err := LoadMetadata(metaPath)
+	if err != nil {
+		return nil, fmt.Errorf("load session metadata: %w", err)
+	}
+	sess := &Session{
+		ID:       sessionID,
+		Dir:      sessDir,
+		Metadata: *meta,
+	}
+	sm.current = sess
+	snap, snapErr := sm.loadSnapshotInternal()
+	if snapErr != nil {
+		log.Printf("[WARNING] snapshot 恢复失败: %v", snapErr)
+	} else if snap != nil {
+		sess.RecoveredSnapshot = snap
+	}
+	return sess, nil
+}
+
+func (sm *SessionManager) activateLoadedSession(sess *Session) error {
+	if sess == nil {
+		return nil
+	}
+	sess.Metadata.Status = "active"
+	sess.Metadata.EndedAt = ""
+	metaPath := filepath.Join(sess.Dir, "metadata.json")
+	if err := sess.Metadata.Save(metaPath); err != nil {
+		return fmt.Errorf("save active session metadata: %w", err)
+	}
+	return nil
+}
+
+func (sm *SessionManager) resolveSessionID(id string) (string, string, error) {
+	if id == "" {
+		return "", "", fmt.Errorf("empty session id")
+	}
+	if id != filepath.Base(id) {
+		return "", "", fmt.Errorf("invalid session id %q", id)
+	}
+	exactDir := filepath.Join(sm.baseDir, "sess-"+id)
+	if info, err := os.Stat(exactDir); err == nil && info.IsDir() {
+		return id, exactDir, nil
+	}
+
+	entries, err := os.ReadDir(sm.baseDir)
+	if err != nil {
+		return "", "", fmt.Errorf("read sessions dir: %w", err)
+	}
+	var matches []string
+	prefix := "sess-" + id
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		sessionID := strings.TrimPrefix(entry.Name(), "sess-")
+		matches = append(matches, sessionID)
+	}
+	if len(matches) == 0 {
+		return "", "", fmt.Errorf("session %q not found", id)
+	}
+	if len(matches) > 1 {
+		sort.Strings(matches)
+		return "", "", fmt.Errorf("session prefix %q is ambiguous (%d matches)", id, len(matches))
+	}
+	return matches[0], filepath.Join(sm.baseDir, "sess-"+matches[0]), nil
 }
 
 // Current 返回当前活跃 Session，nil 表示无 Session 模式。
@@ -359,6 +453,12 @@ func (sm *SessionManager) IncrementTaskCount() {
 // ts: TaskStore 导出的任务快照, rs: Roster 导出的快照, ms: Mailbox 导出的快照。
 // 如果 current 为 nil，返回错误。
 func (sm *SessionManager) SaveSnapshot(ts []TaskSnapshot, rs RosterSnapshot, ms []MailboxSnapshot) error {
+	return sm.SaveSnapshotFull(ts, rs, ms, nil, nil)
+}
+
+// SaveSnapshotFull extends SaveSnapshot with scheduler history and the latest
+// user-visible task result for resume.
+func (sm *SessionManager) SaveSnapshotFull(ts []TaskSnapshot, rs RosterSnapshot, ms []MailboxSnapshot, history []SessionInputSnapshot, result *ResultSnapshot) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -367,11 +467,13 @@ func (sm *SessionManager) SaveSnapshot(ts []TaskSnapshot, rs RosterSnapshot, ms 
 	}
 
 	snap := &Snapshot{
-		Version:   currentSnapshotVersion,
-		SavedAt:   nowUTC(),
-		Tasks:     ts,
-		Roster:    rs,
-		Mailboxes: ms,
+		Version:          currentSnapshotVersion,
+		SavedAt:          nowUTC(),
+		Tasks:            ts,
+		Roster:           rs,
+		Mailboxes:        ms,
+		SchedulerHistory: history,
+		Result:           result,
 	}
 
 	path := filepath.Join(sm.current.Dir, "snapshot.json")

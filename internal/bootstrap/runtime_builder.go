@@ -13,6 +13,7 @@ package bootstrap
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"agentgo/internal/config"
@@ -59,6 +60,7 @@ func buildAgentRuntime(
 	kind config.AgentKind,
 	llmCfg config.LLMConfig,
 	toolProfiles map[string][]string,
+	allKinds []config.AgentKind,
 	replicaIndex int,
 ) (config.AgentRuntimeConfig, error) {
 	// 解析工具集（profile 名查表 / tools 字段直接使用）
@@ -91,6 +93,9 @@ func buildAgentRuntime(
 		model = llmCfg.DefaultModel
 	}
 
+	// 构建团队能力感知提示词：列出系统中所有 Agent 类型及其能力边界
+	teamAwareness := buildTeamAwareness(kind, allKinds, toolProfiles)
+
 	rt := config.AgentRuntimeConfig{
 		InstanceID:                   fmt.Sprintf("%s-%d", kind.Kind, replicaIndex),
 		Kind:                         kind.Kind,
@@ -102,8 +107,69 @@ func buildAgentRuntime(
 		TaskMaxRetries:               kind.TaskMaxRetries,
 		EnforceCompactTokenThreshold: kind.EnforceCompactTokenThreshold,
 		ContextLimit:                 kind.ContextLimit,
+		TeamAwareness:                teamAwareness,
 	}
 	return rt, nil
+}
+
+// buildTeamAwareness 构建团队能力感知提示词。
+// 列出系统中所有 Agent 类型（kind）的工具集与角色描述，帮助每个 Agent 了解
+// 协作者的能力边界，避免指派超出对方能力的任务。
+func buildTeamAwareness(
+	myKind config.AgentKind,
+	allKinds []config.AgentKind,
+	toolProfiles map[string][]string,
+) string {
+	var b strings.Builder
+	b.WriteString("\n# 团队能力感知（本次任务涉及以下 Agent 类型）\n\n")
+	b.WriteString("本次任务由多类 Agent 协作完成。以下为系统中各类 Agent 的能力清单，\n")
+	b.WriteString("供你在派发任务、请求协助或判断协作者能力边界时参考。\n")
+	b.WriteString("请特别注意：**不要指派超出对方工具集范围的操作**。\n\n")
+
+	for _, k := range allKinds {
+		// 跳过 scheduler（不是任务执行者）
+		if k.Kind == "scheduler" {
+			continue
+		}
+
+		// 解析工具集
+		var tools []string
+		if k.Profile != "" {
+			if t, ok := toolProfiles[k.Profile]; ok {
+				tools = t
+			}
+		} else {
+			tools = k.Tools
+		}
+
+		b.WriteString(fmt.Sprintf("## %s\n", k.Kind))
+		if k.Description != "" {
+			b.WriteString(fmt.Sprintf("- 角色：%s\n", strings.TrimSpace(k.Description)))
+		}
+		if k.EventType != "" {
+			b.WriteString(fmt.Sprintf("- 事件类型：%s\n", k.EventType))
+		}
+		if len(tools) > 0 {
+			b.WriteString(fmt.Sprintf("- 可用工具：%s\n", strings.Join(tools, ", ")))
+		}
+		b.WriteString("\n")
+	}
+
+	// 追加一条关于自己的提示
+	b.WriteString("# 纪律提醒\n\n")
+	b.WriteString("- 当你需要其他 Agent 执行写文件、运行命令等操作时，\n")
+	b.WriteString("  必须先确认对方 Agent 类型拥有对应工具（见上表）。\n")
+	b.WriteString("- **发布新任务前，务必确认对方是否拥有对应的工具**。\n")
+	b.WriteString("  如果对方没有执行任务所需的工具，**禁止**发布该 Agent 无能力执行的任务。\n")
+	b.WriteString("  例如：对方没有 write_file → 不应要求其写入文件；\n")
+	b.WriteString("  对方没有 run_shell → 不应要求其执行命令。\n")
+	b.WriteString("- 若目标 Agent 缺少所需工具，可尝试要求其以**其他方式**完成或交付任务：\n")
+	b.WriteString("  如没有写入能力时，要求其以直接文字回复的形式回报；\n")
+	b.WriteString("  如没有网络搜索能力时，要求其基于已有资料回答。\n")
+	b.WriteString("- 不要假设「所有 Agent 都有相同工具集」——不同 kind 的工具配置可能不同。\n")
+	b.WriteString("\n---\n")
+
+	return b.String()
 }
 
 // buildSchedulerRuntime 为 scheduler 单例合成 AgentRuntimeConfig。

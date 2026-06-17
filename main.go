@@ -29,6 +29,7 @@ func main() {
 
 	configPath := flag.String("config", "setting.yaml", "配置文件路径")
 	skipStartupProbe := flag.Bool("skip-startup-probe", false, "跳过启动期 TCP probe（等价于 startup_probe: off）")
+	resumeSessionID := flag.String("resume", "", "恢复指定 Session（完整 ID 或唯一前缀）")
 	flag.Parse()
 
 	// 判断用户是否显式指定了 -config
@@ -39,7 +40,10 @@ func main() {
 		}
 	})
 
-	sys, err := bootstrap.Bootstrap(*configPath, explicit, *skipStartupProbe)
+	sys, err := bootstrap.BootstrapWithOptions(*configPath, explicit, bootstrap.BootstrapOptions{
+		SkipStartupProbe: *skipStartupProbe,
+		ResumeSessionID:  *resumeSessionID,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[错误] 启动失败: %v\n", err)
 		os.Exit(1)

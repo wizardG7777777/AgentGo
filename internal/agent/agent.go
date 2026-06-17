@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -139,9 +140,18 @@ type Agent struct {
 	// 失败路径 buildTransferNote 按此值做 L1/L3 输出截断。Sprint 3 #5 引入。
 	TransferNoteMaxTokens int
 
+	// TextOnlyReportsDir 覆盖 persistTextOnlySubmission 的兜底落盘目录。
+	// 空串时使用默认 "reports"（相对于进程 CWD）。生产线无需设置，
+	// 测试用 t.TempDir() 注入隔离目录。详见 [[persistTextOnlySubmission]]。
+	TextOnlyReportsDir string
+
 	// ProgressNotifyEnabled 控制进度通知功能是否启用。
 	// 为 true 时，Agent 在文件写入、子任务发布或任务过半时通过 mailbox 发送进度消息。
 	ProgressNotifyEnabled bool
+
+	// Activity 是 TUI 使用的实时活动快照。它只做 best-effort 展示，不参与
+	// 任务状态判定；nil 时保持非 TUI 路径的旧行为。
+	Activity *ActivityTracker
 
 	// stateGuard 是 v5 Phase 3 引入的 Agent 运行时状态机字段
 	// （ReactiveSystem.md §7）。零值即 Idle，由 SetState/mustSetState 切换。
@@ -169,18 +179,22 @@ func (a *Agent) transferNoteMaxTokens() int {
 
 // emitTextOnlySubmissionIfNoArtifacts 在任务自然成功的两个出口（finalization 短路 +
 // react_loop_exit:natural）之后调用，判别本次提交是否属于"代理什么都没落盘，仅吐出
-// 一份文字汇报"——如是则 emit KindTextOnlySubmission 让用户 reactor 可见。
+// 一份文字汇报"——如是则同步做两件事：
+//
+//  1. **持久化兜底**：把 content 写到 reports/text_only_<task_id>.md。
+//     2026-05-18 TUI 死锁事故暴露的问题——scheduler 走 text-only 路径时
+//     正文只存在 ViewportCard 内存里，进程退出即丢，磁盘上无任何拷贝。
+//     此处兜底保证正文落盘，TUI 故障也不丢内容。
+//  2. **emit trace 事件**：让 reactor `on:` 直接订阅。
 //
 // 判别条件（全部满足）：
-//   - outputLen > 0（有文字产出）
-//   - task.Artifacts 为空（整个任务生命周期内 0 个 file_written → record-artifact
-//     reactor 未追加任何记录）
+//   - content 非空（有文字产出）
+//   - task.Artifacts 为空（整个任务生命周期内 0 个 file_written）
 //
 // Store=nil 或 GetTask 出错时跳过——只是少一次额外的可观察性事件，不影响主流程。
-// 不在 KindTaskSubmitted 同点判断（保持那段已稳定逻辑只触发 1 个事件的语义），
-// 而是单独走 KindTextOnlySubmission——便于 reactor `on:` 直接订阅，避免 when 表达式。
-func (a *Agent) emitTextOnlySubmissionIfNoArtifacts(taskID string, outputLen, loopsUsed int) {
-	if outputLen <= 0 || a.Store == nil {
+// 文件写入失败仅打 stderr WARNING，不阻断主流程（与 trace.Emit 的"尽力记录"语义一致）。
+func (a *Agent) emitTextOnlySubmissionIfNoArtifacts(taskID, content string, loopsUsed int) {
+	if content == "" || a.Store == nil {
 		return
 	}
 	got, err := a.Store.GetTask(taskID)
@@ -190,13 +204,44 @@ func (a *Agent) emitTextOnlySubmissionIfNoArtifacts(taskID string, outputLen, lo
 	if len(got.Artifacts) > 0 {
 		return
 	}
+	a.persistTextOnlySubmission(taskID, content)
 	trace.Emit(trace.Event{
 		Kind:      trace.KindTextOnlySubmission,
 		TaskID:    taskID,
 		AgentID:   a.ID,
-		OutputLen: outputLen,
+		OutputLen: len(content),
 		LoopsUsed: loopsUsed,
 	})
+}
+
+// persistTextOnlySubmission 把仅文字交付的 task 正文写到 reports/text_only_<task_id>.md。
+//
+// 这是 [[emitTextOnlySubmissionIfNoArtifacts]] 的兜底落盘，保证 TUI 渲染层即使
+// 失灵也不丢正文。reports/ 路径与 verifier 现有产出（text_only_*_APPROVED.md）
+// 同根，便于后续用同一套 glob 找回。
+//
+// 失败语义：仅 stderr WARNING，不返回错误——持久化失败不应影响主流程的任务完成。
+// reports/ 不存在时自动创建（mkdir -p）。
+//
+// 测试钩子：可通过 TextOnlyReportsDir 字段覆盖默认 "reports" 目录，便于单测隔离。
+func (a *Agent) persistTextOnlySubmission(taskID, content string) {
+	if content == "" {
+		return
+	}
+	dir := a.TextOnlyReportsDir
+	if dir == "" {
+		dir = "reports"
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("[agent %s] WARNING: 创建 %s 目录失败: %v", a.ID, dir, err)
+		return
+	}
+	path := filepath.Join(dir, fmt.Sprintf("text_only_%s.md", taskID))
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		log.Printf("[agent %s] WARNING: 写入 text-only 兜底文件 %s 失败: %v", a.ID, path, err)
+		return
+	}
+	log.Printf("[agent %s] text-only submission 已落盘: %s (%d 字节)", a.ID, path, len(content))
 }
 
 // Run starts the agent's main loop. It polls for available tasks and processes them.
@@ -279,6 +324,11 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// idle → processing 必须在所有 SetState(Terminating/Idle) 等 defer 注册前完成，
 	// 否则 defer 跑时 prev 还是 idle，转换表会拒绝 idle→terminating 走 panic。
 	a.mustSetState(AgentStateProcessing, "task_claimed:"+taskID, taskID)
+	agentType := a.EventType
+	if agentType == "" {
+		agentType = "worker"
+	}
+	a.Activity.TaskClaimed(a.ID, agentType, taskID, task.Description)
 
 	// terminatingCause 由闭包捕获，panic 路径与显式分支会覆盖默认值。
 	// 默认 "react_loop_exit:natural" 覆盖正常完成（finalization / SubmitResult 后退出）；
@@ -294,6 +344,9 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		enteredTerminating = true
 		a.mustSetState(AgentStateTerminating, cause, taskID)
 	}
+	defer func() {
+		a.Activity.TaskFinished(a.ID, taskID, taskSuccess, terminatingCause)
+	}()
 
 	// === defer 注册顺序（LIFO 反向 = 执行顺序）===
 	// 注册 1（执行最后）：trace.CloseTask 关闭 trace 文件
@@ -582,7 +635,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					OutputLen: len(lastOutput),
 					LoopsUsed: i,
 				})
-				a.emitTextOnlySubmissionIfNoArtifacts(taskID, len(lastOutput), i)
+				a.emitTextOnlySubmissionIfNoArtifacts(taskID, lastOutput, i)
 				trace.Emit(trace.Event{
 					Kind:    trace.KindTaskCompleted,
 					TaskID:  taskID,
@@ -636,11 +689,16 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		copy(histCopy, history)
 
 		// 注入 agentID、taskID、循环轮次到 context，供 llm_executor 和工具层日志/trace 使用
+		a.Activity.LoopStarted(a.ID, taskID, i)
 		execCtx := WithAgentContext(ctx, a.ID, taskID, i)
+		if a.Activity != nil {
+			execCtx = WithActivityContext(execCtx, a.Activity)
+		}
 		result, execErr := a.Execute(execCtx, task, depResults, histCopy)
 
 		if execErr != nil {
 			terminatingCause = "react_loop_exit:error"
+			a.Activity.LLMEnd(a.ID, taskID, i, "", 0, execErr)
 			enterTerminating(terminatingCause)
 			a.handleFailure(task, taskID, execErr, history)
 			return
@@ -749,7 +807,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					OutputLen: len(lastOutput),
 					LoopsUsed: i + 1,
 				})
-				a.emitTextOnlySubmissionIfNoArtifacts(taskID, len(lastOutput), i+1)
+				a.emitTextOnlySubmissionIfNoArtifacts(taskID, lastOutput, i+1)
 				trace.Emit(trace.Event{
 					Kind:    trace.KindTaskCompleted,
 					TaskID:  taskID,

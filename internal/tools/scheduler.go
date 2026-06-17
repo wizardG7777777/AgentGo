@@ -68,6 +68,18 @@ func (g SchedulerGroup) Register(r *agent.ToolRegistry) {
 				Build(),
 			g.reportDone,
 		)
+
+		r.Register(
+			"report_progress",
+			"向用户汇报中间进度，不终止当前 reactLoop。"+
+				"当 board snapshot 显示还有 pending_downstream_tasks 时使用，"+
+				"让用户知道系统正在工作，降低焦虑感。"+
+				"调用后 reactLoop 会继续，等下游任务完成后再汇报最终结果。",
+			schema.Object().
+				String("summary", "给用户的进度汇报摘要", true).
+				Build(),
+			g.reportProgress,
+		)
 	}
 
 	r.Register(
@@ -200,6 +212,27 @@ func (g SchedulerGroup) reportDone(ctx context.Context, args map[string]any) (st
 	}
 
 	return "已向用户报告完成", nil
+}
+
+// reportProgress 是 report_progress 工具的实现。
+// 向用户输出中间进度摘要，但不调用 FinalizationNotifier，
+// 让 reactLoop 继续执行，等下游任务完成后再汇报最终结果。
+func (g SchedulerGroup) reportProgress(ctx context.Context, args map[string]any) (string, error) {
+	summary, _ := args["summary"].(string)
+	if summary == "" {
+		return "", fmt.Errorf("summary 不能为空")
+	}
+
+	// 输出到用户可见终端
+	if g.UserOutput != nil {
+		fmt.Fprintf(g.UserOutput, "\n📊 任务进度更新\n%s\n\n", summary)
+	} else {
+		log.Printf("📊 任务进度更新\n%s", summary)
+	}
+
+	// 关键：不调用 FinalizationNotifier.MarkTaskFinalized()
+	// 返回成功，让 reactLoop 继续下一轮
+	return "进度已记录，继续处理中...", nil
 }
 
 // buildSchedulerArtifactsReport 扫描指定任务列表，从 task.Artifacts 构造一段

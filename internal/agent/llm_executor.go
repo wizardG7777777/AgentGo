@@ -30,6 +30,7 @@ const (
 	// 多写一遍 APPROVED.md / 多发一条 send_message）被结构性地阻断。
 	// 详见 transfer_note.go L1 注释 + agent.go MaxLoops 兜底路径。
 	ctxNoTools
+	ctxActivity
 )
 
 // WithAgentContext 将 agentID + taskID + loopNum 注入 context，
@@ -40,6 +41,12 @@ func WithAgentContext(ctx context.Context, agentID, taskID string, loopNum int) 
 	ctx = context.WithValue(ctx, ctxTaskID, taskID)
 	ctx = context.WithValue(ctx, ctxLoopNum, loopNum)
 	return ctx
+}
+
+// WithActivityContext injects the best-effort live activity tracker used by the
+// TUI. It is optional; executor behavior is unchanged when absent.
+func WithActivityContext(ctx context.Context, tracker *ActivityTracker) context.Context {
+	return context.WithValue(ctx, ctxActivity, tracker)
 }
 
 // WithCancelSource 标记当前 context 的取消来源，供 processTask 在
@@ -80,6 +87,11 @@ func noToolsFromContext(ctx context.Context) bool {
 	return v
 }
 
+func activityFromContext(ctx context.Context) *ActivityTracker {
+	tracker, _ := ctx.Value(ctxActivity).(*ActivityTracker)
+	return tracker
+}
+
 // truncateForLog 将参数截断为日志友好的短字符串。
 func truncateForLog(args map[string]any, maxLen int) string {
 	b, err := json.Marshal(args)
@@ -108,12 +120,15 @@ func truncateForLog(args map[string]any, maxLen int) string {
 // 三个参数均允许 nil，nil 时整段 Gate + 历史记录路径与改动前字节级一致。
 //
 // systemPrompt 为可选参数，非空时作为 system/developer 消息注入到对话开头。
+// teamAwareness 为可选参数，描述系统中其他 Agent 类型的能力边界，
+// 非空时注入到每条 user prompt 的 task description 之前。
 func NewLLMExecutor(
 	client llm.Client,
 	tools *ToolRegistry,
 	gateReg *gate.Registry,
 	storeView store.StoreHookView,
 	recordToolCall func(string, store.ToolCallRecord),
+	teamAwareness string,
 	systemPrompt ...string,
 ) TaskExecutor {
 	// storeView 当前仅用作未来扩展位。编译器会抱怨未使用，先用 _ 绑定一下。
@@ -129,14 +144,16 @@ func NewLLMExecutor(
 		if task.SystemPrompt != "" {
 			effectivePrompt = task.SystemPrompt
 		}
-		messages := buildMessages(effectivePrompt, task, depResults, history)
+		messages := buildMessages(effectivePrompt, task, depResults, history, teamAwareness)
 
 		agentIDForTrace, _ := ctx.Value(ctxAgentID).(string)
 		loopForTrace, _ := ctx.Value(ctxLoopNum).(int)
+		activity := activityFromContext(ctx)
 		var toolDefs []llm.ToolDef
 		if !noToolsFromContext(ctx) {
 			toolDefs = tools.Defs()
 		}
+		activity.LLMStart(agentIDForTrace, task.ID, loopForTrace, len(toolDefs))
 
 		// Trace：LLM 调用开始
 		trace.Emit(trace.Event{
@@ -155,6 +172,7 @@ func NewLLMExecutor(
 		llmDuration := time.Since(llmStart)
 
 		if err != nil {
+			activity.LLMEnd(agentIDForTrace, task.ID, loopForTrace, "", 0, err)
 			trace.Emit(trace.Event{
 				Kind:       trace.KindLLMCallEnd,
 				TaskID:     task.ID,
@@ -178,6 +196,7 @@ func NewLLMExecutor(
 			ToolCallsCount:   len(resp.ToolCalls),
 		})
 		trace.DumpResponse(task.ID, loopForTrace, resp.Content, resp.ToolCalls, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+		activity.LLMEnd(agentIDForTrace, task.ID, loopForTrace, resp.Content, len(resp.ToolCalls), nil)
 
 		// 无 tool calls → 任务完成
 		if len(resp.ToolCalls) == 0 {
@@ -207,6 +226,7 @@ func NewLLMExecutor(
 				defer wg.Done()
 				argsLog := truncateForLog(c.Arguments, 120)
 				log.Printf("[agent %s] task=%s loop=%d tool=%s args=%s", agentID, task.ID, loopNum, c.Name, argsLog)
+				activity.ToolStarted(agentID, task.ID, loopNum, c.ID, c.Name)
 				// Trace：工具调用开始（含完整 args，不做截断）
 				trace.Emit(trace.Event{
 					Kind:    trace.KindToolCall,
@@ -272,6 +292,7 @@ func NewLLMExecutor(
 						ResultLen:  len(content),
 					})
 				}
+				activity.ToolFinished(agentID, task.ID, loopNum, c.ID, c.Name, toolErr)
 
 				// 写入 ToolCallRecord（hookSystem.md §11.1.3）：
 				//   - 时机：Dispatch 之后、RunPost 之前 —— 让 post hook 能通过
@@ -336,7 +357,8 @@ func NewLLMExecutor(
 
 // buildMessages 将任务信息和执行历史转换为 LLM 对话消息。
 // systemPrompt 非空时作为 system 消息插入到对话开头。
-func buildMessages(systemPrompt string, task *model.Task, depResults map[string]string, history []HistoryEntry) []llm.Message {
+// teamAwareness 非空时注入到 user prompt 的 task description 之前。
+func buildMessages(systemPrompt string, task *model.Task, depResults map[string]string, history []HistoryEntry, teamAwareness string) []llm.Message {
 	var messages []llm.Message
 
 	// 注入 system prompt（如果提供）
@@ -344,8 +366,12 @@ func buildMessages(systemPrompt string, task *model.Task, depResults map[string]
 		messages = append(messages, llm.Message{Role: "system", Content: systemPrompt})
 	}
 
-	// 构建用户消息：任务描述 + 依赖结果
+	// 构建用户消息：团队能力感知 + 任务描述 + 依赖结果
 	var prompt strings.Builder
+	if teamAwareness != "" {
+		prompt.WriteString(teamAwareness)
+		prompt.WriteString("\n")
+	}
 	prompt.WriteString(task.Description)
 
 	if len(depResults) > 0 {

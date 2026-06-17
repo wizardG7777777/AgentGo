@@ -21,15 +21,15 @@ func TestSchedulerGroup_Register_AllTools(t *testing.T) {
 		Holder: &fakeHolder{id: "sched-1"},
 	}.Register(reg)
 	defs := reg.Defs()
-	if len(defs) != 3 {
-		t.Fatalf("expected 3 tools (cancel_task + report_done + probe_directory), got %d", len(defs))
+	if len(defs) != 4 {
+		t.Fatalf("expected 4 tools (cancel_task + report_done + report_progress + probe_directory), got %d", len(defs))
 	}
 	names := map[string]bool{}
 	for _, d := range defs {
 		names[d.Name] = true
 	}
-	if !names["cancel_task"] || !names["report_done"] || !names["probe_directory"] {
-		t.Errorf("expected cancel_task + report_done + probe_directory, got %v", names)
+	if !names["cancel_task"] || !names["report_done"] || !names["report_progress"] || !names["probe_directory"] {
+		t.Errorf("expected cancel_task + report_done + report_progress + probe_directory, got %v", names)
 	}
 }
 
