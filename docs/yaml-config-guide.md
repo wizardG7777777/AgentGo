@@ -13,7 +13,7 @@ AgentGo 有**两类** YAML 文件：
 
 完整可跑模板：[config.example.yaml](../config.example.yaml) + [test_invest.yaml](../test_invest.yaml) + [test_invest_reactors.yaml](../test_invest_reactors.yaml)。
 
-⚠️ 仓库里的 [test_multi_agent.yaml](../test_multi_agent.yaml) 是 v3 残留，**不要参考**——它的顶层字段在 v4/v5 已被忽略。
+⚠️ v3 遗留配置 `test_multi_agent.yaml` 已删除，**不要参考**——它的顶层字段在 v4/v5 已被忽略。
 
 ---
 
@@ -212,7 +212,7 @@ reactor_spawn_depth_exceeded
 
 ```yaml
 when: "${event.task.depth} < 5"
-when: "${event.path} contains reports/"
+when: "${event.path} contains .agentgo/reports/"
 ```
 
 ### 3.4 模板变量

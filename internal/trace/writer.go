@@ -19,7 +19,7 @@ import (
 //	<UTC时间戳>_<task_id前8位>.jsonl
 //	例：2026-04-08T04-17-06_321b561d.jsonl
 //
-// 并发安全：通过单一互斥锁串行化所有 Emit 调用。已知问题（见 KNOWN_ISSUES）：
+// 并发安全：通过单一互斥锁串行化所有 Emit 调用。性能注意点：
 // 高并发场景下锁可能成为瓶颈，未来可改造为 per-task channel + 单 writer goroutine。
 //
 // GC 策略：每次创建新任务文件后，扫描目录，若 .jsonl 文件总数超过 maxTasks，

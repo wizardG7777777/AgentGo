@@ -243,7 +243,7 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if m.view == ViewResult {
+	if m.view == ViewResult && m.focus != FocusSidebar {
 		pageStep := m.layout.MainH - 4
 		if pageStep < 1 {
 			pageStep = 1
@@ -307,17 +307,30 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.focus == FocusSidebar {
 		switch key {
 		case "up", "k":
-			if m.selectedAgent > 0 {
-				m.selectedAgent--
-			}
+			m.moveSelectedAgent(-1)
 			return m, nil
 		case "down", "j":
-			if m.selectedAgent < len(m.agents)-1 {
-				m.selectedAgent++
-			}
+			m.moveSelectedAgent(1)
 			return m, nil
 		case "enter":
-			if m.selectedAgent >= 0 && m.selectedAgent < len(m.agents) {
+			if m.ensureSelectedAgent() {
+				m.view = ViewAgentDetail
+			}
+			return m, nil
+		}
+	}
+
+	// Main panel navigation
+	if m.focus == FocusMain && (m.view == ViewDashboard || m.view == ViewAgentDetail) {
+		switch key {
+		case "up", "k":
+			m.moveSelectedAgent(-1)
+			return m, nil
+		case "down", "j":
+			m.moveSelectedAgent(1)
+			return m, nil
+		case "enter":
+			if m.ensureSelectedAgent() {
 				m.view = ViewAgentDetail
 			}
 			return m, nil
@@ -361,6 +374,44 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m *AppModel) ensureSelectedAgent() bool {
+	if len(m.agents) == 0 {
+		m.selectedAgent = -1
+		return false
+	}
+	if m.selectedAgent < 0 {
+		m.selectedAgent = 0
+	}
+	if m.selectedAgent >= len(m.agents) {
+		m.selectedAgent = len(m.agents) - 1
+	}
+	return true
+}
+
+func (m *AppModel) moveSelectedAgent(delta int) {
+	if len(m.agents) == 0 {
+		m.selectedAgent = -1
+		return
+	}
+	if m.selectedAgent < 0 {
+		m.selectedAgent = 0
+		return
+	}
+	if m.selectedAgent >= len(m.agents) {
+		m.selectedAgent = len(m.agents) - 1
+		return
+	}
+
+	next := m.selectedAgent + delta
+	if next < 0 {
+		next = 0
+	}
+	if next >= len(m.agents) {
+		next = len(m.agents) - 1
+	}
+	m.selectedAgent = next
 }
 
 func (m *AppModel) cycleFocus() {

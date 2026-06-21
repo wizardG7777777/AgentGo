@@ -10,7 +10,7 @@ import (
 // WakeWorthyFilterHook 在 PhaseBeforeWake 阶段筛选"是否值得为该邮箱发布
 // 独立 wake Task"。
 //
-// 背景（KNOWN_ISSUES.md P2 "Mail-notifier Progress-Notify 寄生唤醒"）：
+// 背景（历史修复记录 P2 "Mail-notifier Progress-Notify 寄生唤醒"）：
 // mail-notifier.scan 默认策略是"邮箱非空就发 wake Task"，对 type=info /
 // priority=low 的广播类邮件（progress-notify 等）同样成立，导致每一次
 // 有效写文件放大为 N× 寄生 LLM 调用。实际上这类邮件等 peer 自然进入
@@ -113,7 +113,7 @@ func (h *WakeWorthyFilterHook) Run(hctx hook.MailboxHookContext) hook.MailboxHoo
 	}
 
 	// v2 清扫副作用：只丢弃白名单（info/ack + low），其它（reply / info+normal 等）保留。
-	// 理由见 KNOWN_ISSUES.md + 结构体头部注释。
+	// 理由见历史修复记录与结构体头部注释。
 	dropped := 0
 	if h.Dropper != nil {
 		dropped = h.Dropper.DropMatching(hctx.AgentID, isSafelyDroppable)

@@ -1,7 +1,7 @@
 // 测试 text-only submission 落盘兜底——2026-05-18 TUI 死锁事故的根本对策。
 //
 // 事故复盘：scheduler 走 text_only_submission 路径时正文只活在 ViewportCard 内存里，
-// 进程退出即丢，磁盘上无任何拷贝。本组测试守护"emit 之前必定先落盘到 reports/"。
+// 进程退出即丢，磁盘上无任何拷贝。本组测试守护"emit 之前必定先落盘到 .agentgo/reports/"。
 package agent
 
 import (
@@ -15,7 +15,7 @@ import (
 )
 
 // newAgentForPersistTest 构造一个最小化 Agent，注入临时 TextOnlyReportsDir
-// 隔离测试副作用，避免污染 repo 根的 reports/。
+// 隔离测试副作用，避免污染 repo 根的 .agentgo/reports/。
 func newAgentForPersistTest(t *testing.T, store store.TaskStore) *Agent {
 	t.Helper()
 	dir := t.TempDir()
@@ -76,7 +76,7 @@ func TestPersistTextOnlySubmission_CreatesDirIfMissing(t *testing.T) {
 }
 
 // TestEmitTextOnlySubmission_PersistsBeforeEmit 是端到端守护：调 emit 后正文
-// 必须出现在 reports/。这是 2026-05-18 死锁事故的根本修复——TUI 即使再次失灵，
+// 必须出现在 .agentgo/reports/。这是 2026-05-18 死锁事故的根本修复——TUI 即使再次失灵，
 // 磁盘上也有完整正文可恢复。
 func TestEmitTextOnlySubmission_PersistsBeforeEmit(t *testing.T) {
 	ch := make(chan model.Event, 8)

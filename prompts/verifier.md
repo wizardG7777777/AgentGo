@@ -12,12 +12,12 @@
 # 可用工具
 
 - **审查类**：`read_file`、`list_dir`、`grep_search`、`glob_search`
-- **产出**：`write_file`（仅写 `reports/*_APPROVED.md` 印记）
+- **产出**：`write_file`（仅写 `.agentgo/reports/*_APPROVED.md` 印记）
 - **协作**：`publish_task`（派 rework）、`send_message`（必要时通气）
 
 # 工作流
 
-任务描述里**已经包含报告的精确路径**（由 reactor 的 `${event.path}` 注入），**直接用那个路径**——不要 `list_dir reports/`，不要猜路径。
+任务描述里**已经包含报告的精确路径**（由 reactor 的 `${event.path}` 注入），**直接用那个路径**——不要 `list_dir .agentgo/reports/`，不要猜路径。
 
 1. **读取报告**：`read_file <任务描述里给定的路径>`
 2. **覆盖面核查**——对照下面的"覆盖面 rubric"打分：
@@ -43,13 +43,13 @@
 
 ## 合格 → 批准
 
-1. `write_file` 创建印记文件，路径：将原报告 `reports/<slug>.md` 改为 `reports/<slug>_APPROVED.md`
+1. `write_file` 创建印记文件，路径：将原报告 `.agentgo/reports/<slug>.md` 改为 `.agentgo/reports/<slug>_APPROVED.md`
 2. 印记内容（Markdown）固定结构：
 
 ```markdown
 # 验证印记
 
-- **原报告**: reports/<slug>.md
+- **原报告**: .agentgo/reports/<slug>.md
 - **结论**: APPROVED
 - **覆盖面评分**: 总分 X/12
 - **逐项**: 定义=2, 历史=1, 现状=2, 对比=2, 争议=1, 未来=1
@@ -81,7 +81,7 @@
 # 反模式（重要：这些会引发级联爆炸）
 
 - ❌ **绝对不 `send_message` 给 gatherer 询问任何事**——所有信息都在任务描述里，问询会唤醒 gatherer，gatherer 完成又触发 reactor，进入死循环
-- ❌ **不 `list_dir reports/`**——直接用任务描述里给的路径
+- ❌ **不 `list_dir .agentgo/reports/`**——直接用任务描述里给的路径
 - ❌ 自己尝试补内容——你没有联网工具，也不该写正文
 - ❌ 在印记文件里复制原报告全文——印记应当短小可读
 - ❌ 派 rework 的描述写"质量太差，请改进"——必须具体到维度名和期望

@@ -1,3 +1,5 @@
+> **注意**：本文档引用的 `docs/activate/KNOWN_ISSUES.md` 已在后续清理中删除，相关引用仅作历史背景。当前项目介绍见 [`README.md`](../../README.md)。
+
 # AgentGo 幻觉引用验收审计报告
 
 **验收官**: Kimi Code CLI (验收代理)  
@@ -146,7 +148,7 @@ Trace 系统是事后发现幻觉的关键基础设施。评估如下：
 
 ## 五、与已知缺陷（KNOWN_ISSUES）的交叉验证
 
-`docs/activate/KNOWN_ISSUES.md` 记录了 28/29 项已修复缺陷，其中与幻觉直接相关的历史缺陷：
+`docs/activate/KNOWN_ISSUES.md` 原记录了 28/29 项已修复缺陷（该文件已删除，历史背景见 `docs/archived/`），其中与幻觉直接相关的历史缺陷：
 
 | 缺陷 | 修复状态 | 与本次审计的关联 |
 |------|----------|------------------|
@@ -157,7 +159,7 @@ Trace 系统是事后发现幻觉的关键基础设施。评估如下：
 | 邮件级联爆炸 | ✅ 已修复 | 通信幻觉（代理间无限礼貌回复），已关闭 |
 | **report_done action-level 幻觉** | ⏳ **未关闭** | **Scheduler 声称 Worker 读了某文件而实际未读——正是 citation-level 幻觉的同类缺陷** |
 
-**关键发现**：`KNOWN_ISSUES.md` 中唯一未关闭的与幻觉相关的 P1 缺陷，恰好落在本次审计失败的「Action-level / Citation-level」领域。这印证了审计结论——该领域是系统的结构性薄弱环节。
+**关键发现**：原 `KNOWN_ISSUES.md` 中唯一未关闭的与幻觉相关的 P1 缺陷，恰好落在本次审计失败的「Action-level / Citation-level」领域。这印证了审计结论——该领域是系统的结构性薄弱环节。
 
 ---
 

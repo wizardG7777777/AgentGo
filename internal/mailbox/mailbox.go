@@ -184,7 +184,7 @@ func (mb *Mailbox) Drain() []Message {
 // 同步更新 recent 环形缓冲（移除被丢弃的条目）。
 // 返回被丢弃的邮件数。pred 为 nil 时返回 0 且不修改邮箱。
 //
-// 使用场景（KNOWN_ISSUES.md P2 "寄生唤醒"v2 修复）：hook 系统在
+// 使用场景（历史修复记录 P2 "寄生唤醒"v2 修复）：hook 系统在
 // PhaseBeforeWake 判定当前邮箱内全部邮件"非 wake-worthy"后，调此方法
 // 清空那些永远不会被消费的邮件（典型如 progress-notify 的 info/low 广播），
 // 避免 mail-notifier 每 tick 反复检测到并打印 abort 日志。
@@ -244,7 +244,7 @@ func (mb *Mailbox) filterRecent(pred func(Message) bool) {
 // DrainWithAck 取出全部消息，并通过 registry 仅对 question 类邮件向发信方
 // 自动发送回执（type=ack）。registry 为 nil 时退化为普通 Drain。
 //
-// 策略说明（KNOWN_ISSUES.md P2 "寄生唤醒"的第二刀）：
+// 策略说明（历史修复记录 P2 "寄生唤醒"的第二刀）：
 // 早期版本对除 ack 外的所有类型邮件都自动回 ack，意图是"确认送达"。
 // 但在广播语义下（progress-notify 等 type=info）这条策略会放大噪音 ——
 // 一次广播给 N 个 peer，就产生 N 条 ack 回到发送方邮箱，发送方一旦

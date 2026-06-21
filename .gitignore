@@ -33,6 +33,9 @@ go.work.sum
 # Kiro IDE
 .kiro/
 
+# Trae IDE
+.trae/
+
 # AgentGo runtime artifacts
 # - .agentgo/traces/    JSONL 任务追踪文件（每任务一份，含完整工具调用 args 等可能敏感的数据）
 # - .worktrees/         Git worktree 隔离目录
@@ -49,7 +52,6 @@ setting.yaml
 .mcp.json
 .idea
 .claude/settings.local.json
-test_multi_agent.yaml
 setting.v4.yaml
 setting.test-concurrent.yaml
 
@@ -57,12 +59,13 @@ setting.test-concurrent.yaml
 test_invest.yaml
 test_invest_reactors.yaml
 
-# 调查报告输出目录——agent 生成的产物，不入库
-reports/
-
 # Agent 中间产出 + 历史归档目录
 artifacts/
 .archive/
 
 # 本地编译产物（go build ./. 默认输出到仓库根的同名二进制）
 /agentgo
+
+# 外部/无关项目目录
+systemTest/
+config.program-upgrade-small.yaml

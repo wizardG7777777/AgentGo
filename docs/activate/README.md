@@ -101,9 +101,8 @@
 
 ### 7. KNOWN_ISSUES.md — 已知问题清单
 
-- **文档状态**：当前文件为空（0 行内容）
-- **说明**：审计报告中提及共有 28/29 项已修复缺陷，１项未关闭的 P1（action-level 幻觉）。当前文件为空，可能已被清理或重置。
-- **建议**：若项目已无活跃的已知问题，可考虑将此文件归档至 `docs/archived/` 或标记为「已完成」
+- **文档状态**：已删除
+- **说明**：历史问题清单已清理。相关背景仍保留在 `docs/archived/` 的各阶段设计文档中。
 
 ---
 
@@ -117,4 +116,4 @@
 | MemoryManageSystem.md | ⚠️ 部分实现 | `internal/memory/` | 接口 + ProcessStore 完成，Session/Project 后端未实现 |
 | ToolUpgradePlan.md | ❌ 未实现 | `internal/shell/`（仅基础审批）| 核心组件（shell_commands.yaml, TimeoutHandler, ShellCommandGate）均不存在 |
 | HALLUCINATION_ACCEPTANCE_AUDIT.md | ❌ 未实现 | — | P0/P1 改进建议均未落地 |
-| KNOWN_ISSUES.md | ❌ 空文件 | — | 文件已清空，无活跃内容 |
+| KNOWN_ISSUES.md | ✅ 已删除 | — | 历史问题清单已清理，背景见 `docs/archived/` |

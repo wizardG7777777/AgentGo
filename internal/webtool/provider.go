@@ -23,7 +23,7 @@ type SearchProvider interface {
 
 // NewProvider 严格按 provider 名 + 配置完整性构造 SearchProvider。
 //
-// 行为约定（2026-04-27 重构，详见 docs/activate/nextUpgrade_v5.md §11.1 案例块）：
+// 行为约定（2026-04-27 重构，历史设计见 docs/archived/nextUpgrade_v5.md §11.1 案例块）：
 //   - 空字符串 / "duckduckgo_html" → DuckDuckGoProvider, nil
 //   - "searxng" 缺 apiURL / "tavily"·"serper" 缺 apiKey → nil, error
 //   - 未知 provider → nil, error（不再静默回落 DDG，避免 probe/provider 决策分裂）

@@ -143,7 +143,7 @@ startup_probe: "off"
 func TestMain_DefaultConfigPathMissing_ShouldFailFast(t *testing.T) {
 	// v3 兼容层 2026-04-26 删除后，无 setting.yaml + 内置默认配置不再能启动——
 	// 因为 v4 §11.5.3 校验要求 agents 列表非空。本测试断言这一 fail-fast 行为，
-	// 取代旧的"fallback to defaults" 期望（KNOWN_ISSUES 中的"启动成功 ≠ 真正可用"
+	// 取代旧的"fallback to defaults" 期望（历史问题记录中的"启动成功 ≠ 真正可用"
 	// 反模式由此被 v4 修正）。
 	tmpDir := t.TempDir()
 	result := runMainAsSubprocess(t, tmpDir)

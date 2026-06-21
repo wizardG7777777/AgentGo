@@ -1,3 +1,7 @@
+> **⚠️ 已过时（Deprecated）**：本文档写于 2026-04-19，大量章节描述的是已删除的 `internal/worker`、`internal/explorer`、`internal/cli` 等旧包，以及早期的 hook/scheduler 设计。当前项目的权威介绍请见 [`README.md`](README.md)，配置规范请见 [`docs/yaml-config-guide.md`](docs/yaml-config-guide.md)，历史设计文档请见 [`docs/archived/`](docs/archived/)。本文档保留仅作考古参考，不要按其中包结构或配置项编写新代码。
+
+---
+
 # 现状速览（2026-04-19）
 
 > 本文档原本是设计稿，部分章节早于实现。本节为升级工作提供快速对齐入口，列出**与设计文档不一致的关键实现事实**。后续章节如有冲突，以本节和源代码为准。
@@ -26,7 +30,7 @@
 - Scheduler 事件响应延迟 ~3 分钟根因排查（Phase 3 重构后旧根因路径已不存在，需要重新观察是否仍出现）
 - Trace 多 goroutine 写入竞争（P1 复核）
 
-详细缺陷与状态见 `docs/activate/KNOWN_ISSUES.md`（28/29 已修复）。
+详细缺陷与状态原记录在 `docs/activate/KNOWN_ISSUES.md`（28/29 已修复），该文件已删除，历史背景见 `docs/archived/`。
 
 ---
 

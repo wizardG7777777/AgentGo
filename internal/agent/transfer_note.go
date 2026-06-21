@@ -15,7 +15,7 @@ import (
 // 过时），而是一份压缩的"跨宇宙邮件"——前任在终止前留下一段精炼的决策
 // 备忘，接手者只读这一份。
 //
-// 本最小版范围（见 docs/activate/nextUpgrade_v3.md §8.4 用户拍板）：
+// 本最小版范围（历史决策见 docs/archived/nextUpgrade_v3.md §8.4）：
 //
 // 2026-04-25 重构：handleFailure 的 recoverable 分支不再无条件调 L1。
 // 改为按失败场景分派：

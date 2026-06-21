@@ -159,7 +159,7 @@ func TestSchedulerSystemPrompt_UnavailableToolsGuidance(t *testing.T) {
 // 14.5 min，所有并发场景事实上无法被测试触发。根因是 prompt 中"一次只能发布
 // 一个任务"这句权威陈述与 llm_executor 的并行 tool call 能力矛盾，误导了 LLM。
 //
-// 参见：docs/activate/KNOWN_ISSUES.md "Scheduler publish_task 完全串行发布"
+// 该问题已修复；历史记录见 docs/archived/。
 // ================================================================
 
 // TestSchedulerSystemPrompt_DoesNotClaimSingleTaskPerLoop 断言 prompt 不再声称
@@ -175,7 +175,7 @@ func TestSchedulerSystemPrompt_DoesNotClaimSingleTaskPerLoop(t *testing.T) {
 	for _, phrase := range misleading {
 		if strings.Contains(prompt, phrase) {
 			t.Errorf("prompt 含误导性陈述 %q —— 该陈述与 llm_executor.go 并行 tool call 能力矛盾，"+
-				"会诱导 LLM 把独立任务串行化。见 KNOWN_ISSUES.md 2026-04-20 P0-1", phrase)
+				"会诱导 LLM 把独立任务串行化。见 2026-04-20 历史问题记录 P0-1", phrase)
 		}
 	}
 }
@@ -199,7 +199,7 @@ func TestSchedulerSystemPrompt_ContainsParallelIndependentPublishGuidance(t *tes
 	if !hasIndependence || !hasParallelism {
 		t.Errorf("prompt 缺少独立任务并行发布的明确指引（独立关键词=%v, 并行关键词=%v）—— "+
 			"2026-04-20 测试暴露 scheduler 把独立任务串行化，需在 prompt 中加入"+
-			"明确的'无依赖任务应同轮并行 publish_task'示例。见 KNOWN_ISSUES.md P0-1",
+			"明确的'无依赖任务应同轮并行 publish_task'示例。见历史问题记录 P0-1",
 			hasIndependence, hasParallelism)
 	}
 }
@@ -271,7 +271,7 @@ func TestSchedulerSystemPrompt_PreservesUserOriginalConstraints(t *testing.T) {
 	if !hasPreserveRule {
 		t.Errorf("schedulerSystemPrompt 缺少 `保留用户原始约束` 的规则段（期望含 %v 之一）—— "+
 			"2026-04-23 随机测试暴露 scheduler 把用户 `不用撰写文字报告` 改写成 `总结...`，"+
-			"否定约束丢失。见 KNOWN_ISSUES.md 2026-04-23 P2",
+			"否定约束丢失。见 2026-04-23 历史问题记录 P2",
 			preserveSignals)
 	}
 }

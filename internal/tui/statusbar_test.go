@@ -124,6 +124,18 @@ func TestRenderStatusBar_SidebarHints(t *testing.T) {
 	}
 }
 
+func TestRenderStatusBar_MainAgentHints(t *testing.T) {
+	theme := DefaultTheme()
+	result := renderStatusBar(theme, 140, FocusMain, ViewDashboard, false)
+
+	if !strings.Contains(result, "agent") {
+		t.Error("main dashboard status bar should include agent navigation hint")
+	}
+	if !strings.Contains(result, "view") {
+		t.Error("main dashboard status bar should include view hint")
+	}
+}
+
 func TestRenderStatusBar_ResultHints(t *testing.T) {
 	theme := DefaultTheme()
 	result := renderStatusBar(theme, 140, FocusInput, ViewResult, false)
@@ -133,6 +145,18 @@ func TestRenderStatusBar_ResultHints(t *testing.T) {
 	}
 	if !strings.Contains(result, "page") {
 		t.Error("result view status bar should include page hint")
+	}
+}
+
+func TestRenderStatusBar_ResultHintsRespectSidebarFocus(t *testing.T) {
+	theme := DefaultTheme()
+	result := renderStatusBar(theme, 140, FocusSidebar, ViewResult, false)
+
+	if !strings.Contains(result, "select") {
+		t.Error("sidebar-focused result status bar should keep select hint")
+	}
+	if strings.Contains(result, "scroll") {
+		t.Error("sidebar-focused result status bar should not show scroll hint")
 	}
 }
 

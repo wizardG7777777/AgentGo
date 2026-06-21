@@ -242,7 +242,7 @@ func TestPathBoundaryHook_ViaRegistryAbort(t *testing.T) {
 // root_dir（工具 schema 声明的合法字段），每次都被 hook 以"缺少 path 参数"拒绝，
 // LLM 读错误消息后无法修正，浪费 8 轮 loop + 大量 token。
 //
-// 参见：docs/activate/KNOWN_ISSUES.md "Hook 错误消息不足以让 LLM 自愈"
+// 该问题已修复；历史记录见 docs/archived/。
 // ================================================================
 
 // TestPathBoundaryHook_GlobSearch_AcceptsRootDir 断言 hook 尊重 glob_search 工具

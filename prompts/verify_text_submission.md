@@ -14,13 +14,13 @@
 # 操作步骤
 
 1. **读取审核对象**：
-   - 优先：dep 段尾部如有具体文件路径列表 → `read_file` 那些精确路径（不要 `list_dir reports/`）
+   - 优先：dep 段尾部如有具体文件路径列表 → `read_file` 那些精确路径（不要 `list_dir .agentgo/reports/`）
    - 否则：审核对象就是 dep 段里 `[task_id=...]` 后面的那段 Markdown 文字
 2. **覆盖面打分**：对照系统提示中的"覆盖面 Rubric"给 6 维度 0/1/2 评分
 3. **决策**：
    - **合格**（总分 ≥ 9/12 且无 0 分维度）→ `write_file` 写印记：
      - 若审核对象是文件，印记路径为 `<原文件名>_APPROVED.md`
-     - 若审核对象是 dep 文字，印记路径为 `reports/text_only_${gatherer_task_id}_APPROVED.md`
+     - 若审核对象是 dep 文字，印记路径为 `.agentgo/reports/text_only_${gatherer_task_id}_APPROVED.md`
      - 印记内容按系统提示规定的固定结构；"原报告"字段写明文件路径或 "text-only submission, gatherer task=${gatherer_task_id}"
      - 最后输出文字摘要，包含印记路径和 gatherer task ID
    - **不合格** → `publish_task` 派一个聚焦补充任务回默认队列，描述以"针对缺漏面 rework"开头，注明：原 gatherer task ID（`${gatherer_task_id}`）、缺漏维度、具体期望。最后输出文字摘要：未通过原因 + 已派任务 ID

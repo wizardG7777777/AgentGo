@@ -2,7 +2,7 @@
 //
 // 算法委托给 [github.com/sahilm/fuzzy]：fzf 风格子序列匹配 + 连续/位置加权
 // 打分。本子包只负责 (1) 候选构造约束、(2) 命中字符方括号高亮、(3) 输出
-// 格式化。设计与边界详见 docs/activate/nextUpgrade_v4.md §10。
+// 格式化。历史设计见 docs/archived/nextUpgrade_v4.md §10。
 //
 // 调用方：
 //   - internal/tools/local_read.go 的 globSearch / readFile / listDir / grepSearch

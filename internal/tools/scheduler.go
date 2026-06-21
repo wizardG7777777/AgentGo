@@ -123,7 +123,7 @@ func (g SchedulerGroup) cancelTask(ctx context.Context, args map[string]any) (st
 //
 //  2. **事实校对**：从 task.Artifacts 直接构造一段"实际写入文件清单"，与 LLM 的 summary
 //     并列打印到 stdout。LLM 即使在 summary 里编造产物，用户也能从事实校对块看出矛盾。
-//     这是修复 KNOWN_ISSUES.md "Scheduler report_done 不基于 task.Artifacts 真实清单"
+//     这是修复历史问题"Scheduler report_done 不基于 task.Artifacts 真实清单"
 //     的关键路径，从 internal/scheduler/scheduler.go::buildArtifactsReport 迁移而来。
 //
 //  3. **清空 batch**：调 store.ClearSchedulerBatch 让下一轮 reactLoop 看到干净状态。
@@ -174,7 +174,7 @@ func (g SchedulerGroup) reportDone(ctx context.Context, args map[string]any) (st
 	const maxTerminalLines = 30
 	summaryLines := strings.Split(summary, "\n")
 	if len(summaryLines) > maxTerminalLines {
-		reportPath = filepath.Join(g.ProjectRoot, "reports", fmt.Sprintf("report-%s.md", time.Now().Format("20060102-150405")))
+		reportPath = filepath.Join(g.ProjectRoot, ".agentgo", "reports", fmt.Sprintf("report-%s.md", time.Now().Format("20060102-150405")))
 		if err := os.MkdirAll(filepath.Dir(reportPath), 0755); err == nil {
 			if err := os.WriteFile(reportPath, []byte(summary), 0644); err == nil {
 				displaySummary = fmt.Sprintf(

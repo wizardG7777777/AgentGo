@@ -100,11 +100,11 @@ func TestLoadLatestTextOnlyResult_FromSessionLog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSessionManager: %v", err)
 	}
-	reportsDir := filepath.Join(projectRoot, "reports")
+	reportsDir := filepath.Join(projectRoot, ".agentgo", "reports")
 	if err := os.MkdirAll(reportsDir, 0755); err != nil {
 		t.Fatalf("MkdirAll reports: %v", err)
 	}
-	reportRel := filepath.Join("reports", "text_only_task.md")
+	reportRel := filepath.Join(".agentgo", "reports", "text_only_task.md")
 	if err := os.WriteFile(filepath.Join(projectRoot, reportRel), []byte("restored final report"), 0644); err != nil {
 		t.Fatalf("WriteFile report: %v", err)
 	}

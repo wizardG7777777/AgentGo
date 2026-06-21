@@ -255,7 +255,7 @@ func TestWatchdog_CascadeCancellation_MissingDep(t *testing.T) {
 // 内容应至少包含：任务 ID、超时原因、elapsed、last known activity（最后
 // 一次 tool call 的名字和时间，来自 store.GetToolCallHistory）。
 //
-// 修复方向（与 KNOWN_ISSUES 2026-04-08 第二轮的 agent.sendCrashReport 对称）：
+// 修复方向（与 2026-04-08 历史修复记录的 agent.sendCrashReport 对称）：
 //  1. Watchdog 加字段 MailRegistry（或 Mailbox/Notifier 等命名）
 //  2. bootstrap.go 在 New Watchdog 时注入 mbRegistry
 //  3. checkProcessingTask 超时分支在 FailTaskBySystem 之后，用 EventSource
@@ -273,6 +273,6 @@ func TestWatchdogStruct_HasMailRegistryForCrashReports(t *testing.T) {
 	}
 	t.Fatalf("Watchdog 应持有可发邮件的字段（候选名 %v 之一）用于超时时向 task.EventSource 发送崩溃汇报邮件。"+
 		"当前结构体仅含 %d 个字段（Store/Config/EventCh/Roster），scheduler 在子任务超时时缺失 `为什么死` 的上下文，"+
-		"会盲目重试同样策略。见 KNOWN_ISSUES.md 2026-04-23 P1",
+		"会盲目重试同样策略。见 2026-04-23 历史问题记录 P1",
 		candidates, typ.NumField())
 }

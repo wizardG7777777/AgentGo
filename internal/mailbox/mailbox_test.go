@@ -261,7 +261,7 @@ func TestConcurrentSend(t *testing.T) {
 
 // ---- DrainWithAck 策略：仅对 question 类回 ack ----
 //
-// 背景（KNOWN_ISSUES.md P2 寄生唤醒修复的第二刀）：
+// 背景（历史修复记录 P2 寄生唤醒修复的第二刀）：
 // 早期版本对除 ack 外所有类型都自动回 ack。新策略：只对 MsgTypeQuestion 回 ack，
 // 切断 info 广播引起的 ack 回波（发送方邮箱不再被 N 条 ack 灌满触发自唤醒）。
 

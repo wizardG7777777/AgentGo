@@ -9,7 +9,7 @@ import (
 )
 
 // WakeContextExpandHook 是 Phase 2 关闭"邮件级联爆炸"P0 的根因 #3 修复
-// （hookSystem.md §3.4 + KNOWN_ISSUES.md：唤醒任务不携带原始上下文）。
+// （hookSystem.md §3.4 + 历史修复记录：唤醒任务不携带原始上下文）。
 //
 // 在 PhaseBeforeWake 阶段被 MailNotifier 调用，从 MailboxHookView 读取
 // 该 agent 收件箱内最近 N 条未读邮件，构造一段人类可读的摘要文本，通过

@@ -141,7 +141,7 @@ type Agent struct {
 	TransferNoteMaxTokens int
 
 	// TextOnlyReportsDir 覆盖 persistTextOnlySubmission 的兜底落盘目录。
-	// 空串时使用默认 "reports"（相对于进程 CWD）。生产线无需设置，
+	// 空串时使用默认 ".agentgo/reports"（相对于进程 CWD）。生产线无需设置，
 	// 测试用 t.TempDir() 注入隔离目录。详见 [[persistTextOnlySubmission]]。
 	TextOnlyReportsDir string
 
@@ -181,7 +181,7 @@ func (a *Agent) transferNoteMaxTokens() int {
 // react_loop_exit:natural）之后调用，判别本次提交是否属于"代理什么都没落盘，仅吐出
 // 一份文字汇报"——如是则同步做两件事：
 //
-//  1. **持久化兜底**：把 content 写到 reports/text_only_<task_id>.md。
+//  1. **持久化兜底**：把 content 写到 .agentgo/reports/text_only_<task_id>.md。
 //     2026-05-18 TUI 死锁事故暴露的问题——scheduler 走 text-only 路径时
 //     正文只存在 ViewportCard 内存里，进程退出即丢，磁盘上无任何拷贝。
 //     此处兜底保证正文落盘，TUI 故障也不丢内容。
@@ -214,23 +214,22 @@ func (a *Agent) emitTextOnlySubmissionIfNoArtifacts(taskID, content string, loop
 	})
 }
 
-// persistTextOnlySubmission 把仅文字交付的 task 正文写到 reports/text_only_<task_id>.md。
+// persistTextOnlySubmission 把仅文字交付的 task 正文写到 .agentgo/reports/text_only_<task_id>.md。
 //
 // 这是 [[emitTextOnlySubmissionIfNoArtifacts]] 的兜底落盘，保证 TUI 渲染层即使
-// 失灵也不丢正文。reports/ 路径与 verifier 现有产出（text_only_*_APPROVED.md）
-// 同根，便于后续用同一套 glob 找回。
+// 失灵也不丢正文。所有运行时落盘文件统一收敛到 .agentgo/ 下，便于隔离与清理。
 //
 // 失败语义：仅 stderr WARNING，不返回错误——持久化失败不应影响主流程的任务完成。
-// reports/ 不存在时自动创建（mkdir -p）。
+// .agentgo/reports/ 不存在时自动创建（mkdir -p）。
 //
-// 测试钩子：可通过 TextOnlyReportsDir 字段覆盖默认 "reports" 目录，便于单测隔离。
+// 测试钩子：可通过 TextOnlyReportsDir 字段覆盖默认 ".agentgo/reports" 目录，便于单测隔离。
 func (a *Agent) persistTextOnlySubmission(taskID, content string) {
 	if content == "" {
 		return
 	}
 	dir := a.TextOnlyReportsDir
 	if dir == "" {
-		dir = "reports"
+		dir = ".agentgo/reports"
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		log.Printf("[agent %s] WARNING: 创建 %s 目录失败: %v", a.ID, dir, err)
@@ -539,7 +538,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 
 	// 90% 预算警告：达到 floor(MaxLoops * 0.9) 时注入一次系统提示让 LLM 主动收尾。
 	// 避免 MaxLoops 兜底路径（buildTransferNote → retry）介入——那条路径成本高且
-	// 会出现 LLM 在 transfer-note 阶段调工具产生副作用的边界 case（详见 KNOWN_ISSUES）。
+	// 会出现 LLM 在 transfer-note 阶段调工具产生副作用的边界 case（详见历史修复记录）。
 	// 整数除法 9/10 自带向下取整：MaxLoops=8→7, =10→9, =12→10, =20→18。
 	budgetWarningInjected := false
 	budgetWarnAt := -1

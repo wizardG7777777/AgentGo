@@ -348,6 +348,57 @@ func TestAppModel_HandleKey_SidebarNavigation(t *testing.T) {
 	}
 }
 
+func TestAppModel_HandleKey_SidebarNavigationNormalizesSelection(t *testing.T) {
+	m := newAppModel(testDeps())
+	m.focus = FocusSidebar
+	m.agents = []AgentInfo{
+		{ID: "a1"}, {ID: "a2"}, {ID: "a3"},
+	}
+	m.selectedAgent = -1
+
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	updated := result.(AppModel)
+	if updated.selectedAgent != 0 {
+		t.Errorf("down from unselected should choose first agent, got %d", updated.selectedAgent)
+	}
+
+	updated.selectedAgent = 99
+	result, _ = updated.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	updated = result.(AppModel)
+	if updated.selectedAgent != 2 {
+		t.Errorf("up from out-of-range should clamp to last agent, got %d", updated.selectedAgent)
+	}
+
+	updated.selectedAgent = -1
+	result, _ = updated.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	updated = result.(AppModel)
+	if updated.selectedAgent != 0 {
+		t.Errorf("enter from unselected should select first agent, got %d", updated.selectedAgent)
+	}
+	if updated.view != ViewAgentDetail {
+		t.Error("enter from unselected should switch to AgentDetail when agents exist")
+	}
+}
+
+func TestAppModel_HandleKey_SidebarNavigationWinsInResultView(t *testing.T) {
+	m := newAppModel(testDeps())
+	m.focus = FocusSidebar
+	m.view = ViewResult
+	m.layout.MainH = 7
+	m.agents = []AgentInfo{{ID: "a1"}, {ID: "a2"}}
+	m.selectedAgent = 0
+	m.appendMsg(strings.Join([]string{"line 1", "line 2", "line 3", "line 4", "line 5"}, "\n"), MsgResult)
+
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	updated := result.(AppModel)
+	if updated.selectedAgent != 1 {
+		t.Errorf("sidebar down in result view should select agent, got %d", updated.selectedAgent)
+	}
+	if updated.resultScroll != 0 {
+		t.Errorf("sidebar down in result view should not scroll result, got %d", updated.resultScroll)
+	}
+}
+
 func TestAppModel_HandleKey_SidebarEnter(t *testing.T) {
 	m := newAppModel(testDeps())
 	m.focus = FocusSidebar
@@ -359,6 +410,40 @@ func TestAppModel_HandleKey_SidebarEnter(t *testing.T) {
 
 	if updated.view != ViewAgentDetail {
 		t.Error("Enter in sidebar should switch to AgentDetail view")
+	}
+}
+
+func TestAppModel_HandleKey_MainAgentNavigation(t *testing.T) {
+	m := newAppModel(testDeps())
+	m.focus = FocusMain
+	m.view = ViewDashboard
+	m.agents = []AgentInfo{
+		{ID: "a1"}, {ID: "a2"}, {ID: "a3"},
+	}
+	m.selectedAgent = 0
+
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	updated := result.(AppModel)
+	if updated.selectedAgent != 1 {
+		t.Errorf("main down: selectedAgent = %d, want 1", updated.selectedAgent)
+	}
+
+	result, _ = updated.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	updated = result.(AppModel)
+	if updated.selectedAgent != 2 {
+		t.Errorf("main j: selectedAgent = %d, want 2", updated.selectedAgent)
+	}
+
+	result, _ = updated.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	updated = result.(AppModel)
+	if updated.selectedAgent != 1 {
+		t.Errorf("main k: selectedAgent = %d, want 1", updated.selectedAgent)
+	}
+
+	result, _ = updated.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	updated = result.(AppModel)
+	if updated.view != ViewAgentDetail {
+		t.Error("enter in main should switch to AgentDetail view")
 	}
 }
 
@@ -613,10 +698,14 @@ func TestAppModel_HandleCommand_Quit(t *testing.T) {
 
 func TestAppModel_HandleCommand_Help(t *testing.T) {
 	m := newAppModel(testDeps())
+	m.view = ViewDashboard
 	m.handleCommand("/help")
 
 	if len(m.messages) == 0 {
 		t.Fatal("help should produce messages")
+	}
+	if m.view != ViewChat {
+		t.Fatalf("/help should switch to chat view so help is visible, got %v", m.view)
 	}
 	found := false
 	for _, msg := range m.messages {

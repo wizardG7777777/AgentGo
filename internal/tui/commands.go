@@ -28,6 +28,7 @@ func (m *AppModel) handleCommand(line string) bool {
 
 	case "/help":
 		m.appendMsg(helpText, MsgInfo)
+		m.view = ViewChat
 
 	case "/status":
 		m.showStatus()
