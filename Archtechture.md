@@ -1,184 +1,347 @@
-> **⚠️ 已过时（Deprecated）**：本文档写于 2026-04-19，大量章节描述的是已删除的 `internal/worker`、`internal/explorer`、`internal/cli` 等旧包，以及早期的 hook/scheduler 设计。当前项目的权威介绍请见 [`README.md`](README.md)，配置规范请见 [`docs/yaml-config-guide.md`](docs/yaml-config-guide.md)，历史设计文档请见 [`docs/archived/`](docs/archived/)。本文档保留仅作考古参考，不要按其中包结构或配置项编写新代码。
+# 现状速览（2026-05-09，v5 Reactive System 落地后）
 
----
+> 本文档原本是设计稿，部分章节早于实现。本节为升级工作提供快速对齐入口，列出**当前实现事实**与**与原设计文档的关键差异**。后续章节如有冲突，以本节和源代码为准。
 
-# 现状速览（2026-04-19）
+**已实现的核心包**（`internal/` 下，2026-05-09 状态，共 25 个）：
 
-> 本文档原本是设计稿，部分章节早于实现。本节为升级工作提供快速对齐入口，列出**与设计文档不一致的关键实现事实**。后续章节如有冲突，以本节和源代码为准。
+| 包 | 一句话职责 |
+|---|---|
+| `agent` | ReAct 循环 + 三层历史压缩 + FileStateCache + Memory 注入入口 |
+| `bootstrap` | 系统装配、启动顺序、kind×replica runner 实例化（含 `runtime_builder.go`） |
+| `config` | YAML/JSON 配置加载，**v4 唯一格式**：`llm:` / `scheduler:` / `agents:` / `infra:` / `tool_profiles:` / `reactors_file:` 等顶层块 |
+| `gate` | **统一 Gate 注册表**（v5 替代 v4 三套 HookRegistry）。Phase 路由：`tool:preCall/postCall` / `mailbox:beforeSend/Deliver/Wake`，10 个内置 Gate |
+| `hook` | 旧 Hook 接口仍作为 LLMExecutor 与 Gate 之间的适配层保留；Agent Hook 子系统已空（team-awareness 删除）；Tool/Mailbox builtin 文件夹保留为兼容 surface |
+| `llm` | LLM 客户端 + `Provider` 适配器（`openai` / `deepseek-v4` / `deepseek-r1`） + `Message.ExtraFields` 透传机制 |
+| `mailbox` | 异步信箱、Notifier、recent ring-buffer（容量 16）、TeamSnapshot |
+| `memory` | **Memory System**（v5）。`Store` 接口 + `ProcessStore` 内存实现（`ScopeProcess`），`ScopeSession` / `ScopeProject` v5.x 预留。替代 v4 team-awareness Hook |
+| `model` | `Task` / `Event` / `Claim` 数据结构。`Task` 含 `Artifacts` / `ExpectedArtifacts` / `LastResponse` / `MailChainDepth` / `SchedulerBatch` / `ReadSet` |
+| `pathutil` | 路径越界 + 敏感文件模式拦截 |
+| `probe` | 启动期 TCP probe + 工具可用性探针（`web_search`/`web_fetch` 检测） |
+| `reactor` | **Reactor 注册表**（v5，新增）。订阅 `trace.Event` 的 `Kind`，4 个内置 reactor + `userdef/` 用户 YAML 加载器 |
+| `roster` | 文件级 `TryClaim/Release/ReleaseAll/IsOccupied/ListByAgent` |
+| `runner` | **统一执行代理外壳**（v5，**取代 v4 `internal/worker` + `internal/explorer`，两包已删**）。`runner.New(rt, deps)` 按 `AgentRuntimeConfig` 实例化 |
+| `scheduler` | Scheduler 是 `agent.Agent` 一等代理（Phase 3 重构遗留），`scheduler.New` 返回 `Bundle{Agent, Activator, Mode}` |
+| `session` | Session 管理、history.jsonl、snapshot/replay/archive |
+| `shell` | `CommandFilter`（黑/白/运行时白名单） + 审批门 |
+| `spawn` | **Spawn Manager**（v5，新增）。实现 `reactor.Reactor` 接口，订阅任务终态事件销毁 ad-hoc runner（`one_shot` 生命周期）；`KindOf` 支持 per-kind reactor 路由；`ReactorSpawnMaxDepth=5` 防级联 |
+| `store` | `MemoryTaskStore` + `TaskCancelRegistry` + `ToolCallRecord` + `StoreHookView` + `ArtifactLog`（带 replay）+ ReadSet upsert + scheduler-batch 辅助 |
+| `suggest` | **Did-You-Mean**（v5，新增）。基于 `github.com/sahilm/fuzzy`，被 `tools/local_read.go` 空结果路径与工具未找到诊断使用 |
+| `tools` | 6 个 ToolGroup：LocalRead / LocalWrite / Web / Shell / Meta / Scheduler；`AllToolNames` 是规范名称表 |
+| `trace` | 每任务 JSONL，**Schema B**（嵌套子结构体 `Transition`/`ShellExec`/`ShellTimeout`），`SetDefaultDispatcher(reactorReg)` 使 `trace.Emit` 同时驱动 Reactor |
+| `tui` | **Bubble Tea TUI**（v5，**取代 v4 `internal/cli`，cli 包已删**）。inline 渲染、审批面板（`1/2/3/4/Ctrl+C`）、8 个斜杠命令 |
+| `watchdog` | 周期巡检、级联取消、roster 兜底清理、超时崩溃汇报 |
+| `webtool` | Web 检索/抓取 + SSRF 防护 |
 
-**已实现的核心包**（`internal/` 下）：
-`agent`（ReAct 循环 + 三层历史压缩 + FileStateCache）、`bootstrap`、`cli`、`config`、`explorer`（只读调查代理）、`hook` + `hook/builtin`（Tool Hook + Mailbox Hook 双框架，4 + 3 个内置 hook）、`llm`、`mailbox`（异步信箱 + Notifier + ring-buffer peek）、`model`、`pathutil`、`roster`（文件级 TryClaim/Release）、`scheduler`（**Phase 3：agent.Agent 实例 + Activator 事件桥 + SchedulerExecutor**，详见后文章节）、`shell`（命令审批/拦截）、`store`（公告板 + TaskCancelRegistry + ToolCallRecord 历史）、`tools`、`trace`（每任务一份 JSONL）、`watchdog`、`webtool`、`worker`（10 个工具的执行代理，可配置 N 个实例）。
+> **v5 已删除的包**（不要去找它们）：`internal/cli`、`internal/worker`、`internal/explorer`。职责被 `tui`、`runner`、`tool_profiles` 共同承接。
 
-**关键实现事实，与原设计文档的差异**：
+**关键实现事实**（按"原设计 → v5 实现"对齐）：
 
-- **执行代理 = `worker.Worker`**：原文档统称"执行代理"，实际是 `internal/worker` 包，可通过 `cfg.WorkerCount` 配置 N 个实例。每个 worker 拥有 10 个工具（read/write/edit/list/grep/glob/run_shell/publish_task/web_search/web_fetch）。
-- **Scheduler = `agent.Agent` 一等代理实例**（2026-04-10 Phase 3 重构）：Scheduler 不再是独立写的 ReAct 循环，而是 `agent.NewAgent(EventType="__scheduler__")` 的实例，工具集 = Worker 全集 + SchedulerGroup（cancel_task + report_done）。它能直接 `read_file`/`grep_search`/`web_search`，自动获得 Tool Hook、3 层历史压缩、FileStateCache、Trace、per-task cancel ctx 等所有 worker 拥有的能力。`scheduler.New` 返回 `*Bundle{Agent, Activator, Mode}`。详见 §"Scheduler 一等代理重构"。
-- **Roster 仅做文件级锁，不是团队花名册**：`Roster` 接口的 `TryClaim/Release/ReleaseAll/ListAllAgents` 全部围绕"防文件并发写"。它**不**承担团队成员注册或角色描述功能（设计文档中的"团队花名册"语义未实现，改由 mailbox `TeamSnapshot` 提供轻量替代）。
-- **Mailbox 子系统**（设计文档完全未提及）：`internal/mailbox` 提供基于 Go channel 的异步信箱、`send_message` 工具、ack 自动回执、`TeamSnapshot` 团队感知。详见 §"邮箱与异步通讯"。
-- **Hook 系统**（2026-04-09 起持续迭代，现为 Tool + Mailbox + Agent 三套并列）：Tool Hook 在 `agent.NewLLMExecutor` 内部 dispatch 工具调用前后触发（**6 个内置 hook**：path-boundary / validate-expected-hash / dependency-validator / require-read-before-write / enforce-expected-artifacts / record-artifact）；Mailbox Hook 在 `mailbox.Registry.Send` 和 `MailNotifier.scan` 触发（3 个内置：chain-depth-limit / per-agent-dedup / wake-context-expand）；Agent Hook 在 task 启动/loop 边界触发（2 个内置：team-awareness-task-start / team-awareness-loop-pre）。Phase 3 重构后 scheduler 与 worker 共享同一套 Tool Hook。详见 §"Hook System"。
-- **MailNotifier 默认启用**（2026-04-09 Phase 2 完成后恢复）：邮件级联爆炸 P0 的 4 项根因全部修复后，`config.MailNotifierEnabled` 默认为 `true`，空闲 agent 会被自动唤醒读邮件。`ChainDepthLimitHook` (max=3) 在 BeforeSend 阶段截断超深邮件链，杜绝 cascade。
-- **架构决策：无 git 依赖**（2026-04-09）：曾经的 `internal/isolation`（git worktree 隔离）整体删除。**AgentGo 代码本体不调用 git**。所有 Worker 共享 `ProjectRoot`。当前并发写文件**唯一防线**是 `Roster` 文件锁 + `expected_hash` TOCTOU 检查 + `pathutil.ValidatePath` 路径越界防护。删 git 后**故意暴露**的 4 项退化（并发写覆盖、半成品回滚、跨任务可见性、杀任务清理）正在等待"多代理协同重建"阶段按真实失败模式驱动设计。
-- **任务数据流**（设计文档未提及，2026-04-08 落地 + Phase 3 扩展）：`Task.Artifacts`（实际写入文件清单，`write_file`/`edit_file` 自动追加）、`Task.ExpectedArtifacts`（发布者声明的硬合约，任务结束前由 `agent.checkExpectedArtifacts` 校验，缺失则触发重试）、`Task.LastResponse`（worker 最后一次 LLM 响应，无条件持久化用于失败诊断）、`Task.MailChainDepth`（邮件链跳数，Phase 2 引入）、`Task.SchedulerBatch`（scheduler 当前 reactLoop 跟踪的子任务 ID 列表，Phase 3 引入）。详见 §"产物契约与失败汇报"。
-- **TaskCancelRegistry**：per-task cancel context，看门狗/调度器把任务转为 terminal 状态时自动取消正在执行的代理（通过 `ctx.Done()` 即时感知），不依赖广播。
-- **崩溃汇报**：任务最终失败时 agent 自动调用 `sendCrashReport`，向 `task.EventSource` 发送 `priority=high` 邮件，附 expected vs actual artifacts、worker 最后响应原文。
-- **三层历史压缩**：Layer 1 `snipOldToolResults`（无 LLM 开销，逐轮清理旧工具输出）；Layer 2 `compressHistory`（超过 `CompactTokenThreshold` 时摘要）；Layer 3 context overflow 时 `keepRecent=1` 激进压缩 + RetryRollback。
-- **Trace 系统**：`internal/trace` 每任务一份 JSONL 文件，Session 活跃时落盘到 `.agentgo/sessions/sess-<id>/logs/`（bootstrap 在 `SessionManager.LogDir()` 非空时重定向），否则回退 `.agentgo/traces/`，保留最近 100 个任务。`agentgo trace list/show` 子命令读取 active-session 指针自动定向到同一目录。可通过 `AGENTGO_DUMP_PROMPTS=1` 环境变量额外启用 prompt dump。
-- **LLM Provider Adapter**（2026-04-25 落地）：`internal/llm` 的两层扩展机制，用于适配非严格 OpenAI 兼容的后端（DeepSeek V4 thinking 模式的 `reasoning_content` 往返、R1 的反向删除要求、Qwen/Kimi 自定义字段等）。层 1 通用透传通过 `llm.Message.ExtraFields` + openai-go v3 的 `JSON.ExtraFields` / `SetExtraFields` 自动保留响应里的未知字段，下一轮请求原样回写；层 2 `llm.Provider` 插件接口处理变换型差异（R1 剥离 reasoning_content、Qwen QwQ 解析 `<think>` 标签等）。配置项 `llm_provider` / `explorer_provider`（空串或未知名 fallback `openai`，即 no-op），内置 `openai` / `deepseek-v4` / `deepseek-r1`。新增模型家族 = 实现接口 + `RegisterProvider()` 一行。详见 §"LLM Provider Adapter"。
+- **执行代理 = `runner.Runner`**（不再是 worker / explorer）：原设计的"执行代理"和"调查代理"在 v5 统一为 `internal/runner` 包。所有差异通过 `setting.yaml` 的 `agents[*]` 块声明（kind / replicas / profile / event_type / system_prompt_file / model 等）。Bootstrap 调用 `runtime_builder.buildAgentRuntime(kind, replicaIdx)` 合成 `AgentRuntimeConfig`，然后 `runner.New(rt, deps)`。**没有运行时 Kind 枚举分支** —— Kind 仅是配置字段。
+- **Scheduler = `agent.Agent` 一等代理实例**（2026-04-10 Phase 3 重构后保持至 v5）：`agent.NewAgent(EventType="__scheduler__")` 的实例，工具集 = Worker 全集 + SchedulerGroup（cancel_task + report_done + probe_directory）+ MetaGroup（publish_task / send_message，scheduler 上下文里 publish_task 通过 `BatchTracker` 追加到 `task.SchedulerBatch`）。直接 `read_file`/`grep_search`/`web_search`，自动获得 Gate、3 层历史压缩、FileStateCache、Trace、per-task cancel ctx。`scheduler.New` 返回 `*Bundle{Agent, Activator, Mode}`。详见 §"Scheduler 一等代理重构"。
+- **Roster 仅做文件级锁**：`TryClaim/Release/ReleaseAll/IsOccupied/ListByAgent` 全部围绕"防文件并发写"。团队成员感知改由 mailbox `TeamSnapshot` 与 Memory System 的 `KindContext / file_awareness` 项共同承担。
+- **Mailbox 子系统**：`internal/mailbox` 提供基于 Go channel 的异步信箱、`send_message` 工具、ack 自动回执、recent 16 条 ring buffer（供 Gate peek-without-consume）、`TeamSnapshot` 团队感知。
+- **ReactiveSystem（v5 重构，替代 v4 三套 Hook 系统）**：详见 §"ReactiveSystem：Gate + Reactor + Memory"。要点：
+  - **Gate**（事前决策门，可 Abort）：单一 `gate.Registry`，按 `Phase` 路由 Tool / Mailbox 子域。10 个内置 Gate（6 Tool + 4 Mailbox）。
+  - **Reactor**（事后状态响应，不可 Abort）：`reactor.Registry` 订阅 `trace.Event` 的 `Kind`。4 个内置 reactor（`record-artifact` / `task-end-callback` / `trace-history-event` / `read-set-write`）+ `spawn.Manager` 自身注册为 reactor。**用户可在 `cfg.ReactorsFile` (默认空) 中通过 YAML 声明 reactor**，支持动作 verb：`publish_task` / `invoke_llm` / `spawn_agent` / `call: send_message`，以及 `when:` / `kind:` / `via_translator:`。
+  - **Memory**（取代 team-awareness）：`internal/memory` 的 `ProcessStore` 在 `Agent.processTask` 入口被读取（`team_snapshot` / `file_awareness`），由 scheduler / runners / Roster 监听器写入。`GoalAnchor` 直接删除（`task.Description` 已承载目标）。
+  - **Spawn**：`spawn.Manager` 让 reactor 可以"创建 ad-hoc agent"。从 `base_kind` 模板 + `RuntimeOverride` 派生新 runtime，发布 initial task（`EventType="adhoc:<spawnID>"`），任务终态时 manager 作为 reactor 自动销毁 runner（one_shot）。`ReactorSpawnMaxDepth=5` 防级联。
+- **MailNotifier 默认启用**：邮件级联爆炸 P0 的 4 项根因全部由 Phase 2（v4） + Mailbox Gate（v5）守住。`chain-depth-limit` (max=`MailChainMaxDepth`，默认 3) 在 BeforeSend 截断；`per-agent-dedup` 在 BeforeDeliver 去重；`wake-worthy-filter` 在 BeforeWake 过滤；`wake-context-expand` 在 BeforeWake 累加 wake task description。
+- **TUI 取代 CLI**：`internal/tui` 基于 Bubble Tea，inline 渲染（不接管全屏，bootstrap/scheduler/agent 的 `fmt.Println` 日志直出 stdout 不被吞）。审批面板键位：`1` 通过 / `2`/Esc 拒绝 / `3` 切到指导输入模式 / `4` 永远允许（运行时白名单，进程内不持久化） / Ctrl+C 拒绝并退出。8 个斜杠命令：`/quit /help /status /cancel /steer /mode /new /session`。详见 `docs/activate/InterfaceDesign.md` §TUI 章节。
+- **架构决策：无 git 依赖**（2026-04-09 起保持）：`internal/isolation`（git worktree 隔离）整体删除。所有 runner 共享 `ProjectRoot`。并发写文件防线 = `Roster` 文件锁 + `expected_hash` TOCTOU 检查 + `pathutil.ValidatePath` + `path-boundary` Gate（双重）+ `require-read-before-write` Gate + `enforce-expected-artifacts` Gate + `validate-line-anchors` Gate。
+- **任务数据流**：`Task.Artifacts`（`record-artifact` reactor 在 `KindFileWritten` 上自动追加，路径相对项目根）、`Task.ExpectedArtifacts`（发布者硬合约，由 `enforce-expected-artifacts` Gate 与 `agent.checkExpectedArtifacts` 双重把守）、`Task.LastResponse`（无条件持久化用于失败诊断）、`Task.MailChainDepth`（邮件链跳数）、`Task.SchedulerBatch`（scheduler 当前 reactLoop 跟踪的子任务 ID 列表）、`Task.ReadSet`（v5 Phase 6 新增，由 `read-set-write` reactor 在 `KindToolResult{tool=read_file}` 上写入；`require-read-before-write` Gate 改读 ReadSet 而不再反查 ToolCallHistory）。
+- **TaskCancelRegistry**：per-task cancel context，看门狗/调度器把任务转为 terminal 状态时自动取消正在执行的代理（通过 `ctx.Done()` 即时感知）。
+- **崩溃汇报**：任务最终失败时 agent 自动调用 `sendCrashReport`，向 `task.EventSource` 发送 `priority=high` 邮件，附 expected vs actual artifacts、最后一次 LLM 响应原文。
+- **三层历史压缩**：Layer 1 `snipOldToolResults`（无 LLM 开销，逐轮清理旧工具输出）；Layer 2 `compressHistory`（超过 `enforce_compact_token_threshold` 时摘要）；Layer 3 context overflow 时 `keepRecent=1` 激进压缩 + `RetryRollback`。压缩事件 `KindHistoryCompaction` / `KindHistoryTruncated` 由 `trace-history-event` reactor 计数。
+- **Trace 系统 Schema B**：`internal/trace.Event` 是 fat struct，2026-05-01 新增三个可选指针子结构体 `Transition` / `ShellExec` / `ShellTimeout`，旧字段保留不动。新 EventKind：`KindAgentStateChanged`（开放给用户 reactor）、`KindShellExecuted` / `KindShellTimeoutPending` / `KindShellTimeoutResolved`（仅内置 reactor）。`SetDefaultDispatcher(reactorReg)` 让 `trace.Emit` 同时驱动 Reactor 链路。每任务一份 JSONL，Session 活跃时落盘到 `.agentgo/sessions/sess-<id>/logs/`，否则 `.agentgo/traces/`，保留 100 个。`agentgo trace list/show` 子命令自动定向到 active session 的 `logs/`。可通过 `AGENTGO_DUMP_PROMPTS=1` 启用 prompt dump。
+- **LLM Provider Adapter**（2026-04-25 落地，仍有效）：`internal/llm` 两层机制。层 1 通用透传通过 `llm.Message.ExtraFields` + openai-go v3 的 `JSON.ExtraFields` / `SetExtraFields` 自动保留响应里的未知字段（如 DeepSeek V4 `reasoning_content`），下一轮请求原样回写；层 2 `llm.Provider` 插件接口处理变换型差异（R1 剥离 reasoning_content）。配置项在 `llm.provider`（per-kind 通过 `agents[*]` 顶层无对应字段时回退到 `llm.provider`），内置 `openai` / `deepseek-v4` / `deepseek-r1`。详见 §"LLM Provider Adapter"。
 
 **未启动 / 待设计**：
-- 多代理协同重建（4 项退化的针对性修复）
-- Scheduler 事件响应延迟 ~3 分钟根因排查（Phase 3 重构后旧根因路径已不存在，需要重新观察是否仍出现）
-- Trace 多 goroutine 写入竞争（P1 复核）
+- ScopeSession / ScopeProject 持久化记忆（v5.x 排期）
+- Embedding 与 `QueryByVector`（接口预留，无实现）
+- 引用幻觉验证 Gate / E2E 幻觉测试基线（详见 `docs/activate/HALLUCINATION_ACCEPTANCE_AUDIT.md`，P0 改进尚未落地）
+- Shell 工具改造的 T6（YAML 持久化）（详见 `docs/activate/ToolUpgradePlan.md`）
+- AgentHook 子系统是否在 v5 内合并入 Reactor（方案 C，详见 `docs/activate/MemoryManageSystem.md` §5）
 
 详细缺陷与状态原记录在 `docs/activate/KNOWN_ISSUES.md`（28/29 已修复），该文件已删除，历史背景见 `docs/archived/`。
 
 ---
 
-# Hook System（2026-04-09 阶段 1 + 阶段 2 完成）
+# ReactiveSystem：Gate + Reactor + Memory（v5 重构，2026-05-01 落地）
 
-Hook System 是工具调用生命周期的拦截层，为"软约束 → 硬约束"提供统一的注册、组合、测试、扩展面。原设计规范已归档至 `docs/archived/hookSystem.md`（阶段 1+2 已全部落地，文档不再更新）。
+v4 时代的三套 Hook 系统（`ToolHookRegistry` / `MailboxHookRegistry` / `AgentHookRegistry`）在 v5 经过命名空间清理后，重新归类为两类**核心角色** + 一个独立配套子系统：
 
-## 阶段 1 范围
+- **Gate**（事前决策门，可否决动作）—— 统一到单一 `gate.Registry`，按 `Phase` 路由 Tool / Mailbox 子域。
+- **Reactor**（事后状态响应，不可否决，**用户可配**）—— 全新引入的 `reactor.Registry` 子系统，订阅 `trace.Event` 的 `Kind`。
+- **Memory**（上下文供给）—— 取代 v4 的 `team-awareness-*` Hook。详见 §"Memory System" 章节。
 
-只覆盖 **Tool Hook**（pre-call / post-call）；Mailbox Hook 留到阶段 2。
+设计源头与详细决议：`docs/activate/ReactiveSystem.md` + `docs/activate/MemoryManageSystem.md`。
 
-## 核心组件
+## 核心原则（不可妥协）
 
-| 包 | 职责 |
-|---|---|
-| `internal/hook` | `ToolHook` 接口 + `ToolHookRegistry`（值传递 ToolHookContext + nil 安全 + Args 浅拷贝隔离 + panic recover） |
-| `internal/hook/builtin` | 11 个内置 hook 实现（Tool 6 + Mailbox 3 + Agent 2） |
-| `internal/store/hookview.go` | `StoreHookView` 只读接口（hook 通过它查询任务历史，不能写入） |
-| `internal/store` | `ToolCallRecord` + `AppendToolCall` / `QueryToolCalls` 二级索引 |
+1. **状态转换的驱动权归 AgentGo 内核**：用户 reactor 永远不允许直接调用 `agent.SetState(...)` 或 `store.TransitionState(...)`，YAML 动作语言层面就排除这种能力。Reactor 想让 agent 进入下一状态必须通过 `publish_task` / `send_message` / 调工具，让主流程在合适时机自然驱动。
+2. **Reactor 分两类，失败语义不同**：内置 reactor（开发者 Go 注册）允许声明 `IsSync: true` 同步执行，失败需被 trace 显眼记录；用户 reactor（YAML 声明）**永远异步**，panic-isolated，失败仅记日志。
+3. **trace 是事实标准**：所有状态变更必须遵循三步序列：**主流程 SetState → emit `KindAgentStateChanged`（或对应 EventKind）→ Reactor 订阅者响应**。trace 事件不仅是观察手段，更是 Reactor 系统的**唯一事件源**。
+4. **Reactor 不允许直接驱动新状态转换**（承接原则 1 的延伸，包括内置 reactor）—— 避免 Reactor → Reactor 级联导致事件循环复杂度爆炸；保留单一驱动入口便于 Replay 与调试。
+5. **Reactor 自带的独立 LLM 调用必须是上下文隔离的纯文本生成器**：`invoke_llm` / `via_translator` 路径**无工具、无 history 累积、无运行时上下文**，纯文本输入输出。这阻断了"无监督的影子 agent"攻击面。
 
-## 接入点
-
-`agent.NewLLMExecutor` 在并行工具 goroutine 内按以下顺序：
-
-```
-preCtx := hook.ToolHookContext{Phase: PreCall, ...}
-preDecision := hookReg.RunPre(preCtx)        // 可 Abort
-if Abort:
-    content = "[hook 拒绝] " + reason
-    toolErr = error
-else:
-    result, toolErr = tools.Dispatch(ctx, c)
-
-recordToolCall(taskID, ToolCallRecord{...}) // 写历史（独立闭包）
-
-postCtx := hook.ToolHookContext{Phase: PostCall, Result, Err}
-hookReg.RunPost(postCtx)                     // 纯观察，不短路
-```
-
-`hookReg / storeView / recordToolCall` 三个参数都允许 nil — nil 时整段 hook 路径退化为 noop。这是 V6 回归验证的核心：禁用所有 hook 时行为字节级一致。
-
-## 6 个内置 Tool Hook（注册顺序与优先级）
-
-| Hook | Phase | Prio | Matches | 备注 |
-|---|---|---|---|---|
-| `path-boundary` | Pre | 10 | read/write/edit/list/grep/glob_file 系工具 | 双重校验（工具内仍 ValidatePath 做标准化） |
-| `validate-expected-hash` | Pre | 20 | write_file/edit_file | 接受微秒级 TOCTOU 窗口 |
-| `dependency-validator` | Pre | 25 | publish_task | 校验 `dependencies` 数组中所有 ID 实际存在于公告板，阻止 LLM 幻觉依赖 ID（2026-04-14 P1 修复引入）|
-| `require-read-before-write` | Pre | 30 | write_file/edit_file | 新文件豁免；list_dir 不算"已读"；失败 read 不计入 |
-| `enforce-expected-artifacts` | Pre | 35 | write_file/edit_file | 严格精确匹配 `task.ExpectedArtifacts` 的路径字面量，挡住越权写和路径漂移（2026-04-14 P1 修复引入） |
-| `record-artifact` | Post | 950 | write_file/edit_file | 工具失败时不记录 |
-
-## 3 个内置 Mailbox Hook
-
-详见 §"Mailbox Hook" 表（L132 附近），分别为 `chain-depth-limit` / `per-agent-dedup` / `wake-context-expand`。
-
-## 2 个内置 Agent Hook
-
-Agent Hook 在 task 生命周期边界触发（不是工具调用），目前全部为 `team-awareness` 系列：
-| Hook | Phase | 作用 |
-|---|---|---|
-| `team-awareness-task-start` | PhaseTaskStart | Task 认领时向 agent 注入 `TeamSnapshot`（队友 ID / 当前 task / profile），解决"A 不知道 B 在干什么"问题 |
-| `team-awareness-loop-pre` | PhaseLoopPre | 每轮 reactLoop 前刷新 TeamSnapshot，使 agent 能感知过程中的新成员或任务状态变化 |
-
-## Scheduler 与 Hook 系统
-
-**2026-04-10 Phase 3 之后，scheduler 走 `agent.NewLLMExecutor`，所有 Tool Hook 对
-scheduler 工具正常生效**（包括 `record-artifact` / `path-boundary` /
-`validate-expected-hash` / `require-read-before-write` / `dependency-validator` /
-`enforce-expected-artifacts`）。换句话说：scheduler 读/写文件、发布子任务、发邮件时
-都会经过同一套拦截链，不存在"豁免通道"。这是从根本上修复"P0 report_done 不基于
-`task.Artifacts`"的架构前提——没有这层一致性，hook 无法守住 scheduler 路径。
-
-本节保留以澄清一个常见误解：Phase 3 前 scheduler 的 `dispatchTool` switch 的确绕过
-hook，旧版本 Archtechture.md 曾据此写过"架构隔离"说法，**已作废**。若未来为某类
-scheduler-only 工具再设隔离，需显式在本节登记。
-
-## 与现有硬约束的关系
-
-Hook System **不替换**现有的 8 处硬约束兜底（`checkExpectedArtifacts`、`Roster.TryClaim`、`pathutil.ValidatePath` 等），而是**为它们提供统一的注册、组合、测试、扩展面**。其中 3 处已经迁移到 hook 表达，5 处仍是 inline 实现（包括 Roster 锁，因为它是任务级配对操作不能简单拆成 pre/post hook）。
-
-## 阶段 2：Mailbox Hook（2026-04-09 完成）
-
-阶段 2 把 Hook 框架扩展到 mailbox 子系统，关闭 KNOWN_ISSUES.md 描述的"邮件级联爆炸" P0。与 Tool Hook **并列共存**、独立 registry、独立接口，不耦合。
+## Gate 子系统
 
 ### 核心组件
 
 | 包 / 文件 | 职责 |
 |---|---|
-| `internal/hook/mailbox.go` | `MailboxHook` 接口 + 3 个 `MailboxHookPhase` 常量（`PhaseBeforeSend` / `PhaseBeforeDeliver` / `PhaseBeforeWake`）+ `MailboxHookContext` / `MailboxHookDecision`（值传递） |
-| `internal/hook/mailbox_registry.go` | `MailboxHookRegistry` —— nil 安全 + panic recovery + Priority 升序，与 `ToolHookRegistry` 形态对称。`RunBeforeWake` 额外做 `WakeDescription` 累加 |
-| `internal/hook/mailbox_runner_adapter.go` | `AsMailboxRunner(*MailboxHookRegistry) mailbox.MailboxHookRunner` 适配器，把 hook 包的 registry 包成 mailbox 包内部定义的最小接口 —— 用于打破 hook ↔ mailbox 循环导入 |
-| `internal/mailbox/hookrunner.go` | `MailboxHookRunner` 接口（`BeforeSend` / `BeforeDeliver` / `BeforeWake`）—— 定义在 mailbox 包内部，让 mailbox 包**不依赖** hook 包 |
-| `internal/mailbox/hookview.go` | `MailboxHookView` 接口（`HasPendingMail` / `GetRecentMessages`）—— hook 通过它读邮件不消费 channel |
-| `internal/mailbox/mailbox.go` | `Mailbox.recent` 环形缓冲（容量 16，配合 `Snapshot` 实现 peek-without-consume）+ `Registry.AttachHookRunner` + `Registry.HookRunner` getter |
+| `internal/gate/gate.go` | `Phase` 枚举 + `Context` 接口 + `Decision` 返回值 + `Gate` 接口 |
+| `internal/gate/registry.go` | `Registry`：`map[Phase][]Gate`，按 Phase 分桶，同 Phase 内 `Priority` 升序；nil 安全 + panic recover |
+| `internal/gate/tool_context.go` | `ToolContext` 具体实现（携带 ToolName / Args / TaskID / AgentID / FilePath / 等域专属字段） |
+| `internal/gate/mailbox_context.go` | `MailboxContext` 具体实现（携带 Message / Recipient / 等） |
+| `internal/gate/adapter.go` | `AsMailboxRunner(*Registry) mailbox.MailboxHookRunner` 适配器，把 gate 包的 registry 包成 mailbox 包内部定义的最小接口（保留 v4 的解耦边界） |
+| `internal/hook/builtin/*.go` | 10 个 Gate 实现（v4 命名沿用，注册到新 `gate.Registry`） |
 
-### 接入点
+### Phase 枚举与内置 Gate
+
+| Phase | 触发点 | 内置 Gate（按 Priority 升序） |
+|---|---|---|
+| `tool:preCall` | `agent.NewLLMExecutor` 在 dispatch 工具前 | `path-boundary`(10) / `validate-expected-hash`(20) / `require-read-before-write`(30) / `dependency-validator`(40) / `enforce-expected-artifacts`(50) / `validate-line-anchors`(60) |
+| `tool:postCall` | dispatch 工具后 | （观察占位；`record-artifact` 已迁为 reactor） |
+| `mailbox:beforeSend` | `mailbox.Registry.Send` 入口 | `chain-depth-limit`(20) |
+| `mailbox:beforeDeliver` | 每收件人投递前 | `per-agent-dedup`(30) |
+| `mailbox:beforeWake` | `MailNotifier.scan` 唤醒任务发布前 | `wake-worthy-filter`(40) / `wake-context-expand`(900) |
+
+**Decision 语义**：`Action ∈ {Continue, Abort}` + 可选 `AbortReason` + （BeforeWake 专用）`WakeDescription` 累加。Gate.Matches 返回 false 时跳过；任一 Abort 立即短路。所有 Gate 继续时 BeforeWake 阶段聚合 `WakeDescription` 后由 reactor 写入 wake task。`panic` 被 recover 视作 Continue；nil Registry 返回 Continue —— **禁用所有 Gate 时行为与 v4 字节级一致**（回归测试基线）。
+
+### 接入点（Tool 域）
+
+`agent.NewLLMExecutor` 在并行工具 goroutine 内：
+```
+preCtx := gate.NewToolContext(Phase=tool:preCall, Tool, Args, TaskID, AgentID, ...)
+decision := gateReg.Dispatch(preCtx)
+if decision.Action == Abort:
+    content = "[gate 拒绝] " + decision.AbortReason
+    toolErr = error
+else:
+    result, toolErr = tools.Dispatch(ctx, call)
+
+recordToolCall(taskID, ToolCallRecord{...})
+
+postCtx := gate.NewToolContext(Phase=tool:postCall, ..., Result, Err)
+gateReg.Dispatch(postCtx)  // 观察类，不短路（无 reactor 依赖此）
+```
+
+### 接入点（Mailbox 域）
 
 ```
 mailbox.Registry.Send:
-  preCtx := MailboxHookContext{Phase: PhaseBeforeSend, Message}
-  runner.BeforeSend(msg)        // 整条消息级，Abort 直接返回 error
+  ctx := MailboxContext{Phase: beforeSend, Message}
+  if gateReg.Dispatch(ctx).Aborted: return error
   for each recipient:
-      runner.BeforeDeliver(msg, deliverTo)
-      // 广播：Abort 仅跳过该收件人；单点：Abort 返回 error
+      ctx2 := MailboxContext{Phase: beforeDeliver, Message, Recipient}
+      if gateReg.Dispatch(ctx2).Aborted: skip recipient
       mb.TrySend(msg)
 
 mailbox.MailNotifier.scan:
   for each non-empty mailbox status:
-      // 既有 inline EventType dedup（D4 双重防御内层）
-      if pendingNotifyTypes[status.EventType]: continue
-      runner.BeforeWake(agentID, eventType, unreadCount)
-      // Abort 跳过本次发布；Continue 时累加的 wakeDescription 写入 wake task
+      ctx3 := MailboxContext{Phase: beforeWake, AgentID, EventType, UnreadCount}
+      decision := gateReg.Dispatch(ctx3)
+      if decision.Aborted: continue
       wakeTask := &Task{
-          Description: wakeDescription or default,
-          MailChainDepth: status.MaxChainDepth,  // 链深度继承
+          Description: decision.WakeDescription or default,
+          MailChainDepth: status.MaxChainDepth,
       }
       store.PublishTask(wakeTask)
 ```
 
-`MailboxHookRunner` nil 时所有 hook 路径退化为 noop —— 这是 V9 回归验证的核心：禁用所有 hook 时既有 mailbox/notifier 测试**未修改通过**。
+### 与 Scheduler 的关系
 
-### 3 个内置 Mailbox Hook
+**Phase 3 重构以来 scheduler 走 `agent.NewLLMExecutor`，所有 Tool / Mailbox Gate 对 scheduler 工具调用与发邮件正常生效**，不存在"豁免通道"。这是修复历史 P0「report_done 不基于 `task.Artifacts`」的架构前提。
 
-| Hook | Phase | Prio | 类型 | 决策 |
-|---|---|---|---|---|
-| `chain-depth-limit` | BeforeSend | 10 | **新增** | 拦截 `ChainDepth > MaxDepth` 的消息（默认 max=3）。与 `MetaGroup.sendMessage` 内 inline `ChainDepth = parent.MailChainDepth+1` 写入构成 D3 双重防御 |
-| `per-agent-dedup` | BeforeWake | 500 | **新增** | 通过 `StoreHookView.ScanPendingByEventSource("mail-notifier", eventType)` 检查是否已有 pending 唤醒任务。与 notifier inline 的 EventType dedup 构成 D4 双重防御 |
-| `wake-context-expand` | BeforeWake | 800 | **新增** | 从 `MailboxHookView` 读最近 5 条邮件，构造人类可读的 wake task description（包含 from/type/summary）—— 这是 D2"有限 Replace 例外"：wake task 在 hook 调用时还不存在，hook 是协助构建而非修改 |
+## Reactor 子系统（v5 真正新增的核心能力）
 
-### 4 项根因关闭对照
+Reactor 让"状态变化之后的副作用"被显式表达 + **可由用户 YAML 声明**。`trace.Emit(ev)` 通过 `SetDefaultDispatcher(reactorReg)` 同时驱动 trace 写入与 Reactor 链路。
 
-| KNOWN_ISSUES 根因 | Phase 2 修复 |
+### 核心组件
+
+| 包 / 文件 | 职责 |
 |---|---|
-| #1 mail-notifier 无去重 | `notifier.scan` inline EventType dedup（保留）+ `PerAgentDedupHook`（D4 镜像） |
-| #2 邮件链无环路检测 / 跳数限制 | `Message.ChainDepth` + `Task.MailChainDepth` + `Config.MailChainMaxDepth` + `MetaGroup.sendMessage` 写入 + `ChainDepthLimitHook` 截断 |
-| #3 唤醒任务不携带原始上下文 | `Mailbox.recent` 环形缓冲 + `MailboxHookView.GetRecentMessages` + `WakeContextExpandHook` 写 `WakeDescription` |
-| #4 worker/explorer prompt 强制回复 | 早期已修复（`worker.go:47-50` + `explorer.go:33-37` 把"应回复"弱化为"可以忽略"+反例） |
+| `internal/reactor/reactor.go` | `Reactor` 接口（`Name() / Subscribe() []EventKind / Run(ctx, ev) error / IsSync() bool / Priority() int`）|
+| `internal/reactor/registry.go` | `Registry`：`map[trace.EventKind][]Reactor`，每桶按 Priority 升序；Sync 在 emit 调用方串行；Async 起独立 goroutine + recover |
+| `internal/reactor/builtin/*.go` | 4 个内置 reactor（详见下表） |
+| `internal/reactor/userdef/loader.go` | `LoadFromFile(path, projectRoot, deps)` 解析 `reactors.yaml`，构造用户 reactor |
+| `internal/reactor/userdef/*.go` | 4 类动作动词的实现（publish_task / invoke_llm / spawn_agent / call:send_message）|
 
-### 关键回归测试
+### 4 个内置 Reactor
 
-- `internal/hook/builtin/cascade_e2e_test.go::TestMailCascade_TerminatesAtMaxDepth` —— 模拟 5 步 worker A↔B 邮件循环，验证第 5 步 `chain_depth=4` 被精确截断
-- `TestMailCascade_NoHook_DemonstratesCascadeWouldExplode` —— 反向证明 hook 是 cascade 的唯一防线
-- V9 验证：注释 bootstrap 中所有 mailbox hook 注册后，全部 mailbox/notifier/bootstrap/worker/explorer/cli/agent/tools 包测试**未修改通过**
+| Reactor | IsSync | Priority | 订阅 EventKind | 功能 |
+|---|---|---|---|---|
+| `record-artifact` | Async | 950 | `KindFileWritten` | `write_file`/`edit_file` 成功时写 `Store.AppendArtifact(taskID, path)`；失败不记录。**v5 从 ToolHook PostCall 迁移而来**，是"角色错位治理"的典型示范 |
+| `task-end-callback` | Sync | 500 | `KindTask{Completed,Failed,Cancelled,Retry}` | 调度已注册的任务结束回调（清理 `CurrentTaskHolder`、释放 per-task 资源等）。从 v4 的 `OnTaskEnd` 闭包形态迁移而来 |
+| `trace-history-event` | Async | 950 | `KindHistory{Compaction,Truncated}` | 原子计数历史压缩 / 截断次数，便于性能诊断 |
+| `read-set-write` | Async | 950 | `KindToolResult`（filter `tool=read_file`）| 写 `Task.ReadSet`，供 `require-read-before-write` Gate 替代旧时代反查 ToolCallHistory 的实现 |
 
-## 阶段 3+ 占位
+此外，`spawn.Manager` 自身实现 `reactor.Reactor`，订阅任务终态事件销毁 ad-hoc runner（详见 §"Spawn 子系统"）。
 
-按需扩展（Chathistory / Board / Session / Skill），触发标准是"≥ 2 个具体痛点"。
+### 用户 YAML Reactor
+
+加载入口：`cfg.ReactorsFile`（顶层配置项，例如 `reactors.yaml`）。空值跳过加载。
+
+**4 类动作动词（Phase 5 已落地）**：
+
+| Verb | 用途 | 关键字段 |
+|---|---|---|
+| `publish_task` | 发布新任务 | `description` / `event_type` / `dependencies` / `expected_artifacts` 等 |
+| `invoke_llm` | **一次性纯文本 LLM 调用**（无工具、无 history） | `prompt` / `model` / `output: { sink, ... }`（写文件 / 发邮件 / 进 reactor 自身上下文）|
+| `spawn_agent` | 经 `spawn.Manager` 创建 ad-hoc agent | `base_kind` / `override` / `initial_task: { description \| via_translator }` / `lifecycle: one_shot` |
+| `call: send_message` | 调用受白名单约束的内置工具（v1 仅 send_message）| `args` 模板化 |
+
+**附加修饰符**：
+
+- `when:` —— 条件表达式过滤（基于事件 payload 字段）
+- `kind:` —— per-base-kind 过滤；ad-hoc agent 通过 `spawn.Manager.KindOf` 查得 base_kind 后参与匹配
+- `via_translator:` —— 在 `spawn_agent` 之前先用 `invoke_llm` 把用户 prompt 加工成 `initial_task.description`；不允许嵌套
+
+**仍 fail-fast 的占位字段**（schema 接受、运行期报错）：
+
+- `lifecycle: persistent`（spawn_agent 长期形态尚未实现）
+- `prompt.url` / `prompt.inline`（PromptSpec 占位字段）
+- `call:` 其他工具（read_file / web_search 等需要 agent 上下文，按需逐个加白名单）
+
+### Reactor 与 Trace 的耦合
+
+`trace.SetDefaultDispatcher(reactorReg)` 在 bootstrap 末段调用。此后：
+
+- `trace.Emit(ev)` 先写 trace.jsonl，再调 `reactorReg.Dispatch(ev)`
+- Sync reactor 串行执行；任一失败 emit `KindError` 但继续其他 reactor
+- Async reactor 立即 fork goroutine，panic-recovered，仅记日志
+- `nil` Registry 是 noop —— 禁用所有 reactor 时 trace 行为不变（回归测试基线）
+
+### 内置 vs 用户的失败语义对照
+
+| 维度 | 内置 reactor | 用户 reactor |
+|---|---|---|
+| 注册者 | 开发者 Go 代码（bootstrap.go） | YAML 声明 |
+| 同步性 | 允许 `IsSync: true` | **强制异步** |
+| 失败影响 | panic-isolated，但失败应被 trace 显眼记录（系统不变量被打破） | panic-isolated，仅记日志 |
+| 可订阅 EventKind 范围 | 全部 21 个（包含仅内置开放的 Shell timeout 事件等） | 子集（`KindAgentStateChanged` 等开放给用户；shell timeout 系列暂不开放） |
+
+### Reactor 的判别速查（写新代码时）
+
+1. 它是状态转换的"主动作"吗？ → 留在 `agent.go` 主流程，**不进 ReactiveSystem**
+2. 它是状态变成 B 之后的副作用吗？ → Reactor（开发者 Go = 内置；用户 YAML = 用户）
+3. 它在事件之前需要决策放行/否决吗？ → Gate
+4. 它是邮件多对一聚合吗？ → 留在 `internal/mailbox/` 内部，**不立顶层抽象**（这是 ReactiveSystem v5 设计决议的下放点 —— 原 `Aggregator` 角色被废）
+5. 它需要"在 ReactLoop 节奏点为 LLM 提供上下文"吗？ → 进 [Memory System](#memory-system取代-team-awareness-的-v5-子系统)，**不进 ReactiveSystem**（原 `Provider` 角色被废）
+
+## Memory System（取代 team-awareness 的 v5 子系统）
+
+### 模块命题
+
+v4 的 `team-awareness-*` Hook 是 v2 时代的临时修复 —— 把团队感知信息硬编码注入 LLM history。它的实质问题不是"叫 Hook 不合适"，而是**整个机制的形态都错了**：所有"注入内容"都是临时文本，系统重启后项目知识全部丢失；agent 被多个 hook 反复"塞"东西，而不是主动从知识源拉取；信息复用、跨会话保留、向量检索等持久化记忆能力完全缺失。
+
+v5 用 `internal/memory` 取代之，遵循 4 条设计哲学：**记忆是一等公民** / **Agent 主动拉取（非被动注入）** / **作用域分层（Process/Session/Project）** / **写入与读取解耦**。
+
+### 接口与作用域
+
+```go
+type Scope int  // ScopeProcess (0) | ScopeSession (1, v5.x) | ScopeProject (2, v5.x)
+type Kind  string // KindConstraint / KindLearning / KindPattern / KindContext / KindAgentState
+
+type Store interface {
+    Put(ctx, entry Entry) error
+    Query(ctx, scope Scope, kind Kind, query string, limit int) ([]Entry, error)
+    QueryByVector(ctx, scope Scope, embedding []float32, limit int) ([]Entry, error)  // ErrNotImplemented
+    Delete(ctx, id string) error
+    Clear(ctx, scope Scope) error
+}
+
+type Entry struct {
+    ID, Key, Content, Source string
+    Scope Scope; Kind Kind
+    Embedding []float32; Tags []string
+    CreatedAt, UpdatedAt time.Time
+    AccessCount int
+}
+```
+
+### v5 实现进度
+
+| Scope | 状态 | 存储 | 说明 |
+|---|---|---|---|
+| `ScopeProcess` | ✅ v5 完成 | 纯内存（`map[ID]*Entry` + `(scope,kind,key)→ID` 双索引，单 RWMutex） | team_snapshot / file_awareness / 实时状态 |
+| `ScopeSession` | 📅 v5.x | 落盘 `.agentgo/sessions/sess-<id>/memory.jsonl` | session 结束时清空 |
+| `ScopeProject` | 📅 v5.x | 持久化 `.agentgo/memory/`（JSONL 或 SQLite） | 跨会话学习积累 |
+
+### Query 语义（Phase 1 最小集）
+
+- query 非空 → 精确 key 匹配（快速路径，用于 team_snapshot/file_awareness）
+- query 为空 → 范围检索该 scope+kind 下全部条目（按 UpdatedAt 倒序，limit 截断）
+- `QueryByVector` 返回 `ErrNotImplemented`（接口预留 v5.x）
+
+### Agent 侧的读取入口
+
+```go
+// internal/agent/agent.go: processTask 入口
+func (a *Agent) processTask(ctx context.Context, taskID string) {
+    if a.Memory != nil {
+        // 替代旧的 runAgentInject(PhaseTaskStart)
+        if entries, _ := a.Memory.Query(ctx, memory.ScopeProcess, memory.KindContext, "team_snapshot", 1); len(entries) > 0 {
+            history = append(history, HistoryEntry{IncomingMail: entries[0].Content})
+        }
+        if entries, _ := a.Memory.Query(ctx, memory.ScopeProcess, memory.KindContext, "file_awareness", 1); len(entries) > 0 {
+            history = append(history, HistoryEntry{IncomingMail: entries[0].Content})
+        }
+    }
+    // 进入 ReAct 循环
+}
+```
+
+`Agent.Memory` 字段 `nil` 安全 —— 不持有 store 时退化为 v4-without-team-awareness 行为。
+
+### 三 section 的迁移路径
+
+| Section | v4 位置 | v5 去向 |
+|---|---|---|
+| `TeamSnapshot`（队友状态） | `PhaseTaskStart` / `PhaseLoopPre` 注入 | **Process Memory**：scheduler / runners 在团队状态变化时调 `Memory.Put`；Agent `processTask` 入口 `Memory.Query` |
+| `FileAwareness`（文件占用） | 同上 | **Process Memory**：Roster 监听器 → `Memory.Put`；Agent 按需读取，不再每轮调 `ListClaims` |
+| `GoalAnchor`（目标锚定） | 同上 | **直接删除，不迁移** —— `task.Description` 本身就是目标 |
+
+### AgentHook 子系统命运
+
+team-awareness 三个 hook 删除后 `AgentHookRegistry` 在事实上为空（v4 仅有的 2 个 AgentHook 都是 team-awareness）。v5 阶段保留空壳子系统作为未来"在 ReactLoop 节奏点做副作用"的扩展位；倾向方案是后续合并入 Reactor（订阅新增的 `KindReactLoopIterationEnd` / `KindTaskEnd`），按 Phase 1 启动具体安排再拍板。详见 `docs/activate/MemoryManageSystem.md` §5。
+
+## Spawn 子系统（v5 新增）
+
+`spawn.Manager` 让 reactor 可以"创建 ad-hoc agent"。本质是把"动态拉起 runner、跑完一个任务、自动销毁"这条路径包进一个 reactor.Reactor 实现里。
+
+### 核心组件
+
+| 组件 | 职责 |
+|---|---|
+| `spawn.Manager` | 同时实现 `reactor.Reactor`，订阅 `KindTask{Completed,Failed,Cancelled}` |
+| `SpawnRequest` | `BaseKind` / `Override (RuntimeOverride)` / `InitialTaskDescription` / `Lifecycle` / `SourceTaskID` / `Depth` |
+| `Manager.Spawn(ctx, req)` | (1) 解析 base_kind 模板 + 合并 Override → `AgentRuntimeConfig`；(2) 生成唯一 spawnID + `EventType="adhoc:<spawnID>"`；(3) 发布 initial_task；(4) 起 runner goroutine（ctx 派生自 `m.parentCtx`）；(5) 登记 activeSpawn 映射 |
+| `Manager.Run(ctx, ev)`（reactor 实现）| Initial task 进入终态 → cancel runner ctx，清理映射（one_shot 销毁） |
+| `Manager.KindOf(agentID)` | 返回 ad-hoc agent 的 base_kind，供 §6.2.4 per-kind reactor 路由使用 |
+
+### 防护栏
+
+- `ReactorSpawnMaxDepth = 5`：spawn_agent reactor 级联硬上限。超过时触发 `KindReactorSpawnDepthExceeded` 事件
+- `lifecycle: persistent` schema 接受但运行期报错（v5 仅支持 one_shot）
+- `via_translator` 不允许嵌套（一次 LLM 转译已是上下文隔离的极限）
+
+### Wiring 锚点
+
+```
+bootstrap.go:
+  spawnMgr := spawn.NewManager(cfg, deps, llmFactoryForSpawn, taskStore)
+  reactorReg.Register(spawnMgr)         // 同时是 reactor
+
+  userdefDeps.SpawnHost = spawnMgr      // 用户 reactor 的 spawn_agent 通过它创建 ad-hoc
+
+  // KindOf 合并：静态 agent 从 staticKindOf；ad-hoc 从 spawnMgr.KindOf
+  combinedKindOf := func(agentID) string {
+      if k := staticKindOf(agentID); k != "" { return k }
+      return spawnMgr.KindOf(agentID)
+  }
+```
 
 ---
 
@@ -233,14 +396,18 @@ type Provider interface {
 
 **`client.go` / `agent.go` 不需要任何修改**——这是"不是每遇到一个就补一块"的保障。
 
-## 配置
+## 配置（v4 schema）
 
 ```yaml
-llm_provider: deepseek-v4       # 默认 "openai"
-explorer_provider:              # 空则 fallback 到 llm_provider
+llm:
+  provider: deepseek-v4         # 默认 "" → "openai" no-op；可选 "deepseek-v4" / "deepseek-r1"
+  default_model: ...
+  base_url: ...
+  api_key: ...
+  timeout_sec: ...
 ```
 
-`bootstrap.go` 把 `cfg.LLMProvider` 传给所有 `llm.NewSDKClient(...)` 调用点；explorer 独立使用 `cfg.ExplorerProvider`（空时回退到 `LLMProvider`）。
+`bootstrap.go` 把 `cfg.LLM.Provider` 传给所有 `llm.NewSDKClient(...)` 调用点。如果未来需要 per-kind provider 覆盖（例如 explorer 用不同模型族），可在 `agents[*]` 上加字段；当前阶段所有 kind 共享同一个 provider，per-kind 区分由 `model` 名（同一 endpoint 下选不同模型）承担。
 
 ## 为什么不直接丢弃 openai-go
 
@@ -253,7 +420,7 @@ explorer_provider:              # 空则 fallback 到 llm_provider
 - `internal/llm/provider_builtin.go` —— OpenAI / DeepSeek V4 / DeepSeek R1 三个内置实现
 - `internal/llm/provider_test.go` + `internal/llm/client_test.go` —— 单元测试 + httptest 双轮对话集成测试（模拟 V4 / R1 严格契约，往返断言）
 - `internal/agent/agent.go` / `internal/agent/llm_executor.go` —— HistoryEntry.ExtraFields 透传
-- `internal/config/config.go` —— `LLMProvider` / `ExplorerProvider` 字段
+- `internal/config/config.go` —— `LLMConfig.Provider` 字段（顶层 `llm:` 块）
 - `internal/bootstrap/bootstrap.go` —— 所有 `llm.NewSDKClient(...)` 调用点串联
 
 ---
@@ -589,7 +756,7 @@ internal/
 - **直接回答**：用户的问题属于系统状态查询、闲聊、意图澄清；或者只需 1-2 次 read_file/grep_search/web_search 就能解决的简单查询
 - **发布任务**：信息量超出单次 LLM 调用能处理的范围、或涉及多个独立子问题适合并行调查、或需要持续多步骤的写文件 / 跑命令任务
 ### 调度器不负责什么
-- 不负责长任务的具体执行——通常交给执行代理（Worker），保留自己的上下文容量给规划决策
+- 不负责长任务的具体执行——通常通过 `publish_task` 派发给非 scheduler 的 runner（典型如 worker / explorer kind），保留自己的上下文容量给规划决策
 - 不负责异常检测与任务回收——交给看门狗
 - 不负责维护全局任务图——任务之间仅通过依赖字段表达先后关系，无全局 DAG
 
@@ -613,18 +780,36 @@ internal/
 - main goroutine 监控看门狗的存活状态，若看门狗 goroutine 异常退出（panic 或其他原因），立即通过 for 循环 + recover 重启
 - 看门狗是无状态的（所有状态都在公告板和花名册中），因此重启后可以立即恢复巡检，不会丢失信息
 
-## 调查代理（Explorer）
-调查代理是一个轻量级的只读代理，默认使用快速低成本的 LLM（如 Haiku 级别），专门用于验证和检索。
-### 调查代理的核心职责
-- **验证历史结论**：调度器基于公告板中的历史任务做决策前，发布调查任务让调查代理确认历史结论是否仍然成立。在以下几个场景中，调度器应当倾向于发布调查任务去总结内容：
-    - 有一个或多个目标文件的调查结果完全缺失，调度器无从得知必须文件的内容。
-    - 发现存在冲突或者更改，比如：一个文件的调查记录之后存在更改记录，等等情况下，就有必要进行更改。但是这并非程序强制，而是在提示词中进行限制。因为有的时候更改幅度确实不大，可以不启动调查。
+## 调查代理（Explorer kind）
+
+> **v5 实现现状**：v4 之前 Explorer 是独立的 `internal/explorer` 包；**v5 已删除该包**，"调查代理"在实现上就是 `agents:` 列表中一个声明 `event_type: explore` + `profile: read-only` 的 `runner.Runner` 实例。本节保留以阐述其**配置语义**与**调度器何时应当用它**，而不是描述独立子系统。
+
+### 在 setting.yaml 里如何声明
+
+```yaml
+agents:
+  - kind: explorer
+    replicas: 1
+    event_type: "explore"               # scheduler 通过此 EventType 派发调查任务
+    profile: "read-only"                # 工具集只含 read/list/grep/glob/web_*，无写入工具
+    model: "qwen3.6-flash"              # 通常用更便宜更快的模型
+    system_prompt_file: "prompts/explorer.md"
+    description: "广度优先的只读调查代理，不写文件，仅返回 Markdown 文字回复"
+```
+
+### 调度器何时应当 publish 调查任务
+
+- **验证历史结论**：调度器基于公告板中的已完成任务做决策前，先发布 `event_type=explore` 的调查任务确认历史结论是否仍然成立。倾向于这样做的场景：
+    - 有一个或多个目标文件的调查结果完全缺失，调度器无从得知必须文件的内容
+    - 发现存在冲突或更改（一个文件的调查记录之后存在更改记录等）—— 但这并非程序强制，而是在 system prompt 中给出指引；幅度小的更改可以不启动调查
 - **快速信息检索**：对项目文件、代码、配置等进行只读检索，返回当前状态的快照
 - **对比变更**：将历史任务的结论与当前项目状态进行比对，标注哪些结论已过时
-### 调查代理的特点
-- 只读操作，不修改任何文件或状态
-- 默认用轻量级 LLM，降低时间和成本开销
-- 任务结果简短明确：结论仍然成立 / 结论已过时（附当前状态摘要）
+
+### 配套的硬约束
+
+- **只读纪律**：scheduler 与 `MetaGroup.publishTask` 双端硬拒绝 `event_type=explore && expected_artifacts != nil` —— 防止 scheduler 误把"必须写文件"的任务派给 explorer
+- **降级模型**：用 `model:` 字段切到便宜模型（如 `qwen3.6-flash`、`gpt-4o-mini`），降低验证成本
+- **结果简短**：通过 system prompt 引导 explorer 用"结论仍然成立 / 结论已过时（附当前状态摘要）"的简短回复格式
 
 # 任务依赖管理
 本项目不使用有向无环图（DAG）进行全局任务编排。原因：DAG 要求在任务发布前确定完整的任务拓扑，但 LLM 驱动的任务天然是动态展开的，调度器无法在接收用户输入时就规划出完美的任务图。
@@ -634,7 +819,7 @@ internal/
 - 前置任务 failed 或 cancelled 时，看门狗巡检发现后连锁取消依赖它的后继任务
 - 不做环检测——由调度器在发布任务时自行保证不产生循环依赖，这是调度器作为 LLM 代理的责任
 ## 工作模式
-系统支持两种工作模式，默认启动时为即时模式。CLI 通过 `/mode` 命令切换（**Phase 3 改动**：旧设计提到的 `Shift+Tab` 快捷键未实现，实际是 `/mode` slash command；切换通过 `Bundle.Mode` (`*scheduler.ModeStore`)，scheduler agent 在每次 reactLoop 注入 board snapshot 时实时读取最新 mode）。
+系统支持两种工作模式，默认启动时为即时模式。TUI 通过 `/mode` 斜杠命令切换（**Phase 3 改动**：旧设计提到的 `Shift+Tab` 快捷键未实现，实际是 `/mode`；切换通过 `Bundle.Mode` (`*scheduler.ModeStore`)，scheduler agent 在每次 reactLoop 注入 board snapshot 时实时读取最新 mode）。
 ### 即时模式（默认）
 - 调度器不预先规划完整的任务链，而是作为**"下一步决策者"**被反复唤醒
 - 每次唤醒时，调度器只读取公告板的当前状态，然后决定生成 0 个或多个**立即可执行**的下一步任务
@@ -742,7 +927,7 @@ scheduler agent 与 worker / explorer 共享同一套 `agent.Agent.processTask` 
 `DrainWithAck` 在代理消费消息时自动向发送方回送 `type=ack` 已读回执。
 
 ### 工具与代理集成
-- `send_message` 工具注册在 worker / explorer / scheduler 三类代理上（**Phase 3 后**：scheduler 也通过共享的 `MetaGroup.sendMessage` 注册，消除了之前的双写实现），支持 `to=<agentID>` 点对点或 `to=*` 广播（自动跳过自己）。
+- `send_message` 工具属于 `MetaGroup`，被所有 runner（worker / explorer / 任何用户声明的 kind）以及 scheduler 共享注册（**Phase 3 后**：scheduler 通过同一份 `MetaGroup.sendMessage` 注册，消除了之前的双写实现），支持 `to=<agentID>` 点对点或 `to=*` 广播（自动跳过自己）。tool_profile 没把 `send_message` 列进 allowlist 的 kind 在工具注册时被剪枝。
 - 代理任务开始时，从 `Registry` 拉取 `TeamSnapshot`，把队友 ID + 忙碌/空闲状态 + 当前任务摘要注入为首条 `<team-snapshot>` 系统消息，让 LLM 知道"此刻谁在做什么"。
 - 邮件以 `<agent-mail type=... priority=...>` XML 子标签形式注入 LLM 上下文，prompt 引导代理根据 type 做差异化响应。
 
@@ -760,10 +945,10 @@ Scheduler agent (Phase 3 后) 与 worker / explorer 共享同一套 `Mailbox.Dra
 - Scheduler 通过 `publish_task` 工具的 `expected_artifacts` 参数声明任务必须产出哪些文件。
 - 任务结束前 `agent.checkExpectedArtifacts` 扫描 `task.Artifacts`，缺失任何 expected 文件则触发 `handleFailure` 重试，错误消息明确告知"缺失 X，已写入 Y"。
 - 路径精确匹配失败时按 `filepath.Base` 兜底命中并记 `Drifted` warning，避免硬卡。
-- Explorer 是只读代理，scheduler 和 meta 工具双端硬拒绝 `event_type=explore && expected_artifacts != nil`。
+- 只读 kind（典型如 explorer，但泛化为所有 `event_type=explore` 的 kind）：scheduler 与 `MetaGroup.publishTask` 双端硬拒绝 `event_type=explore && expected_artifacts != nil`，防止派发"必须写文件"的任务给只读代理。
 
 ### `Task.LastResponse`（失败诊断锚点）
-- Worker 每次 non-tool LLM 响应都通过 `Store.RecordLastResponse(taskID, content)` 无条件持久化，无论后续校验成败。
+- Runner 每次 non-tool LLM 响应都通过 `Store.RecordLastResponse(taskID, content)` 无条件持久化，无论后续校验成败。
 - 任务最终崩溃时 `sendCrashReport` 把 LastResponse 原文附在邮件正文里发给 `task.EventSource`，scheduler 不再只看到一个干瘪的"重试次数耗尽"。
 
 ### 校验反馈进入历史
@@ -773,42 +958,82 @@ Scheduler agent (Phase 3 后) 与 worker / explorer 共享同一套 `Mailbox.Dra
 `agent.terminateTask` 在 `RetryCount >= a.MaxRetries` 时调用 `sendCrashReport`，向 `task.EventSource` 发送 `priority=high` 邮件，正文格式："代理 X 在执行任务 Y 时崩溃，原因 Z；任务描述、重试次数、expected vs actual artifacts、worker 最后一次响应原文"。`MaxRetries` 由各壳包（worker/explorer/scheduler）的角色常量设置，不由 yaml 配置。
 
 # 系统启动流程
-系统由 `main.go` → `bootstrap.Bootstrap(configPath, explicit, skipStartupProbe)` 完成初始化，再由 `System.Start(ctx, cancel)` 拉起所有 goroutine，最后 `System.RunCLI(ctx, stdin, stdout)` 阻塞主线程。`skipStartupProbe` 来自 `--skip-startup-probe` 命令行旗标（详见 nextUpgrade_v4.md §9.7）。
 
-## Bootstrap 阶段（构造对象图）
-1. **加载配置**：`config.LoadConfig`，YAML/JSON 自动判别，文件不存在时回退默认值。打印：`[启动] 全局配置加载完成`
-2. **初始化 Trace 系统**：`trace.NewWriter(traceDir, 100)` + 可选 `PromptDumper`（`AGENTGO_DUMP_PROMPTS=1` 启用）。`traceDir` 默认 `.agentgo/traces`，当 `SessionManager.Current() != nil` 时重定向到 `sessMgr.LogDir()`（即 `.agentgo/sessions/sess-<id>/logs/`）。失败仅 warning，不中断主流程。打印：`[启动] Trace 系统已启动 (dir=...)` 或 warning
-3. **初始化公告板**：`store.NewMemoryTaskStore` + `store.NewTaskCancelRegistry`，把 cancelRegistry 注入 store（terminal 状态转换时自动取消正在执行的代理）。打印：`[启动] 公告板初始化完成`
-4. **初始化 Tool Hook 系统**：`hook.NewToolHookRegistry()` + 注册 6 个内置 hook（record-artifact / path-boundary / validate-expected-hash / require-read-before-write / dependency-validator / enforce-expected-artifacts）。打印：`[启动] Hook 系统初始化完成（已注册：record-artifact, path-boundary, validate-expected-hash, require-read-before-write, dependency-validator, enforce-expected-artifacts）`
-5. **初始化花名册**：`roster.NewMemoryRoster`。打印：`[启动] 花名册初始化完成`
-6. **初始化邮箱注册表**：`mailbox.NewRegistry(cfg.MailboxBufferSize)`。打印：`[启动] 邮箱注册表初始化完成`
-7. **初始化 Mailbox Hook 系统**：`hook.NewMailboxHookRegistry()` + 注册 3 个内置 hook（chain-depth-limit / per-agent-dedup / wake-context-expand）+ `mbRegistry.AttachHookRunner(hook.AsMailboxRunner(mailboxHookReg))`。打印：`[启动] Mailbox Hook 系统初始化完成（已注册：...）`
-8. **创建 LLM 客户端**：scheduler / explorer / worker × N 各自创建 `llm.NewSDKClient`（OpenAI 兼容 SDK）
-9. **创建看门狗**：`watchdog.New(store, cfg, eventCh, roster)`
-10. **创建调查代理**：`explorer.New(store, roster, llm, cfg, cancelRegistry, mbRegistry, hookReg, storeView, recordToolCall, searchProvider)`
-11. **创建命令审批通道**：`approvalCh := make(chan shell.ApprovalRequest, 8)`，Worker→CLI 通道
-12. **创建调度器**（Phase 3 重构）：`scheduler.New(store, roster, schedulerLLM, eventCh, cfg, cancelRegistry, mbRegistry, approvalCh, hookReg, storeView, recordToolCall)` 返回 `*scheduler.Bundle{Agent, Activator, Mode}`。**注意**：scheduler 现在需要 roster + approvalCh + hook 三件套，与 worker 一致；构造在 explorer / worker 之后，因为它依赖 approvalCh
-13. **创建执行代理**：`worker.NewWithID("worker-N", ...)` × `cfg.WorkerCount`，每个 worker 持有独立 LLM client
-14. **创建邮差通知器**：`mailbox.NewMailNotifier(...)` 对象
+系统由 `main.go` → `bootstrap.Bootstrap(configPath, explicit, skipStartupProbe)` 完成初始化，再由 `System.Start(ctx, cancel)` 拉起所有 goroutine，最后 `System.RunCLI(ctx, stdin, stdout)`（内部调 `tui.Run`）阻塞主线程。
+
+`main.go` 入口除 `-config` / `-skip-startup-probe` 外还支持 `trace` 子命令：`./agentgo trace list/show ...` 不进 bootstrap，直接进入 `internal/trace/cli.go`。Trace CLI 自动通过 `.agentgo/sessions/active-session` 解析当前 session 的 `logs/` 目录，回退到 `.agentgo/traces/`。
+
+## Bootstrap 阶段（构造对象图，v5 顺序）
+
+| Step | 子系统 | 关键调用 |
+|---|---|---|
+| 1 | 配置加载 | `config.LoadConfig(path, explicit)` + `cfg.Validate()`（v4 §11.5.3 12 条规则） |
+| 1.1 | 启动 banner | `printStartupBanner(stdout, configPath, cfg)` —— 逐 kind 摘要 + 脱敏 api_key |
+| 1.2 | 启动期 TCP probe | `startupProbe(stdout, cfg)` —— best-effort；`startup_probe_failure_action=exit` 改为硬退出；`-skip-startup-probe` 整体跳过 |
+| 1.3 | Session 管理器 | `session.NewSessionManager(...)` + `history.jsonl` 溯源 |
+| 1.5 | Trace 系统 | `trace.NewWriter(traceDir, 100)` + `trace.SetDefault()`；Session 活跃时 `traceDir = sessMgr.LogDir()` |
+| 1.6 | Prompt Dumper | 条件启用（`AGENTGO_DUMP_PROMPTS=1`） |
+| 2 | 公告板 | `store.NewMemoryTaskStore(eventCh, ...)` + `store.NewTaskCancelRegistry()` |
+| 2.3 | Artifact 日志 | `store.OpenArtifactLog()` + `Replay()` + `RestoreArtifacts()` |
+| 2.5 | **Gate Registry** | `gate.NewRegistry()` + 注册 6 个 Tool 域 Gate（path-boundary 等） |
+| 3 | 花名册 | `roster.NewMemoryRoster()` |
+| 3.5 | 邮箱注册表 | `mailbox.NewRegistry(...)` |
+| 3.5.1 | Session History 注入 | `SetHistoryEmitter()` 串联 store / roster / mailbox |
+| 3.6 | Mailbox 域 Gate | 注册 4 个 Mailbox 域 Gate（chain-depth-limit / per-agent-dedup / wake-worthy-filter / wake-context-expand）+ `mbRegistry.AttachHookRunner(gate.AsMailboxRunner(gateReg))` |
+| 3.8 | **Memory System** | `memory.NewProcessStore()` —— team_snapshot / file_awareness 共享存储 |
+| 3.9 | **Reactor Registry** | `reactor.NewRegistry()` + 注册 4 个内置 reactor（record-artifact / task-end-callback / trace-history-event / read-set-write） |
+| 5 | Scheduler | `scheduler.New(...)` 返回 `*Bundle{Agent, Activator, Mode}`；scheduler 是 `EventType="__scheduler__"` 的一等 agent |
+| 6 | 看门狗 | `watchdog.New(store, cfg, eventCh, roster)` |
+| 6.8 | 工具可用性探针 | `probe.RunAll()` —— 检测 `web_search` / `web_fetch` 实际可用性 |
+| 7.5 | 命令审批通道 | `approvalCh := make(chan shell.ApprovalRequest, 8)`（Runner→TUI） |
+| 4.5 | TUI 系统消息通道 | `statusCh := make(chan string, ...)`（agent 输出 → Bubble Tea） |
+| 8 | **Runner 实例化** | 按 `cfg.Agents` 循环，每 kind × `replicas` 调用：(1) `runtime_builder.buildAgentRuntime(kind, replicaIdx)` 合成 `AgentRuntimeConfig`（含 `InstanceID="<kind>-<replicaIdx>"`、`AllowedTools` 由 `profile` 或 `tools` 决定）；(2) `runner.New(rt, deps)` 构造 Runner（含 ToolRegistry allowlist 剪枝、TaskEndCallbackReactor 注册、Mailbox 注册）；(3) 打印 `Runner <id> 已启动 [kind=..., model=...]` |
+| 8.5 | **Spawn Manager** | `spawn.NewManager(cfg, deps, llmFactoryForSpawn, taskStore)` + `reactorReg.Register(spawnMgr)`（manager 自身就是 reactor） |
+| 8.6 | 用户 YAML Reactor | `cfg.ReactorsFile` 非空时 `userdef.LoadFromFile(...)` 解析并注册到 `reactorReg` |
+| 9 | Reactor Dispatcher | `trace.SetDefaultDispatcher(reactorReg)` —— 使 `trace.Emit` 同时驱动 trace.jsonl 写入与 Reactor 链路 |
+| 10 | 邮差通知器 | `mailbox.NewMailNotifier(...)` 对象 |
 
 ## Start 阶段（拉起 goroutine）
-- **Scheduler 双 goroutine**（Phase 3）：先启 `Scheduler.Activator.Run(ctx)`（事件桥），再启 `Scheduler.Agent.Run(ctx)`（poll-based agent）。Activator 必须先就绪，否则 `EventUserInput` 在 Agent 未启动时到达可能丢失。打印：`[启动] 调度器已启动 (agent + activator)`
-- **看门狗**：`runWatchdogWithRecover(ctx)` — for 循环 + recover，panic 后 1 秒延迟重启。打印：`[启动] 看门狗已启动`
-- **邮差通知器**：`MailNotifier.Run(ctx)`，仅当 `cfg.MailNotifierEnabled=true` 时启动（**默认启用**）。打印：`[启动] 邮差通知器已启动`
-- **调查代理**：`Explorer.Run(ctx)`。打印：`[启动] 调查代理已启动`
-- **执行代理**：`Worker[1..N].Run(ctx)` × `cfg.WorkerCount` 并行 goroutine。打印：`[启动] 执行代理已启动 (N 个)`
-- 最后打印：`[启动] 系统就绪，等待用户输入`
+
+| 顺序 | 组件 | 关键调用 |
+|---|---|---|
+| 0 | Spawn Manager parent ctx | `spawnMgr.SetParentContext(ctx)` —— 后续 ad-hoc runner 的 ctx 都派生自此 |
+| 1 | Scheduler Activator | `scheduler.Activator.Run(ctx)`（事件桥）—— **必须先就绪**，否则 `EventUserInput` 可能丢失 |
+| 2 | Scheduler Agent | `scheduler.Agent.Run(ctx)`（poll-based） |
+| 3 | 看门狗 | `runWatchdogWithRecover(ctx)` —— for 循环 + recover，panic 后延迟重启 |
+| 4 | 邮差通知器 | `MailNotifier.Run(ctx)`，仅当 `cfg.Infra.MailNotifier.Enabled=true` 时启动（**默认启用**） |
+| 5+ | Runner（all kind × replica） | `runner[i].Run(ctx)` 并行 goroutine |
+
+最后打印 `[启动] 系统就绪，等待用户输入`。
 
 ## RunCLI 阶段
-- `cli.New(...).Run(ctx)` 阻塞主线程，处理用户输入与命令（`/quit` `/mode` `/status` `/cancel` `/help` `/steer` `/new` `/session`）
-- **自由文本多行聚合**：非 `/` 前缀的输入会被 `collectMultiline` 持续收集，遇到**空行提交**或 `/command` 打断；`/command` 永远单行。这避免了 `bufio.Scanner` 按 `\n` 切分把用户单一意图粉碎成多个 `EventUserInput` 的问题（2026-04-19 P0 修复）
-- 用户输入由 CLI 通过 `eventCh` 发送 `EventUserInput`（并顺带调 `SessionManager.RecordFirstInput` + `IncrementTaskCount`），`scheduler.Activator` 翻译为 `EventType="__scheduler__"` 任务，scheduler agent 在下次 poll 时认领并 reactLoop（详见 §"Scheduler 一等代理重构"）
-- `/new` 关闭当前 Session 并创建新 Session；`/session` 列出历史 Session 并支持按序号切换（详见 §"Session 子系统"，暂待补）
+
+`sys.RunCLI(ctx, stdin, stdout)` 内部调 `tui.Run(ctx, deps)`，基于 Bubble Tea，inline 渲染（不接管全屏，bootstrap / scheduler / agent 的 `fmt.Println` 日志直出 stdout）。
+
+- **斜杠命令**：`/quit /help /status /cancel <id> /steer <agentID> <msg> /mode /new /session [<idx>]`
+- **自由文本**（非 `/` 开头）→ `EventUserInput` 写入 `eventCh`，同步调 `SessionManager.RecordFirstInput` + `IncrementTaskCount`；`scheduler.Activator` 翻译为 `EventType="__scheduler__"` 任务，scheduler agent 在下次 poll 时认领
+- **审批面板**：`ApprovalCh` 收到请求时输入栏被替换为审批面板，键位 `1` 通过 / `2`/Esc 拒绝 / `3` 切到指导输入模式 / `4` 永远允许（写入 `shell.CommandFilter` 的 `runtimeWhitelist`，**进程内不持久化**） / Ctrl+C 拒绝并退出
+- **多审批排队**：并发请求进入队列，`activeApproval` 答复后自动出队下一个
+- **没有 `"""` 多行块**（v1 范围决议；v4 之前的 `bufio.Scanner` 多行聚合机制已不存在）
+
+## Shutdown 阶段
+
+`sys.Shutdown()` 顺序：
+1. `cancel()` 传播到所有 ctx
+2. `SpawnManager.Shutdown()` —— 终止所有 ad-hoc runner
+3. `s.wg.Wait()` 等待所有静态 goroutine
+4. `trace.Default().Close()`
+5. `trace.DefaultDumper().Close()`（若启用）
+6. `ArtifactLog.Close()`
+7. `SessionMgr.Close()`
 
 ## 启动顺序约束
-- 公告板和花名册是基础设施，必须先于所有代理初始化
-- Scheduler 先于其他代理 goroutine 启动（消费者先就绪，避免事件丢失）
-- 看门狗先于 explorer/worker 启动，确保第一批任务就处于监控之下
+
+- 公告板、花名册、Gate、Memory、Reactor 是基础设施，必须先于所有 agent 初始化
+- Scheduler 先于其他 agent goroutine 启动（消费者先就绪，避免事件丢失）
+- Activator 先于 Scheduler Agent 启动（否则 `EventUserInput` 在 Agent 未启动时到达可能丢失）
+- 看门狗先于 runner 启动，确保第一批任务就处于监控之下
+- `trace.SetDefaultDispatcher(reactorReg)` 必须在所有 reactor 注册**之后**调用，否则早期事件无法触发 reactor
 - 任一步骤失败时返回 error 终止启动，不进入半初始化状态
 
 # Trace 系统
@@ -830,22 +1055,60 @@ Trace 系统为每个任务记录完整的执行轨迹，便于问题诊断、�
 
 **格式**: JSON Lines（每行一个 JSON 对象）
 
-## 事件类型
+## 事件类型（v5 Schema B，2026-05-01 升级）
 
-| 事件类型 | 说明 | 关键字段 |
-|---------|------|---------|
-| `task_published` | 任务发布 | `task_id`, `description`, `dependencies` |
-| `task_claimed` | 任务被认领 | `task_id`, `agent_id` |
+`Event` 顶层字段不变，**新增 3 个可选指针子结构体** `Transition` / `ShellExec` / `ShellTimeout` 承载结构化信息，旧 v4 jsonl 与本格式向前兼容（`omitempty` 让旧字段 0 值不出现在 JSON 中）。
+
+### 任务/Agent 状态变更类
+
+| EventKind | 说明 | 关键字段 |
+|-----------|------|----------|
+| `task_published` | 任务发布 | `task_id`, `description`, `dependencies`, `expected_artifacts` |
+| `task_claimed` | 任务被认领 | `task_id`, `agent_id`, `Transition{prev_status, new_status, cause}` |
 | `task_submitted` | SubmitResult 成功，准备进入 completed | `task_id`, `agent_id`, `output_len`, `loops_used` |
-| `task_completed` | 任务完成 | `task_id`, `agent_id` |
-| `task_failed` | 任务失败 | `task_id`, `error` |
-| `error` | 非终态错误（如 ExpectedArtifacts 校验失败、SubmitResult 异常） | `task_id`, `agent_id`, `error` |
-| `llm_call` | LLM 调用 | `prompt_tokens`, `completion_tokens`, `model` |
+| `task_completed` / `task_failed` / `task_cancelled` / `task_retry` | 任务终态 / 重试 | `task_id`, `agent_id`, `Transition{...}`（含 cancel_source / retry_count） |
+| `agent_state_changed` | **v5 新增** —— Agent 4 状态枚举切换 | `agent_id`, `Transition{prev_state, new_state, cause}`；**开放给用户 reactor** |
+| `error` | 非终态错误（ExpectedArtifacts 校验失败、SubmitResult 异常等） | `task_id`, `agent_id`, `error` |
+
+### 工具/LLM 类
+
+| EventKind | 说明 | 关键字段 |
+|-----------|------|----------|
+| `llm_call_start` / `llm_call_end` | LLM 调用 | `prompt_tokens`, `completion_tokens`, `model` |
 | `tool_call` | 工具调用开始 | `tool`, `args` |
-| `tool_result` | 工具调用完成 | `tool`, `duration_ms`, `result_len` |
-| `history_compaction` | 历史压缩 | `layer`, `original_len`, `compacted_len` |
+| `tool_result` | 工具调用完成 | `tool`, `duration_ms`, `result_len`；触发 `read-set-write` reactor |
+| `text_only_submission` | LLM 仅文本响应（无 tool call，自然完成） | `task_id`, `output_len` |
+| `token_stats` | per-task token 使用统计 | `prompt_tokens`, `completion_tokens` |
+
+### 文件 / Shell 类
+
+| EventKind | 说明 | 关键字段 |
+|-----------|------|----------|
+| `file_written` | `write_file` / `edit_file` 成功 | 触发 `record-artifact` reactor → `Store.AppendArtifact` |
+| `write_queued` | 因 Roster 占用而排队 | `file_path`, `holding_agent` |
+| `shell_executed` | **v5 新增** —— shell 命令完成 | `ShellExec{command, exit_code, duration_ms, outcome, stdout/stderr_excerpt}` |
+| `shell_timeout_pending` | **v5 新增** —— shell 命令超时等待决策 | `ShellTimeout{command, elapsed_sec, previous_waits, ...}` |
+| `shell_timeout_resolved` | **v5 新增** —— shell 超时决策落地 | `ShellTimeout{decision, extra_seconds, ...}` |
+
+### 历史压缩 / 通知 / Reactor
+
+| EventKind | 说明 | 关键字段 |
+|-----------|------|----------|
+| `history_compaction` | Layer 1/2/3 历史压缩 | `layer`, `original_len`, `compacted_len`；触发 `trace-history-event` reactor |
+| `history_truncated` | Layer 3 截断 | 同上 |
+| `progress_notify` | 进度通知（`progress_notify_enabled=true` 时） | `to`, `kind`, `summary` |
+| `reactor_spawn_depth_exceeded` | spawn_agent reactor 级联超限（`ReactorSpawnMaxDepth=5`） | `source_task_id`, `depth` |
 
 > **`task_submitted` / `task_completed` 对称性**：`agent.processTask` 的两条完成路径（自然完成 / Finalized 跨轮短路）都会 emit 这两个事件。2026-04-19 修复前，短路路径只 `SubmitResult` 未 emit，导致 `trace list` 把 scheduler 任务错标为 `running/loops=0`。
+
+> **Schema B 兼容性**：新字段 `omitempty`，旧 v4 jsonl 仍可被新 viewer 读懂；旧 viewer 读新 jsonl 时 `Transition` / `ShellExec` / `ShellTimeout` 子结构看不到细节但不崩溃。
+
+### Reactor 订阅约定
+
+| 开放级别 | EventKind |
+|---|---|
+| **开放给用户 YAML reactor** | task_published / task_claimed / task_submitted / task_completed / task_failed / task_cancelled / task_retry / **agent_state_changed** / file_written / tool_result / progress_notify / error |
+| **仅内置 reactor 可订阅** | shell_executed / shell_timeout_pending / shell_timeout_resolved（理由：易被用户 reactor 误触造成 shell 外部副作用级联）；history_compaction / history_truncated（性能监控类，无 LLM 视角语义）；reactor_spawn_depth_exceeded（系统不变量类） |
 
 ## 使用示例
 
@@ -885,141 +1148,260 @@ AGENTGO_DUMP_PROMPTS=1 ./agentgo
 - 超出限制时按修改时间删除最旧文件
 - 正在写入的文件不会被删除
 
-# 全局配置
+# 全局配置（v4 块状 schema，2026-04-26 起唯一支持的格式）
+
 系统运行所需的全局参数，从 `setting.yaml` 或 `setting.json` 读取，文件不存在时使用内置默认值。当前仅支持 `-config <path>` 命令行参数指定文件路径，**单字段命令行覆盖未实现**。配置定义在 `internal/config/config.go`。
 
-## 配置项（与 `Config` 结构体一一对应）
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| **任务调度与并发** | | |
-| ~~max_retry~~ | 已于 2026-04-25 删除。重试上限改为角色语义化常量：`workerMaxRetries=3` / `explorerMaxRetries=3` / `schedulerMaxRetries=5`，各壳包内声明，不暴露 yaml | — |
-| default_concurrency | 单个任务的默认最大执行代理数 | 2 |
-| fifo_limit | 公告板保留已完成任务的数量上限（依赖感知淘汰） | 100 |
-| event_channel_buffer | 事件 channel 缓冲区大小 | 64 |
-| default_timeout_sec | 任务默认超时阈值（秒） | 300 |
-| worker_count | 启动的 Worker 实例数 | 1 |
-| **代理 ReAct 循环** | | |
-| agent_max_loops | 执行代理内部 ReAct 最大循环次数 | 50 |
-| agent_idle_threshold | agent 连续空轮询次数达到阈值后退出 goroutine（0 = 禁用） | 0 |
-| compact_token_threshold | Layer 2 历史压缩触发阈值（prompt tokens） | 80000 |
-| compact_keep_recent | 历史压缩时保留最近 N 条消息 | 3 |
-| max_subtask_depth | worker 通过 `publish_task` 发布的子任务允许的最大深度（scheduler 模式无此限制） | 1 |
-| **调度器** | | |
-| scheduler_ticker_sec | _（Phase 3 后已不使用，仅保留向后兼容）_ 旧 scheduler 事件循环 ticker 兜底间隔 | 10 |
-| scheduler_max_loops | scheduler agent 单次 `processTask` 内 ReAct 循环次数上限（与 `agent_max_loops` 平行） | 10 |
-| **看门狗** | | |
-| watchdog_interval_sec | 看门狗巡检间隔（秒） | 30 |
-| **LLM 后端** | | |
-| llm_base_url | OpenAI 兼容 API 端点 | （无） |
-| llm_api_key | API 密钥 | （无） |
-| llm_model | 主模型名称（用于 scheduler 和 worker） | gpt-4o |
-| llm_timeout_sec | 单次 LLM 调用超时（秒） | 60 |
-| explorer_model | 调查代理使用的轻量模型 | gpt-4o-mini |
-| explorer_event_type | 调查代理监听的事件类型 | explore |
-| **Shell 与文件** | | |
-| shell_timeout_sec | `run_shell` 命令默认超时（秒） | 30 |
-| project_root | 项目根目录（路径越界检查基准） | （无，由 main 设置） |
-| **邮箱与代理通讯** | | |
-| mailbox_buffer_size | 单个代理信箱的 channel 缓冲容量 | 32 |
-| mail_notifier_interval_sec | 邮差扫描间隔（秒） | 5 |
-| mail_notifier_enabled | 邮差是否启动（Phase 2 完成后默认启用，cascade P0 已被 hook 系统关闭） | true |
-| mail_chain_max_depth | 邮件链跳数上限（Phase 2 引入）。`MetaGroup.sendMessage` 写入 `parent.MailChainDepth+1`，超过此阈值的邮件被 `ChainDepthLimitHook` 在 BeforeSend 拒绝 | 3 |
-| **Web 检索** | | |
-| search_api_provider | 搜索 provider 名称 | duckduckgo_html |
-| search_api_url | 搜索 API URL（如 provider 需要） | （无） |
-| search_api_key | 搜索 API 密钥（如 provider 需要） | （无） |
+> **v3 顶层字段已整体删除**（2026-04-26）：`worker_count` / `agent_max_loops`（顶层） / `llm_base_url` / `llm_api_key` / `llm_model` / `llm_timeout_sec` / `worker_profile` / `explorer_profile` / `scheduler_max_loops` / `mailbox_buffer_size`（顶层） / `mail_chain_max_depth`（顶层） / `compact_token_threshold` / `compact_keep_recent` / `default_concurrency`（顶层） / `fifo_limit`（顶层） / `event_channel_buffer`（顶层） / `default_timeout_sec`（顶层） / `watchdog_interval_sec`（顶层） / `mail_notifier_*`（顶层） / `explorer_*`（除 `agents:` 中的 explorer kind） 等。**旧 setting.yaml 仍可解析**（不报错，未知字段被静默忽略），但这些字段不再产生运行时效果。用户必须改写为下述 v4 块状结构。
+
+## 顶层块（与 `Config` 结构体一一对应）
+
+```yaml
+# ==============================================================================
+# v4 块（必填或常用）
+# ==============================================================================
+
+llm:                                # 全局 LLM 默认值
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  api_key: "sk-..."
+  default_model: "qwen3.6-plus"
+  timeout_sec: 60
+  provider: ""                      # 留空 → "openai" no-op；可选 "deepseek-v4" / "deepseek-r1"
+
+scheduler:                          # Scheduler 是硬编码 kind，仅 model 可外部覆盖
+  model: "qwen3-max"
+
+agents:                             # AgentKind 列表 —— 取代 v3 的 worker_count + explorer 二分
+  - kind: worker
+    replicas: 2                     # 实例化为 worker-1 / worker-2
+    profile: "full-access"          # 或 tools: [...]（互斥）
+    model: "qwen3.6-plus"           # 可选，per-kind 覆盖 llm.default_model
+    system_prompt_file: "prompts/worker.md"
+    agent_max_loops: 50
+    task_max_retries: 3
+    enforce_compact_token_threshold: 80000
+    context_limit: 128000
+    description: "通用任务执行代理，能读写文件、跑命令、发邮件"  # 给 scheduler 看的语义提示
+  - kind: explorer
+    replicas: 1
+    event_type: "explore"           # 只领取此 event_type 的任务
+    profile: "read-only"
+    model: "qwen3.6-flash"
+    system_prompt_file: "prompts/explorer.md"
+
+infra:
+  watchdog:      { interval_sec: 30 }
+  mail_notifier: { enabled: true, interval_sec: 5 }
+  store:
+    event_channel_buffer: 64
+    fifo_limit: 100
+    default_concurrency: 2
+    default_timeout_sec: 300        # 任务默认超时
+  roster:        { wait_timeout_sec: 0 }
+
+# ==============================================================================
+# 顶层杂项字段
+# ==============================================================================
+
+project_root: "."                   # 路径越界检查基准
+max_subtask_depth: 1                # publish_task 子任务最大深度
+shell_timeout_sec: 30
+transfer_note_max_tokens: 3000      # TransferNote 单条最大 token 预算
+progress_notify_enabled: false      # 进度通知（写文件 / 发布子任务 / 任务过半）开关
+agent_idle_threshold: 0             # runner 连续空轮询退出阈值；0 = 永不退出
+hashline_enabled: null              # 行哈希锚点开关（null = 默认启用）
+
+# Web 检索
+search_api_provider: "duckduckgo_html"
+search_api_url: ""
+search_api_key: ""
+
+# Shell 命令拦截（追加到默认规则）
+shell_blacklist: []
+shell_greylist:  []
+
+# Tool Profile（命名工具集）
+tool_profiles:
+  read-only:
+    [read_file, list_dir, grep_search, glob_search, web_search, web_fetch, send_message]
+  full-access:
+    [read_file, write_file, edit_file, list_dir, grep_search, glob_search,
+     run_shell, publish_task, send_message, web_search, web_fetch]
+
+# v5 用户 Reactor 配置
+reactors_file: "reactors.yaml"      # 空值跳过加载
+
+# Session
+session_retention_days: 14
+session_archive_max:    50
+
+# 启动期 TCP probe（best-effort 连通性检查）
+startup_probe: ""                   # 空 / "off" / "auto"
+startup_probe_timeout_sec: 5
+startup_probe_failure_action: "warn" # "warn"（默认）或 "exit"
+```
+
+## AgentKind 关键字段说明
+
+| 字段 | 说明 |
+|---|---|
+| `kind` | 唯一标识，scheduler 在 board snapshot 中用以选择派发对象 |
+| `replicas` | 该 kind 的实例数；InstanceID 形如 `<kind>-<replicaIdx>`（1-based） |
+| `event_type` | 只领取此 EventType 的任务；为空时领取默认队列（worker 通常如此） |
+| `profile` / `tools` | 工具集来源，**互斥**。`profile` 引用 `tool_profiles` 中的命名集合；`tools` 直接列举工具名 |
+| `model` | per-kind 模型覆盖（空则用 `llm.default_model`） |
+| `system_prompt_file` | 必填，提示词文件路径；resolves 相对当前 cwd 或绝对路径 |
+| `agent_max_loops` | 单次 `processTask` 内 ReAct 循环次数上限 |
+| `task_max_retries` | 任务级重试上限（v3 时代的 worker/explorer/scheduler hardcoded constant 已被此字段取代） |
+| `enforce_compact_token_threshold` | Layer 2 历史压缩触发阈值（prompt tokens） |
+| `context_limit` | LLM 上下文窗口估算（用于 token 预算） |
+| `description` | 给 scheduler 看的一句话角色描述（拼入 board snapshot 的 `agent_capabilities` 段） |
+
+`internal/config/config.go` 在 v4 之外还保留一个**仅内部使用**的 `AgentRuntimeConfig` 结构，由 `bootstrap.runtime_builder.buildAgentRuntime(kind, replicaIdx)` 合成并注入 `runner.New(rt, deps)`。`AgentRuntimeConfig` 不出现在 YAML 中。
 
 ## 配置加载顺序
+
 1. 通过 `-config <path>` 命令行参数获取配置文件路径（默认 `setting.yaml`）
 2. `LoadConfig` 按文件后缀（`.yaml`/`.yml`/`.json`）选择解析器
 3. 文件不存在时：
    - 显式指定（`-config explicit`）→ 报错终止
    - 默认路径 → 打印 warning 后使用内置默认配置
-4. 解析后字段以文件值为准，未指定字段保持 `DefaultConfig()` 默认值
-5. **单字段命令行覆盖（如 `-worker_count=3`）暂未实现**
-
+4. 解析后字段以文件值为准，未指定字段保持默认值
+5. `cfg.Validate()` 强制 12 条规则（agents 非空、kind 唯一、profile/tools 互斥、system_prompt_file 必填且可读、replicas ≥ 1、event_type 不重复 explorer 队列、startup_probe_failure_action 合法值等）
+6. **单字段命令行覆盖暂未实现**
 
 ---
 
-# 关键代码引用速查
+# 关键代码引用速查（v5）
 
-以下是各核心功能的关键代码位置，供开发和调试时快速定位：
+以下是各核心功能的关键代码位置，供开发和调试时快速定位。**行号是参考点，可能随提交漂移；以包名 + 文件名 + 类型 / 函数名为准**。
 
 ## Agent 核心
 
-| 功能 | 文件 | 关键函数/结构体 |
-|------|------|----------------|
-| Agent 结构体 | `internal/agent/agent.go` | `type Agent struct` (L61) |
-| ReAct 主循环 | `internal/agent/agent.go` | `processTask()` (L148) |
-| 三层历史压缩 | `internal/agent/agent.go` | `snipOldToolResults()` (L337), `compressHistory()` |
-| LLMExecutor | `internal/agent/llm_executor.go` | `NewLLMExecutor()` (L84), `Execute()` (L112) |
-| ToolRegistry | `internal/agent/registry.go` | `type ToolRegistry struct` (L14) |
+| 功能 | 文件 | 关键类型/函数 |
+|------|------|---------------|
+| Agent 结构体 | `internal/agent/agent.go` | `type Agent struct` |
+| ReAct 主循环 | `internal/agent/agent.go` | `processTask()` |
+| Memory 注入入口（v5） | `internal/agent/memory_context.go` | `injectMemoryContext()` |
+| 三层历史压缩 | `internal/agent/agent.go` + `history.go` | `snipOldToolResults()` / `compressHistory()` |
+| LLMExecutor | `internal/agent/llm_executor.go` | `NewLLMExecutor()` / `Execute()` |
+| ToolRegistry | `internal/agent/registry.go` | `type ToolRegistry struct` / `NewToolRegistryWithAllowlist()` |
+
+## Runner（v5 取代 v4 worker / explorer）
+
+| 功能 | 文件 | 关键类型/函数 |
+|------|------|---------------|
+| Runner 外壳 | `internal/runner/runner.go` | `type Runner struct` / `New(rt, deps)` / `Run(ctx)` / `Agent()` |
+| 依赖注入聚合 | `internal/runner/runner.go` | `type RunnerDeps struct` |
+| 工具组装 | `internal/runner/dependency_map.go` | `resolveToolGroups()` |
+| CurrentTaskHolder | `internal/runner/holder.go` | `type CurrentTaskHolder struct`（实现 `tools.TaskHolder`） |
+| Runtime 合成 | `internal/bootstrap/runtime_builder.go` | `buildAgentRuntime(kind, replicaIdx)` |
 
 ## Scheduler
 
-| 功能 | 文件 | 关键函数/结构体 |
-|------|------|----------------|
-| Bundle 构造 | `internal/scheduler/scheduler.go` | `New()` (L50), `type Bundle struct` (L30) |
-| Activator | `internal/scheduler/activator.go` | `Activator.Run()` (L60) |
-| Executor | `internal/scheduler/executor.go` | `SchedulerExecutor.Execute()` (L50) |
-| Board Snapshot | `internal/scheduler/snapshot.go` | `BuildBoardJSON()` (L25) |
-| DoneChecker | `internal/scheduler/scheduler.go` | `currentSchedulerTaskHolder` (L200) |
-| 探针工具 | `internal/tools/scheduler_probe.go` | `probeDirectory()` (L19) |
+| 功能 | 文件 | 关键类型/函数 |
+|------|------|---------------|
+| Bundle 构造 | `internal/scheduler/scheduler.go` | `New()` / `type Bundle struct{ Agent, Activator, Mode }` |
+| Activator（事件桥） | `internal/scheduler/activator.go` | `Activator.Run()` —— 消费 `eventCh`，`EventUserInput` → `PublishTask`，task 终态事件 → `BatchUpdateCh` |
+| Executor | `internal/scheduler/executor.go` | `SchedulerExecutor.Execute()` / `waitForBatchTerminal()` |
+| Board Snapshot | `internal/scheduler/snapshot.go` | `BuildBoardJSON()` |
+| Mode 切换 | `internal/scheduler/scheduler.go` | `type ModeStore struct` / `Bundle.Mode` |
+| 探针工具 | `internal/tools/scheduler_probe.go` | `probeDirectory()` |
 
-## Tools（业务功能工具组）
+## Tools
 
-| 工具组 | 文件 | 关键函数/结构体 | 说明 |
-|--------|------|----------------|------|
-| ToolGroup 接口 | `internal/tools/group.go` | `type ToolGroup interface` (L24) | 工具组通用接口，定义 `Register()` 方法 |
-| LocalReadGroup | `internal/tools/local_read.go` | `type LocalReadGroup struct` (L25) | 只读文件工具：read_file / list_dir / grep_search / glob_search |
-| LocalWriteGroup | `internal/tools/local_write.go` | `type LocalWriteGroup struct` (L32) | 写入文件工具：write_file / edit_file（嵌入 LocalReadGroup） |
-| MetaGroup | `internal/tools/meta.go` | `type MetaGroup struct` (L49) | 元工具：publish_task / send_message（Worker/Explorer/Scheduler 共享） |
-| SchedulerGroup | `internal/tools/scheduler.go` | `type SchedulerGroup struct` (L29) | Scheduler 专属：cancel_task / report_done / probe_directory |
+| 工具组 | 文件 | 关键类型 | 说明 |
+|--------|------|----------|------|
+| ToolGroup 接口 | `internal/tools/group.go` | `type ToolGroup interface` | 工具组通用接口，定义 `Register()` 方法 |
+| 名称表 | `internal/tools/known_tools.go` | `AllToolNames` | 唯一规范工具名集合 |
+| LocalReadGroup | `internal/tools/local_read.go` | `type LocalReadGroup struct` | 只读文件工具：read_file / list_dir / grep_search / glob_search |
+| LocalWriteGroup | `internal/tools/local_write.go` | `type LocalWriteGroup struct` | 写入文件工具：write_file / edit_file |
+| WebGroup | `internal/tools/web.go` | `type WebGroup struct` | web_search / web_fetch |
+| ShellGroup | `internal/tools/shell.go` | `type ShellGroup struct` | run_shell（含审批门集成） |
+| MetaGroup | `internal/tools/meta.go` | `type MetaGroup struct` | publish_task / send_message（含 `BatchTracker` 接口供 scheduler 注入） |
+| SchedulerGroup | `internal/tools/scheduler.go` | `type SchedulerGroup struct` | Scheduler 专属：cancel_task / report_done / probe_directory |
 
-## Hooks（工具调用拦截机制）
+## Gate（v5 统一拦截）
 
-| 钩子/接口 | 文件 | 关键函数/结构体 | 说明 |
-|-----------|------|----------------|------|
-| ToolHook 接口 | `internal/hook/tool.go` | `type ToolHook interface` (L59) | 钩子接口，定义 PreCall/PostCall 拦截能力 |
-| ToolHookRegistry | `internal/hook/registry.go` | `type ToolHookRegistry struct` (L20) | 钩子注册与分发器，按 Priority 升序执行 |
-| PathBoundaryHook | `internal/hook/builtin/path_boundary.go` | `Run()` (L67) | 路径边界校验（PreCall, Prio=10），阻止越界访问 |
-| ValidateExpectedHashHook | `internal/hook/builtin/validate_expected_hash.go` | `Run()` | 乐观并发 hash 校验（PreCall, Prio=20） |
-| ValidateLineAnchorsHook | `internal/hook/builtin/validate_line_anchors.go` | `Run()` | §7 行级哈希锚点校验（PreCall, Prio=25）；失配时返回 ±2 上下文 + 当前哈希 |
-| RequireReadBeforeWriteHook | `internal/hook/builtin/require_read_before_write.go` | `Run()` (L57) | 强制"先读后写"约束（PreCall, Prio=30） |
-| RecordArtifactHook | `internal/hook/builtin/record_artifact.go` | `Run()` | 记录文件产物（PostCall, Prio=950） |
+| 功能 | 文件 | 关键类型/函数 |
+|------|------|---------------|
+| Phase / Gate 接口 | `internal/gate/gate.go` | `type Gate interface` / `type Phase string` |
+| Registry | `internal/gate/registry.go` | `type Registry struct` / `Dispatch(ctx Context)` |
+| ToolContext | `internal/gate/tool_context.go` | `type ToolContext struct` |
+| MailboxContext | `internal/gate/mailbox_context.go` | `type MailboxContext struct` |
+| Mailbox 适配器 | `internal/gate/adapter.go` | `AsMailboxRunner(*Registry) mailbox.MailboxHookRunner` |
+| 内置 Gate | `internal/hook/builtin/*.go` | path-boundary / validate-expected-hash / require-read-before-write / dependency-validator / enforce-expected-artifacts / validate-line-anchors / chain-depth-limit / per-agent-dedup / wake-worthy-filter / wake-context-expand |
+
+## Reactor（v5 状态响应）
+
+| 功能 | 文件 | 关键类型/函数 |
+|------|------|---------------|
+| Reactor 接口 | `internal/reactor/reactor.go` | `type Reactor interface` |
+| Registry | `internal/reactor/registry.go` | `type Registry struct` / `Dispatch(ev trace.Event)` |
+| record-artifact | `internal/reactor/builtin/record_artifact.go` | 订阅 `KindFileWritten` |
+| task-end-callback | `internal/reactor/builtin/task_end_callback.go` | 订阅 `KindTask{Completed,Failed,Cancelled,Retry}` |
+| trace-history-event | `internal/reactor/builtin/trace_history_event.go` | 订阅 `KindHistory{Compaction,Truncated}` |
+| read-set-write | `internal/reactor/builtin/read_set_write.go` | 订阅 `KindToolResult`（filter `tool=read_file`） |
+| 用户 YAML 加载 | `internal/reactor/userdef/loader.go` | `LoadFromFile(path, projectRoot, deps)` |
+| 用户 reactor 实现 | `internal/reactor/userdef/{publish_task,invoke_llm,spawn_agent,call_send_message}.go` | 4 类动作动词 |
+
+## Memory（v5）
+
+| 功能 | 文件 | 关键类型/函数 |
+|------|------|---------------|
+| Store 接口 | `internal/memory/memory.go` | `type Store interface` / `type Entry struct` / `Scope` / `Kind` |
+| ProcessStore | `internal/memory/process_store.go` | `NewProcessStore()` / 单 RWMutex / 双索引 |
+
+## Spawn（v5 ad-hoc agent）
+
+| 功能 | 文件 | 关键类型/函数 |
+|------|------|---------------|
+| Manager（兼 reactor） | `internal/spawn/manager.go` | `type Manager struct` / `NewManager()` / `Spawn(ctx, req)` / `Run(ctx, ev)` / `KindOf(agentID)` / `Shutdown()` |
+| 请求结构 | `internal/spawn/types.go` | `type SpawnRequest struct` / `type RuntimeOverride struct` |
+| 运行时合成 | `internal/spawn/runtime.go` | base_kind 模板 + override 合成 `AgentRuntimeConfig` |
 
 ## Mailbox
 
-| 功能 | 文件 | 关键函数/结构体 |
-|------|------|----------------|
-| Message 结构 | `internal/mailbox/mailbox.go` | `type Message struct` (L15) |
-| Mailbox | `internal/mailbox/mailbox.go` | `type Mailbox struct` (L40) |
-| Registry | `internal/mailbox/mailbox.go` | `type Registry struct` (L260) |
-| MailNotifier | `internal/mailbox/notifier.go` | `type MailNotifier struct` (L20) |
-| MailboxHook | `internal/hook/mailbox.go` | `type MailboxHook interface` (L25) |
-| ChainDepthLimitHook | `internal/hook/builtin/chain_depth_limit.go` | `Run()` (L35) |
+| 功能 | 文件 | 关键类型/函数 |
+|------|------|---------------|
+| Message 结构 | `internal/mailbox/mailbox.go` | `type Message struct` |
+| Mailbox / Registry | `internal/mailbox/mailbox.go` | `type Mailbox struct` / `type Registry struct` |
+| MailNotifier | `internal/mailbox/notifier.go` | `type MailNotifier struct` / `Run(ctx)` |
+| MailboxHookRunner（最小接口） | `internal/mailbox/hookrunner.go` | `type MailboxHookRunner interface` |
+| MailboxHookView | `internal/mailbox/hookview.go` | `HasPendingMail / GetRecentMessages` |
 
 ## Store & Model
 
-| 功能 | 文件 | 关键函数/结构体 |
-|------|------|----------------|
-| Task 结构体 | `internal/model/task.go` | `type Task struct` (L40) |
-| TaskStore 接口 | `internal/store/iface.go` | `type TaskStore interface` (L15) |
-| MemoryTaskStore | `internal/store/memory.go` | `type MemoryTaskStore struct` (L15) |
-| StoreHookView | `internal/store/hookview.go` | `type StoreHookView interface` (L12) |
+| 功能 | 文件 | 关键类型/函数 |
+|------|------|---------------|
+| Task 结构体 | `internal/model/task.go` | `type Task struct` |
+| Event 结构体 | `internal/model/event.go` | `type Event struct` / `EventType` 常量 |
+| TaskStore 接口 | `internal/store/iface.go` | `type TaskStore interface` |
+| MemoryTaskStore | `internal/store/memory.go` | `type MemoryTaskStore struct` / 依赖感知 FIFO 淘汰 |
+| TaskCancelRegistry | `internal/store/cancel.go` | `type TaskCancelRegistry struct` |
+| StoreHookView | `internal/store/hookview.go` | 只读视图（reactor / hook 可见） |
+| ArtifactLog | `internal/store/artifact_log.go` | 持久化 + replay |
+| ReadSet upsert | `internal/store/memory.go` | `UpsertReadSet(taskID, files)` |
 
-## Bootstrap & CLI
+## Bootstrap & TUI
 
-| 功能 | 文件 | 关键函数/结构体 |
-|------|------|----------------|
-| Bootstrap | `internal/bootstrap/bootstrap.go` | `Bootstrap()` (L40), `System` struct (L25) |
-| Start | `internal/bootstrap/bootstrap.go` | `System.Start()` (L200) |
-| CLI | `internal/cli/cli.go` | `CLI.Run()` (L50) |
-| Config | `internal/config/config.go` | `type Config struct` (L10), `LoadConfig()` (L80) |
+| 功能 | 文件 | 关键类型/函数 |
+|------|------|---------------|
+| Bootstrap 主入口 | `internal/bootstrap/bootstrap.go` | `Bootstrap(configPath, explicit, skipStartupProbe)` / `type System struct` |
+| Start | `internal/bootstrap/bootstrap.go` | `System.Start(ctx, cancel)` |
+| Shutdown | `internal/bootstrap/bootstrap.go` | `System.Shutdown()` |
+| 启动 banner / probe | `internal/bootstrap/banner.go` / `probe.go` | `printStartupBanner` / `startupProbe` |
+| Config | `internal/config/config.go` | `type Config struct` / `LoadConfig()` / `Validate()` |
+| TUI 入口 | `internal/tui/tui.go` | `Run(ctx, deps)` / `type Model struct` / `type Deps struct` |
+| TUI 命令分发 | `internal/tui/commands.go` | `/quit /help /status /cancel /steer /mode /new /session` |
+| TUI 审批面板 | `internal/tui/approval.go` | `1/2/3/4/Ctrl+C` 键位 |
 
 ## Trace
 
-| 功能 | 文件 | 关键函数/结构体 |
-|------|------|----------------|
-| Writer | `internal/trace/writer.go` | `type Writer struct` (L27), `Emit()` (L58) |
-| Event 结构 | `internal/trace/event.go` | `type Event struct` (L15) |
+| 功能 | 文件 | 关键类型/函数 |
+|------|------|---------------|
+| Writer | `internal/trace/writer.go` | `type Writer struct` / `Emit(ev Event)` |
+| Event 结构（Schema B） | `internal/trace/event.go` | `type Event struct` / `Transition` / `ShellExec` / `ShellTimeout` 子结构 / `Kind*` 常量 |
+| Dispatcher | `internal/trace/writer.go` | `SetDefaultDispatcher(reactorReg)` / `DefaultDispatcher()` |
+| CLI viewer | `internal/trace/cli.go` | `CLI(args, traceDir, stdout)` —— 启发式异常检测 |
+| Prompt Dumper | `internal/trace/prompt_dumper.go` | `AGENTGO_DUMP_PROMPTS=1` 启用
