@@ -3,6 +3,8 @@ package tui
 import (
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 func TestNewAgentDetail(t *testing.T) {
@@ -159,5 +161,25 @@ func TestRenderAgentDetail_LastErrorFallback(t *testing.T) {
 
 	if !strings.Contains(result, "error: exit status 1") {
 		t.Error("detail should show last error when output is empty")
+	}
+}
+
+func TestRenderAgentDetail_WideOutputWraps(t *testing.T) {
+	theme := DefaultTheme()
+	info := &AgentInfo{
+		ID:              "worker-1",
+		Type:            "worker",
+		State:           "processing",
+		CurrentTaskDesc: strings.Repeat("修复🙂", 20),
+	}
+	result := renderAgentDetail(theme, 42, 16, "worker-1", info, strings.Repeat("输出🙂", 20))
+
+	if !strings.Contains(result, "…") {
+		t.Error("wide task desc should be truncated")
+	}
+	for i, line := range strings.Split(result, "\n") {
+		if got := lipgloss.Width(line); got > 42 {
+			t.Fatalf("line %d visual width = %d, want <= 42: %q", i, got, line)
+		}
 	}
 }

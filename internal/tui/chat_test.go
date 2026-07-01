@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 func TestRenderChat_Empty(t *testing.T) {
@@ -111,6 +113,23 @@ func TestRenderChat_LineTruncation(t *testing.T) {
 
 	if !strings.Contains(result, "…") {
 		t.Error("long lines should be truncated")
+	}
+}
+
+func TestRenderChat_WideLineTruncation(t *testing.T) {
+	theme := DefaultTheme()
+	msgs := []StyledMsg{
+		{Text: strings.Repeat("处理🙂", 20), Kind: MsgInfo, At: time.Now(), AgentID: "worker-1"},
+	}
+	result := renderChat(theme, 40, 8, msgs, nil)
+
+	if !strings.Contains(result, "…") {
+		t.Error("wide lines should be truncated")
+	}
+	for i, line := range strings.Split(result, "\n") {
+		if got := lipgloss.Width(line); got > 40 {
+			t.Fatalf("line %d visual width = %d, want <= 40: %q", i, got, line)
+		}
 	}
 }
 

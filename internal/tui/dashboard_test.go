@@ -3,6 +3,8 @@ package tui
 import (
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 func TestFormatTokens(t *testing.T) {
@@ -147,6 +149,29 @@ func TestRenderAgentCard_TaskDescTruncation(t *testing.T) {
 	}
 }
 
+func TestRenderAgentCard_WideTaskDescTruncation(t *testing.T) {
+	theme := DefaultTheme()
+	ag := AgentInfo{
+		ID:              "w-1",
+		Type:            "worker",
+		State:           "processing",
+		CurrentTaskDesc: strings.Repeat("修复🙂", 20),
+		CallCount:       1,
+		PromptTokens:    1,
+	}
+	card := renderAgentCard(theme, ag, 36)
+
+	if !strings.Contains(card, "…") {
+		t.Error("wide task desc should be truncated with …")
+	}
+	maxWidth := lipgloss.Width(strings.Split(card, "\n")[0])
+	for i, line := range strings.Split(card, "\n") {
+		if got := lipgloss.Width(line); got > maxWidth {
+			t.Fatalf("line %d visual width = %d, want <= %d: %q", i, got, maxWidth, line)
+		}
+	}
+}
+
 func TestRenderAgentCard_ActivityTool(t *testing.T) {
 	theme := DefaultTheme()
 	ag := AgentInfo{
@@ -189,5 +214,15 @@ func TestRenderAgentCard_ActivityModelText(t *testing.T) {
 
 	if !strings.Contains(card, "Comparing the current implementation") {
 		t.Error("card should show recent model text when no tool is active")
+	}
+}
+
+func TestTruncateRunes_UsesCellWidth(t *testing.T) {
+	result := truncateRunes("处理🙂任务", 6)
+	if got := lipgloss.Width(result); got > 6 {
+		t.Fatalf("visual width = %d, want <= 6", got)
+	}
+	if !strings.Contains(result, "…") {
+		t.Error("wide text should be truncated")
 	}
 }

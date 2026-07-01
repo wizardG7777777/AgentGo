@@ -249,12 +249,12 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			pageStep = 1
 		}
 		switch key {
-		case "up", "k":
+		case "up":
 			if m.resultScroll > 0 {
 				m.resultScroll--
 			}
 			return m, nil
-		case "down", "j":
+		case "down":
 			m.resultScroll++
 			m.clampResultScroll()
 			return m, nil
@@ -306,10 +306,10 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Sidebar navigation
 	if m.focus == FocusSidebar {
 		switch key {
-		case "up", "k":
+		case "up":
 			m.moveSelectedAgent(-1)
 			return m, nil
-		case "down", "j":
+		case "down":
 			m.moveSelectedAgent(1)
 			return m, nil
 		case "enter":
@@ -323,10 +323,10 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Main panel navigation
 	if m.focus == FocusMain && (m.view == ViewDashboard || m.view == ViewAgentDetail) {
 		switch key {
-		case "up", "k":
+		case "up":
 			m.moveSelectedAgent(-1)
 			return m, nil
-		case "down", "j":
+		case "down":
 			m.moveSelectedAgent(1)
 			return m, nil
 		case "enter":
@@ -446,7 +446,7 @@ func (m *AppModel) advanceApproval() {
 
 func (m *AppModel) appendMsg(text string, kind MsgKind) {
 	if kind == MsgResult {
-		formatted := formatMarkdown(m.theme, text)
+		formatted := formatMarkdown(m.theme, text, m.width-4)
 		m.lastResult = &StyledMsg{Text: formatted, Kind: kind, At: time.Now()}
 		m.resultScroll = 0
 		return
@@ -478,8 +478,8 @@ func (m *AppModel) clampResultScroll() {
 
 func (m *AppModel) sendUserText(text string) {
 	truncated := text
-	if len(truncated) > 60 {
-		truncated = truncated[:59] + "…"
+	if cellWidth(truncated) > 60 {
+		truncated = truncateCells(truncated, 60)
 	}
 	m.appendMsg(fmt.Sprintf("[你] %s", truncated), MsgInfo)
 

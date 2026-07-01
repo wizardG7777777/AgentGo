@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -430,14 +431,14 @@ func TestAppModel_HandleKey_MainAgentNavigation(t *testing.T) {
 
 	result, _ = updated.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
 	updated = result.(AppModel)
-	if updated.selectedAgent != 2 {
-		t.Errorf("main j: selectedAgent = %d, want 2", updated.selectedAgent)
+	if updated.selectedAgent != 1 {
+		t.Errorf("main j should not navigate: selectedAgent = %d, want 1", updated.selectedAgent)
 	}
 
 	result, _ = updated.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
 	updated = result.(AppModel)
 	if updated.selectedAgent != 1 {
-		t.Errorf("main k: selectedAgent = %d, want 1", updated.selectedAgent)
+		t.Errorf("main k should not navigate: selectedAgent = %d, want 1", updated.selectedAgent)
 	}
 
 	result, _ = updated.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
@@ -596,6 +597,45 @@ func TestAppModel_SendUserText_Truncation(t *testing.T) {
 	}
 }
 
+func TestAppModel_SendUserText_WideTruncation(t *testing.T) {
+	m := newAppModel(testDeps())
+	m.sendUserText(strings.Repeat("输入🙂", 40))
+
+	if len(m.messages) != 1 {
+		t.Fatal("expected 1 message")
+	}
+	if !strings.Contains(m.messages[0].Text, "…") {
+		t.Error("wide user text should be truncated in display")
+	}
+	if !utf8.ValidString(m.messages[0].Text) {
+		t.Fatalf("display message should remain valid UTF-8: %q", m.messages[0].Text)
+	}
+}
+
+func TestAppModel_ShowStatus_WideTaskDescription(t *testing.T) {
+	m := newAppModel(testDeps())
+	task := &model.Task{
+		Description: strings.Repeat("验证🙂", 30),
+		Status:      model.TaskStatusPending,
+		Agents:      []string{"worker-1"},
+	}
+	if err := m.deps.Store.PublishTask(task); err != nil {
+		t.Fatalf("PublishTask: %v", err)
+	}
+
+	m.showStatus()
+
+	if len(m.messages) != 1 {
+		t.Fatalf("messages count = %d, want 1", len(m.messages))
+	}
+	if !strings.Contains(m.messages[0].Text, "…") {
+		t.Error("status output should truncate wide task descriptions")
+	}
+	if !utf8.ValidString(m.messages[0].Text) {
+		t.Fatalf("status output should remain valid UTF-8: %q", m.messages[0].Text)
+	}
+}
+
 func TestAppModel_HandleCommand_ViewSwitch(t *testing.T) {
 	m := newAppModel(testDeps())
 
@@ -662,6 +702,27 @@ func TestAppModel_ResultViewScrollKeys(t *testing.T) {
 	m = updated.(AppModel)
 	if m.resultScroll != 0 {
 		t.Fatalf("home should reset resultScroll, got %d", m.resultScroll)
+	}
+}
+
+func TestAppModel_ResultViewInputAcceptsJK(t *testing.T) {
+	m := newAppModel(testDeps())
+	m.layout.MainH = 7
+	m.focus = FocusInput
+	m.input.Focus()
+	m.appendMsg(strings.Join([]string{"line 1", "line 2", "line 3", "line 4", "line 5"}, "\n"), MsgResult)
+	m.handleCommand("/detail")
+
+	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	m = updated.(AppModel)
+	updated, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	m = updated.(AppModel)
+
+	if got := m.input.Value(); got != "jk" {
+		t.Fatalf("j/k should be inserted into focused input, got %q", got)
+	}
+	if m.resultScroll != 0 {
+		t.Fatalf("j/k should not scroll result while input is focused, got %d", m.resultScroll)
 	}
 }
 

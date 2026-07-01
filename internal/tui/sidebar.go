@@ -33,8 +33,8 @@ func renderSidebar(t Theme, l Layout, agents []AgentInfo, tasks []*model.Task, s
 		if ag.CurrentTaskDesc != "" {
 			desc := ag.CurrentTaskDesc
 			maxDescW := innerW - 4
-			if maxDescW > 0 && len(desc) > maxDescW {
-				desc = desc[:maxDescW-1] + "…"
+			if maxDescW > 0 && cellWidth(desc) > maxDescW {
+				desc = truncateCells(desc, maxDescW)
 			}
 			lines = append(lines, t.SidebarDim.Render("  "+desc))
 		}
@@ -95,8 +95,8 @@ func renderSidebar(t Theme, l Layout, agents []AgentInfo, tasks []*model.Task, s
 			icon, style := taskStatusStyle(t, task.Status)
 			desc := task.Description
 			maxW := innerW - 6
-			if maxW > 0 && len(desc) > maxW {
-				desc = desc[:maxW-1] + "…"
+			if maxW > 0 && cellWidth(desc) > maxW {
+				desc = truncateCells(desc, maxW)
 			}
 			lines = append(lines, fmt.Sprintf("  %s %s",
 				style.Render(icon),
@@ -146,8 +146,8 @@ func renderAgentLine(t Theme, ag AgentInfo, maxW int) string {
 	}
 
 	name := ag.ID
-	if len(name) > maxW-4 {
-		name = name[:maxW-5] + "…"
+	if cellWidth(name) > maxW-4 {
+		name = truncateCells(name, maxW-4)
 	}
 
 	return fmt.Sprintf("%s %s %s",
@@ -174,13 +174,10 @@ func taskStatusStyle(t Theme, status model.TaskStatus) (string, lipgloss.Style) 
 }
 
 func truncOrPad(s string, w int) string {
-	vis := lipgloss.Width(s)
+	vis := cellWidth(s)
 	if vis > w {
-		// crude truncation
-		runes := []rune(s)
-		if len(runes) > w-1 {
-			return string(runes[:w-1]) + "…"
-		}
+		s = truncateCells(s, w)
+		vis = cellWidth(s)
 	}
 	if vis < w {
 		return s + strings.Repeat(" ", w-vis)
