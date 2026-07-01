@@ -148,6 +148,7 @@ session_archive_max: 50           # 归档上限，超过删除最旧
 # 指向一个 YAML 文件 → 由 internal/reactor/userdef.LoadFromFile 解析。
 # Reactor YAML 的撰写规范见 docs/yaml-config-guide.md §3，
 # 现成参考实现见 test_invest_reactors.yaml。
+# 程序变更完成后自动派 verifier 的配置见 reactors.program-verify.yaml。
 # ============================================================
 # reactors_file: reactors.yaml
 
