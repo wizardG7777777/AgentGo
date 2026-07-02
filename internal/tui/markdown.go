@@ -2,11 +2,13 @@ package tui
 
 import (
 	"strings"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 // formatMarkdown renders Markdown text with ANSI styles using the theme.
 // Line-by-line scanning approach (same strategy as before, but cleaner).
-func formatMarkdown(t Theme, text string) string {
+func formatMarkdown(t Theme, text string, maxWidth int) string {
 	var b strings.Builder
 	inCodeBlock := false
 
@@ -98,6 +100,11 @@ func formatMarkdown(t Theme, text string) string {
 		if len(trimmed) > 2 && trimmed[0] >= '0' && trimmed[0] <= '9' && (trimmed[1] == '.' || (trimmed[1] >= '0' && trimmed[1] <= '9' && len(trimmed) > 3 && trimmed[2] == '.')) {
 			b.WriteString(t.MdList.Render("  ") + processed + "\n")
 			continue
+		}
+
+		// Word wrap for normal paragraph lines
+		if maxWidth > 0 {
+			processed = lipgloss.NewStyle().Width(maxWidth).Render(processed)
 		}
 
 		b.WriteString(processed + "\n")

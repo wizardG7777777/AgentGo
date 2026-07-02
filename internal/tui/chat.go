@@ -62,8 +62,9 @@ func renderChat(t Theme, w, h int, messages []StyledMsg, lastResult *StyledMsg) 
 			if ln == "" {
 				continue
 			}
-			if w > 10 && len(ln) > w-12 {
-				ln = ln[:w-13] + "…"
+			available := w - cellWidth(prefix)
+			if available > 0 && cellWidth(ln) > available {
+				ln = truncateCells(ln, available)
 			}
 			lines = append(lines, prefix+style.Render(ln))
 		}
@@ -143,7 +144,7 @@ func renderResultDetail(t Theme, w, h int, msg *StyledMsg, offset int) string {
 		visible = append(visible, "")
 	}
 
-	footer := t.SidebarDim.Render(fmt.Sprintf("lines %d-%d/%d  ↑/↓ j/k PgUp/PgDn scroll  Esc back",
+	footer := t.SidebarDim.Render(fmt.Sprintf("lines %d-%d/%d  ↑/↓ PgUp/PgDn scroll  Esc back",
 		offset+1, end, len(bodyLines)))
 
 	return title + "\n" + divider + "\n" + header + "\n" + strings.Join(visible, "\n") + "\n" + footer

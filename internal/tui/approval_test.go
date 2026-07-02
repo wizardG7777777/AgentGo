@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"agentgo/internal/shell"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 func TestRenderApprovalBar_Basic(t *testing.T) {
@@ -67,6 +69,21 @@ func TestRenderApprovalBar_LongCommand(t *testing.T) {
 
 	if !strings.Contains(result, "…") {
 		t.Error("long command should be truncated")
+	}
+}
+
+func TestRenderApprovalBar_WideCommand(t *testing.T) {
+	theme := DefaultTheme()
+	req := shell.ApprovalRequest{AgentID: "w-1", Command: strings.Repeat("执行🙂", 30)}
+	result := renderApprovalBar(theme, 50, req, 0)
+
+	if !strings.Contains(result, "…") {
+		t.Error("wide command should be truncated")
+	}
+	for i, line := range strings.Split(result, "\n") {
+		if got := lipgloss.Width(line); got > 50 {
+			t.Fatalf("line %d visual width = %d, want <= 50: %q", i, got, line)
+		}
 	}
 }
 

@@ -22,8 +22,8 @@ func renderApprovalBar(t Theme, w int, req shell.ApprovalRequest, queueLen int) 
 	agent := t.SidebarDim.Render(fmt.Sprintf("Agent: %s", req.AgentID))
 
 	cmd := req.Command
-	if len(cmd) > innerW-4 {
-		cmd = cmd[:innerW-5] + "…"
+	if cellWidth(cmd) > innerW-4 {
+		cmd = truncateCells(cmd, innerW-4)
 	}
 	cmdLine := t.ApprovalCmd.Render(fmt.Sprintf("$ %s", cmd))
 

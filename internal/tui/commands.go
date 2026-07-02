@@ -126,8 +126,8 @@ func (m *AppModel) showStatus() {
 			continue
 		}
 		desc := t.Description
-		if len(desc) > 60 {
-			desc = desc[:59] + "…"
+		if cellWidth(desc) > 60 {
+			desc = truncateCells(desc, 60)
 		}
 		lines = append(lines, fmt.Sprintf("  %s [%s] %s — %s",
 			string(t.Status), t.ID[:8], desc, strings.Join(t.Agents, ",")))
@@ -220,8 +220,8 @@ func (m *AppModel) listSessions() {
 	lines = append(lines, "── Sessions ──")
 	for i, s := range sessions {
 		first := s.FirstUserInput
-		if len(first) > 50 {
-			first = first[:49] + "…"
+		if cellWidth(first) > 50 {
+			first = truncateCells(first, 50)
 		}
 		lines = append(lines, fmt.Sprintf("  %d. %s [%s] %s",
 			i+1, s.SessionID, s.CreatedAt, first))
@@ -282,7 +282,7 @@ const helpText = `── AgentGo Commands ──
 ── Hotkeys ──
   Tab                切换焦点 (Input → Sidebar → Main)
   ↑/↓                侧边栏代理选择
-  j/k PgUp/PgDn      在完整结果视图中滚动
+  ↑/↓ PgUp/PgDn      在完整结果视图中滚动
   Enter              选中代理 / 提交输入
   Esc                返回仪表板
   Ctrl+C             退出`

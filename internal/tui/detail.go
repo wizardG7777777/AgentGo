@@ -76,8 +76,8 @@ func renderAgentDetail(t Theme, w, h int, agentID string, info *AgentInfo, outpu
 
 		if info.CurrentTaskDesc != "" {
 			desc := info.CurrentTaskDesc
-			if len(desc) > w-20 {
-				desc = desc[:w-21] + "…"
+			if cellWidth(desc) > w-20 {
+				desc = truncateCells(desc, w-20)
 			}
 			infoParts = append(infoParts, "task: "+desc)
 		}
@@ -100,6 +100,9 @@ func renderAgentDetail(t Theme, w, h int, agentID string, info *AgentInfo, outpu
 		}
 	}
 	infoLine := t.SidebarDim.Render("  " + strings.Join(infoParts, " │ "))
+	if cellWidth(infoLine) > w {
+		infoLine = truncateCells(infoLine, w)
+	}
 	infoH := 1
 
 	divider := t.MdDivider.Render(strings.Repeat("─", w))
@@ -129,6 +132,21 @@ func renderAgentDetail(t Theme, w, h int, agentID string, info *AgentInfo, outpu
 			lines = lines[len(lines)-contentH:]
 		}
 		contentStr = strings.Join(lines, "\n")
+	}
+
+	// Pre-wrap long lines to fit within viewport width
+	if w > 2 {
+		lines := strings.Split(contentStr, "\n")
+		var wrappedLines []string
+		for _, line := range lines {
+			if cellWidth(line) > w-2 {
+				wrapped := lipgloss.NewStyle().Width(w - 2).Render(line)
+				wrappedLines = append(wrappedLines, strings.Split(wrapped, "\n")...)
+			} else {
+				wrappedLines = append(wrappedLines, line)
+			}
+		}
+		contentStr = strings.Join(wrappedLines, "\n")
 	}
 
 	return title + "\n" + infoLine + "\n" + divider + "\n" + contentStr

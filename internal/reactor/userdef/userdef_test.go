@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -248,6 +249,76 @@ reactors:
 	if tasks[0].EventType != "explore" {
 		t.Fatalf("EventType=%q, want explore", tasks[0].EventType)
 	}
+}
+
+func TestProgramVerifyReactors_LoadAndPublishVerifierTask(t *testing.T) {
+	repoRoot := testRepoRoot(t)
+	store := &fakeStore{}
+	rs, err := LoadFromFile(filepath.Join(repoRoot, "reactors.program-verify.yaml"), repoRoot, Deps{
+		Store: store,
+		KindEventTypes: map[string]string{
+			"worker":   "",
+			"verifier": "verify",
+		},
+		AgentKindOf: func(agentID string) string {
+			if agentID == "worker-1" {
+				return "worker"
+			}
+			if agentID == "verifier-1" {
+				return "verifier"
+			}
+			return ""
+		},
+	})
+	if err != nil {
+		t.Fatalf("LoadFromFile: %v", err)
+	}
+	if len(rs) != 1 {
+		t.Fatalf("len=%d want 1", len(rs))
+	}
+
+	if err := rs[0].Run(trace.Event{
+		Kind:    trace.KindTaskCompleted,
+		TaskID:  "worker-task-1",
+		AgentID: "worker-1",
+		Depth:   1,
+	}); err != nil {
+		t.Fatalf("Run worker event: %v", err)
+	}
+	tasks := store.snapshot()
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 verifier task, got %d", len(tasks))
+	}
+	if tasks[0].EventType != "verify" {
+		t.Fatalf("EventType=%q want verify", tasks[0].EventType)
+	}
+	if got := tasks[0].Dependencies; len(got) != 1 || got[0] != "worker-task-1" {
+		t.Fatalf("Dependencies=%v want [worker-task-1]", got)
+	}
+	if !strings.Contains(tasks[0].Description, "worker-task-1") {
+		t.Fatalf("description should mention upstream task, got %q", tasks[0].Description)
+	}
+
+	if err := rs[0].Run(trace.Event{
+		Kind:    trace.KindTaskCompleted,
+		TaskID:  "verifier-task-1",
+		AgentID: "verifier-1",
+		Depth:   1,
+	}); err != nil {
+		t.Fatalf("Run verifier event: %v", err)
+	}
+	if got := len(store.snapshot()); got != 1 {
+		t.Fatalf("verifier completion should not recursively publish, got %d tasks", got)
+	}
+}
+
+func testRepoRoot(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", ".."))
 }
 
 func TestLoadWithKindEventTypes_RejectsUnknownKind(t *testing.T) {

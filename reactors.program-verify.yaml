@@ -1,0 +1,22 @@
+# Program-change verification reactors for config.program-upgrade-small.yaml.
+#
+# These reactors replace the old "AgentHook after worker finish" idea with the
+# current v5 trace.Event + Reactor path. They publish real verifier tasks instead
+# of sending mailbox notifications, so the work is routed through event_type=verify
+# and visible in trace/task history.
+
+reactors:
+  - name: verify_worker_task_completion
+    on: task_completed
+    kind: worker
+    when: "${event.task.depth} < 4"
+    publish_task:
+      kind: verifier
+      dependencies:
+        - "${event.task.id}"
+      description:
+        file: prompts/verify_program_worker.md
+        args:
+          worker_task_id: "${event.task.id}"
+          worker_agent: "${event.agent.id}"
+          source_event: "${event.kind}"

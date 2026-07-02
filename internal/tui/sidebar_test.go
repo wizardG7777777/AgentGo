@@ -31,9 +31,21 @@ func TestTruncOrPad_Longer(t *testing.T) {
 	if !strings.HasSuffix(result, "…") {
 		t.Error("truncated string should end with …")
 	}
-	// rune count should be ≤ width
-	if len([]rune(result)) > 5 {
-		t.Errorf("rune count = %d, should be ≤ 5", len([]rune(result)))
+	if got := lipgloss.Width(result); got > 5 {
+		t.Errorf("visual width = %d, should be ≤ 5", got)
+	}
+}
+
+func TestTruncOrPad_WideAndStyledText(t *testing.T) {
+	theme := DefaultTheme()
+	styled := theme.StateProcessing.Render("处理🙂🙂任务")
+	result := truncOrPad(styled, 8)
+
+	if got := lipgloss.Width(result); got != 8 {
+		t.Errorf("visual width = %d, want 8", got)
+	}
+	if !strings.Contains(result, "…") {
+		t.Error("wide styled text should be truncated with …")
 	}
 }
 
@@ -68,6 +80,19 @@ func TestRenderAgentLine_LongNameTruncation(t *testing.T) {
 	line := renderAgentLine(theme, ag, 15)
 	if !strings.Contains(line, "…") {
 		t.Error("long agent name should be truncated")
+	}
+}
+
+func TestRenderAgentLine_WideNameTruncation(t *testing.T) {
+	theme := DefaultTheme()
+	ag := AgentInfo{ID: "处理任务🙂🙂🙂", State: "processing"}
+	line := renderAgentLine(theme, ag, 16)
+
+	if got := lipgloss.Width(line); got > 16+len(" processing") {
+		t.Errorf("rendered width = %d, expected bounded agent name", got)
+	}
+	if !strings.Contains(line, "…") {
+		t.Error("wide agent name should be truncated")
 	}
 }
 
@@ -164,5 +189,24 @@ func TestRenderSidebar_TaskCounts(t *testing.T) {
 	}
 	if !strings.Contains(result, "failed") {
 		t.Error("should show failed count")
+	}
+}
+
+func TestRenderSidebar_WideDescriptionsStayWithinSidebar(t *testing.T) {
+	theme := DefaultTheme()
+	l := calcLayout(80, 24, ViewDashboard)
+	agents := []AgentInfo{
+		{ID: "worker-1", State: "processing", CurrentTaskDesc: strings.Repeat("处理🙂", 20)},
+	}
+	tasks := []*model.Task{
+		{ID: "task-001", Status: model.TaskStatusProcessing, Description: strings.Repeat("验证🙂", 20)},
+	}
+	result := renderSidebar(theme, l, agents, tasks, 0, FocusSidebar)
+	maxWidth := lipgloss.Width(strings.Split(result, "\n")[0])
+
+	for i, line := range strings.Split(result, "\n") {
+		if got := lipgloss.Width(line); got > maxWidth {
+			t.Fatalf("line %d visual width = %d, want <= %d: %q", i, got, maxWidth, line)
+		}
 	}
 }
