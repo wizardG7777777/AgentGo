@@ -125,10 +125,7 @@ func (m *AppModel) showStatus() {
 		if t.Status != model.TaskStatusPending && t.Status != model.TaskStatusProcessing {
 			continue
 		}
-		desc := t.Description
-		if cellWidth(desc) > 60 {
-			desc = truncateCells(desc, 60)
-		}
+		desc := truncateDisplay(t.Description, 60)
 		lines = append(lines, fmt.Sprintf("  %s [%s] %s — %s",
 			string(t.Status), t.ID[:8], desc, strings.Join(t.Agents, ",")))
 	}
@@ -219,10 +216,7 @@ func (m *AppModel) listSessions() {
 	var lines []string
 	lines = append(lines, "── Sessions ──")
 	for i, s := range sessions {
-		first := s.FirstUserInput
-		if cellWidth(first) > 50 {
-			first = truncateCells(first, 50)
-		}
+		first := truncateDisplay(s.FirstUserInput, 50)
 		lines = append(lines, fmt.Sprintf("  %d. %s [%s] %s",
 			i+1, s.SessionID, s.CreatedAt, first))
 	}

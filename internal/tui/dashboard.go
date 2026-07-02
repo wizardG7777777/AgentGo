@@ -99,16 +99,13 @@ func renderAgentCard(t Theme, ag AgentInfo, w int) string {
 	// Task info
 	taskLine := ""
 	if ag.CurrentTaskDesc != "" {
-		desc := ag.CurrentTaskDesc
-		if cellWidth(desc) > innerW-4 {
-			desc = truncateCells(desc, innerW-4)
-		}
+		desc := truncateDisplay(ag.CurrentTaskDesc, innerW-4)
 		taskLine = t.CardBody.Render(fmt.Sprintf("  → %s", desc))
 	}
 
 	activityLine := ""
 	if doing := agentDoingText(ag); doing != "" {
-		doing = truncateRunes(doing, innerW-4)
+		doing = truncateDisplay(doing, innerW-4)
 		activityLine = t.CardBody.Render(fmt.Sprintf("  ↳ %s", doing))
 	}
 
@@ -177,10 +174,6 @@ func agentDoingText(ag AgentInfo) string {
 		return ag.LastModelText
 	}
 	return ""
-}
-
-func truncateRunes(s string, max int) string {
-	return truncateCells(s, max)
 }
 
 func formatTokens(n int64) string {

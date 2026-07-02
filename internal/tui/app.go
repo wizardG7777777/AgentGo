@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -92,7 +92,7 @@ type AppModel struct {
 	focus FocusState
 
 	// Input
-	input        textinput.Model
+	input        textarea.Model
 	guidanceMode bool
 
 	// Agent data (refreshed by tick)
@@ -127,18 +127,21 @@ func Run(ctx context.Context, deps Deps) error {
 }
 
 func newAppModel(deps Deps) AppModel {
-	ti := textinput.New()
-	ti.Prompt = "❯ "
-	ti.Placeholder = "输入消息或 /command（/help 查看命令）"
-	ti.Focus()
-	ti.CharLimit = 4096
+	ta := textarea.New()
+	ta.Prompt = "❯ "
+	ta.Placeholder = "输入消息或 /command（/help 查看命令）"
+	ta.ShowLineNumbers = false
+	ta.CharLimit = 4096
+	ta.MaxHeight = inputMaxHeight
+	ta.SetHeight(inputMinHeight)
+	ta.Focus()
 
 	m := AppModel{
 		deps:          deps,
 		theme:         DefaultTheme(),
 		view:          ViewDashboard,
 		focus:         FocusInput,
-		input:         ti,
+		input:         ta,
 		selectedAgent: -1,
 		agentOutputs:  make(map[string]string),
 	}
@@ -149,7 +152,7 @@ func newAppModel(deps Deps) AppModel {
 }
 
 func (m AppModel) Init() tea.Cmd {
-	return tea.Batch(textinput.Blink, m.tickCmd())
+	return tea.Batch(textarea.Blink, m.tickCmd())
 }
 
 func (m AppModel) tickCmd() tea.Cmd {
@@ -166,13 +169,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.layout = calcLayout(m.width, m.height, m.view)
-		if m.width > 6 {
-			m.input.Width = m.layout.MainW - 4
-			if m.layout.Compact {
-				m.input.Width = m.width - 4
-			}
-		}
+		m.reflowInputLayout()
 		return m, nil
 
 	case tickMsg:
@@ -205,9 +202,11 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 	}
 
-	// Pass through to textinput
+	// Pass through to textarea
 	var cmd tea.Cmd
+	prevHeight := m.input.Height()
 	m.input, cmd = m.input.Update(msg)
+	m.reflowInputLayoutFrom(prevHeight)
 	return m, cmd
 }
 
@@ -229,6 +228,7 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.guidanceMode {
 			m.guidanceMode = false
 			m.input.Placeholder = "输入消息或 /command（/help 查看命令）"
+			m.reflowInputLayout()
 			return m, nil
 		}
 		if m.view == ViewAgentDetail || m.view == ViewResult {
@@ -291,6 +291,7 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.guidanceMode = true
 			m.input.Placeholder = "输入指导消息，回车发送..."
 			m.input.SetValue("")
+			m.reflowInputLayout()
 			return m, nil
 		case "4":
 			m.activeApproval.ReplyCh <- shell.ApprovalReply{
@@ -343,6 +344,7 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "enter":
 			line := strings.TrimSpace(m.input.Value())
 			m.input.SetValue("")
+			m.reflowInputLayout()
 			if line == "" {
 				return m, nil
 			}
@@ -366,10 +368,18 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// User input → event channel
 			m.sendUserText(line)
 			return m, nil
+
+		case "ctrl+j", "alt+enter":
+			prevHeight := m.input.Height()
+			m.input.InsertRune('\n')
+			m.reflowInputLayoutFrom(prevHeight)
+			return m, nil
 		}
 
 		var cmd tea.Cmd
+		prevHeight := m.input.Height()
 		m.input, cmd = m.input.Update(msg)
+		m.reflowInputLayoutFrom(prevHeight)
 		return m, cmd
 	}
 
@@ -435,6 +445,7 @@ func (m *AppModel) cycleFocus() {
 func (m *AppModel) advanceApproval() {
 	m.guidanceMode = false
 	m.input.Placeholder = "输入消息或 /command（/help 查看命令）"
+	m.reflowInputLayout()
 	if len(m.pendingApprovals) > 0 {
 		next := m.pendingApprovals[0]
 		m.pendingApprovals = m.pendingApprovals[1:]
@@ -442,6 +453,107 @@ func (m *AppModel) advanceApproval() {
 	} else {
 		m.activeApproval = nil
 	}
+}
+
+func (m *AppModel) reflowInputLayout() {
+	m.reflowInputLayoutFrom(m.input.Height())
+}
+
+func (m *AppModel) reflowInputLayoutFrom(prevHeight int) {
+	if m.width <= 0 || m.height <= 0 {
+		return
+	}
+
+	base := calcLayout(m.width, m.height, m.view, inputMinHeight)
+	inputW := base.MainW - 4
+	if base.Compact {
+		inputW = m.width - 4
+	}
+	if inputW < 1 {
+		inputW = 1
+	}
+
+	m.input.MaxHeight = m.maxTextareaHeight()
+	m.input.SetWidth(inputW)
+	m.input.SetHeight(m.desiredTextareaHeight())
+
+	areaH := renderedLineCount(m.input.View())
+	maxAreaH := m.height - headerHeight - statusBarHeight - minBodyHeight
+	if maxAreaH < inputMinHeight {
+		maxAreaH = inputMinHeight
+	}
+	for areaH > maxAreaH && m.input.Height() > inputMinHeight {
+		reduceBy := areaH - maxAreaH
+		nextH := m.input.Height() - reduceBy
+		if nextH < inputMinHeight {
+			nextH = inputMinHeight
+		}
+		m.input.SetHeight(nextH)
+		areaH = renderedLineCount(m.input.View())
+	}
+	if m.activeApproval != nil && !m.guidanceMode {
+		areaH = inputMinHeight
+	}
+	if m.guidanceMode && m.activeApproval != nil {
+		areaH++
+	}
+	m.layout = calcLayout(m.width, m.height, m.view, areaH)
+
+	if m.input.Height() != prevHeight {
+		m.clampResultScroll()
+	}
+}
+
+func (m AppModel) maxTextareaHeight() int {
+	maxH := inputMaxHeight
+	available := m.height - headerHeight - statusBarHeight - minBodyHeight
+	if m.guidanceMode && m.activeApproval != nil {
+		available--
+	}
+	if available < inputMinHeight {
+		return inputMinHeight
+	}
+	if available < maxH {
+		return available
+	}
+	return maxH
+}
+
+func (m AppModel) desiredTextareaHeight() int {
+	width := m.input.Width()
+	if width < 1 {
+		width = 1
+	}
+
+	rows := 1
+	value := m.input.Value()
+	if value != "" {
+		rows = 0
+		for _, line := range strings.Split(value, "\n") {
+			lineWidth := lipgloss.Width(line)
+			lineRows := 1
+			if lineWidth > 0 {
+				lineRows = (lineWidth + width - 1) / width
+			}
+			rows += lineRows
+		}
+	}
+
+	if rows < inputMinHeight {
+		return inputMinHeight
+	}
+	maxH := m.maxTextareaHeight()
+	if rows > maxH {
+		return maxH
+	}
+	return rows
+}
+
+func renderedLineCount(s string) int {
+	if s == "" {
+		return 0
+	}
+	return len(strings.Split(s, "\n"))
 }
 
 func (m *AppModel) appendMsg(text string, kind MsgKind) {
@@ -477,10 +589,7 @@ func (m *AppModel) clampResultScroll() {
 }
 
 func (m *AppModel) sendUserText(text string) {
-	truncated := text
-	if cellWidth(truncated) > 60 {
-		truncated = truncateCells(truncated, 60)
-	}
+	truncated := truncateDisplay(text, 60)
 	m.appendMsg(fmt.Sprintf("[你] %s", truncated), MsgInfo)
 
 	if m.deps.SessionMgr != nil {
@@ -519,7 +628,7 @@ func (m AppModel) View() string {
 		return "Initializing..."
 	}
 
-	m.layout = calcLayout(m.width, m.height, m.view)
+	m.reflowInputLayout()
 
 	var sections []string
 

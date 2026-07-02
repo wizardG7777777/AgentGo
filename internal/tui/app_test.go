@@ -7,6 +7,7 @@ import (
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"agentgo/internal/model"
 	"agentgo/internal/scheduler"
@@ -83,6 +84,89 @@ func TestAppModel_WindowSizeMsg_Compact(t *testing.T) {
 
 	if !updated.layout.Compact {
 		t.Error("60-wide should be compact")
+	}
+}
+
+func TestAppModel_InputReflow_LongTextSoftWraps(t *testing.T) {
+	m := newAppModel(testDeps())
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = result.(AppModel)
+
+	m.input.SetValue(strings.Repeat("x", 420))
+	m.reflowInputLayout()
+
+	if got := m.input.Height(); got <= inputMinHeight {
+		t.Fatalf("textarea height = %d, want > %d for soft-wrapped text", got, inputMinHeight)
+	}
+	if m.layout.InputH != m.input.Height() {
+		t.Fatalf("layout InputH = %d, want textarea height %d", m.layout.InputH, m.input.Height())
+	}
+	if m.layout.MainH != 40-headerHeight-m.layout.InputH-statusBarHeight {
+		t.Fatalf("MainH = %d, does not account for dynamic input height %d", m.layout.MainH, m.layout.InputH)
+	}
+}
+
+func TestAppModel_InputReflow_MultilineValueGrows(t *testing.T) {
+	m := newAppModel(testDeps())
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = result.(AppModel)
+
+	m.input.SetValue(strings.Repeat("line\n", 6))
+	m.reflowInputLayout()
+
+	if got := m.input.Height(); got <= inputMinHeight {
+		t.Fatalf("textarea height = %d, want > %d for multiline text", got, inputMinHeight)
+	}
+}
+
+func TestAppModel_HandleKey_CtrlJInsertsNewline(t *testing.T) {
+	m := newAppModel(testDeps())
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = result.(AppModel)
+	m.focus = FocusInput
+	m.input.SetValue("first")
+
+	result, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlJ})
+	updated := result.(AppModel)
+
+	if got := updated.input.Value(); got != "first\n" {
+		t.Fatalf("input value = %q, want %q", got, "first\n")
+	}
+}
+
+func TestAppModel_View_DetailInputLongChineseTaskFitsScreen(t *testing.T) {
+	m := newAppModel(testDeps())
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 28})
+	m = result.(AppModel)
+	m.view = ViewAgentDetail
+	m.focus = FocusInput
+	m.selectedAgent = 0
+	m.agents = []AgentInfo{{
+		ID:              "explorer-very-long-agent-name",
+		Type:            "explorer",
+		State:           "processing",
+		CurrentTaskDesc: strings.Repeat("结合已经有的调查结果继续分析这个项目的配置文件关系，", 10),
+		CallCount:       3,
+		PromptTokens:    2048,
+		Phase:           "thinking",
+		Loop:            4,
+		LastTool:        "run_shell",
+		ActivityAge:     "now",
+		LastModelText:   strings.Repeat("长中文输出不应该把真实终端撑到自动换行。", 8),
+	}}
+
+	view := m.View()
+	lines := strings.Split(view, "\n")
+	if len(lines) > m.height {
+		t.Fatalf("view lines = %d, want <= terminal height %d", len(lines), m.height)
+	}
+	for i, line := range lines {
+		if strings.Contains(line, "�") {
+			t.Fatalf("line %d contains replacement character: %q", i, line)
+		}
+		if got := lipgloss.Width(line); got > m.width {
+			t.Fatalf("line %d width = %d, want <= terminal width %d: %q", i, got, m.width, line)
+		}
 	}
 }
 

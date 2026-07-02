@@ -77,6 +77,21 @@ func TestCalcLayout_VerticalDistribution(t *testing.T) {
 	}
 }
 
+func TestCalcLayout_DynamicInputHeight(t *testing.T) {
+	l := calcLayout(120, 40, ViewDashboard, 8)
+
+	expectedBody := 40 - headerHeight - 8 - statusBarHeight
+	if l.InputH != 8 {
+		t.Errorf("InputH = %d, want 8", l.InputH)
+	}
+	if l.MainH != expectedBody {
+		t.Errorf("MainH = %d, want %d", l.MainH, expectedBody)
+	}
+	if l.InputY+l.InputH != l.StatusY {
+		t.Error("dynamic input should stay directly above status bar")
+	}
+}
+
 func TestCalcLayout_TinyTerminal(t *testing.T) {
 	l := calcLayout(10, 5, ViewDashboard)
 

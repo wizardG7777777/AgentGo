@@ -122,5 +122,8 @@ const (
 	compactThreshold = 80
 	headerHeight     = 1
 	statusBarHeight  = 1
-	inputHeight      = 3
+	inputMinHeight   = 3
+	inputMaxHeight   = 15
+	minBodyHeight    = 1
+	inputHeight      = inputMinHeight
 )

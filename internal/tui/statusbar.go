@@ -49,6 +49,10 @@ func renderStatusBar(t Theme, w int, focus FocusState, view ViewState, approvalA
 		hints = append(hints, t.StatusKey.Render("↑↓")+t.StatusVal.Render(":agent"))
 		hints = append(hints, t.StatusKey.Render("Enter")+t.StatusVal.Render(":view"))
 	}
+	if focus == FocusInput && !approvalActive {
+		hints = append(hints, t.StatusKey.Render("Enter")+t.StatusVal.Render(":send"))
+		hints = append(hints, t.StatusKey.Render("Ctrl+J")+t.StatusVal.Render(":newline"))
+	}
 	if view == ViewResult && focus != FocusSidebar {
 		hints = append(hints, t.StatusKey.Render("↑↓")+t.StatusVal.Render(":scroll"))
 		hints = append(hints, t.StatusKey.Render("PgUp/PgDn")+t.StatusVal.Render(":page"))

@@ -55,7 +55,7 @@ func renderAgentDetail(t Theme, w, h int, agentID string, info *AgentInfo, outpu
 	}
 
 	// Title bar
-	title := t.MdH2.Render(fmt.Sprintf("  %s Agent: %s", t.IconAgent, agentID))
+	title := t.MdH2.Render(truncateDisplay(fmt.Sprintf("  %s Agent: %s", t.IconAgent, agentID), w))
 	titleH := 1
 
 	// Info bar
@@ -65,21 +65,17 @@ func renderAgentDetail(t Theme, w, h int, agentID string, info *AgentInfo, outpu
 
 		switch info.State {
 		case "processing":
-			infoParts = append(infoParts, t.StateProcessing.Render("● processing"))
+			infoParts = append(infoParts, "● processing")
 		case "waiting_approval":
-			infoParts = append(infoParts, t.StateApproval.Render("⏳ approval"))
+			infoParts = append(infoParts, "⏳ approval")
 		case "idle":
-			infoParts = append(infoParts, t.StateIdle.Render("○ idle"))
+			infoParts = append(infoParts, "○ idle")
 		default:
 			infoParts = append(infoParts, info.State)
 		}
 
 		if info.CurrentTaskDesc != "" {
-			desc := info.CurrentTaskDesc
-			if cellWidth(desc) > w-20 {
-				desc = truncateCells(desc, w-20)
-			}
-			infoParts = append(infoParts, "task: "+desc)
+			infoParts = append(infoParts, "task: "+info.CurrentTaskDesc)
 		}
 
 		if info.CallCount > 0 {
@@ -99,10 +95,11 @@ func renderAgentDetail(t Theme, w, h int, agentID string, info *AgentInfo, outpu
 			infoParts = append(infoParts, "active: "+info.ActivityAge)
 		}
 	}
-	infoLine := t.SidebarDim.Render("  " + strings.Join(infoParts, " │ "))
-	if cellWidth(infoLine) > w {
-		infoLine = truncateCells(infoLine, w)
+	infoLineW := w - t.SidebarDim.GetHorizontalFrameSize()
+	if infoLineW < 1 {
+		infoLineW = 1
 	}
+	infoLine := t.SidebarDim.Render(buildBoundedInfoLine(infoParts, infoLineW))
 	infoH := 1
 
 	divider := t.MdDivider.Render(strings.Repeat("─", w))
@@ -131,23 +128,54 @@ func renderAgentDetail(t Theme, w, h int, agentID string, info *AgentInfo, outpu
 		if len(lines) > contentH {
 			lines = lines[len(lines)-contentH:]
 		}
+		for i, line := range lines {
+			lines[i] = truncateDisplay(line, w)
+		}
 		contentStr = strings.Join(lines, "\n")
 	}
 
-	// Pre-wrap long lines to fit within viewport width
-	if w > 2 {
-		lines := strings.Split(contentStr, "\n")
-		var wrappedLines []string
-		for _, line := range lines {
-			if cellWidth(line) > w-2 {
-				wrapped := lipgloss.NewStyle().Width(w - 2).Render(line)
-				wrappedLines = append(wrappedLines, strings.Split(wrapped, "\n")...)
-			} else {
-				wrappedLines = append(wrappedLines, line)
-			}
-		}
-		contentStr = strings.Join(wrappedLines, "\n")
+	return title + "\n" + infoLine + "\n" + divider + "\n" + contentStr
+}
+
+func buildBoundedInfoLine(parts []string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	const prefix = "  "
+	if width <= cellWidth(prefix) {
+		return truncateDisplay(prefix, width)
 	}
 
-	return title + "\n" + infoLine + "\n" + divider + "\n" + contentStr
+	available := width - cellWidth(prefix)
+	sep := " │ "
+	var line string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		candidate := part
+		if line != "" {
+			candidate = line + sep + part
+		}
+		if cellWidth(candidate) <= available {
+			line = candidate
+			continue
+		}
+
+		remaining := available
+		if line != "" {
+			remaining = available - cellWidth(line) - cellWidth(sep)
+			if remaining <= 0 {
+				break
+			}
+			line += sep + truncateDisplay(part, remaining)
+		} else {
+			line = truncateDisplay(part, remaining)
+		}
+		break
+	}
+
+	return prefix + padDisplay(line, available)
 }

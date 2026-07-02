@@ -2,17 +2,24 @@ package tui
 
 // calcLayout computes panel dimensions from terminal size and view state.
 // Borrows crush's responsive breakpoint pattern: sidebar hidden below compactThreshold.
-func calcLayout(w, h int, view ViewState) Layout {
+func calcLayout(w, h int, view ViewState, inputRows ...int) Layout {
 	l := Layout{Width: w, Height: h}
 	l.Compact = w < compactThreshold
+	inputH := inputMinHeight
+	if len(inputRows) > 0 {
+		inputH = inputRows[0]
+	}
+	if inputH < inputMinHeight {
+		inputH = inputMinHeight
+	}
 
 	// Vertical split: header(1) | body | input(3) | status(1)
 	l.HeaderY = 0
 	l.HeaderH = headerHeight
 	l.StatusY = h - statusBarHeight
 	l.StatusH = statusBarHeight
-	l.InputY = l.StatusY - inputHeight
-	l.InputH = inputHeight
+	l.InputY = l.StatusY - inputH
+	l.InputH = inputH
 
 	bodyY := l.HeaderY + l.HeaderH
 	bodyH := l.InputY - bodyY

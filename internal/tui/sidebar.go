@@ -15,7 +15,10 @@ func renderSidebar(t Theme, l Layout, agents []AgentInfo, tasks []*model.Task, s
 		return ""
 	}
 
-	innerW := l.SidebarW - 2 // padding
+	innerW := l.SidebarW - 3 // padding plus right border
+	if innerW < 1 {
+		innerW = 1
+	}
 	var lines []string
 
 	// --- Agent section ---
@@ -31,11 +34,8 @@ func renderSidebar(t Theme, l Layout, agents []AgentInfo, tasks []*model.Task, s
 
 		// Show current task under agent (dim, indented)
 		if ag.CurrentTaskDesc != "" {
-			desc := ag.CurrentTaskDesc
 			maxDescW := innerW - 4
-			if maxDescW > 0 && cellWidth(desc) > maxDescW {
-				desc = truncateCells(desc, maxDescW)
-			}
+			desc := truncateDisplay(ag.CurrentTaskDesc, maxDescW)
 			lines = append(lines, t.SidebarDim.Render("  "+desc))
 		}
 	}
@@ -93,11 +93,8 @@ func renderSidebar(t Theme, l Layout, agents []AgentInfo, tasks []*model.Task, s
 				continue
 			}
 			icon, style := taskStatusStyle(t, task.Status)
-			desc := task.Description
 			maxW := innerW - 6
-			if maxW > 0 && cellWidth(desc) > maxW {
-				desc = truncateCells(desc, maxW)
-			}
+			desc := truncateDisplay(task.Description, maxW)
 			lines = append(lines, fmt.Sprintf("  %s %s",
 				style.Render(icon),
 				t.SidebarDim.Render(desc)))
@@ -105,25 +102,35 @@ func renderSidebar(t Theme, l Layout, agents []AgentInfo, tasks []*model.Task, s
 		}
 	}
 
-	// Assemble sidebar: join lines, pad height, add border
-	content := strings.Join(lines, "\n")
+	style := lipgloss.NewStyle().
+		Width(l.SidebarW - 1).
+		Border(lipgloss.Border{Right: "│"}).
+		BorderForeground(lipgloss.Color("237"))
+
+	bodyH := l.SidebarH - 2
+	if bodyH < 0 {
+		bodyH = 0
+	}
+	style = style.Height(bodyH)
+	bodyW := innerW
+	if bodyW > 0 {
+		bodyW -= style.GetHorizontalFrameSize()
+		if bodyW < 1 {
+			bodyW = 1
+		}
+	}
 
 	// Constrain to sidebar height
-	contentLines := strings.Split(content, "\n")
-	if len(contentLines) > l.SidebarH {
-		contentLines = contentLines[:l.SidebarH]
+	contentLines := lines
+	if len(contentLines) > bodyH {
+		contentLines = contentLines[:bodyH]
 	}
-	for len(contentLines) < l.SidebarH {
-		contentLines = append(contentLines, strings.Repeat(" ", innerW))
+	for len(contentLines) < bodyH {
+		contentLines = append(contentLines, strings.Repeat(" ", bodyW))
 	}
 
 	body := strings.Join(contentLines, "\n")
-	return lipgloss.NewStyle().
-		Width(l.SidebarW).
-		Height(l.SidebarH).
-		Border(lipgloss.Border{Right: "│"}).
-		BorderForeground(lipgloss.Color("237")).
-		Render(body)
+	return style.Render(body)
 }
 
 func renderAgentLine(t Theme, ag AgentInfo, maxW int) string {
@@ -146,9 +153,7 @@ func renderAgentLine(t Theme, ag AgentInfo, maxW int) string {
 	}
 
 	name := ag.ID
-	if cellWidth(name) > maxW-4 {
-		name = truncateCells(name, maxW-4)
-	}
+	name = truncateDisplay(name, maxW-4)
 
 	return fmt.Sprintf("%s %s %s",
 		stateStyle.Render(icon),
@@ -176,7 +181,7 @@ func taskStatusStyle(t Theme, status model.TaskStatus) (string, lipgloss.Style) 
 func truncOrPad(s string, w int) string {
 	vis := cellWidth(s)
 	if vis > w {
-		s = truncateCells(s, w)
+		s = truncateDisplay(s, w)
 		vis = cellWidth(s)
 	}
 	if vis < w {

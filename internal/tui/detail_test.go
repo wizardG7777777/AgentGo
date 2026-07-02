@@ -183,3 +183,55 @@ func TestRenderAgentDetail_WideOutputWraps(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderAgentDetail_LongChineseTaskDoesNotOverflow(t *testing.T) {
+	theme := DefaultTheme()
+	width := 72
+	height := 16
+	info := &AgentInfo{
+		ID:              "explorer-1",
+		Type:            "explorer",
+		State:           "processing",
+		CurrentTaskDesc: strings.Repeat("结合已经有的调查结果继续分析这个项目的配置文件关系，", 8),
+		CallCount:       2,
+		PromptTokens:    1200,
+		Phase:           "thinking",
+		Loop:            3,
+		LastTool:        "run_shell",
+		ActivityAge:     "1s ago",
+	}
+	output := strings.Repeat("工具输出里也可能包含很长的中文行，需要避免终端自动换行。", 6)
+
+	result := renderAgentDetail(theme, width, height, "explorer-1", info, output)
+	lines := strings.Split(result, "\n")
+	if len(lines) > height {
+		t.Fatalf("rendered lines = %d, want <= %d", len(lines), height)
+	}
+	for i, line := range lines {
+		if strings.Contains(line, "�") {
+			t.Fatalf("line %d contains replacement character: %q", i, line)
+		}
+		if got := lipgloss.Width(line); got > width {
+			t.Fatalf("line %d width = %d, want <= %d: %q", i, got, width, line)
+		}
+	}
+}
+
+func TestBuildBoundedInfoLine_TruncatesByDisplayWidth(t *testing.T) {
+	width := 40
+	line := buildBoundedInfoLine([]string{
+		"type: explorer",
+		"● processing",
+		"task: " + strings.Repeat("中文任务", 12),
+	}, width)
+
+	if strings.Contains(line, "�") {
+		t.Fatalf("line contains replacement character: %q", line)
+	}
+	if got := lipgloss.Width(line); got != width {
+		t.Fatalf("line width = %d, want %d: %q", got, width, line)
+	}
+	if !strings.Contains(line, "…") {
+		t.Fatalf("line should show truncation marker: %q", line)
+	}
+}
