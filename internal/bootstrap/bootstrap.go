@@ -20,6 +20,7 @@ import (
 	"agentgo/internal/mailbox"
 	"agentgo/internal/memory"
 	"agentgo/internal/model"
+	"agentgo/internal/plan"
 	"agentgo/internal/probe"
 	"agentgo/internal/reactor"
 	reactorbuiltin "agentgo/internal/reactor/builtin"
@@ -48,6 +49,8 @@ type System struct {
 	MailboxRegistry *mailbox.Registry
 	MailNotifier    *mailbox.MailNotifier
 	Scheduler       *scheduler.Bundle // Phase 3：scheduler 现在是 agent.Agent + Activator + ModeStore 的复合
+	PlanStore       *plan.Store
+	PlanCoordinator *plan.Coordinator
 	Activity        *agent.ActivityTracker
 	// v4：所有执行/调查代理都是 runner.Runner（取代旧 worker.Worker / explorer.Explorer
 	// 两个 package；详见 nextUpgrade_v4.md §11.6.6）。kind × replicas 实例化在 Bootstrap()
@@ -172,6 +175,21 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	cancelRegistry := store.NewTaskCancelRegistry()
 	taskStore.SetCancelRegistry(cancelRegistry)
 	log.Println("[启动] 公告板初始化完成")
+
+	// Step 2.1: 初始化动态 DAG 的可靠控制面。Plan 状态与 pending
+	// ReplanRequest 使用原子 JSON 存储；内存 signal 仅作唤醒加速。
+	planStatePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "plans.json")
+	if sessMgr != nil && sessMgr.Current() != nil {
+		planStatePath = filepath.Join(sessMgr.Current().Dir, "plan-state.json")
+	}
+	planStore, planErr := plan.OpenStore(planStatePath)
+	if planErr != nil {
+		return nil, fmt.Errorf("初始化 PlanStore 失败: %w", planErr)
+	}
+	planCoordinator := plan.NewCoordinator(planStore, planTaskBackend{store: taskStore})
+	planCoordinator.SetAcceptanceVerifier(planAcceptanceVerifier{store: taskStore, projectRoot: cfg.ProjectRoot})
+	taskStore.SetTaskPlanHooks(makeTaskPlanHooks(planCoordinator))
+	log.Printf("[启动] PlanCoordinator 初始化完成 (state=%s)", planStatePath)
 
 	// Step 2.3: Artifacts 持久化（JSONL 追加日志，2026-04-12 持久化专题起头）
 	//
@@ -432,7 +450,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	sched := scheduler.New(
 		taskStore, r, schedulerLLM, eventCh, cfg, cancelRegistry, mbRegistry, approvalCh,
 		gateReg, storeView, recordToolCall, agentRegistry, memoryStore,
-		outputWriter,
+		outputWriter, planCoordinator,
 	)
 	if sched.Agent != nil {
 		sched.Agent.Activity = activity
@@ -455,6 +473,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		StoreView:             storeView,
 		RecordToolCall:        recordToolCall,
 		Memory:                memoryStore,
+		PlanCoordinator:       planCoordinator,
 		Activity:              activity,
 		MBRegistry:            mbRegistry,
 		CancelRegistry:        cancelRegistry,
@@ -527,7 +546,8 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 			return spawnMgr.KindOf(agentID)
 		}
 		userReactorDeps := userdef.Deps{
-			Store: taskStore,
+			Store:           taskStore,
+			ReplanRequester: replanRequesterAdapter{coordinator: planCoordinator, store: taskStore},
 			LLMFactory: func(model string) userdef.LLMCompleter {
 				// 独立 reactor LLM client：不复用主 agent client，避免共享 history / system prompt 状态。
 				return userdef.NewLLMCompleter(buildKindLLMClient(cfg.LLM, model))
@@ -568,6 +588,8 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		ArtifactLog:     artifactLog, // 可能为 nil（OpenArtifactLog 失败时），Shutdown 会判空
 		SessionMgr:      sessMgr,     // 可能为 nil（Session 初始化失败时），Shutdown 会判空
 		Scheduler:       sched,
+		PlanStore:       planStore,
+		PlanCoordinator: planCoordinator,
 		Activity:        activity,
 		Runners:         runners,
 		ApprovalCh:      approvalCh,
@@ -576,10 +598,10 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		OutputCh:        outputCh,
 		LogFile:         logFile,
 	}
+	if err := restoreOrReconcileRuntime(sys, recoveredSnap); err != nil {
+		return nil, fmt.Errorf("恢复 Plan/Task 运行时状态失败: %w", err)
+	}
 	if recoveredSnap != nil {
-		if err := restoreRuntimeSnapshot(sys, recoveredSnap); err != nil {
-			return nil, fmt.Errorf("恢复 session snapshot 失败: %w", err)
-		}
 		log.Printf("[resume] 已恢复 session snapshot: tasks=%d mailboxes=%d scheduler_history=%d",
 			len(recoveredSnap.Tasks), len(recoveredSnap.Mailboxes), len(recoveredSnap.SchedulerHistory))
 	}
@@ -742,6 +764,23 @@ func (s *System) Shutdown() {
 	}
 	s.wg.Wait()
 	s.saveRuntimeSnapshot()
+	// Drain the Task→Plan durability bridge before tearing down its lazy retry
+	// worker. A bounded wait keeps shutdown responsive; any remaining skew is
+	// detected and blocked by resume reconciliation on the next start.
+	if waiter, ok := s.Store.(interface {
+		WaitPlanMutations(context.Context) error
+	}); ok {
+		waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := waiter.WaitPlanMutations(waitCtx); err != nil {
+			log.Printf("[关闭] WARNING: Task→Plan mutation 未完全落盘: %v", err)
+		}
+		cancel()
+	}
+	if closer, ok := s.Store.(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil {
+			log.Printf("[关闭] WARNING: Task store 关闭失败: %v", err)
+		}
+	}
 	// 关闭 trace 写入器，flush 所有打开的文件句柄
 	if w := trace.Default(); w != nil {
 		w.Close()

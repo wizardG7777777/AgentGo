@@ -34,7 +34,6 @@ func TestPathBoundaryHook_MatchesFileSystemTools(t *testing.T) {
 		// 应当匹配 — 文件系工具
 		"read_file":   true,
 		"list_dir":    true,
-		"list_files":  true,
 		"grep_search": true,
 		"glob_search": true,
 		"write_file":  true,
@@ -46,6 +45,7 @@ func TestPathBoundaryHook_MatchesFileSystemTools(t *testing.T) {
 		"web_fetch":    false,
 		"publish_task": false,
 		"send_message": false,
+		"list_files":   false,
 	}
 	for tool, want := range cases {
 		t.Run(tool, func(t *testing.T) {

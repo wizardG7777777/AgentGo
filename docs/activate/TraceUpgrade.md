@@ -16,7 +16,7 @@
 
 ## 0. 模块命题
 
-ReactiveSystem 把 trace 事件流升格为 Reactor 子系统的**唯一真相源**（[原则 3](ReactiveSystem.md#原则-3trace-是事实标准事件流唯一真相源)）——所有状态变更必须遵循"主流程 SetState → emit `KindXxx` → Reactor 订阅者响应"三步序列。但当前 trace 事件**不带结构化的状态语义**——绝大多数事件只有 `TaskID` + `Reason string`（自由文本），让 Reactor 无法精确订阅"task_status 从 X 变到 Y"或"cancel 来源是 watchdog 还是用户"这类条件。
+ReactiveSystem 把 trace 事件流升格为 Reactor 子系统的**统一事件源**（[原则 3](ReactiveSystem.md#原则-3trace-是-reactor-的统一事件源不替代领域权威存储)）——所有状态变更必须遵循"主流程 SetState → emit `KindXxx` → Reactor 订阅者响应"三步序列。TaskStore / PlanStore 仍分别是 Task 和动态 DAG 的领域权威；trace 负责分发与审计。早期 trace 事件缺少结构化状态语义——绝大多数事件只有 `TaskID` + `Reason string`（自由文本），让 Reactor 无法精确订阅"task_status 从 X 变到 Y"或"cancel 来源是 watchdog 还是用户"这类条件。
 
 本模块在 trace 系统上做**最小侵入式扩展**：保留现有 fat struct 形态（避免大规模迁移），在 Event 上新增三个嵌套子结构体承载结构化字段（状态转移 / Shell 执行 / Shell 超时），并新增 4 个 v5 首批事件需要的 EventKind。完成后：
 

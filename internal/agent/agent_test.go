@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -98,6 +99,92 @@ func TestAgent_RecoverableError(t *testing.T) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestAgent_RecoverableRetryPersistsToolHistoryInStoreAndSnapshot(t *testing.T) {
+	s, r, _ := setup()
+	memoryStore := s.(*store.MemoryTaskStore)
+	task := &model.Task{Description: "retry with durable tool history", EventType: "code"}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("agent-history", task.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	const toolOutput = "durable tool evidence"
+	callCount := 0
+	executor := func(_ context.Context, _ *model.Task, _ map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		callCount++
+		switch callCount {
+		case 1:
+			if len(history) != 0 {
+				t.Fatalf("first round history=%+v, want empty", history)
+			}
+			return ExecuteResult{
+				Output: toolOutput, ToolCalled: true,
+				ToolResults: []ToolResult{{ToolCallID: "tool-1", Content: toolOutput}},
+			}, nil
+		case 2:
+			if len(history) != 1 || history[0].Output != toolOutput {
+				t.Fatalf("failure round did not receive tool history: %+v", history)
+			}
+			return ExecuteResult{}, &ErrRecoverable{Err: errors.New("temporary provider failure")}
+		default:
+			found := false
+			for _, entry := range history {
+				if entry.Output == toolOutput && entry.ToolCalled {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("retry did not restore prior tool history: %+v", history)
+			}
+			return ExecuteResult{Output: "completed after retry"}, nil
+		}
+	}
+
+	ag := NewAgent("agent-history", "code", s, r, executor, 10)
+	ag.processTask(context.Background(), task.ID)
+
+	stored, err := s.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != model.TaskStatusPending || stored.RetryCount != 1 {
+		t.Fatalf("after recoverable failure task=%+v", stored)
+	}
+	var persisted []HistoryEntry
+	if err := json.Unmarshal(stored.LastHistory, &persisted); err != nil {
+		t.Fatalf("stored LastHistory is not valid history JSON: %v", err)
+	}
+	if len(persisted) != 1 || persisted[0].Output != toolOutput {
+		t.Fatalf("stored LastHistory=%+v", persisted)
+	}
+
+	var snapHistory []byte
+	for _, snap := range memoryStore.ExportSnapshot() {
+		if snap.ID == task.ID {
+			snapHistory = snap.LastHistory
+			break
+		}
+	}
+	if string(snapHistory) != string(stored.LastHistory) {
+		t.Fatalf("snapshot LastHistory=%s, store LastHistory=%s", snapHistory, stored.LastHistory)
+	}
+
+	if err := s.ClaimTask("agent-history", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	ag.processTask(context.Background(), task.ID)
+	completed, err := s.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Status != model.TaskStatusCompleted || callCount != 3 {
+		t.Fatalf("retry completion task=%+v calls=%d", completed, callCount)
 	}
 }
 

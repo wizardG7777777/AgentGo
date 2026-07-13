@@ -698,8 +698,8 @@ func TestSaveSnapshot_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadSnapshot failed: %v", err)
 	}
-	if snap.Version != 1 {
-		t.Errorf("Version = %d, want 1", snap.Version)
+	if snap.Version != currentSnapshotVersion {
+		t.Errorf("Version = %d, want %d", snap.Version, currentSnapshotVersion)
 	}
 	if snap.SavedAt == "" {
 		t.Error("SavedAt should be set")

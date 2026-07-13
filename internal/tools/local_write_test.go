@@ -26,9 +26,9 @@ type recordingRoster struct {
 	claimErr   error  // TryClaim 返回的错误
 
 	// §8.3：WaitForRelease mock 控制
-	waitErr      error // WaitForRelease 返回的错误（nil = 模拟成功唤醒）
-	claimAfterWait bool // WaitForRelease 成功后，下次 TryClaim 是否放行
-	tryClaims    int   // TryClaim 调用计数
+	waitErr        error // WaitForRelease 返回的错误（nil = 模拟成功唤醒）
+	claimAfterWait bool  // WaitForRelease 成功后，下次 TryClaim 是否放行
+	tryClaims      int   // TryClaim 调用计数
 }
 
 func (r *recordingRoster) record(ev string) {
@@ -348,6 +348,7 @@ func (c *captureStore) FailTask(string, string, string) error                   
 func (c *captureStore) FailTaskBySystem(string, string) error                      { return nil }
 func (c *captureStore) RetryRollback(string, string, string) error                 { return nil }
 func (c *captureStore) AppendOutput(string, string, string) error                  { return nil }
+func (c *captureStore) RecordLastHistory(string, []byte) error                     { return nil }
 func (c *captureStore) QueryAvailable(string) ([]*model.Task, error)               { return nil, nil }
 func (c *captureStore) GetTask(string) (*model.Task, error)                        { return nil, nil }
 func (c *captureStore) GetDependencyResults(string) (map[string]string, error)     { return nil, nil }
@@ -355,12 +356,12 @@ func (c *captureStore) GetDependencyArtifacts(string) (map[string][]string, erro
 func (c *captureStore) GetDependencyTransferNotes(string) (map[string]string, error) {
 	return nil, nil
 }
-func (c *captureStore) SetTransferNote(string, string) error { return nil }
-func (c *captureStore) RecordLastResponse(string, string) error                    { return nil }
-func (c *captureStore) ScanAll() ([]*model.Task, error)                            { return nil, nil }
-func (c *captureStore) AppendToolCall(string, store.ToolCallRecord) error          { return nil }
-func (c *captureStore) AppendSchedulerBatch(string, string) error                  { return nil }
-func (c *captureStore) ClearSchedulerBatch(string) error                           { return nil }
+func (c *captureStore) SetTransferNote(string, string) error              { return nil }
+func (c *captureStore) RecordLastResponse(string, string) error           { return nil }
+func (c *captureStore) ScanAll() ([]*model.Task, error)                   { return nil, nil }
+func (c *captureStore) AppendToolCall(string, store.ToolCallRecord) error { return nil }
+func (c *captureStore) AppendSchedulerBatch(string, string) error         { return nil }
+func (c *captureStore) ClearSchedulerBatch(string) error                  { return nil }
 func (c *captureStore) QueryToolCalls(string, string) ([]store.ToolCallRecord, error) {
 	return nil, nil
 }
@@ -476,7 +477,6 @@ func TestEditFile_WaitAndRetrySuccess(t *testing.T) {
 // TestNormalizeArtifactPath 一并删除，因为 normalizeArtifactPath 函数也随
 // recordArtifact 一起迁移到了 hook/builtin 包，tools 包内不再持有该实现。
 // 该函数的等价测试也在新的 record_artifact_test.go 中。
-
 
 // === §7 Hashline 行哈希增强测试 ===
 

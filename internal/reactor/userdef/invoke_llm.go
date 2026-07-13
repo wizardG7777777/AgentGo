@@ -37,6 +37,8 @@ type invokeLLMReactor struct {
 	llm        LLMCompleter
 	output     outputSink
 	llmTimeout time.Duration
+	store      PublishStore
+	requester  ReplanRequester
 }
 
 func (r *invokeLLMReactor) Name() string                 { return r.name }
@@ -50,6 +52,13 @@ func (r *invokeLLMReactor) Priority() int                { return 500 }
 func (r *invokeLLMReactor) Run(ev trace.Event) error {
 	if !r.when.eval(ev) {
 		return nil
+	}
+	// Isolated Reactor LLM calls are intentionally kept outside Scheduler-owned
+	// Plans: otherwise high-frequency events could spend untracked Plan tokens or
+	// perform side effects without a DAG decision. Compatibility tasks still use
+	// the legacy path.
+	if redirected, err := redirectPlannedWork(ev, "invoke_llm", "", r.store, r.requester); redirected {
+		return err
 	}
 	prompt := r.prompt.render(ev)
 	if prompt == "" {

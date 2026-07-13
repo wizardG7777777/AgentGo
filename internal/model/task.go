@@ -10,12 +10,13 @@ const (
 	TaskStatusCompleted  TaskStatus = "completed"
 	TaskStatusCancelled  TaskStatus = "cancelled"
 	TaskStatusFailed     TaskStatus = "failed"
+	TaskStatusBlocked    TaskStatus = "blocked"
 )
 
 // ValidTransitions defines the allowed state machine transitions.
 var ValidTransitions = map[TaskStatus][]TaskStatus{
-	TaskStatusPending:    {TaskStatusProcessing, TaskStatusCancelled, TaskStatusFailed},
-	TaskStatusProcessing: {TaskStatusCompleted, TaskStatusFailed, TaskStatusCancelled, TaskStatusPending},
+	TaskStatusPending:    {TaskStatusProcessing, TaskStatusCancelled, TaskStatusFailed, TaskStatusBlocked},
+	TaskStatusProcessing: {TaskStatusCompleted, TaskStatusFailed, TaskStatusCancelled, TaskStatusBlocked, TaskStatusPending},
 }
 
 // IsValidTransition checks whether transitioning from one status to another is allowed.
@@ -32,9 +33,9 @@ func IsValidTransition(from, to TaskStatus) bool {
 	return false
 }
 
-// IsTerminal returns true if the status is a terminal state (completed, cancelled, failed).
+// IsTerminal returns true if the status is a terminal state.
 func IsTerminal(status TaskStatus) bool {
-	return status == TaskStatusCompleted || status == TaskStatusCancelled || status == TaskStatusFailed
+	return status == TaskStatusCompleted || status == TaskStatusCancelled || status == TaskStatusFailed || status == TaskStatusBlocked
 }
 
 type Task struct {
@@ -57,6 +58,31 @@ type Task struct {
 	SystemPrompt   string // 可选的自定义 system prompt，非空时覆盖 Worker 默认 prompt
 	PartialOutput  string // 执行中的部分输出，用于流式进度展示
 	Depth          int    // 子任务嵌套深度，根任务为 0
+
+	// PlanID 把执行 Task 归属到一张动态 DAG。根 Scheduler Task 的 PlanID
+	// 等于自身 Task.ID；未纳入计划控制面的兼容任务保持空值。
+	PlanID string `json:"plan_id,omitempty"`
+
+	// NodeRole 是节点在当前计划中的语义角色。它不参与 Agent 路由；路由仍由
+	// EventType 决定。常见值见 PlanNodeRole* 常量。
+	NodeRole PlanNodeRole `json:"node_role,omitempty"`
+
+	// CreatedRevision / RetiredRevision 记录节点进入和退出当前有效图的规划版本。
+	// Task 状态变化不会修改这两个字段。
+	CreatedRevision int64 `json:"created_revision,omitempty"`
+	RetiredRevision int64 `json:"retired_revision,omitempty"`
+
+	// Supersedes 是非阻塞的替代语义边；Dependencies 才是执行阻塞边。
+	Supersedes []string `json:"supersedes,omitempty"`
+
+	// AcceptanceRunID 仅对正式验收执行 Task 有值。提交验收结果时以它和
+	// 当前 Task.ID 双重校验 Runner 身份，而不是依赖 AgentType。
+	AcceptanceRunID string `json:"acceptance_run_id,omitempty"`
+
+	// PlanMutationSource 是内部控制面写入的权限来源。普通 LLM/YAML 参数不会
+	// 暴露该字段；Coordinator 用它区分 scheduler / acceptance / control，
+	// 以及暂停恢复期间尚不可认领的 control-reserved 节点。
+	PlanMutationSource string `json:"plan_mutation_source,omitempty"`
 
 	// MailChainDepth 是该任务被第几层邮件唤醒。
 	// 用户 /steer 触发的初始任务为 0；被 chain_depth=N 的邮件唤醒的任务为 N。
@@ -140,9 +166,9 @@ type Task struct {
 
 // ReadInfo 是 Task.ReadSet 的 value 类型，记录单个文件被读取的元数据。
 type ReadInfo struct {
-	FilePath   string    `json:"file_path"`             // 冗余存储绝对路径（与 map key 一致），便于 list 输出
-	ReadAt     time.Time `json:"read_at"`               // 首次读取时间戳（首次写入时设定，后续不变）
-	Loop       int       `json:"loop,omitempty"`        // 触发首次读取的 ReactLoop 轮次
-	Hash       string    `json:"hash,omitempty"`        // 读取时刻的文件 SHA256（v5 Phase 6 暂不填，与 v4 §7 hashline 整合留作 v5.x 增量）
+	FilePath   string    `json:"file_path"`              // 冗余存储绝对路径（与 map key 一致），便于 list 输出
+	ReadAt     time.Time `json:"read_at"`                // 首次读取时间戳（首次写入时设定，后续不变）
+	Loop       int       `json:"loop,omitempty"`         // 触发首次读取的 ReactLoop 轮次
+	Hash       string    `json:"hash,omitempty"`         // 读取时刻的文件 SHA256（v5 Phase 6 暂不填，与 v4 §7 hashline 整合留作 v5.x 增量）
 	LastReadAt time.Time `json:"last_read_at,omitempty"` // 最近一次读取时间戳（多次读取覆盖）
 }

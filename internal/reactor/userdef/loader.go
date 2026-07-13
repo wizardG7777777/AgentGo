@@ -43,6 +43,8 @@ var knownEventKinds = map[trace.EventKind]struct{}{
 	trace.KindShellTimeoutPending:       {},
 	trace.KindShellTimeoutResolved:      {},
 	trace.KindReactorSpawnDepthExceeded: {},
+	trace.KindAcceptanceCompleted:       {},
+	trace.KindPlanPaused:                {},
 }
 
 // Deps 聚合 loader 需要的全部外部依赖。
@@ -53,14 +55,16 @@ var knownEventKinds = map[trace.EventKind]struct{}{
 //   - LLMFactory=nil 且 invoke_llm.model 非空：启动期报错，避免静默忽略模型覆盖
 //   - Mailbox=nil：发现 invoke_llm.send_message → 启动期报错
 //   - Emitter=nil：emit_trace 退化到包级 trace.Emit
+//   - ReplanRequester=nil：发现 request_replan reactor → 启动期报错
 //   - KindEventTypes=nil：跳过 publish_task.kind 路由校验（测试场景）
 type Deps struct {
-	Store          PublishStore
-	LLM            LLMCompleter
-	LLMFactory     func(model string) LLMCompleter
-	Mailbox        MailboxSender
-	Emitter        TraceEmitter
-	KindEventTypes map[string]string
+	Store           PublishStore
+	LLM             LLMCompleter
+	LLMFactory      func(model string) LLMCompleter
+	Mailbox         MailboxSender
+	Emitter         TraceEmitter
+	ReplanRequester ReplanRequester
+	KindEventTypes  map[string]string
 	// SpawnHost 是 spawn_agent reactor 的依赖（通常由 internal/spawn.Manager 实现）。
 	// 为 nil 时，发现 spawn_agent reactor → 启动期报错。
 	SpawnHost spawn.SpawnHost
@@ -77,11 +81,12 @@ type Deps struct {
 // 启动期校验：
 //  1. YAML 语法 + schema 类型
 //  2. `on:` 命中已知 EventKind
-//  3. 四个动作字段恰好一个非 nil
+//  3. 五个动作字段恰好一个非 nil
 //  4. PublishTask: Kind 非空 + description.File 在 projectRoot 内 + 模板路径有效
 //  5. InvokeLLM: prompt.File 在 projectRoot 内 + output 三 sink 恰一非 nil
-//  6. when 表达式可解析
-//  7. 依赖完整性：动作所需 Deps 字段非 nil
+//  6. RequestReplan: reason_code 非空 + urgency 为 normal/high + 无越权字段
+//  7. when 表达式可解析
+//  8. 依赖完整性：动作所需 Deps 字段非 nil
 func LoadFromFile(path string, projectRoot string, deps Deps) ([]reactor.Reactor, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -136,6 +141,9 @@ func buildReactor(rc ReactorConfig, idx int, descBaseDir, projectRoot string, de
 	if rc.SpawnAgent != nil {
 		actionCount++
 	}
+	if rc.RequestReplan != nil {
+		actionCount++
+	}
 	if rc.Call != "" {
 		actionCount++
 	}
@@ -143,7 +151,7 @@ func buildReactor(rc ReactorConfig, idx int, descBaseDir, projectRoot string, de
 		return nil, fmt.Errorf("args is only valid with call")
 	}
 	if actionCount == 0 {
-		return nil, fmt.Errorf("must specify exactly one of: publish_task / invoke_llm / spawn_agent / call")
+		return nil, fmt.Errorf("must specify exactly one of: publish_task / invoke_llm / spawn_agent / request_replan / call")
 	}
 	if actionCount > 1 {
 		return nil, fmt.Errorf("must specify exactly one action, found %d", actionCount)
@@ -174,6 +182,8 @@ func buildReactor(rc ReactorConfig, idx int, descBaseDir, projectRoot string, de
 		inner, err = buildInvokeLLM(name, kind, when, rc.InvokeLLM, descBaseDir, projectRoot, deps)
 	case rc.SpawnAgent != nil:
 		inner, err = buildSpawnAgent(name, kind, when, rc.SpawnAgent, descBaseDir, projectRoot, deps)
+	case rc.RequestReplan != nil:
+		inner, err = buildRequestReplan(name, kind, when, rc.RequestReplan, deps)
 	case rc.Call != "":
 		inner, err = buildCall(name, kind, when, rc.Call, rc.Args, deps)
 	default:
@@ -289,6 +299,8 @@ func buildSpawnAgent(name string, kind trace.EventKind, when *whenCond, a *Spawn
 		sysPromTpl: sysPromTpl,
 		lifecycle:  a.Lifecycle,
 		host:       deps.SpawnHost,
+		store:      deps.Store,
+		requester:  deps.ReplanRequester,
 	}, nil
 }
 
@@ -395,6 +407,7 @@ func buildPublishTask(name string, kind trace.EventKind, when *whenCond, a *Publ
 		eventType:    eventType,
 		priority:     a.Priority,
 		store:        deps.Store,
+		requester:    deps.ReplanRequester,
 		depTemplates: a.Dependencies,
 	}, nil
 }
@@ -425,6 +438,8 @@ func buildInvokeLLM(name string, kind trace.EventKind, when *whenCond, a *Invoke
 		llm:        llm,
 		output:     sink,
 		llmTimeout: deps.LLMTimeout,
+		store:      deps.Store,
+		requester:  deps.ReplanRequester,
 	}, nil
 }
 
@@ -493,7 +508,17 @@ func buildOutputSink(spec OutputSpec, descBaseDir, projectRoot string, deps Deps
 		if spec.EmitTrace.Kind == "" {
 			return nil, fmt.Errorf("emit_trace: 'kind' is required")
 		}
-		// 不强制 Kind 在 knownEventKinds 内：用户标记事件允许自定义 kind。
+		// 用户可发射的 trace 标记必须位于独立命名空间，不能伪造
+		// task_completed / acceptance_completed 等由系统生成的事实事件。
+		// 后缀要求非空，避免 "user." 自身成为无法区分用途的公共标记。
+		const userTraceKindPrefix = "user."
+		if !strings.HasPrefix(spec.EmitTrace.Kind, userTraceKindPrefix) ||
+			strings.TrimSpace(strings.TrimPrefix(spec.EmitTrace.Kind, userTraceKindPrefix)) == "" {
+			return nil, fmt.Errorf(
+				"emit_trace.kind must use the %q namespace with a non-empty name (got %q)",
+				userTraceKindPrefix, spec.EmitTrace.Kind,
+			)
+		}
 		return &emitTraceSinkImpl{
 			kind:    trace.EventKind(spec.EmitTrace.Kind),
 			emitter: deps.Emitter,

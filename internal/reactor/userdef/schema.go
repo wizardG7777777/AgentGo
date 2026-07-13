@@ -5,6 +5,7 @@
 //   - invoke_llm — 一次性 LLM 调用 + 三 sink 输出（write_file / send_message / emit_trace）
 //   - spawn_agent — 启动 ad-hoc agent（可含 via_translator 二次加工）
 //   - call — §6.1 B 选项：直接调用内置工具（v1 仅支持 send_message）
+//   - request_replan — 请求内置控制面重新评估事件所属 Plan
 //
 // 可选过滤维度：
 //   - when — §6.1.7 条件表达式（7 算子，无逻辑组合）
@@ -15,23 +16,36 @@ package userdef
 
 // ReactorConfig 是 reactors.yaml 中单个 reactor 条目的 YAML 解析结果。
 //
-// 四个动作字段（PublishTask / InvokeLLM / SpawnAgent / Call）互斥——loader 校验恰一非 nil。
+// 五个动作字段（PublishTask / InvokeLLM / SpawnAgent / Call / RequestReplan）
+// 互斥——loader 校验恰一非 nil。
 type ReactorConfig struct {
 	Name string `yaml:"name,omitempty" json:"name,omitempty"`
 	On   string `yaml:"on" json:"on"`                         // 必填，trace.EventKind 名称（如 "task_failed"）
 	When string `yaml:"when,omitempty" json:"when,omitempty"` // 可选条件表达式
 	Kind string `yaml:"kind,omitempty" json:"kind,omitempty"` // §6.2 per-kind 过滤：限定 source agent kind；空=全局
 
-	// 四个动作（均已真实实现，loader 校验恰一非 nil）
-	PublishTask *PublishTaskAction `yaml:"publish_task,omitempty" json:"publish_task,omitempty"`
-	InvokeLLM   *InvokeLLMAction   `yaml:"invoke_llm,omitempty" json:"invoke_llm,omitempty"`
-	SpawnAgent  *SpawnAgentAction  `yaml:"spawn_agent,omitempty" json:"spawn_agent,omitempty"`
+	// 五个动作（均已真实实现，loader 校验恰一非 nil）
+	PublishTask   *PublishTaskAction   `yaml:"publish_task,omitempty" json:"publish_task,omitempty"`
+	InvokeLLM     *InvokeLLMAction     `yaml:"invoke_llm,omitempty" json:"invoke_llm,omitempty"`
+	SpawnAgent    *SpawnAgentAction    `yaml:"spawn_agent,omitempty" json:"spawn_agent,omitempty"`
+	RequestReplan *RequestReplanAction `yaml:"request_replan,omitempty" json:"request_replan,omitempty"`
 
 	// Call 是 §6.1 B 选项：直接调用内置工具（无 LLM）。
 	// YAML 写法：`call: send_message` + `args: {to: ..., content: ...}`。
 	// v1 仅支持 send_message；其他工具会在 loader 阶段拒绝。
 	Call string            `yaml:"call,omitempty" json:"call,omitempty"`
 	Args map[string]string `yaml:"args,omitempty" json:"args,omitempty"`
+}
+
+// RequestReplanAction 是用户 Reactor 请求控制面重新评估 Plan 的唯一配置入口。
+//
+// YAML 只允许声明原因、紧急程度和可选详情。PlanID、PlanRevision、
+// ExecutionStateVersion、IdempotencyKey 等权威字段必须由 ReplanRequester 根据原始
+// trace.Event 和 PlanStore 状态生成，不能由 YAML 提供。
+type RequestReplanAction struct {
+	ReasonCode string `yaml:"reason_code" json:"reason_code"`
+	Urgency    string `yaml:"urgency" json:"urgency"` // normal / high
+	Detail     string `yaml:"detail,omitempty" json:"detail,omitempty"`
 }
 
 // PromptSpec 是三动词共享的 prompt 来源结构（§6.1.3）。
@@ -131,8 +145,9 @@ type SendMessageSink struct {
 
 // EmitTraceSink 发射一条 trace 事件。
 //
-// Kind 是事件标签，不强制为 trace 内置 EventKind——允许用户自定义标记
-// （但对应的 ${event.x} 路径仍按内置字段解析）。LLM 输出落入 ev.Description。
+// Kind 是用户自定义事件标签，必须使用 `user.` 前缀且前缀后有非空名称，
+// 从而不能伪造 task_completed / acceptance_completed 等系统事实事件。
+// 对应的 ${event.x} 路径仍按内置字段解析；LLM 输出落入 ev.Description。
 // 当前阶段：用户自定义 kind 不能被其他 reactor 通过 `on:` 订阅（on: 仍只接受内置
 // EventKind）。等"两遍 loader"实现后可解锁，详见 §6.1.4 末注释。
 type EmitTraceSink struct {

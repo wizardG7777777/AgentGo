@@ -50,6 +50,9 @@ func (f *fakeStore) RetryRollback(agentID, taskID, reason string) error {
 	return nil
 }
 func (f *fakeStore) AppendOutput(agentID, taskID, chunk string) error { return nil }
+func (f *fakeStore) RecordLastHistory(taskID string, history []byte) error {
+	return nil
+}
 
 func (f *fakeStore) QueryAvailable(eventType string) ([]*model.Task, error) {
 	return nil, nil

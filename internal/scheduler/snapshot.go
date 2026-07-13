@@ -3,6 +3,7 @@ package scheduler
 import (
 	"encoding/json"
 	"sort"
+	"strings"
 	"time"
 
 	"agentgo/internal/config"
@@ -11,6 +12,12 @@ import (
 	"agentgo/internal/probe"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
+)
+
+const (
+	maxReplanRequestSnapshots        = 16
+	maxReplanRequestDetailRunes      = 480
+	maxReplanRequestTotalDetailRunes = 4096
 )
 
 // boardSnapshot 是 scheduler agent 在每轮 reactLoop 看到的全局任务板 JSON 结构。
@@ -23,12 +30,81 @@ import (
 //   - 新字段一律 omitempty，旧测试在传 nil 数据源时仍能通过
 //   - 既有字段顺序不变，避免 LLM 看到的 schema 漂移
 type boardSnapshot struct {
-	Mode                   string                    `json:"mode"`
-	Trigger                triggerInfo               `json:"trigger"`
-	Tasks                  []taskSnapshot            `json:"tasks"`
-	Resources              resourceInfo              `json:"resources"`
-	SessionHistory         []sessionEntry            `json:"session_history,omitempty"`
+	Mode                   string                      `json:"mode"`
+	Trigger                triggerInfo                 `json:"trigger"`
+	Plan                   *planSnapshot               `json:"plan,omitempty"`
+	ResumablePlans         []resumablePlanSnapshot     `json:"resumable_plans,omitempty"`
+	Tasks                  []taskSnapshot              `json:"tasks"`
+	Resources              resourceInfo                `json:"resources"`
+	SessionHistory         []sessionEntry              `json:"session_history,omitempty"`
 	PendingDownstreamTasks []pendingDownstreamSnapshot `json:"pending_downstream_tasks,omitempty"`
+}
+
+type resumablePlanSnapshot struct {
+	ID            string `json:"id"`
+	Status        string `json:"status"`
+	PlanRevision  int64  `json:"plan_revision"`
+	PauseReason   string `json:"pause_reason"`
+	LastUpdatedAt string `json:"last_updated_at"`
+}
+
+type planSnapshot struct {
+	ID                     string                  `json:"id"`
+	Status                 string                  `json:"status"`
+	ExecutionMode          string                  `json:"execution_mode"`
+	ActiveControllerTaskID string                  `json:"active_controller_task_id"`
+	PlanRevision           int64                   `json:"plan_revision"`
+	ExecutionStateVersion  int64                   `json:"execution_state_version"`
+	HandledStateVersion    int64                   `json:"handled_state_version"`
+	GraphDigest            string                  `json:"graph_digest"`
+	AcceptanceSpecRevision int64                   `json:"acceptance_spec_revision"`
+	CurrentNodeIDs         []string                `json:"current_node_ids"`
+	CurrentNodes           []model.PlanNode        `json:"current_nodes,omitempty"`
+	PendingReplanCount     int                     `json:"pending_replan_count"`
+	PendingReplanRequests  []replanRequestSnapshot `json:"pending_replan_requests,omitempty"`
+	PendingReplanOmitted   int                     `json:"pending_replan_omitted,omitempty"`
+	Budget                 model.PlanBudget        `json:"budget"`
+	Usage                  model.BudgetUsage       `json:"usage"`
+	PauseReason            string                  `json:"pause_reason,omitempty"`
+	AcceptanceCriteria     []model.Criterion       `json:"acceptance_criteria,omitempty"`
+	LatestAcceptance       *acceptanceSnapshot     `json:"latest_acceptance,omitempty"`
+	Warnings               []model.PlanWarning     `json:"warnings,omitempty"`
+	RetiredNodes           []model.PlanNode        `json:"retired_nodes,omitempty"`
+}
+
+// replanRequestSnapshot exposes the decision-relevant part of a durable
+// ReplanRequest without copying unbounded event payloads into every Scheduler
+// prompt. The total request count and omitted count make truncation explicit.
+type replanRequestSnapshot struct {
+	RequestID            string `json:"request_id"`
+	Reason               string `json:"reason"`
+	Detail               string `json:"detail,omitempty"`
+	DetailTruncated      bool   `json:"detail_truncated,omitempty"`
+	SourceTaskID         string `json:"source_task_id,omitempty"`
+	SourceEvent          string `json:"source_event"`
+	ObservedRevision     int64  `json:"observed_revision"`
+	ObservedStateVersion int64  `json:"observed_state_version"`
+	Urgency              string `json:"urgency"`
+}
+
+// acceptanceSnapshot is the compact, authoritative acceptance fact visible to
+// Scheduler. Evidence is intentionally omitted from the hot board snapshot;
+// Scheduler can fetch it by ResultID through get_acceptance_evidence when a
+// decision needs the full payload.
+type acceptanceSnapshot struct {
+	RunID               string                  `json:"run_id"`
+	ResultID            string                  `json:"result_id,omitempty"`
+	RunStatus           string                  `json:"run_status"`
+	ResultStatus        string                  `json:"result_status,omitempty"`
+	Verdict             string                  `json:"verdict,omitempty"`
+	Reason              string                  `json:"reason,omitempty"`
+	Scope               string                  `json:"scope"`
+	TargetTaskIDs       []string                `json:"target_task_ids,omitempty"`
+	RunnerTaskID        string                  `json:"runner_task_id,omitempty"`
+	CriterionResults    []model.CriterionResult `json:"criterion_results,omitempty"`
+	FailureFingerprints []string                `json:"failure_fingerprints,omitempty"`
+	ResidualRisks       []string                `json:"residual_risks,omitempty"`
+	RecommendedActions  []string                `json:"recommended_actions,omitempty"`
 }
 
 // pendingDownstreamSnapshot 是 board snapshot 中"下游待处理任务"的一行。
@@ -104,9 +180,13 @@ type agentSnapshot struct {
 }
 
 type triggerInfo struct {
-	Type   string `json:"type"`
-	TaskID string `json:"task_id,omitempty"`
-	Text   string `json:"text,omitempty"`
+	Type                  string `json:"type"`
+	TaskID                string `json:"task_id,omitempty"`
+	Text                  string `json:"text,omitempty"`
+	Reasons               string `json:"reasons,omitempty"`
+	SourceTaskIDs         string `json:"source_task_ids,omitempty"`
+	Urgency               string `json:"urgency,omitempty"`
+	ExecutionStateVersion string `json:"execution_state_version,omitempty"`
 }
 
 type taskSnapshot struct {
@@ -168,7 +248,10 @@ type SnapshotSources struct {
 	// 非空时 BuildBoardJSON 会在 snapshot 中注入 "pending_downstream_tasks" 段，
 	// 提示 LLM 还有 reactor 触发的任务在运行。
 	// nil 或空时该段被 omitempty 省略。
-	PendingDownstreamTasks []PendingDownstreamTask
+	PendingDownstreamTasks  []PendingDownstreamTask
+	Plan                    *model.Plan
+	ResumablePlans          []model.Plan
+	CurrentControllerTaskID string
 }
 
 // PendingDownstreamTask 是下游待处理任务的描述信息。
@@ -201,11 +284,30 @@ func BuildBoardJSON(
 	trigger model.Event,
 	sources SnapshotSources,
 ) string {
-	tasks, _ := s.ScanAll()
+	allTasks, _ := s.ScanAll()
+	tasks := allTasks
+	if sources.Plan != nil {
+		current := make(map[string]bool, len(sources.Plan.CurrentNodeIDs))
+		for _, id := range sources.Plan.CurrentNodeIDs {
+			current[id] = true
+		}
+		tasks = tasks[:0]
+		for _, task := range allTasks {
+			isCurrentController := task.NodeRole == model.PlanNodeRoleController &&
+				(task.ID == sources.CurrentControllerTaskID || (sources.CurrentControllerTaskID == "" && task.ID == sources.Plan.RootTaskID))
+			if task.PlanID == sources.Plan.ID && (current[task.ID] || isCurrentController) {
+				tasks = append(tasks, task)
+			}
+		}
+	}
 
 	ti := triggerInfo{Type: string(trigger.Type), TaskID: trigger.TaskID}
 	if trigger.Payload != nil {
 		ti.Text = trigger.Payload["text"]
+		ti.Reasons = trigger.Payload["reasons"]
+		ti.SourceTaskIDs = trigger.Payload["source_task_ids"]
+		ti.Urgency = trigger.Payload["urgency"]
+		ti.ExecutionStateVersion = trigger.Payload["execution_state_version"]
 	}
 
 	var taskSnaps []taskSnapshot
@@ -239,7 +341,7 @@ func BuildBoardJSON(
 	}
 
 	busyWorkers := 0
-	for _, t := range tasks {
+	for _, t := range allTasks {
 		if t.Status == model.TaskStatusProcessing && t.EventType == "" {
 			busyWorkers += len(t.Agents)
 		}
@@ -258,10 +360,10 @@ func BuildBoardJSON(
 	available := max(workerCount-busyWorkers, 0)
 
 	// 构造 agents 列表（来自 mailbox.Registry + roster + store 的反向映射）
-	agents := buildAgentSnapshots(tasks, sources.MBRegistry, sources.Roster, sources.WorkerProfiles)
+	agents := buildAgentSnapshots(allTasks, sources.MBRegistry, sources.Roster, sources.WorkerProfiles)
 
 	// 构造特化代理聚合视图（来自 AgentRegistry 静态声明 + live task 扫描）
-	specialized := buildSpecializedAgentSnapshots(tasks, sources.AgentRegistry)
+	specialized := buildSpecializedAgentSnapshots(allTasks, sources.AgentRegistry)
 
 	// 构造代理能力声明（来自 AgentRegistry + Worker 能力声明）
 	agentCaps := buildAgentCapabilities(sources.AgentRegistry, sources.WorkerCapabilities, sources.WorkerCapabilitiesByProfile)
@@ -281,9 +383,9 @@ func BuildBoardJSON(
 	}
 
 	bs := boardSnapshot{
-		Mode:                   mode,
-		Trigger:                ti,
-		Tasks:                  taskSnaps,
+		Mode:    mode,
+		Trigger: ti,
+		Tasks:   taskSnaps,
 		Resources: resourceInfo{
 			WorkerCount:       workerCount,
 			BusyWorkers:       busyWorkers,
@@ -296,8 +398,202 @@ func BuildBoardJSON(
 		SessionHistory:         sessionEntries,
 		PendingDownstreamTasks: pendingDownstream,
 	}
+	for _, p := range sources.ResumablePlans {
+		if p.Status != model.PlanStatusPausedAwaitingDecision && p.Status != model.PlanStatusBlocked {
+			continue
+		}
+		bs.ResumablePlans = append(bs.ResumablePlans, resumablePlanSnapshot{
+			ID: p.ID, Status: string(p.Status), PlanRevision: p.CurrentRevision,
+			PauseReason: p.PauseReason, LastUpdatedAt: p.UpdatedAt.Format(time.RFC3339),
+		})
+	}
+	sort.Slice(bs.ResumablePlans, func(i, j int) bool { return bs.ResumablePlans[i].LastUpdatedAt > bs.ResumablePlans[j].LastUpdatedAt })
+	if sources.Plan != nil {
+		ps := &planSnapshot{
+			ID: sources.Plan.ID, Status: string(sources.Plan.Status), ExecutionMode: string(sources.Plan.ExecutionMode),
+			ActiveControllerTaskID: sources.Plan.ActiveDecisionTaskID,
+			PlanRevision:           sources.Plan.CurrentRevision, ExecutionStateVersion: sources.Plan.ExecutionStateVersion,
+			HandledStateVersion: sources.Plan.HandledStateVersion, GraphDigest: sources.Plan.CurrentGraphDigest,
+			AcceptanceSpecRevision: sources.Plan.CurrentAcceptanceSpecRevision,
+			CurrentNodeIDs:         append([]string(nil), sources.Plan.CurrentNodeIDs...),
+			PendingReplanCount:     len(sources.Plan.PendingReplanRequests), Budget: sources.Plan.Budget,
+			Usage: sources.Plan.Usage, PauseReason: sources.Plan.PauseReason,
+		}
+		ps.PendingReplanRequests, ps.PendingReplanOmitted = compactPendingReplanRequests(sources.Plan)
+		for _, taskID := range sources.Plan.CurrentNodeIDs {
+			if node, ok := sources.Plan.Nodes[taskID]; ok {
+				ps.CurrentNodes = append(ps.CurrentNodes, node)
+			}
+		}
+		if spec, ok := sources.Plan.AcceptanceSpecs[sources.Plan.CurrentAcceptanceSpecID]; ok {
+			ps.AcceptanceCriteria = append([]model.Criterion(nil), spec.Criteria...)
+		}
+		ps.LatestAcceptance = latestCurrentAcceptanceSnapshot(sources.Plan)
+		if len(sources.Plan.Warnings) > 8 {
+			ps.Warnings = append([]model.PlanWarning(nil), sources.Plan.Warnings[len(sources.Plan.Warnings)-8:]...)
+		} else {
+			ps.Warnings = append([]model.PlanWarning(nil), sources.Plan.Warnings...)
+		}
+		for _, node := range sources.Plan.Nodes {
+			if node.RetiredRevision > 0 {
+				ps.RetiredNodes = append(ps.RetiredNodes, node)
+			}
+		}
+		sort.Slice(ps.RetiredNodes, func(i, j int) bool { return ps.RetiredNodes[i].RetiredRevision > ps.RetiredNodes[j].RetiredRevision })
+		if len(ps.RetiredNodes) > 8 {
+			ps.RetiredNodes = ps.RetiredNodes[:8]
+		}
+		bs.Plan = ps
+	}
 	data, _ := json.MarshalIndent(bs, "", "  ")
 	return string(data)
+}
+
+func compactPendingReplanRequests(p *model.Plan) ([]replanRequestSnapshot, int) {
+	if p == nil || len(p.PendingReplanRequests) == 0 {
+		return nil, 0
+	}
+	requests := make([]model.ReplanRequest, 0, len(p.PendingReplanRequests))
+	for _, request := range p.PendingReplanRequests {
+		requests = append(requests, request)
+	}
+	sort.Slice(requests, func(i, j int) bool {
+		leftHigh := requests[i].Urgency == model.ReplanUrgencyHigh
+		rightHigh := requests[j].Urgency == model.ReplanUrgencyHigh
+		if leftHigh != rightHigh {
+			return leftHigh
+		}
+		if requests[i].ObservedStateVersion != requests[j].ObservedStateVersion {
+			return requests[i].ObservedStateVersion > requests[j].ObservedStateVersion
+		}
+		if !requests[i].CreatedAt.Equal(requests[j].CreatedAt) {
+			return requests[i].CreatedAt.After(requests[j].CreatedAt)
+		}
+		return requests[i].ID < requests[j].ID
+	})
+
+	limit := len(requests)
+	if limit > maxReplanRequestSnapshots {
+		limit = maxReplanRequestSnapshots
+	}
+	out := make([]replanRequestSnapshot, 0, limit)
+	remainingDetailRunes := maxReplanRequestTotalDetailRunes
+	for _, request := range requests[:limit] {
+		detail := strings.TrimSpace(request.Detail)
+		detailLimit := maxReplanRequestDetailRunes
+		if detailLimit > remainingDetailRunes {
+			detailLimit = remainingDetailRunes
+		}
+		compactedDetail, truncated := truncateSnapshotRunes(detail, detailLimit)
+		remainingDetailRunes -= len([]rune(compactedDetail))
+		out = append(out, replanRequestSnapshot{
+			RequestID: request.ID, Reason: request.ReasonCode,
+			Detail: compactedDetail, DetailTruncated: truncated,
+			SourceTaskID: request.SourceTaskID, SourceEvent: request.SourceEvent,
+			ObservedRevision: request.ObservedRevision, ObservedStateVersion: request.ObservedStateVersion,
+			Urgency: string(request.Urgency),
+		})
+	}
+	return out, len(requests) - limit
+}
+
+func truncateSnapshotRunes(value string, limit int) (string, bool) {
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value, false
+	}
+	if limit <= 0 {
+		return "", len(runes) > 0
+	}
+	if limit == 1 {
+		return "…", true
+	}
+	return string(runes[:limit-1]) + "…", true
+}
+
+func latestCurrentAcceptanceSnapshot(p *model.Plan) *acceptanceSnapshot {
+	if p == nil || p.CurrentAcceptanceSpecID == "" || p.CurrentAcceptanceSpecRevision == 0 {
+		return nil
+	}
+
+	var latest model.AcceptanceRun
+	found := false
+	for _, run := range p.AcceptanceRuns {
+		if run.PlanID != p.ID || run.SpecID != p.CurrentAcceptanceSpecID ||
+			run.SpecRevision != p.CurrentAcceptanceSpecRevision ||
+			run.TargetPlanRevision != p.CurrentRevision ||
+			run.TargetGraphDigest != p.CurrentGraphDigest || run.Status == "stale" {
+			continue
+		}
+		if run.ResultID != "" {
+			result, ok := p.AcceptanceResults[run.ResultID]
+			if !ok || result.PlanID != p.ID || result.RunID != run.ID ||
+				result.Status != model.AcceptanceResultValid {
+				continue
+			}
+		}
+		if !found || acceptanceRunLater(run, latest) {
+			latest = run
+			found = true
+		}
+	}
+	if !found {
+		return nil
+	}
+
+	snapshot := &acceptanceSnapshot{
+		RunID: latest.ID, ResultID: latest.ResultID, RunStatus: latest.Status,
+		Scope: string(latest.Scope), TargetTaskIDs: append([]string(nil), latest.TargetTaskIDs...),
+		RunnerTaskID: latest.RunnerTaskID,
+	}
+	if latest.ResultID == "" {
+		return snapshot
+	}
+	result := p.AcceptanceResults[latest.ResultID]
+	snapshot.ResultStatus = string(result.Status)
+	snapshot.Verdict = string(result.Verdict)
+	snapshot.Reason = result.Reason
+	snapshot.CriterionResults = append([]model.CriterionResult(nil), result.CriterionResults...)
+	snapshot.ResidualRisks = append([]string(nil), result.ResidualRisks...)
+	snapshot.RecommendedActions = append([]string(nil), result.RecommendedActions...)
+	snapshot.FailureFingerprints = acceptanceFailureFingerprints(result)
+	return snapshot
+}
+
+func acceptanceRunLater(candidate, current model.AcceptanceRun) bool {
+	candidateAt := candidate.CompletedAt
+	if candidateAt.IsZero() {
+		candidateAt = candidate.CreatedAt
+	}
+	currentAt := current.CompletedAt
+	if currentAt.IsZero() {
+		currentAt = current.CreatedAt
+	}
+	if !candidateAt.Equal(currentAt) {
+		return candidateAt.After(currentAt)
+	}
+	if !candidate.CreatedAt.Equal(current.CreatedAt) {
+		return candidate.CreatedAt.After(current.CreatedAt)
+	}
+	return candidate.ID > current.ID
+}
+
+func acceptanceFailureFingerprints(result model.AcceptanceResult) []string {
+	seen := make(map[string]bool)
+	if result.FailureFingerprint != "" {
+		seen[result.FailureFingerprint] = true
+	}
+	for _, criterion := range result.CriterionResults {
+		if criterion.FailureFingerprint != "" {
+			seen[criterion.FailureFingerprint] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for fingerprint := range seen {
+		out = append(out, fingerprint)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // buildAgentCapabilities 合并 AgentRegistry 中的特化代理 + Worker 的能力声明，

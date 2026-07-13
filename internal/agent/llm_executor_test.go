@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"agentgo/internal/llm"
@@ -362,7 +363,7 @@ func TestLLMExecutor_NoSystemPrompt_NoSystemMessage(t *testing.T) {
 	}
 }
 
-func TestLLMExecutor_ParallelToolExecution(t *testing.T) {
+func TestLLMExecutor_OrderedToolExecution(t *testing.T) {
 	mock := &mockLLMClient{
 		responses: []llm.Response{
 			{
@@ -408,6 +409,41 @@ func TestLLMExecutor_ParallelToolExecution(t *testing.T) {
 	}
 	if result.ToolResults[2].ToolCallID != "call_3" {
 		t.Errorf("ToolResults[2].ToolCallID = %q, want call_3", result.ToolResults[2].ToolCallID)
+	}
+}
+
+func TestLLMExecutor_RechecksGuardBetweenOrderedTools(t *testing.T) {
+	mock := &mockLLMClient{responses: []llm.Response{{ToolCalls: []llm.ToolCall{
+		{ID: "first", Name: "first"},
+		{ID: "second", Name: "second"},
+	}}}}
+	tools := NewToolRegistry()
+	paused := false
+	secondExecuted := false
+	tools.Register("first", "pause after first call", nil, func(context.Context, map[string]any) (string, error) {
+		paused = true
+		return "first completed", nil
+	})
+	tools.Register("second", "must be blocked", nil, func(context.Context, map[string]any) (string, error) {
+		secondExecuted = true
+		return "unexpected", nil
+	})
+	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "")
+	ctx := WithToolDispatchGuard(context.Background(), func(context.Context, *model.Task) error {
+		if paused {
+			return errors.New("plan paused")
+		}
+		return nil
+	})
+	result, err := executor(ctx, &model.Task{ID: "planned"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondExecuted {
+		t.Fatal("a later tool dispatched after the guard observed a paused Plan")
+	}
+	if len(result.ToolResults) != 2 || !strings.Contains(result.ToolResults[1].Content, "plan paused") {
+		t.Fatalf("guard rejection was not returned as the second tool result: %+v", result.ToolResults)
 	}
 }
 
@@ -477,5 +513,65 @@ func TestLLMExecutor_TaskEmptySystemPrompt_UsesDefault(t *testing.T) {
 	}
 	if msgs[0].Content != "默认提示" {
 		t.Errorf("msgs[0].Content = %q, want %q", msgs[0].Content, "默认提示")
+	}
+}
+
+func TestBuildMessagesInjectsTrustedPlanTaskContext(t *testing.T) {
+	tests := []struct {
+		name               string
+		task               *model.Task
+		wantUser           []string
+		wantSystemBoundary bool
+		forbidUser         []string
+	}{
+		{
+			name:               "planned non-controller",
+			task:               &model.Task{ID: "task-impl", Description: "do work", PlanID: "plan-1", NodeRole: model.PlanNodeRoleImplementation},
+			wantUser:           []string{"<task-context", "task_id: task-impl", "plan_id: plan-1", "node_role: implementation", "do not use publish_task", "use request_replan"},
+			wantSystemBoundary: true,
+		},
+		{
+			name:       "planned controller",
+			task:       &model.Task{ID: "controller-1", Description: "decide", PlanID: "plan-1", NodeRole: model.PlanNodeRoleController},
+			wantUser:   []string{"<task-context", "task_id: controller-1", "plan_id: plan-1", "node_role: controller", "scheduler_controller"},
+			forbidUser: []string{"do not use publish_task", "use request_replan"},
+		},
+		{
+			name:       "unplanned compatibility",
+			task:       &model.Task{ID: "legacy-1", Description: "legacy"},
+			wantUser:   []string{"<task-context", "task_id: legacy-1", "plan_id: none", "node_role: none", "unplanned_compatibility", "publish_task may be used"},
+			forbidUser: []string{"do not use publish_task", "use request_replan"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			messages := buildMessages("task-specific system prompt", tt.task, nil, nil, "")
+			var userContent string
+			var hasBoundary bool
+			for _, message := range messages {
+				if message.Role == "user" && userContent == "" {
+					userContent = message.Content
+				}
+				if message.Role == "system" && strings.Contains(message.Content, "动态 Plan 权限边界") {
+					hasBoundary = true
+				}
+			}
+			if hasBoundary != tt.wantSystemBoundary {
+				t.Fatalf("system boundary=%v, want %v; messages=%+v", hasBoundary, tt.wantSystemBoundary, messages)
+			}
+			for _, want := range tt.wantUser {
+				if !strings.Contains(userContent, want) {
+					t.Errorf("user task context missing %q: %s", want, userContent)
+				}
+			}
+			for _, forbidden := range tt.forbidUser {
+				if strings.Contains(userContent, forbidden) {
+					t.Errorf("user task context unexpectedly contains %q: %s", forbidden, userContent)
+				}
+			}
+			if contextIndex, descriptionIndex := strings.Index(userContent, "<task-context"), strings.Index(userContent, tt.task.Description); contextIndex < 0 || descriptionIndex < 0 || contextIndex > descriptionIndex {
+				t.Fatalf("trusted context must precede description: %s", userContent)
+			}
+		})
 	}
 }

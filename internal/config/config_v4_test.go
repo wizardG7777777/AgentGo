@@ -54,6 +54,47 @@ func TestLoadConfig_V4Sample(t *testing.T) {
 	}
 }
 
+func TestLoadConfigExampleIncludesRunnableAcceptanceVerifier(t *testing.T) {
+	repoRoot := filepath.Join("..", "..")
+	origDir, _ := os.Getwd()
+	if err := os.Chdir(repoRoot); err != nil {
+		t.Fatalf("Chdir(%q): %v", repoRoot, err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+	cfg, err := LoadConfig("config.example.yaml", true)
+	if err != nil {
+		t.Fatalf("LoadConfig(config.example.yaml): %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("config.example.yaml Validate: %v", err)
+	}
+	var verifier *AgentKind
+	for i := range cfg.Agents {
+		if cfg.Agents[i].EventType == "acceptance.verify" {
+			verifier = &cfg.Agents[i]
+			break
+		}
+	}
+	if verifier == nil {
+		t.Fatal("config.example.yaml lacks an acceptance.verify agent")
+	}
+	profile, err := cfg.ResolveProfile(verifier.Profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasSubmit := false
+	for _, tool := range profile {
+		if tool == "submit_acceptance_result" {
+			hasSubmit = true
+			break
+		}
+	}
+	if !hasSubmit {
+		t.Fatalf("acceptance verifier profile %q cannot submit formal results: %v", verifier.Profile, profile)
+	}
+}
+
 // TestValidate_RejectsBackslashPath 规则 9：v4 路径字段不允许反斜杠。
 func TestValidate_RejectsBackslashPath(t *testing.T) {
 	cfg := &Config{
@@ -137,7 +178,6 @@ func TestExpandEnv_EmptyKeyOnUnset(t *testing.T) {
 		t.Errorf("os.ExpandEnv 未按预期替换为空串: got %q", expanded)
 	}
 }
-
 
 // === §7 HashlineEnabled 配置测试 ===
 

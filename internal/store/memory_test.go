@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -49,6 +50,28 @@ func TestPublishAndGetTask(t *testing.T) {
 	}
 	if got.Description != "test task" {
 		t.Errorf("Description = %s, want 'test task'", got.Description)
+	}
+}
+
+func TestPublishTaskPreservesExplicitIdentityAndRejectsDuplicates(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	first := &model.Task{ID: "reserved-controller", Description: "first"}
+	if err := s.PublishTask(first); err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != "reserved-controller" {
+		t.Fatalf("explicit Task identity was rewritten: %s", first.ID)
+	}
+	duplicate := &model.Task{ID: first.ID, Description: "duplicate"}
+	if err := s.PublishTask(duplicate); !errors.Is(err, ErrTaskAlreadyExists) {
+		t.Fatalf("duplicate explicit identity error=%v, want ErrTaskAlreadyExists", err)
+	}
+	stored, err := s.GetTask(first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Description != "first" {
+		t.Fatalf("duplicate publication overwrote original Task: %+v", stored)
 	}
 }
 
@@ -356,6 +379,33 @@ func TestRetryRollback_Basic(t *testing.T) {
 		}
 	default:
 		t.Error("expected retry event")
+	}
+}
+
+func TestRecordLastHistoryCopiesInputAndReadSnapshots(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	task := publishTestTask(t, s, "durable history")
+	history := []byte(`[{"output":"tool evidence","tool_called":true}]`)
+	want := string(history)
+	if err := s.RecordLastHistory(task.ID, history); err != nil {
+		t.Fatal(err)
+	}
+
+	history[0] = 'X'
+	first, err := s.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first.LastHistory) != want {
+		t.Fatalf("caller mutation changed stored history: %s", first.LastHistory)
+	}
+	first.LastHistory[0] = 'Y'
+	second, err := s.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(second.LastHistory) != want {
+		t.Fatalf("read snapshot mutation changed stored history: %s", second.LastHistory)
 	}
 }
 

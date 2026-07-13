@@ -13,6 +13,7 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
+	"agentgo/internal/plan"
 	"agentgo/internal/store"
 	"agentgo/internal/tools/schema"
 )
@@ -38,6 +39,7 @@ type SchedulerGroup struct {
 	FinalizationNotifier FinalizationNotifier // 可选；非 nil 时 reportDone 成功后调 MarkTaskFinalized()
 	ProjectRoot          string               // 项目根目录，供 probe_directory 做路径校验
 	UserOutput           io.Writer            // 用户可见内容的输出目标；nil 时回退到 stdout
+	PlanCoordinator      *plan.Coordinator
 }
 
 // Register 把 cancel_task / report_done 注册到 r。
@@ -61,7 +63,7 @@ func (g SchedulerGroup) Register(r *agent.ToolRegistry) {
 		r.Register(
 			"report_done",
 			"向用户报告最终结果，表示当前请求处理完毕。"+
-				"调用前会校验 SchedulerBatch 中所有任务都已到终态；"+
+				"调用前会校验 SchedulerBatch；若已进入 DAG 或直接执行过写入/命令，还会要求 Plan 已正式终结；"+
 				"调用后会清空 SchedulerBatch 并打印事实校对块（task.Artifacts）。",
 			schema.Object().
 				String("summary", "给用户的最终汇总报告", true).
@@ -102,12 +104,57 @@ func (g SchedulerGroup) cancelTask(ctx context.Context, args map[string]any) (st
 		return "", fmt.Errorf("缺少 task_id 参数")
 	}
 	reason, _ := args["reason"].(string)
+	var currentPlan *model.Plan
+	var currentControllerID string
+	if g.PlanCoordinator != nil && g.Holder != nil {
+		currentID := g.Holder.Get()
+		currentTask, currentErr := g.Store.GetTask(currentID)
+		if currentErr != nil {
+			return "", fmt.Errorf("读取当前 scheduler 任务失败: %w", currentErr)
+		}
+		if currentTask.PlanID != "" {
+			currentControllerID = currentTask.ID
+			currentPlan, currentErr = g.PlanCoordinator.Store().GetPlan(currentTask.PlanID)
+			if currentErr != nil {
+				return "", fmt.Errorf("读取当前 Plan 失败: %w", currentErr)
+			}
+			if currentErr = validateActiveController(currentTask, currentPlan); currentErr != nil {
+				return "", currentErr
+			}
+			if currentPlan.Status != model.PlanStatusRunning {
+				return "", fmt.Errorf("cancel_task 被拒绝：Plan %s 当前为 %s", currentPlan.ID, currentPlan.Status)
+			}
+		}
+	}
+	target, targetErr := g.Store.GetTask(taskID)
+	if targetErr != nil {
+		return "", fmt.Errorf("读取待取消任务失败 (id=%s): %w", taskID, targetErr)
+	}
+	if currentPlan != nil && target.PlanID != currentPlan.ID {
+		return "", fmt.Errorf("cancel_task 被拒绝：任务 %s 不属于当前 Plan %s", taskID, currentPlan.ID)
+	}
 
-	// 尝试 pending→cancelled
-	err := store.TransitionStateWithCancelSource(g.Store, taskID, model.TaskStatusPending, model.TaskStatusCancelled, "scheduler")
-	if err != nil {
-		// 退而求其次：processing→cancelled
-		err = store.TransitionStateWithCancelSource(g.Store, taskID, model.TaskStatusProcessing, model.TaskStatusCancelled, "scheduler")
+	cancel := func() error {
+		// Re-read membership inside the controller lease. A controller switch
+		// cannot interleave between this check and the TaskStore transition.
+		latest, latestErr := g.Store.GetTask(taskID)
+		if latestErr != nil {
+			return latestErr
+		}
+		if currentPlan != nil && latest.PlanID != currentPlan.ID {
+			return fmt.Errorf("任务 %s 不属于当前 Plan %s", taskID, currentPlan.ID)
+		}
+		err := store.TransitionStateWithCancelSource(g.Store, taskID, model.TaskStatusPending, model.TaskStatusCancelled, "scheduler")
+		if err != nil {
+			err = store.TransitionStateWithCancelSource(g.Store, taskID, model.TaskStatusProcessing, model.TaskStatusCancelled, "scheduler")
+		}
+		return err
+	}
+	var err error
+	if currentPlan != nil {
+		err = g.PlanCoordinator.WithControllerLease(ctx, currentPlan.ID, currentControllerID, cancel)
+	} else {
+		err = cancel()
 	}
 	if err != nil {
 		return "", fmt.Errorf("取消任务失败 (id=%s): %w", taskID, err)
@@ -142,7 +189,9 @@ func (g SchedulerGroup) reportDone(ctx context.Context, args map[string]any) (st
 	}
 	batch := currentTask.SchedulerBatch
 
-	// 1. 硬性提前拦截：扫描 batch 是否全部到终态
+	// Check live work before changing the Plan terminal state. Otherwise an
+	// empty compatibility Plan with a pending legacy batch could be closed and
+	// only then have report_done rejected.
 	var pendingTasks []string
 	for _, id := range batch {
 		task, err := g.Store.GetTask(id)
@@ -163,6 +212,25 @@ func (g SchedulerGroup) reportDone(ctx context.Context, args map[string]any) (st
 			"report_done 被拒绝：以下任务尚未完成: %s。请等待所有任务到达终态后再调用 report_done",
 			strings.Join(pendingTasks, ", "),
 		)
+	}
+
+	if g.PlanCoordinator != nil && currentTask.PlanID != "" {
+		p, planErr := g.PlanCoordinator.Store().GetPlan(currentTask.PlanID)
+		if planErr != nil {
+			return "", fmt.Errorf("读取当前 Plan 失败: %w", planErr)
+		}
+		if authorityErr := validateActiveController(currentTask, p); authorityErr != nil {
+			return "", authorityErr
+		}
+		if !model.IsPlanTerminal(p.Status) {
+			if p.Status != model.PlanStatusRunning || reportNeedsFormalFinalization(g.Store, currentTask, p) {
+				return "", fmt.Errorf("report_done 被拒绝：Plan %s 尚未依据最新正式验收进入终态（status=%s）", p.ID, p.Status)
+			}
+			authorityCtx := plan.WithControllerAuthority(ctx, currentTask.ID)
+			if _, completeErr := g.PlanCoordinator.CompleteWithoutExecution(authorityCtx, p.ID); completeErr != nil {
+				return "", fmt.Errorf("结束只读 Plan 失败: %w", completeErr)
+			}
+		}
 	}
 
 	// 2. 事实校对：构造 artifacts 报告
@@ -212,6 +280,48 @@ func (g SchedulerGroup) reportDone(ctx context.Context, args map[string]any) (st
 	}
 
 	return "已向用户报告完成", nil
+}
+
+func validateActiveController(task *model.Task, p *model.Plan) error {
+	if task == nil || p == nil || task.NodeRole != model.PlanNodeRoleController ||
+		task.EventType != "__scheduler__" || task.ID != p.ActiveDecisionTaskID {
+		taskID := ""
+		if task != nil {
+			taskID = task.ID
+		}
+		planID := ""
+		activeID := ""
+		if p != nil {
+			planID = p.ID
+			activeID = p.ActiveDecisionTaskID
+		}
+		return fmt.Errorf("scheduler control operation requires active controller %s for plan %s (caller=%s)", activeID, planID, taskID)
+	}
+	return nil
+}
+
+func reportNeedsFormalFinalization(s store.TaskStore, task *model.Task, p *model.Plan) bool {
+	if p != nil && len(p.CurrentNodeIDs) > 0 {
+		return true
+	}
+	if task == nil {
+		return false
+	}
+	if len(task.Artifacts) > 0 {
+		return true
+	}
+	for _, toolName := range []string{"write_file", "edit_file", "run_shell"} {
+		records, err := s.QueryToolCalls(task.ID, toolName)
+		if err != nil {
+			continue
+		}
+		for _, record := range records {
+			if record.Success {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // reportProgress 是 report_progress 工具的实现。

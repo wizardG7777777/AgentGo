@@ -28,9 +28,23 @@ var AllToolNames = []string{
 	"publish_task",
 	"send_message",
 
+	// PlanControlGroup（是否可见由 profile/内置 Scheduler 装配决定）
+	"continue_waiting",
+	"define_acceptance_spec",
+	"ensure_acceptance_run",
+	"submit_acceptance_result",
+	"request_replan",
+	"supersede_tasks",
+	"finalize_plan",
+	"mark_plan_blocked",
+	"resolve_plan_pause",
+	"get_retired_node",
+	"get_acceptance_evidence",
+
 	// SchedulerGroup（scheduler 专属，不走 profile 配置）
 	"cancel_task",
 	"report_done",
+	"report_progress",
 	"probe_directory",
 }
 

@@ -1,22 +1,15 @@
 # Program-change verification reactors for config.program-upgrade-small.yaml.
 #
-# These reactors replace the old "AgentHook after worker finish" idea with the
-# current v5 trace.Event + Reactor path. They publish real verifier tasks instead
-# of sending mailbox notifications, so the work is routed through event_type=verify
-# and visible in trace/task history.
+# Planned DAGs already wake on every Task terminal fact. This sample therefore
+# demonstrates a project-specific, non-terminal trigger: repeated Worker retry
+# pressure asks Scheduler to inspect the graph early, without creating a Task.
 
 reactors:
-  - name: verify_worker_task_completion
-    on: task_completed
+  - name: review_worker_retry_pressure
+    on: task_retry
     kind: worker
-    when: "${event.task.depth} < 4"
-    publish_task:
-      kind: verifier
-      dependencies:
-        - "${event.task.id}"
-      description:
-        file: prompts/verify_program_worker.md
-        args:
-          worker_task_id: "${event.task.id}"
-          worker_agent: "${event.agent.id}"
-          source_event: "${event.kind}"
+    when: "${event.task.retry_count} >= 2"
+    request_replan:
+      reason_code: worker_retry_pressure
+      urgency: high
+      detail: "A Worker has retried repeatedly; inspect the current facts and decide whether the DAG needs a replacement or narrower task."

@@ -54,12 +54,18 @@ type BatchTracker interface {
 // 控制（`tool_profiles` / `agents[].tools`），故于 2026-04-26 一并移除——见 runner.go
 // 中 ToolRegistry 的 Filter 路径。
 type MetaGroup struct {
-	Store        store.TaskStore
-	Holder       TaskHolder
-	MaxDepth     int
-	MBRegistry   *mailbox.Registry
-	AgentID      string
-	BatchTracker BatchTracker
+	Store  store.TaskStore
+	Holder TaskHolder
+	// LineageHolder 只提供计划父节点身份，不启用 Worker 的深度限制。
+	// Scheduler 使用它把自己发布的 Task 关联到当前 Plan 根控制任务。
+	LineageHolder TaskHolder
+	MaxDepth      int
+	MBRegistry    *mailbox.Registry
+	AgentID       string
+	BatchTracker  BatchTracker
+	// PlanMutationSource 仅由内置装配注入。普通 Worker/Reactor 留空，
+	// 计划控制面据此拒绝它们绕过 Scheduler 直接改变 DAG。
+	PlanMutationSource string
 }
 
 // Register 把 publish_task / send_message 注册到 r。
@@ -72,6 +78,7 @@ func (g MetaGroup) Register(r *agent.ToolRegistry) {
 			schema.Object().
 				String("description", "任务的详细描述", true).
 				String("event_type", "任务类型，留空表示由 Worker 认领；填 \"explore\" 表示交给 Explorer 调查", false).
+				Enum("node_role", "DAG 节点角色；调查阶段用 investigation，实施用 implementation，验证用 verification", []string{"investigation", "implementation", "verification"}, false).
 				Enum("priority", "任务优先级，默认 normal", []string{"low", "normal", "high"}, false).
 				String("dependencies", "逗号分隔的依赖任务 UUID 列表。每个 ID 必须是之前 publish_task 调用返回的真实 task UUID（形如 7b52b232-4e9b-4b97-8bbc-f3d5927dc814），禁止使用占位符（如 \"task-part1\"、\"A\"、\"<id>\"）或自造 ID。若被依赖任务尚未发布，请先发布被依赖任务、从返回值中读取 id 之后再发布当前任务。留空表示无依赖", false).
 				String("expected_artifacts", "逗号分隔的预期产出文件路径列表（相对项目根的相对路径）。任务结束时系统会校验这些文件是否真的写入；缺失则任务失败重试。强烈建议为'报告/总结/文档'类任务填写此字段以防止 report-only 失败", false).
@@ -126,6 +133,13 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 			return "", fmt.Errorf("读取父任务失败: %w", err)
 		}
 		parentDepth = parentTask.Depth
+	} else if g.LineageHolder != nil {
+		// Scheduler 不受子任务深度限制，但仍必须留下真实父控制任务，
+		// 让 Store/PlanCoordinator 能可靠继承 PlanID。
+		parentID = g.LineageHolder.Get()
+		if parentID == "" {
+			return "", fmt.Errorf("无法获取当前计划上下文")
+		}
 	}
 
 	childDepth := parentDepth + 1
@@ -137,10 +151,14 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 	}
 
 	task := &model.Task{
-		Description: desc,
-		EventType:   eventType,
-		EventSource: parentID,
-		Depth:       childDepth,
+		Description:        desc,
+		EventType:          eventType,
+		EventSource:        parentID,
+		Depth:              childDepth,
+		PlanMutationSource: g.PlanMutationSource,
+	}
+	if role, _ := args["node_role"].(string); role != "" {
+		task.NodeRole = model.PlanNodeRole(role)
 	}
 
 	if prio, _ := args["priority"].(string); prio != "" {

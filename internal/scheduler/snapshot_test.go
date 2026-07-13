@@ -768,6 +768,77 @@ func TestBuildBoardJSON_BackwardCompat_AllToolsAvailable(t *testing.T) {
 	}
 }
 
+func TestBuildBoardJSON_PlanIncludesCurrentGraphAcceptanceAndBoundedWarnings(t *testing.T) {
+	s := store.NewMemoryTaskStore(make(chan model.Event, 8), 32, 1, 60)
+	task := &model.Task{ID: "work-1", PlanID: "plan-1", Description: "implement", NodeRole: model.PlanNodeRoleImplementation}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	criteria := []model.Criterion{{
+		ID: "tests", Description: "tests pass", Source: model.AcceptanceAuthorityUser,
+		Required: true, Scope: model.AcceptanceScopePlan, Check: "command_exit", Target: "go test ./...", Expected: "0",
+	}}
+	warnings := make([]model.PlanWarning, 10)
+	for i := range warnings {
+		warnings[i] = model.PlanWarning{Code: fmt.Sprintf("warning-%d", i)}
+	}
+	p := &model.Plan{
+		ID: "plan-1", ActiveDecisionTaskID: "controller-1", CurrentNodeIDs: []string{"work-1"},
+		Nodes: map[string]model.PlanNode{"work-1": {
+			TaskID: "work-1", Title: "implement", Role: model.PlanNodeRoleImplementation,
+		}},
+		CurrentAcceptanceSpecID: "spec-1", CurrentAcceptanceSpecRevision: 1,
+		AcceptanceSpecs: map[string]model.AcceptanceSpec{"spec-1": {ID: "spec-1", Revision: 1, Criteria: criteria}},
+		Warnings:        warnings,
+	}
+	raw := BuildBoardJSON(s, &config.Config{}, "plan", model.Event{}, SnapshotSources{Plan: p})
+	var got boardSnapshot
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Plan == nil || len(got.Plan.CurrentNodes) != 1 || got.Plan.CurrentNodes[0].TaskID != "work-1" {
+		t.Fatalf("current graph missing from snapshot: %+v", got.Plan)
+	}
+	if got.Plan.ActiveControllerTaskID != "controller-1" {
+		t.Fatalf("active controller identity missing from snapshot: %+v", got.Plan)
+	}
+	if len(got.Plan.AcceptanceCriteria) != 1 || got.Plan.AcceptanceCriteria[0].ID != "tests" {
+		t.Fatalf("acceptance criteria missing from snapshot: %+v", got.Plan)
+	}
+	if len(got.Plan.Warnings) != 8 || got.Plan.Warnings[0].Code != "warning-2" {
+		t.Fatalf("warnings are not bounded to the latest eight: %+v", got.Plan.Warnings)
+	}
+}
+
+func TestBuildBoardJSON_PlanIncludesOnlyCurrentController(t *testing.T) {
+	s := store.NewMemoryTaskStore(make(chan model.Event, 8), 32, 1, 60)
+	oldController := &model.Task{
+		PlanID: "plan-1", Description: "old controller context", EventType: "__scheduler__",
+		NodeRole: model.PlanNodeRoleController,
+	}
+	currentController := &model.Task{
+		PlanID: "plan-1", Description: "current controller context", EventType: "__scheduler__",
+		NodeRole: model.PlanNodeRoleController,
+	}
+	if err := s.PublishTask(oldController); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PublishTask(currentController); err != nil {
+		t.Fatal(err)
+	}
+	p := &model.Plan{ID: "plan-1", RootTaskID: oldController.ID, Nodes: map[string]model.PlanNode{}}
+	raw := BuildBoardJSON(s, &config.Config{}, "plan", model.Event{}, SnapshotSources{
+		Plan: p, CurrentControllerTaskID: currentController.ID,
+	})
+	var got boardSnapshot
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Tasks) != 1 || got.Tasks[0].ID != currentController.ID {
+		t.Fatalf("snapshot leaked old controller context: %+v", got.Tasks)
+	}
+}
+
 // Feature: per-worker-tool-profiles, Property: per-profile agent_capabilities output correctness
 // **Validates: Requirements 3.2**
 //
@@ -971,4 +1042,3 @@ func TestBuildBoardJSON_BackwardCompat_NoProfileFields(t *testing.T) {
 		t.Errorf("explorer agent_capabilities has profile=%q, want empty", eCap.Profile)
 	}
 }
-

@@ -34,6 +34,15 @@ func TestSchedulerSystemPrompt_AgentCapabilitiesFieldDescription(t *testing.T) {
 	}
 }
 
+func TestSchedulerSystemPromptUsesRegisteredLocalReadToolNames(t *testing.T) {
+	if strings.Contains(schedulerSystemPrompt, "list_files") {
+		t.Fatal("schedulerSystemPrompt references unregistered list_files instead of list_dir")
+	}
+	if !strings.Contains(schedulerSystemPrompt, "list_dir") {
+		t.Fatal("schedulerSystemPrompt must expose the registered list_dir tool")
+	}
+}
+
 // TestSchedulerSystemPrompt_CapabilitiesRoutingGuidance verifies that the prompt
 // contains capabilities-based routing guidance in the "路由指引" section.
 // Validates: Requirements 9.2, 9.3
@@ -49,8 +58,11 @@ func TestSchedulerSystemPrompt_CapabilitiesRoutingGuidance(t *testing.T) {
 	if !strings.Contains(prompt, "优先匹配能力") {
 		t.Error("schedulerSystemPrompt should contain guidance to prefer capability-matching agents")
 	}
-	if !strings.Contains(prompt, "优先选择 capabilities 包含该能力的代理类型") {
-		t.Error("schedulerSystemPrompt should instruct to prefer agents with matching capabilities")
+	if !strings.Contains(prompt, "capabilities 当前列出真实工具名") || !strings.Contains(prompt, "run_shell") {
+		t.Error("schedulerSystemPrompt should route against actual registered tool names")
+	}
+	if !strings.Contains(prompt, "同时包含 submit_acceptance_result 和所需检查工具") {
+		t.Error("schedulerSystemPrompt should preserve the formal acceptance runner capability boundary")
 	}
 
 	// R9.3: guidance to avoid routing to agents lacking required capabilities
@@ -81,9 +93,10 @@ func TestSchedulerSystemPrompt_OnlyRouteToExistingAgentTypes(t *testing.T) {
 		t.Error("schedulerSystemPrompt should instruct to check event_type before publishing")
 	}
 
-	// R10.3: instruct to call report_done when no matching agent exists
-	if !strings.Contains(prompt, "report_done") {
-		t.Error("schedulerSystemPrompt should mention report_done for when no matching agent exists")
+	// R10.3: explain the missing capability directly instead of publishing an
+	// unclaimable task.
+	if !strings.Contains(prompt, "自然语言向用户说明无法完成的原因") {
+		t.Error("schedulerSystemPrompt should explain missing capabilities directly")
 	}
 	if !strings.Contains(prompt, "无匹配时不发布") {
 		t.Error("schedulerSystemPrompt should instruct not to publish when no matching agent type exists")
@@ -102,7 +115,7 @@ func TestSchedulerSystemPrompt_OnlyRouteToExistingAgentTypes(t *testing.T) {
 // TestSchedulerSystemPrompt_UnavailableToolsGuidance verifies that the
 // schedulerSystemPrompt contains "unavailable_tools" guidance in the
 // "你能看见什么" section, instructing the Scheduler to avoid assigning tasks
-// that depend on unavailable tools and to suggest alternatives via report_done.
+// that depend on unavailable tools and to suggest alternatives directly.
 // Validates: Requirements 4.4
 func TestSchedulerSystemPrompt_UnavailableToolsGuidance(t *testing.T) {
 	prompt := schedulerSystemPrompt
@@ -130,9 +143,9 @@ func TestSchedulerSystemPrompt_UnavailableToolsGuidance(t *testing.T) {
 		t.Error("unavailable_tools guidance should mention web_fetch as an example")
 	}
 
-	// Verify guidance to suggest alternatives via report_done
-	if !strings.Contains(sectionText, "report_done") {
-		t.Error("unavailable_tools guidance should instruct to use report_done for suggesting alternatives")
+	// Verify guidance to explain alternatives in natural language.
+	if !strings.Contains(sectionText, "自然语言说明") {
+		t.Error("unavailable_tools guidance should instruct direct natural-language explanation")
 	}
 }
 
@@ -144,12 +157,12 @@ func TestSchedulerSystemPrompt_UnavailableToolsGuidance(t *testing.T) {
 // P0-1 "Scheduler publish_task 完全串行发布" 缺陷：在修复完成前它应保持红灯。
 // 如果 CI 报此测试失败，**不是回归**，这是提醒 bug 还没修。修复路径：
 // 改写 scheduler.go 第 243 行附近的"publish_task 是单次调用工具，一次只能发布
-// 一个任务"陈述，明确说"每次调用创建一个任务；同一 reactLoop 内可并行多次
-// 调用"，再补一个**纯独立无依赖**任务并行发布的示例（与现有"3 探索 + 1 汇总"
+// 一个任务"陈述，明确说"每次调用创建一个任务；同一 reactLoop 内可按顺序多次
+// 调用，独立 Task 随后并行执行"，再补一个**纯独立无依赖**任务批量登记的示例（与现有"3 探索 + 1 汇总"
 // 的依赖聚合示例形成对照）。
 //
-// ContainsParallelIndependentPublishGuidance 当前是绿的（现有 prompt 已覆盖），
-// 作为回归锁防止修改时误删并行指引。
+// ContainsParallelIndependentExecutionGuidance 当前是绿的（现有 prompt 已覆盖），
+// 作为回归锁防止修改时误删并行执行指引。
 //
 // ❌ 错误处理：删除断言 / 改 Skip / 弱化误导句子列表 —— 这样会掩盖 bug 信号
 // ✅ 正确处理：修 scheduler.go 中的 schedulerSystemPrompt，此处自动变绿
@@ -157,7 +170,8 @@ func TestSchedulerSystemPrompt_UnavailableToolsGuidance(t *testing.T) {
 // 背景（bug 现象）：2026-04-20 并发测试中 scheduler 把 3 个完全独立的子任务按 loop
 // 0/1/2 串行发布（每 loop 只 publish 一个并等完），wall-clock 从预期 ~30s 拖到
 // 14.5 min，所有并发场景事实上无法被测试触发。根因是 prompt 中"一次只能发布
-// 一个任务"这句权威陈述与 llm_executor 的并行 tool call 能力矛盾，误导了 LLM。
+// 一个任务"这句权威陈述误导了 LLM。工具调用本身按模型顺序登记，但同轮创建的
+// 独立 Task 会由多个 Runner 并行执行。
 //
 // 该问题已修复；历史记录见 docs/archived/。
 // ================================================================
@@ -174,32 +188,30 @@ func TestSchedulerSystemPrompt_DoesNotClaimSingleTaskPerLoop(t *testing.T) {
 	}
 	for _, phrase := range misleading {
 		if strings.Contains(prompt, phrase) {
-			t.Errorf("prompt 含误导性陈述 %q —— 该陈述与 llm_executor.go 并行 tool call 能力矛盾，"+
+			t.Errorf("prompt 含误导性陈述 %q —— 该陈述会阻止同轮登记多个独立 Task，"+
 				"会诱导 LLM 把独立任务串行化。见 2026-04-20 历史问题记录 P0-1", phrase)
 		}
 	}
 }
 
-// TestSchedulerSystemPrompt_ContainsParallelIndependentPublishGuidance 断言 prompt
-// 明确指引"无依赖的独立任务应在同一轮 reactLoop 中并行 publish_task"。
-// 当前 prompt 只有"3 独立探索 + 1 汇总"这种含聚合的示例，缺少**纯独立**批量并行例子。
-func TestSchedulerSystemPrompt_ContainsParallelIndependentPublishGuidance(t *testing.T) {
+// TestSchedulerSystemPrompt_ContainsParallelIndependentExecutionGuidance 断言 prompt
+// 明确指引"同轮按顺序登记无依赖 Task，登记后由 Runner 并行执行"。
+func TestSchedulerSystemPrompt_ContainsParallelIndependentExecutionGuidance(t *testing.T) {
 	prompt := schedulerSystemPrompt
-	// 必须同时出现以下两类关键词，才算覆盖"独立任务并行"这一场景：
+	// 必须同时出现以下两类关键词，才算覆盖"同轮登记、独立执行"这一场景：
 	//   - 关系描述："无依赖" / "相互独立" / "独立任务"
-	//   - 模式描述："同一轮" / "同一 reactLoop" / "同时调用 publish_task"
+	//   - 模式描述："同一轮" / "同一 reactLoop"
 	hasIndependence := strings.Contains(prompt, "无依赖") ||
 		strings.Contains(prompt, "相互独立") ||
 		strings.Contains(prompt, "独立任务")
 	hasParallelism := strings.Contains(prompt, "同一轮") ||
 		strings.Contains(prompt, "同一个 reactLoop") ||
-		strings.Contains(prompt, "同一 reactLoop") ||
-		strings.Contains(prompt, "同时调用 publish_task")
+		strings.Contains(prompt, "同一 reactLoop")
 
 	if !hasIndependence || !hasParallelism {
-		t.Errorf("prompt 缺少独立任务并行发布的明确指引（独立关键词=%v, 并行关键词=%v）—— "+
+		t.Errorf("prompt 缺少同轮登记并并行执行独立任务的明确指引（独立关键词=%v, 同轮关键词=%v）—— "+
 			"2026-04-20 测试暴露 scheduler 把独立任务串行化，需在 prompt 中加入"+
-			"明确的'无依赖任务应同轮并行 publish_task'示例。见历史问题记录 P0-1",
+			"明确的'无依赖任务同轮登记、随后并行执行'示例。见历史问题记录 P0-1",
 			hasIndependence, hasParallelism)
 	}
 }

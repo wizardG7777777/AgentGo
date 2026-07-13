@@ -14,6 +14,7 @@ package runner
 //	| publish_task | + Store + TaskHolder + MaxSubtaskDepth |
 //	| send_message | + mailbox.Registry + MailChainMaxDepth（常量）|
 //	| web_search / web_fetch | + webtool.SearchProvider |
+//	| request_replan / acceptance tools | + PlanCoordinator + Store + TaskHolder |
 //
 // 实际注册由 resolveToolGroups 完成——它按 RunnerDeps 构造全部 ToolGroup，
 // 再由 ToolRegistry 的 allowlist 自动剪枝。 unauthorized 工具根本不进 ToolRegistry。
@@ -63,6 +64,12 @@ func resolveToolGroups(
 			MaxDepth:   deps.MaxSubtaskDepth,
 			MBRegistry: deps.MBRegistry,
 			AgentID:    instanceID,
+		},
+		tools.PlanControlGroup{
+			Coordinator: deps.PlanCoordinator,
+			Store:       deps.Store,
+			Holder:      holder,
+			AgentID:     instanceID,
 		},
 	}
 }

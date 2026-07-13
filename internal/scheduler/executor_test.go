@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -9,7 +10,9 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
+	"agentgo/internal/llm"
 	"agentgo/internal/model"
+	"agentgo/internal/plan"
 	"agentgo/internal/probe"
 	"agentgo/internal/store"
 )
@@ -27,6 +30,559 @@ func makeInnerExecutor(callCount *int32, capturedHistory *[]agent.HistoryEntry) 
 			Output:     "ok",
 			ToolCalled: false,
 		}, nil
+	}
+}
+
+type toolDefCaptureClient struct {
+	calls        int
+	toolDefsSeen int
+	response     llm.Response
+}
+
+func (c *toolDefCaptureClient) Chat(_ context.Context, _ []llm.Message, tools []llm.ToolDef) (llm.Response, error) {
+	c.calls++
+	c.toolDefsSeen = len(tools)
+	return c.response, nil
+}
+
+func TestSchedulerExecutorBlocksLaterToolWhenControllerCancelledInSameResponse(t *testing.T) {
+	taskStore := store.NewMemoryTaskStore(nil, 32, 1, 60)
+	root := &model.Task{Description: "planned scheduler", EventType: "__scheduler__"}
+	if err := taskStore.PublishTask(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskStore.ClaimTask("scheduler-1", root.ID); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+	if _, err := coordinator.Create(context.Background(), plan.CreateInput{PlanID: root.PlanID, RootTaskID: root.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	var secondSideEffect int32
+	toolReg := agent.NewToolRegistry()
+	toolReg.Register("cancel_controller", "cancel current controller", nil, func(context.Context, map[string]any) (string, error) {
+		err := store.TransitionStateWithCancelSource(
+			taskStore, root.ID, model.TaskStatusProcessing, model.TaskStatusCancelled, "scheduler",
+		)
+		return "cancelled", err
+	})
+	toolReg.Register("second_side_effect", "must be blocked", nil, func(context.Context, map[string]any) (string, error) {
+		atomic.AddInt32(&secondSideEffect, 1)
+		return "ran", nil
+	})
+	client := &scriptedLLM{responses: []llm.Response{{
+		ToolCalls: []llm.ToolCall{
+			{ID: "cancel-first", Name: "cancel_controller", Arguments: map[string]any{}},
+			{ID: "side-effect-second", Name: "second_side_effect", Arguments: map[string]any{}},
+		},
+		FinishReason: llm.FinishReasonToolCalls,
+	}}}
+	exec := &SchedulerExecutor{
+		Inner: agent.NewLLMExecutor(client, toolReg, nil, taskStore, nil, ""),
+		Store: taskStore, Cfg: config.DefaultConfig(), PlanCoordinator: coordinator,
+	}
+
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := exec.requireToolDispatchPlan(cancelledCtx, root); !errors.Is(err, agent.ErrExecutionSuspended) ||
+		!strings.Contains(err.Error(), "context is no longer active") {
+		t.Fatalf("cancelled dispatch context err=%v, want execution suspension", err)
+	}
+
+	result, err := exec.Execute(context.Background(), root, nil, nil)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if atomic.LoadInt32(&secondSideEffect) != 0 {
+		t.Fatal("second Scheduler side effect ran after the controller Task was cancelled")
+	}
+	if len(result.ToolResults) != 2 || !strings.Contains(result.ToolResults[1].Content, "not processing") {
+		t.Fatalf("second tool did not receive durable controller lease rejection: %+v", result.ToolResults)
+	}
+}
+
+func TestPlanSignalTriggerPayloadIsBounded(t *testing.T) {
+	var reasons, sources []string
+	for i := 0; i < 40; i++ {
+		reasons = append(reasons, strings.Repeat("r", 1024))
+		sources = append(sources, strings.Repeat("s", 1024))
+	}
+	payload := planSignalTriggerPayload("plan-1", &model.PlanSignal{
+		Reasons: reasons, SourceTaskIDs: sources, Urgency: model.ReplanUrgencyHigh,
+		LatestExecutionStateVersion: 99,
+	})
+	if payload["reason_count"] != "40" || payload["source_task_id_count"] != "40" ||
+		payload["reasons_omitted"] != "24" || payload["source_task_ids_omitted"] != "24" ||
+		payload["values_truncated"] != "true" {
+		t.Fatalf("bounded trigger metadata is incomplete: %+v", payload)
+	}
+	if len(payload["reasons"]) > maxPlanSignalTriggerItems*(maxPlanSignalTriggerItemRunes+4) ||
+		len(payload["source_task_ids"]) > maxPlanSignalTriggerItems*(maxPlanSignalTriggerItemRunes+4) {
+		t.Fatalf("bounded trigger leaked the unbounded request set: reasons=%d sources=%d",
+			len(payload["reasons"]), len(payload["source_task_ids"]))
+	}
+}
+
+func TestSchedulerControllerWorkspaceMutationIsFrozenByCurrentAcceptance(t *testing.T) {
+	newFixture := func(t *testing.T, submitPass bool) (*store.MemoryTaskStore, *plan.Coordinator, *model.Task) {
+		t.Helper()
+		taskStore := store.NewMemoryTaskStore(nil, 32, 1, 60)
+		root := &model.Task{Description: "planned scheduler", EventType: "__scheduler__"}
+		if err := taskStore.PublishTask(root); err != nil {
+			t.Fatal(err)
+		}
+		if err := taskStore.ClaimTask("scheduler-1", root.ID); err != nil {
+			t.Fatal(err)
+		}
+		coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+		if _, err := coordinator.Create(context.Background(), plan.CreateInput{PlanID: root.PlanID, RootTaskID: root.ID}); err != nil {
+			t.Fatal(err)
+		}
+		work := &model.Task{ID: "completed-work", Description: "implemented", PlanID: root.PlanID, NodeRole: model.PlanNodeRoleImplementation}
+		if err := taskStore.PublishTask(work); err != nil {
+			t.Fatal(err)
+		}
+		if err := taskStore.ClaimTask("worker", work.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := taskStore.SubmitResult("worker", work.ID, "done"); err != nil {
+			t.Fatal(err)
+		}
+		p, err := coordinator.RegisterTask(context.Background(), plan.RegisterTaskInput{
+			PlanID: root.PlanID, ObservedRevision: 0,
+			Node: model.PlanNode{TaskID: work.ID, Title: work.Description, Status: model.TaskStatusCompleted, Role: model.PlanNodeRoleImplementation},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := coordinator.DefineAcceptanceSpec(context.Background(), p.ID, model.AcceptanceSpec{
+			CreatedBy: "scheduler",
+			Criteria: []model.Criterion{{
+				ID: "goal", Description: "goal satisfied", Source: model.AcceptanceAuthorityScheduler,
+				Required: true, Scope: model.AcceptanceScopePlan, Check: "evidence", Expected: "pass",
+			}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		run, _, err := coordinator.EnsureAcceptanceRun(context.Background(), plan.EnsureAcceptanceRunInput{
+			PlanID: p.ID, Scope: model.AcceptanceScopePlan,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if submitPass {
+			if _, _, err := coordinator.SubmitAcceptanceResult(context.Background(), model.AcceptanceResult{
+				RunID: run.ID, PlanID: p.ID, Verdict: model.AcceptanceVerdictPass,
+				CriterionResults: []model.CriterionResult{{
+					CriterionID: "goal", Verdict: model.AcceptanceVerdictPass, EvidenceIDs: []string{"ev-goal"},
+				}},
+				Evidence: []model.Evidence{{
+					ID: "ev-goal", Kind: "report", Output: "verified", RecordedAt: run.CreatedAt.Add(time.Millisecond),
+				}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return taskStore, coordinator, root
+	}
+
+	t.Run("running acceptance blocks controller write", func(t *testing.T) {
+		taskStore, coordinator, root := newFixture(t, false)
+		var writes int32
+		registry := agent.NewToolRegistry()
+		registry.Register("write_file", "mutate workspace", nil, func(context.Context, map[string]any) (string, error) {
+			atomic.AddInt32(&writes, 1)
+			return "written", nil
+		})
+		client := &scriptedLLM{responses: []llm.Response{{
+			ToolCalls:    []llm.ToolCall{{ID: "write", Name: "write_file", Arguments: map[string]any{}}},
+			FinishReason: llm.FinishReasonToolCalls,
+		}}}
+		exec := &SchedulerExecutor{
+			Inner: agent.NewLLMExecutor(client, registry, nil, taskStore, nil, ""),
+			Store: taskStore, Cfg: config.DefaultConfig(), PlanCoordinator: coordinator,
+		}
+		result, err := exec.Execute(context.Background(), root, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if atomic.LoadInt32(&writes) != 0 || len(result.ToolResults) != 1 ||
+			!strings.Contains(result.ToolResults[0].Content, "workspace mutation is frozen") {
+			t.Fatalf("running acceptance did not freeze controller write: writes=%d results=%+v", writes, result.ToolResults)
+		}
+	})
+
+	t.Run("current pass blocks write before finalize in the same response", func(t *testing.T) {
+		taskStore, coordinator, root := newFixture(t, true)
+		var writes int32
+		registry := agent.NewToolRegistry()
+		registry.Register("write_file", "mutate workspace", nil, func(context.Context, map[string]any) (string, error) {
+			atomic.AddInt32(&writes, 1)
+			return "written", nil
+		})
+		registry.Register("finalize_plan", "finalize", nil, func(ctx context.Context, _ map[string]any) (string, error) {
+			_, err := coordinator.Finalize(plan.WithControllerAuthority(ctx, root.ID), root.PlanID, model.AcceptanceVerdictPass)
+			return "finalized", err
+		})
+		client := &scriptedLLM{responses: []llm.Response{{
+			ToolCalls: []llm.ToolCall{
+				{ID: "write", Name: "write_file", Arguments: map[string]any{}},
+				{ID: "finalize", Name: "finalize_plan", Arguments: map[string]any{}},
+			},
+			FinishReason: llm.FinishReasonToolCalls,
+		}}}
+		exec := &SchedulerExecutor{
+			Inner: agent.NewLLMExecutor(client, registry, nil, taskStore, nil, ""),
+			Store: taskStore, Cfg: config.DefaultConfig(), PlanCoordinator: coordinator,
+		}
+		result, err := exec.Execute(context.Background(), root, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		final, err := coordinator.Store().GetPlan(root.PlanID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if atomic.LoadInt32(&writes) != 0 || final.Status != model.PlanStatusPassed ||
+			len(result.ToolResults) != 2 || !strings.Contains(result.ToolResults[0].Content, "workspace mutation is frozen") ||
+			strings.HasPrefix(result.ToolResults[1].Content, "错误:") {
+			t.Fatalf("PASS freeze/finalize boundary failed: writes=%d plan=%s results=%+v", writes, final.Status, result.ToolResults)
+		}
+	})
+}
+
+func TestSchedulerExecutorRechecksPlanAfterSignalWaitBeforeInner(t *testing.T) {
+	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 16), 32, 1, 60)
+	root := &model.Task{Description: "scheduler root", EventType: "__scheduler__"}
+	if err := taskStore.PublishTask(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskStore.ClaimTask("scheduler-1", root.ID); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+	if _, err := coordinator.Create(context.Background(), plan.CreateInput{PlanID: root.PlanID, RootTaskID: root.ID}); err != nil {
+		t.Fatal(err)
+	}
+	child := &model.Task{Description: "still running", PlanID: root.PlanID}
+	if err := taskStore.PublishTask(child); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskStore.ClaimTask("worker-1", child.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.RegisterTask(context.Background(), plan.RegisterTaskInput{
+		PlanID: root.PlanID, ObservedRevision: 0,
+		Node: model.PlanNode{TaskID: child.ID, Title: child.Description, Status: model.TaskStatusProcessing},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var innerCalls int32
+	var captured []agent.HistoryEntry
+	exec := &SchedulerExecutor{
+		Inner: makeInnerExecutor(&innerCalls, &captured), Store: taskStore,
+		Cfg: config.DefaultConfig(), PlanCoordinator: coordinator,
+		WaitTimeout: time.Second,
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := exec.Execute(context.Background(), root, nil, nil)
+		result <- err
+	}()
+
+	if _, err := coordinator.MarkBlocked(context.Background(), root.PlanID, "awaiting user decision"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, agent.ErrExecutionSuspended) {
+			t.Fatalf("Execute err=%v, want ErrExecutionSuspended", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Scheduler Execute did not leave signal wait after Plan was blocked")
+	}
+	if got := atomic.LoadInt32(&innerCalls); got != 0 {
+		t.Fatalf("Scheduler inner LLM/tool executor called %d times after hard block", got)
+	}
+}
+
+func TestSchedulerExecutorChecksWallBudgetWhileWaitingForPlanSignal(t *testing.T) {
+	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 16), 32, 1, 60)
+	root := &model.Task{Description: "scheduler root", EventType: "__scheduler__"}
+	if err := taskStore.PublishTask(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskStore.ClaimTask("scheduler-1", root.ID); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+	if _, err := coordinator.Create(context.Background(), plan.CreateInput{
+		PlanID: root.PlanID, RootTaskID: root.ID,
+		Budget: model.PlanBudget{MaxWallTime: time.Second}, CreatedAt: time.Now().UTC().Add(-900 * time.Millisecond),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Consume the deterministic 80% warning first. The Execute call below then
+	// proves that a Scheduler still waiting after handling that warning is
+	// suspended when the hard wall-time boundary arrives.
+	warned, err := coordinator.CheckBudget(context.Background(), root.PlanID)
+	if err != nil || warned.Status != model.PlanStatusRunning {
+		t.Fatalf("prepare soft wall warning: plan=%+v err=%v", warned, err)
+	}
+	warningSignal, ok, err := coordinator.TrySignal(root.PlanID)
+	if err != nil || !ok {
+		t.Fatalf("soft wall warning signal=%+v ok=%v err=%v", warningSignal, ok, err)
+	}
+	if err := coordinator.AcknowledgeDecision(
+		context.Background(), root.PlanID, warningSignal.LatestExecutionStateVersion,
+		model.PlanDecisionContinueWaiting, "test handled soft wall warning",
+	); err != nil {
+		t.Fatal(err)
+	}
+	child := &model.Task{Description: "still pending", PlanID: root.PlanID}
+	if err := taskStore.PublishTask(child); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.RegisterTask(context.Background(), plan.RegisterTaskInput{
+		PlanID: root.PlanID, ObservedRevision: 0,
+		Node: model.PlanNode{TaskID: child.ID, Title: child.Description, Status: model.TaskStatusPending},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var innerCalls int32
+	exec := &SchedulerExecutor{
+		Inner: func(context.Context, *model.Task, map[string]string, []agent.HistoryEntry) (agent.ExecuteResult, error) {
+			atomic.AddInt32(&innerCalls, 1)
+			return agent.ExecuteResult{}, nil
+		},
+		Store: taskStore, Cfg: config.DefaultConfig(), PlanCoordinator: coordinator,
+		WaitTimeout: 5 * time.Millisecond,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = exec.Execute(ctx, root, nil, nil)
+	if !errors.Is(err, agent.ErrExecutionSuspended) {
+		t.Fatalf("Execute err=%v, want wall-budget suspension", err)
+	}
+	if got := atomic.LoadInt32(&innerCalls); got != 0 {
+		t.Fatalf("inner LLM/tool executor called %d times after wall budget expiry", got)
+	}
+	p, getErr := coordinator.Store().GetPlan(root.PlanID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if p.Status != model.PlanStatusPausedAwaitingDecision || p.PauseReason != "budget_exhausted:wall_time" {
+		t.Fatalf("wall budget did not pause plan: %+v", p)
+	}
+}
+
+func TestSchedulerExecutorTerminalPlanDoesNotWaitForNonterminalNodes(t *testing.T) {
+	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 16), 32, 1, 60)
+	root := &model.Task{Description: "scheduler root", EventType: "__scheduler__"}
+	if err := taskStore.PublishTask(root); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+	if _, err := coordinator.Create(context.Background(), plan.CreateInput{PlanID: root.PlanID, RootTaskID: root.ID}); err != nil {
+		t.Fatal(err)
+	}
+	child := &model.Task{Description: "unfinished", PlanID: root.PlanID}
+	if err := taskStore.PublishTask(child); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.RegisterTask(context.Background(), plan.RegisterTaskInput{
+		PlanID: root.PlanID, ObservedRevision: 0,
+		Node: model.PlanNode{TaskID: child.ID, Title: child.Description, Role: model.PlanNodeRoleImplementation},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.MarkBlocked(plan.WithControllerAuthority(context.Background(), root.ID), root.PlanID, "user decision required"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.ResolvePause(context.Background(), plan.ResolvePauseInput{
+		PlanID: root.PlanID, Resolution: plan.PauseResolutionTerminate,
+		AuthorizedBy: "user", Reason: "user explicitly chose to stop",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var innerCalls int32
+	exec := &SchedulerExecutor{
+		Inner: func(context.Context, *model.Task, map[string]string, []agent.HistoryEntry) (agent.ExecuteResult, error) {
+			atomic.AddInt32(&innerCalls, 1)
+			return agent.ExecuteResult{Output: "cancelled summary"}, nil
+		},
+		Store: taskStore, Cfg: config.DefaultConfig(), PlanCoordinator: coordinator,
+		WaitTimeout: time.Hour,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	result, err := exec.Execute(ctx, root, nil, nil)
+	if err != nil || result.Output != "cancelled summary" || atomic.LoadInt32(&innerCalls) != 1 {
+		t.Fatalf("terminal summary result=%+v calls=%d err=%v", result, innerCalls, err)
+	}
+}
+
+func TestSchedulerExecutorSuspendsWhenInnerCallBlocksPlan(t *testing.T) {
+	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 16), 32, 1, 60)
+	root := &model.Task{Description: "scheduler root", EventType: "__scheduler__", NodeRole: model.PlanNodeRoleController}
+	if err := taskStore.PublishTask(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskStore.ClaimTask("scheduler-1", root.ID); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+	if _, err := coordinator.Create(context.Background(), plan.CreateInput{PlanID: root.PlanID, RootTaskID: root.ID}); err != nil {
+		t.Fatal(err)
+	}
+	exec := &SchedulerExecutor{
+		Store: taskStore, Cfg: config.DefaultConfig(), PlanCoordinator: coordinator,
+		Inner: func(context.Context, *model.Task, map[string]string, []agent.HistoryEntry) (agent.ExecuteResult, error) {
+			_, err := coordinator.MarkBlocked(context.Background(), root.PlanID, "waiting for user")
+			return agent.ExecuteResult{ToolCalled: true}, err
+		},
+	}
+	_, err := exec.Execute(context.Background(), root, nil, nil)
+	if !errors.Is(err, agent.ErrExecutionSuspended) {
+		t.Fatalf("Execute err=%v, want post-call suspension", err)
+	}
+}
+
+func TestSchedulerExecutorDirectExecutionRequiresFormalFinalization(t *testing.T) {
+	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 16), 32, 1, 60)
+	root := &model.Task{Description: "scheduler root", EventType: "__scheduler__", NodeRole: model.PlanNodeRoleController}
+	if err := taskStore.PublishTask(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskStore.ClaimTask("scheduler-1", root.ID); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+	if _, err := coordinator.Create(context.Background(), plan.CreateInput{PlanID: root.PlanID, RootTaskID: root.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskStore.AppendToolCall(root.ID, store.ToolCallRecord{ToolName: "run_shell", Success: true}); err != nil {
+		t.Fatal(err)
+	}
+	exec := &SchedulerExecutor{
+		Store: taskStore, Cfg: config.DefaultConfig(), PlanCoordinator: coordinator,
+		Inner: func(context.Context, *model.Task, map[string]string, []agent.HistoryEntry) (agent.ExecuteResult, error) {
+			return agent.ExecuteResult{Output: "done without acceptance"}, nil
+		},
+	}
+	result, err := exec.Execute(context.Background(), root, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ToolCalled || !strings.Contains(result.Output, "正式终态") {
+		t.Fatalf("direct execution bypassed formal finalization: %+v", result)
+	}
+}
+
+func TestSchedulerExecutorUntouchedEmptyPlanKeepsReadOnlyCompatibility(t *testing.T) {
+	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 16), 32, 1, 60)
+	root := &model.Task{Description: "read-only question", EventType: "__scheduler__", NodeRole: model.PlanNodeRoleController}
+	if err := taskStore.PublishTask(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskStore.ClaimTask("scheduler-1", root.ID); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+	if _, err := coordinator.Create(context.Background(), plan.CreateInput{PlanID: root.PlanID, RootTaskID: root.ID}); err != nil {
+		t.Fatal(err)
+	}
+	exec := &SchedulerExecutor{
+		Store: taskStore, Cfg: config.DefaultConfig(), PlanCoordinator: coordinator,
+		Inner: func(context.Context, *model.Task, map[string]string, []agent.HistoryEntry) (agent.ExecuteResult, error) {
+			return agent.ExecuteResult{Output: "read-only answer"}, nil
+		},
+	}
+	result, err := exec.Execute(context.Background(), root, nil, nil)
+	if err != nil || result.ToolCalled || result.Output != "read-only answer" {
+		t.Fatalf("empty read-only plan compatibility result=%+v err=%v", result, err)
+	}
+	completed, err := coordinator.Store().GetPlan(root.PlanID)
+	if err != nil || completed.Status != model.PlanStatusCompletedNoExecution {
+		t.Fatalf("read-only control envelope remained live: plan=%+v err=%v", completed, err)
+	}
+}
+
+func TestSchedulerExecutorDoesNotCloseEmptyPlanWithConcurrentSignal(t *testing.T) {
+	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 16), 32, 1, 60)
+	root := &model.Task{Description: "read-only question", EventType: "__scheduler__", NodeRole: model.PlanNodeRoleController}
+	if err := taskStore.PublishTask(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskStore.ClaimTask("scheduler-1", root.ID); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+	if _, err := coordinator.Create(context.Background(), plan.CreateInput{PlanID: root.PlanID, RootTaskID: root.ID}); err != nil {
+		t.Fatal(err)
+	}
+	exec := &SchedulerExecutor{
+		Store: taskStore, Cfg: config.DefaultConfig(), PlanCoordinator: coordinator,
+		Inner: func(context.Context, *model.Task, map[string]string, []agent.HistoryEntry) (agent.ExecuteResult, error) {
+			_, err := coordinator.RequestReplan(context.Background(), model.ReplanRequest{
+				PlanID: root.PlanID, ReasonCode: "fact_arrived_during_decision", SourceEvent: "test",
+			})
+			return agent.ExecuteResult{Output: "stale answer"}, err
+		},
+	}
+	result, err := exec.Execute(context.Background(), root, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ToolCalled || !strings.Contains(result.Output, "尚未处理的 PlanSignal") {
+		t.Fatalf("concurrent signal was closed over: %+v", result)
+	}
+	p, err := coordinator.Store().GetPlan(root.PlanID)
+	if err != nil || p.Status != model.PlanStatusRunning || len(p.PendingReplanRequests) != 1 {
+		t.Fatalf("concurrent signal Plan=%+v err=%v", p, err)
+	}
+}
+
+func TestSchedulerExecutorTerminalControllerGetsFinalSummaryTurn(t *testing.T) {
+	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 16), 32, 1, 60)
+	root := &model.Task{Description: "scheduler root", EventType: "__scheduler__", NodeRole: model.PlanNodeRoleController}
+	if err := taskStore.PublishTask(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskStore.ClaimTask("scheduler-1", root.ID); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+	if _, err := coordinator.Create(context.Background(), plan.CreateInput{PlanID: root.PlanID, RootTaskID: root.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.MarkBlocked(context.Background(), root.PlanID, "user decision required"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.ResolvePause(context.Background(), plan.ResolvePauseInput{
+		PlanID: root.PlanID, Resolution: plan.PauseResolutionTerminate,
+		AuthorizedBy: "test-user", Reason: "stop",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	registry := agent.NewToolRegistry()
+	registry.Register("must_not_be_exposed", "terminal summaries are text-only", nil,
+		func(context.Context, map[string]any) (string, error) { return "unexpected", nil })
+	client := &toolDefCaptureClient{response: llm.Response{Content: "final summary"}}
+	exec := &SchedulerExecutor{
+		Store: taskStore, Cfg: config.DefaultConfig(), PlanCoordinator: coordinator,
+		Inner: agent.NewLLMExecutor(client, registry, nil, taskStore, nil, ""),
+	}
+	result, err := exec.Execute(context.Background(), root, nil, nil)
+	if err != nil || result.ToolCalled || result.Output != "final summary" || client.calls != 1 {
+		t.Fatalf("terminal summary result=%+v calls=%d err=%v", result, client.calls, err)
+	}
+	if client.toolDefsSeen != 0 {
+		t.Fatalf("terminal summary exposed %d tool definitions, want none", client.toolDefsSeen)
 	}
 }
 
@@ -462,5 +1018,115 @@ func TestSchedulerExecutor_ToolHealth_Nil_NoUnavailableTools(t *testing.T) {
 	// With nil ToolHealth, unavailable_tools should be omitted (backward compat)
 	if strings.Contains(mail, `"unavailable_tools"`) {
 		t.Errorf("snapshot should NOT contain unavailable_tools when ToolHealth is nil, got: %s", mail)
+	}
+}
+
+func TestSchedulerExecutor_RecordsPlanTokenUsage(t *testing.T) {
+	s := store.NewMemoryTaskStore(make(chan model.Event, 8), 10, 1, 60)
+	schedTask := &model.Task{Description: "planned scheduler", EventType: "__scheduler__"}
+	if err := s.PublishTask(schedTask); err != nil {
+		t.Fatal(err)
+	}
+	schedTask.PlanID = schedTask.ID
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+	if _, err := coordinator.Create(context.Background(), plan.CreateInput{
+		PlanID: schedTask.PlanID, RootTaskID: schedTask.ID,
+		Budget: model.PlanBudget{MaxTokens: 10_000},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := &SchedulerExecutor{
+		Store: s, Cfg: &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}},
+		PlanCoordinator: coordinator,
+		Inner: func(context.Context, *model.Task, map[string]string, []agent.HistoryEntry) (agent.ExecuteResult, error) {
+			return agent.ExecuteResult{Output: "observed", ToolCalled: true, PromptTokens: 120, CompletionTokens: 30}, nil
+		},
+	}
+	if _, err := exec.Execute(context.Background(), schedTask, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	p, err := coordinator.Store().GetPlan(schedTask.PlanID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Usage.TokensUsed != 150 {
+		t.Fatalf("plan token usage=%d, want 150", p.Usage.TokensUsed)
+	}
+}
+
+func TestSchedulerExecutor_PlannedSignalSkipsLegacyDownstreamWait(t *testing.T) {
+	s := store.NewMemoryTaskStore(make(chan model.Event, 8), 10, 1, 60)
+	schedTask := &model.Task{Description: "planned scheduler", EventType: "__scheduler__"}
+	if err := s.PublishTask(schedTask); err != nil {
+		t.Fatal(err)
+	}
+	schedTask.PlanID = schedTask.ID
+	if err := s.ClaimTask("scheduler", schedTask.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	batchTask := &model.Task{Description: "completed batch member"}
+	if err := s.PublishTask(batchTask); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("worker", batchTask.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SubmitResult("worker", batchTask.ID, "done"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendSchedulerBatch(schedTask.ID, batchTask.ID); err != nil {
+		t.Fatal(err)
+	}
+	downstream := &model.Task{Description: "legacy downstream", Dependencies: []string{batchTask.ID}}
+	if err := s.PublishTask(downstream); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("verifier", downstream.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+	if _, err := coordinator.Create(context.Background(), plan.CreateInput{
+		PlanID: schedTask.PlanID, RootTaskID: schedTask.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.RequestReplan(context.Background(), model.ReplanRequest{
+		PlanID: schedTask.PlanID, SourceTaskID: batchTask.ID,
+		SourceEvent: "task_completed", ReasonCode: "task_completed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var innerCalls int32
+	exec := &SchedulerExecutor{
+		Store: s, Cfg: &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}},
+		PlanCoordinator:       coordinator,
+		WaitTimeout:           50 * time.Millisecond,
+		DownstreamWaitTimeout: 2 * time.Second,
+		Inner: func(context.Context, *model.Task, map[string]string, []agent.HistoryEntry) (agent.ExecuteResult, error) {
+			atomic.AddInt32(&innerCalls, 1)
+			return agent.ExecuteResult{Output: "handled signal", ToolCalled: true}, nil
+		},
+		lastTaskID:       schedTask.ID,
+		progressReported: true,
+	}
+
+	start := time.Now()
+	if _, err := exec.Execute(context.Background(), schedTask, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if atomic.LoadInt32(&innerCalls) != 1 {
+		t.Fatalf("Inner calls=%d, want 1", innerCalls)
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("planned PlanSignal was delayed by legacy downstream wait: %v", elapsed)
+	}
+	stillRunning, err := s.GetTask(downstream.ID)
+	if err != nil || stillRunning.Status != model.TaskStatusProcessing {
+		t.Fatalf("downstream task must remain processing to prove wait was skipped: task=%+v err=%v", stillRunning, err)
 	}
 }

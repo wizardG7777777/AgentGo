@@ -30,10 +30,12 @@ type mockExecutorHook struct {
 	onRun      func(hctx hook.ToolHookContext) // 可选的自定义行为注入
 }
 
-func (m *mockExecutorHook) Name() string                 { return m.name }
-func (m *mockExecutorHook) Phase() hook.ToolHookPhase    { return m.phase }
-func (m *mockExecutorHook) Priority() int                { return m.priority }
-func (m *mockExecutorHook) Matches(toolName string) bool { return m.matchStr == "*" || m.matchStr == toolName }
+func (m *mockExecutorHook) Name() string              { return m.name }
+func (m *mockExecutorHook) Phase() hook.ToolHookPhase { return m.phase }
+func (m *mockExecutorHook) Priority() int             { return m.priority }
+func (m *mockExecutorHook) Matches(toolName string) bool {
+	return m.matchStr == "*" || m.matchStr == toolName
+}
 func (m *mockExecutorHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecision {
 	if hctx.Phase == hook.PhasePreCall {
 		m.preCalled.Store(true)
@@ -524,8 +526,9 @@ func TestExecutor_NilRecordFuncSkipsRecording(t *testing.T) {
 	}
 }
 
-// TestExecutor_ConcurrentToolCallsRecordAll 验证并行工具调用各自记录。
-func TestExecutor_ConcurrentToolCallsRecordAll(t *testing.T) {
+// TestExecutor_MultipleToolCallsRecordAll verifies that ordered multi-tool
+// dispatch still records every call.
+func TestExecutor_MultipleToolCallsRecordAll(t *testing.T) {
 	recStore := newRecordingStore()
 	task := &model.Task{ID: "task-001", Description: "test"}
 	recStore.PublishTask(task)
@@ -579,5 +582,3 @@ func TestExecutor_ConcurrentToolCallsRecordAll(t *testing.T) {
 		}
 	}
 }
-
-

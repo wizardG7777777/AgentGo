@@ -320,10 +320,7 @@ func TestMemoryTaskStore_ArtifactsSurviveRestart(t *testing.T) {
 	s1 := NewMemoryTaskStore(eventCh, 100, 2, 300)
 	s1.SetArtifactLog(log1)
 
-	task := &model.Task{Description: "survivor", ID: "fixed-id"}
-	// 注意：PublishTask 会覆盖 ID 为 UUID，我们需要用手动构造 + 绕过 Publish
-	// 或者用 Publish 后读取生成的 ID。这里用后者。
-	task.ID = "" // 让 Publish 生成
+	task := &model.Task{Description: "survivor"} // ID 留空时由 PublishTask 生成
 	if err := s1.PublishTask(task); err != nil {
 		t.Fatalf("PublishTask 失败: %v", err)
 	}

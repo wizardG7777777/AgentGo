@@ -126,7 +126,41 @@ const (
 	// Reactor spawn 深度超过系统硬上限。用于阻断 spawn_agent reactor 级联爆炸。
 	// payload：Depth 记录被拒绝的目标深度，Reason 记录触发原因。
 	KindReactorSpawnDepthExceeded EventKind = "reactor_spawn_depth_exceeded"
+
+	// 动态 DAG 控制面审计事件。它们描述已经持久化的控制事实，不能作为
+	// PlanStore 的替代品，也不允许由用户 emit_trace 伪造。
+	KindReplanRequested     EventKind = "replan_requested"
+	KindReplanCoalesced     EventKind = "replan_coalesced"
+	KindReplanDecided       EventKind = "replan_decided"
+	KindAcceptanceCompleted EventKind = "acceptance_completed"
+	KindPlanRevisionChanged EventKind = "plan_revision_changed"
+	KindPlanPaused          EventKind = "plan_paused"
 )
+
+// PlanTraceContext 把 trace 事实关联到动态 DAG 的明确版本。
+type PlanTraceContext struct {
+	PlanID                 string `json:"plan_id"`
+	PlanRevision           int64  `json:"plan_revision"`
+	ExecutionStateVersion  int64  `json:"execution_state_version"`
+	AcceptanceSpecRevision int64  `json:"acceptance_spec_revision,omitempty"`
+	GraphDigest            string `json:"graph_digest,omitempty"`
+}
+
+// AcceptanceTraceContext 是统一 acceptance_completed 事件的结构化载荷。
+// Status=stale 时 Verdict 仅供审计，不能完成当前 Plan。
+type AcceptanceTraceContext struct {
+	AcceptanceRunID   string `json:"acceptance_run_id"`
+	ResultID          string `json:"result_id"`
+	SpecID            string `json:"spec_id"`
+	SpecRevision      int64  `json:"spec_revision"`
+	TargetRevision    int64  `json:"target_revision"`
+	TargetGraphDigest string `json:"target_graph_digest"`
+	RunnerTaskID      string `json:"runner_task_id"`
+	RunnerKind        string `json:"runner_kind,omitempty"`
+	Verdict           string `json:"verdict"`
+	Status            string `json:"status"`
+	Reason            string `json:"reason,omitempty"`
+}
 
 // Transition 承载所有"状态转移"语义，跨 task 状态机与 agent 状态机两个域。
 //
@@ -252,7 +286,9 @@ type Event struct {
 
 	// --- v5 Phase 2 新增：嵌套子结构体（TraceUpgrade.md §3） ---
 	// 三者均为指针 + omitempty：nil 时 JSON 完全不输出，保持 v4 jsonl 兼容。
-	Transition   *Transition   `json:"transition,omitempty"`    // 状态转移信息（task / agent 状态机）
-	ShellExec    *ShellExec    `json:"shell_exec,omitempty"`    // Shell 执行结果
-	ShellTimeout *ShellTimeout `json:"shell_timeout,omitempty"` // Shell 超时信息（pending / resolved 共用）
+	Transition   *Transition             `json:"transition,omitempty"`    // 状态转移信息（task / agent 状态机）
+	ShellExec    *ShellExec              `json:"shell_exec,omitempty"`    // Shell 执行结果
+	ShellTimeout *ShellTimeout           `json:"shell_timeout,omitempty"` // Shell 超时信息（pending / resolved 共用）
+	Plan         *PlanTraceContext       `json:"plan,omitempty"`
+	Acceptance   *AcceptanceTraceContext `json:"acceptance,omitempty"`
 }

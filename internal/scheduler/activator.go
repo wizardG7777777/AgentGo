@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"agentgo/internal/model"
+	"agentgo/internal/plan"
 	"agentgo/internal/session"
 	"agentgo/internal/store"
 )
@@ -180,18 +181,23 @@ type Activator struct {
 	// 在每次 EventUserInput 触发时由 handleEvent 写入；
 	// SchedulerExecutor 注入 board snapshot 时通过它读取最近 N 条历史。
 	// nil 时跳过历史追加（向后兼容旧 NewActivator 调用方）。
-	History *SessionHistory
+	History         *SessionHistory
+	PlanCoordinator *plan.Coordinator
 }
 
 // NewActivator 创建一个 Activator。前三个参数都不允许 nil；
 // history 可为 nil（旧调用方兼容）。
-func NewActivator(s store.TaskStore, eventCh <-chan model.Event, batchUpdateCh chan<- struct{}, history *SessionHistory) *Activator {
-	return &Activator{
+func NewActivator(s store.TaskStore, eventCh <-chan model.Event, batchUpdateCh chan<- struct{}, history *SessionHistory, coordinators ...*plan.Coordinator) *Activator {
+	a := &Activator{
 		Store:         s,
 		EventCh:       eventCh,
 		BatchUpdateCh: batchUpdateCh,
 		History:       history,
 	}
+	if len(coordinators) > 0 {
+		a.PlanCoordinator = coordinators[0]
+	}
+	return a
 }
 
 // Run 启动 Activator 的事件分发循环。阻塞直到 ctx 取消。
@@ -249,7 +255,22 @@ func (a *Activator) handleEvent(evt model.Event) {
 			})
 		}
 
-	case model.EventTaskCompleted, model.EventTaskFailed, model.EventTaskCancelled, model.EventWatchdogAlert:
+	case model.EventTaskCompleted, model.EventTaskFailed, model.EventTaskCancelled, model.EventTaskBlocked, model.EventWatchdogAlert:
+		// Planned task lifecycle facts are committed to PlanStore by TaskStore
+		// hooks before this best-effort EventCh notification. Do not duplicate the
+		// request here; only Watchdog adds its distinct high-priority reason.
+		if task, err := a.Store.GetTask(evt.TaskID); err == nil && task.PlanID != "" && a.PlanCoordinator != nil {
+			if evt.Type == model.EventWatchdogAlert {
+				if p, getErr := a.PlanCoordinator.Store().GetPlan(task.PlanID); getErr == nil {
+					_, _ = a.PlanCoordinator.RequestReplan(context.Background(), model.ReplanRequest{
+						PlanID: task.PlanID, SourceTaskID: task.ID, SourceEvent: string(evt.Type),
+						ReasonCode: "watchdog_alert", ObservedRevision: p.CurrentRevision,
+						ObservedStateVersion: p.ExecutionStateVersion, Urgency: model.ReplanUrgencyHigh,
+					})
+				}
+			}
+			return
+		}
 		// 广播 batch 更新信号——SchedulerExecutor.waitForBatchTerminal 在 select
 		// 这个 channel；任何正在等待的 scheduler 实例会被唤醒并重新检查 batch。
 		// channel 缓冲为 1，select default 防 goroutine 阻塞。

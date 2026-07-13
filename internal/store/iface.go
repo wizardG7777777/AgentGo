@@ -18,11 +18,17 @@ type ToolCallRecord struct {
 	ToolName  string
 	Args      map[string]any
 	Success   bool
+	// ExitCode is populated for run_shell from the tool's structured first
+	// line. Success alone is insufficient because run_shell returns non-zero
+	// command exits as a normal tool result.
+	ExitCode *int
 }
 
 type TaskStore interface {
 	// Atomic write operations (require lock)
 
+	// PublishTask generates an ID when task.ID is empty. A non-empty ID is a
+	// control-plane reservation and must be preserved or rejected as duplicate.
 	PublishTask(task *model.Task) error
 	ClaimTask(agentID string, taskID string) error
 	SubmitResult(agentID string, taskID string, result string) error
@@ -31,6 +37,10 @@ type TaskStore interface {
 	FailTaskBySystem(taskID string, reason string) error
 	RetryRollback(agentID string, taskID string, reason string) error
 	AppendOutput(agentID string, taskID string, chunk string) error
+	// RecordLastHistory atomically replaces the serialized ReAct history kept
+	// for retry/resume. Implementations must copy lastHistory before returning
+	// so callers cannot mutate store-owned state through the input slice.
+	RecordLastHistory(taskID string, lastHistory []byte) error
 
 	// AppendArtifact 把一个文件路径追加到 task.Artifacts，自动去重。
 	// 由 LocalWriteGroup 在 write_file/edit_file 成功后调用。

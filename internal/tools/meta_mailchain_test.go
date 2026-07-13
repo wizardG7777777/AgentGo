@@ -316,4 +316,3 @@ func TestSendMessage_FullChain_DepthTracking(t *testing.T) {
 		t.Errorf("Step 3: A 不应收到超深消息，实际: %d", len(msgs))
 	}
 }
-

@@ -30,6 +30,17 @@ func inspectAll(w *Watchdog) {
 	}
 }
 
+func setTaskTiming(t *testing.T, s store.TaskStore, taskID string, createdAt, startedAt time.Time) {
+	t.Helper()
+	mem, ok := s.(*store.MemoryTaskStore)
+	if !ok {
+		t.Fatal("test store is not MemoryTaskStore")
+	}
+	if err := mem.SetTaskTiming(taskID, createdAt, startedAt); err != nil {
+		t.Fatalf("SetTaskTiming: %v", err)
+	}
+}
+
 func TestWatchdog_TimeoutDetection(t *testing.T) {
 	w, s, _ := newTestWatchdog()
 
@@ -41,12 +52,11 @@ func TestWatchdog_TimeoutDetection(t *testing.T) {
 	s.ClaimTask("agent-1", task.ID)
 
 	// Manipulate StartedAt to simulate timeout
-	got, _ := s.GetTask(task.ID)
-	got.StartedAt = time.Now().Add(-5 * time.Second)
+	setTaskTiming(t, s, task.ID, time.Time{}, time.Now().Add(-5*time.Second))
 
 	inspectAll(w)
 
-	got, _ = s.GetTask(task.ID)
+	got, _ := s.GetTask(task.ID)
 	if got.Status != model.TaskStatusFailed {
 		t.Errorf("status = %s, want failed (timeout)", got.Status)
 	}
@@ -81,12 +91,11 @@ func TestWatchdog_UnclaimedDetection(t *testing.T) {
 	s.PublishTask(task)
 
 	// Manipulate CreatedAt to simulate long wait
-	got, _ := s.GetTask(task.ID)
-	got.CreatedAt = time.Now().Add(-5 * time.Second)
+	setTaskTiming(t, s, task.ID, time.Now().Add(-5*time.Second), time.Time{})
 
 	inspectAll(w)
 
-	got, _ = s.GetTask(task.ID)
+	got, _ := s.GetTask(task.ID)
 	if got.Status != model.TaskStatusFailed {
 		t.Errorf("status = %s, want failed (unclaimed)", got.Status)
 	}
@@ -185,7 +194,7 @@ func TestWatchdog_RosterCleanup_ActiveAgentPreserved(t *testing.T) {
 	}
 }
 
-func TestWatchdog_CascadeCancellation_Processing(t *testing.T) {
+func TestWatchdog_TaskSnapshotsCannotRewriteCompletedDependency(t *testing.T) {
 	w, s, _ := newTestWatchdog()
 
 	// 创建依赖任务，先让它 completed 以便后续任务能 ClaimTask
@@ -209,15 +218,15 @@ func TestWatchdog_CascadeCancellation_Processing(t *testing.T) {
 		t.Fatalf("precondition: status = %s, want processing", got.Status)
 	}
 
-	// 现在将依赖任务的状态直接改为 failed（模拟依赖后续被判定失败的场景）
+	// 读取结果是不可变快照；外部不能把已经完成的历史事实改写为 failed。
 	depTask, _ := s.GetTask(dep.ID)
 	depTask.Status = model.TaskStatusFailed
 
 	inspectAll(w)
 
 	got, _ = s.GetTask(task.ID)
-	if got.Status != model.TaskStatusCancelled {
-		t.Errorf("status = %s, want cancelled (cascade from processing)", got.Status)
+	if got.Status != model.TaskStatusProcessing {
+		t.Errorf("status = %s, want processing because completed dependency is immutable", got.Status)
 	}
 }
 

@@ -10,7 +10,9 @@ package runner
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"log"
 	"strings"
 
 	"agentgo/internal/agent"
@@ -19,6 +21,8 @@ import (
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/memory"
+	"agentgo/internal/model"
+	"agentgo/internal/plan"
 	reactorbuiltin "agentgo/internal/reactor/builtin"
 	"agentgo/internal/roster"
 	"agentgo/internal/shell"
@@ -48,13 +52,14 @@ type RunnerDeps struct {
 	// AgentHook 子系统已被 trace.Event + Reactor 取代。
 	// Memory 是 v5 Phase 1 引入的 Memory System 共享存储（MemoryManageSystem.md MM5）。
 	// 为 nil 时 Agent 退化为不读取/不写入（行为等价于 v4 无 team-awareness）。
-	Memory         memory.Store
-	Activity       *agent.ActivityTracker
-	MBRegistry     *mailbox.Registry
-	CancelRegistry *store.TaskCancelRegistry
-	SearchProvider webtool.SearchProvider
-	ShellFilter    *shell.CommandFilter
-	ApprovalCh     chan<- shell.ApprovalRequest
+	Memory          memory.Store
+	PlanCoordinator *plan.Coordinator
+	Activity        *agent.ActivityTracker
+	MBRegistry      *mailbox.Registry
+	CancelRegistry  *store.TaskCancelRegistry
+	SearchProvider  webtool.SearchProvider
+	ShellFilter     *shell.CommandFilter
+	ApprovalCh      chan<- shell.ApprovalRequest
 	// UserOutput 是用户可见内容的输出目标。非 nil 时，agent 的 IsUserFacing 输出
 	// 和 scheduler 的 report_done 会写入此处，而不是直接 fmt.Printf。
 	UserOutput io.Writer
@@ -84,8 +89,9 @@ type Runner struct {
 
 // New 用 AgentRuntimeConfig + RunnerDeps 构造 Runner。
 //
-// 工具集组装策略：注册全部 6 个 ToolGroup，由 ToolRegistry 的 allowlist 过滤实际生效集——
-// LocalRead / LocalWrite / Web / Shell / Meta（publish_task + send_message）。Allowlist
+// 工具集组装策略：注册全部 ToolGroup，由 ToolRegistry 的 allowlist 过滤实际生效集——
+// LocalRead / LocalWrite / Web / Shell / Meta（publish_task + send_message）/
+// PlanControl。Allowlist
 // 过滤是 v3 §9.1 起的稳定机制（详见 agent.NewToolRegistryWithAllowlist），保证 unauthorized
 // 工具根本不进 ToolRegistry，LLM 视野不可见。所以"runner 注册全集 + allowlist 自动剪枝"
 // 在能力等价性上与"按 allowlist 选择性 RegisterGroups"完全等同，但代码更简洁、新增 kind
@@ -110,6 +116,39 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 		rt.TeamAwareness,
 		rt.SystemPrompt,
 	)
+	if deps.PlanCoordinator != nil {
+		inner := executor
+		executor = func(ctx context.Context, task *model.Task, depResults map[string]string, history []agent.HistoryEntry) (agent.ExecuteResult, error) {
+			if err := requireRunnablePlan(deps.PlanCoordinator, task); err != nil {
+				return agent.ExecuteResult{}, err
+			}
+			guardedCtx := agent.WithToolDispatchGuard(ctx, func(dispatchCtx context.Context, guardedTask *model.Task) error {
+				return requirePlanToolDispatch(dispatchCtx, deps.PlanCoordinator, deps.Store, guardedTask)
+			})
+			result, err := inner(guardedCtx, task, depResults, history)
+			if task != nil && task.PlanID != "" {
+				tokens := int64(result.PromptTokens + result.CompletionTokens)
+				latest, latestErr := deps.PlanCoordinator.Store().GetPlan(task.PlanID)
+				if tokens > 0 && latestErr == nil && latest.Status == model.PlanStatusRunning {
+					_, usageErr := deps.PlanCoordinator.RecordUsage(context.Background(), task.PlanID, tokens, 0)
+					if usageErr != nil {
+						log.Printf("[runner] record plan token usage task=%s: %v", task.ID, usageErr)
+					}
+				}
+				latest, latestErr = deps.PlanCoordinator.Store().GetPlan(task.PlanID)
+				if latestErr == nil && (latest.Status == model.PlanStatusPausedAwaitingDecision || latest.Status == model.PlanStatusBlocked) {
+					trace.Emit(trace.Event{Kind: trace.KindPlanPaused, TaskID: task.ID, Reason: latest.PauseReason,
+						Plan: &trace.PlanTraceContext{PlanID: latest.ID, PlanRevision: latest.CurrentRevision,
+							ExecutionStateVersion: latest.ExecutionStateVersion, AcceptanceSpecRevision: latest.CurrentAcceptanceSpecRevision,
+							GraphDigest: latest.CurrentGraphDigest}})
+				}
+				if boundaryErr := requireRunnablePlan(deps.PlanCoordinator, task); boundaryErr != nil {
+					return result, boundaryErr
+				}
+			}
+			return result, err
+		}
+	}
 
 	a := agent.NewAgent(
 		rt.InstanceID,
@@ -165,6 +204,124 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	a.UserOutput = deps.UserOutput
 
 	return &Runner{agent: a}
+}
+
+func requireRunnablePlan(coordinator *plan.Coordinator, task *model.Task) error {
+	if coordinator == nil || task == nil || task.PlanID == "" {
+		return nil
+	}
+	p, budgetErr := coordinator.CheckBudget(context.Background(), task.PlanID)
+	if budgetErr != nil && p == nil {
+		return budgetErr
+	}
+	if p == nil {
+		return fmt.Errorf("plan %s budget check returned no plan", task.PlanID)
+	}
+	if p.Status != model.PlanStatusRunning {
+		if budgetErr != nil {
+			return fmt.Errorf("%w: plan %s is %s: %v", agent.ErrExecutionSuspended, p.ID, p.Status, budgetErr)
+		}
+		return fmt.Errorf("%w: plan %s is %s", agent.ErrExecutionSuspended, p.ID, p.Status)
+	}
+	if task.NodeRole == model.PlanNodeRoleController && p.ActiveDecisionTaskID != task.ID {
+		return fmt.Errorf("%w: controller task %s is not active for plan %s", agent.ErrExecutionSuspended, task.ID, p.ID)
+	}
+	if budgetErr != nil {
+		return budgetErr
+	}
+	return nil
+}
+
+// requirePlanToolDispatch revalidates the Task-backed execution lease at the
+// boundary immediately before every concrete tool call. A model response may
+// contain several ordered calls; a prior call can synchronously trigger Task
+// cancellation, DAG retirement, or formal acceptance submission. Checking only
+// once before the response would allow a later side effect to run under stale
+// authority.
+func requirePlanToolDispatch(ctx context.Context, coordinator *plan.Coordinator, taskStore store.TaskStore, task *model.Task) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%w: task context is no longer active: %v", agent.ErrExecutionSuspended, err)
+		}
+	}
+	if err := requireRunnablePlan(coordinator, task); err != nil {
+		return err
+	}
+	if coordinator == nil || task == nil || task.PlanID == "" {
+		return nil
+	}
+	if taskStore == nil {
+		return fmt.Errorf("%w: task store is unavailable for planned task %s", agent.ErrExecutionSuspended, task.ID)
+	}
+
+	latest, err := taskStore.GetTask(task.ID)
+	if err != nil {
+		return fmt.Errorf("%w: reload planned task %s: %v", agent.ErrExecutionSuspended, task.ID, err)
+	}
+	if latest.PlanID != task.PlanID {
+		return fmt.Errorf("%w: task %s plan identity changed from %s to %s",
+			agent.ErrExecutionSuspended, task.ID, task.PlanID, latest.PlanID)
+	}
+	if latest.Status != model.TaskStatusProcessing {
+		return fmt.Errorf("%w: task %s is %s, not processing", agent.ErrExecutionSuspended, task.ID, latest.Status)
+	}
+
+	p, err := coordinator.Store().GetPlan(task.PlanID)
+	if err != nil {
+		return fmt.Errorf("%w: reload plan %s: %v", agent.ErrExecutionSuspended, task.PlanID, err)
+	}
+	if p.Status != model.PlanStatusRunning {
+		return fmt.Errorf("%w: plan %s is %s", agent.ErrExecutionSuspended, p.ID, p.Status)
+	}
+	if latest.NodeRole == model.PlanNodeRoleController {
+		if p.ActiveDecisionTaskID != latest.ID {
+			return fmt.Errorf("%w: controller task %s is not active for plan %s", agent.ErrExecutionSuspended, latest.ID, p.ID)
+		}
+		return nil
+	}
+	if task.NodeRole == model.PlanNodeRoleController {
+		return fmt.Errorf("%w: task %s controller role no longer matches durable task facts", agent.ErrExecutionSuspended, task.ID)
+	}
+
+	node, ok := p.Nodes[latest.ID]
+	if !ok {
+		return fmt.Errorf("%w: task %s is not registered in current plan %s", agent.ErrExecutionSuspended, latest.ID, p.ID)
+	}
+	if latest.NodeRole != node.Role {
+		return fmt.Errorf("%w: task %s role %s does not match plan role %s",
+			agent.ErrExecutionSuspended, latest.ID, latest.NodeRole, node.Role)
+	}
+	if node.RetiredRevision > 0 || latest.RetiredRevision > 0 || !containsTaskID(p.CurrentNodeIDs, latest.ID) {
+		return fmt.Errorf("%w: task %s was retired from plan %s", agent.ErrExecutionSuspended, latest.ID, p.ID)
+	}
+
+	if node.Role == model.PlanNodeRoleAcceptance {
+		if latest.AcceptanceRunID == "" {
+			return fmt.Errorf("%w: acceptance task %s is not bound to an AcceptanceRun", agent.ErrExecutionSuspended, latest.ID)
+		}
+		run, ok := p.AcceptanceRuns[latest.AcceptanceRunID]
+		if !ok || run.RunnerTaskID != latest.ID {
+			return fmt.Errorf("%w: acceptance task %s does not own run %s",
+				agent.ErrExecutionSuspended, latest.ID, latest.AcceptanceRunID)
+		}
+		if run.ResultID != "" {
+			return fmt.Errorf("%w: acceptance run %s already submitted result %s; further tools are frozen",
+				agent.ErrExecutionSuspended, run.ID, run.ResultID)
+		}
+		if run.Status != "pending" && run.Status != "running" {
+			return fmt.Errorf("%w: acceptance run %s is %s", agent.ErrExecutionSuspended, run.ID, run.Status)
+		}
+	}
+	return nil
+}
+
+func containsTaskID(ids []string, target string) bool {
+	for _, id := range ids {
+		if id == target {
+			return true
+		}
+	}
+	return false
 }
 
 // ID 返回该 Runner 的实例 ID（如 "worker-1"）。

@@ -7,7 +7,13 @@ import (
 )
 
 // currentSnapshotVersion is the current snapshot format version.
-const currentSnapshotVersion = 1
+//
+// Version 2 extends TaskSnapshot with scheduler/runtime fields required to
+// resume an in-flight task graph. LoadSnapshot still accepts version 1 and
+// upgrades it in memory so existing sessions remain resumable.
+const currentSnapshotVersion = 2
+
+const oldestSupportedSnapshotVersion = 1
 
 // Snapshot 是某一时刻的完整状态快照。
 type Snapshot struct {
@@ -21,30 +27,61 @@ type Snapshot struct {
 }
 
 // TaskSnapshot 是单个 Task 的可序列化表示。
-// 仅包含非终态任务（pending / processing）。
 type TaskSnapshot struct {
-	ID                string            `json:"id"`
-	Description       string            `json:"description"`
-	Priority          int               `json:"priority"`
-	Dependencies      []string          `json:"dependencies"`
-	Status            string            `json:"status"`
-	Agents            []string          `json:"agents"`
-	MaxConcurrency    int               `json:"max_concurrency"`
-	Results           map[string]string `json:"results"`
-	Error             string            `json:"error,omitempty"`
-	RetryCount        int               `json:"retry_count"`
-	RetryReasons      []string          `json:"retry_reasons"`
-	TimeoutSeconds    int               `json:"timeout_seconds"`
-	EventSource       string            `json:"event_source,omitempty"`
-	EventType         string            `json:"event_type,omitempty"`
-	SystemPrompt      string            `json:"system_prompt,omitempty"`
-	Depth             int               `json:"depth"`
-	Artifacts         []string          `json:"artifacts,omitempty"`
-	ExpectedArtifacts []string          `json:"expected_artifacts,omitempty"`
-	TransferNote      string            `json:"transfer_note,omitempty"`
-	MailChainDepth    int               `json:"mail_chain_depth,omitempty"`
-	CreatedAt         string            `json:"created_at"`
-	StartedAt         string            `json:"started_at,omitempty"`
+	ID                 string            `json:"id"`
+	Description        string            `json:"description"`
+	Priority           int               `json:"priority"`
+	Dependencies       []string          `json:"dependencies"`
+	Status             string            `json:"status"`
+	Agents             []string          `json:"agents"`
+	MaxConcurrency     int               `json:"max_concurrency"`
+	Results            map[string]string `json:"results"`
+	Error              string            `json:"error,omitempty"`
+	RetryCount         int               `json:"retry_count"`
+	RetryReasons       []string          `json:"retry_reasons"`
+	TimeoutSeconds     int               `json:"timeout_seconds"`
+	EventSource        string            `json:"event_source,omitempty"`
+	EventType          string            `json:"event_type,omitempty"`
+	TriggerRule        string            `json:"trigger_rule,omitempty"`
+	SystemPrompt       string            `json:"system_prompt,omitempty"`
+	Depth              int               `json:"depth"`
+	Artifacts          []string          `json:"artifacts,omitempty"`
+	ExpectedArtifacts  []string          `json:"expected_artifacts,omitempty"`
+	TransferNote       string            `json:"transfer_note,omitempty"`
+	MailChainDepth     int               `json:"mail_chain_depth,omitempty"`
+	SchedulerBatch     []string          `json:"scheduler_batch,omitempty"`
+	LastResponse       string            `json:"last_response,omitempty"`
+	PartialOutput      string            `json:"partial_output,omitempty"`
+	CreatedAt          string            `json:"created_at"`
+	StartedAt          string            `json:"started_at,omitempty"`
+	CompletedAt        string            `json:"completed_at,omitempty"`
+	PlanID             string            `json:"plan_id,omitempty"`
+	NodeRole           string            `json:"node_role,omitempty"`
+	CreatedRevision    int64             `json:"created_revision,omitempty"`
+	RetiredRevision    int64             `json:"retired_revision,omitempty"`
+	Supersedes         []string          `json:"supersedes,omitempty"`
+	AcceptanceRunID    string            `json:"acceptance_run_id,omitempty"`
+	PlanMutationSource string            `json:"plan_mutation_source,omitempty"`
+	// LastHistory preserves the completed ReAct rounds of a suspended/retried
+	// Task. Without it, a resumed Task can repeat tool side effects after a
+	// process restart even though in-memory retry already avoids that replay.
+	LastHistory []byte `json:"last_history,omitempty"`
+	// ToolCalls are durable execution facts used by the dynamic Plan boundary
+	// and formal acceptance verifier. They live on the owning Task snapshot so
+	// restoring a session cannot detach evidence from its Task identity.
+	ToolCalls []ToolCallSnapshot `json:"tool_calls,omitempty"`
+}
+
+// ToolCallSnapshot is the serialization-only form of store.ToolCallRecord.
+// session cannot import store (store already imports session), so the snapshot
+// boundary owns this DTO and store performs the explicit conversion.
+type ToolCallSnapshot struct {
+	Timestamp string         `json:"timestamp,omitempty"`
+	AgentID   string         `json:"agent_id,omitempty"`
+	ToolName  string         `json:"tool_name"`
+	Args      map[string]any `json:"args,omitempty"`
+	Success   bool           `json:"success"`
+	ExitCode  *int           `json:"exit_code,omitempty"`
 }
 
 // RosterSnapshot 是 Roster 的可序列化表示。
@@ -121,8 +158,15 @@ func LoadSnapshot(path string) (*Snapshot, error) {
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return nil, fmt.Errorf("unmarshal snapshot: %w", err)
 	}
-	if snap.Version != currentSnapshotVersion {
-		return nil, fmt.Errorf("unsupported snapshot version %d (expected %d)", snap.Version, currentSnapshotVersion)
+	if snap.Version < oldestSupportedSnapshotVersion || snap.Version > currentSnapshotVersion {
+		return nil, fmt.Errorf(
+			"unsupported snapshot version %d (supported %d-%d)",
+			snap.Version, oldestSupportedSnapshotVersion, currentSnapshotVersion,
+		)
 	}
+	// v1 did not contain the v2 TaskSnapshot fields. Their Go zero values are
+	// the correct migration defaults, so upgrading only requires normalizing
+	// the schema version in memory.
+	snap.Version = currentSnapshotVersion
 	return &snap, nil
 }

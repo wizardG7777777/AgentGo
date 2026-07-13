@@ -5,14 +5,15 @@ AgentGo 是一个使用 Go 1.25 编写的多 Agent 编排系统，类似 OpenCod
 ## 核心特性
 
 - **配置驱动的多 Agent 架构**：在 YAML 中声明 `agents:` 列表，每个 kind 可配置 replicas、工具白名单、模型、system prompt 与行为参数。
-- **Scheduler 即一等 Agent**：调度器本身是一个 ReAct Agent，拥有 `publish_task`、`cancel_task`、`report_done`、`probe_directory` 等专属工具。
+- **Scheduler 即一等 Agent + 动态 DAG**：调度器本身是一个 ReAct Agent；第一轮调查后可建立 Task-backed DAG，并根据逐 Task 终态与 Reactor 请求实时调整，直到最新图通过正式验收。
+- **Plan 控制面**：`PlanID` 跨图版本稳定，PlanRevision、ExecutionStateVersion 和 AcceptanceSpecRevision 分离；只有持久化登记的 active controller 能改图，`report_done` 不能绕过最新 Plan scope 的正式 PASS。
 - **统一 Runner**：所有执行代理共用 `internal/runner`，通过 `AgentRuntimeConfig` 区分能力边界，无需为每种 kind 单独写运行时。
 - **Gate + Reactor 双轨机制**：
   - **Gate**：在工具调用 / 邮箱发送前做决策，可拦截越界写文件、未读先写、依赖缺失、邮箱链过深等风险操作。
-  - **Reactor**：在状态变化后响应 trace 事件，支持用户 YAML 声明事件驱动的副作用（自动派任务、调用 LLM、spawn 临时 Agent、发消息）。
+  - **Reactor**：在状态变化后响应 trace 事件；计划外可执行兼容副作用，计划内只能提交 `request_replan`，由 Scheduler 决定是否改图。
 - **Mailbox 异步通信**：Agent 间可通过 `send_message` 点对点或广播通信，`MailNotifier` 自动唤醒空闲 Agent。
 - **Bubble Tea TUI**：Dashboard、Agent 详情、Chat/Result 视图、Shell 命令审批、Session 切换、斜杠命令。
-- **Session 持久化与恢复**：每次运行生成 UUID Session，保存任务、邮箱、花名册、Scheduler 历史与结果快照，支持 `-resume <id>` 恢复。
+- **Session 与 Plan 持久化恢复**：每次运行生成 UUID Session；Task 快照与原子 PlanStore 共同保存图身份、pending 信号、验收事实和执行历史，支持 `-resume <id>` 恢复。
 - **Trace 可观测性**：每个任务生成 JSONL trace，支持 `agentgo trace list/show` 离线查看与异常检测。
 
 ## 快速开始
@@ -106,8 +107,8 @@ tool_profiles:
     - run_shell
     - web_search
     - web_fetch
-    - publish_task
     - send_message
+    - request_replan
   explorer_full:
     - read_file
     - list_dir
@@ -180,19 +181,30 @@ EventUserInput ──► Scheduler.Activator ──► Store.PublishTask("__sche
                                                   ▼
                                          Scheduler Agent (ReAct)
                                                   │
+                                                  ▼
+                                  PlanCoordinator + atomic PlanStore
+                                  (active controller / versions / budget)
+                                                  │
                        ┌──────────────────────────┼──────────────────────────┐
                        ▼                          ▼                          ▼
-                 publish_task               read_file/etc.             report_done
-                       │                                                       │
-                       ▼                                                       ▼
-           Worker / Explorer / Verifier                            SubmitResult → UserOutput
-           Runner (event_type 队列)
-                       │
-                       ▼
-           Tool call → Gate pre → Execute → Gate post → trace.Event → Reactor
+              Task-backed DAG nodes        Reactor request_replan      AcceptanceRun
+                       │                          │                          │
+                       ▼                          └──────► Scheduler ◄───────┘
+           Worker / Explorer / Verifier                                      │
+           Runner (event_type 队列)                                           ▼
+                       │                                            latest valid PASS
+                       ▼                                                      │
+           Tool call → Gate → Execute → trace.Event                    finalize_plan
+                                                                              │
+                                                                              ▼
+                                                           terminal controller (no tools)
+                                                                              │
+                                                                              ▼
+                                                                             User
 ```
 
 - **任务板（`internal/store`）**：内存任务状态机，支持依赖、Artifacts、ReadSet、TransferNote、重试与 FIFO 淘汰。
+- **Plan 控制面（`internal/plan`）**：动态 DAG、版本身份、PlanSignal 聚合、正式验收、预算/无进展策略及原子持久化；跨 TaskStore 的取消操作由 controller lease 与控制器切换串行化。完整规范见 [`docs/activate/DynamicDAG.md`](docs/activate/DynamicDAG.md)。
 - **Gate 系统（`internal/gate` + `internal/hook`）**：统一拦截工具调用与邮箱事件，保障路径边界、先读后写、依赖校验、预期产物等约束。
 - **Reactor 系统（`internal/reactor`）**：订阅 trace 事件，内置记录 artifact、任务结束回调、历史压缩统计、维护 ReadSet；用户可扩展 YAML Reactor。
 - **Trace 系统（`internal/trace`）**：任务级 JSONL 日志，同时作为 Reactor 的事件源。
@@ -214,6 +226,7 @@ EventUserInput ──► Scheduler.Activator ──► Store.PublishTask("__sche
 │   ├── memory/                   # 内存系统（当前为 ProcessStore）
 │   ├── model/                    # Task / Event 模型
 │   ├── pathutil/                 # 路径工具
+│   ├── plan/                     # 动态 DAG、正式验收、预算与持久 PlanStore
 │   ├── reactor/                  # Reactor 框架与内置实现
 │   │   └── userdef/              # 用户 YAML Reactor
 │   ├── runner/                   # 统一 kind-based Runner
