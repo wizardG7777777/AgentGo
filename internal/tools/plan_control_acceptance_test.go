@@ -193,6 +193,81 @@ func TestRepeatedFormalAcceptanceWithoutSemanticProgressPausesPlan(t *testing.T)
 	}
 }
 
+func TestEnsureAcceptanceRunRequiresReadyCapableRoute(t *testing.T) {
+	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 16), 32, 2, 60)
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), planControlAcceptanceBackend{store: taskStore})
+	controller := &model.Task{Description: "controller", EventType: "__scheduler__", NodeRole: model.PlanNodeRoleController}
+	if err := taskStore.PublishTask(controller); err != nil {
+		t.Fatal(err)
+	}
+	controller.PlanID = controller.ID
+	p, err := coordinator.Create(context.Background(), plan.CreateInput{PlanID: controller.ID, RootTaskID: controller.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := &model.Task{PlanID: p.ID, Description: "work", EventType: "team:worker"}
+	if err := taskStore.PublishTask(work); err != nil {
+		t.Fatal(err)
+	}
+	p, err = coordinator.RegisterTask(context.Background(), plan.RegisterTaskInput{
+		PlanID: p.ID, ObservedRevision: p.CurrentRevision,
+		Node: model.PlanNode{TaskID: work.ID, Title: "work", Role: model.PlanNodeRoleImplementation},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.RecordTaskMutation(context.Background(), p.ID, work.ID, plan.TaskMutation{Status: model.TaskStatusCompleted}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.DefineAcceptanceSpec(context.Background(), p.ID, model.AcceptanceSpec{
+		CreatedBy: "scheduler",
+		Criteria: []model.Criterion{{
+			ID: "tests", Description: "tests pass", Source: model.AcceptanceAuthorityUser,
+			Required: true, Scope: model.AcceptanceScopePlan, Check: "command_exit", Target: "go test ./...", Expected: "0",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	routes := fakeRouteValidator{
+		routes:  map[string][]string{"team:verify": {"submit_acceptance_result"}},
+		planIDs: map[string]string{"team:verify": p.ID},
+	}
+	group := PlanControlGroup{
+		Coordinator: coordinator, Store: taskStore, Holder: &fakeHolder{id: controller.ID},
+		AgentID: "scheduler", RouteValidator: routes,
+	}
+	args := map[string]any{"scope": "plan", "runner_event_type": "team:verify"}
+	if _, err := group.ensureAcceptanceRun(context.Background(), args); err == nil || !strings.Contains(err.Error(), "run_shell") {
+		t.Fatalf("route without criterion tool must be rejected, got %v", err)
+	}
+	latest, err := coordinator.Store().GetPlan(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(latest.AcceptanceRuns) != 0 {
+		t.Fatalf("route rejection must happen before durable AcceptanceRun creation: %+v", latest.AcceptanceRuns)
+	}
+
+	routes.routes["team:verify"] = []string{"submit_acceptance_result", "run_shell"}
+	routes.planIDs["team:verify"] = "another-plan"
+	if _, err := group.ensureAcceptanceRun(context.Background(), args); err == nil || !strings.Contains(err.Error(), "当前 Plan") {
+		t.Fatalf("another Plan's verifier route must be rejected, got %v", err)
+	}
+	latest, err = coordinator.Store().GetPlan(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(latest.AcceptanceRuns) != 0 {
+		t.Fatalf("cross-Plan route rejection must happen before durable AcceptanceRun creation: %+v", latest.AcceptanceRuns)
+	}
+
+	routes.planIDs["team:verify"] = p.ID
+	if message, err := group.ensureAcceptanceRun(context.Background(), args); err != nil || !strings.Contains(message, "created=true") {
+		t.Fatalf("ready verifier route should create run: message=%q err=%v", message, err)
+	}
+}
+
 func containsString(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {

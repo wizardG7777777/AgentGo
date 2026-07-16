@@ -429,6 +429,9 @@ func TestFormalAcceptanceEndToEndUsesLatestPlanFacts(t *testing.T) {
 	if len(runnerTask.Dependencies) != 1 || runnerTask.Dependencies[0] != work.ID {
 		t.Fatalf("acceptance task dependencies=%v, want target %s", runnerTask.Dependencies, work.ID)
 	}
+	if runnerTask.MaxConcurrency != 1 {
+		t.Fatalf("formal acceptance must bind exactly one runner, MaxConcurrency=%d", runnerTask.MaxConcurrency)
+	}
 	if err := taskStore.ClaimTask("verifier", run.RunnerTaskID); err != nil {
 		t.Fatalf("ClaimTask(acceptance runner): %v", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"agentgo/internal/agenttemplate"
 	"agentgo/internal/config"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
@@ -118,6 +119,7 @@ type pendingDownstreamSnapshot struct {
 }
 
 type resourceInfo struct {
+	RuntimeMode       string                     `json:"runtime_mode"`
 	WorkerCount       int                        `json:"worker_count"`
 	BusyWorkers       int                        `json:"busy_workers"`
 	AvailableWorkers  int                        `json:"available_workers"`
@@ -125,6 +127,7 @@ type resourceInfo struct {
 	Agents            []agentSnapshot            `json:"agents,omitempty"`
 	SpecializedAgents []specializedAgentSnapshot `json:"specialized_agents,omitempty"`
 	AgentCapabilities []agentCapabilitySnapshot  `json:"agent_capabilities,omitempty"`
+	AgentTemplates    []agenttemplate.Summary    `json:"agent_templates,omitempty"`
 }
 
 // specializedAgentSnapshot 是 board snapshot 里"特化代理聚合视图"的一行。
@@ -224,12 +227,13 @@ type sessionEntry struct {
 //
 // 这种 nil-tolerant 设计让单元测试可以选择性覆盖某段而不需要构造完整依赖。
 type SnapshotSources struct {
-	MBRegistry    *mailbox.Registry
-	Roster        roster.Roster
-	History       *SessionHistory
-	AgentRegistry *AgentRegistry
-	// WorkerCapabilities 是 Worker 代理的能力声明（从 Config 读取）。
-	// Worker 不在 AgentRegistry 中注册，需要单独传入。
+	MBRegistry      *mailbox.Registry
+	Roster          roster.Roster
+	History         *SessionHistory
+	AgentRegistry   *AgentRegistry
+	TemplateCatalog *agenttemplate.Catalog
+	// WorkerCapabilities 是默认队列的兼容输入。生产路径由
+	// SchedulerExecutor 从 AgentRegistry 的 ready route 提取保证工具集后传入。
 	// nil 时不输出 worker 的 agent_capabilities 记录。
 	WorkerCapabilities *AgentCapabilityInfo
 	// WorkerProfiles 是每个 Worker 的 profile 映射（agentID → profile 名称）。
@@ -354,19 +358,30 @@ func BuildBoardJSON(
 			workerCount += k.Replicas
 		}
 	}
-	if workerCount <= 0 {
-		workerCount = 1 // safety fallback——不应触发（启动校验保证 replicas >= 1）
-	}
 	available := max(workerCount-busyWorkers, 0)
 
-	// 构造 agents 列表（来自 mailbox.Registry + roster + store 的反向映射）
-	agents := buildAgentSnapshots(allTasks, sources.MBRegistry, sources.Roster, sources.WorkerProfiles)
+	snapshotPlanID := ""
+	if sources.Plan != nil {
+		snapshotPlanID = sources.Plan.ID
+	}
+	// 构造 agents 列表（来自 mailbox.Registry + roster + store 的反向映射）。
+	// Plan snapshot 不暴露其他 Plan 的动态 Team 实例。
+	agents := buildAgentSnapshotsForPlan(allTasks, sources.MBRegistry, sources.Roster, sources.WorkerProfiles, sources.AgentRegistry, snapshotPlanID)
 
-	// 构造特化代理聚合视图（来自 AgentRegistry 静态声明 + live task 扫描）
-	specialized := buildSpecializedAgentSnapshots(allTasks, sources.AgentRegistry)
+	// 构造特化代理聚合视图。Plan snapshot 只暴露全局静态 route 与本 Plan Team；
+	// 无 Plan 的兼容/诊断 snapshot 仍使用完整 registry。
+	specialized := buildSpecializedAgentSnapshotsForPlan(allTasks, sources.AgentRegistry, snapshotPlanID)
 
 	// 构造代理能力声明（来自 AgentRegistry + Worker 能力声明）
-	agentCaps := buildAgentCapabilities(sources.AgentRegistry, sources.WorkerCapabilities, sources.WorkerCapabilitiesByProfile)
+	agentCaps := buildAgentCapabilitiesForPlan(sources.AgentRegistry, sources.WorkerCapabilities, sources.WorkerCapabilitiesByProfile, snapshotPlanID)
+	var templateSummaries []agenttemplate.Summary
+	if sources.TemplateCatalog != nil {
+		templateSummaries = sources.TemplateCatalog.List()
+	}
+	runtimeMode := "agent_team"
+	if workerCount == 0 && len(specialized) == 0 {
+		runtimeMode = "scheduler_only"
+	}
 
 	// 构造 session history（来自 SessionHistory + store 的状态查询）
 	sessionEntries := buildSessionEntries(s, sources.History)
@@ -387,6 +402,7 @@ func BuildBoardJSON(
 		Trigger: ti,
 		Tasks:   taskSnaps,
 		Resources: resourceInfo{
+			RuntimeMode:       runtimeMode,
 			WorkerCount:       workerCount,
 			BusyWorkers:       busyWorkers,
 			AvailableWorkers:  available,
@@ -394,6 +410,7 @@ func BuildBoardJSON(
 			Agents:            agents,
 			SpecializedAgents: specialized,
 			AgentCapabilities: agentCaps,
+			AgentTemplates:    templateSummaries,
 		},
 		SessionHistory:         sessionEntries,
 		PendingDownstreamTasks: pendingDownstream,
@@ -610,7 +627,19 @@ func buildAgentCapabilities(
 	workerCaps *AgentCapabilityInfo,
 	capsByProfile map[string]*AgentCapabilityInfo,
 ) []agentCapabilitySnapshot {
+	return buildAgentCapabilitiesForPlan(registry, workerCaps, capsByProfile, "")
+}
+
+func buildAgentCapabilitiesForPlan(
+	registry *AgentRegistry,
+	workerCaps *AgentCapabilityInfo,
+	capsByProfile map[string]*AgentCapabilityInfo,
+	planID string,
+) []agentCapabilitySnapshot {
 	entries := registry.Specialized()
+	if planID != "" {
+		entries = registry.SpecializedForPlan(planID)
+	}
 
 	// Per-profile 模式：capsByProfile 非空时，忽略 workerCaps，为每个 profile 输出一条记录
 	if len(capsByProfile) > 0 {
@@ -683,7 +712,14 @@ func buildAgentCapabilities(
 // Busy 计算：扫描所有 status=processing 的任务，按 EventType 累计实例数。
 // 一个任务如果有 2 个 agent 同时认领（Agents 列表长度 > 1），busy 计 2。
 func buildSpecializedAgentSnapshots(tasks []*model.Task, registry *AgentRegistry) []specializedAgentSnapshot {
+	return buildSpecializedAgentSnapshotsForPlan(tasks, registry, "")
+}
+
+func buildSpecializedAgentSnapshotsForPlan(tasks []*model.Task, registry *AgentRegistry, planID string) []specializedAgentSnapshot {
 	entries := registry.Specialized()
+	if planID != "" {
+		entries = registry.SpecializedForPlan(planID)
+	}
 	if len(entries) == 0 {
 		return nil
 	}
@@ -719,6 +755,17 @@ func buildSpecializedAgentSnapshots(tasks []*model.Task, registry *AgentRegistry
 //  3. 对每个代理调 roster.ListByAgent 拿当前 file claims（roster nil 时跳过）
 //  4. 按 agentID 字典序排序确保稳定输出
 func buildAgentSnapshots(tasks []*model.Task, mb *mailbox.Registry, r roster.Roster, workerProfiles map[string]string) []agentSnapshot {
+	return buildAgentSnapshotsForPlan(tasks, mb, r, workerProfiles, nil, "")
+}
+
+func buildAgentSnapshotsForPlan(
+	tasks []*model.Task,
+	mb *mailbox.Registry,
+	r roster.Roster,
+	workerProfiles map[string]string,
+	registry *AgentRegistry,
+	planID string,
+) []agentSnapshot {
 	if mb == nil {
 		return nil
 	}
@@ -744,6 +791,10 @@ func buildAgentSnapshots(tasks []*model.Task, mb *mailbox.Registry, r roster.Ros
 
 	out := make([]agentSnapshot, 0, len(statuses))
 	for _, st := range statuses {
+		if planID != "" && strings.HasPrefix(st.EventType, "team:") &&
+			(registry == nil || !registry.CanRouteForPlan(planID, st.EventType)) {
+			continue
+		}
 		snap := agentSnapshot{
 			ID:             st.AgentID,
 			Type:           agentTypeFromEventType(st.EventType),
@@ -781,6 +832,7 @@ func buildAgentSnapshots(tasks []*model.Task, mb *mailbox.Registry, r roster.Ros
 //   - "" → worker
 //   - "explore" → explorer
 //   - "__scheduler__" → scheduler
+//   - custom/static/Team route → 保留 event_type，避免把可路由资源折叠成 unknown
 func agentTypeFromEventType(eventType string) string {
 	switch eventType {
 	case "":
@@ -790,7 +842,7 @@ func agentTypeFromEventType(eventType string) string {
 	case "__scheduler__":
 		return "scheduler"
 	default:
-		return "unknown"
+		return eventType
 	}
 }
 

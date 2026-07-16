@@ -1,102 +1,308 @@
 package scheduler
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
-// SpecializedAgent 是一条"特化代理"的静态声明。
-//
-// AgentGo 把代理分为两类：
-//
-//   - **通用 worker**：默认 event_type=""，拥有完整工具集（write/edit/shell/
-//     publish/web/...），是兜底执行器。本 registry **不**记录通用 worker，
-//     因为它们对 scheduler 是透明的——任何默认任务都归它们处理。
-//
-//   - **特化代理**：声明了特定 event_type（如 Explorer 用 "explore"），通常
-//     工具集受裁剪、有明确的能力边界。scheduler 需要知道这类代理的存在，
-//     才能把合适的任务路由给它们（例如把"只读调查"类任务发布为
-//     event_type="explore" 让 Explorer 认领，而不是让通用 worker 执行）。
-//
-// 本 registry 是静态注册表——所有条目在 bootstrap 阶段一次性注入，运行期
-// 只读。count 也是静态的（当前 AgentGo 架构里特化代理数量在启动时就固定了，
-// Explorer 永远一个实例）。未来如果需要动态注册，可以加锁变成读写分离。
+// SpecializedAgent describes one runnable route exposed to Scheduler. The
+// empty EventType is the default worker route and is intentionally omitted
+// from Specialized(), but it is still tracked by CanRoute().
 type SpecializedAgent struct {
-	// EventType 是该代理认领任务时匹配的 EventType 值。
-	// 例如 Explorer 用 "explore"——意味着只有 publish_task 时 event_type
-	// 显式设置为 "explore" 的任务才会被 Explorer 认领。
-	EventType string
-
-	// Count 是该类代理的实例数量（静态）。
-	// 当前 AgentGo 每个特化类型只有 1 个实例，未来可能扩展为多个。
-	Count int
-
-	// Role 是人类可读的一句话角色描述，供 scheduler prompt 提示 LLM。
-	// 例如 "read-only investigator，只能读文件 / 搜索 / 访问网页，不能
-	// 写文件、执行 shell 或发布子任务"。
-	//
-	// 这段文本会直接拼接进 scheduler system prompt 的路由指引段，所以应
-	// 当简洁、动作导向、包含能力边界。
-	Role string
-
-	// Capabilities 是该代理类型的能力标签列表。
-	// 例如 Explorer 可能有 ["codebase_read", "web_search", "message"]。
-	// 用于 board snapshot 的 agent_capabilities 段和未来的任务级能力匹配。
+	EventType    string
+	Count        int
+	Role         string
 	Capabilities []string
 }
 
-// AgentRegistry 是特化代理的静态注册表，由 bootstrap 在启动时填充。
+type routeRegistration struct {
+	key    string
+	PlanID string
+	SpecializedAgent
+}
+
+// AgentRegistry is the runtime authority for task routes. Static agents and
+// dynamically provisioned Teams both register here. A catalog entry alone is
+// never a runnable route.
 //
-// 并发模型：写（Register）在 bootstrap 单 goroutine 期完成；读（Specialized）
-// 可能来自多个 scheduler Execute goroutine。用 sync.RWMutex 保证读写安全，
-// 即使运行期没有写也不影响正确性。
-//
-// nil 安全：`(*AgentRegistry)(nil).Specialized()` 返回 nil 切片。SchedulerExecutor
-// 在 Registry 为 nil 时自然退化为"无特化代理"行为，board snapshot 的
-// specialized_agents 字段会被省略（omitempty）。
+// Registrations are keyed so a Plan-scoped Team can be removed without
+// disturbing a static kind or another Team listening on the same event type.
 type AgentRegistry struct {
-	mu      sync.RWMutex
-	entries []SpecializedAgent
+	mu     sync.RWMutex
+	routes map[string]routeRegistration
+	order  []string
 }
 
-// NewAgentRegistry 返回一个空的 registry。
 func NewAgentRegistry() *AgentRegistry {
-	return &AgentRegistry{}
+	return &AgentRegistry{routes: make(map[string]routeRegistration)}
 }
 
-// Register 追加一条特化代理声明。
-// 同 EventType 重复注册会合并 Count（保险：防止 bootstrap 误注册两次）。
+// Register preserves the historical append/merge API used by bootstrap and
+// tests. Repeated registrations of one event type share a stable legacy key:
+// Count accumulates while non-empty Role and non-nil Capabilities use the
+// latest value.
 func (r *AgentRegistry) Register(entry SpecializedAgent) {
-	if r == nil || entry.EventType == "" {
+	if r == nil || entry.EventType == "" || entry.Count <= 0 {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for i, existing := range r.entries {
-		if existing.EventType == entry.EventType {
-			// 合并 Count，Role / Capabilities 以后注册的为准（通常不会冲突）
-			r.entries[i].Count += entry.Count
-			if entry.Role != "" {
-				r.entries[i].Role = entry.Role
-			}
-			if entry.Capabilities != nil {
-				r.entries[i].Capabilities = entry.Capabilities
-			}
-			return
-		}
+	if r.routes == nil {
+		r.routes = make(map[string]routeRegistration)
 	}
-	r.entries = append(r.entries, entry)
+	key := "legacy:" + entry.EventType
+	if existing, ok := r.routes[key]; ok {
+		existing.Count += entry.Count
+		if entry.Role != "" {
+			existing.Role = entry.Role
+		}
+		if entry.Capabilities != nil {
+			existing.Capabilities = cloneStrings(entry.Capabilities)
+		}
+		r.routes[key] = existing
+		return
+	}
+	entry.Capabilities = cloneStrings(entry.Capabilities)
+	r.routes[key] = routeRegistration{key: key, SpecializedAgent: entry}
+	r.order = append(r.order, key)
 }
 
-// Specialized 返回所有特化代理的快照拷贝（按 EventType 的 registry 顺序）。
-// nil registry 返回 nil。
+// RegisterRoute registers a concrete static kind or dynamic Team. key must be
+// stable for the lifetime of the resource (for example "static:worker" or a
+// Team ID). planID is empty for static/global routes and mandatory for a
+// Plan-private dynamic Team. It is an error to reuse a key, because that would
+// make rollback and recovery ambiguous.
+func (r *AgentRegistry) RegisterRoute(key, eventType, planID string, count int, role string, capabilities []string) error {
+	if r == nil {
+		return fmt.Errorf("agent route registry is nil")
+	}
+	if key == "" {
+		return fmt.Errorf("agent route key is empty")
+	}
+	if count <= 0 {
+		return fmt.Errorf("agent route %q count=%d must be positive", key, count)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.routes == nil {
+		r.routes = make(map[string]routeRegistration)
+	}
+	if _, exists := r.routes[key]; exists {
+		return fmt.Errorf("agent route key %q is already registered", key)
+	}
+	r.routes[key] = routeRegistration{
+		key: key, PlanID: planID,
+		SpecializedAgent: SpecializedAgent{
+			EventType: eventType, Count: count, Role: role,
+			Capabilities: cloneStrings(capabilities),
+		},
+	}
+	r.order = append(r.order, key)
+	return nil
+}
+
+// CanRouteForPlan reports whether a Plan may publish to eventType. Static
+// routes (PlanID="") are global; a dynamic Team route is visible only to its
+// owning Plan. Capability guarantees are computed only across listeners that
+// may claim work for that Plan. Team runners independently enforce the same
+// scope at claim time, so an ineligible listener sharing an event type cannot
+// steal another Plan's Task.
+func (r *AgentRegistry) CanRouteForPlan(planID, eventType string, requiredTools ...string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return canRouteLocked(r.routes, planID, true, eventType, requiredTools)
+}
+
+// UnregisterRoute removes exactly one keyed resource. It returns whether a
+// registration existed.
+func (r *AgentRegistry) UnregisterRoute(key string) bool {
+	if r == nil || key == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.routes[key]; !ok {
+		return false
+	}
+	delete(r.routes, key)
+	for i, candidate := range r.order {
+		if candidate == key {
+			r.order = append(r.order[:i], r.order[i+1:]...)
+			break
+		}
+	}
+	return true
+}
+
+// CanRoute reports whether eventType has at least one ready registration and
+// every agent that can claim from that route contains all required tools. The
+// check never unions capabilities: because any listener may win a claim, one
+// weaker kind sharing the route makes it unsafe for a privileged Task.
+func (r *AgentRegistry) CanRoute(eventType string, requiredTools ...string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return canRouteLocked(r.routes, "", false, eventType, requiredTools)
+}
+
+func canRouteLocked(routes map[string]routeRegistration, planID string, scoped bool, eventType string, requiredTools []string) bool {
+	found := false
+	for _, route := range routes {
+		if route.EventType != eventType || route.Count <= 0 {
+			continue
+		}
+		if scoped && route.PlanID != "" && route.PlanID != planID {
+			continue
+		}
+		found = true
+		if !containsAll(route.Capabilities, requiredTools) {
+			return false
+		}
+	}
+	return found
+}
+
+// RouteCapabilities returns the tools guaranteed on every ready listener for
+// eventType. The boolean is false when no runtime registration exists.
+func (r *AgentRegistry) RouteCapabilities(eventType string) ([]string, bool) {
+	if r == nil {
+		return nil, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return routeCapabilitiesLocked(r.routes, "", false, eventType)
+}
+
+// RouteCapabilitiesForPlan is the Plan-scoped counterpart of
+// RouteCapabilities. It includes global static listeners plus dynamic
+// listeners owned by planID, and excludes every other Plan's Team.
+func (r *AgentRegistry) RouteCapabilitiesForPlan(planID, eventType string) ([]string, bool) {
+	if r == nil {
+		return nil, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return routeCapabilitiesLocked(r.routes, planID, true, eventType)
+}
+
+func routeCapabilitiesLocked(routes map[string]routeRegistration, planID string, scoped bool, eventType string) ([]string, bool) {
+	var common []string
+	found := false
+	for _, route := range routes {
+		if route.EventType != eventType || route.Count <= 0 {
+			continue
+		}
+		if scoped && route.PlanID != "" && route.PlanID != planID {
+			continue
+		}
+		if !found {
+			common = cloneStrings(route.Capabilities)
+			found = true
+			continue
+		}
+		common = intersectStrings(common, route.Capabilities)
+	}
+	return common, found
+}
+
+// Specialized returns an aggregated snapshot in first-registration order.
+// Empty/default routes remain queryable through CanRoute but are not included.
 func (r *AgentRegistry) Specialized() []SpecializedAgent {
 	if r == nil {
 		return nil
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if len(r.entries) == 0 {
+	return specializedLocked(r.routes, r.order, "", false)
+}
+
+// SpecializedForPlan returns the Scheduler-visible route snapshot for one
+// Plan: all global static routes plus only that Plan's dynamic Teams. The
+// global Specialized diagnostic API intentionally remains unchanged.
+func (r *AgentRegistry) SpecializedForPlan(planID string) []SpecializedAgent {
+	if r == nil {
 		return nil
 	}
-	out := make([]SpecializedAgent, len(r.entries))
-	copy(out, r.entries)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return specializedLocked(r.routes, r.order, planID, true)
+}
+
+func specializedLocked(routes map[string]routeRegistration, order []string, planID string, scoped bool) []SpecializedAgent {
+	byEvent := make(map[string]int)
+	var out []SpecializedAgent
+	for _, key := range order {
+		route, ok := routes[key]
+		if !ok || route.EventType == "" || route.Count <= 0 {
+			continue
+		}
+		if scoped && route.PlanID != "" && route.PlanID != planID {
+			continue
+		}
+		idx, exists := byEvent[route.EventType]
+		if !exists {
+			byEvent[route.EventType] = len(out)
+			out = append(out, SpecializedAgent{
+				EventType: route.EventType, Count: route.Count, Role: route.Role,
+				Capabilities: cloneStrings(route.Capabilities),
+			})
+			continue
+		}
+		out[idx].Count += route.Count
+		if route.Role != "" {
+			out[idx].Role = route.Role
+		}
+		// One event type is a shared claim queue. Expose only tools guaranteed
+		// on every listener; showing the last listener's allowlist would invite
+		// Scheduler to publish work that a weaker listener may claim.
+		out[idx].Capabilities = intersectStrings(out[idx].Capabilities, route.Capabilities)
+	}
+	return out
+}
+
+func containsAll(have, required []string) bool {
+	if len(required) == 0 {
+		return true
+	}
+	set := make(map[string]struct{}, len(have))
+	for _, item := range have {
+		set[item] = struct{}{}
+	}
+	for _, item := range required {
+		if _, ok := set[item]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneStrings(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
+}
+
+func intersectStrings(left, right []string) []string {
+	if len(left) == 0 || len(right) == 0 {
+		return []string{}
+	}
+	set := make(map[string]struct{}, len(right))
+	for _, item := range right {
+		set[item] = struct{}{}
+	}
+	out := make([]string, 0, len(left))
+	for _, item := range left {
+		if _, ok := set[item]; ok {
+			out = append(out, item)
+		}
+	}
 	return out
 }

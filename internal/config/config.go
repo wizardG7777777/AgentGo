@@ -69,6 +69,19 @@ type SchedulerKind struct {
 	Model string `yaml:"model,omitempty" json:"model,omitempty"`
 }
 
+// AgentTemplatesConfig controls the optional external AgentTemplate catalogs
+// and the process-wide limit for agents provisioned from templates. Builtin
+// templates are always available and do not need to be listed here.
+//
+// UserDirs are loaded into the user/* namespace. ProjectDirs are resolved
+// relative to ProjectRoot and loaded into project/*. Missing directories are
+// ignored; malformed templates in an existing directory fail startup.
+type AgentTemplatesConfig struct {
+	UserDirs         []string `yaml:"user_dirs,omitempty" json:"user_dirs,omitempty"`
+	ProjectDirs      []string `yaml:"project_dirs,omitempty" json:"project_dirs,omitempty"`
+	MaxRuntimeAgents int      `yaml:"max_runtime_agents,omitempty" json:"max_runtime_agents,omitempty"`
+}
+
 // InfraConfig 非 Agent 运行时基础设施（v4 §11.4）。
 // 子类型独立命名（不用匿名嵌套 struct），便于单测、扩展与 IDE 跳转。
 type InfraConfig struct {
@@ -107,9 +120,12 @@ type RosterConfig struct {
 // 本结构的 Model 字段仅作为运行时元数据使用——主要用途是 HistoryEntry.Model 记录
 // （详见 nextUpgrade_v4.md §11.7.3 模型切换基准重置）与运行时日志。
 type AgentRuntimeConfig struct {
-	InstanceID                   string
-	Kind                         string
-	EventType                    string
+	InstanceID string
+	Kind       string
+	EventType  string
+	// PlanIDScope binds a dynamically provisioned Team runner to exactly one
+	// Plan. Empty keeps static/configured agents global and backward compatible.
+	PlanIDScope                  string
 	AllowedTools                 []string
 	Model                        string
 	SystemPrompt                 string
@@ -131,21 +147,22 @@ type Config struct {
 	// yaml/json 解析时会被默默忽略（不影响启动），但不再产生任何运行时效果。
 	// 用户必须改写为本结构体顶层 yaml 形态：llm: / agents: / infra: / scheduler: / 等。
 	// ============================================================
-	LLM                       LLMConfig     `yaml:"llm" json:"llm"`
-	Scheduler                 SchedulerKind `yaml:"scheduler" json:"scheduler"`
-	Agents                    []AgentKind   `yaml:"agents" json:"agents"`
-	Infra                     InfraConfig   `yaml:"infra" json:"infra"`
-	StartupProbe              string        `yaml:"startup_probe,omitempty" json:"startup_probe,omitempty"`
-	StartupProbeTimeoutSec    int           `yaml:"startup_probe_timeout_sec,omitempty" json:"startup_probe_timeout_sec,omitempty"`
-	StartupProbeFailureAction string        `yaml:"startup_probe_failure_action,omitempty" json:"startup_probe_failure_action,omitempty"`
+	LLM                       LLMConfig            `yaml:"llm" json:"llm"`
+	Scheduler                 SchedulerKind        `yaml:"scheduler" json:"scheduler"`
+	Agents                    []AgentKind          `yaml:"agents" json:"agents"`
+	AgentTemplates            AgentTemplatesConfig `yaml:"agent_templates,omitempty" json:"agent_templates,omitempty"`
+	Infra                     InfraConfig          `yaml:"infra" json:"infra"`
+	StartupProbe              string               `yaml:"startup_probe,omitempty" json:"startup_probe,omitempty"`
+	StartupProbeTimeoutSec    int                  `yaml:"startup_probe_timeout_sec,omitempty" json:"startup_probe_timeout_sec,omitempty"`
+	StartupProbeFailureAction string               `yaml:"startup_probe_failure_action,omitempty" json:"startup_probe_failure_action,omitempty"`
 
 	// ============================================================
 	// 顶层杂项字段（v4 仍保留在顶层，与 setting.v4.yaml 对应）
 	// ============================================================
-	HashlineEnabled       *bool `yaml:"hashline_enabled,omitempty" json:"hashline_enabled,omitempty"`
-	ProjectRoot           string `yaml:"project_root" json:"project_root"`
-	MaxSubtaskDepth       int    `yaml:"max_subtask_depth" json:"max_subtask_depth"`
-	ShellTimeoutSec       int    `yaml:"shell_timeout_sec" json:"shell_timeout_sec"`
+	HashlineEnabled *bool  `yaml:"hashline_enabled,omitempty" json:"hashline_enabled,omitempty"`
+	ProjectRoot     string `yaml:"project_root" json:"project_root"`
+	MaxSubtaskDepth int    `yaml:"max_subtask_depth" json:"max_subtask_depth"`
+	ShellTimeoutSec int    `yaml:"shell_timeout_sec" json:"shell_timeout_sec"`
 
 	// TransferNoteMaxTokens 是 TransferNote 单条最大 token 预算。agent 在生成
 	// L1/L3 交接备忘时按此预算截断文本长度——按 1 token ≈ 2 runes 估算。
@@ -225,6 +242,9 @@ func DefaultConfig() *Config {
 		SearchAPIProvider:     "duckduckgo_html",
 		SessionRetentionDays:  30,
 		SessionArchiveMax:     50,
+		AgentTemplates: AgentTemplatesConfig{
+			MaxRuntimeAgents: 8,
+		},
 		Infra: InfraConfig{
 			Watchdog:     WatchdogConfig{IntervalSec: 30},
 			MailNotifier: MailNotifierConfig{Enabled: true, IntervalSec: 5},
@@ -298,8 +318,9 @@ func LoadConfig(path string, explicit bool) (*Config, error) {
 // Validate 在 Bootstrap 主流程中调用，对应 nextUpgrade_v4.md §11.5.3 全部启动校验
 // 规则。任一规则失败即返回 non-nil error 终止启动。
 //
-// v4 唯一格式：cfg.Agents 必须非空。若 yaml 缺 agents: 列表，启动直接报错——
-// 这是 v3 兼容层 2026-04-26 删除后的硬约束（详见 §11 设计原则第 10 条）。
+// agents 可以为空，此时系统以 Scheduler-only 模式启动，并可在运行期从
+// AgentTemplate provision Team。只要 agents 非空，原有静态 kind 的全部严格
+// 校验仍然执行，非法配置不会静默降级。
 func (c *Config) Validate() error {
 	// 规则 9：所有 v4 路径字段不含反斜杠（路径风格红线）。
 	// 覆盖范围：ProjectRoot + agents[*].system_prompt_file。
@@ -318,10 +339,31 @@ func (c *Config) Validate() error {
 	// 整块缺失 / 为空等价于 scheduler.model = llm.default_model，不报错。
 	// 出现 model 字段时必须为非空字符串。
 
-	// 规则 2：agents 列表必须非空（v4 §11.5.3 第 2 条）。
-	// v3 兼容层 2026-04-26 删除——空 agents 列表直接报错，没有 fallback。
-	if len(c.Agents) == 0 {
-		return fmt.Errorf("agents 列表为空：v4 配置必须声明至少一个 kind（详见 setting.v4.yaml 模板 / nextUpgrade_v4.md §11.3）")
+	// Scheduler 和内置 AgentTemplate 始终存在，因此即使配置了模型完整的
+	// 静态 Agent，仍必须有一个全局或 Scheduler 模型。BaseURL/APIKey 保留
+	// provider/SDK 的既有默认与环境变量语义，不在配置层强制。
+	model := strings.TrimSpace(c.Scheduler.Model)
+	if model == "" {
+		model = strings.TrimSpace(c.LLM.DefaultModel)
+	}
+	if model == "" {
+		return fmt.Errorf("Scheduler 配置缺少模型：请设置 llm.default_model 或 scheduler.model")
+	}
+	for i, agentKind := range c.Agents {
+		if strings.TrimSpace(agentKind.Model) == "" && strings.TrimSpace(c.LLM.DefaultModel) == "" {
+			return fmt.Errorf("agents[%d] (kind=%q) 缺少模型：请设置 agents[%d].model 或 llm.default_model；scheduler.model 只供 Scheduler 和默认 AgentTemplate 使用", i, agentKind.Kind, i)
+		}
+	}
+
+	// 零值（直接构造或 YAML 显式填 0）由 TeamManager 解析为默认 8；
+	// 负数和超过硬上限的值始终拒绝。
+	if c.AgentTemplates.MaxRuntimeAgents < 0 || c.AgentTemplates.MaxRuntimeAgents > 32 {
+		return fmt.Errorf("agent_templates.max_runtime_agents=%d 必须在 0..32 之间（0 或省略时默认 8）", c.AgentTemplates.MaxRuntimeAgents)
+	}
+	for i, dir := range append(append([]string(nil), c.AgentTemplates.UserDirs...), c.AgentTemplates.ProjectDirs...) {
+		if strings.Contains(dir, "\\") {
+			return fmt.Errorf("agent_templates 目录[%d] 包含反斜杠（仅允许 forward slash）: %q", i, dir)
+		}
 	}
 
 	// 规则 3 + 12：每个 AgentKind.Kind 在列表内唯一且非空字符串

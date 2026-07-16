@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"agentgo/internal/agenttemplate"
 	"agentgo/internal/config"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
@@ -52,15 +53,38 @@ func TestBuildBoardJSON_Resources(t *testing.T) {
 func TestBuildBoardJSON_ResourcesDefault(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	cfg := &config.Config{} // WorkerCount=0 → 默认 1
+	cfg := &config.Config{} // Scheduler-only: no static worker route
 
 	out := BuildBoardJSON(s, cfg, "immediate", model.Event{Type: model.EventUserInput}, SnapshotSources{})
 
-	if !strings.Contains(out, `"worker_count": 1`) {
-		t.Errorf("expected worker_count default 1, got: %s", out)
+	if !strings.Contains(out, `"worker_count": 0`) {
+		t.Errorf("expected worker_count=0, got: %s", out)
 	}
-	if !strings.Contains(out, `"available_workers": 1`) {
-		t.Errorf("expected available_workers=1, got: %s", out)
+	if !strings.Contains(out, `"available_workers": 0`) {
+		t.Errorf("expected available_workers=0, got: %s", out)
+	}
+}
+
+func TestBuildBoardJSON_SchedulerOnlySeparatesTemplatesFromReadyRoutes(t *testing.T) {
+	s := store.NewMemoryTaskStore(make(chan model.Event, 8), 16, 1, 60)
+	catalog, err := agenttemplate.Load(agenttemplate.LoadOptions{
+		DefaultModel: "gpt-test", ValidateTools: func([]string) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := BuildBoardJSON(s, &config.Config{}, "immediate", model.Event{Type: model.EventUserInput}, SnapshotSources{
+		TemplateCatalog: catalog,
+	})
+	bs := parseSnapshot(t, out)
+	if bs.Resources.RuntimeMode != "scheduler_only" || bs.Resources.WorkerCount != 0 || len(bs.Resources.SpecializedAgents) != 0 {
+		t.Fatalf("unexpected Scheduler-only runtime facts: %+v", bs.Resources)
+	}
+	if len(bs.Resources.AgentTemplates) != 3 {
+		t.Fatalf("builtins should be visible as templates without becoming routes: %+v", bs.Resources.AgentTemplates)
+	}
+	if len(bs.Resources.AgentCapabilities) != 0 {
+		t.Fatalf("available templates must not fabricate active capabilities: %+v", bs.Resources.AgentCapabilities)
 	}
 }
 
@@ -336,7 +360,8 @@ func TestAgentTypeFromEventType(t *testing.T) {
 		"":              "worker",
 		"explore":       "explorer",
 		"__scheduler__": "scheduler",
-		"random":        "unknown",
+		"random":        "random",
+		"team:abc":      "team:abc",
 	}
 	for in, want := range cases {
 		if got := agentTypeFromEventType(in); got != want {
@@ -410,6 +435,52 @@ func TestBuildBoardJSON_AgentCapabilities_NilWorker(t *testing.T) {
 	}
 	if bs.Resources.AgentCapabilities[0].AgentType != "explore" {
 		t.Errorf("agent_type=%q, want explore", bs.Resources.AgentCapabilities[0].AgentType)
+	}
+}
+
+func TestBuildBoardJSON_PlanSnapshotHidesOtherPlansTeams(t *testing.T) {
+	s := store.NewMemoryTaskStore(make(chan model.Event, 8), 16, 1, 60)
+	cfg := &config.Config{}
+	reg := NewAgentRegistry()
+	mb := mailbox.NewRegistry(8)
+	for _, route := range []struct {
+		key, eventType, planID string
+	}{
+		{key: "static:research", eventType: "research"},
+		{key: "team:a", eventType: "team:a", planID: "plan-a"},
+		{key: "team:b", eventType: "team:b", planID: "plan-b"},
+	} {
+		if err := reg.RegisterRoute(route.key, route.eventType, route.planID, 1, route.key, []string{"read_file"}); err != nil {
+			t.Fatal(err)
+		}
+		mb.Register(route.key+":agent", route.eventType)
+	}
+
+	out := BuildBoardJSON(s, cfg, "plan", model.Event{}, SnapshotSources{
+		AgentRegistry: reg,
+		MBRegistry:    mb,
+		Plan:          &model.Plan{ID: "plan-a"},
+	})
+	bs := parseSnapshot(t, out)
+	if len(bs.Resources.SpecializedAgents) != 2 {
+		t.Fatalf("Plan snapshot specialized routes=%+v, want static + Plan A Team", bs.Resources.SpecializedAgents)
+	}
+	if len(bs.Resources.AgentCapabilities) != 2 {
+		t.Fatalf("Plan snapshot capabilities=%+v, want static + Plan A Team", bs.Resources.AgentCapabilities)
+	}
+	if len(bs.Resources.Agents) != 2 {
+		t.Fatalf("Plan snapshot agents=%+v, want static + Plan A Team instances", bs.Resources.Agents)
+	}
+	if strings.Contains(out, `"team:b"`) {
+		t.Fatalf("Plan B private route leaked into Plan A snapshot: %s", out)
+	}
+	if !strings.Contains(out, `"research"`) || !strings.Contains(out, `"team:a"`) {
+		t.Fatalf("Plan snapshot omitted global static or owning Team route: %s", out)
+	}
+
+	global := BuildBoardJSON(s, cfg, "immediate", model.Event{}, SnapshotSources{AgentRegistry: reg, MBRegistry: mb})
+	if !strings.Contains(global, `"team:b"`) {
+		t.Fatalf("unscoped diagnostic snapshot should retain global registry view: %s", global)
 	}
 }
 

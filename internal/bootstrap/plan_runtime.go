@@ -272,6 +272,11 @@ func (b planTaskBackend) PublishTask(ctx context.Context, spec plan.TaskSpec) (s
 		Dependencies:       append([]string(nil), spec.Dependencies...),
 		PlanMutationSource: "acceptance",
 	}
+	if spec.Role == model.PlanNodeRoleAcceptance {
+		// A formal AcceptanceRun has exactly one bound runner identity. Even if a
+		// custom verifier route has multiple replicas, only one may claim it.
+		task.MaxConcurrency = 1
+	}
 	if spec.Metadata != nil {
 		task.AcceptanceRunID = spec.Metadata["acceptance_run_id"]
 	}

@@ -71,6 +71,24 @@ func (r *TaskEndCallbackReactor) RegisterCallback(cb TaskEndCallback) func() {
 	}
 }
 
+// CallbackCount reports the number of live callback registrations. It is
+// intended for lifecycle diagnostics and regression tests; nil holes retained
+// for slot reuse are not counted.
+func (r *TaskEndCallbackReactor) CallbackCount() int {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	count := 0
+	for _, cb := range r.callbacks {
+		if cb != nil {
+			count++
+		}
+	}
+	return count
+}
+
 func (r *TaskEndCallbackReactor) Name() string  { return "task-end-callback" }
 func (r *TaskEndCallbackReactor) IsSync() bool  { return true }
 func (r *TaskEndCallbackReactor) Priority() int { return 100 }

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/agenttemplate"
 	"agentgo/internal/config"
 	"agentgo/internal/gate"
 	"agentgo/internal/hook"
@@ -32,6 +33,7 @@ import (
 	"agentgo/internal/shell"
 	"agentgo/internal/spawn"
 	"agentgo/internal/store"
+	"agentgo/internal/team"
 	"agentgo/internal/tools"
 	"agentgo/internal/trace"
 	"agentgo/internal/tui"
@@ -55,23 +57,74 @@ type System struct {
 	// v4：所有执行/调查代理都是 runner.Runner（取代旧 worker.Worker / explorer.Explorer
 	// 两个 package；详见 nextUpgrade_v4.md §11.6.6）。kind × replicas 实例化在 Bootstrap()
 	// 主流程展开。
-	Runners      []*runner.Runner
-	ApprovalCh   chan shell.ApprovalRequest // 命令审批通道，Worker→TUI
-	ArtifactLog  *store.ArtifactLog         // Artifacts 持久化日志，Shutdown 时需 Close；nil 表示持久化已禁用
-	SessionMgr   *session.SessionManager    // Session 管理器，nil 表示无 Session 模式
-	SpawnManager *spawn.Manager             // v5 Phase 5 S5+S6：ad-hoc agent 生命周期管理器
-	StatusCh     chan string                // TUI 日志/进度消息通道；Bootstrap 创建，RunCLI 消费
-	OutputCh     chan string                // TUI Agent 用户可见输出通道（result 卡片），与日志分离
-	LogFile      *os.File                   // system.log 句柄，Bootstrap 打开，Shutdown 关闭
-	resultMu     sync.Mutex
-	lastResult   *session.ResultSnapshot
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
+	Runners        []*runner.Runner
+	ApprovalCh     chan shell.ApprovalRequest // 命令审批通道，Worker→TUI
+	ArtifactLog    *store.ArtifactLog         // Artifacts 持久化日志，Shutdown 时需 Close；nil 表示持久化已禁用
+	SessionMgr     *session.SessionManager    // Session 管理器，nil 表示无 Session 模式
+	SpawnManager   *spawn.Manager             // v5 Phase 5 S5+S6：ad-hoc agent 生命周期管理器
+	AgentTemplates *agenttemplate.Catalog     // immutable builtin/user/project template catalog
+	TeamManager    *team.Manager              // Plan-scoped template Team lifecycle and recovery
+	TeamStore      *team.Store                // fsynced TeamSpec identity store
+	StatusCh       chan string                // TUI 日志/进度消息通道；Bootstrap 创建，RunCLI 消费
+	OutputCh       chan string                // TUI Agent 用户可见输出通道（result 卡片），与日志分离
+	LogFile        *os.File                   // system.log 句柄，Bootstrap 打开，Shutdown 关闭
+	resultMu       sync.Mutex
+	lastResult     *session.ResultSnapshot
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
 }
 
 type BootstrapOptions struct {
 	SkipStartupProbe bool
 	ResumeSessionID  string
+}
+
+func resolveAgentTemplateDirs(cfg *config.Config) ([]string, []string, error) {
+	if cfg == nil {
+		return nil, nil, fmt.Errorf("config is nil")
+	}
+	projectRoot := cfg.ProjectRoot
+	if projectRoot == "" {
+		projectRoot = "."
+	}
+	projectRoot, err := filepath.Abs(projectRoot)
+	if err != nil {
+		return nil, nil, err
+	}
+	resolve := func(raw, base string, expandHome bool) (string, error) {
+		path := strings.TrimSpace(raw)
+		if path == "" {
+			return "", fmt.Errorf("template directory is empty")
+		}
+		if expandHome && (path == "~" || strings.HasPrefix(path, "~/")) {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return "", err
+			}
+			path = filepath.Join(home, strings.TrimPrefix(path, "~/"))
+		}
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(base, filepath.FromSlash(path))
+		}
+		return filepath.Clean(path), nil
+	}
+	userDirs := make([]string, 0, len(cfg.AgentTemplates.UserDirs))
+	for _, raw := range cfg.AgentTemplates.UserDirs {
+		dir, err := resolve(raw, ".", true)
+		if err != nil {
+			return nil, nil, err
+		}
+		userDirs = append(userDirs, dir)
+	}
+	projectDirs := make([]string, 0, len(cfg.AgentTemplates.ProjectDirs))
+	for _, raw := range cfg.AgentTemplates.ProjectDirs {
+		dir, err := resolve(raw, projectRoot, false)
+		if err != nil {
+			return nil, nil, err
+		}
+		projectDirs = append(projectDirs, dir)
+	}
+	return userDirs, projectDirs, nil
 }
 
 func Bootstrap(configPath string, explicit bool, skipStartupProbe bool) (*System, error) {
@@ -91,6 +144,22 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("v4 配置校验失败: %w", err)
 	}
+	userTemplateDirs, projectTemplateDirs, err := resolveAgentTemplateDirs(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("解析 AgentTemplate 目录失败: %w", err)
+	}
+	templateDefaultModel := cfg.LLM.DefaultModel
+	if templateDefaultModel == "" {
+		templateDefaultModel = cfg.Scheduler.Model
+	}
+	templateCatalog, err := agenttemplate.Load(agenttemplate.LoadOptions{
+		UserDirs: userTemplateDirs, ProjectDirs: projectTemplateDirs,
+		DefaultModel: templateDefaultModel, ValidateTools: tools.ValidateToolNames,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("加载 AgentTemplate catalog 失败: %w", err)
+	}
+	log.Printf("[启动] AgentTemplate catalog 已加载 (%d 个模板)", len(templateCatalog.List()))
 
 	// Step 1.1: 启动期 banner（§9.5.1）——打印逐 kind 摘要 + 脱敏 api_key，
 	//             让用户视觉核对 YAML 是否被正确读取。
@@ -190,6 +259,16 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	planCoordinator.SetAcceptanceVerifier(planAcceptanceVerifier{store: taskStore, projectRoot: cfg.ProjectRoot})
 	taskStore.SetTaskPlanHooks(makeTaskPlanHooks(planCoordinator))
 	log.Printf("[启动] PlanCoordinator 初始化完成 (state=%s)", planStatePath)
+
+	teamStatePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "agent-teams.json")
+	if sessMgr != nil && sessMgr.Current() != nil {
+		teamStatePath = filepath.Join(sessMgr.Current().Dir, "agent-teams.json")
+	}
+	teamStore, teamErr := team.OpenStore(teamStatePath)
+	if teamErr != nil {
+		return nil, fmt.Errorf("初始化 Agent TeamStore 失败: %w", teamErr)
+	}
+	log.Printf("[启动] Agent TeamStore 初始化完成 (state=%s)", teamStatePath)
 
 	// Step 2.3: Artifacts 持久化（JSONL 追加日志，2026-04-12 持久化专题起头）
 	//
@@ -348,14 +427,13 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	schedulerLLM := buildKindLLMClient(cfg.LLM, cfg.Scheduler.Model)
 
 	// Step 5.5: 构造特化代理注册表（Sprint 3 #7 Scheduler 分配感知）
-	// v4：扫描 cfg.Agents，把所有 EventType != "" 的 kind 注册为特化代理。
+	// v4：扫描 cfg.Agents，把每个静态 kind 注册为 ready route；EventType != ""
+	// 的 kind 同时出现在 Scheduler 的特化代理视图中。默认队列也必须登记，
+	// 否则 Scheduler-only 模式无法区分“空字符串 route”与“没有 route”。
 	// 这取代了 v3 时代基于 cfg.AgentDeclarations + cfg.ExplorerEventType 的硬编码逻辑——
 	// 现在用户可以声明任意命名的特化 kind（不止 explorer），event_type 字段就是分派键。
 	agentRegistry := scheduler.NewAgentRegistry()
 	for _, kind := range cfg.Agents {
-		if kind.EventType == "" {
-			continue // 默认队列（worker 类）—— 不算特化
-		}
 		caps := kind.Tools
 		if len(caps) == 0 && kind.Profile != "" {
 			caps = cfg.ToolProfiles[kind.Profile] // profile 解析失败留 nil，启动校验已保证 profile 存在
@@ -364,12 +442,9 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		if role == "" {
 			role = fmt.Sprintf("kind=%s（监听 event_type=%q）", kind.Kind, kind.EventType)
 		}
-		agentRegistry.Register(scheduler.SpecializedAgent{
-			EventType:    kind.EventType,
-			Count:        kind.Replicas,
-			Role:         role,
-			Capabilities: caps,
-		})
+		if err := agentRegistry.RegisterRoute("static:"+kind.Kind, kind.EventType, "", kind.Replicas, role, caps); err != nil {
+			return nil, fmt.Errorf("注册静态 Agent route kind=%q 失败: %w", kind.Kind, err)
+		}
 	}
 	for _, sa := range agentRegistry.Specialized() {
 		desc := sa.Role
@@ -444,20 +519,6 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		},
 	}
 
-	// Step 5: 创建调度器（Phase 3：scheduler 是 agent.Agent 实例 + Activator + ModeStore）
-	// 工具集 = Worker 全集 + SchedulerGroup，可以读文件 / 搜索 / 查网页 / 跑 shell。
-	// EventCh 由 Activator 监听，转换为 EventType="__scheduler__" 的 task。
-	sched := scheduler.New(
-		taskStore, r, schedulerLLM, eventCh, cfg, cancelRegistry, mbRegistry, approvalCh,
-		gateReg, storeView, recordToolCall, agentRegistry, memoryStore,
-		outputWriter, planCoordinator,
-	)
-	if sched.Agent != nil {
-		sched.Agent.Activity = activity
-		activity.RegisterAgent(sched.Agent.ID, "scheduler")
-	}
-	sched.SchedulerExec.ToolHealth = toolHealth
-
 	// Step 8: 创建执行代理（v4 §11.6.1 唯一路径——按 kind × replicas 实例化统一 Runner）
 	// 共享 RunnerDeps 一次构造、所有 kind/replica 共用
 	// searchProvider 已在 Step 6.8 构造，复用同一实例（避免重复 fallback 日志）。
@@ -474,6 +535,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		RecordToolCall:        recordToolCall,
 		Memory:                memoryStore,
 		PlanCoordinator:       planCoordinator,
+		RouteValidator:        agentRegistry,
 		Activity:              activity,
 		MBRegistry:            mbRegistry,
 		CancelRegistry:        cancelRegistry,
@@ -509,6 +571,32 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 				rt.InstanceID, kind.Kind, rt.Model)
 		}
 	}
+
+	// Step 8.2: 构造 Plan-scoped AgentTemplate TeamManager。它与静态
+	// cfg.Agents 共用 RunnerDeps，但只在 System.Start 后恢复/启动动态 Team。
+	teamLLMFactory := team.LLMFactory(func(model string) llm.Client {
+		return buildKindLLMClient(cfg.LLM, model)
+	})
+	teamMgr := team.NewManager(
+		deps, teamLLMFactory, templateCatalog, planCoordinator, teamStore,
+		agentRegistry, cfg.AgentTemplates.MaxRuntimeAgents,
+	)
+	if err := reactorReg.Register(teamMgr); err != nil {
+		return nil, fmt.Errorf("注册 AgentTemplate TeamManager 失败: %w", err)
+	}
+
+	// Step 5: Scheduler 在 TeamManager 构造后装配，因而模板发现和动态
+	// provision 工具拿到的是同一个 runtime authority。
+	sched := scheduler.New(
+		taskStore, r, schedulerLLM, eventCh, cfg, cancelRegistry, mbRegistry, approvalCh,
+		gateReg, storeView, recordToolCall, agentRegistry, templateCatalog, teamMgr,
+		memoryStore, outputWriter, planCoordinator,
+	)
+	if sched.Agent != nil {
+		sched.Agent.Activity = activity
+		activity.RegisterAgent(sched.Agent.ID, "scheduler")
+	}
+	sched.SchedulerExec.ToolHealth = toolHealth
 
 	// Step 8.5: spawn.Manager 构造 + 注册（v5 Phase 5 S5+S6）
 	//
@@ -594,6 +682,9 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		Runners:         runners,
 		ApprovalCh:      approvalCh,
 		SpawnManager:    spawnMgr,
+		AgentTemplates:  templateCatalog,
+		TeamManager:     teamMgr,
+		TeamStore:       teamStore,
 		StatusCh:        statusCh,
 		OutputCh:        outputCh,
 		LogFile:         logFile,
@@ -613,7 +704,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 }
 
 // Start 启动所有后台 goroutine。cancel 用于 CLI /quit 触发全局退出。
-func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
+func (s *System) Start(ctx context.Context, cancel context.CancelFunc) error {
 	s.cancel = cancel
 
 	// 把当前 ctx 作为所有 ad-hoc spawn 的父 ctx——Shutdown 通过 cancel() 传播。
@@ -621,6 +712,14 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
 	// system 关闭时无法停下。
 	if s.SpawnManager != nil {
 		s.SpawnManager.SetParentContext(ctx)
+	}
+	// 动态 Team 必须先完成持久化恢复和 route 注册，Scheduler 才能看到一致的
+	// runtime snapshot 并安全地发布任务。恢复不一致时启动 fail-closed。
+	if s.TeamManager != nil {
+		if err := s.TeamManager.Start(ctx); err != nil {
+			return fmt.Errorf("恢复 AgentTemplate Team 失败: %w", err)
+		}
+		log.Printf("[启动] AgentTemplate TeamManager 已启动 (%d 个 runtime agent)", s.TeamManager.ActiveCount())
 	}
 
 	// Step 5: 启动调度器（Phase 3：两个 goroutine —— Agent poll + Activator 事件桥）
@@ -669,6 +768,7 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) {
 	log.Printf("[启动] kind-based agents 已启动 (%d 个 runner 实例)", len(s.Runners))
 
 	fmt.Println("[启动] 系统就绪，等待用户输入")
+	return nil
 }
 
 // tuiLogWriter 把日志同时写入文件，并把每一行非空内容复制到 TUI 的 status channel。
@@ -761,6 +861,11 @@ func (s *System) Shutdown() {
 	// SpawnManager 内部的 wg 管理。
 	if s.SpawnManager != nil {
 		s.SpawnManager.Shutdown()
+	}
+	// TeamManager 持有自己的 runtime runner goroutine；先撤销动态 route 并
+	// 等待清理 mailbox/activity/roster，再等待 System 级 goroutine。
+	if s.TeamManager != nil {
+		s.TeamManager.Shutdown()
 	}
 	s.wg.Wait()
 	s.saveRuntimeSnapshot()

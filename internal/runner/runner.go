@@ -14,6 +14,7 @@ import (
 	"io"
 	"log"
 	"strings"
+	"sync"
 
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
@@ -54,12 +55,16 @@ type RunnerDeps struct {
 	// 为 nil 时 Agent 退化为不读取/不写入（行为等价于 v4 无 team-awareness）。
 	Memory          memory.Store
 	PlanCoordinator *plan.Coordinator
-	Activity        *agent.ActivityTracker
-	MBRegistry      *mailbox.Registry
-	CancelRegistry  *store.TaskCancelRegistry
-	SearchProvider  webtool.SearchProvider
-	ShellFilter     *shell.CommandFilter
-	ApprovalCh      chan<- shell.ApprovalRequest
+	// RouteValidator is the shared runtime route authority. It lets every
+	// publish_task caller enforce Plan-private Team ownership, not only the
+	// Scheduler. Nil preserves compatibility for isolated runner tests.
+	RouteValidator tools.RouteValidator
+	Activity       *agent.ActivityTracker
+	MBRegistry     *mailbox.Registry
+	CancelRegistry *store.TaskCancelRegistry
+	SearchProvider webtool.SearchProvider
+	ShellFilter    *shell.CommandFilter
+	ApprovalCh     chan<- shell.ApprovalRequest
 	// UserOutput 是用户可见内容的输出目标。非 nil 时，agent 的 IsUserFacing 输出
 	// 和 scheduler 的 report_done 会写入此处，而不是直接 fmt.Printf。
 	UserOutput io.Writer
@@ -85,6 +90,10 @@ type RunnerDeps struct {
 // 通过 AgentRuntimeConfig 表达，无需多份壳代码。
 type Runner struct {
 	agent *agent.Agent
+
+	lifecycleMu           sync.Mutex
+	closed                bool
+	unregisterTaskEndHook func()
 }
 
 // New 用 AgentRuntimeConfig + RunnerDeps 构造 Runner。
@@ -158,6 +167,7 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 		executor,
 		rt.AgentMaxLoops,
 	)
+	a.PlanIDScope = rt.PlanIDScope
 	a.CancelRegistry = deps.CancelRegistry
 	a.MaxRetries = rt.TaskMaxRetries
 	a.IdleThreshold = 0
@@ -181,19 +191,20 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	// trace.KindTaskCompleted/Failed/Cancelled/Retry emit 同步阶段执行。
 	// 时序差异不影响 holder 语义——holder 仅被 LLM 工具阶段读取，task 终态事件
 	// emit 时主流程已退出 ReactLoop，无并发读取冲突。
+	r := &Runner{agent: a}
 	if deps.TaskEndCallbacks != nil {
 		agentID := rt.InstanceID
 		oneShot := strings.HasPrefix(rt.EventType, "adhoc:")
-		var unregister func()
-		unregister = deps.TaskEndCallbacks.RegisterCallback(func(ev trace.Event) error {
+		unregister := deps.TaskEndCallbacks.RegisterCallback(func(ev trace.Event) error {
 			if ev.AgentID == agentID {
 				holder.Set("")
-				if oneShot && unregister != nil {
-					unregister()
+				if oneShot {
+					r.Close()
 				}
 			}
 			return nil
 		})
+		r.installTaskEndHook(unregister)
 	}
 	a.FileCache = fileCache
 	if deps.MBRegistry != nil {
@@ -203,7 +214,7 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	a.Memory = deps.Memory
 	a.UserOutput = deps.UserOutput
 
-	return &Runner{agent: a}
+	return r
 }
 
 func requireRunnablePlan(coordinator *plan.Coordinator, task *model.Task) error {
@@ -332,6 +343,50 @@ func (r *Runner) ID() string {
 // Run 启动 Runner 主循环，阻塞直到 ctx 取消。
 func (r *Runner) Run(ctx context.Context) {
 	r.agent.Run(ctx)
+}
+
+// RunWithReady starts the Runner and reports readiness only after its Agent has
+// successfully entered the task-store claim loop.
+func (r *Runner) RunWithReady(ctx context.Context, ready func()) {
+	r.agent.RunWithReady(ctx, ready)
+}
+
+// Close releases process-local registrations owned by this Runner. It is safe
+// to call concurrently and more than once. Run lifecycle owners should call it
+// after Run returns; one-shot runners also close themselves on their terminal
+// task event.
+func (r *Runner) Close() {
+	if r == nil {
+		return
+	}
+	r.lifecycleMu.Lock()
+	if r.closed {
+		r.lifecycleMu.Unlock()
+		return
+	}
+	r.closed = true
+	unregister := r.unregisterTaskEndHook
+	r.unregisterTaskEndHook = nil
+	r.lifecycleMu.Unlock()
+	if unregister != nil {
+		unregister()
+	}
+}
+
+func (r *Runner) installTaskEndHook(unregister func()) {
+	if unregister == nil {
+		return
+	}
+	r.lifecycleMu.Lock()
+	if !r.closed {
+		r.unregisterTaskEndHook = unregister
+		r.lifecycleMu.Unlock()
+		return
+	}
+	r.lifecycleMu.Unlock()
+	// Close may race registration during construction. If it won, immediately
+	// release the just-created callback rather than leaving a stale registration.
+	unregister()
 }
 
 // Agent 暴露内部 *agent.Agent，供 bootstrap 在需要直接配置时使用

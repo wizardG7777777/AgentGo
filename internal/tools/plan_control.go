@@ -24,10 +24,11 @@ import (
 // the full group; custom acceptance agents normally receive only
 // submit_acceptance_result and request_replan.
 type PlanControlGroup struct {
-	Coordinator *plan.Coordinator
-	Store       store.TaskStore
-	Holder      TaskHolder
-	AgentID     string
+	Coordinator    *plan.Coordinator
+	Store          store.TaskStore
+	Holder         TaskHolder
+	AgentID        string
+	RouteValidator RouteValidator
 }
 
 func (g PlanControlGroup) Register(r *agent.ToolRegistry) {
@@ -40,7 +41,7 @@ func (g PlanControlGroup) Register(r *agent.ToolRegistry) {
 		schema.Object().String("spec_id", "稳定的验收规范 ID；首次可留空", false).
 			String("criteria_json", "Criterion JSON 数组；source=user|project|scheduler，必须省略 builtin ID/source/BuiltinHardRule；scope=task|milestone|plan，check=command_exit|file_hash|task_status|evidence|manual。前三类 check 的 target 必填；command_exit expected 为规范 0..255 整数；task_status expected 为 pending|processing|completed|cancelled|failed|blocked。示例 [{\"id\":\"tests\",\"description\":\"测试通过\",\"source\":\"scheduler\",\"required\":true,\"scope\":\"plan\",\"check\":\"command_exit\",\"target\":\"go test ./...\",\"expected\":\"0\"}]", true).Build(),
 		g.defineAcceptanceSpec)
-	r.Register("ensure_acceptance_run", "为最新 PlanRevision、GraphDigest 和 AcceptanceSpecRevision 幂等创建正式验收 Task。",
+	r.Register("ensure_acceptance_run", "为最新 PlanRevision、GraphDigest 和 AcceptanceSpecRevision 幂等创建正式验收 Task；runner route 必须 ready 且具备可从 Criterion check 推导的必需工具。",
 		schema.Object().Enum("scope", "验收范围", []string{"task", "milestone", "plan"}, false).
 			String("target_task_ids", "逗号分隔目标 Task ID；Plan 级留空表示当前有效图", false).
 			String("runner_event_type", "验收 Agent 的 event_type", true).
@@ -151,6 +152,12 @@ func (g PlanControlGroup) ensureAcceptanceRun(ctx context.Context, args map[stri
 	runner, _ := args["runner_event_type"].(string)
 	description, _ := args["description"].(string)
 	targets, _ := args["target_task_ids"].(string)
+	if g.RouteValidator != nil {
+		required := acceptanceRouteTools(p)
+		if !g.RouteValidator.CanRouteForPlan(p.ID, runner, required...) {
+			return "", fmt.Errorf("正式验收被拒绝: event_type=%q 没有可供当前 Plan 使用且同时具备 %s 的 ready route；请先从 verifier 模板为当前 Plan provision 单副本 Team", runner, strings.Join(required, ", "))
+		}
+	}
 	ctx = plan.WithControllerAuthority(ctx, controller.ID)
 	run, created, err := g.Coordinator.EnsureAcceptanceRun(ctx, plan.EnsureAcceptanceRunInput{
 		PlanID: p.ID, Scope: model.AcceptanceScope(scope), TargetTaskIDs: splitList(targets),
@@ -160,6 +167,32 @@ func (g PlanControlGroup) ensureAcceptanceRun(ctx context.Context, args map[stri
 		return "", err
 	}
 	return fmt.Sprintf("AcceptanceRun: id=%s task_id=%s created=%t target_revision=%d", run.ID, run.RunnerTaskID, created, run.TargetPlanRevision), nil
+}
+
+func acceptanceRouteTools(p *model.Plan) []string {
+	required := []string{"submit_acceptance_result"}
+	seen := map[string]bool{"submit_acceptance_result": true}
+	if p == nil {
+		return required
+	}
+	spec, ok := p.AcceptanceSpecs[p.CurrentAcceptanceSpecID]
+	if !ok {
+		return required
+	}
+	for _, criterion := range spec.Criteria {
+		tool := ""
+		switch criterion.Check {
+		case "command_exit":
+			tool = "run_shell"
+		case "file_hash":
+			tool = "read_file"
+		}
+		if tool != "" && !seen[tool] {
+			seen[tool] = true
+			required = append(required, tool)
+		}
+	}
+	return required
 }
 
 func (g PlanControlGroup) submitAcceptanceResult(ctx context.Context, args map[string]any) (string, error) {
@@ -311,6 +344,7 @@ func (g PlanControlGroup) finalizePlan(ctx context.Context, args map[string]any)
 	if err != nil {
 		return "", err
 	}
+	emitPlanTerminal(controller.ID, final)
 	return fmt.Sprintf("Plan %s 已进入终态 %s", final.ID, final.Status), nil
 }
 
@@ -417,6 +451,10 @@ func (g PlanControlGroup) resolvePause(ctx context.Context, args map[string]any)
 		}
 		return "", err
 	}
+	// The authorizing controller belongs to a different Plan, so its eventual
+	// Task terminal event cannot be used to clean up the target Plan's Team.
+	// Emit the target identity immediately after the terminal state is durable.
+	emitPlanTerminal(controllerTask.ID, updated)
 	return fmt.Sprintf("Plan %s: status=%s mode=%s", updated.ID, updated.Status, updated.ExecutionMode), nil
 }
 
@@ -489,4 +527,14 @@ func planTraceForTool(p *model.Plan) *trace.PlanTraceContext {
 		AcceptanceSpecRevision: p.CurrentAcceptanceSpecRevision,
 		GraphDigest:            p.CurrentGraphDigest,
 	}
+}
+
+func emitPlanTerminal(taskID string, p *model.Plan) {
+	if p == nil || !model.IsPlanTerminal(p.Status) {
+		return
+	}
+	trace.Emit(trace.Event{
+		Kind: trace.KindPlanTerminal, TaskID: taskID,
+		Reason: string(p.Status), Plan: planTraceForTool(p),
+	})
 }

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -166,6 +167,64 @@ func TestValidate_StartupProbeInvalid(t *testing.T) {
 	cfg := &Config{StartupProbe: "ping"} // "tcp" / "off" 之外
 	if err := cfg.Validate(); err == nil {
 		t.Error("应当拒绝 startup_probe=ping")
+	}
+}
+
+func TestValidate_SchedulerOnlyRequiresAndAcceptsModel(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.LLM.DefaultModel = "gpt-test"
+	cfg.Agents = nil
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("LLM-only Scheduler config should be valid: %v", err)
+	}
+
+	cfg.LLM.DefaultModel = ""
+	cfg.Scheduler.Model = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "缺少模型") {
+		t.Fatalf("empty Scheduler-only config should fail on model, got %v", err)
+	}
+}
+
+func TestValidate_StaticAgentsStillRequireSchedulerModel(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Agents = []AgentKind{{
+		Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
+		SystemPromptFile: filepath.Join("..", "..", "prompts", "worker.md"),
+		AgentMaxLoops:    1, TaskMaxRetries: 1,
+		EnforceCompactTokenThreshold: 1, ContextLimit: 1,
+	}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "Scheduler 配置缺少模型") {
+		t.Fatalf("static Agent model cannot replace the Scheduler/template default model, got %v", err)
+	}
+}
+
+func TestValidate_StaticAgentNeedsOwnOrLLMDefaultModel(t *testing.T) {
+	prompt := filepath.Join(t.TempDir(), "worker.md")
+	if err := os.WriteFile(prompt, []byte("worker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.Scheduler.Model = "scheduler-model"
+	cfg.Agents = []AgentKind{{
+		Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
+		SystemPromptFile: prompt, AgentMaxLoops: 1, TaskMaxRetries: 1,
+		EnforceCompactTokenThreshold: 1, ContextLimit: 1,
+	}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agents[0].model") {
+		t.Fatalf("scheduler.model must not silently become the static Agent model, got %v", err)
+	}
+	cfg.Agents[0].Model = "worker-model"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("explicit per-Agent model should be valid: %v", err)
+	}
+}
+
+func TestValidate_InvalidStaticAgentDoesNotDowngradeToSchedulerOnly(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.LLM.DefaultModel = "gpt-test"
+	cfg.Agents = []AgentKind{{Kind: "broken", Replicas: 0}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "replicas") {
+		t.Fatalf("invalid non-empty agents must remain a hard error, got %v", err)
 	}
 }
 

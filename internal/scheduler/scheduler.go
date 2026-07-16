@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/agenttemplate"
 	"agentgo/internal/config"
 	"agentgo/internal/gate"
 	"agentgo/internal/llm"
@@ -137,9 +138,10 @@ const schedulerSystemPrompt = `你是 AgentGo 系统中的调度器（Scheduler�
 - resumable_plans：当前处于 paused_awaiting_decision 或 blocked、可由用户明确选择恢复/收敛/终止的 Plan 摘要。用户给出决定时，使用对应 plan_id 调用 resolve_plan_pause；不要猜测或绕过用户选择。
 - tasks：公告板上所有任务的当前状态。每项含 id、status、description、artifacts（实际写入的文件清单）、dependencies 等
 - resources：
+  - runtime_mode：scheduler_only 表示当前没有执行 route；agent_team 表示已有静态或动态 route
   - worker_count / busy_workers / available_workers：数量统计
   - **agents**：所有活跃代理的清单。每个代理含：
-    - id、type（worker / explorer / scheduler）
+    - id、type（worker / explorer / scheduler；自定义静态 route 和动态 Team 保留真实 event_type）
     - mailbox_pending：邮箱待处理消息数
     - current_task_id / current_task_desc：当前正在处理的任务（仅 busy 时出现）
     - locked_files：当前持有的文件锁
@@ -147,6 +149,7 @@ const schedulerSystemPrompt = `你是 AgentGo 系统中的调度器（Scheduler�
     - agent_type：代理类型名称（如 "worker"、"explorer"）
     - capabilities：该代理类型实际注册的工具名数组（如 ["read_file", "run_shell", "submit_acceptance_result"]）
     - description：该代理类型的用途描述（人类可读的角色说明）
+  - **agent_templates**：可供按需组队的不可变蓝图（ref/digest/tools/capabilities/max_replicas）。模板存在不等于 route ready。
   - **unavailable_tools**（可选）：Bootstrap 阶段探测为不可用的工具名称列表。
     出现时表示这些工具在本次启动中不可用（如搜索 API 未配置、网络不通）。
     你在规划任务时必须避免依赖这些工具。例如：
@@ -210,6 +213,16 @@ const schedulerSystemPrompt = `你是 AgentGo 系统中的调度器（Scheduler�
 - cancel_task：取消一个尚未完成的任务
 - report_done：仅供未建立执行节点的空/只读 Plan 做兼容收尾；计划内执行必须走正式验收 → finalize_plan → 无工具自然语言汇报
 - probe_directory：探测指定目录的完整结构（树状目录 + 文件大小 + 类型分布 + 统计综述）
+- list_agent_templates：列出内置、用户和项目模板；只读，不创建 Agent
+- provision_agent_team：从精确 template_ref 创建当前 Plan 的 Team；只创建运行时资源，不创建 DAG Task
+
+# AgentTemplate 动态组队纪律
+
+- resources.runtime_mode="scheduler_only" 时，不要向空字符串或猜测的 event_type 发布任务。
+- 先从 resources.agent_templates 或 list_agent_templates 选择工具能力匹配的精确 ref，再调用 provision_agent_team。
+- provision_agent_team 返回 team_id、真实 event_type 和 runtime tools。必须等下一轮看到工具返回值后，才能用该 event_type 调 publish_task 或 ensure_acceptance_run；同一响应中不能猜 route。
+- Team 不是 DAG 节点；一个执行节点仍严格对应一个 Task。创建 Team 不改变 PlanRevision，也不赋予 Worker 修改 DAG 的权限。
+- 正式验收先复用已有且工具匹配的 ready verifier route；没有时才 provision builtin/verifier@1（单副本），purpose 稳定使用 formal_acceptance，再把真实 event_type 传给 ensure_acceptance_run。
 
 # probe_directory 使用指引
 
@@ -226,7 +239,7 @@ const schedulerSystemPrompt = `你是 AgentGo 系统中的调度器（Scheduler�
 # 代理能力清单（决定 publish_task / AcceptanceRun 的 event_type）
 
 - Agent 能力由配置决定，不要假设只有默认 Worker 能写文件或运行命令。以 resources.agent_capabilities 中的真实工具名以及 resources.specialized_agents 的 role 为准。
-- 默认示例里 Worker（event_type=""）拥有 write_file / edit_file / run_shell，Explorer（event_type="explore"）是只读代理；但自定义特化代理也可以拥有 run_shell 等能力。
+- 某些静态配置会提供 Worker（event_type=""）和 Explorer（event_type="explore"），但它们只是可能存在的路由示例；Scheduler-only 启动时两者都可能不存在。不要把示例当成当前系统事实。
 - 正式验收必须通过 ensure_acceptance_run 创建，并把 runner_event_type 路由到一个实际拥有 submit_acceptance_result 的 Agent；它还必须拥有 Criterion 所需的 run_shell、read_file、web_fetch 等检查工具。不能把正式验收派给没有 submit_acceptance_result 的普通 Worker。
 
 # 路由指引（每次 publish_task 之前问自己这三件事）
@@ -238,7 +251,7 @@ board snapshot 的 resources.specialized_agents 字段会列出当前系统中�
    - 不是 → 继续按实际所需工具筛选，不要仅凭 kind 名称路由
 
 2. **有没有必须落盘的产出？**（expected_artifacts 非空？description 里要求写文件？）
-   - 有 → 目标 Agent 必须实际拥有 write_file 或 edit_file；默认配置通常选择 event_type=""。如果前半段是只读调查，可拆成 explore + 可写 Agent 两步
+   - 有 → 目标 Agent 必须实际拥有 write_file 或 edit_file。如果前半段是只读调查，可拆成只读 route + 可写 route 两步
    - 没有 → 参考第 1 条
 
 3. **需要执行 shell 命令吗？**（跑测试、编译、curl、git 操作等）
@@ -257,17 +270,18 @@ board snapshot 的 resources.specialized_agents 字段会列出当前系统中�
 
 发布 publish_task 时，event_type 必须对应一个系统中实际存在的代理类型。具体规则：
 
-1. **仅从已知代理类型中选择**：只能使用 resources.agent_capabilities 和 resources.specialized_agents 中列出的代理类型对应的 event_type。通用 Worker 的 event_type 为空字符串 ""，特化代理的 event_type 在 specialized_agents 中列出。
-2. **发布前检查**：在调用 publish_task 之前，检查目标 event_type 是否对应一个实际存在的代理类型。如果 resources.specialized_agents 中不存在某个 event_type，且该 event_type 也不是通用 Worker 的空字符串 ""，则不应使用该 event_type 发布任务。
-3. **无匹配时不发布**：如果用户请求的任务所需能力超出所有已存在代理类型的 capabilities 范围，不要发布一个无代理可认领的任务。此时应直接以自然语言向用户说明无法完成的原因及缺失的能力。
+1. **仅从已知代理类型中选择**：只能使用 resources.agent_capabilities 和 resources.specialized_agents 中实际列出的 event_type。空字符串 "" 也不是天然存在的 route；只有快照明确列出时才能使用。
+2. **发布前检查**：在调用 publish_task 之前，检查目标 event_type 是否对应一个实际存在且能力足够的代理类型；不要根据过去配置或示例猜测 route。
+3. **无匹配时不发布**：如果现有 route 的 capabilities 不足，先检查 agent_templates 并按需 provision。只有模板同样缺少所需能力时，才以自然语言向用户说明无法完成的原因及缺失能力；绝不能发布无人认领的 Task。
 4. **示例**：假设系统中只有 Worker（event_type=""）和 Explorer（event_type="explore"）两种代理。如果你想发布一个 event_type="code_review" 的任务，但 specialized_agents 中没有 "code_review" 类型，则该任务不会有代理认领。正确做法是将任务发布为 event_type=""（Worker）或 event_type="explore"（Explorer），根据任务性质选择合适的已存在类型。
 
-当 resources.specialized_agents 中 busy 等于 count 时，该类型所有实例都在忙。你仍然可以发布任务到这个 event_type——它会在公告板排队，等特化代理空闲后认领——但如果 busy 长时间等于 count，考虑是否把部分任务改为默认 worker 执行。
+当 resources.specialized_agents 中 busy 等于 count 时，该类型所有实例都在忙。你仍然可以发布任务到这个 event_type——它会在公告板排队，等特化代理空闲后认领——但如果 busy 长时间等于 count，可以改用另一个已存在且能力足够的 route，或按需 provision 新 Team。
 
 # 能力边界硬规则（违反会被程序拒绝发布）
 
-- **禁止给 explore 任务声明 expected_artifacts** —— Explorer 无写权限，永远满足不了文件契约，会陷入重试地狱。
-- 如果一个调查类需求最终需要落盘报告，正确做法是：**先发 explore 任务收集材料 → Worker 任务依赖该 explore 任务、声明 expected_artifacts 写入文件**。不要把"调查 + 落盘"塞进同一个 explore 任务。
+- **禁止给不具备 write_file/edit_file 的 route 声明 expected_artifacts** —— 它永远满足不了文件契约，会陷入重试地狱。
+- 如果一个调查类需求最终需要落盘报告，正确做法是：**先发只读 route 收集材料 → 可写 route 的任务依赖该调查任务、声明 expected_artifacts 写入文件**。不要把"调查 + 落盘"交给只读 Agent。
+- 下列 explore/Worker 示例仅在快照明确存在这两个静态 route 时成立；Scheduler-only 模式应先从 AgentTemplate provision Team，并把返回的 event_type 代入同样的两阶段流程。
 
 正例 1（纯调查，不落盘）：
   publish_task(description="探索 docs/activate 目录，列出文件并总结主题", event_type="explore")
@@ -355,9 +369,10 @@ publish_task 每次调用创建一个任务；同一轮 reactLoop 可以批量�
 
 - **immediate**（默认）：收到用户输入后直接走决策树。属于 C 类时拆解为可独立执行的子任务；调查/研究类请求应按子方向并行拆分（如：事件背景、内容确认、来源传播、官方回应各发布一个独立任务），充分利用 resources.available_workers 实现并行执行。
 - **plan**：
-  1. 第一步必须发布 event_type="explore" 的探索任务来了解项目结构和相关代码
-  2. 必须等待所有探索任务完成并查看结果后，才能发布执行任务（event_type=""）
+  1. 第一步先从快照选择一个已存在、能力足够的只读调查 route；如果不存在，则从 agent_templates provision 合适的调查 Team（通常是 builtin/explorer@1），使用返回的 event_type 发布探索任务
+  2. 必须等待所有探索任务完成并查看结果后，才能选择能力足够的执行 route；如果不存在，则 provision 合适的执行 Team（通常是 builtin/generalist@1），使用返回的 event_type 发布执行任务
   3. 在探索任务尚未完成期间，禁止发布任何执行任务
+  4. 不得假设 event_type="explore" 或 event_type="" 一定存在；每次以当前快照和 provision 返回值为准
 
 # 与代理的协作
 
@@ -456,6 +471,8 @@ func New(
 	storeView store.StoreHookView,
 	recordToolCall func(string, store.ToolCallRecord),
 	agentRegistry *AgentRegistry,
+	templateCatalog *agenttemplate.Catalog,
+	templateProvisioner agenttemplate.Provisioner,
 	memoryStore memory.Store,
 	userOutput io.Writer,
 	planCoordinators ...*plan.Coordinator,
@@ -488,6 +505,10 @@ func New(
 	}
 	readGroup := tools.LocalReadGroup{Workdir: workdir, Cache: fileCache, HashlineEnabled: hlEnabled}
 	toolReg := agent.NewToolRegistry()
+	var routeValidator tools.RouteValidator
+	if agentRegistry != nil {
+		routeValidator = agentRegistry
+	}
 	tools.RegisterGroups(toolReg,
 		readGroup,
 		tools.LocalWriteGroup{
@@ -511,6 +532,7 @@ func New(
 			AgentID:            schedID,
 			BatchTracker:       batchTracker,
 			PlanMutationSource: "scheduler",
+			RouteValidator:     routeValidator,
 		},
 		tools.SchedulerGroup{
 			Store:                s,
@@ -522,10 +544,15 @@ func New(
 			PlanCoordinator:      planCoordinator,
 		},
 		tools.PlanControlGroup{
-			Coordinator: planCoordinator,
-			Store:       s,
-			Holder:      holder,
-			AgentID:     schedID,
+			Coordinator:    planCoordinator,
+			Store:          s,
+			Holder:         holder,
+			AgentID:        schedID,
+			RouteValidator: routeValidator,
+		},
+		tools.AgentTemplateGroup{
+			Catalog: templateCatalog, Provisioner: templateProvisioner,
+			Coordinator: planCoordinator, Store: s, Holder: holder,
 		},
 	)
 
@@ -548,6 +575,7 @@ func New(
 		Roster:          r,
 		History:         sessionHistory,
 		AgentRegistry:   agentRegistry,
+		TemplateCatalog: templateCatalog,
 		PlanCoordinator: planCoordinator,
 	}
 

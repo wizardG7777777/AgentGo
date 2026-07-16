@@ -90,8 +90,13 @@ type TokenStats struct {
 }
 
 type Agent struct {
-	ID                    string
-	EventType             string
+	ID        string
+	EventType string
+	// PlanIDScope is non-empty only for a dynamically provisioned Team runner.
+	// Such a runner must never claim a Task owned by another Plan, even if a
+	// stale or colliding event_type makes that Task visible in the shared queue.
+	// Static agents keep the empty value and remain globally routable.
+	PlanIDScope           string
 	Store                 store.TaskStore
 	Roster                roster.Roster
 	Execute               TaskExecutor
@@ -251,6 +256,17 @@ func (a *Agent) persistTextOnlySubmission(taskID, content string) {
 // Run starts the agent's main loop. It polls for available tasks and processes them.
 // It blocks until ctx is cancelled or no more work is available after a poll cycle.
 func (a *Agent) Run(ctx context.Context) {
+	a.run(ctx, nil)
+}
+
+// RunWithReady is Run with a one-shot readiness callback. ready is invoked
+// only after QueryAvailable has succeeded for the first time, which proves the
+// goroutine has entered the claim loop and can observe work on its route.
+func (a *Agent) RunWithReady(ctx context.Context, ready func()) {
+	a.run(ctx, ready)
+}
+
+func (a *Agent) run(ctx context.Context, ready func()) {
 	defer func() {
 		if a.Roster != nil {
 			a.Roster.ReleaseAll(a.ID)
@@ -258,6 +274,7 @@ func (a *Agent) Run(ctx context.Context) {
 	}()
 
 	idleCount := 0
+	readySignaled := false
 
 	for {
 		select {
@@ -277,6 +294,20 @@ func (a *Agent) Run(ctx context.Context) {
 			a.sleep(ctx)
 			continue
 		}
+		if !readySignaled {
+			readySignaled = true
+			if ready != nil {
+				ready()
+			}
+			// A lifecycle owner may cancel while the readiness callback is
+			// waiting for route publication. Do not claim from the snapshot
+			// returned before that cancellation.
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+		}
 
 		if len(tasks) == 0 {
 			idleCount++
@@ -291,6 +322,9 @@ func (a *Agent) Run(ctx context.Context) {
 		// Try to claim the highest priority task
 		claimed := false
 		for _, task := range tasks {
+			if a.PlanIDScope != "" && task.PlanID != a.PlanIDScope {
+				continue
+			}
 			if err := a.Store.ClaimTask(a.ID, task.ID); err == nil {
 				idleCount = 0
 				taskCtx := ctx

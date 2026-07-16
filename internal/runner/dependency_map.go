@@ -59,11 +59,12 @@ func resolveToolGroups(
 			Filter:     deps.ShellFilter,
 		},
 		tools.MetaGroup{
-			Store:      deps.Store,
-			Holder:     holder,
-			MaxDepth:   deps.MaxSubtaskDepth,
-			MBRegistry: deps.MBRegistry,
-			AgentID:    instanceID,
+			Store:          deps.Store,
+			Holder:         holder,
+			MaxDepth:       deps.MaxSubtaskDepth,
+			MBRegistry:     deps.MBRegistry,
+			AgentID:        instanceID,
+			RouteValidator: deps.RouteValidator,
 		},
 		tools.PlanControlGroup{
 			Coordinator: deps.PlanCoordinator,

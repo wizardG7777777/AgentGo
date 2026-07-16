@@ -111,9 +111,11 @@ func TestMain_ExplicitConfigValid_ShouldStartAndExitOnEOF(t *testing.T) {
 	if err := os.WriteFile(promptPath, []byte("test worker prompt\n"), 0o644); err != nil {
 		t.Fatalf("write prompt failed: %v", err)
 	}
-	// v4 必填：agents 列表 + 每个 kind 的所有行为参数 + system_prompt_file 可读
+	// Scheduler 与内置模板需要全局模型；静态 Agent 仍要声明完整运行参数。
 	cfgPath := filepath.Join(tmpDir, "setting.yaml")
-	cfg := []byte(`agents:
+	cfg := []byte(`llm:
+  default_model: gpt-test
+agents:
   - kind: worker
     replicas: 1
     tools: [read_file]
@@ -140,11 +142,31 @@ startup_probe: "off"
 	}
 }
 
+func TestMain_LLMOnlyConfigStartsSchedulerWithoutStaticAgents(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "setting.yaml")
+	cfg := []byte(`llm:
+  default_model: gpt-test
+startup_probe: "off"
+`)
+	if err := os.WriteFile(cfgPath, cfg, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result := runMainAsSubprocess(t, tmpDir, "-config", cfgPath)
+	if result.exitCode != 0 {
+		t.Fatalf("LLM-only config should start: code=%d stdout=%s stderr=%s", result.exitCode, result.stdout, result.stderr)
+	}
+	if !strings.Contains(result.stdout, "static_agents=0") || !strings.Contains(result.stdout, "runtime teams: 0") {
+		t.Fatalf("startup banner should expose Scheduler-only resources: %s", result.stdout)
+	}
+	if !strings.Contains(result.stdout, "[关闭] 系统已停止") {
+		t.Fatalf("Scheduler-only lifecycle should shut down cleanly: %s", result.stdout)
+	}
+}
+
 func TestMain_DefaultConfigPathMissing_ShouldFailFast(t *testing.T) {
-	// v3 兼容层 2026-04-26 删除后，无 setting.yaml + 内置默认配置不再能启动——
-	// 因为 v4 §11.5.3 校验要求 agents 列表非空。本测试断言这一 fail-fast 行为，
-	// 取代旧的"fallback to defaults" 期望（历史问题记录中的"启动成功 ≠ 真正可用"
-	// 反模式由此被 v4 修正）。
+	// 没有 setting.yaml 时内置默认配置不包含可调用模型；即使 agents 已可选，
+	// Scheduler 本身仍不能在没有模型的情况下启动。
 	tmpDir := t.TempDir()
 	result := runMainAsSubprocess(t, tmpDir)
 
@@ -154,7 +176,7 @@ func TestMain_DefaultConfigPathMissing_ShouldFailFast(t *testing.T) {
 	if !strings.Contains(result.stderr, "默认配置文件") {
 		t.Fatalf("stderr should contain default-config warning, got: %s", result.stderr)
 	}
-	if !strings.Contains(result.stderr, "agents 列表为空") {
-		t.Fatalf("stderr should explain v4 validation failure, got: %s", result.stderr)
+	if !strings.Contains(result.stderr, "Scheduler 配置缺少模型") {
+		t.Fatalf("stderr should explain missing Scheduler model, got: %s", result.stderr)
 	}
 }

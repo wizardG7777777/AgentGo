@@ -1,8 +1,9 @@
 # AgentGo v5 配置文件示例
-# 将此文件复制为 config.yaml（或任意路径，通过 -c 指定）并按需修改。
+# 将此文件复制为 config.yaml（或任意路径，通过 -config 指定）并按需修改。
 #
-# v5 沿用 v4 的嵌套 schema（llm: / tool_profiles: / scheduler: / agents: / infra:），
-# 新增可选的 reactors_file: 字段指向用户 reactor YAML（见文末与 docs/yaml-config-guide.md）。
+# v5 沿用 v4 的嵌套 schema，并新增 agent_templates: 按需团队配置。
+# 只有有效 llm: 也能 Scheduler-only 启动；tool_profiles: / agents: 是可选的预热配置，
+# reactors_file: 仍可指向用户 reactor YAML（见文末与 docs/yaml-config-guide.md）。
 # v3 顶层旧字段（worker_count / llm_base_url / agent_max_loops 等）会被解析层静默忽略，
 # 不报错也不生效。撰写规范详见 docs/yaml-config-guide.md。
 
@@ -65,7 +66,27 @@ scheduler:
   model: gpt-4o                    # 可选，缺省回落 llm.default_model
 
 # ============================================================
-# Agent kind 列表（核心：kind × replicas，同 kind 内完全同质）
+# AgentTemplate（可选）
+#
+# 不配置目录也始终提供：
+#   builtin/generalist@1 / builtin/explorer@1 / builtin/verifier@1
+# user_dirs 中模板获得 user/ namespace，project_dirs 获得 project/ namespace。
+# 项目模板推荐放在可 git 评审的 agent-templates/，不要放进通常被忽略的 .agentgo/。
+# 每个 YAML 文件只定义一个模板；schema 见 docs/activate/AgentTemplate.md。
+# ============================================================
+# agent_templates:
+#   user_dirs:
+#     - /Users/me/.config/agentgo/templates
+#   project_dirs:
+#     - agent-templates
+#   max_runtime_agents: 8
+
+# ============================================================
+# 预热 Agent kind 列表（可选：kind × replicas，同 kind 内完全同质）
+#
+# 整段 agents: 都可以省略。此时启动快照中真实 worker 数量为 0，Scheduler
+# 会先用 list_agent_templates / provision_agent_team 创建真实 route，再发布下一轮 Task。
+# 保留本段则在启动时创建常驻 Agent，适合已知的高频角色或降低首任务延迟。
 # ============================================================
 agents:
   - kind: worker
@@ -176,7 +197,8 @@ session_archive_max: 50           # 归档上限，超过删除最旧
 # legacy/unplanned Reactor 可参考本地旧 test_invest_reactors.yaml；不要把它当作动态 DAG 拓扑模板。
 # 动态 DAG 的 Reactor 示例见 reactors.program-verify.yaml：Task 终态已有内置唤醒，
 # 示例用非终态的重试压力提交 request_replan，由 Scheduler 决定是否调整图。
-# 本示例已声明 acceptance.verify；自定义正式验收 Agent 的 profile 也必须显式加入 submit_acceptance_result。
+# 本示例预热了 acceptance.verify；省略它时 Scheduler 可按需 provision builtin/verifier@1。
+# 自定义正式验收 Agent 或模板仍必须显式加入 submit_acceptance_result。
 # ============================================================
 # reactors_file: reactors.yaml
 

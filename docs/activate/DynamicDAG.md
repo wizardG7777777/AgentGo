@@ -26,6 +26,7 @@
 - `internal/bootstrap/plan_runtime.go`：TaskStore 与 Plan 控制面的事实桥接
 - `internal/scheduler/`：PlanSignal 等待、快照注入和决策确认
 - `internal/tools/plan_control.go`：受控的 Scheduler / acceptance 工具面
+- `internal/agenttemplate/` 与 `internal/team/`：按模板 provision 真实执行 route，并以 ref+digest 恢复
 
 ## 2. 图模型
 
@@ -111,7 +112,7 @@ Task 终态、正式验收、预算、无进展和暂停恢复属于内置触发
 被唤醒不等于必须改图。Scheduler 可以选择：
 
 - `continue_waiting`：确认当前事实不足，继续等下一次关键事件；
-- `publish_task` / `cancel_task` / `supersede_tasks`：发布、取消或替代节点；
+- `publish_task` / `provision_agent_team` / `cancel_task` / `supersede_tasks`：向已有 route 发布节点，或先按模板创建 Team 再发布、取消、替代节点；
 - `ensure_acceptance_run`：创建正式验收；
 - `mark_plan_blocked`：挂起等待外部条件或用户；
 - `finalize_plan`：依据最新正式验收进入终态。
@@ -121,6 +122,10 @@ Task 终态、正式验收、预算、无进展和暂停恢复属于内置触发
 ### 5.1 Scheduler
 
 Scheduler 通过内置工具修改 DAG。计划内 Task 发布前会校验内部的 `PlanMutationSource`，只有 Scheduler 或 Acceptance 控制路径能够注册新图节点。该字段不暴露为普通 LLM/YAML 参数。
+
+执行 route 有两个来源：启动时由 `agents:` 预热的常驻 Agent，以及 Scheduler 运行期间从 AgentTemplate provision 的临时 Agent。Catalog 中存在模板，并不代表已经有 Agent 监听某个 `event_type`。当当前运行资源没有合适 route 时，Scheduler 必须先用 `list_agent_templates` 选择模板，再用 `provision_agent_team` 创建实例；该控制面操作取得真实 route 后才发布下一轮 Task，容量或实例化失败不会留下一个永远无人认领的 pending 节点。已有可用 route 时仍可直接 `publish_task`。
+
+只有有效 `llm:`、没有 `agents:` 的 Scheduler-only 启动是合法形态。此时资源快照明确显示零个运行 worker，不注入伪造 capability；Scheduler 可以处理闲聊/只读任务，也可以按复杂度创建 `builtin/generalist@1`、`builtin/explorer@1` 或项目模板组成执行 Team。Template 只定义能力，Team 只表示运行实例，Task 才是一一对应的 DAG 执行节点。详见 [AgentTemplate.md](AgentTemplate.md)。
 
 Scheduler 快照包含当前 Plan 的 active controller 身份、版本、digest、预算、pending request 总数与有界摘要、当前节点语义、当前 Acceptance Criteria、仅匹配当前 revision/digest/spec 的最新 Acceptance 摘要、最近 8 条警告和压缩历史；因此新 controller 在恢复后不依赖旧 LLM 对话也能继续决策。每条 pending request 摘要保留 request ID、reason/detail、来源 Task/event、观察到的 revision/state version 和 urgency；快照按 high urgency、较新 state 优先，仅注入最多 16 条，单 detail 最多 480 字符、全部 detail 合计最多 4096 字符，并显式报告 omitted 数量，避免事件风暴占满 prompt。Acceptance 摘要包含 Run/Result ID、状态、verdict/reason、逐 Criterion 结果、失败指纹、残余风险和建议动作，但不默认注入可能很重的 Evidence；需要时以 Result ID 调 `get_acceptance_evidence`。旧图或 stale 结果不会出现在该 current 摘要中。所有拓扑与状态控制工具都会再次核对调用 Task 是否等于持久化的 `ActiveDecisionTaskID`。Plan 一旦有业务节点，或 controller 已成功调用 `write_file`、`edit_file`、`run_shell` 跨过只读边界，自然语言“完成”和 `report_done` 都不能绕过正式终态。尚未进入执行的空 Plan 仍兼容闲聊、状态查询和只读回答，并在回答结束时自动进入 `completed_no_execution`，不会留下无人消费的 running Plan。Plan 正式结束后，controller 只获得一个不暴露工具的最终汇报回合，不能在终态后继续产生副作用。
 
@@ -163,11 +168,11 @@ YAML 只能提供字面量 `reason_code`、`urgency` 和可选 `detail`，不对
 
 ### 6.2 自定义验收 Agent
 
-`ensure_acceptance_run` 的 `runner_event_type` 决定正式验收 Task 路由到哪个 Agent。系统不会隐式创建 verifier；项目必须声明验收 Agent。`config.example.yaml` 提供可直接使用的 `acceptance.verify` 示例，也可以声明自定义 Agent kind。runner 的 profile 至少需要 `submit_acceptance_result` 以及完成实际检查所需的只读、shell 或网络工具。
+`ensure_acceptance_run` 可以把正式验收 Task 路由到已经运行的验收 Agent；如果没有合适 route，Scheduler 通过 AgentTemplate provision verifier 后再创建 Run。系统内置 `builtin/verifier@1`，因此 Scheduler-only 配置不需要为了正式验收预先声明一个常驻 verifier。项目仍可在 `agents:` 中预热验收 kind，或在 `agent-templates/` 提供更专业的 `project/*` verifier。runner 至少需要 `submit_acceptance_result` 以及完成实际检查所需的读、shell 或网络工具；控制面只能对从 Criterion schema 确定推导的工具做硬校验，其余由 Scheduler 语义选型。
 
 验收 Agent 只有“执行检查并提交结构化结果”的权限，没有修改 AcceptanceSpec、调整 DAG 或自行结束 Plan 的权限。
 
-自定义的是 runner 与 Criterion，不是正式终态事件。无论使用哪种验收 Agent，控制面都统一发出 `acceptance_completed`；项目若需要额外通知，只能另发 `user.<name>` 事件，不能取代正式验收事实。
+自定义的是 runner 与 Criterion，不是正式验收事实。无论使用哪种验收 Agent，控制面都统一发出 `acceptance_completed`；Plan 在 finalize 或用户终止后另发 `plan_terminal` 供 Plan-scoped 运行资源清理。项目若需要额外通知，只能另发 `user.<name>` 事件，不能取代这些系统事实。
 
 ### 6.3 AcceptanceRun 身份
 
@@ -265,10 +270,14 @@ PlanStore 是 Plan、pending/acknowledged ReplanRequest、AcceptanceSpec/Run/Res
 - 有活动 session：`<session-dir>/plan-state.json`；
 - 无 session 管理器的兼容运行：`<project-root>/.agentgo/state/plans.json`。
 
+AgentTemplate 的 TeamSpec 使用独立的 `agent-teams.json`（对应 `<session-dir>/agent-teams.json` 或 `<project-root>/.agentgo/state/agent-teams.json`），避免把运行资源身份混入 Plan 图模型。
+
 Task 会话快照已升级为 v2，并保存 PlanID、节点角色、版本、Supersedes、AcceptanceRunID、SchedulerBatch、终态时间、运行输出、已完成 ReAct 历史及验收所需的 ToolCall 事实。恢复时：
 
 - v1 快照可读取并在内存中升级；
 - processing Task 安全回到 pending，避免假装仍由已消失的 Agent 执行；
+- 模板 Team 另有持久化 `TeamSpec`，保存 Plan、template ref+digest、副本数和稳定私有 route；恢复时先从当前 Catalog 用 ref 定位并核对 digest，再按原 route provision 实例，使已恢复的 pending Task 仍有相同消费者；
+- ref 缺失、digest 漂移或恢复所需总副本超过容量时，不用其他同名或“相近能力”静默顶替；Team Manager 整体 fail-closed，不启动任何模板 runner/route。v1 要求先恢复原模板或显式处理持久 TeamSpec，不自动迁移到新版本；
 - terminal Task 保留，保证依赖闭包和验收事实可重建；
 - PlanStore 的终态事实覆盖旧 Task 快照，避免恢复时把历史终态回滚；
 - 持久化的 pending ReplanRequest 会再次生成 PlanSignal，不依赖进程内 channel；
@@ -285,7 +294,7 @@ Task 会话快照已升级为 v2，并保存 PlanID、节点角色、版本、Su
 动态 DAG 使用结构化 trace 记录关键控制面事实：
 
 - `replan_requested` / `replan_coalesced` / `replan_decided`；
-- `plan_revision_changed` / `plan_paused`；
+- `plan_revision_changed` / `plan_paused` / `plan_terminal`；
 - `acceptance_completed`。
 
 事件附带 PlanID、PlanRevision、ExecutionStateVersion、AcceptanceSpecRevision 和 GraphDigest；验收事件还附带 Run/Result/runner/verdict/status。Trace 用于观察和审计，不替代 PlanStore 权威状态。
@@ -295,22 +304,23 @@ Task 会话快照已升级为 v2，并保存 PlanID、节点角色、版本、Su
 后续修改动态 DAG 机制时，至少必须证明以下不变量：
 
 1. Task 与执行节点保持一一对应，Agent kind 不影响 Plan 归属或唤醒。
-2. 图变化只增加 PlanRevision；Task 事实只增加 ExecutionStateVersion；规范变化只增加 AcceptanceSpecRevision。
-3. Dependencies 无环且只引用当前节点；Supersedes 不阻塞执行。
-4. 任一 Task 关键终态可在同 Plan 其他 Task 仍运行时唤醒 Scheduler。
-5. ReplanRequest 可持久化、幂等、同 Plan 聚合，确认旧版本时不会吞掉新请求。
-6. Reactor 不能直接修改计划内 DAG，也不能伪造系统 trace 事实。
-7. 过期 revision/digest/spec 的验收只能得到 stale；伪造命令、Task 状态、越界文件 hash 或 runner 身份不能 PASS。
-8. 进入 DAG 或发生直接执行后，`report_done` 和自然文本都不能绕过最新 Plan scope 正式验收；终态 controller 只能无工具汇报。
-9. 80% 预算告警、硬暂停、连续无进展和三种用户决策均有可重复测试。
-10. 重启后图身份、终态依赖、pending 信号和验收身份仍可恢复。
-11. 任一时刻只有 `ActiveDecisionTaskID` 对应的 controller 能认领控制任务和修改 Plan；active controller 丢失时必须挂起。
+2. Scheduler-only 启动不会伪造 worker route；模板 Team 必须先 provision 到 route ready，Scheduler 才能另行发布 Task，失败不遗留孤儿 Task。
+3. 图变化只增加 PlanRevision；Task 事实只增加 ExecutionStateVersion；规范变化只增加 AcceptanceSpecRevision。
+4. Dependencies 无环且只引用当前节点；Supersedes 不阻塞执行。
+5. 任一 Task 关键终态可在同 Plan 其他 Task 仍运行时唤醒 Scheduler。
+6. ReplanRequest 可持久化、幂等、同 Plan 聚合，确认旧版本时不会吞掉新请求。
+7. Reactor 不能直接修改计划内 DAG，也不能借模板 provision 绕过 Scheduler，更不能伪造系统 trace 事实。
+8. 过期 revision/digest/spec 的验收只能得到 stale；伪造命令、Task 状态、越界文件 hash 或 runner 身份不能 PASS。
+9. 进入 DAG 或发生直接执行后，`report_done` 和自然文本都不能绕过最新 Plan scope 正式验收；终态 controller 只能无工具汇报。
+10. 80% 预算告警、硬暂停、连续无进展和三种用户决策均有可重复测试。
+11. 重启后图身份、终态依赖、pending 信号、验收身份以及 TeamSpec 的模板 ref+digest/稳定 route 仍可恢复；模板丢失、漂移或总容量超限必须整体 fail-closed，而不是静默替换或部分启动。
+12. 任一时刻只有 `ActiveDecisionTaskID` 对应的 controller 能认领控制任务和修改 Plan；active controller 丢失时必须挂起。
 
 最低验证命令：
 
 ```bash
 go test ./...
-go test -race ./internal/plan ./internal/store ./internal/scheduler ./internal/reactor/... ./internal/bootstrap ./internal/tools
+go test -race ./internal/agenttemplate ./internal/team ./internal/plan ./internal/store ./internal/scheduler ./internal/reactor/... ./internal/bootstrap ./internal/tools
 go vet ./...
 ```
 

@@ -46,6 +46,10 @@ var AllToolNames = []string{
 	"report_done",
 	"report_progress",
 	"probe_directory",
+
+	// AgentTemplateGroup（scheduler 专属，不走 profile 配置）
+	"list_agent_templates",
+	"provision_agent_team",
 }
 
 // ValidateToolNames 校验给定的工具名列表是否全部在 AllToolNames 中。

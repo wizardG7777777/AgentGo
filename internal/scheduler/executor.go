@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/agenttemplate"
 	"agentgo/internal/config"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
@@ -94,6 +95,10 @@ type SchedulerExecutor struct {
 	// 还是用默认 event_type（让通用 worker 认领）。
 	// nil 时 specialized_agents 字段被 omitempty 省略。
 	AgentRegistry *AgentRegistry
+
+	// TemplateCatalog is the immutable blueprint set. It is deliberately
+	// separate from AgentRegistry: available templates are not runnable routes.
+	TemplateCatalog *agenttemplate.Catalog
 
 	// ToolHealth（可选）：Bootstrap 阶段的工具可用性探测结果。
 	// 通过 SnapshotSources 传递给 BuildBoardJSON。
@@ -190,10 +195,12 @@ func (e *SchedulerExecutor) Execute(
 	// 详细的 per-kind 能力差异通过 AgentRegistry / Specialized 路径展示。
 	var workerCaps []string
 	workerDesc := "执行代理（默认队列）"
+	hasWorkerRoute := false
 	for _, k := range e.Cfg.Agents {
 		if k.EventType != "" {
 			continue
 		}
+		hasWorkerRoute = true
 		if len(k.Tools) > 0 {
 			workerCaps = k.Tools
 		} else if k.Profile != "" {
@@ -207,6 +214,18 @@ func (e *SchedulerExecutor) Execute(
 		}
 		break
 	}
+	if e.AgentRegistry != nil {
+		// Multiple static kinds may share the default queue. Publish-time routing
+		// can only rely on tools guaranteed across every possible claimant.
+		workerCaps, hasWorkerRoute = e.AgentRegistry.RouteCapabilitiesForPlan(task.PlanID, "")
+	}
+	var workerCapability *AgentCapabilityInfo
+	if hasWorkerRoute {
+		workerCapability = &AgentCapabilityInfo{
+			Capabilities: workerCaps,
+			Description:  workerDesc,
+		}
+	}
 	var planView *model.Plan
 	var resumablePlans []model.Plan
 	if e.PlanCoordinator != nil && task.PlanID != "" {
@@ -214,14 +233,12 @@ func (e *SchedulerExecutor) Execute(
 		resumablePlans, _ = e.PlanCoordinator.Store().ListPlans()
 	}
 	snapshot := BuildBoardJSON(e.Store, e.Cfg, mode, trigger, SnapshotSources{
-		MBRegistry:    e.MBRegistry,
-		Roster:        e.Roster,
-		History:       e.History,
-		AgentRegistry: e.AgentRegistry,
-		WorkerCapabilities: &AgentCapabilityInfo{
-			Capabilities: workerCaps,
-			Description:  workerDesc,
-		},
+		MBRegistry:                  e.MBRegistry,
+		Roster:                      e.Roster,
+		History:                     e.History,
+		AgentRegistry:               e.AgentRegistry,
+		TemplateCatalog:             e.TemplateCatalog,
+		WorkerCapabilities:          workerCapability,
 		WorkerProfiles:              e.WorkerProfiles,
 		WorkerCapabilitiesByProfile: e.WorkerCapabilitiesByProfile,
 		ToolHealth:                  e.ToolHealth,

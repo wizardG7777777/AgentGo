@@ -12,6 +12,7 @@ import (
 	"agentgo/internal/model"
 	"agentgo/internal/plan"
 	"agentgo/internal/store"
+	"agentgo/internal/trace"
 )
 
 type rejectPublishTaskStore struct{ store.TaskStore }
@@ -254,6 +255,10 @@ func TestResolvePlanPauseTerminatePersistsAuthorization(t *testing.T) {
 	if _, err := coordinator.MarkBlocked(context.Background(), target.PlanID, "needs a decision"); err != nil {
 		t.Fatal(err)
 	}
+	dispatcher := &capturePlanTraceDispatcher{}
+	originalDispatcher := trace.DefaultDispatcher()
+	trace.SetDefaultDispatcher(dispatcher)
+	t.Cleanup(func() { trace.SetDefaultDispatcher(originalDispatcher) })
 
 	group := PlanControlGroup{Coordinator: coordinator, Store: taskStore, Holder: &fakeHolder{id: decision.ID}}
 	if _, err := group.resolvePause(context.Background(), map[string]any{
@@ -272,6 +277,19 @@ func TestResolvePlanPauseTerminatePersistsAuthorization(t *testing.T) {
 	if override.Resolution != plan.PauseResolutionTerminate || override.Reason != "user chose to stop" ||
 		override.AuthorizedBy != "user-via-task:"+decision.ID {
 		t.Fatalf("terminate override=%+v", override)
+	}
+	terminalEvents := 0
+	for _, event := range dispatcher.events {
+		if event.Kind != trace.KindPlanTerminal {
+			continue
+		}
+		terminalEvents++
+		if event.Plan == nil || event.Plan.PlanID != target.PlanID || event.TaskID != decision.ID || event.Reason != string(model.PlanStatusCancelledByUser) {
+			t.Fatalf("terminal event does not identify target Plan: %+v", event)
+		}
+	}
+	if terminalEvents != 1 {
+		t.Fatalf("plan_terminal event count=%d events=%+v", terminalEvents, dispatcher.events)
 	}
 }
 

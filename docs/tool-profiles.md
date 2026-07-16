@@ -8,7 +8,7 @@
 
 ## 1. 当前配置模型
 
-`tool_profiles` 只负责把一组真实工具名绑定到一个可复用名称；每个 Agent kind 在 `agents:` 中通过 `profile` 引用它，或直接用 `tools` 内联工具名。
+`tool_profiles` 只负责把一组真实工具名绑定到一个可复用名称；每个预热 Agent kind 在 `agents:` 中通过 `profile` 引用它，或直接用 `tools` 内联工具名。省略 `agents:` 时 AgentGo 仍可启动 Scheduler，并从 AgentTemplate 按需创建执行 Agent。
 
 ```yaml
 tool_profiles:
@@ -60,7 +60,7 @@ agents:
     description: 正式验收代理，运行检查并提交结构化证据。
 ```
 
-每个 `agents[*]` 必须在 `profile` 和 `tools` 中恰选一个：
+如果声明了 `agents:`，每个 `agents[*]` 必须在 `profile` 和 `tools` 中恰选一个：
 
 ```yaml
 agents:
@@ -111,6 +111,8 @@ agents:
 以下工具由 Scheduler 内置装配，不通过 profile 配置：
 
 - `cancel_task`
+- `list_agent_templates`：查询内置、user 和 project Catalog；不代表这些 Agent 已经运行
+- `provision_agent_team`：从模板创建一个或多个真实运行实例并注册 ready route；Scheduler 随后再用 `publish_task` 发布首轮 Task
 - `report_done`：只兼容空/只读 Plan；不能代替正式验收
 - `report_progress`
 - `probe_directory`
@@ -130,6 +132,20 @@ agents:
 
 默认 Worker profile 因此不需要 `publish_task`。详细不变量见 [`activate/DynamicDAG.md`](activate/DynamicDAG.md)。
 
+### 3.1 AgentTemplate 与 profile 的边界
+
+AgentTemplate 和 `tool_profiles` 不是同一层复用机制：
+
+- `tool_profiles` 只给主配置中的预热 `agents:` 复用工具名列表；
+- AgentTemplate 是完整且可版本化的实例化定义，包含能力标签、真实 tools、模型、提示词、运行边界与容量；
+- 外部模板必须直接列 `tools`，v1 不允许引用主配置 profile，避免模板从 user/project 目录移动后权限含义发生隐式变化；
+- 模板的 `capabilities` 只是 Scheduler 选型提示，不会授予任何权限；runtime allowlist 仍以 `tools` 为准；
+- 模板不能包含 Scheduler 独占的拓扑控制工具。普通模板需要增删节点时只能 `request_replan`；只有正式 verifier 模板适合持有 `submit_acceptance_result`。
+
+内置模板提供三组保守能力：`builtin/generalist@1` 用于实现，`builtin/explorer@1` 用于只读调查，`builtin/verifier@1` 用于正式验收。项目可以在 `agent-templates/` 中添加更专业的 `project/*` 模板，但不能覆盖内置 ref。
+
+Scheduler-only 启动时，Catalog 中存在模板不代表已经存在 route。Scheduler 必须先 provision 实例，取得真实 route 后再发布 Task；不能把模板名、capability 或预期 kind 当作 `event_type` 猜测。详见 [`activate/AgentTemplate.md`](activate/AgentTemplate.md)。
+
 ## 4. 正式验收 Profile
 
 正式验收 Agent 至少需要：
@@ -139,10 +155,11 @@ agents:
 3. 可选的 `request_replan`，用于把失败事实交回 Scheduler。
 
 它不应拥有 `define_acceptance_spec`、`supersede_tasks` 或 `finalize_plan`。自定义的是验收 runner 与 Criterion，正式 `acceptance_completed` 事实仍由控制面统一产生。
+`run_shell` 不是 OS 级只读沙箱；验收 Agent 的“不修改被验收对象”还需要 prompt 纪律与命令审批，不应仅根据没有 `write_file`/`edit_file` 就宣称强隔离。
 
 ## 5. 能力感知路由
 
-Board Snapshot 的 `resources.agent_capabilities` 直接列出每种 Agent 实际注册的工具名，`resources.specialized_agents` 则提供 `event_type`、实例数量、忙闲状态和自然语言 role。Scheduler 路由时应同时检查：
+Board Snapshot 的 `resources.agent_capabilities` 只列出**已经运行**的 Agent 及其实际注册工具，`resources.specialized_agents` 则提供真实 `event_type`、实例数量、忙闲状态和自然语言 role；模板 Catalog 是尚未 provision 的候选能力，两者不能混为一张资源表。Scheduler 路由时应同时检查：
 
 - 写入任务：目标包含 `write_file` 或 `edit_file`；
 - 命令任务：目标包含 `run_shell`；
@@ -150,16 +167,19 @@ Board Snapshot 的 `resources.agent_capabilities` 直接列出每种 Agent 实�
 - 纯调查：优先选择只有读取/搜索能力的 Agent；
 - `event_type` 必须对应已声明、可认领的 Agent。
 
+没有合适的运行 route 时，Scheduler 应先从 Catalog 选择模板并 provision；没有合适模板时应向用户说明缺失能力或挂起，而不是发布无人消费的 Task。
+
 不要使用 `code_edit`、`shell_exec` 等未注册的抽象标签代替真实工具名。
 
 ## 6. 校验规则与常见错误
 
-- `agents` 至少一项，`kind` 唯一且 `replicas >= 1`。
+- `agents` 可以省略；一旦声明，每个 `kind` 仍须唯一且 `replicas >= 1`。
 - `profile` 必须存在于 `tool_profiles`；`profile` 与 `tools` 不能并存，也不能都缺失。
 - `system_prompt_file` 必须存在且可读。
 - `agent_max_loops`、`task_max_retries`、`enforce_compact_token_threshold`、`context_limit` 都必须为正数。
 - 不要定义空 profile 作为“无工具”权限；当前 allowlist 的空集合保留为兼容语义。要做最小权限 Agent，请至少列出它确实需要的工具。
 - Scheduler 的工具集和系统提示词由 `internal/scheduler` 固定，`scheduler:` 配置块只允许覆盖模型。
+- 外部 AgentTemplate 一文件一个模板，直接列 tools；`system_prompt` / `system_prompt_file` 恰选一个，ref、版本、digest 和容量在加载期校验。
 
 典型错误：
 
@@ -180,6 +200,7 @@ agents:
 
 - 配置结构和校验：`internal/config/config.go`
 - Runtime 合成：`internal/bootstrap/runtime_builder.go`
+- AgentTemplate Catalog 与 Team 生命周期：`internal/agenttemplate/`、`internal/team/`
 - allowlist 注册：`internal/agent/tool_registry.go`
 - 工具名权威清单：`internal/tools/known_tools.go`
 - 动态 Plan 工具：`internal/tools/plan_control.go`

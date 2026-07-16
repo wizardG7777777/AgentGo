@@ -45,6 +45,7 @@ var knownEventKinds = map[trace.EventKind]struct{}{
 	trace.KindReactorSpawnDepthExceeded: {},
 	trace.KindAcceptanceCompleted:       {},
 	trace.KindPlanPaused:                {},
+	trace.KindPlanTerminal:              {},
 }
 
 // Deps 聚合 loader 需要的全部外部依赖。

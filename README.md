@@ -37,7 +37,7 @@ cp config.example.yaml setting.yaml
 # 编辑 setting.yaml，填入 base_url / api_key / default_model
 ```
 
-最小可运行配置至少包含 `llm:`、`tool_profiles:` 和 `agents:` 三块。详见 [`config.example.yaml`](config.example.yaml) 与 [`docs/yaml-config-guide.md`](docs/yaml-config-guide.md)。
+最小可运行配置只需提供有效的 `llm:` 模型信息；此时 AgentGo 以 Scheduler-only 模式启动，需要执行能力时再从内置 AgentTemplate 按需组建 Team。`tool_profiles:` 与 `agents:` 仅用于可选的预热 Agent。详见 [`config.example.yaml`](config.example.yaml)、[`docs/activate/AgentTemplate.md`](docs/activate/AgentTemplate.md) 与 [`docs/yaml-config-guide.md`](docs/yaml-config-guide.md)。
 
 ### 3. 运行
 

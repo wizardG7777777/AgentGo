@@ -135,6 +135,10 @@ const (
 	KindAcceptanceCompleted EventKind = "acceptance_completed"
 	KindPlanRevisionChanged EventKind = "plan_revision_changed"
 	KindPlanPaused          EventKind = "plan_paused"
+	// KindPlanTerminal is emitted only after the target Plan's terminal state is
+	// durably committed. Unlike a Task terminal event, it identifies the Plan
+	// directly so Plan-scoped runtime resources can be released immediately.
+	KindPlanTerminal EventKind = "plan_terminal"
 )
 
 // PlanTraceContext 把 trace 事实关联到动态 DAG 的明确版本。

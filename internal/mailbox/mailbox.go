@@ -50,11 +50,13 @@ const recentBufferSize = 16
 // 系统级常量（v4 §11.5.4：邮件级联爆炸 / 缓冲区大小是稳定性红线，不允许 yaml 调）。
 //
 // DefaultChainMaxDepth 取代旧 cfg.MailChainMaxDepth：邮件链最大跳数。
-//   超过此深度的邮件由 ChainDepthLimitHook 在 BeforeSend 阶段拒绝。
-//   值 10 来自原 DefaultConfig() 的 v3 默认。
+//
+//	超过此深度的邮件由 ChainDepthLimitHook 在 BeforeSend 阶段拒绝。
+//	值 10 来自原 DefaultConfig() 的 v3 默认。
 //
 // DefaultInboxSize 取代旧 cfg.MailboxBufferSize：每个 Mailbox 的 channel 缓冲区。
-//   值 32 来自原 DefaultConfig() 的 v3 默认（也是 NewRegistry 的 fallback）。
+//
+//	值 32 来自原 DefaultConfig() 的 v3 默认（也是 NewRegistry 的 fallback）。
 const (
 	DefaultChainMaxDepth = 10
 	DefaultInboxSize     = 32
@@ -358,6 +360,27 @@ func (r *Registry) Register(agentID, eventType string) *Mailbox {
 	mb := newMailbox(agentID, eventType, r.bufSize)
 	r.boxes[agentID] = mb
 	return mb
+}
+
+// Unregister removes a runtime agent mailbox and any aliases that point to it.
+// It is intended for Plan-scoped dynamic Team teardown. Static agents normally
+// remain registered until process shutdown.
+func (r *Registry) Unregister(agentID string) bool {
+	if r == nil || agentID == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.boxes[agentID]; !ok {
+		return false
+	}
+	delete(r.boxes, agentID)
+	for alias, target := range r.aliases {
+		if target == agentID {
+			delete(r.aliases, alias)
+		}
+	}
+	return true
 }
 
 // ScanNonEmpty 返回所有有未读消息的邮箱状态（agentID + eventType + 消息数量
