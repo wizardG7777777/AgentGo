@@ -63,6 +63,21 @@ func (t *ActivityTracker) RegisterAgent(agentID, agentType string) {
 	}
 }
 
+// UnregisterAgent removes a dynamic agent from the live TUI snapshot after its
+// runtime has stopped. The task/store trace remains the durable audit record.
+func (t *ActivityTracker) UnregisterAgent(agentID string) bool {
+	if t == nil || agentID == "" {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.agents[agentID]; !ok {
+		return false
+	}
+	delete(t.agents, agentID)
+	return true
+}
+
 func (t *ActivityTracker) TaskClaimed(agentID, agentType, taskID, taskDesc string) {
 	if t == nil || agentID == "" {
 		return

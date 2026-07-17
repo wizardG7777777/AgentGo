@@ -23,6 +23,8 @@ type spawnAgentReactor struct {
 	sysPromTpl *promptTemplate // override.system_prompt（可为 nil）
 	lifecycle  string
 	host       spawn.SpawnHost
+	store      PublishStore
+	requester  ReplanRequester
 }
 
 func (r *spawnAgentReactor) Name() string                 { return r.name }
@@ -37,6 +39,9 @@ func (r *spawnAgentReactor) Priority() int                { return 500 }
 func (r *spawnAgentReactor) Run(ev trace.Event) error {
 	if !r.when.eval(ev) {
 		return nil
+	}
+	if redirected, err := redirectPlannedWork(ev, "spawn_agent", "", r.store, r.requester); redirected {
+		return err
 	}
 	if r.lifecycle != "" && r.lifecycle != "one_shot" {
 		return fmt.Errorf("spawn_agent[%s]: lifecycle %q not implemented (v5.x; only one_shot)", r.name, r.lifecycle)

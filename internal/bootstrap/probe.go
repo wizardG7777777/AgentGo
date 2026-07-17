@@ -42,15 +42,18 @@ func printStartupBanner(w io.Writer, configPath string, cfg *config.Config) {
 	if cfg.LLM.TimeoutSec > 0 {
 		fmt.Fprintf(w, "Timeout:          %ds\n", cfg.LLM.TimeoutSec)
 	}
-	if len(cfg.Agents) > 0 {
-		fmt.Fprintln(w, "")
-		fmt.Fprintln(w, "Agent Kinds:")
-		// scheduler 列在第一位（与 §9.5.1 示例输出一致）
-		schedModel := cfg.Scheduler.Model
-		if schedModel == "" {
-			schedModel = cfg.LLM.DefaultModel
-		}
-		fmt.Fprintf(w, "  - scheduler   model=%s    (tools/prompt/behavior 全部 built-in，详见 §11.5.5)\n", schedModel)
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Agent Kinds:")
+	// Scheduler 永远存在；零静态 Agent 时明确报告 scheduler-only，避免用户
+	// 把“没有预热 Team”误解为启动失败。
+	schedModel := cfg.Scheduler.Model
+	if schedModel == "" {
+		schedModel = cfg.LLM.DefaultModel
+	}
+	fmt.Fprintf(w, "  - scheduler   model=%s    (built-in; static_agents=%d)\n", schedModel, len(cfg.Agents))
+	if len(cfg.Agents) == 0 {
+		fmt.Fprintln(w, "  - runtime teams: 0 (Scheduler may provision AgentTemplate Teams on demand)")
+	} else {
 		for _, k := range cfg.Agents {
 			model := k.Model
 			if model == "" {

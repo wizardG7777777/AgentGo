@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"agentgo/internal/gate"
@@ -31,7 +31,34 @@ const (
 	// 详见 transfer_note.go L1 注释 + agent.go MaxLoops 兜底路径。
 	ctxNoTools
 	ctxActivity
+	ctxToolDispatchGuard
+	ctxToolName
 )
+
+// ToolDispatchGuard runs immediately before each concrete tool dispatch. A
+// Plan-aware caller uses it to re-check durable execution authority after the
+// LLM response and after every earlier tool in the same response.
+type ToolDispatchGuard func(context.Context, *model.Task) error
+
+// WithToolDispatchGuard installs a per-dispatch execution boundary. Tool calls
+// are executed in model order, so a call that pauses/finalizes a Plan is
+// visible to the guard before any later call can produce a side effect.
+func WithToolDispatchGuard(ctx context.Context, guard ToolDispatchGuard) context.Context {
+	return context.WithValue(ctx, ctxToolDispatchGuard, guard)
+}
+
+func toolDispatchGuardFromContext(ctx context.Context) ToolDispatchGuard {
+	guard, _ := ctx.Value(ctxToolDispatchGuard).(ToolDispatchGuard)
+	return guard
+}
+
+// ToolNameFromContext returns the concrete tool currently being considered by
+// a per-dispatch guard. It is intentionally set only at the immediate dispatch
+// boundary, after the model response has already been generated.
+func ToolNameFromContext(ctx context.Context) string {
+	name, _ := ctx.Value(ctxToolName).(string)
+	return name
+}
 
 // WithAgentContext 将 agentID + taskID + loopNum 注入 context，
 // 供 llm_executor 和工具调用层（local_write 等）记录日志和 trace 事件使用。
@@ -209,7 +236,11 @@ func NewLLMExecutor(
 			}, nil
 		}
 
-		// 有 tool calls → 并行执行，记录每个 tool call 的结果
+		// Tool calls execute in the model-provided order. Agent tools include
+		// stateful and side-effecting operations, so parallel dispatch would let
+		// report_done/finalize/mark_blocked race with writes or shell commands.
+		// Serial dispatch also makes each prior ToolCallRecord visible to the next
+		// call and gives a Plan guard an actual boundary between calls.
 		type indexedResult struct {
 			toolResult ToolResult
 			output     string
@@ -219,11 +250,8 @@ func NewLLMExecutor(
 		loopNum, _ := ctx.Value(ctxLoopNum).(int)
 
 		results := make([]indexedResult, len(resp.ToolCalls))
-		var wg sync.WaitGroup
 		for i, call := range resp.ToolCalls {
-			wg.Add(1)
-			go func(idx int, c llm.ToolCall) {
-				defer wg.Done()
+			func(idx int, c llm.ToolCall) {
 				argsLog := truncateForLog(c.Arguments, 120)
 				log.Printf("[agent %s] task=%s loop=%d tool=%s args=%s", agentID, task.ID, loopNum, c.Name, argsLog)
 				activity.ToolStarted(agentID, task.ID, loopNum, c.ID, c.Name)
@@ -257,6 +285,13 @@ func NewLLMExecutor(
 					// 错误消息同时注入到 content 和 toolErr，让 LLM 和后续记录都看到。
 					result = ""
 					toolErr = fmt.Errorf("[hook 拒绝] %s: %s", preDecision.HookName, preDecision.AbortReason)
+				} else if guard := toolDispatchGuardFromContext(ctx); guard != nil {
+					dispatchCtx := context.WithValue(ctx, ctxToolName, c.Name)
+					if guardErr := guard(dispatchCtx, task); guardErr != nil {
+						toolErr = fmt.Errorf("tool dispatch suspended: %w", guardErr)
+					} else {
+						result, toolErr = tools.Dispatch(ctx, c)
+					}
 				} else {
 					result, toolErr = tools.Dispatch(ctx, c)
 				}
@@ -302,12 +337,17 @@ func NewLLMExecutor(
 				//     由 toolErr == nil 决定
 				//   - Scheduler 工具不经过本路径，不被记录（hookSystem.md §11.1.3）
 				if recordToolCall != nil {
+					var exitCode *int
+					if c.Name == "run_shell" && toolErr == nil {
+						exitCode = parseRunShellExitCode(result)
+					}
 					recordToolCall(task.ID, store.ToolCallRecord{
 						Timestamp: time.Now(),
 						AgentID:   agentID,
 						ToolName:  c.Name,
 						Args:      c.Arguments,
 						Success:   toolErr == nil,
+						ExitCode:  exitCode,
 					})
 				}
 
@@ -332,7 +372,6 @@ func NewLLMExecutor(
 				}
 			}(i, call)
 		}
-		wg.Wait()
 
 		// 按原始顺序组装输出和 toolResults
 		var output strings.Builder
@@ -355,6 +394,19 @@ func NewLLMExecutor(
 	}
 }
 
+func parseRunShellExitCode(result string) *int {
+	line, _, _ := strings.Cut(result, "\n")
+	value, ok := strings.CutPrefix(strings.TrimSpace(line), "exit_code:")
+	if !ok {
+		return nil
+	}
+	code, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return nil
+	}
+	return &code
+}
+
 // buildMessages 将任务信息和执行历史转换为 LLM 对话消息。
 // systemPrompt 非空时作为 system 消息插入到对话开头。
 // teamAwareness 非空时注入到 user prompt 的 task description 之前。
@@ -365,13 +417,33 @@ func buildMessages(systemPrompt string, task *model.Task, depResults map[string]
 	if systemPrompt != "" {
 		messages = append(messages, llm.Message{Role: "system", Content: systemPrompt})
 	}
+	if task.PlanID != "" && task.NodeRole != model.PlanNodeRoleController {
+		messages = append(messages, llm.Message{Role: "system", Content: strings.TrimSpace(`动态 Plan 权限边界：你是普通执行节点，不是 Scheduler controller。不得使用 publish_task 创建、拆分、替换或扩展计划节点。需要新增节点、替代任务、并行调查、独立复核或因阻塞无法继续时，调用 request_replan 提交事实，由 Scheduler 决定是否调整 DAG。Task 终态会自动唤醒 Scheduler；该权限边界与 AgentType/event_type 无关。`)})
+	}
 
-	// 构建用户消息：团队能力感知 + 任务描述 + 依赖结果
+	// 构建用户消息：团队能力感知 + 受信任任务上下文 + 任务描述 + 依赖结果
 	var prompt strings.Builder
 	if teamAwareness != "" {
 		prompt.WriteString(teamAwareness)
 		prompt.WriteString("\n")
 	}
+	planID := task.PlanID
+	if planID == "" {
+		planID = "none"
+	}
+	nodeRole := string(task.NodeRole)
+	if nodeRole == "" {
+		nodeRole = "none"
+	}
+	planBoundary := "unplanned_compatibility; publish_task may be used only when the tool is available"
+	if task.PlanID != "" {
+		if task.NodeRole == model.PlanNodeRoleController {
+			planBoundary = "scheduler_controller"
+		} else {
+			planBoundary = "scheduler_only; do not use publish_task; use request_replan"
+		}
+	}
+	fmt.Fprintf(&prompt, "<task-context source=\"control-plane\">\ntask_id: %s\nplan_id: %s\nnode_role: %s\ndag_authority: %s\n</task-context>\n", task.ID, planID, nodeRole, planBoundary)
 	prompt.WriteString(task.Description)
 
 	if len(depResults) > 0 {

@@ -44,7 +44,8 @@ func TestSchedulerBundle_New_RegistersMailboxAlias(t *testing.T) {
 	mb := mailbox.NewRegistry(8)
 	cfg := config.DefaultConfig()
 
-	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, mb, nil, nil, nil, nil, nil, nil, nil)
+	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
+		nil, nil, nil, nil)
 	if bundle == nil || bundle.Agent == nil {
 		t.Fatal("New returned nil Bundle")
 	}
@@ -76,7 +77,8 @@ func TestSchedulerBundle_New_AgentEventTypeIsScheduler(t *testing.T) {
 	r := roster.NewMemoryRoster()
 	cfg := config.DefaultConfig()
 
-	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil,
+		nil, nil, nil, nil)
 	if bundle.Agent.EventType != "__scheduler__" {
 		t.Errorf("Agent.EventType = %q, want __scheduler__", bundle.Agent.EventType)
 	}
@@ -100,7 +102,8 @@ func TestSchedulerBundle_New_ModeStoreIsImmediateByDefault(t *testing.T) {
 	r := roster.NewMemoryRoster()
 	cfg := config.DefaultConfig()
 
-	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil,
+		nil, nil, nil, nil)
 	if bundle.Mode == nil {
 		t.Fatal("Bundle.Mode is nil")
 	}
@@ -112,12 +115,12 @@ func TestSchedulerBundle_New_ModeStoreIsImmediateByDefault(t *testing.T) {
 // TestSchedulerBundle_EndToEnd_UserInputToReportDone 是一个端到端集成测试。
 //
 // 它模拟一个完整的请求循环：
-//   1. CLI 发送 EventUserInput（"hello"）到 eventCh
-//   2. Activator 接收事件，PublishTask 一个 EventType="__scheduler__" 的 task
-//   3. Scheduler agent poll 到该 task，进入 processTask
-//   4. SchedulerExecutor 调用 mock LLM
-//   5. mock LLM 直接返回 report_done 工具调用
-//   6. SchedulerGroup.report_done 把 summary 打印到 stdout，scheduler task 完成
+//  1. CLI 发送 EventUserInput（"hello"）到 eventCh
+//  2. Activator 接收事件，PublishTask 一个 EventType="__scheduler__" 的 task
+//  3. Scheduler agent poll 到该 task，进入 processTask
+//  4. SchedulerExecutor 调用 mock LLM
+//  5. mock LLM 直接返回 report_done 工具调用
+//  6. SchedulerGroup.report_done 把 summary 打印到 stdout，scheduler task 完成
 //
 // 这是 scheduler-as-agent 架构的最小验证，证明：
 //   - Activator 桥能把 EventCh 翻译成 task
@@ -151,7 +154,8 @@ func TestSchedulerBundle_EndToEnd_UserInputToReportDone(t *testing.T) {
 		},
 	}
 
-	bundle := New(s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil, nil, nil)
+	bundle := New(s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
+		nil, nil, nil, nil)
 
 	// 启动 Activator + Agent
 	ctx, cancel := context.WithCancel(context.Background())

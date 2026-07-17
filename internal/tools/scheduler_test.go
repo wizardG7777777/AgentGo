@@ -9,8 +9,17 @@ import (
 	"testing"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/llm"
 	"agentgo/internal/model"
+	"agentgo/internal/plan"
+	"agentgo/internal/store"
 )
+
+type schedulerToolCallClient struct{ response llm.Response }
+
+func (c schedulerToolCallClient) Chat(context.Context, []llm.Message, []llm.ToolDef) (llm.Response, error) {
+	return c.response, nil
+}
 
 // ---- Register 注册 ----
 
@@ -30,6 +39,13 @@ func TestSchedulerGroup_Register_AllTools(t *testing.T) {
 	}
 	if !names["cancel_task"] || !names["report_done"] || !names["report_progress"] || !names["probe_directory"] {
 		t.Errorf("expected cancel_task + report_done + report_progress + probe_directory, got %v", names)
+	}
+	registered := make([]string, 0, len(names))
+	for name := range names {
+		registered = append(registered, name)
+	}
+	if err := ValidateToolNames(registered); err != nil {
+		t.Fatalf("SchedulerGroup registered a tool missing from AllToolNames: %v", err)
 	}
 }
 
@@ -174,6 +190,213 @@ func TestSchedulerGroup_ReportDone_AllTerminalSuccess(t *testing.T) {
 	}
 	if !strings.Contains(out, "已向用户报告完成") {
 		t.Errorf("expected success acknowledgment, got %q", out)
+	}
+}
+
+func TestSchedulerGroup_ReportDone_DirectExecutionNeedsTerminalPlan(t *testing.T) {
+	s := newSchedTestStore()
+	schedTask := &model.Task{Description: "user request", EventType: "__scheduler__", NodeRole: model.PlanNodeRoleController}
+	s.PublishTask(schedTask)
+	schedTask.PlanID = schedTask.ID
+	schedTask.Artifacts = []string{"changed.txt"}
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+	if _, err := coordinator.Create(context.Background(), plan.CreateInput{
+		PlanID: schedTask.PlanID, RootTaskID: schedTask.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	g := SchedulerGroup{Store: s, Holder: &fakeHolder{id: schedTask.ID}, PlanCoordinator: coordinator}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("report_done", map[string]any{"summary": "premature"}))
+	if err == nil || !strings.Contains(err.Error(), "尚未依据最新正式验收进入终态") {
+		t.Fatalf("direct execution report_done err=%v", err)
+	}
+}
+
+func TestSchedulerGroup_ReportDone_ClosesUntouchedPlan(t *testing.T) {
+	s := newSchedTestStore()
+	schedTask := &model.Task{Description: "status question", EventType: "__scheduler__", NodeRole: model.PlanNodeRoleController}
+	s.PublishTask(schedTask)
+	schedTask.PlanID = schedTask.ID
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+	if _, err := coordinator.Create(context.Background(), plan.CreateInput{
+		PlanID: schedTask.PlanID, RootTaskID: schedTask.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	g := SchedulerGroup{Store: s, Holder: &fakeHolder{id: schedTask.ID}, PlanCoordinator: coordinator}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+	if _, err := reg.Dispatch(context.Background(), mkCall("report_done", map[string]any{"summary": "read-only answer"})); err != nil {
+		t.Fatal(err)
+	}
+	p, err := coordinator.Store().GetPlan(schedTask.PlanID)
+	if err != nil || p.Status != model.PlanStatusCompletedNoExecution {
+		t.Fatalf("untouched Plan remained live: plan=%+v err=%v", p, err)
+	}
+}
+
+func TestSchedulerGroup_ReportDone_AllowsTerminalPlanReport(t *testing.T) {
+	s := newSchedTestStore()
+	schedTask := &model.Task{Description: "user request", EventType: "__scheduler__", NodeRole: model.PlanNodeRoleController}
+	s.PublishTask(schedTask)
+	schedTask.PlanID = schedTask.ID
+	schedTask.Artifacts = []string{"changed.txt"}
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+	if _, err := coordinator.Create(context.Background(), plan.CreateInput{
+		PlanID: schedTask.PlanID, RootTaskID: schedTask.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.MarkBlocked(context.Background(), schedTask.PlanID, "awaiting user"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.ResolvePause(context.Background(), plan.ResolvePauseInput{
+		PlanID: schedTask.PlanID, Resolution: plan.PauseResolutionTerminate,
+		AuthorizedBy: "test-user", Reason: "stop",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	g := SchedulerGroup{Store: s, Holder: &fakeHolder{id: schedTask.ID}, PlanCoordinator: coordinator}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+	if _, err := reg.Dispatch(context.Background(), mkCall("report_done", map[string]any{"summary": "stopped"})); err != nil {
+		t.Fatalf("terminal report_done: %v", err)
+	}
+}
+
+func TestSchedulerGroup_RejectsSupersededControllerControl(t *testing.T) {
+	s := newSchedTestStore()
+	oldController := &model.Task{Description: "old", EventType: "__scheduler__", NodeRole: model.PlanNodeRoleController}
+	if err := s.PublishTask(oldController); err != nil {
+		t.Fatal(err)
+	}
+	oldController.PlanID = oldController.ID
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+	if _, err := coordinator.Create(context.Background(), plan.CreateInput{
+		PlanID: oldController.PlanID, RootTaskID: oldController.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	newController := &model.Task{
+		Description: "new", PlanID: oldController.PlanID,
+		EventType: "__scheduler__", NodeRole: model.PlanNodeRoleController,
+	}
+	if err := s.PublishTask(newController); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.ActivateController(context.Background(), oldController.PlanID, newController.ID); err != nil {
+		t.Fatal(err)
+	}
+	target := &model.Task{Description: "pending", PlanID: oldController.PlanID}
+	if err := s.PublishTask(target); err != nil {
+		t.Fatal(err)
+	}
+
+	oldGroup := SchedulerGroup{Store: s, Holder: &fakeHolder{id: oldController.ID}, PlanCoordinator: coordinator}
+	oldRegistry := agent.NewToolRegistry()
+	oldGroup.Register(oldRegistry)
+	if _, err := oldRegistry.Dispatch(context.Background(), mkCall("report_done", map[string]any{"summary": "stale"})); err == nil || !strings.Contains(err.Error(), "active controller") {
+		t.Fatalf("superseded controller report_done err=%v", err)
+	}
+	if _, err := oldRegistry.Dispatch(context.Background(), mkCall("cancel_task", map[string]any{"task_id": target.ID})); err == nil || !strings.Contains(err.Error(), "active controller") {
+		t.Fatalf("superseded controller cancel_task err=%v", err)
+	}
+	got, err := s.GetTask(target.ID)
+	if err != nil || got.Status != model.TaskStatusPending {
+		t.Fatalf("superseded controller changed target: task=%+v err=%v", got, err)
+	}
+
+	newGroup := SchedulerGroup{Store: s, Holder: &fakeHolder{id: newController.ID}, PlanCoordinator: coordinator}
+	newRegistry := agent.NewToolRegistry()
+	newGroup.Register(newRegistry)
+	if _, err := newRegistry.Dispatch(context.Background(), mkCall("cancel_task", map[string]any{"task_id": target.ID})); err != nil {
+		t.Fatalf("active controller cancel_task: %v", err)
+	}
+}
+
+func TestSchedulerGroup_OrderedDispatchCannotRaceDirectExecutionWithReportDone(t *testing.T) {
+	tests := []struct {
+		name           string
+		calls          []llm.ToolCall
+		wantWrites     int
+		wantPlanStatus model.PlanStatus
+		wantErrorAt    int
+	}{
+		{
+			name: "write first forces formal finalization",
+			calls: []llm.ToolCall{
+				{ID: "write", Name: "write_file"},
+				{ID: "done", Name: "report_done", Arguments: map[string]any{"summary": "too early"}},
+			},
+			wantWrites: 1, wantPlanStatus: model.PlanStatusRunning, wantErrorAt: 1,
+		},
+		{
+			name: "read-only completion blocks later write",
+			calls: []llm.ToolCall{
+				{ID: "done", Name: "report_done", Arguments: map[string]any{"summary": "read-only"}},
+				{ID: "write", Name: "write_file"},
+			},
+			wantWrites: 0, wantPlanStatus: model.PlanStatusCompletedNoExecution, wantErrorAt: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			taskStore := store.NewMemoryTaskStore(make(chan model.Event, 16), 32, 1, 60)
+			controller := &model.Task{Description: "request", EventType: "__scheduler__"}
+			if err := taskStore.PublishTask(controller); err != nil {
+				t.Fatal(err)
+			}
+			coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+			if _, err := coordinator.Create(context.Background(), plan.CreateInput{
+				PlanID: controller.PlanID, RootTaskID: controller.ID,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			registry := agent.NewToolRegistry()
+			writes := 0
+			registry.Register("write_file", "test write", nil, func(context.Context, map[string]any) (string, error) {
+				writes++
+				return "written", nil
+			})
+			SchedulerGroup{
+				Store: taskStore, Holder: &fakeHolder{id: controller.ID}, PlanCoordinator: coordinator,
+			}.Register(registry)
+			executor := agent.NewLLMExecutor(
+				schedulerToolCallClient{response: llm.Response{ToolCalls: tt.calls}}, registry, nil, taskStore,
+				func(taskID string, rec store.ToolCallRecord) { _ = taskStore.AppendToolCall(taskID, rec) }, "",
+			)
+			ctx := agent.WithToolDispatchGuard(context.Background(), func(context.Context, *model.Task) error {
+				p, err := coordinator.Store().GetPlan(controller.PlanID)
+				if err != nil {
+					return err
+				}
+				if p.Status != model.PlanStatusRunning {
+					return fmt.Errorf("plan is %s", p.Status)
+				}
+				if p.ActiveDecisionTaskID != controller.ID {
+					return fmt.Errorf("controller is not active")
+				}
+				return nil
+			})
+			result, err := executor(ctx, controller, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if writes != tt.wantWrites {
+				t.Fatalf("writes=%d want=%d", writes, tt.wantWrites)
+			}
+			if len(result.ToolResults) != len(tt.calls) || !strings.Contains(result.ToolResults[tt.wantErrorAt].Content, "错误") {
+				t.Fatalf("expected guarded/finalization error at index %d: %+v", tt.wantErrorAt, result.ToolResults)
+			}
+			p, err := coordinator.Store().GetPlan(controller.PlanID)
+			if err != nil || p.Status != tt.wantPlanStatus {
+				t.Fatalf("plan=%+v err=%v want status=%s", p, err, tt.wantPlanStatus)
+			}
+		})
 	}
 }
 

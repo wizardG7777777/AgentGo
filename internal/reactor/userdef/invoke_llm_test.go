@@ -389,7 +389,7 @@ reactors:
       prompt: { file: ./p.md }
       output:
         emit_trace:
-          kind: failure_summary
+          kind: user.custom
 `)
 	llm := &fakeLLM{response: "summary text"}
 	emitter := &fakeEmitter{}
@@ -405,14 +405,49 @@ reactors:
 		t.Fatalf("expected 1 emitted event, got %d", len(events))
 	}
 	got := events[0]
-	if got.Kind != trace.EventKind("failure_summary") {
-		t.Errorf("Kind=%q want failure_summary", got.Kind)
+	if got.Kind != trace.EventKind("user.custom") {
+		t.Errorf("Kind=%q want user.custom", got.Kind)
 	}
 	if got.TaskID != "T-1" || got.AgentID != "worker-1" {
 		t.Errorf("TaskID/AgentID wrong: %+v", got)
 	}
 	if got.Description != "summary text" {
 		t.Errorf("Description=%q want LLM output", got.Description)
+	}
+}
+
+func TestInvokeLLM_EmitTrace_RequiresUserNamespace(t *testing.T) {
+	tests := []struct {
+		name string
+		kind string
+	}{
+		{name: "task lifecycle fact", kind: "task_completed"},
+		{name: "acceptance fact", kind: "acceptance_completed"},
+		{name: "empty user namespace", kind: "user."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writePrompt(t, dir, "p.md", "stub")
+			yamlData := []byte("reactors:\n" +
+				"  - on: task_failed\n" +
+				"    invoke_llm:\n" +
+				"      prompt: { file: ./p.md }\n" +
+				"      output:\n" +
+				"        emit_trace: { kind: " + tt.kind + " }\n")
+
+			_, err := Load(yamlData, dir, dir, Deps{
+				LLM:     &fakeLLM{response: "summary"},
+				Emitter: &fakeEmitter{},
+			})
+			if err == nil {
+				t.Fatalf("Load accepted reserved emit_trace kind %q", tt.kind)
+			}
+			if !strings.Contains(err.Error(), `"user." namespace`) {
+				t.Fatalf("error %q should explain the required user. namespace", err)
+			}
+		})
 	}
 }
 
@@ -427,7 +462,7 @@ reactors:
     invoke_llm:
       prompt: { file: ./p.md }
       output:
-        emit_trace: { kind: x }
+        emit_trace: { kind: user.x }
 `)
 	_, err := Load(yamlData, dir, dir, Deps{})
 	if err == nil || !strings.Contains(err.Error(), "LLM") {
@@ -445,7 +480,7 @@ reactors:
       model: qwen3.6-flash
       prompt: { file: ./p.md }
       output:
-        emit_trace: { kind: x }
+        emit_trace: { kind: user.x }
 `)
 	factory := &recordingLLMFactory{llm: &fakeLLM{response: "ok"}}
 	rs, err := Load(yamlData, dir, dir, Deps{
@@ -473,7 +508,7 @@ reactors:
       model: qwen3.6-flash
       prompt: { file: ./p.md }
       output:
-        emit_trace: { kind: x }
+        emit_trace: { kind: user.x }
 `)
 	_, err := Load(yamlData, dir, dir, Deps{LLM: &fakeLLM{response: "ok"}})
 	if err == nil || !strings.Contains(err.Error(), "LLMFactory") {
@@ -507,7 +542,7 @@ reactors:
       prompt: { file: ./p.md }
       output:
         write_file: ./out.md
-        emit_trace: { kind: x }
+        emit_trace: { kind: user.x }
 `)
 	_, err := Load(yamlData, dir, dir, Deps{LLM: &fakeLLM{response: "x"}})
 	if err == nil || !strings.Contains(err.Error(), "exactly one") {
@@ -524,7 +559,7 @@ reactors:
     invoke_llm:
       prompt: { file: ./p.md }
       output:
-        emit_trace: { kind: x }
+        emit_trace: { kind: user.x }
 `)
 	llm := &fakeLLM{err: errors.New("simulated LLM down")}
 	rs, err := Load(yamlData, dir, dir, Deps{LLM: llm})
@@ -547,7 +582,7 @@ reactors:
     invoke_llm:
       prompt: { file: ./p.md }
       output:
-        emit_trace: { kind: failure_summary }
+        emit_trace: { kind: user.failure_summary }
 `)
 	llm := &fakeLLM{response: "summary"}
 	emitter := &fakeEmitter{}
@@ -581,7 +616,7 @@ reactors:
     invoke_llm:
       prompt: { file: ./p.md }
       output:
-        emit_trace: { kind: x }
+        emit_trace: { kind: user.x }
 `)
 	slowLLM := &slowFakeLLM{delay: 200 * time.Millisecond}
 	rs, err := Load(yamlData, dir, dir, Deps{LLM: slowLLM, LLMTimeout: 20 * time.Millisecond})

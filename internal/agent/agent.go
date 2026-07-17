@@ -29,6 +29,11 @@ type ErrRecoverable struct {
 func (e *ErrRecoverable) Error() string { return e.Err.Error() }
 func (e *ErrRecoverable) Unwrap() error { return e.Err }
 
+// ErrExecutionSuspended is returned by an execution wrapper when the Task's
+// durable Plan is no longer runnable. processTask treats it as a cooperative
+// lease release, not as a task failure or retry.
+var ErrExecutionSuspended = errors.New("task execution suspended by plan control plane")
+
 // ToolResult 保存单个 tool call 的执行结果，用于重建 OpenAI tool calling 协议消息。
 type ToolResult struct {
 	ToolCallID string `json:"tool_call_id"` // 对应 tool call 的 ID
@@ -85,8 +90,13 @@ type TokenStats struct {
 }
 
 type Agent struct {
-	ID                    string
-	EventType             string
+	ID        string
+	EventType string
+	// PlanIDScope is non-empty only for a dynamically provisioned Team runner.
+	// Such a runner must never claim a Task owned by another Plan, even if a
+	// stale or colliding event_type makes that Task visible in the shared queue.
+	// Static agents keep the empty value and remain globally routable.
+	PlanIDScope           string
 	Store                 store.TaskStore
 	Roster                roster.Roster
 	Execute               TaskExecutor
@@ -246,6 +256,17 @@ func (a *Agent) persistTextOnlySubmission(taskID, content string) {
 // Run starts the agent's main loop. It polls for available tasks and processes them.
 // It blocks until ctx is cancelled or no more work is available after a poll cycle.
 func (a *Agent) Run(ctx context.Context) {
+	a.run(ctx, nil)
+}
+
+// RunWithReady is Run with a one-shot readiness callback. ready is invoked
+// only after QueryAvailable has succeeded for the first time, which proves the
+// goroutine has entered the claim loop and can observe work on its route.
+func (a *Agent) RunWithReady(ctx context.Context, ready func()) {
+	a.run(ctx, ready)
+}
+
+func (a *Agent) run(ctx context.Context, ready func()) {
 	defer func() {
 		if a.Roster != nil {
 			a.Roster.ReleaseAll(a.ID)
@@ -253,6 +274,7 @@ func (a *Agent) Run(ctx context.Context) {
 	}()
 
 	idleCount := 0
+	readySignaled := false
 
 	for {
 		select {
@@ -272,6 +294,20 @@ func (a *Agent) Run(ctx context.Context) {
 			a.sleep(ctx)
 			continue
 		}
+		if !readySignaled {
+			readySignaled = true
+			if ready != nil {
+				ready()
+			}
+			// A lifecycle owner may cancel while the readiness callback is
+			// waiting for route publication. Do not claim from the snapshot
+			// returned before that cancellation.
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+		}
 
 		if len(tasks) == 0 {
 			idleCount++
@@ -286,6 +322,9 @@ func (a *Agent) Run(ctx context.Context) {
 		// Try to claim the highest priority task
 		claimed := false
 		for _, task := range tasks {
+			if a.PlanIDScope != "" && task.PlanID != a.PlanIDScope {
+				continue
+			}
 			if err := a.Store.ClaimTask(a.ID, task.ID); err == nil {
 				idleCount = 0
 				taskCtx := ctx
@@ -479,12 +518,12 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// 提供原始 tool_call/tool_result 序列；TransferNote 作为精炼文本提供接手者
 	// "为什么要做这件事 + 前任遇到什么障碍"的决策上下文。两者在 Execute 调用时
 	// 都会出现在 LLM 的上下文里。未来 TransferNote 实测稳定后可考虑删除 LastHistory。
-	if task.RetryCount > 0 && len(task.LastHistory) > 0 {
+	if len(task.LastHistory) > 0 {
 		if err := json.Unmarshal(task.LastHistory, &history); err != nil {
 			log.Printf("[agent %s] 反序列化历史记录失败，从空历史开始: %v", a.ID, err)
 			history = make([]HistoryEntry, 0)
 		} else {
-			log.Printf("[agent %s] 任务 %s 重试 #%d，恢复 %d 条历史记录", a.ID, taskID, task.RetryCount, len(history))
+			log.Printf("[agent %s] 任务 %s 恢复执行（retry=%d），载入 %d 条历史记录", a.ID, taskID, task.RetryCount, len(history))
 		}
 	}
 
@@ -696,6 +735,41 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		result, execErr := a.Execute(execCtx, task, depResults, histCopy)
 
 		if execErr != nil {
+			if errors.Is(execErr, ErrExecutionSuspended) {
+				terminatingCause = "react_loop_exit:plan_suspended"
+				a.Activity.LLMEnd(a.ID, taskID, i, "", 0, execErr)
+				enterTerminating(terminatingCause)
+				// The control-plane boundary is checked after an in-flight LLM/tool
+				// call as well as before the next loop. Preserve that completed
+				// round before releasing the lease so resume does not repeat side
+				// effects or lose the evidence that caused the suspension.
+				if result.ToolCalled || result.Output != "" || result.AssistantContent != "" ||
+					len(result.ToolCalls) > 0 || len(result.ToolResults) > 0 {
+					history = append(history, HistoryEntry{
+						Output: result.Output, ToolCalled: result.ToolCalled,
+						AssistantContent: result.AssistantContent,
+						ToolCalls:        result.ToolCalls, ToolResults: result.ToolResults,
+						ExtraFields: result.ExtraFields, PromptTokens: result.PromptTokens,
+						CompletionTokens: result.CompletionTokens, Model: a.Model,
+					})
+					if result.Output != "" {
+						_ = a.Store.AppendOutput(a.ID, taskID, result.Output)
+					}
+				}
+				var durableHistory []byte
+				if len(history) > 0 {
+					if encoded, marshalErr := json.Marshal(history); marshalErr != nil {
+						log.Printf("[agent %s] 序列化挂起历史失败 task=%s: %v", a.ID, taskID, marshalErr)
+					} else {
+						durableHistory = encoded
+					}
+				}
+				if suspendErr := store.SuspendTaskExecution(a.Store, a.ID, taskID, execErr.Error(), durableHistory); suspendErr != nil &&
+					!errors.Is(suspendErr, store.ErrTaskNotProcessing) {
+					log.Printf("[agent %s] 协作挂起任务失败 task=%s: %v", a.ID, taskID, suspendErr)
+				}
+				return
+			}
 			terminatingCause = "react_loop_exit:error"
 			a.Activity.LLMEnd(a.ID, taskID, i, "", 0, execErr)
 			enterTerminating(terminatingCause)
@@ -1211,7 +1285,7 @@ func appendValidationFeedback(history []HistoryEntry, check ArtifactCheckResult)
 
 // saveHistory 将当前历史序列化并保存到任务中，供重试时恢复。
 func (a *Agent) saveHistory(task *model.Task, history []HistoryEntry) {
-	if len(history) == 0 {
+	if len(history) == 0 || task == nil || a.Store == nil {
 		return
 	}
 	data, err := json.Marshal(history)
@@ -1219,7 +1293,13 @@ func (a *Agent) saveHistory(task *model.Task, history []HistoryEntry) {
 		log.Printf("[agent %s] 序列化历史记录失败: %v", a.ID, err)
 		return
 	}
-	task.LastHistory = data
+	if err := a.Store.RecordLastHistory(task.ID, data); err != nil {
+		log.Printf("[agent %s] 持久化历史记录失败 task=%s: %v", a.ID, task.ID, err)
+		return
+	}
+	// Keep the detached execution snapshot coherent for code that still uses it
+	// later in the same termination path; the store remains the authority.
+	task.LastHistory = append([]byte(nil), data...)
 }
 
 func (a *Agent) shouldRetire(idleCount int) bool {

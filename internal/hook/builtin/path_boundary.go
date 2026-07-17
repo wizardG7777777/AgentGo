@@ -57,7 +57,6 @@ func (h *PathBoundaryHook) Priority() int { return 10 }
 var pathFieldByTool = map[string]string{
 	"read_file":   "path",
 	"list_dir":    "path",
-	"list_files":  "path",
 	"grep_search": "path",
 	"glob_search": "root_dir",
 	"write_file":  "path",

@@ -12,7 +12,7 @@ func TestSaveSnapshot_CreatesFile(t *testing.T) {
 	path := filepath.Join(dir, "snapshot.json")
 
 	snap := &Snapshot{
-		Version:   1,
+		Version:   currentSnapshotVersion,
 		SavedAt:   "2026-04-15T11:00:00Z",
 		Tasks:     []TaskSnapshot{},
 		Roster:    RosterSnapshot{Claims: []ClaimSnapshot{}},
@@ -33,7 +33,7 @@ func TestSaveSnapshot_AtomicWrite_NoTmpLeftover(t *testing.T) {
 	path := filepath.Join(dir, "snapshot.json")
 
 	snap := &Snapshot{
-		Version:   1,
+		Version:   currentSnapshotVersion,
 		SavedAt:   "2026-04-15T11:00:00Z",
 		Tasks:     []TaskSnapshot{},
 		Roster:    RosterSnapshot{Claims: []ClaimSnapshot{}},
@@ -55,7 +55,7 @@ func TestSaveSnapshot_UTF8_TwoSpaceIndent(t *testing.T) {
 	path := filepath.Join(dir, "snapshot.json")
 
 	snap := &Snapshot{
-		Version: 1,
+		Version: currentSnapshotVersion,
 		SavedAt: "2026-04-15T11:00:00Z",
 		Tasks: []TaskSnapshot{
 			{
@@ -90,7 +90,7 @@ func TestSaveSnapshot_UTF8_TwoSpaceIndent(t *testing.T) {
 }
 
 func TestSaveSnapshot_InvalidPath(t *testing.T) {
-	snap := &Snapshot{Version: 1, SavedAt: "2026-04-15T11:00:00Z"}
+	snap := &Snapshot{Version: currentSnapshotVersion, SavedAt: "2026-04-15T11:00:00Z"}
 	err := SaveSnapshot("/nonexistent/dir/snapshot.json", snap)
 	if err == nil {
 		t.Fatal("expected error for invalid path")
@@ -102,7 +102,7 @@ func TestLoadSnapshot_Success(t *testing.T) {
 	path := filepath.Join(dir, "snapshot.json")
 
 	original := &Snapshot{
-		Version: 1,
+		Version: currentSnapshotVersion,
 		SavedAt: "2026-04-15T11:00:00Z",
 		Tasks: []TaskSnapshot{
 			{
@@ -118,7 +118,11 @@ func TestLoadSnapshot_Success(t *testing.T) {
 				RetryReasons:   []string{"timeout"},
 				TimeoutSeconds: 300,
 				Depth:          0,
+				SchedulerBatch: []string{"child-a", "child-b"},
+				LastResponse:   "latest response",
+				PartialOutput:  "partial response",
 				CreatedAt:      "2026-04-15T10:30:05Z",
+				CompletedAt:    "2026-04-15T10:35:05Z",
 			},
 		},
 		Roster: RosterSnapshot{
@@ -168,6 +172,18 @@ func TestLoadSnapshot_Success(t *testing.T) {
 	}
 	if loaded.Tasks[0].Description != original.Tasks[0].Description {
 		t.Errorf("Tasks[0].Description = %q, want %q", loaded.Tasks[0].Description, original.Tasks[0].Description)
+	}
+	if len(loaded.Tasks[0].SchedulerBatch) != 2 || loaded.Tasks[0].SchedulerBatch[1] != "child-b" {
+		t.Errorf("Tasks[0].SchedulerBatch = %v", loaded.Tasks[0].SchedulerBatch)
+	}
+	if loaded.Tasks[0].LastResponse != "latest response" {
+		t.Errorf("Tasks[0].LastResponse = %q", loaded.Tasks[0].LastResponse)
+	}
+	if loaded.Tasks[0].PartialOutput != "partial response" {
+		t.Errorf("Tasks[0].PartialOutput = %q", loaded.Tasks[0].PartialOutput)
+	}
+	if loaded.Tasks[0].CompletedAt != "2026-04-15T10:35:05Z" {
+		t.Errorf("Tasks[0].CompletedAt = %q", loaded.Tasks[0].CompletedAt)
 	}
 	if len(loaded.Roster.Claims) != len(original.Roster.Claims) {
 		t.Fatalf("Roster.Claims len = %d, want %d", len(loaded.Roster.Claims), len(original.Roster.Claims))
@@ -234,12 +250,36 @@ func TestLoadSnapshot_VersionZero(t *testing.T) {
 	}
 }
 
+func TestLoadSnapshot_V1UpgradesToV2(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snapshot.json")
+
+	data := []byte(`{"version": 1, "saved_at": "2026-04-15T11:00:00Z", "tasks": [{"id":"legacy-task","status":"pending","created_at":"2026-04-15T10:00:00Z"}], "roster": {"claims": []}, "mailboxes": []}`)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	loaded, err := LoadSnapshot(path)
+	if err != nil {
+		t.Fatalf("LoadSnapshot(v1): %v", err)
+	}
+	if loaded.Version != currentSnapshotVersion {
+		t.Fatalf("Version = %d, want upgraded v%d", loaded.Version, currentSnapshotVersion)
+	}
+	if len(loaded.Tasks) != 1 || loaded.Tasks[0].ID != "legacy-task" {
+		t.Fatalf("legacy task not preserved: %#v", loaded.Tasks)
+	}
+	if loaded.Tasks[0].SchedulerBatch != nil || loaded.Tasks[0].LastResponse != "" || loaded.Tasks[0].CompletedAt != "" {
+		t.Fatalf("v2-only fields should use zero-value defaults: %#v", loaded.Tasks[0])
+	}
+}
+
 func TestSaveLoadSnapshot_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot.json")
 
 	original := &Snapshot{
-		Version: 1,
+		Version: currentSnapshotVersion,
 		SavedAt: "2026-04-15T11:00:00Z",
 		Tasks: []TaskSnapshot{
 			{
@@ -257,6 +297,20 @@ func TestSaveLoadSnapshot_RoundTrip(t *testing.T) {
 				Depth:          1,
 				CreatedAt:      "2026-04-15T10:00:00Z",
 				StartedAt:      "2026-04-15T10:01:00Z",
+				PlanID:         "plan-1",
+				NodeRole:       "acceptance",
+				LastHistory:    []byte(`[{"output":"done"}]`),
+				ToolCalls: []ToolCallSnapshot{{
+					Timestamp: "2026-04-15T10:01:01.123456789Z",
+					AgentID:   "verifier-1",
+					ToolName:  "run_shell",
+					Args: map[string]any{
+						"command": "go test ./...",
+						"nested":  map[string]any{"values": []any{"one", "two"}},
+					},
+					Success:  true,
+					ExitCode: intPtr(0),
+				}},
 			},
 		},
 		Roster:    RosterSnapshot{Claims: []ClaimSnapshot{}},
@@ -280,12 +334,14 @@ func TestSaveLoadSnapshot_RoundTrip(t *testing.T) {
 	}
 }
 
+func intPtr(value int) *int { return &value }
+
 func TestSaveLoadSnapshot_EmptySnapshot(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot.json")
 
 	original := &Snapshot{
-		Version:   1,
+		Version:   currentSnapshotVersion,
 		SavedAt:   "2026-04-15T11:00:00Z",
 		Tasks:     []TaskSnapshot{},
 		Roster:    RosterSnapshot{Claims: []ClaimSnapshot{}},

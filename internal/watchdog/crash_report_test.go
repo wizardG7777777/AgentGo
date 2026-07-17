@@ -48,8 +48,7 @@ func TestWatchdog_SendsCrashReport_OnTimeout(t *testing.T) {
 		t.Fatalf("claim task: %v", err)
 	}
 	// 把 StartedAt 回拨 10s 触发超时（阈值 = 1 * 1.1 = 1.1s）
-	got, _ := s.GetTask(task.ID)
-	got.StartedAt = time.Now().Add(-10 * time.Second)
+	setTaskTiming(t, s, task.ID, time.Time{}, time.Now().Add(-10*time.Second))
 
 	inspectAll(w)
 
@@ -146,13 +145,12 @@ func TestWatchdog_SkipsCrashReport_WhenEventSourceEmpty(t *testing.T) {
 	if err := s.ClaimTask("agent-1", task.ID); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	got, _ := s.GetTask(task.ID)
-	got.StartedAt = time.Now().Add(-10 * time.Second)
+	setTaskTiming(t, s, task.ID, time.Time{}, time.Now().Add(-10*time.Second))
 
 	inspectAll(w)
 
 	// 任务确实被 watchdog 判定失败（状态转换应当发生）
-	got, _ = s.GetTask(task.ID)
+	got, _ := s.GetTask(task.ID)
 	if got.Status != model.TaskStatusFailed {
 		t.Fatalf("task.status = %s, want failed", got.Status)
 	}
@@ -184,8 +182,7 @@ func TestWatchdog_SkipsCrashReport_WhenEventSourceIsUser(t *testing.T) {
 	if err := s.ClaimTask("agent-1", task.ID); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	got, _ := s.GetTask(task.ID)
-	got.StartedAt = time.Now().Add(-10 * time.Second)
+	setTaskTiming(t, s, task.ID, time.Time{}, time.Now().Add(-10*time.Second))
 
 	inspectAll(w)
 

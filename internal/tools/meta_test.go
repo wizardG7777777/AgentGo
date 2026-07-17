@@ -50,6 +50,9 @@ func (f *fakeStore) RetryRollback(agentID, taskID, reason string) error {
 	return nil
 }
 func (f *fakeStore) AppendOutput(agentID, taskID, chunk string) error { return nil }
+func (f *fakeStore) RecordLastHistory(taskID string, history []byte) error {
+	return nil
+}
 
 func (f *fakeStore) QueryAvailable(eventType string) ([]*model.Task, error) {
 	return nil, nil
@@ -84,6 +87,31 @@ func (f *fakeStore) QueryToolCalls(string, string) ([]store.ToolCallRecord, erro
 type fakeHolder struct{ id string }
 
 func (f *fakeHolder) Get() string { return f.id }
+
+type fakeRouteValidator struct {
+	routes  map[string][]string
+	planIDs map[string]string
+}
+
+func (f fakeRouteValidator) CanRouteForPlan(planID, eventType string, required ...string) bool {
+	have, ok := f.routes[eventType]
+	if !ok {
+		return false
+	}
+	if owner := f.planIDs[eventType]; owner != "" && owner != planID {
+		return false
+	}
+	set := make(map[string]bool, len(have))
+	for _, tool := range have {
+		set[tool] = true
+	}
+	for _, tool := range required {
+		if !set[tool] {
+			return false
+		}
+	}
+	return true
+}
 
 // ---- Register counting tests ----
 
@@ -155,6 +183,104 @@ func TestPublishTask_SchedulerMode_NoDepthLimit(t *testing.T) {
 		if task.Depth != 0 {
 			t.Fatalf("scheduler mode should always produce depth=0, got %d", task.Depth)
 		}
+	}
+}
+
+func TestPublishTask_SchedulerRejectsMissingRuntimeRoute(t *testing.T) {
+	s := newFakeStore()
+	g := MetaGroup{Store: s, RouteValidator: fakeRouteValidator{routes: map[string][]string{"team:ready": {"read_file"}}}}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description": "will hang", "event_type": "team:missing",
+	})); err == nil || !strings.Contains(err.Error(), "没有 ready Agent route") {
+		t.Fatalf("expected deterministic missing-route rejection, got %v", err)
+	}
+	if len(s.createCalls) != 0 {
+		t.Fatalf("missing route must not publish a task: %+v", s.createCalls)
+	}
+	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description": "routable", "event_type": "team:ready",
+	})); err != nil {
+		t.Fatalf("ready route should publish: %v", err)
+	}
+}
+
+func TestPublishTask_DynamicRouteIsBoundToCurrentPlanWhileStaticRouteRemainsGlobal(t *testing.T) {
+	s := newFakeStore()
+	controller := &model.Task{ID: "controller-b", PlanID: "plan-b", Depth: 0, Status: model.TaskStatusProcessing}
+	s.tasks[controller.ID] = controller
+	routes := fakeRouteValidator{
+		routes: map[string][]string{
+			"team:owned-by-a": {"read_file"},
+			"static:global":   {"read_file"},
+		},
+		planIDs: map[string]string{"team:owned-by-a": "plan-a"},
+	}
+	g := MetaGroup{
+		Store: s, LineageHolder: &fakeHolder{id: controller.ID}, RouteValidator: routes,
+	}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description": "must not escape plan scope", "event_type": "team:owned-by-a",
+	})); err == nil || !strings.Contains(err.Error(), "当前 Plan") {
+		t.Fatalf("cross-Plan dynamic route should be rejected, got %v", err)
+	}
+	if len(s.createCalls) != 0 {
+		t.Fatalf("cross-Plan rejection must happen before publishing: %+v", s.createCalls)
+	}
+
+	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description": "global static work", "event_type": "static:global",
+	})); err != nil {
+		t.Fatalf("static route should remain usable from any Plan: %v", err)
+	}
+	if len(s.createCalls) != 1 || s.createCalls[0].EventSource != controller.ID {
+		t.Fatalf("expected one Plan-lineage task on static route, got %+v", s.createCalls)
+	}
+}
+
+func TestPublishTask_ExploreNameUsesRuntimeCapabilitiesWhenRegistryIsAvailable(t *testing.T) {
+	s := newFakeStore()
+	controller := &model.Task{ID: "controller", PlanID: "plan", Status: model.TaskStatusProcessing}
+	s.tasks[controller.ID] = controller
+	g := MetaGroup{
+		Store: s, LineageHolder: &fakeHolder{id: controller.ID},
+		RouteValidator: fakeRouteValidator{routes: map[string][]string{
+			"explore": {"read_file", "write_file"},
+		}},
+	}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description": "custom writable investigation", "event_type": "explore",
+		"expected_artifacts": "report.md",
+	})); err != nil {
+		t.Fatalf("capability-backed writable explore route should be accepted: %v", err)
+	}
+	if len(s.createCalls) != 1 || len(s.createCalls[0].ExpectedArtifacts) != 1 {
+		t.Fatalf("writable explore task was not published: %+v", s.createCalls)
+	}
+}
+
+func TestPublishTask_LegacyExploreFallbackRemainsReadOnlyWithoutRegistry(t *testing.T) {
+	s := newFakeStore()
+	g := MetaGroup{Store: s}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description": "legacy investigation", "event_type": "explore",
+		"expected_artifacts": "report.md",
+	})); err == nil || !strings.Contains(err.Error(), "只读 Explorer") {
+		t.Fatalf("legacy explore route should retain read-only fallback, got %v", err)
+	}
+	if len(s.createCalls) != 0 {
+		t.Fatalf("legacy read-only route published an artifact task: %+v", s.createCalls)
 	}
 }
 

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -51,6 +52,47 @@ func TestLoadConfig_V4Sample(t *testing.T) {
 	}
 	if cfg.StartupProbe == "" {
 		t.Error("startup_probe 字段未被读入")
+	}
+}
+
+func TestLoadConfigExampleIncludesRunnableAcceptanceVerifier(t *testing.T) {
+	repoRoot := filepath.Join("..", "..")
+	origDir, _ := os.Getwd()
+	if err := os.Chdir(repoRoot); err != nil {
+		t.Fatalf("Chdir(%q): %v", repoRoot, err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+	cfg, err := LoadConfig("config.example.yaml", true)
+	if err != nil {
+		t.Fatalf("LoadConfig(config.example.yaml): %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("config.example.yaml Validate: %v", err)
+	}
+	var verifier *AgentKind
+	for i := range cfg.Agents {
+		if cfg.Agents[i].EventType == "acceptance.verify" {
+			verifier = &cfg.Agents[i]
+			break
+		}
+	}
+	if verifier == nil {
+		t.Fatal("config.example.yaml lacks an acceptance.verify agent")
+	}
+	profile, err := cfg.ResolveProfile(verifier.Profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasSubmit := false
+	for _, tool := range profile {
+		if tool == "submit_acceptance_result" {
+			hasSubmit = true
+			break
+		}
+	}
+	if !hasSubmit {
+		t.Fatalf("acceptance verifier profile %q cannot submit formal results: %v", verifier.Profile, profile)
 	}
 }
 
@@ -128,6 +170,64 @@ func TestValidate_StartupProbeInvalid(t *testing.T) {
 	}
 }
 
+func TestValidate_SchedulerOnlyRequiresAndAcceptsModel(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.LLM.DefaultModel = "gpt-test"
+	cfg.Agents = nil
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("LLM-only Scheduler config should be valid: %v", err)
+	}
+
+	cfg.LLM.DefaultModel = ""
+	cfg.Scheduler.Model = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "缺少模型") {
+		t.Fatalf("empty Scheduler-only config should fail on model, got %v", err)
+	}
+}
+
+func TestValidate_StaticAgentsStillRequireSchedulerModel(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Agents = []AgentKind{{
+		Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
+		SystemPromptFile: filepath.Join("..", "..", "prompts", "worker.md"),
+		AgentMaxLoops:    1, TaskMaxRetries: 1,
+		EnforceCompactTokenThreshold: 1, ContextLimit: 1,
+	}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "Scheduler 配置缺少模型") {
+		t.Fatalf("static Agent model cannot replace the Scheduler/template default model, got %v", err)
+	}
+}
+
+func TestValidate_StaticAgentNeedsOwnOrLLMDefaultModel(t *testing.T) {
+	prompt := filepath.Join(t.TempDir(), "worker.md")
+	if err := os.WriteFile(prompt, []byte("worker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.Scheduler.Model = "scheduler-model"
+	cfg.Agents = []AgentKind{{
+		Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
+		SystemPromptFile: prompt, AgentMaxLoops: 1, TaskMaxRetries: 1,
+		EnforceCompactTokenThreshold: 1, ContextLimit: 1,
+	}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agents[0].model") {
+		t.Fatalf("scheduler.model must not silently become the static Agent model, got %v", err)
+	}
+	cfg.Agents[0].Model = "worker-model"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("explicit per-Agent model should be valid: %v", err)
+	}
+}
+
+func TestValidate_InvalidStaticAgentDoesNotDowngradeToSchedulerOnly(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.LLM.DefaultModel = "gpt-test"
+	cfg.Agents = []AgentKind{{Kind: "broken", Replicas: 0}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "replicas") {
+		t.Fatalf("invalid non-empty agents must remain a hard error, got %v", err)
+	}
+}
+
 // TestExpandEnv_EmptyKeyOnUnset 验证 os.ExpandEnv 在 env 未设时把 ${VAR}
 // 替换为空串——这是 §11.3 文档中的预期行为，烟测中无 KEY 仍能跑通。
 func TestExpandEnv_EmptyKeyOnUnset(t *testing.T) {
@@ -137,7 +237,6 @@ func TestExpandEnv_EmptyKeyOnUnset(t *testing.T) {
 		t.Errorf("os.ExpandEnv 未按预期替换为空串: got %q", expanded)
 	}
 }
-
 
 // === §7 HashlineEnabled 配置测试 ===
 

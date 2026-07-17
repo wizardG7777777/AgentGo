@@ -14,6 +14,7 @@
 > **v5.x 增量已落地**：
 > - §6.1 `call:` 动作（B 选项 — 内置工具调用 verb）— v1 仅支持 `call: send_message`，args 模板化
 > - §6.2 per-kind reactors（reactor 配置粒度细化）— 顶层 `kind:` 字段过滤；spawn agents 通过 `spawn.Manager.KindOf` 继承 base_kind 路由（§6.2.4）
+> - `request_replan` 动作 — Reactor 可请求 Scheduler 重新评估动态 Plan，但不能直接改变计划内 DAG；完整控制面见 [DynamicDAG.md](DynamicDAG.md)
 >
 > **仍 fail-fast 的占位字段**（schema 接受、运行期报错）：
 > - `lifecycle: persistent`（spawn_agent 长期形态）
@@ -80,7 +81,8 @@
 - 状态转换的"主动作"（`store.ClaimTask` / `store.TransitionState` / `agent.SetState` 等核心调用）只能由 AgentGo 内置主流程驱动
 - 用户配置的 Reactor 只能订阅"状态已经变成 B 之后"的事件做副作用
 - **用户 Reactor 永远不允许直接调用 `agent.SetState(...)` 或 `store.TransitionState(...)`**——YAML 动作语言的设计层面就排除这种能力
-- Reactor 想让 agent 进入下一状态，必须通过明确 API（publish_task / send_message / 调工具），让主流程在合适时机自然驱动转换
+- Reactor 想让 agent 进入下一状态，必须通过明确 API（publish_task / send_message / request_replan / 调工具），让主流程在合适时机自然驱动转换
+- 对动态 Plan，Reactor 只能 `request_replan`；计划内拓扑只能由 Scheduler/Acceptance 控制路径修改
 
 **理由**：状态机的原子性是系统稳定性的根基。一旦允许用户配置驱动状态转换，事件循环会从有向无环图退化为可能的环，调试地狱、责任归属混乱、Replay 困难。这条规则保证状态机入口固定且可审计；调试时永远知道"状态从哪儿变的"；用户配置错误最多打破 reactor 但不会打破状态机。
 
@@ -93,17 +95,18 @@
 
 两类共享同一个 ReactorRegistry 与事件订阅机制，区别仅在注册入口、同步性许可、失败的可见性级别。
 
-### 原则 3：trace 是事实标准（事件流唯一真相源）
+### 原则 3：trace 是 Reactor 的统一事件源，不替代领域权威存储
 
 所有状态变更必须遵循三步序列：**主流程 SetState → emit `KindAgentStateChanged`（或对应 EventKind）→ Reactor 订阅者响应**。
 
-- trace 事件不仅是观察手段，更是 Reactor 系统的**唯一事件源**
+- trace 事件不仅是观察手段，更是 Reactor 系统的统一订阅入口
+- TaskStore 仍是 Task 事实的权威来源；动态 DAG 的 PlanStore 是图版本、pending ReplanRequest 和正式验收的权威来源。trace 记录这些已提交事实，但不替代领域 Store
 - 这意味着 trace 机制升级（事件 payload 结构化、新增状态变更字段等，详见 `TraceUpgrade.md`）从"前置依赖"升级为**硬性前置**——没有结构化事件，整套 Reactor 架构站不起来
 - TraceUpgrade 与 ReactiveSystem 同步推进（详见 §10 实施顺序）
 
 ### 原则 4：Reactor 不允许直接驱动新状态转换
 
-承接原则 1 的延伸——不仅用户 Reactor，**内置 Reactor 也不允许直接 SetState**。Reactor 想让 agent 进入下一状态必须通过明确 API（publish_task / send_message / 调工具），由主流程在适当时机驱动。
+承接原则 1 的延伸——不仅用户 Reactor，**内置 Reactor 也不允许直接 SetState**。Reactor 想让 agent 进入下一状态必须通过明确 API（publish_task / send_message / request_replan / 调工具），由主流程在适当时机驱动。
 
 **理由**：避免 Reactor → Reactor 级联导致事件循环复杂度爆炸；保留单一驱动入口便于 Replay 与调试。如果某个内置副作用看起来"必须立即转换状态才能继续"，那它本身应当是主流程的一部分，不该是 Reactor。
 
@@ -864,6 +867,8 @@ D 选项不再是单一的 "publish a new task"，而是按"事件触发后该�
 
 **关键边界（必读）**：三动词覆盖的场景**互不重叠**，不是同一个东西的三种写法。`publish_task` 是"已有 agent 干新任务"，`invoke_llm` 是"绕过 agent 系统直接消费一次 token"，`spawn_agent` 是"创建独立的临时 agent 实例"。spec 阶段会在工具描述里明文标注此边界。
 
+**动态 DAG 补充（2026-07）**：上述三动词仍描述“如何执行副作用”，`request_replan` 则是独立的控制面动作。未纳入 Plan 的来源可继续使用 `publish_task`；计划内来源的 `publish_task` 意图会转成 `request_replan`，由 Scheduler 决定是否创建节点。Reactor 不因来源 Agent kind 不同而获得图修改权。
+
 #### 6.1.3 通用 prompt 加载层（三动词共享）
 
 为了"一开始就做好足够的扩展空间"，所有动词的 prompt 来源走同一套抽象，未来只在这层加新字段：
@@ -910,7 +915,7 @@ reactors:
       output:                          # 必填，否则结果丢失
         write_file: ./logs/failure-${event.task.id}.md
         # 或 send_message: { to: admin, content_var: output }
-        # 或 emit_trace: { kind: failure_summary }
+        # 或 emit_trace: { kind: user.failure_summary }
 
   # ── 场景 3：启动 ad-hoc agent ──────────────────────
   - on: task_failed
@@ -1052,7 +1057,7 @@ reactors:
 |---|---|---|
 | 事件类型 | `on:` | 订阅哪种事件类型（task_failed / file_written / ...）|
 | **粒度（本节）** | `kind:` 为空还是指定某个 agent kind | 订阅范围内的哪些 agent 触发的事件 |
-| 动作内容 | `call:` / `publish_task:` / `invoke_llm:` / `spawn_agent:` | 触发后做什么 |
+| 动作内容 | `call:` / `publish_task:` / `invoke_llm:` / `spawn_agent:` / `request_replan:` | 触发后做什么 |
 
 `on:` 与粒度**交叉过滤**——只有事件类型匹配 *且* 来源 agent 在粒度范围内时，reactor 才触发。
 
@@ -1093,7 +1098,7 @@ Global reactor → Per-kind reactor
 
 c 在 Q4 拍板三动词后**独立价值下降**：
 
-1. "任务级链式编排"已被 `publish_task` / `spawn_agent` 部分承接——scheduler 想让 A 完成后做 B，更简单的方式是**在 A 的 description 里写"完成后请 publish_task B"**让 LLM 自然完成
+1. 未纳入 Plan 的“任务级链式编排”可由 `publish_task` / `spawn_agent` 承接；动态 Plan 内由 A 的终态自动唤醒 Scheduler，或由 A 调 `request_replan`，再由 Scheduler 决定是否发布 B
 2. a + b 已覆盖"系统级 + kind 级"所有静态需求；c 是"运行时动态 reactor"——这是个真正的新维度，应作为独立模块（v5.x 或 v6 单独设计），不是 v5 首版赶工
 3. c 的实现复杂度跳一级——**任务级注册表的生命周期管理**比 a/b 复杂得多（任务终结时清理、取消时回滚部分副作用、scheduler LLM 学会输出 reactor 配置），与 v5 首版"S1-S7 全做"目标不兼容
 
@@ -1373,7 +1378,7 @@ func (r *TaskEndCallbackReactor) Run(ev trace.Event) error {
 
 #### 6.6.4 用户 Reactor 通过 YAML 注册（Phase 5）
 
-§6.1 已经详细定义了 YAML schema（三动词 + via_translator + when 字段）。Phase 5 实施时引入 YAML loader 把声明式配置转换为 `Reactor` 接口的具体实现：
+§6.1 已经定义了 YAML 动作 schema；当前 loader 支持三类执行动词、`call:`、`request_replan`、`via_translator` 和 `when` 字段，把声明式配置转换为 `Reactor` 接口的具体实现：
 
 ```go
 // internal/reactor/userdef/yaml_loader.go（伪代码）
@@ -1388,7 +1393,7 @@ func LoadFromYAML(yamlPath string, registry *ReactorRegistry) error {
             name:      decl.Name,
             kinds:     []trace.EventKind{decl.OnEvent},
             whenExpr:  decl.When,        // ${event.x.y} 比较表达式
-            action:    decl.Action,      // publish_task / invoke_llm / spawn_agent
+            action:    decl.Action,      // publish_task / invoke_llm / spawn_agent / request_replan / call
             // 用户 Reactor 强制 IsSync=false（原则 2）
         }
         if err := registry.Register(userReactor); err != nil {
@@ -1401,7 +1406,7 @@ func LoadFromYAML(yamlPath string, registry *ReactorRegistry) error {
 
 `UserReactor.Run(ev)` 内部：
 1. 评估 `when` 表达式（false → 直接返回 nil 不做事）
-2. 按 action 分发（publish_task → 调 store.PublishTask；invoke_llm → 走 §6.1.2 isolated LLM client；spawn_agent → 创建临时 agent 实例）
+2. 按 action 分发（publish_task → 兼容任务走 store.PublishTask，计划内意图转 request_replan；invoke_llm → 走 §6.1.2 isolated LLM client；spawn_agent → 创建临时 agent；request_replan → 写 PlanCoordinator 持久请求）
 
 #### 6.6.5 EventKind 订阅过滤的边界
 

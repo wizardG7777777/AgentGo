@@ -251,11 +251,13 @@ reactors:
 	}
 }
 
-func TestProgramVerifyReactors_LoadAndPublishVerifierTask(t *testing.T) {
+func TestProgramVerifyReactors_RequestPlanReevaluation(t *testing.T) {
 	repoRoot := testRepoRoot(t)
 	store := &fakeStore{}
+	requester := &fakeReplanRequester{response: "queued"}
 	rs, err := LoadFromFile(filepath.Join(repoRoot, "reactors.program-verify.yaml"), repoRoot, Deps{
-		Store: store,
+		Store:           store,
+		ReplanRequester: requester,
 		KindEventTypes: map[string]string{
 			"worker":   "",
 			"verifier": "verify",
@@ -278,37 +280,31 @@ func TestProgramVerifyReactors_LoadAndPublishVerifierTask(t *testing.T) {
 	}
 
 	if err := rs[0].Run(trace.Event{
-		Kind:    trace.KindTaskCompleted,
-		TaskID:  "worker-task-1",
-		AgentID: "worker-1",
-		Depth:   1,
+		Kind:       trace.KindTaskRetry,
+		TaskID:     "worker-task-1",
+		AgentID:    "worker-1",
+		Transition: &trace.Transition{RetryCount: 2},
 	}); err != nil {
 		t.Fatalf("Run worker event: %v", err)
 	}
-	tasks := store.snapshot()
-	if len(tasks) != 1 {
-		t.Fatalf("expected 1 verifier task, got %d", len(tasks))
+	if got := len(store.snapshot()); got != 0 {
+		t.Fatalf("planned Reactor must not publish verifier tasks directly, got %d", got)
 	}
-	if tasks[0].EventType != "verify" {
-		t.Fatalf("EventType=%q want verify", tasks[0].EventType)
-	}
-	if got := tasks[0].Dependencies; len(got) != 1 || got[0] != "worker-task-1" {
-		t.Fatalf("Dependencies=%v want [worker-task-1]", got)
-	}
-	if !strings.Contains(tasks[0].Description, "worker-task-1") {
-		t.Fatalf("description should mention upstream task, got %q", tasks[0].Description)
+	calls := requester.snapshot()
+	if len(calls) != 1 || calls[0].reasonCode != "worker_retry_pressure" || calls[0].urgency != "high" {
+		t.Fatalf("request_replan calls=%+v", calls)
 	}
 
 	if err := rs[0].Run(trace.Event{
-		Kind:    trace.KindTaskCompleted,
-		TaskID:  "verifier-task-1",
-		AgentID: "verifier-1",
-		Depth:   1,
+		Kind:       trace.KindTaskRetry,
+		TaskID:     "verifier-task-1",
+		AgentID:    "verifier-1",
+		Transition: &trace.Transition{RetryCount: 2},
 	}); err != nil {
 		t.Fatalf("Run verifier event: %v", err)
 	}
-	if got := len(store.snapshot()); got != 1 {
-		t.Fatalf("verifier completion should not recursively publish, got %d tasks", got)
+	if got := len(requester.snapshot()); got != 1 {
+		t.Fatalf("verifier retry should not request recursively, got %d calls", got)
 	}
 }
 

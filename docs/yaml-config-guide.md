@@ -2,16 +2,17 @@
 
 > 面向另一个 Agent / 新接手的人类作者。
 > 目的：让你**不读源码也能写出能跑、能过校验**的 AgentGo 配置。
-> 权威源：[internal/config/config.go](../internal/config/config.go) 与 [internal/reactor/userdef/schema.go](../internal/reactor/userdef/schema.go)。
+> 权威源：[internal/config/config.go](../internal/config/config.go)、[internal/agenttemplate/load.go](../internal/agenttemplate/load.go) 与 [internal/reactor/userdef/schema.go](../internal/reactor/userdef/schema.go)。
 
-AgentGo 有**两类** YAML 文件：
+AgentGo 有**三类** YAML 文件：
 
 | 文件 | 角色 | 是否必需 | 解析入口 |
 |---|---|---|---|
-| 主配置（如 `config.yaml`） | 声明 LLM / Agent kinds / tools / 运行时参数 | **必需**，CLI `-c` 指定 | [config.LoadConfig](../internal/config/config.go) |
+| 主配置（如 `config.yaml`） | 声明 LLM / 可选预热 Agent / 模板目录 / 运行时参数 | **必需**，CLI `-config` 指定 | [config.LoadConfig](../internal/config/config.go) |
+| AgentTemplate（如 `agent-templates/reviewer.yaml`） | 声明一种可按需实例化的 Agent 能力 | 可选，由主配置 `agent_templates:` 发现 | [AgentTemplate.md](activate/AgentTemplate.md) |
 | Reactor 配置（如 `reactors.yaml`） | 声明 v5 用户级 reactor（事件触发的副作用） | 可选，由主配置 `reactors_file:` 指向 | [reactor/userdef.LoadFromFile](../internal/reactor/userdef/loader.go) |
 
-完整可跑模板：[config.example.yaml](../config.example.yaml) + [test_invest.yaml](../test_invest.yaml) + [test_invest_reactors.yaml](../test_invest_reactors.yaml)。
+当前动态 Plan 的完整可跑模板是 [config.example.yaml](../config.example.yaml)。本地若仍保留 `test_invest.yaml` / `test_invest_reactors.yaml`，它们属于 legacy/unplanned 对抗示例：来源 Task 一旦属于 Plan，其中的 Reactor `publish_task` 会转成 `request_replan`，不能照搬为动态 DAG 拓扑方案。
 
 ⚠️ v3 遗留配置 `test_multi_agent.yaml` 已删除，**不要参考**——它的顶层字段在 v4/v5 已被忽略。
 
@@ -21,13 +22,12 @@ AgentGo 有**两类** YAML 文件：
 
 写新配置时按这个顺序走，每步都能立即用 `Validate()` 反馈错误：
 
-1. **填 `llm:` 块**：base_url / api_key / default_model / timeout_sec
-2. **填 `tool_profiles:` 命名工具集**（可选，但推荐——多 kind 复用时省字数）
-3. **填 `agents:` 列表**：至少一个 kind，必填字段一个都不能少（见 §2）
-4. **可选 `scheduler:` 块**：通常只覆盖 model
-5. **可选 `infra:` 块**：不写就用默认
-6. **可选 `reactors_file:`**：要写用户 reactor 时才填
-7. 运行 `agentgo -c your.yaml` 验证启动期校验全过
+1. **填 `llm:` 块**：通常只需 base_url / api_key / default_model；timeout_sec 可选
+2. **可直接启动 Scheduler**：只做单 Agent 工作，或让 Scheduler 决定何时组建 Team
+3. **可选 `agent_templates:`**：加载个人/项目模板并设置运行期 Agent 上限
+4. **可选 `tool_profiles:` + `agents:`**：需要启动即常驻的预热 Agent 时再写
+5. **可选 `scheduler:` / `infra:` / `reactors_file:`**
+6. 运行 `agentgo -config your.yaml` 验证启动期校验全过
 
 ---
 
@@ -37,16 +37,17 @@ AgentGo 有**两类** YAML 文件：
 
 ```yaml
 llm:
-  base_url: https://api.openai.com/v1   # 必填
-  api_key: ${OPENAI_API_KEY}            # 必填，支持 ${ENV_VAR} 替换
-  default_model: gpt-4o                 # 必填，agents[*].model 缺省时回落到此
-  timeout_sec: 120                      # 必填
+  base_url: https://api.openai.com/v1   # 可选；空时使用 OpenAI 官方端点
+  api_key: ${OPENAI_API_KEY}            # 可选；空时 SDK 读 OPENAI_API_KEY
+  default_model: gpt-4o                 # 推荐必填；Scheduler/模板/静态 Agent 的默认
+  timeout_sec: 120                      # 可选；省略时 runtime 使用 60 秒
   provider: openai                      # 可选：openai / deepseek-v4 / deepseek-r1
 ```
 
 **关键点**：
 - `${ENV_VAR}` 形式的环境变量替换走 `os.ExpandEnv`，发生在 unmarshal 之前——可以替换 YAML 中**任何**字段的值，不止 api_key
-- 没有 fallback：`llm:` 块缺失会校验失败
+- Scheduler-only 至少要能解析出模型：通常填写 `llm.default_model`，也可由 `scheduler.model` 覆盖
+- `base_url` 为空时 SDK 使用 OpenAI 官方端点；`api_key` 为空时 SDK 尝试读取 `OPENAI_API_KEY`。生产配置仍建议显式写成上面的形式，便于审查实际 provider 边界
 
 ### 1.2 `tool_profiles:` — 命名工具集（推荐）
 
@@ -64,12 +65,15 @@ tool_profiles:
 ```
 
 - key 是 profile 名，value 是工具名列表
-- 工具名必须在 [internal/tools](../internal/tools/) 注册（如 `read_file` / `list_dir` / `grep_search` / `glob_search` / `write_file` / `edit_file` / `run_shell` / `web_search` / `web_fetch` / `publish_task` / `send_message` / `cancel_task`）
+- 工具名必须在 [internal/tools](../internal/tools/) 注册（如 `read_file` / `write_file` / `run_shell` / `publish_task` / `send_message` / `request_replan` / `submit_acceptance_result`；完整列表见 [tool-profiles.md](tool-profiles.md)）
 - 拼错或写不存在的工具名 → 启动期报错
 
-### 1.3 `agents:` — Agent kind 列表（必需，至少一个）
+### 1.3 `agents:` — 预热 Agent kind 列表（可选）
 
-每个 kind 的字段：
+省略 `agents:` 时进入 Scheduler-only 模式：启动快照中没有子 Agent，也不会伪造一个默认 worker。任务需要专门能力时，Scheduler 从 AgentTemplate provision 实例后再发布 Task。
+
+配置 `agents:` 则保持原有预热语义。每个 kind 的字段：
+
 
 ```yaml
 agents:
@@ -110,7 +114,62 @@ scheduler:
 
 scheduler 的工具集 / system prompt / replicas 全部**硬编码**在 [internal/scheduler](../internal/scheduler/)，YAML 不能调。
 
-### 1.5 `infra:` — 运行时基础设施（可选，全有默认）
+### 1.5 `agent_templates:` — 按需 Agent 配置（可选）
+
+```yaml
+agent_templates:
+  user_dirs:
+    - /Users/me/.config/agentgo/templates
+  project_dirs:
+    - agent-templates
+  max_runtime_agents: 8
+```
+
+- `user_dirs`：个人/组织模板目录，目录内文件获得 `user/` namespace；支持 `~/`，普通相对路径按启动工作目录解析。
+- `project_dirs`：项目模板目录，目录内文件获得 `project/` namespace；普通相对路径按 `project_root` 解析。推荐使用仓库根下可提交评审的 `agent-templates/`，不要使用通常被 gitignore 的 `.agentgo/`。
+- `max_runtime_agents`：Scheduler 从模板创建的运行实例全局上限；省略或为零时使用 8，可显式设置 1..32，不包含 `agents:` 预热实例。
+- 内置 `builtin/generalist@1`、`builtin/explorer@1`、`builtin/verifier@1` 无需目录配置，始终存在。
+
+每个目录只读取 YAML 模板文件。v1 采用**一文件一个模板**，不支持 `templates:` 数组、模板继承或 `profile` 引用：
+
+```yaml
+# agent-templates/reviewer.yaml
+name: reviewer
+version: 1
+description: 对实现做只读审查，并把缺陷事实提交给 Scheduler。
+capabilities: [code_read, shell]
+tools:
+  - read_file
+  - list_dir
+  - grep_search
+  - glob_search
+  - run_shell
+  - request_replan
+model: gpt-4o-mini
+system_prompt: |
+  只基于可复核事实审查当前任务；需要改图时调用 request_replan。
+limits:
+  agent_max_loops: 8
+  task_max_retries: 2
+  enforce_compact_token_threshold: 3000
+  context_limit: 12000
+  max_replicas: 2
+```
+
+校验规则：
+
+- `name`、正整数 `version`、非空 `description` / `tools` 必填；name 必须匹配 `^[a-z][a-z0-9_-]{0,63}$`。
+- `capabilities` 可选，只帮助 Scheduler 选型，权限以真实 `tools` 为准；两个列表都不允许空白或重复条目。
+- `system_prompt` 与 `system_prompt_file` 恰好一个；文件路径相对配置的模板目录解析，并且不能以绝对路径、反斜杠、`..` 或符号链接越界；digest 记录解析后的 prompt 内容，不记录路径文字。
+- `model` 为空时在加载期解析为 `llm.default_model`（或 Scheduler model）并进入 digest；存在 ready TeamSpec 时改变全局默认模型会被视为模板内容漂移。
+- 外部模板不能声明 namespace；完整 ref 由来源组成，例如 `project/reviewer@1`。
+- `limits` 可省略；默认为 `10 / 3 / 4000 / 16000 / 4`（按示例字段顺序），显式值必须大于零。`limits.max_replicas` 控制该模板 Team 的副本上限。
+- 工具名拼错或包含 Scheduler 独占 DAG 工具会在启动期失败；YAML 未知字段和同一文件中的第二个 YAML document 也会被拒绝。
+- 同 namespace 的 `name@version` 不能重复，内置 ref 不能覆盖。Catalog 为每个模板计算 digest，持久化 TeamSpec 记录 ref+digest 用于恢复校验。
+
+Scheduler 不能先发布一个没有消费者的 route 再尝试创建 Agent。`provision_agent_team` 只有在 Team 与 route ready 后才成功返回，Scheduler 随后再用该真实 route 调 `publish_task`；容量、加载或实例化失败发生在 Task 发布前，不留下孤儿 pending Task。完整生命周期见 [AgentTemplate.md](activate/AgentTemplate.md)。
+
+### 1.6 `infra:` — 运行时基础设施（可选，全有默认）
 
 ```yaml
 infra:
@@ -128,7 +187,7 @@ infra:
     wait_timeout_sec: 30
 ```
 
-### 1.6 顶层杂项字段
+### 1.7 顶层杂项字段
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
@@ -147,6 +206,7 @@ infra:
 | `startup_probe_timeout_sec` | `0` | 不可负 |
 | `startup_probe_failure_action` | `""` | `"warn"` / `"exit"`；其它值校验失败 |
 | `reactors_file` | `""` | v5 用户 reactor 文件路径（见 §3） |
+| `agent_templates` | 内置 Catalog + 默认容量 | 外部模板目录与模板运行实例上限（见 §1.5） |
 
 ---
 
@@ -154,13 +214,15 @@ infra:
 
 | 现象 | 根因 | 修复 |
 |---|---|---|
-| `agents 列表为空` | 没写 `agents:` 块或写空 | 至少声明一个 kind |
 | `agents[N].kind 重复` | 两个 kind 同名 | 改名（kind 是路由 key） |
 | `同时声明了 profile 和 tools` | 互斥字段都给 | 删掉其一 |
 | `引用了不存在的 profile` | 拼写错 / 忘了在 `tool_profiles:` 定义 | 对齐名字 |
 | `system_prompt_file 不可读` | 路径相对 cwd 解析失败 | 用相对 `agentgo` 启动目录的路径，或绝对路径 |
 | `包含反斜杠` | Windows 风格路径 | 改成 forward slash |
 | `agent_max_loops 必须 > 0` | 字段写了 `0` 或漏掉（int 默认 0） | 显式写正数 |
+| `agent template duplicate ref` | 同一来源 namespace 出现相同 `name@version` | 改模板名或提升 version |
+| `agent template digest mismatch` | 恢复时磁盘模板与 TeamSpec 记录的内容不同 | 恢复原模板或显式处理持久 TeamSpec 后重启；v1 不自动迁移 |
+| `runtime agent limit reached` | 达到全局或模板 `max_replicas` | 等待实例释放、提高显式上限或收缩 DAG 并发 |
 | 启动正常但行为完全没变 | 用了 v3 顶层字段如 `worker_count` | 改成 v4/v5 嵌套 schema |
 
 ---
@@ -168,7 +230,7 @@ infra:
 ## 3. Reactor 配置（v5）
 
 > 仅在主配置 `reactors_file:` 非空时加载。完整 schema 见 [reactor/userdef/schema.go](../internal/reactor/userdef/schema.go)。
-> 现成参考：[test_invest_reactors.yaml](../test_invest_reactors.yaml)。
+> 当前动态 Plan 参考：[reactors.program-verify.yaml](../reactors.program-verify.yaml)。旧 `test_invest_reactors.yaml` 只适用于未纳入 Plan 的兼容任务。
 
 ### 3.1 文件结构
 
@@ -178,10 +240,11 @@ reactors:
     on: <EventKind>            # 必填
     when: "<表达式>"           # 可选条件
     kind: <agent kind>         # 可选，per-kind 过滤源 agent
-    # —— 下面四个动作字段恰好一个非 nil ——
+    # —— 下面五个动作字段恰好一个非 nil ——
     publish_task: { ... }
     invoke_llm:   { ... }
     spawn_agent:  { ... }
+    request_replan: { ... }
     call: send_message         # B 选项；v1 仅支持 send_message
     args: { to: ..., content: ... }
 ```
@@ -199,6 +262,7 @@ file_written / file_write_queued / progress_notify
 error / agent_state_changed
 shell_executed / shell_timeout_pending / shell_timeout_resolved
 reactor_spawn_depth_exceeded
+acceptance_completed / plan_paused / plan_terminal
 ```
 
 写不在表里的 EventKind 启动期直接报错。
@@ -217,7 +281,7 @@ when: "${event.path} contains .agentgo/reports/"
 
 ### 3.4 模板变量
 
-所有动作字段的字符串内都能用 `${event.x}` 引用事件 payload，常用：
+除 `request_replan` 的三个配置值外，其余动作字段的字符串内都能用 `${event.x}` 引用事件 payload，常用：
 
 - `${event.task.id}` / `${event.task.depth}` / `${event.task.kind}`
 - `${event.agent.id}` / `${event.agent.kind}`
@@ -226,6 +290,8 @@ when: "${event.path} contains .agentgo/reports/"
 - `${event.kind}`（事件类型本身）
 
 **启动期会校验**模板中引用的字段名合法（拼错立即报错），但具体可用字段以事件 payload 为准——参考 [trace/event.go](../internal/trace/event.go) 的 Event 结构与各 EventKind 对应的 sub-payload。
+
+`request_replan.reason_code` / `urgency` / `detail` 是字面量，不做模板渲染；实现会把完整原始 Event 单独交给受信任的 `ReplanRequester`，由它读取 Task、Plan 和版本身份。
 
 ### 3.5 动作 1：`publish_task` —— 投递任务
 
@@ -247,6 +313,8 @@ publish_task:
 
 `dependencies` 的典型用例：`text_only_submission` → 派审核任务时，verifier 会在 system prompt 的"前置任务结果"段里自动看到 gatherer 的输出。
 
+计划内边界：如果来源 Task 已属于动态 Plan，Reactor 不得直接改变该 Plan 的拓扑。此时旧 `publish_task` 意图会转成 `request_replan`，由 Scheduler 决定继续等待、调整图或启动正式验收；来源 Task 未纳入 Plan 时仍保持原兼容行为。详见 [DynamicDAG.md](activate/DynamicDAG.md)。
+
 ### 3.6 动作 2：`invoke_llm` —— 一次性 LLM 调用
 
 不带工具 / history / system prompt 注入的独立 LLM 调用，输出去向三选一：
@@ -265,10 +333,12 @@ invoke_llm:
     # 或
     # send_message: { to: "${event.agent.id}", type: info, priority: normal }
     # 或
-    # emit_trace: { kind: my_custom_kind }
+    # emit_trace: { kind: user.my_custom_kind }
 ```
 
 ⚠️ `write_file.path` 渲染后必须在 `project_root` 内，否则运行时拒绝写入。
+
+⚠️ `emit_trace.kind` 必须使用 `user.<name>` 命名空间且 `<name>` 非空。用户 Reactor 不能伪造 `task_completed`、`acceptance_completed` 等系统事实事件。
 
 ### 3.7 动作 3：`spawn_agent` —— 启动 ad-hoc agent
 
@@ -292,7 +362,24 @@ spawn_agent:
   lifecycle: one_shot            # 当前仅 one_shot 真实生效
 ```
 
-### 3.8 动作 4：`call:` —— 直接调用内置工具（B 选项）
+### 3.8 动作 4：`request_replan` —— 请求 Scheduler 重新评估 Plan
+
+这个动作只提交控制面请求，不直接创建 Task 或修改 DAG：
+
+```yaml
+- name: recheck_worker_retry_pressure
+  on: task_retry
+  kind: worker
+  when: "${event.task.retry_count} >= 2"
+  request_replan:
+    reason_code: worker_retry_pressure
+    urgency: high                   # normal / high
+    detail: "Repeated retries suggest the current DAG node may need replacement."
+```
+
+Task 终态已经由内置控制面逐 Task 唤醒，不要再为 `task_completed` / `task_failed` 配置同义 `request_replan`。这个动作主要扩展项目特有的非终态信号。YAML 只允许提供字面量 `reason_code`、`urgency` 和可选 `detail`，这三个值不执行 `${event.x}` 模板渲染。PlanID、来源 Task、PlanRevision、ExecutionStateVersion 和幂等键由系统根据原始事件与 PlanStore 状态注入，不能在 YAML 中覆盖。使用该动作时 Bootstrap 必须提供 PlanCoordinator 对应的 `ReplanRequester`；缺失会在启动期报错。
+
+### 3.9 动作 5：`call:` —— 直接调用内置工具（B 选项）
 
 v1 **仅支持 `send_message`**：
 
@@ -307,7 +394,7 @@ args:
 
 调其它工具会被 loader 拒绝。
 
-### 3.9 `kind:` 顶层字段 —— per-kind 过滤
+### 3.10 `kind:` 顶层字段 —— per-kind 过滤
 
 ```yaml
 - name: only_for_gatherer
@@ -318,16 +405,18 @@ args:
 
 Spawned agent 通过 `spawn.Manager.KindOf` 继承 `base_kind` 路由，所以也会被该过滤命中。
 
-### 3.10 Reactor 启动期校验清单
+### 3.11 Reactor 启动期校验清单
 
 - YAML 语法合法
 - `on:` 命中已知 EventKind
-- 四个动作字段（publish_task / invoke_llm / spawn_agent / call）**恰好一个非 nil**
+- 五个动作字段（publish_task / invoke_llm / spawn_agent / request_replan / call）**恰好一个非 nil**
 - `publish_task.kind` 命中已声明 agent kind
+- `request_replan.reason_code` 非空，`urgency` 只能是 `normal` / `high`，且不得携带控制面权威字段
 - `description.file` / `prompt.file` / `system_prompt.file` 必须在 `project_root` 内
+- `emit_trace.kind` 使用非空的 `user.<name>` 命名空间
 - 模板变量字段名合法
 - `when:` 表达式可解析
-- 依赖完整性：用到的动作所需的内部依赖必须可用（如 invoke_llm 需要 LLM client，publish_task 需要 Store；缺失会报"启动期依赖缺失"错误）
+- 依赖完整性：用到的动作所需的内部依赖必须可用（如 invoke_llm 需要 LLM client，publish_task 需要 Store，request_replan 需要 ReplanRequester；缺失会报"启动期依赖缺失"错误）
 
 ---
 
@@ -335,6 +424,6 @@ Spawned agent 通过 `spawn.Manager.KindOf` 继承 `base_kind` 路由，所以�
 
 - **不要猜字段名**：去看 [config.go](../internal/config/config.go) 的 struct yaml tag，或 [schema.go](../internal/reactor/userdef/schema.go)
 - **不要复制 v3 字段**：顶层 `worker_count` / `llm_base_url` / `agent_max_loops` 等已废弃，写了也无效
-- **不要互斥并存**：`profile` 与 `tools`、动作四字段——只能选一
-- **写完先跑校验**：`agentgo -c your.yaml` 启动失败的 error 信息会精确指出 `agents[N].xxx`，按图索骥即可
-- **复用现成模板**：v5 端到端能跑的最小示例就是 [test_invest.yaml](../test_invest.yaml) + [test_invest_reactors.yaml](../test_invest_reactors.yaml)，照抄结构最稳
+- **不要互斥并存**：`profile` 与 `tools`、动作五字段——只能选一
+- **写完先跑校验**：`agentgo -config your.yaml` 启动失败的 error 信息会精确指出 `agents[N].xxx` 或模板文件路径，按图索骥即可
+- **复用现成模板**：动态 Plan 从 [config.example.yaml](../config.example.yaml) + [reactors.program-verify.yaml](../reactors.program-verify.yaml) 开始；旧 `test_invest*` 只演示 legacy/unplanned Reactor 链，不能当作 Scheduler 拓扑权威

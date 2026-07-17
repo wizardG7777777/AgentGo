@@ -3,24 +3,30 @@ package store
 import (
 	"agentgo/internal/model"
 	"agentgo/internal/session"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
 
-func TestExportSnapshot_SkipsTerminalTasks(t *testing.T) {
+func TestExportSnapshot_IncludesTerminalTasksForDependencyClosure(t *testing.T) {
 	s, _ := newTestStore(10, 100)
-
-	// Create a pending task
-	pending := publishTestTask(t, s, "pending task")
-
-	// Create a processing task
-	processing := publishTestTask(t, s, "processing task")
-	s.ClaimTask("agent-1", processing.ID)
 
 	// Create a completed task
 	completed := publishTestTask(t, s, "completed task")
 	s.ClaimTask("agent-2", completed.ID)
 	s.SubmitResult("agent-2", completed.ID, "done")
+
+	// Create a pending task that depends on the completed task. The completed
+	// node must survive the snapshot or this task cannot be claimed after resume.
+	pending := &model.Task{Description: "pending task", Dependencies: []string{completed.ID}}
+	if err := s.PublishTask(pending); err != nil {
+		t.Fatalf("PublishTask pending: %v", err)
+	}
+
+	// Create a processing task
+	processing := publishTestTask(t, s, "processing task")
+	s.ClaimTask("agent-1", processing.ID)
 
 	// Create a failed task
 	failed := publishTestTask(t, s, "failed task")
@@ -29,14 +35,15 @@ func TestExportSnapshot_SkipsTerminalTasks(t *testing.T) {
 
 	snaps := s.ExportSnapshot()
 
-	// Only pending and processing should be exported
-	if len(snaps) != 2 {
-		t.Fatalf("expected 2 non-terminal tasks, got %d", len(snaps))
+	if len(snaps) != 4 {
+		t.Fatalf("expected all 4 tasks, got %d", len(snaps))
 	}
 
 	ids := map[string]bool{}
+	completedAt := map[string]string{}
 	for _, snap := range snaps {
 		ids[snap.ID] = true
+		completedAt[snap.ID] = snap.CompletedAt
 	}
 	if !ids[pending.ID] {
 		t.Error("pending task should be exported")
@@ -44,11 +51,14 @@ func TestExportSnapshot_SkipsTerminalTasks(t *testing.T) {
 	if !ids[processing.ID] {
 		t.Error("processing task should be exported")
 	}
-	if ids[completed.ID] {
-		t.Error("completed task should NOT be exported")
+	if !ids[completed.ID] {
+		t.Error("completed dependency should be exported")
 	}
-	if ids[failed.ID] {
-		t.Error("failed task should NOT be exported")
+	if completedAt[completed.ID] == "" {
+		t.Error("completed dependency should include CompletedAt")
+	}
+	if !ids[failed.ID] {
+		t.Error("failed task should be exported while it remains in the store")
 	}
 }
 
@@ -66,6 +76,9 @@ func TestExportSnapshot_FieldMapping(t *testing.T) {
 		ExpectedArtifacts: []string{"out.txt"},
 		TransferNote:      "note",
 		MailChainDepth:    3,
+		SchedulerBatch:    []string{"child-1", "child-2"},
+		LastResponse:      "last response",
+		PartialOutput:     "partial output",
 	}
 	s.PublishTask(task)
 	s.ClaimTask("agent-1", task.ID)
@@ -105,6 +118,15 @@ func TestExportSnapshot_FieldMapping(t *testing.T) {
 	}
 	if snap.TransferNote != "note" {
 		t.Errorf("TransferNote = %s, want 'note'", snap.TransferNote)
+	}
+	if len(snap.SchedulerBatch) != 2 || snap.SchedulerBatch[0] != "child-1" || snap.SchedulerBatch[1] != "child-2" {
+		t.Errorf("SchedulerBatch = %v, want [child-1 child-2]", snap.SchedulerBatch)
+	}
+	if snap.LastResponse != "last response" {
+		t.Errorf("LastResponse = %q, want %q", snap.LastResponse, "last response")
+	}
+	if snap.PartialOutput != "partial output" {
+		t.Errorf("PartialOutput = %q, want %q", snap.PartialOutput, "partial output")
 	}
 	if snap.CreatedAt == "" {
 		t.Error("CreatedAt should not be empty")
@@ -248,10 +270,220 @@ func TestExportImport_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTask t2: %v", err)
 	}
-	if got2.Status != model.TaskStatusProcessing {
-		t.Errorf("t2 Status = %s, want processing", got2.Status)
+	if got2.Status != model.TaskStatusPending {
+		t.Errorf("t2 Status = %s, want pending after resume", got2.Status)
 	}
-	if len(got2.Agents) != 1 || got2.Agents[0] != "agent-1" {
-		t.Errorf("t2 Agents = %v, want [agent-1]", got2.Agents)
+	if len(got2.Agents) != 0 {
+		t.Errorf("t2 Agents = %v, want empty after resume", got2.Agents)
+	}
+	if !got2.StartedAt.IsZero() {
+		t.Errorf("t2 StartedAt = %v, want zero after resume", got2.StartedAt)
+	}
+}
+
+func TestExportImport_RoundTripV2RuntimeFields(t *testing.T) {
+	s1, _ := newTestStore(10, 100)
+
+	history := []byte(`[{"output":"command completed","tool_called":true,"tool_calls":[{"id":"call-1","name":"run_shell"}]}]`)
+	task := &model.Task{
+		Description:        "formal acceptance task",
+		EventSource:        "controller-1",
+		EventType:          "verify",
+		NodeRole:           model.PlanNodeRoleAcceptance,
+		PlanID:             "plan-1",
+		CreatedRevision:    7,
+		RetiredRevision:    9,
+		Supersedes:         []string{"old-check"},
+		AcceptanceRunID:    "acceptance-run-1",
+		PlanMutationSource: "acceptance",
+		SchedulerBatch:     []string{"child-a", "child-b"},
+		LastHistory:        history,
+		LastResponse:       "latest acceptance response",
+		PartialOutput:      "streamed so far",
+	}
+	if err := s1.PublishTask(task); err != nil {
+		t.Fatalf("PublishTask: %v", err)
+	}
+	exitCode := 0
+	callTime := time.Date(2026, 7, 13, 10, 11, 12, 345678901, time.UTC)
+	if err := s1.AppendToolCall(task.ID, ToolCallRecord{
+		Timestamp: callTime,
+		AgentID:   "verifier-1",
+		ToolName:  "run_shell",
+		Args: map[string]any{
+			"command": "go test ./...",
+			"options": map[string]any{"env": []any{"CI=1", "COLOR=0"}},
+		},
+		Success:  true,
+		ExitCode: &exitCode,
+	}); err != nil {
+		t.Fatalf("AppendToolCall: %v", err)
+	}
+
+	// Exported mutable data must not alias the live Store.
+	exported := s1.ExportSnapshot()
+	exported[0].LastHistory[0] = 'X'
+	exportedOptions := exported[0].ToolCalls[0].Args["options"].(map[string]any)
+	exportedOptions["env"].([]any)[0] = "MUTATED=1"
+	*exported[0].ToolCalls[0].ExitCode = 99
+	sourceTask, err := s1.GetTask(task.ID)
+	if err != nil {
+		t.Fatalf("GetTask source: %v", err)
+	}
+	if string(sourceTask.LastHistory) != string(history) {
+		t.Fatal("mutating exported LastHistory changed the source Task")
+	}
+	sourceCalls, err := s1.QueryToolCalls(task.ID, "run_shell")
+	if err != nil || len(sourceCalls) != 1 {
+		t.Fatalf("QueryToolCalls source: calls=%v err=%v", sourceCalls, err)
+	}
+	if sourceCalls[0].Args["options"].(map[string]any)["env"].([]any)[0] != "CI=1" || *sourceCalls[0].ExitCode != 0 {
+		t.Fatal("mutating exported ToolCalls changed the source Store")
+	}
+
+	// Exercise the real JSON boundary too: []byte is base64 encoded and nested
+	// JSON args are decoded into fresh map/slice values before Store import.
+	payload, err := json.Marshal(s1.ExportSnapshot())
+	if err != nil {
+		t.Fatalf("marshal TaskSnapshot: %v", err)
+	}
+	var snaps []session.TaskSnapshot
+	if err := json.Unmarshal(payload, &snaps); err != nil {
+		t.Fatalf("unmarshal TaskSnapshot: %v", err)
+	}
+	s2, _ := newTestStore(10, 100)
+	if err := s2.ImportSnapshot(snaps); err != nil {
+		t.Fatalf("ImportSnapshot: %v", err)
+	}
+	// Import must own its own deep copy too.
+	snaps[0].LastHistory[0] = 'Y'
+	snaps[0].ToolCalls[0].Args["options"].(map[string]any)["env"].([]any)[0] = "MUTATED=2"
+	*snaps[0].ToolCalls[0].ExitCode = 98
+
+	got, err := s2.GetTask(task.ID)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if len(got.SchedulerBatch) != 2 || got.SchedulerBatch[0] != "child-a" || got.SchedulerBatch[1] != "child-b" {
+		t.Fatalf("SchedulerBatch = %v", got.SchedulerBatch)
+	}
+	if got.LastResponse != task.LastResponse {
+		t.Errorf("LastResponse = %q, want %q", got.LastResponse, task.LastResponse)
+	}
+	if got.PartialOutput != task.PartialOutput {
+		t.Errorf("PartialOutput = %q, want %q", got.PartialOutput, task.PartialOutput)
+	}
+	if got.PlanID != task.PlanID || got.NodeRole != task.NodeRole || got.CreatedRevision != task.CreatedRevision ||
+		got.RetiredRevision != task.RetiredRevision || got.AcceptanceRunID != task.AcceptanceRunID ||
+		got.PlanMutationSource != task.PlanMutationSource {
+		t.Fatalf("planned Task metadata mismatch: got=%+v want=%+v", got, task)
+	}
+	if len(got.Supersedes) != 1 || got.Supersedes[0] != "old-check" {
+		t.Fatalf("Supersedes = %v", got.Supersedes)
+	}
+	if string(got.LastHistory) != string(history) {
+		t.Fatalf("LastHistory = %s, want %s", got.LastHistory, history)
+	}
+	calls, err := s2.QueryToolCalls(task.ID, "run_shell")
+	if err != nil || len(calls) != 1 {
+		t.Fatalf("restored ToolCalls = %v, err=%v", calls, err)
+	}
+	call := calls[0]
+	if !call.Timestamp.Equal(callTime) || call.AgentID != "verifier-1" || !call.Success ||
+		call.Args["command"] != "go test ./..." || call.ExitCode == nil || *call.ExitCode != 0 {
+		t.Fatalf("restored ToolCall mismatch: %+v", call)
+	}
+	env := call.Args["options"].(map[string]any)["env"].([]any)
+	if len(env) != 2 || env[0] != "CI=1" || env[1] != "COLOR=0" {
+		t.Fatalf("restored nested args = %#v", call.Args)
+	}
+}
+
+func TestImportSnapshotRejectsInvalidToolCallFacts(t *testing.T) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, tc := range []struct {
+		name string
+		call session.ToolCallSnapshot
+	}{
+		{name: "empty tool name", call: session.ToolCallSnapshot{Timestamp: now}},
+		{name: "invalid timestamp", call: session.ToolCallSnapshot{ToolName: "run_shell", Timestamp: "not-a-time"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newTestStore(10, 100)
+			err := s.ImportSnapshot([]session.TaskSnapshot{{
+				ID: "task-1", Status: "pending", CreatedAt: now,
+				ToolCalls: []session.ToolCallSnapshot{tc.call},
+			}})
+			if err == nil || !strings.Contains(err.Error(), "tool call") {
+				t.Fatalf("ImportSnapshot error = %v", err)
+			}
+		})
+	}
+}
+
+func TestImportSnapshot_RebuildsCompletedFIFO(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+
+	tasks := []session.TaskSnapshot{
+		{
+			ID:          "terminal-newer",
+			Description: "newer",
+			Status:      "failed",
+			CreatedAt:   "2026-07-13T09:00:00Z",
+			CompletedAt: "2026-07-13T10:02:00Z",
+		},
+		{
+			ID:          "terminal-older",
+			Description: "older",
+			Status:      "completed",
+			CreatedAt:   "2026-07-13T09:00:00Z",
+			CompletedAt: "2026-07-13T10:01:00Z",
+		},
+	}
+
+	if err := s.ImportSnapshot(tasks); err != nil {
+		t.Fatalf("ImportSnapshot: %v", err)
+	}
+	if len(s.completed) != 2 || s.completed[0] != "terminal-older" || s.completed[1] != "terminal-newer" {
+		t.Fatalf("completed FIFO = %v, want [terminal-older terminal-newer]", s.completed)
+	}
+	older, err := s.GetTask("terminal-older")
+	if err != nil {
+		t.Fatalf("GetTask terminal-older: %v", err)
+	}
+	if older.CompletedAt.IsZero() {
+		t.Fatal("CompletedAt should be restored")
+	}
+}
+
+func TestImportSnapshot_PreservesTerminalDependencyBeyondFIFO(t *testing.T) {
+	s, _ := newTestStore(10, 0)
+
+	tasks := []session.TaskSnapshot{
+		{
+			ID:          "completed-dependency",
+			Description: "dependency",
+			Status:      "completed",
+			CreatedAt:   "2026-07-13T09:00:00Z",
+			CompletedAt: "2026-07-13T10:00:00Z",
+		},
+		{
+			ID:             "pending-dependent",
+			Description:    "dependent",
+			Status:         "pending",
+			Dependencies:   []string{"completed-dependency"},
+			MaxConcurrency: 1,
+			CreatedAt:      "2026-07-13T10:01:00Z",
+		},
+	}
+
+	if err := s.ImportSnapshot(tasks); err != nil {
+		t.Fatalf("ImportSnapshot: %v", err)
+	}
+	if _, err := s.GetTask("completed-dependency"); err != nil {
+		t.Fatalf("completed dependency was evicted during import: %v", err)
+	}
+	if err := s.ClaimTask("agent-resumed", "pending-dependent"); err != nil {
+		t.Fatalf("dependent task should be claimable after restore: %v", err)
 	}
 }

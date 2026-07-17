@@ -54,7 +54,7 @@ func genSnapshot(t *rapid.T) Snapshot {
 	}
 
 	return Snapshot{
-		Version:   1,
+		Version:   currentSnapshotVersion,
 		SavedAt:   genTimestamp(t, "savedAt"),
 		Tasks:     tasks,
 		Roster:    RosterSnapshot{Claims: claims},
@@ -119,8 +119,13 @@ func genTaskSnapshot(t *rapid.T, idx int) TaskSnapshot {
 		Depth:             rapid.IntRange(0, 5).Draw(t, labelIdx("depth", idx)),
 		Artifacts:         artifacts,
 		ExpectedArtifacts: expectedArtifacts,
-		CreatedAt:         genTimestamp(t, labelIdx("taskCreatedAt", idx)),
-		StartedAt:         genTimestamp(t, labelIdx("taskStartedAt", idx)),
+		SchedulerBatch: []string{
+			rapid.StringMatching(`[a-z0-9\-]{4,12}`).Draw(t, labelIdx("batchTask", idx)),
+		},
+		LastResponse:  rapid.StringMatching(`[a-zA-Z0-9 ]{0,30}`).Draw(t, labelIdx("lastResponse", idx)),
+		PartialOutput: rapid.StringMatching(`[a-zA-Z0-9 ]{0,30}`).Draw(t, labelIdx("partialOutput", idx)),
+		CreatedAt:     genTimestamp(t, labelIdx("taskCreatedAt", idx)),
+		StartedAt:     genTimestamp(t, labelIdx("taskStartedAt", idx)),
 	}
 }
 
@@ -219,5 +224,8 @@ func normalizeTaskSnapshot(ts *TaskSnapshot) {
 	}
 	if ts.ExpectedArtifacts == nil {
 		ts.ExpectedArtifacts = []string{}
+	}
+	if ts.SchedulerBatch == nil {
+		ts.SchedulerBatch = []string{}
 	}
 }
