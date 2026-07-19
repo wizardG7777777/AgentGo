@@ -71,6 +71,37 @@ func TestEnableHistoryLog_ReopensOnCreateNew(t *testing.T) {
 	}
 }
 
+// TestEnableHistoryLog_ConfigDisabled_NoOp 验证 F5 接线：SessionConfig.Enabled=false
+// 时 EnableHistoryLog 为 no-op——History() 保持 nil，CreateNew 后也不会自动重开
+// history.jsonl（historyEnabled 不会被置位）。
+func TestEnableHistoryLog_ConfigDisabled_NoOp(t *testing.T) {
+	dir := t.TempDir()
+	sm, err := NewSessionManager(dir, SessionConfig{Enabled: false})
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	// Session 功能其余部分不受影响：当前 Session 正常创建
+	if sm.Current() == nil {
+		t.Fatal("Current() should be non-nil even when Enabled=false")
+	}
+
+	sm.EnableHistoryLog()
+	t.Cleanup(func() { _ = sm.Close() })
+	if sm.History() != nil {
+		t.Fatal("History() should stay nil when SessionConfig.Enabled=false")
+	}
+
+	if _, err := sm.CreateNew(); err != nil {
+		t.Fatalf("CreateNew: %v", err)
+	}
+	if sm.History() != nil {
+		t.Fatal("History() after CreateNew should stay nil when Enabled=false")
+	}
+	if _, err := os.Stat(filepath.Join(sm.Current().Dir, "history.jsonl")); !os.IsNotExist(err) {
+		t.Fatal("history.jsonl should not be created when Enabled=false")
+	}
+}
+
 func TestNewSessionManager_CreatesNewSession(t *testing.T) {
 	dir := t.TempDir()
 	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
@@ -312,7 +343,7 @@ func TestNewSessionManager_RecoverWithCorruptedMetadata_CreatesNew(t *testing.T)
 	}
 }
 
-// --- Task 4.4: 元数据管理方法の単元テスト ---
+// --- Task 4.4: 元数据管理方法的单元测试 ---
 
 func TestRecordFirstInput_SetsFirstInput(t *testing.T) {
 	dir := t.TempDir()
@@ -477,190 +508,7 @@ func TestList_SkipsCorruptedMetadata(t *testing.T) {
 	}
 }
 
-// --- Task 5.4: 日志隔離の単元テスト ---
-
-func TestLogWriter_NilSession_ReturnsStdout(t *testing.T) {
-	sm := &SessionManager{}
-	w := sm.LogWriter()
-	if w != os.Stdout {
-		t.Error("LogWriter() should return os.Stdout when current session is nil")
-	}
-}
-
-func TestLogWriter_DualWrite(t *testing.T) {
-	dir := t.TempDir()
-	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
-
-	sm, err := NewSessionManager(dir, cfg)
-	if err != nil {
-		t.Fatalf("NewSessionManager failed: %v", err)
-	}
-	defer sm.Close()
-
-	w := sm.LogWriter()
-	msg := "hello dual-write test\n"
-	n, err := w.Write([]byte(msg))
-	if err != nil {
-		t.Fatalf("Write failed: %v", err)
-	}
-	if n != len(msg) {
-		t.Errorf("Write returned %d, want %d", n, len(msg))
-	}
-
-	// Verify the log file was written
-	logPath := filepath.Join(sm.Current().Dir, "logs", "agentgo.log")
-	data, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatalf("ReadFile log failed: %v", err)
-	}
-	if string(data) != msg {
-		t.Errorf("log file content = %q, want %q", string(data), msg)
-	}
-}
-
-func TestLogWriter_ReusesExistingHandle(t *testing.T) {
-	dir := t.TempDir()
-	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
-
-	sm, err := NewSessionManager(dir, cfg)
-	if err != nil {
-		t.Fatalf("NewSessionManager failed: %v", err)
-	}
-	defer sm.Close()
-
-	// Call LogWriter twice — should reuse the same file handle
-	w1 := sm.LogWriter()
-	w2 := sm.LogWriter()
-
-	// Write via both writers
-	w1.Write([]byte("first\n"))
-	w2.Write([]byte("second\n"))
-
-	logPath := filepath.Join(sm.Current().Dir, "logs", "agentgo.log")
-	data, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatalf("ReadFile log failed: %v", err)
-	}
-	if string(data) != "first\nsecond\n" {
-		t.Errorf("log file content = %q, want %q", string(data), "first\nsecond\n")
-	}
-}
-
-func TestCreateNew_ClosesOldLogFile(t *testing.T) {
-	dir := t.TempDir()
-	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
-
-	sm, err := NewSessionManager(dir, cfg)
-	if err != nil {
-		t.Fatalf("NewSessionManager failed: %v", err)
-	}
-	defer sm.Close()
-
-	// Open log writer for first session
-	firstSessDir := sm.Current().Dir
-	w := sm.LogWriter()
-	w.Write([]byte("session1 log\n"))
-
-	// Create new session — should close old log file
-	sess2, err := sm.CreateNew()
-	if err != nil {
-		t.Fatalf("CreateNew failed: %v", err)
-	}
-
-	// Verify old session's log file has the content
-	oldLogPath := filepath.Join(firstSessDir, "logs", "agentgo.log")
-	data, err := os.ReadFile(oldLogPath)
-	if err != nil {
-		t.Fatalf("ReadFile old log failed: %v", err)
-	}
-	if string(data) != "session1 log\n" {
-		t.Errorf("old log content = %q, want %q", string(data), "session1 log\n")
-	}
-
-	// Open log writer for new session and write
-	w2 := sm.LogWriter()
-	w2.Write([]byte("session2 log\n"))
-
-	newLogPath := filepath.Join(sess2.Dir, "logs", "agentgo.log")
-	data2, err := os.ReadFile(newLogPath)
-	if err != nil {
-		t.Fatalf("ReadFile new log failed: %v", err)
-	}
-	if string(data2) != "session2 log\n" {
-		t.Errorf("new log content = %q, want %q", string(data2), "session2 log\n")
-	}
-}
-
-func TestClose_ClosesLogWriter(t *testing.T) {
-	dir := t.TempDir()
-	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
-
-	sm, err := NewSessionManager(dir, cfg)
-	if err != nil {
-		t.Fatalf("NewSessionManager failed: %v", err)
-	}
-
-	// Open log writer
-	w := sm.LogWriter()
-	w.Write([]byte("before close\n"))
-
-	sessDir := sm.Current().Dir
-
-	if err := sm.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-
-	// Verify log file content persisted
-	logPath := filepath.Join(sessDir, "logs", "agentgo.log")
-	data, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatalf("ReadFile log failed: %v", err)
-	}
-	if string(data) != "before close\n" {
-		t.Errorf("log content = %q, want %q", string(data), "before close\n")
-	}
-}
-
-func TestLogWriter_AppendMode(t *testing.T) {
-	dir := t.TempDir()
-	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
-
-	sm, err := NewSessionManager(dir, cfg)
-	if err != nil {
-		t.Fatalf("NewSessionManager failed: %v", err)
-	}
-
-	// Write, close, then write again — should append
-	w := sm.LogWriter()
-	w.Write([]byte("line1\n"))
-
-	sessDir := sm.Current().Dir
-
-	if err := sm.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-
-	// Simulate reopening by creating a new manager that recovers the session
-	sm2, err := NewSessionManager(dir, cfg)
-	if err != nil {
-		t.Fatalf("NewSessionManager (2nd) failed: %v", err)
-	}
-	defer sm2.Close()
-
-	w2 := sm2.LogWriter()
-	w2.Write([]byte("line2\n"))
-
-	logPath := filepath.Join(sessDir, "logs", "agentgo.log")
-	data, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatalf("ReadFile log failed: %v", err)
-	}
-	if string(data) != "line1\nline2\n" {
-		t.Errorf("log content = %q, want %q", string(data), "line1\nline2\n")
-	}
-}
-
-// --- Task 10.4: 快照集成の単元テスト ---
+// --- Task 10.4: 快照集成的单元测试 ---
 
 func TestSaveSnapshot_Success(t *testing.T) {
 	dir := t.TempDir()
@@ -874,7 +722,7 @@ func TestStartupRecovery_CorruptedSnapshot(t *testing.T) {
 	}
 }
 
-// --- Task 11.3: Session 切换の集成テスト ---
+// --- Task 11.3: Session 切换的集成测试 ---
 
 func TestSwitchTo_Success(t *testing.T) {
 	dir := t.TempDir()
@@ -1019,48 +867,6 @@ func TestNewSessionManagerWithResume_AmbiguousPrefix(t *testing.T) {
 	}
 }
 
-func TestSwitchTo_ClosesLogWriter(t *testing.T) {
-	dir := t.TempDir()
-	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
-
-	sm, err := NewSessionManager(dir, cfg)
-	if err != nil {
-		t.Fatalf("NewSessionManager failed: %v", err)
-	}
-	firstID := sm.Current().ID
-
-	// Open log writer for first session
-	w := sm.LogWriter()
-	w.Write([]byte("session1 log\n"))
-
-	// Create second session
-	_, err = sm.CreateNew()
-	if err != nil {
-		t.Fatalf("CreateNew failed: %v", err)
-	}
-
-	// Switch back to first session
-	if err := sm.SwitchTo(firstID); err != nil {
-		t.Fatalf("SwitchTo failed: %v", err)
-	}
-
-	// Write to new log writer — should write to first session's log
-	w2 := sm.LogWriter()
-	w2.Write([]byte("session1 resumed\n"))
-
-	logPath := filepath.Join(sm.Current().Dir, "logs", "agentgo.log")
-	data, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatalf("ReadFile log failed: %v", err)
-	}
-	if string(data) != "session1 log\nsession1 resumed\n" {
-		t.Errorf("log content = %q, want %q", string(data), "session1 log\nsession1 resumed\n")
-	}
-
-	// Close to release file handles for cleanup
-	sm.Close()
-}
-
 func TestSwitchTo_NilCurrentSession(t *testing.T) {
 	dir := t.TempDir()
 	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
@@ -1153,5 +959,182 @@ func TestSwitchTo_WithSnapshot(t *testing.T) {
 	}
 	if len(snap.Tasks) != 1 || snap.Tasks[0].ID != "task-switch" {
 		t.Errorf("unexpected snapshot tasks after SwitchTo")
+	}
+}
+
+// TestInitSession_ActiveSessionTrailingNewline 验证 active-session 文件带尾部
+// 换行（手工编辑常见）时 resume 仍命中原 Session，而不是静默新建一个。
+func TestInitSession_ActiveSessionTrailingNewline(t *testing.T) {
+	dir := t.TempDir()
+	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
+
+	sm1, err := NewSessionManager(dir, cfg)
+	if err != nil {
+		t.Fatalf("NewSessionManager failed: %v", err)
+	}
+	wantID := sm1.Current().ID
+	if err := sm1.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// 模拟手工编辑：active-session 尾部带 "\n"
+	activeFile := filepath.Join(dir, "active-session")
+	if err := os.WriteFile(activeFile, []byte(wantID+"\n"), 0644); err != nil {
+		t.Fatalf("WriteFile active-session failed: %v", err)
+	}
+
+	sm2, err := NewSessionManager(dir, cfg)
+	if err != nil {
+		t.Fatalf("second NewSessionManager failed: %v", err)
+	}
+	if sm2.Current() == nil {
+		t.Fatal("expected non-nil current session after resume")
+	}
+	if sm2.Current().ID != wantID {
+		t.Errorf("resumed session ID = %q, want %q（尾部换行导致静默新建）", sm2.Current().ID, wantID)
+	}
+}
+
+// --- B4: SwitchTo/CreateNew 失败原子性 ---
+
+// assertSwitchFailureKeepsOldSession 校验失败后的 manager 状态完全不变：
+// current 仍是旧 Session、旧 metadata 仍 active、active-session 未改、history 持续可写。
+func assertSwitchFailureKeepsOldSession(t *testing.T, sm *SessionManager, dir, oldID string) {
+	t.Helper()
+
+	if sm.Current() == nil || sm.Current().ID != oldID {
+		t.Fatalf("current = %+v, want still %s", sm.Current(), oldID)
+	}
+
+	meta, err := LoadMetadata(filepath.Join(dir, "sess-"+oldID, "metadata.json"))
+	if err != nil {
+		t.Fatalf("LoadMetadata old session: %v", err)
+	}
+	if meta.Status != "active" {
+		t.Errorf("old session status = %q, want active（失败不应把旧 Session 置 closed）", meta.Status)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "active-session"))
+	if err != nil {
+		t.Fatalf("ReadFile active-session: %v", err)
+	}
+	if string(data) != oldID {
+		t.Errorf("active-session = %q, want %q（失败不应改写指向）", string(data), oldID)
+	}
+
+	em := sm.History()
+	if em == nil {
+		t.Fatal("history should still be enabled after failed switch")
+	}
+	if err := em.Append(HistoryEvent{Timestamp: nowUTC(), EventType: HistEventTaskPublished, Payload: map[string]any{"task_id": "after-failed-switch"}}); err != nil {
+		t.Errorf("history Append after failed switch should succeed, got %v", err)
+	}
+}
+
+// TestSwitchTo_NonexistentTarget_KeepsOldSessionActive：目标 Session 不存在时
+// 返回错误，且旧 Session 保持 active、history 持续记录（B4 回归）。
+func TestSwitchTo_NonexistentTarget_KeepsOldSessionActive(t *testing.T) {
+	dir := t.TempDir()
+	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
+
+	sm, err := NewSessionManager(dir, cfg)
+	if err != nil {
+		t.Fatalf("NewSessionManager failed: %v", err)
+	}
+	sm.EnableHistoryLog()
+	t.Cleanup(func() { _ = sm.Close() })
+	oldID := sm.Current().ID
+
+	if err := sm.SwitchTo("nonexistent-uuid"); err == nil {
+		t.Fatal("expected error switching to nonexistent session")
+	}
+
+	assertSwitchFailureKeepsOldSession(t, sm, dir, oldID)
+}
+
+// TestSwitchTo_CorruptTargetMetadata_KeepsOldSessionActive：目标 Session 目录
+// 存在但 metadata.json 损坏时返回错误，manager 状态完全不变（B4 回归）。
+func TestSwitchTo_CorruptTargetMetadata_KeepsOldSessionActive(t *testing.T) {
+	dir := t.TempDir()
+	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
+
+	sm, err := NewSessionManager(dir, cfg)
+	if err != nil {
+		t.Fatalf("NewSessionManager failed: %v", err)
+	}
+	sm.EnableHistoryLog()
+	t.Cleanup(func() { _ = sm.Close() })
+	oldID := sm.Current().ID
+
+	corruptID := "corrupt-target"
+	corruptDir := filepath.Join(dir, "sess-"+corruptID)
+	if err := os.MkdirAll(corruptDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptDir, "metadata.json"), []byte("{invalid json"), 0644); err != nil {
+		t.Fatalf("WriteFile corrupt metadata: %v", err)
+	}
+
+	if err := sm.SwitchTo(corruptID); err == nil {
+		t.Fatal("expected error switching to session with corrupt metadata")
+	}
+
+	assertSwitchFailureKeepsOldSession(t, sm, dir, oldID)
+}
+
+// TestCreateNew_WriteActiveSessionFails_KeepsOldSessionActive：CreateNew 在
+// 写入 active-session 失败时返回错误，且旧 Session 保持 active、history 持续
+// 记录、新 Session 残骸目录被清理（B4 回归）。
+// 通过在 baseDir 下预建名为 active-session.tmp 的目录，让 writeActiveSession
+// 的 tmp 写入确定性失败。
+func TestCreateNew_WriteActiveSessionFails_KeepsOldSessionActive(t *testing.T) {
+	dir := t.TempDir()
+	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
+
+	sm, err := NewSessionManager(dir, cfg)
+	if err != nil {
+		t.Fatalf("NewSessionManager failed: %v", err)
+	}
+	sm.EnableHistoryLog()
+	t.Cleanup(func() { _ = sm.Close() })
+	oldID := sm.Current().ID
+
+	// 统计当前 sess-* 目录数，用于断言失败后无残骸
+	countSessDirs := func() int {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("ReadDir: %v", err)
+		}
+		n := 0
+		for _, e := range entries {
+			if e.IsDir() && strings.HasPrefix(e.Name(), "sess-") {
+				n++
+			}
+		}
+		return n
+	}
+	before := countSessDirs()
+
+	blocker := filepath.Join(dir, "active-session.tmp")
+	if err := os.MkdirAll(blocker, 0755); err != nil {
+		t.Fatalf("MkdirAll blocker: %v", err)
+	}
+
+	if _, err := sm.CreateNew(); err == nil {
+		t.Fatal("expected CreateNew to fail when active-session is not writable")
+	}
+
+	assertSwitchFailureKeepsOldSession(t, sm, dir, oldID)
+
+	if after := countSessDirs(); after != before {
+		t.Errorf("sess-* dir count = %d, want %d（失败的新 Session 目录应被清理）", after, before)
+	}
+
+	// 解除阻塞后 CreateNew 恢复成功（manager 未被失败破坏）
+	if err := os.RemoveAll(blocker); err != nil {
+		t.Fatalf("RemoveAll blocker: %v", err)
+	}
+	if _, err := sm.CreateNew(); err != nil {
+		t.Fatalf("CreateNew after unblock should succeed: %v", err)
 	}
 }

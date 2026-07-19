@@ -1,0 +1,16 @@
+reactors:
+  - name: explorer-text-to-worker
+    on: text_only_submission
+    kind: explorer
+    publish_task:
+      kind: worker
+      priority: 0
+      description:
+        file: prompts/reactors/handle_explorer_text.md
+        args:
+          upstream_task_id: "${event.task.id}"
+          source_agent_id: "${event.agent.id}"
+          output_len: "${event.output_len}"
+          loops_used: "${event.loops_used}"
+      dependencies:
+        - "${event.task.id}"

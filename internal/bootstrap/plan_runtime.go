@@ -268,6 +268,10 @@ func (b planTaskBackend) PublishTask(ctx context.Context, spec plan.TaskSpec) (s
 		PlanID:             spec.PlanID,
 		Description:        spec.Description,
 		EventType:          spec.EventType,
+		EventSource:        spec.ParentTaskID,
+		ParentTaskID:       spec.ParentTaskID,
+		ReplyToAgentID:     spec.ReplyToAgentID,
+		BatchID:            spec.BatchID,
 		NodeRole:           spec.Role,
 		Dependencies:       append([]string(nil), spec.Dependencies...),
 		PlanMutationSource: "acceptance",
@@ -482,37 +486,35 @@ func plannedTaskTitle(description string) string {
 	return title
 }
 
-func recordPlannedTaskMutation(coordinator *plan.Coordinator, mutation store.TaskMutation) error {
+// plannedMutationPrep 是 recordPlannedTaskMutation 的可批处理中间形态：
+//   - immediate 非 nil：控制器终态等特例，需逐条立即执行（自身含读-改-写、
+//     落盘与 trace，保持原同步语义，失败整体重试）；
+//   - keyed 非 nil：普通节点变更，可并入 Coordinator.RecordTaskMutations
+//     与其他变更共享一次落盘（C1 合并 fsync）；
+//   - 两者皆 nil：无需处理（非计划任务 / 非终态控制器 / 守卫拒绝）。
+type plannedMutationPrep struct {
+	immediate func() error
+	keyed     *plan.PlanTaskMutation
+	wake      bool
+	reason    string
+}
+
+// preparePlannedMutation 只做纯计算（读 task 快照，不落盘），把 store 变更
+// 转换为可批量提交的 plan.PlanTaskMutation 或逐条立即执行的特例闭包。
+func preparePlannedMutation(coordinator *plan.Coordinator, mutation store.TaskMutation) plannedMutationPrep {
 	if coordinator == nil || mutation.Task == nil || mutation.Task.PlanID == "" {
-		return nil
+		return plannedMutationPrep{}
 	}
 	task := mutation.Task
 	if task.NodeRole == model.PlanNodeRoleController {
 		if mutation.Kind != store.TaskMutationStatus || !model.IsTerminal(task.Status) {
-			return nil
+			return plannedMutationPrep{}
 		}
-		current, err := coordinator.Store().GetPlan(task.PlanID)
-		if err != nil {
-			return err
-		}
-		if current.ActiveDecisionTaskID != task.ID {
-			return nil
-		}
-		// Normal controller completion is preceded by formal finalization or the
-		// explicit completed_no_execution transition. A terminal controller on a
-		// still-running Plan means the durable signal consumer disappeared.
-		if model.IsPlanTerminal(current.Status) || current.Status != model.PlanStatusRunning {
-			return nil
-		}
-		reason := fmt.Sprintf("controller_%s_before_plan_terminal:%s", task.Status, task.ID)
-		blocked, err := coordinator.MarkBlocked(context.Background(), task.PlanID, reason)
-		if errors.Is(err, plan.ErrPlanTerminal) {
-			return nil
-		}
-		if err == nil {
-			trace.Emit(trace.Event{Kind: trace.KindPlanPaused, TaskID: task.ID, Reason: reason, Plan: planTraceContext(blocked)})
-		}
-		return err
+		// 控制器终态是罕见特例（每个控制器生命周期一次）：保留原同步路径——
+		// 闭包内现读 Plan 再决定 MarkBlocked，失败整体重试，与原实现一致。
+		return plannedMutationPrep{immediate: func() error {
+			return handleTerminalControllerMutation(coordinator, task)
+		}}
 	}
 	wake := mutation.Kind == store.TaskMutationStatus && model.IsTerminal(task.Status)
 	reason := ""
@@ -528,28 +530,142 @@ func recordPlannedTaskMutation(coordinator *plan.Coordinator, mutation store.Tas
 	if task.Status == model.TaskStatusFailed || task.Status == model.TaskStatusBlocked {
 		fingerprint = failureFingerprint(task.Error)
 	}
-	version, err := coordinator.RecordTaskMutation(context.Background(), task.PlanID, task.ID, plan.TaskMutation{
-		Kind: string(mutation.Kind), Status: task.Status, AcceptanceRunID: task.AcceptanceRunID, Summary: summary,
-		FailureFingerprint: fingerprint, ArtifactRefs: append([]string(nil), task.Artifacts...),
-		Wake: wake, ReasonCode: reason, SourceEvent: string(mutation.Kind), Urgency: urgency,
-		OccurredAt: mutation.At,
-	})
+	return plannedMutationPrep{
+		keyed: &plan.PlanTaskMutation{
+			PlanID: task.PlanID, TaskID: task.ID,
+			Mutation: plan.TaskMutation{
+				Kind: string(mutation.Kind), Status: task.Status, AcceptanceRunID: task.AcceptanceRunID, Summary: summary,
+				FailureFingerprint: fingerprint, ArtifactRefs: append([]string(nil), task.Artifacts...),
+				Wake: wake, ReasonCode: reason, SourceEvent: string(mutation.Kind), Urgency: urgency,
+				OccurredAt: mutation.At,
+			},
+		},
+		wake: wake, reason: reason,
+	}
+}
+
+// handleTerminalControllerMutation 是原 recordPlannedTaskMutation 控制器分支的
+// 原样抽取：活跃控制器在 Plan 仍 Running 时终态化 = 持久信号消费者消失，
+// 把 Plan 标记为 Blocked 并发射 trace.KindPlanPaused。
+func handleTerminalControllerMutation(coordinator *plan.Coordinator, task *model.Task) error {
+	current, err := coordinator.Store().GetPlan(task.PlanID)
 	if err != nil {
 		return err
 	}
-	if wake {
-		current, getErr := coordinator.Store().GetPlan(task.PlanID)
-		if getErr == nil {
-			trace.Emit(trace.Event{
-				Kind: trace.KindReplanRequested, TaskID: task.ID, Reason: reason,
-				Plan: planTraceContext(current),
-			})
-		} else {
-			trace.Emit(trace.Event{Kind: trace.KindReplanRequested, TaskID: task.ID, Reason: reason,
-				Plan: &trace.PlanTraceContext{PlanID: task.PlanID, ExecutionStateVersion: version}})
+	if current.ActiveDecisionTaskID != task.ID {
+		return nil
+	}
+	// Normal controller completion is preceded by formal finalization or the
+	// explicit completed_no_execution transition. A terminal controller on a
+	// still-running Plan means the durable signal consumer disappeared.
+	if model.IsPlanTerminal(current.Status) || current.Status != model.PlanStatusRunning {
+		return nil
+	}
+	reason := fmt.Sprintf("controller_%s_before_plan_terminal:%s", task.Status, task.ID)
+	blocked, err := coordinator.MarkBlocked(context.Background(), task.PlanID, reason)
+	if errors.Is(err, plan.ErrPlanTerminal) {
+		return nil
+	}
+	if err == nil {
+		trace.Emit(trace.Event{Kind: trace.KindPlanPaused, TaskID: task.ID, Reason: reason, Plan: planTraceContext(blocked)})
+	}
+	return err
+}
+
+// emitPlanMutationWakeTrace 在变更已持久化后发射 KindReplanRequested。
+// 批量提交后 GetPlan 读到的是整批之后的最新状态（版本可能更靠前），
+// 仅为观测上下文，不影响 ReplanRequest 内已固化的 ObservedStateVersion。
+func emitPlanMutationWakeTrace(coordinator *plan.Coordinator, prep plannedMutationPrep, version int64) {
+	if !prep.wake || prep.keyed == nil {
+		return
+	}
+	current, getErr := coordinator.Store().GetPlan(prep.keyed.PlanID)
+	if getErr == nil {
+		trace.Emit(trace.Event{
+			Kind: trace.KindReplanRequested, TaskID: prep.keyed.TaskID, Reason: prep.reason,
+			Plan: planTraceContext(current),
+		})
+	} else {
+		trace.Emit(trace.Event{Kind: trace.KindReplanRequested, TaskID: prep.keyed.TaskID, Reason: prep.reason,
+			Plan: &trace.PlanTraceContext{PlanID: prep.keyed.PlanID, ExecutionStateVersion: version}})
+	}
+}
+
+// recordPlannedTaskMutation 保持既有同步语义（等价于批尺寸为 1 的
+// applyPlannedMutationBatch）：无 batcher 的接线（store 单测、bootstrap 内
+// 直接联调测试）经 makeTaskPlanHooks 走到这里，行为与 C1 改造前一致。
+func recordPlannedTaskMutation(coordinator *plan.Coordinator, mutation store.TaskMutation) error {
+	prep := preparePlannedMutation(coordinator, mutation)
+	if prep.immediate != nil {
+		return prep.immediate()
+	}
+	if prep.keyed == nil {
+		return nil
+	}
+	versions, errs := coordinator.RecordTaskMutations(context.Background(), []plan.PlanTaskMutation{*prep.keyed})
+	if errs[0] != nil {
+		return errs[0]
+	}
+	emitPlanMutationWakeTrace(coordinator, prep, versions[0])
+	return nil
+}
+
+// applyPlannedMutationBatch 把一批 store 变更按 FIFO 顺序提交（C1 批落盘）：
+// 连续的普通节点变更合并为一次 Coordinator.RecordTaskMutations（一次克隆 +
+// 一次 fsync）；控制器终态特例冲断当前合并段、逐条立即执行——相对顺序与
+// 逐条同步执行完全一致。每条最多 3 次尝试（对齐原 applyPlanMutationWithRetry）。
+// 返回与 batch 对齐的错误切片（nil = 已落盘）。
+func applyPlannedMutationBatch(coordinator *plan.Coordinator, batch []store.TaskMutation) []error {
+	errs := make([]error, len(batch))
+	type keyedItem struct {
+		batchIdx int
+		prep     plannedMutationPrep
+	}
+	var run []keyedItem
+	// flush 提交当前合并段，失败子集最多再试 2 次（合计 3 次）。
+	flush := func() {
+		for attempt := 0; attempt < 3 && len(run) > 0; attempt++ {
+			keyed := make([]plan.PlanTaskMutation, len(run))
+			for j, it := range run {
+				keyed[j] = *it.prep.keyed
+			}
+			versions, cerrs := coordinator.RecordTaskMutations(context.Background(), keyed)
+			var next []keyedItem
+			for j, it := range run {
+				if cerrs[j] == nil {
+					emitPlanMutationWakeTrace(coordinator, it.prep, versions[j])
+				} else {
+					errs[it.batchIdx] = cerrs[j]
+					next = append(next, it)
+				}
+			}
+			run = next
+		}
+		run = nil
+	}
+	for i, m := range batch {
+		prep := preparePlannedMutation(coordinator, m)
+		switch {
+		case prep.immediate != nil:
+			flush()
+			errs[i] = retryPlanMutationOp(prep.immediate)
+		case prep.keyed != nil:
+			run = append(run, keyedItem{batchIdx: i, prep: prep})
 		}
 	}
-	return nil
+	flush()
+	return errs
+}
+
+// retryPlanMutationOp 对齐 store 侧 applyPlanMutationWithRetry 的 3 次尝试策略。
+func retryPlanMutationOp(op func() error) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err = op(); err == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 func plannedTaskSummary(task *model.Task) string {

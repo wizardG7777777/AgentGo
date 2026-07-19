@@ -2,7 +2,6 @@ package session
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -13,14 +12,24 @@ import (
 
 // SessionManager 管理 Session 生命周期。
 // 所有公开方法并发安全（内部 sync.Mutex）。
+//
+// Session 语义（B3 决策，2026-07-18 固化）：
+//   - session 切换是【日志/观测边界】，不是运行时边界：公告板任务、邮箱、
+//     花名册、plan/team 的运行时状态跨 session 连续，不随切换重置；
+//   - 切换前由调用方（bootstrap.System.NewSession/SwitchSession）把运行时
+//     快照刷新到旧 Session 目录；切换后 trace writer、system.log、plan/team
+//     store 的持久化位置经 OnSwitch 钩子迁移到新 Session；
+//   - SwitchTo 故意【不】恢复目标 Session 的 snapshot.json——运行时状态连续
+//     意味着恢复会把旧工作负载复制一份进正在运行的系统。历史 Session 的
+//     snapshot 仅在进程重启 resume 时由 bootstrap 读取。
 type SessionManager struct {
 	mu             sync.Mutex
 	baseDir        string         // ~/.agentgo/sessions/
 	current        *Session       // 当前活跃 Session，nil 表示无 Session 模式
-	logWriter      io.WriteCloser // 当前 Session 的日志文件句柄
 	history        *HistoryLog    // 当前 Session 的 history.jsonl 句柄，nil 表示未开启
 	historyEnabled bool           // true 时切换/新建 Session 自动重开 history.jsonl
 	cfg            SessionConfig  // 配置项
+	onSwitch       func(*Session) // CreateNew/SwitchTo 成功提交后的钩子，锁外调用
 }
 
 // NewSessionManagerWithResume creates a SessionManager and makes resumeID the
@@ -70,7 +79,9 @@ func (sm *SessionManager) initSession() error {
 	activeFile := filepath.Join(sm.baseDir, "active-session")
 	data, err := os.ReadFile(activeFile)
 	if err == nil && len(data) > 0 {
-		sessionID := string(data)
+		// TrimSpace：手工编辑 active-session 容易留下尾部换行，
+		// 不修剪会拼出不存在的 sess-<id>\n 目录而静默新建 Session。
+		sessionID := strings.TrimSpace(string(data))
 		sessDir := filepath.Join(sm.baseDir, "sess-"+sessionID)
 		metaPath := filepath.Join(sessDir, "metadata.json")
 
@@ -92,9 +103,16 @@ func (sm *SessionManager) initSession() error {
 	}
 
 	// 创建新 Session
-	sess, err := sm.createNewInternal()
+	sess, err := sm.createSessionDir()
 	if err != nil {
 		return err
+	}
+	if err := sm.writeActiveSession(sess.ID); err != nil {
+		// 清理未激活的残骸目录，避免留下无 metadata 完整性保证的 sess-* 目录
+		if rmErr := os.RemoveAll(sess.Dir); rmErr != nil {
+			log.Printf("[WARNING] initSession 清理失败 Session 目录失败: %v", rmErr)
+		}
+		return fmt.Errorf("写入 active-session 失败: %w", err)
 	}
 	sm.current = sess
 	return nil
@@ -195,12 +213,100 @@ func (sm *SessionManager) Current() *Session {
 	return sm.current
 }
 
-// CreateNew 创建新 Session 并设为当前活跃 Session。
-// 旧 Session の metadata を "closed" に更新し、日志文件句柄を閉じてから新 Session に切り替える。
-// 呼び出し元（CLI /new コマンド）は TaskStore/Roster/Mailbox の状態リセットを担当する。
-func (sm *SessionManager) CreateNew() (*Session, error) {
+// SetOnSwitch 注册 Session 切换钩子：CreateNew / SwitchTo 成功提交后各触发
+// 一次，入参为新的当前 Session。用途：把绑定到 Session 目录的运行时资源
+// （trace writer、system.log 等）重绑到新 Session（B5/B7）。
+//
+// 语义保证：
+//   - 钩子在 sm.mu 之外调用，回调里可安全调用 manager 方法（Current/LogDir 等）
+//   - 每次成功切换恰好触发一次；切换失败（B4 校验阶段返回错误）不触发
+//   - 启动期 initSession / initSessionByID 不触发（它们不经 CreateNew/SwitchTo）
+//   - 钩子 panic 会被 recover 并打 WARN——切换已提交，坏钩子不能击穿 manager
+//   - 传 nil 卸载钩子
+func (sm *SessionManager) SetOnSwitch(hook func(*Session)) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	sm.onSwitch = hook
+}
+
+// fireOnSwitch 在锁外调用已注册的切换钩子（nil 时 no-op）。
+// 钩子 panic 不向上传播——切换本身已成功提交，坏钩子不得影响 manager。
+func (sm *SessionManager) fireOnSwitch(sess *Session) {
+	sm.mu.Lock()
+	hook := sm.onSwitch
+	sm.mu.Unlock()
+	if hook == nil || sess == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[WARNING] Session OnSwitch 钩子 panic: %v", r)
+		}
+	}()
+	hook(sess)
+}
+
+// CreateNew 创建新 Session 并设为当前活跃 Session。
+// 旧 Session 的 metadata 会被置为 "closed"，其 history 句柄关闭后切换到新 Session。
+// 运行时状态（TaskStore/Roster/Mailbox 等）跨 Session 连续，不随切换重置——
+// 完整语义见 SessionManager 类型注释（B3 决策）。
+//
+// 失败原子：所有可能失败的动作（建新目录、写 metadata、预开 history 句柄、写
+// active-session）都在触碰当前 Session 状态之前完成。任一失败时返回错误且
+// manager 状态完全不变——旧 Session 保持 active、history 持续记录、
+// active-session 文件仍指向旧 Session；新目录残骸会被清理。
+//
+// 成功提交后（锁外）触发一次 OnSwitch 钩子；失败时不触发。
+func (sm *SessionManager) CreateNew() (*Session, error) {
+	sm.mu.Lock()
+	sess, err := sm.createNewLocked()
+	sm.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	sm.fireOnSwitch(sess)
+	return sess, nil
+}
+
+// createNewLocked 是 CreateNew 的实现主体。调用方必须持有 sm.mu；
+// 失败原子性的完整论证见 CreateNew 的文档注释。
+func (sm *SessionManager) createNewLocked() (*Session, error) {
+
+	// ---- 准备阶段（不触碰当前 Session 的任何状态） ----
+
+	sess, err := sm.createSessionDir()
+	if err != nil {
+		return nil, err
+	}
+	// 准备阶段后续步骤失败时，清理尚未激活的新目录残骸
+	committed := false
+	defer func() {
+		if !committed {
+			if rmErr := os.RemoveAll(sess.Dir); rmErr != nil {
+				log.Printf("[WARNING] CreateNew 清理失败 Session 目录失败: %v", rmErr)
+			}
+		}
+	}()
+
+	// 预开新 history 句柄——失败则整体失败，避免切换后 history 静默停记
+	var newHistory *HistoryLog
+	if sm.historyEnabled {
+		h, herr := OpenHistoryLog(filepath.Join(sess.Dir, "history.jsonl"))
+		if herr != nil {
+			return nil, fmt.Errorf("打开新 Session history.jsonl 失败: %w", herr)
+		}
+		newHistory = h
+	}
+
+	// 原子写入 active-session 文件
+	if err := sm.writeActiveSession(sess.ID); err != nil {
+		if newHistory != nil {
+			_ = newHistory.Close()
+		}
+		return nil, fmt.Errorf("写入 active-session 失败: %w", err)
+	}
+
+	// ---- 提交阶段（此后不再有失败路径） ----
 
 	// 关闭旧 Session（更新 metadata 为 closed）
 	if sm.current != nil {
@@ -212,23 +318,18 @@ func (sm *SessionManager) CreateNew() (*Session, error) {
 		}
 	}
 
-	// 关闭旧 Session 的日志文件句柄
-	sm.closeLogWriter()
+	// 换绑旧 Session 的 history 句柄
 	sm.closeHistoryLocked()
+	sm.history = newHistory
 
-	sess, err := sm.createNewInternal()
-	if err != nil {
-		return nil, err
-	}
 	sm.current = sess
-	if sm.historyEnabled {
-		sm.openHistoryLocked()
-	}
+	committed = true
 	return sess, nil
 }
 
-// createNewInternal 是 CreateNew 的内部实现（不加锁）。
-func (sm *SessionManager) createNewInternal() (*Session, error) {
+// createSessionDir 创建新 Session 目录并写入 metadata.json（不加锁）。
+// 不写 active-session——调用方负责在提交点写入，以保证失败原子性。
+func (sm *SessionManager) createSessionDir() (*Session, error) {
 	meta := NewMetadata()
 	sessionID := meta.SessionID
 	sessDir := filepath.Join(sm.baseDir, "sess-"+sessionID)
@@ -250,11 +351,6 @@ func (sm *SessionManager) createNewInternal() (*Session, error) {
 		return nil, fmt.Errorf("保存 metadata.json 失败: %w", err)
 	}
 
-	// 原子写入 active-session 文件
-	if err := sm.writeActiveSession(sessionID); err != nil {
-		return nil, fmt.Errorf("写入 active-session 失败: %w", err)
-	}
-
 	return &Session{
 		ID:       sessionID,
 		Dir:      sessDir,
@@ -263,20 +359,25 @@ func (sm *SessionManager) createNewInternal() (*Session, error) {
 }
 
 // writeActiveSession 原子写入 active-session 文件。
+// rename 成功后对 baseDir 做 fsync（syncDir，best-effort），保证目录项本身落盘。
 func (sm *SessionManager) writeActiveSession(sessionID string) error {
 	activeFile := filepath.Join(sm.baseDir, "active-session")
 	tmp := activeFile + ".tmp"
 	if err := os.WriteFile(tmp, []byte(sessionID), 0644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, activeFile)
+	if err := os.Rename(tmp, activeFile); err != nil {
+		return err
+	}
+	_ = syncDir(sm.baseDir)
+	return nil
 }
 
 // Close 关闭当前 Session。
 // 1. 更新 metadata ended_at 为当前 UTC 时间
 // 2. 更新 metadata status 为 "closed"
 // 3. 保存 metadata
-// 4. 关闭日志文件句柄
+// 4. 关闭 history 句柄
 func (sm *SessionManager) Close() error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -295,8 +396,7 @@ func (sm *SessionManager) Close() error {
 		return fmt.Errorf("保存 metadata 失败: %w", err)
 	}
 
-	// 关闭日志文件句柄
-	sm.closeLogWriter()
+	// 关闭 history 句柄
 	sm.closeHistoryLocked()
 
 	return nil
@@ -312,37 +412,12 @@ func (sm *SessionManager) LogDir() string {
 	return filepath.Join(sm.current.Dir, "logs")
 }
 
-// LogWriter 返回 io.Writer，双写到 Session 日志文件和控制台（stdout）。
-// - current が nil の場合は os.Stdout のみ返す
-// - logWriter が nil の場合は logs/agentgo.log を開く（追記モード）
-// - ファイルオープン失敗時はコンソールに警告を出し、os.Stdout のみ返す
-func (sm *SessionManager) LogWriter() io.Writer {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	if sm.current == nil {
-		return os.Stdout
-	}
-
-	if sm.logWriter != nil {
-		return io.MultiWriter(sm.logWriter, os.Stdout)
-	}
-
-	// Open logs/agentgo.log in append mode
-	logPath := filepath.Join(sm.current.Dir, "logs", "agentgo.log")
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		log.Printf("[WARNING] 日志文件オープン失敗: %v", err)
-		return os.Stdout
-	}
-
-	sm.logWriter = f
-	return io.MultiWriter(f, os.Stdout)
-}
-
 // EnableHistoryLog 开启 history.jsonl 记录（立即为当前 Session 打开文件，并在
 // 后续 CreateNew / SwitchTo 时自动为新 Session 打开）。默认关闭：这是为了避免
 // 单测在 TempDir 清理时被 Windows 文件句柄持锁阻塞——生产侧由 bootstrap 显式调用。
+//
+// SessionConfig.Enabled 为 false 时本方法为 no-op（F5 接线：Enabled=false 跳过
+// history 记录；Session 目录与 metadata 的创建不受影响）。
 //
 // Windows 测试陷阱（必读）：Go 的 os.OpenFile 在 Windows 上不授予 FILE_SHARE_DELETE，
 // 只要 history 句柄还开着，t.TempDir() 的 cleanup 就会在 RemoveAll 时报
@@ -358,6 +433,9 @@ func (sm *SessionManager) LogWriter() io.Writer {
 func (sm *SessionManager) EnableHistoryLog() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	if !sm.cfg.Enabled {
+		return
+	}
 	sm.historyEnabled = true
 	if sm.history == nil {
 		sm.openHistoryLocked()
@@ -401,19 +479,8 @@ func (sm *SessionManager) closeHistoryLocked() {
 	}
 }
 
-// closeLogWriter 关闭当前日志文件句柄（不加锁，调用方需持有 sm.mu）。
-func (sm *SessionManager) closeLogWriter() {
-	if sm.logWriter != nil {
-		if err := sm.logWriter.Close(); err != nil {
-			log.Printf("[WARNING] 关闭日志文件失败: %v", err)
-		}
-		sm.logWriter = nil
-	}
-}
-
-// RecordFirstInput は最初のユーザー入力を記録する。
-// first_user_input が空の場合のみ書き込む（冪等性）。
-// current が nil の場合は no-op。
+// RecordFirstInput 记录首条用户输入。
+// 仅在 first_user_input 为空时写入（幂等）。current 为 nil 时 no-op。
 func (sm *SessionManager) RecordFirstInput(input string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -432,8 +499,8 @@ func (sm *SessionManager) RecordFirstInput(input string) {
 	}
 }
 
-// IncrementTaskCount はタスクカウントをインクリメントし、永続化する。
-// current が nil の場合は no-op。
+// IncrementTaskCount 将任务计数加一并持久化。
+// current 为 nil 时 no-op。
 func (sm *SessionManager) IncrementTaskCount() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -505,69 +572,110 @@ func (sm *SessionManager) loadSnapshotInternal() (*Snapshot, error) {
 }
 
 // SwitchTo 切换到指定 Session。
-// 1. 关闭当前 Session（更新 metadata 为 closed）
-// 2. 查找目标 Session 目录并加载 metadata
-// 3. 更新 active-session 文件
+// 1. 校验目标：目录存在、metadata 可加载、history 句柄可预开（若启用）
+// 2. 更新 active-session 文件并把目标 metadata 置为 active（失败则回滚 active-session）
+// 3. 以上全部成功后才关闭当前 Session（metadata 置 closed）并换绑日志/history 句柄
 // 4. 设置 current 为目标 Session
-// 5. 关闭旧日志文件句柄
+//
+// 失败原子：任一校验失败时返回错误且 manager 状态完全不变——旧 Session 保持
+// active、history 持续记录、active-session 文件仍指向旧 Session。
+//
+// 成功提交后（锁外）触发一次 OnSwitch 钩子；失败时不触发。
 func (sm *SessionManager) SwitchTo(sessionID string) error {
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	// 关闭当前 Session
-	if sm.current != nil {
-		sm.current.Metadata.EndedAt = nowUTC()
-		sm.current.Metadata.Status = "closed"
-		metaPath := filepath.Join(sm.current.Dir, "metadata.json")
-		if err := sm.current.Metadata.Save(metaPath); err != nil {
-			return fmt.Errorf("关闭当前 Session 失败: %w", err)
-		}
+	sess, err := sm.switchToLocked(sessionID)
+	sm.mu.Unlock()
+	if err != nil {
+		return err
 	}
+	sm.fireOnSwitch(sess)
+	return nil
+}
 
-	// 关闭旧日志文件句柄
-	sm.closeLogWriter()
-	sm.closeHistoryLocked()
+// switchToLocked 是 SwitchTo 的实现主体，成功时返回新的当前 Session。
+// 调用方必须持有 sm.mu；失败原子性的完整论证见 SwitchTo 的文档注释。
+func (sm *SessionManager) switchToLocked(sessionID string) (*Session, error) {
 
-	// 查找目标 Session 目录
+	// ---- 校验阶段（不触碰当前 Session 的任何状态） ----
+
+	// 目标 Session 目录必须存在
 	targetDir := filepath.Join(sm.baseDir, "sess-"+sessionID)
 	info, err := os.Stat(targetDir)
 	if err != nil || !info.IsDir() {
-		return fmt.Errorf("target session directory not found: %s", targetDir)
+		return nil, fmt.Errorf("target session directory not found: %s", targetDir)
 	}
 
-	// 加载目标 Session 的 metadata
+	// 目标 Session 的 metadata 必须可加载
 	metaPath := filepath.Join(targetDir, "metadata.json")
 	meta, err := LoadMetadata(metaPath)
 	if err != nil {
-		return fmt.Errorf("load target session metadata: %w", err)
+		return nil, fmt.Errorf("load target session metadata: %w", err)
+	}
+
+	// 预开目标 history 句柄（若启用）——失败则整体失败，
+	// 避免切换后 history 静默停记
+	var newHistory *HistoryLog
+	if sm.historyEnabled {
+		h, herr := OpenHistoryLog(filepath.Join(targetDir, "history.jsonl"))
+		if herr != nil {
+			return nil, fmt.Errorf("open target history log: %w", herr)
+		}
+		newHistory = h
+	}
+	// 校验阶段后续步骤失败时，关闭预开句柄后返回错误
+	abort := func(err error) (*Session, error) {
+		if newHistory != nil {
+			_ = newHistory.Close()
+		}
+		return nil, err
 	}
 
 	// 更新 active-session 文件
 	if err := sm.writeActiveSession(sessionID); err != nil {
-		return fmt.Errorf("update active-session: %w", err)
+		return abort(fmt.Errorf("update active-session: %w", err))
 	}
 
-	// 更新 metadata 状态为 active
+	// 目标 metadata 置为 active 并落盘
 	meta.Status = "active"
 	meta.EndedAt = ""
 	if err := meta.Save(metaPath); err != nil {
-		return fmt.Errorf("save target session metadata: %w", err)
+		// 回滚 active-session 指向旧 Session，避免重启后落到未成功激活的 Session
+		if sm.current != nil {
+			if rbErr := sm.writeActiveSession(sm.current.ID); rbErr != nil {
+				log.Printf("[WARNING] SwitchTo 回滚 active-session 失败: %v", rbErr)
+			}
+		}
+		return abort(fmt.Errorf("save target session metadata: %w", err))
 	}
 
+	// ---- 提交阶段（此后不再有失败路径） ----
+
+	// 关闭当前 Session（切换到自身时跳过——上面已把它重新激活）
+	if sm.current != nil && sm.current.ID != sessionID {
+		sm.current.Metadata.EndedAt = nowUTC()
+		sm.current.Metadata.Status = "closed"
+		oldMetaPath := filepath.Join(sm.current.Dir, "metadata.json")
+		if err := sm.current.Metadata.Save(oldMetaPath); err != nil {
+			log.Printf("[WARNING] SwitchTo 关闭旧 Session metadata 失败: %v", err)
+		}
+	}
+
+	// 换绑旧 history 句柄
+	sm.closeHistoryLocked()
+	sm.history = newHistory
+
 	// 设置 current 为目标 Session
-	sm.current = &Session{
+	sess := &Session{
 		ID:       sessionID,
 		Dir:      targetDir,
 		Metadata: *meta,
 	}
-	if sm.historyEnabled {
-		sm.openHistoryLocked()
-	}
+	sm.current = sess
 
-	return nil
+	return sess, nil
 }
 
-// List は全 Session の Metadata を created_at 降順で返す。
+// List 返回全部 Session 的 Metadata，按 created_at 降序排列。
 func (sm *SessionManager) List() ([]Metadata, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -575,24 +683,48 @@ func (sm *SessionManager) List() ([]Metadata, error) {
 	pattern := filepath.Join(sm.baseDir, "sess-*", "metadata.json")
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
-		return nil, fmt.Errorf("glob 失敗: %w", err)
+		return nil, fmt.Errorf("glob 失败: %w", err)
 	}
 
 	var result []Metadata
 	for _, path := range matches {
 		meta, err := LoadMetadata(path)
 		if err != nil {
-			// スキップして続行
-			log.Printf("[WARNING] metadata 読み込み失敗 %s: %v", path, err)
+			// 跳过损坏的 metadata，继续处理其余 Session
+			log.Printf("[WARNING] metadata 加载失败 %s: %v", path, err)
 			continue
 		}
 		result = append(result, *meta)
 	}
 
-	// created_at 降順ソート
+	// created_at 降序排序
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].CreatedAt > result[j].CreatedAt
 	})
 
 	return result, nil
+}
+
+// ActiveSessionLogsDir 返回 sessionsRoot 下 active-session 指向的 Session 的
+// logs/ 目录路径。读不到 active-session、内容为空白、或 logs/ 目录不存在时
+// 返回 ""。
+//
+// 这是 session 目录布局知识（active-session 文件 + "sess-" 前缀 + logs/
+// 子目录）的唯一对外出口——main.go 的 trace 子命令等进程外消费者经此解析，
+// 不再各自重复实现（B5 收敛）。
+func ActiveSessionLogsDir(sessionsRoot string) string {
+	data, err := os.ReadFile(filepath.Join(sessionsRoot, "active-session"))
+	if err != nil {
+		return ""
+	}
+	// TrimSpace：手工编辑 active-session 容易留下尾部换行（与 initSession 一致）
+	sessionID := strings.TrimSpace(string(data))
+	if sessionID == "" {
+		return ""
+	}
+	logsDir := filepath.Join(sessionsRoot, "sess-"+sessionID, "logs")
+	if info, statErr := os.Stat(logsDir); statErr == nil && info.IsDir() {
+		return logsDir
+	}
+	return ""
 }

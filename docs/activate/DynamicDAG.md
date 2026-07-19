@@ -299,6 +299,8 @@ Task 会话快照已升级为 v2，并保存 PlanID、节点角色、版本、Su
 
 事件附带 PlanID、PlanRevision、ExecutionStateVersion、AcceptanceSpecRevision 和 GraphDigest；验收事件还附带 Run/Result/runner/verdict/status。Trace 用于观察和审计，不替代 PlanStore 权威状态。
 
+运行 `agentgo trace plan <plan_id>` 可把同一 Plan 分散在 controller、worker、acceptance Task 中的生命周期、LLM、工具与上述控制面事件聚合为一条稳定时间线；`plan_id` 支持完整 ID 或唯一前缀。单任务细节继续使用 `agentgo trace show <task_id>`。完整字段与输出说明见 [TraceGuide.md](../../TraceGuide.md)。
+
 ## 11. 改造验收标准
 
 后续修改动态 DAG 机制时，至少必须证明以下不变量：

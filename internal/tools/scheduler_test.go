@@ -748,3 +748,83 @@ func TestFormatSize(t *testing.T) {
 		}
 	}
 }
+
+// ---- A4：结果块走 ResultOutput，普通进度仍走 UserOutput ----
+
+func TestSchedulerGroup_ReportDone_WritesResultOutput(t *testing.T) {
+	s := newSchedTestStore()
+	schedTask := &model.Task{Description: "user request"}
+	s.PublishTask(schedTask)
+	child := &model.Task{ID: "c1", Status: model.TaskStatusCompleted}
+	s.tasks["c1"] = child
+	s.AppendSchedulerBatch(schedTask.ID, "c1")
+
+	var userOut, resultOut strings.Builder
+	g := SchedulerGroup{Store: s, Holder: &fakeHolder{id: schedTask.ID},
+		UserOutput: &userOut, ResultOutput: &resultOut}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("report_done", map[string]any{
+		"summary": "done",
+	}))
+	if err != nil {
+		t.Fatalf("report_done: %v", err)
+	}
+
+	if got := resultOut.String(); !strings.Contains(got, "=== 任务完成 ===") ||
+		!strings.Contains(got, "实际产出（系统校验") {
+		t.Errorf("ResultOutput = %q, want 含结果块与事实校对块", got)
+	}
+	if userOut.Len() != 0 {
+		t.Errorf("结果块不应写 UserOutput，got %q", userOut.String())
+	}
+}
+
+func TestSchedulerGroup_ReportDone_FallsBackToUserOutput(t *testing.T) {
+	s := newSchedTestStore()
+	schedTask := &model.Task{Description: "user request"}
+	s.PublishTask(schedTask)
+
+	var userOut strings.Builder
+	// ResultOutput 保持 nil——单 Writer 装配的既有行为不得改变
+	g := SchedulerGroup{Store: s, Holder: &fakeHolder{id: schedTask.ID}, UserOutput: &userOut}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("report_done", map[string]any{
+		"summary": "done",
+	}))
+	if err != nil {
+		t.Fatalf("report_done: %v", err)
+	}
+	if got := userOut.String(); !strings.Contains(got, "=== 任务完成 ===") {
+		t.Errorf("UserOutput = %q, want 含结果块（ResultOutput nil 回退）", got)
+	}
+}
+
+func TestSchedulerGroup_ReportProgress_WritesUserOutput(t *testing.T) {
+	s := newSchedTestStore()
+	schedTask := &model.Task{Description: "user request"}
+	s.PublishTask(schedTask)
+
+	var userOut, resultOut strings.Builder
+	g := SchedulerGroup{Store: s, Holder: &fakeHolder{id: schedTask.ID},
+		UserOutput: &userOut, ResultOutput: &resultOut}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("report_progress", map[string]any{
+		"summary": "half way",
+	}))
+	if err != nil {
+		t.Fatalf("report_progress: %v", err)
+	}
+
+	if got := userOut.String(); !strings.Contains(got, "📊 任务进度更新") || !strings.Contains(got, "half way") {
+		t.Errorf("UserOutput = %q, want 含进度块", got)
+	}
+	if resultOut.Len() != 0 {
+		t.Errorf("进度消息不应写 ResultOutput，got %q", resultOut.String())
+	}
+}

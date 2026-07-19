@@ -2,7 +2,6 @@ package bootstrap
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -435,6 +434,9 @@ func TestRuntimeSnapshot_SaveAndRestore(t *testing.T) {
 	if restoredTask.LastResponse != task.LastResponse || restoredTask.PartialOutput != task.PartialOutput {
 		t.Fatalf("runtime response fields not restored: last=%q partial=%q", restoredTask.LastResponse, restoredTask.PartialOutput)
 	}
+	if claims := restoredRoster.ExportSnapshot().Claims; len(claims) != 0 {
+		t.Fatalf("process-local roster leases must not survive recovery: %#v", claims)
+	}
 	restoredDependency, err := restoredStore.GetTask(completed.ID)
 	if err != nil {
 		t.Fatalf("terminal dependency missing after restore: %v", err)
@@ -450,36 +452,5 @@ func TestRuntimeSnapshot_SaveAndRestore(t *testing.T) {
 	}
 	if restored.resultSnapshot() == nil || restored.resultSnapshot().Text != "final answer" {
 		t.Fatalf("restored result = %#v", restored.resultSnapshot())
-	}
-}
-
-func TestLoadLatestTextOnlyResult_FromSessionLog(t *testing.T) {
-	projectRoot := t.TempDir()
-	sm, err := session.NewSessionManager(filepath.Join(projectRoot, ".agentgo", "sessions"), session.SessionConfig{Enabled: true})
-	if err != nil {
-		t.Fatalf("NewSessionManager: %v", err)
-	}
-	reportsDir := filepath.Join(projectRoot, ".agentgo", "reports")
-	if err := os.MkdirAll(reportsDir, 0755); err != nil {
-		t.Fatalf("MkdirAll reports: %v", err)
-	}
-	reportRel := filepath.Join(".agentgo", "reports", "text_only_task.md")
-	if err := os.WriteFile(filepath.Join(projectRoot, reportRel), []byte("restored final report"), 0644); err != nil {
-		t.Fatalf("WriteFile report: %v", err)
-	}
-	logLine := "2026/06/17 [agent scheduler-abcd1234] text-only submission 已落盘: " + reportRel + " (123 字节)\n"
-	if err := os.WriteFile(filepath.Join(sm.LogDir(), "system.log"), []byte(logLine), 0644); err != nil {
-		t.Fatalf("WriteFile system.log: %v", err)
-	}
-
-	result, err := loadLatestTextOnlyResult(projectRoot, sm)
-	if err != nil {
-		t.Fatalf("loadLatestTextOnlyResult: %v", err)
-	}
-	if !strings.Contains(result.Text, "restored final report") {
-		t.Fatalf("result text = %q", result.Text)
-	}
-	if !result.Restored {
-		t.Fatal("fallback result should be marked restored")
 	}
 }

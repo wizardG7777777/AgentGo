@@ -1,7 +1,11 @@
 package tui
 
 import (
+	"context"
+	"errors"
+	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -10,33 +14,192 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"agentgo/internal/model"
-	"agentgo/internal/scheduler"
+	"agentgo/internal/output"
 	"agentgo/internal/shell"
-	"agentgo/internal/store"
+	"agentgo/internal/ui"
 )
 
-// testEventCh is the bidirectional channel used in tests; Deps.EventCh
-// exposes only the send direction, so we keep the bidirectional handle here
-// to read back events in assertions.
-var testEventChan chan model.Event
+type cancelAwareObserver struct {
+	unsubscribed chan struct{}
+	once         sync.Once
+}
 
-// testDeps creates a minimal Deps for testing (no nil pointer panics).
-func testDeps() Deps {
-	testEventChan = make(chan model.Event, 16)
-	approvalCh := make(chan shell.ApprovalRequest, 8)
-	systemCh := make(chan string, 16)
-	outputCh := make(chan string, 16)
-	taskStore := store.NewMemoryTaskStore(testEventChan, 100, 1, 300)
+func (o *cancelAwareObserver) Subscribe(buf int) (<-chan ui.Update, func()) {
+	updates := make(chan ui.Update, 1)
+	updates <- ui.Update{Kind: ui.KindSnapshotSync, Snapshot: ui.Snapshot{}}
+	return updates, func() { o.once.Do(func() { close(o.unsubscribed) }) }
+}
 
-	return Deps{
-		Store:       taskStore,
-		EventCh:     testEventChan,
-		CancelFn:    func() {},
-		Scheduler:   &scheduler.Bundle{Mode: scheduler.NewModeStore()},
-		ApprovalCh:  approvalCh,
-		SystemMsgCh: systemCh,
-		OutputCh:    outputCh,
+func (*cancelAwareObserver) Snapshot() ui.Snapshot { return ui.Snapshot{} }
+
+func TestRunWithIO_NonTTYEOFExits(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	observer := &cancelAwareObserver{unsubscribed: make(chan struct{})}
+
+	err := runWithIO(ctx, Deps{Observer: observer}, strings.NewReader(""), io.Discard, false, false)
+	if err != nil {
+		t.Fatalf("non-TTY stdin EOF should be a clean exit: %v", err)
 	}
+	if ctx.Err() != nil {
+		t.Fatal("TUI waited for context timeout instead of exiting on stdin EOF")
+	}
+	select {
+	case <-observer.unsubscribed:
+	case <-time.After(time.Second):
+		t.Fatal("TUI EOF exit did not cancel the Observer subscription")
+	}
+}
+
+// ── 测试替身：fakeUI 同时实现 ui.Controller 与 ui.Observer ──
+//
+// TUI 的全部系统交互都经这两个接口，因此一个 fake 即可取代旧测试里的
+// EventCh/Store/Scheduler/Mailbox/ApprovalCh/SessionMgr 等一堆组件。
+// 观测面返回固定快照（测试可直接改 snapshot 字段）；控制面记录全部调用，
+// 具体行为经各 Fn 字段注入。
+
+type steerCall struct{ agentID, message string }
+
+type resolveCall struct {
+	requestID string
+	reply     shell.ApprovalReply
+}
+
+type fakeUI struct {
+	mu sync.Mutex
+
+	snapshot ui.Snapshot
+
+	// 行为注入
+	sendErr       error
+	cancelFn      func(idPrefix string) (string, error)
+	steerErr      error
+	newID         string
+	sessionErr    error
+	switchChanged bool
+	listFn        func() ([]ui.SessionInfo, error)
+	resolveFn     func(requestID string, reply shell.ApprovalReply) bool
+
+	// 调用记录
+	sentTexts    []string
+	cancelled    []string
+	steers       []steerCall
+	modeSets     []bool
+	newCalls     int
+	switchCalls  int
+	switchedTo   string
+	resolveCalls []resolveCall
+	quitCalls    int
+}
+
+func newFakeUI() *fakeUI {
+	return &fakeUI{snapshot: ui.Snapshot{Mode: "immediate"}, switchChanged: true}
+}
+
+func (f *fakeUI) Subscribe(buf int) (<-chan ui.Update, func()) {
+	if buf < 1 {
+		buf = 1
+	}
+	ch := make(chan ui.Update, buf)
+	// 与 Hub 语义一致：首条必为 KindSnapshotSync 全量快照。
+	ch <- ui.Update{Kind: ui.KindSnapshotSync, Snapshot: f.Snapshot(), At: time.Now()}
+	return ch, func() {}
+}
+
+func (f *fakeUI) Snapshot() ui.Snapshot {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.snapshot
+}
+
+func (f *fakeUI) SendUserText(_ context.Context, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sentTexts = append(f.sentTexts, text)
+	return f.sendErr
+}
+
+func (f *fakeUI) CancelTask(idPrefix string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelled = append(f.cancelled, idPrefix)
+	if f.cancelFn != nil {
+		return f.cancelFn(idPrefix)
+	}
+	return "", errors.New("cancelTask 未注入")
+}
+
+func (f *fakeUI) SteerAgent(agentID, message string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.steers = append(f.steers, steerCall{agentID: agentID, message: message})
+	return f.steerErr
+}
+
+func (f *fakeUI) SetMode(plan bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.modeSets = append(f.modeSets, plan)
+	// 模拟 Hub：SetMode 后下一轮快照即反映新模式。
+	if plan {
+		f.snapshot.Mode = "plan"
+	} else {
+		f.snapshot.Mode = "immediate"
+	}
+}
+
+func (f *fakeUI) NewSession() (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.newCalls++
+	if f.sessionErr != nil {
+		return "", f.sessionErr
+	}
+	return f.newID, nil
+}
+
+func (f *fakeUI) SwitchSession(id string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.switchCalls++
+	f.switchedTo = id
+	return f.switchChanged, f.sessionErr
+}
+
+func (f *fakeUI) ListSessions() ([]ui.SessionInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listFn != nil {
+		return f.listFn()
+	}
+	return nil, f.sessionErr
+}
+
+func (f *fakeUI) ResolveApproval(requestID string, reply shell.ApprovalReply) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resolveCalls = append(f.resolveCalls, resolveCall{requestID: requestID, reply: reply})
+	if f.resolveFn != nil {
+		return f.resolveFn(requestID, reply)
+	}
+	return true
+}
+
+func (f *fakeUI) RequestQuit() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.quitCalls++
+}
+
+// testDeps creates a minimal Deps for testing (fake Controller + Observer).
+func testDeps() Deps {
+	f := newFakeUI()
+	return Deps{Controller: f, Observer: f}
+}
+
+// fakeOf 取出 testDeps 内置的 *fakeUI（同一实例同时是 Controller 与 Observer）。
+func fakeOf(deps Deps) *fakeUI {
+	return deps.Controller.(*fakeUI)
 }
 
 func TestNewAppModel_Defaults(t *testing.T) {
@@ -188,7 +351,7 @@ func TestAppModel_SystemMsg(t *testing.T) {
 
 func TestAppModel_OutputMsg_Normal(t *testing.T) {
 	m := newAppModel(testDeps())
-	result, _ := m.Update(outputMsg("agent output text"))
+	result, _ := m.Update(outputMsg(output.Event{Kind: output.KindText, Text: "agent output text"}))
 	updated := result.(AppModel)
 
 	if len(updated.messages) != 1 {
@@ -201,7 +364,7 @@ func TestAppModel_OutputMsg_Normal(t *testing.T) {
 
 func TestAppModel_OutputMsg_Result(t *testing.T) {
 	m := newAppModel(testDeps())
-	result, _ := m.Update(outputMsg("=== 任务完成 === some result"))
+	result, _ := m.Update(outputMsg(output.Event{Kind: output.KindResult, Text: "plain result without magic markers"}))
 	updated := result.(AppModel)
 
 	if updated.lastResult == nil {
@@ -216,11 +379,28 @@ func TestAppModel_OutputMsg_Result(t *testing.T) {
 	}
 }
 
+// 带结果标记文本但 Kind=KindText 的事件必须保持 MsgAgent——
+// 证明分类只看 Kind，不做 "=== 任务完成 ===" 子串匹配（A4）。
+func TestAppModel_OutputMsg_ResultMarkerTextStaysAgent(t *testing.T) {
+	m := newAppModel(testDeps())
+	result, _ := m.Update(outputMsg(output.Event{Kind: output.KindText, Text: "=== 任务完成 === 只是普通文本"}))
+	updated := result.(AppModel)
+
+	if len(updated.messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(updated.messages))
+	}
+	if updated.messages[0].Kind != MsgAgent {
+		t.Errorf("KindText with result marker text kind = %d, want MsgAgent", updated.messages[0].Kind)
+	}
+	if updated.lastResult != nil {
+		t.Error("KindText must not seed lastResult")
+	}
+}
+
 func TestAppModel_ApprovalMsg_First(t *testing.T) {
 	m := newAppModel(testDeps())
-	replyCh := make(chan shell.ApprovalReply, 1)
-	req := approvalMsg(shell.ApprovalRequest{
-		AgentID: "w-1", Command: "rm -rf /", Pattern: "rm.*", ReplyCh: replyCh,
+	req := approvalMsg(ui.ApprovalItem{
+		RequestID: "r-1", AgentID: "w-1", Command: "rm -rf /", Pattern: "rm.*",
 	})
 	result, _ := m.Update(req)
 	updated := result.(AppModel)
@@ -231,17 +411,18 @@ func TestAppModel_ApprovalMsg_First(t *testing.T) {
 	if updated.activeApproval.AgentID != "w-1" {
 		t.Errorf("active approval agent = %q", updated.activeApproval.AgentID)
 	}
+	if updated.activeApproval.RequestID != "r-1" {
+		t.Errorf("active approval requestID = %q, want r-1", updated.activeApproval.RequestID)
+	}
 }
 
 func TestAppModel_ApprovalMsg_Queued(t *testing.T) {
 	m := newAppModel(testDeps())
-	replyCh1 := make(chan shell.ApprovalReply, 1)
-	replyCh2 := make(chan shell.ApprovalReply, 1)
 
-	m.activeApproval = &shell.ApprovalRequest{AgentID: "w-1", ReplyCh: replyCh1}
+	m.activeApproval = &ui.ApprovalItem{RequestID: "r-1", AgentID: "w-1"}
 
-	result, _ := m.Update(approvalMsg(shell.ApprovalRequest{
-		AgentID: "w-2", ReplyCh: replyCh2,
+	result, _ := m.Update(approvalMsg(ui.ApprovalItem{
+		RequestID: "r-2", AgentID: "w-2",
 	}))
 	updated := result.(AppModel)
 
@@ -250,14 +431,49 @@ func TestAppModel_ApprovalMsg_Queued(t *testing.T) {
 	}
 }
 
+// 其他前端已了结激活审批（KindApprovalResolved）：推进队列，不追加消息。
+func TestAppModel_ApprovalResolvedMsg_Active(t *testing.T) {
+	m := newAppModel(testDeps())
+	m.activeApproval = &ui.ApprovalItem{RequestID: "r-1", AgentID: "w-1"}
+	m.pendingApprovals = []ui.ApprovalItem{{RequestID: "r-2", AgentID: "w-2"}}
+
+	result, _ := m.Update(approvalResolvedMsg(ui.ApprovalResolved{RequestID: "r-1", Outcome: ui.OutcomeApproved}))
+	updated := result.(AppModel)
+
+	if updated.activeApproval == nil || updated.activeApproval.RequestID != "r-2" {
+		t.Fatalf("resolved 激活审批后应推进队列，active = %+v", updated.activeApproval)
+	}
+	if len(updated.pendingApprovals) != 0 {
+		t.Errorf("pending count = %d, want 0", len(updated.pendingApprovals))
+	}
+	if len(updated.messages) != 0 {
+		t.Error("外部了结不应追加消息（本前端没有回复动作可报告）")
+	}
+}
+
+// 其他前端已了结待处理审批：从队列移除，激活项不动。
+func TestAppModel_ApprovalResolvedMsg_Pending(t *testing.T) {
+	m := newAppModel(testDeps())
+	m.activeApproval = &ui.ApprovalItem{RequestID: "r-1", AgentID: "w-1"}
+	m.pendingApprovals = []ui.ApprovalItem{{RequestID: "r-2", AgentID: "w-2"}}
+
+	result, _ := m.Update(approvalResolvedMsg(ui.ApprovalResolved{RequestID: "r-2", Outcome: ui.OutcomeRejected}))
+	updated := result.(AppModel)
+
+	if updated.activeApproval == nil || updated.activeApproval.RequestID != "r-1" {
+		t.Fatal("激活审批不应被其他 ID 的 resolved 影响")
+	}
+	if len(updated.pendingApprovals) != 0 {
+		t.Errorf("pending count = %d, want 0", len(updated.pendingApprovals))
+	}
+}
+
 func TestAppModel_AdvanceApproval(t *testing.T) {
 	m := newAppModel(testDeps())
-	replyCh1 := make(chan shell.ApprovalReply, 1)
-	replyCh2 := make(chan shell.ApprovalReply, 1)
 
-	m.activeApproval = &shell.ApprovalRequest{AgentID: "w-1", ReplyCh: replyCh1}
-	m.pendingApprovals = []shell.ApprovalRequest{
-		{AgentID: "w-2", ReplyCh: replyCh2},
+	m.activeApproval = &ui.ApprovalItem{RequestID: "r-1", AgentID: "w-1"}
+	m.pendingApprovals = []ui.ApprovalItem{
+		{RequestID: "r-2", AgentID: "w-2"},
 	}
 	m.guidanceMode = true
 
@@ -279,8 +495,7 @@ func TestAppModel_AdvanceApproval(t *testing.T) {
 
 func TestAppModel_AdvanceApproval_Empty(t *testing.T) {
 	m := newAppModel(testDeps())
-	replyCh := make(chan shell.ApprovalReply, 1)
-	m.activeApproval = &shell.ApprovalRequest{AgentID: "w-1", ReplyCh: replyCh}
+	m.activeApproval = &ui.ApprovalItem{RequestID: "r-1", AgentID: "w-1"}
 
 	m.advanceApproval()
 
@@ -542,23 +757,26 @@ func TestAppModel_HandleKey_ApprovalKeys(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		m := newAppModel(testDeps())
-		replyCh := make(chan shell.ApprovalReply, 1)
-		m.activeApproval = &shell.ApprovalRequest{
-			AgentID: "w-1", Command: "cmd", ReplyCh: replyCh,
+		deps := testDeps()
+		m := newAppModel(deps)
+		m.activeApproval = &ui.ApprovalItem{
+			RequestID: "r-1", AgentID: "w-1", Command: "cmd",
 		}
 		m.focus = FocusInput
 
 		result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(tc.key)})
 		updated := result.(AppModel)
 
-		select {
-		case reply := <-replyCh:
-			if reply.Approved != tc.approved {
-				t.Errorf("key=%q: Approved=%v, want %v", tc.key, reply.Approved, tc.approved)
-			}
-		default:
-			t.Errorf("key=%q: no reply sent", tc.key)
+		f := fakeOf(deps)
+		if len(f.resolveCalls) != 1 {
+			t.Fatalf("key=%q: ResolveApproval 调用次数 = %d, want 1", tc.key, len(f.resolveCalls))
+		}
+		call := f.resolveCalls[0]
+		if call.requestID != "r-1" {
+			t.Errorf("key=%q: ResolveApproval requestID = %q, want r-1", tc.key, call.requestID)
+		}
+		if call.reply.Approved != tc.approved {
+			t.Errorf("key=%q: Approved=%v, want %v", tc.key, call.reply.Approved, tc.approved)
 		}
 
 		if updated.activeApproval != nil {
@@ -569,9 +787,8 @@ func TestAppModel_HandleKey_ApprovalKeys(t *testing.T) {
 
 func TestAppModel_HandleKey_ApprovalKey3_GuidanceMode(t *testing.T) {
 	m := newAppModel(testDeps())
-	replyCh := make(chan shell.ApprovalReply, 1)
-	m.activeApproval = &shell.ApprovalRequest{
-		AgentID: "w-1", Command: "cmd", ReplyCh: replyCh,
+	m.activeApproval = &ui.ApprovalItem{
+		RequestID: "r-1", AgentID: "w-1", Command: "cmd",
 	}
 	m.focus = FocusInput
 
@@ -587,48 +804,80 @@ func TestAppModel_HandleKey_ApprovalKey3_GuidanceMode(t *testing.T) {
 }
 
 func TestAppModel_HandleKey_ApprovalKey4_Remember(t *testing.T) {
-	m := newAppModel(testDeps())
-	replyCh := make(chan shell.ApprovalReply, 1)
-	m.activeApproval = &shell.ApprovalRequest{
-		AgentID: "w-1", Command: "cmd", Pattern: "rm.*", ReplyCh: replyCh,
+	deps := testDeps()
+	m := newAppModel(deps)
+	m.activeApproval = &ui.ApprovalItem{
+		RequestID: "r-1", AgentID: "w-1", Command: "cmd", Pattern: "rm.*",
 	}
 	m.focus = FocusInput
 
 	m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("4")})
 
-	select {
-	case reply := <-replyCh:
-		if !reply.Approved {
-			t.Error("key 4 should approve")
-		}
-		if reply.RememberPattern != "rm.*" {
-			t.Errorf("RememberPattern = %q, want %q", reply.RememberPattern, "rm.*")
-		}
-	default:
-		t.Error("no reply sent")
+	f := fakeOf(deps)
+	if len(f.resolveCalls) != 1 {
+		t.Fatalf("ResolveApproval 调用次数 = %d, want 1", len(f.resolveCalls))
+	}
+	reply := f.resolveCalls[0].reply
+	if !reply.Approved {
+		t.Error("key 4 should approve")
+	}
+	if reply.RememberPattern != "rm.*" {
+		t.Errorf("RememberPattern = %q, want %q", reply.RememberPattern, "rm.*")
 	}
 }
 
-func TestAppModel_TickRefresh(t *testing.T) {
-	deps := testDeps()
-	called := false
-	deps.AgentInfoFn = func() []AgentInfo {
-		called = true
-		return []AgentInfo{{ID: "test-agent", State: "idle"}}
-	}
+// KindAgentsChanged 到达（Hub 轮询节拍）：整表替换代理与任务列表。
+// 取代旧的 500ms tick 直读 AgentInfoFn/Store.ScanAll 的刷新路径。
+func TestAppModel_AgentsChangedMsg(t *testing.T) {
+	m := newAppModel(testDeps())
 
-	m := newAppModel(deps)
-	result, cmd := m.Update(tickMsg(time.Now()))
+	result, _ := m.Update(agentsChangedMsg{
+		agents: []AgentInfo{{ID: "test-agent", State: "idle"}},
+		tasks:  []*model.Task{{ID: "t-1", Description: "demo"}},
+	})
 	updated := result.(AppModel)
 
-	if !called {
-		t.Error("tick should call AgentInfoFn")
+	if len(updated.agents) != 1 || updated.agents[0].ID != "test-agent" {
+		t.Errorf("agents = %+v, want 1 个 test-agent", updated.agents)
 	}
-	if len(updated.agents) != 1 {
-		t.Errorf("agents count = %d, want 1", len(updated.agents))
+	if len(updated.tasks) != 1 || updated.tasks[0].ID != "t-1" {
+		t.Errorf("tasks = %+v, want 1 个 t-1", updated.tasks)
 	}
-	if cmd == nil {
-		t.Error("tick should return next tick command")
+}
+
+// KindSnapshotSync（订阅后首条更新）：初始化代理/任务，并按快照里的
+// 待审批列表播种审批队列（首条激活，其余排队）。
+func TestAppModel_SnapshotSyncMsg(t *testing.T) {
+	m := newAppModel(testDeps())
+
+	snap := ui.Snapshot{
+		Agents: []ui.AgentCard{{ID: "a-1", State: "processing"}},
+		Tasks: []ui.BoardTask{
+			{ID: "t-1", Desc: "看板任务", Status: "processing"},
+		},
+		Mode: "plan",
+		PendingApprovals: []ui.ApprovalItem{
+			{RequestID: "r-1", AgentID: "w-1"},
+			{RequestID: "r-2", AgentID: "w-2"},
+		},
+	}
+	result, _ := m.Update(snapshotSyncMsg(snap))
+	updated := result.(AppModel)
+
+	if len(updated.agents) != 1 || updated.agents[0].ID != "a-1" {
+		t.Errorf("agents = %+v", updated.agents)
+	}
+	if len(updated.tasks) != 1 || updated.tasks[0].ID != "t-1" {
+		t.Errorf("tasks = %+v", updated.tasks)
+	}
+	if updated.tasks[0].Status != model.TaskStatusProcessing {
+		t.Errorf("BoardTask 状态未还原为 TaskStatus: %q", updated.tasks[0].Status)
+	}
+	if updated.activeApproval == nil || updated.activeApproval.RequestID != "r-1" {
+		t.Fatalf("首条待审批应激活，active = %+v", updated.activeApproval)
+	}
+	if len(updated.pendingApprovals) != 1 || updated.pendingApprovals[0].RequestID != "r-2" {
+		t.Fatalf("其余待审批应排队，pending = %+v", updated.pendingApprovals)
 	}
 }
 
@@ -654,17 +903,26 @@ func TestAppModel_SendUserText(t *testing.T) {
 		t.Error("message should contain user text")
 	}
 
-	// Check event was sent (read from bidirectional handle)
-	select {
-	case evt := <-testEventChan:
-		if evt.Type != model.EventUserInput {
-			t.Errorf("event type = %q, want EventUserInput", evt.Type)
-		}
-		if evt.Payload["text"] != "hello world" {
-			t.Errorf("event payload text = %q", evt.Payload["text"])
-		}
-	default:
-		t.Error("event should be sent to EventCh")
+	// 事件投递经 Controller（RecordUserInput + 5s 超时都在 Hub 侧）
+	f := fakeOf(deps)
+	if len(f.sentTexts) != 1 || f.sentTexts[0] != "hello world" {
+		t.Fatalf("Controller.SendUserText 收到 %v, want [hello world]", f.sentTexts)
+	}
+}
+
+// Controller 投递失败（如 5 秒超时）时错误要渲染给用户。
+func TestAppModel_SendUserText_Error(t *testing.T) {
+	deps := testDeps()
+	fakeOf(deps).sendErr = errors.New("事件通道超时，调度器可能阻塞")
+	m := newAppModel(deps)
+	m.sendUserText("hello")
+
+	last := m.messages[len(m.messages)-1]
+	if last.Kind != MsgError {
+		t.Errorf("失败消息 kind = %d, want MsgError", last.Kind)
+	}
+	if !strings.Contains(last.Text, "调度器可能阻塞") {
+		t.Errorf("失败消息应透出错误文本: %q", last.Text)
 	}
 }
 
@@ -697,15 +955,16 @@ func TestAppModel_SendUserText_WideTruncation(t *testing.T) {
 }
 
 func TestAppModel_ShowStatus_WideTaskDescription(t *testing.T) {
-	m := newAppModel(testDeps())
-	task := &model.Task{
-		Description: strings.Repeat("验证🙂", 30),
-		Status:      model.TaskStatusPending,
-		Agents:      []string{"worker-1"},
-	}
-	if err := m.deps.Store.PublishTask(task); err != nil {
-		t.Fatalf("PublishTask: %v", err)
-	}
+	deps := testDeps()
+	f := fakeOf(deps)
+	f.snapshot.Tasks = []ui.BoardTask{{
+		ID:     "abcd1234-task",
+		Desc:   strings.Repeat("验证🙂", 30),
+		Status: "pending",
+		Agents: []string{"worker-1"},
+	}}
+	f.snapshot.Mode = "immediate"
+	m := newAppModel(deps)
 
 	m.showStatus()
 
@@ -827,17 +1086,15 @@ func TestAppModel_HandleCommand_Unknown(t *testing.T) {
 }
 
 func TestAppModel_HandleCommand_Quit(t *testing.T) {
-	cancelled := false
 	deps := testDeps()
-	deps.CancelFn = func() { cancelled = true }
 	m := newAppModel(deps)
 
 	quit := m.handleCommand("/quit")
 	if !quit {
 		t.Error("/quit should return true")
 	}
-	if !cancelled {
-		t.Error("/quit should call CancelFn")
+	if fakeOf(deps).quitCalls != 1 {
+		t.Error("/quit should call Controller.RequestQuit")
 	}
 }
 
@@ -864,20 +1121,22 @@ func TestAppModel_HandleCommand_Help(t *testing.T) {
 }
 
 func TestAppModel_HandleCommand_Mode(t *testing.T) {
-	m := newAppModel(testDeps())
+	deps := testDeps()
+	m := newAppModel(deps)
+	f := fakeOf(deps)
 
-	if m.deps.Scheduler.Mode.Get() != scheduler.ModeImmediate {
-		t.Fatal("initial mode should be Immediate")
+	if f.Snapshot().Mode != "immediate" {
+		t.Fatal("initial mode should be immediate")
 	}
 
 	m.handleCommand("/mode")
-	if m.deps.Scheduler.Mode.Get() != scheduler.ModePlan {
-		t.Error("first /mode should switch to Plan")
+	if len(f.modeSets) != 1 || !f.modeSets[0] {
+		t.Fatalf("first /mode should SetMode(true), got %v", f.modeSets)
 	}
 
 	m.handleCommand("/mode")
-	if m.deps.Scheduler.Mode.Get() != scheduler.ModeImmediate {
-		t.Error("second /mode should switch back to Immediate")
+	if len(f.modeSets) != 2 || f.modeSets[1] {
+		t.Fatalf("second /mode should SetMode(false), got %v", f.modeSets)
 	}
 }
 
@@ -918,5 +1177,182 @@ func TestAppModel_SelectAgentByID_PrefixMatch(t *testing.T) {
 	m.selectAgentByID("exp")
 	if m.selectedAgent != 1 {
 		t.Errorf("prefix match: selectedAgent = %d, want 1", m.selectedAgent)
+	}
+}
+
+// ── A2：审批回复经 Controller.ResolveApproval（非阻塞性由 Hub 保证）────
+//
+// 旧 replyApproval（对 ReplyCh 的非阻塞发送）已随三通道消费权上移进
+// ui.Hub.ResolveApproval；送达/过期/未知 ID 的用例由 internal/ui 的
+// Broker 测试覆盖。此处保留 TUI 侧 UX 回归：送达追加成功消息、失效追加
+// 提示、两种结局都推进队列。
+
+// 存活审批（Controller 送达返回 true）→ 成功消息 + 推进队列。
+func TestReplyActiveApproval_Delivered(t *testing.T) {
+	deps := testDeps()
+	m := newAppModel(deps)
+	m.activeApproval = &ui.ApprovalItem{RequestID: "r-1", AgentID: "w-1"}
+	m.pendingApprovals = []ui.ApprovalItem{{RequestID: "r-2", AgentID: "w-2"}}
+
+	m.replyActiveApproval(shell.ApprovalReply{Approved: true}, "[审批] 已批准 w-1 的命令")
+
+	f := fakeOf(deps)
+	if len(f.resolveCalls) != 1 || f.resolveCalls[0].requestID != "r-1" {
+		t.Fatalf("ResolveApproval 调用 = %+v, want 1 次 r-1", f.resolveCalls)
+	}
+	if !f.resolveCalls[0].reply.Approved {
+		t.Error("回复内容丢失：Approved 应为 true")
+	}
+	if m.activeApproval == nil || m.activeApproval.RequestID != "r-2" {
+		t.Fatalf("送达后应推进队列，active = %+v", m.activeApproval)
+	}
+	if got := lastMessageText(&m); !strings.Contains(got, "已批准") {
+		t.Errorf("送达应追加成功消息，got %q", got)
+	}
+}
+
+// 失效审批（Controller 返回 false：ReplyCh 已被应答或 agent 放弃等待）→
+// 追加失效提示并推进队列，绝不阻塞 bubbletea Update goroutine（H2）。
+func TestReplyActiveApproval_Stale(t *testing.T) {
+	deps := testDeps()
+	fakeOf(deps).resolveFn = func(string, shell.ApprovalReply) bool { return false }
+	m := newAppModel(deps)
+	m.activeApproval = &ui.ApprovalItem{RequestID: "r-1", AgentID: "w-1"}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.replyActiveApproval(shell.ApprovalReply{Approved: false}, "")
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("失效审批上回复阻塞了 Update（H2 未修复）")
+	}
+
+	if m.activeApproval != nil {
+		t.Error("失效审批也应推进队列（activeApproval=nil）")
+	}
+	if got := lastMessageText(&m); !strings.Contains(got, "该审批已失效（任务已结束）") {
+		t.Errorf("失效提示文案错误，got %q", got)
+	}
+}
+
+// 审批栏激活（非 guidance 模式）时 Esc = 拒绝，与 "[Esc] Reject" 提示一致。
+func TestAppModel_HandleKey_Escape_RejectsApproval(t *testing.T) {
+	deps := testDeps()
+	m := newAppModel(deps)
+	m.activeApproval = &ui.ApprovalItem{
+		RequestID: "r-1", AgentID: "w-1", Command: "cmd",
+	}
+	m.focus = FocusInput
+
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
+	updated := result.(AppModel)
+
+	f := fakeOf(deps)
+	if len(f.resolveCalls) != 1 {
+		t.Fatalf("Esc 应发送一次审批回复，got %d 次", len(f.resolveCalls))
+	}
+	if f.resolveCalls[0].reply.Approved {
+		t.Error("Esc 应发送拒绝（Approved=false）")
+	}
+	if f.resolveCalls[0].requestID != "r-1" {
+		t.Errorf("Esc 回复的 requestID = %q, want r-1", f.resolveCalls[0].requestID)
+	}
+	if updated.activeApproval != nil {
+		t.Error("Esc 拒绝后应推进审批队列（activeApproval=nil）")
+	}
+}
+
+// guidance 模式下 Esc 保持原语义：只退出 guidance，不发送回复、审批保持激活。
+func TestAppModel_HandleKey_Escape_GuidanceModeKeepsApproval(t *testing.T) {
+	deps := testDeps()
+	m := newAppModel(deps)
+	m.activeApproval = &ui.ApprovalItem{
+		RequestID: "r-1", AgentID: "w-1", Command: "cmd",
+	}
+	m.guidanceMode = true
+	m.focus = FocusInput
+
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
+	updated := result.(AppModel)
+
+	if updated.guidanceMode {
+		t.Error("Esc 应退出 guidance 模式")
+	}
+	if updated.activeApproval == nil {
+		t.Error("guidance 模式下 Esc 不应推进审批队列")
+	}
+	if n := len(fakeOf(deps).resolveCalls); n != 0 {
+		t.Errorf("guidance 模式下 Esc 不应发送审批回复，got %d 次", n)
+	}
+}
+
+// guidance 模式回车：自由文本指导经 Controller 送达（Message 非空）。
+func TestAppModel_HandleKey_GuidanceSubmit(t *testing.T) {
+	deps := testDeps()
+	m := newAppModel(deps)
+	m.activeApproval = &ui.ApprovalItem{
+		RequestID: "r-1", AgentID: "w-1", Command: "cmd",
+	}
+	m.guidanceMode = true
+	m.focus = FocusInput
+	m.input.SetValue("请先备份再删除")
+
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	updated := result.(AppModel)
+
+	f := fakeOf(deps)
+	if len(f.resolveCalls) != 1 {
+		t.Fatalf("guidance 回车应发送一次回复，got %d 次", len(f.resolveCalls))
+	}
+	reply := f.resolveCalls[0].reply
+	if reply.Message != "请先备份再删除" {
+		t.Errorf("guidance 回复 Message = %q", reply.Message)
+	}
+	if reply.Approved {
+		t.Error("guidance 回复不应是批准")
+	}
+	if updated.activeApproval != nil {
+		t.Error("guidance 发送后应推进审批队列")
+	}
+}
+
+// 失效审批（Controller 返回 false）：按 1 不阻塞，追加失效提示，
+// 并推进队列让后续待审批继续处理。
+func TestAppModel_HandleKey_ApprovalStaleRequest(t *testing.T) {
+	deps := testDeps()
+	fakeOf(deps).resolveFn = func(string, shell.ApprovalReply) bool { return false }
+	m := newAppModel(deps)
+	m.activeApproval = &ui.ApprovalItem{
+		RequestID: "r-1", AgentID: "w-1", Command: "cmd",
+	}
+	m.focus = FocusInput
+
+	keyDone := make(chan tea.Model, 1)
+	go func() {
+		result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("1")})
+		keyDone <- result
+	}()
+
+	var updated AppModel
+	select {
+	case result := <-keyDone:
+		updated = result.(AppModel)
+	case <-time.After(2 * time.Second):
+		t.Fatal("失效请求上按 1 阻塞了 Update（H2 未修复）")
+	}
+
+	if updated.activeApproval != nil {
+		t.Error("失效审批也应推进队列（activeApproval=nil）")
+	}
+	if len(updated.messages) == 0 {
+		t.Fatal("失效审批应追加提示消息")
+	}
+	last := updated.messages[len(updated.messages)-1]
+	if !strings.Contains(last.Text, "该审批已失效（任务已结束）") {
+		t.Errorf("失效提示文案错误，got: %q", last.Text)
 	}
 }

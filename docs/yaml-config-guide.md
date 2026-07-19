@@ -175,6 +175,8 @@ Scheduler 不能先发布一个没有消费者的 route 再尝试创建 Agent。
 infra:
   watchdog:
     interval_sec: 30
+    pending_alert_grace_sec: 300  # 有合法 route 但本轮 pending 过久：只告警
+    unroutable_grace_sec: 300     # 持续无兼容 route：宽限期后标记 blocked
   mail_notifier:
     enabled: true
     interval_sec: 5
@@ -182,12 +184,33 @@ infra:
     event_channel_buffer: 64
     fifo_limit: 100
     default_concurrency: 2
-    default_timeout_sec: 300        # 任务级超时
+    default_timeout_sec: 300        # 单次 processing 执行的默认超时
   roster:
     wait_timeout_sec: 30
 ```
 
-### 1.7 顶层杂项字段
+- `default_timeout_sec` 只约束任务被领取后的单次执行租约，以 `StartedAt` 为起点；它不是排队超时。
+- `pending_alert_grace_sec` 以当前 `PendingSince` 为起点。有合法 route 时超期只发一次告警，任务继续排队。
+- `unroutable_grace_sec` 从 Watchdog 首次确认“任务已满足依赖且可认领，但没有兼容 route”时独立计时；超期后任务进入 `blocked`。依赖等待与 Plan 暂停期间不累计这段时间。
+
+### 1.7 `ui:` — 前端与 Web Dashboard（可选）
+
+```yaml
+ui:
+  frontends: [tui, web]       # `tui` / `web`；省略或空列表时为 [tui]
+  web:
+    listen: "127.0.0.1:8399" # 启用 web 时必须是合法 host:port
+    token: ""                 # 非 loopback 监听时必填；请使用独立随机 token
+    auto_open: true            # 省略时也为 true
+```
+
+- `tui` 与 `web` 可并存；只启用 `web` 时为 headless 模式，进程等待关闭信号而不进入 TUI。
+- Web Dashboard 通过 HTTP + SSE 提供观测和受控操作（输入、取消、审批、模式/Session 切换），不是只读页面。
+- `web.listen` 为 `127.0.0.1`、`localhost` 或 `::1` 时 token 可为空；绑定 `0.0.0.0`、`::`、LAN 或公网地址时，`token` 为空会被启动校验拒绝。
+- `auto_open` 是三态字段：未设置等于 `true`，显式 `false` 关闭自动打开浏览器。`/healthz` 可用于就绪检查。
+- token 仅保护 Dashboard 管理面，不能替代也不能复用 `llm.api_key`。Dashboard 不写入 LLM 配置或密钥。
+
+### 1.8 顶层杂项字段
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
@@ -201,13 +224,14 @@ infra:
 | `agent_idle_threshold` | `0` | 空闲退出阈值；0=永不空闲退出 |
 | `session_retention_days` | `30` | 已关闭 session 归档阈值 |
 | `session_archive_max` | `50` | 归档上限 |
+| `session_resume_max_idle_sec` | `3600` | 自动恢复 active-session 时允许的快照最大闲置秒数；超限的非终态任务转为 `blocked`，显式 `--resume` 可确认恢复；0=关闭保护；最大 `9223372036` |
+| `session_snapshot_interval_sec` | `30` | 运行期完整快照间隔，用于限制崩溃后的副作用重放窗口；0=仅在 Session 切换/关闭时保存；最大 `9223372036` |
 | `search_api_provider` / `search_api_url` / `search_api_key` | — | 网络搜索 provider |
 | `startup_probe` | `""` | `"tcp"` / `"off"`；其它值校验失败 |
 | `startup_probe_timeout_sec` | `0` | 不可负 |
 | `startup_probe_failure_action` | `""` | `"warn"` / `"exit"`；其它值校验失败 |
 | `reactors_file` | `""` | v5 用户 reactor 文件路径（见 §3） |
 | `agent_templates` | 内置 Catalog + 默认容量 | 外部模板目录与模板运行实例上限（见 §1.5） |
-
 ---
 
 ## 2. 常见错误对照表
@@ -223,6 +247,7 @@ infra:
 | `agent template duplicate ref` | 同一来源 namespace 出现相同 `name@version` | 改模板名或提升 version |
 | `agent template digest mismatch` | 恢复时磁盘模板与 TeamSpec 记录的内容不同 | 恢复原模板或显式处理持久 TeamSpec 后重启；v1 不自动迁移 |
 | `runtime agent limit reached` | 达到全局或模板 `max_replicas` | 等待实例释放、提高显式上限或收缩 DAG 并发 |
+| `ui.web.listen` 非 loopback 但 token 为空 | 管理面将暴露给同网段/公网 | 设置独立 `ui.web.token`，或改回 `127.0.0.1` / `::1` |
 | 启动正常但行为完全没变 | 用了 v3 顶层字段如 `worker_count` | 改成 v4/v5 嵌套 schema |
 
 ---
@@ -255,17 +280,21 @@ reactors:
 
 ```
 task_published / task_claimed / task_submitted / task_completed
-text_only_submission / task_retry / task_failed / task_cancelled
+text_only_submission / task_retry / task_failed / task_blocked / task_cancelled
 llm_call_start / llm_call_end / tool_call / tool_result
 history_compaction / history_truncated / token_stats
 file_written / file_write_queued / progress_notify
 error / agent_state_changed
-shell_executed / shell_timeout_pending / shell_timeout_resolved
+shell_executed
 reactor_spawn_depth_exceeded
+replan_requested / replan_coalesced / replan_decided / plan_revision_changed
 acceptance_completed / plan_paused / plan_terminal
 ```
 
-写不在表里的 EventKind 启动期直接报错。
+写不在表里的 EventKind 启动期直接报错。注意 `shell_timeout_pending` /
+`shell_timeout_resolved` 是 reserved Kind（预留给未来内置的 shell
+TimeoutHandler，暂无发射点）——订阅它们会得到比 unknown kind 更明确的
+"reserved" 报错，而不是通过校验后永远不触发（D4）。
 
 ### 3.3 `when:` 条件表达式
 

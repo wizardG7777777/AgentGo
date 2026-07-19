@@ -7,47 +7,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-func TestNewAgentDetail(t *testing.T) {
-	d := NewAgentDetail("worker-1", 80, 20)
-	if d.AgentID != "worker-1" {
-		t.Errorf("AgentID = %q", d.AgentID)
-	}
-	if !d.Tracking {
-		t.Error("tracking should default to true")
-	}
-	if d.Content != "" {
-		t.Error("content should start empty")
-	}
-}
-
-func TestAgentDetailModel_SetContent(t *testing.T) {
-	d := NewAgentDetail("w-1", 80, 20)
-	d.SetContent("hello\nworld")
-	if d.Content != "hello\nworld" {
-		t.Errorf("Content = %q", d.Content)
-	}
-}
-
-func TestAgentDetailModel_AppendContent(t *testing.T) {
-	d := NewAgentDetail("w-1", 80, 20)
-	d.SetContent("hello")
-	d.AppendContent(" world")
-	if d.Content != "hello world" {
-		t.Errorf("Content = %q", d.Content)
-	}
-}
-
-func TestAgentDetailModel_SetSize(t *testing.T) {
-	d := NewAgentDetail("w-1", 80, 20)
-	d.SetSize(100, 30)
-	if d.Viewport.Width != 100 {
-		t.Errorf("Width = %d, want 100", d.Viewport.Width)
-	}
-	if d.Viewport.Height != 30 {
-		t.Errorf("Height = %d, want 30", d.Viewport.Height)
-	}
-}
-
 func TestRenderAgentDetail_Basic(t *testing.T) {
 	theme := DefaultTheme()
 	info := &AgentInfo{
@@ -93,6 +52,18 @@ func TestRenderAgentDetail_TooSmall(t *testing.T) {
 	result := renderAgentDetail(theme, 5, 2, "w-1", nil, "")
 	if result != "" {
 		t.Error("should return empty for too-small dimensions")
+	}
+}
+
+// D5：terminating 状态与 dashboard 卡片渲染一致（"⊘ terminating"），
+// 不再落入 default 裸文本分支。
+func TestRenderAgentDetail_TerminatingState(t *testing.T) {
+	theme := DefaultTheme()
+	info := &AgentInfo{ID: "w-1", Type: "worker", State: "terminating"}
+	result := renderAgentDetail(theme, 80, 20, "w-1", info, "some output")
+
+	if !strings.Contains(result, "⊘ terminating") {
+		t.Errorf("terminating 状态应渲染为 ⊘ terminating（对齐 dashboard）: %q", result)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"agentgo/internal/model"
 )
@@ -32,6 +33,8 @@ type Store struct {
 	mu    sync.RWMutex
 	path  string
 	state persistentState
+	// persistCount 统计成功的原子落盘次数（C1 合并落盘的计数验证 / 可观测性）。
+	persistCount atomic.Int64
 }
 
 func NewMemoryStore() *Store {
@@ -178,6 +181,32 @@ func (s *Store) GetAcceptanceResult(planID, resultID string) (*model.AcceptanceR
 	return &cp, nil
 }
 
+// RebindDir 把持久化目标切换到 newPath（session 切换后的新 Session 目录），
+// 并立即把当前内存态完整落盘一次到新路径——使新 Session 目录从切换时刻起
+// 即为完整副本。语义（B2/B3 决策）：plan 运行时状态跨 session 连续，切换只
+// 迁移持久化位置，内存态不重置；旧路径文件保持切换时刻的内容（冻结，正确）。
+// 写新路径失败时返回错误且目标路径保持旧值，后续变更仍落旧目录。
+// newPath 为空串时仅切断持久化（等价退回内存态），不写盘。
+func (s *Store) RebindDir(newPath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if newPath != "" {
+		// s.state 在 OpenStore/update 出口均已 normalize，可直接落盘。
+		if err := writeStateAtomic(newPath, &s.state); err != nil {
+			return fmt.Errorf("rebind plan store: %w", err)
+		}
+		s.persistCount.Add(1)
+	}
+	s.path = newPath
+	return nil
+}
+
+// PersistCount 返回成功的原子落盘（全量 JSON + fsync + rename）总次数。
+// 用于 C1 合并落盘的计数验证与运行期可观测性。
+func (s *Store) PersistCount() int64 {
+	return s.persistCount.Load()
+}
+
 // update serializes all writers and commits the complete next state atomically.
 func (s *Store) update(fn func(*persistentState) error) error {
 	s.mu.Lock()
@@ -197,9 +226,61 @@ func (s *Store) update(fn func(*persistentState) error) error {
 		if err := writeStateAtomic(s.path, &next); err != nil {
 			return err
 		}
+		s.persistCount.Add(1)
 	}
 	s.state = next
 	return nil
+}
+
+// updateBatch 把多个变更闭包按序应用到【同一份】克隆状态上，全部处理完后
+// 一次性原子落盘并换入内存——N 条变更合并为 1 次全量 JSON 重写 + fsync（C1）。
+//
+// 失败语义与逐条 update 对齐：
+//   - 单闭包失败：状态回滚到该闭包之前的检查点（不影响批内已成功闭包），
+//     错误记入 errs[i]，批次继续；
+//   - 落盘本身失败：内存状态不前进（等价于整批未生效），此前成功的闭包统一
+//     改记落盘错误，供调用方按原语义重试。
+//
+// 返回值与 fns 对齐，errs[i]==nil 表示第 i 条闭包已包含在持久化状态中。
+func (s *Store) updateBatch(fns ...func(*persistentState) error) []error {
+	errs := make([]error, len(fns))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next, err := cloneJSON(s.state)
+	if err != nil {
+		for i := range errs {
+			errs[i] = err
+		}
+		return errs
+	}
+	normalizePersistentState(&next)
+	for i, fn := range fns {
+		// 每条闭包一份检查点：闭包可能写了一半才返回错误，必须整体回滚。
+		checkpoint, cpErr := cloneJSON(next)
+		if cpErr != nil {
+			errs[i] = cpErr
+			continue
+		}
+		if fnErr := fn(&next); fnErr != nil {
+			next = checkpoint
+			errs[i] = fnErr
+			continue
+		}
+		normalizePersistentState(&next)
+	}
+	if s.path != "" {
+		if err := writeStateAtomic(s.path, &next); err != nil {
+			for i := range errs {
+				if errs[i] == nil {
+					errs[i] = err
+				}
+			}
+			return errs
+		}
+		s.persistCount.Add(1)
+	}
+	s.state = next
+	return errs
 }
 
 func (s *Store) viewRecord(planID string) (*planRecord, error) {

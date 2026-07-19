@@ -54,6 +54,8 @@ func buildKindLLMClient(llmCfg config.LLMConfig, kindModel string) llm.Client {
 //   - SystemPrompt：从 kind.SystemPromptFile 读入到内存（启动期一次性读取，
 //     运行时 prompt 不可变，与 nextUpgrade_v4.md §11.9"配置热重载"边界一致）
 //   - AllowedTools：profile 名查 ToolProfiles 表 / 直接用 tools 字段
+//   - IdleThreshold：取全局 agent_idle_threshold（E3；AgentKind 无 per-kind
+//     覆盖字段，与 spawn 路径的 buildAdhocRuntime 一致）
 //
 // replicaIndex 从 1 开始（与 v3 worker-1/worker-2 命名风格一致）。
 func buildAgentRuntime(
@@ -62,14 +64,17 @@ func buildAgentRuntime(
 	toolProfiles map[string][]string,
 	allKinds []config.AgentKind,
 	replicaIndex int,
+	idleThreshold int,
 ) (config.AgentRuntimeConfig, error) {
 	// 解析工具集（profile 名查表 / tools 字段直接使用）
+	// D3：profile 解析统一委托 config.ResolveToolProfile（与 Config.ResolveProfile
+	// 同一实现），缺失即报错，不再内联 map 查找。
 	var allowed []string
 	if kind.Profile != "" {
-		toolList, ok := toolProfiles[kind.Profile]
-		if !ok {
+		toolList, err := config.ResolveToolProfile(toolProfiles, kind.Profile)
+		if err != nil {
 			return config.AgentRuntimeConfig{}, fmt.Errorf(
-				"kind=%q 引用的 profile %q 不存在于 tool_profiles", kind.Kind, kind.Profile)
+				"kind=%q 引用的 profile 解析失败: %w", kind.Kind, err)
 		}
 		allowed = toolList
 	} else if len(kind.Tools) > 0 {
@@ -94,7 +99,10 @@ func buildAgentRuntime(
 	}
 
 	// 构建团队能力感知提示词：列出系统中所有 Agent 类型及其能力边界
-	teamAwareness := buildTeamAwareness(kind, allKinds, toolProfiles)
+	teamAwareness, err := buildTeamAwareness(kind, allKinds, toolProfiles)
+	if err != nil {
+		return config.AgentRuntimeConfig{}, err
+	}
 
 	rt := config.AgentRuntimeConfig{
 		InstanceID:                   fmt.Sprintf("%s-%d", kind.Kind, replicaIndex),
@@ -108,6 +116,7 @@ func buildAgentRuntime(
 		EnforceCompactTokenThreshold: kind.EnforceCompactTokenThreshold,
 		ContextLimit:                 kind.ContextLimit,
 		TeamAwareness:                teamAwareness,
+		IdleThreshold:                idleThreshold,
 	}
 	return rt, nil
 }
@@ -115,11 +124,15 @@ func buildAgentRuntime(
 // buildTeamAwareness 构建团队能力感知提示词。
 // 列出系统中所有 Agent 类型（kind）的工具集与角色描述，帮助每个 Agent 了解
 // 协作者的能力边界，避免指派超出对方能力的任务。
+//
+// D3：profile 解析统一委托 config.ResolveToolProfile——非空 profile 缺失即报错
+// （原先静默忽略是 bug：team awareness 会把该 kind 展示为"无工具"，误导派发决策）；
+// profile 为空是合法配置（走 tools 直列字段），保持放行。
 func buildTeamAwareness(
 	myKind config.AgentKind,
 	allKinds []config.AgentKind,
 	toolProfiles map[string][]string,
-) string {
+) (string, error) {
 	var b strings.Builder
 	b.WriteString("\n# 团队能力感知（本次任务涉及以下 Agent 类型）\n\n")
 	b.WriteString("本次任务由多类 Agent 协作完成。以下为系统中各类 Agent 的能力清单，\n")
@@ -132,12 +145,15 @@ func buildTeamAwareness(
 			continue
 		}
 
-		// 解析工具集
+		// 解析工具集：非空 profile 必须解析成功（配置笔误应立即暴露）；
+		// profile 为空走 tools 直列字段（合法配置，不意味"无工具"）。
 		var tools []string
 		if k.Profile != "" {
-			if t, ok := toolProfiles[k.Profile]; ok {
-				tools = t
+			t, err := config.ResolveToolProfile(toolProfiles, k.Profile)
+			if err != nil {
+				return "", fmt.Errorf("kind=%q 的 team awareness 构建失败: %w", k.Kind, err)
 			}
+			tools = t
 		} else {
 			tools = k.Tools
 		}
@@ -169,7 +185,22 @@ func buildTeamAwareness(
 	b.WriteString("- 不要假设「所有 Agent 都有相同工具集」——不同 kind 的工具配置可能不同。\n")
 	b.WriteString("\n---\n")
 
-	return b.String()
+	return b.String(), nil
+}
+
+// resolveRouteCapabilities 解析静态 kind 注册 route 时的能力清单：
+// tools 直列字段优先；为空且声明了 profile 时经 cfg.ResolveProfile 解析
+// （D3：缺失即报错——原先裸 map 查找静默留 nil，靠启动校验兜底）。
+func resolveRouteCapabilities(cfg *config.Config, kind config.AgentKind) ([]string, error) {
+	caps := kind.Tools
+	if len(caps) == 0 && kind.Profile != "" {
+		resolved, err := cfg.ResolveProfile(kind.Profile)
+		if err != nil {
+			return nil, err
+		}
+		caps = resolved
+	}
+	return caps, nil
 }
 
 // buildSchedulerRuntime 为 scheduler 单例合成 AgentRuntimeConfig。

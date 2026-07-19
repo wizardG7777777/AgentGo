@@ -161,7 +161,8 @@ func (g PlanControlGroup) ensureAcceptanceRun(ctx context.Context, args map[stri
 	ctx = plan.WithControllerAuthority(ctx, controller.ID)
 	run, created, err := g.Coordinator.EnsureAcceptanceRun(ctx, plan.EnsureAcceptanceRunInput{
 		PlanID: p.ID, Scope: model.AcceptanceScope(scope), TargetTaskIDs: splitList(targets),
-		RunnerKind: runner, Description: description,
+		RunnerKind: runner, Description: description, ParentTaskID: controller.ID,
+		ReplyToAgentID: g.AgentID, BatchID: controller.ID,
 	})
 	if err != nil {
 		return "", err
@@ -399,7 +400,8 @@ func (g PlanControlGroup) resolvePause(ctx context.Context, args map[string]any)
 		resume = &model.Task{
 			ID: uuid.NewString(), PlanID: planID, NodeRole: model.PlanNodeRoleController,
 			PlanMutationSource: "control-reserved", EventType: "__scheduler__",
-			EventSource: controllerTask.ID, Priority: 100,
+			EventSource: controllerTask.ID, ParentTaskID: controllerTask.ID,
+			ReplyToAgentID: g.AgentID, BatchID: controllerTask.ID, Priority: 100,
 			Description: fmt.Sprintf("Resume dynamic plan %s after user selected %s: %s", planID, resolution, reason),
 		}
 	}

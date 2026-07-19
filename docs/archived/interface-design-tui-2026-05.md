@@ -1,3 +1,5 @@
+> **归档说明（2026-07-19）**：本文是 Web Dashboard 引入前的 TUI 接口设计记录。当前多前端边界、启动方式与安全约束以 [README.md](../../README.md)、[Archtechture.md](../../Archtechture.md) 和 internal/ui 为准。
+
 # 接口与结构体设计
 本文档记录系统核心组件的 Go 接口定义和数据结构，作为 Archtechture.md 中架构描述的代码层补充。
 

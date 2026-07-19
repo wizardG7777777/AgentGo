@@ -178,6 +178,9 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 		Description:        desc,
 		EventType:          eventType,
 		EventSource:        parentID,
+		ParentTaskID:       parentID,
+		ReplyToAgentID:     g.AgentID,
+		BatchID:            parentID,
 		Depth:              childDepth,
 		PlanMutationSource: g.PlanMutationSource,
 	}

@@ -4,6 +4,9 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
+
+	"agentgo/internal/agent"
 )
 
 func TestCommandFilter_Blacklist(t *testing.T) {
@@ -234,7 +237,7 @@ func TestWrapShellTool_Block(t *testing.T) {
 	}
 	filter := NewCommandFilter(DefaultBlacklist, nil)
 	approvalCh := make(chan ApprovalRequest, 1)
-	wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1")
+	wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1", nil)
 
 	_, err := wrapped(context.Background(), map[string]any{"command": "rm -rf /"})
 	if err == nil {
@@ -253,7 +256,7 @@ func TestWrapShellTool_Approve_Granted(t *testing.T) {
 	}
 	filter := NewCommandFilter(nil, DefaultGreylist)
 	approvalCh := make(chan ApprovalRequest, 1)
-	wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1")
+	wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1", nil)
 
 	// 模拟用户批准
 	go func() {
@@ -283,7 +286,7 @@ func TestWrapShellTool_Approve_Denied(t *testing.T) {
 	}
 	filter := NewCommandFilter(nil, DefaultGreylist)
 	approvalCh := make(chan ApprovalRequest, 1)
-	wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1")
+	wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1", nil)
 
 	go func() {
 		req := <-approvalCh
@@ -306,7 +309,7 @@ func TestWrapShellTool_Approve_UserGuidance(t *testing.T) {
 	}
 	filter := NewCommandFilter(nil, DefaultGreylist)
 	approvalCh := make(chan ApprovalRequest, 1)
-	wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1")
+	wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1", nil)
 
 	go func() {
 		req := <-approvalCh
@@ -389,7 +392,7 @@ func TestWrapShellTool_RememberPattern_PersistsForSession(t *testing.T) {
 	}
 	filter := NewCommandFilter(nil, DefaultGreylist)
 	approvalCh := make(chan ApprovalRequest, 1)
-	wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1")
+	wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1", nil)
 
 	// 第一次：用户回复 RememberPattern
 	go func() {
@@ -423,7 +426,7 @@ func TestWrapShellTool_Allow(t *testing.T) {
 	}
 	filter := NewCommandFilter(DefaultBlacklist, DefaultGreylist)
 	approvalCh := make(chan ApprovalRequest, 1)
-	wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1")
+	wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1", nil)
 
 	result, err := wrapped(context.Background(), map[string]any{"command": "go test ./..."})
 	if err != nil {
@@ -435,4 +438,196 @@ func TestWrapShellTool_Allow(t *testing.T) {
 	if result != "result" {
 		t.Errorf("result = %q, want result", result)
 	}
+}
+
+
+// ── A2：审批协议强化（RequestID/TaskID/cap-1 ReplyCh/等待钩子/取消文案）────
+
+func TestWrapShellTool_RequestCarriesIDsAndBufferedReplyCh(t *testing.T) {
+	inner := func(ctx context.Context, args map[string]any) (string, error) {
+		return "ok", nil
+	}
+	filter := NewCommandFilter(nil, DefaultGreylist)
+	approvalCh := make(chan ApprovalRequest, 2)
+	wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1", nil)
+
+	// 模拟工具执行 ctx（processTask 注入 taskID）
+	ctx := agent.WithAgentContext(context.Background(), "worker-1", "task-123", 0)
+
+	var firstID string
+	for i := 0; i < 2; i++ {
+		callDone := make(chan struct{})
+		go func() {
+			defer close(callDone)
+			_, _ = wrapped(ctx, map[string]any{"command": "git push origin main"})
+		}()
+
+		var req ApprovalRequest
+		select {
+		case req = <-approvalCh:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for approval request")
+		}
+		if req.RequestID == "" {
+			t.Error("RequestID 应非空（uuid）")
+		}
+		if i == 0 {
+			firstID = req.RequestID
+		} else if req.RequestID == firstID {
+			t.Error("两次审批的 RequestID 应唯一")
+		}
+		if req.TaskID != "task-123" {
+			t.Errorf("TaskID = %q, want task-123（取自工具执行 ctx）", req.TaskID)
+		}
+		if cap(req.ReplyCh) != 1 {
+			t.Errorf("ReplyCh cap = %d, want 1（先到先得，迟到的回复不阻塞发送方）", cap(req.ReplyCh))
+		}
+		req.ReplyCh <- ApprovalReply{Approved: true}
+		select {
+		case <-callDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("批准后 wrapped 未返回")
+		}
+	}
+}
+
+func TestWrapShellTool_NoTaskContext_TaskIDEmpty(t *testing.T) {
+	inner := func(ctx context.Context, args map[string]any) (string, error) {
+		return "ok", nil
+	}
+	filter := NewCommandFilter(nil, DefaultGreylist)
+	approvalCh := make(chan ApprovalRequest, 1)
+	wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1", nil)
+
+	go func() {
+		req := <-approvalCh
+		if req.TaskID != "" {
+			t.Errorf("无任务上下文时 TaskID 应为空，got %q", req.TaskID)
+		}
+		req.ReplyCh <- ApprovalReply{Approved: true}
+	}()
+
+	if _, err := wrapped(context.Background(), map[string]any{"command": "git push origin main"}); err != nil {
+		t.Fatalf("批准后应成功: %v", err)
+	}
+}
+
+// ctx 取消放弃等待：错误文案必须是"取消"而非"超时"（A2 误标修复）。
+func TestWrapShellTool_CancelWhileWaiting_ReportsCancellation(t *testing.T) {
+	inner := func(ctx context.Context, args map[string]any) (string, error) {
+		t.Fatal("取消后不应执行 inner")
+		return "", nil
+	}
+	filter := NewCommandFilter(nil, DefaultGreylist)
+	approvalCh := make(chan ApprovalRequest, 1)
+	wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1", nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	callDone := make(chan error, 1)
+	go func() {
+		_, err := wrapped(ctx, map[string]any{"command": "git push origin main"})
+		callDone <- err
+	}()
+
+	// 等审批请求发出（agent 已进入回复等待）再取消
+	select {
+	case <-approvalCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for approval request")
+	}
+	cancel()
+
+	select {
+	case err := <-callDone:
+		if err == nil {
+			t.Fatal("ctx 取消后应返回 error")
+		}
+		if !strings.Contains(err.Error(), "命令审批被取消（任务结束或系统关闭）") {
+			t.Errorf("取消文案错误，got: %s", err.Error())
+		}
+		if strings.Contains(err.Error(), "超时") {
+			t.Errorf("ctx 取消不应误报为超时，got: %s", err.Error())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ctx 取消后 wrapped 未返回")
+	}
+}
+
+// waitHook：进入回复阻塞前回调 true，等待结束后回调 false，严格成对有序。
+func TestWrapShellTool_WaitHook(t *testing.T) {
+	newHookRecorder := func() (func(bool), func() []bool) {
+		seq := make(chan bool, 8)
+		return func(waiting bool) { seq <- waiting },
+			func() []bool {
+				close(seq)
+				var out []bool
+				for v := range seq {
+					out = append(out, v)
+				}
+				return out
+			}
+	}
+
+	t.Run("批准后 true→false", func(t *testing.T) {
+		inner := func(ctx context.Context, args map[string]any) (string, error) {
+			return "ok", nil
+		}
+		filter := NewCommandFilter(nil, DefaultGreylist)
+		approvalCh := make(chan ApprovalRequest, 1)
+		hook, seq := newHookRecorder()
+		wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1", hook)
+
+		callDone := make(chan struct{})
+		go func() {
+			defer close(callDone)
+			_, _ = wrapped(context.Background(), map[string]any{"command": "git push origin main"})
+		}()
+
+		select {
+		case req := <-approvalCh:
+			req.ReplyCh <- ApprovalReply{Approved: true}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for approval request")
+		}
+		select {
+		case <-callDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("批准后 wrapped 未返回")
+		}
+		if got := seq(); len(got) != 2 || !got[0] || got[1] {
+			t.Errorf("hook 序列 = %v, want [true false]", got)
+		}
+	})
+
+	t.Run("ctx 取消也回调 false", func(t *testing.T) {
+		inner := func(ctx context.Context, args map[string]any) (string, error) {
+			return "", nil
+		}
+		filter := NewCommandFilter(nil, DefaultGreylist)
+		approvalCh := make(chan ApprovalRequest, 1)
+		hook, seq := newHookRecorder()
+		wrapped := WrapShellTool(inner, filter, approvalCh, "worker-1", hook)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		callDone := make(chan struct{})
+		go func() {
+			defer close(callDone)
+			_, _ = wrapped(ctx, map[string]any{"command": "git push origin main"})
+		}()
+
+		select {
+		case <-approvalCh:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for approval request")
+		}
+		cancel()
+		select {
+		case <-callDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("ctx 取消后 wrapped 未返回")
+		}
+		if got := seq(); len(got) != 2 || !got[0] || got[1] {
+			t.Errorf("hook 序列 = %v, want [true false]（取消路径也必须收尾）", got)
+		}
+	})
 }

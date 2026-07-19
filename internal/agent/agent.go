@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"agentgo/internal/llm"
@@ -115,7 +116,10 @@ type Agent struct {
 	// （仅 Layer 1 + Layer 2 压缩生效，与 v3 行为兼容）。详见 nextUpgrade_v4.md §11.7.5。
 	ContextLimit int
 	// TokenStats 是 Agent 级别的累计 Token 消耗（§11.7.3）。
+	// 运行期读写必须经 AddTokenStats / TokenStatsSnapshot（tokenMu 保护）——
+	// UI 轮询 goroutine 与 ReAct 循环并发访问该字段（A3 修复）。
 	TokenStats          TokenStats
+	tokenMu             sync.Mutex
 	OnTaskStart         func(taskID string)               // 任务开始处理时的回调，可选
 	OnTaskEnd           func(taskID string, success bool) // 任务结束回调（defer 保证触发），可选
 	FileCache           *FileStateCache                   // Agent 级别的文件读取缓存，可选
@@ -127,6 +131,12 @@ type Agent struct {
 	// 和 report_done 等输出会写入此处，而不是直接 fmt.Printf 到 stdout。
 	// TUI 模式下应设为一个把内容注入 Bubble Tea 消息流的 Writer。
 	UserOutput io.Writer
+
+	// ResultOutput 是任务最终结果块（"=== 任务完成 ==="）的输出目标。非 nil 时，
+	// IsUserFacing 的自然文本完成结果写入此处；nil 时回退到 UserOutput
+	// （兼容单 Writer 的既有装配）。bootstrap 将其接到 output.KindResult 事件
+	// writer，让"这是最终结果"的分类在产生处完成，消费方不再做子串匹配。
+	ResultOutput io.Writer
 
 	// IsUserFacing 标记此 agent 是否直接对话用户（典型为 scheduler）。
 	//
@@ -154,6 +164,12 @@ type Agent struct {
 	// 空串时使用默认 ".agentgo/reports"（相对于进程 CWD）。生产线无需设置，
 	// 测试用 t.TempDir() 注入隔离目录。详见 [[persistTextOnlySubmission]]。
 	TextOnlyReportsDir string
+
+	// OnTextOnlyPersisted 在 persistTextOnlySubmission 成功落盘后触发（可选）。
+	// 参数为落盘文件的完整路径与正文内容，供装配层把 text-only 结果结构化记入
+	// ResultSnapshot（E8：取代旧的 system.log 文本刮取恢复路径）。
+	// 正文为空或写入失败时不触发。
+	OnTextOnlyPersisted func(path, content string)
 
 	// ProgressNotifyEnabled 控制进度通知功能是否启用。
 	// 为 true 时，Agent 在文件写入、子任务发布或任务过半时通过 mailbox 发送进度消息。
@@ -187,14 +203,33 @@ func (a *Agent) transferNoteMaxTokens() int {
 	return 3000
 }
 
+// AddTokenStats 线程安全地累加一次 LLM 调用的 token 消耗，并返回累加后的
+// 一致快照（供 trace 事件等本 goroutine 后续使用，避免再次取锁）。
+func (a *Agent) AddTokenStats(prompt, completion int64) TokenStats {
+	a.tokenMu.Lock()
+	defer a.tokenMu.Unlock()
+	a.TokenStats.TotalPromptTokens += prompt
+	a.TokenStats.TotalCompletionTokens += completion
+	a.TokenStats.CallCount++
+	return a.TokenStats
+}
+
+// TokenStatsSnapshot 返回累计 token 统计的一致快照，供 UI 轮询等外部
+// goroutine 读取（A3：此前直接读字段，与 ReAct 循环的写入构成数据竞争）。
+func (a *Agent) TokenStatsSnapshot() TokenStats {
+	a.tokenMu.Lock()
+	defer a.tokenMu.Unlock()
+	return a.TokenStats
+}
+
 // emitTextOnlySubmissionIfNoArtifacts 在任务自然成功的两个出口（finalization 短路 +
 // react_loop_exit:natural）之后调用，判别本次提交是否属于"代理什么都没落盘，仅吐出
 // 一份文字汇报"——如是则同步做两件事：
 //
 //  1. **持久化兜底**：把 content 写到 .agentgo/reports/text_only_<task_id>.md。
 //     2026-05-18 TUI 死锁事故暴露的问题——scheduler 走 text-only 路径时
-//     正文只存在 ViewportCard 内存里，进程退出即丢，磁盘上无任何拷贝。
-//     此处兜底保证正文落盘，TUI 故障也不丢内容。
+//     正文只在内存里经 ResultOutput 流向 TUI 渲染，进程退出即丢，磁盘上无
+//     任何拷贝。此处兜底保证正文落盘，TUI 故障也不丢内容。
 //  2. **emit trace 事件**：让 reactor `on:` 直接订阅。
 //
 // 判别条件（全部满足）：
@@ -204,6 +239,14 @@ func (a *Agent) transferNoteMaxTokens() int {
 // Store=nil 或 GetTask 出错时跳过——只是少一次额外的可观察性事件，不影响主流程。
 // 文件写入失败仅打 stderr WARNING，不阻断主流程（与 trace.Emit 的"尽力记录"语义一致）。
 func (a *Agent) emitTextOnlySubmissionIfNoArtifacts(taskID, content string, loopsUsed int) {
+	a.emitTextOnlySubmissionIfNoArtifactsOpt(taskID, content, loopsUsed, true)
+}
+
+// emitTextOnlySubmissionIfNoArtifactsOpt 与上同，recordSnapshot=false 时仅
+// 落盘 + 发 trace 事件，不触发 OnTextOnlyPersisted 覆盖 ResultSnapshot——
+// 供 finalization 短路路径使用：report_done 已通过 ResultOutput 记录了权威
+// 结果，pre-tool 的 lastOutput 不应再覆盖它（A4×E8 接缝修复）。
+func (a *Agent) emitTextOnlySubmissionIfNoArtifactsOpt(taskID, content string, loopsUsed int, recordSnapshot bool) {
 	if content == "" || a.Store == nil {
 		return
 	}
@@ -214,7 +257,7 @@ func (a *Agent) emitTextOnlySubmissionIfNoArtifacts(taskID, content string, loop
 	if len(got.Artifacts) > 0 {
 		return
 	}
-	a.persistTextOnlySubmission(taskID, content)
+	a.persistTextOnlySubmissionOpt(taskID, content, recordSnapshot)
 	trace.Emit(trace.Event{
 		Kind:      trace.KindTextOnlySubmission,
 		TaskID:    taskID,
@@ -232,8 +275,18 @@ func (a *Agent) emitTextOnlySubmissionIfNoArtifacts(taskID, content string, loop
 // 失败语义：仅 stderr WARNING，不返回错误——持久化失败不应影响主流程的任务完成。
 // .agentgo/reports/ 不存在时自动创建（mkdir -p）。
 //
+// 写入成功后触发 OnTextOnlyPersisted（若已装配），把路径与正文结构化交给
+// 装配层记入 ResultSnapshot；上面的 log 行仅作观测日志，不再承担恢复职责（E8）。
+//
 // 测试钩子：可通过 TextOnlyReportsDir 字段覆盖默认 ".agentgo/reports" 目录，便于单测隔离。
 func (a *Agent) persistTextOnlySubmission(taskID, content string) {
+	a.persistTextOnlySubmissionOpt(taskID, content, true)
+}
+
+// persistTextOnlySubmissionOpt 同上；recordSnapshot=false 时跳过
+// OnTextOnlyPersisted 回调（仅落盘 + 观测日志），见
+// emitTextOnlySubmissionIfNoArtifactsOpt 的接缝说明。
+func (a *Agent) persistTextOnlySubmissionOpt(taskID, content string, recordSnapshot bool) {
 	if content == "" {
 		return
 	}
@@ -251,6 +304,9 @@ func (a *Agent) persistTextOnlySubmission(taskID, content string) {
 		return
 	}
 	log.Printf("[agent %s] text-only submission 已落盘: %s (%d 字节)", a.ID, path, len(content))
+	if recordSnapshot && a.OnTextOnlyPersisted != nil {
+		a.OnTextOnlyPersisted(path, content)
+	}
 }
 
 // Run starts the agent's main loop. It polls for available tasks and processes them.
@@ -449,8 +505,8 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				AgentID: a.ID,
 				Reason:  reason,
 				Transition: &trace.Transition{
-					PrevStatus: "processing",
-					NewStatus:  "failed",
+					PrevStatus: string(model.TaskStatusProcessing),
+					NewStatus:  string(model.TaskStatusFailed),
 					Cause:      "react_loop_exit:panic",
 				},
 			})
@@ -470,8 +526,8 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		TaskID:  taskID,
 		AgentID: a.ID,
 		Transition: &trace.Transition{
-			PrevStatus: "pending",
-			NewStatus:  "processing",
+			PrevStatus: string(model.TaskStatusPending),
+			NewStatus:  string(model.TaskStatusProcessing),
 			Cause:      "task_claimed:" + taskID,
 		},
 	})
@@ -600,18 +656,31 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				terminatingCause = "react_loop_exit:cancel"
 			}
 			enterTerminating(terminatingCause)
-			trace.Emit(trace.Event{
-				Kind:    trace.KindTaskCancelled,
-				TaskID:  taskID,
-				AgentID: a.ID,
-				Loop:    i,
-				Reason:  ctx.Err().Error(),
-				Transition: &trace.Transition{
-					PrevStatus:   "processing",
-					NewStatus:    "cancelled",
-					CancelSource: cancelSource,
-				},
-			})
+			// FailTaskBySystem also cancels the task context so the worker exits.
+			// In that case the Store has already emitted the authoritative failed
+			// terminal event; emitting cancelled here would create contradictory
+			// terminal facts. A real cancellation has Store status cancelled and
+			// remains observable. Pending (retry) and other terminal states are
+			// likewise owned by their state-transition path.
+			emitCancelled := true
+			if current, getErr := a.Store.GetTask(taskID); getErr == nil && current != nil {
+				emitCancelled = current.Status == model.TaskStatusProcessing ||
+					current.Status == model.TaskStatusCancelled
+			}
+			if emitCancelled {
+				trace.Emit(trace.Event{
+					Kind:    trace.KindTaskCancelled,
+					TaskID:  taskID,
+					AgentID: a.ID,
+					Loop:    i,
+					Reason:  ctx.Err().Error(),
+					Transition: &trace.Transition{
+						PrevStatus:   string(model.TaskStatusProcessing),
+						NewStatus:    string(model.TaskStatusCancelled),
+						CancelSource: cancelSource,
+					},
+				})
+			}
 			return
 		default:
 		}
@@ -673,14 +742,16 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					OutputLen: len(lastOutput),
 					LoopsUsed: i,
 				})
-				a.emitTextOnlySubmissionIfNoArtifacts(taskID, lastOutput, i)
+				// finalization 短路：report_done 已通过 ResultOutput 记录权威结果，
+				// text-only 兜底仅落盘留档，不覆盖 ResultSnapshot（A4×E8 接缝）。
+				a.emitTextOnlySubmissionIfNoArtifactsOpt(taskID, lastOutput, i, false)
 				trace.Emit(trace.Event{
 					Kind:    trace.KindTaskCompleted,
 					TaskID:  taskID,
 					AgentID: a.ID,
 					Transition: &trace.Transition{
-						PrevStatus: "processing",
-						NewStatus:  "completed",
+						PrevStatus: string(model.TaskStatusProcessing),
+						NewStatus:  string(model.TaskStatusCompleted),
 						Cause:      "finalization_short_circuit",
 					},
 				})
@@ -783,9 +854,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		// §11.7.3 TokenStats 累计——仅落盘到 trace JSONL,不打 stderr。
 		// 长任务下每轮 log.Printf 会刷掉真正重要的错误/警告;排查时按需
 		// `grep token_stats .agentgo/traces/*.jsonl | jq` 即可复盘成本曲线。
-		a.TokenStats.TotalPromptTokens += int64(result.PromptTokens)
-		a.TokenStats.TotalCompletionTokens += int64(result.CompletionTokens)
-		a.TokenStats.CallCount++
+		tokenTotals := a.AddTokenStats(int64(result.PromptTokens), int64(result.CompletionTokens))
 		trace.Emit(trace.Event{
 			Kind:                  trace.KindTokenStats,
 			TaskID:                taskID,
@@ -793,9 +862,9 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			Loop:                  i,
 			PromptTokens:          result.PromptTokens,
 			CompletionTokens:      result.CompletionTokens,
-			TotalPromptTokens:     a.TokenStats.TotalPromptTokens,
-			TotalCompletionTokens: a.TokenStats.TotalCompletionTokens,
-			CallCount:             a.TokenStats.CallCount,
+			TotalPromptTokens:     tokenTotals.TotalPromptTokens,
+			TotalCompletionTokens: tokenTotals.TotalCompletionTokens,
+			CallCount:             tokenTotals.CallCount,
 		})
 
 		// 终止条件：LLM 没有调用工具（自然完成），或 Executor 返回 Finalized=true（finalization tool 信号）
@@ -809,8 +878,14 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			//
 			// 详见 Agent.IsUserFacing 字段注释。
 			if a.IsUserFacing && !result.ToolCalled && lastOutput != "" {
-				if a.UserOutput != nil {
-					fmt.Fprintf(a.UserOutput, "\n=== 任务完成 ===\n%s\n================\n\n", lastOutput)
+				// 结果块优先写 ResultOutput（KindResult 分类在产生处完成）；
+				// 未装配 ResultOutput 时回退 UserOutput（单 Writer 用法兼容）。
+				resultOut := a.ResultOutput
+				if resultOut == nil {
+					resultOut = a.UserOutput
+				}
+				if resultOut != nil {
+					fmt.Fprintf(resultOut, "\n=== 任务完成 ===\n%s\n================\n\n", lastOutput)
 				} else {
 					log.Printf("=== 任务完成 ===\n%s\n================", lastOutput)
 				}
@@ -886,8 +961,8 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					TaskID:  taskID,
 					AgentID: a.ID,
 					Transition: &trace.Transition{
-						PrevStatus: "processing",
-						NewStatus:  "completed",
+						PrevStatus: string(model.TaskStatusProcessing),
+						NewStatus:  string(model.TaskStatusCompleted),
 						Cause:      "react_loop_exit:natural",
 					},
 				})
@@ -992,8 +1067,8 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			Reason:    "max_loops: " + reason,
 			AttemptNo: task.RetryCount,
 			Transition: &trace.Transition{
-				PrevStatus: "processing",
-				NewStatus:  "pending",
+				PrevStatus: string(model.TaskStatusProcessing),
+				NewStatus:  string(model.TaskStatusPending),
 				Cause:      "max_loops_exceeded",
 				RetryCount: task.RetryCount,
 			},
@@ -1078,8 +1153,8 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 				Reason:    "recoverable_error: " + execErr.Error(),
 				AttemptNo: task.RetryCount,
 				Transition: &trace.Transition{
-					PrevStatus: "processing",
-					NewStatus:  "pending",
+					PrevStatus: string(model.TaskStatusProcessing),
+					NewStatus:  string(model.TaskStatusPending),
 					Cause:      "recoverable_error",
 					RetryCount: task.RetryCount,
 				},
@@ -1125,8 +1200,8 @@ func (a *Agent) terminateTask(task *model.Task, taskID string, reason string, ca
 		AgentID: a.ID,
 		Reason:  reason,
 		Transition: &trace.Transition{
-			PrevStatus: "processing",
-			NewStatus:  "failed",
+			PrevStatus: string(model.TaskStatusProcessing),
+			NewStatus:  string(model.TaskStatusFailed),
 			Cause:      cause,
 			RetryCount: retryCount,
 		},
@@ -1134,8 +1209,9 @@ func (a *Agent) terminateTask(task *model.Task, taskID string, reason string, ca
 	a.sendCrashReport(task, taskID, reason)
 }
 
-// sendCrashReport 向 task.EventSource 发送结构化崩溃通知。
-// 没有 EventSource 或没有邮箱注册表时静默跳过（避免在测试场景报错）。
+// sendCrashReport 向 task.ReplyToAgentID 发送结构化崩溃通知。
+// 旧任务仅在 EventSource 确实对应已注册邮箱时兼容回退；父 Task UUID
+// 绝不会再被误当成收件人。没有可路由收件人时静默跳过。
 //
 // 邮件正文不仅包含失败原因，还会附上：
 //   - 任务实际写入的文件清单（task.Artifacts）—— 让 scheduler 立刻知道
@@ -1146,12 +1222,17 @@ func (a *Agent) terminateTask(task *model.Task, taskID string, reason string, ca
 // 重新读取一次 task 是因为 reason 路径里 task 指针可能已陈旧，
 // 没拿到 RecordLastResponse / AppendArtifact 的最新写入。
 func (a *Agent) sendCrashReport(task *model.Task, taskID string, reason string) {
-	if a.MailRegistry == nil || task == nil || task.EventSource == "" || task.EventSource == "user" {
+	if a.MailRegistry == nil || task == nil {
 		return
 	}
 	// 重读 task 以拿到最新的 Artifacts / LastResponse
 	if fresh, err := a.Store.GetTask(taskID); err == nil && fresh != nil {
 		task = fresh
+	}
+	recipient := a.MailRegistry.ResolveReplyRecipient(
+		task.ReplyToAgentID, task.EventSource, task.ID, task.ParentTaskID)
+	if recipient == "" {
+		return
 	}
 	desc := task.Description
 	if len([]rune(desc)) > 100 {
@@ -1189,7 +1270,7 @@ func (a *Agent) sendCrashReport(task *model.Task, taskID string, reason string) 
 
 	msg := mailbox.Message{
 		From:     a.ID,
-		To:       task.EventSource,
+		To:       recipient,
 		Type:     mailbox.MsgTypeInfo,
 		Priority: mailbox.PriorityHigh,
 		Summary:  summary,
@@ -1199,7 +1280,7 @@ func (a *Agent) sendCrashReport(task *model.Task, taskID string, reason string) 
 	if err := a.MailRegistry.Send(msg); err != nil {
 		log.Printf("[agent %s] 发送崩溃汇报失败: %v", a.ID, err)
 	} else {
-		log.Printf("[agent %s] 已向 %s 汇报任务 %s 崩溃", a.ID, task.EventSource, taskID[:8])
+		log.Printf("[agent %s] 已向 %s 汇报任务 %s 崩溃", a.ID, recipient, taskID[:8])
 	}
 }
 

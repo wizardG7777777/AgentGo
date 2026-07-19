@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"strings"
 
-	"agentgo/internal/shell"
+	"agentgo/internal/ui"
 )
 
 // renderApprovalBar draws the approval panel when a request is active.
-func renderApprovalBar(t Theme, w int, req shell.ApprovalRequest, queueLen int) string {
+func renderApprovalBar(t Theme, w int, req ui.ApprovalItem, queueLen int) string {
 	innerW := w - 4
 	if innerW < 20 {
 		innerW = 20

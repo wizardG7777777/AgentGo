@@ -1,0 +1,74 @@
+# KNOWN_ISSUES — 当前限制与验证缺口
+
+最后核对：2026-07-19。
+
+本文件只记录当前仍会影响使用、开发或发布判断的限制。2026-07-18 UI Hub 改造的 41 项问题均已修复，原始核查与测试证据已归档至 [ui-hub-remediation-2026-07-18.md](../archived/ui-hub-remediation-2026-07-18.md)。截至本次核对，没有把已修复条目重新列为开放缺陷。
+
+## 运行与安全
+
+### LLM 凭证不会在启动期完全验证
+
+`llm.default_model`（或 `scheduler.model`）必须存在，但空/失效 API key 通常不会阻止进程、TUI 或 Web Dashboard 启动。首次实际 LLM 调用才会暴露认证、模型或 provider 错误。
+
+- 影响：可用 `-skip-startup-probe` 启动 UI 做配置和界面验证，但不能把“进程已启动”视为 LLM 可用。
+- 处置：使用 `${OPENAI_API_KEY}` 等环境变量；部署前发送一次低风险请求并检查结果/Trace。
+
+### Web Dashboard 是受控管理面，不是只读页面
+
+它拥有提交输入、取消 Task、发送引导、审批、模式和 Session 操作。默认监听 `127.0.0.1:8399`；若监听非 loopback 地址，配置校验会强制要求 `ui.web.token`。
+
+- 影响：不要把端口直接暴露到 LAN/公网，也不要把 LLM API key 当作 Dashboard token。
+- 处置：本机使用 loopback；远程使用独立强 token、受信任的反向代理/TLS 和网络访问控制。
+
+### 同一运行时只能有一个实例
+
+`.agentgo/agentgo.lock` 防止两个进程同时写 Session、trace 和原子文件。异常终止可能留下陈旧锁；Windows 下下一次启动会给出清理指引。
+
+- 影响：不能通过同一个 `project_root` 并发启动多个 AgentGo 实例。
+- 处置：正常退出；若确认没有存活进程，再按启动提示移除该项目运行目录中的陈旧锁。
+
+## 已知功能边界
+
+### Memory 目前只支持进程内存储
+
+`internal/memory` 的 `ProcessStore` 可用，但 Session/Project 持久化后端尚未实现；`QueryByVector` 明确返回 `ErrNotImplemented`。
+
+- 影响：重启后不能依赖 Memory 保留长期知识，也不能使用向量查询。
+- 路线图：[MemoryManageSystem.md](MemoryManageSystem.md)。
+
+### Shell 超时处理仍是固定超时
+
+当前有 Shell 拦截和审批，但没有 `shell_commands.yaml` 持久化规则、`ShellCommandGate` 重构或可插拔 `TimeoutHandler`。`shell_timeout_pending` 与 `shell_timeout_resolved` 是被拒绝订阅的 reserved event kind，不会发射。
+
+- 影响：不要在用户 Reactor 中订阅这两个 kind，也不要假定 Shell 超时可以交互式续时或截断。
+- 路线图：[ToolUpgradePlan.md](ToolUpgradePlan.md)。
+
+### 用户 Reactor 的 prompt/lifecycle 有意受限
+
+用户 Reactor 目前只支持文件型 prompt；`prompt.url`、`prompt.inline` 会在加载时报错。`spawn_agent` 只支持 `one_shot` lifecycle。
+
+- 影响：配置这些预留字段会导致启动失败，不能视为兼容的未来配置。
+- 处置：使用 `prompt.file` 和 `one_shot`；其他形态需先实现并补测试。
+
+### 引用幻觉没有独立的强制防线
+
+目前没有 `CitationVerifierHook`、`RetrievalGate` 或专门的端到端引用真实性基线。Trace 可用于事后审计，但不等价于验证外部引用或模型知识。
+
+- 影响：对外部事实、链接和引用的结果仍需由调用方复核。
+- 历史审计：[hallucination-acceptance-audit-2026-05.md](../archived/hallucination-acceptance-audit-2026-05.md)。
+
+## 验证缺口
+
+完整单元/集成测试应运行 `go test ./...` 和 `go vet ./...`。涉及并发变更时，还应在安装 C 编译器的环境执行：
+
+```text
+go test -race ./...
+```
+
+2026-07-19 已在 Windows 完成全仓测试、`go vet` 与构建，并在 WSL/GCC 下完成全仓 `-race`。Bubble Tea 的非 TTY 输入现显式读取调用方 stdin 并把 EOF 视为正常退出，相关 Windows 跳过已移除；后续仍应把 Windows、macOS、Linux 验证保持为发布门。
+
+## 维护规则
+
+- 新的、可复现且尚未修复的问题在这里记录影响、复现/证据、临时处置和归属。
+- 修复后从本文件移除；若修复过程值得保留，迁移到 `docs/archived/` 并在提交中链接测试。
+- 不把设计愿望、已完成任务或推测性风险伪装成当前 bug。

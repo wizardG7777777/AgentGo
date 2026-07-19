@@ -2,6 +2,8 @@ package spawn
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +14,17 @@ import (
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
 )
+
+// writeTempPrompt 写一个最小 system prompt 临时文件，返回 forward-slash 路径
+// （config 校验规则 9 拒绝反斜杠；/dev/null 在 Windows 上不存在）。
+func writeTempPrompt(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "prompt.md")
+	if err := os.WriteFile(path, []byte("test prompt"), 0o600); err != nil {
+		t.Fatalf("write prompt file: %v", err)
+	}
+	return filepath.ToSlash(path)
+}
 
 // TestManager_Reactor_CleansUpOnTaskCompleted 直接测 Manager 的 reactor.Reactor
 // 实现：构造一个假的 active spawn，发 KindTaskCompleted 事件，验证 cancel 被调用
@@ -70,12 +83,13 @@ func TestManager_Reactor_IgnoresUnknownTaskID(t *testing.T) {
 func TestManager_Reactor_SubscribesToTerminalEvents(t *testing.T) {
 	m := NewManager(&config.Config{}, runner.RunnerDeps{}, nil, nil)
 	subs := m.Subscribe()
-	if len(subs) != 3 {
-		t.Fatalf("expected 3 subscriptions, got %d", len(subs))
+	if len(subs) != 4 {
+		t.Fatalf("expected 4 subscriptions, got %d", len(subs))
 	}
 	wantSet := map[trace.EventKind]struct{}{
 		trace.KindTaskCompleted: {},
 		trace.KindTaskFailed:    {},
+		trace.KindTaskBlocked:   {},
 		trace.KindTaskCancelled: {},
 	}
 	for _, s := range subs {
@@ -171,7 +185,7 @@ func TestManager_Spawn_PublishesInitialTaskDepth(t *testing.T) {
 		Agents: []config.AgentKind{{
 			Kind:             "explorer",
 			Tools:            []string{"read_file"},
-			SystemPromptFile: "/dev/null",
+			SystemPromptFile: writeTempPrompt(t),
 		}},
 	}
 	taskStore := store.NewMemoryTaskStore(nil, 0, 1, 60)
@@ -183,6 +197,9 @@ func TestManager_Spawn_PublishesInitialTaskDepth(t *testing.T) {
 	_, taskID, err := m.Spawn(context.Background(), SpawnRequest{
 		BaseKind:               "explorer",
 		InitialTaskDescription: "x",
+		SourceTaskID:           "source-task-1",
+		ReplyToAgentID:         "worker-1",
+		BatchID:                "batch-1",
 		Depth:                  4,
 	})
 	if err != nil {
@@ -197,6 +214,9 @@ func TestManager_Spawn_PublishesInitialTaskDepth(t *testing.T) {
 	if task.Depth != 4 {
 		t.Fatalf("Depth=%d want 4", task.Depth)
 	}
+	if task.ParentTaskID != "source-task-1" || task.ReplyToAgentID != "worker-1" || task.BatchID != "batch-1" {
+		t.Fatalf("spawned task routing metadata = %+v", task)
+	}
 	if got := m.ActiveCount(); got != 1 {
 		t.Fatalf("ActiveCount=%d want 1 before terminal cleanup", got)
 	}
@@ -208,7 +228,7 @@ func TestManager_KindOf_PersistsAfterSpawnCleanup(t *testing.T) {
 		Agents: []config.AgentKind{{
 			Kind:             "explorer",
 			Tools:            []string{"read_file"},
-			SystemPromptFile: "/dev/null",
+			SystemPromptFile: writeTempPrompt(t),
 		}},
 	}
 	taskStore := store.NewMemoryTaskStore(nil, 0, 1, 60)

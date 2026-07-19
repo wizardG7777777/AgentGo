@@ -12,6 +12,151 @@ import (
 	"time"
 )
 
+// artifactSyncBatchSize / artifactSyncInterval 是 artifacts.jsonl
+// group-commit 的默认批参数：积累 32 条未同步记录，或首个未同步记录
+// 等待满 200ms，触发一次 fsync（取先到期者）。
+const (
+	artifactSyncBatchSize = 32
+	artifactSyncInterval  = 200 * time.Millisecond
+)
+
+// syncFile 是 *os.File 的最小接口缝——测试用计数实现替换，统计 Sync 次数。
+type syncFile interface {
+	Write(p []byte) (int, error)
+	Sync() error
+	Close() error
+}
+
+// artifactGroupCommitter 实现 group-commit 的 fsync 批处理（C3，2026-07-18）。
+// 与 internal/session/history.go 的 groupCommitter 是同构的最小重复实现：
+// 刻意不抽取共享类型——store 已 import session（memory.go），反向共享会
+// 把持久化原语耦合进 session 包；且两边闭合错误值不同（各自
+// ErrArtifactLogClosed / ErrHistoryLogClosed），重复 ~60 行换零耦合。
+//
+// 设计决策（与"全内存缓冲"方案的分歧说明）：
+//   - Append 立即把字节写进 OS（write 系统调用，write-through），不在内存
+//     bufio 里攒批——进程内其他句柄直接读文件立即可见，且进程崩溃不丢
+//     数据；昂贵的是 fsync（毫秒级）而非 write（微秒级），批掉 fsync 已
+//     拿到几乎全部收益。
+//   - fsync 触发条件（满足其一）：
+//     (a) 未同步条目达到 batchSize——由触发满批的那次 Append 同步执行；
+//     (b) 距首个未同步条目超过 interval——定时 goroutine 执行；
+//     (c) Close——停机前兜底同步。
+//
+// 耐久性窗口：机器级崩溃（掉电/内核 panic）最多丢失最后 interval（200ms）
+// 内已 Append 的记录；进程崩溃不丢（字节已在 OS 页缓存）。对
+// artifacts.jsonl 观测日志属可接受代价。
+//
+// 生产读取路径核查（2026-07-18 grep）：artifacts.jsonl 仅 Replay 读取，
+// 且生产仅 bootstrap 启动时在导入任务前调用一次（F12 另案跟踪时序问题），
+// 运行期无读取方。
+type artifactGroupCommitter struct {
+	mu        sync.Mutex
+	file      syncFile
+	pending   int
+	closed    bool
+	batchSize int
+	interval  time.Duration
+	timer     *time.Timer
+	stopCh    chan struct{}
+	exitedCh  chan struct{} // 定时 goroutine 退出时关闭（Close 等待、测试断言无泄漏）
+}
+
+func newArtifactGroupCommitter(file syncFile, batchSize int, interval time.Duration) *artifactGroupCommitter {
+	if batchSize <= 0 {
+		batchSize = artifactSyncBatchSize
+	}
+	if interval <= 0 {
+		interval = artifactSyncInterval
+	}
+	timer := time.NewTimer(interval)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	c := &artifactGroupCommitter{
+		file: file, batchSize: batchSize, interval: interval,
+		timer: timer, stopCh: make(chan struct{}), exitedCh: make(chan struct{}),
+	}
+	go c.run()
+	return c
+}
+
+// run 是定时 fsync goroutine：timer 每次触发后检查是否有未同步条目；
+// 收到停止信号立即退出。timer 由首个 pending 条目重新武装。
+func (c *artifactGroupCommitter) run() {
+	defer close(c.exitedCh)
+	for {
+		select {
+		case <-c.timer.C:
+			c.mu.Lock()
+			if !c.closed && c.pending > 0 {
+				if err := c.file.Sync(); err != nil {
+					log.Printf("[ArtifactLog] WARN 定时 fsync 失败: %v", err)
+				} else {
+					c.pending = 0
+				}
+			}
+			c.mu.Unlock()
+		case <-c.stopCh:
+			c.timer.Stop()
+			return
+		}
+	}
+}
+
+// append 写入一行（data + '\n'）。字节立即落到 OS；fsync 按 group-commit
+// 规则批处理。closed 后返回 ErrArtifactLogClosed。
+func (c *artifactGroupCommitter) append(data []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return ErrArtifactLogClosed
+	}
+	if _, err := c.file.Write(data); err != nil {
+		return fmt.Errorf("写入 artifact log 失败: %w", err)
+	}
+	if _, err := c.file.Write([]byte{'\n'}); err != nil {
+		return fmt.Errorf("写入换行失败: %w", err)
+	}
+	c.pending++
+	if c.pending == 1 {
+		c.timer.Reset(c.interval)
+	}
+	if c.pending >= c.batchSize {
+		if err := c.file.Sync(); err != nil {
+			return fmt.Errorf("fsync artifact log 失败: %w", err)
+		}
+		c.pending = 0
+	}
+	return nil
+}
+
+// close 兜底 fsync（仅当还有未同步条目）、停止定时 goroutine 并等待其
+// 退出（无泄漏），最后关闭文件。幂等。
+func (c *artifactGroupCommitter) close() error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	c.closed = true
+	var syncErr error
+	if c.pending > 0 {
+		if err := c.file.Sync(); err != nil {
+			syncErr = fmt.Errorf("fsync artifact log 失败: %w", err)
+		}
+		c.pending = 0
+	}
+	c.mu.Unlock()
+
+	close(c.stopCh)
+	<-c.exitedCh
+	if err := c.file.Close(); err != nil && syncErr == nil {
+		syncErr = err
+	}
+	return syncErr
+}
+
 // ArtifactLog 是 task.Artifacts 的追加式持久化日志。
 //
 // 设计原则（参见 nextUpgrade_v3.md §9.6 决策讨论）：
@@ -28,9 +173,10 @@ import (
 //     写入交错（即便单行 JSON < 4KB 在 POSIX 上理论上是原子 write，
 //     Windows 上不保证，所以依然上锁）。
 //
-//   - **崩溃安全**：每次追加后调 File.Sync()，保证 fsync 落盘。进程崩溃
-//     最多丢失最后一条未 Sync 的 record；系统崩溃取决于 OS 刷盘时机。
-//     MVP 阶段这个保证足够。
+//   - **崩溃安全（C3 起为 group-commit）**：Append write-through 到 OS
+//     （进程崩溃不丢），fsync 按批触发（满 32 条 / 200ms / Close）。
+//     机器级崩溃最多丢失最后 200ms 的记录——详见
+//     artifactGroupCommitter 文档。
 //
 //   - **不压缩**：MVP 规模下日志增长可控（100 任务/天 × 3 artifact/任务 ×
 //     1 年 ≈ 10 万行 / 10 MB）。等到真的超过 100 MB 或重放时间 > 1s 时
@@ -52,11 +198,8 @@ import (
 //	taskStore.SetArtifactLog(log)
 //	taskStore.RestoreArtifacts(rebuilt)  // 把重放结果推回任务
 type ArtifactLog struct {
-	mu     sync.Mutex
-	file   *os.File
-	writer *bufio.Writer
-	path   string
-	closed bool
+	path string
+	gc   *artifactGroupCommitter
 }
 
 // artifactLogRecord 是 JSONL 文件里单行的结构。
@@ -81,11 +224,13 @@ func OpenArtifactLog(dir string) (*ArtifactLog, error) {
 	if err != nil {
 		return nil, fmt.Errorf("打开 artifact log 失败 %s: %w", path, err)
 	}
-	return &ArtifactLog{
-		file:   f,
-		writer: bufio.NewWriter(f),
-		path:   path,
-	}, nil
+	return newArtifactLog(f, path, artifactSyncBatchSize, artifactSyncInterval), nil
+}
+
+// newArtifactLog 是测试接缝：允许注入计数 syncFile 与自定义批参数，
+// 生产路径统一走 OpenArtifactLog。
+func newArtifactLog(file syncFile, path string, batchSize int, interval time.Duration) *ArtifactLog {
+	return &ArtifactLog{path: path, gc: newArtifactGroupCommitter(file, batchSize, interval)}
 }
 
 // Path 返回 log 文件的绝对路径，供调试和日志打印。
@@ -95,17 +240,11 @@ func (l *ArtifactLog) Path() string {
 
 // Append 把一条 (taskID, path) 追加到 log。
 // 线程安全——内部 Mutex 保证顺序追加。
-// 每次追加后立即 flush + fsync，保证崩溃安全（代价是每次 ~1ms 的 IO）。
+// 字节立即对进程内读者可见；fsync 按 group-commit 批处理（耐久性窗口见
+// artifactGroupCommitter 文档）。
 //
 // 如果 log 已关闭，返回 ErrArtifactLogClosed。
 func (l *ArtifactLog) Append(taskID string, path string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.closed {
-		return ErrArtifactLogClosed
-	}
-
 	rec := artifactLogRecord{
 		Timestamp: time.Now().UTC(),
 		TaskID:    taskID,
@@ -115,20 +254,7 @@ func (l *ArtifactLog) Append(taskID string, path string) error {
 	if err != nil {
 		return fmt.Errorf("序列化 artifact record 失败: %w", err)
 	}
-	// Write + "\n" + Flush + Sync
-	if _, err := l.writer.Write(data); err != nil {
-		return fmt.Errorf("写入 artifact log 失败: %w", err)
-	}
-	if err := l.writer.WriteByte('\n'); err != nil {
-		return fmt.Errorf("写入换行失败: %w", err)
-	}
-	if err := l.writer.Flush(); err != nil {
-		return fmt.Errorf("flush artifact log 失败: %w", err)
-	}
-	if err := l.file.Sync(); err != nil {
-		return fmt.Errorf("fsync artifact log 失败: %w", err)
-	}
-	return nil
+	return l.gc.append(data)
 }
 
 // Replay 从头到尾读取 log，返回 taskID → 去重后的文件路径列表。
@@ -140,16 +266,17 @@ func (l *ArtifactLog) Append(taskID string, path string) error {
 // 可以加一个 Strict mode。
 //
 // Replay 不修改 log 文件状态，可多次调用（但通常只在 bootstrap 调一次）。
-// 不自动 seek 写入头——Append 仍然追加到文件末尾。
+// Append 是 write-through，因此 Replay 看到的就是最新内容（含未 fsync 的行）。
 func (l *ArtifactLog) Replay() (map[string][]string, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	// 持锁重放：与 Append 互斥（沿袭旧语义），避免读到写到一半的行。
+	l.gc.mu.Lock()
+	defer l.gc.mu.Unlock()
 
-	if l.closed {
+	if l.gc.closed {
 		return nil, ErrArtifactLogClosed
 	}
 
-	// 打开一个只读句柄——不使用 l.file，因为它是 O_APPEND|O_WRONLY。
+	// 打开一个只读句柄——不使用写句柄，因为它是 O_APPEND|O_WRONLY。
 	f, err := os.Open(l.path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -200,23 +327,11 @@ func (l *ArtifactLog) Replay() (map[string][]string, error) {
 	return result, nil
 }
 
-// Close 刷新缓冲并关闭底层文件。Close 后再调 Append 会返回
-// ErrArtifactLogClosed。可以安全地多次 Close（幂等）。
+// Close 兜底 fsync 未同步条目、停止定时 goroutine（无泄漏）并关闭文件。
+// Close 后再调 Append 会返回 ErrArtifactLogClosed。可以安全地多次
+// Close（幂等）。
 func (l *ArtifactLog) Close() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.closed {
-		return nil
-	}
-	l.closed = true
-	if l.writer != nil {
-		_ = l.writer.Flush()
-	}
-	if l.file != nil {
-		return l.file.Close()
-	}
-	return nil
+	return l.gc.close()
 }
 
 // ErrArtifactLogClosed 是 Append / Replay 在 log 已关闭后的返回错误。

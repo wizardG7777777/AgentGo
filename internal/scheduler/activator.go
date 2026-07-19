@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -230,6 +231,12 @@ func (a *Activator) handleEvent(evt model.Event) {
 		text := ""
 		if evt.Payload != nil {
 			text = evt.Payload["text"]
+		}
+		trimmed := strings.TrimSpace(text)
+		if strings.HasPrefix(trimmed, "/") {
+			command := strings.Fields(trimmed)[0]
+			log.Printf("[scheduler-activator] 拒绝斜杠命令进入任务队列: %s", command)
+			return
 		}
 		// 创建一个 scheduler task。EventType="__scheduler__" 让 scheduler agent
 		// 通过 EventType 严格匹配认领。

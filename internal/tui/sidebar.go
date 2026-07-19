@@ -83,6 +83,18 @@ func renderSidebar(t Theme, l Layout, agents []AgentInfo, tasks []*model.Task, s
 				t.TaskFailed.Render("failed"),
 				c))
 		}
+		if c := counts[model.TaskStatusCancelled]; c > 0 {
+			lines = append(lines, fmt.Sprintf("  %s %s %d",
+				t.TaskCancelled.Render("⊘"),
+				t.TaskCancelled.Render("cancelled"),
+				c))
+		}
+		if c := counts[model.TaskStatusBlocked]; c > 0 {
+			lines = append(lines, fmt.Sprintf("  %s %s %d",
+				t.TaskFailed.Render("■"),
+				t.TaskFailed.Render("blocked"),
+				c))
+		}
 
 		// Show recent tasks (up to 5 most recent non-completed)
 		shown := 0
@@ -173,6 +185,8 @@ func taskStatusStyle(t Theme, status model.TaskStatus) (string, lipgloss.Style) 
 		return t.IconFailed, t.TaskFailed
 	case model.TaskStatusCancelled:
 		return "⊘", t.TaskCancelled
+	case model.TaskStatusBlocked:
+		return "■", t.TaskFailed
 	default:
 		return "?", t.TaskPending
 	}

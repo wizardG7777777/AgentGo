@@ -37,7 +37,7 @@ func defaultBase(t *testing.T) (config.AgentKind, map[string][]string) {
 func TestBuildAdhocRuntime_NoOverride_InheritsAll(t *testing.T) {
 	base, profiles := defaultBase(t)
 	rt, err := buildAdhocRuntime(base, config.LLMConfig{DefaultModel: "gpt-default"},
-		profiles, RuntimeOverride{}, "instance-id", "adhoc:abc")
+		profiles, RuntimeOverride{}, "instance-id", "adhoc:abc", 0)
 	if err != nil {
 		t.Fatalf("buildAdhocRuntime: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestBuildAdhocRuntime_Override_AppliesNonZero(t *testing.T) {
 		ContextLimit:    8000,
 		// 其他字段零值=不覆盖
 	}
-	rt, err := buildAdhocRuntime(base, config.LLMConfig{}, profiles, override, "id", "adhoc:x")
+	rt, err := buildAdhocRuntime(base, config.LLMConfig{}, profiles, override, "id", "adhoc:x", 0)
 	if err != nil {
 		t.Fatalf("buildAdhocRuntime: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestBuildAdhocRuntime_ModelFallbackChain(t *testing.T) {
 	base, profiles := defaultBase(t)
 	base.Model = "" // 清空 base.Model 让回落 llmCfg.DefaultModel 生效
 	rt, err := buildAdhocRuntime(base, config.LLMConfig{DefaultModel: "gpt-default"},
-		profiles, RuntimeOverride{}, "id", "adhoc:x")
+		profiles, RuntimeOverride{}, "id", "adhoc:x", 0)
 	if err != nil {
 		t.Fatalf("buildAdhocRuntime: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestBuildAdhocRuntime_SystemPromptSetButEmpty(t *testing.T) {
 	base, profiles := defaultBase(t)
 	rt, err := buildAdhocRuntime(base, config.LLMConfig{}, profiles,
 		RuntimeOverride{SystemPrompt: "", SystemPromptSet: true},
-		"id", "adhoc:x")
+		"id", "adhoc:x", 0)
 	if err != nil {
 		t.Fatalf("buildAdhocRuntime: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestBuildAdhocRuntime_SystemPromptSetButEmpty(t *testing.T) {
 
 func TestBuildAdhocRuntime_RejectsBaseWithoutToolsOrProfile(t *testing.T) {
 	base := config.AgentKind{Kind: "broken", SystemPromptFile: "/dev/null"}
-	_, err := buildAdhocRuntime(base, config.LLMConfig{}, nil, RuntimeOverride{}, "id", "adhoc:x")
+	_, err := buildAdhocRuntime(base, config.LLMConfig{}, nil, RuntimeOverride{}, "id", "adhoc:x", 0)
 	if err == nil || !strings.Contains(err.Error(), "无法派生") {
 		t.Errorf("expected derivation error, got %v", err)
 	}
@@ -131,7 +131,7 @@ func TestBuildAdhocRuntime_RejectsBaseWithoutToolsOrProfile(t *testing.T) {
 func TestBuildAdhocRuntime_RejectsUnknownProfile(t *testing.T) {
 	base := config.AgentKind{Kind: "x", Profile: "ghost", SystemPromptFile: "/dev/null"}
 	_, err := buildAdhocRuntime(base, config.LLMConfig{}, map[string][]string{"real": {"read_file"}},
-		RuntimeOverride{}, "id", "adhoc:x")
+		RuntimeOverride{}, "id", "adhoc:x", 0)
 	if err == nil || !strings.Contains(err.Error(), "ghost") {
 		t.Errorf("expected unknown profile error, got %v", err)
 	}
@@ -144,11 +144,36 @@ func TestBuildAdhocRuntime_ProfileExpansion(t *testing.T) {
 	base := config.AgentKind{Kind: "x", Profile: "explore", SystemPromptFile: prompt}
 	rt, err := buildAdhocRuntime(base, config.LLMConfig{},
 		map[string][]string{"explore": {"a", "b", "c"}},
-		RuntimeOverride{}, "id", "adhoc:x")
+		RuntimeOverride{}, "id", "adhoc:x", 0)
 	if err != nil {
 		t.Fatalf("buildAdhocRuntime: %v", err)
 	}
 	if len(rt.AllowedTools) != 3 || rt.AllowedTools[0] != "a" {
 		t.Errorf("profile expansion wrong: %v", rt.AllowedTools)
+	}
+}
+
+// TestBuildAdhocRuntime_IdleThresholdFromGlobalConfig 验证 E3 接线：
+// 全局 agent_idle_threshold 经 buildAdhocRuntime 进入 AgentRuntimeConfig，
+// 不再被丢弃（此前运行时一律硬编码 0，配置是死旋钮）。
+func TestBuildAdhocRuntime_IdleThresholdFromGlobalConfig(t *testing.T) {
+	base, profiles := defaultBase(t)
+	rt, err := buildAdhocRuntime(base, config.LLMConfig{}, profiles,
+		RuntimeOverride{}, "id", "adhoc:x", 3)
+	if err != nil {
+		t.Fatalf("buildAdhocRuntime: %v", err)
+	}
+	if rt.IdleThreshold != 3 {
+		t.Errorf("IdleThreshold=%d want 3（全局 agent_idle_threshold 应透传）", rt.IdleThreshold)
+	}
+
+	// 全局 0（生产推荐默认）也原样透传，保持"永不空闲退出"。
+	rt, err = buildAdhocRuntime(base, config.LLMConfig{}, profiles,
+		RuntimeOverride{}, "id", "adhoc:x", 0)
+	if err != nil {
+		t.Fatalf("buildAdhocRuntime: %v", err)
+	}
+	if rt.IdleThreshold != 0 {
+		t.Errorf("IdleThreshold=%d want 0", rt.IdleThreshold)
 	}
 }

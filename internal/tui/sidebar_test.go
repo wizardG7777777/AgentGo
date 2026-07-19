@@ -192,6 +192,43 @@ func TestRenderSidebar_TaskCounts(t *testing.T) {
 	}
 }
 
+// D5：计数不再遗漏 cancelled / blocked（model.IsTerminal 终态一等公民）。
+func TestRenderSidebar_TaskCountsCancelledAndBlocked(t *testing.T) {
+	theme := DefaultTheme()
+	l := calcLayout(120, 40, ViewDashboard)
+	tasks := []*model.Task{
+		{ID: "t1", Status: model.TaskStatusCancelled, Description: "a"},
+		{ID: "t2", Status: model.TaskStatusCancelled, Description: "b"},
+		{ID: "t3", Status: model.TaskStatusBlocked, Description: "c"},
+	}
+	result := renderSidebar(theme, l, nil, tasks, -1, FocusInput)
+
+	countLine := func(status string) string {
+		for _, line := range strings.Split(result, "\n") {
+			if strings.Contains(line, status) {
+				return line
+			}
+		}
+		return ""
+	}
+	if line := countLine("cancelled"); line == "" || !strings.Contains(line, "2") {
+		t.Errorf("应有 cancelled 计数行且计数为 2: %q", line)
+	}
+	if line := countLine("blocked"); line == "" || !strings.Contains(line, "1") {
+		t.Errorf("应有 blocked 计数行且计数为 1: %q", line)
+	}
+}
+
+// D5：blocked 在 taskStatusStyle 中是一等状态，不再落入 "?" 默认分支。
+func TestTaskStatusStyle_Blocked(t *testing.T) {
+	theme := DefaultTheme()
+	icon, style := taskStatusStyle(theme, model.TaskStatusBlocked)
+	if icon == "" || icon == "?" {
+		t.Errorf("blocked 应有专属图标, got %q", icon)
+	}
+	_ = style.Render("blocked") // should not panic
+}
+
 func TestRenderSidebar_WideDescriptionsStayWithinSidebar(t *testing.T) {
 	theme := DefaultTheme()
 	l := calcLayout(80, 24, ViewDashboard)

@@ -314,108 +314,153 @@ type TaskMutation struct {
 	OccurredAt         time.Time
 }
 
+// PlanTaskMutation 把一条 Task 事实变更绑定到目标 Plan 节点，供
+// RecordTaskMutations 批量提交（C1：多条变更合并为一次落盘）。
+type PlanTaskMutation struct {
+	PlanID   string
+	TaskID   string
+	Mutation TaskMutation
+}
+
 // RecordTaskMutation advances only ExecutionStateVersion. When Wake is true,
 // the associated ReplanRequest is appended in the same durable transaction.
 func (c *Coordinator) RecordTaskMutation(ctx context.Context, planID, taskID string, mutation TaskMutation) (int64, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, err
+	versions, errs := c.RecordTaskMutations(ctx, []PlanTaskMutation{{PlanID: planID, TaskID: taskID, Mutation: mutation}})
+	if errs[0] != nil {
+		return 0, errs[0]
 	}
-	var version int64
-	var notify bool
-	err := c.store.update(func(state *persistentState) error {
-		rec, ok := state.Plans[planID]
-		if !ok {
-			return ErrPlanNotFound
+	return versions[0], nil
+}
+
+// RecordTaskMutations 与逐条 RecordTaskMutation 语义一致，但整批共享一次
+// 状态克隆 + 一次原子落盘（C1 批落盘）。返回值与 mutations 对齐：
+// versions[i]/errs[i] 对应第 i 条；单条失败不影响批内其余变更（该条回滚），
+// 落盘本身失败时全部条目标记失败（内存状态未前进，调用方可整体重试）。
+// 唤醒信号按 Plan 去重后统一发射（信号通道容量为 1，语义与逐条等价）。
+func (c *Coordinator) RecordTaskMutations(ctx context.Context, mutations []PlanTaskMutation) ([]int64, []error) {
+	versions := make([]int64, len(mutations))
+	if err := ctx.Err(); err != nil {
+		errs := make([]error, len(mutations))
+		for i := range errs {
+			errs[i] = err
 		}
-		p := &rec.Plan
-		planTerminal := model.IsPlanTerminal(p.Status)
-		node, ok := p.Nodes[taskID]
-		if !ok {
-			return ErrNodeNotFound
-		}
-		wasTerminal := model.IsTerminal(node.Status)
-		if mutation.Status != "" {
-			node.Status = mutation.Status
-		}
-		if mutation.Summary != "" {
-			node.Summary = mutation.Summary
-		}
-		if node.RetiredRevision == 0 {
-			if mutation.FailureFingerprint != "" {
-				node.FailureFingerprint = mutation.FailureFingerprint
-			}
-			if mutation.ArtifactRefs != nil {
-				node.ArtifactRefs = sortedUniqueStrings(mutation.ArtifactRefs)
-			}
-			if mutation.TraceRef != "" {
-				node.TraceRef = mutation.TraceRef
-			}
-		}
-		p.Nodes[taskID] = node
-		isTerminal := model.IsTerminal(node.Status)
-		if isTerminal && node.Role == model.PlanNodeRoleAcceptance && mutation.AcceptanceRunID != "" {
-			run, exists := p.AcceptanceRuns[mutation.AcceptanceRunID]
-			if !exists {
-				return fmt.Errorf("%w: acceptance task %s references run %s", ErrAcceptanceRunNotFound, taskID, mutation.AcceptanceRunID)
-			}
-			if run.RunnerTaskID != taskID {
-				return fmt.Errorf("acceptance run %s belongs to runner %s, not %s", run.ID, run.RunnerTaskID, taskID)
-			}
-			if run.ResultID == "" && (run.Status == "pending" || run.Status == "running") {
-				if node.Status == model.TaskStatusCompleted {
-					run.Status = "runner_completed_without_result"
-				} else {
-					run.Status = "runner_" + string(node.Status)
-				}
-				run.CompletedAt = mutation.OccurredAt
-				if run.CompletedAt.IsZero() {
-					run.CompletedAt = time.Now().UTC()
-				}
-				p.AcceptanceRuns[run.ID] = run
-				if indexedID, indexed := rec.AcceptanceRunKeys[run.Key]; indexed && indexedID == run.ID {
-					delete(rec.AcceptanceRunKeys, run.Key)
-				}
-			} else if run.ResultID != "" && node.Status != model.TaskStatusCompleted {
-				// Keep the submitted result as immutable audit evidence, but a runner
-				// that failed/cancelled/blocked after submission cannot authorize Plan
-				// finalization. Release the idempotency key so a fresh formal run can
-				// prove the same graph/spec under a completed runner lease.
-				run.Status = "runner_" + string(node.Status) + "_after_result"
-				p.AcceptanceRuns[run.ID] = run
-				if indexedID, indexed := rec.AcceptanceRunKeys[run.Key]; indexed && indexedID == run.ID {
-					delete(rec.AcceptanceRunKeys, run.Key)
-				}
-			}
-		}
-		if !wasTerminal && isTerminal && p.Usage.ActiveTasks > 0 {
-			p.Usage.ActiveTasks--
-		} else if wasTerminal && !isTerminal {
-			p.Usage.ActiveTasks++
-		}
-		p.ExecutionStateVersion++
-		version = p.ExecutionStateVersion
-		p.UpdatedAt = time.Now().UTC()
-		if mutation.Wake && !planTerminal && node.RetiredRevision == 0 {
-			req := model.ReplanRequest{
-				PlanID: planID, SourceTaskID: taskID, SourceEvent: mutation.SourceEvent,
-				ReasonCode: mutation.ReasonCode, ObservedRevision: p.CurrentRevision,
-				ObservedStateVersion: version, Urgency: normalizedUrgency(mutation.Urgency),
-				IdempotencyKey: mutation.IdempotencyKey, CreatedAt: mutation.OccurredAt,
-			}
-			if _, _, err := appendRequest(rec, req); err != nil {
+		return versions, errs
+	}
+	notifyFlags := make([]bool, len(mutations))
+	fns := make([]func(*persistentState) error, len(mutations))
+	for i, m := range mutations {
+		fns[i] = func(state *persistentState) error {
+			version, notify, err := applyTaskMutationOp(state, m.PlanID, m.TaskID, m.Mutation)
+			if err != nil {
 				return err
 			}
-			notify = true
+			versions[i] = version
+			notifyFlags[i] = notify
+			return nil
 		}
-		return nil
-	})
-	if err != nil {
-		return 0, err
 	}
-	if notify {
-		c.notify(planID)
+	errs := c.store.updateBatch(fns...)
+	notified := make(map[string]bool)
+	for i := range mutations {
+		if errs[i] != nil || !notifyFlags[i] || notified[mutations[i].PlanID] {
+			continue
+		}
+		notified[mutations[i].PlanID] = true
+		c.notify(mutations[i].PlanID)
 	}
-	return version, nil
+	return versions, errs
+}
+
+// applyTaskMutationOp 把一条 Task 事实变更应用到（已克隆的）持久化状态上。
+// 成功时返回新的 ExecutionStateVersion 以及是否需要唤醒 Scheduler。
+// 中途返回错误时状态可能已被部分改写，调用方（updateBatch）负责回滚。
+func applyTaskMutationOp(state *persistentState, planID, taskID string, mutation TaskMutation) (int64, bool, error) {
+	rec, ok := state.Plans[planID]
+	if !ok {
+		return 0, false, ErrPlanNotFound
+	}
+	p := &rec.Plan
+	planTerminal := model.IsPlanTerminal(p.Status)
+	node, ok := p.Nodes[taskID]
+	if !ok {
+		return 0, false, ErrNodeNotFound
+	}
+	wasTerminal := model.IsTerminal(node.Status)
+	if mutation.Status != "" {
+		node.Status = mutation.Status
+	}
+	if mutation.Summary != "" {
+		node.Summary = mutation.Summary
+	}
+	if node.RetiredRevision == 0 {
+		if mutation.FailureFingerprint != "" {
+			node.FailureFingerprint = mutation.FailureFingerprint
+		}
+		if mutation.ArtifactRefs != nil {
+			node.ArtifactRefs = sortedUniqueStrings(mutation.ArtifactRefs)
+		}
+		if mutation.TraceRef != "" {
+			node.TraceRef = mutation.TraceRef
+		}
+	}
+	p.Nodes[taskID] = node
+	isTerminal := model.IsTerminal(node.Status)
+	if isTerminal && node.Role == model.PlanNodeRoleAcceptance && mutation.AcceptanceRunID != "" {
+		run, exists := p.AcceptanceRuns[mutation.AcceptanceRunID]
+		if !exists {
+			return 0, false, fmt.Errorf("%w: acceptance task %s references run %s", ErrAcceptanceRunNotFound, taskID, mutation.AcceptanceRunID)
+		}
+		if run.RunnerTaskID != taskID {
+			return 0, false, fmt.Errorf("acceptance run %s belongs to runner %s, not %s", run.ID, run.RunnerTaskID, taskID)
+		}
+		if run.ResultID == "" && (run.Status == "pending" || run.Status == "running") {
+			if node.Status == model.TaskStatusCompleted {
+				run.Status = "runner_completed_without_result"
+			} else {
+				run.Status = "runner_" + string(node.Status)
+			}
+			run.CompletedAt = mutation.OccurredAt
+			if run.CompletedAt.IsZero() {
+				run.CompletedAt = time.Now().UTC()
+			}
+			p.AcceptanceRuns[run.ID] = run
+			if indexedID, indexed := rec.AcceptanceRunKeys[run.Key]; indexed && indexedID == run.ID {
+				delete(rec.AcceptanceRunKeys, run.Key)
+			}
+		} else if run.ResultID != "" && node.Status != model.TaskStatusCompleted {
+			// Keep the submitted result as immutable audit evidence, but a runner
+			// that failed/cancelled/blocked after submission cannot authorize Plan
+			// finalization. Release the idempotency key so a fresh formal run can
+			// prove the same graph/spec under a completed runner lease.
+			run.Status = "runner_" + string(node.Status) + "_after_result"
+			p.AcceptanceRuns[run.ID] = run
+			if indexedID, indexed := rec.AcceptanceRunKeys[run.Key]; indexed && indexedID == run.ID {
+				delete(rec.AcceptanceRunKeys, run.Key)
+			}
+		}
+	}
+	if !wasTerminal && isTerminal && p.Usage.ActiveTasks > 0 {
+		p.Usage.ActiveTasks--
+	} else if wasTerminal && !isTerminal {
+		p.Usage.ActiveTasks++
+	}
+	p.ExecutionStateVersion++
+	version := p.ExecutionStateVersion
+	p.UpdatedAt = time.Now().UTC()
+	notify := false
+	if mutation.Wake && !planTerminal && node.RetiredRevision == 0 {
+		req := model.ReplanRequest{
+			PlanID: planID, SourceTaskID: taskID, SourceEvent: mutation.SourceEvent,
+			ReasonCode: mutation.ReasonCode, ObservedRevision: p.CurrentRevision,
+			ObservedStateVersion: version, Urgency: normalizedUrgency(mutation.Urgency),
+			IdempotencyKey: mutation.IdempotencyKey, CreatedAt: mutation.OccurredAt,
+		}
+		if _, _, err := appendRequest(rec, req); err != nil {
+			return 0, false, err
+		}
+		notify = true
+	}
+	return version, notify, nil
 }
 
 func (c *Coordinator) RequestReplan(ctx context.Context, request model.ReplanRequest) (*model.ReplanRequest, error) {

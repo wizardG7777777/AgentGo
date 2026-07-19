@@ -59,6 +59,9 @@ type TaskSpec struct {
 	EventType    string
 	Role         model.PlanNodeRole
 	Dependencies []string
+	ParentTaskID string
+	ReplyToAgentID string
+	BatchID      string
 	Metadata     map[string]string
 }
 
@@ -273,6 +276,9 @@ type EnsureAcceptanceRunInput struct {
 	RunnerKind    string
 	Description   string
 	Dependencies  []string
+	ParentTaskID  string
+	ReplyToAgentID string
+	BatchID       string
 }
 
 func (c *Coordinator) EnsureAcceptanceRun(ctx context.Context, in EnsureAcceptanceRunInput) (*model.AcceptanceRun, bool, error) {
@@ -357,7 +363,8 @@ func (c *Coordinator) EnsureAcceptanceRun(ctx context.Context, in EnsureAcceptan
 			SpecID: p.CurrentAcceptanceSpecID, SpecRevision: p.CurrentAcceptanceSpecRevision,
 			Scope: scope, TargetPlanRevision: p.CurrentRevision,
 			TargetGraphDigest: p.CurrentGraphDigest, TargetTaskIDs: targets,
-			RunnerKind: in.RunnerKind, Status: "pending", CreatedAt: time.Now().UTC(),
+			RunnerKind: in.RunnerKind, Status: "pending",
+			CreatedAt: nextAcceptanceRunCreatedAt(p, time.Now().UTC()),
 		}
 		p.AcceptanceRuns[run.ID] = run
 		rec.AcceptanceRunKeys[key] = run.ID
@@ -403,6 +410,7 @@ func (c *Coordinator) EnsureAcceptanceRun(ctx context.Context, in EnsureAcceptan
 	taskID, publishErr := c.backend.PublishTask(ctx, TaskSpec{
 		PlanID: run.PlanID, Description: description, EventType: in.RunnerKind,
 		Role: model.PlanNodeRoleAcceptance, Dependencies: sortedUniqueStrings(append(in.Dependencies, run.TargetTaskIDs...)),
+		ParentTaskID: in.ParentTaskID, ReplyToAgentID: in.ReplyToAgentID, BatchID: in.BatchID,
 		Metadata: map[string]string{"acceptance_run_id": run.ID, "acceptance_spec_id": run.SpecID},
 	})
 	updateErr := c.store.update(func(state *persistentState) error {
@@ -630,6 +638,13 @@ func (c *Coordinator) SubmitAcceptanceResult(ctx context.Context, result model.A
 		result.PlanID = p.ID
 		result.RunID = run.ID
 		completedAt := time.Now().UTC()
+		// G6：创建钳制（nextAcceptanceRunCreatedAt）可能让 run.CreatedAt 领先
+		// 墙钟 1ns（同一时钟刻度内连续创建 run）。submission 时间必须不早于
+		// run.CreatedAt，否则 result.CreatedAt 与内建 evidence 的 RecordedAt
+		// 会触发 "evidence predates the acceptance run" 校验。
+		if completedAt.Before(run.CreatedAt) {
+			completedAt = run.CreatedAt
+		}
 		if result.CreatedAt.IsZero() {
 			result.CreatedAt = completedAt
 		}
@@ -1029,7 +1044,30 @@ func hasCurrentAcceptanceVerdict(p *model.Plan, verdict model.AcceptanceVerdict)
 	return ok && result.Status == model.AcceptanceResultValid && result.Verdict == verdict
 }
 
+// nextAcceptanceRunCreatedAt 返回 run 的创建时间，保证严格晚于同 Plan 内
+// 既有全部 run 的 CreatedAt 与 CompletedAt（必要时 +1ns）。这使 CreatedAt
+// 成为 per-plan 单调递增序号并随 run 一起持久化：两个 run 的 CompletedAt
+// 相同（亚毫秒连续完成）时，acceptanceRunIsLater 由创建顺序确定性决胜，
+// 不再落到随机 UUID 字符串比较（G6）。实际偏移至多数纳秒，不影响观测语义。
+// 修复前创建的 legacy run 不参与本钳制，其平局仍走 CreatedAt→UUID 兜底。
+func nextAcceptanceRunCreatedAt(p *model.Plan, now time.Time) time.Time {
+	latest := now
+	for _, run := range p.AcceptanceRuns {
+		if run.CreatedAt.After(latest) {
+			latest = run.CreatedAt
+		}
+		if run.CompletedAt.After(latest) {
+			latest = run.CompletedAt
+		}
+	}
+	if !now.After(latest) {
+		return latest.Add(time.Nanosecond)
+	}
+	return now
+}
+
 func acceptanceRunIsLater(candidate, current model.AcceptanceRun) bool {
+	// 主键：完成时间（未完成回退创建时间）。
 	candidateAt := candidate.CompletedAt
 	if candidateAt.IsZero() {
 		candidateAt = candidate.CreatedAt
@@ -1041,9 +1079,13 @@ func acceptanceRunIsLater(candidate, current model.AcceptanceRun) bool {
 	if !candidateAt.Equal(currentAt) {
 		return candidateAt.After(currentAt)
 	}
+	// 次键：CreatedAt——由 nextAcceptanceRunCreatedAt 保证 per-plan 单调递增，
+	// 即创建顺序决胜，确定性。
 	if !candidate.CreatedAt.Equal(current.CreatedAt) {
 		return candidate.CreatedAt.After(current.CreatedAt)
 	}
+	// 兜底：UUID 字典序——仅用于 legacy/手工构造且 CreatedAt 也相同的数据，
+	// 保证确定性（同一持久化输入恒得同一结果），不承诺恢复真实创建顺序。
 	return candidate.ID > current.ID
 }
 

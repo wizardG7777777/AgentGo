@@ -3,9 +3,12 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"unicode/utf16"
 
 	"gopkg.in/yaml.v3"
 )
@@ -93,6 +96,13 @@ type InfraConfig struct {
 
 type WatchdogConfig struct {
 	IntervalSec int `yaml:"interval_sec" json:"interval_sec"`
+	// PendingAlertGraceSec is the age of one pending queue lease after which Watchdog
+	// reports claim starvation. A runnable route is only alerted, never failed.
+	PendingAlertGraceSec int `yaml:"pending_alert_grace_sec" json:"pending_alert_grace_sec"`
+	// UnroutableGraceSec is a separate observation window that starts only
+	// after a Task is otherwise claimable but has no compatible runtime route.
+	// Expiry moves that Task to blocked with a structured reason.
+	UnroutableGraceSec int `yaml:"unroutable_grace_sec" json:"unroutable_grace_sec"`
 }
 
 type MailNotifierConfig struct {
@@ -104,13 +114,53 @@ type StoreConfig struct {
 	EventChannelBuffer int `yaml:"event_channel_buffer" json:"event_channel_buffer"`
 	FIFOLimit          int `yaml:"fifo_limit" json:"fifo_limit"`
 	DefaultConcurrency int `yaml:"default_concurrency" json:"default_concurrency"`
-	// DefaultTimeoutSec 是任务级默认超时（watchdog 据此判定 unclaimed 任务何时算超时）。
+	// DefaultTimeoutSec 是单次 processing 执行租约的任务级默认超时。
+	// pending 的告警/无 route 宽限分别由 WatchdogConfig 控制，不能复用执行超时。
 	// v3 旧名 cfg.DefaultTimeoutSec，已下沉到 Infra.Store 块下，与 store 容量参数同居。
 	DefaultTimeoutSec int `yaml:"default_timeout_sec" json:"default_timeout_sec"`
 }
 
 type RosterConfig struct {
 	WaitTimeoutSec int `yaml:"wait_timeout_sec" json:"wait_timeout_sec"`
+}
+
+// UIConfig 是 UI Hub 的前端配置块（v4 风格嵌套）。
+//
+// Frontends 声明启用哪些前端：tui（终端 UI，默认唯一启用）/ web（Web
+// Dashboard，含受 token 保护的控制端点）。多个前端可同时启用——UI Hub 是事件源的唯一消费者，
+// 前端只是订阅者。
+type UIConfig struct {
+	Frontends []string    `yaml:"frontends" json:"frontends"`
+	Web       WebUIConfig `yaml:"web" json:"web"`
+}
+
+// WebUIConfig 是 Web Dashboard（internal/dashboard）的监听配置。
+//
+// Token 为空表示不启用鉴权——仅在监听地址为 loopback 时允许（默认
+// 127.0.0.1:8399）。绑定到非 loopback 地址必须设置 token，否则
+// Validate 拒绝启动（本系统具备 shell 执行能力，其管理面绝不能无鉴权
+// 暴露到局域网/公网）。
+type WebUIConfig struct {
+	Listen string `yaml:"listen" json:"listen"`
+	Token  string `yaml:"token" json:"token"`
+	// AutoOpen 控制启动后是否自动用默认浏览器打开 Web 控制台。
+	// 指针三态：未设置（nil）= 默认开；显式 false 关闭。
+	AutoOpen *bool `yaml:"auto_open,omitempty" json:"auto_open,omitempty"`
+}
+
+// AutoOpenEnabled 报告是否启用"启动后自动打开浏览器"（缺省为开）。
+func (c WebUIConfig) AutoOpenEnabled() bool {
+	return c.AutoOpen == nil || *c.AutoOpen
+}
+
+// HasFrontend 报告指定前端是否启用（frontends 去重后的成员判断）。
+func (c UIConfig) HasFrontend(name string) bool {
+	for _, f := range c.Frontends {
+		if f == name {
+			return true
+		}
+	}
+	return false
 }
 
 // AgentRuntimeConfig 内部使用，由 Bootstrap 从 AgentKind + LLMConfig 合成后注入到
@@ -133,6 +183,12 @@ type AgentRuntimeConfig struct {
 	TaskMaxRetries               int
 	EnforceCompactTokenThreshold int
 	ContextLimit                 int
+	// IdleThreshold 对应全局 agent_idle_threshold：agent 连续 N 次空闲轮询后
+	// 退出 goroutine；0 = 永不空闲退出（生产推荐，见 Config.AgentIdleThreshold）。
+	// AgentKind 没有 per-kind 覆盖字段，各 AgentRuntimeConfig 构造点统一填全局值；
+	// scheduler 路径刻意不消费本字段（scheduler 是必须常驻的预制代理，
+	// 见 internal/scheduler/scheduler.go 中 a.IdleThreshold 的注释）。
+	IdleThreshold int
 	// TeamAwareness 是团队能力感知提示词，描述系统中所有 Agent 类型的能力边界。
 	// 由 Bootstrap 在启动时构建，注入到每个 Agent 的任务描述前，避免跨 kind 的
 	// 能力假设错误（如 verifier 假设 gatherer 有 write_file）。
@@ -152,6 +208,7 @@ type Config struct {
 	Agents                    []AgentKind          `yaml:"agents" json:"agents"`
 	AgentTemplates            AgentTemplatesConfig `yaml:"agent_templates,omitempty" json:"agent_templates,omitempty"`
 	Infra                     InfraConfig          `yaml:"infra" json:"infra"`
+	UI                        UIConfig             `yaml:"ui" json:"ui"`
 	StartupProbe              string               `yaml:"startup_probe,omitempty" json:"startup_probe,omitempty"`
 	StartupProbeTimeoutSec    int                  `yaml:"startup_probe_timeout_sec,omitempty" json:"startup_probe_timeout_sec,omitempty"`
 	StartupProbeFailureAction string               `yaml:"startup_probe_failure_action,omitempty" json:"startup_probe_failure_action,omitempty"`
@@ -198,11 +255,26 @@ type Config struct {
 	SessionRetentionDays int `yaml:"session_retention_days" json:"session_retention_days"`
 	// SessionArchiveMax 是最大归档 Session 数。超过此数量时删除最旧的归档。
 	SessionArchiveMax int `yaml:"session_archive_max" json:"session_archive_max"`
+	// SessionResumeMaxIdleSec 是自动恢复 active-session 时允许的快照最大闲置时间。
+	// 超过该时间的非终态任务会 fail-closed 为 blocked；显式 --resume 视为人工确认并绕过。
+	// 0 表示关闭陈旧恢复保护。
+	SessionResumeMaxIdleSec int `yaml:"session_resume_max_idle_sec" json:"session_resume_max_idle_sec"`
+	// SessionSnapshotIntervalSec 是运行期完整快照间隔；0 表示只在切换/关闭时保存。
+	SessionSnapshotIntervalSec int `yaml:"session_snapshot_interval_sec" json:"session_snapshot_interval_sec"`
 }
+
+// time.Duration is an int64 nanosecond count. Values above this many seconds
+// overflow when bootstrap converts the configuration and may make NewTicker
+// panic or invert the stale-resume comparison.
+const maxSessionDurationSeconds = 9_223_372_036
 
 // ResolveProfile 根据 profile 名称从 ToolProfiles 中查找工具列表。
 //   - name 为空 → 返回 nil（意为"允许全部工具"，向后兼容）
 //   - name 不存在于 ToolProfiles → 返回 error（配置笔误应立即暴露）
+//
+// 这是 profile → 工具列表的唯一权威解析入口（D3）：生产路径（runner 构建、
+// team awareness、静态 route 注册）全部委托本函数或其纯函数形态
+// ResolveToolProfile，不再各自内联 map 查找。
 func (c *Config) ResolveProfile(name string) ([]string, error) {
 	if name == "" {
 		return nil, nil
@@ -210,9 +282,20 @@ func (c *Config) ResolveProfile(name string) ([]string, error) {
 	if c.ToolProfiles == nil {
 		return nil, fmt.Errorf("tool profile %q 未找到：tool_profiles 未定义", name)
 	}
-	tools, ok := c.ToolProfiles[name]
+	return ResolveToolProfile(c.ToolProfiles, name)
+}
+
+// ResolveToolProfile 是 ResolveProfile 的纯函数形态，供只持有 tool_profiles 表
+// （而非完整 *Config）的调用方使用，语义与 ResolveProfile 一致：
+//   - name 为空 → 返回 nil（"允许全部工具"，向后兼容）
+//   - name 不存在于 profiles → 返回 error（配置笔误应立即暴露）
+func ResolveToolProfile(profiles map[string][]string, name string) ([]string, error) {
+	if name == "" {
+		return nil, nil
+	}
+	tools, ok := profiles[name]
 	if !ok {
-		return nil, fmt.Errorf("tool profile %q 未找到，可用的 profile: %v", name, profileKeys(c.ToolProfiles))
+		return nil, fmt.Errorf("tool profile %q 未找到，可用的 profile: %v", name, profileKeys(profiles))
 	}
 	return tools, nil
 }
@@ -234,19 +317,25 @@ func ptrTo[T any](v T) *T { return &v }
 
 func DefaultConfig() *Config {
 	return &Config{
-		ShellTimeoutSec:       30,
-		MaxSubtaskDepth:       1,
-		TransferNoteMaxTokens: 3000, // Sprint 3 #5 TransferNote 默认预算
-		ProgressNotifyEnabled: true, // §8.6 进度通知默认启用
-		AgentIdleThreshold:    0,
-		SearchAPIProvider:     "duckduckgo_html",
-		SessionRetentionDays:  30,
-		SessionArchiveMax:     50,
+		ShellTimeoutSec:            30,
+		MaxSubtaskDepth:            1,
+		TransferNoteMaxTokens:      3000, // Sprint 3 #5 TransferNote 默认预算
+		ProgressNotifyEnabled:      true, // §8.6 进度通知默认启用
+		AgentIdleThreshold:         0,
+		SearchAPIProvider:          "duckduckgo_html",
+		SessionRetentionDays:       30,
+		SessionArchiveMax:          50,
+		SessionResumeMaxIdleSec:    3600,
+		SessionSnapshotIntervalSec: 30,
 		AgentTemplates: AgentTemplatesConfig{
 			MaxRuntimeAgents: 8,
 		},
 		Infra: InfraConfig{
-			Watchdog:     WatchdogConfig{IntervalSec: 30},
+			Watchdog: WatchdogConfig{
+				IntervalSec:          30,
+				PendingAlertGraceSec: 300,
+				UnroutableGraceSec:   300,
+			},
 			MailNotifier: MailNotifierConfig{Enabled: true, IntervalSec: 5},
 			Store: StoreConfig{
 				EventChannelBuffer: 64,
@@ -255,6 +344,10 @@ func DefaultConfig() *Config {
 				DefaultTimeoutSec:  300,
 			},
 			Roster: RosterConfig{WaitTimeoutSec: 30},
+		},
+		UI: UIConfig{
+			Frontends: []string{"tui"},
+			Web:       WebUIConfig{Listen: "127.0.0.1:8399", Token: ""},
 		},
 	}
 }
@@ -267,6 +360,36 @@ func DefaultConfig() *Config {
 // os.ExpandEnv，支持 ${ENV_VAR} 替换（Twelve-factor app 标准做法，避免把 API key
 // 提交到版本库）。未引用 env var 的字段不受影响——os.ExpandEnv 仅替换 $name 与 ${name}
 // 形式的 token，其他字面值原样保留。
+// decodeIfUTF16 检测 UTF-16 BOM（FF FE / FE FF）并把内容转码为 UTF-8。
+// 无 BOM 时原样返回（按 UTF-8 处理）。奇数长度截掉尾部残缺字节，容忍手滑编辑。
+func decodeIfUTF16(data []byte) []byte {
+	if len(data) < 2 {
+		return data
+	}
+	var bigEndian bool
+	switch {
+	case data[0] == 0xFF && data[1] == 0xFE:
+		bigEndian = false
+	case data[0] == 0xFE && data[1] == 0xFF:
+		bigEndian = true
+	default:
+		return data
+	}
+	body := data[2:]
+	if len(body)%2 == 1 {
+		body = body[:len(body)-1]
+	}
+	u16 := make([]uint16, len(body)/2)
+	for i := range u16 {
+		if bigEndian {
+			u16[i] = uint16(body[2*i])<<8 | uint16(body[2*i+1])
+		} else {
+			u16[i] = uint16(body[2*i]) | uint16(body[2*i+1])<<8
+		}
+	}
+	return []byte(string(utf16.Decode(u16)))
+}
+
 func LoadConfig(path string, explicit bool) (*Config, error) {
 	cfg := DefaultConfig()
 
@@ -281,6 +404,11 @@ func LoadConfig(path string, explicit bool) (*Config, error) {
 		}
 		return nil, err
 	}
+
+	// UTF-16 转码必须先于环境变量展开：Windows 记事本等编辑器默认存
+	// UTF-16LE，交错 NUL 字节会让 os.ExpandEnv 匹配不到 ${VAR}，配置里的
+	// 环境变量引用被静默保留为字面量（E1）。
+	data = decodeIfUTF16(data)
 
 	// 环境变量展开（v4 §11.3 末尾"环境变量替换"段）
 	expanded := []byte(os.ExpandEnv(string(data)))
@@ -315,8 +443,27 @@ func LoadConfig(path string, explicit bool) (*Config, error) {
 	return cfg, nil
 }
 
-// Validate 在 Bootstrap 主流程中调用，对应 nextUpgrade_v4.md §11.5.3 全部启动校验
-// 规则。任一规则失败即返回 non-nil error 终止启动。
+// Validate 在 Bootstrap 主流程中执行启动配置校验，任一检查失败即返回 non-nil
+// error 终止启动。实际执行的检查（按代码顺序；括号内为 nextUpgrade_v4.md
+// §11.5.3 的历史规则编号，编号不连续——规则 1-2 不存在，规则 10 拆在两处）：
+//  1. 路径风格红线：project_root、agents[*].system_prompt_file 不得含反斜杠；
+//     agent_templates 的 user_dirs/project_dirs 同样不得含反斜杠（规则 9 及附加项）；
+//  2. 模型解析：scheduler.model 缺省回落 llm.default_model，两者皆空即报错；
+//     静态 agents 每项须有自有 model 或全局 llm.default_model；scheduler.model
+//     显式出现（非空串）时不得为纯空白（规则 10 的两半）；
+//  3. agent_templates.max_runtime_agents 须在 0..32 之间（0 或省略 = 默认 8）；
+//  4. agents[*].kind 非空且在列表内唯一（规则 3 + 12）；
+//  5. agents[*].replicas >= 1（规则 4）；
+//  6. profile 与 tools 互斥且恰一（规则 5）；profile 引用必须存在于
+//     tool_profiles（规则 6；工具名合法性由 bootstrap 的 tools.ValidateToolNames
+//     单独校验，不在此处）；
+//  7. agents[*].system_prompt_file 必填且存在可读（规则 8）；
+//  8. 行为参数全部 > 0：agent_max_loops / task_max_retries /
+//     enforce_compact_token_threshold / context_limit（规则 11）；
+//  9. startup_probe 取值合法（tcp/off）、失败动作合法（warn/exit）、
+//     startup_probe_timeout_sec 非负（validateStartupProbe，后加的独立检查）；
+//  10. ui 块：frontends ∈ {tui, web}（去重）；web.listen 为合法 host:port；
+//     非 loopback 监听必须设置 web.token（validateUI）。
 //
 // agents 可以为空，此时系统以 Scheduler-only 模式启动，并可在运行期从
 // AgentTemplate provision Team。只要 agents 非空，原有静态 kind 的全部严格
@@ -441,8 +588,87 @@ func (c *Config) Validate() error {
 	if c.Scheduler.Model != "" && strings.TrimSpace(c.Scheduler.Model) == "" {
 		return fmt.Errorf("scheduler.model 仅含空白字符——若要使用默认模型，请删除该字段")
 	}
+	if c.SessionResumeMaxIdleSec < 0 {
+		return fmt.Errorf("session_resume_max_idle_sec=%d 不能为负", c.SessionResumeMaxIdleSec)
+	}
+	if int64(c.SessionResumeMaxIdleSec) > maxSessionDurationSeconds {
+		return fmt.Errorf("session_resume_max_idle_sec=%d 超出 time.Duration 可表示范围", c.SessionResumeMaxIdleSec)
+	}
+	if c.SessionSnapshotIntervalSec < 0 {
+		return fmt.Errorf("session_snapshot_interval_sec=%d 不能为负", c.SessionSnapshotIntervalSec)
+	}
+	if int64(c.SessionSnapshotIntervalSec) > maxSessionDurationSeconds {
+		return fmt.Errorf("session_snapshot_interval_sec=%d 超出 time.Duration 可表示范围", c.SessionSnapshotIntervalSec)
+	}
+
+	if err := c.validateUI(); err != nil {
+		return err
+	}
 
 	return c.validateStartupProbe()
+}
+
+// validateUI 校验 ui 块：
+//  1. frontends 取值 ∈ {tui, web}，去重（保序，原地归一化）；空列表回落默认 [tui]；
+//  2. web.listen 必须解析为 host:port，端口为 1..65535 的数字；
+//  3. web.listen 绑定非 loopback 地址（0.0.0.0 / :: / 公网 IP 等）时必须设置
+//     web.token——本系统具备 shell 执行能力，其管理面（含 POST 控制端点）
+//     绝不能无鉴权暴露到局域网/公网。
+func (c *Config) validateUI() error {
+	if len(c.UI.Frontends) == 0 {
+		c.UI.Frontends = []string{"tui"}
+	}
+	seen := make(map[string]bool, len(c.UI.Frontends))
+	deduped := c.UI.Frontends[:0]
+	for _, f := range c.UI.Frontends {
+		if f != "tui" && f != "web" {
+			return fmt.Errorf("ui.frontends 含非法取值 %q（仅允许 \"tui\" / \"web\"）", f)
+		}
+		if !seen[f] {
+			seen[f] = true
+			deduped = append(deduped, f)
+		}
+	}
+	c.UI.Frontends = deduped
+
+	if !c.UI.HasFrontend("web") {
+		return nil
+	}
+	listen := strings.TrimSpace(c.UI.Web.Listen)
+	if listen == "" {
+		return fmt.Errorf("ui.web.listen 不能为空（启用 web 前端时必须显式给出 host:port）")
+	}
+	host, portStr, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fmt.Errorf("ui.web.listen=%q 不是合法的 host:port 地址: %w", c.UI.Web.Listen, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("ui.web.listen=%q 端口 %q 无效（须为 1..65535 的数字）", c.UI.Web.Listen, portStr)
+	}
+	if c.UI.Web.Token != "" {
+		return nil
+	}
+	if isLoopbackHost(host) {
+		return nil
+	}
+	return fmt.Errorf("ui.web.listen=%q 绑定了非 loopback 地址但未设置 ui.web.token："+
+		"本系统具备 shell 执行能力，其 Web 管理面（含 POST 控制端点）"+
+		"无鉴权暴露到局域网/公网等同于把命令执行入口开放给同网段任何人——"+
+		"请设置 ui.web.token，或把 listen 改回 127.0.0.1 / ::1", c.UI.Web.Listen)
+}
+
+// isLoopbackHost 报告 host 是否仅指向本机回环：空串（":port" 表示全部网卡）
+// 不算 loopback；"localhost" 与 127.0.0.0/8、::1 算 loopback。
+func isLoopbackHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // validateStartupProbe 校验 startup_probe / 失败动作字段取值合法。

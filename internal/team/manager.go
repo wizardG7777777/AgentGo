@@ -2,7 +2,9 @@ package team
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 
@@ -11,6 +13,7 @@ import (
 	"agentgo/internal/agenttemplate"
 	"agentgo/internal/config"
 	"agentgo/internal/llm"
+	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/plan"
 	"agentgo/internal/runner"
@@ -30,22 +33,35 @@ type Manager struct {
 	routes       RouteRegistry
 	maxInstances int
 
-	opMu      sync.Mutex
-	parentCtx context.Context
-	started   bool
-	closed    bool
-	active    map[string]*activeTeam
-	cleanupWG sync.WaitGroup
+	opMu         sync.Mutex
+	parentCtx    context.Context
+	started      bool
+	closed       bool
+	active       map[string]*activeTeam
+	cleanupWG    sync.WaitGroup
+	shutdownDone chan struct{}
+	// preservedShutdownMailboxIDs 是 ShutdownPreservingMailboxes 已停止但为
+	// 最终 Session 快照暂留的动态邮箱；FinalizeShutdownMailboxes 再删除。
+	preservedShutdownMailboxIDs map[string]struct{}
 }
 
 type activeTeam struct {
-	spec     TeamSpec
-	agentIDs []string
-	tools    []string
-	runners  []*runner.Runner
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
+	spec                   TeamSpec
+	agentIDs               []string
+	tools                  []string
+	runners                []*runner.Runner
+	recoveredMailboxClaims map[string]string // agentID → eventType；失败回滚，正常终止删除
+	cancel                 context.CancelFunc
+	wg                     sync.WaitGroup
 }
+
+type mailboxCleanupMode uint8
+
+const (
+	cleanupMailboxUnregister mailboxCleanupMode = iota
+	cleanupMailboxRollbackRecovered
+	cleanupMailboxPreserveForSnapshot
+)
 
 // NewManager builds a stopped Manager. Start must succeed before Provision is
 // allowed. maxInstances<=0 selects DefaultMaxInstances; values above the hard
@@ -69,6 +85,7 @@ func NewManager(
 		deps: deps, llmFactory: llmFactory, catalog: catalog,
 		coordinator: coordinator, store: store, routes: routes,
 		maxInstances: maxInstances, active: make(map[string]*activeTeam),
+		shutdownDone: make(chan struct{}),
 	}
 }
 
@@ -154,7 +171,16 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.parentCtx = ctx
 	materialized := make([]runtimeActivation, 0, len(prepared))
 	for _, prep := range prepared {
-		materialized = append(materialized, m.materializePrepared(prep))
+		activation, err := m.materializePrepared(prep, true)
+		if err != nil {
+			var cleanupErr error
+			for _, candidate := range materialized {
+				cleanupErr = errors.Join(cleanupErr, m.discardMaterialized(candidate))
+			}
+			m.parentCtx = nil
+			return errors.Join(fmt.Errorf("recover team %s materialize: %w", prep.spec.ID, err), cleanupErr)
+		}
+		materialized = append(materialized, activation)
 	}
 
 	registered := make([]string, 0, len(materialized))
@@ -163,11 +189,12 @@ func (m *Manager) Start(ctx context.Context) error {
 			for _, key := range registered {
 				_ = m.routes.UnregisterRoute(key)
 			}
+			var cleanupErr error
 			for _, candidate := range materialized {
-				m.discardMaterialized(candidate)
+				cleanupErr = errors.Join(cleanupErr, m.discardMaterialized(candidate))
 			}
 			m.parentCtx = nil
-			return fmt.Errorf("recover team %s route: %w", activation.team.spec.ID, err)
+			return errors.Join(fmt.Errorf("recover team %s route: %w", activation.team.spec.ID, err), cleanupErr)
 		}
 		registered = append(registered, activation.team.spec.EventType)
 	}
@@ -177,15 +204,16 @@ func (m *Manager) Start(ctx context.Context) error {
 			for _, key := range registered {
 				_ = m.routes.UnregisterRoute(key)
 			}
+			var cleanupErr error
 			for j, candidate := range materialized {
 				if j <= i {
-					m.stopMaterialized(candidate)
+					cleanupErr = errors.Join(cleanupErr, m.stopMaterialized(candidate))
 				} else {
-					m.discardMaterialized(candidate)
+					cleanupErr = errors.Join(cleanupErr, m.discardMaterialized(candidate))
 				}
 			}
 			m.parentCtx = nil
-			return fmt.Errorf("start recovered team %s: %w", activation.team.spec.ID, err)
+			return errors.Join(fmt.Errorf("start recovered team %s: %w", activation.team.spec.ID, err), cleanupErr)
 		}
 	}
 	for _, activation := range materialized {
@@ -295,19 +323,22 @@ func (m *Manager) Provision(ctx context.Context, req agenttemplate.ProvisionRequ
 		if err != nil {
 			return m.markProvisionFailed(existing, "provision_failed:runtime_prepare", err)
 		}
-		activation := m.materializePrepared(prep)
+		activation, err := m.materializePrepared(prep, false)
+		if err != nil {
+			return m.markProvisionFailed(existing, "provision_failed:runtime_materialize", err)
+		}
 		if err := m.startMaterialized(activation); err != nil {
-			m.stopMaterialized(activation)
-			return m.markProvisionFailed(existing, "provision_failed:runner_start", err)
+			cleanupErr := m.stopMaterialized(activation)
+			return m.markProvisionFailed(existing, "provision_failed:runner_start", errors.Join(err, cleanupErr))
 		}
 		if err := m.registerRoute(existing, tmpl); err != nil {
 			// RegisterRoute should be all-or-nothing, but remove the key
 			// defensively before stopping the runtime in case an implementation
 			// returned an error after a partial mutation.
 			_ = m.routes.UnregisterRoute(existing.EventType)
-			m.stopMaterialized(activation)
+			cleanupErr := m.stopMaterialized(activation)
 			return m.markProvisionFailed(existing, "provision_failed:route_registration",
-				fmt.Errorf("register team route: %w", err))
+				errors.Join(fmt.Errorf("register team route: %w", err), cleanupErr))
 		}
 		m.releaseMaterialized(activation)
 		active := m.active[existing.ID]
@@ -323,25 +354,77 @@ func (m *Manager) Provision(ctx context.Context, req agenttemplate.ProvisionRequ
 // Shutdown cancels runtime runners and removes their ephemeral routes while
 // deliberately leaving durable specs ready for the next process to recover.
 func (m *Manager) Shutdown() {
+	m.ShutdownPreservingMailboxes()
+	m.FinalizeShutdownMailboxes()
+}
+
+// ShutdownPreservingMailboxes 取消 route 和 runner、等待所有 Team 执行退出，
+// 但暂不注销邮箱。System.Shutdown 用它在稳定静止态导出最终 Session 快照，
+// 防止普通 Shutdown 先删动态邮箱再保存而永久丢失未读邮件。
+func (m *Manager) ShutdownPreservingMailboxes() {
+	if m == nil {
+		return
+	}
 	m.opMu.Lock()
+	if m.shutdownDone == nil {
+		m.shutdownDone = make(chan struct{})
+	}
 	if m.closed {
+		done := m.shutdownDone
 		m.opMu.Unlock()
+		if done != nil {
+			<-done
+		} else {
+			m.cleanupWG.Wait()
+		}
 		return
 	}
 	m.closed = true
 	m.started = false
+	if m.preservedShutdownMailboxIDs == nil {
+		m.preservedShutdownMailboxIDs = make(map[string]struct{})
+	}
 	active := make([]*activeTeam, 0, len(m.active))
 	for id, team := range m.active {
 		delete(m.active, id)
 		_ = m.routes.UnregisterRoute(team.spec.EventType)
 		team.cancel()
+		for _, agentID := range team.agentIDs {
+			m.preservedShutdownMailboxIDs[agentID] = struct{}{}
+		}
 		active = append(active, team)
 	}
 	m.opMu.Unlock()
 	for _, team := range active {
-		m.waitAndCleanup(team)
+		if err := m.waitAndCleanup(team, cleanupMailboxPreserveForSnapshot); err != nil {
+			log.Printf("[team] shutdown cleanup team=%s: %v", team.spec.ID, err)
+		}
 	}
 	m.cleanupWG.Wait()
+	close(m.shutdownDone)
+}
+
+// FinalizeShutdownMailboxes 删除为最终快照暂留的动态邮箱。它与
+// ShutdownPreservingMailboxes 均幂等；直接调用 Shutdown 仍保留旧的一步式语义。
+func (m *Manager) FinalizeShutdownMailboxes() {
+	if m == nil {
+		return
+	}
+	// 允许调用方直接/并发调用 Finalize；先等待两阶段关闭的第一阶段完成。
+	m.ShutdownPreservingMailboxes()
+	m.opMu.Lock()
+	ids := make([]string, 0, len(m.preservedShutdownMailboxIDs))
+	for agentID := range m.preservedShutdownMailboxIDs {
+		ids = append(ids, agentID)
+	}
+	m.preservedShutdownMailboxIDs = nil
+	m.opMu.Unlock()
+	if m.deps.MBRegistry == nil {
+		return
+	}
+	for _, agentID := range ids {
+		_ = m.deps.MBRegistry.Unregister(agentID)
+	}
 }
 
 func (m *Manager) ActiveCount() int {
@@ -362,11 +445,32 @@ func (m *Manager) Subscribe() []trace.EventKind {
 		trace.KindPlanPaused,
 		trace.KindTaskCompleted,
 		trace.KindTaskFailed,
+		trace.KindTaskBlocked,
 		trace.KindTaskCancelled,
 	}
 }
 
-func (m *Manager) IsSync() bool  { return true }
+// IsSync 返回 false（C2 修复，2026-07-18）：本 Reactor 的 Run 会读
+// GetTask/GetPlan、竞争 opMu、并在 StopPlan 里做全量 JSON 重写 + 两次 fsync。
+// 过去 IsSync=true 让这些工作全部压在 trace.Emit 调用方（agent 终态路径）
+// 的 goroutine 上，磁盘抖动直接拖慢所有 agent。
+//
+// 改 async 的排序安全论证（改前核查结论）：
+//  1. Registry 只保证 sync Reactor 按 priority 串行、先于 async 投递；订阅
+//     同类事件的其他 Reactor 均不消费 team 状态——TaskEndCallbackReactor
+//     (100, sync) 只触发任务结束回调，spawn.Manager (800, async) 与 950 档
+//     观察类 Reactor（history/artifact/read-set-write）各自独立。
+//  2. 终态事件的 Emit 方（agent 状态机、tools/plan_control）在 Emit 返回后
+//     不再触碰任何 team 运行时状态。
+//  3. 向已终态 Plan 发起 Provision 由 WithControllerLease 拦截（非 Running
+//     即 ErrPlanPaused），与 Reactor 执行时机无关。
+//  4. Run 本身幂等且由 opMu 串行化、带 closed 守卫：多个终态事件并发触发
+//     或与 Shutdown 竞态都安全；Start 恢复时还会兜底清理终态 Plan 的残留
+//     Team，事件与拆解之间崩溃不留泄漏。
+//
+// 代价：async Reactor 失败只记日志、不再向 trace 打 KindError。可接受——
+// GetPlan/StopPlan 的错误是持久层故障，会在其他路径同样暴露。
+func (m *Manager) IsSync() bool  { return false }
 func (m *Manager) Priority() int { return 790 }
 
 func (m *Manager) Run(ev trace.Event) error {
@@ -406,12 +510,15 @@ func (m *Manager) Run(ev trace.Event) error {
 		delete(m.active, id)
 		_ = m.routes.UnregisterRoute(team.spec.EventType)
 		team.cancel()
-		// Never wait here: a synchronous trace Reactor may be executing on the
-		// very runner being cancelled.
+		// 永不在这里等待：Run 可能在 registry 的 async goroutine 上执行，
+		// 同步等待被 cancel 的 runner 退出会把拆解延迟耦合进事件路径；
+		// 保持"取消即返回，清理交给独立 goroutine"。
 		m.cleanupWG.Add(1)
 		go func(team *activeTeam) {
 			defer m.cleanupWG.Done()
-			m.waitAndCleanup(team)
+			if err := m.waitAndCleanup(team, cleanupMailboxUnregister); err != nil {
+				log.Printf("[team] terminal cleanup team=%s: %v", team.spec.ID, err)
+			}
 		}(team)
 	}
 	return nil
@@ -466,17 +573,41 @@ func (m *Manager) prepare(spec TeamSpec, tmpl *agenttemplate.Template) (runtimeP
 	return runtimePreparation{spec: spec, tmpl: tmpl, clients: clients}, nil
 }
 
-func (m *Manager) materializePrepared(prep runtimePreparation) runtimeActivation {
+func (m *Manager) materializePrepared(prep runtimePreparation, claimRecoveredMailboxes bool) (runtimeActivation, error) {
 	ctx, cancel := context.WithCancel(m.parentCtx)
 	agentIDs := teamAgentIDs(prep.spec, prep.tmpl.Name)
+	claimedMailboxes := make([]*mailbox.Mailbox, len(agentIDs))
+	recoveredClaims := make(map[string]string)
+	if claimRecoveredMailboxes && m.deps.MBRegistry != nil {
+		for i, agentID := range agentIDs {
+			mb, err := m.deps.MBRegistry.ClaimRecovered(agentID, prep.spec.EventType)
+			if err != nil {
+				cancel()
+				var rollbackErr error
+				for claimedAgentID, eventType := range recoveredClaims {
+					rollbackErr = errors.Join(rollbackErr,
+						m.deps.MBRegistry.RollbackRecoveredClaim(claimedAgentID, eventType))
+				}
+				return runtimeActivation{}, errors.Join(err, rollbackErr)
+			}
+			if mb != nil {
+				claimedMailboxes[i] = mb
+				recoveredClaims[agentID] = prep.spec.EventType
+			}
+		}
+	}
 	active := &activeTeam{
 		spec: prep.spec, agentIDs: agentIDs,
-		tools: append([]string(nil), prep.tmpl.Tools...), cancel: cancel,
+		tools:                  append([]string(nil), prep.tmpl.Tools...),
+		recoveredMailboxClaims: recoveredClaims, cancel: cancel,
 	}
 	runners := make([]*runner.Runner, 0, prep.spec.Replicas)
 	for i := 0; i < prep.spec.Replicas; i++ {
 		deps := m.deps
 		deps.LLMClient = prep.clients[i]
+		// 只交接上面已原子认领的邮箱；无快照邮箱和新
+		// Provision 都保持 nil，由 runner.New 走严格 Register。
+		deps.ClaimedMailbox = claimedMailboxes[i]
 		rt := config.AgentRuntimeConfig{
 			InstanceID: agentIDs[i], Kind: "template:" + prep.tmpl.Name,
 			EventType: prep.spec.EventType, AllowedTools: append([]string(nil), prep.tmpl.Tools...),
@@ -494,7 +625,7 @@ func (m *Manager) materializePrepared(prep runtimePreparation) runtimeActivation
 	return runtimeActivation{
 		team: active, tmpl: prep.tmpl, runners: runners, ctx: ctx,
 		runGate: make(chan struct{}),
-	}
+	}, nil
 }
 
 func (m *Manager) startMaterialized(activation runtimeActivation) error {
@@ -528,21 +659,21 @@ func (m *Manager) releaseMaterialized(activation runtimeActivation) {
 	close(activation.runGate)
 }
 
-func (m *Manager) discardMaterialized(activation runtimeActivation) {
+func (m *Manager) discardMaterialized(activation runtimeActivation) error {
 	if activation.team == nil {
-		return
+		return nil
 	}
 	activation.team.cancel()
-	m.waitAndCleanup(activation.team)
+	return m.waitAndCleanup(activation.team, cleanupMailboxRollbackRecovered)
 }
 
-func (m *Manager) stopMaterialized(activation runtimeActivation) {
+func (m *Manager) stopMaterialized(activation runtimeActivation) error {
 	if activation.team == nil {
-		return
+		return nil
 	}
 	delete(m.active, activation.team.spec.ID)
 	activation.team.cancel()
-	m.waitAndCleanup(activation.team)
+	return m.waitAndCleanup(activation.team, cleanupMailboxRollbackRecovered)
 }
 
 func (m *Manager) markProvisionFailed(spec TeamSpec, reason string, cause error) error {
@@ -572,17 +703,29 @@ func (m *Manager) activeInstanceCount() int {
 	return total
 }
 
-func (m *Manager) waitAndCleanup(team *activeTeam) {
+func (m *Manager) waitAndCleanup(team *activeTeam, mailboxMode mailboxCleanupMode) error {
 	if team == nil {
-		return
+		return nil
 	}
 	team.wg.Wait()
 	for _, rn := range team.runners {
 		rn.Close()
 	}
+	var cleanupErr error
 	for _, agentID := range team.agentIDs {
 		if m.deps.MBRegistry != nil {
-			_ = m.deps.MBRegistry.Unregister(agentID)
+			eventType, recovered := team.recoveredMailboxClaims[agentID]
+			switch {
+			case mailboxMode == cleanupMailboxPreserveForSnapshot:
+				// Runner 已停止，邮箱不再被消费；保留到最终快照导出完成。
+			case mailboxMode == cleanupMailboxRollbackRecovered && recovered:
+				// materialize/route/start 失败不删除已恢复邮箱；只撤销
+				// claim，让后续重试能重新认领同一 FIFO 未读队列。
+				cleanupErr = errors.Join(cleanupErr,
+					m.deps.MBRegistry.RollbackRecoveredClaim(agentID, eventType))
+			default:
+				_ = m.deps.MBRegistry.Unregister(agentID)
+			}
 		}
 		if m.deps.Activity != nil {
 			_ = m.deps.Activity.UnregisterAgent(agentID)
@@ -591,6 +734,7 @@ func (m *Manager) waitAndCleanup(team *activeTeam) {
 			_ = m.deps.Roster.ReleaseAll(agentID)
 		}
 	}
+	return cleanupErr
 }
 
 func findIdempotent(specs []TeamSpec, req agenttemplate.ProvisionRequest) (TeamSpec, bool) {

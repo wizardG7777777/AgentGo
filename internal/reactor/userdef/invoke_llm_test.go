@@ -169,13 +169,19 @@ func TestInvokeLLM_WriteFile_RejectsOutsideRoot(t *testing.T) {
 	dir := t.TempDir()
 	writePrompt(t, dir, "p.md", "x")
 
+	// 越界目标必须对两个平台都是绝对路径：硬编码 /tmp/... 在 Windows 上是
+	// 相对路径（无卷名），会被 Join 进 projectRoot 内部而无法触发拒绝。
+	// 用 root 之外的第二个临时目录构造真正的越界路径。
+	outside := t.TempDir()
+	evilPath := filepath.Join(outside, "agentgo-evil-${event.task.id}.md")
+
 	yamlData := []byte(`
 reactors:
   - on: task_failed
     invoke_llm:
       prompt: { file: ./p.md }
       output:
-        write_file: /tmp/agentgo-evil-${event.task.id}.md
+        write_file: ` + evilPath + `
 `)
 	llm := &fakeLLM{response: "y"}
 	rs, err := Load(yamlData, dir, dir, Deps{LLM: llm})

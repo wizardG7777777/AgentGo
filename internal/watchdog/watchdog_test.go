@@ -2,7 +2,9 @@ package watchdog
 
 import (
 	"context"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,7 +20,7 @@ func newTestWatchdog() (*Watchdog, store.TaskStore, chan model.Event) {
 	cfg.Infra.Store.DefaultTimeoutSec = 300
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	r := roster.NewMemoryRoster()
-	w := New(s, cfg, ch, r, nil) // 既有测试不需要 MailRegistry；nil 让 sendCrashReport 静默跳过
+	w := New(s, cfg, ch, r, nil, RouteResolverFunc(func(_, _ string) bool { return true }))
 	return w, s, ch
 }
 
@@ -38,6 +40,94 @@ func setTaskTiming(t *testing.T, s store.TaskStore, taskID string, createdAt, st
 	}
 	if err := mem.SetTaskTiming(taskID, createdAt, startedAt); err != nil {
 		t.Fatalf("SetTaskTiming: %v", err)
+	}
+}
+
+func setTaskPendingSince(t *testing.T, s store.TaskStore, taskID string, pendingSince time.Time) {
+	t.Helper()
+	mem, ok := s.(*store.MemoryTaskStore)
+	if !ok {
+		t.Fatal("test store is not MemoryTaskStore")
+	}
+	if err := mem.SetTaskPendingSince(taskID, pendingSince); err != nil {
+		t.Fatalf("SetTaskPendingSince: %v", err)
+	}
+}
+
+func drainEvents(ch <-chan model.Event) []model.Event {
+	var events []model.Event
+	for {
+		select {
+		case evt := <-ch:
+			events = append(events, evt)
+		default:
+			return events
+		}
+	}
+}
+
+func watchdogAlerts(events []model.Event) []model.Event {
+	var alerts []model.Event
+	for _, evt := range events {
+		if evt.Type == model.EventWatchdogAlert {
+			alerts = append(alerts, evt)
+		}
+	}
+	return alerts
+}
+
+type fakePlanRouteRegistry struct {
+	available bool
+	calls     int
+}
+
+func (f *fakePlanRouteRegistry) CanRouteForPlan(_, _ string, _ ...string) bool {
+	f.calls++
+	return f.available
+}
+
+func TestRuntimeRouteResolverPreservesBuiltInSchedulerRoute(t *testing.T) {
+	registry := &fakePlanRouteRegistry{}
+	resolver := NewRuntimeRouteResolver(registry)
+	if !resolver.HasRunnableRoute("plan-1", "__scheduler__") {
+		t.Fatal("built-in scheduler route must be runnable without AgentRegistry registration")
+	}
+	if registry.calls != 0 {
+		t.Fatalf("scheduler route unexpectedly queried registry %d times", registry.calls)
+	}
+	if resolver.HasRunnableRoute("plan-1", "missing") {
+		t.Fatal("unregistered ordinary route reported runnable")
+	}
+	registry.available = true
+	if !resolver.HasRunnableRoute("plan-1", "explore") {
+		t.Fatal("registered ordinary route reported unavailable")
+	}
+}
+
+func TestPendingGraceFallbackIsIndependentFromProcessingTimeout(t *testing.T) {
+	w, _, _ := newTestWatchdog()
+	w.Config.Infra.Store.DefaultTimeoutSec = 1
+	w.Config.Infra.Watchdog.PendingAlertGraceSec = 0
+	w.Config.Infra.Watchdog.UnroutableGraceSec = 0
+
+	want := 300 * time.Second
+	if got := w.claimGrace(); got != want {
+		t.Fatalf("claimGrace = %v, want independent fallback %v", got, want)
+	}
+	if got := w.unroutableGrace(); got != want {
+		t.Fatalf("unroutableGrace = %v, want independent fallback %v", got, want)
+	}
+}
+
+func TestWatchdog_PrunesObservationForTaskNoLongerInStore(t *testing.T) {
+	w, _, _ := newTestWatchdog()
+	w.observePending("evicted-task", pendingObservationRoutable, time.Now())
+	w.RunOnce()
+
+	w.pendingMu.Lock()
+	defer w.pendingMu.Unlock()
+	if len(w.pendingObservations) != 0 {
+		t.Fatalf("stale observations were not pruned: %+v", w.pendingObservations)
 	}
 }
 
@@ -83,21 +173,212 @@ func TestWatchdog_NoFalsePositive(t *testing.T) {
 	}
 }
 
-func TestWatchdog_UnclaimedDetection(t *testing.T) {
-	w, s, _ := newTestWatchdog()
-	w.Config.Infra.Store.DefaultTimeoutSec = 1 // 1 second threshold for testing
+func TestWatchdog_OldCreatedAtDoesNotAgeFreshPendingLease(t *testing.T) {
+	w, s, ch := newTestWatchdog()
+	w.Config.Infra.Watchdog.PendingAlertGraceSec = 1
 
-	task := &model.Task{Description: "unclaimed task"}
-	s.PublishTask(task)
-
-	// Manipulate CreatedAt to simulate long wait
-	setTaskTiming(t, s, task.ID, time.Now().Add(-5*time.Second), time.Time{})
+	task := &model.Task{Description: "fresh retry lease"}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	freshPending := time.Now()
+	setTaskTiming(t, s, task.ID, freshPending.Add(-24*time.Hour), time.Time{})
+	setTaskPendingSince(t, s, task.ID, freshPending)
 
 	inspectAll(w)
 
 	got, _ := s.GetTask(task.ID)
-	if got.Status != model.TaskStatusFailed {
-		t.Errorf("status = %s, want failed (unclaimed)", got.Status)
+	if got.Status != model.TaskStatusPending {
+		t.Errorf("status = %s, want pending; immutable CreatedAt must not drive queue timeout", got.Status)
+	}
+	for _, evt := range drainEvents(ch) {
+		if evt.Type == model.EventWatchdogAlert {
+			t.Fatalf("fresh pending lease emitted watchdog alert: %+v", evt)
+		}
+	}
+}
+
+func TestWatchdog_RoutableQueueWaitAlertsOnceWithoutFailure(t *testing.T) {
+	w, s, ch := newTestWatchdog()
+	w.Config.Infra.Watchdog.PendingAlertGraceSec = 10
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	w.now = func() time.Time { return now }
+
+	task := &model.Task{Description: "queued behind busy compatible runner", EventType: "explore"}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	setTaskPendingSince(t, s, task.ID, now.Add(-11*time.Second))
+
+	inspectAll(w)
+	inspectAll(w)
+
+	got, _ := s.GetTask(task.ID)
+	if got.Status != model.TaskStatusPending {
+		t.Fatalf("status = %s, want pending; route backlog is not task failure", got.Status)
+	}
+	alerts := 0
+	for _, evt := range drainEvents(ch) {
+		if evt.Type != model.EventWatchdogAlert {
+			continue
+		}
+		alerts++
+		if evt.Payload["reason_code"] != "claim_starvation" {
+			t.Errorf("reason_code = %q, want claim_starvation", evt.Payload["reason_code"])
+		}
+	}
+	if alerts != 1 {
+		t.Fatalf("watchdog alerts = %d, want exactly one per pending lease", alerts)
+	}
+}
+
+func TestWatchdog_RetryRearmsClaimAlertFromNewPendingLease(t *testing.T) {
+	w, s, ch := newTestWatchdog()
+	w.Config.Infra.Watchdog.PendingAlertGraceSec = 10
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	w.now = func() time.Time { return now }
+
+	task := &model.Task{Description: "retry gets a new queue lease"}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	setTaskPendingSince(t, s, task.ID, now.Add(-11*time.Second))
+	inspectAll(w)
+	if alerts := watchdogAlerts(drainEvents(ch)); len(alerts) != 1 || alerts[0].Payload["reason_code"] != "claim_starvation" {
+		t.Fatalf("first lease alerts = %+v, want one claim_starvation", alerts)
+	}
+
+	if err := s.ClaimTask("worker-1", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RetryRollback("worker-1", task.ID, "retry"); err != nil {
+		t.Fatal(err)
+	}
+	retried, _ := s.GetTask(task.ID)
+	if retried.PendingSince.IsZero() {
+		t.Fatal("RetryRollback did not establish a new PendingSince")
+	}
+
+	now = retried.PendingSince.Add(9 * time.Second)
+	inspectAll(w)
+	if alerts := watchdogAlerts(drainEvents(ch)); len(alerts) != 0 {
+		t.Fatalf("new pending lease alerted too early: %+v", alerts)
+	}
+	now = retried.PendingSince.Add(11 * time.Second)
+	inspectAll(w)
+	alerts := watchdogAlerts(drainEvents(ch))
+	if len(alerts) != 1 || alerts[0].Payload["reason_code"] != "claim_starvation" {
+		t.Fatalf("second lease alerts = %+v, want one re-armed claim_starvation", alerts)
+	}
+}
+
+func TestWatchdog_UnroutableTaskBlocksAfterIndependentGrace(t *testing.T) {
+	w, s, ch := newTestWatchdog()
+	w.RouteResolver = RouteResolverFunc(func(_, _ string) bool { return false })
+	w.Config.Infra.Watchdog.UnroutableGraceSec = 10
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	w.now = func() time.Time { return now }
+
+	task := &model.Task{Description: "no listener", EventType: "missing-route"}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	inspectAll(w) // starts the independent no-route observation
+	now = now.Add(10 * time.Second)
+	inspectAll(w)
+	if got, _ := s.GetTask(task.ID); got.Status != model.TaskStatusPending {
+		t.Fatalf("status at grace boundary = %s, want pending", got.Status)
+	}
+
+	now = now.Add(time.Second)
+	inspectAll(w)
+	got, _ := s.GetTask(task.ID)
+	if got.Status != model.TaskStatusBlocked {
+		t.Fatalf("status = %s, want blocked after no-route grace", got.Status)
+	}
+	if got.Error == "" || !strings.Contains(got.Error, "no_compatible_route") {
+		t.Fatalf("blocked reason = %q, want no_compatible_route", got.Error)
+	}
+	foundAlert := false
+	for _, evt := range drainEvents(ch) {
+		if evt.Type == model.EventWatchdogAlert && evt.Payload["reason_code"] == "no_compatible_route" {
+			foundAlert = true
+		}
+	}
+	if !foundAlert {
+		t.Fatal("missing structured no_compatible_route watchdog alert")
+	}
+}
+
+func TestWatchdog_DependencyWaitDoesNotConsumeNoRouteGrace(t *testing.T) {
+	w, s, _ := newTestWatchdog()
+	w.RouteResolver = RouteResolverFunc(func(_, eventType string) bool { return eventType == "" })
+	w.Config.Infra.Watchdog.UnroutableGraceSec = 10
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	w.now = func() time.Time { return now }
+
+	dep := &model.Task{Description: "dependency"}
+	if err := s.PublishTask(dep); err != nil {
+		t.Fatal(err)
+	}
+	task := &model.Task{
+		Description: "waits normally", EventType: "missing-route",
+		Dependencies: []string{dep.ID},
+	}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	inspectAll(w)
+	now = now.Add(time.Hour)
+	inspectAll(w)
+	if got, _ := s.GetTask(task.ID); got.Status != model.TaskStatusPending {
+		t.Fatalf("dependency wait status = %s, want pending", got.Status)
+	}
+
+	if err := s.ClaimTask("dep-runner", dep.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SubmitResult("dep-runner", dep.ID, "done"); err != nil {
+		t.Fatal(err)
+	}
+	inspectAll(w) // no-route grace starts only now
+	if got, _ := s.GetTask(task.ID); got.Status != model.TaskStatusPending {
+		t.Fatalf("status immediately after dependency completion = %s, want pending", got.Status)
+	}
+	now = now.Add(11 * time.Second)
+	inspectAll(w)
+	if got, _ := s.GetTask(task.ID); got.Status != model.TaskStatusBlocked {
+		t.Fatalf("status after independent no-route grace = %s, want blocked", got.Status)
+	}
+}
+
+func TestWatchdog_PlanClaimHoldDoesNotConsumeNoRouteGrace(t *testing.T) {
+	w, s, ch := newTestWatchdog()
+	w.RouteResolver = RouteResolverFunc(func(_, _ string) bool { return false })
+	w.Config.Infra.Watchdog.UnroutableGraceSec = 1
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	w.now = func() time.Time { return now }
+	mem := s.(*store.MemoryTaskStore)
+	mem.SetTaskPlanHooks(store.TaskPlanHooks{
+		CanClaim: func(*model.Task) error { return errors.New("plan paused") },
+	})
+
+	task := &model.Task{Description: "held by plan", PlanID: "plan-paused", EventType: "team:work"}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	inspectAll(w)
+	now = now.Add(time.Hour)
+	inspectAll(w)
+
+	got, _ := s.GetTask(task.ID)
+	if got.Status != model.TaskStatusPending {
+		t.Fatalf("status = %s, want pending while Plan CanClaim rejects", got.Status)
+	}
+	for _, evt := range drainEvents(ch) {
+		if evt.Type == model.EventWatchdogAlert {
+			t.Fatalf("Plan-held task emitted watchdog alert: %+v", evt)
+		}
 	}
 }
 
@@ -120,6 +401,44 @@ func TestWatchdog_CascadeCancellation(t *testing.T) {
 	got, _ := s.GetTask(task.ID)
 	if got.Status != model.TaskStatusCancelled {
 		t.Errorf("status = %s, want cancelled (cascade)", got.Status)
+	}
+}
+
+func TestWatchdog_BlockedDependencyBlocksDownstreamWithReason(t *testing.T) {
+	w, s, ch := newTestWatchdog()
+
+	dep := &model.Task{Description: "unroutable dependency"}
+	if err := s.PublishTask(dep); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TransitionState(dep.ID, model.TaskStatusPending, model.TaskStatusBlocked); err != nil {
+		t.Fatal(err)
+	}
+	task := &model.Task{
+		Description:  "downstream must not wait forever",
+		Dependencies: []string{dep.ID},
+	}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+
+	inspectAll(w)
+
+	got, _ := s.GetTask(task.ID)
+	if got.Status != model.TaskStatusBlocked {
+		t.Fatalf("status = %s, want blocked when dependency is blocked", got.Status)
+	}
+	if !strings.Contains(got.Error, "dependency_blocked") || !strings.Contains(got.Error, dep.ID) {
+		t.Fatalf("blocked reason = %q, want dependency_blocked with dependency ID", got.Error)
+	}
+	found := false
+	for _, evt := range watchdogAlerts(drainEvents(ch)) {
+		if evt.TaskID == task.ID && evt.Payload["reason_code"] == "dependency_blocked" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("missing structured dependency_blocked watchdog alert")
 	}
 }
 
@@ -272,7 +591,7 @@ func TestWatchdog_CascadeCancellation_MissingDep(t *testing.T) {
 //  4. 类似覆盖依赖失败级联取消 / unclaimed timeout 两条路径
 func TestWatchdogStruct_HasMailRegistryForCrashReports(t *testing.T) {
 	w := &Watchdog{}
-	typ := reflect.TypeOf(*w)
+	typ := reflect.TypeOf(w).Elem()
 	// 可接受的字段名（命名留给实施阶段选择）
 	candidates := []string{"MailRegistry", "MailSender", "Mailbox", "Mails", "Notifier"}
 	for _, name := range candidates {

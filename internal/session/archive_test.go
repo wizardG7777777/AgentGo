@@ -206,3 +206,114 @@ func TestRunArchive_EmptyDir_NoError(t *testing.T) {
 		t.Fatalf("RunArchive on empty dir: %v", err)
 	}
 }
+
+// TestRunArchive_StartupScenario_ActiveUntouchedAndCapped 复刻 bootstrap 启动
+// 时序（先建 SessionManager + 打开 history 句柄，再跑一次 RunArchive），断言：
+// 超期 closed session 被归档、归档数封顶、活跃 Session 原封不动、且活跃
+// Session 持有打开句柄时调用不报错（Windows rename 陷阱）。
+func TestRunArchive_StartupScenario_ActiveUntouchedAndCapped(t *testing.T) {
+	dir := t.TempDir()
+	cfg := SessionConfig{RetentionDays: 7, ArchiveMax: 2, Enabled: true}
+
+	// 3 个超期 closed session（由旧到新），归档上限 2 → 最旧的应被清理
+	oldTimes := []time.Time{
+		time.Now().UTC().AddDate(0, 0, -30),
+		time.Now().UTC().AddDate(0, 0, -20),
+		time.Now().UTC().AddDate(0, 0, -10),
+	}
+	ids := make([]string, len(oldTimes))
+	for i, ot := range oldTimes {
+		ids[i] = createClosedSession(t, dir, ot)
+	}
+
+	// 活跃 Session（与 bootstrap 相同：manager 就绪后即打开 history 句柄）
+	sm, err := NewSessionManager(dir, cfg)
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	sm.EnableHistoryLog()
+	t.Cleanup(func() { _ = sm.Close() })
+	activeID := sm.Current().ID
+
+	// 与 bootstrap 相同的调用——活跃 Session 的 history 句柄正开着
+	if err := sm.RunArchive(); err != nil {
+		t.Fatalf("RunArchive with open active history handle: %v", err)
+	}
+
+	// 活跃 Session 原地未动，metadata 仍 active
+	activeDir := filepath.Join(dir, "sess-"+activeID)
+	if _, err := os.Stat(activeDir); err != nil {
+		t.Fatalf("active session dir should be untouched: %v", err)
+	}
+	meta, err := LoadMetadata(filepath.Join(activeDir, "metadata.json"))
+	if err != nil {
+		t.Fatalf("LoadMetadata active: %v", err)
+	}
+	if meta.Status != "active" {
+		t.Errorf("active session status = %q, want active", meta.Status)
+	}
+
+	// 超期的 3 个全部移出原目录
+	for _, id := range ids {
+		if _, err := os.Stat(filepath.Join(dir, "sess-"+id)); !os.IsNotExist(err) {
+			t.Errorf("expired session %s should be moved out of baseDir", id)
+		}
+	}
+
+	// 归档封顶为 2，保留最新的两个（ids[1], ids[2]），最旧的（ids[0]）被删除
+	archiveMatches, err := filepath.Glob(filepath.Join(dir, "archive", "sess-*"))
+	if err != nil {
+		t.Fatalf("Glob archive: %v", err)
+	}
+	if len(archiveMatches) != 2 {
+		t.Fatalf("archive count = %d, want 2 (ArchiveMax)", len(archiveMatches))
+	}
+	if _, err := os.Stat(filepath.Join(dir, "archive", "sess-"+ids[0])); !os.IsNotExist(err) {
+		t.Errorf("oldest archive %s should have been deleted by cap", ids[0])
+	}
+	for _, id := range ids[1:] {
+		if _, err := os.Stat(filepath.Join(dir, "archive", "sess-"+id)); err != nil {
+			t.Errorf("expected archive %s retained: %v", id, err)
+		}
+	}
+}
+
+// TestRunArchive_NeverArchivesCurrentSession 防御性场景：当前活跃 Session 的
+// 磁盘 metadata 异常变为 closed 且超期（例如异常退出留下的状态），RunArchive
+// 也必须跳过它——不能 rename 持有打开句柄的活跃目录。
+func TestRunArchive_NeverArchivesCurrentSession(t *testing.T) {
+	dir := t.TempDir()
+	cfg := SessionConfig{RetentionDays: 7, ArchiveMax: 50, Enabled: true}
+
+	sm, err := NewSessionManager(dir, cfg)
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	sm.EnableHistoryLog()
+	t.Cleanup(func() { _ = sm.Close() })
+	activeID := sm.Current().ID
+
+	// 把活跃 Session 的磁盘 metadata 篡改为 closed + 超期
+	metaPath := filepath.Join(dir, "sess-"+activeID, "metadata.json")
+	meta, err := LoadMetadata(metaPath)
+	if err != nil {
+		t.Fatalf("LoadMetadata: %v", err)
+	}
+	meta.Status = "closed"
+	meta.CreatedAt = time.Now().UTC().AddDate(0, 0, -30).Format(time.RFC3339Nano)
+	if err := meta.Save(metaPath); err != nil {
+		t.Fatalf("Save tampered metadata: %v", err)
+	}
+
+	if err := sm.RunArchive(); err != nil {
+		t.Fatalf("RunArchive: %v", err)
+	}
+
+	// 活跃 Session 必须仍在原位（显式 guard 生效，而非靠状态检查漏过）
+	if _, err := os.Stat(filepath.Join(dir, "sess-"+activeID)); err != nil {
+		t.Fatalf("current session must never be archived: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "archive", "sess-"+activeID)); !os.IsNotExist(err) {
+		t.Error("current session must not appear in archive/")
+	}
+}

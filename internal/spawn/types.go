@@ -38,7 +38,9 @@ type SpawnRequest struct {
 	Override               RuntimeOverride
 	InitialTaskDescription string
 	Lifecycle              string // "one_shot" 是 v5 仅支持的值；空串等同 one_shot
-	SourceTaskID           string // 触发 spawn 的上游任务，仅用于 trace/排障
+	SourceTaskID           string // 触发 spawn 的上游任务，也是 initial Task 的显式 parent
+	ReplyToAgentID         string // 接收 initial Task 生命周期汇报的上游代理邮箱
+	BatchID                string // 继承触发事件的批次；空时回退 SourceTaskID
 	Depth                  int    // 本次 spawn 后的 reactor 深度；根事件触发 spawn 时为 1
 }
 

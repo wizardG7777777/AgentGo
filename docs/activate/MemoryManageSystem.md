@@ -1,12 +1,14 @@
+> **状态说明（2026-07-19）**：本文是 Memory 后续路线图。当前仅 `ProcessStore` 可用；Session/Project 后端与向量检索尚未实现，详见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)。
+
 # MemoryManageSystem：v5 记忆管理系统
 
 > **状态**：📋 起草中（2026-04-30 从 nextUpgrade_v5.md §13 提升至 v5 主线）
 > **优先级**：P0（v5 关键架构升级，废止 team-awareness 临时方案 + 取代 ReactiveSystem 原 Provider 抽象）
 > **关联文档**：
 > - [ReactiveSystem.md](ReactiveSystem.md)（原 Provider 抽象已被本模块替代；后续配套讨论中 Aggregator 也下放为 Mailbox 子系统内部固定机制——4 类角色最终缩为 **2 类核心：Reactor / Gate**）
-> - [nextUpgrade_v5.md §13](nextUpgrade_v5.md)（本文档的设计源头；§13 已被本文档取代，仅保留指针）
-> - [InterfaceDesign.md](InterfaceDesign.md)（Memory 接口规约由本文档定稿）
-> - [TraceUpgrade.md](TraceUpgrade.md)（`memory_put` / `memory_query` 新 EventKind 由 Phase 2 落地）
+> - [nextUpgrade_v5.md §13](../archived/nextUpgrade_v5.md)（本文档的设计源头；§13 已被本文档取代，仅保留指针）
+> - [旧 TUI 接口设计归档](../archived/interface-design-tui-2026-05.md)（Memory 接口规约由本文档定稿）
+> - [Trace 升级设计归档](../archived/trace-upgrade-design-2026-05.md)（`memory_put` / `memory_query` 新 EventKind 由 Phase 2 落地）
 > **关键判决**：
 > - team-awareness 三个 hook **直接删除**，不重命名为 Provider
 > - ReactiveSystem.md 原 Provider 抽象**彻底废弃**
@@ -33,7 +35,7 @@ ReactiveSystem.md 原计划的 Provider 抽象（v5 4 类角色之一）本质�
 
 ## 1. 背景：Agent Hook 的职责漂移
 
-承接 [nextUpgrade_v5.md §13.1](nextUpgrade_v5.md#L1086)：
+承接 [nextUpgrade_v5.md §13.1](../archived/nextUpgrade_v5.md#L1086)：
 
 `internal/hook/agent.go` 在 Sprint 1（2026-04-12）落地时，Agent Hook 被实现为**上下文注入框架**（`TeamAwarenessHook` 的 `PhaseTaskStart` / `PhaseLoopPre` 注入团队快照、文件占用、目标锚点）。**这与早期 RFC 中 "Trigger" 层（事件 → 动态拉起 Agent → 工作 → 销毁）的设计意图发生了漂移**。
 
@@ -164,7 +166,7 @@ type Agent struct {
 
 ### 3.5 当前代码对记忆扩展的约束
 
-承接 [§13.6](nextUpgrade_v5.md#L1321)，Memory System 落地时需要正视的现状约束：
+承接 [§13.6](../archived/nextUpgrade_v5.md#L1321)，Memory System 落地时需要正视的现状约束：
 
 | 约束 | 影响 | 缓解方案 |
 |---|---|---|
@@ -179,7 +181,7 @@ type Agent struct {
 
 ## 4. team-awareness 三 section 的迁移路径
 
-承接 [§13.5](nextUpgrade_v5.md#L1290)：
+承接 [§13.5](../archived/nextUpgrade_v5.md#L1290)：
 
 | Section | 当前位置 | 迁移目标 | 理由 |
 |---|---|---|---|
@@ -282,8 +284,8 @@ team-awareness 三个 hook 删除后，**`AgentHookRegistry` 在事实上为空*
 
 ## 8. 不在本模块范围
 
-- **Trigger System 重构**（[nextUpgrade_v5.md §13.4](nextUpgrade_v5.md#L1207) "AgentHook 重新定位为 Trigger System"）—— **仍归 V6 方向**，本模块不涉及。Trigger System 与 Memory System 是 §13 的两个并列议题，提前到 V5 的只有 Memory 部分
-- **常驻 Agent 与临时 Agent 共存**（[§13.4.3 AgentPool](nextUpgrade_v5.md#L1264)）—— 归 Trigger System，留 V6
+- **Trigger System 重构**（[nextUpgrade_v5.md §13.4](../archived/nextUpgrade_v5.md#L1207) "AgentHook 重新定位为 Trigger System"）—— **仍归 V6 方向**，本模块不涉及。Trigger System 与 Memory System 是 §13 的两个并列议题，提前到 V5 的只有 Memory 部分
+- **常驻 Agent 与临时 Agent 共存**（[§13.4.3 AgentPool](../archived/nextUpgrade_v5.md#L1264)）—— 归 Trigger System，留 V6
 - **向量检索**（`QueryByVector`）—— 接口预留，v5.x 引入实现
 - **`MemoryEntry.Embedding` 字段填充** —— 同上
 - **从 LLM 自动生成 Memory（如对话总结自动写入 Project Memory）** —— v5 不做；v5.x 探索时再讨论触发条件

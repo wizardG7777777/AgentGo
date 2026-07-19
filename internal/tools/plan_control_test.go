@@ -143,10 +143,12 @@ func TestResolvePlanPausePersistsUserOverrideAndPublishesResumeController(t *tes
 	}
 	foundResume := false
 	foundResumeID := ""
+	var foundResumeTask *model.Task
 	for _, task := range tasks {
 		if task.ID != target.ID && task.ID != decision.ID && task.PlanID == p.ID && task.EventType == "__scheduler__" && task.NodeRole == model.PlanNodeRoleController {
 			foundResume = true
 			foundResumeID = task.ID
+			foundResumeTask = task
 		}
 	}
 	if !foundResume {
@@ -154,6 +156,9 @@ func TestResolvePlanPausePersistsUserOverrideAndPublishesResumeController(t *tes
 	}
 	if p.ActiveDecisionTaskID != foundResumeID {
 		t.Fatalf("pause resolution did not atomically transfer controller authority: active=%s resume=%s", p.ActiveDecisionTaskID, foundResumeID)
+	}
+	if foundResumeTask.ParentTaskID != decision.ID || foundResumeTask.ReplyToAgentID != "scheduler-1" || foundResumeTask.BatchID != decision.ID {
+		t.Fatalf("resume controller routing metadata = %+v", foundResumeTask)
 	}
 }
 

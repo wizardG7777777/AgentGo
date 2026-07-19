@@ -156,7 +156,7 @@ func TestProperty_TaskCountIncrement(t *testing.T) {
 	})
 }
 
-// Feature: session-logging, Property 8: Session リスト時間降順
+// Feature: session-logging, Property 8: Session 列表按时间降序
 // **Validates: Requirements 3.6**
 // List() SHALL return Metadata sorted by created_at descending.
 func TestProperty_SessionListOrdering(t *testing.T) {

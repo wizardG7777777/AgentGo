@@ -289,7 +289,7 @@ func TestPublishTask_WorkerMode_DepthIncrement(t *testing.T) {
 	parent := &model.Task{ID: "parent", Depth: 1, Status: model.TaskStatusProcessing}
 	s.tasks[parent.ID] = parent
 
-	g := MetaGroup{Store: s, Holder: &fakeHolder{id: "parent"}, MaxDepth: 3}
+	g := MetaGroup{Store: s, Holder: &fakeHolder{id: "parent"}, MaxDepth: 3, AgentID: "worker-7"}
 	reg := agent.NewToolRegistry()
 	g.Register(reg)
 
@@ -301,6 +301,10 @@ func TestPublishTask_WorkerMode_DepthIncrement(t *testing.T) {
 	}
 	if len(s.createCalls) != 1 || s.createCalls[0].Depth != 2 {
 		t.Fatalf("expected child depth=2, got %+v", s.createCalls)
+	}
+	child := s.createCalls[0]
+	if child.ParentTaskID != parent.ID || child.ReplyToAgentID != "worker-7" || child.BatchID != parent.ID {
+		t.Fatalf("child routing metadata = %+v", child)
 	}
 }
 

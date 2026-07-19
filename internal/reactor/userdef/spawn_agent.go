@@ -32,11 +32,24 @@ func (r *spawnAgentReactor) Subscribe() []trace.EventKind { return []trace.Event
 func (r *spawnAgentReactor) IsSync() bool                 { return false }
 func (r *spawnAgentReactor) Priority() int                { return 500 }
 
-// Run 渲染 description / system_prompt（如有 override）→ 调 SpawnHost.Spawn。
+// Run 是无外部 ctx 的兼容入口（既有测试与手工触发路径）。
+// Registry 的 async 分发会优先走 RunWithContext，把可 quiesce 的派生 ctx 传进来。
+func (r *spawnAgentReactor) Run(ev trace.Event) error {
+	return r.run(context.Background(), ev)
+}
+
+// RunWithContext 实现 reactor.CtxReactor（E4）：Registry 关停（Quiesce）时
+// 取消 ctx，在途的 via_translator LLM 调用与 Spawn 调用随之中断。
+// ctx 存活期间行为与 Run 完全一致。
+func (r *spawnAgentReactor) RunWithContext(ctx context.Context, ev trace.Event) error {
+	return r.run(ctx, ev)
+}
+
+// run 渲染 description / system_prompt（如有 override）→ 调 SpawnHost.Spawn。
 //
 // via_translator 路径会在此处发起 reactor 自带 LLM 调用（同步阻塞 reactor goroutine）。
 // LLM 失败或超时会返回 error，由 Registry 记日志（async 不阻塞主流程）。
-func (r *spawnAgentReactor) Run(ev trace.Event) error {
+func (r *spawnAgentReactor) run(ctx context.Context, ev trace.Event) error {
 	if !r.when.eval(ev) {
 		return nil
 	}
@@ -46,7 +59,7 @@ func (r *spawnAgentReactor) Run(ev trace.Event) error {
 	if r.lifecycle != "" && r.lifecycle != "one_shot" {
 		return fmt.Errorf("spawn_agent[%s]: lifecycle %q not implemented (v5.x; only one_shot)", r.name, r.lifecycle)
 	}
-	descCtx, cancel := context.WithCancel(context.Background())
+	descCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	desc, err := r.desc.render(descCtx, ev)
 	if err != nil {
@@ -68,9 +81,11 @@ func (r *spawnAgentReactor) Run(ev trace.Event) error {
 		InitialTaskDescription: desc,
 		Lifecycle:              r.lifecycle,
 		SourceTaskID:           ev.TaskID,
+		ReplyToAgentID:         ev.AgentID,
+		BatchID:                ev.BatchID,
 		Depth:                  ev.Depth + 1,
 	}
-	if _, _, err := r.host.Spawn(context.Background(), req); err != nil {
+	if _, _, err := r.host.Spawn(ctx, req); err != nil {
 		return fmt.Errorf("spawn_agent[%s]: %w", r.name, err)
 	}
 	return nil

@@ -140,6 +140,8 @@ project_root: "."
 infra:
   watchdog:
     interval_sec: 30
+    pending_alert_grace_sec: 300  # 有合法 route 但长期未领取：只告警，不终止任务
+    unroutable_grace_sec: 300     # 无兼容 route 持续超过该时间：标记 blocked
   mail_notifier:
     enabled: true
     interval_sec: 5
@@ -147,9 +149,28 @@ infra:
     event_channel_buffer: 64
     fifo_limit: 100
     default_concurrency: 2
-    default_timeout_sec: 300       # 任务级超时（watchdog 据此判定 unclaimed）
+    default_timeout_sec: 300       # 单次 processing 执行的默认超时
   roster:
     wait_timeout_sec: 30
+
+# ============================================================
+# UI 前端（UI Hub）
+#
+# frontends 声明启用哪些前端：tui（终端 UI，默认唯一启用）/ web（Web
+# Dashboard，内嵌单页应用，HTTP + SSE，含任务/审批等控制面）。两者可同时启用。
+# web.listen 默认 127.0.0.1:8399；绑定非 loopback 地址（0.0.0.0 / :: /
+# 公网 IP）时必须设置 web.token，否则启动校验拒绝——本系统具备 shell
+# 执行能力，其管理面无鉴权暴露到局域网/公网等同于开放命令执行入口。
+# web.token 为空 = 不启用鉴权（仅限 loopback 监听）。
+# web.auto_open 缺省 true：Dashboard 启动成功后自动用系统默认浏览器打开
+# 控制台地址（token 非空时地址自带 ?token=）；显式 false 关闭。
+# ============================================================
+# ui:
+#   frontends: [tui, web]
+#   web:
+#     listen: "127.0.0.1:8399"
+#     token: ""
+#     auto_open: true
 
 # ============================================================
 # 启动期可观测性
@@ -187,6 +208,8 @@ agent_idle_threshold: 0
 # ============================================================
 session_retention_days: 30        # 已关闭 session 超过此天数则归档
 session_archive_max: 50           # 归档上限，超过删除最旧
+session_resume_max_idle_sec: 3600 # 自动恢复快照超过此闲置时间时阻断非终态任务；0=关闭保护
+session_snapshot_interval_sec: 30 # 运行期完整快照间隔，限制崩溃后的副作用重放窗口；0=禁用周期保存
 
 # ============================================================
 # v5 用户 Reactor 配置（可选）

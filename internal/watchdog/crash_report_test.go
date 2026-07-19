@@ -12,8 +12,8 @@ import (
 	"agentgo/internal/store"
 )
 
-// 2026-04-25 P1 行为测试：验证 watchdog 超时/级联取消时向 task.EventSource
-// 发送结构化崩溃汇报邮件（不只是结构体字段存在）。
+// 2026-04-25 P1 行为测试：验证 watchdog 超时/级联取消时向任务的显式
+// ReplyToAgentID（或安全的 legacy EventSource）发送结构化崩溃汇报邮件。
 //
 // 覆盖三个语义层面：
 //   - 超时路径发邮件
@@ -77,6 +77,81 @@ func TestWatchdog_SendsCrashReport_OnTimeout(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("未找到 from=watchdog 的崩溃汇报邮件；共收到 %d 条：%+v", len(msgs), msgs)
+	}
+}
+
+func TestWatchdog_CrashReportPrefersExplicitReplyRecipient(t *testing.T) {
+	w, s, _, schedBox := newWatchdogWithMailbox(t)
+
+	task := &model.Task{
+		Description:    "explicit reply route",
+		TimeoutSeconds: 1,
+		ReplyToAgentID: "scheduler",
+		EventSource:    "parent-task-id-is-not-a-mailbox",
+	}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("agent-1", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	setTaskTiming(t, s, task.ID, time.Time{}, time.Now().Add(-10*time.Second))
+
+	inspectAll(w)
+
+	msgs := schedBox.Drain()
+	if len(msgs) != 1 || msgs[0].To != "scheduler" || !strings.Contains(msgs[0].Content, task.ID) {
+		t.Fatalf("explicit reply recipient messages = %+v", msgs)
+	}
+}
+
+func TestWatchdog_CrashReportSkipsUnroutableLegacyEventSource(t *testing.T) {
+	w, s, _, schedBox := newWatchdogWithMailbox(t)
+
+	task := &model.Task{
+		Description:    "legacy parent task ID",
+		TimeoutSeconds: 1,
+		EventSource:    "parent-task-id-is-not-a-mailbox",
+	}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("agent-1", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	setTaskTiming(t, s, task.ID, time.Time{}, time.Now().Add(-10*time.Second))
+
+	inspectAll(w)
+
+	if msgs := schedBox.Drain(); len(msgs) != 0 {
+		t.Fatalf("unroutable legacy EventSource produced crash report: %+v", msgs)
+	}
+}
+
+func TestWatchdog_CrashReportNeverTargetsParentTaskID(t *testing.T) {
+	w, s, mbReg, _ := newWatchdogWithMailbox(t)
+	parentBox := mbReg.Register("parent-task-uuid", "")
+
+	parent := &model.Task{ID: "parent-task-uuid", Description: "parent"}
+	if err := s.PublishTask(parent); err != nil {
+		t.Fatal(err)
+	}
+	task := &model.Task{
+		ID: "child-task-uuid", Description: "legacy parent happened to have a mailbox",
+		TimeoutSeconds: 1, EventSource: parent.ID, ParentTaskID: parent.ID,
+	}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("agent-1", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	setTaskTiming(t, s, task.ID, time.Time{}, time.Now().Add(-10*time.Second))
+
+	inspectAll(w)
+
+	if msgs := parentBox.Drain(); len(msgs) != 0 {
+		t.Fatalf("parent Task ID received a watchdog crash report: %+v", msgs)
 	}
 }
 

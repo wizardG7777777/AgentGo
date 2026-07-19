@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentGo 控制台</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --border:#262b36; --fg:#d6dae2; --dim:#8a92a3;
+          --accent:#4f9cf9; --ok:#3fb96f; --warn:#d9a13b; --err:#e05d5d; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:13px/1.5 "Segoe UI","Microsoft YaHei",system-ui,sans-serif; }
+  header { display:flex; align-items:center; gap:16px; padding:10px 16px;
+           background:var(--panel); border-bottom:1px solid var(--border);
+           position:sticky; top:0; z-index:10; }
+  header h1 { font-size:15px; margin:0; }
+  header .meta { color:var(--dim); }
+  header .meta b { color:var(--fg); font-weight:600; }
+  #conn { margin-left:auto; padding:2px 10px; border-radius:10px; font-size:12px; }
+  #conn.on  { background:rgba(63,185,111,.15); color:var(--ok); }
+  #conn.off { background:rgba(224,93,93,.15); color:var(--err); }
+  main { display:grid; grid-template-columns:1fr 1fr; gap:12px; padding:12px 16px; }
+  section { background:var(--panel); border:1px solid var(--border); border-radius:8px;
+            padding:10px 12px; min-width:0; }
+  section h2 { font-size:13px; margin:0 0 8px; color:var(--dim); font-weight:600; }
+  #agents { grid-column:1; } #tasks { grid-column:2; }
+  #stream { grid-column:1; } #approvals { grid-column:2; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:8px; }
+  .card { border:1px solid var(--border); border-radius:6px; padding:8px 10px; background:#14171d; }
+  .card .cid { font-weight:600; }
+  .badge { display:inline-block; padding:0 8px; border-radius:9px; font-size:11px; margin-left:6px; }
+  .st-idle { background:rgba(138,146,163,.18); color:var(--dim); }
+  .st-processing { background:rgba(79,156,249,.18); color:var(--accent); }
+  .st-waiting_approval { background:rgba(217,161,59,.18); color:var(--warn); }
+  .st-terminating { background:rgba(224,93,93,.18); color:var(--err); }
+  .card .kv { color:var(--dim); margin-top:4px; }
+  .card .kv b { color:var(--fg); font-weight:500; }
+  .taskgroup { margin-bottom:8px; }
+  .taskgroup h3 { font-size:12px; margin:6px 0 4px; color:var(--fg); }
+  .taskgroup ul { margin:0; padding-left:18px; color:var(--dim); }
+  .taskgroup .tid { color:var(--accent); font-family:Consolas,monospace; }
+  #streamBody { height:340px; overflow-y:auto; font-family:Consolas,"Courier New",monospace;
+                font-size:12px; white-space:pre-wrap; word-break:break-all; }
+  .ev { padding:1px 0; border-bottom:1px dotted #1e222b; }
+  .ev .t { color:var(--dim); margin-right:6px; }
+  .ev .k { color:var(--accent); margin-right:6px; }
+  .ev.log .k { color:var(--dim); } .ev.out .k { color:var(--ok); }
+  .filters { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:6px; color:var(--dim); }
+  .filters label { user-select:none; cursor:pointer; }
+  .appr { border:1px solid var(--warn); border-radius:6px; padding:8px 10px; margin-bottom:6px;
+          background:rgba(217,161,59,.06); }
+  .appr .cmd { font-family:Consolas,monospace; color:var(--warn); }
+  .appr .ops { margin-top:6px; display:flex; gap:6px; }
+  .empty { color:var(--dim); font-style:italic; }
+  .btn { background:#1f242e; color:var(--fg); border:1px solid var(--border); border-radius:5px;
+         padding:3px 10px; font-size:12px; cursor:pointer; }
+  .btn:hover { border-color:var(--accent); }
+  .btn.primary { background:var(--accent); color:#0b0e13; border-color:var(--accent); font-weight:600; }
+  .btn.small { padding:0 8px; font-size:11px; margin-left:6px; }
+  #inputBar { display:flex; gap:8px; padding:10px 16px 0; }
+  #userInput { flex:1; background:var(--panel); border:1px solid var(--border); border-radius:6px;
+               color:var(--fg); padding:6px 10px; font-size:13px; }
+  #userInput:focus { outline:none; border-color:var(--accent); }
+  #toast { position:fixed; top:52px; right:16px; z-index:99; max-width:420px; padding:8px 12px;
+           border-radius:6px; background:rgba(63,185,111,.15); color:var(--ok);
+           border:1px solid var(--ok); cursor:pointer; white-space:pre-wrap; word-break:break-all; }
+  #toast.err { background:rgba(224,93,93,.15); color:var(--err); border-color:var(--err); }
+  #toast.hidden { display:none; }
+  /* 斜杠命令补全下拉 */
+  #inputBar { position:relative; }
+  #suggest { position:absolute; left:16px; right:16px; top:100%; z-index:50;
+             background:#14171d; border:1px solid var(--border); border-radius:6px;
+             margin-top:4px; max-height:260px; overflow-y:auto; }
+  #suggest.hidden { display:none; }
+  #suggest .row { padding:5px 10px; cursor:pointer; display:flex; gap:12px; }
+  #suggest .row.sel, #suggest .row:hover { background:rgba(79,156,249,.12); }
+  .tid { color:var(--accent); font-family:Consolas,monospace; }
+  .u { font-family:Consolas,monospace; color:var(--accent); white-space:nowrap; }
+  .d { color:var(--dim); }
+  /* 模态面板（/help、/status、/session） */
+  #modal { position:fixed; inset:0; z-index:100; background:rgba(0,0,0,.5);
+           display:flex; align-items:flex-start; justify-content:center; padding-top:10vh; }
+  #modal.hidden { display:none; }
+  #modalCard { background:var(--panel); border:1px solid var(--border); border-radius:8px;
+               width:min(640px,92vw); max-height:70vh; display:flex; flex-direction:column; }
+  #modalHead { display:flex; align-items:center; padding:10px 14px; border-bottom:1px solid var(--border); }
+  #modalTitle { font-weight:600; }
+  #modalClose { margin-left:auto; background:none; border:none; color:var(--dim); font-size:18px; cursor:pointer; }
+  #modalBody { padding:12px 14px; overflow-y:auto; }
+  .cmdline { display:flex; gap:12px; padding:3px 0; }
+  .cmdline .u { min-width:200px; }
+  .sessrow { display:flex; gap:10px; align-items:center; padding:5px 0; border-bottom:1px dotted var(--border); }
+</style>
+</head>
+<body>
+<header>
+  <h1>AgentGo 控制台</h1>
+  <button id="modeBtn" class="btn" title="点击切换调度模式（plan / immediate）">模式：-</button>
+  <span class="meta">会话：<b id="session">-</b></span>
+  <button id="newSessBtn" class="btn" title="创建并切换到新会话">新会话</button>
+  <button id="helpBtn" class="btn" title="查看全部斜杠命令（同 /help）">命令</button>
+  <span id="conn" class="off">未连接</span>
+</header>
+<div id="inputBar">
+  <input id="userInput" type="text" placeholder="输入消息或 / 命令（Tab 补全，/help 查看帮助）" autocomplete="off">
+  <button id="sendBtn" class="btn primary">发送</button>
+  <div id="suggest" class="hidden"></div>
+</div>
+<div id="toast" class="hidden"></div>
+<div id="modal" class="hidden">
+  <div id="modalCard">
+    <div id="modalHead"><span id="modalTitle"></span><button id="modalClose">×</button></div>
+    <div id="modalBody"></div>
+  </div>
+</div>
+<main>
+  <section id="agents"><h2>代理</h2><div id="agentCards" class="cards"><div class="empty">加载中…</div></div></section>
+  <section id="tasks"><h2>任务看板</h2><div id="taskBoard"><div class="empty">加载中…</div></div></section>
+  <section id="stream">
+    <h2>事件流</h2>
+    <div class="filters" id="filters"></div>
+    <div id="streamBody"></div>
+  </section>
+  <section id="approvals"><h2>待审批</h2><div id="approvalList"><div class="empty">无待审批</div></div></section>
+</main>
+<script>
+"use strict";
+// ---------- 访问令牌（服务端 ui.web.token 非空时需要） ----------
+let token = localStorage.getItem("agentgo.ui.token") || "";
+function authHeaders() { return token ? { "Authorization": "Bearer " + token } : {}; }
+function withToken(url) { return token ? url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token) : url; }
+function askToken() {
+  const t = prompt("服务器要求访问令牌（ui.web.token），请输入：");
+  if (t !== null) { token = t.trim(); localStorage.setItem("agentgo.ui.token", token); }
+}
+
+// ---------- 本地状态 ----------
+const state = { agents: [], tasks: [], approvals: [] };
+let curMode = "";
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+
+// ---------- 渲染 ----------
+function modeLabel(m) { return m === "plan" ? "计划模式" : (m === "immediate" ? "直接模式" : (m || "-")); }
+function renderModeBtn() { $("modeBtn").textContent = "模式：" + modeLabel(curMode); }
+function renderHeader(snap) {
+  if (!snap) return;
+  curMode = snap.mode || "";
+  renderModeBtn();
+  $("session").textContent = (snap.session && snap.session.id) ? snap.session.id : "-";
+}
+function renderAgents() {
+  const el = $("agentCards");
+  if (!state.agents.length) { el.innerHTML = '<div class="empty">暂无代理</div>'; return; }
+  el.innerHTML = state.agents.map(a => `
+    <div class="card">
+      <div><span class="cid">${esc(a.id)}</span><span class="badge st-${esc(a.state)}">${esc(a.state)}</span></div>
+      <div class="kv">类型 <b>${esc(a.type || "-")}</b> · Loop <b>${a.loop || 0}</b> · 阶段 <b>${esc(a.phase || "-")}</b></div>
+      <div class="kv">任务 <b>${esc(a.current_task_id || "-")}</b> ${esc(a.current_task_desc || "")}</div>
+      <div class="kv">Token <b>${a.prompt_tokens || 0}</b> / <b>${a.completion_tokens || 0}</b>（${a.call_count || 0} 次调用）</div>
+      <div class="kv">邮箱待读 <b>${a.mailbox_pending || 0}</b> · 工具 <b>${esc(a.last_tool || "-")}</b> ×${a.tool_call_count || 0}</div>
+      <div class="kv">活动 <b>${esc(a.activity_age || "-")}</b>${a.last_error ? ' · <span style="color:var(--err)">' + esc(a.last_error) + "</span>" : ""}</div>
+      <div class="kv"><button class="btn small" data-steer="${esc(a.id)}">引导</button></div>
+    </div>`).join("");
+}
+const STATUS_ORDER = ["pending", "processing", "completed", "failed", "cancelled"];
+const STATUS_NAME = { pending: "待处理", processing: "进行中", completed: "已完成", failed: "失败", cancelled: "已取消" };
+const TERMINAL_STATUS = { completed: 1, failed: 1, cancelled: 1 };
+function renderTasks() {
+  const el = $("taskBoard");
+  if (!state.tasks.length) { el.innerHTML = '<div class="empty">暂无任务</div>'; return; }
+  const groups = {};
+  for (const t of state.tasks) (groups[t.status] = groups[t.status] || []).push(t);
+  const keys = Object.keys(groups).sort((a, b) => {
+    const ia = STATUS_ORDER.indexOf(a), ib = STATUS_ORDER.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  el.innerHTML = keys.map(st => `
+    <div class="taskgroup">
+      <h3>${esc(STATUS_NAME[st] || st)}（${groups[st].length}）</h3>
+      <ul>${groups[st].map(t => `<li><span class="tid">${esc(t.id)}</span> ${esc(t.desc || "")}
+        ${t.agents && t.agents.length ? " · " + esc(t.agents.join(", ")) : ""}
+        ${!TERMINAL_STATUS[t.status] ? `<button class="btn small" data-cancel="${esc(t.id)}">取消</button>` : ""}</li>`).join("")}</ul>
+    </div>`).join("");
+}
+function renderApprovals() {
+  const el = $("approvalList");
+  if (!state.approvals.length) { el.innerHTML = '<div class="empty">无待审批</div>'; return; }
+  el.innerHTML = state.approvals.map(a => `
+    <div class="appr">
+      <div><b>${esc(a.agent_id || "-")}</b> 请求执行：</div>
+      <div class="cmd">${esc(a.command || "")}</div>
+      <div class="kv" style="color:var(--dim)">规则 ${esc(a.pattern || "-")} · 任务 ${esc(a.task_id || "-")}</div>
+      <div class="ops">
+        <button class="btn small" data-appr="${esc(a.request_id)}" data-act="approve">批准</button>
+        <button class="btn small" data-appr="${esc(a.request_id)}" data-act="reject">拒绝</button>
+        <button class="btn small" data-appr="${esc(a.request_id)}" data-act="guidance">指导</button>
+        <button class="btn small" data-appr="${esc(a.request_id)}" data-act="remember">始终允许</button>
+      </div>
+    </div>`).join("");
+}
+function renderAll() { renderAgents(); renderTasks(); renderApprovals(); }
+
+// ---------- 事件流（可过滤） ----------
+const KINDS = [
+  ["TraceEvent", "Trace 事件"], ["LogLine", "日志"],
+  ["OutputText", "代理输出"], ["OutputResult", "任务结果"],
+];
+const enabled = { TraceEvent: true, LogLine: true, OutputText: true, OutputResult: true };
+$("filters").innerHTML = KINDS.map(([k, label]) =>
+  `<label><input type="checkbox" data-k="${k}" checked> ${label}</label>`).join("");
+$("filters").addEventListener("change", e => { enabled[e.target.dataset.k] = e.target.checked; });
+function fmtTime(iso) { try { return new Date(iso).toLocaleTimeString("zh-CN", { hour12: false }); } catch { return ""; } }
+function pushEvent(kind, text, cls) {
+  if (!enabled[kind]) return;
+  const body = $("streamBody");
+  const div = document.createElement("div");
+  div.className = "ev " + (cls || "");
+  div.innerHTML = `<span class="t">${fmtTime(new Date().toISOString())}</span><span class="k">${esc(kind)}</span>${esc(text)}`;
+  body.appendChild(div);
+  while (body.childNodes.length > 500) body.removeChild(body.firstChild);
+  body.scrollTop = body.scrollHeight;
+}
+
+// ---------- 控制面（POST 端点，1:1 映射 ui.Controller；全部走 Bearer 头） ----------
+function toast(msg, isErr) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = isErr ? "err" : "";
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(() => t.classList.add("hidden"), 6000);
+}
+$("toast").addEventListener("click", () => $("toast").classList.add("hidden"));
+
+async function postJSON(url, body) {
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: Object.assign({ "Content-Type": "application/json" }, authHeaders()),
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  let data = null;
+  try { data = await resp.json(); } catch { /* 空响应体 */ }
+  if (!resp.ok) {
+    if (resp.status === 401) askToken();
+    const err = new Error((data && data.error) || ("HTTP " + resp.status));
+    err.status = resp.status;
+    throw err;
+  }
+  return data || {};
+}
+
+// 顶栏：用户输入（Enter / 发送按钮）。以 "/" 开头的输入走斜杠命令体系，
+// 不投递给调度器；普通文本成功发送后清空输入框，失败弹错误提示。
+async function sendInput() {
+  const box = $("userInput");
+  const text = box.value.trim();
+  if (!text) return;
+  if (text.startsWith("/")) {
+    box.value = ""; hideSuggest();
+    runCommand(text);
+    return;
+  }
+  try {
+    await postJSON("/api/input", { text });
+    box.value = "";
+  } catch (err) { toast(err.message, true); }
+}
+$("sendBtn").addEventListener("click", sendInput);
+
+// ---------- 斜杠命令：补全下拉 + 执行 ----------
+// 命令目录来自 GET /api/commands（与 TUI 共用 ui.CommandCatalog 数据源）；
+// scope !== "shared" 的是 TUI 视图命令，WebUI 页面已直接展示对应信息。
+let COMMANDS = [];
+const sharedCmds = () => COMMANDS.filter(c => c.scope === "shared");
+function usageOf(c) { return "/" + c.name + (c.args ? " " + c.args : ""); }
+
+let sugItems = [], sugIndex = -1;
+function matchCmds(input) {
+  if (!input.startsWith("/")) return [];
+  const sp = input.indexOf(" ");
+  if (sp >= 0) { // 参数阶段：持续展示该命令的用法提示
+    const name = input.slice(1, sp).toLowerCase();
+    const exact = sharedCmds().find(c => c.name === name || (c.aliases || []).includes(name));
+    return exact ? [exact] : [];
+  }
+  const p = input.slice(1).toLowerCase();
+  return sharedCmds().filter(c => c.name.startsWith(p) || (c.aliases || []).some(a => a.startsWith(p)));
+}
+function hideSuggest() { $("suggest").classList.add("hidden"); sugItems = []; sugIndex = -1; }
+function renderSuggest() {
+  const box = $("userInput"), dd = $("suggest");
+  sugItems = matchCmds(box.value);
+  if (!sugItems.length) { hideSuggest(); return; }
+  if (sugIndex < 0 || sugIndex >= sugItems.length) sugIndex = 0;
+  dd.innerHTML = sugItems.map((c, i) =>
+    `<div class="row${i === sugIndex ? " sel" : ""}" data-i="${i}"><span class="u">${esc(usageOf(c))}</span><span class="d">${esc(c.desc)}</span></div>`).join("");
+  dd.classList.remove("hidden");
+}
+function completeTo(c, runIfNoArgs) {
+  const box = $("userInput");
+  box.value = "/" + c.name + (c.args ? " " : "");
+  box.focus();
+  if (!c.args && runIfNoArgs) { hideSuggest(); sendInput(); } else renderSuggest();
+}
+$("suggest").addEventListener("mousedown", e => { // mousedown 先于输入框 blur
+  const row = e.target.closest(".row");
+  if (!row) return;
+  e.preventDefault();
+  completeTo(sugItems[+row.dataset.i], true);
+});
+$("userInput").addEventListener("input", () => { sugIndex = -1; renderSuggest(); });
+$("userInput").addEventListener("keydown", e => {
+  const ddOpen = !$("suggest").classList.contains("hidden");
+  if (e.key === "ArrowDown" && ddOpen) { sugIndex = (sugIndex + 1) % sugItems.length; renderSuggest(); e.preventDefault(); return; }
+  if (e.key === "ArrowUp" && ddOpen) { sugIndex = (sugIndex - 1 + sugItems.length) % sugItems.length; renderSuggest(); e.preventDefault(); return; }
+  if (e.key === "Tab" && ddOpen) { e.preventDefault(); completeTo(sugItems[sugIndex], false); return; }
+  if (e.key === "Escape") { if (ddOpen) { hideSuggest(); e.preventDefault(); } return; }
+  if (e.key === "Enter") { hideSuggest(); sendInput(); }
+});
+$("userInput").addEventListener("blur", () => setTimeout(hideSuggest, 120));
+
+// resolveCmd：精确名 / 别名优先；否则唯一前缀命中（"/h" → /help）。
+function resolveCmd(token) {
+  const name = token.toLowerCase();
+  const exact = COMMANDS.find(c => c.name === name || (c.aliases || []).includes(name));
+  if (exact) return exact;
+  const pref = COMMANDS.filter(c => c.name.startsWith(name) || (c.aliases || []).some(a => a.startsWith(name)));
+  return pref.length === 1 ? pref[0] : null;
+}
+
+async function getJSON(url) {
+  const resp = await fetch(url, { headers: authHeaders() });
+  let data = null;
+  try { data = await resp.json(); } catch { /* 空响应体 */ }
+  if (!resp.ok) {
+    if (resp.status === 401) askToken();
+    const err = new Error((data && data.error) || ("HTTP " + resp.status));
+    err.status = resp.status;
+    throw err;
+  }
+  return data || {};
+}
+
+async function runCommand(line) {
+  const parts = line.split(/\s+/);
+  const cmd = resolveCmd(parts[0].slice(1));
+  if (!cmd) { toast("未知命令：" + parts[0] + "（输入 /help 查看帮助）", true); return; }
+  if (cmd.scope !== "shared") {
+    toast(usageOf(cmd) + " 是 TUI 视图命令；WebUI 已在页面中直接展示对应信息", true);
+    return;
+  }
+  const args = parts.slice(1);
+  try {
+    switch (cmd.name) {
+      case "help": openModal("命令帮助", helpHTML()); break;
+      case "status": openModal("系统状态", statusHTML()); break;
+      case "cancel": {
+        if (!args[0]) { toast("用法：/cancel <task-id>", true); return; }
+        const d = await postJSON("/api/tasks/cancel", { id_prefix: args[0] });
+        toast("已取消任务：" + (d.task_id || args[0]), false);
+        break;
+      }
+      case "mode": {
+        const next = args[0] || (curMode === "plan" ? "immediate" : "plan");
+        if (next !== "plan" && next !== "immediate") { toast("用法：/mode [plan|immediate]", true); return; }
+        await postJSON("/api/mode", { mode: next });
+        curMode = next; renderModeBtn();
+        toast("已切换到" + modeLabel(next), false);
+        break;
+      }
+      case "steer": {
+        if (!args[0] || !args[1]) { toast("用法：/steer <agent-id> <消息>", true); return; }
+        await postJSON("/api/steer", { agent_id: args[0], message: args.slice(1).join(" ") });
+        toast("已发送指导 → " + args[0], false);
+        break;
+      }
+      case "new": {
+        const d = await postJSON("/api/session/new");
+        if (d.session_id) $("session").textContent = d.session_id;
+        toast("已创建新会话：" + (d.session_id || "-"), false);
+        break;
+      }
+      case "session": {
+        const d = await getJSON("/api/sessions");
+        const list = d.sessions || [];
+        if (!args[0]) { openModal("Sessions（编号切换：/session <编号>）", sessionsHTML(list)); break; }
+        const n = parseInt(args[0], 10);
+        if (!n || n < 1 || n > list.length) { toast("无效编号：" + args[0] + "（1-" + list.length + "）", true); return; }
+        await switchSession(list[n - 1].id);
+        break;
+      }
+    }
+  } catch (err) { toast(err.message, true); }
+}
+
+async function switchSession(id) {
+  const result = await postJSON("/api/session/switch", { id });
+  if (result.changed === false) {
+    toast("已经是当前会话：" + id, false);
+    return;
+  }
+  $("session").textContent = id;
+  toast("已切换到会话：" + id, false);
+}
+
+// ---------- 模态面板（/help、/status、/session） ----------
+function openModal(title, html) {
+  $("modalTitle").textContent = title;
+  $("modalBody").innerHTML = html;
+  $("modal").classList.remove("hidden");
+}
+function closeModal() { $("modal").classList.add("hidden"); }
+$("modalClose").addEventListener("click", closeModal);
+$("modal").addEventListener("click", e => { if (e.target === $("modal")) closeModal(); });
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && !$("modal").classList.contains("hidden")) closeModal();
+});
+$("helpBtn").addEventListener("click", () => openModal("命令帮助", helpHTML()));
+// Sessions 面板里的"切换"按钮（事件委托）。
+$("modalBody").addEventListener("click", async e => {
+  const id = e.target.dataset && e.target.dataset.switch;
+  if (!id) return;
+  try { await switchSession(id); closeModal(); } catch (err) { toast(err.message, true); }
+});
+
+function helpHTML() {
+  const rows = sharedCmds().map(c =>
+    `<div class="cmdline"><span class="u">${esc(usageOf(c))}</span><span>${esc(c.desc)}</span></div>`).join("");
+  const tuiOnly = COMMANDS.filter(c => c.scope !== "shared").map(c => usageOf(c)).join("　");
+  return rows + `<div style="margin-top:10px" class="d">输入 / 即显示补全提示；Tab 补全，Enter 执行。<br>TUI 另有视图命令：${esc(tuiOnly)}</div>`;
+}
+function statusHTML() {
+  const counts = {};
+  for (const t of state.tasks) counts[t.status] = (counts[t.status] || 0) + 1;
+  const c = s => counts[s] || 0;
+  const active = state.tasks.filter(t => t.status === "pending" || t.status === "processing");
+  const lines = [
+    `<div>代理数：<b>${state.agents.length}</b></div>`,
+    `<div style="margin-top:4px">任务：待处理 ${c("pending")} · 进行中 ${c("processing")} · 已完成 ${c("completed")} · 失败 ${c("failed")} · 已取消 ${c("cancelled")}</div>`,
+    `<div style="margin-top:4px">模式：<b>${modeLabel(curMode)}</b></div>`,
+  ];
+  if (active.length) {
+    lines.push(`<div style="margin:10px 0 4px" class="d">活跃任务</div>` + active.map(t =>
+      `<div>· <span class="tid">${esc(t.id)}</span> [${esc(t.status)}] ${esc(t.desc || "")}${t.agents && t.agents.length ? " — " + esc(t.agents.join(", ")) : ""}</div>`).join(""));
+  }
+  return lines.join("");
+}
+function sessionsHTML(list) {
+  if (!list.length) return '<div class="empty">无 Session 记录</div>';
+  return list.map((s, i) =>
+    `<div class="sessrow"><b>${i + 1}.</b><span class="tid">${esc(s.id)}</span><span class="d">[${esc(s.status || "-")}] ${esc(s.created_at || "")} ${esc(s.first_user_input || "")}</span><span style="flex:1"></span><button class="btn small" data-switch="${esc(s.id)}">切换</button></div>`).join("");
+}
+
+// 顶栏：模式切换（点击切换到另一种模式）。
+$("modeBtn").addEventListener("click", async () => {
+  const next = curMode === "plan" ? "immediate" : "plan";
+  try {
+    await postJSON("/api/mode", { mode: next });
+    curMode = next; renderModeBtn();
+    toast("已切换到" + modeLabel(next), false);
+  } catch (err) { toast(err.message, true); }
+});
+
+// 顶栏：新会话。
+$("newSessBtn").addEventListener("click", async () => {
+  try {
+    const d = await postJSON("/api/session/new");
+    if (d.session_id) $("session").textContent = d.session_id;
+    toast("已创建新会话：" + (d.session_id || "-"), false);
+  } catch (err) { toast(err.message, true); }
+});
+
+// 任务看板：取消按钮（confirm 后按完整任务 ID 取消，前缀解析交给 Controller）。
+$("taskBoard").addEventListener("click", async e => {
+  const id = e.target.dataset && e.target.dataset.cancel;
+  if (!id) return;
+  if (!confirm("确认取消任务 " + id + "？")) return;
+  try {
+    const d = await postJSON("/api/tasks/cancel", { id_prefix: id });
+    toast("已取消任务：" + (d.task_id || id), false);
+  } catch (err) { toast(err.message, true); }
+});
+
+// 代理卡片：引导按钮（prompt 收集指导消息）。
+$("agentCards").addEventListener("click", async e => {
+  const id = e.target.dataset && e.target.dataset.steer;
+  if (!id) return;
+  const msg = prompt("发送给 " + id + " 的指导消息：");
+  if (msg === null || !msg.trim()) return;
+  try {
+    await postJSON("/api/steer", { agent_id: id, message: msg.trim() });
+    toast("已发送指导 → " + id, false);
+  } catch (err) { toast(err.message, true); }
+});
+
+// 待审批：批准 / 拒绝 / 指导 / 始终允许。
+// 成功后该项由 SSE ApprovalResolved 更新清除；409 说明审批已失效，本地直接移除。
+$("approvalList").addEventListener("click", async e => {
+  const id = e.target.dataset && e.target.dataset.appr;
+  if (!id) return;
+  const body = { action: e.target.dataset.act };
+  if (body.action === "guidance") {
+    const msg = prompt("输入指导内容（拒绝本次执行并把指导反馈给代理）：");
+    if (msg === null || !msg.trim()) { toast("指导消息不能为空", true); return; }
+    body.message = msg.trim();
+  }
+  try {
+    await postJSON("/api/approvals/" + encodeURIComponent(id), body);
+  } catch (err) {
+    if (err.status === 409) {
+      state.approvals = state.approvals.filter(a => a.request_id !== id);
+      renderApprovals();
+    }
+    toast(err.message, true);
+  }
+});
+
+// ---------- 数据流：快照 + SSE ----------
+function applySnapshot(snap) {
+  if (!snap) return;
+  renderHeader(snap);
+  state.agents = snap.agents || [];
+  state.tasks = snap.tasks || [];
+  state.approvals = snap.pending_approvals || [];
+  renderAll();
+}
+function applyUpdate(u) {
+  switch (u.kind) {
+    case "SnapshotSync": applySnapshot(u.snapshot); break;
+    case "AgentsChanged":
+      state.agents = u.agents || []; state.tasks = u.tasks || [];
+      renderAgents(); renderTasks(); break;
+    case "ApprovalNew": state.approvals.push(u.approval); renderApprovals(); break;
+    case "ApprovalResolved":
+      state.approvals = state.approvals.filter(a => a.request_id !== u.resolved.request_id);
+      renderApprovals(); break;
+    case "TraceEvent": {
+      const t = u.trace;
+      pushEvent("TraceEvent",
+        `${t.kind} agent=${t.agent_id || "-"} task=${t.task_id || "-"}` +
+        (t.tool ? ` tool=${t.tool}` : "") + (t.message ? ` ${t.message}` : "") +
+        (t.duration_ms ? ` (${t.duration_ms}ms)` : ""), "");
+      break;
+    }
+    case "LogLine": pushEvent("LogLine", u.log_line, "log"); break;
+    case "OutputText": pushEvent("OutputText", `[${u.output.agent_id}] ${u.output.text}`, "out"); break;
+    case "OutputResult": pushEvent("OutputResult", `[${u.output.agent_id}] ${u.output.text}`, "out"); break;
+  }
+}
+
+let es = null, backoff = 1000;
+function setConn(on, label) {
+  const c = $("conn");
+  c.className = on ? "on" : "off";
+  c.textContent = label || (on ? "已连接" : "未连接");
+}
+function connectSSE() {
+  if (es) es.close();
+  es = new EventSource(withToken("/api/events"));
+  es.onopen = () => { backoff = 1000; setConn(true); };
+  es.onmessage = e => { try { applyUpdate(JSON.parse(e.data)); } catch (err) { console.warn("bad frame", err); } };
+  es.onerror = () => {
+    setConn(false, "连接断开，" + Math.round(backoff / 1000) + "s 后重连…");
+    es.close(); es = null;
+    setTimeout(connectSSE, backoff);
+    backoff = Math.min(backoff * 2, 15000);
+  };
+}
+
+async function boot() {
+  try {
+    const [snapResp, cmdResp] = await Promise.all([
+      fetch("/api/snapshot", { headers: authHeaders() }),
+      fetch("/api/commands", { headers: authHeaders() }),
+    ]);
+    if (snapResp.status === 401 || cmdResp.status === 401) { askToken(); location.reload(); return; }
+    if (!snapResp.ok) throw new Error("HTTP " + snapResp.status);
+    if (cmdResp.ok) COMMANDS = await cmdResp.json(); // 失败时命令体系退化为"未知命令"提示
+    applySnapshot(await snapResp.json());
+    connectSSE();
+  } catch (err) {
+    setConn(false, "加载失败：" + err.message);
+    setTimeout(boot, 3000);
+  }
+}
+boot();
+</script>
+</body>
+</html>

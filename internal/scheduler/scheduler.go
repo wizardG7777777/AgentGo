@@ -475,6 +475,7 @@ func New(
 	templateProvisioner agenttemplate.Provisioner,
 	memoryStore memory.Store,
 	userOutput io.Writer,
+	resultOutput io.Writer,
 	planCoordinators ...*plan.Coordinator,
 ) *Bundle {
 	schedID := "scheduler-" + uuid.New().String()[:8]
@@ -509,6 +510,13 @@ func New(
 	if agentRegistry != nil {
 		routeValidator = agentRegistry
 	}
+	// 审批等待钩子：把 shell 审批的阻塞窗口映射到 scheduler agent 状态机
+	// （processing ↔ waiting_approval）。agent 在工具注册之后才构造，
+	// 闭包延迟解引用——钩子只在工具执行期触发，届时 a 必定已赋值。
+	var a *agent.Agent
+	approvalWaitHook := func(waiting bool) {
+		agent.SetApprovalWaitState(a, holder.Get(), waiting)
+	}
 	tools.RegisterGroups(toolReg,
 		readGroup,
 		tools.LocalWriteGroup{
@@ -519,10 +527,11 @@ func New(
 		},
 		tools.WebGroup{Provider: searchProvider},
 		tools.ShellGroup{
-			Workdir:    workdir,
-			TimeoutSec: cfg.ShellTimeoutSec,
-			ApprovalCh: approvalCh,
-			AgentID:    schedID,
+			Workdir:          workdir,
+			TimeoutSec:       cfg.ShellTimeoutSec,
+			ApprovalCh:       approvalCh,
+			AgentID:          schedID,
+			ApprovalWaitHook: approvalWaitHook,
 		},
 		tools.MetaGroup{
 			Store:              s,
@@ -541,6 +550,7 @@ func New(
 			FinalizationNotifier: holder, // 同一个 holder 也实现 FinalizationNotifier
 			ProjectRoot:          cfg.ProjectRoot,
 			UserOutput:           userOutput,
+			ResultOutput:         resultOutput,
 			PlanCoordinator:      planCoordinator,
 		},
 		tools.PlanControlGroup{
@@ -560,6 +570,11 @@ func New(
 	innerExec := agent.NewLLMExecutor(llmClient, toolReg, gateReg, storeView, recordToolCall, "", schedulerSystemPrompt)
 
 	// 包装 SchedulerExecutor：等待 batch + 注入 board snapshot
+	// batchUpdateCh 是单槽信号量（buffer=1 + 非阻塞发送）：多次 batch 更新
+	// 合并为一次唤醒，且每次发送仅唤醒一个等待者——不是广播语义（F13）。
+	// 当前唯一消费者是 SchedulerExecutor.waitForBatchTerminal；若未来新增
+	// 消费者，必须先改为广播语义（每消费者独立 channel 或 sync.Cond），
+	// 否则新增消费者可能与现有等待者互相吞掉信号。
 	batchUpdateCh := make(chan struct{}, 1)
 	modeStore := NewModeStore()
 	sessionHistory := NewSessionHistory(0) // 默认容量 16
@@ -580,7 +595,7 @@ func New(
 	}
 
 	// 构造 agent
-	a := agent.NewAgent(
+	a = agent.NewAgent(
 		schedID,
 		"__scheduler__", // 仅认领 EventType=__scheduler__ 的任务（由 Activator publish）
 		s, r, schedExec.Execute,
@@ -588,7 +603,12 @@ func New(
 	)
 	a.CancelRegistry = cancelReg
 	a.MaxRetries = schedulerMaxRetries // 有限重试——见常量注释（2026-04-25 改）
-	a.IdleThreshold = 0                // 永不空闲退出（预制代理）
+	// E3 决策：全局 agent_idle_threshold 刻意不应用于 scheduler。
+	// scheduler 是必须常驻的预制代理——它若空闲退出，将无人派发/汇总
+	// 用户请求，整个系统失能；与 watchdog 一样属于"与系统同生命周期"的
+	// daemon，因此保持硬编码 0（永不空闲退出）。配置值只作用于
+	// 由 runner.New 构造的任务执行类 agent。
+	a.IdleThreshold = 0 // 永不空闲退出（预制代理）
 	// CompactTokenThreshold / CompactKeepRecent 不再从 cfg 读——v4 §11.5.5 把
 	// scheduler 行为参数全部内置；agent.processTask 自带 fallback（80000 / 3）。
 	a.TransferNoteMaxTokens = cfg.TransferNoteMaxTokens
@@ -600,6 +620,7 @@ func New(
 	// 让 LLM 不调 report_done 时用户也能看到答案。详见 Agent.IsUserFacing 字段注释。
 	a.IsUserFacing = true
 	a.UserOutput = userOutput
+	a.ResultOutput = resultOutput
 
 	if mbRegistry != nil {
 		a.Mailbox = mbRegistry.Register(schedID, "__scheduler__")

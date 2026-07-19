@@ -12,11 +12,14 @@
 package reactor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
 	"sort"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"agentgo/internal/trace"
 )
@@ -64,6 +67,15 @@ type Reactor interface {
 	Priority() int
 }
 
+// CtxReactor 是 Reactor 的可选扩展接口（E4）：Async Reactor 实现它即可在
+// RunWithContext 中收到 Registry 派生的可取消 ctx——Quiesce 会取消该 ctx，
+// 在途的 LLM / spawn 调用随之中断，不会在 Shutdown 关闭 store/trace 后继续
+// 写已关闭资源。未实现本接口的 Reactor 继续走原 Run 路径（行为与此前一致）。
+// Sync Reactor 在调用方 goroutine 上执行，不走此路径。
+type CtxReactor interface {
+	RunWithContext(ctx context.Context, ev trace.Event) error
+}
+
 // Registry 是 Reactor 注册与分发器。与 gate.Registry 对称但语义不同：
 //   - 单一输入类型（trace.Event）vs Gate 的接口式 Context
 //   - Dispatch 无返回值 vs Gate 的 Decision
@@ -73,12 +85,48 @@ type Reactor interface {
 type Registry struct {
 	mu             sync.RWMutex
 	reactorsByKind map[trace.EventKind][]Reactor
+
+	// ── E4：async 在途治理（关停 + 背压）──
+	ctx    context.Context    // 派生给 async Reactor 的可取消 ctx，Quiesce 时取消
+	cancel context.CancelFunc // 幂等；NewRegistry 之后永不为 nil
+	wg     sync.WaitGroup     // 在途 async goroutine 计数（Quiesce 据此排空）
+	sem    chan struct{}      // 在途上限令牌桶：容量即上限，满即丢弃（背压）
+	// dropped 只因背压上限被丢弃的 async 分发计数（可观测指标）；
+	// Quiesce 之后的静默丢弃不计入。
+	dropped atomic.Int64
+	// qmu 守护 quiesced 标志与 dispatchAsync 中"检查标志 → wg.Add"的原子性：
+	// Quiesce 置位之后不会再有新的 wg.Add，wg.Wait 因此不与并发 Add 竞争
+	// （WaitGroup 要求计数为零时的 Add 必须先于 Wait 完成）。
+	qmu      sync.Mutex
+	quiesced bool // Quiesce 后置 true，之后的 async 分发静默丢弃
 }
+
+// DefaultMaxAsyncInFlight 是 async Reactor 同时在途的默认上限（E4）。
+//
+// 取值 256 的权衡：稳态下内置 async Reactor 都是微秒级记账操作，并发在途
+// 通常只有个位数；真正的风险是用户 Reactor 订阅高频 Kind（llm_call_start/
+// end、tool_call/result、token_stats）并挂 60s 超时的 LLM 调用——256 给这种
+// 最坏情形一个硬顶（256 个并发 LLM 调用的内存 footprint 仍在数十 MB 量级，
+// 不会拖垮进程），同时对正常负载永不触发。
+const DefaultMaxAsyncInFlight = 256
 
 // NewRegistry 返回空 Registry。
 func NewRegistry() *Registry {
+	return newRegistry(DefaultMaxAsyncInFlight)
+}
+
+// newRegistry 是带在途上限的内部构造（测试用小上限触发背压）。
+// maxAsyncInFlight <= 0 时回落默认值。
+func newRegistry(maxAsyncInFlight int) *Registry {
+	if maxAsyncInFlight <= 0 {
+		maxAsyncInFlight = DefaultMaxAsyncInFlight
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Registry{
 		reactorsByKind: make(map[trace.EventKind][]Reactor),
+		ctx:            ctx,
+		cancel:         cancel,
+		sem:            make(chan struct{}, maxAsyncInFlight),
 	}
 }
 
@@ -138,6 +186,8 @@ func (r *Registry) Register(reactor Reactor) error {
 //     （主流程语义：不可 Abort，所以失败必须吞）
 //   - Async Reactor 立即起独立 goroutine 执行；panic 被 recover 后仅 log；
 //     主流程不等待 Async 完成
+//   - Async 在途数有上限（DefaultMaxAsyncInFlight）：满载即丢弃并记 WARN，
+//     Dispatch 调用方永不阻塞；Quiesce 之后 async 分发静默丢弃（E4）
 //   - 单个 Reactor panic 不影响其他 Reactor
 //
 // nil Registry 直接返回（让 trace.Emit 不必判 nil）。
@@ -155,9 +205,91 @@ func (r *Registry) Dispatch(ev trace.Event) {
 		if rt.IsSync() {
 			r.runSync(rt, ev)
 		} else {
-			go r.runAsync(rt, ev)
+			r.dispatchAsync(rt, ev)
 		}
 	}
+}
+
+// dispatchAsync 投递一个 Async Reactor 到独立 goroutine。
+//
+// 背压策略（E4）：在途数达到上限时直接丢弃本次调用并记 WARN——Reactor 是
+// 观测旁路，绝不允许反向阻塞 trace.Emit 调用方。Quiesce 之后的分发静默丢弃
+// （系统关停中，新异步工作已无生命周期保障；不计入 DroppedAsync，避免关停
+// 期间刷 WARN）。
+func (r *Registry) dispatchAsync(rt Reactor, ev trace.Event) {
+	r.qmu.Lock()
+	if r.quiesced {
+		r.qmu.Unlock()
+		return
+	}
+	select {
+	case r.sem <- struct{}{}:
+	default:
+		r.qmu.Unlock()
+		r.dropped.Add(1)
+		log.Printf("[reactor] WARN: 异步 reactor 在途已达上限（%d），丢弃本次调用: reactor=%s event=%s",
+			cap(r.sem), rt.Name(), ev.Kind)
+		return
+	}
+	r.wg.Add(1)
+	r.qmu.Unlock()
+
+	go func() {
+		defer r.wg.Done()
+		defer func() { <-r.sem }()
+		r.runAsync(r.ctx, rt, ev)
+	}()
+}
+
+// Quiesce 关停 Async 分发并等待在途排空（E4）。
+//
+// 步骤：先置 quiesced 标志（之后的 async 分发静默丢弃），再取消 registry
+// 派生 ctx 打断实现了 CtxReactor 的在途工作（LLM / spawn 调用随 ctx 中断），
+// 最后带超时等待在途 goroutine 全部退出。返回值是超时后仍在运行的 async
+// 数量（0 = 全部排空），调用方应对非零值记 WARN。
+//
+// 语义约定：
+//   - 幂等，可重复调用；nil Registry 返回 0。
+//   - 只约束 async 路径——Sync Reactor 在 trace.Emit 调用方 goroutine 上执行，
+//     Quiesce 之后仍照常运行（语义不变）。
+//   - timeout <= 0 表示无限等待。
+func (r *Registry) Quiesce(timeout time.Duration) (remaining int) {
+	if r == nil {
+		return 0
+	}
+	r.qmu.Lock()
+	r.quiesced = true
+	r.qmu.Unlock()
+
+	r.cancel()
+
+	done := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		close(done)
+	}()
+	if timeout <= 0 {
+		<-done
+		return 0
+	}
+	select {
+	case <-done:
+		return 0
+	case <-time.After(timeout):
+		// len(sem) == 当前在途数（每个在途 goroutine 持有一个令牌）。
+		// 等待 goroutine 会在在途最终排空时退出；进程关停路径下即使有
+		// 永久卡死的 Reactor，泄漏也以进程退出为界。
+		return len(r.sem)
+	}
+}
+
+// DroppedAsync 返回因背压上限被丢弃的 async 分发总数（E4 可观测计数）。
+// Quiesce 之后的静默丢弃不计入。
+func (r *Registry) DroppedAsync() int64 {
+	if r == nil {
+		return 0
+	}
+	return r.dropped.Load()
 }
 
 // runSync 同步执行单个 Reactor，panic 隔离 + 失败 trace 标红。
@@ -197,13 +329,22 @@ func (r *Registry) runSync(rt Reactor, ev trace.Event) {
 //
 // 不向 trace 写 KindError——Async Reactor 大量低价值事件会污染 trace；
 // 真正需要被 trace 看到的失败应当用 Sync Reactor 表达。
-func (r *Registry) runAsync(rt Reactor, ev trace.Event) {
+//
+// ctx 是 Registry 派生的可取消 ctx：实现 CtxReactor 的 Reactor 经
+// RunWithContext 收到它（Quiesce 时取消）；未实现的走原 Run 路径，行为不变。
+func (r *Registry) runAsync(ctx context.Context, rt Reactor, ev trace.Event) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("[reactor] async reactor %s panic: %v (event=%s)", rt.Name(), rec, ev.Kind)
 		}
 	}()
-	if err := rt.Run(ev); err != nil {
+	var err error
+	if cr, ok := rt.(CtxReactor); ok {
+		err = cr.RunWithContext(ctx, ev)
+	} else {
+		err = rt.Run(ev)
+	}
+	if err != nil {
 		log.Printf("[reactor] async reactor %s failed: %v (event=%s task=%s)",
 			rt.Name(), err, ev.Kind, ev.TaskID)
 	}

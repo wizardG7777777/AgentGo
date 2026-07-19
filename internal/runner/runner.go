@@ -13,8 +13,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"runtime/debug"
 	"strings"
 	"sync"
+	"time"
 
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
@@ -61,6 +63,10 @@ type RunnerDeps struct {
 	RouteValidator tools.RouteValidator
 	Activity       *agent.ActivityTracker
 	MBRegistry     *mailbox.Registry
+	// ClaimedMailbox 是 TeamManager 恢复动态 Team 时已通过
+	// Registry.ClaimRecovered 原子认领的邮箱。New 只做窄交接，
+	// 不在构造器内隐式 fallback；普通路径的 nil 值仍严格 Register。
+	ClaimedMailbox *mailbox.Mailbox
 	CancelRegistry *store.TaskCancelRegistry
 	SearchProvider webtool.SearchProvider
 	ShellFilter    *shell.CommandFilter
@@ -106,14 +112,30 @@ type Runner struct {
 // 在能力等价性上与"按 allowlist 选择性 RegisterGroups"完全等同，但代码更简洁、新增 kind
 // 无需额外配线。
 func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
+	if deps.ClaimedMailbox != nil {
+		if deps.MBRegistry == nil {
+			panic("runner: claimed mailbox handoff requires a registry")
+		}
+		if err := deps.MBRegistry.ValidateRecoveredClaim(rt.InstanceID, rt.EventType, deps.ClaimedMailbox); err != nil {
+			panic(fmt.Sprintf("runner: invalid claimed mailbox handoff: %v", err))
+		}
+	}
 	holder := &CurrentTaskHolder{}
 	fileCache := agent.NewFileStateCache(50)
 	workdir := &tools.DefaultWorkdir{ProjectRoot: deps.ProjectRoot}
 
+	// 审批等待钩子：把 shell 审批的阻塞窗口映射到 agent 状态机
+	// （processing ↔ waiting_approval）。agent 在工具注册之后才构造，
+	// 闭包延迟解引用——钩子只在工具执行期触发，届时 a 必定已赋值。
+	var a *agent.Agent
+	approvalWaitHook := func(waiting bool) {
+		agent.SetApprovalWaitState(a, holder.Get(), waiting)
+	}
+
 	toolReg := agent.NewToolRegistryWithAllowlist(rt.AllowedTools)
 
 	// §11.6.2 工具 → 依赖项映射由 dependency_map.go 集中管理
-	groups := resolveToolGroups(rt.InstanceID, deps, holder, fileCache, workdir)
+	groups := resolveToolGroups(rt.InstanceID, deps, holder, fileCache, workdir, approvalWaitHook)
 	tools.RegisterGroups(toolReg, groups...)
 
 	executor := agent.NewLLMExecutor(
@@ -159,7 +181,7 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 		}
 	}
 
-	a := agent.NewAgent(
+	a = agent.NewAgent(
 		rt.InstanceID,
 		rt.EventType,
 		deps.Store,
@@ -170,7 +192,10 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	a.PlanIDScope = rt.PlanIDScope
 	a.CancelRegistry = deps.CancelRegistry
 	a.MaxRetries = rt.TaskMaxRetries
-	a.IdleThreshold = 0
+	// E3：空闲退出阈值从配置链路接入（AgentRuntimeConfig.IdleThreshold，
+	// 源自全局 agent_idle_threshold；构造点未赋值时为零值 = 永不空闲退出，
+	// 与旧硬编码 0 行为一致）。
+	a.IdleThreshold = rt.IdleThreshold
 	a.CompactTokenThreshold = rt.EnforceCompactTokenThreshold
 	a.CompactKeepRecent = 3 // v3 数值；与 internal/agent 包级常量 keepRecentForTruncate 同源管理（§11.5.4）
 	a.TransferNoteMaxTokens = deps.TransferNoteMaxTokens
@@ -188,7 +213,7 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	a.OnTaskStart = func(taskID string) { holder.Set(taskID) }
 	// v5 Phase 4：holder 清理迁移到 task-end-callback Sync Reactor。
 	// 旧路径 (a.OnTaskEnd 闭包) 在 processTask defer 链中执行；新路径在
-	// trace.KindTaskCompleted/Failed/Cancelled/Retry emit 同步阶段执行。
+	// trace.KindTaskCompleted/Failed/Blocked/Cancelled/Retry emit 同步阶段执行。
 	// 时序差异不影响 holder 语义——holder 仅被 LLM 工具阶段读取，task 终态事件
 	// emit 时主流程已退出 ReactLoop，无并发读取冲突。
 	r := &Runner{agent: a}
@@ -208,7 +233,11 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	}
 	a.FileCache = fileCache
 	if deps.MBRegistry != nil {
-		a.Mailbox = deps.MBRegistry.Register(rt.InstanceID, rt.EventType)
+		if deps.ClaimedMailbox != nil {
+			a.Mailbox = deps.ClaimedMailbox
+		} else {
+			a.Mailbox = deps.MBRegistry.Register(rt.InstanceID, rt.EventType)
+		}
 		a.MailRegistry = deps.MBRegistry
 	}
 	a.Memory = deps.Memory
@@ -342,13 +371,56 @@ func (r *Runner) ID() string {
 
 // Run 启动 Runner 主循环，阻塞直到 ctx 取消。
 func (r *Runner) Run(ctx context.Context) {
-	r.agent.Run(ctx)
+	runAgentLoopWithRecover(ctx, r.agent.ID, r.agent.Run)
 }
 
 // RunWithReady starts the Runner and reports readiness only after its Agent has
 // successfully entered the task-store claim loop.
 func (r *Runner) RunWithReady(ctx context.Context, ready func()) {
-	r.agent.RunWithReady(ctx, ready)
+	// 重启后 agent.run 会再次触发 ready 回调——ready 语义是"一次性"的
+	// （调用方多为 chan 发送 / wg.Done，重复触发会阻塞或 panic），
+	// 因此用 sync.Once 收敛为整个监督周期内恰好一次。
+	var once sync.Once
+	runAgentLoopWithRecover(ctx, r.agent.ID, func(runCtx context.Context) {
+		r.agent.RunWithReady(runCtx, func() { once.Do(ready) })
+	})
+}
+
+// runAgentLoopWithRecover 是 E5 引入的 agent 轮询主循环监督包装。
+//
+// 背景：agent.Agent.Run 的轮询循环（QueryAvailable / sleep 等路径）本身没有
+// recover——processTask 的 recover 只覆盖任务执行段。轮询循环一旦 panic，
+// runner goroutine 会静默死亡（静默减员，系统表现为"这个 kind 不再领任务"）。
+// 本包装对齐 bootstrap 对 watchdog 的监督模式（runWatchdogWithRecover）：
+// panic 时打日志（含堆栈）、退避 1s、重启 runOnce，直到 ctx 取消。
+//
+// 只有 panic 才触发重启——runOnce 正常返回（ctx 取消或 IdleThreshold 空闲回收）
+// 时本函数直接返回，不重启；否则空闲回收语义会被破坏（agent 永远退不出）。
+func runAgentLoopWithRecover(ctx context.Context, agentID string, runOnce func(context.Context)) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		panicked := func() (panicked bool) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					panicked = true
+					log.Printf("[runner] agent %s 轮询循环 panic: %v\n%s\n1s 后重启轮询循环",
+						agentID, rec, debug.Stack())
+				}
+			}()
+			runOnce(ctx)
+			return false
+		}()
+		if !panicked {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(1 * time.Second):
+		}
+	}
 }
 
 // Close releases process-local registrations owned by this Runner. It is safe

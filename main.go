@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"agentgo/internal/bootstrap"
+	"agentgo/internal/session"
 	"agentgo/internal/trace"
 )
 
@@ -54,30 +55,30 @@ func main() {
 
 	// 启动后台服务（调度器、看门狗、调查代理）
 	if err := sys.Start(ctx, cancel); err != nil {
-		sys.Shutdown()
+		if shutdownErr := sys.Shutdown(); shutdownErr != nil {
+			fmt.Fprintf(os.Stderr, "[错误] 启动失败后的关闭不完整: %v\n", shutdownErr)
+		}
 		fmt.Fprintf(os.Stderr, "[错误] 启动失败: %v\n", err)
 		os.Exit(1)
 	}
 
 	// CLI 阻塞 main goroutine，/quit 或 stdin 关闭时返回
-	sys.RunCLI(ctx, os.Stdin, os.Stdout)
+	sys.RunCLI(ctx)
 
 	// CLI 退出后关闭所有服务
-	sys.Shutdown()
+	if err := sys.Shutdown(); err != nil {
+		fmt.Fprintf(os.Stderr, "[错误] 系统关闭不完整: %v\n", err)
+	}
 }
 
 // resolveTraceDir 解析 trace 子命令的日志目录。
 // 优先使用当前活跃 Session 的 logs/ 目录，与 bootstrap.go 的重定向保持一致；
 // 读不到 active-session 或目录不存在时，回退到旧路径 .agentgo/traces。
+// session 目录布局知识由 session.ActiveSessionLogsDir 统一出口（B5 收敛）。
 func resolveTraceDir(cwd string) string {
 	sessionsDir := filepath.Join(cwd, ".agentgo", "sessions")
-	activeFile := filepath.Join(sessionsDir, "active-session")
-	if data, err := os.ReadFile(activeFile); err == nil && len(data) > 0 {
-		sessionID := string(data)
-		logsDir := filepath.Join(sessionsDir, "sess-"+sessionID, "logs")
-		if info, statErr := os.Stat(logsDir); statErr == nil && info.IsDir() {
-			return logsDir
-		}
+	if logsDir := session.ActiveSessionLogsDir(sessionsDir); logsDir != "" {
+		return logsDir
 	}
 	return filepath.Join(cwd, ".agentgo", "traces")
 }

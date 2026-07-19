@@ -226,3 +226,85 @@ func TestRunShell_GraylistTriggersApproval(t *testing.T) {
 		t.Fatalf("run_shell did not return after approval")
 	}
 }
+
+
+// A2：ShellGroup.ApprovalWaitHook → shell.WrapShellTool 接线验证
+// （顺带断言 RequestID 与 cap-1 ReplyCh）。命令被拒绝，不会真实执行
+// shell，Windows 上也可运行。
+func TestShellGroup_ApprovalWaitHook(t *testing.T) {
+	filter := shell.NewCommandFilter(nil, []string{`^gray_marker$`})
+	g, approvalCh := newTestShellGroup(t, t.TempDir(), filter)
+
+	hookCh := make(chan bool, 4)
+	g.ApprovalWaitHook = func(waiting bool) { hookCh <- waiting }
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := dispatchRunShell(context.Background(), g, map[string]any{"command": "gray_marker"})
+		done <- err
+	}()
+
+	select {
+	case req := <-approvalCh:
+		if req.RequestID == "" {
+			t.Error("RequestID 应非空")
+		}
+		if cap(req.ReplyCh) != 1 {
+			t.Errorf("ReplyCh cap = %d, want 1", cap(req.ReplyCh))
+		}
+		req.ReplyCh <- shell.ApprovalReply{Approved: false}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for approval request")
+	}
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "拒绝") {
+			t.Fatalf("拒绝后应返回拒绝错误，got: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("run_shell 未在拒绝后返回")
+	}
+
+	// hook 应按 [true, false] 顺序成对触发（done 返回时两次回调均已发生）
+	var seq []bool
+	for i := 0; i < 2; i++ {
+		select {
+		case v := <-hookCh:
+			seq = append(seq, v)
+		case <-time.After(time.Second):
+			t.Fatalf("hook 触发次数不足: %v", seq)
+		}
+	}
+	if !seq[0] || seq[1] {
+		t.Errorf("hook 序列 = %v, want [true false]", seq)
+	}
+}
+
+// A2：nil ApprovalWaitHook 必须是 no-op（scheduler/测试路径的默认形态）。
+func TestShellGroup_NilApprovalWaitHook_NoOp(t *testing.T) {
+	filter := shell.NewCommandFilter(nil, []string{`^gray_marker_nil$`})
+	g, approvalCh := newTestShellGroup(t, t.TempDir(), filter) // 不设 hook
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := dispatchRunShell(context.Background(), g, map[string]any{"command": "gray_marker_nil"})
+		done <- err
+	}()
+
+	select {
+	case req := <-approvalCh:
+		req.ReplyCh <- shell.ApprovalReply{Approved: false}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for approval request")
+	}
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("拒绝后应返回 error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("nil hook 路径 run_shell 未返回")
+	}
+}

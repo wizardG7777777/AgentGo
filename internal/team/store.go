@@ -225,6 +225,25 @@ func (s *Store) StopPlan(planID, reason string) ([]TeamSpec, error) {
 	return out, err
 }
 
+// RebindDir 把持久化目标切换到 newPath（session 切换后的新 Session 目录），
+// 并立即把当前内存态完整落盘一次到新路径——使新 Session 目录从切换时刻起
+// 即为完整副本。语义（B2/B3 决策）：team 运行时状态跨 session 连续，切换只
+// 迁移持久化位置，内存态不重置；旧路径文件保持切换时刻的内容（冻结，正确）。
+// 写新路径失败时返回错误且目标路径保持旧值，后续变更仍落旧目录。
+// newPath 为空串时仅切断持久化（等价退回内存态），不写盘。
+func (s *Store) RebindDir(newPath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if newPath != "" {
+		// s.state 在 OpenStore/update 出口均已 normalize，可直接落盘。
+		if err := writeStateAtomic(newPath, &s.state); err != nil {
+			return fmt.Errorf("rebind team store: %w", err)
+		}
+	}
+	s.path = newPath
+	return nil
+}
+
 func (s *Store) update(fn func(*persistentState) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -1,22 +1,26 @@
+> **归档说明（2026-07-19）**：本文记录 2026-05 的 Trace schema Phase 2 设计。动态 DAG 控制面已在其后扩展事件与载荷；当前字段、事件清单和 CLI 行为以 [TraceGuide.md](../../TraceGuide.md) 与 internal/trace/event.go 为准。
+
 # TraceUpgrade：v5 trace 事件结构化升级
 
 > **状态**：📋 Spec 定稿（2026-05-01 起草，承接 ReactiveSystem.md Phase 2 范围）
 > **优先级**：P0（v5 关键前置基础设施——Reactor 系统的事件源 / Phase 3-6 的硬阻塞）
 > **关联文档**：
-> - [ReactiveSystem.md](ReactiveSystem.md) §6.4 / §6.5（首批事件清单 + payload 草案的源头）
-> - [MemoryManageSystem.md](MemoryManageSystem.md)（其 MM3-MM4 写入侧的 Roster 监听 / 团队状态变更可考虑产生 trace 事件）
-> - [ToolUpgradePlan.md](ToolUpgradePlan.md) §2.8 / §2.9（Shell 三个事件的 payload 字段在本模块定稿）
+> - [ReactiveSystem.md](../activate/ReactiveSystem.md) §6.4 / §6.5（首批事件清单 + payload 草案的源头）
+> - [MemoryManageSystem.md](../activate/MemoryManageSystem.md)（其 MM3-MM4 写入侧的 Roster 监听 / 团队状态变更可考虑产生 trace 事件）
+> - [ToolUpgradePlan.md](../activate/ToolUpgradePlan.md) §2.8 / §2.9（Shell 三个事件的 payload 字段在本模块定稿）
 > **关键判决**：
 > - schema 形态选 **B：嵌套子结构体**（保留现有 fat struct，新增三个指针字段：`Transition` / `ShellExec` / `ShellTimeout`）
 > - `Reason` 自由文本字段**保留**作为人类可读摘要；新增的 `Transition.Cause` 是结构化 enum 给 Reactor when 条件用
 > - Phase 2 不引入 schema 重构（不改 fat struct 形态本身），只**追加**新字段
 > - v4 现有 ~30 个字段的调用点**零迁移**——唯一改动是新增"补 `Transition: &trace.Transition{...}`"的调用点
 
+> **当前实现补注（2026-07）**：本文保留 2026-05 Phase 2 的历史范围与当时的 `17 → 21` 计数。后续动态 DAG 控制面把内置系统 EventKind 扩展到 31 个，并在 `Event` 上追加 `Plan` / `Acceptance` 两个结构化指针载荷；当前 CLI 已支持 `list` / `show` / `plan <plan_id>`。现行完整清单与使用方式以 [TraceGuide.md](../../TraceGuide.md) 和 `internal/trace/event.go` 为准。
+
 ---
 
 ## 0. 模块命题
 
-ReactiveSystem 把 trace 事件流升格为 Reactor 子系统的**统一事件源**（[原则 3](ReactiveSystem.md#原则-3trace-是-reactor-的统一事件源不替代领域权威存储)）——所有状态变更必须遵循"主流程 SetState → emit `KindXxx` → Reactor 订阅者响应"三步序列。TaskStore / PlanStore 仍分别是 Task 和动态 DAG 的领域权威；trace 负责分发与审计。早期 trace 事件缺少结构化状态语义——绝大多数事件只有 `TaskID` + `Reason string`（自由文本），让 Reactor 无法精确订阅"task_status 从 X 变到 Y"或"cancel 来源是 watchdog 还是用户"这类条件。
+ReactiveSystem 把 trace 事件流升格为 Reactor 子系统的**统一事件源**（[原则 3](../activate/ReactiveSystem.md#原则-3trace-是-reactor-的统一事件源不替代领域权威存储)）——所有状态变更必须遵循"主流程 SetState → emit `KindXxx` → Reactor 订阅者响应"三步序列。TaskStore / PlanStore 仍分别是 Task 和动态 DAG 的领域权威；trace 负责分发与审计。早期 trace 事件缺少结构化状态语义——绝大多数事件只有 `TaskID` + `Reason string`（自由文本），让 Reactor 无法精确订阅"task_status 从 X 变到 Y"或"cancel 来源是 watchdog 还是用户"这类条件。
 
 本模块在 trace 系统上做**最小侵入式扩展**：保留现有 fat struct 形态（避免大规模迁移），在 Event 上新增三个嵌套子结构体承载结构化字段（状态转移 / Shell 执行 / Shell 超时），并新增 4 个 v5 首批事件需要的 EventKind。完成后：
 
@@ -63,11 +67,11 @@ trace.Emit(trace.Event{
 })
 ```
 
-Reactor 用例多样（清理 vs 回滚 vs 通知）取决于谁取消，[ReactiveSystem.md §6.4.6](ReactiveSystem.md#646-cancel_source-的特殊提示) 已强调必须把 cancel_source 升级为结构化字段。
+Reactor 用例多样（清理 vs 回滚 vs 通知）取决于谁取消，[ReactiveSystem.md §6.4.6](../activate/ReactiveSystem.md#646-cancel_source-的特殊提示) 已强调必须把 cancel_source 升级为结构化字段。
 
 **痛点 3：Agent 实例状态变更完全无 trace**
 
-[ReactiveSystem.md §7.2 决议](ReactiveSystem.md#72-状态枚举已决议4-个核心状态)引入 4 个 Agent 状态（idle / processing / waiting_approval / terminating）+ SetState API。每次 `SetState(newState, cause)` 必须同步 emit `KindAgentStateChanged` —— 但当前 EventKind 完全没有这个事件，对应的 payload schema 也不存在。
+[ReactiveSystem.md §7.2 决议](../activate/ReactiveSystem.md#72-状态枚举已决议4-个核心状态)引入 4 个 Agent 状态（idle / processing / waiting_approval / terminating）+ SetState API。每次 `SetState(newState, cause)` 必须同步 emit `KindAgentStateChanged` —— 但当前 EventKind 完全没有这个事件，对应的 payload schema 也不存在。
 
 ---
 
@@ -160,7 +164,7 @@ type Transition struct {
 
 ### 3.3 ShellExec 子结构
 
-承接 [ToolUpgradePlan.md §2.9](ToolUpgradePlan.md#29-kindshellexecuted-事件的开放策略) payload 草案：
+承接 [ToolUpgradePlan.md §2.9](../activate/ToolUpgradePlan.md#29-kindshellexecuted-事件的开放策略) payload 草案：
 
 ```go
 type ShellExec struct {
@@ -177,7 +181,7 @@ type ShellExec struct {
 
 ### 3.4 ShellTimeout 子结构
 
-承接 [ToolUpgradePlan.md §2.8.5](ToolUpgradePlan.md#285-trace-事件配套) payload 草案：
+承接 [ToolUpgradePlan.md §2.8.5](../activate/ToolUpgradePlan.md#285-trace-事件配套) payload 草案：
 
 ```go
 type ShellTimeout struct {
@@ -236,7 +240,7 @@ const (
 )
 ```
 
-**事件订阅开放性**（与 [ReactiveSystem.md §6.4](ReactiveSystem.md#641-首批清单)对齐）：
+**事件订阅开放性**（与 [ReactiveSystem.md §6.4](../activate/ReactiveSystem.md#641-首批清单)对齐）：
 
 | EventKind | 用户 YAML schema | 内置 Reactor |
 |---|---|---|
@@ -471,7 +475,7 @@ for _, ev := range events {
 
 ### 8.1 与 ReactiveSystem Phase 2 的关系
 
-本模块对应 [ReactiveSystem.md Phase 2](ReactiveSystem.md#1010-依赖关系总览)。完成本模块后 ReactiveSystem Phase 3 / 4 / 5 / 6 才能启动（Reactor 系统需要结构化事件源）。
+本模块对应 [ReactiveSystem.md Phase 2](../activate/ReactiveSystem.md#1010-依赖关系总览)。完成本模块后 ReactiveSystem Phase 3 / 4 / 5 / 6 才能启动（Reactor 系统需要结构化事件源）。
 
 ### 8.2 内部步骤
 
@@ -513,7 +517,7 @@ T1（schema 定义）─┬─→ T2（测试）         可并行 T3
 - **cmdList / summarize 增强**（waited / shell_calls / timeouts 新列）—— 体验优化，延后到 v5.x
 - **trace 事件导出格式（OpenTelemetry / Jaeger）** —— v5 不考虑外部追踪生态接入，trace 是内部排查工具
 - **Trigger System 触发记录**（[nextUpgrade_v5.md §13.4](nextUpgrade_v5.md)）—— Trigger System 自身是 V6 方向，本模块不为其预留 EventKind
-- **Memory System 的 memory_put / memory_query EventKind** —— [nextUpgrade_v5.md §13.7](nextUpgrade_v5.md) 提到 Memory 操作可作为新 EventKind 被 trace 记录。这是 [MemoryManageSystem.md](MemoryManageSystem.md) 的扩展点，由该模块在 MM2-MM5 阶段决定是否引入；本模块不预留
+- **Memory System 的 memory_put / memory_query EventKind** —— [nextUpgrade_v5.md §13.7](nextUpgrade_v5.md) 提到 Memory 操作可作为新 EventKind 被 trace 记录。这是 [MemoryManageSystem.md](../activate/MemoryManageSystem.md) 的扩展点，由该模块在 MM2-MM5 阶段决定是否引入；本模块不预留
 
 ---
 
@@ -521,9 +525,9 @@ T1（schema 定义）─┬─→ T2（测试）         可并行 T3
 
 | 模块 | 关系 |
 |---|---|
-| [ReactiveSystem.md](ReactiveSystem.md) | 本模块是其 Phase 2 的具体落地；§6.4.5 的 9 事件 payload 草案在本模块定稿；§7.2.6 的 KindAgentStateChanged 由本模块定义 EventKind |
-| [ToolUpgradePlan.md](ToolUpgradePlan.md) | §2.9 的 KindShellExecuted / §2.8.5 的 KindShellTimeoutPending / Resolved 在本模块定义 EventKind 与 sub-payload；ToolUpgradePlan Phase T5-T6 会消费本模块的事件定义 |
-| [MemoryManageSystem.md](MemoryManageSystem.md) | 暂无直接依赖（Memory System 的写入侧与 trace 解耦）；未来若引入 memory_put / query EventKind 时本模块作为 schema 模板参考 |
-| [InterfaceDesign.md](InterfaceDesign.md) | 本模块新增的 `Transition` / `ShellExec` / `ShellTimeout` struct 定义，未来可考虑迁入 InterfaceDesign 作为 trace 模块的接口规约 |
+| [ReactiveSystem.md](../activate/ReactiveSystem.md) | 本模块是其 Phase 2 的具体落地；§6.4.5 的 9 事件 payload 草案在本模块定稿；§7.2.6 的 KindAgentStateChanged 由本模块定义 EventKind |
+| [ToolUpgradePlan.md](../activate/ToolUpgradePlan.md) | §2.9 的 KindShellExecuted / §2.8.5 的 KindShellTimeoutPending / Resolved 在本模块定义 EventKind 与 sub-payload；ToolUpgradePlan Phase T5-T6 会消费本模块的事件定义 |
+| [MemoryManageSystem.md](../activate/MemoryManageSystem.md) | 暂无直接依赖（Memory System 的写入侧与 trace 解耦）；未来若引入 memory_put / query EventKind 时本模块作为 schema 模板参考 |
+| [旧 TUI 接口设计归档](interface-design-tui-2026-05.md) | 本模块新增的 `Transition` / `ShellExec` / `ShellTimeout` struct 定义，未来可考虑迁入 InterfaceDesign 作为 trace 模块的接口规约 |
 | `nextUpgrade_v4.md` | v4 §11 的 `KindHistoryTruncated` / `KindTokenStats` 等已存在事件保持不变；本模块不重构既有事件 |
 | `nextUpgrade_v5.md` | §13.7 提到 trace 系统升级后可记录 memory_put / trigger_fired 等事件；这些是 V6 方向的扩展位，本模块不预留具体 EventKind |

@@ -35,7 +35,8 @@ type StoreHookView interface {
 	// 用于 PerAgentDedupHook 在 BeforeWake 阶段判断是否已存在同源同类型
 	// 的待处理唤醒任务，从而做镜像去重（D4 双重防御）。
 	//
-	// Phase 2 引入。返回的切片是浅拷贝，调用方可以安全遍历但不应修改任务字段。
+	// Phase 2 引入。返回的是深拷贝（cloneTask），与其他读 API 一致——
+	// 调用方修改返回任务不影响 store 内部状态（E6）。
 	ScanPendingByEventSource(source, eventType string) []*model.Task
 
 	// GetReadSet 返回任务的"已读集合"（v5 Phase 6 引入，ReactiveSystem.md §5.2.1）。
@@ -55,7 +56,9 @@ func (s *MemoryTaskStore) GetToolCallHistory(taskID string) []ToolCallRecord {
 
 // ScanPendingByEventSource 实现 StoreHookView 接口的过滤扫描。
 // 在内部读锁下遍历所有任务，匹配 source/eventType/pending 的任务返回。
-// 返回切片是浅拷贝（指针），调用方不应修改任务字段。
+// 返回深拷贝（cloneTask）——此前返回内部 *model.Task 裸指针，调用方
+// 可直接改穿 store 内部状态（E6）；修复后与 GetTask/QueryAvailable 等
+// 其他读 API 的克隆语义一致。
 //
 // Phase 2 引入；用途详见 StoreHookView 接口注释。
 func (s *MemoryTaskStore) ScanPendingByEventSource(source, eventType string) []*model.Task {
@@ -66,7 +69,7 @@ func (s *MemoryTaskStore) ScanPendingByEventSource(source, eventType string) []*
 		if task.EventSource == source &&
 			task.EventType == eventType &&
 			task.Status == model.TaskStatusPending {
-			result = append(result, task)
+			result = append(result, cloneTask(task))
 		}
 	}
 	return result

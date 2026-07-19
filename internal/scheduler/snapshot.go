@@ -344,10 +344,13 @@ func BuildBoardJSON(
 		taskSnaps = append(taskSnaps, snap)
 	}
 
+	// D3：busy 推导统一走 store.BusyAgentTasks；board 口径只统计默认队列
+	// （EventType == ""）。helper 按 agent 去重（每 agent 计 1），旧实现按任务
+	// 累加 len(t.Agents)——同一 agent 同一时刻只处理一个任务，两者数值相同。
 	busyWorkers := 0
-	for _, t := range allTasks {
-		if t.Status == model.TaskStatusProcessing && t.EventType == "" {
-			busyWorkers += len(t.Agents)
+	for _, t := range store.BusyAgentTasks(allTasks) {
+		if t.EventType == "" {
+			busyWorkers++
 		}
 	}
 	// v4：worker count 来自 cfg.Agents 中所有监听默认队列（event_type=""）的 kind 的 replicas 总和。
@@ -774,20 +777,10 @@ func buildAgentSnapshotsForPlan(
 		return nil
 	}
 
-	// 反向映射：agentID → 当前正在处理的 task
-	currentTask := make(map[string]*model.Task)
-	for _, t := range tasks {
-		if t.Status != model.TaskStatusProcessing {
-			continue
-		}
-		for _, agentID := range t.Agents {
-			// 若同一代理认领了多个任务（并发处理），取第一个；
-			// 实践中 worker 一般串行，这是个保守假设
-			if _, exists := currentTask[agentID]; !exists {
-				currentTask[agentID] = t
-			}
-		}
-	}
+	// 反向映射：agentID → 当前正在处理的 task。
+	// D3：统一走 store.BusyAgentTasks——若同一代理认领了多个任务（并发处理），
+	// 保留 first-seen（ScanAll 确定序，实践中 worker 一般串行，这是个保守假设）。
+	currentTask := store.BusyAgentTasks(tasks)
 
 	out := make([]agentSnapshot, 0, len(statuses))
 	for _, st := range statuses {

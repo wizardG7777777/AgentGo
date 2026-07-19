@@ -4,14 +4,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 // currentSnapshotVersion is the current snapshot format version.
 //
 // Version 2 extends TaskSnapshot with scheduler/runtime fields required to
-// resume an in-flight task graph. LoadSnapshot still accepts version 1 and
-// upgrades it in memory so existing sessions remain resumable.
-const currentSnapshotVersion = 2
+// resume an in-flight task graph. Version 3 adds the current pending queue
+// lease timestamp. Version 4 changes MailboxSnapshot.Messages from the recent
+// observation ring to the actual unread queue. LoadSnapshot still accepts
+// older versions and upgrades them in memory so existing sessions remain
+// resumable; pre-v4 mailbox messages are dropped because their read/unread
+// state cannot be distinguished safely.
+const currentSnapshotVersion = 4
 
 const oldestSupportedSnapshotVersion = 1
 
@@ -41,6 +46,9 @@ type TaskSnapshot struct {
 	RetryReasons       []string          `json:"retry_reasons"`
 	TimeoutSeconds     int               `json:"timeout_seconds"`
 	EventSource        string            `json:"event_source,omitempty"`
+	ParentTaskID       string            `json:"parent_task_id,omitempty"`
+	ReplyToAgentID     string            `json:"reply_to_agent_id,omitempty"`
+	BatchID            string            `json:"batch_id,omitempty"`
 	EventType          string            `json:"event_type,omitempty"`
 	TriggerRule        string            `json:"trigger_rule,omitempty"`
 	SystemPrompt       string            `json:"system_prompt,omitempty"`
@@ -53,6 +61,7 @@ type TaskSnapshot struct {
 	LastResponse       string            `json:"last_response,omitempty"`
 	PartialOutput      string            `json:"partial_output,omitempty"`
 	CreatedAt          string            `json:"created_at"`
+	PendingSince       string            `json:"pending_since,omitempty"`
 	StartedAt          string            `json:"started_at,omitempty"`
 	CompletedAt        string            `json:"completed_at,omitempty"`
 	PlanID             string            `json:"plan_id,omitempty"`
@@ -100,7 +109,7 @@ type ClaimSnapshot struct {
 type MailboxSnapshot struct {
 	OwnerID   string            `json:"owner_id"`
 	EventType string            `json:"event_type"`
-	Messages  []MessageSnapshot `json:"messages"`
+	Messages  []MessageSnapshot `json:"messages"` // v4: 真实未读邮件，最新在前
 }
 
 // MessageSnapshot 是单条消息的可序列化表示。
@@ -131,6 +140,7 @@ type ResultSnapshot struct {
 }
 
 // SaveSnapshot 将 Snapshot 原子写入到指定路径（write-tmp-then-rename，UTF-8 + 2 空格缩进）。
+// rename 成功后对所在目录做 fsync（syncDir，best-effort），保证目录项本身落盘。
 func SaveSnapshot(path string, snap *Snapshot) error {
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
@@ -143,6 +153,7 @@ func SaveSnapshot(path string, snap *Snapshot) error {
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("rename snapshot: %w", err)
 	}
+	_ = syncDir(filepath.Dir(path))
 	return nil
 }
 
@@ -164,9 +175,21 @@ func LoadSnapshot(path string) (*Snapshot, error) {
 			snap.Version, oldestSupportedSnapshotVersion, currentSnapshotVersion,
 		)
 	}
-	// v1 did not contain the v2 TaskSnapshot fields. Their Go zero values are
-	// the correct migration defaults, so upgrading only requires normalizing
-	// the schema version in memory.
+	loadedVersion := snap.Version
+	// Older versions did not contain all current TaskSnapshot fields. Their Go
+	// zero values are the correct schema defaults; execution-aware migration
+	// (including establishing a fresh pending lease) happens in TaskStore import.
+	//
+	// Before v4 MailboxSnapshot.Messages came from the non-consuming recent
+	// observation ring, so it included mail that agents had already drained.
+	// Replaying it would manufacture unread mail and can trigger duplicate wake
+	// tasks. Preserve mailbox identity metadata, but fail closed by discarding
+	// those ambiguous historical messages during migration.
+	if loadedVersion < 4 {
+		for i := range snap.Mailboxes {
+			snap.Mailboxes[i].Messages = nil
+		}
+	}
 	snap.Version = currentSnapshotVersion
 	return &snap, nil
 }

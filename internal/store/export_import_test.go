@@ -134,6 +134,34 @@ func TestExportSnapshot_FieldMapping(t *testing.T) {
 	if snap.StartedAt == "" {
 		t.Error("StartedAt should not be empty for processing task")
 	}
+	if snap.PendingSince != "" {
+		t.Errorf("PendingSince = %q, want empty for processing task", snap.PendingSince)
+	}
+}
+
+func TestExportImport_PreservesCurrentPendingLease(t *testing.T) {
+	s1, _ := newTestStore(10, 100)
+	task := publishTestTask(t, s1, "pending lease")
+	createdAt := time.Date(2026, 7, 1, 1, 2, 3, 0, time.UTC)
+	pendingSince := time.Date(2026, 7, 19, 4, 5, 6, 0, time.UTC)
+	if err := s1.SetTaskTiming(task.ID, createdAt, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.SetTaskPendingSince(task.ID, pendingSince); err != nil {
+		t.Fatal(err)
+	}
+	snaps := s1.ExportSnapshot()
+	if len(snaps) != 1 || snaps[0].PendingSince != "2026-07-19T04:05:06Z" {
+		t.Fatalf("exported PendingSince=%q", snaps[0].PendingSince)
+	}
+	s2, _ := newTestStore(10, 100)
+	if err := s2.ImportSnapshot(snaps); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s2.GetTask(task.ID)
+	if !got.CreatedAt.Equal(createdAt) || !got.PendingSince.Equal(pendingSince) {
+		t.Fatalf("restored times: CreatedAt=%v PendingSince=%v", got.CreatedAt, got.PendingSince)
+	}
 }
 
 func TestExportSnapshot_EmptyStore(t *testing.T) {
@@ -155,7 +183,7 @@ func TestImportSnapshot_Basic(t *testing.T) {
 			Priority:       10,
 			Dependencies:   []string{},
 			Status:         "pending",
-			Agents:         []string{},
+			Agents:         []string{"dead-agent"},
 			MaxConcurrency: 2,
 			Results:        map[string]string{},
 			RetryCount:     0,
@@ -163,12 +191,15 @@ func TestImportSnapshot_Basic(t *testing.T) {
 			TimeoutSeconds: 300,
 			Depth:          0,
 			CreatedAt:      now,
+			StartedAt:      now,
 		},
 	}
 
+	beforeRestore := time.Now().UTC()
 	if err := s.ImportSnapshot(tasks); err != nil {
 		t.Fatalf("ImportSnapshot failed: %v", err)
 	}
+	afterRestore := time.Now().UTC()
 
 	got, err := s.GetTask("task-1")
 	if err != nil {
@@ -182,6 +213,12 @@ func TestImportSnapshot_Basic(t *testing.T) {
 	}
 	if got.Status != model.TaskStatusPending {
 		t.Errorf("Status = %s, want pending", got.Status)
+	}
+	if got.PendingSince.Before(beforeRestore) || got.PendingSince.After(afterRestore) {
+		t.Errorf("legacy PendingSince=%v, want fresh lease in [%v,%v]", got.PendingSince, beforeRestore, afterRestore)
+	}
+	if !got.StartedAt.IsZero() || len(got.Agents) != 0 {
+		t.Errorf("legacy pending task retained stale execution lease: %+v", got)
 	}
 }
 
@@ -218,6 +255,17 @@ func TestImportSnapshot_InvalidTime(t *testing.T) {
 	}
 }
 
+func TestImportSnapshot_InvalidPendingSince(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	err := s.ImportSnapshot([]session.TaskSnapshot{{
+		ID: "task-bad-pending", Status: "pending",
+		CreatedAt: "2026-07-19T00:00:00Z", PendingSince: "not-a-time",
+	}})
+	if err == nil {
+		t.Fatal("expected error for invalid pending_since")
+	}
+}
+
 func TestExportImport_RoundTrip(t *testing.T) {
 	s1, _ := newTestStore(10, 100)
 
@@ -247,9 +295,11 @@ func TestExportImport_RoundTrip(t *testing.T) {
 
 	// Import into a new store
 	s2, _ := newTestStore(10, 100)
+	beforeRestore := time.Now().UTC()
 	if err := s2.ImportSnapshot(snaps); err != nil {
 		t.Fatalf("ImportSnapshot failed: %v", err)
 	}
+	afterRestore := time.Now().UTC()
 
 	// Verify round-trip
 	got1, err := s2.GetTask(t1.ID)
@@ -279,9 +329,12 @@ func TestExportImport_RoundTrip(t *testing.T) {
 	if !got2.StartedAt.IsZero() {
 		t.Errorf("t2 StartedAt = %v, want zero after resume", got2.StartedAt)
 	}
+	if got2.PendingSince.Before(beforeRestore) || got2.PendingSince.After(afterRestore) {
+		t.Errorf("t2 PendingSince=%v, want fresh recovery lease in [%v,%v]", got2.PendingSince, beforeRestore, afterRestore)
+	}
 }
 
-func TestExportImport_RoundTripV2RuntimeFields(t *testing.T) {
+func TestExportImport_RoundTripV3RuntimeFields(t *testing.T) {
 	s1, _ := newTestStore(10, 100)
 
 	history := []byte(`[{"output":"command completed","tool_called":true,"tool_calls":[{"id":"call-1","name":"run_shell"}]}]`)

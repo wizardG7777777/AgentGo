@@ -12,9 +12,9 @@ import (
 	"time"
 )
 
-// Writer 是任务级 trace 文件写入器。
+// Writer 是任务级 trace 事件写入器。
 //
-// 每个任务对应一个 JSONL 文件，文件名格式：
+// 每次为 Task 打开句柄时对应一个 JSONL 物理分片，文件名格式：
 //
 //	<UTC时间戳>_<task_id前8位>.jsonl
 //	例：2026-04-08T04-17-06_321b561d.jsonl
@@ -22,13 +22,16 @@ import (
 // 并发安全：通过单一互斥锁串行化所有 Emit 调用。性能注意点：
 // 高并发场景下锁可能成为瓶颈，未来可改造为 per-task channel + 单 writer goroutine。
 //
-// GC 策略：每次创建新任务文件后，扫描目录，若 .jsonl 文件总数超过 maxTasks，
+// 同一 Task 的一次执行结束并 CloseTask 后，后续 retry 会打开新分片；viewer
+// 负责按完整 TaskID 聚合。GC 策略：每次创建新物理文件后，扫描目录，若 .jsonl
+// 文件总数超过 maxTasks，
 // 按修改时间删除最旧的文件（不会删除当前正在写入的文件）。
 type Writer struct {
 	mu       sync.Mutex
 	dir      string
 	files    map[string]*openFile // taskID → 已打开的文件句柄
-	maxTasks int                  // 最大保留任务数；<=0 表示不限制
+	maxTasks int                  // 最大保留物理 trace 文件数；<=0 表示不限制
+	closed   bool                 // Close 后置位：Emit/CloseTask 永久 no-op，绝不重开文件
 }
 
 // openFile 跟踪一个正在被写入的 trace 文件。
@@ -38,7 +41,7 @@ type openFile struct {
 }
 
 // NewWriter 创建一个新的 trace 写入器。
-// dir 是 trace 文件目录（不存在会自动创建）。maxTasks 是磁盘上保留的最大任务文件数。
+// dir 是 trace 文件目录（不存在会自动创建）。maxTasks 是磁盘上保留的最大物理文件数。
 func NewWriter(dir string, maxTasks int) (*Writer, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("创建 trace 目录失败: %w", err)
@@ -70,6 +73,11 @@ func (w *Writer) Emit(event Event) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// Close 后永久丢弃——session 切换重绑后旧 writer 不得复活旧目录的文件
+	if w.closed {
+		return
+	}
+
 	of, isNew, err := w.fileFor(event.TaskID, event.Timestamp)
 	if err != nil {
 		log.Printf("[trace] WARNING: failed to open trace file for task %s: %v", event.TaskID, err)
@@ -94,21 +102,28 @@ func (w *Writer) Emit(event Event) {
 }
 
 // CloseTask 显式关闭一个任务的 trace 文件句柄。
-// 任务结束（task_completed）时由调用方调用，释放文件描述符。
-// 不影响后续读取（文件仍在磁盘上），只是从 in-memory 句柄表中移除。
+// 当前执行尝试结束时由调用方调用，释放文件描述符。不影响后续读取（文件仍在
+// 磁盘上），只是从 in-memory 句柄表中移除；同 Task retry 时会创建新分片。
 func (w *Writer) CloseTask(taskID string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.closed {
+		return
+	}
 	if of, ok := w.files[taskID]; ok {
 		of.f.Close()
 		delete(w.files, taskID)
 	}
 }
 
-// Close 关闭所有打开的文件句柄。Shutdown 时调用。
+// Close 关闭所有打开的文件句柄并永久停用该 Writer。Shutdown 时调用。
+// Close 后 Emit/CloseTask 均为 no-op，绝不重新打开文件——session 切换
+// 重绑（SwapDefaultWriter）后旧 writer 即使被滞后的调用方持有，也无法
+// 复活旧 session 目录的 trace 文件。
 func (w *Writer) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.closed = true
 	for _, of := range w.files {
 		of.f.Close()
 	}
@@ -203,16 +218,42 @@ func (w *Writer) gcDiskFiles() {
 
 // --- 包级默认 Writer ---
 
-// defaultWriter 是包级默认 Writer 实例。bootstrap 时通过 SetDefault 设置。
+// defaultMu 保护包级默认 Writer / Dispatcher。Emit 等热路径只在 RLock 内
+// 取指针快照，锁外执行实际的文件 IO / 派发——绝不在全局锁下做磁盘操作。
+var defaultMu sync.RWMutex
+
+// defaultWriter 是包级默认 Writer 实例。bootstrap 时通过 SetDefault 设置，
+// session 切换时通过 SwapDefaultWriter 重绑。
 // 设为 nil 时所有 trace.Emit 调用都是 no-op，方便测试和按需禁用。
 var defaultWriter *Writer
 
 // SetDefault 设置包级默认 Writer。bootstrap 时调用一次。
 // 传入 nil 可以显式禁用 trace（比如 --no-trace 命令行选项）。
-func SetDefault(w *Writer) { defaultWriter = w }
+// 注意：不会关闭被替换的旧 Writer——需要关闭语义时用 SwapDefaultWriter。
+func SetDefault(w *Writer) {
+	defaultMu.Lock()
+	defer defaultMu.Unlock()
+	defaultWriter = w
+}
+
+// SwapDefaultWriter 原子替换包级默认 Writer 并返回被替换的旧实例。
+// session 切换重绑时使用：调用方拿到旧 Writer 后负责 Close（Close 后旧
+// Writer 永久停用，见 Writer.Close）。传入 nil 等价于 SetDefault(nil) 并
+// 返回旧实例。
+func SwapDefaultWriter(w *Writer) (old *Writer) {
+	defaultMu.Lock()
+	defer defaultMu.Unlock()
+	old = defaultWriter
+	defaultWriter = w
+	return old
+}
 
 // Default 返回当前的默认 Writer。可能为 nil。
-func Default() *Writer { return defaultWriter }
+func Default() *Writer {
+	defaultMu.RLock()
+	defer defaultMu.RUnlock()
+	return defaultWriter
+}
 
 // Dispatcher 是 v5 Phase 4 引入的 Reactor 派发钩子接口（ReactiveSystem.md §6.6）。
 //
@@ -226,15 +267,24 @@ type Dispatcher interface {
 	Dispatch(ev Event)
 }
 
-// defaultDispatcher 是包级默认 Reactor 派发器。
+// defaultDispatcher 是包级默认 Reactor 派发器。与 defaultWriter 共用
+// defaultMu 保护（同一把 RWMutex，二者总是成对快照）。
 var defaultDispatcher Dispatcher
 
 // SetDefaultDispatcher 设置包级默认 Dispatcher。bootstrap 时调用一次。
 // 传入 nil 可以显式卸下 reactor 派发（测试场景常用）。
-func SetDefaultDispatcher(d Dispatcher) { defaultDispatcher = d }
+func SetDefaultDispatcher(d Dispatcher) {
+	defaultMu.Lock()
+	defer defaultMu.Unlock()
+	defaultDispatcher = d
+}
 
 // DefaultDispatcher 返回当前的默认 Dispatcher。可能为 nil。
-func DefaultDispatcher() Dispatcher { return defaultDispatcher }
+func DefaultDispatcher() Dispatcher {
+	defaultMu.RLock()
+	defer defaultMu.RUnlock()
+	return defaultDispatcher
+}
 
 // Emit 是包级 helper：把事件 emit 到默认 Writer，并派发到默认 Dispatcher。
 // Writer / Dispatcher 任一为 nil 时跳过对应步骤（互不依赖）。
@@ -247,17 +297,27 @@ func Emit(event Event) {
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now()
 	}
-	if defaultWriter != nil {
-		defaultWriter.Emit(event)
+	// RLock 内只取指针快照，锁外执行写盘/派发——SwapDefaultWriter 重绑
+	// 与并发 Emit 互不阻塞；快照到的旧 Writer 即使随即被 Close，也因
+	// closed 标志静默丢弃，不会复活旧文件。
+	defaultMu.RLock()
+	w := defaultWriter
+	d := defaultDispatcher
+	defaultMu.RUnlock()
+	if w != nil {
+		w.Emit(event)
 	}
-	if defaultDispatcher != nil {
-		defaultDispatcher.Dispatch(event)
+	if d != nil {
+		d.Dispatch(event)
 	}
 }
 
 // CloseTask 是包级 helper：从默认 Writer 关闭一个任务的文件句柄。
 func CloseTask(taskID string) {
-	if defaultWriter != nil {
-		defaultWriter.CloseTask(taskID)
+	defaultMu.RLock()
+	w := defaultWriter
+	defaultMu.RUnlock()
+	if w != nil {
+		w.CloseTask(taskID)
 	}
 }

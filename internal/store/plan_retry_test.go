@@ -94,8 +94,55 @@ func TestSuspendTaskExecutionRequeuesWithoutConsumingRetry(t *testing.T) {
 	if got.Status != model.TaskStatusPending || len(got.Agents) != 0 || got.RetryCount != 0 {
 		t.Fatalf("suspended task=%+v", got)
 	}
+	if got.PendingSince.IsZero() || !got.StartedAt.IsZero() {
+		t.Fatalf("suspended task did not receive a clean pending lease: %+v", got)
+	}
 	if string(got.LastHistory) != string(history) {
 		t.Fatalf("last history=%s, want %s", got.LastHistory, history)
+	}
+}
+
+func TestSuspendTaskExecutionMultiAgentStartsPendingLeaseOnlyAfterLastAgent(t *testing.T) {
+	s := NewMemoryTaskStore(nil, 32, 2, 60)
+	task := &model.Task{
+		Description:    "cooperative plan suspension",
+		PlanID:         "plan-1",
+		MaxConcurrency: 2,
+	}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("worker-1", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("worker-2", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	processing, _ := s.GetTask(task.ID)
+
+	if err := s.SuspendTaskExecution("worker-1", task.ID, "plan paused", nil); err != nil {
+		t.Fatal(err)
+	}
+	stillRunning, _ := s.GetTask(task.ID)
+	if stillRunning.Status != model.TaskStatusProcessing || len(stillRunning.Agents) != 1 {
+		t.Fatalf("first suspension ended shared execution lease: %+v", stillRunning)
+	}
+	if !stillRunning.PendingSince.IsZero() || !stillRunning.StartedAt.Equal(processing.StartedAt) {
+		t.Fatalf("first suspension reset timing while another agent remained: %+v", stillRunning)
+	}
+
+	if err := s.SuspendTaskExecution("worker-2", task.ID, "plan paused", nil); err != nil {
+		t.Fatal(err)
+	}
+	requeued, _ := s.GetTask(task.ID)
+	if requeued.Status != model.TaskStatusPending || len(requeued.Agents) != 0 {
+		t.Fatalf("last suspension did not requeue task: %+v", requeued)
+	}
+	if requeued.PendingSince.IsZero() || !requeued.StartedAt.IsZero() {
+		t.Fatalf("last suspension did not establish a clean pending lease: %+v", requeued)
+	}
+	if requeued.RetryCount != 0 {
+		t.Fatalf("cooperative suspension consumed retry budget: %d", requeued.RetryCount)
 	}
 }
 

@@ -3,12 +3,7 @@ package tui
 import (
 	"time"
 
-	"agentgo/internal/mailbox"
-	"agentgo/internal/model"
-	"agentgo/internal/scheduler"
-	"agentgo/internal/session"
-	"agentgo/internal/shell"
-	"agentgo/internal/store"
+	"agentgo/internal/ui"
 )
 
 // ViewState controls which content is shown in the main area.
@@ -50,43 +45,25 @@ type StyledMsg struct {
 	AgentID string // non-empty for agent-attributed messages
 }
 
-// AgentInfo is a snapshot of an agent's current state, used by the TUI dashboard.
-type AgentInfo struct {
-	ID               string
-	Type             string // "worker", "explorer", "scheduler"
-	State            string // "idle", "processing", "waiting_approval", "terminating"
-	CurrentTaskID    string
-	CurrentTaskDesc  string
-	MailboxPending   int
-	PromptTokens     int64
-	CompletionTokens int64
-	CallCount        int
-	Loop             int
-	Phase            string
-	LastModelText    string
-	LastTool         string
-	ToolCallCount    int
-	LastActivityAt   time.Time
-	ActivityAge      string
-	LastError        string
-}
+// AgentInfo 是单个代理的运行状态快照（仪表板/侧边栏渲染用）。
+// 自 UI Hub 接入起，它只是 ui.AgentCard 的别名——数据由 Hub 轮询产生，
+// 渲染代码因此完全不需要改动。
+type AgentInfo = ui.AgentCard
 
 // Deps aggregates all external dependencies for the TUI.
+//
+// TUI 不再直接持有任何系统通道 / 组件：所有系统状态经 Observer 订阅
+// （首条必为 KindSnapshotSync 全量快照），所有写操作经 Controller 进入
+// UI Hub。两者的生产实现都是 bootstrap 装配的 *ui.Hub。
 type Deps struct {
-	Store         store.TaskStore
-	EventCh       chan<- model.Event
-	CancelFn      func()
-	Scheduler     *scheduler.Bundle
-	Mailbox       *mailbox.Registry
-	ApprovalCh    <-chan shell.ApprovalRequest
-	SessionMgr    *session.SessionManager
-	SystemMsgCh   <-chan string
-	OutputCh      <-chan string
+	// Controller 是 UI Hub 控制面（发用户输入、审批回复、/cancel、/mode、
+	// /steer、session 切换、/quit）。nil 时各命令渲染"未初始化"错误。
+	Controller ui.Controller
+	// Observer 是 UI Hub 观测面（Subscribe + Snapshot）。nil 时界面只显示
+	// 初始空状态（测试用）。
+	Observer ui.Observer
+	// InitialResult 是启动时恢复的上次任务结果（进入结果视图的内容）。
 	InitialResult string
-
-	// AgentInfoFn returns current snapshots of all agents.
-	// Set by bootstrap; nil means no agent info available.
-	AgentInfoFn func() []AgentInfo
 }
 
 // Layout holds the calculated dimensions of each panel.

@@ -161,7 +161,8 @@ reactors:
 	}
 
 	if err := r.Run(trace.Event{
-		Kind: trace.KindTaskFailed, TaskID: "T-77", Reason: "rate limit",
+		Kind: trace.KindTaskFailed, TaskID: "T-77", AgentID: "worker-7",
+		BatchID: "batch-3", Reason: "rate limit",
 	}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -172,6 +173,9 @@ reactors:
 	want := "Investigate task T-77 failed: rate limit"
 	if tasks[0].Description != want {
 		t.Errorf("desc=%q want=%q", tasks[0].Description, want)
+	}
+	if tasks[0].ParentTaskID != "T-77" || tasks[0].ReplyToAgentID != "worker-7" || tasks[0].BatchID != "batch-3" {
+		t.Fatalf("reactor task routing metadata = %+v", tasks[0])
 	}
 	if tasks[0].EventType != "investigation" || tasks[0].Priority != 5 {
 		t.Errorf("event_type/priority wrong: %+v", tasks[0])

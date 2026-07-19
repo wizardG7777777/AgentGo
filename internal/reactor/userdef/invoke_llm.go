@@ -46,10 +46,23 @@ func (r *invokeLLMReactor) Subscribe() []trace.EventKind { return []trace.EventK
 func (r *invokeLLMReactor) IsSync() bool                 { return false }
 func (r *invokeLLMReactor) Priority() int                { return 500 }
 
-// Run 执行：when 过滤 → 渲染 prompt → 调 LLM → 投递输出。
+// Run 是无外部 ctx 的兼容入口（既有测试与手工触发路径）。
+// Registry 的 async 分发会优先走 RunWithContext，把可 quiesce 的派生 ctx 传进来。
+func (r *invokeLLMReactor) Run(ev trace.Event) error {
+	return r.run(context.Background(), ev)
+}
+
+// RunWithContext 实现 reactor.CtxReactor（E4）：Registry 关停（Quiesce）时
+// 取消 ctx，在途 LLM 调用随之中断，不会在 store/trace 关闭后继续投递输出。
+// ctx 存活期间行为与 Run 完全一致（同样的 llmTimeout 预算）。
+func (r *invokeLLMReactor) RunWithContext(ctx context.Context, ev trace.Event) error {
+	return r.run(ctx, ev)
+}
+
+// run 执行：when 过滤 → 渲染 prompt → 调 LLM → 投递输出。
 //
 // 错误语义：when 不命中返回 nil；其余环节失败返回 error，由 Registry 记日志（async 不阻塞主流程）。
-func (r *invokeLLMReactor) Run(ev trace.Event) error {
+func (r *invokeLLMReactor) run(ctx context.Context, ev trace.Event) error {
 	if !r.when.eval(ev) {
 		return nil
 	}
@@ -65,7 +78,7 @@ func (r *invokeLLMReactor) Run(ev trace.Event) error {
 		return fmt.Errorf("invoke_llm[%s]: rendered prompt is empty", r.name)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), r.llmTimeout)
+	ctx, cancel := context.WithTimeout(ctx, r.llmTimeout)
 	defer cancel()
 
 	out, err := r.llm.Complete(ctx, prompt)

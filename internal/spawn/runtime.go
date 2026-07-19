@@ -15,6 +15,9 @@ import (
 //
 // SystemPrompt 优先级：override.SystemPromptSet=true → override 内容；
 // 否则读 base.SystemPromptFile（与 buildAgentRuntime 一致）。
+//
+// idleThreshold 是全局 agent_idle_threshold 的值（E3）——AgentKind 没有
+// per-kind 覆盖字段，ad-hoc runner 统一继承全局配置。
 func buildAdhocRuntime(
 	base config.AgentKind,
 	llmCfg config.LLMConfig,
@@ -22,6 +25,7 @@ func buildAdhocRuntime(
 	override RuntimeOverride,
 	instanceID string,
 	eventType string,
+	idleThreshold int,
 ) (config.AgentRuntimeConfig, error) {
 	// 工具集解析：与 buildAgentRuntime 同一份逻辑（不做 override）
 	var allowed []string
@@ -75,6 +79,7 @@ func buildAdhocRuntime(
 		TaskMaxRetries:               pickInt(override.TaskMaxRetries, base.TaskMaxRetries),
 		EnforceCompactTokenThreshold: pickInt(override.EnforceCompactTokenThreshold, base.EnforceCompactTokenThreshold),
 		ContextLimit:                 pickInt(override.ContextLimit, base.ContextLimit),
+		IdleThreshold:                idleThreshold,
 	}
 	return rt, nil
 }

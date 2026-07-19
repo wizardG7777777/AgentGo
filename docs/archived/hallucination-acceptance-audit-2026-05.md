@@ -1,4 +1,6 @@
-> **注意**：本文档引用的 `docs/activate/KNOWN_ISSUES.md` 已在后续清理中删除，相关引用仅作历史背景。当前项目介绍见 [`README.md`](../../README.md)。
+> **归档说明（2026-07-19）**：本文是 2026-05 的验收审计，不是当前开放问题清单。尚未落实的引用验证限制已归入 [KNOWN_ISSUES.md](../activate/KNOWN_ISSUES.md)。
+
+> **历史注记**：本文中的 KNOWN_ISSUES 引用反映 2026-05 的审计上下文；当前限制请看 [`docs/activate/KNOWN_ISSUES.md`](../activate/KNOWN_ISSUES.md)，项目运行方式见 [`README.md`](../../README.md)。
 
 # AgentGo 幻觉引用验收审计报告
 

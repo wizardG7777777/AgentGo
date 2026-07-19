@@ -18,6 +18,7 @@ import (
 	reactorbuiltin "agentgo/internal/reactor/builtin"
 	"agentgo/internal/roster"
 	"agentgo/internal/runner"
+	"agentgo/internal/session"
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
 )
@@ -76,6 +77,17 @@ type queryObservingStore struct {
 	store.TaskStore
 	mu      sync.Mutex
 	queries map[string]int
+}
+
+type failingQueryStore struct {
+	store.TaskStore
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (s *failingQueryStore) QueryAvailable(string) ([]*model.Task, error) {
+	s.once.Do(func() { close(s.entered) })
+	return nil, errors.New("simulated query failure")
 }
 
 func (s *queryObservingStore) QueryAvailable(eventType string) ([]*model.Task, error) {
@@ -197,6 +209,242 @@ func TestManagerProvisionIdempotenceLimitsShutdownAndRecovery(t *testing.T) {
 		t.Fatalf("recovery routes=%+v, want one", current)
 	}
 	recovered.Shutdown()
+}
+
+func TestManagerRecoveryClaimsV4UnreadMailboxWithoutDuplicateRegistration(t *testing.T) {
+	catalog := testCatalog(t)
+	coordinator, planID, controllerID := testPlan(t, "plan-mailbox-recovery")
+	durable := NewMemoryStore()
+
+	// 先产生一个持久化 ready TeamSpec，以获得真实的稳定 agentID。
+	first := testManager(t, catalog, coordinator, durable, newFakeRoutes(), 1)
+	t.Cleanup(first.Shutdown)
+	if err := first.Start(context.Background()); err != nil {
+		t.Fatalf("first Start: %v", err)
+	}
+	result, err := first.Provision(context.Background(), agenttemplate.ProvisionRequest{
+		PlanID: planID, ControllerTaskID: controllerID,
+		TemplateRef: "builtin/explorer@1", Purpose: "recover unread mail", Replicas: 1,
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	first.Shutdown()
+
+	mailboxes := mailbox.NewRegistry(8)
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := mailboxes.ImportSnapshot([]session.MailboxSnapshot{{
+		OwnerID: result.AgentIDs[0], EventType: result.EventType,
+		// v4 持久化顺序是最新在前。
+		Messages: []session.MessageSnapshot{
+			{From: "scheduler", To: result.AgentIDs[0], Summary: "second", SentAt: now},
+			{From: "scheduler", To: result.AgentIDs[0], Summary: "first", SentAt: now},
+		},
+	}}); err != nil {
+		t.Fatalf("ImportSnapshot: %v", err)
+	}
+
+	deps := runner.RunnerDeps{
+		Store:  store.NewMemoryTaskStore(nil, 100, 1, 30),
+		Roster: roster.NewMemoryRoster(), MBRegistry: mailboxes,
+		PlanCoordinator: coordinator, ProjectRoot: t.TempDir(),
+	}
+	recovered := NewManager(deps, func(string) llm.Client { return idleLLM{} },
+		catalog, coordinator, durable, newFakeRoutes(), 1)
+	t.Cleanup(recovered.Shutdown)
+	if err := recovered.Start(context.Background()); err != nil {
+		t.Fatalf("recovery Start: %v", err)
+	}
+
+	active, ok := recovered.active[result.TeamID]
+	if !ok || len(active.runners) != 1 {
+		t.Fatalf("recovered active Team mismatch: %+v", active)
+	}
+	msgs := active.runners[0].Agent().Mailbox.Drain()
+	if len(msgs) != 2 || msgs[0].Summary != "first" || msgs[1].Summary != "second" {
+		t.Fatalf("recovered unread FIFO mismatch: %+v", msgs)
+	}
+	if claimed, err := mailboxes.ClaimRecovered(result.AgentIDs[0], result.EventType); !errors.Is(err, mailbox.ErrRecoveredMailboxConflict) || claimed != nil {
+		t.Fatalf("active Team mailbox re-claim = (%v, %v), want conflict", claimed, err)
+	}
+}
+
+func TestManagerShutdownPreservesUnreadMailboxUntilFinalSnapshot(t *testing.T) {
+	catalog := testCatalog(t)
+	coordinator, planID, controllerID := testPlan(t, "plan-mailbox-shutdown-snapshot")
+	durable := NewMemoryStore()
+	mailboxes := mailbox.NewRegistry(8)
+	deps := runner.RunnerDeps{
+		Store:  store.NewMemoryTaskStore(nil, 100, 1, 30),
+		Roster: roster.NewMemoryRoster(), MBRegistry: mailboxes,
+		PlanCoordinator: coordinator, ProjectRoot: t.TempDir(),
+	}
+	manager := NewManager(deps, func(string) llm.Client { return idleLLM{} },
+		catalog, coordinator, durable, newFakeRoutes(), 1)
+	t.Cleanup(manager.Shutdown)
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	result, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
+		PlanID: planID, ControllerTaskID: controllerID,
+		TemplateRef: "builtin/explorer@1", Purpose: "persist unread shutdown mail", Replicas: 1,
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	agentID := result.AgentIDs[0]
+	for _, summary := range []string{"first", "second"} {
+		if err := mailboxes.Send(mailbox.Message{
+			From: "scheduler", To: agentID, Summary: summary, Content: summary,
+			SentAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("Send(%s): %v", summary, err)
+		}
+	}
+
+	manager.ShutdownPreservingMailboxes()
+	foundUnread := false
+	for _, status := range mailboxes.ScanNonEmpty() {
+		if status.AgentID == agentID && status.Count == 2 {
+			foundUnread = true
+			break
+		}
+	}
+	if !foundUnread {
+		t.Fatalf("pre-snapshot shutdown removed Team unread mailbox: %+v", mailboxes.ScanNonEmpty())
+	}
+	snaps := mailboxes.ExportSnapshot()
+	if len(snaps) != 1 || snaps[0].OwnerID != agentID || len(snaps[0].Messages) != 2 {
+		t.Fatalf("final snapshot missing Team unread mailbox: %+v", snaps)
+	}
+
+	// 模拟下一进程导入最终快照：稳定 ID 可重新认领，FIFO 不变。
+	restarted := mailbox.NewRegistry(8)
+	if err := restarted.ImportSnapshot(snaps); err != nil {
+		t.Fatalf("restart ImportSnapshot: %v", err)
+	}
+	recovered, err := restarted.ClaimRecovered(agentID, result.EventType)
+	if err != nil || recovered == nil {
+		t.Fatalf("restart ClaimRecovered = (%v, %v)", recovered, err)
+	}
+	msgs := recovered.Drain()
+	if len(msgs) != 2 || msgs[0].Summary != "first" || msgs[1].Summary != "second" {
+		t.Fatalf("shutdown/restart FIFO mismatch: %+v", msgs)
+	}
+
+	manager.FinalizeShutdownMailboxes()
+	for _, status := range mailboxes.ScanAll() {
+		if status.AgentID == agentID {
+			t.Fatal("FinalizeShutdownMailboxes did not unregister preserved mailbox")
+		}
+	}
+}
+
+func TestManagerRecoveryStartFailureRollsBackMailboxClaim(t *testing.T) {
+	catalog := testCatalog(t)
+	coordinator, planID, controllerID := testPlan(t, "plan-mailbox-start-rollback")
+	durable := NewMemoryStore()
+	first := testManager(t, catalog, coordinator, durable, newFakeRoutes(), 1)
+	t.Cleanup(first.Shutdown)
+	if err := first.Start(context.Background()); err != nil {
+		t.Fatalf("first Start: %v", err)
+	}
+	result, err := first.Provision(context.Background(), agenttemplate.ProvisionRequest{
+		PlanID: planID, ControllerTaskID: controllerID,
+		TemplateRef: "builtin/explorer@1", Purpose: "rollback unread mail", Replicas: 1,
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	first.Shutdown()
+
+	mailboxes := mailbox.NewRegistry(8)
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := mailboxes.ImportSnapshot([]session.MailboxSnapshot{{
+		OwnerID: result.AgentIDs[0], EventType: result.EventType,
+		Messages: []session.MessageSnapshot{
+			{From: "scheduler", To: result.AgentIDs[0], Summary: "second", SentAt: now},
+			{From: "scheduler", To: result.AgentIDs[0], Summary: "first", SentAt: now},
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	queryStore := &failingQueryStore{
+		TaskStore: store.NewMemoryTaskStore(nil, 100, 1, 30),
+		entered:   make(chan struct{}),
+	}
+	activity := agent.NewActivityTracker()
+	deps := runner.RunnerDeps{
+		Store: queryStore, Roster: roster.NewMemoryRoster(), Activity: activity,
+		MBRegistry: mailboxes, PlanCoordinator: coordinator, ProjectRoot: t.TempDir(),
+	}
+	recovered := NewManager(deps, func(string) llm.Client { return idleLLM{} },
+		catalog, coordinator, durable, newFakeRoutes(), 1)
+	t.Cleanup(recovered.Shutdown)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-queryStore.entered
+		cancel()
+	}()
+	if err := recovered.Start(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("recovery Start err=%v, want context.Canceled", err)
+	}
+	if got := len(activity.Snapshots()); got != 0 {
+		t.Fatalf("failed Start left %d activity entries", got)
+	}
+
+	// startMaterialized 失败后必须可以重新认领同一邮箱，
+	// 且未读邮件不得被 Unregister 丢失或改变 FIFO。
+	reclaimed, err := mailboxes.ClaimRecovered(result.AgentIDs[0], result.EventType)
+	if err != nil || reclaimed == nil {
+		t.Fatalf("reclaim after failed Start = (%v, %v)", reclaimed, err)
+	}
+	msgs := reclaimed.Drain()
+	if len(msgs) != 2 || msgs[0].Summary != "first" || msgs[1].Summary != "second" {
+		t.Fatalf("failed Start changed recovered FIFO: %+v", msgs)
+	}
+}
+
+func TestManagerDiscardBeforeStartRollsBackRecoveredMailboxClaim(t *testing.T) {
+	mailboxes := mailbox.NewRegistry(4)
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := mailboxes.ImportSnapshot([]session.MailboxSnapshot{{
+		OwnerID: "explorer-team-route-failure-1", EventType: "team:route-failure",
+		Messages: []session.MessageSnapshot{
+			{From: "scheduler", To: "explorer-team-route-failure-1", Summary: "second", SentAt: now},
+			{From: "scheduler", To: "explorer-team-route-failure-1", Summary: "first", SentAt: now},
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := mailboxes.ClaimRecovered("explorer-team-route-failure-1", "team:route-failure")
+	if err != nil || claimed == nil {
+		t.Fatalf("initial claim = (%v, %v)", claimed, err)
+	}
+
+	_, cancel := context.WithCancel(context.Background())
+	manager := &Manager{deps: runner.RunnerDeps{MBRegistry: mailboxes}}
+	activation := runtimeActivation{team: &activeTeam{
+		spec:     TeamSpec{ID: "route-failure"},
+		agentIDs: []string{"explorer-team-route-failure-1"},
+		recoveredMailboxClaims: map[string]string{
+			"explorer-team-route-failure-1": "team:route-failure",
+		},
+		cancel: cancel,
+	}}
+	if err := manager.discardMaterialized(activation); err != nil {
+		t.Fatalf("discardMaterialized: %v", err)
+	}
+	reclaimed, err := mailboxes.ClaimRecovered("explorer-team-route-failure-1", "team:route-failure")
+	if err != nil || reclaimed != claimed {
+		t.Fatalf("reclaim after pre-start discard = (%v, %v), want %v", reclaimed, err, claimed)
+	}
+	msgs := reclaimed.Drain()
+	if len(msgs) != 2 || msgs[0].Summary != "first" || msgs[1].Summary != "second" {
+		t.Fatalf("pre-start discard changed recovered FIFO: %+v", msgs)
+	}
 }
 
 func TestManagerProvisionPublishesRouteAfterDurableRuntimeReady(t *testing.T) {

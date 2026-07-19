@@ -2,6 +2,7 @@ package builtin
 
 import (
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -115,11 +116,15 @@ func TestReadSetWriteReactor_HappyPath(t *testing.T) {
 	s := &fakeReadSetStore{}
 	r := NewReadSetWriteReactor(s)
 
+	// 项目根用真实临时目录：reactor 经 filepath.Abs/Clean 规范化路径，
+	// 期望的绝对路径必须随平台变化（POSIX /tmp/... vs Windows C:\...）。
+	absPath := filepath.Join(t.TempDir(), "foo.go")
+
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	r.Run(trace.Event{
 		Kind: trace.KindToolResult, TaskID: "t1", Tool: "read_file", Loop: 5,
 		Timestamp: now,
-		Args:      map[string]any{"path": "/proj/foo.go"},
+		Args:      map[string]any{"path": absPath},
 	})
 
 	calls := s.snapshot()
@@ -130,10 +135,10 @@ func TestReadSetWriteReactor_HappyPath(t *testing.T) {
 	if c.taskID != "t1" {
 		t.Errorf("taskID=%q", c.taskID)
 	}
-	if c.absPath != "/proj/foo.go" {
-		t.Errorf("absPath=%q want /proj/foo.go", c.absPath)
+	if c.absPath != absPath {
+		t.Errorf("absPath=%q want %q", c.absPath, absPath)
 	}
-	if c.info.FilePath != "/proj/foo.go" || c.info.Loop != 5 {
+	if c.info.FilePath != absPath || c.info.Loop != 5 {
 		t.Errorf("info wrong: %+v", c.info)
 	}
 	if !c.info.ReadAt.Equal(now) || !c.info.LastReadAt.Equal(now) {

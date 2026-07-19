@@ -52,12 +52,25 @@ type Task struct {
 	RetryReasons   []string
 	LastHistory    []byte // JSON 序列化的历史记录，重试时恢复上下文
 	TimeoutSeconds int
-	EventSource    string
-	EventType      string
-	TriggerRule    string
-	SystemPrompt   string // 可选的自定义 system prompt，非空时覆盖 Worker 默认 prompt
-	PartialOutput  string // 执行中的部分输出，用于流式进度展示
-	Depth          int    // 子任务嵌套深度，根任务为 0
+
+	// EventSource identifies the external trigger or legacy publisher label.
+	// It is not a parent edge and must never be assumed to be a mailbox ID.
+	EventSource string
+	// ParentTaskID is the explicit task-lineage edge used for plan inheritance
+	// and topology inspection. Empty means this Task has no known parent.
+	ParentTaskID string
+	// ReplyToAgentID is the explicit mailbox route for lifecycle reports. It is
+	// intentionally separate from ParentTaskID because task IDs are not agents.
+	ReplyToAgentID string
+	// BatchID groups sibling Tasks created by one scheduling decision. It is
+	// observability metadata, not an execution dependency.
+	BatchID string
+
+	EventType     string
+	TriggerRule   string
+	SystemPrompt  string // 可选的自定义 system prompt，非空时覆盖 Worker 默认 prompt
+	PartialOutput string // 执行中的部分输出，用于流式进度展示
+	Depth         int    // 子任务嵌套深度，根任务为 0
 
 	// PlanID 把执行 Task 归属到一张动态 DAG。根 Scheduler Task 的 PlanID
 	// 等于自身 Task.ID；未纳入计划控制面的兼容任务保持空值。
@@ -159,9 +172,13 @@ type Task struct {
 	// 判定。跨任务"项目知识"由 MemoryManageSystem 的 Project Memory 承接。
 	ReadSet map[string]ReadInfo `json:"read_set,omitempty"`
 
-	CreatedAt   time.Time
-	StartedAt   time.Time
-	CompletedAt time.Time
+	// CreatedAt is the immutable publication timestamp. PendingSince is the
+	// start of the current queue lease and is reset whenever a processing Task
+	// genuinely returns to pending. A claimed Task has a zero PendingSince.
+	CreatedAt    time.Time
+	PendingSince time.Time
+	StartedAt    time.Time
+	CompletedAt  time.Time
 }
 
 // ReadInfo 是 Task.ReadSet 的 value 类型，记录单个文件被读取的元数据。

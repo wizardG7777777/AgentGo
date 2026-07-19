@@ -1,15 +1,15 @@
 // Package trace 提供任务级 JSONL 事件追踪系统，专为故障排查设计。
 //
 // 设计原则：
-//   - 每个任务一份独立的 JSONL 文件，按发布时间命名
+//   - 物理 JSONL 按 writer 打开时间命名；Task 重试可产生多个分片，CLI 按完整 TaskID 聚合
 //   - 写入失败降级为 stderr WARNING，不中断主流程
 //   - 二进制全开（无级别过滤），项目早期阶段以排查故障为优先
 //   - 零第三方依赖，仅使用 stdlib
 //
 // 用法：
 //
-//	// 在 bootstrap 中初始化
-//	w, _ := trace.NewWriter(".agentgo/traces", 100)
+//	// 在 bootstrap 中初始化；traceDir 通常是 active Session 的 logs/
+//	w, _ := trace.NewWriter(traceDir, 100)
 //	trace.SetDefault(w)
 //
 //	// 在任意位置 emit 事件（包级 helper，零依赖注入）
@@ -21,9 +21,10 @@
 //
 // 事后排查：
 //
-//	tail -f .agentgo/traces/2026-04-08T04-17-06_321b561d.jsonl | jq
+//	tail -f <trace-dir>/2026-04-08T04-17-06_321b561d.jsonl | jq
 //	./agentgo trace list
 //	./agentgo trace show 321b561d
+//	./agentgo trace plan 321b561d
 package trace
 
 import "time"
@@ -59,10 +60,11 @@ const (
 	// 本身不进事件——reactor 需要时通过 store 查 task.LastResponse。
 	KindTextOnlySubmission EventKind = "text_only_submission"
 
-	// 非成功终态。2026-04-25 P1 #2 引入——此前 trace 没有 retry/failed/cancelled
+	// 非成功终态。2026-04-25 P1 #2 引入——此前 trace 没有 retry/failed/blocked/cancelled
 	// 事件类型，排障时看到 trace 突然中断但不知道原因；新 EventKind 补齐账本。
 	KindTaskRetry     EventKind = "task_retry"     // RetryRollback 触发（MaxLoops 耗尽或 ErrRecoverable）
 	KindTaskFailed    EventKind = "task_failed"    // terminateTask 终止（重试耗尽或不可恢复错误）
+	KindTaskBlocked   EventKind = "task_blocked"   // 系统确认 pending 任务不可路由后的终态
 	KindTaskCancelled EventKind = "task_cancelled" // 外部 cancel（cancel_task 工具、watchdog、用户 /cancel）
 
 	// LLM 调用
@@ -169,12 +171,12 @@ type AcceptanceTraceContext struct {
 // Transition 承载所有"状态转移"语义，跨 task 状态机与 agent 状态机两个域。
 //
 // 字段填充约定：
-//   - task lifecycle 事件（claimed / completed / failed / cancelled / retry）填 PrevStatus / NewStatus
+//   - task lifecycle 事件（claimed / completed / failed / blocked / cancelled / retry）填 PrevStatus / NewStatus
 //   - agent_state_changed 事件填 PrevState / NewState
 //   - 不同时填两套——但定义在同一 struct 是当前简化处置（未来若发现混淆可拆）
 type Transition struct {
-	// Task 状态机（task_claimed / completed / failed / cancelled / retry）
-	PrevStatus string `json:"prev_status,omitempty"` // pending / processing / completed / failed / cancelled
+	// Task 状态机（task_claimed / completed / failed / blocked / cancelled / retry）
+	PrevStatus string `json:"prev_status,omitempty"` // pending / processing / completed / failed / blocked / cancelled
 	NewStatus  string `json:"new_status,omitempty"`
 
 	// Agent 状态机（agent_state_changed）
@@ -241,7 +243,7 @@ type Event struct {
 	Loop       int    `json:"loop,omitempty"`
 	Error      string `json:"error,omitempty"`
 	NotifyType string `json:"notify_type,omitempty"` // 进度通知类型：file_write / subtask / halfway
-	Reason     string `json:"reason,omitempty"`      // 非成功终态事件（task_retry/failed/cancelled）的解释
+	Reason     string `json:"reason,omitempty"`      // 非成功终态事件（task_retry/failed/blocked/cancelled）的解释
 	AttemptNo  int    `json:"attempt_no,omitempty"`  // task_retry 的第 N 次重试（1-based）；其它事件不填
 
 	// --- 任务生命周期字段（task_published / task_claimed / task_submitted / task_completed） ---
@@ -251,6 +253,8 @@ type Event struct {
 	Priority     string   `json:"priority,omitempty"`
 	Depth        int      `json:"depth,omitempty"`
 	PublishedBy  string   `json:"published_by,omitempty"`
+	ParentTaskID string   `json:"parent_task_id,omitempty"`
+	BatchID      string   `json:"batch_id,omitempty"`
 	OutputLen    int      `json:"output_len,omitempty"`
 	LoopsUsed    int      `json:"loops_used,omitempty"`
 
@@ -288,8 +292,10 @@ type Event struct {
 	Strategy           string `json:"strategy,omitempty"`
 	KeptEntries        int    `json:"kept_entries,omitempty"`
 
-	// --- v5 Phase 2 新增：嵌套子结构体（TraceUpgrade.md §3） ---
-	// 三者均为指针 + omitempty：nil 时 JSON 完全不输出，保持 v4 jsonl 兼容。
+	// --- 结构化子载荷 ---
+	// 五者均为指针 + omitempty：nil 时 JSON 完全不输出，保持旧 jsonl 兼容。
+	// Transition / ShellExec / ShellTimeout 来自 v5 Phase 2；Plan / Acceptance
+	// 由后续动态 DAG 控制面加入。
 	Transition   *Transition             `json:"transition,omitempty"`    // 状态转移信息（task / agent 状态机）
 	ShellExec    *ShellExec              `json:"shell_exec,omitempty"`    // Shell 执行结果
 	ShellTimeout *ShellTimeout           `json:"shell_timeout,omitempty"` // Shell 超时信息（pending / resolved 共用）

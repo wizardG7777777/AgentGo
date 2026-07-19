@@ -123,7 +123,7 @@ func TestNilSubpayloadsOmitted(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 	s := string(data)
-	for _, field := range []string{`"transition"`, `"shell_exec"`, `"shell_timeout"`} {
+	for _, field := range []string{`"transition"`, `"shell_exec"`, `"shell_timeout"`, `"plan"`, `"acceptance"`} {
 		if strings.Contains(s, field) {
 			t.Errorf("nil sub-payload field %s should be omitted, got: %s", field, s)
 		}
@@ -137,12 +137,53 @@ func TestV4JsonlBackwardCompat(t *testing.T) {
 	if err := json.Unmarshal([]byte(v4Line), &ev); err != nil {
 		t.Fatalf("v4 jsonl unmarshal failed: %v", err)
 	}
-	if ev.Transition != nil || ev.ShellExec != nil || ev.ShellTimeout != nil {
-		t.Errorf("v4 jsonl should produce nil sub-payloads, got transition=%v shellExec=%v shellTimeout=%v",
-			ev.Transition, ev.ShellExec, ev.ShellTimeout)
+	if ev.Transition != nil || ev.ShellExec != nil || ev.ShellTimeout != nil || ev.Plan != nil || ev.Acceptance != nil {
+		t.Errorf("v4 jsonl should produce nil sub-payloads, got transition=%v shellExec=%v shellTimeout=%v plan=%v acceptance=%v",
+			ev.Transition, ev.ShellExec, ev.ShellTimeout, ev.Plan, ev.Acceptance)
 	}
 	if ev.Kind != KindTaskClaimed || ev.TaskID != "task-old" {
 		t.Errorf("v4 jsonl base fields lost: kind=%s taskID=%s", ev.Kind, ev.TaskID)
+	}
+}
+
+func TestPlanAcceptanceRoundtrip(t *testing.T) {
+	ev := Event{
+		Timestamp: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC),
+		Kind:      KindAcceptanceCompleted,
+		TaskID:    "acceptance-task",
+		Plan: &PlanTraceContext{
+			PlanID: "plan-1", PlanRevision: 4, ExecutionStateVersion: 8,
+			AcceptanceSpecRevision: 2, GraphDigest: "graph-digest",
+		},
+		Acceptance: &AcceptanceTraceContext{
+			AcceptanceRunID: "run-1", ResultID: "result-1", SpecID: "spec-1",
+			SpecRevision: 2, TargetRevision: 4, TargetGraphDigest: "graph-digest",
+			RunnerTaskID: "acceptance-task", RunnerKind: "verifier",
+			Verdict: "pass", Status: "valid", Reason: "all criteria passed",
+		},
+	}
+	data, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got Event
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Plan == nil || got.Acceptance == nil {
+		t.Fatalf("structured DAG payload lost: plan=%+v acceptance=%+v", got.Plan, got.Acceptance)
+	}
+	if got.Plan.PlanID != "plan-1" || got.Plan.PlanRevision != 4 || got.Plan.ExecutionStateVersion != 8 ||
+		got.Plan.AcceptanceSpecRevision != 2 || got.Plan.GraphDigest != "graph-digest" {
+		t.Fatalf("Plan payload changed: %+v", got.Plan)
+	}
+	if got.Acceptance.AcceptanceRunID != "run-1" || got.Acceptance.ResultID != "result-1" ||
+		got.Acceptance.SpecID != "spec-1" || got.Acceptance.SpecRevision != 2 ||
+		got.Acceptance.TargetRevision != 4 || got.Acceptance.TargetGraphDigest != "graph-digest" ||
+		got.Acceptance.RunnerTaskID != "acceptance-task" || got.Acceptance.RunnerKind != "verifier" ||
+		got.Acceptance.Verdict != "pass" || got.Acceptance.Status != "valid" ||
+		got.Acceptance.Reason != "all criteria passed" {
+		t.Fatalf("Acceptance payload changed: %+v", got.Acceptance)
 	}
 }
 
@@ -252,6 +293,32 @@ func TestFormatEventDetailsTransitionRendering(t *testing.T) {
 }
 
 func TestDetectAnomaliesNewHeuristics(t *testing.T) {
+	t.Run("text-only completion is not a missing-file anomaly", func(t *testing.T) {
+		events := []Event{
+			{Kind: KindTextOnlySubmission, TaskID: "text-task", OutputLen: 42},
+			{Kind: KindTaskCompleted, TaskID: "text-task", OutputLen: 42},
+		}
+		for _, anomaly := range detectAnomalies(events) {
+			if strings.Contains(anomaly, "file_written") {
+				t.Fatalf("successful text-only delivery was flagged as report-only failure: %v", detectAnomalies(events))
+			}
+		}
+	})
+
+	t.Run("unclassified completion without file stays suspicious", func(t *testing.T) {
+		anomalies := detectAnomalies([]Event{{Kind: KindTaskCompleted, TaskID: "unknown-output"}})
+		found := false
+		for _, anomaly := range anomalies {
+			if strings.Contains(anomaly, "file_written") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("missing-file anomaly was suppressed without text_only_submission: %v", anomalies)
+		}
+	})
+
 	t.Run("panic cause", func(t *testing.T) {
 		events := []Event{
 			{

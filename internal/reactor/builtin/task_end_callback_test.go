@@ -22,12 +22,13 @@ func TestTaskEndCallbackReactor_Defaults(t *testing.T) {
 	wantKinds := map[trace.EventKind]bool{
 		trace.KindTaskCompleted: true,
 		trace.KindTaskFailed:    true,
+		trace.KindTaskBlocked:   true,
 		trace.KindTaskCancelled: true,
 		trace.KindTaskRetry:     true,
 	}
 	subs := r.Subscribe()
-	if len(subs) != 4 {
-		t.Fatalf("expected 4 kinds, got %d", len(subs))
+	if len(subs) != 5 {
+		t.Fatalf("expected 5 kinds, got %d", len(subs))
 	}
 	for _, k := range subs {
 		if !wantKinds[k] {

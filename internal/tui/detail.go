@@ -4,49 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
 )
-
-// AgentDetailModel manages the viewport for viewing a selected agent's output.
-type AgentDetailModel struct {
-	AgentID  string
-	Viewport viewport.Model
-	Content  string
-	Ready    bool
-	Tracking bool // auto-scroll to bottom
-}
-
-func NewAgentDetail(agentID string, w, h int) AgentDetailModel {
-	vp := viewport.New(w, h)
-	vp.Style = lipgloss.NewStyle()
-	return AgentDetailModel{
-		AgentID:  agentID,
-		Viewport: vp,
-		Tracking: true,
-	}
-}
-
-func (d *AgentDetailModel) SetSize(w, h int) {
-	d.Viewport.Width = w
-	d.Viewport.Height = h
-}
-
-func (d *AgentDetailModel) SetContent(content string) {
-	d.Content = content
-	d.Viewport.SetContent(content)
-	if d.Tracking {
-		d.Viewport.GotoBottom()
-	}
-}
-
-func (d *AgentDetailModel) AppendContent(chunk string) {
-	d.Content += chunk
-	d.Viewport.SetContent(d.Content)
-	if d.Tracking {
-		d.Viewport.GotoBottom()
-	}
-}
 
 // renderAgentDetail draws the detail view for a selected agent.
 func renderAgentDetail(t Theme, w, h int, agentID string, info *AgentInfo, output string) string {
@@ -68,6 +27,8 @@ func renderAgentDetail(t Theme, w, h int, agentID string, info *AgentInfo, outpu
 			infoParts = append(infoParts, "● processing")
 		case "waiting_approval":
 			infoParts = append(infoParts, "⏳ approval")
+		case "terminating":
+			infoParts = append(infoParts, "⊘ terminating")
 		case "idle":
 			infoParts = append(infoParts, "○ idle")
 		default:

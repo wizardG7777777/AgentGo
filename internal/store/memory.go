@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
 	"agentgo/internal/model"
 	"agentgo/internal/session"
+	"agentgo/internal/trace"
 
 	"github.com/google/uuid"
 )
@@ -94,6 +96,20 @@ func (s *MemoryTaskStore) SetTaskTiming(taskID string, createdAt, startedAt time
 		task.StartedAt = startedAt
 	}
 	s.mu.Unlock()
+	return nil
+}
+
+// SetTaskPendingSince updates the current pending queue lease through the
+// Store lock. Production state transitions own this field; the setter exists
+// for deterministic watchdog and recovery tests.
+func (s *MemoryTaskStore) SetTaskPendingSince(taskID string, pendingSince time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return ErrTaskNotFound
+	}
+	task.PendingSince = pendingSince
 	return nil
 }
 
@@ -287,7 +303,13 @@ func cloneTaskMutation(m TaskMutation) TaskMutation {
 }
 
 // SetCancelRegistry 注入 per-task cancel context 管理器。
+// 生产路径仅 bootstrap 启动早期调用一次（在任何并发读写开始之前）；
+// 这里仍持锁写入（F10）——所有 cancelRegistry 读取点都在 s.mu 保护下，
+// setter 必须进入同一同步域，否则测试期并发 set/get 或未来运行期注入
+// 会构成未同步写。
 func (s *MemoryTaskStore) SetCancelRegistry(r *TaskCancelRegistry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.cancelRegistry = r
 }
 
@@ -369,8 +391,12 @@ func (s *MemoryTaskStore) PublishTask(task *model.Task) error {
 	if alreadyPublished {
 		return fmt.Errorf("%w: %s", ErrTaskAlreadyExists, task.ID)
 	}
+	now := time.Now()
 	task.Status = model.TaskStatusPending
-	task.CreatedAt = time.Now()
+	task.CreatedAt = now
+	task.PendingSince = now
+	task.StartedAt = time.Time{}
+	task.CompletedAt = time.Time{}
 	if task.MaxConcurrency <= 0 {
 		task.MaxConcurrency = s.defaultConcurrency
 		log.Printf("[公告板] 任务 %s 未指定 MaxConcurrency，使用默认值 %d", task.ID, s.defaultConcurrency)
@@ -392,11 +418,21 @@ func (s *MemoryTaskStore) PublishTask(task *model.Task) error {
 		task.RetryReasons = make([]string, 0)
 	}
 
-	// Resolve plan lineage from a real parent Task. Scheduler control roots use
-	// their own Task.ID as PlanID; ordinary compatibility tasks remain unmanaged.
+	// Resolve plan lineage from an explicit parent edge. EventSource remains a
+	// legacy compatibility fallback for snapshots/callers created before
+	// ParentTaskID existed; it is no longer the authoritative topology field.
+	// Scheduler control roots use their own Task.ID as PlanID; ordinary
+	// compatibility tasks remain unmanaged.
 	var parent *model.Task
-	if task.EventSource != "" {
-		parent, _ = s.GetTask(task.EventSource)
+	parentID := task.ParentTaskID
+	if parentID == "" {
+		parentID = task.EventSource
+	}
+	if parentID != "" {
+		parent, _ = s.GetTask(parentID)
+		if parent != nil && task.ParentTaskID == "" {
+			task.ParentTaskID = parent.ID
+		}
 	}
 	if task.PlanID == "" && parent != nil {
 		task.PlanID = parent.PlanID
@@ -427,11 +463,28 @@ func (s *MemoryTaskStore) PublishTask(task *model.Task) error {
 
 	// Emit history event outside the lock
 	s.emitHistory(session.HistEventTaskPublished, map[string]any{
-		"task_id":      task.ID,
-		"description":  task.Description,
-		"priority":     task.Priority,
-		"event_type":   task.EventType,
-		"dependencies": task.Dependencies,
+		"task_id":           task.ID,
+		"description":       task.Description,
+		"priority":          task.Priority,
+		"event_type":        task.EventType,
+		"dependencies":      task.Dependencies,
+		"parent_task_id":    task.ParentTaskID,
+		"reply_to_agent_id": task.ReplyToAgentID,
+		"batch_id":          task.BatchID,
+	})
+
+	// task_published 事件此前有 schema/CLI 渲染/Reactor 白名单但从未发射（D4）。
+	// 与 history 同置于锁外：Emit 失败只降级为 WARNING，不影响主流程。
+	trace.Emit(trace.Event{
+		Kind:         trace.KindTaskPublished,
+		TaskID:       task.ID,
+		Description:  task.Description,
+		Dependencies: append([]string(nil), task.Dependencies...),
+		EventType:    task.EventType,
+		Priority:     strconv.Itoa(task.Priority),
+		Depth:        task.Depth,
+		ParentTaskID: task.ParentTaskID,
+		BatchID:      task.BatchID,
 	})
 	return nil
 }
@@ -480,6 +533,7 @@ func (s *MemoryTaskStore) ClaimTask(agentID string, taskID string) error {
 	if task.Status == model.TaskStatusPending {
 		task.Status = model.TaskStatusProcessing
 		task.StartedAt = time.Now()
+		task.PendingSince = time.Time{}
 	}
 	snapshot := cloneTask(task)
 	s.mu.Unlock()
@@ -578,10 +632,27 @@ func (s *MemoryTaskStore) transitionState(taskID string, from, to model.TaskStat
 		return ErrInvalidTransition
 	}
 
+	now := time.Now()
 	task.Status = to
+	if to == model.TaskStatusPending {
+		// A system-level requeue closes every old execution lease and starts a
+		// fresh queue lease. Agent-aware retry/suspend paths perform the same
+		// reset only after their final live agent exits.
+		task.PendingSince = now
+		task.StartedAt = time.Time{}
+		task.Agents = make([]string, 0)
+		if s.cancelRegistry != nil {
+			s.cancelRegistry.Cancel(taskID)
+		}
+	} else {
+		task.PendingSince = time.Time{}
+		if to == model.TaskStatusProcessing && task.StartedAt.IsZero() {
+			task.StartedAt = now
+		}
+	}
 
 	if model.IsTerminal(to) {
-		task.CompletedAt = time.Now()
+		task.CompletedAt = now
 		task.Agents = make([]string, 0) // 清理残留代理，防止已取消任务中的代理数据残留
 		s.addTerminal(taskID)
 		if s.cancelRegistry != nil {
@@ -688,6 +759,64 @@ func (s *MemoryTaskStore) FailTaskBySystem(taskID string, reason string) error {
 		Detail: reason,
 	})
 	s.sendEvent(model.Event{Type: model.EventTaskFailed, TaskID: taskID})
+	trace.Emit(trace.Event{
+		Kind:   trace.KindTaskFailed,
+		TaskID: taskID,
+		Reason: reason,
+		Transition: &trace.Transition{
+			PrevStatus: string(model.TaskStatusProcessing),
+			NewStatus:  string(model.TaskStatusFailed),
+			Cause:      "system_failure",
+		},
+	})
+	trace.CloseTask(taskID)
+	return nil
+}
+
+// BlockTaskBySystem marks an unclaimable pending Task as blocked while
+// preserving the routing failure reason. It is intentionally separate from
+// TransitionState because that generic state primitive has no error payload.
+func (s *MemoryTaskStore) BlockTaskBySystem(taskID string, reason string) error {
+	s.mu.Lock()
+	task, ok := s.tasks[taskID]
+	if !ok {
+		s.mu.Unlock()
+		return ErrTaskNotFound
+	}
+	if task.Status != model.TaskStatusPending {
+		s.mu.Unlock()
+		return ErrTaskNotPending
+	}
+
+	task.Error = reason
+	task.Status = model.TaskStatusBlocked
+	task.PendingSince = time.Time{}
+	task.CompletedAt = time.Now()
+	task.Agents = make([]string, 0)
+	s.addTerminal(taskID)
+	if s.cancelRegistry != nil {
+		s.cancelRegistry.Cancel(taskID)
+	}
+	snapshot := cloneTask(task)
+	s.mu.Unlock()
+
+	s.notifyPlanMutation(TaskMutation{
+		Kind: TaskMutationStatus, Task: snapshot,
+		FromStatus: model.TaskStatusPending, ToStatus: model.TaskStatusBlocked,
+		Detail: reason,
+	})
+	s.sendEvent(model.Event{Type: model.EventTaskBlocked, TaskID: taskID})
+	trace.Emit(trace.Event{
+		Kind:   trace.KindTaskBlocked,
+		TaskID: taskID,
+		Reason: reason,
+		Transition: &trace.Transition{
+			PrevStatus: string(model.TaskStatusPending),
+			NewStatus:  string(model.TaskStatusBlocked),
+			Cause:      "system_blocked",
+		},
+	})
+	trace.CloseTask(taskID)
 	return nil
 }
 
@@ -715,6 +844,8 @@ func (s *MemoryTaskStore) RetryRollback(agentID string, taskID string, reason st
 
 	if len(task.Agents) == 0 {
 		task.Status = model.TaskStatusPending
+		task.PendingSince = time.Now()
+		task.StartedAt = time.Time{}
 		if s.cancelRegistry != nil {
 			s.cancelRegistry.Cancel(taskID)
 		}
@@ -791,6 +922,8 @@ func (s *MemoryTaskStore) SuspendTaskExecution(agentID, taskID, reason string, l
 			}
 		} else {
 			task.Status = model.TaskStatusPending
+			task.PendingSince = time.Now()
+			task.StartedAt = time.Time{}
 		}
 	}
 	snapshot := cloneTask(task)
@@ -885,7 +1018,13 @@ func (s *MemoryTaskStore) QueryAvailable(eventType string) ([]*model.Task, error
 	}
 
 	sort.Slice(result, func(i, j int) bool {
-		return result[i].Priority > result[j].Priority
+		if result[i].Priority != result[j].Priority {
+			return result[i].Priority > result[j].Priority
+		}
+		if !result[i].CreatedAt.Equal(result[j].CreatedAt) {
+			return result[i].CreatedAt.Before(result[j].CreatedAt)
+		}
+		return result[i].ID < result[j].ID
 	})
 
 	return result, nil
@@ -1220,6 +1359,9 @@ func (s *MemoryTaskStore) GetDependencyArtifacts(taskID string) (map[string][]st
 	return out, nil
 }
 
+// ScanAll 返回全部任务的快照，按 CreatedAt 升序排序（同刻按完整 ID 字典序兜底）。
+// 消费方（TUI 侧栏"最近 5 任务"、scheduler board JSON 等）隐式依赖稳定顺序，
+// map 遍历序会让同一查询每次返回不同结果。
 func (s *MemoryTaskStore) ScanAll() ([]*model.Task, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1228,6 +1370,12 @@ func (s *MemoryTaskStore) ScanAll() ([]*model.Task, error) {
 	for _, task := range s.tasks {
 		result = append(result, cloneTask(task))
 	}
+	sort.Slice(result, func(i, j int) bool {
+		if !result[i].CreatedAt.Equal(result[j].CreatedAt) {
+			return result[i].CreatedAt.Before(result[j].CreatedAt)
+		}
+		return result[i].ID < result[j].ID
+	})
 	return result, nil
 }
 
@@ -1347,6 +1495,9 @@ func (s *MemoryTaskStore) ExportSnapshot() []session.TaskSnapshot {
 			RetryReasons:       copyStrings(task.RetryReasons),
 			TimeoutSeconds:     task.TimeoutSeconds,
 			EventSource:        task.EventSource,
+			ParentTaskID:       task.ParentTaskID,
+			ReplyToAgentID:     task.ReplyToAgentID,
+			BatchID:            task.BatchID,
 			EventType:          task.EventType,
 			TriggerRule:        task.TriggerRule,
 			SystemPrompt:       task.SystemPrompt,
@@ -1359,6 +1510,7 @@ func (s *MemoryTaskStore) ExportSnapshot() []session.TaskSnapshot {
 			LastResponse:       task.LastResponse,
 			PartialOutput:      task.PartialOutput,
 			CreatedAt:          formatTime(task.CreatedAt),
+			PendingSince:       formatTime(task.PendingSince),
 			StartedAt:          formatTime(task.StartedAt),
 			CompletedAt:        formatTime(task.CompletedAt),
 			PlanID:             task.PlanID,
@@ -1396,6 +1548,7 @@ func (s *MemoryTaskStore) ImportSnapshot(tasks []session.TaskSnapshot) error {
 		completedAt time.Time
 	}
 	terminals := make([]terminalEntry, 0)
+	restoredAt := time.Now().UTC()
 
 	for _, snap := range tasks {
 		createdAt, err := parseTime(snap.CreatedAt)
@@ -1403,6 +1556,10 @@ func (s *MemoryTaskStore) ImportSnapshot(tasks []session.TaskSnapshot) error {
 			return fmt.Errorf("parse created_at for task %s: %w", snap.ID, err)
 		}
 		startedAt, _ := parseTime(snap.StartedAt) // empty string → zero time
+		pendingSince, err := parseTime(snap.PendingSince)
+		if err != nil {
+			return fmt.Errorf("parse pending_since for task %s: %w", snap.ID, err)
+		}
 		completedAt, err := parseTime(snap.CompletedAt)
 		if err != nil {
 			return fmt.Errorf("parse completed_at for task %s: %w", snap.ID, err)
@@ -1421,6 +1578,17 @@ func (s *MemoryTaskStore) ImportSnapshot(tasks []session.TaskSnapshot) error {
 			status = model.TaskStatusPending
 			agents = []string{}
 			startedAt = time.Time{}
+			pendingSince = restoredAt
+		} else if status == model.TaskStatusPending {
+			// A legacy pending snapshot has no PendingSince. Give it a fresh
+			// lease rather than comparing the current queue wait with CreatedAt.
+			if pendingSince.IsZero() {
+				pendingSince = restoredAt
+			}
+			agents = []string{}
+			startedAt = time.Time{}
+		} else {
+			pendingSince = time.Time{}
 		}
 
 		task := &model.Task{
@@ -1437,6 +1605,9 @@ func (s *MemoryTaskStore) ImportSnapshot(tasks []session.TaskSnapshot) error {
 			RetryReasons:       copyStrings(snap.RetryReasons),
 			TimeoutSeconds:     snap.TimeoutSeconds,
 			EventSource:        snap.EventSource,
+			ParentTaskID:       snap.ParentTaskID,
+			ReplyToAgentID:     snap.ReplyToAgentID,
+			BatchID:            snap.BatchID,
 			EventType:          snap.EventType,
 			TriggerRule:        snap.TriggerRule,
 			SystemPrompt:       snap.SystemPrompt,
@@ -1449,6 +1620,7 @@ func (s *MemoryTaskStore) ImportSnapshot(tasks []session.TaskSnapshot) error {
 			LastResponse:       snap.LastResponse,
 			PartialOutput:      snap.PartialOutput,
 			CreatedAt:          createdAt,
+			PendingSince:       pendingSince,
 			StartedAt:          startedAt,
 			CompletedAt:        completedAt,
 			PlanID:             snap.PlanID,
@@ -1466,6 +1638,16 @@ func (s *MemoryTaskStore) ImportSnapshot(tasks []session.TaskSnapshot) error {
 		}
 		if model.IsTerminal(task.Status) {
 			terminals = append(terminals, terminalEntry{id: task.ID, completedAt: task.CompletedAt})
+		}
+	}
+	// Upgrade legacy snapshots in memory: EventSource used to double as the
+	// parent edge. Only promote it when it resolves to an actual restored Task;
+	// external sources such as user and mail-notifier remain source labels.
+	for _, task := range s.tasks {
+		if task.ParentTaskID == "" && task.EventSource != "" {
+			if _, ok := s.tasks[task.EventSource]; ok {
+				task.ParentTaskID = task.EventSource
+			}
 		}
 	}
 

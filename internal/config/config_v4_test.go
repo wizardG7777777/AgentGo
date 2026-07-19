@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -52,6 +53,87 @@ func TestLoadConfig_V4Sample(t *testing.T) {
 	}
 	if cfg.StartupProbe == "" {
 		t.Error("startup_probe 字段未被读入")
+	}
+}
+
+func TestWatchdogPendingGraceDefaultsAndYAMLDecode(t *testing.T) {
+	defaults := DefaultConfig()
+	if got := defaults.Infra.Watchdog.PendingAlertGraceSec; got != 300 {
+		t.Fatalf("default pending_alert_grace_sec = %d, want 300", got)
+	}
+	if got := defaults.Infra.Watchdog.UnroutableGraceSec; got != 300 {
+		t.Fatalf("default unroutable_grace_sec = %d, want 300", got)
+	}
+
+	path := filepath.Join(t.TempDir(), "watchdog.yaml")
+	data := []byte("infra:\n  watchdog:\n    pending_alert_grace_sec: 17\n    unroutable_grace_sec: 29\n")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Infra.Watchdog.PendingAlertGraceSec; got != 17 {
+		t.Fatalf("decoded pending_alert_grace_sec = %d, want 17", got)
+	}
+	if got := cfg.Infra.Watchdog.UnroutableGraceSec; got != 29 {
+		t.Fatalf("decoded unroutable_grace_sec = %d, want 29", got)
+	}
+}
+
+func TestSessionRecoverySafetyDefaultsAndYAMLDecode(t *testing.T) {
+	defaults := DefaultConfig()
+	if got := defaults.SessionResumeMaxIdleSec; got != 3600 {
+		t.Fatalf("default session_resume_max_idle_sec = %d, want 3600", got)
+	}
+	if got := defaults.SessionSnapshotIntervalSec; got != 30 {
+		t.Fatalf("default session_snapshot_interval_sec = %d, want 30", got)
+	}
+
+	path := filepath.Join(t.TempDir(), "session.yaml")
+	data := []byte("session_resume_max_idle_sec: 7200\nsession_snapshot_interval_sec: 15\n")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SessionResumeMaxIdleSec != 7200 || cfg.SessionSnapshotIntervalSec != 15 {
+		t.Fatalf("decoded session safety config = %d/%d", cfg.SessionResumeMaxIdleSec, cfg.SessionSnapshotIntervalSec)
+	}
+}
+
+func TestValidateSessionRecoverySafetyRejectsNegativeValues(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.LLM.DefaultModel = "test-model"
+	cfg.SessionResumeMaxIdleSec = -1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "session_resume_max_idle_sec") {
+		t.Fatalf("negative resume max idle should fail, got %v", err)
+	}
+	cfg.SessionResumeMaxIdleSec = 1
+	cfg.SessionSnapshotIntervalSec = -1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "session_snapshot_interval_sec") {
+		t.Fatalf("negative snapshot interval should fail, got %v", err)
+	}
+}
+
+func TestValidateSessionRecoverySafetyRejectsDurationOverflow(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("32-bit int cannot express a time.Duration-overflowing second count")
+	}
+	tooLarge := int64(maxSessionDurationSeconds + 1)
+	cfg := DefaultConfig()
+	cfg.LLM.DefaultModel = "test-model"
+	cfg.SessionResumeMaxIdleSec = int(tooLarge)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "session_resume_max_idle_sec") {
+		t.Fatalf("overflowing resume max idle should fail, got %v", err)
+	}
+	cfg.SessionResumeMaxIdleSec = 1
+	cfg.SessionSnapshotIntervalSec = int(tooLarge)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "session_snapshot_interval_sec") {
+		t.Fatalf("overflowing snapshot interval should fail, got %v", err)
 	}
 }
 
@@ -189,7 +271,7 @@ func TestValidate_StaticAgentsStillRequireSchedulerModel(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Agents = []AgentKind{{
 		Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
-		SystemPromptFile: filepath.Join("..", "..", "prompts", "worker.md"),
+		SystemPromptFile: filepath.ToSlash(filepath.Join("..", "..", "prompts", "worker.md")),
 		AgentMaxLoops:    1, TaskMaxRetries: 1,
 		EnforceCompactTokenThreshold: 1, ContextLimit: 1,
 	}}
@@ -199,7 +281,9 @@ func TestValidate_StaticAgentsStillRequireSchedulerModel(t *testing.T) {
 }
 
 func TestValidate_StaticAgentNeedsOwnOrLLMDefaultModel(t *testing.T) {
-	prompt := filepath.Join(t.TempDir(), "worker.md")
+	// 规则 9 仅允许 forward slash：Windows 上 filepath.Join 产生反斜杠，
+	// 会在到达本测试意图（模型校验）之前先被规则 9 拒绝，故统一 ToSlash。
+	prompt := filepath.ToSlash(filepath.Join(t.TempDir(), "worker.md"))
 	if err := os.WriteFile(prompt, []byte("worker"), 0o600); err != nil {
 		t.Fatal(err)
 	}

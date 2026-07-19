@@ -16,6 +16,8 @@ type planControlAcceptanceBackend struct{ store store.TaskStore }
 func (b planControlAcceptanceBackend) PublishTask(_ context.Context, spec plan.TaskSpec) (string, error) {
 	task := &model.Task{
 		PlanID: spec.PlanID, Description: spec.Description, EventType: spec.EventType,
+		EventSource: spec.ParentTaskID, ParentTaskID: spec.ParentTaskID,
+		ReplyToAgentID: spec.ReplyToAgentID, BatchID: spec.BatchID,
 		NodeRole: spec.Role, Dependencies: append([]string(nil), spec.Dependencies...),
 		AcceptanceRunID: spec.Metadata["acceptance_run_id"],
 	}
@@ -265,6 +267,19 @@ func TestEnsureAcceptanceRunRequiresReadyCapableRoute(t *testing.T) {
 	routes.planIDs["team:verify"] = p.ID
 	if message, err := group.ensureAcceptanceRun(context.Background(), args); err != nil || !strings.Contains(message, "created=true") {
 		t.Fatalf("ready verifier route should create run: message=%q err=%v", message, err)
+	}
+	latest, err = coordinator.Store().GetPlan(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range latest.AcceptanceRuns {
+		acceptanceTask, getErr := taskStore.GetTask(run.RunnerTaskID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if acceptanceTask.ParentTaskID != controller.ID || acceptanceTask.ReplyToAgentID != "scheduler" || acceptanceTask.BatchID != controller.ID {
+			t.Fatalf("acceptance task routing metadata = %+v", acceptanceTask)
+		}
 	}
 }
 

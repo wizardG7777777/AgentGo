@@ -37,11 +37,36 @@ func TestActivator_EventUserInput_PublishesSchedulerTask(t *testing.T) {
 	if task.EventSource != "user" {
 		t.Errorf("expected EventSource=user, got %q", task.EventSource)
 	}
+	if task.ParentTaskID != "" || task.ReplyToAgentID != "" || task.BatchID != "" {
+		t.Fatalf("root user task must not fabricate lineage or reply routing: %+v", task)
+	}
 	if task.TimeoutSeconds != SchedulerTaskTimeoutSec {
 		t.Errorf("expected TimeoutSeconds=%d, got %d", SchedulerTaskTimeoutSec, task.TimeoutSeconds)
 	}
 	if task.MaxConcurrency != 1 {
 		t.Errorf("expected MaxConcurrency=1, got %d", task.MaxConcurrency)
+	}
+}
+
+func TestActivator_EventUserInput_RejectsSlashCommandLeak(t *testing.T) {
+	ch := make(chan model.Event, 4)
+	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
+	history := NewSessionHistory(4)
+	a := NewActivator(s, ch, make(chan struct{}, 1), history)
+
+	for _, input := range []string{"/help", "  /command args"} {
+		a.handleEvent(model.Event{
+			Type:    model.EventUserInput,
+			Payload: map[string]string{"text": input},
+		})
+	}
+
+	tasks, _ := s.ScanAll()
+	if len(tasks) != 0 {
+		t.Fatalf("斜杠命令泄漏后发布了 %d 个 scheduler task", len(tasks))
+	}
+	if history.Len() != 0 {
+		t.Fatalf("斜杠命令泄漏后写入了 %d 条会话历史", history.Len())
 	}
 }
 

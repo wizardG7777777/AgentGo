@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"agentgo/internal/config"
@@ -14,24 +15,81 @@ import (
 	"agentgo/internal/store"
 )
 
+// PlanRouteRegistry is the smallest runtime-routing authority Watchdog needs.
+// scheduler.AgentRegistry satisfies it without making watchdog depend on the
+// scheduler package.
+type PlanRouteRegistry interface {
+	CanRouteForPlan(planID, eventType string, requiredTools ...string) bool
+}
+
+// RouteResolver answers whether a pending Task has a runtime listener that may
+// claim it. It intentionally reports route existence only; worker busy/idle
+// capacity is not inferred here.
+type RouteResolver interface {
+	HasRunnableRoute(planID, eventType string) bool
+}
+
+// RouteResolverFunc adapts a function to RouteResolver.
+type RouteResolverFunc func(planID, eventType string) bool
+
+func (f RouteResolverFunc) HasRunnableRoute(planID, eventType string) bool {
+	return f != nil && f(planID, eventType)
+}
+
+// NewRuntimeRouteResolver adapts AgentRegistry while preserving the built-in
+// Scheduler route, which is not registered alongside ordinary worker routes.
+func NewRuntimeRouteResolver(registry PlanRouteRegistry) RouteResolver {
+	return RouteResolverFunc(func(planID, eventType string) bool {
+		if eventType == "__scheduler__" {
+			return true
+		}
+		return registry != nil && registry.CanRouteForPlan(planID, eventType)
+	})
+}
+
+type pendingObservationKind string
+
+const (
+	pendingObservationRoutable   pendingObservationKind = "routable"
+	pendingObservationUnroutable pendingObservationKind = "unroutable"
+	defaultPendingGraceSec                              = 300
+)
+
+type pendingObservation struct {
+	kind    pendingObservationKind
+	since   time.Time
+	alerted bool
+}
+
 type Watchdog struct {
-	Store        store.TaskStore
-	Config       *config.Config
-	EventCh      chan<- model.Event
-	Roster       roster.Roster
-	MailRegistry *mailbox.Registry // 2026-04-25 P1：超时/级联取消时向 task.EventSource 汇报
+	Store         store.TaskStore
+	Config        *config.Config
+	EventCh       chan<- model.Event
+	Roster        roster.Roster
+	MailRegistry  *mailbox.Registry // 2026-04-25 P1：超时/级联取消时向 task.EventSource 汇报
+	RouteResolver RouteResolver
+
+	pendingMu           sync.Mutex
+	pendingObservations map[string]pendingObservation
+	now                 func() time.Time
 }
 
 // New 构造 Watchdog。mbReg 为 nil 时 sendCrashReport 会静默跳过——保持向后兼容
 // （既有 watchdog 单元测试通过 newTestWatchdog 构造时不传 mbReg，行为不变）。
-func New(s store.TaskStore, cfg *config.Config, eventCh chan<- model.Event, r roster.Roster, mbReg *mailbox.Registry) *Watchdog {
-	return &Watchdog{
-		Store:        s,
-		Config:       cfg,
-		EventCh:      eventCh,
-		Roster:       r,
-		MailRegistry: mbReg,
+func New(s store.TaskStore, cfg *config.Config, eventCh chan<- model.Event, r roster.Roster, mbReg *mailbox.Registry, routes ...RouteResolver) *Watchdog {
+	w := &Watchdog{
+		Store:               s,
+		Config:              cfg,
+		EventCh:             eventCh,
+		Roster:              r,
+		MailRegistry:        mbReg,
+		pendingObservations: make(map[string]pendingObservation),
+		now:                 time.Now,
 	}
+	if len(routes) > 0 {
+		w.RouteResolver = routes[0]
+	}
+	return w
 }
 
 // Run starts the watchdog's ticker-driven inspection loop.
@@ -64,17 +122,24 @@ func (w *Watchdog) inspect() {
 	for _, task := range tasks {
 		w.checkTask(task)
 	}
+	w.prunePendingObservations(tasks)
 
 	// 花名册兜底清理：清除不属于任何活跃代理的残留声明
 	w.cleanupStaleClaims(tasks)
 }
 
 func (w *Watchdog) checkTask(task *model.Task) {
+	if task == nil {
+		return
+	}
 	switch task.Status {
 	case model.TaskStatusProcessing:
+		w.clearPendingObservation(task.ID)
 		w.checkProcessingTask(task)
 	case model.TaskStatusPending:
 		w.checkPendingTask(task)
+	default:
+		w.clearPendingObservation(task.ID)
 	}
 }
 
@@ -122,23 +187,8 @@ func (w *Watchdog) checkProcessingTask(task *model.Task) {
 }
 
 func (w *Watchdog) checkPendingTask(task *model.Task) {
-	// Unclaimed detection: pending too long
-	if !task.CreatedAt.IsZero() {
-		unclaimedThreshold := time.Duration(w.Config.Infra.Store.DefaultTimeoutSec) * time.Second
-		elapsed := time.Since(task.CreatedAt)
-		if elapsed > unclaimedThreshold {
-			log.Printf("[watchdog] task %s unclaimed for too long", task.ID)
-			if err := w.Store.TransitionState(task.ID, model.TaskStatusPending, model.TaskStatusFailed); err != nil {
-				log.Printf("[watchdog] failed to fail task %s: %v", task.ID, err)
-			}
-			w.sendAlert(task.ID)
-			reason := fmt.Sprintf("任务在 pending 状态超过 %v 未被认领（elapsed %v）", unclaimedThreshold, elapsed.Round(time.Second))
-			w.sendCrashReport(task, reason, elapsed)
-			return
-		}
-	}
-
-	// 级联取消：依赖任务失败或被取消
+	// Dependency state is authoritative before queue-age classification. A
+	// healthy but incomplete dependency is normal waiting, not starvation.
 	for _, depID := range task.Dependencies {
 		dep, err := w.Store.GetTask(depID)
 		if err != nil {
@@ -149,7 +199,8 @@ func (w *Watchdog) checkPendingTask(task *model.Task) {
 			}
 			w.sendAlert(task.ID)
 			reason := fmt.Sprintf("级联取消：依赖任务 %s 不存在", depID)
-			w.sendCrashReport(task, reason, time.Since(task.CreatedAt))
+			w.sendCrashReport(task, reason, w.pendingElapsed(task))
+			w.clearPendingObservation(task.ID)
 			return
 		}
 		if dep.Status == model.TaskStatusFailed || dep.Status == model.TaskStatusCancelled {
@@ -159,10 +210,229 @@ func (w *Watchdog) checkPendingTask(task *model.Task) {
 			}
 			w.sendAlert(task.ID)
 			reason := fmt.Sprintf("级联取消：依赖任务 %s 已 %s", depID, dep.Status)
-			w.sendCrashReport(task, reason, time.Since(task.CreatedAt))
+			w.sendCrashReport(task, reason, w.pendingElapsed(task))
+			w.clearPendingObservation(task.ID)
+			return
+		}
+		if dep.Status == model.TaskStatusBlocked {
+			reason := fmt.Sprintf("dependency_blocked: 依赖任务 %s 已 blocked", depID)
+			if err := w.blockPendingTask(task.ID, reason); err != nil {
+				log.Printf("[watchdog] block downstream task %s after dependency %s blocked failed: %v", task.ID, depID, err)
+			} else {
+				w.sendPendingAlert(task.ID, "dependency_blocked", reason)
+				log.Printf("[watchdog] task %s blocked because dependency %s is blocked", task.ID, depID)
+			}
+			w.clearPendingObservation(task.ID)
+			return
+		}
+		if dep.Status != model.TaskStatusCompleted {
+			w.clearPendingObservation(task.ID)
 			return
 		}
 	}
+
+	// QueryAvailable reuses the TaskStore's Plan CanClaim hook. A paused,
+	// blocked, retired, or otherwise control-plane-reserved Task must not age
+	// into a queue failure while it is deliberately ineligible for claiming.
+	claimable, err := w.pendingTaskIsClaimable(task)
+	if err != nil {
+		log.Printf("[watchdog] task %s claimability probe failed: %v", task.ID, err)
+		w.clearPendingObservation(task.ID)
+		return
+	}
+	if !claimable {
+		w.clearPendingObservation(task.ID)
+		return
+	}
+
+	// A nil resolver is an intentionally conservative compatibility mode for
+	// tests/alternate embeddings: route truth is unknown, so Watchdog observes
+	// no destructive pending terminal.
+	if w.RouteResolver == nil {
+		w.clearPendingObservation(task.ID)
+		return
+	}
+	if !w.RouteResolver.HasRunnableRoute(task.PlanID, task.EventType) {
+		w.checkUnroutableTask(task)
+		return
+	}
+	w.checkRoutableQueueWait(task)
+}
+
+func (w *Watchdog) pendingTaskIsClaimable(task *model.Task) (bool, error) {
+	available, err := w.Store.QueryAvailable(task.EventType)
+	if err != nil {
+		return false, err
+	}
+	for _, candidate := range available {
+		if candidate != nil && candidate.ID == task.ID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (w *Watchdog) checkUnroutableTask(task *model.Task) {
+	now := w.currentTime()
+	observation := w.observeUnroutable(task.ID, now)
+	elapsed := nonNegativeDuration(now.Sub(observation.since))
+	grace := w.unroutableGrace()
+	if elapsed <= grace {
+		return
+	}
+
+	reason := fmt.Sprintf(
+		"no_compatible_route: event_type=%q plan_id=%q remained unavailable for %v",
+		task.EventType, task.PlanID, elapsed.Round(time.Second))
+	if !observation.alerted {
+		w.markPendingAlerted(task.ID, pendingObservationUnroutable, observation.since)
+		w.sendPendingAlert(task.ID, "no_compatible_route", reason)
+	}
+
+	if err := w.blockPendingTask(task.ID, reason); err != nil {
+		log.Printf("[watchdog] block unroutable task %s failed: %v", task.ID, err)
+		return
+	}
+	log.Printf("[watchdog] task %s blocked: %s", task.ID, reason)
+	w.clearPendingObservation(task.ID)
+}
+
+func (w *Watchdog) blockPendingTask(taskID, reason string) error {
+	if blocker, ok := w.Store.(interface {
+		BlockTaskBySystem(taskID, reason string) error
+	}); ok {
+		return blocker.BlockTaskBySystem(taskID, reason)
+	}
+	// Alternate stores keep source compatibility. The structured alert carries
+	// the reason even though their generic transition cannot persist Error.
+	return w.Store.TransitionState(taskID, model.TaskStatusPending, model.TaskStatusBlocked)
+}
+
+func (w *Watchdog) observeUnroutable(taskID string, now time.Time) pendingObservation {
+	w.pendingMu.Lock()
+	defer w.pendingMu.Unlock()
+	if w.pendingObservations == nil {
+		w.pendingObservations = make(map[string]pendingObservation)
+	}
+	observation, ok := w.pendingObservations[taskID]
+	if !ok || observation.kind != pendingObservationUnroutable {
+		observation = pendingObservation{kind: pendingObservationUnroutable, since: now}
+		w.pendingObservations[taskID] = observation
+	}
+	return observation
+}
+
+func (w *Watchdog) checkRoutableQueueWait(task *model.Task) {
+	now := w.currentTime()
+	since := task.PendingSince
+	if since.IsZero() {
+		// Legacy/alternate stores without a queue lease start a fresh in-memory
+		// observation. Never fall back to immutable CreatedAt.
+		since = now
+	}
+	observation := w.observePending(task.ID, pendingObservationRoutable, since)
+	elapsed := nonNegativeDuration(now.Sub(observation.since))
+	grace := w.claimGrace()
+	if elapsed <= grace || observation.alerted {
+		return
+	}
+
+	reason := fmt.Sprintf(
+		"claim_starvation: compatible route exists for event_type=%q plan_id=%q but current pending lease has waited %v; task remains pending",
+		task.EventType, task.PlanID, elapsed.Round(time.Second))
+	w.markPendingAlerted(task.ID, pendingObservationRoutable, observation.since)
+	w.sendPendingAlert(task.ID, "claim_starvation", reason)
+	log.Printf("[watchdog] task %s pending with runnable route: %s", task.ID, reason)
+}
+
+func (w *Watchdog) observePending(taskID string, kind pendingObservationKind, since time.Time) pendingObservation {
+	w.pendingMu.Lock()
+	defer w.pendingMu.Unlock()
+	if w.pendingObservations == nil {
+		w.pendingObservations = make(map[string]pendingObservation)
+	}
+	observation, ok := w.pendingObservations[taskID]
+	if !ok || observation.kind != kind || !observation.since.Equal(since) {
+		observation = pendingObservation{kind: kind, since: since}
+		w.pendingObservations[taskID] = observation
+	}
+	return observation
+}
+
+func (w *Watchdog) markPendingAlerted(taskID string, kind pendingObservationKind, since time.Time) {
+	w.pendingMu.Lock()
+	defer w.pendingMu.Unlock()
+	observation, ok := w.pendingObservations[taskID]
+	if !ok || observation.kind != kind || !observation.since.Equal(since) {
+		return
+	}
+	observation.alerted = true
+	w.pendingObservations[taskID] = observation
+}
+
+func (w *Watchdog) clearPendingObservation(taskID string) {
+	w.pendingMu.Lock()
+	delete(w.pendingObservations, taskID)
+	w.pendingMu.Unlock()
+}
+
+func (w *Watchdog) prunePendingObservations(tasks []*model.Task) {
+	pending := make(map[string]struct{}, len(tasks))
+	for _, task := range tasks {
+		if task != nil && task.Status == model.TaskStatusPending {
+			pending[task.ID] = struct{}{}
+		}
+	}
+	w.pendingMu.Lock()
+	for taskID := range w.pendingObservations {
+		if _, ok := pending[taskID]; !ok {
+			delete(w.pendingObservations, taskID)
+		}
+	}
+	w.pendingMu.Unlock()
+}
+
+func (w *Watchdog) currentTime() time.Time {
+	if w.now != nil {
+		return w.now()
+	}
+	return time.Now()
+}
+
+func (w *Watchdog) pendingElapsed(task *model.Task) time.Duration {
+	if task == nil || task.PendingSince.IsZero() {
+		return 0
+	}
+	return nonNegativeDuration(w.currentTime().Sub(task.PendingSince))
+}
+
+func (w *Watchdog) claimGrace() time.Duration {
+	seconds := 0
+	if w.Config != nil {
+		seconds = w.Config.Infra.Watchdog.PendingAlertGraceSec
+	}
+	if seconds <= 0 {
+		seconds = defaultPendingGraceSec
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (w *Watchdog) unroutableGrace() time.Duration {
+	seconds := 0
+	if w.Config != nil {
+		seconds = w.Config.Infra.Watchdog.UnroutableGraceSec
+	}
+	if seconds <= 0 {
+		seconds = defaultPendingGraceSec
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func nonNegativeDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return 0
+	}
+	return d
 }
 
 func (w *Watchdog) sendAlert(taskID string) {
@@ -172,8 +442,23 @@ func (w *Watchdog) sendAlert(taskID string) {
 	}
 }
 
-// sendCrashReport 在 watchdog 外部杀掉任务时，向 task.EventSource（通常是 scheduler）
-// 发一封结构化崩溃汇报邮件，补齐 scheduler 侧"为什么死"的上下文。
+func (w *Watchdog) sendPendingAlert(taskID, reasonCode, reason string) {
+	select {
+	case w.EventCh <- model.Event{
+		Type:   model.EventWatchdogAlert,
+		TaskID: taskID,
+		Payload: map[string]string{
+			"reason_code": reasonCode,
+			"reason":      reason,
+		},
+	}:
+	default:
+	}
+}
+
+// sendCrashReport 在 watchdog 外部杀掉任务时，向显式 ReplyToAgentID（或仍可
+// 路由的 legacy EventSource）发一封结构化崩溃汇报邮件，补齐上级侧
+// "为什么死"的上下文。
 //
 // 与 agent.sendCrashReport 对称——agent 负责"自己死了告诉上级"，watchdog 负责
 // "外部判定你死了告诉上级"。两者并存，从两个视角覆盖任务终态的可观测性。
@@ -181,9 +466,9 @@ func (w *Watchdog) sendAlert(taskID string) {
 // 静默跳过的情形：
 //   - MailRegistry 未注入（测试场景 / 配置关闭）
 //   - task 为 nil（防御）
-//   - EventSource 为空或等于 "user"（顶层任务不打扰用户）
+//   - ReplyToAgentID 与 legacy EventSource 都无法解析为当前可路由邮箱
 func (w *Watchdog) sendCrashReport(task *model.Task, reason string, elapsed time.Duration) {
-	if w.MailRegistry == nil || task == nil || task.EventSource == "" || task.EventSource == "user" {
+	if w.MailRegistry == nil || task == nil {
 		return
 	}
 
@@ -193,6 +478,11 @@ func (w *Watchdog) sendCrashReport(task *model.Task, reason string, elapsed time
 	// 可能更新了状态字段；Artifacts 则可能是 worker 临死前写下的）。
 	if fresh, err := w.Store.GetTask(taskID); err == nil && fresh != nil {
 		task = fresh
+	}
+	recipient := w.MailRegistry.ResolveReplyRecipient(
+		task.ReplyToAgentID, task.EventSource, task.ID, task.ParentTaskID)
+	if recipient == "" {
+		return
 	}
 
 	desc := task.Description
@@ -245,7 +535,7 @@ func (w *Watchdog) sendCrashReport(task *model.Task, reason string, elapsed time
 
 	msg := mailbox.Message{
 		From:     "watchdog",
-		To:       task.EventSource,
+		To:       recipient,
 		Type:     mailbox.MsgTypeInfo,
 		Priority: mailbox.PriorityHigh,
 		Summary:  summary,
@@ -253,9 +543,9 @@ func (w *Watchdog) sendCrashReport(task *model.Task, reason string, elapsed time
 		SentAt:   time.Now(),
 	}
 	if err := w.MailRegistry.Send(msg); err != nil {
-		log.Printf("[watchdog] 发送崩溃汇报给 %s 失败: %v", task.EventSource, err)
+		log.Printf("[watchdog] 发送崩溃汇报给 %s 失败: %v", recipient, err)
 	} else {
-		log.Printf("[watchdog] 已向 %s 汇报任务 %s 死亡 (%s)", task.EventSource, short, truncate(reason, 40))
+		log.Printf("[watchdog] 已向 %s 汇报任务 %s 死亡 (%s)", recipient, short, truncate(reason, 40))
 	}
 }
 

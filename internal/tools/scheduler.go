@@ -38,8 +38,12 @@ type SchedulerGroup struct {
 	MBRegistry           *mailbox.Registry    // 当前未使用，留作未来扩展（例如 report_done 时通知其他代理）
 	FinalizationNotifier FinalizationNotifier // 可选；非 nil 时 reportDone 成功后调 MarkTaskFinalized()
 	ProjectRoot          string               // 项目根目录，供 probe_directory 做路径校验
-	UserOutput           io.Writer            // 用户可见内容的输出目标；nil 时回退到 stdout
-	PlanCoordinator      *plan.Coordinator
+	UserOutput           io.Writer            // 用户可见普通输出（进度汇报等）；nil 时回退到 stdout
+	// ResultOutput 是任务最终结果块（report_done 的 "=== 任务完成 ===" 块）的输出目标；
+	// nil 时回退到 UserOutput。bootstrap 将其接到 output.KindResult 事件 writer，
+	// 让结果分类在产生处完成，消费方不再做子串匹配。
+	ResultOutput    io.Writer
+	PlanCoordinator *plan.Coordinator
 }
 
 // Register 把 cancel_task / report_done 注册到 r。
@@ -96,70 +100,101 @@ func (g SchedulerGroup) Register(r *agent.ToolRegistry) {
 	)
 }
 
-// cancelTask 是 cancel_task 工具的实现。先尝试 pending→cancelled，
-// 失败时尝试 processing→cancelled。两种 transition 都失败则返回错误。
+// cancelTask 是 cancel_task 工具的实现。守卫与状态转换全部委托
+// GuardedCancel（D2：TUI /cancel 也走同一路径），这里只保留参数解析
+// 与成功消息格式，行为与抽取前一致。
 func (g SchedulerGroup) cancelTask(ctx context.Context, args map[string]any) (string, error) {
 	taskID, _ := args["task_id"].(string)
 	if taskID == "" {
 		return "", fmt.Errorf("缺少 task_id 参数")
 	}
 	reason, _ := args["reason"].(string)
+	// callerTaskID 是发起取消的 scheduler 当前任务（GuardedCancel 用它
+	// 推导 Plan 上下文）；Holder 或 PlanCoordinator 缺失时为空，语义
+	// 等同外部调用方。
+	callerTaskID := ""
+	if g.PlanCoordinator != nil && g.Holder != nil {
+		callerTaskID = g.Holder.Get()
+	}
+	if err := GuardedCancel(ctx, g.Store, g.PlanCoordinator, callerTaskID, taskID, "scheduler"); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("任务已取消: id=%s, 原因: %s", taskID, reason), nil
+}
+
+// GuardedCancel 是 cancel_task 工具与 TUI /cancel 共用的受守卫取消路径
+// （D2 抽取）。先尝试 pending→cancelled，失败时尝试 processing→cancelled，
+// 取消来源记为 source（"scheduler" / "user"）。
+//
+// 守卫规则：
+//   - callerTaskID 非空（LLM 工具：scheduler 当前任务）且 coordinator 非空时：
+//     调用方必须是其 Plan 的 active controller、Plan 处于 running，且目标任务
+//     属于同一 Plan；最终转换在 controller 租约内执行并复查 membership。
+//   - callerTaskID 为空（TUI 用户等外部调用方）：没有可依托的 Plan 上下文，
+//     归属某个 Plan 的任务由该 Plan 的控制器托管——直接取消会绕过租约，拒绝。
+//   - 不归属任何 Plan 的任务：直接转换。
+//
+// 错误消息与抽取前 cancel_task 的措辞一致（"cancel_task 被拒绝：..." /
+// "取消任务失败 (id=...): ..."），调用方不应再包装。
+func GuardedCancel(ctx context.Context, s store.TaskStore, coordinator *plan.Coordinator, callerTaskID, targetTaskID, source string) error {
 	var currentPlan *model.Plan
 	var currentControllerID string
-	if g.PlanCoordinator != nil && g.Holder != nil {
-		currentID := g.Holder.Get()
-		currentTask, currentErr := g.Store.GetTask(currentID)
+	if coordinator != nil && callerTaskID != "" {
+		currentTask, currentErr := s.GetTask(callerTaskID)
 		if currentErr != nil {
-			return "", fmt.Errorf("读取当前 scheduler 任务失败: %w", currentErr)
+			return fmt.Errorf("读取当前 scheduler 任务失败: %w", currentErr)
 		}
 		if currentTask.PlanID != "" {
 			currentControllerID = currentTask.ID
-			currentPlan, currentErr = g.PlanCoordinator.Store().GetPlan(currentTask.PlanID)
+			currentPlan, currentErr = coordinator.Store().GetPlan(currentTask.PlanID)
 			if currentErr != nil {
-				return "", fmt.Errorf("读取当前 Plan 失败: %w", currentErr)
+				return fmt.Errorf("读取当前 Plan 失败: %w", currentErr)
 			}
 			if currentErr = validateActiveController(currentTask, currentPlan); currentErr != nil {
-				return "", currentErr
+				return currentErr
 			}
 			if currentPlan.Status != model.PlanStatusRunning {
-				return "", fmt.Errorf("cancel_task 被拒绝：Plan %s 当前为 %s", currentPlan.ID, currentPlan.Status)
+				return fmt.Errorf("cancel_task 被拒绝：Plan %s 当前为 %s", currentPlan.ID, currentPlan.Status)
 			}
 		}
 	}
-	target, targetErr := g.Store.GetTask(taskID)
+	target, targetErr := s.GetTask(targetTaskID)
 	if targetErr != nil {
-		return "", fmt.Errorf("读取待取消任务失败 (id=%s): %w", taskID, targetErr)
+		return fmt.Errorf("读取待取消任务失败 (id=%s): %w", targetTaskID, targetErr)
 	}
 	if currentPlan != nil && target.PlanID != currentPlan.ID {
-		return "", fmt.Errorf("cancel_task 被拒绝：任务 %s 不属于当前 Plan %s", taskID, currentPlan.ID)
+		return fmt.Errorf("cancel_task 被拒绝：任务 %s 不属于当前 Plan %s", targetTaskID, currentPlan.ID)
+	}
+	if currentPlan == nil && target.PlanID != "" {
+		return fmt.Errorf("cancel_task 被拒绝：任务 %s 由 Plan %s 的控制器托管，外部调用方不能取消", targetTaskID, target.PlanID)
 	}
 
 	cancel := func() error {
 		// Re-read membership inside the controller lease. A controller switch
 		// cannot interleave between this check and the TaskStore transition.
-		latest, latestErr := g.Store.GetTask(taskID)
+		latest, latestErr := s.GetTask(targetTaskID)
 		if latestErr != nil {
 			return latestErr
 		}
 		if currentPlan != nil && latest.PlanID != currentPlan.ID {
-			return fmt.Errorf("任务 %s 不属于当前 Plan %s", taskID, currentPlan.ID)
+			return fmt.Errorf("任务 %s 不属于当前 Plan %s", targetTaskID, currentPlan.ID)
 		}
-		err := store.TransitionStateWithCancelSource(g.Store, taskID, model.TaskStatusPending, model.TaskStatusCancelled, "scheduler")
+		err := store.TransitionStateWithCancelSource(s, targetTaskID, model.TaskStatusPending, model.TaskStatusCancelled, source)
 		if err != nil {
-			err = store.TransitionStateWithCancelSource(g.Store, taskID, model.TaskStatusProcessing, model.TaskStatusCancelled, "scheduler")
+			err = store.TransitionStateWithCancelSource(s, targetTaskID, model.TaskStatusProcessing, model.TaskStatusCancelled, source)
 		}
 		return err
 	}
 	var err error
 	if currentPlan != nil {
-		err = g.PlanCoordinator.WithControllerLease(ctx, currentPlan.ID, currentControllerID, cancel)
+		err = coordinator.WithControllerLease(ctx, currentPlan.ID, currentControllerID, cancel)
 	} else {
 		err = cancel()
 	}
 	if err != nil {
-		return "", fmt.Errorf("取消任务失败 (id=%s): %w", taskID, err)
+		return fmt.Errorf("取消任务失败 (id=%s): %w", targetTaskID, err)
 	}
-	return fmt.Sprintf("任务已取消: id=%s, 原因: %s", taskID, reason), nil
+	return nil
 }
 
 // reportDone 是 report_done 工具的实现。包含三段逻辑：
@@ -255,9 +290,14 @@ func (g SchedulerGroup) reportDone(ctx context.Context, args map[string]any) (st
 		}
 	}
 
-	// 4. 输出到用户可见终端
-	if g.UserOutput != nil {
-		fmt.Fprintf(g.UserOutput, "\n=== 任务完成 ===\n%s\n%s================\n\n", displaySummary, artifactsReport)
+	// 4. 输出到用户可见终端——结果块走 ResultOutput（KindResult 分类在产生处完成），
+	//    未装配时回退 UserOutput（单 Writer 用法兼容）。
+	resultOut := g.ResultOutput
+	if resultOut == nil {
+		resultOut = g.UserOutput
+	}
+	if resultOut != nil {
+		fmt.Fprintf(resultOut, "\n=== 任务完成 ===\n%s\n%s================\n\n", displaySummary, artifactsReport)
 	} else {
 		log.Printf("=== 任务完成 ===\n%s\n%s================", displaySummary, artifactsReport)
 	}

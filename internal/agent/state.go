@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -25,9 +26,8 @@ const (
 	// KindHistoryCompaction / KindHistoryTruncated 事件单独监控）。
 	AgentStateProcessing AgentRuntimeState = "processing"
 	// AgentStateWaitingApproval 阻塞等用户批准（仅 needs-approval 工具调用时触发）。
-	// Phase 3 暂不接入 — 需配合 Phase 1 Shell 工具升级（ToolUpgradePlan.md）
-	// 重构 approval 通道，由 Gate 决策结果触发。当前由 internal/shell/intercept.go
-	// 的 ApprovalCh 阻塞实现，但 Agent 主流程对此瞬时阻塞不可见。
+	// 由 internal/shell/intercept.go 的审批等待钩子（ApprovalWaitHook →
+	// SetApprovalWaitState）在进入/退出回复阻塞时驱动。
 	AgentStateWaitingApproval AgentRuntimeState = "waiting_approval"
 	// AgentStateTerminating 任务结束清理中（FailTask / SubmitResult / FileCache 清理 /
 	// 写最终 trace 事件）。
@@ -153,4 +153,26 @@ func isValidTransition(prev, next AgentRuntimeState) bool {
 		return false
 	}
 	return dests[next]
+}
+
+// SetApprovalWaitState 把 shell 命令审批的等待窗口（internal/shell 的
+// ApprovalWaitHook 回调）映射到运行时状态机：waiting=true → waiting_approval，
+// waiting=false → processing。两条边均在 §7.3.5 转换表内。
+//
+// best-effort：a 为 nil 或转换非法（如任务已取消、状态机已进入 terminating）
+// 时只记日志不中断工具执行——waiting_approval 是观测面增强，不是执行正确性依赖。
+// taskID 取自工具执行 ctx（holder），仅用于 trace 事件归档。
+func SetApprovalWaitState(a *Agent, taskID string, waiting bool) {
+	if a == nil {
+		return
+	}
+	target := AgentStateProcessing
+	cause := "approval_wait_end"
+	if waiting {
+		target = AgentStateWaitingApproval
+		cause = "approval_wait_start"
+	}
+	if err := a.SetState(target, cause, taskID); err != nil {
+		log.Printf("[agent %s] 审批等待状态切换失败（waiting=%v，忽略继续）: %v", a.ID, waiting, err)
+	}
 }

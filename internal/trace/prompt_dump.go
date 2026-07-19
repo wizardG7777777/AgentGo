@@ -27,6 +27,7 @@ type PromptDumper struct {
 	dir     string
 	files   map[string]*os.File // taskID → 已打开文件
 	enabled bool
+	closed  bool // Close 后置位：write 永久 no-op，绝不重开文件
 }
 
 // NewPromptDumper 创建一个 prompt dumper。enabled=false 时所有 Dump 调用都是 no-op。
@@ -79,13 +80,15 @@ func (p *PromptDumper) DumpResponse(taskID string, loop int, ts time.Time, conte
 	})
 }
 
-// Close 关闭所有文件句柄。
+// Close 关闭所有文件句柄并永久停用该 dumper（此后 Dump* 均为 no-op，
+// 绝不重开文件——与 Writer.Close 的语义对齐，防止切换后复活旧目录）。
 func (p *PromptDumper) Close() {
 	if p == nil {
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.closed = true
 	for _, f := range p.files {
 		f.Close()
 	}
@@ -108,6 +111,10 @@ func (p *PromptDumper) CloseTask(taskID string) {
 func (p *PromptDumper) write(taskID string, ts time.Time, payload map[string]any) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	if p.closed {
+		return
+	}
 
 	f, ok := p.files[taskID]
 	if !ok {
@@ -138,24 +145,53 @@ func (p *PromptDumper) write(taskID string, ts time.Time, payload map[string]any
 
 // --- 包级默认 PromptDumper ---
 
+// dumperMu 保护包级默认 PromptDumper。Dump* 热路径只在 RLock 内取指针
+// 快照，锁外执行文件 IO（与 defaultWriter 的 holder 语义一致）。
+var dumperMu sync.RWMutex
+
 var defaultDumper *PromptDumper
 
-// SetDefaultDumper 设置包级默认 PromptDumper。
-func SetDefaultDumper(d *PromptDumper) { defaultDumper = d }
+// SetDefaultDumper 设置包级默认 PromptDumper。不关闭被替换的旧实例——
+// 需要关闭语义时用 SwapDefaultDumper。
+func SetDefaultDumper(d *PromptDumper) {
+	dumperMu.Lock()
+	defer dumperMu.Unlock()
+	defaultDumper = d
+}
+
+// SwapDefaultDumper 原子替换包级默认 PromptDumper 并返回旧实例。
+// session 切换重绑时使用：调用方拿到旧实例后负责 Close。
+func SwapDefaultDumper(d *PromptDumper) (old *PromptDumper) {
+	dumperMu.Lock()
+	defer dumperMu.Unlock()
+	old = defaultDumper
+	defaultDumper = d
+	return old
+}
 
 // DefaultDumper 返回包级默认 PromptDumper。可能为 nil。
-func DefaultDumper() *PromptDumper { return defaultDumper }
+func DefaultDumper() *PromptDumper {
+	dumperMu.RLock()
+	defer dumperMu.RUnlock()
+	return defaultDumper
+}
 
 // DumpRequest 包级 helper。
 func DumpRequest(taskID string, loop int, messages any, toolsCount int) {
-	if defaultDumper != nil {
-		defaultDumper.DumpRequest(taskID, loop, time.Now(), messages, toolsCount)
+	dumperMu.RLock()
+	d := defaultDumper
+	dumperMu.RUnlock()
+	if d != nil {
+		d.DumpRequest(taskID, loop, time.Now(), messages, toolsCount)
 	}
 }
 
 // DumpResponse 包级 helper。
 func DumpResponse(taskID string, loop int, content string, toolCalls any, promptTokens, completionTokens int) {
-	if defaultDumper != nil {
-		defaultDumper.DumpResponse(taskID, loop, time.Now(), content, toolCalls, promptTokens, completionTokens)
+	dumperMu.RLock()
+	d := defaultDumper
+	dumperMu.RUnlock()
+	if d != nil {
+		d.DumpResponse(taskID, loop, time.Now(), content, toolCalls, promptTokens, completionTokens)
 	}
 }

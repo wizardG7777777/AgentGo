@@ -30,12 +30,14 @@ import (
 // 由 allowlist 过滤实际生效集。这样新增工具时只需修改本函数一处。
 //
 // holder / fileCache / workdir 在 New() 中提前创建，供 agent 回调和 ToolGroup 共享。
+// approvalWaitHook 透传给 ShellGroup（审批等待 → agent 状态机接线，见 runner.New）。
 func resolveToolGroups(
 	instanceID string,
 	deps RunnerDeps,
 	holder *CurrentTaskHolder,
 	fileCache *agent.FileStateCache,
 	workdir *tools.DefaultWorkdir,
+	approvalWaitHook func(waiting bool),
 ) []tools.ToolGroup {
 	readGroup := tools.LocalReadGroup{
 		Workdir:         workdir,
@@ -52,11 +54,12 @@ func resolveToolGroups(
 		},
 		tools.WebGroup{Provider: deps.SearchProvider},
 		tools.ShellGroup{
-			Workdir:    workdir,
-			TimeoutSec: deps.ShellTimeoutSec,
-			ApprovalCh: deps.ApprovalCh,
-			AgentID:    instanceID,
-			Filter:     deps.ShellFilter,
+			Workdir:          workdir,
+			TimeoutSec:       deps.ShellTimeoutSec,
+			ApprovalCh:       deps.ApprovalCh,
+			AgentID:          instanceID,
+			Filter:           deps.ShellFilter,
+			ApprovalWaitHook: approvalWaitHook,
 		},
 		tools.MetaGroup{
 			Store:          deps.Store,

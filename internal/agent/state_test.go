@@ -682,3 +682,50 @@ func indexEvent(events []trace.Event, match func(trace.Event) bool) int {
 	}
 	return -1
 }
+
+
+// ── A2：SetApprovalWaitState（shell 审批等待钩子 → 状态机桥接）────
+
+func TestSetApprovalWaitState_NilAgentNoop(t *testing.T) {
+	// nil agent 必须是 no-op（构造顺序兜底：工具注册先于 agent 构造），不 panic
+	SetApprovalWaitState(nil, "task-1", true)
+	SetApprovalWaitState(nil, "task-1", false)
+}
+
+func TestSetApprovalWaitState_ProcessingRoundTrip(t *testing.T) {
+	a := &Agent{ID: "w-1"}
+	a.stateGuard.state = AgentStateProcessing
+
+	SetApprovalWaitState(a, "task-1", true)
+	if got := a.CurrentState(); got != AgentStateWaitingApproval {
+		t.Fatalf("等待开始应为 waiting_approval，got %s", got)
+	}
+	SetApprovalWaitState(a, "task-1", false)
+	if got := a.CurrentState(); got != AgentStateProcessing {
+		t.Fatalf("等待结束应回 processing，got %s", got)
+	}
+}
+
+func TestSetApprovalWaitState_IllegalTransitionIgnored(t *testing.T) {
+	// best-effort：idle 状态下收到等待钩子（如任务已取消的竞态）只记日志，
+	// 不 panic、不改变状态
+	a := &Agent{ID: "w-1"}
+	a.stateGuard.state = AgentStateIdle
+
+	SetApprovalWaitState(a, "task-1", true)
+	if got := a.CurrentState(); got != AgentStateIdle {
+		t.Errorf("非法转换应被忽略，状态保持 idle，got %s", got)
+	}
+}
+
+func TestSetApprovalWaitState_EndWhileProcessingSelfLoop(t *testing.T) {
+	// 等待结束钩子落在 processing 上（如等待开始钩子曾被非法忽略）：
+	// 自循环合法 no-op，状态不变
+	a := &Agent{ID: "w-1"}
+	a.stateGuard.state = AgentStateProcessing
+
+	SetApprovalWaitState(a, "task-1", false)
+	if got := a.CurrentState(); got != AgentStateProcessing {
+		t.Errorf("自循环应为 no-op，状态保持 processing，got %s", got)
+	}
+}

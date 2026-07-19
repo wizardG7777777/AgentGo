@@ -46,23 +46,23 @@
   - **Memory**（取代 team-awareness）：`internal/memory` 的 `ProcessStore` 在 `Agent.processTask` 入口被读取（`team_snapshot` / `file_awareness`），由 scheduler / runners / Roster 监听器写入。`GoalAnchor` 直接删除（`task.Description` 已承载目标）。
   - **Spawn**：`spawn.Manager` 让 reactor 可以"创建 ad-hoc agent"。从 `base_kind` 模板 + `RuntimeOverride` 派生新 runtime，发布 initial task（`EventType="adhoc:<spawnID>"`），任务终态时 manager 作为 reactor 自动销毁 runner（one_shot）。`ReactorSpawnMaxDepth=5` 防级联。
 - **MailNotifier 默认启用**：邮件级联爆炸 P0 的 4 项根因全部由 Phase 2（v4） + Mailbox Gate（v5）守住。`chain-depth-limit` (max=`MailChainMaxDepth`，默认 3) 在 BeforeSend 截断；`per-agent-dedup` 在 BeforeDeliver 去重；`wake-worthy-filter` 在 BeforeWake 过滤；`wake-context-expand` 在 BeforeWake 累加 wake task description。
-- **TUI 取代 CLI**：`internal/tui` 基于 Bubble Tea，inline 渲染（不接管全屏，bootstrap/scheduler/agent 的 `fmt.Println` 日志直出 stdout 不被吞）。审批面板键位：`1` 通过 / `2`/Esc 拒绝 / `3` 切到指导输入模式 / `4` 永远允许（运行时白名单，进程内不持久化） / Ctrl+C 拒绝并退出。8 个斜杠命令：`/quit /help /status /cancel /steer /mode /new /session`。详见 `docs/activate/InterfaceDesign.md` §TUI 章节。
+- **TUI 取代 CLI**：`internal/tui` 基于 Bubble Tea，inline 渲染（不接管全屏，bootstrap/scheduler/agent 的 `fmt.Println` 日志直出 stdout 不被吞）。审批面板键位：`1` 通过 / `2`/Esc 拒绝 / `3` 切到指导输入模式 / `4` 永远允许（运行时白名单，进程内不持久化） / Ctrl+C 拒绝并退出。8 个斜杠命令：`/quit /help /status /cancel /steer /mode /new /session`。详见 `docs/archived/interface-design-tui-2026-05.md` §TUI 章节。
 - **架构决策：无 git 依赖**（2026-04-09 起保持）：`internal/isolation`（git worktree 隔离）整体删除。所有 runner 共享 `ProjectRoot`。并发写文件防线 = `Roster` 文件锁 + `expected_hash` TOCTOU 检查 + `pathutil.ValidatePath` + `path-boundary` Gate（双重）+ `require-read-before-write` Gate + `enforce-expected-artifacts` Gate + `validate-line-anchors` Gate。
 - **任务数据流**：`Task.Artifacts`（`record-artifact` reactor 在 `KindFileWritten` 上自动追加，路径相对项目根）、`Task.ExpectedArtifacts`（发布者硬合约，由 `enforce-expected-artifacts` Gate 与 `agent.checkExpectedArtifacts` 双重把守）、`Task.LastResponse`（无条件持久化用于失败诊断）、`Task.MailChainDepth`（邮件链跳数）、`Task.SchedulerBatch`（scheduler 当前 reactLoop 跟踪的子任务 ID 列表）、`Task.ReadSet`（v5 Phase 6 新增，由 `read-set-write` reactor 在 `KindToolResult{tool=read_file}` 上写入；`require-read-before-write` Gate 改读 ReadSet 而不再反查 ToolCallHistory）。
 - **TaskCancelRegistry**：per-task cancel context，看门狗/调度器把任务转为 terminal 状态时自动取消正在执行的代理（通过 `ctx.Done()` 即时感知）。
 - **崩溃汇报**：任务最终失败时 agent 自动调用 `sendCrashReport`，向 `task.EventSource` 发送 `priority=high` 邮件，附 expected vs actual artifacts、最后一次 LLM 响应原文。
 - **三层历史压缩**：Layer 1 `snipOldToolResults`（无 LLM 开销，逐轮清理旧工具输出）；Layer 2 `compressHistory`（超过 `enforce_compact_token_threshold` 时摘要）；Layer 3 context overflow 时 `keepRecent=1` 激进压缩 + `RetryRollback`。压缩事件 `KindHistoryCompaction` / `KindHistoryTruncated` 由 `trace-history-event` reactor 计数。
-- **Trace 系统 Schema B**：`internal/trace.Event` 是 fat struct，2026-05-01 新增三个可选指针子结构体 `Transition` / `ShellExec` / `ShellTimeout`，旧字段保留不动。新 EventKind：`KindAgentStateChanged`（开放给用户 reactor）、`KindShellExecuted` / `KindShellTimeoutPending` / `KindShellTimeoutResolved`（仅内置 reactor）。`SetDefaultDispatcher(reactorReg)` 让 `trace.Emit` 同时驱动 Reactor 链路。每任务一份 JSONL，Session 活跃时落盘到 `.agentgo/sessions/sess-<id>/logs/`，否则 `.agentgo/traces/`，保留 100 个。`agentgo trace list/show` 子命令自动定向到 active session 的 `logs/`。可通过 `AGENTGO_DUMP_PROMPTS=1` 启用 prompt dump。
+- **Trace 系统 Schema B**：`internal/trace.Event` 是 fat struct，包含 `Transition` / `ShellExec` / `ShellTimeout` 以及动态 DAG 的 `Plan` / `Acceptance` 五个可选指针载荷，旧字段保留不动。当前有 31 个内置系统 EventKind，包含七个重规划、验收和 Plan 生命周期审计事件。`SetDefaultDispatcher(reactorReg)` 让 `trace.Emit` 同时驱动 Reactor 链路。物理 JSONL 在 Session 活跃时落盘到 `.agentgo/sessions/sess-<id>/logs/`，否则写入 `.agentgo/traces/`，默认保留 100 个文件；Task 重试可能跨多个分片。`agentgo trace list/show/plan` 会按完整 `task_id` 重组逻辑任务并自动定向到 active session 的 `logs/`，其中 `plan <plan_id>` 聚合跨 Task DAG 时间线。可通过 `AGENTGO_DUMP_PROMPTS=1` 启用 prompt dump。
 - **LLM Provider Adapter**（2026-04-25 落地，仍有效）：`internal/llm` 两层机制。层 1 通用透传通过 `llm.Message.ExtraFields` + openai-go v3 的 `JSON.ExtraFields` / `SetExtraFields` 自动保留响应里的未知字段（如 DeepSeek V4 `reasoning_content`），下一轮请求原样回写；层 2 `llm.Provider` 插件接口处理变换型差异（R1 剥离 reasoning_content）。配置项在 `llm.provider`（per-kind 通过 `agents[*]` 顶层无对应字段时回退到 `llm.provider`），内置 `openai` / `deepseek-v4` / `deepseek-r1`。详见 §"LLM Provider Adapter"。
 
 **未启动 / 待设计**：
 - ScopeSession / ScopeProject 持久化记忆（v5.x 排期）
 - Embedding 与 `QueryByVector`（接口预留，无实现）
-- 引用幻觉验证 Gate / E2E 幻觉测试基线（详见 `docs/activate/HALLUCINATION_ACCEPTANCE_AUDIT.md`，P0 改进尚未落地）
+- 引用幻觉验证 Gate / E2E 幻觉测试基线（详见 `docs/archived/hallucination-acceptance-audit-2026-05.md`，P0 改进尚未落地）
 - Shell 工具改造的 T6（YAML 持久化）（详见 `docs/activate/ToolUpgradePlan.md`）
 - AgentHook 子系统是否在 v5 内合并入 Reactor（方案 C，详见 `docs/activate/MemoryManageSystem.md` §5）
 
-详细缺陷与状态原记录在 `docs/activate/KNOWN_ISSUES.md`（28/29 已修复），该文件已删除，历史背景见 `docs/archived/`。
+当前限制见 `docs/activate/KNOWN_ISSUES.md`；已完成的 UI Hub 修复总账见 `docs/archived/ui-hub-remediation-2026-07-18.md`。
 
 ---
 
@@ -220,7 +220,7 @@ Reactor 让"状态变化之后的副作用"被显式表达 + **可由用户 YAML
 | 注册者 | 开发者 Go 代码（bootstrap.go） | YAML 声明 |
 | 同步性 | 允许 `IsSync: true` | **强制异步** |
 | 失败影响 | panic-isolated，但失败应被 trace 显眼记录（系统不变量被打破） | panic-isolated，仅记日志 |
-| 可订阅 EventKind 范围 | 全部 21 个（包含仅内置开放的 Shell timeout 事件等） | 子集（`KindAgentStateChanged` 等开放给用户；shell timeout 系列暂不开放） |
+| 可订阅 EventKind 范围 | 全部 31 个内置系统事件 | `internal/reactor/userdef/loader.go` 白名单中的 27 个；4 个重规划控制事件仅内置可订阅 |
 
 ### Reactor 的判别速查（写新代码时）
 
@@ -915,7 +915,7 @@ scheduler agent 与 worker / explorer 共享同一套 `agent.Agent.processTask` 
 
 ### 组件
 - **`mailbox.Registry`**：所有代理信箱的注册中心。每个代理通过 `Register(agentID, eventType, aliases...)` 申请信箱，可注册别名（如 `"scheduler"`、`"explorer-1"`）。
-- **`mailbox.Mailbox`**：单个代理的收件箱，内部是带缓冲的 Go channel（容量 = `cfg.MailboxBufferSize`）+ 容量 16 的 ring buffer（Phase 2 引入，用于 hook 系统的 peek-without-consume）。
+- **`mailbox.Mailbox`**：单个代理的收件箱，内部是带缓冲的 Go channel + 容量 16 的 ring buffer（用于 Gate 的 peek-without-consume）。二者语义不同：channel 是未读队列，ring buffer 是包含已读历史的观察窗口；v4 Session 快照只持久化未读队列。
 - **`mailbox.MailNotifier`**：独立 goroutine，定期扫描非空信箱，为有未读邮件的空闲代理发布"唤醒任务"。**默认启用**（`cfg.MailNotifierEnabled=true`，2026-04-09 Phase 2 完成后恢复）。Phase 2 的 `ChainDepthLimitHook` (max=3) + `PerAgentDedupHook` + `WakeContextExpandHook` 三层防御彻底关闭了邮件级联爆炸 P0。
 
 ### 消息结构（`mailbox.Message`）
@@ -959,9 +959,9 @@ Scheduler agent (Phase 3 后) 与 worker / explorer 共享同一套 `Mailbox.Dra
 
 # 系统启动流程
 
-系统由 `main.go` → `bootstrap.Bootstrap(configPath, explicit, skipStartupProbe)` 完成初始化，再由 `System.Start(ctx, cancel)` 拉起所有 goroutine，最后 `System.RunCLI(ctx, stdin, stdout)`（内部调 `tui.Run`）阻塞主线程。
+系统由 `main.go` → `bootstrap.Bootstrap(configPath, explicit, skipStartupProbe)` 完成初始化，再由 `System.Start(ctx, cancel)` 拉起所有 goroutine，最后 `System.RunCLI(ctx)`（内部调 `tui.Run`）阻塞主线程。
 
-`main.go` 入口除 `-config` / `-skip-startup-probe` 外还支持 `trace` 子命令：`./agentgo trace list/show ...` 不进 bootstrap，直接进入 `internal/trace/cli.go`。Trace CLI 自动通过 `.agentgo/sessions/active-session` 解析当前 session 的 `logs/` 目录，回退到 `.agentgo/traces/`。
+`main.go` 入口除 `-config` / `-skip-startup-probe` 外还支持 `trace` 子命令：`./agentgo trace list/show/plan ...` 不进 bootstrap，直接进入 `internal/trace/cli.go`。Trace CLI 自动通过 `.agentgo/sessions/active-session` 解析当前 session 的 `logs/` 目录，回退到 `.agentgo/traces/`；`plan <plan_id>` 会按时间聚合同一动态 DAG 分散在多个 Task 文件中的事件。
 
 ## Bootstrap 阶段（构造对象图，v5 顺序）
 
@@ -1008,7 +1008,7 @@ Scheduler agent (Phase 3 后) 与 worker / explorer 共享同一套 `Mailbox.Dra
 
 ## RunCLI 阶段
 
-`sys.RunCLI(ctx, stdin, stdout)` 内部调 `tui.Run(ctx, deps)`，基于 Bubble Tea，inline 渲染（不接管全屏，bootstrap / scheduler / agent 的 `fmt.Println` 日志直出 stdout）。
+`sys.RunCLI(ctx)` 内部调 `tui.Run(ctx, deps)`，基于 Bubble Tea，inline 渲染（不接管全屏，bootstrap / scheduler / agent 的 `fmt.Println` 日志直出 stdout）。
 
 - **斜杠命令**：`/quit /help /status /cancel <id> /steer <agentID> <msg> /mode /new /session [<idx>]`
 - **自由文本**（非 `/` 开头）→ `EventUserInput` 写入 `eventCh`，同步调 `SessionManager.RecordFirstInput` + `IncrementTaskCount`；`scheduler.Activator` 翻译为 `EventType="__scheduler__"` 任务，scheduler agent 在下次 poll 时认领
@@ -1052,21 +1052,22 @@ Trace 系统为每个任务记录完整的执行轨迹，便于问题诊断、�
 
 **文件命名**: `<UTC时间戳>_<taskID前8位>.jsonl`
 - 示例：`2026-04-08T04-17-06_321b561d.jsonl`
+- 重试会关闭并重新打开 writer，同一 Task 可能对应多个物理文件；同秒且前 8 位碰撞时，一个物理文件也可能含多个 Task。CLI 始终按事件中的完整 `task_id` 聚合。
 
 **格式**: JSON Lines（每行一个 JSON 对象）
 
-## 事件类型（v5 Schema B，2026-05-01 升级）
+## 事件类型（Schema B，2026-07-18 当前实现）
 
-`Event` 顶层字段不变，**新增 3 个可选指针子结构体** `Transition` / `ShellExec` / `ShellTimeout` 承载结构化信息，旧 v4 jsonl 与本格式向前兼容（`omitempty` 让旧字段 0 值不出现在 JSON 中）。
+`Event` 顶层字段保持向后兼容，使用 **5 个可选指针子结构体**：`Transition` / `ShellExec` / `ShellTimeout` 承载状态和 Shell 信息，`Plan` / `Acceptance` 承载动态 DAG 的版本与验收事实。`omitempty` 让旧 jsonl 仍可被当前 viewer 读取。
 
 ### 任务/Agent 状态变更类
 
 | EventKind | 说明 | 关键字段 |
 |-----------|------|----------|
-| `task_published` | 任务发布 | `task_id`, `description`, `dependencies`, `expected_artifacts` |
+| `task_published` | 任务发布 | `task_id`, `parent_task_id`, `batch_id`, `description`, `dependencies`, `event_type`, `priority`, `depth`, `published_by` |
 | `task_claimed` | 任务被认领 | `task_id`, `agent_id`, `Transition{prev_status, new_status, cause}` |
 | `task_submitted` | SubmitResult 成功，准备进入 completed | `task_id`, `agent_id`, `output_len`, `loops_used` |
-| `task_completed` / `task_failed` / `task_cancelled` / `task_retry` | 任务终态 / 重试 | `task_id`, `agent_id`, `Transition{...}`（含 cancel_source / retry_count） |
+| `task_completed` / `task_failed` / `task_blocked` / `task_cancelled` / `task_retry` | 任务终态 / 重试 | `task_id`, `agent_id`, `Transition{...}`（含 cancel_source / retry_count） |
 | `agent_state_changed` | **v5 新增** —— Agent 4 状态枚举切换 | `agent_id`, `Transition{prev_state, new_state, cause}`；**开放给用户 reactor** |
 | `error` | 非终态错误（ExpectedArtifacts 校验失败、SubmitResult 异常等） | `task_id`, `agent_id`, `error` |
 
@@ -1074,9 +1075,9 @@ Trace 系统为每个任务记录完整的执行轨迹，便于问题诊断、�
 
 | EventKind | 说明 | 关键字段 |
 |-----------|------|----------|
-| `llm_call_start` / `llm_call_end` | LLM 调用 | `prompt_tokens`, `completion_tokens`, `model` |
-| `tool_call` | 工具调用开始 | `tool`, `args` |
-| `tool_result` | 工具调用完成 | `tool`, `duration_ms`, `result_len`；触发 `read-set-write` reactor |
+| `llm_call_start` / `llm_call_end` | LLM 调用 | `history_entries`, `tool_calls_count`, `prompt_tokens`, `completion_tokens`, `finish_reason`, `duration_ms` |
+| `tool_call` | 工具调用开始 | `tool`, `call_id`, `args` |
+| `tool_result` | 工具调用完成 | `tool`, `call_id`, `args`, `duration_ms`, `result_len`；触发 `read-set-write` reactor |
 | `text_only_submission` | LLM 仅文本响应（无 tool call，自然完成） | `task_id`, `output_len` |
 | `token_stats` | per-task token 使用统计 | `prompt_tokens`, `completion_tokens` |
 
@@ -1085,7 +1086,7 @@ Trace 系统为每个任务记录完整的执行轨迹，便于问题诊断、�
 | EventKind | 说明 | 关键字段 |
 |-----------|------|----------|
 | `file_written` | `write_file` / `edit_file` 成功 | 触发 `record-artifact` reactor → `Store.AppendArtifact` |
-| `write_queued` | 因 Roster 占用而排队 | `file_path`, `holding_agent` |
+| `file_write_queued` | 文件写入进入队列或完成等待 | `path`, `description`, `wait_ms`；`queue_len` 当前为兼容预留字段 |
 | `shell_executed` | **v5 新增** —— shell 命令完成 | `ShellExec{command, exit_code, duration_ms, outcome, stdout/stderr_excerpt}` |
 | `shell_timeout_pending` | **v5 新增** —— shell 命令超时等待决策 | `ShellTimeout{command, elapsed_sec, previous_waits, ...}` |
 | `shell_timeout_resolved` | **v5 新增** —— shell 超时决策落地 | `ShellTimeout{decision, extra_seconds, ...}` |
@@ -1094,21 +1095,33 @@ Trace 系统为每个任务记录完整的执行轨迹，便于问题诊断、�
 
 | EventKind | 说明 | 关键字段 |
 |-----------|------|----------|
-| `history_compaction` | Layer 1/2/3 历史压缩 | `layer`, `original_len`, `compacted_len`；触发 `trace-history-event` reactor |
-| `history_truncated` | Layer 3 截断 | 同上 |
-| `progress_notify` | 进度通知（`progress_notify_enabled=true` 时） | `to`, `kind`, `summary` |
-| `reactor_spawn_depth_exceeded` | spawn_agent reactor 级联超限（`ReactorSpawnMaxDepth=5`） | `source_task_id`, `depth` |
+| `history_compaction` | 历史压缩 | `prompt_tokens_before`, `prompt_tokens_after`, `strategy`, `kept_entries`；触发 `trace-history-event` reactor |
+| `history_truncated` | 历史截断 | 同上 |
+| `progress_notify` | 进度通知（`progress_notify_enabled=true` 时） | `task_id`, `agent_id`, `loop`, `notify_type` |
+| `reactor_spawn_depth_exceeded` | spawn_agent reactor 级联超限（`ReactorSpawnMaxDepth=5`） | `task_id`, `depth`, `reason` |
+
+### 动态 DAG 控制面
+
+| EventKind | 说明 | 关键字段 |
+|-----------|------|----------|
+| `replan_requested` | Task、工具或 Reactor 请求重新规划 | `reason`, `Plan{...}` |
+| `replan_coalesced` | 多个请求被合并 | `reason`, `Plan{...}` |
+| `replan_decided` | Scheduler 记录重规划决策 | `reason`, `Plan{...}` |
+| `acceptance_completed` | 验收运行完成 | `Plan{...}`, `Acceptance{...}` |
+| `plan_revision_changed` | 当前 DAG 图发生语义变更 | `reason`, `Plan{...}` |
+| `plan_paused` | Plan 因预算、验收或阻塞暂停 | `reason`, `Plan{...}` |
+| `plan_terminal` | Plan 达到终态 | `reason`, `Plan{...}`, `Acceptance{...}`（如有） |
 
 > **`task_submitted` / `task_completed` 对称性**：`agent.processTask` 的两条完成路径（自然完成 / Finalized 跨轮短路）都会 emit 这两个事件。2026-04-19 修复前，短路路径只 `SubmitResult` 未 emit，导致 `trace list` 把 scheduler 任务错标为 `running/loops=0`。
 
-> **Schema B 兼容性**：新字段 `omitempty`，旧 v4 jsonl 仍可被新 viewer 读懂；旧 viewer 读新 jsonl 时 `Transition` / `ShellExec` / `ShellTimeout` 子结构看不到细节但不崩溃。
+> **Schema B 兼容性**：新字段 `omitempty`，旧 jsonl 仍可被新 viewer 读懂；旧 viewer 读新 jsonl 时看不到新增子结构细节，但不会因未知 JSON 字段崩溃。
 
 ### Reactor 订阅约定
 
 | 开放级别 | EventKind |
 |---|---|
-| **开放给用户 YAML reactor** | task_published / task_claimed / task_submitted / task_completed / task_failed / task_cancelled / task_retry / **agent_state_changed** / file_written / tool_result / progress_notify / error |
-| **仅内置 reactor 可订阅** | shell_executed / shell_timeout_pending / shell_timeout_resolved（理由：易被用户 reactor 误触造成 shell 外部副作用级联）；history_compaction / history_truncated（性能监控类，无 LLM 视角语义）；reactor_spawn_depth_exceeded（系统不变量类） |
+| **开放给用户 YAML reactor** | `internal/reactor/userdef/loader.go` 中 `knownEventKinds` 的 27 种事件，包含任务、LLM、工具、历史、文件、Shell、错误、验收及 Plan 终态事件 |
+| **仅内置 reactor 可订阅** | `replan_requested` / `replan_coalesced` / `replan_decided` / `plan_revision_changed` |
 
 ## 使用示例
 
@@ -1127,7 +1140,7 @@ cat .agentgo/sessions/sess-<id>/logs/2026-04-08T04-17-06_321b561d.jsonl | jq '.'
 cat .agentgo/sessions/sess-<id>/logs/*.jsonl | jq 'select(.kind=="tool_call") | .tool' | sort | uniq -c
 
 # 查看 LLM token 消耗
-cat .agentgo/sessions/sess-<id>/logs/*.jsonl | jq 'select(.kind=="llm_call") | {prompt: .prompt_tokens, completion: .completion_tokens}'
+cat .agentgo/sessions/sess-<id>/logs/*.jsonl | jq 'select(.kind=="llm_call_end") | {prompt: .prompt_tokens, completion: .completion_tokens}'
 ```
 
 ### Prompt Dump（调试模式）
@@ -1138,13 +1151,13 @@ AGENTGO_DUMP_PROMPTS=1 ./agentgo
 
 ## 并发安全
 
-- 每任务独立文件，无跨任务竞争
 - 每 Writer 实例一把互斥锁（`sync.Mutex`）
 - `Emit()` 调用串行化，保证 JSON 行不交错
+- 文件名只使用 TaskID 前 8 位；罕见碰撞由 CLI 读取完整 `task_id` 拆分，不依赖文件名推断逻辑任务
 
 ## GC 策略
 
-- 默认保留最近 100 个任务的 trace 文件
+- 默认保留最近 100 个物理 trace 文件（重试分片分别计数）
 - 超出限制时按修改时间删除最旧文件
 - 正在写入的文件不会被删除
 
@@ -1190,13 +1203,16 @@ agents:                             # AgentKind 列表 —— 取代 v3 的 work
     system_prompt_file: "prompts/explorer.md"
 
 infra:
-  watchdog:      { interval_sec: 30 }
+  watchdog:
+    interval_sec: 30
+    pending_alert_grace_sec: 300  # 有合法 route 但 pending 过久：只告警
+    unroutable_grace_sec: 300     # 持续无兼容 route：宽限期后 blocked
   mail_notifier: { enabled: true, interval_sec: 5 }
   store:
     event_channel_buffer: 64
     fifo_limit: 100
     default_concurrency: 2
-    default_timeout_sec: 300        # 任务默认超时
+    default_timeout_sec: 300        # 单次 processing 执行的默认超时
   roster:        { wait_timeout_sec: 0 }
 
 # ==============================================================================
@@ -1234,12 +1250,16 @@ reactors_file: "reactors.yaml"      # 空值跳过加载
 # Session
 session_retention_days: 14
 session_archive_max:    50
+session_resume_max_idle_sec: 3600   # 自动恢复的快照闲置上限；超限非终态任务 fail-closed 为 blocked
+session_snapshot_interval_sec: 30   # 运行期快照心跳；显式 0 仅保留切换/关闭快照
 
 # 启动期 TCP probe（best-effort 连通性检查）
 startup_probe: ""                   # 空 / "off" / "auto"
 startup_probe_timeout_sec: 5
 startup_probe_failure_action: "warn" # "warn"（默认）或 "exit"
 ```
+
+Session 恢复遵守以下安全边界：fsync 的 Plan 终态先覆盖较旧的 Task 快照，再执行陈旧自动恢复保护；`processing` 任务恢复为无 agent 的 `pending`，旧进程的 Roster 文件租约不恢复；snapshot v4 只重放真实未读邮件，v1-v3 中无法区分已读状态的 mailbox 消息会被丢弃。动态 Team runner 以稳定 ID 事务性认领快照预建邮箱：route/start 失败会撤销认领并保留原 FIFO 未读队列，恢复完成后仍无人认领的 terminal/stopped/未知 Team 邮箱会在 MailNotifier 启动前丢弃；普通重复注册仍视为装配错误。正常关机先停止 Team runner 使邮箱静止，但把邮箱保留到最终 Session 快照写完后才注销，确保关机—重启不丢未读邮件；最终快照失败会有限重试、保留邮箱并由 `Shutdown` 返回错误。完整关闭流程由系统级 once 串行化，并发调用只等待同一结果。自动恢复陈旧快照时还会清空未读邮件；整个恢复/Plan 对账阶段都不安装 Reactor dispatcher，恢复审计只写 Trace，避免用户 Reactor 重新发布任务。`/new` 与真正发生的 `/session` 切换会立即把连续运行时保存到新的 current Session，避免 active-session 指针已切换而快照仍为空或陈旧的崩溃窗口；重复选择当前 Session 是无副作用 no-op。若旧/新快照保存或 Plan/Team 持久化重绑失败，System 会回滚到旧 Session、重新刷新旧快照，并以结果 generation CAS 避免旧结果覆盖切换窗口内的新结果。
 
 ## AgentKind 关键字段说明
 

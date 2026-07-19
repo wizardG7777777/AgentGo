@@ -3,16 +3,19 @@ package session
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-// SessionConfig は Session 関連の設定項目。
+// SessionConfig 是 Session 相关的配置项。
 type SessionConfig struct {
 	RetentionDays int  // 保留天数，默认 30
 	ArchiveMax    int  // 最大归档数，默认 50
-	Enabled       bool // 是否启用 Session 功能
+	// Enabled 为 false 时跳过 history.jsonl 记录（EnableHistoryLog 变为 no-op）；
+	// Session 目录与 metadata 仍照常创建。生产侧 bootstrap 恒传 true。
+	Enabled bool
 }
 
 // Session 表示一个 Session 实例。
@@ -34,6 +37,7 @@ type Metadata struct {
 }
 
 // Save 将 Metadata 原子写入到指定路径（write-tmp-then-rename，UTF-8 + 2 空格缩进）。
+// rename 成功后对所在目录做 fsync（syncDir，best-effort），保证目录项本身落盘。
 func (m *Metadata) Save(path string) error {
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
@@ -43,7 +47,11 @@ func (m *Metadata) Save(path string) error {
 	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	_ = syncDir(filepath.Dir(path))
+	return nil
 }
 
 // NewMetadata creates a fresh Metadata for a new Session.

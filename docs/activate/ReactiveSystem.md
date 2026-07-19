@@ -1,3 +1,5 @@
+> **状态说明（2026-07-19）**：本文保留 Gate/Reactor 的设计决策和已落地阶段的背景。当前接口、可订阅事件及 Web 多前端行为以 `internal/`、[Archtechture.md](../../Archtechture.md)、[YAML 配置指南](../yaml-config-guide.md) 为准；文中早期 Phase 讨论不代表待实施工作。
+
 # ReactiveSystem：Reactor 驱动的状态响应架构
 
 > **状态**：✅ **设计决议完成 + 实施全部落地**（2026-04-30 至 2026-05-01 设计阶段；2026-05-01 实施阶段 Phase 1-7 全部完成）
@@ -37,7 +39,7 @@
 > **关联文档**：
 > - `nextUpgrade_v4.md` §7 Hashline / §10 Did-You-Mean（依赖现存 Gate 类组件）
 > - `nextUpgrade_v5.md`（Scheduler 汇报分层 —— 平行模块，不冲突）
-> - `TraceUpgrade.md`（事件 payload 结构化升级，本模块的前置基础设施）
+> - `../archived/trace-upgrade-design-2026-05.md`（事件 payload 结构化升级，本模块的前置基础设施）
 > - [ToolUpgradePlan.md](ToolUpgradePlan.md)（配套文档：Shell 工具改造规格 —— 原 §7.4 的命令名单/UI/持久化/超时等实施细节迁移于此）
 > - [MemoryManageSystem.md](MemoryManageSystem.md)（**配套文档：取代原 Provider 抽象**——team-awareness 删除后由 Memory System 承接长期记忆与上下文供给；本模块的"4 类角色"经讨论后已缩为"**2 类核心角色（Reactor + Gate）**"，Aggregator 下放为 Mailbox 内部固定机制不再立顶层）
 > **关键转折**：把 trace 事件流从"只能记录"升级为"可触发用户配置的程序化逻辑"
@@ -101,7 +103,7 @@
 
 - trace 事件不仅是观察手段，更是 Reactor 系统的统一订阅入口
 - TaskStore 仍是 Task 事实的权威来源；动态 DAG 的 PlanStore 是图版本、pending ReplanRequest 和正式验收的权威来源。trace 记录这些已提交事实，但不替代领域 Store
-- 这意味着 trace 机制升级（事件 payload 结构化、新增状态变更字段等，详见 `TraceUpgrade.md`）从"前置依赖"升级为**硬性前置**——没有结构化事件，整套 Reactor 架构站不起来
+- 这意味着 trace 机制升级（事件 payload 结构化、新增状态变更字段等，详见 `../archived/trace-upgrade-design-2026-05.md`）从"前置依赖"升级为**硬性前置**——没有结构化事件，整套 Reactor 架构站不起来
 - TraceUpgrade 与 ReactiveSystem 同步推进（详见 §10 实施顺序）
 
 ### 原则 4：Reactor 不允许直接驱动新状态转换
@@ -553,8 +555,8 @@ GateRegistry 的 BeforeWake 只管"要不要唤醒"决策；Mailbox 私有 aggre
 
 | 副作用 | 当前位置 | 候选 Reactor 名 | 同步性 |
 |---|---|---|---|
-| ClaimTask 后清理 FileCache | [agent.go:362](internal/agent/agent.go#L362) | `clear-file-cache-on-claim` | Sync |
-| panic recover 后 emit `KindTaskFailed` | [agent.go:317](internal/agent/agent.go#L317)（v4 §11 §S11 已修复）| `panic-emit-failed` | Sync |
+| ClaimTask 后清理 FileCache | [agent.go:362](../../internal/agent/agent.go#L362) | `clear-file-cache-on-claim` | Sync |
+| panic recover 后 emit `KindTaskFailed` | [agent.go:317](../../internal/agent/agent.go#L317)（v4 §11 §S11 已修复）| `panic-emit-failed` | Sync |
 | processTask 退出时的 OnTaskEnd 回调 | processTask defer 链 | `task-end-callback` | Sync |
 | TruncateHistory / Compaction 路径的 trace emit | agent.go 多处 | `trace-history-event` | Async |
 | ReadSet 写入（承接 §5.2 反模式治理）| 不存在（待引入）| `read-set-write` | Async |
@@ -1233,11 +1235,11 @@ shell_timeout_resolved: {task_id, agent_id, command, decision, extra_seconds,
 **v5 隐含前置任务**：
 - 升级 `trace.Event` 结构体，加 `From / To / Cause / Diff` 等结构化字段
 - 在所有状态变更点显式 emit 升级后的事件
-- 这部分工作量独立——可以挂在现有 `TraceUpgrade.md`（当前空文件）下作为前置基础设施
+- 这部分工作量独立——可以挂在现有 `../archived/trace-upgrade-design-2026-05.md`（当前空文件）下作为前置基础设施
 
 **待你拍板**：TraceUpgrade 是否提前到本模块的 §S0 一并做掉？还是分开走两条线？
 
-> **2026-05-01 补**：TraceUpgrade 已独立成 [TraceUpgrade.md](TraceUpgrade.md) 作为 ReactiveSystem 的 Phase 2，spec 已定稿（schema B + 4 个新 EventKind + Transition / ShellExec / ShellTimeout 三个 sub-payload + CLI viewer 适配 + 4 条新启发式异常检测）。
+> **2026-05-01 补**：TraceUpgrade 已独立成 [Trace 升级设计归档](../archived/trace-upgrade-design-2026-05.md) 作为 ReactiveSystem 的 Phase 2，spec 已定稿（schema B + 4 个新 EventKind + Transition / ShellExec / ShellTimeout 三个 sub-payload + CLI viewer 适配 + 4 条新启发式异常检测）。
 
 ### 6.6 ReactorRegistry 完整接口形态（与 §4.4 GateRegistry 对称）
 
@@ -1866,12 +1868,12 @@ Shell 工具（`run_shell`）是 AgentGo 与现实世界交互的核心入口，
 
 ### 10.4 与 TraceUpgrade.md 的协同
 
-`TraceUpgrade.md` 当前是空文件占位。本模块筹备期间已确认：**TraceUpgrade 不是独立模块，而是 ReactiveSystem 的 Phase 2**。
+`../archived/trace-upgrade-design-2026-05.md` 当前是空文件占位。本模块筹备期间已确认：**TraceUpgrade 不是独立模块，而是 ReactiveSystem 的 Phase 2**。
 
-**归属决议（2026-04-29 已定）**：未来 Phase 2 启动时，由 `TraceUpgrade.md` 承接 Phase 2 的详细 spec（事件 payload 字段定义、CLI 适配清单、迁移策略）。保留独立文件便于读者按主题查找，符合 `docs/activate/` 现有组织风格（ToolUpgradePlan / TraceUpgrade 都是按主题切的）。
+**归属决议（2026-04-29 已定）**：未来 Phase 2 启动时，由 `../archived/trace-upgrade-design-2026-05.md` 承接 Phase 2 的详细 spec（事件 payload 字段定义、CLI 适配清单、迁移策略）。保留独立文件便于读者按主题查找，符合 `docs/activate/` 现有组织风格（ToolUpgradePlan / TraceUpgrade 都是按主题切的）。
 
 **当前阶段不做的事**：
-- **不立刻动 `TraceUpgrade.md`**——Q1-Q10 都未拍板，Phase 2 的边界都未锁定，此刻往里填内容只能是猜测，必将返工
+- **不立刻动 `../archived/trace-upgrade-design-2026-05.md`**——Q1-Q10 都未拍板，Phase 2 的边界都未锁定，此刻往里填内容只能是猜测，必将返工
 - TraceUpgrade.md 保持空占位状态，是当前正确状态
 - Phase 2 真要启动时（即 Q8 拍板 + 进入实施阶段时）再统一填充
 

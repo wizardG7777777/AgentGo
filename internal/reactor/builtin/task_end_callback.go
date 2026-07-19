@@ -16,7 +16,7 @@ type TaskEndCallback func(ev trace.Event) error
 // **Sync Reactor 完整链路**（ReactiveSystem.md §5.1.1 §6.6.3）。
 //
 // 行为：订阅一次 processTask 退出时会 emit 的 task lifecycle 事件
-// （completed / failed / cancelled / retry），按注册顺序串行调用所有已注册
+// （completed / failed / blocked / cancelled / retry），按注册顺序串行调用所有已注册
 // TaskEndCallback。任一回调失败立即返回
 // 让 Reactor.Run 报错——交由 Registry 的 Sync 路径写 KindError。
 //
@@ -97,6 +97,7 @@ func (r *TaskEndCallbackReactor) Subscribe() []trace.EventKind {
 	return []trace.EventKind{
 		trace.KindTaskCompleted,
 		trace.KindTaskFailed,
+		trace.KindTaskBlocked,
 		trace.KindTaskCancelled,
 		trace.KindTaskRetry,
 	}

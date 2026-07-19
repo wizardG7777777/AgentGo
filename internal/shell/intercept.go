@@ -7,15 +7,19 @@ import (
 	"regexp"
 	"sync"
 
+	"github.com/google/uuid"
+
 	"agentgo/internal/agent"
 )
 
 // ApprovalRequest 灰名单命令的审批请求，由 Worker 发送到 CLI/TUI。
 type ApprovalRequest struct {
-	AgentID string             // 申请执行的代理 ID
-	Command string             // 待执行的命令
-	Pattern string             // 命中的灰名单原始正则模式，"永远允许" 选项的记忆粒度
-	ReplyCh chan ApprovalReply // 无缓冲，Worker 阻塞等待用户回复
+	RequestID string             // 本次审批的唯一 ID（uuid），供前端枚举/定位待审批请求
+	TaskID    string             // 发起审批的任务 ID（取自工具执行 ctx；无任务上下文时为空）
+	AgentID   string             // 申请执行的代理 ID
+	Command   string             // 待执行的命令
+	Pattern   string             // 命中的灰名单原始正则模式，"永远允许" 选项的记忆粒度
+	ReplyCh   chan ApprovalReply // cap=1，Worker 阻塞等待用户回复
 }
 
 // ApprovalReply 用户对审批请求的回复。
@@ -158,8 +162,10 @@ func (f *CommandFilter) RuntimeWhitelist() []string {
 
 // WrapShellTool 包装原始 run_shell 工具函数，加入黑名单/灰名单拦截层。
 // approvalCh 用于向 CLI 发送审批请求；agentID 标识申请执行的代理。
+// waitHook 可选：进入"等待用户回复"阻塞前回调一次（true），等待结束后再回调
+// 一次（false），供调用方接线 agent 状态机（waiting_approval）；nil 为 no-op。
 func WrapShellTool(inner agent.ToolFunc, filter *CommandFilter,
-	approvalCh chan<- ApprovalRequest, agentID string) agent.ToolFunc {
+	approvalCh chan<- ApprovalRequest, agentID string, waitHook func(waiting bool)) agent.ToolFunc {
 
 	return func(ctx context.Context, args map[string]any) (string, error) {
 		command, _ := args["command"].(string)
@@ -177,20 +183,33 @@ func WrapShellTool(inner agent.ToolFunc, filter *CommandFilter,
 
 		case "approve":
 			log.Printf("[shell-filter] 灰名单审批: agent=%s, command=%q, pattern=%s", agentID, command, pattern)
-			replyCh := make(chan ApprovalReply)
+			// cap=1：agent 侧 ctx 取消放弃等待后，前端迟到的回复也能入队返回，
+			// 而不是把回复方（如 bubbletea Update goroutine）永久阻塞在发送上。
+			replyCh := make(chan ApprovalReply, 1)
 
 			// 向 CLI/TUI 发送审批请求，附带命中的模式以支持"永远允许"
 			select {
 			case approvalCh <- ApprovalRequest{
-				AgentID: agentID, Command: command, Pattern: pattern, ReplyCh: replyCh,
+				RequestID: uuid.New().String(),
+				TaskID:    agent.TaskIDFromContext(ctx),
+				AgentID:   agentID,
+				Command:   command,
+				Pattern:   pattern,
+				ReplyCh:   replyCh,
 			}:
 			case <-ctx.Done():
 				return "", fmt.Errorf("命令审批被取消")
 			}
 
-			// 阻塞等待用户回复
+			// 阻塞等待用户回复（前后各回调一次 waitHook，接线 waiting_approval 状态）
+			if waitHook != nil {
+				waitHook(true)
+			}
 			select {
 			case reply := <-replyCh:
+				if waitHook != nil {
+					waitHook(false)
+				}
 				if reply.RememberPattern != "" {
 					if err := filter.AddRuntimeWhitelist(reply.RememberPattern); err != nil {
 						log.Printf("[shell-filter] 永远允许失败: pattern=%q err=%v", reply.RememberPattern, err)
@@ -207,7 +226,10 @@ func WrapShellTool(inner agent.ToolFunc, filter *CommandFilter,
 				}
 				// 放行 → fall through 到执行
 			case <-ctx.Done():
-				return "", fmt.Errorf("命令审批超时")
+				if waitHook != nil {
+					waitHook(false)
+				}
+				return "", fmt.Errorf("命令审批被取消（任务结束或系统关闭）")
 			}
 		}
 

@@ -4,14 +4,14 @@ import (
 	"strings"
 	"testing"
 
-	"agentgo/internal/shell"
+	"agentgo/internal/ui"
 
 	"github.com/charmbracelet/lipgloss"
 )
 
 func TestRenderApprovalBar_Basic(t *testing.T) {
 	theme := DefaultTheme()
-	req := shell.ApprovalRequest{
+	req := ui.ApprovalItem{
 		AgentID: "worker-1",
 		Command: "rm -rf /tmp/test",
 		Pattern: "rm.*",
@@ -43,7 +43,7 @@ func TestRenderApprovalBar_Basic(t *testing.T) {
 
 func TestRenderApprovalBar_QueueCount(t *testing.T) {
 	theme := DefaultTheme()
-	req := shell.ApprovalRequest{AgentID: "w-1", Command: "ls"}
+	req := ui.ApprovalItem{AgentID: "w-1", Command: "ls"}
 	result := renderApprovalBar(theme, 100, req, 3)
 
 	if !strings.Contains(result, "+3 queued") {
@@ -53,7 +53,7 @@ func TestRenderApprovalBar_QueueCount(t *testing.T) {
 
 func TestRenderApprovalBar_NoQueueCount(t *testing.T) {
 	theme := DefaultTheme()
-	req := shell.ApprovalRequest{AgentID: "w-1", Command: "ls"}
+	req := ui.ApprovalItem{AgentID: "w-1", Command: "ls"}
 	result := renderApprovalBar(theme, 100, req, 0)
 
 	if strings.Contains(result, "queued") {
@@ -64,7 +64,7 @@ func TestRenderApprovalBar_NoQueueCount(t *testing.T) {
 func TestRenderApprovalBar_LongCommand(t *testing.T) {
 	theme := DefaultTheme()
 	longCmd := strings.Repeat("x", 200)
-	req := shell.ApprovalRequest{AgentID: "w-1", Command: longCmd}
+	req := ui.ApprovalItem{AgentID: "w-1", Command: longCmd}
 	result := renderApprovalBar(theme, 80, req, 0)
 
 	if !strings.Contains(result, "…") {
@@ -74,7 +74,7 @@ func TestRenderApprovalBar_LongCommand(t *testing.T) {
 
 func TestRenderApprovalBar_WideCommand(t *testing.T) {
 	theme := DefaultTheme()
-	req := shell.ApprovalRequest{AgentID: "w-1", Command: strings.Repeat("执行🙂", 30)}
+	req := ui.ApprovalItem{AgentID: "w-1", Command: strings.Repeat("执行🙂", 30)}
 	result := renderApprovalBar(theme, 50, req, 0)
 
 	if !strings.Contains(result, "…") {
@@ -89,7 +89,7 @@ func TestRenderApprovalBar_WideCommand(t *testing.T) {
 
 func TestRenderApprovalBar_WithPattern(t *testing.T) {
 	theme := DefaultTheme()
-	req := shell.ApprovalRequest{AgentID: "w-1", Command: "cmd", Pattern: "danger.*"}
+	req := ui.ApprovalItem{AgentID: "w-1", Command: "cmd", Pattern: "danger.*"}
 	result := renderApprovalBar(theme, 100, req, 0)
 
 	if !strings.Contains(result, "danger.*") {
@@ -99,7 +99,7 @@ func TestRenderApprovalBar_WithPattern(t *testing.T) {
 
 func TestRenderApprovalBar_WithoutPattern(t *testing.T) {
 	theme := DefaultTheme()
-	req := shell.ApprovalRequest{AgentID: "w-1", Command: "cmd", Pattern: ""}
+	req := ui.ApprovalItem{AgentID: "w-1", Command: "cmd", Pattern: ""}
 	result := renderApprovalBar(theme, 100, req, 0)
 
 	if strings.Contains(result, "pattern:") {

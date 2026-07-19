@@ -1,266 +1,176 @@
 # AgentGo
 
-AgentGo 是一个使用 Go 1.25 编写的多 Agent 编排系统，类似 OpenCode 风格的 CLI Agent。它通过声明式 YAML 配置定义不同能力的 Agent kind，由统一的 Scheduler Agent 接收用户输入、拆分任务并派发给 Worker / Explorer / Verifier / Gatherer 等执行代理协同完成复杂工作。
+AgentGo 是一个 Go 1.25 编写的多 Agent 编排系统。Scheduler 接收用户输入，按需组建或使用预热的 Agent Team，执行 Task-backed 动态 DAG，并以正式验收决定 Plan 是否完成。
 
-## 核心特性
+它提供两种可同时启用的前端：Bubble Tea TUI 与 Web Dashboard。前端通过 UI Hub 订阅同一套运行时状态；Web Dashboard 还提供提交输入、取消任务、审批、切换模式和 Session 的受控操作接口。
 
-- **配置驱动的多 Agent 架构**：在 YAML 中声明 `agents:` 列表，每个 kind 可配置 replicas、工具白名单、模型、system prompt 与行为参数。
-- **Scheduler 即一等 Agent + 动态 DAG**：调度器本身是一个 ReAct Agent；第一轮调查后可建立 Task-backed DAG，并根据逐 Task 终态与 Reactor 请求实时调整，直到最新图通过正式验收。
-- **Plan 控制面**：`PlanID` 跨图版本稳定，PlanRevision、ExecutionStateVersion 和 AcceptanceSpecRevision 分离；只有持久化登记的 active controller 能改图，`report_done` 不能绕过最新 Plan scope 的正式 PASS。
-- **统一 Runner**：所有执行代理共用 `internal/runner`，通过 `AgentRuntimeConfig` 区分能力边界，无需为每种 kind 单独写运行时。
-- **Gate + Reactor 双轨机制**：
-  - **Gate**：在工具调用 / 邮箱发送前做决策，可拦截越界写文件、未读先写、依赖缺失、邮箱链过深等风险操作。
-  - **Reactor**：在状态变化后响应 trace 事件；计划外可执行兼容副作用，计划内只能提交 `request_replan`，由 Scheduler 决定是否改图。
-- **Mailbox 异步通信**：Agent 间可通过 `send_message` 点对点或广播通信，`MailNotifier` 自动唤醒空闲 Agent。
-- **Bubble Tea TUI**：Dashboard、Agent 详情、Chat/Result 视图、Shell 命令审批、Session 切换、斜杠命令。
-- **Session 与 Plan 持久化恢复**：每次运行生成 UUID Session；Task 快照与原子 PlanStore 共同保存图身份、pending 信号、验收事实和执行历史，支持 `-resume <id>` 恢复。
-- **Trace 可观测性**：每个任务生成 JSONL trace，支持 `agentgo trace list/show` 离线查看与异常检测。
+## 先看哪里
+
+README 是运行手册；架构和历史设计不要混为一谈。
+
+| 目标 | 当前参考 |
+| --- | --- |
+| 配置字段与校验规则 | [config.example.yaml](config.example.yaml)、[YAML 配置指南](docs/yaml-config-guide.md) |
+| 系统组件和启动/关停顺序 | [Archtechture.md](Archtechture.md) |
+| Trace 命令、字段和排错 | [TraceGuide.md](TraceGuide.md) |
+| 动态 Plan 的不变量 | [DynamicDAG.md](docs/activate/DynamicDAG.md) |
+| 按需 Agent Team | [AgentTemplate.md](docs/activate/AgentTemplate.md) |
+| 已知限制与历史归档 | [docs/activate/README.md](docs/activate/README.md)、[KNOWN_ISSUES.md](docs/activate/KNOWN_ISSUES.md) |
 
 ## 快速开始
 
-### 1. 克隆与构建
+### 前置条件
 
-```bash
-git clone <repo-url>
-cd AgentGo
-go build -o agentgo .
-# 或直接运行
-go run . -config setting.yaml
+- Go 1.25（以 [go.mod](go.mod) 为准）。
+- 一个 OpenAI-compatible LLM endpoint、模型名和 API key，才能实际执行 LLM 任务。
+
+复制示例配置。PowerShell：
+
+```powershell
+Copy-Item config.example.yaml setting.yaml
+$env:OPENAI_API_KEY = "你的密钥"
 ```
 
-### 2. 配置
-
-复制示例配置并填写 LLM 信息：
+macOS / Linux：
 
 ```bash
 cp config.example.yaml setting.yaml
-# 编辑 setting.yaml，填入 base_url / api_key / default_model
+export OPENAI_API_KEY='你的密钥'
 ```
 
-最小可运行配置只需提供有效的 `llm:` 模型信息；此时 AgentGo 以 Scheduler-only 模式启动，需要执行能力时再从内置 AgentTemplate 按需组建 Team。`tool_profiles:` 与 `agents:` 仅用于可选的预热 Agent。详见 [`config.example.yaml`](config.example.yaml)、[`docs/activate/AgentTemplate.md`](docs/activate/AgentTemplate.md) 与 [`docs/yaml-config-guide.md`](docs/yaml-config-guide.md)。
-
-### 3. 运行
-
-```bash
-./agentgo -config setting.yaml
-```
-
-启动后将进入 TUI。输入问题或任务描述，Scheduler 会自动规划并派发子任务给相应 Agent。
-
-### 4. 恢复 Session
-
-```bash
-./agentgo -config setting.yaml -resume <session-id-or-prefix>
-```
-
-## CLI 与 TUI
-
-### 启动参数
-
-```bash
-./agentgo -config setting.yaml        # 默认配置文件为 setting.yaml
-./agentgo -skip-startup-probe         # 跳过启动期 LLM TCP 探测
-./agentgo -resume <session-prefix>    # 恢复之前保存的 Session
-./agentgo trace list                  # 离线查看最近任务
-./agentgo trace show <task-id>        # 离线查看单个任务 trace
-```
-
-### TUI 斜杠命令
-
-| 命令 | 说明 |
-|------|------|
-| `/help` | 显示帮助 |
-| `/status` | 任务统计与当前活跃任务 |
-| `/cancel <id-prefix>` | 取消指定任务 |
-| `/mode` | 切换 Scheduler 模式：`immediate` / `plan` |
-| `/steer <agent-id> <msg>` | 向指定 Agent 发送纠偏消息 |
-| `/new` | 创建新 Session |
-| `/session [num]` | 列出或切换 Session |
-| `/dashboard` | 返回 Dashboard 视图 |
-| `/chat` | 切换到消息视图 |
-| `/result` | 查看上一次结果 |
-| `/agent <id-prefix>` | 查看 Agent 详情 |
-| `/quit` | 退出并保存快照 |
-
-Shell 灰名单命令会触发审批栏：按 `1` 批准、`2` 拒绝、`3` 发送指导意见、`4` 批准并临时记住该模式。
-
-## 配置概览
-
-主配置文件采用 v5 嵌套 schema（v3 顶层旧字段已被忽略）：
+在 `setting.yaml` 中至少配置模型；建议把密钥保留为环境变量引用：
 
 ```yaml
 llm:
-  base_url: https://api.openai.com/v1
+  base_url: "https://api.openai.com/v1"
   api_key: ${OPENAI_API_KEY}
-  default_model: gpt-4o
-  timeout_sec: 120
-  # provider: openai  # 可选 openai / deepseek-v4 / deepseek-r1
-
-tool_profiles:
-  worker_standard:
-    - read_file
-    - list_dir
-    - grep_search
-    - glob_search
-    - write_file
-    - edit_file
-    - run_shell
-    - web_search
-    - web_fetch
-    - send_message
-    - request_replan
-  explorer_full:
-    - read_file
-    - list_dir
-    - grep_search
-    - glob_search
-    - web_search
-    - web_fetch
-    - send_message
-
-agents:
-  - kind: worker
-    replicas: 1
-    event_type: ""              # 默认队列
-    profile: worker_standard    # 或 tools: [...]，二者取一
-    model: gpt-4o
-    system_prompt_file: prompts/worker.md
-    agent_max_loops: 10
-    task_max_retries: 3
-    enforce_compact_token_threshold: 4000
-    context_limit: 16000
-    description: |
-      通用工作代理，能读写文件、跑 shell、检索网络。
-
-  - kind: explorer
-    replicas: 1
-    event_type: explore
-    profile: explorer_full
-    model: gpt-4o-mini
-    system_prompt_file: prompts/explorer.md
-    agent_max_loops: 5
-    task_max_retries: 3
-    enforce_compact_token_threshold: 3000
-    context_limit: 8000
-    description: |
-      广度优先调研代理，不写文件，仅返回 Markdown 文字回复。
-
-infra:
-  watchdog: { interval_sec: 30 }
-  mail_notifier: { enabled: true, interval_sec: 5 }
-  store: { event_channel_buffer: 64, fifo_limit: 100, default_concurrency: 2, default_timeout_sec: 300 }
-  roster: { wait_timeout_sec: 30 }
-
-project_root: "."
-max_subtask_depth: 3
-shell_timeout_sec: 60
-hashline_enabled: true
-transfer_note_max_tokens: 3000
-progress_notify_enabled: true
-session_retention_days: 30
-session_archive_max: 50
-
-# 可选：用户 Reactor 配置
-# reactors_file: reactors.yaml
+  default_model: "gpt-4o"
 ```
 
-- `agents` 列表非空，`kind` 必须唯一，`replicas >= 1`。
-- `profile` 与 `tools` 二者取一；`system_prompt_file` 必须存在且路径不含反斜杠。
-- `${ENV_VAR}` 支持在 YAML 任意位置做环境变量替换。
+`llm.default_model`（或 `scheduler.model`）是启动校验所必需的。`agents:` 不是必需项：只有 `llm:` 时系统会以 Scheduler-only 方式启动，Scheduler 可在需要时从内置模板创建 Team。
 
-更多细节请参考 [`docs/yaml-config-guide.md`](docs/yaml-config-guide.md)。
+构建或直接运行：
 
-## 架构亮点
-
+```powershell
+go build -o agentgo.exe .
+.\agentgo.exe -config setting.yaml
+# 或
+go run . -config setting.yaml
 ```
-User (TUI)
-   │
-   ▼
-EventUserInput ──► Scheduler.Activator ──► Store.PublishTask("__scheduler__")
-                                                  │
-                                                  ▼
-                                         Scheduler Agent (ReAct)
-                                                  │
-                                                  ▼
-                                  PlanCoordinator + atomic PlanStore
-                                  (active controller / versions / budget)
-                                                  │
-                       ┌──────────────────────────┼──────────────────────────┐
-                       ▼                          ▼                          ▼
-              Task-backed DAG nodes        Reactor request_replan      AcceptanceRun
-                       │                          │                          │
-                       ▼                          └──────► Scheduler ◄───────┘
-           Worker / Explorer / Verifier                                      │
-           Runner (event_type 队列)                                           ▼
-                       │                                            latest valid PASS
-                       ▼                                                      │
-           Tool call → Gate → Execute → trace.Event                    finalize_plan
-                                                                              │
-                                                                              ▼
-                                                           terminal controller (no tools)
-                                                                              │
-                                                                              ▼
-                                                                             User
-```
-
-- **任务板（`internal/store`）**：内存任务状态机，支持依赖、Artifacts、ReadSet、TransferNote、重试与 FIFO 淘汰。
-- **Plan 控制面（`internal/plan`）**：动态 DAG、版本身份、PlanSignal 聚合、正式验收、预算/无进展策略及原子持久化；跨 TaskStore 的取消操作由 controller lease 与控制器切换串行化。完整规范见 [`docs/activate/DynamicDAG.md`](docs/activate/DynamicDAG.md)。
-- **Gate 系统（`internal/gate` + `internal/hook`）**：统一拦截工具调用与邮箱事件，保障路径边界、先读后写、依赖校验、预期产物等约束。
-- **Reactor 系统（`internal/reactor`）**：订阅 trace 事件，内置记录 artifact、任务结束回调、历史压缩统计、维护 ReadSet；用户可扩展 YAML Reactor。
-- **Trace 系统（`internal/trace`）**：任务级 JSONL 日志，同时作为 Reactor 的事件源。
-- **Session 系统（`internal/session`）**：保存 metadata、history.jsonl、snapshot.json，支持 resume。
-
-## 项目结构
-
-```
-.
-├── main.go                       # 入口：CLI 路由、启动系统
-├── internal/
-│   ├── agent/                    # 通用 ReAct Agent、状态机、LLM 执行器
-│   ├── bootstrap/                # 系统装配、session 恢复
-│   ├── config/                   # 配置加载与校验
-│   ├── gate/                     # 统一 Gate 框架
-│   ├── hook/builtin/             # 内置 Gate 实现
-│   ├── llm/                      # LLM 客户端与 Provider 适配
-│   ├── mailbox/                  # Agent 邮箱与唤醒
-│   ├── memory/                   # 内存系统（当前为 ProcessStore）
-│   ├── model/                    # Task / Event 模型
-│   ├── pathutil/                 # 路径工具
-│   ├── plan/                     # 动态 DAG、正式验收、预算与持久 PlanStore
-│   ├── reactor/                  # Reactor 框架与内置实现
-│   │   └── userdef/              # 用户 YAML Reactor
-│   ├── runner/                   # 统一 kind-based Runner
-│   ├── scheduler/                # Scheduler Agent、Activator、Executor、Board Snapshot
-│   ├── session/                  # Session 管理、快照、归档
-│   ├── shell/                    # Shell 命令过滤与审批
-│   ├── store/                    # 内存任务板
-│   ├── tools/                    # 工具实现
-│   ├── trace/                    # Trace 写入与 CLI
-│   ├── tui/                      # Bubble Tea TUI
-│   └── watchdog/                 # 超时与级联取消看门狗
-├── prompts/                      # 各 kind 的 system prompt
-├── docs/                         # 设计文档与配置指南
-├── config.example.yaml           # v5 配置示例
-├── test_invest.yaml              # 可运行的对抗式调研示例
-├── test_invest_reactors.yaml     # 对应的用户 Reactor 示例
-└── .agentgo/                     # 运行时目录（session、trace、state、reports 等）
-```
-
-## 开发与测试
 
 ```bash
-# 运行全部测试
-go test ./...
-
-# 构建二进制
 go build -o agentgo .
-
-# 运行并指定配置
-go run . -config setting.yaml
-
-# 启用完整 prompt dump（调试 LLM 交互）
-AGENTGO_DUMP_PROMPTS=1 ./agentgo -config setting.yaml
+./agentgo -config setting.yaml
 ```
+
+默认只启动 TUI。退出时使用 `/quit`，或在终端按 Ctrl+C。
+
+### 先启动 Web UI，不配置 LLM API key
+
+可以。启动阶段只要求有模型名；没有有效 API key 时 Dashboard、Session、任务板和 Trace 仍会启动，但首次需要 LLM 的输入会失败。启动期 TCP 探测也可以跳过。
+
+在 `setting.yaml` 增加：
+
+```yaml
+llm:
+  default_model: "待使用的模型名"
+  api_key: ${OPENAI_API_KEY}
+
+ui:
+  frontends: [web]
+  web:
+    listen: "127.0.0.1:8399"
+    auto_open: true
+```
+
+然后运行：
+
+```powershell
+go run . -config setting.yaml -skip-startup-probe
+Invoke-WebRequest http://127.0.0.1:8399/healthz
+```
+
+浏览器打开 `http://127.0.0.1:8399/`。`frontends: [web]` 是无 TUI 的 headless 模式，进程会持续运行直到 Ctrl+C；如需两种界面并存，改成 `[tui, web]`。
+
+当 API key 准备好后，在当前 PowerShell 设置 `$env:OPENAI_API_KEY` 并重新启动即可；无须把密钥写入 YAML。Dashboard 不提供修改 LLM 配置或保存密钥的接口。
+
+### Web Dashboard 的安全边界
+
+Web Dashboard 不是只读页面：它可提交输入、取消 Task、发送引导、处理 Shell 审批、切换模式和 Session。因此：
+
+- 仅本机使用时保留 `127.0.0.1:8399`，可不设 `ui.web.token`。
+- 监听 `0.0.0.0`、`::` 或公网/局域网地址时，`ui.web.token` 是启动校验的必填项；使用独立的随机 token，绝不要复用 LLM API key。
+- `ui.web.auto_open` 未设置时默认为 `true`；服务启动后会打开系统默认浏览器。设为 `false` 可关闭。
+
+带 token 的客户端可在 Dashboard 提示框输入，或使用 `?token=...` 打开地址。健康检查 `/healthz` 不要求 token，其他 API 均受 token 保护。
+
+## 使用与恢复
+
+```text
+agentgo -config setting.yaml        # 默认配置文件也是 setting.yaml
+agentgo -skip-startup-probe         # 跳过启动期 LLM TCP 探测
+agentgo -resume <session-prefix>    # 恢复之前保存的 Session
+agentgo trace list                  # 列出最近 Task
+agentgo trace show <task-id>        # 查看一个 Task 的事件时间线
+agentgo trace plan <plan-id>        # 聚合动态 DAG Plan 的跨 Task 时间线
+```
+
+TUI 斜杠命令：
+
+| 命令 | 作用 |
+| --- | --- |
+| `/help`、`/status` | 查看帮助和运行状态 |
+| `/cancel <id-prefix>` | 取消 Task |
+| `/mode` | 切换 `immediate` / `plan` Scheduler 模式 |
+| `/steer <agent-id> <msg>` | 给 Agent 发送纠偏消息 |
+| `/new`、`/session [num]` | 新建、列出或切换 Session |
+| `/dashboard`、`/chat`、`/result`、`/agent <id-prefix>` | 切换 TUI 视图 |
+| `/quit` | 保存快照并退出 |
+
+灰名单 Shell 命令会请求审批：`1` 批准，`2` 拒绝，`3` 发送指导，`4` 批准并在本进程内临时记住该模式。
+
+## 架构概览
+
+```text
+User (TUI / Web)
+        |
+        v
+      UI Hub
+        |
+        v
+Scheduler Agent --> PlanCoordinator / PlanStore --> Task-backed DAG
+                                                     |
+                      +------------------------------+------------------+
+                      v                              v                  v
+                   Runner Team                Reactor replan     Acceptance runner
+                      |
+                      v
+              Gate -> Tool execution -> Trace / Session persistence
+```
+
+- `internal/plan` 维护动态图版本、控制器租约、验收与预算；最终结果必须满足最新 Plan scope 的正式验收。
+- `internal/runner` 承载预热或按需创建的 Agent；`internal/agenttemplate` 与 `internal/team` 负责模板及运行时 Team。
+- `internal/gate` 在工具/邮箱动作前做决策；`internal/reactor` 订阅状态变化，计划内只可请求 Scheduler 重规划。
+- `internal/session`、`internal/trace` 保存 Session、快照和 JSONL 事件；重试可能产生多个 trace 分片，CLI 会按完整 TaskID 重组。
+- `internal/ui` 是事件通道的唯一消费者和多前端的控制/观测边界；`internal/dashboard` 提供 HTTP + SSE Dashboard。
+
+完整包目录和设计约束见 [Archtechture.md](Archtechture.md)。
+
+## 开发与验证
+
+```powershell
+go test ./...
+go vet ./...
+go build .
+```
+
+在具备 C 编译器的环境，涉及并发修改时还应运行：
+
+```powershell
+go test -race ./internal/agent ./internal/shell ./internal/trace ./internal/bootstrap
+```
+
+调试完整 LLM prompt 时可设置 `AGENTGO_DUMP_PROMPTS=1` 后再启动；prompt dump 可能含有敏感上下文，不应提交或共享。
 
 ## 许可证
 

@@ -40,6 +40,9 @@ func TestPublishAndGetTask(t *testing.T) {
 	if task.CreatedAt.IsZero() {
 		t.Error("CreatedAt should be set")
 	}
+	if task.PendingSince.IsZero() || !task.PendingSince.Equal(task.CreatedAt) {
+		t.Errorf("PendingSince = %v, want publication time %v", task.PendingSince, task.CreatedAt)
+	}
 	if task.MaxConcurrency != 2 {
 		t.Errorf("MaxConcurrency = %d, want default 2", task.MaxConcurrency)
 	}
@@ -88,6 +91,7 @@ func TestGetTask_NotFound(t *testing.T) {
 func TestClaimTask_Basic(t *testing.T) {
 	s, _ := newTestStore(10, 100)
 	task := publishTestTask(t, s, "claim test")
+	createdAt := task.CreatedAt
 
 	err := s.ClaimTask("agent-1", task.ID)
 	if err != nil {
@@ -100,6 +104,12 @@ func TestClaimTask_Basic(t *testing.T) {
 	}
 	if got.StartedAt.IsZero() {
 		t.Error("StartedAt should be set")
+	}
+	if !got.PendingSince.IsZero() {
+		t.Errorf("PendingSince = %v, want zero while processing", got.PendingSince)
+	}
+	if !got.CreatedAt.Equal(createdAt) {
+		t.Errorf("CreatedAt = %v, want unchanged %v", got.CreatedAt, createdAt)
 	}
 	if len(got.Agents) != 1 || got.Agents[0] != "agent-1" {
 		t.Errorf("Agents = %v, want [agent-1]", got.Agents)
@@ -295,6 +305,13 @@ func TestTransitionState_AllValidTransitions(t *testing.T) {
 			if got.Status != tt.to {
 				t.Errorf("status = %s, want %s", got.Status, tt.to)
 			}
+			if tt.to == model.TaskStatusPending {
+				if got.PendingSince.IsZero() || !got.StartedAt.IsZero() || len(got.Agents) != 0 {
+					t.Errorf("processing->pending did not create a clean queue lease: %+v", got)
+				}
+			} else if !got.PendingSince.IsZero() {
+				t.Errorf("non-pending task retained PendingSince: %v", got.PendingSince)
+			}
 		})
 	}
 }
@@ -355,6 +372,7 @@ func TestRetryRollback_Basic(t *testing.T) {
 	s, ch := newTestStore(10, 100)
 	task := publishTestTask(t, s, "retry test")
 	s.ClaimTask("agent-1", task.ID)
+	claimed, _ := s.GetTask(task.ID)
 
 	err := s.RetryRollback("agent-1", task.ID, "temporary error")
 	if err != nil {
@@ -370,6 +388,12 @@ func TestRetryRollback_Basic(t *testing.T) {
 	}
 	if len(got.RetryReasons) != 1 || got.RetryReasons[0] != "temporary error" {
 		t.Errorf("RetryReasons = %v, want ['temporary error']", got.RetryReasons)
+	}
+	if got.PendingSince.IsZero() || got.PendingSince.Before(claimed.StartedAt) {
+		t.Errorf("PendingSince = %v, want fresh lease after StartedAt %v", got.PendingSince, claimed.StartedAt)
+	}
+	if !got.StartedAt.IsZero() || !got.CreatedAt.Equal(claimed.CreatedAt) {
+		t.Errorf("retry changed immutable/execution times: got=%+v", got)
 	}
 
 	select {
@@ -414,6 +438,7 @@ func TestRetryRollback_CooperativeStaysProcessing(t *testing.T) {
 	task := publishTestTask(t, s, "cooperative retry")
 	s.ClaimTask("agent-1", task.ID)
 	s.ClaimTask("agent-2", task.ID)
+	before, _ := s.GetTask(task.ID)
 
 	// Agent-1 retries, but agent-2 still working
 	s.RetryRollback("agent-1", task.ID, "error")
@@ -421,6 +446,35 @@ func TestRetryRollback_CooperativeStaysProcessing(t *testing.T) {
 	got, _ := s.GetTask(task.ID)
 	if got.Status != model.TaskStatusProcessing {
 		t.Errorf("status = %s, want processing (agent-2 still working)", got.Status)
+	}
+	if !got.PendingSince.IsZero() || !got.StartedAt.Equal(before.StartedAt) {
+		t.Errorf("cooperative retry reset the live lease: before=%+v after=%+v", before, got)
+	}
+}
+
+func TestBlockTaskBySystem_PersistsReasonAndClosesPendingLease(t *testing.T) {
+	s, ch := newTestStore(1, 100)
+	task := publishTestTask(t, s, "unroutable")
+	if err := s.BlockTaskBySystem(task.ID, "no_compatible_route"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetTask(task.ID)
+	if got.Status != model.TaskStatusBlocked || got.Error != "no_compatible_route" {
+		t.Fatalf("blocked task=%+v", got)
+	}
+	if got.CompletedAt.IsZero() || !got.PendingSince.IsZero() || len(got.Agents) != 0 {
+		t.Fatalf("blocked task retained a live lease: %+v", got)
+	}
+	select {
+	case event := <-ch:
+		if event.Type != model.EventTaskBlocked {
+			t.Fatalf("event type=%s, want task_blocked", event.Type)
+		}
+	default:
+		t.Fatal("expected task_blocked event")
+	}
+	if err := s.BlockTaskBySystem(task.ID, "again"); err != ErrTaskNotPending {
+		t.Fatalf("second block error=%v, want ErrTaskNotPending", err)
 	}
 }
 

@@ -118,7 +118,8 @@ func (m *Manager) Spawn(_ context.Context, req SpawnRequest) (string, string, er
 	eventType := "adhoc:" + spawnID
 	instanceID := fmt.Sprintf("%s-adhoc-%s", base.Kind, spawnID[:8])
 
-	rt, err := buildAdhocRuntime(base, m.cfg.LLM, m.cfg.ToolProfiles, req.Override, instanceID, eventType)
+	rt, err := buildAdhocRuntime(base, m.cfg.LLM, m.cfg.ToolProfiles, req.Override, instanceID, eventType,
+		m.cfg.AgentIdleThreshold)
 	if err != nil {
 		return "", "", fmt.Errorf("spawn_agent: build runtime: %w", err)
 	}
@@ -130,23 +131,40 @@ func (m *Manager) Spawn(_ context.Context, req SpawnRequest) (string, string, er
 
 	rn := runner.New(rt, deps)
 
+	batchID := req.BatchID
+	if batchID == "" {
+		batchID = req.SourceTaskID
+	}
+	task := &model.Task{
+		Description:    req.InitialTaskDescription,
+		EventType:      eventType,
+		EventSource:    req.SourceTaskID,
+		ParentTaskID:   req.SourceTaskID,
+		ReplyToAgentID: req.ReplyToAgentID,
+		BatchID:        batchID,
+		Depth:          req.Depth,
+	}
+
+	// F9：closed 检查、initial_task 发布、active spawn 登记、wg.Add 必须在
+	// 同一个临界区内完成。旧实现把"已发布"与"未登记"拆在两次加锁之间，
+	// Shutdown 若落进该窗口，Spawn 返回错误但任务已滞留 store——pending
+	// 状态永远没有 runner 认领（孤儿任务）。合并临界区后：
+	//   - 已关闭 → 直接报错，不发布任何任务；
+	//   - 发布失败 → 不登记、不启动 runner，无半成品状态；
+	//   - 登记成功 → Shutdown 随后必能看到该 spawn 并 cancel 它的 ctx
+	//     （与所有活跃 spawn 相同的正常关停路径，任务由 watchdog/resume 兜底）。
+	// 锁内 PublishTask 只触达 store 自有锁与 trace 异步派发（task_published
+	// 无同步 Reactor 订阅），不存在回调 re-entry 取 m.mu 的路径。
+	// wg.Add 也必须在锁内：Shutdown 在锁外 wg.Wait，若 Add 晚于 Wait 开始
+	// 且计数为 0，属于 WaitGroup 误用。
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		return "", "", fmt.Errorf("spawn_agent: manager is closed")
 	}
-	parentCtx := m.parentCtx
-	m.mu.Unlock()
-
-	ctx, cancel := context.WithCancel(parentCtx)
-
-	// 投递 initial_task
-	task := &model.Task{
-		Description: req.InitialTaskDescription,
-		EventType:   eventType,
-		Depth:       req.Depth,
-	}
+	ctx, cancel := context.WithCancel(m.parentCtx)
 	if err := m.publisher.PublishTask(task); err != nil {
+		m.mu.Unlock()
 		cancel()
 		return "", "", fmt.Errorf("spawn_agent: publish initial task: %w", err)
 	}
@@ -159,20 +177,14 @@ func (m *Manager) Spawn(_ context.Context, req SpawnRequest) (string, string, er
 		instanceID: instanceID,
 		baseKind:   base.Kind,
 	}
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		cancel()
-		return "", "", fmt.Errorf("spawn_agent: manager is closed")
-	}
 	m.spawns[spawnID] = sp
 	m.spawnsByTaskID[task.ID] = sp
 	m.agentKindByID[instanceID] = base.Kind
+	m.wg.Add(1)
 	m.mu.Unlock()
 
 	// 登记 active spawn 后再启动 runner，避免极短任务的终态事件早于 spawnsByTaskID
 	// 写入，从而错过 one_shot 清理。
-	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
 		rn.Run(ctx)
@@ -228,6 +240,7 @@ func (m *Manager) Subscribe() []trace.EventKind {
 	return []trace.EventKind{
 		trace.KindTaskCompleted,
 		trace.KindTaskFailed,
+		trace.KindTaskBlocked,
 		trace.KindTaskCancelled,
 	}
 }

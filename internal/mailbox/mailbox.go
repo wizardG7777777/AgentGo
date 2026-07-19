@@ -2,8 +2,10 @@ package mailbox
 
 import (
 	"agentgo/internal/session"
+	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 )
@@ -62,6 +64,10 @@ const (
 	DefaultInboxSize     = 32
 )
 
+// ErrRecoveredMailboxConflict 表示恢复邮箱无法被指定运行时安全认领。
+// 包括 eventType 不匹配、邮箱已活跃或已被其他 Runner 认领。
+var ErrRecoveredMailboxConflict = errors.New("recovered mailbox conflict")
+
 // Mailbox 单个代理的收件箱，底层为 buffered channel。
 //
 // Phase 2 改动：新增 recent 环形缓冲，用于支持 hook 系统的 peek 语义
@@ -73,6 +79,11 @@ type Mailbox struct {
 	ownerID   string
 	eventType string // 代理的任务类型（"" = worker, "explore" = explorer）
 	ch        chan Message
+
+	// inboxMu 串行化所有超出 channel 单次收发保证的复合操作。
+	// snapshot 和 DropMatching 都会临时排空再回填 channel；
+	// TrySend 与 Drain 共享这把锁，以保证并发时仍保持 FIFO。
+	inboxMu sync.Mutex
 
 	// recent 环形缓冲及其互斥锁。仅供 hook 系统的 peek 使用。
 	recentMu sync.Mutex
@@ -90,6 +101,8 @@ func newMailbox(ownerID, eventType string, bufSize int) *Mailbox {
 
 // Len 返回当前收件箱中未读消息数量（非阻塞窥视）。
 func (mb *Mailbox) Len() int {
+	mb.inboxMu.Lock()
+	defer mb.inboxMu.Unlock()
 	return len(mb.ch)
 }
 
@@ -100,6 +113,9 @@ func (mb *Mailbox) Len() int {
 // 注意：channel 写入失败时不追加 recent —— 这确保 recent 中的消息都是
 // 真实"投递成功"的。
 func (mb *Mailbox) TrySend(msg Message) bool {
+	mb.inboxMu.Lock()
+	defer mb.inboxMu.Unlock()
+
 	select {
 	case mb.ch <- msg:
 		mb.appendRecent(msg)
@@ -171,6 +187,13 @@ func (mb *Mailbox) MaxChainDepth() int {
 
 // Drain 非阻塞取出当前 buffer 中的全部消息。无消息时返回 nil。
 func (mb *Mailbox) Drain() []Message {
+	mb.inboxMu.Lock()
+	defer mb.inboxMu.Unlock()
+	return mb.drainUnreadLocked()
+}
+
+// drainUnreadLocked 按 FIFO 排空未读队列。调用方必须已持有 inboxMu。
+func (mb *Mailbox) drainUnreadLocked() []Message {
 	var msgs []Message
 	for {
 		select {
@@ -182,6 +205,20 @@ func (mb *Mailbox) Drain() []Message {
 	}
 }
 
+// snapshotUnread 非破坏性地返回真实未读队列的 FIFO 副本。
+// 这里故意不读 recent：recent 是观察环，可能包含已被 Drain 消费的邮件。
+func (mb *Mailbox) snapshotUnread() []Message {
+	mb.inboxMu.Lock()
+	defer mb.inboxMu.Unlock()
+
+	msgs := mb.drainUnreadLocked()
+	for _, msg := range msgs {
+		// channel 已在 inboxMu 内排空，回填一定容得下，且保留原 FIFO 顺序。
+		mb.ch <- msg
+	}
+	return msgs
+}
+
 // DropMatching 丢弃所有满足谓词的邮件，并把不满足的按原顺序回填到 channel。
 // 同步更新 recent 环形缓冲（移除被丢弃的条目）。
 // 返回被丢弃的邮件数。pred 为 nil 时返回 0 且不修改邮箱。
@@ -191,15 +228,17 @@ func (mb *Mailbox) Drain() []Message {
 // 清空那些永远不会被消费的邮件（典型如 progress-notify 的 info/low 广播），
 // 避免 mail-notifier 每 tick 反复检测到并打印 abort 日志。
 //
-// 并发性：Drain 和 TrySend 共享 channel，Drain+回填期间若有新 TrySend
-// 进来会排在回填消息之前（channel FIFO 语义在短暂的"空 + 新到 + 回填"序列
-// 下会被打破）。该场景极短（微秒级）且 info 类消息对严格 FIFO 不敏感，
-// 可接受。recent ring 由 recentMu 独立保护。
+// 并发性：整个 Drain+过滤+回填过程由 inboxMu 串行化，并发 TrySend
+// 只能在回填完成后进入，因此保留未匹配邮件的原始 FIFO 顺序。recent ring
+// 由 recentMu 独立保护。
 func (mb *Mailbox) DropMatching(pred func(Message) bool) int {
 	if pred == nil {
 		return 0
 	}
-	msgs := mb.Drain()
+	mb.inboxMu.Lock()
+	defer mb.inboxMu.Unlock()
+
+	msgs := mb.drainUnreadLocked()
 	if len(msgs) == 0 {
 		// 即便 channel 为空，recent 里仍可能留有旧邮件的快照，顺带清理
 		mb.filterRecent(pred)
@@ -212,11 +251,7 @@ func (mb *Mailbox) DropMatching(pred func(Message) bool) int {
 			continue
 		}
 		// 回填：直接走 channel，不再 appendRecent（我们下面会重建 recent）
-		select {
-		case mb.ch <- m:
-		default:
-			log.Printf("[mailbox] DropMatching 回填失败 (owner=%s, from=%s) buffer 已满", mb.ownerID, m.From)
-		}
+		mb.ch <- m
 	}
 	mb.filterRecent(pred)
 	return dropped
@@ -297,12 +332,14 @@ func truncate(s string, maxRunes int) string {
 // 注入。零值（未挂接）时所有 hook 调用被跳过 —— 既有测试以及不需要 hook
 // 的调用方完全不需要修改。
 type Registry struct {
-	mu             sync.RWMutex
-	boxes          map[string]*Mailbox
-	aliases        map[string]string // 别名 → 实际 agentID（如 "scheduler" → "scheduler-a1b2c3d4"）
-	bufSize        int
-	hookRunner     MailboxHookRunner      // nil = 未挂接 hook 系统
-	historyEmitter session.HistoryEmitter // nil = no-op
+	mu                 sync.RWMutex
+	boxes              map[string]*Mailbox
+	aliases            map[string]string // 别名 → 实际 agentID（如 "scheduler" → "scheduler-a1b2c3d4"）
+	recoveredUnclaimed map[string]string // ImportSnapshot 新建且尚未被运行时认领的 agentID → eventType
+	recoveredClaimed   map[string]string // 已认领但仍可在 materialize 失败时回滚的 agentID → eventType
+	bufSize            int
+	hookRunner         MailboxHookRunner      // nil = 未挂接 hook 系统
+	historyEmitter     session.HistoryEmitter // nil = no-op
 }
 
 // NewRegistry 创建邮箱注册表。bufSize 为每个 Mailbox 的 channel 缓冲区大小。
@@ -311,9 +348,11 @@ func NewRegistry(bufSize int) *Registry {
 		bufSize = 32
 	}
 	return &Registry{
-		boxes:   make(map[string]*Mailbox),
-		aliases: make(map[string]string),
-		bufSize: bufSize,
+		boxes:              make(map[string]*Mailbox),
+		aliases:            make(map[string]string),
+		recoveredUnclaimed: make(map[string]string),
+		recoveredClaimed:   make(map[string]string),
+		bufSize:            bufSize,
 	}
 }
 
@@ -362,6 +401,109 @@ func (r *Registry) Register(agentID, eventType string) *Mailbox {
 	return mb
 }
 
+// ClaimRecovered 仅认领由 ImportSnapshot 新建的、尚未 materialize 的邮箱。
+// 返回 (nil, nil) 表示该 ID 根本没有邮箱，调用方可以安全创建新邮箱。
+// 若 ID 已存在却不是可认领状态，或 eventType 不匹配，则返回
+// ErrRecoveredMailboxConflict，调用方必须 fail-closed，不得回退到 Register panic。
+// 成功后标记从 unclaimed 移到 claimed，可用 RollbackRecoveredClaim
+// 回滚；普通 Register 的重名 panic 语义保持不变。
+func (r *Registry) ClaimRecovered(agentID, eventType string) (*Mailbox, error) {
+	if r == nil {
+		return nil, fmt.Errorf("%w: registry is nil", ErrRecoveredMailboxConflict)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	recoveredEventType, recoverable := r.recoveredUnclaimed[agentID]
+	if !recoverable {
+		if _, exists := r.boxes[agentID]; exists {
+			state := "active"
+			if _, claimed := r.recoveredClaimed[agentID]; claimed {
+				state = "already claimed"
+			}
+			return nil, fmt.Errorf("%w: agentID=%s is %s", ErrRecoveredMailboxConflict, agentID, state)
+		}
+		return nil, nil
+	}
+	if recoveredEventType != eventType {
+		return nil, fmt.Errorf("%w: agentID=%s event_type snapshot=%q runtime=%q",
+			ErrRecoveredMailboxConflict, agentID, recoveredEventType, eventType)
+	}
+	mb, exists := r.boxes[agentID]
+	if !exists || mb.eventType != eventType {
+		return nil, fmt.Errorf("%w: agentID=%s recovered mailbox invariant violated",
+			ErrRecoveredMailboxConflict, agentID)
+	}
+	delete(r.recoveredUnclaimed, agentID)
+	r.recoveredClaimed[agentID] = eventType
+	return mb, nil
+}
+
+// ValidateRecoveredClaim 验证交给 Runner 的邮箱确实是本 Registry 中该
+// agent/eventType 当前已认领的同一实例，防止未来调用方把别的邮箱静默接错。
+func (r *Registry) ValidateRecoveredClaim(agentID, eventType string, mb *Mailbox) error {
+	if r == nil || mb == nil {
+		return fmt.Errorf("%w: registry or mailbox is nil", ErrRecoveredMailboxConflict)
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	registered, exists := r.boxes[agentID]
+	claimedEventType, claimed := r.recoveredClaimed[agentID]
+	if !exists || registered != mb || !claimed || claimedEventType != eventType || mb.eventType != eventType {
+		return fmt.Errorf("%w: agentID=%s claimed mailbox handoff mismatch", ErrRecoveredMailboxConflict, agentID)
+	}
+	return nil
+}
+
+// RollbackRecoveredClaim 将 materialize 失败的认领退回 unclaimed。
+// 它不删除邮箱、不读写 channel，因此未读消息与 FIFO 顺序原样保留。
+func (r *Registry) RollbackRecoveredClaim(agentID, eventType string) error {
+	if r == nil {
+		return fmt.Errorf("%w: registry is nil", ErrRecoveredMailboxConflict)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	claimedEventType, claimed := r.recoveredClaimed[agentID]
+	if !claimed || claimedEventType != eventType {
+		return fmt.Errorf("%w: agentID=%s has no matching claimed mailbox", ErrRecoveredMailboxConflict, agentID)
+	}
+	mb, exists := r.boxes[agentID]
+	if !exists || mb.eventType != eventType {
+		return fmt.Errorf("%w: agentID=%s claimed mailbox invariant violated", ErrRecoveredMailboxConflict, agentID)
+	}
+	delete(r.recoveredClaimed, agentID)
+	r.recoveredUnclaimed[agentID] = eventType
+	return nil
+}
+
+// DiscardUnclaimedRecovered 删除所有仍未被运行时认领的恢复邮箱，
+// 返回删除数量。已认领 Team 邮箱和普通 Register 活跃邮箱不受影响。
+// Bootstrap 应在 TeamManager.Start 成功后、MailNotifier 启动前调用，
+// 以清理 terminal/stopped/未知 Team 遗留的 orphan 邮箱。
+func (r *Registry) DiscardUnclaimedRecovered() int {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	discarded := 0
+	for agentID := range r.recoveredUnclaimed {
+		if _, exists := r.boxes[agentID]; exists {
+			delete(r.boxes, agentID)
+			discarded++
+		}
+		delete(r.recoveredUnclaimed, agentID)
+		for alias, target := range r.aliases {
+			if target == agentID {
+				delete(r.aliases, alias)
+			}
+		}
+	}
+	return discarded
+}
+
 // Unregister removes a runtime agent mailbox and any aliases that point to it.
 // It is intended for Plan-scoped dynamic Team teardown. Static agents normally
 // remain registered until process shutdown.
@@ -375,6 +517,8 @@ func (r *Registry) Unregister(agentID string) bool {
 		return false
 	}
 	delete(r.boxes, agentID)
+	delete(r.recoveredUnclaimed, agentID)
+	delete(r.recoveredClaimed, agentID)
 	for alias, target := range r.aliases {
 		if target == agentID {
 			delete(r.aliases, alias)
@@ -555,6 +699,36 @@ func (r *Registry) AllIDs() []string {
 	return ids
 }
 
+// ResolveReplyRecipient returns the first currently routable mailbox for a
+// Task reply. replyToAgentID is the explicit, authoritative route. The legacy
+// EventSource is consulted only as a compatibility fallback, and only when it
+// names a real mailbox (or registered alias). forbiddenIDs should contain the
+// current and parent Task IDs so neither can ever become a mail recipient.
+func (r *Registry) ResolveReplyRecipient(replyToAgentID, legacyEventSource string, forbiddenIDs ...string) string {
+	if r == nil {
+		return ""
+	}
+	forbidden := func(candidate string) bool {
+		for _, id := range forbiddenIDs {
+			if candidate != "" && candidate == id {
+				return true
+			}
+		}
+		return false
+	}
+	if replyToAgentID != "" && replyToAgentID != "user" && !forbidden(replyToAgentID) {
+		if _, ok := r.lookup(replyToAgentID); ok {
+			return replyToAgentID
+		}
+	}
+	if legacyEventSource != "" && legacyEventSource != "user" && !forbidden(legacyEventSource) {
+		if _, ok := r.lookup(legacyEventSource); ok {
+			return legacyEventSource
+		}
+	}
+	return ""
+}
+
 // lookup 查找 agentID 对应的 Mailbox，支持别名解析。
 func (r *Registry) lookup(id string) (*Mailbox, bool) {
 	r.mu.RLock()
@@ -567,20 +741,22 @@ func (r *Registry) lookup(id string) (*Mailbox, bool) {
 	return mb, ok
 }
 
-// ExportSnapshot 导出所有已注册邮箱的快照（包括 recent 缓冲中的消息）。
-// 使用 Snapshot() 方法读取 recent 缓冲，不消费 channel 中的消息。
+// ExportSnapshot 导出所有已注册邮箱的快照。Messages 只包含 channel 中
+// 尚未 Drain 的真实未读邮件；recent 是观察环，包含已读历史，不属于可恢复状态。
+// 为保持既有序列化约定，Messages 仍按“最新在前”存储；ImportSnapshot
+// 反转后按 FIFO 恢复。
 func (r *Registry) ExportSnapshot() []session.MailboxSnapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	snaps := make([]session.MailboxSnapshot, 0, len(r.boxes))
 	for id, mb := range r.boxes {
-		// 使用 Snapshot 读取 recent 缓冲中的消息（不消费 channel）
-		recentMsgs := mb.Snapshot(recentBufferSize)
+		unreadMsgs := mb.snapshotUnread()
 
-		msgSnaps := make([]session.MessageSnapshot, len(recentMsgs))
-		for i, msg := range recentMsgs {
-			msgSnaps[i] = session.MessageSnapshot{
+		msgSnaps := make([]session.MessageSnapshot, len(unreadMsgs))
+		for i, msg := range unreadMsgs {
+			// unreadMsgs 最旧在前；持久化 schema 约定最新在前。
+			msgSnaps[len(unreadMsgs)-1-i] = session.MessageSnapshot{
 				From:       msg.From,
 				To:         msg.To,
 				Content:    msg.Content,
@@ -600,37 +776,99 @@ func (r *Registry) ExportSnapshot() []session.MailboxSnapshot {
 	return snaps
 }
 
-// ImportSnapshot 从 MailboxSnapshot 列表恢复邮箱状态。
-// 对于每个快照，如果邮箱尚未注册则注册之，然后将消息发送到邮箱。
-func (r *Registry) ImportSnapshot(snaps []session.MailboxSnapshot) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+type mailboxSnapshotImport struct {
+	ownerID   string
+	eventType string
+	messages  []Message // 最旧在前
+}
 
+// prepareSnapshotImport 在不修改 Registry 的前提下完成全量解析。
+// 任意一条 sent_at 非法时，ImportSnapshot 因此不会留下半恢复邮箱。
+func prepareSnapshotImport(snaps []session.MailboxSnapshot) ([]mailboxSnapshotImport, error) {
+	prepared := make([]mailboxSnapshotImport, 0, len(snaps))
+	seen := make(map[string]struct{}, len(snaps))
 	for _, snap := range snaps {
-		mb, exists := r.boxes[snap.OwnerID]
-		if !exists {
-			mb = newMailbox(snap.OwnerID, snap.EventType, r.bufSize)
-			r.boxes[snap.OwnerID] = mb
+		if _, duplicate := seen[snap.OwnerID]; duplicate {
+			return nil, fmt.Errorf("duplicate mailbox snapshot owner_id=%s", snap.OwnerID)
 		}
+		seen[snap.OwnerID] = struct{}{}
 
-		// 按原始顺序恢复消息（snapshot 中最新的在前，需要反转）
+		messages := make([]Message, len(snap.Messages))
+		// 快照最新在前；内存未读队列按 FIFO（最旧在前）恢复。
 		for i := len(snap.Messages) - 1; i >= 0; i-- {
 			ms := snap.Messages[i]
 			sentAt, err := time.Parse(time.RFC3339, ms.SentAt)
 			if err != nil {
-				return fmt.Errorf("parse sent_at for mailbox %s: %w", snap.OwnerID, err)
+				return nil, fmt.Errorf("parse sent_at for mailbox %s: %w", snap.OwnerID, err)
 			}
-			msg := Message{
-				From:       ms.From,
-				To:         ms.To,
-				Content:    ms.Content,
-				Summary:    ms.Summary,
-				Type:       ms.Type,
-				Priority:   ms.Priority,
-				SentAt:     sentAt,
-				ChainDepth: ms.ChainDepth,
+			messages[len(snap.Messages)-1-i] = Message{
+				From: ms.From, To: ms.To, Content: ms.Content, Summary: ms.Summary,
+				Type: ms.Type, Priority: ms.Priority, SentAt: sentAt, ChainDepth: ms.ChainDepth,
 			}
-			mb.TrySend(msg)
+		}
+		prepared = append(prepared, mailboxSnapshotImport{
+			ownerID: snap.OwnerID, eventType: snap.EventType, messages: messages,
+		})
+	}
+	// 同时导入多个已存在邮箱时按稳定顺序取 inboxMu，避免并发 Import 锁序反转。
+	sort.Slice(prepared, func(i, j int) bool { return prepared[i].ownerID < prepared[j].ownerID })
+	return prepared, nil
+}
+
+// ImportSnapshot 从 MailboxSnapshot 列表原子恢复邮箱状态。
+// 已存在邮箱会追加未读邮件，但不会被标记为可认领；仅由本次导入新建的
+// 邮箱会进入 recovered-unclaimed 集合，供动态 Team Runner 恢复时认领一次。
+func (r *Registry) ImportSnapshot(snaps []session.MailboxSnapshot) error {
+	prepared, err := prepareSnapshotImport(snaps)
+	if err != nil {
+		return err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// 对已存在邮箱同时持锁，先验证全部容量与 eventType，
+	// 再一次性提交，保证不会出现部分邮箱已导入、部分失败的状态。
+	locked := make([]*Mailbox, 0, len(prepared))
+	for _, item := range prepared {
+		if mb, exists := r.boxes[item.ownerID]; exists {
+			mb.inboxMu.Lock()
+			locked = append(locked, mb)
+		}
+	}
+	defer func() {
+		for i := len(locked) - 1; i >= 0; i-- {
+			locked[i].inboxMu.Unlock()
+		}
+	}()
+
+	for _, item := range prepared {
+		if mb, exists := r.boxes[item.ownerID]; exists {
+			if mb.eventType != item.eventType {
+				return fmt.Errorf("mailbox %s event_type mismatch: active=%q snapshot=%q", item.ownerID, mb.eventType, item.eventType)
+			}
+			if len(mb.ch)+len(item.messages) > cap(mb.ch) {
+				return fmt.Errorf("mailbox %s snapshot exceeds unread capacity: current=%d import=%d capacity=%d",
+					item.ownerID, len(mb.ch), len(item.messages), cap(mb.ch))
+			}
+			continue
+		}
+		if len(item.messages) > r.bufSize {
+			return fmt.Errorf("mailbox %s snapshot exceeds unread capacity: import=%d capacity=%d",
+				item.ownerID, len(item.messages), r.bufSize)
+		}
+	}
+
+	for _, item := range prepared {
+		mb, exists := r.boxes[item.ownerID]
+		if !exists {
+			mb = newMailbox(item.ownerID, item.eventType, r.bufSize)
+			r.boxes[item.ownerID] = mb
+			r.recoveredUnclaimed[item.ownerID] = item.eventType
+		}
+		for _, msg := range item.messages {
+			mb.ch <- msg
+			mb.appendRecent(msg)
 		}
 	}
 	return nil

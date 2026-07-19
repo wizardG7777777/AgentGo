@@ -18,6 +18,10 @@ import (
 //
 // 与 trace.EventKind 常量同步——新增 EventKind 时需同步加入此集合（v5 阶段事件清单稳定，
 // Phase 5 内部不会再扩；v5.x 加新事件时此处也需更新）。
+//
+// 准入标准：事件必须有真实发射点才允许用户订阅，否则 YAML 通过了校验却永远
+// 不会触发（D4 白名单倒挂教训）。shell_timeout_pending/resolved 预留给未来的
+// 内置 TimeoutHandler（类型尚未实现，见 reservedEventKinds），暂不开放订阅。
 var knownEventKinds = map[trace.EventKind]struct{}{
 	trace.KindTaskPublished:             {},
 	trace.KindTaskClaimed:               {},
@@ -26,6 +30,7 @@ var knownEventKinds = map[trace.EventKind]struct{}{
 	trace.KindTextOnlySubmission:        {},
 	trace.KindTaskRetry:                 {},
 	trace.KindTaskFailed:                {},
+	trace.KindTaskBlocked:               {},
 	trace.KindTaskCancelled:             {},
 	trace.KindLLMCallStart:              {},
 	trace.KindLLMCallEnd:                {},
@@ -40,12 +45,23 @@ var knownEventKinds = map[trace.EventKind]struct{}{
 	trace.KindError:                     {},
 	trace.KindAgentStateChanged:         {},
 	trace.KindShellExecuted:             {},
-	trace.KindShellTimeoutPending:       {},
-	trace.KindShellTimeoutResolved:      {},
 	trace.KindReactorSpawnDepthExceeded: {},
+	trace.KindReplanRequested:           {},
+	trace.KindReplanCoalesced:           {},
+	trace.KindReplanDecided:             {},
+	trace.KindPlanRevisionChanged:       {},
 	trace.KindAcceptanceCompleted:       {},
 	trace.KindPlanPaused:                {},
 	trace.KindPlanTerminal:              {},
+}
+
+// reservedEventKinds 是"schema 与 CLI 渲染保留、但暂无发射点"的 EventKind。
+// 用户 reactor 订阅它们会得到比 unknown kind 更明确的报错。
+// shell_timeout_pending/resolved 预留给未来的内置 shell TimeoutHandler
+// （ToolUpgradePlan.md §2.8.5；该类型当前不存在，禁止用户订阅一个永不触发的事件）。
+var reservedEventKinds = map[trace.EventKind]struct{}{
+	trace.KindShellTimeoutPending:  {},
+	trace.KindShellTimeoutResolved: {},
 }
 
 // Deps 聚合 loader 需要的全部外部依赖。
@@ -129,6 +145,9 @@ func buildReactor(rc ReactorConfig, idx int, descBaseDir, projectRoot string, de
 	}
 	kind := trace.EventKind(rc.On)
 	if _, ok := knownEventKinds[kind]; !ok {
+		if _, reserved := reservedEventKinds[kind]; reserved {
+			return nil, fmt.Errorf("event kind %q is reserved for a future built-in shell TimeoutHandler and has no emitter yet; user reactors cannot subscribe to it", rc.On)
+		}
 		return nil, fmt.Errorf("unknown event kind %q in 'on'", rc.On)
 	}
 

@@ -12,6 +12,10 @@ import (
 // RunArchive scans closed sessions past retention days, moves them to archive/,
 // then enforces the archive count limit by deleting the oldest archives.
 //
+// The currently-active session is never archived, regardless of its on-disk
+// metadata: besides being semantically wrong, renaming a directory with open
+// handles (history.jsonl / logs) always fails on Windows.
+//
 // Failures are logged as warnings and skipped — archive errors never break the system.
 func (sm *SessionManager) RunArchive() error {
 	sm.mu.Lock()
@@ -30,6 +34,13 @@ func (sm *SessionManager) RunArchive() error {
 
 	for _, metaPath := range matches {
 		sessDir := filepath.Dir(metaPath)
+
+		// 当前活跃 Session 显式跳过。正常情况下其 metadata 为 active（下面的
+		// 状态检查也会拦住），此处是防御：即使磁盘 metadata 异常变成 closed，
+		// 也绝不能 rename 持有打开句柄的目录（Windows 上必然失败）。
+		if sm.current != nil && sessDir == sm.current.Dir {
+			continue
+		}
 
 		meta, err := LoadMetadata(metaPath)
 		if err != nil {

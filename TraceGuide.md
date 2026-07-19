@@ -1,9 +1,9 @@
 # TraceGuide：Trace 系统使用说明书（Agent 排错分析指南）
 
-> **状态**：📋 定稿（2026-05-18）
+> **状态**：📋 当前实现说明（2026-07-18）
 > **面向读者**：AI Agent（进行排错分析时参考本文档）及人类开发者
 > **关联文档**：
-> - [TraceUpgrade.md](docs/activate/TraceUpgrade.md) — v5 升级规范（字段/EventKind 的设计决策）
+> - [TraceUpgrade.md](docs/archived/trace-upgrade-design-2026-05.md) — v5 升级规范（字段/EventKind 的设计决策）
 > - [ReactiveSystem.md](docs/activate/ReactiveSystem.md) — Reactor 系统与 trace 事件的对接关系
 > - [agent_termination_paths.md](docs/agent_termination_paths.md) — Agent 终止路径与对应的 trace 事件
 
@@ -11,10 +11,10 @@
 
 ## 0. 这是什么？
 
-Trace 是 AgentGo 的 **任务级 JSONL 事件追踪系统**，专为故障排查设计。每个任务在运行期间会产生一份完整的 JSONL 文件，记录了从任务发布到完成的全部关键事件。事后可以通过 CLI 工具快速复盘任务的完整生命周期。
+Trace 是 AgentGo 的 **任务级 JSONL 事件追踪系统**，专为故障排查设计。任务在运行期间会产生 JSONL 事件；重试会关闭并重新打开 writer，因此同一 Task 的时间线可能分散在多个物理文件中。CLI 按事件里的完整 `task_id` 重新聚合这些分片；此外还能按 `PlanID` 聚合动态 DAG 中分散在 controller、runner 和 acceptance Task 里的事件。
 
 **核心设计原则**：
-- **每个任务一份独立 JSONL 文件**，按发布时间命名（如 `2026-04-08T04-17-06_321b561d.jsonl`）
+- **物理文件按打开时间命名**（如 `2026-04-08T04-17-06_321b561d.jsonl`）；任务重试可能产生多个分片，极短 ID 碰撞也可能让一个文件含多个 Task，CLI 以完整 `task_id` 为逻辑聚合键
 - **写入失败永不中断主流程**——失败只打印 stderr WARNING，trace 是"尽力记录"语义
 - **零级别过滤**——所有事件全量写入，排查时拥有完整信息
 - **零第三方依赖**——仅使用 Go 标准库
@@ -27,16 +27,16 @@ Trace 是 AgentGo 的 **任务级 JSONL 事件追踪系统**，专为故障排�
 
 Trace 文件存放在 Session 的 `logs/` 子目录下，如果没有活跃 Session 则回退到 `.agentgo/traces/`。
 
-Agent 可以通过以下命令找到 trace 目录：
+CLI 会自动解析真实目录。需要直接分析 JSONL 时，可在 Bash/WSL 中先设置 `TRACE_DIR`：
 ```bash
-# 如果有活跃 session，trace 在 session 的 logs/ 下
-ls .agentgo/sessions/*/logs/*.jsonl
+SESSION_ID=$(cat .agentgo/sessions/active-session 2>/dev/null || true)
+TRACE_DIR=".agentgo/sessions/sess-${SESSION_ID}/logs"
+[ -n "$SESSION_ID" ] && [ -d "$TRACE_DIR" ] || TRACE_DIR=".agentgo/traces"
 
-# 否则在项目根目录
-ls .agentgo/traces/*.jsonl
+ls "$TRACE_DIR"/*.jsonl
 ```
 
-### 1.2 两个核心命令
+### 1.2 三个核心命令
 
 ```bash
 # 列出最近所有任务（表格形式，按发布时间倒序）
@@ -44,19 +44,23 @@ agentgo trace list
 
 # 查看某个任务的完整事件时间线（按时间顺序 + 异常检测）
 agentgo trace show <task_id>
+
+# 聚合同一个动态 DAG Plan 的跨任务时间线
+agentgo trace plan <plan_id>
 ```
 
-`task_id` 可以是完整 UUID 或前 8 位短 ID：
+`task_id` 可以是完整 UUID 或任意唯一前缀；发生前缀碰撞时 CLI 会列出完整候选：
 ```bash
 agentgo trace show 321b561d
 agentgo trace show 321b561d-c564-422c-bfa0-b96f54edcb87
+agentgo trace plan 321b561d
 ```
 
 ### 1.3 实时监控
 
 ```bash
 # 实时 tail 最新任务的 trace 文件
-tail -f .agentgo/traces/$(ls -t .agentgo/traces | grep -v prompts | head -1) | jq
+tail -f "$TRACE_DIR/$(ls -t "$TRACE_DIR" | grep -v prompts | head -1)" | jq
 ```
 
 ### 1.4 原始 JSONL 分析
@@ -64,16 +68,16 @@ tail -f .agentgo/traces/$(ls -t .agentgo/traces | grep -v prompts | head -1) | j
 当 CLI 不够用时，可以直接操作 JSONL 文件：
 ```bash
 # 按事件类型过滤
-grep '"kind":"error"' .agentgo/traces/<file>.jsonl | jq .
+grep '"kind":"error"' "$TRACE_DIR/<file>.jsonl" | jq .
 
 # 统计各类事件数量
-grep -oP '"kind":"[^"]+"' .agentgo/traces/<file>.jsonl | sort | uniq -c | sort -rn
+grep -oP '"kind":"[^"]+"' "$TRACE_DIR/<file>.jsonl" | sort | uniq -c | sort -rn
 
 # 查看所有 LLM 调用的耗时和 token 消耗
-grep '"kind":"llm_call_end"' .agentgo/traces/<file>.jsonl | jq '{loop, duration_ms, prompt_tokens, completion_tokens}'
+grep '"kind":"llm_call_end"' "$TRACE_DIR/<file>.jsonl" | jq '{loop, duration_ms, prompt_tokens, completion_tokens}'
 
 # 查看所有工具调用的错误
-grep '"kind":"tool_result"' .agentgo/traces/<file>.jsonl | jq 'select(.error != null) | {tool, error, duration_ms}'
+grep '"kind":"tool_result"' "$TRACE_DIR/<file>.jsonl" | jq 'select(.error != null) | {tool, error, duration_ms}'
 ```
 
 ---
@@ -86,7 +90,7 @@ grep '"kind":"tool_result"' .agentgo/traces/<file>.jsonl | jq 'select(.error != 
 
 ```
 ts          — 时间戳（ISO 8601）
-kind        — 事件类型（EventKind，22 种之一）
+kind        — 事件类型（31 个内置系统 EventKind 之一；另允许 user.* 自定义事件）
 task_id     — 任务 ID（UUID）
 
 通用字段：
@@ -106,12 +110,16 @@ Token 累计字段（token_stats 专用）：total_prompt_tokens, total_completi
 
 文件操作字段：path, bytes, hash
 
+文件排队/通知字段：queue_len, wait_ms, notify_type
+
 历史压缩字段：prompt_tokens_before, prompt_tokens_after, strategy, kept_entries
 
 v5 子结构体（指针，nil 时不输出）：
   transition    — 状态转移信息（Transition struct）
   shell_exec    — Shell 执行结果（ShellExec struct）
   shell_timeout — Shell 超时信息（ShellTimeout struct）
+  plan          — 动态 DAG 的 Plan 身份与版本（PlanTraceContext）
+  acceptance    — 正式验收结果身份（AcceptanceTraceContext）
 ```
 
 ### 2.2 Transition 子结构体
@@ -152,18 +160,45 @@ stdout_excerpt: stdout 摘要
 stderr_excerpt: stderr 摘要
 ```
 
-### 2.5 全部 EventKind（22 种）
+### 2.5 PlanTraceContext 子结构体
 
-#### 任务生命周期（10 种）
+```yaml
+plan_id:                     跨 revision 稳定的 Plan 身份
+plan_revision:               当前 DAG 结构版本
+execution_state_version:     Task/预算/重规划等执行事实版本
+acceptance_spec_revision:    当前正式验收规范版本
+graph_digest:                当前有效图的确定性 SHA-256 摘要
+```
+
+### 2.6 AcceptanceTraceContext 子结构体
+
+```yaml
+acceptance_run_id:    正式验收 Run ID
+result_id:            验收结果 ID
+spec_id:              验收规范 ID
+spec_revision:        验收规范版本
+target_revision:      被验收的 Plan revision
+target_graph_digest:  被验收的图摘要
+runner_task_id:       执行验收的 Task ID
+runner_kind:          验收 Agent kind（可选）
+verdict:              pass / fail / blocked / disputed / stale
+status:               valid / stale
+reason:               人类可读结果说明
+```
+
+### 2.7 内置 EventKind
+
+#### 任务生命周期
 
 | Kind | 含义 | 关键字段 |
 |---|---|---|
-| `task_published` | 任务发布到调度队列 | `published_by`, `description`, `dependencies`, `event_type`, `priority`, `depth` |
+| `task_published` | 任务发布到调度队列 | `published_by`, `parent_task_id`, `batch_id`, `description`, `dependencies`, `event_type`, `priority`, `depth` |
 | `task_claimed` | Agent 认领任务 | `agent_id`, `transition` (prev="pending", new="processing") |
 | `task_submitted` | 任务提交结果 | `output_len`, `loops_used` |
 | `task_completed` | 任务被标记为完成 | `transition` (prev="processing", new="completed"), `cause` |
 | `task_retry` | 任务触发重试 | `transition` (prev/new, `cause`, `retry_count`), `attempt_no`, `reason` |
 | `task_failed` | 任务失败终态 | `transition` (prev/new, `cause`, `retry_count`), `reason` |
+| `task_blocked` | 系统阻断终态（例如持续无兼容 route） | `transition` (prev="pending", new="blocked", cause="system_blocked"), `reason` |
 | `task_cancelled` | 外部取消任务 | `transition` (prev/new, `cancel_source`), `reason` |
 | `text_only_submission` | 纯文字交付（无文件落盘） | `output_len`, `loops_used` |
 | `reactor_spawn_depth_exceeded` | Reactor spawn 深度超限 | `depth`, `reason` |
@@ -191,7 +226,7 @@ stderr_excerpt: stderr 摘要
 | Kind | 含义 | 关键字段 |
 |---|---|---|
 | `file_written` | 文件落盘成功 | `path`, `bytes`, `hash` |
-| `file_write_queued` | 文件写入排队 | `path`, `queue_len`, `wait_ms` |
+| `file_write_queued` | 文件写入排队 | `path`, `description`, `wait_ms`；`queue_len` 为兼容预留字段，当前发射点不填充 |
 
 #### Agent 状态与 Shell（4 种，v5 Phase 2 新增）
 
@@ -201,6 +236,18 @@ stderr_excerpt: stderr 摘要
 | `shell_executed` | Shell 命令执行完毕 | `shell_exec` (command, exit_code, duration_ms, outcome) |
 | `shell_timeout_pending` | Shell 超时——待决策 | `shell_timeout` (decision 为空) |
 | `shell_timeout_resolved` | Shell 超时——已决策 | `shell_timeout` (decision 非空) |
+
+#### 动态 DAG 控制面（7 种）
+
+| Kind | 含义 | 关键字段 |
+|---|---|---|
+| `replan_requested` | Task/Reactor 请求重新规划 | `reason`, `plan` |
+| `replan_coalesced` | 多个 pending 请求聚合为一次唤醒 | `reason`, `plan` |
+| `replan_decided` | Scheduler 确认本轮重规划决策 | `reason`, `plan` |
+| `acceptance_completed` | 正式验收结果已经持久化 | `plan`, `acceptance` |
+| `plan_revision_changed` | DAG 当前图发生语义变更 | `reason`, `plan` |
+| `plan_paused` | Plan 因预算、无进展或外部条件暂停 | `reason`, `plan` |
+| `plan_terminal` | Plan 终态已经持久化 | `reason`, `plan` |
 
 #### 通用（1 种）
 
@@ -215,13 +262,13 @@ stderr_excerpt: stderr 摘要
 ### 3.1 `agentgo trace list` 输出
 
 ```
-┌──────────┬─────────────────────┬──────────┬────────────┬───────┬───────────┬─────────────┐
-│ Task     │ Published           │ Agent    │ Status     │ Loops │ Files Out │ Duration    │
-├──────────┼─────────────────────┼──────────┼────────────┼───────┼───────────┼─────────────┤
-│ 321b561d │ 2026-04-08 12:17:06 │ worker-1 │ completed  │    12 │         3 │ 8m30s       │
-│ a1b2c3d4 │ 2026-04-08 12:15:00 │ worker-2 │ error      │     5 │         0 │ 2m15s       │
-│ e5f6g7h8 │ 2026-04-08 12:10:00 │ explorer │ pending    │     0 │         0 │ -           │
-└──────────┴─────────────────────┴──────────┴────────────┴───────┴───────────┴─────────────┘
+┌───────────────┬──────────┬─────────────────────┬──────────┬────────────┬───────┬───────────┬────────┬─────────────┐
+│ Task          │ Plan     │ Published           │ Agent    │ Status     │ Loops │ Files Out │ Errors │ Duration    │
+├───────────────┼──────────┼─────────────────────┼──────────┼────────────┼───────┼───────────┼────────┼─────────────┤
+│ 321b561d      │ 321b561d │ 2026-07-18 12:17:06 │ worker-1 │ completed  │    12 │         3 │      0 │ 8m30s       │
+│ a1b2c3d4      │ 321b561d │ 2026-07-18 12:15:00 │ worker-2 │ failed     │     5 │         0 │      1 │ 2m15s       │
+│ file-9a12bc34 │ -        │ 2026-07-18 12:10:00 │          │ malformed  │     0 │         0 │      1 │ -           │
+└───────────────┴──────────┴─────────────────────┴──────────┴────────────┴───────┴───────────┴────────┴─────────────┘
 ```
 
 **Status 列取值与含义**：
@@ -229,36 +276,48 @@ stderr_excerpt: stderr 摘要
 | Status | 含义 |
 |---|---|
 | `pending` | 任务已发布但尚未被认领（只有 `task_published` 事件） |
-| `running` | 任务已被认领，正在处理中（有 `task_claimed` 但没有 `task_completed`） |
+| `processing` | 任务当前已被认领，正在处理中 |
+| `pending(retry)` | 任务已经回滚为待重试，尚未被再次认领 |
 | `completed` | 任务已完成（有 `task_completed` 事件） |
-| `error` | 任务中有 `error` 事件但未 `completed`（可能正在运行但遇到了非致命错误） |
-| `unknown` | 无法确定状态（trace 文件为空或损坏） |
+| `failed` | 任务进入失败终态 |
+| `blocked` | 任务进入系统阻断终态 |
+| `cancelled` | 任务进入取消终态 |
+| `malformed` | 文件中存在无法解析的 JSON 行，且尚无可信终态 |
+| `unknown` | 无法从现有生命周期事件确定状态 |
 | `read_err` | 读取 trace 文件失败 |
 
+`KindError` 是非终态诊断事件，不会再把生命周期状态覆盖成 `error`；`Errors` 列单独统计这类事件、坏 JSON 行与无法完整读取/归属的 timeline issue。`Loops` 统计合并时间线里 `loop >= 0` 的实际 `llm_call_start` 数量，因此跨 retry 分片即使 `loop` 重新从 0 开始也不会少算；旧 trace 没有 start 事件时才回退到最大的 `loops_used`。
+
+若一个物理文件完全没有任何可解析的 `task_id`，CLI 会把它保留为独立 synthetic file group；`Task` 列显示 `file-xxxxxxxx` 命名空间中的稳定诊断 ID，可直接传给 `trace show`。CLI 会保证当前语料内 synthetic ID 唯一，也不会仅凭文件名短 ID 与其他文件合并；若它仍与异常格式的真实 Task 前缀重合，则按普通歧义列出候选，不会静默选错。
+
 **排错时关注点**：
-- `status=running` 且 `duration` 很大 → 任务可能卡住了，用 `trace show` 深入分析
-- `status=error` → 有非致命错误发生，需要检查具体原因
-- `Files Out=0` 且 `status=completed` → 可能是 report-only 模式，检查是否应该产出文件
+- `status=processing` 且 `duration` 很大 → 任务可能卡住了，用 `trace show` 深入分析
+- `Errors>0` → 有非致命诊断事件或损坏行，需要检查具体原因
+- `Files Out=0` 且 `status=completed` → 若存在 `text_only_submission`，这是正常的纯文字交付；否则检查任务是否本应产出文件
 
 ### 3.2 `agentgo trace show <task_id>` 输出
 
 ```
 ════════════════════════════════════════════════════════════════════════════════
- Task: 321b561d
- File: 2026-04-08T04-17-06_321b561d.jsonl
+ Task: 321b561d-c564-422c-bfa0-b96f54edcb87
+ Trace Files: 2
  Events: 87
+ Plan: 321b561d-c564-422c-bfa0-b96f54edcb87  revision=3  state_version=8  acceptance_revision=1
+ Graph Digest: 6f6d5c...
 ════════════════════════════════════════════════════════════════════════════════
-12:17:06.001 [task_published]          by=scheduler deps=[] type=code_edit desc="修复 integration_test.go"
-12:17:06.050 [task_claimed]            agent=worker-1 prev=pending new=processing
-12:17:06.100 [agent_state_changed]     agent=worker-1 prev=idle new=processing cause=task_claimed:321b561d
-12:17:07.200 [llm_call_start]          agent=worker-1 loop=1 history_entries=3 tools=5
-12:17:12.500 [tool_call]               agent=worker-1 loop=1 tool=read_file
-                                        tool=read_file args={"path":"integration_test.go"}
-12:17:12.600 [tool_result]             agent=worker-1 loop=1 tool=read_file duration=100ms result_len=2048
+[12:17:06.001] task_published
+             by=scheduler deps=[] type=code_edit priority=high depth=0 desc="修复 integration_test.go"
+[12:17:06.050] task_claimed agent=worker-1
+             prev=pending new=processing cause=task_claimed:321b561d
+[12:17:07.200] llm_call_start agent=worker-1 loop=0
+             history_entries=3 tools=5
+[12:17:12.500] tool_call agent=worker-1 loop=0
+             tool=read_file call_id=call-1 args={"path":"integration_test.go"}
 ...
-12:25:36.000 [task_completed]          agent=worker-1 prev=processing new=completed cause=finalization_short_circuit
+[12:25:36.000] plan_terminal
+             reason="pass" plan=321b561d... plan_revision=3 state_version=8 acceptance_revision=1 graph_digest=6f6d5c...
 ────────────────────────────────────────────────────────────────────────────────
- status=completed  agent=worker-1  loops=12  files_written=3  duration=8m30s
+ status=completed  agent=worker-1  loops=12  files_written=3  errors=0  duration=8m30s
 
  WARNING 异常检测:
    - WARNING 工具调用错误率 33% (3/9) — 工具集或路径校验可能有问题
@@ -267,6 +326,34 @@ stderr_excerpt: stderr 摘要
 
 **时间间隔警告**：
 如果相邻事件的间隔超过 30 秒，CLI 会在事件行前打印 `WARNING` 提示。这能帮助快速定位"Agent 长时间没有进展"的时间段。
+
+`show` 接受完整 Task UUID 或任意可唯一消歧的前缀。它先按每条事件的完整 `task_id` 拆分可能发生短 ID 碰撞的物理文件，再合并同一 Task 的全部 retry 分片。`Trace Files` 是该逻辑 Task 涉及的物理文件数；与 list 中统计产出事件的 `Files Out` 不是同一概念。
+
+如果某个相关文件存在坏 JSON、部分读取失败，或多 Task 文件中有无法安全归属的空 `task_id` 事件，header 后会显示 `WARNING: timeline incomplete`。可归属的 `<parse_error>` 仍会留在时间线中，其他 Task 或 Plan 不会被无关坏文件阻断。
+
+### 3.3 `agentgo trace plan <plan_id>` 输出
+
+该命令先扫描 `plan.plan_id` 建立 Plan 成员 Task，再纳入每个逻辑 Task 的**全部物理分片和全部事件**，最后按时间戳、文件名、行序稳定排序。后续 retry 分片即使尚未再次携带 `Plan` payload，也会因完整 TaskID 的成员关系被纳入。Header 对三个单调版本字段分别取最高已观测值，Graph Digest 只与最高 Plan Revision 关联，避免 partial 或乱序 context 让版本回退。这样既能看到图版本/重规划/验收事件，也不会漏掉各节点的 LLM、工具和生命周期事件。
+
+```
+════════════════════════════════════════════════════════════════════════════════
+ Plan: 321b561d-c564-422c-bfa0-b96f54edcb87
+ Tasks: 4
+ Trace Files: 6
+ Events: 126
+ Revision: 3  State Version: 8  Acceptance Revision: 1
+ Graph Digest: 6f6d5c...
+ Latest Acceptance: status=valid verdict=pass run=run-1 result=result-1
+════════════════════════════════════════════════════════════════════════════════
+[12:17:06.001] task=321b561d-c564-422c-bfa0-b96f54edcb87 task_published
+[12:18:10.100] task=a1b2c3d4-1111-2222-3333-444444444444 plan_revision_changed
+             reason="publish implementation" plan=321b561d-c564-422c-bfa0-b96f54edcb87 plan_revision=2 ...
+[12:25:36.000] task=e5f60718-5555-6666-7777-888888888888 acceptance_completed
+             plan=321b561d-c564-422c-bfa0-b96f54edcb87 acceptance_run=run-1 result=result-1 verdict=pass status=valid ...
+════════════════════════════════════════════════════════════════════════════════
+```
+
+`Tasks` 统计不同的完整 TaskID，`Trace Files` 统计这些 Task 涉及的不同物理文件。`plan_id` 可以是完整 ID 或唯一前缀；有多个匹配时 CLI 会列出候选。Plan 视图不会把跨任务事件整体套用任务级异常检测，避免把不同节点的读写和终态事实相互混淆。
 
 ---
 
@@ -370,15 +457,15 @@ CLI 的 `trace show` 在末尾自动运行 9 条启发式异常检测。以下�
 
 ---
 
-### 异常 9：Watchdog 兜底取消
-**检测**：出现 `cancel_source=watchdog` 的 `task_cancelled` 事件
+### 异常 9：Watchdog 兜底终态
+**检测**：出现 `transition.cause=system_failure` 且 reason 为任务超时的 `task_failed`，或 reason 以 `no_compatible_route` 开头的 `task_blocked`
 
-**含义**：Watchdog 检测到任务卡死或超时，主动取消了任务。Watchdog 取消应该是罕见事件——频繁出现意味着主流程有问题。
+**含义**：Watchdog 对 processing 执行超时做 failed 兜底，或确认 pending 任务在独立宽限期内持续无兼容 route 后做 blocked 兜底。有 route 但暂时满载的正常排队只告警，不进入终态。
 
 **排查**：
-- 查看被取消任务的 `task_cancelled` 事件的 `reason` 字段，了解 Watchdog 触发原因
-- 检查任务在取消前最后的事件，定位卡死点
-- 检查 Watchdog 的超时配置是否合理
+- 查看终态事件的 `reason` 与 `transition`，区分执行超时和无 route
+- 执行超时检查任务自身 `timeout_seconds`；无 route 检查 event type / Plan route 是否实际注册
+- 不要用 store 的 processing 默认超时解释 pending 等待；pending 告警和无 route 各有独立 grace
 
 ---
 
@@ -390,7 +477,7 @@ CLI 的 `trace show` 在末尾自动运行 9 条启发式异常检测。以下�
 # 1. 查看整体状态
 agentgo trace list
 
-# 2. 找到状态为 running 且 duration 异常大的任务
+# 2. 找到状态为 processing 且 duration 异常大的任务
 agentgo trace show <task_id>
 
 # 3. 在 show 输出中重点关注：
@@ -439,15 +526,16 @@ grep '"kind":"history_truncated"' <file>.jsonl | jq '{prompt_tokens_before, prom
 # 1. 定位失败或取消任务
 agentgo trace show <task_id>
 
-# 2. 在 show 输出中找 task_failed 或 task_cancelled 事件
-#    查看 transition.cause 和 cancel_source 字段
+# 2. 在 show 输出中找 task_failed、task_blocked 或 task_cancelled 事件
+#    查看 transition.cause、reason 和 cancel_source 字段
 
 # 3. 常见失败原因映射：
 #    cause=max_loops_exceeded → Agent 循环次数用完
 #    cause=recoverable_error_retries_exhausted → 可恢复错误重试耗尽
 #    cause=non_recoverable_error → 遇到不可恢复的错误
 #    cause=react_loop_exit:panic → 程序 panic（bug）
-#    cancel_source=watchdog → 看门狗超时取消
+#    cause=system_failure 且 reason=任务超时 → Watchdog 处理执行超时
+#    cause=system_blocked 且 reason=no_compatible_route... → Watchdog 阻断无 route 任务
 #    cancel_source=user → 用户主动取消
 #    cancel_source=scheduler → Scheduler 取消（如依赖任务失败级联）
 ```
@@ -456,10 +544,11 @@ agentgo trace show <task_id>
 
 ```bash
 # 1. 查看文件写入排队事件
-grep '"kind":"file_write_queued"' <file>.jsonl | jq '{path, queue_len, wait_ms}'
+grep '"kind":"file_write_queued"' "$TRACE_DIR/<file>.jsonl" | jq '{path, description, queue_len, wait_ms}'
 
-# 2. 如果 queue_len > 1 或 wait_ms > 1000
-#    → 多 Agent 同时写同一文件的竞争严重
+# 2. 当前实现主要观察 description 与排队结束事件的 wait_ms；queue_len 是预留字段
+#    如果 wait_ms > 1000 或同一路径频繁出现入队事件
+#    → 多 Agent 写同一文件的竞争可能较严重
 #    → 需要优化任务拆分粒度或文件锁策略
 ```
 
@@ -475,8 +564,9 @@ grep '"kind":"file_write_queued"' <file>.jsonl | jq '{path, queue_len, wait_ms}'
 | `task_claimed` | Agent Start 阶段 | `internal/agent/agent.go` (:377-386) |
 | `task_submitted` | Agent 提交结果 | `internal/agent/agent.go` (:578-584) |
 | `task_completed` | Agent 完成 ShortCircuit | `internal/agent/agent.go` (:586-595) |
-| `task_cancelled` | cancel_task 工具/watchdog/用户取消 | `internal/agent/agent.go` (:512-523) |
-| `task_failed` | Panic 路径 / 终止逻辑 | `internal/agent/agent.go` (:355-365) |
+| `task_cancelled` | cancel_task 工具/用户取消 | `internal/agent/agent.go` |
+| `task_failed` | Agent Panic/终止逻辑；系统 processing 超时 | `internal/agent/agent.go`、`internal/store/memory.go` |
+| `task_blocked` | 系统确认 pending 持续无兼容 route | `internal/store/memory.go` |
 | `task_retry` | RetryRollback | `internal/agent/agent.go` |
 | `text_only_submission` | 提交判别衍生 | `internal/agent/agent.go` |
 | `llm_call_start/end` | LLM 调用前后 | `internal/agent/llm_executor.go` (:142-179) |
@@ -493,6 +583,13 @@ grep '"kind":"file_write_queued"' <file>.jsonl | jq '{path, queue_len, wait_ms}'
 | `shell_executed` | Shell 命令执行完 | `internal/tools/` |
 | `shell_timeout_pending` | Shell 超时检测 | `internal/tools/` |
 | `shell_timeout_resolved` | Shell 超时决策 | `internal/tools/` |
+| `replan_requested` | Task 终态、工具或 Reactor 请求重新规划 | `internal/bootstrap/plan_runtime.go`, `internal/tools/plan_control.go` |
+| `replan_coalesced` | Scheduler 聚合多个 PlanSignal | `internal/scheduler/executor.go` |
+| `replan_decided` | Scheduler 确认观察到的事实与决策 | `internal/scheduler/executor.go` |
+| `acceptance_completed` | 正式验收结果持久化后 | `internal/tools/plan_control.go` |
+| `plan_revision_changed` | 新节点注册或节点替代后 | `internal/bootstrap/plan_runtime.go`, `internal/tools/plan_control.go` |
+| `plan_paused` | Plan 进入暂停/阻塞边界 | `internal/bootstrap/plan_runtime.go`, `internal/scheduler/executor.go` |
+| `plan_terminal` | Plan 终态持久化后 | `internal/tools/plan_control.go` |
 
 ---
 
@@ -504,7 +601,7 @@ grep '"kind":"file_write_queued"' <file>.jsonl | jq '{path, queue_len, wait_ms}'
 
 ```bash
 # 找到对应任务的 prompt dump 文件
-ls .agentgo/traces/<timestamp>_<shortid>.prompts.jsonl
+ls "$TRACE_DIR"/<timestamp>_<shortid>.prompts.jsonl
 
 # 查看某次调用的请求内容（messages 很大，建议用 jq 过滤）
 cat <file>.prompts.jsonl | jq 'select(.type=="request") | {loop, model, message_count: (.messages | length)}'
@@ -545,8 +642,12 @@ agentgo trace show <task_id>
 ### 8.3 跨任务关联分析
 
 ```bash
+# 动态 DAG：优先使用内置 Plan 聚合视图
+agentgo trace plan <plan_id>
+
+# 非 Plan 任务：可继续按 Agent 或事件手工对比
 # 对比同一 Agent 的多个任务
-for f in .agentgo/traces/*.jsonl; do
+for f in "$TRACE_DIR"/*.jsonl; do
   echo "=== $(basename $f) ==="
   grep '"kind":"task_completed"' "$f" | jq -c '{task_id, loops_used, files_written: (.//{})}' 2>/dev/null
 done
@@ -554,18 +655,20 @@ done
 
 ### 8.4 常见"健康指标"查询
 
+下面是物理 JSONL 级的快速查询；同一 Task 有 retry 分片时，跨文件的逻辑汇总应以 `trace list/show` 为准。
+
 ```bash
 # 1. 所有失败任务的 reason
-grep '"kind":"task_failed"' .agentgo/traces/*.jsonl | jq '{task_id, reason, cause: .transition.cause}'
+grep '"kind":"task_failed"' "$TRACE_DIR"/*.jsonl | jq '{task_id, reason, cause: .transition.cause}'
 
 # 2. 所有任务的 LLM 调用耗时分布
-grep '"kind":"llm_call_end"' .agentgo/traces/*.jsonl | jq '{task_id, duration_ms}' | jq -s 'sort_by(.duration_ms) | reverse | .[0:10]'
+grep '"kind":"llm_call_end"' "$TRACE_DIR"/*.jsonl | jq '{task_id, duration_ms}' | jq -s 'sort_by(.duration_ms) | reverse | .[0:10]'
 
 # 3. 所有文件的写入记录
-grep '"kind":"file_written"' .agentgo/traces/*.jsonl | jq '{path, bytes, hash}'
+grep '"kind":"file_written"' "$TRACE_DIR"/*.jsonl | jq '{path, bytes, hash}'
 
 # 4. 各事件类型的任务级统计
-for f in .agentgo/traces/*.jsonl; do
+for f in "$TRACE_DIR"/*.jsonl; do
   task=$(basename "$f" .jsonl | cut -d'_' -f2)
   loops=$(grep -c '"kind":"llm_call_start"' "$f" 2>/dev/null || echo 0)
   errors=$(grep -c '"kind":"error"' "$f" 2>/dev/null || echo 0)
@@ -580,7 +683,7 @@ done
 
 Trace 事件流是 Reactor 子系统的**唯一真相源**。当 debug Reactor 行为（如"为什么这个 Reactor 没触发？"）时：
 
-1. 先用 `agentgo trace show <task_id>` 确认目标事件是否确实被 emit
+1. 先用 `agentgo trace show <task_id>` 确认单任务事件；动态 DAG 用 `agentgo trace plan <plan_id>` 检查跨任务事件顺序
 2. 确认事件的 `transition.cause` / `cancel_source` 等字段是否与 Reactor 的 YAML `when:` 条件匹配
 3. Reactor 执行失败时会 emit `kind=error` 事件到 trace，可在时间线上直接看到
 
@@ -592,6 +695,7 @@ Trace 事件流是 Reactor 子系统的**唯一真相源**。当 debug Reactor �
 
 - [ ] 运行 `agentgo trace list`，确认任务 status
 - [ ] 运行 `agentgo trace show <task_id>`，查看完整事件时间线
+- [ ] 若任务属于动态 DAG，运行 `agentgo trace plan <plan_id>`，确认 revision / replan / acceptance / terminal 链路
 - [ ] 检查异常检测输出（9 条规则）
 - [ ] 查看最后一次 `agent_state_changed`——Agent 最后是什么状态？
 - [ ] 查看最后一条 `tool_call`——Agent 卡在什么工具上？
@@ -606,7 +710,7 @@ Trace 事件流是 Reactor 子系统的**唯一真相源**。当 debug Reactor �
 ## 11. 设计约束与已知限制
 
 - **trace 是异步事件记录，不是强一致性日志**：写入失败事件会静默丢失（仅 stderr WARNING）
-- **trace 文件只保留最近 N 个任务**：默认 100 个，超出的最旧文件会被 GC 清理
+- **trace 只保留最近 N 个物理文件**：当前 writer 默认上限为 100；同一 Task 的重试分片分别计数，超出的最旧文件会被 GC 清理
 - **无结构化查询语言**：当前只能用 grep/jq 做文本级过滤，没有 SQL/ElasticSearch 那样的查询能力
 - **无外部追踪生态接入**：不导出到 OpenTelemetry/Jaeger，trace 是内部排查工具
 - **高并发场景下 Writer 有单锁瓶颈**：所有 `Emit` 调用串行化通过一个 `sync.Mutex`，极端场景可能成为性能瓶颈

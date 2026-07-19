@@ -1,11 +1,13 @@
+> **状态说明（2026-07-19）**：本文是未实施的 Shell 路线图，不是现行行为说明。当前支持范围与 reserved event kind 以 [YAML 配置指南](../yaml-config-guide.md) 和 [KNOWN_ISSUES.md](KNOWN_ISSUES.md) 为准。
+
 # ToolUpgradePlan：v5 工具系统升级规划
 
 > **状态**：📋 起草中（2026-04-30 创建，首批承接从 ReactiveSystem.md §7.4 迁移的 Shell 工具改造内容）
 > **优先级**：P1（v5 工具层重要重构，Shell 是首个重点工具）
 > **关联文档**：
 > - [ReactiveSystem.md](ReactiveSystem.md)（Gate / KindShellExecuted 事件 / WaitingApproval 状态等基础设施由其定义；本文档是它在工具层的具体落地）
-> - [nextUpgrade_v4.md](nextUpgrade_v4.md) §7 Hashline / §10 Did-You-Mean
-> - [TraceUpgrade.md](TraceUpgrade.md)（事件 payload 结构化升级，本文档涉及的新事件 schema 由其定稿）
+> - [nextUpgrade_v4.md](../archived/nextUpgrade_v4.md) §7 Hashline / §10 Did-You-Mean
+> - [Trace 升级设计归档](../archived/trace-upgrade-design-2026-05.md)（事件 payload 结构化升级，本文档涉及的新事件 schema 由其定稿）
 
 ---
 
@@ -382,7 +384,7 @@ shell_executed:  {task_id, agent_id, kind, command, exit_code,
 
 - **Gate / Reactor 两类核心抽象本身的设计**：归 [ReactiveSystem.md](ReactiveSystem.md)（原 Provider 抽象已废弃由 [MemoryManageSystem.md](MemoryManageSystem.md) 承接；原 Aggregator 已下放为 Mailbox 子系统内部固定机制）
 - **Agent 实例状态机（idle / processing / waiting_approval / terminating）**：归 [ReactiveSystem.md §7.1-§7.3](ReactiveSystem.md)
-- **trace 事件 payload 结构化升级**：归 [TraceUpgrade.md](TraceUpgrade.md)（Phase 2 落地）
+- **trace 事件 payload 结构化升级**：归 [Trace 升级设计归档](../archived/trace-upgrade-design-2026-05.md)（Phase 2 落地）
 - **其他工具的 Gate 集成**：未来按需在本文档新增章节，当前不展开
 - **Shell 命令的"系统硬编码不可移除黑名单"层**：按 Q11 决议，shell_commands.yaml 是单一真相源，**没有用户不可移除的硬编码黑名单层**
 - **WaitingApproval 的"持续时长触发"超时**：reactor 不支持"状态持续超过 N 分钟自动触发"——独立模块（需要定时器调度），留作 v5.x

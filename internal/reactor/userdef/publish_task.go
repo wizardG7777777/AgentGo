@@ -86,12 +86,19 @@ func (r *publishTaskReactor) Run(ev trace.Event) error {
 			deps = append(deps, v)
 		}
 	}
+	batchID := ev.BatchID
+	if batchID == "" {
+		batchID = ev.TaskID
+	}
 	task := &model.Task{
-		Description:  desc,
-		EventType:    r.eventType,
-		Priority:     r.priority,
-		Dependencies: deps,
-		EventSource:  ev.TaskID,
+		Description:    desc,
+		EventType:      r.eventType,
+		Priority:       r.priority,
+		Dependencies:   deps,
+		EventSource:    ev.TaskID,
+		ParentTaskID:   ev.TaskID,
+		ReplyToAgentID: ev.AgentID,
+		BatchID:        batchID,
 	}
 	if err := r.store.PublishTask(task); err != nil {
 		return fmt.Errorf("publish_task[%s]: store.PublishTask: %w", r.name, err)

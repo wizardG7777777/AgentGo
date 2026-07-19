@@ -41,6 +41,8 @@ go.work.sum
 # - .worktrees/         Git worktree 隔离目录
 .agentgo/
 .worktrees/
+/kimi-debug-session_*.zip
+/smoke.pid
 
 # Editor/IDE
 # .idea/
@@ -54,6 +56,9 @@ setting.yaml
 .claude/settings.local.json
 setting.v4.yaml
 setting.test-concurrent.yaml
+
+# 本地完整配置可能含 LLM / 搜索服务明文凭据；公开模板使用 config.example.yaml
+/general.yaml
 
 # 本地烟测用配置（含明文 API key / search key），不入库
 test_invest.yaml
