@@ -9,9 +9,10 @@ package runner
 //	| 工具 | 自动注入的依赖 |
 //	|---|---|
 //	| read_file / list_dir / grep_search / glob_search | Workdir + FileStateCache |
-//	| write_file / edit_file | + Roster（文件级写锁，附 RosterWaitTimeoutSec）|
-//	| run_shell | + ApprovalCh + shell.CommandFilter + ShellTimeoutSec |
+//	| write_file / edit_file | + Roster（文件级写锁，附 RosterWaitTimeoutSec）；strict 审批 WrapHandler 在 runner.New 装配 |
+//	| run_shell | + interaction.Service + SessionID + shell.CommandFilter + ShellTimeoutSec + Modes（exec 轴短路）|
 //	| publish_task | + Store + TaskHolder + MaxSubtaskDepth |
+//	| request_user_input | + interaction.Service + SessionID + TaskHolder |
 //	| send_message | + mailbox.Registry + MailChainMaxDepth（常量）|
 //	| web_search / web_fetch | + webtool.SearchProvider |
 //	| request_replan / acceptance tools | + PlanCoordinator + Store + TaskHolder |
@@ -30,14 +31,15 @@ import (
 // 由 allowlist 过滤实际生效集。这样新增工具时只需修改本函数一处。
 //
 // holder / fileCache / workdir 在 New() 中提前创建，供 agent 回调和 ToolGroup 共享。
-// approvalWaitHook 透传给 ShellGroup（审批等待 → agent 状态机接线，见 runner.New）。
+// interactionWaitHook 同时透传给 ShellGroup 与 MetaGroup（交互等待 → agent 状态机
+// 接线，见 runner.New）。
 func resolveToolGroups(
 	instanceID string,
 	deps RunnerDeps,
 	holder *CurrentTaskHolder,
 	fileCache *agent.FileStateCache,
 	workdir *tools.DefaultWorkdir,
-	approvalWaitHook func(waiting bool),
+	interactionWaitHook func(waiting bool),
 ) []tools.ToolGroup {
 	readGroup := tools.LocalReadGroup{
 		Workdir:         workdir,
@@ -54,20 +56,25 @@ func resolveToolGroups(
 		},
 		tools.WebGroup{Provider: deps.SearchProvider},
 		tools.ShellGroup{
-			Workdir:          workdir,
-			TimeoutSec:       deps.ShellTimeoutSec,
-			ApprovalCh:       deps.ApprovalCh,
-			AgentID:          instanceID,
-			Filter:           deps.ShellFilter,
-			ApprovalWaitHook: approvalWaitHook,
+			Workdir:             workdir,
+			TimeoutSec:          deps.ShellTimeoutSec,
+			Interactions:        deps.Interactions,
+			SessionID:           deps.SessionID,
+			AgentID:             instanceID,
+			Filter:              deps.ShellFilter,
+			Modes:               deps.Modes,
+			InteractionWaitHook: interactionWaitHook,
 		},
 		tools.MetaGroup{
-			Store:          deps.Store,
-			Holder:         holder,
-			MaxDepth:       deps.MaxSubtaskDepth,
-			MBRegistry:     deps.MBRegistry,
-			AgentID:        instanceID,
-			RouteValidator: deps.RouteValidator,
+			Store:               deps.Store,
+			Holder:              holder,
+			MaxDepth:            deps.MaxSubtaskDepth,
+			MBRegistry:          deps.MBRegistry,
+			AgentID:             instanceID,
+			Interactions:        deps.Interactions,
+			SessionID:           deps.SessionID,
+			InteractionWaitHook: interactionWaitHook,
+			RouteValidator:      deps.RouteValidator,
 		},
 		tools.PlanControlGroup{
 			Coordinator: deps.PlanCoordinator,

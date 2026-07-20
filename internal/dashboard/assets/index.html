@@ -19,19 +19,33 @@
   #conn { margin-left:auto; padding:2px 10px; border-radius:10px; font-size:12px; }
   #conn.on  { background:rgba(63,185,111,.15); color:var(--ok); }
   #conn.off { background:rgba(224,93,93,.15); color:var(--err); }
+  #viewTabs { display:flex; gap:6px; padding:10px 16px 0; overflow-x:auto; }
+  .view-tab { background:transparent; color:var(--dim); border:1px solid transparent; border-radius:6px;
+              padding:5px 12px; cursor:pointer; white-space:nowrap; }
+  .view-tab:hover { color:var(--fg); background:rgba(79,156,249,.06); }
+  .view-tab.active { color:var(--accent); background:rgba(79,156,249,.12); border-color:rgba(79,156,249,.45); }
   main { display:grid; grid-template-columns:1fr 1fr; gap:12px; padding:12px 16px; }
   section { background:var(--panel); border:1px solid var(--border); border-radius:8px;
             padding:10px 12px; min-width:0; }
+  section.view-panel { display:none; }
+  section.view-panel.active { display:block; }
   section h2 { font-size:13px; margin:0 0 8px; color:var(--dim); font-weight:600; }
   #agents { grid-column:1; } #tasks { grid-column:2; }
-  #stream { grid-column:1; } #approvals { grid-column:2; }
+  #result { grid-column:1 / -1; border-color:rgba(63,185,111,.65); }
+  #stream { grid-column:1; } #interactions { grid-column:2; }
+	#agentWorkbench, #activity { grid-column:1 / -1; }
+	#resultBody { max-height:45vh; overflow:auto; white-space:pre-wrap; word-break:break-word;
+	              border-left:3px solid var(--ok); padding:8px 10px; background:rgba(63,185,111,.05); }
+	#resultBody pre { margin:6px 0 0; color:var(--fg); font:13px/1.55 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+	                  white-space:pre-wrap; word-break:break-word; }
+	#resultBody .result-meta { color:var(--ok); font-weight:600; }
   .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:8px; }
   .card { border:1px solid var(--border); border-radius:6px; padding:8px 10px; background:#14171d; }
   .card .cid { font-weight:600; }
   .badge { display:inline-block; padding:0 8px; border-radius:9px; font-size:11px; margin-left:6px; }
   .st-idle { background:rgba(138,146,163,.18); color:var(--dim); }
   .st-processing { background:rgba(79,156,249,.18); color:var(--accent); }
-  .st-waiting_approval { background:rgba(217,161,59,.18); color:var(--warn); }
+  .st-waiting_interaction { background:rgba(217,161,59,.18); color:var(--warn); }
   .st-terminating { background:rgba(224,93,93,.18); color:var(--err); }
   .card .kv { color:var(--dim); margin-top:4px; }
   .card .kv b { color:var(--fg); font-weight:500; }
@@ -47,10 +61,34 @@
   .ev.log .k { color:var(--dim); } .ev.out .k { color:var(--ok); }
   .filters { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:6px; color:var(--dim); }
   .filters label { user-select:none; cursor:pointer; }
-  .appr { border:1px solid var(--warn); border-radius:6px; padding:8px 10px; margin-bottom:6px;
-          background:rgba(217,161,59,.06); }
-  .appr .cmd { font-family:Consolas,monospace; color:var(--warn); }
-  .appr .ops { margin-top:6px; display:flex; gap:6px; }
+  .agent-tabs { display:flex; gap:6px; overflow-x:auto; padding-bottom:8px; margin-bottom:10px;
+                border-bottom:1px solid var(--border); }
+  .agent-tab { flex:0 0 auto; }
+  .agent-tab.active { color:var(--accent); border-color:var(--accent); background:rgba(79,156,249,.12); }
+  .workbench-head { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:10px; }
+  .workbench-head .cid { font-size:15px; }
+  .workbench-grid { display:grid; grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr); gap:10px; }
+  .subpanel { min-width:0; border:1px solid var(--border); border-radius:6px; padding:9px 10px; background:#14171d; }
+  .subpanel h3 { margin:0 0 7px; font-size:12px; color:var(--dim); }
+  .output-item, .activity-item { border-bottom:1px dotted var(--border); padding:6px 0; }
+  .output-item:last-child, .activity-item:last-child { border-bottom:0; }
+  .output-item pre { margin:4px 0 0; white-space:pre-wrap; word-break:break-word;
+                     font:13px/1.55 "Segoe UI","Microsoft YaHei",system-ui,sans-serif; }
+  .activity-meta { color:var(--dim); font-size:12px; }
+  #agentOutput, #agentActivity, #activityBody { max-height:58vh; overflow:auto; }
+  .activity-agents { display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:7px; margin-bottom:10px; }
+  @media (max-width:900px) {
+    main { grid-template-columns:1fr; }
+    #agents, #tasks, #result, #stream, #interactions, #agentWorkbench, #activity { grid-column:1; }
+    .workbench-grid { grid-template-columns:1fr; }
+    header { flex-wrap:wrap; }
+  }
+  .interaction { border:1px solid var(--warn); border-radius:6px; padding:8px 10px; margin-bottom:6px;
+                 background:rgba(217,161,59,.06); }
+  .interaction .prompt { color:var(--fg); white-space:pre-wrap; }
+  .interaction .ops { margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; }
+  .interaction .option-desc { margin-top:3px; color:var(--dim); font-size:12px; }
+  #interactions.attention { outline:2px solid var(--warn); outline-offset:2px; }
   .empty { color:var(--dim); font-style:italic; }
   .btn { background:#1f242e; color:var(--fg); border:1px solid var(--border); border-radius:5px;
          padding:3px 10px; font-size:12px; cursor:pointer; }
@@ -95,7 +133,7 @@
 <body>
 <header>
   <h1>AgentGo 控制台</h1>
-  <button id="modeBtn" class="btn" title="点击切换调度模式（plan / immediate）">模式：-</button>
+  <button id="modeBtn" class="btn" title="点击切换 gate 轴；/mode 可设置 gate / exec / topo">模式：-</button>
   <span class="meta">会话：<b id="session">-</b></span>
   <button id="newSessBtn" class="btn" title="创建并切换到新会话">新会话</button>
   <button id="helpBtn" class="btn" title="查看全部斜杠命令（同 /help）">命令</button>
@@ -106,6 +144,12 @@
   <button id="sendBtn" class="btn primary">发送</button>
   <div id="suggest" class="hidden"></div>
 </div>
+<nav id="viewTabs" aria-label="主视图">
+  <button class="view-tab active" data-view="overview">总览</button>
+  <button class="view-tab" data-view="agents">Agent 工作台</button>
+  <button class="view-tab" data-view="activity">实时动向</button>
+  <button class="view-tab" data-view="trace">Trace / 日志</button>
+</nav>
 <div id="toast" class="hidden"></div>
 <div id="modal" class="hidden">
   <div id="modalCard">
@@ -114,14 +158,28 @@
   </div>
 </div>
 <main>
-  <section id="agents"><h2>代理</h2><div id="agentCards" class="cards"><div class="empty">加载中…</div></div></section>
-  <section id="tasks"><h2>任务看板</h2><div id="taskBoard"><div class="empty">加载中…</div></div></section>
-  <section id="stream">
-    <h2>事件流</h2>
+  <section id="agents" class="view-panel active" data-view-panel="overview"><h2>代理</h2><div id="agentCards" class="cards"><div class="empty">加载中…</div></div></section>
+  <section id="tasks" class="view-panel active" data-view-panel="overview"><h2>任务看板</h2><div id="taskBoard"><div class="empty">加载中…</div></div></section>
+	<section id="result" class="view-panel active" data-view-panel="overview"><h2>最近完成回复</h2><div id="resultBody"><div class="empty">尚无完成结果</div></div></section>
+  <section id="interactions" class="view-panel active" data-view-panel="overview"><h2>等待回应</h2><div id="interactionList"><div class="empty">当前没有等待回应</div></div></section>
+  <section id="agentWorkbench" class="view-panel" data-view-panel="agents">
+    <h2>Agent 工作台</h2>
+    <div id="agentTabs" class="agent-tabs"></div>
+    <div id="agentSummary"></div>
+    <div class="workbench-grid">
+      <div class="subpanel"><h3>独立实时输出</h3><div id="agentOutput"><div class="empty">选择一个 Agent 查看输出</div></div></div>
+      <div class="subpanel"><h3>近期工具与 Trace 动向</h3><div id="agentActivity"><div class="empty">选择一个 Agent 查看动向</div></div></div>
+    </div>
+  </section>
+  <section id="activity" class="view-panel" data-view-panel="activity">
+    <h2>实时动向</h2>
+    <div id="activityBody"><div class="empty">暂无活动</div></div>
+  </section>
+  <section id="stream" class="view-panel" data-view-panel="trace">
+    <h2>Trace / 工具调用 / 系统日志</h2>
     <div class="filters" id="filters"></div>
     <div id="streamBody"></div>
   </section>
-  <section id="approvals"><h2>待审批</h2><div id="approvalList"><div class="empty">无待审批</div></div></section>
 </main>
 <script>
 "use strict";
@@ -135,17 +193,49 @@ function askToken() {
 }
 
 // ---------- 本地状态 ----------
-const state = { agents: [], tasks: [], approvals: [] };
-let curMode = "";
+const state = {
+  agents: [], tasks: [], interactions: [], result: null,
+  feed: { outputs: [], logs: [], traces: [] },
+  activeAgent: "", view: "overview",
+};
+const curModes = { gate: "", exec: "", topo: "" };
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
 
+function setView(view) {
+  state.view = view;
+  document.querySelectorAll("[data-view-panel]").forEach(panel => {
+    panel.classList.toggle("active", panel.dataset.viewPanel === view);
+  });
+  document.querySelectorAll(".view-tab").forEach(tab => {
+    tab.classList.toggle("active", tab.dataset.view === view);
+  });
+  if (view === "agents") renderAgentWorkbench();
+  if (view === "activity") renderActivity();
+  if (view === "trace") renderDiagnostics();
+}
+$("viewTabs").addEventListener("click", e => {
+  const tab = e.target.closest("[data-view]");
+  if (tab) setView(tab.dataset.view);
+});
+
 // ---------- 渲染 ----------
-function modeLabel(m) { return m === "plan" ? "计划模式" : (m === "immediate" ? "直接模式" : (m || "-")); }
-function renderModeBtn() { $("modeBtn").textContent = "模式：" + modeLabel(curMode); }
+function modeLabel(axis, value) {
+  const labels = {
+    gate: { plan: "计划", immediate: "直接" },
+    exec: { normal: "常规", strict: "严格", readonly: "只读", yolo: "放权" },
+    topo: { team: "团队", solo: "单代理" },
+  };
+  return (labels[axis] && labels[axis][value]) || value || "-";
+}
+function renderModeBtn() {
+  $("modeBtn").textContent = `模式：${modeLabel("gate", curModes.gate)} / ${modeLabel("exec", curModes.exec)} / ${modeLabel("topo", curModes.topo)}`;
+}
 function renderHeader(snap) {
   if (!snap) return;
-  curMode = snap.mode || "";
+  curModes.gate = snap.mode || "";
+  curModes.exec = snap.exec_mode || "";
+  curModes.topo = snap.topo_mode || "";
   renderModeBtn();
   $("session").textContent = (snap.session && snap.session.id) ? snap.session.id : "-";
 }
@@ -160,8 +250,17 @@ function renderAgents() {
       <div class="kv">Token <b>${a.prompt_tokens || 0}</b> / <b>${a.completion_tokens || 0}</b>（${a.call_count || 0} 次调用）</div>
       <div class="kv">邮箱待读 <b>${a.mailbox_pending || 0}</b> · 工具 <b>${esc(a.last_tool || "-")}</b> ×${a.tool_call_count || 0}</div>
       <div class="kv">活动 <b>${esc(a.activity_age || "-")}</b>${a.last_error ? ' · <span style="color:var(--err)">' + esc(a.last_error) + "</span>" : ""}</div>
-      <div class="kv"><button class="btn small" data-steer="${esc(a.id)}">引导</button></div>
+      <div class="kv"><button class="btn small" data-open-agent="${esc(a.id)}">查看实时输出</button><button class="btn small" data-steer="${esc(a.id)}">引导</button></div>
     </div>`).join("");
+}
+function renderResult() {
+	const el = $("resultBody");
+	if (!state.result || !state.result.text) {
+		el.innerHTML = '<div class="empty">尚无完成结果</div>';
+		return;
+	}
+	const agent = state.result.agent_id ? ` · ${esc(state.result.agent_id)}` : "";
+	el.innerHTML = `<div class="result-meta">✓ 任务已完成${agent}</div><pre>${esc(state.result.text)}</pre>`;
 }
 const STATUS_ORDER = ["pending", "processing", "completed", "failed", "cancelled"];
 const STATUS_NAME = { pending: "待处理", processing: "进行中", completed: "已完成", failed: "失败", cancelled: "已取消" };
@@ -183,43 +282,168 @@ function renderTasks() {
         ${!TERMINAL_STATUS[t.status] ? `<button class="btn small" data-cancel="${esc(t.id)}">取消</button>` : ""}</li>`).join("")}</ul>
     </div>`).join("");
 }
-function renderApprovals() {
-  const el = $("approvalList");
-  if (!state.approvals.length) { el.innerHTML = '<div class="empty">无待审批</div>'; return; }
-  el.innerHTML = state.approvals.map(a => `
-    <div class="appr">
-      <div><b>${esc(a.agent_id || "-")}</b> 请求执行：</div>
-      <div class="cmd">${esc(a.command || "")}</div>
-      <div class="kv" style="color:var(--dim)">规则 ${esc(a.pattern || "-")} · 任务 ${esc(a.task_id || "-")}</div>
-      <div class="ops">
-        <button class="btn small" data-appr="${esc(a.request_id)}" data-act="approve">批准</button>
-        <button class="btn small" data-appr="${esc(a.request_id)}" data-act="reject">拒绝</button>
-        <button class="btn small" data-appr="${esc(a.request_id)}" data-act="guidance">指导</button>
-        <button class="btn small" data-appr="${esc(a.request_id)}" data-act="remember">始终允许</button>
-      </div>
-    </div>`).join("");
+function renderInteractions() {
+  const el = $("interactionList");
+  if (!state.interactions.length) { el.innerHTML = '<div class="empty">当前没有等待回应</div>'; return; }
+  el.innerHTML = state.interactions.map(item => {
+    const options = item.options || [];
+    const buttons = options.map(option => `
+      <button class="btn small" data-interaction="${esc(item.id)}" data-version="${Number(item.version) || 0}"
+        data-option="${esc(option.id)}" data-requires-text="${option.requires_text ? "true" : "false"}"
+        title="${esc(option.description || option.id)}">${esc(option.label || option.id)}</button>`).join("");
+    const textButton = item.allow_free_text && (item.kind === "text" || !options.length)
+      ? `<button class="btn small" data-interaction="${esc(item.id)}" data-version="${Number(item.version) || 0}" data-free-text="true">输入回答</button>`
+      : "";
+    const descriptions = options.filter(option => option.description).map(option =>
+      `<div class="option-desc"><span class="tid">${esc(option.id)}</span>：${esc(option.description)}</div>`).join("");
+    const subject = item.plan_id || item.task_id || item.subject_id || "-";
+    return `<div class="interaction">
+      <div class="prompt"><b>${esc(item.prompt || "需要你的回应")}</b></div>
+      <div class="kv" style="color:var(--dim)">${esc(item.kind || "interaction")} · ${esc(item.purpose || "-")} · 对象 ${esc(subject)}</div>
+      ${descriptions}<div class="ops">${buttons}${textButton}</div>
+    </div>`;
+  }).join("");
 }
-function renderAll() { renderAgents(); renderTasks(); renderApprovals(); }
+function knownAgentIDs() {
+  const ids = new Set(state.agents.map(a => a.id).filter(Boolean));
+  for (const item of state.feed.outputs) if (item.agent_id) ids.add(item.agent_id);
+  for (const item of state.feed.traces) if (item.agent_id) ids.add(item.agent_id);
+  return Array.from(ids);
+}
+function ensureActiveAgent() {
+  const ids = knownAgentIDs();
+  if (!ids.includes(state.activeAgent)) state.activeAgent = ids[0] || "";
+  return ids;
+}
+function outputKindLabel(kind) {
+  return ({ stream: "模型流", text: "代理输出", result: "最终结果" })[kind] || kind || "输出";
+}
+function traceText(t) {
+  const bits = [t.kind || "trace"];
+  if (t.tool) bits.push("tool=" + t.tool);
+  if (t.task_id) bits.push("task=" + t.task_id);
+  if (t.loop) bits.push("loop=" + t.loop);
+  if (t.path) bits.push(t.path);
+  if (t.message) bits.push(t.message);
+  if (t.duration_ms) bits.push(t.duration_ms + "ms");
+  return bits.join(" · ");
+}
+function traceIsActivity(t) {
+  const kind = String(t.kind || "").toLowerCase();
+  return kind.includes("task_") || kind.includes("tool_") || kind.includes("llm_call") ||
+    kind.includes("progress") || kind.includes("agent_state") || kind.includes("error") ||
+    kind.includes("shell_") || kind.includes("interaction") || kind.includes("file_") ||
+    kind.includes("plan_") || kind.includes("replan_");
+}
+function outputHTML(item) {
+  const suffix = item.error ? ` · 错误：${esc(item.error)}` :
+    (item.kind === "stream" ? (item.done ? " · 已完成" : " · 流式生成中…") : "");
+  return `<div class="output-item"><div class="activity-meta">${fmtTime(item.at)} · ${esc(outputKindLabel(item.kind))}${suffix}</div><pre>${esc(item.text || "")}</pre></div>`;
+}
+function activityHTML(t) {
+  return `<div class="activity-item"><div class="activity-meta">${fmtTime(t.at)}${t.agent_id ? " · " + esc(t.agent_id) : ""}</div><div>${esc(traceText(t))}</div></div>`;
+}
+function renderAgentWorkbench() {
+  const ids = ensureActiveAgent();
+  $("agentTabs").innerHTML = ids.length ? ids.map(id =>
+    `<button class="btn agent-tab${id === state.activeAgent ? " active" : ""}" data-agent-tab="${esc(id)}">${esc(id)}</button>`
+  ).join("") : '<div class="empty">暂无 Agent</div>';
+  if (!state.activeAgent) {
+    $("agentSummary").innerHTML = '<div class="empty">Agent 启动后可在这里查看独立输出</div>';
+    $("agentOutput").innerHTML = '<div class="empty">暂无输出</div>';
+    $("agentActivity").innerHTML = '<div class="empty">暂无动向</div>';
+    return;
+  }
+  const agent = state.agents.find(a => a.id === state.activeAgent);
+  $("agentSummary").innerHTML = agent ? `<div class="workbench-head">
+    <span class="cid">${esc(agent.id)}</span><span class="badge st-${esc(agent.state)}">${esc(agent.state)}</span>
+    <span class="d">${esc(agent.type || "-")} · Loop ${agent.loop || 0} · ${esc(agent.phase || "-")} · 任务 ${esc(agent.current_task_id || "-")}</span>
+    <button class="btn small" data-workbench-steer="${esc(agent.id)}">引导</button>
+  </div>` : `<div class="workbench-head"><span class="cid">${esc(state.activeAgent)}</span><span class="d">历史活动窗口</span></div>`;
+  const outputs = state.feed.outputs.filter(item => item.agent_id === state.activeAgent).slice(-30).reverse();
+  const traces = state.feed.traces.filter(item => item.agent_id === state.activeAgent && traceIsActivity(item)).slice(-100).reverse();
+  $("agentOutput").innerHTML = outputs.length ? outputs.map(outputHTML).join("") : '<div class="empty">该 Agent 尚无输出</div>';
+  $("agentActivity").innerHTML = traces.length ? traces.map(activityHTML).join("") : '<div class="empty">该 Agent 尚无工具或 Trace 动向</div>';
+}
+function renderActivity() {
+  const live = state.agents.filter(a => a.state && a.state !== "idle");
+  const liveHTML = live.length ? `<div class="activity-agents">${live.map(a => `<div class="card">
+    <div><span class="cid">${esc(a.id)}</span><span class="badge st-${esc(a.state)}">${esc(a.state)}</span></div>
+    <div class="kv">${esc(a.phase || "-")} · Loop ${a.loop || 0} · ${esc(a.last_tool || "尚未调用工具")}</div>
+    <div class="kv">${esc(a.current_task_desc || a.current_task_id || "等待任务")}</div>
+  </div>`).join("")}</div>` : '<div class="empty" style="margin-bottom:8px">当前没有活跃 Agent</div>';
+  const traces = state.feed.traces.filter(traceIsActivity).slice(-200).reverse();
+  $("activityBody").innerHTML = liveHTML + (traces.length ? traces.map(activityHTML).join("") : '<div class="empty">暂无结构化活动</div>');
+}
+function renderAll() {
+  renderAgents(); renderTasks(); renderInteractions(); renderResult();
+  renderAgentWorkbench(); renderActivity(); renderDiagnostics();
+}
 
 // ---------- 事件流（可过滤） ----------
 const KINDS = [
   ["TraceEvent", "Trace 事件"], ["LogLine", "日志"],
-  ["OutputText", "代理输出"], ["OutputResult", "任务结果"],
+  ["OutputText", "代理输出"], ["OutputStream", "模型流"], ["OutputResult", "任务结果"],
 ];
-const enabled = { TraceEvent: true, LogLine: true, OutputText: true, OutputResult: true };
+const enabled = { TraceEvent: true, LogLine: true, OutputText: true, OutputStream: true, OutputResult: true };
 $("filters").innerHTML = KINDS.map(([k, label]) =>
   `<label><input type="checkbox" data-k="${k}" checked> ${label}</label>`).join("");
-$("filters").addEventListener("change", e => { enabled[e.target.dataset.k] = e.target.checked; });
+$("filters").addEventListener("change", e => {
+  enabled[e.target.dataset.k] = e.target.checked;
+  renderDiagnostics();
+});
 function fmtTime(iso) { try { return new Date(iso).toLocaleTimeString("zh-CN", { hour12: false }); } catch { return ""; } }
-function pushEvent(kind, text, cls) {
-  if (!enabled[kind]) return;
+function renderDiagnostics() {
   const body = $("streamBody");
-  const div = document.createElement("div");
-  div.className = "ev " + (cls || "");
-  div.innerHTML = `<span class="t">${fmtTime(new Date().toISOString())}</span><span class="k">${esc(kind)}</span>${esc(text)}`;
-  body.appendChild(div);
-  while (body.childNodes.length > 500) body.removeChild(body.firstChild);
+  const rows = [];
+  if (enabled.TraceEvent) for (const t of state.feed.traces) rows.push({
+    at: t.at, kind: "TraceEvent", cls: "", text: `${t.agent_id ? "[" + t.agent_id + "] " : ""}${traceText(t)}`,
+  });
+  if (enabled.LogLine) for (const item of state.feed.logs) rows.push({
+    at: item.at, kind: "LogLine", cls: "log", text: item.text || "",
+    hideTime: /^\d{4}\/\d{2}\/\d{2}/.test(item.text || ""),
+  });
+  for (const item of state.feed.outputs) {
+    const kind = item.kind === "stream" ? "OutputStream" : (item.kind === "result" ? "OutputResult" : "OutputText");
+    if (!enabled[kind]) continue;
+    const suffix = item.error ? ` [stream error] ${item.error}` : (item.kind === "stream" ? (item.done ? " ✓" : " …") : "");
+    rows.push({ at: item.at, kind, cls: "out", text: `[${item.agent_id || "-"}] ${item.text || ""}${suffix}` });
+  }
+  rows.sort((a, b) => new Date(a.at || 0) - new Date(b.at || 0));
+  const visible = rows.slice(-500);
+  body.innerHTML = visible.length ? visible.map(row =>
+    `<div class="ev ${row.cls}"><span class="t">${row.hideTime ? "" : fmtTime(row.at)}</span><span class="k">${esc(row.kind)}</span>${esc(row.text)}</div>`
+  ).join("") : '<div class="empty">当前过滤条件下没有诊断事件</div>';
   body.scrollTop = body.scrollHeight;
+}
+function renderVisibleFeeds() {
+  if (state.view === "agents") renderAgentWorkbench();
+  if (state.view === "activity") renderActivity();
+  if (state.view === "trace") renderDiagnostics();
+}
+function addFeedOutput(item) {
+  if (!item) return;
+  const normalized = Object.assign({ kind: "text", at: new Date().toISOString() }, item);
+  if (normalized.kind === "stream" && normalized.stream_id) {
+    const index = state.feed.outputs.findIndex(existing => existing.kind === "stream" && existing.stream_id === normalized.stream_id);
+    if (index >= 0) state.feed.outputs[index] = normalized;
+    else state.feed.outputs.push(normalized);
+  } else {
+    state.feed.outputs.push(normalized);
+  }
+  if (state.feed.outputs.length > 200) state.feed.outputs.splice(0, state.feed.outputs.length - 200);
+  renderVisibleFeeds();
+}
+function addFeedLog(text, at) {
+  state.feed.logs.push({ text: text || "", at: at || new Date().toISOString() });
+  if (state.feed.logs.length > 500) state.feed.logs.splice(0, state.feed.logs.length - 500);
+  renderVisibleFeeds();
+}
+function addFeedTrace(trace) {
+  if (!trace) return;
+  state.feed.traces.push(trace);
+  if (state.feed.traces.length > 1000) state.feed.traces.splice(0, state.feed.traces.length - 1000);
+  renderVisibleFeeds();
 }
 
 // ---------- 控制面（POST 端点，1:1 映射 ui.Controller；全部走 Bearer 头） ----------
@@ -361,11 +585,34 @@ async function runCommand(line) {
         break;
       }
       case "mode": {
-        const next = args[0] || (curMode === "plan" ? "immediate" : "plan");
-        if (next !== "plan" && next !== "immediate") { toast("用法：/mode [plan|immediate]", true); return; }
-        await postJSON("/api/mode", { mode: next });
-        curMode = next; renderModeBtn();
-        toast("已切换到" + modeLabel(next), false);
+        let axis, value;
+        if (!args.length) {
+          axis = "gate";
+          value = curModes.gate === "plan" ? "immediate" : "plan";
+        } else if (args.length === 2) {
+          axis = args[0].toLowerCase();
+          value = args[1].toLowerCase();
+        } else {
+          toast("用法：/mode [gate|exec|topo <值>]", true);
+          return;
+        }
+        const allowed = {
+          gate: ["immediate", "plan"],
+          exec: ["normal", "strict", "readonly", "yolo"],
+          topo: ["team", "solo"],
+        };
+        if (!allowed[axis] || !allowed[axis].includes(value)) {
+          toast("无效模式；gate=immediate|plan，exec=normal|strict|readonly|yolo，topo=team|solo", true);
+          return;
+        }
+        await setMode(axis, value);
+        toast(`已设置 ${axis}：${modeLabel(axis, value)}`, false);
+        break;
+      }
+      case "plan": {
+        locateInteractions(args.length
+          ? "计划批准/拒绝已迁移为结构化 Interaction；请在等待回应列表中选择对应选项"
+          : "已定位到等待回应列表");
         break;
       }
       case "steer": {
@@ -403,6 +650,25 @@ async function switchSession(id) {
   toast("已切换到会话：" + id, false);
 }
 
+async function setMode(axis, value) {
+  const result = await postJSON("/api/mode", { axis, value });
+  curModes[axis] = result.value || value;
+  renderModeBtn();
+}
+
+function locateInteractions(message) {
+  setView("overview");
+  const panel = $("interactions");
+  panel.scrollIntoView({ behavior: "smooth", block: "start" });
+  panel.classList.add("attention");
+  setTimeout(() => panel.classList.remove("attention"), 1800);
+  if (!state.interactions.length) {
+    toast("当前没有等待回应的 Interaction", false);
+    return;
+  }
+  toast(`${message}（${state.interactions.length} 项）`, false);
+}
+
 // ---------- 模态面板（/help、/status、/session） ----------
 function openModal(title, html) {
   $("modalTitle").textContent = title;
@@ -437,7 +703,8 @@ function statusHTML() {
   const lines = [
     `<div>代理数：<b>${state.agents.length}</b></div>`,
     `<div style="margin-top:4px">任务：待处理 ${c("pending")} · 进行中 ${c("processing")} · 已完成 ${c("completed")} · 失败 ${c("failed")} · 已取消 ${c("cancelled")}</div>`,
-    `<div style="margin-top:4px">模式：<b>${modeLabel(curMode)}</b></div>`,
+    `<div style="margin-top:4px">模式：gate=<b>${modeLabel("gate", curModes.gate)}</b> · exec=<b>${modeLabel("exec", curModes.exec)}</b> · topo=<b>${modeLabel("topo", curModes.topo)}</b></div>`,
+    `<div style="margin-top:4px">等待回应：<b>${state.interactions.length}</b></div>`,
   ];
   if (active.length) {
     lines.push(`<div style="margin:10px 0 4px" class="d">活跃任务</div>` + active.map(t =>
@@ -451,13 +718,12 @@ function sessionsHTML(list) {
     `<div class="sessrow"><b>${i + 1}.</b><span class="tid">${esc(s.id)}</span><span class="d">[${esc(s.status || "-")}] ${esc(s.created_at || "")} ${esc(s.first_user_input || "")}</span><span style="flex:1"></span><button class="btn small" data-switch="${esc(s.id)}">切换</button></div>`).join("");
 }
 
-// 顶栏：模式切换（点击切换到另一种模式）。
+// 顶栏按钮只切换 gate 轴；exec / topo 通过 /mode 显式设置。
 $("modeBtn").addEventListener("click", async () => {
-  const next = curMode === "plan" ? "immediate" : "plan";
+  const next = curModes.gate === "plan" ? "immediate" : "plan";
   try {
-    await postJSON("/api/mode", { mode: next });
-    curMode = next; renderModeBtn();
-    toast("已切换到" + modeLabel(next), false);
+    await setMode("gate", next);
+    toast("已切换 gate：" + modeLabel("gate", next), false);
   } catch (err) { toast(err.message, true); }
 });
 
@@ -481,9 +747,7 @@ $("taskBoard").addEventListener("click", async e => {
   } catch (err) { toast(err.message, true); }
 });
 
-// 代理卡片：引导按钮（prompt 收集指导消息）。
-$("agentCards").addEventListener("click", async e => {
-  const id = e.target.dataset && e.target.dataset.steer;
+async function steerAgent(id) {
   if (!id) return;
   const msg = prompt("发送给 " + id + " 的指导消息：");
   if (msg === null || !msg.trim()) return;
@@ -491,25 +755,62 @@ $("agentCards").addEventListener("click", async e => {
     await postJSON("/api/steer", { agent_id: id, message: msg.trim() });
     toast("已发送指导 → " + id, false);
   } catch (err) { toast(err.message, true); }
+}
+
+// 代理卡片：打开独立工作台或收集指导消息。
+$("agentCards").addEventListener("click", async e => {
+  const openID = e.target.dataset && e.target.dataset.openAgent;
+  if (openID) {
+    state.activeAgent = openID;
+    setView("agents");
+    return;
+  }
+  const id = e.target.dataset && e.target.dataset.steer;
+  if (!id) return;
+  await steerAgent(id);
+});
+$("agentTabs").addEventListener("click", e => {
+  const id = e.target.dataset && e.target.dataset.agentTab;
+  if (!id) return;
+  state.activeAgent = id;
+  renderAgentWorkbench();
+});
+$("agentSummary").addEventListener("click", async e => {
+  const id = e.target.dataset && e.target.dataset.workbenchSteer;
+  if (id) await steerAgent(id);
 });
 
-// 待审批：批准 / 拒绝 / 指导 / 始终允许。
-// 成功后该项由 SSE ApprovalResolved 更新清除；409 说明审批已失效，本地直接移除。
-$("approvalList").addEventListener("click", async e => {
-  const id = e.target.dataset && e.target.dataset.appr;
-  if (!id) return;
-  const body = { action: e.target.dataset.act };
-  if (body.action === "guidance") {
-    const msg = prompt("输入指导内容（拒绝本次执行并把指导反馈给代理）：");
-    if (msg === null || !msg.trim()) { toast("指导消息不能为空", true); return; }
-    body.message = msg.trim();
+// 等待回应：按钮携带稳定 option ID；需要补充内容或纯文本请求时再读取文本。
+$("interactionList").addEventListener("click", async e => {
+  const button = e.target.closest("button[data-interaction]");
+  if (!button) return;
+  const id = button.dataset.interaction;
+  const version = Number(button.dataset.version);
+  const optionID = button.dataset.option || "";
+  let text = "";
+  if (button.dataset.requiresText === "true" || button.dataset.freeText === "true") {
+    const message = button.dataset.freeText === "true"
+      ? "输入你的回答："
+      : "请为选项“" + button.textContent.trim() + "”补充说明：";
+    const input = prompt(message);
+    if (input === null) return;
+    if (!input.trim()) { toast("回答文本不能为空", true); return; }
+    text = input;
   }
+  button.disabled = true;
   try {
-    await postJSON("/api/approvals/" + encodeURIComponent(id), body);
+    await postJSON("/api/interactions/" + encodeURIComponent(id) + "/response", {
+      expected_version: version,
+      option_id: optionID,
+      text,
+    });
+    state.interactions = state.interactions.filter(item => item.id !== id);
+    renderInteractions();
+    toast("回应已提交", false);
   } catch (err) {
-    if (err.status === 409) {
-      state.approvals = state.approvals.filter(a => a.request_id !== id);
-      renderApprovals();
+    button.disabled = false;
+    if (err.status === 409 || err.status === 410) {
+      try { applySnapshot(await getJSON("/api/snapshot")); } catch { /* SSE 会继续自愈 */ }
     }
     toast(err.message, true);
   }
@@ -521,7 +822,14 @@ function applySnapshot(snap) {
   renderHeader(snap);
   state.agents = snap.agents || [];
   state.tasks = snap.tasks || [];
-  state.approvals = snap.pending_approvals || [];
+  state.interactions = snap.pending_interactions || [];
+	state.result = snap.last_result || null;
+  const feed = snap.feed || {};
+  state.feed = {
+    outputs: Array.isArray(feed.outputs) ? feed.outputs : [],
+    logs: Array.isArray(feed.logs) ? feed.logs : [],
+    traces: Array.isArray(feed.traces) ? feed.traces : [],
+  };
   renderAll();
 }
 function applyUpdate(u) {
@@ -529,22 +837,25 @@ function applyUpdate(u) {
     case "SnapshotSync": applySnapshot(u.snapshot); break;
     case "AgentsChanged":
       state.agents = u.agents || []; state.tasks = u.tasks || [];
-      renderAgents(); renderTasks(); break;
-    case "ApprovalNew": state.approvals.push(u.approval); renderApprovals(); break;
-    case "ApprovalResolved":
-      state.approvals = state.approvals.filter(a => a.request_id !== u.resolved.request_id);
-      renderApprovals(); break;
+      renderAgents(); renderTasks(); renderVisibleFeeds(); break;
+    case "InteractionsChanged":
+      state.interactions = u.interactions || [];
+      renderInteractions(); break;
     case "TraceEvent": {
       const t = u.trace;
-      pushEvent("TraceEvent",
-        `${t.kind} agent=${t.agent_id || "-"} task=${t.task_id || "-"}` +
-        (t.tool ? ` tool=${t.tool}` : "") + (t.message ? ` ${t.message}` : "") +
-        (t.duration_ms ? ` (${t.duration_ms}ms)` : ""), "");
+      if (t && !t.at) t.at = u.at || new Date().toISOString();
+      addFeedTrace(t);
       break;
     }
-    case "LogLine": pushEvent("LogLine", u.log_line, "log"); break;
-    case "OutputText": pushEvent("OutputText", `[${u.output.agent_id}] ${u.output.text}`, "out"); break;
-    case "OutputResult": pushEvent("OutputResult", `[${u.output.agent_id}] ${u.output.text}`, "out"); break;
+    case "LogLine": addFeedLog(u.log_line, u.at); break;
+    case "OutputText": addFeedOutput(Object.assign({}, u.output, { kind: "text", at: u.at })); break;
+	case "OutputStream": addFeedOutput(Object.assign({}, u.output, { kind: "stream", at: u.at })); break;
+	case "OutputResult":
+		state.result = u.output || null;
+		renderResult();
+		toast("任务已完成，完整回复已显示在“最近完成回复”区域", false);
+		addFeedOutput(Object.assign({}, u.output, { kind: "result", at: u.at }));
+		break;
   }
 }
 

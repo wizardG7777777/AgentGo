@@ -240,6 +240,16 @@ type AcceptanceResult struct {
 	CreatedAt          time.Time              `json:"created_at"`
 }
 
+// PlanReview 是 gate=plan 模式下 Scheduler 提交给用户审阅的执行计划载荷。
+// 仅在 Plan 处于 paused_awaiting_decision 且 PauseReason="plan_review" 期间有
+// 现实意义；恢复 / 终止后保留作为审计痕迹（用户通过 Interaction 选择执行
+// 时，计划全文同时被复制进保留 controller 任务的描述）。
+type PlanReview struct {
+	Text        string    `json:"text"`
+	SubmittedBy string    `json:"submitted_by,omitempty"` // 提交的 controller 任务 ID
+	SubmittedAt time.Time `json:"submitted_at"`
+}
+
 type ProgressSnapshot struct {
 	PlanRevision        int64     `json:"plan_revision"`
 	SpecRevision        int64     `json:"spec_revision"`
@@ -260,6 +270,7 @@ type ExecutionOverride struct {
 	AddedAcceptanceRuns int64         `json:"added_acceptance_runs,omitempty"`
 	AddedTokens         int64         `json:"added_tokens,omitempty"`
 	AddedTime           time.Duration `json:"added_time,omitempty"`
+	AddedCost           float64       `json:"added_cost,omitempty"`
 	Reason              string        `json:"reason"`
 	AuthorizedBy        string        `json:"authorized_by"`
 	CreatedAt           time.Time     `json:"created_at"`
@@ -292,6 +303,7 @@ type Plan struct {
 	ProgressHistory               []ProgressSnapshot          `json:"progress_history,omitempty"`
 	ConsecutiveNoProgress         int                         `json:"consecutive_no_progress,omitempty"`
 	PauseReason                   string                      `json:"pause_reason,omitempty"`
+	Review                        *PlanReview                 `json:"review,omitempty"`
 	ActiveDecisionTaskID          string                      `json:"active_decision_task_id,omitempty"`
 	Overrides                     []ExecutionOverride         `json:"overrides,omitempty"`
 	CreatedAt                     time.Time                   `json:"created_at"`

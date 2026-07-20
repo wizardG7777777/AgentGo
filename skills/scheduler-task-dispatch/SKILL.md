@@ -1,55 +1,11 @@
 ---
 name: scheduler-task-dispatch
-description: >-
-  Guide Scheduler agents in generating execution agent configuration tables and Reactor dispatch rules
-  at runtime. Use when: (a) deciding A/B/C routing for user requests, (b) generating or modifying
-  AgentKind definitions, (c) setting up Reactor event binding rules, or (d) managing multi-agent
-  task dependencies. Complies with Anthropic agentskills.io open standard.
-version: 2.0.0
-tags: [scheduler, routing, agent-config, reactor, orchestration, skill-package]
-capabilities: [task_routing, config_generation, reactor_binding]
-input_formats: [board_snapshot, user_request]
-output_formats: [publish_task, agent_config_table, reactor_rule]
-compatibility: "AgentGo >= v0.1.0; requires board_snapshot injection and agent_capabilities lookup"
-metadata:
-  target_agent: scheduler
-  skill_category: orchestration
-  standards_compliance: "Anthropic Agent Skills open standard (agentskills.io)"
-  authoring_compliance: "RFC 2119 constraint levels; SkillsMD version tracking"
+description: Guide AgentGo Scheduler agents to classify requests, choose live agent routes, build dependency-safe task DAGs, generate AgentKind or Reactor configuration, and respect Plan user-decision boundaries. Use when routing a user request, publishing dependent tasks, selecting or provisioning capabilities, configuring Scheduler dispatch, or diagnosing dispatch failures.
 ---
 
 # Scheduler Task Dispatch Skill
 
-> 这份文档将 Scheduler 的调度知识从隐性的 system prompt 提升为显式、可版本化、可评审的 **技能包**。
-> 遵循 Anthropic agentskills.io 开放标准（YAML frontmatter + Markdown 指令 + 渐进式披露）。
-> **v2.0.0** 新增：「使用/不使用的场景」决策矩阵、RFC 2119 约束等级、领域启发式规则、失败模式表。
-
----
-
-## 0. 何时使用本 Skill / 何时不使用
-
-### ✅ 使用本 Skill 当：
-
-| 场景 | 典型例子 |
-|------|---------|
-| 需要为收到的用户请求做 A/B/C 路由决策 | "帮我修改 main.go" → C 类，委派 Worker |
-| 需要生成或修改 AgentKind 配置表 | 新增一个 code-reviewer Agent 类型 |
-| 需要设置 Reactor 事件绑定规则 | 当 explorer 任务完成时自动触发 worker 落盘 |
-| 管理跨多个 Agent 的任务依赖链 | explorer 调查 → worker 汇总报告 |
-| 基于 agent_capabilities 选择正确的 event_type | "这个任务需要 run_shell，应发到 Worker" |
-| 排查路由错误或任务分配失败 | 任务发到了没有写权限的 Explorer |
-
-### ❌ 不使用本 Skill 当：
-
-| 场景 | 正确做法 |
-|------|---------|
-| 简单的单 Agent 操作，无需路由决策 | 直接调用 read_file / web_search |
-| 硬编码到 Go 代码的显式路由规则 | 代码层面已处理 |
-| 只需要读取文件或回答事实性问题（B 类） | 自己调 tool，不要走 publish_task |
-| 系统中没有配置任何 Agent（scheduler-only 模式） | 直接告诉用户当前无法委派 |
-| 只是问候/闲聊（A 类） | 自然语言回答 |
-
----
+> 将 Scheduler 的调度知识作为显式、可评审的执行指令使用。
 
 ## 1. 核心职责
 
@@ -58,6 +14,17 @@ Scheduler 是 AgentGo 系统中唯一拥有完整工具能力的一等代理。�
 1. **观察全局状态**：解析 Board Snapshot（tasks、resources、agents、agent_capabilities）
 2. **决策三选一**：A 类（闲聊/状态查询）→ 直接回答；B 类（只读操作）→ 自己调 tool；C 类（写文件/跑命令/复杂改造）→ publish_task 委派
 3. **生成执行代理配置表和 Reactor 规则**：将用户意图转化为结构化的任务分派和事件响应
+
+### 1.1 用户 Interaction 边界
+
+- `gate=plan` 时，完成规划后 MUST 调用 `submit_plan_for_review` 持久化完整计划并结束当前回合；在 `plan_review` Interaction 得到 `execute_plan` 前 MUST NOT 发布 implementation Task。
+- MUST NOT 从普通用户文本猜测 Plan 决定，也 MUST NOT 代表用户选择。`plan_review` 的稳定选项是 `execute_plan` / `revise_plan`（需反馈文本）/ `cancel_request`；暂停后的 `plan_pause` 选项是 `continue_bounded` / `converge_delivery` / `terminate_plan`。
+- PlanStore 是图、版本、pause reason、模式和 `ExecutionOverride` 的执行事实源；Interaction 只拥有用户选择。等待控制面完成 CAS 与领域 effect 时，`waiting_interaction` 是正常状态，不得通过重试、重新派发或另一路径绕过。
+- Shell 灰名单决定属于精确绑定原 command、pattern、working directory、AgentID 和 TaskID 的 `shell_command` Interaction。Scheduler 不得把普通聊天回复解释为 Shell 授权。
+- 当任务确实需要用户澄清或在普通方案间选择时，可调用 `request_user_input(prompt, options_json)`。`options_json` 必须含 2–8 个稳定选项，每项仅使用 `id`、`label`、可选 `description` / `requires_text`；工具只返回 `request_id`、`option_id` 与 `text`。问题应具体且让各选项互斥，不要把可以从仓库或 Board Snapshot 查证的事实抛回给用户。
+- `request_user_input` 固定产生 `Purpose=agent_question`，不能提供 `ActionRef`、Resolution 或 Metadata，也不得用它伪造 `plan_review`、`plan_pause`、Shell authorization 或其他特权 effect。这些领域路径仍必须调用各自控制面工具并等待受信任 handler。
+- 不要假设前端显示序号或键位。TUI/Web 都按稳定 Option ID 回答；`/plan` 只用于定位/列出当前对象，任何兼容入口也必须进入同一 Interaction 管线。
+- pending Interaction 在当前进程内统一展示，`SessionID` 仅记录创建时的审计归属；切换 `/session` 不会隐藏、回答或取消仍在等待的请求。
 
 ---
 
@@ -367,7 +334,7 @@ AgentGo 的 Reactor 系统订阅事件并在条件满足时自动触发下游任
 | 路由到不存在的 event_type | 任务 publish 被拒绝 | 检查 `specialized_agents`，使用已存在的类型或 provision |
 | Explorer 任务完成后直接 report_done | pending_downstream_tasks 非空就被截断 | 先调用 report_progress，等下游清空后再 report_done |
 | 丢失用户的否定约束 | 子任务生成了用户明确拒绝的文件 | Section 11.3：改写 description 时逐字保留否定词 |
-| 多轮尝试后仍无法完成 | 任务反复重试失败 | 向用户汇报三种选择：continue/converge/terminate（resolve_plan_pause） |
+| 多轮尝试后仍无法完成 | Plan 因预算/无进展进入暂停 | 结束当前回合并等待 `plan_pause` Interaction；不得从自由文本解释或代替用户选择 |
 | Scheduler-only 模式无路由 | runtime_mode == "scheduler_only" | 从 agent_templates 选择合适的模板 provision |
 
 ---
@@ -409,27 +376,4 @@ AgentGo 的 Reactor 系统订阅事件并在条件满足时自动触发下游任
 | §6 Reactor 绑定 | `internal/reactor/` | `general_reactor.yaml`, `reactors_file` |
 | §7 依赖管理 | `internal/tools/meta.go` → `publish_task` | `max_subtask_depth` |
 | §9 能力边界 | `internal/gate/` | `tool_profiles` |
-
-## 附录 C：Skill 撰写检查清单（Skill Authoring Checklist）
-
-基于 Anthropic 官方最佳实践和本次互联网调查结果，撰写或增强一个 Skill 包时检查以下项：
-
-### Frontmatter
-- [ ] `name` 全小写、仅限字母/数字/连字符、不超过 64 字符
-- [ ] `name` 与父目录名完全一致
-- [ ] `description` 同时包含**能力声明**和**触发条件**，不超过 1024 字符
-- [ ] `version` 遵循语义化版本号（Major.Minor.Patch）
-- [ ] `compatibility` 声明了必需的环境依赖（如适用）
-
-### 文档结构
-- [ ] 包含 "When to Use / When Not to Use" 决策矩阵
-- [ ] 步骤描述遵循"三句规则"：做什么 → 为什么 → 验证什么
-- [ ] 约束使用 RFC 2119 等级（MUST / MUST NOT / SHOULD / SHOULD NOT / MAY）
-- [ ] 包含至少 1 个**好例子**和 1 个**坏例子**（对比法）
-- [ ] 包含领域启发式规则和失败模式表
-
-### 反模式检查
-- [ ] 未将 SKILL.md 写成百科式文档（面向 Agent 执行，非面向人类阅读）
-- [ ] 未提供过多选项（避免 Agent 决策瘫痪）
-- [ ] 未假设不存在的工具或环境
-- [ ] 长文档已拆分进 references/ 目录
+| §1.1 Interaction 边界 | `internal/interaction/`, `internal/bootstrap/interaction_runtime.go`, `internal/tools/` 的 MetaGroup | `modes.gate`, `tool_profiles` |

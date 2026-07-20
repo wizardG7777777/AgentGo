@@ -13,10 +13,12 @@ import (
 	"agentgo/internal/config"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
+	"agentgo/internal/modes"
 	"agentgo/internal/plan"
 	"agentgo/internal/probe"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
+	"agentgo/internal/tools"
 	"agentgo/internal/trace"
 )
 
@@ -64,15 +66,15 @@ type SchedulerExecutor struct {
 	// 到达终态时的总超时。0 时使用默认值 5 分钟。
 	DownstreamWaitTimeout time.Duration
 
-	// Mode 是 scheduler 启动时的初始 mode 字符串（"immediate" / "plan"）。
+	// Mode 是 scheduler 启动时的初始 gate 轴字符串（"immediate" / "plan"）。
 	// 留空时默认 "immediate"。
-	// 仅在 ModeStore == nil 时使用；ModeStore 非 nil 时每次 Execute 重新读 ModeStore。
+	// 仅在 Modes == nil 时使用；Modes 非 nil 时每次 Execute 重新读 Modes。
 	Mode string
 
-	// ModeStore（可选）：scheduler.Bundle 共享的 mode 持有者。
-	// 非 nil 时优先于 Mode 字段；让 CLI 在运行期通过 /mode 命令切换 mode 后，
-	// 下一次 reactLoop 注入 board snapshot 时立即生效。
-	ModeStore *ModeStore
+	// Modes（可选）：scheduler.Bundle 共享的三轴模式 store。
+	// 非 nil 时优先于 Mode 字段；让 CLI 在运行期通过 /mode 命令切换 gate 轴后，
+	// 下一次 reactLoop 注入 board snapshot 时立即生效。exec / topo 轴也从这里读取。
+	Modes *modes.Store
 
 	// MBRegistry（可选）：scheduler agent 与所有 worker/explorer 共享的邮箱注册表。
 	// 用于 BuildBoardJSON 在 board snapshot 中生成 Resources.Agents 段
@@ -176,12 +178,17 @@ func (e *SchedulerExecutor) Execute(
 	}
 
 	// 4. 注入 board snapshot 到 history 末尾
-	mode := e.Mode
-	if e.ModeStore != nil {
-		mode = e.ModeStore.modeString() // 运行期 mode 切换实时生效
+	// 三轴快照：Modes == nil（单测直构）时 gate 回落 Mode 字段、exec/topo 取默认。
+	modeSnap := modes.Snapshot{
+		Gate: e.Mode,
+		Exec: modes.ExecNormal.String(),
+		Topo: modes.TopoTeam.String(),
 	}
-	if mode == "" {
-		mode = "immediate"
+	if e.Modes != nil {
+		modeSnap = e.Modes.Snapshot() // 运行期模式切换实时生效
+	}
+	if modeSnap.Gate == "" {
+		modeSnap.Gate = modes.GateImmediate.String()
 	}
 	// 构造一个简单的 trigger 事件——SchedulerExecutor 不知道具体触发原因，
 	// 用通用的 ticker_wakeup 类型，让 LLM 知道这是一次"重新观察板子"
@@ -232,7 +239,7 @@ func (e *SchedulerExecutor) Execute(
 		planView, _ = e.PlanCoordinator.Store().GetPlan(task.PlanID)
 		resumablePlans, _ = e.PlanCoordinator.Store().ListPlans()
 	}
-	snapshot := BuildBoardJSON(e.Store, e.Cfg, mode, trigger, SnapshotSources{
+	snapshot := BuildBoardJSON(e.Store, e.Cfg, modeSnap, trigger, SnapshotSources{
 		MBRegistry:                  e.MBRegistry,
 		Roster:                      e.Roster,
 		History:                     e.History,
@@ -315,10 +322,18 @@ func (e *SchedulerExecutor) Execute(
 	// A planned DAG, or direct execution performed by its controller, may only
 	// produce a natural final response after formal finalization. Read-only
 	// questions and conversation remain compatible while an untouched Plan is
-	// still empty.
+	// still empty. Exception: topo=solo with a nodeless Plan skips formal
+	// finalization (no verifier route exists) — see tools.SoloSkipsFormalFinalization.
 	if !result.ToolCalled && !result.Finalized && e.PlanCoordinator != nil && task.PlanID != "" {
 		if p, getErr := e.PlanCoordinator.Store().GetPlan(task.PlanID); getErr == nil && !model.IsPlanTerminal(p.Status) {
-			if planNeedsFormalFinalization(e.Store, task, p) {
+			needsFormal := planNeedsFormalFinalization(e.Store, task, p)
+			if needsFormal && tools.SoloSkipsFormalFinalization(e.Modes, p) {
+				// solo 下 controller 亲自执行的写操作没有 verifier route 可走正式验收，
+				// 且 Plan 无 implementation 节点——放宽为无验收收尾。留审计日志，不静默。
+				log.Printf("[scheduler-exec] solo 编排模式：Plan %s 无 implementation 节点，controller 亲自执行的写操作跳过正式验收，按无验收运行收尾 (task=%s)", p.ID, task.ID)
+				needsFormal = false
+			}
+			if needsFormal {
 				result.ToolCalled = true
 				result.AssistantContent = "计划尚未形成正式终态；必须继续等待、调整 DAG、启动验收或 finalize_plan。"
 				result.Output = result.AssistantContent
@@ -623,7 +638,7 @@ func inferPlanDecision(result agent.ExecuteResult) model.PlanDecision {
 			decision = model.PlanDecisionStartAcceptance
 		case "finalize_plan", "report_done":
 			decision = model.PlanDecisionFinalize
-		case "resolve_plan_pause", "mark_plan_blocked":
+		case "mark_plan_blocked":
 			decision = model.PlanDecisionMarkBlocked
 		}
 	}

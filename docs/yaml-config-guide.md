@@ -22,7 +22,7 @@ AgentGo 有**三类** YAML 文件：
 
 写新配置时按这个顺序走，每步都能立即用 `Validate()` 反馈错误：
 
-1. **填 `llm:` 块**：通常只需 base_url / api_key / default_model；timeout_sec 可选
+1. **填 `llm:` 块**：通常只需 base_url / api_key / default_model；timeout_sec、reasoning_effort、stream 可选
 2. **可直接启动 Scheduler**：只做单 Agent 工作，或让 Scheduler 决定何时组建 Team
 3. **可选 `agent_templates:`**：加载个人/项目模板并设置运行期 Agent 上限
 4. **可选 `tool_profiles:` + `agents:`**：需要启动即常驻的预热 Agent 时再写
@@ -41,13 +41,19 @@ llm:
   api_key: ${OPENAI_API_KEY}            # 可选；空时 SDK 读 OPENAI_API_KEY
   default_model: gpt-4o                 # 推荐必填；Scheduler/模板/静态 Agent 的默认
   timeout_sec: 120                      # 可选；省略时 runtime 使用 60 秒
-  provider: openai                      # 可选：openai / deepseek-v4 / deepseek-r1
+  provider: openai                      # 可选：openai / openrouter / deepseek-v4 / deepseek-r1
+  # reasoning_effort: medium            # 仅为支持该参数的模型启用；空值表示不发送
+  stream: true                          # 可选；启用 Chat Completions SSE
 ```
 
 **关键点**：
 - `${ENV_VAR}` 形式的环境变量替换走 `os.ExpandEnv`，发生在 unmarshal 之前——可以替换 YAML 中**任何**字段的值，不止 api_key
 - Scheduler-only 至少要能解析出模型：通常填写 `llm.default_model`，也可由 `scheduler.model` 覆盖
 - `base_url` 为空时 SDK 使用 OpenAI 官方端点；`api_key` 为空时 SDK 尝试读取 `OPENAI_API_KEY`。生产配置仍建议显式写成上面的形式，便于审查实际 provider 边界
+- `reasoning_effort` 接受 OpenAI 当前公开取值的并集：`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`；具体模型可能只支持其中一部分，不支持时由上游 API 返回模型级错误
+- `provider: openai` 等标准兼容端点发送顶层 `reasoning_effort`；`provider: openrouter` 自动映射为其 Chat API 的 `reasoning.effort`，配置侧无需写两套字段
+- `stream: true` 对所有经统一 LLM 工厂创建的调用生效，包括 Scheduler、预热 Agent、模板/Team Agent、one-shot spawn Agent 和用户 Reactor 的 `invoke_llm`
+- 流式文本会以同一 `stream_id` 的累积快照推送到 TUI/Web；工具调用会先完整聚合名称和 JSON 参数，再交给 Agent 执行，避免半截参数触发工具
 
 ### 1.2 `tool_profiles:` — 命名工具集（推荐）
 
@@ -58,14 +64,16 @@ tool_profiles:
     - write_file
     - run_shell
     - send_message
+    - request_user_input
   explorer_full:
     - read_file
     - web_search
     - send_message
+    - request_user_input
 ```
 
 - key 是 profile 名，value 是工具名列表
-- 工具名必须在 [internal/tools](../internal/tools/) 注册（如 `read_file` / `write_file` / `run_shell` / `publish_task` / `send_message` / `request_replan` / `submit_acceptance_result`；完整列表见 [tool-profiles.md](tool-profiles.md)）
+- 工具名必须在 [internal/tools](../internal/tools/) 注册（如 `read_file` / `write_file` / `run_shell` / `publish_task` / `send_message` / `request_user_input` / `request_replan` / `submit_acceptance_result`；完整列表见 [tool-profiles.md](tool-profiles.md)）
 - 拼错或写不存在的工具名 → 启动期报错
 
 ### 1.3 `agents:` — 预热 Agent kind 列表（可选）
@@ -109,10 +117,19 @@ agents:
 
 ```yaml
 scheduler:
-  model: gpt-4o    # 唯一允许覆盖的字段；缺省回落 llm.default_model
+  model: gpt-4o
+  agent_max_loops: 50
+  enforce_compact_token_threshold: 80000
+  context_limit: 200000
 ```
 
-scheduler 的工具集 / system prompt / replicas 全部**硬编码**在 [internal/scheduler](../internal/scheduler/)，YAML 不能调。
+scheduler 的工具集 / system prompt / replicas 仍固定在 [internal/scheduler](../internal/scheduler/)，但模型和三项运行预算可调：
+
+- `agent_max_loops`：单个 Scheduler Task 的 ReAct 循环上限；省略或 `0` 使用默认 `50`。
+- `enforce_compact_token_threshold`：一个任务内累计 prompt token 达到阈值后触发一次 Layer 2 历史压缩；省略或 `0` 使用默认 `80000`。它不是模型厂商声明的 context window。
+- `context_limit`：预测下一轮 prompt 的 AgentGo Layer 3 硬截断预算；省略或 `0` 使用默认 `200000`。设置它不会扩大模型服务端真正支持的上下文窗口。
+
+三项显式负数都会在启动校验中被拒绝。压缩阈值按单任务累计消耗计数，`context_limit` 按下一次请求的预测 prompt 大小计数，两者量纲不同，应分别根据成本预算和模型窗口调节。
 
 ### 1.5 `agent_templates:` — 按需 Agent 配置（可选）
 
@@ -205,7 +222,7 @@ ui:
 ```
 
 - `tui` 与 `web` 可并存；只启用 `web` 时为 headless 模式，进程等待关闭信号而不进入 TUI。
-- Web Dashboard 通过 HTTP + SSE 提供观测和受控操作（输入、取消、审批、模式/Session 切换），不是只读页面。
+- Web Dashboard 通过 HTTP + SSE 提供观测和受控操作（输入、取消、回答 pending Interaction、模式/Session 切换），不是只读页面。回答使用 `expected_version` 与稳定 `option_id`；服务端动作路由不暴露给浏览器。pending 列表覆盖当前进程内全部仍在等待的请求，`SessionID` 只作创建审计归属，切换 `/session` 不会过滤它们。
 - `web.listen` 为 `127.0.0.1`、`localhost` 或 `::1` 时 token 可为空；绑定 `0.0.0.0`、`::`、LAN 或公网地址时，`token` 为空会被启动校验拒绝。
 - `auto_open` 是三态字段：未设置等于 `true`，显式 `false` 关闭自动打开浏览器。`/healthz` 可用于就绪检查。
 - token 仅保护 Dashboard 管理面，不能替代也不能复用 `llm.api_key`。Dashboard 不写入 LLM 配置或密钥。

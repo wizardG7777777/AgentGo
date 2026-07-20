@@ -79,7 +79,7 @@ func TestBuildBoardJSONExposesOnlyLatestCurrentAcceptanceSummary(t *testing.T) {
 
 	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 1), 16, 1, 60)
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
-	raw := BuildBoardJSON(taskStore, cfg, "plan", model.Event{Type: model.EventPlanSignal}, SnapshotSources{Plan: p})
+	raw := BuildBoardJSON(taskStore, cfg, testModeSnap("plan"), model.Event{Type: model.EventPlanSignal}, SnapshotSources{Plan: p})
 	board := parseSnapshot(t, raw)
 
 	got := board.Plan.LatestAcceptance

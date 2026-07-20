@@ -128,13 +128,13 @@ func TestRenderAgentCard_MailboxPending(t *testing.T) {
 	}
 }
 
-func TestRenderAgentCard_WaitingApproval(t *testing.T) {
+func TestRenderAgentCard_WaitingInteraction(t *testing.T) {
 	theme := DefaultTheme()
-	ag := AgentInfo{ID: "w-1", Type: "worker", State: "waiting_approval"}
+	ag := AgentInfo{ID: "w-1", Type: "worker", State: "waiting_interaction"}
 	card := renderAgentCard(theme, ag, 36)
 
-	if !strings.Contains(card, "waiting approval") {
-		t.Error("card should show waiting approval state")
+	if !strings.Contains(card, "waiting interaction") {
+		t.Error("card should show waiting interaction state")
 	}
 }
 

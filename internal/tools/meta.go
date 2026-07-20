@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/interaction"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
@@ -53,6 +54,9 @@ type RouteValidator interface {
 //   - MaxDepth：仅 Holder != nil 时生效；publish_task 创建的子任务深度超过该值时拒绝
 //   - MBRegistry：邮箱注册表；nil 时不注册 send_message
 //   - AgentID：当前代理 ID（send_message 的发件人）
+//   - Interactions：通用结构化人机交互服务；nil 时不注册 request_user_input
+//   - SessionID：创建 Interaction 时读取当前 Session；切换 Session 不会重标旧请求
+//   - InteractionWaitHook：等待回答期间映射 waiting_interaction 状态
 //   - BatchTracker：（可选，Phase 3）publish_task 成功后追加子任务 ID 到此 tracker；
 //     scheduler 注入时把 ID 写入 scheduler task.SchedulerBatch；worker 不注入则无副作用
 //
@@ -66,18 +70,21 @@ type MetaGroup struct {
 	Holder TaskHolder
 	// LineageHolder 只提供计划父节点身份，不启用 Worker 的深度限制。
 	// Scheduler 使用它把自己发布的 Task 关联到当前 Plan 根控制任务。
-	LineageHolder  TaskHolder
-	MaxDepth       int
-	MBRegistry     *mailbox.Registry
-	AgentID        string
-	BatchTracker   BatchTracker
-	RouteValidator RouteValidator
+	LineageHolder       TaskHolder
+	MaxDepth            int
+	MBRegistry          *mailbox.Registry
+	AgentID             string
+	Interactions        *interaction.Service
+	SessionID           func() string
+	InteractionWaitHook func(waiting bool)
+	BatchTracker        BatchTracker
+	RouteValidator      RouteValidator
 	// PlanMutationSource 仅由内置装配注入。普通 Worker/Reactor 留空，
 	// 计划控制面据此拒绝它们绕过 Scheduler 直接改变 DAG。
 	PlanMutationSource string
 }
 
-// Register 把 publish_task / send_message 注册到 r。
+// Register 把 publish_task / send_message / request_user_input 注册到 r。
 // 各自的依赖缺失时自动跳过对应工具。
 func (g MetaGroup) Register(r *agent.ToolRegistry) {
 	if g.Store != nil {
@@ -114,6 +121,19 @@ func (g MetaGroup) Register(r *agent.ToolRegistry) {
 					[]string{"low", "normal", "high"}, false).
 				Build(),
 			g.sendMessage,
+		)
+	}
+	if g.Interactions != nil {
+		params := schema.Object().
+			String("prompt", "需要用户回答的明确问题", true).
+			String("options_json", "JSON 数组（2-8 项）；每项只能包含 id、label、可选 description、可选 requires_text。普通 Agent 提问只会收到回答，不会授予 Shell 权限或改变 Plan 控制状态", true).
+			Build()
+		params["additionalProperties"] = false
+		r.Register(
+			"request_user_input",
+			"向用户提出一个结构化选择题并等待回答。该工具只返回用户选择，不替代 run_shell 的授权 Interaction，也不替代 Plan 审阅/暂停控制。",
+			params,
+			g.requestUserInput,
 		)
 	}
 }

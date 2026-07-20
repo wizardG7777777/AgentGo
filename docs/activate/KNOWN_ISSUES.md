@@ -1,6 +1,6 @@
 # KNOWN_ISSUES — 当前限制与验证缺口
 
-最后核对：2026-07-19。
+最后核对：2026-07-20。
 
 本文件只记录当前仍会影响使用、开发或发布判断的限制。2026-07-18 UI Hub 改造的 41 项问题均已修复，原始核查与测试证据已归档至 [ui-hub-remediation-2026-07-18.md](../archived/ui-hub-remediation-2026-07-18.md)。截至本次核对，没有把已修复条目重新列为开放缺陷。
 
@@ -15,7 +15,7 @@
 
 ### Web Dashboard 是受控管理面，不是只读页面
 
-它拥有提交输入、取消 Task、发送引导、审批、模式和 Session 操作。默认监听 `127.0.0.1:8399`；若监听非 loopback 地址，配置校验会强制要求 `ui.web.token`。
+它拥有提交输入、取消 Task、发送引导、回答 pending Interaction、模式和 Session 操作。默认监听 `127.0.0.1:8399`；若监听非 loopback 地址，配置校验会强制要求 `ui.web.token`。
 
 - 影响：不要把端口直接暴露到 LAN/公网，也不要把 LLM API key 当作 Dashboard token。
 - 处置：本机使用 loopback；远程使用独立强 token、受信任的反向代理/TLS 和网络访问控制。
@@ -38,10 +38,10 @@
 
 ### Shell 超时处理仍是固定超时
 
-当前有 Shell 拦截和审批，但没有 `shell_commands.yaml` 持久化规则、`ShellCommandGate` 重构或可插拔 `TimeoutHandler`。`shell_timeout_pending` 与 `shell_timeout_resolved` 是被拒绝订阅的 reserved event kind，不会发射。
+当前 Shell 拦截已经使用通用 `shell_command` authorization Interaction：黑名单硬拒绝，灰名单回答与原始 command/pattern/working directory/Agent/Task 精确绑定，并在 Interaction 不可用或绑定不一致时 fail closed。但仍没有 `shell_commands.yaml` 持久化规则、`ShellCommandGate` 重构或可插拔 `TimeoutHandler`。`shell_timeout_pending` 与 `shell_timeout_resolved` 是被拒绝订阅的 reserved event kind，不会发射。
 
 - 影响：不要在用户 Reactor 中订阅这两个 kind，也不要假定 Shell 超时可以交互式续时或截断。
-- 路线图：[ToolUpgradePlan.md](ToolUpgradePlan.md)。
+- 当前用户选择契约：[Interaction 设计](../design/interaction.md)。`ToolUpgradePlan.md` 的旧四键提示与名单写回方案属于已废弃历史，不是当前契约。
 
 ### 用户 Reactor 的 prompt/lifecycle 有意受限
 

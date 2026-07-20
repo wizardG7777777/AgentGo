@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"agentgo/internal/model"
+	"agentgo/internal/modes"
 	"agentgo/internal/ui"
 
 	"github.com/charmbracelet/lipgloss"
@@ -42,7 +43,10 @@ func (m *AppModel) handleCommand(line string) bool {
 		m.cancelTask(parts[1])
 
 	case "/mode":
-		m.toggleMode()
+		m.handleMode(parts)
+
+	case "/plan":
+		m.handlePlan(parts)
 
 	case "/steer":
 		if len(parts) < 3 {
@@ -70,6 +74,15 @@ func (m *AppModel) handleCommand(line string) bool {
 	case "/chat":
 		m.view = ViewChat
 		m.appendMsg("[view] 切换到消息视图", MsgInfo)
+
+	case "/activity":
+		m.view = ViewActivity
+
+	case "/logs":
+		m.view = ViewLogs
+
+	case "/trace":
+		m.view = ViewTrace
 
 	case "/detail", "/result":
 		if m.lastResult == nil {
@@ -119,6 +132,18 @@ func (m *AppModel) showStatus() {
 		mode = "Plan"
 	}
 	lines = append(lines, fmt.Sprintf("  Mode: %s", mode))
+
+	// exec / topo 两轴同样读自 Hub 快照；快照未装配对应 Getter 时回退默认值。
+	execMode := snap.ExecMode
+	if execMode == "" {
+		execMode = "normal"
+	}
+	topoMode := snap.TopoMode
+	if topoMode == "" {
+		topoMode = "team"
+	}
+	lines = append(lines, fmt.Sprintf("  Exec: %s", execMode))
+	lines = append(lines, fmt.Sprintf("  Topo: %s", topoMode))
 
 	// Active tasks detail
 	for _, t := range tasks {
@@ -172,6 +197,136 @@ func (m *AppModel) toggleMode() {
 		m.deps.Controller.SetMode(true)
 		m.appendMsg("[mode] 已切换到 Plan 模式", MsgInfo)
 	}
+}
+
+// modeUsageText 是 /mode 的中文用法说明（列出三轴与全部可选值），
+// 非法参数时输出到消息流。
+const modeUsageText = "[mode] 用法:\n" +
+	"  /mode                                  切换 gate 轴（immediate ↔ plan）\n" +
+	"  /mode gate immediate|plan              设置规划门控轴\n" +
+	"  /mode exec normal|strict|readonly|yolo 设置执行权限轴\n" +
+	"  /mode topo team|solo                   设置编排拓扑轴"
+
+// handleMode 分发 /mode 命令：无参保持原有 gate 轴 toggle 行为；
+// 带参时按轴（gate / exec / topo）设置到指定值，非法参数输出用法说明。
+func (m *AppModel) handleMode(parts []string) {
+	if len(parts) == 1 {
+		m.toggleMode()
+		return
+	}
+	if m.deps.Controller == nil {
+		m.appendMsg("[mode] 控制面未初始化", MsgError)
+		return
+	}
+	if len(parts) != 3 {
+		m.appendMsg(modeUsageText, MsgWarn)
+		return
+	}
+	axis := strings.ToLower(parts[1])
+	value := parts[2]
+	switch axis {
+	case "gate":
+		g, err := modes.ParseGateMode(value)
+		if err != nil {
+			m.appendMsg(fmt.Sprintf("[mode] %v", err), MsgWarn)
+			m.appendMsg(modeUsageText, MsgWarn)
+			return
+		}
+		m.deps.Controller.SetMode(g == modes.GatePlan)
+		m.appendMsg(fmt.Sprintf("[mode] gate 轴已切换到 %s", g.String()), MsgInfo)
+	case "exec":
+		if err := m.deps.Controller.SetExecMode(value); err != nil {
+			m.appendMsg(fmt.Sprintf("[mode] %v", err), MsgWarn)
+			m.appendMsg(modeUsageText, MsgWarn)
+			return
+		}
+		parsed, _ := modes.ParseExecMode(value) // Controller 已校验，此处不会失败
+		m.appendMsg(fmt.Sprintf("[mode] exec 轴已切换到 %s", parsed.String()), MsgInfo)
+	case "topo":
+		if err := m.deps.Controller.SetTopoMode(value); err != nil {
+			m.appendMsg(fmt.Sprintf("[mode] %v", err), MsgWarn)
+			m.appendMsg(modeUsageText, MsgWarn)
+			return
+		}
+		parsed, _ := modes.ParseTopoMode(value) // Controller 已校验，此处不会失败
+		m.appendMsg(fmt.Sprintf("[mode] topo 轴已切换到 %s", parsed.String()), MsgInfo)
+	default:
+		m.appendMsg(fmt.Sprintf("[mode] 未知模式轴 %q", parts[1]), MsgWarn)
+		m.appendMsg(modeUsageText, MsgWarn)
+	}
+}
+
+// planUsageText 是 /plan 的中文用法说明，非法参数时输出到消息流。
+const planUsageText = "[plan] 用法:\n" +
+	"  /plan                       列出等待批准的计划\n" +
+	"  /plan approve [plan-前缀]   批准计划（仅一个待批准时可省略前缀）\n" +
+	"  /plan reject [plan-前缀]    拒绝并终止计划"
+
+// handlePlan 分发 /plan 命令：无参列出待批准计划；approve/reject 走
+// Controller 的 plan_review 入口（前缀解析与歧义处理由 Hub 装配方完成），
+// 结果写消息流。
+func (m *AppModel) handlePlan(parts []string) {
+	if m.deps.Controller == nil {
+		m.appendMsg("[plan] 控制面未初始化", MsgError)
+		return
+	}
+	if len(parts) == 1 {
+		m.listPlanReviews()
+		return
+	}
+	if len(parts) > 3 {
+		m.appendMsg(planUsageText, MsgWarn)
+		return
+	}
+	prefix := ""
+	if len(parts) == 3 {
+		prefix = parts[2]
+	}
+	switch strings.ToLower(parts[1]) {
+	case "approve":
+		summary, err := m.deps.Controller.ApprovePlan(prefix)
+		if err != nil {
+			m.appendMsg(fmt.Sprintf("[plan] %v", err), MsgError)
+			return
+		}
+		m.appendMsg(fmt.Sprintf("[plan] %s", summary), MsgInfo)
+	case "reject":
+		summary, err := m.deps.Controller.RejectPlan(prefix)
+		if err != nil {
+			m.appendMsg(fmt.Sprintf("[plan] %v", err), MsgError)
+			return
+		}
+		m.appendMsg(fmt.Sprintf("[plan] %s", summary), MsgInfo)
+	default:
+		m.appendMsg(planUsageText, MsgWarn)
+	}
+}
+
+// listPlanReviews 渲染待批准计划列表（/plan 无参形态）。
+func (m *AppModel) listPlanReviews() {
+	items, err := m.deps.Controller.PendingPlanReviews()
+	if err != nil {
+		m.appendMsg(fmt.Sprintf("[plan] %v", err), MsgError)
+		return
+	}
+	if len(items) == 0 {
+		m.appendMsg("[plan] 当前没有等待批准的计划", MsgInfo)
+		return
+	}
+	var lines []string
+	lines = append(lines, "── 等待批准的计划 ──")
+	for _, item := range items {
+		excerpt := item.Excerpt
+		if excerpt == "" {
+			excerpt = "（无计划文本）"
+		}
+		lines = append(lines, fmt.Sprintf("  %s [%s]", shortID(item.PlanID), item.SubmittedAt.Local().Format("15:04:05")))
+		for _, excerptLine := range strings.Split(excerpt, "\n") {
+			lines = append(lines, "    "+excerptLine)
+		}
+	}
+	lines = append(lines, "批准: /plan approve [前缀]  拒绝: /plan reject [前缀]")
+	m.appendMsg(strings.Join(lines, "\n"), MsgInfo)
 }
 
 func (m *AppModel) steerAgent(agentID, msg string) {
@@ -276,6 +431,7 @@ func (m *AppModel) selectAgentByID(id string) {
 
 // helpText 由 ui.CommandCatalog 生成——命令目录是两个前端（TUI / WebUI）
 // 的单一数据源，新增命令只需在目录登记，这里的帮助自动同步。
+// 热键区由 keymap 声明表渲染（见 keymap.go），同样不需要手工维护。
 var helpText = buildHelpText()
 
 func buildHelpText() string {
@@ -293,15 +449,6 @@ func buildHelpText() string {
 		pad := strings.Repeat(" ", usageW-lipgloss.Width(u))
 		fmt.Fprintf(&b, "  %s%s  %s\n", u, pad, c.Desc)
 	}
-	b.WriteString(helpHotkeys)
+	b.WriteString(helpHotkeys())
 	return b.String()
 }
-
-const helpHotkeys = `
-── Hotkeys ──
-  Tab                切换焦点 (Input → Sidebar → Main)
-  ↑/↓                侧边栏代理选择
-  ↑/↓ PgUp/PgDn      在完整结果视图中滚动
-  Enter              选中代理 / 提交输入
-  Esc                返回仪表板
-  Ctrl+C             退出`

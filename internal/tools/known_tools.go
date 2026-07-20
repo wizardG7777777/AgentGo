@@ -27,6 +27,7 @@ var AllToolNames = []string{
 	// MetaGroup
 	"publish_task",
 	"send_message",
+	"request_user_input",
 
 	// PlanControlGroup（是否可见由 profile/内置 Scheduler 装配决定）
 	"continue_waiting",
@@ -37,7 +38,7 @@ var AllToolNames = []string{
 	"supersede_tasks",
 	"finalize_plan",
 	"mark_plan_blocked",
-	"resolve_plan_pause",
+	"submit_plan_for_review",
 	"get_retired_node",
 	"get_acceptance_evidence",
 

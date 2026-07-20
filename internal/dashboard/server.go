@@ -22,12 +22,11 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"agentgo/internal/shell"
+	"agentgo/internal/interaction"
 	"agentgo/internal/ui"
 )
 
@@ -121,7 +120,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/tasks/cancel", s.handlePostCancelTask)
 	mux.HandleFunc("/api/steer", s.handlePostSteer)
 	mux.HandleFunc("/api/mode", s.handlePostMode)
-	mux.HandleFunc("/api/approvals/", s.handlePostApproval)
+	mux.HandleFunc("/api/interactions/", s.handlePostInteractionResponse)
 	mux.HandleFunc("/api/session/new", s.handlePostSessionNew)
 	mux.HandleFunc("/api/session/switch", s.handlePostSessionSwitch)
 	return s.authMiddleware(mux)
@@ -322,89 +321,143 @@ func (s *Server) handlePostSteer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// handlePostMode 切换调度模式：{mode} ∈ {plan, immediate}。响应回显生效模式。
+// handlePostMode 切换三轴模式。新协议使用 {axis,value}；为兼容旧 Web
+// 客户端，仍接受 {mode} 并把它解释为 gate 轴。
 func (s *Server) handlePostMode(w http.ResponseWriter, r *http.Request) {
 	if !requirePost(w, r) || !s.controlAvailable(w) {
 		return
 	}
 	var body struct {
-		Mode string `json:"mode"`
+		Axis  string `json:"axis"`
+		Value string `json:"value"`
+		Mode  string `json:"mode"`
 	}
 	if !decodeControlBody(w, r, &body) {
 		return
 	}
-	switch body.Mode {
-	case "plan":
-		s.controller.SetMode(true)
-	case "immediate":
-		s.controller.SetMode(false)
-	default:
-		writeJSONError(w, http.StatusBadRequest, "mode 仅允许 \"plan\" / \"immediate\"")
+	axis := strings.ToLower(strings.TrimSpace(body.Axis))
+	value := strings.ToLower(strings.TrimSpace(body.Value))
+	legacyMode := strings.ToLower(strings.TrimSpace(body.Mode))
+	if axis == "" && value == "" && legacyMode != "" {
+		axis, value = "gate", legacyMode
+	} else if legacyMode != "" {
+		writeJSONError(w, http.StatusBadRequest, "mode 不能与 axis/value 同时使用")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"mode": body.Mode})
+
+	switch axis {
+	case "gate":
+		switch value {
+		case "plan":
+			s.controller.SetMode(true)
+		case "immediate":
+			s.controller.SetMode(false)
+		default:
+			writeJSONError(w, http.StatusBadRequest, "gate 仅允许 immediate / plan")
+			return
+		}
+	case "exec":
+		if err := s.controller.SetExecMode(value); err != nil {
+			writeControlError(w, err)
+			return
+		}
+	case "topo":
+		if err := s.controller.SetTopoMode(value); err != nil {
+			writeControlError(w, err)
+			return
+		}
+	default:
+		writeJSONError(w, http.StatusBadRequest, "axis 仅允许 gate / exec / topo")
+		return
+	}
+	response := map[string]string{"axis": axis, "value": value}
+	if axis == "gate" {
+		response["mode"] = value
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
-// handlePostApproval 回复待审批请求：POST /api/approvals/{requestID}
-// {action} ∈ {approve, reject, guidance, remember}，可选 {message}
-// （guidance 必填）。审批已过期 / 未知 → 409。
-func (s *Server) handlePostApproval(w http.ResponseWriter, r *http.Request) {
+// handlePostInteractionResponse 提交一条结构化用户回答：
+// POST /api/interactions/{id}/response。
+// 客户端只提交稳定 option_id / 文本；RespondedBy 固定由服务端标记为 web。
+func (s *Server) handlePostInteractionResponse(w http.ResponseWriter, r *http.Request) {
 	if !requirePost(w, r) || !s.controlAvailable(w) {
 		return
 	}
-	requestID := strings.TrimPrefix(r.URL.Path, "/api/approvals/")
+	const prefix = "/api/interactions/"
+	const suffix = "/response"
+	tail := strings.TrimPrefix(r.URL.Path, prefix)
+	if !strings.HasSuffix(tail, suffix) {
+		http.NotFound(w, r)
+		return
+	}
+	requestID := strings.TrimSuffix(tail, suffix)
 	if requestID == "" || strings.Contains(requestID, "/") {
-		writeJSONError(w, http.StatusBadRequest, "路径缺少审批请求 ID")
+		writeJSONError(w, http.StatusBadRequest, "路径缺少合法的 Interaction ID")
 		return
 	}
 	var body struct {
-		Action  string `json:"action"`
-		Message string `json:"message"`
+		ExpectedVersion int64  `json:"expected_version"`
+		OptionID        string `json:"option_id"`
+		Text            string `json:"text"`
 	}
 	if !decodeControlBody(w, r, &body) {
 		return
 	}
-	var reply shell.ApprovalReply
-	switch body.Action {
-	case "approve":
-		reply = shell.ApprovalReply{Approved: true}
-	case "reject":
-		reply = shell.ApprovalReply{Approved: false}
-	case "guidance":
-		if strings.TrimSpace(body.Message) == "" {
-			writeJSONError(w, http.StatusBadRequest, "guidance 动作必须携带非空 message")
-			return
-		}
-		reply = shell.ApprovalReply{Approved: false, Message: body.Message}
-	case "remember":
-		// “始终允许”需要该请求命中的灰名单 Pattern 作为记忆粒度，
-		// 从观测面快照的待审批列表取；取不到说明请求已失效。
-		pattern, ok := s.pendingApprovalPattern(requestID)
-		if !ok {
-			writeJSONError(w, http.StatusConflict, "审批已失效")
-			return
-		}
-		reply = shell.ApprovalReply{Approved: true, RememberPattern: pattern}
-	default:
-		writeJSONError(w, http.StatusBadRequest,
-			"未知审批动作 "+strconv.Quote(body.Action)+"，仅允许 approve / reject / guidance / remember")
+	if body.ExpectedVersion <= 0 {
+		writeJSONError(w, http.StatusBadRequest, "expected_version 必须为正整数")
 		return
 	}
-	if !s.controller.ResolveApproval(requestID, reply) {
-		writeJSONError(w, http.StatusConflict, "审批已失效")
+	if strings.TrimSpace(body.OptionID) == "" && strings.TrimSpace(body.Text) == "" {
+		writeJSONError(w, http.StatusBadRequest, "option_id 和 text 至少填写一个")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	resolved, err := s.controller.RespondInteraction(r.Context(), interaction.ResolveInput{
+		RequestID:       requestID,
+		ExpectedVersion: body.ExpectedVersion,
+		OptionID:        strings.TrimSpace(body.OptionID),
+		Text:            body.Text,
+		RespondedBy:     "web",
+	})
+	if err != nil {
+		writeInteractionError(w, resolved, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"request_id": resolved.ID,
+		"version":    resolved.Version,
+		"state":      resolved.State,
+	})
 }
 
-// pendingApprovalPattern 在观测面快照中查找待审批请求的灰名单 Pattern。
-func (s *Server) pendingApprovalPattern(requestID string) (string, bool) {
-	for _, item := range s.observer.Snapshot().PendingApprovals {
-		if item.RequestID == requestID {
-			return item.Pattern, true
-		}
+// writeInteractionError 按 Interaction 协议把回答失败映射为稳定 HTTP 状态。
+// 若受信任处理器已把请求推进到终态，优先依据返回记录判定 410。
+func writeInteractionError(w http.ResponseWriter, request ui.InteractionResult, err error) {
+	switch request.State {
+	case interaction.StateCancelled, interaction.StateExpired,
+		interaction.StateInterrupted, interaction.StateFailed:
+		writeJSONError(w, http.StatusGone, err.Error())
+		return
 	}
-	return "", false
+	switch {
+	case errors.Is(err, interaction.ErrCancelled),
+		errors.Is(err, interaction.ErrExpired),
+		errors.Is(err, interaction.ErrInterrupted),
+		errors.Is(err, interaction.ErrFailed):
+		writeJSONError(w, http.StatusGone, err.Error())
+	case errors.Is(err, interaction.ErrVersionConflict),
+		errors.Is(err, interaction.ErrAlreadyAnswered),
+		errors.Is(err, interaction.ErrInvalidTransition):
+		writeJSONError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, interaction.ErrInvalidRequest),
+		errors.Is(err, interaction.ErrInvalidOption):
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, interaction.ErrNotFound):
+		writeJSONError(w, http.StatusNotFound, err.Error())
+	default:
+		writeControlError(w, err)
+	}
 }
 
 // handlePostSessionNew 创建并切换到新 Session：→ {session_id}。
@@ -497,23 +550,27 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 // updateWire 是 SSE 帧的 JSON 结构：kind 用字符串名（前端 switch 友好），
 // 载荷按 kind 只填一个字段，与 ui.Update 的载荷约定一一对应。
 type updateWire struct {
-	Kind     string               `json:"kind"`
-	Output   *outputWire          `json:"output,omitempty"`
-	LogLine  string               `json:"log_line,omitempty"`
-	Approval *ui.ApprovalItem     `json:"approval,omitempty"`
-	Resolved *ui.ApprovalResolved `json:"resolved,omitempty"`
-	Agents   []ui.AgentCard       `json:"agents,omitempty"`
-	Tasks    []ui.BoardTask       `json:"tasks,omitempty"`
-	Snapshot *ui.Snapshot         `json:"snapshot,omitempty"`
-	Trace    *ui.TraceEvent       `json:"trace,omitempty"`
-	At       time.Time            `json:"at"`
+	Kind         string                `json:"kind"`
+	Output       *outputWire           `json:"output,omitempty"`
+	LogLine      string                `json:"log_line,omitempty"`
+	Interactions *[]ui.InteractionItem `json:"interactions,omitempty"`
+	Agents       []ui.AgentCard        `json:"agents,omitempty"`
+	Tasks        []ui.BoardTask        `json:"tasks,omitempty"`
+	Snapshot     *ui.Snapshot          `json:"snapshot,omitempty"`
+	Trace        *ui.TraceEvent        `json:"trace,omitempty"`
+	At           time.Time             `json:"at"`
 }
 
 // outputWire 是 output.Event 的 JSON 形态（Kind 用字符串，与 UpdateKind 对齐）。
 type outputWire struct {
-	Kind    string `json:"kind"` // "OutputResult" / "OutputText"
-	AgentID string `json:"agent_id"`
-	Text    string `json:"text"`
+	Kind     string `json:"kind"` // "OutputResult" / "OutputText" / "OutputStream"
+	AgentID  string `json:"agent_id"`
+	Text     string `json:"text"`
+	StreamID string `json:"stream_id,omitempty"`
+	TaskID   string `json:"task_id,omitempty"`
+	Loop     int    `json:"loop,omitempty"`
+	Done     bool   `json:"done,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 // encodeUpdate 把一条 ui.Update 编码为 SSE 帧载荷。
@@ -526,12 +583,20 @@ func encodeUpdate(u ui.Update) ([]byte, error) {
 		w.Output = &outputWire{Kind: "OutputResult", AgentID: u.Output.AgentID, Text: u.Output.Text}
 	case ui.KindOutputText:
 		w.Output = &outputWire{Kind: "OutputText", AgentID: u.Output.AgentID, Text: u.Output.Text}
+	case ui.KindOutputStream:
+		w.Output = &outputWire{
+			Kind: "OutputStream", AgentID: u.Output.AgentID, Text: u.Output.Text,
+			StreamID: u.Output.StreamID, TaskID: u.Output.TaskID, Loop: u.Output.Loop,
+			Done: u.Output.Done, Error: u.Output.Error,
+		}
 	case ui.KindLogLine:
 		w.LogLine = u.LogLine
-	case ui.KindApprovalNew:
-		w.Approval = &u.Approval
-	case ui.KindApprovalResolved:
-		w.Resolved = &u.Resolved
+	case ui.KindInteractionsChanged:
+		items := u.Interactions
+		if items == nil {
+			items = []ui.InteractionItem{}
+		}
+		w.Interactions = &items
 	case ui.KindAgentsChanged:
 		w.Agents = u.Agents
 		w.Tasks = u.Tasks

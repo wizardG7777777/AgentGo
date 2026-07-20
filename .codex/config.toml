@@ -1,0 +1,8 @@
+# AgentGo does not use Vercel services. Keep its plugin-provided hooks and skills
+# out of this repository while preserving the plugin for other projects.
+[plugins."vercel-plugin@plugins-cli"]
+enabled = false
+
+# The Vercel MCP server is registered globally, but is not relevant to AgentGo.
+[mcp_servers.vercel]
+enabled = false

@@ -62,9 +62,11 @@ func ProjectTraceEvent(ev trace.Event) TraceEvent {
 // drop-oldest 背压纪律），慢订阅者丢事件、快订阅者与 Hub 主循环均不受影响；
 // 零订阅者时是纯 no-op。可在任意 goroutine 上并发调用（Reactor 分发路径如此）。
 func (h *Hub) EmitTraceEvent(ev trace.Event) {
+	projected := ProjectTraceEvent(ev)
+	h.recordTrace(projected)
 	h.broadcast(Update{
 		Kind:  KindTraceEvent,
-		Trace: ProjectTraceEvent(ev),
+		Trace: projected,
 		At:    time.Now(),
 	})
 }

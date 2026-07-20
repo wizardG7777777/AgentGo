@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"agentgo/internal/output"
 	"agentgo/internal/ui"
 )
 
@@ -63,10 +64,21 @@ func (f *fakeObserver) push(u ui.Update) {
 
 func testSnapshot() ui.Snapshot {
 	return ui.Snapshot{
-		Agents:  []ui.AgentCard{{ID: "worker-1", Type: "worker", State: "processing", Loop: 2}},
-		Tasks:   []ui.BoardTask{{ID: "task-1", Desc: "演示任务", Status: "processing"}},
-		Mode:    "plan",
-		Session: ui.SessionInfo{ID: "sess-1", Status: "active"},
+		Agents:     []ui.AgentCard{{ID: "worker-1", Type: "worker", State: "processing", Loop: 2}},
+		Tasks:      []ui.BoardTask{{ID: "task-1", Desc: "演示任务", Status: "processing"}},
+		Mode:       "plan",
+		ExecMode:   "strict",
+		TopoMode:   "team",
+		Session:    ui.SessionInfo{ID: "sess-1", Status: "active"},
+		LastResult: &ui.ResultItem{AgentID: "scheduler-1", Text: "明确的最终回复"},
+		Feed: ui.FeedSnapshot{
+			Outputs: []ui.FeedOutput{{Kind: "stream", AgentID: "worker-1", StreamID: "stream-1", Text: "partial", At: time.Now()}},
+			Logs:    []ui.LogItem{{Text: "diagnostic", At: time.Now()}},
+			Traces:  []ui.TraceEvent{{Kind: "tool_call", AgentID: "worker-1", Tool: "read_file", At: time.Now()}},
+		},
+		PendingInteractions: []ui.InteractionItem{{
+			ID: "interaction-1", Version: 3, Kind: "choice", Purpose: "plan_pause", Prompt: "如何继续？",
+		}},
 	}
 }
 
@@ -96,11 +108,15 @@ func TestSnapshotEndpoint(t *testing.T) {
 		Tasks []struct {
 			ID string `json:"id"`
 		} `json:"tasks"`
-		Mode    string `json:"mode"`
-		Session struct {
+		Mode     string `json:"mode"`
+		ExecMode string `json:"exec_mode"`
+		TopoMode string `json:"topo_mode"`
+		Session  struct {
 			ID string `json:"id"`
 		} `json:"session"`
-		PendingApprovals []any `json:"pending_approvals"`
+		PendingInteractions []ui.InteractionItem `json:"pending_interactions"`
+		LastResult          *ui.ResultItem       `json:"last_result"`
+		Feed                ui.FeedSnapshot      `json:"feed"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -111,8 +127,85 @@ func TestSnapshotEndpoint(t *testing.T) {
 	if len(body.Tasks) != 1 || body.Tasks[0].ID != "task-1" {
 		t.Fatalf("tasks = %+v", body.Tasks)
 	}
-	if body.Mode != "plan" || body.Session.ID != "sess-1" {
-		t.Fatalf("mode=%q session=%+v", body.Mode, body.Session)
+	if body.Mode != "plan" || body.ExecMode != "strict" || body.TopoMode != "team" || body.Session.ID != "sess-1" {
+		t.Fatalf("modes=%q/%q/%q session=%+v", body.Mode, body.ExecMode, body.TopoMode, body.Session)
+	}
+	if len(body.PendingInteractions) != 1 || body.PendingInteractions[0].ID != "interaction-1" {
+		t.Fatalf("pending_interactions=%+v", body.PendingInteractions)
+	}
+	if body.LastResult == nil || body.LastResult.AgentID != "scheduler-1" || body.LastResult.Text != "明确的最终回复" {
+		t.Fatalf("last_result=%+v", body.LastResult)
+	}
+	if len(body.Feed.Outputs) != 1 || body.Feed.Outputs[0].StreamID != "stream-1" ||
+		len(body.Feed.Logs) != 1 || len(body.Feed.Traces) != 1 || body.Feed.Traces[0].Tool != "read_file" {
+		t.Fatalf("feed=%+v", body.Feed)
+	}
+}
+
+// TestEncodeUpdate_InteractionsChangedFullList 确保 Interaction SSE 始终携带
+// 完整列表，空列表也编码为 []，让前端可以可靠清空旧状态。
+func TestEncodeUpdate_InteractionsChangedFullList(t *testing.T) {
+	now := time.Now()
+	data, err := encodeUpdate(ui.Update{
+		Kind: ui.KindInteractionsChanged,
+		Interactions: []ui.InteractionItem{{
+			ID: "interaction-1", Version: 2, Kind: "choice", Prompt: "选择下一步",
+		}},
+		At: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frame struct {
+		Kind         string               `json:"kind"`
+		Interactions []ui.InteractionItem `json:"interactions"`
+	}
+	if err := json.Unmarshal(data, &frame); err != nil {
+		t.Fatal(err)
+	}
+	if frame.Kind != "InteractionsChanged" || len(frame.Interactions) != 1 || frame.Interactions[0].ID != "interaction-1" {
+		t.Fatalf("frame=%s", data)
+	}
+
+	empty, err := encodeUpdate(ui.Update{Kind: ui.KindInteractionsChanged, At: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(empty), `"interactions":[]`) {
+		t.Fatalf("空列表必须显式编码为 []: %s", empty)
+	}
+}
+
+func TestEncodeUpdate_OutputStreamCarriesStableIdentity(t *testing.T) {
+	data, err := encodeUpdate(ui.Update{
+		Kind: ui.KindOutputStream,
+		Output: output.Event{
+			Kind: output.KindStream, AgentID: "worker-1", TaskID: "task-1",
+			StreamID: "stream-1", Text: "partial", Loop: 3, Done: true,
+		},
+		At: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frame struct {
+		Kind   string `json:"kind"`
+		Output struct {
+			Kind     string `json:"kind"`
+			StreamID string `json:"stream_id"`
+			TaskID   string `json:"task_id"`
+			Text     string `json:"text"`
+			Loop     int    `json:"loop"`
+			Done     bool   `json:"done"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(data, &frame); err != nil {
+		t.Fatal(err)
+	}
+	if frame.Kind != "OutputStream" || frame.Output.Kind != "OutputStream" ||
+		frame.Output.StreamID != "stream-1" || frame.Output.TaskID != "task-1" ||
+		frame.Output.Text != "partial" || frame.Output.Loop != 3 || !frame.Output.Done {
+		t.Fatalf("frame = %s", data)
 	}
 }
 
@@ -302,6 +395,19 @@ func TestIndexServesSPA(t *testing.T) {
 	resp2.Body.Close()
 	if resp2.StatusCode != http.StatusNotFound {
 		t.Fatalf("未知路径 status = %d，期望 404", resp2.StatusCode)
+	}
+}
+
+func TestIndexContainsLayeredViewsAndAgentWorkbench(t *testing.T) {
+	html := string(indexHTML)
+	for _, marker := range []string{
+		`data-view="overview"`, `data-view="agents"`, `data-view="activity"`, `data-view="trace"`,
+		`id="agentTabs"`, `id="agentOutput"`, `id="agentActivity"`, `id="activityBody"`,
+		`独立实时输出`, `Trace / 工具调用 / 系统日志`, `snap.feed`,
+	} {
+		if !strings.Contains(html, marker) {
+			t.Errorf("首页缺少分层 UI 标记 %q", marker)
+		}
 	}
 }
 

@@ -21,10 +21,13 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
 	"agentgo/internal/gate"
+	"agentgo/internal/interaction"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/memory"
 	"agentgo/internal/model"
+	"agentgo/internal/modes"
+	"agentgo/internal/output"
 	"agentgo/internal/plan"
 	reactorbuiltin "agentgo/internal/reactor/builtin"
 	"agentgo/internal/roster"
@@ -40,7 +43,7 @@ import (
 // 只描述"系统级"能力（store、roster、邮箱注册表、hook 注册表等）。
 //
 // 部分字段允许 nil——对应工具不在 AllowedTools 中时，依赖值不被读取。
-// 所以并非所有字段都必须填——例如某 kind 不持有 run_shell，则 ApprovalCh /
+// 所以并非所有字段都必须填——例如某 kind 不持有 run_shell，则 Interactions /
 // ShellFilter 可以为 nil。
 type RunnerDeps struct {
 	Store     store.TaskStore
@@ -70,10 +73,18 @@ type RunnerDeps struct {
 	CancelRegistry *store.TaskCancelRegistry
 	SearchProvider webtool.SearchProvider
 	ShellFilter    *shell.CommandFilter
-	ApprovalCh     chan<- shell.ApprovalRequest
+	Interactions   *interaction.Service
+	SessionID      func() string
+	// Modes 是三轴模式 store：exec 轴驱动 strict 写工具审批（WrapHandler）与
+	// run_shell 的 strict/yolo 短路；nil 等价 normal。
+	// Bootstrap 透传与 scheduler / UI Hub 相同的实例。
+	Modes *modes.Store
 	// UserOutput 是用户可见内容的输出目标。非 nil 时，agent 的 IsUserFacing 输出
 	// 和 scheduler 的 report_done 会写入此处，而不是直接 fmt.Printf。
 	UserOutput io.Writer
+	// StreamOutput publishes replace-in-place LLM stream snapshots. It is shared
+	// by static, template-team and one-shot runners through the same deps object.
+	StreamOutput func(output.Event)
 
 	// TaskEndCallbacks 是 v5 Phase 4 task-end-callback Sync Reactor。
 	// runner.New 在此注册"清空 holder（仅 ev.AgentID 匹配本 runner 时）"回调，
@@ -124,19 +135,24 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	fileCache := agent.NewFileStateCache(50)
 	workdir := &tools.DefaultWorkdir{ProjectRoot: deps.ProjectRoot}
 
-	// 审批等待钩子：把 shell 审批的阻塞窗口映射到 agent 状态机
-	// （processing ↔ waiting_approval）。agent 在工具注册之后才构造，
+	// Interaction 等待钩子：把 shell 人工决策的阻塞窗口映射到 agent 状态机
+	// （processing ↔ waiting_interaction）。agent 在工具注册之后才构造，
 	// 闭包延迟解引用——钩子只在工具执行期触发，届时 a 必定已赋值。
 	var a *agent.Agent
-	approvalWaitHook := func(waiting bool) {
-		agent.SetApprovalWaitState(a, holder.Get(), waiting)
+	interactionWaitHook := func(waiting bool) {
+		agent.SetInteractionWaitState(a, holder.Get(), waiting)
 	}
 
 	toolReg := agent.NewToolRegistryWithAllowlist(rt.AllowedTools)
 
 	// §11.6.2 工具 → 依赖项映射由 dependency_map.go 集中管理
-	groups := resolveToolGroups(rt.InstanceID, deps, holder, fileCache, workdir, approvalWaitHook)
+	groups := resolveToolGroups(rt.InstanceID, deps, holder, fileCache, workdir, interactionWaitHook)
 	tools.RegisterGroups(toolReg, groups...)
+
+	// strict 执行权限强制层（v5 三轴 exec）：exec=strict 时对 write_file /
+	// edit_file 逐次创建 file_write 审批 Interaction；其它档位透传（readonly
+	// 由 exec-mode-guard Gate 拦截）。与 scheduler.New 内同款装配对称。
+	wrapFileWriteApproval(toolReg, deps, rt.InstanceID, interactionWaitHook)
 
 	executor := agent.NewLLMExecutor(
 		deps.LLMClient,
@@ -242,8 +258,18 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	}
 	a.Memory = deps.Memory
 	a.UserOutput = deps.UserOutput
+	a.StreamOutput = deps.StreamOutput
 
 	return r
+}
+
+// wrapFileWriteApproval 对 registry 中的 write_file / edit_file 套 strict 审批包装。
+// 独立成函数以便装配测试直接断言（New 构造的 ToolRegistry 不外露）。
+// 工具不在该 kind 的 allowlist 中时 WrapHandler 返回 false，静默跳过即可。
+func wrapFileWriteApproval(toolReg *agent.ToolRegistry, deps RunnerDeps, instanceID string, waitHook func(bool)) {
+	approver := tools.NewFileWriteApprover(deps.Modes, deps.Interactions, deps.SessionID, instanceID, waitHook)
+	toolReg.WrapHandler("write_file", approver.WrapHandler("write_file"))
+	toolReg.WrapHandler("edit_file", approver.WrapHandler("edit_file"))
 }
 
 func requireRunnablePlan(coordinator *plan.Coordinator, task *model.Task) error {

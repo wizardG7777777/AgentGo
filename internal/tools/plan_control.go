@@ -6,17 +6,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
-	"time"
 
 	"agentgo/internal/agent"
 	"agentgo/internal/model"
+	"agentgo/internal/modes"
 	"agentgo/internal/plan"
 	"agentgo/internal/store"
 	"agentgo/internal/tools/schema"
 	"agentgo/internal/trace"
-
-	"github.com/google/uuid"
 )
 
 // PlanControlGroup exposes narrow, audited control-plane operations. Tool
@@ -29,6 +28,10 @@ type PlanControlGroup struct {
 	Holder         TaskHolder
 	AgentID        string
 	RouteValidator RouteValidator
+	// Modes 是三轴模式 store，submit_plan_for_review 用它判定 gate 轴：
+	// 仅 gate=plan 时真正挂起 Plan 等待用户审阅。nil（runner 装配）按非
+	// plan 模式处理——幂等提示，不挂起。
+	Modes *modes.Store
 }
 
 func (g PlanControlGroup) Register(r *agent.ToolRegistry) {
@@ -67,16 +70,8 @@ func (g PlanControlGroup) Register(r *agent.ToolRegistry) {
 		schema.Object().Enum("verdict", "最终结论；只有最新正式验收 PASS 可以结束 Plan", []string{"pass"}, true).Build(), g.finalizePlan)
 	r.Register("mark_plan_blocked", "因权限、环境、用户选择或外部条件暂停 Plan，保留证据并等待用户决策。",
 		schema.Object().String("reason", "结构化且可向用户解释的阻塞原因", true).Build(), g.markPlanBlocked)
-	r.Register("resolve_plan_pause", "处理预算耗尽或无进展挂起：限额继续、收敛交付或终止。",
-		schema.Object().String("plan_id", "另一个已暂停/阻塞的目标 Plan ID", true).
-			Enum("resolution", "用户选择", []string{"continue", "converge", "terminate"}, true).
-			Int("add_tasks", "新增 Task 额度", false).
-			Int("add_active_tasks", "新增并行活动 Task 额度", false).
-			Int("add_revisions", "新增 PlanRevision 额度", false).
-			Int("add_acceptance_runs", "新增验收次数", false).
-			Int("add_tokens", "新增 token 额度", false).
-			Int("add_minutes", "新增运行分钟数", false).
-			String("reason", "用户授权原因", true).Build(), g.resolvePause)
+	r.Register("submit_plan_for_review", "gate=plan 模式下提交执行计划供用户审阅：把计划全文（markdown，含任务分解/预期产物/执行顺序）持久化并挂起当前 Plan；用户通过 Interaction 选择后，由受信任控制面继续、修订或取消。调用后应结束当前回合，禁止再发布执行任务。",
+		schema.Object().String("plan", "执行计划全文（markdown）：任务分解、预期产物、执行顺序", true).Build(), g.submitPlanForReview)
 	r.Register("get_retired_node", "按需读取已退休节点的压缩摘要，不把冷历史默认注入上下文。",
 		schema.Object().String("task_id", "退休节点 Task ID", true).Build(), g.getRetiredNode)
 	r.Register("get_acceptance_evidence", "读取某次正式验收的结构化结果和证据。",
@@ -363,101 +358,34 @@ func (g PlanControlGroup) markPlanBlocked(ctx context.Context, args map[string]a
 	return fmt.Sprintf("Plan %s 已挂起等待用户决策: %s", updated.ID, reason), nil
 }
 
-func (g PlanControlGroup) resolvePause(ctx context.Context, args map[string]any) (string, error) {
-	controllerTask, current, err := g.currentController()
+// submitPlanForReview 是 plan-gate 模式的计划提交入口。仅 gate=plan 时
+// 真正挂起：PauseForReview 把 Plan 置为 paused_awaiting_decision
+// （PauseReason=plan_review）并把计划全文持久化到 Plan.Review。Interaction
+// handler 据此把计划文本复制进新 controller 任务，或进入修订/取消路径。
+// gate≠plan 与重复提交都幂等返回中文提示，不报错。
+func (g PlanControlGroup) submitPlanForReview(ctx context.Context, args map[string]any) (string, error) {
+	controller, p, err := g.currentController()
 	if err != nil {
 		return "", err
 	}
-	if controllerTask.EventSource != "user" || controllerTask.ID != controllerTask.PlanID || current.RootTaskID != controllerTask.ID {
-		return "", fmt.Errorf("pause resolution requires a fresh user-input Scheduler controller task")
+	if g.Modes == nil || g.Modes.GetGate() != modes.GatePlan {
+		return "当前不是 plan 模式，无需提交审阅：系统不会挂起 Plan，请直接按决策树继续执行", nil
 	}
-	planID, _ := args["plan_id"].(string)
-	if planID == "" {
-		return "", fmt.Errorf("plan_id is required")
+	planText, _ := args["plan"].(string)
+	if strings.TrimSpace(planText) == "" {
+		return "", fmt.Errorf("plan 参数不能为空：请提交完整的执行计划文本（任务分解/预期产物/执行顺序）")
 	}
-	if planID == current.ID {
-		return "", fmt.Errorf("controller task %s cannot authorize its own plan %s", controllerTask.ID, planID)
+	// 幂等：已处于 plan_review 的重复提交不覆盖首次提交的计划文本。
+	if p.Status == model.PlanStatusPausedAwaitingDecision && p.PauseReason == plan.PauseReasonPlanReview {
+		return fmt.Sprintf("Plan %s 已在等待用户审阅，无需重复提交；请结束当前回合等待用户决定", p.ID), nil
 	}
-	resolution, _ := args["resolution"].(string)
-	reason, _ := args["reason"].(string)
-	if strings.TrimSpace(reason) == "" {
-		return "", fmt.Errorf("pause resolution requires an explicit user reason")
-	}
-	switch resolution {
-	case plan.PauseResolutionContinue, plan.PauseResolutionConverge, plan.PauseResolutionTerminate:
-	default:
-		return "", plan.ErrInvalidPauseResolution
-	}
-	target, err := g.Coordinator.Store().GetPlan(planID)
+	ctx = plan.WithControllerAuthority(ctx, controller.ID)
+	updated, err := g.Coordinator.PauseForReview(ctx, p.ID, "gate=plan：执行计划已提交，等待用户审阅", planText)
 	if err != nil {
 		return "", err
 	}
-	if target.Status != model.PlanStatusPausedAwaitingDecision && target.Status != model.PlanStatusBlocked {
-		return "", fmt.Errorf("target plan %s must be paused or blocked, got %s", planID, target.Status)
-	}
-	var resume *model.Task
-	if resolution == plan.PauseResolutionContinue || resolution == plan.PauseResolutionConverge {
-		resume = &model.Task{
-			ID: uuid.NewString(), PlanID: planID, NodeRole: model.PlanNodeRoleController,
-			PlanMutationSource: "control-reserved", EventType: "__scheduler__",
-			EventSource: controllerTask.ID, ParentTaskID: controllerTask.ID,
-			ReplyToAgentID: g.AgentID, BatchID: controllerTask.ID, Priority: 100,
-			Description: fmt.Sprintf("Resume dynamic plan %s after user selected %s: %s", planID, resolution, reason),
-		}
-	}
-	nextControllerTaskID := ""
-	if resume != nil {
-		nextControllerTaskID = resume.ID
-	}
-	// Keep the Plan paused while pruning work so no pending investigation can
-	// be claimed in the gap between choosing CONVERGE and applying cancellations.
-	if resolution == plan.PauseResolutionConverge || resolution == plan.PauseResolutionTerminate {
-		for _, taskID := range target.CurrentNodeIDs {
-			node := target.Nodes[taskID]
-			if resolution == plan.PauseResolutionConverge && node.Role != model.PlanNodeRoleInvestigation {
-				continue
-			}
-			task, taskErr := g.Store.GetTask(taskID)
-			if taskErr != nil || model.IsTerminal(task.Status) {
-				continue
-			}
-			if cancelErr := store.TransitionStateWithCancelSource(g.Store, taskID, task.Status, model.TaskStatusCancelled, "user"); cancelErr != nil {
-				latest, latestErr := g.Store.GetTask(taskID)
-				if latestErr == nil && !model.IsTerminal(latest.Status) {
-					return "", fmt.Errorf("cancel task %s before resolving pause: %w", taskID, cancelErr)
-				}
-			}
-		}
-	}
-	// Publish the reserved controller while the target Plan is still paused.
-	// CanClaim rejects it until ResolvePause atomically flips status and active
-	// authority, so there is no runnable Plan without a durable signal consumer.
-	if resume != nil {
-		if publishErr := g.Store.PublishTask(resume); publishErr != nil {
-			return "", fmt.Errorf("reserve resume plan controller: %w", publishErr)
-		}
-	}
-	updated, err := g.Coordinator.ResolvePause(ctx, plan.ResolvePauseInput{
-		PlanID: planID, Resolution: resolution, AuthorizedBy: "user-via-task:" + controllerTask.ID, Reason: reason,
-		NextControllerTaskID: nextControllerTaskID,
-		Override: model.ExecutionOverride{
-			AddedTasks: int64(intArg(args, "add_tasks")), AddedActiveTasks: int64(intArg(args, "add_active_tasks")),
-			AddedPlanRevisions: int64(intArg(args, "add_revisions")), AddedTokens: int64(intArg(args, "add_tokens")),
-			AddedAcceptanceRuns: int64(intArg(args, "add_acceptance_runs")),
-			AddedTime:           time.Duration(intArg(args, "add_minutes")) * time.Minute,
-		},
-	})
-	if err != nil {
-		if resume != nil {
-			_ = store.TransitionStateWithCancelSource(g.Store, resume.ID, model.TaskStatusPending, model.TaskStatusCancelled, "system")
-		}
-		return "", err
-	}
-	// The authorizing controller belongs to a different Plan, so its eventual
-	// Task terminal event cannot be used to clean up the target Plan's Team.
-	// Emit the target identity immediately after the terminal state is durable.
-	emitPlanTerminal(controllerTask.ID, updated)
-	return fmt.Sprintf("Plan %s: status=%s mode=%s", updated.ID, updated.Status, updated.ExecutionMode), nil
+	log.Printf("[plan-gate] Plan %s 已挂起等待用户审阅（控制面已创建 plan_review Interaction）", updated.ID)
+	return fmt.Sprintf("Plan %s 已挂起等待用户审阅。计划已提交，请用一句话告知用户『计划已提交等待审阅』并结束当前回合——收到 Interaction 响应前禁止发布任何执行任务；选择执行后系统会以新 controller 任务唤醒你按已审阅计划执行。", updated.ID), nil
 }
 
 func (g PlanControlGroup) getRetiredNode(_ context.Context, args map[string]any) (string, error) {

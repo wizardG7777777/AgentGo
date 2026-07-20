@@ -56,7 +56,7 @@ func TestRenderAgentLine_States(t *testing.T) {
 		wantIcon string
 	}{
 		{"processing", theme.IconRunning},
-		{"waiting_approval", theme.IconApproval},
+		{"waiting_interaction", theme.IconInteraction},
 		{"terminating", theme.IconAgent},
 		{"idle", theme.IconIdle},
 		{"unknown", theme.IconIdle},

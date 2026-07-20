@@ -13,6 +13,7 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
+	"agentgo/internal/modes"
 	"agentgo/internal/plan"
 	"agentgo/internal/store"
 	"agentgo/internal/tools/schema"
@@ -44,6 +45,9 @@ type SchedulerGroup struct {
 	// 让结果分类在产生处完成，消费方不再做子串匹配。
 	ResultOutput    io.Writer
 	PlanCoordinator *plan.Coordinator
+	// Modes 是三轴模式 store，report_done 据此判定 topo=solo 的收尾放宽；
+	// nil 等价 team（永不放宽），只出现在单测直构场景。
+	Modes *modes.Store
 }
 
 // Register 把 cancel_task / report_done 注册到 r。
@@ -67,7 +71,8 @@ func (g SchedulerGroup) Register(r *agent.ToolRegistry) {
 		r.Register(
 			"report_done",
 			"向用户报告最终结果，表示当前请求处理完毕。"+
-				"调用前会校验 SchedulerBatch；若已进入 DAG 或直接执行过写入/命令，还会要求 Plan 已正式终结；"+
+				"调用前会校验 SchedulerBatch；若已进入 DAG 或直接执行过写入/命令，还会要求 Plan 已正式终结"+
+				"（topo=solo 且无执行节点时放宽，按无验收运行收尾）；"+
 				"调用后会清空 SchedulerBatch 并打印事实校对块（task.Artifacts）。",
 			schema.Object().
 				String("summary", "给用户的最终汇总报告", true).
@@ -258,7 +263,13 @@ func (g SchedulerGroup) reportDone(ctx context.Context, args map[string]any) (st
 			return "", authorityErr
 		}
 		if !model.IsPlanTerminal(p.Status) {
-			if p.Status != model.PlanStatusRunning || reportNeedsFormalFinalization(g.Store, currentTask, p) {
+			needsFormal := reportNeedsFormalFinalization(g.Store, currentTask, p)
+			if needsFormal && SoloSkipsFormalFinalization(g.Modes, p) {
+				// solo 收尾放宽不静默：留一行审计日志说明跳过正式验收的原因。
+				log.Printf("[scheduler-group] solo 编排模式：Plan %s 无 implementation 节点，controller 亲自执行的写操作跳过正式验收，按无验收运行收尾 (task=%s)", p.ID, currentTask.ID)
+				needsFormal = false
+			}
+			if p.Status != model.PlanStatusRunning || needsFormal {
 				return "", fmt.Errorf("report_done 被拒绝：Plan %s 尚未依据最新正式验收进入终态（status=%s）", p.ID, p.Status)
 			}
 			authorityCtx := plan.WithControllerAuthority(ctx, currentTask.ID)
@@ -362,6 +373,28 @@ func reportNeedsFormalFinalization(s store.TaskStore, task *model.Task, p *model
 		}
 	}
 	return false
+}
+
+// SoloSkipsFormalFinalization 判定当前收尾是否可以跳过正式验收（AcceptanceRun）。
+// 两个条件必须同时成立：
+//   - topo=solo：modeStore 非 nil 且 topo 轴为 solo；nil 等价 team，永不放宽；
+//   - Plan 无 implementation 节点：CurrentNodeIDs 为空（仍是 root-only 控制面信封）。
+//
+// 背景：solo 下 publish_task 被硬拦截，controller（scheduler）亲自执行的
+// write_file/edit_file/run_shell 永远不会形成 Task-backed DAG，系统里也没有
+// verifier route 可跑正式 AcceptanceRun——正式验收路径在 solo 下物理上走不通。
+// 因此对满足条件的 Plan 放宽 reportNeedsFormalFinalization /
+// planNeedsFormalFinalization 的硬性要求，允许 report_done / 自然文本回答走
+// CompleteWithoutExecution 的"无验收运行"收尾。team 模式语义不变；Plan 中
+// 残留任何 implementation 节点（异常状态）时不放宽，仍要求正式验收。
+func SoloSkipsFormalFinalization(modeStore *modes.Store, p *model.Plan) bool {
+	if modeStore == nil || modeStore.GetTopo() != modes.TopoSolo {
+		return false
+	}
+	if p == nil || len(p.CurrentNodeIDs) > 0 {
+		return false
+	}
+	return true
 }
 
 // reportProgress 是 report_progress 工具的实现。

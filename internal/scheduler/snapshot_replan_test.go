@@ -40,7 +40,7 @@ func TestBuildBoardJSONExposesPersistedReactorAndAgentReplanDetails(t *testing.T
 	}
 	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 1), 16, 1, 60)
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
-	raw := BuildBoardJSON(taskStore, cfg, "plan", model.Event{Type: model.EventPlanSignal}, SnapshotSources{Plan: p})
+	raw := BuildBoardJSON(taskStore, cfg, testModeSnap("plan"), model.Event{Type: model.EventPlanSignal}, SnapshotSources{Plan: p})
 	board := parseSnapshot(t, raw)
 
 	if board.Plan == nil || board.Plan.PendingReplanCount != 2 || board.Plan.PendingReplanOmitted != 0 {
@@ -97,7 +97,7 @@ func TestBuildBoardJSONCapsPendingReplanSummaries(t *testing.T) {
 
 	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 1), 16, 1, 60)
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
-	raw := BuildBoardJSON(taskStore, cfg, "plan", model.Event{Type: model.EventPlanSignal}, SnapshotSources{Plan: p})
+	raw := BuildBoardJSON(taskStore, cfg, testModeSnap("plan"), model.Event{Type: model.EventPlanSignal}, SnapshotSources{Plan: p})
 	board := parseSnapshot(t, raw)
 
 	requests := board.Plan.PendingReplanRequests

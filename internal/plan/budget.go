@@ -17,6 +17,11 @@ const (
 	PauseResolutionTerminate = "terminate"
 )
 
+// PauseReasonPlanReview 是 PauseForReview 写入的固定 PauseReason：
+// gate=plan 模式下 Scheduler 已提交执行计划，Plan 挂起等待用户通过
+// Interaction 做出审阅选择。
+const PauseReasonPlanReview = "plan_review"
+
 type budgetDelta struct {
 	revisions  int64
 	tasks      int64
@@ -299,6 +304,55 @@ func (c *Coordinator) MarkBlocked(ctx context.Context, planID, reason string) (*
 	return c.store.GetPlan(planID)
 }
 
+// PauseForReview 把 Running 的 Plan 主动挂起为 PausedAwaitingDecision，
+// PauseReason 固定为 plan_review——这是 gate=plan 模式下 Scheduler 提交执行
+// 计划、等待用户审阅选择的入口。reviewText 是提交给用户审阅的计划全文，
+// 随同一事务写入 Plan.Review 持久化（PlanStore 原子落盘），崩溃恢复后仍可
+// 供 Interaction effect handler 读取并复制进新 controller 任务描述。
+//
+// 状态守卫：终态报 ErrPlanTerminal，非 Running（已暂停 / 阻塞）报
+// ErrPlanPaused；重复提交由调用方（submit_plan_for_review 工具）按
+// PauseReason 预读做幂等，本函数保持严格写语义。
+//
+// 与预算挂起不同，这里不追加 ReplanRequest 也不 notify：调用方（当前
+// controller）正处于唤醒态，挂起后它的 Execute 边界检查会自行以
+// ErrExecutionSuspended 收尾；恢复信号由用户在 Interaction 中选择执行后，
+// 受信任控制面调用 ResolvePause 所产生的 pause_resolved 请求提供。
+func (c *Coordinator) PauseForReview(ctx context.Context, planID, reason, reviewText string) (*model.Plan, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	err := c.store.update(func(state *persistentState) error {
+		rec, ok := state.Plans[planID]
+		if !ok {
+			return ErrPlanNotFound
+		}
+		p := &rec.Plan
+		if err := ensureControllerAuthority(ctx, p); err != nil {
+			return err
+		}
+		if model.IsPlanTerminal(p.Status) {
+			return ErrPlanTerminal
+		}
+		if p.Status != model.PlanStatusRunning {
+			return ErrPlanPaused
+		}
+		now := time.Now().UTC()
+		pausePlan(p, PauseReasonPlanReview, reason, now)
+		p.Review = &model.PlanReview{
+			Text:        reviewText,
+			SubmittedBy: controllerAuthorityFrom(ctx),
+			SubmittedAt: now,
+		}
+		p.ExecutionStateVersion++
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return c.store.GetPlan(planID)
+}
+
 type ResolvePauseInput struct {
 	PlanID               string
 	Resolution           string
@@ -306,6 +360,11 @@ type ResolvePauseInput struct {
 	AuthorizedBy         string
 	Reason               string
 	NextControllerTaskID string
+	// ExpectedPauseReason / ExpectedStateVersion 把一次用户决定绑定到创建
+	// Interaction 时看到的暂停事实。零值保持内部兼容调用的既有语义；控制面
+	// 回答必须同时填写，校验在 PlanStore 写事务内完成，避免先读后写竞态。
+	ExpectedPauseReason  string
+	ExpectedStateVersion int64
 }
 
 func (c *Coordinator) ResolvePause(ctx context.Context, in ResolvePauseInput) (*model.Plan, error) {
@@ -331,6 +390,14 @@ func (c *Coordinator) ResolvePause(ctx context.Context, in ResolvePauseInput) (*
 			return ErrPlanNotFound
 		}
 		p := &rec.Plan
+		if in.ExpectedPauseReason != "" && p.PauseReason != in.ExpectedPauseReason {
+			return fmt.Errorf("%w: pause reason=%q, expected %q",
+				ErrPauseConflict, p.PauseReason, in.ExpectedPauseReason)
+		}
+		if in.ExpectedStateVersion > 0 && p.ExecutionStateVersion != in.ExpectedStateVersion {
+			return fmt.Errorf("%w: execution state version=%d, expected %d",
+				ErrPauseConflict, p.ExecutionStateVersion, in.ExpectedStateVersion)
+		}
 		if p.Status != model.PlanStatusPausedAwaitingDecision && p.Status != model.PlanStatusBlocked {
 			return ErrPlanPaused
 		}
@@ -353,6 +420,7 @@ func (c *Coordinator) ResolvePause(ctx context.Context, in ResolvePauseInput) (*
 			p.Budget.MaxAcceptanceRuns = addLimit(p.Budget.MaxAcceptanceRuns, override.AddedAcceptanceRuns)
 			p.Budget.MaxTokens = addLimit(p.Budget.MaxTokens, override.AddedTokens)
 			p.Budget.MaxWallTime = addDurationLimit(p.Budget.MaxWallTime, override.AddedTime)
+			p.Budget.MaxCost = addFloatLimit(p.Budget.MaxCost, override.AddedCost)
 			p.Overrides = append(p.Overrides, override)
 			p.Status = model.PlanStatusRunning
 			// Transfer authority in the same durable transaction that resumes the
@@ -379,6 +447,7 @@ func (c *Coordinator) ResolvePause(ctx context.Context, in ResolvePauseInput) (*
 			override.AddedAcceptanceRuns = 0
 			override.AddedTokens = 0
 			override.AddedTime = 0
+			override.AddedCost = 0
 			p.Overrides = append(p.Overrides, override)
 			p.Status = model.PlanStatusCancelledByUser
 			p.PauseReason = ""
@@ -398,6 +467,63 @@ func (c *Coordinator) ResolvePause(ctx context.Context, in ResolvePauseInput) (*
 	return c.store.GetPlan(in.PlanID)
 }
 
+// TerminatePlan moves a non-terminal Plan (Running / PausedAwaitingDecision /
+// Blocked) directly to CancelledByUser. It backs the user-driven "cancel the
+// latest request tree" path, where no controller is available to resolve a
+// pause. Like the ResolvePause terminate branch, termination applies no budget
+// increase, but the authorization record (AuthorizedBy / Reason) is still
+// durable so audit can prove who chose it and why; both are required.
+//
+// No notify is sent: TrySignal only yields a signal while PendingReplanRequests
+// is non-empty, so a bare notify would wake NextSignal into an immediate
+// re-sleep. Prompt wakeup of a waiting controller comes from cancelling the
+// controller Task itself (per-task cancel ctx fires NextSignal's ctx.Done),
+// which is the caller's job; the timeout heartbeat in waitForPlanSignal is the
+// fallback. This mirrors the ResolvePause terminate branch, which also commits
+// no wake request.
+func (c *Coordinator) TerminatePlan(ctx context.Context, planID, authorizedBy, reason string) (*model.Plan, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(authorizedBy) == "" {
+		return nil, fmt.Errorf("plan termination requires explicit user authorization")
+	}
+	if strings.TrimSpace(reason) == "" {
+		return nil, fmt.Errorf("plan termination requires an explicit user reason")
+	}
+	c.authorityMu.Lock()
+	defer c.authorityMu.Unlock()
+	err := c.store.update(func(state *persistentState) error {
+		rec, ok := state.Plans[planID]
+		if !ok {
+			return ErrPlanNotFound
+		}
+		p := &rec.Plan
+		if model.IsPlanTerminal(p.Status) {
+			return ErrPlanTerminal
+		}
+		now := time.Now().UTC()
+		// Termination applies no budget increase, but the authorization record
+		// is still durable so audit can prove who chose it and why.
+		p.Overrides = append(p.Overrides, model.ExecutionOverride{
+			ID:           uuid.NewString(),
+			Resolution:   PauseResolutionTerminate,
+			AuthorizedBy: authorizedBy,
+			Reason:       reason,
+			CreatedAt:    now,
+		})
+		p.Status = model.PlanStatusCancelledByUser
+		p.PauseReason = ""
+		p.ExecutionStateVersion++
+		p.UpdatedAt = now
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return c.store.GetPlan(planID)
+}
+
 func addLimit(current, added int64) int64 {
 	if added <= 0 {
 		return current
@@ -409,6 +535,16 @@ func addLimit(current, added int64) int64 {
 }
 
 func addDurationLimit(current, added time.Duration) time.Duration {
+	if added <= 0 {
+		return current
+	}
+	if current == 0 {
+		return added
+	}
+	return current + added
+}
+
+func addFloatLimit(current, added float64) float64 {
 	if added <= 0 {
 		return current
 	}

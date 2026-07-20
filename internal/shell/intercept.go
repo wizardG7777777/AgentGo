@@ -2,32 +2,36 @@ package shell
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"regexp"
 	"sync"
-
-	"github.com/google/uuid"
+	"time"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/interaction"
+	"agentgo/internal/modes"
 )
 
-// ApprovalRequest 灰名单命令的审批请求，由 Worker 发送到 CLI/TUI。
-type ApprovalRequest struct {
-	RequestID string             // 本次审批的唯一 ID（uuid），供前端枚举/定位待审批请求
-	TaskID    string             // 发起审批的任务 ID（取自工具执行 ctx；无任务上下文时为空）
-	AgentID   string             // 申请执行的代理 ID
-	Command   string             // 待执行的命令
-	Pattern   string             // 命中的灰名单原始正则模式，"永远允许" 选项的记忆粒度
-	ReplyCh   chan ApprovalReply // cap=1，Worker 阻塞等待用户回复
-}
+const (
+	// PurposeShellCommand 标识一条 Shell 灰名单授权请求。
+	PurposeShellCommand interaction.Purpose = "shell_command"
+	// ResolutionHandlerShellCommand 是 Bootstrap 回答路由使用的稳定 handler。
+	ResolutionHandlerShellCommand = "shell_command"
 
-// ApprovalReply 用户对审批请求的回复。
-type ApprovalReply struct {
-	Approved        bool   // true=放行执行, false=拒绝
-	Message         string // 非空时为用户自由文本指导（此时 Approved 为 false）
-	RememberPattern string // 非空时把该正则模式加入进程内白名单，本进程后续命中此模式不再询问
-}
+	ActionAllowOnce    = "allow_once"
+	ActionDeny         = "deny"
+	ActionGuidance     = "guidance"
+	ActionAllowSession = "allow_session"
+
+	MetadataCommand    = "command"
+	MetadataPattern    = "pattern"
+	MetadataWorkingDir = "working_dir"
+	MetadataDigest     = "digest"
+)
 
 // MVP 阶段硬编码的默认黑名单（正则模式，匹配即拒绝）。
 var DefaultBlacklist = []string{
@@ -40,7 +44,7 @@ var DefaultBlacklist = []string{
 	`init\s+0`,         // 关机
 }
 
-// MVP 阶段硬编码的默认灰名单（正则模式，匹配时需用户审批）。
+// MVP 阶段硬编码的默认灰名单（正则模式，匹配时需创建用户 Interaction）。
 var DefaultGreylist = []string{
 	`git\s+push`,           // 推送到远程
 	`git\s+reset\s+--hard`, // 硬重置
@@ -57,8 +61,8 @@ var DefaultGreylist = []string{
 
 // CommandFilter 命令拦截器，通过正则模式匹配危险命令。
 //
-// runtimeWhitelist 是"永远允许"的进程内记忆：用户在审批时选择 RememberPattern，
-// 该模式被加入此白名单后，本进程后续命中同模式不再发审批请求。
+// runtimeWhitelist 是"本次运行始终允许"的进程内记忆：用户选择
+// allow_session 后，该模式被加入此白名单，本进程后续命中同模式不再创建请求。
 // 进程重启失效——这是有意的安全边界，避免风险随时间累积。
 type CommandFilter struct {
 	blackPatterns []*regexp.Regexp
@@ -100,7 +104,7 @@ func NewCommandFilter(blacklist, greylist []string) *CommandFilter {
 }
 
 // Check 检查命令是否命中黑名单或灰名单。
-// 返回 action ("allow"/"block"/"approve") 和匹配的原始模式（block/approve 时非空）。
+// 返回 action ("allow"/"block"/"ask") 和匹配的原始模式（block/ask 时非空）。
 //
 // 顺序：黑名单 > 运行时白名单 > 灰名单。
 // 黑名单优先级最高（无法被 "永远允许" 覆盖）；运行时白名单短路灰名单匹配。
@@ -120,7 +124,7 @@ func (f *CommandFilter) Check(command string) (action string, pattern string) {
 	f.wlMu.RUnlock()
 	for i, re := range f.greyPatterns {
 		if re.MatchString(command) {
-			return "approve", f.greyRaw[i]
+			return "ask", f.greyRaw[i]
 		}
 	}
 	return "allow", ""
@@ -160,20 +164,69 @@ func (f *CommandFilter) RuntimeWhitelist() []string {
 	return out
 }
 
-// WrapShellTool 包装原始 run_shell 工具函数，加入黑名单/灰名单拦截层。
-// approvalCh 用于向 CLI 发送审批请求；agentID 标识申请执行的代理。
-// waitHook 可选：进入"等待用户回复"阻塞前回调一次（true），等待结束后再回调
-// 一次（false），供调用方接线 agent 状态机（waiting_approval）；nil 为 no-op。
+// IsRuntimeWhitelisted 报告命令是否命中运行时白名单（allow_session 授权的
+// 进程内记忆）。strict 执行模式用它区分"用户已显式放行的模式"与"普通命令"：
+// 前者直接执行，后者一律转入 ask 路径。
+func (f *CommandFilter) IsRuntimeWhitelisted(command string) bool {
+	f.wlMu.RLock()
+	defer f.wlMu.RUnlock()
+	for _, entry := range f.runtimeWhitelist {
+		if entry.re.MatchString(command) {
+			return true
+		}
+	}
+	return false
+}
+
+// execModeOf 读取 exec 轴当前值；nil store 等价 normal（单测直构场景）。
+func execModeOf(modeStore *modes.Store) modes.ExecMode {
+	if modeStore == nil {
+		return modes.ExecNormal
+	}
+	return modeStore.GetExec()
+}
+
+// WrapShellTool 包装原始 run_shell 工具函数，加入黑名单与 Interaction 灰名单
+// 授权层。灰名单命令创建服务器端 shell_command 请求，并等待该请求真正进入
+// resolved；仅 allow_once / allow_session 会执行 inner。
+//
+// exec 轴（三轴模式）在过滤器判定之后施加短路（docs/design/interaction.md §5.1）：
+//   - yolo：灰名单 ask 自动放行（不创建 Interaction，省一次用户往返），并打
+//     一行中文审计日志；黑名单依旧硬拒。
+//   - strict：所有未命中黑名单 / 运行时白名单的命令一律转入 ask——包括原本
+//     直接放行的普通命令。白名单命中仍放行：那是用户 allow_session 的显式
+//     授权，不应被 strict 重复询问（粒度取舍见设计文档）。黑名单依旧硬拒。
+//
+// interactions 为 nil 或创建/等待失败时一律 fail-closed。sessionID 可为 nil；
+// waitHook 在成功创建请求后、开始等待前收到 true，并在所有退出路径收到 false。
+// modeStore 为 nil 等价 normal（单测直构场景）。
 func WrapShellTool(inner agent.ToolFunc, filter *CommandFilter,
-	approvalCh chan<- ApprovalRequest, agentID string, waitHook func(waiting bool)) agent.ToolFunc {
+	interactions *interaction.Service, sessionID func() string,
+	agentID string, waitHook func(waiting bool), modeStore *modes.Store) agent.ToolFunc {
+	if filter == nil {
+		filter = NewCommandFilter(DefaultBlacklist, DefaultGreylist)
+	}
 
 	return func(ctx context.Context, args map[string]any) (string, error) {
 		command, _ := args["command"].(string)
 		if command == "" {
 			return inner(ctx, args) // 空命令交给原始工具处理（它会报错）
 		}
-
 		action, pattern := filter.Check(command)
+
+		// exec 轴短路：黑名单 block 在任何模式下都保持硬拒绝，不在此触碰。
+		switch execModeOf(modeStore) {
+		case modes.ExecYolo:
+			if action == "ask" {
+				log.Printf("[yolo] 灰名单命令已自动放行: agent=%s, command=%q, pattern=%s", agentID, command, pattern)
+				action = "allow"
+			}
+		case modes.ExecStrict:
+			if action == "allow" && !filter.IsRuntimeWhitelisted(command) {
+				action = "ask"
+				pattern = "" // 非灰名单命中——strict 全量审批，无可捕获模式
+			}
+		}
 
 		switch action {
 		case "block":
@@ -181,59 +234,169 @@ func WrapShellTool(inner agent.ToolFunc, filter *CommandFilter,
 			return "", fmt.Errorf(
 				"⚠ 命令被拒绝（黑名单）：该命令匹配危险模式 [%s]，不允许执行。请使用更安全的替代方案。", pattern)
 
-		case "approve":
-			log.Printf("[shell-filter] 灰名单审批: agent=%s, command=%q, pattern=%s", agentID, command, pattern)
-			// cap=1：agent 侧 ctx 取消放弃等待后，前端迟到的回复也能入队返回，
-			// 而不是把回复方（如 bubbletea Update goroutine）永久阻塞在发送上。
-			replyCh := make(chan ApprovalReply, 1)
-
-			// 向 CLI/TUI 发送审批请求，附带命中的模式以支持"永远允许"
-			select {
-			case approvalCh <- ApprovalRequest{
-				RequestID: uuid.New().String(),
-				TaskID:    agent.TaskIDFromContext(ctx),
-				AgentID:   agentID,
-				Command:   command,
-				Pattern:   pattern,
-				ReplyCh:   replyCh,
-			}:
-			case <-ctx.Done():
-				return "", fmt.Errorf("命令审批被取消")
+		case "ask":
+			if pattern != "" {
+				log.Printf("[shell-filter] 灰名单 Interaction: agent=%s, command=%q, pattern=%s", agentID, command, pattern)
+			} else {
+				log.Printf("[shell-filter] strict 全量审批 Interaction: agent=%s, command=%q", agentID, command)
+			}
+			if interactions == nil {
+				return "", fmt.Errorf("⚠ 命令需要人工授权，但 Interaction 服务不可用；已拒绝执行")
 			}
 
-			// 阻塞等待用户回复（前后各回调一次 waitHook，接线 waiting_approval 状态）
+			workingDir, _ := args["working_dir"].(string)
+			digest := shellCommandDigest(command, pattern, workingDir)
+			taskID := agent.TaskIDFromContext(ctx)
+			currentSessionID := ""
+			if sessionID != nil {
+				currentSessionID = sessionID()
+			}
+			var expiresAt time.Time
+			if deadline, ok := ctx.Deadline(); ok {
+				expiresAt = deadline
+			}
+			options := []interaction.Option{
+				{ID: ActionAllowOnce, Label: "仅允许本次", ActionRef: ActionAllowOnce},
+				{ID: ActionDeny, Label: "拒绝", ActionRef: ActionDeny},
+				{ID: ActionGuidance, Label: "提供指导", RequiresText: true, ActionRef: ActionGuidance},
+			}
+			prompt := fmt.Sprintf("Agent %s 请求执行命令（strict 模式逐条审批）：\n%s", agentID, command)
+			if pattern != "" {
+				prompt = fmt.Sprintf("Agent %s 请求执行灰名单命令：\n%s", agentID, command)
+				// 只有捕获到灰名单模式时才提供 allow_session——strict 全量审批
+				// 没有可加入会话白名单的服务端捕获模式。
+				options = append(options, interaction.Option{
+					ID: ActionAllowSession, Label: "本次运行始终允许该模式", ActionRef: ActionAllowSession,
+				})
+			}
+			request, err := interactions.Create(ctx, interaction.CreateRequest{
+				SessionID:     currentSessionID,
+				Kind:          interaction.KindAuthorization,
+				Purpose:       PurposeShellCommand,
+				Prompt:        prompt,
+				AllowFreeText: true,
+				Options:       options,
+				Origin:  interaction.Origin{Component: "shell", AgentID: agentID, TaskID: taskID},
+				Subject: interaction.Subject{Kind: "shell_command", ID: digest, TaskID: taskID, Digest: digest},
+				Resolution: interaction.ResolutionSpec{
+					Handler: ResolutionHandlerShellCommand, TargetID: digest,
+					AgentID: agentID, TaskID: taskID,
+				},
+				Metadata: map[string]string{
+					MetadataCommand: command, MetadataPattern: pattern,
+					MetadataWorkingDir: workingDir, MetadataDigest: digest,
+				},
+				ExpiresAt: expiresAt,
+			})
+			if err != nil {
+				return "", fmt.Errorf("⚠ 无法创建命令授权请求；已拒绝执行: %w", err)
+			}
+
 			if waitHook != nil {
 				waitHook(true)
 			}
-			select {
-			case reply := <-replyCh:
-				if waitHook != nil {
-					waitHook(false)
+			resolved, err := interactions.Await(ctx, request.ID)
+			if waitHook != nil {
+				waitHook(false)
+			}
+			if err != nil {
+				if ctx.Err() != nil {
+					bestEffortInterrupt(interactions, request.ID, "命令任务已取消或系统正在关闭")
+					return "", fmt.Errorf("命令授权等待被取消（任务结束、超时或系统关闭）: %w", ctx.Err())
 				}
-				if reply.RememberPattern != "" {
-					if err := filter.AddRuntimeWhitelist(reply.RememberPattern); err != nil {
-						log.Printf("[shell-filter] 永远允许失败: pattern=%q err=%v", reply.RememberPattern, err)
-					} else {
-						log.Printf("[shell-filter] 永远允许已生效: pattern=%q", reply.RememberPattern)
-					}
+				switch {
+				case errors.Is(err, interaction.ErrCancelled):
+					return "", fmt.Errorf("⚠ 命令授权已取消: %w", err)
+				case errors.Is(err, interaction.ErrExpired):
+					return "", fmt.Errorf("⚠ 命令授权已过期: %w", err)
+				case errors.Is(err, interaction.ErrInterrupted):
+					return "", fmt.Errorf("⚠ 命令授权已中断: %w", err)
+				default:
+					return "", fmt.Errorf("⚠ 命令授权未完成；已拒绝执行: %w", err)
 				}
-				if reply.Message != "" {
-					// 用户输入了自由文本指导 → 返回给 Agent，不执行命令
-					return "", fmt.Errorf("用户指导: %s", reply.Message)
+			}
+			if !matchesShellRequest(resolved, command, pattern, workingDir, digest, agentID, taskID) {
+				return "", fmt.Errorf("⚠ 命令授权与当前调用不匹配；已拒绝执行")
+			}
+			selected, ok := resolved.SelectedOption()
+			if !ok {
+				return "", fmt.Errorf("⚠ 命令授权缺少有效选项；已拒绝执行")
+			}
+			switch selected.ActionRef {
+			case ActionAllowOnce:
+				// 仅放行当前精确命令调用。
+			case ActionDeny:
+				return "", fmt.Errorf("⚠ 命令被用户拒绝。请调整方案后重试。")
+			case ActionGuidance:
+				if resolved.Response == nil || resolved.Response.Text == "" {
+					return "", fmt.Errorf("⚠ 用户指导为空；命令未执行")
 				}
-				if !reply.Approved {
-					return "", fmt.Errorf("⚠ 命令被用户拒绝。请调整方案后重试。")
+				return "", fmt.Errorf("用户指导: %s", resolved.Response.Text)
+			case ActionAllowSession:
+				// 只能加入创建 Interaction 时由 CommandFilter 捕获的原始模式；
+				// 用户回答和 ActionRef 均不能提供替代正则。
+				if err := filter.AddRuntimeWhitelist(pattern); err != nil {
+					return "", fmt.Errorf("⚠ 无法应用会话白名单；命令未执行: %w", err)
 				}
-				// 放行 → fall through 到执行
-			case <-ctx.Done():
-				if waitHook != nil {
-					waitHook(false)
-				}
-				return "", fmt.Errorf("命令审批被取消（任务结束或系统关闭）")
+				log.Printf("[shell-filter] 会话白名单已生效: pattern=%q", pattern)
+			default:
+				return "", fmt.Errorf("⚠ 未知命令授权动作 %q；已拒绝执行", selected.ActionRef)
 			}
 		}
 
 		// action == "allow" 或灰名单已放行 → 执行原始工具
 		return inner(ctx, args)
+	}
+}
+
+func shellCommandDigest(command, pattern, workingDir string) string {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte(command))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(pattern))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(workingDir))
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func matchesShellRequest(request interaction.Request, command, pattern, workingDir, digest, agentID, taskID string) bool {
+	return request.State == interaction.StateResolved &&
+		request.Purpose == PurposeShellCommand &&
+		request.Resolution.Handler == ResolutionHandlerShellCommand &&
+		request.Resolution.TargetID == digest &&
+		request.Resolution.AgentID == agentID &&
+		request.Resolution.TaskID == taskID &&
+		request.Origin.AgentID == agentID &&
+		request.Origin.TaskID == taskID &&
+		request.Subject.ID == digest &&
+		request.Subject.TaskID == taskID &&
+		request.Subject.Digest == digest &&
+		request.Metadata[MetadataCommand] == command &&
+		request.Metadata[MetadataPattern] == pattern &&
+		request.Metadata[MetadataWorkingDir] == workingDir &&
+		request.Metadata[MetadataDigest] == digest
+}
+
+// bestEffortInterrupt 在原 ctx 已取消后使用独立短超时上下文收尾，避免留下
+// 永久 pending 的幽灵请求。版本冲突时重新读取一次；任何错误都只记录日志，
+// 原命令仍保持 fail-closed。
+func bestEffortInterrupt(interactions *interaction.Service, id, reason string) {
+	if interactions == nil || id == "" {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	for attempt := 0; attempt < 2; attempt++ {
+		request, err := interactions.Get(cleanupCtx, id)
+		if err != nil || request.State.IsTerminal() {
+			return
+		}
+		if _, err = interactions.Interrupt(cleanupCtx, id, request.Version, reason); err == nil {
+			return
+		}
+		if !errors.Is(err, interaction.ErrVersionConflict) {
+			log.Printf("[shell-filter] 收尾 Interaction %s 失败: %v", id, err)
+			return
+		}
 	}
 }

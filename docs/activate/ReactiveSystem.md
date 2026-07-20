@@ -126,7 +126,7 @@ Reactor 子系统支持两种"独立 LLM 调用"路径（详见 §6.1 动作语�
 | 工具权限 | **无工具** —— 不携带任何 tools schema 给 LLM，纯文本输入输出 | 任何 tool definitions |
 | 历史 | **无 history 累积** —— 单轮请求，不参与任何 ReactLoop | 任何已有 agent 的历史消息 |
 | 系统提示词 | **仅使用用户配置的 prompt** | 团队感知 / 角色定义 / 文件感知等由 MemoryStore 提供的上下文 |
-| 运行时上下文 | **完全隔离** | mailbox / approval / file cache / token stats 等 |
+| 运行时上下文 | **完全隔离** | mailbox / interaction / file cache / token stats 等 |
 
 **用途边界**：仅适用于"用 LLM 做一次轻量文本生成/转译"的场景（写日志摘要、为子 agent 生成 initial prompt、根据事件生成通知文案）。**不适用于**需要工具、需要多轮迭代、需要团队协调的场景——这些必须走 `publish_task` 或 `spawn_agent`（不带 via_translator 的 ad-hoc agent 仍走完整 ReactLoop）。
 
@@ -166,7 +166,7 @@ v4 落地了三套独立 Registry（`ToolHookRegistry` / `AgentHookRegistry` / `
 
 - "Task 失败时自动发邮件给指定 agent"
 - "file_written 事件触发外部 lint 脚本"
-- "Agent 进入 WaitingApproval 状态超过阈值时自动取消"
+- "Agent 进入 waiting_interaction 状态超过阈值时自动取消"
 - "任务完成时自动 publish 一个验证子任务"
 
 这些都是**状态转变后的副作用响应**，本质上跟 SQL `TRIGGER AFTER UPDATE` 或 systemd `OnFailure=` 是同一个 family。这正是 Reactor 单元的核心职责——既不能否决状态转变（状态机已经走完），也不应阻塞主流程（一个失败的 Reactor 不能让整个系统僵死）。
@@ -249,7 +249,7 @@ v4 落地了三套独立 Registry（`ToolHookRegistry` / `AgentHookRegistry` / `
 
 | # | 组件 | 当前位置 | v5 真实角色 | 去向 |
 |---|---|---|---|---|
-| X1 | `shell.CommandFilter`（黑/灰/白名单匹配 + 阻拦/审批分流）| `internal/tools/shell/` 内部，bootstrap 时 `shell.BuildFilter` 构造 | **Gate**（事前决策门，按命令名单决定 Abort / 直接放行 / 标记 needs_approval）| 🔁 重构为正式 Gate，与 path-boundary 同档（详见 §7.4 Shell 工具的 ReactiveSystem 集成）|
+| X1 | `shell.CommandFilter`（黑/灰/白名单匹配）| `internal/shell/` 内部，bootstrap 时 `shell.BuildFilter` 构造 | 工具本地策略层：黑名单硬拒绝、白名单放行、灰名单创建 `shell_command` Interaction | 当前未重构为独立 `ShellCommandGate`；用户回答统一走 Interaction（详见 §7.4）|
 
 ---
 
@@ -1179,7 +1179,7 @@ c 不做，意味着 ReactorRegistry **没有运行期动态注册/注销机制*
 
 Q7 选择方案 A 等于**预承诺**以下决议方向：
 
-- **Q9 必落地**：AgentRuntimeState 枚举必须引入（具体枚举内容仍需 Q9 单独拍板，§7.2 列出的 8 个候选 Idle/Polling/Claiming/InReactLoop/WaitingApproval/Compacting/Truncating/Terminating 是起点）
+- **已废弃历史 Q9 草案**：当时提议引入 8 个候选状态；现行实现已收敛为 §7 所述 `idle` / `processing` / `waiting_interaction` / `terminating`，不得再按旧候选集实现
 - **Q10 必落地**：SetState API 形态必须落地（显式 vs helper 的具体决议仍待 Q10）
 - **Phase 3 必执行**：与 Phase 4 ReactorRegistry 配套上线（§10.1 依赖图已确认这是配套设计）
 - **Phase 2 工作量边界扩大**：除 5 个现有事件 payload 升级外，还要预留 `agent_state_changed` 与 3 个 shell 事件（`KindShellExecuted` / `KindShellTimeoutPending` / `KindShellTimeoutResolved`）的事件 schema 定义
@@ -1473,7 +1473,7 @@ func LoadFromYAML(yamlPath string, registry *ReactorRegistry) error {
 Polling             → for 循环位置（无字段）
 Claiming            → ClaimTask 调用瞬间（无字段）
 InReactLoop         → processTask 函数内（loop 变量）
-WaitingApproval     → ApprovalCh recv 阻塞（无字段）
+WaitingInteraction  → Interaction Await 阻塞（已显式）
 Compacting          → 压缩函数调用栈内（无字段）
 Truncating          → TruncateHistory 调用瞬间（无字段）
 Idle                → idleCount 计数器（部分显式）
@@ -1481,7 +1481,7 @@ Idle                → idleCount 计数器（部分显式）
 
 ### 7.1 为什么要显式化
 
-- **Reactor 订阅需要**：如果想让用户配 "Agent 进入 WaitingApproval 状态超过 5 分钟自动取消"，"WaitingApproval 状态" 必须有显式枚举
+- **Reactor 订阅需要**：如果要监控 Agent 等待用户 Interaction 的持续时间，`waiting_interaction` 必须有显式枚举
 - **健康检查与监控**：未来的 watchdog / progress notifier 需要精确知道 "agent 现在在干嘛"
 - **附录 D suspend/resume 前置**：v4 附录 D 的休眠/唤醒优化前提就是状态机显式化
 - **调试**：trace 事件能携带 "状态从 X 转到 Y"，远比 "agent 1 调用了 ClaimTask" 信息密度高
@@ -1496,7 +1496,7 @@ type AgentRuntimeState string
 const (
     AgentStateIdle             AgentRuntimeState = "idle"              // 无任务，轮询 Store 中
     AgentStateProcessing       AgentRuntimeState = "processing"        // 处理任务中（含 ReactLoop / LLM 调用 / 工具执行 / 历史压缩 / 截断）
-    AgentStateWaitingApproval  AgentRuntimeState = "waiting_approval"  // 阻塞等用户批准（仅 needs-approval 工具调用时触发）
+    AgentStateWaitingInteraction AgentRuntimeState = "waiting_interaction" // 阻塞等待任意结构化用户 Interaction
     AgentStateTerminating      AgentRuntimeState = "terminating"       // 任务结束清理中
 )
 ```
@@ -1508,8 +1508,8 @@ const (
 | 状态 | 进入条件 | 退出条件 | 期间 agent 在干什么 |
 |---|---|---|---|
 | `idle` | agent 启动后 / 上一任务 Terminating 完成 | 成功 ClaimTask 一个新任务 | 周期性调 `Store.QueryAvailable`，可能在 `time.Sleep(pollInterval)` 中 |
-| `processing` | ClaimTask 成功 / WaitingApproval 收到 approved 或 rejected 信号 | 进入 WaitingApproval 或 Terminating | ReactLoop 内部所有动作——包括但不限于：LLM 调用、工具执行（非 needs-approval 类）、历史压缩、历史截断、mailbox drain、history 构造 |
-| `waiting_approval` | **仅当**工具调用进入 `ApprovalCh` 阻塞等待时触发 | 收到 approved / rejected 信号（→ processing，rejected 作为工具错误注入 history）或超时 / 外部 cancel（→ terminating）| 阻塞在 `ApprovalCh` 上，不消耗 LLM token，不执行任何动作 |
+| `processing` | ClaimTask 成功 / Interaction 等待结束 | 进入 WaitingInteraction 或 Terminating | ReactLoop 内部所有动作——包括 LLM 调用、工具执行、历史压缩/截断、mailbox drain 与 history 构造 |
+| `waiting_interaction` | Shell 等受控路径调用 `SetInteractionWaitState(..., true)` | Interaction 进入终态、等待取消或调用方退出；通常先回 processing | 阻塞等待结构化用户回答，不消耗 LLM token；可覆盖 Plan、Shell 及后续其它 Interaction purpose |
 | `terminating` | ReactLoop 退出（自然完成 / 超过 MaxLoops / panic recover）| TaskEnd hook 全部执行完，回到 idle | 调用 SubmitResult 或 FailTask、emit TaskEnd hook、清理 FileCache、写最终 trace 事件 |
 
 #### 7.2.2 被显式排除的子动作（用 trace 事件而非状态枚举）
@@ -1536,13 +1536,13 @@ const (
        │      └──────┘               └────────────┘  │
        │                              │     ▲        │
        │                              │     │        │
-       │                              │     │ approved / rejected
+        │                              │     │ interaction_wait_end
        │                              ▼     │        │
        │                       ┌──────────────────┐  │
-       │                       │ waiting_approval │  │
+        │                       │waiting_interaction│ │
        │                       └──────────────────┘  │
        │                              │              │
-       │                              │ timeout / cancel
+        │                              │ cancel / task exit
        │                              │              │
        │  TaskEnd hook done           ▼              │
        │                       ┌────────────┐       │
@@ -1555,13 +1555,13 @@ const (
 
 **6 条转换边**：
 1. `idle → processing`（ClaimTask 成功）
-2. `processing → waiting_approval`（needs-approval 工具调用阻塞）
-3. `waiting_approval → processing`（收到 approved 或 rejected 信号——两者都让 agent 回到 ReactLoop，差别仅在工具调用结果是正常 string 还是 error）
-4. `waiting_approval → terminating`（超时 / 外部 cancel，**不含** rejected——见 Q11.r 决议）
+2. `processing → waiting_interaction`（受控路径开始等待 Interaction）
+3. `waiting_interaction → processing`（Interaction 等待结束；具体 resolved/deny/fail 结果由调用方处理）
+4. `waiting_interaction → terminating`（任务取消或终结与等待窗口竞态时的合法出口）
 5. `processing → terminating`（ReactLoop 退出，含自然完成 / MaxLoops 耗尽 / panic recover 等所有路径）
 6. `terminating → idle`（TaskEnd hook 执行完，回到等任务）
 
-**Q11.r 配套改动（2026-04-30 决议）**：原设计 `waiting_approval → terminating` 包含 rejected，被 Q11.r 修正为"rejected 仅作为工具调用错误注入 history，agent 继续 ReactLoop（→ processing）"。这让 reject 与 path-boundary Abort、validate-line-anchors 失败等其他 Gate Abort 走完全一致的错误处理路径——agent 看到工具失败后由 system prompt 处理纪律决定是否重试、转向替代方案、或最终在任务报告中明确说明因果链后自然 ReactLoop 退出（`processing → terminating`）。
+**当前 Interaction 语义**：`waiting_interaction` 只表达“正在等待用户”，不编码业务结果。Shell 的 `deny` / `guidance` 不执行原命令并作为工具结果返回；Plan 的 execute/revise/cancel 由受信任 handler 更新 PlanStore。Interaction 的 resolved/failed/cancelled/expired/interrupted 与 Agent 运行状态是两套不同状态机。
 
 **显式排除**：
 - 不存在 `processing → idle` 的直接边——所有任务结束必须经过 terminating（保证 cleanup hook 全跑）
@@ -1573,9 +1573,9 @@ const (
 承接 Q7 方案 A 的连锁影响：状态切换由 **Agent 主流程显式调用 SetState** 落地（v5 阶段简单优先，避免 state machine helper 的抽象层）。具体显式切换点位于：
 
 - `Idle → Processing`：[agent.go ClaimTask 调用成功后的位置]
-- `Processing → WaitingApproval`：进入 ApprovalCh 阻塞前
-- `WaitingApproval → Processing`：从 ApprovalCh 接收到 approved 或 rejected 时（rejected 注入 history 后 agent 继续 ReactLoop）
-- `WaitingApproval → Terminating`：从 ApprovalCh 接收到超时信号 / 外部 cancel 时（**不含** rejected）
+- `Processing → WaitingInteraction`：`SetInteractionWaitState(..., true)`，cause=`interaction_wait_start`
+- `WaitingInteraction → Processing`：`SetInteractionWaitState(..., false)`，cause=`interaction_wait_end`
+- `WaitingInteraction → Terminating`：任务取消/终结与等待窗口竞态时允许；交互桥接本身是 best-effort，不覆盖任务终态
 - `Processing → Terminating`：ReactLoop 退出位（含 panic recover defer）
 - `Terminating → Idle`：terminateTask / SubmitResult 完成、TaskEnd hook 跑完后
 
@@ -1606,9 +1606,9 @@ agent_state_changed: {
 
 `cause` 字段示例：
 - `"task_claimed:<task_id>"` （Idle → Processing）
-- `"approval_required:<tool_name>"` （Processing → WaitingApproval）
-- `"approved"` / `"rejected"` （WaitingApproval → Processing；两者都让 agent 回 ReactLoop，差别仅在工具结果是 string 还是 error）
-- `"timeout"` / `"cancel:<source>"` （WaitingApproval → Terminating，仅这两种出口走 terminating）
+- `"interaction_wait_start"` （Processing → WaitingInteraction）
+- `"interaction_wait_end"` （WaitingInteraction → Processing）
+- `"cancel:<source>"` / ReactLoop exit cause（WaitingInteraction → Terminating，任务终结路径）
 - `"react_loop_exit:natural"` / `"react_loop_exit:max_loops"` / `"react_loop_exit:panic"` （Processing → Terminating）
 - `"task_end_hook_done"` （Terminating → Idle）
 
@@ -1620,7 +1620,7 @@ agent_state_changed: {
 
 #### 7.3.1 实施形态
 
-`SetState` 是 `internal/agent.Agent` 的方法（不引入独立 `StateMachine` struct），约 30 行实现 + 一张 6 条边的转换表。
+`SetState` 是 `internal/agent.Agent` 的方法（不引入独立 `StateMachine` struct），由 `stateGuard` 互斥保护并使用一张 6 条边的转换表。
 
 ```go
 // 调用形态（agent.go 主流程内 6 个显式位置）
@@ -1689,14 +1689,14 @@ func (a *Agent) mustSetState(newState AgentRuntimeState, cause string) {
 
 **实践预期**：6 个显式调用点中**不会出现自循环 SetState**（每个切换点的 prev/new 状态都不同）。自循环的合法性更多是"防御性宽容"——即使将来意外写出 `SetState(currentState)` 也不会 panic。
 
-#### 7.3.4 6 个显式调用点（用户确认完整无遗漏）
+#### 7.3.4 六类显式状态边界
 
 | # | 调用点 | 切换 | cause 字段示例 |
 |---|---|---|---|
 | 1 | ClaimTask 成功后 | Idle → Processing | `"task_claimed:<task_id>"` |
-| 2 | needs-approval 工具进入 ApprovalCh 阻塞前 | Processing → WaitingApproval | `"approval_required:<tool_name>"` |
-| 3 | 从 ApprovalCh 接收 approved 或 rejected | WaitingApproval → Processing | `"approved"` / `"rejected"`（rejected 时 ApprovalCh 包装层把工具结果设为 error，agent 在下一轮 ReactLoop 看到该错误后由 system prompt 处理纪律决定后续动作）|
-| 4 | 从 ApprovalCh 超时 / 外部 cancel | WaitingApproval → Terminating | `"timeout"` / `"cancel:<source>"`（**不含** rejected——见 §7.2.3 Q11.r 配套改动说明）|
+| 2 | 受控路径开始等待 Interaction | Processing → WaitingInteraction | `"interaction_wait_start"` |
+| 3 | Interaction 等待结束 | WaitingInteraction → Processing | `"interaction_wait_end"` |
+| 4 | 任务取消/终结与等待竞态 | WaitingInteraction → Terminating | 任务取消或 ReactLoop exit cause |
 | 5 | ReactLoop 退出位（含 panic recover defer）| Processing → Terminating | `"react_loop_exit:natural"` / `":max_loops"` / `":panic"` |
 | 6 | TaskEnd hook 跑完 / SubmitResult 完成 | Terminating → Idle | `"task_end_hook_done"` |
 
@@ -1705,8 +1705,8 @@ func (a *Agent) mustSetState(newState AgentRuntimeState, cause string) {
 ```go
 var validTransitions = map[AgentRuntimeState]map[AgentRuntimeState]bool{
     AgentStateIdle:             {AgentStateProcessing: true},
-    AgentStateProcessing:       {AgentStateWaitingApproval: true, AgentStateTerminating: true},
-    AgentStateWaitingApproval:  {AgentStateProcessing: true, AgentStateTerminating: true},
+    AgentStateProcessing:       {AgentStateWaitingInteraction: true, AgentStateTerminating: true},
+    AgentStateWaitingInteraction: {AgentStateProcessing: true, AgentStateTerminating: true},
     AgentStateTerminating:      {AgentStateIdle: true},
 }
 ```
@@ -1716,26 +1716,35 @@ var validTransitions = map[AgentRuntimeState]map[AgentRuntimeState]bool{
 #### 7.3.6 与 §6.4 / Phase 3 的连锁
 
 - §6.4.1 `KindAgentStateChanged` 事件由 SetState 内部统一 emit，调用方零负担
-- Phase 3 实施清单：6 个调用点穿插 + isValidTransition 表 + SetState/mustSetState 方法 + 单元测试覆盖 6 条合法边 + 至少 6 条非法边 panic 用例（含一条专门测试 `WaitingApproval → Processing` 在 rejected cause 下也合法的用例，避免后续重构误把 rejected 当成 terminating 触发器）
+- Phase 3 当前实现：主流程四条边由 `mustSetState` 驱动；Interaction 往返两条边由 `SetInteractionWaitState` best-effort 驱动；测试覆盖合法边、非法边、自循环与 generic causes
 - Phase 2 TraceUpgrade 把 `KindAgentStateChanged` 加入事件 schema 时直接对齐 §7.2.6 的 payload 草案
 
-### 7.4 Shell 工具的 ReactiveSystem 集成（详见 ToolUpgradePlan.md §2）
+### 7.4 Shell 工具的 Interaction 集成
 
-Shell 工具（`run_shell`）是 AgentGo 与现实世界交互的核心入口，是当前唯一会触发 `WaitingApproval` 状态的工具。其完整改造规格（命令名单格式、approval UI 4 选项、匹配语法、yaml 持久化、TimeoutHandler 抽象等）已迁移至 [ToolUpgradePlan.md §2](ToolUpgradePlan.md#2-shell-工具升级首批重点)。
+Shell 工具（`run_shell`）是当前 `waiting_interaction` 的特权授权生产者。`CommandFilter` 黑名单硬拒绝、白名单/运行期 whitelist 放行、灰名单创建 `KindAuthorization` / `Purpose=shell_command` Interaction。当前契约以 [Interaction 设计](../design/interaction.md) 为准；ToolUpgradePlan §2 的四键提示与名单写回方案属于已废弃历史。
 
-**ReactiveSystem 视角的关键集成接口**（Q11/Q12/Q13/Q11.r 已决议 2026-04-30）：
+**当前关键集成接口**：
 
 | 集成点 | ReactiveSystem 侧语义 | 详细规格位置 |
 |---|---|---|
-| `shell.CommandFilter` 重构为 Gate | 与 path-boundary 同档的正式 Gate，Phase 1 命名空间清理一并完成 | [ToolUpgradePlan §2.3](ToolUpgradePlan.md#23-gate-决策流程) |
-| `WaitingApproval` 触发条件 | needs-approval **不再是工具属性硬编码**，而是 Gate 计算结果（承接 §7.2.1 Q9 措辞精修）| [ToolUpgradePlan §2.3](ToolUpgradePlan.md#23-gate-决策流程) |
-| Reject 作为工具调用错误返还 | 与 path-boundary Abort、validate-line-anchors 失败同档，走 v4 §7/§10 现有错误处理路径；agent 通过 system prompt 处理纪律自适应 | [ToolUpgradePlan §2.4 / §2.5](ToolUpgradePlan.md#24-4-选项-approval-ui-与-agent-通知) |
+| `shell.CommandFilter` | 仍是 `internal/shell` 内的命令策略层，不宣称已落地独立 Shell Gate | `internal/shell/intercept.go` |
+| Interaction 请求 | 绑定 command、matched pattern、working directory、AgentID、TaskID 与 digest；不匹配或服务不可用时 fail closed | [Interaction 设计 §5](../design/interaction.md#5-shell-精确命令授权) |
+| 稳定选项 | `allow_once` / `deny` / `guidance`（需文本）/ `allow_session`；只有 allow 两项执行原调用 | [Interaction 设计 §5](../design/interaction.md#5-shell-精确命令授权) |
+| 运行期 whitelist | `allow_session` 仅为稳定 Option ID；规则在当前进程/本次运行内有效，切换 `/session` 不清空，退出后不持久化 | `internal/shell/rules.go` |
 | `KindShellExecuted` 事件 | 进 §6.4.1 首批清单（#7），但**仅内置 Reactor 可订阅**，用户 YAML schema 暂不开放 | [ToolUpgradePlan §2.9](ToolUpgradePlan.md#29-kindshellexecuted-事件的开放策略) |
-| `TimeoutHandler` 抽象（第三类决策点）| 与 Gate / Reactor 并列的"动作进行中决策点"——Gate 决定开跑前、Reactor 响应已发生、TimeoutHandler 决定动作进行中。v5 仅内置 `truncate` handler，接口层 + YAML 占位 schema 一开始就立住 | [ToolUpgradePlan §2.8](ToolUpgradePlan.md#28-shell-超时机制) |
-| `KindShellTimeoutPending` / `KindShellTimeoutResolved` 事件 | 进 §6.4.1 首批清单（#8 / #9），仅内置 Reactor 可订阅；事件订阅与 handler 决策解耦 —— 内置 Reactor 可监听做日志/metric/告警，不必走 TimeoutHandler 链 | [ToolUpgradePlan §2.8.5](ToolUpgradePlan.md#285-trace-事件配套) |
-| Worker / Explorer prompt 模板更新 | 追加"工具权限处理纪律"段落，与 Gate 重构同 PR 上线避免中间态 | [ToolUpgradePlan §2.5](ToolUpgradePlan.md#25-system-prompt-处理纪律q11r-配套) |
+| `TimeoutHandler` 抽象 | 尚未落地；Shell 当前使用固定超时 | [KNOWN_ISSUES](KNOWN_ISSUES.md#shell-超时处理仍是固定超时) |
+| `KindShellTimeoutPending` / `KindShellTimeoutResolved` | 当前为 reserved kind，不发射且拒绝用户 Reactor 订阅 | [KNOWN_ISSUES](KNOWN_ISSUES.md#shell-超时处理仍是固定超时) |
+| Agent 处理纪律 | deny/guidance 不执行命令；替代方案或最终失败由正常工具结果与 Agent 主循环处理 | [Interaction 设计 §5](../design/interaction.md#5-shell-精确命令授权) |
 
-**为什么拆分**：§7.4 的大部分内容（YAML 文件格式、4 选项 UI 文案、shell-aware tokenization 规则、yaml.v3 Node API 持久化、SIGKILL truncate 机制）属于 Shell 工具自身的实施细节，与 ReactiveSystem 抽象本身解耦——它们只是 Gate 的一个具体消费者。把这部分搬到 ToolUpgradePlan.md，让本文档专注于"四类角色抽象 + 状态机 + 事件流"的核心命题。
+回答采用 `pending → resolving → effect → resolved`。控制面锁定回答后，持有原始命令闭包的 Shell waiter 从 `Await` 返回，重新核对全部绑定再决定是否执行。前端只能提交稳定 Option ID 与文本，不能提供 `ActionRef` 或 whitelist pattern。
+
+### 7.5 Agent 普通提问适配器
+
+MetaGroup 的 `request_user_input` 让 Scheduler 或获 profile 授权的普通 runner 创建 `Kind=choice` / `Purpose=agent_question` Interaction。输入只允许 `prompt` 与 2–8 项严格 option JSON；Agent 只能收到 `request_id`、稳定 `option_id` 与 `text`，不能提供 ActionRef 或触发 Plan/Shell effect。TUI/Web 显示当前进程内全部 pending 请求，`SessionID` 只标记创建审计归属；TUI 用 `PgUp/PgDn` 翻动较长问题正文。
+
+### 7.6 已废弃历史：Approval 专用通道
+
+2026-04 的 Q9/Q11 草案曾设计 `ApprovalCh`、`ApprovalRequest`、`waiting_approval` 和 `1/2/3/4` 单键面板。该方案已被 generic Interaction、`waiting_interaction` 与稳定 Option ID 完整替代，**不是当前契约，也不得作为实现依据**。本文件后续决议表若保留这些术语，仅用于解释历史迁移。
 
 ---
 
@@ -1747,12 +1756,14 @@ Shell 工具（`run_shell`）是 AgentGo 与现实世界交互的核心入口，
 - **Reactor / Gate 的运行时热重载**：v5 阶段配置依然启动期固定，重启生效。热重载留作未来扩展点
 - **跨进程 Reactor（如调用外部 webhook）**：v5 首版仅支持进程内动作（调内置工具 / publish 任务）。webhook / gRPC / 外部消息队列等进程外交互留作未来
 - **Reactor 之间的依赖与编排**：v5 首版每个 Reactor 独立执行，不支持 "Reactor A 完成后触发 Reactor B" 这种链式依赖。需要时改用 publish_task → 新任务上挂新 Reactor 的方式表达
-- **Shell 命令名单 / approval UI / 持久化 / 超时机制等具体实施细节**：迁移至 [ToolUpgradePlan.md §2](ToolUpgradePlan.md#2-shell-工具升级首批重点)，本模块仅保留 §7.4 集成接口表
-- **WaitingApproval 的"持续时长触发"**：reactor 不支持"状态持续超过 N 分钟自动触发"这种时间维度——这是个独立模块（需要定时器调度 / 状态时长追踪），留作 v5.x。当前用 watchdog 兜底超时取消（用户长时间不批准是用户自己的选择）
+- **Shell 持久化名单与可插拔超时处理**：尚未实现；ToolUpgradePlan §2 只保留已废弃历史方案，当前边界见 §7.4 与 KNOWN_ISSUES
+- **`waiting_interaction` 的持续时长触发**：Reactor 不支持“状态持续超过 N 分钟自动触发”这种时间维度；Trace CLI 可检测长期等待，但不能替用户回答
 
 ---
 
 ## 9. 待讨论清单（按优先级排序）
+
+> 本表保留早期决策脉络。Q9/Q11/Q11.r 的专用 Approval 方案已废弃；当前状态和 Shell 用户决定以 §7 与 `docs/design/interaction.md` 为准。
 
 进入 spec 定稿之前，需要逐项对齐：
 
@@ -1769,10 +1780,10 @@ Shell 工具（`run_shell`）是 AgentGo 与现实世界交互的核心入口，
 | Q6 | Reactor 执行模型走 §6.3 哪种？ | i 同步 / ii 异步无回执 / iii 异步带回执 | iii |
 | Q7 | v5 首批支持的触发事件是 §6.4 哪几个？ | 5 + 1（task_claimed/completed/failed/cancelled/file_written + agent_state_changed 配套）；方案 A 同开 Q9+Q10+Phase 3 | ✅ **已拍板**（2026-04-30，详见 §6.4.1-6.4.6）|
 | Q8 | TraceUpgrade（事件 payload 结构化）是否提前到本模块作为 §S0？ | 提前 / 分开走 | 提前 |
-| Q9 | Agent 实例状态枚举是否就是 §7.2 那 8 个？是否漏了什么？ | 4 个核心状态（idle / processing / waiting_approval / terminating）；waiting_approval 仅在 needs-approval 工具调用时触发；压缩期间仍属 processing | ✅ **已拍板**（2026-04-30，详见 §7.2.1-7.2.6）|
+| Q9 | Agent 实例状态枚举是否就是 §7.2 那 8 个？是否漏了什么？ | 4 个核心状态（idle / processing / waiting_interaction / terminating）；压缩期间仍属 processing | ✅ **当前实现已迁移**（详见 §7.2）|
 | Q10 | 状态切换由 Agent 主流程显式调用 vs state machine helper 自动管理？ | ii 显式封装（Agent.SetState 方法）+ 非法切换 panic 由 watchdog 兜底 + 自循环合法但 no-op + 6 调用点确认完整 | ✅ **已拍板**（2026-04-30，详见 §7.3.1-7.3.6）|
-| Q11 | Shell 命令名单结构 + Gate 重构 + approval UI + 匹配语法 + 持久化 | 单一文件 shell_commands.yaml（扁平 blacklist/whitelist）+ shell.CommandFilter 重构为 Gate + 4 选项 approval（Once/All）+ Gate 动态计算 needs_approval + 整体匹配前缀通配 + 启动期模板自动生成 + 直接写回 yaml.v3 Node | ✅ **已拍板**（2026-04-30，详见 [ToolUpgradePlan §2.1-§2.7](ToolUpgradePlan.md#2-shell-工具升级首批重点) + §7.4 集成接口表）|
-| Q11.r | reject 后 agent 的处理机制（多 agent 场景下用户不便对单个 agent 追加指令）| reject 作为工具调用错误返还（与 path-boundary Abort 同档）+ system prompt 补充处理纪律（侵入性更小的替代 / 任务失败时显式说明因果链）→ 用户通过任务报告事后追溯，无需 approval 时输入 reason | ✅ **已拍板**（2026-04-30，详见 [ToolUpgradePlan §2.4 / §2.5](ToolUpgradePlan.md#24-4-选项-approval-ui-与-agent-通知)）|
+| Q11 | Shell 名单、独立 Gate、四键 UI 与持久化 | 2026-04 曾计划 `shell_commands.yaml`、独立 Gate 和专用四选项面板 | ⛔ **已废弃历史**；当前为 CommandFilter + generic Interaction，持久化名单未实现 |
+| Q11.r | 用户拒绝后的处理机制 | `deny` / `guidance` 不执行原命令，作为正常工具结果返回主循环；用户回答由稳定 Option ID 表达 | ✅ **当前实现已迁移**（详见 §7.4）|
 | Q12 | KindShellExecuted 是否进 v5 首批事件？ | 进首批，但仅内置 Reactor 可订阅，用户 YAML schema 暂不开放（占位预留）| ✅ **已拍板**（2026-04-30，详见 [ToolUpgradePlan §2.9](ToolUpgradePlan.md#29-kindshellexecuted-事件的开放策略)）|
 | Q13 | Shell 超时机制 | 用户配置 timeout 阈值（单位秒）即容忍上限；超时拆为「事件 + TimeoutHandler」二段式抽象（emit `KindShellTimeoutPending` → handler 决策 → emit `KindShellTimeoutResolved`）；v5 仅内置 `truncate` handler（行为等同原 `truncate` 单档：SIGKILL + 部分输出 + 错误返还）；接口层 + YAML 占位 schema + 三档 decision 枚举（truncate / wait / continue）一开始就立住，未来 `wait_then_truncate` / `consult_llm` / `message_agent` / `escalate_to_user` 等 handler 可增量加而无需重构 | ✅ **已拍板**（2026-04-30，详见 [ToolUpgradePlan §2.8](ToolUpgradePlan.md#28-shell-超时机制)）|
 

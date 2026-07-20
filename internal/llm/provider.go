@@ -25,6 +25,14 @@ type Provider interface {
 	RequestOptions() []option.RequestOption
 }
 
+// ReasoningEffortMapper is an optional provider capability for gateways whose
+// Chat Completions request shape differs from OpenAI's top-level
+// reasoning_effort field. Providers that do not implement it use the standard
+// OpenAI field automatically.
+type ReasoningEffortMapper interface {
+	ReasoningEffortOptions(effort string) []option.RequestOption
+}
+
 var (
 	providerRegistryMu sync.RWMutex
 	providerRegistry   = map[string]Provider{}

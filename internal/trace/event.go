@@ -180,14 +180,14 @@ type Transition struct {
 	NewStatus  string `json:"new_status,omitempty"`
 
 	// Agent 状态机（agent_state_changed）
-	PrevState string `json:"prev_state,omitempty"` // idle / processing / waiting_approval / terminating
+	PrevState string `json:"prev_state,omitempty"` // idle / processing / waiting_interaction / terminating
 	NewState  string `json:"new_state,omitempty"`
 
 	// 通用字段：结构化原因 enum，让 Reactor when 条件能精确匹配。
 	// 示例值：
 	//   - "task_claimed:<task_id>"            （idle → processing）
-	//   - "approval_required:<tool_name>"     （processing → waiting_approval）
-	//   - "approved" / "rejected" / "timeout" （waiting_approval 出口）
+	//   - "interaction_wait_start"            （processing → waiting_interaction）
+	//   - "interaction_wait_end"              （waiting_interaction → processing）
 	//   - "react_loop_exit:natural" / ":max_loops" / ":panic"  （processing → terminating）
 	//   - "task_end_hook_done"                （terminating → idle）
 	//   - "max_loops_exceeded" / "recoverable_error_retries_exhausted" /

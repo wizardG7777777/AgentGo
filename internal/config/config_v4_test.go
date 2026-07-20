@@ -82,6 +82,43 @@ func TestWatchdogPendingGraceDefaultsAndYAMLDecode(t *testing.T) {
 	}
 }
 
+func TestValidateReasoningEffortAcceptsOpenAIValues(t *testing.T) {
+	for _, effort := range OpenAIReasoningEfforts {
+		t.Run(effort, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.LLM.DefaultModel = "gpt-test"
+			cfg.LLM.ReasoningEffort = effort
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("reasoning_effort=%q should be valid: %v", effort, err)
+			}
+		})
+	}
+}
+
+func TestValidateReasoningEffortRejectsUnknownValue(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.LLM.DefaultModel = "gpt-test"
+	cfg.LLM.ReasoningEffort = "ultra"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "llm.reasoning_effort") {
+		t.Fatalf("Validate error = %v, want reasoning_effort validation error", err)
+	}
+}
+
+func TestLoadConfigDecodesStreamingRequestPolicy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "llm.yaml")
+	data := []byte("llm:\n  default_model: gpt-test\n  reasoning_effort: high\n  stream: true\n")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LLM.ReasoningEffort != "high" || !cfg.LLM.Stream {
+		t.Fatalf("LLM request policy = %+v", cfg.LLM)
+	}
+}
+
 func TestSessionRecoverySafetyDefaultsAndYAMLDecode(t *testing.T) {
 	defaults := DefaultConfig()
 	if got := defaults.SessionResumeMaxIdleSec; got != 3600 {
@@ -264,6 +301,76 @@ func TestValidate_SchedulerOnlyRequiresAndAcceptsModel(t *testing.T) {
 	cfg.Scheduler.Model = ""
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "缺少模型") {
 		t.Fatalf("empty Scheduler-only config should fail on model, got %v", err)
+	}
+}
+
+func TestSchedulerBehaviorDefaultsAndYAMLOverrides(t *testing.T) {
+	defaults := DefaultConfig()
+	if defaults.Scheduler.AgentMaxLoops != DefaultSchedulerMaxLoops {
+		t.Fatalf("default scheduler.agent_max_loops=%d want %d",
+			defaults.Scheduler.AgentMaxLoops, DefaultSchedulerMaxLoops)
+	}
+	if defaults.Scheduler.EnforceCompactTokenThreshold != DefaultSchedulerCompactTokenThreshold {
+		t.Fatalf("default scheduler.enforce_compact_token_threshold=%d want %d",
+			defaults.Scheduler.EnforceCompactTokenThreshold, DefaultSchedulerCompactTokenThreshold)
+	}
+	if defaults.Scheduler.ContextLimit != DefaultSchedulerContextLimit {
+		t.Fatalf("default scheduler.context_limit=%d want %d",
+			defaults.Scheduler.ContextLimit, DefaultSchedulerContextLimit)
+	}
+
+	path := filepath.Join(t.TempDir(), "scheduler.yaml")
+	data := []byte("llm:\n  default_model: test-model\nscheduler:\n  agent_max_loops: 47\n  enforce_compact_token_threshold: 160000\n  context_limit: 240000\n")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("scheduler behavior overrides should validate: %v", err)
+	}
+	if cfg.Scheduler.AgentMaxLoops != 47 ||
+		cfg.Scheduler.EnforceCompactTokenThreshold != 160000 ||
+		cfg.Scheduler.ContextLimit != 240000 {
+		t.Fatalf("scheduler overrides not decoded: %+v", cfg.Scheduler)
+	}
+
+	modelOnlyPath := filepath.Join(t.TempDir(), "scheduler-model-only.yaml")
+	if err := os.WriteFile(modelOnlyPath, []byte("llm:\n  default_model: test-model\nscheduler:\n  model: scheduler-model\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	modelOnly, err := LoadConfig(modelOnlyPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modelOnly.Scheduler.AgentMaxLoops != DefaultSchedulerMaxLoops ||
+		modelOnly.Scheduler.EnforceCompactTokenThreshold != DefaultSchedulerCompactTokenThreshold ||
+		modelOnly.Scheduler.ContextLimit != DefaultSchedulerContextLimit {
+		t.Fatalf("model-only scheduler block lost compatibility defaults: %+v", modelOnly.Scheduler)
+	}
+}
+
+func TestValidate_SchedulerBehaviorRejectsNegativeValues(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*SchedulerKind)
+		field  string
+	}{
+		{"max loops", func(s *SchedulerKind) { s.AgentMaxLoops = -1 }, "agent_max_loops"},
+		{"compact threshold", func(s *SchedulerKind) { s.EnforceCompactTokenThreshold = -1 }, "enforce_compact_token_threshold"},
+		{"context limit", func(s *SchedulerKind) { s.ContextLimit = -1 }, "context_limit"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.LLM.DefaultModel = "test-model"
+			tc.mutate(&cfg.Scheduler)
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("negative %s should fail, got %v", tc.field, err)
+			}
+		})
 	}
 }
 

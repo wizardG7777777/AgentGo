@@ -15,6 +15,7 @@ func TestGetProvider_KnownNames(t *testing.T) {
 		wantType string // 期望的 Name() 返回值
 	}{
 		{"openai", "openai"},
+		{"openrouter", "openrouter"},
 		{"deepseek-v4", "deepseek-v4"},
 		{"deepseek-r1", "deepseek-r1"},
 	}
@@ -49,6 +50,7 @@ func TestRegisteredProviders_ContainsBuiltins(t *testing.T) {
 	names := RegisteredProviders()
 	want := map[string]bool{
 		"openai":      false,
+		"openrouter":  false,
 		"deepseek-v4": false,
 		"deepseek-r1": false,
 	}

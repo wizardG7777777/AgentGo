@@ -36,13 +36,17 @@ func buildKindLLMClient(llmCfg config.LLMConfig, kindModel string) llm.Client {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
-	return llm.NewSDKClient(
+	return llm.NewSDKClientWithConfig(
 		llmCfg.BaseURL,
 		llmCfg.APIKey,
 		model,
 		"", // system prompt 由 runner / scheduler 自管，不在 client 层注入
 		llmCfg.Provider,
 		timeout,
+		llm.ClientConfig{
+			ReasoningEffort: llmCfg.ReasoningEffort,
+			Stream:          llmCfg.Stream,
+		},
 	)
 }
 
@@ -205,19 +209,20 @@ func resolveRouteCapabilities(cfg *config.Config, kind config.AgentKind) ([]stri
 
 // buildSchedulerRuntime 为 scheduler 单例合成 AgentRuntimeConfig。
 //
-// nextUpgrade_v4.md §11.5.5 配置面收窄：scheduler 仅 model 字段允许外部覆盖，
-// 其余字段（工具集 / 系统提示词 / 行为参数 / replicas）全部硬编码在 internal/scheduler。
-// 因此本函数只负责"把外部可配的 model 字段合并好"，其余字段留空——scheduler
-// 内部构造时按内置常量兜底。
+// 工具集 / 系统提示词 / replicas 仍由 internal/scheduler 固定；模型与
+// Agent.processTask 消费的三个预算字段从 SchedulerKind 投影到运行时形状。
 func buildSchedulerRuntime(sched config.SchedulerKind, llmCfg config.LLMConfig) config.AgentRuntimeConfig {
 	model := sched.Model
 	if model == "" {
 		model = llmCfg.DefaultModel
 	}
 	return config.AgentRuntimeConfig{
-		InstanceID: "scheduler",
-		Kind:       "scheduler",
-		Model:      model,
-		// 其余字段（AllowedTools / SystemPrompt / 行为参数）由 internal/scheduler 内部决定
+		InstanceID:                   "scheduler",
+		Kind:                         "scheduler",
+		Model:                        model,
+		AgentMaxLoops:                sched.AgentMaxLoops,
+		EnforceCompactTokenThreshold: sched.EnforceCompactTokenThreshold,
+		ContextLimit:                 sched.ContextLimit,
+		// AllowedTools / SystemPrompt 仍由 internal/scheduler 内部决定。
 	}
 }

@@ -1303,25 +1303,25 @@ func detectAnomalies(events []Event) []string {
 
 	// === v5 Phase 2 新增（TraceUpgrade.md §6.3）===
 
-	// 6. 检测：agent 在 waiting_approval 累计时长 > 5min（用户长时间不批准）
+	// 6. 检测：agent 在 waiting_interaction 累计时长 > 5min（用户长时间未响应）
 	{
-		var waitingApprovalEnter time.Time
+		var waitingInteractionEnter time.Time
 		var totalWaiting time.Duration
 		for _, ev := range events {
 			if ev.Kind != KindAgentStateChanged || ev.Transition == nil {
 				continue
 			}
-			if ev.Transition.NewState == "waiting_approval" {
-				waitingApprovalEnter = ev.Timestamp
+			if ev.Transition.NewState == "waiting_interaction" {
+				waitingInteractionEnter = ev.Timestamp
 			}
-			if ev.Transition.PrevState == "waiting_approval" && !waitingApprovalEnter.IsZero() {
-				totalWaiting += ev.Timestamp.Sub(waitingApprovalEnter)
-				waitingApprovalEnter = time.Time{}
+			if ev.Transition.PrevState == "waiting_interaction" && !waitingInteractionEnter.IsZero() {
+				totalWaiting += ev.Timestamp.Sub(waitingInteractionEnter)
+				waitingInteractionEnter = time.Time{}
 			}
 		}
 		if totalWaiting > 5*time.Minute {
 			anomalies = append(anomalies, fmt.Sprintf(
-				"WARNING agent 累计在 waiting_approval 状态 %s（用户长时间未批准？）",
+				"WARNING agent 累计在 waiting_interaction 状态 %s（用户长时间未响应？）",
 				formatDuration(totalWaiting)))
 		}
 	}

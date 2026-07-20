@@ -150,6 +150,23 @@ func (t *ActivityTracker) LLMEnd(agentID, taskID string, loop int, text string, 
 	s.LastActivityAt = time.Now()
 }
 
+// LLMDelta refreshes the live model preview while a streamed response is in
+// flight. It deliberately receives answer content only; reasoning metadata is
+// never exposed through the activity/UI path.
+func (t *ActivityTracker) LLMDelta(agentID, taskID string, loop int, text string) {
+	if t == nil || agentID == "" || text == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	s := t.ensureLocked(agentID)
+	s.TaskID = firstNonEmpty(taskID, s.TaskID)
+	s.Loop = loop
+	s.Phase = "streaming"
+	s.LastModelText = compactActivityText(text)
+	s.LastActivityAt = time.Now()
+}
+
 func (t *ActivityTracker) ToolStarted(agentID, taskID string, loop int, callID, toolName string) {
 	if t == nil || agentID == "" {
 		return

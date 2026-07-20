@@ -69,6 +69,19 @@ func (r *ToolRegistry) RegisteredCount() int {
 	return len(r.tools)
 }
 
+// WrapHandler 用 wrapper 包装已注册工具 name 的执行函数（拦截/增强用途）。
+// 仅替换执行函数，defs（名称/描述/参数）保持不变，LLM 侧无感知。
+// 工具不存在时返回 false，由调用方决定跳过或报错。
+// 与 Register 一样应在代理启动前的装配期调用。
+func (r *ToolRegistry) WrapHandler(name string, wrapper func(ToolFunc) ToolFunc) bool {
+	fn, ok := r.tools[name]
+	if !ok {
+		return false
+	}
+	r.tools[name] = wrapper(fn)
+	return true
+}
+
 // Dispatch 根据 LLM 返回的 ToolCall 分发到对应的工具函数。
 func (r *ToolRegistry) Dispatch(ctx context.Context, call llm.ToolCall) (string, error) {
 	fn, ok := r.tools[call.Name]

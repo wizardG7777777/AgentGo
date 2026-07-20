@@ -10,6 +10,7 @@ import (
 	"agentgo/internal/config"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
+	"agentgo/internal/modes"
 	"agentgo/internal/probe"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
@@ -30,8 +31,13 @@ const (
 // 字段顺序与 JSON tag 在保持向后兼容的前提下扩展：
 //   - 新字段一律 omitempty，旧测试在传 nil 数据源时仍能通过
 //   - 既有字段顺序不变，避免 LLM 看到的 schema 漂移
+//
+// 三轴模式字段（v5 三轴模式）：Mode 保留原 "mode" 字段=gate 轴字符串，
+// ExecMode / TopoMode 为新增，与 Mode 一样总是出现（非 omitempty）。
 type boardSnapshot struct {
 	Mode                   string                      `json:"mode"`
+	ExecMode               string                      `json:"exec_mode"`
+	TopoMode               string                      `json:"topo_mode"`
 	Trigger                triggerInfo                 `json:"trigger"`
 	Plan                   *planSnapshot               `json:"plan,omitempty"`
 	ResumablePlans         []resumablePlanSnapshot     `json:"resumable_plans,omitempty"`
@@ -271,7 +277,8 @@ type PendingDownstreamTask struct {
 // 参数：
 //   - s: TaskStore，用于 ScanAll
 //   - cfg: 配置（读取 WorkerCount 计算可用 worker 数）
-//   - mode: "immediate" 或 "plan"
+//   - modeSnap: 三轴模式快照（modes.Snapshot）——Gate 写入 "mode" 字段
+//     （兼容旧消费方），Exec / Topo 分别写入 "exec_mode" / "topo_mode"
 //   - trigger: 当前 reactLoop 的触发事件（用户输入、task completed 等）
 //   - sources: 可选数据源（mailbox / roster / session history）
 //
@@ -284,7 +291,7 @@ type PendingDownstreamTask struct {
 func BuildBoardJSON(
 	s store.TaskStore,
 	cfg *config.Config,
-	mode string,
+	modeSnap modes.Snapshot,
 	trigger model.Event,
 	sources SnapshotSources,
 ) string {
@@ -401,8 +408,10 @@ func BuildBoardJSON(
 	}
 
 	bs := boardSnapshot{
-		Mode:    mode,
-		Trigger: ti,
+		Mode:     modeSnap.Gate,
+		ExecMode: modeSnap.Exec,
+		TopoMode: modeSnap.Topo,
+		Trigger:  ti,
 		Tasks:   taskSnaps,
 		Resources: resourceInfo{
 			RuntimeMode:       runtimeMode,

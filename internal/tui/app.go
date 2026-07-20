@@ -14,24 +14,28 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/term"
 
+	"agentgo/internal/interaction"
 	"agentgo/internal/model"
 	"agentgo/internal/output"
 	"agentgo/internal/scheduler"
-	"agentgo/internal/shell"
 	"agentgo/internal/ui"
 )
 
 // ── Bubbletea messages ──
 
-type approvalMsg ui.ApprovalItem
-type approvalResolvedMsg ui.ApprovalResolved
+type interactionsChangedMsg []ui.InteractionItem
 type snapshotSyncMsg ui.Snapshot
 type agentsChangedMsg struct {
 	agents []AgentInfo
 	tasks  []*model.Task
 }
-type systemMsg string
+type systemMsg ui.LogItem
 type outputMsg output.Event
+type traceMsg ui.TraceEvent
+
+// quitWarnExpiredMsg 是 Ctrl+C 强退警告 3 秒窗口到期的一次性 tick 消息
+// （tea.Tick 发出；惰性清除，晚到的旧 tick 不能误杀新警告）。
+type quitWarnExpiredMsg struct{}
 
 // ── Hub subscription (async ui.Update → sync bubbletea) ──
 
@@ -52,21 +56,21 @@ func forwardUpdates(ctx context.Context, obs ui.Observer, p *tea.Program) {
 			switch u.Kind {
 			case ui.KindSnapshotSync:
 				p.Send(snapshotSyncMsg(u.Snapshot))
-			case ui.KindOutputResult, ui.KindOutputText:
+			case ui.KindOutputResult, ui.KindOutputText, ui.KindOutputStream:
 				p.Send(outputMsg(u.Output))
 			case ui.KindLogLine:
 				for _, line := range strings.Split(u.LogLine, "\n") {
 					line = strings.TrimSpace(line)
 					if line != "" {
-						p.Send(systemMsg(line))
+						p.Send(systemMsg(ui.LogItem{Text: line, At: u.At}))
 					}
 				}
-			case ui.KindApprovalNew:
-				p.Send(approvalMsg(u.Approval))
-			case ui.KindApprovalResolved:
-				p.Send(approvalResolvedMsg(u.Resolved))
+			case ui.KindInteractionsChanged:
+				p.Send(interactionsChangedMsg(u.Interactions))
 			case ui.KindAgentsChanged:
 				p.Send(agentsChangedMsg{agents: u.Agents, tasks: boardTasksToModel(u.Tasks)})
+			case ui.KindTraceEvent:
+				p.Send(traceMsg(u.Trace))
 			}
 		}
 	}
@@ -98,6 +102,10 @@ func boardTasksToModel(bts []ui.BoardTask) []*model.Task {
 const (
 	maxMessages    = 500
 	maxHotMessages = 30
+	// quitWarnWindow 是 Ctrl+C 强退警告的有效窗口：窗口内第二次按下即
+	// RequestQuit + tea.Quit。必须与 bootstrap SIGINT 哨兵的 3 秒窗口
+	// 一致（第二次信号 os.Exit(130) 强杀），两边语义才对齐。
+	quitWarnWindow = 3 * time.Second
 )
 
 // AppModel is the root bubbletea Model for the new multi-panel TUI.
@@ -118,8 +126,10 @@ type AppModel struct {
 	focus FocusState
 
 	// Input
-	input        textarea.Model
-	guidanceMode bool
+	input textarea.Model
+	// history 是输入提交历史（环形缓冲容量 100，仅内存）；
+	// 输入框首行 ↑ / 末行 ↓ 浏览，见 keymap.go input-history 条目。
+	history inputHistory
 
 	// Agent data（由 Hub 的 SnapshotSync / AgentsChanged 更新刷新）
 	agents        []AgentInfo
@@ -130,10 +140,23 @@ type AppModel struct {
 	messages     []StyledMsg
 	lastResult   *StyledMsg
 	resultScroll int
+	feedOutputs  []ui.FeedOutput
+	logs         []ui.LogItem
+	traces       []ui.TraceEvent
 
-	// Approval（条目不含 ReplyCh——回复经 Controller.ResolveApproval）
-	activeApproval   *ui.ApprovalItem
-	pendingApprovals []ui.ApprovalItem
+	// Interaction。Hub 每次下发完整 pending 列表；第 0 项是当前条目。
+	interactions             []ui.InteractionItem
+	interactionOption        int
+	interactionPromptScroll  int
+	interactionTextMode      bool
+	interactionTextRequestID string
+	interactionTextVersion   int64
+	interactionTextOptionID  string
+	interactionTextLabel     string
+
+	// quitWarnUntil 非零表示 Ctrl+C 强退警告生效中（3 秒窗口，输入区上方
+	// 渲染一行警告）；窗口内第二次 Ctrl+C 直接强退。
+	quitWarnUntil time.Time
 }
 
 var errInputEOF = errors.New("tui input EOF")
@@ -189,6 +212,10 @@ func runWithIO(ctx context.Context, deps Deps, input io.Reader, output io.Writer
 		opts = append(opts, tea.WithAltScreen())
 	}
 	p := tea.NewProgram(m, opts...)
+	// 注册强杀恢复点：SIGINT 哨兵（bootstrap）在 os.Exit 前经 RunForceCleanup
+	// 调 p.Kill，尽力恢复终端——bubbletea 捕获 SIGINT 后若事件循环卡死，
+	// 进程被强杀时终端可能滞留在 alt-screen / raw mode。
+	RegisterForceCleanup(p.Kill)
 
 	if deps.Observer != nil {
 		go forwardUpdates(runCtx, deps.Observer, p)
@@ -241,11 +268,15 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case snapshotSyncMsg:
-		// 订阅建立后的第一条更新：全量初始化本地状态（代理/任务/待审批）。
+		// 订阅建立后的第一条更新：全量初始化本地状态。
 		snap := ui.Snapshot(msg)
 		m.agents = snap.Agents
 		m.tasks = boardTasksToModel(snap.Tasks)
-		m.syncApprovalsFromSnapshot(snap.PendingApprovals)
+		m.replaceInteractions(snap.PendingInteractions)
+		m.restoreFeed(snap.Feed)
+		if m.lastResult == nil && snap.LastResult != nil && strings.TrimSpace(snap.LastResult.Text) != "" {
+			m.appendMsg(snap.LastResult.Text, MsgResult)
+		}
 		return m, nil
 
 	case agentsChangedMsg:
@@ -253,32 +284,45 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tasks = msg.tasks
 		return m, nil
 
-	case approvalMsg:
-		item := ui.ApprovalItem(msg)
-		if m.activeApproval == nil {
-			m.activeApproval = &item
-		} else {
-			m.pendingApprovals = append(m.pendingApprovals, item)
-		}
-		return m, nil
-
-	case approvalResolvedMsg:
-		// 某个前端已了结该审批（可能是本前端之外的订阅者）。
-		m.removeApproval(ui.ApprovalResolved(msg).RequestID)
+	case interactionsChangedMsg:
+		// 每条更新都是完整 pending 列表。直接替换可从丢帧中恢复，也能
+		// 在 Web 前端抢先回答后清除当前项并推进到下一项。
+		m.replaceInteractions([]ui.InteractionItem(msg))
 		return m, nil
 
 	case systemMsg:
-		m.appendMsg(string(msg), MsgLog)
+		m.appendLog(ui.LogItem(msg))
+		return m, nil
+
+	case traceMsg:
+		m.appendTrace(ui.TraceEvent(msg))
 		return m, nil
 
 	case outputMsg:
 		ev := output.Event(msg)
 		// 分类在产生处完成（eventWriter 打 kind 标记），此处只按 Kind 分发，
 		// 不做 "=== 任务完成 ===" 子串匹配。
-		if ev.Kind == output.KindResult {
+		if ev.Kind == output.KindStream {
+			m.upsertStream(ev)
+		} else if ev.Kind == output.KindResult {
+			m.recordFeedOutput(feedOutputFromEvent(ev, time.Now()))
 			m.appendMsg(ev.Text, MsgResult)
+			// 完成结果是用户请求的最终回复，不是另一条诊断日志。实时到达时
+			// 主动打开完整结果页；后续 status/log 事件只更新消息流，不会把
+			// 用户重新推回日志页。输入焦点保持不变，避免打断正在输入的文本。
+			m.view = ViewResult
 		} else {
+			m.recordFeedOutput(feedOutputFromEvent(ev, time.Now()))
 			m.appendMsg(ev.Text, MsgAgent)
+		}
+		return m, nil
+
+	case quitWarnExpiredMsg:
+		// 3 秒窗口到期的惰性清除：仅当警告确已过期才摘掉（晚到的旧
+		// tick 不能误杀重新计时的警告）。
+		if !m.quitWarnActive() {
+			m.quitWarnUntil = time.Time{}
+			m.reflowInputLayout()
 		}
 		return m, nil
 
@@ -297,36 +341,82 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
-	// Global keys
+	// Global keys（键名常量集中在 keymap.go）
 	switch key {
-	case "ctrl+c":
-		m.appendMsg("[退出] Ctrl-C", MsgInfo)
-		if m.deps.Controller != nil {
-			m.deps.Controller.RequestQuit()
+	case keyCtrlC:
+		// 3 秒警告窗口内第二次按下：强退（与 bootstrap SIGINT 哨兵的
+		// 3 秒窗口语义一致——第二次信号 os.Exit(130) 强杀）。
+		if m.quitWarnActive() {
+			if m.deps.Controller != nil {
+				m.deps.Controller.RequestQuit()
+			}
+			return m, tea.Quit
 		}
-		return m, tea.Quit
+		// 第一次按下：输入框有文本先清文本，再挂 3 秒强退警告
+		// （输入区上方独占一行，quitWarnExpiredMsg 到期惰性清除）。
+		if strings.TrimSpace(m.input.Value()) != "" {
+			m.input.SetValue("")
+		}
+		m.quitWarnUntil = time.Now().Add(quitWarnWindow)
+		m.reflowInputLayout()
+		return m, tea.Tick(quitWarnWindow, func(time.Time) tea.Msg {
+			return quitWarnExpiredMsg{}
+		})
 
-	case "tab":
+	case keyTab:
 		m.cycleFocus()
 		return m, nil
 
-	case "esc":
-		if m.guidanceMode {
-			m.guidanceMode = false
-			m.input.Placeholder = "输入消息或 / 命令（/help 查看帮助）"
-			m.reflowInputLayout()
+	case keyShiftTab:
+		m.cycleFocusReverse()
+		return m, nil
+
+	case keyCtrlL:
+		// Ctrl+L 清屏：只清空消息流显示——不动运行中任务、结果视图、
+		// 输入框与交互请求，也不发任何请求（纯本地渲染操作，零副作用）。
+		m.messages = nil
+		m.appendMsg("[界面] 消息流已清空", MsgLog)
+		return m, nil
+
+	case keyEsc:
+		if m.interactionTextMode {
+			m.cancelInteractionText()
+			if len(m.interactions) > 0 {
+				m.setFocus(FocusInteraction)
+			} else {
+				m.setFocus(FocusInput)
+			}
 			return m, nil
 		}
-		// 审批栏激活时 Esc = 拒绝（与审批栏 "[Esc] Reject" 提示一致）；
-		// 非阻塞发送，agent 已放弃等待时按失效处理并推进队列。
-		if m.activeApproval != nil {
-			m.replyActiveApproval(shell.ApprovalReply{Approved: false},
-				fmt.Sprintf("[审批] 已拒绝 %s 的命令", m.activeApproval.AgentID))
+		// Interaction 焦点中的 Esc 只返回输入框，不提交回答，也不取消
+		// 请求树；明确的拒绝/取消必须作为稳定 option 由 Agent 提供。
+		if m.focus == FocusInteraction {
+			m.setFocus(FocusInput)
 			return m, nil
 		}
-		if m.view == ViewAgentDetail || m.view == ViewResult {
+		// 详情/结果/诊断视图里 Esc 永远归"返回"，不触发请求取消。
+		if m.view == ViewAgentDetail || m.view == ViewResult ||
+			m.view == ViewActivity || m.view == ViewLogs || m.view == ViewTrace {
 			m.view = ViewDashboard
 			return m, nil
+		}
+		// 顶层视图（Dashboard / Chat，任意 focus）：Esc = 取消最近一棵
+		// 请求树。无活跃请求（ErrNoActiveRequest）或控制面未装配时回落
+		// 旧行为（focus 回输入框），不报错刷屏。
+		if m.deps.Controller != nil {
+			summary, err := m.deps.Controller.CancelLatestRequest()
+			switch {
+			case err == nil:
+				m.appendMsg(summary, MsgInfo)
+				// 反馈写在消息流里；切到消息视图让其可见（同斜杠命令反馈）。
+				m.view = ViewChat
+				return m, nil
+			case errors.Is(err, ui.ErrNoActiveRequest):
+				// 回落旧行为
+			default:
+				m.appendMsg(fmt.Sprintf("[取消] %v", err), MsgError)
+				return m, nil
+			}
 		}
 		if m.focus != FocusInput {
 			m.focus = FocusInput
@@ -336,73 +426,104 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if m.view == ViewResult && m.focus != FocusSidebar {
+	if m.view == ViewResult && m.focus == FocusMain {
 		pageStep := m.layout.MainH - 4
 		if pageStep < 1 {
 			pageStep = 1
 		}
 		switch key {
-		case "up":
+		case keyUp:
 			if m.resultScroll > 0 {
 				m.resultScroll--
 			}
 			return m, nil
-		case "down":
+		case keyDown:
 			m.resultScroll++
 			m.clampResultScroll()
 			return m, nil
-		case "pgup", "ctrl+b":
+		case keyPgUp, keyCtrlB:
 			m.resultScroll -= pageStep
 			if m.resultScroll < 0 {
 				m.resultScroll = 0
 			}
 			return m, nil
-		case "pgdown", "ctrl+f":
+		case keyPgDown, keyCtrlF:
 			m.resultScroll += pageStep
 			m.clampResultScroll()
 			return m, nil
-		case "home":
+		case keyHome:
 			m.resultScroll = 0
 			return m, nil
 		}
 	}
 
-	// Approval mode (when active and not in guidance mode)
-	if m.activeApproval != nil && !m.guidanceMode && m.focus == FocusInput {
-		switch key {
-		case "1":
-			m.replyActiveApproval(shell.ApprovalReply{Approved: true},
-				fmt.Sprintf("[审批] 已批准 %s 的命令", m.activeApproval.AgentID))
-			return m, nil
-		case "2":
-			m.replyActiveApproval(shell.ApprovalReply{Approved: false},
-				fmt.Sprintf("[审批] 已拒绝 %s 的命令", m.activeApproval.AgentID))
-			return m, nil
-		case "3":
-			m.guidanceMode = true
-			m.input.Placeholder = "输入指导消息，回车发送..."
-			m.input.SetValue("")
-			m.reflowInputLayout()
-			return m, nil
-		case "4":
-			m.replyActiveApproval(shell.ApprovalReply{
-				Approved:        true,
-				RememberPattern: m.activeApproval.Pattern,
-			}, fmt.Sprintf("[审批] 已批准并记忆 pattern: %s", m.activeApproval.Pattern))
+	// Interaction panel navigation. Printable runes are intentionally ignored
+	// here; they are only text when FocusInput owns the keyboard.
+	if m.focus == FocusInteraction {
+		req := m.activeInteraction()
+		if req == nil {
+			m.setFocus(FocusInput)
 			return m, nil
 		}
+		choiceCount := interactionChoiceCount(*req)
+		switch key {
+		case keyUp:
+			if m.interactionOption > 0 {
+				m.interactionOption--
+			}
+			return m, nil
+		case keyDown:
+			if m.interactionOption+1 < choiceCount {
+				m.interactionOption++
+			}
+			return m, nil
+		case keyPgUp, keyCtrlB:
+			m.interactionPromptScroll -= interactionPromptPageLines
+			if m.interactionPromptScroll < 0 {
+				m.interactionPromptScroll = 0
+			}
+			return m, nil
+		case keyPgDown, keyCtrlF:
+			m.interactionPromptScroll += interactionPromptPageLines
+			maxOffset := interactionPromptMaxScroll(*req, m.width)
+			if m.interactionPromptScroll > maxOffset {
+				m.interactionPromptScroll = maxOffset
+			}
+			return m, nil
+		case keyHome:
+			m.interactionPromptScroll = 0
+			return m, nil
+		case keyEnter:
+			optionID, label, needsText, ok := selectedInteractionChoice(*req, m.interactionOption)
+			if !ok {
+				m.appendMsg("[交互] 当前请求没有可提交的选项", MsgWarn)
+				return m, nil
+			}
+			if needsText {
+				m.beginInteractionText(*req, optionID, label)
+				return m, nil
+			}
+			m.respondInteraction(interaction.ResolveInput{
+				RequestID:       req.ID,
+				ExpectedVersion: req.Version,
+				OptionID:        optionID,
+				RespondedBy:     "tui",
+			}, label)
+			return m, nil
+		}
+		return m, nil
 	}
 
 	// Sidebar navigation
 	if m.focus == FocusSidebar {
 		switch key {
-		case "up":
+		case keyUp:
 			m.moveSelectedAgent(-1)
 			return m, nil
-		case "down":
+		case keyDown:
 			m.moveSelectedAgent(1)
 			return m, nil
-		case "enter":
+		case keyEnter:
 			if m.ensureSelectedAgent() {
 				m.view = ViewAgentDetail
 			}
@@ -413,13 +534,13 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Main panel navigation
 	if m.focus == FocusMain && (m.view == ViewDashboard || m.view == ViewAgentDetail) {
 		switch key {
-		case "up":
+		case keyUp:
 			m.moveSelectedAgent(-1)
 			return m, nil
-		case "down":
+		case keyDown:
 			m.moveSelectedAgent(1)
 			return m, nil
-		case "enter":
+		case keyEnter:
 			if m.ensureSelectedAgent() {
 				m.view = ViewAgentDetail
 			}
@@ -430,20 +551,34 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Input mode
 	if m.focus == FocusInput {
 		switch key {
-		case "enter":
+		case keyEnter:
 			line := strings.TrimSpace(m.input.Value())
+			if m.interactionTextMode {
+				if line == "" {
+					m.appendMsg("[交互] 该选项需要补充文本", MsgWarn)
+					return m, nil
+				}
+				if m.respondInteraction(interaction.ResolveInput{
+					RequestID:       m.interactionTextRequestID,
+					ExpectedVersion: m.interactionTextVersion,
+					OptionID:        m.interactionTextOptionID,
+					Text:            line,
+					RespondedBy:     "tui",
+				}, "文本回答") {
+					m.input.SetValue("")
+					m.finishInteractionText()
+				}
+				m.reflowInputLayout()
+				return m, nil
+			}
+
 			m.input.SetValue("")
 			m.reflowInputLayout()
 			if line == "" {
 				return m, nil
 			}
-
-			// Guidance mode: send as approval reply
-			if m.guidanceMode && m.activeApproval != nil {
-				m.replyActiveApproval(shell.ApprovalReply{Approved: false, Message: line},
-					fmt.Sprintf("[审批] 已将指导发送给 %s", m.activeApproval.AgentID))
-				return m, nil
-			}
+			// 提交的普通输入（含斜杠命令）进入输入历史。
+			m.history.push(line)
 
 			// Slash command
 			if strings.HasPrefix(line, "/") {
@@ -464,11 +599,28 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.sendUserText(line)
 			return m, nil
 
-		case "ctrl+j", "alt+enter":
+		case keyCtrlJ, keyAltEnter:
 			prevHeight := m.input.Height()
 			m.input.InsertRune('\n')
 			m.reflowInputLayoutFrom(prevHeight)
 			return m, nil
+		}
+
+		// ↑/↓ 输入历史（模仿 Claude Code / REPL）：光标已在输入框首行时
+		// ↑ 取更早历史、已在末行时 ↓ 取更晚历史（越过最新一条恢复进入
+		// 前的草稿）；多行中间行的 ↑/↓ 不抢键，透传 textarea 做光标移动。
+		// 历史为空 / 已到边界时同样透传（textarea 的光标移动是 no-op）。
+		if key == keyUp && m.inputAtFirstRow() {
+			if v, ok := m.history.prev(m.input.Value()); ok {
+				m.setInputValue(v)
+				return m, nil
+			}
+		}
+		if key == keyDown && m.inputAtLastRow() {
+			if v, ok := m.history.next(); ok {
+				m.setInputValue(v)
+				return m, nil
+			}
 		}
 
 		var cmd tea.Cmd
@@ -520,85 +672,250 @@ func (m *AppModel) moveSelectedAgent(delta int) {
 }
 
 func (m *AppModel) cycleFocus() {
-	switch m.focus {
-	case FocusInput:
-		if !m.layout.Compact {
-			m.focus = FocusSidebar
-			m.input.Blur()
-			if m.selectedAgent < 0 && len(m.agents) > 0 {
-				m.selectedAgent = 0
+	m.cycleFocusBy(1)
+}
+
+func (m *AppModel) cycleFocusReverse() {
+	m.cycleFocusBy(-1)
+}
+
+func (m *AppModel) cycleFocusBy(delta int) {
+	order := []FocusState{FocusInput}
+	if len(m.interactions) > 0 {
+		order = append(order, FocusInteraction)
+	}
+	if !m.layout.Compact {
+		order = append(order, FocusSidebar)
+	}
+	order = append(order, FocusMain)
+
+	current := 0
+	for i, focus := range order {
+		if focus == m.focus {
+			current = i
+			break
+		}
+	}
+	next := (current + delta) % len(order)
+	if next < 0 {
+		next += len(order)
+	}
+	m.setFocus(order[next])
+}
+
+func (m *AppModel) setFocus(focus FocusState) {
+	m.focus = focus
+	if focus == FocusInput {
+		m.input.Focus()
+	} else {
+		m.input.Blur()
+	}
+	if focus == FocusSidebar && m.selectedAgent < 0 && len(m.agents) > 0 {
+		m.selectedAgent = 0
+	}
+}
+
+func (m *AppModel) activeInteraction() *ui.InteractionItem {
+	if len(m.interactions) == 0 {
+		return nil
+	}
+	return &m.interactions[0]
+}
+
+func cloneInteractionItems(items []ui.InteractionItem) []ui.InteractionItem {
+	if len(items) == 0 {
+		return nil
+	}
+	cloned := make([]ui.InteractionItem, len(items))
+	for i, item := range items {
+		cloned[i] = item
+		cloned[i].Options = append([]ui.InteractionOption(nil), item.Options...)
+	}
+	return cloned
+}
+
+// replaceInteractions 以 Hub 发来的完整列表覆盖本地状态。若当前请求仍在
+// 队首则保留稳定 option ID 对应的选择；若它已被其他前端回答，则清理文本
+// 草稿并自然推进到新队首。
+func (m *AppModel) replaceInteractions(items []ui.InteractionItem) {
+	oldID := ""
+	oldVersion := int64(0)
+	oldOptionID := ""
+	oldFreeText := false
+	if old := m.activeInteraction(); old != nil {
+		oldID = old.ID
+		oldVersion = old.Version
+		if id, _, needsText, ok := selectedInteractionChoice(*old, m.interactionOption); ok {
+			oldOptionID = id
+			oldFreeText = needsText && id == "" && m.interactionOption >= len(old.Options)
+		}
+	}
+
+	m.interactions = cloneInteractionItems(items)
+	m.interactionOption = 0
+	if current := m.activeInteraction(); current != nil && current.ID == oldID && current.Version == oldVersion {
+		for i, option := range current.Options {
+			if option.ID == oldOptionID {
+				m.interactionOption = i
+				break
 			}
 		}
-	case FocusSidebar:
-		m.focus = FocusMain
-	case FocusMain:
-		m.focus = FocusInput
-		m.input.Focus()
-	}
-}
-
-// replyActiveApproval 经 Controller 回复当前激活的审批并推进队列。
-// 送达成功追加 successMsg；Controller 返回 false（未送达）说明 agent 侧
-// 已放弃等待（任务结束或系统关闭），追加失效提示。两种结局都推进队列——
-// 失效请求不应挡住后续待审批。
-// 非阻塞性（A2/H2）由 Hub.ResolveApproval 的 cap=1 非阻塞发送保证，
-// bubbletea Update goroutine 永远不会被审批回复冻结。
-func (m *AppModel) replyActiveApproval(reply shell.ApprovalReply, successMsg string) {
-	if m.activeApproval == nil {
-		return
-	}
-	delivered := false
-	if m.deps.Controller != nil {
-		delivered = m.deps.Controller.ResolveApproval(m.activeApproval.RequestID, reply)
-	}
-	if delivered {
-		m.appendMsg(successMsg, MsgInfo)
+		if oldFreeText && supportsFreeText(*current) {
+			m.interactionOption = len(current.Options)
+		}
+		innerW := m.width - 4
+		if innerW < 20 {
+			innerW = 20
+		}
+		m.interactionPromptScroll = clampInteractionPromptScroll(
+			m.interactionPromptScroll, len(wrapInteractionPrompt(current.Prompt, innerW)))
 	} else {
-		m.appendMsg(fmt.Sprintf("[审批] 该审批已失效（任务已结束）: %s", m.activeApproval.AgentID), MsgInfo)
+		m.interactionPromptScroll = 0
 	}
-	m.advanceApproval()
-}
 
-// removeApproval 处理"其他前端已了结"的审批（KindApprovalResolved）：
-// 命中激活项则推进队列（不追加消息——本前端没有回复动作可报告），
-// 命中待处理项则直接移除。本前端自己回复触发的 Resolved 到达时该 ID
-// 已不在队列中，自然无操作。
-func (m *AppModel) removeApproval(requestID string) {
-	if m.activeApproval != nil && m.activeApproval.RequestID == requestID {
-		m.advanceApproval()
-		return
-	}
-	for i, item := range m.pendingApprovals {
-		if item.RequestID == requestID {
-			m.pendingApprovals = append(m.pendingApprovals[:i], m.pendingApprovals[i+1:]...)
-			return
+	if m.interactionTextMode && !m.interactionTextTargetValid() {
+		m.input.SetValue("")
+		m.finishInteractionText()
+		if len(m.interactions) > 0 {
+			m.setFocus(FocusInteraction)
+		} else {
+			m.setFocus(FocusInput)
 		}
 	}
+	if len(m.interactions) == 0 && m.focus == FocusInteraction {
+		m.setFocus(FocusInput)
+	}
+	// 新待决请求到达（队首 ID 变化）且输入框空闲时，自动把键盘焦点交给
+	// 面板——否则面板仅渲染（◇），↑/↓ 在输入框里被历史/光标占用，用户
+	// 难以发现必须先 Tab。输入中有文本、焦点不在输入框时不抢焦点；
+	// 同一队首的后续刷新（含用户 Esc 回输入框后）不重复抢。
+	if current := m.activeInteraction(); current != nil && current.ID != oldID &&
+		m.focus == FocusInput && !m.interactionTextMode &&
+		strings.TrimSpace(m.input.Value()) == "" {
+		m.setFocus(FocusInteraction)
+	}
+	m.reflowInputLayout()
 }
 
-// syncApprovalsFromSnapshot 用 KindSnapshotSync 携带的待审批列表初始化
-// 审批队列（仅当本地队列为空时——订阅建立时 Hub 已保证这是最新状态，
-// 此后增量更新由 ApprovalNew / ApprovalResolved 维护）。
-func (m *AppModel) syncApprovalsFromSnapshot(items []ui.ApprovalItem) {
-	if m.activeApproval != nil || len(m.pendingApprovals) > 0 || len(items) == 0 {
+func (m *AppModel) interactionTextTargetValid() bool {
+	item := m.activeInteraction()
+	if item == nil || item.ID != m.interactionTextRequestID || item.Version != m.interactionTextVersion {
+		return false
+	}
+	if m.interactionTextOptionID == "" {
+		return supportsFreeText(*item)
+	}
+	for _, option := range item.Options {
+		if option.ID == m.interactionTextOptionID && option.RequiresText {
+			return true
+		}
+	}
+	return false
+}
+
+func supportsFreeText(req ui.InteractionItem) bool {
+	// AllowFreeText on a choice request means an option may carry supplemental
+	// text (for example guidance/revise_plan); it does not make an answer without
+	// option_id valid. Only KindText owns a standalone free-text row.
+	return req.Kind == string(interaction.KindText) && req.AllowFreeText && len(req.Options) == 0
+}
+
+func interactionChoiceCount(req ui.InteractionItem) int {
+	count := len(req.Options)
+	if supportsFreeText(req) {
+		count++
+	}
+	return count
+}
+
+func selectedInteractionChoice(req ui.InteractionItem, selected int) (optionID, label string, needsText, ok bool) {
+	if selected >= 0 && selected < len(req.Options) {
+		option := req.Options[selected]
+		return option.ID, sanitizeTerminalText(option.Label), option.RequiresText, true
+	}
+	if selected == len(req.Options) && supportsFreeText(req) {
+		return "", "自定义回答", true, true
+	}
+	return "", "", false, false
+}
+
+func (m *AppModel) beginInteractionText(req ui.InteractionItem, optionID, label string) {
+	if m.interactionTextMode && m.interactionTextRequestID == req.ID &&
+		m.interactionTextVersion == req.Version && m.interactionTextOptionID == optionID {
+		m.setFocus(FocusInput)
 		return
 	}
-	first := items[0]
-	m.activeApproval = &first
-	m.pendingApprovals = append(m.pendingApprovals, items[1:]...)
+	m.interactionTextMode = true
+	m.interactionTextRequestID = req.ID
+	m.interactionTextVersion = req.Version
+	m.interactionTextOptionID = optionID
+	m.input.SetValue("")
+	if label == "" {
+		label = "所选项"
+	}
+	m.interactionTextLabel = label
+	m.input.Placeholder = fmt.Sprintf("为「%s」补充文本，Enter 提交，Esc 返回...", label)
+	m.setFocus(FocusInput)
+	m.reflowInputLayout()
 }
 
-func (m *AppModel) advanceApproval() {
-	m.guidanceMode = false
+func (m *AppModel) finishInteractionText() {
+	m.interactionTextMode = false
+	m.interactionTextRequestID = ""
+	m.interactionTextVersion = 0
+	m.interactionTextOptionID = ""
+	m.interactionTextLabel = ""
 	m.input.Placeholder = "输入消息或 / 命令（/help 查看帮助）"
+}
+
+func (m *AppModel) cancelInteractionText() {
+	m.input.SetValue("")
+	m.finishInteractionText()
 	m.reflowInputLayout()
-	if len(m.pendingApprovals) > 0 {
-		next := m.pendingApprovals[0]
-		m.pendingApprovals = m.pendingApprovals[1:]
-		m.activeApproval = &next
-	} else {
-		m.activeApproval = nil
+}
+
+func (m *AppModel) respondInteraction(input interaction.ResolveInput, label string) bool {
+	if m.deps.Controller == nil {
+		m.appendMsg("[交互] 控制面未初始化，无法提交回答", MsgError)
+		return false
 	}
+	if _, err := m.deps.Controller.RespondInteraction(m.runContext(), input); err != nil {
+		m.appendMsg(fmt.Sprintf("[交互] 回答失败: %v", err), MsgError)
+		return false
+	}
+	if label == "" {
+		label = "回答"
+	}
+	m.appendMsg(fmt.Sprintf("[交互] 已提交：%s", label), MsgInfo)
+	m.removeInteraction(input.RequestID)
+	return true
+}
+
+func (m *AppModel) removeInteraction(id string) {
+	removedCurrent := len(m.interactions) > 0 && m.interactions[0].ID == id
+	for i, item := range m.interactions {
+		if item.ID == id {
+			m.interactions = append(m.interactions[:i], m.interactions[i+1:]...)
+			break
+		}
+	}
+	wasText := m.interactionTextMode && m.interactionTextRequestID == id
+	if wasText {
+		m.input.SetValue("")
+		m.finishInteractionText()
+	}
+	if removedCurrent {
+		m.interactionOption = 0
+		m.interactionPromptScroll = 0
+	}
+	if (removedCurrent && m.focus == FocusInteraction) || wasText {
+		if len(m.interactions) > 0 {
+			m.setFocus(FocusInteraction)
+		} else {
+			m.setFocus(FocusInput)
+		}
+	}
+	m.reflowInputLayout()
 }
 
 func (m *AppModel) reflowInputLayout() {
@@ -619,17 +936,19 @@ func (m *AppModel) reflowInputLayoutFrom(prevHeight int) {
 		inputW = 1
 	}
 
+	panelH := m.interactionPanelHeight()
 	m.input.MaxHeight = m.maxTextareaHeight()
 	m.input.SetWidth(inputW)
 	m.input.SetHeight(m.desiredTextareaHeight())
 
 	areaH := renderedLineCount(m.input.View())
-	maxAreaH := m.height - headerHeight - statusBarHeight - minBodyHeight
+	extras := m.inputAreaExtraHeight()
+	maxAreaH := m.height - headerHeight - statusBarHeight - minBodyHeight - panelH
 	if maxAreaH < inputMinHeight {
 		maxAreaH = inputMinHeight
 	}
-	for areaH > maxAreaH && m.input.Height() > inputMinHeight {
-		reduceBy := areaH - maxAreaH
+	for areaH+extras > maxAreaH && m.input.Height() > inputMinHeight {
+		reduceBy := areaH + extras - maxAreaH
 		nextH := m.input.Height() - reduceBy
 		if nextH < inputMinHeight {
 			nextH = inputMinHeight
@@ -637,18 +956,8 @@ func (m *AppModel) reflowInputLayoutFrom(prevHeight int) {
 		m.input.SetHeight(nextH)
 		areaH = renderedLineCount(m.input.View())
 	}
-	// 斜杠命令提示框（"/" 开头时）占用输入区上方的额外行；审批栏
-	// 激活时输入区整体被替换，提示框一并隐藏。
-	if !m.guidanceMode {
-		areaH += suggestLineCount(m.input.Value())
-	}
-	if m.activeApproval != nil && !m.guidanceMode {
-		areaH = inputMinHeight
-	}
-	if m.guidanceMode && m.activeApproval != nil {
-		areaH++
-	}
-	m.layout = calcLayout(m.width, m.height, m.view, areaH)
+	areaH += extras
+	m.layout = calcLayout(m.width, m.height, m.view, areaH, panelH)
 
 	if m.input.Height() != prevHeight {
 		m.clampResultScroll()
@@ -657,10 +966,8 @@ func (m *AppModel) reflowInputLayoutFrom(prevHeight int) {
 
 func (m AppModel) maxTextareaHeight() int {
 	maxH := inputMaxHeight
-	available := m.height - headerHeight - statusBarHeight - minBodyHeight
-	if m.guidanceMode && m.activeApproval != nil {
-		available--
-	}
+	available := m.height - headerHeight - statusBarHeight - minBodyHeight -
+		m.interactionPanelHeight() - m.inputAreaExtraHeight()
 	if available < inputMinHeight {
 		return inputMinHeight
 	}
@@ -668,6 +975,30 @@ func (m AppModel) maxTextareaHeight() int {
 		return available
 	}
 	return maxH
+}
+
+func (m AppModel) inputAreaExtraHeight() int {
+	extra := 0
+	if m.interactionTextMode {
+		extra++ // renderInputArea 的模式标题
+	} else {
+		extra += suggestLineCount(m.input.Value())
+	}
+	if m.quitWarnActive() {
+		extra++
+	}
+	return extra
+}
+
+func (m AppModel) interactionPanelHeight() int {
+	req := m.activeInteraction()
+	if req == nil || m.width <= 0 {
+		return 0
+	}
+	return renderedLineCount(renderInteractionPanel(
+		m.theme, m.width, *req, m.interactionOption, m.interactionPromptScroll, len(m.interactions)-1,
+		m.focus == FocusInteraction,
+	))
 }
 
 func (m AppModel) desiredTextareaHeight() int {
@@ -707,6 +1038,34 @@ func renderedLineCount(s string) int {
 	return len(strings.Split(s, "\n"))
 }
 
+// inputAtFirstRow 报告光标是否位于输入框第一可视行（首硬行的首个软换行
+// 行）。光标行号经 bubbles textarea 的公开 API 取得：Line() 是光标所在
+// 硬行（\n 分隔），LineInfo().RowOffset 是行内软换行偏移——软换行的
+// 长首行中间按 ↑ 仍是光标移动，只有顶到第一可视行才取历史。
+func (m *AppModel) inputAtFirstRow() bool {
+	return m.input.Line() == 0 && m.input.LineInfo().RowOffset <= 0
+}
+
+// inputAtLastRow 报告光标是否位于输入框最后可视行（末硬行的最后一个
+// 软换行行）。LineInfo 异常返回零值（Height=0）时 RowOffset>=Height-1
+// 恒成立，退化为"空输入 / 单行输入时 ↓ 直接出历史"。
+func (m *AppModel) inputAtLastRow() bool {
+	li := m.input.LineInfo()
+	return m.input.Line() == m.input.LineCount()-1 && li.RowOffset >= li.Height-1
+}
+
+// setInputValue 用历史条目替换输入框内容。textarea.SetValue 后光标自然
+// 落在文本末尾（REPL 惯例），再按新内容重排输入区高度。
+func (m *AppModel) setInputValue(v string) {
+	m.input.SetValue(v)
+	m.reflowInputLayout()
+}
+
+// quitWarnActive 报告 Ctrl+C 强退警告是否仍在 3 秒窗口内。
+func (m AppModel) quitWarnActive() bool {
+	return !m.quitWarnUntil.IsZero() && time.Now().Before(m.quitWarnUntil)
+}
+
 func (m *AppModel) appendMsg(text string, kind MsgKind) {
 	if kind == MsgResult {
 		formatted := formatMarkdown(m.theme, text, m.width-4)
@@ -716,6 +1075,34 @@ func (m *AppModel) appendMsg(text string, kind MsgKind) {
 	}
 
 	m.messages = append(m.messages, StyledMsg{Text: text, Kind: kind, At: time.Now()})
+	if len(m.messages) > maxMessages {
+		m.messages = m.messages[len(m.messages)-maxMessages:]
+	}
+}
+
+func (m *AppModel) upsertStream(ev output.Event) {
+	if ev.StreamID == "" {
+		return
+	}
+	m.recordFeedOutput(feedOutputFromEvent(ev, time.Now()))
+	text := ev.Text
+	if ev.Error != "" {
+		if text != "" {
+			text += "\n"
+		}
+		text += "[stream error] " + ev.Error
+	}
+	for i := range m.messages {
+		if m.messages[i].StreamID == ev.StreamID {
+			m.messages[i].Text = text
+			m.messages[i].AgentID = ev.AgentID
+			m.messages[i].At = time.Now()
+			return
+		}
+	}
+	m.messages = append(m.messages, StyledMsg{
+		Text: text, Kind: MsgAgent, At: time.Now(), AgentID: ev.AgentID, StreamID: ev.StreamID,
+	})
 	if len(m.messages) > maxMessages {
 		m.messages = m.messages[len(m.messages)-maxMessages:]
 	}
@@ -794,12 +1181,8 @@ func (m AppModel) View() string {
 	// 1. Header（模式 / Session 读自 Hub 最新快照，而非直读组件）
 	snap := m.snapshot()
 	sessionID := snap.Session.ID
-	approvalCount := len(m.pendingApprovals)
-	if m.activeApproval != nil {
-		approvalCount++
-	}
 	header := renderHeader(m.theme, m.layout, snapshotMode(snap),
-		sessionID, len(m.agents), approvalCount)
+		sessionID, len(m.agents), len(m.interactions))
 	sections = append(sections, header)
 
 	// 2. Body (sidebar + main)
@@ -818,29 +1201,35 @@ func (m AppModel) View() string {
 		sections = append(sections, mainContent)
 	}
 
-	// 3. Approval bar (if active) or Input area
-	if m.activeApproval != nil && !m.guidanceMode {
-		sections = append(sections, renderApprovalBar(m.theme, m.width,
-			*m.activeApproval, len(m.pendingApprovals)))
-	} else {
-		agentID := ""
-		if m.activeApproval != nil {
-			agentID = m.activeApproval.AgentID
-		}
-		inputView := m.input.View()
-		if !m.guidanceMode {
-			if sug := renderSuggestBox(m.theme, m.input.Value()); sug != "" {
-				inputView = sug + "\n" + inputView
-			}
-		}
-		inputArea := renderInputArea(m.theme, m.width, inputView,
-			m.guidanceMode, agentID)
-		sections = append(sections, inputArea)
+	// 3. Interaction 面板与输入框始终同时显示；完整列表的第 0 项
+	// 是当前请求，其余项由队列计数提示。
+	if req := m.activeInteraction(); req != nil {
+		sections = append(sections, renderInteractionPanel(
+			m.theme, m.width, *req, m.interactionOption, m.interactionPromptScroll,
+			len(m.interactions)-1, m.focus == FocusInteraction,
+		))
 	}
 
-	// 4. Status bar
+	// 4. 强退警告行（Ctrl+C 3 秒窗口内显示，紧邻输入区上方）
+	if m.quitWarnActive() {
+		sections = append(sections, renderQuitWarn(m.theme, m.width))
+	}
+
+	// 5. Input area。即使存在 pending Interaction，普通英文和数字仍归
+	// textarea；只有显式切到 Interaction 焦点才解释为面板操作。
+	inputView := m.input.View()
+	if !m.interactionTextMode {
+		if sug := renderSuggestBox(m.theme, m.input.Value()); sug != "" {
+			inputView = sug + "\n" + inputView
+		}
+	}
+	inputArea := renderInputArea(m.theme, m.width, inputView,
+		m.interactionTextMode, m.interactionTextLabel)
+	sections = append(sections, inputArea)
+
+	// 6. Status bar
 	sections = append(sections, renderStatusBar(m.theme, m.width,
-		m.focus, m.view, m.activeApproval != nil))
+		m.focus, m.view, m.interactionTextMode))
 
 	return strings.Join(sections, "\n")
 }
@@ -856,9 +1245,7 @@ func (m AppModel) renderMainContent() string {
 	case ViewAgentDetail:
 		if m.selectedAgent >= 0 && m.selectedAgent < len(m.agents) {
 			ag := m.agents[m.selectedAgent]
-			// 无 per-agent 输出缓冲——output 传空串，renderAgentDetail 内部
-			// 回退到 AgentInfo.LastModelText / LastError。
-			return renderAgentDetail(m.theme, w, h, ag.ID, &ag, "")
+			return renderAgentWorkbench(m.theme, w, h, ag, m.outputsForAgent(ag.ID), m.tracesForAgent(ag.ID))
 		}
 		return renderDashboard(m.theme, w, h, m.agents)
 
@@ -868,10 +1255,19 @@ func (m AppModel) renderMainContent() string {
 		if len(msgs) > maxHotMessages {
 			msgs = msgs[len(msgs)-maxHotMessages:]
 		}
-		return renderChat(m.theme, w, h, msgs, m.lastResult)
+		return renderConversationWithActivity(m.theme, w, h, msgs, m.lastResult, m.agents)
 
 	case ViewResult:
 		return renderResultDetail(m.theme, w, h, m.lastResult, m.resultScroll)
+
+	case ViewActivity:
+		return renderActivityView(m.theme, w, h, m.agents, m.traces)
+
+	case ViewLogs:
+		return renderLogsView(m.theme, w, h, m.logs)
+
+	case ViewTrace:
+		return renderTraceView(m.theme, w, h, m.traces)
 
 	default:
 		return renderDashboard(m.theme, w, h, m.agents)

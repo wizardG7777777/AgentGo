@@ -1,8 +1,8 @@
-# 现状速览（2026-05-09，v5 Reactive System 落地后）
+# 现状速览（2026-07-20）
 
 > 本文档原本是设计稿，部分章节早于实现。本节为升级工作提供快速对齐入口，列出**当前实现事实**与**与原设计文档的关键差异**。后续章节如有冲突，以本节和源代码为准。
 
-**已实现的核心包**（`internal/` 下，2026-05-09 状态，共 25 个）：
+**已实现的主要核心包**（`internal/`）：
 
 | 包 | 一句话职责 |
 |---|---|
@@ -11,10 +11,12 @@
 | `config` | YAML/JSON 配置加载，**v4 唯一格式**：`llm:` / `scheduler:` / `agents:` / `infra:` / `tool_profiles:` / `reactors_file:` 等顶层块 |
 | `gate` | **统一 Gate 注册表**（v5 替代 v4 三套 HookRegistry）。Phase 路由：`tool:preCall/postCall` / `mailbox:beforeSend/Deliver/Wake`，10 个内置 Gate |
 | `hook` | 旧 Hook 接口仍作为 LLMExecutor 与 Gate 之间的适配层保留；Agent Hook 子系统已空（team-awareness 删除）；Tool/Mailbox builtin 文件夹保留为兼容 surface |
-| `llm` | LLM 客户端 + `Provider` 适配器（`openai` / `deepseek-v4` / `deepseek-r1`） + `Message.ExtraFields` 透传机制 |
+| `interaction` | 通用结构化人机交互：稳定 Option ID、Version CAS、`pending → resolving → resolved` 两阶段协议，以及 Plan/Shell 受信任 effect 与普通 `agent_question` 路由 |
+| `llm` | LLM 客户端 + `Provider` 适配器（`openai` / `openrouter` / `deepseek-v4` / `deepseek-r1`）+ `reasoning_effort` + SSE 聚合 + `Message.ExtraFields` 透传机制 |
 | `mailbox` | 异步信箱、Notifier、recent ring-buffer（容量 16）、TeamSnapshot |
 | `memory` | **Memory System**（v5）。`Store` 接口 + `ProcessStore` 内存实现（`ScopeProcess`），`ScopeSession` / `ScopeProject` v5.x 预留。替代 v4 team-awareness Hook |
 | `model` | `Task` / `Event` / `Claim` 数据结构。`Task` 含 `Artifacts` / `ExpectedArtifacts` / `LastResponse` / `MailChainDepth` / `SchedulerBatch` / `ReadSet` |
+| `modes` | gate / exec / topo 三轴模式存储；gate=plan 通过 `submit_plan_for_review` 与 `plan_review` Interaction 进入用户评审 |
 | `pathutil` | 路径越界 + 敏感文件模式拦截 |
 | `probe` | 启动期 TCP probe + 工具可用性探针（`web_search`/`web_fetch` 检测） |
 | `reactor` | **Reactor 注册表**（v5，新增）。订阅 `trace.Event` 的 `Kind`，4 个内置 reactor + `userdef/` 用户 YAML 加载器 |
@@ -22,13 +24,13 @@
 | `runner` | **统一执行代理外壳**（v5，**取代 v4 `internal/worker` + `internal/explorer`，两包已删**）。`runner.New(rt, deps)` 按 `AgentRuntimeConfig` 实例化 |
 | `scheduler` | Scheduler 是 `agent.Agent` 一等代理（Phase 3 重构遗留），`scheduler.New` 返回 `Bundle{Agent, Activator, Mode}` |
 | `session` | Session 管理、history.jsonl、snapshot/replay/archive |
-| `shell` | `CommandFilter`（黑/白/运行时白名单） + 审批门 |
+| `shell` | `CommandFilter`（黑/白/运行时白名单）+ 与原始调用精确绑定的 `shell_command` authorization Interaction |
 | `spawn` | **Spawn Manager**（v5，新增）。实现 `reactor.Reactor` 接口，订阅任务终态事件销毁 ad-hoc runner（`one_shot` 生命周期）；`KindOf` 支持 per-kind reactor 路由；`ReactorSpawnMaxDepth=5` 防级联 |
 | `store` | `MemoryTaskStore` + `TaskCancelRegistry` + `ToolCallRecord` + `StoreHookView` + `ArtifactLog`（带 replay）+ ReadSet upsert + scheduler-batch 辅助 |
 | `suggest` | **Did-You-Mean**（v5，新增）。基于 `github.com/sahilm/fuzzy`，被 `tools/local_read.go` 空结果路径与工具未找到诊断使用 |
 | `tools` | 6 个 ToolGroup：LocalRead / LocalWrite / Web / Shell / Meta / Scheduler；`AllToolNames` 是规范名称表 |
 | `trace` | 每任务 JSONL，**Schema B**（嵌套子结构体 `Transition`/`ShellExec`/`ShellTimeout`），`SetDefaultDispatcher(reactorReg)` 使 `trace.Emit` 同时驱动 Reactor |
-| `tui` | **Bubble Tea TUI**（v5，**取代 v4 `internal/cli`，cli 包已删**）。inline 渲染、审批面板（`1/2/3/4/Ctrl+C`）、8 个斜杠命令 |
+| `tui` | **Bubble Tea TUI**（v5，取代已删除的 `internal/cli`）。通用 Interaction 面板使用 `↑/↓` 选择、`PgUp/PgDn` 翻问题、Enter 提交；不注册裸字母或裸数字动作键；命令目录来自 `ui.CommandCatalog()` |
 | `watchdog` | 周期巡检、级联取消、roster 兜底清理、超时崩溃汇报 |
 | `webtool` | Web 检索/抓取 + SSRF 防护 |
 
@@ -46,14 +48,15 @@
   - **Memory**（取代 team-awareness）：`internal/memory` 的 `ProcessStore` 在 `Agent.processTask` 入口被读取（`team_snapshot` / `file_awareness`），由 scheduler / runners / Roster 监听器写入。`GoalAnchor` 直接删除（`task.Description` 已承载目标）。
   - **Spawn**：`spawn.Manager` 让 reactor 可以"创建 ad-hoc agent"。从 `base_kind` 模板 + `RuntimeOverride` 派生新 runtime，发布 initial task（`EventType="adhoc:<spawnID>"`），任务终态时 manager 作为 reactor 自动销毁 runner（one_shot）。`ReactorSpawnMaxDepth=5` 防级联。
 - **MailNotifier 默认启用**：邮件级联爆炸 P0 的 4 项根因全部由 Phase 2（v4） + Mailbox Gate（v5）守住。`chain-depth-limit` (max=`MailChainMaxDepth`，默认 3) 在 BeforeSend 截断；`per-agent-dedup` 在 BeforeDeliver 去重；`wake-worthy-filter` 在 BeforeWake 过滤；`wake-context-expand` 在 BeforeWake 累加 wake task description。
-- **TUI 取代 CLI**：`internal/tui` 基于 Bubble Tea，inline 渲染（不接管全屏，bootstrap/scheduler/agent 的 `fmt.Println` 日志直出 stdout 不被吞）。审批面板键位：`1` 通过 / `2`/Esc 拒绝 / `3` 切到指导输入模式 / `4` 永远允许（运行时白名单，进程内不持久化） / Ctrl+C 拒绝并退出。8 个斜杠命令：`/quit /help /status /cancel /steer /mode /new /session`。详见 `docs/archived/interface-design-tui-2026-05.md` §TUI 章节。
+- **通用 Interaction 前端**：TUI 与 Web 都从 UI Hub 接收当前进程内完整 pending Interaction 列表，并以 `request_id + expected_version + option_id + text` 回答；`SessionID` 仅标记创建审计归属，任务跨 `/session` 继续时不会被过滤。TUI 用 Tab 切换 Interaction 焦点、`↑/↓` 选择、`PgUp/PgDn` 翻长问题、Enter 提交；`RequiresText` 转入普通文本输入。Esc 在 Interaction 焦点只返回输入框。旧 `1/2/3/4` 单键方案仅存在于 `docs/archived/interface-design-tui-2026-05.md`，已经废弃。
+- **Plan、Shell 与 Agent question 共用协议**：PlanStore 是 Plan 执行事实源；`plan_review` / `plan_pause` 的受信任 handler 在 CAS 后更新 PlanStore。Shell 灰名单请求绑定 command/pattern/working directory/Agent/Task；`allow_session` 只把服务端捕获的 pattern 加入当前进程、本次运行的 whitelist，切换 `/session` 不清空，退出后不持久化。MetaGroup 的 `request_user_input` 仅创建 `Purpose=agent_question`，返回稳定 `option_id`/`text`，不能携带 ActionRef 或触发前两类特权 effect。详见 `docs/design/interaction.md`。
 - **架构决策：无 git 依赖**（2026-04-09 起保持）：`internal/isolation`（git worktree 隔离）整体删除。所有 runner 共享 `ProjectRoot`。并发写文件防线 = `Roster` 文件锁 + `expected_hash` TOCTOU 检查 + `pathutil.ValidatePath` + `path-boundary` Gate（双重）+ `require-read-before-write` Gate + `enforce-expected-artifacts` Gate + `validate-line-anchors` Gate。
 - **任务数据流**：`Task.Artifacts`（`record-artifact` reactor 在 `KindFileWritten` 上自动追加，路径相对项目根）、`Task.ExpectedArtifacts`（发布者硬合约，由 `enforce-expected-artifacts` Gate 与 `agent.checkExpectedArtifacts` 双重把守）、`Task.LastResponse`（无条件持久化用于失败诊断）、`Task.MailChainDepth`（邮件链跳数）、`Task.SchedulerBatch`（scheduler 当前 reactLoop 跟踪的子任务 ID 列表）、`Task.ReadSet`（v5 Phase 6 新增，由 `read-set-write` reactor 在 `KindToolResult{tool=read_file}` 上写入；`require-read-before-write` Gate 改读 ReadSet 而不再反查 ToolCallHistory）。
 - **TaskCancelRegistry**：per-task cancel context，看门狗/调度器把任务转为 terminal 状态时自动取消正在执行的代理（通过 `ctx.Done()` 即时感知）。
 - **崩溃汇报**：任务最终失败时 agent 自动调用 `sendCrashReport`，向 `task.EventSource` 发送 `priority=high` 邮件，附 expected vs actual artifacts、最后一次 LLM 响应原文。
 - **三层历史压缩**：Layer 1 `snipOldToolResults`（无 LLM 开销，逐轮清理旧工具输出）；Layer 2 `compressHistory`（超过 `enforce_compact_token_threshold` 时摘要）；Layer 3 context overflow 时 `keepRecent=1` 激进压缩 + `RetryRollback`。压缩事件 `KindHistoryCompaction` / `KindHistoryTruncated` 由 `trace-history-event` reactor 计数。
 - **Trace 系统 Schema B**：`internal/trace.Event` 是 fat struct，包含 `Transition` / `ShellExec` / `ShellTimeout` 以及动态 DAG 的 `Plan` / `Acceptance` 五个可选指针载荷，旧字段保留不动。当前有 31 个内置系统 EventKind，包含七个重规划、验收和 Plan 生命周期审计事件。`SetDefaultDispatcher(reactorReg)` 让 `trace.Emit` 同时驱动 Reactor 链路。物理 JSONL 在 Session 活跃时落盘到 `.agentgo/sessions/sess-<id>/logs/`，否则写入 `.agentgo/traces/`，默认保留 100 个文件；Task 重试可能跨多个分片。`agentgo trace list/show/plan` 会按完整 `task_id` 重组逻辑任务并自动定向到 active session 的 `logs/`，其中 `plan <plan_id>` 聚合跨 Task DAG 时间线。可通过 `AGENTGO_DUMP_PROMPTS=1` 启用 prompt dump。
-- **LLM Provider Adapter**（2026-04-25 落地，仍有效）：`internal/llm` 两层机制。层 1 通用透传通过 `llm.Message.ExtraFields` + openai-go v3 的 `JSON.ExtraFields` / `SetExtraFields` 自动保留响应里的未知字段（如 DeepSeek V4 `reasoning_content`），下一轮请求原样回写；层 2 `llm.Provider` 插件接口处理变换型差异（R1 剥离 reasoning_content）。配置项在 `llm.provider`（per-kind 通过 `agents[*]` 顶层无对应字段时回退到 `llm.provider`），内置 `openai` / `deepseek-v4` / `deepseek-r1`。详见 §"LLM Provider Adapter"。
+- **LLM Provider Adapter 与流式调用**：`internal/llm` 在统一工厂层应用 `reasoning_effort` 与 `stream`，因此 Scheduler、静态/动态 Agent、spawn Agent 和 Reactor LLM 共享同一请求策略。SSE 路径先聚合完整文本、工具调用参数、usage 与未知扩展字段，再返回普通 `Response`；UI 收到带稳定 `stream_id` 的累积快照。Provider 层内置 `openai` / `openrouter` / `deepseek-v4` / `deepseek-r1`，并继续处理 `reasoning_content` 往返差异。详见 §"LLM Provider Adapter"。
 
 **未启动 / 待设计**：
 - ScopeSession / ScopeProject 持久化记忆（v5.x 排期）
@@ -417,10 +420,10 @@ llm:
 
 - `internal/llm/client.go` —— Message/Response 结构 + SDKClient.provider + extras 抽取/回写
 - `internal/llm/provider.go` —— Provider 接口 + 注册表
-- `internal/llm/provider_builtin.go` —— OpenAI / DeepSeek V4 / DeepSeek R1 三个内置实现
+- `internal/llm/provider_builtin.go` —— OpenAI / OpenRouter / DeepSeek V4 / DeepSeek R1 四个内置实现；OpenRouter 在这里把 `reasoning_effort` 映射为 `reasoning.effort`
 - `internal/llm/provider_test.go` + `internal/llm/client_test.go` —— 单元测试 + httptest 双轮对话集成测试（模拟 V4 / R1 严格契约，往返断言）
 - `internal/agent/agent.go` / `internal/agent/llm_executor.go` —— HistoryEntry.ExtraFields 透传
-- `internal/config/config.go` —— `LLMConfig.Provider` 字段（顶层 `llm:` 块）
+- `internal/config/config.go` —— `LLMConfig.Provider` / `ReasoningEffort` / `Stream` 字段（顶层 `llm:` 块）
 - `internal/bootstrap/bootstrap.go` —— 所有 `llm.NewSDKClient(...)` 调用点串联
 
 ---
@@ -985,8 +988,8 @@ Scheduler agent (Phase 3 后) 与 worker / explorer 共享同一套 `Mailbox.Dra
 | 5 | Scheduler | `scheduler.New(...)` 返回 `*Bundle{Agent, Activator, Mode}`；scheduler 是 `EventType="__scheduler__"` 的一等 agent |
 | 6 | 看门狗 | `watchdog.New(store, cfg, eventCh, roster)` |
 | 6.8 | 工具可用性探针 | `probe.RunAll()` —— 检测 `web_search` / `web_fetch` 实际可用性 |
-| 7.5 | 命令审批通道 | `approvalCh := make(chan shell.ApprovalRequest, 8)`（Runner→TUI） |
-| 4.5 | TUI 系统消息通道 | `statusCh := make(chan string, ...)`（agent 输出 → Bubble Tea） |
+| 7.4 | 通用 Interaction Service | `interaction.NewService(...)`；Plan、Shell、Agent question、TUI 与 Web 共享 Version CAS 状态机 |
+| 4.5 | UI 输出通道 | `statusCh` + `outputCh`，由 UI Hub 统一消费并向多前端投影 |
 | 8 | **Runner 实例化** | 按 `cfg.Agents` 循环，每 kind × `replicas` 调用：(1) `runtime_builder.buildAgentRuntime(kind, replicaIdx)` 合成 `AgentRuntimeConfig`（含 `InstanceID="<kind>-<replicaIdx>"`、`AllowedTools` 由 `profile` 或 `tools` 决定）；(2) `runner.New(rt, deps)` 构造 Runner（含 ToolRegistry allowlist 剪枝、TaskEndCallbackReactor 注册、Mailbox 注册）；(3) 打印 `Runner <id> 已启动 [kind=..., model=...]` |
 | 8.5 | **Spawn Manager** | `spawn.NewManager(cfg, deps, llmFactoryForSpawn, taskStore)` + `reactorReg.Register(spawnMgr)`（manager 自身就是 reactor） |
 | 8.6 | 用户 YAML Reactor | `cfg.ReactorsFile` 非空时 `userdef.LoadFromFile(...)` 解析并注册到 `reactorReg` |
@@ -1008,12 +1011,13 @@ Scheduler agent (Phase 3 后) 与 worker / explorer 共享同一套 `Mailbox.Dra
 
 ## RunCLI 阶段
 
-`sys.RunCLI(ctx)` 内部调 `tui.Run(ctx, deps)`，基于 Bubble Tea，inline 渲染（不接管全屏，bootstrap / scheduler / agent 的 `fmt.Println` 日志直出 stdout）。
+`sys.RunCLI(ctx)` 内部调 `tui.Run(ctx, deps)`，基于 Bubble Tea；是否使用 alt-screen 由运行环境决定。
 
-- **斜杠命令**：`/quit /help /status /cancel <id> /steer <agentID> <msg> /mode /new /session [<idx>]`
+- **斜杠命令**：以 `internal/ui.CommandCatalog()` 为事实源；包含 `/help /status /cancel /mode /plan /steer /new /session` 共享命令和 TUI 视图/退出命令
 - **自由文本**（非 `/` 开头）→ `EventUserInput` 写入 `eventCh`，同步调 `SessionManager.RecordFirstInput` + `IncrementTaskCount`；`scheduler.Activator` 翻译为 `EventType="__scheduler__"` 任务，scheduler agent 在下次 poll 时认领
-- **审批面板**：`ApprovalCh` 收到请求时输入栏被替换为审批面板，键位 `1` 通过 / `2`/Esc 拒绝 / `3` 切到指导输入模式 / `4` 永远允许（写入 `shell.CommandFilter` 的 `runtimeWhitelist`，**进程内不持久化**） / Ctrl+C 拒绝并退出
-- **多审批排队**：并发请求进入队列，`activeApproval` 答复后自动出队下一个
+- **Interaction 面板**：面板与普通输入区同时存在；显式切到 Interaction 焦点后用 `↑/↓` + Enter，需文本选项回到 textarea。可打印字符在普通输入焦点始终是文本
+- **并发回答与队列**：Hub 下发完整 pending 列表；回答携带 Version CAS，first-writer-wins。当前条目完成后显示下一项，竞争或陈旧回答不会覆盖已接受选择
+- **`/plan` 兼容别名**：`/plan approve|reject` 分别映射 `execute_plan` / `cancel_request`，但仍进入同一 Interaction CAS/effect 管线，不直接修改 PlanStore
 - **没有 `"""` 多行块**（v1 范围决议；v4 之前的 `bufio.Scanner` 多行聚合机制已不存在）
 
 ## Shutdown 阶段
@@ -1181,8 +1185,11 @@ llm:                                # 全局 LLM 默认值
   timeout_sec: 60
   provider: ""                      # 留空 → "openai" no-op；可选 "deepseek-v4" / "deepseek-r1"
 
-scheduler:                          # Scheduler 是硬编码 kind，仅 model 可外部覆盖
+scheduler:                          # Scheduler 是内置单例；模型与运行预算可覆盖
   model: "qwen3-max"
+  agent_max_loops: 50
+  enforce_compact_token_threshold: 80000
+  context_limit: 200000
 
 agents:                             # AgentKind 列表 —— 取代 v3 的 worker_count + explorer 二分
   - kind: worker
@@ -1337,7 +1344,7 @@ Session 恢复遵守以下安全边界：fsync 的 Plan 终态先覆盖较旧的
 | LocalReadGroup | `internal/tools/local_read.go` | `type LocalReadGroup struct` | 只读文件工具：read_file / list_dir / grep_search / glob_search |
 | LocalWriteGroup | `internal/tools/local_write.go` | `type LocalWriteGroup struct` | 写入文件工具：write_file / edit_file |
 | WebGroup | `internal/tools/web.go` | `type WebGroup struct` | web_search / web_fetch |
-| ShellGroup | `internal/tools/shell.go` | `type ShellGroup struct` | run_shell（含审批门集成） |
+| ShellGroup | `internal/tools/shell.go` | `type ShellGroup struct` | run_shell（黑名单硬拒绝；灰名单经 `shell_command` Interaction） |
 | MetaGroup | `internal/tools/meta.go` | `type MetaGroup struct` | publish_task / send_message（含 `BatchTracker` 接口供 scheduler 注入） |
 | SchedulerGroup | `internal/tools/scheduler.go` | `type SchedulerGroup struct` | Scheduler 专属：cancel_task / report_done / probe_directory |
 
@@ -1412,9 +1419,9 @@ Session 恢复遵守以下安全边界：fsync 的 Plan 终态先覆盖较旧的
 | Shutdown | `internal/bootstrap/bootstrap.go` | `System.Shutdown()` |
 | 启动 banner / probe | `internal/bootstrap/banner.go` / `probe.go` | `printStartupBanner` / `startupProbe` |
 | Config | `internal/config/config.go` | `type Config struct` / `LoadConfig()` / `Validate()` |
-| TUI 入口 | `internal/tui/tui.go` | `Run(ctx, deps)` / `type Model struct` / `type Deps struct` |
-| TUI 命令分发 | `internal/tui/commands.go` | `/quit /help /status /cancel /steer /mode /new /session` |
-| TUI 审批面板 | `internal/tui/approval.go` | `1/2/3/4/Ctrl+C` 键位 |
+| TUI 入口 | `internal/tui/app.go` | `Run(ctx, deps)` / `type AppModel struct` / `type Deps struct` |
+| TUI 命令分发 | `internal/tui/commands.go` + `internal/ui/commands.go` | `/plan` 等命令执行 + `CommandCatalog()` 单一目录 |
+| TUI Interaction 面板 | `internal/tui/interaction.go` / `keymap.go` | `↑/↓` 选择、Enter 提交、RequiresText 文本输入；无裸字母/数字动作键 |
 
 ## Trace
 

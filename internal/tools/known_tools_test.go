@@ -6,6 +6,7 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/agenttemplate"
+	"agentgo/internal/interaction"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/plan"
@@ -43,7 +44,10 @@ func registerAllGroupsFully(t *testing.T, r *agent.ToolRegistry) {
 		},
 		WebGroup{Provider: &fakeSearchProvider{}},
 		ShellGroup{Workdir: &DefaultWorkdir{ProjectRoot: t.TempDir()}, AgentID: "agent-1"},
-		MetaGroup{Store: newFakeStore(), MBRegistry: mailbox.NewRegistry(8)},
+		MetaGroup{
+			Store: newFakeStore(), MBRegistry: mailbox.NewRegistry(8),
+			Interactions: interaction.NewService(nil), AgentID: "agent-1",
+		},
 		PlanControlGroup{Coordinator: coordinator, Store: taskStore, Holder: &fakeHolder{id: "controller"}},
 		SchedulerGroup{
 			Store: newFakeStore(), Holder: &fakeHolder{id: "sched"}, ProjectRoot: t.TempDir(),

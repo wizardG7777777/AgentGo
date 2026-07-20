@@ -24,6 +24,7 @@
 - `internal/model/plan.go`：Plan、节点、版本、验收、预算模型
 - `internal/plan/`：持久化 Store、Coordinator、图校验、验收和预算策略
 - `internal/bootstrap/plan_runtime.go`：TaskStore 与 Plan 控制面的事实桥接
+- `internal/bootstrap/interaction_runtime.go` 与 `internal/interaction/`：从 PlanStore 事实物化用户选择，并以 CAS/effect/complete 消费回答
 - `internal/scheduler/`：PlanSignal 等待、快照注入和决策确认
 - `internal/tools/plan_control.go`：受控的 Scheduler / acceptance 工具面
 - `internal/agenttemplate/` 与 `internal/team/`：按模板 provision 真实执行 route，并以 ref+digest 恢复
@@ -245,19 +246,31 @@ runner 若在提交结果后未能正常 `completed`，Run 会记录 `runner_fai
 
 未被失败 Criterion 引用的证据、证据 ID、时间戳、随机 nonce 或 runner 自报的 failure fingerprint 都不算新进展；同一 epoch 内旧失败集合或旧证据集合的 A→B→A→B 轮换也不能无限重置计数。进展判断、历史追加和连续计数与 AcceptanceResult 在同一个 PlanStore 原子事务内完成，并发验收不能都基于旧历史自称“首次进展”。默认连续 3 个无进展验收结果后挂起为 `no_progress`。
 
-## 8. 暂停后的用户选择
+## 8. Plan Interaction 与暂停后的用户选择
 
-预算耗尽、无进展或外部条件阻塞后，系统向用户暴露三种明确选择：
+PlanStore 始终是 Plan 执行事实的权威来源；Interaction 只记录用户对某一份已绑定 Plan 快照的选择。控制面根据 `paused_awaiting_decision` 的持久化事实创建或恢复进程内 Interaction，并绑定 Plan ID、`ExecutionStateVersion`、`CurrentGraphDigest`、pause reason 以及 gate/exec/topo 三轴模式。`SessionID` 仅记录创建审计归属；任务可跨 `/session` 切换继续运行，UI 因而显示进程内全部 pending 请求。重启后可以从 PlanStore 重新物化 Interaction，不依赖前端保存状态。
 
-1. `continue`：用户授权一个有理由、可审计的限额增量。可增加 Task、活跃 Task、PlanRevision、AcceptanceRun、token 或运行时间额度，然后恢复 normal 模式。
-2. `converge`：取消尚未结束的调查节点，禁止再创建 `investigation` 节点；在有限增量内尽快整理现有证据、完成必要修复、正式验收并汇报残余风险。
-3. `terminate`：取消当前图仍在运行的 Task，并将 Plan 置为 `cancelled_by_user`。
+`gate=plan` 时，Scheduler 调用 `submit_plan_for_review` 将完整计划写入 `Plan.Review`，并以 `PauseReason=plan_review` 挂起。由此生成的 `plan_review` Interaction 提供：
 
-`resolve_plan_pause` 使用 `resolution` 和必填 `reason` 记录用户决定；限额增量通过 `add_tasks`、`add_active_tasks`、`add_revisions`、`add_acceptance_runs`、`add_tokens`、`add_minutes` 显式提供。未授权的额度不会自动变成无限。
+| Option ID | 用户含义 | 领域 effect |
+|---|---|---|
+| `execute_plan` | 执行当前计划 | 以已审阅计划创建新的 controller 并恢复 Plan |
+| `revise_plan` | 要求修改 | 必须附带文本反馈；创建修订 controller，修订后再次提交评审 |
+| `cancel_request` | 取消请求 | 终止 Plan 并取消剩余 Task |
 
-`continue` 和 `converge` 都会持久化 `ExecutionOverride`（增量、原因、授权者、时间），并创建新的 controller Task 消费尚未处理的 PlanSignal。新 controller 会先以预留 ID 持久化在 TaskStore；此时 Plan 仍暂停，所以它不可认领。随后 Plan 恢复与 `ActiveDecisionTaskID` 转移在同一个原子事务内提交。TaskStore 保留预留 ID 且拒绝重复覆盖；预发布失败则 Plan 保持暂停，因此不会出现“Plan 已运行但新 controller 尚不存在”的窗口。恢复不等于清空历史，也不绕过正式验收。
+预算耗尽、连续无进展或外部条件阻塞会生成 `plan_pause` Interaction：
 
-暂停决定不能由旧 Plan 自我授权。`resolve_plan_pause` 只接受一条新的用户输入所创建的根 Scheduler controller，并且它必须操作另一张处于 paused/blocked 的 Plan；`terminate` 同样持久化带有 resolution、授权 Task 和原因的 `ExecutionOverride`。这使“忽略限制继续”“尽快收敛”“直接终止”都能追溯到明确的用户决定。
+| Option ID | 用户含义 | 领域 effect |
+|---|---|---|
+| `continue_bounded` | 限额继续 | 对每个当前非零预算增加 25% 的有界额度并恢复 normal 模式；零表示原本不设限，不会被改成有限值 |
+| `converge_delivery` | 收敛交付 | 增加同样的有界额度，并要求只完成最小可验收交付、尽快进入正式验收 |
+| `terminate_plan` | 终止请求 | 终止 Plan 并取消剩余 Task |
+
+TUI 与 Web 都只提交 `request_id + expected_version + option_id + text`；Option ID 是稳定协议，映射到领域动作的 `ActionRef` 只存在于服务端。回答先通过 CAS 把 Interaction 从 `pending` 锁到 `resolving`，受信任 handler 再重新核对上述 Plan 绑定并提交 PlanStore effect，最后才 `Complete` 为 `resolved`。可恢复 effect 错误会 `Release` 回 `pending`；版本、digest、pause reason 或模式已变化时将请求标为失败，禁止把陈旧选择应用到新 Plan。
+
+`continue_bounded` 和 `converge_delivery` 都持久化 `ExecutionOverride`（增量、resolution、授权者、原因和时间），并创建新的 controller Task 消费尚未处理的 PlanSignal。新 controller 会先以预留 ID 持久化在 TaskStore；此时 Plan 仍暂停，所以它不可认领。随后 Plan 恢复与 `ActiveDecisionTaskID` 转移在同一个 PlanStore 原子事务内提交。TaskStore 保留预留 ID 且拒绝重复覆盖；预发布失败则 Plan 保持暂停，因此不会出现“Plan 已运行但新 controller 尚不存在”的窗口。恢复不等于清空历史，也不绕过正式验收。
+
+旧 Plan 或 Scheduler LLM 不能替用户作答，也不存在面向 Agent 的暂停解析工具。`/plan` 的正常职责是定位和列出当前 Plan/Interaction；旧式命令若为兼容仍保留，也必须进入同一 Interaction CAS/effect 管线，不能形成第二条授权路径。等待选择期间相关 Agent 状态为 `waiting_interaction`。
 
 硬暂停会在 LLM 前后、每个具体工具 dispatch 之前以及 Scheduler 等待期间生效。同一轮返回多个工具时按模型给出的顺序执行，每个工具之间重新核对 Plan 状态与 active controller。普通计划节点还会重新读取 TaskStore，确认上下文未取消、Task 仍为 `processing`、节点仍属于 `CurrentNodeIDs` 且没有退休；验收节点另行确认 Run 尚未提交结果。因此 Task 取消/替代、`report_done`、暂停/终态操作或验收提交都不能和后续写文件、shell 调用穿透边界。普通执行 Task 会释放 lease、保持 retry 计数不变并把本轮 ReAct 历史持久化后回到 pending；controller 会进入 blocked。恢复时由新 controller 接管，已完成的工具调用不会因为丢失历史而被重复执行。
 
@@ -314,7 +327,7 @@ Task 会话快照已升级为 v2，并保存 PlanID、节点角色、版本、Su
 7. Reactor 不能直接修改计划内 DAG，也不能借模板 provision 绕过 Scheduler，更不能伪造系统 trace 事实。
 8. 过期 revision/digest/spec 的验收只能得到 stale；伪造命令、Task 状态、越界文件 hash 或 runner 身份不能 PASS。
 9. 进入 DAG 或发生直接执行后，`report_done` 和自然文本都不能绕过最新 Plan scope 正式验收；终态 controller 只能无工具汇报。
-10. 80% 预算告警、硬暂停、连续无进展和三种用户决策均有可重复测试。
+10. 80% 预算告警、硬暂停、连续无进展、`plan_review` / `plan_pause` 的稳定选项和竞争回答均有可重复测试。
 11. 重启后图身份、终态依赖、pending 信号、验收身份以及 TeamSpec 的模板 ref+digest/稳定 route 仍可恢复；模板丢失、漂移或总容量超限必须整体 fail-closed，而不是静默替换或部分启动。
 12. 任一时刻只有 `ActiveDecisionTaskID` 对应的 controller 能认领控制任务和修改 Plan；active controller 丢失时必须挂起。
 

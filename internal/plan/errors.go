@@ -15,6 +15,7 @@ var (
 	ErrDependencyNotFound       = errors.New("plan node dependency not found")
 	ErrGraphCycle               = errors.New("plan graph contains a cycle")
 	ErrBudgetExceeded           = errors.New("plan budget exhausted")
+	ErrPauseConflict            = errors.New("plan pause state conflict")
 	ErrAcceptanceSpecNotDefined = errors.New("acceptance spec not defined")
 	ErrAcceptanceSpecWeakening  = errors.New("acceptance spec cannot weaken protected criteria")
 	ErrAcceptanceRunNotFound    = errors.New("acceptance run not found")

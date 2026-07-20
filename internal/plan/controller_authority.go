@@ -34,3 +34,13 @@ func ensureControllerAuthority(ctx context.Context, p *model.Plan) error {
 	}
 	return nil
 }
+
+// controllerAuthorityFrom 返回 ctx 绑定的 controller 任务 ID（无绑定时为空串），
+// 供需要把提交者身份写入审计载荷的控制面路径使用（如 PlanReview.SubmittedBy）。
+func controllerAuthorityFrom(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	taskID, _ := ctx.Value(controllerAuthorityContextKey{}).(string)
+	return taskID
+}

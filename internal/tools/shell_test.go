@@ -6,51 +6,76 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/interaction"
 	"agentgo/internal/llm"
+	"agentgo/internal/modes"
 	"agentgo/internal/shell"
 )
 
-// newTestShellGroup 构造一个常规单元测试用 ShellGroup，带宽度为 1 的审批通道。
-func newTestShellGroup(t *testing.T, fallbackDir string, filter *shell.CommandFilter) (ShellGroup, chan shell.ApprovalRequest) {
+func newTestShellGroup(t *testing.T, fallbackDir string, filter *shell.CommandFilter) (ShellGroup, *interaction.Service) {
 	t.Helper()
-	approvalCh := make(chan shell.ApprovalRequest, 1)
-	g := ShellGroup{
-		Workdir:    &DefaultWorkdir{ProjectRoot: fallbackDir},
-		TimeoutSec: 10,
-		ApprovalCh: approvalCh,
-		AgentID:    "test-agent",
-		Filter:     filter,
+	interactions := interaction.NewService(nil)
+	return ShellGroup{
+		Workdir:      &DefaultWorkdir{ProjectRoot: fallbackDir},
+		TimeoutSec:   10,
+		Interactions: interactions,
+		SessionID:    func() string { return "session-tools-test" },
+		AgentID:      "test-agent",
+		Filter:       filter,
+	}, interactions
+}
+
+func dispatchRunShell(ctx context.Context, group ShellGroup, args map[string]any) (string, error) {
+	registry := agent.NewToolRegistry()
+	group.Register(registry)
+	return registry.Dispatch(ctx, llm.ToolCall{Name: "run_shell", Arguments: args})
+}
+
+func emptyFilter() *shell.CommandFilter { return shell.NewCommandFilter(nil, nil) }
+
+func waitToolInteraction(t *testing.T, service *interaction.Service) interaction.Request {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		requests, err := service.ListPending(context.Background(), "session-tools-test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(requests) == 1 {
+			return requests[0]
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("等待 Shell Interaction 超时，pending=%d", len(requests))
+		}
+		time.Sleep(time.Millisecond)
 	}
-	return g, approvalCh
 }
 
-// dispatchRunShell 新建 registry 注册 ShellGroup 并通过 Dispatch 调用 run_shell。
-func dispatchRunShell(ctx context.Context, g ShellGroup, args map[string]any) (string, error) {
-	r := agent.NewToolRegistry()
-	g.Register(r)
-	return r.Dispatch(ctx, llm.ToolCall{Name: "run_shell", Arguments: args})
-}
-
-// emptyFilter 返回一个空 filter，所有命令都会被放行。
-func emptyFilter() *shell.CommandFilter {
-	return shell.NewCommandFilter(nil, nil)
+func completeToolInteraction(t *testing.T, service *interaction.Service, request interaction.Request, optionID string) {
+	t.Helper()
+	locked, err := service.BeginResolve(context.Background(), interaction.ResolveInput{
+		RequestID: request.ID, ExpectedVersion: request.Version, OptionID: optionID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Complete(context.Background(), locked.ID, locked.Version); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestShellGroup_Register_OneTool(t *testing.T) {
-	r := agent.NewToolRegistry()
-	g, _ := newTestShellGroup(t, t.TempDir(), nil)
-	g.Register(r)
-
-	defs := r.Defs()
-	if len(defs) != 1 {
-		t.Fatalf("expected exactly 1 tool, got %d", len(defs))
-	}
-	if defs[0].Name != "run_shell" {
-		t.Fatalf("expected run_shell, got %s", defs[0].Name)
+	registry := agent.NewToolRegistry()
+	group, _ := newTestShellGroup(t, t.TempDir(), nil)
+	group.Register(registry)
+	defs := registry.Defs()
+	if len(defs) != 1 || defs[0].Name != "run_shell" {
+		t.Fatalf("Defs = %+v", defs)
 	}
 }
 
@@ -58,18 +83,10 @@ func TestRunShell_BasicEcho(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip on windows")
 	}
-	g, _ := newTestShellGroup(t, t.TempDir(), emptyFilter())
-	out, err := dispatchRunShell(context.Background(), g, map[string]any{
-		"command": "echo hello",
-	})
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if !strings.Contains(out, "exit_code: 0") {
-		t.Errorf("expected exit_code 0, got: %s", out)
-	}
-	if !strings.Contains(out, "hello") {
-		t.Errorf("expected output to contain 'hello', got: %s", out)
+	group, _ := newTestShellGroup(t, t.TempDir(), emptyFilter())
+	out, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "echo hello"})
+	if err != nil || !strings.Contains(out, "exit_code: 0") || !strings.Contains(out, "hello") {
+		t.Fatalf("out=%q err=%v", out, err)
 	}
 }
 
@@ -77,15 +94,10 @@ func TestRunShell_NonZeroExit(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip on windows")
 	}
-	g, _ := newTestShellGroup(t, t.TempDir(), emptyFilter())
-	out, err := dispatchRunShell(context.Background(), g, map[string]any{
-		"command": "false",
-	})
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if strings.Contains(out, "exit_code: 0") {
-		t.Errorf("expected non-zero exit code, got: %s", out)
+	group, _ := newTestShellGroup(t, t.TempDir(), emptyFilter())
+	out, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "false"})
+	if err != nil || strings.Contains(out, "exit_code: 0") {
+		t.Fatalf("out=%q err=%v", out, err)
 	}
 }
 
@@ -93,218 +105,180 @@ func TestRunShell_Timeout(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip on windows")
 	}
-	g, _ := newTestShellGroup(t, t.TempDir(), emptyFilter())
-	start := time.Now()
-	_, err := dispatchRunShell(context.Background(), g, map[string]any{
-		"command":     "sleep 5",
-		"timeout_sec": float64(1),
+	group, _ := newTestShellGroup(t, t.TempDir(), emptyFilter())
+	started := time.Now()
+	_, err := dispatchRunShell(context.Background(), group, map[string]any{
+		"command": "sleep 5", "timeout_sec": float64(1),
 	})
-	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatalf("expected timeout error, got nil")
+	if err == nil || !strings.Contains(err.Error(), "超时") {
+		t.Fatalf("error = %v", err)
 	}
-	if !strings.Contains(err.Error(), "超时") {
-		t.Errorf("expected timeout error message, got: %v", err)
-	}
-	if elapsed > 3*time.Second {
-		t.Errorf("expected to return within ~2s, took %v", elapsed)
+	if time.Since(started) > 3*time.Second {
+		t.Fatal("命令超时返回过慢")
 	}
 }
 
-func TestRunShell_WorkingDirOverride(t *testing.T) {
+func TestRunShell_WorkingDirectories(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip on windows")
 	}
-	tmp := t.TempDir()
-	sentinel := "sentinel_file.txt"
-	if err := os.WriteFile(filepath.Join(tmp, sentinel), []byte("x"), 0644); err != nil {
-		t.Fatalf("write sentinel: %v", err)
-	}
-
-	// fallback 指向一个不同的空目录
-	other := t.TempDir()
-	g, _ := newTestShellGroup(t, other, emptyFilter())
-
-	out, err := dispatchRunShell(context.Background(), g, map[string]any{
-		"command":     "ls",
-		"working_dir": tmp,
+	t.Run("override", func(t *testing.T) {
+		override := t.TempDir()
+		if err := os.WriteFile(filepath.Join(override, "override.txt"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		group, _ := newTestShellGroup(t, t.TempDir(), emptyFilter())
+		out, err := dispatchRunShell(context.Background(), group, map[string]any{
+			"command": "ls", "working_dir": override,
+		})
+		if err != nil || !strings.Contains(out, "override.txt") {
+			t.Fatalf("out=%q err=%v", out, err)
+		}
 	})
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if !strings.Contains(out, sentinel) {
-		t.Errorf("expected output to contain sentinel %q, got: %s", sentinel, out)
-	}
-}
-
-func TestRunShell_WorkingDirFallback(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skip on windows")
-	}
-	tmp := t.TempDir()
-	sentinel := "fallback_sentinel.txt"
-	if err := os.WriteFile(filepath.Join(tmp, sentinel), []byte("x"), 0644); err != nil {
-		t.Fatalf("write sentinel: %v", err)
-	}
-
-	g, _ := newTestShellGroup(t, tmp, emptyFilter())
-
-	out, err := dispatchRunShell(context.Background(), g, map[string]any{
-		"command": "ls",
+	t.Run("fallback", func(t *testing.T) {
+		fallback := t.TempDir()
+		if err := os.WriteFile(filepath.Join(fallback, "fallback.txt"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		group, _ := newTestShellGroup(t, fallback, emptyFilter())
+		out, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "ls"})
+		if err != nil || !strings.Contains(out, "fallback.txt") {
+			t.Fatalf("out=%q err=%v", out, err)
+		}
 	})
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if !strings.Contains(out, sentinel) {
-		t.Errorf("expected output to contain sentinel %q, got: %s", sentinel, out)
-	}
 }
 
 func TestRunShell_BlacklistBlocked(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skip on windows")
-	}
-	// danger_marker 不对应任何真实命令，即使拦截失败也不会产生破坏。
-	filter := shell.NewCommandFilter([]string{`^danger_marker$`}, nil)
-	g, _ := newTestShellGroup(t, t.TempDir(), filter)
-
-	_, err := dispatchRunShell(context.Background(), g, map[string]any{
-		"command": "danger_marker",
-	})
-	if err == nil {
-		t.Fatalf("expected blacklist error, got nil")
-	}
-	if !strings.Contains(err.Error(), "黑名单") {
-		t.Errorf("expected blacklist error message, got: %v", err)
+	group, _ := newTestShellGroup(t, t.TempDir(), shell.NewCommandFilter([]string{`^danger_marker$`}, nil))
+	_, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "danger_marker"})
+	if err == nil || !strings.Contains(err.Error(), "黑名单") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
-func TestRunShell_GraylistTriggersApproval(t *testing.T) {
+func TestRunShell_InteractionAllowAndFallbackDirectoryBinding(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("skip on windows")
+		t.Skip("skip real shell execution on windows")
 	}
-	filter := shell.NewCommandFilter(nil, []string{`^echo gray$`})
-	g, approvalCh := newTestShellGroup(t, t.TempDir(), filter)
-
+	fallback := t.TempDir()
+	group, service := newTestShellGroup(t, fallback, shell.NewCommandFilter(nil, []string{`^echo gray$`}))
 	type result struct {
 		out string
 		err error
 	}
 	done := make(chan result, 1)
-
 	go func() {
-		out, err := dispatchRunShell(context.Background(), g, map[string]any{
-			"command": "echo gray",
-		})
-		done <- result{out, err}
+		out, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "echo gray"})
+		done <- result{out: out, err: err}
 	}()
-
-	// 等待审批请求到达
-	select {
-	case req := <-approvalCh:
-		if req.AgentID != "test-agent" {
-			t.Errorf("expected agent id test-agent, got %s", req.AgentID)
-		}
-		if req.Command != "echo gray" {
-			t.Errorf("expected command 'echo gray', got %s", req.Command)
-		}
-		// 批准放行
-		req.ReplyCh <- shell.ApprovalReply{Approved: true}
-	case <-time.After(3 * time.Second):
-		t.Fatalf("timeout waiting for approval request")
+	request := waitToolInteraction(t, service)
+	if request.Metadata[shell.MetadataWorkingDir] != fallback {
+		t.Fatalf("Interaction working_dir = %q, want fallback %q",
+			request.Metadata[shell.MetadataWorkingDir], fallback)
 	}
-
+	if request.SessionID != "session-tools-test" || request.Origin.AgentID != "test-agent" {
+		t.Fatalf("request = %+v", request)
+	}
+	completeToolInteraction(t, service, request, shell.ActionAllowOnce)
 	select {
-	case res := <-done:
-		if res.err != nil {
-			t.Fatalf("unexpected err after approval: %v", res.err)
-		}
-		if !strings.Contains(res.out, "gray") {
-			t.Errorf("expected output to contain 'gray', got %s", res.out)
+	case got := <-done:
+		if got.err != nil || !strings.Contains(got.out, "gray") {
+			t.Fatalf("result = %+v", got)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatalf("run_shell did not return after approval")
+		t.Fatal("授权后 run_shell 未返回")
 	}
 }
 
-
-// A2：ShellGroup.ApprovalWaitHook → shell.WrapShellTool 接线验证
-// （顺带断言 RequestID 与 cap-1 ReplyCh）。命令被拒绝，不会真实执行
-// shell，Windows 上也可运行。
-func TestShellGroup_ApprovalWaitHook(t *testing.T) {
-	filter := shell.NewCommandFilter(nil, []string{`^gray_marker$`})
-	g, approvalCh := newTestShellGroup(t, t.TempDir(), filter)
-
-	hookCh := make(chan bool, 4)
-	g.ApprovalWaitHook = func(waiting bool) { hookCh <- waiting }
-
+func TestShellGroup_InteractionWaitHook(t *testing.T) {
+	group, service := newTestShellGroup(t, t.TempDir(), shell.NewCommandFilter(nil, []string{`^gray_marker$`}))
+	var mu sync.Mutex
+	var calls []bool
+	group.InteractionWaitHook = func(waiting bool) {
+		mu.Lock()
+		calls = append(calls, waiting)
+		mu.Unlock()
+	}
 	done := make(chan error, 1)
 	go func() {
-		_, err := dispatchRunShell(context.Background(), g, map[string]any{"command": "gray_marker"})
+		_, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "gray_marker"})
 		done <- err
 	}()
-
-	select {
-	case req := <-approvalCh:
-		if req.RequestID == "" {
-			t.Error("RequestID 应非空")
-		}
-		if cap(req.ReplyCh) != 1 {
-			t.Errorf("ReplyCh cap = %d, want 1", cap(req.ReplyCh))
-		}
-		req.ReplyCh <- shell.ApprovalReply{Approved: false}
-	case <-time.After(3 * time.Second):
-		t.Fatal("timeout waiting for approval request")
+	request := waitToolInteraction(t, service)
+	completeToolInteraction(t, service, request, shell.ActionDeny)
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "拒绝") {
+		t.Fatalf("error = %v", err)
 	}
-
-	select {
-	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "拒绝") {
-			t.Fatalf("拒绝后应返回拒绝错误，got: %v", err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("run_shell 未在拒绝后返回")
-	}
-
-	// hook 应按 [true, false] 顺序成对触发（done 返回时两次回调均已发生）
-	var seq []bool
-	for i := 0; i < 2; i++ {
-		select {
-		case v := <-hookCh:
-			seq = append(seq, v)
-		case <-time.After(time.Second):
-			t.Fatalf("hook 触发次数不足: %v", seq)
-		}
-	}
-	if !seq[0] || seq[1] {
-		t.Errorf("hook 序列 = %v, want [true false]", seq)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 2 || !calls[0] || calls[1] {
+		t.Fatalf("hook calls = %v", calls)
 	}
 }
 
-// A2：nil ApprovalWaitHook 必须是 no-op（scheduler/测试路径的默认形态）。
-func TestShellGroup_NilApprovalWaitHook_NoOp(t *testing.T) {
-	filter := shell.NewCommandFilter(nil, []string{`^gray_marker_nil$`})
-	g, approvalCh := newTestShellGroup(t, t.TempDir(), filter) // 不设 hook
-
+func TestShellGroup_NilInteractionWaitHook(t *testing.T) {
+	group, service := newTestShellGroup(t, t.TempDir(), shell.NewCommandFilter(nil, []string{`^gray_marker$`}))
 	done := make(chan error, 1)
 	go func() {
-		_, err := dispatchRunShell(context.Background(), g, map[string]any{"command": "gray_marker_nil"})
+		_, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "gray_marker"})
 		done <- err
 	}()
-
-	select {
-	case req := <-approvalCh:
-		req.ReplyCh <- shell.ApprovalReply{Approved: false}
-	case <-time.After(3 * time.Second):
-		t.Fatal("timeout waiting for approval request")
+	request := waitToolInteraction(t, service)
+	completeToolInteraction(t, service, request, shell.ActionDeny)
+	if err := <-done; err == nil {
+		t.Fatal("拒绝应返回 error")
 	}
+}
 
+func TestShellGroup_NilInteractionServiceFailsClosed(t *testing.T) {
+	group := ShellGroup{
+		Workdir: &DefaultWorkdir{ProjectRoot: t.TempDir()}, AgentID: "test-agent",
+		Filter: shell.NewCommandFilter(nil, []string{`^gray_marker$`}),
+	}
+	_, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "gray_marker"})
+	if err == nil || !strings.Contains(err.Error(), "Interaction 服务不可用") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+// exec=strict 经 ShellGroup.Modes 接线生效：原本直接放行的普通命令也会
+// 创建 shell_command 审批请求；用户 allow_once 后才真正执行。
+func TestShellGroup_ModesStrictAsksPlainCommand(t *testing.T) {
+	group, service := newTestShellGroup(t, t.TempDir(), emptyFilter())
+	group.Modes = modes.NewStore(modes.GateImmediate, modes.ExecStrict, modes.TopoTeam)
+	type result struct {
+		out string
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "echo strict-ask"})
+		done <- result{out: out, err: err}
+	}()
+	request := waitToolInteraction(t, service)
+	if !strings.Contains(request.Prompt, "strict 模式逐条审批") {
+		t.Fatalf("strict Prompt = %q", request.Prompt)
+	}
+	completeToolInteraction(t, service, request, shell.ActionAllowOnce)
 	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("拒绝后应返回 error")
+	case got := <-done:
+		if got.err != nil || !strings.Contains(got.out, "strict-ask") {
+			t.Fatalf("result = %+v", got)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("nil hook 路径 run_shell 未返回")
+		t.Fatal("授权后 run_shell 未返回")
+	}
+}
+
+// exec=yolo 经 ShellGroup.Modes 接线生效：灰名单命令自动放行，不创建 Interaction。
+func TestShellGroup_ModesYoloAutoAllowsGrey(t *testing.T) {
+	group, service := newTestShellGroup(t, t.TempDir(), shell.NewCommandFilter(nil, []string{`^echo yolo$`}))
+	group.Modes = modes.NewStore(modes.GateImmediate, modes.ExecYolo, modes.TopoTeam)
+	out, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "echo yolo"})
+	if err != nil || !strings.Contains(out, "yolo") {
+		t.Fatalf("yolo 灰名单应自动放行: out=%q err=%v", out, err)
+	}
+	if pending, listErr := service.ListPending(context.Background(), ""); listErr != nil || len(pending) != 0 {
+		t.Fatalf("yolo 不应创建 Interaction: pending=%d err=%v", len(pending), listErr)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"agentgo/internal/config"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
+	"agentgo/internal/modes"
 	"agentgo/internal/probe"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
@@ -21,6 +22,12 @@ import (
 // 这些测试从旧的 internal/scheduler/scheduler_test.go::TestScheduler_BuildBoardJSON_*
 // 迁移而来。原测试调用 sched.buildBoardJSON 私有方法，现在直接测公开 helper
 // BuildBoardJSON。
+
+// testModeSnap 构造测试用三轴模式快照：gate 轴取传入值，exec / topo 轴取默认。
+// 与旧版 BuildBoardJSON 的 mode string 参数一一对应，减少签名变更的测试 churn。
+func testModeSnap(gate string) modes.Snapshot {
+	return modes.Snapshot{Gate: gate, Exec: modes.ExecNormal.String(), Topo: modes.TopoTeam.String()}
+}
 
 func TestBuildBoardJSON_Resources(t *testing.T) {
 	ch := make(chan model.Event, 64)
@@ -36,7 +43,7 @@ func TestBuildBoardJSON_Resources(t *testing.T) {
 		t.Fatalf("claim: %v", err)
 	}
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{Type: model.EventTickerWakeup}, SnapshotSources{})
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{Type: model.EventTickerWakeup}, SnapshotSources{})
 
 	// resources 应当反映：worker_count=4, busy=1, available=3
 	if !strings.Contains(out, `"worker_count": 4`) {
@@ -55,7 +62,7 @@ func TestBuildBoardJSON_ResourcesDefault(t *testing.T) {
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	cfg := &config.Config{} // Scheduler-only: no static worker route
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{Type: model.EventUserInput}, SnapshotSources{})
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{Type: model.EventUserInput}, SnapshotSources{})
 
 	if !strings.Contains(out, `"worker_count": 0`) {
 		t.Errorf("expected worker_count=0, got: %s", out)
@@ -73,7 +80,7 @@ func TestBuildBoardJSON_SchedulerOnlySeparatesTemplatesFromReadyRoutes(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := BuildBoardJSON(s, &config.Config{}, "immediate", model.Event{Type: model.EventUserInput}, SnapshotSources{
+	out := BuildBoardJSON(s, &config.Config{}, testModeSnap("immediate"), model.Event{Type: model.EventUserInput}, SnapshotSources{
 		TemplateCatalog: catalog,
 	})
 	bs := parseSnapshot(t, out)
@@ -93,7 +100,7 @@ func TestBuildBoardJSON_TriggerFields(t *testing.T) {
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
-	out := BuildBoardJSON(s, cfg, "plan", model.Event{
+	out := BuildBoardJSON(s, cfg, testModeSnap("plan"), model.Event{
 		Type:    model.EventUserInput,
 		Payload: map[string]string{"text": "hello world"},
 	}, SnapshotSources{})
@@ -109,6 +116,23 @@ func TestBuildBoardJSON_TriggerFields(t *testing.T) {
 	}
 }
 
+// TestBuildBoardJSON_ModeAxes 验证三轴模式快照写入 JSON：
+// "mode" 字段保持 = gate 轴（兼容旧消费方），exec / topo 轴写入新增字段。
+func TestBuildBoardJSON_ModeAxes(t *testing.T) {
+	ch := make(chan model.Event, 64)
+	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
+
+	out := BuildBoardJSON(s, cfg, modes.Snapshot{Gate: "plan", Exec: "readonly", Topo: "solo"},
+		model.Event{Type: model.EventTickerWakeup}, SnapshotSources{})
+
+	for _, want := range []string{`"mode": "plan"`, `"exec_mode": "readonly"`, `"topo_mode": "solo"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("快照缺少 %s，got: %s", want, out)
+		}
+	}
+}
+
 func TestBuildBoardJSON_TaskWithArtifacts(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
@@ -120,7 +144,7 @@ func TestBuildBoardJSON_TaskWithArtifacts(t *testing.T) {
 	s.AppendArtifact(task.ID, "docs/result.md")
 	s.SubmitResult("worker-1", task.ID, "done")
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{Type: model.EventTaskCompleted}, SnapshotSources{})
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{Type: model.EventTaskCompleted}, SnapshotSources{})
 
 	if !strings.Contains(out, "docs/result.md") {
 		t.Errorf("expected artifact in snapshot, got: %s", out)
@@ -132,7 +156,7 @@ func TestBuildBoardJSON_EmptyStore(t *testing.T) {
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 2}}}
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{Type: model.EventUserInput}, SnapshotSources{})
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{Type: model.EventUserInput}, SnapshotSources{})
 
 	if !strings.Contains(out, `"worker_count": 2`) {
 		t.Errorf("expected worker_count=2 in empty store snapshot, got: %s", out)
@@ -166,7 +190,7 @@ func TestBuildBoardJSON_AgentsFromMailboxRegistry(t *testing.T) {
 	// worker-2 收件箱有 1 条消息
 	_ = mb.Send(mailbox.Message{From: "scheduler-x", To: "worker-2", Content: "hi"})
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{Type: model.EventTickerWakeup}, SnapshotSources{
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{Type: model.EventTickerWakeup}, SnapshotSources{
 		MBRegistry: mb,
 	})
 	bs := parseSnapshot(t, out)
@@ -211,7 +235,7 @@ func TestBuildBoardJSON_AgentsCurrentTaskMapping(t *testing.T) {
 	s.PublishTask(t1)
 	s.ClaimTask("worker-1", t1.ID)
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{}, SnapshotSources{MBRegistry: mb})
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{}, SnapshotSources{MBRegistry: mb})
 	bs := parseSnapshot(t, out)
 
 	byID := make(map[string]agentSnapshot)
@@ -246,7 +270,7 @@ func TestBuildBoardJSON_AgentsRosterLockedFiles(t *testing.T) {
 		t.Fatalf("TryClaim internal/foo.go: %v", err)
 	}
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{}, SnapshotSources{MBRegistry: mb, Roster: r})
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{}, SnapshotSources{MBRegistry: mb, Roster: r})
 	bs := parseSnapshot(t, out)
 
 	if len(bs.Resources.Agents) != 1 {
@@ -270,7 +294,7 @@ func TestBuildBoardJSON_AgentsNilMBRegistry_OmitsField(t *testing.T) {
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{}, SnapshotSources{})
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{}, SnapshotSources{})
 	if strings.Contains(out, `"agents"`) {
 		t.Errorf("agents field should be omitted when MBRegistry is nil, got: %s", out)
 	}
@@ -295,7 +319,7 @@ func TestBuildBoardJSON_SessionHistoryFromHistory(t *testing.T) {
 		SubmittedAt:     time.Date(2026, 4, 10, 12, 1, 0, 0, time.UTC),
 	})
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{}, SnapshotSources{History: hist})
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{}, SnapshotSources{History: hist})
 	bs := parseSnapshot(t, out)
 
 	if len(bs.SessionHistory) != 2 {
@@ -333,7 +357,7 @@ func TestBuildBoardJSON_SessionHistoryOutcomeFromStore(t *testing.T) {
 		SubmittedAt:     time.Now(),
 	})
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{}, SnapshotSources{History: hist})
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{}, SnapshotSources{History: hist})
 	bs := parseSnapshot(t, out)
 
 	if len(bs.SessionHistory) != 1 {
@@ -349,7 +373,7 @@ func TestBuildBoardJSON_SessionHistoryNil_OmitsField(t *testing.T) {
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{}, SnapshotSources{})
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{}, SnapshotSources{})
 	if strings.Contains(out, `"session_history"`) {
 		t.Errorf("session_history should be omitted when History is nil, got: %s", out)
 	}
@@ -390,7 +414,7 @@ func TestBuildBoardJSON_AgentCapabilities_WorkerAndSpecialized(t *testing.T) {
 		Description:  "general worker",
 	}
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{Type: model.EventUserInput}, SnapshotSources{
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{Type: model.EventUserInput}, SnapshotSources{
 		AgentRegistry:      reg,
 		WorkerCapabilities: workerCaps,
 	})
@@ -424,7 +448,7 @@ func TestBuildBoardJSON_AgentCapabilities_NilWorker(t *testing.T) {
 		Capabilities: []string{"read"},
 	})
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{}, SnapshotSources{
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{}, SnapshotSources{
 		AgentRegistry:      reg,
 		WorkerCapabilities: nil,
 	})
@@ -456,7 +480,7 @@ func TestBuildBoardJSON_PlanSnapshotHidesOtherPlansTeams(t *testing.T) {
 		mb.Register(route.key+":agent", route.eventType)
 	}
 
-	out := BuildBoardJSON(s, cfg, "plan", model.Event{}, SnapshotSources{
+	out := BuildBoardJSON(s, cfg, testModeSnap("plan"), model.Event{}, SnapshotSources{
 		AgentRegistry: reg,
 		MBRegistry:    mb,
 		Plan:          &model.Plan{ID: "plan-a"},
@@ -478,7 +502,7 @@ func TestBuildBoardJSON_PlanSnapshotHidesOtherPlansTeams(t *testing.T) {
 		t.Fatalf("Plan snapshot omitted global static or owning Team route: %s", out)
 	}
 
-	global := BuildBoardJSON(s, cfg, "immediate", model.Event{}, SnapshotSources{AgentRegistry: reg, MBRegistry: mb})
+	global := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{}, SnapshotSources{AgentRegistry: reg, MBRegistry: mb})
 	if !strings.Contains(global, `"team:b"`) {
 		t.Fatalf("unscoped diagnostic snapshot should retain global registry view: %s", global)
 	}
@@ -489,7 +513,7 @@ func TestBuildBoardJSON_AgentCapabilities_BothNil_OmitsField(t *testing.T) {
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{}, SnapshotSources{})
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{}, SnapshotSources{})
 	if strings.Contains(out, `"agent_capabilities"`) {
 		t.Errorf("agent_capabilities should be omitted when both nil, got: %s", out)
 	}
@@ -505,7 +529,7 @@ func TestBuildBoardJSON_AgentCapabilities_EmptyCapsAndDesc(t *testing.T) {
 		Description:  "",
 	}
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{}, SnapshotSources{
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{}, SnapshotSources{
 		WorkerCapabilities: workerCaps,
 	})
 	bs := parseSnapshot(t, out)
@@ -758,7 +782,7 @@ func TestProperty_SnapshotUnavailableTools(t *testing.T) {
 		}
 
 		// --- Call BuildBoardJSON ---
-		out := BuildBoardJSON(s, cfg, "immediate", model.Event{Type: model.EventTickerWakeup}, SnapshotSources{
+		out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{Type: model.EventTickerWakeup}, SnapshotSources{
 			ToolHealth: toolHealth,
 		})
 
@@ -804,7 +828,7 @@ func TestBuildBoardJSON_BackwardCompat_NilToolHealth(t *testing.T) {
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{Type: model.EventUserInput}, SnapshotSources{})
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{Type: model.EventUserInput}, SnapshotSources{})
 	if strings.Contains(out, "unavailable_tools") {
 		t.Errorf("unavailable_tools must be absent when ToolHealth is nil (backward compat)\nJSON: %s", out)
 	}
@@ -826,7 +850,7 @@ func TestBuildBoardJSON_BackwardCompat_AllToolsAvailable(t *testing.T) {
 	th.Record(probe.ProbeResult{Tool: "web_search", Available: true, Latency: 100 * time.Millisecond})
 	th.Record(probe.ProbeResult{Tool: "web_fetch", Available: true, Latency: 200 * time.Millisecond})
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{Type: model.EventTickerWakeup}, SnapshotSources{
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{Type: model.EventTickerWakeup}, SnapshotSources{
 		ToolHealth: th,
 	})
 	if strings.Contains(out, "unavailable_tools") {
@@ -862,7 +886,7 @@ func TestBuildBoardJSON_PlanIncludesCurrentGraphAcceptanceAndBoundedWarnings(t *
 		AcceptanceSpecs: map[string]model.AcceptanceSpec{"spec-1": {ID: "spec-1", Revision: 1, Criteria: criteria}},
 		Warnings:        warnings,
 	}
-	raw := BuildBoardJSON(s, &config.Config{}, "plan", model.Event{}, SnapshotSources{Plan: p})
+	raw := BuildBoardJSON(s, &config.Config{}, testModeSnap("plan"), model.Event{}, SnapshotSources{Plan: p})
 	var got boardSnapshot
 	if err := json.Unmarshal([]byte(raw), &got); err != nil {
 		t.Fatal(err)
@@ -898,7 +922,7 @@ func TestBuildBoardJSON_PlanIncludesOnlyCurrentController(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := &model.Plan{ID: "plan-1", RootTaskID: oldController.ID, Nodes: map[string]model.PlanNode{}}
-	raw := BuildBoardJSON(s, &config.Config{}, "plan", model.Event{}, SnapshotSources{
+	raw := BuildBoardJSON(s, &config.Config{}, testModeSnap("plan"), model.Event{}, SnapshotSources{
 		Plan: p, CurrentControllerTaskID: currentController.ID,
 	})
 	var got boardSnapshot
@@ -962,7 +986,7 @@ func TestProperty_PerProfileAgentCapabilitiesOutput(t *testing.T) {
 		}
 
 		// --- 调用 BuildBoardJSON ---
-		out := BuildBoardJSON(s, cfg, "immediate", model.Event{Type: model.EventUserInput}, SnapshotSources{
+		out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{Type: model.EventUserInput}, SnapshotSources{
 			WorkerCapabilitiesByProfile: capsByProfile,
 		})
 
@@ -1067,7 +1091,7 @@ func TestBuildBoardJSON_BackwardCompat_NoProfileFields(t *testing.T) {
 		// WorkerCapabilitiesByProfile: nil  (zero value)
 	}
 
-	out := BuildBoardJSON(s, cfg, "immediate", model.Event{Type: model.EventUserInput}, sources)
+	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{Type: model.EventUserInput}, sources)
 	bs := parseSnapshot(t, out)
 
 	// --- Verify agents do NOT have "profile" field ---

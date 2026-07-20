@@ -10,7 +10,7 @@ import (
 )
 
 // renderHeader draws the top bar: logo | mode | session | agent count.
-func renderHeader(t Theme, l Layout, mode scheduler.Mode, sessionID string, agentCount int, approvalPending int) string {
+func renderHeader(t Theme, l Layout, mode scheduler.Mode, sessionID string, agentCount int, interactionPending int) string {
 	if l.Width < 10 {
 		return ""
 	}
@@ -30,18 +30,18 @@ func renderHeader(t Theme, l Layout, mode scheduler.Mode, sessionID string, agen
 
 	agentLabel := t.HeaderMeta.Render(fmt.Sprintf(" %d agents ", agentCount))
 
-	approvalLabel := ""
-	if approvalPending > 0 {
-		approvalLabel = lipgloss.NewStyle().
+	interactionLabel := ""
+	if interactionPending > 0 {
+		interactionLabel = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("196")).
 			Bold(true).
-			Render(fmt.Sprintf(" ⚠ %d approval ", approvalPending))
+			Render(fmt.Sprintf(" ◆ %d interaction ", interactionPending))
 	}
 
 	sep := t.HeaderSep.Render("│")
 	left := logo + sep + modeLabel + sep + sessLabel + sep + agentLabel
-	if approvalLabel != "" {
-		left += sep + approvalLabel
+	if interactionLabel != "" {
+		left += sep + interactionLabel
 	}
 
 	// Pad to full width with background

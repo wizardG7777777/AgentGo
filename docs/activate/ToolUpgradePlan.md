@@ -1,11 +1,12 @@
-> **状态说明（2026-07-19）**：本文是未实施的 Shell 路线图，不是现行行为说明。当前支持范围与 reserved event kind 以 [YAML 配置指南](../yaml-config-guide.md) 和 [KNOWN_ISSUES.md](KNOWN_ISSUES.md) 为准。
+> **⛔ 已废弃历史（2026-07-20）**：本文保存 2026-04 的未实施 Shell 方案，不是现行契约，也不是已承诺排期。专用 Approval 通道、`waiting_approval`、可编辑模式的四选项单键 UI、`shell_commands.yaml` 自动写回和已落地 TimeoutHandler 等描述均不得作为实现依据。
+>
+> **当前事实源**：[Interaction 设计](../design/interaction.md)、[KNOWN_ISSUES](KNOWN_ISSUES.md) 与源代码 `internal/shell/`。当前使用 generic `shell_command` authorization Interaction、稳定 Option ID、Version CAS 与原调用精确绑定；Agent 状态为 `waiting_interaction`。
 
-# ToolUpgradePlan：v5 工具系统升级规划
+# ToolUpgradePlan：已废弃 Shell 方案与当前差异
 
-> **状态**：📋 起草中（2026-04-30 创建，首批承接从 ReactiveSystem.md §7.4 迁移的 Shell 工具改造内容）
-> **优先级**：P1（v5 工具层重要重构，Shell 是首个重点工具）
+> **状态**：⛔ 已废弃历史（2026-04-30 创建；2026-07-20 被 generic Interaction 契约取代）
 > **关联文档**：
-> - [ReactiveSystem.md](ReactiveSystem.md)（Gate / KindShellExecuted 事件 / WaitingApproval 状态等基础设施由其定义；本文档是它在工具层的具体落地）
+> - [ReactiveSystem.md](ReactiveSystem.md)（当前 Agent 状态机与 Shell Interaction 集成）
 > - [nextUpgrade_v4.md](../archived/nextUpgrade_v4.md) §7 Hashline / §10 Did-You-Mean
 > - [Trace 升级设计归档](../archived/trace-upgrade-design-2026-05.md)（事件 payload 结构化升级，本文档涉及的新事件 schema 由其定稿）
 
@@ -13,11 +14,11 @@
 
 ## 1. 背景与边界
 
-v5 阶段除了 ReactiveSystem 核心重构外，工具层也需要配套升级以适配新的 Gate / Reactor 抽象。本文档承接所有 v5 工具升级工作，**首批重点是 Shell 工具**——它是 AgentGo 与现实世界交互的核心入口、是当前唯一会触发 `WaitingApproval` 状态的工具，其在 ReactiveSystem 体系下的设计需要专门的规格定稿。
+本文件原本承接 v5 Shell 工具升级讨论。下文记录的 Q11/Q12/Q13 方案没有按原样落地；当前 Shell 路径已经转向 generic Interaction，并使用 `waiting_interaction` 作为 Agent 等待状态。
 
 **与 ReactiveSystem.md 的分工**：
 - **ReactiveSystem.md** 定义 Gate / Reactor 两类核心抽象本身，以及 Agent 状态机、事件流、Reactor 注册机制等**基础设施**（注：原计划的 Provider 抽象已废弃由 [MemoryManageSystem.md](MemoryManageSystem.md) 承接；Aggregator 已下放为 Mailbox 子系统内部固定机制不立顶层）
-- **本文档（ToolUpgradePlan.md）** 定义具体工具如何嵌入这套基础设施——Shell 工具的命令名单、approval UI 形态、超时策略、持久化等**工具侧实施细节**
+- **本文档（ToolUpgradePlan.md）** 仅保存旧命令名单、专用 UI、超时策略和持久化提案的历史背景
 
 **未来扩展位**（本文档可承接的其他工具升级，按需添加新章节）：
 - 文件类工具（write_file / edit_file / read_file 等）的 Gate 集成
@@ -26,9 +27,9 @@ v5 阶段除了 ReactiveSystem 核心重构外，工具层也需要配套升级�
 
 ---
 
-## 2. Shell 工具升级（首批重点）
+## 2. 已废弃历史：Shell 工具升级方案
 
-Shell 工具（`run_shell`）的完整改造规格在 2026-04-30 经多轮讨论后定稿，集中记录于本节。决议来源：ReactiveSystem.md Q11 / Q12 / Q13 / Q11.r。
+以下内容是 2026-04-30 的决议快照，已被当前 Interaction 实现取代。保留它只用于解释设计演化；其中“将实现”“v5 当前”等时态都应按历史语境阅读。
 
 ### 2.1 决议汇总
 
@@ -92,7 +93,7 @@ shell 命令进入 Gate 后的处理顺序：
 
 **Q9 措辞精修**：ReactiveSystem.md §7.2 中"waiting_approval 仅在 needs-approval 工具调用时触发"的 needs-approval **不再是工具属性**，而是 **Gate 计算结果**。run_shell 工具本身不再硬编码 `needs_approval=true`，由 ShellCommandGate 根据查询黑白名单后给出。这是 Q9 决议的措辞延伸，本质语义不变但精度更高。
 
-### 2.4 4 选项 Approval UI 与 agent 通知
+### 2.4 已废弃历史：4 选项 Approval UI 与 agent 通知
 
 灰色地带命令进入 approval 流程时，用户面对 4 选项：
 
@@ -323,7 +324,7 @@ shell_timeout_resolved:   {task_id, agent_id, command, decision, extra_seconds, 
 | `wait_then_truncate` | 第一次超时 Wait(extra_sec) 续命，再次超时则 Truncate | 实战出现"长跑命令偶尔卡顿"需求时 |
 | `consult_llm` | 调用 ReactiveSystem 的 isolated LLM client（原则 5）评估 stdout 进展，决定 Truncate / Wait | LLM 成本下降 + prompt 工程成熟时 |
 | `message_agent` | 通过 mailbox 询问监督 agent，等回复决定动作 | 引入 supervisor agent 模式时 |
-| `escalate_to_user` | 弹 approval-like UI 让用户选 Truncate / Wait / Continue | CLI 前端单键提示能力到位后（详见 CLIUpgrade.md 拟新建）|
+| `escalate_to_user` | 创建 generic Interaction，让用户用稳定 Option ID 选择 Truncate / Wait / Continue | 仅在 TimeoutHandler 真正设计并保持当前 Interaction 信任边界时评估 |
 
 **关键约束（继承 ReactiveSystem 原则 5）**：`consult_llm` handler 的 LLM 调用必须是上下文隔离的纯文本生成器——无工具、无 history、无运行时上下文注入。绝不能让"超时判断器"演变成无监督的影子 agent。
 
@@ -383,25 +384,23 @@ shell_executed:  {task_id, agent_id, kind, command, exit_code,
 ## 3. 不在本文档范围
 
 - **Gate / Reactor 两类核心抽象本身的设计**：归 [ReactiveSystem.md](ReactiveSystem.md)（原 Provider 抽象已废弃由 [MemoryManageSystem.md](MemoryManageSystem.md) 承接；原 Aggregator 已下放为 Mailbox 子系统内部固定机制）
-- **Agent 实例状态机（idle / processing / waiting_approval / terminating）**：归 [ReactiveSystem.md §7.1-§7.3](ReactiveSystem.md)
+- **Agent 实例状态机（idle / processing / waiting_interaction / terminating）**：归 [ReactiveSystem.md §7.1-§7.3](ReactiveSystem.md)
 - **trace 事件 payload 结构化升级**：归 [Trace 升级设计归档](../archived/trace-upgrade-design-2026-05.md)（Phase 2 落地）
 - **其他工具的 Gate 集成**：未来按需在本文档新增章节，当前不展开
 - **Shell 命令的"系统硬编码不可移除黑名单"层**：按 Q11 决议，shell_commands.yaml 是单一真相源，**没有用户不可移除的硬编码黑名单层**
-- **WaitingApproval 的"持续时长触发"超时**：reactor 不支持"状态持续超过 N 分钟自动触发"——独立模块（需要定时器调度），留作 v5.x
+- **`waiting_interaction` 的持续时长触发**：Reactor 不支持“状态持续超过 N 分钟自动触发”；Trace CLI 只做异常检测，不替用户回答
 
 ---
 
-## 4. 后续计划
+## 4. 当前实现与仍未落地的方向
 
-Shell 工具升级与 ReactiveSystem.md Phase 1（命名空间清理）配套上线：
+| 能力 | 2026-07 当前状态 |
+|---|---|
+| 黑/灰/白命令策略 | `internal/shell.CommandFilter` 已实现；黑名单硬拒绝，灰名单创建 `shell_command` Interaction |
+| 用户回答 | `allow_once` / `deny` / `guidance` / `allow_session`；前端提交稳定 Option ID，不提交 ActionRef 或 pattern |
+| 精确绑定 | command、matched pattern、working directory、AgentID、TaskID 与 digest 必须全部匹配；失败时 fail closed |
+| 运行期 whitelist | `allow_session` 仅是兼容 ID；规则在当前进程/本次运行内有效，切换 `/session` 不清空，退出后不持久化 |
+| `shell_commands.yaml` 与独立 `ShellCommandGate` | 未实现；若未来推进，必须保持 generic Interaction 契约，不恢复专用 UI |
+| 可插拔 `TimeoutHandler` 与 timeout 事件 | 未实现；事件 kind 仍 reserved 且不向用户 Reactor 开放 |
 
-| 步骤 | 工作 | 配套 ReactiveSystem 阶段 |
-|---|---|---|
-| T1 | shell.CommandFilter 重构为 ShellCommandGate | Phase 1 |
-| T2 | shell_commands.yaml schema + 加载器 + 默认模板 | Phase 1 |
-| T3 | 4 选项 approval UI + 持久化（yaml.v3 Node API）| Phase 1 |
-| T4 | worker.md / explorer.md prompt 模板更新（system prompt 处理纪律）| Phase 1（与 T1 同 PR）|
-| T5 | TimeoutHandler 抽象 + TruncateHandler 内置实现 + YAML 占位 schema | Phase 1 |
-| T6 | KindShellExecuted / KindShellTimeoutPending / KindShellTimeoutResolved 事件 emit（仅内置 Reactor 订阅）| Phase 2-3 |
-
-各步骤的详细 spec 在 Phase 1 启动时定稿。
+未来若重启上述未落地方向，应先新建设计文档并以当前代码重新取证；不要直接把本文历史任务表当作实施清单。

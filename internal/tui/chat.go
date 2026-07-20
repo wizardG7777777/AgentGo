@@ -20,19 +20,16 @@ func renderChat(t Theme, w, h int, messages []StyledMsg, lastResult *StyledMsg) 
 		contentH = 1
 	}
 
-	// Collect visible messages
-	var lines []string
-
-	// Show last result first (pinned)
+	// 结果卡与日志分别裁剪。旧实现先把结果放在日志前，再对整体取最后
+	// contentH 行；日志一多就会把所谓的 "pinned" 结果从顶部裁掉。
+	var resultLines []string
 	if lastResult != nil {
 		resultCard := renderMiniResult(t, *lastResult, w-4)
-		for _, rl := range strings.Split(resultCard, "\n") {
-			lines = append(lines, rl)
-		}
-		lines = append(lines, "")
+		resultLines = append(resultLines, strings.Split(resultCard, "\n")...)
 	}
 
-	// Then show message history (most recent at bottom)
+	var messageLines []string
+	// 日志只使用结果卡剩余的空间，最近消息仍贴近底部。
 	for _, msg := range messages {
 		if msg.Kind == MsgResult {
 			continue
@@ -63,22 +60,39 @@ func renderChat(t Theme, w, h int, messages []StyledMsg, lastResult *StyledMsg) 
 				continue
 			}
 			available := w - cellWidth(prefix)
-			if available > 0 && cellWidth(ln) > available {
-				ln = truncateCells(ln, available)
+			if available < 1 {
+				continue
 			}
-			lines = append(lines, prefix+style.Render(ln))
+			wrapped := wrapDisplay(ln, available)
+			for i, part := range wrapped {
+				linePrefix := prefix
+				if i > 0 {
+					linePrefix = strings.Repeat(" ", cellWidth(prefix))
+				}
+				messageLines = append(messageLines, linePrefix+style.Render(part))
+			}
 		}
 	}
 
-	// Show last contentH lines
-	if len(lines) > contentH {
-		lines = lines[len(lines)-contentH:]
+	if len(resultLines) >= contentH {
+		return title + "\n" + divider + "\n" + strings.Join(resultLines[:contentH], "\n")
 	}
-
-	// Pad to fill height
-	for len(lines) < contentH {
-		lines = append([]string{""}, lines...)
+	reserved := len(resultLines)
+	if reserved > 0 {
+		reserved++ // 结果与日志之间的空行
 	}
+	messageH := contentH - reserved
+	if len(messageLines) > messageH {
+		messageLines = messageLines[len(messageLines)-messageH:]
+	}
+	for len(messageLines) < messageH {
+		messageLines = append([]string{""}, messageLines...)
+	}
+	lines := append([]string{}, resultLines...)
+	if len(resultLines) > 0 {
+		lines = append(lines, "")
+	}
+	lines = append(lines, messageLines...)
 
 	return title + "\n" + divider + "\n" + strings.Join(lines, "\n")
 }

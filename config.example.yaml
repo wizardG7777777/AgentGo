@@ -15,7 +15,9 @@ llm:
   api_key: ${OPENAI_API_KEY}       # 支持 ${ENV_VAR} 环境变量替换（os.ExpandEnv）
   default_model: gpt-4o
   timeout_sec: 120
-  # provider: openai                # 可选：openai / deepseek-v4 / deepseek-r1
+  # provider: openai                # 可选：openai / openrouter / deepseek-v4 / deepseek-r1
+  # reasoning_effort: medium        # 仅为支持该参数的模型启用；可选值见 docs/yaml-config-guide.md
+  stream: true                      # Chat Completions SSE；Agent/UI 原位显示完整累积快照
 
 # ============================================================
 # 工具集白名单（命名复用层）
@@ -35,6 +37,7 @@ tool_profiles:
     - web_search
     - web_fetch
     - send_message
+    - request_user_input          # 结构化询问用户；只返回回答，不授予 Shell 权限或替代 Plan 控制
     - request_replan              # 需要新增节点或遇到阻塞时请求 Scheduler 决策；普通 Agent 不直接改图
 
   explorer_full:
@@ -45,6 +48,7 @@ tool_profiles:
     - web_search
     - web_fetch
     - send_message
+    - request_user_input          # 调研需要用户澄清时提出 2-8 项结构化选择
     - request_replan
 
   acceptance_verifier:
@@ -59,11 +63,26 @@ tool_profiles:
     - request_replan               # 验收失败时请求 Scheduler 决定是否返工
 
 # ============================================================
-# Scheduler 配置（独立块，仅允许 model 字段外部覆盖）
-# 工具集 / system prompt / replicas 等均硬编码在 internal/scheduler。
+# Scheduler 配置（独立块）
+# 工具集 / system prompt / replicas 仍硬编码在 internal/scheduler；以下行为预算可覆盖。
 # ============================================================
 scheduler:
-  model: gpt-4o                    # 可选，缺省回落 llm.default_model
+  model: gpt-4o                              # 可选，缺省回落 llm.default_model
+  agent_max_loops: 50                        # 可选；省略/0 = 50
+  enforce_compact_token_threshold: 80000     # 可选；累计 prompt token 的一次性压缩阈值，省略/0 = 80000
+  context_limit: 200000                      # 可选；下一轮 prompt 硬截断预算，省略/0 = 200000
+
+# ============================================================
+# 三轴工作模式（可选；三轴正交可组合，字段为空 = 该轴取默认）
+#   gate: 规划门控轴 —— immediate（默认）/ plan（先只读探索再执行）
+#   exec: 执行权限轴 —— normal（默认）/ strict / readonly / yolo
+#   topo: 编排拓扑轴 —— team（默认）/ solo
+# 运行期 TUI / Web 的 /mode 只切换 gate 轴；exec / topo 的行为语义由后续版本落地。
+# ============================================================
+# modes:
+#   gate: immediate
+#   exec: normal
+#   topo: team
 
 # ============================================================
 # AgentTemplate（可选）

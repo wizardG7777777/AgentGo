@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -13,9 +14,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"agentgo/internal/interaction"
 	"agentgo/internal/model"
+	"agentgo/internal/modes"
 	"agentgo/internal/output"
-	"agentgo/internal/shell"
 	"agentgo/internal/ui"
 )
 
@@ -54,16 +56,11 @@ func TestRunWithIO_NonTTYEOFExits(t *testing.T) {
 // ── 测试替身：fakeUI 同时实现 ui.Controller 与 ui.Observer ──
 //
 // TUI 的全部系统交互都经这两个接口，因此一个 fake 即可取代旧测试里的
-// EventCh/Store/Scheduler/Mailbox/ApprovalCh/SessionMgr 等一堆组件。
+// EventCh/Store/Scheduler/Mailbox/SessionMgr 等一堆组件。
 // 观测面返回固定快照（测试可直接改 snapshot 字段）；控制面记录全部调用，
 // 具体行为经各 Fn 字段注入。
 
 type steerCall struct{ agentID, message string }
-
-type resolveCall struct {
-	requestID string
-	reply     shell.ApprovalReply
-}
 
 type fakeUI struct {
 	mu sync.Mutex
@@ -71,25 +68,37 @@ type fakeUI struct {
 	snapshot ui.Snapshot
 
 	// 行为注入
-	sendErr       error
-	cancelFn      func(idPrefix string) (string, error)
-	steerErr      error
-	newID         string
-	sessionErr    error
-	switchChanged bool
-	listFn        func() ([]ui.SessionInfo, error)
-	resolveFn     func(requestID string, reply shell.ApprovalReply) bool
+	sendErr        error
+	cancelFn       func(idPrefix string) (string, error)
+	cancelLatestFn func() (string, error)
+	steerErr       error
+	execErr        error
+	topoErr        error
+	newID          string
+	sessionErr     error
+	switchChanged  bool
+	listFn         func() ([]ui.SessionInfo, error)
+	respondFn      func(input interaction.ResolveInput) (ui.InteractionResult, error)
+	approveFn      func(idPrefix string) (string, error)
+	rejectFn       func(idPrefix string) (string, error)
+	planReviews    []ui.PlanReviewItem
+	planReviewsErr error
 
 	// 调用记录
-	sentTexts    []string
-	cancelled    []string
-	steers       []steerCall
-	modeSets     []bool
-	newCalls     int
-	switchCalls  int
-	switchedTo   string
-	resolveCalls []resolveCall
-	quitCalls    int
+	sentTexts         []string
+	cancelled         []string
+	cancelLatestCalls int
+	steers            []steerCall
+	modeSets          []bool
+	execSets          []string
+	topoSets          []string
+	newCalls          int
+	switchCalls       int
+	switchedTo        string
+	interactionCalls  []interaction.ResolveInput
+	quitCalls         int
+	approveCalls      []string
+	rejectCalls       []string
 }
 
 func newFakeUI() *fakeUI {
@@ -129,6 +138,17 @@ func (f *fakeUI) CancelTask(idPrefix string) (string, error) {
 	return "", errors.New("cancelTask 未注入")
 }
 
+func (f *fakeUI) CancelLatestRequest() (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelLatestCalls++
+	if f.cancelLatestFn != nil {
+		return f.cancelLatestFn()
+	}
+	// 默认语义与 Hub 空栈一致：无活跃请求树。
+	return "", ui.ErrNoActiveRequest
+}
+
 func (f *fakeUI) SteerAgent(agentID, message string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -146,6 +166,37 @@ func (f *fakeUI) SetMode(plan bool) {
 	} else {
 		f.snapshot.Mode = "immediate"
 	}
+}
+
+func (f *fakeUI) SetExecMode(mode string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.execSets = append(f.execSets, mode)
+	if f.execErr != nil {
+		return f.execErr
+	}
+	// 模拟 Hub：先解析（非法值报中文错误），成功后快照即反映新模式。
+	parsed, err := modes.ParseExecMode(mode)
+	if err != nil {
+		return err
+	}
+	f.snapshot.ExecMode = parsed.String()
+	return nil
+}
+
+func (f *fakeUI) SetTopoMode(mode string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.topoSets = append(f.topoSets, mode)
+	if f.topoErr != nil {
+		return f.topoErr
+	}
+	parsed, err := modes.ParseTopoMode(mode)
+	if err != nil {
+		return err
+	}
+	f.snapshot.TopoMode = parsed.String()
+	return nil
 }
 
 func (f *fakeUI) NewSession() (string, error) {
@@ -175,14 +226,40 @@ func (f *fakeUI) ListSessions() ([]ui.SessionInfo, error) {
 	return nil, f.sessionErr
 }
 
-func (f *fakeUI) ResolveApproval(requestID string, reply shell.ApprovalReply) bool {
+func (f *fakeUI) RespondInteraction(_ context.Context, input interaction.ResolveInput) (ui.InteractionResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.resolveCalls = append(f.resolveCalls, resolveCall{requestID: requestID, reply: reply})
-	if f.resolveFn != nil {
-		return f.resolveFn(requestID, reply)
+	f.interactionCalls = append(f.interactionCalls, input)
+	if f.respondFn != nil {
+		return f.respondFn(input)
 	}
-	return true
+	return ui.InteractionResult{ID: input.RequestID, Version: input.ExpectedVersion + 1}, nil
+}
+
+func (f *fakeUI) ApprovePlan(idPrefix string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.approveCalls = append(f.approveCalls, idPrefix)
+	if f.approveFn != nil {
+		return f.approveFn(idPrefix)
+	}
+	return "", errors.New("approvePlan 未注入")
+}
+
+func (f *fakeUI) RejectPlan(idPrefix string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rejectCalls = append(f.rejectCalls, idPrefix)
+	if f.rejectFn != nil {
+		return f.rejectFn(idPrefix)
+	}
+	return "", errors.New("rejectPlan 未注入")
+}
+
+func (f *fakeUI) PendingPlanReviews() ([]ui.PlanReviewItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.planReviews, f.planReviewsErr
 }
 
 func (f *fakeUI) RequestQuit() {
@@ -214,11 +291,11 @@ func TestNewAppModel_Defaults(t *testing.T) {
 	if m.selectedAgent != -1 {
 		t.Errorf("default selectedAgent = %d, want -1", m.selectedAgent)
 	}
-	if m.guidanceMode {
-		t.Error("guidance mode should be false initially")
+	if m.interactionTextMode {
+		t.Error("interaction text mode should be false initially")
 	}
-	if m.activeApproval != nil {
-		t.Error("active approval should be nil initially")
+	if len(m.interactions) != 0 {
+		t.Error("pending interactions should be empty initially")
 	}
 }
 
@@ -335,17 +412,14 @@ func TestAppModel_View_DetailInputLongChineseTaskFitsScreen(t *testing.T) {
 
 func TestAppModel_SystemMsg(t *testing.T) {
 	m := newAppModel(testDeps())
-	result, _ := m.Update(systemMsg("hello system"))
+	result, _ := m.Update(systemMsg(ui.LogItem{Text: "hello system", At: time.Now()}))
 	updated := result.(AppModel)
 
-	if len(updated.messages) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(updated.messages))
+	if len(updated.messages) != 0 {
+		t.Fatalf("diagnostic log leaked into conversation: %+v", updated.messages)
 	}
-	if updated.messages[0].Text != "hello system" {
-		t.Errorf("message text = %q, want %q", updated.messages[0].Text, "hello system")
-	}
-	if updated.messages[0].Kind != MsgLog {
-		t.Errorf("message kind = %d, want MsgLog", updated.messages[0].Kind)
+	if len(updated.logs) != 1 || updated.logs[0].Text != "hello system" {
+		t.Fatalf("logs = %+v, want one separated diagnostic log", updated.logs)
 	}
 }
 
@@ -377,6 +451,44 @@ func TestAppModel_OutputMsg_Result(t *testing.T) {
 	if len(updated.messages) != 0 {
 		t.Error("result messages should not appear in messages array")
 	}
+	if updated.view != ViewResult {
+		t.Fatalf("实时完成结果应主动打开完整结果页，view=%v", updated.view)
+	}
+	if updated.focus != FocusInput {
+		t.Fatalf("展示结果不应抢走正在输入的焦点，focus=%v", updated.focus)
+	}
+}
+
+func TestAppModel_OutputStreamUpdatesInPlace(t *testing.T) {
+	m := newAppModel(testDeps())
+	first, _ := m.Update(outputMsg(output.Event{
+		Kind: output.KindStream, AgentID: "worker-1", StreamID: "s1", Text: "你",
+	}))
+	updated := first.(AppModel)
+	second, _ := updated.Update(outputMsg(output.Event{
+		Kind: output.KindStream, AgentID: "worker-1", StreamID: "s1", Text: "你好", Done: true,
+	}))
+	updated = second.(AppModel)
+	if len(updated.messages) != 1 {
+		t.Fatalf("stream snapshots should replace one message, got %d", len(updated.messages))
+	}
+	if got := updated.messages[0]; got.Text != "你好" || got.AgentID != "worker-1" || got.StreamID != "s1" {
+		t.Fatalf("stream message = %+v", got)
+	}
+}
+
+func TestAppModel_SnapshotSyncRestoresLastResult(t *testing.T) {
+	m := newAppModel(testDeps())
+	result, _ := m.Update(snapshotSyncMsg(ui.Snapshot{
+		LastResult: &ui.ResultItem{AgentID: "scheduler", Text: "restored explicit reply"},
+	}))
+	updated := result.(AppModel)
+	if updated.lastResult == nil || !strings.Contains(updated.lastResult.Text, "restored explicit reply") {
+		t.Fatalf("快照结果未恢复到 TUI: %#v", updated.lastResult)
+	}
+	if updated.view != ViewDashboard {
+		t.Fatalf("恢复历史结果不应伪装成实时完成并抢占视图，view=%v", updated.view)
+	}
 }
 
 // 带结果标记文本但 Kind=KindText 的事件必须保持 MsgAgent——
@@ -397,110 +509,91 @@ func TestAppModel_OutputMsg_ResultMarkerTextStaysAgent(t *testing.T) {
 	}
 }
 
-func TestAppModel_ApprovalMsg_First(t *testing.T) {
-	m := newAppModel(testDeps())
-	req := approvalMsg(ui.ApprovalItem{
-		RequestID: "r-1", AgentID: "w-1", Command: "rm -rf /", Pattern: "rm.*",
-	})
-	result, _ := m.Update(req)
-	updated := result.(AppModel)
-
-	if updated.activeApproval == nil {
-		t.Fatal("first approval should become active")
-	}
-	if updated.activeApproval.AgentID != "w-1" {
-		t.Errorf("active approval agent = %q", updated.activeApproval.AgentID)
-	}
-	if updated.activeApproval.RequestID != "r-1" {
-		t.Errorf("active approval requestID = %q, want r-1", updated.activeApproval.RequestID)
+func testInteraction(id string, options ...ui.InteractionOption) ui.InteractionItem {
+	return ui.InteractionItem{
+		ID:      id,
+		Version: 1,
+		Kind:    string(interaction.KindChoice),
+		Purpose: "scheduler_question",
+		Prompt:  "请选择下一步",
+		Options: options,
+		AgentID: "scheduler",
 	}
 }
 
-func TestAppModel_ApprovalMsg_Queued(t *testing.T) {
+func TestAppModel_InteractionsChanged_ReplacesCompleteList(t *testing.T) {
 	m := newAppModel(testDeps())
+	first := testInteraction("r-1", ui.InteractionOption{ID: "a", Label: "A"})
+	second := testInteraction("r-2", ui.InteractionOption{ID: "b", Label: "B"})
 
-	m.activeApproval = &ui.ApprovalItem{RequestID: "r-1", AgentID: "w-1"}
-
-	result, _ := m.Update(approvalMsg(ui.ApprovalItem{
-		RequestID: "r-2", AgentID: "w-2",
-	}))
+	result, _ := m.Update(interactionsChangedMsg{first, second})
 	updated := result.(AppModel)
-
-	if len(updated.pendingApprovals) != 1 {
-		t.Errorf("pending count = %d, want 1", len(updated.pendingApprovals))
+	if len(updated.interactions) != 2 || updated.interactions[0].ID != "r-1" {
+		t.Fatalf("完整列表未写入: %+v", updated.interactions)
 	}
-}
 
-// 其他前端已了结激活审批（KindApprovalResolved）：推进队列，不追加消息。
-func TestAppModel_ApprovalResolvedMsg_Active(t *testing.T) {
-	m := newAppModel(testDeps())
-	m.activeApproval = &ui.ApprovalItem{RequestID: "r-1", AgentID: "w-1"}
-	m.pendingApprovals = []ui.ApprovalItem{{RequestID: "r-2", AgentID: "w-2"}}
-
-	result, _ := m.Update(approvalResolvedMsg(ui.ApprovalResolved{RequestID: "r-1", Outcome: ui.OutcomeApproved}))
-	updated := result.(AppModel)
-
-	if updated.activeApproval == nil || updated.activeApproval.RequestID != "r-2" {
-		t.Fatalf("resolved 激活审批后应推进队列，active = %+v", updated.activeApproval)
-	}
-	if len(updated.pendingApprovals) != 0 {
-		t.Errorf("pending count = %d, want 0", len(updated.pendingApprovals))
+	// Web 前端回答首项后，Hub 的下一份完整列表直接推进到 r-2。
+	result, _ = updated.Update(interactionsChangedMsg{second})
+	updated = result.(AppModel)
+	if len(updated.interactions) != 1 || updated.interactions[0].ID != "r-2" {
+		t.Fatalf("外部回答后未推进: %+v", updated.interactions)
 	}
 	if len(updated.messages) != 0 {
-		t.Error("外部了结不应追加消息（本前端没有回复动作可报告）")
+		t.Error("外部回答不应伪造本地提交消息")
 	}
 }
 
-// 其他前端已了结待处理审批：从队列移除，激活项不动。
-func TestAppModel_ApprovalResolvedMsg_Pending(t *testing.T) {
+func TestAppModel_InteractionsChanged_PreservesStableOptionSelection(t *testing.T) {
 	m := newAppModel(testDeps())
-	m.activeApproval = &ui.ApprovalItem{RequestID: "r-1", AgentID: "w-1"}
-	m.pendingApprovals = []ui.ApprovalItem{{RequestID: "r-2", AgentID: "w-2"}}
-
-	result, _ := m.Update(approvalResolvedMsg(ui.ApprovalResolved{RequestID: "r-2", Outcome: ui.OutcomeRejected}))
-	updated := result.(AppModel)
-
-	if updated.activeApproval == nil || updated.activeApproval.RequestID != "r-1" {
-		t.Fatal("激活审批不应被其他 ID 的 resolved 影响")
+	req := testInteraction("r-1",
+		ui.InteractionOption{ID: "a", Label: "A"},
+		ui.InteractionOption{ID: "b", Label: "B"},
+	)
+	m.replaceInteractions([]ui.InteractionItem{req})
+	m.interactionOption = 1
+	req.Options = []ui.InteractionOption{
+		{ID: "b", Label: "B updated"},
+		{ID: "a", Label: "A"},
 	}
-	if len(updated.pendingApprovals) != 0 {
-		t.Errorf("pending count = %d, want 0", len(updated.pendingApprovals))
+
+	m.replaceInteractions([]ui.InteractionItem{req})
+	if m.interactionOption != 0 {
+		t.Fatalf("应按 option ID 保持选择，got index=%d", m.interactionOption)
 	}
 }
 
-func TestAppModel_AdvanceApproval(t *testing.T) {
+func TestAppModel_InteractionsChanged_ClearsStaleTextMode(t *testing.T) {
 	m := newAppModel(testDeps())
+	first := testInteraction("r-1", ui.InteractionOption{ID: "custom", Label: "补充", RequiresText: true})
+	second := testInteraction("r-2", ui.InteractionOption{ID: "ok", Label: "继续"})
+	m.replaceInteractions([]ui.InteractionItem{first, second})
+	m.beginInteractionText(first, "custom", "补充")
+	m.input.SetValue("未提交草稿")
 
-	m.activeApproval = &ui.ApprovalItem{RequestID: "r-1", AgentID: "w-1"}
-	m.pendingApprovals = []ui.ApprovalItem{
-		{RequestID: "r-2", AgentID: "w-2"},
+	m.replaceInteractions([]ui.InteractionItem{second})
+	if m.interactionTextMode || m.input.Value() != "" {
+		t.Fatal("外部回答后应清除失效文本模式和草稿")
 	}
-	m.guidanceMode = true
-
-	m.advanceApproval()
-
-	if m.guidanceMode {
-		t.Error("guidance mode should be cleared")
-	}
-	if m.activeApproval == nil {
-		t.Fatal("next pending should become active")
-	}
-	if m.activeApproval.AgentID != "w-2" {
-		t.Errorf("next active agent = %q, want w-2", m.activeApproval.AgentID)
-	}
-	if len(m.pendingApprovals) != 0 {
-		t.Error("pending queue should be empty")
+	if m.focus != FocusInteraction {
+		t.Fatalf("应推进到下一项交互焦点，got %d", m.focus)
 	}
 }
 
-func TestAppModel_AdvanceApproval_Empty(t *testing.T) {
-	m := newAppModel(testDeps())
-	m.activeApproval = &ui.ApprovalItem{RequestID: "r-1", AgentID: "w-1"}
+func TestAppModel_View_InteractionAndInputAreBothVisible(t *testing.T) {
+	m := sizedModel(t, testDeps())
+	m.input.SetValue("ordinary123")
+	m.replaceInteractions([]ui.InteractionItem{testInteraction("r-1",
+		ui.InteractionOption{ID: "safe", Label: "安全方案"},
+		ui.InteractionOption{ID: "custom", Label: "自定义", RequiresText: true},
+	)})
+	m.reflowInputLayout()
 
-	m.advanceApproval()
-
-	if m.activeApproval != nil {
-		t.Error("active approval should be nil when queue is empty")
+	view := m.View()
+	if !strings.Contains(view, "需要用户选择") || !strings.Contains(view, "ordinary123") {
+		t.Fatalf("Interaction panel and input must coexist:\n%s", view)
+	}
+	if m.layout.InteractionH == 0 || m.layout.InteractionY+m.layout.InteractionH != m.layout.InputY {
+		t.Fatalf("lower panels are not stacked: %+v", m.layout)
 	}
 }
 
@@ -569,10 +662,95 @@ func TestAppModel_CycleFocus_CompactSkipsSidebar(t *testing.T) {
 	m.layout = calcLayout(60, 30, ViewDashboard)
 
 	m.cycleFocus()
-	// In compact mode, tab from Input should NOT go to Sidebar
-	if m.focus == FocusSidebar {
-		t.Error("compact mode should skip sidebar")
+	if m.focus != FocusMain {
+		t.Fatalf("compact mode should move Input → Main, got %d", m.focus)
 	}
+	m.cycleFocus()
+	if m.focus != FocusInput {
+		t.Fatalf("compact mode should move Main → Input, got %d", m.focus)
+	}
+}
+
+func TestAppModel_CycleFocus_IncludesInteractionOnlyWhenPending(t *testing.T) {
+	m := newAppModel(testDeps())
+	m.layout = calcLayout(120, 40, ViewDashboard)
+	m.replaceInteractions([]ui.InteractionItem{testInteraction("r-1",
+		ui.InteractionOption{ID: "continue", Label: "继续"},
+	)})
+	// 新待决到达且输入空闲：自动聚焦面板（箭头键立即可用）
+	if m.focus != FocusInteraction {
+		t.Fatalf("新交互到达应自动聚焦面板，got %d", m.focus)
+	}
+
+	m.setFocus(FocusInput)
+	m.cycleFocus()
+	if m.focus != FocusInteraction {
+		t.Fatalf("Input 后应进入 Interaction，got %d", m.focus)
+	}
+	m.cycleFocus()
+	if m.focus != FocusSidebar {
+		t.Fatalf("Interaction 后应进入 Sidebar，got %d", m.focus)
+	}
+	m.replaceInteractions(nil)
+	if m.focus != FocusSidebar {
+		t.Fatalf("清空列表不应改变有效的 Sidebar 焦点，got %d", m.focus)
+	}
+}
+
+// 自动聚焦的完整规则：只在"新队首到达 + 焦点在输入框 + 输入为空"时触发。
+func TestAppModel_ReplaceInteractions_AutoFocusRules(t *testing.T) {
+	newReq := func(id string) ui.InteractionItem {
+		return testInteraction(id, ui.InteractionOption{ID: "ok", Label: "好"})
+	}
+
+	t.Run("空闲输入框时新待决自动聚焦", func(t *testing.T) {
+		m := newAppModel(testDeps())
+		m.replaceInteractions([]ui.InteractionItem{newReq("r-1")})
+		if m.focus != FocusInteraction {
+			t.Fatalf("应自动聚焦面板，got %d", m.focus)
+		}
+	})
+
+	t.Run("输入中有文本不抢焦点", func(t *testing.T) {
+		m := newAppModel(testDeps())
+		m.input.SetValue("写到一半的草稿")
+		m.replaceInteractions([]ui.InteractionItem{newReq("r-1")})
+		if m.focus != FocusInput {
+			t.Fatalf("不应抢焦点，got %d", m.focus)
+		}
+	})
+
+	t.Run("焦点在侧栏不抢焦点", func(t *testing.T) {
+		m := newAppModel(testDeps())
+		m.setFocus(FocusSidebar)
+		m.replaceInteractions([]ui.InteractionItem{newReq("r-1")})
+		if m.focus != FocusSidebar {
+			t.Fatalf("不应抢焦点，got %d", m.focus)
+		}
+	})
+
+	t.Run("Esc 回输入框后同一队首不重复抢焦点", func(t *testing.T) {
+		m := newAppModel(testDeps())
+		req := newReq("r-1")
+		m.replaceInteractions([]ui.InteractionItem{req})
+		if m.focus != FocusInteraction {
+			t.Fatalf("前置：应自动聚焦，got %d", m.focus)
+		}
+		result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
+		m = result.(AppModel)
+		if m.focus != FocusInput {
+			t.Fatalf("前置：Esc 应回输入框，got %d", m.focus)
+		}
+		m.replaceInteractions([]ui.InteractionItem{req})
+		if m.focus != FocusInput {
+			t.Fatalf("同一队首不应重复抢焦点，got %d", m.focus)
+		}
+		// 真正的新请求到来时仍应自动聚焦
+		m.replaceInteractions([]ui.InteractionItem{newReq("r-2")})
+		if m.focus != FocusInteraction {
+			t.Fatalf("新队首应再次自动聚焦，got %d", m.focus)
+		}
+	})
 }
 
 func TestAppModel_HandleKey_Escape_FromAgentDetail(t *testing.T) {
@@ -587,15 +765,25 @@ func TestAppModel_HandleKey_Escape_FromAgentDetail(t *testing.T) {
 	}
 }
 
-func TestAppModel_HandleKey_Escape_GuidanceMode(t *testing.T) {
-	m := newAppModel(testDeps())
-	m.guidanceMode = true
+func TestAppModel_HandleKey_Escape_InteractionTextMode(t *testing.T) {
+	deps := testDeps()
+	m := newAppModel(deps)
+	req := testInteraction("r-1", ui.InteractionOption{ID: "custom", Label: "补充", RequiresText: true})
+	m.replaceInteractions([]ui.InteractionItem{req})
+	m.beginInteractionText(req, "custom", "补充")
+	m.input.SetValue("draft")
 
 	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
 	updated := result.(AppModel)
 
-	if updated.guidanceMode {
-		t.Error("Esc should exit guidance mode")
+	if updated.interactionTextMode || updated.input.Value() != "" {
+		t.Error("Esc should exit interaction text mode and clear its draft")
+	}
+	if updated.focus != FocusInteraction {
+		t.Fatalf("Esc should return to Interaction focus, got %d", updated.focus)
+	}
+	if len(fakeOf(deps).interactionCalls) != 0 {
+		t.Error("Esc must not answer the Interaction")
 	}
 }
 
@@ -747,82 +935,87 @@ func TestAppModel_HandleKey_MainAgentNavigation(t *testing.T) {
 	}
 }
 
-func TestAppModel_HandleKey_ApprovalKeys(t *testing.T) {
-	tests := []struct {
-		key      string
-		approved bool
-	}{
-		{"1", true},
-		{"2", false},
-	}
-
-	for _, tc := range tests {
-		deps := testDeps()
-		m := newAppModel(deps)
-		m.activeApproval = &ui.ApprovalItem{
-			RequestID: "r-1", AgentID: "w-1", Command: "cmd",
-		}
-		m.focus = FocusInput
-
-		result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(tc.key)})
-		updated := result.(AppModel)
-
-		f := fakeOf(deps)
-		if len(f.resolveCalls) != 1 {
-			t.Fatalf("key=%q: ResolveApproval 调用次数 = %d, want 1", tc.key, len(f.resolveCalls))
-		}
-		call := f.resolveCalls[0]
-		if call.requestID != "r-1" {
-			t.Errorf("key=%q: ResolveApproval requestID = %q, want r-1", tc.key, call.requestID)
-		}
-		if call.reply.Approved != tc.approved {
-			t.Errorf("key=%q: Approved=%v, want %v", tc.key, call.reply.Approved, tc.approved)
-		}
-
-		if updated.activeApproval != nil {
-			t.Errorf("key=%q: active approval should be cleared", tc.key)
-		}
-	}
-}
-
-func TestAppModel_HandleKey_ApprovalKey3_GuidanceMode(t *testing.T) {
-	m := newAppModel(testDeps())
-	m.activeApproval = &ui.ApprovalItem{
-		RequestID: "r-1", AgentID: "w-1", Command: "cmd",
-	}
-	m.focus = FocusInput
-
-	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("3")})
-	updated := result.(AppModel)
-
-	if !updated.guidanceMode {
-		t.Error("key 3 should activate guidance mode")
-	}
-	if updated.activeApproval == nil {
-		t.Error("approval should remain active in guidance mode")
-	}
-}
-
-func TestAppModel_HandleKey_ApprovalKey4_Remember(t *testing.T) {
+func TestAppModel_HandleKey_InteractionSelectAndSubmit(t *testing.T) {
 	deps := testDeps()
 	m := newAppModel(deps)
-	m.activeApproval = &ui.ApprovalItem{
-		RequestID: "r-1", AgentID: "w-1", Command: "cmd", Pattern: "rm.*",
-	}
-	m.focus = FocusInput
+	m.replaceInteractions([]ui.InteractionItem{testInteraction("r-1",
+		ui.InteractionOption{ID: "safe", Label: "安全方案"},
+		ui.InteractionOption{ID: "fast", Label: "快速方案"},
+	)})
+	m.setFocus(FocusInteraction)
 
-	m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("4")})
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	m = result.(AppModel)
+	if m.interactionOption != 1 {
+		t.Fatalf("Down should select second option, got %d", m.interactionOption)
+	}
+	result, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	updated := result.(AppModel)
 
-	f := fakeOf(deps)
-	if len(f.resolveCalls) != 1 {
-		t.Fatalf("ResolveApproval 调用次数 = %d, want 1", len(f.resolveCalls))
+	calls := fakeOf(deps).interactionCalls
+	if len(calls) != 1 {
+		t.Fatalf("RespondInteraction calls=%d, want 1", len(calls))
 	}
-	reply := f.resolveCalls[0].reply
-	if !reply.Approved {
-		t.Error("key 4 should approve")
+	if calls[0].RequestID != "r-1" || calls[0].ExpectedVersion != 1 || calls[0].OptionID != "fast" {
+		t.Fatalf("unexpected ResolveInput: %+v", calls[0])
 	}
-	if reply.RememberPattern != "rm.*" {
-		t.Errorf("RememberPattern = %q, want %q", reply.RememberPattern, "rm.*")
+	if calls[0].RespondedBy != "tui" {
+		t.Fatalf("RespondedBy=%q, want tui", calls[0].RespondedBy)
+	}
+	if len(updated.interactions) != 0 || updated.focus != FocusInput {
+		t.Fatalf("successful submit should clear item and focus input: %+v focus=%d", updated.interactions, updated.focus)
+	}
+}
+
+func TestAppModel_HandleKey_InteractionRequiresText(t *testing.T) {
+	deps := testDeps()
+	m := newAppModel(deps)
+	req := testInteraction("r-1",
+		ui.InteractionOption{ID: "custom", Label: "自定义", RequiresText: true},
+	)
+	m.replaceInteractions([]ui.InteractionItem{req})
+	m.setFocus(FocusInteraction)
+
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = result.(AppModel)
+	if !m.interactionTextMode || m.focus != FocusInput {
+		t.Fatalf("RequiresText should enter input mode: mode=%v focus=%d", m.interactionTextMode, m.focus)
+	}
+	result, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = result.(AppModel)
+	if len(fakeOf(deps).interactionCalls) != 0 || !m.interactionTextMode {
+		t.Fatal("empty required text must not submit or leave text mode")
+	}
+	m.input.SetValue("请先备份再继续")
+	result, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	updated := result.(AppModel)
+
+	calls := fakeOf(deps).interactionCalls
+	if len(calls) != 1 || calls[0].OptionID != "custom" || calls[0].Text != "请先备份再继续" {
+		t.Fatalf("text ResolveInput=%+v", calls)
+	}
+	if updated.interactionTextMode || updated.input.Value() != "" {
+		t.Error("successful text response should restore normal input")
+	}
+}
+
+func TestAppModel_FocusInput_AllSingleLettersAndDigitsAreText(t *testing.T) {
+	m := newAppModel(testDeps())
+	m.replaceInteractions([]ui.InteractionItem{testInteraction("r-1",
+		ui.InteractionOption{ID: "a", Label: "A"},
+	)})
+	m.setFocus(FocusInput)
+
+	const printable = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	for _, r := range printable {
+		result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = result.(AppModel)
+	}
+	if got := m.input.Value(); got != printable {
+		t.Fatalf("single-letter/digit input was intercepted:\n got %q\nwant %q", got, printable)
+	}
+	if len(fakeOf(m.deps).interactionCalls) != 0 {
+		t.Error("printable input must not answer an Interaction")
 	}
 }
 
@@ -845,8 +1038,7 @@ func TestAppModel_AgentsChangedMsg(t *testing.T) {
 	}
 }
 
-// KindSnapshotSync（订阅后首条更新）：初始化代理/任务，并按快照里的
-// 待审批列表播种审批队列（首条激活，其余排队）。
+// KindSnapshotSync（订阅后首条更新）：初始化代理、任务与完整 Interaction 列表。
 func TestAppModel_SnapshotSyncMsg(t *testing.T) {
 	m := newAppModel(testDeps())
 
@@ -856,9 +1048,9 @@ func TestAppModel_SnapshotSyncMsg(t *testing.T) {
 			{ID: "t-1", Desc: "看板任务", Status: "processing"},
 		},
 		Mode: "plan",
-		PendingApprovals: []ui.ApprovalItem{
-			{RequestID: "r-1", AgentID: "w-1"},
-			{RequestID: "r-2", AgentID: "w-2"},
+		PendingInteractions: []ui.InteractionItem{
+			testInteraction("r-1", ui.InteractionOption{ID: "a", Label: "A"}),
+			testInteraction("r-2", ui.InteractionOption{ID: "b", Label: "B"}),
 		},
 	}
 	result, _ := m.Update(snapshotSyncMsg(snap))
@@ -873,11 +1065,8 @@ func TestAppModel_SnapshotSyncMsg(t *testing.T) {
 	if updated.tasks[0].Status != model.TaskStatusProcessing {
 		t.Errorf("BoardTask 状态未还原为 TaskStatus: %q", updated.tasks[0].Status)
 	}
-	if updated.activeApproval == nil || updated.activeApproval.RequestID != "r-1" {
-		t.Fatalf("首条待审批应激活，active = %+v", updated.activeApproval)
-	}
-	if len(updated.pendingApprovals) != 1 || updated.pendingApprovals[0].RequestID != "r-2" {
-		t.Fatalf("其余待审批应排队，pending = %+v", updated.pendingApprovals)
+	if len(updated.interactions) != 2 || updated.interactions[0].ID != "r-1" || updated.interactions[1].ID != "r-2" {
+		t.Fatalf("pending Interaction 列表未完整同步: %+v", updated.interactions)
 	}
 }
 
@@ -992,6 +1181,17 @@ func TestAppModel_HandleCommand_ViewSwitch(t *testing.T) {
 		t.Error("/chat should set ViewChat")
 	}
 
+	for command, want := range map[string]ViewState{
+		"/activity": ViewActivity,
+		"/logs":     ViewLogs,
+		"/trace":    ViewTrace,
+	} {
+		m.handleCommand(command)
+		if m.view != want {
+			t.Errorf("%s should set view %d, got %d", command, want, m.view)
+		}
+	}
+
 	m.appendMsg("full result text", MsgResult)
 	m.handleCommand("/detail")
 	if m.view != ViewResult {
@@ -1024,6 +1224,7 @@ func TestAppModel_ResultViewScrollKeys(t *testing.T) {
 	m.layout.MainH = 7
 	m.appendMsg(strings.Join([]string{"line 1", "line 2", "line 3", "line 4", "line 5"}, "\n"), MsgResult)
 	m.handleCommand("/detail")
+	m.setFocus(FocusMain)
 
 	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
 	m = updated.(AppModel)
@@ -1066,6 +1267,24 @@ func TestAppModel_ResultViewInputAcceptsJK(t *testing.T) {
 	}
 	if m.resultScroll != 0 {
 		t.Fatalf("j/k should not scroll result while input is focused, got %d", m.resultScroll)
+	}
+}
+
+func TestAppModel_ResultViewArrowsBelongToFocusedInput(t *testing.T) {
+	m := newAppModel(testDeps())
+	m.layout.MainH = 7
+	m.setFocus(FocusInput)
+	m.input.SetValue("first\nsecond")
+	m.appendMsg(strings.Join([]string{"line 1", "line 2", "line 3", "line 4", "line 5"}, "\n"), MsgResult)
+	m.handleCommand("/detail")
+
+	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	m = updated.(AppModel)
+	if m.resultScroll != 0 {
+		t.Fatalf("Up must not scroll result while input is focused, got %d", m.resultScroll)
+	}
+	if m.input.Value() != "first\nsecond" {
+		t.Fatalf("textarea content changed unexpectedly: %q", m.input.Value())
 	}
 }
 
@@ -1140,6 +1359,101 @@ func TestAppModel_HandleCommand_Mode(t *testing.T) {
 	}
 }
 
+// lastMsgText 返回消息流最后一条消息文本（测试辅助）。
+func lastMsgText(t *testing.T, m AppModel) string {
+	t.Helper()
+	if len(m.messages) == 0 {
+		t.Fatal("消息流为空")
+	}
+	return m.messages[len(m.messages)-1].Text
+}
+
+func TestAppModel_HandleCommand_ModeAxes(t *testing.T) {
+	deps := testDeps()
+	m := newAppModel(deps)
+	f := fakeOf(deps)
+
+	// /mode gate plan → 走 Controller.SetMode(true)
+	m.handleCommand("/mode gate plan")
+	if len(f.modeSets) != 1 || !f.modeSets[0] {
+		t.Fatalf("/mode gate plan 应 SetMode(true)，got %v", f.modeSets)
+	}
+	if got := lastMsgText(t, m); !strings.Contains(got, "[mode] gate 轴已切换到 plan") {
+		t.Fatalf("反馈消息 = %q", got)
+	}
+
+	// /mode exec readonly → 走 Controller.SetExecMode
+	m.handleCommand("/mode exec readonly")
+	if len(f.execSets) != 1 || f.execSets[0] != "readonly" {
+		t.Fatalf("/mode exec readonly 应 SetExecMode(readonly)，got %v", f.execSets)
+	}
+	if got := lastMsgText(t, m); !strings.Contains(got, "[mode] exec 轴已切换到 readonly") {
+		t.Fatalf("反馈消息 = %q", got)
+	}
+
+	// /mode topo solo → 走 Controller.SetTopoMode
+	m.handleCommand("/mode topo solo")
+	if len(f.topoSets) != 1 || f.topoSets[0] != "solo" {
+		t.Fatalf("/mode topo solo 应 SetTopoMode(solo)，got %v", f.topoSets)
+	}
+	if got := lastMsgText(t, m); !strings.Contains(got, "[mode] topo 轴已切换到 solo") {
+		t.Fatalf("反馈消息 = %q", got)
+	}
+}
+
+func TestAppModel_HandleCommand_ModeUsage(t *testing.T) {
+	// 非法参数 → 消息流输出中文用法说明（列出三轴与可选值）。
+	for _, line := range []string{
+		"/mode gate",            // 参数个数不对
+		"/mode exec nope",       // exec 非法值
+		"/mode topo nowhere",    // topo 非法值
+		"/mode axis plan",       // 未知轴
+		"/mode gate sometimes",  // gate 非法值
+		"/mode exec readonly x", // 参数过多
+	} {
+		t.Run(line, func(t *testing.T) {
+			m := newAppModel(testDeps())
+			m.handleCommand(line)
+
+			var usage string
+			for _, msg := range m.messages {
+				if strings.Contains(msg.Text, "用法") {
+					usage = msg.Text
+				}
+			}
+			if usage == "" {
+				t.Fatalf("%s 应输出用法说明，消息流 = %+v", line, m.messages)
+			}
+			for _, want := range []string{"gate", "exec", "topo", "immediate|plan", "normal|strict|readonly|yolo", "team|solo"} {
+				if !strings.Contains(usage, want) {
+					t.Fatalf("用法说明缺少 %q: %q", want, usage)
+				}
+			}
+		})
+	}
+}
+
+func TestAppModel_ShowStatus_ThreeModeAxes(t *testing.T) {
+	deps := testDeps()
+	f := fakeOf(deps)
+	f.snapshot.Mode = "plan"
+	f.snapshot.ExecMode = "readonly"
+	f.snapshot.TopoMode = "solo"
+	m := newAppModel(deps)
+
+	m.showStatus()
+
+	if len(m.messages) != 1 {
+		t.Fatalf("messages count = %d, want 1", len(m.messages))
+	}
+	text := m.messages[0].Text
+	for _, want := range []string{"Mode: Plan", "Exec: readonly", "Topo: solo"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("/status 输出缺少 %q: %q", want, text)
+		}
+	}
+}
+
 func TestAppModel_HandleCommand_Agent(t *testing.T) {
 	m := newAppModel(testDeps())
 	m.agents = []AgentInfo{
@@ -1180,179 +1494,677 @@ func TestAppModel_SelectAgentByID_PrefixMatch(t *testing.T) {
 	}
 }
 
-// ── A2：审批回复经 Controller.ResolveApproval（非阻塞性由 Hub 保证）────
-//
-// 旧 replyApproval（对 ReplyCh 的非阻塞发送）已随三通道消费权上移进
-// ui.Hub.ResolveApproval；送达/过期/未知 ID 的用例由 internal/ui 的
-// Broker 测试覆盖。此处保留 TUI 侧 UX 回归：送达追加成功消息、失效追加
-// 提示、两种结局都推进队列。
+// ── Interaction 回答与安全退出 ──
 
-// 存活审批（Controller 送达返回 true）→ 成功消息 + 推进队列。
-func TestReplyActiveApproval_Delivered(t *testing.T) {
+func TestRespondInteraction_ErrorKeepsPendingRequest(t *testing.T) {
 	deps := testDeps()
+	fakeOf(deps).respondFn = func(interaction.ResolveInput) (ui.InteractionResult, error) {
+		return ui.InteractionResult{}, errors.New("version conflict")
+	}
 	m := newAppModel(deps)
-	m.activeApproval = &ui.ApprovalItem{RequestID: "r-1", AgentID: "w-1"}
-	m.pendingApprovals = []ui.ApprovalItem{{RequestID: "r-2", AgentID: "w-2"}}
-
-	m.replyActiveApproval(shell.ApprovalReply{Approved: true}, "[审批] 已批准 w-1 的命令")
-
-	f := fakeOf(deps)
-	if len(f.resolveCalls) != 1 || f.resolveCalls[0].requestID != "r-1" {
-		t.Fatalf("ResolveApproval 调用 = %+v, want 1 次 r-1", f.resolveCalls)
-	}
-	if !f.resolveCalls[0].reply.Approved {
-		t.Error("回复内容丢失：Approved 应为 true")
-	}
-	if m.activeApproval == nil || m.activeApproval.RequestID != "r-2" {
-		t.Fatalf("送达后应推进队列，active = %+v", m.activeApproval)
-	}
-	if got := lastMessageText(&m); !strings.Contains(got, "已批准") {
-		t.Errorf("送达应追加成功消息，got %q", got)
-	}
-}
-
-// 失效审批（Controller 返回 false：ReplyCh 已被应答或 agent 放弃等待）→
-// 追加失效提示并推进队列，绝不阻塞 bubbletea Update goroutine（H2）。
-func TestReplyActiveApproval_Stale(t *testing.T) {
-	deps := testDeps()
-	fakeOf(deps).resolveFn = func(string, shell.ApprovalReply) bool { return false }
-	m := newAppModel(deps)
-	m.activeApproval = &ui.ApprovalItem{RequestID: "r-1", AgentID: "w-1"}
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		m.replyActiveApproval(shell.ApprovalReply{Approved: false}, "")
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("失效审批上回复阻塞了 Update（H2 未修复）")
-	}
-
-	if m.activeApproval != nil {
-		t.Error("失效审批也应推进队列（activeApproval=nil）")
-	}
-	if got := lastMessageText(&m); !strings.Contains(got, "该审批已失效（任务已结束）") {
-		t.Errorf("失效提示文案错误，got %q", got)
-	}
-}
-
-// 审批栏激活（非 guidance 模式）时 Esc = 拒绝，与 "[Esc] Reject" 提示一致。
-func TestAppModel_HandleKey_Escape_RejectsApproval(t *testing.T) {
-	deps := testDeps()
-	m := newAppModel(deps)
-	m.activeApproval = &ui.ApprovalItem{
-		RequestID: "r-1", AgentID: "w-1", Command: "cmd",
-	}
-	m.focus = FocusInput
-
-	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
-	updated := result.(AppModel)
-
-	f := fakeOf(deps)
-	if len(f.resolveCalls) != 1 {
-		t.Fatalf("Esc 应发送一次审批回复，got %d 次", len(f.resolveCalls))
-	}
-	if f.resolveCalls[0].reply.Approved {
-		t.Error("Esc 应发送拒绝（Approved=false）")
-	}
-	if f.resolveCalls[0].requestID != "r-1" {
-		t.Errorf("Esc 回复的 requestID = %q, want r-1", f.resolveCalls[0].requestID)
-	}
-	if updated.activeApproval != nil {
-		t.Error("Esc 拒绝后应推进审批队列（activeApproval=nil）")
-	}
-}
-
-// guidance 模式下 Esc 保持原语义：只退出 guidance，不发送回复、审批保持激活。
-func TestAppModel_HandleKey_Escape_GuidanceModeKeepsApproval(t *testing.T) {
-	deps := testDeps()
-	m := newAppModel(deps)
-	m.activeApproval = &ui.ApprovalItem{
-		RequestID: "r-1", AgentID: "w-1", Command: "cmd",
-	}
-	m.guidanceMode = true
-	m.focus = FocusInput
-
-	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
-	updated := result.(AppModel)
-
-	if updated.guidanceMode {
-		t.Error("Esc 应退出 guidance 模式")
-	}
-	if updated.activeApproval == nil {
-		t.Error("guidance 模式下 Esc 不应推进审批队列")
-	}
-	if n := len(fakeOf(deps).resolveCalls); n != 0 {
-		t.Errorf("guidance 模式下 Esc 不应发送审批回复，got %d 次", n)
-	}
-}
-
-// guidance 模式回车：自由文本指导经 Controller 送达（Message 非空）。
-func TestAppModel_HandleKey_GuidanceSubmit(t *testing.T) {
-	deps := testDeps()
-	m := newAppModel(deps)
-	m.activeApproval = &ui.ApprovalItem{
-		RequestID: "r-1", AgentID: "w-1", Command: "cmd",
-	}
-	m.guidanceMode = true
-	m.focus = FocusInput
-	m.input.SetValue("请先备份再删除")
+	m.replaceInteractions([]ui.InteractionItem{testInteraction("r-1",
+		ui.InteractionOption{ID: "continue", Label: "继续"},
+	)})
+	m.setFocus(FocusInteraction)
 
 	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
 	updated := result.(AppModel)
-
-	f := fakeOf(deps)
-	if len(f.resolveCalls) != 1 {
-		t.Fatalf("guidance 回车应发送一次回复，got %d 次", len(f.resolveCalls))
+	if len(updated.interactions) != 1 {
+		t.Fatal("failed response must remain pending until a full-list update arrives")
 	}
-	reply := f.resolveCalls[0].reply
-	if reply.Message != "请先备份再删除" {
-		t.Errorf("guidance 回复 Message = %q", reply.Message)
-	}
-	if reply.Approved {
-		t.Error("guidance 回复不应是批准")
-	}
-	if updated.activeApproval != nil {
-		t.Error("guidance 发送后应推进审批队列")
+	if got := lastMessageText(&updated); !strings.Contains(got, "version conflict") {
+		t.Fatalf("missing response error: %q", got)
 	}
 }
 
-// 失效审批（Controller 返回 false）：按 1 不阻塞，追加失效提示，
-// 并推进队列让后续待审批继续处理。
-func TestAppModel_HandleKey_ApprovalStaleRequest(t *testing.T) {
+func TestAppModel_HandleKey_Escape_LeavesInteractionWithoutAnswer(t *testing.T) {
 	deps := testDeps()
-	fakeOf(deps).resolveFn = func(string, shell.ApprovalReply) bool { return false }
 	m := newAppModel(deps)
-	m.activeApproval = &ui.ApprovalItem{
-		RequestID: "r-1", AgentID: "w-1", Command: "cmd",
+	m.replaceInteractions([]ui.InteractionItem{testInteraction("r-1",
+		ui.InteractionOption{ID: "cancel", Label: "取消"},
+	)})
+	m.setFocus(FocusInteraction)
+
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
+	updated := result.(AppModel)
+	if updated.focus != FocusInput || len(updated.interactions) != 1 {
+		t.Fatalf("Esc should only leave panel: focus=%d interactions=%d", updated.focus, len(updated.interactions))
 	}
+	f := fakeOf(deps)
+	if len(f.interactionCalls) != 0 || f.cancelLatestCalls != 0 {
+		t.Fatalf("Esc from Interaction caused side effects: answers=%d cancels=%d", len(f.interactionCalls), f.cancelLatestCalls)
+	}
+}
+
+func TestAppModel_HandleKey_FreeTextInteraction(t *testing.T) {
+	deps := testDeps()
+	m := newAppModel(deps)
+	req := testInteraction("r-text")
+	req.Kind = string(interaction.KindText)
+	req.AllowFreeText = true
+	m.replaceInteractions([]ui.InteractionItem{req})
+	m.setFocus(FocusInteraction)
+
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = result.(AppModel)
+	if !m.interactionTextMode {
+		t.Fatal("free-text request should enter text mode")
+	}
+	m.input.SetValue("我的回答")
+	result, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	_ = result.(AppModel)
+	calls := fakeOf(deps).interactionCalls
+	if len(calls) != 1 || calls[0].OptionID != "" || calls[0].Text != "我的回答" {
+		t.Fatalf("free-text ResolveInput=%+v", calls)
+	}
+}
+
+func TestChoiceAllowFreeTextDoesNotExposeInvalidStandaloneAnswer(t *testing.T) {
+	req := testInteraction("r-guidance",
+		ui.InteractionOption{ID: "guidance", Label: "提供指导", RequiresText: true})
+	req.AllowFreeText = true
+	if got := interactionChoiceCount(req); got != 1 {
+		t.Fatalf("choice request exposed %d choices, want only its stable option", got)
+	}
+	panel := renderInteractionPanel(DefaultTheme(), 80, req, 0, 0, 0, true)
+	if strings.Contains(panel, "自定义回答") {
+		t.Fatalf("choice request rendered an answer without option_id: %q", panel)
+	}
+}
+
+func TestInteractionPromptPagingDoesNotChangeChoiceOrSubmit(t *testing.T) {
+	deps := testDeps()
+	m := sizedModel(t, deps)
+	req := testInteraction("r-paged",
+		ui.InteractionOption{ID: "execute", Label: "执行"},
+		ui.InteractionOption{ID: "cancel", Label: "取消"})
+	req.Prompt = strings.Repeat("一行需要审阅的计划内容\n", 12)
+	m.replaceInteractions([]ui.InteractionItem{req})
+	m.interactionOption = 1
+	m.setFocus(FocusInteraction)
+
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyPgDown})
+	m = result.(AppModel)
+	if m.interactionPromptScroll == 0 || m.interactionOption != 1 {
+		t.Fatalf("paging changed selection or did not scroll: scroll=%d option=%d", m.interactionPromptScroll, m.interactionOption)
+	}
+	if calls := fakeOf(deps).interactionCalls; len(calls) != 0 {
+		t.Fatalf("paging submitted an answer: %+v", calls)
+	}
+	result, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyHome})
+	m = result.(AppModel)
+	if m.interactionPromptScroll != 0 {
+		t.Fatalf("Home did not return to first prompt page: %d", m.interactionPromptScroll)
+	}
+}
+
+// ── Esc = 取消最近请求树（仅顶层视图） / Ctrl+C = 清输入+警告→二次强退 ──
+
+// 顶层视图 Esc：取消成功，摘要进消息流（MsgInfo），视图切到 Chat 让反馈可见。
+func TestAppModel_HandleKey_Escape_CancelsLatestRequest(t *testing.T) {
+	deps := testDeps()
+	fakeOf(deps).cancelLatestFn = func() (string, error) {
+		return "已取消请求「写报表」：终止 Plan plan-abc，共取消 4 个任务", nil
+	}
+	m := newAppModel(deps)
+	m.view = ViewDashboard
 	m.focus = FocusInput
 
-	keyDone := make(chan tea.Model, 1)
-	go func() {
-		result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("1")})
-		keyDone <- result
-	}()
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
+	updated := result.(AppModel)
 
-	var updated AppModel
-	select {
-	case result := <-keyDone:
-		updated = result.(AppModel)
-	case <-time.After(2 * time.Second):
-		t.Fatal("失效请求上按 1 阻塞了 Update（H2 未修复）")
-	}
-
-	if updated.activeApproval != nil {
-		t.Error("失效审批也应推进队列（activeApproval=nil）")
+	f := fakeOf(deps)
+	if f.cancelLatestCalls != 1 {
+		t.Fatalf("CancelLatestRequest 调用次数 = %d, want 1", f.cancelLatestCalls)
 	}
 	if len(updated.messages) == 0 {
-		t.Fatal("失效审批应追加提示消息")
+		t.Fatal("取消成功应追加摘要消息")
 	}
 	last := updated.messages[len(updated.messages)-1]
-	if !strings.Contains(last.Text, "该审批已失效（任务已结束）") {
-		t.Errorf("失效提示文案错误，got: %q", last.Text)
+	if last.Kind != MsgInfo {
+		t.Errorf("摘要消息 kind = %d, want MsgInfo", last.Kind)
+	}
+	if !strings.Contains(last.Text, "已取消请求「写报表」") {
+		t.Errorf("摘要消息应透出后端返回文本, got %q", last.Text)
+	}
+	if updated.view != ViewChat {
+		t.Errorf("取消后应切到消息视图让反馈可见, got view=%d", updated.view)
+	}
+}
+
+// 顶层视图 Esc 遇 ErrNoActiveRequest：回落旧行为（focus 回输入框），不报错刷屏。
+func TestAppModel_HandleKey_Escape_NoActiveRequestFallsBack(t *testing.T) {
+	deps := testDeps() // fake 默认返回 ErrNoActiveRequest
+	m := newAppModel(deps)
+	m.focus = FocusSidebar
+
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
+	updated := result.(AppModel)
+
+	if fakeOf(deps).cancelLatestCalls != 1 {
+		t.Fatalf("顶层 Esc 应先尝试取消, 调用次数 = %d, want 1", fakeOf(deps).cancelLatestCalls)
+	}
+	if updated.focus != FocusInput {
+		t.Errorf("无活跃请求时 Esc 应回落 focus 回输入框, got %d", updated.focus)
+	}
+	if len(updated.messages) != 0 {
+		t.Errorf("ErrNoActiveRequest 不应追加任何消息, got %v", updated.messages)
+	}
+}
+
+// 顶层视图 Esc 遇其他错误：写消息流（错误级），不崩溃、不切视图。
+func TestAppModel_HandleKey_Escape_CancelError(t *testing.T) {
+	deps := testDeps()
+	fakeOf(deps).cancelLatestFn = func() (string, error) {
+		return "", errors.New("取消入口未装配")
+	}
+	m := newAppModel(deps)
+	m.view = ViewChat
+
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
+	updated := result.(AppModel)
+
+	if len(updated.messages) == 0 {
+		t.Fatal("取消失败应追加错误消息")
+	}
+	last := updated.messages[len(updated.messages)-1]
+	if last.Kind != MsgError {
+		t.Errorf("取消失败消息 kind = %d, want MsgError", last.Kind)
+	}
+	if !strings.Contains(last.Text, "取消入口未装配") {
+		t.Errorf("错误消息应透出原始错误, got %q", last.Text)
+	}
+	if updated.view != ViewChat {
+		t.Errorf("取消失败不应切换视图, got view=%d", updated.view)
+	}
+}
+
+// 详情/结果/诊断视图 Esc：只返回 Dashboard，绝不触发请求取消。
+func TestAppModel_HandleKey_Escape_DetailViewOnlyGoesBack(t *testing.T) {
+	for _, view := range []ViewState{ViewAgentDetail, ViewResult, ViewActivity, ViewLogs, ViewTrace} {
+		deps := testDeps()
+		m := newAppModel(deps)
+		m.view = view
+
+		result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
+		updated := result.(AppModel)
+
+		if updated.view != ViewDashboard {
+			t.Errorf("view=%d: Esc 应返回 Dashboard, got %d", view, updated.view)
+		}
+		if n := fakeOf(deps).cancelLatestCalls; n != 0 {
+			t.Errorf("view=%d: 详情视图 Esc 不应调用 CancelLatestRequest, got %d 次", view, n)
+		}
+	}
+}
+
+// 输入框有文本时 Ctrl+C：清文本 + 挂 3 秒警告，不退出。
+func TestAppModel_HandleKey_CtrlC_ClearsInputAndWarns(t *testing.T) {
+	deps := testDeps()
+	m := newAppModel(deps)
+	m.input.SetValue("还没写完的请求")
+
+	result, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlC})
+	updated := result.(AppModel)
+
+	if got := updated.input.Value(); got != "" {
+		t.Errorf("第一次 Ctrl+C 应清空输入框, got %q", got)
+	}
+	if !updated.quitWarnActive() {
+		t.Error("第一次 Ctrl+C 应挂起强退警告")
+	}
+	if fakeOf(deps).quitCalls != 0 {
+		t.Error("第一次 Ctrl+C 不应调用 RequestQuit")
+	}
+	if cmd == nil {
+		t.Error("第一次 Ctrl+C 应返回警告过期 tick（测试中不执行，无 goroutine 泄漏）")
+	}
+}
+
+// 输入框无文本时 Ctrl+C：只挂警告，不退出。
+func TestAppModel_HandleKey_CtrlC_EmptyInputWarnsOnly(t *testing.T) {
+	deps := testDeps()
+	m := newAppModel(deps)
+
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlC})
+	updated := result.(AppModel)
+
+	if updated.quitWarnUntil.IsZero() {
+		t.Error("空输入第一次 Ctrl+C 应挂起强退警告")
+	}
+	if fakeOf(deps).quitCalls != 0 {
+		t.Error("空输入第一次 Ctrl+C 不应调用 RequestQuit")
+	}
+}
+
+// 3 秒窗口内第二次 Ctrl+C：RequestQuit + tea.Quit。
+func TestAppModel_HandleKey_CtrlC_SecondPressQuits(t *testing.T) {
+	deps := testDeps()
+	m := newAppModel(deps)
+
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = result.(AppModel)
+	if !m.quitWarnActive() {
+		t.Fatal("第一次按下后警告应生效")
+	}
+
+	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlC})
+
+	if fakeOf(deps).quitCalls != 1 {
+		t.Fatalf("窗口内第二次 Ctrl+C 应调用 RequestQuit 一次, got %d", fakeOf(deps).quitCalls)
+	}
+	if cmd == nil {
+		t.Fatal("窗口内第二次 Ctrl+C 应返回 tea.Quit")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Error("窗口内第二次 Ctrl+C 应产生 tea.QuitMsg")
+	}
+}
+
+// 窗口过期后再按 Ctrl+C：视为新的第一次——重新计时警告，不退出。
+func TestAppModel_HandleKey_CtrlC_ExpiredWindowWarnsAgain(t *testing.T) {
+	deps := testDeps()
+	m := newAppModel(deps)
+	m.quitWarnUntil = time.Now().Add(-time.Second) // 已过期
+
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlC})
+	updated := result.(AppModel)
+
+	if fakeOf(deps).quitCalls != 0 {
+		t.Error("窗口过期后 Ctrl+C 不应调用 RequestQuit")
+	}
+	if !updated.quitWarnActive() {
+		t.Error("窗口过期后 Ctrl+C 应重新计时警告")
+	}
+}
+
+// 警告到期消息：确已过期时惰性清除。
+func TestAppModel_QuitWarnExpiredMsg_Clears(t *testing.T) {
+	m := newAppModel(testDeps())
+	m.quitWarnUntil = time.Now().Add(-time.Second)
+
+	result, _ := m.Update(quitWarnExpiredMsg{})
+	updated := result.(AppModel)
+
+	if !updated.quitWarnUntil.IsZero() {
+		t.Error("过期 tick 应清除已失效的警告")
+	}
+}
+
+// 警告到期消息：窗口仍有效时不能误杀（晚到的旧 tick vs 重新计时的警告）。
+func TestAppModel_QuitWarnExpiredMsg_KeepsFreshWarning(t *testing.T) {
+	m := newAppModel(testDeps())
+	m.quitWarnUntil = time.Now().Add(quitWarnWindow)
+
+	result, _ := m.Update(quitWarnExpiredMsg{})
+	updated := result.(AppModel)
+
+	if updated.quitWarnUntil.IsZero() {
+		t.Error("晚到的旧 tick 不应清除仍有效的警告")
+	}
+}
+
+// 警告生效期间 View 渲染输入区上方警告行，且总行数不越界。
+func TestAppModel_View_QuitWarnLine(t *testing.T) {
+	m := newAppModel(testDeps())
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = result.(AppModel)
+
+	m.quitWarnUntil = time.Now().Add(quitWarnWindow)
+	view := m.View()
+	if !strings.Contains(view, "再按一次 Ctrl+C 强制退出") {
+		t.Error("警告生效期间 View 应包含强退警告行")
+	}
+	if lines := strings.Split(view, "\n"); len(lines) > m.height {
+		t.Fatalf("警告行渲染后总行数 = %d, want <= 终端高度 %d", len(lines), m.height)
+	}
+
+	m.quitWarnUntil = time.Time{}
+	view = m.View()
+	if strings.Contains(view, "再按一次 Ctrl+C 强制退出") {
+		t.Error("警告清除后 View 不应再渲染警告行")
+	}
+}
+
+// ── 输入历史（输入框首行 ↑ / 末行 ↓ 浏览，见 keymap.go input-history）──
+
+// sizedModel 构造一个已完成窗口布局的 AppModel（textarea 获得真实宽度，
+// 避免 width=0 时空格触发软换行干扰行号断言）。
+func sizedModel(t *testing.T, deps Deps) AppModel {
+	t.Helper()
+	m := newAppModel(deps)
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	return result.(AppModel)
+}
+
+// submitLine 经 Enter 键提交一行（与真实按键路径一致）。
+func submitLine(t *testing.T, m AppModel, line string) AppModel {
+	t.Helper()
+	m.input.SetValue(line)
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	return result.(AppModel)
+}
+
+// pressKey 经 handleKey 按下一个特殊键并返回更新后的模型。
+func pressKey(t *testing.T, m AppModel, kt tea.KeyType) AppModel {
+	t.Helper()
+	result, _ := m.handleKey(tea.KeyMsg{Type: kt})
+	return result.(AppModel)
+}
+
+func TestAppModel_InputHistory_SubmitPushes(t *testing.T) {
+	m := sizedModel(t, testDeps())
+
+	m = submitLine(t, m, "hello world")
+	m = submitLine(t, m, "/status")
+
+	if len(m.history.entries) != 2 ||
+		m.history.entries[0] != "hello world" ||
+		m.history.entries[1] != "/status" {
+		t.Fatalf("提交行（含斜杠命令）应入历史, got %v", m.history.entries)
+	}
+	if m.history.cursor != len(m.history.entries) {
+		t.Errorf("提交后游标应重置到最新, cursor=%d len=%d", m.history.cursor, len(m.history.entries))
+	}
+}
+
+func TestAppModel_InputHistory_DedupConsecutive(t *testing.T) {
+	m := sizedModel(t, testDeps())
+
+	m = submitLine(t, m, "重复行")
+	m = submitLine(t, m, "重复行")
+	m = submitLine(t, m, "另一行")
+	m = submitLine(t, m, "重复行") // 非连续重复：正常入栈
+
+	want := []string{"重复行", "另一行", "重复行"}
+	if len(m.history.entries) != len(want) {
+		t.Fatalf("连续重复行应去重, got %v", m.history.entries)
+	}
+	for i, w := range want {
+		if m.history.entries[i] != w {
+			t.Errorf("entries[%d] = %q, want %q", i, m.history.entries[i], w)
+		}
+	}
+}
+
+func TestAppModel_InputHistory_UpDownRecall(t *testing.T) {
+	m := sizedModel(t, testDeps())
+	m = submitLine(t, m, "第一条")
+	m = submitLine(t, m, "第二条")
+
+	// 空输入框（光标在首行）↑：取最新一条
+	m = pressKey(t, m, tea.KeyUp)
+	if got := m.input.Value(); got != "第二条" {
+		t.Fatalf("↑ 应取最新历史, got %q", got)
+	}
+	// 再 ↑：更早一条
+	m = pressKey(t, m, tea.KeyUp)
+	if got := m.input.Value(); got != "第一条" {
+		t.Fatalf("↑ 应取更早历史, got %q", got)
+	}
+	// 已在最旧一条：↑ 透传 textarea（光标移动 no-op），输入不变
+	m = pressKey(t, m, tea.KeyUp)
+	if got := m.input.Value(); got != "第一条" {
+		t.Fatalf("已在最旧一条时 ↑ 不应改变输入, got %q", got)
+	}
+	// ↓：取更晚一条
+	m = pressKey(t, m, tea.KeyDown)
+	if got := m.input.Value(); got != "第二条" {
+		t.Fatalf("↓ 应取更晚历史, got %q", got)
+	}
+	// ↓ 越过最新一条：恢复进入浏览前的草稿（此处为空）
+	m = pressKey(t, m, tea.KeyDown)
+	if got := m.input.Value(); got != "" {
+		t.Fatalf("↓ 越过最新一条应恢复草稿（空）, got %q", got)
+	}
+}
+
+func TestAppModel_InputHistory_DraftStashRestore(t *testing.T) {
+	m := sizedModel(t, testDeps())
+	m = submitLine(t, m, "历史条目")
+
+	m.input.SetValue("未发送草稿")
+	m = pressKey(t, m, tea.KeyUp)
+	if got := m.input.Value(); got != "历史条目" {
+		t.Fatalf("↑ 应取历史, got %q", got)
+	}
+	m = pressKey(t, m, tea.KeyDown)
+	if got := m.input.Value(); got != "未发送草稿" {
+		t.Fatalf("↓ 越过最新应恢复进入历史前的草稿, got %q", got)
+	}
+}
+
+func TestAppModel_InputHistory_ResetOnSubmit(t *testing.T) {
+	m := sizedModel(t, testDeps())
+	m = submitLine(t, m, "旧条目")
+
+	m = pressKey(t, m, tea.KeyUp) // 浏览中
+	m = submitLine(t, m, "新提交")
+
+	if m.history.cursor != len(m.history.entries) {
+		t.Errorf("提交应重置历史游标, cursor=%d len=%d", m.history.cursor, len(m.history.entries))
+	}
+	if m.history.draft != "" {
+		t.Errorf("提交应清空草稿暂存, draft=%q", m.history.draft)
+	}
+	// 重置后 ↓ 不再恢复旧草稿（透传 textarea no-op，输入保持空）
+	m = pressKey(t, m, tea.KeyDown)
+	if got := m.input.Value(); got != "" {
+		t.Errorf("提交重置后 ↓ 不应恢复旧草稿, got %q", got)
+	}
+}
+
+// 多行输入的中间行 ↑/↓ 是光标移动（透传 textarea），只有顶到首行/末行
+// 边界才触发历史导航——textarea 的 Line()/LineInfo() 提供精确行号。
+func TestAppModel_InputHistory_MultilineMiddleRowsPassThrough(t *testing.T) {
+	m := sizedModel(t, testDeps())
+	m = submitLine(t, m, "历史条目")
+
+	m.input.SetValue("a\nb\nc") // 光标落在末行（row 2）
+
+	// 末行 → 中间行 → 首行：↑ 都是光标移动，不抢键
+	m = pressKey(t, m, tea.KeyUp)
+	if m.input.Line() != 1 || m.input.Value() != "a\nb\nc" {
+		t.Fatalf("中间行 ↑ 应透传 textarea, row=%d value=%q", m.input.Line(), m.input.Value())
+	}
+	m = pressKey(t, m, tea.KeyUp)
+	if m.input.Line() != 0 || m.input.Value() != "a\nb\nc" {
+		t.Fatalf("首行前的 ↑ 应透传 textarea, row=%d value=%q", m.input.Line(), m.input.Value())
+	}
+	// 首行 → 中间行 → 末行：↓ 同样透传
+	m = pressKey(t, m, tea.KeyDown)
+	if m.input.Line() != 1 || m.input.Value() != "a\nb\nc" {
+		t.Fatalf("中间行 ↓ 应透传 textarea, row=%d value=%q", m.input.Line(), m.input.Value())
+	}
+	m = pressKey(t, m, tea.KeyDown)
+	if m.input.Line() != 2 || m.input.Value() != "a\nb\nc" {
+		t.Fatalf("末行前的 ↓ 应透传 textarea, row=%d value=%q", m.input.Line(), m.input.Value())
+	}
+	// 光标已在首行：↑ 才取历史（多行文本被暂存为草稿）
+	m = pressKey(t, m, tea.KeyUp)
+	m = pressKey(t, m, tea.KeyUp)
+	m = pressKey(t, m, tea.KeyUp)
+	if got := m.input.Value(); got != "历史条目" {
+		t.Fatalf("首行 ↑ 应取历史, got %q", got)
+	}
+	// ↓ 越过最新一条：恢复多行草稿
+	m = pressKey(t, m, tea.KeyDown)
+	if got := m.input.Value(); got != "a\nb\nc" {
+		t.Fatalf("↓ 越过最新应恢复多行草稿, got %q", got)
+	}
+}
+
+// 环形缓冲容量 100：超出丢最旧。
+func TestInputHistory_CapDropsOldest(t *testing.T) {
+	var h inputHistory
+	for i := 0; i < inputHistoryCap+5; i++ {
+		h.push(fmt.Sprintf("cmd-%d", i))
+	}
+	if len(h.entries) != inputHistoryCap {
+		t.Fatalf("历史容量 = %d, want %d", len(h.entries), inputHistoryCap)
+	}
+	if h.entries[0] != "cmd-5" {
+		t.Errorf("最旧 5 条应被丢弃, entries[0] = %q, want cmd-5", h.entries[0])
+	}
+	if h.entries[len(h.entries)-1] != fmt.Sprintf("cmd-%d", inputHistoryCap+4) {
+		t.Errorf("最新一条应保留, got %q", h.entries[len(h.entries)-1])
+	}
+}
+
+// ── Ctrl+L 清屏（只清消息流显示，零副作用）──
+
+func TestAppModel_HandleKey_CtrlL_ClearsMessagesOnly(t *testing.T) {
+	deps := testDeps()
+	m := sizedModel(t, deps)
+	m.appendMsg("系统日志", MsgLog)
+	m.appendMsg("普通通知", MsgInfo)
+	m.appendMsg("结果文本", MsgResult) // 进 lastResult，不进消息流
+	m.input.SetValue("draft")
+	m.view = ViewChat
+
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlL})
+	updated := result.(AppModel)
+
+	// 消息流清空，只留一条淡淡的清屏提示（MsgLog 暗色样式）
+	if len(updated.messages) != 1 {
+		t.Fatalf("清屏后消息流应只剩清屏提示, got %d 条", len(updated.messages))
+	}
+	if !strings.Contains(updated.messages[0].Text, "消息流已清空") {
+		t.Errorf("清屏提示文案错误, got %q", updated.messages[0].Text)
+	}
+	if updated.messages[0].Kind != MsgLog {
+		t.Errorf("清屏提示应为 MsgLog（淡淡的系统提示）, got kind=%d", updated.messages[0].Kind)
+	}
+	// 零副作用：结果视图、输入框、视图、焦点、历史全部不动
+	if updated.lastResult == nil || !strings.Contains(updated.lastResult.Text, "结果文本") {
+		t.Error("Ctrl+L 不应清空结果视图（lastResult）")
+	}
+	if got := updated.input.Value(); got != "draft" {
+		t.Errorf("Ctrl+L 不应清输入框, got %q", got)
+	}
+	if updated.view != ViewChat {
+		t.Errorf("Ctrl+L 不应切换视图, got view=%d", updated.view)
+	}
+	// 零副作用：不发任何请求（Controller 零调用）
+	f := fakeOf(deps)
+	if len(f.sentTexts) != 0 || f.cancelLatestCalls != 0 || f.quitCalls != 0 ||
+		len(f.modeSets) != 0 || len(f.interactionCalls) != 0 || len(f.cancelled) != 0 {
+		t.Errorf("Ctrl+L 不应触发任何 Controller 调用: %+v", f)
+	}
+}
+
+// ── Shift+Tab 反向切换焦点；模式只由 /mode 改动 ──
+
+func TestAppModel_HandleKey_ShiftTab_CyclesFocusReverse(t *testing.T) {
+	deps := testDeps()
+	m := sizedModel(t, deps)
+	m.replaceInteractions([]ui.InteractionItem{testInteraction("r-1",
+		ui.InteractionOption{ID: "continue", Label: "继续"},
+	)})
+	// 新待决到达会自动聚焦 Interaction（另有测试覆盖）；这里从 Input
+	// 起测完整的反向循环。
+	m.setFocus(FocusInput)
+
+	m = pressKey(t, m, tea.KeyShiftTab)
+	if m.focus != FocusMain {
+		t.Fatalf("Input reverse should reach Main, got %d", m.focus)
+	}
+	m = pressKey(t, m, tea.KeyShiftTab)
+	if m.focus != FocusSidebar {
+		t.Fatalf("Main reverse should reach Sidebar, got %d", m.focus)
+	}
+	m = pressKey(t, m, tea.KeyShiftTab)
+	if m.focus != FocusInteraction {
+		t.Fatalf("Sidebar reverse should reach Interaction, got %d", m.focus)
+	}
+	m = pressKey(t, m, tea.KeyShiftTab)
+	if m.focus != FocusInput {
+		t.Fatalf("Interaction reverse should reach Input, got %d", m.focus)
+	}
+	if calls := fakeOf(deps).modeSets; len(calls) != 0 {
+		t.Fatalf("Shift+Tab must not change mode: %v", calls)
+	}
+}
+
+// ── keymap 声明表一致性（防止键位三处手工同步再漂移）──
+
+// 所有带帮助文案的 keymap 条目都必须出现在 /help 的热键区。
+func TestKeymap_HelpEntriesRendered(t *testing.T) {
+	hotkeys := helpHotkeys()
+	for _, e := range keymap {
+		if e.help == "" {
+			continue
+		}
+		if !strings.Contains(hotkeys, e.helpKeys) {
+			t.Errorf("keymap 条目 %s 的键位 %q 未出现在 /help 热键区", e.id, e.helpKeys)
+		}
+		if !strings.Contains(hotkeys, e.help) {
+			t.Errorf("keymap 条目 %s 的文案 %q 未出现在 /help 热键区", e.id, e.help)
+		}
+	}
+	if !strings.Contains(helpText, hotkeys) {
+		t.Error("helpText 未包含 keymap 渲染的热键区")
+	}
+}
+
+// 键名常量必须与 bubbletea 的 tea.KeyMsg.String() 形式一致——
+// 否则 handleKey 的 case 永远落空。
+func TestKeymap_KeyConstantsMatchBubbletea(t *testing.T) {
+	cases := []struct {
+		msg  tea.KeyMsg
+		want string
+	}{
+		{tea.KeyMsg{Type: tea.KeyCtrlC}, keyCtrlC},
+		{tea.KeyMsg{Type: tea.KeyCtrlL}, keyCtrlL},
+		{tea.KeyMsg{Type: tea.KeyCtrlJ}, keyCtrlJ},
+		{tea.KeyMsg{Type: tea.KeyCtrlB}, keyCtrlB},
+		{tea.KeyMsg{Type: tea.KeyCtrlF}, keyCtrlF},
+		{tea.KeyMsg{Type: tea.KeyEnter, Alt: true}, keyAltEnter},
+		{tea.KeyMsg{Type: tea.KeyTab}, keyTab},
+		{tea.KeyMsg{Type: tea.KeyShiftTab}, keyShiftTab},
+		{tea.KeyMsg{Type: tea.KeyEscape}, keyEsc},
+		{tea.KeyMsg{Type: tea.KeyEnter}, keyEnter},
+		{tea.KeyMsg{Type: tea.KeyUp}, keyUp},
+		{tea.KeyMsg{Type: tea.KeyDown}, keyDown},
+		{tea.KeyMsg{Type: tea.KeyPgUp}, keyPgUp},
+		{tea.KeyMsg{Type: tea.KeyPgDown}, keyPgDown},
+		{tea.KeyMsg{Type: tea.KeyHome}, keyHome},
+	}
+	for _, tc := range cases {
+		if got := tc.msg.String(); got != tc.want {
+			t.Errorf("tea.KeyMsg.String() = %q, want keymap 常量 %q", got, tc.want)
+		}
+	}
+}
+
+// 语义 ID 全表唯一（测试与后续表驱动扩展都依赖它定位条目）。
+func TestKeymap_UniqueIDs(t *testing.T) {
+	seen := map[string]bool{}
+	for _, e := range keymap {
+		if seen[e.id] {
+			t.Errorf("keymap 条目 id %q 重复", e.id)
+		}
+		seen[e.id] = true
+	}
+}
+
+// 新键位进状态栏：宽屏显示全部 hints，窄屏按 trim 优先级裁剪，
+// 状态栏始终单行不折行。
+func TestRenderStatusBar_TrimsGlobalHintsWhenNarrow(t *testing.T) {
+	theme := DefaultTheme()
+	wide := renderStatusBar(theme, 120, FocusInput, ViewDashboard, false)
+	narrow := renderStatusBar(theme, 100, FocusInput, ViewDashboard, false)
+
+	if !strings.Contains(wide, "focus←") || !strings.Contains(wide, "clear") {
+		t.Error("宽屏应包含 Shift+Tab:focus← 与 Ctrl+L:clear 提示")
+	}
+	if strings.Contains(narrow, "clear") {
+		t.Error("窄屏应优先裁掉 Ctrl+L:clear（trim 值最大）")
+	}
+	if !strings.Contains(narrow, "focus←") {
+		t.Error("窄屏在只裁一条时应保留 Shift+Tab:focus←")
+	}
+	if w := lipglossWidth(narrow); w > 100 {
+		t.Errorf("裁剪后状态栏宽度 = %d, want <= 100（不折行）", w)
 	}
 }

@@ -25,10 +25,10 @@ const (
 	// 历史压缩 / 截断——压缩与截断按 §7.2.2 决议保留在 processing 内，由
 	// KindHistoryCompaction / KindHistoryTruncated 事件单独监控）。
 	AgentStateProcessing AgentRuntimeState = "processing"
-	// AgentStateWaitingApproval 阻塞等用户批准（仅 needs-approval 工具调用时触发）。
-	// 由 internal/shell/intercept.go 的审批等待钩子（ApprovalWaitHook →
-	// SetApprovalWaitState）在进入/退出回复阻塞时驱动。
-	AgentStateWaitingApproval AgentRuntimeState = "waiting_approval"
+	// AgentStateWaitingInteraction 阻塞等待用户交互响应。它不绑定具体交互类型：
+	// shell 授权、结构化选项或后续其它需要用户决定的协议都复用该状态。
+	// 由交互等待边界调用 SetInteractionWaitState 驱动。
+	AgentStateWaitingInteraction AgentRuntimeState = "waiting_interaction"
 	// AgentStateTerminating 任务结束清理中（FailTask / SubmitResult / FileCache 清理 /
 	// 写最终 trace 事件）。
 	AgentStateTerminating AgentRuntimeState = "terminating"
@@ -43,12 +43,12 @@ var validTransitions = map[AgentRuntimeState]map[AgentRuntimeState]bool{
 		AgentStateProcessing: true,
 	},
 	AgentStateProcessing: {
-		AgentStateWaitingApproval: true,
-		AgentStateTerminating:     true,
+		AgentStateWaitingInteraction: true,
+		AgentStateTerminating:        true,
 	},
-	AgentStateWaitingApproval: {
-		AgentStateProcessing:  true, // approved / rejected — Q11.r 决议：rejected 也回 Processing
-		AgentStateTerminating: true, // timeout / cancel（不含 rejected）
+	AgentStateWaitingInteraction: {
+		AgentStateProcessing:  true, // 用户已响应，继续处理交互结果
+		AgentStateTerminating: true, // timeout / cancel
 	},
 	AgentStateTerminating: {
 		AgentStateIdle: true,
@@ -56,8 +56,8 @@ var validTransitions = map[AgentRuntimeState]map[AgentRuntimeState]bool{
 }
 
 // stateMu 保护 Agent.runtimeState 的并发访问。
-// 主流程（processTask）单线程切换，但 approval 通道未来可能由其它 goroutine
-// 触发 WaitingApproval 切换，加锁保留扩展空间。
+// 主流程（processTask）单线程切换，但 Interaction 回复通道可能由其它 goroutine
+// 触发 WaitingInteraction 切换，加锁保留扩展空间。
 type stateGuard struct {
 	mu    sync.Mutex
 	state AgentRuntimeState
@@ -86,8 +86,8 @@ func (a *Agent) CurrentState() AgentRuntimeState {
 // 当前 taskID。idle ↔ idle 等无任务上下文场景目前不存在；如果未来 agent 启动
 // 即在 idle 上做切换，再考虑传 "" 走"agent 级"事件归档（writer 当前不支持）。
 //
-// 调用方约定：Phase 3 的 4 个非审批转换在 processTask 内显式调用；
-// approval 相关 2 条边由 Phase 1 Shell 升级负责接入。
+// 调用方约定：Phase 3 的 4 个非交互转换在 processTask 内显式调用；
+// Interaction 相关 2 条边由具体等待协议负责接入。
 func (a *Agent) SetState(newState AgentRuntimeState, cause string, taskID string) error {
 	// v5 Phase 5：Reactor 调用栈守卫（ReactiveSystem.md §7.2.6 原则 4）。
 	// 状态机由主流程显式驱动，Reactor 永远不应推动状态切换。
@@ -155,24 +155,49 @@ func isValidTransition(prev, next AgentRuntimeState) bool {
 	return dests[next]
 }
 
-// SetApprovalWaitState 把 shell 命令审批的等待窗口（internal/shell 的
-// ApprovalWaitHook 回调）映射到运行时状态机：waiting=true → waiting_approval，
-// waiting=false → processing。两条边均在 §7.3.5 转换表内。
+// SetInteractionWaitState 把等待用户交互的窗口映射到运行时状态机。
+// 等待窗口按 Agent 引用计数：首个 waiting=true 才进入
+// waiting_interaction，最后一个 waiting=false 才恢复 processing。
+// 这避免并行工具同时等待时，其中一个先返回就过早宣称
+// Agent 已恢复执行。两条边均在 §7.3.5 转换表内。
 //
 // best-effort：a 为 nil 或转换非法（如任务已取消、状态机已进入 terminating）
-// 时只记日志不中断工具执行——waiting_approval 是观测面增强，不是执行正确性依赖。
+// 时只记日志不中断工具执行——waiting_interaction 是观测面增强，不是执行正确性依赖。
 // taskID 取自工具执行 ctx（holder），仅用于 trace 事件归档。
-func SetApprovalWaitState(a *Agent, taskID string, waiting bool) {
+func SetInteractionWaitState(a *Agent, taskID string, waiting bool) {
 	if a == nil {
 		return
 	}
-	target := AgentStateProcessing
-	cause := "approval_wait_end"
+
+	// 持有计数锁直到 SetState 完成，保证 0→1 与 1→0 边界
+	// 不会被另一个并行等待者重排。SetState 使用独立的
+	// stateGuard，没有反向获取 interactionWaitMu 的路径。
+	a.interactionWaitMu.Lock()
+	defer a.interactionWaitMu.Unlock()
+
 	if waiting {
-		target = AgentStateWaitingApproval
-		cause = "approval_wait_start"
+		if a.interactionWaiters > 0 {
+			a.interactionWaiters++
+			return
+		}
+		if err := a.SetState(AgentStateWaitingInteraction, "interaction_wait_start", taskID); err != nil {
+			log.Printf("[agent %s] 交互等待状态切换失败（waiting=%v，忽略继续）: %v", a.ID, waiting, err)
+			return
+		}
+		a.interactionWaiters = 1
+		return
 	}
-	if err := a.SetState(target, cause, taskID); err != nil {
-		log.Printf("[agent %s] 审批等待状态切换失败（waiting=%v，忽略继续）: %v", a.ID, waiting, err)
+
+	if a.interactionWaiters > 1 {
+		a.interactionWaiters--
+		return
+	}
+	if a.interactionWaiters == 1 {
+		a.interactionWaiters = 0
+	}
+	// interactionWaiters==0 时仍执行一次 SetState：保留原有的
+	// processing 自循环宽容语义，也让异常时序继续以日志暴露。
+	if err := a.SetState(AgentStateProcessing, "interaction_wait_end", taskID); err != nil {
+		log.Printf("[agent %s] 交互等待状态切换失败（waiting=%v，忽略继续）: %v", a.ID, waiting, err)
 	}
 }

@@ -3,13 +3,13 @@ package ui
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/scheduler"
-	"agentgo/internal/shell"
 )
 
 func TestController_SendUserTextOrderAndEvent(t *testing.T) {
@@ -147,6 +147,81 @@ func TestController_SetModeMapping(t *testing.T) {
 	NewHub(Deps{}).SetMode(true)
 }
 
+func TestController_SetExecMode(t *testing.T) {
+	var got []string
+	h := NewHub(Deps{
+		ExecModeSet: func(mode string) error { got = append(got, mode); return nil },
+	})
+	// 合法值（含大小写容错）解析后传规范化小写串。
+	if err := h.SetExecMode("Readonly"); err != nil {
+		t.Fatalf("SetExecMode(readonly) 返回错误：%v", err)
+	}
+	if len(got) != 1 || got[0] != "readonly" {
+		t.Fatalf("ExecModeSet 收到 %v，期望 [readonly]", got)
+	}
+
+	// 非法值返回中文错误，且不触达注入函数。
+	err := h.SetExecMode("nope")
+	if err == nil || !strings.Contains(err.Error(), "未知执行权限模式") {
+		t.Fatalf("err = %v，期望含 未知执行权限模式", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("非法值不应触达 ExecModeSet，收到 %v", got)
+	}
+
+	// 未装配返回 ErrNotAssembled。
+	if err := NewHub(Deps{}).SetExecMode("normal"); !errors.Is(err, ErrNotAssembled) {
+		t.Fatalf("err = %v，期望 ErrNotAssembled", err)
+	}
+}
+
+func TestController_SetTopoMode(t *testing.T) {
+	var got []string
+	h := NewHub(Deps{
+		TopoModeSet: func(mode string) error { got = append(got, mode); return nil },
+	})
+	if err := h.SetTopoMode("Solo"); err != nil {
+		t.Fatalf("SetTopoMode(solo) 返回错误：%v", err)
+	}
+	if len(got) != 1 || got[0] != "solo" {
+		t.Fatalf("TopoModeSet 收到 %v，期望 [solo]", got)
+	}
+
+	err := h.SetTopoMode("nope")
+	if err == nil || !strings.Contains(err.Error(), "未知编排拓扑模式") {
+		t.Fatalf("err = %v，期望含 未知编排拓扑模式", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("非法值不应触达 TopoModeSet，收到 %v", got)
+	}
+
+	if err := NewHub(Deps{}).SetTopoMode("team"); !errors.Is(err, ErrNotAssembled) {
+		t.Fatalf("err = %v，期望 ErrNotAssembled", err)
+	}
+}
+
+func TestSnapshot_ThreeModeAxes(t *testing.T) {
+	h := NewHub(Deps{
+		ModeGet:     func() string { return "plan" },
+		ExecModeGet: func() string { return "readonly" },
+		TopoModeGet: func() string { return "solo" },
+	})
+	h.refreshSnapshot()
+	snap := h.Snapshot()
+	if snap.Mode != "plan" || snap.ExecMode != "readonly" || snap.TopoMode != "solo" {
+		t.Fatalf("快照三轴 = (%q, %q, %q)，期望 (plan, readonly, solo)",
+			snap.Mode, snap.ExecMode, snap.TopoMode)
+	}
+
+	// Getter 未装配时对应字段保持零值（与 ModeGet 既有语义一致）。
+	h = NewHub(Deps{ModeGet: func() string { return "immediate" }})
+	h.refreshSnapshot()
+	snap = h.Snapshot()
+	if snap.ExecMode != "" || snap.TopoMode != "" {
+		t.Fatalf("未装配的轴应为零值，实际 (%q, %q)", snap.ExecMode, snap.TopoMode)
+	}
+}
+
 func TestController_CancelTask(t *testing.T) {
 	var gotPrefix string
 	h := NewHub(Deps{
@@ -169,6 +244,31 @@ func TestController_CancelTask(t *testing.T) {
 
 	// 未装配
 	if _, err := NewHub(Deps{}).CancelTask("x"); !errors.Is(err, ErrNotAssembled) {
+		t.Fatalf("err = %v，期望 ErrNotAssembled", err)
+	}
+}
+
+func TestController_CancelLatestRequest(t *testing.T) {
+	called := false
+	h := NewHub(Deps{
+		CancelLatestRequest: func() (string, error) {
+			called = true
+			return "已取消请求「写月度报表…」：共取消 2 个任务", nil
+		},
+	})
+	summary, err := h.CancelLatestRequest()
+	if err != nil || !called || summary != "已取消请求「写月度报表…」：共取消 2 个任务" {
+		t.Fatalf("summary=%q err=%v called=%v", summary, err, called)
+	}
+
+	// ErrNoActiveRequest 原样透传，调用方可 errors.Is 判定
+	h = NewHub(Deps{CancelLatestRequest: func() (string, error) { return "", ErrNoActiveRequest }})
+	if _, err := h.CancelLatestRequest(); !errors.Is(err, ErrNoActiveRequest) {
+		t.Fatalf("err = %v，期望透传 ErrNoActiveRequest", err)
+	}
+
+	// 未装配
+	if _, err := NewHub(Deps{}).CancelLatestRequest(); !errors.Is(err, ErrNotAssembled) {
 		t.Fatalf("err = %v，期望 ErrNotAssembled", err)
 	}
 }
@@ -217,12 +317,4 @@ func TestController_RequestQuit(t *testing.T) {
 	}
 	// 未装配时静默忽略，不得 panic
 	NewHub(Deps{}).RequestQuit()
-}
-
-func TestController_ResolveApprovalThroughController(t *testing.T) {
-	// Controller 接口维度：ResolveApproval 由 Hub 实现并可用于审批闭环。
-	var c Controller = NewHub(Deps{})
-	if ok := c.ResolveApproval("nothing", shell.ApprovalReply{Approved: true}); ok {
-		t.Fatal("空 Hub 上 ResolveApproval 应返回 false")
-	}
 }

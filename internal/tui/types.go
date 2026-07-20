@@ -14,15 +14,19 @@ const (
 	ViewAgentDetail                  // Selected agent's output stream
 	ViewChat                         // System message history
 	ViewResult                       // Full task result
+	ViewActivity                     // Human-readable cross-agent activity
+	ViewLogs                         // Raw diagnostic logs
+	ViewTrace                        // Structured trace/tool events
 )
 
 // FocusState tracks which panel has keyboard focus.
 type FocusState int
 
 const (
-	FocusInput   FocusState = iota // Text editor (default)
-	FocusSidebar                   // Agent list navigation
-	FocusMain                      // Main content area
+	FocusInput       FocusState = iota // Text editor (default)
+	FocusInteraction                   // Structured user interaction
+	FocusSidebar                       // Agent list navigation
+	FocusMain                          // Main content area
 )
 
 // MsgKind determines message styling.
@@ -39,10 +43,11 @@ const (
 
 // StyledMsg is a message with kind, timestamp, and optional agent attribution.
 type StyledMsg struct {
-	Text    string
-	Kind    MsgKind
-	At      time.Time
-	AgentID string // non-empty for agent-attributed messages
+	Text     string
+	Kind     MsgKind
+	At       time.Time
+	AgentID  string // non-empty for agent-attributed messages
+	StreamID string // non-empty for replace-in-place LLM stream snapshots
 }
 
 // AgentInfo 是单个代理的运行状态快照（仪表板/侧边栏渲染用）。
@@ -56,7 +61,7 @@ type AgentInfo = ui.AgentCard
 // （首条必为 KindSnapshotSync 全量快照），所有写操作经 Controller 进入
 // UI Hub。两者的生产实现都是 bootstrap 装配的 *ui.Hub。
 type Deps struct {
-	// Controller 是 UI Hub 控制面（发用户输入、审批回复、/cancel、/mode、
+	// Controller 是 UI Hub 控制面（发用户输入、Interaction 回答、/cancel、/mode、
 	// /steer、session 切换、/quit）。nil 时各命令渲染"未初始化"错误。
 	Controller ui.Controller
 	// Observer 是 UI Hub 观测面（Subscribe + Snapshot）。nil 时界面只显示
@@ -80,8 +85,8 @@ type Layout struct {
 	// Main content
 	MainX, MainY, MainW, MainH int
 
-	// Approval bar (overlaps input when active)
-	ApprovalY, ApprovalH int
+	// Interaction panel (shown above the input when pending)
+	InteractionY, InteractionH int
 
 	// Input editor
 	InputY, InputH int

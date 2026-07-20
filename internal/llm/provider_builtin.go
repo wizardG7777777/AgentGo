@@ -13,9 +13,24 @@ import (
 
 type OpenAIProvider struct{}
 
-func (*OpenAIProvider) Name() string                              { return "openai" }
-func (*OpenAIProvider) PrepareMessages(h []Message) []Message     { return h }
-func (*OpenAIProvider) RequestOptions() []option.RequestOption    { return nil }
+func (*OpenAIProvider) Name() string                           { return "openai" }
+func (*OpenAIProvider) PrepareMessages(h []Message) []Message  { return h }
+func (*OpenAIProvider) RequestOptions() []option.RequestOption { return nil }
+
+// OpenRouterProvider keeps the OpenAI-compatible message/tool request shape,
+// but maps reasoning effort to OpenRouter's nested reasoning.effort field.
+// Keeping it explicit also prevents a valid configuration from looking like
+// an unknown provider that happened to fall back to OpenAIProvider.
+type OpenRouterProvider struct{}
+
+func (*OpenRouterProvider) Name() string                           { return "openrouter" }
+func (*OpenRouterProvider) PrepareMessages(h []Message) []Message  { return h }
+func (*OpenRouterProvider) RequestOptions() []option.RequestOption { return nil }
+func (*OpenRouterProvider) ReasoningEffortOptions(effort string) []option.RequestOption {
+	return []option.RequestOption{
+		option.WithJSONSet("reasoning", map[string]string{"effort": effort}),
+	}
+}
 
 // ============================================================================
 // DeepSeekV4Provider —— DeepSeek V4 系列（如 deepseek-v4-flash）。
@@ -31,8 +46,8 @@ func (*OpenAIProvider) RequestOptions() []option.RequestOption    { return nil }
 
 type DeepSeekV4Provider struct{}
 
-func (*DeepSeekV4Provider) Name() string                           { return "deepseek-v4" }
-func (*DeepSeekV4Provider) PrepareMessages(h []Message) []Message  { return h }
+func (*DeepSeekV4Provider) Name() string                          { return "deepseek-v4" }
+func (*DeepSeekV4Provider) PrepareMessages(h []Message) []Message { return h }
 func (*DeepSeekV4Provider) RequestOptions() []option.RequestOption {
 	return []option.RequestOption{
 		option.WithJSONSet("thinking", map[string]string{"type": "enabled"}),
@@ -89,6 +104,7 @@ func (*DeepSeekR1Provider) RequestOptions() []option.RequestOption { return nil 
 
 func init() {
 	RegisterProvider(&OpenAIProvider{})
+	RegisterProvider(&OpenRouterProvider{})
 	RegisterProvider(&DeepSeekV4Provider{})
 	RegisterProvider(&DeepSeekR1Provider{})
 }

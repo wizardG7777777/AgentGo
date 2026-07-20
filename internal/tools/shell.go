@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/interaction"
+	"agentgo/internal/modes"
 	"agentgo/internal/shell"
 	"agentgo/internal/tools/schema"
 	"agentgo/internal/trace"
@@ -19,25 +21,30 @@ const shellOutputLimit = 10000
 // defaultShellTimeoutSec 当未显式配置 TimeoutSec 时的默认超时（秒）。
 const defaultShellTimeoutSec = 30
 
-// ShellGroup 注册 run_shell 工具，包含黑/灰名单审批拦截链路。
+// ShellGroup 注册 run_shell 工具，包含黑名单与 Interaction 灰名单授权链路。
 //
 // 必填字段：
 //   - Workdir：动态工作目录提供者
 //   - TimeoutSec：单次命令的超时上限（秒），<=0 时回退为 30
-//   - ApprovalCh：发往 CLI 的审批请求通道（灰名单命令通过它请求人工审批）
-//   - AgentID：用于审批请求的来源标识
+//   - Interactions：结构化人机交互服务；灰名单命令在 nil 时 fail-closed
+//   - AgentID：用于 Interaction 请求的来源标识
 //
 // 可选字段：
 //   - Filter：命令过滤器，nil 时使用 shell.NewCommandFilter(DefaultBlacklist, DefaultGreylist)
-//   - ApprovalWaitHook：审批等待钩子，进入/退出"等待用户回复"阻塞时各回调一次
-//     （true/false），供调用方接线 agent 状态机（waiting_approval）；nil 为 no-op
+//   - SessionID：返回当前 Session ID，nil 时请求不绑定 Session
+//   - Modes：三轴模式 store，exec 轴驱动 strict 全量审批 / yolo 灰名单自动放行；
+//     nil 等价 normal
+//   - InteractionWaitHook：交互等待钩子，进入/退出"等待用户回复"时各回调一次
+//     （true/false），供调用方接线 agent 状态机（waiting_interaction）；nil 为 no-op
 type ShellGroup struct {
-	Workdir          WorkdirProvider
-	TimeoutSec       int
-	ApprovalCh       chan<- shell.ApprovalRequest
-	AgentID          string
-	Filter           *shell.CommandFilter // optional
-	ApprovalWaitHook func(waiting bool)   // optional
+	Workdir             WorkdirProvider
+	TimeoutSec          int
+	Interactions        *interaction.Service
+	SessionID           func() string
+	AgentID             string
+	Filter              *shell.CommandFilter // optional
+	Modes               *modes.Store         // optional
+	InteractionWaitHook func(waiting bool)   // optional
 }
 
 // Register 实现 ToolGroup 接口。
@@ -86,7 +93,7 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 
 		// 每次真实执行（成功/非零退出/超时/启动失败）都恰好 emit 一条
 		// shell_executed 事件（D4：该 Kind 此前有 schema/CLI 渲染/Reactor
-		// 白名单但零发射点）。黑名单拦截/审批拒绝的命令到不了这里，不产生事件。
+		// 白名单但零发射点）。黑名单拦截或用户未授权的命令到不了这里，不产生事件。
 		execEv := trace.Event{
 			Kind:    trace.KindShellExecuted,
 			TaskID:  agent.TaskIDFromContext(ctx),
@@ -133,7 +140,22 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 		filter = shell.NewCommandFilter(shell.DefaultBlacklist, shell.DefaultGreylist)
 	}
 
-	wrappedFn := shell.WrapShellTool(rawFn, filter, g.ApprovalCh, g.AgentID, g.ApprovalWaitHook)
+	authorizedFn := shell.WrapShellTool(rawFn, filter, g.Interactions, g.SessionID,
+		g.AgentID, g.InteractionWaitHook, g.Modes)
+	// Interaction 必须绑定实际执行目录，而不是只看到用户是否显式传参。
+	// 在进入拦截器前复制参数并补齐 Workdir fallback，避免修改 LLM 调用方持有的 map。
+	wrappedFn := func(ctx context.Context, args map[string]any) (string, error) {
+		workingDir, _ := args["working_dir"].(string)
+		if workingDir != "" || workdir == nil {
+			return authorizedFn(ctx, args)
+		}
+		resolvedArgs := make(map[string]any, len(args)+1)
+		for key, value := range args {
+			resolvedArgs[key] = value
+		}
+		resolvedArgs["working_dir"] = workdir.Get()
+		return authorizedFn(ctx, resolvedArgs)
+	}
 
 	params := schema.Object().
 		String("command", "要执行的 shell 命令", true).

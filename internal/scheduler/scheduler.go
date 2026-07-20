@@ -2,20 +2,20 @@ package scheduler
 
 import (
 	"io"
-	"sync"
 	"time"
 
 	"agentgo/internal/agent"
 	"agentgo/internal/agenttemplate"
 	"agentgo/internal/config"
 	"agentgo/internal/gate"
+	"agentgo/internal/interaction"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/memory"
 	"agentgo/internal/model"
+	"agentgo/internal/modes"
 	"agentgo/internal/plan"
 	"agentgo/internal/roster"
-	"agentgo/internal/shell"
 	"agentgo/internal/store"
 	"agentgo/internal/tools"
 	"agentgo/internal/webtool"
@@ -23,12 +23,12 @@ import (
 	"github.com/google/uuid"
 )
 
-// Mode 表示调度器的工作模式（即时 vs 计划）。
+// Mode 是旧版单一调度模式类型，现已并入三轴模式体系（internal/modes）的
+// gate 轴——运行时的模式状态一律由 modes.Store 持有。
 //
-// Phase 3 重构后，scheduler 不再有自己的事件循环和 currentBatch 字段。
-// Mode 现在由 ModeStore 持有，CLI 通过 *ModeStore 切换；SchedulerExecutor
-// 在每次注入 board snapshot 时从 ModeStore 读当前 mode 并写入 JSON。
-type Mode int
+// Deprecated: 新代码请使用 modes.GateMode。本别名仅为兼容 internal/tui 的
+// header 渲染签名而保留（TUI 不允许本次改动），与 modes.GateMode 完全等价。
+type Mode = modes.GateMode
 
 // schedulerMaxRetries 是 Scheduler 角色的任务级重试上限。
 //
@@ -43,11 +43,10 @@ type Mode int
 // 该常量故意不暴露 yaml 配置——"重试几次"是角色属性，不是用户偏好。
 const schedulerMaxRetries = 5
 
-// schedulerMaxLoops 是 Scheduler agent 单次任务内 ReAct 步数上限。
+// schedulerMaxLoops 是 Scheduler agent 单次任务内 ReAct 步数的兼容默认值。
 //
-// 取代旧 cfg.SchedulerMaxLoops。v4 §11.5.5 把 Scheduler 行为参数全部内置——
-// 工具集 / 系统提示词 / 行为参数都是编排逻辑的内禀部分，用户改了不是调优而是
-// 破坏。
+// scheduler.agent_max_loops 现在可在 YAML 覆盖；省略或直接构造 Config 时为
+// 0，仍回落该值。常量别名保留给包内测试和历史注释使用。
 //
 // 2026-04-27 从 10 上调至 30：
 //   - 旧值 10 来自 v3 默认，假设 publish_task → wait_batch → report_done 三步收敛
@@ -55,47 +54,16 @@ const schedulerMaxRetries = 5
 //     看结果 → 再派任务 → 再看结果 → 自然语言回答"多轮编排，10 步偏紧
 //   - 30 步给足头空间，单任务 worst case ~30 次 LLM 调用，仍然可控
 //   - 注意 MaxLoops 是 per-task 而不是进程累计——每个新任务计数从 0 开始
-const schedulerMaxLoops = 30
+const schedulerMaxLoops = config.DefaultSchedulerMaxLoops
 
 const (
-	ModeImmediate Mode = iota // 即时模式：逐步决策
-	ModePlan                  // 计划模式：先探索再规划
+	// ModeImmediate 等价于 modes.GateImmediate。
+	// Deprecated: 使用 modes.GateImmediate；仅为兼容 internal/tui 保留。
+	ModeImmediate = modes.GateImmediate // 即时模式：逐步决策
+	// ModePlan 等价于 modes.GatePlan。
+	// Deprecated: 使用 modes.GatePlan；仅为兼容 internal/tui 保留。
+	ModePlan = modes.GatePlan // 计划模式：先探索再规划
 )
-
-// ModeStore 是线程安全的 mode 持有者，替代旧 *Scheduler 上的 SetMode/GetMode 方法。
-//
-// CLI 在 /mode 命令中读写 ModeStore；SchedulerExecutor 在每次 reactLoop 注入
-// board snapshot 时读 ModeStore 决定 mode 字段。两侧无锁竞争（mode 切换在
-// 用户键入命令的时间尺度，远低于 reactLoop 频率）。
-type ModeStore struct {
-	mu   sync.RWMutex
-	mode Mode
-}
-
-// NewModeStore 创建 ModeStore，初始为 ModeImmediate。
-func NewModeStore() *ModeStore { return &ModeStore{mode: ModeImmediate} }
-
-// Set 切换当前 mode（线程安全）。
-func (m *ModeStore) Set(mode Mode) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.mode = mode
-}
-
-// Get 返回当前 mode（线程安全）。
-func (m *ModeStore) Get() Mode {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.mode
-}
-
-// modeString 把 Mode 翻译成 BuildBoardJSON 期望的字符串值。
-func (m *ModeStore) modeString() string {
-	if m.Get() == ModePlan {
-		return "plan"
-	}
-	return "immediate"
-}
 
 // schedulerSystemPrompt 是 scheduler agent 的 system prompt。
 //
@@ -132,10 +100,12 @@ const schedulerSystemPrompt = `你是 AgentGo 系统中的调度器（Scheduler�
 
 每次你被唤醒时，message 末尾会附带一段 JSON 格式的"系统快照"。它就是你对系统的实时感知，回答任何问题前都应当先扫一眼。结构如下：
 
-- mode："immediate" 或 "plan"，当前工作模式
+- mode："immediate" 或 "plan"，规划门控轴（gate），详见文末"工作模式"段
+- exec_mode："normal" / "strict" / "readonly" / "yolo"，执行权限轴（exec）
+- topo_mode："team" 或 "solo"，编排拓扑轴（topo）
 - trigger：本次唤醒的触发事件类型与 payload
 - plan：当前动态 DAG 的权威摘要。plan_revision 只在图形/规划语义变化时增加；execution_state_version 在 Task 事实变化时增加；acceptance_spec_revision 只在验收标准变化时增加。current_nodes 是最新有效图的节点语义，acceptance_criteria 是当前正式标准；latest_acceptance 只展示仍匹配当前 revision/digest/spec 的最新验收摘要（run/result ID、verdict、逐 Criterion 结果与建议），完整 Evidence 可用其中的 result_id 调 get_acceptance_evidence；warnings 只保留最近 8 条，retired_nodes 是压缩历史。
-- resumable_plans：当前处于 paused_awaiting_decision 或 blocked、可由用户明确选择恢复/收敛/终止的 Plan 摘要。用户给出决定时，使用对应 plan_id 调用 resolve_plan_pause；不要猜测或绕过用户选择。
+- resumable_plans：当前处于 paused_awaiting_decision 或 blocked 的 Plan 摘要，仅供解释状态。系统会为它们创建结构化 Interaction；不得从自然语言猜测决定，也不得通过工具自行恢复或终止。
 - tasks：公告板上所有任务的当前状态。每项含 id、status、description、artifacts（实际写入的文件清单）、dependencies 等
 - resources：
   - runtime_mode：scheduler_only 表示当前没有执行 route；agent_team 表示已有静态或动态 route
@@ -165,6 +135,12 @@ const schedulerSystemPrompt = `你是 AgentGo 系统中的调度器（Scheduler�
 - 用户问"系统正常吗" → 看 resources.agents 都在线 + tasks 中没有 failed → 直接答"正常"
 - **永远不要回答"我没有查询这些信息的功能"** —— 你看到这条 system prompt 本身就证明这些数据通道是通的
 
+# 用户澄清与结构化选择
+
+- 只有当答案真正依赖用户偏好，且无法从仓库、Board Snapshot 或已有上下文查证时，才调用 request_user_input。不要把可以自行检查的事实抛回给用户。
+- request_user_input 必须提供 2–8 个互斥、稳定 ID 的选项；它只把 option_id 和可选文本返回当前工具调用。
+- 它不是 Plan 或 Shell 的特权控制通道。plan_review / plan_pause 由系统创建的 Interaction 处理；灰名单命令仍必须经 run_shell 的精确授权 Interaction。不得从普通聊天文本猜测或代替用户做这些决定。
+
 # 决策三选一（每次收到用户输入先走这一步）
 
 # 动态 DAG 与正式验收纪律
@@ -178,7 +154,7 @@ const schedulerSystemPrompt = `你是 AgentGo 系统中的调度器（Scheduler�
 - 收到 acceptance_completed 或 acceptance Task 终态时先读 plan.latest_acceptance：FAIL/BLOCKED/DISPUTED 根据 criterion_results、failure_fingerprints 和 recommended_actions 调整图；PASS 仍需确认对应 runner Task 已 completed 再调用 finalize_plan。若 run_status 是 runner_completed_without_result / runner_failed / runner_cancelled / runner_blocked 且 result_id 为空，说明旧 runner 已终态但没有提交正式结果；runner_failed_after_result / runner_cancelled_after_result / runner_blocked_after_result 或 publish_abandoned_on_recovery / runner_missing_on_recovery / runner_missing_after_result_on_recovery 也不能用于 finalize。以上状态都应重新调用 ensure_acceptance_run 创建新 runner。需要核验完整证据时，以 result_id 调 get_acceptance_evidence。latest_acceptance 缺失表示没有当前图可用的正式结果，不能拿旧结果收尾。
 - define_acceptance_spec 的 Criterion：source 只能是 user/project/scheduler，必须省略系统保留的 builtin ID/source/BuiltinHardRule；scope 只能是 task/milestone/plan，check 只能是 command_exit/file_hash/task_status/evidence/manual。command_exit/file_hash/task_status 的 target 必填；command_exit expected 是规范的 0..255 十进制整数；task_status expected 只能是 pending/processing/completed/cancelled/failed/blocked。不要自造枚举。command_exit 示例：[{"id":"tests","description":"测试通过","source":"scheduler","required":true,"scope":"plan","check":"command_exit","target":"go test ./...","expected":"0"}]。
 - 当前 revision/digest/spec 的 AcceptanceRun 为 pending/running 或已有 valid PASS 时，write_file/edit_file/run_shell 会被冻结；若仍需修改，先调整 DAG 或增强 AcceptanceSpec 使旧 Run 失效，再让执行节点修改并重新验收。不要反复尝试被冻结的工作区工具。
-- 空 Plan 可直接回答闲聊和只读问题；一旦成功调用 write_file、edit_file 或 run_shell，就必须把执行工作纳入 Task-backed DAG 并走正式验收，不能用自然文本或 report_done 绕过。
+- 空 Plan 可直接回答闲聊和只读问题；一旦成功调用 write_file、edit_file 或 run_shell，就必须把执行工作纳入 Task-backed DAG 并走正式验收，不能用自然文本或 report_done 绕过（topo=solo 时例外：亲自执行的写操作不要求正式验收，见文末"工作模式"段）。
 - Plan 进入终态后的最后一轮会自动隐藏全部工具，只用于向用户汇报冻结结果。
 - 不得为了 PASS 删除用户标准。预算耗尽或连续无进展时 Plan 会挂起；向用户说明三种选择：限额继续、CONVERGE 收敛交付、终止。
 - Reactor 只能 request_replan，不能直接修改计划内 DAG；AgentType/event_type 不参与 DAG 唤醒权限判断。
@@ -207,6 +183,7 @@ const schedulerSystemPrompt = `你是 AgentGo 系统中的调度器（Scheduler�
 - run_shell：直接执行命令（推荐保留给 worker，但有权限）
 - web_search / web_fetch：直接查网页
 - send_message：向指定代理发送结构化消息
+- request_user_input：向用户提出 2–8 项结构化选择并等待回答（只用于普通澄清）
 
 加上调度专属工具：
 - publish_task：发布新任务到公告板，由代理认领执行
@@ -365,14 +342,28 @@ publish_task 每次调用创建一个任务；同一轮 reactLoop 可以批量�
 - 没有 **pending_downstream_tasks** 时**不要**调用 report_progress，那会显得啰嗦
 - report_progress 只汇报进度，不会终止 reactLoop；计划内最终收尾只能由正式 PASS + finalize_plan 完成
 
-# 工作模式
+# 工作模式（三轴正交，可任意组合）
 
+快照中的 mode / exec_mode / topo_mode 三个字段共同描述系统当前模式，三轴相互独立：
+
+**mode（规划门控轴）**：
 - **immediate**（默认）：收到用户输入后直接走决策树。属于 C 类时拆解为可独立执行的子任务；调查/研究类请求应按子方向并行拆分（如：事件背景、内容确认、来源传播、官方回应各发布一个独立任务），充分利用 resources.available_workers 实现并行执行。
 - **plan**：
   1. 第一步先从快照选择一个已存在、能力足够的只读调查 route；如果不存在，则从 agent_templates provision 合适的调查 Team（通常是 builtin/explorer@1），使用返回的 event_type 发布探索任务
-  2. 必须等待所有探索任务完成并查看结果后，才能选择能力足够的执行 route；如果不存在，则 provision 合适的执行 Team（通常是 builtin/generalist@1），使用返回的 event_type 发布执行任务
-  3. 在探索任务尚未完成期间，禁止发布任何执行任务
-  4. 不得假设 event_type="explore" 或 event_type="" 一定存在；每次以当前快照和 provision 返回值为准
+  2. 必须等待所有探索任务完成并查看结果后，把执行计划写成 markdown 文本（任务分解 / 预期产物 / 执行顺序），调用 submit_plan_for_review 提交给用户审阅，然后结束当前回合等待——系统会把当前 Plan 挂起为 paused_awaiting_decision 并创建结构化 Interaction
+  3. **用户通过 Interaction 做出选择前禁止发布任何执行类任务**（implementation 节点）；用户选择执行后，系统会以一个携带已审阅计划文本的新 controller 任务唤醒你，届时再选择能力足够的执行 route（不存在则 provision 合适的执行 Team，通常是 builtin/generalist@1），严格按用户选择执行的计划 publish_task 派发执行
+  4. 用户拒绝后 Plan 进入终态，不得再以任何形式派发该请求的执行任务；探索任务尚未完成期间同样禁止发布执行任务
+  5. 不得假设 event_type="explore" 或 event_type="" 一定存在；每次以当前快照和 provision 返回值为准
+
+**exec_mode（执行权限轴）**：当前处于 normal / strict / readonly / yolo 之一，仅陈述系统所处的执行权限模式。
+
+**topo_mode（编排拓扑轴）**：
+- **team**（默认）：多代理协作，按"决策三选一"处理——C 类任务用 publish_task 委派给合适的 route。
+- **solo**：你是系统中唯一的执行者，没有其它代理会认领任务。此时：
+  1. **禁止调用 publish_task 派发子任务**——系统会拦截并拒绝该调用，重试只会浪费轮次；
+  2. 所有工作（读文件、写文件、跑命令、查网页）都由你用已有工具亲自完成；
+  3. 收尾：solo 下没有 verifier route，你亲自完成的写文件/跑命令**不要求正式验收**——只要没有建立任何执行节点，完成后直接自然语言汇报，或调 report_done 收尾；系统会把这种 Plan 按"无验收运行"终态化。此条优先于上文"写操作必须正式验收 + finalize_plan"的通用纪律（那条只适用于 team）；
+  4. 不要 provision_agent_team 组队，也不要等待任何其它代理——runner 空转是 solo 的正常现象。
 
 # 与代理的协作
 
@@ -422,7 +413,7 @@ func (t *storeBatchTracker) AppendBatch(childTaskID string) error {
 // 启动时调用方应：
 //   - 启动 Bundle.Agent.Run(ctx)（poll-based ReAct 循环）
 //   - 启动 Bundle.Activator.Run(ctx)（EventCh 桥）
-//   - CLI 通过 Bundle.Mode 切换 plan/immediate 模式
+//   - CLI /mode 通过 Bundle.Modes 切换 gate 轴（immediate/plan）
 type Bundle struct {
 	// Agent 是 scheduler 一等代理实例（agent.Agent）。
 	// EventType="__scheduler__"，poll Activator publish 的 scheduler task。
@@ -433,9 +424,10 @@ type Bundle struct {
 	// BatchUpdateCh 信号。
 	Activator *Activator
 
-	// Mode 是 scheduler 的 mode 持有者。CLI /mode 命令通过它切换 immediate/plan，
-	// SchedulerExecutor 在注入 board snapshot 时读它。
-	Mode *ModeStore
+	// Modes 是三轴模式 store（internal/modes），由 bootstrap 按 config 构造后注入。
+	// CLI /mode 命令只切换其中的 gate 轴（immediate/plan）；
+	// SchedulerExecutor 在注入 board snapshot 时读取三轴快照写入 JSON。
+	Modes *modes.Store
 
 	// History 是本会话的用户输入历史。Activator 写入，SchedulerExecutor 在
 	// 注入 board snapshot 时读取。暴露在 Bundle 上方便测试 / 未来 CLI 也能查询。
@@ -456,7 +448,7 @@ type Bundle struct {
 //
 //   - SchedulerGroup（cancel_task / report_done）
 //
-// 参数与 worker.NewWithID 对称（roster / approvalCh / hook 三件套均需要），方便
+// 参数与 runner.New 对称（roster / Interaction / Gate 等共享依赖），方便
 // bootstrap 复用 wiring。
 func New(
 	s store.TaskStore,
@@ -466,7 +458,7 @@ func New(
 	cfg *config.Config,
 	cancelReg *store.TaskCancelRegistry,
 	mbRegistry *mailbox.Registry,
-	approvalCh chan<- shell.ApprovalRequest,
+	interactions *interaction.Service,
 	gateReg *gate.Registry,
 	storeView store.StoreHookView,
 	recordToolCall func(string, store.ToolCallRecord),
@@ -476,12 +468,18 @@ func New(
 	memoryStore memory.Store,
 	userOutput io.Writer,
 	resultOutput io.Writer,
+	modeStore *modes.Store,
 	planCoordinators ...*plan.Coordinator,
 ) *Bundle {
 	schedID := "scheduler-" + uuid.New().String()[:8]
 	var planCoordinator *plan.Coordinator
 	if len(planCoordinators) > 0 {
 		planCoordinator = planCoordinators[0]
+	}
+	// modeStore 为 nil 时回落全默认三轴（immediate/normal/team）——
+	// 生产路径由 bootstrap 按 config 构造后注入，nil 只出现在单测。
+	if modeStore == nil {
+		modeStore = modes.DefaultStore()
 	}
 
 	// Holder + BatchTracker：scheduler agent 的"当前任务上下文"工具
@@ -510,12 +508,19 @@ func New(
 	if agentRegistry != nil {
 		routeValidator = agentRegistry
 	}
-	// 审批等待钩子：把 shell 审批的阻塞窗口映射到 scheduler agent 状态机
-	// （processing ↔ waiting_approval）。agent 在工具注册之后才构造，
+	// Interaction 等待钩子：把 shell 人工决策的阻塞窗口映射到 scheduler 状态机
+	// （processing ↔ waiting_interaction）。agent 在工具注册之后才构造，
 	// 闭包延迟解引用——钩子只在工具执行期触发，届时 a 必定已赋值。
 	var a *agent.Agent
-	approvalWaitHook := func(waiting bool) {
-		agent.SetApprovalWaitState(a, holder.Get(), waiting)
+	interactionWaitHook := func(waiting bool) {
+		agent.SetInteractionWaitState(a, holder.Get(), waiting)
+	}
+	// 当前 Session 归属闭包：ShellGroup / MetaGroup / 写工具审批包装共用一份。
+	interactionSessionID := func() string {
+		if interactions == nil {
+			return ""
+		}
+		return interactions.CurrentSessionID()
 	}
 	tools.RegisterGroups(toolReg,
 		readGroup,
@@ -527,21 +532,26 @@ func New(
 		},
 		tools.WebGroup{Provider: searchProvider},
 		tools.ShellGroup{
-			Workdir:          workdir,
-			TimeoutSec:       cfg.ShellTimeoutSec,
-			ApprovalCh:       approvalCh,
-			AgentID:          schedID,
-			ApprovalWaitHook: approvalWaitHook,
+			Workdir:             workdir,
+			TimeoutSec:          cfg.ShellTimeoutSec,
+			Interactions:        interactions,
+			SessionID:           interactionSessionID,
+			AgentID:             schedID,
+			Modes:               modeStore,
+			InteractionWaitHook: interactionWaitHook,
 		},
 		tools.MetaGroup{
-			Store:              s,
-			Holder:             nil, // scheduler 模式：无 depth 限制
-			LineageHolder:      holder,
-			MBRegistry:         mbRegistry,
-			AgentID:            schedID,
-			BatchTracker:       batchTracker,
-			PlanMutationSource: "scheduler",
-			RouteValidator:     routeValidator,
+			Store:               s,
+			Holder:              nil, // scheduler 模式：无 depth 限制
+			LineageHolder:       holder,
+			MBRegistry:          mbRegistry,
+			AgentID:             schedID,
+			Interactions:        interactions,
+			SessionID:           interactionSessionID,
+			InteractionWaitHook: interactionWaitHook,
+			BatchTracker:        batchTracker,
+			PlanMutationSource:  "scheduler",
+			RouteValidator:      routeValidator,
 		},
 		tools.SchedulerGroup{
 			Store:                s,
@@ -552,6 +562,7 @@ func New(
 			UserOutput:           userOutput,
 			ResultOutput:         resultOutput,
 			PlanCoordinator:      planCoordinator,
+			Modes:                modeStore, // report_done 按 topo 轴判定 solo 收尾放宽
 		},
 		tools.PlanControlGroup{
 			Coordinator:    planCoordinator,
@@ -559,12 +570,27 @@ func New(
 			Holder:         holder,
 			AgentID:        schedID,
 			RouteValidator: routeValidator,
+			Modes:          modeStore, // submit_plan_for_review 按 gate 轴决定是否挂起
 		},
 		tools.AgentTemplateGroup{
 			Catalog: templateCatalog, Provisioner: templateProvisioner,
 			Coordinator: planCoordinator, Store: s, Holder: holder,
 		},
 	)
+
+	// solo 编排强制层（v5 三轴 topo）：topo=solo 时拦截 scheduler 的 publish_task，
+	// 这是 prompt 指引之外的硬约束。包装只作用于 scheduler 自己的 registry——
+	// runner 的 publish_task 与所有 send_message 均不受影响。
+	// modeStore 已在上方 nil 回落为 DefaultStore，此处直接可用。
+	toolReg.WrapHandler("publish_task", wrapPublishTaskForSolo(modeStore))
+
+	// strict 执行权限强制层（v5 三轴 exec）：exec=strict 时 scheduler 的
+	// write_file / edit_file 逐次创建 file_write 审批 Interaction——solo 拓扑下
+	// scheduler 会亲自写文件，strict 必须覆盖这条路径；其它档位透传。
+	// 与 runner.New 内同款装配对称（同一 modeStore 实例由 bootstrap 注入）。
+	writeApprover := tools.NewFileWriteApprover(modeStore, interactions, interactionSessionID, schedID, interactionWaitHook)
+	toolReg.WrapHandler("write_file", writeApprover.WrapHandler("write_file"))
+	toolReg.WrapHandler("edit_file", writeApprover.WrapHandler("edit_file"))
 
 	// 标准 LLM Executor（hook + storeView + recordToolCall 三件套与 worker 一致）
 	innerExec := agent.NewLLMExecutor(llmClient, toolReg, gateReg, storeView, recordToolCall, "", schedulerSystemPrompt)
@@ -576,7 +602,6 @@ func New(
 	// 消费者，必须先改为广播语义（每消费者独立 channel 或 sync.Cond），
 	// 否则新增消费者可能与现有等待者互相吞掉信号。
 	batchUpdateCh := make(chan struct{}, 1)
-	modeStore := NewModeStore()
 	sessionHistory := NewSessionHistory(0) // 默认容量 16
 	schedExec := &SchedulerExecutor{
 		Inner:           innerExec,
@@ -584,8 +609,8 @@ func New(
 		Cfg:             cfg,
 		BatchUpdateCh:   batchUpdateCh,
 		WaitTimeout:     30 * time.Second,
-		Mode:            modeStore.modeString(), // 初始 mode；ModeStore 后续切换由 SchedulerExecutor 在 Execute 内重读
-		ModeStore:       modeStore,
+		Mode:            modeStore.GetGate().String(), // 初始 gate 轴；Modes 后续切换由 SchedulerExecutor 在 Execute 内重读
+		Modes:           modeStore,
 		MBRegistry:      mbRegistry,
 		Roster:          r,
 		History:         sessionHistory,
@@ -594,12 +619,25 @@ func New(
 		PlanCoordinator: planCoordinator,
 	}
 
+	maxLoops := cfg.Scheduler.AgentMaxLoops
+	if maxLoops <= 0 {
+		maxLoops = schedulerMaxLoops
+	}
+	compactThreshold := cfg.Scheduler.EnforceCompactTokenThreshold
+	if compactThreshold <= 0 {
+		compactThreshold = config.DefaultSchedulerCompactTokenThreshold
+	}
+	contextLimit := cfg.Scheduler.ContextLimit
+	if contextLimit <= 0 {
+		contextLimit = config.DefaultSchedulerContextLimit
+	}
+
 	// 构造 agent
 	a = agent.NewAgent(
 		schedID,
 		"__scheduler__", // 仅认领 EventType=__scheduler__ 的任务（由 Activator publish）
 		s, r, schedExec.Execute,
-		schedulerMaxLoops, // v4 §11.5.5：scheduler 行为参数为内置常量
+		maxLoops,
 	)
 	a.CancelRegistry = cancelReg
 	a.MaxRetries = schedulerMaxRetries // 有限重试——见常量注释（2026-04-25 改）
@@ -609,8 +647,11 @@ func New(
 	// daemon，因此保持硬编码 0（永不空闲退出）。配置值只作用于
 	// 由 runner.New 构造的任务执行类 agent。
 	a.IdleThreshold = 0 // 永不空闲退出（预制代理）
-	// CompactTokenThreshold / CompactKeepRecent 不再从 cfg 读——v4 §11.5.5 把
-	// scheduler 行为参数全部内置；agent.processTask 自带 fallback（80000 / 3）。
+	// Scheduler 与普通 runner 共用 Agent.processTask 的三层历史治理；YAML
+	// 现在可以覆盖软压缩阈值与硬截断预算。CompactKeepRecent 仍保持 Agent
+	// 层默认 3，避免暴露会破坏最近 tool-call 配对的低层参数。
+	a.CompactTokenThreshold = compactThreshold
+	a.ContextLimit = contextLimit
 	a.TransferNoteMaxTokens = cfg.TransferNoteMaxTokens
 	a.OnTaskStart = func(taskID string) { holder.Set(taskID) }
 	a.OnTaskEnd = func(taskID string, success bool) { holder.Set("") }
@@ -635,7 +676,7 @@ func New(
 	return &Bundle{
 		Agent:         a,
 		Activator:     activator,
-		Mode:          modeStore,
+		Modes:         modeStore,
 		History:       sessionHistory,
 		SchedulerExec: schedExec,
 	}

@@ -11,6 +11,7 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
+	"agentgo/internal/modes"
 	"agentgo/internal/plan"
 	"agentgo/internal/store"
 )
@@ -235,6 +236,96 @@ func TestSchedulerGroup_ReportDone_ClosesUntouchedPlan(t *testing.T) {
 	p, err := coordinator.Store().GetPlan(schedTask.PlanID)
 	if err != nil || p.Status != model.PlanStatusCompletedNoExecution {
 		t.Fatalf("untouched Plan remained live: plan=%+v err=%v", p, err)
+	}
+}
+
+// newDirectWriteFixture 构造"controller 亲自写文件后 report_done"的公共测试现场：
+// scheduler task 带 controller 角色与 artifacts 事实，Plan 已 Create 且 running。
+func newDirectWriteFixture(t *testing.T) (*schedTestStore, *model.Task, *plan.Coordinator) {
+	t.Helper()
+	s := newSchedTestStore()
+	schedTask := &model.Task{Description: "user request", EventType: "__scheduler__", NodeRole: model.PlanNodeRoleController}
+	s.PublishTask(schedTask)
+	schedTask.PlanID = schedTask.ID
+	schedTask.Artifacts = []string{"changed.txt"} // controller 亲自写文件的事实
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+	if _, err := coordinator.Create(context.Background(), plan.CreateInput{
+		PlanID: schedTask.PlanID, RootTaskID: schedTask.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return s, schedTask, coordinator
+}
+
+// TestSchedulerGroup_ReportDone_SoloDirectWriteSkipsFormalAcceptance 验证
+// topo=solo 且 Plan 无 implementation 节点时，controller 亲自执行的写操作
+// 不再要求正式验收：report_done 走"无验收运行"收尾，Plan 终态化。
+func TestSchedulerGroup_ReportDone_SoloDirectWriteSkipsFormalAcceptance(t *testing.T) {
+	s, schedTask, coordinator := newDirectWriteFixture(t)
+	g := SchedulerGroup{Store: s, Holder: &fakeHolder{id: schedTask.ID}, PlanCoordinator: coordinator,
+		Modes: modes.NewStore(modes.GateImmediate, modes.ExecNormal, modes.TopoSolo)}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	out, err := reg.Dispatch(context.Background(), mkCall("report_done", map[string]any{"summary": "已写入 changed.txt"}))
+	if err != nil {
+		t.Fatalf("solo 亲自写文件后 report_done 应放行: %v", err)
+	}
+	if !strings.Contains(out, "已向用户报告完成") {
+		t.Errorf("expected success acknowledgment, got %q", out)
+	}
+	p, err := coordinator.Store().GetPlan(schedTask.PlanID)
+	if err != nil || p.Status != model.PlanStatusCompletedNoExecution {
+		t.Fatalf("solo 写操作 Plan 应以 completed_no_execution 终态化: plan=%+v err=%v", p, err)
+	}
+}
+
+// TestSchedulerGroup_ReportDone_TeamDirectWriteStillRequiresFormalAcceptance 是
+// team 回归测试：同样的写操作事实，topo=team（显式 team store）时 report_done
+// 仍必须被正式验收要求拒绝，且 Plan 保持 running。
+func TestSchedulerGroup_ReportDone_TeamDirectWriteStillRequiresFormalAcceptance(t *testing.T) {
+	s, schedTask, coordinator := newDirectWriteFixture(t)
+	g := SchedulerGroup{Store: s, Holder: &fakeHolder{id: schedTask.ID}, PlanCoordinator: coordinator,
+		Modes: modes.NewStore(modes.GateImmediate, modes.ExecNormal, modes.TopoTeam)}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("report_done", map[string]any{"summary": "premature"}))
+	if err == nil || !strings.Contains(err.Error(), "尚未依据最新正式验收进入终态") {
+		t.Fatalf("team 亲自写文件后 report_done 应被拒绝: err=%v", err)
+	}
+	p, err := coordinator.Store().GetPlan(schedTask.PlanID)
+	if err != nil || p.Status != model.PlanStatusRunning {
+		t.Fatalf("team 下 Plan 不应被收尾: plan=%+v err=%v", p, err)
+	}
+}
+
+// TestSchedulerGroup_ReportDone_SoloResidualNodeNotRelaxed 覆盖异常残留边界：
+// topo=solo 但 Plan 里存在 implementation 节点时，不走放宽路径，仍要求正式验收。
+func TestSchedulerGroup_ReportDone_SoloResidualNodeNotRelaxed(t *testing.T) {
+	s, schedTask, coordinator := newDirectWriteFixture(t)
+	// 异常残留：solo 下本不该出现的 implementation 节点
+	work := &model.Task{ID: "work-1", Description: "implemented", PlanID: schedTask.PlanID, NodeRole: model.PlanNodeRoleImplementation}
+	s.PublishTask(work)
+	if _, err := coordinator.RegisterTask(context.Background(), plan.RegisterTaskInput{
+		PlanID: schedTask.PlanID, ObservedRevision: 0,
+		Node: model.PlanNode{TaskID: work.ID, Title: work.Description, Status: model.TaskStatusCompleted, Role: model.PlanNodeRoleImplementation},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	g := SchedulerGroup{Store: s, Holder: &fakeHolder{id: schedTask.ID}, PlanCoordinator: coordinator,
+		Modes: modes.NewStore(modes.GateImmediate, modes.ExecNormal, modes.TopoSolo)}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("report_done", map[string]any{"summary": "premature"}))
+	if err == nil || !strings.Contains(err.Error(), "尚未依据最新正式验收进入终态") {
+		t.Fatalf("solo 但残留 implementation 节点时 report_done 应被拒绝: err=%v", err)
+	}
+	p, err := coordinator.Store().GetPlan(schedTask.PlanID)
+	if err != nil || p.Status != model.PlanStatusRunning {
+		t.Fatalf("残留节点场景 Plan 不应被收尾: plan=%+v err=%v", p, err)
 	}
 }
 

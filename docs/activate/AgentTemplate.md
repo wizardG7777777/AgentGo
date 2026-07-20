@@ -145,7 +145,7 @@ flowchart LR
 
 如果没有已运行且工具匹配的验收 route，Scheduler 使用稳定 purpose `formal_acceptance` 从 `builtin/verifier@1` provision 单副本 runner。它获得真实 route 后再创建与 `AcceptanceRun` 绑定的 acceptance Task；后续验收优先复用该 ready Team。
 
-`builtin/verifier@1` 不授予 AgentGo 的文件写/编辑工具，但 `run_shell` 不是只读沙箱；“不修改被验收对象”仍由 prompt 约束和命令审批边界保障，不应解读为 OS 级强隔离。控制面会硬校验 `submit_acceptance_result`，并为 `command_exit` / `file_hash` 分别推导 `run_shell` / `read_file`；`evidence` / `manual` 等无法从 schema 确定推导的工具仍由 Scheduler 根据标准语义选型。
+`builtin/verifier@1` 不授予 AgentGo 的文件写/编辑工具，但 `run_shell` 不是只读沙箱；“不修改被验收对象”仍由 prompt 约束和 Shell 命令策略保障，不应解读为 OS 级强隔离。灰名单命令会创建与原 command、matched pattern、working directory、AgentID 和 TaskID 精确绑定的 `shell_command` Interaction，只有 `allow_once` / `allow_session` 的受信任路径才执行原调用。控制面会硬校验 `submit_acceptance_result`，并为 `command_exit` / `file_hash` 分别推导 `run_shell` / `read_file`；`evidence` / `manual` 等无法从 schema 确定推导的工具仍由 Scheduler 根据标准语义选型。
 
 项目可以提供更专业的 verifier 模板，但模板只能改变“由谁、用什么工具执行检查”，不能改变以下控制面事实：
 
@@ -168,7 +168,7 @@ flowchart LR
 
 已经进入终态的 Plan 会先把所属 TeamSpec 标记为 stopped，不参与 live Team 的 digest/容量恢复；运行中 Plan 的 ready Team 必须全部通过校验后才统一安装 route，避免只恢复半支团队。
 
-这种恢复语义保存的是“当时批准的能力定义”，而不是进程内 goroutine。Team ID、私有 route、Plan、模板 ref 与 digest 是持久身份；Agent instance ID 可由 TeamSpec 确定性重建，无需单独保存。
+这种恢复语义保存的是“当时确认的能力定义”，而不是进程内 goroutine。Team ID、私有 route、Plan、模板 ref 与 digest 是持久身份；Agent instance ID 可由 TeamSpec 确定性重建，无需单独保存。
 
 ## 8. v1 验收边界
 

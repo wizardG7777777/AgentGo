@@ -31,10 +31,10 @@ func TestSetState_LegalTransitions(t *testing.T) {
 		to   AgentRuntimeState
 	}{
 		{"idle->processing", AgentStateIdle, AgentStateProcessing},
-		{"processing->waiting_approval", AgentStateProcessing, AgentStateWaitingApproval},
+		{"processing->waiting_interaction", AgentStateProcessing, AgentStateWaitingInteraction},
 		{"processing->terminating", AgentStateProcessing, AgentStateTerminating},
-		{"waiting_approval->processing", AgentStateWaitingApproval, AgentStateProcessing},
-		{"waiting_approval->terminating", AgentStateWaitingApproval, AgentStateTerminating},
+		{"waiting_interaction->processing", AgentStateWaitingInteraction, AgentStateProcessing},
+		{"waiting_interaction->terminating", AgentStateWaitingInteraction, AgentStateTerminating},
 		{"terminating->idle", AgentStateTerminating, AgentStateIdle},
 	}
 	for _, tc := range cases {
@@ -51,14 +51,13 @@ func TestSetState_LegalTransitions(t *testing.T) {
 	}
 }
 
-func TestSetState_WaitingApprovalRejectedReturnsProcessing(t *testing.T) {
-	// ReactiveSystem.md §7.3.6 要求专门护住 rejected 语义：
-	// rejected 只是工具错误结果，agent 必须回到 processing，而不是 terminating。
+func TestSetState_WaitingInteractionResolvedReturnsProcessing(t *testing.T) {
+	// 用户响应只结束等待窗口，agent 必须回到 processing，而不是 terminating。
 	a := &Agent{ID: "a"}
-	a.stateGuard.state = AgentStateWaitingApproval
+	a.stateGuard.state = AgentStateWaitingInteraction
 
-	if err := a.SetState(AgentStateProcessing, "rejected", "task-rejected"); err != nil {
-		t.Fatalf("waiting_approval -> processing with rejected should be legal: %v", err)
+	if err := a.SetState(AgentStateProcessing, "interaction_wait_end", "task-resolved"); err != nil {
+		t.Fatalf("waiting_interaction -> processing after response should be legal: %v", err)
 	}
 	if got := a.CurrentState(); got != AgentStateProcessing {
 		t.Errorf("CurrentState=%s, want processing", got)
@@ -72,11 +71,11 @@ func TestSetState_IllegalTransitions(t *testing.T) {
 		to   AgentRuntimeState
 	}{
 		{"idle->terminating", AgentStateIdle, AgentStateTerminating},
-		{"idle->waiting_approval", AgentStateIdle, AgentStateWaitingApproval},
+		{"idle->waiting_interaction", AgentStateIdle, AgentStateWaitingInteraction},
 		{"processing->idle", AgentStateProcessing, AgentStateIdle},
 		{"terminating->processing", AgentStateTerminating, AgentStateProcessing},
-		{"terminating->waiting_approval", AgentStateTerminating, AgentStateWaitingApproval},
-		{"waiting_approval->idle", AgentStateWaitingApproval, AgentStateIdle},
+		{"terminating->waiting_interaction", AgentStateTerminating, AgentStateWaitingInteraction},
+		{"waiting_interaction->idle", AgentStateWaitingInteraction, AgentStateIdle},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -100,11 +99,11 @@ func TestMustSetState_PanicOnIllegalTransitions(t *testing.T) {
 		to   AgentRuntimeState
 	}{
 		{"idle->terminating", AgentStateIdle, AgentStateTerminating},
-		{"idle->waiting_approval", AgentStateIdle, AgentStateWaitingApproval},
+		{"idle->waiting_interaction", AgentStateIdle, AgentStateWaitingInteraction},
 		{"processing->idle", AgentStateProcessing, AgentStateIdle},
 		{"terminating->processing", AgentStateTerminating, AgentStateProcessing},
-		{"terminating->waiting_approval", AgentStateTerminating, AgentStateWaitingApproval},
-		{"waiting_approval->idle", AgentStateWaitingApproval, AgentStateIdle},
+		{"terminating->waiting_interaction", AgentStateTerminating, AgentStateWaitingInteraction},
+		{"waiting_interaction->idle", AgentStateWaitingInteraction, AgentStateIdle},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -683,48 +682,108 @@ func indexEvent(events []trace.Event, match func(trace.Event) bool) int {
 	return -1
 }
 
+// ── A2：SetInteractionWaitState（用户交互等待 → 状态机桥接）────
 
-// ── A2：SetApprovalWaitState（shell 审批等待钩子 → 状态机桥接）────
-
-func TestSetApprovalWaitState_NilAgentNoop(t *testing.T) {
+func TestSetInteractionWaitState_NilAgentNoop(t *testing.T) {
 	// nil agent 必须是 no-op（构造顺序兜底：工具注册先于 agent 构造），不 panic
-	SetApprovalWaitState(nil, "task-1", true)
-	SetApprovalWaitState(nil, "task-1", false)
+	SetInteractionWaitState(nil, "task-1", true)
+	SetInteractionWaitState(nil, "task-1", false)
 }
 
-func TestSetApprovalWaitState_ProcessingRoundTrip(t *testing.T) {
+func TestSetInteractionWaitState_ProcessingRoundTrip(t *testing.T) {
 	a := &Agent{ID: "w-1"}
 	a.stateGuard.state = AgentStateProcessing
 
-	SetApprovalWaitState(a, "task-1", true)
-	if got := a.CurrentState(); got != AgentStateWaitingApproval {
-		t.Fatalf("等待开始应为 waiting_approval，got %s", got)
+	SetInteractionWaitState(a, "task-1", true)
+	if got := a.CurrentState(); got != AgentStateWaitingInteraction {
+		t.Fatalf("等待开始应为 waiting_interaction，got %s", got)
 	}
-	SetApprovalWaitState(a, "task-1", false)
+	SetInteractionWaitState(a, "task-1", false)
 	if got := a.CurrentState(); got != AgentStateProcessing {
 		t.Fatalf("等待结束应回 processing，got %s", got)
 	}
 }
 
-func TestSetApprovalWaitState_IllegalTransitionIgnored(t *testing.T) {
+func TestSetInteractionWaitState_ParallelWaitersAreReferenceCounted(t *testing.T) {
+	a := &Agent{ID: "w-1"}
+	a.stateGuard.state = AgentStateProcessing
+
+	SetInteractionWaitState(a, "task-1", true)
+	SetInteractionWaitState(a, "task-1", true)
+	if got := a.CurrentState(); got != AgentStateWaitingInteraction {
+		t.Fatalf("两个等待者进入后应为 waiting_interaction，got %s", got)
+	}
+
+	SetInteractionWaitState(a, "task-1", false)
+	if got := a.CurrentState(); got != AgentStateWaitingInteraction {
+		t.Fatalf("首个等待者退出时仍有等待者，不得过早恢复，got %s", got)
+	}
+
+	SetInteractionWaitState(a, "task-1", false)
+	if got := a.CurrentState(); got != AgentStateProcessing {
+		t.Fatalf("最后一个等待者退出后应恢复 processing，got %s", got)
+	}
+}
+
+func TestSetInteractionWaitState_EmitsGenericCauses(t *testing.T) {
+	tmpDir := t.TempDir()
+	w, err := trace.NewWriter(tmpDir, 100)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	originalDefault := trace.Default()
+	trace.SetDefault(w)
+	t.Cleanup(func() { trace.SetDefault(originalDefault) })
+
+	a := &Agent{ID: "w-1"}
+	a.stateGuard.state = AgentStateProcessing
+	SetInteractionWaitState(a, "task-interaction", true)
+	SetInteractionWaitState(a, "task-interaction", false)
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	var got []trace.Event
+	for _, ev := range readAllStateEvents(t, tmpDir) {
+		if ev.Kind == trace.KindAgentStateChanged && ev.TaskID == "task-interaction" {
+			got = append(got, ev)
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("状态事件数 = %d，期望 2", len(got))
+	}
+	want := []struct{ prev, next, cause string }{
+		{"processing", "waiting_interaction", "interaction_wait_start"},
+		{"waiting_interaction", "processing", "interaction_wait_end"},
+	}
+	for i, expected := range want {
+		tr := got[i].Transition
+		if tr == nil || tr.PrevState != expected.prev || tr.NewState != expected.next || tr.Cause != expected.cause {
+			t.Errorf("event[%d] transition=%+v，期望 %s -> %s (%s)", i, tr, expected.prev, expected.next, expected.cause)
+		}
+	}
+}
+
+func TestSetInteractionWaitState_IllegalTransitionIgnored(t *testing.T) {
 	// best-effort：idle 状态下收到等待钩子（如任务已取消的竞态）只记日志，
 	// 不 panic、不改变状态
 	a := &Agent{ID: "w-1"}
 	a.stateGuard.state = AgentStateIdle
 
-	SetApprovalWaitState(a, "task-1", true)
+	SetInteractionWaitState(a, "task-1", true)
 	if got := a.CurrentState(); got != AgentStateIdle {
 		t.Errorf("非法转换应被忽略，状态保持 idle，got %s", got)
 	}
 }
 
-func TestSetApprovalWaitState_EndWhileProcessingSelfLoop(t *testing.T) {
+func TestSetInteractionWaitState_EndWhileProcessingSelfLoop(t *testing.T) {
 	// 等待结束钩子落在 processing 上（如等待开始钩子曾被非法忽略）：
 	// 自循环合法 no-op，状态不变
 	a := &Agent{ID: "w-1"}
 	a.stateGuard.state = AgentStateProcessing
 
-	SetApprovalWaitState(a, "task-1", false)
+	SetInteractionWaitState(a, "task-1", false)
 	if got := a.CurrentState(); got != AgentStateProcessing {
 		t.Errorf("自循环应为 no-op，状态保持 processing，got %s", got)
 	}

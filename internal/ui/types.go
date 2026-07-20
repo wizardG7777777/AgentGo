@@ -1,25 +1,75 @@
 // Package ui 是 UI Hub：前端无关的控制 / 观测层。
 //
-// 它把系统运行状态（代理卡片、任务看板、待审批、模式、Session）聚合为一份
+// 它把系统运行状态（代理卡片、任务看板、待交互请求、模式、Session）聚合为一份
 // 快照，并以 Update 流的形式扇出给任意数量的前端订阅者（现有 Bubble Tea
 // TUI、未来的 Web GUI）。控制面（发用户输入、取消任务、steer、切模式、
-// 切 Session、审批回复、退出）通过 Controller 接口暴露。
+// 切 Session、Interaction 回答、退出）通过 Controller 接口暴露。
 //
 // 所有环境耦合都经由 Deps 注入的函数 / 通道进入本包；本包不感知
 // Bubble Tea，也不感知 bootstrap 装配细节。
 //
 // 导入方向约束：本包只允许依赖 model / store / mailbox / scheduler /
-// session / shell / output / tools / trace；严禁导入 internal/tui 与
+// session / shell / output / tools / trace / modes；严禁导入 internal/tui 与
 // internal/bootstrap（后两者反向依赖本包）。
 package ui
 
 import (
 	"time"
 
+	"agentgo/internal/interaction"
 	"agentgo/internal/model"
 	"agentgo/internal/output"
 	"agentgo/internal/session"
 )
+
+// InteractionResult 是前端提交回答后可见的最小结果。
+// 它故意不包含 Options/ActionRef、Resolution、Metadata 或完整 Response，
+// 避免新前端把进程内部 Request 对象直接序列化后泄漏服务端路由。
+type InteractionResult struct {
+	ID      string            `json:"request_id"`
+	Version int64             `json:"version"`
+	State   interaction.State `json:"state"`
+}
+
+// ResultItem 是最近一次用户可见任务结果的前端安全快照。它与实时的
+// output.KindResult 使用同一正文，但保留在 Snapshot 中，确保前端晚订阅、
+// SSE 重连或页面刷新后仍能拿到明确回复，而不是只剩日志流。
+type ResultItem struct {
+	AgentID string `json:"agent_id,omitempty"`
+	Text    string `json:"text"`
+}
+
+// FeedOutput is a frontend-safe, recoverable output record. Unlike the live
+// output.Event transport value it carries an explicit timestamp and a stable
+// string kind so Web/TUI snapshots can rebuild per-agent workbenches after a
+// reconnect without replaying edge-triggered updates.
+type FeedOutput struct {
+	Kind     string    `json:"kind"` // "result" | "text" | "stream"
+	AgentID  string    `json:"agent_id,omitempty"`
+	TaskID   string    `json:"task_id,omitempty"`
+	StreamID string    `json:"stream_id,omitempty"`
+	Loop     int       `json:"loop,omitempty"`
+	Text     string    `json:"text"`
+	Done     bool      `json:"done,omitempty"`
+	Error    string    `json:"error,omitempty"`
+	At       time.Time `json:"at"`
+}
+
+// LogItem is a raw diagnostic log record. Logs intentionally stay separate
+// from conversation output; frontends expose them only in diagnostic views.
+type LogItem struct {
+	Text string    `json:"text"`
+	At   time.Time `json:"at"`
+}
+
+// FeedSnapshot is the bounded process-live event window shared by all
+// frontends. Trace JSONL remains the durable forensic source of truth; this
+// snapshot exists to make UI reconnects and per-agent workbenches self-heal.
+type FeedSnapshot struct {
+	Outputs []FeedOutput `json:"outputs"`
+	Logs    []LogItem    `json:"logs"`
+	Traces  []TraceEvent `json:"traces"`
+}
 
 // UpdateKind 标记一条 Update 的类别。每条 Update 只携带一种载荷，
 // 前端按 Kind 取用对应字段，其余字段为零值。
@@ -33,12 +83,15 @@ const (
 	KindOutputResult
 	// KindOutputText 是普通代理输出（对应 output.KindText）。
 	KindOutputText
+	// KindOutputStream is a replace-in-place snapshot of an in-flight model
+	// answer (corresponding to output.KindStream).
+	KindOutputStream
 	// KindLogLine 是系统日志行（来自 statusCh）。
 	KindLogLine
-	// KindApprovalNew 是新到达的待审批请求。
-	KindApprovalNew
-	// KindApprovalResolved 是审批已了结（批准 / 拒绝 / 指导 / 过期）。
-	KindApprovalResolved
+	// KindInteractionsChanged 携带当前运行时的完整 pending Interaction
+	// 列表。Session 切换不终止任务，故不能隐藏旧 Session 中仍活动的控制点；
+	// 完整替换可在慢前端丢失中间事件后自愈。
+	KindInteractionsChanged
 	// KindAgentsChanged 是轮询快照刷新后的代理 / 任务变更通知。
 	KindAgentsChanged
 	// KindTraceEvent 是 trace 事件流（经 internal/dashboard 的 TraceReactor
@@ -57,12 +110,12 @@ func (k UpdateKind) String() string {
 		return "OutputResult"
 	case KindOutputText:
 		return "OutputText"
+	case KindOutputStream:
+		return "OutputStream"
 	case KindLogLine:
 		return "LogLine"
-	case KindApprovalNew:
-		return "ApprovalNew"
-	case KindApprovalResolved:
-		return "ApprovalResolved"
+	case KindInteractionsChanged:
+		return "InteractionsChanged"
 	case KindAgentsChanged:
 		return "AgentsChanged"
 	case KindTraceEvent:
@@ -75,40 +128,49 @@ func (k UpdateKind) String() string {
 // Update 是 Hub 扇出给订阅者的一条更新。每条更新只携带一种载荷：
 //
 //   - KindSnapshotSync      → Snapshot
-//   - KindOutputResult/Text → Output
+//   - KindOutputResult/Text/Stream → Output
 //   - KindLogLine           → LogLine
-//   - KindApprovalNew       → Approval
-//   - KindApprovalResolved  → Resolved
+//   - KindInteractionsChanged → Interactions（完整 pending 列表）
 //   - KindAgentsChanged     → Agents + Tasks
 //   - KindTraceEvent        → Trace
 type Update struct {
-	Kind     UpdateKind
-	Output   output.Event     // KindOutputResult / KindOutputText
-	LogLine  string           // KindLogLine
-	Approval ApprovalItem     // KindApprovalNew
-	Resolved ApprovalResolved // KindApprovalResolved
-	Agents   []AgentCard      // KindAgentsChanged
-	Tasks    []BoardTask      // KindAgentsChanged
-	Snapshot Snapshot         // KindSnapshotSync
-	Trace    TraceEvent       // KindTraceEvent
-	At       time.Time        // 更新产生时间
+	Kind    UpdateKind
+	Output  output.Event // KindOutputResult / KindOutputText / KindOutputStream
+	LogLine string       // KindLogLine
+	// Interactions 是 KindInteractionsChanged 的完整 pending 列表。
+	Interactions []InteractionItem
+	Agents       []AgentCard // KindAgentsChanged
+	Tasks        []BoardTask // KindAgentsChanged
+	Snapshot     Snapshot    // KindSnapshotSync
+	Trace        TraceEvent  // KindTraceEvent
+	At           time.Time   // 更新产生时间
 }
 
-// ApprovalResolved 是一次审批了结的通知。Outcome 取值见 OutcomeXxx 常量。
-type ApprovalResolved struct {
-	RequestID string `json:"request_id"`
-	Outcome   string `json:"outcome"` // "approved" / "rejected" / "guidance" / "expired"
+// InteractionOption 是领域 Option 的前端安全投影。ActionRef 永不离开服务端。
+type InteractionOption struct {
+	ID           string `json:"id"`
+	Label        string `json:"label"`
+	Description  string `json:"description,omitempty"`
+	RequiresText bool   `json:"requires_text,omitempty"`
 }
 
-// ApprovalItem 是呈现给前端的待审批条目。ReplyCh 不暴露给前端——
-// 回复通道由 Hub 私有持有，前端只能通过 Controller.ResolveApproval 回复。
-type ApprovalItem struct {
-	RequestID  string    `json:"request_id"`
-	TaskID     string    `json:"task_id"`
-	AgentID    string    `json:"agent_id"`
-	Command    string    `json:"command"`
-	Pattern    string    `json:"pattern"`
-	ReceivedAt time.Time `json:"received_at"` // Hub 收到请求的时间
+// InteractionItem 是待用户回答的结构化请求投影。Resolution、ActionRef 与
+// Metadata 都属于受信任控制面，不暴露给前端。
+type InteractionItem struct {
+	ID            string              `json:"id"`
+	Version       int64               `json:"version"`
+	Kind          string              `json:"kind"`
+	Purpose       string              `json:"purpose"`
+	Prompt        string              `json:"prompt"`
+	Options       []InteractionOption `json:"options,omitempty"`
+	AllowFreeText bool                `json:"allow_free_text,omitempty"`
+	SubjectKind   string              `json:"subject_kind,omitempty"`
+	SubjectID     string              `json:"subject_id,omitempty"`
+	PlanID        string              `json:"plan_id,omitempty"`
+	TaskID        string              `json:"task_id,omitempty"`
+	AgentID       string              `json:"agent_id,omitempty"`
+	CreatedAt     time.Time           `json:"created_at"`
+	ExpiresAt     time.Time           `json:"expires_at,omitempty"`
 }
 
 // AgentCard 是单个代理的运行状态卡片。字段与 tui.AgentInfo 完全镜像
@@ -116,7 +178,7 @@ type ApprovalItem struct {
 type AgentCard struct {
 	ID               string    `json:"id"`
 	Type             string    `json:"type"`  // "worker", "explorer", "scheduler"
-	State            string    `json:"state"` // "idle", "processing", "waiting_approval", "terminating"
+	State            string    `json:"state"` // "idle", "processing", "waiting_interaction", "terminating"
 	CurrentTaskID    string    `json:"current_task_id"`
 	CurrentTaskDesc  string    `json:"current_task_desc"`
 	MailboxPending   int       `json:"mailbox_pending"`
@@ -182,15 +244,27 @@ func SessionInfoFromMetadata(m session.Metadata) SessionInfo {
 	}
 }
 
+// PlanReviewItem 是 gate=plan 模式下等待用户批准的计划条目（/plan 列表）。
+// ui 包不允许 import internal/plan，条目由装配方从 PlanStore 投影而来。
+type PlanReviewItem struct {
+	PlanID      string    `json:"plan_id"`
+	SubmittedAt time.Time `json:"submitted_at"`
+	Excerpt     string    `json:"excerpt"` // 计划全文摘要（已按展示长度截断）
+}
+
 // Snapshot 是系统某一时刻的完整状态快照。
 //
 // 快照及其切片发布后即视为只读：Hub 内部对快照采用"整体替换、绝不原地
 // 修改"策略，因此订阅者持有旧快照不会与 Hub 的写入产生数据竞争；
 // 前端也不得修改快照内容。
 type Snapshot struct {
-	Agents           []AgentCard    `json:"agents"`
-	Tasks            []BoardTask    `json:"tasks"`
-	Mode             string         `json:"mode"` // "plan" | "immediate"（由注入的 ModeGet 决定）
-	Session          SessionInfo    `json:"session"`
-	PendingApprovals []ApprovalItem `json:"pending_approvals"`
+	Agents              []AgentCard       `json:"agents"`
+	Tasks               []BoardTask       `json:"tasks"`
+	Mode                string            `json:"mode"`      // "plan" | "immediate"（由注入的 ModeGet 决定）
+	ExecMode            string            `json:"exec_mode"` // "normal" | "strict" | "readonly" | "yolo"（由注入的 ExecModeGet 决定）
+	TopoMode            string            `json:"topo_mode"` // "team" | "solo"（由注入的 TopoModeGet 决定）
+	Session             SessionInfo       `json:"session"`
+	PendingInteractions []InteractionItem `json:"pending_interactions"`
+	LastResult          *ResultItem       `json:"last_result,omitempty"`
+	Feed                FeedSnapshot      `json:"feed"`
 }

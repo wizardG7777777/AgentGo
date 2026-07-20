@@ -14,12 +14,21 @@ const (
 	// KindResult 是任务最终结果块，TUI 渲染为 MsgResult（result 卡片），
 	// 并被记录到 ResultSnapshot 供重启恢复。
 	KindResult
+	// KindStream is an ephemeral, replace-in-place snapshot of an in-flight LLM
+	// answer. Text always contains the complete accumulated answer so slow UI
+	// subscribers may safely drop older snapshots without losing characters.
+	KindStream
 )
 
 // Event 是输出通道上的一条消息。Text 保留完整渲染文本（含 "=== 任务完成 ==="
 // 等展示标记）——标记只是呈现层内容，不再承担分类职责。
 type Event struct {
-	Kind    Kind
-	AgentID string
-	Text    string
+	Kind     Kind
+	AgentID  string
+	Text     string
+	StreamID string
+	TaskID   string
+	Loop     int
+	Done     bool
+	Error    string
 }

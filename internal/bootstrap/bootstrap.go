@@ -19,10 +19,12 @@ import (
 	"agentgo/internal/gate"
 	"agentgo/internal/hook"
 	"agentgo/internal/hook/builtin"
+	"agentgo/internal/interaction"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/memory"
 	"agentgo/internal/model"
+	"agentgo/internal/modes"
 	"agentgo/internal/output"
 	"agentgo/internal/plan"
 	"agentgo/internal/probe"
@@ -54,9 +56,12 @@ type System struct {
 	CancelRegistry  *store.TaskCancelRegistry
 	MailboxRegistry *mailbox.Registry
 	MailNotifier    *mailbox.MailNotifier
-	Scheduler       *scheduler.Bundle // Phase 3：scheduler 现在是 agent.Agent + Activator + ModeStore 的复合
+	Scheduler       *scheduler.Bundle // Phase 3：scheduler 现在是 agent.Agent + Activator + 三轴 modes.Store 的复合
 	PlanStore       *plan.Store
 	PlanCoordinator *plan.Coordinator
+	// Interactions is the authoritative structured human-response service shared
+	// by Plan/Scheduler, Shell and every UI frontend.
+	Interactions *interaction.Service
 	// PlanBatcher 是 C1 的 Task→Plan 变更异步落盘器（单 flusher 合并 fsync）。
 	// Shutdown 必须先 Drain（2s 界）再 Stop，不泄漏 goroutine。
 	PlanBatcher *planMutationBatcher
@@ -65,8 +70,7 @@ type System struct {
 	// 两个 package；详见 nextUpgrade_v4.md §11.6.6）。kind × replicas 实例化在 Bootstrap()
 	// 主流程展开。
 	Runners     []*runner.Runner
-	ApprovalCh  chan shell.ApprovalRequest // 命令审批通道，Worker→UI Hub
-	ArtifactLog *store.ArtifactLog         // Artifacts 持久化日志，Shutdown 时需 Close；nil 表示持久化已禁用
+	ArtifactLog *store.ArtifactLog // Artifacts 持久化日志，Shutdown 时需 Close；nil 表示持久化已禁用
 	// artifactReplay 是启动时从 ArtifactLog 重放出的 taskID→artifacts 映射（F12）。
 	// store 构造时还没有任何任务，立即恢复会全部 miss；由 restoreRuntimeSnapshot
 	// 在 Task 快照导入后消费。RestoreArtifacts 是覆盖式恢复（rebuilt 为完整去重
@@ -80,7 +84,7 @@ type System struct {
 	TeamStore       *team.Store             // fsynced TeamSpec identity store
 	StatusCh        chan string             // TUI 日志/进度消息通道；Bootstrap 创建，UI Hub 消费
 	OutputCh        chan output.Event       // Agent 用户可见输出通道（文本/结果已分类），与日志分离；UI Hub 消费
-	// UIHub 是三个 UI 通道（OutputCh/ApprovalCh/StatusCh）的唯一消费者与
+	// UIHub 是输出、状态与 Interaction 投影的统一消费者与
 	// 前端控制/观测面（ui.Controller + ui.Observer）。TUI（RunCLI）只经它
 	// 与系统交互；无订阅者时 Hub 也常驻排干通道，生产者永不阻塞。
 	UIHub *ui.Hub
@@ -397,15 +401,20 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// v4 时代分立的 ToolHookRegistry / MailboxHookRegistry 在 v5 合并为单一
 	// gate.Registry。impl 仍保留在 internal/hook/builtin/，注册时通过
 	// gate.WrapToolHook / WrapMailboxHook 包装为 gate.Gate。
+	//
+	// 三轴模式 store 提前到此创建：exec-mode-guard Gate 需要注入它做 readonly
+	// 判定；同一实例稍后注入 scheduler（快照消费）与 UI Hub（三轴运行时切换）。
+	modeStore := modes.NewStore(cfg.ResolveModes())
 	gateReg := gate.NewRegistry()
 	var storeView store.StoreHookView = taskStore
 	recordToolCall := func(taskID string, rec store.ToolCallRecord) {
 		_ = taskStore.AppendToolCall(taskID, rec)
 	}
-	// 注册 6 个 Tool 域 Gate（impl 仍是 hook.ToolHook 接口，通过 adapter 包装）。
+	// 注册 7 个 Tool 域 Gate（impl 仍是 hook.ToolHook 接口，通过 adapter 包装）。
 	// 注：v5 Phase 4 起 record-artifact 已迁移为 Reactor（订阅 KindFileWritten），
 	// 不再走 Tool PostCall hook 路径——避免 hook 与 reactor 双写导致 task.Artifacts 重复。
 	for _, h := range []hook.ToolHook{
+		builtin.NewExecModeGuardHook(modeStore),
 		builtin.NewPathBoundaryHook(cfg.ProjectRoot),
 		builtin.NewValidateExpectedHashHook(),
 		builtin.NewRequireReadBeforeWriteHook(storeView),
@@ -417,7 +426,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 			return nil, fmt.Errorf("注册 %s 失败: %w", h.Name(), err)
 		}
 	}
-	log.Println("[启动] Tool 域 Gate 注册完成（path-boundary, validate-expected-hash, validate-line-anchors, require-read-before-write, dependency-validator, enforce-expected-artifacts）")
+	log.Println("[启动] Tool 域 Gate 注册完成（exec-mode-guard, path-boundary, validate-expected-hash, validate-line-anchors, require-read-before-write, dependency-validator, enforce-expected-artifacts）")
 
 	// Step 3: 初始化花名册
 	r := roster.NewMemoryRoster()
@@ -509,7 +518,8 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	_ = historyEventReactor // 计数器在 monitor / debug 路径按需读取
 
 	// Step 4: 创建 scheduler LLM 客户端
-	// scheduler model 优先用 cfg.Scheduler.Model（§11.5.5 仅允许该字段外部覆盖），
+	// scheduler model 优先用 cfg.Scheduler.Model；循环与历史预算稍后由
+	// internal/scheduler.New 从同一 cfg.Scheduler 读取。
 	// 缺省回落 cfg.LLM.DefaultModel。LLM endpoint / api_key / provider 与 worker 共享。
 	schedulerLLM := buildKindLLMClient(cfg.LLM, cfg.Scheduler.Model)
 
@@ -544,7 +554,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	}
 	log.Printf("[启动] Agent 注册表初始化完成（%d 个特化代理）", len(agentRegistry.Specialized()))
 
-	// Step 6: 创建看门狗（先于 scheduler 创建——scheduler 需要 approvalCh，但 watchdog 不需要）
+	// Step 6: 创建看门狗（先于 scheduler 创建）。
 	w := watchdog.New(taskStore, cfg, eventCh, r, mbRegistry, watchdog.NewRuntimeRouteResolver(agentRegistry))
 
 	// Step 6.5: 校验 profile 中的工具名拼写（v4：不再在此预解析 worker/explorer profile，
@@ -591,8 +601,20 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		}
 	}
 
-	// Step 7.5: 创建命令审批通道（Worker→CLI）
-	approvalCh := make(chan shell.ApprovalRequest, 8)
+	currentSessionID := func() string {
+		if sessMgr == nil {
+			return ""
+		}
+		current := sessMgr.Current()
+		if current == nil {
+			return ""
+		}
+		return current.Metadata.SessionID
+	}
+	// Step 7.4: 创建通用人机 Interaction 服务。Plan、Shell 与全部前端
+	// 共享同一个 CAS 状态机；UI 只消费安全投影，不持有回复通道。
+	interactionService := interaction.NewService(interaction.NewMemoryStore(),
+		interaction.WithSessionIDProvider(currentSessionID))
 
 	// Step 4.5: 创建 TUI 双通道（日志与 Agent 输出分离，避免竞争）
 	statusCh := make(chan string, 1024)      // 日志/进度消息
@@ -600,6 +622,12 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	activity := agent.NewActivityTracker()
 	var sys *System
 	outputDone := make(chan struct{})
+	streamOutput := func(ev output.Event) {
+		select {
+		case outputCh <- ev:
+		case <-outputDone:
+		}
+	}
 	// 文本输出 writer：每个 agent 一个（按 agentID 标记来源），共享同一 outputCh。
 	newTextWriter := func(agentID string) *eventWriter {
 		return &eventWriter{ch: outputCh, done: outputDone, kind: output.KindText, agentID: agentID}
@@ -641,8 +669,11 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		CancelRegistry:        cancelRegistry,
 		SearchProvider:        searchProvider,
 		ShellFilter:           shellFilter,
-		ApprovalCh:            approvalCh,
+		Interactions:          interactionService,
+		SessionID:             currentSessionID,
+		Modes:                 modeStore,         // 与 scheduler / UI Hub 同一实例：exec 轴驱动 strict/yolo
 		UserOutput:            newTextWriter(""), // 共享兜底（team/spawn ad-hoc runner）；静态 runner 在下方按实例标记
+		StreamOutput:          streamOutput,
 		TaskEndCallbacks:      taskEndReactor,
 		ProjectRoot:           cfg.ProjectRoot,
 		RosterWaitTimeoutSec:  cfg.Infra.Roster.WaitTimeoutSec,
@@ -688,13 +719,17 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 
 	// Step 5: Scheduler 在 TeamManager 构造后装配，因而模板发现和动态
 	// provision 工具拿到的是同一个 runtime authority。
+	// 三轴模式 store：初值来自 cfg.Modes（缺省 immediate/normal/team），
+	// 已在 Step 2.5 创建（exec-mode-guard Gate 注入）；
+	// 同一实例注入 scheduler（快照消费）与 UI Hub（三轴运行时切换）。
 	sched := scheduler.New(
-		taskStore, r, schedulerLLM, eventCh, cfg, cancelRegistry, mbRegistry, approvalCh,
+		taskStore, r, schedulerLLM, eventCh, cfg, cancelRegistry, mbRegistry, interactionService,
 		gateReg, storeView, recordToolCall, agentRegistry, templateCatalog, teamMgr,
-		memoryStore, newTextWriter("scheduler"), resultWriter, planCoordinator,
+		memoryStore, newTextWriter("scheduler"), resultWriter, modeStore, planCoordinator,
 	)
 	if sched.Agent != nil {
 		sched.Agent.Activity = activity
+		sched.Agent.StreamOutput = streamOutput
 		activity.RegisterAgent(sched.Agent.ID, "scheduler")
 	}
 	sched.SchedulerExec.ToolHealth = toolHealth
@@ -783,10 +818,10 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		Scheduler:           sched,
 		PlanStore:           planStore,
 		PlanCoordinator:     planCoordinator,
+		Interactions:        interactionService,
 		PlanBatcher:         planBatcher,
 		Activity:            activity,
 		Runners:             runners,
-		ApprovalCh:          approvalCh,
 		ReactorRegistry:     reactorReg,
 		AgentTemplates:      templateCatalog,
 		TeamManager:         teamMgr,
@@ -831,7 +866,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		sessMgr.SetOnSwitch(sys.onSessionSwitched)
 	}
 
-	// Step 11: 装配 UI Hub——OutputCh/ApprovalCh/StatusCh 的唯一消费者。
+	// Step 11: 装配 UI Hub——Output/Status 与 Interaction 的统一投影。
 	// 此后 TUI（RunCLI）只经 ui.Controller / ui.Observer 与系统交互，不再
 	// 直持任何系统通道 / 组件。
 	sys.UIHub = sys.buildUIHub()
@@ -852,14 +887,14 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 // buildUIHub 装配 UI Hub 的全部依赖：三个 UI 通道直挂；快照轮询复用
 // buildAgentInfoFn / Store.ScanAll / Mode / SessionMgr；控制面复用
 // sendUserText 的事件投递语义（5 秒超时）、cancelTaskByPrefix（D2）、
-// MailboxRegistry.Send（steer）、ModeStore、System.NewSession/SwitchSession
-// （B3）与根 cancel。
+// MailboxRegistry.Send（steer）、三轴 modes.Store 的运行时切换（/mode）、
+// System.NewSession/SwitchSession（B3）与根 cancel。
 func (s *System) buildUIHub() *ui.Hub {
 	return ui.NewHub(ui.Deps{
-		OutputCh:   s.OutputCh,
-		ApprovalCh: s.ApprovalCh,
-		StatusCh:   s.StatusCh,
-		PollAgents: s.buildAgentInfoFn(),
+		OutputCh:     s.OutputCh,
+		StatusCh:     s.StatusCh,
+		Interactions: s.Interactions,
+		PollAgents:   s.buildAgentInfoFn(),
 		PollBoard: func() []ui.BoardTask {
 			tasks, err := s.Store.ScanAll()
 			if err != nil {
@@ -875,10 +910,14 @@ func (s *System) buildUIHub() *ui.Hub {
 			return board
 		},
 		ModeGet: func() string {
-			if s.Scheduler.Mode.Get() == scheduler.ModePlan {
-				return "plan"
-			}
-			return "immediate"
+			// gate 轴字符串保持兼容（"plan" / "immediate"）。
+			return s.Scheduler.Modes.GetGate().String()
+		},
+		ExecModeGet: func() string {
+			return s.Scheduler.Modes.GetExec().String()
+		},
+		TopoModeGet: func() string {
+			return s.Scheduler.Modes.GetTopo().String()
 		},
 		SessionGet: func() ui.SessionInfo {
 			if s.SessionMgr == nil {
@@ -889,6 +928,13 @@ func (s *System) buildUIHub() *ui.Hub {
 				return ui.SessionInfo{}
 			}
 			return ui.SessionInfoFromMetadata(cur.Metadata)
+		},
+		ResultGet: func() *ui.ResultItem {
+			result := s.resultSnapshot()
+			if result == nil || strings.TrimSpace(result.Text) == "" {
+				return nil
+			}
+			return &ui.ResultItem{AgentID: "scheduler", Text: result.Text}
 		},
 		RecordUserInput: func(text string) {
 			if s.SessionMgr == nil {
@@ -914,10 +960,60 @@ func (s *System) buildUIHub() *ui.Hub {
 			}
 			return cancelTaskByPrefix(ctx, s.Store, s.PlanCoordinator, idPrefix)
 		},
-		SteerSend:     s.MailboxRegistry.Send,
-		ModeSet:       s.Scheduler.Mode.Set,
+		CancelLatestRequest: func() (string, error) {
+			ctx := s.startCtx
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			return cancelLatestActiveRequest(ctx, s.Store, s.PlanCoordinator)
+		},
+		SteerSend: s.MailboxRegistry.Send,
+		// /mode 三轴切换：gate 轴走 ModeSet；exec / topo 轴由 Hub 解析成
+		// 规范化小写串后到这里写回 modes.Store（再解析一次做防御性校验）。
+		ModeSet: s.Scheduler.Modes.SetGate,
+		ExecModeSet: func(mode string) error {
+			m, err := modes.ParseExecMode(mode)
+			if err != nil {
+				return err
+			}
+			s.Scheduler.Modes.SetExec(m)
+			return nil
+		},
+		TopoModeSet: func(mode string) error {
+			m, err := modes.ParseTopoMode(mode)
+			if err != nil {
+				return err
+			}
+			s.Scheduler.Modes.SetTopo(m)
+			return nil
+		},
 		SessionNew:    s.NewSession,
 		SessionSwitch: s.SwitchSession,
+		// /plan 三入口：gate=plan 的 plan_review 挂起由用户经 UI 批准/拒绝；
+		// 批准时由 bootstrap 预发布保留 controller 并恢复 Plan（去 LLM 版的
+		// Interaction response），scheduler agent 随后认领该任务按计划执行。
+		ApprovePlanReview: func(idPrefix string) (string, error) {
+			ctx := s.startCtx
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			return s.respondPlanReviewByPrefix(ctx, idPrefix, "execute_plan")
+		},
+		RejectPlanReview: func(idPrefix string) (string, error) {
+			ctx := s.startCtx
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			return s.respondPlanReviewByPrefix(ctx, idPrefix, "cancel_request")
+		},
+		PendingPlanReviews: func() ([]ui.PlanReviewItem, error) {
+			ctx := s.startCtx
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			return s.pendingPlanReviewsFromInteractions(ctx)
+		},
+		ResolveInteraction: s.resolveInteraction,
 		SessionList: func() ([]ui.SessionInfo, error) {
 			if s.SessionMgr == nil {
 				return nil, fmt.Errorf("session 管理器未初始化")
@@ -945,7 +1041,20 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) error {
 	s.cancel = cancel
 	s.startCtx = ctx
 
-	// Step 4.6: 启动 UI Hub（output/approval/status 三通道唯一消费者；
+	// SIGINT 哨兵最先武装：此后任何状态下（含启动期、TUI 事件循环死锁、
+	// Shutdown 挂死）Ctrl+C 都能终止进程。headless 判定与 RunCLI 保持一致。
+	// shutdownDone 提前初始化交给哨兵：Shutdown 完成即撤防 deadline 定时器
+	//（Shutdown 的懒初始化会复用同一 channel）。
+	s.shutdownInitOnce.Do(func() {
+		s.shutdownDone = make(chan struct{})
+	})
+	startSigSentinel(ctx, cancel, !shouldStartTUI(s.uiFrontends()), s.shutdownDone)
+
+	// 将 PlanStore 中的暂停事实持续物化为结构化 Interaction；恢复 Session
+	// 后也由同一 reconciliation 路径重建，不依赖易丢失的瞬时事件。
+	s.startInteractionRuntime(ctx)
+
+	// Step 4.6: 启动 UI Hub（output/status 与 Interaction 投影的统一消费者；
 	// 无订阅者也常驻排干，ctx 取消即退出）。
 	s.startUIHub(ctx)
 
@@ -1419,6 +1528,9 @@ func (s *System) shutdown() error {
 			close(s.outputDone)
 		}
 	})
+	// 先使所有尚未回答的 Interaction 进入明确终态，唤醒 Shell Await 并
+	// 避免控制面留下永久 pending 的幽灵请求；随后再取消全局 ctx。
+	s.interruptPendingInteractions("system shutdown")
 	if s.cancel != nil {
 		s.cancel()
 	}

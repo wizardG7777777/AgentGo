@@ -25,8 +25,8 @@ func renderAgentDetail(t Theme, w, h int, agentID string, info *AgentInfo, outpu
 		switch info.State {
 		case "processing":
 			infoParts = append(infoParts, "● processing")
-		case "waiting_approval":
-			infoParts = append(infoParts, "⏳ approval")
+		case "waiting_interaction":
+			infoParts = append(infoParts, "⏳ interaction")
 		case "terminating":
 			infoParts = append(infoParts, "⊘ terminating")
 		case "idle":

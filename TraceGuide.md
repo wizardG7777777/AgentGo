@@ -127,7 +127,7 @@ v5 子结构体（指针，nil 时不输出）：
 ```yaml
 prev_status: 任务旧状态  # pending / processing / completed / failed / cancelled
 new_status:  任务新状态
-prev_state:  Agent 旧状态  # idle / processing / waiting_approval / terminating
+prev_state:  Agent 旧状态  # idle / processing / waiting_interaction / terminating
 new_state:   Agent 新状态
 cause:       结构化原因 enum
              示例: task_claimed:xxx / max_loops_exceeded / react_loop_exit:panic / approved / rejected
@@ -421,15 +421,15 @@ CLI 的 `trace show` 在末尾自动运行 9 条启发式异常检测。以下�
 
 ---
 
-### 异常 6：Agent 卡在等待批准
-**检测**：Agent 在 `waiting_approval` 状态累计超过 5 分钟
+### 异常 6：Agent 卡在等待用户 Interaction
+**检测**：Agent 在 `waiting_interaction` 状态累计超过 5 分钟
 
-**含义**：Agent 发出了需要用户审批的请求（如 `ask_user`、危险命令确认），但长时间未收到回复或审批。
+**含义**：Agent 正在等待结构化用户选择，例如 Plan 评审、Plan 暂停选择或 Shell 精确命令授权，但长时间未收到回答。
 
 **排查**：
-- 查看 `agent_state_changed` 事件，确认进入和退出 `waiting_approval` 的时间点
-- 检查用户通知渠道是否正常（邮件、IM 等）
-- 检查 Reactor 配置中是否有审批超时自动拒绝的设置
+- 查看 `agent_state_changed` 事件，确认 `interaction_wait_start` / `interaction_wait_end` 以及进入、退出 `waiting_interaction` 的时间点
+- 检查当前进程的完整 `pending_interactions`、TUI Interaction 面板或 Web SSE `InteractionsChanged` 是否正常；`SessionID` 仅作创建审计归属，不能用当前 `/session` 过滤仍在运行任务的问题
+- 检查请求是否已 cancelled / expired / failed / interrupted；Shell 路径在 Interaction 不可用或绑定不一致时会 fail closed
 
 ---
 
@@ -483,8 +483,8 @@ agentgo trace show <task_id>
 # 3. 在 show 输出中重点关注：
 #    - 最后的几条事件是什么？（Agent 卡在什么操作上）
 #    - 有无 30 秒间隔警告？（卡死在某个步骤）
-#    - 最后的 agent_state_changed 是什么状态？（waiting_approval？）
-#    - 最后的 agent_state 是 waiting_approval 且很久没变 → 等用户审批
+#    - 最后的 agent_state_changed 是什么状态？（waiting_interaction？）
+#    - 最后的 agent_state 是 waiting_interaction 且很久没变 → 查 pending Interaction 与前端投影
 #    - 最后的 tool_call 是 run_shell 且对应 tool_result 迟迟未到 → Shell 卡住
 ```
 

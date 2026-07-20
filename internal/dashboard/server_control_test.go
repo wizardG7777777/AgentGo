@@ -11,33 +11,41 @@ import (
 	"strings"
 	"testing"
 
-	"agentgo/internal/shell"
+	"agentgo/internal/interaction"
 	"agentgo/internal/ui"
 )
 
 // fakeController 是记录调用的 ui.Controller 假实现：每个方法记录入参，
 // 返回预设的结果 / 错误。
 type fakeController struct {
-	userText      string
-	userTextErr   error
-	cancelPrefix  string
-	cancelTaskID  string
-	cancelErr     error
-	steerAgentID  string
-	steerMessage  string
-	steerErr      error
-	modeCalls     []bool
-	newSessID     string
-	newSessErr    error
-	switchID      string
-	switchChanged bool
-	switchErr     error
-	resolveID     string
-	resolveReply  shell.ApprovalReply
-	resolveOK     bool
-	sessionsList  []ui.SessionInfo
-	sessionsErr   error
-	quitCalled    bool
+	userText            string
+	userTextErr         error
+	cancelPrefix        string
+	cancelTaskID        string
+	cancelErr           error
+	cancelLatestCalls   int
+	cancelLatestSummary string
+	cancelLatestErr     error
+	steerAgentID        string
+	steerMessage        string
+	steerErr            error
+	modeCalls           []bool
+	execModeCalls       []string
+	execModeErr         error
+	topoModeCalls       []string
+	topoModeErr         error
+	newSessID           string
+	newSessErr          error
+	switchID            string
+	switchChanged       bool
+	switchErr           error
+	interactionInput    interaction.ResolveInput
+	interactionResult   ui.InteractionResult
+	interactionErr      error
+	interactionCalls    int
+	sessionsList        []ui.SessionInfo
+	sessionsErr         error
+	quitCalled          bool
 }
 
 func (f *fakeController) SendUserText(_ context.Context, text string) error {
@@ -50,12 +58,35 @@ func (f *fakeController) CancelTask(idPrefix string) (string, error) {
 	return f.cancelTaskID, f.cancelErr
 }
 
+func (f *fakeController) CancelLatestRequest() (string, error) {
+	f.cancelLatestCalls++
+	return f.cancelLatestSummary, f.cancelLatestErr
+}
+
 func (f *fakeController) SteerAgent(agentID, message string) error {
 	f.steerAgentID, f.steerMessage = agentID, message
 	return f.steerErr
 }
 
 func (f *fakeController) SetMode(plan bool) { f.modeCalls = append(f.modeCalls, plan) }
+
+func (f *fakeController) SetExecMode(mode string) error {
+	f.execModeCalls = append(f.execModeCalls, mode)
+	return f.execModeErr
+}
+
+func (f *fakeController) SetTopoMode(mode string) error {
+	f.topoModeCalls = append(f.topoModeCalls, mode)
+	return f.topoModeErr
+}
+
+// ApprovePlan / RejectPlan / PendingPlanReviews 仅为满足 ui.Controller 接口
+// 扩展而存在——dashboard 本切片不新增对应端点，fake 返回零值。
+func (f *fakeController) ApprovePlan(idPrefix string) (string, error) { return "", nil }
+
+func (f *fakeController) RejectPlan(idPrefix string) (string, error) { return "", nil }
+
+func (f *fakeController) PendingPlanReviews() ([]ui.PlanReviewItem, error) { return nil, nil }
 
 func (f *fakeController) NewSession() (string, error) { return f.newSessID, f.newSessErr }
 
@@ -68,9 +99,17 @@ func (f *fakeController) ListSessions() ([]ui.SessionInfo, error) {
 	return f.sessionsList, f.sessionsErr
 }
 
-func (f *fakeController) ResolveApproval(requestID string, reply shell.ApprovalReply) bool {
-	f.resolveID, f.resolveReply = requestID, reply
-	return f.resolveOK
+func (f *fakeController) RespondInteraction(_ context.Context, input interaction.ResolveInput) (ui.InteractionResult, error) {
+	f.interactionCalls++
+	f.interactionInput = input
+	if f.interactionResult.ID == "" {
+		f.interactionResult = ui.InteractionResult{
+			ID:      input.RequestID,
+			Version: input.ExpectedVersion + 1,
+			State:   interaction.StateResolved,
+		}
+	}
+	return f.interactionResult, f.interactionErr
 }
 
 func (f *fakeController) RequestQuit() { f.quitCalled = true }
@@ -114,10 +153,8 @@ func post(t *testing.T, ts *httptest.Server, path, token, body string) (int, map
 // TestControlEndpoints_MapToController 端点 → Controller 调用的映射矩阵：
 // 每个端点以正确参数调用正确的方法，成功响应体含约定字段。
 func TestControlEndpoints_MapToController(t *testing.T) {
-	fc := &fakeController{cancelTaskID: "task-abcdef", newSessID: "sess-new", resolveOK: true}
-	obs := &fakeObserver{snap: ui.Snapshot{
-		PendingApprovals: []ui.ApprovalItem{{RequestID: "req-1", Pattern: `git\s+push`}},
-	}}
+	fc := &fakeController{cancelTaskID: "task-abcdef", newSessID: "sess-new"}
+	obs := &fakeObserver{snap: ui.Snapshot{}}
 	srv := NewServer(obs, "127.0.0.1:0", "")
 	srv.SetController(fc)
 	ts := httptest.NewServer(srv.handler())
@@ -150,12 +187,12 @@ func TestControlEndpoints_MapToController(t *testing.T) {
 		}
 	})
 
-	t.Run("mode plan/immediate", func(t *testing.T) {
+	t.Run("mode gate（兼容旧 body）", func(t *testing.T) {
 		status, body := post(t, ts, "/api/mode", "", `{"mode":"plan"}`)
-		if status != http.StatusOK || body["mode"] != "plan" {
+		if status != http.StatusOK || body["axis"] != "gate" || body["value"] != "plan" || body["mode"] != "plan" {
 			t.Fatalf("status=%d body=%v", status, body)
 		}
-		status, _ = post(t, ts, "/api/mode", "", `{"mode":"immediate"}`)
+		status, _ = post(t, ts, "/api/mode", "", `{"axis":"gate","value":"immediate"}`)
 		if status != http.StatusOK {
 			t.Fatalf("status=%d", status)
 		}
@@ -164,34 +201,37 @@ func TestControlEndpoints_MapToController(t *testing.T) {
 		}
 	})
 
-	t.Run("approvals approve", func(t *testing.T) {
-		status, _ := post(t, ts, "/api/approvals/req-1", "", `{"action":"approve"}`)
-		if status != http.StatusOK || fc.resolveID != "req-1" || !fc.resolveReply.Approved {
-			t.Fatalf("status=%d resolve=%q/%+v", status, fc.resolveID, fc.resolveReply)
+	t.Run("mode exec/topo", func(t *testing.T) {
+		status, body := post(t, ts, "/api/mode", "", `{"axis":"exec","value":"strict"}`)
+		if status != http.StatusOK || body["axis"] != "exec" || body["value"] != "strict" {
+			t.Fatalf("exec status=%d body=%v", status, body)
+		}
+		status, body = post(t, ts, "/api/mode", "", `{"axis":"topo","value":"solo"}`)
+		if status != http.StatusOK || body["axis"] != "topo" || body["value"] != "solo" {
+			t.Fatalf("topo status=%d body=%v", status, body)
+		}
+		if len(fc.execModeCalls) != 1 || fc.execModeCalls[0] != "strict" ||
+			len(fc.topoModeCalls) != 1 || fc.topoModeCalls[0] != "solo" {
+			t.Fatalf("exec=%v topo=%v", fc.execModeCalls, fc.topoModeCalls)
 		}
 	})
 
-	t.Run("approvals reject", func(t *testing.T) {
-		status, _ := post(t, ts, "/api/approvals/req-1", "", `{"action":"reject"}`)
-		if status != http.StatusOK || fc.resolveReply.Approved || fc.resolveReply.Message != "" {
-			t.Fatalf("status=%d reply=%+v", status, fc.resolveReply)
+	t.Run("interaction response", func(t *testing.T) {
+		fc.interactionResult = ui.InteractionResult{ID: "choice-1", Version: 8, State: interaction.StateResolved}
+		status, body := post(t, ts, "/api/interactions/choice-1/response", "",
+			`{"expected_version":7,"option_id":"revise","text":"补充测试","responded_by":"伪造来源"}`)
+		if status != http.StatusOK || body["request_id"] != "choice-1" || body["state"] != "resolved" {
+			t.Fatalf("status=%d body=%v", status, body)
 		}
-	})
-
-	t.Run("approvals guidance", func(t *testing.T) {
-		status, _ := post(t, ts, "/api/approvals/req-1", "", `{"action":"guidance","message":"先备份再执行"}`)
-		if status != http.StatusOK || fc.resolveReply.Approved || fc.resolveReply.Message != "先备份再执行" {
-			t.Fatalf("status=%d reply=%+v", status, fc.resolveReply)
+		want := interaction.ResolveInput{
+			RequestID:       "choice-1",
+			ExpectedVersion: 7,
+			OptionID:        "revise",
+			Text:            "补充测试",
+			RespondedBy:     "web",
 		}
-	})
-
-	t.Run("approvals remember 取快照中的 Pattern", func(t *testing.T) {
-		status, _ := post(t, ts, "/api/approvals/req-1", "", `{"action":"remember"}`)
-		if status != http.StatusOK {
-			t.Fatalf("status=%d", status)
-		}
-		if !fc.resolveReply.Approved || fc.resolveReply.RememberPattern != `git\s+push` {
-			t.Fatalf("reply=%+v", fc.resolveReply)
+		if fc.interactionInput != want {
+			t.Fatalf("RespondInteraction input=%+v, want %+v", fc.interactionInput, want)
 		}
 	})
 
@@ -225,6 +265,8 @@ func TestControlEndpoints_DomainError(t *testing.T) {
 		userTextErr: errors.New("事件通道超时，调度器可能阻塞"),
 		cancelErr:   errors.New("未找到以 zzz9 开头的任务"),
 		steerErr:    errors.New("代理不存在"),
+		execModeErr: errors.New("未知执行权限模式"),
+		topoModeErr: errors.New("未知编排拓扑模式"),
 		newSessErr:  errors.New("session 管理器未初始化"),
 		switchErr:   errors.New("session sess-x 不存在"),
 	}
@@ -239,6 +281,8 @@ func TestControlEndpoints_DomainError(t *testing.T) {
 		{"/api/input", `{"text":"hi"}`, "事件通道超时"},
 		{"/api/tasks/cancel", `{"id_prefix":"zzz9"}`, "未找到以 zzz9 开头的任务"},
 		{"/api/steer", `{"agent_id":"a1","message":"m"}`, "代理不存在"},
+		{"/api/mode", `{"axis":"exec","value":"unknown"}`, "未知执行权限模式"},
+		{"/api/mode", `{"axis":"topo","value":"unknown"}`, "未知编排拓扑模式"},
 		{"/api/session/new", ``, "session 管理器未初始化"},
 		{"/api/session/switch", `{"id":"sess-x"}`, "不存在"},
 	}
@@ -284,11 +328,14 @@ func TestControlEndpoints_Validation(t *testing.T) {
 		{"steer 缺 message", "/api/steer", `{"agent_id":"a1"}`},
 		{"steer 缺 agent_id", "/api/steer", `{"message":"m"}`},
 		{"非法 mode", "/api/mode", `{"mode":"nope"}`},
-		{"guidance 缺 message", "/api/approvals/req-1", `{"action":"guidance"}`},
-		{"未知审批动作", "/api/approvals/req-1", `{"action":"explode"}`},
+		{"非法 mode axis", "/api/mode", `{"axis":"layout","value":"solo"}`},
+		{"mode 新旧协议混用", "/api/mode", `{"axis":"gate","value":"plan","mode":"plan"}`},
+		{"interaction 缺 version", "/api/interactions/req-1/response", `{"option_id":"continue"}`},
+		{"interaction 缺回答", "/api/interactions/req-1/response", `{"expected_version":1}`},
+		{"interaction 路径多余层级", "/api/interactions/group/req-1/response", `{"expected_version":1,"option_id":"continue"}`},
 		{"session/switch 空 id", "/api/session/switch", `{"id":" "}`},
 		{"请求体非 JSON", "/api/input", `not-json`},
-		{"请求体非 JSON（审批）", "/api/approvals/req-1", `{`},
+		{"请求体非 JSON（Interaction）", "/api/interactions/req-1/response", `{`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -303,36 +350,50 @@ func TestControlEndpoints_Validation(t *testing.T) {
 	}
 	// 校验失败不得触达 Controller
 	if fc.userText != "" || fc.cancelPrefix != "" || fc.steerAgentID != "" ||
-		len(fc.modeCalls) != 0 || fc.switchID != "" || fc.resolveID != "" {
+		len(fc.modeCalls) != 0 || len(fc.execModeCalls) != 0 || len(fc.topoModeCalls) != 0 ||
+		fc.switchID != "" || fc.interactionCalls != 0 {
 		t.Fatalf("校验失败的请求触达了 Controller: %+v", fc)
 	}
 }
 
-// TestControlEndpoints_ApprovalConflict ResolveApproval 返回 false → 409 "审批已失效"；
-// remember 动作在快照中找不到该请求时同样 → 409。
-func TestControlEndpoints_ApprovalConflict(t *testing.T) {
-	fc := &fakeController{resolveOK: false}
-	ts := httptest.NewServer(newControlServer(fc).handler())
-	t.Cleanup(ts.Close)
-
-	status, body := post(t, ts, "/api/approvals/req-gone", "", `{"action":"approve"}`)
-	if status != http.StatusConflict {
-		t.Fatalf("status=%d，期望 409；body=%v", status, body)
+// TestInteractionEndpoint_StatusMapping 固定 Interaction 领域错误与 HTTP
+// 状态的映射，避免多前端竞态被误报为普通 400。
+func TestInteractionEndpoint_StatusMapping(t *testing.T) {
+	cases := []struct {
+		name  string
+		err   error
+		state interaction.State
+		want  int
+	}{
+		{"请求无效", interaction.ErrInvalidRequest, "", http.StatusBadRequest},
+		{"选项无效", interaction.ErrInvalidOption, "", http.StatusBadRequest},
+		{"版本冲突", interaction.ErrVersionConflict, "", http.StatusConflict},
+		{"已被回答", interaction.ErrAlreadyAnswered, "", http.StatusConflict},
+		{"转换冲突", interaction.ErrInvalidTransition, "", http.StatusConflict},
+		{"已取消", interaction.ErrCancelled, "", http.StatusGone},
+		{"已过期", interaction.ErrExpired, "", http.StatusGone},
+		{"已中断", interaction.ErrInterrupted, "", http.StatusGone},
+		{"处理失败", interaction.ErrFailed, "", http.StatusGone},
+		{"返回记录已失败", errors.New("副作用失败"), interaction.StateFailed, http.StatusGone},
+		{"不存在", interaction.ErrNotFound, "", http.StatusNotFound},
+		{"控制面未装配", fmt.Errorf("包装: %w", ui.ErrNotAssembled), "", http.StatusInternalServerError},
 	}
-	if msg, _ := body["error"].(string); msg != "审批已失效" {
-		t.Fatalf("error=%q，期望 审批已失效", msg)
-	}
-
-	// remember 需要先从不存在的快照条目取 Pattern → 同样 409，且不触达 ResolveApproval
-	fc2 := &fakeController{resolveOK: true}
-	ts2 := httptest.NewServer(newControlServer(fc2).handler())
-	t.Cleanup(ts2.Close)
-	status, body = post(t, ts2, "/api/approvals/req-unknown", "", `{"action":"remember"}`)
-	if status != http.StatusConflict {
-		t.Fatalf("remember status=%d，期望 409；body=%v", status, body)
-	}
-	if fc2.resolveID != "" {
-		t.Fatal("快照无此请求时不应调用 ResolveApproval")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := &fakeController{
+				interactionErr: tc.err,
+				interactionResult: ui.InteractionResult{
+					ID: "req-1", Version: 2, State: tc.state,
+				},
+			}
+			ts := httptest.NewServer(newControlServer(fc).handler())
+			t.Cleanup(ts.Close)
+			status, body := post(t, ts, "/api/interactions/req-1/response", "",
+				`{"expected_version":1,"option_id":"continue"}`)
+			if status != tc.want || body["error"] == nil {
+				t.Fatalf("status=%d, want %d; body=%v", status, tc.want, body)
+			}
+		})
 	}
 }
 
@@ -344,7 +405,7 @@ func TestControlEndpoints_MethodMismatch(t *testing.T) {
 
 	paths := []string{
 		"/api/input", "/api/tasks/cancel", "/api/steer", "/api/mode",
-		"/api/approvals/req-1", "/api/session/new", "/api/session/switch",
+		"/api/interactions/req-1/response", "/api/session/new", "/api/session/switch",
 	}
 	for _, p := range paths {
 		resp, err := http.Get(ts.URL + p)
@@ -394,7 +455,7 @@ func TestControlEndpoints_NilController(t *testing.T) {
 		{"/api/tasks/cancel", `{"id_prefix":"zzzz"}`},
 		{"/api/steer", `{"agent_id":"a","message":"m"}`},
 		{"/api/mode", `{"mode":"plan"}`},
-		{"/api/approvals/req-1", `{"action":"approve"}`},
+		{"/api/interactions/req-1/response", `{"expected_version":1,"option_id":"continue"}`},
 		{"/api/session/new", ``},
 		{"/api/session/switch", `{"id":"s1"}`},
 	}

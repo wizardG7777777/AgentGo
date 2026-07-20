@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"agentgo/internal/output"
-	"agentgo/internal/shell"
 )
 
 // testTimeout 是测试里所有"等待 hub 响应"的统一超时护栏。
@@ -83,6 +82,20 @@ func TestHub_OutputEventFanout(t *testing.T) {
 	if u.At.IsZero() {
 		t.Fatal("At 未填充")
 	}
+	waitFor(t, "结果进入 Hub 快照", func() bool {
+		got := h.Snapshot().LastResult
+		return got != nil && got.AgentID == "a1" && got.Text == "=== 任务完成 ==="
+	})
+
+	// 晚订阅者不依赖曾经发生过的 Update 边沿，也能从首个全量快照
+	// 直接恢复最近完成回复。
+	late, stopLate := h.Subscribe(1)
+	defer stopLate()
+	first := recvUpdate(t, late)
+	if first.Kind != KindSnapshotSync || first.Snapshot.LastResult == nil ||
+		first.Snapshot.LastResult.Text != "=== 任务完成 ===" {
+		t.Fatalf("晚订阅首帧未携带结果: %+v", first)
+	}
 
 	outCh <- output.Event{Kind: output.KindText, AgentID: "a2", Text: "进度汇报"}
 	u = recvUpdate(t, sub)
@@ -91,6 +104,34 @@ func TestHub_OutputEventFanout(t *testing.T) {
 	}
 	if u.Output.AgentID != "a2" || u.Output.Text != "进度汇报" {
 		t.Fatalf("Output = %+v，载荷未透传", u.Output)
+	}
+
+	outCh <- output.Event{
+		Kind: output.KindStream, AgentID: "a2", TaskID: "task-1",
+		StreamID: "stream-1", Text: "正在生成", Loop: 2,
+	}
+	u = recvUpdate(t, sub)
+	if u.Kind != KindOutputStream || u.Output.StreamID != "stream-1" || u.Output.Text != "正在生成" || u.Output.Loop != 2 {
+		t.Fatalf("stream update = %+v", u)
+	}
+	outCh <- output.Event{
+		Kind: output.KindStream, AgentID: "a2", TaskID: "task-1",
+		StreamID: "stream-1", Text: "正在生成完整内容", Loop: 2, Done: true,
+	}
+	recvUpdate(t, sub)
+	waitFor(t, "流式快照进入可恢复 feed", func() bool {
+		feed := h.Snapshot().Feed
+		if len(feed.Outputs) != 3 { // result + text + one upserted stream
+			return false
+		}
+		last := feed.Outputs[len(feed.Outputs)-1]
+		return last.StreamID == "stream-1" && last.Text == "正在生成完整内容" && last.Done
+	})
+	lateFeed, stopLateFeed := h.Subscribe(1)
+	defer stopLateFeed()
+	lateSnapshot := recvUpdate(t, lateFeed).Snapshot
+	if got := lateSnapshot.Feed.Outputs[len(lateSnapshot.Feed.Outputs)-1]; got.StreamID != "stream-1" || !got.Done {
+		t.Fatalf("晚订阅者未恢复最新流式快照: %+v", got)
 	}
 }
 
@@ -110,31 +151,10 @@ func TestHub_StatusLineFanout(t *testing.T) {
 	if u.LogLine != "[watchdog] 一切正常" {
 		t.Fatalf("LogLine = %q", u.LogLine)
 	}
-}
-
-func TestHub_ApprovalFanout(t *testing.T) {
-	apprCh := make(chan shell.ApprovalRequest, 4)
-	h := startHub(t, Deps{ApprovalCh: apprCh})
-
-	sub, cancel := h.Subscribe(8)
-	defer cancel()
-	recvUpdate(t, sub) // 吃掉 SnapshotSync
-
-	replyCh := make(chan shell.ApprovalReply, 1)
-	apprCh <- shell.ApprovalRequest{
-		RequestID: "r1", TaskID: "t1", AgentID: "a1",
-		Command: "git push", Pattern: `git\s+push`, ReplyCh: replyCh,
-	}
-	u := recvUpdate(t, sub)
-	if u.Kind != KindApprovalNew {
-		t.Fatalf("Kind = %v，期望 ApprovalNew", u.Kind)
-	}
-	if u.Approval.RequestID != "r1" || u.Approval.Command != "git push" {
-		t.Fatalf("Approval = %+v", u.Approval)
-	}
-	if u.Approval.ReceivedAt.IsZero() {
-		t.Fatal("ReceivedAt 未填充")
-	}
+	waitFor(t, "日志进入诊断 feed", func() bool {
+		logs := h.Snapshot().Feed.Logs
+		return len(logs) == 1 && logs[0].Text == "[watchdog] 一切正常"
+	})
 }
 
 func TestHub_SubscribeGetsSnapshotSync(t *testing.T) {
@@ -221,11 +241,10 @@ func TestHub_DropOldest(t *testing.T) {
 }
 
 func TestHub_ZeroSubscriberDrain(t *testing.T) {
-	// 三个源全部无缓冲：只要 hub 常驻排干，生产者就不会阻塞。
+	// 两个 channel 源均无缓冲：只要 hub 常驻排干，生产者就不会阻塞。
 	outCh := make(chan output.Event)
-	apprCh := make(chan shell.ApprovalRequest)
 	statusCh := make(chan string)
-	h := startHub(t, Deps{OutputCh: outCh, ApprovalCh: apprCh, StatusCh: statusCh})
+	_ = startHub(t, Deps{OutputCh: outCh, StatusCh: statusCh})
 
 	// 零订阅者。推送远超任何缓冲区容量的条目。
 	produceDone := make(chan struct{})
@@ -234,10 +253,6 @@ func TestHub_ZeroSubscriberDrain(t *testing.T) {
 		for i := 0; i < 50; i++ {
 			outCh <- output.Event{Kind: output.KindText, Text: "x"}
 			statusCh <- "log"
-			apprCh <- shell.ApprovalRequest{
-				RequestID: fmt.Sprintf("r%d", i),
-				ReplyCh:   make(chan shell.ApprovalReply, 1),
-			}
 		}
 	}()
 	select {
@@ -246,17 +261,11 @@ func TestHub_ZeroSubscriberDrain(t *testing.T) {
 		t.Fatal("零订阅者时生产者被阻塞：headless 排干保证失效")
 	}
 
-	// 内部状态仍被维护：50 条审批都进了待审批列表。
-	waitFor(t, "待审批列表包含全部请求", func() bool {
-		return len(h.Snapshot().PendingApprovals) == 50
-	})
 	// t.Cleanup 会断言 Run 在 cancel 后干净退出。
 }
 
 func TestHub_SnapshotAssembly(t *testing.T) {
-	apprCh := make(chan shell.ApprovalRequest, 4)
 	h := startHub(t, Deps{
-		ApprovalCh:   apprCh,
 		PollInterval: 10 * time.Millisecond,
 		PollAgents: func() []AgentCard {
 			return []AgentCard{
@@ -285,25 +294,6 @@ func TestHub_SnapshotAssembly(t *testing.T) {
 	}
 	if snap.Session.ID != "sess-9" || snap.Session.TaskCount != 2 {
 		t.Fatalf("Session = %+v", snap.Session)
-	}
-	if len(snap.PendingApprovals) != 0 {
-		t.Fatalf("PendingApprovals = %+v，期望空", snap.PendingApprovals)
-	}
-
-	// 审批到达后快照反映新增；轮询不覆盖待审批列表。
-	replyCh := make(chan shell.ApprovalReply, 1)
-	apprCh <- shell.ApprovalRequest{RequestID: "r9", Command: "git push", ReplyCh: replyCh}
-	waitFor(t, "待审批出现在快照", func() bool {
-		return len(h.Snapshot().PendingApprovals) == 1
-	})
-	if h.Snapshot().PendingApprovals[0].RequestID != "r9" {
-		t.Fatalf("PendingApprovals = %+v", h.Snapshot().PendingApprovals)
-	}
-	if !h.ResolveApproval("r9", shell.ApprovalReply{Approved: true}) {
-		t.Fatal("ResolveApproval 应送达")
-	}
-	if got := len(h.Snapshot().PendingApprovals); got != 0 {
-		t.Fatalf("了结后 PendingApprovals 长度 = %d，期望 0", got)
 	}
 }
 

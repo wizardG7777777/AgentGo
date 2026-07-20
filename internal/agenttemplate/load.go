@@ -77,7 +77,6 @@ var forbiddenTemplateTools = map[string]struct{}{
 	"supersede_tasks":         {},
 	"finalize_plan":           {},
 	"mark_plan_blocked":       {},
-	"resolve_plan_pause":      {},
 	"get_retired_node":        {},
 	"get_acceptance_evidence": {},
 	"cancel_task":             {},

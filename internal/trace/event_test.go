@@ -243,11 +243,11 @@ func TestFormatEventDetailsTransitionRendering(t *testing.T) {
 			ev: Event{
 				Kind: KindAgentStateChanged,
 				Transition: &Transition{
-					PrevState: "processing", NewState: "waiting_approval",
-					Cause: "approval_required:run_shell",
+					PrevState: "processing", NewState: "waiting_interaction",
+					Cause: "interaction_wait_start",
 				},
 			},
-			contains: []string{"prev=processing", "new=waiting_approval", "cause=approval_required:run_shell"},
+			contains: []string{"prev=processing", "new=waiting_interaction", "cause=interaction_wait_start"},
 		},
 		{
 			name: "shell_executed",
@@ -391,26 +391,26 @@ func TestDetectAnomaliesNewHeuristics(t *testing.T) {
 				Timestamp: base,
 				Kind:      KindAgentStateChanged,
 				Transition: &Transition{
-					PrevState: "processing", NewState: "waiting_approval",
+					PrevState: "processing", NewState: "waiting_interaction",
 				},
 			},
 			{
 				Timestamp: base.Add(7 * time.Minute),
 				Kind:      KindAgentStateChanged,
 				Transition: &Transition{
-					PrevState: "waiting_approval", NewState: "processing",
+					PrevState: "waiting_interaction", NewState: "processing",
 				},
 			},
 		}
 		anom := detectAnomalies(events)
 		found := false
 		for _, a := range anom {
-			if strings.Contains(a, "waiting_approval") {
+			if strings.Contains(a, "waiting_interaction") {
 				found = true
 			}
 		}
 		if !found {
-			t.Errorf("expected waiting_approval anomaly, got %v", anom)
+			t.Errorf("expected waiting_interaction anomaly, got %v", anom)
 		}
 	})
 }

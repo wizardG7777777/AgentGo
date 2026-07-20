@@ -72,6 +72,18 @@ func TestCommandCatalog_SharedSetComplete(t *testing.T) {
 	}
 }
 
+func TestCommandCatalog_LayeredTUIViewsComplete(t *testing.T) {
+	for _, name := range []string{"activity", "logs", "trace"} {
+		c, ok := MatchCommand(name)
+		if !ok {
+			t.Fatalf("目录缺少分层视图命令 /%s", name)
+		}
+		if c.Scope != ScopeTUI {
+			t.Fatalf("/%s 应为 ScopeTUI，实际 %q", name, c.Scope)
+		}
+	}
+}
+
 func TestMatchCommand_Alias(t *testing.T) {
 	c, ok := MatchCommand("dash")
 	if !ok || c.Name != "dashboard" {

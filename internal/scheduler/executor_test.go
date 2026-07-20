@@ -12,6 +12,7 @@ import (
 	"agentgo/internal/config"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
+	"agentgo/internal/modes"
 	"agentgo/internal/plan"
 	"agentgo/internal/probe"
 	"agentgo/internal/store"
@@ -657,6 +658,48 @@ func TestSchedulerExecutor_InjectsBoardSnapshotIntoHistory(t *testing.T) {
 	}
 }
 
+// TestSchedulerExecutor_ModesStoreLiveSwitch 验证 SchedulerExecutor 每次 Execute
+// 重读三轴 store：运行期切换 gate / exec / topo 轴后，下一次快照立即反映新值。
+func TestSchedulerExecutor_ModesStoreLiveSwitch(t *testing.T) {
+	ch := make(chan model.Event, 64)
+	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
+	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
+
+	schedTask := &model.Task{Description: "sched", EventType: "__scheduler__"}
+	s.PublishTask(schedTask)
+	s.ClaimTask("scheduler-1", schedTask.ID)
+
+	modeStore := modes.DefaultStore()
+	var calls int32
+	var capturedHistory []agent.HistoryEntry
+	exec := &SchedulerExecutor{
+		Inner:         makeInnerExecutor(&calls, &capturedHistory),
+		Store:         s,
+		Cfg:           cfg,
+		BatchUpdateCh: make(chan struct{}),
+		WaitTimeout:   100 * time.Millisecond,
+		Modes:         modeStore,
+	}
+
+	// 运行期切换到 plan + strict + solo（三轴并行组合）
+	modeStore.SetGate(modes.GatePlan)
+	modeStore.SetExec(modes.ExecStrict)
+	modeStore.SetTopo(modes.TopoSolo)
+
+	if _, err := exec.Execute(context.Background(), schedTask, nil, nil); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if len(capturedHistory) != 1 {
+		t.Fatalf("expected 1 history entry, got %d", len(capturedHistory))
+	}
+	mail := capturedHistory[0].IncomingMail
+	for _, want := range []string{`"mode": "plan"`, `"exec_mode": "strict"`, `"topo_mode": "solo"`} {
+		if !strings.Contains(mail, want) {
+			t.Errorf("快照缺少 %s，got: %s", want, mail)
+		}
+	}
+}
+
 func TestSchedulerExecutor_BatchPending_WaitsUntilComplete(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
@@ -1129,4 +1172,112 @@ func TestSchedulerExecutor_PlannedSignalSkipsLegacyDownstreamWait(t *testing.T) 
 	if err != nil || stillRunning.Status != model.TaskStatusProcessing {
 		t.Fatalf("downstream task must remain processing to prove wait was skipped: task=%+v err=%v", stillRunning, err)
 	}
+}
+
+// newControllerWriteFixture 构造"controller 亲自写文件后给出纯文本回答"的公共现场：
+// scheduler task 已认领、Plan running、write_file 成功事实已记录；
+// LLM 返回不含任何工具调用的纯文本响应。
+func newControllerWriteFixture(t *testing.T, modeStore *modes.Store, withResidualNode bool) (*store.MemoryTaskStore, *plan.Coordinator, *model.Task, *SchedulerExecutor) {
+	t.Helper()
+	taskStore := store.NewMemoryTaskStore(nil, 32, 1, 60)
+	root := &model.Task{Description: "scheduler root", EventType: "__scheduler__"}
+	if err := taskStore.PublishTask(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskStore.ClaimTask("scheduler-1", root.ID); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
+	if _, err := coordinator.Create(context.Background(), plan.CreateInput{PlanID: root.PlanID, RootTaskID: root.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if withResidualNode {
+		// 异常残留：solo 下本不该出现的 implementation 节点。
+		// 任务置为 completed，避免 Execute 入口的 waitForPlanSignal 等待 DAG 进展。
+		work := &model.Task{ID: "work-1", Description: "implemented", PlanID: root.PlanID, NodeRole: model.PlanNodeRoleImplementation}
+		if err := taskStore.PublishTask(work); err != nil {
+			t.Fatal(err)
+		}
+		if err := taskStore.ClaimTask("worker-1", work.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := taskStore.SubmitResult("worker-1", work.ID, "done"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := coordinator.RegisterTask(context.Background(), plan.RegisterTaskInput{
+			PlanID: root.PlanID, ObservedRevision: 0,
+			Node: model.PlanNode{TaskID: work.ID, Title: work.Description, Status: model.TaskStatusCompleted, Role: model.PlanNodeRoleImplementation},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// controller 亲自执行写操作的事实（生产由 record-artifact / 工具记录接线产生）
+	if err := taskStore.AppendToolCall(root.ID, store.ToolCallRecord{
+		Timestamp: time.Now(), AgentID: "scheduler-1", ToolName: "write_file", Success: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &scriptedLLM{responses: []llm.Response{{Content: "写好了，文件已落盘"}}}
+	exec := &SchedulerExecutor{
+		Inner: agent.NewLLMExecutor(client, agent.NewToolRegistry(), nil, taskStore, nil, ""),
+		Store: taskStore, Cfg: config.DefaultConfig(), PlanCoordinator: coordinator,
+		Modes: modeStore,
+	}
+	return taskStore, coordinator, root, exec
+}
+
+// TestSchedulerExecutor_SoloDirectWriteNaturalTextFinalizes 覆盖自然文本收尾路径：
+// controller 亲自写文件后 LLM 直接给纯文本回答时——
+//   - solo 且无 implementation 节点：放宽正式验收，Plan 以 completed_no_execution 终态化；
+//   - team：仍强制继续等待正式验收（回归）；
+//   - solo 但残留 implementation 节点：不放宽，同样强制继续。
+func TestSchedulerExecutor_SoloDirectWriteNaturalTextFinalizes(t *testing.T) {
+	soloStore := func() *modes.Store { return modes.NewStore(modes.GateImmediate, modes.ExecNormal, modes.TopoSolo) }
+	teamStore := func() *modes.Store { return modes.NewStore(modes.GateImmediate, modes.ExecNormal, modes.TopoTeam) }
+
+	t.Run("solo 无节点放宽收尾", func(t *testing.T) {
+		_, coordinator, root, exec := newControllerWriteFixture(t, soloStore(), false)
+		result, err := exec.Execute(context.Background(), root, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.ToolCalled {
+			t.Fatalf("solo 纯文本回答不应被强制继续: result=%+v", result)
+		}
+		p, err := coordinator.Store().GetPlan(root.PlanID)
+		if err != nil || p.Status != model.PlanStatusCompletedNoExecution {
+			t.Fatalf("solo 写操作 Plan 应以 completed_no_execution 终态化: plan=%+v err=%v", p, err)
+		}
+	})
+
+	t.Run("team 仍要求正式验收", func(t *testing.T) {
+		_, coordinator, root, exec := newControllerWriteFixture(t, teamStore(), false)
+		result, err := exec.Execute(context.Background(), root, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.ToolCalled || !strings.Contains(result.AssistantContent, "计划尚未形成正式终态") {
+			t.Fatalf("team 纯文本回答应被强制继续等待正式验收: result=%+v", result)
+		}
+		p, err := coordinator.Store().GetPlan(root.PlanID)
+		if err != nil || p.Status != model.PlanStatusRunning {
+			t.Fatalf("team 下 Plan 不应被收尾: plan=%+v err=%v", p, err)
+		}
+	})
+
+	t.Run("solo 残留节点不放宽", func(t *testing.T) {
+		_, coordinator, root, exec := newControllerWriteFixture(t, soloStore(), true)
+		result, err := exec.Execute(context.Background(), root, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.ToolCalled || !strings.Contains(result.AssistantContent, "计划尚未形成正式终态") {
+			t.Fatalf("solo 残留 implementation 节点时不应放宽: result=%+v", result)
+		}
+		p, err := coordinator.Store().GetPlan(root.PlanID)
+		if err != nil || p.Status != model.PlanStatusRunning {
+			t.Fatalf("残留节点场景 Plan 不应被收尾: plan=%+v err=%v", p, err)
+		}
+	})
 }

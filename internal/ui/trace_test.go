@@ -38,6 +38,10 @@ func TestHub_EmitTraceEventBroadcasts(t *testing.T) {
 	if !te.At.Equal(ts) {
 		t.Fatalf("At = %v，期望沿用事件时间戳 %v", te.At, ts)
 	}
+	feed := h.Snapshot().Feed
+	if len(feed.Traces) != 1 || feed.Traces[0].AgentID != "worker-1" || feed.Traces[0].Tool != "run_shell" {
+		t.Fatalf("Trace 未进入可恢复 feed: %+v", feed.Traces)
+	}
 }
 
 // TestHub_EmitTraceEventMessagePriority Message 摘要按 Error → Reason → Description 取首个非空。

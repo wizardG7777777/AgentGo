@@ -17,6 +17,7 @@ import (
 	"agentgo/internal/mailbox"
 	"agentgo/internal/memory"
 	"agentgo/internal/model"
+	"agentgo/internal/output"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
@@ -138,6 +139,12 @@ type Agent struct {
 	// writer，让"这是最终结果"的分类在产生处完成，消费方不再做子串匹配。
 	ResultOutput io.Writer
 
+	// StreamOutput receives coalesced, self-contained snapshots of in-flight LLM
+	// answer text. It is separate from UserOutput/ResultOutput because stream
+	// snapshots must replace one UI item instead of appending one message per
+	// token. Nil disables UI publication without disabling SDK streaming.
+	StreamOutput func(output.Event)
+
 	// IsUserFacing 标记此 agent 是否直接对话用户（典型为 scheduler）。
 	//
 	// true 时：任何"自然文本完成"路径（!result.ToolCalled）都会自动把 lastOutput
@@ -183,6 +190,13 @@ type Agent struct {
 	// （ReactiveSystem.md §7）。零值即 Idle，由 SetState/mustSetState 切换。
 	// 字段非导出避免外部直接读写——必须经 SetState 走合法性校验 + emit trace。
 	stateGuard stateGuard
+
+	// interactionWaitMu / interactionWaiters 把并行工具调用的等待窗口
+	// 折叠为一个 Agent 状态：第一个等待者进入时切到
+	// waiting_interaction，最后一个退出时才恢复 processing。
+	// LLM 同一次响应中的工具调用可能并行，所以这里不能只用 bool。
+	interactionWaitMu  sync.Mutex
+	interactionWaiters int
 
 	// Memory 是 v5 Phase 1 Memory System 引入的记忆存储引用
 	// （MemoryManageSystem.md MM5）。当前承载 team_snapshot / file_awareness
@@ -802,6 +816,28 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		execCtx := WithAgentContext(ctx, a.ID, taskID, i)
 		if a.Activity != nil {
 			execCtx = WithActivityContext(execCtx, a.Activity)
+		}
+		if a.Activity != nil || a.StreamOutput != nil {
+			streamID := fmt.Sprintf("%s:%s:%d:%d", a.ID, taskID, i, time.Now().UnixNano())
+			lastPublished := time.Time{}
+			execCtx = llm.WithStreamHandler(execCtx, func(ev llm.StreamEvent) {
+				if ev.AccumulatedContent != "" {
+					a.Activity.LLMDelta(a.ID, taskID, i, ev.AccumulatedContent)
+				}
+				if a.StreamOutput == nil || (ev.AccumulatedContent == "" && ev.Error == "") {
+					return
+				}
+				now := time.Now()
+				if !ev.Done && !lastPublished.IsZero() && now.Sub(lastPublished) < 50*time.Millisecond {
+					return
+				}
+				lastPublished = now
+				a.StreamOutput(output.Event{
+					Kind: output.KindStream, AgentID: a.ID, TaskID: taskID,
+					StreamID: streamID, Loop: i, Text: ev.AccumulatedContent,
+					Done: ev.Done, Error: ev.Error,
+				})
+			})
 		}
 		result, execErr := a.Execute(execCtx, task, depResults, histCopy)
 

@@ -1,28 +1,35 @@
 package tui
 
 // calcLayout computes panel dimensions from terminal size and view state.
-// Borrows crush's responsive breakpoint pattern: sidebar hidden below compactThreshold.
-func calcLayout(w, h int, view ViewState, inputRows ...int) Layout {
+// rows[0] is the input area height; rows[1], when present, is the Interaction
+// panel height. The two lower panels stack instead of overlapping.
+func calcLayout(w, h int, view ViewState, rows ...int) Layout {
 	l := Layout{Width: w, Height: h}
 	l.Compact = w < compactThreshold
 	inputH := inputMinHeight
-	if len(inputRows) > 0 {
-		inputH = inputRows[0]
+	if len(rows) > 0 {
+		inputH = rows[0]
 	}
 	if inputH < inputMinHeight {
 		inputH = inputMinHeight
 	}
+	interactionH := 0
+	if len(rows) > 1 && rows[1] > 0 {
+		interactionH = rows[1]
+	}
 
-	// Vertical split: header(1) | body | input(3) | status(1)
+	// Vertical split: header | body | interaction? | input | status.
 	l.HeaderY = 0
 	l.HeaderH = headerHeight
 	l.StatusY = h - statusBarHeight
 	l.StatusH = statusBarHeight
 	l.InputY = l.StatusY - inputH
 	l.InputH = inputH
+	l.InteractionY = l.InputY - interactionH
+	l.InteractionH = interactionH
 
 	bodyY := l.HeaderY + l.HeaderH
-	bodyH := l.InputY - bodyY
+	bodyH := l.InteractionY - bodyY
 	if bodyH < 1 {
 		bodyH = 1
 	}
@@ -53,10 +60,6 @@ func calcLayout(w, h int, view ViewState, inputRows ...int) Layout {
 	if l.MainW < 1 {
 		l.MainW = 1
 	}
-
-	// Approval overlays the input area
-	l.ApprovalY = l.InputY
-	l.ApprovalH = l.InputH
 
 	return l
 }

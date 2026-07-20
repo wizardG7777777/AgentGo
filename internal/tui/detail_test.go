@@ -86,7 +86,7 @@ func TestRenderAgentDetail_States(t *testing.T) {
 		want  string
 	}{
 		{"processing", "processing"},
-		{"waiting_approval", "approval"},
+		{"waiting_interaction", "interaction"},
 		{"idle", "idle"},
 		{"unknown_state", "unknown_state"},
 	}

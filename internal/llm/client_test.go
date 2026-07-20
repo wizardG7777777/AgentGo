@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -62,6 +63,127 @@ func TestSDKClient_Chat_Success(t *testing.T) {
 	}
 	if resp.FinishReason != FinishReasonStop {
 		t.Errorf("finish_reason = %q, want %q", resp.FinishReason, FinishReasonStop)
+	}
+}
+
+func TestSDKClient_ReasoningEffortIsSent(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(openaiResponse("ok", nil))
+	}))
+	defer server.Close()
+
+	client := NewSDKClientWithConfig(server.URL, "key", "gpt-test", "", "openai", 30*time.Second, ClientConfig{
+		ReasoningEffort: "max",
+	})
+	if _, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := body["reasoning_effort"]; got != "max" {
+		t.Fatalf("reasoning_effort = %#v, want max", got)
+	}
+}
+
+func TestSDKClient_OpenRouterReasoningEffortIsMapped(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(openaiResponse("ok", nil))
+	}))
+	defer server.Close()
+
+	client := NewSDKClientWithConfig(server.URL, "key", "openai/gpt-test", "", "openrouter", 30*time.Second, ClientConfig{
+		ReasoningEffort: "xhigh",
+	})
+	if _, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := body["reasoning_effort"]; exists {
+		t.Fatalf("OpenRouter request must not include top-level reasoning_effort: %+v", body)
+	}
+	reasoning, ok := body["reasoning"].(map[string]any)
+	if !ok || reasoning["effort"] != "xhigh" {
+		t.Fatalf("reasoning = %#v, want effort=xhigh", body["reasoning"])
+	}
+}
+
+func TestSDKClient_StreamingAccumulatesContentUsageAndExtras(t *testing.T) {
+	var requestBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		frames := []string{
+			`{"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[{"index":0,"delta":{"role":"assistant","content":"你","reasoning_content":"思"},"finish_reason":null}]}`,
+			`{"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[{"index":0,"delta":{"content":"好","reasoning_content":"考"},"finish_reason":null}]}`,
+			`{"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			`{"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}`,
+		}
+		for _, frame := range frames {
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", frame)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	client := NewSDKClientWithConfig(server.URL, "key", "gpt-test", "", "openai", 30*time.Second, ClientConfig{
+		ReasoningEffort: "high",
+		Stream:          true,
+	})
+	var events []StreamEvent
+	ctx := WithStreamHandler(context.Background(), func(event StreamEvent) {
+		events = append(events, event)
+	})
+	resp, err := client.Chat(ctx, []Message{{Role: "user", Content: "hello"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Content != "你好" || resp.Usage.PromptTokens != 7 || resp.Usage.CompletionTokens != 2 {
+		t.Fatalf("response = %+v", resp)
+	}
+	if got := string(resp.ExtraFields["reasoning_content"]); got != `"思考"` {
+		t.Fatalf("reasoning_content = %s, want %q", got, "思考")
+	}
+	if len(events) != 3 || events[0].AccumulatedContent != "你" || events[1].AccumulatedContent != "你好" || !events[2].Done {
+		t.Fatalf("stream events = %+v", events)
+	}
+	if requestBody["stream"] != true || requestBody["reasoning_effort"] != "high" {
+		t.Fatalf("request body = %+v", requestBody)
+	}
+	streamOptions, ok := requestBody["stream_options"].(map[string]any)
+	if !ok || streamOptions["include_usage"] != true {
+		t.Fatalf("stream_options = %#v", requestBody["stream_options"])
+	}
+}
+
+func TestSDKClient_StreamingAccumulatesToolCallArguments(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"chatcmpl-tool\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":null}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"chatcmpl-tool\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"a.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"chatcmpl-tool\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	client := NewSDKClientWithConfig(server.URL, "key", "gpt-test", "", "openai", 30*time.Second, ClientConfig{Stream: true})
+	resp, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "read"}}, []ToolDef{{Name: "read_file"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Name != "read_file" || resp.ToolCalls[0].Arguments["path"] != "a.txt" {
+		t.Fatalf("tool calls = %+v", resp.ToolCalls)
 	}
 }
 

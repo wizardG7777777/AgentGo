@@ -67,8 +67,8 @@ func renderAgentCard(t Theme, ag AgentInfo, w int) string {
 	case "processing":
 		icon = t.IconRunning
 		cardStyle = t.CardActive.Width(w)
-	case "waiting_approval":
-		icon = t.IconApproval
+	case "waiting_interaction":
+		icon = t.IconInteraction
 		cardStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("214")).
@@ -87,8 +87,8 @@ func renderAgentCard(t Theme, ag AgentInfo, w int) string {
 	switch ag.State {
 	case "processing":
 		stateStr = t.StateProcessing.Render("● processing")
-	case "waiting_approval":
-		stateStr = t.StateApproval.Render("⏳ waiting approval")
+	case "waiting_interaction":
+		stateStr = t.StateInteraction.Render("⏳ waiting interaction")
 	case "terminating":
 		stateStr = t.StateTerminate.Render("⊘ terminating")
 	default:

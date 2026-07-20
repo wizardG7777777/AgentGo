@@ -265,20 +265,20 @@ shell_rules:
 
 	// 验证全局灰名单生效
 	action, _ := filter.Check("global_grey")
-	if action != "approve" {
+	if action != "ask" {
 		t.Errorf("全局灰名单应生效，得到 action=%s", action)
 	}
 
 	// 验证项目级灰名单 add 生效
 	action, _ = filter.Check("project_deploy")
-	if action != "approve" {
+	if action != "ask" {
 		t.Errorf("项目级灰名单 add 应生效，得到 action=%s", action)
 	}
 
 	// 验证项目级灰名单 remove 生效（默认的 git push 被移除）
 	action, _ = filter.Check("git push origin main")
-	if action == "approve" {
-		t.Error("git push 应被项目级 remove 移除，但仍需审批")
+	if action == "ask" {
+		t.Error("git push 应被项目级 remove 移除，但仍会请求 Interaction")
 	}
 }
 
@@ -316,7 +316,7 @@ func TestBuildFilter_EmptyRules(t *testing.T) {
 	}
 
 	action, _ = filter.Check("git push")
-	if action != "approve" {
-		t.Errorf("应使用默认规则，git push 应需审批，得到 action=%s", action)
+	if action != "ask" {
+		t.Errorf("应使用默认规则，git push 应请求 Interaction，得到 action=%s", action)
 	}
 }

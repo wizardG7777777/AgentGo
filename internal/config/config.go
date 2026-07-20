@@ -10,6 +10,8 @@ import (
 	"strings"
 	"unicode/utf16"
 
+	"agentgo/internal/modes"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -23,7 +25,7 @@ import (
 
 // LLMConfig 全局 LLM 默认值（v4 §11.4）。
 // per-kind 通过 AgentKind.Model 覆盖默认模型；BaseURL/APIKey/TimeoutSec 共用。
-// Provider 是 v4 spec 之外的 AgentGo 现存能力（区分 openai / deepseek-v4 / deepseek-r1
+// Provider 是 v4 spec 之外的 AgentGo 现存能力（区分 openai / openrouter / deepseek-v4 / deepseek-r1
 // 等非标 endpoint），保留以兼容现有 internal/llm/provider 注册表。
 type LLMConfig struct {
 	BaseURL      string `yaml:"base_url" json:"base_url"`
@@ -31,6 +33,31 @@ type LLMConfig struct {
 	DefaultModel string `yaml:"default_model" json:"default_model"`
 	TimeoutSec   int    `yaml:"timeout_sec" json:"timeout_sec"`
 	Provider     string `yaml:"provider,omitempty" json:"provider,omitempty"`
+	// ReasoningEffort maps to the OpenAI Chat Completions reasoning_effort
+	// request parameter. Empty means omit the parameter and let the selected
+	// model/provider choose its default. Validation accepts the union of values
+	// currently documented by OpenAI models.
+	ReasoningEffort string `yaml:"reasoning_effort,omitempty" json:"reasoning_effort,omitempty"`
+	// Stream switches the SDK transport to Chat Completions SSE streaming. The
+	// client still returns one fully accumulated Response so ReAct/tool semantics
+	// remain unchanged while live deltas can be observed by the UI.
+	Stream bool `yaml:"stream" json:"stream"`
+}
+
+// OpenAIReasoningEfforts is the current union of reasoning-effort values
+// documented across OpenAI reasoning models. Individual models may support a
+// subset; that model-specific capability remains authoritative at request time.
+var OpenAIReasoningEfforts = []string{
+	"none", "minimal", "low", "medium", "high", "xhigh", "max",
+}
+
+func isOpenAIReasoningEffort(value string) bool {
+	for _, candidate := range OpenAIReasoningEfforts {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 // AgentKind 一个 agent 种类的声明（v4 §11.4）。
@@ -65,11 +92,37 @@ type AgentKind struct {
 	Description string `yaml:"description,omitempty" json:"description,omitempty"`
 }
 
+const (
+	// DefaultSchedulerMaxLoops 是 Scheduler 单任务默认循环预算。
+	DefaultSchedulerMaxLoops = 50
+	// DefaultSchedulerCompactTokenThreshold 保持 Agent 层历史压缩的既有回退值。
+	DefaultSchedulerCompactTokenThreshold = 80000
+	// DefaultSchedulerContextLimit 是预测下一轮 prompt 的默认硬截断预算。
+	DefaultSchedulerContextLimit = 200000
+)
+
 // SchedulerKind scheduler 独立块（v4 §11.5.5）。
-// 配置面刻意收窄——仅 model 字段允许外部覆盖；工具集 / 系统提示词 / 行为参数 /
-// replicas 全部硬编码在 internal/scheduler 包。
+// 工具集 / 系统提示词 / replicas 仍由 internal/scheduler 固定；模型与影响
+// ReAct 历史预算的三个参数允许覆盖。三个预算的零值都回落内置默认。
 type SchedulerKind struct {
-	Model string `yaml:"model,omitempty" json:"model,omitempty"`
+	Model                        string `yaml:"model,omitempty" json:"model,omitempty"`
+	AgentMaxLoops                int    `yaml:"agent_max_loops,omitempty" json:"agent_max_loops,omitempty"`
+	EnforceCompactTokenThreshold int    `yaml:"enforce_compact_token_threshold,omitempty" json:"enforce_compact_token_threshold,omitempty"`
+	ContextLimit                 int    `yaml:"context_limit,omitempty" json:"context_limit,omitempty"`
+}
+
+// ModesConfig 三轴工作模式声明（modes: 块，v5 三轴模式）。
+//
+// 三轴相互正交、可任意组合（如 solo+plan+strict 同时生效）：
+//   - gate：规划门控轴 —— immediate（默认）/ plan（先只读探索再执行）
+//   - exec：执行权限轴 —— normal（默认）/ strict / readonly / yolo
+//   - topo：编排拓扑轴 —— team（默认）/ solo
+//
+// 字段为空 = 该轴取默认值。运行期 TUI / Web 的 /mode 只切换 gate 轴。
+type ModesConfig struct {
+	Gate string `yaml:"gate,omitempty" json:"gate,omitempty"`
+	Exec string `yaml:"exec,omitempty" json:"exec,omitempty"`
+	Topo string `yaml:"topo,omitempty" json:"topo,omitempty"`
 }
 
 // AgentTemplatesConfig controls the optional external AgentTemplate catalogs
@@ -205,6 +258,7 @@ type Config struct {
 	// ============================================================
 	LLM                       LLMConfig            `yaml:"llm" json:"llm"`
 	Scheduler                 SchedulerKind        `yaml:"scheduler" json:"scheduler"`
+	Modes                     ModesConfig          `yaml:"modes,omitempty" json:"modes,omitempty"`
 	Agents                    []AgentKind          `yaml:"agents" json:"agents"`
 	AgentTemplates            AgentTemplatesConfig `yaml:"agent_templates,omitempty" json:"agent_templates,omitempty"`
 	Infra                     InfraConfig          `yaml:"infra" json:"infra"`
@@ -317,6 +371,11 @@ func ptrTo[T any](v T) *T { return &v }
 
 func DefaultConfig() *Config {
 	return &Config{
+		Scheduler: SchedulerKind{
+			AgentMaxLoops:                DefaultSchedulerMaxLoops,
+			EnforceCompactTokenThreshold: DefaultSchedulerCompactTokenThreshold,
+			ContextLimit:                 DefaultSchedulerContextLimit,
+		},
 		ShellTimeoutSec:            30,
 		MaxSubtaskDepth:            1,
 		TransferNoteMaxTokens:      3000, // Sprint 3 #5 TransferNote 默认预算
@@ -450,7 +509,8 @@ func LoadConfig(path string, explicit bool) (*Config, error) {
 //     agent_templates 的 user_dirs/project_dirs 同样不得含反斜杠（规则 9 及附加项）；
 //  2. 模型解析：scheduler.model 缺省回落 llm.default_model，两者皆空即报错；
 //     静态 agents 每项须有自有 model 或全局 llm.default_model；scheduler.model
-//     显式出现（非空串）时不得为纯空白（规则 10 的两半）；
+//     显式出现（非空串）时不得为纯空白；Scheduler 三项可选行为预算不得为负
+//     （规则 10 的两半及后续扩展）；
 //  3. agent_templates.max_runtime_agents 须在 0..32 之间（0 或省略 = 默认 8）；
 //  4. agents[*].kind 非空且在列表内唯一（规则 3 + 12）；
 //  5. agents[*].replicas >= 1（规则 4）；
@@ -463,12 +523,19 @@ func LoadConfig(path string, explicit bool) (*Config, error) {
 //  9. startup_probe 取值合法（tcp/off）、失败动作合法（warn/exit）、
 //     startup_probe_timeout_sec 非负（validateStartupProbe，后加的独立检查）；
 //  10. ui 块：frontends ∈ {tui, web}（去重）；web.listen 为合法 host:port；
-//     非 loopback 监听必须设置 web.token（validateUI）。
+//     非 loopback 监听必须设置 web.token（validateUI）；
+//  11. modes 块：gate ∈ {immediate, plan}、exec ∈ {normal, strict, readonly, yolo}、
+//     topo ∈ {team, solo}；字段为空 = 该轴取默认值（validateModes）。
 //
 // agents 可以为空，此时系统以 Scheduler-only 模式启动，并可在运行期从
 // AgentTemplate provision Team。只要 agents 非空，原有静态 kind 的全部严格
 // 校验仍然执行，非法配置不会静默降级。
 func (c *Config) Validate() error {
+	if c.LLM.ReasoningEffort != "" && !isOpenAIReasoningEffort(c.LLM.ReasoningEffort) {
+		return fmt.Errorf("llm.reasoning_effort=%q 无效；允许值: %s",
+			c.LLM.ReasoningEffort, strings.Join(OpenAIReasoningEfforts, ", "))
+	}
+
 	// 规则 9：所有 v4 路径字段不含反斜杠（路径风格红线）。
 	// 覆盖范围：ProjectRoot + agents[*].system_prompt_file。
 	// LLM.BaseURL 是 URL 不是文件路径，不纳入本条。
@@ -584,6 +651,18 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Scheduler 行为预算是可选覆盖：0 表示使用内置默认，负数没有合理语义，
+	// 启动时明确拒绝。
+	if c.Scheduler.AgentMaxLoops < 0 {
+		return fmt.Errorf("scheduler.agent_max_loops=%d 不能为负", c.Scheduler.AgentMaxLoops)
+	}
+	if c.Scheduler.EnforceCompactTokenThreshold < 0 {
+		return fmt.Errorf("scheduler.enforce_compact_token_threshold=%d 不能为负", c.Scheduler.EnforceCompactTokenThreshold)
+	}
+	if c.Scheduler.ContextLimit < 0 {
+		return fmt.Errorf("scheduler.context_limit=%d 不能为负", c.Scheduler.ContextLimit)
+	}
+
 	// 规则 10：scheduler.model 出现时必须为非空字符串。空整块 / 空 model 字段则缺省回落 LLM.DefaultModel
 	if c.Scheduler.Model != "" && strings.TrimSpace(c.Scheduler.Model) == "" {
 		return fmt.Errorf("scheduler.model 仅含空白字符——若要使用默认模型，请删除该字段")
@@ -605,7 +684,51 @@ func (c *Config) Validate() error {
 		return err
 	}
 
+	if err := c.validateModes(); err != nil {
+		return err
+	}
+
 	return c.validateStartupProbe()
+}
+
+// validateModes 校验 modes: 块三轴取值。字段为空 = 该轴取默认值，合法；
+// 非空值必须能被 modes.ParseXxx 解析（容错大小写），否则启动报错。
+func (c *Config) validateModes() error {
+	if v := c.Modes.Gate; v != "" {
+		if _, err := modes.ParseGateMode(v); err != nil {
+			return fmt.Errorf("modes.gate=%q 非法: %w", v, err)
+		}
+	}
+	if v := c.Modes.Exec; v != "" {
+		if _, err := modes.ParseExecMode(v); err != nil {
+			return fmt.Errorf("modes.exec=%q 非法: %w", v, err)
+		}
+	}
+	if v := c.Modes.Topo; v != "" {
+		if _, err := modes.ParseTopoMode(v); err != nil {
+			return fmt.Errorf("modes.topo=%q 非法: %w", v, err)
+		}
+	}
+	return nil
+}
+
+// ResolveModes 把 modes: 块解析为三轴初值；空字段回落默认值
+// （immediate / normal / team）。
+// 非法值同样回落默认——Validate 已在启动时先行拒绝非法值，此路径仅为防御。
+func (c *Config) ResolveModes() (modes.GateMode, modes.ExecMode, modes.TopoMode) {
+	gate := modes.GateImmediate
+	if g, err := modes.ParseGateMode(c.Modes.Gate); err == nil {
+		gate = g
+	}
+	exec := modes.ExecNormal
+	if e, err := modes.ParseExecMode(c.Modes.Exec); err == nil {
+		exec = e
+	}
+	topo := modes.TopoTeam
+	if t, err := modes.ParseTopoMode(c.Modes.Topo); err == nil {
+		topo = t
+	}
+	return gate, exec, topo
 }
 
 // validateUI 校验 ui 块：

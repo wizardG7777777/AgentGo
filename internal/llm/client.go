@@ -70,23 +70,64 @@ type Client interface {
 	Chat(ctx context.Context, messages []Message, tools []ToolDef) (Response, error)
 }
 
+// StreamEvent is a transport-level snapshot emitted while a streaming Chat
+// Completions response is being accumulated. Only answer content is exposed;
+// provider reasoning fields remain private protocol metadata in ExtraFields.
+type StreamEvent struct {
+	ContentDelta       string
+	AccumulatedContent string
+	Done               bool
+	Error              string
+}
+
+type streamHandlerKey struct{}
+
+// WithStreamHandler installs an optional synchronous observer for streamed
+// answer text. The handler must return quickly; callers that need throttling or
+// fan-out should coalesce snapshots before publishing them to a UI.
+func WithStreamHandler(ctx context.Context, handler func(StreamEvent)) context.Context {
+	if handler == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, streamHandlerKey{}, handler)
+}
+
+func streamHandlerFromContext(ctx context.Context) func(StreamEvent) {
+	handler, _ := ctx.Value(streamHandlerKey{}).(func(StreamEvent))
+	return handler
+}
+
+// ClientConfig controls standard request behavior shared by every AgentGo LLM
+// client created from the global llm block.
+type ClientConfig struct {
+	ReasoningEffort string
+	Stream          bool
+}
+
 // SDKClient 通过 openai-go 官方 SDK 实现 Client 接口。
 type SDKClient struct {
 	client       openai.Client
 	model        openai.ChatModel
 	systemPrompt string
 	provider     Provider
+	request      ClientConfig
 }
 
 const defaultLLMTimeout = 120 * time.Second
 
 // NewSDKClient 创建基于 openai-go SDK 的客户端。
 // baseURL 为空时使用 OpenAI 官方端点。
-// providerName 指定 LLM provider 适配器（"openai"/"deepseek-v4"/"deepseek-r1"），
+// providerName 指定 LLM provider 适配器（"openai"/"openrouter"/"deepseek-v4"/"deepseek-r1"），
 // 空串或未知名称时 fallback 到 OpenAIProvider（no-op，与旧版行为一致）。
 // HTTP 层重试由 SDK 内部处理（429/5xx），此处不再额外设置 MaxRetries，
 // 避免与调用方的业务重试语义重叠。
 func NewSDKClient(baseURL, apiKey, model, systemPrompt, providerName string, timeout time.Duration) *SDKClient {
+	return NewSDKClientWithConfig(baseURL, apiKey, model, systemPrompt, providerName, timeout, ClientConfig{})
+}
+
+// NewSDKClientWithConfig is the production constructor. NewSDKClient remains
+// as a compatibility wrapper for focused tests and external package users.
+func NewSDKClientWithConfig(baseURL, apiKey, model, systemPrompt, providerName string, timeout time.Duration, request ClientConfig) *SDKClient {
 	if timeout <= 0 {
 		timeout = defaultLLMTimeout
 		log.Printf("[llm] 未指定超时，使用默认值 %v", timeout)
@@ -111,6 +152,7 @@ func NewSDKClient(baseURL, apiKey, model, systemPrompt, providerName string, tim
 		model:        openai.ChatModel(model),
 		systemPrompt: systemPrompt,
 		provider:     GetProvider(providerName),
+		request:      request,
 	}
 }
 
@@ -122,6 +164,17 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 
 	params := openai.ChatCompletionNewParams{
 		Model: c.model,
+	}
+	var reasoningOpts []option.RequestOption
+	if c.request.ReasoningEffort != "" {
+		// ReasoningEffort is a string-backed SDK type. Casting keeps AgentGo
+		// aligned with newly documented OpenAI values (for example "max") even
+		// when the generated SDK constants lag the API specification.
+		if mapper, ok := c.provider.(ReasoningEffortMapper); ok {
+			reasoningOpts = mapper.ReasoningEffortOptions(c.request.ReasoningEffort)
+		} else {
+			params.ReasoningEffort = shared.ReasoningEffort(c.request.ReasoningEffort)
+		}
 	}
 
 	// 插入 system prompt（使用 system 角色以兼容 Dashscope 等非 OpenAI 后端）
@@ -155,6 +208,14 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 	var providerOpts []option.RequestOption
 	if c.provider != nil {
 		providerOpts = c.provider.RequestOptions()
+	}
+	providerOpts = append(providerOpts, reasoningOpts...)
+
+	if c.request.Stream {
+		params.StreamOptions = openai.ChatCompletionStreamOptionsParam{
+			IncludeUsage: openai.Bool(true),
+		}
+		return c.chatStreaming(ctx, params, providerOpts)
 	}
 
 	// 调用 SDK — HTTP 层错误（429/5xx）由 SDK 内部重试处理
@@ -229,6 +290,117 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 		}
 	}
 
+	return result, nil
+}
+
+// chatStreaming executes the same Chat Completions request over SSE and
+// reconstructs the ordinary Response contract consumed by the ReAct loop.
+// Tool calls are never dispatched from partial chunks: only the fully
+// accumulated response is returned to the executor.
+func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatCompletionNewParams, opts []option.RequestOption) (Response, error) {
+	stream := c.client.Chat.Completions.NewStreaming(ctx, params, opts...)
+	defer stream.Close()
+
+	handler := streamHandlerFromContext(ctx)
+	emitFailure := func(err error) (Response, error) {
+		if handler != nil {
+			handler(StreamEvent{Done: true, Error: err.Error()})
+		}
+		return Response{}, err
+	}
+
+	var acc openai.ChatCompletionAccumulator
+	var accumulatedContent string
+	// The SDK accumulator intentionally ignores JSON metadata. Keep string
+	// deltas (notably reasoning_content) by concatenation and retain the last
+	// raw value for other extension-field shapes.
+	extraStrings := make(map[string]string)
+	extraRaw := make(map[string]json.RawMessage)
+	for stream.Next() {
+		chunk := stream.Current()
+		if field, ok := chunk.JSON.ExtraFields["error"]; ok && field.Raw() != "" {
+			return emitFailure(&ErrRecoverable{Err: fmt.Errorf("流式响应返回 provider error: %s", field.Raw())})
+		}
+		if !acc.AddChunk(chunk) {
+			return emitFailure(&ErrBadResponse{Err: errors.New("流式响应 chunk 无法按序聚合")})
+		}
+		for _, choice := range chunk.Choices {
+			delta := choice.Delta
+			if delta.Content != "" {
+				accumulatedContent += delta.Content
+				if handler != nil {
+					handler(StreamEvent{
+						ContentDelta:       delta.Content,
+						AccumulatedContent: accumulatedContent,
+					})
+				}
+			}
+			for key, field := range delta.JSON.ExtraFields {
+				raw := field.Raw()
+				if raw == "" {
+					continue
+				}
+				var fragment string
+				if err := json.Unmarshal([]byte(raw), &fragment); err == nil {
+					extraStrings[key] += fragment
+					continue
+				}
+				extraRaw[key] = json.RawMessage(raw)
+			}
+		}
+	}
+	if err := stream.Err(); err != nil {
+		return emitFailure(classifySDKError(err))
+	}
+	if len(acc.Choices) == 0 {
+		return emitFailure(&ErrUnrecoverable{Err: errors.New("LLM 流式响应返回空 choices")})
+	}
+
+	choice := acc.Choices[0]
+	finishReason := parseFinishReason(string(choice.FinishReason))
+	switch finishReason {
+	case FinishReasonLength:
+		return emitFailure(&ErrBadResponse{Err: errors.New("响应被截断 (finish_reason=length)")})
+	case FinishReasonContentFilter:
+		return emitFailure(&ErrUnrecoverable{Err: errors.New("响应被内容过滤器拦截 (finish_reason=content_filter)")})
+	case FinishReasonUnknown:
+		log.Printf("[llm] 警告: 流式响应未知 finish_reason=%q", choice.FinishReason)
+	}
+
+	var toolCalls []ToolCall
+	for _, tc := range choice.Message.ToolCalls {
+		args := make(map[string]any)
+		if tc.Function.Arguments != "" {
+			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+				return emitFailure(&ErrBadResponse{Err: fmt.Errorf("流式 tool call %q 参数解析失败: %w", tc.Function.Name, err)})
+			}
+		}
+		toolCalls = append(toolCalls, ToolCall{ID: tc.ID, Name: tc.Function.Name, Arguments: args})
+	}
+
+	result := Response{
+		Content:      choice.Message.Content,
+		ToolCalls:    toolCalls,
+		FinishReason: finishReason,
+	}
+	result.Usage.PromptTokens = int(acc.Usage.PromptTokens)
+	result.Usage.CompletionTokens = int(acc.Usage.CompletionTokens)
+	if len(extraStrings)+len(extraRaw) > 0 {
+		result.ExtraFields = make(map[string]json.RawMessage, len(extraStrings)+len(extraRaw))
+		for key, value := range extraRaw {
+			result.ExtraFields[key] = value
+		}
+		for key, value := range extraStrings {
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				return emitFailure(&ErrBadResponse{Err: fmt.Errorf("流式扩展字段 %q 聚合失败: %w", key, err)})
+			}
+			result.ExtraFields[key] = encoded
+		}
+	}
+	if handler != nil {
+		handler(StreamEvent{AccumulatedContent: result.Content, Done: true})
+	}
 	return result, nil
 }
 

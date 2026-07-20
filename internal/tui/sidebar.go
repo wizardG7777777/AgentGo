@@ -153,9 +153,9 @@ func renderAgentLine(t Theme, ag AgentInfo, maxW int) string {
 	case "processing":
 		icon = t.IconRunning
 		stateStyle = t.StateProcessing
-	case "waiting_approval":
-		icon = t.IconApproval
-		stateStyle = t.StateApproval
+	case "waiting_interaction":
+		icon = t.IconInteraction
+		stateStyle = t.StateInteraction
 	case "terminating":
 		icon = t.IconAgent
 		stateStyle = t.StateTerminate

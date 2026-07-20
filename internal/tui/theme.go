@@ -6,10 +6,10 @@ import "github.com/charmbracelet/lipgloss"
 // centralized Styles struct — all sub-components reference this single instance.
 type Theme struct {
 	// Header
-	HeaderStyle   lipgloss.Style
-	HeaderTitle   lipgloss.Style
-	HeaderMeta    lipgloss.Style
-	HeaderSep     lipgloss.Style
+	HeaderStyle lipgloss.Style
+	HeaderTitle lipgloss.Style
+	HeaderMeta  lipgloss.Style
+	HeaderSep   lipgloss.Style
 
 	// Sidebar
 	SidebarBorder   lipgloss.Style
@@ -20,20 +20,20 @@ type Theme struct {
 	SidebarSection  lipgloss.Style
 
 	// Agent states
-	StateIdle       lipgloss.Style
-	StateProcessing lipgloss.Style
-	StateApproval   lipgloss.Style
-	StateTerminate  lipgloss.Style
+	StateIdle        lipgloss.Style
+	StateProcessing  lipgloss.Style
+	StateInteraction lipgloss.Style
+	StateTerminate   lipgloss.Style
 
 	// Main content
 	MainBorder lipgloss.Style
 
 	// Dashboard cards
-	CardBorder   lipgloss.Style
-	CardTitle    lipgloss.Style
-	CardBody     lipgloss.Style
-	CardActive   lipgloss.Style
-	CardIdle     lipgloss.Style
+	CardBorder lipgloss.Style
+	CardTitle  lipgloss.Style
+	CardBody   lipgloss.Style
+	CardActive lipgloss.Style
+	CardIdle   lipgloss.Style
 
 	// Messages
 	MsgTimestamp lipgloss.Style
@@ -47,12 +47,12 @@ type Theme struct {
 	ResultBorder lipgloss.Style
 	ResultTitle  lipgloss.Style
 
-	// Approval
-	ApprovalBorder lipgloss.Style
-	ApprovalTitle  lipgloss.Style
-	ApprovalKey    lipgloss.Style
-	ApprovalCmd    lipgloss.Style
-	ApprovalQueue  lipgloss.Style
+	// Interaction
+	InteractionBorder lipgloss.Style
+	InteractionTitle  lipgloss.Style
+	InteractionKey    lipgloss.Style
+	InteractionPrompt lipgloss.Style
+	InteractionQueue  lipgloss.Style
 
 	// Editor / Input
 	EditorPrompt lipgloss.Style
@@ -64,14 +64,14 @@ type Theme struct {
 	StatusVal   lipgloss.Style
 
 	// Markdown
-	MdH1       lipgloss.Style
-	MdH2       lipgloss.Style
-	MdH3       lipgloss.Style
-	MdBold     lipgloss.Style
-	MdCode     lipgloss.Style
-	MdCodeBlk  lipgloss.Style
-	MdList     lipgloss.Style
-	MdDivider  lipgloss.Style
+	MdH1      lipgloss.Style
+	MdH2      lipgloss.Style
+	MdH3      lipgloss.Style
+	MdBold    lipgloss.Style
+	MdCode    lipgloss.Style
+	MdCodeBlk lipgloss.Style
+	MdList    lipgloss.Style
+	MdDivider lipgloss.Style
 
 	// Task status
 	TaskPending    lipgloss.Style
@@ -81,28 +81,28 @@ type Theme struct {
 	TaskCancelled  lipgloss.Style
 
 	// Icons
-	IconAgent     string
-	IconIdle      string
-	IconRunning   string
-	IconApproval  string
-	IconDone      string
-	IconFailed    string
-	IconPending   string
-	IconArrow     string
-	IconSection   string
+	IconAgent       string
+	IconIdle        string
+	IconRunning     string
+	IconInteraction string
+	IconDone        string
+	IconFailed      string
+	IconPending     string
+	IconArrow       string
+	IconSection     string
 }
 
 // DefaultTheme creates the default color theme.
 func DefaultTheme() Theme {
-	accent := lipgloss.Color("39")    // blue
-	green := lipgloss.Color("82")     // bright green
-	yellow := lipgloss.Color("214")   // orange/yellow
-	red := lipgloss.Color("196")      // red
-	dim := lipgloss.Color("240")      // dark gray
-	dimmer := lipgloss.Color("236")   // very dark gray
-	bright := lipgloss.Color("252")   // bright gray
-	cyan := lipgloss.Color("87")      // cyan
-	_ = lipgloss.Color("141")         // purple, reserved
+	accent := lipgloss.Color("39")  // blue
+	green := lipgloss.Color("82")   // bright green
+	yellow := lipgloss.Color("214") // orange/yellow
+	red := lipgloss.Color("196")    // red
+	dim := lipgloss.Color("240")    // dark gray
+	dimmer := lipgloss.Color("236") // very dark gray
+	bright := lipgloss.Color("252") // bright gray
+	cyan := lipgloss.Color("87")    // cyan
+	_ = lipgloss.Color("141")       // purple, reserved
 
 	return Theme{
 		// Header
@@ -148,7 +148,7 @@ func DefaultTheme() Theme {
 		StateProcessing: lipgloss.NewStyle().
 			Foreground(green).
 			Bold(true),
-		StateApproval: lipgloss.NewStyle().
+		StateInteraction: lipgloss.NewStyle().
 			Foreground(yellow).
 			Bold(true),
 		StateTerminate: lipgloss.NewStyle().
@@ -193,20 +193,20 @@ func DefaultTheme() Theme {
 			Foreground(green).
 			Bold(true),
 
-		// Approval
-		ApprovalBorder: lipgloss.NewStyle().
+		// Interaction
+		InteractionBorder: lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(red).
 			Padding(0, 1),
-		ApprovalTitle: lipgloss.NewStyle().
+		InteractionTitle: lipgloss.NewStyle().
 			Foreground(red).
 			Bold(true),
-		ApprovalKey: lipgloss.NewStyle().
+		InteractionKey: lipgloss.NewStyle().
 			Foreground(cyan).
 			Bold(true),
-		ApprovalCmd: lipgloss.NewStyle().
+		InteractionPrompt: lipgloss.NewStyle().
 			Foreground(yellow),
-		ApprovalQueue: lipgloss.NewStyle().
+		InteractionQueue: lipgloss.NewStyle().
 			Foreground(dim),
 
 		// Editor
@@ -244,14 +244,14 @@ func DefaultTheme() Theme {
 		TaskCancelled:  lipgloss.NewStyle().Foreground(dim),
 
 		// Icons
-		IconAgent:    "◉",
-		IconIdle:     "○",
-		IconRunning:  "●",
-		IconApproval: "⏳",
-		IconDone:     "✓",
-		IconFailed:   "✗",
-		IconPending:  "◇",
-		IconArrow:    "▸",
-		IconSection:  "─",
+		IconAgent:       "◉",
+		IconIdle:        "○",
+		IconRunning:     "●",
+		IconInteraction: "⏳",
+		IconDone:        "✓",
+		IconFailed:      "✗",
+		IconPending:     "◇",
+		IconArrow:       "▸",
+		IconSection:     "─",
 	}
 }

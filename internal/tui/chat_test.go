@@ -78,6 +78,24 @@ func TestRenderChat_WithLastResult(t *testing.T) {
 	}
 }
 
+func TestRenderChat_LastResultStaysPinnedWhenLogsOverflow(t *testing.T) {
+	theme := DefaultTheme()
+	now := time.Now()
+	lastResult := &StyledMsg{Text: "explicit final reply", Kind: MsgResult, At: now}
+	msgs := make([]StyledMsg, 0, 100)
+	for i := 0; i < 100; i++ {
+		msgs = append(msgs, StyledMsg{Text: "noisy diagnostic log", Kind: MsgLog, At: now})
+	}
+
+	result := renderChat(theme, 80, 14, msgs, lastResult)
+	if !strings.Contains(result, "explicit final reply") {
+		t.Fatal("日志溢出不应再把最近结果卡从消息页裁掉")
+	}
+	if len(strings.Split(result, "\n")) > 14 {
+		t.Fatal("保留结果卡后仍必须遵守终端高度约束")
+	}
+}
+
 func TestRenderChat_Timestamps(t *testing.T) {
 	theme := DefaultTheme()
 	now := time.Date(2026, 5, 26, 14, 30, 45, 0, time.UTC)
@@ -103,7 +121,7 @@ func TestRenderChat_AgentAttribution(t *testing.T) {
 	}
 }
 
-func TestRenderChat_LineTruncation(t *testing.T) {
+func TestRenderChat_LongLineWrapsWithoutContentLoss(t *testing.T) {
 	theme := DefaultTheme()
 	longLine := strings.Repeat("x", 200)
 	msgs := []StyledMsg{
@@ -111,20 +129,20 @@ func TestRenderChat_LineTruncation(t *testing.T) {
 	}
 	result := renderChat(theme, 80, 20, msgs, nil)
 
-	if !strings.Contains(result, "…") {
-		t.Error("long lines should be truncated")
+	if strings.Contains(result, "…") || strings.Count(result, "x") != len(longLine) {
+		t.Error("long lines should wrap instead of being truncated")
 	}
 }
 
-func TestRenderChat_WideLineTruncation(t *testing.T) {
+func TestRenderChat_WideLineWrapsWithinCellWidth(t *testing.T) {
 	theme := DefaultTheme()
 	msgs := []StyledMsg{
 		{Text: strings.Repeat("处理🙂", 20), Kind: MsgInfo, At: time.Now(), AgentID: "worker-1"},
 	}
 	result := renderChat(theme, 40, 8, msgs, nil)
 
-	if !strings.Contains(result, "…") {
-		t.Error("wide lines should be truncated")
+	if strings.Contains(result, "…") {
+		t.Error("wide lines should wrap instead of being truncated")
 	}
 	for i, line := range strings.Split(result, "\n") {
 		if got := lipgloss.Width(line); got > 40 {

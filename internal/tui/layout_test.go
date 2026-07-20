@@ -103,9 +103,16 @@ func TestCalcLayout_TinyTerminal(t *testing.T) {
 	}
 }
 
-func TestCalcLayout_ApprovalOverlapsInput(t *testing.T) {
-	l := calcLayout(120, 40, ViewDashboard)
-	if l.ApprovalY != l.InputY {
-		t.Errorf("ApprovalY = %d, want %d (should overlap input)", l.ApprovalY, l.InputY)
+func TestCalcLayout_InteractionStacksAboveInput(t *testing.T) {
+	l := calcLayout(120, 40, ViewDashboard, 4, 7)
+	if l.InteractionH != 7 {
+		t.Fatalf("InteractionH = %d, want 7", l.InteractionH)
+	}
+	if l.InteractionY+l.InteractionH != l.InputY {
+		t.Fatalf("Interaction should end where input starts: interactionY=%d interactionH=%d inputY=%d",
+			l.InteractionY, l.InteractionH, l.InputY)
+	}
+	if l.InputY+l.InputH != l.StatusY {
+		t.Error("input should remain directly above status bar")
 	}
 }

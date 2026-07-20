@@ -36,23 +36,23 @@ func TestRenderHeader_PlanMode(t *testing.T) {
 	}
 }
 
-func TestRenderHeader_WithApprovals(t *testing.T) {
+func TestRenderHeader_WithInteractions(t *testing.T) {
 	theme := DefaultTheme()
 	l := calcLayout(120, 40, ViewDashboard)
 	result := renderHeader(theme, l, scheduler.ModeImmediate, "", 2, 3)
 
-	if !strings.Contains(result, "3 approval") {
-		t.Error("should show approval count when > 0")
+	if !strings.Contains(result, "3 interaction") {
+		t.Error("should show interaction count when > 0")
 	}
 }
 
-func TestRenderHeader_NoApprovals(t *testing.T) {
+func TestRenderHeader_NoInteractions(t *testing.T) {
 	theme := DefaultTheme()
 	l := calcLayout(120, 40, ViewDashboard)
 	result := renderHeader(theme, l, scheduler.ModeImmediate, "", 2, 0)
 
-	if strings.Contains(result, "approval") {
-		t.Error("should not show approval indicator when count is 0")
+	if strings.Contains(result, "interaction") {
+		t.Error("should not show interaction indicator when count is 0")
 	}
 }
 
