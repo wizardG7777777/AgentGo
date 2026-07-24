@@ -13,6 +13,7 @@ import (
 	"agentgo/internal/model"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
+	"agentgo/internal/trace"
 )
 
 // PlanRouteRegistry is the smallest runtime-routing authority Watchdog needs.
@@ -50,9 +51,10 @@ func NewRuntimeRouteResolver(registry PlanRouteRegistry) RouteResolver {
 type pendingObservationKind string
 
 const (
-	pendingObservationRoutable   pendingObservationKind = "routable"
-	pendingObservationUnroutable pendingObservationKind = "unroutable"
-	defaultPendingGraceSec                              = 300
+	pendingObservationRoutable          pendingObservationKind = "routable"
+	pendingObservationUnroutable        pendingObservationKind = "unroutable"
+	pendingObservationAcceptanceBlocked pendingObservationKind = "acceptance_blocked"
+	defaultPendingGraceSec                                     = 300
 )
 
 type pendingObservation struct {
@@ -134,7 +136,7 @@ func (w *Watchdog) checkTask(task *model.Task) {
 	}
 	switch task.Status {
 	case model.TaskStatusProcessing:
-		w.clearPendingObservation(task.ID)
+		w.clearPendingObservationExcept(task.ID, pendingObservationAcceptanceBlocked)
 		w.checkProcessingTask(task)
 	case model.TaskStatusPending:
 		w.checkPendingTask(task)
@@ -164,6 +166,9 @@ func (w *Watchdog) checkProcessingTask(task *model.Task) {
 	for _, depID := range task.Dependencies {
 		dep, err := w.Store.GetTask(depID)
 		if err != nil {
+			if w.guardAcceptanceCascade(task, depID, "missing", fmt.Sprintf("依赖任务 %s 不存在", depID)) {
+				return
+			}
 			log.Printf("[watchdog] task %s dependency %s not found (processing), cancelling", task.ID, depID)
 			if err := store.TransitionStateWithCancelSource(w.Store, task.ID, model.TaskStatusProcessing, model.TaskStatusCancelled, "dependency_failure"); err != nil {
 				log.Printf("[watchdog] 级联取消 task %s 失败: %v", task.ID, err)
@@ -174,6 +179,9 @@ func (w *Watchdog) checkProcessingTask(task *model.Task) {
 			return
 		}
 		if dep.Status == model.TaskStatusFailed || dep.Status == model.TaskStatusCancelled {
+			if w.guardAcceptanceCascade(task, depID, string(dep.Status), fmt.Sprintf("依赖任务 %s 已 %s", depID, dep.Status)) {
+				return
+			}
 			log.Printf("[watchdog] task %s dependency %s is %s (processing), cascade cancelling", task.ID, depID, dep.Status)
 			if err := store.TransitionStateWithCancelSource(w.Store, task.ID, model.TaskStatusProcessing, model.TaskStatusCancelled, "dependency_failure"); err != nil {
 				log.Printf("[watchdog] 级联取消 task %s 失败: %v", task.ID, err)
@@ -186,30 +194,58 @@ func (w *Watchdog) checkProcessingTask(task *model.Task) {
 	}
 }
 
+// emitPendingCascadeCancelTrace 为 pending→cancelled 的级联取消补发 trace 事件。
+// processing 任务的取消事件由正在执行的 agent 在 ctx.Done() 分支 emit；
+// pending 任务没有执行者，若不在此补发，排队期间被级联取消的任务在 trace
+// 中完全不可见（2026-07-21 验收空转事故里多个排队验收任务即是如此）。
+func emitPendingCascadeCancelTrace(taskID, reason string) {
+	trace.Emit(trace.Event{
+		Kind:   trace.KindTaskCancelled,
+		TaskID: taskID,
+		Reason: reason,
+		Transition: &trace.Transition{
+			PrevStatus:   string(model.TaskStatusPending),
+			NewStatus:    string(model.TaskStatusCancelled),
+			Cause:        "cascade_dependency_failure",
+			CancelSource: "dependency_failure",
+		},
+	})
+}
+
 func (w *Watchdog) checkPendingTask(task *model.Task) {
 	// Dependency state is authoritative before queue-age classification. A
 	// healthy but incomplete dependency is normal waiting, not starvation.
 	for _, depID := range task.Dependencies {
 		dep, err := w.Store.GetTask(depID)
 		if err != nil {
+			if w.guardAcceptanceCascade(task, depID, "missing", fmt.Sprintf("依赖任务 %s 不存在", depID)) {
+				return
+			}
 			// 依赖缺失，视为失败
 			log.Printf("[watchdog] task %s dependency %s not found, cancelling", task.ID, depID)
+			reason := fmt.Sprintf("级联取消：依赖任务 %s 不存在", depID)
 			if err := store.TransitionStateWithCancelSource(w.Store, task.ID, model.TaskStatusPending, model.TaskStatusCancelled, "dependency_failure"); err != nil {
 				log.Printf("[watchdog] 级联取消 task %s 失败: %v", task.ID, err)
+			} else {
+				emitPendingCascadeCancelTrace(task.ID, reason)
 			}
 			w.sendAlert(task.ID)
-			reason := fmt.Sprintf("级联取消：依赖任务 %s 不存在", depID)
 			w.sendCrashReport(task, reason, w.pendingElapsed(task))
 			w.clearPendingObservation(task.ID)
 			return
 		}
 		if dep.Status == model.TaskStatusFailed || dep.Status == model.TaskStatusCancelled {
+			if w.guardAcceptanceCascade(task, depID, string(dep.Status), fmt.Sprintf("依赖任务 %s 已 %s", depID, dep.Status)) {
+				return
+			}
 			log.Printf("[watchdog] task %s dependency %s is %s, cascade cancelling", task.ID, depID, dep.Status)
+			reason := fmt.Sprintf("级联取消：依赖任务 %s 已 %s", depID, dep.Status)
 			if err := store.TransitionStateWithCancelSource(w.Store, task.ID, model.TaskStatusPending, model.TaskStatusCancelled, "dependency_failure"); err != nil {
 				log.Printf("[watchdog] 级联取消 task %s 失败: %v", task.ID, err)
+			} else {
+				emitPendingCascadeCancelTrace(task.ID, reason)
 			}
 			w.sendAlert(task.ID)
-			reason := fmt.Sprintf("级联取消：依赖任务 %s 已 %s", depID, dep.Status)
 			w.sendCrashReport(task, reason, w.pendingElapsed(task))
 			w.clearPendingObservation(task.ID)
 			return
@@ -322,6 +358,31 @@ func (w *Watchdog) observeUnroutable(taskID string, now time.Time) pendingObserv
 	return observation
 }
 
+// guardAcceptanceCascade 让 acceptance 角色的 dependent 免于级联取消：依赖
+// 已失败/取消/缺失时，验收任务的存废由 PlanCoordinator/Scheduler 经 replan
+// 决定（supersede 或重绑定目标），watchdog 只按租约告警一次，不直接终态化。
+// 返回 true 表示已接管，调用方应立即 return。
+func (w *Watchdog) guardAcceptanceCascade(task *model.Task, depID, depStatus, reason string) bool {
+	if task.NodeRole != model.PlanNodeRoleAcceptance || task.PlanID == "" {
+		return false
+	}
+	since := task.PendingSince
+	if task.Status == model.TaskStatusProcessing {
+		since = task.StartedAt
+	}
+	now := w.currentTime()
+	if since.IsZero() {
+		since = now
+	}
+	observation := w.observePending(task.ID, pendingObservationAcceptanceBlocked, since)
+	if !observation.alerted {
+		w.markPendingAlerted(task.ID, pendingObservationAcceptanceBlocked, observation.since)
+		w.sendPendingAlert(task.ID, "acceptance_dependency_lost", reason)
+		log.Printf("[watchdog] acceptance task %s dependency %s is %s; alerting control plane instead of cascade cancelling", task.ID, depID, depStatus)
+	}
+	return true
+}
+
 func (w *Watchdog) checkRoutableQueueWait(task *model.Task) {
 	now := w.currentTime()
 	since := task.PendingSince
@@ -373,6 +434,17 @@ func (w *Watchdog) markPendingAlerted(taskID string, kind pendingObservationKind
 func (w *Watchdog) clearPendingObservation(taskID string) {
 	w.pendingMu.Lock()
 	delete(w.pendingObservations, taskID)
+	w.pendingMu.Unlock()
+}
+
+// clearPendingObservationExcept 清除除指定 kind 外的租约观测。processing 分支
+// 用它保留 acceptance_blocked 观测——验收豁免的告警租约横跨 processing 阶段，
+// 每轮清理会导致重复告警。
+func (w *Watchdog) clearPendingObservationExcept(taskID string, keep pendingObservationKind) {
+	w.pendingMu.Lock()
+	if observation, ok := w.pendingObservations[taskID]; ok && observation.kind != keep {
+		delete(w.pendingObservations, taskID)
+	}
 	w.pendingMu.Unlock()
 }
 
