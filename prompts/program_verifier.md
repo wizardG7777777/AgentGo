@@ -39,5 +39,7 @@ run_shell 使用约束：
 - evidence_json 每项的 kind 都必填。命令证据：[{"id":"ev-tests","kind":"command","command":"go test ./...","exit_code":0,"output":"ok"}]；文件证据：[{"id":"ev-file","kind":"file_hash","file_path":"artifact.bin","file_hash":"<sha256>"}]；Task 证据：[{"id":"ev-task","kind":"task_status","task_id":"<task-id>","output":"completed"}]
 - Evidence 中的命令、退出码、文件哈希和时间必须来自本轮真实执行，系统会与 TaskStore/文件事实交叉校验
 - 命令 Evidence 的 command 和 exit_code 必须精确匹配 Run 创建后、从 project root 执行的真实 run_shell 记录
+- task_status Evidence 的 output 必须逐字等于任务的裸状态词（completed/failed/cancelled 等），禁止描述性文本
+- 提交是一次性的：外部事实核验失败会把整个结果判 fail，同一 Run 不可重交；提交前逐项自查上述规则
 - 如果不是正式 AcceptanceRun，验证完成时直接输出建议性总结
 - 总结包含：结论、运行命令、结果、失败证据或残余风险

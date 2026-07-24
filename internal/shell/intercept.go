@@ -33,7 +33,9 @@ const (
 	MetadataDigest     = "digest"
 )
 
-// MVP 阶段硬编码的默认黑名单（正则模式，匹配即拒绝）。
+// 默认黑名单（正则模式，匹配即拒绝）。同时覆盖 Unix 与 Windows/PowerShell
+// 危险命令形态——run_shell 在 Windows 由 PowerShell 解释、POSIX 由 sh 解释，
+// 两套方言的不可逆操作都必须硬拒（2026-07-21 跨平台排查 H2）。
 var DefaultBlacklist = []string{
 	`rm\s+-rf\s+/`,     // rm -rf /
 	`mkfs\.`,           // 格式化磁盘
@@ -42,9 +44,19 @@ var DefaultBlacklist = []string{
 	`shutdown`,         // 关机
 	`reboot`,           // 重启
 	`init\s+0`,         // 关机
+	// ---- Windows / PowerShell 形态（cmdlet 大小写不敏感，统一加 (?i)）----
+	`(?i)\bformat\s+[a-z]:`,           // format C: 格式化磁盘
+	`(?i)\bdiskpart\b`,                // 磁盘分区操作
+	`(?i)\bbcdedit\b`,                 // 启动配置修改
+	`(?i)-enc(odedcommand)?(\s|$)`,    // PowerShell base64 编码载荷（-enc 为其合法前缀缩写）
+	`(?i)\biex\b|Invoke-Expression`,   // 动态执行任意字符串
+	`(?i)\breg\s+delete\b`,            // 注册表删除
+	`(?i)\b(rd|rmdir)\b[^|&]*/s\b`,    // cmd 递归删除目录
+	`(?i)\bdel\b[^|&]*/s\b`,           // cmd 递归删除文件
+	`(?i)Remove-Item\b[^|&]*-Recurse`, // PowerShell 递归删除
 }
 
-// MVP 阶段硬编码的默认灰名单（正则模式，匹配时需创建用户 Interaction）。
+// 默认灰名单（正则模式，匹配时需创建用户 Interaction）。
 var DefaultGreylist = []string{
 	`git\s+push`,           // 推送到远程
 	`git\s+reset\s+--hard`, // 硬重置
@@ -57,6 +69,11 @@ var DefaultGreylist = []string{
 	`npm\s+install\s+-g`,   // 全局安装 npm 包
 	`apt\s+install`,        // 安装系统包
 	`yum\s+install`,        // 安装系统包
+	// ---- Windows / PowerShell 形态 ----
+	`(?i)\bStop-Process\b`,                  // 终止进程
+	`(?i)\bSet-ExecutionPolicy\b`,           // 修改脚本执行策略
+	`(?i)\bicacls\b|\btakeown\b`,            // 修改 ACL / 所有权
+	`(?i)\brm\s+-[a-z]*(r[a-z]*f|f[a-z]*r)`, // rm -rf 递归强制删除（PowerShell rm 别名同形）
 }
 
 // CommandFilter 命令拦截器，通过正则模式匹配危险命令。
@@ -276,8 +293,8 @@ func WrapShellTool(inner agent.ToolFunc, filter *CommandFilter,
 				Prompt:        prompt,
 				AllowFreeText: true,
 				Options:       options,
-				Origin:  interaction.Origin{Component: "shell", AgentID: agentID, TaskID: taskID},
-				Subject: interaction.Subject{Kind: "shell_command", ID: digest, TaskID: taskID, Digest: digest},
+				Origin:        interaction.Origin{Component: "shell", AgentID: agentID, TaskID: taskID},
+				Subject:       interaction.Subject{Kind: "shell_command", ID: digest, TaskID: taskID, Digest: digest},
 				Resolution: interaction.ResolutionSpec{
 					Handler: ResolutionHandlerShellCommand, TargetID: digest,
 					AgentID: agentID, TaskID: taskID,

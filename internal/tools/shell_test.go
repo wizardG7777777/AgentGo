@@ -80,9 +80,7 @@ func TestShellGroup_Register_OneTool(t *testing.T) {
 }
 
 func TestRunShell_BasicEcho(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skip on windows")
-	}
+	// echo 在 POSIX sh 与 Windows PowerShell（别名）下均可用。
 	group, _ := newTestShellGroup(t, t.TempDir(), emptyFilter())
 	out, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "echo hello"})
 	if err != nil || !strings.Contains(out, "exit_code: 0") || !strings.Contains(out, "hello") {
@@ -91,20 +89,16 @@ func TestRunShell_BasicEcho(t *testing.T) {
 }
 
 func TestRunShell_NonZeroExit(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skip on windows")
-	}
+	// exit 3 在 POSIX sh 与 PowerShell 下都以退出码 3 终止。
 	group, _ := newTestShellGroup(t, t.TempDir(), emptyFilter())
-	out, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "false"})
-	if err != nil || strings.Contains(out, "exit_code: 0") {
+	out, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "exit 3"})
+	if err != nil || !strings.Contains(out, "exit_code: 3") {
 		t.Fatalf("out=%q err=%v", out, err)
 	}
 }
 
 func TestRunShell_Timeout(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skip on windows")
-	}
+	// sleep 在 PowerShell 中是 Start-Sleep 的别名，两个平台都可用。
 	group, _ := newTestShellGroup(t, t.TempDir(), emptyFilter())
 	started := time.Now()
 	_, err := dispatchRunShell(context.Background(), group, map[string]any{
@@ -119,9 +113,7 @@ func TestRunShell_Timeout(t *testing.T) {
 }
 
 func TestRunShell_WorkingDirectories(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skip on windows")
-	}
+	// ls 在 PowerShell 中是 Get-ChildItem 的别名，两个平台都可用。
 	t.Run("override", func(t *testing.T) {
 		override := t.TempDir()
 		if err := os.WriteFile(filepath.Join(override, "override.txt"), []byte("x"), 0o644); err != nil {
@@ -157,9 +149,7 @@ func TestRunShell_BlacklistBlocked(t *testing.T) {
 }
 
 func TestRunShell_InteractionAllowAndFallbackDirectoryBinding(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skip real shell execution on windows")
-	}
+	// echo gray 在 POSIX sh 与 Windows PowerShell（别名）下均可用。
 	fallback := t.TempDir()
 	group, service := newTestShellGroup(t, fallback, shell.NewCommandFilter(nil, []string{`^echo gray$`}))
 	type result struct {
@@ -280,5 +270,51 @@ func TestShellGroup_ModesYoloAutoAllowsGrey(t *testing.T) {
 	}
 	if pending, listErr := service.ListPending(context.Background(), ""); listErr != nil || len(pending) != 0 {
 		t.Fatalf("yolo 不应创建 Interaction: pending=%d err=%v", len(pending), listErr)
+	}
+}
+
+// shellCommand 平台分发：Windows 走 PowerShell（-NoProfile -NonInteractive -Command），
+// POSIX 走 sh -c（2026-07-21 跨平台排查 H1/M7）。
+func TestShellCommand_PlatformDispatch(t *testing.T) {
+	bin, args := shellCommand("echo hi")
+	if runtime.GOOS == "windows" {
+		if bin != "powershell" {
+			t.Fatalf("bin=%q want powershell", bin)
+		}
+		want := []string{"-NoProfile", "-NonInteractive", "-Command", "echo hi"}
+		if len(args) != len(want) {
+			t.Fatalf("args=%v want %v", args, want)
+		}
+		for i := range want {
+			if args[i] != want[i] {
+				t.Fatalf("args=%v want %v", args, want)
+			}
+		}
+		return
+	}
+	if bin != "sh" || len(args) != 2 || args[0] != "-c" || args[1] != "echo hi" {
+		t.Fatalf("bin=%q args=%v, want sh -c", bin, args)
+	}
+}
+
+// run_shell 工具描述必须包含当前 shell 方言说明——LLM 写命令前需要知道
+// 解释器是谁（2026-07-21 验收马拉松事故根因）。
+func TestRunShell_DescriptionContainsDialect(t *testing.T) {
+	registry := agent.NewToolRegistry()
+	group, _ := newTestShellGroup(t, t.TempDir(), nil)
+	group.Register(registry)
+	defs := registry.Defs()
+	if len(defs) != 1 {
+		t.Fatalf("Defs = %+v", defs)
+	}
+	desc := defs[0].Description
+	if runtime.GOOS == "windows" {
+		if !strings.Contains(desc, "PowerShell") || !strings.Contains(desc, "write_file") {
+			t.Errorf("Windows 描述缺 PowerShell 方言或写文件规则: %q", desc)
+		}
+		return
+	}
+	if !strings.Contains(desc, "POSIX sh") {
+		t.Errorf("POSIX 描述缺 sh 方言说明: %q", desc)
 	}
 }

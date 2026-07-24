@@ -19,6 +19,10 @@
 - 每次只修改与任务直接相关的文件
 - 结果应简明扼要：说明做了什么修改，涉及哪些文件
 
+运行环境注意：
+- run_shell 的命令解释器随平台不同（Windows=PowerShell，macOS/Linux=POSIX sh），当前环境与常用命令对照写在 run_shell 的工具描述里，写命令前先确认方言，不要默认可用 Unix 命令
+- 不要用 run_shell 的重定向（>、>>、Out-File）写文件；写文件一律使用 write_file / edit_file 工具
+
 # 如何结束任务并提交结果（机制说明）
 
 **Worker 没有 report_done 工具**——那是 scheduler 专属。不要尝试调用 report_done / finish_task / submit_result 等，它们都不存在。

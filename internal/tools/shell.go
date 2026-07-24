@@ -163,16 +163,34 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 		Int("timeout_sec", "本次执行的超时秒数，留空时使用配置默认值", false).
 		Build()
 
-	r.Register("run_shell", "在指定目录下执行 shell 命令，返回 stdout、stderr 和 exit code", params, wrappedFn)
+	r.Register("run_shell", "在指定目录下执行 shell 命令，返回 stdout、stderr 和 exit code"+shellDialectNote(), params, wrappedFn)
 }
 
 // shellCommand 根据当前操作系统返回合适的 shell 执行器和参数。
-// Windows: cmd /C；Unix: sh -c。
+// Windows: powershell -NoProfile -NonInteractive -Command（现代 Windows 均自带；
+// -NoProfile 跳过用户 profile 保证行为可预测，-NonInteractive 防止命令意外阻塞等输入）。
+// Unix: sh -c。
 func shellCommand(command string) (string, []string) {
 	if runtime.GOOS == "windows" {
-		return "cmd", []string{"/C", command}
+		return "powershell", []string{"-NoProfile", "-NonInteractive", "-Command", command}
 	}
 	return "sh", []string{"-c", command}
+}
+
+// shellDialectNote 返回面向 LLM 的当前 shell 环境说明，拼入 run_shell 工具描述。
+// 2026-07-21 验收马拉松事故的根因之一就是 LLM 不知道命令由谁解释，按 Unix
+// 先验写 test -s / mkdir -p 等命令在 Windows 上失败或产生副作用（字面 -p 目录）。
+func shellDialectNote() string {
+	if runtime.GOOS == "windows" {
+		return "\n\n当前环境：Windows，命令由 PowerShell（powershell -NoProfile -Command）解释。" +
+			"\n- 使用 PowerShell 语法；ls/cat/cp/mv/rm/echo/pwd 等常见 Unix 别名可用，但不要假设 bash/sed/awk/grep 存在" +
+			"\n- 常用对照：test -s <f> → Test-Path <f>；ls -la → Get-ChildItem；cat <f> → Get-Content <f>；" +
+			"mkdir -p <d> → New-Item -ItemType Directory -Force <d>；grep <pat> <f> → Select-String <pat> <f>" +
+			"\n- 禁止用 >、>> 或 Out-File 写文件内容（PowerShell 5.1 重定向会产生 UTF-16 编码文件）；写文件一律使用 write_file / edit_file 工具"
+	}
+	return "\n\n当前环境：" + runtime.GOOS + "，命令由 POSIX sh（sh -c）解释。" +
+		"\n- 使用 POSIX sh 语法，不要假设 bash 专有特性（[[ ]]、数组等）可用" +
+		"\n- 写文件优先使用 write_file / edit_file 工具，而非 shell 重定向"
 }
 
 // truncateKeepTail 截断字符串，保留尾部 limit 个字符。
