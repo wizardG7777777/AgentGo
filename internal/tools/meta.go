@@ -98,6 +98,7 @@ func (g MetaGroup) Register(r *agent.ToolRegistry) {
 				Enum("priority", "任务优先级，默认 normal", []string{"low", "normal", "high"}, false).
 				String("dependencies", "逗号分隔的依赖任务 UUID 列表。每个 ID 必须是之前 publish_task 调用返回的真实 task UUID（形如 7b52b232-4e9b-4b97-8bbc-f3d5927dc814），禁止使用占位符（如 \"task-part1\"、\"A\"、\"<id>\"）或自造 ID。若被依赖任务尚未发布，请先发布被依赖任务、从返回值中读取 id 之后再发布当前任务。留空表示无依赖", false).
 				String("expected_artifacts", "逗号分隔的预期产出文件路径列表（相对项目根的相对路径）。任务结束时系统会校验这些文件是否真的写入；缺失则任务失败重试。强烈建议为'报告/总结/文档'类任务填写此字段以防止 report-only 失败", false).
+				Int("max_concurrency", "该任务允许几个 Agent 同时认领执行，默认 1（单交付物任务必须是 1，否则多个 Agent 会重复执行同一份工作并互相覆盖产出）。仅当确实需要多个 Agent 冗余/分片执行同一任务时才设为 >1", false).
 				Build(),
 			g.publishTask,
 		)
@@ -203,6 +204,13 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 		BatchID:            parentID,
 		Depth:              childDepth,
 		PlanMutationSource: g.PlanMutationSource,
+		// 单交付物任务的语义默认是"执行一次"。未显式指定时显式置 1，
+		// 不落进 store 的 default_concurrency 兜底——该配置是兼容层，
+		// 大于 1 会让多个 Agent 重复执行同一任务（2026-07-22 排查）。
+		MaxConcurrency: 1,
+	}
+	if v, ok := args["max_concurrency"].(float64); ok && v >= 1 {
+		task.MaxConcurrency = int(v)
 	}
 	if role, _ := args["node_role"].(string); role != "" {
 		task.NodeRole = model.PlanNodeRole(role)

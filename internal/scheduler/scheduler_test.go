@@ -43,6 +43,23 @@ func TestSchedulerSystemPromptUsesRegisteredLocalReadToolNames(t *testing.T) {
 	}
 }
 
+func TestSchedulerSystemPrompt_TaskResultRefsAreReadOnDemand(t *testing.T) {
+	required := []string{
+		"result_refs",
+		"original_bytes/original_runes",
+		"sha256",
+		"progress.retained_tail",
+		"get_task_result",
+		"excerpt 足以支持当前决策",
+		"不得机械地遍历或读完所有 result_refs",
+	}
+	for _, phrase := range required {
+		if !strings.Contains(schedulerSystemPrompt, phrase) {
+			t.Errorf("schedulerSystemPrompt should contain task-result guidance %q", phrase)
+		}
+	}
+}
+
 // TestSchedulerSystemPrompt_CapabilitiesRoutingGuidance verifies that the prompt
 // contains capabilities-based routing guidance in the "路由指引" section.
 // Validates: Requirements 9.2, 9.3

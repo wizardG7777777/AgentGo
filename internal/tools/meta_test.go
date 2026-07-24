@@ -788,3 +788,33 @@ func TestSendMessage_DefaultMsgType(t *testing.T) {
 		t.Fatalf("expected default priority=normal, got %q", msgs[0].Priority)
 	}
 }
+
+// publish_task 的并发语义：未指定时显式置 1（单交付物任务默认执行一次，
+// 不落进 store default_concurrency 兜底，2026-07-22 排查）；显式指定时透传。
+func TestPublishTask_MaxConcurrencyDefaultOneAndExplicitOverride(t *testing.T) {
+	s := newFakeStore()
+	g := MetaGroup{Store: s, Holder: nil, MaxDepth: 3}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description": "default concurrency",
+	})); err != nil {
+		t.Fatalf("publish default failed: %v", err)
+	}
+	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description": "explicit concurrency", "max_concurrency": float64(3),
+	})); err != nil {
+		t.Fatalf("publish explicit failed: %v", err)
+	}
+
+	if len(s.createCalls) != 2 {
+		t.Fatalf("expected 2 created tasks, got %d", len(s.createCalls))
+	}
+	if got := s.createCalls[0].MaxConcurrency; got != 1 {
+		t.Errorf("default MaxConcurrency = %d, want 1", got)
+	}
+	if got := s.createCalls[1].MaxConcurrency; got != 3 {
+		t.Errorf("explicit MaxConcurrency = %d, want 3", got)
+	}
+}
