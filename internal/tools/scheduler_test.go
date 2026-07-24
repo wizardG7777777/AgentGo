@@ -31,15 +31,15 @@ func TestSchedulerGroup_Register_AllTools(t *testing.T) {
 		Holder: &fakeHolder{id: "sched-1"},
 	}.Register(reg)
 	defs := reg.Defs()
-	if len(defs) != 4 {
-		t.Fatalf("expected 4 tools (cancel_task + report_done + report_progress + probe_directory), got %d", len(defs))
+	if len(defs) != 5 {
+		t.Fatalf("expected 5 Scheduler tools, got %d", len(defs))
 	}
 	names := map[string]bool{}
 	for _, d := range defs {
 		names[d.Name] = true
 	}
-	if !names["cancel_task"] || !names["report_done"] || !names["report_progress"] || !names["probe_directory"] {
-		t.Errorf("expected cancel_task + report_done + report_progress + probe_directory, got %v", names)
+	if !names["cancel_task"] || !names["get_task_result"] || !names["report_done"] || !names["report_progress"] || !names["probe_directory"] {
+		t.Errorf("expected cancel_task + get_task_result + report_done + report_progress + probe_directory, got %v", names)
 	}
 	registered := make([]string, 0, len(names))
 	for name := range names {
@@ -68,6 +68,9 @@ func TestSchedulerGroup_Register_NoHolderSkipsReportDone(t *testing.T) {
 	}
 	if len(defs) != 2 || !names["cancel_task"] || !names["probe_directory"] {
 		t.Errorf("expected cancel_task + probe_directory without Holder, got %v", names)
+	}
+	if names["get_task_result"] {
+		t.Error("get_task_result must not be registered without Holder")
 	}
 }
 

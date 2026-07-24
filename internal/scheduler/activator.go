@@ -269,9 +269,13 @@ func (a *Activator) handleEvent(evt model.Event) {
 		if task, err := a.Store.GetTask(evt.TaskID); err == nil && task.PlanID != "" && a.PlanCoordinator != nil {
 			if evt.Type == model.EventWatchdogAlert {
 				if p, getErr := a.PlanCoordinator.Store().GetPlan(task.PlanID); getErr == nil {
+					reasonCode := evt.Payload["reason_code"]
+					if reasonCode == "" {
+						reasonCode = "watchdog_alert"
+					}
 					_, _ = a.PlanCoordinator.RequestReplan(context.Background(), model.ReplanRequest{
 						PlanID: task.PlanID, SourceTaskID: task.ID, SourceEvent: string(evt.Type),
-						ReasonCode: "watchdog_alert", ObservedRevision: p.CurrentRevision,
+						ReasonCode: reasonCode, Detail: evt.Payload["reason"], ObservedRevision: p.CurrentRevision,
 						ObservedStateVersion: p.ExecutionStateVersion, Urgency: model.ReplanUrgencyHigh,
 					})
 				}

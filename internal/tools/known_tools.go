@@ -44,6 +44,7 @@ var AllToolNames = []string{
 
 	// SchedulerGroup（scheduler 专属，不走 profile 配置）
 	"cancel_task",
+	"get_task_result",
 	"report_done",
 	"report_progress",
 	"probe_directory",

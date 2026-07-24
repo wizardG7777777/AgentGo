@@ -2,13 +2,17 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"agentgo/internal/agent"
 	"agentgo/internal/mailbox"
@@ -50,7 +54,26 @@ type SchedulerGroup struct {
 	Modes *modes.Store
 }
 
-// Register 把 cancel_task / report_done 注册到 r。
+const (
+	defaultTaskResultPageRunes = 4000
+	maxTaskResultPageRunes     = 8000
+)
+
+type taskResultPage struct {
+	TaskID        string `json:"task_id"`
+	AgentID       string `json:"agent_id"`
+	Status        string `json:"status"`
+	Offset        int    `json:"offset"`
+	LimitApplied  int    `json:"limit_applied"`
+	NextOffset    int    `json:"next_offset"`
+	Complete      bool   `json:"complete"`
+	OriginalBytes int    `json:"original_bytes"`
+	OriginalRunes int    `json:"original_runes"`
+	SHA256        string `json:"sha256"`
+	Content       string `json:"content"`
+}
+
+// Register 把 Scheduler 控制工具注册到 r。
 // Store / Holder 缺失时跳过对应工具。
 func (g SchedulerGroup) Register(r *agent.ToolRegistry) {
 	if g.Store == nil {
@@ -68,6 +91,18 @@ func (g SchedulerGroup) Register(r *agent.ToolRegistry) {
 	)
 
 	if g.Holder != nil {
+		r.Register(
+			"get_task_result",
+			"按需分页读取 board result_refs 指向的完整任务结果。只在 excerpt 不足以支持当前决策时调用；不要机械读取所有任务。",
+			schema.Object().
+				String("task_id", "result_refs 所属任务 ID", true).
+				String("agent_id", "结果生产者 ID；任务只有一份结果时可省略", false).
+				Int("offset", "Unicode rune 偏移，0-based；默认 0", false).
+				Int("limit", "本页最多返回的 Unicode rune 数；默认 4000，服务端最大 8000", false).
+				Build(),
+			g.getTaskResult,
+		)
+
 		r.Register(
 			"report_done",
 			"向用户报告最终结果，表示当前请求处理完毕。"+
@@ -103,6 +138,155 @@ func (g SchedulerGroup) Register(r *agent.ToolRegistry) {
 			Build(),
 		g.probeDirectory,
 	)
+}
+
+func (g SchedulerGroup) getTaskResult(_ context.Context, args map[string]any) (string, error) {
+	if g.Holder == nil {
+		return "", fmt.Errorf("get_task_result requires scheduler task context")
+	}
+	currentID := strings.TrimSpace(g.Holder.Get())
+	if currentID == "" {
+		return "", fmt.Errorf("get_task_result requires a current scheduler task")
+	}
+	current, err := g.Store.GetTask(currentID)
+	if err != nil {
+		return "", fmt.Errorf("读取当前 scheduler 任务失败: %w", err)
+	}
+	if err := validateTaskResultCaller(current); err != nil {
+		return "", err
+	}
+
+	taskID, _ := args["task_id"].(string)
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return "", fmt.Errorf("缺少 task_id 参数")
+	}
+	target, err := g.Store.GetTask(taskID)
+	if err != nil {
+		return "", fmt.Errorf("读取任务结果失败 (id=%s): %w", taskID, err)
+	}
+	if err := g.authorizeTaskResultRead(current, target); err != nil {
+		return "", err
+	}
+	if !model.IsTerminal(target.Status) {
+		return "", fmt.Errorf("任务 %s 当前状态为 %s；Results 仅在终态后提供稳定分页读取", taskID, target.Status)
+	}
+	if len(target.Results) == 0 {
+		return "", fmt.Errorf("任务 %s 当前没有可读取的 Results", taskID)
+	}
+
+	agentIDs := make([]string, 0, len(target.Results))
+	for id := range target.Results {
+		agentIDs = append(agentIDs, id)
+	}
+	sort.Strings(agentIDs)
+	agentID, _ := args["agent_id"].(string)
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		if len(agentIDs) != 1 {
+			return "", fmt.Errorf("任务 %s 有多份结果，请指定 agent_id（可选值: %s）", taskID, strings.Join(agentIDs, ", "))
+		}
+		agentID = agentIDs[0]
+	}
+	result, ok := target.Results[agentID]
+	if !ok {
+		return "", fmt.Errorf("任务 %s 没有 agent_id=%s 的结果（可选值: %s）", taskID, agentID, strings.Join(agentIDs, ", "))
+	}
+
+	offset := 0
+	if value, present := toInt(args["offset"]); present {
+		offset = value
+	}
+	if offset < 0 {
+		return "", fmt.Errorf("offset 不能为负数: %d", offset)
+	}
+	limit := defaultTaskResultPageRunes
+	if value, present := toInt(args["limit"]); present {
+		if value <= 0 {
+			return "", fmt.Errorf("limit 必须 > 0: %d", value)
+		}
+		limit = min(value, maxTaskResultPageRunes)
+	}
+
+	runes := []rune(result)
+	if offset > len(runes) {
+		return "", fmt.Errorf("offset %d 超出结果总 rune 数 %d", offset, len(runes))
+	}
+	next := min(offset+limit, len(runes))
+	page := taskResultPage{
+		TaskID: taskID, AgentID: agentID, Status: string(target.Status),
+		Offset: offset, LimitApplied: limit, NextOffset: next, Complete: next == len(runes),
+		OriginalBytes: len(result), OriginalRunes: utf8.RuneCountInString(result),
+		SHA256: computeSHA256([]byte(result)), Content: string(runes[offset:next]),
+	}
+	data, err := json.Marshal(page)
+	if err != nil {
+		return "", fmt.Errorf("序列化任务结果失败: %w", err)
+	}
+	return string(data), nil
+}
+
+// authorizeTaskResultRead mirrors the task visibility of BuildBoardJSON. A
+// managed Plan controller sees only its current graph (plus itself). A legacy
+// root has no PlanStore record, so it is restricted to its own PlanID group or
+// explicit SchedulerBatch/ParentTaskID lineage.
+func (g SchedulerGroup) authorizeTaskResultRead(current, target *model.Task) error {
+	if err := validateTaskResultCaller(current); err != nil {
+		return err
+	}
+	if g.PlanCoordinator == nil || current.PlanID == "" {
+		return g.authorizeLegacyTaskResultRead(current, target)
+	}
+	p, err := g.PlanCoordinator.Store().GetPlan(current.PlanID)
+	if errors.Is(err, plan.ErrPlanNotFound) {
+		// PlanID is assigned to every Scheduler root by TaskStore. Only a real
+		// PlanStore record turns that identifier into a managed DAG.
+		return g.authorizeLegacyTaskResultRead(current, target)
+	}
+	if err != nil {
+		return fmt.Errorf("读取当前 Plan 失败: %w", err)
+	}
+	if err := validateActiveController(current, p); err != nil {
+		return fmt.Errorf("get_task_result 被拒绝: %w", err)
+	}
+	if p.Status != model.PlanStatusRunning {
+		return fmt.Errorf("get_task_result 被拒绝：Plan %s 当前为 %s", p.ID, p.Status)
+	}
+	if target.PlanID != p.ID {
+		return fmt.Errorf("get_task_result 被拒绝：任务 %s 不属于当前 Plan %s", target.ID, p.ID)
+	}
+	if target.ID == current.ID {
+		return nil
+	}
+	for _, id := range p.CurrentNodeIDs {
+		if id == target.ID {
+			return nil
+		}
+	}
+	return fmt.Errorf("get_task_result 被拒绝：任务 %s 不在当前 Plan 图中", target.ID)
+}
+
+func validateTaskResultCaller(current *model.Task) error {
+	if current == nil || current.EventType != "__scheduler__" || current.Status != model.TaskStatusProcessing {
+		currentID := ""
+		if current != nil {
+			currentID = current.ID
+		}
+		return fmt.Errorf("get_task_result 被拒绝：调用方 %s 不是正在执行的 Scheduler 任务", currentID)
+	}
+	return nil
+}
+
+func (g SchedulerGroup) authorizeLegacyTaskResultRead(current, target *model.Task) error {
+	tasks, err := g.Store.ScanAll()
+	if err != nil {
+		return fmt.Errorf("读取 legacy 任务可见范围失败: %w", err)
+	}
+	visible := store.LegacyRequestTaskIDs(tasks, current.ID)
+	if _, ok := visible[target.ID]; ok {
+		return nil
+	}
+	return fmt.Errorf("get_task_result 被拒绝：任务 %s 不属于当前 Scheduler batch/lineage", target.ID)
 }
 
 // cancelTask 是 cancel_task 工具的实现。守卫与状态转换全部委托

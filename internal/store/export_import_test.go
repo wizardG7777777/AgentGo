@@ -1,12 +1,14 @@
 package store
 
 import (
-	"agentgo/internal/model"
-	"agentgo/internal/session"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"agentgo/internal/model"
+	"agentgo/internal/session"
 )
 
 func TestExportSnapshot_IncludesTerminalTasksForDependencyClosure(t *testing.T) {
@@ -59,6 +61,59 @@ func TestExportSnapshot_IncludesTerminalTasksForDependencyClosure(t *testing.T) 
 	}
 	if !ids[failed.ID] {
 		t.Error("failed task should be exported while it remains in the store")
+	}
+}
+
+func TestExportImport_PreservesFullMultiAgentResults(t *testing.T) {
+	s1, _ := newTestStore(10, 100)
+	want := map[string]string{
+		"worker-a": "HEAD-完整结果🙂-" + strings.Repeat("甲🚀", 6000) + "-MIDDLE-SECRET-TAIL",
+		"worker-b": "full evidence 🚀-" + strings.Repeat("b", 12000) + "-end",
+	}
+	task := &model.Task{Description: "multi-agent result", MaxConcurrency: len(want)}
+	if err := s1.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	for _, agentID := range []string{"worker-a", "worker-b"} {
+		if err := s1.ClaimTask(agentID, task.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, agentID := range []string{"worker-a", "worker-b"} {
+		if err := s1.SubmitResult(agentID, task.ID, want[agentID]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	payload, err := json.Marshal(s1.ExportSnapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshots []session.TaskSnapshot
+	if err := json.Unmarshal(payload, &snapshots); err != nil {
+		t.Fatal(err)
+	}
+	s2, _ := newTestStore(10, 100)
+	if err := s2.ImportSnapshot(snapshots); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s2.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.TaskStatusCompleted || !reflect.DeepEqual(got.Results, want) {
+		t.Fatalf("restored terminal Results mismatch: status=%s results=%#v", got.Status, got.Results)
+	}
+
+	// Imported and exported maps must not alias the restored Store.
+	for i := range snapshots {
+		if snapshots[i].ID == task.ID {
+			snapshots[i].Results["worker-a"] = "mutated"
+		}
+	}
+	again, err := s2.GetTask(task.ID)
+	if err != nil || !reflect.DeepEqual(again.Results, want) {
+		t.Fatalf("snapshot mutation changed restored Results: task=%+v err=%v", again, err)
 	}
 }
 

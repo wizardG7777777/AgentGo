@@ -1,10 +1,13 @@
 package scheduler
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"agentgo/internal/agenttemplate"
 	"agentgo/internal/config"
@@ -20,17 +23,24 @@ const (
 	maxReplanRequestSnapshots        = 16
 	maxReplanRequestDetailRunes      = 480
 	maxReplanRequestTotalDetailRunes = 4096
+
+	// Task result bodies are cold data. The hot board carries a small, shared
+	// excerpt budget plus stable metadata; Scheduler can fetch the exact body
+	// through get_task_result when a decision genuinely needs it.
+	maxTaskResultExcerptRunes       = 768
+	maxBoardResultExcerptTotalRunes = 4096
+	maxTaskProgressTailRunes        = 1000
+	maxTaskLastResponseRunes        = 1200
 )
 
-// boardSnapshot 是 scheduler agent 在每轮 reactLoop 看到的全局任务板 JSON 结构。
+// boardSnapshot 是 scheduler agent 在每轮 reactLoop 看到的当前控制域 JSON 结构。
 //
 // Phase 3 初版只含 mode/trigger/tasks/resources 四段。Phase 3.1 扩展：
 //   - resources.Agents 改为完整代理列表（含 mailbox 待处理数 + 当前认领任务）
 //   - 新增顶层 SessionHistory 字段（本会话用户输入历史）
 //
-// 字段顺序与 JSON tag 在保持向后兼容的前提下扩展：
-//   - 新字段一律 omitempty，旧测试在传 nil 数据源时仍能通过
-//   - 既有字段顺序不变，避免 LLM 看到的 schema 漂移
+// v5 热快照不再内联无界 Results / PartialOutput：终态正文通过
+// result_refs 按需分页读取，执行中输出只保留有界 progress tail。
 //
 // 三轴模式字段（v5 三轴模式）：Mode 保留原 "mode" 字段=gate 轴字符串，
 // ExecMode / TopoMode 为新增，与 Mode 一样总是出现（非 omitempty）。
@@ -199,16 +209,46 @@ type triggerInfo struct {
 }
 
 type taskSnapshot struct {
-	ID            string            `json:"id"`
-	Description   string            `json:"description"`
-	Status        string            `json:"status"`
-	EventType     string            `json:"event_type,omitempty"`
-	Results       map[string]string `json:"results,omitempty"`
-	Error         string            `json:"error,omitempty"`
-	Dependencies  []string          `json:"dependencies,omitempty"`
-	PartialOutput string            `json:"partial_output,omitempty"`
-	Artifacts     []string          `json:"artifacts,omitempty"`
-	LastResponse  string            `json:"last_response,omitempty"`
+	ID                  string                   `json:"id"`
+	Description         string                   `json:"description"`
+	Status              string                   `json:"status"`
+	EventType           string                   `json:"event_type,omitempty"`
+	ResultRefs          []taskResultRef          `json:"result_refs,omitempty"`
+	Error               string                   `json:"error,omitempty"`
+	Dependencies        []string                 `json:"dependencies,omitempty"`
+	Progress            *taskProgressSnapshot    `json:"progress,omitempty"`
+	Artifacts           []string                 `json:"artifacts,omitempty"`
+	LastResponsePreview *taskTextPreviewSnapshot `json:"last_response_preview,omitempty"`
+}
+
+// taskResultRef is the stable hot-board index for one agent result. Excerpt is
+// deliberately optional: all results remain discoverable even after the small
+// board-wide excerpt budget has been consumed.
+type taskResultRef struct {
+	AgentID       string `json:"agent_id"`
+	OriginalBytes int    `json:"original_bytes"`
+	OriginalRunes int    `json:"original_runes"`
+	SHA256        string `json:"sha256"`
+	Excerpt       string `json:"excerpt,omitempty"`
+	Truncated     bool   `json:"truncated"`
+}
+
+// taskProgressSnapshot keeps only the latest part of an in-flight transcript.
+// PartialOutput itself is an observability stream, not an authoritative result;
+// copying its unbounded body into every Scheduler prompt caused the largest
+// prompt spikes seen in real sessions.
+type taskProgressSnapshot struct {
+	OriginalBytes int    `json:"original_bytes"`
+	OriginalRunes int    `json:"original_runes"`
+	RetainedTail  string `json:"retained_tail"`
+	Truncated     bool   `json:"truncated"`
+}
+
+type taskTextPreviewSnapshot struct {
+	OriginalBytes int    `json:"original_bytes"`
+	OriginalRunes int    `json:"original_runes"`
+	Text          string `json:"text"`
+	Truncated     bool   `json:"truncated"`
 }
 
 // sessionEntry 是 board snapshot 中"用户输入历史"段的单条记录。
@@ -284,7 +324,8 @@ type PendingDownstreamTask struct {
 //
 // 设计原则：
 //   - 自包含 helper 函数，不依赖 *Scheduler 或 *agent.Agent，方便单测
-//   - 已完成任务展开 Results；失败/重试中任务展开 LastResponse；processing 任务展开 PartialOutput
+//   - 终态 Results 只展开 result_refs + 有界 excerpt；完整正文由 get_task_result 按需读取
+//   - 失败/重试中的 LastResponse 与 processing PartialOutput 都只展示有界预览
 //   - sources 任一字段为 nil 时对应段缺省（向后兼容）
 //
 // Phase 3.1 改动：新增 sources 参数，扩展 Resources.Agents + SessionHistory 两段。
@@ -302,14 +343,27 @@ func BuildBoardJSON(
 		for _, id := range sources.Plan.CurrentNodeIDs {
 			current[id] = true
 		}
-		tasks = tasks[:0]
+		filtered := make([]*model.Task, 0, len(sources.Plan.CurrentNodeIDs)+1)
 		for _, task := range allTasks {
 			isCurrentController := task.NodeRole == model.PlanNodeRoleController &&
 				(task.ID == sources.CurrentControllerTaskID || (sources.CurrentControllerTaskID == "" && task.ID == sources.Plan.RootTaskID))
 			if task.PlanID == sources.Plan.ID && (current[task.ID] || isCurrentController) {
-				tasks = append(tasks, task)
+				filtered = append(filtered, task)
 			}
 		}
+		tasks = filtered
+	} else if sources.CurrentControllerTaskID != "" {
+		// Legacy Scheduler roots have no PlanStore record. Keep their board and
+		// get_task_result authority aligned by exposing only the current request
+		// tree, not every retained task from unrelated roots or sessions.
+		visible := store.LegacyRequestTaskIDs(allTasks, sources.CurrentControllerTaskID)
+		filtered := make([]*model.Task, 0, len(visible))
+		for _, task := range allTasks {
+			if _, ok := visible[task.ID]; ok {
+				filtered = append(filtered, task)
+			}
+		}
+		tasks = filtered
 	}
 
 	ti := triggerInfo{Type: string(trigger.Type), TaskID: trigger.TaskID}
@@ -321,6 +375,7 @@ func BuildBoardJSON(
 		ti.ExecutionStateVersion = trigger.Payload["execution_state_version"]
 	}
 
+	resultExcerpts := allocateTaskResultExcerpts(tasks, trigger)
 	var taskSnaps []taskSnapshot
 	for _, t := range tasks {
 		snap := taskSnapshot{
@@ -330,7 +385,7 @@ func BuildBoardJSON(
 			EventType:   t.EventType,
 		}
 		if model.IsTerminal(t.Status) && len(t.Results) > 0 {
-			snap.Results = t.Results
+			snap.ResultRefs = buildTaskResultRefs(t.Results, resultExcerpts[t.ID])
 		}
 		if t.Error != "" {
 			snap.Error = t.Error
@@ -339,14 +394,14 @@ func BuildBoardJSON(
 			snap.Dependencies = t.Dependencies
 		}
 		if t.Status == model.TaskStatusProcessing && t.PartialOutput != "" {
-			snap.PartialOutput = t.PartialOutput
+			snap.Progress = buildTaskProgressSnapshot(t.PartialOutput)
 		}
 		if len(t.Artifacts) > 0 {
 			snap.Artifacts = t.Artifacts
 		}
-		// 失败/重试中的任务展开 LastResponse；已 completed 的任务用 Results
+		// 失败/重试中的任务只展开 LastResponse 预览；completed 使用 result_refs。
 		if t.LastResponse != "" && t.Status != model.TaskStatusCompleted {
-			snap.LastResponse = t.LastResponse
+			snap.LastResponsePreview = buildTaskTextPreview(t.LastResponse, maxTaskLastResponseRunes)
 		}
 		taskSnaps = append(taskSnaps, snap)
 	}
@@ -412,7 +467,7 @@ func BuildBoardJSON(
 		ExecMode: modeSnap.Exec,
 		TopoMode: modeSnap.Topo,
 		Trigger:  ti,
-		Tasks:   taskSnaps,
+		Tasks:    taskSnaps,
 		Resources: resourceInfo{
 			RuntimeMode:       runtimeMode,
 			WorkerCount:       workerCount,
@@ -476,6 +531,143 @@ func BuildBoardJSON(
 	}
 	data, _ := json.MarshalIndent(bs, "", "  ")
 	return string(data)
+}
+
+// allocateTaskResultExcerpts distributes one small budget across all visible
+// result refs. Trigger/source tasks are considered first, followed by the most
+// recently created visible tasks. Metadata is emitted for every result even
+// when its excerpt receives no budget.
+func allocateTaskResultExcerpts(tasks []*model.Task, trigger model.Event) map[string]map[string]string {
+	byID := make(map[string]*model.Task, len(tasks))
+	for _, task := range tasks {
+		if task != nil {
+			byID[task.ID] = task
+		}
+	}
+
+	priorityIDs := make([]string, 0, len(tasks)+4)
+	priorityIDs = append(priorityIDs, trigger.TaskID)
+	if trigger.Payload != nil {
+		priorityIDs = append(priorityIDs, splitSnapshotIDs(trigger.Payload["source_task_ids"])...)
+	}
+	for i := len(tasks) - 1; i >= 0; i-- {
+		if tasks[i] != nil {
+			priorityIDs = append(priorityIDs, tasks[i].ID)
+		}
+	}
+
+	remaining := maxBoardResultExcerptTotalRunes
+	seenTasks := make(map[string]bool, len(priorityIDs))
+	out := make(map[string]map[string]string)
+	for _, taskID := range priorityIDs {
+		if remaining <= 0 {
+			break
+		}
+		if taskID == "" || seenTasks[taskID] {
+			continue
+		}
+		seenTasks[taskID] = true
+		task := byID[taskID]
+		if task == nil || !model.IsTerminal(task.Status) || len(task.Results) == 0 {
+			continue
+		}
+
+		agentIDs := sortedResultAgentIDs(task.Results)
+		for _, agentID := range agentIDs {
+			if remaining <= 0 {
+				break
+			}
+			limit := min(maxTaskResultExcerptRunes, remaining)
+			excerpt, _ := compactSnapshotExcerpt(task.Results[agentID], limit)
+			if excerpt == "" {
+				continue
+			}
+			if out[taskID] == nil {
+				out[taskID] = make(map[string]string)
+			}
+			out[taskID][agentID] = excerpt
+			remaining -= utf8.RuneCountInString(excerpt)
+		}
+	}
+	return out
+}
+
+func splitSnapshotIDs(raw string) []string {
+	var out []string
+	for _, value := range strings.Split(raw, ",") {
+		if value = strings.TrimSpace(value); value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func sortedResultAgentIDs(results map[string]string) []string {
+	ids := make([]string, 0, len(results))
+	for id := range results {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func buildTaskResultRefs(results map[string]string, excerpts map[string]string) []taskResultRef {
+	ids := sortedResultAgentIDs(results)
+	refs := make([]taskResultRef, 0, len(ids))
+	for _, agentID := range ids {
+		value := results[agentID]
+		excerpt := excerpts[agentID]
+		sum := sha256.Sum256([]byte(value))
+		refs = append(refs, taskResultRef{
+			AgentID:       agentID,
+			OriginalBytes: len(value),
+			OriginalRunes: utf8.RuneCountInString(value),
+			SHA256:        fmt.Sprintf("%x", sum),
+			Excerpt:       excerpt,
+			Truncated:     excerpt != value,
+		})
+	}
+	return refs
+}
+
+func buildTaskProgressSnapshot(value string) *taskProgressSnapshot {
+	runes := []rune(value)
+	retained := value
+	truncated := len(runes) > maxTaskProgressTailRunes
+	if truncated {
+		retained = string(runes[len(runes)-maxTaskProgressTailRunes:])
+	}
+	return &taskProgressSnapshot{
+		OriginalBytes: len(value), OriginalRunes: len(runes),
+		RetainedTail: retained, Truncated: truncated,
+	}
+}
+
+func buildTaskTextPreview(value string, limit int) *taskTextPreviewSnapshot {
+	text, truncated := compactSnapshotExcerpt(value, limit)
+	return &taskTextPreviewSnapshot{
+		OriginalBytes: len(value), OriginalRunes: utf8.RuneCountInString(value),
+		Text: text, Truncated: truncated,
+	}
+}
+
+// compactSnapshotExcerpt preserves both the opening conclusion and trailing
+// caveats. The returned string never exceeds limit runes.
+func compactSnapshotExcerpt(value string, limit int) (string, bool) {
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value, false
+	}
+	if limit <= 0 {
+		return "", len(runes) > 0
+	}
+	if limit == 1 {
+		return "…", true
+	}
+	contentBudget := limit - 1
+	head := contentBudget * 3 / 4
+	tail := contentBudget - head
+	return string(runes[:head]) + "…" + string(runes[len(runes)-tail:]), true
 }
 
 func compactPendingReplanRequests(p *model.Plan) ([]replanRequestSnapshot, int) {

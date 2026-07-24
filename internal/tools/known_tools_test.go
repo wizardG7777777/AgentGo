@@ -20,7 +20,7 @@ import (
 //   - MetaGroup：publish_task 需 Store、send_message 需 MBRegistry
 //   - PlanControlGroup：Coordinator / Store / Holder 三者非 nil 才注册
 //   - SchedulerGroup：Store 非 nil 注册 cancel_task/probe_directory，
-//     Holder 非 nil 才补 report_done/report_progress
+//     Holder 非 nil 才补 get_task_result/report_done/report_progress
 //   - AgentTemplateGroup：list 需 Catalog，provision 另需
 //     Provisioner / Coordinator / Store / Holder
 func registerAllGroupsFully(t *testing.T, r *agent.ToolRegistry) {
