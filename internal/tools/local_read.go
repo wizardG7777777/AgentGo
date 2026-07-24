@@ -37,7 +37,8 @@ func (g LocalReadGroup) Register(r *agent.ToolRegistry) {
 		schema.Object().
 			String("path", "文件路径", true).
 			Int("offset", "起始行号（1-based），可选；不传则从文件开头读", false).
-			Int("limit", "读取行数上限，可选；不传则读到文件末尾或字符上限", false).
+			Int("limit", "读取行数上限，可选；分页建议每次 200 行左右（输出上限 10000 字符，页过大将被截断导致重叠重读）；不传则读到文件末尾或字符上限", false).
+			Bool("force_full", "缓存命中时仍强制返回全文。默认 false：同一文件重复读取且内容未变时仅返回摘要+hash（请先回顾你的笔记），防止为相同内容重复支付 prompt", false).
 			Build(),
 		g.readFile,
 	)
@@ -125,13 +126,21 @@ func (g LocalReadGroup) readFile(ctx context.Context, args map[string]any) (stri
 	// 缓存命中检查（缓存的是完整格式化内容 + hash；切片参数不参与缓存键）
 	if g.Cache != nil && !hasOffset && !hasLimit {
 		if content, hash, ok := g.Cache.Get(path); ok {
+			// 闸 1（2026-07-22 分层记忆 v2）：命中即"文件未变"（Get 已做
+			// mtime+size 校验）。重复读取默认只回摘要+hash，引导模型回顾
+			// 自己的笔记/前次结果，防止为相同内容重复支付 prompt（实测
+			// explorer 重读率 72–87%）；确需全文用 force_full=true。
+			forceFull, _ := args["force_full"].(bool)
+			if !forceFull {
+				return formatReadCacheStub(path, hash), nil
+			}
 			// 缓存中存的是已经包含 content_hash 后缀的旧格式内容；
 			// 为了头部信息一致，从缓存读出后重新构造头部。
 			// 简化处理：缓存命中直接返回旧格式 + 简单头
 			if g.HashlineEnabled {
 				content = hashline.FormatHashLines(1, content)
 			}
-			return formatReadFileResult(path, content, hash, 1, -1, -1, false), nil
+			return formatReadFileResult(path, content, hash, 1, -1, -1, false, ""), nil
 		}
 	}
 
@@ -147,7 +156,13 @@ func (g LocalReadGroup) readFile(ctx context.Context, args map[string]any) (stri
 		return "", fmt.Errorf("读取文件失败: %w", err)
 	}
 	hash := computeSHA256(data)
-	content := string(data)
+	// 展示层 CRLF 归一化：hash 仍按磁盘原始字节计算（expected_hash 乐观锁语义
+	// 不变），LLM 看到的内容统一为 LF（2026-07-21 跨平台排查 M4）。
+	content, crlfNormalized := normalizeCRLF(string(data))
+	crlfNote := ""
+	if crlfNormalized {
+		crlfNote = "CRLF→LF 已归一化展示，磁盘文件行尾不变"
+	}
 
 	// 计算总行数（用于头部信息显示）
 	totalLines := strings.Count(content, "\n")
@@ -185,7 +200,15 @@ func (g LocalReadGroup) readFile(ctx context.Context, args map[string]any) (stri
 	// 10000 字符截断（在切片之后）
 	truncated := false
 	if len(content) > 10000 {
-		content = content[:10000] + "\n... (截断，文件过大)"
+		origChars := len(content)
+		// 带元数据的截断公告（2026-07-22 闸 2，参考 Codex "Warning: truncated
+		// (original token count: N)"）：给出本段原大小与续读行号，让模型用
+		// offset 精确续读，而不是重读全文或凭猜测续翻页。
+		nextLine := strings.Count(content[:10000], "\n") + 1
+		if hasOffset || hasLimit {
+			nextLine += startLine - 1
+		}
+		content = content[:10000] + fmt.Sprintf("\n... [已截断：本段原 %d 字符，仅显示前 10000；用 offset=%d 续读（分页建议每次 200 行左右）]", origChars, nextLine)
 		truncated = true
 	}
 
@@ -197,12 +220,13 @@ func (g LocalReadGroup) readFile(ctx context.Context, args map[string]any) (stri
 	if g.HashlineEnabled {
 		content = hashline.FormatHashLines(startLine, content)
 	}
-	return formatReadFileResult(path, content, hash, startLine, endLine, totalLines, truncated), nil
+	return formatReadFileResult(path, content, hash, startLine, endLine, totalLines, truncated, crlfNote), nil
 }
 
 // formatReadFileResult 构造 read_file 工具的标准输出格式。
 // 头部含路径、行范围、总行数、hash，让 LLM 一眼判断"还需不需要继续读"。
-func formatReadFileResult(path, content, hash string, startLine, endLine, totalLines int, truncated bool) string {
+// note 为非空时以方括号附注形式追加到头部（如 CRLF 归一化提示）。
+func formatReadFileResult(path, content, hash string, startLine, endLine, totalLines int, truncated bool, note string) string {
 	var sb strings.Builder
 	sb.WriteString("[file] ")
 	sb.WriteString(path)
@@ -218,10 +242,31 @@ func formatReadFileResult(path, content, hash string, startLine, endLine, totalL
 	if truncated {
 		sb.WriteString(" [truncated to 10000 chars]")
 	}
+	if note != "" {
+		sb.WriteString(" [")
+		sb.WriteString(note)
+		sb.WriteString("]")
+	}
 	sb.WriteString("\n[hash] ")
 	sb.WriteString(hash)
 	sb.WriteString("\n---\n")
 	sb.WriteString(content)
+	return sb.String()
+}
+
+// formatReadCacheStub 构造缓存命中（文件未变）时的摘要响应（闸 1，
+// 2026-07-22 分层记忆 v2）。保持 [file]/[hash] 头部与正常响应同构，
+// 使下游按格式解析的逻辑（artifact 记录、ReadSet 等）不受影响；
+// 正文用取回指引替代全文，把"是否需要再付全文的 prompt"的决定权交给模型。
+func formatReadCacheStub(path, hash string) string {
+	var sb strings.Builder
+	sb.WriteString("[file] ")
+	sb.WriteString(path)
+	sb.WriteString(" (already read, unchanged)\n[hash] ")
+	sb.WriteString(hash)
+	sb.WriteString("\n---\n")
+	sb.WriteString("该文件此前已读取且内容未变（hash 一致）。请先回顾你在前文写的笔记或本次任务早些时候的 read_file 结果；")
+	sb.WriteString("若内容已被历史压缩清理且笔记不足，传 force_full=true 重新获取全文，或用 offset/limit 只读需要的区段。")
 	return sb.String()
 }
 

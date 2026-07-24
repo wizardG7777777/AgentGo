@@ -35,17 +35,23 @@ func TestSnipOldToolResults(t *testing.T) {
 
 	snipOldToolResults(history, 3)
 
-	// 前 2 个应被清空
+	// 前 2 个应被清空（结构化墓碑：含工具名、目标与原长度，见 snipStub）
 	for i := 0; i < 2; i++ {
 		got := history[i].ToolResults[0].Content
-		if got != "[已清空，内容过长]" {
-			t.Errorf("history[%d] content = %q, want [已清空，内容过长]", i, got)
+		if !strings.HasPrefix(got, "[已清空] run_shell") {
+			t.Errorf("history[%d] content = %q, want structured snip stub", i, got)
+		}
+		if !strings.Contains(got, "原 8 字符") {
+			t.Errorf("history[%d] stub should carry original length, got %q", i, got)
+		}
+		if !strings.Contains(got, "/tmp") {
+			t.Errorf("history[%d] stub should carry target path, got %q", i, got)
 		}
 	}
 	// 后 3 个应保持不变
 	for i := 2; i < 5; i++ {
 		got := history[i].ToolResults[0].Content
-		if got == "[已清空，内容过长]" {
+		if strings.HasPrefix(got, "[已清空]") {
 			t.Errorf("history[%d] content should NOT be snipped, got %q", i, got)
 		}
 	}
@@ -53,6 +59,33 @@ func TestSnipOldToolResults(t *testing.T) {
 	// 验证 ToolCallID 仍然保留
 	if history[0].ToolResults[0].ToolCallID != "call_run_shell" {
 		t.Errorf("ToolCallID was modified, got %q", history[0].ToolResults[0].ToolCallID)
+	}
+}
+
+// TestSnipStub 验证结构化墓碑的元数据提取：目标取 path/command/pattern/task_id
+// 首个非空；超长目标截断到 60 字符；nil Arguments 安全。
+func TestSnipStub(t *testing.T) {
+	stub := snipStub("read_file", map[string]any{"path": "internal/plan/coordinator.go"}, 8432)
+	for _, want := range []string{"[已清空] read_file internal/plan/coordinator.go", "原 8432 字符", "force_full=true"} {
+		if !strings.Contains(stub, want) {
+			t.Errorf("stub missing %q: %q", want, stub)
+		}
+	}
+
+	longPath := strings.Repeat("a", 80)
+	stub = snipStub("read_file", map[string]any{"path": longPath}, 10)
+	if !strings.Contains(stub, strings.Repeat("a", 57)+"...") {
+		t.Errorf("stub should truncate target to 60 chars: %q", stub)
+	}
+
+	stub = snipStub("run_shell", nil, 100)
+	if !strings.HasPrefix(stub, "[已清空] run_shell（原 100 字符）") {
+		t.Errorf("nil args should yield tool-only stub: %q", stub)
+	}
+
+	stub = snipStub("run_shell", map[string]any{"command": "go test ./..."}, 50)
+	if !strings.Contains(stub, "run_shell go test ./...") {
+		t.Errorf("stub should prefer command for run_shell: %q", stub)
 	}
 }
 
@@ -69,8 +102,41 @@ func TestSnipOldToolResults_PreservesNonTargetTools(t *testing.T) {
 
 	// write_file 不在目标工具列表中，全部应保持原样
 	for i, entry := range history {
-		if entry.ToolResults[0].Content == "[已清空，内容过长]" {
+		if strings.HasPrefix(entry.ToolResults[0].Content, "[已清空]") {
 			t.Errorf("history[%d] write_file content should NOT be snipped", i)
+		}
+	}
+}
+
+func TestSnipOldToolResults_GetTaskResultPagesAreBoundedPerTool(t *testing.T) {
+	history := []HistoryEntry{
+		makeEntry("get_task_result", "page-1"),
+		makeEntry("read_file", "read-1"),
+		makeEntry("get_task_result", "page-2"),
+		makeEntry("get_task_result", "page-3"),
+		makeEntry("read_file", "read-2"),
+		makeEntry("get_task_result", "page-4"),
+		makeEntry("get_task_result", "page-5"),
+	}
+
+	snipOldToolResults(history, 2)
+
+	for _, index := range []int{0, 2, 3} {
+		if got := history[index].ToolResults[0].Content; !strings.HasPrefix(got, "[已清空] get_task_result") {
+			t.Errorf("history[%d] old get_task_result page=%q", index, got)
+		}
+		if got := history[index].ToolResults[0].ToolCallID; got != "call_get_task_result" {
+			t.Errorf("history[%d] ToolCallID changed: %q", index, got)
+		}
+	}
+	for _, index := range []int{5, 6} {
+		if got := history[index].ToolResults[0].Content; strings.HasPrefix(got, "[已清空]") {
+			t.Errorf("history[%d] recent get_task_result page was snipped", index)
+		}
+	}
+	for _, index := range []int{1, 4} {
+		if got := history[index].ToolResults[0].Content; strings.HasPrefix(got, "[已清空]") {
+			t.Errorf("history[%d] read_file should use its own keepRecent counter", index)
 		}
 	}
 }

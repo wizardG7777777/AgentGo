@@ -248,13 +248,28 @@ func TestReadFile_CacheHit(t *testing.T) {
 		t.Fatalf("首次读取内容错: %q", out1)
 	}
 
-	// 第二次同参数 read_file 应命中缓存
+	// 第二次同参数 read_file 命中缓存：文件未变时返回摘要 stub 而非全文
+	// （闸 1，2026-07-22），并给出 force_full / offset 取回指引。
 	out2, err := g.readFile(context.Background(), map[string]any{"path": fp})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out2, "original") {
-		t.Errorf("缓存未命中（应返回原内容）: %q", out2)
+	if strings.Contains(out2, "original") {
+		t.Errorf("缓存命中不应再返回全文: %q", out2)
+	}
+	for _, want := range []string{"already read, unchanged", "force_full=true", "[hash]"} {
+		if !strings.Contains(out2, want) {
+			t.Errorf("缓存命中 stub 缺少 %q: %q", want, out2)
+		}
+	}
+
+	// force_full=true 时仍返回全文。
+	out2f, err := g.readFile(context.Background(), map[string]any{"path": fp, "force_full": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out2f, "original") {
+		t.Errorf("force_full=true 应返回全文: %q", out2f)
 	}
 
 	// 外部/他人改写文件后，stat 校验应使缓存失效并重新读盘
@@ -543,7 +558,6 @@ func TestGrepSearch_Empty_DidYouMean(t *testing.T) {
 	}
 }
 
-
 // === §7 Hashline 行哈希增强测试 ===
 
 func TestReadFile_HashlineEnabled(t *testing.T) {
@@ -592,7 +606,6 @@ func TestReadFile_HashlineDisabled(t *testing.T) {
 	}
 }
 
-
 // §10 Did-You-Mean：read_file 路径不存在时给出父目录近似文件候选。
 func TestReadFile_NotExist_DidYouMean(t *testing.T) {
 	tmp := t.TempDir()
@@ -639,5 +652,31 @@ func TestGlobSearch_Empty_DidYouMean(t *testing.T) {
 	}
 	if !strings.Contains(out, "conf") && !strings.Contains(out, "Conf") {
 		t.Errorf("期望含 'conf' 的候选，实际: %v", out)
+	}
+}
+
+// TestReadFile_TruncationNotice 验证 10000 字符截断时附带元数据公告
+// （2026-07-22 闸 2）：本段原大小 + 续读行号指引。
+func TestReadFile_TruncationNotice(t *testing.T) {
+	tmp := t.TempDir()
+	fp := filepath.Join(tmp, "big.txt")
+	// 200 行 × 100 字符 = 20000 字符，必然触发截断。
+	var sb strings.Builder
+	for i := 0; i < 200; i++ {
+		sb.WriteString(strings.Repeat("x", 99) + "\n")
+	}
+	if err := os.WriteFile(fp, []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	g := newTestGroup(tmp, nil)
+	out, err := g.readFile(context.Background(), map[string]any{"path": fp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"[truncated to 10000 chars]", "已截断：本段原 20000 字符", "用 offset=", "续读"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("截断公告缺少 %q:\n%s", want, out[len(out)-300:])
+		}
 	}
 }

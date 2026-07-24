@@ -1456,15 +1456,41 @@ func (a *Agent) String() string {
 
 // snipTargetTools 是 Layer 1 清理目标工具名称集合。
 var snipTargetTools = map[string]bool{
-	"run_shell":   true,
-	"read_file":   true,
-	"grep_search": true,
-	"glob_search": true,
+	"run_shell":       true,
+	"read_file":       true,
+	"grep_search":     true,
+	"glob_search":     true,
+	"get_task_result": true,
+}
+
+// snipStub 生成结构化墓碑（2026-07-22 分层记忆 v2 M1 层）。
+// 旧占位符 "[已清空，内容过长]" 只告知"被清了"，模型不知道清的是哪个文件、
+// 原内容多大、怎么取回，重读决策是盲目的（explorer 重读浪费事故，实测同
+// 文件最多被读 12 次）。墓碑携带工具名 + 目标（path/command/pattern）+
+// 原内容长度 + 取回指引，让模型的重读决策从盲目变成知情；并优先引导它
+// 回顾自己在 assistant 消息里写的笔记（笔记不被 Layer-1 清理）。
+func snipStub(toolName string, args map[string]any, originalLen int) string {
+	target := ""
+	for _, key := range []string{"path", "command", "pattern", "task_id"} {
+		if v, ok := args[key].(string); ok && v != "" {
+			target = v
+			break
+		}
+	}
+	if runes := []rune(target); len(runes) > 60 {
+		target = string(runes[:57]) + "..."
+	}
+	desc := toolName
+	if target != "" {
+		desc += " " + target
+	}
+	return fmt.Sprintf("[已清空] %s（原 %d 字符）：内容已被历史压缩清理；请先回顾你在前文写的笔记，确需内容可重新调用 %s（read_file 命中缓存时仅返回摘要，需全文传 force_full=true）",
+		desc, originalLen, toolName)
 }
 
 // snipOldToolResults 清理历史中旧的高输出工具结果（Layer 1）。
-// 对每种目标工具，保留最近 keepRecent 条结果不变，更早的结果用占位符替换 Content。
-// 直接修改 history 切片中的 ToolResults。
+// 对每种目标工具，保留最近 keepRecent 条结果不变，更早的结果用结构化墓碑
+// 替换 Content（见 snipStub）。直接修改 history 切片中的 ToolResults。
 func snipOldToolResults(history []HistoryEntry, keepRecent int) {
 	// 从后往前遍历，保留最近 keepRecent 条，清理更早的
 	seen := make(map[string]int)
@@ -1477,7 +1503,7 @@ func snipOldToolResults(history []HistoryEntry, keepRecent int) {
 			}
 			seen[name]++
 			if seen[name] > keepRecent {
-				entry.ToolResults[j].Content = "[已清空，内容过长]"
+				entry.ToolResults[j].Content = snipStub(name, entry.ToolCalls[j].Arguments, len(entry.ToolResults[j].Content))
 			}
 		}
 	}
