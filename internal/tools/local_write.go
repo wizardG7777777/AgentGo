@@ -31,10 +31,10 @@ import (
 // 写入产物事实流的登记由 Hook System 的 RecordArtifactHook 在 PostCall
 // 阶段接管，详见 internal/hook/builtin/record_artifact.go。
 type LocalWriteGroup struct {
-	LocalReadGroup                // embed: 继承 Workdir + Cache
-	Roster         roster.Roster  // required
-	AgentID        string         // required
-	WaitTimeoutSec int            // §8.3：文件冲突排队等待秒数，0 = 不排队（旧行为）
+	LocalReadGroup               // embed: 继承 Workdir + Cache
+	Roster         roster.Roster // required
+	AgentID        string        // required
+	WaitTimeoutSec int           // §8.3：文件冲突排队等待秒数，0 = 不排队（旧行为）
 }
 
 // Register 把 write_file / edit_file 注册到 r。
@@ -115,11 +115,11 @@ func (g LocalWriteGroup) claimOrWait(ctx context.Context, path, verb string) err
 
 	// Trace：排队结束，记录实际等待耗时
 	trace.Emit(trace.Event{
-		Kind:    trace.KindFileWriteQueued,
-		TaskID:  agent.TaskIDFromContext(ctx),
-		AgentID: g.AgentID,
-		Path:    path,
-		WaitMS:  waitDuration.Milliseconds(),
+		Kind:        trace.KindFileWriteQueued,
+		TaskID:      agent.TaskIDFromContext(ctx),
+		AgentID:     g.AgentID,
+		Path:        path,
+		WaitMS:      waitDuration.Milliseconds(),
 		Description: "排队等待结束，成功获得文件锁",
 	})
 
@@ -243,15 +243,37 @@ func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (str
 
 	// 计数匹配
 	count := strings.Count(content, oldStr)
-	if count == 0 {
-		return "", fmt.Errorf("未找到匹配内容，old_str 在文件中不存在")
-	}
 	if count > 1 {
 		return "", fmt.Errorf("匹配到 %d 处，请提供更精确的 old_str", count)
 	}
 
-	// 执行替换
-	newContent := strings.Replace(content, oldStr, newStr, 1)
+	matched := false
+	crlfRetried := false
+	newContent := ""
+	if count == 1 {
+		newContent = strings.Replace(content, oldStr, newStr, 1)
+		matched = true
+	} else if isFullCRLF(content) {
+		// CRLF 重试：read_file 展示层已归一化为 LF，LLM 按展示构造的 old_str
+		// 与磁盘 CRLF 内容必然失配。仅在全量 CRLF 文件上重试，替换后逆变换
+		// 回 CRLF 保证无损往返；混合行尾文件不重试（2026-07-21 排查 M4）。
+		normContent, _ := normalizeCRLF(content)
+		normOld, _ := normalizeCRLF(oldStr)
+		switch strings.Count(normContent, normOld) {
+		case 1:
+			normNew, _ := normalizeCRLF(newStr)
+			newContent = strings.ReplaceAll(strings.Replace(normContent, normOld, normNew, 1), "\n", "\r\n")
+			matched = true
+			crlfRetried = true
+		case 0:
+			// 归一化后仍无匹配，落入下方统一错误
+		default:
+			return "", fmt.Errorf("匹配到多处（CRLF 归一化后），请提供更精确的 old_str")
+		}
+	}
+	if !matched {
+		return "", fmt.Errorf("未找到匹配内容，old_str 在文件中不存在")
+	}
 
 	if err := os.WriteFile(path, []byte(newContent), 0644); err != nil {
 		return "", fmt.Errorf("写入文件失败: %w", err)
@@ -285,5 +307,9 @@ func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (str
 		removed = oldLen - newLen
 	}
 
-	return fmt.Sprintf("文件已编辑: %s (字节变化: +%d/-%d)", path, added, removed), nil
+	result := fmt.Sprintf("文件已编辑: %s (字节变化: +%d/-%d)", path, added, removed)
+	if crlfRetried {
+		result += "（提示：该文件为 CRLF 行尾，已按 CRLF 兼容模式完成替换，行尾保持 CRLF 不变）"
+	}
+	return result, nil
 }

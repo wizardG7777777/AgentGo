@@ -1683,6 +1683,7 @@ func (s *System) buildAgentInfoFn() func() []ui.AgentCard {
 				CallCount:        ts.CallCount,
 			}
 			s.applyActivityInfo(&info)
+			info.SchedulerControl = s.schedulerControlState(ref.id)
 			infos = append(infos, info)
 			seen[a.ID] = true
 		}
@@ -1769,6 +1770,16 @@ func (s *System) applyActivitySnapshot(info *ui.AgentCard, snap agent.ActivitySn
 	info.LastActivityAt = snap.LastActivityAt
 	info.ActivityAge = formatActivityAge(snap.LastActivityAt)
 	info.LastError = snap.LastError
+	if len(snap.ActiveTools) > 0 {
+		info.ActiveTools = make([]ui.AgentToolActivity, 0, len(snap.ActiveTools))
+		for _, tool := range snap.ActiveTools {
+			info.ActiveTools = append(info.ActiveTools, ui.AgentToolActivity{
+				CallID: tool.CallID, Tool: tool.ToolName, StartedAt: tool.StartedAt,
+			})
+		}
+	} else {
+		info.ActiveTools = nil
+	}
 }
 
 func formatActivityAge(t time.Time) string {
