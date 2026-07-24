@@ -3,6 +3,8 @@ package bootstrap
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -325,7 +327,9 @@ func TestReplanRequesterAdapterDeduplicatesReplayedEvent(t *testing.T) {
 	}
 }
 
-func TestSchedulerWakesAfterOneTaskTerminalWhilePeerStillRuns(t *testing.T) {
+// 唤醒门控：并行节点中的"中间完成"不唤醒 Scheduler（只会 continue_waiting），
+// 阶段内最后一个节点终态时才一次性唤醒。
+func TestSchedulerWakesOnlyAfterPhaseTerminalNotIntermediateCompletion(t *testing.T) {
 	taskStore, coordinator := newPlannedStore(t, t.TempDir())
 	root := &model.Task{Description: "dynamic plan", EventType: "__scheduler__"}
 	_ = taskStore.PublishTask(root)
@@ -348,7 +352,7 @@ func TestSchedulerWakesAfterOneTaskTerminalWhilePeerStillRuns(t *testing.T) {
 	called := make(chan struct{}, 1)
 	exec := &scheduler.SchedulerExecutor{
 		Store: taskStore, Cfg: config.DefaultConfig(), PlanCoordinator: coordinator,
-		WaitTimeout: 100 * time.Millisecond,
+		WaitTimeout: 2 * time.Second,
 		Inner: func(context.Context, *model.Task, map[string]string, []agent.HistoryEntry) (agent.ExecuteResult, error) {
 			called <- struct{}{}
 			return agent.ExecuteResult{Output: "observed", ToolCalled: true}, nil
@@ -365,17 +369,24 @@ func TestSchedulerWakesAfterOneTaskTerminalWhilePeerStillRuns(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
+	// 中间完成（peer 仍在跑）：不得唤醒。
 	if err := taskStore.SubmitResult("worker-a", children[0].ID, "done"); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case <-called:
-	case <-time.After(time.Second):
-		t.Fatal("Scheduler was not woken by the first terminal Task")
+		t.Fatal("Scheduler woke on intermediate task_completed; wake must be gated until phase terminal")
+	case <-time.After(300 * time.Millisecond):
 	}
-	peer, _ := taskStore.GetTask(children[1].ID)
-	if peer.Status != model.TaskStatusProcessing {
-		t.Fatalf("peer status=%s; test did not prove incremental wakeup", peer.Status)
+
+	// 阶段内最后一个节点终态：必须唤醒（且远早于 WaitTimeout 心跳）。
+	if err := taskStore.SubmitResult("worker-b", children[1].ID, "done"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("Scheduler was not woken after the last phase node terminated")
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
@@ -1054,4 +1065,53 @@ func errorString(err error) string {
 		return "<nil>"
 	}
 	return err.Error()
+}
+
+func TestVerifyAcceptanceArtifactMixedPathForms(t *testing.T) {
+	// 回归（2026-07-21 验收马拉松事故）：历史数据里 task.Artifacts 可能被
+	// 登记为绝对路径（record-artifact 在 project_root="." 下的旧行为），而
+	// ExpectedArtifacts 按合约是相对路径。比对两侧统一归一化后，两种登记
+	// 形态都必须能通过验收。
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "docs", "a.md"), []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	artifactForms := map[string]string{
+		"相对路径登记": "docs/a.md",
+		"绝对路径登记": filepath.Join(root, "docs", "a.md"),
+	}
+	for name, artifact := range artifactForms {
+		t.Run(name, func(t *testing.T) {
+			taskStore := store.NewMemoryTaskStore(make(chan model.Event, 64), 256, 2, 300)
+			verifier := planAcceptanceVerifier{store: taskStore, projectRoot: root}
+
+			target := &model.Task{
+				Description:       "impl",
+				EventType:         "work",
+				ExpectedArtifacts: []string{"docs/a.md"},
+			}
+			if err := taskStore.PublishTask(target); err != nil {
+				t.Fatal(err)
+			}
+			if err := taskStore.ClaimTask("worker-1", target.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := taskStore.AppendArtifact(target.ID, artifact); err != nil {
+				t.Fatal(err)
+			}
+			if err := taskStore.SubmitResult("worker-1", target.ID, "done"); err != nil {
+				t.Fatal(err)
+			}
+
+			run := model.AcceptanceRun{TargetTaskIDs: []string{target.ID}}
+			result := model.AcceptanceResult{Verdict: model.AcceptanceVerdictPass}
+			if err := verifier.VerifyAcceptance(context.Background(), nil, run, result); err != nil {
+				t.Fatalf("artifact=%q 应通过验收比对: %v", artifact, err)
+			}
+		})
+	}
 }

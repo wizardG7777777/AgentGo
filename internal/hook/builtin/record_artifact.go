@@ -88,6 +88,12 @@ func (h *RecordArtifactHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecisio
 //   - 路径在 projectRoot 之外（filepath.Rel 返回 ".." 前缀）→ 返回 / 风格 cleaned 路径
 //   - projectRoot 为空 → 返回 / 风格 cleaned 路径
 //
+// projectRoot 可能是相对路径（setting.yaml 的 project_root: "."），而
+// filepath.Rel 在 base 相对 / target 绝对时直接报错（Windows 与 POSIX 同），
+// 此时先转成绝对路径再重试——否则 artifact 会被登记成绝对路径，与
+// expected_artifacts 的相对路径字面比对永远失败（2026-07-21 验收马拉松事故）。
+// 仅在直接 Rel 失败时才走 Abs 重试，保持词法相对可解场景的行为字节级不变。
+//
 // 设计理由：artifact 路径主要供 LLM 阅读和下游 worker 解析，跨平台一致比
 // OS native 分隔符更重要。原 tools 包的 TestNormalizeArtifactPath 在 Windows
 // 上一直失败的根因就是这里 —— C5 迁移顺手解决，对应测试也已删除。
@@ -96,6 +102,11 @@ func normalizeArtifactPath(absPath, projectRoot string) string {
 	if projectRoot != "" {
 		if rel, err := filepath.Rel(projectRoot, cleaned); err == nil && !strings.HasPrefix(rel, "..") {
 			return filepath.ToSlash(rel)
+		}
+		if rootAbs, err := filepath.Abs(projectRoot); err == nil {
+			if rel, err := filepath.Rel(rootAbs, cleaned); err == nil && !strings.HasPrefix(rel, "..") {
+				return filepath.ToSlash(rel)
+			}
 		}
 	}
 	return filepath.ToSlash(cleaned)

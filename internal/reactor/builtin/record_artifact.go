@@ -64,11 +64,22 @@ var _ reactor.Reactor = (*RecordArtifactReactor)(nil)
 //   - projectRoot 非空且路径在其内部 → 返回 / 风格相对路径
 //   - 路径在 projectRoot 之外 → 返回 / 风格 cleaned 路径
 //   - projectRoot 为空 → 返回 / 风格 cleaned 路径
+//
+// projectRoot 可能是相对路径（setting.yaml 的 project_root: "."），而
+// filepath.Rel 在 base 相对 / target 绝对时直接报错（Windows 与 POSIX 同），
+// 此时先转成绝对路径再重试——否则 artifact 会被登记成绝对路径，与
+// expected_artifacts 的相对路径字面比对永远失败（2026-07-21 验收马拉松事故）。
+// 仅在直接 Rel 失败时才走 Abs 重试，保持词法相对可解场景的行为字节级不变。
 func normalizeArtifactPath(absPath, projectRoot string) string {
 	cleaned := filepath.Clean(absPath)
 	if projectRoot != "" {
 		if rel, err := filepath.Rel(projectRoot, cleaned); err == nil && !strings.HasPrefix(rel, "..") {
 			return filepath.ToSlash(rel)
+		}
+		if rootAbs, err := filepath.Abs(projectRoot); err == nil {
+			if rel, err := filepath.Rel(rootAbs, cleaned); err == nil && !strings.HasPrefix(rel, "..") {
+				return filepath.ToSlash(rel)
+			}
 		}
 	}
 	return filepath.ToSlash(cleaned)

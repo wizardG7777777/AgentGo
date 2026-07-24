@@ -2,6 +2,8 @@ package builtin
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -155,6 +157,20 @@ func TestRecordArtifactReactor_StoreFailureTolerated(t *testing.T) {
 	r := NewRecordArtifactReactor(s, "/proj")
 	if err := r.Run(trace.Event{Kind: trace.KindFileWritten, TaskID: "t1", Path: "/proj/a.md"}); err != nil {
 		t.Errorf("store failure should be tolerated, got %v", err)
+	}
+}
+
+func TestNormalizeArtifactPath_RelativeProjectRoot(t *testing.T) {
+	// 回归（2026-07-21 验收马拉松事故）：setting.yaml 的 project_root: "." 是
+	// 相对路径，filepath.Rel(".", 绝对路径) 直接报错会让 artifact 被登记成
+	// 绝对路径，导致验收比对永远失败。修复后必须先 Abs 再 Rel。
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	abs := filepath.Join(cwd, "docs", "foo.md")
+	if got := normalizeArtifactPath(abs, "."); got != "docs/foo.md" {
+		t.Errorf("got=%q want=%q", got, "docs/foo.md")
 	}
 }
 

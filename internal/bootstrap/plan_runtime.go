@@ -67,11 +67,11 @@ func (v planAcceptanceVerifier) VerifyAcceptance(ctx context.Context, _ *model.P
 		if result.Verdict == model.AcceptanceVerdictPass {
 			actual := make(map[string]bool, len(task.Artifacts))
 			for _, path := range task.Artifacts {
-				actual[filepath.Clean(path)] = true
+				actual[canonicalArtifactKey(v.projectRoot, path)] = true
 			}
 			for _, expected := range task.ExpectedArtifacts {
 				clean := filepath.Clean(expected)
-				if !actual[clean] {
+				if !actual[canonicalArtifactKey(v.projectRoot, expected)] {
 					return fmt.Errorf("target %s lacks expected artifact %s", taskID, expected)
 				}
 				path, err := safeEvidencePath(v.projectRoot, clean)
@@ -92,7 +92,7 @@ func (v planAcceptanceVerifier) VerifyAcceptance(ctx context.Context, _ *model.P
 				return fmt.Errorf("task status evidence %s references unavailable task %s: %w", evidence.ID, evidence.TaskID, err)
 			}
 			if evidence.Output != string(task.Status) {
-				return fmt.Errorf("task status evidence %s claims %q for task %s, actual status is %q",
+				return fmt.Errorf("task status evidence %s claims %q for task %s, actual status is %q; output must exactly equal the bare status word, descriptive text is rejected",
 					evidence.ID, evidence.Output, evidence.TaskID, task.Status)
 			}
 		}
@@ -134,15 +134,28 @@ func (v planAcceptanceVerifier) VerifyAcceptance(ctx context.Context, _ *model.P
 				}
 			}
 			if !found {
-				return fmt.Errorf("no successful run_shell fact for command %q", evidence.Command)
+				return fmt.Errorf("no successful run_shell fact for command %q; the command must verbatim match a run_shell call executed after this run was created, with working_dir at the project root, by the acceptance runner or a target task, and exit_code must equal that call", evidence.Command)
 			}
 		}
 	}
 	return nil
 }
 
-func runShellWorkingDirMatchesProjectRoot(projectRoot string, args map[string]any) (bool, error) {
-	rootAbs, err := filepath.Abs(projectRoot)
+// canonicalArtifactKey 把 artifact 路径规整为项目根下的绝对路径用于比对。
+// 历史数据中 task.Artifacts 可能混有两种登记形态（相对项目根 / 绝对路径），
+// expected_artifacts 则按合约是相对路径——两侧先统一成同一形态再比较，
+// 避免登记侧与校验侧路径形态不一致导致验收永远失败（2026-07-21 验收马拉松事故）。
+func canonicalArtifactKey(projectRoot, p string) string {
+	clean := filepath.Clean(p)
+	if !filepath.IsAbs(clean) {
+		if rootAbs, err := filepath.Abs(projectRoot); err == nil {
+			clean = filepath.Join(rootAbs, clean)
+		}
+	}
+	return clean
+}
+
+func runShellWorkingDirMatchesProjectRoot(projectRoot string, args map[string]any) (bool, error) {	rootAbs, err := filepath.Abs(projectRoot)
 	if err != nil {
 		return false, fmt.Errorf("resolve absolute project root: %w", err)
 	}
@@ -602,11 +615,13 @@ func recordPlannedTaskMutation(coordinator *plan.Coordinator, mutation store.Tas
 	if prep.keyed == nil {
 		return nil
 	}
-	versions, errs := coordinator.RecordTaskMutations(context.Background(), []plan.PlanTaskMutation{*prep.keyed})
+	versions, notified, errs := coordinator.RecordTaskMutations(context.Background(), []plan.PlanTaskMutation{*prep.keyed})
 	if errs[0] != nil {
 		return errs[0]
 	}
-	emitPlanMutationWakeTrace(coordinator, prep, versions[0])
+	if notified[0] {
+		emitPlanMutationWakeTrace(coordinator, prep, versions[0])
+	}
 	return nil
 }
 
@@ -629,11 +644,13 @@ func applyPlannedMutationBatch(coordinator *plan.Coordinator, batch []store.Task
 			for j, it := range run {
 				keyed[j] = *it.prep.keyed
 			}
-			versions, cerrs := coordinator.RecordTaskMutations(context.Background(), keyed)
+			versions, notified, cerrs := coordinator.RecordTaskMutations(context.Background(), keyed)
 			var next []keyedItem
 			for j, it := range run {
 				if cerrs[j] == nil {
-					emitPlanMutationWakeTrace(coordinator, it.prep, versions[j])
+					if notified[j] {
+						emitPlanMutationWakeTrace(coordinator, it.prep, versions[j])
+					}
 				} else {
 					errs[it.batchIdx] = cerrs[j]
 					next = append(next, it)
