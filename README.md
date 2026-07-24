@@ -24,6 +24,7 @@ README 是运行手册；架构和历史设计不要混为一谈。
 
 - Go 1.25（以 [go.mod](go.mod) 为准）。
 - 一个 OpenAI-compatible LLM endpoint、模型名和 API key，才能实际执行 LLM 任务。
+- 平台要求：Windows / macOS / Linux。**Windows 上要求系统自带 PowerShell（5.1+）**——`run_shell` 工具在 Windows 由 `powershell -NoProfile -Command` 解释（不用 cmd，原因：cmd 的引号规则与 Unix 命令先验冲突会导致命令被错误解析，PowerShell 提供可预测的语法与 Unix 别名层）。不含 PowerShell 的裁剪/嵌入式 Windows 不受支持。POSIX 平台由 `sh -c` 解释。注意：PowerShell 进程启动约 0.1–0.3s，每次 `run_shell` 调用会有同等量级的固定开销。
 
 复制示例配置。PowerShell：
 
@@ -123,6 +124,7 @@ agentgo -resume <session-prefix>    # 恢复之前保存的 Session
 agentgo trace list                  # 列出最近 Task
 agentgo trace show <task-id>        # 查看一个 Task 的事件时间线
 agentgo trace plan <plan-id>        # 聚合动态 DAG Plan 的跨 Task 时间线
+agentgo trace stats [task|agent|plan]  # 聚合 session 内 LLM 调用与 token 消耗（含浪费口径与异常提示）
 ```
 
 TUI 斜杠命令：

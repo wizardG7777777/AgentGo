@@ -39,7 +39,7 @@
 **关键实现事实**（按"原设计 → v5 实现"对齐）：
 
 - **执行代理 = `runner.Runner`**（不再是 worker / explorer）：原设计的"执行代理"和"调查代理"在 v5 统一为 `internal/runner` 包。所有差异通过 `setting.yaml` 的 `agents[*]` 块声明（kind / replicas / profile / event_type / system_prompt_file / model 等）。Bootstrap 调用 `runtime_builder.buildAgentRuntime(kind, replicaIdx)` 合成 `AgentRuntimeConfig`，然后 `runner.New(rt, deps)`。**没有运行时 Kind 枚举分支** —— Kind 仅是配置字段。
-- **Scheduler = `agent.Agent` 一等代理实例**（2026-04-10 Phase 3 重构后保持至 v5）：`agent.NewAgent(EventType="__scheduler__")` 的实例，工具集 = Worker 全集 + SchedulerGroup（cancel_task + report_done + probe_directory）+ MetaGroup（publish_task / send_message，scheduler 上下文里 publish_task 通过 `BatchTracker` 追加到 `task.SchedulerBatch`）。直接 `read_file`/`grep_search`/`web_search`，自动获得 Gate、3 层历史压缩、FileStateCache、Trace、per-task cancel ctx。`scheduler.New` 返回 `*Bundle{Agent, Activator, Mode}`。详见 §"Scheduler 一等代理重构"。
+- **Scheduler = `agent.Agent` 一等代理实例**（2026-04-10 Phase 3 重构后保持至 v5）：`agent.NewAgent(EventType="__scheduler__")` 的实例，工具集 = Worker 全集 + SchedulerGroup（cancel_task + get_task_result + report_done + probe_directory）+ MetaGroup（publish_task / send_message，scheduler 上下文里 publish_task 通过 `BatchTracker` 追加到 `task.SchedulerBatch`）。直接 `read_file`/`grep_search`/`web_search`，自动获得 Gate、3 层历史压缩、FileStateCache、Trace、per-task cancel ctx。`scheduler.New` 返回 `*Bundle{Agent, Activator, Mode}`。详见 §"Scheduler 一等代理重构"。
 - **Roster 仅做文件级锁**：`TryClaim/Release/ReleaseAll/IsOccupied/ListByAgent` 全部围绕"防文件并发写"。团队成员感知改由 mailbox `TeamSnapshot` 与 Memory System 的 `KindContext / file_awareness` 项共同承担。
 - **Mailbox 子系统**：`internal/mailbox` 提供基于 Go channel 的异步信箱、`send_message` 工具、ack 自动回执、recent 16 条 ring buffer（供 Gate peek-without-consume）、`TeamSnapshot` 团队感知。
 - **ReactiveSystem（v5 重构，替代 v4 三套 Hook 系统）**：详见 §"ReactiveSystem：Gate + Reactor + Memory"。要点：
@@ -55,7 +55,7 @@
 - **TaskCancelRegistry**：per-task cancel context，看门狗/调度器把任务转为 terminal 状态时自动取消正在执行的代理（通过 `ctx.Done()` 即时感知）。
 - **崩溃汇报**：任务最终失败时 agent 自动调用 `sendCrashReport`，向 `task.EventSource` 发送 `priority=high` 邮件，附 expected vs actual artifacts、最后一次 LLM 响应原文。
 - **三层历史压缩**：Layer 1 `snipOldToolResults`（无 LLM 开销，逐轮清理旧工具输出）；Layer 2 `compressHistory`（超过 `enforce_compact_token_threshold` 时摘要）；Layer 3 context overflow 时 `keepRecent=1` 激进压缩 + `RetryRollback`。压缩事件 `KindHistoryCompaction` / `KindHistoryTruncated` 由 `trace-history-event` reactor 计数。
-- **Trace 系统 Schema B**：`internal/trace.Event` 是 fat struct，包含 `Transition` / `ShellExec` / `ShellTimeout` 以及动态 DAG 的 `Plan` / `Acceptance` 五个可选指针载荷，旧字段保留不动。当前有 31 个内置系统 EventKind，包含七个重规划、验收和 Plan 生命周期审计事件。`SetDefaultDispatcher(reactorReg)` 让 `trace.Emit` 同时驱动 Reactor 链路。物理 JSONL 在 Session 活跃时落盘到 `.agentgo/sessions/sess-<id>/logs/`，否则写入 `.agentgo/traces/`，默认保留 100 个文件；Task 重试可能跨多个分片。`agentgo trace list/show/plan` 会按完整 `task_id` 重组逻辑任务并自动定向到 active session 的 `logs/`，其中 `plan <plan_id>` 聚合跨 Task DAG 时间线。可通过 `AGENTGO_DUMP_PROMPTS=1` 启用 prompt dump。
+- **Trace 系统 Schema B**：`internal/trace.Event` 是 fat struct，包含 `Transition` / `ShellExec` / `ShellTimeout` 以及动态 DAG 的 `Plan` / `Acceptance` 五个可选指针载荷，旧字段保留不动。当前有 31 个内置系统 EventKind，包含七个重规划、验收和 Plan 生命周期审计事件。`SetDefaultDispatcher(reactorReg)` 让 `trace.Emit` 同时驱动 Reactor 链路。物理 JSONL 在 Session 活跃时落盘到 `.agentgo/sessions/sess-<id>/logs/`，否则写入 `.agentgo/traces/`，默认保留 100 个文件；Task 重试可能跨多个分片。`agentgo trace list/show/plan/stats` 会按完整 `task_id` 重组逻辑任务并自动定向到 active session 的 `logs/`，其中 `plan <plan_id>` 聚合跨 Task DAG 时间线。可通过 `AGENTGO_DUMP_PROMPTS=1` 启用 prompt dump。
 - **LLM Provider Adapter 与流式调用**：`internal/llm` 在统一工厂层应用 `reasoning_effort` 与 `stream`，因此 Scheduler、静态/动态 Agent、spawn Agent 和 Reactor LLM 共享同一请求策略。SSE 路径先聚合完整文本、工具调用参数、usage 与未知扩展字段，再返回普通 `Response`；UI 收到带稳定 `stream_id` 的累积快照。Provider 层内置 `openai` / `openrouter` / `deepseek-v4` / `deepseek-r1`，并继续处理 `reasoning_content` 往返差异。详见 §"LLM Provider Adapter"。
 
 **未启动 / 待设计**：
@@ -458,7 +458,7 @@ Scheduler 在最初的设计里是一个**独立写的事件驱动 ReAct 循环*
                             ToolRegistry
                               ├─ Worker 全集（read/write/edit/grep/glob/list/run_shell/web_*）
                               ├─ MetaGroup（send_message + publish_task with BatchTracker）
-                              └─ SchedulerGroup（cancel_task + report_done）
+                              └─ SchedulerGroup（cancel_task + get_task_result + report_done）
 ```
 
 ## 核心组件
@@ -467,9 +467,9 @@ Scheduler 在最初的设计里是一个**独立写的事件驱动 ReAct 循环*
 |---|---|
 | `internal/scheduler/scheduler.go` | `Bundle` struct（Agent + Activator + ModeStore），`New(...)` 构造一等代理及其配套部件，`schedulerSystemPrompt`，`currentSchedulerTaskHolder`，`storeBatchTracker` |
 | `internal/scheduler/executor.go` | `SchedulerExecutor` —— TaskExecutor wrapper，等 batch + 注入 snapshot |
-| `internal/scheduler/snapshot.go` | `BuildBoardJSON` —— 从 store 读全局任务板，输出 JSON |
+| `internal/scheduler/snapshot.go` | `BuildBoardJSON` —— 输出当前 Plan/请求树可见任务；终态正文投影为有界 `result_refs`，执行中输出投影为有界 `progress` |
 | `internal/scheduler/activator.go` | `Activator` goroutine，EventCh ↔ task 桥 |
-| `internal/tools/scheduler.go` | `SchedulerGroup`：`cancel_task` + `report_done` |
+| `internal/tools/scheduler.go` | `SchedulerGroup`：`cancel_task` + `get_task_result` + `report_done` + `report_progress` |
 | `internal/tools/meta.go` | `MetaGroup` 新增 `BatchTracker` 字段，scheduler 注入时 publish_task 追加到 `task.SchedulerBatch` |
 | `internal/model/task.go` | `Task` 新增 `SchedulerBatch []string` 字段（仅 scheduler task 使用） |
 | `internal/store/{iface,memory}.go` | `AppendSchedulerBatch` / `ClearSchedulerBatch` 方法 |
@@ -480,7 +480,7 @@ Scheduler 在最初的设计里是一个**独立写的事件驱动 ReAct 循环*
 |---|---|---|
 | D1 | 等待 batch 完成的实现：**SchedulerExecutor 内部同步 select 阻塞** | `executor.go::waitForBatchTerminal` 在 `BatchUpdateCh` 与 30s 兜底之间循环。比 RetryRollback spin loop 干净（不堆 RetryCount，watchdog 友好），比 dependency 机制安全（不会被 worker failed 级联取消） |
 | D2 | `task.SchedulerBatch` 是新字段，不复用 Dependencies | Dependencies 严格 completed 语义，scheduler 需要"终态"语义；新字段命名清晰 |
-| D3 | `SchedulerGroup` 仅含 `cancel_task` + `report_done` | `publish_task` / `send_message` 复用 `MetaGroup`（共享 ChainDepth 继承等关键行为）；通过 `BatchTracker` 接口让 scheduler 上下文里的 publish_task 追加到 `task.SchedulerBatch` |
+| D3 | `SchedulerGroup` 只放 Scheduler 专属控制/结果工具 | `get_task_result` 仅分页读取当前可见终态结果；`publish_task` / `send_message` 仍复用 `MetaGroup`，并通过 `BatchTracker` 追加到 `task.SchedulerBatch` |
 | D4 | `Activator` 是 EventCh ↔ scheduler agent 的桥 | `EventUserInput` → `PublishTask`，`EventTask{Completed,Failed,Cancelled,WatchdogAlert}` → `BatchUpdateCh` 信号 |
 | D5 | board snapshot 通过 `IncomingMail` 注入 history | 复用既有的 `agent.HistoryEntry.IncomingMail` 字段，与 mailbox 注入对称 |
 | D6 | scheduler task 的 `TimeoutSeconds=86400`（1 天） | `MemoryTaskStore.PublishTask` 把 0 替换为默认值，scheduler 必须显式设大值；24h 是工程兜底 |
@@ -503,8 +503,8 @@ Scheduler 在最初的设计里是一个**独立写的事件驱动 ReAct 循环*
 | 能力 | 实现 |
 |---|---|
 | 事件驱动入口 | `Activator` goroutine 监听 EventCh |
-| 全局任务板视角 | `BuildBoardJSON` 注入到 history，LLM 看到所有 task 的状态 |
-| `cancel_task` / `report_done` | `SchedulerGroup`，独占工具，worker 没有 |
+| 当前控制域任务板 | `BuildBoardJSON` 注入当前 Plan 有效图或 legacy 请求树；结果 excerpt 全板共享上限 |
+| `cancel_task` / `get_task_result` / `report_done` | `SchedulerGroup`，独占工具，worker 没有；完整结果只在 excerpt 不足时按 rune 偏移读取 |
 | **探针工具 `probe_directory`** | Scheduler 专属目录探测，用于任务规划前了解工作区全貌 |
 | 系统级 mailbox 别名 `"scheduler"` | `New` 构造时 `mbRegistry.RegisterAlias("scheduler", schedID)` |
 | 提前 `report_done` 硬拦截 | `SchedulerGroup.report_done` 内部扫描 `task.SchedulerBatch` 状态 |
@@ -856,7 +856,7 @@ agents:
 - **`EventTaskCompleted` / `Failed` / `Cancelled` / `WatchdogAlert`** → `Activator` 向 `BatchUpdateCh`（容量 1，select default 防阻塞）发送一个信号；任何正在 `SchedulerExecutor.waitForBatchTerminal` 中阻塞等待 batch 完成的 scheduler 实例会被唤醒重新检查
 - **其他事件类型**（如 `EventTaskRetry`、`EventTickerWakeup`）：Activator 忽略
 ### 事件与调度器决策映射
-事件 → Activator → store/Channel 之后，scheduler agent 读到的是 `BuildBoardJSON` 注入的全局任务板快照（含所有 task 状态、Artifacts、依赖、resources），LLM 据此做决策：
+事件 → Activator → store/Channel 之后，scheduler agent 读到的是 `BuildBoardJSON` 注入的当前控制域快照（含可见 task 状态、Artifacts、依赖、resources 和有界结果引用），LLM 据此做决策：
 - **任务 completed/failed/cancelled**：通过 board snapshot 看到，结合 SchedulerBatch 决定是否进入下一阶段
 - **用户新输入**：scheduler task 的 `Description` 字段就是用户文本
 - **看门狗告警**：board snapshot 显示该 task 状态变更（通常进入 failed），scheduler 据此决策
@@ -864,9 +864,9 @@ agents:
 scheduler agent 与 worker / explorer 共享同一套 `agent.Agent.processTask` 实现，区别仅在于 `TaskExecutor` 是 `SchedulerExecutor`（包装 `NewLLMExecutor`）：
 1. **认领**：`agent.Agent.Run` poll 到 `__scheduler__` 任务，`ClaimTask` + `processTask`
 2. **等待 batch**：`SchedulerExecutor.Execute` 进入前先 `waitForBatchTerminal`——如果 `task.SchedulerBatch` 中还有非终态任务，select 在 `BatchUpdateCh` / 30s 兜底 / `ctx.Done()` 之间循环等待
-3. **观察**：调用 `BuildBoardJSON` 生成全局任务板快照，注入到 history 末尾（`IncomingMail` 类型，与 mailbox 注入对称）
+3. **观察**：调用 `BuildBoardJSON` 生成当前 Plan/请求树快照，注入到 history 末尾（`IncomingMail` 类型，与 mailbox 注入对称）
 4. **思考**：调底层 `NewLLMExecutor` 实际调用 LLM
-5. **行动**：LLM 调用 `publish_task`（追加到 `task.SchedulerBatch`）/ `cancel_task` / `report_done`（清空 batch + 打印事实校对块）/ `send_message` / `read_file` / `grep_search` / 等等
+5. **行动**：LLM 调用 `publish_task`（追加到 `task.SchedulerBatch`）/ `cancel_task` / `get_task_result`（按需分页）/ `report_done` / `send_message` / `read_file` / `grep_search` / 等等
 6. **循环**：LLM 还有 tool call 则下一轮 reactLoop（`agent.Agent.processTask` 内部 for 循环）；LLM 给文本响应（无 tool call）则任务完成
 - `cfg.SchedulerMaxLoops` 控制单次 reactLoop 上限
 ## 实现机制
@@ -964,7 +964,7 @@ Scheduler agent (Phase 3 后) 与 worker / explorer 共享同一套 `Mailbox.Dra
 
 系统由 `main.go` → `bootstrap.Bootstrap(configPath, explicit, skipStartupProbe)` 完成初始化，再由 `System.Start(ctx, cancel)` 拉起所有 goroutine，最后 `System.RunCLI(ctx)`（内部调 `tui.Run`）阻塞主线程。
 
-`main.go` 入口除 `-config` / `-skip-startup-probe` 外还支持 `trace` 子命令：`./agentgo trace list/show/plan ...` 不进 bootstrap，直接进入 `internal/trace/cli.go`。Trace CLI 自动通过 `.agentgo/sessions/active-session` 解析当前 session 的 `logs/` 目录，回退到 `.agentgo/traces/`；`plan <plan_id>` 会按时间聚合同一动态 DAG 分散在多个 Task 文件中的事件。
+`main.go` 入口除 `-config` / `-skip-startup-probe` 外还支持 `trace` 子命令：`./agentgo trace list/show/plan/stats ...` 不进 bootstrap，直接进入 `internal/trace/cli.go`。Trace CLI 自动通过 `.agentgo/sessions/active-session` 解析当前 session 的 `logs/` 目录，回退到 `.agentgo/traces/`；`plan <plan_id>` 会按时间聚合同一动态 DAG 分散在多个 Task 文件中的事件。
 
 ## Bootstrap 阶段（构造对象图，v5 顺序）
 
@@ -1331,7 +1331,7 @@ Session 恢复遵守以下安全边界：fsync 的 Plan 终态先覆盖较旧的
 | Bundle 构造 | `internal/scheduler/scheduler.go` | `New()` / `type Bundle struct{ Agent, Activator, Mode }` |
 | Activator（事件桥） | `internal/scheduler/activator.go` | `Activator.Run()` —— 消费 `eventCh`，`EventUserInput` → `PublishTask`，task 终态事件 → `BatchUpdateCh` |
 | Executor | `internal/scheduler/executor.go` | `SchedulerExecutor.Execute()` / `waitForBatchTerminal()` |
-| Board Snapshot | `internal/scheduler/snapshot.go` | `BuildBoardJSON()` |
+| Board Snapshot | `internal/scheduler/snapshot.go` | `BuildBoardJSON()` / `result_refs` / `progress` |
 | Mode 切换 | `internal/scheduler/scheduler.go` | `type ModeStore struct` / `Bundle.Mode` |
 | 探针工具 | `internal/tools/scheduler_probe.go` | `probeDirectory()` |
 
@@ -1346,7 +1346,7 @@ Session 恢复遵守以下安全边界：fsync 的 Plan 终态先覆盖较旧的
 | WebGroup | `internal/tools/web.go` | `type WebGroup struct` | web_search / web_fetch |
 | ShellGroup | `internal/tools/shell.go` | `type ShellGroup struct` | run_shell（黑名单硬拒绝；灰名单经 `shell_command` Interaction） |
 | MetaGroup | `internal/tools/meta.go` | `type MetaGroup struct` | publish_task / send_message（含 `BatchTracker` 接口供 scheduler 注入） |
-| SchedulerGroup | `internal/tools/scheduler.go` | `type SchedulerGroup struct` | Scheduler 专属：cancel_task / report_done / probe_directory |
+| SchedulerGroup | `internal/tools/scheduler.go` | `type SchedulerGroup struct` | Scheduler 专属：cancel_task / get_task_result / report_done / report_progress / probe_directory |
 
 ## Gate（v5 统一拦截）
 

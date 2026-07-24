@@ -1,8 +1,8 @@
 # KNOWN_ISSUES — 当前限制与验证缺口
 
-最后核对：2026-07-20。
+最后核对：2026-07-22。
 
-本文件只记录当前仍会影响使用、开发或发布判断的限制。2026-07-18 UI Hub 改造的 41 项问题均已修复，原始核查与测试证据已归档至 [ui-hub-remediation-2026-07-18.md](../archived/ui-hub-remediation-2026-07-18.md)。截至本次核对，没有把已修复条目重新列为开放缺陷。
+本文件只记录当前仍会影响使用、开发或发布判断的限制。2026-07-18 UI Hub 改造的 41 项问题均已修复，原始核查与测试证据已归档至 [ui-hub-remediation-2026-07-18.md](../archived/ui-hub-remediation-2026-07-18.md)。2026-07-20 验收事实核验失败循环与级联取消事故已修复，证据归档至 [acceptance-fact-verification-and-cascade-incident-2026-07-20.md](../archived/acceptance-fact-verification-and-cascade-incident-2026-07-20.md)。2026-07-21 artifact 路径归一化缺陷导致的验收马拉松事故已修复，证据归档至 [artifact-path-normalization-incident-2026-07-21.md](../archived/artifact-path-normalization-incident-2026-07-21.md)。2026-07-21 验收空转（6 次 AcceptanceRun）与 Scheduler 篡改工作区事故已修复，证据归档至 [acceptance-spin-and-env-mutation-incident-2026-07-21.md](../archived/acceptance-spin-and-env-mutation-incident-2026-07-21.md)。2026-07-22 浪费可观测化专项落地：TUI 顶栏新增 session 级 token 总计（Hub 进程级累加器喂入，ad-hoc 团队销毁后消耗不隐形）；trace CLI 新增 stats 子命令（task/agent/plan 三维度 token 聚合 + 浪费口径 + 异常提示，见 TraceGuide §3.4）；watchdog 为 pending 级联取消补发 task_cancelled 事件（此前排队中的级联取消在 trace 中不可见）；修正 detectAnomalies 第 9 条从不命中的死检查（cancel_source 实际值为 dependency_failure）。截至本次核对，没有把已修复条目重新列为开放缺陷。
 
 ## 运行与安全
 
@@ -56,6 +56,21 @@
 
 - 影响：对外部事实、链接和引用的结果仍需由调用方复核。
 - 历史审计：[hallucination-acceptance-audit-2026-05.md](../archived/hallucination-acceptance-audit-2026-05.md)。
+
+### 调查型任务存在 read_file 重读浪费（缓解已落地，首次复测后指标已修正）
+
+Layer-1 历史压缩（`snipOldToolResults`）会清掉旧的 read_file 结果，agent 不做中间笔记时只能重读恢复。修正后的重读口径（重复全文读 + 相同 offset 重复分页，顺序分页不算）下，历史任务基线为 34–61%。
+
+2026-07-22 已落地四层缓解：explorer prompt 边读边记硬要求（方案 A）、snip 结构化墓碑（`snipStub`）、read_file 缓存命中摘要 + `force_full` 逃生门（闸 1）、截断元数据公告 + 分页建议（闸 2）；`trace stats` 重读率检测已按 path+offset 去重修正。
+
+2026-07-23 首次复测（~950k tokens，总量未降）暴露三个残留问题：
+
+- **模型先发制人绕过闸 1**：从墓碑/工具描述学会 `force_full` 后预传该参数，stub 未省到 token；
+- **方案 A 遵从度弱**：未出现结构化笔记，但报告更详细（指令转化为"更仔细阅读"）；
+- **分页/上限错配**：模型按 300–400 行/页请求，超出 10000 字符上限导致截断与重叠重读（已在工具描述与截断公告中加入"每次 200 行左右"的放宽建议，效果待观察）。
+
+- 影响（残留）：缓解效果依赖模型遵从，首次复测未证实节费；worker 编辑流中若模型忘记传 `force_full`，edit_file 可能因内容不在上下文而反复失配（失败安全，但增加 round trip）。
+- 处置：复测后用 `trace stats` 对比修正口径下的重读率（基线 34–61%）；若仍不足，评估方案 B（压缩分层）或 view-time 裁剪。完整证据与方案：[explorer-reread-waste-analysis-2026-07-22.md](explorer-reread-waste-analysis-2026-07-22.md)。
 
 ## 验证缺口
 

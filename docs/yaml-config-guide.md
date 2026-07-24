@@ -200,13 +200,14 @@ infra:
   store:
     event_channel_buffer: 64
     fifo_limit: 100
-    default_concurrency: 2
+    default_concurrency: 1       # 任务级认领上限兜底；>1 会让多个 Agent 重复执行同一任务
     default_timeout_sec: 300        # 单次 processing 执行的默认超时
   roster:
     wait_timeout_sec: 30
 ```
 
 - `default_timeout_sec` 只约束任务被领取后的单次执行租约，以 `StartedAt` 为起点；它不是排队超时。
+- `default_concurrency` 是"一个任务允许几个 Agent 同时认领执行"的兜底值，**只**对未显式指定 `max_concurrency` 的非 plan 发布路径生效：scheduler 经 `publish_task` 发布的任务与验收 runner 任务默认恒为 1（单交付物任务的正确语义）。把它调成 >1 不会让系统吞吐变大，只会让多个 Agent 重复执行同一任务并互相覆盖产出。
 - `pending_alert_grace_sec` 以当前 `PendingSince` 为起点。有合法 route 时超期只发一次告警，任务继续排队。
 - `unroutable_grace_sec` 从 Watchdog 首次确认“任务已满足依赖且可认领，但没有兼容 route”时独立计时；超期后任务进入 `blocked`。依赖等待与 Plan 暂停期间不累计这段时间。
 
