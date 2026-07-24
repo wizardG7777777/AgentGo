@@ -28,6 +28,9 @@ type snapshotSyncMsg ui.Snapshot
 type agentsChangedMsg struct {
 	agents []AgentInfo
 	tasks  []*model.Task
+	// Session 级 token 累计（Hub 轮询节拍随 AgentsChanged 携带）
+	sessionPromptTokens     int64
+	sessionCompletionTokens int64
 }
 type systemMsg ui.LogItem
 type outputMsg output.Event
@@ -36,6 +39,11 @@ type traceMsg ui.TraceEvent
 // quitWarnExpiredMsg 是 Ctrl+C 强退警告 3 秒窗口到期的一次性 tick 消息
 // （tea.Tick 发出；惰性清除，晚到的旧 tick 不能误杀新警告）。
 type quitWarnExpiredMsg struct{}
+
+// submitTimeoutMsg 是 Enter 提交防抖到期的一次性 tick 消息（tea.Tick
+// 发出）。seq 与 AppModel.submitSeq 比对：窗口内又有新 Enter 时代数已
+// 递增，晚到的旧 tick 直接忽略。
+type submitTimeoutMsg struct{ seq int }
 
 // ── Hub subscription (async ui.Update → sync bubbletea) ──
 
@@ -68,7 +76,12 @@ func forwardUpdates(ctx context.Context, obs ui.Observer, p *tea.Program) {
 			case ui.KindInteractionsChanged:
 				p.Send(interactionsChangedMsg(u.Interactions))
 			case ui.KindAgentsChanged:
-				p.Send(agentsChangedMsg{agents: u.Agents, tasks: boardTasksToModel(u.Tasks)})
+				p.Send(agentsChangedMsg{
+					agents:                  u.Agents,
+					tasks:                   boardTasksToModel(u.Tasks),
+					sessionPromptTokens:     u.SessionPromptTokens,
+					sessionCompletionTokens: u.SessionCompletionTokens,
+				})
 			case ui.KindTraceEvent:
 				p.Send(traceMsg(u.Trace))
 			}
@@ -106,6 +119,12 @@ const (
 	// RequestQuit + tea.Quit。必须与 bootstrap SIGINT 哨兵的 3 秒窗口
 	// 一致（第二次信号 os.Exit(130) 强杀），两边语义才对齐。
 	quitWarnWindow = 3 * time.Second
+	// submitDebounce 是 Enter 提交防抖窗口。Windows Terminal 等终端把
+	// 剪贴板内容逐键注入（ConPTY 不透传 bracketed paste）时，每个换行
+	// 都是一个真实 Enter——爆发流中的后续按键在窗口内到达并刷新提交
+	// 代数，整段粘贴因此合并为一次提交。真人 Enter 后 100ms 内不可能
+	// 再敲键，正常提交交互无感。
+	submitDebounce = 100 * time.Millisecond
 )
 
 // AppModel is the root bubbletea Model for the new multi-panel TUI.
@@ -130,11 +149,20 @@ type AppModel struct {
 	// history 是输入提交历史（环形缓冲容量 100，仅内存）；
 	// 输入框首行 ↑ / 末行 ↓ 浏览，见 keymap.go input-history 条目。
 	history inputHistory
+	// submitSeq 是 Enter 提交防抖的代数：每次 Enter 递增并挂一个
+	// submitDebounce 定时 tick；窗口内新的 Enter 刷新代数，旧 tick
+	// 到期时因 seq 失配被忽略（见 keyEnter 分支与 submitTimeoutMsg）。
+	submitSeq int
 
 	// Agent data（由 Hub 的 SnapshotSync / AgentsChanged 更新刷新）
 	agents        []AgentInfo
 	tasks         []*model.Task
 	selectedAgent int // index in agents list, -1 = none
+
+	// Session 级 token 累计（Hub 累加器下发；含已销毁 ad-hoc 团队的消耗。
+	// 为零时顶栏回退到对存活 agent 卡片求和——兼容未装配累加器的轻量 Hub）。
+	sessionPromptTokens     int64
+	sessionCompletionTokens int64
 
 	// Messages
 	messages     []StyledMsg
@@ -274,6 +302,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tasks = boardTasksToModel(snap.Tasks)
 		m.replaceInteractions(snap.PendingInteractions)
 		m.restoreFeed(snap.Feed)
+		m.sessionPromptTokens = snap.SessionPromptTokens
+		m.sessionCompletionTokens = snap.SessionCompletionTokens
 		if m.lastResult == nil && snap.LastResult != nil && strings.TrimSpace(snap.LastResult.Text) != "" {
 			m.appendMsg(snap.LastResult.Text, MsgResult)
 		}
@@ -282,6 +312,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case agentsChangedMsg:
 		m.agents = msg.agents
 		m.tasks = msg.tasks
+		m.sessionPromptTokens = msg.sessionPromptTokens
+		m.sessionCompletionTokens = msg.sessionCompletionTokens
 		return m, nil
 
 	case interactionsChangedMsg:
@@ -326,6 +358,14 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case submitTimeoutMsg:
+		// Enter 提交防抖到期：窗口内又有新 Enter 时代数已递增，旧
+		// tick 作废；否则执行真正的提交。
+		if msg.seq != m.submitSeq {
+			return m, nil
+		}
+		return m.commitInputSubmit()
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -339,6 +379,14 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// 整段粘贴（bracketed paste）：bubbletea 把一整段粘贴作为一个
+	// KeyRunes{Paste:true} 事件投递，其中的换行是 rune 而不是 Enter
+	// 键。必须在任何按键分发之前拦截，否则粘贴文本中的 '\r'/'\n'
+	// 会被当成逐次提交；同时无论当前焦点在哪都把文本写入输入框
+	// （粘贴的意图永远是输入，焦点在侧栏/交互面板时不能静默丢弃）。
+	if msg.Paste {
+		return m.insertPastedText(string(msg.Runes))
+	}
 	key := msg.String()
 
 	// Global keys（键名常量集中在 keymap.go）
@@ -378,7 +426,26 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.appendMsg("[界面] 消息流已清空", MsgLog)
 		return m, nil
 
+	case keyCtrlV:
+		// Ctrl+V 主动读系统剪贴板整体插入（textarea 内置 Paste 绑定
+		// 返回剪贴板读取 cmd；读回的多行文本经 pasteMsg 分行插入，
+		// 换行不会触发提交）。这是 Windows 上的可靠粘贴路径：终端
+		// 逐键注入剪贴板内容时 '\r'/'\n' 会被当成 Enter 逐行提交，
+		// 而应用主动读剪贴板完全绕开终端投递。macOS 终端拦截
+		// Cmd+V 后以 bracketed paste 投递，走上方 msg.Paste 分支，
+		// 两条路径等效。粘贴的意图永远是输入——任意焦点都重定向
+		// 到输入框。
+		m.setFocus(FocusInput)
+		prevHeight := m.input.Height()
+		var cmd tea.Cmd
+		m.input, cmd = m.input.Update(msg)
+		m.reflowInputLayoutFrom(prevHeight)
+		return m, cmd
+
 	case keyEsc:
+		// 作废可能存在的 Enter 防抖待提交（用户 Esc 的意图是取消/返回，
+		// 不应在 100ms 后突然把输入框内容发出去）。
+		m.submitSeq++
 		if m.interactionTextMode {
 			m.cancelInteractionText()
 			if len(m.interactions) > 0 {
@@ -552,52 +619,21 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.focus == FocusInput {
 		switch key {
 		case keyEnter:
-			line := strings.TrimSpace(m.input.Value())
-			if m.interactionTextMode {
-				if line == "" {
-					m.appendMsg("[交互] 该选项需要补充文本", MsgWarn)
-					return m, nil
-				}
-				if m.respondInteraction(interaction.ResolveInput{
-					RequestID:       m.interactionTextRequestID,
-					ExpectedVersion: m.interactionTextVersion,
-					OptionID:        m.interactionTextOptionID,
-					Text:            line,
-					RespondedBy:     "tui",
-				}, "文本回答") {
-					m.input.SetValue("")
-					m.finishInteractionText()
-				}
-				m.reflowInputLayout()
-				return m, nil
-			}
-
-			m.input.SetValue("")
-			m.reflowInputLayout()
-			if line == "" {
-				return m, nil
-			}
-			// 提交的普通输入（含斜杠命令）进入输入历史。
-			m.history.push(line)
-
-			// Slash command
-			if strings.HasPrefix(line, "/") {
-				prevView := m.view
-				if quit := m.handleCommand(line); quit {
-					return m, tea.Quit
-				}
-				// 命令反馈写在消息流里；命令本身没有切换视图时
-				// （/cancel、/mode、未知命令等），切到消息视图让
-				// 反馈可见——否则默认的仪表板视图会吞掉所有反馈。
-				if m.view == prevView && m.view != ViewChat {
-					m.view = ViewChat
-				}
-				return m, nil
-			}
-
-			// User input → event channel
-			m.sendUserText(line)
-			return m, nil
+			// Enter 提交防抖：不立即提交，先按换行处理并挂一个
+			// submitDebounce 定时 tick。Windows Terminal 等终端把
+			// 剪贴板内容逐键注入时，每个换行都是一个真实 Enter——
+			// 爆发流中的下一个按键在窗口内到达（Enter 刷新代数，
+			// 普通字符直接落入输入框），整段粘贴合并为一次提交；
+			// 真人 Enter 后 100ms 内不会再敲键，tick 到期即按原语义
+			// 提交（TrimSpace 会去掉刚插入的换行），交互无感。
+			m.submitSeq++
+			seq := m.submitSeq
+			prevHeight := m.input.Height()
+			m.input.InsertRune('\n')
+			m.reflowInputLayoutFrom(prevHeight)
+			return m, tea.Tick(submitDebounce, func(time.Time) tea.Msg {
+				return submitTimeoutMsg{seq: seq}
+			})
 
 		case keyCtrlJ, keyAltEnter:
 			prevHeight := m.input.Height()
@@ -630,6 +666,76 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	return m, nil
+}
+
+// insertPastedText 把一段（可能多行的）粘贴文本整体写入输入框：
+// 规范化 CRLF/CR → LF（textarea 只按 '\n' 分行），焦点切回输入框，
+// 然后作为一个 KeyRunes 事件交给 textarea 的 insertRunesFromUserInput
+// 分行插入。粘贴文本不会触发提交，用户检查后再按 Enter 发送。
+func (m AppModel) insertPastedText(text string) (tea.Model, tea.Cmd) {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	if text == "" {
+		return m, nil
+	}
+	m.setFocus(FocusInput)
+	prevHeight := m.input.Height()
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(text), Paste: true})
+	m.reflowInputLayoutFrom(prevHeight)
+	return m, cmd
+}
+
+// commitInputSubmit 执行 Enter 防抖到期后的真正提交：interaction 文本
+// 回答 / 斜杠命令 / 普通用户输入，语义与防抖引入前的 keyEnter 分支一致。
+func (m AppModel) commitInputSubmit() (tea.Model, tea.Cmd) {
+	line := strings.TrimSpace(m.input.Value())
+	if m.interactionTextMode {
+		if line == "" {
+			m.input.SetValue("")
+			m.appendMsg("[交互] 该选项需要补充文本", MsgWarn)
+			return m, nil
+		}
+		if m.respondInteraction(interaction.ResolveInput{
+			RequestID:       m.interactionTextRequestID,
+			ExpectedVersion: m.interactionTextVersion,
+			OptionID:        m.interactionTextOptionID,
+			Text:            line,
+			RespondedBy:     "tui",
+		}, "文本回答") {
+			m.input.SetValue("")
+			m.finishInteractionText()
+		}
+		m.reflowInputLayout()
+		return m, nil
+	}
+
+	m.input.SetValue("")
+	m.reflowInputLayout()
+	if line == "" {
+		return m, nil
+	}
+	// 提交的普通输入（含斜杠命令）进入输入历史。
+	m.history.push(line)
+
+	// Slash command
+	if strings.HasPrefix(line, "/") {
+		prevView := m.view
+		if quit := m.handleCommand(line); quit {
+			return m, tea.Quit
+		}
+		// 命令反馈写在消息流里；命令本身没有切换视图时
+		// （/cancel、/mode、未知命令等），切到消息视图让
+		// 反馈可见——否则默认的仪表板视图会吞掉所有反馈。
+		if m.view == prevView && m.view != ViewChat {
+			m.view = ViewChat
+		}
+		return m, nil
+	}
+
+	// User input → event channel
+	m.sendUserText(line)
 	return m, nil
 }
 
@@ -1181,8 +1287,17 @@ func (m AppModel) View() string {
 	// 1. Header（模式 / Session 读自 Hub 最新快照，而非直读组件）
 	snap := m.snapshot()
 	sessionID := snap.Session.ID
+	// Session 级 token 总计：优先取 Hub 累加器（含已销毁 ad-hoc 团队的
+	// 消耗）；累加器未装配（轻量 Hub / 测试 fake）时回退为对存活 agent
+	// 卡片求和。
+	totalTokens := m.sessionPromptTokens + m.sessionCompletionTokens
+	if totalTokens == 0 {
+		for _, ag := range m.agents {
+			totalTokens += ag.PromptTokens + ag.CompletionTokens
+		}
+	}
 	header := renderHeader(m.theme, m.layout, snapshotMode(snap),
-		sessionID, len(m.agents), len(m.interactions))
+		sessionID, len(m.agents), len(m.interactions), totalTokens)
 	sections = append(sections, header)
 
 	// 2. Body (sidebar + main)

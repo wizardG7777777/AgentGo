@@ -103,7 +103,7 @@ func enterKey(t *testing.T, m AppModel, line string) AppModel {
 	t.Helper()
 	m.input.SetValue(line)
 	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	return result.(AppModel)
+	return firePendingSubmit(t, result.(AppModel))
 }
 
 func TestCommand_UnknownCommandSwitchesToChatView(t *testing.T) {

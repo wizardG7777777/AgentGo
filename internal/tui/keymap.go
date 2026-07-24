@@ -22,6 +22,7 @@ const (
 	keyCtrlC    = "ctrl+c"
 	keyCtrlL    = "ctrl+l"
 	keyCtrlJ    = "ctrl+j"
+	keyCtrlV    = "ctrl+v"
 	keyCtrlB    = "ctrl+b"
 	keyCtrlF    = "ctrl+f"
 	keyAltEnter = "alt+enter"
@@ -82,6 +83,10 @@ var keymap = []keymapEntry{
 		helpKeys: "Enter", help: "提交输入"},
 	{id: "input-newline", ctx: ctxInput, keys: "Ctrl+J", hint: "newline",
 		helpKeys: "Ctrl+J", help: "输入框内换行"},
+	// Ctrl+V 读系统剪贴板整体插入（多行保留、不触发提交）；macOS 终端
+	// 拦截 Cmd+V 后以 bracketed paste 投递，等效走 msg.Paste 分支。
+	{id: "input-paste", ctx: ctxInput, keys: "Ctrl+V", hint: "paste", trim: 4,
+		helpKeys: "Ctrl+V", help: "粘贴剪贴板内容（保留多行）"},
 	// 输入历史只进 /help：状态栏空间紧张，再添一条 ↑↓ 提示会破坏既有
 	// 宽度取舍（sidebar/input 长度对比回归测试）。
 	{id: "input-history", ctx: ctxInput, keys: "↑↓",

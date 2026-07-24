@@ -59,8 +59,53 @@ func TestRenderAgentWorkbenchShowsOnlySelectedAgent(t *testing.T) {
 		[]ui.TraceEvent{{Kind: "tool_call", AgentID: "worker-1", Tool: "read_file", At: at}},
 	)
 
-	if !strings.Contains(view, "worker one output") || !strings.Contains(view, "read_file") {
+	if !strings.Contains(view, "Current Turn") || !strings.Contains(view, "Recent Decisions") ||
+		!strings.Contains(view, "worker one output") || !strings.Contains(view, "read_file") {
 		t.Fatalf("agent workbench missing output or trace: %q", view)
+	}
+	if strings.Contains(view, "Controller State") {
+		t.Fatalf("ordinary agent should not render scheduler control facet: %q", view)
+	}
+}
+
+func TestRenderSchedulerWorkbenchAlignsTurnsToolsAndControlState(t *testing.T) {
+	at := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	view := renderAgentWorkbench(DefaultTheme(), 120, 34,
+		AgentInfo{
+			ID: "scheduler-1", Type: "scheduler", State: "processing", Phase: "tooling",
+			CurrentTaskID: "controller-1", Loop: 8, ToolCallCount: 12,
+			ActiveTools: []ui.AgentToolActivity{{CallID: "active-1", Tool: "ensure_acceptance_run", StartedAt: at}},
+			SchedulerControl: &ui.SchedulerControlState{
+				PlanID: "plan-1", Status: "running", Revision: 7, ExecutionStateVersion: 19, HandledStateVersion: 18,
+				TasksTotal: 5, TasksCompleted: 3, TasksProcessing: 1, TasksPending: 1,
+				AcceptanceAttempt: 5, AcceptanceStatus: "running", BudgetUsedPercent: 68,
+			},
+		},
+		[]ui.FeedOutput{
+			{Kind: "stream", AgentID: "scheduler-1", TaskID: "controller-1", StreamID: "old", Loop: 7, Text: "old verbose narration", At: at.Add(-time.Minute)},
+			{Kind: "stream", AgentID: "scheduler-1", TaskID: "controller-1", StreamID: "current", Loop: 8, Text: "current decision\n\nchecking acceptance", At: at},
+			{Kind: "result", AgentID: "scheduler-1", Text: "final answer", At: at.Add(time.Minute)},
+		},
+		[]ui.TraceEvent{
+			{Kind: "tool_call", AgentID: "scheduler-1", Loop: 8, Tool: "get_acceptance_evidence", CallID: "call-1", Outcome: "running", At: at},
+			{Kind: "tool_result", AgentID: "scheduler-1", Loop: 8, Tool: "get_acceptance_evidence", CallID: "call-1", Outcome: "success", ArgsSummary: `{"result_id":"result-4"}`, DurationMS: 2, At: at.Add(time.Second)},
+		},
+	)
+
+	for _, want := range []string{
+		"Current Turn", "current decision", "checking acceptance", "Controller State", "DAG 3/5 complete",
+		"acceptance #5 running", "budget 68%", "Active Tools", "ensure_acceptance_run",
+		"Recent Decisions", "get_acceptance_evidence", "Final Result", "final answer",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("scheduler workbench missing %q: %q", want, view)
+		}
+	}
+	if strings.Contains(view, "old verbose narration") {
+		t.Fatalf("completed old turns should not be flattened into Current Turn: %q", view)
+	}
+	if strings.Count(view, "get_acceptance_evidence") != 1 {
+		t.Fatalf("tool call/result pair should collapse to one decision: %q", view)
 	}
 }
 

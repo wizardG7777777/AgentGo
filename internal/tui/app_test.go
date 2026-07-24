@@ -988,7 +988,7 @@ func TestAppModel_HandleKey_InteractionRequiresText(t *testing.T) {
 	}
 	m.input.SetValue("请先备份再继续")
 	result, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
-	updated := result.(AppModel)
+	updated := firePendingSubmit(t, result.(AppModel))
 
 	calls := fakeOf(deps).interactionCalls
 	if len(calls) != 1 || calls[0].OptionID != "custom" || calls[0].Text != "请先备份再继续" {
@@ -1552,7 +1552,7 @@ func TestAppModel_HandleKey_FreeTextInteraction(t *testing.T) {
 	}
 	m.input.SetValue("我的回答")
 	result, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
-	_ = result.(AppModel)
+	_ = firePendingSubmit(t, result.(AppModel))
 	calls := fakeOf(deps).interactionCalls
 	if len(calls) != 1 || calls[0].OptionID != "" || calls[0].Text != "我的回答" {
 		t.Fatalf("free-text ResolveInput=%+v", calls)
@@ -1837,12 +1837,21 @@ func sizedModel(t *testing.T, deps Deps) AppModel {
 	return result.(AppModel)
 }
 
-// submitLine 经 Enter 键提交一行（与真实按键路径一致）。
+// firePendingSubmit 直接投递 Enter 提交防抖的到期 tick（跳过真实
+// submitDebounce 等待），完成一次提交。
+func firePendingSubmit(t *testing.T, m AppModel) AppModel {
+	t.Helper()
+	result, _ := m.Update(submitTimeoutMsg{seq: m.submitSeq})
+	return result.(AppModel)
+}
+
+// submitLine 经 Enter 键提交一行（与真实按键路径一致：Enter 进入提交
+// 防抖，再投递到期 tick 完成提交）。
 func submitLine(t *testing.T, m AppModel, line string) AppModel {
 	t.Helper()
 	m.input.SetValue(line)
 	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
-	return result.(AppModel)
+	return firePendingSubmit(t, result.(AppModel))
 }
 
 // pressKey 经 handleKey 按下一个特殊键并返回更新后的模型。
@@ -2166,5 +2175,40 @@ func TestRenderStatusBar_TrimsGlobalHintsWhenNarrow(t *testing.T) {
 	}
 	if w := lipglossWidth(narrow); w > 100 {
 		t.Errorf("裁剪后状态栏宽度 = %d, want <= 100（不折行）", w)
+	}
+}
+
+// Session 级 token 累计（2026-07-22）：Hub 累加器非零时顶栏必须用它
+// （含已销毁 ad-hoc 团队的消耗），而不是对存活 agent 卡片求和；
+// 累加器为零（轻量 Hub / 测试 fake）时回退求和。
+func TestAppModel_SessionTokensDriveHeader(t *testing.T) {
+	m := newAppModel(testDeps())
+	m.width, m.height = 120, 40
+	m.layout = calcLayout(120, 40, ViewDashboard)
+
+	// Hub 累加器：prompt 100000 + completion 5300 = 105300 → "105.3k"；
+	// 存活 agent 卡片只有 1000（若错误求和会显示 "1.0k"）。
+	result, _ := m.Update(agentsChangedMsg{
+		agents:                  []AgentInfo{{ID: "a-1", State: "idle", PromptTokens: 900, CompletionTokens: 100, CallCount: 1}},
+		sessionPromptTokens:     100000,
+		sessionCompletionTokens: 5300,
+	})
+	updated := result.(AppModel)
+	header := strings.SplitN(updated.View(), "\n", 2)[0]
+	if !strings.Contains(header, "tokens: 105.3k") {
+		t.Errorf("顶栏应显示 Hub 累加值 105.3k: %q", header)
+	}
+	if strings.Contains(header, "tokens: 1.0k") {
+		t.Errorf("顶栏错误地对存活 agent 求和: %q", header)
+	}
+
+	// 累加器为零 → 回退到 agent 求和（900+100=1000 → "1.0k"）。
+	result, _ = m.Update(agentsChangedMsg{
+		agents: []AgentInfo{{ID: "a-1", State: "idle", PromptTokens: 900, CompletionTokens: 100, CallCount: 1}},
+	})
+	fallback := result.(AppModel)
+	header = strings.SplitN(fallback.View(), "\n", 2)[0]
+	if !strings.Contains(header, "tokens: 1.0k") {
+		t.Errorf("累加器为零时顶栏应回退到 agent 求和 1.0k: %q", header)
 	}
 }
