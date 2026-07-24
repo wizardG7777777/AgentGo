@@ -10,6 +10,7 @@ import (
 	"agentgo/internal/model"
 	"agentgo/internal/output"
 	"agentgo/internal/scheduler"
+	"agentgo/internal/trace"
 )
 
 // DefaultPollInterval 是 PollInterval 未设置（<=0）时的默认轮询间隔。
@@ -140,6 +141,14 @@ type Hub struct {
 	nextSubID int                 // 订阅 ID 自增
 	snapshot  Snapshot            // 最新快照（整体替换，绝不原地修改）
 	feed      FeedSnapshot        // 有界实时窗口；在 Snapshot/Subscribe 时复制
+
+	// Session 级 token 累加器：由 EmitTraceEvent 逐条累加 token_stats 事件
+	// （每次 LLM 调用恰好一条，载本轮消耗）。独立于 snapshot 存放，
+	// refreshSnapshot 整体替换快照时不会被抹掉；ad-hoc 团队销毁后其消耗
+	// 仍累计在此，避免"对存活 agent 求和"导致的消耗隐形。
+	sessionPromptTokens     int64
+	sessionCompletionTokens int64
+	sessionCallCount        int
 }
 
 // NewHub 创建 Hub。Run 尚未启动前即可 Subscribe / 调用 Controller。
@@ -213,10 +222,13 @@ func (h *Hub) Run(ctx context.Context) {
 			h.refreshSnapshot()
 			snap := h.Snapshot()
 			h.broadcast(Update{
-				Kind:   KindAgentsChanged,
-				Agents: snap.Agents,
-				Tasks:  snap.Tasks,
-				At:     time.Now(),
+				Kind:                    KindAgentsChanged,
+				Agents:                  snap.Agents,
+				Tasks:                   snap.Tasks,
+				SessionPromptTokens:     snap.SessionPromptTokens,
+				SessionCompletionTokens: snap.SessionCompletionTokens,
+				SessionCallCount:        snap.SessionCallCount,
+				At:                      time.Now(),
 			})
 		}
 	}
@@ -268,7 +280,21 @@ func (h *Hub) Snapshot() Snapshot {
 func (h *Hub) snapshotWithFeedLocked() Snapshot {
 	snap := h.snapshot
 	snap.Feed = cloneFeedSnapshot(h.feed)
+	snap.SessionPromptTokens = h.sessionPromptTokens
+	snap.SessionCompletionTokens = h.sessionCompletionTokens
+	snap.SessionCallCount = h.sessionCallCount
 	return snap
+}
+
+// recordTokenStats 累加一条 token_stats 事件的本轮消耗到 session 级计数器。
+// token_stats 每次 LLM 调用恰好 emit 一条（agent.go 主循环），因此不存在
+// 重复计数；llm_call_end 虽也载本轮 token，但不纳入（会与 token_stats 双计）。
+func (h *Hub) recordTokenStats(ev trace.Event) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.sessionPromptTokens += int64(ev.PromptTokens)
+	h.sessionCompletionTokens += int64(ev.CompletionTokens)
+	h.sessionCallCount++
 }
 
 func cloneFeedSnapshot(feed FeedSnapshot) FeedSnapshot {

@@ -10,7 +10,7 @@ import (
 func TestRenderHeader_Immediate(t *testing.T) {
 	theme := DefaultTheme()
 	l := calcLayout(120, 40, ViewDashboard)
-	result := renderHeader(theme, l, scheduler.ModeImmediate, "sess-001", 3, 0)
+	result := renderHeader(theme, l, scheduler.ModeImmediate, "sess-001", 3, 0, 0)
 
 	if !strings.Contains(result, "AgentGo") {
 		t.Error("should contain logo")
@@ -29,7 +29,7 @@ func TestRenderHeader_Immediate(t *testing.T) {
 func TestRenderHeader_PlanMode(t *testing.T) {
 	theme := DefaultTheme()
 	l := calcLayout(120, 40, ViewDashboard)
-	result := renderHeader(theme, l, scheduler.ModePlan, "", 1, 0)
+	result := renderHeader(theme, l, scheduler.ModePlan, "", 1, 0, 0)
 
 	if !strings.Contains(result, "Plan") {
 		t.Error("should show Plan mode")
@@ -39,7 +39,7 @@ func TestRenderHeader_PlanMode(t *testing.T) {
 func TestRenderHeader_WithInteractions(t *testing.T) {
 	theme := DefaultTheme()
 	l := calcLayout(120, 40, ViewDashboard)
-	result := renderHeader(theme, l, scheduler.ModeImmediate, "", 2, 3)
+	result := renderHeader(theme, l, scheduler.ModeImmediate, "", 2, 3, 0)
 
 	if !strings.Contains(result, "3 interaction") {
 		t.Error("should show interaction count when > 0")
@@ -49,7 +49,7 @@ func TestRenderHeader_WithInteractions(t *testing.T) {
 func TestRenderHeader_NoInteractions(t *testing.T) {
 	theme := DefaultTheme()
 	l := calcLayout(120, 40, ViewDashboard)
-	result := renderHeader(theme, l, scheduler.ModeImmediate, "", 2, 0)
+	result := renderHeader(theme, l, scheduler.ModeImmediate, "", 2, 0, 0)
 
 	if strings.Contains(result, "interaction") {
 		t.Error("should not show interaction indicator when count is 0")
@@ -59,17 +59,32 @@ func TestRenderHeader_NoInteractions(t *testing.T) {
 func TestRenderHeader_NoSession(t *testing.T) {
 	theme := DefaultTheme()
 	l := calcLayout(120, 40, ViewDashboard)
-	result := renderHeader(theme, l, scheduler.ModeImmediate, "", 2, 0)
+	result := renderHeader(theme, l, scheduler.ModeImmediate, "", 2, 0, 0)
 
 	if strings.Contains(result, "Session:") {
 		t.Error("should not show Session label when ID is empty")
 	}
 }
 
+func TestRenderHeader_TokenTotal(t *testing.T) {
+	theme := DefaultTheme()
+	l := calcLayout(120, 40, ViewDashboard)
+
+	withTokens := renderHeader(theme, l, scheduler.ModeImmediate, "", 2, 0, 15300)
+	if !strings.Contains(withTokens, "tokens: 15.3k") {
+		t.Errorf("should show session token total, got %q", withTokens)
+	}
+
+	noTokens := renderHeader(theme, l, scheduler.ModeImmediate, "", 2, 0, 0)
+	if strings.Contains(noTokens, "tokens:") {
+		t.Error("should not show token label when total is 0")
+	}
+}
+
 func TestRenderHeader_TooNarrow(t *testing.T) {
 	theme := DefaultTheme()
 	l := calcLayout(5, 10, ViewDashboard)
-	result := renderHeader(theme, l, scheduler.ModeImmediate, "", 0, 0)
+	result := renderHeader(theme, l, scheduler.ModeImmediate, "", 0, 0, 0)
 
 	if result != "" {
 		t.Error("should return empty for very narrow terminal")

@@ -9,8 +9,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// renderHeader draws the top bar: logo | mode | session | agent count.
-func renderHeader(t Theme, l Layout, mode scheduler.Mode, sessionID string, agentCount int, interactionPending int) string {
+// renderHeader draws the top bar: logo | mode | session | agent count | session token total.
+// totalTokens 为全 session 各 agent 累计消耗之和（prompt+completion），<=0 时不显示。
+func renderHeader(t Theme, l Layout, mode scheduler.Mode, sessionID string, agentCount int, interactionPending int, totalTokens int64) string {
 	if l.Width < 10 {
 		return ""
 	}
@@ -30,6 +31,11 @@ func renderHeader(t Theme, l Layout, mode scheduler.Mode, sessionID string, agen
 
 	agentLabel := t.HeaderMeta.Render(fmt.Sprintf(" %d agents ", agentCount))
 
+	tokenLabel := ""
+	if totalTokens > 0 {
+		tokenLabel = t.HeaderMeta.Render(fmt.Sprintf(" tokens: %s ", formatTokens(totalTokens)))
+	}
+
 	interactionLabel := ""
 	if interactionPending > 0 {
 		interactionLabel = lipgloss.NewStyle().
@@ -40,6 +46,9 @@ func renderHeader(t Theme, l Layout, mode scheduler.Mode, sessionID string, agen
 
 	sep := t.HeaderSep.Render("│")
 	left := logo + sep + modeLabel + sep + sessLabel + sep + agentLabel
+	if tokenLabel != "" {
+		left += sep + tokenLabel
+	}
 	if interactionLabel != "" {
 		left += sep + interactionLabel
 	}
