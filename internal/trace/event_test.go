@@ -342,25 +342,25 @@ func TestDetectAnomaliesNewHeuristics(t *testing.T) {
 		}
 	})
 
-	t.Run("watchdog cancel", func(t *testing.T) {
+	t.Run("cascade cancel", func(t *testing.T) {
 		events := []Event{
 			{
 				Kind: KindTaskCancelled,
 				Transition: &Transition{
 					PrevStatus: "processing", NewStatus: "cancelled",
-					CancelSource: "watchdog",
+					CancelSource: "dependency_failure",
 				},
 			},
 		}
 		anom := detectAnomalies(events)
 		found := false
 		for _, a := range anom {
-			if strings.Contains(a, "watchdog") {
+			if strings.Contains(a, "级联取消") {
 				found = true
 			}
 		}
 		if !found {
-			t.Errorf("expected watchdog anomaly, got %v", anom)
+			t.Errorf("expected cascade cancel anomaly, got %v", anom)
 		}
 	})
 

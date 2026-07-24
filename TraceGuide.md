@@ -36,7 +36,7 @@ TRACE_DIR=".agentgo/sessions/sess-${SESSION_ID}/logs"
 ls "$TRACE_DIR"/*.jsonl
 ```
 
-### 1.2 三个核心命令
+### 1.2 四个核心命令
 
 ```bash
 # 列出最近所有任务（表格形式，按发布时间倒序）
@@ -47,6 +47,9 @@ agentgo trace show <task_id>
 
 # 聚合同一个动态 DAG Plan 的跨任务时间线
 agentgo trace plan <plan_id>
+
+# 聚合当前 session 全部任务的 LLM 调用与 token 消耗（task/agent/plan 三个维度）
+agentgo trace stats [task|agent|plan]
 ```
 
 `task_id` 可以是完整 UUID 或任意唯一前缀；发生前缀碰撞时 CLI 会列出完整候选：
@@ -355,6 +358,26 @@ reason:               人类可读结果说明
 
 `Tasks` 统计不同的完整 TaskID，`Trace Files` 统计这些 Task 涉及的不同物理文件。`plan_id` 可以是完整 ID 或唯一前缀；有多个匹配时 CLI 会列出候选。Plan 视图不会把跨任务事件整体套用任务级异常检测，避免把不同节点的读写和终态事实相互混淆。
 
+### 3.4 `agentgo trace stats [task|agent|plan]` 输出
+
+该命令聚合当前 trace 目录内全部任务（含 retry 分片，按完整 TaskID 合并）的 `llm_call_end` 事件，回答"这个 session 的 token 都烧在哪"。token 只取自 `llm_call_end`（每次 LLM 调用一条）；`token_stats` 是 per-agent 累计值，不纳入以避免重复计数。
+
+```
+session 总计: 51 个任务, 467 次 LLM 调用, prompt=7.7M, completion=360.6k, 合计=8.1M tokens, 重试=8 次, 浪费=0 tokens (0%)
+  （浪费口径：终态 cancelled/failed 任务的全部 token；completed 任务的 retry 消耗无法切分，见 RETRIES 列）
+
+按 task 聚合（合计 token 降序）:
+TASK      AGENT            CALLS   RETRIES  PROMPT     COMPLETION  TOTAL      WASTED     STATUS
+2b208a28  scheduler-98a... 30      0        1.1M       21.1k       1.1M       0          completed
+...
+```
+
+- 分组维度：`task`（默认，每任务一行）/ `agent`（按执行者）/ `plan`（按所属 Plan，无 Plan 上下文的任务归入 `(no-plan)`）。
+- **浪费口径**：终态为 `cancelled` / `failed` 的任务，其全部 LLM token 计入 `WASTED`——这些产出未被下游使用，是纯损失。`completed` 任务中间 retry 的消耗无法精确切分，经 `RETRIES` 列单列。
+- **异常提示**：表格后按 task 粒度输出高置信异常（规则刻意保守，与 `trace show` 的 9 条检测互不相关）：session 浪费占比 > 20%；单任务重试 >= 3 次；单任务消耗 > session 总量 40%（任务数 >= 3 时）；单任务 read_file 重读率 > 30%（总读取 >= 4 次；口径为重复全文读 + 相同 offset 重复分页，大文件顺序分页不计，Layer-1 snip 后的重读循环信号）。
+
+注意：`pending` 状态被级联取消的任务从未被 claim，其 `task_cancelled` 事件由 watchdog 补发（2026-07-22 起，`transition.cancel_source=dependency_failure`）；此前这类取消在 trace 中完全不可见。
+
 ---
 
 ## 4. 异常检测规则详解
@@ -457,15 +480,15 @@ CLI 的 `trace show` 在末尾自动运行 9 条启发式异常检测。以下�
 
 ---
 
-### 异常 9：Watchdog 兜底终态
-**检测**：出现 `transition.cause=system_failure` 且 reason 为任务超时的 `task_failed`，或 reason 以 `no_compatible_route` 开头的 `task_blocked`
+### 异常 9：级联取消传播
+**检测**：出现 `transition.cancel_source=dependency_failure` 的 `task_cancelled`
 
-**含义**：Watchdog 对 processing 执行超时做 failed 兜底，或确认 pending 任务在独立宽限期内持续无兼容 route 后做 blocked 兜底。有 route 但暂时满载的正常排队只告警，不进入终态。
+**含义**：Watchdog 因依赖任务失败/取消/不存在而级联取消下游任务。processing 任务的该事件由执行 agent 在 `ctx.Done()` 分支 emit；pending 任务（从未被 claim、没有执行者）的该事件由 watchdog 在取消时补发（2026-07-22 起，此前排队中的级联取消在 trace 中完全不可见）。偶发属正常的依赖失败传播；频繁出现说明 DAG 结构或上游任务质量有系统性问题。
 
 **排查**：
-- 查看终态事件的 `reason` 与 `transition`，区分执行超时和无 route
-- 执行超时检查任务自身 `timeout_seconds`；无 route 检查 event type / Plan route 是否实际注册
-- 不要用 store 的 processing 默认超时解释 pending 等待；pending 告警和无 route 各有独立 grace
+- 看事件的 `reason`（"级联取消：依赖任务 X 已 failed/cancelled/不存在"）定位上游根因任务
+- 用 `trace show <上游任务ID>` 排查上游为什么失败/被取消
+- 用 `trace stats` 的 `WASTED` 列量化级联取消烧掉的 token
 
 ---
 

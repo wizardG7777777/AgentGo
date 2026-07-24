@@ -38,6 +38,15 @@ func CLI(args []string, dir string, out io.Writer) error {
 			return fmt.Errorf("usage: agentgo trace plan <plan_id>")
 		}
 		return cmdPlan(dir, args[1], out)
+	case "stats":
+		groupBy := "task"
+		if len(args) >= 2 {
+			groupBy = args[1]
+		}
+		if groupBy != "task" && groupBy != "agent" && groupBy != "plan" {
+			return fmt.Errorf("usage: agentgo trace stats [task|agent|plan]")
+		}
+		return cmdStats(dir, groupBy, out)
 	case "help", "-h", "--help":
 		return printUsage(out)
 	default:
@@ -54,12 +63,15 @@ subcommands:
                         task_id 可以是完整 UUID 或任意唯一前缀
   plan <plan_id>        聚合展示一个动态 DAG Plan 的跨任务事件时间线
                         plan_id 可以是完整 UUID 或唯一前缀
+  stats [task|agent|plan]  聚合当前 trace 目录内全部任务的 LLM 调用与
+                        token 消耗（默认按 task 分组，按总 token 降序）
 
 示例:
   agentgo trace list
   agentgo trace show 321b561d
   agentgo trace show 321b561d-c564-422c-bfa0-b96f54edcb87
   agentgo trace plan 321b561d
+  agentgo trace stats agent
 
 实时查看最新任务的事件流（用 tail -f 即可）:
   tail -f .agentgo/sessions/sess-<id>/logs/<时间戳>_<task_id前8位>.jsonl | jq
@@ -576,6 +588,293 @@ func summarizeTask(group *taskTrace) taskSummary {
 
 func isTerminalSummaryStatus(status string) bool {
 	return status == "completed" || status == "failed" || status == "blocked" || status == "cancelled"
+}
+
+// statsAgg 是 stats 命令一个聚合桶的累计数据。token 取自 llm_call_end 事件
+// （每次 LLM 调用一条，载本轮消耗）；token_stats 事件是 per-agent 累计值，
+// 若同时纳入会重复计数，因此不读。
+// wasted 口径：终态为 cancelled / failed 的任务，其全部 LLM token 计为浪费
+// （产出未被下游使用）。completed 任务中间 retry 的消耗无法精确切分，
+// 经 retries 计数单列，不混入 wasted。
+type statsAgg struct {
+	tasks      map[string]struct{}
+	calls      int
+	prompt     int64
+	completion int64
+	retries    int
+	wasted     int64
+}
+
+func (a *statsAgg) total() int64 { return a.prompt + a.completion }
+
+// readFileStat 记录单 path 的 read_file 调用结构：full 为无 offset/limit 的
+// 全文读取次数，pages 为分页读取（offset → 次数）。重读判定据此区分
+// "重复读同一内容"（浪费）与"大文件顺序分页"（合法新内容）。
+type readFileStat struct {
+	full  int
+	pages map[int]int
+}
+
+// reReads 返回该 path 的浪费性重读次数：重复全文读（full-1）+
+// 相同 offset 的重复分页（每页 count-1）。新 offset 的分页不计——
+// 那是对大文件的合法顺序阅读（2026-07-22 指标修正：此前按 path 计数
+// 把 memory.go 这类 1700+ 行文件的顺序分页误报为重读，基线 72–87%
+// 被显著高估）。
+func (s *readFileStat) reReads() int {
+	n := 0
+	if s.full > 1 {
+		n += s.full - 1
+	}
+	for _, count := range s.pages {
+		if count > 1 {
+			n += count - 1
+		}
+	}
+	return n
+}
+
+// taskStat 是一个任务（含 retry 分片合并后）的 token 统计，是 stats 的
+// 最小聚合单位；agent / plan 视图由它二次聚合，异常检测也基于它。
+type taskStat struct {
+	id     string
+	agent  string
+	status string
+	planID string
+	calls  int
+	agg    statsAgg
+	// reads 统计同任务内 read_file 按 path 的调用结构，供重读率异常检测。
+	reads map[string]*readFileStat
+}
+
+// cmdStats 实现 agentgo trace stats [task|agent|plan]。
+// 回答"这个 session 的 token 都烧在哪"：把目录内全部任务（含 retry 分片，
+// 由 groupTraceFiles 按完整 TaskID 合并）的 llm_call_end 事件按维度聚合。
+func cmdStats(dir, groupBy string, out io.Writer) error {
+	files, err := listTaskFiles(dir)
+	if err != nil {
+		return err
+	}
+	groups := groupTraceFiles(loadTraceFiles(files))
+
+	// 第一层：per-task 聚合。
+	taskStats := make([]*taskStat, 0, len(groups))
+	for _, g := range groups {
+		summary := summarizeTask(g)
+		ts := &taskStat{id: g.displayID(), agent: summary.agentID, status: summary.status, planID: summary.planID, reads: make(map[string]*readFileStat)}
+		for _, record := range g.records {
+			switch record.event.Kind {
+			case KindLLMCallEnd:
+				ts.agg.calls++
+				ts.agg.prompt += int64(record.event.PromptTokens)
+				ts.agg.completion += int64(record.event.CompletionTokens)
+			case KindTaskRetry:
+				ts.agg.retries++
+			case KindToolCall:
+				if record.event.Tool == "read_file" {
+					path, _ := record.event.Args["path"].(string)
+					rs := ts.reads[path]
+					if rs == nil {
+						rs = &readFileStat{pages: make(map[int]int)}
+						ts.reads[path] = rs
+					}
+					_, hasOffset := record.event.Args["offset"]
+					_, hasLimit := record.event.Args["limit"]
+					if !hasOffset && !hasLimit {
+						rs.full++
+					} else {
+						offset := 1
+						if v, ok := record.event.Args["offset"].(float64); ok && v > 0 {
+							offset = int(v)
+						}
+						rs.pages[offset]++
+					}
+				}
+			}
+		}
+		if ts.status == "cancelled" || ts.status == "failed" {
+			ts.agg.wasted = ts.agg.total()
+		}
+		taskStats = append(taskStats, ts)
+	}
+
+	// 第二层：按分组维度聚合。
+	type statsRow struct {
+		key    string
+		agent  string // 仅 task 视图使用
+		status string // 仅 task 视图使用
+		agg    *statsAgg
+	}
+	buckets := make(map[string]*statsAgg)
+	rowsByKey := make(map[string]*statsRow)
+	for _, ts := range taskStats {
+		key := ""
+		switch groupBy {
+		case "agent":
+			key = ts.agent
+			if key == "" {
+				key = "(unknown)"
+			}
+		case "plan":
+			key = ts.planID
+			if key == "" {
+				key = "(no-plan)"
+			}
+		default: // task
+			key = ts.id
+		}
+		bucket := buckets[key]
+		if bucket == nil {
+			bucket = &statsAgg{tasks: make(map[string]struct{})}
+			buckets[key] = bucket
+			rowsByKey[key] = &statsRow{key: key, agent: ts.agent, status: ts.status, agg: bucket}
+		}
+		bucket.tasks[ts.id] = struct{}{}
+		bucket.calls += ts.agg.calls
+		bucket.prompt += ts.agg.prompt
+		bucket.completion += ts.agg.completion
+		bucket.retries += ts.agg.retries
+		bucket.wasted += ts.agg.wasted
+	}
+
+	rows := make([]*statsRow, 0, len(rowsByKey))
+	var session statsAgg
+	for _, row := range rowsByKey {
+		rows = append(rows, row)
+		session.calls += row.agg.calls
+		session.prompt += row.agg.prompt
+		session.completion += row.agg.completion
+		session.retries += row.agg.retries
+		session.wasted += row.agg.wasted
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].agg.total() != rows[j].agg.total() {
+			return rows[i].agg.total() > rows[j].agg.total()
+		}
+		return rows[i].key < rows[j].key
+	})
+
+	wastedPct := 0.0
+	if session.total() > 0 {
+		wastedPct = float64(session.wasted) / float64(session.total()) * 100
+	}
+	fmt.Fprintf(out, "session 总计: %d 个任务, %d 次 LLM 调用, prompt=%s, completion=%s, 合计=%s tokens, 重试=%d 次, 浪费=%s tokens (%.0f%%)\n",
+		len(groups), session.calls,
+		formatTokenCount(session.prompt), formatTokenCount(session.completion),
+		formatTokenCount(session.total()), session.retries,
+		formatTokenCount(session.wasted), wastedPct)
+	fmt.Fprintln(out, "  （浪费口径：终态 cancelled/failed 任务的全部 token；completed 任务的 retry 消耗无法切分，见 RETRIES 列）")
+	if session.calls == 0 {
+		fmt.Fprintln(out, "\n（目录内没有 LLM 调用记录）")
+		return nil
+	}
+
+	switch groupBy {
+	case "task":
+		fmt.Fprintln(out, "\n按 task 聚合（合计 token 降序）:")
+		fmt.Fprintln(out, "TASK      AGENT            CALLS   RETRIES  PROMPT     COMPLETION  TOTAL      WASTED     STATUS")
+		for _, row := range rows {
+			fmt.Fprintf(out, "%-9s %-16s %-7d %-8d %-10s %-11s %-10s %-10s %s\n",
+				fitColumn(shortIdentifier(row.key), 9), fitColumn(row.agent, 16),
+				row.agg.calls, row.agg.retries,
+				formatTokenCount(row.agg.prompt), formatTokenCount(row.agg.completion),
+				formatTokenCount(row.agg.total()), formatTokenCount(row.agg.wasted), row.status)
+		}
+	case "agent":
+		fmt.Fprintln(out, "\n按 agent 聚合（合计 token 降序）:")
+		fmt.Fprintln(out, "AGENT            TASKS   CALLS   RETRIES  PROMPT     COMPLETION  TOTAL      WASTED")
+		for _, row := range rows {
+			fmt.Fprintf(out, "%-16s %-7d %-7d %-8d %-10s %-11s %-10s %-10s\n",
+				fitColumn(row.key, 16), len(row.agg.tasks), row.agg.calls, row.agg.retries,
+				formatTokenCount(row.agg.prompt), formatTokenCount(row.agg.completion),
+				formatTokenCount(row.agg.total()), formatTokenCount(row.agg.wasted))
+		}
+	case "plan":
+		fmt.Fprintln(out, "\n按 plan 聚合（合计 token 降序）:")
+		fmt.Fprintln(out, "PLAN      TASKS   CALLS   RETRIES  PROMPT     COMPLETION  TOTAL      WASTED")
+		for _, row := range rows {
+			label := row.key
+			if label != "(no-plan)" {
+				label = shortIdentifier(label)
+			}
+			fmt.Fprintf(out, "%-9s %-7d %-7d %-8d %-10s %-11s %-10s %-10s\n",
+				fitColumn(label, 9), len(row.agg.tasks), row.agg.calls, row.agg.retries,
+				formatTokenCount(row.agg.prompt), formatTokenCount(row.agg.completion),
+				formatTokenCount(row.agg.total()), formatTokenCount(row.agg.wasted))
+		}
+	}
+	printStatsAnomalies(out, taskStats, &session)
+	fmt.Fprintf(out, "\ntrace 目录: %s\n", dir)
+	return nil
+}
+
+// printStatsAnomalies 在 stats 表格后输出 task 粒度的异常提示。规则刻意
+// 保守（只报高置信信号），阈值与 detectAnomalies 无关、互不影响：
+//   - session 浪费占比 > 20%：取消/失败任务消耗过高，检查 DAG 依赖与级联取消；
+//   - 单任务重试 >= 3 次：同因重试可能存在系统性失败；
+//   - 单任务消耗 > session 总量 40%（任务数 >= 3 时）：消耗异常集中；
+//   - 单任务 read_file 重读率 > 30%（总读取 >= 4 次）：重复读取同一内容
+//     （重复全文读 / 相同 offset 重复分页；新 offset 的顺序分页不算），
+//     多为 Layer-1 snip 清掉旧内容后的重读循环（见
+//     docs/activate/explorer-reread-waste-analysis-2026-07-22.md）。
+func printStatsAnomalies(out io.Writer, taskStats []*taskStat, session *statsAgg) {
+	var warnings []string
+	if session.total() > 0 && session.wasted*5 > session.total() {
+		warnings = append(warnings, fmt.Sprintf(
+			"浪费占比 %.0f%% 超过 20%%（取消/失败任务消耗过高，检查 DAG 依赖结构与级联取消来源）",
+			float64(session.wasted)/float64(session.total())*100))
+	}
+	for _, ts := range taskStats {
+		if ts.agg.retries >= 3 {
+			warnings = append(warnings, fmt.Sprintf(
+				"任务 %s 重试 %d 次（同因重试可能存在系统性失败，用 trace show %s 排查）",
+				shortIdentifier(ts.id), ts.agg.retries, shortIdentifier(ts.id)))
+		}
+		if len(taskStats) >= 3 && session.total() > 0 && ts.agg.total()*5 > session.total()*2 {
+			warnings = append(warnings, fmt.Sprintf(
+				"任务 %s 消耗 %s tokens，占 session 总量 %.0f%%（单任务消耗异常集中，检查是否跑满 loops 或上下文膨胀）",
+				shortIdentifier(ts.id), formatTokenCount(ts.agg.total()),
+				float64(ts.agg.total())/float64(session.total())*100))
+		}
+		// read_file 重读率：只计"重复读同一内容"（重复全文读 + 相同 offset
+		// 重复分页），大文件顺序分页不算浪费。
+		totalReads, reReads := 0, 0
+		worstPath, worstCount := "", 0
+		for path, rs := range ts.reads {
+			totalReads += rs.full
+			for _, count := range rs.pages {
+				totalReads += count
+			}
+			if n := rs.reReads(); n > worstCount {
+				worstPath, worstCount = path, n
+			}
+			reReads += rs.reReads()
+		}
+		if totalReads >= 4 && reReads*10 > totalReads*3 {
+			warnings = append(warnings, fmt.Sprintf(
+				"任务 %s read_file 重读率 %.0f%%（%d/%d 次为重复读取；最高 %s 被重读 %d 次——Layer-1 snip 后的重读循环，参考 explorer-reread-waste 分析）",
+				shortIdentifier(ts.id), float64(reReads)/float64(totalReads)*100,
+				reReads, totalReads, worstPath, worstCount))
+		}
+	}
+	if len(warnings) == 0 {
+		return
+	}
+	fmt.Fprintln(out, "\n异常提示:")
+	for _, w := range warnings {
+		fmt.Fprintf(out, "  WARNING %s\n", w)
+	}
+}
+
+// formatTokenCount 把 token 数格式化为 k/M 缩写，供 stats 表格对齐。
+func formatTokenCount(n int64) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
 }
 
 // cmdShow 实现 agentgo trace show <task_id>。
@@ -1351,19 +1650,22 @@ func detectAnomalies(events []Event) []string {
 		}
 	}
 
-	// 9. 检测：cancel_source=watchdog 出现（兜底取消应该罕见）
+	// 9. 检测：级联取消出现（cancel_source=dependency_failure；依赖失败传播，
+	// 频繁出现说明 DAG 结构或依赖管理有问题）。注意真实来源字符串是
+	// "dependency_failure"（watchdog.go / TransitionStateWithCancelSource），
+	// 不要写成 "watchdog"——那只是历史 fixture 里的占位值。
 	{
-		watchdogCancels := 0
+		cascadeCancels := 0
 		for _, ev := range events {
 			if ev.Kind == KindTaskCancelled && ev.Transition != nil &&
-				ev.Transition.CancelSource == "watchdog" {
-				watchdogCancels++
+				ev.Transition.CancelSource == "dependency_failure" {
+				cascadeCancels++
 			}
 		}
-		if watchdogCancels > 0 {
+		if cascadeCancels > 0 {
 			anomalies = append(anomalies, fmt.Sprintf(
-				"WARNING watchdog 兜底取消 %d 次（主流程可能存在卡死或泄漏）",
-				watchdogCancels))
+				"WARNING 级联取消 %d 次（依赖失败传播；若频繁出现，检查 DAG 依赖结构与上游失败原因）",
+				cascadeCancels))
 		}
 	}
 

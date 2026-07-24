@@ -775,3 +775,226 @@ func eventKindValuesFromSource(t *testing.T) map[string]struct{} {
 	})
 	return values
 }
+
+// TestCmdStatsAggregatesTokens 验证 stats 子命令：token 取自 llm_call_end
+// 逐次调用事件（不读累计型 token_stats，避免重复计数），并支持
+// task / agent / plan 三种分组维度。
+func TestCmdStatsAggregatesTokens(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 22, 1, 0, 0, 0, time.UTC)
+	planID := "11111111-1111-1111-1111-111111111111"
+	planCtx := &PlanTraceContext{PlanID: planID, PlanRevision: 1, ExecutionStateVersion: 1}
+
+	taskA := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	writeTraceFixture(t, dir, base, taskA, []Event{
+		{Timestamp: base, Kind: KindTaskPublished, TaskID: taskA, Description: "任务A", Plan: planCtx},
+		{Timestamp: base.Add(time.Second), Kind: KindTaskClaimed, TaskID: taskA, AgentID: "worker-1"},
+		{Timestamp: base.Add(2 * time.Second), Kind: KindLLMCallEnd, TaskID: taskA, AgentID: "worker-1", Loop: 0, PromptTokens: 1000, CompletionTokens: 150},
+		{Timestamp: base.Add(3 * time.Second), Kind: KindTaskRetry, TaskID: taskA, AgentID: "worker-1", AttemptNo: 1},
+		{Timestamp: base.Add(4 * time.Second), Kind: KindLLMCallEnd, TaskID: taskA, AgentID: "worker-1", Loop: 0, PromptTokens: 2000, CompletionTokens: 200},
+		// token_stats 是累计值，stats 不得纳入（否则 prompt 会虚高 6000）。
+		{Timestamp: base.Add(5 * time.Second), Kind: KindTokenStats, TaskID: taskA, AgentID: "worker-1", PromptTokens: 2000, CompletionTokens: 200, TotalPromptTokens: 6000, TotalCompletionTokens: 700, CallCount: 2},
+		{Timestamp: base.Add(6 * time.Second), Kind: KindTaskCompleted, TaskID: taskA, AgentID: "worker-1"},
+	})
+	taskB := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	writeTraceFixture(t, dir, base.Add(10*time.Second), taskB, []Event{
+		{Timestamp: base.Add(10 * time.Second), Kind: KindTaskPublished, TaskID: taskB, Description: "任务B"},
+		{Timestamp: base.Add(11 * time.Second), Kind: KindTaskClaimed, TaskID: taskB, AgentID: "worker-2"},
+		{Timestamp: base.Add(12 * time.Second), Kind: KindLLMCallEnd, TaskID: taskB, AgentID: "worker-2", Loop: 0, PromptTokens: 500, CompletionTokens: 50},
+		{Timestamp: base.Add(13 * time.Second), Kind: KindTaskCompleted, TaskID: taskB, AgentID: "worker-2"},
+	})
+	// 任务C 被级联取消：其全部 token 应计入浪费口径。
+	taskC := "cccccccc-cccc-cccc-cccc-cccccccccccc"
+	writeTraceFixture(t, dir, base.Add(20*time.Second), taskC, []Event{
+		{Timestamp: base.Add(20 * time.Second), Kind: KindTaskPublished, TaskID: taskC, Description: "任务C"},
+		{Timestamp: base.Add(21 * time.Second), Kind: KindTaskClaimed, TaskID: taskC, AgentID: "worker-3"},
+		{Timestamp: base.Add(22 * time.Second), Kind: KindLLMCallEnd, TaskID: taskC, AgentID: "worker-3", Loop: 0, PromptTokens: 300, CompletionTokens: 30},
+		{Timestamp: base.Add(23 * time.Second), Kind: KindTaskCancelled, TaskID: taskC, AgentID: "worker-3",
+			Transition: &Transition{PrevStatus: "processing", NewStatus: "cancelled", CancelSource: "dependency_failure"}},
+	})
+
+	// 默认 task 视图：session 总计 + 每任务一行。
+	var taskOut bytes.Buffer
+	if err := CLI([]string{"stats"}, dir, &taskOut); err != nil {
+		t.Fatalf("CLI stats: %v", err)
+	}
+	got := taskOut.String()
+	for _, want := range []string{
+		"session 总计: 3 个任务, 4 次 LLM 调用, prompt=3.8k, completion=430, 合计=4.2k tokens, 重试=1 次, 浪费=330 tokens (8%)",
+		"aaaaaaaa", "worker-1", "completed",
+		"bbbbbbbb", "worker-2",
+		"cccccccc", "worker-3", "cancelled", "330",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("stats task output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "6.0k") || strings.Contains(got, "9.5k") {
+		t.Errorf("token_stats 累计值被误计入 stats:\n%s", got)
+	}
+
+	// agent 视图：worker-1 聚合 2 次调用 / prompt 3.0k。
+	var agentOut bytes.Buffer
+	if err := CLI([]string{"stats", "agent"}, dir, &agentOut); err != nil {
+		t.Fatalf("CLI stats agent: %v", err)
+	}
+	got = agentOut.String()
+	if !strings.Contains(got, "worker-1") || !strings.Contains(got, "worker-2") {
+		t.Errorf("stats agent output missing agents:\n%s", got)
+	}
+	if !strings.Contains(got, "3.0k") {
+		t.Errorf("stats agent output missing worker-1 prompt 3.0k:\n%s", got)
+	}
+
+	// plan 视图：任务A 归入 plan 短 ID，任务B 归入 (no-plan)。
+	var planOut bytes.Buffer
+	if err := CLI([]string{"stats", "plan"}, dir, &planOut); err != nil {
+		t.Fatalf("CLI stats plan: %v", err)
+	}
+	got = planOut.String()
+	if !strings.Contains(got, "11111111") || !strings.Contains(got, "(no-plan)") {
+		t.Errorf("stats plan output missing plan buckets:\n%s", got)
+	}
+
+	// 非法分组维度必须报错。
+	if err := CLI([]string{"stats", "bogus"}, dir, &bytes.Buffer{}); err == nil {
+		t.Fatal("stats bogus groupBy should fail")
+	}
+}
+
+func TestCmdStatsEmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	var out bytes.Buffer
+	if err := CLI([]string{"stats"}, dir, &out); err != nil {
+		t.Fatalf("CLI stats on empty dir: %v", err)
+	}
+	if !strings.Contains(out.String(), "没有 LLM 调用记录") {
+		t.Errorf("empty dir should note no LLM calls:\n%s", out.String())
+	}
+}
+
+// TestCmdStatsAnomalies 验证 stats 末尾的 task 粒度异常提示：浪费占比超阈、
+// 同任务多次重试、单任务消耗异常集中三类信号。
+func TestCmdStatsAnomalies(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 22, 2, 0, 0, 0, time.UTC)
+
+	// A：大头任务（占 session 总量 > 40%）。
+	taskA := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	writeTraceFixture(t, dir, base, taskA, []Event{
+		{Timestamp: base, Kind: KindTaskClaimed, TaskID: taskA, AgentID: "worker-1"},
+		{Timestamp: base.Add(time.Second), Kind: KindLLMCallEnd, TaskID: taskA, AgentID: "worker-1", PromptTokens: 1000, CompletionTokens: 100},
+		{Timestamp: base.Add(2 * time.Second), Kind: KindTaskCompleted, TaskID: taskA, AgentID: "worker-1"},
+	})
+	// B：被取消（贡献浪费占比 > 20%）。
+	taskB := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	writeTraceFixture(t, dir, base.Add(10*time.Second), taskB, []Event{
+		{Timestamp: base.Add(10 * time.Second), Kind: KindTaskClaimed, TaskID: taskB, AgentID: "worker-2"},
+		{Timestamp: base.Add(11 * time.Second), Kind: KindLLMCallEnd, TaskID: taskB, AgentID: "worker-2", PromptTokens: 500, CompletionTokens: 50},
+		{Timestamp: base.Add(12 * time.Second), Kind: KindTaskCancelled, TaskID: taskB, AgentID: "worker-2"},
+	})
+	// C：同任务重试 3 次。
+	taskC := "cccccccc-cccc-cccc-cccc-cccccccccccc"
+	writeTraceFixture(t, dir, base.Add(20*time.Second), taskC, []Event{
+		{Timestamp: base.Add(20 * time.Second), Kind: KindTaskClaimed, TaskID: taskC, AgentID: "worker-3"},
+		{Timestamp: base.Add(21 * time.Second), Kind: KindTaskRetry, TaskID: taskC, AgentID: "worker-3", AttemptNo: 1},
+		{Timestamp: base.Add(22 * time.Second), Kind: KindTaskRetry, TaskID: taskC, AgentID: "worker-3", AttemptNo: 2},
+		{Timestamp: base.Add(23 * time.Second), Kind: KindTaskRetry, TaskID: taskC, AgentID: "worker-3", AttemptNo: 3},
+		{Timestamp: base.Add(24 * time.Second), Kind: KindLLMCallEnd, TaskID: taskC, AgentID: "worker-3", PromptTokens: 100, CompletionTokens: 10},
+		{Timestamp: base.Add(25 * time.Second), Kind: KindTaskCompleted, TaskID: taskC, AgentID: "worker-3"},
+	})
+
+	var out bytes.Buffer
+	if err := CLI([]string{"stats"}, dir, &out); err != nil {
+		t.Fatalf("CLI stats: %v", err)
+	}
+	got := out.String()
+	for _, want := range []string{"异常提示:", "浪费占比", "重试 3 次", "异常集中"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("stats anomalies output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestCmdStatsNoAnomaliesWhenHealthy 验证健康 session 不输出异常提示区块。
+func TestCmdStatsNoAnomaliesWhenHealthy(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 22, 3, 0, 0, 0, time.UTC)
+	for i, id := range []string{
+		"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+		"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+		"cccccccc-cccc-cccc-cccc-cccccccccccc",
+	} {
+		ts := base.Add(time.Duration(i*10) * time.Second)
+		writeTraceFixture(t, dir, ts, id, []Event{
+			{Timestamp: ts, Kind: KindTaskClaimed, TaskID: id, AgentID: "worker-1"},
+			{Timestamp: ts.Add(time.Second), Kind: KindLLMCallEnd, TaskID: id, AgentID: "worker-1", PromptTokens: 100, CompletionTokens: 10},
+			{Timestamp: ts.Add(2 * time.Second), Kind: KindTaskCompleted, TaskID: id, AgentID: "worker-1"},
+		})
+	}
+	var out bytes.Buffer
+	if err := CLI([]string{"stats"}, dir, &out); err != nil {
+		t.Fatalf("CLI stats: %v", err)
+	}
+	if strings.Contains(out.String(), "异常提示:") {
+		t.Errorf("healthy session should not print anomalies:\n%s", out.String())
+	}
+}
+
+// TestCmdStatsReReadMetric 验证修正后的重读判定（2026-07-22）：
+// 只有"重复读同一内容"算浪费——重复全文读、相同 offset 重复分页；
+// 大文件不同 offset 的顺序分页是合法阅读，不计入。
+func TestCmdStatsReReadMetric(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 23, 1, 0, 0, 0, time.UTC)
+	read := func(ts time.Time, taskID, path string, args map[string]any) Event {
+		if args == nil {
+			args = map[string]any{}
+		}
+		args["path"] = path
+		return Event{Timestamp: ts, Kind: KindToolCall, TaskID: taskID, Tool: "read_file", Args: args}
+	}
+
+	// 任务A：a.go 全文读 2 次（1 次浪费）+ big.go 分页 1/300/600（合法）
+	// + big.go offset=300 重复（1 次浪费）→ 5 次读取，2 次重读 = 40%。
+	taskA := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	writeTraceFixture(t, dir, base, taskA, []Event{
+		{Timestamp: base, Kind: KindTaskClaimed, TaskID: taskA, AgentID: "explorer-1"},
+		read(base.Add(time.Second), taskA, "a.go", nil),
+		read(base.Add(2*time.Second), taskA, "a.go", nil),
+		read(base.Add(3*time.Second), taskA, "big.go", map[string]any{"offset": float64(1), "limit": float64(300)}),
+		read(base.Add(4*time.Second), taskA, "big.go", map[string]any{"offset": float64(300), "limit": float64(300)}),
+		read(base.Add(5*time.Second), taskA, "big.go", map[string]any{"offset": float64(300), "limit": float64(400)}),
+		read(base.Add(6*time.Second), taskA, "big.go", map[string]any{"offset": float64(600), "limit": float64(300)}),
+		{Timestamp: base.Add(6500 * time.Millisecond), Kind: KindLLMCallEnd, TaskID: taskA, AgentID: "explorer-1", PromptTokens: 100, CompletionTokens: 10},
+		{Timestamp: base.Add(7 * time.Second), Kind: KindTaskCompleted, TaskID: taskA, AgentID: "explorer-1"},
+	})
+	// 任务B：纯顺序分页 + 一次全文读 → 0 重读，不应出现 WARNING。
+	taskB := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	writeTraceFixture(t, dir, base.Add(10*time.Second), taskB, []Event{
+		{Timestamp: base.Add(10 * time.Second), Kind: KindTaskClaimed, TaskID: taskB, AgentID: "explorer-1"},
+		read(base.Add(11*time.Second), taskB, "x.go", nil),
+		read(base.Add(12*time.Second), taskB, "big.go", map[string]any{"offset": float64(1), "limit": float64(200)}),
+		read(base.Add(13*time.Second), taskB, "big.go", map[string]any{"offset": float64(200), "limit": float64(200)}),
+		read(base.Add(14*time.Second), taskB, "big.go", map[string]any{"offset": float64(400), "limit": float64(200)}),
+		read(base.Add(15*time.Second), taskB, "big.go", map[string]any{"offset": float64(600), "limit": float64(200)}),
+		{Timestamp: base.Add(16 * time.Second), Kind: KindTaskCompleted, TaskID: taskB, AgentID: "explorer-1"},
+	})
+
+	var out bytes.Buffer
+	if err := CLI([]string{"stats"}, dir, &out); err != nil {
+		t.Fatalf("CLI stats: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "任务 aaaaaaaa read_file 重读率 33%（2/6 次为重复读取") {
+		t.Errorf("任务A 重读判定不符（应为 2/6=33%%）:\n%s", got)
+	}
+	// 任务B 纯顺序分页 + 一次全文读 → 0 重读，不应出现在异常提示区块。
+	anomalySection := ""
+	if idx := strings.Index(got, "异常提示:"); idx >= 0 {
+		anomalySection = got[idx:]
+	}
+	if strings.Contains(anomalySection, "bbbbbbbb") {
+		t.Errorf("任务B 纯顺序分页不应被判为重读:\n%s", anomalySection)
+	}
+}
