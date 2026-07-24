@@ -49,11 +49,11 @@ func (g PlanControlGroup) Register(r *agent.ToolRegistry) {
 			String("target_task_ids", "逗号分隔目标 Task ID；Plan 级留空表示当前有效图", false).
 			String("runner_event_type", "验收 Agent 的 event_type", true).
 			String("description", "验收 Task 描述", false).Build(), g.ensureAcceptanceRun)
-	r.Register("submit_acceptance_result", "提交结构化正式验收结果。系统会校验 Runner、最新版本、证据和目标 Task 事实；命令证据必须精确匹配从 project root 执行的真实 run_shell。",
+	r.Register("submit_acceptance_result", "提交结构化正式验收结果。系统会校验 Runner、最新版本、证据和目标 Task 事实。硬性证据规则（违反即整体判 fail）：task_status 证据的 output 必须逐字等于任务状态词（如 completed），禁止描述性文本；command 证据必须与一次真实 run_shell 调用的命令串逐字符一致，且该调用发生在本 Run 创建之后、working_dir 为 project root、由本验收任务或目标任务执行，exit_code 也必须一致。提交一次性生效：核验失败即判 fail，同一 Run 不可重交。",
 		schema.Object().String("run_id", "AcceptanceRun ID；通常可从当前任务自动取得", false).
 			Enum("verdict", "验收结论", []string{"pass", "fail", "blocked", "disputed"}, true).
 			String("criterion_results_json", "CriterionResult JSON 数组；verdict=pass|fail|blocked|disputed；示例 [{\"criterion_id\":\"tests\",\"verdict\":\"pass\",\"summary\":\"go test 通过\",\"evidence_ids\":[\"ev-tests\"]}]", true).
-			String("evidence_json", "Evidence JSON 数组；每项 kind 必填且 PASS 必须提供真实新鲜证据；命令示例 [{\"id\":\"ev-tests\",\"kind\":\"command\",\"command\":\"go test ./...\",\"exit_code\":0,\"output\":\"ok\"}]；文件示例 [{\"id\":\"ev-file\",\"kind\":\"file_hash\",\"file_path\":\"artifact.bin\",\"file_hash\":\"<sha256>\"}]；Task 示例 [{\"id\":\"ev-task\",\"kind\":\"task_status\",\"task_id\":\"<task-id>\",\"output\":\"completed\"}]", true).
+			String("evidence_json", "Evidence JSON 数组；每项 kind 必填且 PASS 必须提供真实新鲜证据。命令示例 [{\"id\":\"ev-tests\",\"kind\":\"command\",\"command\":\"go test ./...\",\"exit_code\":0,\"output\":\"ok\"}]（command/exit_code 逐字取自你刚执行的真实 run_shell 记录，不得凭记忆重写）；文件示例 [{\"id\":\"ev-file\",\"kind\":\"file_hash\",\"file_path\":\"artifact.bin\",\"file_hash\":\"<sha256>\"}]；Task 示例 [{\"id\":\"ev-task\",\"kind\":\"task_status\",\"task_id\":\"<task-id>\",\"output\":\"completed\"}]（output 只能是裸状态词）", true).
 			String("failure_fingerprint", "规范化失败指纹", false).
 			String("residual_risks", "换行分隔的残余风险", false).
 			String("recommended_actions", "换行分隔的后续动作", false).Build(), g.submitAcceptanceResult)

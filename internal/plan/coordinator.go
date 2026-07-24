@@ -325,7 +325,7 @@ type PlanTaskMutation struct {
 // RecordTaskMutation advances only ExecutionStateVersion. When Wake is true,
 // the associated ReplanRequest is appended in the same durable transaction.
 func (c *Coordinator) RecordTaskMutation(ctx context.Context, planID, taskID string, mutation TaskMutation) (int64, error) {
-	versions, errs := c.RecordTaskMutations(ctx, []PlanTaskMutation{{PlanID: planID, TaskID: taskID, Mutation: mutation}})
+	versions, _, errs := c.RecordTaskMutations(ctx, []PlanTaskMutation{{PlanID: planID, TaskID: taskID, Mutation: mutation}})
 	if errs[0] != nil {
 		return 0, errs[0]
 	}
@@ -337,14 +337,15 @@ func (c *Coordinator) RecordTaskMutation(ctx context.Context, planID, taskID str
 // versions[i]/errs[i] 对应第 i 条；单条失败不影响批内其余变更（该条回滚），
 // 落盘本身失败时全部条目标记失败（内存状态未前进，调用方可整体重试）。
 // 唤醒信号按 Plan 去重后统一发射（信号通道容量为 1，语义与逐条等价）。
-func (c *Coordinator) RecordTaskMutations(ctx context.Context, mutations []PlanTaskMutation) ([]int64, []error) {
+func (c *Coordinator) RecordTaskMutations(ctx context.Context, mutations []PlanTaskMutation) ([]int64, []bool, []error) {
 	versions := make([]int64, len(mutations))
+	notified := make([]bool, len(mutations))
 	if err := ctx.Err(); err != nil {
 		errs := make([]error, len(mutations))
 		for i := range errs {
 			errs[i] = err
 		}
-		return versions, errs
+		return versions, notified, errs
 	}
 	notifyFlags := make([]bool, len(mutations))
 	fns := make([]func(*persistentState) error, len(mutations))
@@ -360,15 +361,19 @@ func (c *Coordinator) RecordTaskMutations(ctx context.Context, mutations []PlanT
 		}
 	}
 	errs := c.store.updateBatch(fns...)
-	notified := make(map[string]bool)
+	notifiedPlans := make(map[string]bool)
 	for i := range mutations {
-		if errs[i] != nil || !notifyFlags[i] || notified[mutations[i].PlanID] {
+		if errs[i] != nil || !notifyFlags[i] {
 			continue
 		}
-		notified[mutations[i].PlanID] = true
+		notified[i] = true
+		if notifiedPlans[mutations[i].PlanID] {
+			continue
+		}
+		notifiedPlans[mutations[i].PlanID] = true
 		c.notify(mutations[i].PlanID)
 	}
-	return versions, errs
+	return versions, notified, errs
 }
 
 // applyTaskMutationOp 把一条 Task 事实变更应用到（已克隆的）持久化状态上。
@@ -449,18 +454,44 @@ func applyTaskMutationOp(state *persistentState, planID, taskID string, mutation
 	p.UpdatedAt = time.Now().UTC()
 	notify := false
 	if mutation.Wake && !planTerminal && node.RetiredRevision == 0 {
-		req := model.ReplanRequest{
-			PlanID: planID, SourceTaskID: taskID, SourceEvent: mutation.SourceEvent,
-			ReasonCode: mutation.ReasonCode, ObservedRevision: p.CurrentRevision,
-			ObservedStateVersion: version, Urgency: normalizedUrgency(mutation.Urgency),
-			IdempotencyKey: mutation.IdempotencyKey, CreatedAt: mutation.OccurredAt,
+		if mutation.ReasonCode == "task_completed" && hasOtherNonTerminalCurrentNodes(p, taskID) {
+			// 阶段内仍有节点在跑：完成类信号延迟到阶段内最后一个节点终态再一次性
+			// 唤醒，避免 Scheduler 为"只能 continue_waiting"的中间完成支付整轮
+			// LLM 调用。节点状态事实已在上文持久化，不丢信息；waitForPlanSignal
+			// 的预算心跳在全部节点终态后会兜底放行，不会死锁。
+		} else {
+			req := model.ReplanRequest{
+				PlanID: planID, SourceTaskID: taskID, SourceEvent: mutation.SourceEvent,
+				ReasonCode: mutation.ReasonCode, ObservedRevision: p.CurrentRevision,
+				ObservedStateVersion: version, Urgency: normalizedUrgency(mutation.Urgency),
+				IdempotencyKey: mutation.IdempotencyKey, CreatedAt: mutation.OccurredAt,
+			}
+			if _, _, err := appendRequest(rec, req); err != nil {
+				return 0, false, err
+			}
+			notify = true
 		}
-		if _, _, err := appendRequest(rec, req); err != nil {
-			return 0, false, err
-		}
-		notify = true
 	}
 	return version, notify, nil
+}
+
+// hasOtherNonTerminalCurrentNodes 报告当前图中除 excludeID 外是否仍有非终态
+// 节点（已退休节点不计）。节点状态由 RecordTaskMutations 同步维护，批内按序
+// 应用保证"同批最后一个完成的节点"看到的是其余节点均已终态。
+func hasOtherNonTerminalCurrentNodes(p *model.Plan, excludeID string) bool {
+	for _, id := range p.CurrentNodeIDs {
+		if id == excludeID {
+			continue
+		}
+		other, ok := p.Nodes[id]
+		if !ok || other.RetiredRevision > 0 {
+			continue
+		}
+		if !model.IsTerminal(other.Status) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Coordinator) RequestReplan(ctx context.Context, request model.ReplanRequest) (*model.ReplanRequest, error) {

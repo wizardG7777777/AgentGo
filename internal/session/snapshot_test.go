@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -101,6 +102,8 @@ func TestSaveSnapshot_InvalidPath(t *testing.T) {
 func TestLoadSnapshot_Success(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot.json")
+	longWorkerResult := "HEAD🙂-" + strings.Repeat("中🚀", 5000) + "-MIDDLE-SECRET-TAIL"
+	longVerifierResult := "evidence-" + strings.Repeat("甲", 9000) + "-end"
 
 	original := &Snapshot{
 		Version: currentSnapshotVersion,
@@ -114,7 +117,7 @@ func TestLoadSnapshot_Success(t *testing.T) {
 				Status:         "pending",
 				Agents:         []string{"worker-1"},
 				MaxConcurrency: 2,
-				Results:        map[string]string{"key": "value"},
+				Results:        map[string]string{"worker": longWorkerResult, "verifier": longVerifierResult},
 				RetryCount:     1,
 				RetryReasons:   []string{"timeout"},
 				TimeoutSeconds: 300,
@@ -178,6 +181,9 @@ func TestLoadSnapshot_Success(t *testing.T) {
 	}
 	if loaded.Tasks[0].Description != original.Tasks[0].Description {
 		t.Errorf("Tasks[0].Description = %q, want %q", loaded.Tasks[0].Description, original.Tasks[0].Description)
+	}
+	if len(loaded.Tasks[0].Results) != 2 || loaded.Tasks[0].Results["worker"] != longWorkerResult || loaded.Tasks[0].Results["verifier"] != longVerifierResult {
+		t.Errorf("Tasks[0].Results lost full result bodies: %#v", loaded.Tasks[0].Results)
 	}
 	if loaded.Tasks[0].ParentTaskID != "parent-task-1" || loaded.Tasks[0].ReplyToAgentID != "scheduler-1" || loaded.Tasks[0].BatchID != "batch-1" {
 		t.Fatalf("Tasks[0] routing metadata = %+v", loaded.Tasks[0])

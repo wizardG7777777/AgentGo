@@ -635,7 +635,7 @@ func TestManagerProvisionPersistenceFailureNeverExposesRoute(t *testing.T) {
 	}
 }
 
-func TestManagerRecoveryDigestMismatchFailsClosed(t *testing.T) {
+func TestManagerRecoveryStopsStaleDigestTeam(t *testing.T) {
 	catalog := testCatalog(t)
 	coordinator, planID, controllerID := testPlan(t, "plan-digest")
 	durable := NewMemoryStore()
@@ -647,15 +647,50 @@ func TestManagerRecoveryDigestMismatchFailsClosed(t *testing.T) {
 	}
 	routes := newFakeRoutes()
 	manager := testManager(t, catalog, coordinator, durable, routes, 4)
-	err := manager.Start(context.Background())
-	if !errors.Is(err, ErrTemplateDigestMismatch) {
-		t.Fatalf("Start err=%v, want ErrTemplateDigestMismatch", err)
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatalf("Start must tolerate stale digest, got %v", err)
+	}
+	defer manager.Shutdown()
+	got, err := durable.Get(spec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusStopped || !strings.HasPrefix(got.StopReason, "template_digest_changed:") {
+		t.Fatalf("stale team = status %s reason %q, want stopped/template_digest_changed:", got.Status, got.StopReason)
 	}
 	if manager.ActiveCount() != 0 {
-		t.Fatalf("digest mismatch started %d agents", manager.ActiveCount())
+		t.Fatalf("stale digest started %d agents", manager.ActiveCount())
 	}
 	if current, _ := routes.snapshot(); len(current) != 0 {
-		t.Fatalf("digest mismatch installed routes: %+v", current)
+		t.Fatalf("stale digest installed routes: %+v", current)
+	}
+}
+
+func TestManagerRecoveryStopsTeamWithUnavailableTemplate(t *testing.T) {
+	catalog := testCatalog(t)
+	coordinator, planID, controllerID := testPlan(t, "plan-missing-template")
+	durable := NewMemoryStore()
+	spec := testSpec("missing-template-team", controllerID, "investigate")
+	spec.PlanID = planID
+	spec.TemplateRef = "builtin/deleted@99"
+	if _, _, err := durable.Ensure(spec); err != nil {
+		t.Fatalf("persist spec with unavailable template: %v", err)
+	}
+	routes := newFakeRoutes()
+	manager := testManager(t, catalog, coordinator, durable, routes, 4)
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatalf("Start must tolerate unavailable template, got %v", err)
+	}
+	defer manager.Shutdown()
+	got, err := durable.Get(spec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusStopped || !strings.HasPrefix(got.StopReason, "template_unavailable:") {
+		t.Fatalf("team = status %s reason %q, want stopped/template_unavailable:", got.Status, got.StopReason)
+	}
+	if manager.ActiveCount() != 0 {
+		t.Fatalf("unavailable template started %d agents", manager.ActiveCount())
 	}
 }
 

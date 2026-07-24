@@ -24,12 +24,12 @@ func TestRecordTaskMutationsBatchAppliesInOrderAndPersistsOnce(t *testing.T) {
 	registerNode(t, c, p.ID, p.CurrentRevision, "task-c")
 
 	baseline := ps.PersistCount()
-	versions, errs := c.RecordTaskMutations(context.Background(), []PlanTaskMutation{
+	versions, _, errs := c.RecordTaskMutations(context.Background(), []PlanTaskMutation{
 		{PlanID: "p-batch", TaskID: "task-a", Mutation: TaskMutation{Status: model.TaskStatusProcessing}},
 		{PlanID: "p-batch", TaskID: "task-b", Mutation: TaskMutation{Status: model.TaskStatusProcessing}},
 		{PlanID: "p-batch", TaskID: "task-a", Mutation: TaskMutation{
-			Status: model.TaskStatusCompleted, Wake: true,
-			SourceEvent: "status", ReasonCode: "task_completed", IdempotencyKey: "batch-a-done",
+			Status: model.TaskStatusFailed, Wake: true,
+			SourceEvent: "status", ReasonCode: "task_failed", IdempotencyKey: "batch-a-done",
 		}},
 	})
 	for i, err := range errs {
@@ -50,12 +50,12 @@ func TestRecordTaskMutationsBatchAppliesInOrderAndPersistsOnce(t *testing.T) {
 	if got.ExecutionStateVersion != versions[2] {
 		t.Fatalf("ExecutionStateVersion=%d, want %d", got.ExecutionStateVersion, versions[2])
 	}
-	if got.Nodes["task-a"].Status != model.TaskStatusCompleted ||
+	if got.Nodes["task-a"].Status != model.TaskStatusFailed ||
 		got.Nodes["task-b"].Status != model.TaskStatusProcessing ||
 		got.Nodes["task-c"].Status != model.TaskStatusPending {
 		t.Fatalf("batch statuses not applied in order: %+v", got.Nodes)
 	}
-	// wake 变更在同一 durable 事务内追加 ReplanRequest
+	// wake 变更在同一 durable 事务内追加 ReplanRequest（失败类信号不受唤醒门控）
 	if len(got.PendingReplanRequests) != 1 {
 		t.Fatalf("pending replan requests=%d, want 1", len(got.PendingReplanRequests))
 	}
@@ -79,7 +79,7 @@ func TestRecordTaskMutationsBatchFailureIsolation(t *testing.T) {
 	registerNode(t, c, p.ID, p.CurrentRevision, "task-b")
 
 	baseline := ps.PersistCount()
-	versions, errs := c.RecordTaskMutations(context.Background(), []PlanTaskMutation{
+	versions, _, errs := c.RecordTaskMutations(context.Background(), []PlanTaskMutation{
 		{PlanID: "p-isolation", TaskID: "task-a", Mutation: TaskMutation{Status: model.TaskStatusCompleted}},
 		{PlanID: "p-isolation", TaskID: "ghost", Mutation: TaskMutation{Status: model.TaskStatusCompleted}},
 		{PlanID: "p-isolation", TaskID: "task-b", Mutation: TaskMutation{Status: model.TaskStatusFailed}},
@@ -133,7 +133,7 @@ func TestRecordTaskMutationsBatchPersistFailureMarksAll(t *testing.T) {
 	}
 
 	baseline := ps.PersistCount()
-	_, errs := c.RecordTaskMutations(context.Background(), []PlanTaskMutation{
+	_, _, errs := c.RecordTaskMutations(context.Background(), []PlanTaskMutation{
 		{PlanID: "p-persist-fail", TaskID: "task-a", Mutation: TaskMutation{Status: model.TaskStatusCompleted}},
 		{PlanID: "p-persist-fail", TaskID: "task-a", Mutation: TaskMutation{Summary: "x"}},
 	})
@@ -162,13 +162,13 @@ func TestRecordTaskMutationsBatchWakeRequestsAllDurable(t *testing.T) {
 	p = registerNode(t, c, p.ID, p.CurrentRevision, "task-a")
 	registerNode(t, c, p.ID, p.CurrentRevision, "task-b")
 
-	versions, errs := c.RecordTaskMutations(context.Background(), []PlanTaskMutation{
-		{PlanID: "p-wake-batch", TaskID: "task-a", Mutation: TaskMutation{
-			Status: model.TaskStatusCompleted, Wake: true, SourceEvent: "status", ReasonCode: "task_completed",
-		}},
+	versions, _, errs := c.RecordTaskMutations(context.Background(), []PlanTaskMutation{
 		{PlanID: "p-wake-batch", TaskID: "task-b", Mutation: TaskMutation{
 			Status: model.TaskStatusFailed, Wake: true, SourceEvent: "status", ReasonCode: "task_failed",
 			Urgency: model.ReplanUrgencyHigh,
+		}},
+		{PlanID: "p-wake-batch", TaskID: "task-a", Mutation: TaskMutation{
+			Status: model.TaskStatusCompleted, Wake: true, SourceEvent: "status", ReasonCode: "task_completed",
 		}},
 	})
 	for i, err := range errs {
@@ -241,7 +241,7 @@ func TestRecordTaskMutationsBatchSeesSequentialState(t *testing.T) {
 		t.Fatal(err)
 	}
 	activeBefore := p.Usage.ActiveTasks
-	_, errs := c.RecordTaskMutations(context.Background(), []PlanTaskMutation{
+	_, _, errs := c.RecordTaskMutations(context.Background(), []PlanTaskMutation{
 		{PlanID: "p-seq", TaskID: "task-a", Mutation: TaskMutation{Status: model.TaskStatusCompleted}},
 		{PlanID: "p-seq", TaskID: "task-a", Mutation: TaskMutation{Status: model.TaskStatusProcessing}},
 	})

@@ -22,5 +22,6 @@ var (
 	ErrAcceptanceStale          = errors.New("acceptance result is stale")
 	ErrAcceptanceConstraint     = errors.New("acceptance hard constraint failed")
 	ErrAcceptanceNotPassed      = errors.New("latest acceptance has not passed")
+	ErrAcceptanceCircuitOpen    = errors.New("acceptance circuit open: repeated identical external fact verification failures")
 	ErrInvalidPauseResolution   = errors.New("invalid pause resolution")
 )

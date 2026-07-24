@@ -138,8 +138,8 @@ func TestPlanSignalAggregationIsolationAndAckRace(t *testing.T) {
 	p2 = registerNode(t, c, p2.ID, 0, "two-a")
 
 	v1, err := c.RecordTaskMutation(context.Background(), p1.ID, "one-a", TaskMutation{
-		Status: model.TaskStatusCompleted, Wake: true, SourceEvent: "task_completed",
-		ReasonCode: "task_completed", IdempotencyKey: "p1-a-complete",
+		Status: model.TaskStatusFailed, Wake: true, SourceEvent: "task_failed",
+		ReasonCode: "task_failed", IdempotencyKey: "p1-a-complete",
 	})
 	if err != nil {
 		t.Fatal(err)

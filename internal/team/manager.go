@@ -143,11 +143,23 @@ func (m *Manager) Start(ctx context.Context) error {
 	for _, spec := range ready {
 		tmpl, err := m.catalog.Resolve(spec.TemplateRef)
 		if err != nil {
-			return fmt.Errorf("recover team %s template: %w", spec.ID, err)
+			// 模板已被删除/改名：中止启动会让任何模板升级都变成硬故障。
+			// 停用陈旧 Team，需要时由 Scheduler 重新 provision。
+			log.Printf("[team] 恢复 Team %s 失败：模板 %s 不可用（%v），已标记 stopped；需要时 Scheduler 会重新 provision", spec.ID, spec.TemplateRef, err)
+			if _, stopErr := m.store.SetStatus(spec.ID, StatusStopped, "template_unavailable:"+spec.TemplateRef); stopErr != nil {
+				return fmt.Errorf("stop team %s with unavailable template: %w", spec.ID, stopErr)
+			}
+			continue
 		}
 		if tmpl.Digest != spec.TemplateDigest {
-			return fmt.Errorf("%w: team=%s ref=%s stored=%s current=%s",
-				ErrTemplateDigestMismatch, spec.ID, spec.TemplateRef, spec.TemplateDigest, tmpl.Digest)
+			// 模板内容或默认模型变化会改变 digest（升级路径的常态）。
+			// 停用陈旧 Team 而不是中止启动；不静默复用旧 digest 的运行时。
+			log.Printf("[team] Team %s 的模板 %s digest 已变化（stored=%s current=%s），已标记 stopped；需要时 Scheduler 会重新 provision",
+				spec.ID, spec.TemplateRef, spec.TemplateDigest, tmpl.Digest)
+			if _, stopErr := m.store.SetStatus(spec.ID, StatusStopped, "template_digest_changed:"+tmpl.Digest); stopErr != nil {
+				return fmt.Errorf("stop team %s after digest change: %w", spec.ID, stopErr)
+			}
+			continue
 		}
 		if err := validateReplicas(tmpl, spec.Replicas); err != nil {
 			return fmt.Errorf("recover team %s: %w", spec.ID, err)
