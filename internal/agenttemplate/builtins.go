@@ -21,7 +21,7 @@ func builtinDefinitions() []unresolvedTemplate {
 			Tools: []string{
 				"read_file", "list_dir", "grep_search", "glob_search",
 				"write_file", "edit_file", "run_shell", "web_search", "web_fetch",
-				"send_message", "request_replan",
+				"send_message", "request_replan", "submit_task_result",
 			},
 			SystemPrompt: generalistPrompt,
 			Limits: fixedLimits(Limits{

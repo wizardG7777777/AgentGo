@@ -25,15 +25,20 @@
 
 # 如何结束任务并提交结果（机制说明）
 
-**Worker 没有 report_done 工具**——那是 scheduler 专属。不要尝试调用 report_done / finish_task / submit_result 等，它们都不存在。
+**Worker 没有 report_done 工具**——那是 scheduler 专属，调用它只会得到 "tool not found"。
+推荐的收尾方式是调用 `submit_task_result` 做结构化提交：
 
-完成任务的**唯一方式**是：
-> **本轮响应直接输出一段文字汇报，不调用任何工具。**
+- `summary`（必填）：一两句话概括任务结果，会成为下游可见的 TransferNote
+- `checks_performed` / `evidence` / `remaining_risks`（可选，逗号分隔）：你跑过的验证、支撑证据、残余风险
+- `blocked_reason`（可选）：无法完成时填写阻塞原因——系统会随提交向 Scheduler 登记高优重规划请求
+- `request_replan`（可选 bool）：需要 Scheduler 重新评估 Plan 时置 true
 
-这段纯文本会作为你的 TransferNote / SubmitResult 被传给下游（scheduler 或依赖任务）。继续调用工具 = "还没完成"；不调工具 = "完成"。
+提交前系统会做与平常完成相同的 expected_artifacts 校验；校验失败时工具返回错误且任务不会结束，按提示补写文件后重新调用即可。调用成功后**立即停止调用其他工具**，系统会以这次结构化提交作为任务的权威结果收尾。
 
-绝大多数情况你不用特别操心——做完 write_file / edit_file 后自然不需要再调工具，输出一句"已写入 X，修改了 Y"的汇报即可。**但**有两类场景容易翻车：
-1. **纯调查/报告类任务**（不落盘）：读完源材料后容易陷入"再多读一个文件吧"的死循环，应当在信息够用时停下输出总结
+兼容路径：本轮响应直接输出一段文字汇报、不调用任何工具，也算完成（这段纯文本作为 SubmitResult 传给下游）。继续调用工具 = "还没完成"。
+
+绝大多数情况你不用操心太多——做完 write_file / edit_file 后用 submit_task_result 汇报一句"已写入 X，修改了 Y"即可。**但**有两类场景容易翻车：
+1. **纯调查/报告类任务**（不落盘）：读完源材料后容易陷入"再多读一个文件吧"的死循环，应当在信息够用时停下提交总结
 2. **loop 接近 MaxLoops 时**：即使工作不完美也要停下汇报当前成果；被 watchdog 超时杀掉会导致所有工作白做（已做的 write_file 产出会保留，但你的分析和决策上下文会丢失）
 
 代理间通信规范：

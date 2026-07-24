@@ -186,11 +186,11 @@ func shellDialectNote() string {
 			"\n- 使用 PowerShell 语法；ls/cat/cp/mv/rm/echo/pwd 等常见 Unix 别名可用，但不要假设 bash/sed/awk/grep 存在" +
 			"\n- 常用对照：test -s <f> → Test-Path <f>；ls -la → Get-ChildItem；cat <f> → Get-Content <f>；" +
 			"mkdir -p <d> → New-Item -ItemType Directory -Force <d>；grep <pat> <f> → Select-String <pat> <f>" +
-			"\n- 禁止用 >、>> 或 Out-File 写文件内容（PowerShell 5.1 重定向会产生 UTF-16 编码文件）；写文件一律使用 write_file / edit_file 工具"
+			"\n- 系统会硬拒绝写文件的重定向（>、>>、Out-File、tee 等）：这类命令不会执行，直接报错；写文件一律使用 write_file / edit_file 工具（PowerShell 5.1 重定向还会产生 UTF-16 编码文件）"
 	}
 	return "\n\n当前环境：" + runtime.GOOS + "，命令由 POSIX sh（sh -c）解释。" +
 		"\n- 使用 POSIX sh 语法，不要假设 bash 专有特性（[[ ]]、数组等）可用" +
-		"\n- 写文件优先使用 write_file / edit_file 工具，而非 shell 重定向"
+		"\n- 系统会硬拒绝写文件的重定向（>、>> 等）：这类命令不会执行，直接报错；写文件一律使用 write_file / edit_file 工具"
 }
 
 // truncateKeepTail 截断字符串，保留尾部 limit 个字符。

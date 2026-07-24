@@ -144,6 +144,7 @@ func TestWrapFileWriteApproval_StrictFullCycle(t *testing.T) {
 func TestResolveToolGroups_WiresModesToShellGroup(t *testing.T) {
 	modeStore := modes.NewStore(modes.GateImmediate, modes.ExecYolo, modes.TopoTeam)
 	groups := resolveToolGroups("w-1", RunnerDeps{Modes: modeStore}, &CurrentTaskHolder{},
+		agent.NewFinalizationHolder(), agent.NewSubmitState(),
 		agent.NewFileStateCache(1), &tools.DefaultWorkdir{}, nil)
 
 	var shellGroup *tools.ShellGroup

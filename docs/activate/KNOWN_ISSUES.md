@@ -1,6 +1,6 @@
 # KNOWN_ISSUES — 当前限制与验证缺口
 
-最后核对：2026-07-22。
+最后核对：2026-07-24。
 
 本文件只记录当前仍会影响使用、开发或发布判断的限制。2026-07-18 UI Hub 改造的 41 项问题均已修复，原始核查与测试证据已归档至 [ui-hub-remediation-2026-07-18.md](../archived/ui-hub-remediation-2026-07-18.md)。2026-07-20 验收事实核验失败循环与级联取消事故已修复，证据归档至 [acceptance-fact-verification-and-cascade-incident-2026-07-20.md](../archived/acceptance-fact-verification-and-cascade-incident-2026-07-20.md)。2026-07-21 artifact 路径归一化缺陷导致的验收马拉松事故已修复，证据归档至 [artifact-path-normalization-incident-2026-07-21.md](../archived/artifact-path-normalization-incident-2026-07-21.md)。2026-07-21 验收空转（6 次 AcceptanceRun）与 Scheduler 篡改工作区事故已修复，证据归档至 [acceptance-spin-and-env-mutation-incident-2026-07-21.md](../archived/acceptance-spin-and-env-mutation-incident-2026-07-21.md)。2026-07-22 浪费可观测化专项落地：TUI 顶栏新增 session 级 token 总计（Hub 进程级累加器喂入，ad-hoc 团队销毁后消耗不隐形）；trace CLI 新增 stats 子命令（task/agent/plan 三维度 token 聚合 + 浪费口径 + 异常提示，见 TraceGuide §3.4）；watchdog 为 pending 级联取消补发 task_cancelled 事件（此前排队中的级联取消在 trace 中不可见）；修正 detectAnomalies 第 9 条从不命中的死检查（cancel_source 实际值为 dependency_failure）。截至本次核对，没有把已修复条目重新列为开放缺陷。
 
@@ -50,6 +50,13 @@
 - 影响：配置这些预留字段会导致启动失败，不能视为兼容的未来配置。
 - 处置：使用 `prompt.file` 和 `one_shot`；其他形态需先实现并补测试。
 
+### Agent 执行隔离限于文件声明级
+
+Roster 花名册只对 `write_file` / `edit_file` 的声明式写路径做文件级互斥；`run_shell` 的副作用（包管理、git、重定向之外的间接修改）不受隔离。verifier 模板不授文件写工具，但 `run_shell` 不是只读沙箱（见 [AgentTemplate.md](AgentTemplate.md) §6），"不修改被验收对象"由 prompt 与 Shell 命令策略保障，不是 OS 级强隔离。
+
+- 影响：并发 Agent 可通过 shell 互相踩踏工作区；验收 runner 理论上能污染被验收对象。
+- 处置：高风险操作用 exec=strict 全量审批或灰名单 Interaction 把守；worktree/容器级隔离评估后再立项。
+
 ### 引用幻觉没有独立的强制防线
 
 目前没有 `CitationVerifierHook`、`RetrievalGate` 或专门的端到端引用真实性基线。Trace 可用于事后审计，但不等价于验证外部引用或模型知识。
@@ -81,6 +88,13 @@ go test -race ./...
 ```
 
 2026-07-19 已在 Windows 完成全仓测试、`go vet` 与构建，并在 WSL/GCC 下完成全仓 `-race`。Bubble Tea 的非 TTY 输入现显式读取调用方 stdin 并把 EOF 视为正常退出，相关 Windows 跳过已移除；后续仍应把 Windows、macOS、Linux 验证保持为发布门。
+
+### 缺少 Agent 行为级评测
+
+现有测试证明控制面不变量（状态机、验收事实核验、级联取消），但没有跨模型/Prompt 的固定任务行为基线：成功率、token、重规划次数、验收轮数、无进展暂停次数均无自动采集。单元测试全绿不等于真实 LLM 行为达标。
+
+- 影响：prompt 修改、模型更换或工具描述调整后，行为回归只能靠人工复测发现（2026-07-23 重读浪费复测即为例证）。
+- 处置：重要 prompt 变更后用 `trace stats` 抽查；行为 eval 框架（固定任务集 + 指标采集）待立项。
 
 ## 维护规则
 

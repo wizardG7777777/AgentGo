@@ -16,6 +16,7 @@ package runner
 //	| send_message | + mailbox.Registry + MailChainMaxDepth（常量）|
 //	| web_search / web_fetch | + webtool.SearchProvider |
 //	| request_replan / acceptance tools | + PlanCoordinator + Store + TaskHolder |
+//	| submit_task_result | + Store + TaskHolder + FinalizationNotifier + SubmitState（runner.New 注入）|
 //
 // 实际注册由 resolveToolGroups 完成——它按 RunnerDeps 构造全部 ToolGroup，
 // 再由 ToolRegistry 的 allowlist 自动剪枝。 unauthorized 工具根本不进 ToolRegistry。
@@ -30,13 +31,16 @@ import (
 // 返回的 slice 包含所有可能用到的 Group，由调用方传入 ToolRegistry 后
 // 由 allowlist 过滤实际生效集。这样新增工具时只需修改本函数一处。
 //
-// holder / fileCache / workdir 在 New() 中提前创建，供 agent 回调和 ToolGroup 共享。
+// holder / finHolder / submitState / fileCache / workdir 在 New() 中提前创建，
+// 供 agent 回调和 ToolGroup 共享。
 // interactionWaitHook 同时透传给 ShellGroup 与 MetaGroup（交互等待 → agent 状态机
 // 接线，见 runner.New）。
 func resolveToolGroups(
 	instanceID string,
 	deps RunnerDeps,
 	holder *CurrentTaskHolder,
+	finHolder *agent.FinalizationHolder,
+	submitState *agent.SubmitState,
 	fileCache *agent.FileStateCache,
 	workdir *tools.DefaultWorkdir,
 	interactionWaitHook func(waiting bool),
@@ -77,10 +81,12 @@ func resolveToolGroups(
 			RouteValidator:      deps.RouteValidator,
 		},
 		tools.PlanControlGroup{
-			Coordinator: deps.PlanCoordinator,
-			Store:       deps.Store,
-			Holder:      holder,
-			AgentID:     instanceID,
+			Coordinator:          deps.PlanCoordinator,
+			Store:                deps.Store,
+			Holder:               holder,
+			AgentID:              instanceID,
+			FinalizationNotifier: finHolder,
+			SubmitState:          submitState,
 		},
 	}
 }

@@ -20,6 +20,7 @@ go test ./...         # Run all tests
 go test ./internal/store/   # Run tests for a single package
 go test -run TestName ./internal/agent/  # Run a single test
 ./agentgo trace list  # Inspect recent task traces (subcommand of the same binary)
+./agentgo config doctor  # 校验配置 + prompt 承诺工具与实际 allowlist 对账（error/warning/info 分级）
 ```
 
 No Makefile or linter configured — standard Go tooling only. Tests assume LF line endings (enforced via `.gitattributes`).
@@ -29,7 +30,7 @@ No Makefile or linter configured — standard Go tooling only. Tests assume LF l
 ### System Startup Flow
 
 ```
-main.go  (-config flag, default "setting.yaml"; -skip-startup-probe; subcommand: trace)
+main.go  (-config flag, default "setting.yaml"; -skip-startup-probe; subcommands: trace, config)
   └→ bootstrap.Bootstrap(configPath, explicit, skipStartupProbe)
        ├─ config.LoadConfig(path, explicit)         // YAML/JSON, v4 schema
        ├─ cfg.Validate()                            // model、Agent、UI 与运行时配置校验
@@ -213,10 +214,11 @@ The **MemoryRoster** prevents file write conflicts between concurrent agents:
 | `glob_search` | LocalRead | Recursive glob with `**` support, max 200 results | `pathutil.ValidatePath` + `path-boundary` Gate |
 | `write_file` | LocalWrite | Create/overwrite, optional `expected_hash` | Roster lock + path Gate + `validate-expected-hash` Gate + `require-read-before-write` Gate + `enforce-expected-artifacts` Gate |
 | `edit_file` | LocalWrite | Precise old→new replacement (exactly 1 match) | Same as write_file + line-anchor validation |
-| `run_shell` | Shell | Shell command (`sh -c` / PowerShell `-NoProfile -Command`), output capped 10000 chars | `shell.CommandFilter`; blacklist hard deny, greylist → exact-call-bound `shell_command` authorization Interaction |
+| `run_shell` | Shell | Shell command (`sh -c` / PowerShell `-NoProfile -Command`), output capped 10000 chars | `shell.CommandFilter`; blacklist hard deny, 写文件重定向（`>`/`>>`/`Out-File`/`tee`）硬拒绝并指引 write_file/edit_file, greylist → exact-call-bound `shell_command` authorization Interaction |
 | `publish_task` | Meta | Publish child task | `MaxSubtaskDepth` + `dependency-validator` Gate + `BatchTracker` (scheduler-only) |
 | `send_message` | Meta | Direct mailbox message | `MailChainMaxDepth` + Mailbox Gates |
 | `request_user_input` | Meta | Ask a 2–8 option `agent_question` and await `option_id`/`text` | No client-supplied ActionRef or privileged Plan/Shell effect; ordinary runners require allowlist |
+| `submit_task_result` | PlanControl | 普通执行节点的结构化完成提交（summary/checks_performed/evidence/remaining_risks/blocked_reason/request_replan）；调用即显式完成意图，经 FinalizationHolder 短路 ReAct 循环 | Runner-only（scheduler 用 `report_done`，acceptance 节点用 `submit_acceptance_result`）；提交前强制 ExpectedArtifacts 校验；blocked/replan 自动持久化 ReplanRequest |
 | `web_search` | Web | Pluggable backend (DuckDuckGo HTML by default), max 10 results | SSRF protection |
 | `web_fetch` | Web | Fetch URL, extract text, max 1MB / 10000 chars | SSRF protection |
 | `cancel_task` | Scheduler | Cancel another task | Scheduler-only (declare in profile) |

@@ -127,6 +127,10 @@ type Agent struct {
 	Mailbox             *mailbox.Mailbox                  // 代理间通信收件箱，可选
 	MailRegistry        *mailbox.Registry                 // 邮箱注册表，用于 DrainWithAck 自动回执
 	FinalizationChecker FinalizationChecker               // 可选；用于 finalization tool 信号检查
+	// SubmitState 暂存 submit_task_result 工具写入的结构化提交（已通过 ExpectedArtifacts 校验、待消费）。
+	// finalization 短路分支 Take 命中时以其渲染文本替代 lastOutput 收尾（Cause=submit_task_result）；
+	// nil 或 Take 未命中时走 report_done 兼容路径（lastOutput），行为与旧版完全一致。
+	SubmitState *SubmitState
 
 	// UserOutput 是用户可见内容的输出目标。非 nil 时，IsUserFacing 的自然文本完成
 	// 和 report_done 等输出会写入此处，而不是直接 fmt.Printf 到 stdout。
@@ -733,12 +737,29 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		if a.FinalizationChecker != nil && a.FinalizationChecker.IsFinalized() {
 			log.Printf("[agent %s] FinalizationChecker.IsFinalized()=true，终止 reactLoop (task=%s)", a.ID, taskID)
 			enterTerminating(terminatingCause)
-			// 使用上一轮保存的 lastOutput 完成任务（不进行 ExpectedArtifacts 校验，因为 finalization tool 负责最终汇报）
-			// TransferNote：成功路径直接用 lastOutput（LLM 自述已经是合理总结，不需二次压缩）
-			if lastOutput != "" {
-				_ = a.Store.SetTransferNote(taskID, lastOutput)
+			// 使用上一轮保存的 lastOutput 完成任务（不进行 ExpectedArtifacts 校验，因为 finalization tool 负责最终汇报）。
+			// 若上一轮调用的是 submit_task_result，SubmitState 里暂存了已通过校验的结构化提交：
+			// 其渲染文本替代 lastOutput 成为权威结果负载，TransferNote 只用 summary，
+			// Transition.Cause 记为 submit_task_result 以区别于 report_done 兼容路径。
+			resultText := lastOutput
+			transferNote := lastOutput
+			cause := "finalization_short_circuit"
+			if a.SubmitState != nil {
+				if sub, ok := a.SubmitState.Take(taskID); ok {
+					resultText = sub.Format()
+					transferNote = sub.Summary
+					cause = "submit_task_result"
+					// 结构化提交路径：渲染文本是权威最终响应，覆盖 worker 的自由文本自述。
+					if err := a.Store.RecordLastResponse(taskID, resultText); err != nil {
+						log.Printf("[agent %s] RecordLastResponse error: %v", a.ID, err)
+					}
+				}
 			}
-			if err := a.Store.SubmitResult(a.ID, taskID, lastOutput); err != nil {
+			// TransferNote：成功路径直接用最终文本（LLM 自述已经是合理总结，不需二次压缩）
+			if transferNote != "" {
+				_ = a.Store.SetTransferNote(taskID, transferNote)
+			}
+			if err := a.Store.SubmitResult(a.ID, taskID, resultText); err != nil {
 				log.Printf("[agent %s] SubmitResult error: %v", a.ID, err)
 				trace.Emit(trace.Event{
 					Kind:    trace.KindError,
@@ -753,12 +774,12 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					Kind:      trace.KindTaskSubmitted,
 					TaskID:    taskID,
 					AgentID:   a.ID,
-					OutputLen: len(lastOutput),
+					OutputLen: len(resultText),
 					LoopsUsed: i,
 				})
-				// finalization 短路：report_done 已通过 ResultOutput 记录权威结果，
+				// finalization 短路：report_done / submit_task_result 已记录权威结果，
 				// text-only 兜底仅落盘留档，不覆盖 ResultSnapshot（A4×E8 接缝）。
-				a.emitTextOnlySubmissionIfNoArtifactsOpt(taskID, lastOutput, i, false)
+				a.emitTextOnlySubmissionIfNoArtifactsOpt(taskID, resultText, i, false)
 				trace.Emit(trace.Event{
 					Kind:    trace.KindTaskCompleted,
 					TaskID:  taskID,
@@ -766,7 +787,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					Transition: &trace.Transition{
 						PrevStatus: string(model.TaskStatusProcessing),
 						NewStatus:  string(model.TaskStatusCompleted),
-						Cause:      "finalization_short_circuit",
+						Cause:      cause,
 					},
 				})
 			}
@@ -1618,6 +1639,18 @@ func checkExpectedArtifacts(store storeReader, taskID string) ArtifactCheckResul
 // storeReader 是 checkExpectedArtifacts 需要的最小 Store 接口子集，方便测试。
 type storeReader interface {
 	GetTask(taskID string) (*model.Task, error)
+}
+
+// CheckExpectedArtifacts 是 checkExpectedArtifacts 的导出包装，
+// 供 tools 包（submit_task_result）在工具层复用同一套 ExpectedArtifacts 合约校验，
+// 保证工具提交与自然完成路径的校验语义完全一致。
+func CheckExpectedArtifacts(s storeReader, taskID string) ArtifactCheckResult {
+	return checkExpectedArtifacts(s, taskID)
+}
+
+// BuildArtifactFailureReason 是 buildArtifactFailureReason 的导出包装，理由同上。
+func BuildArtifactFailureReason(check ArtifactCheckResult) string {
+	return buildArtifactFailureReason(check)
 }
 
 // mergeArtifactsIntoDeps 把每个依赖任务的 Artifacts 文件路径列表追加到对应的 SubmitResult 文本后面。

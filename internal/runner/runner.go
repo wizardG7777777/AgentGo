@@ -132,6 +132,11 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 		}
 	}
 	holder := &CurrentTaskHolder{}
+	// finHolder / submitState 是 submit_task_result 的提交通道：工具校验通过后
+	// Put 结构化提交并 MarkTaskFinalized，agent 在下一轮 loop 顶部短路消费。
+	// 生命周期约定同 finalization.go：OnTaskStart Set(taskID)，任务终态 Set("")。
+	finHolder := agent.NewFinalizationHolder()
+	submitState := agent.NewSubmitState()
 	fileCache := agent.NewFileStateCache(50)
 	workdir := &tools.DefaultWorkdir{ProjectRoot: deps.ProjectRoot}
 
@@ -146,7 +151,7 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	toolReg := agent.NewToolRegistryWithAllowlist(rt.AllowedTools)
 
 	// §11.6.2 工具 → 依赖项映射由 dependency_map.go 集中管理
-	groups := resolveToolGroups(rt.InstanceID, deps, holder, fileCache, workdir, interactionWaitHook)
+	groups := resolveToolGroups(rt.InstanceID, deps, holder, finHolder, submitState, fileCache, workdir, interactionWaitHook)
 	tools.RegisterGroups(toolReg, groups...)
 
 	// strict 执行权限强制层（v5 三轴 exec）：exec=strict 时对 write_file /
@@ -226,7 +231,9 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	}
 	a.Model = rt.Model
 	a.ContextLimit = rt.ContextLimit
-	a.OnTaskStart = func(taskID string) { holder.Set(taskID) }
+	a.OnTaskStart = func(taskID string) { holder.Set(taskID); finHolder.Set(taskID) }
+	a.FinalizationChecker = finHolder
+	a.SubmitState = submitState
 	// v5 Phase 4：holder 清理迁移到 task-end-callback Sync Reactor。
 	// 旧路径 (a.OnTaskEnd 闭包) 在 processTask defer 链中执行；新路径在
 	// trace.KindTaskCompleted/Failed/Blocked/Cancelled/Retry emit 同步阶段执行。
@@ -239,6 +246,7 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 		unregister := deps.TaskEndCallbacks.RegisterCallback(func(ev trace.Event) error {
 			if ev.AgentID == agentID {
 				holder.Set("")
+				finHolder.Set("")
 				if oneShot {
 					r.Close()
 				}

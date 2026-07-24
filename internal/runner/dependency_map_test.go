@@ -18,6 +18,7 @@ func TestResolveToolGroups_WiresInteractionDependencies(t *testing.T) {
 	sessionID := func() string { return "session-test" }
 
 	groups := resolveToolGroups("w-1", RunnerDeps{Interactions: interactions, SessionID: sessionID}, holder,
+		agent.NewFinalizationHolder(), agent.NewSubmitState(),
 		agent.NewFileStateCache(1), &tools.DefaultWorkdir{}, hook)
 
 	var shellGroup *tools.ShellGroup

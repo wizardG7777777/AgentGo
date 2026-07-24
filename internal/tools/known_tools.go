@@ -34,6 +34,7 @@ var AllToolNames = []string{
 	"define_acceptance_spec",
 	"ensure_acceptance_run",
 	"submit_acceptance_result",
+	"submit_task_result",
 	"request_replan",
 	"supersede_tasks",
 	"finalize_plan",

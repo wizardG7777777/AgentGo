@@ -32,10 +32,31 @@ type PlanControlGroup struct {
 	// 仅 gate=plan 时真正挂起 Plan 等待用户审阅。nil（runner 装配）按非
 	// plan 模式处理——幂等提示，不挂起。
 	Modes *modes.Store
+	// FinalizationNotifier / SubmitState 是 submit_task_result 的提交通道注入
+	// （runner 装配传入 agent.FinalizationHolder + agent.SubmitState）。
+	// 任一 nil 则不注册 submit_task_result——scheduler 装配不传这两个字段，
+	// 它的权威提交通道是 report_done。
+	FinalizationNotifier FinalizationNotifier
+	SubmitState          *agent.SubmitState
 }
 
 func (g PlanControlGroup) Register(r *agent.ToolRegistry) {
-	if g.Coordinator == nil || g.Store == nil || g.Holder == nil {
+	if g.Store == nil || g.Holder == nil {
+		return
+	}
+	// submit_task_result 只依赖 Store/Holder 与提交通道注入，不依赖 Plan 控制面，
+	// 因此独立于下方 Coordinator nil 检查注册——无 Plan 的兼容任务也必须可用。
+	if g.FinalizationNotifier != nil && g.SubmitState != nil {
+		r.Register("submit_task_result", "以结构化字段提交当前普通执行节点的最终结果并结束任务。summary 必填（一两句话概括结果，会成为下游可见的 TransferNote）；checks_performed/evidence/remaining_risks 为逗号分隔的可选清单；无法完成时填 blocked_reason（会随提交向 Scheduler 登记高优 ReplanRequest），request_replan=true 仅请求重规划。提交前系统会执行 expected_artifacts 校验，缺失时返回错误且不结束任务。调用成功后禁止再调用其他工具。controller/scheduler 任务用 report_done，验收任务用 submit_acceptance_result。",
+			schema.Object().String("summary", "一两句话的任务结果概括；会成为下游可见的 TransferNote", true).
+				String("checks_performed", "逗号分隔的已执行检查清单（如 go build, go test ./internal/...）", false).
+				String("evidence", "逗号分隔的证据清单（文件路径、命令输出要点等）", false).
+				String("remaining_risks", "逗号分隔的残余风险清单", false).
+				String("blocked_reason", "无法完成时的阻塞原因；非空时随提交向 Scheduler 登记高优 ReplanRequest", false).
+				Bool("request_replan", "true 时随提交请求 Scheduler 重新评估当前 Plan", false).Build(),
+			g.submitTaskResult)
+	}
+	if g.Coordinator == nil {
 		return
 	}
 	r.Register("continue_waiting", "确认已观察最新 PlanSignal，当前不调整 DAG，继续等待后续关键事实。",

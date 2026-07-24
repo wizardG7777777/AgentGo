@@ -38,7 +38,9 @@ tool_profiles:
     - web_fetch
     - send_message
     - request_user_input          # 结构化询问用户；只返回回答，不授予 Shell 权限或替代 Plan 控制
+    - publish_task                # 仅 plan_id 为空的兼容任务可发布一层子任务（受 MaxSubtaskDepth 约束）；计划内改图走 request_replan
     - request_replan              # 需要新增节点或遇到阻塞时请求 Scheduler 决策；普通 Agent 不直接改图
+    - submit_task_result          # 结构化提交最终结果（summary/检查/证据/风险）；带 expected_artifacts 校验
 
   explorer_full:
     - read_file

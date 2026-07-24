@@ -48,7 +48,12 @@ func registerAllGroupsFully(t *testing.T, r *agent.ToolRegistry) {
 			Store: newFakeStore(), MBRegistry: mailbox.NewRegistry(8),
 			Interactions: interaction.NewService(nil), AgentID: "agent-1",
 		},
-		PlanControlGroup{Coordinator: coordinator, Store: taskStore, Holder: &fakeHolder{id: "controller"}},
+		PlanControlGroup{
+			Coordinator: coordinator, Store: taskStore, Holder: &fakeHolder{id: "controller"},
+			// submit_task_result 需提交通道注入才注册；全量并集守护按完整依赖装配。
+			FinalizationNotifier: &fakeFinalizationNotifier{},
+			SubmitState:          agent.NewSubmitState(),
+		},
 		SchedulerGroup{
 			Store: newFakeStore(), Holder: &fakeHolder{id: "sched"}, ProjectRoot: t.TempDir(),
 		},
