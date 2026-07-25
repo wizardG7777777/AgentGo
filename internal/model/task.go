@@ -111,6 +111,22 @@ type Task struct {
 	// 注入到自己的 user prompt 中，避免凭空捏造上游产出。
 	Artifacts []string
 
+	// ArtifactMeta 是 Artifacts 的并行元数据通道：key 为与 Artifacts 相同的
+	// 相对路径，value 为登记时刻算出的内容 hash / 字节数。验收的 file_hash
+	// 证据可直接读这里，不必事后重算 SHA256。
+	//
+	// 设计取舍（为什么不改 Artifacts 的类型）：Artifacts []string 被看板快照、
+	// ExpectedArtifacts 合约校验、GetDependencyArtifacts 注入等大量代码按
+	// 字符串列表消费，改类型牵连面过大；并行 map 与 ReadSet 同型，零值兼容——
+	// 旧会话快照 / 旧 artifacts.jsonl 没有元数据时该字段为 nil/缺 key，
+	// 消费方按"无元数据"降级即可。
+	//
+	// 写入路径：record-artifact Reactor 读落盘文件计算后调
+	// Store.AppendArtifactWithMeta；查询路径：GetTask 等读 API 的克隆体上
+	// 直接取 task.ArtifactMeta[path]。同一文件被重复写入时保留最新一次的
+	// 元数据（last-wins，与 artifacts.jsonl 重放语义一致）。
+	ArtifactMeta map[string]ArtifactMeta `json:"artifact_meta,omitempty"`
+
 	// ExpectedArtifacts 是发布者声明的"本任务必须产出的文件路径"清单。
 	// 任务结束时 agent.processTask 会校验 Artifacts 是否包含全部 ExpectedArtifacts，
 	// 缺失则任务失败重试。这是 Level 3 的硬性合约校验。
@@ -180,6 +196,17 @@ type Task struct {
 	StartedAt    time.Time
 	CompletedAt  time.Time
 }
+
+// ArtifactMeta 是 Task.ArtifactMeta 的 value 类型，记录单个产物文件在
+// 登记时刻的内容元数据。两字段同为零值表示"无元数据"（旧日志 / 读取失败
+// 降级），消费方应据此跳过 hash 证据比对而不是当作空文件。
+type ArtifactMeta struct {
+	SHA256 string `json:"sha256,omitempty"` // 登记时刻文件内容的 SHA256（hex）
+	Bytes  int64  `json:"bytes,omitempty"`  // 登记时刻文件字节数
+}
+
+// IsZero 报告元数据是否为空（未登记或登记时读取失败降级）。
+func (m ArtifactMeta) IsZero() bool { return m.SHA256 == "" && m.Bytes == 0 }
 
 // ReadInfo 是 Task.ReadSet 的 value 类型，记录单个文件被读取的元数据。
 type ReadInfo struct {

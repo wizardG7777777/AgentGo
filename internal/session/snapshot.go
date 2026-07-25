@@ -33,44 +33,48 @@ type Snapshot struct {
 
 // TaskSnapshot 是单个 Task 的可序列化表示。
 type TaskSnapshot struct {
-	ID                 string            `json:"id"`
-	Description        string            `json:"description"`
-	Priority           int               `json:"priority"`
-	Dependencies       []string          `json:"dependencies"`
-	Status             string            `json:"status"`
-	Agents             []string          `json:"agents"`
-	MaxConcurrency     int               `json:"max_concurrency"`
-	Results            map[string]string `json:"results"`
-	Error              string            `json:"error,omitempty"`
-	RetryCount         int               `json:"retry_count"`
-	RetryReasons       []string          `json:"retry_reasons"`
-	TimeoutSeconds     int               `json:"timeout_seconds"`
-	EventSource        string            `json:"event_source,omitempty"`
-	ParentTaskID       string            `json:"parent_task_id,omitempty"`
-	ReplyToAgentID     string            `json:"reply_to_agent_id,omitempty"`
-	BatchID            string            `json:"batch_id,omitempty"`
-	EventType          string            `json:"event_type,omitempty"`
-	TriggerRule        string            `json:"trigger_rule,omitempty"`
-	SystemPrompt       string            `json:"system_prompt,omitempty"`
-	Depth              int               `json:"depth"`
-	Artifacts          []string          `json:"artifacts,omitempty"`
-	ExpectedArtifacts  []string          `json:"expected_artifacts,omitempty"`
-	TransferNote       string            `json:"transfer_note,omitempty"`
-	MailChainDepth     int               `json:"mail_chain_depth,omitempty"`
-	SchedulerBatch     []string          `json:"scheduler_batch,omitempty"`
-	LastResponse       string            `json:"last_response,omitempty"`
-	PartialOutput      string            `json:"partial_output,omitempty"`
-	CreatedAt          string            `json:"created_at"`
-	PendingSince       string            `json:"pending_since,omitempty"`
-	StartedAt          string            `json:"started_at,omitempty"`
-	CompletedAt        string            `json:"completed_at,omitempty"`
-	PlanID             string            `json:"plan_id,omitempty"`
-	NodeRole           string            `json:"node_role,omitempty"`
-	CreatedRevision    int64             `json:"created_revision,omitempty"`
-	RetiredRevision    int64             `json:"retired_revision,omitempty"`
-	Supersedes         []string          `json:"supersedes,omitempty"`
-	AcceptanceRunID    string            `json:"acceptance_run_id,omitempty"`
-	PlanMutationSource string            `json:"plan_mutation_source,omitempty"`
+	ID                string            `json:"id"`
+	Description       string            `json:"description"`
+	Priority          int               `json:"priority"`
+	Dependencies      []string          `json:"dependencies"`
+	Status            string            `json:"status"`
+	Agents            []string          `json:"agents"`
+	MaxConcurrency    int               `json:"max_concurrency"`
+	Results           map[string]string `json:"results"`
+	Error             string            `json:"error,omitempty"`
+	RetryCount        int               `json:"retry_count"`
+	RetryReasons      []string          `json:"retry_reasons"`
+	TimeoutSeconds    int               `json:"timeout_seconds"`
+	EventSource       string            `json:"event_source,omitempty"`
+	ParentTaskID      string            `json:"parent_task_id,omitempty"`
+	ReplyToAgentID    string            `json:"reply_to_agent_id,omitempty"`
+	BatchID           string            `json:"batch_id,omitempty"`
+	EventType         string            `json:"event_type,omitempty"`
+	TriggerRule       string            `json:"trigger_rule,omitempty"`
+	SystemPrompt      string            `json:"system_prompt,omitempty"`
+	Depth             int               `json:"depth"`
+	Artifacts         []string          `json:"artifacts,omitempty"`
+	ExpectedArtifacts []string          `json:"expected_artifacts,omitempty"`
+	// ArtifactMeta 是 Artifacts 的并行元数据（登记时刻的内容 hash/字节数）。
+	// 纯增量字段：旧版本快照没有它，Unmarshal 得 nil，按"无元数据"降级，
+	// 因此不提升 currentSnapshotVersion（与 LastHistory/ToolCalls 同策略）。
+	ArtifactMeta       map[string]ArtifactMetaSnapshot `json:"artifact_meta,omitempty"`
+	TransferNote       string                          `json:"transfer_note,omitempty"`
+	MailChainDepth     int                             `json:"mail_chain_depth,omitempty"`
+	SchedulerBatch     []string                        `json:"scheduler_batch,omitempty"`
+	LastResponse       string                          `json:"last_response,omitempty"`
+	PartialOutput      string                          `json:"partial_output,omitempty"`
+	CreatedAt          string                          `json:"created_at"`
+	PendingSince       string                          `json:"pending_since,omitempty"`
+	StartedAt          string                          `json:"started_at,omitempty"`
+	CompletedAt        string                          `json:"completed_at,omitempty"`
+	PlanID             string                          `json:"plan_id,omitempty"`
+	NodeRole           string                          `json:"node_role,omitempty"`
+	CreatedRevision    int64                           `json:"created_revision,omitempty"`
+	RetiredRevision    int64                           `json:"retired_revision,omitempty"`
+	Supersedes         []string                        `json:"supersedes,omitempty"`
+	AcceptanceRunID    string                          `json:"acceptance_run_id,omitempty"`
+	PlanMutationSource string                          `json:"plan_mutation_source,omitempty"`
 	// LastHistory preserves the completed ReAct rounds of a suspended/retried
 	// Task. Without it, a resumed Task can repeat tool side effects after a
 	// process restart even though in-memory retry already avoids that replay.
@@ -79,6 +83,14 @@ type TaskSnapshot struct {
 	// and formal acceptance verifier. They live on the owning Task snapshot so
 	// restoring a session cannot detach evidence from its Task identity.
 	ToolCalls []ToolCallSnapshot `json:"tool_calls,omitempty"`
+}
+
+// ArtifactMetaSnapshot 是 model.ArtifactMeta 的可序列化形式。
+// 与 ToolCallSnapshot 同理——session 不 import model/store，快照边界拥有
+// 自己的 DTO，由 store 在导出/导入时做显式转换。
+type ArtifactMetaSnapshot struct {
+	SHA256 string `json:"sha256,omitempty"`
+	Bytes  int64  `json:"bytes,omitempty"`
 }
 
 // ToolCallSnapshot is the serialization-only form of store.ToolCallRecord.

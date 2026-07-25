@@ -318,3 +318,80 @@ func TestRunShell_DescriptionContainsDialect(t *testing.T) {
 		t.Errorf("POSIX 描述缺 sh 方言说明: %q", desc)
 	}
 }
+
+// 验收加固：注入 ExtraGreylist 后，写倾向命令升级为 shell_command 审批
+// （Prompt 走灰名单通道、记录捕获模式），用户 allow_once 后才真正执行。
+func TestRunShell_ExtraGreylistAsksWriteish(t *testing.T) {
+	group, service := newTestShellGroup(t, t.TempDir(), emptyFilter())
+	group.ExtraGreylist = shell.AcceptanceHardeningGreylist
+	type result struct {
+		out string
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		// rm 在 POSIX sh 与 Windows PowerShell（Remove-Item 别名）下均可用；
+		// 目标文件不存在必然非零退出，但工具层只返回 out（含 exit_code），不返回 err。
+		out, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "rm surely-not-exist-file"})
+		done <- result{out: out, err: err}
+	}()
+	request := waitToolInteraction(t, service)
+	if !strings.Contains(request.Prompt, "灰名单命令") {
+		t.Fatalf("Prompt = %q，期望灰名单通道（捕获到模式）", request.Prompt)
+	}
+	if request.Metadata[shell.MetadataPattern] == "" {
+		t.Fatal("灰名单命中应记录匹配模式")
+	}
+	completeToolInteraction(t, service, request, shell.ActionAllowOnce)
+	select {
+	case got := <-done:
+		if got.err != nil || !strings.Contains(got.out, "exit_code") {
+			t.Fatalf("result = %+v", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("授权后 run_shell 未返回")
+	}
+}
+
+// 验收加固不影响正当命令：测试 / 构建类与只读命令仍直接放行，不创建 Interaction。
+func TestRunShell_ExtraGreylistKeepsLegitCommandsAllowed(t *testing.T) {
+	group, service := newTestShellGroup(t, t.TempDir(), emptyFilter())
+	group.ExtraGreylist = shell.AcceptanceHardeningGreylist
+	// go version 跨平台可用且零副作用，代表 go test / go build 这一类验收正当命令。
+	out, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "go version"})
+	if err != nil || !strings.Contains(out, "exit_code: 0") {
+		t.Fatalf("go version 应直接放行: out=%q err=%v", out, err)
+	}
+	// echo 在双方言下均可用。
+	if out, err = dispatchRunShell(context.Background(), group, map[string]any{"command": "echo hello"}); err != nil || !strings.Contains(out, "hello") {
+		t.Fatalf("echo 应直接放行: out=%q err=%v", out, err)
+	}
+	if pending, listErr := service.ListPending(context.Background(), ""); listErr != nil || len(pending) != 0 {
+		t.Fatalf("正当命令不应创建 Interaction: pending=%d err=%v", len(pending), listErr)
+	}
+}
+
+// 验收加固 fail-closed：Interaction 服务不可用时，加固灰名单命令同样拒绝执行。
+func TestRunShell_ExtraGreylistFailsClosedWithoutInteractionService(t *testing.T) {
+	group := ShellGroup{
+		Workdir: &DefaultWorkdir{ProjectRoot: t.TempDir()}, AgentID: "test-agent",
+		Filter:        emptyFilter(),
+		ExtraGreylist: shell.AcceptanceHardeningGreylist,
+	}
+	_, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "git add ."})
+	if err == nil || !strings.Contains(err.Error(), "Interaction 服务不可用") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+// 对照：未注入 ExtraGreylist 时同一写倾向命令直接放行（非验收语境行为完全不变）。
+func TestRunShell_WithoutExtraGreylistSameCommandAllowed(t *testing.T) {
+	group, service := newTestShellGroup(t, t.TempDir(), emptyFilter())
+	out, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "rm surely-not-exist-file"})
+	if err != nil || !strings.Contains(out, "exit_code") {
+		t.Fatalf("未注入 ExtraGreylist 时应直接放行: out=%q err=%v", out, err)
+	}
+	if pending, listErr := service.ListPending(context.Background(), ""); listErr != nil || len(pending) != 0 {
+		t.Fatalf("不应创建 Interaction: pending=%d err=%v", len(pending), listErr)
+	}
+}

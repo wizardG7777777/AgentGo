@@ -21,6 +21,9 @@ func (m *mockExpectedStore) GetTask(taskID string) (*model.Task, error) {
 	return nil, store.ErrTaskNotFound
 }
 func (m *mockExpectedStore) AppendArtifact(taskID string, path string) error     { return nil }
+func (m *mockExpectedStore) AppendArtifactWithMeta(taskID string, path string, meta model.ArtifactMeta) error {
+	return nil
+}
 func (m *mockExpectedStore) GetToolCallHistory(taskID string) []store.ToolCallRecord {
 	return nil
 }

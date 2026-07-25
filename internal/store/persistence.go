@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"agentgo/internal/model"
 )
 
 // artifactSyncBatchSize / artifactSyncInterval 是 artifacts.jsonl
@@ -200,14 +202,31 @@ func (c *artifactGroupCommitter) close() error {
 type ArtifactLog struct {
 	path string
 	gc   *artifactGroupCommitter
+	// meta 是 (taskID → path → ArtifactMeta) 的内存索引，与日志内容保持一致：
+	// Append/AppendWithMeta 写入时同步更新，Replay 重放时重建。由 gc.mu 保护。
+	//
+	// 为什么挂在这里而不是改 Replay/RestoreArtifacts 的签名：bootstrap 的
+	// 启动装配（OpenArtifactLog → Replay → SetArtifactLog → RestoreArtifacts）
+	// 是稳定调用点且签名被 resume.go 的接口断言固定，改签名会静默断链；
+	// 同一 *ArtifactLog 对象贯穿整条链路，把重放出的元数据缓存在对象上，
+	// RestoreArtifacts 经 artifactMeta() 取回即可让恢复链路保持完整。
+	meta map[string]map[string]model.ArtifactMeta
 }
 
 // artifactLogRecord 是 JSONL 文件里单行的结构。
 // 字段名保持短但清晰，便于人工用 `jq` / `grep` 查看。
+//
+// 兼容性（无 schema 版本字段，逐行 JSON 天然容忍字段漂移）：
+//   - 旧格式行没有 sha256/bytes——新代码 Unmarshal 得到零值 meta，按
+//     "无元数据"降级，重放路径列表行为与旧版字节级一致
+//   - 新格式行被旧二进制读取时未知字段被 encoding/json 忽略——双向兼容，
+//     因此不引入版本号
 type artifactLogRecord struct {
 	Timestamp time.Time `json:"ts"`
 	TaskID    string    `json:"task"`
 	Path      string    `json:"path"`
+	SHA256    string    `json:"sha256,omitempty"`
+	Bytes     int64     `json:"bytes,omitempty"`
 }
 
 // OpenArtifactLog 打开（或创建）指定目录下的 artifacts.jsonl 文件。
@@ -230,7 +249,11 @@ func OpenArtifactLog(dir string) (*ArtifactLog, error) {
 // newArtifactLog 是测试接缝：允许注入计数 syncFile 与自定义批参数，
 // 生产路径统一走 OpenArtifactLog。
 func newArtifactLog(file syncFile, path string, batchSize int, interval time.Duration) *ArtifactLog {
-	return &ArtifactLog{path: path, gc: newArtifactGroupCommitter(file, batchSize, interval)}
+	return &ArtifactLog{
+		path: path,
+		gc:   newArtifactGroupCommitter(file, batchSize, interval),
+		meta: make(map[string]map[string]model.ArtifactMeta),
+	}
 }
 
 // Path 返回 log 文件的绝对路径，供调试和日志打印。
@@ -245,16 +268,60 @@ func (l *ArtifactLog) Path() string {
 //
 // 如果 log 已关闭，返回 ErrArtifactLogClosed。
 func (l *ArtifactLog) Append(taskID string, path string) error {
+	return l.AppendWithMeta(taskID, path, model.ArtifactMeta{})
+}
+
+// AppendWithMeta 与 Append 同义，但把产物的内容元数据（sha256/bytes）
+// 一并写入记录，并同步更新内存 meta 索引。meta 为零值时落盘行与旧格式
+// 完全一致（omitempty），与历史调用方行为无差异。
+func (l *ArtifactLog) AppendWithMeta(taskID string, path string, meta model.ArtifactMeta) error {
 	rec := artifactLogRecord{
 		Timestamp: time.Now().UTC(),
 		TaskID:    taskID,
 		Path:      path,
+		SHA256:    meta.SHA256,
+		Bytes:     meta.Bytes,
 	}
 	data, err := json.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("序列化 artifact record 失败: %w", err)
 	}
-	return l.gc.append(data)
+	if err := l.gc.append(data); err != nil {
+		return err
+	}
+	l.gc.mu.Lock()
+	l.rememberMetaLocked(taskID, path, meta)
+	l.gc.mu.Unlock()
+	return nil
+}
+
+// rememberMetaLocked 把一条元数据写入内存索引（last-wins：同一文件重复
+// 写入时保留最新一次的 hash）。零值 meta 不登记，保持索引只含有意义的
+// 条目。调用方必须持有 gc.mu。
+func (l *ArtifactLog) rememberMetaLocked(taskID, path string, meta model.ArtifactMeta) {
+	if meta.IsZero() {
+		return
+	}
+	if _, ok := l.meta[taskID]; !ok {
+		l.meta[taskID] = make(map[string]model.ArtifactMeta)
+	}
+	l.meta[taskID][path] = meta
+}
+
+// artifactMeta 返回 taskID 已登记元数据的副本（无条目时返回 nil）。
+// 供 RestoreArtifacts 在恢复路径列表时一并恢复元数据。
+func (l *ArtifactLog) artifactMeta(taskID string) map[string]model.ArtifactMeta {
+	l.gc.mu.Lock()
+	defer l.gc.mu.Unlock()
+	src := l.meta[taskID]
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]model.ArtifactMeta, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
 }
 
 // Replay 从头到尾读取 log，返回 taskID → 去重后的文件路径列表。
@@ -290,6 +357,9 @@ func (l *ArtifactLog) Replay() (map[string][]string, error) {
 	result := make(map[string][]string)
 	// 跟踪已见过的 (taskID, path) 对，实现去重
 	seen := make(map[string]map[string]bool)
+	// 重放即重建内存 meta 索引：路径列表按首次出现去重（保持旧语义），
+	// 元数据按 last-wins 覆盖（同一文件重复写入时最新 hash 胜出）。
+	l.meta = make(map[string]map[string]model.ArtifactMeta)
 
 	scanner := bufio.NewScanner(f)
 	// 单行最大 1 MB——artifact path 不可能比这更长，但留个宽度。
@@ -311,6 +381,8 @@ func (l *ArtifactLog) Replay() (map[string][]string, error) {
 		if rec.TaskID == "" || rec.Path == "" {
 			continue
 		}
+		// 旧格式行没有 sha256/bytes——Unmarshal 得零值，rememberMetaLocked 跳过
+		l.rememberMetaLocked(rec.TaskID, rec.Path, model.ArtifactMeta{SHA256: rec.SHA256, Bytes: rec.Bytes})
 		// 去重
 		if _, ok := seen[rec.TaskID]; !ok {
 			seen[rec.TaskID] = make(map[string]bool)

@@ -339,6 +339,12 @@ func (s *MemoryTaskStore) SetArtifactLog(log *ArtifactLog) {
 // 在当前 store 里不存在（例如任务已被 FIFO 淘汰但日志仍留着），**跳过**
 // 而不是创建幽灵任务。这保证重放永远不会让 task 凭空出现。
 //
+// 元数据恢复：若已注入 artifactLog（bootstrap 保证 SetArtifactLog 先于
+// 本方法），逐路径取日志重放出的 ArtifactMeta 覆盖到 task.ArtifactMeta；
+// 日志没有元数据的旧格式行保留 TaskSnapshot 导入时已恢复的条目（快照是
+// 旧日志场景下唯一的元数据来源）。最终 map 按恢复后的路径列表裁剪，
+// 与 Artifacts 保持对齐。
+//
 // 返回实际恢复的 (taskID 数, artifact 总数)，供日志打印。
 func (s *MemoryTaskStore) RestoreArtifacts(rebuilt map[string][]string) (taskCount, artifactCount int) {
 	s.mu.Lock()
@@ -354,6 +360,25 @@ func (s *MemoryTaskStore) RestoreArtifacts(rebuilt map[string][]string) (taskCou
 		// 里 PublishTask 只发布空 artifacts 的新任务，所以覆盖是安全的。
 		task.Artifacts = make([]string, len(paths))
 		copy(task.Artifacts, paths)
+
+		var logMeta map[string]model.ArtifactMeta
+		if s.artifactLog != nil {
+			logMeta = s.artifactLog.artifactMeta(taskID)
+		}
+		merged := make(map[string]model.ArtifactMeta, len(paths))
+		for _, p := range paths {
+			if m, ok := logMeta[p]; ok && !m.IsZero() {
+				merged[p] = m // 日志是权威源（追加序最新）
+			} else if m, ok := task.ArtifactMeta[p]; ok && !m.IsZero() {
+				merged[p] = m // 旧日志无元数据：保留快照导入的条目
+			}
+		}
+		if len(merged) > 0 {
+			task.ArtifactMeta = merged
+		} else {
+			task.ArtifactMeta = nil
+		}
+
 		taskCount++
 		artifactCount += len(paths)
 	}
@@ -1084,6 +1109,18 @@ func (s *MemoryTaskStore) GetDependencyResults(taskID string) (map[string]string
 //     的注释（内存是真相来源）
 //   - 去重命中的路径不写 log（不必要的 IO + 让 Replay 更快）
 func (s *MemoryTaskStore) AppendArtifact(taskID string, path string) error {
+	return s.AppendArtifactWithMeta(taskID, path, model.ArtifactMeta{})
+}
+
+// AppendArtifactWithMeta 与 AppendArtifact 同义，但顺带登记产物的内容元数据
+// （record-artifact Reactor 从落盘文件算出）。元数据写入 task.ArtifactMeta，
+// 与 Artifacts 列表以路径为 key 对齐。
+//
+// 与 AppendArtifact 的唯一语义差异在**去重命中**时：同一文件被重复写入
+// （write→edit）会产生新 hash，因此当本次 meta 非零且与已登记值不同时，
+// 更新内存元数据并补写一条日志（Replay 对元数据 last-wins，恢复出最新值）；
+// meta 为零值或未变化时保持纯 no-op——旧调用方（无 meta）行为与从前一致。
+func (s *MemoryTaskStore) AppendArtifactWithMeta(taskID string, path string, meta model.ArtifactMeta) error {
 	s.mu.Lock()
 	task, ok := s.tasks[taskID]
 	if !ok {
@@ -1093,11 +1130,32 @@ func (s *MemoryTaskStore) AppendArtifact(taskID string, path string) error {
 	// 去重检查
 	for _, existing := range task.Artifacts {
 		if existing == path {
+			if meta.IsZero() || task.ArtifactMeta[path] == meta {
+				s.mu.Unlock()
+				return nil // 已存在且无新元数据——不写 log
+			}
+			// 重复写入产生了新 hash：更新元数据并补写日志（下方统一处理）
+			if task.ArtifactMeta == nil {
+				task.ArtifactMeta = make(map[string]model.ArtifactMeta)
+			}
+			task.ArtifactMeta[path] = meta
+			logRef := s.artifactLog
 			s.mu.Unlock()
-			return nil // 已存在，无操作——不写 log
+			if logRef != nil {
+				if err := logRef.AppendWithMeta(taskID, path, meta); err != nil {
+					log.Printf("[store] WARN artifact log 写入失败 task=%s path=%s: %v", taskID, path, err)
+				}
+			}
+			return nil
 		}
 	}
 	task.Artifacts = append(task.Artifacts, path)
+	if !meta.IsZero() {
+		if task.ArtifactMeta == nil {
+			task.ArtifactMeta = make(map[string]model.ArtifactMeta)
+		}
+		task.ArtifactMeta[path] = meta
+	}
 	logRef := s.artifactLog
 	snapshot := cloneTask(task)
 	s.mu.Unlock()
@@ -1105,7 +1163,7 @@ func (s *MemoryTaskStore) AppendArtifact(taskID string, path string) error {
 
 	// 锁外写日志，避免 fsync 阻塞其他 Store 操作
 	if logRef != nil {
-		if err := logRef.Append(taskID, path); err != nil {
+		if err := logRef.AppendWithMeta(taskID, path, meta); err != nil {
 			// 不回滚内存状态——内存是真相来源
 			log.Printf("[store] WARN artifact log 写入失败 task=%s path=%s: %v", taskID, path, err)
 		}
@@ -1504,6 +1562,7 @@ func (s *MemoryTaskStore) ExportSnapshot() []session.TaskSnapshot {
 			Depth:              task.Depth,
 			Artifacts:          copyStrings(task.Artifacts),
 			ExpectedArtifacts:  copyStrings(task.ExpectedArtifacts),
+			ArtifactMeta:       exportArtifactMeta(task.ArtifactMeta),
 			TransferNote:       task.TransferNote,
 			MailChainDepth:     task.MailChainDepth,
 			SchedulerBatch:     copyStrings(task.SchedulerBatch),
@@ -1614,6 +1673,7 @@ func (s *MemoryTaskStore) ImportSnapshot(tasks []session.TaskSnapshot) error {
 			Depth:              snap.Depth,
 			Artifacts:          copyStrings(snap.Artifacts),
 			ExpectedArtifacts:  copyStrings(snap.ExpectedArtifacts),
+			ArtifactMeta:       importArtifactMeta(snap.ArtifactMeta),
 			TransferNote:       snap.TransferNote,
 			MailChainDepth:     snap.MailChainDepth,
 			SchedulerBatch:     copyStrings(snap.SchedulerBatch),
@@ -1681,6 +1741,32 @@ func copyStringMap(src map[string]string) map[string]string {
 	dst := make(map[string]string, len(src))
 	for k, v := range src {
 		dst[k] = v
+	}
+	return dst
+}
+
+// exportArtifactMeta 把 model 侧元数据转换为快照 DTO。nil/空输入返回 nil，
+// 配合 omitempty 让无元数据的任务快照与旧格式字节级一致。
+func exportArtifactMeta(src map[string]model.ArtifactMeta) map[string]session.ArtifactMetaSnapshot {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]session.ArtifactMetaSnapshot, len(src))
+	for k, v := range src {
+		dst[k] = session.ArtifactMetaSnapshot{SHA256: v.SHA256, Bytes: v.Bytes}
+	}
+	return dst
+}
+
+// importArtifactMeta 把快照 DTO 还原为 model 侧元数据。旧版本快照没有该
+// 字段（nil），返回 nil——任务按"无元数据"降级。
+func importArtifactMeta(src map[string]session.ArtifactMetaSnapshot) map[string]model.ArtifactMeta {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]model.ArtifactMeta, len(src))
+	for k, v := range src {
+		dst[k] = model.ArtifactMeta{SHA256: v.SHA256, Bytes: v.Bytes}
 	}
 	return dst
 }

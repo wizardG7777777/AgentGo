@@ -1344,6 +1344,12 @@ func formatEventDetails(ev Event) string {
 			ev.TotalPromptTokens, ev.TotalCompletionTokens))
 	case KindProgressNotify:
 		parts = append(parts, fmt.Sprintf("notify_type=%s", ev.NotifyType))
+	case KindMemoryContextInject:
+		parts = append(parts, fmt.Sprintf("source=%s", ev.NotifyType))
+		if ev.Path != "" {
+			parts = append(parts, fmt.Sprintf("key=%s", ev.Path))
+		}
+		parts = append(parts, fmt.Sprintf("runes=%d", ev.OutputLen))
 	case KindError:
 		parts = append(parts, fmt.Sprintf("error=%q", truncate(ev.Error, 200)))
 		parts = appendReason(parts, "reason", ev.Reason)
@@ -1495,7 +1501,7 @@ func eventCarriesLoop(kind EventKind) bool {
 	switch kind {
 	case KindLLMCallStart, KindLLMCallEnd, KindToolCall, KindToolResult,
 		KindHistoryCompaction, KindHistoryTruncated, KindTokenStats, KindProgressNotify,
-		KindTaskCancelled:
+		KindMemoryContextInject, KindTaskCancelled:
 		return true
 	default:
 		return false

@@ -79,17 +79,26 @@ var DefaultGreylist = []string{
 
 // CommandFilter 命令拦截器，通过正则模式匹配危险命令。
 //
-// runtimeWhitelist 是"本次运行始终允许"的进程内记忆：用户选择
+// 运行时白名单（wl）是"本次运行始终允许"的进程内记忆：用户选择
 // allow_session 后，该模式被加入此白名单，本进程后续命中同模式不再创建请求。
 // 进程重启失效——这是有意的安全边界，避免风险随时间累积。
+// wl 为共享指针：DeriveWithExtraGreylist 派生的过滤器与源过滤器共用同一份
+// 白名单状态，保持单过滤器时期的全局 allow_session 语义不变。
 type CommandFilter struct {
 	blackPatterns []*regexp.Regexp
 	greyPatterns  []*regexp.Regexp
 	blackRaw      []string // 原始模式字符串，用于错误消息
 	greyRaw       []string
 
-	wlMu             sync.RWMutex
-	runtimeWhitelist []runtimeWhitelistEntry
+	wl *runtimeWhitelistState
+}
+
+// runtimeWhitelistState 是运行时白名单的共享状态容器。独立成指针字段，
+// 使派生过滤器（DeriveWithExtraGreylist）与源过滤器共享同一份
+// allow_session 记忆。
+type runtimeWhitelistState struct {
+	mu      sync.RWMutex
+	entries []runtimeWhitelistEntry
 }
 
 type runtimeWhitelistEntry struct {
@@ -99,7 +108,7 @@ type runtimeWhitelistEntry struct {
 
 // NewCommandFilter 创建命令拦截器。编译失败的正则模式会被跳过并记录警告。
 func NewCommandFilter(blacklist, greylist []string) *CommandFilter {
-	f := &CommandFilter{}
+	f := &CommandFilter{wl: &runtimeWhitelistState{}}
 	for _, pattern := range blacklist {
 		re, err := regexp.Compile(pattern)
 		if err != nil {
@@ -138,14 +147,14 @@ func (f *CommandFilter) Check(command string) (action string, pattern string) {
 			return "block", f.blackRaw[i]
 		}
 	}
-	f.wlMu.RLock()
-	for _, entry := range f.runtimeWhitelist {
+	f.wl.mu.RLock()
+	for _, entry := range f.wl.entries {
 		if entry.re.MatchString(command) {
-			f.wlMu.RUnlock()
+			f.wl.mu.RUnlock()
 			return "allow", ""
 		}
 	}
-	f.wlMu.RUnlock()
+	f.wl.mu.RUnlock()
 	for i, re := range f.greyPatterns {
 		if re.MatchString(command) {
 			return "ask", f.greyRaw[i]
@@ -166,23 +175,23 @@ func (f *CommandFilter) AddRuntimeWhitelist(pattern string) error {
 	if err != nil {
 		return fmt.Errorf("compile %q: %w", pattern, err)
 	}
-	f.wlMu.Lock()
-	defer f.wlMu.Unlock()
-	for _, entry := range f.runtimeWhitelist {
+	f.wl.mu.Lock()
+	defer f.wl.mu.Unlock()
+	for _, entry := range f.wl.entries {
 		if entry.raw == pattern {
 			return nil
 		}
 	}
-	f.runtimeWhitelist = append(f.runtimeWhitelist, runtimeWhitelistEntry{raw: pattern, re: re})
+	f.wl.entries = append(f.wl.entries, runtimeWhitelistEntry{raw: pattern, re: re})
 	return nil
 }
 
 // RuntimeWhitelist 返回运行时白名单的快照（原始模式字符串），供 TUI / 调试展示。
 func (f *CommandFilter) RuntimeWhitelist() []string {
-	f.wlMu.RLock()
-	defer f.wlMu.RUnlock()
-	out := make([]string, 0, len(f.runtimeWhitelist))
-	for _, entry := range f.runtimeWhitelist {
+	f.wl.mu.RLock()
+	defer f.wl.mu.RUnlock()
+	out := make([]string, 0, len(f.wl.entries))
+	for _, entry := range f.wl.entries {
 		out = append(out, entry.raw)
 	}
 	return out
@@ -192,9 +201,9 @@ func (f *CommandFilter) RuntimeWhitelist() []string {
 // 进程内记忆）。strict 执行模式用它区分"用户已显式放行的模式"与"普通命令"：
 // 前者直接执行，后者一律转入 ask 路径。
 func (f *CommandFilter) IsRuntimeWhitelisted(command string) bool {
-	f.wlMu.RLock()
-	defer f.wlMu.RUnlock()
-	for _, entry := range f.runtimeWhitelist {
+	f.wl.mu.RLock()
+	defer f.wl.mu.RUnlock()
+	for _, entry := range f.wl.entries {
 		if entry.re.MatchString(command) {
 			return true
 		}

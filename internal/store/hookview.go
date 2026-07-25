@@ -25,6 +25,11 @@ type StoreHookView interface {
 	// path 应当是相对项目根的相对路径，由调用方负责标准化。
 	AppendArtifact(taskID string, path string) error
 
+	// AppendArtifactWithMeta 与 AppendArtifact 同义，但顺带登记产物的内容
+	// 元数据（sha256/bytes）。由 record-artifact Reactor 在读取落盘文件
+	// 计算后调用；meta 为零值时与 AppendArtifact 行为完全一致。
+	AppendArtifactWithMeta(taskID string, path string, meta model.ArtifactMeta) error
+
 	// GetToolCallHistory 返回任务的完整工具调用历史，按时间升序。
 	// 任务不存在时返回 nil（hook 需要容忍这种情形，例如任务已被淘汰）。
 	// 返回值是内部数据的浅拷贝，调用方可以安全遍历。

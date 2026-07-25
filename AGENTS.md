@@ -80,7 +80,7 @@ main.go  (-config flag, default "setting.yaml"; -skip-startup-probe; subcommands
 | `internal/interaction` | **通用结构化人机交互协议**：`pending → resolving → resolved` 两阶段回答，CAS `Version`、稳定 Option ID、服务端私有 `ActionRef`，以及 cancel/expire/fail/interrupt 终态。Plan、Shell 与 `agent_question` 共用同一 Service；Interaction 只拥有“用户选择”事实，不直接拥有 Plan/Task/Shell 执行事实 |
 | `internal/llm` | LLM client interface + openai-go SDK implementation, `Provider` adapter (built-in: `openai` / `deepseek-v4` / `deepseek-r1`), `Message.ExtraFields` passthrough for non-standard fields (e.g. `reasoning_content`); error types (Recoverable / Unrecoverable / BadResponse) |
 | `internal/mailbox` | Direct agent-to-agent messaging (`send_message`), `MailNotifier` (default enabled), recent-message ring buffer (16) for hook peek, `TeamSnapshot` for team awareness |
-| `internal/memory` | **Memory System** (v5). `Store` interface with `ScopeProcess` (implemented via `ProcessStore` — pure in-memory, RWMutex) / `ScopeSession` / `ScopeProject` (the latter two reserved for v5.x). Replaces v4 `team-awareness` Hooks; agent reads at `processTask` entry |
+| `internal/memory` | **Memory System** (v5). `Store` interface with `ScopeProcess` (`ProcessStore` — pure in-memory, RWMutex) / `ScopeSession` (`SessionStore` — JSONL backend at `sess-<id>/memory.jsonl`, routed via `ProcessStore.AttachSessionStore`) / `ScopeProject` (reserved for v5.x). Replaces v4 `team-awareness` Hooks; agent reads at `processTask` entry |
 | `internal/model` | `Task`, `Event`, `Claim` data structures and state machine. `Task.SchedulerBatch`, `Task.Artifacts`, `Task.ExpectedArtifacts`, `Task.MailChainDepth`, `Task.LastResponse`, `Task.ReadSet` |
 | `internal/modes` | **Three-axis mode store** (2026-07, NEW). `Store` (RWMutex) holds three orthogonal axes: gate (`immediate`/`plan` — plan-gate via `submit_plan_for_review` + `plan_review` Interaction), exec (`normal`/`strict`/`readonly`/`yolo` — readonly enforced by the `exec-mode-guard` Gate; strict = write_file/edit_file 逐次 `file_write` Interaction 审批 + run_shell 全量审批（白名单仍放行）; yolo = 灰名单 ask 自动放行+中文审计日志，两者黑名单都硬拒), topo (`team`/`solo` — solo forbids scheduler `publish_task`, direct execution + relaxed finalization). Injected into scheduler/bootstrap/UI Hub; axes compose freely (e.g. solo+plan+readonly) |
 | `internal/pathutil` | Path traversal prevention + sensitive file pattern blocking |
@@ -158,11 +158,12 @@ Gate behaviour: `Decision.Action ∈ {Continue, Abort}` + optional `AbortReason`
 - `task-end-callback` — Sync, Prio 500, on `KindTask{Completed,Failed,Cancelled,Retry}` → invokes registered task-end callbacks (e.g. clear `CurrentTaskHolder`)
 - `trace-history-event` — Async, Prio 950, on `KindHistory{Compaction,Truncated}` → atomic counters
 - `read-set-write` — Async, Prio 950, on `KindToolResult` (filters tool=read_file) → `Store.UpsertReadSet`
+- `runtime-anomaly` — Async, Prio 950, on `KindTaskCompleted` → runtime port of `trace/cli.go` `detectAnomalies` heuristics #3/#5 (fabricated write / tool error rate >30%) reading Store ToolCallRecord; on hit calls `Coordinator.RequestReplan` (idempotency key `anomaly_reactor|<taskID>|<code>`), degrades to a `KindError` trace warning when the task has no Plan
 - `spawn.Manager` itself is registered as a Reactor and listens to terminal task events to tear down `one_shot` ad-hoc agents
 
 **User YAML reactors** (`cfg.ReactorsFile`, loader at `reactor/userdef/`):
 - Action verbs: `publish_task` (publish a new Task) / `invoke_llm` (one-shot pure-text LLM, no tools/history) / `spawn_agent` (materialise an ad-hoc agent via `spawn.Manager`) / `call: send_message` (only `send_message` in the v1 whitelist)
-- Conditions: `when:` expression filtering, `kind:` per-base-kind filtering (uses `spawn.Manager.KindOf` for ad-hoc agents)
+- Conditions: `when:` expression filtering — leaf operators `== != < <= > >= in` plus nested `and:` / `or:` / `not:` combinators (depth-capped at 8); `kind:` per-base-kind filtering (uses `spawn.Manager.KindOf` for ad-hoc agents)
 - `via_translator:` runs an `invoke_llm` to rewrite `initial_task.description` before `spawn_agent`
 - **Sync vs Async**: built-in reactors may set `IsSync=true`; user reactors are **always async**, panic-isolated, failures only logged
 - Reactor Principle 4: Reactors **may not directly drive new state transitions** (no `SetState` / `TransitionState`) — they must use `publish_task` / `send_message` / tool calls and let the main loop transition naturally
@@ -173,11 +174,11 @@ Gate behaviour: `Decision.Action ∈ {Continue, Abort}` + optional `AbortReason`
 `internal/memory` provides scope-based long/short-term memory:
 
 ```go
-type Scope int  // ScopeProcess (implemented) | ScopeSession (v5.x) | ScopeProject (v5.x)
+type Scope int  // ScopeProcess (implemented) | ScopeSession (implemented) | ScopeProject (v5.x)
 type Kind  string // KindConstraint | KindLearning | KindPattern | KindContext | KindAgentState
 ```
 
-`ProcessStore` is the only v5 implementation — pure in-memory (`map[ID]*Entry` + `(scope,kind,key)→ID` index, single RWMutex). Agents read at `processTask` entry via `injectMemoryContext` (`Memory.Query(ScopeProcess, KindContext, "team_snapshot"|"file_awareness", 1)`); writers (scheduler / runners on team-state change, Roster on file-claim change) call `Memory.Put` directly. `GoalAnchor` was simply deleted (the task description already carries the goal). `Memory` is `nil`-safe — agents without one degrade to v4-without-team-awareness behaviour.
+`ProcessStore` is the in-memory implementation (`map[ID]*Entry` + `(scope,kind,key)→ID` index, single RWMutex); `SessionStore` persists `ScopeSession` entries to `<session-dir>/memory.jsonl` (envelope log: put/delete/clear, replay on open, last-writer-wins; per-write open→fsync→close, no resident handle). `ProcessStore.AttachSessionStore` routes Session-scope calls to the attached backend — wired at startup in `resume.go` (`wireSessionMemory`) and rebound on `/new` & `/session` switch (`onSessionSwitched`). Agents read at `processTask` entry via `injectMemoryContext` (`Memory.Query(ScopeProcess, KindContext, "team_snapshot"|"file_awareness", 1)`), which is currently also the only production writer (lazy compute + write-through); `KindLearning`/`KindPattern`/`KindConstraint` remain type definitions with no production writers, and `QueryByVector` is unimplemented. `GoalAnchor` was simply deleted (the task description already carries the goal). `Memory` is `nil`-safe — agents without one degrade to v4-without-team-awareness behaviour. Injected sections emit a `memory_context_inject` trace event (source key + rune count) for context auditing.
 
 ### Bulletin Board (公告板) Mechanism
 

@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"agentgo/internal/memory"
 	"agentgo/internal/model"
 	"agentgo/internal/session"
 	"agentgo/internal/store"
@@ -179,12 +181,52 @@ func restoreOrReconcileRuntime(sys *System, snap *session.Snapshot) error {
 // and writer-only stale audit events have been settled successfully.
 func restoreRuntimeBeforeReactorActivation(sys *System, snap *session.Snapshot, blocks []staleResumeBlock, dispatcher trace.Dispatcher) error {
 	trace.SetDefaultDispatcher(nil)
+	wireSessionMemory(sys)
 	if err := restoreOrReconcileRuntime(sys, snap); err != nil {
 		return err
 	}
 	emitStaleResumeBlocks(blocks)
 	trace.SetDefaultDispatcher(dispatcher)
 	return nil
+}
+
+// wireSessionMemory 是 Session 作用域 Memory（MM8）的唯一装配挂点：Session
+// 就绪后（SessionManager 已在 Bootstrap 早期 initSession）把 SessionStore
+// 挂接到所有 Agent 共享的 *memory.ProcessStore 上，此后 ScopeSession 的
+// Put/Query/Delete/Clear 按 scope 路由到 sess-<id>/memory.jsonl（与
+// snapshot.json 同目录）。
+//
+// 取道 sys.Scheduler.Agent.Memory 拿共享实例：Scheduler 与全部 Runner 持有
+// 的是同一个 *memory.ProcessStore 指针（bootstrap 构造期注入），挂接一次
+// 全系统生效。
+//
+// 降级路径（全部只告警不失败，维持 v5 Phase 1 现状行为）：
+//   - 无 Session 管理器 / 无当前 Session（无 Session 模式）
+//   - Scheduler 尚未装配或 Memory 不是 *memory.ProcessStore
+//   - SessionStore 打开失败（文件损坏以外的 IO 错误等）
+//
+// 已知限制：session 运行时切换（/new、/session）不会重挂 memory.jsonl——
+// OnSwitch 钩子在 bootstrap.go 的 onSessionSwitched，Session Memory 的切换
+// 重绑留待该钩子侧跟进；进程重启 resume 路径不受影响。
+func wireSessionMemory(sys *System) {
+	if sys == nil || sys.SessionMgr == nil || sys.SessionMgr.Current() == nil {
+		return
+	}
+	if sys.Scheduler == nil || sys.Scheduler.Agent == nil {
+		return
+	}
+	proc, ok := sys.Scheduler.Agent.Memory.(*memory.ProcessStore)
+	if !ok || proc == nil {
+		return
+	}
+	path := filepath.Join(sys.SessionMgr.Current().Dir, "memory.jsonl")
+	backend, err := memory.NewSessionStore(path)
+	if err != nil {
+		log.Printf("[启动] WARNING: Session Memory 后端打开失败，降级为仅 process scope: %v", err)
+		return
+	}
+	proc.AttachSessionStore(backend)
+	log.Printf("[启动] Session Memory 已挂接（%s）", path)
 }
 
 // wireTextOnlyResultPersistence 把 scheduler agent 的 text-only 落盘回调

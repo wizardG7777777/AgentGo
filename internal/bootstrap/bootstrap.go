@@ -495,6 +495,9 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	//   - trace-history-event (Async)：订阅历史压缩 / 截断事件，原子计数累加
 	//   - read-set-write (Async)：v5 Phase 6 引入，订阅 KindToolResult filter read_file，
 	//     写 task.ReadSet 取代 require-read-before-write Gate 反查日志
+	//   - runtime-anomaly (Async)：订阅 KindTaskCompleted，用 Store 运行时数据复刻
+	//     trace CLI detectAnomalies 最高信号启发式（凭空写入 / 工具错误率>30%），
+	//     命中即经 planCoordinator 请求重规划（无 Plan 降级为 trace 告警）
 	reactorReg := reactor.NewRegistry()
 	if err := reactorReg.Register(reactorbuiltin.NewRecordArtifactReactor(storeView, cfg.ProjectRoot)); err != nil {
 		return nil, fmt.Errorf("注册 RecordArtifactReactor 失败: %w", err)
@@ -509,6 +512,9 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	}
 	if err := reactorReg.Register(reactorbuiltin.NewReadSetWriteReactor(taskStore)); err != nil {
 		return nil, fmt.Errorf("注册 ReadSetWriteReactor 失败: %w", err)
+	}
+	if err := reactorReg.Register(reactorbuiltin.NewAnomalyReactor(storeView, planCoordinator)); err != nil {
+		return nil, fmt.Errorf("注册 AnomalyReactor 失败: %w", err)
 	}
 	// 注：用户 reactor + spawn.Manager + trace.SetDefaultDispatcher 推迟到
 	// RunnerDeps 构造完成后（见 Step 8 末尾），因为 spawn.Manager 需要 RunnerDeps
@@ -848,7 +854,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	if err := restoreRuntimeBeforeReactorActivation(sys, recoveredSnap, staleResumeBlocks, reactorReg); err != nil {
 		return nil, fmt.Errorf("恢复 Plan/Task 运行时状态失败: %w", err)
 	}
-	log.Println("[启动] Reactor 系统初始化完成（record-artifact, task-end-callback, trace-history-event, read-set-write, spawn-manager）")
+	log.Println("[启动] Reactor 系统初始化完成（record-artifact, task-end-callback, trace-history-event, read-set-write, runtime-anomaly, spawn-manager）")
 	if recoveredSnap != nil {
 		log.Printf("[resume] 已恢复 session snapshot: tasks=%d mailboxes=%d scheduler_history=%d",
 			len(recoveredSnap.Tasks), len(recoveredSnap.Mailboxes), len(recoveredSnap.SchedulerHistory))
@@ -1280,6 +1286,8 @@ func (w *tuiLogWriter) Write(p []byte) (n int, err error) {
 // 成功提交后执行全部 session 目录重绑（B2/B5/B7）：
 //  1. plan/team store 的持久化位置迁移到新 Session 目录（RebindDir 会把当前
 //     内存态立即写一次到新路径；运行时状态跨 session 连续，仅落盘位置迁移）；
+//  1.5 Session Memory（memory.jsonl）换绑到新 Session 目录（新后端实例从
+//     目标文件 replay 出该 session 的历史；无常驻句柄，换绑即生效）；
 //  2. trace writer / prompt dumper / system.log 重绑到新 Session 的 logs/ 目录。
 //
 // Plan/Team 是恢复所需的关键持久化事实：失败会记录到 sessionSwitchErr，
@@ -1307,6 +1315,22 @@ func (s *System) onSessionSwitched(newSess *session.Session) {
 			s.recordSessionSwitchError(fmt.Errorf("TeamStore 重绑失败: %w", err))
 		} else {
 			log.Printf("[session] TeamStore 已重绑到新 Session (dir=%s)", newSess.Dir)
+		}
+	}
+
+	// 1.5 Session Memory 重绑：memory.jsonl 迁移到新 Session 目录（新实例
+	//    从目标文件 replay 出该 session 的历史）。SessionStore 无常驻句柄
+	//    （每次写入 open→fsync→close），换绑无需关闭旧后端。失败只告警
+	//    并保留旧绑定（同 trace/system.log 的观测资源语义，不阻断切换）。
+	if s.Scheduler != nil && s.Scheduler.Agent != nil {
+		if proc, ok := s.Scheduler.Agent.Memory.(*memory.ProcessStore); ok && proc != nil {
+			memPath := filepath.Join(newSess.Dir, "memory.jsonl")
+			if backend, err := memory.NewSessionStore(memPath); err != nil {
+				log.Printf("[session] WARNING: Session Memory 重绑失败 (%s): %v —— 保持旧目录", memPath, err)
+			} else {
+				proc.AttachSessionStore(backend)
+				log.Printf("[session] Session Memory 已重绑到新 Session (dir=%s)", newSess.Dir)
+			}
 		}
 	}
 

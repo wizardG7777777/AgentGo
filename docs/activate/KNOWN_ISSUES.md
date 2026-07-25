@@ -29,11 +29,11 @@
 
 ## 已知功能边界
 
-### Memory 目前只支持进程内存储
+### Memory 的 Project 作用域与向量查询仍未实现
 
-`internal/memory` 的 `ProcessStore` 可用，但 Session/Project 持久化后端尚未实现；`QueryByVector` 明确返回 `ErrNotImplemented`。
+`internal/memory` 的 `ProcessStore`（进程内）与 `SessionStore`（`sess-<id>/memory.jsonl` 持久化，MM8）可用；`ScopeProject` 仍返回 `ErrScopeUnsupported`，`QueryByVector` 明确返回 `ErrNotImplemented`。`KindLearning` / `KindPattern` / `KindConstraint` 尚无生产写入方。
 
-- 影响：重启后不能依赖 Memory 保留长期知识，也不能使用向量查询。
+- 影响：跨 session 的长期知识（Project 级）与语义检索不可用；学习类记忆目前不存在。
 - 路线图：[MemoryManageSystem.md](MemoryManageSystem.md)。
 
 ### Shell 超时处理仍是固定超时

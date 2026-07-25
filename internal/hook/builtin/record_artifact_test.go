@@ -25,6 +25,9 @@ func (m *mockArtifactStore) AppendArtifact(taskID string, path string) error {
 	m.appendCalls = append(m.appendCalls, taskID+"="+path)
 	return m.appendErr
 }
+func (m *mockArtifactStore) AppendArtifactWithMeta(taskID string, path string, meta model.ArtifactMeta) error {
+	return m.AppendArtifact(taskID, path)
+}
 func (m *mockArtifactStore) GetToolCallHistory(taskID string) []store.ToolCallRecord {
 	return nil
 }

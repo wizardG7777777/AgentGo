@@ -8,7 +8,7 @@
 //   - request_replan — 请求内置控制面重新评估事件所属 Plan
 //
 // 可选过滤维度：
-//   - when — §6.1.7 条件表达式（7 算子，无逻辑组合）
+//   - when — §6.1.7 条件表达式（7 个叶子算子 + and/or/not 嵌套组合）
 //   - kind — §6.2 per-kind 粒度过滤（限定 source agent 的 kind）
 //
 // 设计依据：docs/activate/ReactiveSystem.md §6.1 / §6.2。
@@ -21,8 +21,11 @@ package userdef
 type ReactorConfig struct {
 	Name string `yaml:"name,omitempty" json:"name,omitempty"`
 	On   string `yaml:"on" json:"on"`                         // 必填，trace.EventKind 名称（如 "task_failed"）
-	When string `yaml:"when,omitempty" json:"when,omitempty"` // 可选条件表达式
 	Kind string `yaml:"kind,omitempty" json:"kind,omitempty"` // §6.2 per-kind 过滤：限定 source agent kind；空=全局
+
+	// When 是可选条件表达式。字符串 = 单个叶子比较表达式（== != < <= > >= in）；
+	// map = and/or/not 逻辑组合（可嵌套，最深 8 层）。语法与语义详见 when.go 头部注释。
+	When any `yaml:"when,omitempty" json:"when,omitempty"`
 
 	// 五个动作（均已真实实现，loader 校验恰一非 nil）
 	PublishTask   *PublishTaskAction   `yaml:"publish_task,omitempty" json:"publish_task,omitempty"`

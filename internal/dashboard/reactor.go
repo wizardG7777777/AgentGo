@@ -37,6 +37,7 @@ var TraceEventKinds = []trace.EventKind{
 	trace.KindFileWritten,
 	trace.KindFileWriteQueued,
 	trace.KindProgressNotify,
+	trace.KindMemoryContextInject,
 	trace.KindError,
 	trace.KindAgentStateChanged,
 	trace.KindShellExecuted,

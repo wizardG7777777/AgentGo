@@ -14,7 +14,14 @@ var ErrNotImplemented = errors.New("memory: 操作未实现")
 
 // ProcessStore 是 ScopeProcess 的纯内存实现。Session / Project 作用域写入
 // 时直接拒绝（返回 ErrScopeUnsupported）——这是 v5 Phase 1 的最小集策略，
-// 防止上层误用拿不到的作用域。MM8/MM9 引入文件后端时再扩展。
+// 防止上层误用拿不到的作用域。
+//
+// MM8 起可通过 AttachSessionStore 挂接一个 ScopeSession 后端（SessionStore），
+// 此后 ScopeSession 的 Put/Query/Delete/Clear 全部委托给该后端，ProcessStore
+// 自身演变为"按 scope 路由的复合 Store"。选此方案而非另建 Composite 类型的
+// 原因：bootstrap 早已把 *ProcessStore 单例直接注入所有 Agent（RunnerDeps
+// .Memory / scheduler），路由放在 ProcessStore 内部可以做到装配侧零改动，
+// 且未挂接后端时 Process 作用域行为与 v5 Phase 1 逐字节一致。
 //
 // 并发模型：单 sync.RWMutex 串行化全部读写。条目数量少（Process 作用域
 // 只承载 team_snapshot / file_awareness 等少量定点 key），锁粒度足够。
@@ -27,6 +34,9 @@ type ProcessStore struct {
 	// keyIndex 按 (scope,kind,key) 索引到 ID，便于 Put 的 upsert 与
 	// Query 的精确 key 匹配快速定位。
 	keyIndex map[scopeKindKey]string
+	// sessionBackend 是可选的 ScopeSession 委托后端（MM8）。nil 时
+	// ScopeSession 维持 Phase 1 行为（Put/Clear 拒绝，Query 空结果）。
+	sessionBackend *SessionStore
 	// nowFn 为可注入时间源，便于测试。
 	nowFn func() time.Time
 }
@@ -39,7 +49,7 @@ type scopeKindKey struct {
 }
 
 // ErrScopeUnsupported 标识当前实现不支持的作用域。
-var ErrScopeUnsupported = errors.New("memory: 当前实现仅支持 ScopeProcess")
+var ErrScopeUnsupported = errors.New("memory: 当前实现不支持该作用域")
 
 // NewProcessStore 构造一个空的 Process 内存存储。
 func NewProcessStore() *ProcessStore {
@@ -50,8 +60,30 @@ func NewProcessStore() *ProcessStore {
 	}
 }
 
+// AttachSessionStore 挂接 ScopeSession 后端（MM8）。挂接后本实例按 scope
+// 路由：ScopeSession 委托给 backend，ScopeProcess 维持纯内存。重复挂接以
+// 后者为准（调用方负责旧后端的 Close）。
+func (s *ProcessStore) AttachSessionStore(backend *SessionStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionBackend = backend
+}
+
+// SessionBackend 返回当前挂接的 ScopeSession 后端，未挂接时返回 nil。
+func (s *ProcessStore) SessionBackend() *SessionStore {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sessionBackend
+}
+
 // Put 写入或更新一条记忆。详见 Store.Put 文档。
-func (s *ProcessStore) Put(_ context.Context, entry Entry) error {
+func (s *ProcessStore) Put(ctx context.Context, entry Entry) error {
+	if entry.Scope == ScopeSession {
+		// 挂接了 Session 后端则委托；未挂接维持 Phase 1 拒绝行为。
+		if backend := s.SessionBackend(); backend != nil {
+			return backend.Put(ctx, entry)
+		}
+	}
 	if entry.Scope != ScopeProcess {
 		return fmt.Errorf("%w: scope=%s", ErrScopeUnsupported, entry.Scope)
 	}
@@ -112,7 +144,14 @@ func (s *ProcessStore) Put(_ context.Context, entry Entry) error {
 //   - query 非空但未命中 Key：返回空切片（暂不做模糊匹配）
 //
 // AccessCount 在每次返回非空结果时递增（LRU 数据准备，v5 仅记录不利用）。
-func (s *ProcessStore) Query(_ context.Context, scope Scope, kind Kind, query string, limit int) ([]Entry, error) {
+func (s *ProcessStore) Query(ctx context.Context, scope Scope, kind Kind, query string, limit int) ([]Entry, error) {
+	// ScopeSession 委托：仅在挂接后端时拦截；未挂接时落到下方既有扫描
+	// （Process 索引里没有 session 条目，返回空——与 Phase 1 行为一致）。
+	if scope == ScopeSession {
+		if backend := s.SessionBackend(); backend != nil {
+			return backend.Query(ctx, scope, kind, query, limit)
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -154,20 +193,32 @@ func (s *ProcessStore) QueryByVector(_ context.Context, _ Scope, _ []float32, _ 
 }
 
 // Delete 按 ID 删除条目。不存在视为幂等成功。
-func (s *ProcessStore) Delete(_ context.Context, id string) error {
+// Process 索引未命中且挂接了 Session 后端时，委托后端按 ID 删除
+// （ID 自带 scope 前缀，两个命名空间不会互相误删）。
+func (s *ProcessStore) Delete(ctx context.Context, id string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	e, ok := s.entries[id]
-	if !ok {
+	if ok {
+		delete(s.entries, id)
+		delete(s.keyIndex, scopeKindKey{e.Scope, e.Kind, e.Key})
+		s.mu.Unlock()
 		return nil
 	}
-	delete(s.entries, id)
-	delete(s.keyIndex, scopeKindKey{e.Scope, e.Kind, e.Key})
+	backend := s.sessionBackend
+	s.mu.Unlock()
+	if backend != nil {
+		return backend.Delete(ctx, id)
+	}
 	return nil
 }
 
 // Clear 清空指定作用域下所有条目。
-func (s *ProcessStore) Clear(_ context.Context, scope Scope) error {
+func (s *ProcessStore) Clear(ctx context.Context, scope Scope) error {
+	if scope == ScopeSession {
+		if backend := s.SessionBackend(); backend != nil {
+			return backend.Clear(ctx, scope)
+		}
+	}
 	if scope != ScopeProcess {
 		return fmt.Errorf("%w: scope=%s", ErrScopeUnsupported, scope)
 	}

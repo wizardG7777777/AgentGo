@@ -143,7 +143,7 @@ func TestWrapFileWriteApproval_StrictFullCycle(t *testing.T) {
 // 否则 strict/yolo 对 runner 的 run_shell 不生效。
 func TestResolveToolGroups_WiresModesToShellGroup(t *testing.T) {
 	modeStore := modes.NewStore(modes.GateImmediate, modes.ExecYolo, modes.TopoTeam)
-	groups := resolveToolGroups("w-1", RunnerDeps{Modes: modeStore}, &CurrentTaskHolder{},
+	groups := resolveToolGroups("w-1", nil, RunnerDeps{Modes: modeStore}, &CurrentTaskHolder{},
 		agent.NewFinalizationHolder(), agent.NewSubmitState(),
 		agent.NewFileStateCache(1), &tools.DefaultWorkdir{}, nil)
 

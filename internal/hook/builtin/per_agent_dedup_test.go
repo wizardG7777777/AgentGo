@@ -19,6 +19,9 @@ func (m *mockStoreView) GetTask(taskID string) (*model.Task, error) {
 	return nil, store.ErrTaskNotFound
 }
 func (m *mockStoreView) AppendArtifact(taskID string, path string) error { return nil }
+func (m *mockStoreView) AppendArtifactWithMeta(taskID string, path string, meta model.ArtifactMeta) error {
+	return nil
+}
 func (m *mockStoreView) GetToolCallHistory(taskID string) []store.ToolCallRecord {
 	return nil
 }

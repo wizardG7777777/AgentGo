@@ -10,14 +10,28 @@ import (
 
 // when 条件求值（§6.1.7）。
 //
-// 语法：`<operand> <op> <operand>`
+// 叶子表达式（字符串形式）：`<operand> <op> <operand>`
 //
 //   operand: ${event.x.y} 或字面量（数字 / "字符串" / 'string' / bareword）
 //   op:      ==  !=  <  <=  >  >=  in
 //   in:      右侧必须是方括号列表 [a, b, c]，元素可以是字面量或 ${...}
 //
-// **明确不支持**：逻辑组合（and / or / not）、括号、嵌套表达式。
-// 复杂条件请写多个 reactor。详见 spec §6.1.7。
+// 逻辑组合（map 形式，可嵌套）：
+//
+//   when:
+//     and:                        # 全部子条件成立才为真
+//       - "${event.task.retry_count} >= 2"
+//       - or:                     # 任一子条件成立即为真
+//           - "${event.agent.id} == worker-1"
+//           - "${event.agent.id} == worker-2"
+//       - not: "${event.task.id} == T-0"   # 单条件取反
+//
+// 组合规则：
+//   - and / or 的值必须是非空条件列表；not 的值是单个条件（叶子或下一层组合）
+//   - 每个组合 map 恰好包含一个键（and/or/not 之一）
+//   - 组合嵌套最深 maxWhenNesting 层，防止病态配置
+//   - 叶子字符串内仍不支持行内 and/or/not/&&/||（引号与 ${} 外的裸词会被拒绝），
+//     需要组合时请使用上述嵌套结构
 //
 // 类型语义：
 //   - 比较运算符（< <= > >=）：左右两侧解析后都尝试转 int；
@@ -25,8 +39,17 @@ import (
 //   - 等值运算符（== !=）：永远字符串比较，避免 "5" == 5 类的踩坑。
 //   - in：成员关系，字符串相等比对。
 
-// whenCond 是已解析的 when 表达式；nil 表示无条件（恒真）。
+// maxWhenNesting 是 and/or/not 组合节点的最大嵌套层数（叶子不计层）。
+const maxWhenNesting = 8
+
+// whenCond 是已解析的 when 条件树；nil 表示无条件（恒真）。
+//
+// logic 为空时是叶子比较节点（left/op/right 有效）；
+// logic 为 "and"/"or"/"not" 时是组合节点（children 为子条件，not 恰好一个）。
 type whenCond struct {
+	logic    string
+	children []*whenCond
+
 	left  operand
 	op    string
 	right []operand // 单元素：普通运算；多元素：in 列表
@@ -37,14 +60,77 @@ type operand struct {
 	raw   string // isVar=true 时是 path（不含 ${}），false 时是字面量原文
 }
 
-// parseWhen 解析单行 when 表达式。空字符串返回 nil（恒真）。
-func parseWhen(expr string) (*whenCond, error) {
-	expr = strings.TrimSpace(expr)
-	if expr == "" {
+// parseWhen 解析 YAML `when:` 字段的原始值。
+//
+// nil 或空字符串返回 nil（恒真）。字符串按叶子表达式解析；
+// map[string]any 按 and/or/not 逻辑组合解析（可嵌套，最深 maxWhenNesting 层）。
+func parseWhen(raw any) (*whenCond, error) {
+	if raw == nil {
 		return nil, nil
 	}
+	if s, ok := raw.(string); ok && strings.TrimSpace(s) == "" {
+		return nil, nil
+	}
+	return parseWhenNode(raw, "when", 0)
+}
+
+// parseWhenNode 递归解析条件节点；path 用于中文报错定位（如 when.or[2]）。
+// depth 是已进入的组合节点层数（顶层为 0）。
+func parseWhenNode(raw any, path string, depth int) (*whenCond, error) {
+	switch v := raw.(type) {
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return nil, fmt.Errorf("%s: 条件表达式不能为空", path)
+		}
+		return parseWhenLeaf(v, path)
+	case map[string]any:
+		if depth >= maxWhenNesting {
+			return nil, fmt.Errorf("%s: and/or/not 组合嵌套超过最大深度 %d 层", path, maxWhenNesting)
+		}
+		if len(v) != 1 {
+			return nil, fmt.Errorf("%s: 组合节点必须恰好包含一个键（and/or/not），实际 %d 个", path, len(v))
+		}
+		for key, val := range v {
+			switch key {
+			case "and", "or":
+				list, ok := val.([]any)
+				if !ok {
+					return nil, fmt.Errorf("%s.%s: %s 需要非空条件列表，实际类型 %T", path, key, key, val)
+				}
+				if len(list) == 0 {
+					return nil, fmt.Errorf("%s.%s: 子条件列表不能为空", path, key)
+				}
+				children := make([]*whenCond, 0, len(list))
+				for i, item := range list {
+					child, err := parseWhenNode(item, fmt.Sprintf("%s.%s[%d]", path, key, i), depth+1)
+					if err != nil {
+						return nil, err
+					}
+					children = append(children, child)
+				}
+				return &whenCond{logic: key, children: children}, nil
+			case "not":
+				if _, isList := val.([]any); isList {
+					return nil, fmt.Errorf("%s.not: not 只接受单个条件，不支持列表", path)
+				}
+				child, err := parseWhenNode(val, path+".not", depth+1)
+				if err != nil {
+					return nil, err
+				}
+				return &whenCond{logic: "not", children: []*whenCond{child}}, nil
+			default:
+				return nil, fmt.Errorf("%s: 未知的组合键 %q（仅支持 and/or/not）", path, key)
+			}
+		}
+	}
+	return nil, fmt.Errorf("%s: 不支持的条件类型 %T（期望字符串表达式或 and/or/not 组合）", path, raw)
+}
+
+// parseWhenLeaf 解析单行叶子表达式。空字符串由上层拦截，此处不会收到。
+func parseWhenLeaf(expr string, path string) (*whenCond, error) {
+	expr = strings.TrimSpace(expr)
 	if hasLogicalComposition(expr) {
-		return nil, fmt.Errorf("when: logical composition is not supported (use multiple reactors instead): %q", expr)
+		return nil, fmt.Errorf("%s: 单行表达式不支持 and/or/not 逻辑组合，请改用嵌套 and:/or:/not: 结构：%q", path, expr)
 	}
 
 	// 顺序匹配：长 op 优先（防止 "<=" 被切成 "<"）
@@ -61,26 +147,27 @@ func parseWhen(expr string) (*whenCond, error) {
 		right := strings.TrimSpace(expr[idx+len(op):])
 		l, err := parseOperand(left)
 		if err != nil {
-			return nil, fmt.Errorf("when: left %w", err)
+			return nil, fmt.Errorf("%s: 左操作数无效：%w", path, err)
 		}
 		if opNorm == "in" {
 			rs, err := parseList(right)
 			if err != nil {
-				return nil, fmt.Errorf("when: right %w", err)
+				return nil, fmt.Errorf("%s: 右操作数无效：%w", path, err)
 			}
 			return &whenCond{left: l, op: "in", right: rs}, nil
 		}
 		r, err := parseOperand(right)
 		if err != nil {
-			return nil, fmt.Errorf("when: right %w", err)
+			return nil, fmt.Errorf("%s: 右操作数无效：%w", path, err)
 		}
 		return &whenCond{left: l, op: opNorm, right: []operand{r}}, nil
 	}
-	return nil, fmt.Errorf("when: no recognized operator in %q (supported: == != < <= > >= in)", expr)
+	return nil, fmt.Errorf("%s: 未识别运算符（支持 == != < <= > >= in）：%q", path, expr)
 }
 
-// hasLogicalComposition rejects and/or/not-style composition outside quoted strings
-// and ${...} references. v5 deliberately supports exactly one comparison per reactor.
+// hasLogicalComposition 拒绝叶子字符串中引号与 ${...} 之外的 and/or/not 裸词
+// 及 &&/||。逻辑组合必须改用嵌套 and:/or:/not: map 结构（见 parseWhenNode），
+// 防止行内写法与嵌套写法两套语义并存。
 func hasLogicalComposition(expr string) bool {
 	inSingle, inDouble, inVar := false, false, 0
 	var token strings.Builder
@@ -266,6 +353,28 @@ func (w *whenCond) eval(ev trace.Event) bool {
 	if w == nil {
 		return true
 	}
+	switch w.logic {
+	case "and": // 全部子条件成立才为真（解析期已保证列表非空）
+		for _, c := range w.children {
+			if !c.eval(ev) {
+				return false
+			}
+		}
+		return true
+	case "or": // 任一子条件成立即为真
+		for _, c := range w.children {
+			if c.eval(ev) {
+				return true
+			}
+		}
+		return false
+	case "not": // 单条件取反
+		if len(w.children) != 1 {
+			return false // 防御：解析期已保证恰好一个子条件
+		}
+		return !w.children[0].eval(ev)
+	}
+	// 叶子比较节点
 	left := resolveOperand(w.left, ev)
 	switch w.op {
 	case "==":

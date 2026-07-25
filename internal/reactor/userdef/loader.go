@@ -42,6 +42,7 @@ var knownEventKinds = map[trace.EventKind]struct{}{
 	trace.KindFileWritten:               {},
 	trace.KindFileWriteQueued:           {},
 	trace.KindProgressNotify:            {},
+	trace.KindMemoryContextInject:       {},
 	trace.KindError:                     {},
 	trace.KindAgentStateChanged:         {},
 	trace.KindShellExecuted:             {},
@@ -102,7 +103,7 @@ type Deps struct {
 //  4. PublishTask: Kind 非空 + description.File 在 projectRoot 内 + 模板路径有效
 //  5. InvokeLLM: prompt.File 在 projectRoot 内 + output 三 sink 恰一非 nil
 //  6. RequestReplan: reason_code 非空 + urgency 为 normal/high + 无越权字段
-//  7. when 表达式可解析
+//  7. when 条件（叶子表达式或 and/or/not 嵌套组合）可解析且嵌套深度合规
 //  8. 依赖完整性：动作所需 Deps 字段非 nil
 func LoadFromFile(path string, projectRoot string, deps Deps) ([]reactor.Reactor, error) {
 	data, err := os.ReadFile(path)

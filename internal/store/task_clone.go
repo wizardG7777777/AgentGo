@@ -18,6 +18,12 @@ func cloneTask(src *model.Task) *model.Task {
 	dst.SchedulerBatch = cloneStrings(src.SchedulerBatch)
 	dst.Supersedes = cloneStrings(src.Supersedes)
 	dst.Results = cloneStringMap(src.Results)
+	if src.ArtifactMeta != nil {
+		dst.ArtifactMeta = make(map[string]model.ArtifactMeta, len(src.ArtifactMeta))
+		for k, v := range src.ArtifactMeta {
+			dst.ArtifactMeta[k] = v
+		}
+	}
 	if src.ReadSet != nil {
 		dst.ReadSet = make(map[string]model.ReadInfo, len(src.ReadSet))
 		for k, v := range src.ReadSet {

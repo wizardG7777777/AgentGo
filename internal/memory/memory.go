@@ -7,7 +7,9 @@
 //  3. 作用域分层：Process / Session / Project
 //  4. 写入与读取解耦：写入由系统组件触发，读取由 Agent 框架层调度
 //
-// 当前 v5 首版仅实现 ScopeProcess 内存存储。Session / Project 留作 MM8/MM9。
+// 当前实现：ScopeProcess 纯内存（ProcessStore）；ScopeSession 由
+// SessionStore（JSONL 文件后端，MM8）实现，经 ProcessStore.AttachSessionStore
+// 挂接后按 scope 路由。ScopeProject 留作 MM9。
 package memory
 
 import (
@@ -23,7 +25,8 @@ const (
 	// 典型内容：当前活跃 Agent 状态、board snapshot 缓存、实时文件占用。
 	ScopeProcess Scope = iota
 	// ScopeSession 会话级：session 结束清空，落盘到
-	// .agentgo/sessions/sess-<id>/memory.jsonl（v5 不实现，预留）。
+	// .agentgo/sessions/sess-<id>/memory.jsonl（MM8 起由 SessionStore 实现，
+	// 经 ProcessStore.AttachSessionStore 挂接后生效）。
 	ScopeSession
 	// ScopeProject 项目级：跨会话持久化到 .agentgo/memory/（v5 不实现，预留）。
 	ScopeProject

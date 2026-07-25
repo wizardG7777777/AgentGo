@@ -20,6 +20,9 @@ func (m *combinedMockStoreView) GetTask(taskID string) (*model.Task, error) {
 	return nil, store.ErrTaskNotFound
 }
 func (m *combinedMockStoreView) AppendArtifact(taskID string, path string) error { return nil }
+func (m *combinedMockStoreView) AppendArtifactWithMeta(taskID string, path string, meta model.ArtifactMeta) error {
+	return nil
+}
 func (m *combinedMockStoreView) GetToolCallHistory(taskID string) []store.ToolCallRecord {
 	return nil
 }

@@ -2,9 +2,13 @@
 package builtin
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"os"
 	"path/filepath"
 	"strings"
 
+	"agentgo/internal/model"
 	"agentgo/internal/reactor"
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
@@ -41,7 +45,8 @@ func (r *RecordArtifactReactor) Subscribe() []trace.EventKind {
 	return []trace.EventKind{trace.KindFileWritten}
 }
 
-// Run 写入 task.Artifacts。store == nil 时静默 no-op（测试 / 最小注册场景）。
+// Run 写入 task.Artifacts，并同步登记产物元数据（sha256/bytes）到
+// task.ArtifactMeta。store == nil 时静默 no-op（测试 / 最小注册场景）。
 // 路径为空 / 任务不存在等失败均吞错——artifact 记录是 best-effort 的审计记录，
 // 不能反向阻塞主流程（Async Reactor 也无法阻塞）。
 func (r *RecordArtifactReactor) Run(ev trace.Event) error {
@@ -52,8 +57,25 @@ func (r *RecordArtifactReactor) Run(ev trace.Event) error {
 		return nil
 	}
 	rel := normalizeArtifactPath(ev.Path, r.projectRoot)
-	_ = r.store.AppendArtifact(ev.TaskID, rel)
+	_ = r.store.AppendArtifactWithMeta(ev.TaskID, rel, computeArtifactMeta(ev.Path))
 	return nil
+}
+
+// computeArtifactMeta 读取落盘文件内容，计算 SHA256 与字节数。
+//
+// 为什么不复用 trace.Event.Hash/Bytes：那是写入方自报的字段，依赖每个
+// KindFileWritten 发射源都填写；reactor 以落盘文件为准，对现有与未来的
+// 发射源一视同仁，且顺带验证文件确实已持久化。
+//
+// 失败（文件已被移动/删除、权限不足等）降级为零值 meta——只登记路径，
+// 不阻断、不重试：与 artifact 记录本身的 best-effort 语义一致。
+func computeArtifactMeta(path string) model.ArtifactMeta {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return model.ArtifactMeta{}
+	}
+	sum := sha256.Sum256(data)
+	return model.ArtifactMeta{SHA256: hex.EncodeToString(sum[:]), Bytes: int64(len(data))}
 }
 
 // 编译期断言 RecordArtifactReactor 实现 Reactor 接口。

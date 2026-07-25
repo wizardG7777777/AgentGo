@@ -97,7 +97,7 @@ func TestRunnerSubmitTaskResultShortCircuitsWithStructuredPayload(t *testing.T) 
 // 否则 submit_task_result 根本不会被注册（nil 任一字段即跳过注册）。
 func TestResolveToolGroups_WiresSubmitChannelToPlanControlGroup(t *testing.T) {
 	submitState := agent.NewSubmitState()
-	groups := resolveToolGroups("w-1", RunnerDeps{}, &CurrentTaskHolder{},
+	groups := resolveToolGroups("w-1", nil, RunnerDeps{}, &CurrentTaskHolder{},
 		agent.NewFinalizationHolder(), submitState, agent.NewFileStateCache(1), &tools.DefaultWorkdir{}, nil)
 
 	var planGroup *tools.PlanControlGroup

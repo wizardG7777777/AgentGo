@@ -31,6 +31,11 @@ const defaultShellTimeoutSec = 30
 //
 // 可选字段：
 //   - Filter：命令过滤器，nil 时使用 shell.NewCommandFilter(DefaultBlacklist, DefaultGreylist)
+//   - ExtraGreylist：追加的命令灰名单模式，在 Filter（或默认名单）的灰名单之后
+//     参与匹配；命中后与内置灰名单同一通道处理（创建 shell_command 授权
+//     Interaction，服务不可用时 fail-closed）。派生过滤器与 Filter 共享运行时
+//     白名单，allow_session 语义不变。验收角色由 dependency_map 注入
+//     shell.AcceptanceHardeningGreylist；普通角色留空，行为与之前完全一致
 //   - SessionID：返回当前 Session ID，nil 时请求不绑定 Session
 //   - Modes：三轴模式 store，exec 轴驱动 strict 全量审批 / yolo 灰名单自动放行；
 //     nil 等价 normal
@@ -43,6 +48,7 @@ type ShellGroup struct {
 	SessionID           func() string
 	AgentID             string
 	Filter              *shell.CommandFilter // optional
+	ExtraGreylist       []string             // optional
 	Modes               *modes.Store         // optional
 	InteractionWaitHook func(waiting bool)   // optional
 }
@@ -138,6 +144,12 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 	filter := g.Filter
 	if filter == nil {
 		filter = shell.NewCommandFilter(shell.DefaultBlacklist, shell.DefaultGreylist)
+	}
+	// 验收加固：追加灰名单只在派生过滤器上生效，原 Filter（可能是全局
+	// 共享实例）的灰名单判定不变；运行时白名单与原 Filter 共享，
+	// allow_session 语义不变。
+	if len(g.ExtraGreylist) > 0 {
+		filter = filter.DeriveWithExtraGreylist(g.ExtraGreylist)
 	}
 
 	authorizedFn := shell.WrapShellTool(rawFn, filter, g.Interactions, g.SessionID,

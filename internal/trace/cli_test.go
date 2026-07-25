@@ -54,6 +54,7 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"file_written", Event{Kind: KindFileWritten, Tool: "write_file", Path: "a.go", Bytes: 42, Hash: "full-hash"}, []string{"path=a.go", "bytes=42", "hash=full-hash", "tool=write_file"}},
 		{"file_write_queued", Event{Kind: KindFileWriteQueued, Path: "a.go", QueueLen: 2, WaitMS: 15, Description: "acquired"}, []string{"path=a.go", "queue_len=2", "wait_ms=15", `desc="acquired"`}},
 		{"progress_notify", Event{Kind: KindProgressNotify, NotifyType: "halfway"}, []string{"notify_type=halfway"}},
+		{"memory_context_inject", Event{Kind: KindMemoryContextInject, NotifyType: "team_snapshot", Path: "team_snapshot:worker-1", OutputLen: 128}, []string{"source=team_snapshot", "key=team_snapshot:worker-1", "runes=128"}},
 		{"error", Event{Kind: KindError, Error: "boom", Reason: "reactor"}, []string{`error="boom"`, `reason="reactor"`}},
 		{"agent_state_changed", Event{Kind: KindAgentStateChanged, Transition: &Transition{PrevState: "idle", NewState: "processing", Cause: "claim"}}, []string{"prev=idle", "new=processing", "cause=claim"}},
 		{"shell_executed", Event{Kind: KindShellExecuted, Tool: "run_shell", Args: map[string]any{"command": "go test"}, ShellExec: &ShellExec{Command: "go test", ExitCode: 0, DurationMS: 9, Outcome: "success", StdoutExcerpt: "ok", StderrExcerpt: "warn"}}, []string{`cmd="go test"`, "exit=0", "outcome=success", `stdout="ok"`, `stderr="warn"`, "tool=run_shell"}},
@@ -68,8 +69,8 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"plan_paused", planEvent(KindPlanPaused, "budget"), []string{`reason="budget"`, "acceptance_revision=2"}},
 		{"plan_terminal", planEvent(KindPlanTerminal, "pass"), []string{`reason="pass"`, "plan=plan-1"}},
 	}
-	if len(cases) != 32 {
-		t.Fatalf("test inventory has %d built-in EventKinds, want 32", len(cases))
+	if len(cases) != 33 {
+		t.Fatalf("test inventory has %d built-in EventKinds, want 33", len(cases))
 	}
 	seen := make(map[string]struct{}, len(cases))
 	for _, tc := range cases {

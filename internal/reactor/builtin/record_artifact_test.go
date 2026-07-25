@@ -1,6 +1,8 @@
 package builtin
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -25,16 +27,20 @@ type fakeStoreView struct {
 type artifactCall struct {
 	taskID string
 	path   string
+	meta   model.ArtifactMeta
 }
 
 func (s *fakeStoreView) GetTask(taskID string) (*model.Task, error) { return nil, nil }
 func (s *fakeStoreView) AppendArtifact(taskID, path string) error {
+	return s.AppendArtifactWithMeta(taskID, path, model.ArtifactMeta{})
+}
+func (s *fakeStoreView) AppendArtifactWithMeta(taskID, path string, meta model.ArtifactMeta) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.failOnAppend {
 		return errors.New("simulated store failure")
 	}
-	s.calls = append(s.calls, artifactCall{taskID, path})
+	s.calls = append(s.calls, artifactCall{taskID, path, meta})
 	return nil
 }
 func (s *fakeStoreView) QueryToolCalls(taskID, tool string) ([]store.ToolCallRecord, error) {
@@ -157,6 +163,56 @@ func TestRecordArtifactReactor_StoreFailureTolerated(t *testing.T) {
 	r := NewRecordArtifactReactor(s, "/proj")
 	if err := r.Run(trace.Event{Kind: trace.KindFileWritten, TaskID: "t1", Path: "/proj/a.md"}); err != nil {
 		t.Errorf("store failure should be tolerated, got %v", err)
+	}
+}
+
+func TestRecordArtifactReactor_ComputesMetaFromDisk(t *testing.T) {
+	// hash 正确性：reactor 读取落盘文件计算 sha256/bytes 并随路径一并登记
+	root := t.TempDir()
+	content := "hello artifact meta\n"
+	abs := filepath.Join(root, "docs", "foo.md")
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(abs, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &fakeStoreView{}
+	r := NewRecordArtifactReactor(s, root)
+	if err := r.Run(trace.Event{Kind: trace.KindFileWritten, TaskID: "t1", Path: abs}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	calls := s.snapshotCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(calls))
+	}
+	if calls[0].path != "docs/foo.md" {
+		t.Errorf("path=%q want docs/foo.md", calls[0].path)
+	}
+	wantSum := sha256.Sum256([]byte(content))
+	if want := hex.EncodeToString(wantSum[:]); calls[0].meta.SHA256 != want {
+		t.Errorf("sha256=%q want %q", calls[0].meta.SHA256, want)
+	}
+	if calls[0].meta.Bytes != int64(len(content)) {
+		t.Errorf("bytes=%d want %d", calls[0].meta.Bytes, len(content))
+	}
+}
+
+func TestRecordArtifactReactor_MetaDegradesOnReadFailure(t *testing.T) {
+	// 写文件失败降级：文件不可读（不存在）时只登记路径、meta 为零值，不报错
+	s := &fakeStoreView{}
+	r := NewRecordArtifactReactor(s, t.TempDir())
+	missing := filepath.Join(t.TempDir(), "no-such-file.md")
+	if err := r.Run(trace.Event{Kind: trace.KindFileWritten, TaskID: "t1", Path: missing}); err != nil {
+		t.Fatalf("读取失败不应返回错误, got %v", err)
+	}
+	calls := s.snapshotCalls()
+	if len(calls) != 1 {
+		t.Fatalf("读取失败仍应登记路径, calls=%d", len(calls))
+	}
+	if !calls[0].meta.IsZero() {
+		t.Errorf("读取失败应降级为零值 meta, got %+v", calls[0].meta)
 	}
 }
 

@@ -83,6 +83,10 @@ func (r *recordingStore) AppendArtifact(taskID string, path string) error {
 	return nil // 不需要
 }
 
+func (r *recordingStore) AppendArtifactWithMeta(taskID string, path string, meta model.ArtifactMeta) error {
+	return nil // 不需要
+}
+
 func (r *recordingStore) GetToolCallHistory(taskID string) []store.ToolCallRecord {
 	r.mu.Lock()
 	defer r.mu.Unlock()

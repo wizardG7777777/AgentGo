@@ -121,6 +121,10 @@ func (m *mockHookView) AppendArtifact(taskID string, path string) error {
 	return nil
 }
 
+func (m *mockHookView) AppendArtifactWithMeta(taskID string, path string, meta model.ArtifactMeta) error {
+	return m.AppendArtifact(taskID, path)
+}
+
 func (m *mockHookView) GetToolCallHistory(taskID string) []ToolCallRecord {
 	return m.history[taskID]
 }

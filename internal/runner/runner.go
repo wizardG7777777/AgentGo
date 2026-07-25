@@ -150,8 +150,9 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 
 	toolReg := agent.NewToolRegistryWithAllowlist(rt.AllowedTools)
 
-	// §11.6.2 工具 → 依赖项映射由 dependency_map.go 集中管理
-	groups := resolveToolGroups(rt.InstanceID, deps, holder, finHolder, submitState, fileCache, workdir, interactionWaitHook)
+	// §11.6.2 工具 → 依赖项映射由 dependency_map.go 集中管理；
+	// rt.AllowedTools 除注册剪枝外还用于验收角色的 shell 加固判定。
+	groups := resolveToolGroups(rt.InstanceID, rt.AllowedTools, deps, holder, finHolder, submitState, fileCache, workdir, interactionWaitHook)
 	tools.RegisterGroups(toolReg, groups...)
 
 	// strict 执行权限强制层（v5 三轴 exec）：exec=strict 时对 write_file /

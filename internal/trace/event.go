@@ -103,6 +103,11 @@ const (
 	// 进度通知事件（文件写入 / 子任务发布 / 任务过半）
 	KindProgressNotify EventKind = "progress_notify"
 
+	// Memory 上下文注入审计（injectMemoryContext 实际注入 history 时按 section 发出）。
+	// payload：NotifyType=来源（team_snapshot/file_awareness）、Path=实际命中的
+	// Memory 检索键、OutputLen=注入文本 rune 数、Loop=注入点（-1=任务入口）。
+	KindMemoryContextInject EventKind = "memory_context_inject"
+
 	// 通用错误事件（比 task_completed 严重的故障，但任务并未终止）
 	KindError EventKind = "error"
 
