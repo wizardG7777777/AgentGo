@@ -102,6 +102,12 @@ type Agent struct {
 	Store                 store.TaskStore
 	Roster                roster.Roster
 	Execute               TaskExecutor
+	// ToolSwapper 是 executor 暴露的按任务工具注册表替换通道（*LLMExecutor
+	// 实现 ToolRegistrySwapper）。任务携带 NodeCapability.Tools 时，
+	// processTask 经它换入过滤视图、任务结束恢复；nil 表示 executor 不支持
+	// 按任务过滤——携带工具子集的任务将 fail-closed 终止（无法保证
+	// "LLM 只见子集"的隔离语义时不降级执行）。与 Execute 一样在装配期注入。
+	ToolSwapper           ToolRegistrySwapper
 	MaxLoops              int
 	MaxRetries            int // 最大重试次数，0 表示不限制
 	PollInterval          time.Duration
@@ -357,7 +363,7 @@ func (a *Agent) run(ctx context.Context, ready func()) {
 		default:
 		}
 
-		tasks, err := a.Store.QueryAvailable(a.EventType)
+		tasks, err := a.Store.QueryAvailable(a.EventType, a.ID)
 		if err != nil {
 			log.Printf("[agent %s] QueryAvailable error: %v", a.ID, err)
 			idleCount++
@@ -553,6 +559,55 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// 任务开始回调（用于 publish_subtask 跟踪当前任务 ID 等扩展点）
 	if a.OnTaskStart != nil {
 		a.OnTaskStart(taskID)
+	}
+
+	// === per-node 能力（model.NodeCapability）应用点 ===
+	// 与 FinalizationChecker/SubmitState 装配正交：只影响本任务执行期间
+	// executor 可见的工具集与 a.Model，任务结束经 defer 全部恢复。
+	// 无 Capability 时零开销短路。
+	if task.Capability != nil {
+		// 工具子集裁剪：换入 executor 的过滤视图。fail-closed 兜底——节点
+		// 工具 ⊄ executor 注册全集（或 executor 不支持按任务过滤）时任务
+		// 直接失败且不降级执行：用超集工具集跑一个声明了子集的任务会打破
+		// "LLM 只见子集"的隔离语义。Store 层 QueryAvailable 已按
+		// CapabilityChecker 预过滤，这里是执行面的第二道防线。
+		if len(task.Capability.Tools) > 0 {
+			if a.ToolSwapper == nil {
+				reason := fmt.Sprintf("节点能力要求工具子集 %v，但 executor 不支持按任务工具过滤（Agent.ToolSwapper 未装配），不降级执行", task.Capability.Tools)
+				log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
+				terminatingCause = "react_loop_exit:error"
+				enterTerminating(terminatingCause)
+				a.terminateTask(task, taskID, reason, "capability_violation")
+				return
+			}
+			full := a.ToolSwapper.ToolRegistry()
+			if missing := full.Missing(task.Capability.Tools); len(missing) > 0 {
+				reason := fmt.Sprintf("节点能力工具子集越界：executor 注册全集缺少 %v（节点声明 %v），不降级执行", missing, task.Capability.Tools)
+				log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
+				terminatingCause = "react_loop_exit:error"
+				enterTerminating(terminatingCause)
+				a.terminateTask(task, taskID, reason, "capability_violation")
+				return
+			}
+			filtered := full.Filtered(task.Capability.Tools)
+			old := a.ToolSwapper.SwapToolRegistry(filtered)
+			defer a.ToolSwapper.SwapToolRegistry(old)
+			log.Printf("[agent %s] 任务 %s 节点能力生效：工具子集 %v（%d/%d 已注册）",
+				a.ID, taskID, task.Capability.Tools, filtered.RegisteredCount(), full.RegisteredCount())
+		}
+		// 模型覆盖：a.Model 在每次 LLM 请求前的 token 预测/截断
+		// （PredictNextPromptTokens/TruncateHistory）与 HistoryEntry.Model
+		// 记录处读取，替换后这些路径自动跟随；defer 恢复。wire 层请求模型
+		// 经 llm.WithModelOverride 写入 ctx——processTask 的 ctx 派生出每轮
+		// execCtx 直达 client.Chat，SDKClient 读取后替换请求模型（llm/client.go
+		// modelOverrideKey），因此覆盖对实际 API 请求同样生效。
+		if task.Capability.Model != "" {
+			origModel := a.Model
+			a.Model = task.Capability.Model
+			ctx = llm.WithModelOverride(ctx, task.Capability.Model)
+			defer func() { a.Model = origModel }()
+			log.Printf("[agent %s] 任务 %s 节点能力生效：模型覆盖 %s → %s", a.ID, taskID, origModel, task.Capability.Model)
+		}
 	}
 
 	// 清空文件缓存（任务切换时避免脏读）

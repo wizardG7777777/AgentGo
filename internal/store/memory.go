@@ -57,6 +57,9 @@ type MemoryTaskStore struct {
 	// historyEmitter 是事件溯源日志的发射接口。可选——nil 时跳过所有事件发射。
 	// 通过 SetHistoryEmitter 注入，避免对 session.HistoryLog 的硬依赖。
 	historyEmitter      session.HistoryEmitter
+	// capabilityChecker 是按认领方过滤节点能力任务的检查器。可选——nil 时
+	// QueryAvailable 不做能力过滤（兼容旧装配）。由 bootstrap 注入。
+	capabilityChecker   CapabilityChecker
 	planHooks           TaskPlanHooks
 	planMutationBacklog []TaskMutation
 	planMutationChanged chan struct{}
@@ -321,6 +324,16 @@ func (s *MemoryTaskStore) SetHistoryEmitter(e session.HistoryEmitter) {
 	s.historyEmitter = e
 }
 
+// SetCapabilityChecker 注入节点能力检查器（per-node capability）。nil 为合法
+// ——QueryAvailable 退化为不做能力过滤（兼容旧装配与单测默认路径）。
+// 必须在 bootstrap 早期调用（在任何轮询可能发生之前），与 SetHistoryEmitter
+// 同一装配约定。
+func (s *MemoryTaskStore) SetCapabilityChecker(c CapabilityChecker) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.capabilityChecker = c
+}
+
 // SetArtifactLog 注入 artifact 持久化 log。nil 为合法——表示禁用持久化。
 // 必须在 bootstrap 早期调用（在任何 AppendArtifact 可能发生之前），因为
 // log 写入不是事务化的——如果中途注入，启动前的 AppendArtifact 将不会
@@ -500,7 +513,7 @@ func (s *MemoryTaskStore) PublishTask(task *model.Task) error {
 
 	// task_published 事件此前有 schema/CLI 渲染/Reactor 白名单但从未发射（D4）。
 	// 与 history 同置于锁外：Emit 失败只降级为 WARNING，不影响主流程。
-	trace.Emit(trace.Event{
+	published := trace.Event{
 		Kind:         trace.KindTaskPublished,
 		TaskID:       task.ID,
 		Description:  task.Description,
@@ -510,7 +523,14 @@ func (s *MemoryTaskStore) PublishTask(task *model.Task) error {
 		Depth:        task.Depth,
 		ParentTaskID: task.ParentTaskID,
 		BatchID:      task.BatchID,
-	})
+	}
+	// 节点能力覆盖（per-node NodeCapability）随发布事件投影到 trace，
+	// 供 trace CLI / Reactor 观测该节点被声明的工具子集与模型覆盖。
+	if task.Capability != nil {
+		published.ToolsOverride = append([]string(nil), task.Capability.Tools...)
+		published.ModelOverride = task.Capability.Model
+	}
+	trace.Emit(published)
 	return nil
 }
 
@@ -524,7 +544,7 @@ func (s *MemoryTaskStore) ClaimTask(agentID string, taskID string) error {
 		return ErrTaskNotFound
 	}
 	if hooks.CanClaim != nil {
-		if err := hooks.CanClaim(cloneTask(task)); err != nil {
+		if err := hooks.CanClaim(agentID, cloneTask(task)); err != nil {
 			s.mu.Unlock()
 			return fmt.Errorf("%w: %v", ErrTaskClaimBlocked, err)
 		}
@@ -1014,7 +1034,7 @@ func (s *MemoryTaskStore) RecordLastResponse(taskID, content string) error {
 	return nil
 }
 
-func (s *MemoryTaskStore) QueryAvailable(eventType string) ([]*model.Task, error) {
+func (s *MemoryTaskStore) QueryAvailable(eventType, agentID string) ([]*model.Task, error) {
 	hooks := s.planHooksSnapshot()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1035,7 +1055,16 @@ func (s *MemoryTaskStore) QueryAvailable(eventType string) ([]*model.Task, error
 			continue
 		}
 		if hooks.CanClaim != nil {
-			if err := hooks.CanClaim(cloneTask(task)); err != nil {
+			if err := hooks.CanClaim(agentID, cloneTask(task)); err != nil {
+				continue
+			}
+		}
+		// 节点能力过滤：任务声明了工具子集且已注入检查器时，按认领方身份
+		// 判定（不变式：节点工具集 ⊆ 认领 runner 白名单）。agentID 为空串的
+		// 探测性查询无认领方身份，跳过本过滤（与 nil checker 同语义）。
+		if s.capabilityChecker != nil && agentID != "" &&
+			task.Capability != nil && len(task.Capability.Tools) > 0 {
+			if err := s.capabilityChecker(agentID, cloneTask(task)); err != nil {
 				continue
 			}
 		}
@@ -1579,6 +1608,7 @@ func (s *MemoryTaskStore) ExportSnapshot() []session.TaskSnapshot {
 			Supersedes:         copyStrings(task.Supersedes),
 			AcceptanceRunID:    task.AcceptanceRunID,
 			PlanMutationSource: task.PlanMutationSource,
+			Capability:         exportCapability(task.Capability),
 			LastHistory:        append([]byte(nil), task.LastHistory...),
 			ToolCalls:          exportToolCallSnapshots(s.toolCalls[task.ID]),
 		}
@@ -1690,6 +1720,7 @@ func (s *MemoryTaskStore) ImportSnapshot(tasks []session.TaskSnapshot) error {
 			Supersedes:         copyStrings(snap.Supersedes),
 			AcceptanceRunID:    snap.AcceptanceRunID,
 			PlanMutationSource: snap.PlanMutationSource,
+			Capability:         importCapability(snap.Capability),
 			LastHistory:        append([]byte(nil), snap.LastHistory...),
 		}
 		s.tasks[task.ID] = task
@@ -1769,6 +1800,31 @@ func importArtifactMeta(src map[string]session.ArtifactMetaSnapshot) map[string]
 		dst[k] = model.ArtifactMeta{SHA256: v.SHA256, Bytes: v.Bytes}
 	}
 	return dst
+}
+
+// exportCapability 把 model 侧节点能力声明转换为快照 DTO。nil 输入返回 nil，
+// 配合 omitempty 让无能力约束的任务快照与旧格式字节级一致。Tools 切片深拷贝，
+// 防止快照持有方修改穿透 store 内部状态。
+func exportCapability(src *model.NodeCapability) *session.CapabilitySnapshot {
+	if src == nil {
+		return nil
+	}
+	return &session.CapabilitySnapshot{
+		Tools: append([]string(nil), src.Tools...),
+		Model: src.Model,
+	}
+}
+
+// importCapability 把快照 DTO 还原为 model 侧节点能力声明。旧版本快照没有该
+// 字段（nil），返回 nil——任务按"无节点能力约束"处理。
+func importCapability(src *session.CapabilitySnapshot) *model.NodeCapability {
+	if src == nil {
+		return nil
+	}
+	return &model.NodeCapability{
+		Tools: append([]string(nil), src.Tools...),
+		Model: src.Model,
+	}
 }
 
 // formatTime 将 time.Time 格式化为 RFC3339 字符串。零值返回空字符串。

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"agentgo/internal/model"
 )
@@ -16,6 +17,12 @@ type digestNode struct {
 	Role         model.PlanNodeRole `json:"role"`
 	Dependencies []string           `json:"dependencies,omitempty"`
 	Supersedes   []string           `json:"supersedes,omitempty"`
+	// Capability 纳入 digest 的理由：节点能力（工具子集 / 模型覆盖）改变的是
+	// 该节点的执行边界与产出方式，属于图语义的一部分——同一 DAG 拓扑下把某
+	// 节点从「全权 worker」收窄为「只读调查」后，此前按旧能力通过的验收结论
+	// 不再可信。digest 变化会使绑定旧 digest 的验收（TargetGraphDigest）失效，
+	// 强制重新验收。nil 与「两字段皆空」归一为缺省，保持旧图 digest 不变。
+	Capability *model.NodeCapability `json:"capability,omitempty"`
 }
 
 // ComputeGraphDigest returns a deterministic digest of the current effective
@@ -64,11 +71,28 @@ func computeGraphDigest(p *model.Plan, excludeAcceptance bool) string {
 		nodes = append(nodes, digestNode{
 			TaskID: id, Title: n.Title, Role: n.Role,
 			Dependencies: deps, Supersedes: supersedes,
+			Capability: normalizeDigestCapability(n.Capability),
 		})
 	}
 	data, _ := json.Marshal(nodes)
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+// normalizeDigestCapability 把节点能力归一为稳定的 digest 输入：
+//   - nil 与「Tools/Model 皆空」归一为 nil（digest 与旧版图保持一致）；
+//   - Tools 排序去重——同一工具集合的不同书写顺序不得改变图语义，
+//     否则会造成 digest 抖动、误使有效验收失效。
+func normalizeDigestCapability(c *model.NodeCapability) *model.NodeCapability {
+	if c == nil {
+		return nil
+	}
+	tools := sortedUniqueStrings(c.Tools)
+	modelName := strings.TrimSpace(c.Model)
+	if len(tools) == 0 && modelName == "" {
+		return nil
+	}
+	return &model.NodeCapability{Tools: tools, Model: modelName}
 }
 
 func filterAcceptanceEdges(p *model.Plan, edges []string) []string {

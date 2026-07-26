@@ -54,7 +54,7 @@ func (f *fakeStore) RecordLastHistory(taskID string, history []byte) error {
 	return nil
 }
 
-func (f *fakeStore) QueryAvailable(eventType string) ([]*model.Task, error) {
+func (f *fakeStore) QueryAvailable(eventType, agentID string) ([]*model.Task, error) {
 	return nil, nil
 }
 func (f *fakeStore) GetTask(taskID string) (*model.Task, error) {

@@ -85,16 +85,16 @@ type failingQueryStore struct {
 	once    sync.Once
 }
 
-func (s *failingQueryStore) QueryAvailable(string) ([]*model.Task, error) {
+func (s *failingQueryStore) QueryAvailable(string, string) ([]*model.Task, error) {
 	s.once.Do(func() { close(s.entered) })
 	return nil, errors.New("simulated query failure")
 }
 
-func (s *queryObservingStore) QueryAvailable(eventType string) ([]*model.Task, error) {
+func (s *queryObservingStore) QueryAvailable(eventType, agentID string) ([]*model.Task, error) {
 	s.mu.Lock()
 	s.queries[eventType]++
 	s.mu.Unlock()
-	return s.TaskStore.QueryAvailable(eventType)
+	return s.TaskStore.QueryAvailable(eventType, agentID)
 }
 
 func (s *queryObservingStore) queryCount(eventType string) int {

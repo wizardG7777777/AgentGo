@@ -95,7 +95,7 @@ func TestRecoveryMissingAcceptanceRunnerCanResumeWithFreshRun(t *testing.T) {
 	initialTasks := store.NewMemoryTaskStore(make(chan model.Event, 16), 64, 1, 60)
 	initialCoordinator := plan.NewCoordinator(planStore, planTaskBackend{store: initialTasks})
 	initialCoordinator.SetAcceptanceVerifier(planAcceptanceVerifier{store: initialTasks, projectRoot: rootDir})
-	initialTasks.SetTaskPlanHooks(makeTaskPlanHooks(initialCoordinator))
+	initialTasks.SetTaskPlanHooks(makeTaskPlanHooks(initialCoordinator, nil))
 
 	root := &model.Task{Description: "recover acceptance", EventType: "__scheduler__"}
 	if err := initialTasks.PublishTask(root); err != nil {
@@ -139,7 +139,7 @@ func TestRecoveryMissingAcceptanceRunnerCanResumeWithFreshRun(t *testing.T) {
 	recoveredTasks := store.NewMemoryTaskStore(make(chan model.Event, 16), 64, 1, 60)
 	recoveredCoordinator := plan.NewCoordinator(planStore, planTaskBackend{store: recoveredTasks})
 	recoveredCoordinator.SetAcceptanceVerifier(planAcceptanceVerifier{store: recoveredTasks, projectRoot: rootDir})
-	recoveredTasks.SetTaskPlanHooks(makeTaskPlanHooks(recoveredCoordinator))
+	recoveredTasks.SetTaskPlanHooks(makeTaskPlanHooks(recoveredCoordinator, nil))
 	sys := &System{Store: recoveredTasks, PlanCoordinator: recoveredCoordinator}
 	if err := restoreRuntimeSnapshot(sys, &session.Snapshot{Tasks: recoveredSnapshots}); err != nil {
 		t.Fatalf("restoreRuntimeSnapshot: %v", err)
@@ -193,7 +193,7 @@ func TestRecoveryAbandonsUnboundPendingAcceptancePublication(t *testing.T) {
 	planStore := plan.NewMemoryStore()
 	initialTasks := store.NewMemoryTaskStore(make(chan model.Event, 16), 64, 1, 60)
 	initialCoordinator := plan.NewCoordinator(planStore, nil)
-	initialTasks.SetTaskPlanHooks(makeTaskPlanHooks(initialCoordinator))
+	initialTasks.SetTaskPlanHooks(makeTaskPlanHooks(initialCoordinator, nil))
 	root := &model.Task{Description: "crash during acceptance publish", EventType: "__scheduler__"}
 	if err := initialTasks.PublishTask(root); err != nil {
 		t.Fatal(err)
@@ -230,7 +230,7 @@ func TestRecoveryAbandonsUnboundPendingAcceptancePublication(t *testing.T) {
 	recoveredTasks := store.NewMemoryTaskStore(make(chan model.Event, 16), 64, 1, 60)
 	recoveredCoordinator := plan.NewCoordinator(planStore, planTaskBackend{store: recoveredTasks})
 	recoveredCoordinator.SetAcceptanceVerifier(planAcceptanceVerifier{store: recoveredTasks, projectRoot: rootDir})
-	recoveredTasks.SetTaskPlanHooks(makeTaskPlanHooks(recoveredCoordinator))
+	recoveredTasks.SetTaskPlanHooks(makeTaskPlanHooks(recoveredCoordinator, nil))
 	sys := &System{Store: recoveredTasks, PlanCoordinator: recoveredCoordinator}
 	if err := restoreRuntimeSnapshot(sys, &session.Snapshot{Tasks: initialTasks.ExportSnapshot()}); err != nil {
 		t.Fatal(err)
@@ -269,7 +269,7 @@ func TestRecoveryCancelsRetiredTaskLeaseAndReconcilesUsage(t *testing.T) {
 	planStore := plan.NewMemoryStore()
 	initialTasks := store.NewMemoryTaskStore(make(chan model.Event, 16), 64, 1, 60)
 	initialCoordinator := plan.NewCoordinator(planStore, planTaskBackend{store: initialTasks})
-	initialTasks.SetTaskPlanHooks(makeTaskPlanHooks(initialCoordinator))
+	initialTasks.SetTaskPlanHooks(makeTaskPlanHooks(initialCoordinator, nil))
 	root := &model.Task{Description: "supersede crash recovery", EventType: "__scheduler__"}
 	if err := initialTasks.PublishTask(root); err != nil {
 		t.Fatal(err)
@@ -310,7 +310,7 @@ func TestRecoveryCancelsRetiredTaskLeaseAndReconcilesUsage(t *testing.T) {
 
 	recoveredTasks := store.NewMemoryTaskStore(make(chan model.Event, 16), 64, 1, 60)
 	recoveredCoordinator := plan.NewCoordinator(planStore, planTaskBackend{store: recoveredTasks})
-	recoveredTasks.SetTaskPlanHooks(makeTaskPlanHooks(recoveredCoordinator))
+	recoveredTasks.SetTaskPlanHooks(makeTaskPlanHooks(recoveredCoordinator, nil))
 	sys := &System{Store: recoveredTasks, PlanCoordinator: recoveredCoordinator}
 	if err := restoreRuntimeSnapshot(sys, &session.Snapshot{Tasks: initialTasks.ExportSnapshot()}); err != nil {
 		t.Fatal(err)

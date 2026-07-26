@@ -160,7 +160,10 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	// 由 exec-mode-guard Gate 拦截）。与 scheduler.New 内同款装配对称。
 	wrapFileWriteApproval(toolReg, deps, rt.InstanceID, interactionWaitHook)
 
-	executor := agent.NewLLMExecutor(
+	// per-node 能力（model.NodeCapability）：拿 *LLMExecutor 结构句柄——
+	// Execute 方法值作为 TaskExecutor，句柄本身接到 Agent.ToolSwapper，
+	// 让 processTask 在节点声明工具子集时换入过滤视图、任务结束恢复。
+	llmExec := agent.NewSwappableLLMExecutor(
 		deps.LLMClient,
 		toolReg,
 		deps.GateReg,
@@ -169,6 +172,7 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 		rt.TeamAwareness,
 		rt.SystemPrompt,
 	)
+	executor := agent.TaskExecutor(llmExec.Execute)
 	if deps.PlanCoordinator != nil {
 		inner := executor
 		executor = func(ctx context.Context, task *model.Task, depResults map[string]string, history []agent.HistoryEntry) (agent.ExecuteResult, error) {
@@ -212,6 +216,7 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 		rt.AgentMaxLoops,
 	)
 	a.PlanIDScope = rt.PlanIDScope
+	a.ToolSwapper = llmExec // per-node 能力：按任务换入/恢复工具过滤视图
 	a.CancelRegistry = deps.CancelRegistry
 	a.MaxRetries = rt.TaskMaxRetries
 	// E3：空闲退出阈值从配置链路接入（AgentRuntimeConfig.IdleThreshold，

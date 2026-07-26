@@ -304,3 +304,21 @@ func TestSchedulerSystemPrompt_PreservesUserOriginalConstraints(t *testing.T) {
 			preserveSignals)
 	}
 }
+
+// TestSchedulerSystemPrompt_NodeCapabilityGuidance 断言 prompt 含 publish_task
+// tools/model 节点能力声明小节，且讲清"子集 ⊆ 现存路由白名单"硬约束（越界
+// 任务无人认领、等 claim_starvation 告警修复）与裁剪后的收尾通道
+// （submit_task_result 或纯文本）。
+func TestSchedulerSystemPrompt_NodeCapabilityGuidance(t *testing.T) {
+	prompt := schedulerSystemPrompt
+	required := []string{
+		"节点能力声明",
+		"claim_starvation",
+		"submit_task_result",
+	}
+	for _, phrase := range required {
+		if !strings.Contains(prompt, phrase) {
+			t.Errorf("schedulerSystemPrompt 缺少节点能力声明指引 %q", phrase)
+		}
+	}
+}

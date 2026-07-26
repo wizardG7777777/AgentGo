@@ -85,7 +85,11 @@ type TaskStore interface {
 
 	// Non-atomic read operations (snapshot, no lock required)
 
-	QueryAvailable(eventType string) ([]*model.Task, error)
+	// QueryAvailable 返回 eventType 路由上当前可认领的 pending 任务。
+	// agentID 是轮询方身份：注入 CapabilityChecker 后，节点能力
+	// （task.Capability.Tools）超出该 agent 白名单的任务被过滤；
+	// 无认领方身份的探测性调用（如 watchdog）传空串，跳过能力过滤。
+	QueryAvailable(eventType, agentID string) ([]*model.Task, error)
 	GetTask(taskID string) (*model.Task, error)
 	GetDependencyResults(taskID string) (map[string]string, error)
 	// GetDependencyArtifacts 返回 taskID 所有依赖任务实际写入的文件路径，
@@ -103,6 +107,15 @@ type TaskStore interface {
 
 	ScanAll() ([]*model.Task, error)
 }
+
+// CapabilityChecker 按认领方身份判定其是否满足任务的节点能力要求
+// （model.Task.Capability）。返回非 nil error 表示该 agent 不可认领此任务：
+// QueryAvailable 会把它从该 agent 的可见集合中过滤掉。
+//
+// 由 bootstrap 经 SetCapabilityChecker 注入（典型实现：agentID → runner 工具
+// 白名单，校验 task.Capability.Tools ⊆ 白名单）；nil 时不过滤（兼容旧装配）。
+// agentID 为空串的探测性查询不调用本检查（无认领方身份，无从判定）。
+type CapabilityChecker func(agentID string, task *model.Task) error
 
 type cancelSourceTransitioner interface {
 	TransitionStateWithCancelSource(taskID string, from, to model.TaskStatus, cancelSource string) error

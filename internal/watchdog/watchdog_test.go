@@ -360,7 +360,7 @@ func TestWatchdog_PlanClaimHoldDoesNotConsumeNoRouteGrace(t *testing.T) {
 	w.now = func() time.Time { return now }
 	mem := s.(*store.MemoryTaskStore)
 	mem.SetTaskPlanHooks(store.TaskPlanHooks{
-		CanClaim: func(*model.Task) error { return errors.New("plan paused") },
+		CanClaim: func(string, *model.Task) error { return errors.New("plan paused") },
 	})
 
 	task := &model.Task{Description: "held by plan", PlanID: "plan-paused", EventType: "team:work"}

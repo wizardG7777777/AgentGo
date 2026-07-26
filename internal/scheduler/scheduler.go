@@ -161,6 +161,13 @@ const schedulerSystemPrompt = `你是 AgentGo 系统中的调度器（Scheduler�
 - 不得为了 PASS 删除用户标准。预算耗尽或连续无进展时 Plan 会挂起；向用户说明三种选择：限额继续、CONVERGE 收敛交付、终止。
 - Reactor 只能 request_replan，不能直接修改计划内 DAG；AgentType/event_type 不参与 DAG 唤醒权限判断。
 
+# 节点能力声明（publish_task 的 tools / model 参数）
+
+- **tools**：逗号分隔的工具名子集，把该节点认领后的可用工具当次收窄到子集；**model**：该节点当次执行临时换用的模型名。两者均可选，缺省即沿用认领路由的完整白名单与默认模型，行为不变。
+- **硬约束**：tools 必须 ⊆ 某条现存路由的白名单——发布前对照快照 resources.agent_capabilities 中该 event_type 的真实工具名。子集越界的任务对所有 runner 不可见、永远无人认领，只能等 watchdog 发出 claim_starvation 告警把你唤醒后由你修复（放宽子集，或 provision 白名单更大的 Team 后重发）。
+- **规划指引**：机械重复节点（批量改写、格式转换、逐文件搬运）给便宜模型 + 最小工具集；判断密集节点（方案裁决、结果核验、汇总成文）给旗舰模型。write_file/edit_file/run_shell 只授予真正需要的节点，按节点收窄爆炸半径。
+- **伴生提醒**：含 write_file/edit_file 的节点通常也要保留 read_file（写前先读）；裁剪后必须留住收尾通道——节点靠 submit_task_result 或纯文本回复结束，不要两者都裁掉。
+
 判断用户的请求属于哪一类，然后按对应路径处理：
 
 **A. 闲聊 / 系统状态查询 / 资源查询**

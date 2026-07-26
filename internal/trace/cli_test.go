@@ -35,7 +35,7 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		ev   Event
 		want []string
 	}{
-		{"task_published", Event{Kind: KindTaskPublished, PublishedBy: "scheduler", Dependencies: []string{"dep"}, EventType: "worker", Priority: "high", Depth: 2, Description: "work"}, []string{"by=scheduler", "deps=[dep]", "type=worker", "priority=high", "depth=2", `desc="work"`}},
+		{"task_published", Event{Kind: KindTaskPublished, PublishedBy: "scheduler", Dependencies: []string{"dep"}, EventType: "worker", Priority: "high", Depth: 2, ToolsOverride: []string{"read_file", "web_fetch"}, ModelOverride: "deepseek-r1", Description: "work"}, []string{"by=scheduler", "deps=[dep]", "type=worker", "priority=high", "depth=2", "tools_override=[read_file web_fetch]", "model_override=deepseek-r1", `desc="work"`}},
 		{"task_claimed", Event{Kind: KindTaskClaimed, Transition: transition}, []string{"prev=processing", "new=failed", "cause=test-cause"}},
 		{"task_submitted", Event{Kind: KindTaskSubmitted, OutputLen: 10, LoopsUsed: 2}, []string{"output_len=10", "loops_used=2"}},
 		{"task_completed", Event{Kind: KindTaskCompleted, OutputLen: 10, LoopsUsed: 2, Transition: transition}, []string{"cause=test-cause", "output_len=10", "loops_used=2"}},

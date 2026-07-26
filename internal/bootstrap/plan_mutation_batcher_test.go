@@ -352,7 +352,7 @@ func TestPlanMutationBatcherEndToEndThroughStore(t *testing.T) {
 	t.Cleanup(func() { _ = s.Close() })
 	b := newPlanMutationBatcher(c)
 	t.Cleanup(b.Stop)
-	hooks := makeTaskPlanHooks(c)
+	hooks := makeTaskPlanHooks(c, nil)
 	hooks.Mutated = b.submit
 	s.SetTaskPlanHooks(hooks)
 

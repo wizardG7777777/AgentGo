@@ -36,7 +36,11 @@ type TaskPlanHooks struct {
 	// CanClaim is evaluated immediately before a pending Task is exposed or
 	// claimed. It lets the Plan control plane suspend new work while a Plan is
 	// paused/blocked without making store depend on internal/plan.
-	CanClaim func(task *model.Task) error
+	//
+	// agentID 是发起查询/认领的代理 ID：QueryAvailable 轮询传入轮询者 ID，
+	// 无认领方身份的探测性查询（如 watchdog）传空串；ClaimTask 传入认领者 ID。
+	// 实现方需要按认领方身份判定（如 per-node 能力）时使用，不需要时可忽略。
+	CanClaim func(agentID string, task *model.Task) error
 	// CanEvict protects Task facts still referenced by a live Plan from the
 	// global terminal FIFO. Returning false pins the Task until a later sweep.
 	CanEvict func(task *model.Task) bool

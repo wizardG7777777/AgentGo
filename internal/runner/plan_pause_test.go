@@ -64,7 +64,7 @@ func TestRunnerStopsBeforeNextExecuteWhenPlanBecomesBlocked(t *testing.T) {
 	}
 
 	taskStore := store.NewMemoryTaskStore(nil, 32, 1, 60)
-	taskStore.SetTaskPlanHooks(store.TaskPlanHooks{CanClaim: func(task *model.Task) error {
+	taskStore.SetTaskPlanHooks(store.TaskPlanHooks{CanClaim: func(agentID string, task *model.Task) error {
 		if task.PlanID == "" {
 			return nil
 		}

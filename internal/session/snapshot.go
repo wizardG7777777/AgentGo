@@ -75,6 +75,10 @@ type TaskSnapshot struct {
 	Supersedes         []string                        `json:"supersedes,omitempty"`
 	AcceptanceRunID    string                          `json:"acceptance_run_id,omitempty"`
 	PlanMutationSource string                          `json:"plan_mutation_source,omitempty"`
+	// Capability 是任务的节点能力声明（工具子集 / 模型覆盖）的快照形式。
+	// 纯增量字段：旧版本快照没有它，Unmarshal 得 nil，按"无节点能力约束"处理，
+	// 因此不提升 currentSnapshotVersion（与 ArtifactMeta/ToolCalls 同策略）。
+	Capability *CapabilitySnapshot `json:"capability,omitempty"`
 	// LastHistory preserves the completed ReAct rounds of a suspended/retried
 	// Task. Without it, a resumed Task can repeat tool side effects after a
 	// process restart even though in-memory retry already avoids that replay.
@@ -91,6 +95,14 @@ type TaskSnapshot struct {
 type ArtifactMetaSnapshot struct {
 	SHA256 string `json:"sha256,omitempty"`
 	Bytes  int64  `json:"bytes,omitempty"`
+}
+
+// CapabilitySnapshot 是 model.NodeCapability 的可序列化形式。
+// 与 ToolCallSnapshot / ArtifactMetaSnapshot 同策略——session 不 import
+// model/store，快照边界拥有自己的 DTO，由 store 在导出/导入时做显式转换。
+type CapabilitySnapshot struct {
+	Tools []string `json:"tools,omitempty"` // 非空 = 当次任务工具子集
+	Model string   `json:"model,omitempty"` // 非空 = 当次任务模型覆盖
 }
 
 // ToolCallSnapshot is the serialization-only form of store.ToolCallRecord.

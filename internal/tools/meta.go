@@ -98,6 +98,8 @@ func (g MetaGroup) Register(r *agent.ToolRegistry) {
 				Enum("priority", "任务优先级，默认 normal", []string{"low", "normal", "high"}, false).
 				String("dependencies", "逗号分隔的依赖任务 UUID 列表。每个 ID 必须是之前 publish_task 调用返回的真实 task UUID（形如 7b52b232-4e9b-4b97-8bbc-f3d5927dc814），禁止使用占位符（如 \"task-part1\"、\"A\"、\"<id>\"）或自造 ID。若被依赖任务尚未发布，请先发布被依赖任务、从返回值中读取 id 之后再发布当前任务。留空表示无依赖", false).
 				String("expected_artifacts", "逗号分隔的预期产出文件路径列表（相对项目根的相对路径）。任务结束时系统会校验这些文件是否真的写入；缺失则任务失败重试。强烈建议为'报告/总结/文档'类任务填写此字段以防止 report-only 失败", false).
+				String("tools", "逗号分隔的工具名子集：限定本 DAG 节点只允许使用这些工具（必须是认领 Agent 白名单的子集，否则无人能认领）。仅 Scheduler 计划控制面可设置；留空表示不限制", false).
+				String("model", "本 DAG 节点的模型覆盖（如 deepseek-r1）。仅 Scheduler 计划控制面可设置；留空表示沿用认领 Agent 的默认模型", false).
 				Int("max_concurrency", "该任务允许几个 Agent 同时认领执行，默认 1（单交付物任务必须是 1，否则多个 Agent 会重复执行同一份工作并互相覆盖产出）。仅当确实需要多个 Agent 冗余/分片执行同一任务时才设为 >1", false).
 				Build(),
 			g.publishTask,
@@ -243,6 +245,39 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 			}
 		}
 	}
+
+	// 节点能力覆盖（per-node NodeCapability）：tools 子集 + model 覆盖。
+	// 三道校验：a. 写入权限 → b. 静态合法 → c. 伴生关系软警告（不拒绝）。
+	toolsArg, _ := args["tools"].(string)
+	modelArg, _ := args["model"].(string)
+	// a. 写入权限：节点能力只能由控制面（PlanMutationSource=scheduler）写入。
+	//    普通 Worker / Reactor 携带任一参数即拒绝——它们无权改变 DAG 节点的
+	//    执行边界，否则认领约束（子集 ⊆ 白名单）会被非控制面绕过。
+	if (strings.TrimSpace(toolsArg) != "" || strings.TrimSpace(modelArg) != "") &&
+		g.PlanMutationSource != "scheduler" {
+		return "", fmt.Errorf("发布任务被拒绝: tools/model 节点能力参数只能由 Scheduler 计划控制面设置（当前 PlanMutationSource=%q）", g.PlanMutationSource)
+	}
+	var capabilityWarnings []string
+	if strings.TrimSpace(toolsArg) != "" || strings.TrimSpace(modelArg) != "" {
+		var capTools []string
+		for _, name := range strings.Split(toolsArg, ",") {
+			name = strings.TrimSpace(name)
+			if name != "" {
+				capTools = append(capTools, name)
+			}
+		}
+		// b. 静态合法：工具名必须真实存在（与 tool_profiles 同一权威清单）；
+		//    model 只做非空/去空白校验——模型名是否可用由 LLM 端点决定，
+		//    发布面不维护模型清单。
+		if err := ValidateToolNames(capTools); err != nil {
+			return "", fmt.Errorf("发布任务被拒绝: tools 参数含未注册工具名: %w", err)
+		}
+		capModel := strings.TrimSpace(modelArg)
+		task.Capability = &model.NodeCapability{Tools: capTools, Model: capModel}
+		// c. 伴生关系软警告：子集明显不自洽时在返回文本里提示，但不硬拒——
+		//    合法极简节点（如纯 web_fetch 调查节点）不应被误伤。
+		capabilityWarnings = nodeCapabilityWarnings(capTools)
+	}
 	if g.RouteValidator != nil && len(task.ExpectedArtifacts) > 0 &&
 		!g.RouteValidator.CanRouteForPlan(parentPlanID, eventType, "write_file") &&
 		!g.RouteValidator.CanRouteForPlan(parentPlanID, eventType, "edit_file") {
@@ -289,7 +324,44 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 		}
 	}
 
-	return fmt.Sprintf("已创建任务: id=%s, depth=%d, description=%s", task.ID, childDepth, desc), nil
+	result := fmt.Sprintf("已创建任务: id=%s, depth=%d, description=%s", task.ID, childDepth, desc)
+	if len(capabilityWarnings) > 0 {
+		result += "；节点能力警告: " + strings.Join(capabilityWarnings, "；")
+	}
+	return result, nil
+}
+
+// nodeCapabilityWarnings 对节点工具子集做伴生关系检查，返回软警告列表。
+// 只提示明显不自洽的组合，不拒绝——合法极简节点（纯 web_fetch 调查等）
+// 不应被误伤；执行类工具集是否够用的最终判定在认领侧（子集 ⊆ 白名单）。
+func nodeCapabilityWarnings(capTools []string) []string {
+	if len(capTools) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(capTools))
+	for _, name := range capTools {
+		set[name] = true
+	}
+	var warnings []string
+	// require-read-before-write Gate 要求写前必须先读：子集带写工具却不带
+	// read_file 时，第一次写会被该 Gate 永远拦截，节点必然失败重试。
+	if (set["write_file"] || set["edit_file"]) && !set["read_file"] {
+		warnings = append(warnings, "tools 含 write_file/edit_file 但不含 read_file——require-read-before-write Gate 会拦截所有写入，节点将无法产出文件")
+	}
+	// 收尾通道提示：子集不含任何执行类工具（读/写/web/shell）时，节点只能
+	// 以纯文字响应收尾；若发布方期待它操作文件或网络，结果必然落空。
+	execTools := []string{"read_file", "list_dir", "grep_search", "glob_search", "write_file", "edit_file", "web_search", "web_fetch", "run_shell"}
+	hasExec := false
+	for _, name := range execTools {
+		if set[name] {
+			hasExec = true
+			break
+		}
+	}
+	if !hasExec {
+		warnings = append(warnings, "tools 子集不含任何执行类工具（read/write/web/shell），该节点只能以纯文字响应收尾")
+	}
+	return warnings
 }
 
 // sendMessage 是 worker.MakeSendMessageTool 的内联端口，避免循环依赖。

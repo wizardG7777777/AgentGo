@@ -37,7 +37,7 @@ func TestQueryAvailable_PriorityThenFIFOWithStableIDTieBreak(t *testing.T) {
 
 	want := []string{"high-same-a", "high-same-b", "high-new", "low-old"}
 	for round := 0; round < 5; round++ {
-		got, err := s.QueryAvailable("code")
+		got, err := s.QueryAvailable("code", "agent-fifo")
 		if err != nil {
 			t.Fatalf("QueryAvailable: %v", err)
 		}

@@ -24,7 +24,7 @@ func newPlannedStore(t *testing.T, root string) (*store.MemoryTaskStore, *plan.C
 	planStore := plan.NewMemoryStore()
 	coordinator := plan.NewCoordinator(planStore, planTaskBackend{store: taskStore})
 	coordinator.SetAcceptanceVerifier(planAcceptanceVerifier{store: taskStore, projectRoot: root})
-	taskStore.SetTaskPlanHooks(makeTaskPlanHooks(coordinator))
+	taskStore.SetTaskPlanHooks(makeTaskPlanHooks(coordinator, nil))
 	return taskStore, coordinator
 }
 
@@ -151,7 +151,7 @@ func TestTerminalActiveControllerCanBeReclaimedAfterSnapshotRestore(t *testing.T
 	snapshots = append(snapshots, worker)
 
 	restored := store.NewMemoryTaskStore(make(chan model.Event, 16), 32, 1, 60)
-	restored.SetTaskPlanHooks(makeTaskPlanHooks(coordinator))
+	restored.SetTaskPlanHooks(makeTaskPlanHooks(coordinator, nil))
 	if err := restored.ImportSnapshot(snapshots); err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestTerminalActiveControllerCanBeReclaimedAfterSnapshotRestore(t *testing.T
 	if restoredController.Status != model.TaskStatusPending || len(restoredController.Agents) != 0 {
 		t.Fatalf("restored controller lease=%+v, want pending with no agents", restoredController)
 	}
-	available, err := restored.QueryAvailable("__scheduler__")
+	available, err := restored.QueryAvailable("__scheduler__", "scheduler-after-restart")
 	if err != nil || len(available) != 1 || available[0].ID != root.ID {
 		t.Fatalf("terminal active controller not queryable: available=%+v err=%v", available, err)
 	}
@@ -778,7 +778,7 @@ func TestPlanRuntimePausedAndBlockedTasksCannotBeClaimed(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			available, err := taskStore.QueryAvailable("")
+			available, err := taskStore.QueryAvailable("", "worker")
 			if err != nil || !containsTaskID(available, child.ID) {
 				t.Fatalf("pending planned task was not initially available: tasks=%v err=%v", taskIDs(available), err)
 			}
@@ -786,7 +786,7 @@ func TestPlanRuntimePausedAndBlockedTasksCannotBeClaimed(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			available, err = taskStore.QueryAvailable("")
+			available, err = taskStore.QueryAvailable("", "worker")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -994,7 +994,7 @@ func TestFormalAcceptanceRejectsForgedCommandExit(t *testing.T) {
 func TestCurrentPlanNodesArePinnedAgainstTerminalFIFO(t *testing.T) {
 	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 64), 1, 1, 300)
 	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), planTaskBackend{store: taskStore})
-	taskStore.SetTaskPlanHooks(makeTaskPlanHooks(coordinator))
+	taskStore.SetTaskPlanHooks(makeTaskPlanHooks(coordinator, nil))
 	root := &model.Task{Description: "large plan", EventType: "__scheduler__"}
 	if err := taskStore.PublishTask(root); err != nil {
 		t.Fatal(err)

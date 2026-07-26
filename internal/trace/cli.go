@@ -1264,6 +1264,13 @@ func formatEventDetails(ev Event) string {
 			parts = append(parts, fmt.Sprintf("priority=%s", ev.Priority))
 		}
 		parts = append(parts, fmt.Sprintf("depth=%d", ev.Depth))
+		// 节点能力覆盖：仅发布方显式声明时出现（NodeCapability 投影）。
+		if len(ev.ToolsOverride) > 0 {
+			parts = append(parts, fmt.Sprintf("tools_override=%v", ev.ToolsOverride))
+		}
+		if ev.ModelOverride != "" {
+			parts = append(parts, fmt.Sprintf("model_override=%s", ev.ModelOverride))
+		}
 		if ev.Description != "" {
 			parts = append(parts, fmt.Sprintf("desc=%q", truncate(ev.Description, 80)))
 		}

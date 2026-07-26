@@ -114,6 +114,45 @@ func TestSDKClient_OpenRouterReasoningEffortIsMapped(t *testing.T) {
 	}
 }
 
+func TestSDKClient_ModelOverrideViaContext(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(openaiResponse("ok", nil))
+	}))
+	defer server.Close()
+
+	client := NewSDKClient(server.URL, "key", "gpt-4o", "", "", 30*time.Second)
+
+	// 无覆盖：请求模型为构造期模型。
+	if _, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "a"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := body["model"]; got != "gpt-4o" {
+		t.Fatalf("无覆盖时 model = %#v, want gpt-4o", got)
+	}
+
+	// per-node 能力：ctx 携带覆盖时替换 wire 请求模型。
+	ctx := WithModelOverride(context.Background(), "gpt-4o-mini")
+	if _, err := client.Chat(ctx, []Message{{Role: "user", Content: "b"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := body["model"]; got != "gpt-4o-mini" {
+		t.Fatalf("覆盖时 model = %#v, want gpt-4o-mini", got)
+	}
+
+	// 空串覆盖 = 不覆盖（保持构造期模型）。
+	if _, err := client.Chat(WithModelOverride(context.Background(), ""), []Message{{Role: "user", Content: "c"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := body["model"]; got != "gpt-4o" {
+		t.Fatalf("空串覆盖时 model = %#v, want gpt-4o", got)
+	}
+}
+
 func TestSDKClient_StreamingAccumulatesContentUsageAndExtras(t *testing.T) {
 	var requestBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

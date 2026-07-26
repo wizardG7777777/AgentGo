@@ -349,7 +349,7 @@ func (c *captureStore) FailTaskBySystem(string, string) error                   
 func (c *captureStore) RetryRollback(string, string, string) error                 { return nil }
 func (c *captureStore) AppendOutput(string, string, string) error                  { return nil }
 func (c *captureStore) RecordLastHistory(string, []byte) error                     { return nil }
-func (c *captureStore) QueryAvailable(string) ([]*model.Task, error)               { return nil, nil }
+func (c *captureStore) QueryAvailable(string, string) ([]*model.Task, error)     { return nil, nil }
 func (c *captureStore) GetTask(string) (*model.Task, error)                        { return nil, nil }
 func (c *captureStore) GetDependencyResults(string) (map[string]string, error)     { return nil, nil }
 func (c *captureStore) GetDependencyArtifacts(string) (map[string][]string, error) { return nil, nil }

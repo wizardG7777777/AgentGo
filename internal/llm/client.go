@@ -82,6 +82,28 @@ type StreamEvent struct {
 
 type streamHandlerKey struct{}
 
+// modelOverrideKey 是 per-call 模型覆盖的 context 键。
+// 用于 per-node 能力（model.NodeCapability.Model）：Agent 在任务入口把节点
+// 指定的模型写入 ctx，SDKClient.Chat 读取后替换请求模型——wire 层模型不再
+// 绑定在客户端构造期。未设置时行为与之前完全一致（用 c.model）。
+type modelOverrideKey struct{}
+
+// WithModelOverride 把本次调用链的 LLM 请求模型覆盖为 model。
+// 空串时原样返回（不覆盖）。仅 SDKClient 生产路径消费该值；
+// 测试 fake Client 忽略 ctx 时自然退回各自构造期模型。
+func WithModelOverride(ctx context.Context, model string) context.Context {
+	if model == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, modelOverrideKey{}, model)
+}
+
+// modelOverrideFromContext 读取 per-call 模型覆盖；未设置返回空串。
+func modelOverrideFromContext(ctx context.Context) string {
+	m, _ := ctx.Value(modelOverrideKey{}).(string)
+	return m
+}
+
 // WithStreamHandler installs an optional synchronous observer for streamed
 // answer text. The handler must return quickly; callers that need throttling or
 // fan-out should coalesce snapshots before publishing them to a UI.
@@ -164,6 +186,10 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 
 	params := openai.ChatCompletionNewParams{
 		Model: c.model,
+	}
+	// per-call 模型覆盖（per-node 能力）：ctx 携带时替换 wire 请求模型。
+	if m := modelOverrideFromContext(ctx); m != "" {
+		params.Model = openai.ChatModel(m)
 	}
 	var reasoningOpts []option.RequestOption
 	if c.request.ReasoningEffort != "" {

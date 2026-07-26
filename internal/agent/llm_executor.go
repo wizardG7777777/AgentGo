@@ -8,6 +8,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"agentgo/internal/gate"
@@ -132,6 +133,84 @@ func truncateForLog(args map[string]any, maxLen int) string {
 	return s
 }
 
+// LLMExecutor 是基于 LLM 的 TaskExecutor 实现：每次 Execute 对应 ReAct 循环中
+// 的一步（调用 LLM → 有 tool calls 则串行执行并返回 ToolCalled=true，否则
+// ToolCalled=false 表示任务完成）。
+//
+// 它持有"当前生效"的工具注册表，支持按任务换入/恢复过滤视图——这是 per-node
+// 能力（model.NodeCapability.Tools）在执行面的落点：processTask 在任务声明了
+// 工具子集时经 SwapToolRegistry 换入 ToolRegistry.Filtered 视图，任务结束恢复。
+// Agent 串行处理任务，正常路径无并发竞争；toolsMu 仅作防御性保护。
+type LLMExecutor struct {
+	client         llm.Client
+	gateReg        *gate.Registry
+	recordToolCall func(string, store.ToolCallRecord)
+	teamAwareness  string
+	sysPrompt      string
+	toolsMu        sync.RWMutex
+	tools          *ToolRegistry
+}
+
+// ToolRegistrySwapper 是支持按任务替换工具注册表的 executor 能力接口
+// （当前唯一实现是 *LLMExecutor）。processTask 只依赖本接口，不依赖具体类型。
+type ToolRegistrySwapper interface {
+	// SwapToolRegistry 原子替换当前生效的工具注册表，返回被替换的旧 registry，
+	// 供调用方在任务边界恢复。
+	SwapToolRegistry(reg *ToolRegistry) (old *ToolRegistry)
+	// ToolRegistry 返回当前生效的工具注册表（可能是上一任务边界换入的过滤视图；
+	// processTask 在任务入口调用时即为该 agent 的完整注册集）。
+	ToolRegistry() *ToolRegistry
+}
+
+// 编译期断言：*LLMExecutor 必须实现 ToolRegistrySwapper。
+var _ ToolRegistrySwapper = (*LLMExecutor)(nil)
+
+// SwapToolRegistry 实现 ToolRegistrySwapper。reg 为 nil 是编程错误（会让后续
+// Execute  nil 解引用），此处直接拒绝并保持原 registry。
+func (e *LLMExecutor) SwapToolRegistry(reg *ToolRegistry) (old *ToolRegistry) {
+	if reg == nil {
+		return e.ToolRegistry()
+	}
+	e.toolsMu.Lock()
+	defer e.toolsMu.Unlock()
+	old = e.tools
+	e.tools = reg
+	return old
+}
+
+// ToolRegistry 实现 ToolRegistrySwapper。
+func (e *LLMExecutor) ToolRegistry() *ToolRegistry {
+	e.toolsMu.RLock()
+	defer e.toolsMu.RUnlock()
+	return e.tools
+}
+
+// newLLMExecutor 是 LLMExecutor 的统一构造入口。storeView 当前未在 executor
+// 内部使用，仅透传以便未来扩展（如未来需要在 executor 内直接查询任务状态再启用）。
+func newLLMExecutor(
+	client llm.Client,
+	tools *ToolRegistry,
+	gateReg *gate.Registry,
+	storeView store.StoreHookView,
+	recordToolCall func(string, store.ToolCallRecord),
+	teamAwareness string,
+	systemPrompt ...string,
+) *LLMExecutor {
+	_ = storeView
+	var sysPrompt string
+	if len(systemPrompt) > 0 {
+		sysPrompt = systemPrompt[0]
+	}
+	return &LLMExecutor{
+		client:         client,
+		tools:          tools,
+		gateReg:        gateReg,
+		recordToolCall: recordToolCall,
+		teamAwareness:  teamAwareness,
+		sysPrompt:      sysPrompt,
+	}
+}
+
 // NewLLMExecutor 创建一个基于 LLM 的 TaskExecutor。
 // 每次调用对应 ReAct 循环中的一步：调用 LLM → 如果有 tool calls 则执行并返回 ToolCalled=true，
 // 否则返回 ToolCalled=false 表示任务完成。
@@ -149,6 +228,10 @@ func truncateForLog(args map[string]any, maxLen int) string {
 // systemPrompt 为可选参数，非空时作为 system/developer 消息注入到对话开头。
 // teamAwareness 为可选参数，描述系统中其他 Agent 类型的能力边界，
 // 非空时注入到每条 user prompt 的 task description 之前。
+//
+// 本函数保持返回 TaskExecutor 函数形态（兼容全部既有调用方）。需要按任务
+// 替换工具注册表（per-node 能力）的装配方请改用 NewSwappableLLMExecutor
+// 拿到 *LLMExecutor 句柄，并把 Agent.ToolSwapper 一并接线。
 func NewLLMExecutor(
 	client llm.Client,
 	tools *ToolRegistry,
@@ -158,20 +241,37 @@ func NewLLMExecutor(
 	teamAwareness string,
 	systemPrompt ...string,
 ) TaskExecutor {
-	// storeView 当前仅用作未来扩展位。编译器会抱怨未使用，先用 _ 绑定一下。
-	// 如未来需要在 executor 内直接查询任务状态（例如 hook 间共享），再启用。
-	_ = storeView
-	var sysPrompt string
-	if len(systemPrompt) > 0 {
-		sysPrompt = systemPrompt[0]
-	}
-	return func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	return newLLMExecutor(client, tools, gateReg, storeView, recordToolCall, teamAwareness, systemPrompt...).Execute
+}
+
+// NewSwappableLLMExecutor 与 NewLLMExecutor 参数完全相同，但返回 *LLMExecutor
+// 结构形态：调用方用 executor.Execute 作为 TaskExecutor，同时可把 executor
+// 本身赋给 Agent.ToolSwapper，让 processTask 在 per-node 能力任务上换入
+// 过滤视图。
+func NewSwappableLLMExecutor(
+	client llm.Client,
+	tools *ToolRegistry,
+	gateReg *gate.Registry,
+	storeView store.StoreHookView,
+	recordToolCall func(string, store.ToolCallRecord),
+	teamAwareness string,
+	systemPrompt ...string,
+) *LLMExecutor {
+	return newLLMExecutor(client, tools, gateReg, storeView, recordToolCall, teamAwareness, systemPrompt...)
+}
+
+// Execute 实现 TaskExecutor 签名（方法值可直接赋给 Agent.Execute）。
+func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	// 整个 Execute 使用同一份 registry 快照——任务边界换入的过滤视图对本次
+	// 调用自洽，不会在 Chat 与 Dispatch 之间被换走。
+	tools := e.ToolRegistry()
+	{
 		// Task-level system prompt 优先于默认值
-		effectivePrompt := sysPrompt
+		effectivePrompt := e.sysPrompt
 		if task.SystemPrompt != "" {
 			effectivePrompt = task.SystemPrompt
 		}
-		messages := buildMessages(effectivePrompt, task, depResults, history, teamAwareness)
+		messages := buildMessages(effectivePrompt, task, depResults, history, e.teamAwareness)
 
 		agentIDForTrace, _ := ctx.Value(ctxAgentID).(string)
 		loopForTrace, _ := ctx.Value(ctxLoopNum).(int)
@@ -195,7 +295,7 @@ func NewLLMExecutor(
 		trace.DumpRequest(task.ID, loopForTrace, messages, len(toolDefs))
 
 		llmStart := time.Now()
-		resp, err := client.Chat(ctx, messages, toolDefs)
+		resp, err := e.client.Chat(ctx, messages, toolDefs)
 		llmDuration := time.Since(llmStart)
 
 		if err != nil {
@@ -268,7 +368,7 @@ func NewLLMExecutor(
 
 				// Gate pre-call：允许注册的 Gate 拒绝本次调用。
 				// gateReg 为 nil 时 Dispatch 直接返回 Continue（nil receiver 安全）。
-				preDecision := gateReg.Dispatch(&gate.ToolContext{
+				preDecision := e.gateReg.Dispatch(&gate.ToolContext{
 					CtxField:     ctx,
 					PhaseField:   gate.PhaseToolPreCall,
 					AgentIDField: agentID,
@@ -336,12 +436,12 @@ func NewLLMExecutor(
 				//   - 写入范围：无论 pre hook Abort 还是真正执行都写，Success
 				//     由 toolErr == nil 决定
 				//   - Scheduler 工具不经过本路径，不被记录（hookSystem.md §11.1.3）
-				if recordToolCall != nil {
+				if e.recordToolCall != nil {
 					var exitCode *int
 					if c.Name == "run_shell" && toolErr == nil {
 						exitCode = parseRunShellExitCode(result)
 					}
-					recordToolCall(task.ID, store.ToolCallRecord{
+					e.recordToolCall(task.ID, store.ToolCallRecord{
 						Timestamp: time.Now(),
 						AgentID:   agentID,
 						ToolName:  c.Name,
@@ -352,7 +452,7 @@ func NewLLMExecutor(
 				}
 
 				// Gate post-call：纯观察，Dispatch 返回值忽略。gateReg 为 nil 时无操作。
-				_ = gateReg.Dispatch(&gate.ToolContext{
+				_ = e.gateReg.Dispatch(&gate.ToolContext{
 					CtxField:     ctx,
 					PhaseField:   gate.PhaseToolPostCall,
 					AgentIDField: agentID,

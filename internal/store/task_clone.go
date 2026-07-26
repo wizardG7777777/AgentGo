@@ -18,6 +18,12 @@ func cloneTask(src *model.Task) *model.Task {
 	dst.SchedulerBatch = cloneStrings(src.SchedulerBatch)
 	dst.Supersedes = cloneStrings(src.Supersedes)
 	dst.Results = cloneStringMap(src.Results)
+	if src.Capability != nil {
+		dst.Capability = &model.NodeCapability{
+			Tools: cloneStrings(src.Capability.Tools),
+			Model: src.Capability.Model,
+		}
+	}
 	if src.ArtifactMeta != nil {
 		dst.ArtifactMeta = make(map[string]model.ArtifactMeta, len(src.ArtifactMeta))
 		for k, v := range src.ArtifactMeta {

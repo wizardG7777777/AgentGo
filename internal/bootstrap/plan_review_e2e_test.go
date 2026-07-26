@@ -113,7 +113,7 @@ func TestPlanGate_EndToEnd_SubmitApproveExecute(t *testing.T) {
 	r := roster.NewMemoryRoster()
 	mb := mailbox.NewRegistry(8)
 	coord := plan.NewCoordinator(plan.NewMemoryStore(), nil)
-	s.SetTaskPlanHooks(makeTaskPlanHooks(coord))
+	s.SetTaskPlanHooks(makeTaskPlanHooks(coord, nil))
 	cfg := config.DefaultConfig()
 	cfg.Agents = []config.AgentKind{{Kind: "worker", Replicas: 1}}
 	modeStore := modes.NewStore(modes.GatePlan, modes.ExecNormal, modes.TopoTeam)

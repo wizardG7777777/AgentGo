@@ -296,7 +296,9 @@ func (w *Watchdog) checkPendingTask(task *model.Task) {
 }
 
 func (w *Watchdog) pendingTaskIsClaimable(task *model.Task) (bool, error) {
-	available, err := w.Store.QueryAvailable(task.EventType)
+	// 探测性查询无认领方身份：agentID 传空串，QueryAvailable 跳过
+	// per-node 能力过滤（该过滤需要具体认领方的白名单才能判定）。
+	available, err := w.Store.QueryAvailable(task.EventType, "")
 	if err != nil {
 		return false, err
 	}

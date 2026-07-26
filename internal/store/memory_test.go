@@ -493,7 +493,7 @@ func TestQueryAvailable_FilterAndSort(t *testing.T) {
 	s.PublishTask(t4)
 
 	// Filter by event type
-	tasks, _ := s.QueryAvailable("code")
+	tasks, _ := s.QueryAvailable("code", "agent-1")
 	if len(tasks) != 2 {
 		t.Fatalf("got %d code tasks, want 2", len(tasks))
 	}
@@ -504,7 +504,7 @@ func TestQueryAvailable_FilterAndSort(t *testing.T) {
 	// 严格匹配：空 EventType 过滤器只返回 EventType="" 的任务（Worker 语义），
 	// 不再像旧实现那样作为通配符返回所有任务。这个修复防止 Worker 顺手抢走
 	// explore 类型任务，避免跨代理类型迁移引发的契约违约。
-	untyped, _ := s.QueryAvailable("")
+	untyped, _ := s.QueryAvailable("", "agent-1")
 	if len(untyped) != 1 {
 		t.Fatalf("empty filter should match only EventType=\"\" tasks, got %d, want 1", len(untyped))
 	}
@@ -513,7 +513,7 @@ func TestQueryAvailable_FilterAndSort(t *testing.T) {
 	}
 
 	// 严格匹配：search 过滤器只返回 search 任务
-	search, _ := s.QueryAvailable("search")
+	search, _ := s.QueryAvailable("search", "agent-1")
 	if len(search) != 1 {
 		t.Fatalf("got %d search tasks, want 1", len(search))
 	}

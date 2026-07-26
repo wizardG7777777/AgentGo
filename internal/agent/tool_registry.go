@@ -105,3 +105,56 @@ func (r *ToolRegistry) Dispatch(ctx context.Context, call llm.ToolCall) (string,
 func (r *ToolRegistry) Defs() []llm.ToolDef {
 	return r.defs
 }
+
+// Missing 返回 allow 中未在本 registry 注册的工具名（保持入参顺序，去重）。
+// 用于 per-node 能力（model.NodeCapability.Tools）的 fail-closed 判定：
+// 返回值非空表示节点声明的工具子集越出本 registry 全集，调用方应拒绝执行
+// 而不是降级（Filtered 会静默跳过这些名字）。
+func (r *ToolRegistry) Missing(allow []string) []string {
+	seen := make(map[string]bool, len(allow))
+	var missing []string
+	for _, name := range allow {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		if _, ok := r.tools[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	return missing
+}
+
+// Filtered 返回仅包含 allow 中工具的过滤视图（per-node 能力裁剪用）。
+//
+// 实现取舍——克隆式薄包装：
+//   - tools map 与 defs 切片都是新建的，且只收录 allow 命中的条目；对视图
+//     Dispatch 一个不在 allow 中的工具名会走"未知工具"分支，形成第二道防线
+//     （第一道是 LLM 只见过滤后的 defs）。
+//   - ToolFunc 执行体与原 registry 共享（工具注册后只读，跨视图并发安全）；
+//     defs 中的 ToolDef 是值拷贝，Description/Parameters 不被视图修改。
+//   - 原 registry 完全不被触碰——调用方（processTask）在任务结束换回原
+//     registry 即完成恢复，视图本身用完即弃。
+//   - allow 中未注册的名字被静默跳过；越界判定请先用 Missing，本函数不做
+//     fail-closed（职责分离：Missing 给判定，Filtered 给视图）。
+func (r *ToolRegistry) Filtered(allow []string) *ToolRegistry {
+	allowed := make(map[string]bool, len(allow))
+	for _, name := range allow {
+		allowed[name] = true
+	}
+	view := &ToolRegistry{
+		tools: make(map[string]ToolFunc, len(allow)),
+		defs:  make([]llm.ToolDef, 0, len(allow)),
+	}
+	for name, fn := range r.tools {
+		if allowed[name] {
+			view.tools[name] = fn
+		}
+	}
+	for _, def := range r.defs {
+		if allowed[def.Name] {
+			view.defs = append(view.defs, def)
+		}
+	}
+	return view
+}

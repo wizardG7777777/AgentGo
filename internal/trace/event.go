@@ -263,6 +263,12 @@ type Event struct {
 	OutputLen    int      `json:"output_len,omitempty"`
 	LoopsUsed    int      `json:"loops_used,omitempty"`
 
+	// 节点能力覆盖（per-node NodeCapability，仅 task_published 填充）：
+	// Scheduler 发布任务时为该 DAG 节点声明的工具子集 / 模型覆盖。
+	// 未声明时缺省（omitempty），保持旧 jsonl 兼容。
+	ToolsOverride []string `json:"tools_override,omitempty"`
+	ModelOverride string   `json:"model_override,omitempty"`
+
 	// --- LLM 调用字段 ---
 	PromptTokens     int    `json:"prompt_tokens,omitempty"`
 	CompletionTokens int    `json:"completion_tokens,omitempty"`

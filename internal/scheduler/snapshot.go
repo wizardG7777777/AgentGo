@@ -219,6 +219,10 @@ type taskSnapshot struct {
 	Progress            *taskProgressSnapshot    `json:"progress,omitempty"`
 	Artifacts           []string                 `json:"artifacts,omitempty"`
 	LastResponsePreview *taskTextPreviewSnapshot `json:"last_response_preview,omitempty"`
+	// Capability 投影任务的 per-node 节点能力声明（tools 子集 / model 覆盖），
+	// 让 Scheduler 重规划时能看到自己此前设过什么。tools 量小（个位数），
+	// 不做 result_refs 式有界摘录，直接全量放置。
+	Capability *model.NodeCapability `json:"capability,omitempty"`
 }
 
 // taskResultRef is the stable hot-board index for one agent result. Excerpt is
@@ -402,6 +406,13 @@ func BuildBoardJSON(
 		// 失败/重试中的任务只展开 LastResponse 预览；completed 使用 result_refs。
 		if t.LastResponse != "" && t.Status != model.TaskStatusCompleted {
 			snap.LastResponsePreview = buildTaskTextPreview(t.LastResponse, maxTaskLastResponseRunes)
+		}
+		// 节点能力投影：克隆防共享（ScanAll 克隆体仍不应被快照层别名）。
+		if t.Capability != nil {
+			snap.Capability = &model.NodeCapability{
+				Tools: append([]string(nil), t.Capability.Tools...),
+				Model: t.Capability.Model,
+			}
 		}
 		taskSnaps = append(taskSnaps, snap)
 	}

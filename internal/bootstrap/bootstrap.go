@@ -346,8 +346,13 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// C1：Task→Plan 变更落盘改为异步批处理——Mutated hook 仅入队（agent
 	// goroutine 上不再做全量 fsync），单个 flusher 合并落盘。Plan 事实最终
 	// 一致（毫秒级滞后），Shutdown 经 PlanBatcher.Drain 兜底。
+	// 节点能力注册表（per-node NodeCapability 认领检查的事实源）：
+	// 此处先建空表并注入 hooks/checker 闭包，白名单在下方 Step 8 创建静态
+	// runner 时逐条登记，动态来源（spawn.KindOf / agentRegistry route 能力）
+	// 在 Step 8.5 后接线——checker 每次调用现查表，后填充自然生效。
+	capReg := newCapabilityRegistry()
 	planBatcher := newPlanMutationBatcher(planCoordinator)
-	planHooks := makeTaskPlanHooks(planCoordinator)
+	planHooks := makeTaskPlanHooks(planCoordinator, capReg.checker())
 	planHooks.Mutated = planBatcher.submit
 	taskStore.SetTaskPlanHooks(planHooks)
 	log.Printf("[启动] PlanCoordinator 初始化完成 (state=%s)", planStatePath)
@@ -705,6 +710,11 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 			kindDeps.UserOutput = newTextWriter(rt.InstanceID)
 			rn := runner.New(rt, kindDeps)
 			runners = append(runners, rn)
+			// 能力注册：rt.AllowedTools 即 runner.New 注册工具的过滤依据
+			// （resolveToolGroups 的 allowlist），是 runner 真实白名单的最可靠
+			// 事实源——登记 agentID 与 kind 两级（kind 级供 spawn ad-hoc 继承）。
+			capReg.registerAgent(rt.InstanceID, rt.AllowedTools)
+			capReg.registerKind(kind.Kind, rt.AllowedTools)
 			log.Printf("[启动] Runner %s 已启动 [kind=%s, model=%s]",
 				rt.InstanceID, kind.Kind, rt.Model)
 		}
@@ -751,6 +761,17 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	if err := reactorReg.Register(spawnMgr); err != nil {
 		return nil, fmt.Errorf("注册 spawn.Manager 失败: %w", err)
 	}
+
+	// 能力注册表动态来源接线：
+	//   - spawn ad-hoc agent：KindOf 解析 base kind，白名单继承静态 kind
+	//     （spawn/types.go：AllowedTools 不可 override、始终来自 base kind）；
+	//   - 动态 Team：RouteCapabilitiesForPlan 给出该 eventType 全部 ready
+	//     listener 的能力交集，与 team runner 白名单同出 tmpl.Tools。
+	// 两级来源就绪后把 checker 注入 store（A 方注入点）：QueryAvailable 过滤
+	// 与 CanClaim 双保险自此对显式声明 capability 的任务生效。
+	capReg.kindOf = spawnMgr.KindOf
+	capReg.routeCaps = agentRegistry.RouteCapabilitiesForPlan
+	taskStore.SetCapabilityChecker(store.CapabilityChecker(capReg.checker()))
 
 	// Step 8.6: 用户 YAML reactor（v5 Phase 5 S1-S6）
 	//

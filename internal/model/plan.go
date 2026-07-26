@@ -54,6 +54,9 @@ type PlanNode struct {
 	FailureFingerprint string       `json:"failure_fingerprint,omitempty"`
 	ArtifactRefs       []string     `json:"artifact_refs,omitempty"`
 	TraceRef           string       `json:"trace_ref,omitempty"`
+	// Capability 是该 DAG 节点的能力声明，与 Task.Capability 同型同义。
+	// 由 Plan 控制面在节点物化为 Task 时拷贝过去；nil 表示无节点级约束。
+	Capability *NodeCapability `json:"capability,omitempty"`
 }
 
 type PlanBudget struct {

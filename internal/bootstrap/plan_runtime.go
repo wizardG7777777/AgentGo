@@ -303,12 +303,23 @@ func (b planTaskBackend) PublishTask(ctx context.Context, spec plan.TaskSpec) (s
 	return task.ID, nil
 }
 
-func makeTaskPlanHooks(coordinator *plan.Coordinator) store.TaskPlanHooks {
+// makeTaskPlanHooks 装配 Task→Plan 守卫。capCheck 是节点能力检查
+// （capabilityRegistry.checker()，可为 nil——nil 时退化为纯 plan 守卫，
+// 供不装配能力注册表的兼容测试路径使用）。
+func makeTaskPlanHooks(coordinator *plan.Coordinator, capCheck CapabilityChecker) store.TaskPlanHooks {
 	return store.TaskPlanHooks{
 		Prepare: func(task *model.Task, parent *model.Task) error {
 			return preparePlannedTask(coordinator, task, parent)
 		},
-		CanClaim: func(task *model.Task) error {
+		CanClaim: func(agentID string, task *model.Task) error {
+			// 节点能力检查（双保险之一）：独立于下方 plan 守卫——能力 ⊆ 白名单
+			// 是认领的硬前提，即使 plan 守卫缺省（coordinator=nil 的兼容装配）
+			// 也不跳过；checker 对未声明 capability 的任务直接放行。
+			if capCheck != nil {
+				if err := capCheck(agentID, task); err != nil {
+					return err
+				}
+			}
 			if coordinator == nil || task == nil || task.PlanID == "" {
 				return nil
 			}
@@ -470,6 +481,10 @@ func preparePlannedTask(coordinator *plan.Coordinator, task, parent *model.Task)
 				TaskID: task.ID, Title: plannedTaskTitle(task.Description), Status: task.Status,
 				Role: task.NodeRole, Dependencies: append([]string(nil), task.Dependencies...),
 				Supersedes: append([]string(nil), task.Supersedes...),
+				// 节点能力投影：PlanNode 持久化进 plan-state.json，必须与 Task
+				// 脱钩（store 侧 task 是独立克隆体），故按 plan 包惯例整体克隆
+				// （与 Dependencies/Supersedes 的 append 克隆一致），不浅共享指针。
+				Capability: cloneNodeCapability(task.Capability),
 			},
 		})
 		if registerErr == nil {
@@ -497,6 +512,19 @@ func plannedTaskTitle(description string) string {
 		title = string(runes[:160]) + "…"
 	}
 	return title
+}
+
+// cloneNodeCapability 克隆节点能力声明。Capability 只在发布时由控制面写入、
+// 之后不可变，但 PlanNode 与 Task 分属两个持久化域（plan-state.json 与 store），
+// 克隆可避免跨域共享指针——与上方 Dependencies/Supersedes 的克隆惯例一致。
+func cloneNodeCapability(c *model.NodeCapability) *model.NodeCapability {
+	if c == nil {
+		return nil
+	}
+	return &model.NodeCapability{
+		Tools: append([]string(nil), c.Tools...),
+		Model: c.Model,
+	}
 }
 
 // plannedMutationPrep 是 recordPlannedTaskMutation 的可批处理中间形态：

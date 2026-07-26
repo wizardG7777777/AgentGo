@@ -97,6 +97,14 @@ type Task struct {
 	// 以及暂停恢复期间尚不可认领的 control-reserved 节点。
 	PlanMutationSource string `json:"plan_mutation_source,omitempty"`
 
+	// Capability 是本任务（DAG 节点）的能力声明。由 Scheduler 在 publish_task
+	// 时按节点指定：Tools 非空表示当次任务只允许使用该工具子集（必须 ⊆ 认领
+	// runner 的工具白名单，Store 在 QueryAvailable 过滤、agent 在 processTask
+	// 入口 fail-closed 校验并换入过滤视图）；Model 非空表示当次任务的模型覆盖。
+	// nil 表示无节点级能力约束，agent 按 kind 声明的完整能力执行（kind 退化为
+	// 能力天花板）。发布后视为只读契约，执行期不修改。
+	Capability *NodeCapability `json:"capability,omitempty"`
+
 	// MailChainDepth 是该任务被第几层邮件唤醒。
 	// 用户 /steer 触发的初始任务为 0；被 chain_depth=N 的邮件唤醒的任务为 N。
 	// MetaGroup.sendMessage 在构造 outgoing message 时读取此值并 +1 写入 msg.ChainDepth；
@@ -195,6 +203,20 @@ type Task struct {
 	PendingSince time.Time
 	StartedAt    time.Time
 	CompletedAt  time.Time
+}
+
+// NodeCapability 是 DAG 节点级的能力声明，随 Task / PlanNode 携带。
+// 三方（model / store / agent）共用的统一契约，字段语义：
+//   - Tools 非空：当次任务的工具子集。核心不变式：节点工具集 ⊆ 认领 runner
+//     白名单。Store.QueryAvailable 据此过滤不可认领的任务；agent.processTask
+//     据此把 executor 的工具注册表换成过滤视图（越界则任务直接失败）。
+//   - Model 非空：当次任务的模型覆盖，任务结束时恢复原值。
+//
+// 两字段都为空（或整体为 nil）时等价于"无节点能力约束"，各消费方按零开销
+// 短路处理。
+type NodeCapability struct {
+	Tools []string `json:"tools,omitempty"` // 非空 = 当次任务工具子集
+	Model string   `json:"model,omitempty"` // 非空 = 当次任务模型覆盖
 }
 
 // ArtifactMeta 是 Task.ArtifactMeta 的 value 类型，记录单个产物文件在
