@@ -53,15 +53,26 @@ func (r *RecordArtifactReactor) IsSync() bool  { return false }
 func (r *RecordArtifactReactor) Priority() int { return 950 }
 
 func (r *RecordArtifactReactor) Subscribe() []trace.EventKind {
-	return []trace.EventKind{trace.KindFileWritten}
+	return []trace.EventKind{trace.KindFileWritten, trace.KindShellExecuted}
 }
 
-// Run 写入 task.Artifacts，并同步登记产物元数据（sha256/bytes）到
-// task.ArtifactMeta。store == nil 时静默 no-op（测试 / 最小注册场景）。
+// Run 按事件类型分派：
+//   - KindFileWritten：登记写工具产物（路径 + 落盘重算的 sha256/bytes）。
+//   - KindShellExecuted：shell 写事实补登——shell 命令（如 Set-Content）
+//     写文件不产生 file_written 事件，任务声明的 ExpectedArtifacts 若已
+//     在盘上出现，补登进 artifact 账本。没有这一步，shell 写产物的任务会
+//     撞 expected_artifacts 终态校验的假阴性（「你实际没有写入任何文件」），
+//     验收 file_hash 证据链也因账本缺失而断裂（2026-07-27 真实运行事故）。
+//
+// store == nil 时静默 no-op（测试 / 最小注册场景）。
 // 路径为空 / 任务不存在等失败均吞错——artifact 记录是 best-effort 的审计记录，
 // 不能反向阻塞主流程（Async Reactor 也无法阻塞）。
 func (r *RecordArtifactReactor) Run(ev trace.Event) error {
 	if r.store == nil {
+		return nil
+	}
+	if ev.Kind == trace.KindShellExecuted {
+		r.backfillExpectedArtifacts(ev)
 		return nil
 	}
 	if ev.Path == "" {
@@ -77,6 +88,52 @@ func (r *RecordArtifactReactor) Run(ev trace.Event) error {
 	}
 	_ = r.store.AppendArtifactWithMeta(ev.TaskID, rel, computeArtifactMeta(physicalPath))
 	return nil
+}
+
+// backfillExpectedArtifacts 在 shell 命令成功（exit 0）后复核任务声明的
+// ExpectedArtifacts：盘上已出现的补登进 task.Artifacts 并落盘重算
+// ArtifactMeta。幂等性由 store.AppendArtifactWithMeta 内建（同路径同 meta
+// no-op、新 hash 更新元数据、新路径追加），多次 shell 调用不会重复登记。
+//
+// 只在 Outcome=="success" 时补登：失败/超时命令的部分写入是噪音，且
+// 「命令声称要做的」与「盘上实际存在的」应以成功出口为准。盘上不存在
+// （或虽是路径但为目录）的声明跳过——不登记幽灵产物。
+func (r *RecordArtifactReactor) backfillExpectedArtifacts(ev trace.Event) {
+	if ev.ShellExec == nil || ev.ShellExec.Outcome != "success" {
+		return
+	}
+	task, err := r.store.GetTask(ev.TaskID)
+	if err != nil || task == nil || len(task.ExpectedArtifacts) == 0 {
+		return
+	}
+	for _, expected := range task.ExpectedArtifacts {
+		physical := r.resolveExpectedPhysical(ev.TaskID, expected)
+		fi, err := os.Stat(physical)
+		if err != nil || fi.IsDir() {
+			continue
+		}
+		rel := normalizeArtifactPath(expected, r.projectRoot)
+		_ = r.store.AppendArtifactWithMeta(ev.TaskID, rel, computeArtifactMeta(physical))
+	}
+}
+
+// resolveExpectedPhysical 把 expected_artifacts 声明（约定为相对主根路径）
+// 解析为实际 stat 位置：拼上主根（wsMgr 存在时用其绝对归一的根），隔离
+// 任务再经 ResolveForTask 映射到 workspace 副本（shell 在 workspace 根下
+// 执行，相对路径写落点即副本）。
+func (r *RecordArtifactReactor) resolveExpectedPhysical(taskID, expected string) string {
+	abs := expected
+	if !filepath.IsAbs(abs) {
+		root := r.projectRoot
+		if r.wsMgr != nil {
+			root = r.wsMgr.ProjectRoot() // 构造期已绝对归一（相对根事故修复）
+		}
+		abs = filepath.Join(root, abs)
+	}
+	if r.wsMgr != nil {
+		return r.wsMgr.ResolveForTask(taskID, abs)
+	}
+	return abs
 }
 
 // computeArtifactMeta 读取落盘文件内容，计算 SHA256 与字节数。

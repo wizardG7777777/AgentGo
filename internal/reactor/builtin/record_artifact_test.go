@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"agentgo/internal/agent"
 	"agentgo/internal/model"
 	"agentgo/internal/reactor"
 	"agentgo/internal/store"
@@ -19,10 +20,12 @@ import (
 )
 
 // fakeStoreView 是只实现 StoreHookView 的最小 mock，记录 AppendArtifact 的调用。
+// task 非 nil 时 GetTask 返回它（shell 补登路径需要带 ExpectedArtifacts 的任务）。
 type fakeStoreView struct {
 	mu           sync.Mutex
 	calls        []artifactCall
 	failOnAppend bool
+	task         *model.Task
 }
 
 type artifactCall struct {
@@ -31,7 +34,12 @@ type artifactCall struct {
 	meta   model.ArtifactMeta
 }
 
-func (s *fakeStoreView) GetTask(taskID string) (*model.Task, error) { return nil, nil }
+func (s *fakeStoreView) GetTask(taskID string) (*model.Task, error) {
+	if s.task != nil && s.task.ID == taskID {
+		return s.task, nil
+	}
+	return nil, nil
+}
 func (s *fakeStoreView) AppendArtifact(taskID, path string) error {
 	return s.AppendArtifactWithMeta(taskID, path, model.ArtifactMeta{})
 }
@@ -65,8 +73,8 @@ var _ store.StoreHookView = (*fakeStoreView)(nil)
 func TestRecordArtifactReactor_BasicSubscribe(t *testing.T) {
 	r := NewRecordArtifactReactor(nil, "")
 	subs := r.Subscribe()
-	if len(subs) != 1 || subs[0] != trace.KindFileWritten {
-		t.Errorf("expected only KindFileWritten subscribe, got %v", subs)
+	if len(subs) != 2 || subs[0] != trace.KindFileWritten || subs[1] != trace.KindShellExecuted {
+		t.Errorf("expected [KindFileWritten KindShellExecuted] subscribe, got %v", subs)
 	}
 	if r.IsSync() {
 		t.Error("should be async")
@@ -341,5 +349,186 @@ func TestRecordArtifactReactor_NilManagerUnchanged(t *testing.T) {
 	wantSum := sha256.Sum256([]byte(content))
 	if want := hex.EncodeToString(wantSum[:]); calls[0].meta.SHA256 != want {
 		t.Errorf("nil Manager 应按注入前行为直读主根, got %q want %q", calls[0].meta.SHA256, want)
+	}
+}
+
+// === shell 写事实补登（KindShellExecuted → ExpectedArtifacts 盘后补登） ===
+
+// shellExecEvent 构造一次 run_shell 执行事件。
+func shellExecEvent(taskID, outcome string) trace.Event {
+	return trace.Event{
+		Kind:      trace.KindShellExecuted,
+		TaskID:    taskID,
+		AgentID:   "agent-x",
+		Tool:      "run_shell",
+		ShellExec: &trace.ShellExec{Command: "Set-Content out.txt x", Outcome: outcome, ExitCode: 0},
+	}
+}
+
+// shell 成功 + 声明的预期产物已在盘上 → 补登路径与落盘重算的 meta。
+func TestRecordArtifactReactor_ShellBackfillRegistersExpectedArtifact(t *testing.T) {
+	root := t.TempDir()
+	content := "line2-agentA（shell 写入）"
+	if err := os.WriteFile(filepath.Join(root, "out.txt"), []byte(content), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	fs := &fakeStoreView{task: &model.Task{ID: "t1", ExpectedArtifacts: []string{"out.txt"}}}
+	r := NewRecordArtifactReactor(fs, root)
+	if err := r.Run(shellExecEvent("t1", "success")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	calls := fs.snapshotCalls()
+	if len(calls) != 1 || calls[0].path != "out.txt" || calls[0].taskID != "t1" {
+		t.Fatalf("应补登 1 条 out.txt，实际: %+v", calls)
+	}
+	sum := sha256.Sum256([]byte(content))
+	wantSHA := hex.EncodeToString(sum[:])
+	if calls[0].meta.SHA256 != wantSHA || calls[0].meta.Bytes != int64(len(content)) {
+		t.Fatalf("meta 应为落盘重算值 sha=%s bytes=%d，实际: %+v", wantSHA, len(content), calls[0].meta)
+	}
+}
+
+// 盘上文件变化后再次补登：应携带新 hash（store 侧据以更新 ArtifactMeta）。
+func TestRecordArtifactReactor_ShellBackfillRefreshesMetaOnChange(t *testing.T) {
+	root := t.TempDir()
+	p := filepath.Join(root, "out.txt")
+	fs := &fakeStoreView{task: &model.Task{ID: "t1", ExpectedArtifacts: []string{"out.txt"}}}
+	r := NewRecordArtifactReactor(fs, root)
+
+	_ = os.WriteFile(p, []byte("v1"), 0o644)
+	if err := r.Run(shellExecEvent("t1", "success")); err != nil {
+		t.Fatalf("Run#1: %v", err)
+	}
+	_ = os.WriteFile(p, []byte("v2-changed"), 0o644)
+	if err := r.Run(shellExecEvent("t1", "success")); err != nil {
+		t.Fatalf("Run#2: %v", err)
+	}
+	calls := fs.snapshotCalls()
+	if len(calls) != 2 {
+		t.Fatalf("应补登 2 次，实际 %d", len(calls))
+	}
+	v1SHA := calls[0].meta.SHA256
+	v2SHA := calls[1].meta.SHA256
+	if v1SHA == v2SHA {
+		t.Fatalf("文件变更后两次补登的 hash 应不同，实际均为 %s", v1SHA)
+	}
+	sum := sha256.Sum256([]byte("v2-changed"))
+	if v2SHA != hex.EncodeToString(sum[:]) {
+		t.Fatalf("第二次补登 hash 应为新内容重算值，实际 %s", v2SHA)
+	}
+}
+
+// 失败/超时命令不补登（部分写入是噪音）。
+func TestRecordArtifactReactor_ShellBackfillSkipsFailureAndTimeout(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "out.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	fs := &fakeStoreView{task: &model.Task{ID: "t1", ExpectedArtifacts: []string{"out.txt"}}}
+	r := NewRecordArtifactReactor(fs, root)
+	for _, outcome := range []string{"failure", "timeout"} {
+		if err := r.Run(shellExecEvent("t1", outcome)); err != nil {
+			t.Fatalf("Run(%s): %v", outcome, err)
+		}
+	}
+	if got := len(fs.snapshotCalls()); got != 0 {
+		t.Fatalf("failure/timeout 不应补登，实际 %d 条", got)
+	}
+}
+
+// 声明了但盘上不存在 → 跳过（不登记幽灵产物）；任务无 ExpectedArtifacts → 短路。
+func TestRecordArtifactReactor_ShellBackfillSkipsMissingAndNoExpected(t *testing.T) {
+	root := t.TempDir()
+	fs := &fakeStoreView{task: &model.Task{ID: "t1", ExpectedArtifacts: []string{"ghost.txt"}}}
+	r := NewRecordArtifactReactor(fs, root)
+	if err := r.Run(shellExecEvent("t1", "success")); err != nil {
+		t.Fatalf("Run ghost: %v", err)
+	}
+
+	fs2 := &fakeStoreView{task: &model.Task{ID: "t2"}}
+	r2 := NewRecordArtifactReactor(fs2, root)
+	if err := r2.Run(shellExecEvent("t2", "success")); err != nil {
+		t.Fatalf("Run no-expected: %v", err)
+	}
+	if len(fs.snapshotCalls()) != 0 || len(fs2.snapshotCalls()) != 0 {
+		t.Fatal("幽灵路径与无声明任务均不应补登")
+	}
+}
+
+// 隔离任务：shell 在 workspace 根下执行，产物落副本——补登必须经
+// ResolveForTask 读 workspace 副本的内容（主根旧版本不得污染 meta）。
+func TestRecordArtifactReactor_ShellBackfillResolvesWorkspaceCopy(t *testing.T) {
+	root := t.TempDir()
+	mainPath := filepath.Join(root, "out.txt")
+	if err := os.WriteFile(mainPath, []byte("主根旧内容"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	mgr := workspace.NewManager(root, nil)
+	v, err := mgr.Materialize("t1")
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	// 模拟 shell 在 workspace 根写入副本（经 COW 解析后的落点）。
+	wsPath, err := v.WritePath(mainPath)
+	if err != nil {
+		t.Fatalf("WritePath: %v", err)
+	}
+	wsContent := "workspace 副本新内容"
+	if err := os.WriteFile(wsPath, []byte(wsContent), 0o644); err != nil {
+		t.Fatalf("写副本: %v", err)
+	}
+
+	fs := &fakeStoreView{task: &model.Task{ID: "t1", ExpectedArtifacts: []string{"out.txt"}}}
+	r := NewRecordArtifactReactor(fs, root, mgr)
+	if err := r.Run(shellExecEvent("t1", "success")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	calls := fs.snapshotCalls()
+	if len(calls) != 1 {
+		t.Fatalf("应补登 1 条，实际 %d", len(calls))
+	}
+	sum := sha256.Sum256([]byte(wsContent))
+	if calls[0].meta.SHA256 != hex.EncodeToString(sum[:]) {
+		t.Fatalf("meta 应来自 workspace 副本而非主根旧内容，实际 sha=%s", calls[0].meta.SHA256)
+	}
+}
+
+// e2e 回归（2026-07-27 事故）：worker 用 shell 写预期产物，补登后
+// agent.CheckExpectedArtifacts 不得再报「你实际没有写入任何文件」假阴性。
+func TestRecordArtifactReactor_ShellBackfillClosesExpectedArtifactsCheck(t *testing.T) {
+	root := t.TempDir()
+	s := store.NewMemoryTaskStore(nil, 16, 4, 60)
+	task := &model.Task{ID: "t1", ExpectedArtifacts: []string{"shared.txt"}}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatalf("PublishTask: %v", err)
+	}
+	// worker 用 shell 写出产物（账本尚无任何记录）。
+	content := "line1\nline2-agentA\n"
+	if err := os.WriteFile(filepath.Join(root, "shared.txt"), []byte(content), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	before := agent.CheckExpectedArtifacts(s, "t1")
+	if len(before.Missing) != 1 {
+		t.Fatalf("补登前应有 1 个缺失产物，实际: %+v", before)
+	}
+
+	r := NewRecordArtifactReactor(s, root)
+	if err := r.Run(shellExecEvent("t1", "success")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	after := agent.CheckExpectedArtifacts(s, "t1")
+	if len(after.Missing) != 0 {
+		t.Fatalf("补登后 expected_artifacts 校验应通过，实际缺失: %v", after.Missing)
+	}
+	// 账本里的 meta 应可用于后续 file_hash 证据（sha256 与内容一致）。
+	got, err := s.GetTask("t1")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	meta := got.ArtifactMeta["shared.txt"]
+	sum := sha256.Sum256([]byte(content))
+	if meta.SHA256 != hex.EncodeToString(sum[:]) {
+		t.Fatalf("ArtifactMeta sha 不符: %s", meta.SHA256)
 	}
 }
