@@ -119,6 +119,14 @@ func (g LocalReadGroup) readFile(ctx context.Context, args map[string]any) (stri
 		}
 		path = validPath
 	}
+	// 按任务写时复制隔离：Workdir 同时实现 PathOverlayer 时（runner 装配的
+	// workspace.Swapper），把主根逻辑路径解析为物理读取位置——workspace 中
+	// 已有本任务写过的副本则读副本，否则穿透主根实时内容；无隔离时 passthrough
+	// （零开销）。path 在此之后即为物理路径，FileStateCache 的 Get/Put 统一以
+	// 它为键，保证读侧缓存键与写侧 Invalidate 键一致。
+	if ov, ok := g.Workdir.(PathOverlayer); ok {
+		path = ov.ReadPath(path)
+	}
 
 	offset, hasOffset := toInt(args["offset"])
 	limit, hasLimit := toInt(args["limit"])
@@ -271,6 +279,9 @@ func formatReadCacheStub(path, hash string) string {
 }
 
 // listDir 实现 list_dir 工具。
+// 注意：目录级操作刻意不做 workspace overlay（v1 决定）——目录枚举始终面对
+// 主根视图，任务 workspace 内尚未合并的副本不出现在列表里；文件级读取
+// （read_file）才有读穿透语义。
 func (g LocalReadGroup) listDir(ctx context.Context, args map[string]any) (string, error) {
 	path, _ := args["path"].(string)
 	if path == "" {
@@ -354,6 +365,7 @@ func writeTree(sb *strings.Builder, dir string, level, maxDepth int) error {
 }
 
 // grepSearch 实现 grep_search 工具。
+// 与 list_dir 同属目录级操作：不做 workspace overlay（v1 决定），始终搜索主根视图。
 func (g LocalReadGroup) grepSearch(ctx context.Context, args map[string]any) (string, error) {
 	pattern, _ := args["pattern"].(string)
 	searchPath, _ := args["path"].(string)
@@ -426,6 +438,7 @@ func (g LocalReadGroup) grepSearch(ctx context.Context, args map[string]any) (st
 }
 
 // globSearch 实现 glob_search 工具。
+// 与 list_dir 同属目录级操作：不做 workspace overlay（v1 决定），始终遍历主根视图。
 func (g LocalReadGroup) globSearch(ctx context.Context, args map[string]any) (string, error) {
 	pattern, _ := args["pattern"].(string)
 	if pattern == "" {

@@ -1271,6 +1271,9 @@ func formatEventDetails(ev Event) string {
 		if ev.ModelOverride != "" {
 			parts = append(parts, fmt.Sprintf("model_override=%s", ev.ModelOverride))
 		}
+		if ev.IsolationOverride != "" {
+			parts = append(parts, fmt.Sprintf("isolation_override=%s", ev.IsolationOverride))
+		}
 		if ev.Description != "" {
 			parts = append(parts, fmt.Sprintf("desc=%q", truncate(ev.Description, 80)))
 		}
@@ -1357,6 +1360,24 @@ func formatEventDetails(ev Event) string {
 			parts = append(parts, fmt.Sprintf("key=%s", ev.Path))
 		}
 		parts = append(parts, fmt.Sprintf("runes=%d", ev.OutputLen))
+	case KindWorkspaceMaterialized, KindWorkspaceCleaned:
+		// workspace 物化 / 清理：Path 是 workspace 根路径。
+		if ev.Path != "" {
+			parts = append(parts, fmt.Sprintf("path=%s", ev.Path))
+		}
+	case KindWorkspaceMerged:
+		// 合并完成：Description 载逐文件结果摘要（fast-forward / auto-merged 计数）。
+		if ev.Description != "" {
+			parts = append(parts, fmt.Sprintf("desc=%q", truncate(ev.Description, 160)))
+		}
+	case KindWorkspaceMergeConflict:
+		// 合并冲突：Path=冲突文件，Description=冲突详情。
+		if ev.Path != "" {
+			parts = append(parts, fmt.Sprintf("path=%s", ev.Path))
+		}
+		if ev.Description != "" {
+			parts = append(parts, fmt.Sprintf("desc=%q", truncate(ev.Description, 160)))
+		}
 	case KindError:
 		parts = append(parts, fmt.Sprintf("error=%q", truncate(ev.Error, 200)))
 		parts = appendReason(parts, "reason", ev.Reason)

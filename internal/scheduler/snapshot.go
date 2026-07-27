@@ -408,10 +408,13 @@ func BuildBoardJSON(
 			snap.LastResponsePreview = buildTaskTextPreview(t.LastResponse, maxTaskLastResponseRunes)
 		}
 		// 节点能力投影：克隆防共享（ScanAll 克隆体仍不应被快照层别名）。
+		// IsolationSpec 仅一个字符串字段，共享指针无别名风险；
+		// Scheduler 修复/重规划隔离节点时需要看到隔离声明。
 		if t.Capability != nil {
 			snap.Capability = &model.NodeCapability{
-				Tools: append([]string(nil), t.Capability.Tools...),
-				Model: t.Capability.Model,
+				Tools:     append([]string(nil), t.Capability.Tools...),
+				Model:     t.Capability.Model,
+				Isolation: t.Capability.Isolation,
 			}
 		}
 		taskSnaps = append(taskSnaps, snap)

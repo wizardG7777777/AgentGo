@@ -255,7 +255,6 @@ func TestValidateExpectedHashHook_ViaRegistry(t *testing.T) {
 	}
 }
 
-
 // TestValidateExpectedHashHook_LineAnchorsSkips 验证 §7 互斥规则：
 // 提供 line_anchors 时 expected_hash 即使存在且错误也应被跳过。
 func TestValidateExpectedHashHook_LineAnchorsSkips(t *testing.T) {
@@ -274,5 +273,42 @@ func TestValidateExpectedHashHook_LineAnchorsSkips(t *testing.T) {
 	})
 	if d.Action != hook.Continue {
 		t.Errorf("Action = %v, want Continue when line_anchors provided (even with wrong expected_hash)", d.Action)
+	}
+}
+
+// ---- 写时复制隔离：ResolvePhysicalPath 应被优先采用 ----
+
+func TestValidateExpectedHashHook_ResolvePhysicalPath(t *testing.T) {
+	// 主根版本与 workspace 副本内容不同：副本的 hash 才是校验基准。
+	mainPath, _ := makeFileWithHash(t, "主根旧内容")
+	wsPath, wsHash := makeFileWithHash(t, "workspace 副本新内容")
+
+	h := NewValidateExpectedHashHook()
+	h.ResolvePhysicalPath = func(taskID, p string) string {
+		if p == mainPath {
+			return wsPath
+		}
+		return p
+	}
+
+	// 用副本的 hash → Continue（若误读主根会 Abort）
+	d := h.Run(hook.ToolHookContext{
+		TaskID:   "t1",
+		ToolName: "write_file",
+		Args:     map[string]any{"path": mainPath, "expected_hash": wsHash},
+	})
+	if d.Action != hook.Continue {
+		t.Fatalf("应读 workspace 副本校验：期望 Continue，实际 %v（%s）", d.Action, d.AbortReason)
+	}
+
+	// 未装配 resolver 时按原路径读取（非隔离任务行为不变）
+	h2 := NewValidateExpectedHashHook()
+	d2 := h2.Run(hook.ToolHookContext{
+		TaskID:   "t1",
+		ToolName: "write_file",
+		Args:     map[string]any{"path": mainPath, "expected_hash": wsHash},
+	})
+	if d2.Action != hook.Abort {
+		t.Fatalf("无 resolver 时主根旧内容应失配 Abort，实际 %v", d2.Action)
 	}
 }

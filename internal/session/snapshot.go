@@ -103,6 +103,9 @@ type ArtifactMetaSnapshot struct {
 type CapabilitySnapshot struct {
 	Tools []string `json:"tools,omitempty"` // 非空 = 当次任务工具子集
 	Model string   `json:"model,omitempty"` // 非空 = 当次任务模型覆盖
+	// IsolationMode 非空 = 当次任务执行隔离模式（如 "workspace"）。
+	// 旧快照无此字段，反序列化为空串 = 不隔离，向后兼容。
+	IsolationMode string `json:"isolation_mode,omitempty"`
 }
 
 // ToolCallSnapshot is the serialization-only form of store.ToolCallRecord.

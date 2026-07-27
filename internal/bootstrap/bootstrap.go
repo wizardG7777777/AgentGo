@@ -26,6 +26,7 @@ import (
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
 	"agentgo/internal/output"
+	"agentgo/internal/pathutil"
 	"agentgo/internal/plan"
 	"agentgo/internal/probe"
 	"agentgo/internal/reactor"
@@ -45,6 +46,7 @@ import (
 	"agentgo/internal/ui"
 	"agentgo/internal/watchdog"
 	"agentgo/internal/webtool"
+	"agentgo/internal/workspace"
 )
 
 type System struct {
@@ -418,14 +420,18 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// 注册 7 个 Tool 域 Gate（impl 仍是 hook.ToolHook 接口，通过 adapter 包装）。
 	// 注：v5 Phase 4 起 record-artifact 已迁移为 Reactor（订阅 KindFileWritten），
 	// 不再走 Tool PostCall hook 路径——避免 hook 与 reactor 双写导致 task.Artifacts 重复。
+	// 两个内容校验 Gate 提出切片先构造：wsMgr 在 Step 3.1 建成后才存在，
+	// 隔离 resolver 在那里接上（hook 是指针，注册后经同一指针调用，装配期无并发）。
+	expectedHashHook := builtin.NewValidateExpectedHashHook()
+	lineAnchorsHook := builtin.NewValidateLineAnchorsHook()
 	for _, h := range []hook.ToolHook{
 		builtin.NewExecModeGuardHook(modeStore),
 		builtin.NewPathBoundaryHook(cfg.ProjectRoot),
-		builtin.NewValidateExpectedHashHook(),
+		expectedHashHook,
 		builtin.NewRequireReadBeforeWriteHook(storeView),
 		builtin.NewDependencyValidatorHook(storeView),
 		builtin.NewEnforceExpectedArtifactsHook(storeView, cfg.ProjectRoot),
-		builtin.NewValidateLineAnchorsHook(),
+		lineAnchorsHook,
 	} {
 		if err := gateReg.Register(gate.WrapToolHook(h)); err != nil {
 			return nil, fmt.Errorf("注册 %s 失败: %w", h.Name(), err)
@@ -436,6 +442,28 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// Step 3: 初始化花名册
 	r := roster.NewMemoryRoster()
 	log.Println("[启动] 花名册初始化完成")
+
+	// Step 3.1: 构造全局唯一的 workspace 控制面 Manager（写时复制执行隔离）。
+	// 同一实例注入：record-artifact reactor（ArtifactMeta 重算路径解析）、
+	// watchdog（孤儿 workspace 周期清扫）、各 Runner 运行时（隔离任务的
+	// overlay 视图换入，由 runtime_builder 的 WorkspaceManager 字段携带）。
+	// 合并回主根的写入经 roster 逐文件 TryClaim，与工具写路径同一占用协议。
+	wsMgr := workspace.NewManager(cfg.ProjectRoot, r)
+	log.Println("[启动] workspace 控制面初始化完成（.agentgo/workspaces）")
+
+	// 写时复制隔离：两个内容校验 Gate 必须读 workspace 副本而非主根旧版本
+	// （copy-on-write 之后主根内容是过期的）。ValidatePath 把 LLM 给的相对/
+	// 绝对逻辑路径归一为主根绝对路径，再经 Manager 解析到任务物理落点；
+	// 越界路径原样返回，交给 path-boundary Gate 拒绝。
+	resolvePhysical := func(taskID, p string) string {
+		abs, err := pathutil.ValidatePath(p, cfg.ProjectRoot)
+		if err != nil {
+			return p
+		}
+		return wsMgr.ResolveForTask(taskID, abs)
+	}
+	expectedHashHook.ResolvePhysicalPath = resolvePhysical
+	lineAnchorsHook.ResolvePhysicalPath = resolvePhysical
 
 	// Step 3.5: 初始化邮箱注册表（v4：缓冲区大小是系统级常量，不暴露 yaml）
 	mbRegistry := mailbox.NewRegistry(mailbox.DefaultInboxSize)
@@ -504,7 +532,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	//     trace CLI detectAnomalies 最高信号启发式（凭空写入 / 工具错误率>30%），
 	//     命中即经 planCoordinator 请求重规划（无 Plan 降级为 trace 告警）
 	reactorReg := reactor.NewRegistry()
-	if err := reactorReg.Register(reactorbuiltin.NewRecordArtifactReactor(storeView, cfg.ProjectRoot)); err != nil {
+	if err := reactorReg.Register(reactorbuiltin.NewRecordArtifactReactor(storeView, cfg.ProjectRoot, wsMgr)); err != nil {
 		return nil, fmt.Errorf("注册 RecordArtifactReactor 失败: %w", err)
 	}
 	taskEndReactor := reactorbuiltin.NewTaskEndCallbackReactor()
@@ -567,6 +595,9 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 
 	// Step 6: 创建看门狗（先于 scheduler 创建）。
 	w := watchdog.New(taskStore, cfg, eventCh, r, mbRegistry, watchdog.NewRuntimeRouteResolver(agentRegistry))
+	// workspace 孤儿清扫：终态 / 失踪任务的残留目录由 watchdog 周期兜底
+	// （合并成功的正常清理由执行面负责；nil-safe 字段注入，不改 New 签名）。
+	w.WorkspaceManager = wsMgr
 
 	// Step 6.5: 校验 profile 中的工具名拼写（v4：不再在此预解析 worker/explorer profile，
 	//             各 kind 的 profile 解析延后到 buildAgentRuntime）
@@ -694,6 +725,10 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		ProgressNotifyEnabled: cfg.ProgressNotifyEnabled,
 		HashlineEnabled:       *cfg.HashlineEnabled,
 	}
+	// workspace 控制面注入（B 线握手缝 runtime_builder.withWorkspaceManager）：
+	// 全部 kind × replica 的 Runner 共享进程级唯一 Manager；认领声明
+	// Capability.Isolation 的任务时执行面经它换入 overlay 视图。
+	deps = withWorkspaceManager(deps, wsMgr)
 	var runners []*runner.Runner
 	for _, kind := range cfg.Agents {
 		kindLLM := buildKindLLMClient(cfg.LLM, kind.Model)

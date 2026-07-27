@@ -80,19 +80,29 @@ func computeGraphDigest(p *model.Plan, excludeAcceptance bool) string {
 }
 
 // normalizeDigestCapability 把节点能力归一为稳定的 digest 输入：
-//   - nil 与「Tools/Model 皆空」归一为 nil（digest 与旧版图保持一致）；
+//   - nil 与「Tools/Model/Isolation 皆空」归一为 nil（digest 与旧版图保持一致）；
 //   - Tools 排序去重——同一工具集合的不同书写顺序不得改变图语义，
-//     否则会造成 digest 抖动、误使有效验收失效。
+//     否则会造成 digest 抖动、误使有效验收失效；
+//   - Isolation 按 Mode 归一：nil 与 Mode 空串等价（都表示不隔离），
+//     非空 Mode 原样保留——隔离改变节点的写入落点与合并语义，属于执行边界。
 func normalizeDigestCapability(c *model.NodeCapability) *model.NodeCapability {
 	if c == nil {
 		return nil
 	}
 	tools := sortedUniqueStrings(c.Tools)
 	modelName := strings.TrimSpace(c.Model)
-	if len(tools) == 0 && modelName == "" {
+	isolationMode := ""
+	if c.Isolation != nil {
+		isolationMode = strings.TrimSpace(c.Isolation.Mode)
+	}
+	if len(tools) == 0 && modelName == "" && isolationMode == "" {
 		return nil
 	}
-	return &model.NodeCapability{Tools: tools, Model: modelName}
+	out := &model.NodeCapability{Tools: tools, Model: modelName}
+	if isolationMode != "" {
+		out.Isolation = &model.IsolationSpec{Mode: isolationMode}
+	}
+	return out
 }
 
 func filterAcceptanceEdges(p *model.Plan, edges []string) []string {

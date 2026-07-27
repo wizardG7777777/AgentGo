@@ -63,9 +63,11 @@ gate=plan 模式下，用户审批的不再只是"做哪几步、什么顺序"�
 
 组合顺序：先由 spawn 从 base_kind 物化一只 ad-hoc Runner（AllowedTools 继承 base_kind），它认领的节点再按 tools 子集当次裁剪。模型维度的生效遵循"就近原则"：节点声明 > spawn override > kind 配置 > 全局默认——每层只在比自己更靠近任务的声明缺省时生效。
 
-## 6. 为 worktree 隔离预留的挂载点
+## 6. Isolation 字段：挂载点已落地
 
-节点能力声明落在 `model.NodeCapability` 这一容器类型上，本迭代只挂 Tools / Model 两个字段。将来实现节点级 worktree 隔离时，在同一容器上追加 Workdir / WritablePaths：节点只在指定 worktree 与可写路径集合内工作，路由判定从"工具名子集"自然扩展为"工具名 + 路径域子集"，执行面在认领时把 path-boundary 一并收窄。届时不需要新概念——"子集不变式""当次生效""fail-closed"三条不变式原样平移。
+§6（初版"为 worktree 隔离预留的挂载点"）的预判已实现：`model.NodeCapability` 追加第三个字段 `Isolation *IsolationSpec`，与 Tools/Model 同一容器、同一发布守卫（仅 Scheduler 计划控制面可写）、同一 digest 口径（Mode 空串 ≡ nil）。"子集不变式""当次生效""fail-closed"三条不变式原样平移——隔离声明同样只随当次任务生效，不声明的节点零开销。
+
+目前唯一合法值 `Mode: "workspace"`：认领后该节点在写时复制 overlay 中执行（读穿透主根、写落 `.agentgo/workspaces/<taskID>/`），成功终态由控制面自动合并回主根，冲突 → 任务 failed + 自动 replan 交 Scheduler 裁决。完整设计见 [`workspace-isolation.md`](workspace-isolation.md)。
 
 ## 7. 明确不做
 

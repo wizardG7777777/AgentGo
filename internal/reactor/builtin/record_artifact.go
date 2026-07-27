@@ -12,6 +12,7 @@ import (
 	"agentgo/internal/reactor"
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
+	"agentgo/internal/workspace"
 )
 
 // RecordArtifactReactor 是 v5 Phase 4 第一个内置 Reactor 示范——从 v4 时代
@@ -29,12 +30,22 @@ import (
 type RecordArtifactReactor struct {
 	store       store.StoreHookView
 	projectRoot string
+	// wsMgr 是 workspace 控制面（nil-safe）。file_written 事件的 Path 恒为主根
+	// 逻辑路径；隔离任务的写入在合并前落在任务 workspace 副本里，落盘重算
+	// sha256/bytes 前必须经 ResolveForTask 解析到真实物理位置。
+	// nil 时维持原行为（直接用主根 Path），非隔离任务行为不变。
+	wsMgr *workspace.Manager
 }
 
 // NewRecordArtifactReactor 构造一个 Reactor。store / projectRoot 与 v4
-// RecordArtifactHook 同型——bootstrap 注入。
-func NewRecordArtifactReactor(s store.StoreHookView, projectRoot string) *RecordArtifactReactor {
-	return &RecordArtifactReactor{store: s, projectRoot: projectRoot}
+// RecordArtifactHook 同型——bootstrap 注入。wsMgr 为可选构造参数
+// （workspace 控制面），缺省/为 nil 时按主根路径直读，行为与注入前一致。
+func NewRecordArtifactReactor(s store.StoreHookView, projectRoot string, wsMgr ...*workspace.Manager) *RecordArtifactReactor {
+	r := &RecordArtifactReactor{store: s, projectRoot: projectRoot}
+	if len(wsMgr) > 0 {
+		r.wsMgr = wsMgr[0]
+	}
+	return r
 }
 
 func (r *RecordArtifactReactor) Name() string  { return "record-artifact" }
@@ -57,7 +68,14 @@ func (r *RecordArtifactReactor) Run(ev trace.Event) error {
 		return nil
 	}
 	rel := normalizeArtifactPath(ev.Path, r.projectRoot)
-	_ = r.store.AppendArtifactWithMeta(ev.TaskID, rel, computeArtifactMeta(ev.Path))
+	// 隔离任务的重算路径解析：任务有活动 workspace 且文件已写入副本时，
+	// ResolveForTask 返回 workspace 物理路径；否则原样返回主根路径。
+	// wsMgr 为 nil 时直接用主根 Path（非隔离任务与注入前行为一致）。
+	physicalPath := ev.Path
+	if r.wsMgr != nil {
+		physicalPath = r.wsMgr.ResolveForTask(ev.TaskID, ev.Path)
+	}
+	_ = r.store.AppendArtifactWithMeta(ev.TaskID, rel, computeArtifactMeta(physicalPath))
 	return nil
 }
 

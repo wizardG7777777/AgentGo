@@ -18,6 +18,8 @@ import (
 
 	"agentgo/internal/config"
 	"agentgo/internal/llm"
+	"agentgo/internal/runner"
+	"agentgo/internal/workspace"
 )
 
 // buildKindLLMClient 基于 LLMConfig 与 per-kind model 覆盖值构造 llm.Client。
@@ -225,4 +227,16 @@ func buildSchedulerRuntime(sched config.SchedulerKind, llmCfg config.LLMConfig) 
 		ContextLimit:                 sched.ContextLimit,
 		// AllowedTools / SystemPrompt 仍由 internal/scheduler 内部决定。
 	}
+}
+
+// withWorkspaceManager 把共享的 *workspace.Manager 挂到 RunnerDeps 上——
+// 这是「按任务写时复制执行隔离」B 线（执行面）与 C 线（bootstrap 控制面）
+// 的握手缝：bootstrap.go（C 线）构造进程级共享 Manager 后经本函数注入，
+// 全部 kind × replica 的 Runner 共享同一 Manager（每个 Runner 仍持有独立
+// Swapper，见 runner.New）。刻意用结构体字段注入而非新增位置参数，降低
+// 跨线签名握手成本；nil 表示未启用隔离，声明 Isolation 的任务在认领时
+// fail-closed（capability_violation）。
+func withWorkspaceManager(deps runner.RunnerDeps, mgr *workspace.Manager) runner.RunnerDeps {
+	deps.WorkspaceManager = mgr
+	return deps
 }

@@ -54,6 +54,12 @@ var knownEventKinds = map[trace.EventKind]struct{}{
 	trace.KindAcceptanceCompleted:       {},
 	trace.KindPlanPaused:                {},
 	trace.KindPlanTerminal:              {},
+	// workspace 隔离生命周期四事件：发射点已就位（Manager.Materialize /
+	// MergeTask / Cleanup 与 watchdog 孤儿清扫），允许用户 YAML reactor 订阅。
+	trace.KindWorkspaceMaterialized:  {},
+	trace.KindWorkspaceMerged:        {},
+	trace.KindWorkspaceMergeConflict: {},
+	trace.KindWorkspaceCleaned:       {},
 }
 
 // reservedEventKinds 是"schema 与 CLI 渲染保留、但暂无发射点"的 EventKind。

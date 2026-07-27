@@ -36,6 +36,7 @@ import (
 	"agentgo/internal/tools"
 	"agentgo/internal/trace"
 	"agentgo/internal/webtool"
+	"agentgo/internal/workspace"
 )
 
 // RunnerDeps 是构造 Runner 时传入的所有共享基础设施。
@@ -79,6 +80,11 @@ type RunnerDeps struct {
 	// run_shell 的 strict/yolo 短路；nil 等价 normal。
 	// Bootstrap 透传与 scheduler / UI Hub 相同的实例。
 	Modes *modes.Store
+	// WorkspaceManager 是「按任务写时复制执行隔离」的共享 workspace 生命周期
+	// 管理器（internal/workspace，B 线执行面消费；bootstrap 装配注入，见
+	// runtime_builder.withWorkspaceManager 握手缝）。nil 表示未启用隔离——
+	// 声明 Isolation 的任务在认领时 fail-closed（capability_violation）。
+	WorkspaceManager *workspace.Manager
 	// UserOutput 是用户可见内容的输出目标。非 nil 时，agent 的 IsUserFacing 输出
 	// 和 scheduler 的 report_done 会写入此处，而不是直接 fmt.Printf。
 	UserOutput io.Writer
@@ -138,7 +144,12 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	finHolder := agent.NewFinalizationHolder()
 	submitState := agent.NewSubmitState()
 	fileCache := agent.NewFileStateCache(50)
-	workdir := &tools.DefaultWorkdir{ProjectRoot: deps.ProjectRoot}
+	// 按任务写时复制隔离：每个 Runner 持有独立 workspace.Swapper——同时满足
+	// tools.WorkdirProvider（Get 恒返回主根，路径边界校验不受隔离影响）、
+	// tools.PathOverlayer（读写路径解析）与 tools.ActiveViewer（run_shell 默认
+	// 工作目录切换）。认领 Capability.Isolation 任务时 Agent 经 Activate 换入
+	// 视图、defer 恢复；无视图时全部 passthrough，行为与 DefaultWorkdir 等价。
+	workdir := workspace.NewSwapper(deps.ProjectRoot)
 
 	// Interaction 等待钩子：把 shell 人工决策的阻塞窗口映射到 agent 状态机
 	// （processing ↔ waiting_interaction）。agent 在工具注册之后才构造，
@@ -240,6 +251,14 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	a.OnTaskStart = func(taskID string) { holder.Set(taskID); finHolder.Set(taskID) }
 	a.FinalizationChecker = finHolder
 	a.SubmitState = submitState
+	// 按任务写时复制隔离：共享 Manager（生命周期/合并）+ 本 Runner 独立
+	// Swapper（视图换入）；replan 登记通道复用 plan.Coordinator（与
+	// submit_task_result / request_replan 工具同款 RequestReplan）。
+	a.WorkspaceManager = deps.WorkspaceManager
+	a.WorkspaceActivator = workdir
+	if deps.PlanCoordinator != nil {
+		a.WorkspaceReplanRequester = deps.PlanCoordinator
+	}
 	// v5 Phase 4：holder 清理迁移到 task-end-callback Sync Reactor。
 	// 旧路径 (a.OnTaskEnd 闭包) 在 processTask defer 链中执行；新路径在
 	// trace.KindTaskCompleted/Failed/Blocked/Cancelled/Retry emit 同步阶段执行。

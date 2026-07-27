@@ -165,3 +165,94 @@ func TestPublishTask_Capability_CompanionWarnings(t *testing.T) {
 		t.Errorf("无执行类工具时应提示收尾通道，got %q", out)
 	}
 }
+
+// ===== isolation 参数（写时复制执行隔离声明）=====
+// 与 tools/model 同一守卫模式：仅 Scheduler 计划控制面可写；非空值只接受
+// "workspace"；合法值落到 Task.Capability.Isolation。
+
+// a. 写入权限：非控制面携带 isolation 参数必须被拒绝（与 tools/model 同款）。
+func TestPublishTask_Isolation_NonControlPlaneRejected(t *testing.T) {
+	s := newFakeStore()
+	// Worker 语义：PlanMutationSource 留空（bootstrap 对非 scheduler 不注入）。
+	g := MetaGroup{Store: s}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+	_, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description": "x", "isolation": "workspace",
+	}))
+	if err == nil || !strings.Contains(err.Error(), "只能由 Scheduler 计划控制面设置") {
+		t.Fatalf("非控制面携带 isolation 应被拒绝，got %v", err)
+	}
+	if len(s.createCalls) != 0 {
+		t.Fatalf("拒绝前不得发布任务: %+v", s.createCalls)
+	}
+}
+
+// b. 静态合法：非 "workspace" 的隔离值必须报错（拼错不得静默降级为不隔离）。
+func TestPublishTask_Isolation_UnknownModeRejected(t *testing.T) {
+	s := newFakeStore()
+	g := schedulerCapableMeta(s)
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description": "bad isolation", "isolation": "container",
+	}))
+	if err == nil || !strings.Contains(err.Error(), "isolation 参数只接受") {
+		t.Fatalf("非法 isolation 值应被拒绝，got %v", err)
+	}
+	if len(s.createCalls) != 0 {
+		t.Fatalf("校验失败前不得发布任务: %+v", s.createCalls)
+	}
+}
+
+// 合法 isolation="workspace" 必须落到 Task.Capability.Isolation（去空白）。
+func TestPublishTask_Isolation_PersistedOnTask(t *testing.T) {
+	s := newFakeStore()
+	g := schedulerCapableMeta(s)
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description": "isolated node", "isolation": " workspace ",
+	}))
+	if err != nil {
+		t.Fatalf("合法 isolation 声明应发布成功: %v", err)
+	}
+	if len(s.createCalls) != 1 {
+		t.Fatalf("expected 1 task, got %d", len(s.createCalls))
+	}
+	cap := s.createCalls[0].Capability
+	if cap == nil || cap.Isolation == nil {
+		t.Fatalf("Task.Capability.Isolation 未写入: %+v", cap)
+	}
+	if cap.Isolation.Mode != "workspace" {
+		t.Errorf("Isolation.Mode 应去空白后为 workspace，got %q", cap.Isolation.Mode)
+	}
+	// 仅 isolation 时 Tools/Model 保持零值。
+	if len(cap.Tools) != 0 || cap.Model != "" {
+		t.Errorf("仅 isolation 的 Capability 形态错误: %+v", cap)
+	}
+}
+
+// isolation 与 tools/model 同设时三者完整落盘。
+func TestPublishTask_Isolation_WithToolsAndModel(t *testing.T) {
+	s := newFakeStore()
+	g := schedulerCapableMeta(s)
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description": "full cap", "tools": "read_file,write_file", "model": "deepseek-r1", "isolation": "workspace",
+	}))
+	if err != nil {
+		t.Fatalf("全量能力声明应发布成功: %v", err)
+	}
+	cap := s.createCalls[0].Capability
+	if cap == nil || cap.Isolation == nil || cap.Isolation.Mode != "workspace" {
+		t.Fatalf("Capability.Isolation 未随全量声明落盘: %+v", cap)
+	}
+	if len(cap.Tools) != 2 || cap.Model != "deepseek-r1" {
+		t.Errorf("Capability.Tools/Model 形态错误: %+v", cap)
+	}
+}

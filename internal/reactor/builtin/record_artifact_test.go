@@ -15,6 +15,7 @@ import (
 	"agentgo/internal/reactor"
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
+	"agentgo/internal/workspace"
 )
 
 // fakeStoreView 是只实现 StoreHookView 的最小 mock，记录 AppendArtifact 的调用。
@@ -252,5 +253,93 @@ func TestNormalizeArtifactPath(t *testing.T) {
 				t.Errorf("got=%q expected to contain %q", got, tc.wantContain)
 			}
 		})
+	}
+}
+
+// ===== workspace.Manager 注入（ResolveForTask 路径解析）=====
+// file_written 的 Path 恒为主根逻辑路径；隔离任务的真实文件在合并前位于
+// workspace 副本。这里锁定注入 Manager 后 reactor 经 ResolveForTask
+// 定位真实物理文件，同时保持 artifact 登记使用主根逻辑路径。
+
+// 注入 Manager 且任务有活动视图：meta 仍按解析后的物理路径正确重算。
+func TestRecordArtifactReactor_WithWorkspaceManager(t *testing.T) {
+	root := t.TempDir()
+	content := "isolated write\n"
+	abs := filepath.Join(root, "docs", "foo.md")
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(abs, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := workspace.NewManager(root, nil)
+	if _, err := mgr.Materialize("t-iso"); err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+
+	s := &fakeStoreView{}
+	r := NewRecordArtifactReactor(s, root, mgr)
+	if err := r.Run(trace.Event{Kind: trace.KindFileWritten, TaskID: "t-iso", Path: abs}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	calls := s.snapshotCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(calls))
+	}
+	if calls[0].path != "docs/foo.md" {
+		t.Errorf("登记路径应仍为主根逻辑相对路径, got %q", calls[0].path)
+	}
+	wantSum := sha256.Sum256([]byte(content))
+	if want := hex.EncodeToString(wantSum[:]); calls[0].meta.SHA256 != want {
+		t.Errorf("注入 Manager 后 sha256 应仍按物理文件重算, got %q want %q", calls[0].meta.SHA256, want)
+	}
+}
+
+// 注入 Manager 但任务无活动视图：ResolveForTask 原样返回主根路径，行为不变。
+func TestRecordArtifactReactor_ManagerWithoutActiveView(t *testing.T) {
+	root := t.TempDir()
+	content := "plain write\n"
+	abs := filepath.Join(root, "a.md")
+	if err := os.WriteFile(abs, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := workspace.NewManager(root, nil) // 不 Materialize：任务无视图
+	s := &fakeStoreView{}
+	r := NewRecordArtifactReactor(s, root, mgr)
+	if err := r.Run(trace.Event{Kind: trace.KindFileWritten, TaskID: "t-plain", Path: abs}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	calls := s.snapshotCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(calls))
+	}
+	wantSum := sha256.Sum256([]byte(content))
+	if want := hex.EncodeToString(wantSum[:]); calls[0].meta.SHA256 != want {
+		t.Errorf("无视图任务应回退主根路径重算, got %q want %q", calls[0].meta.SHA256, want)
+	}
+}
+
+// nil Manager（缺省注入）：维持注入前行为——直接用主根 Path 重算。
+func TestRecordArtifactReactor_NilManagerUnchanged(t *testing.T) {
+	root := t.TempDir()
+	content := "legacy path\n"
+	abs := filepath.Join(root, "b.md")
+	if err := os.WriteFile(abs, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &fakeStoreView{}
+	r := NewRecordArtifactReactor(s, root) // 不传 wsMgr
+	if err := r.Run(trace.Event{Kind: trace.KindFileWritten, TaskID: "t-legacy", Path: abs}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	calls := s.snapshotCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(calls))
+	}
+	wantSum := sha256.Sum256([]byte(content))
+	if want := hex.EncodeToString(wantSum[:]); calls[0].meta.SHA256 != want {
+		t.Errorf("nil Manager 应按注入前行为直读主根, got %q want %q", calls[0].meta.SHA256, want)
 	}
 }

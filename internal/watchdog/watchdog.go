@@ -14,6 +14,7 @@ import (
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
+	"agentgo/internal/workspace"
 )
 
 // PlanRouteRegistry is the smallest runtime-routing authority Watchdog needs.
@@ -63,6 +64,18 @@ type pendingObservation struct {
 	alerted bool
 }
 
+// WorkspaceCleaner 是 Watchdog 清扫孤儿 workspace 所需的最小控制面接口。
+// *workspace.Manager 天然满足（见下方编译期断言）；测试可注入 fake。
+type WorkspaceCleaner interface {
+	// ListOrphans 返回 workspace 根下全部任务目录的 taskID（不做存活判断）。
+	ListOrphans() ([]string, error)
+	// Cleanup 删除任务 workspace 目录并注销活动视图。
+	Cleanup(taskID string) error
+}
+
+// 编译期断言：*workspace.Manager 满足清扫接口。
+var _ WorkspaceCleaner = (*workspace.Manager)(nil)
+
 type Watchdog struct {
 	Store         store.TaskStore
 	Config        *config.Config
@@ -70,6 +83,10 @@ type Watchdog struct {
 	Roster        roster.Roster
 	MailRegistry  *mailbox.Registry // 2026-04-25 P1：超时/级联取消时向 task.EventSource 汇报
 	RouteResolver RouteResolver
+	// WorkspaceManager 是 workspace 控制面（nil-safe）：注入后每个巡检周期
+	// 顺带清扫孤儿 workspace（任务不存在或已达终态的任务目录）。
+	// nil 时跳过——保持既有测试与最小装配行为不变。
+	WorkspaceManager WorkspaceCleaner
 
 	pendingMu           sync.Mutex
 	pendingObservations map[string]pendingObservation
@@ -128,6 +145,10 @@ func (w *Watchdog) inspect() {
 
 	// 花名册兜底清理：清除不属于任何活跃代理的残留声明
 	w.cleanupStaleClaims(tasks)
+
+	// workspace 孤儿兜底清理：任务已终态 / 已消失的任务目录（合并成功的
+	// 正常清理由执行面负责，这里只兜失败 / 取消 / 崩溃的残留）
+	w.cleanupWorkspaceOrphans()
 }
 
 func (w *Watchdog) checkTask(task *model.Task) {
@@ -666,5 +687,38 @@ func (w *Watchdog) cleanupStaleClaims(tasks []*model.Task) {
 			log.Printf("[watchdog] 清理代理 %s 的残留花名册声明", agentID)
 			w.Roster.ReleaseAll(agentID)
 		}
+	}
+}
+
+// cleanupWorkspaceOrphans 清扫孤儿 workspace：ListOrphans 列出全部任务目录，
+// 逐个对照 TaskStore——任务不存在（已被淘汰）或已达终态（含 failed/cancelled
+// 的崩溃残留）的目录由 Manager.Cleanup 移除；任务仍活跃（pending/processing）
+// 的目录保留，可能是正在执行或可重试的隔离任务。
+// WorkspaceManager 为 nil 时整体跳过（nil-safe，行为与注入前一致）。
+func (w *Watchdog) cleanupWorkspaceOrphans() {
+	mgr := w.WorkspaceManager
+	if mgr == nil {
+		return
+	}
+	orphans, err := mgr.ListOrphans()
+	if err != nil {
+		log.Printf("[watchdog] workspace 孤儿扫描失败: %v", err)
+		return
+	}
+	for _, taskID := range orphans {
+		task, err := w.Store.GetTask(taskID)
+		switch {
+		case err != nil || task == nil:
+			// 任务已不存在（store 淘汰 / 从未登记）→ 孤儿，清理
+		case model.IsTerminal(task.Status):
+			// 任务已终态 → 残留的 workspace 不会再被使用，清理
+		default:
+			continue // 任务仍活跃，保留 workspace
+		}
+		if err := mgr.Cleanup(taskID); err != nil {
+			log.Printf("[watchdog] 清理孤儿 workspace 失败 (task=%s): %v", taskID, err)
+			continue
+		}
+		log.Printf("[watchdog] 已清理孤儿 workspace (task=%s)", taskID)
 	}
 }

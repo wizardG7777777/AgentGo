@@ -35,7 +35,7 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		ev   Event
 		want []string
 	}{
-		{"task_published", Event{Kind: KindTaskPublished, PublishedBy: "scheduler", Dependencies: []string{"dep"}, EventType: "worker", Priority: "high", Depth: 2, ToolsOverride: []string{"read_file", "web_fetch"}, ModelOverride: "deepseek-r1", Description: "work"}, []string{"by=scheduler", "deps=[dep]", "type=worker", "priority=high", "depth=2", "tools_override=[read_file web_fetch]", "model_override=deepseek-r1", `desc="work"`}},
+		{"task_published", Event{Kind: KindTaskPublished, PublishedBy: "scheduler", Dependencies: []string{"dep"}, EventType: "worker", Priority: "high", Depth: 2, ToolsOverride: []string{"read_file", "web_fetch"}, ModelOverride: "deepseek-r1", IsolationOverride: "workspace", Description: "work"}, []string{"by=scheduler", "deps=[dep]", "type=worker", "priority=high", "depth=2", "tools_override=[read_file web_fetch]", "model_override=deepseek-r1", "isolation_override=workspace", `desc="work"`}},
 		{"task_claimed", Event{Kind: KindTaskClaimed, Transition: transition}, []string{"prev=processing", "new=failed", "cause=test-cause"}},
 		{"task_submitted", Event{Kind: KindTaskSubmitted, OutputLen: 10, LoopsUsed: 2}, []string{"output_len=10", "loops_used=2"}},
 		{"task_completed", Event{Kind: KindTaskCompleted, OutputLen: 10, LoopsUsed: 2, Transition: transition}, []string{"cause=test-cause", "output_len=10", "loops_used=2"}},
@@ -55,6 +55,10 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"file_write_queued", Event{Kind: KindFileWriteQueued, Path: "a.go", QueueLen: 2, WaitMS: 15, Description: "acquired"}, []string{"path=a.go", "queue_len=2", "wait_ms=15", `desc="acquired"`}},
 		{"progress_notify", Event{Kind: KindProgressNotify, NotifyType: "halfway"}, []string{"notify_type=halfway"}},
 		{"memory_context_inject", Event{Kind: KindMemoryContextInject, NotifyType: "team_snapshot", Path: "team_snapshot:worker-1", OutputLen: 128}, []string{"source=team_snapshot", "key=team_snapshot:worker-1", "runes=128"}},
+		{"workspace_materialized", Event{Kind: KindWorkspaceMaterialized, Path: "/proj/.agentgo/workspaces/t1"}, []string{"path=/proj/.agentgo/workspaces/t1"}},
+		{"workspace_merged", Event{Kind: KindWorkspaceMerged, Description: "fast_forward=2 auto_merged=1"}, []string{`desc="fast_forward=2 auto_merged=1"`}},
+		{"workspace_merge_conflict", Event{Kind: KindWorkspaceMergeConflict, Path: "/proj/a.go", Description: "regions=2"}, []string{"path=/proj/a.go", `desc="regions=2"`}},
+		{"workspace_cleaned", Event{Kind: KindWorkspaceCleaned, Path: "/proj/.agentgo/workspaces/t1"}, []string{"path=/proj/.agentgo/workspaces/t1"}},
 		{"error", Event{Kind: KindError, Error: "boom", Reason: "reactor"}, []string{`error="boom"`, `reason="reactor"`}},
 		{"agent_state_changed", Event{Kind: KindAgentStateChanged, Transition: &Transition{PrevState: "idle", NewState: "processing", Cause: "claim"}}, []string{"prev=idle", "new=processing", "cause=claim"}},
 		{"shell_executed", Event{Kind: KindShellExecuted, Tool: "run_shell", Args: map[string]any{"command": "go test"}, ShellExec: &ShellExec{Command: "go test", ExitCode: 0, DurationMS: 9, Outcome: "success", StdoutExcerpt: "ok", StderrExcerpt: "warn"}}, []string{`cmd="go test"`, "exit=0", "outcome=success", `stdout="ok"`, `stderr="warn"`, "tool=run_shell"}},
@@ -69,8 +73,8 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"plan_paused", planEvent(KindPlanPaused, "budget"), []string{`reason="budget"`, "acceptance_revision=2"}},
 		{"plan_terminal", planEvent(KindPlanTerminal, "pass"), []string{`reason="pass"`, "plan=plan-1"}},
 	}
-	if len(cases) != 33 {
-		t.Fatalf("test inventory has %d built-in EventKinds, want 33", len(cases))
+	if len(cases) != 37 {
+		t.Fatalf("test inventory has %d built-in EventKinds, want 37", len(cases))
 	}
 	seen := make(map[string]struct{}, len(cases))
 	for _, tc := range cases {

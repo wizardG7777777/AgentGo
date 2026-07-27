@@ -155,7 +155,8 @@ func canonicalArtifactKey(projectRoot, p string) string {
 	return clean
 }
 
-func runShellWorkingDirMatchesProjectRoot(projectRoot string, args map[string]any) (bool, error) {	rootAbs, err := filepath.Abs(projectRoot)
+func runShellWorkingDirMatchesProjectRoot(projectRoot string, args map[string]any) (bool, error) {
+	rootAbs, err := filepath.Abs(projectRoot)
 	if err != nil {
 		return false, fmt.Errorf("resolve absolute project root: %w", err)
 	}
@@ -521,10 +522,15 @@ func cloneNodeCapability(c *model.NodeCapability) *model.NodeCapability {
 	if c == nil {
 		return nil
 	}
-	return &model.NodeCapability{
+	out := &model.NodeCapability{
 		Tools: append([]string(nil), c.Tools...),
 		Model: c.Model,
 	}
+	if c.Isolation != nil {
+		iso := *c.Isolation
+		out.Isolation = &iso
+	}
+	return out
 }
 
 // plannedMutationPrep 是 recordPlannedTaskMutation 的可批处理中间形态：

@@ -25,7 +25,12 @@ type mismatch struct {
 //
 // Phase: PreCall, Priority: 25（位于 ValidateExpectedHash=20 与
 // RequireReadBeforeWrite=30 之间）。
-type ValidateLineAnchorsHook struct{}
+type ValidateLineAnchorsHook struct {
+	// ResolvePhysicalPath 与 ValidateExpectedHashHook 同名字段同义：
+	// 隔离任务 copy-on-write 后行哈希必须对 workspace 副本重算，
+	// 否则会把对副本的合法编辑误判为失配。nil 时按 args 原路径读取。
+	ResolvePhysicalPath PhysicalPathResolver
+}
 
 // NewValidateLineAnchorsHook 构造函数。
 func NewValidateLineAnchorsHook() *ValidateLineAnchorsHook {
@@ -56,6 +61,9 @@ func (h *ValidateLineAnchorsHook) Run(hctx hook.ToolHookContext) hook.ToolHookDe
 	path, ok := hctx.Args["path"].(string)
 	if !ok || path == "" {
 		return hook.ToolHookDecision{Action: hook.Continue}
+	}
+	if h.ResolvePhysicalPath != nil {
+		path = h.ResolvePhysicalPath(hctx.TaskID, path)
 	}
 
 	data, err := os.ReadFile(path)

@@ -11,7 +11,7 @@ import (
 
 func digestTestPlan(cap *model.NodeCapability) *model.Plan {
 	return &model.Plan{
-		ID:            "p1",
+		ID:             "p1",
 		CurrentNodeIDs: []string{"n1"},
 		Nodes: map[string]model.PlanNode{
 			"n1": {TaskID: "n1", Title: "t", Role: model.PlanNodeRoleImplementation, Capability: cap},
@@ -55,5 +55,56 @@ func TestComputeWorkGraphDigest_CapabilityIncluded(t *testing.T) {
 	withCap := ComputeWorkGraphDigest(digestTestPlan(&model.NodeCapability{Tools: []string{"read_file"}}))
 	if without == withCap {
 		t.Error("work 口径同样纳入 capability（节点执行边界是工作图语义的一部分）")
+	}
+}
+
+// ===== isolation（执行隔离声明）纳入 digest 的口径 =====
+// 隔离改变节点的写入落点与合并语义（overlay vs 主根直写），与 tools/model
+// 同属执行边界：有无 isolation 的 plan digest 必须不同；Mode 空串与 nil 等价。
+
+func TestComputeGraphDigest_IsolationChangesDigest(t *testing.T) {
+	without := ComputeGraphDigest(digestTestPlan(nil))
+	withIsolation := ComputeGraphDigest(digestTestPlan(&model.NodeCapability{
+		Isolation: &model.IsolationSpec{Mode: model.IsolationModeWorkspace},
+	}))
+	if without == withIsolation {
+		t.Error("新增 isolation 隔离声明必须改变 graph digest（旧验收应失效）")
+	}
+
+	// work 口径同样纳入。
+	withoutWork := ComputeWorkGraphDigest(digestTestPlan(nil))
+	withWork := ComputeWorkGraphDigest(digestTestPlan(&model.NodeCapability{
+		Isolation: &model.IsolationSpec{Mode: model.IsolationModeWorkspace},
+	}))
+	if withoutWork == withWork {
+		t.Error("work 口径同样纳入 isolation（隔离是工作图语义的一部分）")
+	}
+}
+
+func TestComputeGraphDigest_IsolationNormalization(t *testing.T) {
+	// Mode 空串 ≡ Isolation nil ≡ Capability 全空 ≡ nil：四者 digest 一致。
+	base := ComputeGraphDigest(digestTestPlan(nil))
+	emptySpec := ComputeGraphDigest(digestTestPlan(&model.NodeCapability{
+		Isolation: &model.IsolationSpec{},
+	}))
+	emptyMode := ComputeGraphDigest(digestTestPlan(&model.NodeCapability{
+		Isolation: &model.IsolationSpec{Mode: "  "},
+	}))
+	if base != emptySpec {
+		t.Error("Isolation 空 spec 与 nil 必须归一为同一 digest")
+	}
+	if base != emptyMode {
+		t.Error("Isolation.Mode 空白与 nil 必须归一为同一 digest")
+	}
+
+	// Mode 去空白归一：「 workspace 」与「workspace」语义相同，digest 一致。
+	padded := ComputeGraphDigest(digestTestPlan(&model.NodeCapability{
+		Isolation: &model.IsolationSpec{Mode: " workspace "},
+	}))
+	trimmed := ComputeGraphDigest(digestTestPlan(&model.NodeCapability{
+		Isolation: &model.IsolationSpec{Mode: "workspace"},
+	}))
+	if padded != trimmed {
+		t.Error("Isolation.Mode 的周边空白不得改变 digest")
 	}
 }

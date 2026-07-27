@@ -49,10 +49,10 @@ func TestValidateLineAnchorsHook_EmptyAnchorsContinues(t *testing.T) {
 	d := h.Run(hook.ToolHookContext{
 		ToolName: "edit_file",
 		Args: map[string]any{
-			"path":          "/any/foo.go",
-			"old_str":       "x",
-			"new_str":       "y",
-			"line_anchors":  []any{},
+			"path":         "/any/foo.go",
+			"old_str":      "x",
+			"new_str":      "y",
+			"line_anchors": []any{},
 		},
 	})
 	if d.Action != hook.Continue {
@@ -82,9 +82,9 @@ func TestValidateLineAnchorsHook_FileNotExistContinues(t *testing.T) {
 	d := h.Run(hook.ToolHookContext{
 		ToolName: "write_file",
 		Args: map[string]any{
-			"path":          missing,
-			"content":       "x",
-			"line_anchors":  []any{"1#VK"},
+			"path":         missing,
+			"content":      "x",
+			"line_anchors": []any{"1#VK"},
 		},
 	})
 	if d.Action != hook.Continue {
@@ -109,10 +109,10 @@ func TestValidateLineAnchorsHook_MatchSuccess(t *testing.T) {
 	d := h.Run(hook.ToolHookContext{
 		ToolName: "edit_file",
 		Args: map[string]any{
-			"path":          fp,
-			"old_str":       "package main",
-			"new_str":       "package hashline",
-			"line_anchors":  anchors,
+			"path":         fp,
+			"old_str":      "package main",
+			"new_str":      "package hashline",
+			"line_anchors": anchors,
 		},
 	})
 	if d.Action != hook.Continue {
@@ -135,10 +135,10 @@ func TestValidateLineAnchorsHook_HashMismatch(t *testing.T) {
 	d := h.Run(hook.ToolHookContext{
 		ToolName: "edit_file",
 		Args: map[string]any{
-			"path":          fp,
-			"old_str":       "x",
-			"new_str":       "y",
-			"line_anchors":  anchors,
+			"path":         fp,
+			"old_str":      "x",
+			"new_str":      "y",
+			"line_anchors": anchors,
 		},
 	})
 	if d.Action != hook.Abort {
@@ -168,8 +168,8 @@ func TestValidateLineAnchorsHook_LineOutOfRange(t *testing.T) {
 	d := h.Run(hook.ToolHookContext{
 		ToolName: "edit_file",
 		Args: map[string]any{
-			"path":          fp,
-			"line_anchors":  anchors,
+			"path":         fp,
+			"line_anchors": anchors,
 		},
 	})
 	if d.Action != hook.Abort {
@@ -189,8 +189,8 @@ func TestValidateLineAnchorsHook_ParseError(t *testing.T) {
 	d := h.Run(hook.ToolHookContext{
 		ToolName: "edit_file",
 		Args: map[string]any{
-			"path":          fp,
-			"line_anchors":  anchors,
+			"path":         fp,
+			"line_anchors": anchors,
 		},
 	})
 	if d.Action != hook.Abort {
@@ -214,8 +214,8 @@ func TestValidateLineAnchorsHook_ContextLines(t *testing.T) {
 	d := h.Run(hook.ToolHookContext{
 		ToolName: "edit_file",
 		Args: map[string]any{
-			"path":          fp,
-			"line_anchors":  anchors,
+			"path":         fp,
+			"line_anchors": anchors,
 		},
 	})
 	if d.Action != hook.Abort {
@@ -244,8 +244,8 @@ func TestValidateLineAnchorsHook_ViaRegistry(t *testing.T) {
 	d := reg.RunPre(hook.ToolHookContext{
 		ToolName: "edit_file",
 		Args: map[string]any{
-			"path":          fp,
-			"line_anchors":  []any{"1#ZZ"},
+			"path":         fp,
+			"line_anchors": []any{"1#ZZ"},
 		},
 	})
 	if d.Action != hook.Abort {
@@ -320,4 +320,48 @@ func TestValidateLineAnchorsHook_ChainOverridesExpectedHash(t *testing.T) {
 				d.HookName)
 		}
 	})
+}
+
+// ---- 写时复制隔离：行哈希应对 workspace 副本重算 ----
+
+func TestValidateLineAnchorsHook_ResolvePhysicalPath(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.go")
+	wsPath := filepath.Join(dir, "ws.go")
+	if err := os.WriteFile(mainPath, []byte("alpha\nbeta\n"), 0644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if err := os.WriteFile(wsPath, []byte("alpha\ngamma\n"), 0644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	// 副本第 2 行是 gamma：锚点按副本内容构造
+	wsAnchor := "2#" + hashline.ComputeLineHash(2, "gamma")
+	mainAnchor := "2#" + hashline.ComputeLineHash(2, "beta")
+
+	h := NewValidateLineAnchorsHook()
+	h.ResolvePhysicalPath = func(taskID, p string) string {
+		if p == mainPath {
+			return wsPath
+		}
+		return p
+	}
+
+	d := h.Run(hook.ToolHookContext{
+		TaskID:   "t1",
+		ToolName: "edit_file",
+		Args:     map[string]any{"path": mainPath, "line_anchors": []any{wsAnchor}},
+	})
+	if d.Action != hook.Continue {
+		t.Fatalf("应对 workspace 副本校验通过，实际 %v（%s）", d.Action, d.AbortReason)
+	}
+
+	// 主根内容的锚点在副本上失配 → Abort（证明读的确是副本）
+	d2 := h.Run(hook.ToolHookContext{
+		TaskID:   "t1",
+		ToolName: "edit_file",
+		Args:     map[string]any{"path": mainPath, "line_anchors": []any{mainAnchor}},
+	})
+	if d2.Action != hook.Abort {
+		t.Fatalf("主根锚点对副本应失配 Abort，实际 %v", d2.Action)
+	}
 }

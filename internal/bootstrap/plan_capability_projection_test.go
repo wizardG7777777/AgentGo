@@ -22,7 +22,10 @@ func TestPreparePlannedTask_ProjectsCapabilityToPlanNode(t *testing.T) {
 	child := &model.Task{
 		Description: "capped node", EventSource: root.ID,
 		PlanMutationSource: "scheduler",
-		Capability:         &model.NodeCapability{Tools: []string{"read_file", "web_fetch"}, Model: "deepseek-r1"},
+		Capability: &model.NodeCapability{
+			Tools: []string{"read_file", "web_fetch"}, Model: "deepseek-r1",
+			Isolation: &model.IsolationSpec{Mode: model.IsolationModeWorkspace},
+		},
 	}
 	if err := taskStore.PublishTask(child); err != nil {
 		t.Fatal(err)
@@ -45,12 +48,19 @@ func TestPreparePlannedTask_ProjectsCapabilityToPlanNode(t *testing.T) {
 	if node.Capability.Model != "deepseek-r1" {
 		t.Errorf("投影 Model 不符: %q", node.Capability.Model)
 	}
+	if node.Capability.Isolation == nil || node.Capability.Isolation.Mode != model.IsolationModeWorkspace {
+		t.Errorf("投影 Isolation 不符: %+v", node.Capability.Isolation)
+	}
 
 	// 必须是克隆而非指针共享：改写 Task 侧不得影响已注册的 PlanNode。
 	child.Capability.Tools[0] = "mutated"
+	child.Capability.Isolation.Mode = "mutated"
 	pAfter, _ := coordinator.Store().GetPlan(root.PlanID)
 	if pAfter.Nodes[child.ID].Capability.Tools[0] != "read_file" {
 		t.Error("PlanNode.Capability 与 Task 共享了底层数组——投影必须克隆")
+	}
+	if pAfter.Nodes[child.ID].Capability.Isolation.Mode != model.IsolationModeWorkspace {
+		t.Error("PlanNode.Capability.Isolation 与 Task 共享了指针——投影必须克隆")
 	}
 
 	// digest 口径：同构图无 capability 的对照 plan，digest 必须不同。

@@ -126,6 +126,28 @@ func (g LocalWriteGroup) claimOrWait(ctx context.Context, path, verb string) err
 	return nil
 }
 
+// resolveWritePath 在 pathutil.ValidatePath 之后把主根逻辑路径解析为物理写入位置
+// （按任务写时复制隔离）。Workdir 同时实现 PathOverlayer 时（runner 装配的
+// workspace.Swapper）经它解析：edit 场景由实现方完成 copy-on-write 基线复制，
+// 新文件直接落任务 workspace；无隔离（未实现或 passthrough）时原样返回。
+// isolated=true 表示隔离生效——workspace 内本任务独占，调用方据此跳过
+// claimOrWait / Roster.Release（主根锁在任务终态合并时由 workspace.Manager
+// 逐文件统一声明）。
+func (g LocalWriteGroup) resolveWritePath(logicalPath string) (physicalPath string, isolated bool, err error) {
+	ov, ok := g.Workdir.(PathOverlayer)
+	if !ok {
+		return logicalPath, false, nil
+	}
+	newPath, err := ov.WritePath(logicalPath)
+	if err != nil {
+		return "", false, fmt.Errorf("解析隔离写入位置失败: %w", err)
+	}
+	if newPath != logicalPath {
+		return newPath, true, nil
+	}
+	return logicalPath, false, nil
+}
+
 // writeFile 实现 write_file 工具。端口自 worker.makeWriteFileTool。
 // 严格顺序：validate → claimOrWait → (defer Release) → MkdirAll → WriteFile → 缓存失效。
 // 注：expected_hash 校验在 C7 后由 ValidateExpectedHashHook 接管，不再在工具内部读取。
@@ -148,11 +170,24 @@ func (g LocalWriteGroup) writeFile(ctx context.Context, args map[string]any) (st
 		path = validPath
 	}
 
-	// §8.3：通过 claimOrWait 声明文件写入权——冲突时排队等待前任释放
-	if err := g.claimOrWait(ctx, path, "写入"); err != nil {
+	// 按任务写时复制隔离：logicalPath 始终是主根逻辑路径（trace 事件与返回
+	// 消息的账目坐标恒为主根；物理定位由 workspace.Manager.ResolveForTask
+	// 负责），path 在此之后为实际落盘的物理路径。
+	logicalPath := path
+	physicalPath, isolated, err := g.resolveWritePath(logicalPath)
+	if err != nil {
 		return "", err
 	}
-	defer g.Roster.Release(g.AgentID, path)
+	path = physicalPath
+
+	// §8.3：通过 claimOrWait 声明文件写入权——冲突时排队等待前任释放。
+	// 隔离生效时跳过：workspace 内本任务独占，主根锁由合并时统一声明。
+	if !isolated {
+		if err := g.claimOrWait(ctx, path, "写入"); err != nil {
+			return "", err
+		}
+		defer g.Roster.Release(g.AgentID, path)
+	}
 
 	// C7 迁移：原 expected_hash 校验段已删除。
 	// 乐观并发控制由 ValidateExpectedHashHook（PreCall, prio=20）接管。
@@ -168,26 +203,35 @@ func (g LocalWriteGroup) writeFile(ctx context.Context, args map[string]any) (st
 		return "", fmt.Errorf("写入文件失败: %w", err)
 	}
 
-	// 写入后使缓存失效
+	// 写入后使缓存失效（键为最终物理路径，与 read_file 的 Get/Put 键一致）
 	if g.Cache != nil {
 		g.Cache.Invalidate(path)
 	}
 
-	// Trace：file_written 事件（可审计的落盘记录）
-	trace.Emit(trace.Event{
+	// Trace：file_written 事件（可审计的落盘记录）。
+	// Path 保持主根逻辑路径——record-artifact / 验收的账目坐标恒为主根。
+	writeEv := trace.Event{
 		Kind:    trace.KindFileWritten,
 		TaskID:  agent.TaskIDFromContext(ctx),
 		AgentID: g.AgentID,
 		Tool:    "write_file",
-		Path:    path,
+		Path:    logicalPath,
 		Bytes:   len(content),
 		Hash:    computeSHA256([]byte(content)),
-	})
+	}
+	if isolated {
+		writeEv.Description = fmt.Sprintf("写时复制隔离：落点 %s，任务成功终态合并回主根", path)
+	}
+	trace.Emit(writeEv)
 
 	// Artifacts：C5 迁移后由 RecordArtifactHook（PostCall）记录到 task.Artifacts。
 	// 详见 internal/hook/builtin/record_artifact.go。
 
-	return fmt.Sprintf("文件已写入: %s (%d 字节)", path, len(content)), nil
+	result := fmt.Sprintf("文件已写入: %s (%d 字节)", logicalPath, len(content))
+	if isolated {
+		result += "（写时复制隔离：已落入任务工作区，任务完成后合并回主根）"
+	}
+	return result, nil
 }
 
 // editFile 实现 edit_file 工具。端口自 worker.makeEditFileTool。
@@ -224,13 +268,26 @@ func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (str
 		path = validPath
 	}
 
-	// §8.3：通过 claimOrWait 声明文件写入权——冲突时排队等待前任释放
-	if err := g.claimOrWait(ctx, path, "编辑"); err != nil {
+	// 按任务写时复制隔离：logicalPath 始终是主根逻辑路径（trace 事件与返回
+	// 消息的账目坐标恒为主根）；WritePath 顺带完成 copy-on-write——主根已有
+	// 文件先复制基线进 workspace，下方读取/替换/写回都作用于副本。
+	logicalPath := path
+	physicalPath, isolated, err := g.resolveWritePath(logicalPath)
+	if err != nil {
 		return "", err
 	}
-	defer g.Roster.Release(g.AgentID, path)
+	path = physicalPath
 
-	// 读取文件（锁持有期间）
+	// §8.3：通过 claimOrWait 声明文件写入权——冲突时排队等待前任释放。
+	// 隔离生效时跳过：workspace 内本任务独占，主根锁由合并时统一声明。
+	if !isolated {
+		if err := g.claimOrWait(ctx, path, "编辑"); err != nil {
+			return "", err
+		}
+		defer g.Roster.Release(g.AgentID, path)
+	}
+
+	// 读取文件（锁持有期间；隔离时读 workspace 内的 copy-on-write 基线副本）
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("文件不存在: %s", path)
@@ -279,21 +336,26 @@ func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (str
 		return "", fmt.Errorf("写入文件失败: %w", err)
 	}
 
-	// 写入后使缓存失效
+	// 写入后使缓存失效（键为最终物理路径，与 read_file 的 Get/Put 键一致）
 	if g.Cache != nil {
 		g.Cache.Invalidate(path)
 	}
 
-	// Trace：file_written 事件（edit 也算一次落盘）
-	trace.Emit(trace.Event{
+	// Trace：file_written 事件（edit 也算一次落盘）。
+	// Path 保持主根逻辑路径——record-artifact / 验收的账目坐标恒为主根。
+	writeEv := trace.Event{
 		Kind:    trace.KindFileWritten,
 		TaskID:  agent.TaskIDFromContext(ctx),
 		AgentID: g.AgentID,
 		Tool:    "edit_file",
-		Path:    path,
+		Path:    logicalPath,
 		Bytes:   len(newContent),
 		Hash:    computeSHA256([]byte(newContent)),
-	})
+	}
+	if isolated {
+		writeEv.Description = fmt.Sprintf("写时复制隔离：落点 %s，任务成功终态合并回主根", path)
+	}
+	trace.Emit(writeEv)
 
 	// Artifacts：C5 迁移后由 RecordArtifactHook（PostCall）记录到 task.Artifacts。
 
@@ -307,9 +369,12 @@ func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (str
 		removed = oldLen - newLen
 	}
 
-	result := fmt.Sprintf("文件已编辑: %s (字节变化: +%d/-%d)", path, added, removed)
+	result := fmt.Sprintf("文件已编辑: %s (字节变化: +%d/-%d)", logicalPath, added, removed)
 	if crlfRetried {
 		result += "（提示：该文件为 CRLF 行尾，已按 CRLF 兼容模式完成替换，行尾保持 CRLF 不变）"
+	}
+	if isolated {
+		result += "（写时复制隔离：已落入任务工作区，任务完成后合并回主根）"
 	}
 	return result, nil
 }

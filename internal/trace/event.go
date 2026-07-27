@@ -111,6 +111,23 @@ const (
 	// 通用错误事件（比 task_completed 严重的故障，但任务并未终止）
 	KindError EventKind = "error"
 
+	// === 工作区隔离（workspace isolation）===
+
+	// 任务 workspace 物化完成（认领隔离任务时）。payload：Path=workspace 根路径。
+	KindWorkspaceMaterialized EventKind = "workspace_materialized"
+
+	// 任务 workspace 合并回主根完成。payload：Description 含逐文件结果摘要
+	//（fast-forward / auto-merged 计数）。
+	KindWorkspaceMerged EventKind = "workspace_merged"
+
+	// 合并出现无法自动解决的冲突。payload：Path=冲突文件，
+	// Description=冲突详情（区域数、基线/主根/workspace 三方哈希）。
+	KindWorkspaceMergeConflict EventKind = "workspace_merge_conflict"
+
+	// 任务 workspace 已清理（合并成功后或 Watchdog 孤儿清扫）。
+	// payload：Path=workspace 根路径。
+	KindWorkspaceCleaned EventKind = "workspace_cleaned"
+
 	// === v5 Phase 2 新增（TraceUpgrade.md §4） ===
 
 	// Agent 实例状态机变更（ReactiveSystem.md §7.2 引入的 4 状态机）。
@@ -268,6 +285,8 @@ type Event struct {
 	// 未声明时缺省（omitempty），保持旧 jsonl 兼容。
 	ToolsOverride []string `json:"tools_override,omitempty"`
 	ModelOverride string   `json:"model_override,omitempty"`
+	// IsolationOverride 非空 = 该节点声明了执行隔离模式（如 "workspace"）。
+	IsolationOverride string `json:"isolation_override,omitempty"`
 
 	// --- LLM 调用字段 ---
 	PromptTokens     int    `json:"prompt_tokens,omitempty"`

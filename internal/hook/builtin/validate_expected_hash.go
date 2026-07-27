@@ -33,9 +33,21 @@ import (
 //   - 计算的 SHA256 != expected_hash → Abort，错误消息包含期望和实际 hash
 //   - hash 一致 → Continue
 //
+// PhysicalPathResolver 把任务的主根逻辑路径解析为当前物理路径。
+// 任务处于按任务写时复制隔离（workspace isolation）时，copy-on-write 之后
+// 文件真实内容在 workspace 副本中，PreCall 的内容校验必须读副本而非主根
+// 旧版本——否则会把对副本的合法编辑误判为「已被其他代理修改」。
+// 签名与 workspace.Manager.ResolveForTask 一致，装配时直接赋值（可在其外
+// 再包一层 pathutil.ValidatePath 归一相对路径，见 bootstrap 接线）。
+type PhysicalPathResolver func(taskID, absPath string) string
+
 // Phase: PreCall, Priority: 20（位于 PathBoundary=10 之后，先做路径
 // 校验再做内容校验是合理的顺序）。
-type ValidateExpectedHashHook struct{}
+type ValidateExpectedHashHook struct {
+	// ResolvePhysicalPath 为 nil 时按 args 原路径读取（非隔离任务零开销，
+	// 行为与 C7 迁移时完全一致）。
+	ResolvePhysicalPath PhysicalPathResolver
+}
 
 // NewValidateExpectedHashHook 是 ValidateExpectedHashHook 的构造函数。
 // 本 hook 无任何外部依赖，构造函数仅为 API 一致性而存在。
@@ -75,7 +87,7 @@ func (h *ValidateExpectedHashHook) Run(hctx hook.ToolHookContext) hook.ToolHookD
 		return hook.ToolHookDecision{Action: hook.Continue}
 	}
 
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(h.resolvePath(hctx))
 	if err != nil {
 		if os.IsNotExist(err) {
 			// 文件不存在 → 允许新建，与原 inline 行为一致
@@ -102,6 +114,16 @@ func (h *ValidateExpectedHashHook) Run(hctx hook.ToolHookContext) hook.ToolHookD
 	return hook.ToolHookDecision{Action: hook.Continue}
 }
 
+// resolvePath 返回校验应读取的物理路径：装配了 ResolvePhysicalPath
+// （按任务写时复制隔离）时解析到 workspace 副本，否则返回 args 原路径。
+func (h *ValidateExpectedHashHook) resolvePath(hctx hook.ToolHookContext) string {
+	path, _ := hctx.Args["path"].(string)
+	if h.ResolvePhysicalPath != nil && path != "" {
+		return h.ResolvePhysicalPath(hctx.TaskID, path)
+	}
+	return path
+}
+
 // sha256Hex 计算字节切片的 SHA256 摘要并返回十六进制字符串。
 // 与 internal/tools 包的 computeSHA256 行为完全一致 —— 这里独立实现是为了
 // 避免 hook/builtin 包反向依赖 tools 包，保持依赖方向单一（hook 只依赖 store）。
@@ -109,4 +131,3 @@ func sha256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
-

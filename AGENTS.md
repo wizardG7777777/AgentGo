@@ -105,6 +105,7 @@ main.go（子命令 trace / config 分流；否则 -config 等 flags）
 | `internal/output` | 类型化输出通道事件（文本 / 任务结果，不用魔法字符串分类） |
 | `internal/watchdog` | 周期健康检查、级联取消、roster 清理、超时检测（110% 阈值）、panic 自动重启 |
 | `internal/webtool` | Web 搜索 + URL 抓取，SSRF 防护，搜索后端可插拔 |
+| `internal/workspace` | 按任务写时复制执行隔离：Manager（物化/合并/清理/孤儿扫描）、View（overlay 读穿透/写落副本）、Swapper（per-Runner 换入）；`types.go` 为冻结契约 |
 
 > v5 已删除（不要再找）：`internal/cli`、`internal/worker`、`internal/explorer`。
 
@@ -115,7 +116,7 @@ main.go（子命令 trace / config 分流；否则 -config 等 flags）
 - **按任务取消**：`TaskCancelRegistry` 给每个任务挂可取消 context，任务进入终态即取消，执行中代理经 `ctx.Done()` 立即感知。
 - **错误分型**：`llm.ErrRecoverable`（429/5xx）与 `ErrBadResponse`（length 截断）桥接为 `agent.ErrRecoverable` 触发重试回滚；`ErrUnrecoverable`（401/403）直接失败任务。
 - **Kind 即配置**：`setting.yaml` 的 `agents[*]` 声明 kind + replicas + `profile`/`tools` + model + prompt；Bootstrap 按 kind×replica 建 Runner。运行时没有 `Agent.Kind` 枚举分支。
-- **工具按 allowlist 剪枝**：`runner.resolveToolGroups()` 注册全部 ToolGroup，`ToolRegistry` 按 `AllowedTools` 在注册时剪掉未授权工具；任务级再经 `publish_task` 的 `tools` 参数二次裁剪——provision 时 kind 白名单是天花板，plan 时节点可声明更小的子集，认领后当次生效。新增工具必须同步 `internal/tools/known_tools.go`。
+- **工具按 allowlist 剪枝**：`runner.resolveToolGroups()` 注册全部 ToolGroup，`ToolRegistry` 按 `AllowedTools` 在注册时剪掉未授权工具；任务级再经 `publish_task` 的 `tools` 参数二次裁剪——provision 时 kind 白名单是天花板，plan 时节点可声明更小的子集，认领后当次生效。新增工具必须同步 `internal/tools/known_tools.go`。节点能力容器 `model.NodeCapability` 另挂 `Isolation` 字段（写时复制执行隔离，见下条）。
 - **公告板**：发布 → pending；`QueryAvailable(eventType)` 按优先级排序轮询；`ClaimTask` 原子转 processing（认领时查依赖与并发上限）。终态 `Task.Results` 完整保留，board 快照只带预算内摘录（`result_refs`）；`Task.Artifacts`（实际产出，record-artifact Reactor 追加）≠ `Task.ExpectedArtifacts`（声明契约，Gate + 终止时校验）；`Task.ReadSet` 由 read-set-write Reactor 维护。
 - **Roster 花名册**：`write_file`/`edit_file` 先 `TryClaim`，被占用时返回含「占用」与占用者 ID 的错误；Watchdog 清理不再活跃代理的 claims；Roster 监听器写 `file_awareness` 到 Memory。
 - **Gate**：`Decision.Action ∈ {Continue, Abort}`；同 Phase 内按 Priority 升序；panic 恢复为 Continue；nil Registry 一律 Continue。内置 11 个：tool:preCall 7 个（exec-mode-guard / path-boundary / validate-expected-hash / require-read-before-write / dependency-validator / enforce-expected-artifacts / validate-line-anchors）、beforeSend 1 个（chain-depth-limit）、beforeDeliver 1 个（per-agent-dedup）、beforeWake 2 个（wake-worthy-filter / wake-context-expand）。
@@ -152,7 +153,7 @@ pending → cancelled / failed
 | Scheduler 专属 | `cancel_task` `get_task_result` `report_done` `report_progress` `probe_directory` |
 | AgentTemplate（Scheduler 专属） | `list_agent_templates` `provision_agent_team` |
 
-普通 Runner 的工具来自 `tool_profiles` 或 `agents[].tools`；Scheduler 专属组不走 profile。`publish_task` 另接受可选 `tools`（逗号分隔工具名子集）与 `model`（模型名）参数（仅 Scheduler 计划控制面可设置），为单个 DAG 节点声明能力覆盖（`model.NodeCapability`）：认领 Runner 当次换入过滤后的工具注册表视图并临时替换模型，任务结束恢复。节点工具集必须 ⊆ 某条现存路由的白名单——`QueryAvailable(eventType, agentID)` 按认领方过滤 + `ClaimTask` 落锁前 `CanClaim` 叠加检查（双保险，fail-closed），子集越界的任务对所有 Runner 不可见，滞留至 Watchdog 发出 `claim_starvation` 告警后由 Scheduler 修复；无 override 的任务行为不变。详见 `docs/design/per-node-capability.md`。
+普通 Runner 的工具来自 `tool_profiles` 或 `agents[].tools`；Scheduler 专属组不走 profile。`publish_task` 另接受可选 `tools`（逗号分隔工具名子集）、`model`（模型名）与 `isolation`（执行隔离，唯一合法值 `"workspace"`）参数（仅 Scheduler 计划控制面可设置），为单个 DAG 节点声明能力覆盖（`model.NodeCapability`）：认领 Runner 当次换入过滤后的工具注册表视图并临时替换模型，任务结束恢复；声明 `isolation:"workspace"` 的节点在写时复制 overlay 中执行（读穿透主根、写落 `.agentgo/workspaces/<taskID>/`），成功终态控制面自动合并回主根，冲突 → 任务 failed + 自动 replan 由 Scheduler 裁决（详见 `docs/design/workspace-isolation.md`）。节点工具集必须 ⊆ 某条现存路由的白名单——`QueryAvailable(eventType, agentID)` 按认领方过滤 + `ClaimTask` 落锁前 `CanClaim` 叠加检查（双保险，fail-closed），子集越界的任务对所有 Runner 不可见，滞留至 Watchdog 发出 `claim_starvation` 告警后由 Scheduler 修复；无 override 的任务行为不变。详见 `docs/design/per-node-capability.md`。
 
 ## 配置（v4 schema，唯一支持的格式）
 
@@ -198,7 +199,8 @@ AgentGo 同等支持 Windows / macOS / Linux。以下每一条都曾在生产坏
 - `docs/activate/ReactiveSystem.md` — v5 Gate + Reactor 架构
 - `docs/activate/MemoryManageSystem.md` — v5 Memory 设计与迁移
 - `docs/design/interaction.md` — Interaction 状态机、Plan/Shell effect 边界、TUI/Web 响应契约
-- `docs/design/per-node-capability.md` — per-node 能力覆盖（publish_task tools/model）设计
+- `docs/design/per-node-capability.md` — per-node 能力覆盖（publish_task tools/model/isolation）设计
+- `docs/design/workspace-isolation.md` — 按任务写时复制执行隔离（overlay / 合并协议 / 触点表）设计
 - `docs/activate/KNOWN_ISSUES.md` — 当前限制、验证缺口与可复现的开放问题
 - `docs/tool-profiles.md` — 工具 profile / agent 声明 schema
 - `docs/archived/` — 历史 RFC 与已完成的升级计划

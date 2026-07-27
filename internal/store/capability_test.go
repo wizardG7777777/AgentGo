@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"agentgo/internal/model"
+	"agentgo/internal/session"
+	"agentgo/internal/trace"
 )
 
 // allowlistChecker 构造一个模拟 bootstrap 注入的 CapabilityChecker：
@@ -242,4 +244,91 @@ func TestSnapshot_CapabilityRoundTrip(t *testing.T) {
 		t.Fatalf("无能力任务往返后 Capability = %+v，want nil", plain.Capability)
 	}
 	// 旧版本快照没有 capability 字段，Unmarshal 得 nil——已被 noCap 用例覆盖。
+}
+
+// TestTaskClone_PreservesIsolation 回归：task 克隆丢失 Isolation 会让读路径
+// （ScanAll/GetTask 克隆体）上的隔离节点静默退化为非隔离执行。
+func TestTaskClone_PreservesIsolation(t *testing.T) {
+	src := &model.Task{
+		ID: "t1",
+		Capability: &model.NodeCapability{
+			Tools:     []string{"read_file"},
+			Isolation: &model.IsolationSpec{Mode: model.IsolationModeWorkspace},
+		},
+	}
+	dst := cloneTask(src)
+	if dst.Capability == nil || dst.Capability.Isolation == nil {
+		t.Fatal("克隆后 Isolation 丢失")
+	}
+	if dst.Capability.Isolation.Mode != model.IsolationModeWorkspace {
+		t.Fatalf("Isolation.Mode = %q，期望 %q", dst.Capability.Isolation.Mode, model.IsolationModeWorkspace)
+	}
+	// 深拷贝：改克隆体不应穿透回原 task
+	dst.Capability.Isolation.Mode = "mutated"
+	if src.Capability.Isolation.Mode != model.IsolationModeWorkspace {
+		t.Fatal("克隆体 Isolation 与原 task 共享指针")
+	}
+}
+
+// TestCapabilitySnapshotRoundTrip_PreservesIsolation 回归：session 快照
+// 导出/导入必须保留隔离声明，否则 resume 后隔离节点静默退化。
+func TestCapabilitySnapshotRoundTrip_PreservesIsolation(t *testing.T) {
+	src := &model.NodeCapability{
+		Tools:     []string{"write_file"},
+		Model:     "m-1",
+		Isolation: &model.IsolationSpec{Mode: model.IsolationModeWorkspace},
+	}
+	back := importCapability(exportCapability(src))
+	if back == nil || back.Isolation == nil || back.Isolation.Mode != model.IsolationModeWorkspace {
+		t.Fatalf("快照往返后 Isolation 丢失: %+v", back)
+	}
+	// 旧快照（无 isolation_mode 字段）→ 不隔离
+	legacy := importCapability(&session.CapabilitySnapshot{Tools: []string{"read_file"}})
+	if legacy == nil || legacy.Isolation != nil {
+		t.Fatalf("旧快照应还原为不隔离: %+v", legacy)
+	}
+}
+
+// TestPublishTask_EmitsIsolationOverride 回归：task_published 事件必须投影
+// 节点的隔离声明（与 tools/model 覆盖同通道），供 trace CLI / Reactor 观测。
+func TestPublishTask_EmitsIsolationOverride(t *testing.T) {
+	d := installCaptureDispatcher(t)
+	s, _ := newTestStore(16, 100)
+	task := &model.Task{
+		Description: "隔离节点",
+		Capability: &model.NodeCapability{
+			Tools:     []string{"write_file"},
+			Isolation: &model.IsolationSpec{Mode: model.IsolationModeWorkspace},
+		},
+	}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatalf("PublishTask: %v", err)
+	}
+	found := false
+	for _, ev := range d.snapshot() {
+		if ev.Kind != trace.KindTaskPublished || ev.TaskID != task.ID {
+			continue
+		}
+		found = true
+		if ev.IsolationOverride != model.IsolationModeWorkspace {
+			t.Fatalf("IsolationOverride = %q，期望 %q", ev.IsolationOverride, model.IsolationModeWorkspace)
+		}
+		if len(ev.ToolsOverride) != 1 || ev.ToolsOverride[0] != "write_file" {
+			t.Fatalf("ToolsOverride 投影丢失: %v", ev.ToolsOverride)
+		}
+	}
+	if !found {
+		t.Fatal("未捕获到该任务的 task_published 事件")
+	}
+
+	// 无 Capability 的任务不投影（omitempty 兼容旧 jsonl）
+	plain := &model.Task{Description: "普通节点"}
+	if err := s.PublishTask(plain); err != nil {
+		t.Fatalf("PublishTask plain: %v", err)
+	}
+	for _, ev := range d.snapshot() {
+		if ev.Kind == trace.KindTaskPublished && ev.TaskID == plain.ID && ev.IsolationOverride != "" {
+			t.Fatalf("无 Capability 任务不应投影 IsolationOverride，实际 %q", ev.IsolationOverride)
+		}
+	}
 }

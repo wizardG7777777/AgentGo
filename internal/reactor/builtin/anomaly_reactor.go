@@ -78,6 +78,14 @@ type taskAnomaly struct {
 // Store 数据无法区分"纯文本交付"（KindTextOnlySubmission 是 trace 事件侧的判别，
 // Store 无对应事实可查）——做了只会与既有防线重复报警且误报率高，故只落地
 // 信号最高的 ②③ 两条。
+//
+// workspace 隔离任务的适用性（2026-07-26 C 线核查）：本检测只消费
+// ToolCallRecord（工具名 + Success 标志），不做任何文件系统 stat——隔离任务
+// 的写入在合并前落在 workspace 副本而非主根，但这不影响记录流：write_file
+// 落副本同样记 Success=true，read_file 读穿透主根同样留记录，因此
+// fabricated_write / tool_error_rate 两条启发式对隔离与非隔离任务行为一致，
+// 无需经 workspace.Manager.ResolveForTask 做路径解析（record-artifact reactor
+// 才需要——它按落盘文件重算 sha256）。
 func detectTaskAnomalies(history []store.ToolCallRecord) []taskAnomaly {
 	var anomalies []taskAnomaly
 

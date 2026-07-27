@@ -41,6 +41,10 @@ const defaultShellTimeoutSec = 30
 //     nil 等价 normal
 //   - InteractionWaitHook：交互等待钩子，进入/退出"等待用户回复"时各回调一次
 //     （true/false），供调用方接线 agent 状态机（waiting_interaction）；nil 为 no-op
+//   - ActiveViewer：按任务写时复制隔离的活动视图提供者（runner 装配的
+//     workspace.Swapper）；非 nil 且 ActiveView() 非 nil 时，LLM 未显式传
+//     working_dir 的默认执行目录切到 workspace 根（尽力隔离：命令写主根绝对
+//     路径不可完全阻止，属设计上有意接受的 shell 残余风险，见 workspace/types.go）
 type ShellGroup struct {
 	Workdir             WorkdirProvider
 	TimeoutSec          int
@@ -51,6 +55,7 @@ type ShellGroup struct {
 	ExtraGreylist       []string             // optional
 	Modes               *modes.Store         // optional
 	InteractionWaitHook func(waiting bool)   // optional
+	ActiveViewer        ActiveViewer         // optional
 }
 
 // Register 实现 ToolGroup 接口。
@@ -61,6 +66,23 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 	}
 
 	workdir := g.Workdir
+
+	// defaultWorkDir 是 LLM 未显式传 working_dir 时的默认执行目录：
+	// 隔离任务（ActiveViewer 有活动视图）切到 workspace 根——写倾向命令的
+	// 相对路径落点随之进 workspace；显式传 working_dir 时维持现状按主根
+	// 校验（shell 残余风险，有意接受）。无视图时回退主根（Workdir.Get），
+	// 与旧行为完全一致。
+	defaultWorkDir := func() string {
+		if g.ActiveViewer != nil {
+			if view := g.ActiveViewer.ActiveView(); view != nil {
+				return view.Root()
+			}
+		}
+		if workdir != nil {
+			return workdir.Get()
+		}
+		return ""
+	}
 
 	rawFn := func(ctx context.Context, args map[string]any) (string, error) {
 		command, _ := args["command"].(string)
@@ -76,10 +98,10 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 			effectiveTimeoutSec = v
 		}
 
-		// 确定工作目录：args 优先，其次 Workdir.Get()。
+		// 确定工作目录：args 优先，其次默认目录（隔离时 workspace 根，否则主根）。
 		workingDir, _ := args["working_dir"].(string)
-		if workingDir == "" && workdir != nil {
-			workingDir = workdir.Get()
+		if workingDir == "" {
+			workingDir = defaultWorkDir()
 		}
 
 		timeout := time.Duration(effectiveTimeoutSec) * time.Second
@@ -155,17 +177,22 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 	authorizedFn := shell.WrapShellTool(rawFn, filter, g.Interactions, g.SessionID,
 		g.AgentID, g.InteractionWaitHook, g.Modes)
 	// Interaction 必须绑定实际执行目录，而不是只看到用户是否显式传参。
-	// 在进入拦截器前复制参数并补齐 Workdir fallback，避免修改 LLM 调用方持有的 map。
+	// 在进入拦截器前复制参数并补齐默认目录（隔离时 workspace 根，否则
+	// Workdir fallback），避免修改 LLM 调用方持有的 map。
 	wrappedFn := func(ctx context.Context, args map[string]any) (string, error) {
 		workingDir, _ := args["working_dir"].(string)
-		if workingDir != "" || workdir == nil {
+		if workingDir != "" {
+			return authorizedFn(ctx, args)
+		}
+		dir := defaultWorkDir()
+		if dir == "" {
 			return authorizedFn(ctx, args)
 		}
 		resolvedArgs := make(map[string]any, len(args)+1)
 		for key, value := range args {
 			resolvedArgs[key] = value
 		}
-		resolvedArgs["working_dir"] = workdir.Get()
+		resolvedArgs["working_dir"] = dir
 		return authorizedFn(ctx, resolvedArgs)
 	}
 

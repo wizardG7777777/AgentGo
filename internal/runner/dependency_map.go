@@ -10,7 +10,7 @@ package runner
 //	|---|---|
 //	| read_file / list_dir / grep_search / glob_search | Workdir + FileStateCache |
 //	| write_file / edit_file | + Roster（文件级写锁，附 RosterWaitTimeoutSec）；strict 审批 WrapHandler 在 runner.New 装配 |
-//	| run_shell | + interaction.Service + SessionID + shell.CommandFilter + ShellTimeoutSec + Modes（exec 轴短路）；验收角色（白名单含 submit_acceptance_result）再注入 shell.AcceptanceHardeningGreylist |
+//	| run_shell | + interaction.Service + SessionID + shell.CommandFilter + ShellTimeoutSec + Modes（exec 轴短路）；验收角色（白名单含 submit_acceptance_result）再注入 shell.AcceptanceHardeningGreylist；workdir 实现 tools.ActiveViewer 时（*workspace.Swapper）注入 ActiveViewer |
 //	| publish_task | + Store + TaskHolder + MaxSubtaskDepth |
 //	| request_user_input | + interaction.Service + SessionID + TaskHolder |
 //	| send_message | + mailbox.Registry + MailChainMaxDepth（常量）|
@@ -35,7 +35,10 @@ import (
 // 目前还用于验收角色判定（见 acceptanceShellGreylist）。
 //
 // holder / finHolder / submitState / fileCache / workdir 在 New() 中提前创建，
-// 供 agent 回调和 ToolGroup 共享。
+// 供 agent 回调和 ToolGroup 共享。workdir 生产上是 per-runner 的
+// *workspace.Swapper（同时实现 tools.ActiveViewer——run_shell 默认工作目录
+// 随隔离视图切换）；单测直构的 DefaultWorkdir 不满足该可选接口，shell 行为
+// 与旧版完全一致。
 // interactionWaitHook 同时透传给 ShellGroup 与 MetaGroup（交互等待 → agent 状态机
 // 接线，见 runner.New）。
 func resolveToolGroups(
@@ -46,7 +49,7 @@ func resolveToolGroups(
 	finHolder *agent.FinalizationHolder,
 	submitState *agent.SubmitState,
 	fileCache *agent.FileStateCache,
-	workdir *tools.DefaultWorkdir,
+	workdir tools.WorkdirProvider,
 	interactionWaitHook func(waiting bool),
 ) []tools.ToolGroup {
 	readGroup := tools.LocalReadGroup{
@@ -54,6 +57,9 @@ func resolveToolGroups(
 		Cache:           fileCache,
 		HashlineEnabled: deps.HashlineEnabled,
 	}
+	// 按任务写时复制隔离：workdir 实现 ActiveViewer 时（*workspace.Swapper）
+	// 把它注入 shell 组；未实现时 ActiveViewer=nil，run_shell 默认目录恒为主根。
+	activeViewer, _ := workdir.(tools.ActiveViewer)
 	return []tools.ToolGroup{
 		readGroup,
 		tools.LocalWriteGroup{
@@ -73,6 +79,7 @@ func resolveToolGroups(
 			ExtraGreylist:       acceptanceShellGreylist(allowedTools),
 			Modes:               deps.Modes,
 			InteractionWaitHook: interactionWaitHook,
+			ActiveViewer:        activeViewer,
 		},
 		tools.MetaGroup{
 			Store:               deps.Store,

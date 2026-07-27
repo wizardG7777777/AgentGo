@@ -1,6 +1,6 @@
 # KNOWN_ISSUES — 当前限制与验证缺口
 
-最后核对：2026-07-24。
+最后核对：2026-07-27。
 
 本文件只记录当前仍会影响使用、开发或发布判断的限制。2026-07-18 UI Hub 改造的 41 项问题均已修复，原始核查与测试证据已归档至 [ui-hub-remediation-2026-07-18.md](../archived/ui-hub-remediation-2026-07-18.md)。2026-07-20 验收事实核验失败循环与级联取消事故已修复，证据归档至 [acceptance-fact-verification-and-cascade-incident-2026-07-20.md](../archived/acceptance-fact-verification-and-cascade-incident-2026-07-20.md)。2026-07-21 artifact 路径归一化缺陷导致的验收马拉松事故已修复，证据归档至 [artifact-path-normalization-incident-2026-07-21.md](../archived/artifact-path-normalization-incident-2026-07-21.md)。2026-07-21 验收空转（6 次 AcceptanceRun）与 Scheduler 篡改工作区事故已修复，证据归档至 [acceptance-spin-and-env-mutation-incident-2026-07-21.md](../archived/acceptance-spin-and-env-mutation-incident-2026-07-21.md)。2026-07-22 浪费可观测化专项落地：TUI 顶栏新增 session 级 token 总计（Hub 进程级累加器喂入，ad-hoc 团队销毁后消耗不隐形）；trace CLI 新增 stats 子命令（task/agent/plan 三维度 token 聚合 + 浪费口径 + 异常提示，见 TraceGuide §3.4）；watchdog 为 pending 级联取消补发 task_cancelled 事件（此前排队中的级联取消在 trace 中不可见）；修正 detectAnomalies 第 9 条从不命中的死检查（cancel_source 实际值为 dependency_failure）。截至本次核对，没有把已修复条目重新列为开放缺陷。
 
@@ -50,12 +50,21 @@
 - 影响：配置这些预留字段会导致启动失败，不能视为兼容的未来配置。
 - 处置：使用 `prompt.file` 和 `one_shot`；其他形态需先实现并补测试。
 
-### Agent 执行隔离限于文件声明级
+### Agent 执行隔离：工具写已可按任务隔离，shell 残余风险仍在
 
-Roster 花名册只对 `write_file` / `edit_file` 的声明式写路径做文件级互斥；`run_shell` 的副作用（包管理、git、重定向之外的间接修改）不受隔离。verifier 模板不授文件写工具，但 `run_shell` 不是只读沙箱（见 [AgentTemplate.md](AgentTemplate.md) §6），"不修改被验收对象"由 prompt 与 Shell 命令策略保障，不是 OS 级强隔离。
+2026-07-26 起，Scheduler 可在 `publish_task` 时对 DAG 节点声明 `isolation: "workspace"`（写时复制 overlay）：该节点的 `write_file`/`edit_file` 全部落入任务专属 workspace（`.agentgo/workspaces/<taskID>/`），读穿透主根，任务成功终态由控制面自动合并回主根（fast-forward / 行级三路自动合并），冲突则任务 failed + 自动高优 replan 交 Scheduler 裁决。详见 [workspace-isolation.md](../design/workspace-isolation.md)。
+
+残余风险（有意接受）：`run_shell` 的副作用不受同等隔离——隔离任务的 shell 默认工作目录切到 workspace 根，但命令写主根**绝对路径**不可完全阻止（重定向写文件检测仍以 projectRoot 为边界）；verifier 模板不授文件写工具，但 `run_shell` 不是只读沙箱（见 [AgentTemplate.md](AgentTemplate.md) §6），"不修改被验收对象"由 prompt 与 Shell 命令策略保障，不是 OS 级强隔离。非隔离任务之间仍只有 Roster 文件级互斥。
 
 - 影响：并发 Agent 可通过 shell 互相踩踏工作区；验收 runner 理论上能污染被验收对象。
-- 处置：高风险操作用 exec=strict 全量审批或灰名单 Interaction 把守；worktree/容器级隔离评估后再立项。
+- 处置：高风险操作用 exec=strict 全量审批或灰名单 Interaction 把守；fan-out 并行写同一批文件的 DAG 节点应声明 `isolation: "workspace"`；容器级隔离评估后再立项。
+
+### shell 旁路写入断裂 file_hash 验收证据链
+
+`run_shell` 写入文件（如 PowerShell `Set-Content`、重定向白名单外的间接写）不产生 `file_written` 事件，record-artifact Reactor 与 `Task.ArtifactMeta` 因此没有任何记录；验收阶段 `file_hash` 类证据会报 `file_hash criterion lacks file evidence` 被硬拒（2026-07-27 真实运行复现：worker 被迫用 shell 写目标文件后，verifier 两次 file_hash 提交失败，最终改用 `command_exit` 证据才验收通过）。
+
+- 影响：shell 写入比例高的任务，验收只能走 `command_exit` / `task_status` 证据通道；file_hash 通道不可用。
+- 处置：验收 spec 为 shell 密集型节点优先声明 `command_exit` 类判据；长期方向是 shell 写事实（如重定向扫描命中）也产出 artifact 账本记录。
 
 ### 引用幻觉没有独立的强制防线
 

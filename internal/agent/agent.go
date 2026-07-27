@@ -98,10 +98,10 @@ type Agent struct {
 	// Such a runner must never claim a Task owned by another Plan, even if a
 	// stale or colliding event_type makes that Task visible in the shared queue.
 	// Static agents keep the empty value and remain globally routable.
-	PlanIDScope           string
-	Store                 store.TaskStore
-	Roster                roster.Roster
-	Execute               TaskExecutor
+	PlanIDScope string
+	Store       store.TaskStore
+	Roster      roster.Roster
+	Execute     TaskExecutor
 	// ToolSwapper 是 executor 暴露的按任务工具注册表替换通道（*LLMExecutor
 	// 实现 ToolRegistrySwapper）。任务携带 NodeCapability.Tools 时，
 	// processTask 经它换入过滤视图、任务结束恢复；nil 表示 executor 不支持
@@ -137,6 +137,20 @@ type Agent struct {
 	// finalization 短路分支 Take 命中时以其渲染文本替代 lastOutput 收尾（Cause=submit_task_result）；
 	// nil 或 Take 未命中时走 report_done 兼容路径（lastOutput），行为与旧版完全一致。
 	SubmitState *SubmitState
+
+	// WorkspaceManager / WorkspaceActivator 是「按任务写时复制执行隔离」
+	// （model.NodeCapability.Isolation）的执行面注入，runner 装配时设置：
+	// 认领 Isolation 非 nil 的任务时 Materialize 任务 workspace 并经 Activator
+	// 换入 overlay 视图（defer 恢复）；任务成功终态在 SubmitResult（标记
+	// completed）之前经 MergeTask 合并回主根，成功后 Cleanup。任一 nil 时
+	// 隔离任务在认领点 fail-closed（capability_violation）；无 Isolation 的
+	// 任务零开销短路，行为完全不变。详见 workspace_merge.go。
+	WorkspaceManager   WorkspaceLifecycleManager
+	WorkspaceActivator WorkspaceViewActivator
+	// WorkspaceReplanRequester 是合并冲突时自动登记高优 ReplanRequest 的通道
+	// （runner 装配时注入 plan.Coordinator）。nil 或任务无 PlanID 时跳过登记——
+	// 任务转 failed 本身不受影响。
+	WorkspaceReplanRequester ReplanRequester
 
 	// UserOutput 是用户可见内容的输出目标。非 nil 时，IsUserFacing 的自然文本完成
 	// 和 report_done 等输出会写入此处，而不是直接 fmt.Printf 到 stdout。
@@ -608,6 +622,42 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			defer func() { a.Model = origModel }()
 			log.Printf("[agent %s] 任务 %s 节点能力生效：模型覆盖 %s → %s", a.ID, taskID, origModel, task.Capability.Model)
 		}
+		// 执行隔离（写时复制 overlay）：认领时物化任务 workspace 并把本 Runner 的
+		// Swapper 换入该任务视图，defer 恢复。执行期读穿透主根、写落任务 workspace；
+		// 成功终态由 mergeWorkspaceBeforeComplete 在 SubmitResult 前合并回主根。
+		// 与工具子集同款 fail-closed：模式未知或执行面未装配时不降级执行。
+		if task.Capability.Isolation != nil {
+			if task.Capability.Isolation.Mode != model.IsolationModeWorkspace {
+				reason := fmt.Sprintf("节点能力要求未知隔离模式 %q（当前仅支持 %q），不降级执行",
+					task.Capability.Isolation.Mode, model.IsolationModeWorkspace)
+				log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
+				terminatingCause = "react_loop_exit:error"
+				enterTerminating(terminatingCause)
+				a.terminateTask(task, taskID, reason, "capability_violation")
+				return
+			}
+			if a.WorkspaceManager == nil || a.WorkspaceActivator == nil {
+				reason := "节点能力要求 workspace 执行隔离，但执行面未装配（Agent.WorkspaceManager/WorkspaceActivator 为 nil），不降级执行"
+				log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
+				terminatingCause = "react_loop_exit:error"
+				enterTerminating(terminatingCause)
+				a.terminateTask(task, taskID, reason, "capability_violation")
+				return
+			}
+			view, err := a.WorkspaceManager.Materialize(taskID)
+			if err != nil {
+				reason := fmt.Sprintf("workspace 物化失败: %v，不降级执行", err)
+				log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
+				terminatingCause = "react_loop_exit:error"
+				enterTerminating(terminatingCause)
+				a.terminateTask(task, taskID, reason, "capability_violation")
+				return
+			}
+			restore := a.WorkspaceActivator.Activate(view)
+			defer restore()
+			log.Printf("[agent %s] 任务 %s 节点能力生效：workspace 执行隔离（视图根 %s）", a.ID, taskID, view.Root())
+			// KindWorkspaceMaterialized 由 Manager 负责 emit（types.go 契约），这里不重复。
+		}
 	}
 
 	// 清空文件缓存（任务切换时避免脏读）
@@ -791,7 +841,6 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		// 说明上一轮调用了 finalization tool，立即终止 reactLoop。
 		if a.FinalizationChecker != nil && a.FinalizationChecker.IsFinalized() {
 			log.Printf("[agent %s] FinalizationChecker.IsFinalized()=true，终止 reactLoop (task=%s)", a.ID, taskID)
-			enterTerminating(terminatingCause)
 			// 使用上一轮保存的 lastOutput 完成任务（不进行 ExpectedArtifacts 校验，因为 finalization tool 负责最终汇报）。
 			// 若上一轮调用的是 submit_task_result，SubmitState 里暂存了已通过校验的结构化提交：
 			// 其渲染文本替代 lastOutput 成为权威结果负载，TransferNote 只用 summary，
@@ -814,6 +863,14 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			if transferNote != "" {
 				_ = a.Store.SetTransferNote(taskID, transferNote)
 			}
+			// 写时复制隔离：合并必须在 SubmitResult（标记 completed）之前完成。
+			// 合并失败/冲突时 helper 已把任务转 failed 并自动登记 replan，直接返回。
+			if !a.mergeWorkspaceBeforeComplete(ctx, task, taskID) {
+				terminatingCause = "react_loop_exit:error"
+				enterTerminating(terminatingCause)
+				return
+			}
+			enterTerminating(terminatingCause)
 			if err := a.Store.SubmitResult(a.ID, taskID, resultText); err != nil {
 				log.Printf("[agent %s] SubmitResult error: %v", a.ID, err)
 				trace.Emit(trace.Event{
@@ -1047,6 +1104,14 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			// 读取这一段作为上游交接备忘。失败路径走 handleFailure 里的 buildTransferNote。
 			if lastOutput != "" {
 				_ = a.Store.SetTransferNote(taskID, lastOutput)
+			}
+
+			// 写时复制隔离：合并必须在 SubmitResult（标记 completed）之前完成。
+			// 合并失败/冲突时 helper 已把任务转 failed 并自动登记 replan，直接返回。
+			if !a.mergeWorkspaceBeforeComplete(ctx, task, taskID) {
+				terminatingCause = "react_loop_exit:error"
+				enterTerminating(terminatingCause)
+				return
 			}
 
 			enterTerminating(terminatingCause)

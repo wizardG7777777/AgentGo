@@ -215,8 +215,21 @@ type Task struct {
 // 两字段都为空（或整体为 nil）时等价于"无节点能力约束"，各消费方按零开销
 // 短路处理。
 type NodeCapability struct {
-	Tools []string `json:"tools,omitempty"` // 非空 = 当次任务工具子集
-	Model string   `json:"model,omitempty"` // 非空 = 当次任务模型覆盖
+	Tools     []string       `json:"tools,omitempty"`     // 非空 = 当次任务工具子集
+	Model     string         `json:"model,omitempty"`     // 非空 = 当次任务模型覆盖
+	Isolation *IsolationSpec `json:"isolation,omitempty"` // 非 nil = 当次任务启用执行隔离
+}
+
+// IsolationModeWorkspace 是目前唯一支持的隔离模式：写时复制 overlay。
+const IsolationModeWorkspace = "workspace"
+
+// IsolationSpec 声明节点的执行隔离方式。Mode 目前唯一合法值为
+// IsolationModeWorkspace（"workspace"）：认领该任务的 Runner 在写时复制
+// overlay 中执行——读穿透主根、写落任务专属 workspace
+//（.agentgo/workspaces/<taskID>/），任务成功终态由控制面合并回主根
+//（自动三路合并优先，冲突交 Scheduler 裁决兜底）。
+type IsolationSpec struct {
+	Mode string `json:"mode,omitempty"`
 }
 
 // ArtifactMeta 是 Task.ArtifactMeta 的 value 类型，记录单个产物文件在

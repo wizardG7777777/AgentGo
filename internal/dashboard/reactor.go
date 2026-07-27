@@ -49,6 +49,11 @@ var TraceEventKinds = []trace.EventKind{
 	trace.KindAcceptanceCompleted,
 	trace.KindPlanPaused,
 	trace.KindPlanTerminal,
+	// workspace 隔离生命周期四事件（发射点：workspace.Manager + watchdog）。
+	trace.KindWorkspaceMaterialized,
+	trace.KindWorkspaceMerged,
+	trace.KindWorkspaceMergeConflict,
+	trace.KindWorkspaceCleaned,
 }
 
 // TraceReactor 把 trace 事件流接入 UI Hub（KindTraceEvent → SSE）。

@@ -56,7 +56,7 @@ type MemoryTaskStore struct {
 	artifactLog *ArtifactLog
 	// historyEmitter 是事件溯源日志的发射接口。可选——nil 时跳过所有事件发射。
 	// 通过 SetHistoryEmitter 注入，避免对 session.HistoryLog 的硬依赖。
-	historyEmitter      session.HistoryEmitter
+	historyEmitter session.HistoryEmitter
 	// capabilityChecker 是按认领方过滤节点能力任务的检查器。可选——nil 时
 	// QueryAvailable 不做能力过滤（兼容旧装配）。由 bootstrap 注入。
 	capabilityChecker   CapabilityChecker
@@ -529,6 +529,9 @@ func (s *MemoryTaskStore) PublishTask(task *model.Task) error {
 	if task.Capability != nil {
 		published.ToolsOverride = append([]string(nil), task.Capability.Tools...)
 		published.ModelOverride = task.Capability.Model
+		if task.Capability.Isolation != nil {
+			published.IsolationOverride = task.Capability.Isolation.Mode
+		}
 	}
 	trace.Emit(published)
 	return nil
@@ -1809,22 +1812,31 @@ func exportCapability(src *model.NodeCapability) *session.CapabilitySnapshot {
 	if src == nil {
 		return nil
 	}
-	return &session.CapabilitySnapshot{
+	out := &session.CapabilitySnapshot{
 		Tools: append([]string(nil), src.Tools...),
 		Model: src.Model,
 	}
+	if src.Isolation != nil {
+		out.IsolationMode = src.Isolation.Mode
+	}
+	return out
 }
 
 // importCapability 把快照 DTO 还原为 model 侧节点能力声明。旧版本快照没有该
-// 字段（nil），返回 nil——任务按"无节点能力约束"处理。
+// 字段（nil），返回 nil——任务按"无节点能力约束"处理。IsolationMode 空串
+// （旧快照）同样还原为不隔离。
 func importCapability(src *session.CapabilitySnapshot) *model.NodeCapability {
 	if src == nil {
 		return nil
 	}
-	return &model.NodeCapability{
+	out := &model.NodeCapability{
 		Tools: append([]string(nil), src.Tools...),
 		Model: src.Model,
 	}
+	if src.IsolationMode != "" {
+		out.Isolation = &model.IsolationSpec{Mode: src.IsolationMode}
+	}
+	return out
 }
 
 // formatTime 将 time.Time 格式化为 RFC3339 字符串。零值返回空字符串。

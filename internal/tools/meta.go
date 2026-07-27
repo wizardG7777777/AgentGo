@@ -100,6 +100,7 @@ func (g MetaGroup) Register(r *agent.ToolRegistry) {
 				String("expected_artifacts", "逗号分隔的预期产出文件路径列表（相对项目根的相对路径）。任务结束时系统会校验这些文件是否真的写入；缺失则任务失败重试。强烈建议为'报告/总结/文档'类任务填写此字段以防止 report-only 失败", false).
 				String("tools", "逗号分隔的工具名子集：限定本 DAG 节点只允许使用这些工具（必须是认领 Agent 白名单的子集，否则无人能认领）。仅 Scheduler 计划控制面可设置；留空表示不限制", false).
 				String("model", "本 DAG 节点的模型覆盖（如 deepseek-r1）。仅 Scheduler 计划控制面可设置；留空表示沿用认领 Agent 的默认模型", false).
+				String("isolation", "本 DAG 节点的执行隔离：唯一合法值 \"workspace\"——认领该节点的 Agent 在写时复制 overlay 中执行（读穿透主根、写落任务专属 workspace .agentgo/workspaces/<taskID>/），任务成功终态由控制面自动合并回主根；合并冲突时任务失败并自动 replan，由 Scheduler 裁决。仅 Scheduler 计划控制面可设置；留空表示不隔离", false).
 				Int("max_concurrency", "该任务允许几个 Agent 同时认领执行，默认 1（单交付物任务必须是 1，否则多个 Agent 会重复执行同一份工作并互相覆盖产出）。仅当确实需要多个 Agent 冗余/分片执行同一任务时才设为 >1", false).
 				Build(),
 			g.publishTask,
@@ -246,19 +247,26 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 		}
 	}
 
-	// 节点能力覆盖（per-node NodeCapability）：tools 子集 + model 覆盖。
+	// 节点能力覆盖（per-node NodeCapability）：tools 子集 + model 覆盖 + isolation 隔离。
 	// 三道校验：a. 写入权限 → b. 静态合法 → c. 伴生关系软警告（不拒绝）。
 	toolsArg, _ := args["tools"].(string)
 	modelArg, _ := args["model"].(string)
+	isolationArg, _ := args["isolation"].(string)
+	isolationMode := strings.TrimSpace(isolationArg)
 	// a. 写入权限：节点能力只能由控制面（PlanMutationSource=scheduler）写入。
 	//    普通 Worker / Reactor 携带任一参数即拒绝——它们无权改变 DAG 节点的
 	//    执行边界，否则认领约束（子集 ⊆ 白名单）会被非控制面绕过。
-	if (strings.TrimSpace(toolsArg) != "" || strings.TrimSpace(modelArg) != "") &&
+	if (strings.TrimSpace(toolsArg) != "" || strings.TrimSpace(modelArg) != "" || isolationMode != "") &&
 		g.PlanMutationSource != "scheduler" {
-		return "", fmt.Errorf("发布任务被拒绝: tools/model 节点能力参数只能由 Scheduler 计划控制面设置（当前 PlanMutationSource=%q）", g.PlanMutationSource)
+		return "", fmt.Errorf("发布任务被拒绝: tools/model/isolation 节点能力参数只能由 Scheduler 计划控制面设置（当前 PlanMutationSource=%q）", g.PlanMutationSource)
 	}
 	var capabilityWarnings []string
-	if strings.TrimSpace(toolsArg) != "" || strings.TrimSpace(modelArg) != "" {
+	if strings.TrimSpace(toolsArg) != "" || strings.TrimSpace(modelArg) != "" || isolationMode != "" {
+		// b. 静态合法：isolation 目前唯一合法值是 "workspace"（写时复制隔离）；
+		//    其他值直接报错——拼错的隔离声明若静默忽略会让并行节点失去保护。
+		if isolationMode != "" && isolationMode != model.IsolationModeWorkspace {
+			return "", fmt.Errorf("发布任务被拒绝: isolation 参数只接受 %q（写时复制工作区隔离），收到 %q", model.IsolationModeWorkspace, isolationMode)
+		}
 		var capTools []string
 		for _, name := range strings.Split(toolsArg, ",") {
 			name = strings.TrimSpace(name)
@@ -266,7 +274,7 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 				capTools = append(capTools, name)
 			}
 		}
-		// b. 静态合法：工具名必须真实存在（与 tool_profiles 同一权威清单）；
+		// b. 静态合法（续）：工具名必须真实存在（与 tool_profiles 同一权威清单）；
 		//    model 只做非空/去空白校验——模型名是否可用由 LLM 端点决定，
 		//    发布面不维护模型清单。
 		if err := ValidateToolNames(capTools); err != nil {
@@ -274,6 +282,9 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 		}
 		capModel := strings.TrimSpace(modelArg)
 		task.Capability = &model.NodeCapability{Tools: capTools, Model: capModel}
+		if isolationMode != "" {
+			task.Capability.Isolation = &model.IsolationSpec{Mode: isolationMode}
+		}
 		// c. 伴生关系软警告：子集明显不自洽时在返回文本里提示，但不硬拒——
 		//    合法极简节点（如纯 web_fetch 调查节点）不应被误伤。
 		capabilityWarnings = nodeCapabilityWarnings(capTools)

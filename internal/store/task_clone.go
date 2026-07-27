@@ -23,6 +23,12 @@ func cloneTask(src *model.Task) *model.Task {
 			Tools: cloneStrings(src.Capability.Tools),
 			Model: src.Capability.Model,
 		}
+		// IsolationSpec 仅一个字符串字段，值拷贝即可——克隆丢失隔离声明会让
+		// 读路径（ScanAll/GetTask 克隆体）上的节点静默退化为非隔离执行。
+		if src.Capability.Isolation != nil {
+			iso := *src.Capability.Isolation
+			dst.Capability.Isolation = &iso
+		}
 	}
 	if src.ArtifactMeta != nil {
 		dst.ArtifactMeta = make(map[string]model.ArtifactMeta, len(src.ArtifactMeta))
