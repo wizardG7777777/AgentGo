@@ -1011,6 +1011,7 @@ func TestAppModel_FocusInput_AllSingleLettersAndDigitsAreText(t *testing.T) {
 		result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
 		m = result.(AppModel)
 	}
+	m = settlePasteBurst(t, m)
 	if got := m.input.Value(); got != printable {
 		t.Fatalf("single-letter/digit input was intercepted:\n got %q\nwant %q", got, printable)
 	}
@@ -1261,6 +1262,7 @@ func TestAppModel_ResultViewInputAcceptsJK(t *testing.T) {
 	m = updated.(AppModel)
 	updated, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
 	m = updated.(AppModel)
+	m = settlePasteBurst(t, m)
 
 	if got := m.input.Value(); got != "jk" {
 		t.Fatalf("j/k should be inserted into focused input, got %q", got)
@@ -1837,16 +1839,29 @@ func sizedModel(t *testing.T, deps Deps) AppModel {
 	return result.(AppModel)
 }
 
-// firePendingSubmit 直接投递 Enter 提交防抖的到期 tick（跳过真实
-// submitDebounce 等待），完成一次提交。
+// firePendingSubmit 保留为旧测试的兼容辅助。普通 Enter 现在即时提交，
+// 因此模型已经是提交后的状态，无需再投递 tick。
 func firePendingSubmit(t *testing.T, m AppModel) AppModel {
 	t.Helper()
-	result, _ := m.Update(submitTimeoutMsg{seq: m.submitSeq})
+	return m
+}
+
+// settlePasteBurst 显式推进输入分类时钟，供不运行 Bubble Tea event loop
+// 的模型测试观察最终写入 textarea 的文本。
+func settlePasteBurst(t *testing.T, m AppModel) AppModel {
+	t.Helper()
+	if !m.pasteBurst.hasTimedState() {
+		return m
+	}
+	at := m.pasteBurst.lastPlainAt.Add(pasteBurstActiveIdleTimeout + pasteBurstTickSlack)
+	if !m.pasteBurst.active && m.pasteBurst.buffer == "" && m.pasteBurst.pendingASCII != nil {
+		at = m.pasteBurst.pendingASCII.at.Add(pasteBurstCharInterval + pasteBurstTickSlack)
+	}
+	result, _ := m.Update(pasteBurstTickMsg{seq: m.pasteBurst.seq, at: at})
 	return result.(AppModel)
 }
 
-// submitLine 经 Enter 键提交一行（与真实按键路径一致：Enter 进入提交
-// 防抖，再投递到期 tick 完成提交）。
+// submitLine 经 Enter 键即时提交一行。
 func submitLine(t *testing.T, m AppModel, line string) AppModel {
 	t.Helper()
 	m.input.SetValue(line)

@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -127,7 +128,7 @@ func TestPasteThenEnterSubmitsWholeMultilineText(t *testing.T) {
 	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("第一行\n第二行"), Paste: true})
 	updated := result.(AppModel)
 	result, _ = updated.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
-	updated = firePendingSubmit(t, result.(AppModel))
+	updated = result.(AppModel)
 	_ = updated
 
 	sent := fakeOf(deps).sentTexts
@@ -139,77 +140,93 @@ func TestPasteThenEnterSubmitsWholeMultilineText(t *testing.T) {
 	}
 }
 
-// ── Enter 提交防抖（Windows Terminal 逐键注入粘贴的兜底）──
+// ── Windows ConPTY 粘贴突发状态机 ──
 
-// 模拟终端逐键注入的粘贴爆发流：line1 <Enter> line2 <Enter> 在防抖
-// 窗口内连续到达，必须合并为一次提交，文本保留换行。
-func TestEnterDebounce_MergesKeystrokePasteBurst(t *testing.T) {
+// 模拟终端逐键注入的粘贴流：快速字符和真实 Enter 必须先重组为完整
+// 多行文本，不能在任一换行处向 Scheduler 提交残片。
+func TestPasteBurst_MergesKeystrokeStreamWithoutPartialSubmit(t *testing.T) {
 	deps := testDeps()
 	m := newAppModel(deps)
 
-	m.input.SetValue("第一行")
-	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEnter}) // 爆发流第一个换行
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("line1")})
 	m = result.(AppModel)
-	// 窗口内第二行字符到达（普通按键路径，直接落入输入框）
+	// 第一块停顿超过旧实现的 100ms，状态机只把它刷入 textarea，
+	// 不把它提交给 Scheduler；500ms 保护窗口仍继续等待下一块。
+	firstSeq := m.pasteBurst.seq
+	firstFlushAt := m.pasteBurst.lastPlainAt.Add(pasteBurstActiveIdleTimeout + pasteBurstTickSlack)
+	result, _ = m.Update(pasteBurstTickMsg{seq: firstSeq, at: firstFlushAt})
+	m = result.(AppModel)
+	if got := m.input.Value(); got != "line1" {
+		t.Fatalf("首块应先完整刷入输入框，得到 %q", got)
+	}
+	result, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = result.(AppModel)
 	result, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("第二行")})
 	m = result.(AppModel)
-	result, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyEnter}) // 爆发流第二个换行
-	m = result.(AppModel)
 
-	// 旧的 tick 到期（seq 已刷新）：不得提交
-	result, _ = m.Update(submitTimeoutMsg{seq: m.submitSeq - 1})
-	m = result.(AppModel)
 	if sent := fakeOf(deps).sentTexts; len(sent) != 0 {
-		t.Fatalf("过期 tick 不得触发提交，实际 %v", sent)
+		t.Fatalf("粘贴仍在注入时不得提交残片，实际 %v", sent)
 	}
 
-	// 最新 tick 到期：整段合并为一次提交
-	m = firePendingSubmit(t, m)
+	seq := m.pasteBurst.seq
+	flushAt := m.pasteBurst.lastPlainAt.Add(pasteBurstActiveIdleTimeout + pasteBurstTickSlack)
+	result, _ = m.Update(pasteBurstTickMsg{seq: seq, at: flushAt})
+	m = result.(AppModel)
+	if got := m.input.Value(); got != "line1\n第二行" {
+		t.Fatalf("状态机应完整重组多行文本，得到 %q", got)
+	}
+	if sent := fakeOf(deps).sentTexts; len(sent) != 0 {
+		t.Fatalf("状态机刷入输入框不得自动提交，实际 %v", sent)
+	}
+
+	// 用户检查完整文本后再按 Enter；测试显式越过保护窗口，不等待墙钟。
+	m.pasteBurst.windowUntil = time.Now().Add(-time.Second)
+	m.pasteBurst.lastPlainAt = time.Now().Add(-time.Second)
+	result, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = result.(AppModel)
 	sent := fakeOf(deps).sentTexts
 	if len(sent) != 1 {
-		t.Fatalf("粘贴爆发流应合并为一次提交，实际 %d 次", len(sent))
+		t.Fatalf("完整文本应仅提交一次，实际 %d 次", len(sent))
 	}
-	if sent[0] != "第一行\n第二行" {
+	if sent[0] != "line1\n第二行" {
 		t.Fatalf("提交文本应保留换行，得到 %q", sent[0])
 	}
 }
 
-// 真人单次 Enter：防抖到期后按原语义提交（末尾换行被 TrimSpace 去掉）。
-func TestEnterDebounce_SingleEnterSubmitsAfterTick(t *testing.T) {
+// 真人单次 Enter 保持原有即时提交语义，不再引入固定 100ms 延迟。
+func TestPasteBurst_SingleEnterSubmitsImmediately(t *testing.T) {
 	deps := testDeps()
 	m := newAppModel(deps)
 
 	m.input.SetValue("hello")
 	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
 	m = result.(AppModel)
-	if sent := fakeOf(deps).sentTexts; len(sent) != 0 {
-		t.Fatal("Enter 后 tick 到期前不得提交")
-	}
-	m = firePendingSubmit(t, m)
 	sent := fakeOf(deps).sentTexts
 	if len(sent) != 1 || sent[0] != "hello" {
-		t.Fatalf("防抖到期应提交原样文本，得到 %v", sent)
+		t.Fatalf("普通 Enter 应立即提交原样文本，得到 %v", sent)
 	}
 	if got := m.input.Value(); got != "" {
 		t.Fatalf("提交后输入框应清空，得到 %q", got)
 	}
 }
 
-// Enter 后立即 Esc（取消意图）：pending 提交必须作废，tick 到期不再
-// 把输入框内容发出去。
-func TestEnterDebounce_EscInvalidatesPendingSubmit(t *testing.T) {
+// 状态被 Esc 边界清空后，晚到的旧 tick 不得重新刷入或提交内容。
+func TestPasteBurst_EscInvalidatesOldTick(t *testing.T) {
 	deps := testDeps()
 	m := newAppModel(deps)
 
-	m.input.SetValue("不想发了")
-	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("burst")})
 	m = result.(AppModel)
+	oldSeq := m.pasteBurst.seq
 	result, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
 	m = result.(AppModel)
-	// 用 Enter 时的旧 seq 投递 tick：代数已被 Esc 刷新，不得提交
-	result, _ = m.Update(submitTimeoutMsg{seq: m.submitSeq - 1})
+	before := m.input.Value()
+	result, _ = m.Update(pasteBurstTickMsg{seq: oldSeq, at: time.Now().Add(time.Second)})
 	m = result.(AppModel)
 	if sent := fakeOf(deps).sentTexts; len(sent) != 0 {
-		t.Fatalf("Esc 后 pending 提交应作废，实际提交 %v", sent)
+		t.Fatalf("Esc 后旧 tick 不得提交，实际 %v", sent)
+	}
+	if got := m.input.Value(); got != before {
+		t.Fatalf("旧 tick 不得改动输入框，原为 %q，得到 %q", before, got)
 	}
 }

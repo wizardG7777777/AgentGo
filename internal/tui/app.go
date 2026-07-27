@@ -40,10 +40,12 @@ type traceMsg ui.TraceEvent
 // （tea.Tick 发出；惰性清除，晚到的旧 tick 不能误杀新警告）。
 type quitWarnExpiredMsg struct{}
 
-// submitTimeoutMsg 是 Enter 提交防抖到期的一次性 tick 消息（tea.Tick
-// 发出）。seq 与 AppModel.submitSeq 比对：窗口内又有新 Enter 时代数已
-// 递增，晚到的旧 tick 直接忽略。
-type submitTimeoutMsg struct{ seq int }
+// pasteBurstTickMsg 驱动一次粘贴突发状态检查。seq 用于淘汰 reset 后
+// 晚到的旧 tick；生产消息的 at 留空以取实际处理时刻，测试可显式推进。
+type pasteBurstTickMsg struct {
+	seq uint64
+	at  time.Time
+}
 
 // ── Hub subscription (async ui.Update → sync bubbletea) ──
 
@@ -119,12 +121,6 @@ const (
 	// RequestQuit + tea.Quit。必须与 bootstrap SIGINT 哨兵的 3 秒窗口
 	// 一致（第二次信号 os.Exit(130) 强杀），两边语义才对齐。
 	quitWarnWindow = 3 * time.Second
-	// submitDebounce 是 Enter 提交防抖窗口。Windows Terminal 等终端把
-	// 剪贴板内容逐键注入（ConPTY 不透传 bracketed paste）时，每个换行
-	// 都是一个真实 Enter——爆发流中的后续按键在窗口内到达并刷新提交
-	// 代数，整段粘贴因此合并为一次提交。真人 Enter 后 100ms 内不可能
-	// 再敲键，正常提交交互无感。
-	submitDebounce = 100 * time.Millisecond
 )
 
 // AppModel is the root bubbletea Model for the new multi-panel TUI.
@@ -149,10 +145,9 @@ type AppModel struct {
 	// history 是输入提交历史（环形缓冲容量 100，仅内存）；
 	// 输入框首行 ↑ / 末行 ↓ 浏览，见 keymap.go input-history 条目。
 	history inputHistory
-	// submitSeq 是 Enter 提交防抖的代数：每次 Enter 递增并挂一个
-	// submitDebounce 定时 tick；窗口内新的 Enter 刷新代数，旧 tick
-	// 到期时因 seq 失配被忽略（见 keyEnter 分支与 submitTimeoutMsg）。
-	submitSeq int
+	// pasteBurst 把 Windows ConPTY 退化出的高速 KeyRunes + Enter 流
+	// 重组为一次粘贴；普通 Enter 仍立即提交。
+	pasteBurst pasteBurstState
 
 	// Agent data（由 Hub 的 SnapshotSync / AgentsChanged 更新刷新）
 	agents        []AgentInfo
@@ -358,13 +353,18 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case submitTimeoutMsg:
-		// Enter 提交防抖到期：窗口内又有新 Enter 时代数已递增，旧
-		// tick 作废；否则执行真正的提交。
-		if msg.seq != m.submitSeq {
+	case pasteBurstTickMsg:
+		if !m.pasteBurst.acceptTick(msg.seq) {
 			return m, nil
 		}
-		return m.commitInputSubmit()
+		now := msg.at
+		if now.IsZero() {
+			// tea.Tick 的消息可能在高速按键队列后才被处理；必须以实际
+			// 处理时刻结算，不能使用定时器早先触发时的陈旧时间。
+			now = time.Now()
+		}
+		m.applyPasteBurstFlush(m.pasteBurst.flushIfDue(now))
+		return m, m.armPasteBurstTick(now)
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -385,9 +385,55 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// 会被当成逐次提交；同时无论当前焦点在哪都把文本写入输入框
 	// （粘贴的意图永远是输入，焦点在侧栏/交互面板时不能静默丢弃）。
 	if msg.Paste {
+		m.applyPasteBurstFlush(m.pasteBurst.flushBeforeBoundary())
+		m.pasteBurst.clearAfterExplicitPaste()
 		return m.insertPastedText(string(msg.Runes))
 	}
 	key := msg.String()
+	now := time.Now()
+
+	if m.focus == FocusInput {
+		// 下一按键可能比定时 tick 更早进入 Update；先按事件时刻结算已经
+		// 到期的候选，避免前一段状态污染后一段输入。
+		m.applyPasteBurstFlush(m.pasteBurst.flushIfDue(now))
+
+		if msg.Type == tea.KeyRunes && !msg.Alt {
+			if text := m.pasteBurst.onRunes(msg.Runes, now); text != "" {
+				prevHeight := m.input.Height()
+				m.input.InsertString(text)
+				m.reflowInputLayoutFrom(prevHeight)
+			}
+			return m, m.armPasteBurstTick(now)
+		}
+
+		switch key {
+		case keyEnter:
+			if m.pasteBurst.appendNewlineIfActive(now) {
+				return m, m.armPasteBurstTick(now)
+			}
+			if m.pasteBurst.inEnterSuppressWindow(now) {
+				prevHeight := m.input.Height()
+				m.input.InsertRune('\n')
+				m.reflowInputLayoutFrom(prevHeight)
+				return m, nil
+			}
+			m.applyPasteBurstFlush(m.pasteBurst.flushBeforeBoundary())
+			return m.commitInputSubmit()
+		case keyTab:
+			if m.pasteBurst.appendTabIfActive(now) {
+				return m, m.armPasteBurstTick(now)
+			}
+			if m.pasteBurst.inEnterSuppressWindow(now) {
+				prevHeight := m.input.Height()
+				m.input.InsertRune('\t')
+				m.reflowInputLayoutFrom(prevHeight)
+				return m, nil
+			}
+			m.applyPasteBurstFlush(m.pasteBurst.flushBeforeBoundary())
+		default:
+			m.applyPasteBurstFlush(m.pasteBurst.flushBeforeBoundary())
+		}
+	}
 
 	// Global keys（键名常量集中在 keymap.go）
 	switch key {
@@ -443,9 +489,6 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case keyEsc:
-		// 作废可能存在的 Enter 防抖待提交（用户 Esc 的意图是取消/返回，
-		// 不应在 100ms 后突然把输入框内容发出去）。
-		m.submitSeq++
 		if m.interactionTextMode {
 			m.cancelInteractionText()
 			if len(m.interactions) > 0 {
@@ -618,23 +661,6 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Input mode
 	if m.focus == FocusInput {
 		switch key {
-		case keyEnter:
-			// Enter 提交防抖：不立即提交，先按换行处理并挂一个
-			// submitDebounce 定时 tick。Windows Terminal 等终端把
-			// 剪贴板内容逐键注入时，每个换行都是一个真实 Enter——
-			// 爆发流中的下一个按键在窗口内到达（Enter 刷新代数，
-			// 普通字符直接落入输入框），整段粘贴合并为一次提交；
-			// 真人 Enter 后 100ms 内不会再敲键，tick 到期即按原语义
-			// 提交（TrimSpace 会去掉刚插入的换行），交互无感。
-			m.submitSeq++
-			seq := m.submitSeq
-			prevHeight := m.input.Height()
-			m.input.InsertRune('\n')
-			m.reflowInputLayoutFrom(prevHeight)
-			return m, tea.Tick(submitDebounce, func(time.Time) tea.Msg {
-				return submitTimeoutMsg{seq: seq}
-			})
-
 		case keyCtrlJ, keyAltEnter:
 			prevHeight := m.input.Height()
 			m.input.InsertRune('\n')
@@ -687,8 +713,38 @@ func (m AppModel) insertPastedText(text string) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// commitInputSubmit 执行 Enter 防抖到期后的真正提交：interaction 文本
-// 回答 / 斜杠命令 / 普通用户输入，语义与防抖引入前的 keyEnter 分支一致。
+func (m *AppModel) applyPasteBurstFlush(flush pasteBurstFlush) {
+	if flush.kind == pasteBurstFlushNone || flush.text == "" {
+		return
+	}
+	prevHeight := m.input.Height()
+	switch flush.kind {
+	case pasteBurstFlushPaste:
+		text := strings.ReplaceAll(flush.text, "\r\n", "\n")
+		text = strings.ReplaceAll(text, "\r", "\n")
+		m.input, _ = m.input.Update(tea.KeyMsg{
+			Type:  tea.KeyRunes,
+			Runes: []rune(text),
+			Paste: true,
+		})
+	case pasteBurstFlushTyped:
+		m.input.InsertString(flush.text)
+	}
+	m.reflowInputLayoutFrom(prevHeight)
+}
+
+func (m *AppModel) armPasteBurstTick(now time.Time) tea.Cmd {
+	delay, seq, ok := m.pasteBurst.armTimer(now)
+	if !ok {
+		return nil
+	}
+	return tea.Tick(delay, func(time.Time) tea.Msg {
+		return pasteBurstTickMsg{seq: seq}
+	})
+}
+
+// commitInputSubmit 执行普通 Enter 的真正提交：interaction 文本回答 /
+// 斜杠命令 / 普通用户输入。
 func (m AppModel) commitInputSubmit() (tea.Model, tea.Cmd) {
 	line := strings.TrimSpace(m.input.Value())
 	if m.interactionTextMode {
