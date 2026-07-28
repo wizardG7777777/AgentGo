@@ -559,7 +559,22 @@ func (s *MemoryTaskStore) ClaimTask(agentID string, taskID string) error {
 		// Check dependencies
 		for _, depID := range task.Dependencies {
 			dep, exists := s.tasks[depID]
-			if !exists || dep.Status != model.TaskStatusCompleted {
+			if !exists {
+				s.mu.Unlock()
+				return ErrDependencyNotMet
+			}
+			// 验收 runner（AcceptanceRunID 非空）与验收语义对齐：依赖只需终态。
+			// VerifyAcceptance 对非 pass 裁决本就允许 failed 依赖（plan_runtime.go），
+			// 通用认领闸若要求 completed，含失败目标的验收任务永远无法被认领——
+			// 连「判负」的机会都没有，plan 楔死（2026-07-27 真实运行事故）。
+			if task.AcceptanceRunID != "" {
+				if !model.IsTerminal(dep.Status) {
+					s.mu.Unlock()
+					return ErrDependencyNotMet
+				}
+				continue
+			}
+			if dep.Status != model.TaskStatusCompleted {
 				s.mu.Unlock()
 				return ErrDependencyNotMet
 			}

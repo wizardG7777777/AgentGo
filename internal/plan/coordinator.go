@@ -809,6 +809,8 @@ func (c *Coordinator) ApplySupersede(ctx context.Context, in SupersedeInput) (*m
 			p.Nodes[id] = compactRetiredNode(p.Nodes[id], nextRevision, replacementIDs, in.Reason)
 			delete(current, id)
 		}
+		// 依赖边改写：与 SupersedeExisting 同一语义（见 redirectSupersededDeps）。
+		redirectSupersededDeps(p, current, retired, replacementIDs)
 		p.CurrentNodeIDs = p.CurrentNodeIDs[:0]
 		for id := range current {
 			p.CurrentNodeIDs = append(p.CurrentNodeIDs, id)

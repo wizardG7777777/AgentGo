@@ -82,6 +82,12 @@ func (c *Coordinator) SupersedeExisting(ctx context.Context, in SupersedeExistin
 			p.Nodes[id] = compactRetiredNode(p.Nodes[id], nextRevision, replacements, in.Reason)
 			delete(current, id)
 		}
+		// 依赖边改写：剩余当前节点里指向退休节点的依赖全部重定向到替代
+		// 节点集合。没有这一步，退休节点仍被引用，validateCurrentGraph 以
+		// ErrDependencyNotFound 回滚整个 supersede——acceptance 角色节点
+		// 同样在此覆盖（2026-07-27 真实运行：验收节点引用被退休节点，
+		// 替代失败、plan 楔死）。
+		redirectSupersededDeps(p, current, retired, replacements)
 		p.CurrentNodeIDs = p.CurrentNodeIDs[:0]
 		for id := range current {
 			p.CurrentNodeIDs = append(p.CurrentNodeIDs, id)
@@ -128,6 +134,34 @@ func firstStringSetOverlap(left, right []string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// redirectSupersededDeps 把 current 中每个剩余节点的依赖边里指向 retired
+// 的条目重定向到 replacements（多个替代节点时展开为对全部替代节点的依赖，
+// 结果排序去重）。节点角色不做区分——acceptance 角色节点同样改写。
+// ApplySupersede 与 SupersedeExisting 共用。
+func redirectSupersededDeps(p *model.Plan, current map[string]bool, retired, replacements []string) {
+	retiredSet := make(map[string]bool, len(retired))
+	for _, id := range retired {
+		retiredSet[id] = true
+	}
+	for id := range current {
+		node := p.Nodes[id]
+		changed := false
+		redirected := make([]string, 0, len(node.Dependencies))
+		for _, dep := range node.Dependencies {
+			if retiredSet[dep] {
+				redirected = append(redirected, replacements...)
+				changed = true
+			} else {
+				redirected = append(redirected, dep)
+			}
+		}
+		if changed {
+			node.Dependencies = sortedUniqueStrings(redirected)
+			p.Nodes[id] = node
+		}
+	}
 }
 
 // compactRetiredNode keeps cold history intentionally small. The latest graph
