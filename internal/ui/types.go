@@ -55,6 +55,23 @@ type FeedOutput struct {
 	At       time.Time `json:"at"`
 }
 
+// AgentTurn 是一次 LLM 调用的公开输出事实。streaming 记录只在进程内
+// 原位更新；completed/failed 记录由 Session turns.jsonl 持久化且不可变。
+// ToolCalls 仅含工具名，完整参数和结果仍以 trace 为准。
+type AgentTurn struct {
+	ID          string    `json:"id"`
+	SessionID   string    `json:"session_id,omitempty"`
+	AgentID     string    `json:"agent_id"`
+	TaskID      string    `json:"task_id,omitempty"`
+	Loop        int       `json:"loop"`
+	Text        string    `json:"text"`
+	Status      string    `json:"status"` // streaming | completed | failed
+	ToolCalls   []string  `json:"tool_calls,omitempty"`
+	StartedAt   time.Time `json:"started_at"`
+	CompletedAt time.Time `json:"completed_at,omitempty"`
+	Error       string    `json:"error,omitempty"`
+}
+
 // LogItem is a raw diagnostic log record. Logs intentionally stay separate
 // from conversation output; frontends expose them only in diagnostic views.
 type LogItem struct {
@@ -86,6 +103,10 @@ const (
 	// KindOutputStream is a replace-in-place snapshot of an in-flight model
 	// answer (corresponding to output.KindStream).
 	KindOutputStream
+	// KindOutputTurn 是一次 LLM 调用完成后的不可变轮次事实。
+	KindOutputTurn
+	// KindTurnsChanged 在 Session 边界变化后携带新 Session 的完整轮次列表。
+	KindTurnsChanged
 	// KindLogLine 是系统日志行（来自 statusCh）。
 	KindLogLine
 	// KindInteractionsChanged 携带当前运行时的完整 pending Interaction
@@ -112,6 +133,10 @@ func (k UpdateKind) String() string {
 		return "OutputText"
 	case KindOutputStream:
 		return "OutputStream"
+	case KindOutputTurn:
+		return "OutputTurn"
+	case KindTurnsChanged:
+		return "TurnsChanged"
 	case KindLogLine:
 		return "LogLine"
 	case KindInteractionsChanged:
@@ -128,19 +153,21 @@ func (k UpdateKind) String() string {
 // Update 是 Hub 扇出给订阅者的一条更新。每条更新只携带一种载荷：
 //
 //   - KindSnapshotSync      → Snapshot
-//   - KindOutputResult/Text/Stream → Output
+//   - KindOutputResult/Text/Stream/Turn → Output
+//   - KindTurnsChanged      → Turns（完整 Session 轮次列表）
 //   - KindLogLine           → LogLine
 //   - KindInteractionsChanged → Interactions（完整 pending 列表）
 //   - KindAgentsChanged     → Agents + Tasks
 //   - KindTraceEvent        → Trace
 type Update struct {
 	Kind    UpdateKind
-	Output  output.Event // KindOutputResult / KindOutputText / KindOutputStream
+	Output  output.Event // KindOutputResult / KindOutputText / KindOutputStream / KindOutputTurn
 	LogLine string       // KindLogLine
 	// Interactions 是 KindInteractionsChanged 的完整 pending 列表。
 	Interactions []InteractionItem
 	Agents       []AgentCard // KindAgentsChanged
 	Tasks        []BoardTask // KindAgentsChanged
+	Turns        []AgentTurn // KindTurnsChanged
 	// Session 级 token 累计（KindAgentsChanged 随轮询节拍携带，语义同
 	// Snapshot.SessionPromptTokens 等字段；其它 Kind 为零值）。
 	SessionPromptTokens     int64
@@ -310,6 +337,7 @@ type Snapshot struct {
 	PendingInteractions []InteractionItem `json:"pending_interactions"`
 	LastResult          *ResultItem       `json:"last_result,omitempty"`
 	Feed                FeedSnapshot      `json:"feed"`
+	Turns               []AgentTurn       `json:"turns"`
 	// Session 级 token 累计：进程启动以来全部 LLM 调用的汇总，由 Hub 逐条
 	// 累加 token_stats 事件得到。与 AgentCard.PromptTokens 的关键区别是
 	// ad-hoc 团队（verifier 等 one_shot agent）销毁后其消耗仍保留在这里——

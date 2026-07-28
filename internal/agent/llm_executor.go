@@ -329,6 +329,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		if len(resp.ToolCalls) == 0 {
 			return ExecuteResult{
 				Output:           resp.Content,
+				AssistantContent: resp.Content,
 				ToolCalled:       false,
 				PromptTokens:     resp.Usage.PromptTokens,
 				CompletionTokens: resp.Usage.CompletionTokens,

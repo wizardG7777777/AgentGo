@@ -256,6 +256,9 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	// submit_task_result / request_replan 工具同款 RequestReplan）。
 	a.WorkspaceManager = deps.WorkspaceManager
 	a.WorkspaceActivator = workdir
+	// expected-artifacts 磁盘兜底：账本失忆场景（重试换任务 ID）stat 盘上
+	// 真实文件代替强制重写，解析口径与 record-artifact 一致。
+	a.ArtifactResolver = agent.NewArtifactPhysicalResolver(deps.ProjectRoot, deps.WorkspaceManager)
 	if deps.PlanCoordinator != nil {
 		a.WorkspaceReplanRequester = deps.PlanCoordinator
 	}

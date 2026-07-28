@@ -147,6 +147,9 @@ type Agent struct {
 	// 任务零开销短路，行为完全不变。详见 workspace_merge.go。
 	WorkspaceManager   WorkspaceLifecycleManager
 	WorkspaceActivator WorkspaceViewActivator
+	// ArtifactResolver 是 expected-artifacts 校验的磁盘兜底解析器（runner
+	// 装配注入 NewArtifactPhysicalResolver）。nil 时校验退化为纯账本比对。
+	ArtifactResolver ArtifactPhysicalResolver
 	// WorkspaceReplanRequester 是合并冲突时自动登记高优 ReplanRequest 的通道
 	// （runner 装配时注入 plan.Coordinator）。nil 或任务无 PlanID 时跳过登记——
 	// 任务转 failed 本身不受影响。
@@ -163,10 +166,10 @@ type Agent struct {
 	// writer，让"这是最终结果"的分类在产生处完成，消费方不再做子串匹配。
 	ResultOutput io.Writer
 
-	// StreamOutput receives coalesced, self-contained snapshots of in-flight LLM
-	// answer text. It is separate from UserOutput/ResultOutput because stream
-	// snapshots must replace one UI item instead of appending one message per
-	// token. Nil disables UI publication without disabling SDK streaming.
+	// StreamOutput 同时接收合并后的在途快照（KindStream）和每次 LLM 调用
+	// 唯一的不可变完成事实（KindTurn）。它与 UserOutput/ResultOutput 分离：
+	// 流式快照原位替换一个 UI 项，完成轮次则追加到 Session 账本。nil 只
+	// 禁用 UI/轮次发布，不禁用 SDK streaming。
 	StreamOutput func(output.Event)
 
 	// IsUserFacing 标记此 agent 是否直接对话用户（典型为 scheduler）。
@@ -230,6 +233,49 @@ type Agent struct {
 	// TeamRefreshInterval 是 team_snapshot / file_awareness 的轮数刷新间隔。
 	// <=0 时回退为默认 5。与 v4 TeamAwarenessConfig.SnapshotRefreshInterval 等价。
 	TeamRefreshInterval int
+}
+
+// publishCompletedTurn 为一次 TaskExecutor 调用发布恰好一个不可变的
+// UI/Session 轮次事实。优先使用公开 assistant 文本；仅填写 Output 的自然
+// 文本 executor 保持兼容。工具参数/结果与 provider reasoning 元数据有意排除。
+func (a *Agent) publishCompletedTurn(
+	turnID, taskID string,
+	loop int,
+	result ExecuteResult,
+	execErr error,
+	lastStreamText string,
+) {
+	if a == nil || a.StreamOutput == nil || turnID == "" {
+		return
+	}
+	text := result.AssistantContent
+	if text == "" && !result.ToolCalled {
+		text = result.Output
+	}
+	if text == "" {
+		text = lastStreamText
+	}
+	toolNames := make([]string, 0, len(result.ToolCalls))
+	for _, call := range result.ToolCalls {
+		if call.Name != "" {
+			toolNames = append(toolNames, call.Name)
+		}
+	}
+	errText := ""
+	if execErr != nil {
+		errText = execErr.Error()
+	}
+	a.StreamOutput(output.Event{
+		Kind:      output.KindTurn,
+		AgentID:   a.ID,
+		TaskID:    taskID,
+		StreamID:  turnID,
+		Loop:      loop,
+		Text:      text,
+		Done:      true,
+		Error:     errText,
+		ToolCalls: toolNames,
+	})
 }
 
 // transferNoteMaxTokens 返回实际使用的 TransferNote 预算。
@@ -950,12 +996,16 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		if a.Activity != nil {
 			execCtx = WithActivityContext(execCtx, a.Activity)
 		}
+		turnID := fmt.Sprintf("%s:%s:%d:%d", a.ID, taskID, i, time.Now().UnixNano())
+		lastStreamText := ""
 		if a.Activity != nil || a.StreamOutput != nil {
-			streamID := fmt.Sprintf("%s:%s:%d:%d", a.ID, taskID, i, time.Now().UnixNano())
 			lastPublished := time.Time{}
 			execCtx = llm.WithStreamHandler(execCtx, func(ev llm.StreamEvent) {
 				if ev.AccumulatedContent != "" {
-					a.Activity.LLMDelta(a.ID, taskID, i, ev.AccumulatedContent)
+					lastStreamText = ev.AccumulatedContent
+					if a.Activity != nil {
+						a.Activity.LLMDelta(a.ID, taskID, i, ev.AccumulatedContent)
+					}
 				}
 				if a.StreamOutput == nil || (ev.AccumulatedContent == "" && ev.Error == "") {
 					return
@@ -967,12 +1017,13 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				lastPublished = now
 				a.StreamOutput(output.Event{
 					Kind: output.KindStream, AgentID: a.ID, TaskID: taskID,
-					StreamID: streamID, Loop: i, Text: ev.AccumulatedContent,
+					StreamID: turnID, Loop: i, Text: ev.AccumulatedContent,
 					Done: ev.Done, Error: ev.Error,
 				})
 			})
 		}
 		result, execErr := a.Execute(execCtx, task, depResults, histCopy)
+		a.publishCompletedTurn(turnID, taskID, i, result, execErr, lastStreamText)
 
 		if execErr != nil {
 			if errors.Is(execErr, ErrExecutionSuspended) {
@@ -1076,7 +1127,10 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			//   - Missing 非空：完全没写，必须重试
 			//   - Drifted 非空但 Missing 空：basename 命中但路径漂移，视作成功，记 warning
 			//   - 两者都空：完美通过
-			check := checkExpectedArtifacts(a.Store, taskID)
+			check := checkExpectedArtifactsWithResolver(a.Store, taskID, a.ArtifactResolver)
+			if len(check.Recovered) > 0 {
+				log.Printf("[agent %s] 任务 %s 预期产物经磁盘兜底找回: %v", a.ID, taskID, check.Recovered)
+			}
 			if len(check.Missing) > 0 {
 				reason := buildArtifactFailureReason(check)
 				log.Printf("[agent %s] 任务 %s 缺少预期产出文件: %v (实际写入: %v)",
@@ -1706,6 +1760,10 @@ type ArtifactCheckResult struct {
 	Missing []string // 完全找不到的预期路径（精确匹配 + basename 兜底都失败）
 	Drifted []string // basename 兜底命中但路径不一致的预期项（"expected: X, actual: docs/X" 形式）
 	Actual  []string // 任务实际写入的全部 artifacts，便于注入到反馈消息
+	// Recovered 是账本缺失但经磁盘兜底命中的预期项：重试/替代任务换新
+	// 任务 ID 后账本失忆，前次尝试写好的文件还在盘上——stat 命中即视为
+	// 满足契约（文件系统是唯一真实来源），不再强制 LLM 重写一遍。
+	Recovered []string
 }
 
 // checkExpectedArtifacts 校验任务的 ExpectedArtifacts 是否全部出现在 Artifacts 中。
@@ -1761,11 +1819,39 @@ type storeReader interface {
 	GetTask(taskID string) (*model.Task, error)
 }
 
+// checkExpectedArtifactsWithResolver 在账本比对之上加磁盘兜底：账本缺失的
+// 预期项经 resolve 解析到物理位置 stat 一次，存在（且非目录）即转入
+// Recovered 视为满足——覆盖「重试换新任务 ID 后账本失忆、文件其实已在盘上」
+// 的空转场景；resolve 为 nil 时与纯账本比对完全一致。
+func checkExpectedArtifactsWithResolver(s storeReader, taskID string, resolve ArtifactPhysicalResolver) ArtifactCheckResult {
+	res := checkExpectedArtifacts(s, taskID)
+	if len(res.Missing) == 0 || resolve == nil {
+		return res
+	}
+	var stillMissing []string
+	for _, expected := range res.Missing {
+		fi, err := os.Stat(resolve(taskID, expected))
+		if err == nil && !fi.IsDir() {
+			res.Recovered = append(res.Recovered, expected)
+			continue
+		}
+		stillMissing = append(stillMissing, expected)
+	}
+	res.Missing = stillMissing
+	return res
+}
+
 // CheckExpectedArtifacts 是 checkExpectedArtifacts 的导出包装，
 // 供 tools 包（submit_task_result）在工具层复用同一套 ExpectedArtifacts 合约校验，
 // 保证工具提交与自然完成路径的校验语义完全一致。
 func CheckExpectedArtifacts(s storeReader, taskID string) ArtifactCheckResult {
 	return checkExpectedArtifacts(s, taskID)
+}
+
+// CheckExpectedArtifactsWithDisk 是 checkExpectedArtifactsWithResolver 的导出
+// 包装（submit_task_result 工具层磁盘兜底入口），语义同上。
+func CheckExpectedArtifactsWithDisk(s storeReader, taskID string, resolve ArtifactPhysicalResolver) ArtifactCheckResult {
+	return checkExpectedArtifactsWithResolver(s, taskID, resolve)
 }
 
 // BuildArtifactFailureReason 是 buildArtifactFailureReason 的导出包装，理由同上。

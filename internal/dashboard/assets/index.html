@@ -167,7 +167,7 @@
     <div id="agentTabs" class="agent-tabs"></div>
     <div id="agentSummary"></div>
     <div class="workbench-grid">
-      <div class="subpanel"><h3>独立实时输出</h3><div id="agentOutput"><div class="empty">选择一个 Agent 查看输出</div></div></div>
+      <div class="subpanel"><h3>完整轮次输出</h3><div id="agentOutput"><div class="empty">选择一个 Agent 查看输出</div></div></div>
       <div class="subpanel"><h3>近期工具与 Trace 动向</h3><div id="agentActivity"><div class="empty">选择一个 Agent 查看动向</div></div></div>
     </div>
   </section>
@@ -195,8 +195,9 @@ function askToken() {
 // ---------- 本地状态 ----------
 const state = {
   agents: [], tasks: [], interactions: [], result: null,
+  turns: [],
   feed: { outputs: [], logs: [], traces: [] },
-  activeAgent: "", view: "overview",
+  activeAgent: "", agentOutputFollow: true, view: "overview",
 };
 const curModes = { gate: "", exec: "", topo: "" };
 const $ = id => document.getElementById(id);
@@ -306,6 +307,7 @@ function renderInteractions() {
 }
 function knownAgentIDs() {
   const ids = new Set(state.agents.map(a => a.id).filter(Boolean));
+  for (const turn of state.turns) if (turn.agent_id) ids.add(turn.agent_id);
   for (const item of state.feed.outputs) if (item.agent_id) ids.add(item.agent_id);
   for (const item of state.feed.traces) if (item.agent_id) ids.add(item.agent_id);
   return Array.from(ids);
@@ -314,9 +316,6 @@ function ensureActiveAgent() {
   const ids = knownAgentIDs();
   if (!ids.includes(state.activeAgent)) state.activeAgent = ids[0] || "";
   return ids;
-}
-function outputKindLabel(kind) {
-  return ({ stream: "模型流", text: "代理输出", result: "最终结果" })[kind] || kind || "输出";
 }
 function traceText(t) {
   const bits = [t.kind || "trace"];
@@ -335,10 +334,15 @@ function traceIsActivity(t) {
     kind.includes("shell_") || kind.includes("interaction") || kind.includes("file_") ||
     kind.includes("plan_") || kind.includes("replan_");
 }
-function outputHTML(item) {
-  const suffix = item.error ? ` · 错误：${esc(item.error)}` :
-    (item.kind === "stream" ? (item.done ? " · 已完成" : " · 流式生成中…") : "");
-  return `<div class="output-item"><div class="activity-meta">${fmtTime(item.at)} · ${esc(outputKindLabel(item.kind))}${suffix}</div><pre>${esc(item.text || "")}</pre></div>`;
+function turnHTML(turn) {
+  const status = turn.status || "streaming";
+  const tools = Array.isArray(turn.tool_calls) && turn.tool_calls.length
+    ? `<div class="activity-meta">tools: ${turn.tool_calls.map(esc).join(" → ")}</div>` : "";
+  const error = turn.error ? `<div class="err">错误：${esc(turn.error)}</div>` : "";
+  return `<div class="output-item">
+    <div class="activity-meta">Loop ${turn.loop || 0} · ${esc(status)} · task ${esc(turn.task_id || "-")} · ${fmtTime(turn.completed_at || turn.started_at)}</div>
+    <pre>${esc(turn.text || "（本轮没有公开文本）")}</pre>${tools}${error}
+  </div>`;
 }
 function activityHTML(t) {
   return `<div class="activity-item"><div class="activity-meta">${fmtTime(t.at)}${t.agent_id ? " · " + esc(t.agent_id) : ""}</div><div>${esc(traceText(t))}</div></div>`;
@@ -360,9 +364,15 @@ function renderAgentWorkbench() {
     <span class="d">${esc(agent.type || "-")} · Loop ${agent.loop || 0} · ${esc(agent.phase || "-")} · 任务 ${esc(agent.current_task_id || "-")}</span>
     <button class="btn small" data-workbench-steer="${esc(agent.id)}">引导</button>
   </div>` : `<div class="workbench-head"><span class="cid">${esc(state.activeAgent)}</span><span class="d">历史活动窗口</span></div>`;
-  const outputs = state.feed.outputs.filter(item => item.agent_id === state.activeAgent).slice(-30).reverse();
+  const turns = state.turns.filter(item => item.agent_id === state.activeAgent);
   const traces = state.feed.traces.filter(item => item.agent_id === state.activeAgent && traceIsActivity(item)).slice(-100).reverse();
-  $("agentOutput").innerHTML = outputs.length ? outputs.map(outputHTML).join("") : '<div class="empty">该 Agent 尚无输出</div>';
+  const outputPanel = $("agentOutput");
+  const priorTop = outputPanel.scrollTop;
+  const nearBottom = outputPanel.scrollHeight - outputPanel.scrollTop - outputPanel.clientHeight < 32;
+  outputPanel.innerHTML = turns.length ? turns.map(turnHTML).join("") : '<div class="empty">该 Agent 尚无轮次输出</div>';
+  if (state.agentOutputFollow || nearBottom) outputPanel.scrollTop = outputPanel.scrollHeight;
+  else outputPanel.scrollTop = priorTop;
+  state.agentOutputFollow = false;
   $("agentActivity").innerHTML = traces.length ? traces.map(activityHTML).join("") : '<div class="empty">该 Agent 尚无工具或 Trace 动向</div>';
 }
 function renderActivity() {
@@ -383,9 +393,9 @@ function renderAll() {
 // ---------- 事件流（可过滤） ----------
 const KINDS = [
   ["TraceEvent", "Trace 事件"], ["LogLine", "日志"],
-  ["OutputText", "代理输出"], ["OutputStream", "模型流"], ["OutputResult", "任务结果"],
+  ["OutputText", "代理输出"], ["OutputStream", "模型流"], ["OutputTurn", "完成轮次"], ["OutputResult", "任务结果"],
 ];
-const enabled = { TraceEvent: true, LogLine: true, OutputText: true, OutputStream: true, OutputResult: true };
+const enabled = { TraceEvent: true, LogLine: true, OutputText: true, OutputStream: true, OutputTurn: true, OutputResult: true };
 $("filters").innerHTML = KINDS.map(([k, label]) =>
   `<label><input type="checkbox" data-k="${k}" checked> ${label}</label>`).join("");
 $("filters").addEventListener("change", e => {
@@ -409,6 +419,10 @@ function renderDiagnostics() {
     const suffix = item.error ? ` [stream error] ${item.error}` : (item.kind === "stream" ? (item.done ? " ✓" : " …") : "");
     rows.push({ at: item.at, kind, cls: "out", text: `[${item.agent_id || "-"}] ${item.text || ""}${suffix}` });
   }
+  if (enabled.OutputTurn) for (const turn of state.turns) rows.push({
+    at: turn.completed_at || turn.started_at, kind: "OutputTurn", cls: "out",
+    text: `[${turn.agent_id || "-"}] L${turn.loop || 0} ${turn.text || "（本轮没有公开文本）"}`,
+  });
   rows.sort((a, b) => new Date(a.at || 0) - new Date(b.at || 0));
   const visible = rows.slice(-500);
   body.innerHTML = visible.length ? visible.map(row =>
@@ -433,6 +447,37 @@ function addFeedOutput(item) {
   }
   if (state.feed.outputs.length > 200) state.feed.outputs.splice(0, state.feed.outputs.length - 200);
   renderVisibleFeeds();
+}
+function addTurn(item) {
+  if (!item || !item.stream_id) return;
+  const normalized = {
+    id: item.stream_id, session_id: item.session_id || "", agent_id: item.agent_id || "", task_id: item.task_id || "",
+    loop: item.loop || 0, text: item.text || "", status: item.error ? "failed" : "completed",
+    tool_calls: item.tool_calls || [], started_at: item.at || new Date().toISOString(),
+    completed_at: item.at || new Date().toISOString(), error: item.error || "",
+  };
+  const index = state.turns.findIndex(turn => turn.id === normalized.id);
+  if (index >= 0) state.turns[index] = normalized;
+  else state.turns.push(normalized);
+  renderVisibleFeeds();
+}
+function upsertStreamingTurn(item) {
+  if (!item || !item.stream_id) return;
+  const index = state.turns.findIndex(turn => turn.id === item.stream_id);
+  if (index >= 0) {
+    if (state.turns[index].status === "completed" || state.turns[index].status === "failed") return;
+    state.turns[index] = Object.assign({}, state.turns[index], {
+      text: item.text || state.turns[index].text || "",
+      error: item.error || state.turns[index].error || "",
+      status: "streaming",
+    });
+  } else {
+    state.turns.push({
+      id: item.stream_id, session_id: item.session_id || "", agent_id: item.agent_id || "", task_id: item.task_id || "",
+      loop: item.loop || 0, text: item.text || "", status: "streaming",
+      tool_calls: [], started_at: item.at || new Date().toISOString(), error: item.error || "",
+    });
+  }
 }
 function addFeedLog(text, at) {
   state.feed.logs.push({ text: text || "", at: at || new Date().toISOString() });
@@ -762,6 +807,7 @@ $("agentCards").addEventListener("click", async e => {
   const openID = e.target.dataset && e.target.dataset.openAgent;
   if (openID) {
     state.activeAgent = openID;
+    state.agentOutputFollow = true;
     setView("agents");
     return;
   }
@@ -773,6 +819,7 @@ $("agentTabs").addEventListener("click", e => {
   const id = e.target.dataset && e.target.dataset.agentTab;
   if (!id) return;
   state.activeAgent = id;
+  state.agentOutputFollow = true;
   renderAgentWorkbench();
 });
 $("agentSummary").addEventListener("click", async e => {
@@ -819,11 +866,13 @@ $("interactionList").addEventListener("click", async e => {
 // ---------- 数据流：快照 + SSE ----------
 function applySnapshot(snap) {
   if (!snap) return;
+  state.agentOutputFollow = true;
   renderHeader(snap);
   state.agents = snap.agents || [];
   state.tasks = snap.tasks || [];
   state.interactions = snap.pending_interactions || [];
-	state.result = snap.last_result || null;
+  state.result = snap.last_result || null;
+  state.turns = Array.isArray(snap.turns) ? snap.turns : [];
   const feed = snap.feed || {};
   state.feed = {
     outputs: Array.isArray(feed.outputs) ? feed.outputs : [],
@@ -841,6 +890,10 @@ function applyUpdate(u) {
     case "InteractionsChanged":
       state.interactions = u.interactions || [];
       renderInteractions(); break;
+    case "TurnsChanged":
+      state.turns = Array.isArray(u.turns) ? u.turns : [];
+      state.agentOutputFollow = true;
+      renderVisibleFeeds(); break;
     case "TraceEvent": {
       const t = u.trace;
       if (t && !t.at) t.at = u.at || new Date().toISOString();
@@ -849,13 +902,17 @@ function applyUpdate(u) {
     }
     case "LogLine": addFeedLog(u.log_line, u.at); break;
     case "OutputText": addFeedOutput(Object.assign({}, u.output, { kind: "text", at: u.at })); break;
-	case "OutputStream": addFeedOutput(Object.assign({}, u.output, { kind: "stream", at: u.at })); break;
-	case "OutputResult":
-		state.result = u.output || null;
-		renderResult();
-		toast("任务已完成，完整回复已显示在“最近完成回复”区域", false);
-		addFeedOutput(Object.assign({}, u.output, { kind: "result", at: u.at }));
-		break;
+    case "OutputStream": {
+      const item = Object.assign({}, u.output, { kind: "stream", at: u.at });
+      upsertStreamingTurn(item); addFeedOutput(item); break;
+    }
+    case "OutputTurn": addTurn(Object.assign({}, u.output, { at: u.at })); break;
+    case "OutputResult":
+      state.result = u.output || null;
+      renderResult();
+      toast("任务已完成，完整回复已显示在“最近完成回复”区域", false);
+      addFeedOutput(Object.assign({}, u.output, { kind: "result", at: u.at }));
+      break;
   }
 }
 

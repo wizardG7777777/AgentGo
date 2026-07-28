@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"path/filepath"
 	"strings"
 
 	"agentgo/internal/model"
@@ -139,4 +140,36 @@ func (a *Agent) failWorkspaceMerge(ctx context.Context, task *model.Task, taskID
 		return
 	}
 	log.Printf("[agent %s] 任务 %s 合并冲突已自动登记高优 ReplanRequest（plan=%s）", a.ID, taskID, task.PlanID)
+}
+
+// ArtifactPhysicalResolver 把 expected_artifacts 声明（约定为相对主根路径）
+// 解析为实际 stat 位置：隔离任务经 workspace 视图解析到副本/读穿透，非隔离
+// 任务拼主根。runner 装配注入；为 nil 时 expected-artifacts 校验退化为纯账本
+// 比对（与引入磁盘兜底前行为一致）。
+type ArtifactPhysicalResolver func(taskID, expected string) string
+
+// NewArtifactPhysicalResolver 构造期望产物的物理解析器（nil-safe）：
+// 相对路径先拼根（wsMgr 存在时取其绝对归一的 ProjectRoot，与 record-artifact
+// 的 resolveExpectedPhysical 同口径），再经 ResolveForTask 映射到任务视图。
+//
+// 用途：expected-artifacts 校验的磁盘兜底——重试/替代任务换新任务 ID 后，
+// 按任务 ID 记账的 artifact 账本失忆，但前次尝试写好的文件还在盘上
+// （2026-07-28 smoke 实测 worker 因此空转 4 次提交）。文件系统是唯一真实
+// 来源（docs/archived/hallucination-acceptance-audit-2026-05.md:174），
+// 账本缺失时 stat 一次比让 LLM 重写一遍便宜且正确。
+func NewArtifactPhysicalResolver(projectRoot string, wsMgr *workspace.Manager) ArtifactPhysicalResolver {
+	return func(taskID, expected string) string {
+		abs := expected
+		if !filepath.IsAbs(abs) {
+			root := projectRoot
+			if wsMgr != nil {
+				root = wsMgr.ProjectRoot()
+			}
+			abs = filepath.Join(root, abs)
+		}
+		if wsMgr != nil {
+			return wsMgr.ResolveForTask(taskID, abs)
+		}
+		return abs
+	}
 }

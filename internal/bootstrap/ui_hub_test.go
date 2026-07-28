@@ -11,6 +11,7 @@ import (
 	"agentgo/internal/modes"
 	"agentgo/internal/output"
 	"agentgo/internal/scheduler"
+	"agentgo/internal/session"
 	"agentgo/internal/shell"
 	"agentgo/internal/store"
 	"agentgo/internal/ui"
@@ -24,6 +25,11 @@ func TestSystem_UIHub_EndToEnd(t *testing.T) {
 	outputCh := make(chan output.Event, 4)
 	statusCh := make(chan string, 4)
 	interactions := interaction.NewService(interaction.NewMemoryStore())
+	sessionMgr, err := session.NewSessionManager(t.TempDir(), session.SessionConfig{})
+	if err != nil {
+		t.Fatalf("创建 SessionManager 失败: %v", err)
+	}
+	sessionID := sessionMgr.Current().ID
 
 	s := &System{
 		Store:           store.NewMemoryTaskStore(nil, 100, 1, 300),
@@ -33,6 +39,7 @@ func TestSystem_UIHub_EndToEnd(t *testing.T) {
 		OutputCh:        outputCh,
 		StatusCh:        statusCh,
 		Interactions:    interactions,
+		SessionMgr:      sessionMgr,
 	}
 	// 与 BootstrapWithOptions 同一装配路径（Step 11）。
 	s.UIHub = s.buildUIHub()
@@ -55,8 +62,13 @@ func TestSystem_UIHub_EndToEnd(t *testing.T) {
 		return s.UIHub.Snapshot().Mode == "immediate"
 	})
 
-	// 两条通道与一条结构化请求 → 订阅者看到三种 Update。
+	// 两条通道与一条结构化请求 → 订阅者看到结果、完成轮次、日志与交互更新。
 	outputCh <- output.Event{Kind: output.KindResult, AgentID: "worker-1", Text: "任务完成"}
+	outputCh <- output.Event{
+		Kind: output.KindTurn, SessionID: sessionID, AgentID: "worker-1",
+		StreamID: "turn-e2e", TaskID: "task-e2e", Loop: 2,
+		Text: "第二轮完整输出", ToolCalls: []string{"read_file"}, Done: true,
+	}
 	created, err := interactions.Create(context.Background(), interaction.CreateRequest{
 		ID: "ix_hub_e2e", Kind: interaction.KindAuthorization,
 		Purpose: shell.PurposeShellCommand, Prompt: "allow?",
@@ -70,6 +82,7 @@ func TestSystem_UIHub_EndToEnd(t *testing.T) {
 
 	remaining := map[ui.UpdateKind]bool{
 		ui.KindOutputResult:        true,
+		ui.KindOutputTurn:          true,
 		ui.KindInteractionsChanged: true,
 		ui.KindLogLine:             true,
 	}
@@ -84,6 +97,11 @@ func TestSystem_UIHub_EndToEnd(t *testing.T) {
 	waitForUI(t, "结果进入统一 UI 快照", func() bool {
 		result := s.UIHub.Snapshot().LastResult
 		return result != nil && result.Text == "任务完成" && result.AgentID == "worker-1"
+	})
+	waitForUI(t, "完成轮次经 UI Hub 写入 Session 账本", func() bool {
+		turns, loadErr := sessionMgr.LoadTurns(sessionID)
+		return loadErr == nil && len(turns) == 1 &&
+			turns[0].ID == "turn-e2e" && turns[0].Text == "第二轮完整输出"
 	})
 
 	// 待交互进入快照；经 Controller 回复并应用后从快照消失。

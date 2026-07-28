@@ -111,6 +111,83 @@ func (m *AppModel) outputsForAgent(agentID string) []ui.FeedOutput {
 	return out
 }
 
+func (m *AppModel) replaceTurns(turns []ui.AgentTurn) {
+	m.turns = cloneAgentTurns(turns)
+}
+
+func cloneAgentTurns(turns []ui.AgentTurn) []ui.AgentTurn {
+	if len(turns) == 0 {
+		return nil
+	}
+	out := make([]ui.AgentTurn, len(turns))
+	for i, turn := range turns {
+		out[i] = turn
+		out[i].ToolCalls = append([]string(nil), turn.ToolCalls...)
+	}
+	return out
+}
+
+func (m *AppModel) upsertTurnEvent(ev output.Event, at time.Time) {
+	if ev.StreamID == "" || ev.AgentID == "" {
+		return
+	}
+	for i := len(m.turns) - 1; i >= 0; i-- {
+		if m.turns[i].ID != ev.StreamID {
+			continue
+		}
+		if m.turns[i].Status == "completed" || m.turns[i].Status == "failed" {
+			return
+		}
+		if ev.Text != "" || m.turns[i].Text == "" {
+			m.turns[i].Text = ev.Text
+		}
+		if ev.Error != "" {
+			m.turns[i].Error = ev.Error
+		}
+		if ev.Kind == output.KindTurn {
+			m.turns[i].Status = "completed"
+			if ev.Error != "" {
+				m.turns[i].Status = "failed"
+			}
+			m.turns[i].CompletedAt = at
+			m.turns[i].ToolCalls = append([]string(nil), ev.ToolCalls...)
+		}
+		return
+	}
+	status := "streaming"
+	completedAt := time.Time{}
+	if ev.Kind == output.KindTurn {
+		status = "completed"
+		completedAt = at
+		if ev.Error != "" {
+			status = "failed"
+		}
+	}
+	m.turns = append(m.turns, ui.AgentTurn{
+		ID:          ev.StreamID,
+		SessionID:   ev.SessionID,
+		AgentID:     ev.AgentID,
+		TaskID:      ev.TaskID,
+		Loop:        ev.Loop,
+		Text:        ev.Text,
+		Status:      status,
+		ToolCalls:   append([]string(nil), ev.ToolCalls...),
+		StartedAt:   at,
+		CompletedAt: completedAt,
+		Error:       ev.Error,
+	})
+}
+
+func (m *AppModel) turnsForAgent(agentID string) []ui.AgentTurn {
+	out := make([]ui.AgentTurn, 0)
+	for _, turn := range m.turns {
+		if turn.AgentID == agentID {
+			out = append(out, turn)
+		}
+	}
+	return out
+}
+
 func (m *AppModel) tracesForAgent(agentID string) []ui.TraceEvent {
 	out := make([]ui.TraceEvent, 0)
 	for _, event := range m.traces {
@@ -166,29 +243,156 @@ func renderLiveActivity(t Theme, w, h int, agents []AgentInfo) string {
 	return title + "\n" + divider + "\n" + strings.Join(lines, "\n")
 }
 
-func renderAgentWorkbench(t Theme, w, h int, info AgentInfo, outputs []ui.FeedOutput, traces []ui.TraceEvent) string {
+func renderAgentWorkbench(
+	t Theme,
+	w, h int,
+	info AgentInfo,
+	turns []ui.AgentTurn,
+	outputs []ui.FeedOutput,
+	traces []ui.TraceEvent,
+	scrollFromBottom int,
+) string {
+	fixed, history, viewportH := agentWorkbenchParts(t, w, h, info, turns, outputs, traces)
+	if viewportH <= 0 {
+		if len(fixed) > h {
+			fixed = fixed[:h]
+		}
+		return strings.Join(fixed, "\n")
+	}
+	maxScroll := maxInt(0, len(history)-viewportH)
+	if scrollFromBottom < 0 {
+		scrollFromBottom = 0
+	}
+	if scrollFromBottom > maxScroll {
+		scrollFromBottom = maxScroll
+	}
+	end := len(history) - scrollFromBottom
+	start := maxInt(0, end-viewportH)
+	visible := append([]string(nil), history[start:end]...)
+	for len(visible) < viewportH {
+		visible = append([]string{""}, visible...)
+	}
+	return strings.Join(append(fixed, visible...), "\n")
+}
+
+func agentWorkbenchMaxScroll(
+	t Theme,
+	w, h int,
+	info AgentInfo,
+	turns []ui.AgentTurn,
+	outputs []ui.FeedOutput,
+	traces []ui.TraceEvent,
+) int {
+	_, history, viewportH := agentWorkbenchParts(t, w, h, info, turns, outputs, traces)
+	return maxInt(0, len(history)-viewportH)
+}
+
+func agentWorkbenchParts(
+	t Theme,
+	w, h int,
+	info AgentInfo,
+	turns []ui.AgentTurn,
+	outputs []ui.FeedOutput,
+	traces []ui.TraceEvent,
+) (fixed []string, history []string, viewportH int) {
 	title := t.MdH2.Render(truncateDisplay(fmt.Sprintf("  %s Agent: %s", t.IconAgent, info.ID), w))
 	meta := fmt.Sprintf("  %s · task %s · loop %d · %s · %d tools",
 		info.State, shortID(info.CurrentTaskID), info.Loop, info.Phase, info.ToolCallCount)
 	divider := t.MdDivider.Render(strings.Repeat("─", w))
-	header := []string{title, t.SidebarDim.Render(truncateDisplay(meta, w)), divider}
-	if h <= len(header) {
-		return strings.Join(header[:maxInt(1, h)], "\n")
+	fixed = []string{title, t.SidebarDim.Render(truncateDisplay(meta, w)), divider}
+	if h <= len(fixed) {
+		return fixed, nil, 0
 	}
 
-	sections := []workbenchSection{{Title: "  Current Turn", Lines: agentOutputLines(t, w, outputs, info), Flexible: true}}
 	if control := schedulerControlLines(t, w, info.SchedulerControl); len(control) > 0 {
-		sections = append(sections, workbenchSection{Title: "  Controller State", Lines: control, MaxLines: 3})
+		fixed = append(fixed, t.MdH2.Render("  Controller State"))
+		fixed = append(fixed, tailLines(control, 3)...)
 	}
 	if active := activeToolLines(t, w, info.ActiveTools); len(active) > 0 {
-		sections = append(sections, workbenchSection{Title: "  Active Tools", Lines: active, MaxLines: 3})
+		fixed = append(fixed, t.MdH2.Render("  Active Tools"))
+		fixed = append(fixed, tailLines(active, 2)...)
 	}
-	sections = append(sections, workbenchSection{Title: "  Recent Decisions", Lines: recentDecisionLines(t, w, traces), Flexible: true})
+	if hasDecisionTrace(traces) {
+		fixed = append(fixed, t.MdH2.Render("  Recent Decisions"))
+		fixed = append(fixed, tailLines(recentDecisionLines(t, w, traces), 3)...)
+	}
+
+	history = turnHistoryLines(t, w, turns, outputs, info)
 	if final := latestResultLines(t, w, outputs); len(final) > 0 {
-		sections = append(sections, workbenchSection{Title: "  Final Result", Lines: final, MaxLines: 3})
+		history = append(history, t.MdH2.Render("  Final Result"))
+		history = append(history, final...)
 	}
-	body := fitWorkbenchSections(t, sections, h-len(header))
-	return strings.Join(append(header, body...), "\n")
+	viewportH = h - len(fixed)
+	if viewportH < 0 {
+		viewportH = 0
+	}
+	return fixed, history, viewportH
+}
+
+func turnHistoryLines(t Theme, w int, turns []ui.AgentTurn, outputs []ui.FeedOutput, info AgentInfo) []string {
+	lines := []string{t.MdH2.Render(fmt.Sprintf("  Turn History · %d turns", len(turns)))}
+	if len(turns) == 0 {
+		lines = append(lines, agentOutputLines(t, w, outputs, info)...)
+		return lines
+	}
+	for i, turn := range turns {
+		icon := "✓"
+		switch turn.Status {
+		case "streaming":
+			icon = "…"
+		case "failed":
+			icon = "✗"
+		}
+		at := turn.CompletedAt
+		if at.IsZero() {
+			at = turn.StartedAt
+		}
+		timeText := ""
+		if !at.IsZero() {
+			timeText = " · " + at.Format("15:04:05")
+		}
+		header := fmt.Sprintf("  %s Loop %d · %s · task %s%s",
+			icon, turn.Loop, turn.Status, shortID(turn.TaskID), timeText)
+		lines = append(lines, t.MsgLog.Render(truncateDisplay(header, w)))
+		textLines := wrapWorkbenchText(t, w, turn.Text)
+		if len(textLines) == 0 {
+			textLines = []string{t.SidebarDim.Render("  （本轮没有公开文本）")}
+		}
+		lines = append(lines, textLines...)
+		if len(turn.ToolCalls) > 0 {
+			toolsText := "  tools: " + strings.Join(turn.ToolCalls, " → ")
+			for _, line := range wrapDisplay(toolsText, maxInt(1, w-2)) {
+				lines = append(lines, t.MsgLog.Render("  "+strings.TrimSpace(line)))
+			}
+		}
+		if turn.Error != "" {
+			for _, line := range wrapDisplay("error: "+turn.Error, maxInt(1, w-2)) {
+				lines = append(lines, t.MsgError.Render("  "+line))
+			}
+		}
+		if i+1 < len(turns) {
+			lines = append(lines, t.MdDivider.Render(strings.Repeat("┄", maxInt(1, w))))
+		}
+	}
+	return lines
+}
+
+func tailLines(lines []string, limit int) []string {
+	if limit <= 0 || len(lines) <= limit {
+		return lines
+	}
+	return lines[len(lines)-limit:]
+}
+
+func hasDecisionTrace(traces []ui.TraceEvent) bool {
+	for _, event := range traces {
+		if event.Kind == "tool_call" || event.Kind == "tool_result" ||
+			strings.HasPrefix(event.Kind, "plan_") || strings.HasPrefix(event.Kind, "replan_") ||
+			event.Kind == "acceptance_completed" || event.Kind == "error" {
+			return true
+		}
+	}
+	return false
 }
 
 func agentOutputLines(t Theme, w int, outputs []ui.FeedOutput, info AgentInfo) []string {
@@ -237,94 +441,6 @@ func agentOutputLines(t Theme, w int, outputs []ui.FeedOutput, info AgentInfo) [
 		lines = []string{t.SidebarDim.Render(message)}
 	}
 	return lines
-}
-
-type workbenchSection struct {
-	Title    string
-	Lines    []string
-	MaxLines int
-	Flexible bool
-}
-
-func fitWorkbenchSections(t Theme, sections []workbenchSection, height int) []string {
-	if height <= 0 {
-		return nil
-	}
-	visible := make([]workbenchSection, 0, len(sections))
-	for _, section := range sections {
-		if len(section.Lines) == 0 {
-			continue
-		}
-		if section.MaxLines > 0 && len(section.Lines) > section.MaxLines {
-			section.Lines = section.Lines[len(section.Lines)-section.MaxLines:]
-		}
-		visible = append(visible, section)
-	}
-	if len(visible) == 0 {
-		return []string{t.SidebarDim.Render("No agent activity yet.")}
-	}
-	if height <= len(visible) {
-		out := make([]string, 0, height)
-		for _, section := range visible[:height] {
-			out = append(out, t.MdH2.Render(section.Title))
-		}
-		return out
-	}
-
-	availableLines := height - len(visible)
-	fixedUsed := 0
-	flexCount := 0
-	for _, section := range visible {
-		if section.Flexible {
-			flexCount++
-		} else {
-			fixedUsed += len(section.Lines)
-		}
-	}
-	if fixedUsed > availableLines-flexCount {
-		fixedUsed = maxInt(0, availableLines-flexCount)
-	}
-	flexBudget := availableLines - fixedUsed
-	out := make([]string, 0, height)
-	remainingFixed := fixedUsed
-	remainingFlex := flexCount
-	for _, section := range visible {
-		out = append(out, t.MdH2.Render(section.Title))
-		budget := len(section.Lines)
-		if section.Flexible {
-			budget = maxInt(1, flexBudget/maxInt(1, remainingFlex))
-			if remainingFlex == flexCount && flexCount > 1 {
-				budget = maxInt(budget, flexBudget*2/3)
-			}
-			if budget > flexBudget-(remainingFlex-1) {
-				budget = flexBudget - (remainingFlex - 1)
-			}
-			if budget > len(section.Lines) {
-				budget = len(section.Lines)
-			}
-			flexBudget -= budget
-			remainingFlex--
-		} else if budget > remainingFixed {
-			budget = remainingFixed
-		}
-		if !section.Flexible && budget > len(section.Lines) {
-			budget = len(section.Lines)
-		}
-		if budget < 0 {
-			budget = 0
-		}
-		if !section.Flexible {
-			remainingFixed -= budget
-		}
-		if len(section.Lines) > budget {
-			section.Lines = section.Lines[len(section.Lines)-budget:]
-		}
-		out = append(out, section.Lines...)
-	}
-	if len(out) > height {
-		out = out[:height]
-	}
-	return out
 }
 
 func wrapWorkbenchText(t Theme, w int, text string) []string {

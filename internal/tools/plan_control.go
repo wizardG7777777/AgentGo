@@ -38,6 +38,9 @@ type PlanControlGroup struct {
 	// 它的权威提交通道是 report_done。
 	FinalizationNotifier FinalizationNotifier
 	SubmitState          *agent.SubmitState
+	// ArtifactResolver 是 submit_task_result 的 expected-artifacts 磁盘兜底
+	// 解析器（runner 装配注入）。nil 时校验退化为纯账本比对。
+	ArtifactResolver agent.ArtifactPhysicalResolver
 }
 
 func (g PlanControlGroup) Register(r *agent.ToolRegistry) {

@@ -556,6 +556,7 @@ type updateWire struct {
 	Interactions *[]ui.InteractionItem `json:"interactions,omitempty"`
 	Agents       []ui.AgentCard        `json:"agents,omitempty"`
 	Tasks        []ui.BoardTask        `json:"tasks,omitempty"`
+	Turns        *[]ui.AgentTurn       `json:"turns,omitempty"`
 	Snapshot     *ui.Snapshot          `json:"snapshot,omitempty"`
 	Trace        *ui.TraceEvent        `json:"trace,omitempty"`
 	At           time.Time             `json:"at"`
@@ -563,14 +564,16 @@ type updateWire struct {
 
 // outputWire 是 output.Event 的 JSON 形态（Kind 用字符串，与 UpdateKind 对齐）。
 type outputWire struct {
-	Kind     string `json:"kind"` // "OutputResult" / "OutputText" / "OutputStream"
-	AgentID  string `json:"agent_id"`
-	Text     string `json:"text"`
-	StreamID string `json:"stream_id,omitempty"`
-	TaskID   string `json:"task_id,omitempty"`
-	Loop     int    `json:"loop,omitempty"`
-	Done     bool   `json:"done,omitempty"`
-	Error    string `json:"error,omitempty"`
+	Kind      string   `json:"kind"` // OutputResult / OutputText / OutputStream / OutputTurn
+	AgentID   string   `json:"agent_id"`
+	SessionID string   `json:"session_id,omitempty"`
+	Text      string   `json:"text"`
+	StreamID  string   `json:"stream_id,omitempty"`
+	TaskID    string   `json:"task_id,omitempty"`
+	Loop      int      `json:"loop,omitempty"`
+	Done      bool     `json:"done,omitempty"`
+	Error     string   `json:"error,omitempty"`
+	ToolCalls []string `json:"tool_calls,omitempty"`
 }
 
 // encodeUpdate 把一条 ui.Update 编码为 SSE 帧载荷。
@@ -585,10 +588,22 @@ func encodeUpdate(u ui.Update) ([]byte, error) {
 		w.Output = &outputWire{Kind: "OutputText", AgentID: u.Output.AgentID, Text: u.Output.Text}
 	case ui.KindOutputStream:
 		w.Output = &outputWire{
-			Kind: "OutputStream", AgentID: u.Output.AgentID, Text: u.Output.Text,
+			Kind: "OutputStream", AgentID: u.Output.AgentID, SessionID: u.Output.SessionID, Text: u.Output.Text,
 			StreamID: u.Output.StreamID, TaskID: u.Output.TaskID, Loop: u.Output.Loop,
 			Done: u.Output.Done, Error: u.Output.Error,
 		}
+	case ui.KindOutputTurn:
+		w.Output = &outputWire{
+			Kind: "OutputTurn", AgentID: u.Output.AgentID, SessionID: u.Output.SessionID, Text: u.Output.Text,
+			StreamID: u.Output.StreamID, TaskID: u.Output.TaskID, Loop: u.Output.Loop,
+			Done: true, Error: u.Output.Error, ToolCalls: append([]string(nil), u.Output.ToolCalls...),
+		}
+	case ui.KindTurnsChanged:
+		turns := append([]ui.AgentTurn(nil), u.Turns...)
+		if turns == nil {
+			turns = []ui.AgentTurn{}
+		}
+		w.Turns = &turns
 	case ui.KindLogLine:
 		w.LogLine = u.LogLine
 	case ui.KindInteractionsChanged:

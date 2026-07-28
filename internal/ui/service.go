@@ -2,6 +2,8 @@ package ui
 
 import (
 	"context"
+	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -61,6 +63,12 @@ type Deps struct {
 	// KindResult 时立即更新自己的快照；此 getter 用于启动恢复、页面晚订阅与
 	// Session 切换后的周期自愈。
 	ResultGet func() *ResultItem
+	// TurnLoad 读取指定 Session 的全部已完成 LLM 轮次。Hub 只在启动或
+	// Session ID 变化时调用，不参与 500ms 常规轮询。
+	TurnLoad func(sessionID string) ([]AgentTurn, error)
+	// TurnAppend 把一个 completed/failed 轮次同步追加到其 Session 账本。
+	// 同一轮的流式 delta 不调用它。
+	TurnAppend func(turn AgentTurn) error
 
 	// ── 控制面注入（Controller 实现依赖；nil 时返回 ErrNotAssembled）──
 
@@ -141,6 +149,12 @@ type Hub struct {
 	nextSubID int                 // 订阅 ID 自增
 	snapshot  Snapshot            // 最新快照（整体替换，绝不原地修改）
 	feed      FeedSnapshot        // 有界实时窗口；在 Snapshot/Subscribe 时复制
+	turns     []AgentTurn         // 当前 Session 全部轮次（完成历史 + 当前 streaming）
+	// turnSessionID 标识 turns 所属 Session。pendingTurns 可跨 Session 保留，
+	// 以便切换并发下失败的旧 Session append 仍按原归属重试。
+	turnSessionID    string
+	persistedTurnIDs map[string]bool
+	pendingTurns     map[string]AgentTurn
 
 	// Session 级 token 累加器：由 EmitTraceEvent 逐条累加 token_stats 事件
 	// （每次 LLM 调用恰好一条，载本轮消耗）。独立于 snapshot 存放，
@@ -154,8 +168,10 @@ type Hub struct {
 // NewHub 创建 Hub。Run 尚未启动前即可 Subscribe / 调用 Controller。
 func NewHub(deps Deps) *Hub {
 	return &Hub{
-		deps: deps,
-		subs: make(map[int]chan Update),
+		deps:             deps,
+		subs:             make(map[int]chan Update),
+		persistedTurnIDs: make(map[string]bool),
+		pendingTurns:     make(map[string]AgentTurn),
 	}
 }
 
@@ -202,8 +218,32 @@ func (h *Hub) Run(ctx context.Context) {
 				h.setLastResult(&ResultItem{AgentID: ev.AgentID, Text: ev.Text})
 			}
 			now := time.Now()
-			h.recordOutput(ev, now)
-			h.broadcast(Update{Kind: outputUpdateKind(ev.Kind), Output: ev, At: now})
+			activeSessionID := h.currentSessionID()
+			eventSessionID := ev.SessionID
+			if eventSessionID == "" {
+				eventSessionID = activeSessionID
+			}
+			visible := true
+			if ev.Kind == output.KindStream || ev.Kind == output.KindTurn {
+				if h.ensureTurnsSession(activeSessionID) {
+					h.broadcast(Update{Kind: KindTurnsChanged, Turns: h.Snapshot().Turns, At: now})
+				}
+				visible = activeSessionID == "" || eventSessionID == activeSessionID
+				if visible {
+					h.recordTurnEvent(ev, eventSessionID, now)
+				} else if ev.Kind == output.KindTurn {
+					h.queueDetachedTurn(ev, eventSessionID, now)
+				}
+			}
+			if visible && ev.Kind != output.KindTurn {
+				h.recordOutput(ev, now)
+			}
+			if ev.Kind == output.KindTurn {
+				h.flushPendingTurns()
+			}
+			if visible {
+				h.broadcast(Update{Kind: outputUpdateKind(ev.Kind), Output: ev, At: now})
+			}
 		case line, ok := <-statusCh:
 			if !ok {
 				statusCh = nil
@@ -219,8 +259,12 @@ func (h *Hub) Run(ctx context.Context) {
 			}
 			h.refreshInteractions()
 		case <-ticker.C:
-			h.refreshSnapshot()
+			turnsChanged := h.refreshSnapshot()
+			h.flushPendingTurns()
 			snap := h.Snapshot()
+			if turnsChanged {
+				h.broadcast(Update{Kind: KindTurnsChanged, Turns: snap.Turns, At: time.Now()})
+			}
 			h.broadcast(Update{
 				Kind:                    KindAgentsChanged,
 				Agents:                  snap.Agents,
@@ -280,6 +324,7 @@ func (h *Hub) Snapshot() Snapshot {
 func (h *Hub) snapshotWithFeedLocked() Snapshot {
 	snap := h.snapshot
 	snap.Feed = cloneFeedSnapshot(h.feed)
+	snap.Turns = cloneAgentTurns(h.turns)
 	snap.SessionPromptTokens = h.sessionPromptTokens
 	snap.SessionCompletionTokens = h.sessionCompletionTokens
 	snap.SessionCallCount = h.sessionCallCount
@@ -303,6 +348,18 @@ func cloneFeedSnapshot(feed FeedSnapshot) FeedSnapshot {
 		Logs:    append([]LogItem(nil), feed.Logs...),
 		Traces:  append([]TraceEvent(nil), feed.Traces...),
 	}
+}
+
+func cloneAgentTurns(turns []AgentTurn) []AgentTurn {
+	if len(turns) == 0 {
+		return nil
+	}
+	out := make([]AgentTurn, len(turns))
+	for i, turn := range turns {
+		out[i] = turn
+		out[i].ToolCalls = append([]string(nil), turn.ToolCalls...)
+	}
+	return out
 }
 
 func feedOutputFromEvent(ev output.Event, at time.Time) FeedOutput {
@@ -337,6 +394,172 @@ func (h *Hub) recordOutput(ev output.Event, at time.Time) {
 	}
 }
 
+func (h *Hub) currentSessionID() string {
+	if h.deps.SessionGet == nil {
+		return ""
+	}
+	return h.deps.SessionGet().ID
+}
+
+// ensureTurnsSession 在启动和 Session 切换时一次性装载完整轮次账本。
+// Hub.Run 是唯一生产调用方，因此加载与 output 事件天然串行；测试直接调用
+// 时的二次 Session 检查仍可避免重复读盘。
+func (h *Hub) ensureTurnsSession(sessionID string) bool {
+	h.mu.RLock()
+	if h.turnSessionID == sessionID {
+		h.mu.RUnlock()
+		return false
+	}
+	h.mu.RUnlock()
+
+	var loaded []AgentTurn
+	if sessionID != "" && h.deps.TurnLoad != nil {
+		turns, err := h.deps.TurnLoad(sessionID)
+		if err != nil {
+			log.Printf("[UI Hub] 加载 Session %s 轮次账本失败: %v", sessionID, err)
+			// 切换目标加载失败时不能继续展示旧 Session 历史。先清空视图，
+			// 保留旧 turnSessionID 以便下一次轮询继续重试目标账本。
+			h.mu.Lock()
+			changed := h.turnSessionID != sessionID && len(h.turns) > 0
+			if h.turnSessionID != sessionID {
+				h.turns = nil
+			}
+			h.mu.Unlock()
+			return changed
+		}
+		loaded = cloneAgentTurns(turns)
+	}
+	h.mu.Lock()
+	changed := false
+	if h.turnSessionID != sessionID {
+		h.turnSessionID = sessionID
+		h.turns = loaded
+		changed = true
+		for _, turn := range loaded {
+			if turn.ID != "" && (turn.Status == "completed" || turn.Status == "failed") {
+				h.persistedTurnIDs[turn.ID] = true
+			}
+		}
+	}
+	h.mu.Unlock()
+	return changed
+}
+
+// recordTurnEvent 把同一 StreamID 的 delta 原位更新；KindTurn 到达时冻结为
+// completed/failed，并进入待持久化队列。不同 ID 永远追加，跨 loop 不覆盖。
+func (h *Hub) recordTurnEvent(ev output.Event, sessionID string, at time.Time) {
+	if ev.StreamID == "" || ev.AgentID == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	idx := -1
+	for i := len(h.turns) - 1; i >= 0; i-- {
+		if h.turns[i].ID == ev.StreamID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		h.turns = append(h.turns, AgentTurn{
+			ID:        ev.StreamID,
+			SessionID: sessionID,
+			AgentID:   ev.AgentID,
+			TaskID:    ev.TaskID,
+			Loop:      ev.Loop,
+			Status:    "streaming",
+			StartedAt: at,
+		})
+		idx = len(h.turns) - 1
+	}
+	turn := h.turns[idx]
+	if turn.SessionID == "" {
+		turn.SessionID = sessionID
+	}
+	if ev.Text != "" || turn.Text == "" {
+		turn.Text = ev.Text
+	}
+	if ev.Error != "" {
+		turn.Error = ev.Error
+	}
+	if ev.Kind == output.KindTurn {
+		if turn.Status == "completed" || turn.Status == "failed" {
+			return
+		}
+		turn.Status = "completed"
+		if ev.Error != "" {
+			turn.Status = "failed"
+		}
+		turn.CompletedAt = at
+		turn.ToolCalls = append([]string(nil), ev.ToolCalls...)
+		if !h.persistedTurnIDs[turn.ID] {
+			h.pendingTurns[turn.ID] = turn
+		}
+	}
+	h.turns[idx] = turn
+}
+
+// queueDetachedTurn 处理 Session 切换后才到达的旧边界完成事件：它仍按
+// 事件携带的 SessionID 持久化，但不回灌当前前端的轮次列表。
+func (h *Hub) queueDetachedTurn(ev output.Event, sessionID string, at time.Time) {
+	if ev.StreamID == "" || ev.AgentID == "" || sessionID == "" {
+		return
+	}
+	status := "completed"
+	if ev.Error != "" {
+		status = "failed"
+	}
+	turn := AgentTurn{
+		ID:          ev.StreamID,
+		SessionID:   sessionID,
+		AgentID:     ev.AgentID,
+		TaskID:      ev.TaskID,
+		Loop:        ev.Loop,
+		Text:        ev.Text,
+		Status:      status,
+		ToolCalls:   append([]string(nil), ev.ToolCalls...),
+		StartedAt:   at,
+		CompletedAt: at,
+		Error:       ev.Error,
+	}
+	h.mu.Lock()
+	if !h.persistedTurnIDs[turn.ID] {
+		h.pendingTurns[turn.ID] = turn
+	}
+	h.mu.Unlock()
+}
+
+// flushPendingTurns 同步落盘待提交轮次。失败项保留到下一次 output/ticker
+// 重试；成功后才标记 persisted，避免瞬时磁盘错误造成永久历史缺口。
+func (h *Hub) flushPendingTurns() {
+	if h.deps.TurnAppend == nil {
+		return
+	}
+	h.mu.RLock()
+	pending := make([]AgentTurn, 0, len(h.pendingTurns))
+	for _, turn := range h.pendingTurns {
+		pending = append(pending, turn)
+	}
+	h.mu.RUnlock()
+	sort.Slice(pending, func(i, j int) bool {
+		if pending[i].CompletedAt.Equal(pending[j].CompletedAt) {
+			return pending[i].ID < pending[j].ID
+		}
+		return pending[i].CompletedAt.Before(pending[j].CompletedAt)
+	})
+	for _, turn := range pending {
+		if err := h.deps.TurnAppend(turn); err != nil {
+			log.Printf("[UI Hub] 持久化 Agent %s loop=%d 轮次失败: %v", turn.AgentID, turn.Loop, err)
+			continue
+		}
+		h.mu.Lock()
+		delete(h.pendingTurns, turn.ID)
+		h.persistedTurnIDs[turn.ID] = true
+		h.mu.Unlock()
+	}
+}
+
 func (h *Hub) recordLog(line string, at time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -357,7 +580,7 @@ func (h *Hub) recordTrace(event TraceEvent) {
 
 // refreshSnapshot 调用各轮询函数重建快照并整体替换。
 // 轮询函数与 Interaction Store 读取均在锁外调用（可能较慢）。
-func (h *Hub) refreshSnapshot() {
+func (h *Hub) refreshSnapshot() bool {
 	var snap Snapshot
 	if h.deps.PollAgents != nil {
 		snap.Agents = h.deps.PollAgents()
@@ -377,6 +600,7 @@ func (h *Hub) refreshSnapshot() {
 	if h.deps.SessionGet != nil {
 		snap.Session = h.deps.SessionGet()
 	}
+	turnsChanged := h.ensureTurnsSession(snap.Session.ID)
 	if h.deps.ResultGet != nil {
 		snap.LastResult = cloneResultItem(h.deps.ResultGet())
 	} else {
@@ -396,6 +620,7 @@ func (h *Hub) refreshSnapshot() {
 	h.mu.Lock()
 	h.snapshot = snap
 	h.mu.Unlock()
+	return turnsChanged
 }
 
 func (h *Hub) setLastResult(result *ResultItem) {
@@ -469,6 +694,9 @@ func outputUpdateKind(k output.Kind) UpdateKind {
 	}
 	if k == output.KindStream {
 		return KindOutputStream
+	}
+	if k == output.KindTurn {
+		return KindOutputTurn
 	}
 	return KindOutputText
 }

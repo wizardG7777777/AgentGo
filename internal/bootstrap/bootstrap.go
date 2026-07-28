@@ -664,7 +664,24 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	activity := agent.NewActivityTracker()
 	var sys *System
 	outputDone := make(chan struct{})
+	var streamSessionMu sync.Mutex
+	streamSessions := make(map[string]string)
 	streamOutput := func(ev output.Event) {
+		if ev.StreamID != "" && (ev.Kind == output.KindStream || ev.Kind == output.KindTurn) {
+			streamSessionMu.Lock()
+			sessionID := streamSessions[ev.StreamID]
+			if sessionID == "" {
+				sessionID = currentSessionID()
+				streamSessions[ev.StreamID] = sessionID
+			}
+			ev.SessionID = sessionID
+			if ev.Kind == output.KindTurn {
+				delete(streamSessions, ev.StreamID)
+			}
+			streamSessionMu.Unlock()
+		} else if ev.SessionID == "" {
+			ev.SessionID = currentSessionID()
+		}
 		select {
 		case outputCh <- ev:
 		case <-outputDone:
@@ -997,6 +1014,22 @@ func (s *System) buildUIHub() *ui.Hub {
 				return nil
 			}
 			return &ui.ResultItem{AgentID: "scheduler", Text: result.Text}
+		},
+		TurnLoad: func(sessionID string) ([]ui.AgentTurn, error) {
+			if s.SessionMgr == nil || sessionID == "" {
+				return nil, nil
+			}
+			records, err := s.SessionMgr.LoadTurns(sessionID)
+			if err != nil {
+				return nil, err
+			}
+			return uiTurnsFromSession(records), nil
+		},
+		TurnAppend: func(turn ui.AgentTurn) error {
+			if s.SessionMgr == nil || turn.SessionID == "" {
+				return nil
+			}
+			return s.SessionMgr.AppendTurn(turn.SessionID, sessionTurnFromUI(turn))
 		},
 		RecordUserInput: func(text string) {
 			if s.SessionMgr == nil {

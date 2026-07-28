@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1892,5 +1894,32 @@ func TestCheckExpectedArtifacts_DifferentBasenameStillMissing(t *testing.T) {
 	res := checkExpectedArtifacts(r, "any-id")
 	if len(res.Missing) != 1 || res.Missing[0] != "report.md" {
 		t.Errorf("expected ['report.md'] missing, got: %+v", res)
+	}
+}
+
+func TestCheckExpectedArtifactsWithResolver_DiskFallback(t *testing.T) {
+	dir := t.TempDir()
+	// 盘上只有 a.md（前次尝试写好的）与一个目录（目录不算产物）；账本为空
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "dir.md"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := &fakeStoreReader{task: &model.Task{
+		ExpectedArtifacts: []string{"a.md", "b.md", "dir.md"},
+	}}
+	resolve := func(taskID, expected string) string { return filepath.Join(dir, expected) }
+	res := checkExpectedArtifactsWithResolver(r, "any-id", resolve)
+	if len(res.Recovered) != 1 || res.Recovered[0] != "a.md" {
+		t.Errorf("盘上存在的 a.md 应转入 Recovered: %+v", res)
+	}
+	if len(res.Missing) != 2 || res.Missing[0] != "b.md" || res.Missing[1] != "dir.md" {
+		t.Errorf("盘上无 b.md 应仍 Missing；目录不算产物但也同样不满足契约: %+v", res)
+	}
+	// nil resolver 退化为纯账本比对（行为与引入兜底前一致）
+	res2 := checkExpectedArtifactsWithResolver(r, "any-id", nil)
+	if len(res2.Missing) != 3 || len(res2.Recovered) != 0 {
+		t.Errorf("nil resolver 应纯账本比对（3 Missing、0 Recovered）: %+v", res2)
 	}
 }

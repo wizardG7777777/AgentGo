@@ -52,9 +52,9 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 	blockedReason, _ := args["blocked_reason"].(string)
 	requestReplan, _ := args["request_replan"].(bool)
 
-	// ExpectedArtifacts 合约校验（与自然完成路径同源）。缺失时返回错误并保持
-	// 未 finalized——本轮 ReAct 循环继续，LLM 补写后可再次调用本工具。
-	check := agent.CheckExpectedArtifacts(g.Store, task.ID)
+	// ExpectedArtifacts 合约校验（与自然完成路径同源，含磁盘兜底）。缺失时
+	// 返回错误并保持未 finalized——本轮 ReAct 循环继续，LLM 补写后可再次调用。
+	check := agent.CheckExpectedArtifactsWithDisk(g.Store, task.ID, g.ArtifactResolver)
 	if len(check.Missing) > 0 {
 		return "", fmt.Errorf("submit_task_result 被拒绝：%s", agent.BuildArtifactFailureReason(check))
 	}

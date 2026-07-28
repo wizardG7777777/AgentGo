@@ -9,6 +9,7 @@ import (
 
 	"agentgo/internal/bootstrap"
 	"agentgo/internal/config"
+	"agentgo/internal/eval"
 	"agentgo/internal/session"
 	"agentgo/internal/trace"
 )
@@ -32,6 +33,11 @@ func main() {
 	// 子命令路由：config 族（当前含 doctor）只做配置静态检查，不启动主系统
 	if len(os.Args) >= 2 && os.Args[1] == "config" {
 		os.Exit(config.CLI(os.Args[2:], os.Stdout, os.Stderr))
+	}
+
+	// 子命令路由：eval 族（当前含 preflight）做行为评测驱动，不启动主系统
+	if len(os.Args) >= 2 && os.Args[1] == "eval" {
+		os.Exit(eval.CLI(os.Args[2:], os.Stdout, os.Stderr))
 	}
 
 	configPath := flag.String("config", "setting.yaml", "配置文件路径")

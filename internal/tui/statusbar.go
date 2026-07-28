@@ -90,8 +90,10 @@ func statusHints(t Theme, focus FocusState, view ViewState, interactionTextMode 
 	case FocusSidebar:
 		active[ctxSidebar] = true
 	case FocusMain:
-		if view == ViewDashboard || view == ViewAgentDetail {
+		if view == ViewDashboard {
 			active[ctxMain] = true
+		} else if view == ViewAgentDetail {
+			active[ctxAgentDetail] = true
 		}
 	case FocusInput:
 		if interactionTextMode {

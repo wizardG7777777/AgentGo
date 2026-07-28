@@ -1,10 +1,12 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"agentgo/internal/output"
 	"agentgo/internal/ui"
 )
 
@@ -51,15 +53,54 @@ func TestRecordFeedOutputUpsertsStreamAndFiltersByAgent(t *testing.T) {
 	}
 }
 
+func TestUpsertTurnEventKeepsEveryLoopAndFreezesTerminalTurn(t *testing.T) {
+	m := newAppModel(testDeps())
+	at := time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC)
+	m.upsertTurnEvent(output.Event{
+		Kind: output.KindStream, StreamID: "turn-1", AgentID: "worker-1",
+		TaskID: "task-1", Loop: 1, Text: "部",
+	}, at)
+	m.upsertTurnEvent(output.Event{
+		Kind: output.KindStream, StreamID: "turn-1", AgentID: "worker-1",
+		TaskID: "task-1", Loop: 1, Text: "第一轮完整正文",
+	}, at.Add(time.Second))
+	m.upsertTurnEvent(output.Event{
+		Kind: output.KindTurn, StreamID: "turn-1", AgentID: "worker-1",
+		TaskID: "task-1", Loop: 1, Text: "第一轮完整正文",
+		ToolCalls: []string{"read_file"}, Done: true,
+	}, at.Add(2*time.Second))
+	m.upsertTurnEvent(output.Event{
+		Kind: output.KindStream, StreamID: "turn-1", AgentID: "worker-1",
+		TaskID: "task-1", Loop: 1, Text: "迟到快照不应覆盖",
+	}, at.Add(3*time.Second))
+	m.upsertTurnEvent(output.Event{
+		Kind: output.KindTurn, StreamID: "turn-2", AgentID: "worker-1",
+		TaskID: "task-1", Loop: 2, Text: "第二轮", Done: true,
+	}, at.Add(4*time.Second))
+
+	if len(m.turns) != 2 {
+		t.Fatalf("不同 loop 必须分别追加，实际为 %+v", m.turns)
+	}
+	if m.turns[0].Text != "第一轮完整正文" || m.turns[0].Status != "completed" ||
+		len(m.turns[0].ToolCalls) != 1 {
+		t.Fatalf("终态轮次应冻结且保留工具名: %+v", m.turns[0])
+	}
+}
+
 func TestRenderAgentWorkbenchShowsOnlySelectedAgent(t *testing.T) {
 	at := time.Date(2026, 7, 20, 10, 0, 0, 0, time.UTC)
 	view := renderAgentWorkbench(DefaultTheme(), 100, 24,
 		AgentInfo{ID: "worker-1", State: "processing", Phase: "model", CurrentTaskID: "task-1"},
-		[]ui.FeedOutput{{Kind: "stream", AgentID: "worker-1", Text: "worker one output", At: at}},
+		[]ui.AgentTurn{{
+			ID: "turn-1", AgentID: "worker-1", TaskID: "task-1", Loop: 1,
+			Text: "worker one output", Status: "completed", CompletedAt: at,
+		}},
+		nil,
 		[]ui.TraceEvent{{Kind: "tool_call", AgentID: "worker-1", Tool: "read_file", At: at}},
+		0,
 	)
 
-	if !strings.Contains(view, "Current Turn") || !strings.Contains(view, "Recent Decisions") ||
+	if !strings.Contains(view, "Turn History") || !strings.Contains(view, "Recent Decisions") ||
 		!strings.Contains(view, "worker one output") || !strings.Contains(view, "read_file") {
 		t.Fatalf("agent workbench missing output or trace: %q", view)
 	}
@@ -68,9 +109,9 @@ func TestRenderAgentWorkbenchShowsOnlySelectedAgent(t *testing.T) {
 	}
 }
 
-func TestRenderSchedulerWorkbenchAlignsTurnsToolsAndControlState(t *testing.T) {
+func TestRenderSchedulerWorkbenchKeepsAllTurnsAndControlState(t *testing.T) {
 	at := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
-	view := renderAgentWorkbench(DefaultTheme(), 120, 34,
+	view := renderAgentWorkbench(DefaultTheme(), 120, 48,
 		AgentInfo{
 			ID: "scheduler-1", Type: "scheduler", State: "processing", Phase: "tooling",
 			CurrentTaskID: "controller-1", Loop: 8, ToolCallCount: 12,
@@ -81,19 +122,29 @@ func TestRenderSchedulerWorkbenchAlignsTurnsToolsAndControlState(t *testing.T) {
 				AcceptanceAttempt: 5, AcceptanceStatus: "running", BudgetUsedPercent: 68,
 			},
 		},
+		[]ui.AgentTurn{
+			{
+				ID: "old", AgentID: "scheduler-1", TaskID: "controller-1", Loop: 7,
+				Text: "old verbose narration", Status: "completed", CompletedAt: at.Add(-time.Minute),
+			},
+			{
+				ID: "current", AgentID: "scheduler-1", TaskID: "controller-1", Loop: 8,
+				Text: "current decision\n\nchecking acceptance", Status: "completed",
+				ToolCalls: []string{"get_acceptance_evidence"}, CompletedAt: at,
+			},
+		},
 		[]ui.FeedOutput{
-			{Kind: "stream", AgentID: "scheduler-1", TaskID: "controller-1", StreamID: "old", Loop: 7, Text: "old verbose narration", At: at.Add(-time.Minute)},
-			{Kind: "stream", AgentID: "scheduler-1", TaskID: "controller-1", StreamID: "current", Loop: 8, Text: "current decision\n\nchecking acceptance", At: at},
 			{Kind: "result", AgentID: "scheduler-1", Text: "final answer", At: at.Add(time.Minute)},
 		},
 		[]ui.TraceEvent{
 			{Kind: "tool_call", AgentID: "scheduler-1", Loop: 8, Tool: "get_acceptance_evidence", CallID: "call-1", Outcome: "running", At: at},
 			{Kind: "tool_result", AgentID: "scheduler-1", Loop: 8, Tool: "get_acceptance_evidence", CallID: "call-1", Outcome: "success", ArgsSummary: `{"result_id":"result-4"}`, DurationMS: 2, At: at.Add(time.Second)},
 		},
+		0,
 	)
 
 	for _, want := range []string{
-		"Current Turn", "current decision", "checking acceptance", "Controller State", "DAG 3/5 complete",
+		"Turn History", "old verbose narration", "current decision", "checking acceptance", "Controller State", "DAG 3/5 complete",
 		"acceptance #5 running", "budget 68%", "Active Tools", "ensure_acceptance_run",
 		"Recent Decisions", "get_acceptance_evidence", "Final Result", "final answer",
 	} {
@@ -101,11 +152,30 @@ func TestRenderSchedulerWorkbenchAlignsTurnsToolsAndControlState(t *testing.T) {
 			t.Fatalf("scheduler workbench missing %q: %q", want, view)
 		}
 	}
-	if strings.Contains(view, "old verbose narration") {
-		t.Fatalf("completed old turns should not be flattened into Current Turn: %q", view)
+}
+
+func TestRenderAgentWorkbenchScrollsFromNewestToOldest(t *testing.T) {
+	at := time.Date(2026, 7, 28, 11, 0, 0, 0, time.UTC)
+	turns := make([]ui.AgentTurn, 0, 12)
+	for i := 1; i <= 12; i++ {
+		turns = append(turns, ui.AgentTurn{
+			ID: fmt.Sprintf("turn-%02d", i), AgentID: "worker-1",
+			TaskID: "task-1", Loop: i, Text: fmt.Sprintf("轮次正文-%c", 'A'+rune(i-1)),
+			Status: "completed", CompletedAt: at.Add(time.Duration(i) * time.Second),
+		})
 	}
-	if strings.Count(view, "get_acceptance_evidence") != 1 {
-		t.Fatalf("tool call/result pair should collapse to one decision: %q", view)
+	info := AgentInfo{ID: "worker-1", State: "processing", Phase: "model", CurrentTaskID: "task-1", Loop: 12}
+	maxScroll := agentWorkbenchMaxScroll(DefaultTheme(), 80, 16, info, turns, nil, nil)
+	if maxScroll <= 0 {
+		t.Fatal("足够长的轮次历史应产生可滚动区域")
+	}
+	latest := renderAgentWorkbench(DefaultTheme(), 80, 16, info, turns, nil, nil, 0)
+	oldest := renderAgentWorkbench(DefaultTheme(), 80, 16, info, turns, nil, nil, maxScroll)
+	if !strings.Contains(latest, "轮次正文-L") || strings.Contains(latest, "轮次正文-A") {
+		t.Fatalf("自动跟随应定位到最新轮次: %q", latest)
+	}
+	if !strings.Contains(oldest, "轮次正文-A") || strings.Contains(oldest, "轮次正文-L") {
+		t.Fatalf("滚动到顶应显示最早轮次: %q", oldest)
 	}
 }
 

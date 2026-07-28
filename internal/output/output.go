@@ -18,17 +18,25 @@ const (
 	// answer. Text always contains the complete accumulated answer so slow UI
 	// subscribers may safely drop older snapshots without losing characters.
 	KindStream
+	// KindTurn 是一次 LLM 调用完成后的不可变轮次事实。与 KindStream 的
+	// 临时快照不同，它必须按 Agent/Task/Loop 追加到 Session 轮次账本，
+	// 供 TUI/Web 重连、Session 恢复和完整历史浏览。
+	KindTurn
 )
 
 // Event 是输出通道上的一条消息。Text 保留完整渲染文本（含 "=== 任务完成 ==="
 // 等展示标记）——标记只是呈现层内容，不再承担分类职责。
 type Event struct {
-	Kind     Kind
-	AgentID  string
-	Text     string
-	StreamID string
-	TaskID   string
-	Loop     int
-	Done     bool
-	Error    string
+	Kind      Kind
+	AgentID   string
+	SessionID string
+	Text      string
+	StreamID  string
+	TaskID    string
+	Loop      int
+	Done      bool
+	Error     string
+	// ToolCalls 只包含本轮模型请求的工具名，不携带参数或结果，避免轮次
+	// 账本复制敏感/高体积 payload；完整调用事实仍以 trace JSONL 为准。
+	ToolCalls []string
 }

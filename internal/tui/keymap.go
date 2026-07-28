@@ -35,6 +35,7 @@ const (
 	keyPgUp     = "pgup"
 	keyPgDown   = "pgdown"
 	keyHome     = "home"
+	keyEnd      = "end"
 )
 
 // keyContext 标识键位生效的上下文/视图（状态栏按它取舍 hints）。
@@ -46,7 +47,8 @@ const (
 	ctxInteraction                       // 结构化交互面板聚焦
 	ctxInteractionText                   // 交互补充文本输入
 	ctxSidebar                           // 侧边栏聚焦
-	ctxMain                              // 主面板聚焦（Dashboard / AgentDetail 视图）
+	ctxMain                              // Dashboard 主面板聚焦
+	ctxAgentDetail                       // Agent 详情轮次历史主面板
 	ctxResult                            // 完整结果视图（主面板焦点）
 )
 
@@ -75,9 +77,14 @@ var keymap = []keymapEntry{
 	{id: "sidebar-select", ctx: ctxSidebar, keys: "↑↓", hint: "select",
 		helpKeys: "↑/↓", help: "侧边栏代理选择"},
 	{id: "sidebar-view", ctx: ctxSidebar, keys: "Enter", hint: "view"},
-	// 主面板（/help 与侧边栏共用"代理选择"一行，不重复列）
+	// Dashboard 主面板（/help 与侧边栏共用"代理选择"一行，不重复列）
 	{id: "main-select", ctx: ctxMain, keys: "↑↓", hint: "agent"},
 	{id: "main-view", ctx: ctxMain, keys: "Enter", hint: "view"},
+	// Agent 详情轮次历史
+	{id: "agent-turn-scroll", ctx: ctxAgentDetail, keys: "↑↓", hint: "turns",
+		helpKeys: "↑/↓ PgUp/PgDn", help: "Agent 轮次历史滚动"},
+	{id: "agent-turn-latest", ctx: ctxAgentDetail, keys: "End", hint: "latest",
+		helpKeys: "Home/End", help: "跳到最早轮次/恢复跟随最新轮次"},
 	// 输入框
 	{id: "input-submit", ctx: ctxInput, keys: "Enter", hint: "send",
 		helpKeys: "Enter", help: "提交输入"},

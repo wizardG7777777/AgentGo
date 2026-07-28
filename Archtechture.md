@@ -1,4 +1,4 @@
-# 现状速览（2026-07-20）
+# 现状速览（2026-07-28）
 
 > 本文档原本是设计稿，部分章节早于实现。本节为升级工作提供快速对齐入口，列出**当前实现事实**与**与原设计文档的关键差异**。后续章节如有冲突，以本节和源代码为准。
 
@@ -23,14 +23,14 @@
 | `roster` | 文件级 `TryClaim/Release/ReleaseAll/IsOccupied/ListByAgent` |
 | `runner` | **统一执行代理外壳**（v5，**取代 v4 `internal/worker` + `internal/explorer`，两包已删**）。`runner.New(rt, deps)` 按 `AgentRuntimeConfig` 实例化 |
 | `scheduler` | Scheduler 是 `agent.Agent` 一等代理（Phase 3 重构遗留），`scheduler.New` 返回 `Bundle{Agent, Activator, Mode}` |
-| `session` | Session 管理、history.jsonl、snapshot/replay/archive |
+| `session` | Session 管理、history.jsonl、公开 LLM 轮次 turns.jsonl、snapshot/replay/archive |
 | `shell` | `CommandFilter`（黑/白/运行时白名单）+ 与原始调用精确绑定的 `shell_command` authorization Interaction |
 | `spawn` | **Spawn Manager**（v5，新增）。实现 `reactor.Reactor` 接口，订阅任务终态事件销毁 ad-hoc runner（`one_shot` 生命周期）；`KindOf` 支持 per-kind reactor 路由；`ReactorSpawnMaxDepth=5` 防级联 |
 | `store` | `MemoryTaskStore` + `TaskCancelRegistry` + `ToolCallRecord` + `StoreHookView` + `ArtifactLog`（带 replay）+ ReadSet upsert + scheduler-batch 辅助 |
 | `suggest` | **Did-You-Mean**（v5，新增）。基于 `github.com/sahilm/fuzzy`，被 `tools/local_read.go` 空结果路径与工具未找到诊断使用 |
 | `tools` | 6 个 ToolGroup：LocalRead / LocalWrite / Web / Shell / Meta / Scheduler；`AllToolNames` 是规范名称表 |
 | `trace` | 每任务 JSONL，**Schema B**（嵌套子结构体 `Transition`/`ShellExec`/`ShellTimeout`），`SetDefaultDispatcher(reactorReg)` 使 `trace.Emit` 同时驱动 Reactor |
-| `tui` | **Bubble Tea TUI**（v5，取代已删除的 `internal/cli`）。通用 Interaction 面板使用 `↑/↓` 选择、`PgUp/PgDn` 翻问题、Enter 提交；不注册裸字母或裸数字动作键；命令目录来自 `ui.CommandCatalog()` |
+| `tui` | **Bubble Tea TUI**（v5，取代已删除的 `internal/cli`）。Agent 详情按 Loop 浏览全部公开轮次并支持 Home/End 最早/最新；Interaction 不注册裸字母或裸数字动作键；命令目录来自 `ui.CommandCatalog()` |
 | `watchdog` | 周期巡检、级联取消、roster 兜底清理、超时崩溃汇报 |
 | `webtool` | Web 检索/抓取 + SSRF 防护 |
 
@@ -49,6 +49,7 @@
   - **Spawn**：`spawn.Manager` 让 reactor 可以"创建 ad-hoc agent"。从 `base_kind` 模板 + `RuntimeOverride` 派生新 runtime，发布 initial task（`EventType="adhoc:<spawnID>"`），任务终态时 manager 作为 reactor 自动销毁 runner（one_shot）。`ReactorSpawnMaxDepth=5` 防级联。
 - **MailNotifier 默认启用**：邮件级联爆炸 P0 的 4 项根因全部由 Phase 2（v4） + Mailbox Gate（v5）守住。`chain-depth-limit` (max=`MailChainMaxDepth`，默认 3) 在 BeforeSend 截断；`per-agent-dedup` 在 BeforeDeliver 去重；`wake-worthy-filter` 在 BeforeWake 过滤；`wake-context-expand` 在 BeforeWake 累加 wake task description。
 - **通用 Interaction 前端**：TUI 与 Web 都从 UI Hub 接收当前进程内完整 pending Interaction 列表，并以 `request_id + expected_version + option_id + text` 回答；`SessionID` 仅标记创建审计归属，任务跨 `/session` 继续时不会被过滤。TUI 用 Tab 切换 Interaction 焦点、`↑/↓` 选择、`PgUp/PgDn` 翻长问题、Enter 提交；`RequiresText` 转入普通文本输入。Esc 在 Interaction 焦点只返回输入框。旧 `1/2/3/4` 单键方案仅存在于 `docs/archived/interface-design-tui-2026-05.md`，已经废弃。
+- **Agent 公开轮次历史**：Scheduler 与所有 Runner 共用 `output.KindStream` / `output.KindTurn` 协议。同轮流式文本以稳定 ID 原位更新；每次 LLM 调用返回后冻结唯一完成事实并追加到 Session 的 `turns.jsonl`。UI Hub 的 `Snapshot.Turns` 不受 200 条实时 feed 上限影响，TUI/Web 重连或切换 Session 后可恢复全部 Loop；账本只保存公开正文、工具名、状态和错误。
 - **Plan、Shell 与 Agent question 共用协议**：PlanStore 是 Plan 执行事实源；`plan_review` / `plan_pause` 的受信任 handler 在 CAS 后更新 PlanStore。Shell 灰名单请求绑定 command/pattern/working directory/Agent/Task；`allow_session` 只把服务端捕获的 pattern 加入当前进程、本次运行的 whitelist，切换 `/session` 不清空，退出后不持久化。MetaGroup 的 `request_user_input` 仅创建 `Purpose=agent_question`，返回稳定 `option_id`/`text`，不能携带 ActionRef 或触发前两类特权 effect。详见 `docs/design/interaction.md`。
 - **架构决策：无 git 依赖**（2026-04-09 起保持）：`internal/isolation`（git worktree 隔离）整体删除——git 锁模型为单用户串行设计、整树 checkout 摧毁 mtime 观测层，隔离要的是命名空间而非版本控制。所有 runner 共享 `ProjectRoot`。并发写文件防线 = `Roster` 文件锁 + `expected_hash` TOCTOU 检查 + `pathutil.ValidatePath` + `path-boundary` Gate（双重）+ `require-read-before-write` Gate + `enforce-expected-artifacts` Gate + `validate-line-anchors` Gate。2026-07-26 起新增**按任务写时复制隔离**（`internal/workspace`，仍无 git）：DAG 节点声明 `isolation:"workspace"` 后，认领 Runner 在 overlay 中执行（读穿透主根、写落 `.agentgo/workspaces/<taskID>/`），成功终态控制面经 Roster 锁逐文件合并回主根（fast-forward / 行级三路自动合并），冲突 → 任务 failed + 自动高优 replan 交 Scheduler 裁决。详见 `docs/design/workspace-isolation.md`。
 - **任务数据流**：`Task.Artifacts`（`record-artifact` reactor 在 `KindFileWritten` 上自动追加，路径相对项目根）、`Task.ExpectedArtifacts`（发布者硬合约，由 `enforce-expected-artifacts` Gate 与 `agent.checkExpectedArtifacts` 双重把守）、`Task.LastResponse`（无条件持久化用于失败诊断）、`Task.MailChainDepth`（邮件链跳数）、`Task.SchedulerBatch`（scheduler 当前 reactLoop 跟踪的子任务 ID 列表）、`Task.ReadSet`（v5 Phase 6 新增，由 `read-set-write` reactor 在 `KindToolResult{tool=read_file}` 上写入；`require-read-before-write` Gate 改读 ReadSet 而不再反查 ToolCallHistory）。

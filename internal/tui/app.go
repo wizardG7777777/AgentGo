@@ -24,6 +24,7 @@ import (
 // ── Bubbletea messages ──
 
 type interactionsChangedMsg []ui.InteractionItem
+type turnsChangedMsg []ui.AgentTurn
 type snapshotSyncMsg ui.Snapshot
 type agentsChangedMsg struct {
 	agents []AgentInfo
@@ -66,7 +67,7 @@ func forwardUpdates(ctx context.Context, obs ui.Observer, p *tea.Program) {
 			switch u.Kind {
 			case ui.KindSnapshotSync:
 				p.Send(snapshotSyncMsg(u.Snapshot))
-			case ui.KindOutputResult, ui.KindOutputText, ui.KindOutputStream:
+			case ui.KindOutputResult, ui.KindOutputText, ui.KindOutputStream, ui.KindOutputTurn:
 				p.Send(outputMsg(u.Output))
 			case ui.KindLogLine:
 				for _, line := range strings.Split(u.LogLine, "\n") {
@@ -77,6 +78,8 @@ func forwardUpdates(ctx context.Context, obs ui.Observer, p *tea.Program) {
 				}
 			case ui.KindInteractionsChanged:
 				p.Send(interactionsChangedMsg(u.Interactions))
+			case ui.KindTurnsChanged:
+				p.Send(turnsChangedMsg(u.Turns))
 			case ui.KindAgentsChanged:
 				p.Send(agentsChangedMsg{
 					agents:                  u.Agents,
@@ -164,8 +167,12 @@ type AppModel struct {
 	lastResult   *StyledMsg
 	resultScroll int
 	feedOutputs  []ui.FeedOutput
-	logs         []ui.LogItem
-	traces       []ui.TraceEvent
+	turns        []ui.AgentTurn
+	// agentDetailScroll 是 Agent 轮次历史相对底部的行偏移；0 表示自动
+	// 跟随最新轮次，向上滚动后保持当前位置，End 恢复跟随。
+	agentDetailScroll int
+	logs              []ui.LogItem
+	traces            []ui.TraceEvent
 
 	// Interaction。Hub 每次下发完整 pending 列表；第 0 项是当前条目。
 	interactions             []ui.InteractionItem
@@ -297,6 +304,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tasks = boardTasksToModel(snap.Tasks)
 		m.replaceInteractions(snap.PendingInteractions)
 		m.restoreFeed(snap.Feed)
+		m.replaceTurns(snap.Turns)
 		m.sessionPromptTokens = snap.SessionPromptTokens
 		m.sessionCompletionTokens = snap.SessionCompletionTokens
 		if m.lastResult == nil && snap.LastResult != nil && strings.TrimSpace(snap.LastResult.Text) != "" {
@@ -317,6 +325,11 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.replaceInteractions([]ui.InteractionItem(msg))
 		return m, nil
 
+	case turnsChangedMsg:
+		m.replaceTurns([]ui.AgentTurn(msg))
+		m.agentDetailScroll = 0
+		return m, nil
+
 	case systemMsg:
 		m.appendLog(ui.LogItem(msg))
 		return m, nil
@@ -331,6 +344,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 不做 "=== 任务完成 ===" 子串匹配。
 		if ev.Kind == output.KindStream {
 			m.upsertStream(ev)
+			m.upsertTurnEvent(ev, time.Now())
+		} else if ev.Kind == output.KindTurn {
+			m.upsertTurnEvent(ev, time.Now())
 		} else if ev.Kind == output.KindResult {
 			m.recordFeedOutput(feedOutputFromEvent(ev, time.Now()))
 			m.appendMsg(ev.Text, MsgResult)
@@ -508,6 +524,7 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.view == ViewAgentDetail || m.view == ViewResult ||
 			m.view == ViewActivity || m.view == ViewLogs || m.view == ViewTrace {
 			m.view = ViewDashboard
+			m.agentDetailScroll = 0
 			return m, nil
 		}
 		// 顶层视图（Dashboard / Chat，任意 focus）：Esc = 取消最近一棵
@@ -636,13 +653,47 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case keyEnter:
 			if m.ensureSelectedAgent() {
 				m.view = ViewAgentDetail
+				m.agentDetailScroll = 0
 			}
 			return m, nil
 		}
 	}
 
-	// Main panel navigation
-	if m.focus == FocusMain && (m.view == ViewDashboard || m.view == ViewAgentDetail) {
+	// Agent 详情主面板：轮次历史按相对底部偏移滚动。0 始终跟随最新；
+	// 用户上翻后新轮次不会抢走当前位置，End 明确恢复自动跟随。
+	if m.focus == FocusMain && m.view == ViewAgentDetail {
+		pageStep := maxInt(1, m.layout.MainH-8)
+		switch key {
+		case keyUp:
+			m.agentDetailScroll++
+			m.clampAgentDetailScroll()
+			return m, nil
+		case keyDown:
+			if m.agentDetailScroll > 0 {
+				m.agentDetailScroll--
+			}
+			return m, nil
+		case keyPgUp, keyCtrlB:
+			m.agentDetailScroll += pageStep
+			m.clampAgentDetailScroll()
+			return m, nil
+		case keyPgDown, keyCtrlF:
+			m.agentDetailScroll -= pageStep
+			if m.agentDetailScroll < 0 {
+				m.agentDetailScroll = 0
+			}
+			return m, nil
+		case keyHome:
+			m.agentDetailScroll = m.maxAgentDetailScroll()
+			return m, nil
+		case keyEnd:
+			m.agentDetailScroll = 0
+			return m, nil
+		}
+	}
+
+	// Dashboard 主面板导航
+	if m.focus == FocusMain && m.view == ViewDashboard {
 		switch key {
 		case keyUp:
 			m.moveSelectedAgent(-1)
@@ -653,6 +704,7 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case keyEnter:
 			if m.ensureSelectedAgent() {
 				m.view = ViewAgentDetail
+				m.agentDetailScroll = 0
 			}
 			return m, nil
 		}
@@ -830,7 +882,31 @@ func (m *AppModel) moveSelectedAgent(delta int) {
 	if next >= len(m.agents) {
 		next = len(m.agents) - 1
 	}
-	m.selectedAgent = next
+	if next != m.selectedAgent {
+		m.selectedAgent = next
+		m.agentDetailScroll = 0
+	}
+}
+
+func (m *AppModel) maxAgentDetailScroll() int {
+	if m.selectedAgent < 0 || m.selectedAgent >= len(m.agents) {
+		return 0
+	}
+	ag := m.agents[m.selectedAgent]
+	return agentWorkbenchMaxScroll(
+		m.theme, m.layout.MainW, m.layout.MainH, ag,
+		m.turnsForAgent(ag.ID), m.outputsForAgent(ag.ID), m.tracesForAgent(ag.ID),
+	)
+}
+
+func (m *AppModel) clampAgentDetailScroll() {
+	maxScroll := m.maxAgentDetailScroll()
+	if m.agentDetailScroll > maxScroll {
+		m.agentDetailScroll = maxScroll
+	}
+	if m.agentDetailScroll < 0 {
+		m.agentDetailScroll = 0
+	}
 }
 
 func (m *AppModel) cycleFocus() {
@@ -1416,7 +1492,10 @@ func (m AppModel) renderMainContent() string {
 	case ViewAgentDetail:
 		if m.selectedAgent >= 0 && m.selectedAgent < len(m.agents) {
 			ag := m.agents[m.selectedAgent]
-			return renderAgentWorkbench(m.theme, w, h, ag, m.outputsForAgent(ag.ID), m.tracesForAgent(ag.ID))
+			return renderAgentWorkbench(
+				m.theme, w, h, ag, m.turnsForAgent(ag.ID),
+				m.outputsForAgent(ag.ID), m.tracesForAgent(ag.ID), m.agentDetailScroll,
+			)
 		}
 		return renderDashboard(m.theme, w, h, m.agents)
 

@@ -22,6 +22,9 @@ go test ./internal/store/         # 单包测试
 go test -run TestName ./internal/agent/   # 单个测试
 ./agentgo -config setting.yaml    # 启动（另有 -skip-startup-probe、-resume <sessionID>）
 ./agentgo config doctor           # 校验配置 + prompt 承诺工具与实际 allowlist 对账（error/warning/info 分级）
+./agentgo eval preflight          # 行为评测凭证前置检查：env 变量注入 + LLM 密钥真实端点探测（eval/ 资产不入库）
+./agentgo eval run [-smoke]       # 跑黄金任务套件并与基线对比（eval/suite.yaml，本地资产不入库）
+./agentgo eval record             # 跑整套件并把结果录制为新基线（eval/baseline.json）
 ```
 
 ### trace 子命令（调试主入口）
@@ -49,7 +52,7 @@ go test -run TestName ./internal/agent/   # 单个测试
 main.go（子命令 trace / config 分流；否则 -config 等 flags）
   └→ bootstrap.BootstrapWithOptions(...)
        ├─ config.LoadConfig + cfg.Validate()      // v4 schema 校验
-       ├─ session.NewSessionManager               // .agentgo/sessions/, history.jsonl
+       ├─ session.NewSessionManager               // .agentgo/sessions/, history.jsonl + turns.jsonl
        ├─ trace.NewWriter + SetDefault            // 活跃 Session 时写入其 logs/
        ├─ store.NewMemoryTaskStore(eventCh, ...)  // 公告板 + cancelRegistry
        ├─ gate.NewRegistry()                      // 注册内置 Gates（经 internal/hook 适配器）
@@ -76,6 +79,7 @@ main.go（子命令 trace / config 分流；否则 -config 等 flags）
 | `internal/bootstrap` | 系统装配与启动编排；`runtime_builder.go` 由 `AgentKind` 合成 `AgentRuntimeConfig`；SIGINT 哨兵；请求树取消 |
 | `internal/config` | YAML/JSON 配置加载，仅支持 v4 schema（`llm:`/`scheduler:`/`agents:`/`infra:`/`tool_profiles:`/`modes:`/`reactors_file:` 等块）；v3 顶层字段已于 2026-04-26 移除，静默忽略 |
 | `internal/dashboard` | Web 前端：内嵌 SPA、`/api/snapshot`、`/api/events` SSE、`/healthz`、`/api/interactions/{id}/response`；Bearer/?token= 鉴权，非 loopback 监听强制 token |
+| `internal/eval` | 行为评测体系（`agentgo eval` 子命令族）：preflight 凭证检查、黄金任务进程外黑盒驱动（临时 project_root + `/api/input` 注入 + snapshot 终态轮询）、确定性判据、环境三元组基线对比；套件/模板/基线在 gitignored `eval/` 下 |
 | `internal/gate` | 统一 Gate 注册表。Phase 路由：`tool:preCall` / `tool:postCall` / `mailbox:beforeSend` / `mailbox:beforeDeliver` / `mailbox:beforeWake` |
 | `internal/hook` | 遗留 Hook 接口与内置实现，现作为 Gate 的适配层（内置 Gate 实现存放于此） |
 | `internal/interaction` | 结构化人机交互协议：`pending → resolving → resolved` 两阶段 CAS；Plan / Shell / `agent_question` 共用同一 Service。详见 `docs/design/interaction.md` |
@@ -91,7 +95,7 @@ main.go（子命令 trace / config 分流；否则 -config 等 flags）
 | `internal/roster` | 文件级占用：原子 `TryClaim` / `Release` / `ReleaseAll` / `IsOccupied` |
 | `internal/runner` | 统一执行代理外壳（取代已删除的 `internal/worker`、`internal/explorer`） |
 | `internal/scheduler` | Scheduler 是一等 `agent.Agent`（`EventType="__scheduler__"`）；`Activator` 是 eventCh 唯一消费者 |
-| `internal/session` | Session 生命周期：history.jsonl、快照、回放、归档、保留策略 |
+| `internal/session` | Session 生命周期：history.jsonl、公开 LLM 轮次 `turns.jsonl`、快照、回放、归档、保留策略 |
 | `internal/shell` | Shell 命令过滤（黑/灰/白名单）+ `shell_command` 授权 Interaction；POSIX 走 `sh -c`，Windows 走 PowerShell |
 | `internal/spawn` | Spawn Manager（实现 `reactor.Reactor`）：从 `base_kind` 物化一次性 ad-hoc Runner，初始任务终结即拆除 |
 | `internal/store` | `TaskStore` 接口、`MemoryTaskStore`、TaskCancelRegistry、ToolCallRecord、ArtifactLog 回放、ReadSet |
@@ -100,9 +104,9 @@ main.go（子命令 trace / config 分流；否则 -config 等 flags）
 | `internal/agenttemplate` | 代理模板目录（内嵌 builtin prompts） |
 | `internal/tools` | 统一 ToolGroup 架构；`known_tools.go` 的 `AllToolNames` 是工具名权威清单 |
 | `internal/trace` | 任务级 JSONL trace（Schema B fat struct）；CLI 查看器；`SetDefaultDispatcher` 扇出到 Reactors |
-| `internal/tui` | Bubble Tea TUI；键位事实源在 `keymap.go` |
-| `internal/ui` | 斜杠命令目录（TUI/Web 共享的单一数据源） |
-| `internal/output` | 类型化输出通道事件（文本 / 任务结果，不用魔法字符串分类） |
+| `internal/tui` | Bubble Tea TUI；键位事实源在 `keymap.go`；Agent 详情按 Loop 浏览完整轮次，Home/End 控制最早/最新 |
+| `internal/ui` | TUI/Web 共享 Hub、安全快照与斜杠命令目录；轮次历史不受有界诊断 feed 淘汰 |
+| `internal/output` | 类型化输出通道事件（文本 / 流式快照 / 不可变完成轮次 / 任务结果） |
 | `internal/watchdog` | 周期健康检查、级联取消、roster 清理、超时检测（110% 阈值）、panic 自动重启 |
 | `internal/webtool` | Web 搜索 + URL 抓取，SSRF 防护，搜索后端可插拔 |
 | `internal/workspace` | 按任务写时复制执行隔离：Manager（物化/合并/清理/孤儿扫描）、View（overlay 读穿透/写落副本）、Swapper（per-Runner 换入）；`types.go` 为冻结契约 |
@@ -117,7 +121,7 @@ main.go（子命令 trace / config 分流；否则 -config 等 flags）
 - **错误分型**：`llm.ErrRecoverable`（429/5xx）与 `ErrBadResponse`（length 截断）桥接为 `agent.ErrRecoverable` 触发重试回滚；`ErrUnrecoverable`（401/403）直接失败任务。
 - **Kind 即配置**：`setting.yaml` 的 `agents[*]` 声明 kind + replicas + `profile`/`tools` + model + prompt；Bootstrap 按 kind×replica 建 Runner。运行时没有 `Agent.Kind` 枚举分支。
 - **工具按 allowlist 剪枝**：`runner.resolveToolGroups()` 注册全部 ToolGroup，`ToolRegistry` 按 `AllowedTools` 在注册时剪掉未授权工具；任务级再经 `publish_task` 的 `tools` 参数二次裁剪——provision 时 kind 白名单是天花板，plan 时节点可声明更小的子集，认领后当次生效。新增工具必须同步 `internal/tools/known_tools.go`。节点能力容器 `model.NodeCapability` 另挂 `Isolation` 字段（写时复制执行隔离，见下条）。
-- **公告板**：发布 → pending；`QueryAvailable(eventType)` 按优先级排序轮询；`ClaimTask` 原子转 processing（认领时查依赖与并发上限——依赖须 completed；验收 runner（`AcceptanceRunID` 非空）放宽为依赖终态即可，与 VerifyAcceptance 的非 pass 裁决语义对齐）。终态 `Task.Results` 完整保留，board 快照只带预算内摘录（`result_refs`）；`Task.Artifacts`（实际产出，record-artifact Reactor 追加——写工具经 `KindFileWritten`，shell 写产物经 `KindShellExecuted` 成功后对 ExpectedArtifacts 盘后补登）≠ `Task.ExpectedArtifacts`（声明契约，Gate + 终止时校验）；`Task.ReadSet` 由 read-set-write Reactor 维护。
+- **公告板**：发布 → pending；`QueryAvailable(eventType)` 按优先级排序轮询；`ClaimTask` 原子转 processing（认领时查依赖与并发上限——依赖须 completed；验收 runner（`AcceptanceRunID` 非空）放宽为依赖终态即可，与 VerifyAcceptance 的非 pass 裁决语义对齐）。终态 `Task.Results` 完整保留，board 快照只带预算内摘录（`result_refs`）；`Task.Artifacts`（实际产出，record-artifact Reactor 追加——写工具经 `KindFileWritten`，shell 写产物经 `KindShellExecuted` 成功后对 ExpectedArtifacts 盘后补登）≠ `Task.ExpectedArtifacts`（声明契约，Gate + 终止时校验——校验含磁盘兜底：账本缺失的预期项 stat 物理路径，防重试换任务 ID 后的账本失忆空转）；`Task.ReadSet` 由 read-set-write Reactor 维护。
 - **Roster 花名册**：`write_file`/`edit_file` 先 `TryClaim`，被占用时返回含「占用」与占用者 ID 的错误；Watchdog 清理不再活跃代理的 claims；Roster 监听器写 `file_awareness` 到 Memory。
 - **Gate**：`Decision.Action ∈ {Continue, Abort}`；同 Phase 内按 Priority 升序；panic 恢复为 Continue；nil Registry 一律 Continue。内置 11 个：tool:preCall 7 个（exec-mode-guard / path-boundary / validate-expected-hash / require-read-before-write / dependency-validator / enforce-expected-artifacts / validate-line-anchors）、beforeSend 1 个（chain-depth-limit）、beforeDeliver 1 个（per-agent-dedup）、beforeWake 2 个（wake-worthy-filter / wake-context-expand）。
 - **Reactor**：同步 Reactor 在 `trace.Emit` 调用方 goroutine 串行执行，异步各起 goroutine 且 panic 隔离。内置：record-artifact / task-end-callback / trace-history-event / read-set-write / runtime-anomaly，外加 spawn.Manager 与 team.Manager。用户 YAML Reactor 支持 `publish_task` / `invoke_llm` / `spawn_agent` / `call: send_message` 动作与 `when:` 条件；**永远异步**；Reactor 不得直接驱动状态迁移（无 `SetState`），只能发任务/消息让主循环自然迁移。
@@ -125,6 +129,7 @@ main.go（子命令 trace / config 分流；否则 -config 等 flags）
 - **Modes 三轴**：gate=plan 时 Scheduler 须 `submit_plan_for_review` 挂起等用户裁决；exec=readonly 由 exec-mode-guard Gate 硬拒写工具，strict 逐次审批写与 shell，yolo 灰名单自动放行（黑名单仍硬拒）；topo=solo 禁止 Scheduler `publish_task`，亲自执行。
 - **Memory**：processTask 入口查询 `ScopeProcess/KindContext` 的 `team_snapshot`、`file_awareness` 注入；nil-safe，无 Memory 时退化为不注入。
 - **3 层历史压缩**：L1 snip 旧工具输出为结构化墓碑（无 LLM 调用）；L2 超 `CompactTokenThreshold` 时摘要压缩；L3 context 溢出时激进压缩（keepRecent=1）。
+- **公开轮次账本**：每次 Agent/Scheduler `TaskExecutor` 调用使用稳定轮次 ID；`KindStream` 只原位更新在途文本，返回后发布唯一 `KindTurn` 并 append+fsync 到当前 Session 的 `turns.jsonl`。账本只含公开 assistant 正文、工具名和终态错误，不复制 reasoning、工具参数或结果；TUI/Web 从 `Snapshot.Turns` 恢复全部 Loop。
 - **FileStateCache**：按 Runner 的 LRU（容量 50），Get 时 `os.Stat` 比对 mtime+size 再验证（跨代理写透明失效）；写工具经 Roster 路径时失效。
 - **乐观并发**：`write_file`/`edit_file` 接受 `expected_hash`，SHA256 不符即返回「冲突」错误。
 - **路径安全**：`pathutil.ValidatePath` 强制项目根边界并拦截敏感文件（.env、.ssh 等），工具内与 path-boundary Gate 双重执行。

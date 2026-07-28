@@ -71,6 +71,11 @@ func testSnapshot() ui.Snapshot {
 		TopoMode:   "team",
 		Session:    ui.SessionInfo{ID: "sess-1", Status: "active"},
 		LastResult: &ui.ResultItem{AgentID: "scheduler-1", Text: "明确的最终回复"},
+		Turns: []ui.AgentTurn{{
+			ID: "turn-1", SessionID: "sess-1", AgentID: "worker-1",
+			TaskID: "task-1", Loop: 2, Text: "完整轮次", Status: "completed",
+			ToolCalls: []string{"read_file"}, CompletedAt: time.Now(),
+		}},
 		Feed: ui.FeedSnapshot{
 			Outputs: []ui.FeedOutput{{Kind: "stream", AgentID: "worker-1", StreamID: "stream-1", Text: "partial", At: time.Now()}},
 			Logs:    []ui.LogItem{{Text: "diagnostic", At: time.Now()}},
@@ -116,6 +121,7 @@ func TestSnapshotEndpoint(t *testing.T) {
 		} `json:"session"`
 		PendingInteractions []ui.InteractionItem `json:"pending_interactions"`
 		LastResult          *ui.ResultItem       `json:"last_result"`
+		Turns               []ui.AgentTurn       `json:"turns"`
 		Feed                ui.FeedSnapshot      `json:"feed"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
@@ -135,6 +141,9 @@ func TestSnapshotEndpoint(t *testing.T) {
 	}
 	if body.LastResult == nil || body.LastResult.AgentID != "scheduler-1" || body.LastResult.Text != "明确的最终回复" {
 		t.Fatalf("last_result=%+v", body.LastResult)
+	}
+	if len(body.Turns) != 1 || body.Turns[0].ID != "turn-1" || body.Turns[0].Text != "完整轮次" {
+		t.Fatalf("turns=%+v", body.Turns)
 	}
 	if len(body.Feed.Outputs) != 1 || body.Feed.Outputs[0].StreamID != "stream-1" ||
 		len(body.Feed.Logs) != 1 || len(body.Feed.Traces) != 1 || body.Feed.Traces[0].Tool != "read_file" {
@@ -206,6 +215,68 @@ func TestEncodeUpdate_OutputStreamCarriesStableIdentity(t *testing.T) {
 		frame.Output.StreamID != "stream-1" || frame.Output.TaskID != "task-1" ||
 		frame.Output.Text != "partial" || frame.Output.Loop != 3 || !frame.Output.Done {
 		t.Fatalf("frame = %s", data)
+	}
+}
+
+func TestEncodeUpdate_OutputTurnAndTurnsChanged(t *testing.T) {
+	now := time.Now()
+	data, err := encodeUpdate(ui.Update{
+		Kind: ui.KindOutputTurn,
+		Output: output.Event{
+			Kind: output.KindTurn, AgentID: "scheduler-1", TaskID: "task-1",
+			StreamID: "turn-1", Text: "本轮正文", Loop: 4, Done: true,
+			ToolCalls: []string{"get_task_result"},
+		},
+		At: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frame struct {
+		Kind   string `json:"kind"`
+		Output struct {
+			Kind      string   `json:"kind"`
+			StreamID  string   `json:"stream_id"`
+			Text      string   `json:"text"`
+			ToolCalls []string `json:"tool_calls"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(data, &frame); err != nil {
+		t.Fatal(err)
+	}
+	if frame.Kind != "OutputTurn" || frame.Output.Kind != "OutputTurn" ||
+		frame.Output.StreamID != "turn-1" || frame.Output.Text != "本轮正文" ||
+		len(frame.Output.ToolCalls) != 1 || frame.Output.ToolCalls[0] != "get_task_result" {
+		t.Fatalf("完成轮次 SSE 编码错误: %s", data)
+	}
+
+	changed, err := encodeUpdate(ui.Update{
+		Kind: ui.KindTurnsChanged,
+		Turns: []ui.AgentTurn{{
+			ID: "turn-2", AgentID: "worker-1", Loop: 1, Text: "恢复轮次", Status: "completed",
+		}},
+		At: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var changedFrame struct {
+		Kind  string         `json:"kind"`
+		Turns []ui.AgentTurn `json:"turns"`
+	}
+	if err := json.Unmarshal(changed, &changedFrame); err != nil {
+		t.Fatal(err)
+	}
+	if changedFrame.Kind != "TurnsChanged" || len(changedFrame.Turns) != 1 ||
+		changedFrame.Turns[0].ID != "turn-2" {
+		t.Fatalf("完整轮次列表 SSE 编码错误: %s", changed)
+	}
+	empty, err := encodeUpdate(ui.Update{Kind: ui.KindTurnsChanged, At: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(empty), `"turns":[]`) {
+		t.Fatalf("空轮次列表必须显式编码以清空旧 Session 视图: %s", empty)
 	}
 }
 
@@ -403,7 +474,7 @@ func TestIndexContainsLayeredViewsAndAgentWorkbench(t *testing.T) {
 	for _, marker := range []string{
 		`data-view="overview"`, `data-view="agents"`, `data-view="activity"`, `data-view="trace"`,
 		`id="agentTabs"`, `id="agentOutput"`, `id="agentActivity"`, `id="activityBody"`,
-		`独立实时输出`, `Trace / 工具调用 / 系统日志`, `snap.feed`,
+		`完整轮次输出`, `Trace / 工具调用 / 系统日志`, `snap.feed`, `state.turns`,
 	} {
 		if !strings.Contains(html, marker) {
 			t.Errorf("首页缺少分层 UI 标记 %q", marker)

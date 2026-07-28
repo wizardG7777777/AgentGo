@@ -99,6 +99,7 @@ func resolveToolGroups(
 			AgentID:              instanceID,
 			FinalizationNotifier: finHolder,
 			SubmitState:          submitState,
+			ArtifactResolver:     agent.NewArtifactPhysicalResolver(deps.ProjectRoot, deps.WorkspaceManager),
 		},
 	}
 }
