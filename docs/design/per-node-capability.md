@@ -58,7 +58,7 @@ gate=plan 模式下，用户审批的不再只是"做哪几步、什么顺序"�
 
 两者是正交的两层覆盖：
 
-- `spawn.RuntimeOverride`（`internal/spawn`）是**整只 ad-hoc agent** 的覆盖：SystemPrompt / Model / MaxLoops 等，刻意**不可**覆盖 AllowedTools / Profile——保持路由与工具集闭合。认领面因此可以把 spawn ad-hoc 的白名单直接解析为 base kind 的白名单（capability registry 的事实源之一）。
+- `spawn.RuntimeOverride`（`internal/spawn`）是**整只 ad-hoc agent** 的覆盖：SystemPrompt / Model / 重试与上下文预算等，刻意**不可**覆盖 AllowedTools / Profile——保持路由与工具集闭合。认领面因此可以把 spawn ad-hoc 的白名单直接解析为 base kind 的白名单（capability registry 的事实源之一）。
 - 节点能力声明是**单个任务节点**的覆盖：tools 只缩（子集语义），model 只换当次。
 
 组合顺序：先由 spawn 从 base_kind 物化一只 ad-hoc Runner（AllowedTools 继承 base_kind），它认领的节点再按 tools 子集当次裁剪。模型维度的生效遵循"就近原则"：节点声明 > spawn override > kind 配置 > 全局默认——每层只在比自己更靠近任务的声明缺省时生效。
@@ -71,6 +71,6 @@ gate=plan 模式下，用户审批的不再只是"做哪几步、什么顺序"�
 
 ## 7. 明确不做
 
-- **跨 provider 模型覆盖**：`model` 只是模型名，不切换 provider / base_url / api_key——Provider 适配在 bootstrap 期与 LLM client 绑定，当次替换只改请求中的 model 字段。需要另一家 provider 的模型时，应配置独立 kind 路由，而不是节点覆盖。
+- **跨 endpoint 模型覆盖**：`model` 只是模型名，不切换 base_url / api_key——这些在 bootstrap 期与 LLM client 绑定，当次替换只改请求中的 model 字段。需要另一家 endpoint 的模型时，应配置独立 kind 路由，而不是节点覆盖。
 - **验收节点 override**：正式验收 Runner 的能力由 verifier route 的 kind 配置决定，不接受节点级 tools/model 覆盖。验收的公正性依赖稳定、可复现的执行环境；"验收该有什么工具"是 AcceptanceSpec 语义的一部分，不应随节点漂移。
 - **发布时 ⊆ 路由校验**：见 §4——route 集合动态变化，发布时校验会误拒合法的先发布后 provision 流程；判定集中在认领侧并 fail-closed。

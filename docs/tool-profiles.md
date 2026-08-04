@@ -32,7 +32,7 @@ tool_profiles:
     - grep_search
     - glob_search
     - run_shell
-    - submit_acceptance_result
+    - submit_task_result
     - request_replan
 
 agents:
@@ -42,7 +42,6 @@ agents:
     profile: worker_standard
     model: gpt-4o
     system_prompt_file: prompts/worker.md
-    agent_max_loops: 10
     task_max_retries: 3
     enforce_compact_token_threshold: 4000
     context_limit: 16000
@@ -54,7 +53,6 @@ agents:
     profile: acceptance_verifier
     model: gpt-4o-mini
     system_prompt_file: prompts/program_verifier.md
-    agent_max_loops: 8
     task_max_retries: 2
     enforce_compact_token_threshold: 3000
     context_limit: 12000
@@ -71,7 +69,6 @@ agents:
     tools: [read_file, list_dir, grep_search, glob_search, request_replan]
     model: gpt-4o-mini
     system_prompt_file: prompts/explorer.md
-    agent_max_loops: 6
     task_max_retries: 2
     enforce_compact_token_threshold: 3000
     context_limit: 8000
@@ -95,20 +92,12 @@ agents:
 | `publish_task` | MetaGroup | 发布兼容子任务；计划内普通 Agent 不可用它改图 |
 | `send_message` | MetaGroup | 发送 Agent 消息 |
 | `request_user_input` | MetaGroup | 创建 2–8 选项的普通 `agent_question`，等待后只返回 `request_id`、稳定 `option_id` 与 `text` |
-| `request_replan` | PlanControlGroup | 提交事实，请 Scheduler 重新评估 DAG |
-| `submit_acceptance_result` | PlanControlGroup | 正式验收 runner 提交 CriterionResult 与 Evidence |
+| `request_replan` | PlanControlGroup | 提交事实，请 Scheduler 重新评估编排（非图任务发布通用 replan 唤醒任务） |
+| `submit_task_result` | PlanControlGroup | 普通执行节点的结构化提交（Graph acceptance runner 经 `verdict`/`event` 提交验收结论） |
 
-以下 Plan 工具只应由内置 Scheduler 控制面持有：
+以下 Plan 工具已随 V6（C6a/C6b）全部删除，不要再写入 profile：
 
-- `continue_waiting`
-- `define_acceptance_spec`
-- `ensure_acceptance_run`
-- `supersede_tasks`
-- `finalize_plan`
-- `mark_plan_blocked`
-- `submit_plan_for_review`
-- `get_retired_node`
-- `get_acceptance_evidence`
+- `continue_waiting` / `define_acceptance_spec` / `ensure_acceptance_run` / `supersede_tasks` / `finalize_plan` / `mark_plan_blocked` / `submit_plan_for_review` / `get_retired_node` / `get_acceptance_evidence` / `submit_acceptance_result`
 
 以下工具由 Scheduler 内置装配，不通过 profile 配置：
 
@@ -136,7 +125,7 @@ Plan 与 Shell 的边界不变：Scheduler 用 `submit_plan_for_review` 持久�
 - 未纳入 Plan 的兼容工作流仍可显式授予 `publish_task`。
 - 用户 Reactor 对计划内来源的 `publish_task` / `spawn_agent` / isolated `invoke_llm` 意图会转换为 `request_replan`。
 
-默认 Worker profile 因此不需要 `publish_task`。详细不变量见 [`activate/DynamicDAG.md`](activate/DynamicDAG.md)。
+默认 Worker profile 因此不需要 `publish_task`。详细不变量见 [`archived/DynamicDAG.md`](archived/DynamicDAG.md)（V6 前历史文档）。
 
 ### 3.1 AgentTemplate 与 profile 的边界
 
@@ -146,21 +135,21 @@ AgentTemplate 和 `tool_profiles` 不是同一层复用机制：
 - AgentTemplate 是完整且可版本化的实例化定义，包含能力标签、真实 tools、模型、提示词、运行边界与容量；
 - 外部模板必须直接列 `tools`，v1 不允许引用主配置 profile，避免模板从 user/project 目录移动后权限含义发生隐式变化；
 - 模板的 `capabilities` 只是 Scheduler 选型提示，不会授予任何权限；runtime allowlist 仍以 `tools` 为准；
-- 模板不能包含 Scheduler 独占的拓扑控制工具。普通模板需要增删节点时只能 `request_replan`；只有正式 verifier 模板适合持有 `submit_acceptance_result`。
+- 模板不能包含 Scheduler 独占的拓扑控制工具。普通模板需要增删节点时只能 `request_replan`；verifier 模板适合持有 `submit_task_result`（经 `verdict`/`event` 提交验收结论）。
 
 内置模板提供三组保守能力：`builtin/generalist@1` 用于实现，`builtin/explorer@1` 用于只读调查，`builtin/verifier@1` 用于正式验收。项目可以在 `agent-templates/` 中添加更专业的 `project/*` 模板，但不能覆盖内置 ref。
 
 Scheduler-only 启动时，Catalog 中存在模板不代表已经存在 route。Scheduler 必须先 provision 实例，取得真实 route 后再发布 Task；不能把模板名、capability 或预期 kind 当作 `event_type` 猜测。详见 [`activate/AgentTemplate.md`](activate/AgentTemplate.md)。
 
-## 4. 正式验收 Profile
+## 4. 验收 Profile（Graph acceptance 节点 runner）
 
-正式验收 Agent 至少需要：
+验收 Agent 至少需要：
 
-1. `submit_acceptance_result`；
-2. Criterion 实际需要的检查工具，例如 `run_shell`、`read_file` 或 `web_fetch`；
+1. `submit_task_result`（用 `verdict` 字段提交 pass/fail/fixable 等结论，写 `Results["verdict"]` 供 `$.verdict` 边条件；图按 event 路由时同名结论同时填 `event`）；
+2. 验收判据实际需要的检查工具，例如 `run_shell`、`read_file` 或 `web_fetch`；
 3. 可选的 `request_replan`，用于把失败事实交回 Scheduler。
 
-它不应拥有 `define_acceptance_spec`、`supersede_tasks` 或 `finalize_plan`。自定义的是验收 runner 与 Criterion，正式 `acceptance_completed` 事实仍由控制面统一产生。
+自定义的是验收 runner 与判据；验收结论驱动图边路由由 Graph Runtime 统一完成（C6b 起不再有服务端验收核验器与熔断）。
 `run_shell` 不是 OS 级只读沙箱；验收 Agent 的“不修改被验收对象”还需要 prompt 纪律与命令策略，不应仅根据没有 `write_file`/`edit_file` 就宣称强隔离。灰名单命令会创建与原始 command、matched pattern、working directory、AgentID 和 TaskID 精确绑定的 `shell_command` authorization Interaction；只有 `allow_once` 或 `allow_session` 的受信任 effect 完成后才会执行原命令，`deny` / `guidance` 不执行。
 
 ## 5. 能力感知路由
@@ -169,7 +158,7 @@ Board Snapshot 的 `resources.agent_capabilities` 只列出**已经运行**的 A
 
 - 写入任务：目标包含 `write_file` 或 `edit_file`；
 - 命令任务：目标包含 `run_shell`；
-- 正式验收：目标同时包含 `submit_acceptance_result` 和所需检查工具；
+- Graph 验收：目标路由 `acceptance.verify`（或包含 `submit_task_result` 与所需检查工具的验收 Agent）；
 - 纯调查：优先选择只有读取/搜索能力的 Agent；
 - `event_type` 必须对应已声明、可认领的 Agent。
 
@@ -182,9 +171,9 @@ Board Snapshot 的 `resources.agent_capabilities` 只列出**已经运行**的 A
 - `agents` 可以省略；一旦声明，每个 `kind` 仍须唯一且 `replicas >= 1`。
 - `profile` 必须存在于 `tool_profiles`；`profile` 与 `tools` 不能并存，也不能都缺失。
 - `system_prompt_file` 必须存在且可读。
-- `agent_max_loops`、`task_max_retries`、`enforce_compact_token_threshold`、`context_limit` 都必须为正数。
+- `task_max_retries`、`enforce_compact_token_threshold`、`context_limit` 都必须为正数；`agent_max_loops` 已于 V6 移除（显式设置报迁移诊断）。
+- Scheduler 的工具集和系统提示词由 `internal/scheduler` 固定；`scheduler:` 可覆盖模型、`enforce_compact_token_threshold` 与 `context_limit`。
 - 不要定义空 profile 作为“无工具”权限；当前 allowlist 的空集合保留为兼容语义。要做最小权限 Agent，请至少列出它确实需要的工具。
-- Scheduler 的工具集和系统提示词由 `internal/scheduler` 固定；`scheduler:` 可覆盖模型、`agent_max_loops`、`enforce_compact_token_threshold` 与 `context_limit`。
 - 外部 AgentTemplate 一文件一个模板，直接列 tools；`system_prompt` / `system_prompt_file` 恰选一个，ref、版本、digest 和容量在加载期校验。
 
 典型错误：

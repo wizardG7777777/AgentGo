@@ -12,11 +12,11 @@
 | `gate` | **统一 Gate 注册表**（v5 替代 v4 三套 HookRegistry）。Phase 路由：`tool:preCall/postCall` / `mailbox:beforeSend/Deliver/Wake`，10 个内置 Gate |
 | `hook` | 旧 Hook 接口仍作为 LLMExecutor 与 Gate 之间的适配层保留；Agent Hook 子系统已空（team-awareness 删除）；Tool/Mailbox builtin 文件夹保留为兼容 surface |
 | `interaction` | 通用结构化人机交互：稳定 Option ID、Version CAS、`pending → resolving → resolved` 两阶段协议，以及 Plan/Shell 受信任 effect 与普通 `agent_question` 路由 |
-| `llm` | LLM 客户端 + `Provider` 适配器（`openai` / `openrouter` / `deepseek-v4` / `deepseek-r1`）+ `reasoning_effort` + SSE 聚合 + `Message.ExtraFields` 透传机制 |
+| `llm` | LLM 客户端（统一 OpenAI-compatible Chat Completions，V6 移除 Provider 适配层）+ `reasoning_effort` + SSE 聚合 + `Message.ExtraFields` 透传机制 |
 | `mailbox` | 异步信箱、Notifier、recent ring-buffer（容量 16）、TeamSnapshot |
 | `memory` | **Memory System**（v5）。`Store` 接口 + `ProcessStore` 内存实现（`ScopeProcess`），`ScopeSession` / `ScopeProject` v5.x 预留。替代 v4 team-awareness Hook |
 | `model` | `Task` / `Event` / `Claim` 数据结构。`Task` 含 `Artifacts` / `ExpectedArtifacts` / `LastResponse` / `MailChainDepth` / `SchedulerBatch` / `ReadSet` |
-| `modes` | gate / exec / topo 三轴模式存储；gate=plan 通过 `submit_plan_for_review` 与 `plan_review` Interaction 进入用户评审 |
+| `modes` | exec / topo 两轴模式存储（gate 轴已于 V6 移除；执行前审阅改由 Graph approval 节点承担） |
 | `pathutil` | 路径越界 + 敏感文件模式拦截 |
 | `probe` | 启动期 TCP probe + 工具可用性探针（`web_search`/`web_fetch` 检测） |
 | `reactor` | **Reactor 注册表**（v5，新增）。订阅 `trace.Event` 的 `Kind`，4 个内置 reactor + `userdef/` 用户 YAML 加载器 |
@@ -57,11 +57,10 @@
 - **崩溃汇报**：任务最终失败时 agent 自动调用 `sendCrashReport`，向 `task.EventSource` 发送 `priority=high` 邮件，附 expected vs actual artifacts、最后一次 LLM 响应原文。
 - **三层历史压缩**：Layer 1 `snipOldToolResults`（无 LLM 开销，逐轮清理旧工具输出）；Layer 2 `compressHistory`（超过 `enforce_compact_token_threshold` 时摘要）；Layer 3 context overflow 时 `keepRecent=1` 激进压缩 + `RetryRollback`。压缩事件 `KindHistoryCompaction` / `KindHistoryTruncated` 由 `trace-history-event` reactor 计数。
 - **Trace 系统 Schema B**：`internal/trace.Event` 是 fat struct，包含 `Transition` / `ShellExec` / `ShellTimeout` 以及动态 DAG 的 `Plan` / `Acceptance` 五个可选指针载荷，旧字段保留不动。当前有 31 个内置系统 EventKind，包含七个重规划、验收和 Plan 生命周期审计事件。`SetDefaultDispatcher(reactorReg)` 让 `trace.Emit` 同时驱动 Reactor 链路。物理 JSONL 在 Session 活跃时落盘到 `.agentgo/sessions/sess-<id>/logs/`，否则写入 `.agentgo/traces/`，默认保留 100 个文件；Task 重试可能跨多个分片。`agentgo trace list/show/plan/stats` 会按完整 `task_id` 重组逻辑任务并自动定向到 active session 的 `logs/`，其中 `plan <plan_id>` 聚合跨 Task DAG 时间线。可通过 `AGENTGO_DUMP_PROMPTS=1` 启用 prompt dump。
-- **LLM Provider Adapter 与流式调用**：`internal/llm` 在统一工厂层应用 `reasoning_effort` 与 `stream`，因此 Scheduler、静态/动态 Agent、spawn Agent 和 Reactor LLM 共享同一请求策略。SSE 路径先聚合完整文本、工具调用参数、usage 与未知扩展字段，再返回普通 `Response`；UI 收到带稳定 `stream_id` 的累积快照。Provider 层内置 `openai` / `openrouter` / `deepseek-v4` / `deepseek-r1`，并继续处理 `reasoning_content` 往返差异。详见 §"LLM Provider Adapter"。
+- **LLM 请求策略与流式调用**：`internal/llm` 在统一工厂层应用 `reasoning_effort` 与 `stream`，因此 Scheduler、静态/动态 Agent、spawn Agent 和 Reactor LLM 共享同一请求策略（V6 起统一 OpenAI-compatible Chat Completions，无 provider 分支）。SSE 路径先聚合完整文本、工具调用参数、usage 与未知扩展字段，再返回普通 `Response`；UI 收到带稳定 `stream_id` 的累积快照。未知扩展字段经 ExtraFields 透传往返（如 `reasoning_content`）。详见 §"LLM 请求路径与 ExtraFields 透传"。
 
 **未启动 / 待设计**：
 - ScopeSession / ScopeProject 持久化记忆（v5.x 排期）
-- Embedding 与 `QueryByVector`（接口预留，无实现）
 - 引用幻觉验证 Gate / E2E 幻觉测试基线（详见 `docs/archived/hallucination-acceptance-audit-2026-05.md`，P0 改进尚未落地）
 - Shell 工具改造的 T6（YAML 持久化）（详见 `docs/activate/ToolUpgradePlan.md`）
 - AgentHook 子系统是否在 v5 内合并入 Reactor（方案 C，详见 `docs/activate/MemoryManageSystem.md` §5）
@@ -251,7 +250,6 @@ type Kind  string // KindConstraint / KindLearning / KindPattern / KindContext /
 type Store interface {
     Put(ctx, entry Entry) error
     Query(ctx, scope Scope, kind Kind, query string, limit int) ([]Entry, error)
-    QueryByVector(ctx, scope Scope, embedding []float32, limit int) ([]Entry, error)  // ErrNotImplemented
     Delete(ctx, id string) error
     Clear(ctx, scope Scope) error
 }
@@ -259,9 +257,8 @@ type Store interface {
 type Entry struct {
     ID, Key, Content, Source string
     Scope Scope; Kind Kind
-    Embedding []float32; Tags []string
+    Tags []string
     CreatedAt, UpdatedAt time.Time
-    AccessCount int
 }
 ```
 
@@ -277,7 +274,6 @@ type Entry struct {
 
 - query 非空 → 精确 key 匹配（快速路径，用于 team_snapshot/file_awareness）
 - query 为空 → 范围检索该 scope+kind 下全部条目（按 UpdatedAt 倒序，limit 截断）
-- `QueryByVector` 返回 `ErrNotImplemented`（接口预留 v5.x）
 
 ### Agent 侧的读取入口
 
@@ -349,7 +345,7 @@ bootstrap.go:
 
 ---
 
-# LLM Provider Adapter（2026-04-25 落地）
+# LLM 请求路径与 ExtraFields 透传（2026-04-25 落地；V6 起统一 OpenAI-compatible Chat Completions，Provider 层已移除）
 
 ## 背景
 
@@ -359,7 +355,7 @@ bootstrap.go:
 - **DeepSeek R1 (deepseek-reasoner)**：要求**相反**——下一轮请求必须删除历史 assistant 消息里的 `reasoning_content`，否则同样 400。
 - **Qwen QwQ / Kimi / Claude 兼容网关**：各有各的自定义字段、`<think>` 标签、tool_use 格式差异。
 
-"每遇到一个模型加一个 if/else" 走不通。本架构用两层机制把这类差异收敛到可维护的边界上，**保留 openai-go 基座不变**。
+"每遇到一个模型加一个 if/else" 走不通。本架构用 ExtraFields 通用透传机制把「保留即可」类差异收敛到可维护的边界上，**保留 openai-go 基座不变**。
 
 ## 层 1：ExtraFields 通用透传（零预知）
 
@@ -372,59 +368,30 @@ bootstrap.go:
 
 **覆盖范围**：DeepSeek V4 的 `reasoning_content`、provider 自定义元数据等所有"只要原样回传就行"的扩展。无需编写任何模型专属代码。
 
-## 层 2：Provider 插件（处理变换型/负向差异）
-
-层 1 对付不了"必须删除"或"要转换格式"的差异。层 2 给一个小接口：
-
-```go
-type Provider interface {
-    Name() string
-    PrepareMessages(history []Message) []Message           // 发请求前改造 history
-    RequestOptions() []option.RequestOption                // 追加 provider 特有的 RequestOption
-}
-```
-
-`providerRegistry` 按 name 查找。内置实现：
-
-| name | 行为 |
-|------|------|
-| `openai` | no-op；也是 `GetProvider("")` 和未知名的 fallback |
-| `deepseek-v4` | no-op（层 1 已覆盖其 reasoning_content 往返）；保留结构作为未来挂点（例如开关 `thinking:disabled`） |
-| `deepseek-r1` | `PrepareMessages` 遍历 history，对每条 assistant 消息从 `ExtraFields` 里剥离 `reasoning_content`，保留其它 extras |
-
-新增模型家族的步骤：
-
-1. 实现 `Provider` 接口（~30–50 行）
-2. 在 `init()` 里 `RegisterProvider(&XxxProvider{})`
-3. 补对应 provider 单测
-
-**`client.go` / `agent.go` 不需要任何修改**——这是"不是每遇到一个就补一块"的保障。
+## 层 2：Provider 插件（**已于 V6 移除**）——原 `Provider` 接口（`PrepareMessages` / `RequestOptions`）、注册表与 openai / openrouter / deepseek-v4 / deepseek-r1 四个内置实现已整体删除；V6 起只保留统一 OpenAI-compatible Chat Completions 请求路径，`llm.provider` 字段在 Validate 返回迁移诊断错误。层 1 ExtraFields 透传保留。
 
 ## 配置（v4 schema）
 
 ```yaml
 llm:
-  provider: deepseek-v4         # 默认 "" → "openai" no-op；可选 "deepseek-v4" / "deepseek-r1"
   default_model: ...
   base_url: ...
   api_key: ...
   timeout_sec: ...
 ```
 
-`bootstrap.go` 把 `cfg.LLM.Provider` 传给所有 `llm.NewSDKClient(...)` 调用点。如果未来需要 per-kind provider 覆盖（例如 explorer 用不同模型族），可在 `agents[*]` 上加字段；当前阶段所有 kind 共享同一个 provider，per-kind 区分由 `model` 名（同一 endpoint 下选不同模型）承担。
+`bootstrap.go` 经 `runtime_builder.buildKindLLMClient` 统一构造 `llm.Client` 注入所有调用点（V6 起不再传 provider）。per-kind 模型区分由 `model` 名（同一 endpoint 下选不同模型）承担。
 
 ## 为什么不直接丢弃 openai-go
 
-考虑过激进方案：改用 `net/http + encoding/json`，所有消息走 map。litellm / LangChain 走的就是这条路。但 openai-go 提供的重试、类型补全、参数校验、tool schema 组装仍然值得保留；层 1 + 层 2 已经把所有"典型非兼容扩展"类别处理掉，无须下这一刀。如果未来出现层 2 也无法优雅处理的 provider（例如完全不同的 tool 协议），再考虑把底层 HTTP 层接口化。
+考虑过激进方案：改用 `net/http + encoding/json`，所有消息走 map。litellm / LangChain 走的就是这条路。但 openai-go 提供的重试、类型补全、参数校验、tool schema 组装仍然值得保留；层 1 ExtraFields 透传已覆盖「保留即可」类典型非兼容扩展，无须下这一刀。如果未来出现透传无法优雅处理的 endpoint（例如完全不同的 tool 协议），再考虑把底层 HTTP 层接口化。
 
 ## 关键文件
 
-- `internal/llm/client.go` —— Message/Response 结构 + SDKClient.provider + extras 抽取/回写
-- `internal/llm/provider.go` —— Provider 接口 + 注册表
-- `internal/llm/provider_builtin.go` —— OpenAI / OpenRouter / DeepSeek V4 / DeepSeek R1 四个内置实现；OpenRouter 在这里把 `reasoning_effort` 映射为 `reasoning.effort`
-- `internal/llm/provider_test.go` + `internal/llm/client_test.go` —— 单元测试 + httptest 双轮对话集成测试（模拟 V4 / R1 严格契约，往返断言）
+- `internal/llm/client.go` —— Message/Response 结构 + SDKClient + extras 抽取/回写
+- `internal/llm/client_test.go` —— 单元测试 + httptest 集成测试（含 ExtraFields 往返断言）
 - `internal/agent/agent.go` / `internal/agent/llm_executor.go` —— HistoryEntry.ExtraFields 透传
-- `internal/config/config.go` —— `LLMConfig.Provider` / `ReasoningEffort` / `Stream` 字段（顶层 `llm:` 块）
+- `internal/config/config.go` —— `LLMConfig.ReasoningEffort` / `Stream` 字段（顶层 `llm:` 块）；`Provider` 仅保留解析位，非空即被 Validate 拒绝（V6 迁移诊断）
 - `internal/bootstrap/bootstrap.go` —— 所有 `llm.NewSDKClient(...)` 调用点串联
 
 ---
@@ -578,7 +545,7 @@ internal/
 - **请求协助**：代理在执行过程中发现任务超出自身能力时，可向公告板发布子任务请求其他代理协助
 - **停止条件**：代理在以下任一条件满足时停止当前任务的执行：
     - **LLM 未调用工具（正常完成）**：LLM 返回的响应中没有任何工具调用，视为代理认为任务已完成。此时代理将完整的执行历史记录和最终结果提交到公告板。
-    - **达到最大循环次数**：代理内部 ReAct 循环次数到达配置的上限，强制停止。阈值应设置得足够大，使 90%+ 的复杂调用不会触发。触发后走重试回退路径（processing→pending），重试次数加一，并将已有的部分结果和"因循环上限终止"的标注写入重试原因，使下一个接手的代理能获得充分的上下文提示，避免重蹈覆辙。
+    - **可恢复故障重试**：LLM 瞬时错误（429/5xx 等）触发重试回退路径（processing→pending），重试次数加一，并将已有的部分结果写入重试原因，使下一个接手的代理能获得充分的上下文提示，避免重蹈覆辙；重试预算耗尽则任务失败。（V6 起不再有固定循环轮数上限；程序性死循环由不可配置的 emergency fuse 兜底——触发后任务进 blocked 并登记 replan，不自动重跑。）
     - **超时**：单次任务执行的总时长超过超时阈值，强制停止。超时不走重试回退，而是由调度器介入：调度器将原任务标记为 failed，然后将其重新拆分为更细粒度的子任务重新发布。新的子任务继承原任务已消耗的重试次数（不重置），这样如果任务本身就无法完成，拆分后的子任务也会很快达到重试上限而终止，避免无限拆分。
     - **外部取消**：代理通过 Go context 或专用 channel 收到取消信号（来自看门狗或人类操作员），立即停止当前执行，清理资源，不提交结果。
 
@@ -868,8 +835,7 @@ scheduler agent 与 worker / explorer 共享同一套 `agent.Agent.processTask` 
 3. **观察**：调用 `BuildBoardJSON` 生成当前 Plan/请求树快照，注入到 history 末尾（`IncomingMail` 类型，与 mailbox 注入对称）
 4. **思考**：调底层 `NewLLMExecutor` 实际调用 LLM
 5. **行动**：LLM 调用 `publish_task`（追加到 `task.SchedulerBatch`）/ `cancel_task` / `get_task_result`（按需分页）/ `report_done` / `send_message` / `read_file` / `grep_search` / 等等
-6. **循环**：LLM 还有 tool call 则下一轮 reactLoop（`agent.Agent.processTask` 内部 for 循环）；LLM 给文本响应（无 tool call）则任务完成
-- `cfg.SchedulerMaxLoops` 控制单次 reactLoop 上限
+6. **循环**：LLM 还有 tool call 则下一轮 reactLoop（`agent.Agent.processTask` 内部 for 循环，无固定轮数上限）；LLM 给文本响应（无 tool call）则任务完成
 ## 实现机制
 - 使用 Go channel 作为事件通道，公告板写操作完成后向 channel 发送事件
 - `scheduler.Activator` goroutine 以 select 监听事件 channel，转换为 store/BatchUpdateCh 副作用
@@ -1084,7 +1050,6 @@ Trace 系统为每个任务记录完整的执行轨迹，便于问题诊断、�
 | `tool_call` | 工具调用开始 | `tool`, `call_id`, `args` |
 | `tool_result` | 工具调用完成 | `tool`, `call_id`, `args`, `duration_ms`, `result_len`；触发 `read-set-write` reactor |
 | `text_only_submission` | LLM 仅文本响应（无 tool call，自然完成） | `task_id`, `output_len` |
-| `token_stats` | per-task token 使用统计 | `prompt_tokens`, `completion_tokens` |
 
 ### 文件 / Shell 类
 
@@ -1101,21 +1066,24 @@ Trace 系统为每个任务记录完整的执行轨迹，便于问题诊断、�
 | EventKind | 说明 | 关键字段 |
 |-----------|------|----------|
 | `history_compaction` | 历史压缩 | `prompt_tokens_before`, `prompt_tokens_after`, `strategy`, `kept_entries`；触发 `trace-history-event` reactor |
-| `history_truncated` | 历史截断 | 同上 |
 | `progress_notify` | 进度通知（`progress_notify_enabled=true` 时） | `task_id`, `agent_id`, `loop`, `notify_type` |
 | `reactor_spawn_depth_exceeded` | spawn_agent reactor 级联超限（`ReactorSpawnMaxDepth=5`） | `task_id`, `depth`, `reason` |
 
-### 动态 DAG 控制面
+### Graph 控制面（V6）
 
-| EventKind | 说明 | 关键字段 |
-|-----------|------|----------|
-| `replan_requested` | Task、工具或 Reactor 请求重新规划 | `reason`, `Plan{...}` |
-| `replan_coalesced` | 多个请求被合并 | `reason`, `Plan{...}` |
-| `replan_decided` | Scheduler 记录重规划决策 | `reason`, `Plan{...}` |
-| `acceptance_completed` | 验收运行完成 | `Plan{...}`, `Acceptance{...}` |
-| `plan_revision_changed` | 当前 DAG 图发生语义变更 | `reason`, `Plan{...}` |
-| `plan_paused` | Plan 因预算、验收或阻塞暂停 | `reason`, `Plan{...}` |
-| `plan_terminal` | Plan 达到终态 | `reason`, `Plan{...}`, `Acceptance{...}`（如有） |
+Plan 控制面（replan_* / plan_* / acceptance_completed）已于 V6 整体删除。Graph 生命周期事件携带 `graph_id` / `node_id` / `activation_id` 并写入独立 `graph_<id>.jsonl` 分片：
+
+| EventKind | 说明 |
+|-----------|------|
+| `graph_submitted` / `graph_submission_rejected` | JSON Graph 提交激活 / 校验失败 |
+| `node_activation_created` | 节点新 activation（回边新建，绝不重开旧 task） |
+| `graph_transition_selected` | 边选择生效（按 source activation 幂等） |
+| `graph_wait_started` / `graph_wait_resumed` | wait_event / approval 挂起与恢复 |
+| `graph_join_resolved` | join 汇聚裁决 |
+| `graph_approval_decided` | 人工审批决议 |
+| `graph_revision_committed` | patch_graph 定义变更提交 |
+| `graph_change_requested` | 节点请求 graph change（唤醒 Scheduler） |
+| `graph_ended` | 图到达终态（completed/failed） |
 
 > **`task_submitted` / `task_completed` 对称性**：`agent.processTask` 的两条完成路径（自然完成 / Finalized 跨轮短路）都会 emit 这两个事件。2026-04-19 修复前，短路路径只 `SubmitResult` 未 emit，导致 `trace list` 把 scheduler 任务错标为 `running/loops=0`。
 
@@ -1125,8 +1093,8 @@ Trace 系统为每个任务记录完整的执行轨迹，便于问题诊断、�
 
 | 开放级别 | EventKind |
 |---|---|
-| **开放给用户 YAML reactor** | `internal/reactor/userdef/loader.go` 中 `knownEventKinds` 的 27 种事件，包含任务、LLM、工具、历史、文件、Shell、错误、验收及 Plan 终态事件 |
-| **仅内置 reactor 可订阅** | `replan_requested` / `replan_coalesced` / `replan_decided` / `plan_revision_changed` |
+| **开放给用户 YAML reactor** | `internal/reactor/userdef/loader.go` 中 `knownEventKinds` 白名单（任务、LLM、工具、历史、文件、Shell、错误、Graph 等事件） |
+| **仅内置 reactor 可订阅** | 白名单外的运行时事件（详见 loader.go 注释） |
 
 ## 使用示例
 
@@ -1184,13 +1152,10 @@ llm:                                # 全局 LLM 默认值
   api_key: "sk-..."
   default_model: "qwen3.6-plus"
   timeout_sec: 60
-  provider: ""                      # 留空 → "openai" no-op；可选 "deepseek-v4" / "deepseek-r1"
 
 scheduler:                          # Scheduler 是内置单例；模型与运行预算可覆盖
   model: "qwen3-max"
-  agent_max_loops: 50
   enforce_compact_token_threshold: 80000
-  context_limit: 200000
 
 agents:                             # AgentKind 列表 —— 取代 v3 的 worker_count + explorer 二分
   - kind: worker
@@ -1198,10 +1163,8 @@ agents:                             # AgentKind 列表 —— 取代 v3 的 work
     profile: "full-access"          # 或 tools: [...]（互斥）
     model: "qwen3.6-plus"           # 可选，per-kind 覆盖 llm.default_model
     system_prompt_file: "prompts/worker.md"
-    agent_max_loops: 50
     task_max_retries: 3
     enforce_compact_token_threshold: 80000
-    context_limit: 128000
     description: "通用任务执行代理，能读写文件、跑命令、发邮件"  # 给 scheduler 看的语义提示
   - kind: explorer
     replicas: 1
@@ -1230,7 +1193,6 @@ infra:
 project_root: "."                   # 路径越界检查基准
 max_subtask_depth: 1                # publish_task 子任务最大深度
 shell_timeout_sec: 30
-transfer_note_max_tokens: 3000      # TransferNote 单条最大 token 预算
 progress_notify_enabled: false      # 进度通知（写文件 / 发布子任务 / 任务过半）开关
 agent_idle_threshold: 0             # runner 连续空轮询退出阈值；0 = 永不退出
 hashline_enabled: null              # 行哈希锚点开关（null = 默认启用）
@@ -1279,10 +1241,8 @@ Session 恢复遵守以下安全边界：fsync 的 Plan 终态先覆盖较旧的
 | `profile` / `tools` | 工具集来源，**互斥**。`profile` 引用 `tool_profiles` 中的命名集合；`tools` 直接列举工具名 |
 | `model` | per-kind 模型覆盖（空则用 `llm.default_model`） |
 | `system_prompt_file` | 必填，提示词文件路径；resolves 相对当前 cwd 或绝对路径 |
-| `agent_max_loops` | 单次 `processTask` 内 ReAct 循环次数上限 |
 | `task_max_retries` | 任务级重试上限（v3 时代的 worker/explorer/scheduler hardcoded constant 已被此字段取代） |
 | `enforce_compact_token_threshold` | Layer 2 历史压缩触发阈值（prompt tokens） |
-| `context_limit` | LLM 上下文窗口估算（用于 token 预算） |
 | `description` | 给 scheduler 看的一句话角色描述（拼入 board snapshot 的 `agent_capabilities` 段） |
 
 `internal/config/config.go` 在 v4 之外还保留一个**仅内部使用**的 `AgentRuntimeConfig` 结构，由 `bootstrap.runtime_builder.buildAgentRuntime(kind, replicaIdx)` 合成并注入 `runner.New(rt, deps)`。`AgentRuntimeConfig` 不出现在 YAML 中。

@@ -133,8 +133,7 @@ TUI 斜杠命令：
 | --- | --- |
 | `/help`、`/status` | 查看帮助和运行状态 |
 | `/cancel <id-prefix>` | 取消 Task |
-| `/mode` | 切换 `immediate` / `plan` Scheduler 模式 |
-| `/plan [approve\|reject <prefix>]` | 列出待评审 Plan；`approve` / `reject` 是进入同一 Interaction CAS/effect 管线的兼容别名 |
+| `/mode` | 切换三轴模式（gate 轴仅 `immediate`） |
 | `/steer <agent-id> <msg>` | 给 Agent 发送纠偏消息 |
 | `/new`、`/session [num]` | 新建、列出或切换 Session |
 | `/dashboard`、`/chat`、`/result`、`/agent <id-prefix>` | 切换总览、会话、最终结果或单 Agent 工作台 |
@@ -143,7 +142,7 @@ TUI 斜杠命令：
 
 TUI 的 `/chat` 会在空间允许时附带紧凑的 Live Activity 区；在 `/dashboard` 选中 Agent 后进入的详情页则是该 Agent 的独立工作台。长文本按终端单元格宽度换行，不再用单行截断代替正文。`/activity`、`/logs`、`/trace` 中按 Esc 返回总览，不会误触发取消请求。
 
-Plan/Shell 控制面或 Agent 的 `request_user_input` 需要用户决定时，TUI 显示通用 Interaction 面板：Tab 切换焦点，`↑/↓` 选择，`PgUp/PgDn` 翻动较长的问题正文，Enter 提交；要求补充文本的选项会进入普通输入框。动作不绑定裸英文字母或裸数字，正常输入不会被截获。TUI/Web 展示当前进程内全部 pending 请求；`SessionID` 只作创建审计归属，切换 `/session` 不会隐藏仍在运行任务的问题。
+Graph approval/Shell 控制面或 Agent 的 `request_user_input` 需要用户决定时，TUI 显示通用 Interaction 面板：Tab 切换焦点，`↑/↓` 选择，`PgUp/PgDn` 翻动较长的问题正文，Enter 提交；要求补充文本的选项会进入普通输入框。动作不绑定裸英文字母或裸数字，正常输入不会被截获。TUI/Web 展示当前进程内全部 pending 请求；`SessionID` 只作创建审计归属，切换 `/session` 不会隐藏仍在运行任务的问题。
 
 灰名单 Shell 命令使用 `shell_command` authorization Interaction，稳定选项为 `allow_once` / `deny` / `guidance` / `allow_session`。其中 `allow_session` 名称为兼容协议 ID，实际把服务端捕获的原始匹配规则加入**当前进程、本次运行**的 whitelist；切换 AgentGo `/session` 不会清空，退出后不持久化。
 
@@ -156,22 +155,22 @@ User (TUI / Web)
       UI Hub / Interaction Service
         |
         v
-Scheduler Agent --> PlanCoordinator / PlanStore --> Task-backed DAG
+Scheduler Agent --> submit_graph / publish_task --> Task-backed DAG / Graph Runtime
                                                      |
                       +------------------------------+------------------+
                       v                              v                  v
-                   Runner Team                Reactor replan     Acceptance runner
+                   Runner Team                Reactor replan     Acceptance runner (acceptance.verify)
                       |
                       v
               Gate -> Tool execution -> Trace / Session persistence
 ```
 
-- `internal/plan` 维护动态图版本、控制器租约、验收与预算；最终结果必须满足最新 Plan scope 的正式验收。
+- `internal/graph` 维护 JSON 图契约、activation 模型与 durable 恢复；验收经 acceptance 节点 + `submit_task_result` 的 `verdict`/`event` 契约驱动边路由。
 - `internal/runner` 承载预热或按需创建的 Agent；`internal/agenttemplate` 与 `internal/team` 负责模板及运行时 Team。
 - `internal/gate` 在工具/邮箱动作前做决策；`internal/reactor` 订阅状态变化，计划内只可请求 Scheduler 重规划。
 - `internal/session`、`internal/trace` 保存 Session、快照和 JSONL 事件；重试可能产生多个 trace 分片，CLI 会按完整 TaskID 重组。
 - `internal/ui` 是事件通道的唯一消费者和多前端的控制/观测边界；`internal/dashboard` 提供 HTTP + SSE Dashboard。
-- `internal/interaction` 以版本 CAS 和稳定 Option ID 持有用户选择；PlanStore、TaskStore 与 Shell 调用仍分别拥有实际执行事实。
+- `internal/interaction` 以版本 CAS 和稳定 Option ID 持有用户选择；Graph Runtime、TaskStore 与 Shell 调用仍分别拥有实际执行事实。
 
 完整包目录和设计约束见 [Archtechture.md](Archtechture.md)。
 
@@ -190,6 +189,8 @@ go test -race ./internal/agent ./internal/shell ./internal/trace ./internal/boot
 ```
 
 调试完整 LLM prompt 时可设置 `AGENTGO_DUMP_PROMPTS=1` 后再启动；prompt dump 可能含有敏感上下文，不应提交或共享。
+
+trace 事件中的工具参数/命令自 V6 §7.4 起默认脱敏（结构字段保留，自由内容替换为 `<redacted len=N sha256=前12>` 占位）；调试需要完整参数时可设置 `AGENTGO_TRACE_FULL_ARGS=1` 旁路脱敏（与 prompt dump 同级的显式开发开关，同样不应提交或共享其产物）。
 
 ## 许可证
 

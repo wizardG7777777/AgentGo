@@ -108,9 +108,6 @@ type MemoryStore interface {
     // 文本检索 + 标签过滤
     Query(ctx context.Context, scope MemoryScope, kind MemoryKind, query string, limit int) ([]MemoryEntry, error)
 
-    // 向量检索（可选，v5.x 引入）
-    QueryByVector(ctx context.Context, scope MemoryScope, embedding []float32, limit int) ([]MemoryEntry, error)
-
     // 删除
     Delete(ctx context.Context, id string) error
 
@@ -124,12 +121,10 @@ type MemoryEntry struct {
     Kind        MemoryKind
     Key         string      // 检索键
     Content     string      // 文本内容（或序列化后的结构化数据）
-    Embedding   []float32   // 可选：向量嵌入
     Tags        []string    // 标签
     Source      string      // 来源（agentID / taskID / user）
     CreatedAt   time.Time
     UpdatedAt   time.Time
-    AccessCount int         // 访问频次（LRU 依据）
 }
 ```
 
@@ -286,8 +281,7 @@ team-awareness 三个 hook 删除后，**`AgentHookRegistry` 在事实上为空*
 
 - **Trigger System 重构**（[nextUpgrade_v5.md §13.4](../archived/nextUpgrade_v5.md#L1207) "AgentHook 重新定位为 Trigger System"）—— **仍归 V6 方向**，本模块不涉及。Trigger System 与 Memory System 是 §13 的两个并列议题，提前到 V5 的只有 Memory 部分
 - **常驻 Agent 与临时 Agent 共存**（[§13.4.3 AgentPool](../archived/nextUpgrade_v5.md#L1264)）—— 归 Trigger System，留 V6
-- **向量检索**（`QueryByVector`）—— 接口预留，v5.x 引入实现
-- **`MemoryEntry.Embedding` 字段填充** —— 同上
+- **向量检索**（`QueryByVector`）—— v5.x 引入实现
 - **从 LLM 自动生成 Memory（如对话总结自动写入 Project Memory）** —— v5 不做；v5.x 探索时再讨论触发条件
 - **跨进程 Memory 共享（如多个 AgentGo 实例共享同一 Project Memory）** —— v5 不考虑，仅单进程
 - **Memory 的事后检索 UI** —— `internal/cli` 当前不提供 `/memory` 命令查看历史记忆，CLI 升级时再考虑（详见 InterfaceDesign.md §CLI 交互层）

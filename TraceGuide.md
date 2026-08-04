@@ -11,7 +11,7 @@
 
 ## 0. 这是什么？
 
-Trace 是 AgentGo 的 **任务级 JSONL 事件追踪系统**，专为故障排查设计。任务在运行期间会产生 JSONL 事件；重试会关闭并重新打开 writer，因此同一 Task 的时间线可能分散在多个物理文件中。CLI 按事件里的完整 `task_id` 重新聚合这些分片；此外还能按 `PlanID` 聚合动态 DAG 中分散在 controller、runner 和 acceptance Task 里的事件。
+Trace 是 AgentGo 的 **任务级 JSONL 事件追踪系统**，专为故障排查设计。任务在运行期间会产生 JSONL 事件；重试会关闭并重新打开 writer，因此同一 Task 的时间线可能分散在多个物理文件中。CLI 按事件里的完整 `task_id` 重新聚合这些分片；Graph 生命周期事件（无 task_id）落在独立的 `graph_<graph_id前8位>.jsonl` 分片（见 3.3）。
 
 **核心设计原则**：
 - **物理文件按打开时间命名**（如 `2026-04-08T04-17-06_321b561d.jsonl`）；任务重试可能产生多个分片，极短 ID 碰撞也可能让一个文件含多个 Task，CLI 以完整 `task_id` 为逻辑聚合键
@@ -36,7 +36,7 @@ TRACE_DIR=".agentgo/sessions/sess-${SESSION_ID}/logs"
 ls "$TRACE_DIR"/*.jsonl
 ```
 
-### 1.2 四个核心命令
+### 1.2 核心命令
 
 ```bash
 # 列出最近所有任务（表格形式，按发布时间倒序）
@@ -45,18 +45,18 @@ agentgo trace list
 # 查看某个任务的完整事件时间线（按时间顺序 + 异常检测）
 agentgo trace show <task_id>
 
-# 聚合同一个动态 DAG Plan 的跨任务时间线
-agentgo trace plan <plan_id>
+# 聚合当前 session 全部任务的 LLM 调用与 token 消耗（task/agent 两个维度）
+agentgo trace stats [task|agent]
 
-# 聚合当前 session 全部任务的 LLM 调用与 token 消耗（task/agent/plan 三个维度）
-agentgo trace stats [task|agent|plan]
+# Graph 编排：列出全部图 / 展示图生命周期时间线 / 单节点 activation 视图
+agentgo trace graph [graph_id]
+agentgo trace node <graph_id>/<node_id>
 ```
 
 `task_id` 可以是完整 UUID 或任意唯一前缀；发生前缀碰撞时 CLI 会列出完整候选：
 ```bash
 agentgo trace show 321b561d
 agentgo trace show 321b561d-c564-422c-bfa0-b96f54edcb87
-agentgo trace plan 321b561d
 ```
 
 ### 1.3 实时监控
@@ -107,8 +107,6 @@ attempt_no  — 重试次数（task_retry 专用，1-based）
 
 LLM 调用字段：prompt_tokens, completion_tokens, history_entries, tool_calls_count, finish_reason, duration_ms
 
-Token 累计字段（token_stats 专用）：total_prompt_tokens, total_completion_tokens, call_count
-
 工具调用字段：tool, args, call_id, result_len
 
 文件操作字段：path, bytes, hash
@@ -121,8 +119,6 @@ v5 子结构体（指针，nil 时不输出）：
   transition    — 状态转移信息（Transition struct）
   shell_exec    — Shell 执行结果（ShellExec struct）
   shell_timeout — Shell 超时信息（ShellTimeout struct）
-  plan          — 动态 DAG 的 Plan 身份与版本（PlanTraceContext）
-  acceptance    — 正式验收结果身份（AcceptanceTraceContext）
 ```
 
 ### 2.2 Transition 子结构体
@@ -133,7 +129,7 @@ new_status:  任务新状态
 prev_state:  Agent 旧状态  # idle / processing / waiting_interaction / terminating
 new_state:   Agent 新状态
 cause:       结构化原因 enum
-             示例: task_claimed:xxx / max_loops_exceeded / react_loop_exit:panic / approved / rejected
+             示例: task_claimed:xxx / non_recoverable_error / runtime_loop_fuse / react_loop_exit:panic / approved / rejected
 cancel_source: 取消来源（task_cancelled 专用）  # user / watchdog / scheduler / dependency_failure
 retry_count:  重试计数（task_failed / task_retry 专用）
 ```
@@ -163,31 +159,20 @@ stdout_excerpt: stdout 摘要
 stderr_excerpt: stderr 摘要
 ```
 
-### 2.5 PlanTraceContext 子结构体
+### 2.5 Graph 身份字段（V6）
+
+Graph 事件（见 3.3）携带以下字段而非 PlanTraceContext（Plan 控制面已于 V6 删除）：
 
 ```yaml
-plan_id:                     跨 revision 稳定的 Plan 身份
-plan_revision:               当前 DAG 结构版本
-execution_state_version:     Task/预算/重规划等执行事实版本
-acceptance_spec_revision:    当前正式验收规范版本
-graph_digest:                当前有效图的确定性 SHA-256 摘要
+graph_id:                    图身份（子图为 <父图ID>/<activationID>）
+node_id:                     事件所属节点
+activation_id:               节点的一次进入（<nodeID>@<n>，回边新建）
 ```
 
-### 2.6 AcceptanceTraceContext 子结构体
 
-```yaml
-acceptance_run_id:    正式验收 Run ID
-result_id:            验收结果 ID
-spec_id:              验收规范 ID
-spec_revision:        验收规范版本
-target_revision:      被验收的 Plan revision
-target_graph_digest:  被验收的图摘要
-runner_task_id:       执行验收的 Task ID
-runner_kind:          验收 Agent kind（可选）
-verdict:              pass / fail / blocked / disputed / stale
-status:               valid / stale
-reason:               人类可读结果说明
-```
+### 2.6 AcceptanceTraceContext 子结构体（已于 V6 随 Plan 控制面删除）
+
+Plan 时代的验收身份子结构已删除；V6 验收语义由 Graph acceptance 节点承担（`submit_task_result` 的 `verdict`/`event` 契约），相关事实看 `graph_` 分片与任务终态事件。
 
 ### 2.7 内置 EventKind
 
@@ -207,15 +192,13 @@ reason:               人类可读结果说明
 | `reactor_spawn_depth_exceeded` | Reactor spawn 深度超限 | `depth`, `reason` |
 | `progress_notify` | 进度通知 | `notify_type` (file_write/subtask/halfway) |
 
-#### LLM 调用与 Token（5 种）
+#### LLM 调用与 Token（4 种）
 
 | Kind | 含义 | 关键字段 |
 |---|---|---|
 | `llm_call_start` | LLM 调用开始 | `history_entries`, `tool_calls_count` |
-| `llm_call_end` | LLM 调用结束 | `duration_ms`, `prompt_tokens`, `completion_tokens`, `tool_calls_count`, `finish_reason`, `error` |
-| `token_stats` | Agent 级 Token 累计 | `prompt_tokens`, `completion_tokens`, `total_prompt_tokens`, `total_completion_tokens`, `call_count` |
+| `llm_call_end` | LLM 调用结束（唯一 token 账本，每次调用一条） | `duration_ms`, `prompt_tokens`, `completion_tokens`, `tool_calls_count`, `finish_reason`, `error` |
 | `history_compaction` | 上下文压缩 | `prompt_tokens_before`, `strategy`, `kept_entries` |
-| `history_truncated` | 上下文硬截断 | `prompt_tokens_before`, `prompt_tokens_after`, `kept_entries`, `strategy` |
 
 #### 工具调用（2 种）
 
@@ -240,17 +223,20 @@ reason:               人类可读结果说明
 | `shell_timeout_pending` | Shell 超时——待决策 | `shell_timeout` (decision 为空) |
 | `shell_timeout_resolved` | Shell 超时——已决策 | `shell_timeout` (decision 非空) |
 
-#### 动态 DAG 控制面（7 种）
+#### Graph 控制面（V6，10 种）
 
 | Kind | 含义 | 关键字段 |
 |---|---|---|
-| `replan_requested` | Task/Reactor 请求重新规划 | `reason`, `plan` |
-| `replan_coalesced` | 多个 pending 请求聚合为一次唤醒 | `reason`, `plan` |
-| `replan_decided` | Scheduler 确认本轮重规划决策 | `reason`, `plan` |
-| `acceptance_completed` | 正式验收结果已经持久化 | `plan`, `acceptance` |
-| `plan_revision_changed` | DAG 当前图发生语义变更 | `reason`, `plan` |
-| `plan_paused` | Plan 因预算、无进展或外部条件暂停 | `reason`, `plan` |
-| `plan_terminal` | Plan 终态已经持久化 | `reason`, `plan` |
+| `graph_submitted` | JSON Graph 提交并激活 root | `graph_id` |
+| `graph_submission_rejected` | 图提交校验失败 | `error` |
+| `node_activation_created` | 节点新 activation 创建（回边亦新） | `graph_id`, `node_id`, `activation_id` |
+| `graph_transition_selected` | 边选择生效（幂等） | `graph_id`, `node_id`, `activation_id` |
+| `graph_wait_started` / `graph_wait_resumed` | wait_event/approval 挂起与恢复 | `graph_id`, `node_id` |
+| `graph_join_resolved` | join 汇聚裁决 | `graph_id`, `node_id` |
+| `graph_approval_decided` | 人工审批决议 | `graph_id`, `node_id` |
+| `graph_revision_committed` | patch_graph 定义变更提交 | `graph_id`, `desc` |
+| `graph_change_requested` | 节点请求 graph change（唤醒 Scheduler） | `graph_id`, `node_id`, `activation_id`, `reason` |
+| `graph_ended` | 图到达终态 | `graph_id`, `reason` |
 
 #### 通用（1 种）
 
@@ -265,13 +251,13 @@ reason:               人类可读结果说明
 ### 3.1 `agentgo trace list` 输出
 
 ```
-┌───────────────┬──────────┬─────────────────────┬──────────┬────────────┬───────┬───────────┬────────┬─────────────┐
-│ Task          │ Plan     │ Published           │ Agent    │ Status     │ Loops │ Files Out │ Errors │ Duration    │
-├───────────────┼──────────┼─────────────────────┼──────────┼────────────┼───────┼───────────┼────────┼─────────────┤
-│ 321b561d      │ 321b561d │ 2026-07-18 12:17:06 │ worker-1 │ completed  │    12 │         3 │      0 │ 8m30s       │
-│ a1b2c3d4      │ 321b561d │ 2026-07-18 12:15:00 │ worker-2 │ failed     │     5 │         0 │      1 │ 2m15s       │
-│ file-9a12bc34 │ -        │ 2026-07-18 12:10:00 │          │ malformed  │     0 │         0 │      1 │ -           │
-└───────────────┴──────────┴─────────────────────┴──────────┴────────────┴───────┴───────────┴────────┴─────────────┘
+┌───────────────┬─────────────────────┬──────────┬────────────┬───────┬───────────┬────────┬─────────────┐
+│ Task          │ Published           │ Agent    │ Status     │ Loops │ Files Out │ Errors │ Duration    │
+├───────────────┼─────────────────────┼──────────┼────────────┼───────┼───────────┼────────┼─────────────┤
+│ 321b561d      │ 2026-07-18 12:17:06 │ worker-1 │ completed  │    12 │         3 │      0 │ 8m30s       │
+│ a1b2c3d4      │ 2026-07-18 12:15:00 │ worker-2 │ failed     │     5 │         0 │      1 │ 2m15s       │
+│ file-9a12bc34 │ 2026-07-18 12:10:00 │          │ malformed  │     0 │         0 │      1 │ -           │
+└───────────────┴─────────────────────┴──────────┴────────────┴───────┴───────────┴────────┴─────────────┘
 ```
 
 **Status 列取值与含义**：
@@ -305,8 +291,6 @@ reason:               人类可读结果说明
  Task: 321b561d-c564-422c-bfa0-b96f54edcb87
  Trace Files: 2
  Events: 87
- Plan: 321b561d-c564-422c-bfa0-b96f54edcb87  revision=3  state_version=8  acceptance_revision=1
- Graph Digest: 6f6d5c...
 ════════════════════════════════════════════════════════════════════════════════
 [12:17:06.001] task_published
              by=scheduler deps=[] type=code_edit priority=high depth=0 desc="修复 integration_test.go"
@@ -317,8 +301,8 @@ reason:               人类可读结果说明
 [12:17:12.500] tool_call agent=worker-1 loop=0
              tool=read_file call_id=call-1 args={"path":"integration_test.go"}
 ...
-[12:25:36.000] plan_terminal
-             reason="pass" plan=321b561d... plan_revision=3 state_version=8 acceptance_revision=1 graph_digest=6f6d5c...
+[12:25:36.000] task_completed
+             output_len=1280
 ────────────────────────────────────────────────────────────────────────────────
  status=completed  agent=worker-1  loops=12  files_written=3  errors=0  duration=8m30s
 
@@ -332,35 +316,44 @@ reason:               人类可读结果说明
 
 `show` 接受完整 Task UUID 或任意可唯一消歧的前缀。它先按每条事件的完整 `task_id` 拆分可能发生短 ID 碰撞的物理文件，再合并同一 Task 的全部 retry 分片。`Trace Files` 是该逻辑 Task 涉及的物理文件数；与 list 中统计产出事件的 `Files Out` 不是同一概念。
 
-如果某个相关文件存在坏 JSON、部分读取失败，或多 Task 文件中有无法安全归属的空 `task_id` 事件，header 后会显示 `WARNING: timeline incomplete`。可归属的 `<parse_error>` 仍会留在时间线中，其他 Task 或 Plan 不会被无关坏文件阻断。
+如果某个相关文件存在坏 JSON、部分读取失败，或多 Task 文件中有无法安全归属的空 `task_id` 事件，header 后会显示 `WARNING: timeline incomplete`。可归属的 `<parse_error>` 仍会留在时间线中，其他 Task 不会被无关坏文件阻断。
 
-### 3.3 `agentgo trace plan <plan_id>` 输出
+### 3.3 `agentgo trace graph` / `agentgo trace node` 与 `graph_` 分片
 
-该命令先扫描 `plan.plan_id` 建立 Plan 成员 Task，再纳入每个逻辑 Task 的**全部物理分片和全部事件**，最后按时间戳、文件名、行序稳定排序。后续 retry 分片即使尚未再次携带 `Plan` payload，也会因完整 TaskID 的成员关系被纳入。Header 对三个单调版本字段分别取最高已观测值，Graph Digest 只与最高 Plan Revision 关联，避免 partial 或乱序 context 让版本回退。这样既能看到图版本/重规划/验收事件，也不会漏掉各节点的 LLM、工具和生命周期事件。
+V6 起 Graph 生命周期事件（`graph_submitted` / `node_activation_created` / `graph_transition_selected` / `graph_wait_started` / `graph_wait_resumed` / `graph_join_resolved` / `graph_approval_decided` / `graph_revision_committed` / `graph_change_requested` / `graph_ended` 等）携带 `graph_id` / `node_id` / `activation_id` 而不是 `task_id`。排查 Graph 编排的**首选入口**是两条专用命令（V6 §7.5）：
 
-```
-════════════════════════════════════════════════════════════════════════════════
- Plan: 321b561d-c564-422c-bfa0-b96f54edcb87
- Tasks: 4
- Trace Files: 6
- Events: 126
- Revision: 3  State Version: 8  Acceptance Revision: 1
- Graph Digest: 6f6d5c...
- Latest Acceptance: status=valid verdict=pass run=run-1 result=result-1
-════════════════════════════════════════════════════════════════════════════════
-[12:17:06.001] task=321b561d-c564-422c-bfa0-b96f54edcb87 task_published
-[12:18:10.100] task=a1b2c3d4-1111-2222-3333-444444444444 plan_revision_changed
-             reason="publish implementation" plan=321b561d-c564-422c-bfa0-b96f54edcb87 plan_revision=2 ...
-[12:25:36.000] task=e5f60718-5555-6666-7777-888888888888 acceptance_completed
-             plan=321b561d-c564-422c-bfa0-b96f54edcb87 acceptance_run=run-1 result=result-1 verdict=pass status=valid ...
-════════════════════════════════════════════════════════════════════════════════
+```bash
+# 无参：列出全部已知图（trace 事件 ∪ .agentgo/state/graphs 目录，去重，
+# 含状态与最近事件时间）
+agentgo trace graph
+
+# 按时间序展示一张图的全部生命周期事件；graph_id 可为完整 ID 或唯一前缀
+# （碰撞时列候选，与 task_id 前缀语义一致；子图 ID 含 /，同样按前缀匹配）
+agentgo trace graph deploy-pipeline
+
+# 只展示单个节点的事件，按 activation 分组（<node>@1、<node>@2……
+# 回边重进 = 新 activation，一目了然）；在最后一个 / 处切分图与节点
+agentgo trace node deploy-pipeline/implement
 ```
 
-`Tasks` 统计不同的完整 TaskID，`Trace Files` 统计这些 Task 涉及的不同物理文件。`plan_id` 可以是完整 ID 或唯一前缀；有多个匹配时 CLI 会列出候选。Plan 视图不会把跨任务事件整体套用任务级异常检测，避免把不同节点的读写和终态事实相互混淆。
+`trace graph <id>` 的输出分两段：
 
-### 3.4 `agentgo trace stats [task|agent|plan]` 输出
+- **Header**：graph_id、status、revision、state_version、digest、事件数、分片数。头部字段优先取自 `.agentgo/state/graphs/<graph_id>/snapshot.json`（压缩时才写，缺席属正常）；snapshot 缺席或不可读时由事件重建（revision/digest 取自 `graph_submitted` / `graph_revision_committed` 的 desc，status 以 `graph_ended` 校准）。
+- **时间线**：全部图事件按时间排序，activation/transition/wait/join/approval/revision/change/ended 行内展示 graph/node/activation/关键字段；携 `task_id` 的事件（`graph_change_requested`）以 `task=<前8位>` 引用形式展示，不合并任务时间线（任务细节走 `trace show <task_id>`）。
 
-该命令聚合当前 trace 目录内全部任务（含 retry 分片，按完整 TaskID 合并）的 `llm_call_end` 事件，回答"这个 session 的 token 都烧在哪"。token 只取自 `llm_call_end`（每次 LLM 调用一条）；`token_stats` 是 per-agent 累计值，不纳入以避免重复计数。
+**覆盖度标记（Coverage）**：
+
+| 标记 | 含义 |
+|---|---|
+| `complete` | 预期分片存在、贡献文件无坏行/读取失败、snapshot 可读或缺席 |
+| `partial` | 预期分片缺失（被 GC 或写入失败），或贡献分片有坏行/读取失败（会列明文件名与原因） |
+| `degraded` | snapshot.json 存在但不可读或与 graph_id 不符；头部由事件重建，时间线照常展示 |
+
+**`graph_` 分片说明**：不带 `task_id` 的 Graph 事件写入独立的 `graph_<graph_id前8位>.jsonl` 分片（与任务分片同目录，无时间戳前缀）；分片名中 `/`（子图分段符）、`:`（Windows 非法字符）等替换为 `~`，父子图可能共享分片，CLI 按事件里的完整 `graph_id` 精确归并。例外：`graph_change_requested` 携带请求者任务的 `task_id`，落在该任务的普通分片里——`trace graph/node` 会扫描全部分片按 GraphID 归并，无需人工翻找。需要直接看原始分片时仍可 `cat "$TRACE_DIR"/graph_*.jsonl | jq`。
+
+### 3.4 `agentgo trace stats [task|agent]` 输出
+
+该命令聚合当前 trace 目录内全部任务（含 retry 分片，按完整 TaskID 合并）的 `llm_call_end` 事件，回答"这个 session 的 token 都烧在哪"。token 只取自 `llm_call_end`（每次 LLM 调用一条，唯一 token 账本）。
 
 ```
 session 总计: 51 个任务, 467 次 LLM 调用, prompt=7.7M, completion=360.6k, 合计=8.1M tokens, 重试=8 次, 浪费=0 tokens (0%)
@@ -372,7 +365,7 @@ TASK      AGENT            CALLS   RETRIES  PROMPT     COMPLETION  TOTAL      WA
 ...
 ```
 
-- 分组维度：`task`（默认，每任务一行）/ `agent`（按执行者）/ `plan`（按所属 Plan，无 Plan 上下文的任务归入 `(no-plan)`）。
+- 分组维度：`task`（默认，每任务一行）/ `agent`（按执行者）。
 - **浪费口径**：终态为 `cancelled` / `failed` 的任务，其全部 LLM token 计入 `WASTED`——这些产出未被下游使用，是纯损失。`completed` 任务中间 retry 的消耗无法精确切分，经 `RETRIES` 列单列。
 - **异常提示**：表格后按 task 粒度输出高置信异常（规则刻意保守，与 `trace show` 的 9 条检测互不相关）：session 浪费占比 > 20%；单任务重试 >= 3 次；单任务消耗 > session 总量 40%（任务数 >= 3 时）；单任务 read_file 重读率 > 30%（总读取 >= 4 次；口径为重复全文读 + 相同 offset 重复分页，大文件顺序分页不计，Layer-1 snip 后的重读循环信号）。
 
@@ -424,7 +417,7 @@ CLI 的 `trace show` 在末尾自动运行 9 条启发式异常检测。以下�
 
 **排查**：
 - 查看每次 `history_compaction` 的 `tokens_before` 值，评估触发时的上下文大小
-- 检查 Agent 的 MaxLoops 和 ContextLimit 配置是否合理
+- 检查 Agent 的 ContextLimit 与历史压缩阈值配置是否合理
 - 确认压缩策略 (`strategy` 字段) 是否正确执行
 
 ---
@@ -447,7 +440,7 @@ CLI 的 `trace show` 在末尾自动运行 9 条启发式异常检测。以下�
 ### 异常 6：Agent 卡在等待用户 Interaction
 **检测**：Agent 在 `waiting_interaction` 状态累计超过 5 分钟
 
-**含义**：Agent 正在等待结构化用户选择，例如 Plan 评审、Plan 暂停选择或 Shell 精确命令授权，但长时间未收到回答。
+**含义**：Agent 正在等待结构化用户选择，例如 Graph approval 审批、agent_question 澄清或 Shell 精确命令授权，但长时间未收到回答。
 
 **排查**：
 - 查看 `agent_state_changed` 事件，确认 `interaction_wait_start` / `interaction_wait_end` 以及进入、退出 `waiting_interaction` 的时间点
@@ -530,17 +523,17 @@ grep '"kind":"tool_call"' <file>.jsonl | jq '{loop, tool, call_id}' | head -20
 ### 场景 C：排查"Agent 消耗太多 Token / 钱"
 
 ```bash
-# 1. 查看 token_stats 累计
-grep '"kind":"token_stats"' <file>.jsonl | jq '{total_prompt_tokens, total_completion_tokens, call_count}'
-
-# 2. 统计每轮 LLM 调用的 token 消耗曲线
+# 1. 统计每轮 LLM 调用的 token 消耗曲线（llm_call_end 是唯一 token 账本）
 grep '"kind":"llm_call_end"' <file>.jsonl | jq '{loop, prompt_tokens, completion_tokens, duration_ms}'
 
-# 3. 检查历史膨胀
-grep '"kind":"history_truncated"' <file>.jsonl | jq '{prompt_tokens_before, prompt_tokens_after, kept_entries}'
+# 2. 按 agent 聚合 token 消耗
+grep '"kind":"llm_call_end"' <file>.jsonl | jq -s 'group_by(.agent_id) | map({agent: .[0].agent_id, prompt: (map(.prompt_tokens // 0) | add), completion: (map(.completion_tokens // 0) | add), calls: length})'
 
-# 4. 如果 history_truncated 频繁出现且 prompt_tokens_before 远大于 after
-#    → Agent 的上下文管理有问题，可能需要减少 MaxLoops 或改进压缩策略
+# 3. 检查历史压缩（V6 起固定硬截断已删除，上下文适配靠压缩与溢出重试）
+grep '"kind":"history_compaction"' <file>.jsonl | jq '{prompt_tokens_before, kept_entries, strategy}'
+
+# 4. 如果 prompt_tokens 持续增长逼近模型窗口
+#    → 调低 enforce_compact_token_threshold 让压缩更早触发，或拆分任务缩短上下文
 ```
 
 ### 场景 D：排查"Agent 为何失败/取消"
@@ -553,7 +546,7 @@ agentgo trace show <task_id>
 #    查看 transition.cause、reason 和 cancel_source 字段
 
 # 3. 常见失败原因映射：
-#    cause=max_loops_exceeded → Agent 循环次数用完
+#    cause=runtime_loop_fuse → emergency loop fuse 触发（程序性死循环兜底，任务已 blocked）
 #    cause=recoverable_error_retries_exhausted → 可恢复错误重试耗尽
 #    cause=non_recoverable_error → 遇到不可恢复的错误
 #    cause=react_loop_exit:panic → 程序 panic（bug）
@@ -598,21 +591,13 @@ grep '"kind":"file_write_queued"' "$TRACE_DIR/<file>.jsonl" | jq '{path, descrip
 | `file_write_queued` | 文件冲突排队 | `internal/tools/local_write.go` |
 | `agent_state_changed` | SetState 调用时 | `internal/agent/state.go` (:124-134) |
 | `history_compaction` | 上下文压缩 | `internal/agent/` |
-| `history_truncated` | 上下文截断 | `internal/agent/agent.go` (:616+) |
-| `token_stats` | 每轮 LLM 调用后 | `internal/agent/` |
 | `progress_notify` | 进度通知 | `internal/agent/progress_notify.go` |
 | `error` | Reactor Sync 失败等 | `internal/reactor/reactor.go` (:164-193) |
 | `reactor_spawn_depth_exceeded` | Reactor spawn 深度超限 | `internal/reactor/` |
 | `shell_executed` | Shell 命令执行完 | `internal/tools/` |
 | `shell_timeout_pending` | Shell 超时检测 | `internal/tools/` |
 | `shell_timeout_resolved` | Shell 超时决策 | `internal/tools/` |
-| `replan_requested` | Task 终态、工具或 Reactor 请求重新规划 | `internal/bootstrap/plan_runtime.go`, `internal/tools/plan_control.go` |
-| `replan_coalesced` | Scheduler 聚合多个 PlanSignal | `internal/scheduler/executor.go` |
-| `replan_decided` | Scheduler 确认观察到的事实与决策 | `internal/scheduler/executor.go` |
-| `acceptance_completed` | 正式验收结果持久化后 | `internal/tools/plan_control.go` |
-| `plan_revision_changed` | 新节点注册或节点替代后 | `internal/bootstrap/plan_runtime.go`, `internal/tools/plan_control.go` |
-| `plan_paused` | Plan 进入暂停/阻塞边界 | `internal/bootstrap/plan_runtime.go`, `internal/scheduler/executor.go` |
-| `plan_terminal` | Plan 终态持久化后 | `internal/tools/plan_control.go` |
+| `graph_*`（10 种 Graph 事件） | Graph Runtime 生命周期 | `internal/graph/runtime.go`, `internal/tools/graph_control.go`, `internal/tools/plan_control.go`（graph change 请求） |
 
 ---
 
@@ -634,6 +619,32 @@ cat <file>.prompts.jsonl | jq 'select(.type=="response") | .choices[0].message.c
 ```
 
 **注意**：Prompt dump 文件可能比主 trace 大 10-50 倍，不建议默认开启。仅在需要深入调查 LLM 行为时临时开启。
+
+---
+
+## 7.5 事件身份、默认脱敏与降级标记（V6 §7）
+
+### 事件身份字段
+
+- `session_id`：事件所属 Session，由 Writer 集中盖戳（Emit 时为空才补上当前绑定 Session；无活跃 Session 时不输出）。
+- `invocation_id`：同一次 LLM 调用的关联身份，格式 `<taskID前8>-<loop>-<seq>`。同一轮的 `llm_call_start` / `llm_call_end` / `context_manifest_built` 三条事件带相同值，可用 `jq 'select(.invocation_id=="...")'` 精确捞取一轮调用。
+
+### 默认脱敏（schema-aware redaction）
+
+工具事件（`tool_call` / `tool_result`）的 `args` 与 `shell_executed` 的命令自 V6 §7.4 起默认脱敏：
+
+| 类别 | 字段 | 处理 |
+|---|---|---|
+| 结构字段 | `path` / `url` / `name` / `kind` / `event_type` / `to` / `status` / `verdict` / `event` 等 | 原样保留（Reactor 消费面不受影响） |
+| 截断保留 | `command` / `expected_artifacts` | 保留前 200 字符 + 截断标记 |
+| 自由内容 | `content`（write_file / send_message）、`old_str` / `new_str`（edit_file）、`description`（publish_task） | 替换为 `<redacted len=N sha256=前12>` |
+| 其余字段 | 未列名 | 标量保留；>200 字符的字符串（或 JSON 超长的 map/slice）按 `<redacted>` 占位替换 |
+
+开发调试需要完整参数时设置 `AGENTGO_TRACE_FULL_ARGS=1`（与 `AGENTGO_DUMP_PROMPTS` 同级的显式开关）整体旁路脱敏。
+
+### trace_degraded 降级标记
+
+Writer 连续写失败（首次失败即触发）时在 trace 目录落 `trace_degraded.marker`（JSON：首次失败时间、错误、连续失败次数），并经 log + UI status 通道告警；写恢复后自动清除。`agentgo trace list/show` 检测到 marker 时在 header 打 `trace_degraded` 提示——看到它意味着期间事件可能不完整。
 
 ---
 
@@ -665,10 +676,11 @@ agentgo trace show <task_id>
 ### 8.3 跨任务关联分析
 
 ```bash
-# 动态 DAG：优先使用内置 Plan 聚合视图
-agentgo trace plan <plan_id>
+# Graph 多节点编排：先看图级时间线与单节点 activation（V6 §7.5）
+agentgo trace graph <graph_id>
+agentgo trace node <graph_id>/<node_id>
 
-# 非 Plan 任务：可继续按 Agent 或事件手工对比
+# 非图任务：可继续按 Agent 或事件手工对比
 # 对比同一 Agent 的多个任务
 for f in "$TRACE_DIR"/*.jsonl; do
   echo "=== $(basename $f) ==="
@@ -706,7 +718,7 @@ done
 
 Trace 事件流是 Reactor 子系统的**唯一真相源**。当 debug Reactor 行为（如"为什么这个 Reactor 没触发？"）时：
 
-1. 先用 `agentgo trace show <task_id>` 确认单任务事件；动态 DAG 用 `agentgo trace plan <plan_id>` 检查跨任务事件顺序
+1. 先用 `agentgo trace show <task_id>` 确认单任务事件；Graph 编排的任务再用 `agentgo trace graph <graph_id>` 确认跨节点事件顺序
 2. 确认事件的 `transition.cause` / `cancel_source` 等字段是否与 Reactor 的 YAML `when:` 条件匹配
 3. Reactor 执行失败时会 emit `kind=error` 事件到 trace，可在时间线上直接看到
 
@@ -718,13 +730,13 @@ Trace 事件流是 Reactor 子系统的**唯一真相源**。当 debug Reactor �
 
 - [ ] 运行 `agentgo trace list`，确认任务 status
 - [ ] 运行 `agentgo trace show <task_id>`，查看完整事件时间线
-- [ ] 若任务属于动态 DAG，运行 `agentgo trace plan <plan_id>`，确认 revision / replan / acceptance / terminal 链路
+- [ ] 若任务属于 Graph 编排，运行 `agentgo trace graph <graph_id>`（或 `trace node <graph_id>/<node_id>`），确认 activation / transition / approval / ended 链路
 - [ ] 检查异常检测输出（9 条规则）
 - [ ] 查看最后一次 `agent_state_changed`——Agent 最后是什么状态？
 - [ ] 查看最后一条 `tool_call`——Agent 卡在什么工具上？
 - [ ] 查看 `llm_call_end` 的最后一条——finish_reason 是什么？
-- [ ] 如果 token 消耗异常，查看 `token_stats` 累计值
-- [ ] 如果上下文可能有问题，查看 `history_compaction` / `history_truncated`
+- [ ] 如果 token 消耗异常，用 `llm_call_end` 聚合（见场景 C）或运行 `agentgo trace stats`
+- [ ] 如果上下文可能有问题，查看 `history_compaction`
 - [ ] 如果是失败任务，查看 `task_failed.transition.cause`
 - [ ] 如果是取消任务，查看 `task_cancelled.transition.cancel_source`
 

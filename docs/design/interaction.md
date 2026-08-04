@@ -97,47 +97,17 @@ pending           ──Expire────▶ expired
 }
 ```
 
-这条路径适用于澄清需求或让用户在普通方案间选择。它不替代 `submit_plan_for_review`、`plan_pause` 或 `shell_command` authorization；这些用途仍由受信任控制面创建并执行领域 effect。
+这条路径适用于澄清需求或让用户在普通方案间选择。它不替代 Graph approval 节点或 `shell_command` authorization；这些用途仍由受信任控制面创建并执行领域 effect。
 
-## 4. Plan 集成
+## 4. Graph approval 集成（V6）
 
-### 4.1 `plan_review`
+Plan 时代的 `plan_review` / `plan_pause` 集成已随 Plan 控制面删除（`submit_plan_for_review`、`Plan.Review`、`paused_awaiting_decision` 调和、PlanStore CAS 绑定均不存在了）。执行前审阅改由 **Graph approval 节点**承担：
 
-`gate=plan` 时 Scheduler 调用 `submit_plan_for_review`，把完整计划正文写入 `Plan.Review`，再以 `PauseReason=plan_review` 挂起。控制面从该持久化事实生成：
+- Graph Runtime 激活 approval 节点时，经 `ApprovalGateway`（`internal/bootstrap/graph_approval.go`）创建 `KindAuthorization` / `Purpose=graph_approval` 的 Interaction，选项为批准 / 拒绝，请求携带 graph_id、node_id、activation_id；
+- Interaction Service 决议进入终态（resolved / cancelled / expired / failed / interrupted）后，经 `Service.SetOnResolved` 回调映射为 `Runtime.OnApprovalDecided`——批准得 `approved`、其余得 `rejected`（附原因文本），写回节点 Result 并驱动 `{event: approved|rejected}` 边条件；
+- 审批决议的幂等身份是 `(graph_id, activation_id)`：进程重启后已记录 requestID 的挂起节点不会重复发起请求，决议也只生效一次。
 
-| Option ID | 展示含义 | 服务端 effect |
-|---|---|---|
-| `execute_plan` | 执行计划 | 从已审阅正文创建新 controller 并恢复 Plan |
-| `revise_plan` | 要求修改 | 要求非空反馈，创建修订 controller；修订后重新提交评审 |
-| `cancel_request` | 取消请求 | 终止 Plan 并取消剩余 Task |
-
-### 4.2 `plan_pause`
-
-预算耗尽、连续无进展或外部条件阻塞时，控制面生成：
-
-| Option ID | 展示含义 | 服务端 effect |
-|---|---|---|
-| `continue_bounded` | 限额继续 | 对每个当前非零预算增加 25% 的有界额度并恢复执行 |
-| `converge_delivery` | 收敛交付 | 同样增加有界额度，并要求只完成最小可验收交付 |
-| `terminate_plan` | 终止请求 | 终止 Plan 并取消剩余 Task |
-
-零预算表示原本不设限；有界继续不会把它改成有限值。continue/converge 都持久化 `ExecutionOverride`，包括 resolution、预算增量、授权者、原因与时间。
-
-### 4.3 PlanStore CAS 与恢复
-
-创建 Interaction 时绑定：
-
-- Plan ID；
-- `ExecutionStateVersion`；
-- `CurrentGraphDigest`；
-- pause reason；
-- gate、exec、topo 三轴模式。
-
-应用 effect 前必须重新读取 PlanStore 并逐项核对。任何一项变化都表示回答已陈旧；handler 必须失败，不能把旧选择套用到新图。模式 Store 还会把“核对三轴快照”到“提交 Plan effect”置于与模式 setter 共用的串行化边界内，避免校验后、提交前的 TOCTOU 漂移。controller Task 先以预留 ID 写入 TaskStore，再在单个 PlanStore 原子事务中恢复 Plan 并转移 `ActiveDecisionTaskID`；预发布失败时 Plan 保持暂停。Plan 终止 effect 一旦提交，后续任务扫尾失败只会产生警告，Interaction 仍完成，不会重新开放一个已生效的选择。
-
-Interaction Service 是进程内运行时协调层。`SessionID` 只记录请求创建时的审计归属；任务可跨 `/session` 切换继续运行，因此切换 Session 不会隐藏或取消旧 Session 创建的 pending 请求。启动或轮询时，reconciler 根据 PlanStore 中仍处于 `paused_awaiting_decision` 的事实补建缺失请求，因此前端断开或进程重启不会把 PlanStore 执行事实降级为 UI 状态。
-
-`/plan` 用于定位和列出 Plan/Interaction。任何保留的旧命令兼容入口也只能转换成同一份 `ResolveInput`，进入相同 CAS/effect 管线，不能直接修改 PlanStore 或形成第二条用户决定路径。
+Interaction Service 是进程内运行时协调层。`SessionID` 只记录请求创建时的审计归属；任务可跨 `/session` 切换继续运行，因此切换 Session 不会隐藏或取消旧 Session 创建的 pending 请求。
 
 ## 5. Shell 精确命令授权
 
@@ -181,6 +151,12 @@ Shell 是通用两阶段协议的受控适配：Interaction handler 锁定并完
 | `allow_session` | 执行当前写入，并把服务端捕获的**确切路径**记入该 agent 实例的进程内放行集 |
 
 授权记录绑定工具名、路径、`SHA-256(tool + NUL + path + NUL + SHA-256(payload))`（payload：write_file=content，edit_file=`old_str + NUL + new_str`）、AgentID、TaskID；`Await` 返回后逐项复核，篡改即 fail closed。`allow_session` 的进程内记忆粒度为确切路径（`filepath.Clean` 归一），不跨 agent 共享、进程退出不持久化——目录级粒度留待后续版本。Bootstrap 的 `file_write` handler 与 `shell_command` 同为服务端零 effect：写文件副作用只由等待中的工具 wrapper 执行。`exec` 为其它档位时包装器完全透传（`readonly` 由 `exec-mode-guard` Gate 在 PreCall 阶段拦截，不经过该 wrapper）。
+
+### 5.3 图审批（`graph_approval`，C5c）
+
+V6 Graph 的 `approval` 节点激活时经 bootstrap 装配的 `graph.ApprovalGateway` 桥（`internal/bootstrap/graph_approval.go`）创建 `KindAuthorization` / `Purpose=graph_approval` Interaction，选项两项：`approve`（批准）/ `reject`（拒绝，允许附文本）。请求 ID 由 `(graph_id, activation_id)` 确定性派生（SHA-256 截断），崩溃窗口后的补发与重启后的 rearm 都凭它幂等去重；图身份（graph/node/activation）写入请求 Metadata，不依赖进程内索引。
+
+与 `shell_command` / `file_write` 相同，其 Resolution handler（`graph_approval`）是**服务端零 effect**：`resolveInteraction` 只锁定回答并 Complete。决议回填走另一条路——`interaction.Service.SetOnResolved` 终态回调（单槽位挂点，`resolved` 按选中 option 定批准/拒绝，`cancelled`/`expired`/`failed`/`interrupted` 一律映射为 rejected 并载明原因），回调内异步调用 `Runtime.OnApprovalDecided`（Runtime 锁纪律：网关的 `RequestApproval` 在 Runtime 锁内同步执行，不得回调 Runtime）。Interaction 是内存服务不跨重启：bootstrap 在恢复非终态图后为 waiting 的 approval 节点按 durable `request_id` 幂等补登记（`rearmPendingGraphApprovals`），既有请求已到终态的立即补回填一次。
 
 ## 6. TUI 与 Web 契约
 

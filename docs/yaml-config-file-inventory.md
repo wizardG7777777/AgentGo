@@ -38,7 +38,6 @@ llm:
   api_key: "${DEEPSEEK_API_KEY}"       # 必填，环境变量
   default_model: "deepseek-chat"
   timeout_sec: 120
-  provider: "openai-compatible"         # 可选: openai-compatible / anthropic
 
 # ── 工具配置集 ──
 tool_profiles:
@@ -57,9 +56,7 @@ tool_profiles:
 
 scheduler:
   model: "deepseek-reasoner"
-  agent_max_loops: 50
   enforce_compact_token_threshold: 80000
-  context_limit: 200000
 
 agents:
   - kind: worker
@@ -67,9 +64,7 @@ agents:
     profile: worker_standard
     model: "deepseek-chat"
     system_prompt_file: prompts/worker.md
-    agent_max_loops: 10
     task_max_retries: 3
-    context_limit: 16000
 
   - kind: explorer
     replicas: 1
@@ -77,8 +72,6 @@ agents:
     profile: explorer_full
     model: "deepseek-reasoner"
     system_prompt_file: prompts/explorer.md
-    agent_max_loops: 5
-    context_limit: 8000
 
 project_root: "."
 infra:
@@ -104,8 +97,7 @@ search_api_key: "${SERPAPI_API_KEY}"
 
 **特点**:
 - `tool_profiles` 用 YAML 列表格式（`- name: xxx` + `tools: [...]`）
-- provider 默认 `openai-compatible`，模型用 `deepseek-chat`
-- explorer context_limit 仅 8000（偏小，实测 scheduler 首调 prompt_tokens 已达 8525）
+- llm 块不再含 `provider` 字段（V6 已移除，读到即返回迁移诊断错误），模型用 `deepseek-chat`
 
 ---
 
@@ -117,7 +109,6 @@ search_api_key: "${SERPAPI_API_KEY}"
 
 | 差异项 | config.example.yaml | general.yaml |
 |--------|-------------------|--------------|
-| LLM provider | `openai-compatible` | `deepseek` |
 | `max_concurrent_agents` | **不存在** | **5**（general.yaml 特有字段） |
 | tool_profiles 格式 | 列表格式 | 映射格式（`profile_name: [tools]`） |
 | YAML anchor | 无 | `&worker_base` / `<<: *worker_base` 复用示例 |
@@ -138,7 +129,6 @@ search_api_key: "${SERPAPI_API_KEY}"
 |----------|-----|
 | `llm.base_url` | `https://api.deepseek.com` |
 | `llm.default_model` | `deepseek-v4-pro` |
-| `llm.provider` | `deepseek` |
 | `scheduler.model` | `deepseek-v4-pro` |
 | `agents[worker].model` | `deepseek-v4-flash` |
 | `agents[worker].replicas` | 3 |
@@ -188,7 +178,6 @@ search_api_key: "${SERPAPI_API_KEY}"
 
 **其他值得注意的差异**（相对 setting.v4.yaml）:
 - `enforce_compact_token_threshold: 10000`（而非默认 4000）
-- `agents[explorer].context_limit: 16000`（而非默认 8000，因为实测 scheduler 首调已达 8525 tokens）
 
 ---
 
@@ -227,7 +216,6 @@ project_root: "."
 | **角色** | 英文模板 | 中文模板 | 运行配置 | 运行配置(v4) | 并发测试 | 最简启动 |
 | **编码** | UTF-8 | UTF-8 | UTF-16 LE ⚠️ | UTF-8 | UTF-8 | UTF-8 |
 | **行数** | ~173 | ~171 | ~156 | ~164 | ~159 | 16 |
-| **LLM provider** | openai-compatible | deepseek | deepseek | deepseek | deepseek-v4-pro | openai-compatible |
 | **default_model** | deepseek-chat | deepseek-chat | deepseek-v4-pro | deepseek-v4-pro | deepseek-v4-flash | deepseek-chat |
 | **scheduler.model** | deepseek-reasoner | deepseek-reasoner | deepseek-v4-pro | deepseek-v4-pro | deepseek-v4-pro | — |
 | **worker.model** | deepseek-chat | deepseek-chat | deepseek-v4-flash | deepseek-v4-flash | deepseek-v4-flash | — |
@@ -237,7 +225,6 @@ project_root: "."
 | **tool_profiles 格式** | 列表 | 映射 | 列表 | 列表 | 映射 | 列表 |
 | **max_concurrent_agents** | — | **5** | — | — | — | — |
 | **max_loops** | — | — | — | — | — | **10** |
-| **context_limit (explorer)** | 8000 | 8000 | 8000 | 8000 | **16000** | — |
 | **compact_threshold** | 4000 | 4000 | 4000 | 4000 | **10000** | — |
 | **邮件通知** | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | **启动探针** | tcp | tcp | tcp | tcp | tcp | — |
@@ -276,7 +263,7 @@ general.yaml (最详尽中文模板, ~171行)
 | `api_key` | string | — | ✅ | API 密钥，支持 `${ENV_VAR}` 环境变量引用 |
 | `default_model` | string | — | ✅ | 全局默认模型，所有 agent 的后备 |
 | `timeout_sec` | int | 120 | ❌ | 单次 LLM 请求超时秒数 |
-| `provider` | string | `"openai-compatible"` | ❌ | `openai-compatible` / `anthropic` / `deepseek` / `deepseek-v4` / `deepseek-v4-pro` / `deepseek-r1` |
+| ~~`provider`~~ | — | — | — | **V6 已移除**：AgentGo 只实现 OpenAI-compatible Chat Completions；旧配置保留该字段会在 Validate 返回迁移诊断错误 |
 
 ### 5.2 工具配置集 (`tool_profiles:`)
 
@@ -301,9 +288,7 @@ general.yaml (最详尽中文模板, ~171行)
 | 配置项 | 类型 | 默认值 | 必需 | 说明 |
 |--------|------|--------|------|------|
 | `model` | string | 继承 `llm.default_model` | ❌ | scheduler 专用模型覆盖 |
-| `agent_max_loops` | int | 50 | ❌ | 单个 Scheduler Task 的 ReAct 循环上限；0 使用默认值 |
 | `enforce_compact_token_threshold` | int | 80000 | ❌ | 单任务累计 prompt token 的一次性历史压缩阈值；0 使用默认值 |
-| `context_limit` | int | 200000 | ❌ | 预测下一轮 prompt 的硬截断预算；0 使用默认值，不改变模型真实窗口 |
 
 ### 5.4 Agent 节点配置 (`agents[]:`)
 
@@ -315,10 +300,8 @@ general.yaml (最详尽中文模板, ~171行)
 | `profile` | string | — | ✅ | 引用 `tool_profiles` 中的名称 |
 | `model` | string | 继承 `llm.default_model` | ❌ | 覆盖该 kind 的模型 |
 | `system_prompt_file` | string | — | ✅ | 系统提示词文件路径 |
-| `agent_max_loops` | int | 10 | ❌ | 单次任务最大推理循环数 |
 | `task_max_retries` | int | 3 | ❌ | 任务失败最大重试次数 |
 | `enforce_compact_token_threshold` | int | 4000 | ❌ | 触发上下文压缩的 token 阈值 |
-| `context_limit` | int | 16000 | ❌ | 上下文窗口大小上限 |
 
 ### 5.5 基础设施 (`infra:`)
 
@@ -386,7 +369,9 @@ general.yaml (最详尽中文模板, ~171行)
 
 ### ❌ 可选（有合理默认值）
 
-`llm.timeout_sec`(120), `llm.provider`("openai-compatible"), `scheduler.agent_max_loops`(50), `scheduler.enforce_compact_token_threshold`(80000), `scheduler.context_limit`(200000), `agents[].event_type`(""), `agents[].agent_max_loops`(10), `agents[].task_max_retries`(3), `agents[].enforce_compact_token_threshold`(4000), `agents[].context_limit`(16000), `infra.*`(见上表), `project_root`("."), `max_subtask_depth`(3), `shell_timeout_sec`(60), `shell_blacklist`([]), `shell_greylist`([]), `search_api_provider`("serper"), `startup_probe`("tcp"), `startup_probe_timeout_sec`(5), `startup_probe_failure_action`("warn")
+`llm.timeout_sec`(120), `scheduler.enforce_compact_token_threshold`(80000), `agents[].event_type`(""), `agents[].task_max_retries`(3), `agents[].enforce_compact_token_threshold`(4000), `infra.*`(见上表), `project_root`("."), `max_subtask_depth`(3), `shell_timeout_sec`(60), `shell_blacklist`([]), `shell_greylist`([]), `search_api_provider`("serper"), `startup_probe`("tcp"), `startup_probe_timeout_sec`(5), `startup_probe_failure_action`("warn")
+
+> V6 移除项（不再出现在默认值清单，显式设置报迁移诊断）：`llm.provider`、`scheduler.agent_max_loops`、`agents[].agent_max_loops`、`scheduler.context_limit`、`agents[].context_limit`。
 
 ---
 
@@ -416,7 +401,6 @@ llm.default_model           ← 全局默认（必须设置）
 | # | 问题 | 严重程度 | 建议 |
 |---|------|----------|------|
 | 1 | `setting.yaml` 为 UTF-16 LE 编码 | ⚠️ 中 | 迁移到 `setting.v4.yaml`（UTF-8），删除或重命名旧文件 |
-| 2 | `config.example.yaml` 中 explorer `context_limit: 8000` 偏小 | ⚠️ 中 | 实测 scheduler 首调已 8525 tokens，建议上调至 16000 |
-| 3 | `setting.test-concurrent.yaml` 中 `llm.provider: deepseek-v4-pro` 疑似笔误 | ⚠️ 低 | provider 应为 `deepseek`，`deepseek-v4-pro` 是模型名 |
+| 3 | ~~`setting.test-concurrent.yaml` 的 `llm.provider` 取值笔误~~ | ✅ 已解决 | `llm.provider` 字段已于 V6 整体移除，各配置文件中的该字段已同步删除 |
 | 4 | 文件数量多（6 个），部分功能重叠 | 💡 低 | 考虑: 保留 `config.example.yaml`（模板）+ `setting.yaml`（UTF-8 修复后）+ `setting.test-concurrent.yaml`，归档其余 |
 | 5 | `setting.test-concurrent.yaml` 含硬编码 api_key | 🔴 高 | 应立即替换为 `${DEEPSEEK_API_KEY}` 环境变量引用 |

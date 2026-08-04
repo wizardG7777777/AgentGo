@@ -26,7 +26,7 @@ AgentGo 有两类 YAML 文件：
 
 ### ⚠️ v3→v4 迁移注意
 
-v3 顶层字段已整体删除（`worker_count`、`agent_max_loops`、`llm_base_url`、`llm_api_key` 等 20+ 字段）。旧 `setting.yaml` 仍可解析（未知字段静默忽略），但不再产生运行时效果。**v4 块状 schema 是自 2026-04-26 起唯一支持的格式。**
+v3 顶层字段已整体删除（`worker_count`、`agent_max_loops`（顶层）、`llm_base_url`、`llm_api_key` 等 20+ 字段）。旧 `setting.yaml` 仍可解析（未知字段静默忽略），但不再产生运行时效果。**v4 块状 schema 是自 2026-04-26 起唯一支持的格式。** 另注：v4 块内的 `agent_max_loops`（agents[]/scheduler）与 `llm.provider` 已于 V6 移除——显式设置不再是静默忽略，而是启动期迁移诊断错误，请直接删除这些字段。
 
 ---
 
@@ -40,7 +40,6 @@ llm:
   api_key: ${OPENAI_API_KEY}            # 必填，支持 ${ENV_VAR}
   default_model: gpt-4o                 # 必填，agents[*].model 缺省回退值
   timeout_sec: 120                      # 必填
-  provider: openai                      # 可选：openai / deepseek-v4 / deepseek-r1
 ```
 
 - `${ENV_VAR}` 走 `os.ExpandEnv`，可替换 YAML 中任意字段的值
@@ -102,10 +101,8 @@ agents:
     # tools: [read_file, write_file]    # ↑↓ 二选一
     model: gpt-4o                        # 可选，覆盖 llm.default_model
     system_prompt_file: prompts/worker.md  # 必填，文件须存在且可读
-    agent_max_loops: 10                  # 必填，> 0
     task_max_retries: 3                  # 必填，> 0
     enforce_compact_token_threshold: 4000  # 必填，> 0
-    context_limit: 16000                 # 必填，> 0
     description: |                       # 可选，给 scheduler 看的一句话角色描述
       通用工作代理。能写文件、跑 shell。
 ```
@@ -123,19 +120,17 @@ agents:
 - `profile` / `tools` **恰好一个**非空（互斥）
 - `profile` 引用的名字必须在 `tool_profiles:` 中存在
 - `system_prompt_file` 路径须存在且可读；不能含反斜杠 `\`
-- 四个行为参数全部 `> 0`
+- 两个行为参数（`task_max_retries` / `enforce_compact_token_threshold`）全部 `> 0`（`context_limit` 已于 V6 移除，显式设置报迁移诊断）
 
 ### 2.4 `scheduler:` — Scheduler 配置（可选）
 
 ```yaml
 scheduler:
   model: gpt-4o
-  agent_max_loops: 50                    # 省略/0 = 50
   enforce_compact_token_threshold: 80000 # 省略/0 = 80000
-  context_limit: 200000                  # 省略/0 = 200000
 ```
 
-Scheduler 在 v5 是 `agent.Agent` 一等代理实例（Phase 3 重构后保持），工具集 = Worker 全集 + SchedulerGroup + MetaGroup。循环和历史预算复用同一 `agent.Agent.processTask` 实现；`context_limit` 只控制 AgentGo 的历史截断，不能扩大模型服务端 context window。
+Scheduler 在 v5 是 `agent.Agent` 一等代理实例（Phase 3 重构后保持），工具集 = Worker 全集 + SchedulerGroup + MetaGroup。循环和历史预算复用同一 `agent.Agent.processTask` 实现。
 
 ### 2.5 `infra:` — 基础设施（可选，不写用默认值）
 
@@ -225,7 +220,7 @@ infra:
 
 | 功能 | 状态 | 缺失项 |
 |------|------|--------|
-| Memory System | ⚠️ 部分实现 | ScopeSession/ScopeProject 后端未实现；向量检索返回 `ErrNotImplemented` |
+| Memory System | ⚠️ 部分实现 | ScopeSession/ScopeProject 后端未实现 |
 | Tool Upgrade Plan | ❌ 未实现 | `shell_commands.yaml` 不存在；`ShellCommandGate`、`TimeoutHandler` 不存在 |
 | Hallucination Audit | ❌ 未实现 | CitationVerifierHook、RetrievalGate、E2E 测试基线均不存在 |
 
@@ -281,10 +276,8 @@ agents:
     replicas: 2
     profile: worker_standard
     system_prompt_file: prompts/worker.md
-    agent_max_loops: 15
     task_max_retries: 3
     enforce_compact_token_threshold: 4000
-    context_limit: 16000
     description: |
       通用工作代理。能读写文件、跑 shell、检索网络；
       适合落盘类执行任务，不擅长纯调研。
@@ -294,18 +287,14 @@ agents:
     event_type: explore
     profile: explorer_full
     system_prompt_file: prompts/explorer.md
-    agent_max_loops: 10
     task_max_retries: 2
     enforce_compact_token_threshold: 4000
-    context_limit: 32000
     description: |
       广度优先调研代理。不写文件，仅返回 Markdown 文字回复。
 
 scheduler:
   model: gpt-4o
-  agent_max_loops: 50
   enforce_compact_token_threshold: 80000
-  context_limit: 200000
 
 infra:
   watchdog:

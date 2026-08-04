@@ -1,6 +1,6 @@
 # KNOWN_ISSUES — 当前限制与验证缺口
 
-最后核对：2026-07-29。
+最后核对：2026-08-03。
 
 本文件只记录当前仍会影响使用、开发或发布判断的限制。2026-07-18 UI Hub 改造的 41 项问题均已修复，原始核查与测试证据已归档至 [ui-hub-remediation-2026-07-18.md](../archived/ui-hub-remediation-2026-07-18.md)。2026-07-20 验收事实核验失败循环与级联取消事故已修复，证据归档至 [acceptance-fact-verification-and-cascade-incident-2026-07-20.md](../archived/acceptance-fact-verification-and-cascade-incident-2026-07-20.md)。2026-07-21 artifact 路径归一化缺陷导致的验收马拉松事故已修复，证据归档至 [artifact-path-normalization-incident-2026-07-21.md](../archived/artifact-path-normalization-incident-2026-07-21.md)。2026-07-21 验收空转（6 次 AcceptanceRun）与 Scheduler 篡改工作区事故已修复，证据归档至 [acceptance-spin-and-env-mutation-incident-2026-07-21.md](../archived/acceptance-spin-and-env-mutation-incident-2026-07-21.md)。2026-07-22 浪费可观测化专项落地：TUI 顶栏新增 session 级 token 总计（Hub 进程级累加器喂入，ad-hoc 团队销毁后消耗不隐形）；trace CLI 新增 stats 子命令（task/agent/plan 三维度 token 聚合 + 浪费口径 + 异常提示，见 TraceGuide §3.4）；watchdog 为 pending 级联取消补发 task_cancelled 事件（此前排队中的级联取消在 trace 中不可见）；修正 detectAnomalies 第 9 条从不命中的死检查（cancel_source 实际值为 dependency_failure）。2026-07-27 Windows ConPTY 长多行粘贴被固定 100ms Enter 防抖切成多条请求的问题已修复，状态机与回归证据归档至 [windows-tui-multiline-paste-incident-2026-07-27.md](../archived/windows-tui-multiline-paste-incident-2026-07-27.md)。2026-07-27 shell 旁路写入（`run_shell` 写文件不产生 `file_written` 事件）导致 artifact 账本缺失、`expected_artifacts` 校验假阴性的问题已修复：record-artifact Reactor 现订阅 `KindShellExecuted`，成功命令后对任务声明的 ExpectedArtifacts 做盘后补登（幂等、workspace 感知、回归测试见 `internal/reactor/builtin/record_artifact_test.go`）。2026-07-27 plan 楔死事故（验收目标含失败节点：验收 runner 认领闸要求 completed 而永远 pending、supersede 不改写 acceptance 节点依赖边被 digest 校验回滚、run 创建零预警）已修复：验收 runner（AcceptanceRunID 非空）依赖只需终态、supersede 改写全部剩余当前节点依赖边、EnsureAcceptanceRun 追加 `acceptance_target_incomplete` PlanWarning，回归见 `internal/plan/supersede_redirect_test.go`、`internal/store/claim_acceptance_runner_test.go`、`internal/bootstrap/supersede_wedge_test.go`。2026-07-28 验收证据类型混挂（verifier 把 command 佐证证据挂到 file_hash criterion，连续三次真实运行复现）已修复：类型化 criterion 的证据纯度违例消息改为指明违例证据 ID 与修正指引，verifier 指引文本补 typed-criterion purity 规则，回归见 `internal/plan/acceptance_evidence_purity_test.go`。2026-07-28 Agent 工作台跨轮输出被最新一轮覆盖的问题已修复：Scheduler 与普通 Agent 现共用不可变完成轮次事件和 Session `turns.jsonl` 账本，TUI/Web 可恢复并浏览全部轮次；证据归档至 [agent-turn-history-loss-incident-2026-07-28.md](../archived/agent-turn-history-loss-incident-2026-07-28.md)。2026-07-29 验收 verifier 的 command 证据在 Windows 上误读 UTF-8 中文文件（PowerShell 对无 BOM 文件按系统 ANSI/GBK 解码，子串断言全部误 fail；行为评测全量首跑 long-form-write 连续两轮验收因此翻车，verifier 自述「文档实际含全部标题」仍被迫判 fail）已修复：内置 verifier 指引补充「内容断言优先 read_file/file_hash 证据；必须 command 证据时显式带 -Encoding UTF8」（`internal/agenttemplate/prompts/verifier.md`）。2026-07-29 expected-artifacts 校验「账本失忆」空转（重试/替代任务换新任务 ID 后 artifact 账本为空，前次尝试写好的文件明明在盘上却连撞提交拒绝，eval smoke 实测 worker 空转 4 轮 + 一次重试回滚）已修复：校验增加磁盘兜底——账本缺失的预期项经 `agent.NewArtifactPhysicalResolver` 解析后 stat，盘上存在（非目录）即转入 `ArtifactCheckResult.Recovered` 视为满足；resolver 为 nil 时退化为纯账本比对，装配点见 `internal/runner/runner.go` 与 `internal/runner/dependency_map.go`。截至本次核对，没有把已修复条目重新列为开放缺陷。
 
@@ -29,11 +29,11 @@
 
 ## 已知功能边界
 
-### Memory 的 Project 作用域与向量查询仍未实现
+### Memory 的 Project 作用域仍未实现
 
-`internal/memory` 的 `ProcessStore`（进程内）与 `SessionStore`（`sess-<id>/memory.jsonl` 持久化，MM8）可用；`ScopeProject` 仍返回 `ErrScopeUnsupported`，`QueryByVector` 明确返回 `ErrNotImplemented`。`KindLearning` / `KindPattern` / `KindConstraint` 尚无生产写入方。
+`internal/memory` 的 `ProcessStore`（进程内）与 `SessionStore`（`sess-<id>/memory.jsonl` 持久化，MM8）可用；`ScopeProject` 仍返回 `ErrScopeUnsupported`。CM3 起 `KindLearning` / `KindConstraint` / `KindResult` / `KindDecision` / `KindBlocker` 已有生产写入方（任务终态晋升器）；`KindPattern` 尚无生产写入方。Session Memory 不自动晋升为 Project Memory（V6 语义主链固定为「原始记录 → Task Memory → Session Memory」）。
 
-- 影响：跨 session 的长期知识（Project 级）与语义检索不可用；学习类记忆目前不存在。
+- 影响：跨 session 的长期知识（Project 级）不可用；Session Memory 随 session 结束生命周期终结。
 - 路线图：[MemoryManageSystem.md](MemoryManageSystem.md)。
 
 ### Shell 超时处理仍是固定超时
@@ -58,6 +58,21 @@
 
 - 影响：并发 Agent 可通过 shell 互相踩踏工作区；验收 runner 理论上能污染被验收对象。
 - 处置：高风险操作用 exec=strict 全量审批或灰名单 Interaction 把守；fan-out 并行写同一批文件的 DAG 节点应声明 `isolation: "workspace"`；容器级隔离评估后再立项。
+
+### ~~Graph acceptance 节点的验收判定暂无服务端核验~~（已于 G1b 落地服务端核验）
+
+G1b 已把核验等价物建到 Graph 路径：acceptance 节点 completed 终态结算时，Graph Runtime 经注入的 `AcceptanceVerifier`（`internal/graph/acceptance.go`，活系统实现 `internal/bootstrap/graph_acceptance.go`）对验收 agent 经 `submit_task_result` 的 `evidence_items` 参数上报到 `Results["evidence"]` 的 JSON 证据逐条服务端核验——command 对照 Effect Journal 该任务的 shell 账（账载命令 digest 逐字比对 + exit code 相符）、file_hash 在 pathutil 边界内重算 sha256 比对、task_status 逐字命中状态词表。`valid` 按自报 verdict 正常转移；`disputed`/`unverifiable` 不采信 verdict——节点置 failed（自报 verdict/event 不进入路由输入）并发 graph change 唤醒交 Scheduler 裁决；审计经 trace `acceptance_completed` 事件。回归：`internal/graph/acceptance_test.go`、`internal/bootstrap/graph_acceptance_test.go`、`internal/bootstrap/graph_acceptance_integration_test.go`（真/假证据两路端到端）。
+
+剩余边界（有意接受）：
+
+- Plan 时代的**熔断器未迁移**：连续 disputed 没有自动熔断计数，靠 Scheduler 经 graph change 流裁决（patch_graph 改图或人工介入）。
+- **evidence 契约靠 prompt 教**：验收 agent 不上报 `evidence_items`（或旧 prompt 部署）一律 unverifiable → 节点 failed + 唤醒，属有意的保守默认；`submit_task_result` 只在提交边界校验「合法 JSON 数组」，类型与逐字纪律的服务端核验在图侧。
+- command 证据的逐字比对在**账载 digest 口径**下进行（Effect Journal 脱敏纪律只存命令 sha256 前 12），理论碰撞窗口与账本脱敏同级。
+- 未注入核验器的第三方装配保持 C5c 契约自报行为（不核验）。
+
+### ~~V6 C6a 过渡态：旧动态 DAG 路径无法形成正式终态~~（已于 C6b 解决）
+
+C6b 已删除 `internal/plan` 整包、验收四工具（`define_acceptance_spec` / `ensure_acceptance_run` / `submit_acceptance_result` / `get_acceptance_evidence`）与收尾强制逻辑（`planNeedsFormalFinalization`）：旧 `publish_task` DAG 的收尾不再需要正式验收，`report_done` 只校验 SchedulerBatch 终态；多节点编排走 `submit_graph`，验收语义由 Graph acceptance 节点 + `submit_task_result` 的 `verdict`/`event` 契约承担，并已于 G1b 获得服务端核验（见上条）。
 
 ### 引用幻觉没有独立的强制防线
 

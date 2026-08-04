@@ -41,7 +41,6 @@ llm:
   api_key: ${OPENAI_API_KEY}            # 可选；空时 SDK 读 OPENAI_API_KEY
   default_model: gpt-4o                 # 推荐必填；Scheduler/模板/静态 Agent 的默认
   timeout_sec: 120                      # 可选；省略时 runtime 使用 60 秒
-  provider: openai                      # 可选：openai / openrouter / deepseek-v4 / deepseek-r1
   # reasoning_effort: medium            # 仅为支持该参数的模型启用；空值表示不发送
   stream: true                          # 可选；启用 Chat Completions SSE
 ```
@@ -51,7 +50,6 @@ llm:
 - Scheduler-only 至少要能解析出模型：通常填写 `llm.default_model`，也可由 `scheduler.model` 覆盖
 - `base_url` 为空时 SDK 使用 OpenAI 官方端点；`api_key` 为空时 SDK 尝试读取 `OPENAI_API_KEY`。生产配置仍建议显式写成上面的形式，便于审查实际 provider 边界
 - `reasoning_effort` 接受 OpenAI 当前公开取值的并集：`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`；具体模型可能只支持其中一部分，不支持时由上游 API 返回模型级错误
-- `provider: openai` 等标准兼容端点发送顶层 `reasoning_effort`；`provider: openrouter` 自动映射为其 Chat API 的 `reasoning.effort`，配置侧无需写两套字段
 - `stream: true` 对所有经统一 LLM 工厂创建的调用生效，包括 Scheduler、预热 Agent、模板/Team Agent、one-shot spawn Agent 和用户 Reactor 的 `invoke_llm`
 - 流式文本会以同一 `stream_id` 的累积快照推送到 TUI/Web；工具调用会先完整聚合名称和 JSON 参数，再交给 Agent 执行，避免半截参数触发工具
 
@@ -92,10 +90,8 @@ agents:
     # tools: [read_file, write_file]    # ↑↓二选一
     model: gpt-4o                        # 可选，覆盖 llm.default_model
     system_prompt_file: prompts/worker.md  # 必填，文件必须存在且可读
-    agent_max_loops: 10                  # 必填，> 0
     task_max_retries: 3                  # 必填，> 0
     enforce_compact_token_threshold: 4000  # 必填，> 0
-    context_limit: 16000                 # 必填，> 0
     description: |                       # 可选，给 scheduler 看的一句话角色描述
       通用工作代理。能写文件、跑 shell。
 ```
@@ -106,7 +102,7 @@ agents:
 - `profile` / `tools` **恰好一个**非空（互斥）
 - `profile` 引用的名字必须在 `tool_profiles:` 里存在
 - `system_prompt_file` 路径必须存在且可读；**不能含反斜杠 `\`**（仅允许 forward slash，跨平台一致）
-- 四个行为参数（`agent_max_loops` / `task_max_retries` / `enforce_compact_token_threshold` / `context_limit`）必须全部 `> 0`
+- 两个行为参数（`task_max_retries` / `enforce_compact_token_threshold`）必须全部 `> 0`；`agent_max_loops` 与 `context_limit` 已于 V6 移除，显式设置报迁移诊断
 
 **`description` 撰写建议**（影响 scheduler 派任质量）：
 - 单句话、动作导向："广度优先调研代理，不写文件，只返回 Markdown"
@@ -118,18 +114,14 @@ agents:
 ```yaml
 scheduler:
   model: gpt-4o
-  agent_max_loops: 50
   enforce_compact_token_threshold: 80000
-  context_limit: 200000
 ```
 
-scheduler 的工具集 / system prompt / replicas 仍固定在 [internal/scheduler](../internal/scheduler/)，但模型和三项运行预算可调：
+scheduler 的工具集 / system prompt / replicas 仍固定在 [internal/scheduler](../internal/scheduler/)，但模型和压缩预算可调：
 
-- `agent_max_loops`：单个 Scheduler Task 的 ReAct 循环上限；省略或 `0` 使用默认 `50`。
 - `enforce_compact_token_threshold`：一个任务内累计 prompt token 达到阈值后触发一次 Layer 2 历史压缩；省略或 `0` 使用默认 `80000`。它不是模型厂商声明的 context window。
-- `context_limit`：预测下一轮 prompt 的 AgentGo Layer 3 硬截断预算；省略或 `0` 使用默认 `200000`。设置它不会扩大模型服务端真正支持的上下文窗口。
 
-三项显式负数都会在启动校验中被拒绝。压缩阈值按单任务累计消耗计数，`context_limit` 按下一次请求的预测 prompt 大小计数，两者量纲不同，应分别根据成本预算和模型窗口调节。
+显式负数会在启动校验中被拒绝。压缩阈值按单任务累计消耗计数；上下文溢出由 Layer 3 溢出重试兜底。`agent_max_loops` 与 `context_limit` 已于 V6 移除：Loop 不再有固定轮数上限（由结构化终态、取消、deadline 与预算约束，另有不可配置的 emergency fuse 兜底程序性死循环），也不再有固定上下文硬截断（适配由压缩与溢出重试承担）；旧配置显式设置这些字段会在启动校验报迁移诊断。
 
 ### 1.5 `agent_templates:` — 按需 Agent 配置（可选）
 
@@ -166,10 +158,8 @@ model: gpt-4o-mini
 system_prompt: |
   只基于可复核事实审查当前任务；需要改图时调用 request_replan。
 limits:
-  agent_max_loops: 8
   task_max_retries: 2
   enforce_compact_token_threshold: 3000
-  context_limit: 12000
   max_replicas: 2
 ```
 
@@ -261,7 +251,7 @@ ui:
 | `引用了不存在的 profile` | 拼写错 / 忘了在 `tool_profiles:` 定义 | 对齐名字 |
 | `system_prompt_file 不可读` | 路径相对 cwd 解析失败 | 用相对 `agentgo` 启动目录的路径，或绝对路径 |
 | `包含反斜杠` | Windows 风格路径 | 改成 forward slash |
-| `agent_max_loops 必须 > 0` | 字段写了 `0` 或漏掉（int 默认 0） | 显式写正数 |
+| `已于 V6 移除`（agent_max_loops / llm.provider） | 旧配置仍写已删除字段 | 直接删除该字段（Loop 不再有固定轮数上限；请求路径统一 OpenAI-compatible） |
 | `agent template duplicate ref` | 同一来源 namespace 出现相同 `name@version` | 改模板名或提升 version |
 | `agent template digest mismatch` | 恢复时磁盘模板与 TeamSpec 记录的内容不同 | 恢复原模板或显式处理持久 TeamSpec 后重启；v1 不自动迁移 |
 | `runtime agent limit reached` | 达到全局或模板 `max_replicas` | 等待实例释放、提高显式上限或收缩 DAG 并发 |
@@ -300,7 +290,7 @@ reactors:
 task_published / task_claimed / task_submitted / task_completed
 text_only_submission / task_retry / task_failed / task_blocked / task_cancelled
 llm_call_start / llm_call_end / tool_call / tool_result
-history_compaction / history_truncated / token_stats
+history_compaction / history_truncated
 file_written / file_write_queued / progress_notify
 error / agent_state_changed
 shell_executed
@@ -360,7 +350,7 @@ publish_task:
 
 `dependencies` 的典型用例：`text_only_submission` → 派审核任务时，verifier 会在 system prompt 的"前置任务结果"段里自动看到 gatherer 的输出。
 
-计划内边界：如果来源 Task 已属于动态 Plan，Reactor 不得直接改变该 Plan 的拓扑。此时旧 `publish_task` 意图会转成 `request_replan`，由 Scheduler 决定继续等待、调整图或启动正式验收；来源 Task 未纳入 Plan 时仍保持原兼容行为。详见 [DynamicDAG.md](activate/DynamicDAG.md)。
+计划内边界（V6 起）：Plan 时代的「Reactor 不得改变 Plan 拓扑、publish_task 意图转 request_replan」拦截已随 Plan 控制面删除；现在来源 Task 属于 Graph 编排时，`request_replan` 动作会转为 graph change 请求（`graph_change_requested` 事件 + Scheduler 唤醒任务），由 Scheduler 用 `patch_graph` 裁决；其余行为统一。历史背景见 [DynamicDAG.md](../archived/DynamicDAG.md)。
 
 ### 3.6 动作 2：`invoke_llm` —— 一次性 LLM 调用
 
@@ -394,7 +384,6 @@ spawn_agent:
   base_kind: worker              # 必填，必须命中已声明 kind
   override:                      # 可选；零值=不覆盖
     model: gpt-4o
-    agent_max_loops: 5
     # 不能覆盖：kind / event_type / instance_id / allowed_tools / profile / tools
     system_prompt:
       file: prompts/special.md
@@ -424,7 +413,7 @@ spawn_agent:
     detail: "Repeated retries suggest the current DAG node may need replacement."
 ```
 
-Task 终态已经由内置控制面逐 Task 唤醒，不要再为 `task_completed` / `task_failed` 配置同义 `request_replan`。这个动作主要扩展项目特有的非终态信号。YAML 只允许提供字面量 `reason_code`、`urgency` 和可选 `detail`，这三个值不执行 `${event.x}` 模板渲染。PlanID、来源 Task、PlanRevision、ExecutionStateVersion 和幂等键由系统根据原始事件与 PlanStore 状态注入，不能在 YAML 中覆盖。使用该动作时 Bootstrap 必须提供 PlanCoordinator 对应的 `ReplanRequester`；缺失会在启动期报错。
+Task 终态已经由内置控制面逐 Task 唤醒，不要再为 `task_completed` / `task_failed` 配置同义 `request_replan`。这个动作主要扩展项目特有的非终态信号。YAML 只允许提供字面量 `reason_code`、`urgency` 和可选 `detail`，这三个值不执行 `${event.x}` 模板渲染。C6b 起该动作发布一个通用 replan 唤醒任务（`EventType="__scheduler__"`、幂等标记 `[replan-request: <taskID>/replan]`，同一任务的重复请求幂等），交给 Scheduler 裁决后续编排；幂等键由系统生成，不能在 YAML 中覆盖。使用该动作时 Bootstrap 必须为 Deps 提供任务 Store；缺失会在启动期报错。
 
 ### 3.9 动作 5：`call:` —— 直接调用内置工具（B 选项）
 
@@ -470,7 +459,7 @@ Spawned agent 通过 `spawn.Manager.KindOf` 继承 `base_kind` 路由，所以�
 ## 4. 当你不确定时
 
 - **不要猜字段名**：去看 [config.go](../internal/config/config.go) 的 struct yaml tag，或 [schema.go](../internal/reactor/userdef/schema.go)
-- **不要复制 v3 字段**：顶层 `worker_count` / `llm_base_url` / `agent_max_loops` 等已废弃，写了也无效
 - **不要互斥并存**：`profile` 与 `tools`、动作五字段——只能选一
 - **写完先跑校验**：`agentgo -config your.yaml` 启动失败的 error 信息会精确指出 `agents[N].xxx` 或模板文件路径，按图索骥即可
 - **复用现成模板**：动态 Plan 从 [config.example.yaml](../config.example.yaml) + [reactors.program-verify.yaml](../reactors.program-verify.yaml) 开始；旧 `test_invest*` 只演示 legacy/unplanned Reactor 链，不能当作 Scheduler 拓扑权威
+- **不要复制 v3 字段**：顶层 `worker_count` / `llm_base_url` / `agent_max_loops` 等已废弃，写了也无效；V6 起 v4 块内的 `agent_max_loops`（agents[]/scheduler）与 `llm.provider` 也已移除——显式设置会报迁移诊断，必须删除

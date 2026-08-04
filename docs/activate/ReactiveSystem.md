@@ -16,7 +16,7 @@
 > **v5.x 增量已落地**：
 > - §6.1 `call:` 动作（B 选项 — 内置工具调用 verb）— v1 仅支持 `call: send_message`，args 模板化
 > - §6.2 per-kind reactors（reactor 配置粒度细化）— 顶层 `kind:` 字段过滤；spawn agents 通过 `spawn.Manager.KindOf` 继承 base_kind 路由（§6.2.4）
-> - `request_replan` 动作 — Reactor 可请求 Scheduler 重新评估动态 Plan，但不能直接改变计划内 DAG；完整控制面见 [DynamicDAG.md](DynamicDAG.md)
+> - `request_replan` 动作 — Reactor 可请求 Scheduler 重新评估；Graph 任务转为 graph change 请求（Plan 时代控制面已删除，历史见 [DynamicDAG.md](../archived/DynamicDAG.md)）
 >
 > **仍 fail-fast 的占位字段**（schema 接受、运行期报错）：
 > - `lifecycle: persistent`（spawn_agent 长期形态）
@@ -102,7 +102,7 @@
 所有状态变更必须遵循三步序列：**主流程 SetState → emit `KindAgentStateChanged`（或对应 EventKind）→ Reactor 订阅者响应**。
 
 - trace 事件不仅是观察手段，更是 Reactor 系统的统一订阅入口
-- TaskStore 仍是 Task 事实的权威来源；动态 DAG 的 PlanStore 是图版本、pending ReplanRequest 和正式验收的权威来源。trace 记录这些已提交事实，但不替代领域 Store
+- TaskStore 仍是 Task 事实的权威来源；Graph 编排的 GraphStore（`internal/graph`）是图定义、activation、边选择与审批的权威来源（Plan 时代的 PlanStore 已于 V6 删除）。trace 记录这些已提交事实，但不替代领域 Store
 - 这意味着 trace 机制升级（事件 payload 结构化、新增状态变更字段等，详见 `../archived/trace-upgrade-design-2026-05.md`）从"前置依赖"升级为**硬性前置**——没有结构化事件，整套 Reactor 架构站不起来
 - TraceUpgrade 与 ReactiveSystem 同步推进（详见 §10 实施顺序）
 
@@ -926,7 +926,6 @@ reactors:
       override:                        # 可选，仅覆盖列出的字段
         system_prompt:
           file: ./prompts/post_mortem_system.md
-        agent_max_loops: 5
         context_limit: 8000
       initial_task:
         description:
@@ -1510,7 +1509,7 @@ const (
 | `idle` | agent 启动后 / 上一任务 Terminating 完成 | 成功 ClaimTask 一个新任务 | 周期性调 `Store.QueryAvailable`，可能在 `time.Sleep(pollInterval)` 中 |
 | `processing` | ClaimTask 成功 / Interaction 等待结束 | 进入 WaitingInteraction 或 Terminating | ReactLoop 内部所有动作——包括 LLM 调用、工具执行、历史压缩/截断、mailbox drain 与 history 构造 |
 | `waiting_interaction` | Shell 等受控路径调用 `SetInteractionWaitState(..., true)` | Interaction 进入终态、等待取消或调用方退出；通常先回 processing | 阻塞等待结构化用户回答，不消耗 LLM token；可覆盖 Plan、Shell 及后续其它 Interaction purpose |
-| `terminating` | ReactLoop 退出（自然完成 / 超过 MaxLoops / panic recover）| TaskEnd hook 全部执行完，回到 idle | 调用 SubmitResult 或 FailTask、emit TaskEnd hook、清理 FileCache、写最终 trace 事件 |
+| `terminating` | ReactLoop 退出（自然完成 / emergency fuse / panic recover）| TaskEnd hook 全部执行完，回到 idle | 调用 SubmitResult 或 FailTask、emit TaskEnd hook、清理 FileCache、写最终 trace 事件 |
 
 #### 7.2.2 被显式排除的子动作（用 trace 事件而非状态枚举）
 
@@ -1549,7 +1548,7 @@ const (
        └───────────────────────│terminating │◀──────┘
                                └────────────┘
                               ReactLoop 退出
-                              （自然完成 / MaxLoops
+                              （自然完成 / fuse
                                  / panic recover）
 ```
 
@@ -1558,10 +1557,10 @@ const (
 2. `processing → waiting_interaction`（受控路径开始等待 Interaction）
 3. `waiting_interaction → processing`（Interaction 等待结束；具体 resolved/deny/fail 结果由调用方处理）
 4. `waiting_interaction → terminating`（任务取消或终结与等待窗口竞态时的合法出口）
-5. `processing → terminating`（ReactLoop 退出，含自然完成 / MaxLoops 耗尽 / panic recover 等所有路径）
+5. `processing → terminating`（ReactLoop 退出，含自然完成 / emergency fuse / panic recover 等所有路径）
 6. `terminating → idle`（TaskEnd hook 执行完，回到等任务）
 
-**当前 Interaction 语义**：`waiting_interaction` 只表达“正在等待用户”，不编码业务结果。Shell 的 `deny` / `guidance` 不执行原命令并作为工具结果返回；Plan 的 execute/revise/cancel 由受信任 handler 更新 PlanStore。Interaction 的 resolved/failed/cancelled/expired/interrupted 与 Agent 运行状态是两套不同状态机。
+**当前 Interaction 语义**：`waiting_interaction` 只表达“正在等待用户”，不编码业务结果。Shell 的 `deny` / `guidance` 不执行原命令并作为工具结果返回；Graph approval 的批准/拒绝经 `OnApprovalDecided` 驱动图转移。Interaction 的 resolved/failed/cancelled/expired/interrupted 与 Agent 运行状态是两套不同状态机。
 
 **显式排除**：
 - 不存在 `processing → idle` 的直接边——所有任务结束必须经过 terminating（保证 cleanup hook 全跑）
@@ -1609,7 +1608,7 @@ agent_state_changed: {
 - `"interaction_wait_start"` （Processing → WaitingInteraction）
 - `"interaction_wait_end"` （WaitingInteraction → Processing）
 - `"cancel:<source>"` / ReactLoop exit cause（WaitingInteraction → Terminating，任务终结路径）
-- `"react_loop_exit:natural"` / `"react_loop_exit:max_loops"` / `"react_loop_exit:panic"` （Processing → Terminating）
+- `"react_loop_exit:natural"` / `"react_loop_exit:runtime_loop_fuse"` / `"react_loop_exit:panic"` （Processing → Terminating）
 - `"task_end_hook_done"` （Terminating → Idle）
 
 具体字段定义在 Phase 2 TraceUpgrade spec 阶段细化。
@@ -1697,7 +1696,7 @@ func (a *Agent) mustSetState(newState AgentRuntimeState, cause string) {
 | 2 | 受控路径开始等待 Interaction | Processing → WaitingInteraction | `"interaction_wait_start"` |
 | 3 | Interaction 等待结束 | WaitingInteraction → Processing | `"interaction_wait_end"` |
 | 4 | 任务取消/终结与等待竞态 | WaitingInteraction → Terminating | 任务取消或 ReactLoop exit cause |
-| 5 | ReactLoop 退出位（含 panic recover defer）| Processing → Terminating | `"react_loop_exit:natural"` / `":max_loops"` / `":panic"` |
+| 5 | ReactLoop 退出位（含 panic recover defer）| Processing → Terminating | `"react_loop_exit:natural"` / `":runtime_loop_fuse"` / `":panic"` |
 | 6 | TaskEnd hook 跑完 / SubmitResult 完成 | Terminating → Idle | `"task_end_hook_done"` |
 
 #### 7.3.5 isValidTransition 转换表（6 条边）

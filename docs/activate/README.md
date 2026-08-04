@@ -18,7 +18,7 @@
 
 | 文档 | 状态 | 使用方式 |
 | --- | --- | --- |
-| [DynamicDAG.md](DynamicDAG.md) | 已实现，仍是 Plan 不变量参考 | 修改 Plan、验收、暂停/恢复或重规划前阅读 |
+| [DynamicDAG.md](../archived/DynamicDAG.md) | 已于 V6 归档（Plan 控制面已删除，Graph 见 `internal/graph`） | 仅历史参考 |
 | [AgentTemplate.md](AgentTemplate.md) | 已实现，仍是按需 Team 契约 | 修改模板 catalog、provision 或 runtime route 前阅读 |
 | [ReactiveSystem.md](ReactiveSystem.md) | 已实现，保留 Gate/Reactor 决策背景 | 修改 Gate、Reactor、状态事件或用户 Reactor schema 前阅读 |
 | [MemoryManageSystem.md](MemoryManageSystem.md) | 部分实现 | 仅用于 Memory 后续工作；现状见架构文档和 [KNOWN_ISSUES.md](KNOWN_ISSUES.md) |

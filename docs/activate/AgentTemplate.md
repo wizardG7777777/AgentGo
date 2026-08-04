@@ -88,7 +88,6 @@ tools:
 model: gpt-4o
 system_prompt_file: prompts/rust-migrator.md
 limits:
-  agent_max_loops: 12
   task_max_retries: 3
   enforce_compact_token_threshold: 4000
   context_limit: 20000
@@ -104,7 +103,7 @@ limits:
 - `tools`：必填、非空；每项必须是 AgentGo 已注册的真实工具名，trim 后不能为空或重复。真正权限只由该 allowlist 决定。
 - `model`：可选；空时在加载期解析为 `llm.default_model`（或 Scheduler model）并进入 digest。因此存在 ready TeamSpec 时改变全局默认模型也属于能力定义漂移，需要按恢复规则处理。
 - `system_prompt` / `system_prompt_file`：恰好填写一个。文件路径相对该来源的模板目录解析；解析后的 prompt 内容进入 digest，路径本身不进入。绝对路径、反斜杠、`..` 和符号链接越界都会被拒绝。
-- `limits`：可选；默认值依次为 `agent_max_loops: 10`、`task_max_retries: 3`、`enforce_compact_token_threshold: 4000`、`context_limit: 16000`、`max_replicas: 4`。显式值必须为正数，其中 `max_replicas` 限制单个 Team 请求的副本数。
+- `limits`：可选；默认值依次为 `task_max_retries: 3`、`enforce_compact_token_threshold: 4000`、`context_limit: 16000`、`max_replicas: 4`。显式值必须为正数，其中 `max_replicas` 限制单个 Team 请求的副本数。`agent_max_loops` 已于 V6 移除——旧模板显式设置该字段会在加载期报迁移诊断错误（Loop 由结构化终态、取消、deadline 与预算约束，不再有固定轮数上限）。
 
 外部模板不能获得 Scheduler 独占的 DAG 控制工具。`submit_acceptance_result` 只适合专门的 verifier 模板；普通模板遇到需要改图的事实应调用 `request_replan`。
 
@@ -185,6 +184,6 @@ flowchart LR
 
 相关文档：
 
-- [DynamicDAG.md](DynamicDAG.md) — 图、唤醒、验收和恢复的不变量
+- [DynamicDAG.md](../archived/DynamicDAG.md) — V6 前 Plan 时代历史文档（图、唤醒、验收和恢复的不变量）
 - [yaml-config-guide.md](../yaml-config-guide.md) — 主配置与外部模板 schema
 - [tool-profiles.md](../tool-profiles.md) — 工具授权和模板能力边界
