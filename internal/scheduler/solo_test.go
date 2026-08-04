@@ -15,7 +15,6 @@ import (
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
-	"agentgo/internal/plan"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
 	"agentgo/internal/tools"
@@ -35,7 +34,7 @@ func newSoloTestBundle(t *testing.T, modeStore *modes.Store, mockLLM llm.Client)
 	cfg.Agents = []config.AgentKind{{Kind: "worker", Replicas: 1}}
 
 	bundle := New(s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
-		nil, nil, nil, nil, nil, modeStore)
+		nil, nil, nil, nil, nil, modeStore, nil, nil, nil)
 
 	task := &model.Task{Description: "solo 测试任务", EventType: "__scheduler__"}
 	if err := s.PublishTask(task); err != nil {
@@ -74,7 +73,7 @@ func TestSoloPublishTaskBlocked_Solo(t *testing.T) {
 			},
 		}},
 	}}}
-	bundle, s, task := newSoloTestBundle(t, modes.NewStore(modes.GateImmediate, modes.ExecNormal, modes.TopoSolo), mockLLM)
+	bundle, s, task := newSoloTestBundle(t, modes.NewStore(modes.ExecNormal, modes.TopoSolo), mockLLM)
 
 	content := executeOneRound(t, bundle, task)
 	if !strings.Contains(content, "solo 编排模式禁止派发子任务") {
@@ -107,7 +106,7 @@ func TestSoloPublishTaskBlocked_TeamAllows(t *testing.T) {
 			},
 		}},
 	}}}
-	bundle, s, _ := newSoloTestBundle(t, modes.NewStore(modes.GateImmediate, modes.ExecNormal, modes.TopoTeam), mockLLM)
+	bundle, s, _ := newSoloTestBundle(t, modes.NewStore(modes.ExecNormal, modes.TopoTeam), mockLLM)
 
 	content := executeOneRound(t, bundle, mustTask(t, s))
 	if !strings.Contains(content, "已创建任务") {
@@ -203,7 +202,7 @@ func TestSoloPublishTaskBlocked_SendMessageAllowed(t *testing.T) {
 			},
 		}},
 	}}}
-	bundle, _, task := newSoloTestBundle(t, modes.NewStore(modes.GateImmediate, modes.ExecNormal, modes.TopoSolo), mockLLM)
+	bundle, _, task := newSoloTestBundle(t, modes.NewStore(modes.ExecNormal, modes.TopoSolo), mockLLM)
 
 	content := executeOneRound(t, bundle, task)
 	if strings.Contains(content, "solo 编排模式禁止") {
@@ -234,12 +233,9 @@ func TestSchedulerSystemPrompt_ContainsSoloGuidance(t *testing.T) {
 
 // TestSchedulerBundle_SoloMode_DirectExecutionCompletes 是 solo 不卡死集成测试。
 //
-// 场景：topo=solo + 已装配 PlanCoordinator（与生产一致，scheduler 任务发布会
-// 自动建立 root-only Plan）。LLM 全程不注册任何 DAG 节点，只调用普通工具
-// （read_file）后 report_done 收尾。断言：
-//   - scheduler 任务到达 completed（不会在 waitForPlanSignal 等处挂死——
-//     root-only Plan 无节点，waitForPlanSignal 立即返回）；
-//   - Plan 到达终态（只读路径走 CompleteWithoutExecution）；
+// 场景：topo=solo。LLM 全程不派发子任务，只调用普通工具（read_file）后
+// report_done 收尾。断言：
+//   - scheduler 任务到达 completed（不会在任何等待处挂死）；
 //   - 公告板没有产生任何子任务。
 func TestSchedulerBundle_SoloMode_DirectExecutionCompletes(t *testing.T) {
 	// 独立项目根，read_file 读取其中的真实文件
@@ -256,8 +252,7 @@ func TestSchedulerBundle_SoloMode_DirectExecutionCompletes(t *testing.T) {
 	cfg.ProjectRoot = projectRoot
 	cfg.Agents = []config.AgentKind{{Kind: "worker", Replicas: 1}}
 
-	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
-	modeStore := modes.NewStore(modes.GateImmediate, modes.ExecNormal, modes.TopoSolo)
+	modeStore := modes.NewStore(modes.ExecNormal, modes.TopoSolo)
 
 	mockLLM := &scriptedLLM{responses: []llm.Response{
 		// 第一轮：普通只读工具
@@ -276,19 +271,11 @@ func TestSchedulerBundle_SoloMode_DirectExecutionCompletes(t *testing.T) {
 	}}
 
 	bundle := New(s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
-		nil, nil, nil, nil, nil, modeStore, coordinator)
+		nil, nil, nil, nil, nil, modeStore, nil, nil, nil)
 
-	// 模拟生产发布路径：__scheduler__ 任务由 store 自动赋 PlanID + controller 角色，
-	// 随后 plan hook 建立 root-only Plan（此处手动调 Create，与 bootstrap 的 hook 等价）。
 	root := &model.Task{Description: "读取 note.txt 并总结", EventType: "__scheduler__"}
 	if err := s.PublishTask(root); err != nil {
 		t.Fatalf("发布 scheduler 任务失败: %v", err)
-	}
-	if root.PlanID != root.ID || root.NodeRole != model.PlanNodeRoleController {
-		t.Fatalf("scheduler 任务应自动成为 Plan controller: PlanID=%s NodeRole=%s", root.PlanID, root.NodeRole)
-	}
-	if _, err := coordinator.Create(context.Background(), plan.CreateInput{PlanID: root.PlanID, RootTaskID: root.ID}); err != nil {
-		t.Fatalf("创建 root-only Plan 失败: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -315,16 +302,7 @@ func TestSchedulerBundle_SoloMode_DirectExecutionCompletes(t *testing.T) {
 		t.Fatalf("solo 下 scheduler 任务未在 10s 内 completed（疑似挂死），当前状态: %+v", task)
 	}
 
-	// root-only Plan 应随 report_done 走只读完成路径到达终态
-	p, err := coordinator.Store().GetPlan(root.PlanID)
-	if err != nil {
-		t.Fatalf("读取 Plan 失败: %v", err)
-	}
-	if !model.IsPlanTerminal(p.Status) {
-		t.Errorf("Plan 应到达终态，实际 status=%s", p.Status)
-	}
-
-	// 全程不应产生任何子任务（LLM 未注册 DAG 节点，也没有 publish_task 漏网）
+	// 全程不应产生任何子任务（LLM 未派发，也没有 publish_task 漏网）
 	tasks, err := s.ScanAll()
 	if err != nil {
 		t.Fatalf("ScanAll 失败: %v", err)
@@ -338,13 +316,11 @@ func TestSchedulerBundle_SoloMode_DirectExecutionCompletes(t *testing.T) {
 
 // TestSchedulerBundle_SoloMode_DirectWriteCompletes 是 solo 写操作收尾集成测试。
 //
-// 场景：topo=solo + 已装配 PlanCoordinator，recordToolCall 按生产方式接线
-// （bootstrap 同款闭包），因此 controller 亲自 write_file 成功后，收尾守卫能
-// 看到这次写操作事实。LLM 第二轮调用 report_done 收尾。断言：
-//   - scheduler 任务到达 completed（放宽前：report_done 被"尚未依据最新正式验收
-//     进入终态"拒绝，随后自然文本回合又被强制继续，任务在 30 轮空转后 failed）；
-//   - Plan 以 completed_no_execution 终态化（无验收运行收尾路径）；
-//   - 文件真实落盘，公告板没有产生任何子任务。
+// 场景：topo=solo，recordToolCall 按生产方式接线（bootstrap 同款闭包）。
+// LLM 第一轮亲自 write_file，第二轮 report_done 收尾。断言：
+//   - scheduler 任务到达 completed；
+//   - 写操作事实被记录，文件真实落盘；
+//   - 公告板没有产生任何子任务。
 func TestSchedulerBundle_SoloMode_DirectWriteCompletes(t *testing.T) {
 	projectRoot := t.TempDir()
 
@@ -356,10 +332,9 @@ func TestSchedulerBundle_SoloMode_DirectWriteCompletes(t *testing.T) {
 	cfg.ProjectRoot = projectRoot
 	cfg.Agents = []config.AgentKind{{Kind: "worker", Replicas: 1}}
 
-	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
-	modeStore := modes.NewStore(modes.GateImmediate, modes.ExecNormal, modes.TopoSolo)
+	modeStore := modes.NewStore(modes.ExecNormal, modes.TopoSolo)
 
-	// 与 bootstrap 一致的工具调用记录接线：write_file 成功后收尾守卫才能看到事实
+	// 与 bootstrap 一致的工具调用记录接线
 	recordToolCall := func(taskID string, rec store.ToolCallRecord) {
 		_ = s.AppendToolCall(taskID, rec)
 	}
@@ -381,17 +356,11 @@ func TestSchedulerBundle_SoloMode_DirectWriteCompletes(t *testing.T) {
 	}}
 
 	bundle := New(s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, recordToolCall,
-		nil, nil, nil, nil, nil, nil, modeStore, coordinator)
+		nil, nil, nil, nil, nil, nil, modeStore, nil, nil, nil)
 
 	root := &model.Task{Description: "写入 solo_write.txt", EventType: "__scheduler__"}
 	if err := s.PublishTask(root); err != nil {
 		t.Fatalf("发布 scheduler 任务失败: %v", err)
-	}
-	if root.PlanID != root.ID || root.NodeRole != model.PlanNodeRoleController {
-		t.Fatalf("scheduler 任务应自动成为 Plan controller: PlanID=%s NodeRole=%s", root.PlanID, root.NodeRole)
-	}
-	if _, err := coordinator.Create(context.Background(), plan.CreateInput{PlanID: root.PlanID, RootTaskID: root.ID}); err != nil {
-		t.Fatalf("创建 root-only Plan 失败: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -400,7 +369,7 @@ func TestSchedulerBundle_SoloMode_DirectWriteCompletes(t *testing.T) {
 	wg.Add(1)
 	go func() { defer wg.Done(); bundle.Agent.Run(ctx) }()
 
-	// 等待 scheduler 任务到达 completed；若收尾被正式验收要求卡死，此处超时失败
+	// 等待 scheduler 任务到达 completed；若收尾卡死，此处超时失败
 	deadline := time.Now().Add(10 * time.Second)
 	var finalTask *model.Task
 	for time.Now().Before(deadline) {
@@ -415,22 +384,13 @@ func TestSchedulerBundle_SoloMode_DirectWriteCompletes(t *testing.T) {
 
 	if finalTask == nil {
 		task, _ := s.GetTask(root.ID)
-		t.Fatalf("solo 写操作任务未在 10s 内 completed（收尾被正式验收要求卡死），当前状态: %+v", task)
+		t.Fatalf("solo 写操作任务未在 10s 内 completed，当前状态: %+v", task)
 	}
 
-	// 写操作事实确实被记录（否则本测试没有真正走到放宽分支）
+	// 写操作事实确实被记录
 	records, err := s.QueryToolCalls(root.ID, "write_file")
 	if err != nil || len(records) == 0 || !records[0].Success {
-		t.Fatalf("write_file 成功记录缺失，测试未覆盖放宽分支: records=%+v err=%v", records, err)
-	}
-
-	// Plan 应走"无验收运行"收尾到达终态
-	p, err := coordinator.Store().GetPlan(root.PlanID)
-	if err != nil {
-		t.Fatalf("读取 Plan 失败: %v", err)
-	}
-	if p.Status != model.PlanStatusCompletedNoExecution {
-		t.Errorf("Plan 应以 completed_no_execution 终态化，实际 status=%s", p.Status)
+		t.Fatalf("write_file 成功记录缺失: records=%+v err=%v", records, err)
 	}
 
 	// 文件真实落盘

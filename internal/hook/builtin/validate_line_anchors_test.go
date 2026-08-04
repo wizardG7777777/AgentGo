@@ -256,8 +256,8 @@ func TestValidateLineAnchorsHook_ViaRegistry(t *testing.T) {
 // TestValidateLineAnchorsHook_ChainOverridesExpectedHash 是 §7.7 互斥的双 hook 链路实测：
 // expected_hash hook (prio=20) 与 line_anchors hook (prio=25) 都注册到 registry 时，
 // 提供 line_anchors 的请求应当：
-//   1. 让 expected_hash hook 在自检阶段直接 Continue（不论 expected_hash 是对是错）
-//   2. 让 line_anchors hook 接管校验
+//  1. 让 expected_hash hook 在自检阶段直接 Continue（不论 expected_hash 是对是错）
+//  2. 让 line_anchors hook 接管校验
 //
 // 现有 TestValidateExpectedHashHook_LineAnchorsSkips 只覆盖单 hook 单方面让位；
 // 本测试用 registry 跑完整链路，把"哪一个 hook 在拒绝/放行"的决断暴露出来——

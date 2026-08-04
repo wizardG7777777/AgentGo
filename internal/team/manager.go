@@ -15,7 +15,6 @@ import (
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
-	"agentgo/internal/plan"
 	"agentgo/internal/runner"
 	"agentgo/internal/trace"
 )
@@ -28,7 +27,6 @@ type Manager struct {
 	deps         runner.RunnerDeps
 	llmFactory   LLMFactory
 	catalog      *agenttemplate.Catalog
-	coordinator  *plan.Coordinator
 	store        TeamStore
 	routes       RouteRegistry
 	maxInstances int
@@ -70,7 +68,6 @@ func NewManager(
 	deps runner.RunnerDeps,
 	llmFactory LLMFactory,
 	catalog *agenttemplate.Catalog,
-	coordinator *plan.Coordinator,
 	store TeamStore,
 	routes RouteRegistry,
 	maxInstances int,
@@ -83,7 +80,7 @@ func NewManager(
 	}
 	return &Manager{
 		deps: deps, llmFactory: llmFactory, catalog: catalog,
-		coordinator: coordinator, store: store, routes: routes,
+		store: store, routes: routes,
 		maxInstances: maxInstances, active: make(map[string]*activeTeam),
 		shutdownDone: make(chan struct{}),
 	}
@@ -91,8 +88,9 @@ func NewManager(
 
 // Start recovers every durable ready TeamSpec. Recovery is fail-closed: a
 // changed template digest or an over-limit ready set starts no runners and
-// returns an error. Teams belonging to terminal Plans are durably stopped and
-// skipped before digest validation.
+// returns an error. Teams whose controller task is already terminal or has
+// been evicted from the task store are durably stopped and skipped before
+// digest validation.
 func (m *Manager) Start(ctx context.Context) error {
 	m.opMu.Lock()
 	defer m.opMu.Unlock()
@@ -116,26 +114,30 @@ func (m *Manager) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list durable teams: %w", err)
 	}
-	terminalPlans := make(map[string]string)
 	ready := make([]TeamSpec, 0, len(specs))
 	for _, spec := range specs {
 		if spec.Status != StatusReady {
 			continue
 		}
-		p, err := m.coordinator.Store().GetPlan(spec.PlanID)
+		// Team 归属发起 provision 的 Scheduler controller 任务：controller 已
+		// 终态或已从任务存储淘汰（GetTask 失败）的 Team 不再恢复，按
+		// controller 维度标记 stopped，需要时由 Scheduler 重新 provision。
+		task, err := m.deps.Store.GetTask(spec.ControllerTaskID)
 		if err != nil {
-			return fmt.Errorf("recover team %s plan %s: %w", spec.ID, spec.PlanID, err)
+			log.Printf("[team] 恢复 Team %s 跳过：controller 任务 %s 已淘汰或不存在（%v），已标记 stopped", spec.ID, spec.ControllerTaskID, err)
+			if _, stopErr := m.store.StopController(spec.ControllerTaskID, "controller_missing"); stopErr != nil {
+				return fmt.Errorf("stop team %s with missing controller during recovery: %w", spec.ID, stopErr)
+			}
+			continue
 		}
-		if model.IsPlanTerminal(p.Status) {
-			terminalPlans[p.ID] = "plan_terminal:" + string(p.Status)
+		if model.IsTerminal(task.Status) {
+			log.Printf("[team] 恢复 Team %s 跳过：controller 任务 %s 已终态（%s），已标记 stopped", spec.ID, spec.ControllerTaskID, task.Status)
+			if _, stopErr := m.store.StopController(spec.ControllerTaskID, "controller_terminal:"+string(task.Status)); stopErr != nil {
+				return fmt.Errorf("stop team %s with terminal controller during recovery: %w", spec.ID, stopErr)
+			}
 			continue
 		}
 		ready = append(ready, spec)
-	}
-	for planID, reason := range terminalPlans {
-		if _, err := m.store.StopPlan(planID, reason); err != nil {
-			return fmt.Errorf("stop terminal plan %s teams during recovery: %w", planID, err)
-		}
 	}
 
 	total := 0
@@ -235,8 +237,9 @@ func (m *Manager) Start(ctx context.Context) error {
 	return nil
 }
 
-// Provision creates or reuses a homogeneous Team. Controller authority is
-// checked and held through the durable/route mutation via WithControllerLease.
+// Provision creates or reuses a homogeneous Team. Team 的归属（owner）是发起
+// provision 的 Scheduler controller 任务（req.ControllerTaskID），生命周期挂
+// 在该任务的终态上；opMu 把幂等查找、持久化与路由安装串行化为一次操作。
 func (m *Manager) Provision(ctx context.Context, req agenttemplate.ProvisionRequest) (agenttemplate.ProvisionResult, error) {
 	m.opMu.Lock()
 	defer m.opMu.Unlock()
@@ -257,12 +260,11 @@ func (m *Manager) Provision(ctx context.Context, req agenttemplate.ProvisionRequ
 	if err := ctx.Err(); err != nil {
 		return agenttemplate.ProvisionResult{}, err
 	}
-	req.PlanID = strings.TrimSpace(req.PlanID)
 	req.ControllerTaskID = strings.TrimSpace(req.ControllerTaskID)
 	req.TemplateRef = strings.TrimSpace(req.TemplateRef)
 	req.Purpose = strings.TrimSpace(req.Purpose)
-	if req.PlanID == "" || req.ControllerTaskID == "" || req.TemplateRef == "" || req.Purpose == "" {
-		return agenttemplate.ProvisionResult{}, fmt.Errorf("plan_id, controller_task_id, template_ref and purpose are required")
+	if req.ControllerTaskID == "" || req.TemplateRef == "" || req.Purpose == "" {
+		return agenttemplate.ProvisionResult{}, fmt.Errorf("controller_task_id, template_ref and purpose are required")
 	}
 	if req.Replicas == 0 {
 		req.Replicas = 1
@@ -276,91 +278,76 @@ func (m *Manager) Provision(ctx context.Context, req agenttemplate.ProvisionRequ
 		return agenttemplate.ProvisionResult{}, err
 	}
 
-	var result agenttemplate.ProvisionResult
-	err = m.coordinator.WithControllerLease(ctx, req.PlanID, req.ControllerTaskID, func() error {
-		specs, err := m.store.List()
-		if err != nil {
-			return fmt.Errorf("list teams: %w", err)
-		}
-		existing, found := findIdempotent(specs, req)
-		if found && existing.TemplateDigest != tmpl.Digest {
-			return fmt.Errorf("%w: team=%s ref=%s stored=%s current=%s",
-				ErrTemplateDigestMismatch, existing.ID, existing.TemplateRef, existing.TemplateDigest, tmpl.Digest)
-		}
-		if found && existing.Status != StatusReady {
-			return fmt.Errorf("idempotent team %s is %s", existing.ID, existing.Status)
-		}
-		if found {
-			existing.ControllerTaskID = req.ControllerTaskID
-			if active, ok := m.active[existing.ID]; ok {
-				stored, _, err := m.store.Ensure(existing)
-				if err != nil {
-					return fmt.Errorf("refresh team controller: %w", err)
-				}
-				existing = stored
-				result = resultFor(existing, active.agentIDs, active.tools, true)
-				return nil
-			}
-		}
-
-		replicas := req.Replicas
-		if m.activeInstanceCount()+replicas > m.maxInstances {
-			return fmt.Errorf("%w: active=%d requested=%d max=%d",
-				ErrProcessLimitExceeded, m.activeInstanceCount(), replicas, m.maxInstances)
-		}
-		if !found {
-			id := uuid.NewString()
-			existing = TeamSpec{
-				ID: id, TemplateRef: tmpl.Ref, TemplateDigest: tmpl.Digest,
-				PlanID: req.PlanID, ControllerTaskID: req.ControllerTaskID,
-				Purpose: req.Purpose, EventType: "team:" + id,
-				Replicas: replicas, Status: StatusReady,
-			}
-		}
-		// Durability is established before runner/mailbox construction, and the
-		// route is deliberately the final published readiness surface.
-		stored, created, err := m.store.Ensure(existing)
-		if err != nil {
-			return fmt.Errorf("persist team: %w", err)
-		}
-		existing = stored
-		if existing.TemplateDigest != tmpl.Digest {
-			return fmt.Errorf("%w: team=%s ref=%s stored=%s current=%s",
-				ErrTemplateDigestMismatch, existing.ID, existing.TemplateRef, existing.TemplateDigest, tmpl.Digest)
-		}
-		if existing.Status != StatusReady {
-			return fmt.Errorf("idempotent team %s is %s", existing.ID, existing.Status)
-		}
-		prep, err := m.prepare(existing, tmpl)
-		if err != nil {
-			return m.markProvisionFailed(existing, "provision_failed:runtime_prepare", err)
-		}
-		activation, err := m.materializePrepared(prep, false)
-		if err != nil {
-			return m.markProvisionFailed(existing, "provision_failed:runtime_materialize", err)
-		}
-		if err := m.startMaterialized(activation); err != nil {
-			cleanupErr := m.stopMaterialized(activation)
-			return m.markProvisionFailed(existing, "provision_failed:runner_start", errors.Join(err, cleanupErr))
-		}
-		if err := m.registerRoute(existing, tmpl); err != nil {
-			// RegisterRoute should be all-or-nothing, but remove the key
-			// defensively before stopping the runtime in case an implementation
-			// returned an error after a partial mutation.
-			_ = m.routes.UnregisterRoute(existing.EventType)
-			cleanupErr := m.stopMaterialized(activation)
-			return m.markProvisionFailed(existing, "provision_failed:route_registration",
-				errors.Join(fmt.Errorf("register team route: %w", err), cleanupErr))
-		}
-		m.releaseMaterialized(activation)
-		active := m.active[existing.ID]
-		result = resultFor(existing, active.agentIDs, active.tools, !created)
-		return nil
-	})
+	specs, err := m.store.List()
 	if err != nil {
-		return agenttemplate.ProvisionResult{}, err
+		return agenttemplate.ProvisionResult{}, fmt.Errorf("list teams: %w", err)
 	}
-	return result, nil
+	existing, found := findIdempotent(specs, req)
+	if found && existing.TemplateDigest != tmpl.Digest {
+		return agenttemplate.ProvisionResult{}, fmt.Errorf("%w: team=%s ref=%s stored=%s current=%s",
+			ErrTemplateDigestMismatch, existing.ID, existing.TemplateRef, existing.TemplateDigest, tmpl.Digest)
+	}
+	if found && existing.Status != StatusReady {
+		return agenttemplate.ProvisionResult{}, fmt.Errorf("idempotent team %s is %s", existing.ID, existing.Status)
+	}
+	if found {
+		if active, ok := m.active[existing.ID]; ok {
+			return resultFor(existing, active.agentIDs, active.tools, true), nil
+		}
+	}
+
+	replicas := req.Replicas
+	if m.activeInstanceCount()+replicas > m.maxInstances {
+		return agenttemplate.ProvisionResult{}, fmt.Errorf("%w: active=%d requested=%d max=%d",
+			ErrProcessLimitExceeded, m.activeInstanceCount(), replicas, m.maxInstances)
+	}
+	if !found {
+		id := uuid.NewString()
+		existing = TeamSpec{
+			ID: id, TemplateRef: tmpl.Ref, TemplateDigest: tmpl.Digest,
+			ControllerTaskID: req.ControllerTaskID,
+			Purpose:          req.Purpose, EventType: "team:" + id,
+			Replicas: replicas, Status: StatusReady,
+		}
+	}
+	// Durability is established before runner/mailbox construction, and the
+	// route is deliberately the final published readiness surface.
+	stored, created, err := m.store.Ensure(existing)
+	if err != nil {
+		return agenttemplate.ProvisionResult{}, fmt.Errorf("persist team: %w", err)
+	}
+	existing = stored
+	if existing.TemplateDigest != tmpl.Digest {
+		return agenttemplate.ProvisionResult{}, fmt.Errorf("%w: team=%s ref=%s stored=%s current=%s",
+			ErrTemplateDigestMismatch, existing.ID, existing.TemplateRef, existing.TemplateDigest, tmpl.Digest)
+	}
+	if existing.Status != StatusReady {
+		return agenttemplate.ProvisionResult{}, fmt.Errorf("idempotent team %s is %s", existing.ID, existing.Status)
+	}
+	prep, err := m.prepare(existing, tmpl)
+	if err != nil {
+		return agenttemplate.ProvisionResult{}, m.markProvisionFailed(existing, "provision_failed:runtime_prepare", err)
+	}
+	activation, err := m.materializePrepared(prep, false)
+	if err != nil {
+		return agenttemplate.ProvisionResult{}, m.markProvisionFailed(existing, "provision_failed:runtime_materialize", err)
+	}
+	if err := m.startMaterialized(activation); err != nil {
+		cleanupErr := m.stopMaterialized(activation)
+		return agenttemplate.ProvisionResult{}, m.markProvisionFailed(existing, "provision_failed:runner_start", errors.Join(err, cleanupErr))
+	}
+	if err := m.registerRoute(existing, tmpl); err != nil {
+		// RegisterRoute should be all-or-nothing, but remove the key
+		// defensively before stopping the runtime in case an implementation
+		// returned an error after a partial mutation.
+		_ = m.routes.UnregisterRoute(existing.EventType)
+		cleanupErr := m.stopMaterialized(activation)
+		return agenttemplate.ProvisionResult{}, m.markProvisionFailed(existing, "provision_failed:route_registration",
+			errors.Join(fmt.Errorf("register team route: %w", err), cleanupErr))
+	}
+	m.releaseMaterialized(activation)
+	active := m.active[existing.ID]
+	return resultFor(existing, active.agentIDs, active.tools, !created), nil
 }
 
 // Shutdown cancels runtime runners and removes their ephemeral routes while
@@ -445,16 +432,12 @@ func (m *Manager) ActiveCount() int {
 	return m.activeInstanceCount()
 }
 
-// Reactor implementation. Task terminal events provide a fallback Plan lookup
-// for terminal paths that do not emit a dedicated plan event.
+// Reactor implementation. Scheduler controller 任务的终态事件触发其名下全部
+// active Team 的拆除；Start 恢复路径兜底清理事件丢失期间残留的 Team。
 func (m *Manager) Name() string { return "agent-template-team-manager" }
 
 func (m *Manager) Subscribe() []trace.EventKind {
 	return []trace.EventKind{
-		trace.KindAcceptanceCompleted,
-		trace.KindPlanTerminal,
-		trace.KindPlanRevisionChanged,
-		trace.KindPlanPaused,
 		trace.KindTaskCompleted,
 		trace.KindTaskFailed,
 		trace.KindTaskBlocked,
@@ -463,7 +446,7 @@ func (m *Manager) Subscribe() []trace.EventKind {
 }
 
 // IsSync 返回 false（C2 修复，2026-07-18）：本 Reactor 的 Run 会读
-// GetTask/GetPlan、竞争 opMu、并在 StopPlan 里做全量 JSON 重写 + 两次 fsync。
+// GetTask、竞争 opMu、并在 StopController 里做全量 JSON 重写 + 两次 fsync。
 // 过去 IsSync=true 让这些工作全部压在 trace.Emit 调用方（agent 终态路径）
 // 的 goroutine 上，磁盘抖动直接拖慢所有 agent。
 //
@@ -474,35 +457,29 @@ func (m *Manager) Subscribe() []trace.EventKind {
 //     观察类 Reactor（history/artifact/read-set-write）各自独立。
 //  2. 终态事件的 Emit 方（agent 状态机、tools/plan_control）在 Emit 返回后
 //     不再触碰任何 team 运行时状态。
-//  3. 向已终态 Plan 发起 Provision 由 WithControllerLease 拦截（非 Running
-//     即 ErrPlanPaused），与 Reactor 执行时机无关。
+//  3. controller 任务终态后的 Team 拆除只由本 Reactor 与 Start 恢复兜底
+//     驱动，与 Emit 方执行时机无关；Provision 不再持有任何外部租约，opMu
+//     串行化保证拆除与 provision 不交错、幂等查找结果稳定。
 //  4. Run 本身幂等且由 opMu 串行化、带 closed 守卫：多个终态事件并发触发
-//     或与 Shutdown 竞态都安全；Start 恢复时还会兜底清理终态 Plan 的残留
-//     Team，事件与拆解之间崩溃不留泄漏。
+//     或与 Shutdown 竞态都安全；Start 恢复时还会兜底清理 controller 已终态/
+//     已淘汰的残留 Team，事件与拆解之间崩溃不留泄漏。
 //
 // 代价：async Reactor 失败只记日志、不再向 trace 打 KindError。可接受——
-// GetPlan/StopPlan 的错误是持久层故障，会在其他路径同样暴露。
+// GetTask/StopController 的错误是持久层故障，会在其他路径同样暴露。
 func (m *Manager) IsSync() bool  { return false }
 func (m *Manager) Priority() int { return 790 }
 
 func (m *Manager) Run(ev trace.Event) error {
-	planID := ""
-	if ev.Plan != nil {
-		planID = ev.Plan.PlanID
-	}
-	if planID == "" && ev.TaskID != "" && m.deps.Store != nil {
-		if task, err := m.deps.Store.GetTask(ev.TaskID); err == nil {
-			planID = task.PlanID
-		}
-	}
-	if planID == "" {
+	if ev.TaskID == "" || m.deps.Store == nil {
 		return nil
 	}
-	p, err := m.coordinator.Store().GetPlan(planID)
+	task, err := m.deps.Store.GetTask(ev.TaskID)
 	if err != nil {
-		return err
+		// 任务已淘汰/不存在时无从判定其是否为 controller 终态；残留 Team
+		// 由 Start 恢复路径（controller_missing）兜底清理。
+		return nil
 	}
-	if !model.IsPlanTerminal(p.Status) {
+	if task.EventType != "__scheduler__" || !model.IsTerminal(task.Status) {
 		return nil
 	}
 
@@ -511,12 +488,12 @@ func (m *Manager) Run(ev trace.Event) error {
 	if m.closed {
 		return nil
 	}
-	reason := "plan_terminal:" + string(p.Status)
-	if _, err := m.store.StopPlan(planID, reason); err != nil {
+	reason := "controller_terminal:" + string(task.Status)
+	if _, err := m.store.StopController(task.ID, reason); err != nil {
 		return err
 	}
 	for id, team := range m.active {
-		if team.spec.PlanID != planID {
+		if team.spec.ControllerTaskID != task.ID {
 			continue
 		}
 		delete(m.active, id)
@@ -529,7 +506,7 @@ func (m *Manager) Run(ev trace.Event) error {
 		go func(team *activeTeam) {
 			defer m.cleanupWG.Done()
 			if err := m.waitAndCleanup(team, cleanupMailboxUnregister); err != nil {
-				log.Printf("[team] terminal cleanup team=%s: %v", team.spec.ID, err)
+				log.Printf("[team] controller terminal cleanup team=%s: %v", team.spec.ID, err)
 			}
 		}(team)
 	}
@@ -540,8 +517,6 @@ func (m *Manager) validateDependencies() error {
 	switch {
 	case m.catalog == nil:
 		return fmt.Errorf("team manager catalog is nil")
-	case m.coordinator == nil:
-		return fmt.Errorf("team manager plan coordinator is nil")
 	case m.store == nil:
 		return fmt.Errorf("team manager store is nil")
 	case m.routes == nil:
@@ -623,11 +598,9 @@ func (m *Manager) materializePrepared(prep runtimePreparation, claimRecoveredMai
 		rt := config.AgentRuntimeConfig{
 			InstanceID: agentIDs[i], Kind: "template:" + prep.tmpl.Name,
 			EventType: prep.spec.EventType, AllowedTools: append([]string(nil), prep.tmpl.Tools...),
-			PlanIDScope: prep.spec.PlanID,
-			Model:       prep.tmpl.Model, SystemPrompt: prep.tmpl.SystemPrompt,
-			AgentMaxLoops: prep.tmpl.AgentMaxLoops, TaskMaxRetries: prep.tmpl.TaskMaxRetries,
+			Model: prep.tmpl.Model, SystemPrompt: prep.tmpl.SystemPrompt,
+			TaskMaxRetries:               prep.tmpl.TaskMaxRetries,
 			EnforceCompactTokenThreshold: prep.tmpl.EnforceCompactTokenThreshold,
-			ContextLimit:                 prep.tmpl.ContextLimit,
 			TeamAwareness: fmt.Sprintf("Template team %s has %d homogeneous replicas for: %s",
 				prep.tmpl.Ref, prep.spec.Replicas, prep.spec.Purpose),
 		}
@@ -703,7 +676,7 @@ func (m *Manager) registerRoute(spec TeamSpec, tmpl *agenttemplate.Template) err
 	if spec.Purpose != "" {
 		role = spec.Purpose + " — " + role
 	}
-	return m.routes.RegisterRoute(spec.EventType, spec.EventType, spec.PlanID, spec.Replicas, role,
+	return m.routes.RegisterRoute(spec.EventType, spec.EventType, spec.ControllerTaskID, spec.Replicas, role,
 		append([]string(nil), tmpl.Tools...))
 }
 
@@ -751,7 +724,7 @@ func (m *Manager) waitAndCleanup(team *activeTeam, mailboxMode mailboxCleanupMod
 
 func findIdempotent(specs []TeamSpec, req agenttemplate.ProvisionRequest) (TeamSpec, bool) {
 	for _, spec := range specs {
-		if spec.PlanID == req.PlanID && spec.TemplateRef == req.TemplateRef &&
+		if spec.ControllerTaskID == req.ControllerTaskID && spec.TemplateRef == req.TemplateRef &&
 			spec.Purpose == req.Purpose && spec.Replicas == req.Replicas {
 			return spec, true
 		}

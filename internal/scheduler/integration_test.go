@@ -46,7 +46,7 @@ func TestSchedulerBundle_New_RegistersMailboxAlias(t *testing.T) {
 	cfg := config.DefaultConfig()
 
 	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	if bundle == nil || bundle.Agent == nil {
 		t.Fatal("New returned nil Bundle")
 	}
@@ -79,7 +79,7 @@ func TestSchedulerBundle_New_AgentEventTypeIsScheduler(t *testing.T) {
 	cfg := config.DefaultConfig()
 
 	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil,
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	if bundle.Agent.EventType != "__scheduler__" {
 		t.Errorf("Agent.EventType = %q, want __scheduler__", bundle.Agent.EventType)
 	}
@@ -102,38 +102,32 @@ func TestSchedulerBundle_New_AppliesConfiguredBehaviorBudgets(t *testing.T) {
 		s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 		r := roster.NewMemoryRoster()
 		return New(s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil,
-			nil, nil, nil, nil, nil, nil)
+			nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	}
 
 	t.Run("yaml values", func(t *testing.T) {
 		cfg := config.DefaultConfig()
-		cfg.Scheduler.AgentMaxLoops = 47
 		cfg.Scheduler.EnforceCompactTokenThreshold = 160000
-		cfg.Scheduler.ContextLimit = 240000
 		agent := newBundle(cfg).Agent
-		if agent.MaxLoops != 47 || agent.CompactTokenThreshold != 160000 || agent.ContextLimit != 240000 {
-			t.Fatalf("scheduler agent budgets not applied: loops=%d compact=%d context=%d",
-				agent.MaxLoops, agent.CompactTokenThreshold, agent.ContextLimit)
+		if agent.CompactTokenThreshold != 160000 {
+			t.Fatalf("scheduler agent budget not applied: compact=%d",
+				agent.CompactTokenThreshold)
 		}
 	})
 
 	t.Run("zero values preserve compatibility defaults", func(t *testing.T) {
 		cfg := config.DefaultConfig()
-		cfg.Scheduler.AgentMaxLoops = 0
 		cfg.Scheduler.EnforceCompactTokenThreshold = 0
-		cfg.Scheduler.ContextLimit = 0
 		agent := newBundle(cfg).Agent
-		if agent.MaxLoops != schedulerMaxLoops ||
-			agent.CompactTokenThreshold != config.DefaultSchedulerCompactTokenThreshold ||
-			agent.ContextLimit != config.DefaultSchedulerContextLimit {
-			t.Fatalf("scheduler compatibility defaults changed: loops=%d compact=%d context=%d",
-				agent.MaxLoops, agent.CompactTokenThreshold, agent.ContextLimit)
+		if agent.CompactTokenThreshold != config.DefaultSchedulerCompactTokenThreshold {
+			t.Fatalf("scheduler compatibility defaults changed: compact=%d",
+				agent.CompactTokenThreshold)
 		}
 	})
 }
 
-// TestSchedulerBundle_New_ModesDefaultAxes 验证 Bundle.Modes 默认三轴
-// 为 immediate / normal / team（nil modeStore 回落 DefaultStore）。
+// TestSchedulerBundle_New_ModesDefaultAxes 验证 Bundle.Modes 两轴默认值
+// 为 normal / team（nil modeStore 回落 DefaultStore）。
 func TestSchedulerBundle_New_ModesDefaultAxes(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
@@ -141,12 +135,9 @@ func TestSchedulerBundle_New_ModesDefaultAxes(t *testing.T) {
 	cfg := config.DefaultConfig()
 
 	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil,
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	if bundle.Modes == nil {
 		t.Fatal("Bundle.Modes is nil")
-	}
-	if bundle.Modes.GetGate() != modes.GateImmediate {
-		t.Errorf("default gate = %v, want GateImmediate", bundle.Modes.GetGate())
 	}
 	if bundle.Modes.GetExec() != modes.ExecNormal {
 		t.Errorf("default exec = %v, want ExecNormal", bundle.Modes.GetExec())
@@ -199,7 +190,7 @@ func TestSchedulerBundle_EndToEnd_UserInputToReportDone(t *testing.T) {
 	}
 
 	bundle := New(s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	// 启动 Activator + Agent
 	ctx, cancel := context.WithCancel(context.Background())

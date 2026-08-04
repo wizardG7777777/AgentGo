@@ -23,7 +23,7 @@ func TestAgent_OnTaskEnd_ReportsSuccessOnSubmitResult(t *testing.T) {
 		return ExecuteResult{Output: "ok", ToolCalled: false}, nil
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 10)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	called := false
 	successVal := false
 	ag.OnTaskEnd = func(taskID string, success bool) {
@@ -56,7 +56,7 @@ func TestAgent_OnTaskEnd_ReportsFailureOnExecutionError(t *testing.T) {
 		return ExecuteResult{}, errors.New("boom")
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 10)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	called := false
 	successVal := true
 	ag.OnTaskEnd = func(taskID string, success bool) {

@@ -15,10 +15,9 @@ import (
 // LLM 服务器连接失败时走 ErrRecoverable 路径，166+ 次空转。修复后
 // scheduler 改用 schedulerMaxRetries=5 常量，这个终止路径必须被验证。
 //
-// 实现注意：handleFailure 在 recoverable 分支里会调用 buildTransferNote，
-// 后者内部会再调一次 Execute 做 L1 LLM 压缩（transfer_note.go:82）。
-// 所以每次失败迭代的 executor 调用数 = 2（主调用 + L1 压缩尝试）。
-// 因此 callCount 上限按 "(MaxRetries+1) * 2" 计算，而不是朴素的 MaxRetries+1。
+// 实现注意：V6 CM4 删除 TransferNote 后，handleFailure 的 recoverable 分支
+// 不再发起任何额外 LLM 调用——每次失败迭代的 executor 调用数恒为 1，
+// callCount 上限就是朴素的 MaxRetries+1。
 func TestAgent_RecoverableError_BoundedByMaxRetries(t *testing.T) {
 	testCases := []struct {
 		name       string
@@ -43,7 +42,7 @@ func TestAgent_RecoverableError_BoundedByMaxRetries(t *testing.T) {
 				return ExecuteResult{}, &ErrRecoverable{Err: errors.New("persistent llm outage")}
 			}
 
-			ag := NewAgent("agent-retry", "code", s, r, executor, 5)
+			ag := NewAgent("agent-retry", "code", s, r, executor)
 			ag.MaxRetries = tc.maxRetries
 
 			// 关键断言：循环必须在有限次外层迭代里终止。
@@ -78,13 +77,12 @@ func TestAgent_RecoverableError_BoundedByMaxRetries(t *testing.T) {
 				t.Errorf("status = %s, want failed (bounded retry should terminate)", got.Status)
 			}
 
-			// callCount 上限（2026-04-25 TransferNote 分类分派后）：
-			//   - 前 MaxRetries 次迭代 = transient（未到 terminal），每次 1 次主调用（L1 skip）
-			//   - 最后 1 次迭代 = willTerminate=true，2 次调用（主 + L1）
-			// 总上限 = MaxRetries + 2。超过说明某条路径漏算了 RetryCount 或分类错误。
-			maxCalls := tc.maxRetries + 2
+			// callCount 上限：每次失败迭代恰好 1 次主调用（V6 CM4 起失败路径
+			// 不再有额外的交接备忘 LLM 调用），总上限 = MaxRetries + 1。
+			// 超过说明某条路径漏算了 RetryCount 或终止判定失效。
+			maxCalls := tc.maxRetries + 1
 			if callCount > maxCalls {
-				t.Errorf("callCount = %d, want <= %d （transient skip L1 + terminal 1 次 L1；可能退化为无限重试或 L1 分派失效）",
+				t.Errorf("callCount = %d, want <= %d（可能退化为无限重试）",
 					callCount, maxCalls)
 			}
 			if callCount == 0 {
@@ -121,7 +119,7 @@ func TestAgent_RecoverableError_MaxRetriesZeroStillRetries(t *testing.T) {
 		return ExecuteResult{Output: "finally ok", ToolCalled: false}, nil
 	}
 
-	ag := NewAgent("agent-zero", "code", s, r, executor, 5)
+	ag := NewAgent("agent-zero", "code", s, r, executor)
 	ag.MaxRetries = 0 // 显式"不限制"
 
 	outerIters := 0

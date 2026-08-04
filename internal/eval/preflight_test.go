@@ -2,6 +2,7 @@ package eval
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -117,6 +118,45 @@ func TestPreflight_OK(t *testing.T) {
 	s := out.String()
 	if !strings.Contains(s, "凭证检查通过") || !strings.Contains(s, "200 OK") || !strings.Contains(s, "eval-test-model") {
 		t.Fatalf("成功报告要素不全: %s", s)
+	}
+}
+
+func TestPreflight_ProbesSchedulerModelOverride(t *testing.T) {
+	models := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("解码探测请求: %v", err)
+		}
+		models <- body.Model
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"choices":[]}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	tpl := filepath.Join(t.TempDir(), "config.template.yaml")
+	content := fmt.Sprintf(`llm:
+  base_url: %s
+  api_key: ${EVAL_TEST_API_KEY}
+  default_model: fallback-model
+scheduler:
+  model: scheduler-model
+`, srv.URL)
+	if err := os.WriteFile(tpl, []byte(content), 0o644); err != nil {
+		t.Fatalf("写模板失败: %v", err)
+	}
+	t.Setenv("EVAL_TEST_API_KEY", "sk-test")
+	var out strings.Builder
+	if err := Preflight(context.Background(), PreflightOptions{TemplatePath: tpl}, &out); err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	if got := <-models; got != "scheduler-model" {
+		t.Fatalf("探测模型 = %q, want scheduler-model", got)
+	}
+	if !strings.Contains(out.String(), "scheduler-model") {
+		t.Fatalf("成功报告应展示真实 Scheduler 模型: %s", out.String())
 	}
 }
 
@@ -277,7 +317,7 @@ func TestPreflight_TemplateNotFound(t *testing.T) {
 }
 
 func TestPreflight_TemplateFailsV4Validate(t *testing.T) {
-	// agents[0] 缺行为参数（agent_max_loops 等必填且 >0）——
+	// agents[0] 缺行为参数（task_max_retries/enforce_compact_token_threshold 必填且 >0）——
 	// 必须在 preflight 阶段拦截，而不是等子进程启动失败空转 90 秒
 	srv, hits := newStubServer(t, http.StatusOK, `{}`)
 	content := fmt.Sprintf(`llm:

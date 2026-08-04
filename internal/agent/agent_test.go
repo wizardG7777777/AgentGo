@@ -33,7 +33,7 @@ func TestAgent_SuccessfulExecution(t *testing.T) {
 		return ExecuteResult{Output: "executed successfully", ToolCalled: false}, nil
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.PollInterval = 10 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -78,7 +78,7 @@ func TestAgent_RecoverableError(t *testing.T) {
 		return ExecuteResult{Output: "success on retry", ToolCalled: false}, nil
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.PollInterval = 10 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -148,7 +148,7 @@ func TestAgent_RecoverableRetryPersistsToolHistoryInStoreAndSnapshot(t *testing.
 		}
 	}
 
-	ag := NewAgent("agent-history", "code", s, r, executor, 10)
+	ag := NewAgent("agent-history", "code", s, r, executor)
 	ag.processTask(context.Background(), task.ID)
 
 	stored, err := s.GetTask(task.ID)
@@ -200,7 +200,7 @@ func TestAgent_UnrecoverableError(t *testing.T) {
 		return ExecuteResult{}, errors.New("permanent failure")
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.PollInterval = 10 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -231,7 +231,7 @@ func TestAgent_ContextCancellation(t *testing.T) {
 		return ExecuteResult{}, ctx.Err()
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.PollInterval = 10 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -265,7 +265,7 @@ func TestAgent_SkipsWrongEventType(t *testing.T) {
 	}
 
 	// Agent only handles "code" events
-	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.PollInterval = 10 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -305,7 +305,7 @@ func TestAgent_ReadsDependencyResults(t *testing.T) {
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.PollInterval = 10 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -370,7 +370,7 @@ func TestBugCondition_MultiRoundTaskExecutorCallCount(t *testing.T) {
 		return ExecuteResult{Output: "final result", ToolCalled: false}, nil
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 
 	ctx := context.Background()
 	ag.processTask(ctx, task.ID)
@@ -380,55 +380,6 @@ func TestBugCondition_MultiRoundTaskExecutorCallCount(t *testing.T) {
 	if callCount != totalRoundsNeeded {
 		t.Errorf("executor call count = %d, want %d (proves bug: processTask only calls executor once, no ReAct loop)",
 			callCount, totalRoundsNeeded)
-	}
-}
-
-// TestBugCondition_MaxLoopsHasNoEffect verifies that changing MaxLoops should
-// affect how many times the executor can be called. On unfixed code, MaxLoops
-// is never referenced — the executor is always called exactly once regardless.
-//
-// **Validates: Requirements 1.4, 1.5, 2.3**
-func TestBugCondition_MaxLoopsHasNoEffect(t *testing.T) {
-	maxLoopsValues := []int{1, 3, 5, 10}
-
-	for _, maxLoops := range maxLoopsValues {
-		t.Run(fmt.Sprintf("MaxLoops=%d", maxLoops), func(t *testing.T) {
-			s, r, _ := setup()
-
-			task := &model.Task{Description: "maxloops test", EventType: "code"}
-			s.PublishTask(task)
-
-			if err := s.ClaimTask("agent-1", task.ID); err != nil {
-				t.Fatalf("ClaimTask failed: %v", err)
-			}
-
-			callCount := 0
-			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
-				callCount++
-				return ExecuteResult{Output: "result", ToolCalled: true}, nil
-			}
-
-			ag := NewAgent("agent-1", "code", s, r, executor, maxLoops)
-
-			ctx := context.Background()
-			ag.processTask(ctx, task.ID)
-
-			// BUG ASSERTION: With executor always returning ToolCalled: true,
-			// the loop should run exactly MaxLoops times and then trigger RetryRollback.
-			// On unfixed code, callCount is ALWAYS 1 regardless of MaxLoops,
-			// proving MaxLoops is never referenced.
-			//
-			// Sprint 3 #5 调整：handleMaxLoops 路径现在会额外调一次 Execute 用于
-			// buildTransferNote L1 压缩，因此期望是 maxLoops + 1。这个额外调用
-			// 不是 ReactLoop 的一部分，而是"任务终止前生成跨 agent 交接备忘"，
-			// 属于 TransferNote 子系统。测试期望同步更新，继续守护"ReactLoop
-			// 不多跑一圈"的原始不变式。
-			expected := maxLoops + 1
-			if callCount != expected {
-				t.Errorf("MaxLoops=%d but executor called %d time(s) — expected %d (loops + 1 TransferNote L1 call)",
-					maxLoops, callCount, expected)
-			}
-		})
 	}
 }
 
@@ -473,7 +424,7 @@ func TestPreservation_SingleRoundCompletion(t *testing.T) {
 				return ExecuteResult{Output: tc.result, ToolCalled: false}, nil
 			}
 
-			ag := NewAgent("agent-1", "code", s, r, executor, 50)
+			ag := NewAgent("agent-1", "code", s, r, executor)
 			ag.processTask(context.Background(), task.ID)
 
 			got, err := s.GetTask(task.ID)
@@ -520,7 +471,7 @@ func TestPreservation_UnrecoverableError(t *testing.T) {
 				return ExecuteResult{}, errors.New(tc.errMsg)
 			}
 
-			ag := NewAgent("agent-1", "code", s, r, executor, 50)
+			ag := NewAgent("agent-1", "code", s, r, executor)
 			ag.processTask(context.Background(), task.ID)
 
 			got, err := s.GetTask(task.ID)
@@ -565,7 +516,7 @@ func TestPreservation_RecoverableError(t *testing.T) {
 				return ExecuteResult{}, &ErrRecoverable{Err: errors.New(tc.errMsg)}
 			}
 
-			ag := NewAgent("agent-1", "code", s, r, executor, 50)
+			ag := NewAgent("agent-1", "code", s, r, executor)
 			ag.processTask(context.Background(), task.ID)
 
 			got, err := s.GetTask(task.ID)
@@ -615,7 +566,7 @@ func TestPreservation_DependencyResults(t *testing.T) {
 			return ExecuteResult{Output: "done", ToolCalled: false}, nil
 		}
 
-		ag := NewAgent("agent-1", "code", s, r, executor, 50)
+		ag := NewAgent("agent-1", "code", s, r, executor)
 		ag.processTask(context.Background(), task.ID)
 
 		if receivedDeps == nil {
@@ -653,7 +604,7 @@ func TestPreservation_DependencyResults(t *testing.T) {
 			return ExecuteResult{Output: "done", ToolCalled: false}, nil
 		}
 
-		ag := NewAgent("agent-1", "code", s, r, executor, 50)
+		ag := NewAgent("agent-1", "code", s, r, executor)
 		ag.processTask(context.Background(), task.ID)
 
 		if receivedDeps[dep1.ID] != "output-1" {
@@ -677,7 +628,7 @@ func TestPreservation_DependencyResults(t *testing.T) {
 			return ExecuteResult{Output: "done", ToolCalled: false}, nil
 		}
 
-		ag := NewAgent("agent-1", "code", s, r, executor, 50)
+		ag := NewAgent("agent-1", "code", s, r, executor)
 		ag.processTask(context.Background(), task.ID)
 
 		if receivedDeps == nil {
@@ -698,7 +649,7 @@ func TestPreservation_ContextCancellation(t *testing.T) {
 			return ExecuteResult{Output: "done", ToolCalled: false}, nil
 		}
 
-		ag := NewAgent("agent-1", "code", s, r, executor, 50)
+		ag := NewAgent("agent-1", "code", s, r, executor)
 		ag.PollInterval = 10 * time.Millisecond
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -735,7 +686,7 @@ func TestPreservation_ContextCancellation(t *testing.T) {
 			return ExecuteResult{Output: "done", ToolCalled: false}, nil
 		}
 
-		ag := NewAgent("agent-1", "code", s, r, executor, 50)
+		ag := NewAgent("agent-1", "code", s, r, executor)
 		ag.PollInterval = 50 * time.Millisecond
 
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -777,7 +728,7 @@ func TestPreservation_ExecutorReceivesCorrectTask(t *testing.T) {
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.processTask(context.Background(), task.ID)
 
 	if receivedTask == nil {
@@ -814,7 +765,7 @@ func TestPreservation_SingleRoundCompletion_Quick(t *testing.T) {
 			return ExecuteResult{Output: result, ToolCalled: false}, nil
 		}
 
-		ag := NewAgent("agent-1", "code", s, r, executor, 50)
+		ag := NewAgent("agent-1", "code", s, r, executor)
 		ag.processTask(context.Background(), task.ID)
 
 		got, _ := s.GetTask(task.ID)
@@ -863,7 +814,7 @@ func TestPreservation_ErrorHandling_Quick(t *testing.T) {
 				return ExecuteResult{}, errors.New(ec.errMsg)
 			}
 
-			ag := NewAgent("agent-1", "code", s, r, executor, 50)
+			ag := NewAgent("agent-1", "code", s, r, executor)
 			ag.processTask(context.Background(), task.ID)
 
 			got, _ := s.GetTask(task.ID)
@@ -933,7 +884,7 @@ func TestProperty_RoundTripConsistency(t *testing.T) {
 				return ExecuteResult{Output: expectedOutputs[round], ToolCalled: false}, nil
 			}
 
-			ag := NewAgent("agent-1", "code", s, r, executor, totalRounds+10)
+			ag := NewAgent("agent-1", "code", s, r, executor)
 			ag.processTask(context.Background(), task.ID)
 
 			// Verify executor was called the expected number of times
@@ -990,7 +941,7 @@ func TestProperty_HistoryLengthInvariant(t *testing.T) {
 				return ExecuteResult{Output: fmt.Sprintf("round-%d-final", round), ToolCalled: false}, nil
 			}
 
-			ag := NewAgent("agent-1", "code", s, r, executor, totalRounds+10)
+			ag := NewAgent("agent-1", "code", s, r, executor)
 			ag.processTask(context.Background(), task.ID)
 
 			// Verify executor was called the expected number of times
@@ -1050,7 +1001,7 @@ func TestProperty_HistoryToolCalledAlwaysTrue(t *testing.T) {
 				return ExecuteResult{Output: fmt.Sprintf("round-%d-final", round), ToolCalled: false}, nil
 			}
 
-			ag := NewAgent("agent-1", "code", s, r, executor, totalRounds+10)
+			ag := NewAgent("agent-1", "code", s, r, executor)
 			ag.processTask(context.Background(), task.ID)
 
 			// Verify executor was called the expected number of times
@@ -1121,7 +1072,7 @@ func TestProperty_ReadOnlySemantics(t *testing.T) {
 		return ExecuteResult{Output: expectedOutputs[round], ToolCalled: false}, nil
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, totalRounds+10)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.processTask(context.Background(), task.ID)
 
 	// Verify executor was called the expected number of times
@@ -1165,7 +1116,7 @@ func TestProperty_ReadOnlySemantics(t *testing.T) {
 // =============================================================================
 // Behavior Preservation Tests — Tasks 4.1–4.4
 // These tests verify that existing behaviors (single-round completion, error
-// handling, MaxLoops cap, context cancellation) remain correct after the
+// handling, context cancellation) remain correct after the
 // history-passing changes.
 // =============================================================================
 
@@ -1192,7 +1143,7 @@ func TestBehavior_SingleRoundEmptyHistory(t *testing.T) {
 		return ExecuteResult{Output: "done-first-round", ToolCalled: false}, nil
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.processTask(context.Background(), task.ID)
 
 	// Executor should be called exactly once
@@ -1258,7 +1209,7 @@ func TestBehavior_ErrorDoesNotAppendHistory(t *testing.T) {
 		}
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.processTask(context.Background(), task.ID)
 
 	// Executor should be called exactly 2 times (round 0 success, round 1 error)
@@ -1283,95 +1234,6 @@ func TestBehavior_ErrorDoesNotAppendHistory(t *testing.T) {
 	}
 	if got.Status != model.TaskStatusFailed {
 		t.Errorf("status = %s, want failed", got.Status)
-	}
-}
-
-// TestBehavior_MaxLoopsHistoryLength verifies that when all rounds return
-// ToolCalled: true, the last round's executor receives history of length
-// MaxLoops-1, and RetryRollback is triggered. Tests with MaxLoops = 2, 3, 5.
-//
-// **Validates: Requirements 3.5, 4.4**
-func TestBehavior_MaxLoopsHistoryLength(t *testing.T) {
-	maxLoopsValues := []int{2, 3, 5}
-
-	for _, maxLoops := range maxLoopsValues {
-		t.Run(fmt.Sprintf("MaxLoops=%d", maxLoops), func(t *testing.T) {
-			s, r, _ := setup()
-
-			task := &model.Task{Description: "maxloops-history", EventType: "code"}
-			s.PublishTask(task)
-			if err := s.ClaimTask("agent-1", task.ID); err != nil {
-				t.Fatalf("ClaimTask failed: %v", err)
-			}
-
-			historyLengths := make([]int, 0, maxLoops)
-			callCount := 0
-
-			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
-				callCount++
-				historyLengths = append(historyLengths, len(history))
-				return ExecuteResult{Output: fmt.Sprintf("round-%d", callCount-1), ToolCalled: true}, nil
-			}
-
-			ag := NewAgent("agent-1", "code", s, r, executor, maxLoops)
-			ag.processTask(context.Background(), task.ID)
-
-			// Executor should be called MaxLoops + 1 times:
-			//   - MaxLoops: ReactLoop 迭代
-			//   - +1: handleMaxLoops 路径 buildTransferNote L1 压缩（Sprint 3 #5 新增）
-			expected := maxLoops + 1
-			if callCount != expected {
-				t.Fatalf("executor call count = %d, want %d (MaxLoops+1 含 TransferNote L1)", callCount, expected)
-			}
-
-			// 90% 预算警告会在 i >= floor(maxLoops*0.9) 的那一轮一次性追加 1 条 history
-			// （详见 agent.go budgetWarningPrompt 注入点）。被警告之后所有 round 看到的
-			// history 长度都比"老语义" + 1。整数除法天然向下取整。
-			budgetWarnAt := maxLoops * 9 / 10
-			warningExtra := func(round int) int {
-				if round >= budgetWarnAt {
-					return 1
-				}
-				return 0
-			}
-
-			// Verify history length at the first MaxLoops rounds.
-			// 老语义：round i 看到 len(history) == i
-			// 新语义：round i 看到 len(history) == i + warningExtra(i)
-			for i := 0; i < maxLoops; i++ {
-				want := i + warningExtra(i)
-				if got := historyLengths[i]; got != want {
-					t.Errorf("round %d: len(history) = %d, want %d", i, got, want)
-				}
-			}
-
-			// 最后一次常规 round 看到的 history 长度同上规则
-			lastRegular := historyLengths[maxLoops-1]
-			lastWant := (maxLoops - 1) + warningExtra(maxLoops-1)
-			if lastRegular != lastWant {
-				t.Errorf("last regular round: len(history) = %d, want %d", lastRegular, lastWant)
-			}
-
-			// TransferNote L1 压缩调用：history 累计 = maxLoops（每轮 append）+ warning 注入数 + 1（<transfer-request>）
-			l1CallIdx := maxLoops
-			l1Want := maxLoops + warningExtra(maxLoops-1) + 1
-			if got := historyLengths[l1CallIdx]; got != l1Want {
-				t.Errorf("L1 call: len(history) = %d, want %d (maxLoops + warning + <transfer-request>)",
-					got, l1Want)
-			}
-
-			// RetryRollback should have been triggered: task goes back to pending
-			got, err := s.GetTask(task.ID)
-			if err != nil {
-				t.Fatalf("GetTask failed: %v", err)
-			}
-			if got.Status != model.TaskStatusPending {
-				t.Errorf("status = %s, want pending (RetryRollback)", got.Status)
-			}
-			if got.RetryCount != 1 {
-				t.Errorf("RetryCount = %d, want 1", got.RetryCount)
-			}
-		})
 	}
 }
 
@@ -1403,7 +1265,7 @@ func TestBehavior_ContextCancelExitsLoop(t *testing.T) {
 		return ExecuteResult{Output: fmt.Sprintf("round-%d", callCount-1), ToolCalled: true}, nil
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 100)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.processTask(ctx, task.ID)
 
 	// The executor should be called at most 2 times:
@@ -1427,7 +1289,7 @@ func TestAgent_IdleRetire_ExitsAfterThreshold(t *testing.T) {
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.PollInterval = 10 * time.Millisecond
 	ag.IdleThreshold = 3
 
@@ -1452,7 +1314,7 @@ func TestAgent_IdleRetire_ResetsOnClaim(t *testing.T) {
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.PollInterval = 10 * time.Millisecond
 	ag.IdleThreshold = 5
 
@@ -1494,7 +1356,7 @@ func TestAgent_IdleRetire_DisabledByDefault(t *testing.T) {
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.PollInterval = 10 * time.Millisecond
 	// IdleThreshold 默认为 0，不启用
 
@@ -1534,7 +1396,7 @@ func TestAgent_PerTaskCancel_StopsExecution(t *testing.T) {
 		return ExecuteResult{}, ctx.Err()
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.PollInterval = 10 * time.Millisecond
 	ag.CancelRegistry = registry
 	ag.IdleThreshold = 3 // 任务取消后代理回到轮询，很快因空闲退出
@@ -1583,7 +1445,7 @@ func TestAgent_PerTaskCancel_NilRegistryFallback(t *testing.T) {
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.PollInterval = 10 * time.Millisecond
 	// CancelRegistry 默认 nil
 
@@ -1622,7 +1484,7 @@ func TestAgent_AppendOutput_CalledDuringExecution(t *testing.T) {
 		return ExecuteResult{Output: "final", ToolCalled: false}, nil
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.PollInterval = 10 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1683,7 +1545,7 @@ func TestAgent_OnTaskStart_Called(t *testing.T) {
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
 
-	ag := NewAgent("agent-hook", "code", s, r, executor, 50)
+	ag := NewAgent("agent-hook", "code", s, r, executor)
 	ag.PollInterval = 10 * time.Millisecond
 	ag.OnTaskStart = func(taskID string) {
 		capturedTaskID = taskID
@@ -1731,7 +1593,7 @@ func TestAgent_FileCache_ClearedOnTaskStart(t *testing.T) {
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
 
-	ag := NewAgent("agent-1", "code", s, r, executor, 50)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.FileCache = cache
 	ag.processTask(context.Background(), task.ID)
 }

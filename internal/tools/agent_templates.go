@@ -10,18 +10,16 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/agenttemplate"
 	"agentgo/internal/model"
-	"agentgo/internal/plan"
 	"agentgo/internal/store"
 	"agentgo/internal/tools/schema"
 )
 
 // AgentTemplateGroup exposes Scheduler-only discovery and provisioning. It
 // creates runtime Team resources, never DAG nodes; Scheduler must use the
-// returned event_type in a later publish_task/ensure_acceptance_run call.
+// returned event_type in a later publish_task call.
 type AgentTemplateGroup struct {
 	Catalog     *agenttemplate.Catalog
 	Provisioner agenttemplate.Provisioner
-	Coordinator *plan.Coordinator
 	Store       store.TaskStore
 	Holder      TaskHolder
 }
@@ -32,13 +30,13 @@ func (g AgentTemplateGroup) Register(r *agent.ToolRegistry) {
 	}
 	r.Register("list_agent_templates", "列出不可变 AgentTemplate；模板只是可用蓝图，不代表已有可认领任务的 runtime route。",
 		schema.Object().Build(), g.list)
-	if g.Provisioner == nil || g.Coordinator == nil || g.Store == nil || g.Holder == nil {
+	if g.Provisioner == nil || g.Store == nil || g.Holder == nil {
 		return
 	}
-	r.Register("provision_agent_team", "从一个精确版本模板创建 Plan-scoped Agent Team。成功返回 ready event_type；必须等下一轮读到真实返回值后再发布 Task，禁止猜测 route。",
+	r.Register("provision_agent_team", "从一个精确版本模板创建按发起 controller 任务归属的 Agent Team。成功返回 ready event_type；必须等下一轮读到真实返回值后再发布 Task，禁止猜测 route。",
 		schema.Object().
 			String("template_ref", "精确引用 namespace/name@version，例如 builtin/generalist@1", true).
-			String("purpose", "该 Team 在当前 Plan 中的明确职责", true).
+			String("purpose", "该 Team 的职责", true).
 			Int("replicas", "同质副本数，默认 1，受模板和进程预算限制", false).
 			Build(), g.provision)
 }
@@ -52,7 +50,7 @@ func (g AgentTemplateGroup) list(_ context.Context, _ map[string]any) (string, e
 }
 
 func (g AgentTemplateGroup) provision(ctx context.Context, args map[string]any) (string, error) {
-	controller, p, err := g.currentController()
+	task, err := g.currentController()
 	if err != nil {
 		return "", err
 	}
@@ -84,7 +82,7 @@ func (g AgentTemplateGroup) provision(ctx context.Context, args map[string]any) 
 		return "", fmt.Errorf("replicas must be between 1 and 32")
 	}
 	result, err := g.Provisioner.Provision(ctx, agenttemplate.ProvisionRequest{
-		PlanID: p.ID, ControllerTaskID: controller.ID, TemplateRef: ref,
+		ControllerTaskID: task.ID, TemplateRef: ref,
 		Purpose: purpose, Replicas: replicas,
 	})
 	if err != nil {
@@ -97,24 +95,19 @@ func (g AgentTemplateGroup) provision(ctx context.Context, args map[string]any) 
 	return string(data), nil
 }
 
-func (g AgentTemplateGroup) currentController() (*model.Task, *model.Plan, error) {
+// currentController 取当前任务，并要求它是正在执行的 Scheduler 任务
+// （EventType == "__scheduler__" 且 Status == processing）。
+func (g AgentTemplateGroup) currentController() (*model.Task, error) {
 	taskID := g.Holder.Get()
 	if taskID == "" {
-		return nil, nil, fmt.Errorf("no current task context")
+		return nil, fmt.Errorf("no current task context")
 	}
 	task, err := g.Store.GetTask(taskID)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	if task.PlanID == "" || task.NodeRole != model.PlanNodeRoleController || task.EventType != "__scheduler__" {
-		return nil, nil, fmt.Errorf("agent team provisioning requires a Scheduler controller task")
+	if task.EventType != "__scheduler__" || task.Status != model.TaskStatusProcessing {
+		return nil, fmt.Errorf("agent team provisioning requires a running Scheduler task")
 	}
-	p, err := g.Coordinator.Store().GetPlan(task.PlanID)
-	if err != nil {
-		return nil, nil, err
-	}
-	if p.Status != model.PlanStatusRunning || p.ActiveDecisionTaskID != task.ID {
-		return nil, nil, fmt.Errorf("controller task %s is not active for running plan %s", task.ID, p.ID)
-	}
-	return task, p, nil
+	return task, nil
 }

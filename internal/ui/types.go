@@ -117,7 +117,7 @@ const (
 	KindAgentsChanged
 	// KindTraceEvent 是 trace 事件流（经 internal/dashboard 的 TraceReactor
 	// 注入 Hub.EmitTraceEvent）。注意 trace 含高频事件（llm_call_start/end、
-	// tool_call/result、token_stats）——订阅者侧由 drop-oldest 背压策略保护，
+	// tool_call/result）——订阅者侧由 drop-oldest 背压策略保护，
 	// 慢前端只丢事件、绝不阻塞 Hub。
 	KindTraceEvent
 )
@@ -198,7 +198,6 @@ type InteractionItem struct {
 	AllowFreeText bool                `json:"allow_free_text,omitempty"`
 	SubjectKind   string              `json:"subject_kind,omitempty"`
 	SubjectID     string              `json:"subject_id,omitempty"`
-	PlanID        string              `json:"plan_id,omitempty"`
 	TaskID        string              `json:"task_id,omitempty"`
 	AgentID       string              `json:"agent_id,omitempty"`
 	CreatedAt     time.Time           `json:"created_at"`
@@ -208,25 +207,24 @@ type InteractionItem struct {
 // AgentCard 是单个代理的运行状态卡片。字段与 tui.AgentInfo 完全镜像
 // （本包不允许 import tui，故显式复制字段集；bootstrap 装配时做转换）。
 type AgentCard struct {
-	ID               string                 `json:"id"`
-	Type             string                 `json:"type"`  // "worker", "explorer", "scheduler"
-	State            string                 `json:"state"` // "idle", "processing", "waiting_interaction", "terminating"
-	CurrentTaskID    string                 `json:"current_task_id"`
-	CurrentTaskDesc  string                 `json:"current_task_desc"`
-	MailboxPending   int                    `json:"mailbox_pending"`
-	PromptTokens     int64                  `json:"prompt_tokens"`
-	CompletionTokens int64                  `json:"completion_tokens"`
-	CallCount        int                    `json:"call_count"`
-	Loop             int                    `json:"loop"`
-	Phase            string                 `json:"phase"`
-	LastModelText    string                 `json:"last_model_text"`
-	LastTool         string                 `json:"last_tool"`
-	ToolCallCount    int                    `json:"tool_call_count"`
-	LastActivityAt   time.Time              `json:"last_activity_at"`
-	ActivityAge      string                 `json:"activity_age"`
-	LastError        string                 `json:"last_error"`
-	ActiveTools      []AgentToolActivity    `json:"active_tools,omitempty"`
-	SchedulerControl *SchedulerControlState `json:"scheduler_control,omitempty"`
+	ID               string              `json:"id"`
+	Type             string              `json:"type"`  // "worker", "explorer", "scheduler"
+	State            string              `json:"state"` // "idle", "processing", "waiting_interaction", "terminating"
+	CurrentTaskID    string              `json:"current_task_id"`
+	CurrentTaskDesc  string              `json:"current_task_desc"`
+	MailboxPending   int                 `json:"mailbox_pending"`
+	PromptTokens     int64               `json:"prompt_tokens"`
+	CompletionTokens int64               `json:"completion_tokens"`
+	CallCount        int                 `json:"call_count"`
+	Loop             int                 `json:"loop"`
+	Phase            string              `json:"phase"`
+	LastModelText    string              `json:"last_model_text"`
+	LastTool         string              `json:"last_tool"`
+	ToolCallCount    int                 `json:"tool_call_count"`
+	LastActivityAt   time.Time           `json:"last_activity_at"`
+	ActivityAge      string              `json:"activity_age"`
+	LastError        string              `json:"last_error"`
+	ActiveTools      []AgentToolActivity `json:"active_tools,omitempty"`
 }
 
 // AgentToolActivity is the frontend-safe projection of one tool invocation
@@ -237,32 +235,6 @@ type AgentToolActivity struct {
 	CallID    string    `json:"call_id,omitempty"`
 	Tool      string    `json:"tool"`
 	StartedAt time.Time `json:"started_at"`
-}
-
-// SchedulerControlState is the optional role-specific facet attached to the
-// otherwise shared Agent workbench. It projects only decision-relevant Plan
-// facts; the PlanStore remains authoritative and complete evidence stays in
-// the trace/acceptance stores.
-type SchedulerControlState struct {
-	PlanID                 string  `json:"plan_id"`
-	Status                 string  `json:"status"`
-	Revision               int64   `json:"revision"`
-	ExecutionStateVersion  int64   `json:"execution_state_version"`
-	HandledStateVersion    int64   `json:"handled_state_version"`
-	TasksTotal             int     `json:"tasks_total"`
-	TasksPending           int     `json:"tasks_pending"`
-	TasksProcessing        int     `json:"tasks_processing"`
-	TasksCompleted         int     `json:"tasks_completed"`
-	TasksFailed            int     `json:"tasks_failed"`
-	TasksCancelled         int     `json:"tasks_cancelled"`
-	PendingReplans         int     `json:"pending_replans"`
-	AcceptanceRunID        string  `json:"acceptance_run_id,omitempty"`
-	AcceptanceStatus       string  `json:"acceptance_status,omitempty"`
-	AcceptanceVerdict      string  `json:"acceptance_verdict,omitempty"`
-	AcceptanceAttempt      int     `json:"acceptance_attempt,omitempty"`
-	AcceptanceSpecRevision int64   `json:"acceptance_spec_revision,omitempty"`
-	PauseReason            string  `json:"pause_reason,omitempty"`
-	BudgetUsedPercent      float64 `json:"budget_used_percent,omitempty"`
 }
 
 // BoardTask 是任务看板 / 侧边栏需要的一行任务信息，由 model.Task 映射而来。
@@ -314,14 +286,6 @@ func SessionInfoFromMetadata(m session.Metadata) SessionInfo {
 	}
 }
 
-// PlanReviewItem 是 gate=plan 模式下等待用户批准的计划条目（/plan 列表）。
-// ui 包不允许 import internal/plan，条目由装配方从 PlanStore 投影而来。
-type PlanReviewItem struct {
-	PlanID      string    `json:"plan_id"`
-	SubmittedAt time.Time `json:"submitted_at"`
-	Excerpt     string    `json:"excerpt"` // 计划全文摘要（已按展示长度截断）
-}
-
 // Snapshot 是系统某一时刻的完整状态快照。
 //
 // 快照及其切片发布后即视为只读：Hub 内部对快照采用"整体替换、绝不原地
@@ -330,7 +294,6 @@ type PlanReviewItem struct {
 type Snapshot struct {
 	Agents              []AgentCard       `json:"agents"`
 	Tasks               []BoardTask       `json:"tasks"`
-	Mode                string            `json:"mode"`      // "plan" | "immediate"（由注入的 ModeGet 决定）
 	ExecMode            string            `json:"exec_mode"` // "normal" | "strict" | "readonly" | "yolo"（由注入的 ExecModeGet 决定）
 	TopoMode            string            `json:"topo_mode"` // "team" | "solo"（由注入的 TopoModeGet 决定）
 	Session             SessionInfo       `json:"session"`
@@ -339,7 +302,7 @@ type Snapshot struct {
 	Feed                FeedSnapshot      `json:"feed"`
 	Turns               []AgentTurn       `json:"turns"`
 	// Session 级 token 累计：进程启动以来全部 LLM 调用的汇总，由 Hub 逐条
-	// 累加 token_stats 事件得到。与 AgentCard.PromptTokens 的关键区别是
+	// 累加 llm_call_end 事件得到。与 AgentCard.PromptTokens 的关键区别是
 	// ad-hoc 团队（verifier 等 one_shot agent）销毁后其消耗仍保留在这里——
 	// 对存活 agent 卡片求和会在团队销毁时让消耗"凭空消失"（2026-07-22 发现）。
 	SessionPromptTokens     int64 `json:"session_prompt_tokens"`

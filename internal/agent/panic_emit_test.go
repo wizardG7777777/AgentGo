@@ -35,7 +35,7 @@ func TestPanicRecovery_EmitsKindTaskFailed(t *testing.T) {
 		panic("intentional test panic to drive recovery path")
 	}
 
-	ag := NewAgent("agent-panic-emit", "code", s, r, executor, 5)
+	ag := NewAgent("agent-panic-emit", "code", s, r, executor)
 	// processTask 不应再 propagate panic——defer recover() 必须吞下
 	ag.processTask(context.Background(), task.ID)
 

@@ -205,13 +205,13 @@ func TestLoadConfigExampleIncludesRunnableAcceptanceVerifier(t *testing.T) {
 	}
 	hasSubmit := false
 	for _, tool := range profile {
-		if tool == "submit_acceptance_result" {
+		if tool == "submit_task_result" {
 			hasSubmit = true
 			break
 		}
 	}
 	if !hasSubmit {
-		t.Fatalf("acceptance verifier profile %q cannot submit formal results: %v", verifier.Profile, profile)
+		t.Fatalf("acceptance verifier profile %q cannot submit verdict/event results: %v", verifier.Profile, profile)
 	}
 }
 
@@ -224,10 +224,8 @@ func TestValidate_RejectsBackslashPath(t *testing.T) {
 				Replicas:                     1,
 				Profile:                      "any",
 				SystemPromptFile:             `prompts\worker.md`, // 反斜杠！
-				AgentMaxLoops:                10,
 				TaskMaxRetries:               3,
 				EnforceCompactTokenThreshold: 4000,
-				ContextLimit:                 16000,
 			},
 		},
 		ToolProfiles: map[string][]string{"any": {"read_file"}},
@@ -241,8 +239,8 @@ func TestValidate_RejectsBackslashPath(t *testing.T) {
 func TestValidate_RejectsDuplicateKind(t *testing.T) {
 	cfg := &Config{
 		Agents: []AgentKind{
-			{Kind: "worker", Replicas: 1, Profile: "p", SystemPromptFile: "x", AgentMaxLoops: 1, TaskMaxRetries: 1, EnforceCompactTokenThreshold: 1, ContextLimit: 1},
-			{Kind: "worker", Replicas: 1, Profile: "p", SystemPromptFile: "x", AgentMaxLoops: 1, TaskMaxRetries: 1, EnforceCompactTokenThreshold: 1, ContextLimit: 1},
+			{Kind: "worker", Replicas: 1, Profile: "p", SystemPromptFile: "x", TaskMaxRetries: 1, EnforceCompactTokenThreshold: 1},
+			{Kind: "worker", Replicas: 1, Profile: "p", SystemPromptFile: "x", TaskMaxRetries: 1, EnforceCompactTokenThreshold: 1},
 		},
 		ToolProfiles: map[string][]string{"p": {"read_file"}},
 	}
@@ -255,7 +253,7 @@ func TestValidate_RejectsDuplicateKind(t *testing.T) {
 func TestValidate_RejectsEmptyKind(t *testing.T) {
 	cfg := &Config{
 		Agents: []AgentKind{
-			{Kind: "", Replicas: 1, Profile: "p", SystemPromptFile: "x", AgentMaxLoops: 1, TaskMaxRetries: 1, EnforceCompactTokenThreshold: 1, ContextLimit: 1},
+			{Kind: "", Replicas: 1, Profile: "p", SystemPromptFile: "x", TaskMaxRetries: 1, EnforceCompactTokenThreshold: 1},
 		},
 		ToolProfiles: map[string][]string{"p": {"read_file"}},
 	}
@@ -271,7 +269,7 @@ func TestValidate_ProfileToolsMutex(t *testing.T) {
 			{
 				Kind: "w", Replicas: 1,
 				Profile: "p", Tools: []string{"read_file"}, // 同时给两者
-				SystemPromptFile: "x", AgentMaxLoops: 1, TaskMaxRetries: 1, EnforceCompactTokenThreshold: 1, ContextLimit: 1,
+				SystemPromptFile: "x", TaskMaxRetries: 1, EnforceCompactTokenThreshold: 1,
 			},
 		},
 		ToolProfiles: map[string][]string{"p": {"read_file"}},
@@ -306,21 +304,21 @@ func TestValidate_SchedulerOnlyRequiresAndAcceptsModel(t *testing.T) {
 
 func TestSchedulerBehaviorDefaultsAndYAMLOverrides(t *testing.T) {
 	defaults := DefaultConfig()
-	if defaults.Scheduler.AgentMaxLoops != DefaultSchedulerMaxLoops {
-		t.Fatalf("default scheduler.agent_max_loops=%d want %d",
-			defaults.Scheduler.AgentMaxLoops, DefaultSchedulerMaxLoops)
+	if defaults.Scheduler.AgentMaxLoops != 0 {
+		t.Fatalf("default scheduler.agent_max_loops=%d want 0（V6 起不再填充默认值）",
+			defaults.Scheduler.AgentMaxLoops)
 	}
 	if defaults.Scheduler.EnforceCompactTokenThreshold != DefaultSchedulerCompactTokenThreshold {
 		t.Fatalf("default scheduler.enforce_compact_token_threshold=%d want %d",
 			defaults.Scheduler.EnforceCompactTokenThreshold, DefaultSchedulerCompactTokenThreshold)
 	}
-	if defaults.Scheduler.ContextLimit != DefaultSchedulerContextLimit {
-		t.Fatalf("default scheduler.context_limit=%d want %d",
-			defaults.Scheduler.ContextLimit, DefaultSchedulerContextLimit)
+	if defaults.Scheduler.ContextLimit != 0 {
+		t.Fatalf("default scheduler.context_limit=%d want 0（V6 起不再填充默认值）",
+			defaults.Scheduler.ContextLimit)
 	}
 
 	path := filepath.Join(t.TempDir(), "scheduler.yaml")
-	data := []byte("llm:\n  default_model: test-model\nscheduler:\n  agent_max_loops: 47\n  enforce_compact_token_threshold: 160000\n  context_limit: 240000\n")
+	data := []byte("llm:\n  default_model: test-model\nscheduler:\n  enforce_compact_token_threshold: 160000\n")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -331,9 +329,7 @@ func TestSchedulerBehaviorDefaultsAndYAMLOverrides(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("scheduler behavior overrides should validate: %v", err)
 	}
-	if cfg.Scheduler.AgentMaxLoops != 47 ||
-		cfg.Scheduler.EnforceCompactTokenThreshold != 160000 ||
-		cfg.Scheduler.ContextLimit != 240000 {
+	if cfg.Scheduler.EnforceCompactTokenThreshold != 160000 {
 		t.Fatalf("scheduler overrides not decoded: %+v", cfg.Scheduler)
 	}
 
@@ -345,11 +341,140 @@ func TestSchedulerBehaviorDefaultsAndYAMLOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if modelOnly.Scheduler.AgentMaxLoops != DefaultSchedulerMaxLoops ||
+	if modelOnly.Scheduler.AgentMaxLoops != 0 ||
 		modelOnly.Scheduler.EnforceCompactTokenThreshold != DefaultSchedulerCompactTokenThreshold ||
-		modelOnly.Scheduler.ContextLimit != DefaultSchedulerContextLimit {
+		modelOnly.Scheduler.ContextLimit != 0 {
 		t.Fatalf("model-only scheduler block lost compatibility defaults: %+v", modelOnly.Scheduler)
 	}
+}
+
+// TestValidate_AgentMaxLoopsMigrationDiagnostic V6 迁移诊断：agent_max_loops
+// 已于 V6 移除。显式设置（YAML 或直造）必须报错且文案含「已于 V6 移除」；
+// 不设置（零值）则通过——零值是区分「显式设置」与「未设置」的唯一信号。
+func TestValidate_AgentMaxLoopsMigrationDiagnostic(t *testing.T) {
+	prompt := filepath.ToSlash(filepath.Join(t.TempDir(), "worker.md"))
+	if err := os.WriteFile(prompt, []byte("worker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("scheduler 块显式设置报错", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.LLM.DefaultModel = "test-model"
+		cfg.Scheduler.AgentMaxLoops = 50
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "scheduler.agent_max_loops") ||
+			!strings.Contains(err.Error(), "已于 V6 移除") {
+			t.Fatalf("scheduler.agent_max_loops=50 应报 V6 迁移诊断，got %v", err)
+		}
+	})
+
+	t.Run("agents 块显式设置报错", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.LLM.DefaultModel = "test-model"
+		cfg.Agents = []AgentKind{{
+			Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
+			SystemPromptFile: prompt, AgentMaxLoops: 10, TaskMaxRetries: 1,
+			EnforceCompactTokenThreshold: 1,
+		}}
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "agent_max_loops") ||
+			!strings.Contains(err.Error(), "已于 V6 移除") {
+			t.Fatalf("agents[0].agent_max_loops=10 应报 V6 迁移诊断，got %v", err)
+		}
+	})
+
+	t.Run("YAML 显式设置报错", func(t *testing.T) {
+		yamlPath := filepath.Join(t.TempDir(), "legacy.yaml")
+		data := []byte("llm:\n  default_model: test-model\nscheduler:\n  agent_max_loops: 47\n")
+		if err := os.WriteFile(yamlPath, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadConfig(yamlPath, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "已于 V6 移除") {
+			t.Fatalf("YAML 显式 agent_max_loops 应报 V6 迁移诊断，got %v", err)
+		}
+	})
+
+	t.Run("不设置则通过", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.LLM.DefaultModel = "test-model"
+		cfg.Agents = []AgentKind{{
+			Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
+			SystemPromptFile: prompt, TaskMaxRetries: 1,
+			EnforceCompactTokenThreshold: 1,
+		}}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("未设置 agent_max_loops 应通过校验，got %v", err)
+		}
+	})
+}
+
+// TestValidate_ContextLimitMigrationDiagnostic V6 迁移诊断：context_limit
+// 已于 V6 移除（固定上下文硬限截断层与 history_truncated 事件一并删除）。
+// 显式设置（YAML 或直造）必须报错且文案含「已于 V6 移除」；
+// 不设置（零值）则通过——零值是区分「显式设置」与「未设置」的唯一信号。
+func TestValidate_ContextLimitMigrationDiagnostic(t *testing.T) {
+	prompt := filepath.ToSlash(filepath.Join(t.TempDir(), "worker.md"))
+	if err := os.WriteFile(prompt, []byte("worker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("scheduler 块显式设置报错", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.LLM.DefaultModel = "test-model"
+		cfg.Scheduler.ContextLimit = 240000
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "scheduler.context_limit") ||
+			!strings.Contains(err.Error(), "已于 V6 移除") {
+			t.Fatalf("scheduler.context_limit=240000 应报 V6 迁移诊断，got %v", err)
+		}
+	})
+
+	t.Run("agents 块显式设置报错", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.LLM.DefaultModel = "test-model"
+		cfg.Agents = []AgentKind{{
+			Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
+			SystemPromptFile: prompt, ContextLimit: 16000, TaskMaxRetries: 1,
+			EnforceCompactTokenThreshold: 1,
+		}}
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "context_limit") ||
+			!strings.Contains(err.Error(), "已于 V6 移除") {
+			t.Fatalf("agents[0].context_limit=16000 应报 V6 迁移诊断，got %v", err)
+		}
+	})
+
+	t.Run("YAML 显式设置报错", func(t *testing.T) {
+		yamlPath := filepath.Join(t.TempDir(), "legacy.yaml")
+		data := []byte("llm:\n  default_model: test-model\nscheduler:\n  context_limit: 240000\n")
+		if err := os.WriteFile(yamlPath, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadConfig(yamlPath, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "已于 V6 移除") {
+			t.Fatalf("YAML 显式 context_limit 应报 V6 迁移诊断，got %v", err)
+		}
+	})
+
+	t.Run("不设置则通过", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.LLM.DefaultModel = "test-model"
+		cfg.Agents = []AgentKind{{
+			Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
+			SystemPromptFile: prompt, TaskMaxRetries: 1,
+			EnforceCompactTokenThreshold: 1,
+		}}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("未设置 context_limit 应通过校验，got %v", err)
+		}
+	})
 }
 
 func TestValidate_SchedulerBehaviorRejectsNegativeValues(t *testing.T) {
@@ -358,9 +483,7 @@ func TestValidate_SchedulerBehaviorRejectsNegativeValues(t *testing.T) {
 		mutate func(*SchedulerKind)
 		field  string
 	}{
-		{"max loops", func(s *SchedulerKind) { s.AgentMaxLoops = -1 }, "agent_max_loops"},
 		{"compact threshold", func(s *SchedulerKind) { s.EnforceCompactTokenThreshold = -1 }, "enforce_compact_token_threshold"},
-		{"context limit", func(s *SchedulerKind) { s.ContextLimit = -1 }, "context_limit"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -379,8 +502,8 @@ func TestValidate_StaticAgentsStillRequireSchedulerModel(t *testing.T) {
 	cfg.Agents = []AgentKind{{
 		Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
 		SystemPromptFile: filepath.ToSlash(filepath.Join("..", "..", "prompts", "worker.md")),
-		AgentMaxLoops:    1, TaskMaxRetries: 1,
-		EnforceCompactTokenThreshold: 1, ContextLimit: 1,
+		TaskMaxRetries: 1,
+		EnforceCompactTokenThreshold: 1,
 	}}
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "Scheduler 配置缺少模型") {
 		t.Fatalf("static Agent model cannot replace the Scheduler/template default model, got %v", err)
@@ -398,8 +521,8 @@ func TestValidate_StaticAgentNeedsOwnOrLLMDefaultModel(t *testing.T) {
 	cfg.Scheduler.Model = "scheduler-model"
 	cfg.Agents = []AgentKind{{
 		Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
-		SystemPromptFile: prompt, AgentMaxLoops: 1, TaskMaxRetries: 1,
-		EnforceCompactTokenThreshold: 1, ContextLimit: 1,
+		SystemPromptFile: prompt, TaskMaxRetries: 1,
+		EnforceCompactTokenThreshold: 1,
 	}}
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agents[0].model") {
 		t.Fatalf("scheduler.model must not silently become the static Agent model, got %v", err)
@@ -444,10 +567,8 @@ agents:
   - kind: worker
     replicas: 1
     system_prompt_file: prompts/w.md
-    agent_max_loops: 10
     task_max_retries: 3
     enforce_compact_token_threshold: 4000
-    context_limit: 16000
 infra:
   watchdog:
     interval_sec: 30
@@ -487,10 +608,8 @@ agents:
   - kind: worker
     replicas: 1
     system_prompt_file: prompts/w.md
-    agent_max_loops: 10
     task_max_retries: 3
     enforce_compact_token_threshold: 4000
-    context_limit: 16000
 infra:
   watchdog:
     interval_sec: 30
@@ -530,10 +649,8 @@ agents:
   - kind: worker
     replicas: 1
     system_prompt_file: prompts/w.md
-    agent_max_loops: 10
     task_max_retries: 3
     enforce_compact_token_threshold: 4000
-    context_limit: 16000
 infra:
   watchdog:
     interval_sec: 30

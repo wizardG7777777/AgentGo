@@ -26,7 +26,7 @@ func TestAgent_NaturalCompletion_WritesToResultOutput(t *testing.T) {
 	}
 
 	var userOut, resultOut strings.Builder
-	ag := NewAgent("agent-1", "code", s, r, executor, 10)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.IsUserFacing = true
 	ag.UserOutput = &userOut
 	ag.ResultOutput = &resultOut
@@ -56,7 +56,7 @@ func TestAgent_NaturalCompletion_FallsBackToUserOutput(t *testing.T) {
 	}
 
 	var userOut strings.Builder
-	ag := NewAgent("agent-1", "code", s, r, executor, 10)
+	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.IsUserFacing = true
 	ag.UserOutput = &userOut
 	// ResultOutput 保持 nil——单 Writer 装配的既有行为不得改变

@@ -17,13 +17,13 @@ Scheduler 是 AgentGo 系统中唯一拥有完整工具能力的一等代理。�
 
 ### 1.1 用户 Interaction 边界
 
-- `gate=plan` 时，完成规划后 MUST 调用 `submit_plan_for_review` 持久化完整计划并结束当前回合；在 `plan_review` Interaction 得到 `execute_plan` 前 MUST NOT 发布 implementation Task。
-- MUST NOT 从普通用户文本猜测 Plan 决定，也 MUST NOT 代表用户选择。`plan_review` 的稳定选项是 `execute_plan` / `revise_plan`（需反馈文本）/ `cancel_request`；暂停后的 `plan_pause` 选项是 `continue_bounded` / `converge_delivery` / `terminate_plan`。
-- PlanStore 是图、版本、pause reason、模式和 `ExecutionOverride` 的执行事实源；Interaction 只拥有用户选择。等待控制面完成 CAS 与领域 effect 时，`waiting_interaction` 是正常状态，不得通过重试、重新派发或另一路径绕过。
+- `gate=plan` 与 plan review 通道已于 V6 移除：`submit_plan_for_review` 等 Plan 专属工具不复存在，执行前审阅改由 Graph approval 节点承担（用户经 `graph_approval` Interaction 批准/拒绝）。
+- MUST NOT 从普通用户文本猜测用户的批准/拒绝决定，也 MUST NOT 代表用户选择。
+- Graph Runtime 是图、activation 与节点终态的执行事实源；Interaction 只拥有用户选择。等待控制面完成 CAS 与领域 effect 时，`waiting_interaction` 是正常状态，不得通过重试、重新派发或另一路径绕过。
 - Shell 灰名单决定属于精确绑定原 command、pattern、working directory、AgentID 和 TaskID 的 `shell_command` Interaction。Scheduler 不得把普通聊天回复解释为 Shell 授权。
 - 当任务确实需要用户澄清或在普通方案间选择时，可调用 `request_user_input(prompt, options_json)`。`options_json` 必须含 2–8 个稳定选项，每项仅使用 `id`、`label`、可选 `description` / `requires_text`；工具只返回 `request_id`、`option_id` 与 `text`。问题应具体且让各选项互斥，不要把可以从仓库或 Board Snapshot 查证的事实抛回给用户。
-- `request_user_input` 固定产生 `Purpose=agent_question`，不能提供 `ActionRef`、Resolution 或 Metadata，也不得用它伪造 `plan_review`、`plan_pause`、Shell authorization 或其他特权 effect。这些领域路径仍必须调用各自控制面工具并等待受信任 handler。
-- 不要假设前端显示序号或键位。TUI/Web 都按稳定 Option ID 回答；`/plan` 只用于定位/列出当前对象，任何兼容入口也必须进入同一 Interaction 管线。
+- `request_user_input` 固定产生 `Purpose=agent_question`，不能提供 `ActionRef`、Resolution 或 Metadata，也不得用它伪造 Shell authorization、`graph_approval` 或其他特权 effect。这些领域路径仍必须调用各自控制面工具并等待受信任 handler。
+- 不要假设前端显示序号或键位。TUI/Web 都按稳定 Option ID 回答；`/plan` 兼容入口已随 plan review 通道一并移除，任何回答都必须进入同一 Interaction 管线。
 - pending Interaction 在当前进程内统一展示，`SessionID` 仅记录创建时的审计归属；切换 `/session` 不会隐藏、回答或取消仍在等待的请求。
 
 ---
@@ -115,7 +115,7 @@ session_history:
 | `run_shell` | agent_capabilities 包含 "run_shell" |
 | `write_file` / `edit_file` | agent_capabilities 包含 "write_file" 和 "edit_file" |
 | `web_search` + `web_fetch`（只读） | agent_capabilities 包含两者；优先用 Explorer |
-| `submit_acceptance_result`（正式验收） | MUST 路由到包含此工具的 Agent |
+| `submit_task_result` 的 `verdict`/`event`（Graph 验收） | MUST 路由到 acceptance.verify（或包含 submit_task_result 的验收 Agent） |
 
 ### 4.3 硬性约束
 
@@ -146,7 +146,6 @@ agents:
     # === v2.0.0 新增字段（全部 optional，向后兼容）===
     skill_id: "worker-v1"            # 唯一技能标识，用于路由表索引
     skill_version: "1.0.0"           # 语义化版本号
-    agent_max_loops: 10
     task_max_retries: 3
     enforce_compact_token_threshold: 4000
     context_limit: 16000

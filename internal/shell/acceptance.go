@@ -8,8 +8,8 @@ package shell
 // Set-Content、rm 等）。在 worktree 隔离（架构级方案，另案）落地前，
 // 验收语境下的写倾向 shell 命令一律升级为灰名单 Interaction 审批。
 //
-// 接线方式：dependency_map.go 在验收角色（工具白名单含
-// submit_acceptance_result）的 ShellGroup 上注入 ExtraGreylist =
+// 接线方式：dependency_map.go 在验收角色（工具白名单含 run_shell 且不含
+// write_file/edit_file）的 ShellGroup 上注入 ExtraGreylist =
 // AcceptanceHardeningGreylist；tools.ShellGroup.Register 经
 // DeriveWithExtraGreylist 派生过滤器。非验收语境不注入，行为完全不变。
 

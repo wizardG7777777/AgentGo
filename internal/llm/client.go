@@ -127,11 +127,11 @@ type ClientConfig struct {
 }
 
 // SDKClient 通过 openai-go 官方 SDK 实现 Client 接口。
+// 请求路径统一为 OpenAI-compatible Chat Completions（V6 起不再按 provider 分支）。
 type SDKClient struct {
 	client       openai.Client
 	model        openai.ChatModel
 	systemPrompt string
-	provider     Provider
 	request      ClientConfig
 }
 
@@ -139,17 +139,15 @@ const defaultLLMTimeout = 120 * time.Second
 
 // NewSDKClient 创建基于 openai-go SDK 的客户端。
 // baseURL 为空时使用 OpenAI 官方端点。
-// providerName 指定 LLM provider 适配器（"openai"/"openrouter"/"deepseek-v4"/"deepseek-r1"），
-// 空串或未知名称时 fallback 到 OpenAIProvider（no-op，与旧版行为一致）。
 // HTTP 层重试由 SDK 内部处理（429/5xx），此处不再额外设置 MaxRetries，
 // 避免与调用方的业务重试语义重叠。
-func NewSDKClient(baseURL, apiKey, model, systemPrompt, providerName string, timeout time.Duration) *SDKClient {
-	return NewSDKClientWithConfig(baseURL, apiKey, model, systemPrompt, providerName, timeout, ClientConfig{})
+func NewSDKClient(baseURL, apiKey, model, systemPrompt string, timeout time.Duration) *SDKClient {
+	return NewSDKClientWithConfig(baseURL, apiKey, model, systemPrompt, timeout, ClientConfig{})
 }
 
 // NewSDKClientWithConfig is the production constructor. NewSDKClient remains
 // as a compatibility wrapper for focused tests and external package users.
-func NewSDKClientWithConfig(baseURL, apiKey, model, systemPrompt, providerName string, timeout time.Duration, request ClientConfig) *SDKClient {
+func NewSDKClientWithConfig(baseURL, apiKey, model, systemPrompt string, timeout time.Duration, request ClientConfig) *SDKClient {
 	if timeout <= 0 {
 		timeout = defaultLLMTimeout
 		log.Printf("[llm] 未指定超时，使用默认值 %v", timeout)
@@ -173,17 +171,11 @@ func NewSDKClientWithConfig(baseURL, apiKey, model, systemPrompt, providerName s
 		client:       client,
 		model:        openai.ChatModel(model),
 		systemPrompt: systemPrompt,
-		provider:     GetProvider(providerName),
 		request:      request,
 	}
 }
 
 func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDef) (Response, error) {
-	// Provider 有机会在发请求前改造 history（例如 DeepSeek R1 剥离老轮次的 reasoning_content）。
-	if c.provider != nil {
-		messages = c.provider.PrepareMessages(messages)
-	}
-
 	params := openai.ChatCompletionNewParams{
 		Model: c.model,
 	}
@@ -191,16 +183,11 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 	if m := modelOverrideFromContext(ctx); m != "" {
 		params.Model = openai.ChatModel(m)
 	}
-	var reasoningOpts []option.RequestOption
 	if c.request.ReasoningEffort != "" {
 		// ReasoningEffort is a string-backed SDK type. Casting keeps AgentGo
 		// aligned with newly documented OpenAI values (for example "max") even
 		// when the generated SDK constants lag the API specification.
-		if mapper, ok := c.provider.(ReasoningEffortMapper); ok {
-			reasoningOpts = mapper.ReasoningEffortOptions(c.request.ReasoningEffort)
-		} else {
-			params.ReasoningEffort = shared.ReasoningEffort(c.request.ReasoningEffort)
-		}
+		params.ReasoningEffort = shared.ReasoningEffort(c.request.ReasoningEffort)
 	}
 
 	// 插入 system prompt（使用 system 角色以兼容 Dashscope 等非 OpenAI 后端）
@@ -230,22 +217,15 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 		})
 	}
 
-	// Provider 可追加请求 RequestOption（例如 WithJSONSet 注入 body 字段）
-	var providerOpts []option.RequestOption
-	if c.provider != nil {
-		providerOpts = c.provider.RequestOptions()
-	}
-	providerOpts = append(providerOpts, reasoningOpts...)
-
 	if c.request.Stream {
 		params.StreamOptions = openai.ChatCompletionStreamOptionsParam{
 			IncludeUsage: openai.Bool(true),
 		}
-		return c.chatStreaming(ctx, params, providerOpts)
+		return c.chatStreaming(ctx, params)
 	}
 
 	// 调用 SDK — HTTP 层错误（429/5xx）由 SDK 内部重试处理
-	completion, err := c.client.Chat.Completions.New(ctx, params, providerOpts...)
+	completion, err := c.client.Chat.Completions.New(ctx, params)
 	if err != nil {
 		return Response{}, classifySDKError(err)
 	}
@@ -323,8 +303,8 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 // reconstructs the ordinary Response contract consumed by the ReAct loop.
 // Tool calls are never dispatched from partial chunks: only the fully
 // accumulated response is returned to the executor.
-func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatCompletionNewParams, opts []option.RequestOption) (Response, error) {
-	stream := c.client.Chat.Completions.NewStreaming(ctx, params, opts...)
+func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatCompletionNewParams) (Response, error) {
+	stream := c.client.Chat.Completions.NewStreaming(ctx, params)
 	defer stream.Close()
 
 	handler := streamHandlerFromContext(ctx)

@@ -26,9 +26,8 @@ import (
 // kindModel 为空字符串时回落 LLMConfig.DefaultModel——这是 v4 §11.4 注释中
 // "Model 缺省回落 LLM.DefaultModel" 的实际落地点。
 //
-// LLMConfig.Provider 用于区分 openai / deepseek-v4 / deepseek-r1 等非标 endpoint
-// 的请求 quirks。空字符串时 SDKClient 内部 fallback 到 OpenAIProvider（详见
-// internal/llm/provider.go）。
+// V6 起请求路径统一为 OpenAI-compatible Chat Completions，不再按 provider 分支；
+// llm.provider 字段已在 config.Validate() 中拒绝（迁移诊断）。
 func buildKindLLMClient(llmCfg config.LLMConfig, kindModel string) llm.Client {
 	model := kindModel
 	if model == "" {
@@ -43,7 +42,6 @@ func buildKindLLMClient(llmCfg config.LLMConfig, kindModel string) llm.Client {
 		llmCfg.APIKey,
 		model,
 		"", // system prompt 由 runner / scheduler 自管，不在 client 层注入
-		llmCfg.Provider,
 		timeout,
 		llm.ClientConfig{
 			ReasoningEffort: llmCfg.ReasoningEffort,
@@ -117,10 +115,8 @@ func buildAgentRuntime(
 		AllowedTools:                 allowed,
 		Model:                        model,
 		SystemPrompt:                 string(promptBytes),
-		AgentMaxLoops:                kind.AgentMaxLoops,
 		TaskMaxRetries:               kind.TaskMaxRetries,
 		EnforceCompactTokenThreshold: kind.EnforceCompactTokenThreshold,
-		ContextLimit:                 kind.ContextLimit,
 		TeamAwareness:                teamAwareness,
 		IdleThreshold:                idleThreshold,
 	}
@@ -212,7 +208,7 @@ func resolveRouteCapabilities(cfg *config.Config, kind config.AgentKind) ([]stri
 // buildSchedulerRuntime 为 scheduler 单例合成 AgentRuntimeConfig。
 //
 // 工具集 / 系统提示词 / replicas 仍由 internal/scheduler 固定；模型与
-// Agent.processTask 消费的三个预算字段从 SchedulerKind 投影到运行时形状。
+// Agent.processTask 消费的压缩预算字段从 SchedulerKind 投影到运行时形状。
 func buildSchedulerRuntime(sched config.SchedulerKind, llmCfg config.LLMConfig) config.AgentRuntimeConfig {
 	model := sched.Model
 	if model == "" {
@@ -222,9 +218,7 @@ func buildSchedulerRuntime(sched config.SchedulerKind, llmCfg config.LLMConfig) 
 		InstanceID:                   "scheduler",
 		Kind:                         "scheduler",
 		Model:                        model,
-		AgentMaxLoops:                sched.AgentMaxLoops,
 		EnforceCompactTokenThreshold: sched.EnforceCompactTokenThreshold,
-		ContextLimit:                 sched.ContextLimit,
 		// AllowedTools / SystemPrompt 仍由 internal/scheduler 内部决定。
 	}
 }

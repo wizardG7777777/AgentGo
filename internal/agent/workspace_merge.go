@@ -4,9 +4,8 @@ package agent
 // 收口：认领隔离任务时经 WorkspaceLifecycleManager / WorkspaceViewActivator
 // 换入 overlay 视图（agent.go 的 NodeCapability 应用块），任务成功终态在
 // SubmitResult（标记 completed）之前经 MergeTask 合并回主根；合并失败/冲突
-// 时任务转 failed 并经 ReplanRequester 自动登记高优 ReplanRequest（与
-// submit_task_result / request_replan 工具同款 plan.Coordinator.RequestReplan
-// 通道），交 Scheduler 裁决兜底。
+// 时任务转 failed，非图任务再经「通用 replan 唤醒任务」（replan_wake.go，
+// 与 request_replan 工具非图路径同款机制）唤醒 Scheduler 裁决兜底。
 //
 // 设计契约与合并语义见 internal/workspace/types.go（A 线实现），本文件只
 // 针对其冻结签名编码。
@@ -18,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"agentgo/internal/effect"
 	"agentgo/internal/model"
 	"agentgo/internal/workspace"
 )
@@ -39,14 +39,7 @@ type WorkspaceViewActivator interface {
 	Activate(v *workspace.View) (restore func())
 }
 
-// ReplanRequester 是 plan.Coordinator.RequestReplan 的窄接口（与
-// submit_task_result / request_replan 工具登记 replan 同款通道）。
-// 定义为接口避免 agent → plan 的包依赖。
-type ReplanRequester interface {
-	RequestReplan(ctx context.Context, req model.ReplanRequest) (*model.ReplanRequest, error)
-}
-
-// mergeConflictDetail 携带一次合并冲突的明细，用于拼 replan 原因。
+// mergeConflictDetail 携带一次合并冲突的明细，用于拼 replan 唤醒详情。
 type mergeConflictDetail struct {
 	paths   []string // 冲突文件的主根绝对路径
 	regions int      // 冲突区域总数
@@ -58,7 +51,7 @@ type mergeConflictDetail struct {
 // 返回 true：无 Isolation（零开销短路）或合并成功（已 Cleanup），调用方继续
 // SubmitResult。返回 false：合并失败/冲突——任务已由本函数转 failed（reason
 // 含 workspace_conflict 与冲突文件清单，不 Cleanup 保留现场供排查），并已
-// 尽力自动登记 ReplanRequest；调用方必须直接 return，不得再 SubmitResult。
+// 尽力发布 replan 唤醒任务；调用方必须直接 return，不得再 SubmitResult。
 func (a *Agent) mergeWorkspaceBeforeComplete(ctx context.Context, task *model.Task, taskID string) bool {
 	if task == nil || task.Capability == nil || task.Capability.Isolation == nil {
 		return true
@@ -66,16 +59,24 @@ func (a *Agent) mergeWorkspaceBeforeComplete(ctx context.Context, task *model.Ta
 	mgr := a.WorkspaceManager
 	if mgr == nil {
 		// 认领时已对未装配 fail-closed，正常到不了这里；防御兜底按失败处理。
-		a.failWorkspaceMerge(ctx, task, taskID,
+		a.failWorkspaceMerge(task, taskID,
 			"workspace_conflict: WorkspaceManager 未装配，无法合并隔离工作区", nil)
 		return false
 	}
 
+	// H2b Effect Journal：合并是状态迁移（Policy=never_replay——禁止自动
+	// 重放，冲突走 replan），执行前先落账（prepared）。Target 载任务 ID
+	//（workspace 坐标由 taskID 唯一确定）。
+	effID := a.effectPrepare(effect.KindWorkspaceMerge, taskID, taskID,
+		effectDigest12([]byte(taskID+"|"+a.ID)), effect.PolicyNeverReplay)
+
 	result, err := mgr.MergeTask(ctx, taskID, a.ID)
 	switch {
 	case err != nil:
+		// 合并执行返回错误：主根是否被部分改写不可知 → unknown。
+		a.effectMarkUnknown(effID, "合并执行错误: "+err.Error())
 		log.Printf("[agent %s] 任务 %s workspace 合并失败: %v", a.ID, taskID, err)
-		a.failWorkspaceMerge(ctx, task, taskID,
+		a.failWorkspaceMerge(task, taskID,
 			fmt.Sprintf("workspace_conflict: 合并执行失败: %v", err), nil)
 		return false
 	case result != nil && result.Conflicted:
@@ -84,9 +85,12 @@ func (a *Agent) mergeWorkspaceBeforeComplete(ctx context.Context, task *model.Ta
 		for _, rep := range result.Reports {
 			regions += len(rep.Conflicts)
 		}
+		// 冲突结果已知（未合并，现场保留走 replan）——记 settled 载冲突摘要。
+		a.effectSettle(effID, fmt.Sprintf("conflict: files=%d regions=%d（未合并，任务转 failed 走 replan）",
+			len(conflicted), regions))
 		log.Printf("[agent %s] 任务 %s workspace 合并冲突（%d 个文件，%d 处冲突区域）: %v",
 			a.ID, taskID, len(conflicted), regions, conflicted)
-		a.failWorkspaceMerge(ctx, task, taskID,
+		a.failWorkspaceMerge(task, taskID,
 			fmt.Sprintf("workspace_conflict: %d 个文件无法自动合并: %s",
 				len(conflicted), strings.Join(conflicted, ", ")),
 			&mergeConflictDetail{paths: conflicted, regions: regions})
@@ -95,6 +99,8 @@ func (a *Agent) mergeWorkspaceBeforeComplete(ctx context.Context, task *model.Ta
 
 	// 合并成功：清理任务 workspace。Cleanup 失败不阻断完成——合并已落盘，
 	// 孤儿目录交 Watchdog 经 ListOrphans 清扫。
+	merged := mergeOutcomeSummary(result)
+	a.effectSettle(effID, "merged: "+merged)
 	if err := mgr.Cleanup(taskID); err != nil {
 		log.Printf("[agent %s] 任务 %s workspace 合并成功后清理失败（不阻断，交 Watchdog 清扫）: %v",
 			a.ID, taskID, err)
@@ -104,42 +110,42 @@ func (a *Agent) mergeWorkspaceBeforeComplete(ctx context.Context, task *model.Ta
 	return true
 }
 
+// mergeOutcomeSummary 汇总一次成功合并的逐文件结果（fast-forward /
+// auto-merged 计数），供 Effect Journal 的 ResultSummary。
+func mergeOutcomeSummary(result *workspace.MergeResult) string {
+	if result == nil {
+		return "fast_forward=0 auto_merged=0 files=0"
+	}
+	fastForward, autoMerged := 0, 0
+	for _, rep := range result.Reports {
+		switch rep.Outcome {
+		case workspace.OutcomeFastForward:
+			fastForward++
+		case workspace.OutcomeAutoMerged:
+			autoMerged++
+		}
+	}
+	return fmt.Sprintf("fast_forward=%d auto_merged=%d files=%d", fastForward, autoMerged, len(result.Reports))
+}
+
 // failWorkspaceMerge 是合并失败/冲突的统一收口：任务经 terminateTask 转
-// failed（不 Cleanup，保留 workspace 现场供排查）；任务挂在 Plan 上时经
-// RequestReplan 同款通道自动登记高优 ReplanRequest，冲突文件与冲突区域数
-// 写进 replan 原因，交 Scheduler 裁决兜底。登记失败不掩盖任务失败本身。
-func (a *Agent) failWorkspaceMerge(ctx context.Context, task *model.Task, taskID, reason string, detail *mergeConflictDetail) {
+// failed（不 Cleanup，保留 workspace 现场供排查）；非图任务再发布「通用
+// replan 唤醒任务」唤醒 Scheduler 裁决后续编排（reason_code=workspace_conflict），
+// 冲突文件与冲突区域数写进唤醒详情。唤醒发布失败不掩盖任务失败本身。
+func (a *Agent) failWorkspaceMerge(task *model.Task, taskID, reason string, detail *mergeConflictDetail) {
 	a.terminateTask(task, taskID, reason, "workspace_merge_conflict")
 
-	if a.WorkspaceReplanRequester == nil || task == nil || task.PlanID == "" {
+	if task == nil {
 		return
 	}
 	replanDetail := "workspace 合并失败，任务已转 failed，workspace 现场保留待排查。\n原因: " + reason
 	if detail != nil && len(detail.paths) > 0 {
 		replanDetail = fmt.Sprintf(
 			"workspace 合并冲突：%d 个文件、%d 处冲突区域。\n冲突文件:\n  - %s\n"+
-				"请重新评估 Plan（拆分/重排对同一文件的并行写入任务）。",
+				"请重新评估后续编排（拆分/重排对同一文件的并行写入任务）。",
 			len(detail.paths), detail.regions, strings.Join(detail.paths, "\n  - "))
 	}
-	// plan.Coordinator.RequestReplan 校验 Detail ≤ 2000 runes，留余量截断。
-	if rs := []rune(replanDetail); len(rs) > 1900 {
-		replanDetail = string(rs[:1900]) + "…（截断）"
-	}
-	req := model.ReplanRequest{
-		PlanID:       task.PlanID,
-		SourceTaskID: taskID,
-		SourceEvent:  "workspace_merge",
-		ReasonCode:   "workspace_conflict",
-		Detail:       replanDetail,
-		Urgency:      model.ReplanUrgencyHigh,
-		// ObservedRevision / ObservedStateVersion / IdempotencyKey 留零，
-		// 由 Coordinator 落库时回填当前值并生成幂等键（appendRequest 语义）。
-	}
-	if _, err := a.WorkspaceReplanRequester.RequestReplan(ctx, req); err != nil {
-		log.Printf("[agent %s] 任务 %s 合并冲突自动 replan 登记失败（任务已 failed）: %v", a.ID, taskID, err)
-		return
-	}
-	log.Printf("[agent %s] 任务 %s 合并冲突已自动登记高优 ReplanRequest（plan=%s）", a.ID, taskID, task.PlanID)
+	a.publishReplanWakeTask(task, taskID, "workspace_conflict", replanDetail)
 }
 
 // ArtifactPhysicalResolver 把 expected_artifacts 声明（约定为相对主根路径）

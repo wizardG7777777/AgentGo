@@ -21,16 +21,16 @@ type mockHookRunner struct {
 	beforeWakeCalls []wakeCall
 
 	// 控制返回值
-	beforeSendAbort      bool
-	beforeSendReason     string
-	beforeSendHookName   string
-	beforeDeliverAbort   func(deliverTo string) bool // nil = 永不 abort
-	beforeDeliverReason  string
-	beforeDeliverHookID  string
-	beforeWakeAbort      bool
-	beforeWakeReason     string
-	beforeWakeHookName   string
-	beforeWakeWakeDesc   string
+	beforeSendAbort     bool
+	beforeSendReason    string
+	beforeSendHookName  string
+	beforeDeliverAbort  func(deliverTo string) bool // nil = 永不 abort
+	beforeDeliverReason string
+	beforeDeliverHookID string
+	beforeWakeAbort     bool
+	beforeWakeReason    string
+	beforeWakeHookName  string
+	beforeWakeWakeDesc  string
 }
 
 type wakeCall struct {

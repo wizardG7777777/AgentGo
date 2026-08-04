@@ -15,7 +15,6 @@ func interactionItemFromRequest(request interaction.Request) InteractionItem {
 		AllowFreeText: request.AllowFreeText,
 		SubjectKind:   request.Subject.Kind,
 		SubjectID:     request.Subject.ID,
-		PlanID:        request.Subject.PlanID,
 		TaskID:        request.Subject.TaskID,
 		AgentID:       request.Origin.AgentID,
 		CreatedAt:     request.CreatedAt,

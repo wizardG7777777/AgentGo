@@ -2,10 +2,8 @@ package store
 
 import "agentgo/internal/model"
 
-// LegacyRequestTaskIDs returns the request-tree scope for a Scheduler root
-// that has no managed PlanStore record. Modern tasks share the root PlanID;
-// imported compatibility snapshots may instead rely on SchedulerBatch plus
-// explicit ParentTaskID edges.
+// LegacyRequestTaskIDs returns the request-tree scope for a Scheduler root.
+// Tasks are linked by SchedulerBatch plus explicit ParentTaskID edges.
 //
 // BatchID, Dependencies, and EventSource are intentionally excluded: they are
 // observability/routing fields, not ownership edges.
@@ -41,32 +39,18 @@ func LegacyRequestTaskIDs(tasks []*model.Task, controllerID string) map[string]s
 	}
 	add(controller)
 	for _, id := range controller.SchedulerBatch {
-		if task := byID[id]; task != nil && legacyPlanCompatible(controller, task) {
+		if task := byID[id]; task != nil {
 			add(task)
 		}
 	}
-	if controller.PlanID != "" {
-		for _, task := range tasks {
-			if task != nil && task.PlanID == controller.PlanID {
-				add(task)
-			}
-		}
-	}
 
-	// Expand the explicit descendant closure for old snapshots whose children
-	// do not yet carry an inherited PlanID.
+	// Expand the explicit descendant closure.
 	for len(queue) > 0 {
 		parentID := queue[0]
 		queue = queue[1:]
 		for _, child := range children[parentID] {
-			if legacyPlanCompatible(controller, child) {
-				add(child)
-			}
+			add(child)
 		}
 	}
 	return visible
-}
-
-func legacyPlanCompatible(controller, task *model.Task) bool {
-	return controller.PlanID == "" || task.PlanID == "" || controller.PlanID == task.PlanID
 }

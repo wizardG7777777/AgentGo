@@ -235,7 +235,7 @@ func TestShellGroup_NilInteractionServiceFailsClosed(t *testing.T) {
 // 创建 shell_command 审批请求；用户 allow_once 后才真正执行。
 func TestShellGroup_ModesStrictAsksPlainCommand(t *testing.T) {
 	group, service := newTestShellGroup(t, t.TempDir(), emptyFilter())
-	group.Modes = modes.NewStore(modes.GateImmediate, modes.ExecStrict, modes.TopoTeam)
+	group.Modes = modes.NewStore(modes.ExecStrict, modes.TopoTeam)
 	type result struct {
 		out string
 		err error
@@ -263,7 +263,7 @@ func TestShellGroup_ModesStrictAsksPlainCommand(t *testing.T) {
 // exec=yolo 经 ShellGroup.Modes 接线生效：灰名单命令自动放行，不创建 Interaction。
 func TestShellGroup_ModesYoloAutoAllowsGrey(t *testing.T) {
 	group, service := newTestShellGroup(t, t.TempDir(), shell.NewCommandFilter(nil, []string{`^echo yolo$`}))
-	group.Modes = modes.NewStore(modes.GateImmediate, modes.ExecYolo, modes.TopoTeam)
+	group.Modes = modes.NewStore(modes.ExecYolo, modes.TopoTeam)
 	out, err := dispatchRunShell(context.Background(), group, map[string]any{"command": "echo yolo"})
 	if err != nil || !strings.Contains(out, "yolo") {
 		t.Fatalf("yolo 灰名单应自动放行: out=%q err=%v", out, err)

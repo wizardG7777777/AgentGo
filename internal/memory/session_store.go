@@ -15,8 +15,8 @@ import (
 
 // SessionStore 是 ScopeSession 的 JSONL 文件后端实现（MemoryManageSystem.md MM8）。
 //
-// 持久化模型：追加式 JSONL 日志，每行一条 diskRecord（op=put/delete/clear）。
-// Put/Delete/Clear 写穿（write-through）：先 append + 一次 fsync，成功后再
+// 持久化模型：追加式 JSONL 日志，每行一条 diskRecord（op=put/supersede/delete/clear）。
+// Put/Supersede/Delete/Clear 写穿（write-through）：先 append + 一次 fsync，成功后再
 // 更新内存索引——append 路径全程只 fsync 一次（项目纪律：同一代码路径不得
 // 出现第二次 fsync）。启动时按序重放日志重建内存索引，天然
 // last-writer-wins。
@@ -30,8 +30,7 @@ import (
 //   - 崩溃安全语义与 fsync 边界完全一致，不存在"缓冲区未落盘"窗口。
 //
 // 内存索引与 ProcessStore 同构（entries + (scope,kind,key)→ID），查询语义
-// 与 ProcessStore 完全一致：精确 Key 匹配 / 空 query 按 UpdatedAt 倒序 /
-// AccessCount 只在内存递增（访问频次是易失统计，不落盘）。
+// 与 ProcessStore 完全一致：精确 Key 匹配 / 空 query 按 UpdatedAt 倒序。
 //
 // 并发模型：单 sync.RWMutex 串行化全部读写（与 ProcessStore 相同）。
 type SessionStore struct {
@@ -42,23 +41,28 @@ type SessionStore struct {
 	path   string
 	closed bool
 	nowFn  func() time.Time
+	// idSeq 是 Supersede 生成条目 ID 的进程内单调序号（与时间戳拼合保证唯一）。
+	idSeq int64
 }
 
 // diskRecord 是 memory.jsonl 的单行信封。Op 取值：
 //   - "put"：全量 upsert Entry（含 ID/CreatedAt/UpdatedAt，重放时原样落索引）
+//   - "supersede"：单条事务同时携带退位旧条目与接管检索键的新条目
 //   - "delete"：按 ID 删除（墓碑）
 //   - "clear"：清空指定 Scope 下全部条目
 type diskRecord struct {
-	Op    string `json:"op"`
-	Entry *Entry `json:"entry,omitempty"`
-	ID    string `json:"id,omitempty"`
-	Scope Scope  `json:"scope,omitempty"`
+	Op      string `json:"op"`
+	Entry   *Entry `json:"entry,omitempty"`
+	Retired *Entry `json:"retired,omitempty"`
+	ID      string `json:"id,omitempty"`
+	Scope   Scope  `json:"scope,omitempty"`
 }
 
 const (
-	diskOpPut    = "put"
-	diskOpDelete = "delete"
-	diskOpClear  = "clear"
+	diskOpPut       = "put"
+	diskOpSupersede = "supersede"
+	diskOpDelete    = "delete"
+	diskOpClear     = "clear"
 )
 
 // NewSessionStore 打开（不存在则创建）path 指向的 JSONL 后端，并重放已有
@@ -101,8 +105,9 @@ func (s *SessionStore) load() error {
 
 	var badLines int
 	scanner := bufio.NewScanner(f)
-	// 单条 Entry 的 Content 可能较长（学习总结等），放宽行宽到 1MB。
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	// supersede 事务一行同时携新旧两条 Entry，为两份长 Content
+	// 与 JSON 信封留出余量。
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -131,18 +136,18 @@ func (s *SessionStore) load() error {
 func (s *SessionStore) applyRecord(rec *diskRecord) bool {
 	switch rec.Op {
 	case diskOpPut:
-		if rec.Entry == nil || rec.Entry.ID == "" || rec.Entry.Key == "" {
+		return s.applyPutEntry(rec.Entry)
+	case diskOpSupersede:
+		// 先完整校验两份载荷，再应用；即使日志行被人工损坏，
+		// 重放也不会只执行「旧条目退位」半个事务。
+		if !validPutEntry(rec.Retired) || !validPutEntry(rec.Entry) ||
+			rec.Retired.ID == rec.Entry.ID ||
+			rec.Retired.EffectiveState() != StateSuperseded ||
+			rec.Retired.SupersededBy != rec.Entry.ID {
 			return false
 		}
-		cp := *rec.Entry
-		if oldID, ok := s.keyIndex[scopeKindKey{cp.Scope, cp.Kind, cp.Key}]; ok && oldID != cp.ID {
-			delete(s.entries, oldID)
-		}
-		if old, ok := s.entries[cp.ID]; ok {
-			delete(s.keyIndex, scopeKindKey{old.Scope, old.Kind, old.Key})
-		}
-		s.entries[cp.ID] = &cp
-		s.keyIndex[scopeKindKey{cp.Scope, cp.Kind, cp.Key}] = cp.ID
+		_ = s.applyPutEntry(rec.Retired)
+		_ = s.applyPutEntry(rec.Entry)
 		return true
 	case diskOpDelete:
 		if rec.ID == "" {
@@ -163,6 +168,28 @@ func (s *SessionStore) applyRecord(rec *diskRecord) bool {
 		return true
 	}
 	return false
+}
+
+func validPutEntry(entry *Entry) bool {
+	return entry != nil && entry.ID != "" && entry.Key != ""
+}
+
+// applyPutEntry 对一条已校验的全量 Entry 应用 last-writer-wins 索引
+// 语义。它只改内存；运行时调用者必须先 appendRecord 成功。
+func (s *SessionStore) applyPutEntry(entry *Entry) bool {
+	if !validPutEntry(entry) {
+		return false
+	}
+	cp := *entry
+	if oldID, ok := s.keyIndex[scopeKindKey{cp.Scope, cp.Kind, cp.Key}]; ok && oldID != cp.ID {
+		delete(s.entries, oldID)
+	}
+	if old, ok := s.entries[cp.ID]; ok {
+		delete(s.keyIndex, scopeKindKey{old.Scope, old.Kind, old.Key})
+	}
+	s.entries[cp.ID] = &cp
+	s.keyIndex[scopeKindKey{cp.Scope, cp.Kind, cp.Key}] = cp.ID
+	return true
 }
 
 // appendRecord 把一条变更记录写穿到磁盘：open(append) → write → 一次 fsync
@@ -217,7 +244,9 @@ func (s *SessionStore) Put(_ context.Context, entry Entry) error {
 		merged.Content = entry.Content
 		merged.Tags = entry.Tags
 		merged.Source = entry.Source
-		merged.Embedding = entry.Embedding
+		merged.State = entry.State
+		merged.Evidence = entry.Evidence
+		merged.SupersededBy = entry.SupersededBy
 		merged.UpdatedAt = now
 		if err := s.appendRecord(diskRecord{Op: diskOpPut, Entry: &merged}); err != nil {
 			return err
@@ -246,8 +275,93 @@ func (s *SessionStore) Put(_ context.Context, entry Entry) error {
 	return nil
 }
 
+// Supersede 以「新结论取代旧结论」的语义写入一条记忆（V6 §3 CM3）：
+//   - 新条目获得 (scope,kind,key) 的检索键，正常参与查询与召回；
+//   - 同 Key 的旧条目（若有）不删除，而是置 State=superseded、记录
+//     SupersededBy=新条目 ID，并把检索键改写为 "<key>#<旧ID>" 的审计键
+//     （让出原 Key 的 keyIndex 槽位；范围查询仍可见，满足「保留审计」，
+//     召回侧经 Entry.Recalled 过滤不注入）。
+//
+// 与 Put 的原地覆盖不同：Supersede 保留完整的取代链，是 Session 晋升器
+// 写入同 Key 新结论的唯一通道。返回被取代旧条目的 ID（无旧条目返回 ""）。
+//
+// 落盘顺序：新旧两份全量 Entry 装入同一条 op=supersede 日志记录，
+// 单次 append + fsync 后才同时修改内存索引。崩溃时要么整行可重放，
+// 要么损坏/截断行整体跳过而保留旧活跃条目，不存在持久化半个取代链。
+func (s *SessionStore) Supersede(_ context.Context, entry Entry) (string, error) {
+	if entry.Scope != ScopeSession {
+		return "", fmt.Errorf("%w: scope=%s", ErrScopeUnsupported, entry.Scope)
+	}
+	if entry.Key == "" {
+		return "", errors.New("memory: Entry.Key 不能为空")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := s.nowFn()
+	if entry.ID == "" {
+		s.idSeq++
+		entry.ID = fmt.Sprintf("%s:%s:%s:%d:%d", entry.Scope, entry.Kind, entry.Key, now.UnixNano(), s.idSeq)
+	}
+	if entry.CreatedAt.IsZero() {
+		entry.CreatedAt = now
+	}
+	entry.UpdatedAt = now
+
+	idxKey := scopeKindKey{entry.Scope, entry.Kind, entry.Key}
+	supersededID := ""
+	var retired *Entry
+
+	// 旧条目退位：只构造事务载荷，此处不动索引。
+	if existingID, ok := s.keyIndex[idxKey]; ok && existingID != entry.ID {
+		old := s.entries[existingID]
+		retiredCopy := *old
+		retiredCopy.State = StateSuperseded
+		retiredCopy.SupersededBy = entry.ID
+		retiredCopy.Key = old.Key + "#" + old.ID
+		retiredCopy.UpdatedAt = now
+		retired = &retiredCopy
+		supersededID = existingID
+	}
+
+	record := diskRecord{Op: diskOpPut, Entry: &entry}
+	if retired != nil {
+		record.Op = diskOpSupersede
+		record.Retired = retired
+	}
+	if err := s.appendRecord(record); err != nil {
+		return "", err
+	}
+	if !s.applyRecord(&record) {
+		// 载荷由本方构造，此分支只是防御性不变式检查。日志已写穿时
+		// 不能伪装成未发生，返错迫使上层不置 PromotedAt 并在重启重放。
+		return "", errors.New("memory: supersede 事务载荷不变式失败")
+	}
+	return supersededID, nil
+}
+
+// MarkStale 把条目标记为失效（stale）：保留条目与检索键供审计，召回侧经
+// Entry.Recalled 过滤不再注入。幂等——不存在或已是 stale 时直接返回 nil。
+func (s *SessionStore) MarkStale(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.entries[id]
+	if !ok || e.EffectiveState() == StateStale {
+		return nil
+	}
+	mutated := *e
+	mutated.State = StateStale
+	mutated.UpdatedAt = s.nowFn()
+	if err := s.appendRecord(diskRecord{Op: diskOpPut, Entry: &mutated}); err != nil {
+		return err
+	}
+	*s.entries[id] = mutated
+	return nil
+}
+
 // Query 检索语义与 ProcessStore.Query 完全一致（精确 Key / 空 query 范围
-// 检索按 UpdatedAt 倒序 / limit 截断 / AccessCount 内存递增）。
+// 检索按 UpdatedAt 倒序 / limit 截断）。
 func (s *SessionStore) Query(_ context.Context, scope Scope, kind Kind, query string, limit int) ([]Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -255,7 +369,6 @@ func (s *SessionStore) Query(_ context.Context, scope Scope, kind Kind, query st
 	if query != "" {
 		if id, ok := s.keyIndex[scopeKindKey{scope, kind, query}]; ok {
 			e := s.entries[id]
-			e.AccessCount++
 			return []Entry{*e}, nil
 		}
 		return nil, nil
@@ -275,15 +388,9 @@ func (s *SessionStore) Query(_ context.Context, scope Scope, kind Kind, query st
 	}
 	out := make([]Entry, 0, len(matched))
 	for _, e := range matched {
-		e.AccessCount++
 		out = append(out, *e)
 	}
 	return out, nil
-}
-
-// QueryByVector 与 ProcessStore 一致，预留不实现。
-func (s *SessionStore) QueryByVector(_ context.Context, _ Scope, _ []float32, _ int) ([]Entry, error) {
-	return nil, ErrNotImplemented
 }
 
 // Delete 按 ID 删除。条目不存在时幂等成功且不产生磁盘记录（没有什么可删）。

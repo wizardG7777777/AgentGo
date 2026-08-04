@@ -16,7 +16,9 @@ import (
 	"agentgo/internal/agenttemplate"
 	"agentgo/internal/config"
 	"agentgo/internal/dashboard"
+	"agentgo/internal/effect"
 	"agentgo/internal/gate"
+	"agentgo/internal/graph"
 	"agentgo/internal/hook"
 	"agentgo/internal/hook/builtin"
 	"agentgo/internal/interaction"
@@ -27,8 +29,8 @@ import (
 	"agentgo/internal/modes"
 	"agentgo/internal/output"
 	"agentgo/internal/pathutil"
-	"agentgo/internal/plan"
 	"agentgo/internal/probe"
+	"agentgo/internal/prompt"
 	"agentgo/internal/reactor"
 	reactorbuiltin "agentgo/internal/reactor/builtin"
 	"agentgo/internal/reactor/userdef"
@@ -39,6 +41,7 @@ import (
 	"agentgo/internal/shell"
 	"agentgo/internal/spawn"
 	"agentgo/internal/store"
+	"agentgo/internal/taskmem"
 	"agentgo/internal/team"
 	"agentgo/internal/tools"
 	"agentgo/internal/trace"
@@ -58,21 +61,31 @@ type System struct {
 	CancelRegistry  *store.TaskCancelRegistry
 	MailboxRegistry *mailbox.Registry
 	MailNotifier    *mailbox.MailNotifier
-	Scheduler       *scheduler.Bundle // Phase 3：scheduler 现在是 agent.Agent + Activator + 三轴 modes.Store 的复合
-	PlanStore       *plan.Store
-	PlanCoordinator *plan.Coordinator
+	Scheduler       *scheduler.Bundle // scheduler 是 agent.Agent + Activator + 两轴 modes.Store 的复合
+	// GraphStore / GraphRuntime 是 V6 Graph 运行桥接（C5a）：图的持久化与
+	// 执行引擎，由 wireGraphRuntime 装配。Shutdown 时 Close GraphStore
+	// （每图 journal 句柄）；C5b 的 Scheduler 图工具经 GraphRuntime
+	// 提交/查询图。
+	GraphStore   *graph.Store
+	GraphRuntime *graph.Runtime
 	// Interactions is the authoritative structured human-response service shared
-	// by Plan/Scheduler, Shell and every UI frontend.
+	// by Scheduler/Graph approval, Shell and every UI frontend.
 	Interactions *interaction.Service
-	// PlanBatcher 是 C1 的 Task→Plan 变更异步落盘器（单 flusher 合并 fsync）。
-	// Shutdown 必须先 Drain（2s 界）再 Stop，不泄漏 goroutine。
-	PlanBatcher *planMutationBatcher
-	Activity    *agent.ActivityTracker
+	Activity     *agent.ActivityTracker
 	// v4：所有执行/调查代理都是 runner.Runner（取代旧 worker.Worker / explorer.Explorer
 	// 两个 package；详见 nextUpgrade_v4.md §11.6.6）。kind × replicas 实例化在 Bootstrap()
 	// 主流程展开。
 	Runners     []*runner.Runner
 	ArtifactLog *store.ArtifactLog // Artifacts 持久化日志，Shutdown 时需 Close；nil 表示持久化已禁用
+	// agentAuditEntries 是 /doctor agents 审计（V6 §2 P1b）的装配期要素
+	// 快照：每个静态 kind 一条 + scheduler 一条，启动期收集后只读。
+	agentAuditEntries []AgentAuditEntry
+	// agentAudit 是审计任务终态的补记 Reactor（agent_audit_completed）；
+	// 进程内 FIFO meta，nil 表示未注册（审计任务可发布但无 completed 补记）。
+	agentAudit *agentAuditReactor
+	// EffectJournal 是 V6 §4 H2b 副作用账本（internal/effect），Shutdown 时需
+	// Close；nil 表示账本已禁用（初始化失败，全部埋点降级不记账）。
+	EffectJournal *effect.Journal
 	// artifactReplay 是启动时从 ArtifactLog 重放出的 taskID→artifacts 映射（F12）。
 	// store 构造时还没有任何任务，立即恢复会全部 miss；由 restoreRuntimeSnapshot
 	// 在 Task 快照导入后消费。RestoreArtifacts 是覆盖式恢复（rebuilt 为完整去重
@@ -82,7 +95,7 @@ type System struct {
 	SpawnManager    *spawn.Manager          // v5 Phase 5 S5+S6：ad-hoc agent 生命周期管理器
 	ReactorRegistry *reactor.Registry       // E4：Shutdown 时 Quiesce（取消在途 async reactor 并带界排空）
 	AgentTemplates  *agenttemplate.Catalog  // immutable builtin/user/project template catalog
-	TeamManager     *team.Manager           // Plan-scoped template Team lifecycle and recovery
+	TeamManager     *team.Manager           // controller-scoped template Team lifecycle and recovery
 	TeamStore       *team.Store             // fsynced TeamSpec identity store
 	StatusCh        chan string             // TUI 日志/进度消息通道；Bootstrap 创建，UI Hub 消费
 	OutputCh        chan output.Event       // Agent 用户可见输出通道（文本/结果已分类），与日志分离；UI Hub 消费
@@ -106,7 +119,7 @@ type System struct {
 	// snapshotMu serializes periodic/shutdown saves with Session switches so a
 	// snapshot exported for the old Session can never be committed to the new one.
 	snapshotMu sync.Mutex
-	// sessionSwitchErr carries critical Plan/Team persistence rebind failures
+	// sessionSwitchErr carries critical Team persistence rebind failures
 	// from SessionManager's synchronous OnSwitch callback back to NewSession /
 	// SwitchSession, which can then roll the committed manager switch back.
 	sessionSwitchErrMu sync.Mutex
@@ -312,6 +325,10 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	if traceErr != nil {
 		fmt.Printf("[启动] WARNING: trace 系统初始化失败 (dir=%s): %v\n", traceDir, traceErr)
 	} else {
+		// V6 §7.2：SessionID 由 Writer 集中盖戳——绑定当前活跃 Session
+		if sessMgr != nil && sessMgr.Current() != nil {
+			traceWriter.SetSessionID(sessMgr.Current().ID)
+		}
 		trace.SetDefault(traceWriter)
 		log.Printf("[启动] Trace 系统已启动 (dir=%s, 保留最近 100 个任务)", traceDir)
 	}
@@ -326,6 +343,13 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		log.Println("[启动] Prompt dump 已启用 (AGENTGO_DUMP_PROMPTS=1)")
 	}
 
+	// Step 1.7: V6 §7.4 trace 默认脱敏的显式旁路（与 prompt dump 同级开发开关）：
+	// AGENTGO_TRACE_FULL_ARGS=1 时工具参数/命令完整落 trace，不做脱敏。
+	if os.Getenv("AGENTGO_TRACE_FULL_ARGS") == "1" {
+		trace.SetFullArgsEnabled(true)
+		log.Println("[启动] trace 完整参数记录已启用 (AGENTGO_TRACE_FULL_ARGS=1)：工具参数不再脱敏")
+	}
+
 	// Step 2: 初始化公告板
 	eventCh := make(chan model.Event, cfg.Infra.Store.EventChannelBuffer)
 	taskStore := store.NewMemoryTaskStore(eventCh, cfg.Infra.Store.FIFOLimit, cfg.Infra.Store.DefaultConcurrency, cfg.Infra.Store.DefaultTimeoutSec)
@@ -333,31 +357,11 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	taskStore.SetCancelRegistry(cancelRegistry)
 	log.Println("[启动] 公告板初始化完成")
 
-	// Step 2.1: 初始化动态 DAG 的可靠控制面。Plan 状态与 pending
-	// ReplanRequest 使用原子 JSON 存储；内存 signal 仅作唤醒加速。
-	planStatePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "plans.json")
-	if sessMgr != nil && sessMgr.Current() != nil {
-		planStatePath = filepath.Join(sessMgr.Current().Dir, "plan-state.json")
-	}
-	planStore, planErr := plan.OpenStore(planStatePath)
-	if planErr != nil {
-		return nil, fmt.Errorf("初始化 PlanStore 失败: %w", planErr)
-	}
-	planCoordinator := plan.NewCoordinator(planStore, planTaskBackend{store: taskStore})
-	planCoordinator.SetAcceptanceVerifier(planAcceptanceVerifier{store: taskStore, projectRoot: cfg.ProjectRoot})
-	// C1：Task→Plan 变更落盘改为异步批处理——Mutated hook 仅入队（agent
-	// goroutine 上不再做全量 fsync），单个 flusher 合并落盘。Plan 事实最终
-	// 一致（毫秒级滞后），Shutdown 经 PlanBatcher.Drain 兜底。
 	// 节点能力注册表（per-node NodeCapability 认领检查的事实源）：
-	// 此处先建空表并注入 hooks/checker 闭包，白名单在下方 Step 8 创建静态
+	// 此处先建空表并注入 checker 闭包，白名单在下方 Step 8 创建静态
 	// runner 时逐条登记，动态来源（spawn.KindOf / agentRegistry route 能力）
 	// 在 Step 8.5 后接线——checker 每次调用现查表，后填充自然生效。
 	capReg := newCapabilityRegistry()
-	planBatcher := newPlanMutationBatcher(planCoordinator)
-	planHooks := makeTaskPlanHooks(planCoordinator, capReg.checker())
-	planHooks.Mutated = planBatcher.submit
-	taskStore.SetTaskPlanHooks(planHooks)
-	log.Printf("[启动] PlanCoordinator 初始化完成 (state=%s)", planStatePath)
 
 	teamStatePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "agent-teams.json")
 	if sessMgr != nil && sessMgr.Current() != nil {
@@ -403,14 +407,50 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 			artifactLog.Path(), len(artifactReplay))
 	}
 
+	// Step 2.4: Effect Journal（V6 §4 H2b，副作用账本）。
+	//
+	// .agentgo/state/effects.jsonl：副作用执行前记 prepared、执行后记
+	// settled/unknown，崩溃恢复以账本 + 实际外部状态共同裁决。与 artifact
+	// log 同一降级姿态：初始化失败只打印 warning——账本是观测设施，
+	// 不能让磁盘问题阻塞 CLI 启动（nil 时全部埋点不记账）。
+	//
+	// 恢复裁决在此处同步执行：trace writer 已就位（Step 1.5）而 Reactor
+	// dispatcher 尚未挂载（末段才 SetDefaultDispatcher），effect_* 事件
+	// 只落 trace 分片，不会触发任何 Reactor 副作用——与下方运行时状态
+	// 恢复前 detach dispatcher 是同一防护意图。
+	effectJournal, ejErr := effect.OpenJournal(artifactLogDir)
+	var effectRecoveryDecisions []effect.RecoveryDecision
+	if ejErr != nil {
+		fmt.Printf("[启动] WARNING: effect journal 初始化失败 (dir=%s): %v —— 副作用账本已禁用\n", artifactLogDir, ejErr)
+		effectJournal = nil
+	} else {
+		decisions := effectJournal.Recover(effect.FileHashVerifier{})
+		effectRecoveryDecisions = decisions
+		if len(decisions) > 0 {
+			unknownCount := 0
+			for _, d := range decisions {
+				if d.Decision != effect.DecisionVerifiedSettled {
+					unknownCount++
+				}
+			}
+			log.Printf("[启动] Effect Journal 恢复裁决完成：%d 条待裁决（核验一致转 settled %d 条，保持 unknown %d 条）",
+				len(decisions), len(decisions)-unknownCount, unknownCount)
+			if unknownCount > 0 {
+				// unknown 清单必须向用户可见（控制台 + system.log + trace 事件三通道）。
+				fmt.Printf("[启动] WARNING: %d 条副作用在崩溃窗口结果不可知（unknown），未自动重跑；请经 trace show <task_id> 查看 effect_* 事件人工裁决\n", unknownCount)
+			}
+		}
+		log.Printf("[启动] Effect Journal 已启用 (log=%s)", effectJournal.Path())
+	}
+
 	// Step 2.5: 初始化统一 Gate 系统（v5 Phase 1，ReactiveSystem.md §4.4）
 	//
 	// v4 时代分立的 ToolHookRegistry / MailboxHookRegistry 在 v5 合并为单一
 	// gate.Registry。impl 仍保留在 internal/hook/builtin/，注册时通过
 	// gate.WrapToolHook / WrapMailboxHook 包装为 gate.Gate。
 	//
-	// 三轴模式 store 提前到此创建：exec-mode-guard Gate 需要注入它做 readonly
-	// 判定；同一实例稍后注入 scheduler（快照消费）与 UI Hub（三轴运行时切换）。
+	// 两轴模式 store 提前到此创建：exec-mode-guard Gate 需要注入它做 readonly
+	// 判定；同一实例稍后注入 scheduler（快照消费）与 UI Hub（运行时切换）。
 	modeStore := modes.NewStore(cfg.ResolveModes())
 	gateReg := gate.NewRegistry()
 	var storeView store.StoreHookView = taskStore
@@ -530,7 +570,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	//     写 task.ReadSet 取代 require-read-before-write Gate 反查日志
 	//   - runtime-anomaly (Async)：订阅 KindTaskCompleted，用 Store 运行时数据复刻
 	//     trace CLI detectAnomalies 最高信号启发式（凭空写入 / 工具错误率>30%），
-	//     命中即经 planCoordinator 请求重规划（无 Plan 降级为 trace 告警）
+	//     命中即 emit trace 告警（C6b 起 Plan 控制面已删，降级为纯观测）
 	reactorReg := reactor.NewRegistry()
 	if err := reactorReg.Register(reactorbuiltin.NewRecordArtifactReactor(storeView, cfg.ProjectRoot, wsMgr)); err != nil {
 		return nil, fmt.Errorf("注册 RecordArtifactReactor 失败: %w", err)
@@ -546,8 +586,16 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	if err := reactorReg.Register(reactorbuiltin.NewReadSetWriteReactor(taskStore)); err != nil {
 		return nil, fmt.Errorf("注册 ReadSetWriteReactor 失败: %w", err)
 	}
-	if err := reactorReg.Register(reactorbuiltin.NewAnomalyReactor(storeView, planCoordinator)); err != nil {
+	if err := reactorReg.Register(reactorbuiltin.NewAnomalyReactor(storeView)); err != nil {
 		return nil, fmt.Errorf("注册 AnomalyReactor 失败: %w", err)
+	}
+	// Step 3.9.1: V6 Graph 运行桥接（C5a，graph_runtime.go）——图持久化恢复、
+	// 执行引擎与任务终态回填 Reactor（graph-terminal-feed）。必须在
+	// dispatcher 挂载前完成注册（restoreRuntimeBeforeReactorActivation）。
+	graphStore, graphRuntime, err := wireGraphRuntime(
+		cfg, taskStore, reactorReg, effectJournal, unresolvedEffectTaskReasons(effectRecoveryDecisions))
+	if err != nil {
+		return nil, err
 	}
 	// 注：用户 reactor + spawn.Manager + trace.SetDefaultDispatcher 推迟到
 	// RunnerDeps 构造完成后（见 Step 8 末尾），因为 spawn.Manager 需要 RunnerDeps
@@ -559,7 +607,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// Step 4: 创建 scheduler LLM 客户端
 	// scheduler model 优先用 cfg.Scheduler.Model；循环与历史预算稍后由
 	// internal/scheduler.New 从同一 cfg.Scheduler 读取。
-	// 缺省回落 cfg.LLM.DefaultModel。LLM endpoint / api_key / provider 与 worker 共享。
+	// 缺省回落 cfg.LLM.DefaultModel。LLM endpoint / api_key 与 worker 共享。
 	schedulerLLM := buildKindLLMClient(cfg.LLM, cfg.Scheduler.Model)
 
 	// Step 5.5: 构造特化代理注册表（Sprint 3 #7 Scheduler 分配感知）
@@ -653,15 +701,41 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		}
 		return current.Metadata.SessionID
 	}
-	// Step 7.4: 创建通用人机 Interaction 服务。Plan、Shell 与全部前端
-	// 共享同一个 CAS 状态机；UI 只消费安全投影，不持有回复通道。
+	// Step 7.4: 创建通用人机 Interaction 服务。Scheduler/Graph approval、Shell
+	// 与全部前端共享同一个 CAS 状态机；UI 只消费安全投影，不持有回复通道。
 	interactionService := interaction.NewService(interaction.NewMemoryStore(),
 		interaction.WithSessionIDProvider(currentSessionID))
+
+	// Step 7.4.1: V6 Graph approval/tool 桥（C5c，graph_approval.go /
+	// graph_tool.go）——approval 节点经 Interaction 服务请求人工裁决
+	// （决议经 Service 终态回调异步回填 Runtime.OnApprovalDecided）；
+	// tool 节点执行只读四工具（LocalReadGroup 同源 handler，pathutil 边界
+	// 照常生效）。必须在 resumeNonTerminalGraphs 之前完成注入：恢复路径的
+	// approval 补发 / tool 重执行都走这两个桥。
+	graphApprovalGW := wireGraphApprovalBridge(interactionService, graphRuntime)
+	wireGraphToolBridge(cfg.ProjectRoot, graphRuntime)
+
+	// Step 7.4.2: V6 Graph acceptance 服务端核验桥（G1b，graph_acceptance.go）——
+	// acceptance 节点 completed 终态结算时核验验收 agent 自报的
+	// Results["evidence"]（command 对 Effect Journal shell 账逐字比对 +
+	// exit code、file_hash 边界内重算 sha256、task_status 词表）；disputed/
+	// unverifiable 不采信 verdict（节点 failed + graph change 唤醒任务交
+	// Scheduler 裁决）。effectJournal 为 nil 时核验器按 unverifiable 保守
+	// 处理（不误判 valid）。与 approval/tool 桥同批注入：启动后第一批验收
+	// 任务终态必须已装配。
+	wireGraphAcceptanceBridge(cfg.ProjectRoot, effectJournal, taskStore, graphRuntime)
 
 	// Step 4.5: 创建 TUI 双通道（日志与 Agent 输出分离，避免竞争）
 	statusCh := make(chan string, 1024)      // 日志/进度消息
 	outputCh := make(chan output.Event, 256) // Agent 用户可见输出（文本/结果已分类）
 	activity := agent.NewActivityTracker()
+
+	// V6 §7.1 trace_degraded：Writer 进入降级态（首次连续写失败）时告警——
+	// log + UI status 通道非阻塞投递（trace 故障绝不反压主流程）。session
+	// 切换换绑的新 writer 在 onSessionSwitched 接同一回调。
+	if w := trace.Default(); w != nil {
+		w.SetOnDegraded(traceDegradedAlerter(statusCh))
+	}
 	var sys *System
 	outputDone := make(chan struct{})
 	var streamSessionMu sync.Mutex
@@ -714,6 +788,9 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		shellFilter = shell.NewCommandFilter(shell.DefaultBlacklist, shell.DefaultGreylist)
 		fmt.Printf("[启动] WARNING: shell 过滤器规则加载失败，使用默认规则: %v\n", fErr)
 	}
+	// Task Memory（CM2）与 Session 晋升器（CM3）共用同一 Store 实例：
+	// 晋升器从它读终态 Task Memory 并回写 PromotedAt 幂等标记。
+	taskMemStore := taskmem.NewStore(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "taskmem"))
 	deps := runner.RunnerDeps{
 		Store:                 taskStore,
 		Roster:                r,
@@ -721,7 +798,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		StoreView:             storeView,
 		RecordToolCall:        recordToolCall,
 		Memory:                memoryStore,
-		PlanCoordinator:       planCoordinator,
+		TaskMemStore:          taskMemStore,
 		RouteValidator:        agentRegistry,
 		Activity:              activity,
 		MBRegistry:            mbRegistry,
@@ -731,6 +808,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		Interactions:          interactionService,
 		SessionID:             currentSessionID,
 		Modes:                 modeStore,         // 与 scheduler / UI Hub 同一实例：exec 轴驱动 strict/yolo
+		EffectJournal:         effectJournal,     // H2b 副作用账本；nil（初始化失败）时埋点降级不记账
 		UserOutput:            newTextWriter(""), // 共享兜底（team/spawn ad-hoc runner）；静态 runner 在下方按实例标记
 		StreamOutput:          streamOutput,
 		TaskEndCallbacks:      taskEndReactor,
@@ -738,7 +816,6 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		RosterWaitTimeoutSec:  cfg.Infra.Roster.WaitTimeoutSec,
 		ShellTimeoutSec:       cfg.ShellTimeoutSec,
 		MaxSubtaskDepth:       cfg.MaxSubtaskDepth,
-		TransferNoteMaxTokens: cfg.TransferNoteMaxTokens,
 		ProgressNotifyEnabled: cfg.ProgressNotifyEnabled,
 		HashlineEnabled:       *cfg.HashlineEnabled,
 	}
@@ -746,7 +823,16 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// 全部 kind × replica 的 Runner 共享进程级唯一 Manager；认领声明
 	// Capability.Isolation 的任务时执行面经它换入 overlay 视图。
 	deps = withWorkspaceManager(deps, wsMgr)
+
+	// Step 8.1.5: 注册 Session Memory 晋升 Reactor（V6 §3 CM3，
+	// session_promotion.go）：订阅四种任务终态事件，把终态 Task Memory
+	// 筛选晋升为 Session Memory（每 Task 终态最多一次，PromotedAt 幂等）。
+	// 后端惰性解析——SessionStore 在 resume 阶段才挂接到 memoryStore。
+	if err := reactorReg.Register(newSessionPromotionReactor(taskMemStore, memoryStore.SessionBackend)); err != nil {
+		return nil, fmt.Errorf("注册 Session Memory 晋升 Reactor 失败: %w", err)
+	}
 	var runners []*runner.Runner
+	var auditEntries []AgentAuditEntry
 	for _, kind := range cfg.Agents {
 		kindLLM := buildKindLLMClient(cfg.LLM, kind.Model)
 		for i := 1; i <= kind.Replicas; i++ {
@@ -756,6 +842,19 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 			}
 			if err := tools.ValidateToolNames(rt.AllowedTools); err != nil {
 				return nil, fmt.Errorf("kind=%q replica=%d 工具名校验失败: %w", kind.Kind, i, err)
+			}
+			// /doctor agents 审计（V6 §2 P1b）：每个静态 kind 收集一条装配
+			// 期要素（同 kind 各副本的 prompt/白名单相同，只记一次）。
+			if i == 1 {
+				auditEntries = append(auditEntries, AgentAuditEntry{
+					Kind:          kind.Kind,
+					EventType:     kind.EventType,
+					Description:   auditDescriptionFallback(kind),
+					PromptDigest:  prompt.DigestText(rt.SystemPrompt),
+					PromptExcerpt: auditExcerpt(rt.SystemPrompt),
+					AllowedTools:  append([]string(nil), rt.AllowedTools...),
+					Replicas:      kind.Replicas,
+				})
 			}
 			kindDeps := deps
 			kindDeps.LLMClient = kindLLM
@@ -772,13 +871,13 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		}
 	}
 
-	// Step 8.2: 构造 Plan-scoped AgentTemplate TeamManager。它与静态
+	// Step 8.2: 构造按 controller 任务归属的 AgentTemplate TeamManager。它与静态
 	// cfg.Agents 共用 RunnerDeps，但只在 System.Start 后恢复/启动动态 Team。
 	teamLLMFactory := team.LLMFactory(func(model string) llm.Client {
 		return buildKindLLMClient(cfg.LLM, model)
 	})
 	teamMgr := team.NewManager(
-		deps, teamLLMFactory, templateCatalog, planCoordinator, teamStore,
+		deps, teamLLMFactory, templateCatalog, teamStore,
 		agentRegistry, cfg.AgentTemplates.MaxRuntimeAgents,
 	)
 	if err := reactorReg.Register(teamMgr); err != nil {
@@ -787,13 +886,15 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 
 	// Step 5: Scheduler 在 TeamManager 构造后装配，因而模板发现和动态
 	// provision 工具拿到的是同一个 runtime authority。
-	// 三轴模式 store：初值来自 cfg.Modes（缺省 immediate/normal/team），
+	// 两轴模式 store：初值来自 cfg.Modes（缺省 normal/team），
 	// 已在 Step 2.5 创建（exec-mode-guard Gate 注入）；
-	// 同一实例注入 scheduler（快照消费）与 UI Hub（三轴运行时切换）。
+	// 同一实例注入 scheduler（快照消费）与 UI Hub（两轴运行时切换）。
 	sched := scheduler.New(
 		taskStore, r, schedulerLLM, eventCh, cfg, cancelRegistry, mbRegistry, interactionService,
 		gateReg, storeView, recordToolCall, agentRegistry, templateCatalog, teamMgr,
-		memoryStore, newTextWriter("scheduler"), resultWriter, modeStore, planCoordinator,
+		memoryStore, newTextWriter("scheduler"), resultWriter, modeStore,
+		graphRuntime, graphStore, // C5b：submit_graph / patch_graph 的图控制面注入
+		effectJournal, // H2b：scheduler 工具面与 workspace 合并的副作用账本
 	)
 	if sched.Agent != nil {
 		sched.Agent.Activity = activity
@@ -801,6 +902,18 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		activity.RegisterAgent(sched.Agent.ID, "scheduler")
 	}
 	sched.SchedulerExec.ToolHealth = toolHealth
+
+	// /doctor agents 审计（V6 §2 P1b）：scheduler 条目（内嵌 prompt +
+	// 注册全集即真实白名单）。
+	auditEntries = append(auditEntries, AgentAuditEntry{
+		Kind:          "scheduler",
+		EventType:     "__scheduler__",
+		Description:   "系统调度器：用户输入裁决、任务委派与图编排控制面",
+		PromptDigest:  prompt.DigestText(scheduler.SystemPrompt()),
+		PromptExcerpt: auditExcerpt(scheduler.SystemPrompt()),
+		AllowedTools:  sched.ToolReg.Names(),
+		Replicas:      1,
+	})
 
 	// Step 8.5: spawn.Manager 构造 + 注册（v5 Phase 5 S5+S6）
 	//
@@ -817,12 +930,13 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// 能力注册表动态来源接线：
 	//   - spawn ad-hoc agent：KindOf 解析 base kind，白名单继承静态 kind
 	//     （spawn/types.go：AllowedTools 不可 override、始终来自 base kind）；
-	//   - 动态 Team：RouteCapabilitiesForPlan 给出该 eventType 全部 ready
-	//     listener 的能力交集，与 team runner 白名单同出 tmpl.Tools。
+	//   - 动态 Team：RouteCapabilities 给出该 eventType 全部 ready listener
+	//     的能力交集，与 team runner 白名单同出 tmpl.Tools（team 事件类型按
+	//     Team 唯一，交集天然只覆盖该 Team 的 listener）。
 	// 两级来源就绪后把 checker 注入 store（A 方注入点）：QueryAvailable 过滤
-	// 与 CanClaim 双保险自此对显式声明 capability 的任务生效。
+	// 与 ClaimTask 落锁前检查的双保险自此对显式声明 capability 的任务生效。
 	capReg.kindOf = spawnMgr.KindOf
-	capReg.routeCaps = agentRegistry.RouteCapabilitiesForPlan
+	capReg.routeCaps = agentRegistry.RouteCapabilities
 	taskStore.SetCapabilityChecker(store.CapabilityChecker(capReg.checker()))
 
 	// Step 8.6: 用户 YAML reactor（v5 Phase 5 S1-S6）
@@ -849,8 +963,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 			return spawnMgr.KindOf(agentID)
 		}
 		userReactorDeps := userdef.Deps{
-			Store:           taskStore,
-			ReplanRequester: replanRequesterAdapter{coordinator: planCoordinator, store: taskStore},
+			Store: taskStore,
 			LLMFactory: func(model string) userdef.LLMCompleter {
 				// 独立 reactor LLM client：不复用主 agent client，避免共享 history / system prompt 状态。
 				return userdef.NewLLMCompleter(buildKindLLMClient(cfg.LLM, model))
@@ -891,20 +1004,21 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		CancelRegistry:      cancelRegistry,
 		MailboxRegistry:     mbRegistry,
 		MailNotifier:        mailNotifier,
-		ArtifactLog:         artifactLog, // 可能为 nil（OpenArtifactLog 失败时），Shutdown 会判空
+		ArtifactLog:         artifactLog,   // 可能为 nil（OpenArtifactLog 失败时），Shutdown 会判空
+		EffectJournal:       effectJournal, // 可能为 nil（OpenJournal 失败时），Shutdown 会判空
 		artifactReplay:      artifactReplay,
 		SessionMgr:          sessMgr, // 可能为 nil（Session 初始化失败时），Shutdown 会判空
 		Scheduler:           sched,
-		PlanStore:           planStore,
-		PlanCoordinator:     planCoordinator,
+		GraphStore:          graphStore,
+		GraphRuntime:        graphRuntime,
 		Interactions:        interactionService,
-		PlanBatcher:         planBatcher,
 		Activity:            activity,
 		Runners:             runners,
 		ReactorRegistry:     reactorReg,
 		AgentTemplates:      templateCatalog,
 		TeamManager:         teamMgr,
 		TeamStore:           teamStore,
+		agentAuditEntries:   auditEntries,
 		StatusCh:            statusCh,
 		OutputCh:            outputCh,
 		LogFile:             logFileHolder,
@@ -913,21 +1027,40 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	}
 	var staleResumeBlocks []staleResumeBlock
 	if recoveredSnap != nil {
-		recoveredSnap, staleResumeBlocks = prepareRecoveredSnapshot(
+		// Effect Journal 是副作用恢复的权威源。任一保持 unknown
+		// 的裁决都先把同 TaskID 非终态快照 quarantine 为 blocked，
+		// 再应用通用 stale resume guard。显式 --resume 也不能绕过
+		// unknown Effect，否则 processing 任务会静默重放 Shell/消息。
+		var effectBlocks []staleResumeBlock
+		recoveredSnap, effectBlocks = protectUnknownEffectResume(recoveredSnap, effectRecoveryDecisions, time.Now())
+		staleResumeBlocks = append(staleResumeBlocks, effectBlocks...)
+		if len(effectBlocks) > 0 {
+			log.Printf("[resume] Effect Journal unknown 裁决已隔离 %d 个非终态任务，未自动重跑", len(effectBlocks))
+		}
+		var staleBlocks []staleResumeBlock
+		recoveredSnap, staleBlocks = prepareRecoveredSnapshot(
 			sys,
 			recoveredSnap,
 			opts.ResumeSessionID != "",
 			time.Duration(cfg.SessionResumeMaxIdleSec)*time.Second,
 			time.Now(),
 		)
-		if len(staleResumeBlocks) > 0 {
-			log.Printf("[resume] 陈旧自动恢复保护已阻断 %d 个非终态任务；如需确认恢复，请显式使用 --resume <session-id>", len(staleResumeBlocks))
+		staleResumeBlocks = append(staleResumeBlocks, staleBlocks...)
+		if len(staleBlocks) > 0 {
+			log.Printf("[resume] 陈旧自动恢复保护已阻断 %d 个非终态任务；如需确认恢复，请显式使用 --resume <session-id>", len(staleBlocks))
 		}
 	}
 	if err := restoreRuntimeBeforeReactorActivation(sys, recoveredSnap, staleResumeBlocks, reactorReg); err != nil {
 		return nil, fmt.Errorf("恢复 Plan/Task 运行时状态失败: %w", err)
 	}
-	log.Println("[启动] Reactor 系统初始化完成（record-artifact, task-end-callback, trace-history-event, read-set-write, runtime-anomaly, spawn-manager）")
+	// V6 Graph：快照导入完成后恢复非终态图的执行。时序是硬约束——board 的
+	// (graph_id, activation_id) 幂等补发靠公告板中已恢复的旧任务去重，
+	// 提前 Resume 会把崩溃前已发布的任务误判缺失而重复发布（详见函数注释）。
+	resumeNonTerminalGraphs(sys)
+	// C5c：重启后为 waiting 的 approval 节点补登记 Interaction（内存服务不跨
+	// 重启；确定性 requestID + Get 去重保证幂等）。
+	rearmPendingGraphApprovals(sys.GraphStore, graphApprovalGW)
+	log.Println("[启动] Reactor 系统初始化完成（record-artifact, task-end-callback, trace-history-event, read-set-write, runtime-anomaly, graph-terminal-feed, spawn-manager）")
 	if recoveredSnap != nil {
 		log.Printf("[resume] 已恢复 session snapshot: tasks=%d mailboxes=%d scheduler_history=%d",
 			len(recoveredSnap.Tasks), len(recoveredSnap.Mailboxes), len(recoveredSnap.SchedulerHistory))
@@ -936,13 +1069,21 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		sys.seedResult(initialResult)
 	}
 
-	// Step 10: session 切换钩子——/new 或 /session 成功提交后，把 plan/team
+	// Step 10: session 切换钩子——/new 或 /session 成功提交后，把 team
 	// store 的持久化位置迁移到新 Session 目录（B2），并把 trace writer、
 	// prompt dumper、system.log 重绑到新 Session 的 logs/ 目录（B5/B7）。
 	// 钩子只在显式 CreateNew/SwitchTo 成功后触发；启动期 initSession 不触发，
 	// 因此此刻注册不会立即回调。
 	if sessMgr != nil {
 		sessMgr.SetOnSwitch(sys.onSessionSwitched)
+	}
+
+	// Step 10.5: 注册 /doctor agents 审计终态补记 Reactor（V6 §2 P1b，
+	// agent_audit.go）——审计任务到达终态时补记 agent_audit_completed
+	//（Async、100 档；发布期 meta 是进程内 FIFO 事实）。
+	sys.agentAudit = newAgentAuditReactor()
+	if err := sys.ReactorRegistry.Register(sys.agentAudit); err != nil {
+		return nil, fmt.Errorf("注册 agent-audit Reactor 失败: %w", err)
 	}
 
 	// Step 11: 装配 UI Hub——Output/Status 与 Interaction 的统一投影。
@@ -966,7 +1107,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 // buildUIHub 装配 UI Hub 的全部依赖：三个 UI 通道直挂；快照轮询复用
 // buildAgentInfoFn / Store.ScanAll / Mode / SessionMgr；控制面复用
 // sendUserText 的事件投递语义（5 秒超时）、cancelTaskByPrefix（D2）、
-// MailboxRegistry.Send（steer）、三轴 modes.Store 的运行时切换（/mode）、
+// MailboxRegistry.Send（steer）、两轴 modes.Store 的运行时切换（/mode）、
 // System.NewSession/SwitchSession（B3）与根 cancel。
 func (s *System) buildUIHub() *ui.Hub {
 	return ui.NewHub(ui.Deps{
@@ -987,10 +1128,6 @@ func (s *System) buildUIHub() *ui.Hub {
 				board = append(board, ui.BoardTaskFromModel(*t))
 			}
 			return board
-		},
-		ModeGet: func() string {
-			// gate 轴字符串保持兼容（"plan" / "immediate"）。
-			return s.Scheduler.Modes.GetGate().String()
 		},
 		ExecModeGet: func() string {
 			return s.Scheduler.Modes.GetExec().String()
@@ -1053,19 +1190,18 @@ func (s *System) buildUIHub() *ui.Hub {
 			if ctx == nil {
 				ctx = context.Background()
 			}
-			return cancelTaskByPrefix(ctx, s.Store, s.PlanCoordinator, idPrefix)
+			return cancelTaskByPrefix(ctx, s.Store, idPrefix)
 		},
 		CancelLatestRequest: func() (string, error) {
 			ctx := s.startCtx
 			if ctx == nil {
 				ctx = context.Background()
 			}
-			return cancelLatestActiveRequest(ctx, s.Store, s.PlanCoordinator)
+			return cancelLatestActiveRequest(ctx, s.Store)
 		},
 		SteerSend: s.MailboxRegistry.Send,
-		// /mode 三轴切换：gate 轴走 ModeSet；exec / topo 轴由 Hub 解析成
-		// 规范化小写串后到这里写回 modes.Store（再解析一次做防御性校验）。
-		ModeSet: s.Scheduler.Modes.SetGate,
+		// /mode 两轴切换：exec / topo 轴由 Hub 解析成规范化小写串后到这里
+		// 写回 modes.Store（再解析一次做防御性校验）。
 		ExecModeSet: func(mode string) error {
 			m, err := modes.ParseExecMode(mode)
 			if err != nil {
@@ -1082,33 +1218,11 @@ func (s *System) buildUIHub() *ui.Hub {
 			s.Scheduler.Modes.SetTopo(m)
 			return nil
 		},
-		SessionNew:    s.NewSession,
-		SessionSwitch: s.SwitchSession,
-		// /plan 三入口：gate=plan 的 plan_review 挂起由用户经 UI 批准/拒绝；
-		// 批准时由 bootstrap 预发布保留 controller 并恢复 Plan（去 LLM 版的
-		// Interaction response），scheduler agent 随后认领该任务按计划执行。
-		ApprovePlanReview: func(idPrefix string) (string, error) {
-			ctx := s.startCtx
-			if ctx == nil {
-				ctx = context.Background()
-			}
-			return s.respondPlanReviewByPrefix(ctx, idPrefix, "execute_plan")
-		},
-		RejectPlanReview: func(idPrefix string) (string, error) {
-			ctx := s.startCtx
-			if ctx == nil {
-				ctx = context.Background()
-			}
-			return s.respondPlanReviewByPrefix(ctx, idPrefix, "cancel_request")
-		},
-		PendingPlanReviews: func() ([]ui.PlanReviewItem, error) {
-			ctx := s.startCtx
-			if ctx == nil {
-				ctx = context.Background()
-			}
-			return s.pendingPlanReviewsFromInteractions(ctx)
-		},
+		SessionNew:         s.NewSession,
+		SessionSwitch:      s.SwitchSession,
 		ResolveInteraction: s.resolveInteraction,
+		// /doctor agents（V6 §2 P1b）：只读代理审计任务创建入口。
+		RequestAgentAudit: s.RequestAgentAudit,
 		SessionList: func() ([]ui.SessionInfo, error) {
 			if s.SessionMgr == nil {
 				return nil, fmt.Errorf("session 管理器未初始化")
@@ -1144,10 +1258,6 @@ func (s *System) Start(ctx context.Context, cancel context.CancelFunc) error {
 		s.shutdownDone = make(chan struct{})
 	})
 	startSigSentinel(ctx, cancel, !shouldStartTUI(s.uiFrontends()), s.shutdownDone)
-
-	// 将 PlanStore 中的暂停事实持续物化为结构化 Interaction；恢复 Session
-	// 后也由同一 reconciliation 路径重建，不依赖易丢失的瞬时事件。
-	s.startInteractionRuntime(ctx)
 
 	// Step 4.6: 启动 UI Hub（output/status 与 Interaction 投影的统一消费者；
 	// 无订阅者也常驻排干，ctx 取消即退出）。
@@ -1373,13 +1483,13 @@ func (w *tuiLogWriter) Write(p []byte) (n int, err error) {
 
 // onSessionSwitched 是 SessionManager 的 OnSwitch 钩子：/new 或 /session
 // 成功提交后执行全部 session 目录重绑（B2/B5/B7）：
-//  1. plan/team store 的持久化位置迁移到新 Session 目录（RebindDir 会把当前
+//  1. team store 的持久化位置迁移到新 Session 目录（RebindDir 会把当前
 //     内存态立即写一次到新路径；运行时状态跨 session 连续，仅落盘位置迁移）；
-//  1.5 Session Memory（memory.jsonl）换绑到新 Session 目录（新后端实例从
+//     1.5 Session Memory（memory.jsonl）换绑到新 Session 目录（新后端实例从
 //     目标文件 replay 出该 session 的历史；无常驻句柄，换绑即生效）；
 //  2. trace writer / prompt dumper / system.log 重绑到新 Session 的 logs/ 目录。
 //
-// Plan/Team 是恢复所需的关键持久化事实：失败会记录到 sessionSwitchErr，
+// Team 是恢复所需的关键持久化事实：失败会记录到 sessionSwitchErr，
 // 由 System.NewSession/SwitchSession 在同一 snapshotMu 边界内回滚 Session。
 // trace/dumper/system.log 属于观测资源，仍各自 open-new-before-close-old，失败
 // 只告警并保留旧绑定。
@@ -1388,16 +1498,7 @@ func (s *System) onSessionSwitched(newSess *session.Session) {
 		return
 	}
 
-	// 1. plan/team store 持久化位置迁移。某些配置下两者可为 nil
-	//    （scheduler-only / teams 禁用），判空跳过。
-	if s.PlanStore != nil {
-		if err := s.PlanStore.RebindDir(filepath.Join(newSess.Dir, "plan-state.json")); err != nil {
-			log.Printf("[session] WARNING: PlanStore 重绑失败: %v —— plan 持久化保持旧目录", err)
-			s.recordSessionSwitchError(fmt.Errorf("PlanStore 重绑失败: %w", err))
-		} else {
-			log.Printf("[session] PlanStore 已重绑到新 Session (dir=%s)", newSess.Dir)
-		}
-	}
+	// 1. team store 持久化位置迁移。某些配置下可为 nil（teams 禁用），判空跳过。
 	if s.TeamStore != nil {
 		if err := s.TeamStore.RebindDir(filepath.Join(newSess.Dir, "agent-teams.json")); err != nil {
 			log.Printf("[session] WARNING: TeamStore 重绑失败: %v —— team 持久化保持旧目录", err)
@@ -1435,6 +1536,10 @@ func (s *System) onSessionSwitched(newSess *session.Session) {
 	if err != nil {
 		log.Printf("[session] WARNING: 新 Session trace writer 创建失败 (%s): %v —— trace 保持旧绑定", logsDir, err)
 	} else {
+		// V6 §7.2/§7.1：换绑同步——新 writer 盖戳新 Session ID，降级告警
+		// 回调接同一 status 通道
+		newWriter.SetSessionID(newSess.ID)
+		newWriter.SetOnDegraded(traceDegradedAlerter(s.StatusCh))
 		old := trace.SwapDefaultWriter(newWriter)
 		if old != nil {
 			_ = old.Close() // Close 后旧 writer 永久停用，不会复活旧目录文件
@@ -1464,6 +1569,20 @@ func (s *System) onSessionSwitched(newSess *session.Session) {
 		} else {
 			s.LogFile.Swap(newLogFile)
 			log.Printf("[session] system.log 已重绑到新 Session (dir=%s)", logsDir)
+		}
+	}
+}
+
+// traceDegradedAlerter 构造 V6 §7.1 trace 降级告警回调：log + UI status
+// 通道非阻塞投递——trace 故障绝不反压主流程。bootstrap 在 statusCh 创建后
+// 接到初始 writer；onSessionSwitched 给换绑的新 writer 接同一形态回调。
+func traceDegradedAlerter(statusCh chan<- string) func(error) {
+	return func(err error) {
+		msg := fmt.Sprintf("[trace] 降级：trace 写入连续失败（%v），事件可能丢失；详见 trace 目录下 %s", err, trace.DegradedMarkerFileName)
+		log.Println(msg)
+		select {
+		case statusCh <- msg:
+		default:
 		}
 	}
 }
@@ -1517,10 +1636,9 @@ func (w *eventWriter) Write(p []byte) (int, error) {
 // cancelTaskByPrefix 实现 TUI /cancel 的任务解析与受守卫取消（D2）。
 // idPrefix 经 Store.ScanAll 前缀匹配（与 trace CLI 的前缀解析语义对齐）：
 // 0 个匹配 → 未找到；多于 1 个 → 歧义错误并列出候选 ID，不取消任何任务；
-// 恰好 1 个 → 走与 LLM cancel_task 相同的 tools.GuardedCancel（调用方无
-// Plan 上下文，source="user"——归属 Plan 的任务会被守卫拒绝）。
-// 前缀短于 4 字符直接报错，不做猜测。
-func cancelTaskByPrefix(ctx context.Context, s store.TaskStore, coordinator *plan.Coordinator, idPrefix string) (string, error) {
+// 恰好 1 个 → 走与 LLM cancel_task 相同的 tools.GuardedCancel（两段式转换，
+// 来源记为 "user"）。前缀短于 4 字符直接报错，不做猜测。
+func cancelTaskByPrefix(ctx context.Context, s store.TaskStore, idPrefix string) (string, error) {
 	const minPrefixLen = 4
 	if len(idPrefix) < minPrefixLen {
 		return "", fmt.Errorf("任务 ID 前缀过短（至少 %d 个字符）: %s", minPrefixLen, idPrefix)
@@ -1539,7 +1657,7 @@ func cancelTaskByPrefix(ctx context.Context, s store.TaskStore, coordinator *pla
 	case 0:
 		return "", fmt.Errorf("未找到以 %s 开头的任务", idPrefix)
 	case 1:
-		if err := tools.GuardedCancel(ctx, s, coordinator, "", matches[0], "user"); err != nil {
+		if err := tools.GuardedCancel(ctx, s, matches[0], "user"); err != nil {
 			return "", err
 		}
 		return matches[0], nil
@@ -1700,26 +1818,17 @@ func (s *System) shutdown() error {
 	} else if snapshotErr != nil {
 		log.Printf("[关闭] ERROR: 最终 Session 快照保存失败，动态 Team 邮箱保留且未注销: %v", snapshotErr)
 	}
-	// Drain the Task→Plan durability bridge before tearing down the store's lazy
-	// retry worker. C1：变更由 PlanBatcher 的 flusher 异步落盘——先在原 2s 界内
-	// 等待"队列空 + 在途 apply 完成"，再 Stop flusher（等其退出，不泄漏
-	// goroutine）。超时后残余变更被丢弃并计数告警；偏差由下次启动的 resume
-	// 对账检测并阻断（与既有语义一致）。batcher 的 submit hook 永不返回错误，
-	// store 侧 planMutationBacklog/WaitPlanMutations 在接入 batcher 后保持空转。
-	if s.PlanBatcher != nil {
-		waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		if err := s.PlanBatcher.Drain(waitCtx); err != nil {
-			log.Printf("[关闭] WARNING: Task→Plan mutation 未完全落盘: %v", err)
-		}
-		cancel()
-		s.PlanBatcher.Stop()
-		if dropped := s.PlanBatcher.Dropped(); dropped > 0 {
-			log.Printf("[关闭] WARNING: %d 条 Task→Plan mutation 超出 drain 界被丢弃（resume 对账兜底）", dropped)
-		}
-	}
 	if closer, ok := s.Store.(interface{ Close() error }); ok {
 		if err := closer.Close(); err != nil {
 			log.Printf("[关闭] WARNING: Task store 关闭失败: %v", err)
+		}
+	}
+	// 关闭 Graph 持久化 Store（每图 journal 句柄）。位置约束：必须在
+	// ReactorRegistry Quiesce 之后——在途 graph-terminal-feed 会经
+	// Runtime 写 journal；Windows 上句柄不关闭会挡住目录清理。
+	if s.GraphStore != nil {
+		if err := s.GraphStore.Close(); err != nil {
+			log.Printf("[关闭] WARNING: Graph store 关闭失败: %v", err)
 		}
 	}
 	// 关闭 trace 写入器，flush 所有打开的文件句柄
@@ -1733,6 +1842,13 @@ func (s *System) shutdown() error {
 	if s.ArtifactLog != nil {
 		if err := s.ArtifactLog.Close(); err != nil {
 			fmt.Printf("[关闭] WARNING: artifact log 关闭失败: %v\n", err)
+		}
+	}
+	// 关闭 effect journal（H2b 副作用账本）。位置约束：与 artifact log 同段——
+	// agent 已全部停止（wg.Wait）且 reactor 已 quiesce，此后不再有新账目。
+	if s.EffectJournal != nil {
+		if err := s.EffectJournal.Close(); err != nil {
+			fmt.Printf("[关闭] WARNING: effect journal 关闭失败: %v\n", err)
 		}
 	}
 	// 关闭 Session 管理器——更新 metadata 并关闭日志文件句柄
@@ -1796,7 +1912,6 @@ func (s *System) buildAgentInfoFn() func() []ui.AgentCard {
 				CallCount:        ts.CallCount,
 			}
 			s.applyActivityInfo(&info)
-			info.SchedulerControl = s.schedulerControlState(ref.id)
 			infos = append(infos, info)
 			seen[a.ID] = true
 		}

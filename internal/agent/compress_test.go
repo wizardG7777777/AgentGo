@@ -65,8 +65,8 @@ func TestSnipOldToolResults(t *testing.T) {
 // TestSnipStub 验证结构化墓碑的元数据提取：目标取 path/command/pattern/task_id
 // 首个非空；超长目标截断到 60 字符；nil Arguments 安全。
 func TestSnipStub(t *testing.T) {
-	stub := snipStub("read_file", map[string]any{"path": "internal/plan/coordinator.go"}, 8432)
-	for _, want := range []string{"[已清空] read_file internal/plan/coordinator.go", "原 8432 字符", "force_full=true"} {
+	stub := snipStub("read_file", map[string]any{"path": "internal/agent/agent.go"}, 8432)
+	for _, want := range []string{"[已清空] read_file internal/agent/agent.go", "原 8432 字符", "force_full=true"} {
 		if !strings.Contains(stub, want) {
 			t.Errorf("stub missing %q: %q", want, stub)
 		}

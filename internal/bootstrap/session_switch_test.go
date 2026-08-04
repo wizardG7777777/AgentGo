@@ -9,7 +9,6 @@ import (
 
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
-	"agentgo/internal/plan"
 	"agentgo/internal/roster"
 	"agentgo/internal/scheduler"
 	"agentgo/internal/session"
@@ -19,16 +18,15 @@ import (
 )
 
 // B2/B3 修复的端到端回归测试：真实 SessionManager + onSessionSwitched 钩子。
-// B2：切换触发 plan/team store 持久化位置迁移——新 Session 目录从切换时刻起
-//     持有反映内存活态的 plan-state.json / agent-teams.json，旧目录冻结。
+// B2：切换触发 team store 持久化位置迁移——新 Session 目录从切换时刻起
+//     持有反映内存活态的 agent-teams.json，旧目录冻结。
 // B3：System.NewSession/SwitchSession 在切换前把运行时快照刷新到旧 Session
 //     目录，切换成功后清空 lastResult；切换失败时旧 Session 保持 active。
 
-// switchTestEnv 装配一套带 plan/team store 与运行时状态的 System。
+// switchTestEnv 装配一套带 team store 与运行时状态的 System。
 type switchTestEnv struct {
 	sm        *session.SessionManager
 	sys       *System
-	planCoord *plan.Coordinator
 	teamStore *team.Store
 	sessDir   string // 当前（绑定时刻）Session 目录
 }
@@ -64,24 +62,13 @@ func newSwitchTestEnv(t *testing.T, sm *session.SessionManager) *switchTestEnv {
 		t.Fatalf("PublishTask: %v", err)
 	}
 
-	planStore, err := plan.OpenStore(filepath.Join(sess.Dir, "plan-state.json"))
-	if err != nil {
-		t.Fatalf("plan.OpenStore: %v", err)
-	}
-	planCoord := plan.NewCoordinator(planStore, nil)
-	if _, err := planCoord.Create(t.Context(), plan.CreateInput{
-		PlanID: "plan-live", RootTaskID: "root-live", Budget: model.PlanBudget{},
-	}); err != nil {
-		t.Fatalf("plan Create: %v", err)
-	}
-
 	teamStore, err := team.OpenStore(filepath.Join(sess.Dir, "agent-teams.json"))
 	if err != nil {
 		t.Fatalf("team.OpenStore: %v", err)
 	}
 	if _, _, err := teamStore.Ensure(team.TeamSpec{
 		ID: "team-a", TemplateRef: "builtin/explorer@1", TemplateDigest: "sha256:test",
-		PlanID: "plan-live", ControllerTaskID: "ctrl-1", Purpose: "investigate",
+		ControllerTaskID: "ctrl-1", Purpose: "investigate",
 		EventType: "team:team-a", Replicas: 1, Status: team.StatusReady,
 	}); err != nil {
 		t.Fatalf("team Ensure: %v", err)
@@ -98,14 +85,12 @@ func newSwitchTestEnv(t *testing.T, sm *session.SessionManager) *switchTestEnv {
 		MailboxRegistry: mb,
 		Scheduler:       &scheduler.Bundle{History: hist},
 		SessionMgr:      sm,
-		PlanStore:       planStore,
 		TeamStore:       teamStore,
-		PlanCoordinator: planCoord,
 	}
 	sys.seedResult(&session.ResultSnapshot{Text: "old session result", SavedAt: time.Now().UTC().Format(time.RFC3339Nano)})
 
 	sm.SetOnSwitch(sys.onSessionSwitched)
-	return &switchTestEnv{sm: sm, sys: sys, planCoord: planCoord, teamStore: teamStore, sessDir: sess.Dir}
+	return &switchTestEnv{sm: sm, sys: sys, teamStore: teamStore, sessDir: sess.Dir}
 }
 
 // snapshotAt 读取指定 Session 目录下的 snapshot.json；不存在时返回 nil。
@@ -201,8 +186,8 @@ func TestNewSessionSerializesWithPeriodicSnapshotBoundary(t *testing.T) {
 }
 
 // B2 bootstrap 级：真实 SessionManager.CreateNew 触发 onSessionSwitched，
-// 两个 store 的持久化位置迁移到新 Session 目录且反映活态，旧目录冻结。
-func TestOnSessionSwitched_RebindsPlanAndTeamStores(t *testing.T) {
+// team store 的持久化位置迁移到新 Session 目录且反映活态，旧目录冻结。
+func TestOnSessionSwitched_RebindsTeamStore(t *testing.T) {
 	sessRoot := filepath.Join(t.TempDir(), "sessions")
 	sm, err := session.NewSessionManager(sessRoot, session.SessionConfig{Enabled: true})
 	if err != nil {
@@ -218,13 +203,6 @@ func TestOnSessionSwitched_RebindsPlanAndTeamStores(t *testing.T) {
 	}
 
 	// 新 Session 目录从切换时刻起持有完整副本
-	newPlanStore, err := plan.OpenStore(filepath.Join(newSess.Dir, "plan-state.json"))
-	if err != nil {
-		t.Fatalf("reopen new plan store: %v", err)
-	}
-	if _, err := newPlanStore.GetPlan("plan-live"); err != nil {
-		t.Fatalf("新 Session plan-state.json 缺少活态 plan: %v", err)
-	}
 	newTeamStore, err := team.OpenStore(filepath.Join(newSess.Dir, "agent-teams.json"))
 	if err != nil {
 		t.Fatalf("reopen new team store: %v", err)
@@ -234,20 +212,8 @@ func TestOnSessionSwitched_RebindsPlanAndTeamStores(t *testing.T) {
 	}
 
 	// 切换后的变更只落新目录
-	if _, err := env.planCoord.Create(t.Context(), plan.CreateInput{
-		PlanID: "plan-after", RootTaskID: "root-after", Budget: model.PlanBudget{},
-	}); err != nil {
-		t.Fatalf("plan Create after switch: %v", err)
-	}
 	if _, err := env.teamStore.SetStatus("team-a", team.StatusStopped, "done"); err != nil {
 		t.Fatalf("team SetStatus after switch: %v", err)
-	}
-	newPlanStore, err = plan.OpenStore(filepath.Join(newSess.Dir, "plan-state.json"))
-	if err != nil {
-		t.Fatalf("reopen new plan store again: %v", err)
-	}
-	if _, err := newPlanStore.GetPlan("plan-after"); err != nil {
-		t.Fatalf("新 plan-state.json 缺少切换后的变更: %v", err)
 	}
 	newTeamStore, err = team.OpenStore(filepath.Join(newSess.Dir, "agent-teams.json"))
 	if err != nil {
@@ -259,13 +225,6 @@ func TestOnSessionSwitched_RebindsPlanAndTeamStores(t *testing.T) {
 	}
 
 	// 旧目录冻结在切换时刻
-	oldPlanStore, err := plan.OpenStore(filepath.Join(oldDir, "plan-state.json"))
-	if err != nil {
-		t.Fatalf("reopen old plan store: %v", err)
-	}
-	if _, err := oldPlanStore.GetPlan("plan-after"); err == nil {
-		t.Fatal("旧 plan-state.json 混入了切换后的变更——未冻结")
-	}
 	oldTeamStore, err := team.OpenStore(filepath.Join(oldDir, "agent-teams.json"))
 	if err != nil {
 		t.Fatalf("reopen old team store: %v", err)
@@ -313,12 +272,12 @@ func TestSwitchSession_SnapshotsOldSessionAndClearsResult(t *testing.T) {
 	}
 
 	// B2 链路随 System.SwitchSession 同样生效：目标目录持有活态 store 副本
-	newPlanStore, err := plan.OpenStore(filepath.Join(target.Dir, "plan-state.json"))
+	newTeamStore, err := team.OpenStore(filepath.Join(target.Dir, "agent-teams.json"))
 	if err != nil {
-		t.Fatalf("reopen new plan store: %v", err)
+		t.Fatalf("reopen new team store: %v", err)
 	}
-	if _, err := newPlanStore.GetPlan("plan-live"); err != nil {
-		t.Fatalf("目标 Session plan-state.json 缺少活态 plan: %v", err)
+	if _, err := newTeamStore.Get("team-a"); err != nil {
+		t.Fatalf("目标 Session agent-teams.json 缺少活态 team: %v", err)
 	}
 }
 
@@ -456,7 +415,7 @@ func TestSwitchSession_CriticalRebindFailureRollsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := newSwitchTestEnv(t, sm)
-	if err := os.Mkdir(filepath.Join(target.Dir, "plan-state.json"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(target.Dir, "agent-teams.json"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -471,17 +430,16 @@ func TestSwitchSession_CriticalRebindFailureRollsBack(t *testing.T) {
 		t.Fatalf("rebind rollback changed old result: %#v", result)
 	}
 	assertSnapshotHasTaskAndResult(t, snapshotAt(t, env.sessDir))
-	if _, err := env.planCoord.Create(t.Context(), plan.CreateInput{
-		PlanID: "plan-after-rebind-rollback", RootTaskID: "root-after-rebind-rollback",
-	}); err != nil {
+	if _, err := env.teamStore.SetStatus("team-a", team.StatusStopped, "after-rollback"); err != nil {
 		t.Fatal(err)
 	}
-	reopenedOld, err := plan.OpenStore(filepath.Join(env.sessDir, "plan-state.json"))
+	reopenedOld, err := team.OpenStore(filepath.Join(env.sessDir, "agent-teams.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reopenedOld.GetPlan("plan-after-rebind-rollback"); err != nil {
-		t.Fatalf("PlanStore did not return to old Session after rollback: %v", err)
+	got, err := reopenedOld.Get("team-a")
+	if err != nil || got.Status != team.StatusStopped {
+		t.Fatalf("TeamStore did not return to old Session after rollback: got=%+v err=%v", got, err)
 	}
 }
 

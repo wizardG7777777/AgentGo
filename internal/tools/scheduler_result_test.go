@@ -10,7 +10,6 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/model"
-	"agentgo/internal/plan"
 	"agentgo/internal/store"
 )
 
@@ -193,52 +192,8 @@ func TestSchedulerGroup_GetTaskResultRejectsNonTerminalResults(t *testing.T) {
 	}
 }
 
-func TestSchedulerGroup_GetTaskResultManagedPlanVisibility(t *testing.T) {
-	s, controller := newLegacyResultFixture(t, 64)
-	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
-	p, err := coordinator.Create(context.Background(), plan.CreateInput{PlanID: controller.PlanID, RootTaskID: controller.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	current := &model.Task{ID: "current-node", Description: "current", PlanID: p.ID, NodeRole: model.PlanNodeRoleImplementation}
-	publishCompletedResultTask(t, s, current, map[string]string{"worker": "allowed"})
-	if _, err := coordinator.RegisterTask(context.Background(), plan.RegisterTaskInput{
-		PlanID: p.ID, ObservedRevision: p.CurrentRevision,
-		Node: model.PlanNode{TaskID: current.ID, Title: current.Description, Status: model.TaskStatusCompleted, Role: model.PlanNodeRoleImplementation},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	retiredOrStray := &model.Task{ID: "not-current", PlanID: p.ID, NodeRole: model.PlanNodeRoleImplementation}
-	publishCompletedResultTask(t, s, retiredOrStray, map[string]string{"worker": "hidden"})
-	crossPlan := &model.Task{ID: "other-plan", PlanID: "plan-other", NodeRole: model.PlanNodeRoleImplementation}
-	publishCompletedResultTask(t, s, crossPlan, map[string]string{"worker": "cross"})
-
-	registry := newResultToolRegistry(SchedulerGroup{Store: s, Holder: &fakeHolder{id: controller.ID}, PlanCoordinator: coordinator})
-	page, err := dispatchResultPage(t, registry, map[string]any{"task_id": current.ID})
-	if err != nil || page.Content != "allowed" {
-		t.Fatalf("current Plan node should be readable: page=%+v err=%v", page, err)
-	}
-	for _, taskID := range []string{retiredOrStray.ID, crossPlan.ID} {
-		if _, err := registry.Dispatch(context.Background(), mkCall("get_task_result", map[string]any{"task_id": taskID})); err == nil || !strings.Contains(err.Error(), "get_task_result 被拒绝") {
-			t.Fatalf("task %s should be outside managed visibility: %v", taskID, err)
-		}
-	}
-
-	newController := &model.Task{ID: "new-controller", EventType: "__scheduler__", PlanID: p.ID, NodeRole: model.PlanNodeRoleController}
-	if err := s.PublishTask(newController); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.ClaimTask("scheduler-2", newController.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := coordinator.ActivateController(context.Background(), p.ID, newController.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := registry.Dispatch(context.Background(), mkCall("get_task_result", map[string]any{"task_id": current.ID})); err == nil || !strings.Contains(err.Error(), "active controller") {
-		t.Fatalf("superseded controller should be rejected: %v", err)
-	}
-}
-
+// 可见性（C6b）：Scheduler 只能读取自己 SchedulerBatch / ParentTaskID 谱系
+// 内的任务结果（store.LegacyRequestTaskIDs）；谱系外的任务一律拒绝。
 func TestSchedulerGroup_GetTaskResultLegacyScope(t *testing.T) {
 	s, controller := newLegacyResultFixture(t, 64)
 	samePlan := &model.Task{ID: "same-plan", ParentTaskID: controller.ID}
@@ -255,10 +210,7 @@ func TestSchedulerGroup_GetTaskResultLegacyScope(t *testing.T) {
 	labelOnly := &model.Task{ID: "label-only", BatchID: controller.ID, Dependencies: []string{samePlan.ID}}
 	publishCompletedResultTask(t, s, labelOnly, map[string]string{"worker": "label"})
 
-	// A Coordinator with no matching PlanStore record exercises the real legacy
-	// classification: non-empty PlanID alone is not a managed Plan.
-	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
-	registry := newResultToolRegistry(SchedulerGroup{Store: s, Holder: &fakeHolder{id: controller.ID}, PlanCoordinator: coordinator})
+	registry := newResultToolRegistry(SchedulerGroup{Store: s, Holder: &fakeHolder{id: controller.ID}})
 	for _, taskID := range []string{samePlan.ID, batchOnly.ID, descendant.ID} {
 		if _, err := dispatchResultPage(t, registry, map[string]any{"task_id": taskID}); err != nil {
 			t.Fatalf("legacy task %s should be readable: %v", taskID, err)

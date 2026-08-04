@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"agentgo/internal/gate"
@@ -26,23 +27,29 @@ const (
 	ctxLoopNum
 	ctxTaskID
 	ctxCancelSource
-	// ctxNoTools 用于在 buildTransferNote / 其它"应当只输出文字"的 LLM 调用路径上
-	// 指示 executor 不暴露工具集。这样 LLM 想调工具也无工具可调，副作用泄漏（如
-	// 多写一遍 APPROVED.md / 多发一条 send_message）被结构性地阻断。
-	// 详见 transfer_note.go L1 注释 + agent.go MaxLoops 兜底路径。
-	ctxNoTools
 	ctxActivity
 	ctxToolDispatchGuard
 	ctxToolName
+	// ctxManifestSideInfo 携带 processTask 每 attempt 一份的 Context Manifest
+	// 侧信息（Memory 段 UpdatedAt、压缩处置回填），executor 构建 Manifest 时只读。
+	ctxManifestSideInfo
+	// ctxTaskMemCarrier 携带当前 Task Memory 的有界渲染（V6 §3 CM2），
+	// executor 把它注入 messages 并在 Manifest 登记 task_memory 段。
+	ctxTaskMemCarrier
+	// ctxPromptBuild 携带 processTask 每个 attempt 编译并冻结的 Prompt
+	// Build（V6 §2 P1a，值语义不可变），executor 把 Build.ID 并入每轮
+	// context_manifest_built 事件的 prompt_build_id 字段。
+	ctxPromptBuild
 )
 
-// ToolDispatchGuard runs immediately before each concrete tool dispatch. A
-// Plan-aware caller uses it to re-check durable execution authority after the
-// LLM response and after every earlier tool in the same response.
+// ToolDispatchGuard runs immediately before each concrete tool dispatch. The
+// runner uses it to re-check task liveness (dispatch ctx 未取消 + 任务经 Store
+// 重读仍 processing) after the LLM response and after every earlier tool in
+// the same response.
 type ToolDispatchGuard func(context.Context, *model.Task) error
 
 // WithToolDispatchGuard installs a per-dispatch execution boundary. Tool calls
-// are executed in model order, so a call that pauses/finalizes a Plan is
+// are executed in model order, so a call that cancels/finalizes the task is
 // visible to the guard before any later call can produce a side effect.
 func WithToolDispatchGuard(ctx context.Context, guard ToolDispatchGuard) context.Context {
 	return context.WithValue(ctx, ctxToolDispatchGuard, guard)
@@ -103,18 +110,6 @@ func CancelSourceFromContext(ctx context.Context) string {
 	return source
 }
 
-// WithNoTools 标记当前 LLM 调用不应暴露任何工具。executor 看到该标记后会
-// 把传给 client.Chat 的 toolDefs 替换为空切片——LLM 物理上无工具可调，
-// 强制走"只输出文字"的路径。用于 buildTransferNote 等期望纯文本输出的场景。
-func WithNoTools(ctx context.Context) context.Context {
-	return context.WithValue(ctx, ctxNoTools, true)
-}
-
-func noToolsFromContext(ctx context.Context) bool {
-	v, _ := ctx.Value(ctxNoTools).(bool)
-	return v
-}
-
 func activityFromContext(ctx context.Context) *ActivityTracker {
 	tracker, _ := ctx.Value(ctxActivity).(*ActivityTracker)
 	return tracker
@@ -149,6 +144,61 @@ type LLMExecutor struct {
 	sysPrompt      string
 	toolsMu        sync.RWMutex
 	tools          *ToolRegistry
+	// finalizationChecker 是 finalizing fence 的状态源（runner 装配注入与
+	// submit_task_result 提交通道共享的 FinalizationHolder）。非 nil 时，
+	// 每次具体工具 dispatch 前检查：已 finalized（submit_task_result 被接受）
+	// 则跳过本次调用——不 dispatch、不产生副作用，返回「已跳过」提示文本并
+	// emit tool_call_skipped。nil 时无 fence（兼容旧装配与 scheduler 路径）。
+	finalizationChecker FinalizationChecker
+	// sug / sugMu 是 V6 §4 H2a 的 per-task 建议状态（重复熔断计数 + 待判定
+	// 建议），任务切换时整体重置；实现见 suggestions.go。
+	sugMu sync.Mutex
+	sug   *suggestionTracker
+	// promptVersion 是 V6 §2 P1a prompt 编译的身份维度：system prompt 的
+	// 来源版本（runner=system_prompt_file 内容 sha256 前 12，scheduler=
+	// 内嵌常量版本，team 模板=模板 Version）。装配期经 SetPromptVersion
+	// 设置一次，之后只读（与 sysPrompt 同为构造期冻结事实）。
+	promptVersion string
+	// invSeq 是 V6 §7.2 InvocationID 的 executor 级单调序号：每次 Execute
+	// （= 一次 LLM 调用）取一次，拼成 <taskID前8>-<loop>-<seq>。重试产生的
+	// 同 (task,loop) 重复调用借 seq 区分。
+	invSeq atomic.Uint64
+}
+
+// SetPromptVersion 注入 system prompt 的来源版本（V6 §2 P1a）。装配方在
+// 构造 executor 后调用一次；空串表示来源版本未知（组件 Version 缺省）。
+func (e *LLMExecutor) SetPromptVersion(version string) {
+	e.promptVersion = version
+}
+
+// SystemPrompt 实现 PromptIdentityProvider：返回启动期装配的静态 system
+// prompt 全文（任务级 task.SystemPrompt 覆盖判定在 processTask 侧）。
+func (e *LLMExecutor) SystemPrompt() string { return e.sysPrompt }
+
+// PromptVersion 实现 PromptIdentityProvider。
+func (e *LLMExecutor) PromptVersion() string { return e.promptVersion }
+
+// TeamAwareness 实现 PromptIdentityProvider：返回静态团队感知文本。
+func (e *LLMExecutor) TeamAwareness() string { return e.teamAwareness }
+
+// 编译期断言：*LLMExecutor 必须实现 PromptIdentityProvider。
+var _ PromptIdentityProvider = (*LLMExecutor)(nil)
+
+// SetFinalizationChecker 注入 finalizing fence 的状态源。runner 在构造
+// executor 后调用一次；nil 表示关闭 fence（默认）。
+func (e *LLMExecutor) SetFinalizationChecker(checker FinalizationChecker) {
+	e.toolsMu.Lock()
+	defer e.toolsMu.Unlock()
+	e.finalizationChecker = checker
+}
+
+// finalizing 报告当前是否处于收尾态（finalization fence 判定）：checker 已
+// 装配且已 finalized 时为 true。与 ToolRegistry 同一把锁读取，保证与换入的
+// 工具视图一致的快照语义。
+func (e *LLMExecutor) finalizing() bool {
+	e.toolsMu.RLock()
+	defer e.toolsMu.RUnlock()
+	return e.finalizationChecker != nil && e.finalizationChecker.IsFinalized()
 }
 
 // ToolRegistrySwapper 是支持按任务替换工具注册表的 executor 能力接口
@@ -273,13 +323,50 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		}
 		messages := buildMessages(effectivePrompt, task, depResults, history, e.teamAwareness)
 
+		// CM2（V6 §3）：Task Memory 注入——user 首条之后插入有界渲染。
+		// 载体降级（dropped）时不注入正文，Manifest 仍会记 dropped:<原因>。
+		if carrier := taskMemCarrierFromContext(ctx); carrier != nil && carrier.dropped == "" && carrier.text != "" {
+			messages = insertTaskMemMessage(messages, carrier.text)
+		}
+
 		agentIDForTrace, _ := ctx.Value(ctxAgentID).(string)
 		loopForTrace, _ := ctx.Value(ctxLoopNum).(int)
-		activity := activityFromContext(ctx)
-		var toolDefs []llm.ToolDef
-		if !noToolsFromContext(ctx) {
-			toolDefs = tools.Defs()
+		// V6 §7.2：每次 Execute（= 一次 LLM 调用）生成统一调用身份
+		// <taskID前8>-<loop>-<seq>，挂到本轮 llm_call_start / llm_call_end /
+		// context_manifest_built 三处事件，同一轮三事件可经 invocation_id
+		// 精确关联。Attempt/Turn 身份本轮不加——Loop 序号已可关联同任务
+		// 各轮，重试靠 seq 区分。
+		shortTaskID := task.ID
+		if len(shortTaskID) > 8 {
+			shortTaskID = shortTaskID[:8]
 		}
+		invocationID := fmt.Sprintf("%s-%d-%d", shortTaskID, loopForTrace, e.invSeq.Add(1))
+		activity := activityFromContext(ctx)
+		toolDefs := tools.Defs()
+		// CM1（V6 §3）：每次 LLM 调用前生成 Context Manifest 影子账本——逐段
+		// 记录来源/作用域/权威等级/新鲜度/digest/token 估算/处置，纯观测，
+		// 不改变 messages 与 toolDefs 的任何字节。每轮恰好一条
+		// context_manifest_built 事件（落任务分片）；实测 prompt tokens 由
+		// 同 (task_id, loop) 的 llm_call_end 事件对账。
+		manifest := buildContextManifest(ctx, effectivePrompt, task, depResults, history, e.teamAwareness, toolDefs)
+		manifestEv := trace.Event{
+			Kind:           trace.KindContextManifestBuilt,
+			TaskID:         task.ID,
+			AgentID:        agentIDForTrace,
+			Loop:           loopForTrace,
+			InvocationID:   invocationID,
+			PromptTokens:   manifest.TotalEstimatedTokens,
+			HistoryEntries: len(history),
+			Description:    manifest.SummaryJSON(),
+		}
+		// V6 §2 P1a：prompt_bound 不独立成事件——context_manifest_built 每轮
+		// 恰好一条、与 LLM 调用同域同频，prompt_build_id 作为本轮上下文的
+		// 身份字段并入，避免同频双账本。Build 由 processTask 在 attempt
+		// 开始编译冻结，同 attempt 各轮复用同一 ID。
+		if build, ok := promptBuildFromContext(ctx); ok {
+			manifestEv.PromptBuildID = build.ID
+		}
+		trace.Emit(manifestEv)
 		activity.LLMStart(agentIDForTrace, task.ID, loopForTrace, len(toolDefs))
 
 		// Trace：LLM 调用开始
@@ -288,6 +375,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 			TaskID:         task.ID,
 			AgentID:        agentIDForTrace,
 			Loop:           loopForTrace,
+			InvocationID:   invocationID,
 			HistoryEntries: len(history),
 			ToolCallsCount: len(toolDefs),
 		})
@@ -301,12 +389,13 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		if err != nil {
 			activity.LLMEnd(agentIDForTrace, task.ID, loopForTrace, "", 0, err)
 			trace.Emit(trace.Event{
-				Kind:       trace.KindLLMCallEnd,
-				TaskID:     task.ID,
-				AgentID:    agentIDForTrace,
-				Loop:       loopForTrace,
-				DurationMS: llmDuration.Milliseconds(),
-				Error:      err.Error(),
+				Kind:         trace.KindLLMCallEnd,
+				TaskID:       task.ID,
+				AgentID:      agentIDForTrace,
+				Loop:         loopForTrace,
+				InvocationID: invocationID,
+				DurationMS:   llmDuration.Milliseconds(),
+				Error:        err.Error(),
 			})
 			return ExecuteResult{}, classifyError(err)
 		}
@@ -317,11 +406,17 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 			TaskID:           task.ID,
 			AgentID:          agentIDForTrace,
 			Loop:             loopForTrace,
+			InvocationID:     invocationID,
 			DurationMS:       llmDuration.Milliseconds(),
 			PromptTokens:     resp.Usage.PromptTokens,
 			CompletionTokens: resp.Usage.CompletionTokens,
 			ToolCallsCount:   len(resp.ToolCalls),
 		})
+		// CM1 对账：Manifest 估算 tokens 与实测值对照，只记录不告警
+		//（估算口径 rune/3，偏差供后续校准估算系数参考）。
+		log.Printf("[agent %s] task=%s loop=%d manifest 估算 prompt tokens=%d，实测=%d，偏差=%+d",
+			agentIDForTrace, task.ID, loopForTrace, manifest.TotalEstimatedTokens,
+			resp.Usage.PromptTokens, resp.Usage.PromptTokens-manifest.TotalEstimatedTokens)
 		trace.DumpResponse(task.ID, loopForTrace, resp.Content, resp.ToolCalls, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
 		activity.LLMEnd(agentIDForTrace, task.ID, loopForTrace, resp.Content, len(resp.ToolCalls), nil)
 
@@ -349,21 +444,53 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 
 		agentID, _ := ctx.Value(ctxAgentID).(string)
 		loopNum, _ := ctx.Value(ctxLoopNum).(int)
+		// H2a：本任务的建议跟踪器（重复熔断计数 + 待判定建议）；任务切换时
+		// 由 suggestionsForTask 整体重置，per-task 计数任务结束即弃。
+		sugTrack := e.suggestionsForTask(task.ID)
 
 		results := make([]indexedResult, len(resp.ToolCalls))
 		for i, call := range resp.ToolCalls {
 			func(idx int, c llm.ToolCall) {
+				// finalizing fence：submit_task_result 被接受（MarkTaskFinalized）
+				// 后，同一响应中排在其后的工具调用一律跳过——不 dispatch、不产生
+				// 副作用、不写 ToolCallRecord（调用从未发生），只返回结构化提示
+				// 文本并 emit tool_call_skipped 审计事件。工具按序串行执行，
+				// 前一个调用置上的 finalized 标志对后续调用即时可见。
+				if e.finalizing() {
+					content := "已跳过：任务已进入收尾（finalizing），本次调用未执行"
+					log.Printf("[agent %s] task=%s loop=%d tool=%s 被 finalizing fence 跳过（call_id=%s）", agentID, task.ID, loopNum, c.Name, c.ID)
+					trace.Emit(trace.Event{
+						Kind:    trace.KindToolCallSkipped,
+						TaskID:  task.ID,
+						AgentID: agentID,
+						Loop:    loopNum,
+						Tool:    c.Name,
+						CallID:  c.ID,
+						Reason:  "task_finalizing",
+					})
+					results[idx] = indexedResult{
+						toolResult: ToolResult{
+							ToolCallID: c.ID,
+							Content:    content,
+						},
+						output: fmt.Sprintf("[%s] %s\n", c.Name, content),
+					}
+					return
+				}
+
 				argsLog := truncateForLog(c.Arguments, 120)
 				log.Printf("[agent %s] task=%s loop=%d tool=%s args=%s", agentID, task.ID, loopNum, c.Name, argsLog)
 				activity.ToolStarted(agentID, task.ID, loopNum, c.ID, c.Name)
-				// Trace：工具调用开始（含完整 args，不做截断）
+				// Trace：工具调用开始。V6 §7.4：Args 过默认脱敏（结构字段保留、
+				// 自由内容替换为 <redacted> 占位；AGENTGO_TRACE_FULL_ARGS=1 可旁路），
+				// 原 c.Arguments 不受影响，继续参与 Gate / dispatch / ToolCallRecord。
 				trace.Emit(trace.Event{
 					Kind:    trace.KindToolCall,
 					TaskID:  task.ID,
 					AgentID: agentID,
 					Loop:    loopNum,
 					Tool:    c.Name,
-					Args:    c.Arguments,
+					Args:    trace.RedactArgs(c.Name, c.Arguments),
 					CallID:  c.ID,
 				})
 
@@ -384,17 +511,24 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				if preDecision.Action == gate.Abort {
 					// Pre hook 拒绝 — 跳过实际工具调用，合成错误返回值。
 					// 错误消息同时注入到 content 和 toolErr，让 LLM 和后续记录都看到。
+					// H2a：结构化拒绝在此完成 pending 判定、过滤、熔断与文本构建
+					// （无结构化字段的 Gate 走旧 [hook 拒绝] 文本路径）。
 					result = ""
-					toolErr = fmt.Errorf("[hook 拒绝] %s: %s", preDecision.HookName, preDecision.AbortReason)
-				} else if guard := toolDispatchGuardFromContext(ctx); guard != nil {
-					dispatchCtx := context.WithValue(ctx, ctxToolName, c.Name)
-					if guardErr := guard(dispatchCtx, task); guardErr != nil {
-						toolErr = fmt.Errorf("tool dispatch suspended: %w", guardErr)
+					toolErr = e.handleGateAbort(sugTrack, task.ID, agentID, loopNum, preDecision)
+				} else {
+					// 调用通过 Gate：判定上一轮建议的 disposition（adopted /
+					// abandoned），随后照常 dispatch。
+					e.resolvePendingOnPass(sugTrack, task.ID, agentID, loopNum, c)
+					if guard := toolDispatchGuardFromContext(ctx); guard != nil {
+						dispatchCtx := context.WithValue(ctx, ctxToolName, c.Name)
+						if guardErr := guard(dispatchCtx, task); guardErr != nil {
+							toolErr = fmt.Errorf("tool dispatch suspended: %w", guardErr)
+						} else {
+							result, toolErr = tools.Dispatch(ctx, c)
+						}
 					} else {
 						result, toolErr = tools.Dispatch(ctx, c)
 					}
-				} else {
-					result, toolErr = tools.Dispatch(ctx, c)
 				}
 				dur := time.Since(start)
 
@@ -408,7 +542,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 						AgentID:    agentID,
 						Loop:       loopNum,
 						Tool:       c.Name,
-						Args:       c.Arguments, // v5 Phase 6：与 KindToolCall 对称，让 Reactor 能读 args.path
+						Args:       trace.RedactArgs(c.Name, c.Arguments), // v5 Phase 6：与 KindToolCall 对称，让 Reactor 能读 args.path；V6 §7.4 起过默认脱敏（path 属保留字段）
 						CallID:     c.ID,
 						DurationMS: dur.Milliseconds(),
 						Error:      toolErr.Error(),
@@ -422,7 +556,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 						AgentID:    agentID,
 						Loop:       loopNum,
 						Tool:       c.Name,
-						Args:       c.Arguments, // v5 Phase 6：read-set-write Reactor 据此 filter 并拿 path
+						Args:       trace.RedactArgs(c.Name, c.Arguments), // v5 Phase 6：read-set-write Reactor 据此 filter 并拿 path；V6 §7.4 起过默认脱敏（path 属保留字段）
 						CallID:     c.ID,
 						DurationMS: dur.Milliseconds(),
 						ResultLen:  len(content),
@@ -444,6 +578,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 					}
 					e.recordToolCall(task.ID, store.ToolCallRecord{
 						Timestamp: time.Now(),
+						CallID:    c.ID,
 						AgentID:   agentID,
 						ToolName:  c.Name,
 						Args:      c.Arguments,
@@ -518,9 +653,6 @@ func buildMessages(systemPrompt string, task *model.Task, depResults map[string]
 	if systemPrompt != "" {
 		messages = append(messages, llm.Message{Role: "system", Content: systemPrompt})
 	}
-	if task.PlanID != "" && task.NodeRole != model.PlanNodeRoleController {
-		messages = append(messages, llm.Message{Role: "system", Content: strings.TrimSpace(`动态 Plan 权限边界：你是普通执行节点，不是 Scheduler controller。不得使用 publish_task 创建、拆分、替换或扩展计划节点。需要新增节点、替代任务、并行调查、独立复核或因阻塞无法继续时，调用 request_replan 提交事实，由 Scheduler 决定是否调整 DAG。Task 终态会自动唤醒 Scheduler；该权限边界与 AgentType/event_type 无关。`)})
-	}
 
 	// 构建用户消息：团队能力感知 + 受信任任务上下文 + 任务描述 + 依赖结果
 	var prompt strings.Builder
@@ -528,23 +660,12 @@ func buildMessages(systemPrompt string, task *model.Task, depResults map[string]
 		prompt.WriteString(teamAwareness)
 		prompt.WriteString("\n")
 	}
-	planID := task.PlanID
-	if planID == "" {
-		planID = "none"
-	}
-	nodeRole := string(task.NodeRole)
-	if nodeRole == "" {
-		nodeRole = "none"
-	}
-	planBoundary := "unplanned_compatibility; publish_task may be used only when the tool is available"
-	if task.PlanID != "" {
-		if task.NodeRole == model.PlanNodeRoleController {
-			planBoundary = "scheduler_controller"
-		} else {
-			planBoundary = "scheduler_only; do not use publish_task; use request_replan"
-		}
-	}
-	fmt.Fprintf(&prompt, "<task-context source=\"control-plane\">\ntask_id: %s\nplan_id: %s\nnode_role: %s\ndag_authority: %s\n</task-context>\n", task.ID, planID, nodeRole, planBoundary)
+	// <task-context>：task_id 必含；图任务（V6 Graph）追加 graph_id /
+	// node_id / activation_id 三字段（source 属性仍 "control-plane"），
+	// 供 LLM 识别自身所处的图路由语境；非图任务仅 task_id。
+	// 渲染实现与 Context Manifest（CM1）共用 renderTaskContextBlock，
+	// 保证 manifest digest 与消息内容字节级一致。
+	prompt.WriteString(renderTaskContextBlock(task))
 	prompt.WriteString(task.Description)
 
 	if len(depResults) > 0 {

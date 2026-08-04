@@ -140,7 +140,7 @@ func TestReadFile_OverlayPassthroughWhenNoCopy(t *testing.T) {
 // write_file：隔离生效时——写入落 overlay、主根不动、跳过 roster 全流程，
 // 且 file_written 事件的 Path 保持主根逻辑路径。
 func TestWriteFile_OverlaySkipsRosterAndKeepsLogicalTracePath(t *testing.T) {
-	d := &capturePlanTraceDispatcher{}
+	d := &captureGraphTraceDispatcher{}
 	original := trace.DefaultDispatcher()
 	trace.SetDefaultDispatcher(d)
 	t.Cleanup(func() { trace.SetDefaultDispatcher(original) })
@@ -194,7 +194,7 @@ func TestWriteFile_OverlaySkipsRosterAndKeepsLogicalTracePath(t *testing.T) {
 // edit_file：隔离生效时经 copy-on-write 编辑副本，主根原文件不变，
 // 跳过 roster，trace Path 保持逻辑路径。
 func TestEditFile_OverlayEditsCopyNotMain(t *testing.T) {
-	d := &capturePlanTraceDispatcher{}
+	d := &captureGraphTraceDispatcher{}
 	original := trace.DefaultDispatcher()
 	trace.SetDefaultDispatcher(d)
 	t.Cleanup(func() { trace.SetDefaultDispatcher(original) })

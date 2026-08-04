@@ -223,7 +223,7 @@ func execModeOf(modeStore *modes.Store) modes.ExecMode {
 // 授权层。灰名单命令创建服务器端 shell_command 请求，并等待该请求真正进入
 // resolved；仅 allow_once / allow_session 会执行 inner。
 //
-// exec 轴（三轴模式）在过滤器判定之后施加短路（docs/design/interaction.md §5.1）：
+// exec 轴在过滤器判定之后施加短路（docs/design/interaction.md §5.1）：
 //   - yolo：灰名单 ask 自动放行（不创建 Interaction，省一次用户往返），并打
 //     一行中文审计日志；黑名单依旧硬拒。
 //   - strict：所有未命中黑名单 / 运行时白名单的命令一律转入 ask——包括原本

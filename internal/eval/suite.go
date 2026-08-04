@@ -31,11 +31,15 @@ type SuiteDefault struct {
 type TaskDef struct {
 	Name       string      `yaml:"name"`
 	Smoke      bool        `yaml:"smoke"`       // true = 进 --smoke 层（便宜、快）
+	Skip       bool        `yaml:"skip"`        // true = 本轮跳过（结果状态 skipped，不算 pass）
 	Prompt     string      `yaml:"prompt"`      // 内联提示词（与 prompt_file 二选一）
 	PromptFile string      `yaml:"prompt_file"` // 相对套件目录的提示词文件
 	Fixtures   []Fixture   `yaml:"fixtures"`    // 运行前铺进临时 project_root 的文件
 	Judges     []JudgeSpec `yaml:"judges"`      // 确定性判据
 	TimeoutSec int         `yaml:"timeout_sec"` // 0 = 用 suite defaults
+	// LLMScript 是 offline 子命令专用的 fake-LLM 脚本路径（相对套件目录）；
+	// live 套件不设置。offline case 缺脚本 = unqualified（资格不全，不得算 pass）。
+	LLMScript string `yaml:"llm_script"`
 }
 
 // Fixture 运行前写入临时 project_root 的一个文件。
@@ -56,23 +60,30 @@ type JudgeSpec struct {
 	// 已观察到的无害变体（smoke 通过、全量首跑即翻车），精确 hash 会在
 	// 这种噪声上慢性误报；行级内容契约仍由 hash 主体保证。
 	TrimTrailingBlank bool     `yaml:"trim_trailing_blank,omitempty"`
-	Kind              string   `yaml:"kind,omitempty"`   // event_count / event_absent：trace 事件 kind
+	Kind              string   `yaml:"kind,omitempty"`   // event_count / event_absent / event_field：trace 事件 kind
+	Kinds             []string `yaml:"kinds,omitempty"`  // event_order：按序应出现的事件 kind 清单
+	Field             string   `yaml:"field,omitempty"`  // event_field：事件 JSON 点路径（如 graph_id / lease.digest）
+	Equals            string   `yaml:"equals,omitempty"` // event_field：期望值（字符串化比对）
+	NonEmpty          bool     `yaml:"non_empty,omitempty"` // event_field：只要求字段非空
 	Metric            string   `yaml:"metric,omitempty"` // metric_bounds：指标名
 	Min               *float64 `yaml:"min,omitempty"`
 	Max               *float64 `yaml:"max,omitempty"`
 }
 
-// knownJudgeTypes 是 v1 支持的判据类型全集（全部确定性，无 LLM 裁判）。
+// knownJudgeTypes 是支持的判据类型全集（全部确定性，无 LLM 裁判）。
 var knownJudgeTypes = map[string]bool{
-	"task_completed":  true, // 运行正常收敛（非超时/启动失败）
-	"file_exists":     true, // 产物文件存在
-	"file_contains":   true, // 产物含子串/正则
-	"file_hash":       true, // 产物 SHA256 精确匹配
-	"file_min_bytes":  true, // 产物字节数下界（长文截断防线）
-	"acceptance_pass": true, // 最后一次验收 verdict == pass
-	"event_count":     true, // 某 kind trace 事件次数 ∈ [min, max]
-	"event_absent":    true, // 某 kind trace 事件为零
-	"metric_bounds":   true, // 数值指标 ∈ [min, max]
+	"task_completed": true, // 运行正常收敛（非超时/启动失败）
+	"file_exists":    true, // 产物文件存在
+	"file_absent":    true, // 文件不存在（禁止行为防线，如 finalizing fence 拦截的写）
+	"file_contains":  true, // 产物含子串/正则
+	"file_hash":      true, // 产物 SHA256 精确匹配
+	"file_min_bytes": true, // 产物字节数下界（长文截断防线）
+	"event_count":    true, // 某 kind trace 事件次数 ∈ [min, max]
+	"event_absent":   true, // 某 kind trace 事件为零（证据不完整时结论 trace_incomplete）
+	"event_order":    true, // kinds 清单的首现顺序严格递增
+	"event_field":    true, // 某 kind 事件的字段满足 equals / non_empty
+	"glob_count":     true, // project_root 相对 glob 命中文件数 ∈ [min, max]（如 graph 分片）
+	"metric_bounds":  true, // 数值指标 ∈ [min, max]
 }
 
 // LoadSuite 加载并校验套件：prompt_file 在此解析为内联 Prompt，

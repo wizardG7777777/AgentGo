@@ -9,7 +9,6 @@ import (
 	"agentgo/internal/interaction"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
-	"agentgo/internal/plan"
 	"agentgo/internal/store"
 )
 
@@ -18,16 +17,17 @@ import (
 //   - LocalReadGroup / LocalWriteGroup / ShellGroup：无 skip 规则，全量注册
 //   - WebGroup：Provider 非 nil 才注册（fakeSearchProvider）
 //   - MetaGroup：publish_task 需 Store、send_message 需 MBRegistry
-//   - PlanControlGroup：Coordinator / Store / Holder 三者非 nil 才注册
+//   - PlanControlGroup：Store / Holder 非 nil 才注册（request_replan 恒注册）；
+//     submit_task_result 另需 FinalizationNotifier + SubmitState 提交通道注入
 //   - SchedulerGroup：Store 非 nil 注册 cancel_task/probe_directory，
 //     Holder 非 nil 才补 get_task_result/report_done/report_progress
 //   - AgentTemplateGroup：list 需 Catalog，provision 另需
-//     Provisioner / Coordinator / Store / Holder
+//     Provisioner / Store / Holder
+//   - GraphControlGroup：无 skip 规则，无条件注册（nil 依赖调用时报错）
 func registerAllGroupsFully(t *testing.T, r *agent.ToolRegistry) {
 	t.Helper()
 
 	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 16), 32, 1, 60)
-	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
 	catalog, err := agenttemplate.Load(agenttemplate.LoadOptions{
 		DefaultModel: "test-model", ValidateTools: ValidateToolNames,
 	})
@@ -49,7 +49,7 @@ func registerAllGroupsFully(t *testing.T, r *agent.ToolRegistry) {
 			Interactions: interaction.NewService(nil), AgentID: "agent-1",
 		},
 		PlanControlGroup{
-			Coordinator: coordinator, Store: taskStore, Holder: &fakeHolder{id: "controller"},
+			Store: taskStore, Holder: &fakeHolder{id: "controller"},
 			// submit_task_result 需提交通道注入才注册；全量并集守护按完整依赖装配。
 			FinalizationNotifier: &fakeFinalizationNotifier{},
 			SubmitState:          agent.NewSubmitState(),
@@ -59,8 +59,11 @@ func registerAllGroupsFully(t *testing.T, r *agent.ToolRegistry) {
 		},
 		AgentTemplateGroup{
 			Catalog: catalog, Provisioner: &recordingTemplateProvisioner{},
-			Coordinator: coordinator, Store: taskStore, Holder: &fakeHolder{id: "controller"},
+			Store: taskStore, Holder: &fakeHolder{id: "controller"},
 		},
+		// GraphControlGroup 无条件注册两个工具（nil 依赖在调用时报明确中文
+		// 错误），全量并集守护按零依赖装配即可。
+		GraphControlGroup{},
 	)
 }
 

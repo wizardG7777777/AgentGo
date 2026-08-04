@@ -48,14 +48,13 @@ type SpawnRequest struct {
 //
 // 零值语义：每个字段零值 = "不覆盖，沿用 base_kind 配置"。SystemPromptSet 单独
 // 标记 system prompt 是否被显式覆盖（区分"override 了空串"与"未 override"）。
+// V6 起不再含循环上限与上下文硬限覆盖（两者均已删除）。
 type RuntimeOverride struct {
 	SystemPrompt                 string
 	SystemPromptSet              bool
 	Model                        string
-	AgentMaxLoops                int
 	TaskMaxRetries               int
 	EnforceCompactTokenThreshold int
-	ContextLimit                 int
 }
 
 // SpawnHost 是 reactor.userdef.spawn_agent 消费的 spawn 接口。

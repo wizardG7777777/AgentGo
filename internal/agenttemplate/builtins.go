@@ -25,8 +25,8 @@ func builtinDefinitions() []unresolvedTemplate {
 			},
 			SystemPrompt: generalistPrompt,
 			Limits: fixedLimits(Limits{
-				AgentMaxLoops: 12, TaskMaxRetries: 3,
-				EnforceCompactTokenThreshold: 4000, ContextLimit: 16000, MaxReplicas: 4,
+				TaskMaxRetries:               3,
+				EnforceCompactTokenThreshold: 4000, MaxReplicas: 4,
 			}),
 			SourceFile: "embed:prompts/generalist.md",
 		},
@@ -41,8 +41,8 @@ func builtinDefinitions() []unresolvedTemplate {
 			},
 			SystemPrompt: explorerPrompt,
 			Limits: fixedLimits(Limits{
-				AgentMaxLoops: 8, TaskMaxRetries: 2,
-				EnforceCompactTokenThreshold: 3000, ContextLimit: 12000, MaxReplicas: 6,
+				TaskMaxRetries:               2,
+				EnforceCompactTokenThreshold: 3000, MaxReplicas: 6,
 			}),
 			SourceFile: "embed:prompts/explorer.md",
 		},
@@ -53,12 +53,12 @@ func builtinDefinitions() []unresolvedTemplate {
 			Capabilities: []string{"acceptance-verification", "test-execution", "evidence-validation"},
 			Tools: []string{
 				"read_file", "list_dir", "grep_search", "glob_search", "run_shell",
-				"web_search", "web_fetch", "submit_acceptance_result", "request_replan",
+				"web_search", "web_fetch", "submit_task_result", "request_replan",
 			},
 			SystemPrompt: verifierPrompt,
 			Limits: fixedLimits(Limits{
-				AgentMaxLoops: 10, TaskMaxRetries: 2,
-				EnforceCompactTokenThreshold: 3000, ContextLimit: 12000, MaxReplicas: 1,
+				TaskMaxRetries:               2,
+				EnforceCompactTokenThreshold: 3000, MaxReplicas: 1,
 			}),
 			SourceFile: "embed:prompts/verifier.md",
 		},

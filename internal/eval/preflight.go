@@ -1,4 +1,4 @@
-// Package eval 实现行为评测体系（agentgo eval 子命令族）的驱动器。
+// Package eval 实现行为评测体系（独立开发工具 agentgo-eval）的驱动器。
 //
 // 评测驱动器对真实 agentgo 二进制做进程外黑盒驱动：经 dashboard 的
 // /api/input 注入任务、收割 trace JSONL 聚合指标、跑确定性 judges。
@@ -217,11 +217,11 @@ func probeLLM(ctx context.Context, client *http.Client, baseURL, apiKey, model s
 			"        3. base_url 与密钥所属服务商匹配（常见：把 A 家密钥配到 B 家端点）。")
 	case resp.StatusCode == http.StatusNotFound:
 		return "", fail("端点路径不存在。多半是 base_url 填错（缺 /v1 或路径多了一级）；\n" +
-			"        少数端点对未知模型名也返回 404，可一并核对 default_model。")
+			"        少数端点对未知模型名也返回 404，可一并核对 scheduler.model / llm.default_model。")
 	case resp.StatusCode == http.StatusTooManyRequests:
 		return fmt.Sprintf("端点返回 429 限流——密钥大概率有效，但跑批可能受挫，建议错峰或降低并发"), nil
 	case resp.StatusCode == http.StatusBadRequest:
-		return "", fail("请求被端点拒绝（参数或模型名问题）。请核对 default_model 在该端点真实存在；\n" +
+		return "", fail("请求被端点拒绝（参数或模型名问题）。请核对 scheduler.model / llm.default_model 的实际生效值在该端点真实存在；\n" +
 			"        若模型名无误，把端点返回原文反馈给维护者以调整探测请求。")
 	case resp.StatusCode >= 500:
 		return "", fail("端点服务端错误，与密钥无关的可能性大。稍后重试 preflight；\n" +
@@ -275,7 +275,7 @@ func Preflight(ctx context.Context, opts PreflightOptions, stdout io.Writer) err
 	// 模板整体过一遍 v4 校验：字段级错误（如 agents[*] 行为参数缺失）
 	// 在跑批前 50ms 内暴露，而不是等子进程启动失败、健康等待空转 90 秒。
 	if err := cfg.Validate(); err != nil {
-		return fmt.Errorf("凭证检查失败：模板未通过 v4 配置校验\n  模板: %s\n  错误: %v\n  提示: 对照 config.example.yaml 或你 setting.yaml 的对应块补齐字段（常见：agents[*] 的 agent_max_loops/task_max_retries/enforce_compact_token_threshold/context_limit 四项必填且 >0）。",
+		return fmt.Errorf("凭证检查失败：模板未通过 v4 配置校验\n  模板: %s\n  错误: %v\n  提示: 对照 config.example.yaml 或你 setting.yaml 的对应块补齐字段（常见：agents[*] 的 task_max_retries/enforce_compact_token_threshold 两项必填且 >0；agent_max_loops 与 context_limit 已于 V6 移除，须从模板删除）。",
 			opts.TemplatePath, err)
 	}
 
@@ -286,9 +286,11 @@ func Preflight(ctx context.Context, opts PreflightOptions, stdout io.Writer) err
 	if cfg.LLM.BaseURL == "" {
 		return fmt.Errorf("凭证检查失败：模板 llm.base_url 为空\n  模板: %s\n  提示: 请对齐你 setting.yaml 的 llm.base_url。", opts.TemplatePath)
 	}
-	model := cfg.LLM.DefaultModel
+	// 评测入口由 Scheduler 承接；与真实运行及 FingerprintEnvironment 保持
+	// 同一模型选择顺序：显式 scheduler.model 优先，全局默认仅作回退。
+	model := strings.TrimSpace(cfg.Scheduler.Model)
 	if model == "" {
-		model = cfg.Scheduler.Model
+		model = strings.TrimSpace(cfg.LLM.DefaultModel)
 	}
 	if model == "" {
 		return fmt.Errorf("凭证检查失败：模板未声明任何模型（llm.default_model 与 scheduler.model 均空）\n  模板: %s\n  提示: 请对齐你 setting.yaml 的 llm.default_model。", opts.TemplatePath)

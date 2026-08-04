@@ -54,11 +54,10 @@ type Origin struct {
 }
 
 // Subject 绑定本次决定实际作用的对象及其事实版本。
-// PlanID / TaskID / ToolCallID 保留显式字段，避免消费者从自由文本中反推。
+// TaskID / ToolCallID 保留显式字段，避免消费者从自由文本中反推。
 type Subject struct {
 	Kind       string `json:"kind,omitempty"`
 	ID         string `json:"id,omitempty"`
-	PlanID     string `json:"plan_id,omitempty"`
 	TaskID     string `json:"task_id,omitempty"`
 	ToolCallID string `json:"tool_call_id,omitempty"`
 	Version    int64  `json:"version,omitempty"`
@@ -66,14 +65,13 @@ type Subject struct {
 }
 
 // ResolutionSpec 是回答的服务器端投递路由。Handler 是稳定的路由器键；
-// 其余字段让处理器精确定位 Scheduler continuation、Plan 或工具调用。
+// 其余字段让处理器精确定位 Scheduler continuation、Graph approval 或工具调用。
 // 前端只能提交 ResolveInput，不能改写本结构。
 type ResolutionSpec struct {
 	Handler    string `json:"handler"`
 	TargetID   string `json:"target_id,omitempty"`
 	AgentID    string `json:"agent_id,omitempty"`
 	TaskID     string `json:"task_id,omitempty"`
-	PlanID     string `json:"plan_id,omitempty"`
 	ToolCallID string `json:"tool_call_id,omitempty"`
 	EventType  string `json:"event_type,omitempty"`
 }

@@ -2,7 +2,6 @@ package watchdog
 
 import (
 	"context"
-	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -20,7 +19,7 @@ func newTestWatchdog() (*Watchdog, store.TaskStore, chan model.Event) {
 	cfg.Infra.Store.DefaultTimeoutSec = 300
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	r := roster.NewMemoryRoster()
-	w := New(s, cfg, ch, r, nil, RouteResolverFunc(func(_, _ string) bool { return true }))
+	w := New(s, cfg, ch, r, nil, RouteResolverFunc(func(string) bool { return true }))
 	return w, s, ch
 }
 
@@ -89,17 +88,17 @@ func (f *fakePlanRouteRegistry) CanRouteForPlan(_, _ string, _ ...string) bool {
 func TestRuntimeRouteResolverPreservesBuiltInSchedulerRoute(t *testing.T) {
 	registry := &fakePlanRouteRegistry{}
 	resolver := NewRuntimeRouteResolver(registry)
-	if !resolver.HasRunnableRoute("plan-1", "__scheduler__") {
+	if !resolver.HasRunnableRoute("__scheduler__") {
 		t.Fatal("built-in scheduler route must be runnable without AgentRegistry registration")
 	}
 	if registry.calls != 0 {
 		t.Fatalf("scheduler route unexpectedly queried registry %d times", registry.calls)
 	}
-	if resolver.HasRunnableRoute("plan-1", "missing") {
+	if resolver.HasRunnableRoute("missing") {
 		t.Fatal("unregistered ordinary route reported runnable")
 	}
 	registry.available = true
-	if !resolver.HasRunnableRoute("plan-1", "explore") {
+	if !resolver.HasRunnableRoute("explore") {
 		t.Fatal("registered ordinary route reported unavailable")
 	}
 }
@@ -274,7 +273,7 @@ func TestWatchdog_RetryRearmsClaimAlertFromNewPendingLease(t *testing.T) {
 
 func TestWatchdog_UnroutableTaskBlocksAfterIndependentGrace(t *testing.T) {
 	w, s, ch := newTestWatchdog()
-	w.RouteResolver = RouteResolverFunc(func(_, _ string) bool { return false })
+	w.RouteResolver = RouteResolverFunc(func(string) bool { return false })
 	w.Config.Infra.Watchdog.UnroutableGraceSec = 10
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	w.now = func() time.Time { return now }
@@ -312,7 +311,7 @@ func TestWatchdog_UnroutableTaskBlocksAfterIndependentGrace(t *testing.T) {
 
 func TestWatchdog_DependencyWaitDoesNotConsumeNoRouteGrace(t *testing.T) {
 	w, s, _ := newTestWatchdog()
-	w.RouteResolver = RouteResolverFunc(func(_, eventType string) bool { return eventType == "" })
+	w.RouteResolver = RouteResolverFunc(func(eventType string) bool { return eventType == "" })
 	w.Config.Infra.Watchdog.UnroutableGraceSec = 10
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	w.now = func() time.Time { return now }
@@ -349,36 +348,6 @@ func TestWatchdog_DependencyWaitDoesNotConsumeNoRouteGrace(t *testing.T) {
 	inspectAll(w)
 	if got, _ := s.GetTask(task.ID); got.Status != model.TaskStatusBlocked {
 		t.Fatalf("status after independent no-route grace = %s, want blocked", got.Status)
-	}
-}
-
-func TestWatchdog_PlanClaimHoldDoesNotConsumeNoRouteGrace(t *testing.T) {
-	w, s, ch := newTestWatchdog()
-	w.RouteResolver = RouteResolverFunc(func(_, _ string) bool { return false })
-	w.Config.Infra.Watchdog.UnroutableGraceSec = 1
-	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	w.now = func() time.Time { return now }
-	mem := s.(*store.MemoryTaskStore)
-	mem.SetTaskPlanHooks(store.TaskPlanHooks{
-		CanClaim: func(string, *model.Task) error { return errors.New("plan paused") },
-	})
-
-	task := &model.Task{Description: "held by plan", PlanID: "plan-paused", EventType: "team:work"}
-	if err := s.PublishTask(task); err != nil {
-		t.Fatal(err)
-	}
-	inspectAll(w)
-	now = now.Add(time.Hour)
-	inspectAll(w)
-
-	got, _ := s.GetTask(task.ID)
-	if got.Status != model.TaskStatusPending {
-		t.Fatalf("status = %s, want pending while Plan CanClaim rejects", got.Status)
-	}
-	for _, evt := range drainEvents(ch) {
-		if evt.Type == model.EventWatchdogAlert {
-			t.Fatalf("Plan-held task emitted watchdog alert: %+v", evt)
-		}
 	}
 }
 

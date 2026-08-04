@@ -97,6 +97,13 @@ func (h *ValidateExpectedHashHook) Run(hctx hook.ToolHookContext) hook.ToolHookD
 			Action:      hook.Abort,
 			HookName:    h.Name(),
 			AbortReason: fmt.Sprintf("hash 校验前读取文件失败: %v", err),
+			ReasonCode:  ReasonWritePrecheckFailed,
+			Suggestions: []hook.Suggestion{
+				hook.NewSuggestion(h.Name(), ReasonWritePrecheckFailed, path, true,
+					hook.ToolCallAction("read_file", map[string]any{"path": path},
+						"重新读取目标文件以暴露真实读取错误，再决定是否写入"),
+				),
+			},
 		}
 	}
 
@@ -109,6 +116,13 @@ func (h *ValidateExpectedHashHook) Run(hctx hook.ToolHookContext) hook.ToolHookD
 				"写入冲突：文件 %s 的内容已被其他代理修改（期望哈希 %s，当前哈希 %s）。请重新调用 read_file 获取最新内容后再试",
 				path, expectedHash, current,
 			),
+			ReasonCode: ReasonWriteConflict,
+			Suggestions: []hook.Suggestion{
+				hook.NewSuggestion(h.Name(), ReasonWriteConflict, path, true,
+					hook.ToolCallAction("read_file", map[string]any{"path": path},
+						"重新读取最新内容并取得新哈希后再写"),
+				),
+			},
 		}
 	}
 	return hook.ToolHookDecision{Action: hook.Continue}

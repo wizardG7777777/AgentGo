@@ -18,8 +18,8 @@ func testChoiceInput(id, sessionID string) CreateRequest {
 		Prompt:        "计划已暂停，请选择下一步",
 		AllowFreeText: true,
 		Origin:        Origin{Component: "scheduler", AgentID: "scheduler", TaskID: "controller-1"},
-		Subject:       Subject{Kind: "plan", ID: "plan-1", PlanID: "plan-1", Version: 7, Digest: "graph-abc"},
-		Resolution:    ResolutionSpec{Handler: "plan_resume", PlanID: "plan-1", TaskID: "controller-1"},
+		Subject:       Subject{Kind: "plan", ID: "plan-1", Version: 7, Digest: "graph-abc"},
+		Resolution:    ResolutionSpec{Handler: "plan_resume", TaskID: "controller-1"},
 		Metadata: map[string]string{
 			"execution_state_version": "7",
 			"gate":                    "plan",
@@ -422,5 +422,119 @@ func TestCurrentSessionIDReadsProviderAtRequestTime(t *testing.T) {
 	var nilService *Service
 	if got := nilService.CurrentSessionID(); got != "" {
 		t.Fatalf("nil service CurrentSessionID = %q", got)
+	}
+}
+
+// TestServiceOnResolved 终态回调挂点（C5c）：resolved/cancelled 等终态各触发
+// 一次（深拷贝、含最终状态）；resolving→pending（Release）等非终态不触发；
+// 未注册回调时迁移照常（nil 安全）；重复 Complete 幂等不重复触发。
+func TestServiceOnResolved(t *testing.T) {
+	service, request := newTestService(t)
+
+	var mu sync.Mutex
+	var fired []Request
+	service.SetOnResolved(func(r Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		fired = append(fired, r)
+	})
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(fired)
+	}
+
+	ctx := context.Background()
+	locked, err := service.BeginResolve(ctx, ResolveInput{RequestID: request.ID, ExpectedVersion: request.Version, OptionID: "continue"})
+	if err != nil {
+		t.Fatalf("BeginResolve: %v", err)
+	}
+	if count() != 0 {
+		t.Fatalf("resolving 不是终态，不应触发回调，实际 %d 次", count())
+	}
+	completed, err := service.Complete(ctx, locked.ID, locked.Version)
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if count() != 1 {
+		t.Fatalf("resolved 应触发 1 次回调，实际 %d", count())
+	}
+	mu.Lock()
+	got := fired[0]
+	mu.Unlock()
+	if got.State != StateResolved || got.ID != request.ID || got.Response == nil || got.Response.OptionID != "continue" {
+		t.Errorf("回调应收到 resolved 终态深拷贝（含 Response）: %+v", got)
+	}
+	// 深拷贝隔离：改动回调收到的副本不污染 Store。
+	got.Response.OptionID = "tampered"
+	latest, err := service.Get(ctx, request.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if latest.Response == nil || latest.Response.OptionID != "continue" {
+		t.Errorf("回调副本不应污染 Store: %+v", latest.Response)
+	}
+	// 重复 Complete 幂等返回，不重复触发。
+	if _, err := service.Complete(ctx, locked.ID, locked.Version); err != nil {
+		t.Fatalf("重复 Complete 应幂等: %v", err)
+	}
+	if count() != 1 {
+		t.Errorf("幂等 Complete 不应重复触发回调，实际 %d 次", count())
+	}
+	_ = completed
+
+	// cancelled 终态同样触发（另一个请求）。
+	other, err := service.Create(ctx, testChoiceInput("ix_cancel", "session-a"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := service.Cancel(ctx, other.ID, other.Version, "测试取消"); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if count() != 2 {
+		t.Fatalf("cancelled 应触发回调，实际共 %d 次", count())
+	}
+	mu.Lock()
+	if fired[1].State != StateCancelled || fired[1].StatusReason != "测试取消" {
+		t.Errorf("cancelled 回调应载明状态与原因: %+v", fired[1])
+	}
+	mu.Unlock()
+
+	// Release（resolving→pending）不是终态，不触发。
+	third, err := service.Create(ctx, testChoiceInput("ix_release", "session-a"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	locked3, err := service.BeginResolve(ctx, ResolveInput{RequestID: third.ID, ExpectedVersion: third.Version, OptionID: "continue"})
+	if err != nil {
+		t.Fatalf("BeginResolve: %v", err)
+	}
+	if _, err := service.Release(ctx, locked3.ID, locked3.Version, "可恢复失败"); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if count() != 2 {
+		t.Errorf("Release 回 pending 不应触发回调，实际共 %d 次", count())
+	}
+
+	// SetOnResolved(nil) 清除后不再触发；nil 安全（未注册时迁移照常）。
+	service.SetOnResolved(nil)
+	if _, err := service.Fail(ctx, third.ID, 3, "不可恢复"); err != nil {
+		t.Fatalf("Fail: %v", err)
+	}
+	if count() != 2 {
+		t.Errorf("清除回调后不应再触发，实际共 %d 次", count())
+	}
+}
+
+// TestServiceOnResolvedNilSafe 未注册回调时全部终态迁移照常工作。
+func TestServiceOnResolvedNilSafe(t *testing.T) {
+	service, request := newTestService(t)
+	ctx := context.Background()
+	locked, err := service.BeginResolve(ctx, ResolveInput{RequestID: request.ID, ExpectedVersion: request.Version, OptionID: "continue"})
+	if err != nil {
+		t.Fatalf("BeginResolve: %v", err)
+	}
+	if _, err := service.Complete(ctx, locked.ID, locked.Version); err != nil {
+		t.Fatalf("未注册回调时 Complete 应照常成功: %v", err)
 	}
 }

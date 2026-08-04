@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -17,8 +16,6 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
-	"agentgo/internal/modes"
-	"agentgo/internal/plan"
 	"agentgo/internal/store"
 	"agentgo/internal/tools/schema"
 )
@@ -47,11 +44,7 @@ type SchedulerGroup struct {
 	// ResultOutput 是任务最终结果块（report_done 的 "=== 任务完成 ===" 块）的输出目标；
 	// nil 时回退到 UserOutput。bootstrap 将其接到 output.KindResult 事件 writer，
 	// 让结果分类在产生处完成，消费方不再做子串匹配。
-	ResultOutput    io.Writer
-	PlanCoordinator *plan.Coordinator
-	// Modes 是三轴模式 store，report_done 据此判定 topo=solo 的收尾放宽；
-	// nil 等价 team（永不放宽），只出现在单测直构场景。
-	Modes *modes.Store
+	ResultOutput io.Writer
 }
 
 const (
@@ -106,8 +99,7 @@ func (g SchedulerGroup) Register(r *agent.ToolRegistry) {
 		r.Register(
 			"report_done",
 			"向用户报告最终结果，表示当前请求处理完毕。"+
-				"调用前会校验 SchedulerBatch；若已进入 DAG 或直接执行过写入/命令，还会要求 Plan 已正式终结"+
-				"（topo=solo 且无执行节点时放宽，按无验收运行收尾）；"+
+				"调用前会校验 SchedulerBatch；"+
 				"调用后会清空 SchedulerBatch 并打印事实校对块（task.Artifacts）。",
 			schema.Object().
 				String("summary", "给用户的最终汇总报告", true).
@@ -226,44 +218,22 @@ func (g SchedulerGroup) getTaskResult(_ context.Context, args map[string]any) (s
 	return string(data), nil
 }
 
-// authorizeTaskResultRead mirrors the task visibility of BuildBoardJSON. A
-// managed Plan controller sees only its current graph (plus itself). A legacy
-// root has no PlanStore record, so it is restricted to its own PlanID group or
-// explicit SchedulerBatch/ParentTaskID lineage.
+// authorizeTaskResultRead mirrors the task visibility of BuildBoardJSON: a
+// Scheduler root may read only tasks inside its own SchedulerBatch /
+// ParentTaskID lineage（C6b 起 Plan 控制面已删除，legacy 谱系检查是唯一路径）。
 func (g SchedulerGroup) authorizeTaskResultRead(current, target *model.Task) error {
 	if err := validateTaskResultCaller(current); err != nil {
 		return err
 	}
-	if g.PlanCoordinator == nil || current.PlanID == "" {
-		return g.authorizeLegacyTaskResultRead(current, target)
-	}
-	p, err := g.PlanCoordinator.Store().GetPlan(current.PlanID)
-	if errors.Is(err, plan.ErrPlanNotFound) {
-		// PlanID is assigned to every Scheduler root by TaskStore. Only a real
-		// PlanStore record turns that identifier into a managed DAG.
-		return g.authorizeLegacyTaskResultRead(current, target)
-	}
+	tasks, err := g.Store.ScanAll()
 	if err != nil {
-		return fmt.Errorf("读取当前 Plan 失败: %w", err)
+		return fmt.Errorf("读取 legacy 任务可见范围失败: %w", err)
 	}
-	if err := validateActiveController(current, p); err != nil {
-		return fmt.Errorf("get_task_result 被拒绝: %w", err)
-	}
-	if p.Status != model.PlanStatusRunning {
-		return fmt.Errorf("get_task_result 被拒绝：Plan %s 当前为 %s", p.ID, p.Status)
-	}
-	if target.PlanID != p.ID {
-		return fmt.Errorf("get_task_result 被拒绝：任务 %s 不属于当前 Plan %s", target.ID, p.ID)
-	}
-	if target.ID == current.ID {
+	visible := store.LegacyRequestTaskIDs(tasks, current.ID)
+	if _, ok := visible[target.ID]; ok {
 		return nil
 	}
-	for _, id := range p.CurrentNodeIDs {
-		if id == target.ID {
-			return nil
-		}
-	}
-	return fmt.Errorf("get_task_result 被拒绝：任务 %s 不在当前 Plan 图中", target.ID)
+	return fmt.Errorf("get_task_result 被拒绝：任务 %s 不属于当前 Scheduler batch/lineage", target.ID)
 }
 
 func validateTaskResultCaller(current *model.Task) error {
@@ -277,19 +247,7 @@ func validateTaskResultCaller(current *model.Task) error {
 	return nil
 }
 
-func (g SchedulerGroup) authorizeLegacyTaskResultRead(current, target *model.Task) error {
-	tasks, err := g.Store.ScanAll()
-	if err != nil {
-		return fmt.Errorf("读取 legacy 任务可见范围失败: %w", err)
-	}
-	visible := store.LegacyRequestTaskIDs(tasks, current.ID)
-	if _, ok := visible[target.ID]; ok {
-		return nil
-	}
-	return fmt.Errorf("get_task_result 被拒绝：任务 %s 不属于当前 Scheduler batch/lineage", target.ID)
-}
-
-// cancelTask 是 cancel_task 工具的实现。守卫与状态转换全部委托
+// cancelTask 是 cancel_task 工具的实现。状态转换全部委托 GuardedCancel
 // GuardedCancel（D2：TUI /cancel 也走同一路径），这里只保留参数解析
 // 与成功消息格式，行为与抽取前一致。
 func (g SchedulerGroup) cancelTask(ctx context.Context, args map[string]any) (string, error) {
@@ -298,87 +256,27 @@ func (g SchedulerGroup) cancelTask(ctx context.Context, args map[string]any) (st
 		return "", fmt.Errorf("缺少 task_id 参数")
 	}
 	reason, _ := args["reason"].(string)
-	// callerTaskID 是发起取消的 scheduler 当前任务（GuardedCancel 用它
-	// 推导 Plan 上下文）；Holder 或 PlanCoordinator 缺失时为空，语义
-	// 等同外部调用方。
-	callerTaskID := ""
-	if g.PlanCoordinator != nil && g.Holder != nil {
-		callerTaskID = g.Holder.Get()
-	}
-	if err := GuardedCancel(ctx, g.Store, g.PlanCoordinator, callerTaskID, taskID, "scheduler"); err != nil {
+	if err := GuardedCancel(ctx, g.Store, taskID, "scheduler"); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("任务已取消: id=%s, 原因: %s", taskID, reason), nil
 }
 
-// GuardedCancel 是 cancel_task 工具与 TUI /cancel 共用的受守卫取消路径
-// （D2 抽取）。先尝试 pending→cancelled，失败时尝试 processing→cancelled，
-// 取消来源记为 source（"scheduler" / "user"）。
+// GuardedCancel 是 cancel_task 工具与 TUI /cancel 共用的取消路径（D2 抽取）。
+// 先尝试 pending→cancelled，失败时尝试 processing→cancelled，取消来源记为
+// source（"scheduler" / "user"）。
 //
-// 守卫规则：
-//   - callerTaskID 非空（LLM 工具：scheduler 当前任务）且 coordinator 非空时：
-//     调用方必须是其 Plan 的 active controller、Plan 处于 running，且目标任务
-//     属于同一 Plan；最终转换在 controller 租约内执行并复查 membership。
-//   - callerTaskID 为空（TUI 用户等外部调用方）：没有可依托的 Plan 上下文，
-//     归属某个 Plan 的任务由该 Plan 的控制器托管——直接取消会绕过租约，拒绝。
-//   - 不归属任何 Plan 的任务：直接转换。
+// C6b 起 Plan 归属守卫（controller 租约 / membership 复查 / 外部调用方拦截）
+// 已随其整包删除：任何调用方都是直接两段式转换。
 //
-// 错误消息与抽取前 cancel_task 的措辞一致（"cancel_task 被拒绝：..." /
-// "取消任务失败 (id=...): ..."），调用方不应再包装。
-func GuardedCancel(ctx context.Context, s store.TaskStore, coordinator *plan.Coordinator, callerTaskID, targetTaskID, source string) error {
-	var currentPlan *model.Plan
-	var currentControllerID string
-	if coordinator != nil && callerTaskID != "" {
-		currentTask, currentErr := s.GetTask(callerTaskID)
-		if currentErr != nil {
-			return fmt.Errorf("读取当前 scheduler 任务失败: %w", currentErr)
-		}
-		if currentTask.PlanID != "" {
-			currentControllerID = currentTask.ID
-			currentPlan, currentErr = coordinator.Store().GetPlan(currentTask.PlanID)
-			if currentErr != nil {
-				return fmt.Errorf("读取当前 Plan 失败: %w", currentErr)
-			}
-			if currentErr = validateActiveController(currentTask, currentPlan); currentErr != nil {
-				return currentErr
-			}
-			if currentPlan.Status != model.PlanStatusRunning {
-				return fmt.Errorf("cancel_task 被拒绝：Plan %s 当前为 %s", currentPlan.ID, currentPlan.Status)
-			}
-		}
+// 错误消息保持「取消任务失败 (id=...): ...」措辞，调用方不应再包装。
+func GuardedCancel(_ context.Context, s store.TaskStore, targetTaskID, source string) error {
+	if _, err := s.GetTask(targetTaskID); err != nil {
+		return fmt.Errorf("取消任务失败 (id=%s): %w", targetTaskID, err)
 	}
-	target, targetErr := s.GetTask(targetTaskID)
-	if targetErr != nil {
-		return fmt.Errorf("读取待取消任务失败 (id=%s): %w", targetTaskID, targetErr)
-	}
-	if currentPlan != nil && target.PlanID != currentPlan.ID {
-		return fmt.Errorf("cancel_task 被拒绝：任务 %s 不属于当前 Plan %s", targetTaskID, currentPlan.ID)
-	}
-	if currentPlan == nil && target.PlanID != "" {
-		return fmt.Errorf("cancel_task 被拒绝：任务 %s 由 Plan %s 的控制器托管，外部调用方不能取消", targetTaskID, target.PlanID)
-	}
-
-	cancel := func() error {
-		// Re-read membership inside the controller lease. A controller switch
-		// cannot interleave between this check and the TaskStore transition.
-		latest, latestErr := s.GetTask(targetTaskID)
-		if latestErr != nil {
-			return latestErr
-		}
-		if currentPlan != nil && latest.PlanID != currentPlan.ID {
-			return fmt.Errorf("任务 %s 不属于当前 Plan %s", targetTaskID, currentPlan.ID)
-		}
-		err := store.TransitionStateWithCancelSource(s, targetTaskID, model.TaskStatusPending, model.TaskStatusCancelled, source)
-		if err != nil {
-			err = store.TransitionStateWithCancelSource(s, targetTaskID, model.TaskStatusProcessing, model.TaskStatusCancelled, source)
-		}
-		return err
-	}
-	var err error
-	if currentPlan != nil {
-		err = coordinator.WithControllerLease(ctx, currentPlan.ID, currentControllerID, cancel)
-	} else {
-		err = cancel()
+	err := store.TransitionStateWithCancelSource(s, targetTaskID, model.TaskStatusPending, model.TaskStatusCancelled, source)
+	if err != nil {
+		err = store.TransitionStateWithCancelSource(s, targetTaskID, model.TaskStatusProcessing, model.TaskStatusCancelled, source)
 	}
 	if err != nil {
 		return fmt.Errorf("取消任务失败 (id=%s): %w", targetTaskID, err)
@@ -413,9 +311,8 @@ func (g SchedulerGroup) reportDone(ctx context.Context, args map[string]any) (st
 	}
 	batch := currentTask.SchedulerBatch
 
-	// Check live work before changing the Plan terminal state. Otherwise an
-	// empty compatibility Plan with a pending legacy batch could be closed and
-	// only then have report_done rejected.
+	// 硬拦截：batch 中还有未到终态的任务时拒绝 report_done，避免 Scheduler
+	// 在下游仍在执行时提前向用户宣布完成。
 	var pendingTasks []string
 	for _, id := range batch {
 		task, err := g.Store.GetTask(id)
@@ -436,31 +333,6 @@ func (g SchedulerGroup) reportDone(ctx context.Context, args map[string]any) (st
 			"report_done 被拒绝：以下任务尚未完成: %s。请等待所有任务到达终态后再调用 report_done",
 			strings.Join(pendingTasks, ", "),
 		)
-	}
-
-	if g.PlanCoordinator != nil && currentTask.PlanID != "" {
-		p, planErr := g.PlanCoordinator.Store().GetPlan(currentTask.PlanID)
-		if planErr != nil {
-			return "", fmt.Errorf("读取当前 Plan 失败: %w", planErr)
-		}
-		if authorityErr := validateActiveController(currentTask, p); authorityErr != nil {
-			return "", authorityErr
-		}
-		if !model.IsPlanTerminal(p.Status) {
-			needsFormal := reportNeedsFormalFinalization(g.Store, currentTask, p)
-			if needsFormal && SoloSkipsFormalFinalization(g.Modes, p) {
-				// solo 收尾放宽不静默：留一行审计日志说明跳过正式验收的原因。
-				log.Printf("[scheduler-group] solo 编排模式：Plan %s 无 implementation 节点，controller 亲自执行的写操作跳过正式验收，按无验收运行收尾 (task=%s)", p.ID, currentTask.ID)
-				needsFormal = false
-			}
-			if p.Status != model.PlanStatusRunning || needsFormal {
-				return "", fmt.Errorf("report_done 被拒绝：Plan %s 尚未依据最新正式验收进入终态（status=%s）", p.ID, p.Status)
-			}
-			authorityCtx := plan.WithControllerAuthority(ctx, currentTask.ID)
-			if _, completeErr := g.PlanCoordinator.CompleteWithoutExecution(authorityCtx, p.ID); completeErr != nil {
-				return "", fmt.Errorf("结束只读 Plan 失败: %w", completeErr)
-			}
-		}
 	}
 
 	// 2. 事实校对：构造 artifacts 报告
@@ -517,70 +389,6 @@ func (g SchedulerGroup) reportDone(ctx context.Context, args map[string]any) (st
 	return "已向用户报告完成", nil
 }
 
-func validateActiveController(task *model.Task, p *model.Plan) error {
-	if task == nil || p == nil || task.NodeRole != model.PlanNodeRoleController ||
-		task.EventType != "__scheduler__" || task.ID != p.ActiveDecisionTaskID {
-		taskID := ""
-		if task != nil {
-			taskID = task.ID
-		}
-		planID := ""
-		activeID := ""
-		if p != nil {
-			planID = p.ID
-			activeID = p.ActiveDecisionTaskID
-		}
-		return fmt.Errorf("scheduler control operation requires active controller %s for plan %s (caller=%s)", activeID, planID, taskID)
-	}
-	return nil
-}
-
-func reportNeedsFormalFinalization(s store.TaskStore, task *model.Task, p *model.Plan) bool {
-	if p != nil && len(p.CurrentNodeIDs) > 0 {
-		return true
-	}
-	if task == nil {
-		return false
-	}
-	if len(task.Artifacts) > 0 {
-		return true
-	}
-	for _, toolName := range []string{"write_file", "edit_file", "run_shell"} {
-		records, err := s.QueryToolCalls(task.ID, toolName)
-		if err != nil {
-			continue
-		}
-		for _, record := range records {
-			if record.Success {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// SoloSkipsFormalFinalization 判定当前收尾是否可以跳过正式验收（AcceptanceRun）。
-// 两个条件必须同时成立：
-//   - topo=solo：modeStore 非 nil 且 topo 轴为 solo；nil 等价 team，永不放宽；
-//   - Plan 无 implementation 节点：CurrentNodeIDs 为空（仍是 root-only 控制面信封）。
-//
-// 背景：solo 下 publish_task 被硬拦截，controller（scheduler）亲自执行的
-// write_file/edit_file/run_shell 永远不会形成 Task-backed DAG，系统里也没有
-// verifier route 可跑正式 AcceptanceRun——正式验收路径在 solo 下物理上走不通。
-// 因此对满足条件的 Plan 放宽 reportNeedsFormalFinalization /
-// planNeedsFormalFinalization 的硬性要求，允许 report_done / 自然文本回答走
-// CompleteWithoutExecution 的"无验收运行"收尾。team 模式语义不变；Plan 中
-// 残留任何 implementation 节点（异常状态）时不放宽，仍要求正式验收。
-func SoloSkipsFormalFinalization(modeStore *modes.Store, p *model.Plan) bool {
-	if modeStore == nil || modeStore.GetTopo() != modes.TopoSolo {
-		return false
-	}
-	if p == nil || len(p.CurrentNodeIDs) > 0 {
-		return false
-	}
-	return true
-}
-
 // reportProgress 是 report_progress 工具的实现。
 // 向用户输出中间进度摘要，但不调用 FinalizationNotifier，
 // 让 reactLoop 继续执行，等下游任务完成后再汇报最终结果。
@@ -606,8 +414,8 @@ func (g SchedulerGroup) reportProgress(ctx context.Context, args map[string]any)
 // "系统校验"文本块，附加到 report_done 输出末尾。
 //
 // 这是 LLM 自由发挥的硬约束兜底——LLM 生成的 summary 可能编造不存在的产物，
-// 但本函数只读 task.Artifacts（由 RecordArtifactHook 在 write_file/edit_file
-// 成功后硬连线追加），任何由 LLM 编造的文件都不会出现在这里；任何 LLM 没提
+// 但本函数只读 task.Artifacts（由 record-artifact Reactor 在文件写入事件后
+// 硬连线追加），任何由 LLM 编造的文件都不会出现在这里；任何 LLM 没提
 // 的真实文件也会被列出。
 //
 // 单个任务 GetTask 失败不影响整体输出，只在该行打印错误标记。

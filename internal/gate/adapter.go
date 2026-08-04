@@ -74,6 +74,8 @@ func (a *toolGateAdapter) Run(c Context) Decision {
 		Action:      adaptHookAction(d.Action),
 		AbortReason: d.AbortReason,
 		HookName:    d.HookName,
+		ReasonCode:  d.ReasonCode,
+		Suggestions: d.Suggestions,
 	}
 }
 
@@ -126,6 +128,8 @@ func (a *mailboxGateAdapter) Run(c Context) Decision {
 		Action:          adaptHookAction(d.Action),
 		AbortReason:     d.AbortReason,
 		HookName:        d.HookName,
+		ReasonCode:      d.ReasonCode,
+		Suggestions:     d.Suggestions,
 		WakeDescription: d.WakeDescription,
 	}
 }

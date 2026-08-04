@@ -16,7 +16,7 @@ import (
 // 无灰名单模式可捕获时不提供 allow_session 选项。
 func TestWrapShellTool_StrictAsksAllCommands(t *testing.T) {
 	service := interaction.NewService(nil)
-	modeStore := modes.NewStore(modes.GateImmediate, modes.ExecStrict, modes.TopoTeam)
+	modeStore := modes.NewStore(modes.ExecStrict, modes.TopoTeam)
 	var calls atomic.Int32
 	inner := func(context.Context, map[string]any) (string, error) {
 		calls.Add(1)
@@ -57,7 +57,7 @@ func TestWrapShellTool_StrictAsksAllCommands(t *testing.T) {
 // 此后同模式命令直接放行。
 func TestWrapShellTool_StrictGreyKeepsAllowSession(t *testing.T) {
 	service := interaction.NewService(nil)
-	modeStore := modes.NewStore(modes.GateImmediate, modes.ExecStrict, modes.TopoTeam)
+	modeStore := modes.NewStore(modes.ExecStrict, modes.TopoTeam)
 	filter := NewCommandFilter(nil, []string{`^git push`})
 	var calls atomic.Int32
 	wrapper := WrapShellTool(func(context.Context, map[string]any) (string, error) {
@@ -102,7 +102,7 @@ func TestWrapShellTool_StrictGreyKeepsAllowSession(t *testing.T) {
 // strict 模式：黑名单依旧硬拒，不创建 Interaction。
 func TestWrapShellTool_StrictBlacklistStillBlocked(t *testing.T) {
 	service := interaction.NewService(nil)
-	modeStore := modes.NewStore(modes.GateImmediate, modes.ExecStrict, modes.TopoTeam)
+	modeStore := modes.NewStore(modes.ExecStrict, modes.TopoTeam)
 	var executed atomic.Bool
 	wrapper := WrapShellTool(func(context.Context, map[string]any) (string, error) {
 		executed.Store(true)
@@ -122,7 +122,7 @@ func TestWrapShellTool_StrictBlacklistStillBlocked(t *testing.T) {
 // strict 模式：运行时白名单（用户 allow_session 的显式授权）命中仍直接放行。
 func TestWrapShellTool_StrictWhitelistStillAllowed(t *testing.T) {
 	service := interaction.NewService(nil)
-	modeStore := modes.NewStore(modes.GateImmediate, modes.ExecStrict, modes.TopoTeam)
+	modeStore := modes.NewStore(modes.ExecStrict, modes.TopoTeam)
 	filter := NewCommandFilter(nil, []string{`^git push`})
 	if err := filter.AddRuntimeWhitelist(`^git push`); err != nil {
 		t.Fatal(err)
@@ -149,7 +149,7 @@ func TestWrapShellTool_YoloAutoAllowsGrey(t *testing.T) {
 	defer log.SetOutput(prev)
 
 	service := interaction.NewService(nil)
-	modeStore := modes.NewStore(modes.GateImmediate, modes.ExecYolo, modes.TopoTeam)
+	modeStore := modes.NewStore(modes.ExecYolo, modes.TopoTeam)
 	var calls atomic.Int32
 	wrapper := WrapShellTool(func(context.Context, map[string]any) (string, error) {
 		calls.Add(1)
@@ -173,7 +173,7 @@ func TestWrapShellTool_YoloAutoAllowsGrey(t *testing.T) {
 // yolo 模式：黑名单依旧硬拒；普通命令行为不变。
 func TestWrapShellTool_YoloBlacklistStillBlocked(t *testing.T) {
 	service := interaction.NewService(nil)
-	modeStore := modes.NewStore(modes.GateImmediate, modes.ExecYolo, modes.TopoTeam)
+	modeStore := modes.NewStore(modes.ExecYolo, modes.TopoTeam)
 	var calls atomic.Int32
 	wrapper := WrapShellTool(func(context.Context, map[string]any) (string, error) {
 		calls.Add(1)
@@ -196,7 +196,7 @@ func TestWrapShellTool_YoloBlacklistStillBlocked(t *testing.T) {
 // 并发场景：strict 下多条普通命令各自创建独立请求，回答按 digest 绑定互不串扰。
 func TestWrapShellTool_StrictConcurrentRequestsCorrelated(t *testing.T) {
 	service := interaction.NewService(nil)
-	modeStore := modes.NewStore(modes.GateImmediate, modes.ExecStrict, modes.TopoTeam)
+	modeStore := modes.NewStore(modes.ExecStrict, modes.TopoTeam)
 	inner := func(_ context.Context, args map[string]any) (string, error) {
 		return args["command"].(string), nil
 	}

@@ -35,7 +35,7 @@ func TestStoreRebindDir_MovesPersistenceKeepsState(t *testing.T) {
 	}
 
 	// 换绑后的变更只落新路径
-	if _, err := store.SetStatus(spec.ID, StatusStopped, "plan_terminal:pass"); err != nil {
+	if _, err := store.SetStatus(spec.ID, StatusStopped, "controller_terminal:completed"); err != nil {
 		t.Fatalf("SetStatus: %v", err)
 	}
 	got, err = store.Get(spec.ID)
@@ -47,7 +47,7 @@ func TestStoreRebindDir_MovesPersistenceKeepsState(t *testing.T) {
 		t.Fatalf("reopen new path again: %v", err)
 	}
 	got, err = reopenedNew.Get(spec.ID)
-	if err != nil || got.Status != StatusStopped || got.StopReason != "plan_terminal:pass" {
+	if err != nil || got.Status != StatusStopped || got.StopReason != "controller_terminal:completed" {
 		t.Fatalf("新路径缺少换绑后的变更: got=%+v err=%v", got, err)
 	}
 
@@ -63,7 +63,7 @@ func TestStoreRebindDir_MovesPersistenceKeepsState(t *testing.T) {
 }
 
 // B2 回归：RebindDir 到新路径失败时保留旧路径，后续变更仍落旧路径
-// （与 internal/plan 的同构用例对齐——此前 team 侧缺这条失败路径覆盖）。
+// （此前 team 侧缺这条失败路径覆盖）。
 func TestStoreRebindDir_FailureKeepsOldPath(t *testing.T) {
 	oldPath := filepath.Join(t.TempDir(), "sess-a", "agent-teams.json")
 	store, err := OpenStore(oldPath)

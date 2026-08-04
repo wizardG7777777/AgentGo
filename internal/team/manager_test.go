@@ -14,7 +14,6 @@ import (
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
-	"agentgo/internal/plan"
 	reactorbuiltin "agentgo/internal/reactor/builtin"
 	"agentgo/internal/roster"
 	"agentgo/internal/runner"
@@ -31,7 +30,7 @@ func (idleLLM) Chat(context.Context, []llm.Message, []llm.ToolDef) (llm.Response
 
 type routeRecord struct {
 	eventType    string
-	planID       string
+	ownerScope   string
 	count        int
 	role         string
 	capabilities []string
@@ -46,7 +45,7 @@ type fakeRoutes struct {
 
 func newFakeRoutes() *fakeRoutes { return &fakeRoutes{routes: make(map[string]routeRecord)} }
 
-func (r *fakeRoutes) RegisterRoute(key, eventType, planID string, count int, role string, capabilities []string) error {
+func (r *fakeRoutes) RegisterRoute(key, eventType, ownerScope string, count int, role string, capabilities []string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.beforeRegister != nil {
@@ -58,7 +57,7 @@ func (r *fakeRoutes) RegisterRoute(key, eventType, planID string, count int, rol
 		return errors.New("duplicate route")
 	}
 	r.routes[key] = routeRecord{
-		eventType: eventType, planID: planID, count: count, role: role,
+		eventType: eventType, ownerScope: ownerScope, count: count, role: role,
 		capabilities: append([]string(nil), capabilities...),
 	}
 	r.registers++
@@ -130,13 +129,14 @@ func (r *fakeRoutes) snapshot() (map[string]routeRecord, int) {
 
 func TestManagerProvisionIdempotenceLimitsShutdownAndRecovery(t *testing.T) {
 	catalog := testCatalog(t)
-	coordinator, planID, controllerID := testPlan(t, "plan-provision")
+	taskStore := store.NewMemoryTaskStore(nil, 100, 1, 30)
+	controllerID := newControllerTask(t, taskStore, "controller-provision")
 	durable := NewMemoryStore()
 	routes := newFakeRoutes()
-	manager := testManager(t, catalog, coordinator, durable, routes, 2)
+	manager := testManagerWithStore(t, catalog, taskStore, durable, routes, 2)
 	req := agenttemplate.ProvisionRequest{
-		PlanID: planID, ControllerTaskID: controllerID,
-		TemplateRef: "builtin/explorer@1", Purpose: "map the codebase", Replicas: 2,
+		ControllerTaskID: controllerID,
+		TemplateRef:      "builtin/explorer@1", Purpose: "map the codebase", Replicas: 2,
 	}
 	if _, err := manager.Provision(context.Background(), req); !errors.Is(err, ErrNotStarted) {
 		t.Fatalf("Provision before Start err=%v, want ErrNotStarted", err)
@@ -157,8 +157,8 @@ func TestManagerProvisionIdempotenceLimitsShutdownAndRecovery(t *testing.T) {
 	}
 	routeSnapshot, registerCount := routes.snapshot()
 	route := routeSnapshot[first.EventType]
-	if route.planID != planID || route.count != 2 || !contains(route.capabilities, "read_file") || contains(route.capabilities, "code-investigation") {
-		t.Fatalf("route must expose concrete tools, got %+v", route)
+	if route.ownerScope != controllerID || route.count != 2 || !contains(route.capabilities, "read_file") || contains(route.capabilities, "code-investigation") {
+		t.Fatalf("route must expose concrete tools and controller ownership, got %+v", route)
 	}
 
 	second, err := manager.Provision(context.Background(), req)
@@ -174,15 +174,15 @@ func TestManagerProvisionIdempotenceLimitsShutdownAndRecovery(t *testing.T) {
 	}
 
 	_, err = manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
-		PlanID: planID, ControllerTaskID: controllerID,
-		TemplateRef: "builtin/generalist@1", Purpose: "implement", Replicas: 1,
+		ControllerTaskID: controllerID,
+		TemplateRef:      "builtin/generalist@1", Purpose: "implement", Replicas: 1,
 	})
 	if !errors.Is(err, ErrProcessLimitExceeded) {
 		t.Fatalf("process limit err=%v, want ErrProcessLimitExceeded", err)
 	}
 	_, err = manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
-		PlanID: planID, ControllerTaskID: controllerID,
-		TemplateRef: "builtin/verifier@1", Purpose: "accept", Replicas: 2,
+		ControllerTaskID: controllerID,
+		TemplateRef:      "builtin/verifier@1", Purpose: "accept", Replicas: 2,
 	})
 	if err == nil {
 		t.Fatal("verifier template accepted replicas above template max")
@@ -197,8 +197,10 @@ func TestManagerProvisionIdempotenceLimitsShutdownAndRecovery(t *testing.T) {
 		t.Fatalf("Shutdown left runtime routes: %+v", current)
 	}
 
+	// 恢复与首次 provision 共用同一任务存储：controller 任务仍存活（非终态、
+	// 未淘汰），ready TeamSpec 才能通过 Start 的 controller 检查被恢复。
 	recoveredRoutes := newFakeRoutes()
-	recovered := testManager(t, catalog, coordinator, durable, recoveredRoutes, 2)
+	recovered := testManagerWithStore(t, catalog, taskStore, durable, recoveredRoutes, 2)
 	if err := recovered.Start(context.Background()); err != nil {
 		t.Fatalf("recovery Start: %v", err)
 	}
@@ -213,18 +215,19 @@ func TestManagerProvisionIdempotenceLimitsShutdownAndRecovery(t *testing.T) {
 
 func TestManagerRecoveryClaimsV4UnreadMailboxWithoutDuplicateRegistration(t *testing.T) {
 	catalog := testCatalog(t)
-	coordinator, planID, controllerID := testPlan(t, "plan-mailbox-recovery")
+	taskStore := store.NewMemoryTaskStore(nil, 100, 1, 30)
+	controllerID := newControllerTask(t, taskStore, "controller-mailbox-recovery")
 	durable := NewMemoryStore()
 
 	// 先产生一个持久化 ready TeamSpec，以获得真实的稳定 agentID。
-	first := testManager(t, catalog, coordinator, durable, newFakeRoutes(), 1)
+	first := testManagerWithStore(t, catalog, taskStore, durable, newFakeRoutes(), 1)
 	t.Cleanup(first.Shutdown)
 	if err := first.Start(context.Background()); err != nil {
 		t.Fatalf("first Start: %v", err)
 	}
 	result, err := first.Provision(context.Background(), agenttemplate.ProvisionRequest{
-		PlanID: planID, ControllerTaskID: controllerID,
-		TemplateRef: "builtin/explorer@1", Purpose: "recover unread mail", Replicas: 1,
+		ControllerTaskID: controllerID,
+		TemplateRef:      "builtin/explorer@1", Purpose: "recover unread mail", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -245,12 +248,12 @@ func TestManagerRecoveryClaimsV4UnreadMailboxWithoutDuplicateRegistration(t *tes
 	}
 
 	deps := runner.RunnerDeps{
-		Store:  store.NewMemoryTaskStore(nil, 100, 1, 30),
+		Store:  taskStore,
 		Roster: roster.NewMemoryRoster(), MBRegistry: mailboxes,
-		PlanCoordinator: coordinator, ProjectRoot: t.TempDir(),
+		ProjectRoot: t.TempDir(),
 	}
 	recovered := NewManager(deps, func(string) llm.Client { return idleLLM{} },
-		catalog, coordinator, durable, newFakeRoutes(), 1)
+		catalog, durable, newFakeRoutes(), 1)
 	t.Cleanup(recovered.Shutdown)
 	if err := recovered.Start(context.Background()); err != nil {
 		t.Fatalf("recovery Start: %v", err)
@@ -271,23 +274,24 @@ func TestManagerRecoveryClaimsV4UnreadMailboxWithoutDuplicateRegistration(t *tes
 
 func TestManagerShutdownPreservesUnreadMailboxUntilFinalSnapshot(t *testing.T) {
 	catalog := testCatalog(t)
-	coordinator, planID, controllerID := testPlan(t, "plan-mailbox-shutdown-snapshot")
 	durable := NewMemoryStore()
 	mailboxes := mailbox.NewRegistry(8)
+	taskStore := store.NewMemoryTaskStore(nil, 100, 1, 30)
+	controllerID := newControllerTask(t, taskStore, "controller-mailbox-shutdown-snapshot")
 	deps := runner.RunnerDeps{
-		Store:  store.NewMemoryTaskStore(nil, 100, 1, 30),
+		Store:  taskStore,
 		Roster: roster.NewMemoryRoster(), MBRegistry: mailboxes,
-		PlanCoordinator: coordinator, ProjectRoot: t.TempDir(),
+		ProjectRoot: t.TempDir(),
 	}
 	manager := NewManager(deps, func(string) llm.Client { return idleLLM{} },
-		catalog, coordinator, durable, newFakeRoutes(), 1)
+		catalog, durable, newFakeRoutes(), 1)
 	t.Cleanup(manager.Shutdown)
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	result, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
-		PlanID: planID, ControllerTaskID: controllerID,
-		TemplateRef: "builtin/explorer@1", Purpose: "persist unread shutdown mail", Replicas: 1,
+		ControllerTaskID: controllerID,
+		TemplateRef:      "builtin/explorer@1", Purpose: "persist unread shutdown mail", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -342,16 +346,17 @@ func TestManagerShutdownPreservesUnreadMailboxUntilFinalSnapshot(t *testing.T) {
 
 func TestManagerRecoveryStartFailureRollsBackMailboxClaim(t *testing.T) {
 	catalog := testCatalog(t)
-	coordinator, planID, controllerID := testPlan(t, "plan-mailbox-start-rollback")
+	taskStore := store.NewMemoryTaskStore(nil, 100, 1, 30)
+	controllerID := newControllerTask(t, taskStore, "controller-mailbox-start-rollback")
 	durable := NewMemoryStore()
-	first := testManager(t, catalog, coordinator, durable, newFakeRoutes(), 1)
+	first := testManagerWithStore(t, catalog, taskStore, durable, newFakeRoutes(), 1)
 	t.Cleanup(first.Shutdown)
 	if err := first.Start(context.Background()); err != nil {
 		t.Fatalf("first Start: %v", err)
 	}
 	result, err := first.Provision(context.Background(), agenttemplate.ProvisionRequest{
-		PlanID: planID, ControllerTaskID: controllerID,
-		TemplateRef: "builtin/explorer@1", Purpose: "rollback unread mail", Replicas: 1,
+		ControllerTaskID: controllerID,
+		TemplateRef:      "builtin/explorer@1", Purpose: "rollback unread mail", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -371,16 +376,16 @@ func TestManagerRecoveryStartFailureRollsBackMailboxClaim(t *testing.T) {
 	}
 
 	queryStore := &failingQueryStore{
-		TaskStore: store.NewMemoryTaskStore(nil, 100, 1, 30),
+		TaskStore: taskStore,
 		entered:   make(chan struct{}),
 	}
 	activity := agent.NewActivityTracker()
 	deps := runner.RunnerDeps{
 		Store: queryStore, Roster: roster.NewMemoryRoster(), Activity: activity,
-		MBRegistry: mailboxes, PlanCoordinator: coordinator, ProjectRoot: t.TempDir(),
+		MBRegistry: mailboxes, ProjectRoot: t.TempDir(),
 	}
 	recovered := NewManager(deps, func(string) llm.Client { return idleLLM{} },
-		catalog, coordinator, durable, newFakeRoutes(), 1)
+		catalog, durable, newFakeRoutes(), 1)
 	t.Cleanup(recovered.Shutdown)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -449,7 +454,6 @@ func TestManagerDiscardBeforeStartRollsBackRecoveredMailboxClaim(t *testing.T) {
 
 func TestManagerProvisionPublishesRouteAfterDurableRuntimeReady(t *testing.T) {
 	catalog := testCatalog(t)
-	coordinator, planID, controllerID := testPlan(t, "plan-ready-order")
 	durable := NewMemoryStore()
 	mailboxes := mailbox.NewRegistry(8)
 	activity := agent.NewActivityTracker()
@@ -457,6 +461,7 @@ func TestManagerProvisionPublishesRouteAfterDurableRuntimeReady(t *testing.T) {
 		TaskStore: store.NewMemoryTaskStore(nil, 100, 1, 30),
 		queries:   make(map[string]int),
 	}
+	controllerID := newControllerTask(t, taskStore, "controller-ready-order")
 	routes := newFakeRoutes()
 	routes.beforeRegister = func(_ string, eventType string, count int) error {
 		teamID := strings.TrimPrefix(eventType, "team:")
@@ -483,18 +488,18 @@ func TestManagerProvisionPublishesRouteAfterDurableRuntimeReady(t *testing.T) {
 	deps := runner.RunnerDeps{
 		Store:  taskStore,
 		Roster: roster.NewMemoryRoster(), Activity: activity, MBRegistry: mailboxes,
-		PlanCoordinator: coordinator, ProjectRoot: t.TempDir(),
+		ProjectRoot: t.TempDir(),
 	}
 	manager := NewManager(deps, func(string) llm.Client { return idleLLM{} },
-		catalog, coordinator, durable, routes, 2)
+		catalog, durable, routes, 2)
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	defer manager.Shutdown()
 
 	result, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
-		PlanID: planID, ControllerTaskID: controllerID,
-		TemplateRef: "builtin/explorer@1", Purpose: "inspect", Replicas: 2,
+		ControllerTaskID: controllerID,
+		TemplateRef:      "builtin/explorer@1", Purpose: "inspect", Replicas: 2,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -506,27 +511,28 @@ func TestManagerProvisionPublishesRouteAfterDurableRuntimeReady(t *testing.T) {
 
 func TestManagerProvisionRouteFailureStopsSpecAndCleansRuntime(t *testing.T) {
 	catalog := testCatalog(t)
-	coordinator, planID, controllerID := testPlan(t, "plan-route-failure")
 	durable := NewMemoryStore()
 	routeErr := errors.New("simulated route registration failure")
 	routes := newFakeRoutes()
 	routes.beforeRegister = func(string, string, int) error { return routeErr }
 	mailboxes := mailbox.NewRegistry(8)
 	activity := agent.NewActivityTracker()
+	taskStore := store.NewMemoryTaskStore(nil, 100, 1, 30)
+	controllerID := newControllerTask(t, taskStore, "controller-route-failure")
 	deps := runner.RunnerDeps{
-		Store:  store.NewMemoryTaskStore(nil, 100, 1, 30),
+		Store:  taskStore,
 		Roster: roster.NewMemoryRoster(), Activity: activity, MBRegistry: mailboxes,
-		PlanCoordinator: coordinator, ProjectRoot: t.TempDir(),
+		ProjectRoot: t.TempDir(),
 	}
 	manager := NewManager(deps, func(string) llm.Client { return idleLLM{} },
-		catalog, coordinator, durable, routes, 2)
+		catalog, durable, routes, 2)
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
 	_, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
-		PlanID: planID, ControllerTaskID: controllerID,
-		TemplateRef: "builtin/explorer@1", Purpose: "inspect", Replicas: 1,
+		ControllerTaskID: controllerID,
+		TemplateRef:      "builtin/explorer@1", Purpose: "inspect", Replicas: 1,
 	})
 	if !errors.Is(err, routeErr) {
 		t.Fatalf("Provision err=%v, want route registration failure", err)
@@ -553,7 +559,7 @@ func TestManagerProvisionRouteFailureStopsSpecAndCleansRuntime(t *testing.T) {
 	manager.Shutdown()
 
 	recoveredRoutes := newFakeRoutes()
-	recovered := testManager(t, catalog, coordinator, durable, recoveredRoutes, 2)
+	recovered := testManager(t, catalog, durable, recoveredRoutes, 2)
 	if err := recovered.Start(context.Background()); err != nil {
 		t.Fatalf("recovery after failed provision: %v", err)
 	}
@@ -568,7 +574,6 @@ func TestManagerProvisionRouteFailureStopsSpecAndCleansRuntime(t *testing.T) {
 
 func TestManagerProvisionPersistenceFailureNeverExposesRoute(t *testing.T) {
 	catalog := testCatalog(t)
-	coordinator, planID, controllerID := testPlan(t, "plan-persist-failure")
 	persistErr := errors.New("simulated persistence failure")
 	storeBackend := &blockingEnsureStore{
 		TeamStore: NewMemoryStore(), entered: make(chan struct{}),
@@ -577,13 +582,15 @@ func TestManagerProvisionPersistenceFailureNeverExposesRoute(t *testing.T) {
 	routes := newFakeRoutes()
 	mailboxes := mailbox.NewRegistry(8)
 	activity := agent.NewActivityTracker()
+	taskStore := store.NewMemoryTaskStore(nil, 100, 1, 30)
+	controllerID := newControllerTask(t, taskStore, "controller-persist-failure")
 	deps := runner.RunnerDeps{
-		Store:  store.NewMemoryTaskStore(nil, 100, 1, 30),
+		Store:  taskStore,
 		Roster: roster.NewMemoryRoster(), Activity: activity, MBRegistry: mailboxes,
-		PlanCoordinator: coordinator, ProjectRoot: t.TempDir(),
+		ProjectRoot: t.TempDir(),
 	}
 	manager := NewManager(deps, func(string) llm.Client { return idleLLM{} },
-		catalog, coordinator, storeBackend, routes, 2)
+		catalog, storeBackend, routes, 2)
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -595,8 +602,8 @@ func TestManagerProvisionPersistenceFailureNeverExposesRoute(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		_, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
-			PlanID: planID, ControllerTaskID: controllerID,
-			TemplateRef: "builtin/explorer@1", Purpose: "inspect", Replicas: 1,
+			ControllerTaskID: controllerID,
+			TemplateRef:      "builtin/explorer@1", Purpose: "inspect", Replicas: 1,
 		})
 		done <- err
 	}()
@@ -637,16 +644,15 @@ func TestManagerProvisionPersistenceFailureNeverExposesRoute(t *testing.T) {
 
 func TestManagerRecoveryStopsStaleDigestTeam(t *testing.T) {
 	catalog := testCatalog(t)
-	coordinator, planID, controllerID := testPlan(t, "plan-digest")
 	durable := NewMemoryStore()
+	routes := newFakeRoutes()
+	manager := testManager(t, catalog, durable, routes, 4)
+	controllerID := newControllerTask(t, manager.deps.Store, "controller-digest")
 	spec := testSpec("digest-team", controllerID, "investigate")
-	spec.PlanID = planID
 	spec.TemplateDigest = "sha256:stale"
 	if _, _, err := durable.Ensure(spec); err != nil {
 		t.Fatalf("persist stale spec: %v", err)
 	}
-	routes := newFakeRoutes()
-	manager := testManager(t, catalog, coordinator, durable, routes, 4)
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatalf("Start must tolerate stale digest, got %v", err)
 	}
@@ -668,16 +674,15 @@ func TestManagerRecoveryStopsStaleDigestTeam(t *testing.T) {
 
 func TestManagerRecoveryStopsTeamWithUnavailableTemplate(t *testing.T) {
 	catalog := testCatalog(t)
-	coordinator, planID, controllerID := testPlan(t, "plan-missing-template")
 	durable := NewMemoryStore()
+	routes := newFakeRoutes()
+	manager := testManager(t, catalog, durable, routes, 4)
+	controllerID := newControllerTask(t, manager.deps.Store, "controller-missing-template")
 	spec := testSpec("missing-template-team", controllerID, "investigate")
-	spec.PlanID = planID
 	spec.TemplateRef = "builtin/deleted@99"
 	if _, _, err := durable.Ensure(spec); err != nil {
 		t.Fatalf("persist spec with unavailable template: %v", err)
 	}
-	routes := newFakeRoutes()
-	manager := testManager(t, catalog, coordinator, durable, routes, 4)
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatalf("Start must tolerate unavailable template, got %v", err)
 	}
@@ -694,62 +699,128 @@ func TestManagerRecoveryStopsTeamWithUnavailableTemplate(t *testing.T) {
 	}
 }
 
+// controller 任务已从任务存储淘汰（GetTask 失败）的 ready Team 在恢复时按
+// controller 维度标记 stopped，不再恢复运行时。
+func TestManagerRecoveryStopsTeamWithMissingController(t *testing.T) {
+	catalog := testCatalog(t)
+	durable := NewMemoryStore()
+	routes := newFakeRoutes()
+	manager := testManager(t, catalog, durable, routes, 4)
+	spec := testSpec("missing-controller-team", "controller-never-published", "investigate")
+	if _, _, err := durable.Ensure(spec); err != nil {
+		t.Fatalf("persist spec with missing controller: %v", err)
+	}
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatalf("Start must tolerate missing controller, got %v", err)
+	}
+	defer manager.Shutdown()
+	got, err := durable.Get(spec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusStopped || got.StopReason != "controller_missing" {
+		t.Fatalf("team = status %s reason %q, want stopped/controller_missing", got.Status, got.StopReason)
+	}
+	if manager.ActiveCount() != 0 {
+		t.Fatalf("missing controller started %d agents", manager.ActiveCount())
+	}
+	if current, _ := routes.snapshot(); len(current) != 0 {
+		t.Fatalf("missing controller installed routes: %+v", current)
+	}
+}
+
+// controller 任务已终态的 ready Team 在恢复时同样被标记 stopped 并跳过——
+// 恢复只接 controller 仍存活的 Team。digest 用真实值以隔离 controller 检查。
+func TestManagerRecoveryStopsTeamWithTerminalController(t *testing.T) {
+	catalog := testCatalog(t)
+	durable := NewMemoryStore()
+	routes := newFakeRoutes()
+	manager := testManager(t, catalog, durable, routes, 4)
+	controllerID := newControllerTask(t, manager.deps.Store, "controller-terminal-recovery")
+	spec := testSpec("terminal-controller-team", controllerID, "investigate")
+	tmpl, err := catalog.Resolve("builtin/explorer@1")
+	if err != nil {
+		t.Fatalf("resolve explorer template: %v", err)
+	}
+	spec.TemplateDigest = tmpl.Digest
+	if _, _, err := durable.Ensure(spec); err != nil {
+		t.Fatalf("persist spec with terminal controller: %v", err)
+	}
+	terminalControllerTask(t, manager.deps.Store, controllerID, model.TaskStatusFailed)
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatalf("Start must tolerate terminal controller, got %v", err)
+	}
+	defer manager.Shutdown()
+	got, err := durable.Get(spec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusStopped || got.StopReason != "controller_terminal:failed" {
+		t.Fatalf("team = status %s reason %q, want stopped/controller_terminal:failed", got.Status, got.StopReason)
+	}
+	if manager.ActiveCount() != 0 {
+		t.Fatalf("terminal controller started %d agents", manager.ActiveCount())
+	}
+	if current, _ := routes.snapshot(); len(current) != 0 {
+		t.Fatalf("terminal controller installed routes: %+v", current)
+	}
+}
+
 func TestManagerProvisionRejectsDurableDigestDrift(t *testing.T) {
 	catalog := testCatalog(t)
-	coordinator, planID, controllerID := testPlan(t, "plan-live-digest")
 	durable := NewMemoryStore()
-	manager := testManager(t, catalog, coordinator, durable, newFakeRoutes(), 4)
+	manager := testManager(t, catalog, durable, newFakeRoutes(), 4)
+	controllerID := newControllerTask(t, manager.deps.Store, "controller-live-digest")
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	defer manager.Shutdown()
 	spec := testSpec("live-digest-team", controllerID, "investigate")
-	spec.PlanID = planID
 	spec.TemplateDigest = "sha256:stale"
 	if _, _, err := durable.Ensure(spec); err != nil {
 		t.Fatal(err)
 	}
 	_, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
-		PlanID: planID, ControllerTaskID: controllerID,
-		TemplateRef: "builtin/explorer@1", Purpose: "investigate", Replicas: 2,
+		ControllerTaskID: controllerID,
+		TemplateRef:      "builtin/explorer@1", Purpose: "investigate", Replicas: 2,
 	})
 	if !errors.Is(err, ErrTemplateDigestMismatch) {
 		t.Fatalf("Provision err=%v, want ErrTemplateDigestMismatch", err)
 	}
 }
 
-func TestManagerTerminalPlanReactorStopsTeamAndRecoverySkipsIt(t *testing.T) {
+// controller 任务终态事件触发其名下 active Team 的拆除并持久化 stopped；
+// stopped Team 永不被后续进程恢复。
+func TestManagerTerminalControllerReactorStopsTeamAndRecoverySkipsIt(t *testing.T) {
 	catalog := testCatalog(t)
-	coordinator, planID, controllerID := testPlan(t, "plan-terminal")
 	durable := NewMemoryStore()
 	routes := newFakeRoutes()
-	manager := testManager(t, catalog, coordinator, durable, routes, 2)
+	manager := testManager(t, catalog, durable, routes, 2)
+	controllerID := newControllerTask(t, manager.deps.Store, "controller-terminal")
 	subscribesTerminal := false
 	for _, kind := range manager.Subscribe() {
-		if kind == trace.KindPlanTerminal {
+		if kind == trace.KindTaskCompleted {
 			subscribesTerminal = true
 			break
 		}
 	}
 	if !subscribesTerminal {
-		t.Fatal("TeamManager does not subscribe to plan_terminal")
+		t.Fatal("TeamManager does not subscribe to task terminal events")
 	}
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	result, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
-		PlanID: planID, ControllerTaskID: controllerID,
-		TemplateRef: "builtin/explorer@1", Purpose: "inspect", Replicas: 1,
+		ControllerTaskID: controllerID,
+		TemplateRef:      "builtin/explorer@1", Purpose: "inspect", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	if _, err := coordinator.CompleteWithoutExecution(context.Background(), planID); err != nil {
-		t.Fatalf("CompleteWithoutExecution: %v", err)
-	}
+	terminalControllerTask(t, manager.deps.Store, controllerID, model.TaskStatusCompleted)
 	if err := manager.Run(trace.Event{
-		Kind: trace.KindPlanTerminal,
-		Plan: &trace.PlanTraceContext{PlanID: planID},
+		Kind:   trace.KindTaskCompleted,
+		TaskID: controllerID,
 	}); err != nil {
 		t.Fatalf("terminal Reactor: %v", err)
 	}
@@ -765,10 +836,10 @@ func TestManagerTerminalPlanReactorStopsTeamAndRecoverySkipsIt(t *testing.T) {
 	}
 	manager.Shutdown()
 
-	// Even a now-stale digest is ignored for a terminal Plan: stopped teams
-	// must never be recovered simply because their old template changed.
+	// controller 已终态的 Team 持久态为 stopped，即使此后模板 digest 变化
+	// 也绝不会被恢复。
 	recoveredRoutes := newFakeRoutes()
-	recovered := testManager(t, catalog, coordinator, durable, recoveredRoutes, 2)
+	recovered := testManager(t, catalog, durable, recoveredRoutes, 2)
 	if err := recovered.Start(context.Background()); err != nil {
 		t.Fatalf("terminal recovery: %v", err)
 	}
@@ -780,22 +851,22 @@ func TestManagerTerminalPlanReactorStopsTeamAndRecoverySkipsIt(t *testing.T) {
 
 func TestManagerShutdownRemovesDynamicRuntimeSurfaces(t *testing.T) {
 	catalog := testCatalog(t)
-	coordinator, planID, controllerID := testPlan(t, "plan-cleanup")
 	taskStore := store.NewMemoryTaskStore(nil, 100, 1, 30)
+	controllerID := newControllerTask(t, taskStore, "controller-cleanup")
 	activity := agent.NewActivityTracker()
 	mailboxes := mailbox.NewRegistry(8)
 	deps := runner.RunnerDeps{
 		Store: taskStore, Roster: roster.NewMemoryRoster(), Activity: activity,
-		MBRegistry: mailboxes, PlanCoordinator: coordinator, ProjectRoot: t.TempDir(),
+		MBRegistry: mailboxes, ProjectRoot: t.TempDir(),
 	}
 	manager := NewManager(deps, func(string) llm.Client { return idleLLM{} },
-		catalog, coordinator, NewMemoryStore(), newFakeRoutes(), 2)
+		catalog, NewMemoryStore(), newFakeRoutes(), 2)
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	result, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
-		PlanID: planID, ControllerTaskID: controllerID,
-		TemplateRef: "builtin/explorer@1", Purpose: "inspect", Replicas: 1,
+		ControllerTaskID: controllerID,
+		TemplateRef:      "builtin/explorer@1", Purpose: "inspect", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -819,42 +890,34 @@ func TestManagerShutdownRemovesDynamicRuntimeSurfaces(t *testing.T) {
 
 func TestManagerRepeatedTerminalTeamsReleaseTaskEndCallbacks(t *testing.T) {
 	catalog := testCatalog(t)
-	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
 	callbacks := reactorbuiltin.NewTaskEndCallbackReactor()
+	taskStore := store.NewMemoryTaskStore(nil, 100, 1, 30)
 	deps := runner.RunnerDeps{
-		Store: store.NewMemoryTaskStore(nil, 100, 1, 30), Roster: roster.NewMemoryRoster(),
-		PlanCoordinator: coordinator, TaskEndCallbacks: callbacks, ProjectRoot: t.TempDir(),
+		Store: taskStore, Roster: roster.NewMemoryRoster(),
+		TaskEndCallbacks: callbacks, ProjectRoot: t.TempDir(),
 	}
 	manager := NewManager(deps, func(string) llm.Client { return idleLLM{} },
-		catalog, coordinator, NewMemoryStore(), newFakeRoutes(), 2)
+		catalog, NewMemoryStore(), newFakeRoutes(), 2)
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	defer manager.Shutdown()
 
 	for round := 0; round < 5; round++ {
-		planID := fmt.Sprintf("callback-plan-%d", round)
-		controllerID := "controller-" + planID
-		if _, err := coordinator.Create(context.Background(), plan.CreateInput{
-			PlanID: planID, RootTaskID: controllerID,
-		}); err != nil {
-			t.Fatalf("round %d create plan: %v", round, err)
-		}
+		controllerID := newControllerTask(t, taskStore, fmt.Sprintf("controller-callback-%d", round))
 		if _, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
-			PlanID: planID, ControllerTaskID: controllerID,
-			TemplateRef: "builtin/explorer@1", Purpose: fmt.Sprintf("round-%d", round), Replicas: 2,
+			ControllerTaskID: controllerID,
+			TemplateRef:      "builtin/explorer@1", Purpose: fmt.Sprintf("round-%d", round), Replicas: 2,
 		}); err != nil {
 			t.Fatalf("round %d Provision: %v", round, err)
 		}
 		if got := callbacks.CallbackCount(); got != 2 {
 			t.Fatalf("round %d live callback count=%d, want 2", round, got)
 		}
-		if _, err := coordinator.CompleteWithoutExecution(context.Background(), planID); err != nil {
-			t.Fatalf("round %d terminal plan: %v", round, err)
-		}
+		terminalControllerTask(t, taskStore, controllerID, model.TaskStatusCompleted)
 		if err := manager.Run(trace.Event{
-			Kind: trace.KindAcceptanceCompleted,
-			Plan: &trace.PlanTraceContext{PlanID: planID},
+			Kind:   trace.KindTaskCompleted,
+			TaskID: controllerID,
 		}); err != nil {
 			t.Fatalf("round %d terminal Reactor: %v", round, err)
 		}
@@ -895,35 +958,65 @@ func testCatalog(t *testing.T) *agenttemplate.Catalog {
 	return catalog
 }
 
-func testPlan(t *testing.T, planID string) (*plan.Coordinator, string, string) {
+// newControllerTask 在任务存储中发布一个 __scheduler__ controller 任务并返回
+// 其 ID。Team 的归属（owner）即该任务：恢复与终态拆解路径都凭它判定生命周期。
+func newControllerTask(t *testing.T, taskStore store.TaskStore, description string) string {
 	t.Helper()
-	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
-	controllerID := "controller-" + planID
-	created, err := coordinator.Create(context.Background(), plan.CreateInput{
-		PlanID: planID, RootTaskID: controllerID,
-	})
-	if err != nil {
-		t.Fatalf("create plan: %v", err)
+	task := &model.Task{Description: description, EventType: "__scheduler__", Priority: 1}
+	if err := taskStore.PublishTask(task); err != nil {
+		t.Fatalf("publish controller task: %v", err)
 	}
-	return coordinator, created.ID, controllerID
+	return task.ID
 }
 
+// terminalControllerTask 把 controller 任务沿合法迁移推进到指定终态
+//（completed 需经 processing；cancelled/failed 可从 pending 直达）。
+func terminalControllerTask(t *testing.T, taskStore store.TaskStore, taskID string, to model.TaskStatus) {
+	t.Helper()
+	task, err := taskStore.GetTask(taskID)
+	if err != nil {
+		t.Fatalf("get controller task %s: %v", taskID, err)
+	}
+	from := task.Status
+	if to == model.TaskStatusCompleted && from == model.TaskStatusPending {
+		if err := taskStore.TransitionState(taskID, from, model.TaskStatusProcessing); err != nil {
+			t.Fatalf("start controller task %s: %v", taskID, err)
+		}
+		from = model.TaskStatusProcessing
+	}
+	if err := taskStore.TransitionState(taskID, from, to); err != nil {
+		t.Fatalf("terminate controller task %s to %s: %v", taskID, to, err)
+	}
+}
+
+// testManager 构造使用独立任务存储的 Manager。涉及跨 Manager 恢复同一批
+// TeamSpec 的用例应改用 testManagerWithStore 共享存储——恢复路径会检查
+// controller 任务是否仍存活。
 func testManager(
 	t *testing.T,
 	catalog *agenttemplate.Catalog,
-	coordinator *plan.Coordinator,
 	durable TeamStore,
 	routes RouteRegistry,
 	maxInstances int,
 ) *Manager {
 	t.Helper()
-	taskStore := store.NewMemoryTaskStore(nil, 100, 1, 30)
+	return testManagerWithStore(t, catalog, store.NewMemoryTaskStore(nil, 100, 1, 30), durable, routes, maxInstances)
+}
+
+func testManagerWithStore(
+	t *testing.T,
+	catalog *agenttemplate.Catalog,
+	taskStore store.TaskStore,
+	durable TeamStore,
+	routes RouteRegistry,
+	maxInstances int,
+) *Manager {
+	t.Helper()
 	deps := runner.RunnerDeps{
-		Store: taskStore, Roster: roster.NewMemoryRoster(),
-		PlanCoordinator: coordinator, ProjectRoot: t.TempDir(),
+		Store: taskStore, Roster: roster.NewMemoryRoster(), ProjectRoot: t.TempDir(),
 	}
 	return NewManager(deps, func(string) llm.Client { return idleLLM{} },
-		catalog, coordinator, durable, routes, maxInstances)
+		catalog, durable, routes, maxInstances)
 }
 
 func contains(values []string, target string) bool {

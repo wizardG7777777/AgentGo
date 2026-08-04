@@ -2,17 +2,11 @@ package tools
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 
 	"agentgo/internal/agent"
 	"agentgo/internal/model"
-	"agentgo/internal/modes"
-	"agentgo/internal/plan"
 	"agentgo/internal/store"
 	"agentgo/internal/tools/schema"
 	"agentgo/internal/trace"
@@ -20,18 +14,18 @@ import (
 
 // PlanControlGroup exposes narrow, audited control-plane operations. Tool
 // visibility is still governed by ToolRegistry allowlists: Scheduler receives
-// the full group; custom acceptance agents normally receive only
-// submit_acceptance_result and request_replan.
+// the full group; ordinary execution agents normally receive only
+// submit_task_result and request_replan.
+//
+// C6b 已随 Plan 控制面整包删除验收四工具（define_acceptance_spec /
+// ensure_acceptance_run / submit_acceptance_result / get_acceptance_evidence）
+// 与 request_replan 的 Plan 控制面路径；本组剩余 submit_task_result 与
+// request_replan，验收语义由 V6 Graph acceptance 节点 + submit_task_result 的
+// verdict/event 契约承担。
 type PlanControlGroup struct {
-	Coordinator    *plan.Coordinator
-	Store          store.TaskStore
-	Holder         TaskHolder
-	AgentID        string
-	RouteValidator RouteValidator
-	// Modes 是三轴模式 store，submit_plan_for_review 用它判定 gate 轴：
-	// 仅 gate=plan 时真正挂起 Plan 等待用户审阅。nil（runner 装配）按非
-	// plan 模式处理——幂等提示，不挂起。
-	Modes *modes.Store
+	Store   store.TaskStore
+	Holder  TaskHolder
+	AgentID string
 	// FinalizationNotifier / SubmitState 是 submit_task_result 的提交通道注入
 	// （runner 装配传入 agent.FinalizationHolder + agent.SubmitState）。
 	// 任一 nil 则不注册 submit_task_result——scheduler 装配不传这两个字段，
@@ -47,412 +41,162 @@ func (g PlanControlGroup) Register(r *agent.ToolRegistry) {
 	if g.Store == nil || g.Holder == nil {
 		return
 	}
-	// submit_task_result 只依赖 Store/Holder 与提交通道注入，不依赖 Plan 控制面，
-	// 因此独立于下方 Coordinator nil 检查注册——无 Plan 的兼容任务也必须可用。
 	if g.FinalizationNotifier != nil && g.SubmitState != nil {
-		r.Register("submit_task_result", "以结构化字段提交当前普通执行节点的最终结果并结束任务。summary 必填（一两句话概括结果，会成为下游可见的 TransferNote）；checks_performed/evidence/remaining_risks 为逗号分隔的可选清单；无法完成时填 blocked_reason（会随提交向 Scheduler 登记高优 ReplanRequest），request_replan=true 仅请求重规划。提交前系统会执行 expected_artifacts 校验，缺失时返回错误且不结束任务。调用成功后禁止再调用其他工具。controller/scheduler 任务用 report_done，验收任务用 submit_acceptance_result。",
-			schema.Object().String("summary", "一两句话的任务结果概括；会成为下游可见的 TransferNote", true).
+		r.Register("submit_task_result", "以结构化字段提交当前普通执行节点的最终结果并结束任务。summary 必填（一两句话概括结果，会随依赖结果传递给下游任务）；checks_performed/evidence/remaining_risks 为逗号分隔的可选清单；status 可选（缺省 completed）：status=blocked 表示任务无法完成、以 blocked 终态收尾并自动唤醒 Scheduler 重新规划（blocked 终态不会放行下游依赖任务），此时 blocked_reason 必填；无法完成但不算 blocked 时也可只填 blocked_reason（会随提交向 Scheduler 登记高优 ReplanRequest），request_replan=true 仅请求重规划；event 可选——本结果对应的事件名，写入 Results[\"event\"] 供 V6 Graph 边条件 {event: ...} 匹配，必须属于 Graph 事件词表，仅当任务属于一张图且下游按事件路由时才需要填。提交前系统会执行 expected_artifacts 校验，缺失时返回错误且不结束任务。调用成功即进入收尾（finalizing）：同一响应中排在其后的工具调用会被系统跳过不执行，因此提交前必须先完成所有写操作；每个任务只能成功提交一次。controller/scheduler 任务用 report_done。",
+			schema.Object().String("summary", "一两句话的任务结果概括；会随依赖结果传递给下游任务", true).
 				String("checks_performed", "逗号分隔的已执行检查清单（如 go build, go test ./internal/...）", false).
-				String("evidence", "逗号分隔的证据清单（文件路径、命令输出要点等）", false).
+				String("evidence", "逗号分隔的证据清单（文件路径、命令输出要点等），随结果渲染传递给下游", false).
 				String("remaining_risks", "逗号分隔的残余风险清单", false).
-				String("blocked_reason", "无法完成时的阻塞原因；非空时随提交向 Scheduler 登记高优 ReplanRequest", false).
-				Bool("request_replan", "true 时随提交请求 Scheduler 重新评估当前 Plan", false).Build(),
+				Enum("status", "自述终态：completed=正常完成（缺省）；blocked=无法完成，以 blocked 终态收尾并自动唤醒 Scheduler 重新规划（此时 blocked_reason 必填）", []string{"completed", "blocked"}, false).
+				String("blocked_reason", "无法完成时的阻塞原因；status=blocked 时必填，其余情况非空时随提交向 Scheduler 登记高优 ReplanRequest", false).
+				Bool("request_replan", "true 时随提交请求 Scheduler 重新评估当前任务图", false).
+				String("event", "本结果对应的事件名，供 Graph 边条件 {event: ...} 匹配（仅允许 ready/completed/fixable/failed/blocked/pass/approved/rejected/timeout/always）；任务不属于图或下游不按事件路由时省略", false).
+				String("verdict", "本结果的验收结论（如 pass/fail/fixable），写入 Results[\"verdict\"] 供 Graph acceptance 节点的路径边条件 {$.verdict eq ...} 匹配；仅验收类任务需要填", false).
+				String("evidence_items", "机器可核验证据（JSON 数组字符串）：[{\"criterion\":\"判据名\",\"type\":\"command|file_hash|task_status\",\"value\":\"...\"}]，逐字写入 Results[\"evidence\"] 由 Graph acceptance 节点服务端逐条核验——command 的 value 必须是本次任务真实执行过的命令串（可附 \"expect_exit\":N，缺省期望 exit 0），file_hash 的 value 是项目内文件路径（或 路径=sha256），task_status 的 value 是裸状态词；验收类任务（Graph acceptance 节点）必填，缺失或核验不通过时 verdict 不被采信；非验收任务省略", false).Build(),
 			g.submitTaskResult)
 	}
-	if g.Coordinator == nil {
-		return
-	}
-	r.Register("continue_waiting", "确认已观察最新 PlanSignal，当前不调整 DAG，继续等待后续关键事实。",
-		schema.Object().String("reason", "继续等待的原因", true).Build(), g.continueWaiting)
-	r.Register("define_acceptance_spec", "在调查结束、实施前冻结或增强正式验收标准。不得删除系统或用户的受保护标准；必须省略由系统注入的 builtin Criterion。",
-		schema.Object().String("spec_id", "稳定的验收规范 ID；首次可留空", false).
-			String("criteria_json", "Criterion JSON 数组；source=user|project|scheduler，必须省略 builtin ID/source/BuiltinHardRule；scope=task|milestone|plan，check=command_exit|file_hash|task_status|evidence|manual。前三类 check 的 target 必填；command_exit expected 为规范 0..255 整数；task_status expected 为 pending|processing|completed|cancelled|failed|blocked。示例 [{\"id\":\"tests\",\"description\":\"测试通过\",\"source\":\"scheduler\",\"required\":true,\"scope\":\"plan\",\"check\":\"command_exit\",\"target\":\"go test ./...\",\"expected\":\"0\"}]", true).Build(),
-		g.defineAcceptanceSpec)
-	r.Register("ensure_acceptance_run", "为最新 PlanRevision、GraphDigest 和 AcceptanceSpecRevision 幂等创建正式验收 Task；runner route 必须 ready 且具备可从 Criterion check 推导的必需工具。",
-		schema.Object().Enum("scope", "验收范围", []string{"task", "milestone", "plan"}, false).
-			String("target_task_ids", "逗号分隔目标 Task ID；Plan 级留空表示当前有效图", false).
-			String("runner_event_type", "验收 Agent 的 event_type", true).
-			String("description", "验收 Task 描述", false).Build(), g.ensureAcceptanceRun)
-	r.Register("submit_acceptance_result", "提交结构化正式验收结果。系统会校验 Runner、最新版本、证据和目标 Task 事实。硬性证据规则（违反即整体判 fail）：task_status 证据的 output 必须逐字等于任务状态词（如 completed），禁止描述性文本；command 证据必须与一次真实 run_shell 调用的命令串逐字符一致，且该调用发生在本 Run 创建之后、working_dir 为 project root、由本验收任务或目标任务执行，exit_code 也必须一致。提交一次性生效：核验失败即判 fail，同一 Run 不可重交。",
-		schema.Object().String("run_id", "AcceptanceRun ID；通常可从当前任务自动取得", false).
-			Enum("verdict", "验收结论", []string{"pass", "fail", "blocked", "disputed"}, true).
-			String("criterion_results_json", "CriterionResult JSON 数组；verdict=pass|fail|blocked|disputed；示例 [{\"criterion_id\":\"tests\",\"verdict\":\"pass\",\"summary\":\"go test 通过\",\"evidence_ids\":[\"ev-tests\"]}]", true).
-			String("evidence_json", "Evidence JSON 数组；每项 kind 必填且 PASS 必须提供真实新鲜证据。命令示例 [{\"id\":\"ev-tests\",\"kind\":\"command\",\"command\":\"go test ./...\",\"exit_code\":0,\"output\":\"ok\"}]（command/exit_code 逐字取自你刚执行的真实 run_shell 记录，不得凭记忆重写）；文件示例 [{\"id\":\"ev-file\",\"kind\":\"file_hash\",\"file_path\":\"artifact.bin\",\"file_hash\":\"<sha256>\"}]；Task 示例 [{\"id\":\"ev-task\",\"kind\":\"task_status\",\"task_id\":\"<task-id>\",\"output\":\"completed\"}]（output 只能是裸状态词）", true).
-			String("failure_fingerprint", "规范化失败指纹", false).
-			String("residual_risks", "换行分隔的残余风险", false).
-			String("recommended_actions", "换行分隔的后续动作", false).Build(), g.submitAcceptanceResult)
-	r.Register("request_replan", "请求 PlanCoordinator 重新唤醒 Scheduler；不会直接修改 DAG。",
+	r.Register("request_replan", "请求重新唤醒 Scheduler 评估当前任务编排；不会直接修改 DAG。图（Graph）节点任务调用时登记 graph change 请求并以 __scheduler__ 唤醒任务交给 Scheduler 用 patch_graph 裁决（同一 activation 的重复请求幂等）；非图任务登记通用 replan 唤醒任务（同一任务的重复请求幂等），由 Scheduler 裁决后续编排。",
 		schema.Object().String("reason_code", "结构化原因代码", true).
 			Enum("urgency", "优先级", []string{"normal", "high"}, false).
 			String("detail", "补充说明", false).
 			String("idempotency_key", "可选幂等键；留空由系统生成", false).Build(), g.requestReplan)
-	r.Register("supersede_tasks", "将已失效的当前节点退休，并用已发布的当前 Task 建立非阻塞 Supersedes 替代关系。",
-		schema.Object().String("retire_task_ids", "逗号分隔的待退休 Task ID", true).
-			String("replacement_task_ids", "逗号分隔的替代 Task ID；必须已经发布", true).
-			String("reason", "替代原因；所有非终态旧 Task 会被强制取消", true).Build(), g.supersedeTasks)
-	r.Register("finalize_plan", "依据最新正式验收结果结束 Plan；没有当前有效 PASS 时不能成功完成。",
-		schema.Object().Enum("verdict", "最终结论；只有最新正式验收 PASS 可以结束 Plan", []string{"pass"}, true).Build(), g.finalizePlan)
-	r.Register("mark_plan_blocked", "因权限、环境、用户选择或外部条件暂停 Plan，保留证据并等待用户决策。",
-		schema.Object().String("reason", "结构化且可向用户解释的阻塞原因", true).Build(), g.markPlanBlocked)
-	r.Register("submit_plan_for_review", "gate=plan 模式下提交执行计划供用户审阅：把计划全文（markdown，含任务分解/预期产物/执行顺序）持久化并挂起当前 Plan；用户通过 Interaction 选择后，由受信任控制面继续、修订或取消。调用后应结束当前回合，禁止再发布执行任务。",
-		schema.Object().String("plan", "执行计划全文（markdown）：任务分解、预期产物、执行顺序", true).Build(), g.submitPlanForReview)
-	r.Register("get_retired_node", "按需读取已退休节点的压缩摘要，不把冷历史默认注入上下文。",
-		schema.Object().String("task_id", "退休节点 Task ID", true).Build(), g.getRetiredNode)
-	r.Register("get_acceptance_evidence", "读取某次正式验收的结构化结果和证据。",
-		schema.Object().String("result_id", "AcceptanceResult ID", true).Build(), g.getAcceptanceEvidence)
-}
-
-func (g PlanControlGroup) current() (*model.Task, *model.Plan, error) {
-	taskID := g.Holder.Get()
-	if taskID == "" {
-		return nil, nil, fmt.Errorf("no current task context")
-	}
-	task, err := g.Store.GetTask(taskID)
-	if err != nil {
-		return nil, nil, err
-	}
-	if task.PlanID == "" {
-		return nil, nil, fmt.Errorf("task %s is not associated with a plan", taskID)
-	}
-	p, err := g.Coordinator.Store().GetPlan(task.PlanID)
-	return task, p, err
-}
-
-func (g PlanControlGroup) currentController() (*model.Task, *model.Plan, error) {
-	task, p, err := g.current()
-	if err != nil {
-		return nil, nil, err
-	}
-	if task.NodeRole != model.PlanNodeRoleController || task.EventType != "__scheduler__" {
-		return nil, nil, fmt.Errorf("plan control operation requires a Scheduler controller task")
-	}
-	if p.ActiveDecisionTaskID != task.ID {
-		return nil, nil, fmt.Errorf("controller task %s is not active for plan %s", task.ID, p.ID)
-	}
-	return task, p, nil
-}
-
-func (g PlanControlGroup) continueWaiting(_ context.Context, args map[string]any) (string, error) {
-	_, p, err := g.currentController()
-	if err != nil {
-		return "", err
-	}
-	reason, _ := args["reason"].(string)
-	return fmt.Sprintf("Plan %s 将继续等待：%s", p.ID, reason), nil
-}
-
-func (g PlanControlGroup) defineAcceptanceSpec(ctx context.Context, args map[string]any) (string, error) {
-	controller, p, err := g.currentController()
-	if err != nil {
-		return "", err
-	}
-	raw, _ := args["criteria_json"].(string)
-	var criteria []model.Criterion
-	if err := json.Unmarshal([]byte(raw), &criteria); err != nil {
-		return "", fmt.Errorf("criteria_json: %w", err)
-	}
-	specID, _ := args["spec_id"].(string)
-	ctx = plan.WithControllerAuthority(ctx, controller.ID)
-	spec, err := g.Coordinator.DefineAcceptanceSpec(ctx, p.ID, model.AcceptanceSpec{
-		ID: specID, Criteria: criteria, CreatedBy: g.AgentID,
-	})
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("AcceptanceSpec 已冻结: id=%s revision=%d criteria=%d", spec.ID, spec.Revision, len(spec.Criteria)), nil
-}
-
-func (g PlanControlGroup) ensureAcceptanceRun(ctx context.Context, args map[string]any) (string, error) {
-	controller, p, err := g.currentController()
-	if err != nil {
-		return "", err
-	}
-	scope, _ := args["scope"].(string)
-	runner, _ := args["runner_event_type"].(string)
-	description, _ := args["description"].(string)
-	targets, _ := args["target_task_ids"].(string)
-	if g.RouteValidator != nil {
-		required := acceptanceRouteTools(p)
-		if !g.RouteValidator.CanRouteForPlan(p.ID, runner, required...) {
-			return "", fmt.Errorf("正式验收被拒绝: event_type=%q 没有可供当前 Plan 使用且同时具备 %s 的 ready route；请先从 verifier 模板为当前 Plan provision 单副本 Team", runner, strings.Join(required, ", "))
-		}
-	}
-	ctx = plan.WithControllerAuthority(ctx, controller.ID)
-	run, created, err := g.Coordinator.EnsureAcceptanceRun(ctx, plan.EnsureAcceptanceRunInput{
-		PlanID: p.ID, Scope: model.AcceptanceScope(scope), TargetTaskIDs: splitList(targets),
-		RunnerKind: runner, Description: description, ParentTaskID: controller.ID,
-		ReplyToAgentID: g.AgentID, BatchID: controller.ID,
-	})
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("AcceptanceRun: id=%s task_id=%s created=%t target_revision=%d", run.ID, run.RunnerTaskID, created, run.TargetPlanRevision), nil
-}
-
-func acceptanceRouteTools(p *model.Plan) []string {
-	required := []string{"submit_acceptance_result"}
-	seen := map[string]bool{"submit_acceptance_result": true}
-	if p == nil {
-		return required
-	}
-	spec, ok := p.AcceptanceSpecs[p.CurrentAcceptanceSpecID]
-	if !ok {
-		return required
-	}
-	for _, criterion := range spec.Criteria {
-		tool := ""
-		switch criterion.Check {
-		case "command_exit":
-			tool = "run_shell"
-		case "file_hash":
-			tool = "read_file"
-		}
-		if tool != "" && !seen[tool] {
-			seen[tool] = true
-			required = append(required, tool)
-		}
-	}
-	return required
-}
-
-func (g PlanControlGroup) submitAcceptanceResult(ctx context.Context, args map[string]any) (string, error) {
-	task, p, err := g.current()
-	if err != nil {
-		return "", err
-	}
-	if task.NodeRole != model.PlanNodeRoleAcceptance || task.AcceptanceRunID == "" {
-		return "", fmt.Errorf("current task %s is not a bound acceptance runner", task.ID)
-	}
-	runID, _ := args["run_id"].(string)
-	if runID == "" {
-		runID = task.AcceptanceRunID
-	}
-	if runID != task.AcceptanceRunID {
-		return "", fmt.Errorf("current task is not bound to acceptance run %s", runID)
-	}
-	var criterionResults []model.CriterionResult
-	if raw, _ := args["criterion_results_json"].(string); json.Unmarshal([]byte(raw), &criterionResults) != nil {
-		return "", fmt.Errorf("criterion_results_json is invalid")
-	}
-	var evidence []model.Evidence
-	if raw, _ := args["evidence_json"].(string); json.Unmarshal([]byte(raw), &evidence) != nil {
-		return "", fmt.Errorf("evidence_json is invalid")
-	}
-	verdict, _ := args["verdict"].(string)
-	fingerprint, _ := args["failure_fingerprint"].(string)
-	residual, _ := args["residual_risks"].(string)
-	actions, _ := args["recommended_actions"].(string)
-	result, created, err := g.Coordinator.SubmitAcceptanceResult(ctx, model.AcceptanceResult{
-		RunID: runID, PlanID: p.ID, Verdict: model.AcceptanceVerdict(verdict),
-		CriterionResults: criterionResults, Evidence: evidence, FailureFingerprint: fingerprint,
-		ResidualRisks: splitLines(residual), RecommendedActions: splitLines(actions),
-		SubmittedByTaskID: task.ID,
-	})
-	if err != nil && result == nil {
-		return "", err
-	}
-	if result == nil {
-		return "", err
-	}
-	if created {
-		if run, runErr := g.Coordinator.Store().GetAcceptanceRun(p.ID, runID); runErr == nil {
-			latest, _ := g.Coordinator.Store().GetPlan(p.ID)
-			trace.Emit(trace.Event{
-				Kind: trace.KindAcceptanceCompleted, TaskID: task.ID,
-				Plan: planTraceForTool(latest),
-				Acceptance: &trace.AcceptanceTraceContext{
-					AcceptanceRunID: run.ID, ResultID: result.ID, SpecID: run.SpecID,
-					SpecRevision: run.SpecRevision, TargetRevision: run.TargetPlanRevision,
-					TargetGraphDigest: run.TargetGraphDigest, RunnerTaskID: task.ID,
-					RunnerKind: task.EventType, Verdict: string(result.Verdict),
-					Status: string(result.Status), Reason: result.Reason,
-				},
-			})
-		}
-	}
-	return fmt.Sprintf("AcceptanceResult 已记录: id=%s created=%t verdict=%s status=%s reason=%s", result.ID, created, result.Verdict, result.Status, result.Reason), err
 }
 
 func (g PlanControlGroup) requestReplan(ctx context.Context, args map[string]any) (string, error) {
-	task, p, err := g.current()
-	if err != nil {
-		return "", err
+	// 图任务（V6 Graph，GraphID 非空）走 graph change 流（C5d）；
+	// 非图任务（C6b 起 Plan 控制面已删除）走通用 replan 唤醒任务——同一
+	// 机制：发布 __scheduler__ 唤醒任务交给 Scheduler 裁决，不做服务端
+	// 状态迁移。
+	if taskID := g.Holder.Get(); taskID != "" {
+		task, err := g.Store.GetTask(taskID)
+		if err != nil {
+			return "", err
+		}
+		if task.GraphID != "" {
+			return g.requestGraphChange(task, args)
+		}
+		return g.requestGenericReplan(ctx, task, args)
 	}
+	return "", fmt.Errorf("no current task context")
+}
+
+// replanRequestMarker 是非图 replan 唤醒任务描述中的幂等标记；查重按该
+// 子串匹配。幂等键为 <taskID>/replan：同一任务的重复请求只保留一个唤醒任务。
+func replanRequestMarker(taskID string) string {
+	return "[replan-request: " + taskID + "/replan]"
+}
+
+// requestGenericReplan 是 request_replan 的非图路径（C6b）：不触碰任何
+// 服务端控制面状态，只向公告板发布 __scheduler__ 唤醒任务（描述含幂等
+// 标记与请求者上下文），Scheduler 认领后自行裁决后续编排；同一任务已有
+// 未处理（非终态）的同类唤醒任务时幂等返回，不重复发布。
+//
+// 唤醒任务刻意不携带 GraphID/NodeID/ActivationID：它是 Scheduler 的控制面
+// 输入而非图节点任务，带图身份会被 graph-terminal-feed 当作节点终态回填引擎。
+func (g PlanControlGroup) requestGenericReplan(_ context.Context, task *model.Task, args map[string]any) (string, error) {
 	reason, _ := args["reason_code"].(string)
 	urgency, _ := args["urgency"].(string)
 	detail, _ := args["detail"].(string)
-	key, _ := args["idempotency_key"].(string)
-	if key == "" {
-		sum := sha256.Sum256([]byte(strings.Join([]string{
-			p.ID, task.ID, reason, detail, fmt.Sprintf("%d", p.CurrentRevision),
-		}, "\x00")))
-		key = "request-replan-tool:" + hex.EncodeToString(sum[:])
-	}
-	req, err := g.Coordinator.RequestReplan(ctx, model.ReplanRequest{
-		PlanID: p.ID, SourceTaskID: task.ID, SourceEvent: "request_replan_tool",
-		ReasonCode: reason, Detail: detail, Urgency: model.ReplanUrgency(urgency),
-		ObservedRevision: p.CurrentRevision, ObservedStateVersion: p.ExecutionStateVersion,
-		IdempotencyKey: key,
-	})
-	if err != nil {
-		return "", err
-	}
-	if req.ObservedStateVersion > p.ExecutionStateVersion {
-		latest, _ := g.Coordinator.Store().GetPlan(p.ID)
-		trace.Emit(trace.Event{Kind: trace.KindReplanRequested, TaskID: task.ID,
-			Reason: req.ReasonCode, Plan: planTraceForTool(latest)})
-	}
-	return "ReplanRequest 已持久化: " + req.ID, nil
-}
+	marker := replanRequestMarker(task.ID)
 
-func (g PlanControlGroup) supersedeTasks(ctx context.Context, args map[string]any) (string, error) {
-	controller, p, err := g.currentController()
-	if err != nil {
-		return "", err
-	}
-	retireRaw, _ := args["retire_task_ids"].(string)
-	replacementRaw, _ := args["replacement_task_ids"].(string)
-	reason, _ := args["reason"].(string)
-	retireTaskIDs := splitList(retireRaw)
-	ctx = plan.WithControllerAuthority(ctx, controller.ID)
-	updated, err := g.Coordinator.SupersedeExisting(ctx, plan.SupersedeExistingInput{
-		PlanID: p.ID, ObservedRevision: p.CurrentRevision,
-		RetireTaskIDs: retireTaskIDs, ReplacementTaskIDs: splitList(replacementRaw), Reason: reason,
-	})
-	if err != nil {
-		return "", err
-	}
-	trace.Emit(trace.Event{Kind: trace.KindPlanRevisionChanged, TaskID: controller.ID, Reason: reason, Plan: planTraceForTool(updated)})
-	var cancelFailures []string
-	for _, taskID := range retireTaskIDs {
-		task, taskErr := g.Store.GetTask(taskID)
-		if taskErr != nil {
-			cancelFailures = append(cancelFailures, fmt.Sprintf("%s: %v", taskID, taskErr))
-			continue
-		}
-		if model.IsTerminal(task.Status) {
-			continue
-		}
-		if cancelErr := store.TransitionStateWithCancelSource(g.Store, taskID, task.Status, model.TaskStatusCancelled, "scheduler"); cancelErr != nil {
-			// A concurrent terminal transition is sufficient: the safety invariant is
-			// that no retired Task remains claimable after supersede returns.
-			latest, latestErr := g.Store.GetTask(taskID)
-			if latestErr == nil && model.IsTerminal(latest.Status) {
+	// 幂等查重：同一任务的未处理同类请求只保留一个唤醒任务。
+	// MemoryTaskStore.ScanAll 永不返回错误；其它实现扫描失败时退化为直接
+	// 发布（多一个唤醒任务无害，Scheduler 裁决天然幂等）。
+	if tasks, err := g.Store.ScanAll(); err == nil {
+		for _, t := range tasks {
+			if t == nil || t.EventType != "__scheduler__" || model.IsTerminal(t.Status) {
 				continue
 			}
-			cancelFailures = append(cancelFailures, fmt.Sprintf("%s: %v", taskID, cancelErr))
+			if strings.Contains(t.Description, marker) {
+				return fmt.Sprintf("本任务的 replan 请求已登记（唤醒任务 %s 待处理），无需重复请求；请继续完成当前任务", t.ID), nil
+			}
 		}
 	}
-	if len(cancelFailures) > 0 {
-		blockReason := "supersede cancellation failed: " + strings.Join(cancelFailures, "; ")
-		if _, blockErr := g.Coordinator.MarkBlocked(ctx, p.ID, blockReason); blockErr != nil {
-			return "", fmt.Errorf("%s; additionally failed to block plan %s: %w", blockReason, p.ID, blockErr)
+
+	// 审计事实由唤醒任务自身的 task_published 事件承担（描述含幂等标记、
+	// reason_code 与 detail），C6c 起不再单独 emit replan 时代事件。
+	description := fmt.Sprintf(
+		"%s\n任务 %s（event_type=%s）在执行中请求 replan。\nreason_code=%s urgency=%s\n详情：%s\n处理指引：读取公告板当前任务状态，裁决是否需要补充/调整后续任务编排；判断无需调整时直接结束本任务。",
+		marker, task.ID, task.EventType, reason, urgency, detail)
+	wake := &model.Task{
+		Description:    description,
+		EventType:      "__scheduler__",
+		EventSource:    "replan-request",
+		ParentTaskID:   task.ID,
+		MaxConcurrency: 1, // 同一时刻只允许一个 Scheduler 处理同一请求
+	}
+	if err := g.Store.PublishTask(wake); err != nil {
+		return "", fmt.Errorf("发布 replan 唤醒任务失败: %w", err)
+	}
+	return fmt.Sprintf("Replan 请求已登记并唤醒 Scheduler（唤醒任务 %s）。Scheduler 将裁决后续编排；请继续完成当前任务，不要等待裁决结果。", wake.ID), nil
+}
+
+// graphChangeRequestID 是 graph change 请求的确定性幂等键：同一 activation
+// 的重复请求共享同一 ID，据此查重，避免唤醒任务刷屏。
+func graphChangeRequestID(task *model.Task) string {
+	return task.GraphID + "/" + task.ActivationID + "/change"
+}
+
+// graphChangeMarker 是唤醒任务描述中的幂等标记（含 requestID），查重按
+// 该子串匹配；同时让 Scheduler 一眼识别任务来源。
+func graphChangeMarker(requestID string) string {
+	return "[graph-change-request: " + requestID + "]"
+}
+
+// requestGraphChange 是 request_replan 的图任务路径（C5d）：
+//  1. emit graph_change_requested 审计事件（图/节点/activation + 请求者任务）；
+//  2. 向公告板发布 __scheduler__ 唤醒任务，Scheduler 认领后用 patch_graph 裁决；
+//  3. 同一 activation 已有未处理（非终态）的同类唤醒任务时幂等返回，不重复发布。
+//
+// 唤醒任务刻意不携带 GraphID/NodeID/ActivationID：它是 Scheduler 的控制面
+// 输入而非图节点任务，带图身份会被 graph-terminal-feed 当作节点终态回填引擎。
+func (g PlanControlGroup) requestGraphChange(task *model.Task, args map[string]any) (string, error) {
+	reason, _ := args["reason_code"].(string)
+	urgency, _ := args["urgency"].(string)
+	detail, _ := args["detail"].(string)
+	requestID := graphChangeRequestID(task)
+	marker := graphChangeMarker(requestID)
+
+	// 幂等查重：同一 (graph_id, activation_id) 的未处理同类请求只保留一个
+	// 唤醒任务。MemoryTaskStore.ScanAll 永不返回错误；其它实现扫描失败时
+	// 退化为直接发布（多一个唤醒任务无害，Scheduler 裁决天然幂等）。
+	if tasks, err := g.Store.ScanAll(); err == nil {
+		for _, t := range tasks {
+			if t == nil || t.EventType != "__scheduler__" || model.IsTerminal(t.Status) {
+				continue
+			}
+			if strings.Contains(t.Description, marker) {
+				return fmt.Sprintf("同一 activation 的 graph change 请求已登记（唤醒任务 %s 待处理），无需重复请求；请继续完成当前任务", t.ID), nil
+			}
 		}
-		return "", fmt.Errorf("%s; plan %s was explicitly blocked", blockReason, p.ID)
 	}
-	return fmt.Sprintf("PlanRevision=%d，已退休并终止 %d 个节点", updated.CurrentRevision, len(retireTaskIDs)), nil
-}
 
-func (g PlanControlGroup) finalizePlan(ctx context.Context, args map[string]any) (string, error) {
-	controller, p, err := g.currentController()
-	if err != nil {
-		return "", err
-	}
-	verdict, _ := args["verdict"].(string)
-	ctx = plan.WithControllerAuthority(ctx, controller.ID)
-	final, err := g.Coordinator.Finalize(ctx, p.ID, model.AcceptanceVerdict(verdict))
-	if err != nil {
-		return "", err
-	}
-	emitPlanTerminal(controller.ID, final)
-	return fmt.Sprintf("Plan %s 已进入终态 %s", final.ID, final.Status), nil
-}
+	trace.Emit(trace.Event{
+		Kind: trace.KindGraphChangeRequested, TaskID: task.ID,
+		GraphID: task.GraphID, NodeID: task.NodeID, ActivationID: task.ActivationID,
+		Reason: reason, Description: detail,
+	})
 
-func (g PlanControlGroup) markPlanBlocked(ctx context.Context, args map[string]any) (string, error) {
-	controller, p, err := g.currentController()
-	if err != nil {
-		return "", err
+	description := fmt.Sprintf(
+		"%s\n图 %s 的节点 %s（activation %s）在执行中请求 graph change。\nreason_code=%s urgency=%s\n详情：%s\n请求者任务：%s（event_type=%s）\n处理指引：读取该图当前状态（当前 revision），用 patch_graph（base_revision CAS）裁决是否修改；冲突时重新读取最新 revision 再改；判断无需修改时直接结束本任务。",
+		marker, task.GraphID, task.NodeID, task.ActivationID, reason, urgency, detail, task.ID, task.EventType)
+	wake := &model.Task{
+		Description:    description,
+		EventType:      "__scheduler__",
+		EventSource:    "graph-change-request",
+		ParentTaskID:   task.ID,
+		MaxConcurrency: 1, // 与用户请求一致：同一时刻只允许一个 Scheduler 处理同一请求
 	}
-	reason, _ := args["reason"].(string)
-	ctx = plan.WithControllerAuthority(ctx, controller.ID)
-	updated, err := g.Coordinator.MarkBlocked(ctx, p.ID, reason)
-	if err != nil {
-		return "", err
+	if err := g.Store.PublishTask(wake); err != nil {
+		return "", fmt.Errorf("发布 graph change 唤醒任务失败: %w", err)
 	}
-	return fmt.Sprintf("Plan %s 已挂起等待用户决策: %s", updated.ID, reason), nil
-}
-
-// submitPlanForReview 是 plan-gate 模式的计划提交入口。仅 gate=plan 时
-// 真正挂起：PauseForReview 把 Plan 置为 paused_awaiting_decision
-// （PauseReason=plan_review）并把计划全文持久化到 Plan.Review。Interaction
-// handler 据此把计划文本复制进新 controller 任务，或进入修订/取消路径。
-// gate≠plan 与重复提交都幂等返回中文提示，不报错。
-func (g PlanControlGroup) submitPlanForReview(ctx context.Context, args map[string]any) (string, error) {
-	controller, p, err := g.currentController()
-	if err != nil {
-		return "", err
-	}
-	if g.Modes == nil || g.Modes.GetGate() != modes.GatePlan {
-		return "当前不是 plan 模式，无需提交审阅：系统不会挂起 Plan，请直接按决策树继续执行", nil
-	}
-	planText, _ := args["plan"].(string)
-	if strings.TrimSpace(planText) == "" {
-		return "", fmt.Errorf("plan 参数不能为空：请提交完整的执行计划文本（任务分解/预期产物/执行顺序）")
-	}
-	// 幂等：已处于 plan_review 的重复提交不覆盖首次提交的计划文本。
-	if p.Status == model.PlanStatusPausedAwaitingDecision && p.PauseReason == plan.PauseReasonPlanReview {
-		return fmt.Sprintf("Plan %s 已在等待用户审阅，无需重复提交；请结束当前回合等待用户决定", p.ID), nil
-	}
-	ctx = plan.WithControllerAuthority(ctx, controller.ID)
-	updated, err := g.Coordinator.PauseForReview(ctx, p.ID, "gate=plan：执行计划已提交，等待用户审阅", planText)
-	if err != nil {
-		return "", err
-	}
-	log.Printf("[plan-gate] Plan %s 已挂起等待用户审阅（控制面已创建 plan_review Interaction）", updated.ID)
-	return fmt.Sprintf("Plan %s 已挂起等待用户审阅。计划已提交，请用一句话告知用户『计划已提交等待审阅』并结束当前回合——收到 Interaction 响应前禁止发布任何执行任务；选择执行后系统会以新 controller 任务唤醒你按已审阅计划执行。", updated.ID), nil
-}
-
-func (g PlanControlGroup) getRetiredNode(_ context.Context, args map[string]any) (string, error) {
-	_, p, err := g.current()
-	if err != nil {
-		return "", err
-	}
-	taskID, _ := args["task_id"].(string)
-	node, ok := p.Nodes[taskID]
-	if !ok || node.RetiredRevision == 0 {
-		return "", fmt.Errorf("retired node %s not found", taskID)
-	}
-	data, _ := json.MarshalIndent(node, "", "  ")
-	return string(data), nil
-}
-
-func (g PlanControlGroup) getAcceptanceEvidence(_ context.Context, args map[string]any) (string, error) {
-	_, p, err := g.current()
-	if err != nil {
-		return "", err
-	}
-	resultID, _ := args["result_id"].(string)
-	result, err := g.Coordinator.Store().GetAcceptanceResult(p.ID, resultID)
-	if err != nil {
-		return "", err
-	}
-	data, _ := json.MarshalIndent(result, "", "  ")
-	return string(data), nil
+	return fmt.Sprintf("Graph change 请求已登记并唤醒 Scheduler：graph=%s node=%s activation=%s（唤醒任务 %s）。Scheduler 将用 patch_graph 裁决是否修改图定义；请继续完成当前任务，不要等待改图结果。",
+		task.GraphID, task.NodeID, task.ActivationID, wake.ID), nil
 }
 
 func splitList(raw string) []string {
 	var out []string
 	for _, item := range strings.Split(raw, ",") {
-		if item = strings.TrimSpace(item); item != "" {
-			out = append(out, item)
-		}
-	}
-	return out
-}
-
-func splitLines(raw string) []string {
-	var out []string
-	for _, item := range strings.Split(raw, "\n") {
 		if item = strings.TrimSpace(item); item != "" {
 			out = append(out, item)
 		}
@@ -469,26 +213,4 @@ func intArg(args map[string]any, key string) int {
 	default:
 		return 0
 	}
-}
-
-func planTraceForTool(p *model.Plan) *trace.PlanTraceContext {
-	if p == nil {
-		return nil
-	}
-	return &trace.PlanTraceContext{
-		PlanID: p.ID, PlanRevision: p.CurrentRevision,
-		ExecutionStateVersion:  p.ExecutionStateVersion,
-		AcceptanceSpecRevision: p.CurrentAcceptanceSpecRevision,
-		GraphDigest:            p.CurrentGraphDigest,
-	}
-}
-
-func emitPlanTerminal(taskID string, p *model.Plan) {
-	if p == nil || !model.IsPlanTerminal(p.Status) {
-		return
-	}
-	trace.Emit(trace.Event{
-		Kind: trace.KindPlanTerminal, TaskID: taskID,
-		Reason: string(p.Status), Plan: planTraceForTool(p),
-	})
 }

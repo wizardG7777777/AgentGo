@@ -20,9 +20,9 @@ type mockMailboxHook struct {
 	callN    *atomic.Int32
 }
 
-func (m *mockMailboxHook) Name() string             { return m.name }
-func (m *mockMailboxHook) Phase() MailboxHookPhase  { return m.phase }
-func (m *mockMailboxHook) Priority() int            { return m.priority }
+func (m *mockMailboxHook) Name() string            { return m.name }
+func (m *mockMailboxHook) Phase() MailboxHookPhase { return m.phase }
+func (m *mockMailboxHook) Priority() int           { return m.priority }
 func (m *mockMailboxHook) Run(hctx MailboxHookContext) MailboxHookDecision {
 	if m.callN != nil {
 		m.callN.Add(1)
@@ -40,9 +40,9 @@ type panickingMailboxHook struct {
 	priority int
 }
 
-func (p *panickingMailboxHook) Name() string                                            { return p.name }
-func (p *panickingMailboxHook) Phase() MailboxHookPhase                                 { return p.phase }
-func (p *panickingMailboxHook) Priority() int                                           { return p.priority }
+func (p *panickingMailboxHook) Name() string            { return p.name }
+func (p *panickingMailboxHook) Phase() MailboxHookPhase { return p.phase }
+func (p *panickingMailboxHook) Priority() int           { return p.priority }
 func (p *panickingMailboxHook) Run(hctx MailboxHookContext) MailboxHookDecision {
 	panic("测试用 panic")
 }

@@ -5,11 +5,10 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"unicode/utf8"
+	"time"
 
 	"agentgo/internal/memory"
 	"agentgo/internal/roster"
-	"agentgo/internal/trace"
 )
 
 // memory_context.go 是 v5 Phase 1 Memory System 的 Agent 侧读取/写入逻辑，
@@ -30,19 +29,6 @@ import (
 // memoryRefreshIntervalDefault 是默认的 team snapshot 刷新间隔（轮数），
 // 与 v4 TeamAwarenessConfig.SnapshotRefreshInterval 保持一致。
 const memoryRefreshIntervalDefault = 5
-
-// 注入审计事件使用 trace.KindMemoryContextInject（已登记 internal/trace/event.go，
-// 并同步 dashboard.TraceEventKinds 与 userdef loader knownEventKinds——
-// TUI/Web 事件流可见，用户 YAML reactor 可订阅）。
-//
-// 不复用现有 Kind 的评估记录：
-//   - KindProgressNotify：语义是"进度通知 mailbox 消息已发送"，且受
-//     progress_notify_enabled 开关控制，注入埋点挂它会伪造通知审计事实
-//   - KindHistoryCompaction/Truncated：trace-history-event reactor 按 Kind
-//     累加压缩/截断计数器，注入事件会污染计数
-//   - KindTokenStats：UI Hub 按它累加 session token 顶栏总数
-//   - KindFileWritten/KindToolResult：record-artifact / read-set-write
-//     reactor 的输入，语义更远
 
 // teamSnapshotKey 构造 per-agent team_snapshot 在 Memory 中的检索键。
 //
@@ -74,9 +60,6 @@ func fileAwarenessKey(agentID string) string {
 // hasNewMail 为 true 时强制刷新 team_snapshot（与 v4 ForceOnMail=true 一致）。
 //
 // nil-safe：a.Memory 为 nil 时直接返回 ""，等价于禁用本特性。
-//
-// 审计埋点：每个实际注入 history 的 section 发射一条 trace.KindMemoryContextInject
-// 事件（详见 emitMemoryContextInject）；未注入（提前返回或 section 为空）不发。
 func (a *Agent) injectMemoryContext(ctx context.Context, taskID string, loopIdx int, hasNewMail bool) string {
 	if a.Memory == nil {
 		return ""
@@ -141,60 +124,39 @@ func (a *Agent) injectMemoryContext(ctx context.Context, taskID string, loopIdx 
 		}
 	}
 
-	// 埋点必须基于 Query 回读的拼装结果（即真正进入 history 的最终文本），
+	// 注入文本必须基于 Query 回读的拼装结果（即真正进入 history 的最终文本），
 	// 而不是上面 write-through 的计算值——Query 可能命中回退键或更早的条目，
-	// 两者内容会分叉。空 section 不参与拼接（未注入），按"未注入不发事件"
-	// 原则跳过。
-	snapshot, snapKey := a.queryMemoryContext(ctx, teamSnapshotKey(a.ID), "team_snapshot")
-	fileAwareness, faKey := a.queryMemoryContext(ctx, fileAwarenessKey(a.ID), "file_awareness")
-	if snapshot != "" {
-		a.emitMemoryContextInject(taskID, loopIdx, "team_snapshot", snapKey, snapshot)
-	}
-	if fileAwareness != "" {
-		a.emitMemoryContextInject(taskID, loopIdx, "file_awareness", faKey, fileAwareness)
+	// 两者内容会分叉。空 section 不参与拼接（未注入）。
+	snapshot, _, snapshotAt := a.queryMemoryContext(ctx, teamSnapshotKey(a.ID), "team_snapshot")
+	fileAwareness, _, fileAwarenessAt := a.queryMemoryContext(ctx, fileAwarenessKey(a.ID), "file_awareness")
+	// CM1：把各段实际命中 Entry 的 UpdatedAt 记录到 Manifest 侧信息，
+	// executor 构建 Context Manifest 时据此判定 memory_* 段的 live/stale。
+	// 仅当段内容非空（真正进入 history）才记录。
+	if info := manifestSideInfoFromContext(ctx); info != nil {
+		if strings.TrimSpace(snapshot) != "" {
+			info.recordMemorySectionUpdatedAt(markerTeamSnapshot, snapshotAt)
+		}
+		if strings.TrimSpace(fileAwareness) != "" {
+			info.recordMemorySectionUpdatedAt(markerFileAwareness, fileAwarenessAt)
+		}
 	}
 	return joinSections(snapshot, fileAwareness)
 }
 
-// emitMemoryContextInject 为单个实际注入 history 的 Memory section 发射一条
-// 审计事件（kind = memory_context_inject）。字段约定（全部复用 trace.Event
-// 现有字段，无 schema 改动；消费方均先按 Kind 分派再读字段，跨 Kind 复用安全）：
-//   - NotifyType：section 来源（team_snapshot / file_awareness）
-//   - Path：实际命中的 Memory 检索键（含回退键，如 team_snapshot:worker-1）
-//   - OutputLen：注入文本的 rune 数（中文场景比字节数更贴近上下文占用，
-//     与 get_task_result 按 rune 分页的口径一致）
-//   - Description：人类可读摘要（trace CLI 默认分支展示 desc=）
-//   - Loop：注入发生点（-1=任务入口，>0=第 N 轮刷新）
-//
-// content 必须是即将拼进 history 的最终文本；调用方保证非空（空=未注入，不发）。
-func (a *Agent) emitMemoryContextInject(taskID string, loopIdx int, section, key, content string) {
-	runes := utf8.RuneCountInString(content)
-	trace.Emit(trace.Event{
-		Kind:        trace.KindMemoryContextInject,
-		TaskID:      taskID,
-		AgentID:     a.ID,
-		Loop:        loopIdx,
-		NotifyType:  section,
-		Path:        key,
-		OutputLen:   runes,
-		Description: fmt.Sprintf("memory 上下文注入: source=%s key=%s runes=%d", section, key, runes),
-	})
-}
-
-// queryMemoryContext 按 keys 顺序查询 Memory，返回第一条非空条目的内容与
-// 实际命中的 key（keys 是 per-agent 新键 + v4 全局旧键的回退序列；命中键
-// 对审计埋点有意义，调用方原样记入事件）。无命中时返回 ("", "")。
-func (a *Agent) queryMemoryContext(ctx context.Context, keys ...string) (string, string) {
+// queryMemoryContext 按 keys 顺序查询 Memory，返回第一条非空条目的内容、
+// 实际命中的 key 与条目 UpdatedAt（keys 是 per-agent 新键 + v4 全局旧键的
+// 回退序列）。无命中时返回 ("", "", 零值时间)。
+func (a *Agent) queryMemoryContext(ctx context.Context, keys ...string) (string, string, time.Time) {
 	for _, key := range keys {
 		entries, err := a.Memory.Query(ctx, memory.ScopeProcess, memory.KindContext, key, 1)
 		if err != nil || len(entries) == 0 {
 			continue
 		}
 		if content := strings.TrimSpace(entries[0].Content); content != "" {
-			return content, key
+			return content, key, entries[0].UpdatedAt
 		}
 	}
-	return "", ""
+	return "", "", time.Time{}
 }
 
 // joinSections 用空行拼接非空段。与 hook/builtin/team_awareness.go 同型函数语义一致。

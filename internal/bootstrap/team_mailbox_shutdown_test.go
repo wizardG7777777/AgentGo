@@ -14,7 +14,7 @@ import (
 	"agentgo/internal/agenttemplate"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
-	"agentgo/internal/plan"
+	"agentgo/internal/model"
 	"agentgo/internal/roster"
 	"agentgo/internal/runner"
 	"agentgo/internal/scheduler"
@@ -30,14 +30,13 @@ func (shutdownIdleLLM) Chat(context.Context, []llm.Message, []llm.ToolDef) (llm.
 }
 
 type shutdownMailboxTestEnv struct {
-	sys         *System
-	mailboxes   *mailbox.Registry
-	sessionDir  string
-	agentID     string
-	eventType   string
-	catalog     *agenttemplate.Catalog
-	coordinator *plan.Coordinator
-	durable     team.TeamStore
+	sys        *System
+	mailboxes  *mailbox.Registry
+	sessionDir string
+	agentID    string
+	eventType  string
+	catalog    *agenttemplate.Catalog
+	durable    team.TeamStore
 }
 
 func newShutdownMailboxTestEnv(t *testing.T) *shutdownMailboxTestEnv {
@@ -52,13 +51,6 @@ func newShutdownMailboxTestEnv(t *testing.T) *shutdownMailboxTestEnv {
 	if err != nil {
 		t.Fatalf("load template catalog: %v", err)
 	}
-	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
-	createdPlan, err := coordinator.Create(context.Background(), plan.CreateInput{
-		PlanID: "plan-shutdown-mailbox", RootTaskID: "controller-shutdown-mailbox",
-	})
-	if err != nil {
-		t.Fatalf("create plan: %v", err)
-	}
 
 	taskStore := store.NewMemoryTaskStore(nil, 100, 1, 30)
 	mailboxes := mailbox.NewRegistry(8)
@@ -67,17 +59,17 @@ func newShutdownMailboxTestEnv(t *testing.T) *shutdownMailboxTestEnv {
 	manager := team.NewManager(
 		runner.RunnerDeps{
 			Store: taskStore, Roster: r, MBRegistry: mailboxes,
-			PlanCoordinator: coordinator, ProjectRoot: t.TempDir(),
+			ProjectRoot: t.TempDir(),
 		},
 		func(string) llm.Client { return shutdownIdleLLM{} },
-		catalog, coordinator, durable, scheduler.NewAgentRegistry(), 1,
+		catalog, durable, scheduler.NewAgentRegistry(), 1,
 	)
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatalf("TeamManager Start: %v", err)
 	}
 	provisioned, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
-		PlanID: createdPlan.ID, ControllerTaskID: "controller-shutdown-mailbox",
-		TemplateRef: "builtin/explorer@1", Purpose: "persist shutdown unread mail", Replicas: 1,
+		ControllerTaskID: "controller-shutdown-mailbox",
+		TemplateRef:      "builtin/explorer@1", Purpose: "persist shutdown unread mail", Replicas: 1,
 	})
 	if err != nil {
 		manager.Shutdown()
@@ -108,7 +100,7 @@ func newShutdownMailboxTestEnv(t *testing.T) *shutdownMailboxTestEnv {
 	return &shutdownMailboxTestEnv{
 		sys: sys, mailboxes: mailboxes, sessionDir: sessionDir,
 		agentID: agentID, eventType: provisioned.EventType,
-		catalog: catalog, coordinator: coordinator, durable: durable,
+		catalog: catalog, durable: durable,
 	}
 }
 
@@ -129,13 +121,21 @@ func TestSystemShutdownSnapshotsDynamicTeamUnreadMailboxBeforeCleanup(t *testing
 
 	// 真正用同一 durable TeamStore 重建 TeamManager，验证 System.Shutdown
 	// 产出的 snapshot 能贯通 ImportSnapshot → Start → stable-ID claim。
+	// Team 恢复要求 controller 任务存活（manager.Start 对 controller 缺失的
+	// Team 标记 stopped 并跳过）：模拟真实重启时 controller 任务随快照恢复。
+	restoredTasks := store.NewMemoryTaskStore(nil, 100, 1, 30)
+	if err := restoredTasks.PublishTask(&model.Task{
+		ID: "controller-shutdown-mailbox", Description: "recovered controller", EventType: "__scheduler__",
+	}); err != nil {
+		t.Fatalf("恢复 controller 任务: %v", err)
+	}
 	restartedManager := team.NewManager(
 		runner.RunnerDeps{
-			Store: store.NewMemoryTaskStore(nil, 100, 1, 30), Roster: roster.NewMemoryRoster(),
-			MBRegistry: restarted, PlanCoordinator: env.coordinator, ProjectRoot: t.TempDir(),
+			Store: restoredTasks, Roster: roster.NewMemoryRoster(),
+			MBRegistry: restarted, ProjectRoot: t.TempDir(),
 		},
 		func(string) llm.Client { return shutdownIdleLLM{} },
-		env.catalog, env.coordinator, env.durable, scheduler.NewAgentRegistry(), 1,
+		env.catalog, env.durable, scheduler.NewAgentRegistry(), 1,
 	)
 	if err := restartedManager.Start(context.Background()); err != nil {
 		t.Fatalf("restarted TeamManager Start: %v", err)

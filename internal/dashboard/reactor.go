@@ -12,9 +12,7 @@ type TraceSink interface {
 }
 
 // TraceEventKinds 是 TraceReactor 订阅的事件集合：与
-// internal/reactor/userdef/loader.go 的 knownEventKinds 白名单保持一致
-// （已含 plan/replan 类事件：replan_requested/coalesced/decided、
-// plan_revision_changed、acceptance_completed、plan_paused、plan_terminal）。
+// internal/reactor/userdef/loader.go 的 knownEventKinds 白名单保持一致。
 // shell_timeout_pending/resolved 暂无发射点（loader.go reservedEventKinds），
 // 不订阅。新增 trace.EventKind 时此处需同步。
 var TraceEventKinds = []trace.EventKind{
@@ -32,23 +30,13 @@ var TraceEventKinds = []trace.EventKind{
 	trace.KindToolCall,
 	trace.KindToolResult,
 	trace.KindHistoryCompaction,
-	trace.KindHistoryTruncated,
-	trace.KindTokenStats,
 	trace.KindFileWritten,
 	trace.KindFileWriteQueued,
 	trace.KindProgressNotify,
-	trace.KindMemoryContextInject,
 	trace.KindError,
 	trace.KindAgentStateChanged,
 	trace.KindShellExecuted,
 	trace.KindReactorSpawnDepthExceeded,
-	trace.KindReplanRequested,
-	trace.KindReplanCoalesced,
-	trace.KindReplanDecided,
-	trace.KindPlanRevisionChanged,
-	trace.KindAcceptanceCompleted,
-	trace.KindPlanPaused,
-	trace.KindPlanTerminal,
 	// workspace 隔离生命周期四事件（发射点：workspace.Manager + watchdog）。
 	trace.KindWorkspaceMaterialized,
 	trace.KindWorkspaceMerged,
@@ -61,8 +49,8 @@ var TraceEventKinds = []trace.EventKind{
 // 纯观测旁路：Async（失败仅记日志）、低优先级 950（观察类 900-1000 段，
 // 与 trace-history-event 同档）。nil sink 安全（未装配 UI Hub 时 no-op）。
 //
-// 速率说明：订阅集合含高频 kind（llm_call_start/end、tool_call/result、
-// token_stats）。Run 只做一次非阻塞广播（Hub 侧 drop-oldest），本身微秒级，
+// 速率说明：订阅集合含高频 kind（llm_call_start/end、tool_call/result）。
+// Run 只做一次非阻塞广播（Hub 侧 drop-oldest），本身微秒级，
 // 远低于 reactor 默认 256 在途上限的触发门槛。
 type TraceReactor struct {
 	sink TraceSink

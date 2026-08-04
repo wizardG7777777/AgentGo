@@ -362,8 +362,6 @@ func TestSaveLoadSnapshot_RoundTrip(t *testing.T) {
 				Depth:          1,
 				CreatedAt:      "2026-04-15T10:00:00Z",
 				StartedAt:      "2026-04-15T10:01:00Z",
-				PlanID:         "plan-1",
-				NodeRole:       "acceptance",
 				LastHistory:    []byte(`[{"output":"done"}]`),
 				ToolCalls: []ToolCallSnapshot{{
 					Timestamp: "2026-04-15T10:01:01.123456789Z",

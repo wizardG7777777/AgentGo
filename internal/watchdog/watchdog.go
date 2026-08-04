@@ -20,6 +20,9 @@ import (
 // PlanRouteRegistry is the smallest runtime-routing authority Watchdog needs.
 // scheduler.AgentRegistry satisfies it without making watchdog depend on the
 // scheduler package.
+//
+// C6b 注：方法签名中的 planID 是 scheduler 侧路由鉴权的历史形参（watchdog
+// 已无 Plan 概念，恒传空串）；watchdog 自身只按 eventType 判定路由存在性。
 type PlanRouteRegistry interface {
 	CanRouteForPlan(planID, eventType string, requiredTools ...string) bool
 }
@@ -28,34 +31,33 @@ type PlanRouteRegistry interface {
 // claim it. It intentionally reports route existence only; worker busy/idle
 // capacity is not inferred here.
 type RouteResolver interface {
-	HasRunnableRoute(planID, eventType string) bool
+	HasRunnableRoute(eventType string) bool
 }
 
 // RouteResolverFunc adapts a function to RouteResolver.
-type RouteResolverFunc func(planID, eventType string) bool
+type RouteResolverFunc func(eventType string) bool
 
-func (f RouteResolverFunc) HasRunnableRoute(planID, eventType string) bool {
-	return f != nil && f(planID, eventType)
+func (f RouteResolverFunc) HasRunnableRoute(eventType string) bool {
+	return f != nil && f(eventType)
 }
 
 // NewRuntimeRouteResolver adapts AgentRegistry while preserving the built-in
 // Scheduler route, which is not registered alongside ordinary worker routes.
 func NewRuntimeRouteResolver(registry PlanRouteRegistry) RouteResolver {
-	return RouteResolverFunc(func(planID, eventType string) bool {
+	return RouteResolverFunc(func(eventType string) bool {
 		if eventType == "__scheduler__" {
 			return true
 		}
-		return registry != nil && registry.CanRouteForPlan(planID, eventType)
+		return registry != nil && registry.CanRouteForPlan("", eventType)
 	})
 }
 
 type pendingObservationKind string
 
 const (
-	pendingObservationRoutable          pendingObservationKind = "routable"
-	pendingObservationUnroutable        pendingObservationKind = "unroutable"
-	pendingObservationAcceptanceBlocked pendingObservationKind = "acceptance_blocked"
-	defaultPendingGraceSec                                     = 300
+	pendingObservationRoutable   pendingObservationKind = "routable"
+	pendingObservationUnroutable pendingObservationKind = "unroutable"
+	defaultPendingGraceSec                              = 300
 )
 
 type pendingObservation struct {
@@ -157,7 +159,7 @@ func (w *Watchdog) checkTask(task *model.Task) {
 	}
 	switch task.Status {
 	case model.TaskStatusProcessing:
-		w.clearPendingObservationExcept(task.ID, pendingObservationAcceptanceBlocked)
+		w.clearPendingObservation(task.ID)
 		w.checkProcessingTask(task)
 	case model.TaskStatusPending:
 		w.checkPendingTask(task)
@@ -187,9 +189,6 @@ func (w *Watchdog) checkProcessingTask(task *model.Task) {
 	for _, depID := range task.Dependencies {
 		dep, err := w.Store.GetTask(depID)
 		if err != nil {
-			if w.guardAcceptanceCascade(task, depID, "missing", fmt.Sprintf("依赖任务 %s 不存在", depID)) {
-				return
-			}
 			log.Printf("[watchdog] task %s dependency %s not found (processing), cancelling", task.ID, depID)
 			if err := store.TransitionStateWithCancelSource(w.Store, task.ID, model.TaskStatusProcessing, model.TaskStatusCancelled, "dependency_failure"); err != nil {
 				log.Printf("[watchdog] 级联取消 task %s 失败: %v", task.ID, err)
@@ -200,9 +199,6 @@ func (w *Watchdog) checkProcessingTask(task *model.Task) {
 			return
 		}
 		if dep.Status == model.TaskStatusFailed || dep.Status == model.TaskStatusCancelled {
-			if w.guardAcceptanceCascade(task, depID, string(dep.Status), fmt.Sprintf("依赖任务 %s 已 %s", depID, dep.Status)) {
-				return
-			}
 			log.Printf("[watchdog] task %s dependency %s is %s (processing), cascade cancelling", task.ID, depID, dep.Status)
 			if err := store.TransitionStateWithCancelSource(w.Store, task.ID, model.TaskStatusProcessing, model.TaskStatusCancelled, "dependency_failure"); err != nil {
 				log.Printf("[watchdog] 级联取消 task %s 失败: %v", task.ID, err)
@@ -239,9 +235,6 @@ func (w *Watchdog) checkPendingTask(task *model.Task) {
 	for _, depID := range task.Dependencies {
 		dep, err := w.Store.GetTask(depID)
 		if err != nil {
-			if w.guardAcceptanceCascade(task, depID, "missing", fmt.Sprintf("依赖任务 %s 不存在", depID)) {
-				return
-			}
 			// 依赖缺失，视为失败
 			log.Printf("[watchdog] task %s dependency %s not found, cancelling", task.ID, depID)
 			reason := fmt.Sprintf("级联取消：依赖任务 %s 不存在", depID)
@@ -256,9 +249,6 @@ func (w *Watchdog) checkPendingTask(task *model.Task) {
 			return
 		}
 		if dep.Status == model.TaskStatusFailed || dep.Status == model.TaskStatusCancelled {
-			if w.guardAcceptanceCascade(task, depID, string(dep.Status), fmt.Sprintf("依赖任务 %s 已 %s", depID, dep.Status)) {
-				return
-			}
 			log.Printf("[watchdog] task %s dependency %s is %s, cascade cancelling", task.ID, depID, dep.Status)
 			reason := fmt.Sprintf("级联取消：依赖任务 %s 已 %s", depID, dep.Status)
 			if err := store.TransitionStateWithCancelSource(w.Store, task.ID, model.TaskStatusPending, model.TaskStatusCancelled, "dependency_failure"); err != nil {
@@ -288,9 +278,8 @@ func (w *Watchdog) checkPendingTask(task *model.Task) {
 		}
 	}
 
-	// QueryAvailable reuses the TaskStore's Plan CanClaim hook. A paused,
-	// blocked, retired, or otherwise control-plane-reserved Task must not age
-	// into a queue failure while it is deliberately ineligible for claiming.
+	// QueryAvailable 复用 TaskStore 的可认领性判定（依赖完成度、并发上限、
+	// per-node 能力）。被刻意保留为不可认领的任务不应在排队中老化为队列失败。
 	claimable, err := w.pendingTaskIsClaimable(task)
 	if err != nil {
 		log.Printf("[watchdog] task %s claimability probe failed: %v", task.ID, err)
@@ -309,7 +298,7 @@ func (w *Watchdog) checkPendingTask(task *model.Task) {
 		w.clearPendingObservation(task.ID)
 		return
 	}
-	if !w.RouteResolver.HasRunnableRoute(task.PlanID, task.EventType) {
+	if !w.RouteResolver.HasRunnableRoute(task.EventType) {
 		w.checkUnroutableTask(task)
 		return
 	}
@@ -341,8 +330,8 @@ func (w *Watchdog) checkUnroutableTask(task *model.Task) {
 	}
 
 	reason := fmt.Sprintf(
-		"no_compatible_route: event_type=%q plan_id=%q remained unavailable for %v",
-		task.EventType, task.PlanID, elapsed.Round(time.Second))
+		"no_compatible_route: event_type=%q remained unavailable for %v",
+		task.EventType, elapsed.Round(time.Second))
 	if !observation.alerted {
 		w.markPendingAlerted(task.ID, pendingObservationUnroutable, observation.since)
 		w.sendPendingAlert(task.ID, "no_compatible_route", reason)
@@ -381,31 +370,6 @@ func (w *Watchdog) observeUnroutable(taskID string, now time.Time) pendingObserv
 	return observation
 }
 
-// guardAcceptanceCascade 让 acceptance 角色的 dependent 免于级联取消：依赖
-// 已失败/取消/缺失时，验收任务的存废由 PlanCoordinator/Scheduler 经 replan
-// 决定（supersede 或重绑定目标），watchdog 只按租约告警一次，不直接终态化。
-// 返回 true 表示已接管，调用方应立即 return。
-func (w *Watchdog) guardAcceptanceCascade(task *model.Task, depID, depStatus, reason string) bool {
-	if task.NodeRole != model.PlanNodeRoleAcceptance || task.PlanID == "" {
-		return false
-	}
-	since := task.PendingSince
-	if task.Status == model.TaskStatusProcessing {
-		since = task.StartedAt
-	}
-	now := w.currentTime()
-	if since.IsZero() {
-		since = now
-	}
-	observation := w.observePending(task.ID, pendingObservationAcceptanceBlocked, since)
-	if !observation.alerted {
-		w.markPendingAlerted(task.ID, pendingObservationAcceptanceBlocked, observation.since)
-		w.sendPendingAlert(task.ID, "acceptance_dependency_lost", reason)
-		log.Printf("[watchdog] acceptance task %s dependency %s is %s; alerting control plane instead of cascade cancelling", task.ID, depID, depStatus)
-	}
-	return true
-}
-
 func (w *Watchdog) checkRoutableQueueWait(task *model.Task) {
 	now := w.currentTime()
 	since := task.PendingSince
@@ -422,8 +386,8 @@ func (w *Watchdog) checkRoutableQueueWait(task *model.Task) {
 	}
 
 	reason := fmt.Sprintf(
-		"claim_starvation: compatible route exists for event_type=%q plan_id=%q but current pending lease has waited %v; task remains pending",
-		task.EventType, task.PlanID, elapsed.Round(time.Second))
+		"claim_starvation: compatible route exists for event_type=%q but current pending lease has waited %v; task remains pending",
+		task.EventType, elapsed.Round(time.Second))
 	w.markPendingAlerted(task.ID, pendingObservationRoutable, observation.since)
 	w.sendPendingAlert(task.ID, "claim_starvation", reason)
 	log.Printf("[watchdog] task %s pending with runnable route: %s", task.ID, reason)
@@ -457,17 +421,6 @@ func (w *Watchdog) markPendingAlerted(taskID string, kind pendingObservationKind
 func (w *Watchdog) clearPendingObservation(taskID string) {
 	w.pendingMu.Lock()
 	delete(w.pendingObservations, taskID)
-	w.pendingMu.Unlock()
-}
-
-// clearPendingObservationExcept 清除除指定 kind 外的租约观测。processing 分支
-// 用它保留 acceptance_blocked 观测——验收豁免的告警租约横跨 processing 阶段，
-// 每轮清理会导致重复告警。
-func (w *Watchdog) clearPendingObservationExcept(taskID string, keep pendingObservationKind) {
-	w.pendingMu.Lock()
-	if observation, ok := w.pendingObservations[taskID]; ok && observation.kind != keep {
-		delete(w.pendingObservations, taskID)
-	}
 	w.pendingMu.Unlock()
 }
 

@@ -36,10 +36,10 @@ type MailboxContext struct {
 	UnreadCount int
 }
 
-func (c *MailboxContext) Phase() Phase            { return c.PhaseField }
-func (c *MailboxContext) AgentID() string         { return c.AgentIDField }
-func (c *MailboxContext) TaskID() string          { return c.TaskIDField }
-func (c *MailboxContext) Ctx() context.Context    { return c.CtxField }
+func (c *MailboxContext) Phase() Phase         { return c.PhaseField }
+func (c *MailboxContext) AgentID() string      { return c.AgentIDField }
+func (c *MailboxContext) TaskID() string       { return c.TaskIDField }
+func (c *MailboxContext) Ctx() context.Context { return c.CtxField }
 
 // 编译期断言 MailboxContext 实现 Context 接口。
 var _ Context = (*MailboxContext)(nil)

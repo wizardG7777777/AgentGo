@@ -15,26 +15,26 @@ func TestAgentRegistryRuntimeRoutesAreExactAndRemovable(t *testing.T) {
 	if err := reg.RegisterRoute("static:writer", "", "", 1, "writer", []string{"read_file", "write_file"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.RegisterRoute("team:verify", "team:verify", "plan-a", 1, "verifier", []string{"read_file", "submit_acceptance_result"}); err != nil {
+	if err := reg.RegisterRoute("team:verify", "team:verify", "ctrl-a", 1, "verifier", []string{"read_file", "submit_task_result"}); err != nil {
 		t.Fatal(err)
 	}
 	if !reg.CanRoute("") || !reg.CanRoute("", "write_file") {
 		t.Fatal("default static route should be ready with its own capabilities")
 	}
-	if !reg.CanRoute("team:verify", "read_file", "submit_acceptance_result") {
+	if !reg.CanRoute("team:verify", "read_file", "submit_task_result") {
 		t.Fatal("verifier route should satisfy its complete capability set")
 	}
 	if reg.CanRoute("team:verify", "run_shell") {
 		t.Fatal("route must not claim a capability it does not have")
 	}
-	if !reg.CanRouteForPlan("plan-a", "team:verify", "submit_acceptance_result") {
-		t.Fatal("dynamic Team route should be ready for its owning Plan")
+	if !reg.CanRouteForPlan("ctrl-a", "team:verify", "submit_task_result") {
+		t.Fatal("dynamic Team route should be ready for its owning scope")
 	}
-	if reg.CanRouteForPlan("plan-b", "team:verify") || reg.CanRouteForPlan("", "team:verify") {
-		t.Fatal("dynamic Team route must not be routable by another or unmanaged Plan")
+	if reg.CanRouteForPlan("ctrl-b", "team:verify") || reg.CanRouteForPlan("", "team:verify") {
+		t.Fatal("dynamic Team route must not be routable by another or unmanaged scope")
 	}
-	if !reg.CanRouteForPlan("plan-a", "", "write_file") || !reg.CanRouteForPlan("plan-b", "", "write_file") {
-		t.Fatal("static route should remain global across Plans")
+	if !reg.CanRouteForPlan("ctrl-a", "", "write_file") || !reg.CanRouteForPlan("ctrl-b", "", "write_file") {
+		t.Fatal("static route should remain global across scopes")
 	}
 	if !reg.UnregisterRoute("team:verify") || reg.CanRoute("team:verify") {
 		t.Fatal("unregistered dynamic route must stop being routable")
@@ -43,20 +43,20 @@ func TestAgentRegistryRuntimeRoutesAreExactAndRemovable(t *testing.T) {
 
 func TestAgentRegistryDoesNotUnionCapabilitiesAcrossSameRoute(t *testing.T) {
 	reg := NewAgentRegistry()
-	if err := reg.RegisterRoute("kind:submitter", "verify", "", 1, "submitter", []string{"submit_acceptance_result"}); err != nil {
+	if err := reg.RegisterRoute("kind:submitter", "verify", "", 1, "submitter", []string{"submit_task_result"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := reg.RegisterRoute("kind:shell", "verify", "", 1, "shell", []string{"run_shell"}); err != nil {
 		t.Fatal(err)
 	}
-	if reg.CanRoute("verify", "submit_acceptance_result", "run_shell") {
+	if reg.CanRoute("verify", "submit_task_result", "run_shell") {
 		t.Fatal("capabilities from incompatible agents sharing a route must not be unioned")
 	}
 }
 
 func TestAgentRegistryRequiresEveryListenerOnSharedRouteToBeCapable(t *testing.T) {
 	reg := NewAgentRegistry()
-	if err := reg.RegisterRoute("kind:verifier", "verify", "", 1, "verifier", []string{"submit_acceptance_result", "run_shell"}); err != nil {
+	if err := reg.RegisterRoute("kind:verifier", "verify", "", 1, "verifier", []string{"submit_task_result", "run_shell"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := reg.RegisterRoute("kind:readonly", "verify", "", 1, "readonly", []string{"read_file"}); err != nil {
@@ -65,7 +65,7 @@ func TestAgentRegistryRequiresEveryListenerOnSharedRouteToBeCapable(t *testing.T
 	if !reg.CanRoute("verify") {
 		t.Fatal("shared route with ready listeners should remain routable for unprivileged tasks")
 	}
-	if reg.CanRoute("verify", "submit_acceptance_result", "run_shell") {
+	if reg.CanRoute("verify", "submit_task_result", "run_shell") {
 		t.Fatal("a weaker listener could claim the privileged task")
 	}
 	entries := reg.Specialized()
@@ -80,30 +80,30 @@ func TestAgentRegistryRequiresEveryListenerOnSharedRouteToBeCapable(t *testing.T
 	}
 }
 
-func TestAgentRegistryPlanScopedViewsKeepStaticRoutesGlobalAndTeamsPrivate(t *testing.T) {
+func TestAgentRegistryOwnerScopedViewsKeepStaticRoutesGlobalAndTeamsPrivate(t *testing.T) {
 	reg := NewAgentRegistry()
 	if err := reg.RegisterRoute("static:research", "research", "", 1, "global research", []string{"read_file"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.RegisterRoute("team:a", "team:a", "plan-a", 1, "Plan A team", []string{"read_file"}); err != nil {
+	if err := reg.RegisterRoute("team:a", "team:a", "ctrl-a", 1, "ctrl-a team", []string{"read_file"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.RegisterRoute("team:b", "team:b", "plan-b", 1, "Plan B team", []string{"run_shell"}); err != nil {
+	if err := reg.RegisterRoute("team:b", "team:b", "ctrl-b", 1, "ctrl-b team", []string{"run_shell"}); err != nil {
 		t.Fatal(err)
 	}
 
 	if got := reg.Specialized(); len(got) != 3 {
 		t.Fatalf("global diagnostic view len=%d, want all 3 routes: %+v", len(got), got)
 	}
-	view := reg.SpecializedForPlan("plan-a")
+	view := reg.SpecializedForPlan("ctrl-a")
 	if len(view) != 2 || view[0].EventType != "research" || view[1].EventType != "team:a" {
-		t.Fatalf("Plan A view must contain global static + own Team only: %+v", view)
+		t.Fatalf("ctrl-a view must contain global static + own Team only: %+v", view)
 	}
-	if _, ok := reg.RouteCapabilitiesForPlan("plan-a", "team:b"); ok {
-		t.Fatal("Plan B Team capabilities leaked into Plan A view")
+	if _, ok := reg.RouteCapabilitiesForPlan("ctrl-a", "team:b"); ok {
+		t.Fatal("ctrl-b Team capabilities leaked into ctrl-a view")
 	}
-	if caps, ok := reg.RouteCapabilitiesForPlan("plan-b", "research"); !ok || !containsAll(caps, []string{"read_file"}) {
-		t.Fatalf("global static capabilities unavailable to Plan B: caps=%v ok=%v", caps, ok)
+	if caps, ok := reg.RouteCapabilitiesForPlan("ctrl-b", "research"); !ok || !containsAll(caps, []string{"read_file"}) {
+		t.Fatalf("global static capabilities unavailable to ctrl-b: caps=%v ok=%v", caps, ok)
 	}
 }
 

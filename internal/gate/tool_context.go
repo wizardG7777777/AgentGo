@@ -27,10 +27,10 @@ type ToolContext struct {
 // Phase / AgentID / TaskID / Ctx 实现 gate.Context 接口。
 // 字段名带 Field 后缀避免与方法名冲突——Go 允许同名 method 与 struct field 共存
 // 但读起来歧义太大，加后缀清晰可见。
-func (c *ToolContext) Phase() Phase            { return c.PhaseField }
-func (c *ToolContext) AgentID() string         { return c.AgentIDField }
-func (c *ToolContext) TaskID() string          { return c.TaskIDField }
-func (c *ToolContext) Ctx() context.Context    { return c.CtxField }
+func (c *ToolContext) Phase() Phase         { return c.PhaseField }
+func (c *ToolContext) AgentID() string      { return c.AgentIDField }
+func (c *ToolContext) TaskID() string       { return c.TaskIDField }
+func (c *ToolContext) Ctx() context.Context { return c.CtxField }
 
 // 编译期断言 ToolContext 实现 Context 接口。
 var _ Context = (*ToolContext)(nil)

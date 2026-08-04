@@ -9,7 +9,6 @@ import (
 
 	"agentgo/internal/bootstrap"
 	"agentgo/internal/config"
-	"agentgo/internal/eval"
 	"agentgo/internal/session"
 	"agentgo/internal/trace"
 )
@@ -23,7 +22,8 @@ func main() {
 			os.Exit(1)
 		}
 		traceDir := resolveTraceDir(cwd)
-		if err := trace.CLI(os.Args[2:], traceDir, os.Stdout); err != nil {
+		graphStateDir := filepath.Join(cwd, ".agentgo", "state", "graphs")
+		if err := trace.CLI(os.Args[2:], traceDir, graphStateDir, os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "[错误] %v\n", err)
 			os.Exit(1)
 		}
@@ -35,9 +35,12 @@ func main() {
 		os.Exit(config.CLI(os.Args[2:], os.Stdout, os.Stderr))
 	}
 
-	// 子命令路由：eval 族（当前含 preflight）做行为评测驱动，不启动主系统
+	// eval 子命令族已于 V6 移出 Release 二进制（docs/nextUpgrade-V6.md §7.6）：
+	// 行为评测（preflight/run/record）改由独立开发工具 agentgo-eval 承载
+	// （cmd/agentgo-eval）。显式拒绝，避免 "eval" 被当作游离参数静默启动主系统。
 	if len(os.Args) >= 2 && os.Args[1] == "eval" {
-		os.Exit(eval.CLI(os.Args[2:], os.Stdout, os.Stderr))
+		fmt.Fprintf(os.Stderr, "[错误] eval 子命令已于 V6 移出本二进制：行为评测请使用独立开发工具 agentgo-eval（go build -o agentgo-eval ./cmd/agentgo-eval）\n")
+		os.Exit(2)
 	}
 
 	configPath := flag.String("config", "setting.yaml", "配置文件路径")

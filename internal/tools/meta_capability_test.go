@@ -11,13 +11,13 @@ import (
 	"agentgo/internal/agent"
 )
 
-// schedulerCapableMeta 构造一个具备控制面权限（PlanMutationSource=scheduler）
+// schedulerCapableMeta 构造一个具备控制面权限（AllowNodeCapability=true）
 // 的 MetaGroup，与 scheduler 装配时的注入一致。
 func schedulerCapableMeta(s *fakeStore) MetaGroup {
-	return MetaGroup{Store: s, PlanMutationSource: "scheduler"}
+	return MetaGroup{Store: s, AllowNodeCapability: true}
 }
 
-// a. 写入权限：非控制面（Worker/Reactor 装配下 PlanMutationSource 为空）
+// a. 写入权限：非控制面（Worker/Reactor 装配下 AllowNodeCapability 为零值）
 // 携带 tools 或 model 参数必须被拒绝。
 func TestPublishTask_Capability_NonControlPlaneRejected(t *testing.T) {
 	cases := []struct {
@@ -31,7 +31,7 @@ func TestPublishTask_Capability_NonControlPlaneRejected(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newFakeStore()
-			// Worker 语义：PlanMutationSource 留空（bootstrap 对非 scheduler 不注入）。
+			// Worker 语义：AllowNodeCapability 留零值（bootstrap 对非 scheduler 不注入）。
 			g := MetaGroup{Store: s}
 			reg := agent.NewToolRegistry()
 			g.Register(reg)
@@ -173,7 +173,7 @@ func TestPublishTask_Capability_CompanionWarnings(t *testing.T) {
 // a. 写入权限：非控制面携带 isolation 参数必须被拒绝（与 tools/model 同款）。
 func TestPublishTask_Isolation_NonControlPlaneRejected(t *testing.T) {
 	s := newFakeStore()
-	// Worker 语义：PlanMutationSource 留空（bootstrap 对非 scheduler 不注入）。
+	// Worker 语义：AllowNodeCapability 留零值（bootstrap 对非 scheduler 不注入）。
 	g := MetaGroup{Store: s}
 	reg := agent.NewToolRegistry()
 	g.Register(reg)

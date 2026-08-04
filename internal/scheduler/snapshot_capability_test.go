@@ -27,7 +27,7 @@ func TestBuildBoardJSON_TaskCapabilityProjection(t *testing.T) {
 		t.Fatalf("publish plain: %v", err)
 	}
 
-	out := BuildBoardJSON(s, cfg, testModeSnap("immediate"), model.Event{Type: model.EventTickerWakeup}, SnapshotSources{})
+	out := BuildBoardJSON(s, cfg, testModeSnap(), model.Event{Type: model.EventTickerWakeup}, SnapshotSources{})
 
 	// 带 capability 的任务：tools 全量直放（量小，不做有界摘录）+ model 覆盖。
 	if !strings.Contains(out, `"capability"`) {

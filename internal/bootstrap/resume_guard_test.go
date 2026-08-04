@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"agentgo/internal/effect"
 	"agentgo/internal/model"
-	"agentgo/internal/plan"
 	"agentgo/internal/session"
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
@@ -15,6 +15,66 @@ import (
 
 type staleResumeTraceCapture struct {
 	events []trace.Event
+}
+
+func TestProtectUnknownEffectResumeQuarantinesMatchingNonTerminalTask(t *testing.T) {
+	now := time.Date(2026, 8, 4, 10, 0, 0, 0, time.UTC)
+	snap := &session.Snapshot{Tasks: []session.TaskSnapshot{
+		{
+			ID: "task-unknown", Status: string(model.TaskStatusProcessing), Agents: []string{"worker-1"},
+			Lease: &session.LeaseSnapshot{BusinessTools: []string{"run_shell"}, Digest: "lease-unknown"},
+		},
+		{ID: "task-clean", Status: string(model.TaskStatusPending)},
+		{ID: "task-done", Status: string(model.TaskStatusCompleted)},
+	}}
+	decisions := []effect.RecoveryDecision{
+		{EffectID: "task-unknown-1", TaskID: "task-unknown", Kind: effect.KindShell, Decision: effect.DecisionKeptUnknownManual},
+		// 已核验 settled 的裁决不得隔离任务。
+		{EffectID: "task-clean-1", TaskID: "task-clean", Kind: effect.KindFileWrite, Decision: effect.DecisionVerifiedSettled},
+	}
+
+	guarded, blocks := protectUnknownEffectResume(snap, decisions, now)
+	if len(blocks) != 1 || blocks[0].TaskID != "task-unknown" || blocks[0].Cause != "effect_recovery_unknown" {
+		t.Fatalf("unknown Effect 应产生一条任务 quarantine: %+v", blocks)
+	}
+	got := guarded.Tasks[0]
+	if got.Status != string(model.TaskStatusBlocked) ||
+		!strings.Contains(got.Error, "effect_recovery_quarantine") ||
+		!strings.Contains(got.Error, "task-unknown-1") ||
+		len(got.Agents) != 0 || got.CompletedAt == "" {
+		t.Fatalf("匹配的 processing 任务应被可见地 blocked: %+v", got)
+	}
+	if got.Lease == nil || !got.Lease.Revoked || got.Lease.Digest != "lease-unknown" {
+		t.Fatalf("quarantine 必须撤销既有执行租约且保留 digest: %+v", got.Lease)
+	}
+	if guarded.Tasks[1].Status != string(model.TaskStatusPending) || guarded.Tasks[2].Status != string(model.TaskStatusCompleted) {
+		t.Fatalf("已 settled/无 unknown 的任务不得受影响: %+v", guarded.Tasks)
+	}
+	if snap.Tasks[0].Status != string(model.TaskStatusProcessing) {
+		t.Fatal("不得原地修改 SessionManager 持有的恢复快照")
+	}
+	if snap.Tasks[0].Lease == nil || snap.Tasks[0].Lease.Revoked {
+		t.Fatal("不得通过共享 Lease 指针改写原始恢复快照")
+	}
+}
+
+func TestUnresolvedEffectTaskReasonsKeepsOnlyUnknownDecisions(t *testing.T) {
+	reasons := unresolvedEffectTaskReasons([]effect.RecoveryDecision{
+		{EffectID: "task-unknown-1", TaskID: "task-unknown", Kind: effect.KindShell, Decision: effect.DecisionKeptUnknownManual},
+		{EffectID: "task-unknown-2", TaskID: "task-unknown", Kind: effect.KindMessage, Decision: effect.DecisionReplayableHold},
+		{EffectID: "task-settled-1", TaskID: "task-settled", Kind: effect.KindFileWrite, Decision: effect.DecisionVerifiedSettled},
+		{EffectID: "missing-task", Kind: effect.KindShell, Decision: effect.DecisionKeptUnknownManual},
+	})
+
+	if len(reasons) != 1 {
+		t.Fatalf("Graph quarantine 索引应只保留有 task_id 的 unresolved Effect: %#v", reasons)
+	}
+	reason := reasons["task-unknown"]
+	for _, want := range []string{"effect_recovery_quarantine", "task-unknown-1", "task-unknown-2"} {
+		if !strings.Contains(reason, want) {
+			t.Fatalf("Graph quarantine 原因缺少 %q: %q", want, reason)
+		}
+	}
 }
 
 func (c *staleResumeTraceCapture) Dispatch(event trace.Event) {
@@ -27,8 +87,14 @@ func TestProtectStaleAutomaticResume(t *testing.T) {
 		Version: 3,
 		SavedAt: now.Add(-2 * time.Hour).Format(time.RFC3339Nano),
 		Tasks: []session.TaskSnapshot{
-			{ID: "pending", Status: string(model.TaskStatusPending), PendingSince: now.Add(-2 * time.Hour).Format(time.RFC3339Nano)},
-			{ID: "processing", Status: string(model.TaskStatusProcessing), Agents: []string{"worker-1"}},
+			{
+				ID: "pending", Status: string(model.TaskStatusPending), PendingSince: now.Add(-2 * time.Hour).Format(time.RFC3339Nano),
+				Lease: &session.LeaseSnapshot{BusinessTools: []string{"write_file"}, Digest: "pending-lease"},
+			},
+			{
+				ID: "processing", Status: string(model.TaskStatusProcessing), Agents: []string{"worker-1"},
+				Lease: &session.LeaseSnapshot{ControlTools: []string{"submit_task_result"}, Digest: "processing-lease"},
+			},
 			{ID: "completed", Status: string(model.TaskStatusCompleted)},
 		},
 		Mailboxes: []session.MailboxSnapshot{{
@@ -55,12 +121,18 @@ func TestProtectStaleAutomaticResume(t *testing.T) {
 		if len(task.Agents) != 0 || task.PendingSince != "" || task.CompletedAt == "" {
 			t.Fatalf("task %s terminal fields not normalized: %+v", task.ID, task)
 		}
+		if task.Lease == nil || !task.Lease.Revoked {
+			t.Fatalf("task %s terminal blocked 后仍持活租约: %+v", task.ID, task.Lease)
+		}
 	}
 	if got.Tasks[2].Status != string(model.TaskStatusCompleted) {
 		t.Fatalf("terminal task was changed: %+v", got.Tasks[2])
 	}
 	if original.Tasks[0].Status != string(model.TaskStatusPending) || original.Tasks[1].Status != string(model.TaskStatusProcessing) {
 		t.Fatal("原始快照被改写")
+	}
+	if original.Tasks[0].Lease.Revoked || original.Tasks[1].Lease.Revoked {
+		t.Fatal("陈旧保护不得通过共享 Lease 指针改写原始快照")
 	}
 	if len(got.Mailboxes) != 0 {
 		t.Fatalf("陈旧自动恢复不应重放 mailbox: %#v", got.Mailboxes)
@@ -121,46 +193,26 @@ func TestProtectStaleAutomaticResumeFailsClosedOnClearlyFutureSavedAt(t *testing
 	}
 }
 
-func TestPrepareRecoveredSnapshotOverlaysPlanTerminalFactBeforeStaleGuard(t *testing.T) {
-	_, coordinator := newPlannedStore(t, t.TempDir())
-	p, err := coordinator.Create(context.Background(), plan.CreateInput{
-		PlanID: "plan-terminal-overlay", RootTaskID: "root",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	p, err = coordinator.RegisterTask(context.Background(), plan.RegisterTaskInput{
-		PlanID: p.ID, ObservedRevision: p.CurrentRevision,
-		Node: model.PlanNode{
-			TaskID: "work-completed", Title: "completed before snapshot flush",
-			Role: model.PlanNodeRoleImplementation, Status: model.TaskStatusProcessing,
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := coordinator.RecordTaskMutation(context.Background(), p.ID, "work-completed", plan.TaskMutation{
-		Status: model.TaskStatusCompleted,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
+// C6b 起 prepareRecoveredSnapshot 只做陈旧自动恢复守卫：不再有 Plan 终态事实
+// overlay（控制面已随其整包删除），陈旧快照中的非终态任务一律阻断。
+func TestPrepareRecoveredSnapshotAppliesStaleGuardWithoutOverlay(t *testing.T) {
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	snap := &session.Snapshot{
 		SavedAt: now.Add(-2 * time.Hour).Format(time.RFC3339Nano),
 		Tasks: []session.TaskSnapshot{{
-			ID: "work-completed", PlanID: p.ID,
-			NodeRole:     string(model.PlanNodeRoleImplementation),
-			Status:       string(model.TaskStatusPending),
+			ID: "work-pending", Status: string(model.TaskStatusPending),
 			PendingSince: now.Add(-2 * time.Hour).Format(time.RFC3339Nano),
 		}},
 	}
-	prepared, blocks := prepareRecoveredSnapshot(&System{PlanCoordinator: coordinator}, snap, false, time.Hour, now)
-	if len(blocks) != 0 {
-		t.Fatalf("authoritative terminal Plan fact was stale-blocked: %#v", blocks)
+	prepared, blocks := prepareRecoveredSnapshot(&System{}, snap, false, time.Hour, now)
+	if len(blocks) != 1 {
+		t.Fatalf("陈旧快照的非终态任务应被阻断: %#v", blocks)
 	}
-	if got := prepared.Tasks[0]; got.Status != string(model.TaskStatusCompleted) || got.PendingSince != "" || got.CompletedAt == "" {
-		t.Fatalf("terminal Plan fact was not preserved: %+v", got)
+	if got := prepared.Tasks[0]; got.Status != string(model.TaskStatusBlocked) || !strings.Contains(got.Error, "stale_resume_guard") {
+		t.Fatalf("stale guard 未生效: %+v", got)
+	}
+	if snap.Tasks[0].Status != string(model.TaskStatusPending) {
+		t.Fatal("原始快照被改写")
 	}
 }
 
@@ -198,24 +250,10 @@ func TestEmitStaleResumeBlocksWritesBlockedTerminalTruth(t *testing.T) {
 	}
 }
 
+// 恢复全程 dispatcher 保持分离：恢复自身的审计事件（含恢复期间产生的事件）
+// 不得到达 Reactor 分发器；恢复成功后才安装运行时 dispatcher。
 func TestRestoreRuntimeBeforeReactorActivationSuppressesReconcileDispatch(t *testing.T) {
-	taskStore, coordinator := newPlannedStore(t, t.TempDir())
-	p, err := coordinator.Create(context.Background(), plan.CreateInput{
-		PlanID: "plan-recovery-no-reactor", RootTaskID: "root",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	p, err = coordinator.RegisterTask(context.Background(), plan.RegisterTaskInput{
-		PlanID: p.ID, ObservedRevision: p.CurrentRevision,
-		Node: model.PlanNode{
-			TaskID: "terminal-during-recovery", Title: "terminal snapshot",
-			Role: model.PlanNodeRoleImplementation, Status: model.TaskStatusProcessing,
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 4), 32, 1, 60)
 
 	preexisting := &staleResumeTraceCapture{}
 	runtimeDispatcher := &staleResumeTraceCapture{}
@@ -229,20 +267,16 @@ func TestRestoreRuntimeBeforeReactorActivationSuppressesReconcileDispatch(t *tes
 	})
 
 	snap := &session.Snapshot{Tasks: []session.TaskSnapshot{{
-		ID: "terminal-during-recovery", Description: "terminal snapshot",
-		Status: string(model.TaskStatusBlocked), PlanID: p.ID,
-		NodeRole:    string(model.PlanNodeRoleImplementation),
-		CreatedAt:   time.Now().UTC().Format(time.RFC3339Nano),
-		CompletedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		ID: "restored-pending", Description: "恢复期间导入的任务",
+		Status: string(model.TaskStatusPending),
 	}}}
 	if err := restoreRuntimeBeforeReactorActivation(
-		&System{Store: taskStore, PlanCoordinator: coordinator}, snap, nil, runtimeDispatcher,
+		&System{Store: taskStore}, snap, nil, runtimeDispatcher,
 	); err != nil {
 		t.Fatalf("restoreRuntimeBeforeReactorActivation: %v", err)
 	}
-	recoveredPlan, err := coordinator.Store().GetPlan(p.ID)
-	if err != nil || len(recoveredPlan.PendingReplanRequests) == 0 {
-		t.Fatalf("test did not exercise recovery replan emission: plan=%+v err=%v", recoveredPlan, err)
+	if _, err := taskStore.GetTask("restored-pending"); err != nil {
+		t.Fatalf("快照任务应已导入: %v", err)
 	}
 	if len(preexisting.events) != 0 || len(runtimeDispatcher.events) != 0 {
 		t.Fatalf("recovery leaked to dispatcher: preexisting=%d runtime=%d", len(preexisting.events), len(runtimeDispatcher.events))

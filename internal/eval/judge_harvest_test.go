@@ -14,11 +14,8 @@ import (
 // judgeMetrics 构造判据测试用指标。
 func judgeMetrics() *RunMetrics {
 	return &RunMetrics{
-		TerminalStatus:    "completed",
-		AcceptanceRounds:  2,
-		AcceptanceVerdict: "pass",
-		Replans:           1,
-		EventCounts:       map[string]int{"workspace_merged": 2},
+		TerminalStatus: "completed",
+		EventCounts:    map[string]int{"workspace_merged": 2},
 	}
 }
 
@@ -95,24 +92,6 @@ func TestJudge_FileHashTrimTrailingBlank(t *testing.T) {
 	}
 }
 
-func TestJudge_AcceptancePass(t *testing.T) {
-	m := judgeMetrics()
-	res := RunJudges([]JudgeSpec{{Type: "acceptance_pass"}}, t.TempDir(), m)
-	if !res[0].Passed {
-		t.Fatalf("verdict=pass 应通过: %s", res[0].Detail)
-	}
-	m.AcceptanceVerdict = "fail"
-	res = RunJudges([]JudgeSpec{{Type: "acceptance_pass"}}, t.TempDir(), m)
-	if res[0].Passed || !strings.Contains(res[0].Detail, "fail") {
-		t.Fatalf("verdict=fail 应失败: %+v", res[0])
-	}
-	m.AcceptanceRounds = 0
-	res = RunJudges([]JudgeSpec{{Type: "acceptance_pass"}}, t.TempDir(), m)
-	if res[0].Passed || !strings.Contains(res[0].Detail, "未发生") {
-		t.Fatalf("无验收 run 应失败并说明: %+v", res[0])
-	}
-}
-
 func TestJudge_EventCountAndAbsent(t *testing.T) {
 	m := judgeMetrics()
 	res := RunJudges([]JudgeSpec{
@@ -135,7 +114,7 @@ func TestJudge_MetricBounds(t *testing.T) {
 	res := RunJudges([]JudgeSpec{
 		{Type: "metric_bounds", Metric: "total_tokens", Max: f64(200)},
 		{Type: "metric_bounds", Metric: "total_tokens", Max: f64(120)},
-		{Type: "metric_bounds", Metric: "replans", Min: f64(1)},
+		{Type: "metric_bounds", Metric: "llm_calls", Min: f64(0)},
 		{Type: "metric_bounds", Metric: "不存在的指标", Max: f64(1)},
 	}, t.TempDir(), m)
 	want := []bool{true, false, true, false}
@@ -160,26 +139,13 @@ func TestHarvestEvents(t *testing.T) {
 		{Kind: trace.KindTaskCompleted, LoopsUsed: 7}, // 发射端当前不填，不应计入
 		{Kind: trace.KindTaskFailed},
 		{Kind: trace.KindError},
-		{Kind: trace.KindReplanRequested},
-		{Kind: trace.KindReplanRequested},
-		{Kind: trace.KindAcceptanceCompleted, Acceptance: &trace.AcceptanceTraceContext{Verdict: "fail"}},
-		{Kind: trace.KindAcceptanceCompleted, Acceptance: &trace.AcceptanceTraceContext{Verdict: "pass"}},
 		{Kind: trace.KindLLMCallEnd, PromptTokens: 10, CompletionTokens: 5},
 		{Kind: trace.KindLLMCallEnd, PromptTokens: 20, CompletionTokens: 7},
 	}
 	m := &RunMetrics{}
 	HarvestEvents(events, m)
-	if m.Subtasks != 2 {
-		t.Errorf("Subtasks = %d，期望 2（根任务不计入）", m.Subtasks)
-	}
 	if m.Loops != 12 {
 		t.Errorf("Loops = %d，期望 12（7+5，按 agent/task 最大 loop 求和）", m.Loops)
-	}
-	if m.Replans != 2 {
-		t.Errorf("Replans = %d，期望 2", m.Replans)
-	}
-	if m.AcceptanceRounds != 2 || m.AcceptanceVerdict != "pass" {
-		t.Errorf("验收 = %d 轮 %q，期望 2 轮 pass（取最后一次）", m.AcceptanceRounds, m.AcceptanceVerdict)
 	}
 	if m.Errors != 2 {
 		t.Errorf("Errors = %d，期望 2", m.Errors)
@@ -187,8 +153,8 @@ func TestHarvestEvents(t *testing.T) {
 	if m.LLMCalls != 2 {
 		t.Errorf("LLMCalls = %d，期望 2", m.LLMCalls)
 	}
-	if m.EventCounts["replan_requested"] != 2 {
-		t.Errorf("EventCounts[replan_requested] = %d，期望 2", m.EventCounts["replan_requested"])
+	if m.EventCounts["task_published"] != 3 {
+		t.Errorf("EventCounts[task_published] = %d，期望 3", m.EventCounts["task_published"])
 	}
 
 	// token 兜底：snapshot 缺失时从 llm_call_end 求和

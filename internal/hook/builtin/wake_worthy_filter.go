@@ -91,6 +91,7 @@ func (h *WakeWorthyFilterHook) Run(hctx hook.MailboxHookContext) hook.MailboxHoo
 				"agent=%s 邮箱 peek 结果为空（ring buffer 边界或并发 drain），下沉到路径 A 等待自然 drain",
 				hctx.AgentID,
 			),
+			ReasonCode: ReasonWakeNotWorthy,
 		}
 	}
 
@@ -131,6 +132,7 @@ func (h *WakeWorthyFilterHook) Run(hctx hook.MailboxHookContext) hook.MailboxHoo
 		Action:      hook.Abort,
 		HookName:    h.Name(),
 		AbortReason: reason,
+		ReasonCode:  ReasonWakeNotWorthy,
 	}
 }
 

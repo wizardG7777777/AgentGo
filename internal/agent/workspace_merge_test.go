@@ -6,7 +6,8 @@ package agent
 //     成功后 Cleanup——用真 *workspace.Manager（t.TempDir() 主根）断言真实
 //     合并产物落回主根；
 //   - 合并冲突 → 任务 failed（reason 含 workspace_conflict 与冲突清单）+
-//     自动登记高优 ReplanRequest（不 Cleanup 保留现场）；
+//     发布通用 replan 唤醒任务（reason_code=workspace_conflict，不 Cleanup
+//     保留现场）；图任务跳过唤醒发布；
 //   - 认领点 fail-closed（未知模式 / 执行面未装配）；
 //   - 无 Isolation 任务零影响；失败路径不 merge 不 Cleanup。
 
@@ -53,30 +54,12 @@ func (c *countingManager) Cleanup(taskID string) error {
 	return c.real.Cleanup(taskID)
 }
 
-// fakeReplanRequester 捕获自动登记的 ReplanRequest。
-type fakeReplanRequester struct {
-	calls int
-	req   model.ReplanRequest
-	err   error
-}
-
-func (f *fakeReplanRequester) RequestReplan(_ context.Context, req model.ReplanRequest) (*model.ReplanRequest, error) {
-	f.calls++
-	f.req = req
-	if f.err != nil {
-		return nil, f.err
-	}
-	out := req
-	return &out, nil
-}
-
 // publishIsolationTask 发布并认领一个带执行隔离声明的任务。
-func publishIsolationTask(t *testing.T, s store.TaskStore, agentID, planID string) string {
+func publishIsolationTask(t *testing.T, s store.TaskStore, agentID string) string {
 	t.Helper()
 	task := &model.Task{
 		Description: "隔离任务",
 		EventType:   "code",
-		PlanID:      planID,
 		Capability:  &model.NodeCapability{Isolation: &model.IsolationSpec{Mode: model.IsolationModeWorkspace}},
 	}
 	if err := s.PublishTask(task); err != nil {
@@ -96,10 +79,9 @@ func TestProcessTask_IsolationNaturalCompletionMergesAndCleansUp(t *testing.T) {
 	mainRoot := t.TempDir()
 	mgr := &countingManager{real: workspace.NewManager(mainRoot, nil)}
 	swapper := workspace.NewSwapper(mainRoot)
-	replan := &fakeReplanRequester{}
 
 	const agentID = "agent-iso"
-	taskID := publishIsolationTask(t, s, agentID, "")
+	taskID := publishIsolationTask(t, s, agentID)
 	target := filepath.Join(mainRoot, "out.txt")
 
 	var ag *Agent
@@ -128,10 +110,9 @@ func TestProcessTask_IsolationNaturalCompletionMergesAndCleansUp(t *testing.T) {
 		}
 		return ExecuteResult{Output: "done"}, nil
 	}
-	ag = NewAgent(agentID, "code", s, r, exec, 5)
+	ag = NewAgent(agentID, "code", s, r, exec)
 	ag.WorkspaceManager = mgr
 	ag.WorkspaceActivator = swapper
-	ag.WorkspaceReplanRequester = replan
 	ag.processTask(context.Background(), taskID)
 
 	task, err := s.GetTask(taskID)
@@ -162,9 +143,9 @@ func TestProcessTask_IsolationNaturalCompletionMergesAndCleansUp(t *testing.T) {
 	if mgr.real.ActiveView(taskID) != nil {
 		t.Fatal("Cleanup 后 Manager 不应再持有活动视图")
 	}
-	// 无冲突不登记 replan。
-	if replan.calls != 0 {
-		t.Fatalf("成功路径不应登记 replan，实际 %d 次", replan.calls)
+	// 成功路径不发布 replan 唤醒任务。
+	if wake := findReplanWakeTask(t, s, taskID); wake != nil {
+		t.Fatalf("成功路径不应发布 replan 唤醒任务，实际: %+v", wake)
 	}
 }
 
@@ -178,7 +159,7 @@ func TestProcessTask_IsolationShortCircuitMergesBeforeComplete(t *testing.T) {
 	swapper := workspace.NewSwapper(mainRoot)
 
 	const agentID = "agent-iso"
-	taskID := publishIsolationTask(t, s, agentID, "")
+	taskID := publishIsolationTask(t, s, agentID)
 	target := filepath.Join(mainRoot, "short.txt")
 
 	holder := NewFinalizationHolder()
@@ -194,7 +175,7 @@ func TestProcessTask_IsolationShortCircuitMergesBeforeComplete(t *testing.T) {
 		holder.MarkTaskFinalized() // 模拟 submit_task_result 成功后的信号
 		return ExecuteResult{Output: "已提交", ToolCalled: true}, nil
 	}
-	ag := NewAgent(agentID, "code", s, r, exec, 5)
+	ag := NewAgent(agentID, "code", s, r, exec)
 	ag.FinalizationChecker = holder
 	ag.OnTaskStart = func(id string) { holder.Set(id) }
 	ag.WorkspaceManager = mgr
@@ -218,8 +199,9 @@ func TestProcessTask_IsolationShortCircuitMergesBeforeComplete(t *testing.T) {
 }
 
 // 合并冲突：任务转 failed（reason 含 workspace_conflict 与冲突文件清单）、
-// 自动登记高优 ReplanRequest（冲突文件与冲突区域数写进原因）、不 Cleanup。
-func TestProcessTask_IsolationMergeConflictFailsAndReplans(t *testing.T) {
+// 发布 reason_code=workspace_conflict 的通用 replan 唤醒任务（冲突文件与
+// 冲突区域数写进唤醒详情）、不 Cleanup。
+func TestProcessTask_IsolationMergeConflictFailsAndPublishesReplanWake(t *testing.T) {
 	s, r, _ := setup()
 	mainRoot := t.TempDir()
 	conflictedPath := filepath.Join(mainRoot, "conflicted.txt")
@@ -238,18 +220,16 @@ func TestProcessTask_IsolationMergeConflictFailsAndReplans(t *testing.T) {
 		},
 	}
 	swapper := workspace.NewSwapper(mainRoot)
-	replan := &fakeReplanRequester{}
 
 	const agentID = "agent-iso"
-	taskID := publishIsolationTask(t, s, agentID, "plan-1")
+	taskID := publishIsolationTask(t, s, agentID)
 
 	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 		return ExecuteResult{Output: "done"}, nil
 	}
-	ag := NewAgent(agentID, "code", s, r, exec, 5)
+	ag := NewAgent(agentID, "code", s, r, exec)
 	ag.WorkspaceManager = mgr
 	ag.WorkspaceActivator = swapper
-	ag.WorkspaceReplanRequester = replan
 	ag.processTask(context.Background(), taskID)
 
 	task, err := s.GetTask(taskID)
@@ -268,27 +248,83 @@ func TestProcessTask_IsolationMergeConflictFailsAndReplans(t *testing.T) {
 	if mgr.cleanupCalls != 0 {
 		t.Fatalf("冲突保留现场，不应 Cleanup，实际 %d 次", mgr.cleanupCalls)
 	}
-	// 自动 replan：同款 RequestReplan 通道，高优，原因含冲突文件与区域数。
-	if replan.calls != 1 {
-		t.Fatalf("应自动登记 1 次 replan，实际 %d", replan.calls)
+	// 自动 replan：公告板上恰好一条通用唤醒任务，详情含冲突文件与区域数。
+	wake := findReplanWakeTask(t, s, taskID)
+	if wake == nil {
+		t.Fatal("合并冲突后应发布通用 replan 唤醒任务")
 	}
-	req := replan.req
-	if req.PlanID != "plan-1" || req.SourceTaskID != taskID {
-		t.Fatalf("replan 归属错误: PlanID=%s SourceTaskID=%s", req.PlanID, req.SourceTaskID)
+	if wake.EventSource != "replan-request" || wake.ParentTaskID != taskID || wake.MaxConcurrency != 1 {
+		t.Fatalf("唤醒任务形状错误: EventSource=%s ParentTaskID=%s MaxConcurrency=%d",
+			wake.EventSource, wake.ParentTaskID, wake.MaxConcurrency)
 	}
-	if req.ReasonCode != "workspace_conflict" {
-		t.Fatalf("ReasonCode = %s，want workspace_conflict", req.ReasonCode)
+	if !strings.Contains(wake.Description, "reason_code=workspace_conflict") {
+		t.Fatalf("唤醒任务描述应含 reason_code=workspace_conflict，实际: %s", wake.Description)
 	}
-	if req.Urgency != model.ReplanUrgencyHigh {
-		t.Fatalf("Urgency = %s，want high", req.Urgency)
-	}
-	if !strings.Contains(req.Detail, conflictedPath) || !strings.Contains(req.Detail, "2 处冲突区域") {
-		t.Fatalf("replan 原因应含冲突文件与冲突区域数，实际: %s", req.Detail)
+	if !strings.Contains(wake.Description, conflictedPath) || !strings.Contains(wake.Description, "2 处冲突区域") {
+		t.Fatalf("唤醒详情应含冲突文件与冲突区域数，实际: %s", wake.Description)
 	}
 }
 
-// 合并执行错误（非冲突）：同样转 failed + 自动 replan。
-func TestProcessTask_IsolationMergeErrorFailsAndReplans(t *testing.T) {
+// 合并冲突 × 图任务：任务同样转 failed，但不发布 replan 唤醒任务——
+// 图任务终态由 graph-terminal-feed 回填引擎按边条件路由。
+func TestProcessTask_IsolationMergeConflictGraphTaskSkipsReplanWake(t *testing.T) {
+	s, r, _ := setup()
+	mainRoot := t.TempDir()
+	conflictedPath := filepath.Join(mainRoot, "conflicted.txt")
+	mgr := &countingManager{
+		real: workspace.NewManager(mainRoot, nil),
+		mergeResult: &workspace.MergeResult{
+			Conflicted: true,
+			Reports: []workspace.FileReport{{
+				Path:    conflictedPath,
+				Outcome: workspace.OutcomeConflict,
+				Conflicts: []workspace.ConflictRegion{
+					{BaseStart: 3, BaseEnd: 5},
+				},
+			}},
+		},
+	}
+	swapper := workspace.NewSwapper(mainRoot)
+
+	const agentID = "agent-iso"
+	task := &model.Task{
+		Description: "图隔离任务",
+		EventType:   "code",
+		GraphID:     "graph-1", NodeID: "node-a", ActivationID: "node-a@1",
+		Capability: &model.NodeCapability{Isolation: &model.IsolationSpec{Mode: model.IsolationModeWorkspace}},
+	}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatalf("PublishTask: %v", err)
+	}
+	if err := s.ClaimTask(agentID, task.ID); err != nil {
+		t.Fatalf("ClaimTask: %v", err)
+	}
+
+	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		return ExecuteResult{Output: "done"}, nil
+	}
+	ag := NewAgent(agentID, "code", s, r, exec)
+	ag.WorkspaceManager = mgr
+	ag.WorkspaceActivator = swapper
+	ag.processTask(context.Background(), task.ID)
+
+	got, err := s.GetTask(task.ID)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if got.Status != model.TaskStatusFailed {
+		t.Fatalf("status = %s，want failed", got.Status)
+	}
+	if !strings.Contains(got.Error, "workspace_conflict") {
+		t.Fatalf("失败原因应含 workspace_conflict，实际: %s", got.Error)
+	}
+	if wake := findReplanWakeTask(t, s, task.ID); wake != nil {
+		t.Fatalf("图任务不应发布 replan 唤醒任务，实际: %+v", wake)
+	}
+}
+
+// 合并执行错误（非冲突）：同样转 failed + 发布 replan 唤醒任务。
+func TestProcessTask_IsolationMergeErrorFailsAndPublishesReplanWake(t *testing.T) {
 	s, r, _ := setup()
 	mainRoot := t.TempDir()
 	mgr := &countingManager{
@@ -296,18 +332,16 @@ func TestProcessTask_IsolationMergeErrorFailsAndReplans(t *testing.T) {
 		mergeErr: errors.New("模拟合并 IO 故障"),
 	}
 	swapper := workspace.NewSwapper(mainRoot)
-	replan := &fakeReplanRequester{}
 
 	const agentID = "agent-iso"
-	taskID := publishIsolationTask(t, s, agentID, "plan-1")
+	taskID := publishIsolationTask(t, s, agentID)
 
 	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 		return ExecuteResult{Output: "done"}, nil
 	}
-	ag := NewAgent(agentID, "code", s, r, exec, 5)
+	ag := NewAgent(agentID, "code", s, r, exec)
 	ag.WorkspaceManager = mgr
 	ag.WorkspaceActivator = swapper
-	ag.WorkspaceReplanRequester = replan
 	ag.processTask(context.Background(), taskID)
 
 	task, err := s.GetTask(taskID)
@@ -323,8 +357,9 @@ func TestProcessTask_IsolationMergeErrorFailsAndReplans(t *testing.T) {
 	if mgr.cleanupCalls != 0 {
 		t.Fatalf("失败保留现场，不应 Cleanup，实际 %d 次", mgr.cleanupCalls)
 	}
-	if replan.calls != 1 || replan.req.ReasonCode != "workspace_conflict" {
-		t.Fatalf("应登记 1 次 workspace_conflict replan，实际 %+v", replan.req)
+	wake := findReplanWakeTask(t, s, taskID)
+	if wake == nil || !strings.Contains(wake.Description, "reason_code=workspace_conflict") {
+		t.Fatalf("应发布 1 条 reason_code=workspace_conflict 的唤醒任务，实际 %+v", wake)
 	}
 }
 
@@ -353,7 +388,7 @@ func TestProcessTask_IsolationFailClosedUnknownMode(t *testing.T) {
 		execCalls++
 		return ExecuteResult{Output: "done"}, nil
 	}
-	ag := NewAgent(agentID, "code", s, r, exec, 5)
+	ag := NewAgent(agentID, "code", s, r, exec)
 	ag.WorkspaceManager = mgr
 	ag.WorkspaceActivator = swapper
 	ag.processTask(context.Background(), task.ID)
@@ -381,14 +416,14 @@ func TestProcessTask_IsolationFailClosedUnassembled(t *testing.T) {
 	s, r, _ := setup()
 
 	const agentID = "agent-iso"
-	taskID := publishIsolationTask(t, s, agentID, "")
+	taskID := publishIsolationTask(t, s, agentID)
 
 	execCalls := 0
 	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 		execCalls++
 		return ExecuteResult{Output: "done"}, nil
 	}
-	ag := NewAgent(agentID, "code", s, r, exec, 5)
+	ag := NewAgent(agentID, "code", s, r, exec)
 	// 不装配 WorkspaceManager / WorkspaceActivator
 	ag.processTask(context.Background(), taskID)
 
@@ -408,13 +443,12 @@ func TestProcessTask_IsolationFailClosedUnassembled(t *testing.T) {
 }
 
 // 无 Isolation 任务：装配了 Manager/Activator 也零开销短路——不物化、
-// 不合并、不清理，行为完全不变。
+// 不合并、不清理、不发布 replan 唤醒任务，行为完全不变。
 func TestProcessTask_NoIsolationZeroOverhead(t *testing.T) {
 	s, r, _ := setup()
 	mainRoot := t.TempDir()
 	mgr := &countingManager{real: workspace.NewManager(mainRoot, nil)}
 	swapper := workspace.NewSwapper(mainRoot)
-	replan := &fakeReplanRequester{}
 
 	const agentID = "agent-iso"
 	task := &model.Task{Description: "普通任务", EventType: "code"}
@@ -431,10 +465,9 @@ func TestProcessTask_NoIsolationZeroOverhead(t *testing.T) {
 		}
 		return ExecuteResult{Output: "done"}, nil
 	}
-	ag := NewAgent(agentID, "code", s, r, exec, 5)
+	ag := NewAgent(agentID, "code", s, r, exec)
 	ag.WorkspaceManager = mgr
 	ag.WorkspaceActivator = swapper
-	ag.WorkspaceReplanRequester = replan
 	ag.processTask(context.Background(), task.ID)
 
 	got, err := s.GetTask(task.ID)
@@ -444,9 +477,12 @@ func TestProcessTask_NoIsolationZeroOverhead(t *testing.T) {
 	if got.Status != model.TaskStatusCompleted {
 		t.Fatalf("status = %s，want completed（error: %s）", got.Status, got.Error)
 	}
-	if mgr.materializeCalls != 0 || mgr.mergeCalls != 0 || mgr.cleanupCalls != 0 || replan.calls != 0 {
-		t.Fatalf("无 Isolation 应零开销短路，实际 物化 %d / 合并 %d / 清理 %d / replan %d",
-			mgr.materializeCalls, mgr.mergeCalls, mgr.cleanupCalls, replan.calls)
+	if mgr.materializeCalls != 0 || mgr.mergeCalls != 0 || mgr.cleanupCalls != 0 {
+		t.Fatalf("无 Isolation 应零开销短路，实际 物化 %d / 合并 %d / 清理 %d",
+			mgr.materializeCalls, mgr.mergeCalls, mgr.cleanupCalls)
+	}
+	if wake := findReplanWakeTask(t, s, task.ID); wake != nil {
+		t.Fatalf("无 Isolation 不应发布 replan 唤醒任务，实际: %+v", wake)
 	}
 }
 
@@ -458,12 +494,12 @@ func TestProcessTask_IsolationFailureSkipsMergeAndCleanup(t *testing.T) {
 	swapper := workspace.NewSwapper(mainRoot)
 
 	const agentID = "agent-iso"
-	taskID := publishIsolationTask(t, s, agentID, "")
+	taskID := publishIsolationTask(t, s, agentID)
 
 	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 		return ExecuteResult{}, errors.New("unrecoverable boom")
 	}
-	ag := NewAgent(agentID, "code", s, r, exec, 5)
+	ag := NewAgent(agentID, "code", s, r, exec)
 	ag.MaxRetries = 1
 	ag.WorkspaceManager = mgr
 	ag.WorkspaceActivator = swapper

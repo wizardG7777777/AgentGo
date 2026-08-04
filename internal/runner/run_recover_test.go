@@ -107,7 +107,7 @@ func TestRunAgentLoopWithRecover_CancelDuringBackoffStops(t *testing.T) {
 // panic（nil 解引用）。若包装生效，Runner.Run 会 recover + 退避重启，
 // 直到 ctx 取消才退出；若未生效，Run 会在第一次 panic 后直接崩溃测试进程。
 func TestRunnerRun_SurvivesAgentPanic(t *testing.T) {
-	ag := agent.NewAgent("w-nilstore", "evt", nil, nil, nil, 0)
+	ag := agent.NewAgent("w-nilstore", "evt", nil, nil, nil)
 	rn := &Runner{agent: ag}
 
 	ctx, cancel := context.WithCancel(context.Background())

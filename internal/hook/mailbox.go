@@ -69,6 +69,12 @@ type MailboxHookDecision struct {
 	AbortReason string
 	HookName    string
 
+	// ReasonCode 是 V6 §4 H2a 的稳定拒绝原因码（snake_case），Abort 时填写。
+	// mailbox 域当前只填原因码（Suggestions 留空）。
+	ReasonCode string
+	// Suggestions 预留给结构化恢复提示；mailbox 域暂不产出。
+	Suggestions []Suggestion
+
 	// WakeDescription 仅在 BeforeWake 阶段使用。空字符串表示"本 hook 不
 	// 提供 description"。多个 hook 累加追加（中间用 "\n\n" 分隔）。
 	// 最终的 description 由 notifier.scan 拿到累加结果后写入 wake task。

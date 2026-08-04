@@ -32,13 +32,6 @@ type TraceEvent struct {
 	DurationMS             int64     `json:"duration_ms,omitempty"`
 	PromptTokens           int       `json:"prompt_tokens,omitempty"`
 	CompletionTokens       int       `json:"completion_tokens,omitempty"`
-	PlanID                 string    `json:"plan_id,omitempty"`
-	PlanRevision           int64     `json:"plan_revision,omitempty"`
-	ExecutionStateVersion  int64     `json:"execution_state_version,omitempty"`
-	AcceptanceSpecRevision int64     `json:"acceptance_spec_revision,omitempty"`
-	AcceptanceRunID        string    `json:"acceptance_run_id,omitempty"`
-	AcceptanceStatus       string    `json:"acceptance_status,omitempty"`
-	AcceptanceVerdict      string    `json:"acceptance_verdict,omitempty"`
 	At                     time.Time `json:"at"`
 }
 
@@ -51,9 +44,6 @@ func ProjectTraceEvent(ev trace.Event) TraceEvent {
 	}
 	if msg == "" {
 		msg = ev.Description
-	}
-	if msg == "" && ev.Acceptance != nil {
-		msg = ev.Acceptance.Reason
 	}
 	at := ev.Timestamp
 	if at.IsZero() {
@@ -84,17 +74,6 @@ func ProjectTraceEvent(ev trace.Event) TraceEvent {
 		} else {
 			projected.Outcome = "success"
 		}
-	}
-	if ev.Plan != nil {
-		projected.PlanID = ev.Plan.PlanID
-		projected.PlanRevision = ev.Plan.PlanRevision
-		projected.ExecutionStateVersion = ev.Plan.ExecutionStateVersion
-		projected.AcceptanceSpecRevision = ev.Plan.AcceptanceSpecRevision
-	}
-	if ev.Acceptance != nil {
-		projected.AcceptanceRunID = ev.Acceptance.AcceptanceRunID
-		projected.AcceptanceStatus = ev.Acceptance.Status
-		projected.AcceptanceVerdict = ev.Acceptance.Verdict
 	}
 	return projected
 }
@@ -193,15 +172,15 @@ func truncateTraceSummary(value string, limit int) string {
 
 // EmitTraceEvent 把一条 trace 事件包装为 KindTraceEvent 更新广播给全部订阅者。
 //
-// 速率安全：trace 含高频事件（llm_call_start/end、tool_call/result、
-// token_stats）。本方法只做一次非阻塞扇出（与 Hub 其他广播同一
+// 速率安全：trace 含高频事件（llm_call_start/end、tool_call/result）。
+// 本方法只做一次非阻塞扇出（与 Hub 其他广播同一
 // drop-oldest 背压纪律），慢订阅者丢事件、快订阅者与 Hub 主循环均不受影响；
 // 零订阅者时是纯 no-op。可在任意 goroutine 上并发调用（Reactor 分发路径如此）。
 func (h *Hub) EmitTraceEvent(ev trace.Event) {
 	projected := ProjectTraceEvent(ev)
 	h.recordTrace(projected)
-	if ev.Kind == trace.KindTokenStats {
-		h.recordTokenStats(ev)
+	if ev.Kind == trace.KindLLMCallEnd {
+		h.recordLLMUsage(ev)
 	}
 	h.broadcast(Update{
 		Kind:  KindTraceEvent,

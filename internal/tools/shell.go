@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/effect"
 	"agentgo/internal/interaction"
 	"agentgo/internal/modes"
 	"agentgo/internal/shell"
@@ -37,7 +38,7 @@ const defaultShellTimeoutSec = 30
 //     白名单，allow_session 语义不变。验收角色由 dependency_map 注入
 //     shell.AcceptanceHardeningGreylist；普通角色留空，行为与之前完全一致
 //   - SessionID：返回当前 Session ID，nil 时请求不绑定 Session
-//   - Modes：三轴模式 store，exec 轴驱动 strict 全量审批 / yolo 灰名单自动放行；
+//   - Modes：两轴模式 store，exec 轴驱动 strict 全量审批 / yolo 灰名单自动放行；
 //     nil 等价 normal
 //   - InteractionWaitHook：交互等待钩子，进入/退出"等待用户回复"时各回调一次
 //     （true/false），供调用方接线 agent 状态机（waiting_interaction）；nil 为 no-op
@@ -56,6 +57,9 @@ type ShellGroup struct {
 	Modes               *modes.Store         // optional
 	InteractionWaitHook func(waiting bool)   // optional
 	ActiveViewer        ActiveViewer         // optional
+	// EffectJournal 是 V6 §4 H2b 副作用账本（internal/effect）；
+	// nil 时 run_shell 不记账（行为与引入账本前完全一致）。
+	EffectJournal *effect.Journal // optional
 }
 
 // Register 实现 ToolGroup 接口。
@@ -114,6 +118,13 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 			cmd.Dir = workingDir
 		}
 
+		// H2b Effect Journal：命令执行前先落账（prepared）。Target 只载命令
+		// digest（脱敏：完整命令不进账本），Policy=manual_only——命令副作用
+		// 不可盲目重放，恢复裁决不自动执行任何动作。
+		effID := effectPrepare(g.EffectJournal, ctx, g.AgentID,
+			effect.KindShell, "cmd:"+digest12([]byte(command)),
+			digest12([]byte(command+"\n"+workingDir)), effect.PolicyManualOnly)
+
 		start := time.Now()
 		output, err := cmd.CombinedOutput()
 		durationMS := time.Since(start).Milliseconds()
@@ -122,13 +133,15 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 		// 每次真实执行（成功/非零退出/超时/启动失败）都恰好 emit 一条
 		// shell_executed 事件（D4：该 Kind 此前有 schema/CLI 渲染/Reactor
 		// 白名单但零发射点）。黑名单拦截或用户未授权的命令到不了这里，不产生事件。
+		// V6 §7.4：Command 过默认脱敏（截 200 字符；AGENTGO_TRACE_FULL_ARGS=1
+		// 旁路）——record-artifact 只消费 Outcome，不受影响。
 		execEv := trace.Event{
 			Kind:    trace.KindShellExecuted,
 			TaskID:  agent.TaskIDFromContext(ctx),
 			AgentID: g.AgentID,
 			Tool:    "run_shell",
 			ShellExec: &trace.ShellExec{
-				Command:    command,
+				Command:    trace.RedactShellCommand(command),
 				DurationMS: durationMS,
 			},
 		}
@@ -139,6 +152,9 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 				execEv.ShellExec.Outcome = "timeout"
 				execEv.Error = fmt.Sprintf("命令执行超时（%d 秒）", effectiveTimeoutSec)
 				trace.Emit(execEv)
+				// 超时时进程已被杀，但已执行部分产生的副作用不可知 → unknown。
+				effectMarkUnknown(g.EffectJournal, effID,
+					fmt.Sprintf("命令超时（%d 秒），已执行部分的副作用不可知", effectiveTimeoutSec))
 				return "", fmt.Errorf("命令执行超时（%d 秒）: %s", effectiveTimeoutSec, command)
 			}
 			if exitErr, ok := err.(*exec.ExitError); ok {
@@ -147,6 +163,8 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 				execEv.ShellExec.Outcome = "failure"
 				execEv.Error = err.Error()
 				trace.Emit(execEv)
+				// 启动失败（进程未运行）——结果已知：未产生进程副作用。
+				effectSettle(g.EffectJournal, effID, "启动失败，未执行: "+err.Error())
 				return "", fmt.Errorf("启动命令失败: %w", err)
 			}
 		}
@@ -158,6 +176,9 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 			execEv.ShellExec.Outcome = "failure"
 		}
 		trace.Emit(execEv)
+
+		effectSettle(g.EffectJournal, effID, fmt.Sprintf("exit_code=%d outcome=%s duration_ms=%d out_bytes=%d out_sha256=%s",
+			exitCode, execEv.ShellExec.Outcome, durationMS, len(output), digest12(output)))
 
 		return fmt.Sprintf("exit_code: %d\nstdout+stderr:\n%s", exitCode, outStr), nil
 	}

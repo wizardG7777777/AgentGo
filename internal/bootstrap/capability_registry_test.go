@@ -8,10 +8,11 @@ import (
 	"testing"
 
 	"agentgo/internal/model"
+	"agentgo/internal/store"
 )
 
 func capableTask(tools ...string) *model.Task {
-	return &model.Task{ID: "t1", PlanID: "p1", EventType: "worker",
+	return &model.Task{ID: "t1", EventType: "worker",
 		Capability: &model.NodeCapability{Tools: tools}}
 }
 
@@ -53,15 +54,15 @@ func TestCapabilityRegistry_SpawnAdhocInheritsBaseKind(t *testing.T) {
 
 func TestCapabilityRegistry_DynamicTeamRouteIntersection(t *testing.T) {
 	reg := newCapabilityRegistry()
-	reg.routeCaps = func(planID, eventType string) ([]string, bool) {
-		if planID == "p1" && eventType == "team:research" {
+	reg.routeCaps = func(eventType string) ([]string, bool) {
+		if eventType == "team:research" {
 			return []string{"read_file", "web_fetch"}, true
 		}
 		return nil, false
 	}
 	check := reg.checker()
 
-	teamTask := &model.Task{ID: "t2", PlanID: "p1", EventType: "team:research",
+	teamTask := &model.Task{ID: "t2", EventType: "team:research",
 		Capability: &model.NodeCapability{Tools: []string{"read_file"}}}
 	if err := check("team-agent-1", teamTask); err != nil {
 		t.Fatalf("team route 能力交集内应放行: %v", err)
@@ -106,20 +107,32 @@ func TestCapabilityRegistry_NoCapabilityPasses(t *testing.T) {
 	}
 }
 
-// CanClaim 双保险：能力检查叠加在 plan 守卫之前，即使无 coordinator 也生效。
-func TestMakeTaskPlanHooks_CanClaimLayersCapabilityCheck(t *testing.T) {
+// ClaimTask 落锁双保险：checker 经 store.SetCapabilityChecker 注入后，能力
+// 越界的能力任务在落锁前被拦下（C6b 起 plan 守卫已删除，检查器是唯一守卫）。
+func TestCapabilityChecker_ClaimTaskDoubleInsurance(t *testing.T) {
 	reg := newCapabilityRegistry()
 	reg.registerAgent("worker-1", []string{"read_file"})
-	hooks := makeTaskPlanHooks(nil, reg.checker())
+	s := store.NewMemoryTaskStore(nil, 100, 1, 300)
+	s.SetCapabilityChecker(store.CapabilityChecker(reg.checker()))
 
-	if err := hooks.CanClaim("worker-1", capableTask("read_file")); err != nil {
-		t.Fatalf("子集内应放行: %v", err)
+	inScope := &model.Task{ID: "in-scope", EventType: "worker",
+		Capability: &model.NodeCapability{Tools: []string{"read_file"}}}
+	outOfScope := &model.Task{ID: "out-of-scope", EventType: "worker",
+		Capability: &model.NodeCapability{Tools: []string{"edit_file"}}}
+	plain := &model.Task{ID: "plain", EventType: "worker"}
+	for _, task := range []*model.Task{inScope, outOfScope, plain} {
+		if err := s.PublishTask(task); err != nil {
+			t.Fatalf("PublishTask(%s): %v", task.ID, err)
+		}
 	}
-	if err := hooks.CanClaim("worker-1", capableTask("edit_file")); err == nil {
-		t.Fatal("能力越界应被 CanClaim 拦下")
+
+	if err := s.ClaimTask("worker-1", inScope.ID); err != nil {
+		t.Fatalf("子集内应认领成功: %v", err)
 	}
-	// 无 capability 任务落到原 plan 守卫语义（coordinator=nil → 放行）。
-	if err := hooks.CanClaim("worker-1", &model.Task{ID: "plain"}); err != nil {
-		t.Fatalf("无 capability 任务应走原守卫语义: %v", err)
+	if err := s.ClaimTask("worker-1", outOfScope.ID); err == nil {
+		t.Fatal("能力越界应被 ClaimTask 拦下")
+	}
+	if err := s.ClaimTask("worker-1", plain.ID); err != nil {
+		t.Fatalf("无 capability 任务认领行为不变: %v", err)
 	}
 }

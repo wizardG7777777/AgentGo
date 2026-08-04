@@ -19,6 +19,10 @@ import (
 //	<UTC时间戳>_<task_id前8位>.jsonl
 //	例：2026-04-08T04-17-06_321b561d.jsonl
 //
+// TaskID 为空而 GraphID 非空的 Graph Runtime 事件（V6 §6）归入稳定的
+// graph_<graph_id前8位>.jsonl 分片（同目录，无时间戳前缀）；分片名中的
+// 路径敌对字符见 graphShardFileName。
+//
 // 并发安全：通过单一互斥锁串行化所有 Emit 调用。性能注意点：
 // 高并发场景下锁可能成为瓶颈，未来可改造为 per-task channel + 单 writer goroutine。
 //
@@ -32,6 +36,20 @@ type Writer struct {
 	files    map[string]*openFile // taskID → 已打开的文件句柄
 	maxTasks int                  // 最大保留物理 trace 文件数；<=0 表示不限制
 	closed   bool                 // Close 后置位：Emit/CloseTask 永久 no-op，绝不重开文件
+
+	// sessionID 是 V6 §7.2 统一事件身份的盖戳源：Emit 时事件 SessionID 为空
+	// 则补上本值（显式填写的不覆盖）。bootstrap/session 切换时经 SetSessionID
+	// 注入；无活跃 Session 时为空，事件不带 session_id。
+	sessionID string
+
+	// --- V6 §7.1 trace_degraded：连续写失败降级态 ---
+	// onDegraded 在进入降级态（首次写失败）时触发一次，锁外调用；恢复后再次
+	// 失败会重新触发。回调必须非阻塞且不得回调 Writer 方法。
+	onDegraded   func(error)
+	degraded     bool      // 是否处于降级态
+	failCount    int       // 本轮降级态内连续失败次数
+	firstFailAt  time.Time // 本轮降级态首次失败时间
+	firstFailErr string    // 本轮降级态首次失败错误串
 }
 
 // openFile 跟踪一个正在被写入的 trace 文件。
@@ -56,14 +74,42 @@ func NewWriter(dir string, maxTasks int) (*Writer, error) {
 // Dir 返回 trace 目录的绝对路径。
 func (w *Writer) Dir() string { return w.dir }
 
+// SetSessionID 设置 Emit 盖戳用的 session id（V6 §7.2）。bootstrap 在创建
+// writer 后、session 切换换绑新 writer 时调用。
+func (w *Writer) SetSessionID(id string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.sessionID = id
+}
+
+// SessionID 返回当前盖戳用的 session id（主要供测试断言）。
+func (w *Writer) SessionID() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.sessionID
+}
+
+// SetOnDegraded 设置进入降级态（首次连续写失败）时的回调（V6 §7.1）。
+// 回调在锁外触发，必须非阻塞且不得回调 Writer 方法；nil 表示只落 marker 文件。
+func (w *Writer) SetOnDegraded(cb func(error)) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.onDegraded = cb
+}
+
 // Emit 写入一条事件。线程安全。失败时打印 stderr WARNING 但不返回错误，
 // 确保 trace 写入失败永远不会中断主流程。
+//
+// 归档规则：TaskID 非空的事件归入任务分片；TaskID 为空但 GraphID 非空的
+// 事件（V6 §6 Graph Runtime 事件）归入 graph_<graph_id前8位>.jsonl 分片
+// （与 task 分片同目录，命名细节见 graphShardFileName）；两者皆空的事件
+// 无法归档，丢弃。
 func (w *Writer) Emit(event Event) {
 	if w == nil {
 		return
 	}
-	if event.TaskID == "" {
-		// 没有 task ID 的事件无法归档，丢弃
+	if event.TaskID == "" && event.GraphID == "" {
+		// 没有任务/图归属的事件无法归档，丢弃
 		return
 	}
 	if event.Timestamp.IsZero() {
@@ -71,34 +117,56 @@ func (w *Writer) Emit(event Event) {
 	}
 
 	w.mu.Lock()
-	defer w.mu.Unlock()
 
 	// Close 后永久丢弃——session 切换重绑后旧 writer 不得复活旧目录的文件
 	if w.closed {
+		w.mu.Unlock()
 		return
 	}
 
-	of, isNew, err := w.fileFor(event.TaskID, event.Timestamp)
+	// V6 §7.2：SessionID 集中盖戳——事件未显式携带时补上 writer 绑定的
+	// session id；发射方显式填写的值不覆盖。
+	if event.SessionID == "" {
+		event.SessionID = w.sessionID
+	}
+
+	of, isNew, err := w.fileFor(event)
 	if err != nil {
-		log.Printf("[trace] WARNING: failed to open trace file for task %s: %v", event.TaskID, err)
+		log.Printf("[trace] WARNING: failed to open trace file for task %s graph %s: %v", event.TaskID, event.GraphID, err)
+		cb := w.recordFailureLocked(err)
+		w.mu.Unlock()
+		if cb != nil {
+			cb(err)
+		}
 		return
 	}
 
 	data, err := json.Marshal(event)
 	if err != nil {
+		// marshal 失败是事件数据本身的问题（非磁盘故障），不计入降级态
 		log.Printf("[trace] WARNING: failed to marshal event (task=%s kind=%s): %v", event.TaskID, event.Kind, err)
+		w.mu.Unlock()
 		return
 	}
 
 	if _, err := of.f.Write(append(data, '\n')); err != nil {
 		log.Printf("[trace] WARNING: failed to write trace event (task=%s): %v", event.TaskID, err)
+		cb := w.recordFailureLocked(err)
+		w.mu.Unlock()
+		if cb != nil {
+			cb(err)
+		}
 		return
 	}
+
+	// 写成功：若此前处于降级态则清除 marker 并恢复
+	w.recordSuccessLocked()
 
 	// 创建新文件后做一次磁盘 GC，把超出保留上限的旧文件清理掉
 	if isNew {
 		w.gcDiskFiles()
 	}
+	w.mu.Unlock()
 }
 
 // CloseTask 显式关闭一个任务的 trace 文件句柄。
@@ -131,18 +199,50 @@ func (w *Writer) Close() error {
 	return nil
 }
 
-// fileFor 返回 taskID 对应的文件句柄。如果是首次访问，会创建新文件并返回 isNew=true。
-func (w *Writer) fileFor(taskID string, ts time.Time) (*openFile, bool, error) {
-	if of, ok := w.files[taskID]; ok {
-		return of, false, nil
-	}
-
-	// 文件名：2026-04-08T04-17-06_321b561d.jsonl
-	shortID := taskID
+// graphShardFileName 返回 GraphID 对应的分片文件名：graph_<graph_id前8位>.jsonl。
+// graph_id 允许 "/"（子图分段符，子图 ID 形如 <父图ID>/<activationID>）与 ":"
+// 等 Windows 非法文件名字符（validate.go 的 graphIDSegmentCharset），统一替换
+// 为该字符集之外的 "~"，保证子图事件也能落到扁平、可创建的分片文件（此前
+// 前 8 位含 "/" 的子图事件因目录不存在而写入失败被丢弃）。trace CLI 用同一
+// 函数定位分片，两侧按构造对齐。
+func graphShardFileName(graphID string) string {
+	shortID := graphID
 	if len(shortID) > 8 {
 		shortID = shortID[:8]
 	}
-	filename := fmt.Sprintf("%s_%s.jsonl", ts.UTC().Format("2006-01-02T15-04-05"), shortID)
+	shortID = strings.Map(func(r rune) rune {
+		switch r {
+		case '/', '\\', ':':
+			return '~'
+		}
+		return r
+	}, shortID)
+	return fmt.Sprintf("graph_%s.jsonl", shortID)
+}
+
+// fileFor 返回事件归档分片的文件句柄。如果是首次访问，会创建新文件并返回
+// isNew=true。TaskID 非空走任务分片（<时间戳>_<task_id前8位>.jsonl）；
+// 否则走 graph 分片（命名见 graphShardFileName，单一稳定文件名，句柄随
+// Writer 生命周期保持打开）。
+func (w *Writer) fileFor(ev Event) (*openFile, bool, error) {
+	key := ev.TaskID
+	var filename string
+	if key != "" {
+		// 任务分片文件名：2026-04-08T04-17-06_321b561d.jsonl
+		shortID := key
+		if len(shortID) > 8 {
+			shortID = shortID[:8]
+		}
+		filename = fmt.Sprintf("%s_%s.jsonl", ev.Timestamp.UTC().Format("2006-01-02T15-04-05"), shortID)
+	} else {
+		// graph 分片：句柄键加前缀，避免与恰好同名的任务 ID 撞键
+		key = "graph\x00" + ev.GraphID
+		filename = graphShardFileName(ev.GraphID)
+	}
+	if of, ok := w.files[key]; ok {
+		return of, false, nil
+	}
+
 	path := filepath.Join(w.dir, filename)
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
@@ -151,7 +251,7 @@ func (w *Writer) fileFor(taskID string, ts time.Time) (*openFile, bool, error) {
 	}
 
 	of := &openFile{f: f, path: path}
-	w.files[taskID] = of
+	w.files[key] = of
 	return of, true, nil
 }
 

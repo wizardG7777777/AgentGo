@@ -157,7 +157,7 @@ func computeArtifactMeta(path string) model.ArtifactMeta {
 var _ reactor.Reactor = (*RecordArtifactReactor)(nil)
 
 // normalizeArtifactPath 把绝对路径转换为相对项目根的相对路径。
-// 与 v4 hook/builtin/record_artifact.go 同名函数行为字节级一致：
+// 与 internal/hook/builtin/helpers.go 同名函数行为字节级一致：
 //   - projectRoot 非空且路径在其内部 → 返回 / 风格相对路径
 //   - 路径在 projectRoot 之外 → 返回 / 风格 cleaned 路径
 //   - projectRoot 为空 → 返回 / 风格 cleaned 路径

@@ -69,7 +69,7 @@ func TestSchedulerExecutor_ToolCallsGoThroughHook(t *testing.T) {
 
 	// 构造标准 LLMExecutor（与 worker 一致的三件套）
 	innerExec := agent.NewLLMExecutor(mockLLM, toolReg, hookReg, s, recordFunc, "")
-	
+
 	exec := &SchedulerExecutor{
 		Inner:         innerExec,
 		Store:         s,
@@ -90,7 +90,7 @@ func TestSchedulerExecutor_ToolCallsGoThroughHook(t *testing.T) {
 	if lastToolName != "test_tool" {
 		t.Errorf("Hook 看到的工具名 = %q, want test_tool", lastToolName)
 	}
-	
+
 	// 验证工具调用被记录
 	if atomic.LoadInt32(&recordedCalls) == 0 {
 		t.Error("工具调用未被记录到 ToolCallRecord")
@@ -101,7 +101,7 @@ type mockPreCallHook struct {
 	onPreCall func(hook.ToolHookContext) hook.ToolHookDecision
 }
 
-func (m *mockPreCallHook) Name() string             { return "mock-pre-call" }
+func (m *mockPreCallHook) Name() string              { return "mock-pre-call" }
 func (m *mockPreCallHook) Phase() hook.ToolHookPhase { return hook.PhasePreCall }
 func (m *mockPreCallHook) Matches(tool string) bool  { return true }
 func (m *mockPreCallHook) Priority() int             { return 100 }

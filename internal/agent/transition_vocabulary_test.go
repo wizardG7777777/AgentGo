@@ -30,7 +30,7 @@ func TestTransitionPayloads_UseModelTaskStatusVocabulary(t *testing.T) {
 
 	cases := []struct {
 		name      string
-		maxLoops  int
+		loopFuse  int // >0 时覆盖 emergencyLoopFuse（仅 fuse 用例使用）
 		executor  TaskExecutor
 		finalizer FinalizationChecker
 		cancelCtx bool
@@ -41,7 +41,6 @@ func TestTransitionPayloads_UseModelTaskStatusVocabulary(t *testing.T) {
 	}{
 		{
 			name:      "task_claimed",
-			maxLoops:  3,
 			executor:  staticExec(ExecuteResult{Output: "done", ToolCalled: false}, nil),
 			wantKind:  trace.KindTaskClaimed,
 			wantCause: "", // cause 含 taskID，另行前缀断言
@@ -50,7 +49,6 @@ func TestTransitionPayloads_UseModelTaskStatusVocabulary(t *testing.T) {
 		},
 		{
 			name:      "completed_natural",
-			maxLoops:  3,
 			executor:  staticExec(ExecuteResult{Output: "done", ToolCalled: false}, nil),
 			wantKind:  trace.KindTaskCompleted,
 			wantCause: "react_loop_exit:natural",
@@ -59,7 +57,6 @@ func TestTransitionPayloads_UseModelTaskStatusVocabulary(t *testing.T) {
 		},
 		{
 			name:      "completed_finalization_short_circuit",
-			maxLoops:  5,
 			executor:  staticExec(ExecuteResult{Output: "progress", ToolCalled: true}, nil),
 			finalizer: &flipFinalizationChecker{},
 			wantKind:  trace.KindTaskCompleted,
@@ -69,7 +66,6 @@ func TestTransitionPayloads_UseModelTaskStatusVocabulary(t *testing.T) {
 		},
 		{
 			name:      "cancelled_ctx_done",
-			maxLoops:  3,
 			executor:  staticExec(ExecuteResult{Output: "x", ToolCalled: true}, nil),
 			cancelCtx: true,
 			wantKind:  trace.KindTaskCancelled,
@@ -77,17 +73,16 @@ func TestTransitionPayloads_UseModelTaskStatusVocabulary(t *testing.T) {
 			wantNew:   model.TaskStatusCancelled,
 		},
 		{
-			name:      "retry_max_loops",
-			maxLoops:  2,
+			name:      "blocked_runtime_loop_fuse",
+			loopFuse:  3,
 			executor:  staticExec(ExecuteResult{Output: "x", ToolCalled: true}, nil),
-			wantKind:  trace.KindTaskRetry,
-			wantCause: "max_loops_exceeded",
+			wantKind:  trace.KindTaskBlocked,
+			wantCause: "runtime_loop_fuse",
 			wantPrev:  model.TaskStatusProcessing,
-			wantNew:   model.TaskStatusPending,
+			wantNew:   model.TaskStatusBlocked,
 		},
 		{
 			name:      "retry_recoverable_error",
-			maxLoops:  5,
 			executor:  staticExec(ExecuteResult{}, &ErrRecoverable{Err: errors.New("429 rate limit")}),
 			wantKind:  trace.KindTaskRetry,
 			wantCause: "recoverable_error",
@@ -96,7 +91,6 @@ func TestTransitionPayloads_UseModelTaskStatusVocabulary(t *testing.T) {
 		},
 		{
 			name:      "failed_non_recoverable",
-			maxLoops:  3,
 			executor:  staticExec(ExecuteResult{}, errors.New("unrecoverable boom")),
 			wantKind:  trace.KindTaskFailed,
 			wantCause: "non_recoverable_error",
@@ -104,8 +98,7 @@ func TestTransitionPayloads_UseModelTaskStatusVocabulary(t *testing.T) {
 			wantNew:   model.TaskStatusFailed,
 		},
 		{
-			name:     "failed_panic_recovery",
-			maxLoops: 3,
+			name: "failed_panic_recovery",
 			executor: func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
 				panic("kaboom")
 			},
@@ -130,7 +123,10 @@ func TestTransitionPayloads_UseModelTaskStatusVocabulary(t *testing.T) {
 				t.Fatalf("ClaimTask: %v", err)
 			}
 
-			ag := NewAgent(agentID, "code", s, r, tc.executor, tc.maxLoops)
+			ag := NewAgent(agentID, "code", s, r, tc.executor)
+			if tc.loopFuse > 0 {
+				ag.loopFuse = tc.loopFuse
+			}
 			if tc.finalizer != nil {
 				ag.FinalizationChecker = tc.finalizer
 			}

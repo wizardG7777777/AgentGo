@@ -32,10 +32,10 @@ func TestRenderTemplate_TransitionFields(t *testing.T) {
 				PrevStatus: "processing",
 				NewStatus:  "failed",
 				RetryCount: 4,
-				Cause:      "max_loops_exceeded",
+				Cause:      "non_recoverable_error",
 			},
 		})
-	want := "retry=4 from=processing to=failed cause=max_loops_exceeded"
+	want := "retry=4 from=processing to=failed cause=non_recoverable_error"
 	if got != want {
 		t.Errorf("got=%q want=%q", got, want)
 	}
@@ -257,11 +257,9 @@ reactors:
 
 func TestProgramVerifyReactors_RequestPlanReevaluation(t *testing.T) {
 	repoRoot := testRepoRoot(t)
-	store := &fakeStore{}
-	requester := &fakeReplanRequester{response: "queued"}
+	st := newReplanWakeStore()
 	rs, err := LoadFromFile(filepath.Join(repoRoot, "reactors.program-verify.yaml"), repoRoot, Deps{
-		Store:           store,
-		ReplanRequester: requester,
+		Store: st,
 		KindEventTypes: map[string]string{
 			"worker":   "",
 			"verifier": "verify",
@@ -291,12 +289,16 @@ func TestProgramVerifyReactors_RequestPlanReevaluation(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Run worker event: %v", err)
 	}
-	if got := len(store.snapshot()); got != 0 {
-		t.Fatalf("planned Reactor must not publish verifier tasks directly, got %d", got)
+	wakes := wakeTasks(t, st)
+	if len(wakes) != 1 {
+		t.Fatalf("worker 重试压力应发布 1 个 replan 唤醒任务，got %d", len(wakes))
 	}
-	calls := requester.snapshot()
-	if len(calls) != 1 || calls[0].reasonCode != "worker_retry_pressure" || calls[0].urgency != "high" {
-		t.Fatalf("request_replan calls=%+v", calls)
+	if !strings.Contains(wakes[0].Description, "reason_code=worker_retry_pressure") ||
+		!strings.Contains(wakes[0].Description, "urgency=high") {
+		t.Fatalf("唤醒任务描述应含 reason_code/urgency: %q", wakes[0].Description)
+	}
+	if wakes[0].ParentTaskID != "worker-task-1" {
+		t.Fatalf("ParentTaskID = %q, want worker-task-1", wakes[0].ParentTaskID)
 	}
 
 	if err := rs[0].Run(trace.Event{
@@ -307,8 +309,8 @@ func TestProgramVerifyReactors_RequestPlanReevaluation(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Run verifier event: %v", err)
 	}
-	if got := len(requester.snapshot()); got != 1 {
-		t.Fatalf("verifier retry should not request recursively, got %d calls", got)
+	if got := len(wakeTasks(t, st)); got != 1 {
+		t.Fatalf("verifier retry 不应触发 per-kind 过滤外的发布，got %d 个唤醒任务", got)
 	}
 }
 

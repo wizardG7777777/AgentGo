@@ -50,7 +50,7 @@ func TestSDKClient_Chat_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL, "test-key", "gpt-4o", "", "", 30*time.Second)
+	client := NewSDKClient(server.URL, "test-key", "gpt-4o", "", 30*time.Second)
 	resp, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "hello"}}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -77,7 +77,7 @@ func TestSDKClient_ReasoningEffortIsSent(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClientWithConfig(server.URL, "key", "gpt-test", "", "openai", 30*time.Second, ClientConfig{
+	client := NewSDKClientWithConfig(server.URL, "key", "gpt-test", "", 30*time.Second, ClientConfig{
 		ReasoningEffort: "max",
 	})
 	if _, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil); err != nil {
@@ -85,32 +85,6 @@ func TestSDKClient_ReasoningEffortIsSent(t *testing.T) {
 	}
 	if got := body["reasoning_effort"]; got != "max" {
 		t.Fatalf("reasoning_effort = %#v, want max", got)
-	}
-}
-
-func TestSDKClient_OpenRouterReasoningEffortIsMapped(t *testing.T) {
-	var body map[string]any
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatal(err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(openaiResponse("ok", nil))
-	}))
-	defer server.Close()
-
-	client := NewSDKClientWithConfig(server.URL, "key", "openai/gpt-test", "", "openrouter", 30*time.Second, ClientConfig{
-		ReasoningEffort: "xhigh",
-	})
-	if _, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, exists := body["reasoning_effort"]; exists {
-		t.Fatalf("OpenRouter request must not include top-level reasoning_effort: %+v", body)
-	}
-	reasoning, ok := body["reasoning"].(map[string]any)
-	if !ok || reasoning["effort"] != "xhigh" {
-		t.Fatalf("reasoning = %#v, want effort=xhigh", body["reasoning"])
 	}
 }
 
@@ -125,7 +99,7 @@ func TestSDKClient_ModelOverrideViaContext(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL, "key", "gpt-4o", "", "", 30*time.Second)
+	client := NewSDKClient(server.URL, "key", "gpt-4o", "", 30*time.Second)
 
 	// 无覆盖：请求模型为构造期模型。
 	if _, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "a"}}, nil); err != nil {
@@ -177,7 +151,7 @@ func TestSDKClient_StreamingAccumulatesContentUsageAndExtras(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClientWithConfig(server.URL, "key", "gpt-test", "", "openai", 30*time.Second, ClientConfig{
+	client := NewSDKClientWithConfig(server.URL, "key", "gpt-test", "", 30*time.Second, ClientConfig{
 		ReasoningEffort: "high",
 		Stream:          true,
 	})
@@ -216,7 +190,7 @@ func TestSDKClient_StreamingAccumulatesToolCallArguments(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClientWithConfig(server.URL, "key", "gpt-test", "", "openai", 30*time.Second, ClientConfig{Stream: true})
+	client := NewSDKClientWithConfig(server.URL, "key", "gpt-test", "", 30*time.Second, ClientConfig{Stream: true})
 	resp, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "read"}}, []ToolDef{{Name: "read_file"}})
 	if err != nil {
 		t.Fatal(err)
@@ -243,7 +217,7 @@ func TestSDKClient_Chat_WithToolCalls(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL, "test-key", "gpt-4o", "", "", 30*time.Second)
+	client := NewSDKClient(server.URL, "test-key", "gpt-4o", "", 30*time.Second)
 	resp, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "read file"}}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -275,7 +249,7 @@ func TestSDKClient_Chat_SystemPrompt(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL, "key", "gpt-4o", "你是任务调度器", "", 30*time.Second)
+	client := NewSDKClient(server.URL, "key", "gpt-4o", "你是任务调度器", 30*time.Second)
 	client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
 
 	messages, ok := capturedBody["messages"].([]any)
@@ -302,7 +276,7 @@ func TestSDKClient_Chat_401_Unrecoverable(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL, "bad-key", "gpt-4o", "", "", 30*time.Second)
+	client := NewSDKClient(server.URL, "bad-key", "gpt-4o", "", 30*time.Second)
 	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
 
 	var unrecoverable *ErrUnrecoverable
@@ -324,7 +298,7 @@ func TestSDKClient_Chat_429_Recoverable(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL+"/v1", "key", "gpt-4o", "", "", 30*time.Second)
+	client := NewSDKClient(server.URL+"/v1", "key", "gpt-4o", "", 30*time.Second)
 	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
 
 	var recoverable *ErrRecoverable
@@ -347,7 +321,7 @@ func TestSDKClient_Chat_500_Unrecoverable(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL+"/v1", "key", "gpt-4o", "", "", 30*time.Second)
+	client := NewSDKClient(server.URL+"/v1", "key", "gpt-4o", "", 30*time.Second)
 	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
 
 	var unrecoverable *ErrUnrecoverable
@@ -376,7 +350,7 @@ func TestSDKClient_Chat_400_ModelNotFound_Unrecoverable(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL+"/v1", "key", "gpt-5", "", "", 30*time.Second)
+	client := NewSDKClient(server.URL+"/v1", "key", "gpt-5", "", 30*time.Second)
 	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
 
 	var unrecoverable *ErrUnrecoverable
@@ -404,7 +378,7 @@ func TestSDKClient_Chat_502_Recoverable(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL+"/v1", "key", "gpt-4o", "", "", 30*time.Second)
+	client := NewSDKClient(server.URL+"/v1", "key", "gpt-4o", "", 30*time.Second)
 	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
 
 	var recoverable *ErrRecoverable
@@ -426,7 +400,7 @@ func TestSDKClient_Chat_503_Recoverable(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL+"/v1", "key", "gpt-4o", "", "", 30*time.Second)
+	client := NewSDKClient(server.URL+"/v1", "key", "gpt-4o", "", 30*time.Second)
 	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
 
 	var recoverable *ErrRecoverable
@@ -461,7 +435,7 @@ func TestSDKClient_Chat_EndpointPropagation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL+"/v1", "bad-key", "gpt-4o", "", "", 30*time.Second)
+	client := NewSDKClient(server.URL+"/v1", "bad-key", "gpt-4o", "", 30*time.Second)
 	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
 
 	var unrecoverable *ErrUnrecoverable
@@ -485,7 +459,7 @@ func TestSDKClient_Chat_ContextCancel(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL, "key", "gpt-4o", "", "", 30*time.Second)
+	client := NewSDKClient(server.URL, "key", "gpt-4o", "", 30*time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // 立即取消
 
@@ -502,7 +476,7 @@ func TestSDKClient_Chat_FinishReasonLength_ReturnsBadResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL, "key", "gpt-4o", "", "", 30*time.Second)
+	client := NewSDKClient(server.URL, "key", "gpt-4o", "", 30*time.Second)
 	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
 
 	var badResp *ErrBadResponse
@@ -518,7 +492,7 @@ func TestSDKClient_Chat_FinishReasonContentFilter_ReturnsUnrecoverable(t *testin
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL, "key", "gpt-4o", "", "", 30*time.Second)
+	client := NewSDKClient(server.URL, "key", "gpt-4o", "", 30*time.Second)
 	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
 
 	var unrecov *ErrUnrecoverable
@@ -544,7 +518,7 @@ func TestSDKClient_Chat_BadToolCallJSON_ReturnsBadResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL, "key", "gpt-4o", "", "", 30*time.Second)
+	client := NewSDKClient(server.URL, "key", "gpt-4o", "", 30*time.Second)
 	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
 
 	var badResp *ErrBadResponse
@@ -569,7 +543,7 @@ func TestConvertMessage_UnknownRole_ReturnsError(t *testing.T) {
 
 func TestDefaultTimeout_Applied(t *testing.T) {
 	// timeout=0 应使用默认值，不应 panic
-	client := NewSDKClient("http://localhost:1", "key", "gpt-4o", "", "", 0)
+	client := NewSDKClient("http://localhost:1", "key", "gpt-4o", "", 0)
 	if client == nil {
 		t.Fatal("expected non-nil client with default timeout")
 	}
@@ -616,7 +590,7 @@ func TestSDKClient_Chat_ExtractExtraFields(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL, "key", "gpt-4o", "", "", 30*time.Second)
+	client := NewSDKClient(server.URL, "key", "gpt-4o", "", 30*time.Second)
 	resp, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -647,7 +621,7 @@ func TestSDKClient_Chat_NoExtraFieldsInResponse_NilMap(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL, "key", "gpt-4o", "", "", 30*time.Second)
+	client := NewSDKClient(server.URL, "key", "gpt-4o", "", 30*time.Second)
 	resp, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -667,7 +641,7 @@ func TestSDKClient_Chat_RoundtripExtraFields_WrittenBackOnAssistant(t *testing.T
 	}))
 	defer server.Close()
 
-	client := NewSDKClient(server.URL, "key", "gpt-4o", "", "", 30*time.Second)
+	client := NewSDKClient(server.URL, "key", "gpt-4o", "", 30*time.Second)
 	history := []Message{
 		{Role: "user", Content: "q1"},
 		{
@@ -710,141 +684,6 @@ func TestSDKClient_Chat_RoundtripExtraFields_WrittenBackOnAssistant(t *testing.T
 }
 
 // ============================================================================
-// 集成 — 模拟 DeepSeek V4 / R1 后端的两轮对话
-// ============================================================================
-
-// TestSDKClient_DeepSeekV4_SimulatedRoundTrip 模拟 V4 的严格契约：
-// 第一轮返回 reasoning_content；第二轮 server 校验 assistant 消息里必须有
-// reasoning_content，缺失则 400。client 用 providerName="deepseek-v4"。
-func TestSDKClient_DeepSeekV4_SimulatedRoundTrip(t *testing.T) {
-	var round int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]any
-		json.NewDecoder(r.Body).Decode(&body)
-		round++
-
-		if round == 2 {
-			// 第二轮：检查 assistant 消息是否带 reasoning_content
-			messages, _ := body["messages"].([]any)
-			var asstFound bool
-			for _, m := range messages {
-				mm := m.(map[string]any)
-				if mm["role"] != "assistant" {
-					continue
-				}
-				asstFound = true
-				if _, has := mm["reasoning_content"]; !has {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(400)
-					json.NewEncoder(w).Encode(map[string]any{
-						"error": map[string]any{
-							"message": "reasoning_content in thinking mode must be passed back",
-							"type":    "invalid_request_error",
-						},
-					})
-					return
-				}
-			}
-			if !asstFound {
-				t.Errorf("第二轮请求里没有 assistant 消息")
-			}
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(openaiResponseWithExtras(
-			"round-"+itoa(round),
-			map[string]any{"reasoning_content": "thinking on round " + itoa(round)},
-		))
-	}))
-	defer server.Close()
-
-	client := NewSDKClient(server.URL, "key", "deepseek-v4-flash", "", "deepseek-v4", 30*time.Second)
-
-	// 第一轮
-	r1, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "q1"}}, nil)
-	if err != nil {
-		t.Fatalf("round 1 失败: %v", err)
-	}
-	if r1.ExtraFields == nil {
-		t.Fatal("round 1 ExtraFields 为 nil")
-	}
-
-	// 第二轮：携带第一轮的 assistant ExtraFields
-	history := []Message{
-		{Role: "user", Content: "q1"},
-		{Role: "assistant", Content: r1.Content, ExtraFields: r1.ExtraFields},
-		{Role: "user", Content: "q2"},
-	}
-	r2, err := client.Chat(context.Background(), history, nil)
-	if err != nil {
-		t.Fatalf("round 2 失败（400 说明 reasoning_content 没被回写）: %v", err)
-	}
-	if r2.Content != "round-2" {
-		t.Errorf("round 2 content = %q, want %q", r2.Content, "round-2")
-	}
-}
-
-// TestSDKClient_DeepSeekR1_StripsOnSecondRound 模拟 R1 的反向契约：
-// 第二轮 server 校验 assistant 消息里**不能**带 reasoning_content，否则 400。
-// client 用 providerName="deepseek-r1"。
-func TestSDKClient_DeepSeekR1_StripsOnSecondRound(t *testing.T) {
-	var round int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]any
-		json.NewDecoder(r.Body).Decode(&body)
-		round++
-
-		if round == 2 {
-			messages, _ := body["messages"].([]any)
-			for _, m := range messages {
-				mm := m.(map[string]any)
-				if mm["role"] != "assistant" {
-					continue
-				}
-				if _, has := mm["reasoning_content"]; has {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(400)
-					json.NewEncoder(w).Encode(map[string]any{
-						"error": map[string]any{
-							"message": "reasoning_content must be removed from previous messages",
-							"type":    "invalid_request_error",
-						},
-					})
-					return
-				}
-			}
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(openaiResponseWithExtras(
-			"round-"+itoa(round),
-			map[string]any{"reasoning_content": "R1 thinking on round " + itoa(round)},
-		))
-	}))
-	defer server.Close()
-
-	client := NewSDKClient(server.URL, "key", "deepseek-reasoner", "", "deepseek-r1", 30*time.Second)
-
-	r1, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "q1"}}, nil)
-	if err != nil {
-		t.Fatalf("round 1 失败: %v", err)
-	}
-
-	history := []Message{
-		{Role: "user", Content: "q1"},
-		{Role: "assistant", Content: r1.Content, ExtraFields: r1.ExtraFields},
-		{Role: "user", Content: "q2"},
-	}
-	r2, err := client.Chat(context.Background(), history, nil)
-	if err != nil {
-		t.Fatalf("round 2 失败（400 说明 R1 provider 没剥离 reasoning_content）: %v", err)
-	}
-	if r2.Content != "round-2" {
-		t.Errorf("round 2 content = %q", r2.Content)
-	}
-}
-
-// ============================================================================
 // helpers
 // ============================================================================
 
@@ -862,16 +701,4 @@ func keysOfAny(m map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
-}
-
-func itoa(i int) string {
-	switch i {
-	case 1:
-		return "1"
-	case 2:
-		return "2"
-	case 3:
-		return "3"
-	}
-	return "N"
 }

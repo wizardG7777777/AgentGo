@@ -11,7 +11,6 @@ import (
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/output"
-	"agentgo/internal/scheduler"
 	"agentgo/internal/trace"
 )
 
@@ -51,8 +50,6 @@ type Deps struct {
 	PollBoard func() []BoardTask
 	// PollInterval 是快照轮询间隔；<=0 时使用 DefaultPollInterval。
 	PollInterval time.Duration
-	// ModeGet 返回当前调度模式（"plan" / "immediate"）。
-	ModeGet func() string
 	// ExecModeGet 返回当前执行权限模式（"normal" / "strict" / "readonly" / "yolo"）。
 	ExecModeGet func() string
 	// TopoModeGet 返回当前编排拓扑模式（"team" / "solo"）。
@@ -88,10 +85,6 @@ type Deps struct {
 	// SteerSend 投递一条已构造好的 steer 邮件。消息构造（From=user /
 	// MsgTypeSteer / PriorityHigh）是协议，保留在 ui 层；注入方只负责传输。
 	SteerSend func(msg mailbox.Message) error
-	// ModeSet 切换调度模式的 gate 轴。Controller.SetMode 负责
-	// bool→scheduler.Mode（= modes.GateMode）的映射
-	// （true=plan，false=immediate），与三轴 modes.Store 的 gate 轴语义一致。
-	ModeSet func(mode scheduler.Mode)
 	// ExecModeSet 切换 exec 轴。Controller.SetExecMode 已用
 	// modes.ParseExecMode 解析并传入规范化小写串（"normal" 等），
 	// 装配方只需写入 store，无需再解析。
@@ -105,19 +98,13 @@ type Deps struct {
 	SessionSwitch func(id string) (changed bool, err error)
 	// SessionList 返回全部 Session 信息。
 	SessionList func() ([]SessionInfo, error)
-	// ApprovePlanReview 批准一个处于 plan_review 挂起的 Plan（gate=plan）。
-	// idPrefix 为 Plan ID 前缀；空串在恰好一个待批准时默认选中。返回一行
-	// 中文摘要；前缀解析 / 歧义处理 / 保留 controller 预发布与 Plan 恢复
-	// 全部由装配方完成。
-	ApprovePlanReview func(idPrefix string) (summary string, err error)
-	// RejectPlanReview 拒绝并终止一个处于 plan_review 挂起的 Plan。
-	// 前缀语义同 ApprovePlanReview。
-	RejectPlanReview func(idPrefix string) (summary string, err error)
-	// PendingPlanReviews 返回全部等待批准的计划条目（/plan 列表）。
-	PendingPlanReviews func() ([]PlanReviewItem, error)
 	// ResolveInteraction 由 bootstrap 路由并执行服务器端 ActionRef；Hub 不
 	// 解释业务动作，只转交客户端的 option_id / text 与 expected_version。
 	ResolveInteraction func(context.Context, interaction.ResolveInput) (interaction.Request, error)
+	// RequestAgentAudit 为 Scheduler 创建只读代理审计任务（V6 §2 P1b，
+	// /doctor agents），返回审计任务 ID。审计包（各 agent 的身份/prompt
+	// 摘要/真实工具面/运行模式/路由状态 + 只读指令）由装配方构建。
+	RequestAgentAudit func() (taskID string, err error)
 	// QuitFn 是退出入口（对应 tui 的 /quit → CancelFn）。
 	QuitFn func()
 }
@@ -156,7 +143,7 @@ type Hub struct {
 	persistedTurnIDs map[string]bool
 	pendingTurns     map[string]AgentTurn
 
-	// Session 级 token 累加器：由 EmitTraceEvent 逐条累加 token_stats 事件
+	// Session 级 token 累加器：由 EmitTraceEvent 逐条累加 llm_call_end 事件
 	// （每次 LLM 调用恰好一条，载本轮消耗）。独立于 snapshot 存放，
 	// refreshSnapshot 整体替换快照时不会被抹掉；ad-hoc 团队销毁后其消耗
 	// 仍累计在此，避免"对存活 agent 求和"导致的消耗隐形。
@@ -331,10 +318,10 @@ func (h *Hub) snapshotWithFeedLocked() Snapshot {
 	return snap
 }
 
-// recordTokenStats 累加一条 token_stats 事件的本轮消耗到 session 级计数器。
-// token_stats 每次 LLM 调用恰好 emit 一条（agent.go 主循环），因此不存在
-// 重复计数；llm_call_end 虽也载本轮 token，但不纳入（会与 token_stats 双计）。
-func (h *Hub) recordTokenStats(ev trace.Event) {
+// recordLLMUsage 累加一条 llm_call_end 事件的本轮消耗到 session 级计数器。
+// llm_call_end 每次 LLM 调用恰好 emit 一条（成功路径载本轮 token，失败路径
+// 为零），是 V6 起唯一的 token 账本，因此不存在重复计数。
+func (h *Hub) recordLLMUsage(ev trace.Event) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.sessionPromptTokens += int64(ev.PromptTokens)
@@ -587,9 +574,6 @@ func (h *Hub) refreshSnapshot() bool {
 	}
 	if h.deps.PollBoard != nil {
 		snap.Tasks = h.deps.PollBoard()
-	}
-	if h.deps.ModeGet != nil {
-		snap.Mode = h.deps.ModeGet()
 	}
 	if h.deps.ExecModeGet != nil {
 		snap.ExecMode = h.deps.ExecModeGet()

@@ -1,16 +1,12 @@
 package builtin
 
 import (
-	"context"
-	"errors"
-	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"agentgo/internal/model"
-	"agentgo/internal/plan"
 	"agentgo/internal/reactor"
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
@@ -18,45 +14,13 @@ import (
 
 // ---------- 测试替身 ----------
 
-// fakeAnomalyStore 实现 anomalyStoreView，返回预设的任务与工具历史。
+// fakeAnomalyStore 实现 anomalyStoreView，返回预设的工具历史。
 type fakeAnomalyStore struct {
-	task    *model.Task
-	taskErr error
 	history []store.ToolCallRecord
 }
 
-func (f *fakeAnomalyStore) GetTask(string) (*model.Task, error) { return f.task, f.taskErr }
 func (f *fakeAnomalyStore) GetToolCallHistory(string) []store.ToolCallRecord {
 	return f.history
-}
-
-// fakeReplanRequester 记录收到的 ReplanRequest，可注入错误。
-type fakeReplanRequester struct {
-	mu       sync.Mutex
-	requests []model.ReplanRequest
-	err      error
-}
-
-func (f *fakeReplanRequester) RequestReplan(_ context.Context, req model.ReplanRequest) (*model.ReplanRequest, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.err != nil {
-		return nil, f.err
-	}
-	cp := req
-	if cp.ID == "" {
-		cp.ID = fmt.Sprintf("req-%d", len(f.requests)+1)
-	}
-	f.requests = append(f.requests, cp)
-	return &cp, nil
-}
-
-func (f *fakeReplanRequester) snapshot() []model.ReplanRequest {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]model.ReplanRequest, len(f.requests))
-	copy(out, f.requests)
-	return out
 }
 
 // captureReactor 同步捕获 KindError 事件（同步 → 在 trace.Emit 调用方
@@ -115,7 +79,7 @@ func completedEv(taskID string) trace.Event {
 // ---------- 元数据 / 接口 ----------
 
 func TestAnomalyReactor_Metadata(t *testing.T) {
-	r := NewAnomalyReactor(nil, nil)
+	r := NewAnomalyReactor(nil)
 	var _ reactor.Reactor = r
 	if r.Name() != "runtime-anomaly" {
 		t.Errorf("Name = %q", r.Name())
@@ -133,65 +97,59 @@ func TestAnomalyReactor_Metadata(t *testing.T) {
 }
 
 func TestAnomalyReactor_NilDepsNoPanic(t *testing.T) {
-	r := NewAnomalyReactor(nil, nil)
+	r := NewAnomalyReactor(nil)
 	if err := r.Run(completedEv("t-1")); err != nil {
 		t.Errorf("nil store 应静默 no-op，got err=%v", err)
 	}
 }
 
 func TestAnomalyReactor_EmptyTaskIDNoPanic(t *testing.T) {
-	r := NewAnomalyReactor(&fakeAnomalyStore{history: []store.ToolCallRecord{okCall("write_file")}}, &fakeReplanRequester{})
+	cap := installCapture(t)
+	r := NewAnomalyReactor(&fakeAnomalyStore{history: []store.ToolCallRecord{okCall("write_file")}})
 	if err := r.Run(trace.Event{Kind: trace.KindTaskCompleted}); err != nil {
 		t.Errorf("空 TaskID 应静默 no-op，got err=%v", err)
+	}
+	if evs := cap.snapshot(); len(evs) != 0 {
+		t.Errorf("空 TaskID 不应告警，got %d 条", len(evs))
 	}
 }
 
 func TestAnomalyReactor_NoHistoryNoAnomaly(t *testing.T) {
-	req := &fakeReplanRequester{}
-	r := NewAnomalyReactor(&fakeAnomalyStore{task: &model.Task{PlanID: "p-1"}}, req)
+	cap := installCapture(t)
+	r := NewAnomalyReactor(&fakeAnomalyStore{})
 	if err := r.Run(completedEv("t-1")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if got := req.snapshot(); len(got) != 0 {
-		t.Errorf("无工具历史不应报警，got %d 条请求", len(got))
+	if evs := cap.snapshot(); len(evs) != 0 {
+		t.Errorf("无工具历史不应报警，got %d 条告警", len(evs))
 	}
 }
 
 // ---------- 启发式 ②：fabricated_write ----------
 
 func TestAnomalyReactor_FabricatedWriteHit(t *testing.T) {
-	req := &fakeReplanRequester{}
+	cap := installCapture(t)
 	st := &fakeAnomalyStore{
-		task:    &model.Task{ID: "t-1", PlanID: "p-1"},
 		history: []store.ToolCallRecord{okCall("write_file"), okCall("write_file")},
 	}
-	r := NewAnomalyReactor(st, req)
+	r := NewAnomalyReactor(st)
 	if err := r.Run(completedEv("t-1")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	got := req.snapshot()
-	if len(got) != 1 {
-		t.Fatalf("应产生 1 条重规划请求，got %d", len(got))
+	evs := cap.snapshot()
+	if len(evs) != 1 {
+		t.Fatalf("应发 1 条 KindError 告警，got %d", len(evs))
 	}
-	rr := got[0]
-	if rr.PlanID != "p-1" || rr.SourceTaskID != "t-1" {
-		t.Errorf("PlanID/SourceTaskID = %q/%q", rr.PlanID, rr.SourceTaskID)
+	ev := evs[0]
+	if ev.Kind != trace.KindError || ev.TaskID != "t-1" || ev.AgentID != "agent-1" {
+		t.Errorf("告警事件字段不对: %+v", ev)
 	}
-	if rr.SourceEvent != "anomaly_reactor" {
-		t.Errorf("SourceEvent = %q", rr.SourceEvent)
+	if !strings.Contains(ev.Error, anomalyCodeFabricatedWrite) ||
+		!strings.Contains(ev.Error, "WARNING anomaly_reactor") {
+		t.Errorf("告警内容应含异常码与 WARNING 前缀: %q", ev.Error)
 	}
-	if rr.ReasonCode != anomalyCodeFabricatedWrite {
-		t.Errorf("ReasonCode = %q", rr.ReasonCode)
-	}
-	if rr.Urgency != model.ReplanUrgencyNormal {
-		t.Errorf("Urgency = %q, 应 normal", rr.Urgency)
-	}
-	wantKey := "anomaly_reactor|t-1|" + anomalyCodeFabricatedWrite
-	if rr.IdempotencyKey != wantKey {
-		t.Errorf("IdempotencyKey = %q, want %q", rr.IdempotencyKey, wantKey)
-	}
-	if !strings.Contains(rr.Detail, "read_file") {
-		t.Errorf("Detail 应含人类可读说明: %q", rr.Detail)
+	if !strings.Contains(ev.Error, "read_file") {
+		t.Errorf("告警内容应含人类可读说明: %q", ev.Error)
 	}
 }
 
@@ -204,14 +162,13 @@ func TestAnomalyReactor_FabricatedWriteMiss(t *testing.T) {
 		"list_dir 等其他工具不触发":     {okCall("list_dir"), okCall("grep_search")},
 	}
 	for name, history := range cases {
-		req := &fakeReplanRequester{}
-		st := &fakeAnomalyStore{task: &model.Task{ID: "t-1", PlanID: "p-1"}, history: history}
-		r := NewAnomalyReactor(st, req)
+		cap := installCapture(t)
+		r := NewAnomalyReactor(&fakeAnomalyStore{history: history})
 		if err := r.Run(completedEv("t-1")); err != nil {
 			t.Fatalf("%s: Run: %v", name, err)
 		}
-		if got := req.snapshot(); len(got) != 0 {
-			t.Errorf("%s: 不应报警，got %d 条请求", name, len(got))
+		if evs := cap.snapshot(); len(evs) != 0 {
+			t.Errorf("%s: 不应报警，got %d 条告警", name, len(evs))
 		}
 	}
 }
@@ -243,223 +200,107 @@ func TestAnomalyReactor_ToolErrorRate(t *testing.T) {
 		{"0 调用不命中", nil, false},
 	}
 	for _, tc := range cases {
-		req := &fakeReplanRequester{}
-		st := &fakeAnomalyStore{task: &model.Task{ID: "t-1", PlanID: "p-1"}, history: tc.history}
-		r := NewAnomalyReactor(st, req)
+		cap := installCapture(t)
+		r := NewAnomalyReactor(&fakeAnomalyStore{history: tc.history})
 		if err := r.Run(completedEv("t-1")); err != nil {
 			t.Fatalf("%s: Run: %v", tc.name, err)
 		}
-		got := req.snapshot()
+		evs := cap.snapshot()
 		if tc.wantHit {
-			if len(got) != 1 || got[0].ReasonCode != anomalyCodeToolErrorRate {
-				t.Errorf("%s: 应命中 tool_error_rate，got %+v", tc.name, got)
+			if len(evs) != 1 || !strings.Contains(evs[0].Error, anomalyCodeToolErrorRate) {
+				t.Errorf("%s: 应命中 tool_error_rate，got %+v", tc.name, evs)
 			}
-		} else if len(got) != 0 {
-			t.Errorf("%s: 不应报警，got %+v", tc.name, got)
+		} else if len(evs) != 0 {
+			t.Errorf("%s: 不应报警，got %+v", tc.name, evs)
 		}
 	}
 }
 
 func TestAnomalyReactor_ToolErrorRateDetail(t *testing.T) {
-	req := &fakeReplanRequester{}
+	cap := installCapture(t)
 	history := []store.ToolCallRecord{
 		errCall("run_shell"), errCall("read_file"), okCall("read_file"), okCall("list_dir"), okCall("read_file"),
 	}
-	st := &fakeAnomalyStore{task: &model.Task{ID: "t-1", PlanID: "p-1"}, history: history}
-	r := NewAnomalyReactor(st, req)
+	r := NewAnomalyReactor(&fakeAnomalyStore{history: history})
 	if err := r.Run(completedEv("t-1")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	got := req.snapshot()
-	if len(got) != 1 {
-		t.Fatalf("应 1 条请求，got %d", len(got))
+	evs := cap.snapshot()
+	if len(evs) != 1 {
+		t.Fatalf("应 1 条告警，got %d", len(evs))
 	}
-	if !strings.Contains(got[0].Detail, "40% (2/5)") {
-		t.Errorf("Detail 应含错误率统计: %q", got[0].Detail)
+	if !strings.Contains(evs[0].Error, "40% (2/5)") {
+		t.Errorf("告警内容应含错误率统计: %q", evs[0].Error)
 	}
 }
 
 // ---------- 双异常并发 ----------
 
 func TestAnomalyReactor_BothAnomaliesReportSeparately(t *testing.T) {
-	req := &fakeReplanRequester{}
+	cap := installCapture(t)
 	// 5 次调用：write_file 全成功 + 2 次其他工具失败 → 同时命中 ②③
 	history := []store.ToolCallRecord{
 		okCall("write_file"), errCall("run_shell"), errCall("run_shell"), okCall("write_file"), okCall("write_file"),
 	}
-	st := &fakeAnomalyStore{task: &model.Task{ID: "t-1", PlanID: "p-1"}, history: history}
-	r := NewAnomalyReactor(st, req)
+	r := NewAnomalyReactor(&fakeAnomalyStore{history: history})
 	if err := r.Run(completedEv("t-1")); err != nil {
 		t.Fatalf("Run: %v", err)
-	}
-	got := req.snapshot()
-	if len(got) != 2 {
-		t.Fatalf("两条异常应各报一次，got %d: %+v", len(got), got)
-	}
-	keys := map[string]bool{}
-	for _, rr := range got {
-		keys[rr.IdempotencyKey] = true
-	}
-	if !keys["anomaly_reactor|t-1|"+anomalyCodeFabricatedWrite] ||
-		!keys["anomaly_reactor|t-1|"+anomalyCodeToolErrorRate] {
-		t.Errorf("幂等键应各含 taskID+异常码: %v", keys)
-	}
-}
-
-// ---------- 无 Plan 降级 ----------
-
-func TestAnomalyReactor_NoPlanDegradesToTraceWarning(t *testing.T) {
-	cap := installCapture(t)
-	req := &fakeReplanRequester{}
-	st := &fakeAnomalyStore{
-		task:    &model.Task{ID: "t-1"}, // 无 PlanID
-		history: []store.ToolCallRecord{okCall("write_file")},
-	}
-	r := NewAnomalyReactor(st, req)
-	if err := r.Run(completedEv("t-1")); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if got := req.snapshot(); len(got) != 0 {
-		t.Errorf("无 Plan 任务不应请求重规划，got %d", len(got))
 	}
 	evs := cap.snapshot()
-	if len(evs) != 1 {
-		t.Fatalf("应发 1 条 KindError 告警，got %d", len(evs))
+	if len(evs) != 2 {
+		t.Fatalf("两条异常应各报一次，got %d: %+v", len(evs), evs)
 	}
-	if evs[0].Kind != trace.KindError || evs[0].TaskID != "t-1" {
-		t.Errorf("告警事件字段不对: %+v", evs[0])
+	codes := map[string]bool{}
+	for _, ev := range evs {
+		if strings.Contains(ev.Error, anomalyCodeFabricatedWrite) {
+			codes[anomalyCodeFabricatedWrite] = true
+		}
+		if strings.Contains(ev.Error, anomalyCodeToolErrorRate) {
+			codes[anomalyCodeToolErrorRate] = true
+		}
 	}
-	if !strings.Contains(evs[0].Error, anomalyCodeFabricatedWrite) ||
-		!strings.Contains(evs[0].Error, "WARNING anomaly_reactor") {
-		t.Errorf("告警内容应含异常码与 WARNING 前缀: %q", evs[0].Error)
-	}
-}
-
-func TestAnomalyReactor_GetTaskErrorDegradesToTraceWarning(t *testing.T) {
-	cap := installCapture(t)
-	req := &fakeReplanRequester{}
-	st := &fakeAnomalyStore{
-		taskErr: fmt.Errorf("task 已被淘汰"),
-		history: []store.ToolCallRecord{okCall("write_file")},
-	}
-	r := NewAnomalyReactor(st, req)
-	if err := r.Run(completedEv("t-gone")); err != nil {
-		t.Fatalf("GetTask 失败不应报错（降级告警），got %v", err)
-	}
-	if got := req.snapshot(); len(got) != 0 {
-		t.Errorf("任务查不到不应请求重规划，got %d", len(got))
-	}
-	if evs := cap.snapshot(); len(evs) != 1 {
-		t.Errorf("应降级发 1 条 trace 告警，got %d", len(evs))
+	if !codes[anomalyCodeFabricatedWrite] || !codes[anomalyCodeToolErrorRate] {
+		t.Errorf("两条告警应各含一个异常码: %v", codes)
 	}
 }
 
 // ---------- 幂等防重 ----------
 
 func TestAnomalyReactor_SameTaskSameCodeReportedOnce(t *testing.T) {
-	req := &fakeReplanRequester{}
+	cap := installCapture(t)
 	st := &fakeAnomalyStore{
-		task:    &model.Task{ID: "t-1", PlanID: "p-1"},
 		history: []store.ToolCallRecord{okCall("write_file")},
 	}
-	r := NewAnomalyReactor(st, req)
+	r := NewAnomalyReactor(st)
 	// 模拟任务重试后再次 completed：同一 (taskID, code) 只报一次
 	for i := 0; i < 3; i++ {
 		if err := r.Run(completedEv("t-1")); err != nil {
 			t.Fatalf("Run #%d: %v", i, err)
 		}
 	}
-	if got := req.snapshot(); len(got) != 1 {
-		t.Errorf("同一任务同一异常码应只报一次，got %d 条请求", len(got))
+	if evs := cap.snapshot(); len(evs) != 1 {
+		t.Errorf("同一任务同一异常码应只报一次，got %d 条告警", len(evs))
 	}
 }
 
 func TestAnomalyReactor_DifferentTasksReportIndependently(t *testing.T) {
-	req := &fakeReplanRequester{}
+	cap := installCapture(t)
 	st := &fakeAnomalyStore{
-		task:    &model.Task{ID: "t-1", PlanID: "p-1"},
 		history: []store.ToolCallRecord{okCall("write_file")},
 	}
-	r := NewAnomalyReactor(st, req)
+	r := NewAnomalyReactor(st)
 	_ = r.Run(completedEv("t-1"))
 	_ = r.Run(completedEv("t-2"))
-	if got := req.snapshot(); len(got) != 2 {
-		t.Errorf("不同任务各自独立审计，应报 2 次，got %d", len(got))
+	evs := cap.snapshot()
+	if len(evs) != 2 {
+		t.Fatalf("不同任务各自独立审计，应报 2 次，got %d", len(evs))
 	}
-}
-
-// TestAnomalyReactor_CoordinatorIdempotencyAcrossInstances 用真实
-// plan.Coordinator 验证：即使进程内防重被绕过（两个 Reactor 实例，各自的
-// reported 集合为空），相同幂等键在 Coordinator 侧也只落一条 ReplanRequest。
-func TestAnomalyReactor_CoordinatorIdempotencyAcrossInstances(t *testing.T) {
-	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
-	if _, err := coordinator.Create(context.Background(), plan.CreateInput{
-		PlanID: "p-1", RootTaskID: "t-root", Budget: model.PlanBudget{},
-	}); err != nil {
-		t.Fatalf("Create plan: %v", err)
+	seen := map[string]bool{}
+	for _, ev := range evs {
+		seen[ev.TaskID] = true
 	}
-	st := &fakeAnomalyStore{
-		task:    &model.Task{ID: "t-1", PlanID: "p-1"},
-		history: []store.ToolCallRecord{okCall("write_file")},
-	}
-	// 两个独立实例 → 进程内 reported 不共享，全靠 Coordinator 幂等键去重
-	r1 := NewAnomalyReactor(st, coordinator)
-	r2 := NewAnomalyReactor(st, coordinator)
-	if err := r1.Run(completedEv("t-1")); err != nil {
-		t.Fatalf("r1.Run: %v", err)
-	}
-	if err := r2.Run(completedEv("t-1")); err != nil {
-		t.Fatalf("r2.Run: %v", err)
-	}
-	p, err := coordinator.Store().GetPlan("p-1")
-	if err != nil {
-		t.Fatalf("GetPlan: %v", err)
-	}
-	if len(p.PendingReplanRequests) != 1 {
-		t.Fatalf("相同幂等键应只落 1 条 ReplanRequest，got %d", len(p.PendingReplanRequests))
-	}
-	for _, rr := range p.PendingReplanRequests {
-		if rr.ReasonCode != anomalyCodeFabricatedWrite || rr.SourceEvent != "anomaly_reactor" {
-			t.Errorf("落库请求字段不对: %+v", rr)
-		}
-		if rr.Urgency != model.ReplanUrgencyNormal {
-			t.Errorf("Urgency = %q, 应 normal", rr.Urgency)
-		}
-	}
-}
-
-// ---------- Plan 终态 / 错误处理 ----------
-
-func TestAnomalyReactor_PlanTerminalFallsBackToTraceWarning(t *testing.T) {
-	cap := installCapture(t)
-	req := &fakeReplanRequester{err: plan.ErrPlanTerminal}
-	st := &fakeAnomalyStore{
-		task:    &model.Task{ID: "t-1", PlanID: "p-1"},
-		history: []store.ToolCallRecord{okCall("write_file")},
-	}
-	r := NewAnomalyReactor(st, req)
-	if err := r.Run(completedEv("t-1")); err != nil {
-		t.Fatalf("Plan 终态应降级告警而非报错，got %v", err)
-	}
-	if evs := cap.snapshot(); len(evs) != 1 {
-		t.Errorf("Plan 终态应降级发 1 条 trace 告警，got %d", len(evs))
-	}
-}
-
-func TestAnomalyReactor_RequesterTransientErrorPropagates(t *testing.T) {
-	cap := installCapture(t)
-	req := &fakeReplanRequester{err: errors.New("store 写入失败")}
-	st := &fakeAnomalyStore{
-		task:    &model.Task{ID: "t-1", PlanID: "p-1"},
-		history: []store.ToolCallRecord{okCall("write_file")},
-	}
-	r := NewAnomalyReactor(st, req)
-	err := r.Run(completedEv("t-1"))
-	if err == nil || !strings.Contains(err.Error(), "request_replan") {
-		t.Errorf("瞬时错误应返回给 Async 路径记日志，got %v", err)
-	}
-	if evs := cap.snapshot(); len(evs) != 0 {
-		t.Errorf("瞬时错误不应降级告警（避免重复信号），got %d 条", len(evs))
+	if !seen["t-1"] || !seen["t-2"] {
+		t.Errorf("两条告警应分属 t-1/t-2: %v", seen)
 	}
 }
 
@@ -469,8 +310,9 @@ func TestAnomalyReactor_RequesterTransientErrorPropagates(t *testing.T) {
 // Reactor 跑完后任务的 Status / Results / Artifacts 原封不动——它对 Store
 // 只有读操作（anomalyStoreView 结构上就不暴露写方法）。
 func TestAnomalyReactor_DoesNotMutateTaskState(t *testing.T) {
+	cap := installCapture(t)
 	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 16), 100, 2, 300)
-	task := &model.Task{Description: "anomaly no-mutate", PlanID: "p-1"}
+	task := &model.Task{Description: "anomaly no-mutate"}
 	if err := taskStore.PublishTask(task); err != nil {
 		t.Fatalf("PublishTask: %v", err)
 	}
@@ -478,15 +320,14 @@ func TestAnomalyReactor_DoesNotMutateTaskState(t *testing.T) {
 		t.Fatalf("AppendToolCall: %v", err)
 	}
 
-	req := &fakeReplanRequester{}
-	r := NewAnomalyReactor(taskStore, req)
+	r := NewAnomalyReactor(taskStore)
 	if err := r.Run(completedEv(task.ID)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	// 异常确实命中（请求已发出）
-	if got := req.snapshot(); len(got) != 1 {
-		t.Fatalf("前置条件：应命中 1 条异常，got %d", len(got))
+	// 异常确实命中（告警已发出）
+	if evs := cap.snapshot(); len(evs) != 1 {
+		t.Fatalf("前置条件：应命中 1 条异常告警，got %d", len(evs))
 	}
 	// 任务状态原封不动
 	after, err := taskStore.GetTask(task.ID)
@@ -504,22 +345,15 @@ func TestAnomalyReactor_DoesNotMutateTaskState(t *testing.T) {
 	}
 }
 
-// ---------- 跨包握手端到端（trace.Emit → Registry.Dispatch → 异步 Reactor → Coordinator）----------
+// ---------- 跨包握手端到端（trace.Emit → Registry.Dispatch → 异步 Reactor → KindError 告警）----------
 
-// TestAnomalyReactor_E2E_DispatchToReplanRequest 走真实派发链路：
-// 全部用生产组件（MemoryTaskStore / plan.Coordinator / reactor.Registry /
-// trace.SetDefaultDispatcher），emit 一条 KindTaskCompleted，断言异常最终
-// 物化为 Plan 的 PendingReplanRequests——这是"装配漏接"级别的验证：
-// 注册、订阅、异步派发、控制面写入任何一环断掉本测试都会失败。
-func TestAnomalyReactor_E2E_DispatchToReplanRequest(t *testing.T) {
-	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
-	if _, err := coordinator.Create(context.Background(), plan.CreateInput{
-		PlanID: "p-e2e", RootTaskID: "t-root", Budget: model.PlanBudget{},
-	}); err != nil {
-		t.Fatalf("Create plan: %v", err)
-	}
+// TestAnomalyReactor_E2E_DispatchToWarning 走真实派发链路：
+// 全部用生产组件（MemoryTaskStore / reactor.Registry / trace.SetDefaultDispatcher），
+// emit 一条 KindTaskCompleted，断言异常最终物化为一条 KindError 告警事件——这是
+// "装配漏接"级别的验证：注册、订阅、异步派发、告警 emit 任何一环断掉本测试都会失败。
+func TestAnomalyReactor_E2E_DispatchToWarning(t *testing.T) {
 	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 16), 100, 2, 300)
-	task := &model.Task{Description: "anomaly e2e", PlanID: "p-e2e"}
+	task := &model.Task{Description: "anomaly e2e"}
 	if err := taskStore.PublishTask(task); err != nil {
 		t.Fatalf("PublishTask: %v", err)
 	}
@@ -527,9 +361,13 @@ func TestAnomalyReactor_E2E_DispatchToReplanRequest(t *testing.T) {
 		t.Fatalf("AppendToolCall: %v", err)
 	}
 
+	cap := &captureReactor{}
 	reg := reactor.NewRegistry()
-	if err := reg.Register(NewAnomalyReactor(taskStore, coordinator)); err != nil {
-		t.Fatalf("Register: %v", err)
+	if err := reg.Register(NewAnomalyReactor(taskStore)); err != nil {
+		t.Fatalf("Register anomaly: %v", err)
+	}
+	if err := reg.Register(cap); err != nil {
+		t.Fatalf("Register capture: %v", err)
 	}
 	original := trace.DefaultDispatcher()
 	trace.SetDefaultDispatcher(reg)
@@ -538,24 +376,23 @@ func TestAnomalyReactor_E2E_DispatchToReplanRequest(t *testing.T) {
 	// 模拟主流程：任务完成
 	trace.Emit(completedEv(task.ID))
 
-	// Async Reactor：轮询等重规划请求落库
+	// Async Reactor：轮询等告警事件落到捕获器
 	deadline := time.After(2 * time.Second)
 	for {
-		p, err := coordinator.Store().GetPlan("p-e2e")
-		if err != nil {
-			t.Fatalf("GetPlan: %v", err)
-		}
-		if len(p.PendingReplanRequests) == 1 {
-			for _, rr := range p.PendingReplanRequests {
-				if rr.ReasonCode != anomalyCodeFabricatedWrite || rr.SourceTaskID != task.ID {
-					t.Errorf("落库请求字段不对: %+v", rr)
-				}
+		evs := cap.snapshot()
+		if len(evs) == 1 {
+			ev := evs[0]
+			if ev.TaskID != task.ID || !strings.Contains(ev.Error, anomalyCodeFabricatedWrite) {
+				t.Errorf("告警事件字段不对: %+v", ev)
 			}
-			return // 通过：emit → dispatch → reactor → coordinator 全链路物化
+			return // 通过：emit → dispatch → reactor → 告警 全链路物化
+		}
+		if len(evs) > 1 {
+			t.Fatalf("应只有 1 条告警，got %d", len(evs))
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("2s 内未等到重规划请求落库（PendingReplanRequests=%d）", len(p.PendingReplanRequests))
+			t.Fatalf("2s 内未等到 KindError 告警（已捕获 %d 条）", len(evs))
 		default:
 			time.Sleep(5 * time.Millisecond)
 		}

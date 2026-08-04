@@ -84,7 +84,7 @@ func normalizePersistentState(state *persistentState) error {
 		if err := validateSpec(spec); err != nil {
 			return fmt.Errorf("team %s: %w", id, err)
 		}
-		key := idempotencyKey(spec.PlanID, spec.TemplateRef, spec.Purpose, spec.Replicas)
+		key := idempotencyKey(spec.ControllerTaskID, spec.TemplateRef, spec.Purpose, spec.Replicas)
 		if previous, exists := rebuilt[key]; exists && previous != id {
 			return fmt.Errorf("teams %s and %s have duplicate idempotency identity", previous, id)
 		}
@@ -96,10 +96,9 @@ func normalizePersistentState(state *persistentState) error {
 	return nil
 }
 
-// Ensure atomically creates spec or returns the existing idempotent team.
-// ControllerTaskID is intentionally not part of the identity: when Scheduler
-// authority transfers, an authorized successor adopts the same ready team and
-// the durable controller audit field is refreshed.
+// Ensure atomically creates spec or returns the existing idempotent team. The
+// idempotency identity is (controller task, template ref, purpose, replicas):
+// repeated provisioning by the same controller task reuses the ready team.
 func (s *Store) Ensure(spec TeamSpec) (TeamSpec, bool, error) {
 	if err := validateSpec(spec); err != nil {
 		return TeamSpec{}, false, err
@@ -107,16 +106,11 @@ func (s *Store) Ensure(spec TeamSpec) (TeamSpec, bool, error) {
 	var out TeamSpec
 	created := false
 	err := s.update(func(state *persistentState) error {
-		key := idempotencyKey(spec.PlanID, spec.TemplateRef, spec.Purpose, spec.Replicas)
+		key := idempotencyKey(spec.ControllerTaskID, spec.TemplateRef, spec.Purpose, spec.Replicas)
 		if id, ok := state.IdempotencyIndex[key]; ok {
 			existing, exists := state.Teams[id]
 			if !exists {
 				return fmt.Errorf("team idempotency index points to missing team %s", id)
-			}
-			if existing.Status == StatusReady && existing.ControllerTaskID != spec.ControllerTaskID {
-				existing.ControllerTaskID = spec.ControllerTaskID
-				existing.UpdatedAt = time.Now().UTC()
-				state.Teams[id] = existing
 			}
 			out = existing
 			return nil
@@ -198,17 +192,18 @@ func (s *Store) SetStatus(teamID string, status Status, reason string) (TeamSpec
 	return out, err
 }
 
-// StopPlan marks every ready team for planID stopped in one durable commit.
-// The returned records are the complete set for that plan after the mutation.
-func (s *Store) StopPlan(planID, reason string) ([]TeamSpec, error) {
-	if strings.TrimSpace(planID) == "" {
-		return nil, fmt.Errorf("plan id is required")
+// StopController marks every ready team owned by controllerTaskID stopped in
+// one durable commit. The returned records are the complete set for that
+// controller after the mutation.
+func (s *Store) StopController(controllerTaskID, reason string) ([]TeamSpec, error) {
+	if strings.TrimSpace(controllerTaskID) == "" {
+		return nil, fmt.Errorf("controller task id is required")
 	}
 	var out []TeamSpec
 	err := s.update(func(state *persistentState) error {
 		now := time.Now().UTC()
 		for id, spec := range state.Teams {
-			if spec.PlanID != planID {
+			if spec.ControllerTaskID != controllerTaskID {
 				continue
 			}
 			if spec.Status != StatusStopped || spec.StopReason != reason {
@@ -336,8 +331,8 @@ func validateSpec(spec TeamSpec) error {
 	if strings.TrimSpace(spec.TemplateRef) == "" || strings.TrimSpace(spec.TemplateDigest) == "" {
 		return fmt.Errorf("template ref and digest are required")
 	}
-	if strings.TrimSpace(spec.PlanID) == "" || strings.TrimSpace(spec.ControllerTaskID) == "" {
-		return fmt.Errorf("plan id and controller task id are required")
+	if strings.TrimSpace(spec.ControllerTaskID) == "" {
+		return fmt.Errorf("controller task id is required")
 	}
 	if strings.TrimSpace(spec.Purpose) == "" {
 		return fmt.Errorf("team purpose is required")
@@ -355,14 +350,14 @@ func validStatus(status Status) bool {
 	return status == StatusReady || status == StatusStopped
 }
 
-func idempotencyKey(planID, templateRef, purpose string, replicas int) string {
+func idempotencyKey(controllerTaskID, templateRef, purpose string, replicas int) string {
 	payload, _ := json.Marshal(struct {
-		PlanID      string `json:"plan_id"`
-		TemplateRef string `json:"template_ref"`
-		Purpose     string `json:"purpose"`
-		Replicas    int    `json:"replicas"`
+		ControllerTaskID string `json:"controller_task_id"`
+		TemplateRef      string `json:"template_ref"`
+		Purpose          string `json:"purpose"`
+		Replicas         int    `json:"replicas"`
 	}{
-		PlanID: strings.TrimSpace(planID), TemplateRef: strings.TrimSpace(templateRef),
+		ControllerTaskID: strings.TrimSpace(controllerTaskID), TemplateRef: strings.TrimSpace(templateRef),
 		Purpose: strings.TrimSpace(purpose), Replicas: replicas,
 	})
 	sum := sha256.Sum256(payload)

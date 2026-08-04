@@ -22,7 +22,7 @@ func formatMarkdown(t Theme, text string, maxWidth int) string {
 				// Show language hint if present
 				lang := strings.TrimPrefix(trimmed, "```")
 				if lang != "" {
-					b.WriteString(t.MdDivider.Render("── "+lang+" "))
+					b.WriteString(t.MdDivider.Render("── " + lang + " "))
 				}
 			}
 			b.WriteString("\n")

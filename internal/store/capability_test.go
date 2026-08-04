@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -118,23 +119,23 @@ func TestQueryAvailable_CapabilityFilterSkipsAnonymousProbe(t *testing.T) {
 	}
 }
 
-// CanClaim 钩子新签名：QueryAvailable 传轮询者 ID，ClaimTask 传认领者 ID。
-func TestCanClaimHookReceivesAgentID(t *testing.T) {
+// CapabilityChecker 双路径都收到认领方身份：QueryAvailable 传轮询者 ID，
+// ClaimTask 传认领者 ID。
+func TestCapabilityCheckerReceivesAgentID(t *testing.T) {
 	s, _ := newTestStore(10, 100)
 	var queryAgent, claimAgent string
-	s.SetTaskPlanHooks(TaskPlanHooks{
-		CanClaim: func(agentID string, task *model.Task) error {
-			// 按调用路径分别记录：QueryAvailable 与 ClaimTask 各触发一次
-			if agentID == "agent-poll" {
-				queryAgent = agentID
-			}
-			if agentID == "agent-claim" {
-				claimAgent = agentID
-			}
-			return nil
-		},
+	s.SetCapabilityChecker(func(agentID string, task *model.Task) error {
+		// 按调用路径分别记录：QueryAvailable 与 ClaimTask 各触发一次
+		if agentID == "agent-poll" {
+			queryAgent = agentID
+		}
+		if agentID == "agent-claim" {
+			claimAgent = agentID
+		}
+		return nil
 	})
-	task := &model.Task{Description: "hook 探针", EventType: "code"}
+	task := &model.Task{Description: "checker 探针", EventType: "code",
+		Capability: &model.NodeCapability{Tools: []string{"read_file"}}}
 	if err := s.PublishTask(task); err != nil {
 		t.Fatalf("PublishTask: %v", err)
 	}
@@ -142,13 +143,55 @@ func TestCanClaimHookReceivesAgentID(t *testing.T) {
 		t.Fatalf("QueryAvailable: %v", err)
 	}
 	if queryAgent != "agent-poll" {
-		t.Fatalf("QueryAvailable 路径 CanClaim 收到的 agentID = %q，want agent-poll", queryAgent)
+		t.Fatalf("QueryAvailable 路径 checker 收到的 agentID = %q，want agent-poll", queryAgent)
 	}
 	if err := s.ClaimTask("agent-claim", task.ID); err != nil {
 		t.Fatalf("ClaimTask: %v", err)
 	}
 	if claimAgent != "agent-claim" {
-		t.Fatalf("ClaimTask 路径 CanClaim 收到的 agentID = %q，want agent-claim", claimAgent)
+		t.Fatalf("ClaimTask 路径 checker 收到的 agentID = %q，want agent-claim", claimAgent)
+	}
+}
+
+// ClaimTask 的能力双保险：checker 拒绝时认领失败并返回 ErrTaskClaimBlocked，
+// 即使 QueryAvailable 过滤被绕过（直接按 ID 认领）。
+func TestClaimTask_CapabilityBlocked(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	s.SetCapabilityChecker(allowlistChecker(map[string][]string{
+		"agent-lite": {"read_file"},
+	}))
+	task := &model.Task{Description: "需要 shell", EventType: "code",
+		Capability: &model.NodeCapability{Tools: []string{"run_shell"}}}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatalf("PublishTask: %v", err)
+	}
+	err := s.ClaimTask("agent-lite", task.ID)
+	if !errors.Is(err, ErrTaskClaimBlocked) {
+		t.Fatalf("ClaimTask err = %v，want ErrTaskClaimBlocked", err)
+	}
+}
+
+// 依赖统一要求 completed：依赖处于其他终态（failed）时认领被拒，
+// 不再有「依赖终态即可」的放宽路径。
+func TestClaimTask_FailedDependencyRejected(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	dep := &model.Task{Description: "依赖", EventType: "code"}
+	if err := s.PublishTask(dep); err != nil {
+		t.Fatalf("PublishTask dep: %v", err)
+	}
+	if err := s.ClaimTask("agent-1", dep.ID); err != nil {
+		t.Fatalf("ClaimTask dep: %v", err)
+	}
+	if err := s.FailTask("agent-1", dep.ID, "boom"); err != nil {
+		t.Fatalf("FailTask dep: %v", err)
+	}
+	task := &model.Task{Description: "依赖 failed 的任务", EventType: "code",
+		Dependencies: []string{dep.ID}}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatalf("PublishTask: %v", err)
+	}
+	if err := s.ClaimTask("agent-2", task.ID); err != ErrDependencyNotMet {
+		t.Fatalf("ClaimTask err = %v，want ErrDependencyNotMet", err)
 	}
 }
 

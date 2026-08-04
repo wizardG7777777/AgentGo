@@ -7,24 +7,24 @@ import (
 )
 
 func TestLegacyRequestTaskIDsUsesOnlyOwnershipEdges(t *testing.T) {
-	controller := &model.Task{ID: "root", PlanID: "root", SchedulerBatch: []string{"batch"}}
+	controller := &model.Task{ID: "root", SchedulerBatch: []string{"batch"}}
 	tasks := []*model.Task{
 		controller,
-		{ID: "same-plan", PlanID: "root"},
 		{ID: "batch"},
 		{ID: "descendant", ParentTaskID: "batch"},
-		{ID: "different-plan", PlanID: "other", ParentTaskID: "root"},
+		{ID: "child", ParentTaskID: "root"},
+		{ID: "unrelated"},
 		{ID: "batch-label", BatchID: "root"},
-		{ID: "dependency-label", Dependencies: []string{"same-plan"}},
+		{ID: "dependency-label", Dependencies: []string{"batch"}},
 		{ID: "event-label", EventSource: "root"},
 	}
 	visible := LegacyRequestTaskIDs(tasks, controller.ID)
-	for _, id := range []string{"root", "same-plan", "batch", "descendant"} {
+	for _, id := range []string{"root", "batch", "descendant", "child"} {
 		if _, ok := visible[id]; !ok {
 			t.Errorf("expected %s in legacy request scope", id)
 		}
 	}
-	for _, id := range []string{"different-plan", "batch-label", "dependency-label", "event-label"} {
+	for _, id := range []string{"unrelated", "batch-label", "dependency-label", "event-label"} {
 		if _, ok := visible[id]; ok {
 			t.Errorf("authority-only label admitted %s", id)
 		}

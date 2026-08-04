@@ -22,9 +22,9 @@ type adapterTestHook struct {
 	called   int
 }
 
-func (h *adapterTestHook) Name() string             { return h.name }
-func (h *adapterTestHook) Phase() MailboxHookPhase  { return h.phase }
-func (h *adapterTestHook) Priority() int            { return h.priority }
+func (h *adapterTestHook) Name() string            { return h.name }
+func (h *adapterTestHook) Phase() MailboxHookPhase { return h.phase }
+func (h *adapterTestHook) Priority() int           { return h.priority }
 func (h *adapterTestHook) Run(hctx MailboxHookContext) MailboxHookDecision {
 	h.captured = hctx
 	h.called++

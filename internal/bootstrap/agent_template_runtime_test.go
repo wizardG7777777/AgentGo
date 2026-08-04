@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"agentgo/internal/agenttemplate"
-	"agentgo/internal/plan"
 	"agentgo/internal/team"
 )
 
@@ -37,19 +36,13 @@ func TestBootstrapSchedulerOnlyCanProvisionAndShutdownTemplateTeam(t *testing.T)
 			sys.AgentTemplates, sys.TeamManager, sys.TeamStore, len(sys.Runners))
 	}
 
-	p, err := sys.PlanCoordinator.Create(context.Background(), plan.CreateInput{
-		PlanID: "template-runtime-plan", RootTaskID: "template-runtime-controller",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := sys.Start(ctx, cancel); err != nil {
 		t.Fatal(err)
 	}
 	result, err := sys.TeamManager.Provision(context.Background(), agenttemplate.ProvisionRequest{
-		PlanID: p.ID, ControllerTaskID: p.ActiveDecisionTaskID,
-		TemplateRef: "builtin/generalist@1", Purpose: "implementation", Replicas: 1,
+		ControllerTaskID: "template-runtime-controller",
+		TemplateRef:      "builtin/generalist@1", Purpose: "implementation", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatal(err)

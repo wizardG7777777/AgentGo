@@ -88,7 +88,6 @@
   .interaction .prompt { color:var(--fg); white-space:pre-wrap; }
   .interaction .ops { margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; }
   .interaction .option-desc { margin-top:3px; color:var(--dim); font-size:12px; }
-  #interactions.attention { outline:2px solid var(--warn); outline-offset:2px; }
   .empty { color:var(--dim); font-style:italic; }
   .btn { background:#1f242e; color:var(--fg); border:1px solid var(--border); border-radius:5px;
          padding:3px 10px; font-size:12px; cursor:pointer; }
@@ -133,7 +132,7 @@
 <body>
 <header>
   <h1>AgentGo 控制台</h1>
-  <button id="modeBtn" class="btn" title="点击切换 gate 轴；/mode 可设置 gate / exec / topo">模式：-</button>
+  <button id="modeBtn" class="btn" title="点击切换 topo 轴；/mode 可设置 exec / topo">模式：-</button>
   <span class="meta">会话：<b id="session">-</b></span>
   <button id="newSessBtn" class="btn" title="创建并切换到新会话">新会话</button>
   <button id="helpBtn" class="btn" title="查看全部斜杠命令（同 /help）">命令</button>
@@ -199,7 +198,7 @@ const state = {
   feed: { outputs: [], logs: [], traces: [] },
   activeAgent: "", agentOutputFollow: true, view: "overview",
 };
-const curModes = { gate: "", exec: "", topo: "" };
+const curModes = { exec: "", topo: "" };
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
 
@@ -223,18 +222,16 @@ $("viewTabs").addEventListener("click", e => {
 // ---------- 渲染 ----------
 function modeLabel(axis, value) {
   const labels = {
-    gate: { plan: "计划", immediate: "直接" },
     exec: { normal: "常规", strict: "严格", readonly: "只读", yolo: "放权" },
     topo: { team: "团队", solo: "单代理" },
   };
   return (labels[axis] && labels[axis][value]) || value || "-";
 }
 function renderModeBtn() {
-  $("modeBtn").textContent = `模式：${modeLabel("gate", curModes.gate)} / ${modeLabel("exec", curModes.exec)} / ${modeLabel("topo", curModes.topo)}`;
+  $("modeBtn").textContent = `模式：${modeLabel("exec", curModes.exec)} / ${modeLabel("topo", curModes.topo)}`;
 }
 function renderHeader(snap) {
   if (!snap) return;
-  curModes.gate = snap.mode || "";
   curModes.exec = snap.exec_mode || "";
   curModes.topo = snap.topo_mode || "";
   renderModeBtn();
@@ -297,7 +294,7 @@ function renderInteractions() {
       : "";
     const descriptions = options.filter(option => option.description).map(option =>
       `<div class="option-desc"><span class="tid">${esc(option.id)}</span>：${esc(option.description)}</div>`).join("");
-    const subject = item.plan_id || item.task_id || item.subject_id || "-";
+    const subject = item.task_id || item.subject_id || "-";
     return `<div class="interaction">
       <div class="prompt"><b>${esc(item.prompt || "需要你的回应")}</b></div>
       <div class="kv" style="color:var(--dim)">${esc(item.kind || "interaction")} · ${esc(item.purpose || "-")} · 对象 ${esc(subject)}</div>
@@ -331,8 +328,7 @@ function traceIsActivity(t) {
   const kind = String(t.kind || "").toLowerCase();
   return kind.includes("task_") || kind.includes("tool_") || kind.includes("llm_call") ||
     kind.includes("progress") || kind.includes("agent_state") || kind.includes("error") ||
-    kind.includes("shell_") || kind.includes("interaction") || kind.includes("file_") ||
-    kind.includes("plan_") || kind.includes("replan_");
+    kind.includes("shell_") || kind.includes("interaction") || kind.includes("file_");
 }
 function turnHTML(turn) {
   const status = turn.status || "streaming";
@@ -632,38 +628,37 @@ async function runCommand(line) {
       case "mode": {
         let axis, value;
         if (!args.length) {
-          axis = "gate";
-          value = curModes.gate === "plan" ? "immediate" : "plan";
+          axis = "topo";
+          value = curModes.topo === "solo" ? "team" : "solo";
         } else if (args.length === 2) {
           axis = args[0].toLowerCase();
           value = args[1].toLowerCase();
         } else {
-          toast("用法：/mode [gate|exec|topo <值>]", true);
+          toast("用法：/mode [exec|topo <值>]", true);
           return;
         }
         const allowed = {
-          gate: ["immediate", "plan"],
           exec: ["normal", "strict", "readonly", "yolo"],
           topo: ["team", "solo"],
         };
         if (!allowed[axis] || !allowed[axis].includes(value)) {
-          toast("无效模式；gate=immediate|plan，exec=normal|strict|readonly|yolo，topo=team|solo", true);
+          toast("无效模式；exec=normal|strict|readonly|yolo，topo=team|solo", true);
           return;
         }
         await setMode(axis, value);
         toast(`已设置 ${axis}：${modeLabel(axis, value)}`, false);
         break;
       }
-      case "plan": {
-        locateInteractions(args.length
-          ? "计划批准/拒绝已迁移为结构化 Interaction；请在等待回应列表中选择对应选项"
-          : "已定位到等待回应列表");
-        break;
-      }
       case "steer": {
         if (!args[0] || !args[1]) { toast("用法：/steer <agent-id> <消息>", true); return; }
         await postJSON("/api/steer", { agent_id: args[0], message: args.slice(1).join(" ") });
         toast("已发送指导 → " + args[0], false);
+        break;
+      }
+      case "doctor": {
+        if (args[0] !== "agents") { toast("用法：/doctor agents — 审计代理身份与实际权限的一致性（只读）", true); return; }
+        const d = await postJSON("/api/doctor/agents", {});
+        toast("代理审计任务已创建：" + (d.task_id || "-") + "，报告将作为任务结果回显", false);
         break;
       }
       case "new": {
@@ -701,19 +696,6 @@ async function setMode(axis, value) {
   renderModeBtn();
 }
 
-function locateInteractions(message) {
-  setView("overview");
-  const panel = $("interactions");
-  panel.scrollIntoView({ behavior: "smooth", block: "start" });
-  panel.classList.add("attention");
-  setTimeout(() => panel.classList.remove("attention"), 1800);
-  if (!state.interactions.length) {
-    toast("当前没有等待回应的 Interaction", false);
-    return;
-  }
-  toast(`${message}（${state.interactions.length} 项）`, false);
-}
-
 // ---------- 模态面板（/help、/status、/session） ----------
 function openModal(title, html) {
   $("modalTitle").textContent = title;
@@ -748,7 +730,7 @@ function statusHTML() {
   const lines = [
     `<div>代理数：<b>${state.agents.length}</b></div>`,
     `<div style="margin-top:4px">任务：待处理 ${c("pending")} · 进行中 ${c("processing")} · 已完成 ${c("completed")} · 失败 ${c("failed")} · 已取消 ${c("cancelled")}</div>`,
-    `<div style="margin-top:4px">模式：gate=<b>${modeLabel("gate", curModes.gate)}</b> · exec=<b>${modeLabel("exec", curModes.exec)}</b> · topo=<b>${modeLabel("topo", curModes.topo)}</b></div>`,
+    `<div style="margin-top:4px">模式：exec=<b>${modeLabel("exec", curModes.exec)}</b> · topo=<b>${modeLabel("topo", curModes.topo)}</b></div>`,
     `<div style="margin-top:4px">等待回应：<b>${state.interactions.length}</b></div>`,
   ];
   if (active.length) {
@@ -763,12 +745,12 @@ function sessionsHTML(list) {
     `<div class="sessrow"><b>${i + 1}.</b><span class="tid">${esc(s.id)}</span><span class="d">[${esc(s.status || "-")}] ${esc(s.created_at || "")} ${esc(s.first_user_input || "")}</span><span style="flex:1"></span><button class="btn small" data-switch="${esc(s.id)}">切换</button></div>`).join("");
 }
 
-// 顶栏按钮只切换 gate 轴；exec / topo 通过 /mode 显式设置。
+// 顶栏按钮切换 topo 轴；exec / topo 也可通过 /mode 显式设置。
 $("modeBtn").addEventListener("click", async () => {
-  const next = curModes.gate === "plan" ? "immediate" : "plan";
+  const next = curModes.topo === "solo" ? "team" : "solo";
   try {
-    await setMode("gate", next);
-    toast("已切换 gate：" + modeLabel("gate", next), false);
+    await setMode("topo", next);
+    toast("已切换 topo：" + modeLabel("topo", next), false);
   } catch (err) { toast(err.message, true); }
 });
 

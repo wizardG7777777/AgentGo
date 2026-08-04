@@ -321,3 +321,61 @@ func TestSetDefault_NilIsNoop(t *testing.T) {
 	SetDefault(nil)
 	Emit(Event{Kind: KindTaskClaimed, TaskID: "should-be-noop"}) // must not panic
 }
+
+// TaskID 为空但 GraphID 非空的事件应归入 graph_<graph_id前8位>.jsonl 分片。
+func TestEmit_GraphShardFile(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := NewWriter(dir, 0)
+	defer w.Close()
+
+	graphID := "graph-1234abcd"
+	w.Emit(Event{Kind: KindGraphSubmitted, GraphID: graphID, Description: "revision=1"})
+	w.Emit(Event{Kind: KindGraphEnded, GraphID: graphID})
+
+	files := listTraceFiles(t, dir)
+	if len(files) != 1 {
+		t.Fatalf("应只有 1 个 graph 分片文件，实际 %d: %v", len(files), files)
+	}
+	if files[0] != "graph_graph-12.jsonl" {
+		t.Errorf("分片文件名应为 graph_graph-12.jsonl，实际 %s", files[0])
+	}
+
+	events := readEvents(t, filepath.Join(dir, files[0]))
+	if len(events) != 2 {
+		t.Fatalf("应有 2 条事件，实际 %d", len(events))
+	}
+	if events[0].Kind != KindGraphSubmitted || events[0].GraphID != graphID {
+		t.Errorf("首条事件不符: kind=%s graph_id=%s", events[0].Kind, events[0].GraphID)
+	}
+	if events[1].Kind != KindGraphEnded {
+		t.Errorf("次条事件应为 graph_ended，实际 %s", events[1].Kind)
+	}
+}
+
+// TaskID 与 GraphID 同时非空时优先归入任务分片。
+func TestEmit_TaskIDTakesTaskShard(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := NewWriter(dir, 0)
+	defer w.Close()
+
+	w.Emit(Event{Kind: KindNodeActivationCreated, TaskID: "task-aaa", GraphID: "graph-xyz"})
+
+	files := listTraceFiles(t, dir)
+	if len(files) != 1 {
+		t.Fatalf("应只有 1 个任务分片文件，实际 %d: %v", len(files), files)
+	}
+	if !strings.HasSuffix(files[0], "_task-aaa.jsonl") {
+		t.Errorf("应落在任务分片（_task-aaa.jsonl），实际 %s", files[0])
+	}
+}
+
+// TaskID 与 GraphID 皆空的事件才丢弃。
+func TestEmit_NoTaskIDNoGraphIDDropped(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := NewWriter(dir, 0)
+	defer w.Close()
+	w.Emit(Event{Kind: KindTaskClaimed})
+	if files := listTraceFiles(t, dir); len(files) != 0 {
+		t.Errorf("TaskID/GraphID 皆空的事件应被丢弃，实际产生 %d 个文件", len(files))
+	}
+}

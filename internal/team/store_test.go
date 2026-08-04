@@ -21,10 +21,10 @@ func TestStoreEnsureIsIdempotentAndDurable(t *testing.T) {
 		t.Fatalf("Ensure did not set timestamps: %+v", stored)
 	}
 
-	// Team ID and controller are not part of the idempotency identity. A new
-	// authorized controller adopts the existing durable team instead of making
-	// another runtime route.
-	second := testSpec("team-b", "controller-b", "investigate")
+	// Team ID 不属于幂等身份（controller 任务 + 模板 + 用途 + 副本数）：同一
+	// controller 以相同需求重复 provision 时复用既有 durable team，而不是再建
+	// 一条运行时路由。
+	second := testSpec("team-b", "controller-a", "investigate")
 	reused, created, err := store.Ensure(second)
 	if err != nil || created {
 		t.Fatalf("Ensure(second) reused=%+v created=%v err=%v", reused, created, err)
@@ -32,8 +32,15 @@ func TestStoreEnsureIsIdempotentAndDurable(t *testing.T) {
 	if reused.ID != first.ID || reused.EventType != first.EventType {
 		t.Fatalf("idempotent Ensure changed identity: %+v", reused)
 	}
-	if reused.ControllerTaskID != "controller-b" {
-		t.Fatalf("controller transfer was not persisted: %+v", reused)
+	if reused.ControllerTaskID != "controller-a" {
+		t.Fatalf("idempotent Ensure changed controller ownership: %+v", reused)
+	}
+
+	// controller 属于幂等身份：另一个 controller 的相同需求各自建队。
+	third := testSpec("team-c", "controller-c", "investigate")
+	other, created, err := store.Ensure(third)
+	if err != nil || !created || other.ID != third.ID {
+		t.Fatalf("Ensure(third) stored=%+v created=%v err=%v, want a new team for another controller", other, created, err)
 	}
 
 	reopened, err := OpenStore(path)
@@ -44,21 +51,26 @@ func TestStoreEnsureIsIdempotentAndDurable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get after reopen: %v", err)
 	}
-	if got.ControllerTaskID != "controller-b" || got.Status != StatusReady {
+	if got.ControllerTaskID != "controller-a" || got.Status != StatusReady {
 		t.Fatalf("reopened spec mismatch: %+v", got)
 	}
 
-	stopped, err := reopened.StopPlan(first.PlanID, "plan_terminal:pass")
+	stopped, err := reopened.StopController("controller-a", "controller_terminal:completed")
 	if err != nil || len(stopped) != 1 {
-		t.Fatalf("StopPlan stopped=%+v err=%v", stopped, err)
+		t.Fatalf("StopController stopped=%+v err=%v", stopped, err)
 	}
 	reopenedAgain, err := OpenStore(path)
 	if err != nil {
 		t.Fatalf("second reopen: %v", err)
 	}
 	got, err = reopenedAgain.Get(first.ID)
-	if err != nil || got.Status != StatusStopped || got.StopReason != "plan_terminal:pass" {
+	if err != nil || got.Status != StatusStopped || got.StopReason != "controller_terminal:completed" {
 		t.Fatalf("stopped state not durable: got=%+v err=%v", got, err)
+	}
+	// StopController 只作用于目标 controller 名下的 Team。
+	other, err = reopenedAgain.Get(third.ID)
+	if err != nil || other.Status != StatusReady {
+		t.Fatalf("StopController leaked across controllers: other=%+v err=%v", other, err)
 	}
 	if _, err := reopenedAgain.Get("missing"); !errors.Is(err, ErrTeamNotFound) {
 		t.Fatalf("Get(missing) err=%v, want ErrTeamNotFound", err)
@@ -86,7 +98,7 @@ func TestStoreRejectsDuplicateEventTypeAndMalformedRecords(t *testing.T) {
 func testSpec(id, controller, purpose string) TeamSpec {
 	return TeamSpec{
 		ID: id, TemplateRef: "builtin/explorer@1", TemplateDigest: "sha256:test",
-		PlanID: "plan-1", ControllerTaskID: controller, Purpose: purpose,
+		ControllerTaskID: controller, Purpose: purpose,
 		EventType: "team:" + id, Replicas: 2, Status: StatusReady,
 	}
 }

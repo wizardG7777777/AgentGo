@@ -22,9 +22,9 @@ type mockHook struct {
 	callN    *atomic.Int32
 }
 
-func (m *mockHook) Name() string              { return m.name }
-func (m *mockHook) Phase() ToolHookPhase      { return m.phase }
-func (m *mockHook) Priority() int             { return m.priority }
+func (m *mockHook) Name() string         { return m.name }
+func (m *mockHook) Phase() ToolHookPhase { return m.phase }
+func (m *mockHook) Priority() int        { return m.priority }
 func (m *mockHook) Matches(toolName string) bool {
 	if m.matchStr == "*" {
 		return true
@@ -48,10 +48,10 @@ type panickingHook struct {
 	priority int
 }
 
-func (p *panickingHook) Name() string                       { return p.name }
-func (p *panickingHook) Phase() ToolHookPhase               { return p.phase }
-func (p *panickingHook) Priority() int                      { return p.priority }
-func (p *panickingHook) Matches(toolName string) bool       { return true }
+func (p *panickingHook) Name() string                 { return p.name }
+func (p *panickingHook) Phase() ToolHookPhase         { return p.phase }
+func (p *panickingHook) Priority() int                { return p.priority }
+func (p *panickingHook) Matches(toolName string) bool { return true }
 func (p *panickingHook) Run(hctx ToolHookContext) ToolHookDecision {
 	panic("测试用 panic")
 }

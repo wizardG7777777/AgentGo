@@ -176,21 +176,6 @@ func TestProcessStore_QueryUnknownKey(t *testing.T) {
 	}
 }
 
-func TestProcessStore_AccessCountIncrements(t *testing.T) {
-	s := NewProcessStore()
-	ctx := context.Background()
-	_ = s.Put(ctx, Entry{Scope: ScopeProcess, Kind: KindContext, Key: "team_snapshot", Content: "x"})
-	for i := 0; i < 3; i++ {
-		es, _ := s.Query(ctx, ScopeProcess, KindContext, "team_snapshot", 1)
-		if len(es) != 1 {
-			t.Fatalf("Query iter %d: expect 1, got %d", i, len(es))
-		}
-		if es[0].AccessCount != i+1 {
-			t.Errorf("iter %d: AccessCount=%d want %d", i, es[0].AccessCount, i+1)
-		}
-	}
-}
-
 func TestProcessStore_Delete(t *testing.T) {
 	s := NewProcessStore()
 	ctx := context.Background()
@@ -238,14 +223,6 @@ func TestProcessStore_RejectsUnsupportedScope(t *testing.T) {
 		if err != nil && !errors.Is(err, ErrScopeUnsupported) {
 			t.Errorf("Put scope=%s err=%v should be ErrScopeUnsupported", sc, err)
 		}
-	}
-}
-
-func TestProcessStore_QueryByVectorNotImplemented(t *testing.T) {
-	s := NewProcessStore()
-	_, err := s.QueryByVector(context.Background(), ScopeProcess, []float32{0.1}, 1)
-	if !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("QueryByVector should return ErrNotImplemented, got %v", err)
 	}
 }
 

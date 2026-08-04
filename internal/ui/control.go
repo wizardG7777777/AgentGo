@@ -11,7 +11,6 @@ import (
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
-	"agentgo/internal/scheduler"
 )
 
 // ErrNotAssembled 表示控制面对应的注入函数未装配（Deps 中为 nil）。
@@ -43,8 +42,6 @@ type Controller interface {
 	CancelLatestRequest() (summary string, err error)
 	// SteerAgent 向指定代理发送高优先级指导邮件。
 	SteerAgent(agentID, message string) error
-	// SetMode 切换调度模式：true=Plan，false=Immediate。
-	SetMode(plan bool)
 	// SetExecMode 切换 exec 轴（normal / strict / readonly / yolo）；
 	// 非法值返回中文错误，未装配返回 ErrNotAssembled。
 	SetExecMode(mode string) error
@@ -58,17 +55,14 @@ type Controller interface {
 	SwitchSession(id string) (changed bool, err error)
 	// ListSessions 返回全部 Session 信息。
 	ListSessions() ([]SessionInfo, error)
-	// ApprovePlan 批准一个等待用户批准的计划（gate=plan 的 plan_review
-	// 挂起），idPrefix 为 Plan ID 前缀（空串在恰好一个待批准时默认选中），
-	// 返回一行中文摘要；未装配返回 ErrNotAssembled。
-	ApprovePlan(idPrefix string) (summary string, err error)
-	// RejectPlan 拒绝并终止一个等待批准的计划，前缀语义同 ApprovePlan。
-	RejectPlan(idPrefix string) (summary string, err error)
-	// PendingPlanReviews 返回全部等待批准的计划条目。
-	PendingPlanReviews() ([]PlanReviewItem, error)
 	// RespondInteraction 提交结构化回答。expected_version 与稳定 option_id
 	// 共同防止多前端竞态；业务副作用由 bootstrap 中受信任的 handler 执行。
 	RespondInteraction(ctx context.Context, input interaction.ResolveInput) (InteractionResult, error)
+	// RequestAgentAudit 触发一次只读代理审计（/doctor agents，V6 §2 P1b）：
+	// 为 Scheduler 创建携带审计包（各 agent 的身份/prompt 摘要/真实工具面/
+	// 运行模式/路由状态）的任务，返回审计任务 ID；审计报告作为普通任务
+	// 结果回显。无 Scheduler 或装配缺失时返回中文错误。
+	RequestAgentAudit() (taskID string, err error)
 	// RequestQuit 请求退出系统。
 	RequestQuit()
 }
@@ -136,20 +130,6 @@ func (h *Hub) SteerAgent(agentID, message string) error {
 	})
 }
 
-// SetMode 切换调度模式的 gate 轴，bool→scheduler.Mode（= modes.GateMode）
-// 映射与三轴 modes.Store 的 gate 轴语义一致：true=plan，false=immediate。
-// 接口无 error 返回值，ModeSet 未装配时静默忽略。
-func (h *Hub) SetMode(plan bool) {
-	if h.deps.ModeSet == nil {
-		return
-	}
-	if plan {
-		h.deps.ModeSet(scheduler.ModePlan)
-	} else {
-		h.deps.ModeSet(scheduler.ModeImmediate)
-	}
-}
-
 // SetExecMode 切换 exec 轴。字符串先经 modes.ParseExecMode 解析
 // （容错大小写与首尾空白），非法值直接返回中文错误；合法时把规范化后的
 // 小写串交给注入的 ExecModeSet 写入 store。
@@ -201,32 +181,6 @@ func (h *Hub) ListSessions() ([]SessionInfo, error) {
 	return h.deps.SessionList()
 }
 
-// ApprovePlan 委托注入的 plan_review 批准入口（前缀解析、保留 controller
-// 预发布与 Plan 恢复由装配方完成），返回一行中文摘要供消息流展示。
-func (h *Hub) ApprovePlan(idPrefix string) (string, error) {
-	if h.deps.ApprovePlanReview == nil {
-		return "", notAssembled("ApprovePlanReview")
-	}
-	return h.deps.ApprovePlanReview(idPrefix)
-}
-
-// RejectPlan 委托注入的 plan_review 拒绝入口（Plan 终止与任务扫尾由装配方
-// 完成），返回一行中文摘要供消息流展示。
-func (h *Hub) RejectPlan(idPrefix string) (string, error) {
-	if h.deps.RejectPlanReview == nil {
-		return "", notAssembled("RejectPlanReview")
-	}
-	return h.deps.RejectPlanReview(idPrefix)
-}
-
-// PendingPlanReviews 委托注入的待批准计划列表入口（/plan 列表）。
-func (h *Hub) PendingPlanReviews() ([]PlanReviewItem, error) {
-	if h.deps.PendingPlanReviews == nil {
-		return nil, notAssembled("PendingPlanReviews")
-	}
-	return h.deps.PendingPlanReviews()
-}
-
 // RespondInteraction 只委托装配层；Hub 不接触 ActionRef 或业务 Metadata。
 func (h *Hub) RespondInteraction(ctx context.Context, input interaction.ResolveInput) (InteractionResult, error) {
 	if h.deps.ResolveInteraction == nil {
@@ -234,6 +188,16 @@ func (h *Hub) RespondInteraction(ctx context.Context, input interaction.ResolveI
 	}
 	request, err := h.deps.ResolveInteraction(ctx, input)
 	return InteractionResult{ID: request.ID, Version: request.Version, State: request.State}, err
+}
+
+// RequestAgentAudit 委托注入的审计任务创建入口（审计包构建、只读指令与
+// 发布由装配方完成），返回审计任务 ID。结果回收走普通任务结果通道
+//（scheduler 完成后经 ResultOutput → OutputCh → feed），UI 层无额外路径。
+func (h *Hub) RequestAgentAudit() (string, error) {
+	if h.deps.RequestAgentAudit == nil {
+		return "", notAssembled("RequestAgentAudit")
+	}
+	return h.deps.RequestAgentAudit()
 }
 
 // RequestQuit 调用注入的退出入口；未装配时静默忽略（接口无 error 返回值）。

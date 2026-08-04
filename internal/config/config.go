@@ -25,8 +25,9 @@ import (
 
 // LLMConfig 全局 LLM 默认值（v4 §11.4）。
 // per-kind 通过 AgentKind.Model 覆盖默认模型；BaseURL/APIKey/TimeoutSec 共用。
-// Provider 是 v4 spec 之外的 AgentGo 现存能力（区分 openai / openrouter / deepseek-v4 / deepseek-r1
-// 等非标 endpoint），保留以兼容现有 internal/llm/provider 注册表。
+// Provider 字段已于 V6 移除（AgentGo 只实现 OpenAI-compatible Chat Completions，
+// 不再按 provider 分支做请求变换）；结构体保留该字段仅为让旧 YAML 仍能解析，
+// Validate() 会对非空值返回明确的迁移诊断错误。
 type LLMConfig struct {
 	BaseURL      string `yaml:"base_url" json:"base_url"`
 	APIKey       string `yaml:"api_key" json:"api_key"`
@@ -64,17 +65,24 @@ func isOpenAIReasoningEffort(value string) bool {
 // 同 kind 的多个实例（replicas 个）完全同质——同工具集、同提示词、同模型。
 // 异质化通过声明多个 kind 实现。
 type AgentKind struct {
-	Kind                         string   `yaml:"kind" json:"kind"`
-	Replicas                     int      `yaml:"replicas" json:"replicas"`
-	EventType                    string   `yaml:"event_type,omitempty" json:"event_type,omitempty"`
-	Profile                      string   `yaml:"profile,omitempty" json:"profile,omitempty"`
-	Tools                        []string `yaml:"tools,omitempty" json:"tools,omitempty"`
-	Model                        string   `yaml:"model,omitempty" json:"model,omitempty"`
-	SystemPromptFile             string   `yaml:"system_prompt_file" json:"system_prompt_file"`
-	AgentMaxLoops                int      `yaml:"agent_max_loops" json:"agent_max_loops"`
-	TaskMaxRetries               int      `yaml:"task_max_retries" json:"task_max_retries"`
-	EnforceCompactTokenThreshold int      `yaml:"enforce_compact_token_threshold" json:"enforce_compact_token_threshold"`
-	ContextLimit                 int      `yaml:"context_limit" json:"context_limit"`
+	Kind             string   `yaml:"kind" json:"kind"`
+	Replicas         int      `yaml:"replicas" json:"replicas"`
+	EventType        string   `yaml:"event_type,omitempty" json:"event_type,omitempty"`
+	Profile          string   `yaml:"profile,omitempty" json:"profile,omitempty"`
+	Tools            []string `yaml:"tools,omitempty" json:"tools,omitempty"`
+	Model            string   `yaml:"model,omitempty" json:"model,omitempty"`
+	SystemPromptFile string   `yaml:"system_prompt_file" json:"system_prompt_file"`
+	// AgentMaxLoops 已于 V6 移除（固定循环上限不再是终止条件，见
+	// docs/nextUpgrade-V6.md §5 升级思路 5/6/8）。结构体保留该字段仅为让旧
+	// YAML 仍能解析，Validate() 会对非零值返回明确的迁移诊断错误。
+	AgentMaxLoops                int `yaml:"agent_max_loops" json:"agent_max_loops"`
+	TaskMaxRetries               int `yaml:"task_max_retries" json:"task_max_retries"`
+	EnforceCompactTokenThreshold int `yaml:"enforce_compact_token_threshold" json:"enforce_compact_token_threshold"`
+	// ContextLimit 已于 V6 移除（固定上下文硬限截断层与 history_truncated 事件
+	// 一并删除，见 docs/nextUpgrade-V6.md §7.4；上下文适配由 L2 压缩与 L3 溢出
+	// 重试承担）。结构体保留该字段仅为让旧 YAML 仍能解析，Validate() 会对
+	// 非零值返回明确的迁移诊断错误。
+	ContextLimit int `yaml:"context_limit" json:"context_limit"`
 
 	// Description 是给 scheduler 看的一句话角色描述（人工撰写的语义提示词）。
 	//
@@ -93,32 +101,34 @@ type AgentKind struct {
 }
 
 const (
-	// DefaultSchedulerMaxLoops 是 Scheduler 单任务默认循环预算。
-	DefaultSchedulerMaxLoops = 50
 	// DefaultSchedulerCompactTokenThreshold 保持 Agent 层历史压缩的既有回退值。
 	DefaultSchedulerCompactTokenThreshold = 80000
-	// DefaultSchedulerContextLimit 是预测下一轮 prompt 的默认硬截断预算。
-	DefaultSchedulerContextLimit = 200000
 )
 
 // SchedulerKind scheduler 独立块（v4 §11.5.5）。
 // 工具集 / 系统提示词 / replicas 仍由 internal/scheduler 固定；模型与影响
-// ReAct 历史预算的三个参数允许覆盖。三个预算的零值都回落内置默认。
+// ReAct 历史压缩预算的参数允许覆盖，零值回落内置默认。
 type SchedulerKind struct {
-	Model                        string `yaml:"model,omitempty" json:"model,omitempty"`
-	AgentMaxLoops                int    `yaml:"agent_max_loops,omitempty" json:"agent_max_loops,omitempty"`
-	EnforceCompactTokenThreshold int    `yaml:"enforce_compact_token_threshold,omitempty" json:"enforce_compact_token_threshold,omitempty"`
-	ContextLimit                 int    `yaml:"context_limit,omitempty" json:"context_limit,omitempty"`
+	Model string `yaml:"model,omitempty" json:"model,omitempty"`
+	// AgentMaxLoops 已于 V6 移除（与 agents[*].agent_max_loops 同步删除）。
+	// 保留解析位以便 Validate() 对显式设置的旧配置给出迁移诊断。
+	AgentMaxLoops                int `yaml:"agent_max_loops,omitempty" json:"agent_max_loops,omitempty"`
+	EnforceCompactTokenThreshold int `yaml:"enforce_compact_token_threshold,omitempty" json:"enforce_compact_token_threshold,omitempty"`
+	// ContextLimit 已于 V6 移除（与 agents[*].context_limit 同步删除）。
+	// 保留解析位以便 Validate() 对显式设置的旧配置给出迁移诊断。
+	ContextLimit int `yaml:"context_limit,omitempty" json:"context_limit,omitempty"`
 }
 
-// ModesConfig 三轴工作模式声明（modes: 块，v5 三轴模式）。
+// ModesConfig 两轴工作模式声明（modes: 块，v5 三轴模式；gate 轴已于 V6 C6c 整体移除）。
 //
-// 三轴相互正交、可任意组合（如 solo+plan+strict 同时生效）：
-//   - gate：规划门控轴 —— immediate（默认）/ plan（先只读探索再执行）
+// 两轴相互正交、可任意组合：
 //   - exec：执行权限轴 —— normal（默认）/ strict / readonly / yolo
 //   - topo：编排拓扑轴 —— team（默认）/ solo
 //
-// 字段为空 = 该轴取默认值。运行期 TUI / Web 的 /mode 只切换 gate 轴。
+// 字段为空 = 该轴取默认值。
+//
+// Gate 字段仅为迁移诊断保留解析位：gate 轴已整体移除（执行前审阅改由
+// Graph approval 节点承担），显式设置任何非空值都在 Validate 报 V6 迁移诊断。
 type ModesConfig struct {
 	Gate string `yaml:"gate,omitempty" json:"gate,omitempty"`
 	Exec string `yaml:"exec,omitempty" json:"exec,omitempty"`
@@ -223,19 +233,14 @@ func (c UIConfig) HasFrontend(name string) bool {
 // 本结构的 Model 字段仅作为运行时元数据使用——主要用途是 HistoryEntry.Model 记录
 // （详见 nextUpgrade_v4.md §11.7.3 模型切换基准重置）与运行时日志。
 type AgentRuntimeConfig struct {
-	InstanceID string
-	Kind       string
-	EventType  string
-	// PlanIDScope binds a dynamically provisioned Team runner to exactly one
-	// Plan. Empty keeps static/configured agents global and backward compatible.
-	PlanIDScope                  string
+	InstanceID                   string
+	Kind                         string
+	EventType                    string
 	AllowedTools                 []string
 	Model                        string
 	SystemPrompt                 string
-	AgentMaxLoops                int
 	TaskMaxRetries               int
 	EnforceCompactTokenThreshold int
-	ContextLimit                 int
 	// IdleThreshold 对应全局 agent_idle_threshold：agent 连续 N 次空闲轮询后
 	// 退出 goroutine；0 = 永不空闲退出（生产推荐，见 Config.AgentIdleThreshold）。
 	// AgentKind 没有 per-kind 覆盖字段，各 AgentRuntimeConfig 构造点统一填全局值；
@@ -275,13 +280,8 @@ type Config struct {
 	MaxSubtaskDepth int    `yaml:"max_subtask_depth" json:"max_subtask_depth"`
 	ShellTimeoutSec int    `yaml:"shell_timeout_sec" json:"shell_timeout_sec"`
 
-	// TransferNoteMaxTokens 是 TransferNote 单条最大 token 预算。agent 在生成
-	// L1/L3 交接备忘时按此预算截断文本长度——按 1 token ≈ 2 runes 估算。
-	// 默认 3000 对应 ~6000 字符中文或 ~12000 字符英文。
-	TransferNoteMaxTokens int `yaml:"transfer_note_max_tokens" json:"transfer_note_max_tokens"`
-
 	// ProgressNotifyEnabled 控制进度通知功能是否启用。启用后，agent 在完成
-	// 文件写入、子任务发布或任务过半时，通过 mailbox 向相关 Agent 发送轻量级进度消息。
+	// 文件写入或子任务发布时，通过 mailbox 向相关 Agent 发送轻量级进度消息。
 	ProgressNotifyEnabled bool `yaml:"progress_notify_enabled" json:"progress_notify_enabled"`
 
 	// AgentIdleThreshold 是 agent runner 在连续 N 次空闲轮询后退出 goroutine 的阈值。
@@ -372,13 +372,10 @@ func ptrTo[T any](v T) *T { return &v }
 func DefaultConfig() *Config {
 	return &Config{
 		Scheduler: SchedulerKind{
-			AgentMaxLoops:                DefaultSchedulerMaxLoops,
 			EnforceCompactTokenThreshold: DefaultSchedulerCompactTokenThreshold,
-			ContextLimit:                 DefaultSchedulerContextLimit,
 		},
 		ShellTimeoutSec:            30,
 		MaxSubtaskDepth:            1,
-		TransferNoteMaxTokens:      3000, // Sprint 3 #5 TransferNote 默认预算
 		ProgressNotifyEnabled:      true, // §8.6 进度通知默认启用
 		AgentIdleThreshold:         0,
 		SearchAPIProvider:          "duckduckgo_html",
@@ -509,7 +506,7 @@ func LoadConfig(path string, explicit bool) (*Config, error) {
 //     agent_templates 的 user_dirs/project_dirs 同样不得含反斜杠（规则 9 及附加项）；
 //  2. 模型解析：scheduler.model 缺省回落 llm.default_model，两者皆空即报错；
 //     静态 agents 每项须有自有 model 或全局 llm.default_model；scheduler.model
-//     显式出现（非空串）时不得为纯空白；Scheduler 三项可选行为预算不得为负
+//     显式出现（非空串）时不得为纯空白；Scheduler 两项可选行为预算不得为负
 //     （规则 10 的两半及后续扩展）；
 //  3. agent_templates.max_runtime_agents 须在 0..32 之间（0 或省略 = 默认 8）；
 //  4. agents[*].kind 非空且在列表内唯一（规则 3 + 12）；
@@ -518,19 +515,29 @@ func LoadConfig(path string, explicit bool) (*Config, error) {
 //     tool_profiles（规则 6；工具名合法性由 bootstrap 的 tools.ValidateToolNames
 //     单独校验，不在此处）；
 //  7. agents[*].system_prompt_file 必填且存在可读（规则 8）；
-//  8. 行为参数全部 > 0：agent_max_loops / task_max_retries /
-//     enforce_compact_token_threshold / context_limit（规则 11）；
+//  8. 行为参数全部 > 0：task_max_retries /
+//     enforce_compact_token_threshold（规则 11）；
+//     agent_max_loops 与 context_limit 已于 V6 移除，显式设置（非零）
+//     返回迁移诊断错误；
 //  9. startup_probe 取值合法（tcp/off）、失败动作合法（warn/exit）、
 //     startup_probe_timeout_sec 非负（validateStartupProbe，后加的独立检查）；
 //  10. ui 块：frontends ∈ {tui, web}（去重）；web.listen 为合法 host:port；
 //     非 loopback 监听必须设置 web.token（validateUI）；
-//  11. modes 块：gate ∈ {immediate, plan}、exec ∈ {normal, strict, readonly, yolo}、
-//     topo ∈ {team, solo}；字段为空 = 该轴取默认值（validateModes）。
+//  11. modes 块：gate 轴已于 V6 C6c 整体移除（显式设置任何非空值报迁移
+//     诊断）、exec ∈ {normal, strict, readonly, yolo}、topo ∈ {team, solo}；
+//     字段为空 = 该轴取默认值（validateModes）。
 //
 // agents 可以为空，此时系统以 Scheduler-only 模式启动，并可在运行期从
 // AgentTemplate provision Team。只要 agents 非空，原有静态 kind 的全部严格
 // 校验仍然执行，非法配置不会静默降级。
 func (c *Config) Validate() error {
+	// llm.provider 已于 V6 移除：读到旧字段必须给出明确的迁移诊断，
+	// 不允许静默忽略或回退（V6 升级决议，见 docs/nextUpgrade-V6.md）。
+	if c.LLM.Provider != "" {
+		return fmt.Errorf("llm.provider=%q 已于 V6 移除：AgentGo 只实现 OpenAI-compatible Chat Completions 请求路径，"+
+			"不再区分 provider 适配分支；请从配置中删除 llm.provider 字段", c.LLM.Provider)
+	}
+
 	if c.LLM.ReasoningEffort != "" && !isOpenAIReasoningEffort(c.LLM.ReasoningEffort) {
 		return fmt.Errorf("llm.reasoning_effort=%q 无效；允许值: %s",
 			c.LLM.ReasoningEffort, strings.Join(OpenAIReasoningEfforts, ", "))
@@ -637,8 +644,19 @@ func (c *Config) Validate() error {
 
 	// 规则 11：行为参数显式声明且 > 0
 	for i, k := range c.Agents {
-		if k.AgentMaxLoops <= 0 {
-			return fmt.Errorf("agents[%d] (kind=%q).agent_max_loops 必须 > 0", i, k.Kind)
+		// agent_max_loops 已于 V6 移除：读到显式设置的旧字段必须给出明确的
+		// 迁移诊断，不允许静默忽略（与 llm.provider 同款模式）。零值视为未设置。
+		if k.AgentMaxLoops != 0 {
+			return fmt.Errorf("agents[%d] (kind=%q).agent_max_loops=%d 已于 V6 移除："+
+				"Loop 不再因到达固定轮数而终止，由结构化终态、取消、deadline、预算与 emergency fuse 共同约束；"+
+				"请从配置中删除该字段", i, k.Kind, k.AgentMaxLoops)
+		}
+		// context_limit 已于 V6 移除：固定上下文硬限截断层（含 history_truncated
+		// 事件）一并删除，上下文适配由 L2 压缩与 L3 溢出重试承担。零值视为未设置。
+		if k.ContextLimit != 0 {
+			return fmt.Errorf("agents[%d] (kind=%q).context_limit=%d 已于 V6 移除："+
+				"固定上下文硬限已删除，上下文适配由历史压缩（enforce_compact_token_threshold）与溢出重试承担；"+
+				"请从配置中删除该字段", i, k.Kind, k.ContextLimit)
 		}
 		if k.TaskMaxRetries <= 0 {
 			return fmt.Errorf("agents[%d] (kind=%q).task_max_retries 必须 > 0", i, k.Kind)
@@ -646,21 +664,22 @@ func (c *Config) Validate() error {
 		if k.EnforceCompactTokenThreshold <= 0 {
 			return fmt.Errorf("agents[%d] (kind=%q).enforce_compact_token_threshold 必须 > 0", i, k.Kind)
 		}
-		if k.ContextLimit <= 0 {
-			return fmt.Errorf("agents[%d] (kind=%q).context_limit 必须 > 0", i, k.Kind)
-		}
 	}
 
 	// Scheduler 行为预算是可选覆盖：0 表示使用内置默认，负数没有合理语义，
-	// 启动时明确拒绝。
-	if c.Scheduler.AgentMaxLoops < 0 {
-		return fmt.Errorf("scheduler.agent_max_loops=%d 不能为负", c.Scheduler.AgentMaxLoops)
+	// 启动时明确拒绝。agent_max_loops 与 context_limit 已于 V6 移除，显式设置即迁移诊断。
+	if c.Scheduler.AgentMaxLoops != 0 {
+		return fmt.Errorf("scheduler.agent_max_loops=%d 已于 V6 移除："+
+			"Loop 不再因到达固定轮数而终止，由结构化终态、取消、deadline、预算与 emergency fuse 共同约束；"+
+			"请从配置中删除该字段", c.Scheduler.AgentMaxLoops)
+	}
+	if c.Scheduler.ContextLimit != 0 {
+		return fmt.Errorf("scheduler.context_limit=%d 已于 V6 移除："+
+			"固定上下文硬限已删除，上下文适配由历史压缩（enforce_compact_token_threshold）与溢出重试承担；"+
+			"请从配置中删除该字段", c.Scheduler.ContextLimit)
 	}
 	if c.Scheduler.EnforceCompactTokenThreshold < 0 {
 		return fmt.Errorf("scheduler.enforce_compact_token_threshold=%d 不能为负", c.Scheduler.EnforceCompactTokenThreshold)
-	}
-	if c.Scheduler.ContextLimit < 0 {
-		return fmt.Errorf("scheduler.context_limit=%d 不能为负", c.Scheduler.ContextLimit)
 	}
 
 	// 规则 10：scheduler.model 出现时必须为非空字符串。空整块 / 空 model 字段则缺省回落 LLM.DefaultModel
@@ -691,13 +710,12 @@ func (c *Config) Validate() error {
 	return c.validateStartupProbe()
 }
 
-// validateModes 校验 modes: 块三轴取值。字段为空 = 该轴取默认值，合法；
+// validateModes 校验 modes: 块两轴取值。字段为空 = 该轴取默认值，合法；
 // 非空值必须能被 modes.ParseXxx 解析（容错大小写），否则启动报错。
+// gate 轴已于 V6 C6c 整体移除：显式设置任何非空值一律报迁移诊断。
 func (c *Config) validateModes() error {
 	if v := c.Modes.Gate; v != "" {
-		if _, err := modes.ParseGateMode(v); err != nil {
-			return fmt.Errorf("modes.gate=%q 非法: %w", v, err)
-		}
+		return fmt.Errorf("modes.gate=%q 非法: modes.gate 轴已于 V6 整体移除（执行前审阅改由 Graph approval 节点承担），请从配置中删除 gate 键", v)
 	}
 	if v := c.Modes.Exec; v != "" {
 		if _, err := modes.ParseExecMode(v); err != nil {
@@ -712,14 +730,9 @@ func (c *Config) validateModes() error {
 	return nil
 }
 
-// ResolveModes 把 modes: 块解析为三轴初值；空字段回落默认值
-// （immediate / normal / team）。
+// ResolveModes 把 modes: 块解析为两轴初值；空字段回落默认值（normal / team）。
 // 非法值同样回落默认——Validate 已在启动时先行拒绝非法值，此路径仅为防御。
-func (c *Config) ResolveModes() (modes.GateMode, modes.ExecMode, modes.TopoMode) {
-	gate := modes.GateImmediate
-	if g, err := modes.ParseGateMode(c.Modes.Gate); err == nil {
-		gate = g
-	}
+func (c *Config) ResolveModes() (modes.ExecMode, modes.TopoMode) {
 	exec := modes.ExecNormal
 	if e, err := modes.ParseExecMode(c.Modes.Exec); err == nil {
 		exec = e
@@ -728,7 +741,7 @@ func (c *Config) ResolveModes() (modes.GateMode, modes.ExecMode, modes.TopoMode)
 	if t, err := modes.ParseTopoMode(c.Modes.Topo); err == nil {
 		topo = t
 	}
-	return gate, exec, topo
+	return exec, topo
 }
 
 // validateUI 校验 ui 块：

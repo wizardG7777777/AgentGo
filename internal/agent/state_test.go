@@ -465,7 +465,7 @@ func TestE2E_AgentStateMachineLifecycle(t *testing.T) {
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
 
-	ag := NewAgent("agent-e2e", "code", s, r, executor, 5)
+	ag := NewAgent("agent-e2e", "code", s, r, executor)
 	ag.PollInterval = 10 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -578,7 +578,7 @@ func TestE2E_AgentStateMachine_PanicPath(t *testing.T) {
 		panic(errors.New("intentional panic for test"))
 	}
 
-	ag := NewAgent("agent-panic", "code", s, r, executor, 5)
+	ag := NewAgent("agent-panic", "code", s, r, executor)
 	ag.PollInterval = 10 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

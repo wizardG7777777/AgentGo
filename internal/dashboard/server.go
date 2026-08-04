@@ -31,7 +31,7 @@ import (
 )
 
 // sseSubscriberBuf 是 SSE 订阅通道的缓冲。trace 高频事件（llm_call_start/end、
-// tool_call/result、token_stats）叠加 500ms 轮询的 AgentsChanged，256 给
+// tool_call/result）叠加 500ms 轮询的 AgentsChanged，256 给
 // 浏览器渲染留出充足余量；满了由 Hub drop-oldest 兜底。
 const sseSubscriberBuf = 256
 
@@ -123,6 +123,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/interactions/", s.handlePostInteractionResponse)
 	mux.HandleFunc("/api/session/new", s.handlePostSessionNew)
 	mux.HandleFunc("/api/session/switch", s.handlePostSessionSwitch)
+	mux.HandleFunc("/api/doctor/agents", s.handlePostDoctorAgents)
 	return s.authMiddleware(mux)
 }
 
@@ -321,8 +322,8 @@ func (s *Server) handlePostSteer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// handlePostMode 切换三轴模式。新协议使用 {axis,value}；为兼容旧 Web
-// 客户端，仍接受 {mode} 并把它解释为 gate 轴。
+// handlePostMode 切换 exec / topo 两轴模式。旧 {mode} 与 axis=gate 请求
+// 仅用于返回明确的 V6 迁移诊断，不再进入控制器。
 func (s *Server) handlePostMode(w http.ResponseWriter, r *http.Request) {
 	if !requirePost(w, r) || !s.controlAvailable(w) {
 		return
@@ -339,7 +340,8 @@ func (s *Server) handlePostMode(w http.ResponseWriter, r *http.Request) {
 	value := strings.ToLower(strings.TrimSpace(body.Value))
 	legacyMode := strings.ToLower(strings.TrimSpace(body.Mode))
 	if axis == "" && value == "" && legacyMode != "" {
-		axis, value = "gate", legacyMode
+		writeJSONError(w, http.StatusBadRequest, "gate 轴已于 V6 移除：请使用 axis=exec|topo；执行前审阅改由 Graph approval 节点承担")
+		return
 	} else if legacyMode != "" {
 		writeJSONError(w, http.StatusBadRequest, "mode 不能与 axis/value 同时使用")
 		return
@@ -347,15 +349,8 @@ func (s *Server) handlePostMode(w http.ResponseWriter, r *http.Request) {
 
 	switch axis {
 	case "gate":
-		switch value {
-		case "plan":
-			s.controller.SetMode(true)
-		case "immediate":
-			s.controller.SetMode(false)
-		default:
-			writeJSONError(w, http.StatusBadRequest, "gate 仅允许 immediate / plan")
-			return
-		}
+		writeJSONError(w, http.StatusBadRequest, "gate 轴已于 V6 移除：执行前审阅改由 Graph approval 节点承担")
+		return
 	case "exec":
 		if err := s.controller.SetExecMode(value); err != nil {
 			writeControlError(w, err)
@@ -367,13 +362,10 @@ func (s *Server) handlePostMode(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	default:
-		writeJSONError(w, http.StatusBadRequest, "axis 仅允许 gate / exec / topo")
+		writeJSONError(w, http.StatusBadRequest, "axis 仅允许 exec / topo")
 		return
 	}
 	response := map[string]string{"axis": axis, "value": value}
-	if axis == "gate" {
-		response["mode"] = value
-	}
 	writeJSON(w, http.StatusOK, response)
 }
 
@@ -494,6 +486,20 @@ func (s *Server) handlePostSessionSwitch(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "changed": changed})
+}
+
+// handlePostDoctorAgents 触发只读代理审计（/doctor agents，V6 §2 P1b）：
+// 无请求体，创建审计任务并返回 {task_id}；审计报告作为普通任务结果回显。
+func (s *Server) handlePostDoctorAgents(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r) || !s.controlAvailable(w) {
+		return
+	}
+	taskID, err := s.controller.RequestAgentAudit()
+	if err != nil {
+		writeControlError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"task_id": taskID})
 }
 
 // handleEvents 是 SSE 事件流端点：订阅 UI Hub（缓冲 sseSubscriberBuf），

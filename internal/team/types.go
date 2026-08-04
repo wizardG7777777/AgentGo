@@ -19,7 +19,8 @@ const (
 
 // Status is the durable lifecycle state of a TeamSpec. Runtime cancellation
 // during a normal process shutdown does not change ready: a subsequent process
-// must recover it. stopped is reserved for a terminal Plan.
+// must recover it. stopped is reserved for Teams whose controller task reached
+// a terminal state or was evicted from the task store.
 type Status string
 
 const (
@@ -43,7 +44,6 @@ type TeamSpec struct {
 	ID               string    `json:"id"`
 	TemplateRef      string    `json:"template_ref"`
 	TemplateDigest   string    `json:"template_digest"`
-	PlanID           string    `json:"plan_id"`
 	ControllerTaskID string    `json:"controller_task_id"`
 	Purpose          string    `json:"purpose"`
 	EventType        string    `json:"event_type"`
@@ -56,19 +56,20 @@ type TeamSpec struct {
 
 // TeamStore is the minimum durable storage contract required by Manager.
 // Ensure is atomic and returns created=false for the idempotency identity
-// (plan, template ref, purpose, replicas).
+// (controller task, template ref, purpose, replicas).
 type TeamStore interface {
 	Ensure(spec TeamSpec) (stored TeamSpec, created bool, err error)
 	Get(teamID string) (TeamSpec, error)
 	List() ([]TeamSpec, error)
 	SetStatus(teamID string, status Status, reason string) (TeamSpec, error)
-	StopPlan(planID, reason string) ([]TeamSpec, error)
+	StopController(controllerTaskID, reason string) ([]TeamSpec, error)
 }
 
 // RouteRegistry publishes/removes runtime-only Scheduler routing facts. key is
 // the stable TeamSpec.EventType so registration can be rolled back exactly.
+// ownerScope 是路由的归属范围：发起 provision 的 controller 任务 ID。
 type RouteRegistry interface {
-	RegisterRoute(key, eventType, planID string, count int, role string, capabilities []string) error
+	RegisterRoute(key, eventType, ownerScope string, count int, role string, capabilities []string) error
 	UnregisterRoute(key string) bool
 }
 

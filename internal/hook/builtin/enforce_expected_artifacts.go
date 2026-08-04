@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"agentgo/internal/hook"
+	"agentgo/internal/model"
 	"agentgo/internal/store"
 )
 
@@ -99,9 +100,9 @@ func (h *EnforceExpectedArtifactsHook) Run(hctx hook.ToolHookContext) hook.ToolH
 		return hook.ToolHookDecision{Action: hook.Continue}
 	}
 
-	// 规范化为相对项目根的相对路径，与 RecordArtifactHook 使用的同一函数，
-	// 确保 expected_artifacts 的声明路径（通常是相对路径）能与 write_file 的
-	// 实际 path（可能是绝对或相对）做可比较的字符串匹配。
+	// 规范化为相对项目根的相对路径（normalizeArtifactPath，与 record-artifact
+	// Reactor 的同名函数行为一致），确保 expected_artifacts 的声明路径（通常是
+	// 相对路径）能与 write_file 的实际 path（可能是绝对或相对）做可比较的字符串匹配。
 	normalized := normalizeArtifactPath(rawPath, h.ProjectRoot)
 
 	for _, expected := range task.ExpectedArtifacts {
@@ -130,5 +131,33 @@ func (h *EnforceExpectedArtifactsHook) Run(hctx hook.ToolHookContext) hook.ToolH
 				"直接停止 write_file，改为在文本响应中总结你的发现。",
 			hctx.ToolName, normalized, task.ExpectedArtifacts,
 		),
+		ReasonCode:  ReasonMissingExpectedArtifacts,
+		Suggestions: []hook.Suggestion{h.missingArtifactSuggestion(task, normalized)},
 	}
+}
+
+// missingArtifactSuggestion 为"写入路径不在 expected_artifacts"的拒绝构造
+// 候选建议：把声明中尚未产出的缺失产物路径作为 write_file 的合法目标
+//（每条一个动作，有界 ≤3）；全部已产出时退化为第一个声明路径。
+func (h *EnforceExpectedArtifactsHook) missingArtifactSuggestion(task *model.Task, target string) hook.Suggestion {
+	recorded := make(map[string]bool, len(task.Artifacts))
+	for _, a := range task.Artifacts {
+		recorded[normalizeArtifactPath(a, h.ProjectRoot)] = true
+	}
+	missing := make([]string, 0, len(task.ExpectedArtifacts))
+	for _, expected := range task.ExpectedArtifacts {
+		n := normalizeArtifactPath(expected, h.ProjectRoot)
+		if !recorded[n] {
+			missing = append(missing, n)
+		}
+	}
+	if len(missing) == 0 {
+		missing = append(missing, normalizeArtifactPath(task.ExpectedArtifacts[0], h.ProjectRoot))
+	}
+	actions := make([]hook.SuggestedAction, 0, len(missing))
+	for _, m := range missing {
+		actions = append(actions, hook.ToolCallAction("write_file", map[string]any{"path": m},
+			"改为写入任务声明的缺失产物路径"))
+	}
+	return hook.NewSuggestion(h.Name(), ReasonMissingExpectedArtifacts, target, true, actions...)
 }

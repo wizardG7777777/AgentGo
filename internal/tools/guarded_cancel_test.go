@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"agentgo/internal/model"
-	"agentgo/internal/plan"
 	"agentgo/internal/store"
 )
 
@@ -20,38 +19,8 @@ func newGuardedCancelStore(t *testing.T) (*store.MemoryTaskStore, *store.TaskCan
 	return s, reg
 }
 
-// D2：外部调用方（TUI /cancel，无 Plan 上下文）取消 Plan 托管任务必须被
-// 拒绝——与 LLM cancel_task 的拒绝语义同出一源（GuardedCancel）。
-func TestGuardedCancel_ExternalCallerRefusedOnPlanOwnedTask(t *testing.T) {
-	s, _ := newGuardedCancelStore(t)
-	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
-	root := &model.Task{ID: "root-ctrl", Description: "root", EventType: "__scheduler__",
-		NodeRole: model.PlanNodeRoleController, PlanID: "plan-1"}
-	if err := s.PublishTask(root); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := coordinator.Create(context.Background(), plan.CreateInput{PlanID: "plan-1", RootTaskID: root.ID}); err != nil {
-		t.Fatal(err)
-	}
-	target := &model.Task{ID: "plan-member-1", Description: "x", PlanID: "plan-1"}
-	if err := s.PublishTask(target); err != nil {
-		t.Fatal(err)
-	}
-
-	err := GuardedCancel(context.Background(), s, coordinator, "", target.ID, "user")
-	if err == nil || !strings.Contains(err.Error(), "cancel_task 被拒绝") {
-		t.Fatalf("外部调用方取消 Plan 托管任务应被拒绝, err=%v", err)
-	}
-	got, getErr := s.GetTask(target.ID)
-	if getErr != nil {
-		t.Fatal(getErr)
-	}
-	if got.Status != model.TaskStatusPending {
-		t.Fatalf("被拒绝后任务状态不应改变: %s", got.Status)
-	}
-}
-
-// D2：不归属 Plan 的 pending 任务可被外部调用方取消，取消来源记为 "user"。
+// C6b：Plan 归属守卫已随其整包删除——不归属任何控制面的 pending
+// 任务可被外部调用方（TUI /cancel）取消，取消来源记为 "user"。
 func TestGuardedCancel_ExternalCallerCancelsFreePendingTask(t *testing.T) {
 	s, reg := newGuardedCancelStore(t)
 	target := &model.Task{ID: "free-pending-1", Description: "x"}
@@ -61,7 +30,7 @@ func TestGuardedCancel_ExternalCallerCancelsFreePendingTask(t *testing.T) {
 	// 模拟 runner 认领时注册的 cancel context——来源只对有注册的任务落账。
 	reg.GetOrCreate(context.Background(), target.ID)
 
-	if err := GuardedCancel(context.Background(), s, nil, "", target.ID, "user"); err != nil {
+	if err := GuardedCancel(context.Background(), s, target.ID, "user"); err != nil {
 		t.Fatalf("取消自由任务失败: %v", err)
 	}
 	got, getErr := s.GetTask(target.ID)
@@ -76,7 +45,7 @@ func TestGuardedCancel_ExternalCallerCancelsFreePendingTask(t *testing.T) {
 	}
 }
 
-// D2：processing 中的自由任务走第二条转换分支（processing→cancelled）。
+// processing 中的任务走第二条转换分支（processing→cancelled）。
 func TestGuardedCancel_ExternalCallerCancelsProcessingTask(t *testing.T) {
 	s, reg := newGuardedCancelStore(t)
 	target := &model.Task{ID: "free-processing-1", Description: "x"}
@@ -88,7 +57,7 @@ func TestGuardedCancel_ExternalCallerCancelsProcessingTask(t *testing.T) {
 	}
 	reg.GetOrCreate(context.Background(), target.ID)
 
-	if err := GuardedCancel(context.Background(), s, nil, "", target.ID, "user"); err != nil {
+	if err := GuardedCancel(context.Background(), s, target.ID, "user"); err != nil {
 		t.Fatalf("取消 processing 任务失败: %v", err)
 	}
 	got, getErr := s.GetTask(target.ID)
@@ -103,35 +72,21 @@ func TestGuardedCancel_ExternalCallerCancelsProcessingTask(t *testing.T) {
 	}
 }
 
-// D2：目标不存在时报错措辞与抽取前 cancel_task 一致。
-func TestGuardedCancel_TargetNotFound(t *testing.T) {
-	s, _ := newGuardedCancelStore(t)
-	err := GuardedCancel(context.Background(), s, nil, "", "no-such-task", "user")
-	if err == nil || !strings.Contains(err.Error(), "读取待取消任务失败") {
-		t.Fatalf("应报读取待取消任务失败, err=%v", err)
-	}
-}
-
-// D2：LLM 工具侧语义保持——active controller 可取消本 Plan 成员（租约路径）。
-func TestGuardedCancel_ActiveControllerCancelsPlanMember(t *testing.T) {
+// C6b 新语义：任何任务都可被外部调用方取消——带图身份（GraphID）的任务
+// 也不再有归属守卫，直接两段式转换。
+func TestGuardedCancel_ExternalCallerCancelsGraphTask(t *testing.T) {
 	s, reg := newGuardedCancelStore(t)
-	controller := &model.Task{ID: "ctrl-1", Description: "c", EventType: "__scheduler__",
-		NodeRole: model.PlanNodeRoleController, PlanID: "plan-1"}
-	if err := s.PublishTask(controller); err != nil {
-		t.Fatal(err)
+	target := &model.Task{
+		ID: "graph-node-1", Description: "x", EventType: "code",
+		GraphID: "g-1", NodeID: "implement", ActivationID: "implement@1",
 	}
-	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
-	if _, err := coordinator.Create(context.Background(), plan.CreateInput{PlanID: "plan-1", RootTaskID: controller.ID}); err != nil {
-		t.Fatal(err)
-	}
-	target := &model.Task{ID: "member-1", Description: "x", PlanID: "plan-1"}
 	if err := s.PublishTask(target); err != nil {
 		t.Fatal(err)
 	}
 	reg.GetOrCreate(context.Background(), target.ID)
 
-	if err := GuardedCancel(context.Background(), s, coordinator, controller.ID, target.ID, "scheduler"); err != nil {
-		t.Fatalf("active controller 取消本 Plan 任务应成功: %v", err)
+	if err := GuardedCancel(context.Background(), s, target.ID, "user"); err != nil {
+		t.Fatalf("外部调用方取消图任务不应被拒绝: %v", err)
 	}
 	got, getErr := s.GetTask(target.ID)
 	if getErr != nil {
@@ -140,37 +95,47 @@ func TestGuardedCancel_ActiveControllerCancelsPlanMember(t *testing.T) {
 	if got.Status != model.TaskStatusCancelled {
 		t.Fatalf("状态 = %s, want cancelled", got.Status)
 	}
+}
+
+// scheduler 经 cancel_task 取消任务时来源记为 "scheduler"。
+func TestGuardedCancel_SchedulerSourceRecorded(t *testing.T) {
+	s, reg := newGuardedCancelStore(t)
+	target := &model.Task{ID: "target-1", Description: "x"}
+	if err := s.PublishTask(target); err != nil {
+		t.Fatal(err)
+	}
+	reg.GetOrCreate(context.Background(), target.ID)
+
+	if err := GuardedCancel(context.Background(), s, target.ID, "scheduler"); err != nil {
+		t.Fatalf("scheduler 取消任务失败: %v", err)
+	}
 	if src := reg.Source(target.ID); src != "scheduler" {
 		t.Fatalf("取消来源 = %q, want scheduler", src)
 	}
 }
 
-// D2：LLM 工具侧语义保持——controller 不能取消其他 Plan 的任务。
-func TestGuardedCancel_ControllerRefusedOnForeignPlanTask(t *testing.T) {
+// 目标不存在时报错措辞：「取消任务失败 (id=...)」。
+func TestGuardedCancel_TargetNotFound(t *testing.T) {
 	s, _ := newGuardedCancelStore(t)
-	controller := &model.Task{ID: "ctrl-1", Description: "c", EventType: "__scheduler__",
-		NodeRole: model.PlanNodeRoleController, PlanID: "plan-1"}
-	if err := s.PublishTask(controller); err != nil {
-		t.Fatal(err)
+	err := GuardedCancel(context.Background(), s, "no-such-task", "user")
+	if err == nil || !strings.Contains(err.Error(), "取消任务失败 (id=no-such-task)") {
+		t.Fatalf("应报取消任务失败, err=%v", err)
 	}
-	coordinator := plan.NewCoordinator(plan.NewMemoryStore(), nil)
-	if _, err := coordinator.Create(context.Background(), plan.CreateInput{PlanID: "plan-1", RootTaskID: controller.ID}); err != nil {
-		t.Fatal(err)
-	}
-	target := &model.Task{ID: "foreign-1", Description: "x", PlanID: "plan-2"}
+}
+
+// 已终态任务两段转换都失败，返回「取消任务失败」错误。
+func TestGuardedCancel_TerminalTaskRejected(t *testing.T) {
+	s, _ := newGuardedCancelStore(t)
+	target := &model.Task{ID: "done-1", Description: "x"}
 	if err := s.PublishTask(target); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.TransitionState(target.ID, model.TaskStatusPending, model.TaskStatusCancelled); err != nil {
+		t.Fatal(err)
+	}
 
-	err := GuardedCancel(context.Background(), s, coordinator, controller.ID, target.ID, "scheduler")
-	if err == nil || !strings.Contains(err.Error(), "不属于当前 Plan") {
-		t.Fatalf("取消其他 Plan 任务应被拒绝, err=%v", err)
-	}
-	got, getErr := s.GetTask(target.ID)
-	if getErr != nil {
-		t.Fatal(getErr)
-	}
-	if got.Status != model.TaskStatusPending {
-		t.Fatalf("被拒绝后任务状态不应改变: %s", got.Status)
+	err := GuardedCancel(context.Background(), s, target.ID, "user")
+	if err == nil || !strings.Contains(err.Error(), "取消任务失败 (id=done-1)") {
+		t.Fatalf("取消终态任务应失败, err=%v", err)
 	}
 }

@@ -112,7 +112,7 @@ func TestTemplateDigestCoversResolvedExecutionContract(t *testing.T) {
 	base := Template{
 		Description: "description", Capabilities: []string{"a", "b"},
 		Tools: []string{"read_file", "run_shell"}, Model: "model-a", SystemPrompt: "prompt",
-		Limits: Limits{AgentMaxLoops: 1, TaskMaxRetries: 2, EnforceCompactTokenThreshold: 3, ContextLimit: 4, MaxReplicas: 5},
+		Limits: Limits{TaskMaxRetries: 2, EnforceCompactTokenThreshold: 3, MaxReplicas: 5},
 	}
 	baseDigest, err := templateDigest(base)
 	if err != nil {
@@ -125,10 +125,8 @@ func TestTemplateDigestCoversResolvedExecutionContract(t *testing.T) {
 		"tools":             func(v *Template) { v.Tools = []string{"read_file"} },
 		"model":             func(v *Template) { v.Model = "model-b" },
 		"prompt":            func(v *Template) { v.SystemPrompt = "changed" },
-		"agent max loops":   func(v *Template) { v.AgentMaxLoops++ },
 		"task retries":      func(v *Template) { v.TaskMaxRetries++ },
 		"compact threshold": func(v *Template) { v.EnforceCompactTokenThreshold++ },
-		"context limit":     func(v *Template) { v.ContextLimit++ },
 		"maximum replicas":  func(v *Template) { v.MaxReplicas++ },
 	}
 	for name, mutate := range mutations {

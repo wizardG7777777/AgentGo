@@ -1,0 +1,904 @@
+package graph
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+// 本文件实现 V6 §6 第 9–14 条的 GraphStore：内存中的有类型 GraphDocument
+// 是活跃图的主读写对象，JSON 仅作对外契约与持久化格式。变更 API 按角色
+// 分离，字段所有权由 API 形状强制（V6 §6-9）：Scheduler 只能经
+// DefinitionPatch 写定义字段，类型上不存在写 status/executor/execution
+// 的途径；运行面写入一律 CAS state_version。
+//
+// 持久化 = 每图一份 snapshot.json + append-only journal.jsonl（journal.go）；
+// 启动恢复见 recover.go；任何落盘失败使该图进入 persistence-degraded
+// （变更 fail-closed，读取仍可用）。
+
+// ============================================================
+// 错误类型
+// ============================================================
+
+var (
+	// ErrGraphNotFound 图不在内存索引中。
+	ErrGraphNotFound = errors.New("graph: 图不存在")
+	// ErrGraphExists SubmitGraph 时同 graph_id 的图已存在。
+	ErrGraphExists = errors.New("graph: 图已存在")
+	// ErrNodeNotFound 变更目标节点不存在。
+	ErrNodeNotFound = errors.New("graph: 节点不存在")
+	// ErrStoreClosed Store 已 Close，拒绝一切变更。
+	ErrStoreClosed = errors.New("graph: Store 已关闭")
+	// ErrRevisionConflict 定义面 CAS 失败；errors.Is 匹配，
+	// errors.As 取 *RevisionConflictError 携带的当前 revision。
+	ErrRevisionConflict = errors.New("graph: revision 冲突")
+	// ErrStateVersionConflict 运行面 CAS 失败；errors.Is 匹配，
+	// errors.As 取 *StateVersionConflictError 携带的当前 state_version。
+	ErrStateVersionConflict = errors.New("graph: state_version 冲突")
+	// ErrInvalidTransition 图/节点状态机拒绝的迁移。
+	ErrInvalidTransition = errors.New("graph: 非法状态迁移")
+	// ErrDegraded 图处于 persistence-degraded，变更 fail-closed。
+	ErrDegraded = errors.New("graph: 持久化降级")
+	// ErrTransitionExists 同一 (graph_id, source_activation_id, transition_id)
+	// 的边选择已生效过（V6 §6-17 幂等身份）；errors.Is 匹配。
+	ErrTransitionExists = errors.New("graph: 边选择已生效")
+)
+
+// RevisionConflictError 携带定义面 CAS 冲突详情。
+type RevisionConflictError struct {
+	GraphID string
+	Base    int64 // 调用方声明的 baseRevision
+	Current int64 // 当前 revision
+}
+
+func (e *RevisionConflictError) Error() string {
+	return fmt.Sprintf("%v: 图 %s 的 baseRevision=%d，当前 revision=%d",
+		ErrRevisionConflict, e.GraphID, e.Base, e.Current)
+}
+
+func (e *RevisionConflictError) Is(target error) bool { return target == ErrRevisionConflict }
+
+// StateVersionConflictError 携带运行面 CAS 冲突详情。
+type StateVersionConflictError struct {
+	GraphID string
+	NodeID  string // 图级变更为空串
+	Base    int64  // 调用方声明的 baseStateVersion
+	Current int64  // 当前 state_version
+}
+
+func (e *StateVersionConflictError) Error() string {
+	if e.NodeID != "" {
+		return fmt.Sprintf("%v: 图 %s 节点 %s 的 baseStateVersion=%d，当前 state_version=%d",
+			ErrStateVersionConflict, e.GraphID, e.NodeID, e.Base, e.Current)
+	}
+	return fmt.Sprintf("%v: 图 %s 的 baseStateVersion=%d，当前 state_version=%d",
+		ErrStateVersionConflict, e.GraphID, e.Base, e.Current)
+}
+
+func (e *StateVersionConflictError) Is(target error) bool { return target == ErrStateVersionConflict }
+
+// DegradedError 包装导致降级的底层落盘错误。
+type DegradedError struct {
+	GraphID string
+	Err     error
+}
+
+func (e *DegradedError) Error() string {
+	return fmt.Sprintf("%v: 图 %s 的变更无法落盘: %v", ErrDegraded, e.GraphID, e.Err)
+}
+
+func (e *DegradedError) Unwrap() error        { return e.Err }
+func (e *DegradedError) Is(target error) bool { return target == ErrDegraded }
+
+// TransitionExistsError 携带重复生效的边选择记录详情。
+type TransitionExistsError struct {
+	GraphID string
+	Record  TransitionRecord
+}
+
+func (e *TransitionExistsError) Error() string {
+	return fmt.Sprintf("%v: 图 %s 的 (source_activation=%s, transition_id=%d) 不允许重复生效",
+		ErrTransitionExists, e.GraphID, e.Record.SourceActivationID, e.Record.TransitionID)
+}
+
+func (e *TransitionExistsError) Is(target error) bool { return target == ErrTransitionExists }
+
+// ============================================================
+// TransitionRecord —— 已生效边选择的 durable 簿记（V6 §6-17）
+// ============================================================
+
+// TransitionRecord 是一条已生效的边选择记录：幂等身份 =
+// (graph_id, source_activation_id, transition_id)，同一来源 activation 的
+// 同一条边最多生效一次；恢复时重放已记录事实，不重新猜测路由决定。
+// 它与 GraphDocument 契约分离，存放在 entry 级簿记中（snapshot 存全量、
+// journal 逐条重放，压缩后不丢失）。
+type TransitionRecord struct {
+	SourceNodeID       string `json:"source_node_id"`
+	SourceActivationID string `json:"source_activation_id"`
+	TransitionID       int    `json:"transition_id"` // 源节点 next 下标
+	TargetNodeID       string `json:"target_node_id"`
+	// TargetActivationID 在边选择 durable 时一并冻结。目标若已有在途
+	// activation 则指向它；否则预留下一个单调 ID。恢复不再根据目标当前
+	// status 猜测这条边是否已经创建过新 activation。
+	TargetActivationID string `json:"target_activation_id,omitempty"`
+}
+
+// transitionPayload 是 transition journal 记录的 payload，与 TransitionRecord 同形。
+type transitionPayload = TransitionRecord
+
+// transitionKey 是 entry 级边选择簿记的键（graph_id 由 entry 本身确定）。
+type transitionKey struct {
+	sourceActivationID string
+	transitionID       int
+}
+
+// sortedTransitionRecords 把边选择集合输出为确定顺序的切片
+// （source_activation_id → transition_id → target_node_id 升序）。
+func sortedTransitionRecords(set map[transitionKey]TransitionRecord) []TransitionRecord {
+	out := make([]TransitionRecord, 0, len(set))
+	for _, rec := range set {
+		out = append(out, rec)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.SourceActivationID != b.SourceActivationID {
+			return a.SourceActivationID < b.SourceActivationID
+		}
+		if a.TransitionID != b.TransitionID {
+			return a.TransitionID < b.TransitionID
+		}
+		return a.TargetNodeID < b.TargetNodeID
+	})
+	return out
+}
+
+// ============================================================
+// DefinitionPatch —— Scheduler 定义面的唯一变更入口
+// ============================================================
+
+// NodeDefUpsert 只承载节点的定义字段与扩展字段。upsert 已存在节点时整体
+// 替换定义字段，status/executor/execution 运行字段原样保留——类型上不
+// 存在经 DefinitionPatch 写运行字段的途径（V6 §6-9 的强制点：Scheduler
+// 不能整图覆盖伪造 completed 或占用者身份）。
+type NodeDefUpsert struct {
+	ID         string                     `json:"id"`
+	Kind       NodeKind                   `json:"kind"`
+	Task       *NodeTask                  `json:"task,omitempty"`
+	Capability *Capability                `json:"capability,omitempty"`
+	Next       []Transition               `json:"next"`
+	Wait       *WaitSpec                  `json:"wait,omitempty"`
+	Tool       *ToolSpec                  `json:"tool,omitempty"`
+	Subgraph   *SubgraphSpec              `json:"subgraph,omitempty"`
+	Metadata   map[string]string          `json:"metadata,omitempty"`
+	Extensions map[string]json.RawMessage `json:"extensions,omitempty"`
+}
+
+// DefinitionPatch 是一次定义面变更，按固定顺序应用：删除节点 → upsert
+// 节点 → 改 root。应用后在候选副本上重跑语义校验链（validateSemantics +
+// validateRuntimeState），任一失败整体不生效。
+type DefinitionPatch struct {
+	RemoveNodes []string        `json:"remove_nodes,omitempty"`
+	UpsertNodes []NodeDefUpsert `json:"upsert_nodes,omitempty"`
+	Root        *string         `json:"root,omitempty"`
+}
+
+// empty 报告 patch 是否不含任何操作（空 patch 拒绝，避免无意义 revision 膨胀）。
+func (p *DefinitionPatch) empty() bool {
+	return len(p.RemoveNodes) == 0 && len(p.UpsertNodes) == 0 && p.Root == nil
+}
+
+// ============================================================
+// Store 与 entry
+// ============================================================
+
+// GraphSummary 是 List 返回的单图摘要。
+type GraphSummary struct {
+	GraphID      string
+	Revision     int64
+	StateVersion int64
+	Status       GraphStatus
+	Root         string
+	NodeCount    int
+	Digest       string
+	Seq          int64 // 已落盘的 journal 最大 seq
+	Degraded     bool  // 是否处于 persistence-degraded
+}
+
+// Store 是 GraphDocument 的内存主索引 + 持久化协调器。同一图的变更经
+// entry 锁串行，不同图并行；普通读取全部来自内存深拷贝，不碰硬盘；
+// 不存在「并发 Runner 各自读文件后覆盖整图」的任何路径（V6 §6-11）。
+type Store struct {
+	dir     string
+	mu      sync.RWMutex // 护 entries 与 closed
+	entries map[string]*entry
+	closed  bool
+
+	// OnDegraded 在图进入 persistence-degraded 时调用（挂告警用，V6 §6-13）。
+	// 在 entry 锁外同步触发，回调内可安全调用 Store 的读取方法。
+	OnDegraded func(graphID string, err error)
+}
+
+// entry 是单图的内存态：文档指针、journal writer、持久化游标与降级状态。
+type entry struct {
+	mu             sync.RWMutex
+	doc            *GraphDocument // 已提交内存快照；替换指针即生效
+	journal        journalSink
+	seq            int64  // 已落盘的 journal 最大 seq
+	digest         string // 已落盘状态的执行语义摘要
+	journalEntries int64  // 距上次 snapshot 的 journal 条目数（压缩阈值）
+	journalBytes   int64  // 距上次 snapshot 的 journal 字节数（压缩阈值，近似）
+	degraded       error  // 非 nil 即 persistence-degraded（记录首个失败）
+	dir            string // <store.dir>/<graph_id>
+
+	// Graph Runtime 的 entry 级簿记（不属 GraphDocument 契约；snapshot 存
+	// 全量、journal 逐条重放，压缩截断后仍可重建，见 journal.go/recover.go）：
+	transitions   map[transitionKey]TransitionRecord // 已生效边选择（V6 §6-17 幂等身份）
+	activationSeq map[string]int                     // node_id → 已分配的最大 activation 序号（V6 §6-16）
+}
+
+// NewStore 创建以 dir 为持久化根的 Store（布局 <dir>/<graph_id>/snapshot.json
+// + journal.jsonl）。构造时不读盘；启动恢复显式调用 Recover。
+func NewStore(dir string) (*Store, error) {
+	if strings.TrimSpace(dir) == "" {
+		return nil, fmt.Errorf("graph: 持久化根目录不能为空")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("graph: 创建持久化根目录: %w", err)
+	}
+	return &Store{dir: dir, entries: make(map[string]*entry)}, nil
+}
+
+// graphDir 返回图的持久化目录。逻辑 graph_id 先经完整校验，再把 Windows
+// 不可表示的分段（如含 ':' 或设备名 CON）可逆编码；普通分段保持原目录名。
+// "/" 仍映射为嵌套目录（subgraph 物化子图住在父图目录下）。
+func (s *Store) graphDir(graphID string) (string, error) {
+	dir, err := graphStoragePath(s.dir, graphID)
+	if err != nil {
+		return "", fmt.Errorf("graph: graph_id %q 不能映射为持久化目录: %w", graphID, err)
+	}
+	return dir, nil
+}
+
+// ============================================================
+// 读取（全部走内存，不碰硬盘）
+// ============================================================
+
+// Get 返回图的深拷贝（调用方改写不影响 Store 内的共享内存）。
+func (s *Store) Get(graphID string) (*GraphDocument, bool) {
+	e, ok := s.lookup(graphID)
+	if !ok {
+		return nil, false
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	cp, err := cloneDoc(e.doc)
+	if err != nil {
+		return nil, false // 内存对象不含不可序列化内容，理论不可达
+	}
+	return cp, true
+}
+
+// List 返回全部图的摘要（按 graph_id 排序，结果确定）。
+func (s *Store) List() []GraphSummary {
+	s.mu.RLock()
+	entries := make([]*entry, 0, len(s.entries))
+	for _, e := range s.entries {
+		entries = append(entries, e)
+	}
+	s.mu.RUnlock()
+	out := make([]GraphSummary, 0, len(entries))
+	for _, e := range entries {
+		e.mu.RLock()
+		out = append(out, GraphSummary{
+			GraphID:      e.doc.GraphID,
+			Revision:     e.doc.Revision,
+			StateVersion: e.doc.StateVersion,
+			Status:       e.doc.Status,
+			Root:         e.doc.Root,
+			NodeCount:    len(e.doc.Nodes),
+			Digest:       e.digest,
+			Seq:          e.seq,
+			Degraded:     e.degraded != nil,
+		})
+		e.mu.RUnlock()
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].GraphID < out[j].GraphID })
+	return out
+}
+
+// Digest 返回图当前已落盘状态的执行语义摘要。
+func (s *Store) Digest(graphID string) (string, bool) {
+	e, ok := s.lookup(graphID)
+	if !ok {
+		return "", false
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.digest, true
+}
+
+// Degraded 查询图是否处于 persistence-degraded；是则返回首个落盘错误。
+func (s *Store) Degraded(graphID string) (error, bool) {
+	e, ok := s.lookup(graphID)
+	if !ok {
+		return nil, false
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.degraded, e.degraded != nil
+}
+
+func (s *Store) lookup(graphID string) (*entry, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.entries[graphID]
+	return e, ok
+}
+
+// lookupForMutation 供变更路径使用：Store 关闭后拒绝一切变更。
+func (s *Store) lookupForMutation(graphID string) (*entry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+	e, ok := s.entries[graphID]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrGraphNotFound, graphID)
+	}
+	return e, nil
+}
+
+// ============================================================
+// 变更 API（按角色分离）
+// ============================================================
+
+// SubmitGraph 新建一张图。doc 先序列化重走完整 ParseAndValidate（含
+// 「新图必须 pending、节点运行面必须为空」约束），revision 归一为 1、
+// state_version 归 0；
+// submit 全量写入 journal 并 fsync 成功后才入内存索引——关键事实先
+// durable 再对外确认（V6 §6-12）。落盘失败时图不入索引，直接返回错误。
+func (s *Store) SubmitGraph(doc *GraphDocument) error {
+	if doc == nil {
+		return fmt.Errorf("graph: 提交的文档为 nil")
+	}
+	data, err := json.Marshal(doc)
+	if err != nil {
+		return fmt.Errorf("graph: 序列化提交文档: %w", err)
+	}
+	parsed, err := ParseAndValidate(data)
+	if err != nil {
+		return err
+	}
+	// 初始版本归一：revision 从 1 开始，state_version 从 0 开始。
+	parsed.Revision = 1
+	parsed.StateVersion = 0
+
+	dir, err := s.graphDir(parsed.GraphID)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrStoreClosed
+	}
+	if _, ok := s.entries[parsed.GraphID]; ok {
+		return fmt.Errorf("%w: %s", ErrGraphExists, parsed.GraphID)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("graph: 创建图目录: %w", err)
+	}
+	// O_EXCL 防止覆盖磁盘上已存在的同名 journal（未 Recover 的残留）。
+	jw, err := openJournal(filepath.Join(dir, journalFileName), true)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("graph: 图 %s 的 journal 已存在于磁盘（是否遗漏启动 Recover？）: %w", parsed.GraphID, err)
+		}
+		return fmt.Errorf("graph: 创建 journal: %w", err)
+	}
+	line, digest, err := buildJournalLine(1, journalKindSubmit, parsed, submitPayload{Doc: parsed})
+	if err != nil {
+		_ = jw.close()
+		return err
+	}
+	if err := jw.append(line); err != nil {
+		_ = jw.close()
+		return fmt.Errorf("graph: 提交事实落盘失败: %w", err)
+	}
+	s.entries[parsed.GraphID] = &entry{
+		doc:            parsed,
+		journal:        jw,
+		seq:            1,
+		digest:         digest,
+		journalEntries: 1,
+		journalBytes:   int64(len(line)) + 1,
+		dir:            dir,
+		transitions:    make(map[transitionKey]TransitionRecord),
+		activationSeq:  activationSeqFromDoc(parsed),
+	}
+	return nil
+}
+
+// PatchGraph 是 Scheduler 定义面的唯一变更入口（V6 §6-9）：只能改定义
+// 字段（upsert 节点的 kind/task/capability/next/metadata/extensions、删除
+// 节点、改 root）。baseRevision 与当前不符返回 *RevisionConflictError
+// （携带当前 revision）。应用后在候选副本上重跑语义校验链，通过则
+// revision+1、state_version+1、重算 digest，journal append + fsync 后生效。
+func (s *Store) PatchGraph(graphID string, baseRevision int64, patch DefinitionPatch) (int64, error) {
+	if patch.empty() {
+		return 0, fmt.Errorf("graph: 空 patch（至少包含一项定义操作）")
+	}
+	var newRevision int64
+	err := s.mutate(graphID, journalKindPatch, patchPayload{Patch: patch}, true, func(c *GraphDocument) error {
+		if c.Revision != baseRevision {
+			return &RevisionConflictError{GraphID: graphID, Base: baseRevision, Current: c.Revision}
+		}
+		if err := validatePatchRuntimeSafety(c, &patch); err != nil {
+			return err
+		}
+		if err := applyPatch(c, &patch); err != nil {
+			return err
+		}
+		c.Revision++
+		c.StateVersion++
+		newRevision = c.Revision
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return newRevision, nil
+}
+
+// validatePatchRuntimeSafety 只拦截无法保留既有 activation 身份的操作：已有
+// activation 的节点定义可以 upsert（Execution.Definition 冻结旧语义），
+// 但图仍运行时不能从承载运行事实的 Nodes 表中物理删除，即使该 activation
+// 已终态——join 与 durable transition 仍可能引用它。整图终态后才可清理。
+func validatePatchRuntimeSafety(doc *GraphDocument, patch *DefinitionPatch) error {
+	for _, id := range patch.RemoveNodes {
+		node, ok := doc.Nodes[id]
+		if !ok {
+			continue // applyPatch 负责稳定的“不存在”诊断
+		}
+		if !doc.Status.IsTerminal() && node.Execution != nil {
+			return fmt.Errorf("graph: patch 不能从非终态图删除已有 activation 的节点 %q（status=%s activation=%s）；其运行事实和 transition/join 引用必须保留",
+				id, node.Status, activationIDOf(node))
+		}
+	}
+	return nil
+}
+
+func activationIDOf(node Node) string {
+	if node.Execution == nil {
+		return ""
+	}
+	return node.Execution.ActivationID
+}
+
+// SetNodeStatus 是 Graph Runtime 写节点状态的入口：状态机校验 +
+// state_version CAS；仅 state_version+1，revision 与 digest 不变。
+func (s *Store) SetNodeStatus(graphID, nodeID string, to NodeStatus, stateVersion int64) error {
+	return s.mutate(graphID, journalKindNodeStatus, nodeStatusPayload{NodeID: nodeID, To: to}, false,
+		func(c *GraphDocument) error {
+			if err := checkStateVersion(c, nodeID, stateVersion); err != nil {
+				return err
+			}
+			n, ok := c.Nodes[nodeID]
+			if !ok {
+				return fmt.Errorf("%w: 图 %s 节点 %s", ErrNodeNotFound, graphID, nodeID)
+			}
+			if !IsValidNodeStatusTransition(n.Status, to) {
+				return fmt.Errorf("%w: 图 %s 节点 %s 不能从 %q 迁到 %q",
+					ErrInvalidTransition, graphID, nodeID, n.Status, to)
+			}
+			n.Status = to
+			c.Nodes[nodeID] = n
+			c.StateVersion++
+			return nil
+		})
+}
+
+// SetExecutor 是调度/认领系统写节点 executor 的入口（认领事实）。
+// 形状校验（type 仅 "agent"、agent_id 非空）与 validate.go 阶段 9 一致。
+func (s *Store) SetExecutor(graphID, nodeID string, exec Executor, stateVersion int64) error {
+	if exec.Type != ExecutorTypeAgent {
+		return fmt.Errorf("graph: executor.type 仅允许 %q，实际为 %q", ExecutorTypeAgent, exec.Type)
+	}
+	if strings.TrimSpace(exec.AgentID) == "" {
+		return fmt.Errorf("graph: executor.agent_id 不能为空")
+	}
+	return s.mutate(graphID, journalKindExecutor, executorPayload{NodeID: nodeID, Executor: exec}, false,
+		func(c *GraphDocument) error {
+			if err := checkStateVersion(c, nodeID, stateVersion); err != nil {
+				return err
+			}
+			n, ok := c.Nodes[nodeID]
+			if !ok {
+				return fmt.Errorf("%w: 图 %s 节点 %s", ErrNodeNotFound, graphID, nodeID)
+			}
+			ex := exec
+			n.Executor = &ex
+			c.Nodes[nodeID] = n
+			c.StateVersion++
+			return nil
+		})
+}
+
+// SetExecution 是 Agent Loop / Harness 写执行事实的入口
+// （phase/task_id/activation_id/result_ref/evidence_refs）。
+func (s *Store) SetExecution(graphID, nodeID string, exec Execution, stateVersion int64) error {
+	if strings.TrimSpace(exec.Phase) == "" {
+		return fmt.Errorf("graph: execution.phase 不能为空")
+	}
+	return s.mutate(graphID, journalKindExecution, executionPayload{NodeID: nodeID, Execution: exec}, false,
+		func(c *GraphDocument) error {
+			if err := checkStateVersion(c, nodeID, stateVersion); err != nil {
+				return err
+			}
+			n, ok := c.Nodes[nodeID]
+			if !ok {
+				return fmt.Errorf("%w: 图 %s 节点 %s", ErrNodeNotFound, graphID, nodeID)
+			}
+			ex := exec
+			n.Execution = &ex
+			c.Nodes[nodeID] = n
+			c.StateVersion++
+			return nil
+		})
+}
+
+// SetGraphStatus 是 Graph Runtime 写图状态的入口：图状态机校验 +
+// state_version CAS；仅 state_version+1。
+func (s *Store) SetGraphStatus(graphID string, to GraphStatus, stateVersion int64) error {
+	return s.mutate(graphID, journalKindGraphStatus, graphStatusPayload{To: to}, false,
+		func(c *GraphDocument) error {
+			if err := checkStateVersion(c, "", stateVersion); err != nil {
+				return err
+			}
+			if !IsValidGraphStatusTransition(c.Status, to) {
+				return fmt.Errorf("%w: 图 %s 不能从 %q 迁到 %q",
+					ErrInvalidTransition, graphID, c.Status, to)
+			}
+			c.Status = to
+			c.StateVersion++
+			return nil
+		})
+}
+
+// SetExecutionAndStatus 是 Graph Runtime 写「execution + 节点状态」的原子入口
+// （V6 §6-15/16）：activation 创建（ready）、任务发布成功（running）、节点
+// 终态与挂起都必须单条 journal 记录生效——拆成 execution/status 两条会在
+// 两者之间留下崩溃窗口（durable 说已激活/已终结但状态对不上）。因此执行
+// activation_id 强制非空：Graph Runtime 的一切节点写入都携带 activation 上下文。
+func (s *Store) SetExecutionAndStatus(graphID, nodeID string, exec Execution, to NodeStatus, stateVersion int64) error {
+	if strings.TrimSpace(exec.Phase) == "" {
+		return fmt.Errorf("graph: execution.phase 不能为空")
+	}
+	if strings.TrimSpace(exec.ActivationID) == "" {
+		return fmt.Errorf("graph: execution.activation_id 不能为空（Graph Runtime 写入必须携带 activation 上下文）")
+	}
+	return s.mutate(graphID, journalKindExecutionStatus,
+		executionStatusPayload{NodeID: nodeID, Execution: exec, To: to}, false,
+		func(c *GraphDocument) error {
+			if err := checkStateVersion(c, nodeID, stateVersion); err != nil {
+				return err
+			}
+			n, ok := c.Nodes[nodeID]
+			if !ok {
+				return fmt.Errorf("%w: 图 %s 节点 %s", ErrNodeNotFound, graphID, nodeID)
+			}
+			if !IsValidNodeStatusTransition(n.Status, to) {
+				return fmt.Errorf("%w: 图 %s 节点 %s 不能从 %q 迁到 %q",
+					ErrInvalidTransition, graphID, nodeID, n.Status, to)
+			}
+			ex := exec
+			n.Execution = &ex
+			n.Status = to
+			c.Nodes[nodeID] = n
+			c.StateVersion++
+			return nil
+		})
+}
+
+// RecordTransition 记录一条边选择生效事实（V6 §6-17，durable）。同一
+// (graph_id, source_activation_id, transition_id) 已生效过则返回
+// *TransitionExistsError（errors.Is 匹配 ErrTransitionExists）——调用方
+// 应先 HasTransition 查询再决定是否激活目标，重复记录是防御性兜底。
+func (s *Store) RecordTransition(graphID string, rec TransitionRecord, stateVersion int64) error {
+	if strings.TrimSpace(rec.SourceNodeID) == "" || strings.TrimSpace(rec.SourceActivationID) == "" ||
+		strings.TrimSpace(rec.TargetNodeID) == "" {
+		return fmt.Errorf("graph: 边选择记录的 source_node_id/source_activation_id/target_node_id 均不能为空")
+	}
+	if rec.TransitionID < 0 {
+		return fmt.Errorf("graph: 边选择记录的 transition_id 不能为负: %d", rec.TransitionID)
+	}
+	return s.mutate(graphID, journalKindTransition, transitionPayload(rec), false,
+		func(c *GraphDocument) error {
+			if err := checkStateVersion(c, "", stateVersion); err != nil {
+				return err
+			}
+			c.StateVersion++
+			return nil
+		})
+}
+
+// HasTransition 查询某来源 activation 的指定边是否已生效。
+func (s *Store) HasTransition(graphID, sourceActivationID string, transitionID int) (TransitionRecord, bool) {
+	e, ok := s.lookup(graphID)
+	if !ok {
+		return TransitionRecord{}, false
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	rec, ok := e.transitions[transitionKey{sourceActivationID, transitionID}]
+	return rec, ok
+}
+
+// Transitions 返回图已生效的边选择记录（确定顺序，见 sortedTransitionRecords）。
+func (s *Store) Transitions(graphID string) []TransitionRecord {
+	e, ok := s.lookup(graphID)
+	if !ok {
+		return nil
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return sortedTransitionRecords(e.transitions)
+}
+
+// NextActivationID 返回节点下一个 activation_id（<nodeID>@<n>，n 为该节点
+// 在图内的单调序号，V6 §6-16）。序号表由 execution/execution_status 事实
+// （含 submit 文档携带的 execution）重建并随持久化一起走：snapshot 存全量、
+// journal 重放取最大，进程重启后绝不重号。
+func (s *Store) NextActivationID(graphID, nodeID string) (string, error) {
+	e, ok := s.lookup(graphID)
+	if !ok {
+		return "", fmt.Errorf("%w: %s", ErrGraphNotFound, graphID)
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return fmt.Sprintf("%s@%d", nodeID, e.activationSeq[nodeID]+1), nil
+}
+
+// parseActivationID 解析 Graph Runtime 的 activation_id 形态 <nodeID>@<n>。
+// 节点 ID 字符集不含 '@'（validate.go idCharset），末个 '@' 即分隔点；
+// 不符合形态（无序号段、序号非正整数）时 ok=false。
+func parseActivationID(id string) (nodeID string, n int, ok bool) {
+	i := strings.LastIndexByte(id, '@')
+	if i <= 0 || i == len(id)-1 {
+		return "", 0, false
+	}
+	v, err := strconv.Atoi(id[i+1:])
+	if err != nil || v < 1 {
+		return "", 0, false
+	}
+	return id[:i], v, true
+}
+
+// noteActivation 把 <nodeID>@<n> 形式的 activation_id 登记进序号表（取最大）。
+// activation_id 的属主节点与写入节点不一致时忽略（防御性）。
+func noteActivation(seq map[string]int, nodeID, activationID string) {
+	owner, n, ok := parseActivationID(activationID)
+	if !ok || owner != nodeID {
+		return
+	}
+	if n > seq[nodeID] {
+		seq[nodeID] = n
+	}
+}
+
+// activationSeqFromDoc 扫描文档各节点 execution.activation_id 重建序号表
+// （submit 文档理论上不带 execution，此处防御性扫描）。
+func activationSeqFromDoc(doc *GraphDocument) map[string]int {
+	seq := make(map[string]int)
+	for id, n := range doc.Nodes {
+		if n.Execution != nil {
+			noteActivation(seq, id, n.Execution.ActivationID)
+		}
+	}
+	return seq
+}
+
+// ============================================================
+// 变更统一纪律与辅助
+// ============================================================
+
+// mutate 定位 entry、串行化执行变更，并在首次进入 degraded 时触发
+// OnDegraded 回调（entry 锁外）。
+func (s *Store) mutate(graphID, kind string, payload any, revalidate bool, applyFn func(c *GraphDocument) error) error {
+	e, err := s.lookupForMutation(graphID)
+	if err != nil {
+		return err
+	}
+	wasDegraded := e.isDegraded()
+	e.mu.Lock()
+	err = e.mutateLocked(kind, payload, revalidate, applyFn)
+	e.mu.Unlock()
+	if !wasDegraded && e.isDegraded() && s.OnDegraded != nil {
+		s.OnDegraded(graphID, e.degradedCause())
+	}
+	return err
+}
+
+// mutateLocked 统一变更纪律（V6 §6-11/12）：锁内克隆候选 → apply → 可选
+// 语义重校验 → journal append + fsync 成功 → 替换内存指针生效。
+// 任一步失败内存不前进；落盘失败标记 degraded（后续变更 fail-closed）。
+// entry 级簿记（边选择 / activation 序号）随 durable 成功在同一把锁内生效。
+func (e *entry) mutateLocked(kind string, payload any, revalidate bool, applyFn func(c *GraphDocument) error) error {
+	if e.degraded != nil {
+		return &DegradedError{GraphID: e.doc.GraphID, Err: e.degraded}
+	}
+	cand, err := cloneDoc(e.doc)
+	if err != nil {
+		return err
+	}
+	if err := applyFn(cand); err != nil {
+		return err
+	}
+	// 边选择幂等身份的前置校验（entry 级簿记，必须在 journal append 前拦截）
+	if kind == journalKindTransition {
+		rec := TransitionRecord(payload.(transitionPayload))
+		key := transitionKey{rec.SourceActivationID, rec.TransitionID}
+		if _, dup := e.transitions[key]; dup {
+			return &TransitionExistsError{GraphID: e.doc.GraphID, Record: rec}
+		}
+	}
+	if revalidate {
+		if err := validateSemantics(cand); err != nil {
+			return err
+		}
+		if err := validateRuntimeState(cand); err != nil {
+			return err
+		}
+	}
+	line, digest, err := buildJournalLine(e.seq+1, kind, cand, payload)
+	if err != nil {
+		return err
+	}
+	if err := e.journal.append(line); err != nil {
+		e.markDegradedLocked(err)
+		return &DegradedError{GraphID: e.doc.GraphID, Err: err}
+	}
+	e.doc = cand
+	e.seq++
+	e.digest = digest
+	e.journalEntries++
+	e.journalBytes += int64(len(line)) + 1
+	e.noteBookkeepingLocked(kind, payload)
+	if e.journalEntries > journalCompactMaxEntries || e.journalBytes > journalCompactMaxBytes {
+		if err := e.compactLocked(); err != nil {
+			// 本次变更已 durable 且生效；压缩失败只降级后续变更。
+			e.markDegradedLocked(err)
+		}
+	}
+	return nil
+}
+
+// noteBookkeepingLocked 在变更 durable 生效后同步 entry 级簿记：
+// transition 记录进边选择集合；execution/execution_status 记录推进
+// activation 序号表（取 <nodeID>@<n> 的最大 n）。
+func (e *entry) noteBookkeepingLocked(kind string, payload any) {
+	switch kind {
+	case journalKindTransition:
+		rec := TransitionRecord(payload.(transitionPayload))
+		e.transitions[transitionKey{rec.SourceActivationID, rec.TransitionID}] = rec
+		noteActivation(e.activationSeq, rec.TargetNodeID, rec.TargetActivationID)
+	case journalKindExecution:
+		p := payload.(executionPayload)
+		noteActivation(e.activationSeq, p.NodeID, p.Execution.ActivationID)
+	case journalKindExecutionStatus:
+		p := payload.(executionStatusPayload)
+		noteActivation(e.activationSeq, p.NodeID, p.Execution.ActivationID)
+	}
+}
+
+// markDegradedLocked 记录首个落盘失败（degraded 为粘滞状态，首因保留）。
+func (e *entry) markDegradedLocked(err error) {
+	if e.degraded == nil {
+		e.degraded = err
+	}
+}
+
+func (e *entry) isDegraded() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.degraded != nil
+}
+
+func (e *entry) degradedCause() error {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.degraded
+}
+
+// checkStateVersion 校验运行面 CAS 前提。
+func checkStateVersion(c *GraphDocument, nodeID string, base int64) error {
+	if c.StateVersion != base {
+		return &StateVersionConflictError{GraphID: c.GraphID, NodeID: nodeID, Base: base, Current: c.StateVersion}
+	}
+	return nil
+}
+
+// applyPatch 按固定顺序应用定义面操作：删除节点 → upsert 节点 → 改 root。
+// 语义正确性（root 指向、引用、可达性、转移形态）由调用方随后的
+// validateSemantics 统一保证。upsert 已存在节点时整体替换定义字段、
+// 原样保留运行字段；新节点的运行字段从零开始（status=inactive）。
+func applyPatch(doc *GraphDocument, patch *DefinitionPatch) error {
+	for _, id := range patch.RemoveNodes {
+		if id == "" {
+			return fmt.Errorf("graph: patch 含空节点 ID 的删除操作")
+		}
+		if _, ok := doc.Nodes[id]; !ok {
+			return fmt.Errorf("graph: patch 删除不存在的节点 %q", id)
+		}
+		delete(doc.Nodes, id)
+	}
+	for _, up := range patch.UpsertNodes {
+		if up.ID == "" {
+			return fmt.Errorf("graph: patch 含空 ID 的 upsert 操作")
+		}
+		n, ok := doc.Nodes[up.ID]
+		if !ok {
+			n = Node{Status: NodeInactive}
+		}
+		n.Kind = up.Kind
+		n.Task = up.Task
+		n.Capability = up.Capability
+		n.Next = up.Next
+		n.Wait = up.Wait
+		n.Tool = up.Tool
+		n.Subgraph = up.Subgraph
+		n.Metadata = up.Metadata
+		n.Extensions = up.Extensions
+		doc.Nodes[up.ID] = n
+	}
+	if patch.Root != nil {
+		doc.Root = *patch.Root
+	}
+	return nil
+}
+
+// cloneDoc 经 JSON 往返深拷贝文档（Extensions 的 RawMessage 一并复制）。
+func cloneDoc(doc *GraphDocument) (*GraphDocument, error) {
+	data, err := json.Marshal(doc)
+	if err != nil {
+		return nil, fmt.Errorf("graph: 克隆文档: %w", err)
+	}
+	var out GraphDocument
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("graph: 克隆文档: %w", err)
+	}
+	return &out, nil
+}
+
+// Close 关闭全部 journal writer 并拒绝后续变更；内存读取仍可用。幂等。
+// Windows 硬约束：测试必须 t.Cleanup 先 Close 再让 TempDir 清理。
+func (s *Store) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	entries := make([]*entry, 0, len(s.entries))
+	for _, e := range s.entries {
+		entries = append(entries, e)
+	}
+	s.mu.Unlock()
+	var errs []error
+	for _, e := range entries {
+		e.mu.Lock()
+		if err := e.journal.close(); err != nil {
+			errs = append(errs, fmt.Errorf("graph: 关闭图 %s 的 journal: %w", e.doc.GraphID, err))
+		}
+		e.mu.Unlock()
+	}
+	return errors.Join(errs...)
+}

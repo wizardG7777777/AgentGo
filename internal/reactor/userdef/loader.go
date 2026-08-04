@@ -37,23 +37,13 @@ var knownEventKinds = map[trace.EventKind]struct{}{
 	trace.KindToolCall:                  {},
 	trace.KindToolResult:                {},
 	trace.KindHistoryCompaction:         {},
-	trace.KindHistoryTruncated:          {},
-	trace.KindTokenStats:                {},
 	trace.KindFileWritten:               {},
 	trace.KindFileWriteQueued:           {},
 	trace.KindProgressNotify:            {},
-	trace.KindMemoryContextInject:       {},
 	trace.KindError:                     {},
 	trace.KindAgentStateChanged:         {},
 	trace.KindShellExecuted:             {},
 	trace.KindReactorSpawnDepthExceeded: {},
-	trace.KindReplanRequested:           {},
-	trace.KindReplanCoalesced:           {},
-	trace.KindReplanDecided:             {},
-	trace.KindPlanRevisionChanged:       {},
-	trace.KindAcceptanceCompleted:       {},
-	trace.KindPlanPaused:                {},
-	trace.KindPlanTerminal:              {},
 	// workspace 隔离生命周期四事件：发射点已就位（Manager.Materialize /
 	// MergeTask / Cleanup 与 watchdog 孤儿清扫），允许用户 YAML reactor 订阅。
 	trace.KindWorkspaceMaterialized:  {},
@@ -74,21 +64,19 @@ var reservedEventKinds = map[trace.EventKind]struct{}{
 // Deps 聚合 loader 需要的全部外部依赖。
 //
 // nil 字段语义：
-//   - Store=nil：发现 publish_task reactor → 启动期报错
+//   - Store=nil：发现 publish_task / request_replan reactor → 启动期报错
 //   - LLM/LLMFactory 均 nil：发现 invoke_llm reactor → 启动期报错
 //   - LLMFactory=nil 且 invoke_llm.model 非空：启动期报错，避免静默忽略模型覆盖
 //   - Mailbox=nil：发现 invoke_llm.send_message → 启动期报错
 //   - Emitter=nil：emit_trace 退化到包级 trace.Emit
-//   - ReplanRequester=nil：发现 request_replan reactor → 启动期报错
 //   - KindEventTypes=nil：跳过 publish_task.kind 路由校验（测试场景）
 type Deps struct {
-	Store           PublishStore
-	LLM             LLMCompleter
-	LLMFactory      func(model string) LLMCompleter
-	Mailbox         MailboxSender
-	Emitter         TraceEmitter
-	ReplanRequester ReplanRequester
-	KindEventTypes  map[string]string
+	Store          PublishStore
+	LLM            LLMCompleter
+	LLMFactory     func(model string) LLMCompleter
+	Mailbox        MailboxSender
+	Emitter        TraceEmitter
+	KindEventTypes map[string]string
 	// SpawnHost 是 spawn_agent reactor 的依赖（通常由 internal/spawn.Manager 实现）。
 	// 为 nil 时，发现 spawn_agent reactor → 启动期报错。
 	SpawnHost spawn.SpawnHost
@@ -303,10 +291,8 @@ func buildSpawnAgent(name string, kind trace.EventKind, when *whenCond, a *Spawn
 			return nil, err
 		}
 		override.Model = a.Override.Model
-		override.AgentMaxLoops = a.Override.AgentMaxLoops
 		override.TaskMaxRetries = a.Override.TaskMaxRetries
 		override.EnforceCompactTokenThreshold = a.Override.EnforceCompactTokenThreshold
-		override.ContextLimit = a.Override.ContextLimit
 		if a.Override.SystemPrompt != nil {
 			tpl, err := loadPrompt(*a.Override.SystemPrompt, descBaseDir, projectRoot)
 			if err != nil {
@@ -326,8 +312,6 @@ func buildSpawnAgent(name string, kind trace.EventKind, when *whenCond, a *Spawn
 		sysPromTpl: sysPromTpl,
 		lifecycle:  a.Lifecycle,
 		host:       deps.SpawnHost,
-		store:      deps.Store,
-		requester:  deps.ReplanRequester,
 	}, nil
 }
 
@@ -385,14 +369,16 @@ func loadDescriptionWithTranslator(spec PromptSpec, baseDir, projectRoot string,
 
 func validateSpawnOverride(o SpawnOverride) error {
 	switch {
-	case o.AgentMaxLoops < 0:
-		return fmt.Errorf("spawn_agent.override.agent_max_loops must be >= 0")
+	case o.AgentMaxLoops != 0:
+		// V6 迁移诊断：固定循环上限已删除，显式设置即报错，不静默忽略。
+		return fmt.Errorf("spawn_agent.override.agent_max_loops was removed in V6: loops are bounded by structured terminal states, cancellation, deadlines and budgets, not a fixed round cap; delete this field")
+	case o.ContextLimit != 0:
+		// V6 迁移诊断：固定上下文硬限已删除，显式设置即报错，不静默忽略。
+		return fmt.Errorf("spawn_agent.override.context_limit was removed in V6: context fitting is handled by history compaction and overflow retry, not a fixed hard cap; delete this field")
 	case o.TaskMaxRetries < 0:
 		return fmt.Errorf("spawn_agent.override.task_max_retries must be >= 0")
 	case o.EnforceCompactTokenThreshold < 0:
 		return fmt.Errorf("spawn_agent.override.enforce_compact_token_threshold must be >= 0")
-	case o.ContextLimit < 0:
-		return fmt.Errorf("spawn_agent.override.context_limit must be >= 0")
 	}
 	return nil
 }
@@ -434,7 +420,6 @@ func buildPublishTask(name string, kind trace.EventKind, when *whenCond, a *Publ
 		eventType:    eventType,
 		priority:     a.Priority,
 		store:        deps.Store,
-		requester:    deps.ReplanRequester,
 		depTemplates: a.Dependencies,
 	}, nil
 }
@@ -465,8 +450,6 @@ func buildInvokeLLM(name string, kind trace.EventKind, when *whenCond, a *Invoke
 		llm:        llm,
 		output:     sink,
 		llmTimeout: deps.LLMTimeout,
-		store:      deps.Store,
-		requester:  deps.ReplanRequester,
 	}, nil
 }
 

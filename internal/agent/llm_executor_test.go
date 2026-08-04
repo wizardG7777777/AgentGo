@@ -418,10 +418,10 @@ func TestLLMExecutor_RechecksGuardBetweenOrderedTools(t *testing.T) {
 		{ID: "second", Name: "second"},
 	}}}}
 	tools := NewToolRegistry()
-	paused := false
+	live := true
 	secondExecuted := false
-	tools.Register("first", "pause after first call", nil, func(context.Context, map[string]any) (string, error) {
-		paused = true
+	tools.Register("first", "cancel task after first call", nil, func(context.Context, map[string]any) (string, error) {
+		live = false
 		return "first completed", nil
 	})
 	tools.Register("second", "must be blocked", nil, func(context.Context, map[string]any) (string, error) {
@@ -430,19 +430,19 @@ func TestLLMExecutor_RechecksGuardBetweenOrderedTools(t *testing.T) {
 	})
 	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "")
 	ctx := WithToolDispatchGuard(context.Background(), func(context.Context, *model.Task) error {
-		if paused {
-			return errors.New("plan paused")
+		if !live {
+			return errors.New("任务已迁出 processing，中止本轮工具派发")
 		}
 		return nil
 	})
-	result, err := executor(ctx, &model.Task{ID: "planned"}, nil, nil)
+	result, err := executor(ctx, &model.Task{ID: "guarded"}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if secondExecuted {
-		t.Fatal("a later tool dispatched after the guard observed a paused Plan")
+		t.Fatal("任务失效后仍有后续工具被派发")
 	}
-	if len(result.ToolResults) != 2 || !strings.Contains(result.ToolResults[1].Content, "plan paused") {
+	if len(result.ToolResults) != 2 || !strings.Contains(result.ToolResults[1].Content, "中止本轮工具派发") {
 		t.Fatalf("guard rejection was not returned as the second tool result: %+v", result.ToolResults)
 	}
 }
@@ -516,55 +516,50 @@ func TestLLMExecutor_TaskEmptySystemPrompt_UsesDefault(t *testing.T) {
 	}
 }
 
-func TestBuildMessagesInjectsTrustedPlanTaskContext(t *testing.T) {
+// buildMessages 的 <task-context>（V6 C6b 起）：只有 task_id 必含；图任务
+// 追加 graph_id / node_id / activation_id。无 plan_id / node_role，也不再
+// 注入「动态 Plan 权限边界」system 消息。
+func TestBuildMessagesInjectsTrustedTaskContext(t *testing.T) {
 	tests := []struct {
-		name               string
-		task               *model.Task
-		wantUser           []string
-		wantSystemBoundary bool
-		forbidUser         []string
+		name     string
+		task     *model.Task
+		wantUser []string
 	}{
 		{
-			name:               "planned non-controller",
-			task:               &model.Task{ID: "task-impl", Description: "do work", PlanID: "plan-1", NodeRole: model.PlanNodeRoleImplementation},
-			wantUser:           []string{"<task-context", "task_id: task-impl", "plan_id: plan-1", "node_role: implementation", "do not use publish_task", "use request_replan"},
-			wantSystemBoundary: true,
+			name:     "non-graph task",
+			task:     &model.Task{ID: "task-impl", Description: "do work"},
+			wantUser: []string{"<task-context source=\"control-plane\">", "task_id: task-impl"},
 		},
 		{
-			name:       "planned controller",
-			task:       &model.Task{ID: "controller-1", Description: "decide", PlanID: "plan-1", NodeRole: model.PlanNodeRoleController},
-			wantUser:   []string{"<task-context", "task_id: controller-1", "plan_id: plan-1", "node_role: controller", "scheduler_controller"},
-			forbidUser: []string{"do not use publish_task", "use request_replan"},
-		},
-		{
-			name:       "unplanned compatibility",
-			task:       &model.Task{ID: "legacy-1", Description: "legacy"},
-			wantUser:   []string{"<task-context", "task_id: legacy-1", "plan_id: none", "node_role: none", "unplanned_compatibility", "publish_task may be used"},
-			forbidUser: []string{"do not use publish_task", "use request_replan"},
+			name: "graph task",
+			task: &model.Task{
+				ID: "node-task-1", Description: "graph work",
+				GraphID: "graph-1", NodeID: "node-a", ActivationID: "node-a@2",
+			},
+			wantUser: []string{
+				"<task-context source=\"control-plane\">", "task_id: node-task-1",
+				"graph_id: graph-1", "node_id: node-a", "activation_id: node-a@2",
+			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			messages := buildMessages("task-specific system prompt", tt.task, nil, nil, "")
 			var userContent string
-			var hasBoundary bool
 			for _, message := range messages {
 				if message.Role == "user" && userContent == "" {
 					userContent = message.Content
 				}
 				if message.Role == "system" && strings.Contains(message.Content, "动态 Plan 权限边界") {
-					hasBoundary = true
+					t.Fatalf("不得再注入「动态 Plan 权限边界」system 消息: %+v", message)
 				}
-			}
-			if hasBoundary != tt.wantSystemBoundary {
-				t.Fatalf("system boundary=%v, want %v; messages=%+v", hasBoundary, tt.wantSystemBoundary, messages)
 			}
 			for _, want := range tt.wantUser {
 				if !strings.Contains(userContent, want) {
 					t.Errorf("user task context missing %q: %s", want, userContent)
 				}
 			}
-			for _, forbidden := range tt.forbidUser {
+			for _, forbidden := range []string{"plan_id", "node_role", "dag_authority"} {
 				if strings.Contains(userContent, forbidden) {
 					t.Errorf("user task context unexpectedly contains %q: %s", forbidden, userContent)
 				}

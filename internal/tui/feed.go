@@ -304,10 +304,6 @@ func agentWorkbenchParts(
 		return fixed, nil, 0
 	}
 
-	if control := schedulerControlLines(t, w, info.SchedulerControl); len(control) > 0 {
-		fixed = append(fixed, t.MdH2.Render("  Controller State"))
-		fixed = append(fixed, tailLines(control, 3)...)
-	}
 	if active := activeToolLines(t, w, info.ActiveTools); len(active) > 0 {
 		fixed = append(fixed, t.MdH2.Render("  Active Tools"))
 		fixed = append(fixed, tailLines(active, 2)...)
@@ -460,39 +456,6 @@ func wrapWorkbenchText(t Theme, w int, text string) []string {
 	return lines
 }
 
-func schedulerControlLines(t Theme, w int, state *ui.SchedulerControlState) []string {
-	if state == nil {
-		return nil
-	}
-	line1 := fmt.Sprintf("  plan %s · %s · rev %d · state %d/%d", shortID(state.PlanID), state.Status,
-		state.Revision, state.HandledStateVersion, state.ExecutionStateVersion)
-	line2 := fmt.Sprintf("  DAG %d/%d complete · %d running · %d pending · %d failed · %d cancelled · %d replans",
-		state.TasksCompleted, state.TasksTotal, state.TasksProcessing, state.TasksPending,
-		state.TasksFailed, state.TasksCancelled, state.PendingReplans)
-	lines := []string{t.MsgInfo.Render(truncateDisplay(line1, w)), t.MsgInfo.Render(truncateDisplay(line2, w))}
-	var facts []string
-	if state.AcceptanceAttempt > 0 || state.AcceptanceRunID != "" {
-		acceptance := fmt.Sprintf("acceptance #%d", state.AcceptanceAttempt)
-		if state.AcceptanceStatus != "" {
-			acceptance += " " + state.AcceptanceStatus
-		}
-		if state.AcceptanceVerdict != "" {
-			acceptance += "/" + state.AcceptanceVerdict
-		}
-		facts = append(facts, acceptance)
-	}
-	if state.BudgetUsedPercent > 0 {
-		facts = append(facts, fmt.Sprintf("budget %.0f%%", state.BudgetUsedPercent))
-	}
-	if state.PauseReason != "" {
-		facts = append(facts, "paused: "+state.PauseReason)
-	}
-	if len(facts) > 0 {
-		lines = append(lines, t.MsgInfo.Render(truncateDisplay("  "+strings.Join(facts, " · "), w)))
-	}
-	return lines
-}
-
 func activeToolLines(t Theme, w int, tools []ui.AgentToolActivity) []string {
 	lines := make([]string, 0, len(tools))
 	now := time.Now()
@@ -536,12 +499,6 @@ func recentDecisionLines(t Theme, w int, traces []ui.TraceEvent) []string {
 			icon = "✗"
 		case "running":
 			icon = "…"
-		}
-		if event.PlanID != "" {
-			detail += fmt.Sprintf(" · plan %s rev %d", shortID(event.PlanID), event.PlanRevision)
-		}
-		if event.AcceptanceStatus != "" || event.AcceptanceVerdict != "" {
-			detail += " · " + strings.Trim(strings.Join([]string{event.AcceptanceStatus, event.AcceptanceVerdict}, "/"), "/")
 		}
 		if event.ArgsSummary != "" {
 			detail += " · " + event.ArgsSummary
@@ -637,12 +594,6 @@ func traceLines(t Theme, w int, traces []ui.TraceEvent, activityOnly bool) []str
 		}
 		if event.Outcome != "" {
 			detail += firstWithPrefix(event.Outcome, " · ")
-		}
-		if event.PlanID != "" {
-			detail += fmt.Sprintf(" · plan=%s rev=%d state=%d", shortID(event.PlanID), event.PlanRevision, event.ExecutionStateVersion)
-		}
-		if event.AcceptanceStatus != "" || event.AcceptanceVerdict != "" {
-			detail += " · acceptance=" + strings.Trim(strings.Join([]string{event.AcceptanceStatus, event.AcceptanceVerdict}, "/"), "/")
 		}
 		if event.DurationMS > 0 {
 			detail += fmt.Sprintf(" · %dms", event.DurationMS)

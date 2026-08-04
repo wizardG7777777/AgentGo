@@ -17,7 +17,6 @@ import (
 	"agentgo/internal/interaction"
 	"agentgo/internal/model"
 	"agentgo/internal/output"
-	"agentgo/internal/scheduler"
 	"agentgo/internal/ui"
 )
 
@@ -1397,14 +1396,6 @@ func (m *AppModel) snapshot() ui.Snapshot {
 	return m.deps.Observer.Snapshot()
 }
 
-// snapshotMode 把快照中的模式字符串映射为 header 渲染用的 scheduler.Mode。
-func snapshotMode(snap ui.Snapshot) scheduler.Mode {
-	if snap.Mode == "plan" {
-		return scheduler.ModePlan
-	}
-	return scheduler.ModeImmediate
-}
-
 // ── View ──
 
 func (m AppModel) View() string {
@@ -1428,7 +1419,7 @@ func (m AppModel) View() string {
 			totalTokens += ag.PromptTokens + ag.CompletionTokens
 		}
 	}
-	header := renderHeader(m.theme, m.layout, snapshotMode(snap),
+	header := renderHeader(m.theme, m.layout, snap.ExecMode, snap.TopoMode,
 		sessionID, len(m.agents), len(m.interactions), totalTokens)
 	sections = append(sections, header)
 

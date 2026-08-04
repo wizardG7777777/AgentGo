@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -33,7 +34,7 @@ type RunnerOptions struct {
 	TemplatePath string        // 配置模板路径（llm 块含 ${VAR} 占位符）
 	OnlyTask     string        // 非空 = 只跑指定任务
 	SmokeOnly    bool          // true = 只跑 smoke 标记的任务
-	BinaryPath   string        // 被测二进制；空 = os.Executable()
+	BinaryPath   string        // 被测二进制；必填（agentgo-eval CLI 经 resolveTestBinary 解析后传入）
 	RunsDir      string        // 运行现场根目录；空 = eval/runs
 	PollInterval time.Duration // 快照轮询间隔；0 = 3s
 	Stdout       io.Writer     // 进度输出；nil = io.Discard
@@ -99,6 +100,11 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 套件内容 digest 是可比性键：套件变了，基线行就不再是同一参照系
+	if suiteData, err := os.ReadFile(r.opts.SuitePath); err == nil {
+		sum := sha256.Sum256(suiteData)
+		env.SuiteDigest = hex.EncodeToString(sum[:])[:12]
+	}
 	// 运行现场会落代理写出的 .go 文件（fixtures/产物），若被父模块的
 	// go build/test ./... 走查会直接编挂（2026-07-29 实测：run 现场的
 	// 调研 fixture 让全量测试失败）。确保现场根有隔离 go.mod 挡板。
@@ -147,18 +153,8 @@ func (r *Runner) runOne(ctx context.Context, runID string, task TaskDef) TaskRes
 		res.Metrics.TerminalStatus = status
 		res.Metrics.WallSec = time.Since(started).Seconds()
 		res.Judges = RunJudges(task.Judges, filepath.Join(res.Workdir, "project"), &res.Metrics)
-		res.Passed = true
-		for _, j := range res.Judges {
-			if !j.Passed {
-				res.Passed = false
-				break
-			}
-		}
-		mark := "PASS"
-		if !res.Passed {
-			mark = "FAIL"
-		}
-		r.log("[%s] %s：终态 %s，耗时 %.0fs", mark, task.Name, status, res.Metrics.WallSec)
+		res.Status = deriveTaskStatus(status, res.Judges)
+		r.log("[%s] %s：终态 %s，耗时 %.0fs", strings.ToUpper(res.Status), task.Name, status, res.Metrics.WallSec)
 		return res
 	}
 
@@ -202,32 +198,57 @@ func (r *Runner) runOne(ctx context.Context, runID string, task TaskDef) TaskRes
 		return finish("spawn_error")
 	}
 
-	// 3. 起子进程（stdout/stderr 落 child.log；env 继承——密钥经环境变量进子进程）
-	binary := r.opts.BinaryPath
-	if binary == "" {
-		if exe, err := os.Executable(); err == nil {
-			binary = exe
-		}
+	// 3. 起子进程并驱动到终态
+	drive := r.driveChild(ctx, res.Workdir, task.Name, r.opts.BinaryPath, cfgPath, port, token, task.Prompt, task.TimeoutSec)
+
+	// 4. 收割与判据
+	events, incomplete := CollectTraceEventsWithStatus(projectDir)
+	res.Metrics.TraceEvents = events
+	res.Metrics.TraceIncompleteReasons = incomplete
+	HarvestEvents(events, &res.Metrics)
+	if drive.snap != nil {
+		res.Metrics.PromptTokens = drive.snap.SessionPromptTokens
+		res.Metrics.CompletionTokens = drive.snap.SessionCompletionTokens
+	}
+	SnapshotTokenFallback(events, &res.Metrics)
+	return finish(drive.status)
+}
+
+// childDrive 一次子进程驱动（起进程 → 健康等待 → 注入 → 终态等待）的结果。
+type childDrive struct {
+	status string
+	snap   *pollSnapshot
+}
+
+// driveChild 起被测 agentgo 子进程并驱动到终态：stdout/stderr 落 child.log，
+// 任何阶段失败都收敛为 status（spawn_error / health_timeout / inject_error /
+// completed / timeout / cancelled / child_exited），并负责子进程回收与
+// 启动失败时的 child.log 尾部转储。live run 与 offline 共用本驱动。
+func (r *Runner) driveChild(ctx context.Context, workdir, taskName, binaryPath, cfgPath string, port int, token, prompt string, timeoutSec int) childDrive {
+	// BinaryPath 必须由调用方显式给出（agentgo-eval CLI 经 resolveTestBinary 解析）。
+	if binaryPath == "" {
+		r.log("[错误] %s：未指定被测二进制（RunnerOptions.BinaryPath 为空）", taskName)
+		return childDrive{status: "spawn_error"}
 	}
 	childCtx, cancelChild := context.WithCancel(ctx)
 	defer cancelChild()
-	cmd := exec.CommandContext(childCtx, binary, "-config", cfgPath, "-skip-startup-probe")
-	logFile, err := os.Create(filepath.Join(res.Workdir, "child.log"))
+	cmd := exec.CommandContext(childCtx, binaryPath, "-config", cfgPath, "-skip-startup-probe")
+	logFile, err := os.Create(filepath.Join(workdir, "child.log"))
 	if err != nil {
-		r.log("[错误] %s：建 child.log 失败: %v", task.Name, err)
-		return finish("spawn_error")
+		r.log("[错误] %s：建 child.log 失败: %v", taskName, err)
+		return childDrive{status: "spawn_error"}
 	}
 	defer logFile.Close()
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
-		r.log("[错误] %s：子进程启动失败: %v", task.Name, err)
-		return finish("spawn_error")
+		r.log("[错误] %s：子进程启动失败: %v", taskName, err)
+		return childDrive{status: "spawn_error"}
 	}
 	// 子进程退出监视（健康检查与轮询都要能区分「系统静止」与「进程死了」）
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
-	r.log("%s：子进程已起（pid %d，端口 %d）", task.Name, cmd.Process.Pid, port)
+	r.log("%s：子进程已起（pid %d，端口 %d）", taskName, cmd.Process.Pid, port)
 
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	stopChild := func() {
@@ -240,40 +261,31 @@ func (r *Runner) runOne(ctx context.Context, runID string, task TaskDef) TaskRes
 		}
 	}
 
-	// 4. 健康等待
+	// 健康等待
 	if !r.waitHealthy(ctx, baseURL, exited, 90*time.Second) {
 		select {
 		case err := <-exited:
-			r.log("[错误] %s：子进程健康等待期内退出: %v", task.Name, err)
+			r.log("[错误] %s：子进程健康等待期内退出: %v", taskName, err)
 		default:
-			r.log("[错误] %s：健康等待超时", task.Name)
+			r.log("[错误] %s：健康等待超时", taskName)
 		}
-		r.logChildLogTail(res.Workdir, 2000)
+		r.logChildLogTail(workdir, 2000)
 		stopChild()
-		return finish("health_timeout")
+		return childDrive{status: "health_timeout"}
 	}
 
-	// 5. 注入提示词
-	if err := r.postInput(ctx, baseURL, token, task.Prompt); err != nil {
-		r.log("[错误] %s：注入失败: %v", task.Name, err)
+	// 注入提示词
+	if err := r.postInput(ctx, baseURL, token, prompt); err != nil {
+		r.log("[错误] %s：注入失败: %v", taskName, err)
 		stopChild()
-		return finish("inject_error")
+		return childDrive{status: "inject_error"}
 	}
-	r.log("%s：提示词已注入，等待收敛（超时 %ds）…", task.Name, task.TimeoutSec)
+	r.log("%s：提示词已注入，等待收敛（超时 %ds）…", taskName, timeoutSec)
 
-	// 6. 终态等待
-	status, snap := r.pollTerminal(ctx, baseURL, token, time.Duration(task.TimeoutSec)*time.Second, exited)
+	// 终态等待
+	status, snap := r.pollTerminal(ctx, baseURL, token, time.Duration(timeoutSec)*time.Second, exited)
 	stopChild()
-
-	// 7. 收割与判据
-	events := CollectTraceEvents(projectDir)
-	HarvestEvents(events, &res.Metrics)
-	if snap != nil {
-		res.Metrics.PromptTokens = snap.SessionPromptTokens
-		res.Metrics.CompletionTokens = snap.SessionCompletionTokens
-	}
-	SnapshotTokenFallback(events, &res.Metrics)
-	return finish(status)
+	return childDrive{status: status, snap: snap}
 }
 
 // waitHealthy 轮询 /healthz 直到就绪或超时；子进程提前退出立即返回 false。
@@ -376,11 +388,22 @@ type runOverrides struct {
 	ProjectRoot string
 	WebListen   string
 	WebToken    string
+	// OfflineLLM 非空时把 llm 块指向离线 fake 端点（offline 子命令专用）：
+	// 覆盖 base_url/api_key/default_model，强制 stream=false（脚本确定性），
+	// 并删除 reactors_file——用户 YAML Reactor 的 invoke_llm 会击穿脚本编排。
+	OfflineLLM *offlineLLMOverride
+}
+
+// offlineLLMOverride 离线 fake 端点的 llm 覆盖参数。
+type offlineLLMOverride struct {
+	BaseURL string
+	APIKey  string
+	Model   string
 }
 
 // renderRunConfig 以模板为底渲染运行配置：解析为 YAML 节点值（${VAR}
 // 占位符作为普通字符串原样保留，由子进程启动时 ExpandEnv 展开），
-// 只覆盖 project_root 与 ui.web 两个域。
+// 只覆盖 project_root 与 ui.web 两个域（离线模式另覆盖 llm 域）。
 func renderRunConfig(templatePath, outPath string, ov runOverrides) error {
 	data, err := os.ReadFile(templatePath)
 	if err != nil {
@@ -405,6 +428,21 @@ func renderRunConfig(templatePath, outPath string, ov runOverrides) error {
 	}
 	web["listen"] = ov.WebListen
 	web["token"] = ov.WebToken
+
+	if ov.OfflineLLM != nil {
+		llm, _ := doc["llm"].(map[string]any)
+		if llm == nil {
+			llm = map[string]any{}
+			doc["llm"] = llm
+		}
+		llm["base_url"] = ov.OfflineLLM.BaseURL
+		llm["api_key"] = ov.OfflineLLM.APIKey
+		if ov.OfflineLLM.Model != "" {
+			llm["default_model"] = ov.OfflineLLM.Model
+		}
+		llm["stream"] = false
+		delete(doc, "reactors_file")
+	}
 
 	out, err := yaml.Marshal(doc)
 	if err != nil {

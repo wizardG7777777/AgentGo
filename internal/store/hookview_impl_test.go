@@ -82,7 +82,7 @@ func TestStoreHookView_GetToolCallHistory_PopulatedTask(t *testing.T) {
 
 func TestStoreHookView_GetToolCallHistory_NoCallsReturnsNil(t *testing.T) {
 	// 任务存在但无 tool calls：当前实现返回 nil（QueryToolCalls 内部为 nil）。
-	// 这是 plan 的明确语义，hook 需要容忍 nil 切片（range 安全）。
+	// 这是 store 的明确语义，hook 需要容忍 nil 切片（range 安全）。
 	s, _ := newTestStore(10, 100)
 	task := publishTestTask(t, s, "no calls")
 

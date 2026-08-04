@@ -74,10 +74,10 @@ func TestBusyAgentTasks_SchedulerCountAgreement(t *testing.T) {
 
 	publish("t1", "")
 	publish("t2", "")
-	publish("t3", "")       // 双 agent 并发认领（defaultConcurrency=2）
+	publish("t3", "")        // 双 agent 并发认领（defaultConcurrency=2）
 	publish("t4", "explore") // 特化队列，board 口径不统计
-	publish("t5", "")       // 保持 pending（无人认领）
-	publish("t6", "")       // 走完终态
+	publish("t5", "")        // 保持 pending（无人认领）
+	publish("t6", "")        // 走完终态
 	claim("worker-1", "t1")
 	claim("worker-2", "t2")
 	claim("worker-3", "t3")

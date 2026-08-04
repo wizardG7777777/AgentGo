@@ -63,5 +63,6 @@ func (h *ChainDepthLimitHook) Run(hctx hook.MailboxHookContext) hook.MailboxHook
 			"邮件链跳数 %d 超过上限 %d (from=%s, to=%s)，可能存在级联循环 — 拒绝投递",
 			depth, h.MaxDepth, hctx.Message.From, hctx.Message.To,
 		),
+		ReasonCode: ReasonMailChainDepthExceeded,
 	}
 }

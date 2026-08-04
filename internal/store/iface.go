@@ -14,10 +14,15 @@ import (
 // 由 hook 消费者自行决定是否计入统计。
 type ToolCallRecord struct {
 	Timestamp time.Time
-	AgentID   string
-	ToolName  string
-	Args      map[string]any
-	Success   bool
+	// CallID is the protocol-level identity supplied by the model. It lets
+	// downstream consumers join the durable ledger to the matching tool result
+	// without relying on timestamp or map iteration order. Empty is accepted for
+	// snapshots written before this field existed.
+	CallID   string
+	AgentID  string
+	ToolName string
+	Args     map[string]any
+	Success  bool
 	// ExitCode is populated for run_shell from the tool's structured first
 	// line. Success alone is insufficient because run_shell returns non-zero
 	// command exits as a normal tool result.
@@ -76,13 +81,6 @@ type TaskStore interface {
 	// 而不是只看到一个干瘪的 "重试次数耗尽" 错误。
 	RecordLastResponse(taskID string, content string) error
 
-	// SetTransferNote 写入 task.TransferNote——跨 agent 交接的压缩备忘。
-	// 由 agent 在任务成功（lastOutput 直传）或失败（buildTransferNote L1/L3 链）
-	// 时调用。下游依赖任务通过 GetDependencyTransferNotes 读取；重试接手者通过
-	// GetTask 直接读 task.TransferNote。
-	// Sprint 3 #5 引入。
-	SetTransferNote(taskID string, note string) error
-
 	// Non-atomic read operations (snapshot, no lock required)
 
 	// QueryAvailable 返回 eventType 路由上当前可认领的 pending 任务。
@@ -96,14 +94,6 @@ type TaskStore interface {
 	// 按依赖任务的 ID 分组：map[parent_task_id][]artifact_path。
 	// 由 agent.processTask 在任务启动时调用，把结果注入下游 worker 的 user prompt。
 	GetDependencyArtifacts(taskID string) (map[string][]string, error)
-
-	// GetDependencyTransferNotes 返回 taskID 所有依赖任务的 TransferNote 文本，
-	// 按依赖任务的 ID 分组：map[parent_task_id]transfer_note。
-	// 依赖任务 TransferNote 为空时该条目被省略——接手者只看到非空的上游备忘。
-	// 由 agent.processTask 在任务启动时调用，把结果以 <upstream-transfer-notes>
-	// 形式注入下游 agent 的 user prompt。
-	// Sprint 3 #5 引入。
-	GetDependencyTransferNotes(taskID string) (map[string]string, error)
 
 	ScanAll() ([]*model.Task, error)
 }
@@ -128,4 +118,57 @@ func TransitionStateWithCancelSource(s TaskStore, taskID string, from, to model.
 		return st.TransitionStateWithCancelSource(taskID, from, to, cancelSource)
 	}
 	return s.TransitionState(taskID, from, to)
+}
+
+// resultFieldRecorder 是可选接口：支持向 processing 任务的 Results 写任意
+// 键值的 Store（MemoryTaskStore 实现）。与 cancelSourceTransitioner 同模式——
+// 不扩张 TaskStore 主接口，保持测试 fake 与旧装配兼容。
+type resultFieldRecorder interface {
+	RecordResultField(taskID string, key string, value string) error
+}
+
+// RecordResultField 向任务的 Results 写入一个键值（不改变任务状态）。
+// 用途：submit_task_result 的 event 参数在 SubmitResult 前落 Results["event"]，
+// 供 V6 Graph 转移求值（graph-terminal-feed 把 Results 全量并入 TerminalFact.Result，
+// 引擎的 eventNameOf 优先采用 "event" 键做事件形态匹配）。
+// Store 不支持该可选能力时静默成功（兼容旧装配；调用方只依赖尽力而为）。
+func RecordResultField(s TaskStore, taskID string, key string, value string) error {
+	if st, ok := s.(resultFieldRecorder); ok {
+		return st.RecordResultField(taskID, key, value)
+	}
+	return nil
+}
+
+// leaseFreezer 是可选接口：支持原子冻结任务执行租约的 Store
+// （MemoryTaskStore 实现）。与 resultFieldRecorder 同模式——不扩张
+// TaskStore 主接口，保持测试 fake 与旧装配兼容。
+type leaseFreezer interface {
+	FreezeTaskLease(taskID string, lease *model.ExecutionLease) (*model.ExecutionLease, bool, error)
+}
+
+// FreezeTaskLease 原子冻结任务执行租约（V6 §4 H1）：任务尚无 Lease 时写入
+// candidate 并返回 (effective, true)；已有 Lease（重试重认领 / 快照恢复）时
+// 原样返回 (existing, false)——调用方据此区分 emit frozen / reused 事件。
+// Store 不支持该可选能力时返回 (candidate, true, nil)：租约降级为调用方
+// 进程内事实，重试时按确定性规则重新计算（同输入同 Digest）。
+func FreezeTaskLease(s TaskStore, taskID string, candidate *model.ExecutionLease) (*model.ExecutionLease, bool, error) {
+	if st, ok := s.(leaseFreezer); ok {
+		return st.FreezeTaskLease(taskID, candidate)
+	}
+	return candidate, true, nil
+}
+
+// leaseRevoker 是可选接口：支持撤销任务执行租约的 Store。
+type leaseRevoker interface {
+	RevokeTaskLease(taskID string) (*model.ExecutionLease, bool, error)
+}
+
+// RevokeTaskLease 撤销任务执行租约（Revoked=true）。返回 (lease, newlyRevoked,
+// err)；任务无租约或租约已撤销时 newlyRevoked=false（幂等，重复撤销不发
+// 第二次事件）。Store 不支持该可选能力时静默成功（兼容旧装配）。
+func RevokeTaskLease(s TaskStore, taskID string) (*model.ExecutionLease, bool, error) {
+	if st, ok := s.(leaseRevoker); ok {
+		return st.RevokeTaskLease(taskID)
+	}
+	return nil, false, nil
 }

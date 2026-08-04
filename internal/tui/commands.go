@@ -45,9 +45,6 @@ func (m *AppModel) handleCommand(line string) bool {
 	case "/mode":
 		m.handleMode(parts)
 
-	case "/plan":
-		m.handlePlan(parts)
-
 	case "/steer":
 		if len(parts) < 3 {
 			m.appendMsg("[steer] 用法: /steer <agentID> <message>", MsgWarn)
@@ -59,6 +56,13 @@ func (m *AppModel) handleCommand(line string) bool {
 
 	case "/new":
 		m.newSession()
+
+	case "/doctor":
+		if len(parts) < 2 || parts[1] != "agents" {
+			m.appendMsg("[doctor] 用法: /doctor agents — 审计代理身份与实际权限的一致性（只读）", MsgWarn)
+			return false
+		}
+		m.requestAgentAudit()
 
 	case "/session":
 		if len(parts) < 2 {
@@ -127,13 +131,7 @@ func (m *AppModel) showStatus() {
 		counts[string(model.TaskStatusCompleted)],
 		counts[string(model.TaskStatusFailed)]))
 
-	mode := "Immediate"
-	if snap.Mode == "plan" {
-		mode = "Plan"
-	}
-	lines = append(lines, fmt.Sprintf("  Mode: %s", mode))
-
-	// exec / topo 两轴同样读自 Hub 快照；快照未装配对应 Getter 时回退默认值。
+	// exec / topo 两轴读自 Hub 快照；快照未装配对应 Getter 时回退默认值。
 	execMode := snap.ExecMode
 	if execMode == "" {
 		execMode = "normal"
@@ -183,32 +181,39 @@ func shortID(id string) string {
 	return id[:8]
 }
 
-// toggleMode 切换调度模式。当前模式读自 Hub 快照；切换后的界面显示
-// 在下一轮快照刷新（Hub 轮询间隔）时更新。
+// toggleMode 快速切换 topo 轴（team ↔ solo）。当前模式读自 Hub 快照；切换后的
+// 界面显示在下一轮快照刷新（Hub 轮询间隔）时更新。
+// V6 起 gate 轴已移除，/mode 无参的快捷 toggle 语义落在 topo 轴上。
 func (m *AppModel) toggleMode() {
 	if m.deps.Controller == nil {
 		m.appendMsg("[mode] 控制面未初始化", MsgError)
 		return
 	}
-	if m.snapshot().Mode == "plan" {
-		m.deps.Controller.SetMode(false)
-		m.appendMsg("[mode] 已切换到 Immediate 模式", MsgInfo)
+	if m.snapshot().TopoMode == "solo" {
+		if err := m.deps.Controller.SetTopoMode("team"); err != nil {
+			m.appendMsg(fmt.Sprintf("[mode] %v", err), MsgError)
+			return
+		}
+		m.appendMsg("[mode] 已切换到 team 模式", MsgInfo)
 	} else {
-		m.deps.Controller.SetMode(true)
-		m.appendMsg("[mode] 已切换到 Plan 模式", MsgInfo)
+		if err := m.deps.Controller.SetTopoMode("solo"); err != nil {
+			m.appendMsg(fmt.Sprintf("[mode] %v", err), MsgError)
+			return
+		}
+		m.appendMsg("[mode] 已切换到 solo 模式", MsgInfo)
 	}
 }
 
-// modeUsageText 是 /mode 的中文用法说明（列出三轴与全部可选值），
+// modeUsageText 是 /mode 的中文用法说明（V6 起为 exec / topo 两轴），
 // 非法参数时输出到消息流。
 const modeUsageText = "[mode] 用法:\n" +
-	"  /mode                                  切换 gate 轴（immediate ↔ plan）\n" +
-	"  /mode gate immediate|plan              设置规划门控轴\n" +
+	"  /mode                                  快速切换 topo 轴（team ↔ solo）\n" +
 	"  /mode exec normal|strict|readonly|yolo 设置执行权限轴\n" +
-	"  /mode topo team|solo                   设置编排拓扑轴"
+	"  /mode topo team|solo                   设置编排拓扑轴\n" +
+	"  （gate 轴已于 V6 移除：执行前审阅改由 Graph approval 节点承担）"
 
-// handleMode 分发 /mode 命令：无参保持原有 gate 轴 toggle 行为；
-// 带参时按轴（gate / exec / topo）设置到指定值，非法参数输出用法说明。
+// handleMode 分发 /mode 命令：无参快捷切换 topo 轴；带参时按轴（exec / topo）
+// 设置到指定值，非法参数输出用法说明。
 func (m *AppModel) handleMode(parts []string) {
 	if len(parts) == 1 {
 		m.toggleMode()
@@ -226,14 +231,8 @@ func (m *AppModel) handleMode(parts []string) {
 	value := parts[2]
 	switch axis {
 	case "gate":
-		g, err := modes.ParseGateMode(value)
-		if err != nil {
-			m.appendMsg(fmt.Sprintf("[mode] %v", err), MsgWarn)
-			m.appendMsg(modeUsageText, MsgWarn)
-			return
-		}
-		m.deps.Controller.SetMode(g == modes.GatePlan)
-		m.appendMsg(fmt.Sprintf("[mode] gate 轴已切换到 %s", g.String()), MsgInfo)
+		m.appendMsg("[mode] gate 轴已于 V6 移除：执行前审阅改由 Graph approval 节点承担", MsgWarn)
+		m.appendMsg(modeUsageText, MsgWarn)
 	case "exec":
 		if err := m.deps.Controller.SetExecMode(value); err != nil {
 			m.appendMsg(fmt.Sprintf("[mode] %v", err), MsgWarn)
@@ -256,77 +255,19 @@ func (m *AppModel) handleMode(parts []string) {
 	}
 }
 
-// planUsageText 是 /plan 的中文用法说明，非法参数时输出到消息流。
-const planUsageText = "[plan] 用法:\n" +
-	"  /plan                       列出等待批准的计划\n" +
-	"  /plan approve [plan-前缀]   批准计划（仅一个待批准时可省略前缀）\n" +
-	"  /plan reject [plan-前缀]    拒绝并终止计划"
-
-// handlePlan 分发 /plan 命令：无参列出待批准计划；approve/reject 走
-// Controller 的 plan_review 入口（前缀解析与歧义处理由 Hub 装配方完成），
-// 结果写消息流。
-func (m *AppModel) handlePlan(parts []string) {
+// requestAgentAudit 触发 /doctor agents 只读代理审计：审计任务发布给
+// Scheduler，报告作为普通任务结果回显到消息流（无需轮询）。
+func (m *AppModel) requestAgentAudit() {
 	if m.deps.Controller == nil {
-		m.appendMsg("[plan] 控制面未初始化", MsgError)
+		m.appendMsg("[doctor] 控制面未初始化", MsgError)
 		return
 	}
-	if len(parts) == 1 {
-		m.listPlanReviews()
-		return
-	}
-	if len(parts) > 3 {
-		m.appendMsg(planUsageText, MsgWarn)
-		return
-	}
-	prefix := ""
-	if len(parts) == 3 {
-		prefix = parts[2]
-	}
-	switch strings.ToLower(parts[1]) {
-	case "approve":
-		summary, err := m.deps.Controller.ApprovePlan(prefix)
-		if err != nil {
-			m.appendMsg(fmt.Sprintf("[plan] %v", err), MsgError)
-			return
-		}
-		m.appendMsg(fmt.Sprintf("[plan] %s", summary), MsgInfo)
-	case "reject":
-		summary, err := m.deps.Controller.RejectPlan(prefix)
-		if err != nil {
-			m.appendMsg(fmt.Sprintf("[plan] %v", err), MsgError)
-			return
-		}
-		m.appendMsg(fmt.Sprintf("[plan] %s", summary), MsgInfo)
-	default:
-		m.appendMsg(planUsageText, MsgWarn)
-	}
-}
-
-// listPlanReviews 渲染待批准计划列表（/plan 无参形态）。
-func (m *AppModel) listPlanReviews() {
-	items, err := m.deps.Controller.PendingPlanReviews()
+	taskID, err := m.deps.Controller.RequestAgentAudit()
 	if err != nil {
-		m.appendMsg(fmt.Sprintf("[plan] %v", err), MsgError)
+		m.appendMsg(fmt.Sprintf("[doctor] %v", err), MsgError)
 		return
 	}
-	if len(items) == 0 {
-		m.appendMsg("[plan] 当前没有等待批准的计划", MsgInfo)
-		return
-	}
-	var lines []string
-	lines = append(lines, "── 等待批准的计划 ──")
-	for _, item := range items {
-		excerpt := item.Excerpt
-		if excerpt == "" {
-			excerpt = "（无计划文本）"
-		}
-		lines = append(lines, fmt.Sprintf("  %s [%s]", shortID(item.PlanID), item.SubmittedAt.Local().Format("15:04:05")))
-		for _, excerptLine := range strings.Split(excerpt, "\n") {
-			lines = append(lines, "    "+excerptLine)
-		}
-	}
-	lines = append(lines, "批准: /plan approve [前缀]  拒绝: /plan reject [前缀]")
-	m.appendMsg(strings.Join(lines, "\n"), MsgInfo)
+	m.appendMsg(fmt.Sprintf("[doctor] 代理审计任务已创建: %s — 审计报告将作为任务结果回显", shortID(taskID)), MsgInfo)
 }
 
 func (m *AppModel) steerAgent(agentID, msg string) {

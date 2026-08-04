@@ -16,7 +16,6 @@ func cloneTask(src *model.Task) *model.Task {
 	dst.Artifacts = cloneStrings(src.Artifacts)
 	dst.ExpectedArtifacts = cloneStrings(src.ExpectedArtifacts)
 	dst.SchedulerBatch = cloneStrings(src.SchedulerBatch)
-	dst.Supersedes = cloneStrings(src.Supersedes)
 	dst.Results = cloneStringMap(src.Results)
 	if src.Capability != nil {
 		dst.Capability = &model.NodeCapability{
@@ -42,6 +41,19 @@ func cloneTask(src *model.Task) *model.Task {
 			dst.ReadSet[k] = v
 		}
 	}
+	dst.Lease = cloneLease(src.Lease)
+	return &dst
+}
+
+// cloneLease 深拷贝执行租约（V6 §4 H1）。克隆丢失会让读路径上的任务静默
+// 退化为「未冻结」，重认领时重复 emit frozen 事件并丢失 Revoked 状态。
+func cloneLease(src *model.ExecutionLease) *model.ExecutionLease {
+	if src == nil {
+		return nil
+	}
+	dst := *src
+	dst.BusinessTools = cloneStrings(src.BusinessTools)
+	dst.ControlTools = cloneStrings(src.ControlTools)
 	return &dst
 }
 

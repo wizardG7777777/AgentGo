@@ -58,12 +58,13 @@ func (h *ValidateLineAnchorsHook) Run(hctx hook.ToolHookContext) hook.ToolHookDe
 		return hook.ToolHookDecision{Action: hook.Continue}
 	}
 
-	path, ok := hctx.Args["path"].(string)
-	if !ok || path == "" {
+	argPath, ok := hctx.Args["path"].(string)
+	if !ok || argPath == "" {
 		return hook.ToolHookDecision{Action: hook.Continue}
 	}
+	path := argPath
 	if h.ResolvePhysicalPath != nil {
-		path = h.ResolvePhysicalPath(hctx.TaskID, path)
+		path = h.ResolvePhysicalPath(hctx.TaskID, argPath)
 	}
 
 	data, err := os.ReadFile(path)
@@ -75,6 +76,13 @@ func (h *ValidateLineAnchorsHook) Run(hctx hook.ToolHookContext) hook.ToolHookDe
 			Action:      hook.Abort,
 			HookName:    h.Name(),
 			AbortReason: fmt.Sprintf("行哈希校验前读取文件失败: %v", err),
+			ReasonCode:  ReasonWritePrecheckFailed,
+			Suggestions: []hook.Suggestion{
+				hook.NewSuggestion(h.Name(), ReasonWritePrecheckFailed, argPath, true,
+					hook.ToolCallAction("read_file", map[string]any{"path": argPath},
+						"重新读取目标文件以暴露真实读取错误，再决定是否写入"),
+				),
+			},
 		}
 	}
 
@@ -120,6 +128,13 @@ func (h *ValidateLineAnchorsHook) Run(hctx hook.ToolHookContext) hook.ToolHookDe
 		Action:      hook.Abort,
 		HookName:    h.Name(),
 		AbortReason: reason,
+		ReasonCode:  ReasonLineAnchorStale,
+		Suggestions: []hook.Suggestion{
+			hook.NewSuggestion(h.Name(), ReasonLineAnchorStale, argPath, true,
+				hook.ToolCallAction("read_file", map[string]any{"path": argPath},
+					"重新读取文件取得最新 LINE#HASH 引用后再编辑"),
+			),
+		},
 	}
 }
 

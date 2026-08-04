@@ -20,10 +20,6 @@ import (
 )
 
 const (
-	maxReplanRequestSnapshots        = 16
-	maxReplanRequestDetailRunes      = 480
-	maxReplanRequestTotalDetailRunes = 4096
-
 	// Task result bodies are cold data. The hot board carries a small, shared
 	// excerpt budget plus stable metadata; Scheduler can fetch the exact body
 	// through get_task_result when a decision genuinely needs it.
@@ -42,86 +38,15 @@ const (
 // v5 热快照不再内联无界 Results / PartialOutput：终态正文通过
 // result_refs 按需分页读取，执行中输出只保留有界 progress tail。
 //
-// 三轴模式字段（v5 三轴模式）：Mode 保留原 "mode" 字段=gate 轴字符串，
-// ExecMode / TopoMode 为新增，与 Mode 一样总是出现（非 omitempty）。
+// 两轴模式字段（exec / topo）总是出现（非 omitempty）。
 type boardSnapshot struct {
-	Mode                   string                      `json:"mode"`
 	ExecMode               string                      `json:"exec_mode"`
 	TopoMode               string                      `json:"topo_mode"`
 	Trigger                triggerInfo                 `json:"trigger"`
-	Plan                   *planSnapshot               `json:"plan,omitempty"`
-	ResumablePlans         []resumablePlanSnapshot     `json:"resumable_plans,omitempty"`
 	Tasks                  []taskSnapshot              `json:"tasks"`
 	Resources              resourceInfo                `json:"resources"`
 	SessionHistory         []sessionEntry              `json:"session_history,omitempty"`
 	PendingDownstreamTasks []pendingDownstreamSnapshot `json:"pending_downstream_tasks,omitempty"`
-}
-
-type resumablePlanSnapshot struct {
-	ID            string `json:"id"`
-	Status        string `json:"status"`
-	PlanRevision  int64  `json:"plan_revision"`
-	PauseReason   string `json:"pause_reason"`
-	LastUpdatedAt string `json:"last_updated_at"`
-}
-
-type planSnapshot struct {
-	ID                     string                  `json:"id"`
-	Status                 string                  `json:"status"`
-	ExecutionMode          string                  `json:"execution_mode"`
-	ActiveControllerTaskID string                  `json:"active_controller_task_id"`
-	PlanRevision           int64                   `json:"plan_revision"`
-	ExecutionStateVersion  int64                   `json:"execution_state_version"`
-	HandledStateVersion    int64                   `json:"handled_state_version"`
-	GraphDigest            string                  `json:"graph_digest"`
-	AcceptanceSpecRevision int64                   `json:"acceptance_spec_revision"`
-	CurrentNodeIDs         []string                `json:"current_node_ids"`
-	CurrentNodes           []model.PlanNode        `json:"current_nodes,omitempty"`
-	PendingReplanCount     int                     `json:"pending_replan_count"`
-	PendingReplanRequests  []replanRequestSnapshot `json:"pending_replan_requests,omitempty"`
-	PendingReplanOmitted   int                     `json:"pending_replan_omitted,omitempty"`
-	Budget                 model.PlanBudget        `json:"budget"`
-	Usage                  model.BudgetUsage       `json:"usage"`
-	PauseReason            string                  `json:"pause_reason,omitempty"`
-	AcceptanceCriteria     []model.Criterion       `json:"acceptance_criteria,omitempty"`
-	LatestAcceptance       *acceptanceSnapshot     `json:"latest_acceptance,omitempty"`
-	Warnings               []model.PlanWarning     `json:"warnings,omitempty"`
-	RetiredNodes           []model.PlanNode        `json:"retired_nodes,omitempty"`
-}
-
-// replanRequestSnapshot exposes the decision-relevant part of a durable
-// ReplanRequest without copying unbounded event payloads into every Scheduler
-// prompt. The total request count and omitted count make truncation explicit.
-type replanRequestSnapshot struct {
-	RequestID            string `json:"request_id"`
-	Reason               string `json:"reason"`
-	Detail               string `json:"detail,omitempty"`
-	DetailTruncated      bool   `json:"detail_truncated,omitempty"`
-	SourceTaskID         string `json:"source_task_id,omitempty"`
-	SourceEvent          string `json:"source_event"`
-	ObservedRevision     int64  `json:"observed_revision"`
-	ObservedStateVersion int64  `json:"observed_state_version"`
-	Urgency              string `json:"urgency"`
-}
-
-// acceptanceSnapshot is the compact, authoritative acceptance fact visible to
-// Scheduler. Evidence is intentionally omitted from the hot board snapshot;
-// Scheduler can fetch it by ResultID through get_acceptance_evidence when a
-// decision needs the full payload.
-type acceptanceSnapshot struct {
-	RunID               string                  `json:"run_id"`
-	ResultID            string                  `json:"result_id,omitempty"`
-	RunStatus           string                  `json:"run_status"`
-	ResultStatus        string                  `json:"result_status,omitempty"`
-	Verdict             string                  `json:"verdict,omitempty"`
-	Reason              string                  `json:"reason,omitempty"`
-	Scope               string                  `json:"scope"`
-	TargetTaskIDs       []string                `json:"target_task_ids,omitempty"`
-	RunnerTaskID        string                  `json:"runner_task_id,omitempty"`
-	CriterionResults    []model.CriterionResult `json:"criterion_results,omitempty"`
-	FailureFingerprints []string                `json:"failure_fingerprints,omitempty"`
-	ResidualRisks       []string                `json:"residual_risks,omitempty"`
-	RecommendedActions  []string                `json:"recommended_actions,omitempty"`
 }
 
 // pendingDownstreamSnapshot 是 board snapshot 中"下游待处理任务"的一行。
@@ -302,9 +227,9 @@ type SnapshotSources struct {
 	// 非空时 BuildBoardJSON 会在 snapshot 中注入 "pending_downstream_tasks" 段，
 	// 提示 LLM 还有 reactor 触发的任务在运行。
 	// nil 或空时该段被 omitempty 省略。
-	PendingDownstreamTasks  []PendingDownstreamTask
-	Plan                    *model.Plan
-	ResumablePlans          []model.Plan
+	PendingDownstreamTasks []PendingDownstreamTask
+	// CurrentControllerTaskID 是当前 controller（scheduler root）任务 ID。
+	// 非空时快照只暴露当前请求树，并作为动态 Team 路由的归属 scope。
 	CurrentControllerTaskID string
 }
 
@@ -321,8 +246,8 @@ type PendingDownstreamTask struct {
 // 参数：
 //   - s: TaskStore，用于 ScanAll
 //   - cfg: 配置（读取 WorkerCount 计算可用 worker 数）
-//   - modeSnap: 三轴模式快照（modes.Snapshot）——Gate 写入 "mode" 字段
-//     （兼容旧消费方），Exec / Topo 分别写入 "exec_mode" / "topo_mode"
+//   - modeSnap: 两轴模式快照（modes.Snapshot）——Exec / Topo 分别写入
+//     "exec_mode" / "topo_mode"
 //   - trigger: 当前 reactLoop 的触发事件（用户输入、task completed 等）
 //   - sources: 可选数据源（mailbox / roster / session history）
 //
@@ -342,24 +267,9 @@ func BuildBoardJSON(
 ) string {
 	allTasks, _ := s.ScanAll()
 	tasks := allTasks
-	if sources.Plan != nil {
-		current := make(map[string]bool, len(sources.Plan.CurrentNodeIDs))
-		for _, id := range sources.Plan.CurrentNodeIDs {
-			current[id] = true
-		}
-		filtered := make([]*model.Task, 0, len(sources.Plan.CurrentNodeIDs)+1)
-		for _, task := range allTasks {
-			isCurrentController := task.NodeRole == model.PlanNodeRoleController &&
-				(task.ID == sources.CurrentControllerTaskID || (sources.CurrentControllerTaskID == "" && task.ID == sources.Plan.RootTaskID))
-			if task.PlanID == sources.Plan.ID && (current[task.ID] || isCurrentController) {
-				filtered = append(filtered, task)
-			}
-		}
-		tasks = filtered
-	} else if sources.CurrentControllerTaskID != "" {
-		// Legacy Scheduler roots have no PlanStore record. Keep their board and
-		// get_task_result authority aligned by exposing only the current request
-		// tree, not every retained task from unrelated roots or sessions.
+	if sources.CurrentControllerTaskID != "" {
+		// 只暴露当前请求树，不暴露无关 root 或历史会话留存的任务，
+		// 让 board 与 get_task_result 的可见域口径一致。
 		visible := store.LegacyRequestTaskIDs(allTasks, sources.CurrentControllerTaskID)
 		filtered := make([]*model.Task, 0, len(visible))
 		for _, task := range allTasks {
@@ -439,20 +349,19 @@ func BuildBoardJSON(
 	}
 	available := max(workerCount-busyWorkers, 0)
 
-	snapshotPlanID := ""
-	if sources.Plan != nil {
-		snapshotPlanID = sources.Plan.ID
-	}
-	// 构造 agents 列表（来自 mailbox.Registry + roster + store 的反向映射）。
-	// Plan snapshot 不暴露其他 Plan 的动态 Team 实例。
-	agents := buildAgentSnapshotsForPlan(allTasks, sources.MBRegistry, sources.Roster, sources.WorkerProfiles, sources.AgentRegistry, snapshotPlanID)
+	// 动态 Team 路由的归属 scope 即当前 controller 任务 ID：快照只暴露全局
+	// 静态 route 与归属当前 controller 的 Team；空串时只见全局路由。
+	snapshotOwnerID := sources.CurrentControllerTaskID
 
-	// 构造特化代理聚合视图。Plan snapshot 只暴露全局静态 route 与本 Plan Team；
-	// 无 Plan 的兼容/诊断 snapshot 仍使用完整 registry。
-	specialized := buildSpecializedAgentSnapshotsForPlan(allTasks, sources.AgentRegistry, snapshotPlanID)
+	// 构造 agents 列表（来自 mailbox.Registry + roster + store 的反向映射）。
+	agents := buildAgentSnapshotsForPlan(allTasks, sources.MBRegistry, sources.Roster, sources.WorkerProfiles, sources.AgentRegistry, snapshotOwnerID)
+
+	// 构造特化代理聚合视图。归属 scope 之外的动态 Team 不暴露；
+	// 无 controller 的兼容/诊断 snapshot 仍使用完整 registry。
+	specialized := buildSpecializedAgentSnapshotsForPlan(allTasks, sources.AgentRegistry, snapshotOwnerID)
 
 	// 构造代理能力声明（来自 AgentRegistry + Worker 能力声明）
-	agentCaps := buildAgentCapabilitiesForPlan(sources.AgentRegistry, sources.WorkerCapabilities, sources.WorkerCapabilitiesByProfile, snapshotPlanID)
+	agentCaps := buildAgentCapabilitiesForPlan(sources.AgentRegistry, sources.WorkerCapabilities, sources.WorkerCapabilitiesByProfile, snapshotOwnerID)
 	var templateSummaries []agenttemplate.Summary
 	if sources.TemplateCatalog != nil {
 		templateSummaries = sources.TemplateCatalog.List()
@@ -477,7 +386,6 @@ func BuildBoardJSON(
 	}
 
 	bs := boardSnapshot{
-		Mode:     modeSnap.Gate,
 		ExecMode: modeSnap.Exec,
 		TopoMode: modeSnap.Topo,
 		Trigger:  ti,
@@ -495,53 +403,6 @@ func BuildBoardJSON(
 		},
 		SessionHistory:         sessionEntries,
 		PendingDownstreamTasks: pendingDownstream,
-	}
-	for _, p := range sources.ResumablePlans {
-		if p.Status != model.PlanStatusPausedAwaitingDecision && p.Status != model.PlanStatusBlocked {
-			continue
-		}
-		bs.ResumablePlans = append(bs.ResumablePlans, resumablePlanSnapshot{
-			ID: p.ID, Status: string(p.Status), PlanRevision: p.CurrentRevision,
-			PauseReason: p.PauseReason, LastUpdatedAt: p.UpdatedAt.Format(time.RFC3339),
-		})
-	}
-	sort.Slice(bs.ResumablePlans, func(i, j int) bool { return bs.ResumablePlans[i].LastUpdatedAt > bs.ResumablePlans[j].LastUpdatedAt })
-	if sources.Plan != nil {
-		ps := &planSnapshot{
-			ID: sources.Plan.ID, Status: string(sources.Plan.Status), ExecutionMode: string(sources.Plan.ExecutionMode),
-			ActiveControllerTaskID: sources.Plan.ActiveDecisionTaskID,
-			PlanRevision:           sources.Plan.CurrentRevision, ExecutionStateVersion: sources.Plan.ExecutionStateVersion,
-			HandledStateVersion: sources.Plan.HandledStateVersion, GraphDigest: sources.Plan.CurrentGraphDigest,
-			AcceptanceSpecRevision: sources.Plan.CurrentAcceptanceSpecRevision,
-			CurrentNodeIDs:         append([]string(nil), sources.Plan.CurrentNodeIDs...),
-			PendingReplanCount:     len(sources.Plan.PendingReplanRequests), Budget: sources.Plan.Budget,
-			Usage: sources.Plan.Usage, PauseReason: sources.Plan.PauseReason,
-		}
-		ps.PendingReplanRequests, ps.PendingReplanOmitted = compactPendingReplanRequests(sources.Plan)
-		for _, taskID := range sources.Plan.CurrentNodeIDs {
-			if node, ok := sources.Plan.Nodes[taskID]; ok {
-				ps.CurrentNodes = append(ps.CurrentNodes, node)
-			}
-		}
-		if spec, ok := sources.Plan.AcceptanceSpecs[sources.Plan.CurrentAcceptanceSpecID]; ok {
-			ps.AcceptanceCriteria = append([]model.Criterion(nil), spec.Criteria...)
-		}
-		ps.LatestAcceptance = latestCurrentAcceptanceSnapshot(sources.Plan)
-		if len(sources.Plan.Warnings) > 8 {
-			ps.Warnings = append([]model.PlanWarning(nil), sources.Plan.Warnings[len(sources.Plan.Warnings)-8:]...)
-		} else {
-			ps.Warnings = append([]model.PlanWarning(nil), sources.Plan.Warnings...)
-		}
-		for _, node := range sources.Plan.Nodes {
-			if node.RetiredRevision > 0 {
-				ps.RetiredNodes = append(ps.RetiredNodes, node)
-			}
-		}
-		sort.Slice(ps.RetiredNodes, func(i, j int) bool { return ps.RetiredNodes[i].RetiredRevision > ps.RetiredNodes[j].RetiredRevision })
-		if len(ps.RetiredNodes) > 8 {
-			ps.RetiredNodes = ps.RetiredNodes[:8]
-		}
-		bs.Plan = ps
 	}
 	data, _ := json.MarshalIndent(bs, "", "  ")
 	return string(data)
@@ -684,153 +545,6 @@ func compactSnapshotExcerpt(value string, limit int) (string, bool) {
 	return string(runes[:head]) + "…" + string(runes[len(runes)-tail:]), true
 }
 
-func compactPendingReplanRequests(p *model.Plan) ([]replanRequestSnapshot, int) {
-	if p == nil || len(p.PendingReplanRequests) == 0 {
-		return nil, 0
-	}
-	requests := make([]model.ReplanRequest, 0, len(p.PendingReplanRequests))
-	for _, request := range p.PendingReplanRequests {
-		requests = append(requests, request)
-	}
-	sort.Slice(requests, func(i, j int) bool {
-		leftHigh := requests[i].Urgency == model.ReplanUrgencyHigh
-		rightHigh := requests[j].Urgency == model.ReplanUrgencyHigh
-		if leftHigh != rightHigh {
-			return leftHigh
-		}
-		if requests[i].ObservedStateVersion != requests[j].ObservedStateVersion {
-			return requests[i].ObservedStateVersion > requests[j].ObservedStateVersion
-		}
-		if !requests[i].CreatedAt.Equal(requests[j].CreatedAt) {
-			return requests[i].CreatedAt.After(requests[j].CreatedAt)
-		}
-		return requests[i].ID < requests[j].ID
-	})
-
-	limit := len(requests)
-	if limit > maxReplanRequestSnapshots {
-		limit = maxReplanRequestSnapshots
-	}
-	out := make([]replanRequestSnapshot, 0, limit)
-	remainingDetailRunes := maxReplanRequestTotalDetailRunes
-	for _, request := range requests[:limit] {
-		detail := strings.TrimSpace(request.Detail)
-		detailLimit := maxReplanRequestDetailRunes
-		if detailLimit > remainingDetailRunes {
-			detailLimit = remainingDetailRunes
-		}
-		compactedDetail, truncated := truncateSnapshotRunes(detail, detailLimit)
-		remainingDetailRunes -= len([]rune(compactedDetail))
-		out = append(out, replanRequestSnapshot{
-			RequestID: request.ID, Reason: request.ReasonCode,
-			Detail: compactedDetail, DetailTruncated: truncated,
-			SourceTaskID: request.SourceTaskID, SourceEvent: request.SourceEvent,
-			ObservedRevision: request.ObservedRevision, ObservedStateVersion: request.ObservedStateVersion,
-			Urgency: string(request.Urgency),
-		})
-	}
-	return out, len(requests) - limit
-}
-
-func truncateSnapshotRunes(value string, limit int) (string, bool) {
-	runes := []rune(value)
-	if len(runes) <= limit {
-		return value, false
-	}
-	if limit <= 0 {
-		return "", len(runes) > 0
-	}
-	if limit == 1 {
-		return "…", true
-	}
-	return string(runes[:limit-1]) + "…", true
-}
-
-func latestCurrentAcceptanceSnapshot(p *model.Plan) *acceptanceSnapshot {
-	if p == nil || p.CurrentAcceptanceSpecID == "" || p.CurrentAcceptanceSpecRevision == 0 {
-		return nil
-	}
-
-	var latest model.AcceptanceRun
-	found := false
-	for _, run := range p.AcceptanceRuns {
-		if run.PlanID != p.ID || run.SpecID != p.CurrentAcceptanceSpecID ||
-			run.SpecRevision != p.CurrentAcceptanceSpecRevision ||
-			run.TargetPlanRevision != p.CurrentRevision ||
-			run.TargetGraphDigest != p.CurrentGraphDigest || run.Status == "stale" {
-			continue
-		}
-		if run.ResultID != "" {
-			result, ok := p.AcceptanceResults[run.ResultID]
-			if !ok || result.PlanID != p.ID || result.RunID != run.ID ||
-				result.Status != model.AcceptanceResultValid {
-				continue
-			}
-		}
-		if !found || acceptanceRunLater(run, latest) {
-			latest = run
-			found = true
-		}
-	}
-	if !found {
-		return nil
-	}
-
-	snapshot := &acceptanceSnapshot{
-		RunID: latest.ID, ResultID: latest.ResultID, RunStatus: latest.Status,
-		Scope: string(latest.Scope), TargetTaskIDs: append([]string(nil), latest.TargetTaskIDs...),
-		RunnerTaskID: latest.RunnerTaskID,
-	}
-	if latest.ResultID == "" {
-		return snapshot
-	}
-	result := p.AcceptanceResults[latest.ResultID]
-	snapshot.ResultStatus = string(result.Status)
-	snapshot.Verdict = string(result.Verdict)
-	snapshot.Reason = result.Reason
-	snapshot.CriterionResults = append([]model.CriterionResult(nil), result.CriterionResults...)
-	snapshot.ResidualRisks = append([]string(nil), result.ResidualRisks...)
-	snapshot.RecommendedActions = append([]string(nil), result.RecommendedActions...)
-	snapshot.FailureFingerprints = acceptanceFailureFingerprints(result)
-	return snapshot
-}
-
-func acceptanceRunLater(candidate, current model.AcceptanceRun) bool {
-	candidateAt := candidate.CompletedAt
-	if candidateAt.IsZero() {
-		candidateAt = candidate.CreatedAt
-	}
-	currentAt := current.CompletedAt
-	if currentAt.IsZero() {
-		currentAt = current.CreatedAt
-	}
-	if !candidateAt.Equal(currentAt) {
-		return candidateAt.After(currentAt)
-	}
-	if !candidate.CreatedAt.Equal(current.CreatedAt) {
-		return candidate.CreatedAt.After(current.CreatedAt)
-	}
-	return candidate.ID > current.ID
-}
-
-func acceptanceFailureFingerprints(result model.AcceptanceResult) []string {
-	seen := make(map[string]bool)
-	if result.FailureFingerprint != "" {
-		seen[result.FailureFingerprint] = true
-	}
-	for _, criterion := range result.CriterionResults {
-		if criterion.FailureFingerprint != "" {
-			seen[criterion.FailureFingerprint] = true
-		}
-	}
-	out := make([]string, 0, len(seen))
-	for fingerprint := range seen {
-		out = append(out, fingerprint)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // buildAgentCapabilities 合并 AgentRegistry 中的特化代理 + Worker 的能力声明，
 // 产出 agent_capabilities 数组。
 //
@@ -852,11 +566,11 @@ func buildAgentCapabilitiesForPlan(
 	registry *AgentRegistry,
 	workerCaps *AgentCapabilityInfo,
 	capsByProfile map[string]*AgentCapabilityInfo,
-	planID string,
+	ownerID string,
 ) []agentCapabilitySnapshot {
 	entries := registry.Specialized()
-	if planID != "" {
-		entries = registry.SpecializedForPlan(planID)
+	if ownerID != "" {
+		entries = registry.SpecializedForPlan(ownerID)
 	}
 
 	// Per-profile 模式：capsByProfile 非空时，忽略 workerCaps，为每个 profile 输出一条记录
@@ -933,10 +647,10 @@ func buildSpecializedAgentSnapshots(tasks []*model.Task, registry *AgentRegistry
 	return buildSpecializedAgentSnapshotsForPlan(tasks, registry, "")
 }
 
-func buildSpecializedAgentSnapshotsForPlan(tasks []*model.Task, registry *AgentRegistry, planID string) []specializedAgentSnapshot {
+func buildSpecializedAgentSnapshotsForPlan(tasks []*model.Task, registry *AgentRegistry, ownerID string) []specializedAgentSnapshot {
 	entries := registry.Specialized()
-	if planID != "" {
-		entries = registry.SpecializedForPlan(planID)
+	if ownerID != "" {
+		entries = registry.SpecializedForPlan(ownerID)
 	}
 	if len(entries) == 0 {
 		return nil
@@ -982,7 +696,7 @@ func buildAgentSnapshotsForPlan(
 	r roster.Roster,
 	workerProfiles map[string]string,
 	registry *AgentRegistry,
-	planID string,
+	ownerID string,
 ) []agentSnapshot {
 	if mb == nil {
 		return nil
@@ -999,8 +713,8 @@ func buildAgentSnapshotsForPlan(
 
 	out := make([]agentSnapshot, 0, len(statuses))
 	for _, st := range statuses {
-		if planID != "" && strings.HasPrefix(st.EventType, "team:") &&
-			(registry == nil || !registry.CanRouteForPlan(planID, st.EventType)) {
+		if ownerID != "" && strings.HasPrefix(st.EventType, "team:") &&
+			(registry == nil || !registry.CanRouteForPlan(ownerID, st.EventType)) {
 			continue
 		}
 		snap := agentSnapshot{

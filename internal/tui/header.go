@@ -4,25 +4,26 @@ import (
 	"fmt"
 	"strings"
 
-	"agentgo/internal/scheduler"
-
 	"github.com/charmbracelet/lipgloss"
 )
 
-// renderHeader draws the top bar: logo | mode | session | agent count | session token total.
+// renderHeader draws the top bar: logo | modes | session | agent count | session token total.
 // totalTokens 为全 session 各 agent 累计消耗之和（prompt+completion），<=0 时不显示。
-func renderHeader(t Theme, l Layout, mode scheduler.Mode, sessionID string, agentCount int, interactionPending int, totalTokens int64) string {
+// V6 起 gate 轴已移除，模式区展示 exec / topo 两轴现状。
+func renderHeader(t Theme, l Layout, execMode, topoMode, sessionID string, agentCount int, interactionPending int, totalTokens int64) string {
 	if l.Width < 10 {
 		return ""
 	}
 
 	logo := t.HeaderTitle.Render(" ◆ AgentGo ")
 
-	modeStr := "Immediate"
-	if mode == scheduler.ModePlan {
-		modeStr = "Plan"
+	if execMode == "" {
+		execMode = "normal"
 	}
-	modeLabel := t.HeaderMeta.Render(fmt.Sprintf(" Mode: %s ", modeStr))
+	if topoMode == "" {
+		topoMode = "team"
+	}
+	modeLabel := t.HeaderMeta.Render(fmt.Sprintf(" Exec: %s Topo: %s ", execMode, topoMode))
 
 	sessLabel := ""
 	if sessionID != "" {

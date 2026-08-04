@@ -1,8 +1,11 @@
 package agent
 
 import (
+	"context"
 	"sync"
 	"testing"
+
+	"agentgo/internal/model"
 )
 
 // TestTokenStats_ConcurrentAddAndSnapshot 验证 A3 修复：
@@ -66,7 +69,7 @@ func TestTokenStats_ConcurrentAddAndSnapshot(t *testing.T) {
 }
 
 // TestAddTokenStats_ReturnsUpdatedSnapshot 验证返回值即为累加后快照，
-// 供写方 goroutine 复用（trace 事件），无需再次取锁。
+// 供写方 goroutine 复用，无需再次取锁。
 func TestAddTokenStats_ReturnsUpdatedSnapshot(t *testing.T) {
 	a := &Agent{ID: "test-agent"}
 
@@ -80,5 +83,69 @@ func TestAddTokenStats_ReturnsUpdatedSnapshot(t *testing.T) {
 	}
 	if got := a.TokenStatsSnapshot(); got != s2 {
 		t.Fatalf("TokenStatsSnapshot() = %+v, want %+v", got, s2)
+	}
+}
+
+// TestProcessTask_NoTokenStatsTraceEvent 钉住 V6 删除不变量：
+// token_stats 事件（与 llm_call_end 重复的第二账本）已删除——一次完整任务
+// 执行后，trace 目录中不得存在 kind 为 "token_stats" 的事件（常量已删，用
+// 字符串字面量断言）；Agent.TokenStats 内存计数器保留，仍正常累计。
+func TestProcessTask_NoTokenStatsTraceEvent(t *testing.T) {
+	dir := captureTraceToDir(t)
+	s, r, _ := setup()
+
+	task := &model.Task{Description: "token stats absence", EventType: "code"}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatalf("PublishTask: %v", err)
+	}
+	if err := s.ClaimTask("agent-1", task.ID); err != nil {
+		t.Fatalf("ClaimTask: %v", err)
+	}
+
+	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+		return ExecuteResult{Output: "done", ToolCalled: false, PromptTokens: 100, CompletionTokens: 10}, nil
+	}
+	ag := NewAgent("agent-1", "code", s, r, executor)
+	ag.processTask(context.Background(), task.ID)
+
+	for _, ev := range readTraceEventsFromDir(t, dir) {
+		if string(ev.Kind) == "token_stats" {
+			t.Errorf("trace 中不应存在 token_stats 事件（V6 已删除）: %+v", ev)
+		}
+	}
+
+	// 内存计数器是 TUI/Web AgentCard 的实时视图数据源，必须仍在累计。
+	if snap := ag.TokenStatsSnapshot(); snap.CallCount != 1 || snap.TotalPromptTokens != 100 || snap.TotalCompletionTokens != 10 {
+		t.Errorf("TokenStats 内存计数器应正常累计, got %+v", snap)
+	}
+}
+
+// TestProcessTask_NoHistoryTruncatedTraceEvent 钉住 V6 删除不变量：
+// 固定上下文硬限截断层（context_limit 配置 + TruncateHistory 调用点）与
+// history_truncated 事件已删除——一次完整任务执行后，trace 目录中不得存在
+// kind 为 "history_truncated" 的事件（常量已删，用字符串字面量断言）。
+// L2 压缩（history_compaction）与 L3 溢出重试不在本测试约束范围，予以保留。
+func TestProcessTask_NoHistoryTruncatedTraceEvent(t *testing.T) {
+	dir := captureTraceToDir(t)
+	s, r, _ := setup()
+
+	task := &model.Task{Description: "history truncated absence", EventType: "code"}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatalf("PublishTask: %v", err)
+	}
+	if err := s.ClaimTask("agent-1", task.ID); err != nil {
+		t.Fatalf("ClaimTask: %v", err)
+	}
+
+	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+		return ExecuteResult{Output: "done", ToolCalled: false, PromptTokens: 100, CompletionTokens: 10}, nil
+	}
+	ag := NewAgent("agent-1", "code", s, r, executor)
+	ag.processTask(context.Background(), task.ID)
+
+	for _, ev := range readTraceEventsFromDir(t, dir) {
+		if string(ev.Kind) == "history_truncated" {
+			t.Errorf("trace 中不应存在 history_truncated 事件（V6 已删除）: %+v", ev)
+		}
 	}
 }

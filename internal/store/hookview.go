@@ -3,11 +3,11 @@ package store
 import "agentgo/internal/model"
 
 // StoreHookView 是 hook 系统访问 Store 的只读视图（外加 AppendArtifact 这一个
-// postCall hook 的约定写操作）。
+// record-artifact Reactor 的约定写操作）。
 //
 // 设计原则（hookSystem.md §11.1.1 / §11.4）：
 //   - hook 构造时拿到的是本接口，不是完整 TaskStore，防止 hook 侵入编排能力
-//   - 除 AppendArtifact 外全部只读——AppendArtifact 是 RecordArtifactHook 的
+//   - 除 AppendArtifact 外全部只读——AppendArtifact 是 record-artifact Reactor 的
 //     唯一写入途径，其语义是"事实登记"而非状态变更
 //   - AppendToolCall 不在本接口上——它由 llm_executor.go 通过独立闭包写入
 //     （C4.3 方案 A），避免 hook 能自己塞历史做作弊
@@ -21,7 +21,7 @@ type StoreHookView interface {
 	GetTask(taskID string) (*model.Task, error)
 
 	// AppendArtifact 把文件路径追加到任务产物清单。
-	// 由 RecordArtifactHook（PostCall on write_file/edit_file）调用。
+	// 由 record-artifact Reactor（订阅 KindFileWritten）调用。
 	// path 应当是相对项目根的相对路径，由调用方负责标准化。
 	AppendArtifact(taskID string, path string) error
 

@@ -10,7 +10,7 @@ import (
 
 // readonlyStore 构造 exec 轴为 readonly 的模式 store（gate/topo 用默认值）。
 func readonlyStore() *modes.Store {
-	return modes.NewStore(modes.GateImmediate, modes.ExecReadonly, modes.TopoTeam)
+	return modes.NewStore(modes.ExecReadonly, modes.TopoTeam)
 }
 
 // TestExecModeGuard_ReadonlyBlocksWriteTools readonly 模式下三个写类工具
@@ -61,7 +61,7 @@ func TestExecModeGuard_ReadonlyAllowsOtherTools(t *testing.T) {
 func TestExecModeGuard_OtherModesContinue(t *testing.T) {
 	for _, mode := range []modes.ExecMode{modes.ExecNormal, modes.ExecStrict, modes.ExecYolo} {
 		t.Run(mode.String(), func(t *testing.T) {
-			h := NewExecModeGuardHook(modes.NewStore(modes.GateImmediate, mode, modes.TopoTeam))
+			h := NewExecModeGuardHook(modes.NewStore(mode, modes.TopoTeam))
 			for _, tool := range []string{"write_file", "edit_file", "run_shell"} {
 				d := h.Run(hook.ToolHookContext{Phase: hook.PhasePreCall, ToolName: tool})
 				if d.Action != hook.Continue {

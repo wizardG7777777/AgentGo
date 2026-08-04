@@ -3,8 +3,8 @@
 // 不验证单个组件——它们在各自包里都有 e2e 覆盖。本文件验证 v5 各 Phase 协作
 // 链路在一起跑时无 regression：
 //
-//   trace.Dispatcher (Phase 2/4) → reactor.Registry → user reactor (Phase 5)
-//   → store.PublishTask (Phase 6 数据流入口) → 新事件 emit 回 dispatcher
+//	trace.Dispatcher (Phase 2/4) → reactor.Registry → user reactor (Phase 5)
+//	→ store.PublishTask (Phase 6 数据流入口) → 新事件 emit 回 dispatcher
 //
 // 同时验证 spawn.Manager 作为 reactor 订阅 task 终态时不会与 user reactor 互相干扰。
 package userdef
@@ -24,10 +24,10 @@ import (
 )
 
 // TestV5Phase7_E2E_UserReactorPublishesTaskOnFailure 模拟典型链路：
-//   1. 主流程 emit KindTaskFailed
-//   2. user reactor (publish_task) 命中 → 新任务投递到公告板
-//   3. 公告板 PublishTask 触发 KindTaskPublished 事件
-//   4. dispatcher 把新事件再次派发——但本次没有订阅者命中（无 reactor on: task_published）
+//  1. 主流程 emit KindTaskFailed
+//  2. user reactor (publish_task) 命中 → 新任务投递到公告板
+//  3. 公告板 PublishTask 触发 KindTaskPublished 事件
+//  4. dispatcher 把新事件再次派发——但本次没有订阅者命中（无 reactor on: task_published）
 //
 // 验证项：dispatcher 多 reactor 路由不互相干扰；async user reactor 不阻塞触发线程。
 func TestV5Phase7_E2E_UserReactorPublishesTaskOnFailure(t *testing.T) {

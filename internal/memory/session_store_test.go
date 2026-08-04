@@ -207,9 +207,6 @@ func TestSessionStore_ProjectScopeStillUnsupported(t *testing.T) {
 	if err := s.Clear(ctx, ScopeProject); !errors.Is(err, ErrScopeUnsupported) {
 		t.Errorf("Clear ScopeProject err=%v, want ErrScopeUnsupported", err)
 	}
-	if _, err := s.QueryByVector(ctx, ScopeSession, []float32{1}, 1); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("QueryByVector err=%v, want ErrNotImplemented", err)
-	}
 }
 
 func TestSessionStore_EmptyKeyRejected(t *testing.T) {

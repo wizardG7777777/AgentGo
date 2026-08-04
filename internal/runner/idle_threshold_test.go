@@ -30,7 +30,7 @@ func TestNewMapsIdleThresholdFromRuntimeConfig(t *testing.T) {
 
 	rn := New(config.AgentRuntimeConfig{
 		InstanceID: "worker-1", Kind: "worker", AllowedTools: []string{"read_file"},
-		AgentMaxLoops: 4, TaskMaxRetries: 2, IdleThreshold: 7,
+		TaskMaxRetries: 2, IdleThreshold: 7,
 	}, deps)
 	if got := rn.Agent().IdleThreshold; got != 7 {
 		t.Errorf("Agent.IdleThreshold=%d，want 7（配置值应透传到 agent）", got)
@@ -39,7 +39,7 @@ func TestNewMapsIdleThresholdFromRuntimeConfig(t *testing.T) {
 	// 构造点未赋值（零值）时保持旧行为：0 = 永不空闲退出。
 	rn = New(config.AgentRuntimeConfig{
 		InstanceID: "worker-2", Kind: "worker", AllowedTools: []string{"read_file"},
-		AgentMaxLoops: 4, TaskMaxRetries: 2,
+		TaskMaxRetries: 2,
 	}, deps)
 	if got := rn.Agent().IdleThreshold; got != 0 {
 		t.Errorf("Agent.IdleThreshold=%d，want 0（未配置时保持永不空闲退出）", got)

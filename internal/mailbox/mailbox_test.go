@@ -467,4 +467,3 @@ func TestDrainWithAck_MixedBatch_PreservesOrder(t *testing.T) {
 		t.Errorf("s2 应收到 2 条 ack（对 q1/q2），实际: %d", len(acks2))
 	}
 }
-

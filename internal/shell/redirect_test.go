@@ -158,7 +158,7 @@ func TestWrapShellTool_RedirectWriteBlockedInStrictAndYolo(t *testing.T) {
 	} {
 		t.Run(entry.name, func(t *testing.T) {
 			service := interaction.NewService(nil)
-			modeStore := modes.NewStore(modes.GateImmediate, entry.mode, modes.TopoTeam)
+			modeStore := modes.NewStore(entry.mode, modes.TopoTeam)
 			var executed atomic.Bool
 			wrapper := WrapShellTool(func(context.Context, map[string]any) (string, error) {
 				executed.Store(true)

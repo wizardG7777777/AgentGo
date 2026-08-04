@@ -51,18 +51,14 @@ func TestSystem_UIHub_EndToEnd(t *testing.T) {
 	updates, unsubscribe := s.UIHub.Subscribe(16)
 	defer unsubscribe()
 
-	// 首条必为全量快照（订阅建立即下发）。注意其内容可能早于 Run 的
-	// 启动刷新（订阅与启动并发时快照为零值）；生产路径 RunCLI 订阅远在
-	// Start 之后，不受影响。这里改为等待快照经轮询刷新后断言 Mode。
+	// 两条通道与一条结构化请求 → 订阅者看到结果、完成轮次、日志与交互更新。
 	u := recvUIUpdate(t, updates)
 	if u.Kind != ui.KindSnapshotSync {
 		t.Fatalf("首条更新 Kind = %v，期望 SnapshotSync", u.Kind)
 	}
-	waitForUI(t, "快照 Mode 经 ModeGet 刷新", func() bool {
-		return s.UIHub.Snapshot().Mode == "immediate"
+	waitForUI(t, "快照 TopoMode 经 TopoModeGet 刷新", func() bool {
+		return s.UIHub.Snapshot().TopoMode == "team"
 	})
-
-	// 两条通道与一条结构化请求 → 订阅者看到结果、完成轮次、日志与交互更新。
 	outputCh <- output.Event{Kind: output.KindResult, AgentID: "worker-1", Text: "任务完成"}
 	outputCh <- output.Event{
 		Kind: output.KindTurn, SessionID: sessionID, AgentID: "worker-1",
@@ -132,10 +128,10 @@ func TestSystem_UIHub_EndToEnd(t *testing.T) {
 	}
 }
 
-// TestSystem_UIHub_ThreeModeAxes 三轴模式的装配闭环：经 buildUIHub 装配的
+// TestSystem_UIHub_TwoModeAxes 两轴模式的装配闭环：经 buildUIHub 装配的
 // Hub，SetExecMode / SetTopoMode 写回同一个 modes.Store，快照经轮询刷新后
-// 读出三轴当前值；非法值返回中文错误且不写 store。
-func TestSystem_UIHub_ThreeModeAxes(t *testing.T) {
+// 读出两轴当前值；非法值返回中文错误且不写 store。
+func TestSystem_UIHub_TwoModeAxes(t *testing.T) {
 	modeStore := modes.DefaultStore()
 	s := &System{
 		Store:           store.NewMemoryTaskStore(nil, 100, 1, 300),
@@ -152,10 +148,10 @@ func TestSystem_UIHub_ThreeModeAxes(t *testing.T) {
 	defer cancel()
 	s.startUIHub(ctx)
 
-	// 初值为三轴默认（immediate / normal / team）。
-	waitForUI(t, "快照三轴初值", func() bool {
+	// 初值为两轴默认（normal / team）。
+	waitForUI(t, "快照两轴初值", func() bool {
 		snap := s.UIHub.Snapshot()
-		return snap.Mode == "immediate" && snap.ExecMode == "normal" && snap.TopoMode == "team"
+		return snap.ExecMode == "normal" && snap.TopoMode == "team"
 	})
 
 	// SetExecMode / SetTopoMode 写回同一个 modes.Store。
@@ -172,8 +168,8 @@ func TestSystem_UIHub_ThreeModeAxes(t *testing.T) {
 		t.Fatalf("GetTopo = %v，期望 TopoSolo", got)
 	}
 
-	// 快照经轮询刷新后读出三轴新值。
-	waitForUI(t, "快照三轴更新", func() bool {
+	// 快照经轮询刷新后读出两轴新值。
+	waitForUI(t, "快照两轴更新", func() bool {
 		snap := s.UIHub.Snapshot()
 		return snap.ExecMode == "readonly" && snap.TopoMode == "solo"
 	})

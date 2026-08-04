@@ -9,9 +9,6 @@ import (
 	"time"
 )
 
-// ErrNotImplemented 标识当前实现未支持的能力（如 QueryByVector）。
-var ErrNotImplemented = errors.New("memory: 操作未实现")
-
 // ProcessStore 是 ScopeProcess 的纯内存实现。Session / Project 作用域写入
 // 时直接拒绝（返回 ErrScopeUnsupported）——这是 v5 Phase 1 的最小集策略，
 // 防止上层误用拿不到的作用域。
@@ -97,14 +94,17 @@ func (s *ProcessStore) Put(ctx context.Context, entry Entry) error {
 	now := s.nowFn()
 	idxKey := scopeKindKey{entry.Scope, entry.Kind, entry.Key}
 
-	// upsert：同 (scope,kind,key) 已存在时覆盖 Content / Tags / Source / Embedding
-	// 并刷新 UpdatedAt，但 CreatedAt 保留首次写入时间。
+	// upsert：同 (scope,kind,key) 已存在时覆盖 Content / Tags / Source /
+	// 生命周期字段（State/Evidence/SupersededBy）并刷新 UpdatedAt，
+	// 但 CreatedAt 保留首次写入时间。
 	if existingID, ok := s.keyIndex[idxKey]; ok {
 		old := s.entries[existingID]
 		old.Content = entry.Content
 		old.Tags = entry.Tags
 		old.Source = entry.Source
-		old.Embedding = entry.Embedding
+		old.State = entry.State
+		old.Evidence = entry.Evidence
+		old.SupersededBy = entry.SupersededBy
 		old.UpdatedAt = now
 		return nil
 	}
@@ -120,7 +120,6 @@ func (s *ProcessStore) Put(ctx context.Context, entry Entry) error {
 		old.Content = entry.Content
 		old.Tags = entry.Tags
 		old.Source = entry.Source
-		old.Embedding = entry.Embedding
 		old.UpdatedAt = now
 		s.keyIndex[idxKey] = entry.ID
 		return nil
@@ -142,8 +141,6 @@ func (s *ProcessStore) Put(ctx context.Context, entry Entry) error {
 //   - query 非空且命中某条 (scope,kind,query) 的 Key：返回精确匹配的那一条
 //   - query 为空：返回该 (scope,kind) 下全部条目（按 UpdatedAt 倒序，limit 截断）
 //   - query 非空但未命中 Key：返回空切片（暂不做模糊匹配）
-//
-// AccessCount 在每次返回非空结果时递增（LRU 数据准备，v5 仅记录不利用）。
 func (s *ProcessStore) Query(ctx context.Context, scope Scope, kind Kind, query string, limit int) ([]Entry, error) {
 	// ScopeSession 委托：仅在挂接后端时拦截；未挂接时落到下方既有扫描
 	// （Process 索引里没有 session 条目，返回空——与 Phase 1 行为一致）。
@@ -160,7 +157,6 @@ func (s *ProcessStore) Query(ctx context.Context, scope Scope, kind Kind, query 
 		idxKey := scopeKindKey{scope, kind, query}
 		if id, ok := s.keyIndex[idxKey]; ok {
 			e := s.entries[id]
-			e.AccessCount++
 			return []Entry{*e}, nil
 		}
 		return nil, nil
@@ -181,15 +177,9 @@ func (s *ProcessStore) Query(ctx context.Context, scope Scope, kind Kind, query 
 	}
 	out := make([]Entry, 0, len(matched))
 	for _, e := range matched {
-		e.AccessCount++
 		out = append(out, *e)
 	}
 	return out, nil
-}
-
-// QueryByVector v5 Phase 1 不实现，返回 ErrNotImplemented。
-func (s *ProcessStore) QueryByVector(_ context.Context, _ Scope, _ []float32, _ int) ([]Entry, error) {
-	return nil, ErrNotImplemented
 }
 
 // Delete 按 ID 删除条目。不存在视为幂等成功。

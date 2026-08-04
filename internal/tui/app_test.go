@@ -79,30 +79,25 @@ type fakeUI struct {
 	switchChanged  bool
 	listFn         func() ([]ui.SessionInfo, error)
 	respondFn      func(input interaction.ResolveInput) (ui.InteractionResult, error)
-	approveFn      func(idPrefix string) (string, error)
-	rejectFn       func(idPrefix string) (string, error)
-	planReviews    []ui.PlanReviewItem
-	planReviewsErr error
+	agentAuditFn   func() (string, error)
 
 	// 调用记录
 	sentTexts         []string
 	cancelled         []string
 	cancelLatestCalls int
 	steers            []steerCall
-	modeSets          []bool
 	execSets          []string
 	topoSets          []string
 	newCalls          int
 	switchCalls       int
 	switchedTo        string
 	interactionCalls  []interaction.ResolveInput
+	agentAuditCalls   int
 	quitCalls         int
-	approveCalls      []string
-	rejectCalls       []string
 }
 
 func newFakeUI() *fakeUI {
-	return &fakeUI{snapshot: ui.Snapshot{Mode: "immediate"}, switchChanged: true}
+	return &fakeUI{snapshot: ui.Snapshot{TopoMode: "team"}, switchChanged: true}
 }
 
 func (f *fakeUI) Subscribe(buf int) (<-chan ui.Update, func()) {
@@ -154,18 +149,6 @@ func (f *fakeUI) SteerAgent(agentID, message string) error {
 	defer f.mu.Unlock()
 	f.steers = append(f.steers, steerCall{agentID: agentID, message: message})
 	return f.steerErr
-}
-
-func (f *fakeUI) SetMode(plan bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.modeSets = append(f.modeSets, plan)
-	// 模拟 Hub：SetMode 后下一轮快照即反映新模式。
-	if plan {
-		f.snapshot.Mode = "plan"
-	} else {
-		f.snapshot.Mode = "immediate"
-	}
 }
 
 func (f *fakeUI) SetExecMode(mode string) error {
@@ -236,30 +219,15 @@ func (f *fakeUI) RespondInteraction(_ context.Context, input interaction.Resolve
 	return ui.InteractionResult{ID: input.RequestID, Version: input.ExpectedVersion + 1}, nil
 }
 
-func (f *fakeUI) ApprovePlan(idPrefix string) (string, error) {
+// agentAuditFn 是 /doctor agents 审计任务创建的行为注入。
+func (f *fakeUI) RequestAgentAudit() (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.approveCalls = append(f.approveCalls, idPrefix)
-	if f.approveFn != nil {
-		return f.approveFn(idPrefix)
+	f.agentAuditCalls++
+	if f.agentAuditFn != nil {
+		return f.agentAuditFn()
 	}
-	return "", errors.New("approvePlan 未注入")
-}
-
-func (f *fakeUI) RejectPlan(idPrefix string) (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.rejectCalls = append(f.rejectCalls, idPrefix)
-	if f.rejectFn != nil {
-		return f.rejectFn(idPrefix)
-	}
-	return "", errors.New("rejectPlan 未注入")
-}
-
-func (f *fakeUI) PendingPlanReviews() ([]ui.PlanReviewItem, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.planReviews, f.planReviewsErr
+	return "audit-task-1", nil
 }
 
 func (f *fakeUI) RequestQuit() {
@@ -1048,7 +1016,6 @@ func TestAppModel_SnapshotSyncMsg(t *testing.T) {
 		Tasks: []ui.BoardTask{
 			{ID: "t-1", Desc: "看板任务", Status: "processing"},
 		},
-		Mode: "plan",
 		PendingInteractions: []ui.InteractionItem{
 			testInteraction("r-1", ui.InteractionOption{ID: "a", Label: "A"}),
 			testInteraction("r-2", ui.InteractionOption{ID: "b", Label: "B"}),
@@ -1153,7 +1120,6 @@ func TestAppModel_ShowStatus_WideTaskDescription(t *testing.T) {
 		Status: "pending",
 		Agents: []string{"worker-1"},
 	}}
-	f.snapshot.Mode = "immediate"
 	m := newAppModel(deps)
 
 	m.showStatus()
@@ -1346,18 +1312,19 @@ func TestAppModel_HandleCommand_Mode(t *testing.T) {
 	m := newAppModel(deps)
 	f := fakeOf(deps)
 
-	if f.Snapshot().Mode != "immediate" {
-		t.Fatal("initial mode should be immediate")
+	if f.Snapshot().TopoMode != "team" {
+		t.Fatal("initial topo mode should be team")
+	}
+
+	// /mode 无参 = topo 轴快捷 toggle（team ↔ solo）
+	m.handleCommand("/mode")
+	if len(f.topoSets) != 1 || f.topoSets[0] != "solo" {
+		t.Fatalf("first /mode should SetTopoMode(solo), got %v", f.topoSets)
 	}
 
 	m.handleCommand("/mode")
-	if len(f.modeSets) != 1 || !f.modeSets[0] {
-		t.Fatalf("first /mode should SetMode(true), got %v", f.modeSets)
-	}
-
-	m.handleCommand("/mode")
-	if len(f.modeSets) != 2 || f.modeSets[1] {
-		t.Fatalf("second /mode should SetMode(false), got %v", f.modeSets)
+	if len(f.topoSets) != 2 || f.topoSets[1] != "team" {
+		t.Fatalf("second /mode should SetTopoMode(team), got %v", f.topoSets)
 	}
 }
 
@@ -1375,13 +1342,25 @@ func TestAppModel_HandleCommand_ModeAxes(t *testing.T) {
 	m := newAppModel(deps)
 	f := fakeOf(deps)
 
-	// /mode gate plan → 走 Controller.SetMode(true)
+	// /mode gate plan → V6 起 gate 轴整体移除，报迁移诊断，不触达任何模式写入
 	m.handleCommand("/mode gate plan")
-	if len(f.modeSets) != 1 || !f.modeSets[0] {
-		t.Fatalf("/mode gate plan 应 SetMode(true)，got %v", f.modeSets)
+	if len(f.execSets) != 0 || len(f.topoSets) != 0 {
+		t.Fatalf("/mode gate plan 应被拒绝（V6 gate 轴已移除），got exec=%v topo=%v", f.execSets, f.topoSets)
 	}
-	if got := lastMsgText(t, m); !strings.Contains(got, "[mode] gate 轴已切换到 plan") {
-		t.Fatalf("反馈消息 = %q", got)
+	diagnostic := ""
+	for _, msg := range m.messages {
+		if strings.Contains(msg.Text, "gate 轴已于 V6 移除") {
+			diagnostic = msg.Text
+		}
+	}
+	if !strings.Contains(diagnostic, "gate 轴已于 V6 移除") || !strings.Contains(diagnostic, "Graph approval") {
+		t.Fatalf("迁移诊断消息 = %q", diagnostic)
+	}
+
+	// /mode gate immediate → 同样拒绝（gate 轴已整体移除，immediate 也不例外）
+	m.handleCommand("/mode gate immediate")
+	if len(f.execSets) != 0 || len(f.topoSets) != 0 {
+		t.Fatalf("/mode gate immediate 应被拒绝（V6 gate 轴已移除），got exec=%v topo=%v", f.execSets, f.topoSets)
 	}
 
 	// /mode exec readonly → 走 Controller.SetExecMode
@@ -1404,7 +1383,7 @@ func TestAppModel_HandleCommand_ModeAxes(t *testing.T) {
 }
 
 func TestAppModel_HandleCommand_ModeUsage(t *testing.T) {
-	// 非法参数 → 消息流输出中文用法说明（列出三轴与可选值）。
+	// 非法参数 → 消息流输出中文用法说明（列出两轴与可选值）。
 	for _, line := range []string{
 		"/mode gate",            // 参数个数不对
 		"/mode exec nope",       // exec 非法值
@@ -1426,7 +1405,7 @@ func TestAppModel_HandleCommand_ModeUsage(t *testing.T) {
 			if usage == "" {
 				t.Fatalf("%s 应输出用法说明，消息流 = %+v", line, m.messages)
 			}
-			for _, want := range []string{"gate", "exec", "topo", "immediate|plan", "normal|strict|readonly|yolo", "team|solo"} {
+			for _, want := range []string{"gate 轴已于 V6 移除", "exec", "topo", "normal|strict|readonly|yolo", "team|solo"} {
 				if !strings.Contains(usage, want) {
 					t.Fatalf("用法说明缺少 %q: %q", want, usage)
 				}
@@ -1435,10 +1414,9 @@ func TestAppModel_HandleCommand_ModeUsage(t *testing.T) {
 	}
 }
 
-func TestAppModel_ShowStatus_ThreeModeAxes(t *testing.T) {
+func TestAppModel_ShowStatus_TwoModeAxes(t *testing.T) {
 	deps := testDeps()
 	f := fakeOf(deps)
-	f.snapshot.Mode = "plan"
 	f.snapshot.ExecMode = "readonly"
 	f.snapshot.TopoMode = "solo"
 	m := newAppModel(deps)
@@ -1449,7 +1427,7 @@ func TestAppModel_ShowStatus_ThreeModeAxes(t *testing.T) {
 		t.Fatalf("messages count = %d, want 1", len(m.messages))
 	}
 	text := m.messages[0].Text
-	for _, want := range []string{"Mode: Plan", "Exec: readonly", "Topo: solo"} {
+	for _, want := range []string{"Exec: readonly", "Topo: solo"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("/status 输出缺少 %q: %q", want, text)
 		}
@@ -2072,7 +2050,7 @@ func TestAppModel_HandleKey_CtrlL_ClearsMessagesOnly(t *testing.T) {
 	// 零副作用：不发任何请求（Controller 零调用）
 	f := fakeOf(deps)
 	if len(f.sentTexts) != 0 || f.cancelLatestCalls != 0 || f.quitCalls != 0 ||
-		len(f.modeSets) != 0 || len(f.interactionCalls) != 0 || len(f.cancelled) != 0 {
+		len(f.execSets) != 0 || len(f.topoSets) != 0 || len(f.interactionCalls) != 0 || len(f.cancelled) != 0 {
 		t.Errorf("Ctrl+L 不应触发任何 Controller 调用: %+v", f)
 	}
 }
@@ -2105,7 +2083,7 @@ func TestAppModel_HandleKey_ShiftTab_CyclesFocusReverse(t *testing.T) {
 	if m.focus != FocusInput {
 		t.Fatalf("Interaction reverse should reach Input, got %d", m.focus)
 	}
-	if calls := fakeOf(deps).modeSets; len(calls) != 0 {
+	if calls := append(append([]string{}, fakeOf(deps).execSets...), fakeOf(deps).topoSets...); len(calls) != 0 {
 		t.Fatalf("Shift+Tab must not change mode: %v", calls)
 	}
 }

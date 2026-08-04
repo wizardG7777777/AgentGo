@@ -57,7 +57,7 @@ func TestBuildBoardJSON_ResultRefsAreBoundedStableAndSorted(t *testing.T) {
 		"a-short": short,
 	})
 
-	raw := BuildBoardJSON(s, &config.Config{}, testModeSnap("immediate"), model.Event{}, SnapshotSources{})
+	raw := BuildBoardJSON(s, &config.Config{}, testModeSnap(), model.Event{}, SnapshotSources{})
 	snap := snapshotTaskByID(t, parseSnapshot(t, raw), task.ID)
 	if len(snap.ResultRefs) != 2 {
 		t.Fatalf("result refs=%+v", snap.ResultRefs)
@@ -100,8 +100,8 @@ func TestBuildBoardJSON_ResultExcerptBudgetPrioritizesTriggerSources(t *testing.
 		tasks = append(tasks, task)
 	}
 	trigger := model.Event{TaskID: tasks[0].ID, Payload: map[string]string{"source_task_ids": tasks[1].ID}}
-	raw := BuildBoardJSON(s, &config.Config{}, testModeSnap("immediate"), trigger, SnapshotSources{})
-	if again := BuildBoardJSON(s, &config.Config{}, testModeSnap("immediate"), trigger, SnapshotSources{}); again != raw {
+	raw := BuildBoardJSON(s, &config.Config{}, testModeSnap(), trigger, SnapshotSources{})
+	if again := BuildBoardJSON(s, &config.Config{}, testModeSnap(), trigger, SnapshotSources{}); again != raw {
 		t.Fatal("result-ref allocation should be deterministic")
 	}
 	snapshot := parseSnapshot(t, raw)
@@ -148,7 +148,7 @@ func TestBuildBoardJSON_ProgressKeepsBoundedUTF8Tail(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	raw := BuildBoardJSON(s, &config.Config{}, testModeSnap("immediate"), model.Event{}, SnapshotSources{})
+	raw := BuildBoardJSON(s, &config.Config{}, testModeSnap(), model.Event{}, SnapshotSources{})
 	got := snapshotTaskByID(t, parseSnapshot(t, raw), task.ID).Progress
 	if got == nil || !got.Truncated {
 		t.Fatalf("expected truncated progress: %+v", got)
@@ -180,7 +180,7 @@ func TestBuildBoardJSON_LastResponseUsesBoundedPreview(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	raw := BuildBoardJSON(s, &config.Config{}, testModeSnap("immediate"), model.Event{}, SnapshotSources{})
+	raw := BuildBoardJSON(s, &config.Config{}, testModeSnap(), model.Event{}, SnapshotSources{})
 	preview := snapshotTaskByID(t, parseSnapshot(t, raw), task.ID).LastResponsePreview
 	if preview == nil || !preview.Truncated || utf8.RuneCountInString(preview.Text) > maxTaskLastResponseRunes {
 		t.Fatalf("expected bounded LastResponse preview: %+v", preview)
@@ -209,7 +209,7 @@ func TestBuildBoardJSON_LegacyVisibilityMatchesRequestTree(t *testing.T) {
 	completeSnapshotResultTask(t, s, grandchild, map[string]string{"worker": "grandchild result"})
 	unrelated := &model.Task{ID: "other-root", Description: "other", EventType: "__scheduler__"}
 	completeSnapshotResultTask(t, s, unrelated, map[string]string{"worker": "UNRELATED-SECRET"})
-	unrelatedBusy := &model.Task{ID: "other-busy-worker", Description: "other busy", PlanID: "other-root"}
+	unrelatedBusy := &model.Task{ID: "other-busy-worker", Description: "other busy"}
 	if err := s.PublishTask(unrelatedBusy); err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestBuildBoardJSON_LegacyVisibilityMatchesRequestTree(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	raw := BuildBoardJSON(s, &config.Config{}, testModeSnap("immediate"), model.Event{}, SnapshotSources{
+	raw := BuildBoardJSON(s, &config.Config{}, testModeSnap(), model.Event{}, SnapshotSources{
 		CurrentControllerTaskID: controller.ID,
 	})
 	snapshot := parseSnapshot(t, raw)

@@ -44,7 +44,7 @@ func dispatchWriteFile(registry *agent.ToolRegistry, path, content string) (stri
 func TestWrapFileWriteApproval_StrictBlocksWithoutService(t *testing.T) {
 	dir := t.TempDir()
 	registry := newWriteToolRegistry(t, dir)
-	deps := RunnerDeps{Modes: modes.NewStore(modes.GateImmediate, modes.ExecStrict, modes.TopoTeam)}
+	deps := RunnerDeps{Modes: modes.NewStore(modes.ExecStrict, modes.TopoTeam)}
 	wrapFileWriteApproval(registry, deps, "worker-1", nil)
 
 	target := filepath.Join(dir, "a.txt")
@@ -80,7 +80,7 @@ func TestWrapFileWriteApproval_StrictFullCycle(t *testing.T) {
 	registry := newWriteToolRegistry(t, dir)
 	service := interaction.NewService(nil)
 	deps := RunnerDeps{
-		Modes:        modes.NewStore(modes.GateImmediate, modes.ExecStrict, modes.TopoTeam),
+		Modes:        modes.NewStore(modes.ExecStrict, modes.TopoTeam),
 		Interactions: service,
 		SessionID:    func() string { return "session-test" },
 	}
@@ -142,7 +142,7 @@ func TestWrapFileWriteApproval_StrictFullCycle(t *testing.T) {
 // resolveToolGroups 必须把 Modes 透传给 ShellGroup（exec 轴短路依赖），
 // 否则 strict/yolo 对 runner 的 run_shell 不生效。
 func TestResolveToolGroups_WiresModesToShellGroup(t *testing.T) {
-	modeStore := modes.NewStore(modes.GateImmediate, modes.ExecYolo, modes.TopoTeam)
+	modeStore := modes.NewStore(modes.ExecYolo, modes.TopoTeam)
 	groups := resolveToolGroups("w-1", nil, RunnerDeps{Modes: modeStore}, &CurrentTaskHolder{},
 		agent.NewFinalizationHolder(), agent.NewSubmitState(),
 		agent.NewFileStateCache(1), &tools.DefaultWorkdir{}, nil)

@@ -2,10 +2,8 @@ package scheduler
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"agentgo/internal/agent"
@@ -14,12 +12,9 @@ import (
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
-	"agentgo/internal/plan"
 	"agentgo/internal/probe"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
-	"agentgo/internal/tools"
-	"agentgo/internal/trace"
 )
 
 // SchedulerExecutor 是包装 agent.NewLLMExecutor 的 TaskExecutor。
@@ -53,10 +48,6 @@ type SchedulerExecutor struct {
 	// nil 时退化为纯 timeout polling 模式（用于单测）。
 	BatchUpdateCh <-chan struct{}
 
-	// PlanCoordinator is the authoritative Plan-scoped signal source. When set,
-	// BatchUpdateCh is only a legacy fallback for unmanaged tasks.
-	PlanCoordinator *plan.Coordinator
-
 	// WaitTimeout 是 select 等待 batch 完成时的兜底超时。
 	// 防止 BatchUpdateCh 信号丢失导致永久阻塞。
 	// 0 时使用默认值 30 秒。
@@ -66,14 +57,9 @@ type SchedulerExecutor struct {
 	// 到达终态时的总超时。0 时使用默认值 5 分钟。
 	DownstreamWaitTimeout time.Duration
 
-	// Mode 是 scheduler 启动时的初始 gate 轴字符串（"immediate" / "plan"）。
-	// 留空时默认 "immediate"。
-	// 仅在 Modes == nil 时使用；Modes 非 nil 时每次 Execute 重新读 Modes。
-	Mode string
-
-	// Modes（可选）：scheduler.Bundle 共享的三轴模式 store。
-	// 非 nil 时优先于 Mode 字段；让 CLI 在运行期通过 /mode 命令切换 gate 轴后，
-	// 下一次 reactLoop 注入 board snapshot 时立即生效。exec / topo 轴也从这里读取。
+	// Modes（可选）：scheduler.Bundle 共享的两轴模式 store。
+	// 让 CLI 在运行期通过 /mode 命令切换 exec / topo 轴后，
+	// 下一次 reactLoop 注入 board snapshot 时立即生效。
 	Modes *modes.Store
 
 	// MBRegistry（可选）：scheduler agent 与所有 worker/explorer 共享的邮箱注册表。
@@ -131,39 +117,24 @@ func (e *SchedulerExecutor) Execute(
 	depResults map[string]string,
 	history []agent.HistoryEntry,
 ) (agent.ExecuteResult, error) {
-	if err := e.requireRunnablePlan(task); err != nil {
-		return agent.ExecuteResult{}, err
-	}
 	// 按 task 隔离状态：新任务开始时重置 progressReported
 	if e.lastTaskID != task.ID {
 		e.lastTaskID = task.ID
 		e.progressReported = false
 	}
 
-	// 1. 计划内任务按关键节点终态增量唤醒；兼容任务仍走旧 batch 等待。
-	planSignal, err := e.waitForPlanSignal(ctx, task)
-	if err != nil {
+	// 1. 等待 legacy batch：SchedulerBatch 中所有子任务到达终态
+	// （BatchUpdateCh 信号或 WaitTimeout 兜底时重新检查）。
+	if err := e.waitForBatchTerminal(ctx, task.ID); err != nil {
 		return agent.ExecuteResult{}, err
 	}
-	if planSignal != nil && len(planSignal.RequestIDs) > 1 {
-		boundedReasons, omitted, truncated := boundedPlanSignalValues(planSignal.Reasons)
-		if omitted > 0 || truncated {
-			boundedReasons = fmt.Sprintf("%s [omitted=%d truncated=%t]", boundedReasons, omitted, truncated)
-		}
-		trace.Emit(trace.Event{Kind: trace.KindReplanCoalesced, TaskID: task.ID,
-			Reason: boundedReasons, Plan: schedulerPlanTrace(e.PlanCoordinator, task.PlanID)})
-	}
 
-	// 2. 计划内工作完全由逐节点 PlanSignal 驱动；旧 downstream 全量等待
-	// 仅保留给未纳入 Plan 的兼容任务，避免一次关键终态被反向拖成整批等待。
-	planned := e.PlanCoordinator != nil && task.PlanID != ""
-	var downstream []string
-	if !planned {
-		downstream = e.detectDownstreamTasks(task.ID)
-	}
+	// 2. 兼容路径的 downstream 全量等待：reactor 触发的 verifier 等依赖
+	// SchedulerBatch 的任务，仅在已汇报过进度后才阻塞等待，避免拖慢首轮决策。
+	downstream := e.detectDownstreamTasks(task.ID)
 
 	// 3. 如果之前已汇报过进度且还有下游任务，阻塞等待下游完成
-	if !planned && e.progressReported && len(downstream) > 0 {
+	if e.progressReported && len(downstream) > 0 {
 		log.Printf("[scheduler-exec] 检测到 %d 个下游任务仍在运行，等待完成 (sched_task=%s)",
 			len(downstream), task.ID)
 		if err := e.waitForDownstreamTasks(ctx, downstream); err != nil {
@@ -178,24 +149,17 @@ func (e *SchedulerExecutor) Execute(
 	}
 
 	// 4. 注入 board snapshot 到 history 末尾
-	// 三轴快照：Modes == nil（单测直构）时 gate 回落 Mode 字段、exec/topo 取默认。
+	// 两轴快照：Modes == nil（单测直构）时 exec/topo 取默认。
 	modeSnap := modes.Snapshot{
-		Gate: e.Mode,
 		Exec: modes.ExecNormal.String(),
 		Topo: modes.TopoTeam.String(),
 	}
 	if e.Modes != nil {
 		modeSnap = e.Modes.Snapshot() // 运行期模式切换实时生效
 	}
-	if modeSnap.Gate == "" {
-		modeSnap.Gate = modes.GateImmediate.String()
-	}
 	// 构造一个简单的 trigger 事件——SchedulerExecutor 不知道具体触发原因，
 	// 用通用的 ticker_wakeup 类型，让 LLM 知道这是一次"重新观察板子"
 	trigger := model.Event{Type: model.EventTickerWakeup}
-	if planSignal != nil {
-		trigger = model.Event{Type: model.EventPlanSignal, Payload: planSignalTriggerPayload(task.PlanID, planSignal)}
-	}
 	// v4：worker 能力从默认队列（event_type="")的所有 kind 聚合而来。
 	// 取第一个匹配 kind 的工具列表作为代表——同 event_type 的多 kind 异构是 v4
 	// 的合法情形，但 board snapshot 的 WorkerCapabilities 只展示一份代表样本，
@@ -223,8 +187,10 @@ func (e *SchedulerExecutor) Execute(
 	}
 	if e.AgentRegistry != nil {
 		// Multiple static kinds may share the default queue. Publish-time routing
-		// can only rely on tools guaranteed across every possible claimant.
-		workerCaps, hasWorkerRoute = e.AgentRegistry.RouteCapabilitiesForPlan(task.PlanID, "")
+		// can only rely on tools guaranteed across every possible claimant. The
+		// owner scope is the current controller task itself: its dynamic Teams
+		// plus all global static routes are visible.
+		workerCaps, hasWorkerRoute = e.AgentRegistry.RouteCapabilitiesForPlan(task.ID, "")
 	}
 	var workerCapability *AgentCapabilityInfo
 	if hasWorkerRoute {
@@ -232,12 +198,6 @@ func (e *SchedulerExecutor) Execute(
 			Capabilities: workerCaps,
 			Description:  workerDesc,
 		}
-	}
-	var planView *model.Plan
-	var resumablePlans []model.Plan
-	if e.PlanCoordinator != nil && task.PlanID != "" {
-		planView, _ = e.PlanCoordinator.Store().GetPlan(task.PlanID)
-		resumablePlans, _ = e.PlanCoordinator.Store().ListPlans()
 	}
 	snapshot := BuildBoardJSON(e.Store, e.Cfg, modeSnap, trigger, SnapshotSources{
 		MBRegistry:                  e.MBRegistry,
@@ -250,8 +210,6 @@ func (e *SchedulerExecutor) Execute(
 		WorkerCapabilitiesByProfile: e.WorkerCapabilitiesByProfile,
 		ToolHealth:                  e.ToolHealth,
 		PendingDownstreamTasks:      e.buildPendingDownstreamInfo(downstream),
-		Plan:                        planView,
-		ResumablePlans:              resumablePlans,
 		CurrentControllerTaskID:     task.ID,
 	})
 
@@ -263,91 +221,16 @@ func (e *SchedulerExecutor) Execute(
 	})
 
 	// 5. 调底层 LLM Execute
-	// The signal wait and snapshot build above may have raced with a hard pause.
-	// Re-check at the actual LLM/tool boundary so a blocked Plan cannot leak one
-	// more Scheduler call.
-	if err := e.requireRunnablePlan(task); err != nil {
-		return agent.ExecuteResult{}, err
-	}
-	// A terminal Plan still needs one user-facing summary turn. Expose no tools
-	// in that turn so a controller can report the frozen outcome but cannot
-	// mutate files or start fresh work after finalization.
-	innerCtx := ctx
-	if e.PlanCoordinator != nil && task.PlanID != "" {
-		if latestPlan, getErr := e.PlanCoordinator.Store().GetPlan(task.PlanID); getErr == nil && model.IsPlanTerminal(latestPlan.Status) {
-			innerCtx = agent.WithNoTools(innerCtx)
-		}
-		innerCtx = agent.WithToolDispatchGuard(innerCtx, func(dispatchCtx context.Context, guardedTask *model.Task) error {
-			return e.requireToolDispatchPlan(dispatchCtx, guardedTask)
-		})
-	}
+	// ToolDispatchGuard 是 scheduler 侧收窄后的工具派发边界：任务 ctx 已取消
+	// 或任务在 store 中不再 processing 时拒绝任何工具派发，防止已死/已取消的
+	// controller 继续产生副作用。旧控制面的图运行态 / controller 活性 /
+	// 验收冻结检查已随其删除一并移除。
+	innerCtx := agent.WithToolDispatchGuard(ctx, func(dispatchCtx context.Context, guardedTask *model.Task) error {
+		return e.requireToolDispatch(dispatchCtx, guardedTask)
+	})
 	result, err := e.Inner(innerCtx, task, depResults, historyWithSnap)
-	if e.PlanCoordinator != nil && task.PlanID != "" {
-		tokens := int64(result.PromptTokens + result.CompletionTokens)
-		latest, latestErr := e.PlanCoordinator.Store().GetPlan(task.PlanID)
-		// A tool in this call may already have finalized or suspended the Plan.
-		// Do not let usage accounting overwrite that control-plane decision.
-		if tokens > 0 && latestErr == nil && latest.Status == model.PlanStatusRunning {
-			_, usageErr := e.PlanCoordinator.RecordUsage(context.Background(), task.PlanID, tokens, 0)
-			if usageErr != nil {
-				log.Printf("[scheduler-exec] record plan token usage task=%s: %v", task.ID, usageErr)
-			}
-		}
-		latest, latestErr = e.PlanCoordinator.Store().GetPlan(task.PlanID)
-		if latestErr == nil && (latest.Status == model.PlanStatusPausedAwaitingDecision || latest.Status == model.PlanStatusBlocked) {
-			trace.Emit(trace.Event{Kind: trace.KindPlanPaused, TaskID: task.ID, Reason: latest.PauseReason,
-				Plan: schedulerPlanTrace(e.PlanCoordinator, task.PlanID)})
-		}
-		if boundaryErr := e.requireRunnablePlan(task); boundaryErr != nil {
-			return result, boundaryErr
-		}
-	}
 	if err != nil {
 		return result, err
-	}
-
-	// A signal is acknowledged only after a successful Scheduler decision. Any
-	// newer request created during this LLM call remains pending by version.
-	if planSignal != nil && e.PlanCoordinator != nil {
-		decision := inferPlanDecision(result)
-		authorityCtx := plan.WithControllerAuthority(ctx, task.ID)
-		if ackErr := e.PlanCoordinator.AcknowledgeDecision(authorityCtx, task.PlanID,
-			planSignal.LatestExecutionStateVersion, decision, "scheduler executor decision"); ackErr != nil {
-			return result, fmt.Errorf("acknowledge plan signal: %w", ackErr)
-		}
-		trace.Emit(trace.Event{Kind: trace.KindReplanDecided, TaskID: task.ID,
-			Reason: string(decision), Plan: schedulerPlanTrace(e.PlanCoordinator, task.PlanID)})
-	}
-
-	// A planned DAG, or direct execution performed by its controller, may only
-	// produce a natural final response after formal finalization. Read-only
-	// questions and conversation remain compatible while an untouched Plan is
-	// still empty. Exception: topo=solo with a nodeless Plan skips formal
-	// finalization (no verifier route exists) — see tools.SoloSkipsFormalFinalization.
-	if !result.ToolCalled && !result.Finalized && e.PlanCoordinator != nil && task.PlanID != "" {
-		if p, getErr := e.PlanCoordinator.Store().GetPlan(task.PlanID); getErr == nil && !model.IsPlanTerminal(p.Status) {
-			needsFormal := planNeedsFormalFinalization(e.Store, task, p)
-			if needsFormal && tools.SoloSkipsFormalFinalization(e.Modes, p) {
-				// solo 下 controller 亲自执行的写操作没有 verifier route 可走正式验收，
-				// 且 Plan 无 implementation 节点——放宽为无验收收尾。留审计日志，不静默。
-				log.Printf("[scheduler-exec] solo 编排模式：Plan %s 无 implementation 节点，controller 亲自执行的写操作跳过正式验收，按无验收运行收尾 (task=%s)", p.ID, task.ID)
-				needsFormal = false
-			}
-			if needsFormal {
-				result.ToolCalled = true
-				result.AssistantContent = "计划尚未形成正式终态；必须继续等待、调整 DAG、启动验收或 finalize_plan。"
-				result.Output = result.AssistantContent
-			} else if _, completeErr := e.PlanCoordinator.CompleteWithoutExecution(
-				plan.WithControllerAuthority(ctx, task.ID), p.ID); completeErr != nil {
-				if errors.Is(completeErr, plan.ErrPlanPendingRequests) {
-					result.ToolCalled = true
-					result.AssistantContent = "检测到尚未处理的 PlanSignal；必须先读取最新事实再决定是否结束。"
-					result.Output = result.AssistantContent
-				} else {
-					return result, fmt.Errorf("complete read-only plan: %w", completeErr)
-				}
-			}
-		}
 	}
 
 	// 6. 检查本轮是否调用了 report_progress，记录状态供下次迭代使用
@@ -359,290 +242,30 @@ func (e *SchedulerExecutor) Execute(
 	return result, nil
 }
 
-const (
-	maxPlanSignalTriggerItems     = 16
-	maxPlanSignalTriggerItemRunes = 128
-)
-
-func planSignalTriggerPayload(planID string, signal *model.PlanSignal) map[string]string {
-	payload := map[string]string{"plan_id": planID}
-	if signal == nil {
-		return payload
-	}
-	reasons, reasonsOmitted, reasonsTruncated := boundedPlanSignalValues(signal.Reasons)
-	sources, sourcesOmitted, sourcesTruncated := boundedPlanSignalValues(signal.SourceTaskIDs)
-	payload["reasons"] = reasons
-	payload["source_task_ids"] = sources
-	payload["urgency"] = string(signal.Urgency)
-	payload["execution_state_version"] = fmt.Sprintf("%d", signal.LatestExecutionStateVersion)
-	payload["reason_count"] = fmt.Sprintf("%d", len(signal.Reasons))
-	payload["source_task_id_count"] = fmt.Sprintf("%d", len(signal.SourceTaskIDs))
-	if reasonsOmitted > 0 {
-		payload["reasons_omitted"] = fmt.Sprintf("%d", reasonsOmitted)
-	}
-	if sourcesOmitted > 0 {
-		payload["source_task_ids_omitted"] = fmt.Sprintf("%d", sourcesOmitted)
-	}
-	if reasonsTruncated || sourcesTruncated {
-		payload["values_truncated"] = "true"
-	}
-	return payload
-}
-
-func boundedPlanSignalValues(values []string) (summary string, omitted int, truncated bool) {
-	limit := len(values)
-	if limit > maxPlanSignalTriggerItems {
-		limit = maxPlanSignalTriggerItems
-		omitted = len(values) - limit
-	}
-	bounded := make([]string, 0, limit)
-	for _, value := range values[:limit] {
-		runes := []rune(value)
-		if len(runes) > maxPlanSignalTriggerItemRunes {
-			value = string(runes[:maxPlanSignalTriggerItemRunes]) + "…"
-			truncated = true
-		}
-		bounded = append(bounded, value)
-	}
-	return strings.Join(bounded, ","), omitted, truncated
-}
-
-func (e *SchedulerExecutor) requireRunnablePlan(task *model.Task) error {
-	if e.PlanCoordinator == nil || task == nil || task.PlanID == "" {
-		return nil
-	}
-	p, budgetErr := e.PlanCoordinator.CheckBudget(context.Background(), task.PlanID)
-	if budgetErr != nil && p == nil {
-		return budgetErr
-	}
-	if p == nil {
-		return fmt.Errorf("plan %s budget check returned no plan", task.PlanID)
-	}
-	if task.NodeRole == model.PlanNodeRoleController && p.ActiveDecisionTaskID != task.ID {
-		return fmt.Errorf("%w: controller task %s is not active for plan %s", agent.ErrExecutionSuspended, task.ID, p.ID)
-	}
-	if model.IsPlanTerminal(p.Status) && task.NodeRole == model.PlanNodeRoleController {
-		return nil
-	}
-	if p.Status != model.PlanStatusRunning {
-		if budgetErr != nil {
-			return fmt.Errorf("%w: plan %s is %s: %v", agent.ErrExecutionSuspended, p.ID, p.Status, budgetErr)
-		}
-		return fmt.Errorf("%w: plan %s is %s", agent.ErrExecutionSuspended, p.ID, p.Status)
-	}
-	if budgetErr != nil {
-		return budgetErr
-	}
-	return nil
-}
-
-// requireToolDispatchPlan is stricter than requireRunnablePlan: terminal
-// controllers may receive one no-tools summary turn, but no tool may dispatch
-// after the Plan leaves running or after controller authority changes.
-func (e *SchedulerExecutor) requireToolDispatchPlan(ctx context.Context, task *model.Task) error {
+// requireToolDispatch 是 ToolDispatchGuard 收窄后的判定：只校验任务 ctx 仍然
+// 存活、且任务在 store 中仍处于 processing。
+// 注：Plan 时代这些错误包装 agent.ErrExecutionSuspended；该哨兵已随控制面
+// 一并删除（internal/agent 不再特判它），此处退回普通错误。
+func (e *SchedulerExecutor) requireToolDispatch(ctx context.Context, task *model.Task) error {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("%w: controller context is no longer active: %v", agent.ErrExecutionSuspended, err)
+			return fmt.Errorf("controller context is no longer active: %v", err)
 		}
 	}
-	if e.PlanCoordinator == nil || task == nil || task.PlanID == "" {
+	if task == nil {
 		return nil
 	}
 	if e.Store == nil {
-		return fmt.Errorf("%w: task store is unavailable for planned controller %s", agent.ErrExecutionSuspended, task.ID)
+		return fmt.Errorf("task store is unavailable for controller %s", task.ID)
 	}
 	latest, err := e.Store.GetTask(task.ID)
 	if err != nil {
-		return fmt.Errorf("%w: reload planned controller %s: %v", agent.ErrExecutionSuspended, task.ID, err)
-	}
-	if latest.PlanID != task.PlanID {
-		return fmt.Errorf("%w: controller %s plan identity changed from %s to %s",
-			agent.ErrExecutionSuspended, task.ID, task.PlanID, latest.PlanID)
+		return fmt.Errorf("reload controller %s: %v", task.ID, err)
 	}
 	if latest.Status != model.TaskStatusProcessing {
-		return fmt.Errorf("%w: controller task %s is %s, not processing", agent.ErrExecutionSuspended, latest.ID, latest.Status)
+		return fmt.Errorf("controller task %s is %s, not processing", latest.ID, latest.Status)
 	}
-	if latest.NodeRole != model.PlanNodeRoleController || latest.EventType != "__scheduler__" {
-		return fmt.Errorf("%w: task %s is not a durable Scheduler controller", agent.ErrExecutionSuspended, latest.ID)
-	}
-	p, budgetErr := e.PlanCoordinator.CheckBudget(context.Background(), task.PlanID)
-	if budgetErr != nil && p == nil {
-		return budgetErr
-	}
-	if p == nil {
-		return fmt.Errorf("plan %s budget check returned no plan", task.PlanID)
-	}
-	if p.Status != model.PlanStatusRunning {
-		return fmt.Errorf("%w: plan %s is %s", agent.ErrExecutionSuspended, p.ID, p.Status)
-	}
-	if p.ActiveDecisionTaskID != latest.ID {
-		return fmt.Errorf("%w: controller task %s is not active for plan %s", agent.ErrExecutionSuspended, latest.ID, p.ID)
-	}
-	if isControllerWorkspaceMutation(agent.ToolNameFromContext(ctx)) {
-		if runID, frozen := currentAcceptanceFreeze(p); frozen {
-			return fmt.Errorf("%w: workspace mutation is frozen by current acceptance run %s; mutate the DAG or AcceptanceSpec first, then run formal acceptance again",
-				agent.ErrExecutionSuspended, runID)
-		}
-	}
-	return budgetErr
-}
-
-func isControllerWorkspaceMutation(toolName string) bool {
-	switch toolName {
-	case "write_file", "edit_file", "run_shell":
-		return true
-	default:
-		return false
-	}
-}
-
-func currentAcceptanceFreeze(p *model.Plan) (string, bool) {
-	if p == nil {
-		return "", false
-	}
-	for _, run := range p.AcceptanceRuns {
-		if run.TargetPlanRevision != p.CurrentRevision || run.TargetGraphDigest != p.CurrentGraphDigest ||
-			run.SpecID != p.CurrentAcceptanceSpecID || run.SpecRevision != p.CurrentAcceptanceSpecRevision {
-			continue
-		}
-		if run.Status == "pending" || run.Status == "running" {
-			return run.ID, true
-		}
-		if run.ResultID == "" {
-			continue
-		}
-		result, ok := p.AcceptanceResults[run.ResultID]
-		if ok && result.Status == model.AcceptanceResultValid && result.Verdict == model.AcceptanceVerdictPass {
-			return run.ID, true
-		}
-	}
-	return "", false
-}
-
-func planNeedsFormalFinalization(s store.TaskStore, task *model.Task, p *model.Plan) bool {
-	if p != nil && len(p.CurrentNodeIDs) > 0 {
-		return true
-	}
-	if s == nil || task == nil {
-		return false
-	}
-	latest, err := s.GetTask(task.ID)
-	if err == nil && len(latest.Artifacts) > 0 {
-		return true
-	}
-	// These controller-side tools cross the read-only investigation boundary.
-	// A successful call must be represented by Task-backed DAG work and pass a
-	// formal acceptance run before the user request can be completed.
-	for _, toolName := range []string{"write_file", "edit_file", "run_shell"} {
-		records, queryErr := s.QueryToolCalls(task.ID, toolName)
-		if queryErr != nil {
-			continue
-		}
-		for _, record := range records {
-			if record.Success {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func schedulerPlanTrace(coordinator *plan.Coordinator, planID string) *trace.PlanTraceContext {
-	if coordinator == nil || planID == "" {
-		return nil
-	}
-	p, err := coordinator.Store().GetPlan(planID)
-	if err != nil {
-		return &trace.PlanTraceContext{PlanID: planID}
-	}
-	return &trace.PlanTraceContext{
-		PlanID: p.ID, PlanRevision: p.CurrentRevision, ExecutionStateVersion: p.ExecutionStateVersion,
-		AcceptanceSpecRevision: p.CurrentAcceptanceSpecRevision, GraphDigest: p.CurrentGraphDigest,
-	}
-}
-
-func (e *SchedulerExecutor) waitForPlanSignal(ctx context.Context, task *model.Task) (*model.PlanSignal, error) {
-	if e.PlanCoordinator == nil || task == nil || task.PlanID == "" {
-		return nil, e.waitForBatchTerminal(ctx, task.ID)
-	}
-	// A terminal Plan gets one frozen, no-tools summary turn. It must not wait
-	// for unfinished nodes or fresh signals: no further Plan decision is legal.
-	if current, err := e.PlanCoordinator.Store().GetPlan(task.PlanID); err != nil {
-		return nil, err
-	} else if model.IsPlanTerminal(current.Status) {
-		return nil, nil
-	}
-	// Deliver an already-persisted request first, including requests recovered
-	// after restart. No channel notification is required for this path.
-	if signal, ok, err := e.PlanCoordinator.TrySignal(task.PlanID); err != nil || ok {
-		if err != nil {
-			return nil, err
-		}
-		return &signal, nil
-	}
-
-	currentPlan, err := e.PlanCoordinator.Store().GetPlan(task.PlanID)
-	if err != nil || !planHasNonTerminalNodes(e.Store, currentPlan) {
-		return nil, nil
-	}
-
-	timeout := e.WaitTimeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-	for {
-		waitCtx, cancel := context.WithTimeout(ctx, timeout)
-		signal, waitErr := e.PlanCoordinator.NextSignal(waitCtx, task.PlanID)
-		cancel()
-		if waitErr == nil {
-			return &signal, nil
-		}
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		if waitErr != context.DeadlineExceeded {
-			return nil, waitErr
-		}
-		// Wall-time budgets advance even when no Task emits a mutation. The
-		// timeout is therefore a budget heartbeat, not only a lost-signal poll.
-		if budgetErr := e.requireRunnablePlan(task); budgetErr != nil {
-			return nil, budgetErr
-		}
-		latest, getErr := e.PlanCoordinator.Store().GetPlan(task.PlanID)
-		if getErr != nil || !planHasNonTerminalNodes(e.Store, latest) {
-			return nil, nil
-		}
-	}
-}
-
-func planHasNonTerminalNodes(s store.TaskStore, p *model.Plan) bool {
-	if p == nil {
-		return false
-	}
-	for _, id := range p.CurrentNodeIDs {
-		task, err := s.GetTask(id)
-		if err == nil && task != nil && !model.IsTerminal(task.Status) {
-			return true
-		}
-	}
-	return false
-}
-
-func inferPlanDecision(result agent.ExecuteResult) model.PlanDecision {
-	decision := model.PlanDecisionContinueWaiting
-	for _, call := range result.ToolCalls {
-		switch call.Name {
-		case "publish_task", "cancel_task", "supersede_tasks":
-			decision = model.PlanDecisionApplyPatch
-		case "ensure_acceptance_run", "define_acceptance_spec":
-			decision = model.PlanDecisionStartAcceptance
-		case "finalize_plan", "report_done":
-			decision = model.PlanDecisionFinalize
-		case "mark_plan_blocked":
-			decision = model.PlanDecisionMarkBlocked
-		}
-	}
-	return decision
+	return nil
 }
 
 // waitForBatchTerminal 阻塞直到当前 scheduler task 的 SchedulerBatch 中所有

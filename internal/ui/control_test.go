@@ -9,7 +9,6 @@ import (
 
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
-	"agentgo/internal/scheduler"
 )
 
 func TestController_SendUserTextOrderAndEvent(t *testing.T) {
@@ -132,21 +131,6 @@ func TestController_SteerAgentNotAssembled(t *testing.T) {
 	}
 }
 
-func TestController_SetModeMapping(t *testing.T) {
-	var modes []scheduler.Mode
-	h := NewHub(Deps{
-		ModeSet: func(m scheduler.Mode) { modes = append(modes, m) },
-	})
-	h.SetMode(true)
-	h.SetMode(false)
-	if len(modes) != 2 || modes[0] != scheduler.ModePlan || modes[1] != scheduler.ModeImmediate {
-		t.Fatalf("modes = %v，期望 [ModePlan ModeImmediate]", modes)
-	}
-
-	// 未装配时静默忽略，不得 panic
-	NewHub(Deps{}).SetMode(true)
-}
-
 func TestController_SetExecMode(t *testing.T) {
 	var got []string
 	h := NewHub(Deps{
@@ -200,21 +184,20 @@ func TestController_SetTopoMode(t *testing.T) {
 	}
 }
 
-func TestSnapshot_ThreeModeAxes(t *testing.T) {
+func TestSnapshot_TwoModeAxes(t *testing.T) {
 	h := NewHub(Deps{
-		ModeGet:     func() string { return "plan" },
 		ExecModeGet: func() string { return "readonly" },
 		TopoModeGet: func() string { return "solo" },
 	})
 	h.refreshSnapshot()
 	snap := h.Snapshot()
-	if snap.Mode != "plan" || snap.ExecMode != "readonly" || snap.TopoMode != "solo" {
-		t.Fatalf("快照三轴 = (%q, %q, %q)，期望 (plan, readonly, solo)",
-			snap.Mode, snap.ExecMode, snap.TopoMode)
+	if snap.ExecMode != "readonly" || snap.TopoMode != "solo" {
+		t.Fatalf("快照两轴 = (%q, %q)，期望 (readonly, solo)",
+			snap.ExecMode, snap.TopoMode)
 	}
 
-	// Getter 未装配时对应字段保持零值（与 ModeGet 既有语义一致）。
-	h = NewHub(Deps{ModeGet: func() string { return "immediate" }})
+	// Getter 未装配时对应字段保持零值。
+	h = NewHub(Deps{})
 	h.refreshSnapshot()
 	snap = h.Snapshot()
 	if snap.ExecMode != "" || snap.TopoMode != "" {

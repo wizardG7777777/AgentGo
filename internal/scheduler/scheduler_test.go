@@ -43,6 +43,43 @@ func TestSchedulerSystemPromptUsesRegisteredLocalReadToolNames(t *testing.T) {
 	}
 }
 
+func TestSchedulerSystemPrompt_ModeContractUsesOnlyCurrentAxes(t *testing.T) {
+	for _, phrase := range []string{
+		`exec_mode`,
+		`topo_mode`,
+		`两轴正交`,
+		`Graph 中显式使用 approval 节点`,
+	} {
+		if !strings.Contains(schedulerSystemPrompt, phrase) {
+			t.Errorf("schedulerSystemPrompt 缺少当前模式契约 %q", phrase)
+		}
+	}
+	for _, stale := range []string{
+		`- mode：`,
+		`mode / exec_mode / topo_mode`,
+		`三轴`,
+		`规划门控轴`,
+		`Immediate 模式`,
+	} {
+		if strings.Contains(schedulerSystemPrompt, stale) {
+			t.Errorf("schedulerSystemPrompt 仍包含过期模式契约 %q", stale)
+		}
+	}
+}
+
+func TestSchedulerSystemPrompt_ReadGraphBeforePatch(t *testing.T) {
+	for _, phrase := range []string{
+		`submit_graph / read_graph / patch_graph`,
+		`read_graph：按 graph_id 读取权威 GraphDocument 与当前 revision`,
+		`修改前必须调用 read_graph`,
+		`冲突时再次调用 read_graph`,
+	} {
+		if !strings.Contains(schedulerSystemPrompt, phrase) {
+			t.Errorf("schedulerSystemPrompt 缺少 read_graph CAS 指引 %q", phrase)
+		}
+	}
+}
+
 func TestSchedulerSystemPrompt_TaskResultRefsAreReadOnDemand(t *testing.T) {
 	required := []string{
 		"result_refs",
@@ -78,8 +115,8 @@ func TestSchedulerSystemPrompt_CapabilitiesRoutingGuidance(t *testing.T) {
 	if !strings.Contains(prompt, "capabilities 当前列出真实工具名") || !strings.Contains(prompt, "run_shell") {
 		t.Error("schedulerSystemPrompt should route against actual registered tool names")
 	}
-	if !strings.Contains(prompt, "同时包含 submit_acceptance_result 和所需检查工具") {
-		t.Error("schedulerSystemPrompt should preserve the formal acceptance runner capability boundary")
+	if !strings.Contains(prompt, "同时包含 submit_task_result") {
+		t.Error("schedulerSystemPrompt should preserve the acceptance-node verdict submission capability boundary")
 	}
 
 	// R9.3: guidance to avoid routing to agents lacking required capabilities

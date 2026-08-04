@@ -14,11 +14,10 @@ const (
 
 // Limits bounds one provisioned agent and the number of homogeneous replicas
 // that may be requested from the template.
+// V6 起不含循环上限与上下文硬限（两者均已删除，见 docs/nextUpgrade-V6.md §5/§7.4）。
 type Limits struct {
-	AgentMaxLoops                int `yaml:"agent_max_loops" json:"agent_max_loops"`
 	TaskMaxRetries               int `yaml:"task_max_retries" json:"task_max_retries"`
 	EnforceCompactTokenThreshold int `yaml:"enforce_compact_token_threshold" json:"enforce_compact_token_threshold"`
-	ContextLimit                 int `yaml:"context_limit" json:"context_limit"`
 	MaxReplicas                  int `yaml:"max_replicas" json:"max_replicas"`
 }
 
@@ -27,7 +26,7 @@ type Limits struct {
 // derived by the loader and cannot be supplied by external YAML.
 //
 // Limits is embedded so runtime code can use either t.Limits or the convenient
-// t.AgentMaxLoops style without duplicating values.
+// t.TaskMaxRetries style without duplicating values.
 type Template struct {
 	Ref          string   `json:"ref"`
 	Namespace    string   `json:"namespace"`
@@ -60,10 +59,9 @@ type Summary struct {
 }
 
 // ProvisionRequest asks the runtime to create or reuse one homogeneous team.
-// The controller identity is carried explicitly so the implementation can
-// enforce current-plan authority before mutating runtime state.
+// ControllerTaskID 即 Team 的归属（owner）：发起 provision 的 Scheduler
+// controller 任务 ID，Team 的生命周期挂在该任务的终态上。
 type ProvisionRequest struct {
-	PlanID           string
 	ControllerTaskID string
 	TemplateRef      string
 	Purpose          string

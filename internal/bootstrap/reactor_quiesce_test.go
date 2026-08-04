@@ -25,10 +25,12 @@ type ctxBlockReactor struct {
 	ctxErr   atomic.Value
 }
 
-func (r *ctxBlockReactor) Name() string                 { return "e4-shutdown-probe" }
-func (r *ctxBlockReactor) Priority() int                { return 500 }
-func (r *ctxBlockReactor) IsSync() bool                 { return false }
-func (r *ctxBlockReactor) Subscribe() []trace.EventKind { return []trace.EventKind{trace.KindLLMCallStart} }
+func (r *ctxBlockReactor) Name() string  { return "e4-shutdown-probe" }
+func (r *ctxBlockReactor) Priority() int { return 500 }
+func (r *ctxBlockReactor) IsSync() bool  { return false }
+func (r *ctxBlockReactor) Subscribe() []trace.EventKind {
+	return []trace.EventKind{trace.KindLLMCallStart}
+}
 
 // Run 走到这里说明 registry 的 ctx 接线断了（应走 RunWithContext）。
 func (r *ctxBlockReactor) Run(trace.Event) error {

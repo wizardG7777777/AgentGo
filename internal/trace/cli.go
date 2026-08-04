@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -18,10 +21,12 @@ import (
 // 延迟阈值：相邻事件间隔超过此值时在 show 输出中标记 WARNING。
 const slowGapThreshold = 30 * time.Second
 
-// CLI 实现 `agentgo trace list/show/plan` 子命令的入口。
+// CLI 实现 `agentgo trace list/show/stats/graph/node` 子命令的入口。
 // args 是 trace 子命令后的剩余参数。dir 是 trace 文件目录。
-// 输出写入 out（通常是 os.Stdout）。
-func CLI(args []string, dir string, out io.Writer) error {
+// graphStateDir 是 GraphStore 持久化根目录（<project_root>/.agentgo/state/graphs），
+// 供 graph/node 子命令读取 snapshot 头部；传空串跳过 snapshot（头部字段由
+// 事件重建）。输出写入 out（通常是 os.Stdout）。
+func CLI(args []string, dir, graphStateDir string, out io.Writer) error {
 	if len(args) == 0 {
 		return printUsage(out)
 	}
@@ -33,20 +38,25 @@ func CLI(args []string, dir string, out io.Writer) error {
 			return fmt.Errorf("usage: agentgo trace show <task_id>")
 		}
 		return cmdShow(dir, args[1], out)
-	case "plan":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: agentgo trace plan <plan_id>")
-		}
-		return cmdPlan(dir, args[1], out)
 	case "stats":
 		groupBy := "task"
 		if len(args) >= 2 {
 			groupBy = args[1]
 		}
-		if groupBy != "task" && groupBy != "agent" && groupBy != "plan" {
-			return fmt.Errorf("usage: agentgo trace stats [task|agent|plan]")
+		if groupBy != "task" && groupBy != "agent" {
+			return fmt.Errorf("usage: agentgo trace stats [task|agent]")
 		}
 		return cmdStats(dir, groupBy, out)
+	case "graph":
+		if len(args) < 2 {
+			return cmdGraphList(dir, graphStateDir, out)
+		}
+		return cmdGraph(dir, graphStateDir, args[1], out)
+	case "node":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: agentgo trace node <graph_id>/<node_id>")
+		}
+		return cmdGraphNode(dir, graphStateDir, args[1], out)
 	case "help", "-h", "--help":
 		return printUsage(out)
 	default:
@@ -61,17 +71,23 @@ subcommands:
   list                  列出最近的任务（按发布时间倒序）
   show <task_id>        按时间顺序展示某个任务的全部事件
                         task_id 可以是完整 UUID 或任意唯一前缀
-  plan <plan_id>        聚合展示一个动态 DAG Plan 的跨任务事件时间线
-                        plan_id 可以是完整 UUID 或唯一前缀
-  stats [task|agent|plan]  聚合当前 trace 目录内全部任务的 LLM 调用与
+  stats [task|agent]    聚合当前 trace 目录内全部任务的 LLM 调用与
                         token 消耗（默认按 task 分组，按总 token 降序）
+  graph [graph_id]      无参：列出全部已知图（trace 事件 ∪ state 目录）
+                        带参：按时间顺序展示该图的全部生命周期事件
+                        graph_id 可以是完整 ID 或任意唯一前缀
+  node <graph_id>/<node_id>
+                        只展示单个节点的事件，按 activation 分组
+                        （回边重进 = 新 activation，一目了然）
 
 示例:
   agentgo trace list
   agentgo trace show 321b561d
   agentgo trace show 321b561d-c564-422c-bfa0-b96f54edcb87
-  agentgo trace plan 321b561d
   agentgo trace stats agent
+  agentgo trace graph
+  agentgo trace graph deploy-pipeline
+  agentgo trace node deploy-pipeline/implement
 
 实时查看最新任务的事件流（用 tail -f 即可）:
   tail -f .agentgo/sessions/sess-<id>/logs/<时间戳>_<task_id前8位>.jsonl | jq
@@ -416,6 +432,15 @@ func assignUniqueSyntheticIDs(groups []*taskTrace) {
 	}
 }
 
+// printDegradedHint 在检测到 trace_degraded.marker 时向 out 打印一行降级
+// 提示（V6 §7.1）；无 marker 时 no-op。
+func printDegradedHint(dir string, out io.Writer) {
+	if m := ReadDegradedMarker(dir); m != nil {
+		fmt.Fprintf(out, "trace_degraded: 首次失败 %s，连续失败 %d 次（%s）——期间事件可能不完整\n\n",
+			m.FirstFailureTime, m.Count, m.Error)
+	}
+}
+
 // cmdList 实现 agentgo trace list。
 func cmdList(dir string, out io.Writer) error {
 	files, err := listTaskFiles(dir)
@@ -429,16 +454,19 @@ func cmdList(dir string, out io.Writer) error {
 
 	groups := groupTraceFiles(loadTraceFiles(files))
 
+	// V6 §7.1：检测到降级标记时在表头前提示——marker 存在即当前处于降级态
+	//（Writer 写恢复后会清除），期间事件可能不完整
+	printDegradedHint(dir, out)
+
 	// 表头
-	fmt.Fprintln(out, "┌───────────────┬──────────┬─────────────────────┬──────────┬────────────┬───────┬───────────┬────────┬─────────────┐")
-	fmt.Fprintln(out, "│ Task          │ Plan     │ Published           │ Agent    │ Status     │ Loops │ Files Out │ Errors │ Duration    │")
-	fmt.Fprintln(out, "├───────────────┼──────────┼─────────────────────┼──────────┼────────────┼───────┼───────────┼────────┼─────────────┤")
+	fmt.Fprintln(out, "┌───────────────┬─────────────────────┬──────────┬────────────┬───────┬───────────┬────────┬─────────────┐")
+	fmt.Fprintln(out, "│ Task          │ Published           │ Agent    │ Status     │ Loops │ Files Out │ Errors │ Duration    │")
+	fmt.Fprintln(out, "├───────────────┼─────────────────────┼──────────┼────────────┼───────┼───────────┼────────┼─────────────┤")
 
 	for _, group := range groups {
 		row := summarizeTask(group)
-		fmt.Fprintf(out, "│ %-13s │ %-8s │ %-19s │ %-8s │ %-10s │ %5d │ %9d │ %6d │ %-11s │\n",
+		fmt.Fprintf(out, "│ %-13s │ %-19s │ %-8s │ %-10s │ %5d │ %9d │ %6d │ %-11s │\n",
 			row.taskShortID,
-			shortIdentifier(row.planID),
 			row.publishedAt.Local().Format("2006-01-02 15:04:05"),
 			fitColumn(row.agentID, 8),
 			row.status,
@@ -448,7 +476,7 @@ func cmdList(dir string, out io.Writer) error {
 			formatDuration(row.duration),
 		)
 	}
-	fmt.Fprintln(out, "└───────────────┴──────────┴─────────────────────┴──────────┴────────────┴───────┴───────────┴────────┴─────────────┘")
+	fmt.Fprintln(out, "└───────────────┴─────────────────────┴──────────┴────────────┴───────┴───────────┴────────┴─────────────┘")
 	fmt.Fprintf(out, "\n共 %d 个任务，trace 目录: %s\n", len(groups), dir)
 	return nil
 }
@@ -456,7 +484,6 @@ func cmdList(dir string, out io.Writer) error {
 // taskSummary 是 list 命令一行的汇总信息。
 type taskSummary struct {
 	taskShortID  string
-	planID       string
 	publishedAt  time.Time
 	agentID      string
 	status       string // 对齐 model.TaskStatus：pending / processing / pending(retry) / completed / failed / cancelled；诊断值：malformed / unknown / read_err
@@ -496,9 +523,6 @@ func summarizeTask(group *taskTrace) taskSummary {
 		}
 		if ev.AgentID != "" {
 			fallbackAgentID = ev.AgentID
-		}
-		if ev.Plan != nil && ev.Plan.PlanID != "" {
-			row.planID = ev.Plan.PlanID
 		}
 		if !ev.Timestamp.IsZero() {
 			if firstTS.IsZero() || ev.Timestamp.Before(firstTS) {
@@ -591,8 +615,7 @@ func isTerminalSummaryStatus(status string) bool {
 }
 
 // statsAgg 是 stats 命令一个聚合桶的累计数据。token 取自 llm_call_end 事件
-// （每次 LLM 调用一条，载本轮消耗）；token_stats 事件是 per-agent 累计值，
-// 若同时纳入会重复计数，因此不读。
+// （每次 LLM 调用一条，载本轮消耗），是唯一的 token 账本。
 // wasted 口径：终态为 cancelled / failed 的任务，其全部 LLM token 计为浪费
 // （产出未被下游使用）。completed 任务中间 retry 的消耗无法精确切分，
 // 经 retries 计数单列，不混入 wasted。
@@ -634,19 +657,18 @@ func (s *readFileStat) reReads() int {
 }
 
 // taskStat 是一个任务（含 retry 分片合并后）的 token 统计，是 stats 的
-// 最小聚合单位；agent / plan 视图由它二次聚合，异常检测也基于它。
+// 最小聚合单位；agent 视图由它二次聚合，异常检测也基于它。
 type taskStat struct {
 	id     string
 	agent  string
 	status string
-	planID string
 	calls  int
 	agg    statsAgg
 	// reads 统计同任务内 read_file 按 path 的调用结构，供重读率异常检测。
 	reads map[string]*readFileStat
 }
 
-// cmdStats 实现 agentgo trace stats [task|agent|plan]。
+// cmdStats 实现 agentgo trace stats [task|agent]。
 // 回答"这个 session 的 token 都烧在哪"：把目录内全部任务（含 retry 分片，
 // 由 groupTraceFiles 按完整 TaskID 合并）的 llm_call_end 事件按维度聚合。
 func cmdStats(dir, groupBy string, out io.Writer) error {
@@ -660,7 +682,7 @@ func cmdStats(dir, groupBy string, out io.Writer) error {
 	taskStats := make([]*taskStat, 0, len(groups))
 	for _, g := range groups {
 		summary := summarizeTask(g)
-		ts := &taskStat{id: g.displayID(), agent: summary.agentID, status: summary.status, planID: summary.planID, reads: make(map[string]*readFileStat)}
+		ts := &taskStat{id: g.displayID(), agent: summary.agentID, status: summary.status, reads: make(map[string]*readFileStat)}
 		for _, record := range g.records {
 			switch record.event.Kind {
 			case KindLLMCallEnd:
@@ -713,11 +735,6 @@ func cmdStats(dir, groupBy string, out io.Writer) error {
 			key = ts.agent
 			if key == "" {
 				key = "(unknown)"
-			}
-		case "plan":
-			key = ts.planID
-			if key == "" {
-				key = "(no-plan)"
 			}
 		default: // task
 			key = ts.id
@@ -785,19 +802,6 @@ func cmdStats(dir, groupBy string, out io.Writer) error {
 		for _, row := range rows {
 			fmt.Fprintf(out, "%-16s %-7d %-7d %-8d %-10s %-11s %-10s %-10s\n",
 				fitColumn(row.key, 16), len(row.agg.tasks), row.agg.calls, row.agg.retries,
-				formatTokenCount(row.agg.prompt), formatTokenCount(row.agg.completion),
-				formatTokenCount(row.agg.total()), formatTokenCount(row.agg.wasted))
-		}
-	case "plan":
-		fmt.Fprintln(out, "\n按 plan 聚合（合计 token 降序）:")
-		fmt.Fprintln(out, "PLAN      TASKS   CALLS   RETRIES  PROMPT     COMPLETION  TOTAL      WASTED")
-		for _, row := range rows {
-			label := row.key
-			if label != "(no-plan)" {
-				label = shortIdentifier(label)
-			}
-			fmt.Fprintf(out, "%-9s %-7d %-7d %-8d %-10s %-11s %-10s %-10s\n",
-				fitColumn(label, 9), len(row.agg.tasks), row.agg.calls, row.agg.retries,
 				formatTokenCount(row.agg.prompt), formatTokenCount(row.agg.completion),
 				formatTokenCount(row.agg.total()), formatTokenCount(row.agg.wasted))
 		}
@@ -908,12 +912,10 @@ func cmdShow(dir, taskIDQuery string, out io.Writer) error {
 	fmt.Fprintf(out, " Task: %s\n", group.displayID())
 	fmt.Fprintf(out, " Trace Files: %d\n", len(group.files))
 	fmt.Fprintf(out, " Events: %d\n", len(events))
-	if planCtx := latestPlanContext(events, ""); planCtx != nil {
-		fmt.Fprintf(out, " Plan: %s  revision=%d  state_version=%d  acceptance_revision=%d\n",
-			planCtx.PlanID, planCtx.PlanRevision, planCtx.ExecutionStateVersion, planCtx.AcceptanceSpecRevision)
-		if planCtx.GraphDigest != "" {
-			fmt.Fprintf(out, " Graph Digest: %s\n", planCtx.GraphDigest)
-		}
+	// V6 §7.1：检测到降级标记时在 header 打 trace_degraded 提示
+	if m := ReadDegradedMarker(dir); m != nil {
+		fmt.Fprintf(out, " trace_degraded: 首次失败 %s，连续失败 %d 次（%s）——期间事件可能不完整\n",
+			m.FirstFailureTime, m.Count, m.Error)
 	}
 	fmt.Fprintln(out, "════════════════════════════════════════════════════════════════════════════════")
 	printTimelineIssues(out, group.issues)
@@ -1022,222 +1024,6 @@ func uniqueTraceIssues(issues []traceIssue) []traceIssue {
 	return unique
 }
 
-type planTimelineEvent struct {
-	record traceEventRecord
-	taskID string
-}
-
-// cmdPlan 把同一 Plan 下分散在 controller、runner 与 acceptance Task
-// 的事件聚合成一条稳定时间线。成员身份来自任一 Plan context；一旦某个
-// Task 成为成员，就纳入该完整 Task 的全部 trace 分片，包括没有 Plan payload
-// 的 retry 文件。PlanID 对应的根 Task 也始终纳入。
-func cmdPlan(dir, planIDQuery string, out io.Writer) error {
-	query := strings.TrimSpace(planIDQuery)
-	if query == "" {
-		return fmt.Errorf("plan_id 不能为空")
-	}
-	files, err := listTaskFiles(dir)
-	if err != nil {
-		return err
-	}
-	groups := groupTraceFiles(loadTraceFiles(files))
-	planIDs := make(map[string]struct{})
-	for _, group := range groups {
-		for _, record := range group.records {
-			ev := record.event
-			if ev.Plan != nil && ev.Plan.PlanID != "" {
-				planIDs[ev.Plan.PlanID] = struct{}{}
-			}
-		}
-	}
-
-	planID, candidates := resolvePlanID(planIDs, query)
-	if len(candidates) == 0 {
-		return fmt.Errorf("未找到匹配 plan_id=%s 的 trace 事件", planIDQuery)
-	}
-	if len(candidates) > 1 {
-		fmt.Fprintf(out, "找到 %d 个匹配的 Plan，请使用更长的 plan_id 区分:\n", len(candidates))
-		for _, candidate := range candidates {
-			fmt.Fprintf(out, "  %s\n", candidate)
-		}
-		return nil
-	}
-
-	var timeline []planTimelineEvent
-	planTasks := make(map[string]struct{})
-	planFiles := make(map[string]struct{})
-	var issues []traceIssue
-	for _, group := range groups {
-		if !taskTraceBelongsToPlan(group, planID) {
-			continue
-		}
-		if group.taskID != "" {
-			planTasks[group.taskID] = struct{}{}
-		}
-		for path := range group.files {
-			planFiles[path] = struct{}{}
-		}
-		issues = append(issues, group.issues...)
-		for _, record := range group.records {
-			timeline = append(timeline, planTimelineEvent{
-				record: record, taskID: group.displayID(),
-			})
-		}
-	}
-	sort.SliceStable(timeline, func(i, j int) bool {
-		left, right := timeline[i].record, timeline[j].record
-		if !left.event.Timestamp.Equal(right.event.Timestamp) {
-			return left.event.Timestamp.Before(right.event.Timestamp)
-		}
-		if left.file.filename != right.file.filename {
-			return left.file.filename < right.file.filename
-		}
-		return left.line < right.line
-	})
-
-	allEvents := make([]Event, 0, len(timeline))
-	for _, item := range timeline {
-		allEvents = append(allEvents, item.record.event)
-	}
-	planCtx := latestPlanContext(allEvents, planID)
-	acceptance := latestAcceptanceContext(timeline, planID)
-
-	fmt.Fprintln(out, "════════════════════════════════════════════════════════════════════════════════")
-	fmt.Fprintf(out, " Plan: %s\n", planID)
-	fmt.Fprintf(out, " Tasks: %d\n", len(planTasks))
-	fmt.Fprintf(out, " Trace Files: %d\n", len(planFiles))
-	fmt.Fprintf(out, " Events: %d\n", len(timeline))
-	if planCtx != nil {
-		fmt.Fprintf(out, " Revision: %d  State Version: %d  Acceptance Revision: %d\n",
-			planCtx.PlanRevision, planCtx.ExecutionStateVersion, planCtx.AcceptanceSpecRevision)
-		if planCtx.GraphDigest != "" {
-			fmt.Fprintf(out, " Graph Digest: %s\n", planCtx.GraphDigest)
-		}
-	}
-	if acceptance != nil {
-		fmt.Fprintf(out, " Latest Acceptance: status=%s verdict=%s run=%s result=%s\n",
-			acceptance.Status, acceptance.Verdict, acceptance.AcceptanceRunID, acceptance.ResultID)
-	}
-	fmt.Fprintln(out, "════════════════════════════════════════════════════════════════════════════════")
-	printTimelineIssues(out, issues)
-
-	var prev time.Time
-	for i, item := range timeline {
-		ev := item.record.event
-		if i > 0 && !prev.IsZero() && ev.Timestamp.Sub(prev) > slowGapThreshold {
-			fmt.Fprintf(out, "  WARNING: Plan 距离上一条事件间隔 %s（超过 %s 阈值）\n",
-				formatDuration(ev.Timestamp.Sub(prev)), formatDuration(slowGapThreshold))
-		}
-		prev = ev.Timestamp
-		fmt.Fprintf(out, "[%s] task=%s %-30s", ev.Timestamp.Local().Format("15:04:05.000"),
-			item.taskID, ev.Kind)
-		if ev.AgentID != "" {
-			fmt.Fprintf(out, " agent=%s", ev.AgentID)
-		}
-		if eventCarriesLoop(ev.Kind) && ev.Loop >= 0 {
-			fmt.Fprintf(out, " loop=%d", ev.Loop)
-		}
-		fmt.Fprintln(out)
-		if details := formatEventDetails(ev); details != "" {
-			fmt.Fprintf(out, "             %s\n", details)
-		}
-	}
-	fmt.Fprintln(out, "════════════════════════════════════════════════════════════════════════════════")
-	return nil
-}
-
-func resolvePlanID(planIDs map[string]struct{}, query string) (string, []string) {
-	if _, ok := planIDs[query]; ok {
-		return query, []string{query}
-	}
-	var candidates []string
-	for planID := range planIDs {
-		if strings.HasPrefix(planID, query) {
-			candidates = append(candidates, planID)
-		}
-	}
-	sort.Strings(candidates)
-	if len(candidates) == 1 {
-		return candidates[0], candidates
-	}
-	return "", candidates
-}
-
-func taskTraceBelongsToPlan(group *taskTrace, planID string) bool {
-	if group.taskID == planID {
-		return true
-	}
-	for _, record := range group.records {
-		ev := record.event
-		if ev.Plan != nil && ev.Plan.PlanID == planID {
-			return true
-		}
-	}
-	return false
-}
-
-func latestPlanContext(events []Event, planID string) *PlanTraceContext {
-	targetPlanID := planID
-	if targetPlanID == "" {
-		// show 视图通常只有一个 Plan；若历史数据混入多个，维持旧行为，
-		// 选择时间线上最后出现的 Plan 身份，再只汇总该 Plan。
-		for _, ev := range events {
-			if ev.Plan != nil && ev.Plan.PlanID != "" {
-				targetPlanID = ev.Plan.PlanID
-			}
-		}
-	}
-	if targetPlanID == "" {
-		return nil
-	}
-	latest := &PlanTraceContext{PlanID: targetPlanID}
-	found := false
-	var digest string
-	digestRevision := int64(-1)
-	for _, ev := range events {
-		if ev.Plan == nil || ev.Plan.PlanID != targetPlanID {
-			continue
-		}
-		found = true
-		if ev.Plan.PlanRevision > latest.PlanRevision {
-			latest.PlanRevision = ev.Plan.PlanRevision
-		}
-		if ev.Plan.ExecutionStateVersion > latest.ExecutionStateVersion {
-			latest.ExecutionStateVersion = ev.Plan.ExecutionStateVersion
-		}
-		if ev.Plan.AcceptanceSpecRevision > latest.AcceptanceSpecRevision {
-			latest.AcceptanceSpecRevision = ev.Plan.AcceptanceSpecRevision
-		}
-		if ev.Plan.GraphDigest != "" && ev.Plan.PlanRevision >= digestRevision {
-			digest = ev.Plan.GraphDigest
-			digestRevision = ev.Plan.PlanRevision
-		}
-	}
-	if !found {
-		return nil
-	}
-	// Digest 描述具体图 revision。只有在最高已知 revision 上观测到 digest
-	// 才展示，避免把旧图 digest 错配到新 revision；只带 state 的 partial
-	// context 不会清掉同 revision 已知 digest。
-	if digestRevision == latest.PlanRevision {
-		latest.GraphDigest = digest
-	}
-	return latest
-}
-
-func latestAcceptanceContext(timeline []planTimelineEvent, planID string) *AcceptanceTraceContext {
-	var latest *AcceptanceTraceContext
-	for _, item := range timeline {
-		ev := item.record.event
-		if ev.Acceptance == nil || ev.Plan == nil || ev.Plan.PlanID != planID {
-			continue
-		}
-		copyCtx := *ev.Acceptance
-		latest = &copyCtx
-	}
-	return latest
-}
-
 // formatEventDetails 把事件的可选字段格式化为单行可读文本。
 func formatEventDetails(ev Event) string {
 	var parts []string
@@ -1344,22 +1130,52 @@ func formatEventDetails(ev Event) string {
 		if ev.Description != "" {
 			parts = append(parts, fmt.Sprintf("desc=%q", truncate(ev.Description, 120)))
 		}
-	case KindHistoryCompaction, KindHistoryTruncated:
+	case KindHistoryCompaction:
 		parts = append(parts, fmt.Sprintf("tokens_before=%d tokens_after=%d strategy=%s kept_entries=%d",
 			ev.PromptTokensBefore, ev.PromptTokensAfter, ev.Strategy, ev.KeptEntries))
-	case KindTokenStats:
-		parts = append(parts, fmt.Sprintf(
-			"call=%d prompt_tokens=%d completion_tokens=%d total_prompt_tokens=%d total_completion_tokens=%d",
-			ev.CallCount, ev.PromptTokens, ev.CompletionTokens,
-			ev.TotalPromptTokens, ev.TotalCompletionTokens))
+	case KindContextManifestBuilt:
+		// CM1 影子账本：est_prompt_tokens 是 rune/3 估算总量（实测由同轮
+		// llm_call_end 对账）；Description 是逐段 JSON 摘要，截断展示。
+		// prompt_build_id（P1a）是本轮上下文绑定的冻结 Build 身份。
+		parts = append(parts, fmt.Sprintf("est_prompt_tokens=%d history_entries=%d", ev.PromptTokens, ev.HistoryEntries))
+		if ev.PromptBuildID != "" {
+			parts = append(parts, fmt.Sprintf("build=%s", ev.PromptBuildID))
+		}
+		if ev.Description != "" {
+			parts = append(parts, fmt.Sprintf("sections=%q", truncate(ev.Description, 200)))
+		}
+	case KindPromptCompiled:
+		// P1a Prompt 有序编译：Build.ID + 逐组件身份摘要（不含正文）。
+		if ev.PromptBuildID != "" {
+			parts = append(parts, fmt.Sprintf("build=%s", ev.PromptBuildID))
+		}
+		if ev.Description != "" {
+			parts = append(parts, fmt.Sprintf("components=%q", truncate(ev.Description, 200)))
+		}
+	case KindAgentAuditStarted, KindAgentAuditWarning, KindAgentAuditCompleted:
+		// P1b /doctor agents 审计：只载计数/digest/类型摘要（不含 prompt
+		// 正文）；completed 的 Reason 载终态。
+		parts = appendReason(parts, "reason", ev.Reason)
+		if ev.Description != "" {
+			parts = append(parts, fmt.Sprintf("summary=%q", truncate(ev.Description, 200)))
+		}
+	case KindTaskMemoryCreated, KindTaskMemoryUpdated, KindTaskMemoryCheckpointed:
+		// CM2 Task Memory：Description 是段计数 JSON 摘要（不含正文）；
+		// checkpoint 事件带 Reason（history_compaction / attempt_end / terminal:*）。
+		parts = appendReason(parts, "reason", ev.Reason)
+		if ev.Description != "" {
+			parts = append(parts, fmt.Sprintf("sections=%q", truncate(ev.Description, 200)))
+		}
+	case KindSessionMemoryPromotionProposed, KindSessionMemoryPromotionDecided,
+		KindMemoryRecalled, KindMemoryEntryStateChanged:
+		// CM3 Session Memory：Reason 载终态（晋升事件）；Description 是 JSON
+		// 摘要（晋升 decided/条目数/Key 列表/状态迁移，均不含正文）。
+		parts = appendReason(parts, "reason", ev.Reason)
+		if ev.Description != "" {
+			parts = append(parts, fmt.Sprintf("summary=%q", truncate(ev.Description, 200)))
+		}
 	case KindProgressNotify:
 		parts = append(parts, fmt.Sprintf("notify_type=%s", ev.NotifyType))
-	case KindMemoryContextInject:
-		parts = append(parts, fmt.Sprintf("source=%s", ev.NotifyType))
-		if ev.Path != "" {
-			parts = append(parts, fmt.Sprintf("key=%s", ev.Path))
-		}
-		parts = append(parts, fmt.Sprintf("runes=%d", ev.OutputLen))
 	case KindWorkspaceMaterialized, KindWorkspaceCleaned:
 		// workspace 物化 / 清理：Path 是 workspace 根路径。
 		if ev.Path != "" {
@@ -1426,14 +1242,144 @@ func formatEventDetails(ev Event) string {
 	case KindReactorSpawnDepthExceeded:
 		parts = append(parts, fmt.Sprintf("depth=%d", ev.Depth))
 		parts = appendReason(parts, "reason", ev.Reason)
-	case KindReplanRequested, KindReplanCoalesced, KindReplanDecided,
-		KindPlanRevisionChanged, KindPlanPaused, KindPlanTerminal:
+	case KindRuntimeLoopFuseTriggered:
+		// emergency fuse：Loop 载触发时的循环计数，Reason 载兜底说明。
+		parts = append(parts, fmt.Sprintf("loop=%d", ev.Loop))
+		parts = appendReason(parts, "reason", ev.Reason)
+	case KindTaskFinalizing:
+		// 结构化提交被接受：Transition.NewStatus 载自述终态（completed/blocked）。
+		if ev.Transition != nil && ev.Transition.NewStatus != "" {
+			parts = append(parts, fmt.Sprintf("status=%s", ev.Transition.NewStatus))
+		}
+	case KindToolCallSkipped:
+		// finalizing fence 拦截：Tool/CallID 定位被跳过的调用，Reason 载原因。
+		parts = append(parts, fmt.Sprintf("tool=%s", ev.Tool))
+		if ev.CallID != "" {
+			parts = append(parts, fmt.Sprintf("call_id=%s", ev.CallID))
+		}
+		parts = appendReason(parts, "reason", ev.Reason)
+	case KindTaskResultCommitted:
+		// 结构化提交的收尾事务已 durable：Transition 载终态与 cause。
+		parts = appendTaskTransition(parts, ev.Transition, false, false)
+		parts = appendReason(parts, "reason", ev.Reason)
+	case KindSuggestionsReturned:
+		// H2a：Gate 结构化拒绝给出建议——只展示计数与标识，不载正文。
+		if ev.Suggestion != nil {
+			if ev.Suggestion.ReasonCode != "" {
+				parts = append(parts, fmt.Sprintf("reason_code=%s", ev.Suggestion.ReasonCode))
+			}
+			parts = append(parts, fmt.Sprintf("retryable=%v", ev.Suggestion.Retryable))
+			parts = append(parts, fmt.Sprintf("offered=%d", ev.Suggestion.Offered))
+			if ev.Suggestion.Filtered > 0 {
+				parts = append(parts, fmt.Sprintf("filtered=%d", ev.Suggestion.Filtered))
+			}
+			if ev.Suggestion.FilterReason != "" {
+				parts = append(parts, fmt.Sprintf("filter=%s", ev.Suggestion.FilterReason))
+			}
+			if ev.Suggestion.RepeatCount > 1 {
+				parts = append(parts, fmt.Sprintf("repeat=%d", ev.Suggestion.RepeatCount))
+			}
+		}
+	case KindSuggestionDisposition:
+		// H2a：上一轮建议的去向（adopted / abandoned / repeated）。
+		if ev.Suggestion != nil {
+			if ev.Suggestion.SuggestionID != "" {
+				parts = append(parts, fmt.Sprintf("id=%s", ev.Suggestion.SuggestionID))
+			}
+			if ev.Suggestion.Disposition != "" {
+				parts = append(parts, fmt.Sprintf("disposition=%s", ev.Suggestion.Disposition))
+			}
+			if ev.Suggestion.ReasonCode != "" {
+				parts = append(parts, fmt.Sprintf("reason_code=%s", ev.Suggestion.ReasonCode))
+			}
+		}
+	case KindExecutionLeaseFrozen, KindExecutionLeaseRejected,
+		KindExecutionLeaseReused, KindExecutionLeaseRevoked:
+		// ExecutionLease（V6 §4 H1）：Lease 子载荷载 digest/工具计数/模型/
+		// 隔离/Synthetic；rejected 附缺失清单，revoked 附撤销原因。
+		if ev.Lease != nil {
+			if ev.Lease.Digest != "" {
+				parts = append(parts, fmt.Sprintf("digest=%s", ev.Lease.Digest))
+			}
+			parts = append(parts, fmt.Sprintf("biz=%d ctl=%d", ev.Lease.BusinessTools, ev.Lease.ControlTools))
+			if ev.Lease.Model != "" {
+				parts = append(parts, fmt.Sprintf("model=%s", ev.Lease.Model))
+			}
+			if ev.Lease.Workspace != "" {
+				parts = append(parts, fmt.Sprintf("workspace=%s", ev.Lease.Workspace))
+			}
+			if ev.Lease.Synthetic {
+				parts = append(parts, "synthetic=true")
+			}
+			if len(ev.Lease.Missing) > 0 {
+				parts = append(parts, fmt.Sprintf("missing=%v", ev.Lease.Missing))
+			}
+			if ev.Lease.Cause != "" {
+				parts = appendReason(parts, "cause", ev.Lease.Cause)
+			}
+		}
+		parts = appendReason(parts, "reason", ev.Reason)
+	case KindEffectPrepared, KindEffectSettled, KindEffectUnknown, KindEffectRecoveryDecided:
+		// Effect Journal（V6 §4 H2b）：展示标识与摘要（effect_id / kind /
+		// policy / target / result_summary / decision），不含完整参数/命令。
+		if ev.Effect != nil {
+			if ev.Effect.EffectID != "" {
+				parts = append(parts, fmt.Sprintf("effect=%s", ev.Effect.EffectID))
+			}
+			parts = append(parts, fmt.Sprintf("kind=%s policy=%s", ev.Effect.Kind, ev.Effect.Policy))
+			if ev.Effect.Target != "" {
+				parts = append(parts, fmt.Sprintf("target=%s", truncate(ev.Effect.Target, 80)))
+			}
+			if ev.Effect.ResultSummary != "" {
+				parts = append(parts, fmt.Sprintf("result=%q", truncate(ev.Effect.ResultSummary, 120)))
+			}
+			if ev.Effect.Decision != "" {
+				parts = append(parts, fmt.Sprintf("decision=%s", ev.Effect.Decision))
+			}
+			parts = appendReason(parts, "reason", ev.Effect.Reason)
+		}
+	case KindGraphSubmitted, KindGraphSubmissionRejected, KindNodeActivationCreated,
+		KindGraphTransitionSelected, KindGraphEnded, KindGraphJoinResolved,
+		KindGraphWaitStarted, KindGraphWaitResumed, KindGraphApprovalDecided,
+		KindGraphChangeRequested, KindGraphRevisionCommitted:
+		// Graph Runtime 事件（V6 §6）：展示图 / 节点 / activation 归属。
+		if ev.GraphID != "" {
+			parts = append(parts, fmt.Sprintf("graph=%s", ev.GraphID))
+		}
+		if ev.NodeID != "" {
+			parts = append(parts, fmt.Sprintf("node=%s", ev.NodeID))
+		}
+		if ev.ActivationID != "" {
+			parts = append(parts, fmt.Sprintf("activation=%s", ev.ActivationID))
+		}
+		if ev.Description != "" {
+			parts = append(parts, fmt.Sprintf("desc=%q", truncate(ev.Description, 200)))
+		}
+		if ev.Error != "" {
+			parts = append(parts, fmt.Sprintf("error=%q", truncate(ev.Error, 200)))
+		}
 		parts = appendReason(parts, "reason", ev.Reason)
 	case KindAcceptanceCompleted:
+		// 验收服务端核验（G1b）：图归属 + 自报 verdict / 核验结论 / 核验条数。
+		if ev.GraphID != "" {
+			parts = append(parts, fmt.Sprintf("graph=%s", ev.GraphID))
+		}
+		if ev.NodeID != "" {
+			parts = append(parts, fmt.Sprintf("node=%s", ev.NodeID))
+		}
+		if ev.ActivationID != "" {
+			parts = append(parts, fmt.Sprintf("activation=%s", ev.ActivationID))
+		}
+		if ev.Acceptance != nil {
+			parts = append(parts, fmt.Sprintf("verdict=%s verify=%s checked=%d",
+				ev.Acceptance.Verdict, ev.Acceptance.Status, ev.Acceptance.Checked))
+			parts = appendReason(parts, "reason", ev.Acceptance.Reason)
+		}
 		parts = appendReason(parts, "reason", ev.Reason)
 	default:
 		// 用户事件使用 user.<name> 命名空间，payload 的 Description 是
-		// 主要可读内容。未知未来事件也至少展示已有通用字段，避免静默空白。
+		// 主要可读内容。未知未来事件（含旧版 plan_/replan_ 等已删除的
+		// Plan 时代事件行）也至少展示已有通用字段，避免静默空白。
 		if ev.Description != "" {
 			parts = append(parts, fmt.Sprintf("desc=%q", truncate(ev.Description, 200)))
 		}
@@ -1442,8 +1388,6 @@ func formatEventDetails(ev Event) string {
 		}
 		parts = appendReason(parts, "reason", ev.Reason)
 	}
-	parts = appendPlanContext(parts, ev.Plan)
-	parts = appendAcceptanceContext(parts, ev.Acceptance)
 	return strings.Join(parts, " ")
 }
 
@@ -1489,47 +1433,13 @@ func appendExcerpt(parts []string, key, excerpt string) []string {
 	return append(parts, fmt.Sprintf("%s=%q", key, truncate(excerpt, 160)))
 }
 
-func appendPlanContext(parts []string, plan *PlanTraceContext) []string {
-	if plan == nil {
-		return parts
-	}
-	parts = append(parts, fmt.Sprintf(
-		"plan=%s plan_revision=%d state_version=%d acceptance_revision=%d",
-		plan.PlanID, plan.PlanRevision, plan.ExecutionStateVersion, plan.AcceptanceSpecRevision))
-	if plan.GraphDigest != "" {
-		parts = append(parts, fmt.Sprintf("graph_digest=%s", plan.GraphDigest))
-	}
-	return parts
-}
-
-func appendAcceptanceContext(parts []string, acceptance *AcceptanceTraceContext) []string {
-	if acceptance == nil {
-		return parts
-	}
-	parts = append(parts,
-		fmt.Sprintf("acceptance_run=%s", acceptance.AcceptanceRunID),
-		fmt.Sprintf("result=%s", acceptance.ResultID),
-		fmt.Sprintf("spec=%s", acceptance.SpecID),
-		fmt.Sprintf("spec_revision=%d", acceptance.SpecRevision),
-		fmt.Sprintf("target_revision=%d", acceptance.TargetRevision),
-		fmt.Sprintf("target_digest=%s", acceptance.TargetGraphDigest),
-		fmt.Sprintf("runner_task=%s", acceptance.RunnerTaskID),
-	)
-	if acceptance.RunnerKind != "" {
-		parts = append(parts, fmt.Sprintf("runner_kind=%s", acceptance.RunnerKind))
-	}
-	parts = append(parts,
-		fmt.Sprintf("verdict=%s", acceptance.Verdict),
-		fmt.Sprintf("status=%s", acceptance.Status),
-	)
-	return appendReason(parts, "acceptance_reason", acceptance.Reason)
-}
-
 func eventCarriesLoop(kind EventKind) bool {
 	switch kind {
 	case KindLLMCallStart, KindLLMCallEnd, KindToolCall, KindToolResult,
-		KindHistoryCompaction, KindHistoryTruncated, KindTokenStats, KindProgressNotify,
-		KindMemoryContextInject, KindTaskCancelled:
+		KindHistoryCompaction, KindProgressNotify,
+		KindTaskCancelled, KindContextManifestBuilt,
+		KindTaskMemoryUpdated, KindTaskMemoryCheckpointed,
+		KindToolCallSkipped:
 		return true
 	default:
 		return false
@@ -1741,4 +1651,585 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
 	}
 	return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
+}
+
+// ============================================================
+// trace graph / trace node（V6 §7.5 Graph 查询入口）
+// ============================================================
+
+// graphSnapshotHead 是 GraphStore snapshot.json 的本地最小解码结构。
+// 纪律：trace 包不得 import internal/graph（graph 已 import trace 发事件，
+// 反向会成环），snapshot 头部字段在 CLI 侧用本结构解码；字段名与
+// internal/graph/journal.go 的 snapshotFile 保持对齐。
+type graphSnapshotHead struct {
+	Version      int    `json:"version"`
+	GraphID      string `json:"graph_id"`
+	Revision     int64  `json:"revision"`
+	StateVersion int64  `json:"state_version"`
+	Digest       string `json:"digest"`
+	Doc          *struct {
+		Status string `json:"status"`
+	} `json:"doc"`
+}
+
+// graphEventSet 是一张图的全部可归事件与其物理来源。
+type graphEventSet struct {
+	records []traceEventRecord
+	issues  []traceIssue
+	files   map[string]taskFile
+}
+
+// graphScan 是一次 trace 目录扫描的结果：按事件的 GraphID 精确归组。
+// 图事件主体在 graph_<前缀>.jsonl 分片；graph_change_requested 携 TaskID
+// 落任务分片（internal/tools/plan_control.go），因此扫描覆盖全部 JSONL
+// 分片而不是只看 graph_ 分片。
+type graphScan struct {
+	byGraph map[string]*graphEventSet
+	files   map[string]bool // 目录内存在的 .jsonl 文件名集合（判预期分片缺失用）
+}
+
+func (s *graphScan) setFor(graphID string) *graphEventSet {
+	set := s.byGraph[graphID]
+	if set == nil {
+		set = &graphEventSet{files: make(map[string]taskFile)}
+		s.byGraph[graphID] = set
+	}
+	return set
+}
+
+// scanGraphEvents 读取 dir 内全部 JSONL 分片（含任务分片），把带 GraphID
+// 的事件按完整 GraphID 归组，按 ts+filename+line 稳定排序。分片中的坏行
+// 与读取失败转化为各图的 issue（覆盖度 partial 判定的输入）。
+func scanGraphEvents(dir string) (*graphScan, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("无法读取 trace 目录 %s: %w", dir, err)
+	}
+	scan := &graphScan{byGraph: make(map[string]*graphEventSet), files: make(map[string]bool)}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, ".jsonl") || strings.HasSuffix(name, ".prompts.jsonl") {
+			continue
+		}
+		scan.files[name] = true
+		file := taskFile{path: filepath.Join(dir, name), filename: name}
+		events, readErr := readAllEvents(file.path)
+		graphIDs := make(map[string]struct{})
+		parseErrs := 0
+		for _, ev := range events {
+			if ev.GraphID != "" {
+				graphIDs[ev.GraphID] = struct{}{}
+			}
+			if ev.Kind == "<parse_error>" {
+				parseErrs++
+			}
+		}
+		for line, ev := range events {
+			if ev.GraphID == "" {
+				continue
+			}
+			set := scan.setFor(ev.GraphID)
+			set.files[file.path] = file
+			set.records = append(set.records, traceEventRecord{event: ev, file: file, line: line + 1})
+		}
+		// 坏行/读取失败归属：只记到本分片实际贡献了事件的图上。分片内可能
+		// 混有多张图（父子图共享 8 位前缀），此时坏行无法精确归属，保守地
+		// 全部标记并在消息中说明。
+		if parseErrs > 0 || readErr != nil {
+			for id := range graphIDs {
+				set := scan.setFor(id)
+				if parseErrs > 0 {
+					msg := fmt.Sprintf("%d 行无法解析", parseErrs)
+					if len(graphIDs) > 1 {
+						msg = fmt.Sprintf("%d 行无法解析（分片内混有 %d 张图，无法精确归属）", parseErrs, len(graphIDs))
+					}
+					set.issues = append(set.issues, traceIssue{file: file, message: msg, errorCount: parseErrs})
+				}
+				if readErr != nil {
+					set.issues = append(set.issues, traceIssue{file: file, message: readErr.Error(), errorCount: 1, readFailure: true})
+				}
+			}
+		}
+	}
+	for _, set := range scan.byGraph {
+		sortTraceRecords(set.records)
+	}
+	return scan, nil
+}
+
+// graphStateEntry 是 .agentgo/state/graphs 下一图持久化目录的发现结果。
+type graphStateEntry struct {
+	id           string
+	snapshotPath string // 空串表示该图尚无 snapshot.json（仅 journal，属正常）
+}
+
+// scanGraphStateDir 发现 GraphStore 持久化目录下的全部图。graph_id 的 "/"
+// 段映射为嵌套目录（子图嵌在父图目录下，见 store.graphDir）；含
+// snapshot.json 或 journal.jsonl 的目录计为一张图。目录不存在返回空结果
+// （没跑过图不是错误）。
+func scanGraphStateDir(graphStateDir string) map[string]graphStateEntry {
+	out := make(map[string]graphStateEntry)
+	if graphStateDir == "" {
+		return out
+	}
+	root := filepath.Clean(graphStateDir)
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil || rel == "." {
+			return nil
+		}
+		// 子图按 <父图>/<activationID> 嵌套（MaxSubgraphDepth 另有上限），
+		// 深度设防御性上限，避免异常目录结构导致无限下钻。
+		if len(strings.Split(filepath.ToSlash(rel), "/")) > 8 {
+			return filepath.SkipDir
+		}
+		snap := filepath.Join(path, "snapshot.json")
+		if _, serr := os.Stat(snap); serr == nil {
+			out[filepath.ToSlash(rel)] = graphStateEntry{id: filepath.ToSlash(rel), snapshotPath: snap}
+			return nil
+		}
+		if _, jerr := os.Stat(filepath.Join(path, "journal.jsonl")); jerr == nil {
+			out[filepath.ToSlash(rel)] = graphStateEntry{id: filepath.ToSlash(rel)}
+		}
+		return nil
+	})
+	return out
+}
+
+// readGraphSnapshotHead 读取一图的 snapshot 头。snapshotPath 为空（图尚无
+// snapshot，压缩前属正常）时 ok=false、err=nil；文件存在但读不出/解码失败/
+// graph_id 不符时 ok=false 且 err 非 nil（覆盖度 degraded 判定）。
+func readGraphSnapshotHead(snapshotPath, graphID string) (head graphSnapshotHead, ok bool, err error) {
+	if snapshotPath == "" {
+		return graphSnapshotHead{}, false, nil
+	}
+	data, err := os.ReadFile(snapshotPath)
+	if err != nil {
+		return graphSnapshotHead{}, false, err
+	}
+	if err := json.Unmarshal(data, &head); err != nil {
+		return graphSnapshotHead{}, false, fmt.Errorf("snapshot JSON 解析失败: %w", err)
+	}
+	if head.GraphID != "" && head.GraphID != graphID {
+		return graphSnapshotHead{}, false, fmt.Errorf("snapshot 的 graph_id=%q 与查询的图 %q 不符", head.GraphID, graphID)
+	}
+	return head, true, nil
+}
+
+// resolveGraphID 按完整 ID 或唯一前缀定位图；候选集合 = trace 事件里的
+// GraphID ∪ state 目录里发现的图。语义与 task_id 前缀一致：碰撞列候选。
+func resolveGraphID(scan *graphScan, state map[string]graphStateEntry, query string) ([]string, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, fmt.Errorf("graph_id 不能为空")
+	}
+	seen := make(map[string]struct{})
+	for id := range scan.byGraph {
+		seen[id] = struct{}{}
+	}
+	for id := range state {
+		seen[id] = struct{}{}
+	}
+	var matches []string
+	for id := range seen {
+		if strings.HasPrefix(id, query) {
+			matches = append(matches, id)
+		}
+	}
+	sort.Strings(matches)
+	return matches, nil
+}
+
+var (
+	// graph_submitted 的 Description 形如 "revision=1 digest=abc123def456"。
+	graphSubmittedDescRe = regexp.MustCompile(`\brevision=(\d+)(?:\s+digest=(\S+))?`)
+	// graph_revision_committed 的 Description 形如 "new_revision=2 upsert=[...]"。
+	graphRevisionDescRe = regexp.MustCompile(`\bnew_revision=(\d+)\b`)
+)
+
+// graphFactsFromEvents 从图事件时间线（已按时间排序）重建头部事实：
+// status 取最新生命周期事件，revision/digest 取最新 submitted/committed
+// 描述里的值；没有对应事件时保持零值。
+func graphFactsFromEvents(records []traceEventRecord) (status string, revision int64, hasRevision bool, digest string) {
+	for _, r := range records {
+		ev := r.event
+		switch ev.Kind {
+		case KindGraphSubmitted:
+			status = "running"
+			if m := graphSubmittedDescRe.FindStringSubmatch(ev.Description); m != nil {
+				if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
+					revision, hasRevision = v, true
+				}
+				if m[2] != "" {
+					digest = m[2]
+				}
+			}
+		case KindGraphRevisionCommitted:
+			if m := graphRevisionDescRe.FindStringSubmatch(ev.Description); m != nil {
+				if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
+					revision, hasRevision = v, true
+				}
+			}
+		case KindGraphSubmissionRejected:
+			status = "submission_rejected"
+		case KindGraphEnded:
+			// graph_ended：经 end 节点完成时 Reason 为空；失败终态 Reason 载原因。
+			if ev.Reason == "" {
+				status = "completed"
+			} else {
+				status = "failed"
+			}
+		}
+	}
+	return status, revision, hasRevision, digest
+}
+
+// resolveGraphStatus 合并事件与 snapshot 两个来源的图状态：终态
+// （completed/failed）一旦出现以它为准（snapshot 可能旧于 trace，trace
+// 也可能已被 GC 而只剩 snapshot）；否则 snapshot 优先，事件兜底。
+func resolveGraphStatus(eventStatus, snapStatus string) string {
+	if isTerminalGraphStatus(eventStatus) {
+		return eventStatus
+	}
+	if isTerminalGraphStatus(snapStatus) {
+		return snapStatus
+	}
+	if snapStatus != "" {
+		return snapStatus
+	}
+	if eventStatus != "" {
+		return eventStatus
+	}
+	return "unknown"
+}
+
+func isTerminalGraphStatus(s string) bool { return s == "completed" || s == "failed" }
+
+// truncateDigest12 与 internal/graph 的 truncateDigest 同口径（前 12 位）。
+func truncateDigest12(d string) string {
+	if len(d) > 12 {
+		return d[:12]
+	}
+	return d
+}
+
+// graphHeader 是 trace graph / trace node 输出的头部信息。
+type graphHeader struct {
+	id           string
+	status       string
+	revision     string
+	stateVersion string
+	digest       string
+	fromSnapshot bool
+	rebuilt      bool // snapshot 不可用且头部字段由事件重建
+	events       int
+	shards       int
+	coverage     string // complete / partial / degraded
+	reasons      []string
+}
+
+// buildGraphHeader 汇总 snapshot 头（可读时优先）与事件重建信息，并给出
+// 覆盖度判定：
+//   - complete：预期分片存在、贡献文件无坏行/读取失败、snapshot 可读或缺席；
+//   - partial：预期分片缺失（被 GC 或写入失败），或贡献文件有坏行/读取失败；
+//   - degraded：snapshot 存在但不可读/不符（时间线照常展示）。
+//
+// degraded 优先于 partial。
+func buildGraphHeader(id string, set *graphEventSet, entry graphStateEntry, scan *graphScan) graphHeader {
+	h := graphHeader{
+		id: id, status: "unknown", revision: "unknown", stateVersion: "unknown", digest: "unknown",
+	}
+	var records []traceEventRecord
+	if set != nil {
+		h.events = len(set.records)
+		h.shards = len(set.files)
+		records = set.records
+	}
+	eventStatus, eventRev, hasEventRev, eventDigest := graphFactsFromEvents(records)
+
+	head, snapOK, snapErr := readGraphSnapshotHead(entry.snapshotPath, id)
+	snapStatus := ""
+	switch {
+	case snapErr != nil:
+		h.coverage = "degraded"
+		h.reasons = append(h.reasons, fmt.Sprintf("snapshot 不可读（%v），头部字段由事件重建", snapErr))
+	case snapOK:
+		h.fromSnapshot = true
+		h.revision = strconv.FormatInt(head.Revision, 10)
+		h.stateVersion = strconv.FormatInt(head.StateVersion, 10)
+		if head.Digest != "" {
+			h.digest = truncateDigest12(head.Digest)
+		}
+		if head.Doc != nil {
+			snapStatus = head.Doc.Status
+		}
+	}
+	h.status = resolveGraphStatus(eventStatus, snapStatus)
+	if !h.fromSnapshot {
+		if hasEventRev {
+			h.revision = strconv.FormatInt(eventRev, 10)
+		}
+		if eventDigest != "" {
+			h.digest = eventDigest
+		}
+		h.rebuilt = len(records) > 0
+	}
+
+	// partial 判定：预期分片缺失，或贡献文件存在坏行/读取失败。
+	expectedShard := graphShardFileName(id)
+	if !scan.files[expectedShard] {
+		h.reasons = append(h.reasons,
+			fmt.Sprintf("预期分片 %s 不存在（事件可能已被 GC 或从未写入）", expectedShard))
+	}
+	if set != nil {
+		for _, issue := range uniqueTraceIssues(set.issues) {
+			h.reasons = append(h.reasons, fmt.Sprintf("%s: %s", issue.file.filename, issue.message))
+		}
+	}
+	if h.coverage == "" {
+		if len(h.reasons) > 0 {
+			h.coverage = "partial"
+		} else {
+			h.coverage = "complete"
+		}
+	}
+	return h
+}
+
+func printGraphHeader(out io.Writer, h graphHeader) {
+	fmt.Fprintln(out, "════════════════════════════════════════════════════════════════════════════════")
+	fmt.Fprintf(out, " Graph: %s\n", h.id)
+	fmt.Fprintf(out, " Status: %s  Revision: %s  StateVersion: %s  Digest: %s\n",
+		h.status, h.revision, h.stateVersion, h.digest)
+	fmt.Fprintf(out, " Events: %d  Shards: %d  Coverage: %s\n", h.events, h.shards, h.coverage)
+	fmt.Fprintln(out, "════════════════════════════════════════════════════════════════════════════════")
+	if h.rebuilt {
+		fmt.Fprintln(out, " （snapshot 不可用，头部字段由事件重建；state_version 仅 snapshot 携带）")
+	}
+	for _, reason := range h.reasons {
+		fmt.Fprintf(out, " WARNING: %s\n", reason)
+	}
+}
+
+// printGraphTimeline 按时间序打印图事件（与 cmdShow 同一排版：首行时间 +
+// kind + 归属引用，次行 formatEventDetails 细节——graph/node/activation
+// 归属字段由后者展示；相邻事件间隔超阈值时标 WARNING）。
+func printGraphTimeline(out io.Writer, records []traceEventRecord) {
+	var prev time.Time
+	for i, record := range records {
+		ev := record.event
+		ts := ev.Timestamp.Local().Format("15:04:05.000")
+		warnPrefix := ""
+		if i > 0 && !prev.IsZero() {
+			gap := ev.Timestamp.Sub(prev)
+			if gap > slowGapThreshold {
+				fmt.Fprintf(out, "  WARNING: 距离上一条事件间隔 %s（超过 %s 阈值）\n",
+					formatDuration(gap), formatDuration(slowGapThreshold))
+				warnPrefix = "  "
+			}
+		}
+		prev = ev.Timestamp
+
+		fmt.Fprintf(out, "%s[%s] %-24s", warnPrefix, ts, ev.Kind)
+		// 携 TaskID 的图事件（graph_change_requested）以引用形式展示任务，
+		// 不合并任务时间线（任务细节走 trace show <task_id>）。
+		if ev.TaskID != "" {
+			fmt.Fprintf(out, " task=%s", shortIdentifier(ev.TaskID))
+		}
+		fmt.Fprintln(out)
+
+		if details := formatEventDetails(ev); details != "" {
+			fmt.Fprintf(out, "             %s\n", details)
+		}
+	}
+}
+
+// resolveSingleGraph 是 graph/node 两个命令共用的定位步骤：扫描 + 前缀
+// 解析。0 个匹配报中文错误；多个匹配列候选并返回空串（调用方直接返回）。
+func resolveSingleGraph(dir, graphStateDir, query string, out io.Writer) (string, *graphScan, *graphEventSet, graphStateEntry, error) {
+	scan, err := scanGraphEvents(dir)
+	if err != nil {
+		return "", nil, nil, graphStateEntry{}, err
+	}
+	state := scanGraphStateDir(graphStateDir)
+	matches, err := resolveGraphID(scan, state, strings.TrimSpace(query))
+	if err != nil {
+		return "", nil, nil, graphStateEntry{}, err
+	}
+	if len(matches) == 0 {
+		return "", nil, nil, graphStateEntry{}, fmt.Errorf("未找到匹配 graph_id=%s 的图（trace 目录: %s）", query, dir)
+	}
+	if len(matches) > 1 {
+		fmt.Fprintf(out, "找到 %d 个匹配的图，请使用更长的 graph_id 区分:\n", len(matches))
+		for _, id := range matches {
+			fmt.Fprintf(out, "  %s\n", id)
+		}
+		return "", scan, nil, graphStateEntry{}, nil
+	}
+	id := matches[0]
+	return id, scan, scan.byGraph[id], state[id], nil
+}
+
+// cmdGraph 实现 agentgo trace graph <graph_id>：图级生命周期时间线。
+func cmdGraph(dir, graphStateDir, query string, out io.Writer) error {
+	id, scan, set, entry, err := resolveSingleGraph(dir, graphStateDir, query, out)
+	if err != nil || id == "" {
+		return err
+	}
+	header := buildGraphHeader(id, set, entry, scan)
+	printGraphHeader(out, header)
+	if set == nil || len(set.records) == 0 {
+		fmt.Fprintln(out, "（该图没有可追溯的事件：分片可能已被 GC，或事件从未写入）")
+		return nil
+	}
+	printGraphTimeline(out, set.records)
+	fmt.Fprintln(out, "────────────────────────────────────────────────────────────────────────────────")
+	fmt.Fprintf(out, " events=%d  shards=%d  coverage=%s\n", header.events, header.shards, header.coverage)
+	return nil
+}
+
+// cmdGraphList 实现无参 agentgo trace graph：列出全部已知图
+// （trace 事件 ∪ state 目录，去重），含状态与最近事件时间。
+func cmdGraphList(dir, graphStateDir string, out io.Writer) error {
+	scan, err := scanGraphEvents(dir)
+	if err != nil {
+		return err
+	}
+	state := scanGraphStateDir(graphStateDir)
+	ids := make(map[string]struct{})
+	for id := range scan.byGraph {
+		ids[id] = struct{}{}
+	}
+	for id := range state {
+		ids[id] = struct{}{}
+	}
+	if len(ids) == 0 {
+		fmt.Fprintf(out, "trace 目录 %s 与 state 目录中没有已知的图\n", dir)
+		return nil
+	}
+	type graphRow struct {
+		id        string
+		status    string
+		revision  string
+		events    int
+		lastEvent time.Time
+	}
+	rows := make([]graphRow, 0, len(ids))
+	for id := range ids {
+		row := graphRow{id: id, status: "unknown", revision: "-"}
+		eventStatus := ""
+		if set := scan.byGraph[id]; set != nil {
+			row.events = len(set.records)
+			status, rev, hasRev, _ := graphFactsFromEvents(set.records)
+			eventStatus = status
+			if hasRev {
+				row.revision = strconv.FormatInt(rev, 10)
+			}
+			for _, rec := range set.records {
+				if rec.event.Timestamp.After(row.lastEvent) {
+					row.lastEvent = rec.event.Timestamp
+				}
+			}
+		}
+		snapStatus := ""
+		if entry, ok := state[id]; ok {
+			if head, snapOK, snapErr := readGraphSnapshotHead(entry.snapshotPath, id); snapErr == nil && snapOK {
+				if head.Doc != nil {
+					snapStatus = head.Doc.Status
+				}
+				// revision 与头部一致：snapshot 可读时优先（比事件里的旧值更新）。
+				row.revision = strconv.FormatInt(head.Revision, 10)
+				if row.lastEvent.IsZero() {
+					if info, serr := os.Stat(entry.snapshotPath); serr == nil {
+						row.lastEvent = info.ModTime()
+					}
+				}
+			}
+		}
+		row.status = resolveGraphStatus(eventStatus, snapStatus)
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if !rows[i].lastEvent.Equal(rows[j].lastEvent) {
+			return rows[i].lastEvent.After(rows[j].lastEvent)
+		}
+		return rows[i].id < rows[j].id
+	})
+
+	fmt.Fprintln(out, "GRAPH                              STATUS       REV   EVENTS  LAST EVENT")
+	for _, row := range rows {
+		last := "-"
+		if !row.lastEvent.IsZero() {
+			last = row.lastEvent.Local().Format("2006-01-02 15:04:05")
+		}
+		fmt.Fprintf(out, "%-34s %-12s %-5s %-7d %s\n",
+			fitColumn(row.id, 34), row.status, row.revision, row.events, last)
+	}
+	fmt.Fprintf(out, "\n共 %d 张图，trace 目录: %s\n", len(rows), dir)
+	return nil
+}
+
+// cmdGraphNode 实现 agentgo trace node <graph_id>/<node_id>：单节点视图，
+// 事件按 activation 分组（回边重进 = 新 activation，一目了然）。
+// graph_id 自身可能含 "/"（子图），node_id 不含（validate.go idCharset），
+// 因此在最后一个 "/" 处切分。
+func cmdGraphNode(dir, graphStateDir, arg string, out io.Writer) error {
+	i := strings.LastIndexByte(arg, '/')
+	if i <= 0 || i == len(arg)-1 {
+		return fmt.Errorf("usage: agentgo trace node <graph_id>/<node_id>（子图的 graph_id 自身含 /，命令在最后一个 / 处切分）")
+	}
+	graphQuery, nodeID := arg[:i], arg[i+1:]
+	id, scan, set, entry, err := resolveSingleGraph(dir, graphStateDir, graphQuery, out)
+	if err != nil || id == "" {
+		return err
+	}
+	header := buildGraphHeader(id, set, entry, scan)
+	printGraphHeader(out, header)
+	fmt.Fprintf(out, " Node: %s\n", nodeID)
+
+	var nodeRecords []traceEventRecord
+	if set != nil {
+		for _, rec := range set.records {
+			if rec.event.NodeID == nodeID {
+				nodeRecords = append(nodeRecords, rec)
+			}
+		}
+	}
+	if len(nodeRecords) == 0 {
+		fmt.Fprintf(out, "（图 %s 中没有节点 %s 的事件）\n", id, nodeID)
+		return nil
+	}
+
+	// 按 activation 分组，保持首次出现顺序；无 activation 的事件归兜底组。
+	type actGroup struct {
+		activation string
+		records    []traceEventRecord
+	}
+	var groups []*actGroup
+	byActivation := make(map[string]*actGroup)
+	for _, rec := range nodeRecords {
+		key := rec.event.ActivationID
+		if key == "" {
+			key = "(无 activation)"
+		}
+		g := byActivation[key]
+		if g == nil {
+			g = &actGroup{activation: key}
+			byActivation[key] = g
+			groups = append(groups, g)
+		}
+		g.records = append(g.records, rec)
+	}
+	for _, g := range groups {
+		fmt.Fprintf(out, "──── activation %s（%d 事件）────\n", g.activation, len(g.records))
+		printGraphTimeline(out, g.records)
+	}
+	fmt.Fprintln(out, "────────────────────────────────────────────────────────────────────────────────")
+	fmt.Fprintf(out, " node=%s  activations=%d  events=%d\n", nodeID, len(groups), len(nodeRecords))
+	return nil
 }

@@ -79,12 +79,12 @@ func mustShellGroup(t *testing.T, groups []tools.ToolGroup) *tools.ShellGroup {
 	return nil
 }
 
-// 验收角色（白名单含 submit_acceptance_result）的 ShellGroup 必须注入
+// 验收角色（白名单含 run_shell 且不含写工具）的 ShellGroup 必须注入
 // 验收加固灰名单：verifier 不授文件写工具，run_shell 的写倾向命令需要
 // 升级为灰名单 Interaction 审批（worktree 隔离落地前的过渡收紧）。
 func TestResolveToolGroups_AcceptanceRoleGetsHardenedShell(t *testing.T) {
 	groups := resolveToolGroups("verifier-1",
-		[]string{"read_file", "run_shell", "submit_acceptance_result", "request_replan"},
+		[]string{"read_file", "run_shell", "submit_task_result", "request_replan"},
 		RunnerDeps{}, &CurrentTaskHolder{},
 		agent.NewFinalizationHolder(), agent.NewSubmitState(),
 		agent.NewFileStateCache(1), &tools.DefaultWorkdir{}, nil)
@@ -95,13 +95,14 @@ func TestResolveToolGroups_AcceptanceRoleGetsHardenedShell(t *testing.T) {
 	}
 }
 
-// 非验收语境行为完全不变：普通执行 / 只读 / 未配置白名单的 runtime 不注入
-// 加固灰名单。submit_task_result 是普通执行节点的提交工具，不是验收信号。
+// 非验收语境行为完全不变：持有写工具的执行 kind / 无 shell / 未配置白名单的
+// runtime 不注入加固灰名单。
 func TestResolveToolGroups_NonAcceptanceRoleKeepsShellUnchanged(t *testing.T) {
 	for _, allowed := range [][]string{
-		{"read_file", "run_shell", "submit_task_result"},
-		{"read_file", "run_shell"},
-		nil, // 单测直构场景：nil 白名单不加固（生产 kind 必有非空白名单）
+		{"read_file", "run_shell", "write_file", "submit_task_result"},
+		{"read_file", "run_shell", "edit_file"},
+		{"read_file", "grep_search"}, // 无 run_shell：shell 非其通道，不加固
+		nil,                          // 单测直构场景：nil 白名单不加固（生产 kind 必有非空白名单）
 	} {
 		groups := resolveToolGroups("w-1", allowed, RunnerDeps{}, &CurrentTaskHolder{},
 			agent.NewFinalizationHolder(), agent.NewSubmitState(),

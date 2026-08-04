@@ -28,7 +28,7 @@ func TestPublishTaskPrefersExplicitParentAndMigratesLegacyParent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ParentTaskID != parentA.ID || got.PlanID != parentA.PlanID {
+	if got.ParentTaskID != parentA.ID {
 		t.Fatalf("explicit parent was not authoritative: %+v", got)
 	}
 
@@ -40,7 +40,7 @@ func TestPublishTaskPrefersExplicitParentAndMigratesLegacyParent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ParentTaskID != parentB.ID || got.PlanID != parentB.PlanID {
+	if got.ParentTaskID != parentB.ID {
 		t.Fatalf("legacy EventSource parent was not migrated: %+v", got)
 	}
 }

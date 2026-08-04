@@ -11,8 +11,8 @@ import (
 
 // SessionConfig 是 Session 相关的配置项。
 type SessionConfig struct {
-	RetentionDays int  // 保留天数，默认 30
-	ArchiveMax    int  // 最大归档数，默认 50
+	RetentionDays int // 保留天数，默认 30
+	ArchiveMax    int // 最大归档数，默认 50
 	// Enabled 为 false 时跳过 history.jsonl 记录（EnableHistoryLog 变为 no-op）；
 	// Session 目录与 metadata 仍照常创建。生产侧 bootstrap 恒传 true。
 	Enabled bool

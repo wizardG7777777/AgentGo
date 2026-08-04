@@ -22,8 +22,8 @@ const (
 	// AgentStateIdle 无任务，轮询 Store 中。
 	AgentStateIdle AgentRuntimeState = "idle"
 	// AgentStateProcessing 处理任务中（含 ReactLoop / LLM 调用 / 工具执行 /
-	// 历史压缩 / 截断——压缩与截断按 §7.2.2 决议保留在 processing 内，由
-	// KindHistoryCompaction / KindHistoryTruncated 事件单独监控）。
+	// 历史压缩——压缩按 §7.2.2 决议保留在 processing 内，由
+	// KindHistoryCompaction 事件单独监控）。
 	AgentStateProcessing AgentRuntimeState = "processing"
 	// AgentStateWaitingInteraction 阻塞等待用户交互响应。它不绑定具体交互类型：
 	// shell 授权、结构化选项或后续其它需要用户决定的协议都复用该状态。

@@ -70,6 +70,14 @@ type Decision struct {
 	// Abort 时由 Gate 填写自身 Name()。
 	HookName string
 
+	// ReasonCode 是 V6 §4 H2a 的稳定拒绝原因码（snake_case），Abort 时填写。
+	// 空串表示该 Gate 尚未迁移到结构化建议——消费方走旧纯文本路径兼容。
+	ReasonCode string `json:"reason_code,omitempty"`
+	// Suggestions 是结构化恢复提示（稳定 ID + 原因码 + retryable + 有界
+	// 候选动作）。nil 时消费方走旧文本路径（逐步迁移，不强迫全部 Gate
+	// 一次改完）。
+	Suggestions []Suggestion `json:"suggestions,omitempty"`
+
 	// WakeDescription 仅 PhaseMailboxBeforeWake 阶段使用。空串表示"本 Gate 不
 	// 提供 description"。多个 Gate 累加追加（中间用 "\n\n" 分隔）。
 	WakeDescription string
@@ -102,7 +110,7 @@ type Gate interface {
 	// 约定段：
 	//   - 0-100   系统级强制（如 PathBoundary / ChainDepthLimit）
 	//   - 500     默认中段
-	//   - 900-1000 累加 / 观察类（如 RecordArtifact / WakeContextExpand）
+	//   - 900-1000 累加 / 观察类（如 WakeContextExpand）
 	Priority() int
 
 	// Matches 决定本 Gate 是否对该 Context 感兴趣。

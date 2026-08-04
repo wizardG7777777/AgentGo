@@ -87,7 +87,7 @@ func TestReadSetWriteReactor_FilterByError(t *testing.T) {
 	// 失败的 read_file：过滤掉
 	r.Run(trace.Event{
 		Kind: trace.KindToolResult, Tool: "read_file",
-		Args: map[string]any{"path": "/p/x"},
+		Args:  map[string]any{"path": "/p/x"},
 		Error: "permission denied",
 	})
 

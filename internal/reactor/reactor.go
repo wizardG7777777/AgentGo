@@ -105,7 +105,7 @@ type Registry struct {
 //
 // 取值 256 的权衡：稳态下内置 async Reactor 都是微秒级记账操作，并发在途
 // 通常只有个位数；真正的风险是用户 Reactor 订阅高频 Kind（llm_call_start/
-// end、tool_call/result、token_stats）并挂 60s 超时的 LLM 调用——256 给这种
+// end、tool_call/result）并挂 60s 超时的 LLM 调用——256 给这种
 // 最坏情形一个硬顶（256 个并发 LLM 调用的内存 footprint 仍在数十 MB 量级，
 // 不会拖垮进程），同时对正常负载永不触发。
 const DefaultMaxAsyncInFlight = 256

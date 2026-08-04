@@ -73,13 +73,10 @@ func TestTraceReactor_Metadata(t *testing.T) {
 	for _, k := range kinds {
 		set[k] = true
 	}
-	// 高频观测类 + plan/replan 类必须在订阅集内
+	// 高频观测类必须在订阅集内（plan/replan 类已随 C6c 删除，不再订阅）
 	for _, k := range []trace.EventKind{
-		trace.KindLLMCallStart, trace.KindToolResult, trace.KindTokenStats,
+		trace.KindLLMCallStart, trace.KindToolResult, trace.KindLLMCallEnd,
 		trace.KindTaskBlocked,
-		trace.KindReplanRequested, trace.KindReplanDecided,
-		trace.KindPlanRevisionChanged, trace.KindPlanTerminal,
-		trace.KindAcceptanceCompleted,
 	} {
 		if !set[k] {
 			t.Fatalf("订阅集缺少 %s", k)

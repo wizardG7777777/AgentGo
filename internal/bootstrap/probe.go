@@ -63,8 +63,8 @@ func printStartupBanner(w io.Writer, configPath string, cfg *config.Config) {
 			if profile == "" && len(k.Tools) > 0 {
 				profile = fmt.Sprintf("inline(%d tools)", len(k.Tools))
 			}
-			fmt.Fprintf(w, "  - %-10s × %d  model=%-20s profile=%-20s loops=%-3d ctx=%d\n",
-				k.Kind, k.Replicas, model, profile, k.AgentMaxLoops, k.ContextLimit)
+			fmt.Fprintf(w, "  - %-10s × %d  model=%-20s profile=%-20s\n",
+				k.Kind, k.Replicas, model, profile)
 		}
 	}
 	fmt.Fprintln(w, "")

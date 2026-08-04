@@ -81,21 +81,24 @@ func TestBaselineCompare(t *testing.T) {
 	base := &Baseline{
 		Environment: env,
 		Tasks: map[string]BaselineTask{
-			"taskA": {TerminalStatus: "completed", JudgesPassed: true, WallSec: 100, TotalTokens: 1000, Loops: 10, Replans: 1, AcceptanceRounds: 2, Errors: 0},
+			"taskA": {TerminalStatus: "completed", JudgesPassed: true, WallSec: 100, TotalTokens: 1000, Loops: 10, Errors: 0},
 			"taskB": {TerminalStatus: "completed", JudgesPassed: true, WallSec: 50, TotalTokens: 500},
 		},
 	}
 
-	// 环境不匹配 → 拒绝对比
-	_, err := base.Compare(Environment{Model: "m2"}, nil, 0.3)
-	if err == nil || !strings.Contains(err.Error(), "环境三元组不匹配") {
-		t.Fatalf("环境不匹配应拒绝: %v", err)
+	// 环境可比性键不匹配 → not_comparable 告警（V6：不再整体拒绝，列出差异项）
+	ncAlerts, err := base.Compare(Environment{Model: "m2"}, nil, 0.3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ncAlerts) != 1 || ncAlerts[0].Level != "not_comparable" || !strings.Contains(ncAlerts[0].Detail, "model") {
+		t.Fatalf("环境不匹配应报 not_comparable: %+v", ncAlerts)
 	}
 
 	// 全同 → 无告警
 	results := []TaskResult{
-		{Name: "taskA", Passed: true, Metrics: RunMetrics{TerminalStatus: "completed", WallSec: 100, PromptTokens: 1000, Loops: 10, Replans: 1, AcceptanceRounds: 2}},
-		{Name: "taskB", Passed: true, Metrics: RunMetrics{TerminalStatus: "completed", WallSec: 50, PromptTokens: 500}},
+		{Name: "taskA", Status: StatusPass, Metrics: RunMetrics{TerminalStatus: "completed", WallSec: 100, PromptTokens: 1000, Loops: 10}},
+		{Name: "taskB", Status: StatusPass, Metrics: RunMetrics{TerminalStatus: "completed", WallSec: 50, PromptTokens: 500}},
 	}
 	alerts, err := base.Compare(env, results, 0.3)
 	if err != nil {
@@ -107,7 +110,7 @@ func TestBaselineCompare(t *testing.T) {
 
 	// 终态翻转 → hard；token 超带 → soft
 	results[0].Metrics.TerminalStatus = "timeout"
-	results[0].Passed = false
+	results[0].Status = StatusFail
 	results[1].Metrics.PromptTokens = 800 // +60%
 	alerts, err = base.Compare(env, results, 0.3)
 	if err != nil {

@@ -56,7 +56,7 @@ func TestProcessTask_CapabilityToolFilterNarrowsLLMView(t *testing.T) {
 	const agentID = "agent-cap"
 	taskID := publishAndClaim(t, s, agentID, &model.NodeCapability{Tools: []string{"read_file"}})
 
-	ag := NewAgent(agentID, "code", s, r, exec.Execute, 5)
+	ag := NewAgent(agentID, "code", s, r, exec.Execute)
 	ag.ToolSwapper = exec
 	ag.processTask(context.Background(), taskID)
 
@@ -99,7 +99,7 @@ func TestProcessTask_CapabilityToolFilterFailClosed(t *testing.T) {
 	taskID := publishAndClaim(t, s, agentID,
 		&model.NodeCapability{Tools: []string{"read_file", "nonexistent_tool"}})
 
-	ag := NewAgent(agentID, "code", s, r, exec.Execute, 5)
+	ag := NewAgent(agentID, "code", s, r, exec.Execute)
 	ag.ToolSwapper = exec
 	ag.processTask(context.Background(), taskID)
 
@@ -132,7 +132,7 @@ func TestProcessTask_CapabilityNilSwapperFailClosed(t *testing.T) {
 	const agentID = "agent-cap"
 	taskID := publishAndClaim(t, s, agentID, &model.NodeCapability{Tools: []string{"read_file"}})
 
-	ag := NewAgent(agentID, "code", s, r, plainExec, 5)
+	ag := NewAgent(agentID, "code", s, r, plainExec)
 	ag.processTask(context.Background(), taskID)
 
 	task, err := s.GetTask(taskID)
@@ -161,7 +161,7 @@ func TestProcessTask_CapabilityModelOverrideAndRestore(t *testing.T) {
 		seenModel = ag.Model // 执行期间读到的模型
 		return ExecuteResult{Output: "done"}, nil
 	}
-	ag = NewAgent(agentID, "code", s, r, exec, 5)
+	ag = NewAgent(agentID, "code", s, r, exec)
 	ag.Model = "m-base"
 	ag.processTask(context.Background(), taskID)
 

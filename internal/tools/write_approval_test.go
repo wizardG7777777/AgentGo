@@ -15,7 +15,7 @@ import (
 )
 
 func strictStore() *modes.Store {
-	return modes.NewStore(modes.GateImmediate, modes.ExecStrict, modes.TopoTeam)
+	return modes.NewStore(modes.ExecStrict, modes.TopoTeam)
 }
 
 func waitFileWritePending(t *testing.T, service *interaction.Service, count int) []interaction.Request {
@@ -261,9 +261,9 @@ func TestFileWriteApprover_AllowSessionExactPath(t *testing.T) {
 // normal / yolo / readonly / nil store：全部透传，零 Create。
 func TestFileWriteApprover_NonStrictPassthrough(t *testing.T) {
 	stores := map[string]*modes.Store{
-		"normal":   modes.NewStore(modes.GateImmediate, modes.ExecNormal, modes.TopoTeam),
-		"yolo":     modes.NewStore(modes.GateImmediate, modes.ExecYolo, modes.TopoTeam),
-		"readonly": modes.NewStore(modes.GateImmediate, modes.ExecReadonly, modes.TopoTeam),
+		"normal":   modes.NewStore(modes.ExecNormal, modes.TopoTeam),
+		"yolo":     modes.NewStore(modes.ExecYolo, modes.TopoTeam),
+		"readonly": modes.NewStore(modes.ExecReadonly, modes.TopoTeam),
 		"nil":      nil,
 	}
 	for name, store := range stores {

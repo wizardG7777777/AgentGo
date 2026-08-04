@@ -13,6 +13,9 @@ import (
 //
 // 同步性：Async（与其他用户 reactor 一致）；Priority 500。
 // 一次触发只 spawn 一个 ad-hoc agent + 一个 initial_task。
+//
+// C6b 起 Plan 控制面已删除，spawn_agent 行为统一为直接 spawn——不再有
+// 「Plan 内任务改道 ReplanRequest」的 plan_boundary 拦截。
 type spawnAgentReactor struct {
 	name       string
 	onKind     trace.EventKind
@@ -23,8 +26,6 @@ type spawnAgentReactor struct {
 	sysPromTpl *promptTemplate // override.system_prompt（可为 nil）
 	lifecycle  string
 	host       spawn.SpawnHost
-	store      PublishStore
-	requester  ReplanRequester
 }
 
 func (r *spawnAgentReactor) Name() string                 { return r.name }
@@ -52,9 +53,6 @@ func (r *spawnAgentReactor) RunWithContext(ctx context.Context, ev trace.Event) 
 func (r *spawnAgentReactor) run(ctx context.Context, ev trace.Event) error {
 	if !r.when.eval(ev) {
 		return nil
-	}
-	if redirected, err := redirectPlannedWork(ev, "spawn_agent", "", r.store, r.requester); redirected {
-		return err
 	}
 	if r.lifecycle != "" && r.lifecycle != "one_shot" {
 		return fmt.Errorf("spawn_agent[%s]: lifecycle %q not implemented (v5.x; only one_shot)", r.name, r.lifecycle)

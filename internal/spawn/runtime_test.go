@@ -27,10 +27,8 @@ func defaultBase(t *testing.T) (config.AgentKind, map[string][]string) {
 		Tools:                        []string{"read_file", "list_dir"},
 		SystemPromptFile:             prompt,
 		Model:                        "gpt-base",
-		AgentMaxLoops:                10,
 		TaskMaxRetries:               3,
 		EnforceCompactTokenThreshold: 50000,
-		ContextLimit:                 100000,
 	}, nil
 }
 
@@ -53,7 +51,7 @@ func TestBuildAdhocRuntime_NoOverride_InheritsAll(t *testing.T) {
 	if rt.Model != "gpt-base" {
 		t.Errorf("Model=%q want gpt-base (base wins, llm default unused)", rt.Model)
 	}
-	if rt.AgentMaxLoops != 10 || rt.TaskMaxRetries != 3 || rt.ContextLimit != 100000 {
+	if rt.TaskMaxRetries != 3 || rt.EnforceCompactTokenThreshold != 50000 {
 		t.Errorf("base numeric fields not inherited: %+v", rt)
 	}
 	if len(rt.AllowedTools) != 2 {
@@ -67,8 +65,7 @@ func TestBuildAdhocRuntime_Override_AppliesNonZero(t *testing.T) {
 		SystemPrompt:    "OVERRIDE PROMPT",
 		SystemPromptSet: true,
 		Model:           "gpt-override",
-		AgentMaxLoops:   5,
-		ContextLimit:    8000,
+		TaskMaxRetries:  9,
 		// 其他字段零值=不覆盖
 	}
 	rt, err := buildAdhocRuntime(base, config.LLMConfig{}, profiles, override, "id", "adhoc:x", 0)
@@ -81,15 +78,12 @@ func TestBuildAdhocRuntime_Override_AppliesNonZero(t *testing.T) {
 	if rt.Model != "gpt-override" {
 		t.Errorf("Model not overridden: %q", rt.Model)
 	}
-	if rt.AgentMaxLoops != 5 {
-		t.Errorf("AgentMaxLoops not overridden: %d", rt.AgentMaxLoops)
-	}
-	if rt.ContextLimit != 8000 {
-		t.Errorf("ContextLimit not overridden: %d", rt.ContextLimit)
+	if rt.TaskMaxRetries != 9 {
+		t.Errorf("TaskMaxRetries not overridden: %d", rt.TaskMaxRetries)
 	}
 	// 未 override 的字段保持 base
-	if rt.TaskMaxRetries != 3 {
-		t.Errorf("TaskMaxRetries should stay base=3, got %d", rt.TaskMaxRetries)
+	if rt.EnforceCompactTokenThreshold != 50000 {
+		t.Errorf("EnforceCompactTokenThreshold should stay base=50000, got %d", rt.EnforceCompactTokenThreshold)
 	}
 }
 

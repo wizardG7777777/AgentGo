@@ -76,6 +76,9 @@ func (h *PathBoundaryHook) Matches(toolName string) bool {
 //   - 路径参数缺失或非字符串 → Abort，错误消息带出正确字段名 + 跨工具差异提示
 //   - pathutil.ValidatePath 返回 error（越界 / 敏感文件）→ Abort
 //   - 其他情况 → Continue
+//
+// 四类 Abort 统一使用 ReasonPathOutOfBoundary 原因码：路径类拒绝没有唯一
+// 安全恢复方案（H2a 过滤纪律），不给工具动作建议，只标记升级 user。
 func (h *PathBoundaryHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecision {
 	field, ok := pathFieldByTool[hctx.ToolName]
 	if !ok {
@@ -83,35 +86,42 @@ func (h *PathBoundaryHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecision 
 	}
 	rawPath, exists := hctx.Args[field]
 	if !exists {
-		return hook.ToolHookDecision{
-			Action:      hook.Abort,
-			HookName:    h.Name(),
-			AbortReason: h.missingFieldReason(hctx, field),
-		}
+		return h.abortOutOfBoundary(h.missingFieldReason(hctx, field), hctx.ToolName)
 	}
 	pathStr, ok := rawPath.(string)
 	if !ok {
-		return hook.ToolHookDecision{
-			Action:      hook.Abort,
-			HookName:    h.Name(),
-			AbortReason: fmt.Sprintf("工具 %s 的 %s 参数类型必须是 string，收到 %T", hctx.ToolName, field, rawPath),
-		}
+		return h.abortOutOfBoundary(
+			fmt.Sprintf("工具 %s 的 %s 参数类型必须是 string，收到 %T", hctx.ToolName, field, rawPath),
+			hctx.ToolName,
+		)
 	}
 	if pathStr == "" {
-		return hook.ToolHookDecision{
-			Action:      hook.Abort,
-			HookName:    h.Name(),
-			AbortReason: fmt.Sprintf("工具 %s 的 %s 参数不能为空", hctx.ToolName, field),
-		}
+		return h.abortOutOfBoundary(
+			fmt.Sprintf("工具 %s 的 %s 参数不能为空", hctx.ToolName, field),
+			hctx.ToolName,
+		)
 	}
 	if _, err := pathutil.ValidatePath(pathStr, h.ProjectRoot); err != nil {
-		return hook.ToolHookDecision{
-			Action:      hook.Abort,
-			HookName:    h.Name(),
-			AbortReason: fmt.Sprintf("路径校验失败: %v", err),
-		}
+		return h.abortOutOfBoundary(fmt.Sprintf("路径校验失败: %v", err), pathStr)
 	}
 	return hook.ToolHookDecision{Action: hook.Continue}
+}
+
+// abortOutOfBoundary 构造路径类拒绝的统一 Abort 决策：不可自动重试，
+// 升级 user（target 用于派生建议 ID 的目标 digest）。
+func (h *PathBoundaryHook) abortOutOfBoundary(reason, target string) hook.ToolHookDecision {
+	return hook.ToolHookDecision{
+		Action:      hook.Abort,
+		HookName:    h.Name(),
+		AbortReason: reason,
+		ReasonCode:  ReasonPathOutOfBoundary,
+		Suggestions: []hook.Suggestion{
+			hook.NewSuggestion(h.Name(), ReasonPathOutOfBoundary, target, false,
+				hook.EscalationAction(hook.SuggestKindUser,
+					"路径越出项目根边界或参数非法，需用户确认路径或调整项目根后重试"),
+			),
+		},
+	}
 }
 
 // missingFieldReason 构造"缺少路径参数"的自助指引错误消息：

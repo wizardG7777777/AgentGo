@@ -73,5 +73,6 @@ func (h *PerAgentDedupHook) Run(hctx hook.MailboxHookContext) hook.MailboxHookDe
 			"已存在 %d 个 EventSource=%s EventType=%q 的 pending 唤醒任务（agent=%s），跳过重复发布",
 			len(pending), mailNotifierEventSource, hctx.EventType, hctx.AgentID,
 		),
+		ReasonCode: ReasonWakeTaskDuplicate,
 	}
 }

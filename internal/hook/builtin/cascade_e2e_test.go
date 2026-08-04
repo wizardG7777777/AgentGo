@@ -13,11 +13,11 @@ import (
 //
 // 测试模拟一个真实的 worker A ↔ worker B 邮件互回循环：
 //
-//   1. worker A 主动发出 chain_depth=0 的初始邮件（模拟用户 /steer）
-//   2. worker B 被唤醒，回复 chain_depth=1
-//   3. worker A 被唤醒，回复 chain_depth=2
-//   4. worker B 被唤醒，回复 chain_depth=3
-//   5. worker A 试图回复 chain_depth=4 → **应被 ChainDepthLimitHook 拒绝**
+//  1. worker A 主动发出 chain_depth=0 的初始邮件（模拟用户 /steer）
+//  2. worker B 被唤醒，回复 chain_depth=1
+//  3. worker A 被唤醒，回复 chain_depth=2
+//  4. worker B 被唤醒，回复 chain_depth=3
+//  5. worker A 试图回复 chain_depth=4 → **应被 ChainDepthLimitHook 拒绝**
 //
 // 期望结果：
 //   - mailbox 总投递数有界（不会无限增长）

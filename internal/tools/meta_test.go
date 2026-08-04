@@ -70,10 +70,6 @@ func (f *fakeStore) GetDependencyResults(taskID string) (map[string]string, erro
 func (f *fakeStore) GetDependencyArtifacts(taskID string) (map[string][]string, error) {
 	return nil, nil
 }
-func (f *fakeStore) GetDependencyTransferNotes(taskID string) (map[string]string, error) {
-	return nil, nil
-}
-func (f *fakeStore) SetTransferNote(taskID string, note string) error       { return nil }
 func (f *fakeStore) AppendArtifact(taskID string, path string) error        { return nil }
 func (f *fakeStore) RecordLastResponse(taskID string, content string) error { return nil }
 func (f *fakeStore) AppendSchedulerBatch(taskID, childTaskID string) error  { return nil }
@@ -88,17 +84,21 @@ type fakeHolder struct{ id string }
 
 func (f *fakeHolder) Get() string { return f.id }
 
+// fakeRouteValidator 模拟运行时路由权威：routes 是 event_type → 保证工具的
+// 映射；ownerScopes 是 event_type → 归属 scope ID（controller 任务 ID）的映射，
+// 空串表示全局路由。CanRouteForPlan 第一参数是发布方的归属 scope（Scheduler
+// 经 LineageHolder 传 controller 任务 ID；Worker 发布时传 ""）。
 type fakeRouteValidator struct {
-	routes  map[string][]string
-	planIDs map[string]string
+	routes      map[string][]string
+	ownerScopes map[string]string
 }
 
-func (f fakeRouteValidator) CanRouteForPlan(planID, eventType string, required ...string) bool {
+func (f fakeRouteValidator) CanRouteForPlan(ownerScopeID, eventType string, required ...string) bool {
 	have, ok := f.routes[eventType]
 	if !ok {
 		return false
 	}
-	if owner := f.planIDs[eventType]; owner != "" && owner != planID {
+	if owner := f.ownerScopes[eventType]; owner != "" && owner != ownerScopeID {
 		return false
 	}
 	set := make(map[string]bool, len(have))
@@ -207,16 +207,19 @@ func TestPublishTask_SchedulerRejectsMissingRuntimeRoute(t *testing.T) {
 	}
 }
 
-func TestPublishTask_DynamicRouteIsBoundToCurrentPlanWhileStaticRouteRemainsGlobal(t *testing.T) {
+// 动态 Team 路由按归属 scope（controller 任务 ID）绑定：别的 scope 拥有的
+// team 路由对当前请求不可见；本 scope 拥有的路由与全局静态路由照常可用。
+func TestPublishTask_DynamicRouteIsBoundToCurrentScopeWhileStaticRouteRemainsGlobal(t *testing.T) {
 	s := newFakeStore()
-	controller := &model.Task{ID: "controller-b", PlanID: "plan-b", Depth: 0, Status: model.TaskStatusProcessing}
+	controller := &model.Task{ID: "controller-b", Depth: 0, Status: model.TaskStatusProcessing}
 	s.tasks[controller.ID] = controller
 	routes := fakeRouteValidator{
 		routes: map[string][]string{
 			"team:owned-by-a": {"read_file"},
+			"team:owned-by-b": {"read_file"},
 			"static:global":   {"read_file"},
 		},
-		planIDs: map[string]string{"team:owned-by-a": "plan-a"},
+		ownerScopes: map[string]string{"team:owned-by-a": "controller-a", "team:owned-by-b": "controller-b"},
 	}
 	g := MetaGroup{
 		Store: s, LineageHolder: &fakeHolder{id: controller.ID}, RouteValidator: routes,
@@ -225,27 +228,37 @@ func TestPublishTask_DynamicRouteIsBoundToCurrentPlanWhileStaticRouteRemainsGlob
 	g.Register(reg)
 
 	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "must not escape plan scope", "event_type": "team:owned-by-a",
-	})); err == nil || !strings.Contains(err.Error(), "当前 Plan") {
-		t.Fatalf("cross-Plan dynamic route should be rejected, got %v", err)
+		"description": "must not escape request scope", "event_type": "team:owned-by-a",
+	})); err == nil || !strings.Contains(err.Error(), "没有 ready Agent route") {
+		t.Fatalf("cross-scope dynamic route should be rejected, got %v", err)
 	}
 	if len(s.createCalls) != 0 {
-		t.Fatalf("cross-Plan rejection must happen before publishing: %+v", s.createCalls)
+		t.Fatalf("cross-scope rejection must happen before publishing: %+v", s.createCalls)
 	}
 
 	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description": "own team work", "event_type": "team:owned-by-b",
+	})); err != nil {
+		t.Fatalf("own-scope dynamic route should publish: %v", err)
+	}
+	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
 		"description": "global static work", "event_type": "static:global",
 	})); err != nil {
-		t.Fatalf("static route should remain usable from any Plan: %v", err)
+		t.Fatalf("static route should remain usable from any scope: %v", err)
 	}
-	if len(s.createCalls) != 1 || s.createCalls[0].EventSource != controller.ID {
-		t.Fatalf("expected one Plan-lineage task on static route, got %+v", s.createCalls)
+	if len(s.createCalls) != 2 {
+		t.Fatalf("expected 2 published tasks, got %+v", s.createCalls)
+	}
+	for _, created := range s.createCalls {
+		if created.EventSource != controller.ID || created.ParentTaskID != controller.ID {
+			t.Fatalf("published task lost controller lineage: %+v", created)
+		}
 	}
 }
 
 func TestPublishTask_ExploreNameUsesRuntimeCapabilitiesWhenRegistryIsAvailable(t *testing.T) {
 	s := newFakeStore()
-	controller := &model.Task{ID: "controller", PlanID: "plan", Status: model.TaskStatusProcessing}
+	controller := &model.Task{ID: "controller", Status: model.TaskStatusProcessing}
 	s.tasks[controller.ID] = controller
 	g := MetaGroup{
 		Store: s, LineageHolder: &fakeHolder{id: controller.ID},

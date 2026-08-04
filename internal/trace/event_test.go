@@ -123,7 +123,7 @@ func TestNilSubpayloadsOmitted(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 	s := string(data)
-	for _, field := range []string{`"transition"`, `"shell_exec"`, `"shell_timeout"`, `"plan"`, `"acceptance"`} {
+	for _, field := range []string{`"transition"`, `"shell_exec"`, `"shell_timeout"`} {
 		if strings.Contains(s, field) {
 			t.Errorf("nil sub-payload field %s should be omitted, got: %s", field, s)
 		}
@@ -137,53 +137,26 @@ func TestV4JsonlBackwardCompat(t *testing.T) {
 	if err := json.Unmarshal([]byte(v4Line), &ev); err != nil {
 		t.Fatalf("v4 jsonl unmarshal failed: %v", err)
 	}
-	if ev.Transition != nil || ev.ShellExec != nil || ev.ShellTimeout != nil || ev.Plan != nil || ev.Acceptance != nil {
-		t.Errorf("v4 jsonl should produce nil sub-payloads, got transition=%v shellExec=%v shellTimeout=%v plan=%v acceptance=%v",
-			ev.Transition, ev.ShellExec, ev.ShellTimeout, ev.Plan, ev.Acceptance)
+	if ev.Transition != nil || ev.ShellExec != nil || ev.ShellTimeout != nil {
+		t.Errorf("v4 jsonl should produce nil sub-payloads, got transition=%v shellExec=%v shellTimeout=%v",
+			ev.Transition, ev.ShellExec, ev.ShellTimeout)
 	}
 	if ev.Kind != KindTaskClaimed || ev.TaskID != "task-old" {
 		t.Errorf("v4 jsonl base fields lost: kind=%s taskID=%s", ev.Kind, ev.TaskID)
 	}
 }
 
-func TestPlanAcceptanceRoundtrip(t *testing.T) {
-	ev := Event{
-		Timestamp: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC),
-		Kind:      KindAcceptanceCompleted,
-		TaskID:    "acceptance-task",
-		Plan: &PlanTraceContext{
-			PlanID: "plan-1", PlanRevision: 4, ExecutionStateVersion: 8,
-			AcceptanceSpecRevision: 2, GraphDigest: "graph-digest",
-		},
-		Acceptance: &AcceptanceTraceContext{
-			AcceptanceRunID: "run-1", ResultID: "result-1", SpecID: "spec-1",
-			SpecRevision: 2, TargetRevision: 4, TargetGraphDigest: "graph-digest",
-			RunnerTaskID: "acceptance-task", RunnerKind: "verifier",
-			Verdict: "pass", Status: "valid", Reason: "all criteria passed",
-		},
+// TestLegacyPlanJsonlTolerated 验证 V6 只读 legacy 姿态：含已删除的
+// plan/acceptance 子载荷与 plan_/replan_ kind 的旧 JSONL 行仍能解析，
+// 未知字段被忽略、kind 原样保留（渲染层按未知 kind 处理，见 cli_test）。
+func TestLegacyPlanJsonlTolerated(t *testing.T) {
+	legacyLine := `{"ts":"2026-07-18T00:00:00Z","kind":"plan_terminal","task_id":"task-old","reason":"pass","plan":{"plan_id":"p1","plan_revision":3},"acceptance":{"verdict":"pass"}}`
+	var ev Event
+	if err := json.Unmarshal([]byte(legacyLine), &ev); err != nil {
+		t.Fatalf("legacy plan jsonl unmarshal failed: %v", err)
 	}
-	data, err := json.Marshal(ev)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	var got Event
-	if err := json.Unmarshal(data, &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if got.Plan == nil || got.Acceptance == nil {
-		t.Fatalf("structured DAG payload lost: plan=%+v acceptance=%+v", got.Plan, got.Acceptance)
-	}
-	if got.Plan.PlanID != "plan-1" || got.Plan.PlanRevision != 4 || got.Plan.ExecutionStateVersion != 8 ||
-		got.Plan.AcceptanceSpecRevision != 2 || got.Plan.GraphDigest != "graph-digest" {
-		t.Fatalf("Plan payload changed: %+v", got.Plan)
-	}
-	if got.Acceptance.AcceptanceRunID != "run-1" || got.Acceptance.ResultID != "result-1" ||
-		got.Acceptance.SpecID != "spec-1" || got.Acceptance.SpecRevision != 2 ||
-		got.Acceptance.TargetRevision != 4 || got.Acceptance.TargetGraphDigest != "graph-digest" ||
-		got.Acceptance.RunnerTaskID != "acceptance-task" || got.Acceptance.RunnerKind != "verifier" ||
-		got.Acceptance.Verdict != "pass" || got.Acceptance.Status != "valid" ||
-		got.Acceptance.Reason != "all criteria passed" {
-		t.Fatalf("Acceptance payload changed: %+v", got.Acceptance)
+	if ev.Kind != "plan_terminal" || ev.TaskID != "task-old" || ev.Reason != "pass" {
+		t.Errorf("legacy plan jsonl base fields lost: %+v", ev)
 	}
 }
 
@@ -222,10 +195,10 @@ func TestFormatEventDetailsTransitionRendering(t *testing.T) {
 				Reason: "max retries",
 				Transition: &Transition{
 					PrevStatus: "processing", NewStatus: "failed",
-					Cause: "max_loops_exceeded", RetryCount: 3,
+					Cause: "recoverable_error_retries_exhausted", RetryCount: 3,
 				},
 			},
-			contains: []string{"prev=processing", "new=failed", "retry=3", "cause=max_loops_exceeded", `reason="max retries"`},
+			contains: []string{"prev=processing", "new=failed", "retry=3", "cause=recoverable_error_retries_exhausted", `reason="max retries"`},
 		},
 		{
 			name: "task_cancelled with cancel_source",

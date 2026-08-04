@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/effect"
 	"agentgo/internal/pathutil"
 	"agentgo/internal/roster"
 	"agentgo/internal/tools/hashline"
@@ -28,13 +29,16 @@ import (
 // 严格遵循「先锁后读」的顺序，避免 TOCTOU 竞态。
 //
 // C5 迁移：原 Store / ProjectRoot 字段以及 recordArtifact 方法已删除。
-// 写入产物事实流的登记由 Hook System 的 RecordArtifactHook 在 PostCall
-// 阶段接管，详见 internal/hook/builtin/record_artifact.go。
+// 写入产物事实流的登记现由 record-artifact Reactor（订阅 KindFileWritten）
+// 接管，详见 internal/reactor/builtin/record_artifact.go。
 type LocalWriteGroup struct {
 	LocalReadGroup               // embed: 继承 Workdir + Cache
 	Roster         roster.Roster // required
 	AgentID        string        // required
 	WaitTimeoutSec int           // §8.3：文件冲突排队等待秒数，0 = 不排队（旧行为）
+	// EffectJournal 是 V6 §4 H2b 副作用账本（internal/effect）；
+	// nil 时 write_file/edit_file 不记账（行为与引入账本前完全一致）。
+	EffectJournal *effect.Journal
 }
 
 // Register 把 write_file / edit_file 注册到 r。
@@ -193,15 +197,26 @@ func (g LocalWriteGroup) writeFile(ctx context.Context, args map[string]any) (st
 	// 乐观并发控制由 ValidateExpectedHashHook（PreCall, prio=20）接管。
 	// 决策 B1：接受微小 TOCTOU 窗口（hook 校验在 Roster 锁外）。
 
+	// H2b Effect Journal：执行前先落账（prepared），ArgsDigest 取将落盘
+	// 内容的 sha256 前 12——恢复裁决据此与盘上事实比对（verify_first）。
+	effID := effectPrepare(g.EffectJournal, ctx, g.AgentID,
+		effect.KindFileWrite, logicalPath, digest12([]byte(content)), effect.PolicyVerifyFirst)
+
 	// 确保父目录存在
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
+		effectMarkUnknown(g.EffectJournal, effID, "创建目录失败: "+err.Error())
 		return "", fmt.Errorf("创建目录失败: %w", err)
 	}
 
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		// 写入返回错误时盘上可能残留部分内容——结果不可知，标 unknown
+		// 交恢复裁决（核验盘上 hash 定论），不静默定论。
+		effectMarkUnknown(g.EffectJournal, effID, "写入返回错误: "+err.Error())
 		return "", fmt.Errorf("写入文件失败: %w", err)
 	}
+	contentHash := computeSHA256([]byte(content))
+	effectSettle(g.EffectJournal, effID, fmt.Sprintf("bytes=%d sha256=%s", len(content), contentHash))
 
 	// 写入后使缓存失效（键为最终物理路径，与 read_file 的 Get/Put 键一致）
 	if g.Cache != nil {
@@ -217,15 +232,15 @@ func (g LocalWriteGroup) writeFile(ctx context.Context, args map[string]any) (st
 		Tool:    "write_file",
 		Path:    logicalPath,
 		Bytes:   len(content),
-		Hash:    computeSHA256([]byte(content)),
+		Hash:    contentHash,
 	}
 	if isolated {
 		writeEv.Description = fmt.Sprintf("写时复制隔离：落点 %s，任务成功终态合并回主根", path)
 	}
 	trace.Emit(writeEv)
 
-	// Artifacts：C5 迁移后由 RecordArtifactHook（PostCall）记录到 task.Artifacts。
-	// 详见 internal/hook/builtin/record_artifact.go。
+	// Artifacts：由 record-artifact Reactor（订阅 KindFileWritten）记录到
+	// task.Artifacts，详见 internal/reactor/builtin/record_artifact.go。
 
 	result := fmt.Sprintf("文件已写入: %s (%d 字节)", logicalPath, len(content))
 	if isolated {
@@ -332,9 +347,17 @@ func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (str
 		return "", fmt.Errorf("未找到匹配内容，old_str 在文件中不存在")
 	}
 
+	// H2b Effect Journal：newContent 已确定、写盘前先落账（prepared），
+	// ArgsDigest 取替换后全文的 sha256 前 12——恢复裁决据此与盘上事实比对。
+	effID := effectPrepare(g.EffectJournal, ctx, g.AgentID,
+		effect.KindFileEdit, logicalPath, digest12([]byte(newContent)), effect.PolicyVerifyFirst)
+
 	if err := os.WriteFile(path, []byte(newContent), 0644); err != nil {
+		effectMarkUnknown(g.EffectJournal, effID, "写入返回错误: "+err.Error())
 		return "", fmt.Errorf("写入文件失败: %w", err)
 	}
+	newHash := computeSHA256([]byte(newContent))
+	effectSettle(g.EffectJournal, effID, fmt.Sprintf("bytes=%d sha256=%s", len(newContent), newHash))
 
 	// 写入后使缓存失效（键为最终物理路径，与 read_file 的 Get/Put 键一致）
 	if g.Cache != nil {
@@ -350,14 +373,14 @@ func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (str
 		Tool:    "edit_file",
 		Path:    logicalPath,
 		Bytes:   len(newContent),
-		Hash:    computeSHA256([]byte(newContent)),
+		Hash:    newHash,
 	}
 	if isolated {
 		writeEv.Description = fmt.Sprintf("写时复制隔离：落点 %s，任务成功终态合并回主根", path)
 	}
 	trace.Emit(writeEv)
 
-	// Artifacts：C5 迁移后由 RecordArtifactHook（PostCall）记录到 task.Artifacts。
+	// Artifacts：由 record-artifact Reactor（订阅 KindFileWritten）记录到 task.Artifacts。
 
 	oldLen := len(content)
 	newLen := len(newContent)

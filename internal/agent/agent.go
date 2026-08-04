@@ -13,13 +13,16 @@ import (
 	"sync"
 	"time"
 
+	"agentgo/internal/effect"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/memory"
 	"agentgo/internal/model"
+	"agentgo/internal/modes"
 	"agentgo/internal/output"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
+	"agentgo/internal/taskmem"
 	"agentgo/internal/trace"
 )
 
@@ -30,11 +33,6 @@ type ErrRecoverable struct {
 
 func (e *ErrRecoverable) Error() string { return e.Err.Error() }
 func (e *ErrRecoverable) Unwrap() error { return e.Err }
-
-// ErrExecutionSuspended is returned by an execution wrapper when the Task's
-// durable Plan is no longer runnable. processTask treats it as a cooperative
-// lease release, not as a task failure or retry.
-var ErrExecutionSuspended = errors.New("task execution suspended by plan control plane")
 
 // ToolResult 保存单个 tool call 的执行结果，用于重建 OpenAI tool calling 协议消息。
 type ToolResult struct {
@@ -62,7 +60,7 @@ type ExecuteResult struct {
 // 包含完整的 tool calling 信息，确保历史消息能正确重建为 OpenAI 协议格式。
 //
 // PromptTokens / CompletionTokens / Model 由 nextUpgrade_v4.md §11.7.3 引入，
-// 用于 PredictNextPromptTokens 的"实测锚定 + 新增估算"策略：
+// 供历史压缩的 token 估算做"实测锚定 + 新增估算"：
 //   - PromptTokens：产生该条 assistant 回复时的实测 prompt token 数（来自 SDK Usage）
 //   - CompletionTokens：同上，本轮 completion 实测值
 //   - Model：产生该回复时使用的模型名（不同模型 tokenizer 不同，跨模型实测值不可比）
@@ -84,7 +82,9 @@ type HistoryEntry struct {
 type TaskExecutor func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error)
 
 // TokenStats 是 Agent 级别的累计 Token 消耗统计（nextUpgrade_v4.md §11.7.3）。
-// 每次 LLM 调用后累加，用于成本追踪和运行时监控。
+// 每次 LLM 调用后累加，仅作 TUI/Web AgentCard 的实时视图数据源（经
+// TokenStatsSnapshot 消费）；V6 起不再序列化进 trace——llm_call_end 事件
+// 是唯一 token 账本，原 token_stats 累计事件已删除。
 type TokenStats struct {
 	TotalPromptTokens     int64
 	TotalCompletionTokens int64
@@ -94,21 +94,15 @@ type TokenStats struct {
 type Agent struct {
 	ID        string
 	EventType string
-	// PlanIDScope is non-empty only for a dynamically provisioned Team runner.
-	// Such a runner must never claim a Task owned by another Plan, even if a
-	// stale or colliding event_type makes that Task visible in the shared queue.
-	// Static agents keep the empty value and remain globally routable.
-	PlanIDScope string
-	Store       store.TaskStore
-	Roster      roster.Roster
-	Execute     TaskExecutor
+	Store     store.TaskStore
+	Roster    roster.Roster
+	Execute   TaskExecutor
 	// ToolSwapper 是 executor 暴露的按任务工具注册表替换通道（*LLMExecutor
 	// 实现 ToolRegistrySwapper）。任务携带 NodeCapability.Tools 时，
 	// processTask 经它换入过滤视图、任务结束恢复；nil 表示 executor 不支持
 	// 按任务过滤——携带工具子集的任务将 fail-closed 终止（无法保证
 	// "LLM 只见子集"的隔离语义时不降级执行）。与 Execute 一样在装配期注入。
 	ToolSwapper           ToolRegistrySwapper
-	MaxLoops              int
 	MaxRetries            int // 最大重试次数，0 表示不限制
 	PollInterval          time.Duration
 	IdleThreshold         int // 连续空轮询退出阈值，0 表示禁用
@@ -116,13 +110,11 @@ type Agent struct {
 	CompactTokenThreshold int // Layer 2 触发阈值（prompt tokens），默认 80000
 	CompactKeepRecent     int // 压缩时保留最近 N 条历史，默认 3
 	// Model 是该 Agent 当前生效的模型名，用于 HistoryEntry.Model 记录。
-	// nextUpgrade_v4.md §11.7.3：跨模型实测值不可比，PredictNextPromptTokens
+	// nextUpgrade_v4.md §11.7.3：跨模型实测值不可比，压缩阈值估算
 	// 仅锚定当前模型一致的最近一条 PromptTokens > 0 条目。空串时退化为粗略估算。
 	Model string
-	// ContextLimit 是历史 token 硬上限（§11.7.4 截断保护）。0 表示不做硬限截断
-	// （仅 Layer 1 + Layer 2 压缩生效，与 v3 行为兼容）。详见 nextUpgrade_v4.md §11.7.5。
-	ContextLimit int
-	// TokenStats 是 Agent 级别的累计 Token 消耗（§11.7.3）。
+	// TokenStats 是 Agent 级别的累计 Token 消耗（§11.7.3），仅作 UI 实时视图
+	// 数据源，不写入 trace 账本。
 	// 运行期读写必须经 AddTokenStats / TokenStatsSnapshot（tokenMu 保护）——
 	// UI 轮询 goroutine 与 ReAct 循环并发访问该字段（A3 修复）。
 	TokenStats          TokenStats
@@ -150,10 +142,11 @@ type Agent struct {
 	// ArtifactResolver 是 expected-artifacts 校验的磁盘兜底解析器（runner
 	// 装配注入 NewArtifactPhysicalResolver）。nil 时校验退化为纯账本比对。
 	ArtifactResolver ArtifactPhysicalResolver
-	// WorkspaceReplanRequester 是合并冲突时自动登记高优 ReplanRequest 的通道
-	// （runner 装配时注入 plan.Coordinator）。nil 或任务无 PlanID 时跳过登记——
-	// 任务转 failed 本身不受影响。
-	WorkspaceReplanRequester ReplanRequester
+
+	// EffectJournal 是 V6 §4 H2b 副作用账本（internal/effect），runner 装配
+	// 注入；workspace 合并（mergeWorkspaceBeforeComplete）经它记录
+	// prepared/settled。nil 时不记账（行为与引入账本前完全一致）。
+	EffectJournal *effect.Journal
 
 	// UserOutput 是用户可见内容的输出目标。非 nil 时，IsUserFacing 的自然文本完成
 	// 和 report_done 等输出会写入此处，而不是直接 fmt.Printf 到 stdout。
@@ -178,7 +171,7 @@ type Agent struct {
 	// 打印到 stdout，无需 LLM 显式调用 report_done。
 	//
 	// false 时（默认，worker / explorer 行为）：自然完成不打印——它们的输出由
-	// scheduler 通过 board snapshot / TransferNote 间接消费。
+	// scheduler 通过 board snapshot / 依赖结果注入间接消费。
 	//
 	// 设计动机（2026-04-27 架构修复）：用户提示词措辞（如"不用撰写报告"）可能让
 	// LLM 词法匹配到工具名 `report_done` 而跳过该工具，导致用户终端 30+ 分钟看不到
@@ -189,10 +182,6 @@ type Agent struct {
 	// report_done 工具仍然保留（作为可选的 artifacts 校对块格式化工具），但不再是
 	// 用户可见输出的唯一通道——LLM 不调它也能让用户看到内容。详见 v5 §11 设计文档。
 	IsUserFacing bool
-
-	// TransferNoteMaxTokens 是 TransferNote 单条的 token 预算上限。0 或负数视为默认 3000。
-	// 失败路径 buildTransferNote 按此值做 L1/L3 输出截断。Sprint 3 #5 引入。
-	TransferNoteMaxTokens int
 
 	// TextOnlyReportsDir 覆盖 persistTextOnlySubmission 的兜底落盘目录。
 	// 空串时使用默认 ".agentgo/reports"（相对于进程 CWD）。生产线无需设置，
@@ -233,6 +222,31 @@ type Agent struct {
 	// TeamRefreshInterval 是 team_snapshot / file_awareness 的轮数刷新间隔。
 	// <=0 时回退为默认 5。与 v4 TeamAwarenessConfig.SnapshotRefreshInterval 等价。
 	TeamRefreshInterval int
+
+	// TaskMemStore 是 V6 §3 Task Memory（CM2，internal/taskmem）的持久化
+	// 存储。nil 时整链路关闭：不创建/更新/注入/checkpoint，行为与之前
+	// 完全一致。装配见 runner.New（deps.TaskMemStore）。
+	TaskMemStore *taskmem.Store
+
+	// Modes 是 exec 轴模式源（V6 §4 H1 ExecutionLease 的 Policy 交集输入）：
+	// exec=readonly 时租约从 BusinessTools 剔除写工具与 run_shell；
+	// exec=strict 时租约记 ApprovalRequired=true。nil 等价 normal（兼容
+	// 旧装配与单测直构）。runner / scheduler 装配注入与 Gate 相同的实例。
+	Modes *modes.Store
+
+	// PromptSource 是 V6 §2 P1a Prompt 有序编译的静态 prompt 身份源
+	// （*LLMExecutor 实现 PromptIdentityProvider；runner / scheduler 装配
+	// 注入，与 Execute/ToolSwapper 同一句柄）。processTask 在每个 attempt
+	// 开始编译并冻结 Prompt Build（组件含 agent_role 全文 digest、
+	// 当时工具清单、控制协议块），经 ctx 载体供 executor 把 Build.ID 并入
+	// 每轮 context_manifest_built 事件。nil 时 agent_role/base_contract
+	// 组件缺失（降级观测，不阻断任务）。
+	PromptSource PromptIdentityProvider
+
+	// loopFuse 是 emergency loop fuse 的测试覆盖口：>0 时替代包级常量
+	// emergencyLoopFuse 生效。生产装配不得设置——fuse 是不可经任何 YAML/配置
+	// 调低的程序缺陷防御兜底，不是正常终止条件（V6，见 processTask 循环顶部）。
+	loopFuse int
 }
 
 // publishCompletedTurn 为一次 TaskExecutor 调用发布恰好一个不可变的
@@ -278,17 +292,8 @@ func (a *Agent) publishCompletedTurn(
 	})
 }
 
-// transferNoteMaxTokens 返回实际使用的 TransferNote 预算。
-// TransferNoteMaxTokens 字段 <= 0 时使用默认值 3000。
-func (a *Agent) transferNoteMaxTokens() int {
-	if a.TransferNoteMaxTokens > 0 {
-		return a.TransferNoteMaxTokens
-	}
-	return 3000
-}
-
 // AddTokenStats 线程安全地累加一次 LLM 调用的 token 消耗，并返回累加后的
-// 一致快照（供 trace 事件等本 goroutine 后续使用，避免再次取锁）。
+// 一致快照（供本 goroutine 后续使用，避免再次取锁）。
 func (a *Agent) AddTokenStats(prompt, completion int64) TokenStats {
 	a.tokenMu.Lock()
 	defer a.tokenMu.Unlock()
@@ -462,9 +467,6 @@ func (a *Agent) run(ctx context.Context, ready func()) {
 		// Try to claim the highest priority task
 		claimed := false
 		for _, task := range tasks {
-			if a.PlanIDScope != "" && task.PlanID != a.PlanIDScope {
-				continue
-			}
 			if err := a.Store.ClaimTask(a.ID, task.ID); err == nil {
 				idleCount = 0
 				taskCtx := ctx
@@ -486,6 +488,25 @@ func (a *Agent) run(ctx context.Context, ready func()) {
 			a.sleep(ctx)
 		}
 	}
+}
+
+// emergencyLoopFuse 是 ReAct 循环的应急保险丝（V6，docs/nextUpgrade-V6.md
+// §5 升级思路 8）：循环计数越过该值时判定为程序缺陷造成的真死循环，任务
+// 进入 blocked 终态并登记 replan，绝不自动重跑同一 Task。
+//
+// 它不是正常终止条件——正常 Loop 由结构化终态、用户/系统取消、任务
+// deadline 与 token/成本预算共同约束；循环计数本身继续作为 trace/eval 的
+// 观测指标存在。本常量故意不暴露任何 YAML/配置入口，不可调低；测试可经
+// Agent.loopFuse 未导出字段覆盖。
+const emergencyLoopFuse = 10000
+
+// loopFuseLimit 返回本 Agent 生效的 fuse 值：未设置测试覆盖时恒为
+// emergencyLoopFuse。
+func (a *Agent) loopFuseLimit() int {
+	if a.loopFuse > 0 {
+		return a.loopFuse
+	}
+	return emergencyLoopFuse
 }
 
 func (a *Agent) processTask(ctx context.Context, taskID string) {
@@ -510,7 +531,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 
 	// terminatingCause 由闭包捕获，panic 路径与显式分支会覆盖默认值。
 	// 默认 "react_loop_exit:natural" 覆盖正常完成（finalization / SubmitResult 后退出）；
-	// max_loops / handleFailure 等显式分支跑前会赋值；panic 路径在合并 defer 中覆盖。
+	// runtime_loop_fuse / handleFailure 等显式分支跑前会赋值；panic 路径在合并 defer 中覆盖。
 	terminatingCause := "react_loop_exit:natural"
 	taskSuccess := false
 	enteredTerminating := false
@@ -553,30 +574,18 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 
 	// === 合并 defer：panic 恢复 + processing → terminating 切换 ===
 	//
-	// Sprint 3 #5 引入的 panic 恢复在 v5 Phase 3 与 SetState(Terminating) 合并：
-	//   - panic 路径需要把 terminatingCause 设为 "react_loop_exit:panic"，
-	//     这必须在 SetState(Terminating) 调用 *之前* 完成
-	//   - 解决办法：让二者共用同一个 defer——recover 后立即覆盖 cause，再走 SetState
-	//   - 注册顺序上本 defer 必须最后注册，才能在所有其它 defer 之前先跑
+	// panic 路径需要把 terminatingCause 设为 "react_loop_exit:panic"，
+	// 这必须在 SetState(Terminating) 调用 *之前* 完成——解决办法是让二者
+	// 共用同一个 defer：recover 后立即覆盖 cause，再走 SetState。
+	// 注册顺序上本 defer 必须最后注册，才能在所有其它 defer 之前先跑。
 	//
-	// 为什么不走 buildTransferNote(L1→L3)？
-	//   - panic 发生时 ctx 可能已取消、LLM client 状态未知
-	//   - 直接再调一次 LLM（L1）高概率二次失败
-	//   - L3 纯代码拼装够用：工具轨迹 + Artifacts + 最后响应已经构成可读的交接
+	// panic 路径不再生成交接备忘（TransferNote 机制已于 V6 CM4 删除）：
+	// 重试接手上下文由 Task Memory + LastHistory 承担（task_memory.go）。
 	defer func() {
 		if rec := recover(); rec != nil {
 			terminatingCause = "react_loop_exit:panic"
 			log.Printf("[agent %s] 任务 %s processTask panic 被恢复: %v", a.ID, taskID, rec)
 			enterTerminating(terminatingCause)
-			// 构造 L3 交接备忘
-			var toolHistory []store.ToolCallRecord
-			if a.Store != nil {
-				toolHistory, _ = a.Store.QueryToolCalls(taskID, "")
-			}
-			note := mechanicalTransferNote(task, nil, toolHistory, a.transferNoteMaxTokens())
-			if note != "" {
-				_ = a.Store.SetTransferNote(taskID, note)
-			}
 			// 终止任务，避免卡在 processing 状态
 			reason := fmt.Sprintf("agent panic: %v", rec)
 			if err := a.Store.FailTask(a.ID, taskID, reason); err != nil {
@@ -621,89 +630,80 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		a.OnTaskStart(taskID)
 	}
 
-	// === per-node 能力（model.NodeCapability）应用点 ===
-	// 与 FinalizationChecker/SubmitState 装配正交：只影响本任务执行期间
-	// executor 可见的工具集与 a.Model，任务结束经 defer 全部恢复。
-	// 无 Capability 时零开销短路。
-	if task.Capability != nil {
-		// 工具子集裁剪：换入 executor 的过滤视图。fail-closed 兜底——节点
-		// 工具 ⊄ executor 注册全集（或 executor 不支持按任务过滤）时任务
-		// 直接失败且不降级执行：用超集工具集跑一个声明了子集的任务会打破
-		// "LLM 只见子集"的隔离语义。Store 层 QueryAvailable 已按
+	// === ExecutionLease（V6 §4 H1 冻结执行租约）应用点 ===
+	// 认领点冻结/复用租约（计算式：NodeRequirement ∩ RouteCeiling ∩ Policy，
+	// 见 execution_lease.go）；executor 可见工具集换入
+	// BusinessTools ∪ ControlTools 的过滤视图，模型与隔离从租约冻结值读取，
+	// 任务结束经 defer 全部恢复。与 FinalizationChecker/SubmitState 装配正交。
+	lease, leaseReject := a.acquireExecutionLease(task)
+	if lease == nil {
+		// fail-closed（execution_lease_rejected 已 emit）：显式声明越界或
+		// executor 无换入面——用超集工具集跑一个声明了子集的任务会打破
+		// "LLM 只见子集"的隔离语义，不降级执行。Store 层 QueryAvailable 已按
 		// CapabilityChecker 预过滤，这里是执行面的第二道防线。
-		if len(task.Capability.Tools) > 0 {
-			if a.ToolSwapper == nil {
-				reason := fmt.Sprintf("节点能力要求工具子集 %v，但 executor 不支持按任务工具过滤（Agent.ToolSwapper 未装配），不降级执行", task.Capability.Tools)
-				log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
-				terminatingCause = "react_loop_exit:error"
-				enterTerminating(terminatingCause)
-				a.terminateTask(task, taskID, reason, "capability_violation")
-				return
-			}
-			full := a.ToolSwapper.ToolRegistry()
-			if missing := full.Missing(task.Capability.Tools); len(missing) > 0 {
-				reason := fmt.Sprintf("节点能力工具子集越界：executor 注册全集缺少 %v（节点声明 %v），不降级执行", missing, task.Capability.Tools)
-				log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
-				terminatingCause = "react_loop_exit:error"
-				enterTerminating(terminatingCause)
-				a.terminateTask(task, taskID, reason, "capability_violation")
-				return
-			}
-			filtered := full.Filtered(task.Capability.Tools)
-			old := a.ToolSwapper.SwapToolRegistry(filtered)
-			defer a.ToolSwapper.SwapToolRegistry(old)
-			log.Printf("[agent %s] 任务 %s 节点能力生效：工具子集 %v（%d/%d 已注册）",
-				a.ID, taskID, task.Capability.Tools, filtered.RegisteredCount(), full.RegisteredCount())
+		terminatingCause = "react_loop_exit:error"
+		enterTerminating(terminatingCause)
+		a.terminateTask(task, taskID, leaseReject, "capability_violation")
+		return
+	}
+	// 工具视图换入（Lease 驱动，取代旧直接读 task.Capability.Tools 的短路）：
+	// 视图 = BusinessTools ∪ ControlTools——显式声明漏带控制工具时节点仍能
+	// 收尾。并集覆盖注册全集时跳过换入（恒等变换，无能力声明任务零开销）。
+	if a.ToolSwapper != nil && leaseViewNeedsSwap(a.ToolSwapper.ToolRegistry(), lease) {
+		full := a.ToolSwapper.ToolRegistry()
+		filtered := full.Filtered(lease.ToolUnion())
+		old := a.ToolSwapper.SwapToolRegistry(filtered)
+		defer a.ToolSwapper.SwapToolRegistry(old)
+		log.Printf("[agent %s] 任务 %s 执行租约生效：%s（%d/%d 已注册）",
+			a.ID, taskID, describeLeaseTools(lease), filtered.RegisteredCount(), full.RegisteredCount())
+	}
+	// 模型覆盖：租约冻结值 ≠ 当前模型时换入（capability 覆盖的冻结产物）。
+	// a.Model 在 HistoryEntry.Model 记录处读取，替换后自动跟随；defer 恢复。
+	// wire 层请求模型经 llm.WithModelOverride 写入 ctx——processTask 的 ctx
+	// 派生出每轮 execCtx 直达 client.Chat，SDKClient 读取后替换请求模型
+	//（llm/client.go modelOverrideKey），因此覆盖对实际 API 请求同样生效。
+	if lease.Model != "" && lease.Model != a.Model {
+		origModel := a.Model
+		a.Model = lease.Model
+		ctx = llm.WithModelOverride(ctx, lease.Model)
+		defer func() { a.Model = origModel }()
+		log.Printf("[agent %s] 任务 %s 执行租约生效：模型覆盖 %s → %s", a.ID, taskID, origModel, lease.Model)
+	}
+	// 执行隔离（写时复制 overlay）：认领时物化任务 workspace 并把本 Runner 的
+	// Swapper 换入该任务视图，defer 恢复。执行期读穿透主根、写落任务 workspace；
+	// 成功终态由 mergeWorkspaceBeforeComplete 在 SubmitResult 前合并回主根。
+	// 与工具子集同款 fail-closed：模式未知或执行面未装配时不降级执行。
+	if lease.Workspace != "" {
+		if lease.Workspace != model.IsolationModeWorkspace {
+			reason := fmt.Sprintf("节点能力要求未知隔离模式 %q（当前仅支持 %q），不降级执行",
+				lease.Workspace, model.IsolationModeWorkspace)
+			log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
+			terminatingCause = "react_loop_exit:error"
+			enterTerminating(terminatingCause)
+			a.terminateTask(task, taskID, reason, "capability_violation")
+			return
 		}
-		// 模型覆盖：a.Model 在每次 LLM 请求前的 token 预测/截断
-		// （PredictNextPromptTokens/TruncateHistory）与 HistoryEntry.Model
-		// 记录处读取，替换后这些路径自动跟随；defer 恢复。wire 层请求模型
-		// 经 llm.WithModelOverride 写入 ctx——processTask 的 ctx 派生出每轮
-		// execCtx 直达 client.Chat，SDKClient 读取后替换请求模型（llm/client.go
-		// modelOverrideKey），因此覆盖对实际 API 请求同样生效。
-		if task.Capability.Model != "" {
-			origModel := a.Model
-			a.Model = task.Capability.Model
-			ctx = llm.WithModelOverride(ctx, task.Capability.Model)
-			defer func() { a.Model = origModel }()
-			log.Printf("[agent %s] 任务 %s 节点能力生效：模型覆盖 %s → %s", a.ID, taskID, origModel, task.Capability.Model)
+		if a.WorkspaceManager == nil || a.WorkspaceActivator == nil {
+			reason := "节点能力要求 workspace 执行隔离，但执行面未装配（Agent.WorkspaceManager/WorkspaceActivator 为 nil），不降级执行"
+			log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
+			terminatingCause = "react_loop_exit:error"
+			enterTerminating(terminatingCause)
+			a.terminateTask(task, taskID, reason, "capability_violation")
+			return
 		}
-		// 执行隔离（写时复制 overlay）：认领时物化任务 workspace 并把本 Runner 的
-		// Swapper 换入该任务视图，defer 恢复。执行期读穿透主根、写落任务 workspace；
-		// 成功终态由 mergeWorkspaceBeforeComplete 在 SubmitResult 前合并回主根。
-		// 与工具子集同款 fail-closed：模式未知或执行面未装配时不降级执行。
-		if task.Capability.Isolation != nil {
-			if task.Capability.Isolation.Mode != model.IsolationModeWorkspace {
-				reason := fmt.Sprintf("节点能力要求未知隔离模式 %q（当前仅支持 %q），不降级执行",
-					task.Capability.Isolation.Mode, model.IsolationModeWorkspace)
-				log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
-				terminatingCause = "react_loop_exit:error"
-				enterTerminating(terminatingCause)
-				a.terminateTask(task, taskID, reason, "capability_violation")
-				return
-			}
-			if a.WorkspaceManager == nil || a.WorkspaceActivator == nil {
-				reason := "节点能力要求 workspace 执行隔离，但执行面未装配（Agent.WorkspaceManager/WorkspaceActivator 为 nil），不降级执行"
-				log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
-				terminatingCause = "react_loop_exit:error"
-				enterTerminating(terminatingCause)
-				a.terminateTask(task, taskID, reason, "capability_violation")
-				return
-			}
-			view, err := a.WorkspaceManager.Materialize(taskID)
-			if err != nil {
-				reason := fmt.Sprintf("workspace 物化失败: %v，不降级执行", err)
-				log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
-				terminatingCause = "react_loop_exit:error"
-				enterTerminating(terminatingCause)
-				a.terminateTask(task, taskID, reason, "capability_violation")
-				return
-			}
-			restore := a.WorkspaceActivator.Activate(view)
-			defer restore()
-			log.Printf("[agent %s] 任务 %s 节点能力生效：workspace 执行隔离（视图根 %s）", a.ID, taskID, view.Root())
-			// KindWorkspaceMaterialized 由 Manager 负责 emit（types.go 契约），这里不重复。
+		view, err := a.WorkspaceManager.Materialize(taskID)
+		if err != nil {
+			reason := fmt.Sprintf("workspace 物化失败: %v，不降级执行", err)
+			log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
+			terminatingCause = "react_loop_exit:error"
+			enterTerminating(terminatingCause)
+			a.terminateTask(task, taskID, reason, "capability_violation")
+			return
 		}
+		restore := a.WorkspaceActivator.Activate(view)
+		defer restore()
+		log.Printf("[agent %s] 任务 %s 执行租约生效：workspace 执行隔离（视图根 %s）", a.ID, taskID, view.Root())
+		// KindWorkspaceMaterialized 由 Manager 负责 emit（types.go 契约），这里不重复。
 	}
 
 	// 清空文件缓存（任务切换时避免脏读）
@@ -726,23 +726,30 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		depResults = mergeArtifactsIntoDeps(depResults, depArtifacts)
 	}
 
-	// 拉取依赖任务的 TransferNote（上游代理在终止前留下的压缩交接备忘），
-	// 以 <upstream-transfer-notes> 形式作为首条 user 消息注入 history。
-	// Sprint 3 #5：让下游代理既能看到上游的 Artifacts 文件清单，又能看到
-	// 上游对工作的自述总结——两层信息互补。
-	depNotes, noteErr := a.Store.GetDependencyTransferNotes(taskID)
-	if noteErr != nil {
-		log.Printf("[agent %s] GetDependencyTransferNotes error: %v", a.ID, noteErr)
-	}
-
 	var lastOutput string
 	history := make([]HistoryEntry, 0)
 
+	// CM1（V6 §3）：Context Manifest 侧信息载体，每个 attempt 一份，经 ctx
+	// 传给 executor 只读——承载 Memory 段 UpdatedAt（新鲜度判定）与本 attempt
+	// 内的压缩处置（L2 strategy / L3 truncated）。taskStartedAt 取认领时刻，
+	// 是 Memory 段 live/stale 判定的比较基准。
+	manifestInfo := newManifestSideInfo(time.Now())
+	ctx = withManifestSideInfo(ctx, manifestInfo)
+
+	// CM2（V6 §3）：Task Memory 加载或创建（attempt 恢复=加载既有，继续
+	// 滚动；新建=初始化 Goal/Constraints 并落盘 + emit task_memory_created）。
+	// Agent.TaskMemStore 为 nil 时返回 nil，整链路关闭。defer finalize 按
+	// 任务最终状态收口：终态置 Sealed 封存，重试回滚只 checkpoint 不封存。
+	taskMem := a.initTaskMemory(task)
+	if taskMem != nil {
+		ctx = withTaskMemCarrier(ctx, taskMem.carrier)
+		defer taskMem.finalize(a, taskID)
+	}
+
 	// 重试时恢复之前的历史上下文，避免 LLM 丢失上下文重复操作。
-	// 本最小版 TransferNote 与 LastHistory 并存：LastHistory 作为完整的历史副本
-	// 提供原始 tool_call/tool_result 序列；TransferNote 作为精炼文本提供接手者
-	// "为什么要做这件事 + 前任遇到什么障碍"的决策上下文。两者在 Execute 调用时
-	// 都会出现在 LLM 的上下文里。未来 TransferNote 实测稳定后可考虑删除 LastHistory。
+	// 重试/接手的上下文恢复由 LastHistory（完整 tool_call/tool_result 序列）
+	// + Task Memory（滚动工作状态，task_memory.go）共同承担；V6 CM4 已删除
+	// TransferNote 精炼备忘机制。
 	if len(task.LastHistory) > 0 {
 		if err := json.Unmarshal(task.LastHistory, &history); err != nil {
 			log.Printf("[agent %s] 反序列化历史记录失败，从空历史开始: %v", a.ID, err)
@@ -752,30 +759,11 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		}
 	}
 
-	// 依赖 TransferNote 注入：依赖链场景。每条上游备忘作为单独条目，
-	// 用 XML 标签分隔便于 LLM 识别"这是其他任务的交接，不是我自己的历史"。
-	if len(depNotes) > 0 {
-		var sb strings.Builder
-		sb.WriteString("<upstream-transfer-notes>\n")
-		for depID, note := range depNotes {
-			fmt.Fprintf(&sb, "<note from=\"%s\">\n%s\n</note>\n", depID, strings.TrimSpace(note))
-		}
-		sb.WriteString("</upstream-transfer-notes>")
-		history = append(history, HistoryEntry{IncomingMail: sb.String()})
-	}
-
-	// 自身 TransferNote 注入：重试换手场景。前任留下的备忘让新 agent 知道
-	// "我为什么被叫醒 + 前任遇到了什么障碍"。即便 LastHistory 已恢复了完整
-	// 对话，TransferNote 作为"精炼提示"仍然有价值——它不会被 Layer 2 压缩吞掉。
-	if task.RetryCount > 0 && task.TransferNote != "" {
-		hint := fmt.Sprintf(
-			"<transfer-note>\n"+
-				"这是第 %d 次重试。以下是前任代理在终止前留下的交接备忘：\n\n%s\n\n"+
-				"请结合上方的 LastHistory（如有）+ 本备忘，从任务目标重新出发，避免重蹈覆辙。\n"+
-				"</transfer-note>",
-			task.RetryCount, strings.TrimSpace(task.TransferNote),
-		)
-		history = append(history, HistoryEntry{IncomingMail: hint})
+	// CM4：依赖任务的 Task Memory 交接注入（取代已删除的
+	// <upstream-transfer-notes> TransferNote 注入）。下游代理除「前置任务
+	// 结果 + Artifacts」外，还能看到上游终结时封存的滚动工作状态。
+	if block := a.buildDepTaskMemoryBlock(task, manifestInfo); block != "" {
+		history = append(history, HistoryEntry{IncomingMail: block})
 	}
 
 	// 任务级注入点：team_snapshot / file_awareness 走 Memory System
@@ -786,6 +774,32 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			IncomingMail: injected,
 		})
 	}
+
+	// CM3（V6 §3）：Session Memory 召回注入（任务入口一次）。重试 attempt
+	// 跳过——LastHistory 已含上次注入，重复注入会让 LLM 看到旧时间戳的
+	// 重复块（与 team_snapshot 的 RetryCount>0 短路同款理由）。
+	if task.RetryCount == 0 {
+		if recalled := a.recallSessionMemory(ctx, taskID); recalled != "" {
+			history = append(history, HistoryEntry{
+				IncomingMail: recalled,
+			})
+		}
+	}
+
+	// V6 §2 P1a：Prompt 有序编译——每个 attempt 在执行租约冻结、工具视图
+	// 换入之后编译一次并冻结（重试新 attempt 重新编译；输入不变则
+	// Build.ID 稳定，重试天然复用同 Build.ID）。组件含 agent_role（system
+	// prompt 全文，task.SystemPrompt 覆盖时是另一个 Build）、当时工具清单
+	//（来自冻结租约/注册全集）与控制协议块；Build.Text 与 buildMessages
+	// 的 system+user 首条逐字节一致——不改变任何消息字节，编译产物只
+	// 用于身份与观测。核心指令在任务执行中不改变（现状语义的钉住）。
+	// executor 每轮把 Build.ID 并入 context_manifest_built 事件
+	//（prompt_bound 不独立成事件，避免同频双账本）。
+	promptBuild := a.compilePromptBuild(task, depResults, lease)
+	ctx = withPromptBuild(ctx, promptBuild)
+	a.emitPromptCompiled(taskID, promptBuild)
+	log.Printf("[agent %s] 任务 %s prompt 已编译冻结：build=%s 组件=%d digest=%s",
+		a.ID, taskID, promptBuild.ID, len(promptBuild.Components), promptBuild.Digest)
 
 	// Layer 2: token 累计跟踪，用于触发摘要压缩
 	var totalPromptTokens int
@@ -800,17 +814,12 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		keepRecent = 3
 	}
 
-	// 90% 预算警告：达到 floor(MaxLoops * 0.9) 时注入一次系统提示让 LLM 主动收尾。
-	// 避免 MaxLoops 兜底路径（buildTransferNote → retry）介入——那条路径成本高且
-	// 会出现 LLM 在 transfer-note 阶段调工具产生副作用的边界 case（详见历史修复记录）。
-	// 整数除法 9/10 自带向下取整：MaxLoops=8→7, =10→9, =12→10, =20→18。
-	budgetWarningInjected := false
-	budgetWarnAt := -1
-	if a.MaxLoops > 0 {
-		budgetWarnAt = a.MaxLoops * 9 / 10
-	}
-
-	for i := 0; i < a.MaxLoops; i++ {
+	// V6：ReAct 循环不再有固定轮数上限（docs/nextUpgrade-V6.md §5 升级思路
+	// 5/6/8）。循环只经以下路径退出：结构化终态（自然完成 / finalization
+	// 短路）、ctx 取消（watchdog / 用户 / 系统）、错误处理（重试回滚或终止）、
+	// 以及循环顶部 emergency fuse 对程序性死循环的兜底。循环计数 i 继续用于
+	// trace / turns / 进度观测，不再是终止条件。
+	for i := 0; ; i++ {
 		select {
 		case <-ctx.Done():
 			// 2026-04-25 P1 #2：取消类终态 trace 事件。由外部（watchdog /
@@ -854,6 +863,17 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		default:
 		}
 
+		// emergency fuse：循环计数越过兜底阈值，判定为程序缺陷造成的真死循环。
+		// 这不是正常终止条件（正常退出靠结构化终态 / 取消 / 错误处理），fuse
+		// 触发后任务进 blocked + 登记 replan，绝不自动重跑同一 Task。
+		// 放在 ctx 取消检查之后：外部取消是更高优先级的权威终止语义。
+		if i >= a.loopFuseLimit() {
+			terminatingCause = "react_loop_exit:runtime_loop_fuse"
+			enterTerminating(terminatingCause)
+			a.tripRuntimeLoopFuse(ctx, task, taskID, i, history)
+			return
+		}
+
 		// 排水信箱：将收到的代理间消息注入历史，作为 user 角色消息；同时向发信方自动发送回执
 		hasNewMail := false
 		if a.Mailbox != nil {
@@ -874,47 +894,82 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			})
 		}
 
-		// 90% 预算到达时一次性注入收尾提示。注入后 budgetWarningInjected 持久化在
-		// history 里，无需每轮重发——LLM 看到 <budget-warning> 就会知道该收口了。
-		if !budgetWarningInjected && budgetWarnAt > 0 && i >= budgetWarnAt {
-			history = append(history, HistoryEntry{
-				IncomingMail: fmt.Sprintf(budgetWarningPrompt, i+1, a.MaxLoops, a.MaxLoops-i),
-			})
-			budgetWarningInjected = true
-		}
-
 		// 前置检查：如果设置了 FinalizationChecker 且已 finalized，
 		// 说明上一轮调用了 finalization tool，立即终止 reactLoop。
 		if a.FinalizationChecker != nil && a.FinalizationChecker.IsFinalized() {
 			log.Printf("[agent %s] FinalizationChecker.IsFinalized()=true，终止 reactLoop (task=%s)", a.ID, taskID)
+			// V6 §4 H1：finalizing 被接受即撤销执行租约——此后任何工具
+			// dispatch 拒绝（防御层，与 L1 finalizing fence 互补）。
+			a.revokeLeaseOnFinalizing(taskID)
 			// 使用上一轮保存的 lastOutput 完成任务（不进行 ExpectedArtifacts 校验，因为 finalization tool 负责最终汇报）。
 			// 若上一轮调用的是 submit_task_result，SubmitState 里暂存了已通过校验的结构化提交：
-			// 其渲染文本替代 lastOutput 成为权威结果负载，TransferNote 只用 summary，
+			// 其渲染文本替代 lastOutput 成为权威结果负载，
 			// Transition.Cause 记为 submit_task_result 以区别于 report_done 兼容路径。
 			resultText := lastOutput
-			transferNote := lastOutput
 			cause := "finalization_short_circuit"
+			submitEvent := ""
+			submitVerdict := ""
+			submitEvidenceItems := ""
+			submitStatus := ""
+			submitBlockedReason := ""
+			submitSummary := ""
 			if a.SubmitState != nil {
 				if sub, ok := a.SubmitState.Take(taskID); ok {
 					resultText = sub.Format()
-					transferNote = sub.Summary
 					cause = "submit_task_result"
+					submitEvent = sub.Event
+					submitVerdict = sub.Verdict
+					submitEvidenceItems = sub.EvidenceItems
+					submitStatus = sub.Status
+					submitBlockedReason = sub.BlockedReason
+					submitSummary = sub.Summary
 					// 结构化提交路径：渲染文本是权威最终响应，覆盖 worker 的自由文本自述。
 					if err := a.Store.RecordLastResponse(taskID, resultText); err != nil {
 						log.Printf("[agent %s] RecordLastResponse error: %v", a.ID, err)
 					}
 				}
 			}
-			// TransferNote：成功路径直接用最终文本（LLM 自述已经是合理总结，不需二次压缩）
-			if transferNote != "" {
-				_ = a.Store.SetTransferNote(taskID, transferNote)
+			// 结构化 blocked（V6 §5）：与 completed 路径分岔——同一收尾事务内
+			// 先落 blocked 终态（durable）、再为**非图任务**发布 replan 唤醒任务；
+			// 不走 workspace 合并 / SubmitResult（blocked 不是成功终态，隔离
+			// 副本不合并回主根），blocked 也永远不满足下游依赖。
+			if submitStatus == SubmitStatusBlocked {
+				enterTerminating("react_loop_exit:agent_reported_blocked")
+				a.commitStructuredBlocked(task, taskMem, taskID, resultText, submitBlockedReason, submitSummary)
+				return
 			}
 			// 写时复制隔离：合并必须在 SubmitResult（标记 completed）之前完成。
-			// 合并失败/冲突时 helper 已把任务转 failed 并自动登记 replan，直接返回。
+			// 合并失败/冲突时 helper 已把任务转 failed 并发布 replan 唤醒任务，直接返回。
 			if !a.mergeWorkspaceBeforeComplete(ctx, task, taskID) {
 				terminatingCause = "react_loop_exit:error"
 				enterTerminating(terminatingCause)
 				return
+			}
+			// Graph 事件键（C5b）：submit_task_result 携带的 event 在 SubmitResult 前
+			// 写入 Results["event"]，graph-terminal-feed 随后把它并入 TerminalFact.Result
+			// 驱动事件形态转移条件。位置约束：必须在 workspace 合并成功之后（合并失败
+			// 任务转 failed，不应留下 ready 类事件键误导路由）、SubmitResult 之前
+			// （Results 键随完成快照一起对外可见）。Store 不支持时静默跳过。
+			if submitEvent != "" {
+				if err := store.RecordResultField(a.Store, taskID, "event", submitEvent); err != nil {
+					log.Printf("[agent %s] RecordResultField(event) error: %v", a.ID, err)
+				}
+			}
+			// Graph 验收键（C6b）：与 event 同理，submit_task_result 携带的
+			// verdict 在 SubmitResult 前写入 Results["verdict"]，驱动 acceptance
+			// 节点的 $.verdict 路径形态转移条件。
+			if submitVerdict != "" {
+				if err := store.RecordResultField(a.Store, taskID, "verdict", submitVerdict); err != nil {
+					log.Printf("[agent %s] RecordResultField(verdict) error: %v", a.ID, err)
+				}
+			}
+			// Graph 验收证据键（G1b）：evidence_items 的原始 JSON 数组写入
+			// Results["evidence"]，由 Graph Runtime 的服务端核验器逐条核验
+			// （缺失或核验不通过时 verdict 不被采信）。
+			if submitEvidenceItems != "" {
+				if err := store.RecordResultField(a.Store, taskID, "evidence", submitEvidenceItems); err != nil {
+					log.Printf("[agent %s] RecordResultField(evidence) error: %v", a.ID, err)
+				}
 			}
 			enterTerminating(terminatingCause)
 			if err := a.Store.SubmitResult(a.ID, taskID, resultText); err != nil {
@@ -948,42 +1003,22 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 						Cause:      cause,
 					},
 				})
+				// 结构化提交的收尾事务已 durable 提交 completed 终态
+				//（report_done 兼容路径不算结构化提交，不重复记账）。
+				if cause == "submit_task_result" {
+					trace.Emit(trace.Event{
+						Kind:    trace.KindTaskResultCommitted,
+						TaskID:  taskID,
+						AgentID: a.ID,
+						Transition: &trace.Transition{
+							PrevStatus: string(model.TaskStatusProcessing),
+							NewStatus:  string(model.TaskStatusCompleted),
+							Cause:      cause,
+						},
+					})
+				}
 			}
 			return
-		}
-
-		// §11.7.4 layer-3 截断保护：每轮 LLM 调用前校验预测 prompt_tokens 不超
-		// per-kind ContextLimit。2026-04-27 升级为双层降级 cascade（详见
-		// token_truncate.go TruncateHistory）：
-		//   Layer A：从最老条目开始删 middle，保护 head=1 + tail=3
-		//   Layer B：tail 内 fat ToolResult 内容级缩减（head/tail 保留 + 中间截断标记）
-		// 失败模式（双层都跑过仍超）：warn + 用尽力截断的 history 继续——让 LLM 调用
-		// 真不行时由 §9.3 ErrUnrecoverable 兜底。ContextLimit<=0（v3 兼容路径）no-op。
-		if a.ContextLimit > 0 {
-			before := PredictNextPromptTokens(history, a.Model, task.SystemPrompt, "")
-			truncated, terr := TruncateHistory(history, a.Model, task.SystemPrompt, a.ContextLimit)
-			// "已经发生了改动"判定：长度变了或某 entry 内的 ToolResults 被 shrink 过。
-			// 仅看长度会漏掉 Layer B 的内容级缩减；用预测值差异更可靠。
-			afterPredicted := PredictNextPromptTokens(truncated, a.Model, task.SystemPrompt, "")
-			if len(truncated) != len(history) || afterPredicted != before || terr != nil {
-				log.Printf("[agent %s] task=%s loop=%d 历史截断: %d→%d entries, ~%d→~%d prompt tokens",
-					a.ID, taskID, i, len(history), len(truncated), before, afterPredicted)
-				trace.Emit(trace.Event{
-					Kind:               trace.KindHistoryTruncated,
-					TaskID:             taskID,
-					AgentID:            a.ID,
-					Loop:               i,
-					PromptTokensBefore: before,
-					PromptTokensAfter:  afterPredicted,
-					KeptEntries:        len(truncated),
-					Strategy:           "drop_middle+shrink_tail",
-				})
-				if terr != nil {
-					log.Printf("[agent %s] task=%s loop=%d 双层截断（删 middle + 缩 tail 内容）后仍 ~%d > context_limit=%d: %v（用截断 history 继续，依赖 §9.3 错误码兜底）",
-						a.ID, taskID, i, afterPredicted, a.ContextLimit, terr)
-				}
-				history = truncated
-			}
 		}
 
 		// 构建只读副本传入 executor
@@ -1026,66 +1061,21 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		a.publishCompletedTurn(turnID, taskID, i, result, execErr, lastStreamText)
 
 		if execErr != nil {
-			if errors.Is(execErr, ErrExecutionSuspended) {
-				terminatingCause = "react_loop_exit:plan_suspended"
-				a.Activity.LLMEnd(a.ID, taskID, i, "", 0, execErr)
-				enterTerminating(terminatingCause)
-				// The control-plane boundary is checked after an in-flight LLM/tool
-				// call as well as before the next loop. Preserve that completed
-				// round before releasing the lease so resume does not repeat side
-				// effects or lose the evidence that caused the suspension.
-				if result.ToolCalled || result.Output != "" || result.AssistantContent != "" ||
-					len(result.ToolCalls) > 0 || len(result.ToolResults) > 0 {
-					history = append(history, HistoryEntry{
-						Output: result.Output, ToolCalled: result.ToolCalled,
-						AssistantContent: result.AssistantContent,
-						ToolCalls:        result.ToolCalls, ToolResults: result.ToolResults,
-						ExtraFields: result.ExtraFields, PromptTokens: result.PromptTokens,
-						CompletionTokens: result.CompletionTokens, Model: a.Model,
-					})
-					if result.Output != "" {
-						_ = a.Store.AppendOutput(a.ID, taskID, result.Output)
-					}
-				}
-				var durableHistory []byte
-				if len(history) > 0 {
-					if encoded, marshalErr := json.Marshal(history); marshalErr != nil {
-						log.Printf("[agent %s] 序列化挂起历史失败 task=%s: %v", a.ID, taskID, marshalErr)
-					} else {
-						durableHistory = encoded
-					}
-				}
-				if suspendErr := store.SuspendTaskExecution(a.Store, a.ID, taskID, execErr.Error(), durableHistory); suspendErr != nil &&
-					!errors.Is(suspendErr, store.ErrTaskNotProcessing) {
-					log.Printf("[agent %s] 协作挂起任务失败 task=%s: %v", a.ID, taskID, suspendErr)
-				}
-				return
-			}
 			terminatingCause = "react_loop_exit:error"
 			a.Activity.LLMEnd(a.ID, taskID, i, "", 0, execErr)
 			enterTerminating(terminatingCause)
-			a.handleFailure(task, taskID, execErr, history)
+			// CM2：Attempt 结束前立即 checkpoint（含 L3 压缩前的状态保全）。
+			taskMem.checkpoint(a, taskID, i, "attempt_end")
+			a.handleFailure(task, taskID, execErr, history, manifestInfo)
 			return
 		}
 
 		lastOutput = result.Output
 		totalPromptTokens += result.PromptTokens
 
-		// §11.7.3 TokenStats 累计——仅落盘到 trace JSONL,不打 stderr。
-		// 长任务下每轮 log.Printf 会刷掉真正重要的错误/警告;排查时按需
-		// `grep token_stats .agentgo/traces/*.jsonl | jq` 即可复盘成本曲线。
-		tokenTotals := a.AddTokenStats(int64(result.PromptTokens), int64(result.CompletionTokens))
-		trace.Emit(trace.Event{
-			Kind:                  trace.KindTokenStats,
-			TaskID:                taskID,
-			AgentID:               a.ID,
-			Loop:                  i,
-			PromptTokens:          result.PromptTokens,
-			CompletionTokens:      result.CompletionTokens,
-			TotalPromptTokens:     tokenTotals.TotalPromptTokens,
-			TotalCompletionTokens: tokenTotals.TotalCompletionTokens,
-			CallCount:             tokenTotals.CallCount,
-		})
+		// §11.7.3 TokenStats 内存计数器累计——仅作 UI 实时视图数据源。
+		// V6 起不再 emit token_stats 事件（与 llm_call_end 重复的第二账本已删除）。
+		a.AddTokenStats(int64(result.PromptTokens), int64(result.CompletionTokens))
 
 		// 终止条件：LLM 没有调用工具（自然完成），或 Executor 返回 Finalized=true（finalization tool 信号）
 		if !result.ToolCalled || result.Finalized {
@@ -1145,23 +1135,17 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				history = appendValidationFeedback(history, check)
 				terminatingCause = "react_loop_exit:error"
 				enterTerminating(terminatingCause)
-				a.handleFailure(task, taskID, &ErrRecoverable{Err: fmt.Errorf("%s", reason)}, history)
+				// CM2：Attempt 结束前立即 checkpoint。
+				taskMem.checkpoint(a, taskID, i, "attempt_end")
+				a.handleFailure(task, taskID, &ErrRecoverable{Err: fmt.Errorf("%s", reason)}, history, manifestInfo)
 				return
 			}
 			if len(check.Drifted) > 0 {
 				log.Printf("[agent %s] 任务 %s 路径漂移已容忍: %v", a.ID, taskID, check.Drifted)
 			}
 
-			// TransferNote：成功路径把 lastOutput 直接写入 TransferNote。
-			// lastOutput 是 LLM 对任务的最终文本响应，本身就是合理的自述总结，
-			// 不需要额外的 LLM 压缩调用。下游依赖任务通过 GetDependencyTransferNotes
-			// 读取这一段作为上游交接备忘。失败路径走 handleFailure 里的 buildTransferNote。
-			if lastOutput != "" {
-				_ = a.Store.SetTransferNote(taskID, lastOutput)
-			}
-
 			// 写时复制隔离：合并必须在 SubmitResult（标记 completed）之前完成。
-			// 合并失败/冲突时 helper 已把任务转 failed 并自动登记 replan，直接返回。
+			// 合并失败/冲突时 helper 已把任务转 failed 并发布 replan 唤醒任务，直接返回。
 			if !a.mergeWorkspaceBeforeComplete(ctx, task, taskID) {
 				terminatingCause = "react_loop_exit:error"
 				enterTerminating(terminatingCause)
@@ -1207,8 +1191,8 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		}
 
 		// ToolCalled == true：追加到历史，继续循环
-		// PromptTokens / CompletionTokens / Model 用于 §11.7.3 实测锚定的下次预测，
-		// 详见 PredictNextPromptTokens / TruncateHistory。Model 字段为空串时（Agent
+		// PromptTokens / CompletionTokens / Model 用于 §11.7.3 实测锚定，供历史压缩
+		// 的 token 估算使用。Model 字段为空串时（Agent
 		// 未注入模型名）退化为 v3 行为——估算时不做模型一致性筛选。
 		history = append(history, HistoryEntry{
 			Output:           result.Output,
@@ -1225,6 +1209,10 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		// 进度通知：在 history append 之后、PhaseLoopPost 之前发送
 		a.progressNotify(ctx, taskID, i, result, &pFlags)
 
+		// CM2（V6 §3）：settled Turn 收口——从结构化账本收集本轮事实滚动
+		// 更新 Task Memory；仅实质变化时调版本/落盘/发 task_memory_updated。
+		taskMem.applySettledTurn(a, taskID, result, i)
+
 		// 注：MM7 之后 PhaseLoopPost AgentHook 调用点已删除——观察类需求走 trace.Emit
 		// （ReactLoop 的逐轮节奏可通过 KindLLMCallEnd / KindToolResult 等事件还原）。
 
@@ -1235,8 +1223,15 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		if !summarized && totalPromptTokens > compactThreshold {
 			tokensBefore := totalPromptTokens
 			entriesBefore := len(history)
+			// CM2：历史压缩前强制 checkpoint——即将被压缩的旧轮次其关键
+			// 事实须已沉淀进 Task Memory 并落盘。
+			taskMem.checkpoint(a, taskID, i, "history_compaction")
 			history = compressHistory(history, keepRecent)
 			summarized = true
+			strategy := fmt.Sprintf("summary+keep_recent=%d", keepRecent)
+			// CM1：回填压缩处置——后续轮次的 Manifest 中 history 段
+			// Disposition 记为 compressed:<strategy>。
+			manifestInfo.l2Strategy = strategy
 			log.Printf("[agent %s] 任务 %s 触发历史摘要压缩，当前 prompt tokens: %d", a.ID, taskID, totalPromptTokens)
 			trace.Emit(trace.Event{
 				Kind:               trace.KindHistoryCompaction,
@@ -1245,69 +1240,149 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				Loop:               i,
 				PromptTokensBefore: tokensBefore,
 				PromptTokensAfter:  0, // 实际值要等下次 LLM 调用才能拿到，这里只记录"压缩前"信号
-				Strategy:           fmt.Sprintf("summary+keep_recent=%d", keepRecent),
+				Strategy:           strategy,
 				KeptEntries:        entriesBefore,
 			})
 		}
 	}
+}
 
-	reason := fmt.Sprintf("因循环上限终止: 已执行 %d 轮，部分结果: %s", a.MaxLoops, lastOutput)
-	terminatingCause = "react_loop_exit:max_loops"
-	enterTerminating(terminatingCause)
+// tripRuntimeLoopFuse 是 emergency loop fuse 触发时的统一收口（V6，见
+// processTask 循环顶部）。它替代已删除的「MaxLoops 耗尽 → 交接备忘 →
+// 回滚重试」路径，语义刻意不同：
+//
+//  1. emit KindRuntimeLoopFuseTriggered——运行时异常审计事实；
+//  2. 任务 processing → blocked（BlockProcessingTaskBySystem），写入原因；
+//     blocked 是终态，绝不自动重跑同一 Task；
+//  3. 向任务发布者发送崩溃汇报（与 terminateTask 同款邮件通道），避免上游
+//     静默等待；
+//  4. 非图任务发布「通用 replan 唤醒任务」（reason_code=runtime_loop_fuse，
+//     幂等键 <taskID>/replan，见 replan_wake.go）唤醒 Scheduler 裁决后续
+//     编排；图任务跳过——终态由 graph-terminal-feed 回填引擎按边条件路由。
+//
+// 设计上本路径不再调用 LLM——fuse 的存在就是为了阻断失控行为，失控路径上
+// 再发起 LLM 调用违背其目的。历史经 saveHistory 落盘仅作事后排查证据，
+// 不为重试服务（blocked 不重试）。
+func (a *Agent) tripRuntimeLoopFuse(ctx context.Context, task *model.Task, taskID string, loop int, history []HistoryEntry) {
+	reason := fmt.Sprintf("emergency loop fuse 触发：ReAct 循环计数 %d 越过兜底阈值 %d，判定为程序缺陷造成的死循环；任务已转 blocked，不会自动重跑",
+		loop, a.loopFuseLimit())
+	log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
 
-	// 保存当前历史到任务，供下次重试恢复上下文
+	trace.Emit(trace.Event{
+		Kind:    trace.KindRuntimeLoopFuseTriggered,
+		TaskID:  taskID,
+		AgentID: a.ID,
+		Loop:    loop,
+		Reason:  reason,
+	})
+
+	// 历史落盘仅供事后排查；blocked 任务不会被重试恢复。
 	a.saveHistory(task, history)
 
-	// TransferNote：MaxLoops 耗尽路径走 buildTransferNote（L1 → L3 链）。
-	// L1 会追加 <transfer-request> 指令做最后一次 LLM 压缩；失败则 L3 机械兑底。
-	// 注意：此处 history 已经是最后状态（包含所有 loop 的结果），
-	// buildTransferNote 内部对 history 只读，不修改原切片。
-	//
-	// 关键：processTask 循环里用的是 `execCtx := WithAgentContext(...)`（新变量），
-	// 入参 ctx 本身从未被注入。直接传 ctx 进 buildTransferNote 会导致 L1 那次
-	// LLM 调用在 trace / log 里缺 agent_id / loop 字段（2026-04-25 P1 #1）。
-	// 此处显式补一次注入，loop=-1 标记"非 ReactLoop 的终止路径调用"，
-	// 便于 trace 工具区分主循环事件与交接备忘事件。
-	tnCtx := WithAgentContext(ctx, a.ID, taskID, -1)
-	tnCtx = WithNoTools(tnCtx) // L1 期望纯文本输出，物理屏蔽工具集避免副作用泄漏
-	note := a.buildTransferNote(tnCtx, task, depResults, history, a.transferNoteMaxTokens())
-	if note != "" {
-		_ = a.Store.SetTransferNote(taskID, note)
+	if blocker, ok := a.Store.(processingTaskBlocker); ok {
+		if err := blocker.BlockProcessingTaskBySystem(taskID, reason, "runtime_loop_fuse"); err != nil {
+			log.Printf("[agent %s] 任务 %s BlockProcessingTaskBySystem error: %v", a.ID, taskID, err)
+		}
+	} else {
+		// Store 不支持 processing→blocked 时降级为 failed——终态语义必须达成，
+		// 不能让任务滞留 processing。
+		log.Printf("[agent %s] 任务 %s Store 不支持 BlockProcessingTaskBySystem，降级 FailTask", a.ID, taskID)
+		a.terminateTask(task, taskID, reason, "runtime_loop_fuse")
+	}
+	a.sendCrashReport(task, taskID, reason)
+
+	// 自动 replan 唤醒（V6 C6b 起取代原 Plan 控制面的 RequestReplan 登记通道）：
+	// 非图任务发布通用 replan 唤醒任务交 Scheduler 裁决后续编排；图任务由
+	// publishReplanWakeTask 内部跳过（终态经 graph-terminal-feed 回填路由）。
+	// 发布失败不掩盖 fuse 事实本身。
+	detail := "emergency loop fuse 触发，任务已转 blocked（终态，不重跑）。\n" +
+		"这通常意味着程序缺陷或模型行为死循环，请评估是否调整该任务的执行方式（拆分 / 更换方式 / 终止）。\n原因: " + reason
+	a.publishReplanWakeTask(task, taskID, "runtime_loop_fuse", detail)
+}
+
+// processingTaskBlocker 是 store 层的窄接口（MemoryTaskStore 实现）：
+// processing → blocked 的系统侧迁移。定义为接口保持 agent → store 只依赖
+// TaskStore 主接口的装配形状，测试可用 fake 断言迁移语义。
+type processingTaskBlocker interface {
+	BlockProcessingTaskBySystem(taskID string, reason string, cause string) error
+}
+
+// commitStructuredBlocked 是 submit_task_result status=blocked 的收尾事务
+// （V6 §5 升级思路 2+3）：agent 自报无法完成时，任务以 blocked 终态收尾而
+// 不是 completed——「报 blocked 却放行下游」路径由此关闭（认领闸只认
+// completed，blocked 永远不满足依赖）。
+//
+// 收尾事务顺序（同一收尾路径内，终态先 durable）：
+//  1. 结果摘要保留在 task.Results[a.ID]（与 SubmitResult 同键位），阻塞原因
+//     由 store 写入 task.Error；event/verdict 键刻意不写——graph 的
+//     eventNameOf 让 Result["event"] 优先于终态映射，写入会把 blocked 节点
+//     错误路由成事件命中；
+//  2. processing → blocked（BlockProcessingTaskBySystem，cause=
+//     agent_reported_blocked 与系统兜底拦截区分）；Store 不支持该迁移时
+//     降级 failed——终态语义必须达成，不能让任务滞留 processing；
+//  3. 终态落盘后 emit task_result_committed（结构化 status/cause）；
+//  4. 非图任务发布通用 replan 唤醒任务（幂等键 <taskID>/replan）交
+//     Scheduler 裁决；图任务由 graph-terminal-feed 回填驱动边路由。
+//     唤醒发布失败时终态事实保留，额外 emit error 事件。
+func (a *Agent) commitStructuredBlocked(task *model.Task, taskMem *taskMemRuntime, taskID, resultText, blockedReason, summary string) {
+	// blocked_reason 是 submit_task_result 经 schema 校验后的权威终态事实。
+	// 必须先写 Task Memory，再让 Store 发出 blocked 终态事件；异步
+	// Session promotion 随后等待 finalize 的 sealed checkpoint。
+	taskMem.recordBlockedReason(a, taskID, blockedReason)
+
+	// 结果摘要保留（best-effort，与 SubmitResult 同键位）：终态后公告板
+	// 快照与 Scheduler 仍能看到 agent 的自述与证据。
+	if err := store.RecordResultField(a.Store, taskID, a.ID, resultText); err != nil {
+		log.Printf("[agent %s] 任务 %s blocked 收尾写入结果摘要失败: %v", a.ID, taskID, err)
 	}
 
-	// 检查重试次数是否已耗尽，避免无限重试
-	if a.MaxRetries > 0 && task.RetryCount >= a.MaxRetries {
-		failReason := fmt.Sprintf("重试次数耗尽 (%d/%d): %s", task.RetryCount, a.MaxRetries, reason)
-		a.terminateTask(task, taskID, failReason, "max_loops_exceeded")
+	blocker, ok := a.Store.(processingTaskBlocker)
+	if !ok {
+		// Store 不支持 processing→blocked 时降级为 failed——终态语义必须达成，
+		// 不能让任务滞留 processing（与 runtime loop fuse 同款兜底）。
+		log.Printf("[agent %s] 任务 %s Store 不支持 BlockProcessingTaskBySystem，结构化 blocked 降级 FailTask", a.ID, taskID)
+		a.terminateTask(task, taskID, "agent 自报 blocked（store 不支持 blocked 迁移，降级 failed）: "+blockedReason, "agent_reported_blocked")
+		return
+	}
+	if err := blocker.BlockProcessingTaskBySystem(taskID, blockedReason, "agent_reported_blocked"); err != nil {
+		// 迁移失败（如并发取消已先落终态）：终态事实归竞态获胜方，不补发
+		// 唤醒任务，只留错误账本。
+		log.Printf("[agent %s] 任务 %s 结构化 blocked 终态迁移失败: %v", a.ID, taskID, err)
+		trace.Emit(trace.Event{
+			Kind:    trace.KindError,
+			TaskID:  taskID,
+			AgentID: a.ID,
+			Error:   "结构化 blocked 终态迁移失败: " + err.Error(),
+		})
 		return
 	}
 
-	if err := a.Store.RetryRollback(a.ID, taskID, reason); err != nil {
-		if errors.Is(err, store.ErrTaskNotProcessing) {
-			log.Printf("[agent %s] 任务 %s RetryRollback (max loops) 跳过：状态已被外部转换", a.ID, taskID)
-		} else {
-			log.Printf("[agent %s] RetryRollback (max loops) error: %v", a.ID, err)
-		}
-	} else {
-		// 2026-04-25 P1 #2：重试 trace 事件。AttemptNo 记新一轮的序号
-		// （task.RetryCount 在 RetryRollback 内部递增，读当前值即是下一次尝试号）。
+	trace.Emit(trace.Event{
+		Kind:    trace.KindTaskResultCommitted,
+		TaskID:  taskID,
+		AgentID: a.ID,
+		Reason:  blockedReason,
+		Transition: &trace.Transition{
+			PrevStatus: string(model.TaskStatusProcessing),
+			NewStatus:  string(model.TaskStatusBlocked),
+			Cause:      "agent_reported_blocked",
+		},
+	})
+
+	// replan 唤醒与终态同一收尾事务：终态已 durable，唤醒失败不推翻终态，
+	// 记 error 事件（Scheduler 也可经公告板巡检发现 blocked 任务）。
+	detail := "blocked_reason: " + blockedReason + "\nsummary: " + summary
+	if err := a.publishReplanWakeTask(task, taskID, "agent_reported_blocked", detail); err != nil {
 		trace.Emit(trace.Event{
-			Kind:      trace.KindTaskRetry,
-			TaskID:    taskID,
-			AgentID:   a.ID,
-			Reason:    "max_loops: " + reason,
-			AttemptNo: task.RetryCount,
-			Transition: &trace.Transition{
-				PrevStatus: string(model.TaskStatusProcessing),
-				NewStatus:  string(model.TaskStatusPending),
-				Cause:      "max_loops_exceeded",
-				RetryCount: task.RetryCount,
-			},
+			Kind:    trace.KindError,
+			TaskID:  taskID,
+			AgentID: a.ID,
+			Error:   "blocked 终态已落盘，但 replan 唤醒任务发布失败: " + err.Error(),
 		})
 	}
 }
 
-func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, history []HistoryEntry) {
+func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, history []HistoryEntry, manifestInfo *manifestSideInfo) {
 	var recoverable *ErrRecoverable
 	if errors.As(execErr, &recoverable) {
 		// Layer 3: 如果是上下文溢出错误，在重试前激进压缩历史
@@ -1316,47 +1391,18 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 			log.Printf("[agent %s] 任务 %s 检测到上下文溢出，执行激进压缩", a.ID, taskID)
 			snipOldToolResults(history, 1)        // 激进清理：只保留最近 1 条
 			history = compressHistory(history, 1) // 激进压缩：只保留最近 1 条
+			// CM1：回填 L3 处置——本 attempt 随后的 LLM 调用的 Manifest 中
+			// history 段 Disposition 记为 truncated。
+			if manifestInfo != nil {
+				manifestInfo.l3Truncated = true
+			}
 		}
 
-		// 预判是否即将 terminate——这个判断决定 note 的成本策略。
+		// 预判是否即将 terminate。
 		willTerminate := a.MaxRetries > 0 && task.RetryCount >= a.MaxRetries
 
-		// TransferNote 分类策略（2026-04-25 重构）：
-		//
-		// 旧行为：任何 recoverable 失败都调 L1（一次额外 LLM 调用），L1 失败降级 L3。
-		// 代价：LLM 服务宕机时每次 retry 都烧一次无效 dial；即使服务正常，
-		// 普通 transient 失败也调 LLM 做"信息与 history 高度重复"的总结。
-		//
-		// 新行为按场景分派：
-		//   - overflow：压缩已经把 history 缩到 1 条，L1 是唯一保住 reasoning 链的路径——调 L1
-		//   - willTerminate：任务即将进入 failed 终态，note 会被下游 + crashReport 消费——调 L1
-		//   - 其他 transient（网络 / 5xx / rate limit / ExpectedArtifacts 失败）：
-		//     LastHistory 完整保留、retry 接手者能靠 history 恢复，L1 价值低且大概率失败——
-		//     走零成本的 L3 mechanical 兜底，保留结构化交接文本，但不烧 LLM 调用
-		//
-		// 两条路径都经过 SetTransferNote；下游依赖 / retry 接手者读到的
-		// note 格式一致（都是 <transfer-note> / <transfer-note level="raw"> 包裹的文本）。
-		tnCtx := WithAgentContext(context.Background(), a.ID, taskID, -1)
-		tnCtx = WithNoTools(tnCtx) // L1 期望纯文本输出，物理屏蔽工具集避免副作用泄漏
-		var note string
-		if overflow || willTerminate {
-			// L1 高价值路径：允许一次 LLM 调用做自然语言压缩，失败自动降级 L3
-			note = a.buildTransferNote(tnCtx, task, nil, history, a.transferNoteMaxTokens())
-		} else {
-			// 普通 transient：直接 L3 机械拼装，零 LLM 调用
-			var toolHistory []store.ToolCallRecord
-			if a.Store != nil && task != nil {
-				toolHistory, _ = a.Store.QueryToolCalls(task.ID, "")
-			}
-			note = mechanicalTransferNote(task, history, toolHistory, a.transferNoteMaxTokens())
-		}
-		if note != "" {
-			_ = a.Store.SetTransferNote(taskID, note)
-		}
-
 		// 全局重试上限：可恢复错误也要受 MaxRetries 约束，避免无限重试。
-		// 此前只有 handleMaxLoops 路径检查 MaxRetries，导致 ExpectedArtifacts 校验
-		// 失败、tool 错误等可恢复故障可以无限循环（实战中观察到 24+ 次重试，烧 2 小时）。
+		// 此前可恢复故障不受限（实战中观察到 24+ 次重试，烧 2 小时）。
 		if willTerminate {
 			failReason := fmt.Sprintf("重试次数耗尽 (%d/%d): %s",
 				task.RetryCount, a.MaxRetries, execErr.Error())
@@ -1392,16 +1438,8 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 			})
 		}
 	} else {
-		// 不可恢复错误：先记 TransferNote（走纯机械 L3，不调 LLM——execErr 很可能是
-		// LLM 自身故障，再调一次只会失败），然后终止 + 崩溃汇报
-		var toolHistory []store.ToolCallRecord
-		if a.Store != nil && task != nil {
-			toolHistory, _ = a.Store.QueryToolCalls(task.ID, "")
-		}
-		note := mechanicalTransferNote(task, history, toolHistory, a.transferNoteMaxTokens())
-		if note != "" {
-			_ = a.Store.SetTransferNote(taskID, note)
-		}
+		// 不可恢复错误：诊断原因后终止 + 崩溃汇报（V6 CM4 起不再生成
+		// TransferNote——重试/下游交接由 Task Memory + LastHistory 承担）。
 		reason := diagnoseLLMError(execErr, history, a.Model)
 		log.Printf("[agent %s] 任务 %s 不可恢复错误：%s", a.ID, taskID, reason)
 		a.terminateTask(task, taskID, reason, "non_recoverable_error")
@@ -1414,7 +1452,7 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 //     避免上游静默等待。崩溃邮件遵循固定格式："代理 X 在执行任务 Y 时崩溃，原因 Z"。
 //
 // cause 是 trace.Transition.Cause 的结构化原因 enum（v5 Phase 2 引入），让 Reactor when
-// 条件能精确匹配 max_loops_exceeded / non_recoverable_error 等分支。
+// 条件能精确匹配 runtime_loop_fuse / non_recoverable_error 等分支。
 func (a *Agent) terminateTask(task *model.Task, taskID string, reason string, cause string) {
 	if err := a.Store.FailTask(a.ID, taskID, reason); err != nil {
 		log.Printf("[agent %s] FailTask error: %v", a.ID, err)
@@ -1550,7 +1588,7 @@ func diagnoseLLMError(execErr error, history []HistoryEntry, model string) strin
 	case unrecov.StatusCode == 404:
 		return fmt.Sprintf("无法连接到 %s。请检查网络连通性或 base_url 配置。", unrecov.Endpoint)
 	case unrecov.Code == "context_length_exceeded":
-		return fmt.Sprintf("请求超出模型上下文上限。当前历史长度约 %d tokens，请考虑降低 context_limit 或开启更积极的历史压缩。", estTokens)
+		return fmt.Sprintf("请求超出模型上下文上限。当前历史长度约 %d tokens，请考虑调低 enforce_compact_token_threshold 让压缩更早触发，或拆分任务缩短上下文。", estTokens)
 	default:
 		return fmt.Sprintf("LLM 调用失败: %s (status=%d, code=%s)。完整响应: %s", unrecov.Message, unrecov.StatusCode, unrecov.Code, unrecov.Err.Error())
 	}
@@ -1630,14 +1668,13 @@ func (a *Agent) sleep(ctx context.Context) {
 }
 
 // NewAgent creates a new agent with the given configuration.
-func NewAgent(id, eventType string, s store.TaskStore, r roster.Roster, exec TaskExecutor, maxLoops int) *Agent {
+func NewAgent(id, eventType string, s store.TaskStore, r roster.Roster, exec TaskExecutor) *Agent {
 	return &Agent{
 		ID:           id,
 		EventType:    eventType,
 		Store:        s,
 		Roster:       r,
 		Execute:      exec,
-		MaxLoops:     maxLoops,
 		PollInterval: 500 * time.Millisecond,
 	}
 }

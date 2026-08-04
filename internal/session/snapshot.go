@@ -58,34 +58,40 @@ type TaskSnapshot struct {
 	// ArtifactMeta 是 Artifacts 的并行元数据（登记时刻的内容 hash/字节数）。
 	// 纯增量字段：旧版本快照没有它，Unmarshal 得 nil，按"无元数据"降级，
 	// 因此不提升 currentSnapshotVersion（与 LastHistory/ToolCalls 同策略）。
-	ArtifactMeta       map[string]ArtifactMetaSnapshot `json:"artifact_meta,omitempty"`
-	TransferNote       string                          `json:"transfer_note,omitempty"`
-	MailChainDepth     int                             `json:"mail_chain_depth,omitempty"`
-	SchedulerBatch     []string                        `json:"scheduler_batch,omitempty"`
-	LastResponse       string                          `json:"last_response,omitempty"`
-	PartialOutput      string                          `json:"partial_output,omitempty"`
-	CreatedAt          string                          `json:"created_at"`
-	PendingSince       string                          `json:"pending_since,omitempty"`
-	StartedAt          string                          `json:"started_at,omitempty"`
-	CompletedAt        string                          `json:"completed_at,omitempty"`
-	PlanID             string                          `json:"plan_id,omitempty"`
-	NodeRole           string                          `json:"node_role,omitempty"`
-	CreatedRevision    int64                           `json:"created_revision,omitempty"`
-	RetiredRevision    int64                           `json:"retired_revision,omitempty"`
-	Supersedes         []string                        `json:"supersedes,omitempty"`
-	AcceptanceRunID    string                          `json:"acceptance_run_id,omitempty"`
-	PlanMutationSource string                          `json:"plan_mutation_source,omitempty"`
+	ArtifactMeta   map[string]ArtifactMetaSnapshot `json:"artifact_meta,omitempty"`
+	MailChainDepth int                             `json:"mail_chain_depth,omitempty"`
+	SchedulerBatch []string                        `json:"scheduler_batch,omitempty"`
+	LastResponse   string                          `json:"last_response,omitempty"`
+	PartialOutput  string                          `json:"partial_output,omitempty"`
+	CreatedAt      string                          `json:"created_at"`
+	PendingSince   string                          `json:"pending_since,omitempty"`
+	StartedAt      string                          `json:"started_at,omitempty"`
+	CompletedAt    string                          `json:"completed_at,omitempty"`
+	// GraphID / NodeID / ActivationID 是 V6 Graph 归属身份（见 model.Task
+	// 同名字段）。纯增量字段：旧版本快照没有它们，Unmarshal 得空串，按
+	// 「非图任务」降级，因此不提升 currentSnapshotVersion。
+	// 必须随快照走：恢复后 graph-terminal-feed 凭 GraphID 回填引擎、
+	// graphBoard 凭 (GraphID, ActivationID) 幂等去重；丢失会让在途图
+	// 节点永久等不到终态事实。
+	GraphID      string `json:"graph_id,omitempty"`
+	NodeID       string `json:"node_id,omitempty"`
+	ActivationID string `json:"activation_id,omitempty"`
 	// Capability 是任务的节点能力声明（工具子集 / 模型覆盖）的快照形式。
 	// 纯增量字段：旧版本快照没有它，Unmarshal 得 nil，按"无节点能力约束"处理，
 	// 因此不提升 currentSnapshotVersion（与 ArtifactMeta/ToolCalls 同策略）。
 	Capability *CapabilitySnapshot `json:"capability,omitempty"`
+	// Lease 是任务的冻结执行租约（V6 §4 H1，model.ExecutionLease）的快照
+	// 形式。纯增量字段：旧版本快照没有它，Unmarshal 得 nil，按「尚未冻结」
+	// 处理——下次认领时按计算规则即时冻结，因此不提升
+	// currentSnapshotVersion（与 Capability/ArtifactMeta 同策略）。
+	Lease *LeaseSnapshot `json:"lease,omitempty"`
 	// LastHistory preserves the completed ReAct rounds of a suspended/retried
 	// Task. Without it, a resumed Task can repeat tool side effects after a
 	// process restart even though in-memory retry already avoids that replay.
 	LastHistory []byte `json:"last_history,omitempty"`
-	// ToolCalls are durable execution facts used by the dynamic Plan boundary
-	// and formal acceptance verifier. They live on the owning Task snapshot so
-	// restoring a session cannot detach evidence from its Task identity.
+	// ToolCalls are durable execution facts. They live on the owning Task
+	// snapshot so restoring a session cannot detach evidence from its Task
+	// identity.
 	ToolCalls []ToolCallSnapshot `json:"tool_calls,omitempty"`
 }
 
@@ -108,11 +114,28 @@ type CapabilitySnapshot struct {
 	IsolationMode string `json:"isolation_mode,omitempty"`
 }
 
+// LeaseSnapshot 是 model.ExecutionLease 的可序列化形式（V6 §4 H1）。
+// 与 CapabilitySnapshot 同策略——session 不 import model/store，快照边界
+// 拥有自己的 DTO，由 store 在导出/导入时做显式转换。
+type LeaseSnapshot struct {
+	Attempt          int      `json:"attempt,omitempty"`
+	FrozenAt         string   `json:"frozen_at,omitempty"`
+	BusinessTools    []string `json:"business_tools,omitempty"`
+	ControlTools     []string `json:"control_tools,omitempty"`
+	Model            string   `json:"model,omitempty"`
+	Workspace        string   `json:"workspace,omitempty"`
+	Synthetic        bool     `json:"synthetic,omitempty"`
+	ApprovalRequired bool     `json:"approval_required,omitempty"`
+	Revoked          bool     `json:"revoked,omitempty"`
+	Digest           string   `json:"digest,omitempty"`
+}
+
 // ToolCallSnapshot is the serialization-only form of store.ToolCallRecord.
 // session cannot import store (store already imports session), so the snapshot
 // boundary owns this DTO and store performs the explicit conversion.
 type ToolCallSnapshot struct {
 	Timestamp string         `json:"timestamp,omitempty"`
+	CallID    string         `json:"call_id,omitempty"`
 	AgentID   string         `json:"agent_id,omitempty"`
 	ToolName  string         `json:"tool_name"`
 	Args      map[string]any `json:"args,omitempty"`

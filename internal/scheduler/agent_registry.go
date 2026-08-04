@@ -16,8 +16,8 @@ type SpecializedAgent struct {
 }
 
 type routeRegistration struct {
-	key    string
-	PlanID string
+	key     string
+	OwnerID string
 	SpecializedAgent
 }
 
@@ -25,7 +25,7 @@ type routeRegistration struct {
 // dynamically provisioned Teams both register here. A catalog entry alone is
 // never a runnable route.
 //
-// Registrations are keyed so a Plan-scoped Team can be removed without
+// Registrations are keyed so an owner-scoped Team can be removed without
 // disturbing a static kind or another Team listening on the same event type.
 type AgentRegistry struct {
 	mu     sync.RWMutex
@@ -69,10 +69,11 @@ func (r *AgentRegistry) Register(entry SpecializedAgent) {
 
 // RegisterRoute registers a concrete static kind or dynamic Team. key must be
 // stable for the lifetime of the resource (for example "static:worker" or a
-// Team ID). planID is empty for static/global routes and mandatory for a
-// Plan-private dynamic Team. It is an error to reuse a key, because that would
-// make rollback and recovery ambiguous.
-func (r *AgentRegistry) RegisterRoute(key, eventType, planID string, count int, role string, capabilities []string) error {
+// Team ID). ownerID is the owning scope: the controller task ID for a
+// dynamically provisioned Team, and empty for static/global routes. It is an
+// error to reuse a key, because that would make rollback and recovery
+// ambiguous.
+func (r *AgentRegistry) RegisterRoute(key, eventType, ownerID string, count int, role string, capabilities []string) error {
 	if r == nil {
 		return fmt.Errorf("agent route registry is nil")
 	}
@@ -91,7 +92,7 @@ func (r *AgentRegistry) RegisterRoute(key, eventType, planID string, count int, 
 		return fmt.Errorf("agent route key %q is already registered", key)
 	}
 	r.routes[key] = routeRegistration{
-		key: key, PlanID: planID,
+		key: key, OwnerID: ownerID,
 		SpecializedAgent: SpecializedAgent{
 			EventType: eventType, Count: count, Role: role,
 			Capabilities: cloneStrings(capabilities),
@@ -101,19 +102,19 @@ func (r *AgentRegistry) RegisterRoute(key, eventType, planID string, count int, 
 	return nil
 }
 
-// CanRouteForPlan reports whether a Plan may publish to eventType. Static
-// routes (PlanID="") are global; a dynamic Team route is visible only to its
-// owning Plan. Capability guarantees are computed only across listeners that
-// may claim work for that Plan. Team runners independently enforce the same
-// scope at claim time, so an ineligible listener sharing an event type cannot
-// steal another Plan's Task.
-func (r *AgentRegistry) CanRouteForPlan(planID, eventType string, requiredTools ...string) bool {
+// CanRouteForPlan reports whether the given owner scope may publish to
+// eventType. Static routes (OwnerID="") are global; a dynamic Team route is
+// visible only to its owning scope. Capability guarantees are computed only
+// across listeners that may claim work for that scope. Team runners
+// independently enforce the same scope at claim time, so an ineligible
+// listener sharing an event type cannot steal another scope's Task.
+func (r *AgentRegistry) CanRouteForPlan(ownerID, eventType string, requiredTools ...string) bool {
 	if r == nil {
 		return false
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return canRouteLocked(r.routes, planID, true, eventType, requiredTools)
+	return canRouteLocked(r.routes, ownerID, true, eventType, requiredTools)
 }
 
 // UnregisterRoute removes exactly one keyed resource. It returns whether a
@@ -150,13 +151,13 @@ func (r *AgentRegistry) CanRoute(eventType string, requiredTools ...string) bool
 	return canRouteLocked(r.routes, "", false, eventType, requiredTools)
 }
 
-func canRouteLocked(routes map[string]routeRegistration, planID string, scoped bool, eventType string, requiredTools []string) bool {
+func canRouteLocked(routes map[string]routeRegistration, ownerID string, scoped bool, eventType string, requiredTools []string) bool {
 	found := false
 	for _, route := range routes {
 		if route.EventType != eventType || route.Count <= 0 {
 			continue
 		}
-		if scoped && route.PlanID != "" && route.PlanID != planID {
+		if scoped && route.OwnerID != "" && route.OwnerID != ownerID {
 			continue
 		}
 		found = true
@@ -178,26 +179,26 @@ func (r *AgentRegistry) RouteCapabilities(eventType string) ([]string, bool) {
 	return routeCapabilitiesLocked(r.routes, "", false, eventType)
 }
 
-// RouteCapabilitiesForPlan is the Plan-scoped counterpart of
+// RouteCapabilitiesForPlan is the owner-scoped counterpart of
 // RouteCapabilities. It includes global static listeners plus dynamic
-// listeners owned by planID, and excludes every other Plan's Team.
-func (r *AgentRegistry) RouteCapabilitiesForPlan(planID, eventType string) ([]string, bool) {
+// listeners owned by ownerID, and excludes every other scope's Team.
+func (r *AgentRegistry) RouteCapabilitiesForPlan(ownerID, eventType string) ([]string, bool) {
 	if r == nil {
 		return nil, false
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return routeCapabilitiesLocked(r.routes, planID, true, eventType)
+	return routeCapabilitiesLocked(r.routes, ownerID, true, eventType)
 }
 
-func routeCapabilitiesLocked(routes map[string]routeRegistration, planID string, scoped bool, eventType string) ([]string, bool) {
+func routeCapabilitiesLocked(routes map[string]routeRegistration, ownerID string, scoped bool, eventType string) ([]string, bool) {
 	var common []string
 	found := false
 	for _, route := range routes {
 		if route.EventType != eventType || route.Count <= 0 {
 			continue
 		}
-		if scoped && route.PlanID != "" && route.PlanID != planID {
+		if scoped && route.OwnerID != "" && route.OwnerID != ownerID {
 			continue
 		}
 		if !found {
@@ -222,18 +223,18 @@ func (r *AgentRegistry) Specialized() []SpecializedAgent {
 }
 
 // SpecializedForPlan returns the Scheduler-visible route snapshot for one
-// Plan: all global static routes plus only that Plan's dynamic Teams. The
-// global Specialized diagnostic API intentionally remains unchanged.
-func (r *AgentRegistry) SpecializedForPlan(planID string) []SpecializedAgent {
+// owner scope: all global static routes plus only that scope's dynamic Teams.
+// The global Specialized diagnostic API intentionally remains unchanged.
+func (r *AgentRegistry) SpecializedForPlan(ownerID string) []SpecializedAgent {
 	if r == nil {
 		return nil
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return specializedLocked(r.routes, r.order, planID, true)
+	return specializedLocked(r.routes, r.order, ownerID, true)
 }
 
-func specializedLocked(routes map[string]routeRegistration, order []string, planID string, scoped bool) []SpecializedAgent {
+func specializedLocked(routes map[string]routeRegistration, order []string, ownerID string, scoped bool) []SpecializedAgent {
 	byEvent := make(map[string]int)
 	var out []SpecializedAgent
 	for _, key := range order {
@@ -241,7 +242,7 @@ func specializedLocked(routes map[string]routeRegistration, order []string, plan
 		if !ok || route.EventType == "" || route.Count <= 0 {
 			continue
 		}
-		if scoped && route.PlanID != "" && route.PlanID != planID {
+		if scoped && route.OwnerID != "" && route.OwnerID != ownerID {
 			continue
 		}
 		idx, exists := byEvent[route.EventType]

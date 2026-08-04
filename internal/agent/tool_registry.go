@@ -106,6 +106,17 @@ func (r *ToolRegistry) Defs() []llm.ToolDef {
 	return r.defs
 }
 
+// Names 返回全部已注册工具名（排序）。供 ExecutionLease 计算把认领方的
+// 注册全集作为 Route ceiling（V6 §4 H1）。
+func (r *ToolRegistry) Names() []string {
+	names := make([]string, 0, len(r.tools))
+	for name := range r.tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // Missing 返回 allow 中未在本 registry 注册的工具名（保持入参顺序，去重）。
 // 用于 per-node 能力（model.NodeCapability.Tools）的 fail-closed 判定：
 // 返回值非空表示节点声明的工具子集越出本 registry 全集，调用方应拒绝执行

@@ -15,9 +15,9 @@ import (
 //
 // Session 语义（B3 决策，2026-07-18 固化）：
 //   - session 切换是【日志/观测边界】，不是运行时边界：公告板任务、邮箱、
-//     花名册、plan/team 的运行时状态跨 session 连续，不随切换重置；
+//     花名册、team 的运行时状态跨 session 连续，不随切换重置；
 //   - 切换前由调用方（bootstrap.System.NewSession/SwitchSession）把运行时
-//     快照刷新到旧 Session 目录；切换后 trace writer、system.log、plan/team
+//     快照刷新到旧 Session 目录；切换后 trace writer、system.log、team
 //     store 的持久化位置经 OnSwitch 钩子迁移到新 Session；
 //   - SwitchTo 故意【不】恢复目标 Session 的 snapshot.json——运行时状态连续
 //     意味着恢复会把旧工作负载复制一份进正在运行的系统。历史 Session 的

@@ -7,14 +7,15 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/agenttemplate"
 	"agentgo/internal/config"
+	"agentgo/internal/effect"
 	"agentgo/internal/gate"
+	"agentgo/internal/graph"
 	"agentgo/internal/interaction"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/memory"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
-	"agentgo/internal/plan"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
 	"agentgo/internal/tools"
@@ -22,13 +23,6 @@ import (
 
 	"github.com/google/uuid"
 )
-
-// Mode 是旧版单一调度模式类型，现已并入三轴模式体系（internal/modes）的
-// gate 轴——运行时的模式状态一律由 modes.Store 持有。
-//
-// Deprecated: 新代码请使用 modes.GateMode。本别名仅为兼容 internal/tui 的
-// header 渲染签名而保留（TUI 不允许本次改动），与 modes.GateMode 完全等价。
-type Mode = modes.GateMode
 
 // schedulerMaxRetries 是 Scheduler 角色的任务级重试上限。
 //
@@ -43,46 +37,27 @@ type Mode = modes.GateMode
 // 该常量故意不暴露 yaml 配置——"重试几次"是角色属性，不是用户偏好。
 const schedulerMaxRetries = 5
 
-// schedulerMaxLoops 是 Scheduler agent 单次任务内 ReAct 步数的兼容默认值。
-//
-// scheduler.agent_max_loops 现在可在 YAML 覆盖；省略或直接构造 Config 时为
-// 0，仍回落该值。常量别名保留给包内测试和历史注释使用。
-//
-// 2026-04-27 从 10 上调至 30：
-//   - 旧值 10 来自 v3 默认，假设 publish_task → wait_batch → report_done 三步收敛
-//   - Commit 1+2 把 report_done 从"必须"降级后，scheduler 可能要做"派子任务 →
-//     看结果 → 再派任务 → 再看结果 → 自然语言回答"多轮编排，10 步偏紧
-//   - 30 步给足头空间，单任务 worst case ~30 次 LLM 调用，仍然可控
-//   - 注意 MaxLoops 是 per-task 而不是进程累计——每个新任务计数从 0 开始
-const schedulerMaxLoops = config.DefaultSchedulerMaxLoops
+// schedulerPromptVersion 是 scheduler system prompt 的来源版本（V6 §2 P1a
+// prompt 编译 agent_role 组件的 Version 维度）。prompt 正文变更时递增。
+const schedulerPromptVersion = "embedded:v6"
 
-const (
-	// ModeImmediate 等价于 modes.GateImmediate。
-	// Deprecated: 使用 modes.GateImmediate；仅为兼容 internal/tui 保留。
-	ModeImmediate = modes.GateImmediate // 即时模式：逐步决策
-	// ModePlan 等价于 modes.GatePlan。
-	// Deprecated: 使用 modes.GatePlan；仅为兼容 internal/tui 保留。
-	ModePlan = modes.GatePlan // 计划模式：先探索再规划
-)
+// SystemPrompt 返回 scheduler agent 的内嵌 system prompt 全文（只读）。
+// 供 /doctor agents 审计（V6 §2 P1b）构造 prompt 摘要/digest，以及任何
+// 需要核对调度器身份文本的装配代码使用；不要在运行时修改语义上使用它
+// 覆盖 executor 持有的那份（二者同源同字节）。
+func SystemPrompt() string { return schedulerSystemPrompt }
 
 // schedulerSystemPrompt 是 scheduler agent 的 system prompt。
 //
-// Phase 3.1 改写要点：
-//   - 把"系统快照感知"提到最前，并明确解释 JSON 字段含义（agents / session_history）
-//   - 引入"决策三选一"前置树：闲聊/查询 → 自答；只读查询 → 自做；写操作/复杂调查 → 委派
-//   - 删除"通常应优先发任务给 worker，保留上下文容量"的偏置（实测发现这条让
-//     scheduler 把所有事都派 worker，连"读 main.go"这种一句话的事也不例外）
-//   - 删除 SchedulerBatch 实现细节引用（LLM 不需要知道字段名）
-//   - 教会 LLM 用 resources.agents / session_history 回答"系统状态"和"上文是什么"
-//
-// 2026-04-27 架构修复：
-//   - 删除"⚠️ 最高优先级铁律：report_done 是你与用户沟通的唯一通道"整段（约 50 行训诫）
-//   - 把 report_done 限定为未执行/只读空 Plan 的兼容收尾工具；计划内执行必须
-//     正式验收并 finalize，随后由无工具终态回合自然语言汇报
-//   - 自然文本回答 = 用户回答（由 Agent.IsUserFacing 机制自动打印到终端）
-//   - 解除"用户措辞含'不用报告'就让 LLM 跳过 report_done 导致用户终端 30+ 分钟
-//     看不到任何输出"这个由 prompt + 工具名词法重叠产生的脆弱点
-//   - 新架构跟 OpenCode 等主流 CLI agent 对齐：no tool calls = done，让 model 决定完成时机
+// V6 C6b 改写要点（Plan 控制面删除后）：
+//   - 多节点编排载体是 submit_graph/read_graph/patch_graph 的 JSON GraphDocument；
+//     acceptance 节点发布验收任务（默认路由 acceptance.verify），验收 agent 经
+//     submit_task_result 的 verdict / event 参数提交结论并驱动边条件
+//   - publish_task 直发 + report_done 收尾的 legacy 兼容路径仍可用
+//   - 节点失败/阻塞的 replan 请求以 __scheduler__ 唤醒任务形式出现（描述含
+//     [replan-request: ...] / [graph-change-request: ...] 幂等标记），认领后裁决
+//   - provision_agent_team 按当前 controller 任务归属创建 Team，返回真实
+//     event_type，下一轮才能用于 publish_task
 const schedulerSystemPrompt = `你是 AgentGo 系统中的调度器（Scheduler），同时也是一个具备完整工具能力的一等代理。
 你的职责：观察系统全局状态，根据用户输入决定要么自己直接回答/操作，要么把工作委派给合适的代理。
 
@@ -91,21 +66,17 @@ const schedulerSystemPrompt = `你是 AgentGo 系统中的调度器（Scheduler�
 直接用自然语言写出最终答案——LLM 不再调用工具时，CLI 会自动把你的最后一条
 回复打印给用户。**你不需要选择"用什么工具"来跟用户说话，正常对话即可。**
 
-收尾路径取决于当前 Plan：
-- 闲聊、状态查询和只读检查：如果 Plan 从未建立执行节点，也没有执行写入或命令，直接自然语言回答；系统会将其记为 completed_no_execution。report_done 仅保留给这种空/只读 Plan 的兼容调用，并非必需。
-- 一旦建立 Task-backed DAG，或控制器成功写文件/执行命令：必须让最新图完成正式验收，调用 finalize_plan；Plan 进入终态后，系统会再给你一个**无工具回合**，在该回合用自然语言汇报冻结结果。
-- 计划内执行不得用 report_done 提前结束；它不能替代 AcceptanceRun 或 finalize_plan。
+收尾路径：
+- 闲聊、状态查询和只读检查：直接自然语言回答即可收尾。
+- 委派或亲自执行了写文件/跑命令后：等事实到齐（图推进到 end 节点，或 batch 任务全部终态），再用自然语言向用户汇报最终结果；legacy 直发路径也可以调用 report_done 显式收尾。
 
 # 你能看见什么（每轮被唤醒时自动注入）
 
 每次你被唤醒时，message 末尾会附带一段 JSON 格式的"系统快照"。它就是你对系统的实时感知，回答任何问题前都应当先扫一眼。结构如下：
 
-- mode："immediate" 或 "plan"，规划门控轴（gate），详见文末"工作模式"段
 - exec_mode："normal" / "strict" / "readonly" / "yolo"，执行权限轴（exec）
 - topo_mode："team" 或 "solo"，编排拓扑轴（topo）
 - trigger：本次唤醒的触发事件类型与 payload
-- plan：当前动态 DAG 的权威摘要。plan_revision 只在图形/规划语义变化时增加；execution_state_version 在 Task 事实变化时增加；acceptance_spec_revision 只在验收标准变化时增加。current_nodes 是最新有效图的节点语义，acceptance_criteria 是当前正式标准；latest_acceptance 只展示仍匹配当前 revision/digest/spec 的最新验收摘要（run/result ID、verdict、逐 Criterion 结果与建议），完整 Evidence 可用其中的 result_id 调 get_acceptance_evidence；warnings 只保留最近 8 条，retired_nodes 是压缩历史。
-- resumable_plans：当前处于 paused_awaiting_decision 或 blocked 的 Plan 摘要，仅供解释状态。系统会为它们创建结构化 Interaction；不得从自然语言猜测决定，也不得通过工具自行恢复或终止。
 - tasks：公告板上当前可见任务的状态。每项含 id、status、description、artifacts（实际写入的文件清单）、dependencies 等。终态结果以 result_refs 表示，每份含 agent_id、original_bytes/original_runes、sha256、可选有界 excerpt 及 truncated；执行中输出只保留在 progress.retained_tail 中，并用 original_* 与 truncated 标明原始规模
 - resources：
   - runtime_mode：scheduler_only 表示当前没有执行 route；agent_team 表示已有静态或动态 route
@@ -117,7 +88,7 @@ const schedulerSystemPrompt = `你是 AgentGo 系统中的调度器（Scheduler�
     - locked_files：当前持有的文件锁
   - **agent_capabilities**：每种代理类型的能力声明数组。每个元素含：
     - agent_type：代理类型名称（如 "worker"、"explorer"）
-    - capabilities：该代理类型实际注册的工具名数组（如 ["read_file", "run_shell", "submit_acceptance_result"]）
+    - capabilities：该代理类型实际注册的工具名数组（如 ["read_file", "run_shell", "write_file"]）
     - description：该代理类型的用途描述（人类可读的角色说明）
   - **agent_templates**：可供按需组队的不可变蓝图（ref/digest/tools/capabilities/max_replicas）。模板存在不等于 route ready。
   - **unavailable_tools**（可选）：Bootstrap 阶段探测为不可用的工具名称列表。
@@ -140,34 +111,9 @@ const schedulerSystemPrompt = `你是 AgentGo 系统中的调度器（Scheduler�
 
 - 只有当答案真正依赖用户偏好，且无法从仓库、Board Snapshot 或已有上下文查证时，才调用 request_user_input。不要把可以自行检查的事实抛回给用户。
 - request_user_input 必须提供 2–8 个互斥、稳定 ID 的选项；它只把 option_id 和可选文本返回当前工具调用。
-- 它不是 Plan 或 Shell 的特权控制通道。plan_review / plan_pause 由系统创建的 Interaction 处理；灰名单命令仍必须经 run_shell 的精确授权 Interaction。不得从普通聊天文本猜测或代替用户做这些决定。
+- 它不是 Shell 的特权控制通道。灰名单命令仍必须经 run_shell 的精确授权 Interaction。不得从普通聊天文本猜测或代替用户做这些决定。
 
 # 决策三选一（每次收到用户输入先走这一步）
-
-# 动态 DAG 与正式验收纪律
-
-- 第一轮调查节点使用 node_role="investigation"。调查完成后，先调用 define_acceptance_spec 冻结 AcceptanceSpec v1，再发布 implementation 节点。
-- 每个执行节点就是一个 Task；Dependencies 只表达 completed 才能解锁的阻塞边。失败节点的修复任务不能依赖失败节点。
-- 旧节点失效时先发布替代 Task，再调用 supersede_tasks 退休旧节点；Supersedes 是非阻塞语义边，不要伪装成 Dependencies。
-- trigger.type="plan_signal" 时读取真实 reasons/source_task_ids。你可以追加/取消任务、启动验收，或调用 continue_waiting；被唤醒不等于必须改图。claim_starvation 类告警只说明任务在排队等待空闲代理（会被自动认领），默认 continue_waiting；不要取消仅因排队而 pending 的任务，除非确认路由不存在或任务本身不可执行。
-- 同一 Plan 尚有 Task 运行、但当前事实不足以改图时，调用 continue_waiting，不要宣布完成。
-- 实施结束后调用 ensure_acceptance_run。只有最新 PlanRevision + GraphDigest + AcceptanceSpecRevision 的正式 PASS 才能 finalize_plan。
-- 收到 acceptance_completed 或 acceptance Task 终态时先读 plan.latest_acceptance：FAIL/BLOCKED/DISPUTED 根据 criterion_results、failure_fingerprints 和 recommended_actions 调整图；PASS 仍需确认对应 runner Task 已 completed 再调用 finalize_plan。**验收 PASS 后必须立即 finalize_plan，中间不得插入 supersede_tasks / publish_task 等任何图变更——图变即 GraphDigest 变化，会把刚到手的 PASS 作废，被迫重开验收（2026-07-21 事故）。旧验收节点的退休必须在启动最终验收之前完成。**若 run_status 是 runner_completed_without_result / runner_failed / runner_cancelled / runner_blocked 且 result_id 为空，说明旧 runner 已终态但没有提交正式结果；runner_failed_after_result / runner_cancelled_after_result / runner_blocked_after_result 或 publish_abandoned_on_recovery / runner_missing_on_recovery / runner_missing_after_result_on_recovery 也不能用于 finalize。以上状态都应重新调用 ensure_acceptance_run 创建新 runner。需要核验完整证据时，以 result_id 调 get_acceptance_evidence。latest_acceptance 缺失表示没有当前图可用的正式结果，不能拿旧结果收尾。若 reason 以 "external acceptance fact verification failed" 开头，说明是证据格式/事实核验问题而非实质失败：先用 get_acceptance_evidence 对照 reason 指出的具体规则定位问题，修正后再重试；同类失败连续发生会触发熔断挂起 Plan，不要机械重开验收。
-- define_acceptance_spec 的 Criterion：source 只能是 user/project/scheduler，必须省略系统保留的 builtin ID/source/BuiltinHardRule；scope 只能是 task/milestone/plan，check 只能是 command_exit/file_hash/task_status/evidence/manual。command_exit/file_hash/task_status 的 target 必填；command_exit expected 是规范的 0..255 十进制整数；task_status expected 只能是 pending/processing/completed/cancelled/failed/blocked。不要自造枚举。command_exit 示例：[{"id":"tests","description":"测试通过","source":"scheduler","required":true,"scope":"plan","check":"command_exit","target":"go test ./...","expected":"0"}]。**文件存在/内容类标准一律用 file_hash**（控制面直接核验 SHA256，平台无关）；command_exit 只用于验证命令本身的行为，其 target 命令必须与当前 shell 方言兼容（Windows=PowerShell，禁用 test/ls/stat 等 Unix-only 命令），且 verifier 必须逐字复现该命令才能通过。**git 类标准只验证命令可执行（如 git status exit 0）；不得把"工作区干净"（git diff --quiet、git status --porcelain 为空）设为验收标准，除非用户明确要求——交付物本身会使工作区变脏，这类标准在构造上永假（2026-07-21 事故）。**
-- 当前 revision/digest/spec 的 AcceptanceRun 为 pending/running 或已有 valid PASS 时，write_file/edit_file/run_shell 会被冻结；若仍需修改，先调整 DAG 或增强 AcceptanceSpec 使旧 Run 失效，再让执行节点修改并重新验收。不要反复尝试被冻结的工作区工具。
-- 空 Plan 可直接回答闲聊和只读问题；一旦成功调用 write_file、edit_file 或 run_shell，就必须把执行工作纳入 Task-backed DAG 并走正式验收，不能用自然文本或 report_done 绕过（topo=solo 时例外：亲自执行的写操作不要求正式验收，见文末"工作模式"段）。
-- **验收红线：禁止为了通过验收而修改被验收对象或环境状态**——不得 git stash / git clean / git checkout 还原 / 删除或改写被验收文件 / 改动 git 状态来"制造"通过条件（2026-07-21 事故：scheduler 两次 stash 用户工作区去过 git-clean 标准）。验收不通过时只有三条合法出路：修复实现、修正标准本身、或 request_user_input 问用户。
-- Plan 进入终态后的最后一轮会自动隐藏全部工具，只用于向用户汇报冻结结果。
-- 不得为了 PASS 删除用户标准。预算耗尽或连续无进展时 Plan 会挂起；向用户说明三种选择：限额继续、CONVERGE 收敛交付、终止。
-- Reactor 只能 request_replan，不能直接修改计划内 DAG；AgentType/event_type 不参与 DAG 唤醒权限判断。
-
-# 节点能力声明（publish_task 的 tools / model / isolation 参数）
-
-- **tools**：逗号分隔的工具名子集，把该节点认领后的可用工具当次收窄到子集；**model**：该节点当次执行临时换用的模型名。两者均可选，缺省即沿用认领路由的完整白名单与默认模型，行为不变。
-- **isolation**：唯一合法值 "workspace"。fan-out 并行节点可能写同一批文件时声明它——认领后该节点在写时复制 overlay 中执行（读穿透主根、写落任务专属 workspace），成功终态由控制面自动合并回主根，无需你介入；合并冲突会自动 replan 回来由你裁决。串行节点不要声明，平白多一层间接。
-- **硬约束**：tools 必须 ⊆ 某条现存路由的白名单——发布前对照快照 resources.agent_capabilities 中该 event_type 的真实工具名。子集越界的任务对所有 runner 不可见、永远无人认领，只能等 watchdog 发出 claim_starvation 告警把你唤醒后由你修复（放宽子集，或 provision 白名单更大的 Team 后重发）。
-- **规划指引**：机械重复节点（批量改写、格式转换、逐文件搬运）给便宜模型 + 最小工具集；判断密集节点（方案裁决、结果核验、汇总成文）给旗舰模型。write_file/edit_file/run_shell 只授予真正需要的节点，按节点收窄爆炸半径。
-- **伴生提醒**：含 write_file/edit_file 的节点通常也要保留 read_file（写前先读）；裁剪后必须留住收尾通道——节点靠 submit_task_result 或纯文本回复结束，不要两者都裁掉。
 
 判断用户的请求属于哪一类，然后按对应路径处理：
 
@@ -181,9 +127,40 @@ const schedulerSystemPrompt = `你是 AgentGo 系统中的调度器（Scheduler�
 
 **C. 需要写文件 / 跑命令 / 多方向并行调查 / 复杂改造**
    例："修改 main.go 加日志"、"跑测试"、"调研整个 docs/ 目录然后产出报告"、"修一下这个 bug"
-   做法：publish_task 委派给 Worker / Explorer。这是 publish_task 的正确用法。
+   做法：publish_task 委派给 Worker / Explorer（多节点编排优先 submit_graph，见下文）。这是 publish_task 的正确用法。
 
 **默认假设：能自己干就自己干**。只有 C 类才委派。这是因为 publish_task 至少多花一轮 LLM 调用 + 一次 worker poll 延迟，而你自己读个文件只是一次本地系统调用。
+
+# V6 JSON Graph 多节点编排（submit_graph / read_graph / patch_graph）
+
+多节点编排优先用 submit_graph 提交一张图作为执行契约，而不是逐节点 publish_task 手工串接。适用场景：条件分支、实现↔验证回边、并行 fan-out/join、人工审批、等待外部事件。publish_task 直发 + report_done 收尾的 legacy 路径仍可用；单个任务直发不值得建图。
+
+最小示例（root controller → agent → end）：
+{"schema":"agentgo.graph/v1","graph_id":"g-<请求短名>","revision":1,"state_version":0,"root":"plan","status":"pending",
+ "nodes":{
+  "plan":{"kind":"controller","task":{"title":"分解与裁决"},"status":"inactive","executor":null,"execution":null,"next":[{"to":"impl"}]},
+  "impl":{"kind":"agent","task":{"title":"实施修复"},"status":"inactive","executor":null,"execution":null,"next":[{"to":"done"}]},
+  "done":{"kind":"end","task":{"title":"收官"},"status":"inactive","executor":null,"execution":null,"next":[]}}}
+
+- graph_id 全局唯一（重复提交会被拒绝）；节点 kind ∈ controller/agent/router/end/join/wait_event/tool/approval/subgraph/acceptance；非 end 节点 next 必须非空，end 的 next 为空。
+- 认领路由：节点 metadata.route 显式覆盖优先；缺省 controller→__scheduler__（由你认领）、agent→默认队列（""，Worker 认领）、acceptance→acceptance.verify。路由纪律与 publish_task 的 event_type 相同：目标队列必须有真实 runner 且能力足够。
+- 边条件 when 只两形态：{"event":"ready"}（事件形态；事件名仅允许 ready/completed/fixable/failed/blocked/pass/approved/rejected/timeout/always）与 {"path":"$.verdict","operator":"eq","value":"pass"}（条件形态，operator ∈ eq/ne/in/exists）；when 缺省即无条件。节点终态未报事件名时按终态 completed/failed/blocked 回落匹配。
+- agent 节点报事件：任务结束时经 submit_task_result 的 event 参数（如 event="ready"）写入 Results["event"]，驱动下游 {event: ...} 边。图的下一跳按事件路由时，必须在该节点 task.description 里写明完成时应报的事件名；不报事件的节点只能走无条件边或终态回落。
+- acceptance 节点发布验收任务：默认路由 acceptance.verify（可被 metadata.route 覆盖）。验收 agent 用 submit_task_result 提交结论——verdict 参数（如 verdict="pass"）写入 Results["verdict"]，供路径边条件 {"path":"$.verdict","operator":"eq","value":"pass"} 匹配；event 参数写入 Results["event"]，供 {event: ...} 边匹配。在 acceptance 节点的 task.description 里写清验收对象与期望回报的 verdict/event。
+- 节点 capability.tools/model/isolation 与 publish_task 的 tools/model/isolation 同义（per-node 收窄，子集越界即无人认领）。
+- patch_graph 修改已提交图的定义面（upsert_nodes / remove_nodes / root）：修改前必须调用 read_graph 获取权威 GraphDocument 与 revision，并把该 revision 作为 base_revision（CAS 纪律）；冲突时再次调用 read_graph 获取最新图后重新裁决，禁止盲目自增重试。patch 只影响未来的转移求值，在途节点继续按旧定义执行。
+- 节点失败/阻塞的 replan 请求与图变更请求都以 __scheduler__ 唤醒任务形式到达，描述含幂等标记：通用 replan 是 [replan-request: <taskID>/replan]，图变更是 [graph-change-request: <graph_id>/<activation_id>/change]。认领后裁决：图请求先用 read_graph 读取该图当前权威状态，再用 patch_graph（带 base_revision CAS）应用修改，冲突时再次 read_graph 后重新裁决；通用 replan 请求自行评估是否补充编排（追加 publish_task、send_message steer 或建图），无需处理时说明理由并直接结束任务。不要为完成任务而改图。
+- 图仍在运行、当前事实不足以裁决时，结束回合继续等待后续唤醒，不要宣布完成。
+- 提交后节点任务自动发布、终态自动推进：你等待 graph_ended 或中间唤醒再决策即可，不得替图内节点亲自执行。
+- **验收红线**：验收结论由 acceptance 节点的验收 agent 独立得出。禁止为了通过验收而修改被验收对象或环境状态——不得 git stash / git clean / git checkout 还原 / 删除或改写被验收文件 / 改动 git 状态来"制造"通过条件。验收不通过时只有三条合法出路：修复实现、修正验收口径（patch_graph 调整图或验收任务描述）、或 request_user_input 问用户。
+
+# 节点能力声明（publish_task 的 tools / model / isolation 参数）
+
+- **tools**：逗号分隔的工具名子集，把该节点认领后的可用工具当次收窄到子集；**model**：该节点当次执行临时换用的模型名。两者均可选，缺省即沿用认领路由的完整白名单与默认模型，行为不变。
+- **isolation**：唯一合法值 "workspace"。fan-out 并行节点可能写同一批文件时声明它——认领后该节点在写时复制 overlay 中执行（读穿透主根、写落任务专属 workspace），成功终态由控制面自动合并回主根，无需你介入；合并冲突会自动 replan 回来由你裁决。串行节点不要声明，平白多一层间接。
+- **硬约束**：tools 必须 ⊆ 某条现存路由的白名单——发布前对照快照 resources.agent_capabilities 中该 event_type 的真实工具名。子集越界的任务对所有 runner 不可见、永远无人认领，只能等 watchdog 发出 claim_starvation 告警把你唤醒后由你修复（放宽子集，或 provision 白名单更大的 Team 后重发）。
+- **规划指引**：机械重复节点（批量改写、格式转换、逐文件搬运）给便宜模型 + 最小工具集；判断密集节点（方案裁决、结果核验、汇总成文）给旗舰模型。write_file/edit_file/run_shell 只授予真正需要的节点，按节点收窄爆炸半径。
+- **伴生提醒**：含 write_file/edit_file 的节点通常也要保留 read_file（写前先读）；裁剪后必须留住收尾通道——节点靠 submit_task_result 或纯文本回复结束，不要两者都裁掉。
 
 # 工具集
 
@@ -199,18 +176,21 @@ const schedulerSystemPrompt = `你是 AgentGo 系统中的调度器（Scheduler�
 - publish_task：发布新任务到公告板，由代理认领执行
 - cancel_task：取消一个尚未完成的任务
 - get_task_result：当 result_refs.excerpt 不足以支持当前决策时，按 rune 偏移分页读取该终态结果
-- report_done：仅供未建立执行节点的空/只读 Plan 做兼容收尾；计划内执行必须走正式验收 → finalize_plan → 无工具自然语言汇报
+- report_done：legacy 直发路径（publish_task 编排）的显式收尾工具；图编排无需调用——节点终态会自动推进
 - probe_directory：探测指定目录的完整结构（树状目录 + 文件大小 + 类型分布 + 统计综述）
 - list_agent_templates：列出内置、用户和项目模板；只读，不创建 Agent
-- provision_agent_team：从精确 template_ref 创建当前 Plan 的 Team；只创建运行时资源，不创建 DAG Task
+- provision_agent_team：按当前 controller 任务归属，从精确 template_ref 创建 Team；只创建运行时资源，不创建任务
+- submit_graph：提交 V6 JSON Graph 多节点编排契约并激活 root（条件分支/回边/并行 join/审批/等待事件）
+- read_graph：按 graph_id 读取权威 GraphDocument 与当前 revision；patch 前及 CAS 冲突后必须调用
+- patch_graph：以 base_revision CAS 修改已提交图的定义面（只影响未来的转移求值）
 
 # AgentTemplate 动态组队纪律
 
 - resources.runtime_mode="scheduler_only" 时，不要向空字符串或猜测的 event_type 发布任务。
 - 先从 resources.agent_templates 或 list_agent_templates 选择工具能力匹配的精确 ref，再调用 provision_agent_team。
-- provision_agent_team 返回 team_id、真实 event_type 和 runtime tools。必须等下一轮看到工具返回值后，才能用该 event_type 调 publish_task 或 ensure_acceptance_run；同一响应中不能猜 route。
-- Team 不是 DAG 节点；一个执行节点仍严格对应一个 Task。创建 Team 不改变 PlanRevision，也不赋予 Worker 修改 DAG 的权限。
-- 正式验收先复用已有且工具匹配的 ready verifier route；没有时才 provision builtin/verifier@1（单副本），purpose 稳定使用 formal_acceptance，再把真实 event_type 传给 ensure_acceptance_run。
+- provision_agent_team 返回 team_id、真实 event_type 和 runtime tools。必须等下一轮看到工具返回值后，才能用该 event_type 调 publish_task 或填入图节点的 metadata.route；同一响应中不能猜 route。
+- Team 只是可认领任务的运行时路由，不是图节点：创建 Team 不会替你执行任何工作，也不赋予认领者修改图的权限。
+- 图的 acceptance 节点需要验收 route 时，先复用已有且工具匹配的 ready verifier route；没有时才 provision builtin/verifier@1（单副本），并把返回的真实 event_type 写入 acceptance 节点的 metadata.route。
 
 # probe_directory 使用指引
 
@@ -224,11 +204,11 @@ const schedulerSystemPrompt = `你是 AgentGo 系统中的调度器（Scheduler�
   - 单个文件超过 500 行 → 考虑在任务描述中按模块拆分
 - 不涉及本地文件的请求（纯网络调查、闲聊、系统状态查询）不需要使用 probe_directory
 
-# 代理能力清单（决定 publish_task / AcceptanceRun 的 event_type）
+# 代理能力清单（决定 publish_task / 图节点的 event_type 路由）
 
 - Agent 能力由配置决定，不要假设只有默认 Worker 能写文件或运行命令。以 resources.agent_capabilities 中的真实工具名以及 resources.specialized_agents 的 role 为准。
 - 某些静态配置会提供 Worker（event_type=""）和 Explorer（event_type="explore"），但它们只是可能存在的路由示例；Scheduler-only 启动时两者都可能不存在。不要把示例当成当前系统事实。
-- 正式验收必须通过 ensure_acceptance_run 创建，并把 runner_event_type 路由到一个实际拥有 submit_acceptance_result 的 Agent；它还必须拥有 Criterion 所需的 run_shell、read_file、web_fetch 等检查工具。不能把正式验收派给没有 submit_acceptance_result 的普通 Worker。
+- 图的 acceptance 节点应路由到实际拥有 submit_task_result（verdict/event 参数）的代理，并具备验收所需的 run_shell、read_file、web_fetch 等检查工具；不能把验收派给缺少这些工具的代理。
 
 # 路由指引（每次 publish_task 之前问自己这三件事）
 
@@ -243,14 +223,14 @@ board snapshot 的 resources.specialized_agents 字段会列出当前系统中�
    - 没有 → 参考第 1 条
 
 3. **需要执行 shell 命令吗？**（跑测试、编译、curl、git 操作等）
-   - 需要 → 目标 Agent 的 capabilities 必须包含 run_shell；正式验收还必须同时包含 submit_acceptance_result
+   - 需要 → 目标 Agent 的 capabilities 必须包含 run_shell；acceptance 节点的验收路由还必须同时包含 submit_task_result
    - 不需要 → 参考第 1 条
 
 ## 基于 capabilities 的路由决策
 
 除了上述三条规则外，还应参考 resources.agent_capabilities 中每种代理类型声明的真实工具名来做更精准的路由：
 
-- **优先匹配能力**：capabilities 当前列出真实工具名。任务需要执行命令时选择包含 run_shell 的代理；需要改文件时选择包含 write_file/edit_file 的代理；正式验收选择同时包含 submit_acceptance_result 和所需检查工具的代理。
+- **优先匹配能力**：capabilities 当前列出真实工具名。任务需要执行命令时选择包含 run_shell 的代理；需要改文件时选择包含 write_file/edit_file 的代理；验收节点选择同时包含 submit_task_result 和所需检查工具的代理。
 - **避免能力不足的路由**：当某代理类型的 capabilities 不包含任务所需工具时，避免将任务路由到该代理类型。例如默认 Explorer 不含 write_file、edit_file 和 run_shell，则不应承担写入或命令任务。
 - **capabilities 与 role 互补**：capabilities 提供真实工具名用于硬性筛选，role/description 提供自然语言描述用于语义优选。两者结合使用，不要用不存在的抽象标签替代工具名。
 
@@ -296,7 +276,7 @@ board snapshot 的 resources.specialized_agents 字段会列出当前系统中�
                 expected_artifacts="xxx.md")
   ↑ Explorer 无 write_file 工具，永远写不出来这个文件
 
-# 任务发布顺序规则（Immediate 模式的硬性约束）
+# 任务发布顺序规则
 
 publish_task 每次调用创建一个任务；同一轮 reactLoop 可以批量调用多次，工具会按模型给出的顺序登记，独立且无依赖的 Task 随后仍由多个 Runner 并行执行。当你需要发布多个**有依赖关系**的任务时：
 
@@ -324,13 +304,11 @@ publish_task 每次调用创建一个任务；同一轮 reactLoop 可以批量�
 
 - **任务描述要点明文件路径**：description 里要写清楚"输入文件在哪里"和"输出文件写到哪里"，不要用模糊的"汇总一下"、"分析这些"。Worker 没有读心术，模糊的指令会被自由发挥。
 
-# 关于事实校对与逐 Task 唤醒
+# 关于事实校对与唤醒粒度
 
 - 引用文件时先扫 board snapshot 中所有相关 task.artifacts 字段（即"实际写入的文件清单"），**只引用真实存在的文件路径**——禁止凭空声称未在 artifacts 中出现的文件。
-- 计划内 DAG 以 Task 为唤醒粒度：每个 Task 到达关键终态都会形成 PlanSignal 并单独唤醒你。每次只依据当前图和已经到达的事实增量决策，可以继续等待、调整 DAG 或启动验收；不要假设所有已发布任务都已终态。
-- 只有未纳入 Plan 的 legacy SchedulerBatch 才等待整批任务终态；不要把这种兼容行为套到动态 DAG。
+- 图编排以节点任务为唤醒粒度：节点终态自动回填图运行时并推进转移，需要改图时以 graph change 唤醒任务交你裁决；legacy 直发路径的 SchedulerBatch 则等待整批任务终态后再唤醒你。每次只依据当前已到达的事实增量决策，不要假设所有已发布任务都已终态。
 - 调查/研究类任务的所有子任务完成后，先评估各任务结果是否有明显信息缺口或未覆盖的子问题；若有，追加新任务补充调查，而非直接收尾。
-- 最新图完成后必须以正式 AcceptanceRun 的结构化证据校对事实；只有与最新 PlanRevision、GraphDigest、AcceptanceSpecRevision 匹配的 PASS 才能 finalize_plan。
 
 # 关于下游任务与进度汇报
 
@@ -346,25 +324,18 @@ publish_task 每次调用创建一个任务；同一轮 reactLoop 可以批量�
 
 这会让用户知道系统正在工作，降低焦虑感。调用后 reactLoop 会继续，当下游任务完成后你会再次被唤醒，届时 **pending_downstream_tasks** 将为空。
 
-**选择 B：进入正式验收（仅当当前图和下游都已就绪）**
-如果 **pending_downstream_tasks** 不存在或为空，还要检查当前图的所有必需节点；满足条件后调用 ensure_acceptance_run，而不是直接宣布完成。
+**选择 B：直接收尾（仅当没有未完成工作时）**
+如果 **pending_downstream_tasks** 不存在或为空，且没有其它在途工作，用自然语言汇报最终结果收尾（legacy 直发路径也可调 report_done）。
 
 ## 纪律提醒
 - 没有 **pending_downstream_tasks** 时**不要**调用 report_progress，那会显得啰嗦
-- report_progress 只汇报进度，不会终止 reactLoop；计划内最终收尾只能由正式 PASS + finalize_plan 完成
+- report_progress 只汇报进度，不会终止 reactLoop；最终收尾靠自然语言汇报（或 legacy 路径的 report_done）
 
-# 工作模式（三轴正交，可任意组合）
+# 工作模式（两轴正交，可任意组合）
 
-快照中的 mode / exec_mode / topo_mode 三个字段共同描述系统当前模式，三轴相互独立：
+快照中的 exec_mode / topo_mode 两个字段共同描述系统当前模式，两轴相互独立。执行前审阅不属于模式轴；需要时在 Graph 中显式使用 approval 节点。
 
-**mode（规划门控轴）**：
-- **immediate**（默认）：收到用户输入后直接走决策树。属于 C 类时拆解为可独立执行的子任务；调查/研究类请求应按子方向并行拆分（如：事件背景、内容确认、来源传播、官方回应各发布一个独立任务），充分利用 resources.available_workers 实现并行执行。
-- **plan**：
-  1. 第一步先从快照选择一个已存在、能力足够的只读调查 route；如果不存在，则从 agent_templates provision 合适的调查 Team（通常是 builtin/explorer@1），使用返回的 event_type 发布探索任务
-  2. 必须等待所有探索任务完成并查看结果后，把执行计划写成 markdown 文本（任务分解 / 预期产物 / 执行顺序），调用 submit_plan_for_review 提交给用户审阅，然后结束当前回合等待——系统会把当前 Plan 挂起为 paused_awaiting_decision 并创建结构化 Interaction
-  3. **用户通过 Interaction 做出选择前禁止发布任何执行类任务**（implementation 节点）；用户选择执行后，系统会以一个携带已审阅计划文本的新 controller 任务唤醒你，届时再选择能力足够的执行 route（不存在则 provision 合适的执行 Team，通常是 builtin/generalist@1），严格按用户选择执行的计划 publish_task 派发执行
-  4. 用户拒绝后 Plan 进入终态，不得再以任何形式派发该请求的执行任务；探索任务尚未完成期间同样禁止发布执行任务
-  5. 不得假设 event_type="explore" 或 event_type="" 一定存在；每次以当前快照和 provision 返回值为准
+收到用户输入后直接走决策树。属于 C 类时拆解为可独立执行的子任务；调查/研究类请求应按子方向并行拆分（如：事件背景、内容确认、来源传播、官方回应各发布一个独立任务），充分利用 resources.available_workers 实现并行执行。
 
 **exec_mode（执行权限轴）**：当前处于 normal / strict / readonly / yolo 之一，仅陈述系统所处的执行权限模式。
 
@@ -373,7 +344,7 @@ publish_task 每次调用创建一个任务；同一轮 reactLoop 可以批量�
 - **solo**：你是系统中唯一的执行者，没有其它代理会认领任务。此时：
   1. **禁止调用 publish_task 派发子任务**——系统会拦截并拒绝该调用，重试只会浪费轮次；
   2. 所有工作（读文件、写文件、跑命令、查网页）都由你用已有工具亲自完成；
-  3. 收尾：solo 下没有 verifier route，你亲自完成的写文件/跑命令**不要求正式验收**——只要没有建立任何执行节点，完成后直接自然语言汇报，或调 report_done 收尾；系统会把这种 Plan 按"无验收运行"终态化。此条优先于上文"写操作必须正式验收 + finalize_plan"的通用纪律（那条只适用于 team）；
+  3. 收尾：solo 下没有其它代理可路由，你亲自完成的写文件/跑命令**不要求验收**——完成后直接自然语言汇报，或调 report_done 收尾；
   4. 不要 provision_agent_team 组队，也不要等待任何其它代理——runner 空转是 solo 的正常现象。
 
 # 与代理的协作
@@ -424,7 +395,7 @@ func (t *storeBatchTracker) AppendBatch(childTaskID string) error {
 // 启动时调用方应：
 //   - 启动 Bundle.Agent.Run(ctx)（poll-based ReAct 循环）
 //   - 启动 Bundle.Activator.Run(ctx)（EventCh 桥）
-//   - CLI /mode 通过 Bundle.Modes 切换 gate 轴（immediate/plan）
+//   - CLI /mode 通过 Bundle.Modes 切换 exec / topo 轴
 type Bundle struct {
 	// Agent 是 scheduler 一等代理实例（agent.Agent）。
 	// EventType="__scheduler__"，poll Activator publish 的 scheduler task。
@@ -435,9 +406,9 @@ type Bundle struct {
 	// BatchUpdateCh 信号。
 	Activator *Activator
 
-	// Modes 是三轴模式 store（internal/modes），由 bootstrap 按 config 构造后注入。
-	// CLI /mode 命令只切换其中的 gate 轴（immediate/plan）；
-	// SchedulerExecutor 在注入 board snapshot 时读取三轴快照写入 JSON。
+	// Modes 是两轴模式 store（internal/modes），由 bootstrap 按 config 构造后注入。
+	// CLI /mode 命令读写 exec / topo；SchedulerExecutor 在注入 board snapshot
+	// 时读取两轴快照写入 JSON。执行前审阅由 Graph approval 节点承担。
 	Modes *modes.Store
 
 	// History 是本会话的用户输入历史。Activator 写入，SchedulerExecutor 在
@@ -447,6 +418,11 @@ type Bundle struct {
 	// SchedulerExec 是 scheduler 的 SchedulerExecutor 实例。暴露在 Bundle 上
 	// 以便 Bootstrap 在构造后注入 ToolHealth 等运行时依赖。
 	SchedulerExec *SchedulerExecutor
+
+	// ToolReg 是 scheduler 装配完成的工具注册表（RegisterGroups 全量 +
+	// publish_task/write_file/edit_file 的 mode 包装）。暴露供 bootstrap 级
+	// 装配断言与诊断读取；运行期变更（WrapHandler）同样作用于它。
+	ToolReg *agent.ToolRegistry
 }
 
 // New 构造 scheduler 一等代理及其配套部件。
@@ -480,14 +456,15 @@ func New(
 	userOutput io.Writer,
 	resultOutput io.Writer,
 	modeStore *modes.Store,
-	planCoordinators ...*plan.Coordinator,
+	graphRuntime *graph.Runtime,
+	graphStore *graph.Store,
+	// effectJournal 是 V6 §4 H2b 共享副作用账本（internal/effect）：
+	// scheduler 的写工具 / run_shell / send_message 经它记录
+	// prepared/settled。nil 时不记账（单测直构场景）。
+	effectJournal *effect.Journal,
 ) *Bundle {
 	schedID := "scheduler-" + uuid.New().String()[:8]
-	var planCoordinator *plan.Coordinator
-	if len(planCoordinators) > 0 {
-		planCoordinator = planCoordinators[0]
-	}
-	// modeStore 为 nil 时回落全默认三轴（immediate/normal/team）——
+	// modeStore 为 nil 时回落两轴默认值（normal/team）——
 	// 生产路径由 bootstrap 按 config 构造后注入，nil 只出现在单测。
 	if modeStore == nil {
 		modeStore = modes.DefaultStore()
@@ -540,6 +517,7 @@ func New(
 			Roster:         r,
 			AgentID:        schedID,
 			WaitTimeoutSec: cfg.Infra.Roster.WaitTimeoutSec, // §8.3 文件冲突排队
+			EffectJournal:  effectJournal,
 		},
 		tools.WebGroup{Provider: searchProvider},
 		tools.ShellGroup{
@@ -550,6 +528,7 @@ func New(
 			AgentID:             schedID,
 			Modes:               modeStore,
 			InteractionWaitHook: interactionWaitHook,
+			EffectJournal:       effectJournal,
 		},
 		tools.MetaGroup{
 			Store:               s,
@@ -561,8 +540,9 @@ func New(
 			SessionID:           interactionSessionID,
 			InteractionWaitHook: interactionWaitHook,
 			BatchTracker:        batchTracker,
-			PlanMutationSource:  "scheduler",
+			AllowNodeCapability: true,
 			RouteValidator:      routeValidator,
+			EffectJournal:       effectJournal,
 		},
 		tools.SchedulerGroup{
 			Store:                s,
@@ -572,30 +552,29 @@ func New(
 			ProjectRoot:          cfg.ProjectRoot,
 			UserOutput:           userOutput,
 			ResultOutput:         resultOutput,
-			PlanCoordinator:      planCoordinator,
-			Modes:                modeStore, // report_done 按 topo 轴判定 solo 收尾放宽
 		},
 		tools.PlanControlGroup{
-			Coordinator:    planCoordinator,
-			Store:          s,
-			Holder:         holder,
-			AgentID:        schedID,
-			RouteValidator: routeValidator,
-			Modes:          modeStore, // submit_plan_for_review 按 gate 轴决定是否挂起
+			Store:   s,
+			Holder:  holder,
+			AgentID: schedID,
 		},
 		tools.AgentTemplateGroup{
 			Catalog: templateCatalog, Provisioner: templateProvisioner,
-			Coordinator: planCoordinator, Store: s, Holder: holder,
+			Store: s, Holder: holder,
 		},
+		// V6 Graph 控制面（C5b）：submit_graph / read_graph / patch_graph。graphRuntime/
+		// graphStore 来自 bootstrap 的 System.GraphRuntime/GraphStore；
+		// 为 nil（单测直构）时工具仍注册、调用返回明确中文错误。
+		tools.GraphControlGroup{Runtime: graphRuntime, Store: graphStore},
 	)
 
-	// solo 编排强制层（v5 三轴 topo）：topo=solo 时拦截 scheduler 的 publish_task，
+	// solo 编排强制层：topo=solo 时拦截 scheduler 的 publish_task，
 	// 这是 prompt 指引之外的硬约束。包装只作用于 scheduler 自己的 registry——
 	// runner 的 publish_task 与所有 send_message 均不受影响。
 	// modeStore 已在上方 nil 回落为 DefaultStore，此处直接可用。
 	toolReg.WrapHandler("publish_task", wrapPublishTaskForSolo(modeStore))
 
-	// strict 执行权限强制层（v5 三轴 exec）：exec=strict 时 scheduler 的
+	// strict 执行权限强制层：exec=strict 时 scheduler 的
 	// write_file / edit_file 逐次创建 file_write 审批 Interaction——solo 拓扑下
 	// scheduler 会亲自写文件，strict 必须覆盖这条路径；其它档位透传。
 	// 与 runner.New 内同款装配对称（同一 modeStore 实例由 bootstrap 注入）。
@@ -603,8 +582,13 @@ func New(
 	toolReg.WrapHandler("write_file", writeApprover.WrapHandler("write_file"))
 	toolReg.WrapHandler("edit_file", writeApprover.WrapHandler("edit_file"))
 
-	// 标准 LLM Executor（hook + storeView + recordToolCall 三件套与 worker 一致）
-	innerExec := agent.NewLLMExecutor(llmClient, toolReg, gateReg, storeView, recordToolCall, "", schedulerSystemPrompt)
+	// 标准 LLM Executor（hook + storeView + recordToolCall 三件套与 worker 一致）。
+	// V6 §2 起改用 Swappable 结构句柄：Execute 语义不变，句柄本身接到
+	// Agent.ToolSwapper / PromptSource——__scheduler__ 任务保持记录型租约
+	//（execution_lease.go 按 EventType 钉住），swapper 仅供 prompt 编译与
+	// /doctor agents 审计读取真实工具面。
+	innerExec := agent.NewSwappableLLMExecutor(llmClient, toolReg, gateReg, storeView, recordToolCall, "", schedulerSystemPrompt)
+	innerExec.SetPromptVersion(schedulerPromptVersion)
 
 	// 包装 SchedulerExecutor：等待 batch + 注入 board snapshot
 	// batchUpdateCh 是单槽信号量（buffer=1 + 非阻塞发送）：多次 batch 更新
@@ -615,32 +599,22 @@ func New(
 	batchUpdateCh := make(chan struct{}, 1)
 	sessionHistory := NewSessionHistory(0) // 默认容量 16
 	schedExec := &SchedulerExecutor{
-		Inner:           innerExec,
+		Inner:           innerExec.Execute,
 		Store:           s,
 		Cfg:             cfg,
 		BatchUpdateCh:   batchUpdateCh,
 		WaitTimeout:     30 * time.Second,
-		Mode:            modeStore.GetGate().String(), // 初始 gate 轴；Modes 后续切换由 SchedulerExecutor 在 Execute 内重读
 		Modes:           modeStore,
 		MBRegistry:      mbRegistry,
 		Roster:          r,
 		History:         sessionHistory,
 		AgentRegistry:   agentRegistry,
 		TemplateCatalog: templateCatalog,
-		PlanCoordinator: planCoordinator,
 	}
 
-	maxLoops := cfg.Scheduler.AgentMaxLoops
-	if maxLoops <= 0 {
-		maxLoops = schedulerMaxLoops
-	}
 	compactThreshold := cfg.Scheduler.EnforceCompactTokenThreshold
 	if compactThreshold <= 0 {
 		compactThreshold = config.DefaultSchedulerCompactTokenThreshold
-	}
-	contextLimit := cfg.Scheduler.ContextLimit
-	if contextLimit <= 0 {
-		contextLimit = config.DefaultSchedulerContextLimit
 	}
 
 	// 构造 agent
@@ -648,7 +622,6 @@ func New(
 		schedID,
 		"__scheduler__", // 仅认领 EventType=__scheduler__ 的任务（由 Activator publish）
 		s, r, schedExec.Execute,
-		maxLoops,
 	)
 	a.CancelRegistry = cancelReg
 	a.MaxRetries = schedulerMaxRetries // 有限重试——见常量注释（2026-04-25 改）
@@ -658,12 +631,10 @@ func New(
 	// daemon，因此保持硬编码 0（永不空闲退出）。配置值只作用于
 	// 由 runner.New 构造的任务执行类 agent。
 	a.IdleThreshold = 0 // 永不空闲退出（预制代理）
-	// Scheduler 与普通 runner 共用 Agent.processTask 的三层历史治理；YAML
-	// 现在可以覆盖软压缩阈值与硬截断预算。CompactKeepRecent 仍保持 Agent
+	// Scheduler 与普通 runner 共用 Agent.processTask 的历史压缩治理；YAML
+	// 现在可以覆盖软压缩阈值。CompactKeepRecent 仍保持 Agent
 	// 层默认 3，避免暴露会破坏最近 tool-call 配对的低层参数。
 	a.CompactTokenThreshold = compactThreshold
-	a.ContextLimit = contextLimit
-	a.TransferNoteMaxTokens = cfg.TransferNoteMaxTokens
 	a.OnTaskStart = func(taskID string) { holder.Set(taskID) }
 	a.OnTaskEnd = func(taskID string, success bool) { holder.Set("") }
 	a.FileCache = fileCache
@@ -680,9 +651,19 @@ func New(
 		a.MailRegistry = mbRegistry
 	}
 	a.Memory = memoryStore
+	// V6 §4 H1：exec 轴模式源注入（ExecutionLease 的 Policy 交集输入）；
+	// scheduler 自身工具装配不变（它即控制面），但同样生成 Lease 记录。
+	a.Modes = modeStore
+	// V6 §2 P1a：prompt 编译身份源 + 观测用 swapper（__scheduler__ 任务
+	// 保持记录型租约，见 execution_lease.go 的 EventType 分支）。
+	a.PromptSource = innerExec
+	a.ToolSwapper = innerExec
+	// V6 §4 H2b：scheduler 亲自执行（solo 拓扑）时的 workspace 合并埋点账本；
+	// 工具层账本已在上方 RegisterGroups 注入。
+	a.EffectJournal = effectJournal
 
 	// Activator
-	activator := NewActivator(s, eventCh, batchUpdateCh, sessionHistory, planCoordinator)
+	activator := NewActivator(s, eventCh, batchUpdateCh, sessionHistory)
 
 	return &Bundle{
 		Agent:         a,
@@ -690,5 +671,6 @@ func New(
 		Modes:         modeStore,
 		History:       sessionHistory,
 		SchedulerExec: schedExec,
+		ToolReg:       toolReg,
 	}
 }

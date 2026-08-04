@@ -75,7 +75,7 @@ LLM 文字回复内容应当是一段完整的 Markdown，**结构示例**（这
 # 完成判定
 
 - 完成判定就是"我尽力覆盖了能覆盖的维度，已经把整合 Markdown 作为文字回复返回"，而不是"内容完美"
-- 接近 agent_max_loops 时哪怕不完整也要停下，**直接输出当前已整理的 Markdown**——宁可让 verifier 派个 rework 也别被 watchdog 砍掉
+- 轮次已经很多时哪怕不完整也要停下，**直接输出当前已整理的 Markdown**——宁可让 verifier 派个 rework 也别被 watchdog 砍掉
 
 # 反模式（不要做）
 

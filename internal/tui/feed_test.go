@@ -109,18 +109,13 @@ func TestRenderAgentWorkbenchShowsOnlySelectedAgent(t *testing.T) {
 	}
 }
 
-func TestRenderSchedulerWorkbenchKeepsAllTurnsAndControlState(t *testing.T) {
+func TestRenderSchedulerWorkbenchKeepsAllTurns(t *testing.T) {
 	at := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
 	view := renderAgentWorkbench(DefaultTheme(), 120, 48,
 		AgentInfo{
 			ID: "scheduler-1", Type: "scheduler", State: "processing", Phase: "tooling",
 			CurrentTaskID: "controller-1", Loop: 8, ToolCallCount: 12,
 			ActiveTools: []ui.AgentToolActivity{{CallID: "active-1", Tool: "ensure_acceptance_run", StartedAt: at}},
-			SchedulerControl: &ui.SchedulerControlState{
-				PlanID: "plan-1", Status: "running", Revision: 7, ExecutionStateVersion: 19, HandledStateVersion: 18,
-				TasksTotal: 5, TasksCompleted: 3, TasksProcessing: 1, TasksPending: 1,
-				AcceptanceAttempt: 5, AcceptanceStatus: "running", BudgetUsedPercent: 68,
-			},
 		},
 		[]ui.AgentTurn{
 			{
@@ -144,8 +139,8 @@ func TestRenderSchedulerWorkbenchKeepsAllTurnsAndControlState(t *testing.T) {
 	)
 
 	for _, want := range []string{
-		"Turn History", "old verbose narration", "current decision", "checking acceptance", "Controller State", "DAG 3/5 complete",
-		"acceptance #5 running", "budget 68%", "Active Tools", "ensure_acceptance_run",
+		"Turn History", "old verbose narration", "current decision", "checking acceptance",
+		"Active Tools", "ensure_acceptance_run",
 		"Recent Decisions", "get_acceptance_evidence", "Final Result", "final answer",
 	} {
 		if !strings.Contains(view, want) {

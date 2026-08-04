@@ -66,7 +66,7 @@ func TestProcessTask_ContextCancellationDoesNotOverwriteSystemTerminalTrace(t *t
 			}
 			tc.prepare(t, s, task)
 
-			a := NewAgent("worker-1", "", s, roster.NewMemoryRoster(), nil, 1)
+			a := NewAgent("worker-1", "", s, roster.NewMemoryRoster(), nil)
 			a.Activity = NewActivityTracker()
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()

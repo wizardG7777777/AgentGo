@@ -66,7 +66,6 @@ func testSnapshot() ui.Snapshot {
 	return ui.Snapshot{
 		Agents:     []ui.AgentCard{{ID: "worker-1", Type: "worker", State: "processing", Loop: 2}},
 		Tasks:      []ui.BoardTask{{ID: "task-1", Desc: "演示任务", Status: "processing"}},
-		Mode:       "plan",
 		ExecMode:   "strict",
 		TopoMode:   "team",
 		Session:    ui.SessionInfo{ID: "sess-1", Status: "active"},
@@ -113,9 +112,9 @@ func TestSnapshotEndpoint(t *testing.T) {
 		Tasks []struct {
 			ID string `json:"id"`
 		} `json:"tasks"`
-		Mode     string `json:"mode"`
-		ExecMode string `json:"exec_mode"`
-		TopoMode string `json:"topo_mode"`
+		Mode     json.RawMessage `json:"mode"`
+		ExecMode string          `json:"exec_mode"`
+		TopoMode string          `json:"topo_mode"`
 		Session  struct {
 			ID string `json:"id"`
 		} `json:"session"`
@@ -133,8 +132,8 @@ func TestSnapshotEndpoint(t *testing.T) {
 	if len(body.Tasks) != 1 || body.Tasks[0].ID != "task-1" {
 		t.Fatalf("tasks = %+v", body.Tasks)
 	}
-	if body.Mode != "plan" || body.ExecMode != "strict" || body.TopoMode != "team" || body.Session.ID != "sess-1" {
-		t.Fatalf("modes=%q/%q/%q session=%+v", body.Mode, body.ExecMode, body.TopoMode, body.Session)
+	if len(body.Mode) != 0 || body.ExecMode != "strict" || body.TopoMode != "team" || body.Session.ID != "sess-1" {
+		t.Fatalf("obsolete mode=%s exec/topo=%q/%q session=%+v", body.Mode, body.ExecMode, body.TopoMode, body.Session)
 	}
 	if len(body.PendingInteractions) != 1 || body.PendingInteractions[0].ID != "interaction-1" {
 		t.Fatalf("pending_interactions=%+v", body.PendingInteractions)
@@ -478,6 +477,26 @@ func TestIndexContainsLayeredViewsAndAgentWorkbench(t *testing.T) {
 	} {
 		if !strings.Contains(html, marker) {
 			t.Errorf("首页缺少分层 UI 标记 %q", marker)
+		}
+	}
+	for _, marker := range []string{
+		`curModes.topo === "solo" ? "team" : "solo"`,
+		`await setMode("topo", next)`,
+		`用法：/mode [exec|topo <值>]`,
+	} {
+		if !strings.Contains(html, marker) {
+			t.Errorf("首页缺少两轴模式标记 %q", marker)
+		}
+	}
+	for _, stale := range []string{
+		`curModes.gate`,
+		`snap.mode`,
+		`setMode("gate"`,
+		`gate: ["immediate", "plan"]`,
+		`点击切换 gate 轴`,
+	} {
+		if strings.Contains(html, stale) {
+			t.Errorf("首页仍包含已移除的 gate 模式逻辑 %q", stale)
 		}
 	}
 }

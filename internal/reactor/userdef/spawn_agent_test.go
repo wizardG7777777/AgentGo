@@ -104,8 +104,7 @@ reactors:
       override:
         system_prompt: { file: ./sys.md }
         model: gpt-x
-        agent_max_loops: 5
-        context_limit: 8000
+        task_max_retries: 5
       initial_task:
         description: { file: ./task.md }
 `)
@@ -118,7 +117,7 @@ reactors:
 		t.Fatalf("Run: %v", err)
 	}
 	got := host.snapshot()[0]
-	if got.Override.Model != "gpt-x" || got.Override.AgentMaxLoops != 5 || got.Override.ContextLimit != 8000 {
+	if got.Override.Model != "gpt-x" || got.Override.TaskMaxRetries != 5 {
 		t.Errorf("override numeric fields wrong: %+v", got.Override)
 	}
 	if !got.Override.SystemPromptSet {
@@ -267,7 +266,7 @@ reactors:
 	}
 }
 
-func TestSpawnAgent_RejectsNegativeOverride(t *testing.T) {
+func TestSpawnAgent_RejectsRemovedAgentMaxLoops(t *testing.T) {
 	dir := t.TempDir()
 	writePrompt(t, dir, "task.md", "x")
 	yamlData := []byte(`
@@ -276,13 +275,34 @@ reactors:
     spawn_agent:
       base_kind: explorer
       override:
-        agent_max_loops: -1
+        agent_max_loops: 5
       initial_task:
         description: { file: ./task.md }
 `)
 	_, err := Load(yamlData, dir, dir, Deps{SpawnHost: &fakeSpawnHost{}})
-	if err == nil || !strings.Contains(err.Error(), "agent_max_loops") {
-		t.Errorf("expected negative override error, got %v", err)
+	// agent_max_loops 已于 V6 移除：显式设置必须报迁移诊断，不静默忽略。
+	if err == nil || !strings.Contains(err.Error(), "agent_max_loops") || !strings.Contains(err.Error(), "removed in V6") {
+		t.Errorf("expected V6 migration diagnostic, got %v", err)
+	}
+}
+
+func TestSpawnAgent_RejectsRemovedContextLimit(t *testing.T) {
+	dir := t.TempDir()
+	writePrompt(t, dir, "task.md", "x")
+	yamlData := []byte(`
+reactors:
+  - on: task_failed
+    spawn_agent:
+      base_kind: explorer
+      override:
+        context_limit: 8000
+      initial_task:
+        description: { file: ./task.md }
+`)
+	_, err := Load(yamlData, dir, dir, Deps{SpawnHost: &fakeSpawnHost{}})
+	// context_limit 已于 V6 移除：显式设置必须报迁移诊断，不静默忽略。
+	if err == nil || !strings.Contains(err.Error(), "context_limit") || !strings.Contains(err.Error(), "removed in V6") {
+		t.Errorf("expected V6 migration diagnostic, got %v", err)
 	}
 }
 

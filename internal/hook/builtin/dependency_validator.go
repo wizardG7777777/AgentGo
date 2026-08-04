@@ -81,14 +81,10 @@ func (h *DependencyValidatorHook) Run(hctx hook.ToolHookContext) hook.ToolHookDe
 	}
 	depsStr, ok := depsRaw.(string)
 	if !ok {
-		return hook.ToolHookDecision{
-			Action:   hook.Abort,
-			HookName: h.Name(),
-			AbortReason: fmt.Sprintf(
-				"publish_task 的 dependencies 参数类型必须是 string（逗号分隔的 UUID 列表），收到 %T",
-				depsRaw,
-			),
-		}
+		return h.abortNotReady(fmt.Sprintf(
+			"publish_task 的 dependencies 参数类型必须是 string（逗号分隔的 UUID 列表），收到 %T",
+			depsRaw,
+		), fmt.Sprintf("%v", depsRaw))
 	}
 	depsStr = strings.TrimSpace(depsStr)
 	if depsStr == "" {
@@ -103,36 +99,48 @@ func (h *DependencyValidatorHook) Run(hctx hook.ToolHookContext) hook.ToolHookDe
 
 		// 层 A-1：UUID 格式前置校验 —— 快速拦截占位符
 		if !uuidRE.MatchString(id) {
-			return hook.ToolHookDecision{
-				Action:   hook.Abort,
-				HookName: h.Name(),
-				AbortReason: fmt.Sprintf(
-					"publish_task 被拒绝：dependencies 中 %q 不是合法的 UUID 格式。"+
-						"每个依赖 ID 必须是之前 publish_task 调用返回的真实 task UUID"+
-						"（形如 7b52b232-4e9b-4b97-8bbc-f3d5927dc814），"+
-						"禁止使用占位符（如 \"task-part1\"、\"A\"、\"<id>\"）或自造 ID。"+
-						"若被依赖任务尚未发布，请先调用 publish_task 发布它、"+
-						"从返回值中读取真实 id 之后再发布当前任务。",
-					id,
-				),
-			}
+			return h.abortNotReady(fmt.Sprintf(
+				"publish_task 被拒绝：dependencies 中 %q 不是合法的 UUID 格式。"+
+					"每个依赖 ID 必须是之前 publish_task 调用返回的真实 task UUID"+
+					"（形如 7b52b232-4e9b-4b97-8bbc-f3d5927dc814），"+
+					"禁止使用占位符（如 \"task-part1\"、\"A\"、\"<id>\"）或自造 ID。"+
+					"若被依赖任务尚未发布，请先调用 publish_task 发布它、"+
+					"从返回值中读取真实 id 之后再发布当前任务。",
+				id,
+			), id)
 		}
 
 		// 层 A-2：store 存在性校验 —— 格式对但任务不存在
 		if _, err := h.Store.GetTask(id); err != nil {
-			return hook.ToolHookDecision{
-				Action:   hook.Abort,
-				HookName: h.Name(),
-				AbortReason: fmt.Sprintf(
-					"publish_task 被拒绝：依赖任务 %s 不存在于 store 中。"+
-						"可能原因：(a) 该任务尚未发布 —— 请先调用 publish_task 发布它，"+
-						"从返回值读取真实 id 之后再发布当前任务；"+
-						"(b) 该任务已被取消或清理 —— 请检查最新的 board snapshot 确认可用任务列表。",
-					id,
-				),
-			}
+			return h.abortNotReady(fmt.Sprintf(
+				"publish_task 被拒绝：依赖任务 %s 不存在于 store 中。"+
+					"可能原因：(a) 该任务尚未发布 —— 请先调用 publish_task 发布它，"+
+					"从返回值读取真实 id 之后再发布当前任务；"+
+					"(b) 该任务已被取消或清理 —— 请检查最新的 board snapshot 确认可用任务列表。",
+				id,
+			), id)
 		}
 	}
 
 	return hook.ToolHookDecision{Action: hook.Continue}
+}
+
+// abortNotReady 构造依赖未就绪的统一 Abort 决策：依赖是否就绪不是单次重试
+// 能改变的（占位符 / 未发布 / 已清理），不可自动重试——升级为 replan /
+// blocked 标记，由调度方重新编排（H2a：依赖类拒绝不给工具动作建议）。
+func (h *DependencyValidatorHook) abortNotReady(reason, target string) hook.ToolHookDecision {
+	return hook.ToolHookDecision{
+		Action:      hook.Abort,
+		HookName:    h.Name(),
+		AbortReason: reason,
+		ReasonCode:  ReasonDependencyNotReady,
+		Suggestions: []hook.Suggestion{
+			hook.NewSuggestion(h.Name(), ReasonDependencyNotReady, target, false,
+				hook.EscalationAction(hook.SuggestKindRequestReplan,
+					"依赖未就绪：请求 replan，让调度方先发布/修复依赖任务后再编排本任务"),
+				hook.EscalationAction(hook.SuggestKindBlocked,
+					"或提交 blocked 并说明缺失的依赖"),
+			),
+		},
+	}
 }

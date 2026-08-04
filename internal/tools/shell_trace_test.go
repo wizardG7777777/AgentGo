@@ -10,17 +10,17 @@ import (
 )
 
 // installShellTraceCapture 替换包级默认 trace Dispatcher 并在测试结束时还原。
-// 复用 plan_control_acceptance_test.go 的 capturePlanTraceDispatcher（同包）。
-func installShellTraceCapture(t *testing.T) *capturePlanTraceDispatcher {
+// 复用 plan_control_graph_test.go 的 captureGraphTraceDispatcher（同包）。
+func installShellTraceCapture(t *testing.T) *captureGraphTraceDispatcher {
 	t.Helper()
-	d := &capturePlanTraceDispatcher{}
+	d := &captureGraphTraceDispatcher{}
 	original := trace.DefaultDispatcher()
 	trace.SetDefaultDispatcher(d)
 	t.Cleanup(func() { trace.SetDefaultDispatcher(original) })
 	return d
 }
 
-func shellExecutedEvents(d *capturePlanTraceDispatcher) []trace.Event {
+func shellExecutedEvents(d *captureGraphTraceDispatcher) []trace.Event {
 	var out []trace.Event
 	for _, ev := range d.events {
 		if ev.Kind == trace.KindShellExecuted {

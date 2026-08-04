@@ -156,37 +156,10 @@ func TestProperty2_SubtaskPublishDetection(t *testing.T) {
 	}
 }
 
-// TestProperty3_HalfwayDetection verifies that detectHalfway returns true
-// if and only if loopIndex > maxLoops/2, for random pairs of (loopIndex, maxLoops)
-// where maxLoops in [1, 200] and loopIndex in [0, maxLoops-1].
-//
-// **Validates: Requirements 3.1**
-func TestProperty3_HalfwayDetection(t *testing.T) {
-	cfg := &quick.Config{
-		MaxCount: 200,
-		Values: func(values []reflect.Value, rng *rand.Rand) {
-			maxLoops := rng.Intn(200) + 1   // [1, 200]
-			loopIndex := rng.Intn(maxLoops) // [0, maxLoops-1]
-			values[0] = reflect.ValueOf(loopIndex)
-			values[1] = reflect.ValueOf(maxLoops)
-		},
-	}
-
-	prop := func(loopIndex, maxLoops int) bool {
-		got := detectHalfway(loopIndex, maxLoops)
-		want := loopIndex > maxLoops/2
-		return got == want
-	}
-
-	if err := quick.Check(prop, cfg); err != nil {
-		t.Errorf("Property 3 failed: %v", err)
-	}
-}
-
 // TestProperty5_MessageFixedFieldInvariants verifies that all messages built by
-// buildFileWriteMsg, buildSubtaskMsg, and buildHalfwayMsg have fixed fields:
+// buildFileWriteMsg and buildSubtaskMsg have fixed fields:
 // Type=="info", Priority=="low", ChainDepth==0.
-// Additionally: file-write and halfway messages have To=="*",
+// Additionally: file-write messages have To=="*",
 // subtask messages have To=="scheduler".
 //
 // **Validates: Requirements 4.1, 4.2, 5.1, 5.2**
@@ -201,25 +174,22 @@ func TestProperty5_MessageFixedFieldInvariants(t *testing.T) {
 			for i := range files {
 				files[i] = randomPath(rng)
 			}
-			maxLoops := rng.Intn(200) + 1   // [1, 200]
-			loopIndex := rng.Intn(maxLoops) // [0, maxLoops-1]
+			loopIndex := rng.Intn(200) // [0, 199]
 
 			values[0] = reflect.ValueOf(agentID)
 			values[1] = reflect.ValueOf(files)
 			values[2] = reflect.ValueOf(loopIndex)
-			values[3] = reflect.ValueOf(maxLoops)
 		},
 	}
 
-	prop := func(agentID string, files []string, loopIndex, maxLoops int) bool {
+	prop := func(agentID string, files []string, loopIndex int) bool {
 		msgs := []struct {
 			msg    mailbox.Message
 			wantTo string
 			label  string
 		}{
-			{buildFileWriteMsg(agentID, files, loopIndex, maxLoops), "*", "buildFileWriteMsg"},
-			{buildSubtaskMsg(agentID, loopIndex, maxLoops), "scheduler", "buildSubtaskMsg"},
-			{buildHalfwayMsg(agentID, loopIndex, maxLoops), "*", "buildHalfwayMsg"},
+			{buildFileWriteMsg(agentID, files, loopIndex), "*", "buildFileWriteMsg"},
+			{buildSubtaskMsg(agentID, loopIndex), "scheduler", "buildSubtaskMsg"},
 		}
 
 		for _, tc := range msgs {
@@ -249,8 +219,8 @@ func TestProperty5_MessageFixedFieldInvariants(t *testing.T) {
 }
 
 // TestProperty6_FileWriteMsgContentCompleteness verifies that buildFileWriteMsg
-// produces a Content string containing agentID, filepath.Base(path),
-// the string representation of loopIndex+1, and the string representation of maxLoops.
+// produces a Content string containing agentID, filepath.Base(path), and
+// the string representation of loopIndex+1.
 //
 // **Validates: Requirements 1.2, 4.4**
 func TestProperty6_FileWriteMsgContentCompleteness(t *testing.T) {
@@ -264,18 +234,16 @@ func TestProperty6_FileWriteMsgContentCompleteness(t *testing.T) {
 			for i := range files {
 				files[i] = randomPath(rng)
 			}
-			maxLoops := rng.Intn(200) + 1   // [1, 200]
-			loopIndex := rng.Intn(maxLoops) // [0, maxLoops-1]
+			loopIndex := rng.Intn(200) // [0, 199]
 
 			values[0] = reflect.ValueOf(agentID)
 			values[1] = reflect.ValueOf(files)
 			values[2] = reflect.ValueOf(loopIndex)
-			values[3] = reflect.ValueOf(maxLoops)
 		},
 	}
 
-	prop := func(agentID string, files []string, loopIndex, maxLoops int) bool {
-		msg := buildFileWriteMsg(agentID, files, loopIndex, maxLoops)
+	prop := func(agentID string, files []string, loopIndex int) bool {
+		msg := buildFileWriteMsg(agentID, files, loopIndex)
 
 		// Content must contain agentID
 		if !strings.Contains(msg.Content, agentID) {
@@ -296,64 +264,11 @@ func TestProperty6_FileWriteMsgContentCompleteness(t *testing.T) {
 			t.Logf("Content missing loopIndex+1 %q: %q", loopStr, msg.Content)
 			return false
 		}
-		// Content must contain maxLoops as string
-		maxStr := fmt.Sprintf("%d", maxLoops)
-		if !strings.Contains(msg.Content, maxStr) {
-			t.Logf("Content missing maxLoops %q: %q", maxStr, msg.Content)
-			return false
-		}
 		return true
 	}
 
 	if err := quick.Check(prop, cfg); err != nil {
 		t.Errorf("Property 6 failed: %v", err)
-	}
-}
-
-// TestProperty7_HalfwayMsgContentCompleteness verifies that buildHalfwayMsg
-// produces a Content string containing agentID, the string representation of
-// loopIndex+1, and the string representation of maxLoops.
-//
-// **Validates: Requirements 4.5**
-func TestProperty7_HalfwayMsgContentCompleteness(t *testing.T) {
-	cfg := &quick.Config{
-		MaxCount: 200,
-		Values: func(values []reflect.Value, rng *rand.Rand) {
-			agentID := "agent-" + randomString(rng, 6)
-			maxLoops := rng.Intn(200) + 1   // [1, 200]
-			loopIndex := rng.Intn(maxLoops) // [0, maxLoops-1]
-
-			values[0] = reflect.ValueOf(agentID)
-			values[1] = reflect.ValueOf(loopIndex)
-			values[2] = reflect.ValueOf(maxLoops)
-		},
-	}
-
-	prop := func(agentID string, loopIndex, maxLoops int) bool {
-		msg := buildHalfwayMsg(agentID, loopIndex, maxLoops)
-
-		// Content must contain agentID
-		if !strings.Contains(msg.Content, agentID) {
-			t.Logf("Content missing agentID %q: %q", agentID, msg.Content)
-			return false
-		}
-		// Content must contain loopIndex+1 as string
-		loopStr := fmt.Sprintf("%d", loopIndex+1)
-		if !strings.Contains(msg.Content, loopStr) {
-			t.Logf("Content missing loopIndex+1 %q: %q", loopStr, msg.Content)
-			return false
-		}
-		// Content must contain maxLoops as string
-		maxStr := fmt.Sprintf("%d", maxLoops)
-		if !strings.Contains(msg.Content, maxStr) {
-			t.Logf("Content missing maxLoops %q: %q", maxStr, msg.Content)
-			return false
-		}
-		return true
-	}
-
-	if err := quick.Check(prop, cfg); err != nil {
-		t.Errorf("Property 7 failed: %v", err)
 	}
 }
 
@@ -363,7 +278,7 @@ func TestProperty7_HalfwayMsgContentCompleteness(t *testing.T) {
 //
 // The test creates a real mailbox.Registry with a sibling and a scheduler alias,
 // sets ProgressNotifyEnabled=false, then calls progressNotify with an
-// ExecuteResult that would trigger all three conditions. After the call it
+// ExecuteResult that would trigger all conditions. After the call it
 // drains all mailboxes and asserts they are empty, and checks that
 // progressFlags remains all-false.
 //
@@ -373,12 +288,11 @@ func TestProperty8_ConfigDisabledSkipsAll(t *testing.T) {
 		MaxCount: 100,
 		Values: func(values []reflect.Value, rng *rand.Rand) {
 			values[0] = reflect.ValueOf("worker-" + randomString(rng, 6))
-			// maxLoops in [4, 200] so halfway can trigger
-			values[1] = reflect.ValueOf(rng.Intn(197) + 4)
+			values[1] = reflect.ValueOf(rng.Intn(200))
 		},
 	}
 
-	prop := func(agentID string, maxLoops int) bool {
+	prop := func(agentID string, loopIndex int) bool {
 		// Set up a real mailbox.Registry with a sibling and a scheduler
 		reg := mailbox.NewRegistry(64)
 		siblingMB := reg.Register("sibling-001", "")
@@ -388,12 +302,11 @@ func TestProperty8_ConfigDisabledSkipsAll(t *testing.T) {
 
 		ag := &Agent{
 			ID:                    agentID,
-			MaxLoops:              maxLoops,
 			ProgressNotifyEnabled: false, // disabled!
 			MailRegistry:          reg,
 		}
 
-		// Build an ExecuteResult that triggers ALL three conditions
+		// Build an ExecuteResult that triggers ALL conditions
 		triggeringResult := ExecuteResult{
 			ToolCalled: true,
 			ToolCalls: []llm.ToolCall{
@@ -406,9 +319,6 @@ func TestProperty8_ConfigDisabledSkipsAll(t *testing.T) {
 			},
 		}
 
-		// loopIndex that guarantees halfway: maxLoops-1 > maxLoops/2 for maxLoops >= 4
-		loopIndex := maxLoops - 1
-
 		flags := &progressFlags{}
 
 		ctx := context.Background()
@@ -416,22 +326,20 @@ func TestProperty8_ConfigDisabledSkipsAll(t *testing.T) {
 
 		// Verify: no messages were sent to sibling
 		if msgs := siblingMB.Drain(); len(msgs) != 0 {
-			t.Logf("sibling got %d messages, want 0 (agentID=%s, maxLoops=%d)",
-				len(msgs), agentID, maxLoops)
+			t.Logf("sibling got %d messages, want 0 (agentID=%s)", len(msgs), agentID)
 			return false
 		}
 
 		// Verify: no messages were sent to scheduler
 		if msgs := schedMB.Drain(); len(msgs) != 0 {
-			t.Logf("scheduler got %d messages, want 0 (agentID=%s, maxLoops=%d)",
-				len(msgs), agentID, maxLoops)
+			t.Logf("scheduler got %d messages, want 0 (agentID=%s)", len(msgs), agentID)
 			return false
 		}
 
 		// Verify: progressFlags remains all false (unchanged)
-		if flags.notifiedFileWrite || flags.notifiedSubtask || flags.notifiedHalfway {
-			t.Logf("flags modified: fw=%v sub=%v hw=%v (want all false)",
-				flags.notifiedFileWrite, flags.notifiedSubtask, flags.notifiedHalfway)
+		if flags.notifiedFileWrite || flags.notifiedSubtask {
+			t.Logf("flags modified: fw=%v sub=%v (want all false)",
+				flags.notifiedFileWrite, flags.notifiedSubtask)
 			return false
 		}
 
@@ -445,15 +353,15 @@ func TestProperty8_ConfigDisabledSkipsAll(t *testing.T) {
 
 // TestProperty4_AtMostOncePerTriggerType verifies that for any sequence of
 // progressNotify calls on the same progressFlags instance, each trigger type
-// (file_write, subtask, halfway) produces at most one Send call, even when
-// every call in the sequence satisfies all three trigger conditions.
+// (file_write, subtask) produces at most one Send call, even when
+// every call in the sequence satisfies all trigger conditions.
 //
 // The test creates a real mailbox.Registry with a sibling agent and a scheduler
 // alias, then calls progressNotify N times (N in [2,10]) with results that
-// always trigger all three conditions. After all calls, it drains the mailboxes
-// and verifies exactly 3 total messages were sent (one per trigger type).
+// always trigger all conditions. After all calls, it drains the mailboxes
+// and verifies the messages (one per trigger type).
 //
-// **Validates: Requirements 1.3, 2.2, 3.2**
+// **Validates: Requirements 1.3, 2.2**
 func TestProperty4_AtMostOncePerTriggerType(t *testing.T) {
 	cfg := &quick.Config{
 		MaxCount: 100,
@@ -463,12 +371,11 @@ func TestProperty4_AtMostOncePerTriggerType(t *testing.T) {
 			values[0] = reflect.ValueOf(n)
 			// Random agent ID
 			values[1] = reflect.ValueOf("worker-" + randomString(rng, 6))
-			// maxLoops in [4, 200] (need at least 4 so halfway can trigger)
-			values[2] = reflect.ValueOf(rng.Intn(197) + 4)
+			values[2] = reflect.ValueOf(rng.Intn(200))
 		},
 	}
 
-	prop := func(n int, agentID string, maxLoops int) bool {
+	prop := func(n int, agentID string, loopIndex int) bool {
 		// Set up a real mailbox.Registry with a sibling and a scheduler
 		reg := mailbox.NewRegistry(64)
 		siblingMB := reg.Register("sibling-001", "")
@@ -479,15 +386,13 @@ func TestProperty4_AtMostOncePerTriggerType(t *testing.T) {
 
 		ag := &Agent{
 			ID:                    agentID,
-			MaxLoops:              maxLoops,
 			ProgressNotifyEnabled: true,
 			MailRegistry:          reg,
 		}
 
-		// Build an ExecuteResult that triggers ALL three conditions:
+		// Build an ExecuteResult that triggers ALL conditions:
 		// - write_file with successful result
 		// - publish_subtask
-		// - loopIndex > maxLoops/2 (use maxLoops-1 to guarantee halfway)
 		triggeringResult := ExecuteResult{
 			ToolCalled: true,
 			ToolCalls: []llm.ToolCall{
@@ -500,9 +405,6 @@ func TestProperty4_AtMostOncePerTriggerType(t *testing.T) {
 			},
 		}
 
-		// loopIndex that guarantees halfway: maxLoops-1 > maxLoops/2 for maxLoops >= 4
-		loopIndex := maxLoops - 1
-
 		// Single flags instance shared across all calls
 		flags := &progressFlags{}
 
@@ -512,39 +414,33 @@ func TestProperty4_AtMostOncePerTriggerType(t *testing.T) {
 			ag.progressNotify(ctx, "task-001", loopIndex, triggeringResult, flags)
 		}
 
-		// Drain sibling mailbox: should have file_write (To="*") + halfway (To="*")
+		// Drain sibling mailbox: should have file_write broadcast only (To="*")
 		siblingMsgs := siblingMB.Drain()
-		// Drain scheduler mailbox: should have subtask (To="scheduler") + broadcasts (To="*")
+		// Drain scheduler mailbox: subtask (To="scheduler") + file_write broadcast (To="*")
 		schedMsgs := schedMB.Drain()
-
-		// Count by notify type from sibling perspective:
-		// Sibling receives broadcasts (To="*"): file_write + halfway = 2
-		// Scheduler receives: subtask (To="scheduler") + broadcasts (To="*") = 3
-		// But we need to count total unique sends. Let's count all messages.
 
 		// file_write broadcast: sibling gets 1, sched gets 1 = 2 deliveries from 1 Send
 		// subtask point-to-point: sched gets 1 = 1 delivery from 1 Send
-		// halfway broadcast: sibling gets 1, sched gets 1 = 2 deliveries from 1 Send
-		// Total: sibling should have 2 msgs, sched should have 3 msgs
+		// Total: sibling should have 1 msg, sched should have 2 msgs
 
-		// Verify sibling got exactly 2 messages (file_write + halfway broadcasts)
-		if len(siblingMsgs) != 2 {
-			t.Logf("sibling got %d messages, want 2 (n=%d, agentID=%s, maxLoops=%d)",
-				len(siblingMsgs), n, agentID, maxLoops)
+		// Verify sibling got exactly 1 message (file_write broadcast)
+		if len(siblingMsgs) != 1 {
+			t.Logf("sibling got %d messages, want 1 (n=%d, agentID=%s)",
+				len(siblingMsgs), n, agentID)
 			return false
 		}
 
-		// Verify scheduler got exactly 3 messages (subtask + file_write broadcast + halfway broadcast)
-		if len(schedMsgs) != 3 {
-			t.Logf("scheduler got %d messages, want 3 (n=%d, agentID=%s, maxLoops=%d)",
-				len(schedMsgs), n, agentID, maxLoops)
+		// Verify scheduler got exactly 2 messages (subtask + file_write broadcast)
+		if len(schedMsgs) != 2 {
+			t.Logf("scheduler got %d messages, want 2 (n=%d, agentID=%s)",
+				len(schedMsgs), n, agentID)
 			return false
 		}
 
 		// Verify flags are all set (each trigger fired exactly once)
-		if !flags.notifiedFileWrite || !flags.notifiedSubtask || !flags.notifiedHalfway {
-			t.Logf("flags not all set: fw=%v sub=%v hw=%v",
-				flags.notifiedFileWrite, flags.notifiedSubtask, flags.notifiedHalfway)
+		if !flags.notifiedFileWrite || !flags.notifiedSubtask {
+			t.Logf("flags not all set: fw=%v sub=%v",
+				flags.notifiedFileWrite, flags.notifiedSubtask)
 			return false
 		}
 
@@ -568,12 +464,11 @@ func TestProperty4_AtMostOncePerTriggerType(t *testing.T) {
 func TestProgressNotify_NilMailRegistry_NoPanic(t *testing.T) {
 	ag := &Agent{
 		ID:                    "worker-nil-reg",
-		MaxLoops:              10,
 		ProgressNotifyEnabled: true,
 		MailRegistry:          nil, // explicitly nil
 	}
 
-	// Build a result that would trigger all three conditions
+	// Build a result that would trigger all conditions
 	result := ExecuteResult{
 		ToolCalled: true,
 		ToolCalls: []llm.ToolCall{
@@ -593,9 +488,9 @@ func TestProgressNotify_NilMailRegistry_NoPanic(t *testing.T) {
 	ag.progressNotify(ctx, "task-nil-reg", 8, result, flags)
 
 	// Flags should remain untouched (early return before any detection)
-	if flags.notifiedFileWrite || flags.notifiedSubtask || flags.notifiedHalfway {
-		t.Errorf("flags should be all false when MailRegistry is nil, got fw=%v sub=%v hw=%v",
-			flags.notifiedFileWrite, flags.notifiedSubtask, flags.notifiedHalfway)
+	if flags.notifiedFileWrite || flags.notifiedSubtask {
+		t.Errorf("flags should be all false when MailRegistry is nil, got fw=%v sub=%v",
+			flags.notifiedFileWrite, flags.notifiedSubtask)
 	}
 }
 
@@ -616,7 +511,6 @@ func TestProgressNotify_SendError_NoInterrupt(t *testing.T) {
 
 	ag := &Agent{
 		ID:                    "worker-send-err",
-		MaxLoops:              10,
 		ProgressNotifyEnabled: true,
 		MailRegistry:          reg,
 	}
@@ -637,18 +531,15 @@ func TestProgressNotify_SendError_NoInterrupt(t *testing.T) {
 	flags := &progressFlags{}
 	ctx := context.Background()
 
-	// loopIndex=8, maxLoops=10 → 8 > 10/2=5 → halfway triggers too
+	// loopIndex=8
 	ag.progressNotify(ctx, "task-send-err", 8, result, flags)
 
-	// All three flags should be set despite the subtask Send error
+	// Both flags should be set despite the subtask Send error
 	if !flags.notifiedFileWrite {
 		t.Error("notifiedFileWrite should be true (broadcast succeeds even with no recipients)")
 	}
 	if !flags.notifiedSubtask {
 		t.Error("notifiedSubtask should be true (flag set even when Send returns error)")
-	}
-	if !flags.notifiedHalfway {
-		t.Error("notifiedHalfway should be true (broadcast succeeds)")
 	}
 }
 
@@ -668,7 +559,6 @@ func TestProgressNotify_PanicRecovery(t *testing.T) {
 
 	ag := &Agent{
 		ID:                    "worker-panic",
-		MaxLoops:              10,
 		ProgressNotifyEnabled: true,
 		MailRegistry:          reg,
 	}
@@ -724,7 +614,6 @@ func TestProgressNotify_TraceEventKind(t *testing.T) {
 
 	ag := &Agent{
 		ID:                    "worker-trace",
-		MaxLoops:              20,
 		ProgressNotifyEnabled: true,
 		MailRegistry:          reg,
 	}

@@ -130,11 +130,11 @@ func TestCombinedHooks_ExpandBuildsWhenDedupContinues(t *testing.T) {
 
 // spyMailboxView 是一个间谍 mock，记录方法调用
 type spyMailboxView struct {
-	messages          []mailbox.Message
-	getRecentCalled   bool
-	hasPendingCalled  bool
-	getRecentAgentID  string
-	getRecentN        int
+	messages         []mailbox.Message
+	getRecentCalled  bool
+	hasPendingCalled bool
+	getRecentAgentID string
+	getRecentN       int
 }
 
 func (s *spyMailboxView) HasPendingMail(agentID string) bool {

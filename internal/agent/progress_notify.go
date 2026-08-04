@@ -18,7 +18,6 @@ import (
 type progressFlags struct {
 	notifiedFileWrite bool
 	notifiedSubtask   bool
-	notifiedHalfway   bool
 }
 
 // detectFileWrite 检测本轮 ExecuteResult 中是否有成功的文件写入。
@@ -72,16 +71,11 @@ func detectSubtaskPublish(result ExecuteResult) bool {
 	return false
 }
 
-// detectHalfway 检测当前循环是否已过半。
-func detectHalfway(loopIndex, maxLoops int) bool {
-	return loopIndex > maxLoops/2
-}
-
 // buildFileWriteMsg 构造文件写入进度通知消息。
 // To="*" 广播给所有兄弟 Agent，Type/Priority/ChainDepth 固定。
 // Content 包含 agentID、filepath.Base(path)、轮次信息。
 // 多个文件时仅取第一个文件名展示。
-func buildFileWriteMsg(agentID string, files []string, loopIndex, maxLoops int) mailbox.Message {
+func buildFileWriteMsg(agentID string, files []string, loopIndex int) mailbox.Message {
 	baseName := ""
 	if len(files) > 0 {
 		baseName = filepath.Base(files[0])
@@ -93,14 +87,14 @@ func buildFileWriteMsg(agentID string, files []string, loopIndex, maxLoops int) 
 		Priority:   mailbox.PriorityLow,
 		ChainDepth: 0,
 		Summary:    fmt.Sprintf("[进度] %s 写入了文件", agentID),
-		Content:    fmt.Sprintf("代理 %s 在任务执行中写入了文件: %s（轮次 %d/%d）", agentID, baseName, loopIndex+1, maxLoops),
+		Content:    fmt.Sprintf("代理 %s 在任务执行中写入了文件: %s（轮次 %d）", agentID, baseName, loopIndex+1),
 		SentAt:     time.Now(),
 	}
 }
 
 // buildSubtaskMsg 构造子任务发布进度通知消息。
 // To="scheduler" 点对点通知 Scheduler Agent。
-func buildSubtaskMsg(agentID string, loopIndex, maxLoops int) mailbox.Message {
+func buildSubtaskMsg(agentID string, loopIndex int) mailbox.Message {
 	return mailbox.Message{
 		From:       agentID,
 		To:         "scheduler",
@@ -108,22 +102,7 @@ func buildSubtaskMsg(agentID string, loopIndex, maxLoops int) mailbox.Message {
 		Priority:   mailbox.PriorityLow,
 		ChainDepth: 0,
 		Summary:    fmt.Sprintf("[进度] %s 发布了子任务", agentID),
-		Content:    fmt.Sprintf("代理 %s 在任务执行中发布了子任务（轮次 %d/%d）", agentID, loopIndex+1, maxLoops),
-		SentAt:     time.Now(),
-	}
-}
-
-// buildHalfwayMsg 构造任务过半进度通知消息。
-// To="*" 广播给所有兄弟 Agent。
-func buildHalfwayMsg(agentID string, loopIndex, maxLoops int) mailbox.Message {
-	return mailbox.Message{
-		From:       agentID,
-		To:         "*",
-		Type:       mailbox.MsgTypeInfo,
-		Priority:   mailbox.PriorityLow,
-		ChainDepth: 0,
-		Summary:    fmt.Sprintf("[进度] %s 任务过半", agentID),
-		Content:    fmt.Sprintf("代理 %s 任务执行已过半（轮次 %d/%d）", agentID, loopIndex+1, maxLoops),
+		Content:    fmt.Sprintf("代理 %s 在任务执行中发布了子任务（轮次 %d）", agentID, loopIndex+1),
 		SentAt:     time.Now(),
 	}
 }
@@ -131,6 +110,9 @@ func buildHalfwayMsg(agentID string, loopIndex, maxLoops int) mailbox.Message {
 // progressNotify 检测本轮触发条件并发送进度通知。
 // 所有错误静默降级（log.Printf），不影响 ReactLoop。
 // defer/recover 保护，panic 不会逃逸。
+//
+// V6 起删除「任务过半」通知：固定轮数上限已移除，「过半」失去参照系；
+// 保留文件写入与子任务发布两类事件型通知。
 //
 // 形参 _ context.Context 保留类型签名作"任务级函数"的文档信号——当前函数体内
 // 不需要 ctx（MailRegistry.Send / trace.Emit / log.Printf 均不接 ctx），未来若
@@ -149,7 +131,7 @@ func (a *Agent) progressNotify(_ context.Context, taskID string, loopIndex int, 
 	// 1. 文件写入检测
 	if !flags.notifiedFileWrite {
 		if files := detectFileWrite(result); len(files) > 0 {
-			msg := buildFileWriteMsg(a.ID, files, loopIndex, a.MaxLoops)
+			msg := buildFileWriteMsg(a.ID, files, loopIndex)
 			if err := a.MailRegistry.Send(msg); err != nil {
 				log.Printf("[agent %s] 进度通知(file_write)发送失败: %v", a.ID, err)
 			}
@@ -167,7 +149,7 @@ func (a *Agent) progressNotify(_ context.Context, taskID string, loopIndex int, 
 	// 2. 子任务发布检测
 	if !flags.notifiedSubtask {
 		if detectSubtaskPublish(result) {
-			msg := buildSubtaskMsg(a.ID, loopIndex, a.MaxLoops)
+			msg := buildSubtaskMsg(a.ID, loopIndex)
 			if err := a.MailRegistry.Send(msg); err != nil {
 				log.Printf("[agent %s] 进度通知(subtask)发送失败: %v", a.ID, err)
 			}
@@ -178,24 +160,6 @@ func (a *Agent) progressNotify(_ context.Context, taskID string, loopIndex int, 
 				AgentID:    a.ID,
 				Loop:       loopIndex,
 				NotifyType: "subtask",
-			})
-		}
-	}
-
-	// 3. 任务过半检测
-	if !flags.notifiedHalfway {
-		if detectHalfway(loopIndex, a.MaxLoops) {
-			msg := buildHalfwayMsg(a.ID, loopIndex, a.MaxLoops)
-			if err := a.MailRegistry.Send(msg); err != nil {
-				log.Printf("[agent %s] 进度通知(halfway)发送失败: %v", a.ID, err)
-			}
-			flags.notifiedHalfway = true
-			trace.Emit(trace.Event{
-				Kind:       trace.KindProgressNotify,
-				TaskID:     taskID,
-				AgentID:    a.ID,
-				Loop:       loopIndex,
-				NotifyType: "halfway",
 			})
 		}
 	}

@@ -398,6 +398,9 @@ func TestExecutor_AppendsToolCallOnSuccess(t *testing.T) {
 	if history[0].ToolName != "success_tool" {
 		t.Errorf("ToolName = %q, want success_tool", history[0].ToolName)
 	}
+	if history[0].CallID != "call_1" {
+		t.Errorf("CallID = %q, want call_1", history[0].CallID)
+	}
 	if history[0].AgentID != "agent-1" {
 		t.Errorf("AgentID = %q, want agent-1", history[0].AgentID)
 	}

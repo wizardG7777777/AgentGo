@@ -5,14 +5,13 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
+	"agentgo/internal/effect"
 	"agentgo/internal/memory"
 	"agentgo/internal/model"
 	"agentgo/internal/session"
-	"agentgo/internal/store"
 	"agentgo/internal/trace"
 )
 
@@ -54,6 +53,7 @@ type staleResumeBlock struct {
 	TaskID     string
 	PrevStatus string
 	Reason     string
+	Cause      string
 }
 
 func emitStaleResumeBlocks(blocks []staleResumeBlock) {
@@ -66,6 +66,10 @@ func emitStaleResumeBlocks(blocks []staleResumeBlock) {
 		return
 	}
 	for _, blocked := range blocks {
+		cause := blocked.Cause
+		if cause == "" {
+			cause = "stale_resume_guard"
+		}
 		writer.Emit(trace.Event{
 			Kind:   trace.KindTaskBlocked,
 			TaskID: blocked.TaskID,
@@ -73,25 +77,111 @@ func emitStaleResumeBlocks(blocks []staleResumeBlock) {
 			Transition: &trace.Transition{
 				PrevStatus: blocked.PrevStatus,
 				NewStatus:  string(model.TaskStatusBlocked),
-				Cause:      "stale_resume_guard",
+				Cause:      cause,
 			},
 		})
 		writer.CloseTask(blocked.TaskID)
 	}
 }
 
+// protectUnknownEffectResume 把 Effect Journal 仍无法证明已 settled 的
+// TaskID 对应非终态快照改为 blocked quarantine。这个保护不受
+// --resume 影响：显式恢复只确认使用快照，不能把 unknown Shell/消息
+// 变成可静默重放的已知操作。
+func protectUnknownEffectResume(snap *session.Snapshot, decisions []effect.RecoveryDecision, now time.Time) (*session.Snapshot, []staleResumeBlock) {
+	if snap == nil || len(decisions) == 0 {
+		return snap, nil
+	}
+	byTask := make(map[string][]effect.RecoveryDecision)
+	for _, decision := range decisions {
+		if decision.TaskID == "" || decision.Decision == effect.DecisionVerifiedSettled {
+			continue
+		}
+		byTask[decision.TaskID] = append(byTask[decision.TaskID], decision)
+	}
+	if len(byTask) == 0 {
+		return snap, nil
+	}
+
+	guarded := *snap
+	guarded.Tasks = append([]session.TaskSnapshot(nil), snap.Tasks...)
+	completedAt := now.UTC().Format(time.RFC3339Nano)
+	var blocks []staleResumeBlock
+	for i := range guarded.Tasks {
+		task := &guarded.Tasks[i]
+		if model.IsTerminal(model.TaskStatus(task.Status)) {
+			continue
+		}
+		unknown := byTask[task.ID]
+		if len(unknown) == 0 {
+			continue
+		}
+		ids := make([]string, 0, len(unknown))
+		for _, decision := range unknown {
+			ids = append(ids, fmt.Sprintf("%s(%s/%s)", decision.EffectID, decision.Kind, decision.Decision))
+		}
+		reason := fmt.Sprintf(
+			"effect_recovery_quarantine: 任务有 %d 条副作用结果仍 unknown（%s）；为避免重复 Shell/消息/合并，恢复时已阻断，需人工或 Scheduler 核验后 replan",
+			len(unknown), strings.Join(ids, ", "),
+		)
+		blocks = append(blocks, staleResumeBlock{
+			TaskID: task.ID, PrevStatus: task.Status, Reason: reason,
+			Cause: "effect_recovery_unknown",
+		})
+		task.Status = string(model.TaskStatusBlocked)
+		task.Error = reason
+		task.Agents = nil
+		task.PendingSince = ""
+		task.CompletedAt = completedAt
+		revokeSnapshotLease(task)
+	}
+	return &guarded, blocks
+}
+
+// revokeSnapshotLease 在 recovery guard 把任务改成 terminal blocked 时，
+// 同步撤销快照中的执行租约。TaskSnapshot 复制是浅拷贝，必须先复制 Lease
+// 及其 slice，避免 guard 反向改写 SessionManager 持有的原始快照。
+func revokeSnapshotLease(task *session.TaskSnapshot) {
+	if task == nil || task.Lease == nil {
+		return
+	}
+	lease := *task.Lease
+	lease.BusinessTools = append([]string(nil), task.Lease.BusinessTools...)
+	lease.ControlTools = append([]string(nil), task.Lease.ControlTools...)
+	lease.Revoked = true
+	task.Lease = &lease
+}
+
+// unresolvedEffectTaskReasons 为 Graph 恢复桥生成旧 task_id 的 quarantine
+// 索引。Session Task 快照可能已经丢失，但 Graph journal 仍会引用该 ID；
+// 只要 Effect 未核验 settled，activation 就不能按「任务缺失」重发。
+func unresolvedEffectTaskReasons(decisions []effect.RecoveryDecision) map[string]string {
+	grouped := make(map[string][]string)
+	for _, decision := range decisions {
+		if decision.TaskID == "" || decision.Decision == effect.DecisionVerifiedSettled {
+			continue
+		}
+		grouped[decision.TaskID] = append(grouped[decision.TaskID],
+			fmt.Sprintf("%s(%s/%s)", decision.EffectID, decision.Kind, decision.Decision))
+	}
+	out := make(map[string]string, len(grouped))
+	for taskID, items := range grouped {
+		out[taskID] = fmt.Sprintf(
+			"effect_recovery_quarantine: 旧任务有 %d 条副作用结果仍 unknown（%s）；Graph 恢复不得补发该 activation，需人工或 Scheduler 核验后 replan",
+			len(items), strings.Join(items, ", "))
+	}
+	return out
+}
+
 const snapshotFutureSkewTolerance = time.Minute
 
-// prepareRecoveredSnapshot resolves the more durable Plan terminal facts
-// before applying the stale automatic-resume guard. Reversing this order would
-// turn an old-but-completed Plan node into a synthetic blocked Task and then
-// hide the authoritative terminal fact from overlayPlanTerminalFacts.
+// prepareRecoveredSnapshot applies the stale automatic-resume guard to the
+// recovered snapshot before any task fact is imported.
 func prepareRecoveredSnapshot(sys *System, snap *session.Snapshot, explicit bool, maxIdle time.Duration, now time.Time) (*session.Snapshot, []staleResumeBlock) {
 	if snap == nil {
 		return nil, nil
 	}
 	prepared := *snap
-	prepared.Tasks = overlayPlanTerminalFacts(sys, snap.Tasks)
 	return protectStaleAutomaticResume(&prepared, explicit, maxIdle, now)
 }
 
@@ -153,32 +243,30 @@ func protectStaleAutomaticResume(snap *session.Snapshot, explicit bool, maxIdle 
 		task.Agents = nil
 		task.PendingSince = ""
 		task.CompletedAt = completedAt
+		revokeSnapshotLease(task)
 	}
 	return &guarded, protected
 }
 
-// restoreOrReconcileRuntime closes the durability gap between the eagerly
-// fsynced PlanStore and the shutdown Task snapshot. Even when no snapshot file
-// exists (for example after a crash before the first graceful shutdown), every
-// loaded live Plan must be reconciled against the empty TaskStore and blocked
-// rather than left running without an executable controller or DAG nodes.
+// restoreOrReconcileRuntime restores the shutdown Task snapshot when one
+// exists. Even when no snapshot file exists (for example after a crash before
+// the first graceful shutdown), startup simply proceeds with an empty board —
+// C6b 起 Plan 控制面对账已随其整包删除，图运行时的恢复由
+// resumeNonTerminalGraphs 经 durable journal 幂等补发承担。
 func restoreOrReconcileRuntime(sys *System, snap *session.Snapshot) error {
 	wireTextOnlyResultPersistence(sys)
 	if snap != nil {
 		return restoreRuntimeSnapshot(sys, snap)
 	}
-	if err := reconcilePlanTaskFacts(sys); err != nil {
-		return fmt.Errorf("reconcile plan/task facts without snapshot: %w", err)
-	}
 	return nil
 }
 
 // restoreRuntimeBeforeReactorActivation keeps the global dispatcher detached
-// for the whole recovery/reconciliation transaction. Reconciliation may emit
-// plan audit events (for example replan_requested); allowing user Reactors to
-// observe those events could publish new work while startup is deliberately
-// failing closed. The dispatcher is installed only after all durable facts
-// and writer-only stale audit events have been settled successfully.
+// for the whole recovery transaction. Recovery itself may emit audit events;
+// allowing user Reactors to observe those events could publish new work while
+// startup is deliberately failing closed. The dispatcher is installed only
+// after all durable facts and writer-only stale audit events have been settled
+// successfully.
 func restoreRuntimeBeforeReactorActivation(sys *System, snap *session.Snapshot, blocks []staleResumeBlock, dispatcher trace.Dispatcher) error {
 	trace.SetDefaultDispatcher(nil)
 	wireSessionMemory(sys)
@@ -249,24 +337,19 @@ func restoreRuntimeSnapshot(sys *System, snap *session.Snapshot) error {
 		return nil
 	}
 	if importer, ok := sys.Store.(taskSnapshotImporter); ok {
-		tasks := overlayPlanTerminalFacts(sys, snap.Tasks)
-		if err := importer.ImportSnapshot(tasks); err != nil {
+		if err := importer.ImportSnapshot(snap.Tasks); err != nil {
 			return fmt.Errorf("restore tasks: %w", err)
 		}
 		// F12：artifact 重放必须在任务导入之后才有意义——bootstrap 早期 store
 		// 为空，RestoreArtifacts 会全部 miss。RestoreArtifacts 是覆盖式恢复
 		// （replay 结果是完整去重列表、且 AppendArtifact 逐条 write-through 落
 		// 日志，日志是权威源），对 TaskSnapshot 已内嵌 Artifacts 的任务也不会
-		// 重复追加。必须在 reconcilePlanTaskFacts 之前完成，使对账看到恢复后
-		// 的 artifacts。
+		// 重复追加。
 		if restorer, ok := sys.Store.(artifactRestorer); ok && len(sys.artifactReplay) > 0 {
 			restoredTasks, restoredArts := restorer.RestoreArtifacts(sys.artifactReplay)
 			if restoredTasks > 0 {
 				log.Printf("[resume] artifact 重放恢复 %d 个任务 / %d 个 artifact", restoredTasks, restoredArts)
 			}
-		}
-		if err := reconcilePlanTaskFacts(sys); err != nil {
-			return fmt.Errorf("reconcile plan/task facts: %w", err)
 		}
 	}
 	if importer, ok := sys.Roster.(rosterSnapshotImporter); ok {
@@ -291,177 +374,6 @@ func restoreRuntimeSnapshot(sys *System, snap *session.Snapshot) error {
 		sys.seedResult(snap.Result)
 	}
 	return nil
-}
-
-// PlanStore is fsynced on every mutation while Task snapshots are periodic.
-// On recovery, a terminal Plan node is therefore authoritative over an older
-// processing Task snapshot. The inverse skew (terminal Task snapshot, stale
-// Plan node) is repaired by reconcilePlanTaskFacts immediately after import.
-func overlayPlanTerminalFacts(sys *System, snapshots []session.TaskSnapshot) []session.TaskSnapshot {
-	out := append([]session.TaskSnapshot(nil), snapshots...)
-	if sys == nil || sys.PlanCoordinator == nil {
-		return out
-	}
-	for i := range out {
-		snapshot := &out[i]
-		if snapshot.PlanID == "" || snapshot.NodeRole == string(model.PlanNodeRoleController) {
-			continue
-		}
-		p, err := sys.PlanCoordinator.Store().GetPlan(snapshot.PlanID)
-		if err != nil {
-			continue
-		}
-		node, ok := p.Nodes[snapshot.ID]
-		if ok && model.IsTerminal(node.Status) && !model.IsTerminal(model.TaskStatus(snapshot.Status)) {
-			snapshot.Status = string(node.Status)
-			snapshot.Agents = nil
-			snapshot.PendingSince = ""
-			if snapshot.CompletedAt == "" {
-				snapshot.CompletedAt = p.UpdatedAt.Format(time.RFC3339Nano)
-			}
-		}
-	}
-	return out
-}
-
-func reconcilePlanTaskFacts(sys *System) error {
-	if sys == nil || sys.PlanCoordinator == nil || sys.Store == nil {
-		return nil
-	}
-	tasks, err := sys.Store.ScanAll()
-	if err != nil {
-		return err
-	}
-	tasksByID := make(map[string]*model.Task, len(tasks))
-	for _, task := range tasks {
-		tasksByID[task.ID] = task
-	}
-	// Supersede is a PlanStore transaction followed by a cross-store Task
-	// cancellation. A crash in that gap can recover a retired node whose Task
-	// still holds a pending/processing execution lease. Close that lease from
-	// the authoritative retired fact before any runner can be restarted.
-	for i, task := range tasks {
-		if task.PlanID == "" || task.NodeRole == model.PlanNodeRoleController || model.IsTerminal(task.Status) {
-			continue
-		}
-		p, planErr := sys.PlanCoordinator.Store().GetPlan(task.PlanID)
-		if planErr != nil {
-			return planErr
-		}
-		node, ok := p.Nodes[task.ID]
-		if !ok || node.RetiredRevision == 0 {
-			continue
-		}
-		if cancelErr := store.TransitionStateWithCancelSource(
-			sys.Store, task.ID, task.Status, model.TaskStatusCancelled, "recovery",
-		); cancelErr != nil {
-			latest, latestErr := sys.Store.GetTask(task.ID)
-			if latestErr != nil || !model.IsTerminal(latest.Status) {
-				return fmt.Errorf("cancel retired task %s during recovery: %w", task.ID, cancelErr)
-			}
-		}
-		latest, latestErr := sys.Store.GetTask(task.ID)
-		if latestErr != nil {
-			return latestErr
-		}
-		tasks[i] = latest
-		tasksByID[task.ID] = latest
-		log.Printf("[resume] 已终止退休节点 %s 的残留执行租约", task.ID)
-	}
-
-	// Task snapshots and PlanStore are separate durability boundaries. A Plan
-	// node with no corresponding Task cannot be interpreted as completed (or as
-	// safely absent): there is no executable fact to support that conclusion.
-	// Freeze live execution and persist a high-priority recovery request instead
-	// of fabricating a replacement Task with guessed metadata.
-	plans, err := sys.PlanCoordinator.Store().ListPlans()
-	if err != nil {
-		return err
-	}
-	for i := range plans {
-		p := &plans[i]
-		// Terminal Plans are immutable acceptance records and their Task facts may
-		// have been intentionally released by the terminal FIFO. Only resumable
-		// Plans require executable current-node counterparts.
-		if model.IsPlanTerminal(p.Status) {
-			continue
-		}
-		var missing []string
-		for _, taskID := range p.CurrentNodeIDs {
-			if _, ok := tasksByID[taskID]; !ok {
-				missing = append(missing, taskID)
-			}
-		}
-		sort.Strings(missing)
-		if _, recoveryErr := sys.PlanCoordinator.MarkMissingAcceptanceRunners(context.Background(), p.ID, missing); recoveryErr != nil {
-			return fmt.Errorf("close abandoned acceptance runner leases for plan %s: %w", p.ID, recoveryErr)
-		}
-		if len(missing) == 0 {
-			if p.Status != model.PlanStatusRunning {
-				continue
-			}
-			controller, ok := tasksByID[p.ActiveDecisionTaskID]
-			if ok && controller.PlanID == p.ID && controller.NodeRole == model.PlanNodeRoleController && !model.IsTerminal(controller.Status) {
-				continue
-			}
-			reason := "recovery_missing_active_controller:" + p.ActiveDecisionTaskID
-			if _, blockErr := sys.PlanCoordinator.MarkBlocked(context.Background(), p.ID, reason); blockErr != nil {
-				return fmt.Errorf("block plan %s after missing active controller: %w", p.ID, blockErr)
-			}
-			log.Printf("[resume] Plan %s 已挂起：active controller %s 不可恢复", p.ID, p.ActiveDecisionTaskID)
-			continue
-		}
-		reason := "recovery_missing_current_tasks:" + strings.Join(missing, ",")
-		if _, blockErr := sys.PlanCoordinator.MarkBlocked(context.Background(), p.ID, reason); blockErr != nil {
-			return fmt.Errorf("block plan %s after torn task snapshot: %w", p.ID, blockErr)
-		}
-		log.Printf("[resume] Plan %s 已挂起：当前 DAG 节点缺少 Task 快照 (%s)", p.ID, strings.Join(missing, ","))
-	}
-
-	for _, task := range tasks {
-		if task.PlanID == "" || task.NodeRole == model.PlanNodeRoleController {
-			continue
-		}
-		p, err := sys.PlanCoordinator.Store().GetPlan(task.PlanID)
-		if err != nil {
-			return err
-		}
-		node, ok := p.Nodes[task.ID]
-		if !ok {
-			return fmt.Errorf("planned task %s is missing from plan %s", task.ID, task.PlanID)
-		}
-		summary := plannedTaskSummary(task)
-		if node.Status == task.Status && node.Summary == summary && sameStringSlice(node.ArtifactRefs, task.Artifacts) {
-			continue
-		}
-		kind := store.TaskMutationResult
-		if node.Status != task.Status {
-			kind = store.TaskMutationStatus
-		}
-		if err := recordPlannedTaskMutation(sys.PlanCoordinator, store.TaskMutation{
-			Kind: kind, Task: task, FromStatus: node.Status, ToStatus: task.Status, At: time.Now().UTC(),
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func sameStringSlice(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	seen := make(map[string]int, len(a))
-	for _, value := range a {
-		seen[value]++
-	}
-	for _, value := range b {
-		if seen[value] == 0 {
-			return false
-		}
-		seen[value]--
-	}
-	return true
 }
 
 func (s *System) saveRuntimeSnapshot() {

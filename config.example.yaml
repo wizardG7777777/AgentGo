@@ -15,7 +15,6 @@ llm:
   api_key: ${OPENAI_API_KEY}       # 支持 ${ENV_VAR} 环境变量替换（os.ExpandEnv）
   default_model: gpt-4o
   timeout_sec: 120
-  # provider: openai                # 可选：openai / openrouter / deepseek-v4 / deepseek-r1
   # reasoning_effort: medium        # 仅为支持该参数的模型启用；可选值见 docs/yaml-config-guide.md
   stream: true                      # Chat Completions SSE；Agent/UI 原位显示完整累积快照
 
@@ -61,8 +60,8 @@ tool_profiles:
     - run_shell
     - web_search
     - web_fetch
-    - submit_acceptance_result     # 仅绑定 AcceptanceRun 的 Task 能提交正式结果
-    - request_replan               # 验收失败时请求 Scheduler 决定是否返工
+    - submit_task_result             # Graph acceptance 节点 runner 经它提交 verdict/event 结论
+    - request_replan                 # 验收失败时请求 Scheduler 决定是否返工
 
 # ============================================================
 # Scheduler 配置（独立块）
@@ -70,19 +69,17 @@ tool_profiles:
 # ============================================================
 scheduler:
   model: gpt-4o                              # 可选，缺省回落 llm.default_model
-  agent_max_loops: 50                        # 可选；省略/0 = 50
   enforce_compact_token_threshold: 80000     # 可选；累计 prompt token 的一次性压缩阈值，省略/0 = 80000
-  context_limit: 200000                      # 可选；下一轮 prompt 硬截断预算，省略/0 = 200000
 
 # ============================================================
-# 三轴工作模式（可选；三轴正交可组合，字段为空 = 该轴取默认）
-#   gate: 规划门控轴 —— immediate（默认）/ plan（先只读探索再执行）
+# 两轴工作模式（可选；两轴正交可组合，字段为空 = 该轴取默认）
 #   exec: 执行权限轴 —— normal（默认）/ strict / readonly / yolo
 #   topo: 编排拓扑轴 —— team（默认）/ solo
-# 运行期 TUI / Web 的 /mode 只切换 gate 轴；exec / topo 的行为语义由后续版本落地。
+# gate 轴已于 V6 移除（执行前审阅改由 Graph approval 节点承担）；
+# 显式设置 modes.gate 会在启动校验报迁移诊断。
+# 运行期可用 TUI / Web 的 /mode 切换两轴。
 # ============================================================
 # modes:
-#   gate: immediate
 #   exec: normal
 #   topo: team
 
@@ -117,10 +114,8 @@ agents:
     # 或直接用 tools: [read_file, write_file, ...]  二选一
     model: gpt-4o                  # 覆盖 llm.default_model
     system_prompt_file: prompts/worker.md
-    agent_max_loops: 10
     task_max_retries: 3
     enforce_compact_token_threshold: 4000
-    context_limit: 16000
     # description 给 scheduler 看的一句话角色说明，影响任务派发选择
     description: |
       通用工作代理。能读写文件、跑 shell、检索网络；
@@ -132,10 +127,8 @@ agents:
     profile: explorer_full
     model: gpt-4o-mini             # 调查类可用更便宜模型
     system_prompt_file: prompts/explorer.md
-    agent_max_loops: 5
     task_max_retries: 3
     enforce_compact_token_threshold: 3000
-    context_limit: 8000
     description: |
       广度优先调研代理。不写文件，仅返回 Markdown 文字回复。
 
@@ -145,13 +138,11 @@ agents:
     profile: acceptance_verifier
     model: gpt-4o-mini
     system_prompt_file: prompts/program_verifier.md
-    agent_max_loops: 8
     task_max_retries: 2
     enforce_compact_token_threshold: 3000
-    context_limit: 12000
     description: |
-      正式验收代理。执行只读检查、测试与构建，并通过
-      submit_acceptance_result 提交结构化 Criterion 和 Evidence 结果。
+      正式验收代理（Graph acceptance 节点 runner）。执行只读检查、测试与构建，
+      并通过 submit_task_result 的 verdict/event 字段提交验收结论。
 
 # ============================================================
 # 运行时基础设施
@@ -242,7 +233,7 @@ session_snapshot_interval_sec: 30 # 运行期完整快照间隔，限制崩溃�
 # 动态 DAG 的 Reactor 示例见 reactors.program-verify.yaml：Task 终态已有内置唤醒，
 # 示例用非终态的重试压力提交 request_replan，由 Scheduler 决定是否调整图。
 # 本示例预热了 acceptance.verify；省略它时 Scheduler 可按需 provision builtin/verifier@1。
-# 自定义正式验收 Agent 或模板仍必须显式加入 submit_acceptance_result。
+# 自定义验收 Agent 或模板必须显式加入 submit_task_result（经 verdict/event 提交结论）。
 # ============================================================
 # reactors_file: reactors.yaml
 
@@ -256,10 +247,8 @@ session_snapshot_interval_sec: 30 # 运行期完整快照间隔，限制崩溃�
 #       event_type: ""
 #       profile: worker_standard
 #       system_prompt_file: prompts/worker.md
-#       agent_max_loops: 10
 #       task_max_retries: 3
 #       enforce_compact_token_threshold: 4000
-#       context_limit: 16000
 #     model: gpt-4o
 #
 #   - kind: worker-deep

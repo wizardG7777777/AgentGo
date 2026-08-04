@@ -70,6 +70,7 @@ artifacts/
 
 # 本地编译产物（go build ./. 默认输出到仓库根的同名二进制）
 /agentgo
+/agentgo-eval
 
 # 外部/无关项目目录
 systemTest/

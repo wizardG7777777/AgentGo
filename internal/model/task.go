@@ -72,30 +72,13 @@ type Task struct {
 	PartialOutput string // 执行中的部分输出，用于流式进度展示
 	Depth         int    // 子任务嵌套深度，根任务为 0
 
-	// PlanID 把执行 Task 归属到一张动态 DAG。根 Scheduler Task 的 PlanID
-	// 等于自身 Task.ID；未纳入计划控制面的兼容任务保持空值。
-	PlanID string `json:"plan_id,omitempty"`
-
-	// NodeRole 是节点在当前计划中的语义角色。它不参与 Agent 路由；路由仍由
-	// EventType 决定。常见值见 PlanNodeRole* 常量。
-	NodeRole PlanNodeRole `json:"node_role,omitempty"`
-
-	// CreatedRevision / RetiredRevision 记录节点进入和退出当前有效图的规划版本。
-	// Task 状态变化不会修改这两个字段。
-	CreatedRevision int64 `json:"created_revision,omitempty"`
-	RetiredRevision int64 `json:"retired_revision,omitempty"`
-
-	// Supersedes 是非阻塞的替代语义边；Dependencies 才是执行阻塞边。
-	Supersedes []string `json:"supersedes,omitempty"`
-
-	// AcceptanceRunID 仅对正式验收执行 Task 有值。提交验收结果时以它和
-	// 当前 Task.ID 双重校验 Runner 身份，而不是依赖 AgentType。
-	AcceptanceRunID string `json:"acceptance_run_id,omitempty"`
-
-	// PlanMutationSource 是内部控制面写入的权限来源。普通 LLM/YAML 参数不会
-	// 暴露该字段；Coordinator 用它区分 scheduler / acceptance / control，
-	// 以及暂停恢复期间尚不可认领的 control-reserved 节点。
-	PlanMutationSource string `json:"plan_mutation_source,omitempty"`
+	// GraphID / NodeID / ActivationID 是 V6 Graph 归属身份：本任务由 Graph
+	// Runtime 为图 graph_id 的节点 node_id 的某次 activation（<nodeID>@<n>）
+	// 发布时写入，终态后由 graph-terminal-feed Reactor 凭它回填引擎
+	// （OnTaskTerminal 的幂等身份）。普通任务三字段皆空。
+	GraphID      string `json:"graph_id,omitempty"`
+	NodeID       string `json:"node_id,omitempty"`
+	ActivationID string `json:"activation_id,omitempty"`
 
 	// Capability 是本任务（DAG 节点）的能力声明。由 Scheduler 在 publish_task
 	// 时按节点指定：Tools 非空表示当次任务只允许使用该工具子集（必须 ⊆ 认领
@@ -104,6 +87,14 @@ type Task struct {
 	// nil 表示无节点级能力约束，agent 按 kind 声明的完整能力执行（kind 退化为
 	// 能力天花板）。发布后视为只读契约，执行期不修改。
 	Capability *NodeCapability `json:"capability,omitempty"`
+
+	// Lease 是 V6 §4（H1）的冻结执行租约：任务首次被认领时按
+	// NodeRequirement ∩ RouteCeiling ∩ Policy 冻结的当次执行契约
+	// （见 model/execution_lease.go）。nil 表示尚未冻结（旧快照恢复或任务
+	// 从未被认领）——认领时按计算规则即时冻结；重试重认领/进程重启恢复
+	// 复用既有租约而不重新计算；任务终态（含 finalizing 被接受）置
+	// Revoked。发布后视为只读契约，仅 Revoked 位在撤销时翻转。
+	Lease *ExecutionLease `json:"lease,omitempty"`
 
 	// MailChainDepth 是该任务被第几层邮件唤醒。
 	// 用户 /steer 触发的初始任务为 0；被 chain_depth=N 的邮件唤醒的任务为 N。
@@ -140,28 +131,6 @@ type Task struct {
 	// 缺失则任务失败重试。这是 Level 3 的硬性合约校验。
 	// 路径同样为相对项目根的相对路径。
 	ExpectedArtifacts []string
-
-	// TransferNote 是一份压缩的跨 agent 交接备忘，供下游任务或重试时恢复上下文。
-	//
-	// 生成路径（见 internal/agent/transfer_note.go）：
-	//   - 成功路径：agent 在 SubmitResult 之前把 lastOutput（LLM 最终响应）直接
-	//     写入本字段。lastOutput 本身已经是合理的自述总结，不需额外压缩
-	//   - 失败路径：agent.buildTransferNote 两级调用链
-	//       L1：生成 <transfer-request> prompt 让 LLM 做最后一次自压缩
-	//       L3：机械拼装（无 LLM 调用）——任务目标 + 工具轨迹 + Artifacts + 最后响应
-	//
-	// 读取路径：
-	//   - 依赖链场景：下游 agent 在 processTask 入口通过 Store.GetDependencyTransferNotes
-	//     读取所有上游任务的 TransferNote，以 <upstream-transfer-notes> 形式注入首条 history
-	//   - 重试换手场景：接手者通过 task.TransferNote 直接读取前任的备忘，
-	//     以 <transfer-note> 形式注入首条 history
-	//
-	// 与 LastHistory 的关系（2026-04-12 引入时保持共存）：
-	//   - LastHistory 是完整的历史序列化，重试时完整恢复上下文（可能很大）
-	//   - TransferNote 是精炼文本（默认 < 3000 tokens），跨 agent 更友好
-	//   - 两者并存，重试时优先用 TransferNote，LastHistory 作为 fallback
-	//   - 等 TransferNote 实测稳定后再决定是否删除 LastHistory
-	TransferNote string
 
 	// LastResponse 是 agent 最近一次 LLM 非工具响应的原始文本（worker 的"我做完了"那句话）。
 	// 在每次 worker 提交"无 tool call"响应时由 Store.RecordLastResponse 写入；
@@ -205,7 +174,7 @@ type Task struct {
 	CompletedAt  time.Time
 }
 
-// NodeCapability 是 DAG 节点级的能力声明，随 Task / PlanNode 携带。
+// NodeCapability 是 DAG 节点级的能力声明，随 Task 携带。
 // 三方（model / store / agent）共用的统一契约，字段语义：
 //   - Tools 非空：当次任务的工具子集。核心不变式：节点工具集 ⊆ 认领 runner
 //     白名单。Store.QueryAvailable 据此过滤不可认领的任务；agent.processTask

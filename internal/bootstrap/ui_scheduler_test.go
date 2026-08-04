@@ -13,10 +13,10 @@ func TestApplyActivitySnapshotProjectsActiveTools(t *testing.T) {
 	info := ui.AgentCard{ID: "scheduler-1"}
 	(&System{}).applyActivitySnapshot(&info, agent.ActivitySnapshot{
 		AgentID: "scheduler-1", Phase: "tooling",
-		ActiveTools: []agent.ToolActivity{{CallID: "call-1", ToolName: "continue_waiting", StartedAt: started}},
+		ActiveTools: []agent.ToolActivity{{CallID: "call-1", ToolName: "submit_task_result", StartedAt: started}},
 	})
 	if len(info.ActiveTools) != 1 || info.ActiveTools[0].CallID != "call-1" ||
-		info.ActiveTools[0].Tool != "continue_waiting" || !info.ActiveTools[0].StartedAt.Equal(started) {
+		info.ActiveTools[0].Tool != "submit_task_result" || !info.ActiveTools[0].StartedAt.Equal(started) {
 		t.Fatalf("active tool projection = %+v", info.ActiveTools)
 	}
 }

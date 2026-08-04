@@ -5,7 +5,7 @@
 //   - invoke_llm — 一次性 LLM 调用 + 三 sink 输出（write_file / send_message / emit_trace）
 //   - spawn_agent — 启动 ad-hoc agent（可含 via_translator 二次加工）
 //   - call — §6.1 B 选项：直接调用内置工具（v1 仅支持 send_message）
-//   - request_replan — 请求内置控制面重新评估事件所属 Plan
+//   - request_replan — 发布通用 replan 唤醒任务给 Scheduler（C6b 起 Plan 控制面已删除）
 //
 // 可选过滤维度：
 //   - when — §6.1.7 条件表达式（7 个叶子算子 + and/or/not 嵌套组合）
@@ -40,11 +40,12 @@ type ReactorConfig struct {
 	Args map[string]string `yaml:"args,omitempty" json:"args,omitempty"`
 }
 
-// RequestReplanAction 是用户 Reactor 请求控制面重新评估 Plan 的唯一配置入口。
+// RequestReplanAction 是用户 Reactor 请求重新评估后续编排的唯一配置入口
+// （C6b 起 Plan 控制面已删除，落地为发给 Scheduler 的通用 replan 唤醒任务）。
 //
-// YAML 只允许声明原因、紧急程度和可选详情。PlanID、PlanRevision、
-// ExecutionStateVersion、IdempotencyKey 等权威字段必须由 ReplanRequester 根据原始
-// trace.Event 和 PlanStore 状态生成，不能由 YAML 提供。
+// YAML 只允许声明原因、紧急程度和可选详情。幂等键（<taskID>/replan）、
+// 唤醒任务的路由与归属等权威字段必须由实现根据原始 trace.Event 生成，
+// 不能由 YAML 提供。
 type RequestReplanAction struct {
 	ReasonCode string `yaml:"reason_code" json:"reason_code"`
 	Urgency    string `yaml:"urgency" json:"urgency"` // normal / high
@@ -174,12 +175,16 @@ type SpawnAgentAction struct {
 // 这些一旦覆盖会破坏 ad-hoc 路由（EventType）或工具/Gate 集合的闭合（Tools），
 // 当前阶段不暴露。
 type SpawnOverride struct {
-	SystemPrompt                 *PromptSpec `yaml:"system_prompt,omitempty" json:"system_prompt,omitempty"`
-	Model                        string      `yaml:"model,omitempty" json:"model,omitempty"`
-	AgentMaxLoops                int         `yaml:"agent_max_loops,omitempty" json:"agent_max_loops,omitempty"`
-	TaskMaxRetries               int         `yaml:"task_max_retries,omitempty" json:"task_max_retries,omitempty"`
-	EnforceCompactTokenThreshold int         `yaml:"enforce_compact_token_threshold,omitempty" json:"enforce_compact_token_threshold,omitempty"`
-	ContextLimit                 int         `yaml:"context_limit,omitempty" json:"context_limit,omitempty"`
+	SystemPrompt *PromptSpec `yaml:"system_prompt,omitempty" json:"system_prompt,omitempty"`
+	Model        string      `yaml:"model,omitempty" json:"model,omitempty"`
+	// AgentMaxLoops 已于 V6 移除：保留解析位以便 loader 对显式设置的旧配置
+	// 给出迁移诊断错误，而不是静默忽略。
+	AgentMaxLoops                int `yaml:"agent_max_loops,omitempty" json:"agent_max_loops,omitempty"`
+	TaskMaxRetries               int `yaml:"task_max_retries,omitempty" json:"task_max_retries,omitempty"`
+	EnforceCompactTokenThreshold int `yaml:"enforce_compact_token_threshold,omitempty" json:"enforce_compact_token_threshold,omitempty"`
+	// ContextLimit 已于 V6 移除：保留解析位以便 loader 对显式设置的旧配置
+	// 给出迁移诊断错误，而不是静默忽略。
+	ContextLimit int `yaml:"context_limit,omitempty" json:"context_limit,omitempty"`
 }
 
 // SpawnInitialTask 是 spawn_agent.initial_task 的内容。

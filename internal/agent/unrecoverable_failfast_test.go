@@ -67,7 +67,7 @@ func TestUnrecoverable_FailsFastWithoutRetry(t *testing.T) {
 
 	// MaxRetries=5 是个干扰项——若 fail-fast 失效退化到重试路径，RetryCount 会被
 	// 推到 5 才终止；正确行为是 RetryCount 保持 0 直接 failed。
-	ag := NewAgent("agent-failfast", "code", s, r, executor, 5)
+	ag := NewAgent("agent-failfast", "code", s, r, executor)
 	ag.MaxRetries = 5
 	ag.processTask(context.Background(), task.ID)
 

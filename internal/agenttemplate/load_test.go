@@ -36,10 +36,8 @@ capabilities: [audit]
 tools: [read_file]
 system_prompt_file: prompt.md
 limits:
-  agent_max_loops: 7
   task_max_retries: 1
   enforce_compact_token_threshold: 2500
-  context_limit: 9000
   max_replicas: 3
 `)
 
@@ -63,7 +61,7 @@ limits:
 	if writer.Namespace != NamespaceUser || writer.Model != "custom-model" || writer.MaxReplicas != 2 {
 		t.Fatalf("writer metadata = %#v", writer)
 	}
-	if writer.AgentMaxLoops != defaultLimits.AgentMaxLoops || writer.ContextLimit != defaultLimits.ContextLimit {
+	if writer.TaskMaxRetries != defaultLimits.TaskMaxRetries || writer.EnforceCompactTokenThreshold != defaultLimits.EnforceCompactTokenThreshold {
 		t.Fatalf("writer defaults not applied: %#v", writer.Limits)
 	}
 
@@ -74,7 +72,7 @@ limits:
 	if auditor.SystemPrompt != "Prompt loaded from a file.\n" {
 		t.Fatalf("resolved prompt = %q", auditor.SystemPrompt)
 	}
-	if auditor.AgentMaxLoops != 7 || auditor.ContextLimit != 9000 || !filepath.IsAbs(auditor.SourceFile) {
+	if auditor.TaskMaxRetries != 1 || auditor.EnforceCompactTokenThreshold != 2500 || !filepath.IsAbs(auditor.SourceFile) {
 		t.Fatalf("auditor metadata = %#v", auditor)
 	}
 
@@ -221,7 +219,8 @@ func TestLoadRejectsDuplicateUnknownAndControlTools(t *testing.T) {
 		{name: "empty", tools: "[]", validator: func([]string) error { return nil }, match: "at least one"},
 		{name: "duplicate", tools: "[read_file, read_file]", validator: func([]string) error { return nil }, match: "duplicate"},
 		{name: "publish", tools: "[publish_task]", validator: func([]string) error { return nil }, match: "reserved"},
-		{name: "scheduler control", tools: "[finalize_plan]", validator: func([]string) error { return nil }, match: "reserved"},
+		{name: "scheduler control", tools: "[report_done]", validator: func([]string) error { return nil }, match: "reserved"},
+		{name: "team provisioning", tools: "[provision_agent_team]", validator: func([]string) error { return nil }, match: "reserved"},
 		{name: "runtime unknown", tools: "[not_registered]", validator: func([]string) error { return validatorErr }, match: validatorErr.Error()},
 	} {
 		tc := tc
@@ -243,14 +242,16 @@ system_prompt: test
 	}
 }
 
-func TestLoadAllowsReplanAndAcceptanceSubmission(t *testing.T) {
+func TestLoadAllowsReplanAndTaskResultSubmission(t *testing.T) {
 	t.Parallel()
 
+	// request_replan / submit_task_result 是工作代理可持有的计划控制面工具
+	//（verifier 模板契约），不在保留清单内，模板可声明。
 	dir := t.TempDir()
 	content := `name: custom-verifier
 version: 1
 description: Custom verifier
-tools: [read_file, request_replan, submit_acceptance_result]
+tools: [read_file, request_replan, submit_task_result]
 system_prompt: verify
 `
 	writeTestFile(t, filepath.Join(dir, "verifier.yaml"), content)
@@ -383,6 +384,46 @@ limits:
 				t.Fatalf("Load limits error = %v", err)
 			}
 		})
+	}
+}
+
+func TestLoadRejectsRemovedAgentMaxLoops(t *testing.T) {
+	t.Parallel()
+
+	// limits.agent_max_loops 已于 V6 移除：显式设置必须报迁移诊断，不静默忽略。
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "legacy.yaml"), `
+name: legacy-loops
+version: 1
+description: Legacy loops template
+tools: [read_file]
+system_prompt: test
+limits:
+  agent_max_loops: 7
+`)
+	_, err := Load(LoadOptions{UserDirs: []string{dir}, DefaultModel: "test-model", ValidateTools: func([]string) error { return nil }})
+	if err == nil || !strings.Contains(err.Error(), "agent_max_loops") || !strings.Contains(err.Error(), "removed in V6") {
+		t.Fatalf("Load legacy agent_max_loops error = %v, want V6 migration diagnostic", err)
+	}
+}
+
+func TestLoadRejectsRemovedContextLimit(t *testing.T) {
+	t.Parallel()
+
+	// limits.context_limit 已于 V6 移除：显式设置必须报迁移诊断，不静默忽略。
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "legacy.yaml"), `
+name: legacy-context
+version: 1
+description: Legacy context template
+tools: [read_file]
+system_prompt: test
+limits:
+  context_limit: 9000
+`)
+	_, err := Load(LoadOptions{UserDirs: []string{dir}, DefaultModel: "test-model", ValidateTools: func([]string) error { return nil }})
+	if err == nil || !strings.Contains(err.Error(), "context_limit") || !strings.Contains(err.Error(), "removed in V6") {
+		t.Fatalf("Load legacy context_limit error = %v, want V6 migration diagnostic", err)
 	}
 }
 

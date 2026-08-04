@@ -144,13 +144,13 @@ func TestQuiesce_DrainsQuickWorkAndGoroutinesExit(t *testing.T) {
 	reg := newRegistry(16)
 	var ran atomic.Int32
 	const n = 10
-	if err := reg.Register(newStubR("quick", 500, false, []trace.EventKind{trace.KindTokenStats},
+	if err := reg.Register(newStubR("quick", 500, false, []trace.EventKind{trace.KindLLMCallEnd},
 		func(ev trace.Event) error { ran.Add(1); return nil })); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	before := runtime.NumGoroutine()
 	for i := 0; i < n; i++ {
-		reg.Dispatch(trace.Event{Kind: trace.KindTokenStats})
+		reg.Dispatch(trace.Event{Kind: trace.KindLLMCallEnd})
 	}
 	if rem := reg.Quiesce(3 * time.Second); rem != 0 {
 		t.Fatalf("Quiesce remaining=%d，期望 0", rem)

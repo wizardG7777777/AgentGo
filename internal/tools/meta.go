@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/effect"
 	"agentgo/internal/interaction"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
@@ -40,10 +41,13 @@ type BatchTracker interface {
 
 // RouteValidator is the runtime authority for task routing. Production
 // Scheduler and runners inject it so a catalog entry, stale event_type, or a
-// Team route owned by another Plan cannot create an invalid Task. Isolated
-// compatibility paths may leave it nil.
+// Team route owned by another request scope cannot create an invalid Task.
+// Isolated compatibility paths may leave it nil.
+//
+// CanRouteForPlan 的第一参数是路由归属 scope ID（controller 任务 ID；
+// 空串 = 全局）。
 type RouteValidator interface {
-	CanRouteForPlan(planID, eventType string, requiredTools ...string) bool
+	CanRouteForPlan(ownerScopeID, eventType string, requiredTools ...string) bool
 }
 
 // MetaGroup 注册任务发布与代理间通信工具。
@@ -68,8 +72,9 @@ type RouteValidator interface {
 type MetaGroup struct {
 	Store  store.TaskStore
 	Holder TaskHolder
-	// LineageHolder 只提供计划父节点身份，不启用 Worker 的深度限制。
-	// Scheduler 使用它把自己发布的 Task 关联到当前 Plan 根控制任务。
+	// LineageHolder 只提供父任务身份，不启用 Worker 的深度限制。
+	// Scheduler 使用它把自己发布的 Task 关联到当前 controller 任务
+	// （ParentTaskID 谱系关联 + 路由归属 scope）。
 	LineageHolder       TaskHolder
 	MaxDepth            int
 	MBRegistry          *mailbox.Registry
@@ -79,9 +84,13 @@ type MetaGroup struct {
 	InteractionWaitHook func(waiting bool)
 	BatchTracker        BatchTracker
 	RouteValidator      RouteValidator
-	// PlanMutationSource 仅由内置装配注入。普通 Worker/Reactor 留空，
-	// 计划控制面据此拒绝它们绕过 Scheduler 直接改变 DAG。
-	PlanMutationSource string
+	// AllowNodeCapability 仅由内置装配注入（Scheduler 装配置 true）。
+	// 普通 Worker/Reactor 留零值，publish_task 据此拒绝它们经
+	// tools/model/isolation 参数改变节点的执行边界。
+	AllowNodeCapability bool
+	// EffectJournal 是 V6 §4 H2b 副作用账本（internal/effect）；
+	// nil 时 send_message 不记账（行为与引入账本前完全一致）。
+	EffectJournal *effect.Journal
 }
 
 // Register 把 publish_task / send_message / request_user_input 注册到 r。
@@ -94,7 +103,6 @@ func (g MetaGroup) Register(r *agent.ToolRegistry) {
 			schema.Object().
 				String("description", "任务的详细描述", true).
 				String("event_type", "ready Agent route；静态默认 Worker 可留空，动态 Team 必须填写 provision_agent_team 返回的真实 event_type", false).
-				Enum("node_role", "DAG 节点角色；调查阶段用 investigation，实施用 implementation，验证用 verification", []string{"investigation", "implementation", "verification"}, false).
 				Enum("priority", "任务优先级，默认 normal", []string{"low", "normal", "high"}, false).
 				String("dependencies", "逗号分隔的依赖任务 UUID 列表。每个 ID 必须是之前 publish_task 调用返回的真实 task UUID（形如 7b52b232-4e9b-4b97-8bbc-f3d5927dc814），禁止使用占位符（如 \"task-part1\"、\"A\"、\"<id>\"）或自造 ID。若被依赖任务尚未发布，请先发布被依赖任务、从返回值中读取 id 之后再发布当前任务。留空表示无依赖", false).
 				String("expected_artifacts", "逗号分隔的预期产出文件路径列表（相对项目根的相对路径）。任务结束时系统会校验这些文件是否真的写入；缺失则任务失败重试。强烈建议为'报告/总结/文档'类任务填写此字段以防止 report-only 失败", false).
@@ -130,12 +138,12 @@ func (g MetaGroup) Register(r *agent.ToolRegistry) {
 	if g.Interactions != nil {
 		params := schema.Object().
 			String("prompt", "需要用户回答的明确问题", true).
-			String("options_json", "JSON 数组（2-8 项）；每项只能包含 id、label、可选 description、可选 requires_text。普通 Agent 提问只会收到回答，不会授予 Shell 权限或改变 Plan 控制状态", true).
+			String("options_json", "JSON 数组（2-8 项）；每项只能包含 id、label、可选 description、可选 requires_text。普通 Agent 提问只会收到回答，不会授予 Shell 权限或改变图执行状态", true).
 			Build()
 		params["additionalProperties"] = false
 		r.Register(
 			"request_user_input",
-			"向用户提出一个结构化选择题并等待回答。该工具只返回用户选择，不替代 run_shell 的授权 Interaction，也不替代 Plan 审阅/暂停控制。",
+			"向用户提出一个结构化选择题并等待回答。该工具只返回用户选择，不替代 run_shell 的授权 Interaction，也不替代图审批（approval）节点。",
 			params,
 			g.requestUserInput,
 		)
@@ -155,8 +163,8 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 	eventType, _ := args["event_type"].(string)
 
 	parentID := ""
-	parentPlanID := ""
-	parentDepth := -1 // Scheduler 模式下 childDepth = 0
+	parentOwnerID := "" // Worker 任务不再携带控制面归属：固定空串（全局）
+	parentDepth := -1   // Scheduler 模式下 childDepth = 0
 	if g.Holder != nil {
 		parentID = g.Holder.Get()
 		if parentID == "" {
@@ -167,27 +175,22 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 			return "", fmt.Errorf("读取父任务失败: %w", err)
 		}
 		parentDepth = parentTask.Depth
-		parentPlanID = parentTask.PlanID
 	} else if g.LineageHolder != nil {
-		// Scheduler 不受子任务深度限制，但仍必须留下真实父控制任务，
-		// 让 Store/PlanCoordinator 能可靠继承 PlanID。
+		// Scheduler 不受子任务深度限制，但仍必须留下真实父任务，
+		// 保持 ParentTaskID 谱系关联；controller 任务 ID 即路由归属 scope。
 		parentID = g.LineageHolder.Get()
 		if parentID == "" {
-			return "", fmt.Errorf("无法获取当前计划上下文")
+			return "", fmt.Errorf("无法获取当前任务上下文")
 		}
-		parentTask, err := g.Store.GetTask(parentID)
-		if err != nil {
-			return "", fmt.Errorf("读取当前计划控制任务失败: %w", err)
-		}
-		parentPlanID = parentTask.PlanID
+		parentOwnerID = parentID
 	}
 
-	if g.RouteValidator != nil && !g.RouteValidator.CanRouteForPlan(parentPlanID, eventType) {
+	if g.RouteValidator != nil && !g.RouteValidator.CanRouteForPlan(parentOwnerID, eventType) {
 		display := eventType
 		if display == "" {
 			display = "<default>"
 		}
-		return "", fmt.Errorf("发布任务被拒绝: event_type=%q 没有 ready Agent route 可供当前 Plan 使用；请先为当前 Plan provision Agent Team，并在下一轮使用返回的真实 event_type", display)
+		return "", fmt.Errorf("发布任务被拒绝: event_type=%q 没有 ready Agent route 可供当前请求使用；请先 provision Agent Team，并在下一轮使用返回的真实 event_type", display)
 	}
 
 	childDepth := parentDepth + 1
@@ -199,14 +202,13 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 	}
 
 	task := &model.Task{
-		Description:        desc,
-		EventType:          eventType,
-		EventSource:        parentID,
-		ParentTaskID:       parentID,
-		ReplyToAgentID:     g.AgentID,
-		BatchID:            parentID,
-		Depth:              childDepth,
-		PlanMutationSource: g.PlanMutationSource,
+		Description:    desc,
+		EventType:      eventType,
+		EventSource:    parentID,
+		ParentTaskID:   parentID,
+		ReplyToAgentID: g.AgentID,
+		BatchID:        parentID,
+		Depth:          childDepth,
 		// 单交付物任务的语义默认是"执行一次"。未显式指定时显式置 1，
 		// 不落进 store 的 default_concurrency 兜底——该配置是兼容层，
 		// 大于 1 会让多个 Agent 重复执行同一任务（2026-07-22 排查）。
@@ -215,10 +217,6 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 	if v, ok := args["max_concurrency"].(float64); ok && v >= 1 {
 		task.MaxConcurrency = int(v)
 	}
-	if role, _ := args["node_role"].(string); role != "" {
-		task.NodeRole = model.PlanNodeRole(role)
-	}
-
 	if prio, _ := args["priority"].(string); prio != "" {
 		switch prio {
 		case "low":
@@ -253,12 +251,13 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 	modelArg, _ := args["model"].(string)
 	isolationArg, _ := args["isolation"].(string)
 	isolationMode := strings.TrimSpace(isolationArg)
-	// a. 写入权限：节点能力只能由控制面（PlanMutationSource=scheduler）写入。
-	//    普通 Worker / Reactor 携带任一参数即拒绝——它们无权改变 DAG 节点的
-	//    执行边界，否则认领约束（子集 ⊆ 白名单）会被非控制面绕过。
+	// a. 写入权限：节点能力只能由控制面（AllowNodeCapability=true 的
+	//    Scheduler 装配）写入。普通 Worker / Reactor 携带任一参数即拒绝——
+	//    它们无权改变 DAG 节点的执行边界，否则认领约束（子集 ⊆ 白名单）
+	//    会被非控制面绕过。
 	if (strings.TrimSpace(toolsArg) != "" || strings.TrimSpace(modelArg) != "" || isolationMode != "") &&
-		g.PlanMutationSource != "scheduler" {
-		return "", fmt.Errorf("发布任务被拒绝: tools/model/isolation 节点能力参数只能由 Scheduler 计划控制面设置（当前 PlanMutationSource=%q）", g.PlanMutationSource)
+		!g.AllowNodeCapability {
+		return "", fmt.Errorf("发布任务被拒绝: tools/model/isolation 节点能力参数只能由 Scheduler 计划控制面设置")
 	}
 	var capabilityWarnings []string
 	if strings.TrimSpace(toolsArg) != "" || strings.TrimSpace(modelArg) != "" || isolationMode != "" {
@@ -290,8 +289,8 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 		capabilityWarnings = nodeCapabilityWarnings(capTools)
 	}
 	if g.RouteValidator != nil && len(task.ExpectedArtifacts) > 0 &&
-		!g.RouteValidator.CanRouteForPlan(parentPlanID, eventType, "write_file") &&
-		!g.RouteValidator.CanRouteForPlan(parentPlanID, eventType, "edit_file") {
+		!g.RouteValidator.CanRouteForPlan(parentOwnerID, eventType, "write_file") &&
+		!g.RouteValidator.CanRouteForPlan(parentOwnerID, eventType, "edit_file") {
 		return "", fmt.Errorf("发布任务被拒绝: event_type=%q 的 ready route 没有 write_file/edit_file，不能声明 expected_artifacts=%v", eventType, task.ExpectedArtifacts)
 	}
 
@@ -428,9 +427,19 @@ func (g MetaGroup) sendMessage(ctx context.Context, args map[string]any) (string
 		SentAt:     time.Now(),
 		ChainDepth: chainDepth,
 	}
+	// H2b Effect Journal：发送前先落账（prepared）。Target 只载收件人，
+	// ArgsDigest 是 路由+正文 的 digest（脱敏：正文不进账本）；
+	// Policy=manual_only——外部消息不得重发，恢复裁决不自动执行任何动作。
+	effID := effectPrepare(g.EffectJournal, ctx, g.AgentID,
+		effect.KindMessage, to,
+		digest12([]byte(g.AgentID+"->"+to+"\n"+content)), effect.PolicyManualOnly)
 	if err := g.MBRegistry.Send(msg); err != nil {
+		// 发送返回错误：广播场景可能已部分投递，外部状态不可知 → unknown。
+		effectMarkUnknown(g.EffectJournal, effID, "发送返回错误: "+err.Error())
 		return "", err
 	}
+	effectSettle(g.EffectJournal, effID,
+		fmt.Sprintf("已受理（type=%s priority=%s to=%s）", msgType, priority, to))
 	if to == "*" {
 		return "消息已广播给所有代理", nil
 	}

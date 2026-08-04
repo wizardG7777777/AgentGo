@@ -58,11 +58,14 @@ func (h *ExecModeGuardHook) Matches(toolName string) bool {
 }
 
 // Run 在 readonly 模式下 Abort 写类工具；其它模式（normal / strict / yolo）
-// 与 nil store 一律 Continue。
+// 与 nil store 一律 Continue。原因码按模式派生（exec_mode_<mode>）：
+// 模式拒绝不是 agent 能自愈的——不给工具动作建议，只建议 switch_mode
+//（由用户执行 /mode 切换，agent 无权自切）。
 func (h *ExecModeGuardHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecision {
 	if h.Modes == nil || h.Modes.GetExec() != modes.ExecReadonly {
 		return hook.ToolHookDecision{Action: hook.Continue}
 	}
+	reasonCode := ReasonExecModePrefix + h.Modes.GetExec().String()
 	return hook.ToolHookDecision{
 		Action:   hook.Abort,
 		HookName: h.Name(),
@@ -71,5 +74,12 @@ func (h *ExecModeGuardHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecision
 				"如需执行写操作，请先用 /mode exec normal 切换执行权限模式，或在配置文件 modes.exec 中调整",
 			hctx.ToolName,
 		),
+		ReasonCode: reasonCode,
+		Suggestions: []hook.Suggestion{
+			hook.NewSuggestion(h.Name(), reasonCode, hctx.ToolName, false,
+				hook.EscalationAction(hook.SuggestKindSwitchMode,
+					"请求用户用 /mode exec normal 切换执行权限模式后再写（agent 无权自切模式）"),
+			),
+		},
 	}
 }

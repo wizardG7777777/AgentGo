@@ -30,18 +30,8 @@ var AllToolNames = []string{
 	"request_user_input",
 
 	// PlanControlGroup（是否可见由 profile/内置 Scheduler 装配决定）
-	"continue_waiting",
-	"define_acceptance_spec",
-	"ensure_acceptance_run",
-	"submit_acceptance_result",
 	"submit_task_result",
 	"request_replan",
-	"supersede_tasks",
-	"finalize_plan",
-	"mark_plan_blocked",
-	"submit_plan_for_review",
-	"get_retired_node",
-	"get_acceptance_evidence",
 
 	// SchedulerGroup（scheduler 专属，不走 profile 配置）
 	"cancel_task",
@@ -53,6 +43,11 @@ var AllToolNames = []string{
 	// AgentTemplateGroup（scheduler 专属，不走 profile 配置）
 	"list_agent_templates",
 	"provision_agent_team",
+
+	// GraphControlGroup（scheduler 专属，不走 profile 配置）
+	"submit_graph",
+	"read_graph",
+	"patch_graph",
 }
 
 // ValidateToolNames 校验给定的工具名列表是否全部在 AllToolNames 中。

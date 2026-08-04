@@ -97,5 +97,12 @@ func (h *RequireReadBeforeWriteHook) Run(hctx hook.ToolHookContext) hook.ToolHoo
 				"若任务真的需要在不读取的情况下修改，先 read_file 一次再 write_file。",
 			target,
 		),
+		ReasonCode: ReasonReadBeforeWrite,
+		Suggestions: []hook.Suggestion{
+			hook.NewSuggestion(h.Name(), ReasonReadBeforeWrite, target, true,
+				hook.ToolCallAction("read_file", map[string]any{"path": target},
+					"先读取目标文件，再重新执行本次写入"),
+			),
+		},
 	}
 }

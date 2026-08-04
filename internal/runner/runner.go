@@ -20,6 +20,7 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
+	"agentgo/internal/effect"
 	"agentgo/internal/gate"
 	"agentgo/internal/interaction"
 	"agentgo/internal/llm"
@@ -28,11 +29,12 @@ import (
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
 	"agentgo/internal/output"
-	"agentgo/internal/plan"
+	"agentgo/internal/prompt"
 	reactorbuiltin "agentgo/internal/reactor/builtin"
 	"agentgo/internal/roster"
 	"agentgo/internal/shell"
 	"agentgo/internal/store"
+	"agentgo/internal/taskmem"
 	"agentgo/internal/tools"
 	"agentgo/internal/trace"
 	"agentgo/internal/webtool"
@@ -59,8 +61,10 @@ type RunnerDeps struct {
 	// AgentHook 子系统已被 trace.Event + Reactor 取代。
 	// Memory 是 v5 Phase 1 引入的 Memory System 共享存储（MemoryManageSystem.md MM5）。
 	// 为 nil 时 Agent 退化为不读取/不写入（行为等价于 v4 无 team-awareness）。
-	Memory          memory.Store
-	PlanCoordinator *plan.Coordinator
+	Memory memory.Store
+	// TaskMemStore 是 V6 §3 Task Memory（CM2，internal/taskmem）的共享存储。
+	// 为 nil 时 Agent 的 Task Memory 链路整链关闭（不创建/更新/注入）。
+	TaskMemStore *taskmem.Store
 	// RouteValidator is the shared runtime route authority. It lets every
 	// publish_task caller enforce Plan-private Team ownership, not only the
 	// Scheduler. Nil preserves compatibility for isolated runner tests.
@@ -76,7 +80,7 @@ type RunnerDeps struct {
 	ShellFilter    *shell.CommandFilter
 	Interactions   *interaction.Service
 	SessionID      func() string
-	// Modes 是三轴模式 store：exec 轴驱动 strict 写工具审批（WrapHandler）与
+	// Modes 是两轴模式 store：exec 轴驱动 strict 写工具审批（WrapHandler）与
 	// run_shell 的 strict/yolo 短路；nil 等价 normal。
 	// Bootstrap 透传与 scheduler / UI Hub 相同的实例。
 	Modes *modes.Store
@@ -85,6 +89,10 @@ type RunnerDeps struct {
 	// runtime_builder.withWorkspaceManager 握手缝）。nil 表示未启用隔离——
 	// 声明 Isolation 的任务在认领时 fail-closed（capability_violation）。
 	WorkspaceManager *workspace.Manager
+	// EffectJournal 是 V6 §4 H2b 共享副作用账本（internal/effect，bootstrap
+	// 装配注入）：写工具 / run_shell / send_message / workspace 合并经它记录
+	// prepared/settled。nil 时全部埋点降级为不记账（行为与引入账本前一致）。
+	EffectJournal *effect.Journal
 	// UserOutput 是用户可见内容的输出目标。非 nil 时，agent 的 IsUserFacing 输出
 	// 和 scheduler 的 report_done 会写入此处，而不是直接 fmt.Printf。
 	UserOutput io.Writer
@@ -103,7 +111,6 @@ type RunnerDeps struct {
 	RosterWaitTimeoutSec  int
 	ShellTimeoutSec       int
 	MaxSubtaskDepth       int
-	TransferNoteMaxTokens int
 	ProgressNotifyEnabled bool
 	HashlineEnabled       bool // §7
 }
@@ -166,7 +173,7 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	groups := resolveToolGroups(rt.InstanceID, rt.AllowedTools, deps, holder, finHolder, submitState, fileCache, workdir, interactionWaitHook)
 	tools.RegisterGroups(toolReg, groups...)
 
-	// strict 执行权限强制层（v5 三轴 exec）：exec=strict 时对 write_file /
+	// strict 执行权限强制层：exec=strict 时对 write_file /
 	// edit_file 逐次创建 file_write 审批 Interaction；其它档位透传（readonly
 	// 由 exec-mode-guard Gate 拦截）。与 scheduler.New 内同款装配对称。
 	wrapFileWriteApproval(toolReg, deps, rt.InstanceID, interactionWaitHook)
@@ -183,39 +190,24 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 		rt.TeamAwareness,
 		rt.SystemPrompt,
 	)
+	// V6 §2 P1a：prompt 编译身份——agent_role 组件的 Version 取
+	// system_prompt_file 内容 sha256 前 12（文件在启动期一次性读入，
+	// 与 rt.SystemPrompt 同字节）。
+	llmExec.SetPromptVersion("file:" + prompt.DigestText(rt.SystemPrompt))
+	// finalizing fence：submit_task_result 被接受后，同一响应中排在其后的
+	// 工具调用不再 dispatch（executor 与提交通道共享同一 finHolder）。
+	llmExec.SetFinalizationChecker(finHolder)
 	executor := agent.TaskExecutor(llmExec.Execute)
-	if deps.PlanCoordinator != nil {
-		inner := executor
-		executor = func(ctx context.Context, task *model.Task, depResults map[string]string, history []agent.HistoryEntry) (agent.ExecuteResult, error) {
-			if err := requireRunnablePlan(deps.PlanCoordinator, task); err != nil {
-				return agent.ExecuteResult{}, err
-			}
-			guardedCtx := agent.WithToolDispatchGuard(ctx, func(dispatchCtx context.Context, guardedTask *model.Task) error {
-				return requirePlanToolDispatch(dispatchCtx, deps.PlanCoordinator, deps.Store, guardedTask)
-			})
-			result, err := inner(guardedCtx, task, depResults, history)
-			if task != nil && task.PlanID != "" {
-				tokens := int64(result.PromptTokens + result.CompletionTokens)
-				latest, latestErr := deps.PlanCoordinator.Store().GetPlan(task.PlanID)
-				if tokens > 0 && latestErr == nil && latest.Status == model.PlanStatusRunning {
-					_, usageErr := deps.PlanCoordinator.RecordUsage(context.Background(), task.PlanID, tokens, 0)
-					if usageErr != nil {
-						log.Printf("[runner] record plan token usage task=%s: %v", task.ID, usageErr)
-					}
-				}
-				latest, latestErr = deps.PlanCoordinator.Store().GetPlan(task.PlanID)
-				if latestErr == nil && (latest.Status == model.PlanStatusPausedAwaitingDecision || latest.Status == model.PlanStatusBlocked) {
-					trace.Emit(trace.Event{Kind: trace.KindPlanPaused, TaskID: task.ID, Reason: latest.PauseReason,
-						Plan: &trace.PlanTraceContext{PlanID: latest.ID, PlanRevision: latest.CurrentRevision,
-							ExecutionStateVersion: latest.ExecutionStateVersion, AcceptanceSpecRevision: latest.CurrentAcceptanceSpecRevision,
-							GraphDigest: latest.CurrentGraphDigest}})
-				}
-				if boundaryErr := requireRunnablePlan(deps.PlanCoordinator, task); boundaryErr != nil {
-					return result, boundaryErr
-				}
-			}
-			return result, err
-		}
+	// 工具派发活性守卫（V6 C6b 起取代 Plan 控制面租约校验）：同一次 LLM
+	// 响应可能携带多个有序工具调用，前面的调用可能已同步触发任务取消或
+	// 终态迁移；只在响应前检查一次会让后续调用在失效权限下继续产生副作用，
+	// 因此每次具体工具派发前都重查活性。
+	inner := executor
+	executor = func(ctx context.Context, task *model.Task, depResults map[string]string, history []agent.HistoryEntry) (agent.ExecuteResult, error) {
+		guardedCtx := agent.WithToolDispatchGuard(ctx, func(dispatchCtx context.Context, guardedTask *model.Task) error {
+			return requireLiveToolDispatch(dispatchCtx, deps.Store, guardedTask)
+		})
+		return inner(guardedCtx, task, depResults, history)
 	}
 
 	a = agent.NewAgent(
@@ -224,10 +216,10 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 		deps.Store,
 		deps.Roster,
 		executor,
-		rt.AgentMaxLoops,
 	)
-	a.PlanIDScope = rt.PlanIDScope
 	a.ToolSwapper = llmExec // per-node 能力：按任务换入/恢复工具过滤视图
+	// V6 §2 P1a：prompt 编译的静态身份源（同一 executor 句柄）。
+	a.PromptSource = llmExec
 	a.CancelRegistry = deps.CancelRegistry
 	a.MaxRetries = rt.TaskMaxRetries
 	// E3：空闲退出阈值从配置链路接入（AgentRuntimeConfig.IdleThreshold，
@@ -235,8 +227,7 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	// 与旧硬编码 0 行为一致）。
 	a.IdleThreshold = rt.IdleThreshold
 	a.CompactTokenThreshold = rt.EnforceCompactTokenThreshold
-	a.CompactKeepRecent = 3 // v3 数值；与 internal/agent 包级常量 keepRecentForTruncate 同源管理（§11.5.4）
-	a.TransferNoteMaxTokens = deps.TransferNoteMaxTokens
+	a.CompactKeepRecent = 3 // v3 数值（§11.5.4）
 	a.ProgressNotifyEnabled = deps.ProgressNotifyEnabled
 	a.Activity = deps.Activity
 	if deps.Activity != nil {
@@ -247,21 +238,20 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 		deps.Activity.RegisterAgent(rt.InstanceID, agentType)
 	}
 	a.Model = rt.Model
-	a.ContextLimit = rt.ContextLimit
 	a.OnTaskStart = func(taskID string) { holder.Set(taskID); finHolder.Set(taskID) }
 	a.FinalizationChecker = finHolder
 	a.SubmitState = submitState
 	// 按任务写时复制隔离：共享 Manager（生命周期/合并）+ 本 Runner 独立
-	// Swapper（视图换入）；replan 登记通道复用 plan.Coordinator（与
-	// submit_task_result / request_replan 工具同款 RequestReplan）。
+	// Swapper（视图换入）；合并冲突/失败时由 agent 侧发布通用 replan 唤醒
+	// 任务交 Scheduler 裁决（见 internal/agent/replan_wake.go）。
 	a.WorkspaceManager = deps.WorkspaceManager
 	a.WorkspaceActivator = workdir
+	// H2b Effect Journal：workspace 合并埋点的账本注入（工具层账本经
+	// resolveToolGroups 注入各 ToolGroup）。
+	a.EffectJournal = deps.EffectJournal
 	// expected-artifacts 磁盘兜底：账本失忆场景（重试换任务 ID）stat 盘上
 	// 真实文件代替强制重写，解析口径与 record-artifact 一致。
 	a.ArtifactResolver = agent.NewArtifactPhysicalResolver(deps.ProjectRoot, deps.WorkspaceManager)
-	if deps.PlanCoordinator != nil {
-		a.WorkspaceReplanRequester = deps.PlanCoordinator
-	}
 	// v5 Phase 4：holder 清理迁移到 task-end-callback Sync Reactor。
 	// 旧路径 (a.OnTaskEnd 闭包) 在 processTask defer 链中执行；新路径在
 	// trace.KindTaskCompleted/Failed/Blocked/Cancelled/Retry emit 同步阶段执行。
@@ -293,6 +283,9 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 		a.MailRegistry = deps.MBRegistry
 	}
 	a.Memory = deps.Memory
+	a.TaskMemStore = deps.TaskMemStore
+	// V6 §4 H1：exec 轴模式源注入（ExecutionLease 的 Policy 交集输入）。
+	a.Modes = deps.Modes
 	a.UserOutput = deps.UserOutput
 	a.StreamOutput = deps.StreamOutput
 
@@ -308,122 +301,40 @@ func wrapFileWriteApproval(toolReg *agent.ToolRegistry, deps RunnerDeps, instanc
 	toolReg.WrapHandler("edit_file", approver.WrapHandler("edit_file"))
 }
 
-func requireRunnablePlan(coordinator *plan.Coordinator, task *model.Task) error {
-	if coordinator == nil || task == nil || task.PlanID == "" {
-		return nil
-	}
-	p, budgetErr := coordinator.CheckBudget(context.Background(), task.PlanID)
-	if budgetErr != nil && p == nil {
-		return budgetErr
-	}
-	if p == nil {
-		return fmt.Errorf("plan %s budget check returned no plan", task.PlanID)
-	}
-	if p.Status != model.PlanStatusRunning {
-		if budgetErr != nil {
-			return fmt.Errorf("%w: plan %s is %s: %v", agent.ErrExecutionSuspended, p.ID, p.Status, budgetErr)
-		}
-		return fmt.Errorf("%w: plan %s is %s", agent.ErrExecutionSuspended, p.ID, p.Status)
-	}
-	if task.NodeRole == model.PlanNodeRoleController && p.ActiveDecisionTaskID != task.ID {
-		return fmt.Errorf("%w: controller task %s is not active for plan %s", agent.ErrExecutionSuspended, task.ID, p.ID)
-	}
-	if budgetErr != nil {
-		return budgetErr
-	}
-	return nil
-}
-
-// requirePlanToolDispatch revalidates the Task-backed execution lease at the
-// boundary immediately before every concrete tool call. A model response may
-// contain several ordered calls; a prior call can synchronously trigger Task
-// cancellation, DAG retirement, or formal acceptance submission. Checking only
-// once before the response would allow a later side effect to run under stale
-// authority.
-func requirePlanToolDispatch(ctx context.Context, coordinator *plan.Coordinator, taskStore store.TaskStore, task *model.Task) error {
+// requireLiveToolDispatch 在每次具体工具调用前做活性检查（V6 C6b 起取代
+// requirePlanToolDispatch 的 Plan 控制面租约校验）。同一次 LLM 响应可能
+// 携带多个有序工具调用，前面的调用可能已同步触发任务取消或终态迁移；只在
+// 响应前检查一次会让后续调用在失效的执行权限下继续产生副作用。
+//
+// 检查项：(a) dispatch ctx 未取消；(b) 任务经 Store 重读仍为 processing。
+// 任一不满足即返回中文错误，中止本轮工具派发。taskStore 为 nil（单测直构）
+// 时退化为仅 ctx 检查，与旧无守卫行为兼容。
+func requireLiveToolDispatch(ctx context.Context, taskStore store.TaskStore, task *model.Task) error {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("%w: task context is no longer active: %v", agent.ErrExecutionSuspended, err)
+			return fmt.Errorf("任务执行上下文已取消，中止本轮工具派发: %v", err)
 		}
 	}
-	if err := requireRunnablePlan(coordinator, task); err != nil {
-		return err
-	}
-	if coordinator == nil || task == nil || task.PlanID == "" {
+	if task == nil || taskStore == nil {
 		return nil
 	}
-	if taskStore == nil {
-		return fmt.Errorf("%w: task store is unavailable for planned task %s", agent.ErrExecutionSuspended, task.ID)
-	}
-
 	latest, err := taskStore.GetTask(task.ID)
 	if err != nil {
-		return fmt.Errorf("%w: reload planned task %s: %v", agent.ErrExecutionSuspended, task.ID, err)
+		return fmt.Errorf("重读任务 %s 状态失败，中止本轮工具派发: %v", task.ID, err)
 	}
-	if latest.PlanID != task.PlanID {
-		return fmt.Errorf("%w: task %s plan identity changed from %s to %s",
-			agent.ErrExecutionSuspended, task.ID, task.PlanID, latest.PlanID)
+	if latest == nil {
+		return fmt.Errorf("任务 %s 已不存在，中止本轮工具派发", task.ID)
 	}
 	if latest.Status != model.TaskStatusProcessing {
-		return fmt.Errorf("%w: task %s is %s, not processing", agent.ErrExecutionSuspended, task.ID, latest.Status)
+		return fmt.Errorf("任务 %s 当前状态为 %s（非 processing），中止本轮工具派发", task.ID, latest.Status)
 	}
-
-	p, err := coordinator.Store().GetPlan(task.PlanID)
-	if err != nil {
-		return fmt.Errorf("%w: reload plan %s: %v", agent.ErrExecutionSuspended, task.PlanID, err)
-	}
-	if p.Status != model.PlanStatusRunning {
-		return fmt.Errorf("%w: plan %s is %s", agent.ErrExecutionSuspended, p.ID, p.Status)
-	}
-	if latest.NodeRole == model.PlanNodeRoleController {
-		if p.ActiveDecisionTaskID != latest.ID {
-			return fmt.Errorf("%w: controller task %s is not active for plan %s", agent.ErrExecutionSuspended, latest.ID, p.ID)
-		}
-		return nil
-	}
-	if task.NodeRole == model.PlanNodeRoleController {
-		return fmt.Errorf("%w: task %s controller role no longer matches durable task facts", agent.ErrExecutionSuspended, task.ID)
-	}
-
-	node, ok := p.Nodes[latest.ID]
-	if !ok {
-		return fmt.Errorf("%w: task %s is not registered in current plan %s", agent.ErrExecutionSuspended, latest.ID, p.ID)
-	}
-	if latest.NodeRole != node.Role {
-		return fmt.Errorf("%w: task %s role %s does not match plan role %s",
-			agent.ErrExecutionSuspended, latest.ID, latest.NodeRole, node.Role)
-	}
-	if node.RetiredRevision > 0 || latest.RetiredRevision > 0 || !containsTaskID(p.CurrentNodeIDs, latest.ID) {
-		return fmt.Errorf("%w: task %s was retired from plan %s", agent.ErrExecutionSuspended, latest.ID, p.ID)
-	}
-
-	if node.Role == model.PlanNodeRoleAcceptance {
-		if latest.AcceptanceRunID == "" {
-			return fmt.Errorf("%w: acceptance task %s is not bound to an AcceptanceRun", agent.ErrExecutionSuspended, latest.ID)
-		}
-		run, ok := p.AcceptanceRuns[latest.AcceptanceRunID]
-		if !ok || run.RunnerTaskID != latest.ID {
-			return fmt.Errorf("%w: acceptance task %s does not own run %s",
-				agent.ErrExecutionSuspended, latest.ID, latest.AcceptanceRunID)
-		}
-		if run.ResultID != "" {
-			return fmt.Errorf("%w: acceptance run %s already submitted result %s; further tools are frozen",
-				agent.ErrExecutionSuspended, run.ID, run.ResultID)
-		}
-		if run.Status != "pending" && run.Status != "running" {
-			return fmt.Errorf("%w: acceptance run %s is %s", agent.ErrExecutionSuspended, run.ID, run.Status)
-		}
+	// V6 §4 H1：执行租约已撤销（终态 / finalizing 被接受）后任何工具
+	// dispatch 拒绝——与 finalizing fence 互补的防御层（fence 拦截同一
+	// 响应内的尾随调用，本检查覆盖所有经 Store 重读可见的撤销事实）。
+	if latest.Lease != nil && latest.Lease.Revoked {
+		return fmt.Errorf("任务 %s 的执行租约已撤销（digest=%s），中止本轮工具派发", task.ID, latest.Lease.Digest)
 	}
 	return nil
-}
-
-func containsTaskID(ids []string, target string) bool {
-	for _, id := range ids {
-		if id == target {
-			return true
-		}
-	}
-	return false
 }
 
 // ID 返回该 Runner 的实例 ID（如 "worker-1"）。

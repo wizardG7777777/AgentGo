@@ -51,6 +51,14 @@ type ToolHookDecision struct {
 	// HookName 记录产生本次决策的 hook 名，供错误消息和日志追溯。
 	// Continue 时可为空；Abort 时由 hook 填写自身 Name()。
 	HookName string
+
+	// ReasonCode 是 V6 §4 H2a 的稳定拒绝原因码（snake_case），Abort 时填写。
+	// 空串表示本 hook 尚未迁移到结构化建议——Harness 走旧纯文本注入路径，
+	// 保持向后兼容（逐步迁移，不强迫全部 hook 一次改完）。
+	ReasonCode string
+	// Suggestions 是结构化恢复提示候选（稳定 ID + 原因码 + retryable +
+	// 有界动作清单）。nil 时 Harness 走旧文本路径。
+	Suggestions []Suggestion
 }
 
 // ToolHook 是单个 hook 的接口。每个实现必须是无状态或并发安全的——
@@ -65,7 +73,7 @@ type ToolHook interface {
 	// Phase 1 只做精确字符串匹配或通配 "*"。
 	Matches(toolName string) bool
 	// Priority 数字越小越先执行。范围 [0, 1000]。
-	// 约定：0-100 系统强制（如 PathBoundary）、500 默认、900-1000 观察类（如 RecordArtifact）。
+	// 约定：0-100 系统强制（如 PathBoundary）、500 默认、900-1000 观察类。
 	Priority() int
 	// Run 执行 hook 逻辑。接收值传 ToolHookContext 副本，返回决策。
 	// Post 阶段的返回值被 Registry 忽略（post 阶段纯观察）。

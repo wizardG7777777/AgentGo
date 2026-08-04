@@ -29,7 +29,6 @@ type fakeController struct {
 	steerAgentID        string
 	steerMessage        string
 	steerErr            error
-	modeCalls           []bool
 	execModeCalls       []string
 	execModeErr         error
 	topoModeCalls       []string
@@ -45,6 +44,9 @@ type fakeController struct {
 	interactionCalls    int
 	sessionsList        []ui.SessionInfo
 	sessionsErr         error
+	auditTaskID         string
+	auditErr            error
+	auditCalls          int
 	quitCalled          bool
 }
 
@@ -68,8 +70,6 @@ func (f *fakeController) SteerAgent(agentID, message string) error {
 	return f.steerErr
 }
 
-func (f *fakeController) SetMode(plan bool) { f.modeCalls = append(f.modeCalls, plan) }
-
 func (f *fakeController) SetExecMode(mode string) error {
 	f.execModeCalls = append(f.execModeCalls, mode)
 	return f.execModeErr
@@ -79,14 +79,6 @@ func (f *fakeController) SetTopoMode(mode string) error {
 	f.topoModeCalls = append(f.topoModeCalls, mode)
 	return f.topoModeErr
 }
-
-// ApprovePlan / RejectPlan / PendingPlanReviews 仅为满足 ui.Controller 接口
-// 扩展而存在——dashboard 本切片不新增对应端点，fake 返回零值。
-func (f *fakeController) ApprovePlan(idPrefix string) (string, error) { return "", nil }
-
-func (f *fakeController) RejectPlan(idPrefix string) (string, error) { return "", nil }
-
-func (f *fakeController) PendingPlanReviews() ([]ui.PlanReviewItem, error) { return nil, nil }
 
 func (f *fakeController) NewSession() (string, error) { return f.newSessID, f.newSessErr }
 
@@ -110,6 +102,11 @@ func (f *fakeController) RespondInteraction(_ context.Context, input interaction
 		}
 	}
 	return f.interactionResult, f.interactionErr
+}
+
+func (f *fakeController) RequestAgentAudit() (string, error) {
+	f.auditCalls++
+	return f.auditTaskID, f.auditErr
 }
 
 func (f *fakeController) RequestQuit() { f.quitCalled = true }
@@ -187,17 +184,22 @@ func TestControlEndpoints_MapToController(t *testing.T) {
 		}
 	})
 
-	t.Run("mode gate（兼容旧 body）", func(t *testing.T) {
+	t.Run("mode gate 已移除（V6 迁移诊断）", func(t *testing.T) {
+		// 旧 body {"mode":...} 与新式 axis=gate 一律 400 + 迁移诊断，不触达 Controller
 		status, body := post(t, ts, "/api/mode", "", `{"mode":"plan"}`)
-		if status != http.StatusOK || body["axis"] != "gate" || body["value"] != "plan" || body["mode"] != "plan" {
-			t.Fatalf("status=%d body=%v", status, body)
+		if status != http.StatusBadRequest || !strings.Contains(body["error"].(string), "gate 轴已于 V6 移除") {
+			t.Fatalf("旧 body status=%d body=%v", status, body)
 		}
-		status, _ = post(t, ts, "/api/mode", "", `{"axis":"gate","value":"immediate"}`)
-		if status != http.StatusOK {
-			t.Fatalf("status=%d", status)
+		status, body = post(t, ts, "/api/mode", "", `{"axis":"gate","value":"immediate"}`)
+		if status != http.StatusBadRequest || !strings.Contains(body["error"].(string), "gate 轴已于 V6 移除") {
+			t.Fatalf("axis=gate status=%d body=%v", status, body)
 		}
-		if len(fc.modeCalls) != 2 || !fc.modeCalls[0] || fc.modeCalls[1] {
-			t.Fatalf("modeCalls=%v，期望 [true false]", fc.modeCalls)
+		status, body = post(t, ts, "/api/mode", "", `{"axis":"layout","value":"team"}`)
+		if status != http.StatusBadRequest || body["error"] != "axis 仅允许 exec / topo" {
+			t.Fatalf("未知 axis 应只列出当前两轴: status=%d body=%v", status, body)
+		}
+		if len(fc.execModeCalls) != 0 || len(fc.topoModeCalls) != 0 {
+			t.Fatalf("gate 请求不应触达 Controller: exec=%v topo=%v", fc.execModeCalls, fc.topoModeCalls)
 		}
 	})
 
@@ -350,7 +352,7 @@ func TestControlEndpoints_Validation(t *testing.T) {
 	}
 	// 校验失败不得触达 Controller
 	if fc.userText != "" || fc.cancelPrefix != "" || fc.steerAgentID != "" ||
-		len(fc.modeCalls) != 0 || len(fc.execModeCalls) != 0 || len(fc.topoModeCalls) != 0 ||
+		len(fc.execModeCalls) != 0 || len(fc.topoModeCalls) != 0 ||
 		fc.switchID != "" || fc.interactionCalls != 0 {
 		t.Fatalf("校验失败的请求触达了 Controller: %+v", fc)
 	}
@@ -427,20 +429,20 @@ func TestControlEndpoints_Auth(t *testing.T) {
 	ts := httptest.NewServer(srv.handler())
 	t.Cleanup(ts.Close)
 
-	status, _ := post(t, ts, "/api/mode", "", `{"mode":"plan"}`)
+	status, _ := post(t, ts, "/api/mode", "", `{"axis":"exec","value":"strict"}`)
 	if status != http.StatusUnauthorized {
 		t.Fatalf("无凭据 status=%d，期望 401", status)
 	}
-	if len(fc.modeCalls) != 0 {
+	if len(fc.execModeCalls) != 0 {
 		t.Fatal("未授权请求不得触达 Controller")
 	}
-	status, _ = post(t, ts, "/api/mode", "wrong", `{"mode":"plan"}`)
+	status, _ = post(t, ts, "/api/mode", "wrong", `{"axis":"exec","value":"strict"}`)
 	if status != http.StatusUnauthorized {
 		t.Fatalf("错误凭据 status=%d，期望 401", status)
 	}
-	status, _ = post(t, ts, "/api/mode", "secret", `{"mode":"plan"}`)
-	if status != http.StatusOK || len(fc.modeCalls) != 1 {
-		t.Fatalf("正确凭据 status=%d modeCalls=%v", status, fc.modeCalls)
+	status, _ = post(t, ts, "/api/mode", "secret", `{"axis":"exec","value":"strict"}`)
+	if status != http.StatusOK || len(fc.execModeCalls) != 1 {
+		t.Fatalf("正确凭据 status=%d execModeCalls=%v", status, fc.execModeCalls)
 	}
 }
 

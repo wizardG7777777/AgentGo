@@ -75,10 +75,8 @@ func buildAdhocRuntime(
 		Model:        model,
 		SystemPrompt: systemPrompt,
 
-		AgentMaxLoops:                pickInt(override.AgentMaxLoops, base.AgentMaxLoops),
 		TaskMaxRetries:               pickInt(override.TaskMaxRetries, base.TaskMaxRetries),
 		EnforceCompactTokenThreshold: pickInt(override.EnforceCompactTokenThreshold, base.EnforceCompactTokenThreshold),
-		ContextLimit:                 pickInt(override.ContextLimit, base.ContextLimit),
 		IdleThreshold:                idleThreshold,
 	}
 	return rt, nil

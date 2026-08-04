@@ -47,7 +47,7 @@ func TestHub_EmitTraceEventBroadcasts(t *testing.T) {
 
 func TestProjectTraceEventAddsSafeDecisionContext(t *testing.T) {
 	ev := trace.Event{
-		Kind: trace.KindAcceptanceCompleted, AgentID: "scheduler-1", Tool: "ensure_acceptance_run",
+		Kind: trace.KindTaskFailed, AgentID: "scheduler-1", Tool: "run_shell",
 		Args: map[string]any{
 			"runner_kind": "verifier",
 			"api_token":   "must-not-leak",
@@ -55,13 +55,10 @@ func TestProjectTraceEventAddsSafeDecisionContext(t *testing.T) {
 			"nested":      map[string]any{"password": "also-secret", "path": "internal/tui/feed.go"},
 		},
 		CallID: "call-1", ResultLen: 42,
-		Plan:       &trace.PlanTraceContext{PlanID: "plan-1", PlanRevision: 7, ExecutionStateVersion: 19, AcceptanceSpecRevision: 3},
-		Acceptance: &trace.AcceptanceTraceContext{AcceptanceRunID: "run-5", Status: "valid", Verdict: "fail", Reason: "tests failed"},
+		Reason: "tests failed",
 	}
 	got := ProjectTraceEvent(ev)
-	if got.CallID != "call-1" || got.ResultLen != 42 || got.PlanID != "plan-1" || got.PlanRevision != 7 ||
-		got.ExecutionStateVersion != 19 || got.AcceptanceSpecRevision != 3 || got.AcceptanceRunID != "run-5" ||
-		got.AcceptanceStatus != "valid" || got.AcceptanceVerdict != "fail" || got.Message != "tests failed" {
+	if got.CallID != "call-1" || got.ResultLen != 42 || got.Message != "tests failed" {
 		t.Fatalf("decision context projection = %+v", got)
 	}
 	if strings.Contains(got.ArgsSummary, "must-not-leak") || strings.Contains(got.ArgsSummary, "also-secret") ||
@@ -81,7 +78,7 @@ func TestHub_EmitTraceEventMessagePriority(t *testing.T) {
 		{"error 优先", trace.Event{Kind: trace.KindError, Error: "boom", Reason: "r", Description: "d"}, "boom"},
 		{"reason 次之", trace.Event{Kind: trace.KindTaskFailed, Reason: "重试耗尽", Description: "d"}, "重试耗尽"},
 		{"description 兜底", trace.Event{Kind: trace.KindTaskPublished, Description: "演示任务"}, "演示任务"},
-		{"全空", trace.Event{Kind: trace.KindTokenStats}, ""},
+		{"全空", trace.Event{Kind: trace.KindLLMCallStart}, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -103,7 +100,7 @@ func TestHub_EmitTraceEventZeroSubscriber(t *testing.T) {
 	// 启动后仍无订阅者，同样 no-op。
 	h2 := startHub(t, Deps{})
 	for i := 0; i < 100; i++ {
-		h2.EmitTraceEvent(trace.Event{Kind: trace.KindTokenStats, AgentID: "a1"})
+		h2.EmitTraceEvent(trace.Event{Kind: trace.KindLLMCallEnd, AgentID: "a1"})
 	}
 }
 
@@ -140,15 +137,15 @@ func TestHub_EmitTraceEventSlowSubscriberDrops(t *testing.T) {
 }
 
 // TestHub_SessionTokenAccumulation 验证 session 级 token 累加器：
-// token_stats 事件逐条累加（每次 LLM 调用一条），refreshSnapshot 整体替换
-// 快照不抹掉累计值；其它 kind 不纳入（避免与 llm_call_end 双计）。
+// llm_call_end 事件逐条累加（每次 LLM 调用恰好一条，V6 起为唯一 token 账本），
+// refreshSnapshot 整体替换快照不抹掉累计值；其它 kind 不纳入。
 func TestHub_SessionTokenAccumulation(t *testing.T) {
 	h := startHub(t, Deps{})
 
-	h.EmitTraceEvent(trace.Event{Kind: trace.KindTokenStats, AgentID: "worker-1", PromptTokens: 1000, CompletionTokens: 100})
-	h.EmitTraceEvent(trace.Event{Kind: trace.KindTokenStats, AgentID: "verifier-team-x-1", PromptTokens: 2000, CompletionTokens: 200})
-	// llm_call_end 同样载本轮 token，但不得纳入（与 token_stats 双计）。
-	h.EmitTraceEvent(trace.Event{Kind: trace.KindLLMCallEnd, AgentID: "worker-1", PromptTokens: 9999, CompletionTokens: 999})
+	h.EmitTraceEvent(trace.Event{Kind: trace.KindLLMCallEnd, AgentID: "worker-1", PromptTokens: 1000, CompletionTokens: 100})
+	h.EmitTraceEvent(trace.Event{Kind: trace.KindLLMCallEnd, AgentID: "verifier-team-x-1", PromptTokens: 2000, CompletionTokens: 200})
+	// llm_call_start 不载 token，不得纳入累加。
+	h.EmitTraceEvent(trace.Event{Kind: trace.KindLLMCallStart, AgentID: "worker-1"})
 
 	snap := h.Snapshot()
 	if snap.SessionPromptTokens != 3000 || snap.SessionCompletionTokens != 300 || snap.SessionCallCount != 2 {

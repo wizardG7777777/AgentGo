@@ -48,6 +48,10 @@ type unresolvedTemplate struct {
 // unresolvedLimits uses pointers so omitted values can receive defaults while
 // an explicitly configured zero remains an error instead of being mistaken
 // for omission.
+//
+// AgentMaxLoops 与 ContextLimit 已于 V6 移除：保留解析位以便对显式设置这些
+// 字段的旧模板给出明确的迁移诊断错误（与 config 层 llm.provider /
+// agent_max_loops 同款模式），而不是静默忽略。
 type unresolvedLimits struct {
 	AgentMaxLoops                *int `yaml:"agent_max_loops"`
 	TaskMaxRetries               *int `yaml:"task_max_retries"`
@@ -57,34 +61,23 @@ type unresolvedLimits struct {
 }
 
 var defaultLimits = Limits{
-	AgentMaxLoops:                10,
 	TaskMaxRetries:               3,
 	EnforceCompactTokenThreshold: 4000,
-	ContextLimit:                 16000,
 	MaxReplicas:                  4,
 }
 
 // Tools that can mutate or finalize the DAG/control plane are never grantable
 // through an AgentTemplate. request_replan is intentionally absent: workers
-// may request a decision but cannot perform it. submit_acceptance_result is
-// likewise allowed because formal verifier templates require it and its own
-// runtime guard binds it to the active AcceptanceRun.
+// may request a decision but cannot perform it. submit_task_result is
+// likewise allowed because formal verifier templates require it.
 var forbiddenTemplateTools = map[string]struct{}{
-	"publish_task":            {},
-	"continue_waiting":        {},
-	"define_acceptance_spec":  {},
-	"ensure_acceptance_run":   {},
-	"supersede_tasks":         {},
-	"finalize_plan":           {},
-	"mark_plan_blocked":       {},
-	"get_retired_node":        {},
-	"get_acceptance_evidence": {},
-	"cancel_task":             {},
-	"report_done":             {},
-	"report_progress":         {},
-	"probe_directory":         {},
-	"list_agent_templates":    {},
-	"provision_agent_team":    {},
+	"publish_task":         {},
+	"cancel_task":          {},
+	"report_done":          {},
+	"report_progress":      {},
+	"probe_directory":      {},
+	"list_agent_templates": {},
+	"provision_agent_team": {},
 }
 
 // Load builds a new immutable catalog. Built-ins are always present. Missing
@@ -348,16 +341,24 @@ func normalizeUniqueList(field string, values []string, required bool) ([]string
 }
 
 func resolveLimits(in unresolvedLimits) (Limits, error) {
+	// limits.agent_max_loops 已于 V6 移除（固定循环上限不再是终止条件，见
+	// docs/nextUpgrade-V6.md §5）：显式设置即迁移诊断，不静默忽略。
+	if in.AgentMaxLoops != nil {
+		return Limits{}, fmt.Errorf("limits.agent_max_loops was removed in V6: loops are bounded by structured terminal states, cancellation, deadlines and budgets, not a fixed round cap; delete this field from the template")
+	}
+	// limits.context_limit 已于 V6 移除（固定上下文硬限截断层已删除，见
+	// docs/nextUpgrade-V6.md §7.4）：显式设置即迁移诊断，不静默忽略。
+	if in.ContextLimit != nil {
+		return Limits{}, fmt.Errorf("limits.context_limit was removed in V6: context fitting is handled by history compaction and overflow retry, not a fixed hard cap; delete this field from the template")
+	}
 	out := defaultLimits
 	values := []struct {
 		name     string
 		provided *int
 		value    *int
 	}{
-		{"limits.agent_max_loops", in.AgentMaxLoops, &out.AgentMaxLoops},
 		{"limits.task_max_retries", in.TaskMaxRetries, &out.TaskMaxRetries},
 		{"limits.enforce_compact_token_threshold", in.EnforceCompactTokenThreshold, &out.EnforceCompactTokenThreshold},
-		{"limits.context_limit", in.ContextLimit, &out.ContextLimit},
 		{"limits.max_replicas", in.MaxReplicas, &out.MaxReplicas},
 	}
 	for _, item := range values {
@@ -374,10 +375,8 @@ func resolveLimits(in unresolvedLimits) (Limits, error) {
 
 func fixedLimits(in Limits) unresolvedLimits {
 	return unresolvedLimits{
-		AgentMaxLoops:                intPtr(in.AgentMaxLoops),
 		TaskMaxRetries:               intPtr(in.TaskMaxRetries),
 		EnforceCompactTokenThreshold: intPtr(in.EnforceCompactTokenThreshold),
-		ContextLimit:                 intPtr(in.ContextLimit),
 		MaxReplicas:                  intPtr(in.MaxReplicas),
 	}
 }

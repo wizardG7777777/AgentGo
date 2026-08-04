@@ -129,7 +129,6 @@ func TestExportSnapshot_FieldMapping(t *testing.T) {
 		SystemPrompt:      "custom prompt",
 		Depth:             2,
 		ExpectedArtifacts: []string{"out.txt"},
-		TransferNote:      "note",
 		MailChainDepth:    3,
 		SchedulerBatch:    []string{"child-1", "child-2"},
 		LastResponse:      "last response",
@@ -170,9 +169,6 @@ func TestExportSnapshot_FieldMapping(t *testing.T) {
 	}
 	if snap.MailChainDepth != 3 {
 		t.Errorf("MailChainDepth = %d, want 3", snap.MailChainDepth)
-	}
-	if snap.TransferNote != "note" {
-		t.Errorf("TransferNote = %s, want 'note'", snap.TransferNote)
 	}
 	if len(snap.SchedulerBatch) != 2 || snap.SchedulerBatch[0] != "child-1" || snap.SchedulerBatch[1] != "child-2" {
 		t.Errorf("SchedulerBatch = %v, want [child-1 child-2]", snap.SchedulerBatch)
@@ -330,7 +326,6 @@ func TestExportImport_RoundTrip(t *testing.T) {
 		Priority:          5,
 		EventType:         "code",
 		ExpectedArtifacts: []string{"a.txt"},
-		TransferNote:      "note1",
 	}
 	s1.PublishTask(t1)
 	s1.AppendArtifact(t1.ID, "docs/out.md")
@@ -394,20 +389,13 @@ func TestExportImport_RoundTripV3RuntimeFields(t *testing.T) {
 
 	history := []byte(`[{"output":"command completed","tool_called":true,"tool_calls":[{"id":"call-1","name":"run_shell"}]}]`)
 	task := &model.Task{
-		Description:        "formal acceptance task",
-		EventSource:        "controller-1",
-		EventType:          "verify",
-		NodeRole:           model.PlanNodeRoleAcceptance,
-		PlanID:             "plan-1",
-		CreatedRevision:    7,
-		RetiredRevision:    9,
-		Supersedes:         []string{"old-check"},
-		AcceptanceRunID:    "acceptance-run-1",
-		PlanMutationSource: "acceptance",
-		SchedulerBatch:     []string{"child-a", "child-b"},
-		LastHistory:        history,
-		LastResponse:       "latest acceptance response",
-		PartialOutput:      "streamed so far",
+		Description:    "formal acceptance task",
+		EventSource:    "controller-1",
+		EventType:      "verify",
+		SchedulerBatch: []string{"child-a", "child-b"},
+		LastHistory:    history,
+		LastResponse:   "latest acceptance response",
+		PartialOutput:  "streamed so far",
 	}
 	if err := s1.PublishTask(task); err != nil {
 		t.Fatalf("PublishTask: %v", err)
@@ -416,6 +404,7 @@ func TestExportImport_RoundTripV3RuntimeFields(t *testing.T) {
 	callTime := time.Date(2026, 7, 13, 10, 11, 12, 345678901, time.UTC)
 	if err := s1.AppendToolCall(task.ID, ToolCallRecord{
 		Timestamp: callTime,
+		CallID:    "call-1",
 		AgentID:   "verifier-1",
 		ToolName:  "run_shell",
 		Args: map[string]any{
@@ -481,14 +470,6 @@ func TestExportImport_RoundTripV3RuntimeFields(t *testing.T) {
 	if got.PartialOutput != task.PartialOutput {
 		t.Errorf("PartialOutput = %q, want %q", got.PartialOutput, task.PartialOutput)
 	}
-	if got.PlanID != task.PlanID || got.NodeRole != task.NodeRole || got.CreatedRevision != task.CreatedRevision ||
-		got.RetiredRevision != task.RetiredRevision || got.AcceptanceRunID != task.AcceptanceRunID ||
-		got.PlanMutationSource != task.PlanMutationSource {
-		t.Fatalf("planned Task metadata mismatch: got=%+v want=%+v", got, task)
-	}
-	if len(got.Supersedes) != 1 || got.Supersedes[0] != "old-check" {
-		t.Fatalf("Supersedes = %v", got.Supersedes)
-	}
 	if string(got.LastHistory) != string(history) {
 		t.Fatalf("LastHistory = %s, want %s", got.LastHistory, history)
 	}
@@ -497,7 +478,7 @@ func TestExportImport_RoundTripV3RuntimeFields(t *testing.T) {
 		t.Fatalf("restored ToolCalls = %v, err=%v", calls, err)
 	}
 	call := calls[0]
-	if !call.Timestamp.Equal(callTime) || call.AgentID != "verifier-1" || !call.Success ||
+	if !call.Timestamp.Equal(callTime) || call.CallID != "call-1" || call.AgentID != "verifier-1" || !call.Success ||
 		call.Args["command"] != "go test ./..." || call.ExitCode == nil || *call.ExitCode != 0 {
 		t.Fatalf("restored ToolCall mismatch: %+v", call)
 	}
@@ -526,6 +507,24 @@ func TestImportSnapshotRejectsInvalidToolCallFacts(t *testing.T) {
 				t.Fatalf("ImportSnapshot error = %v", err)
 			}
 		})
+	}
+}
+
+func TestImportSnapshotAcceptsLegacyToolCallWithoutCallID(t *testing.T) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	s, _ := newTestStore(10, 100)
+	if err := s.ImportSnapshot([]session.TaskSnapshot{{
+		ID: "legacy-task", Status: "pending", CreatedAt: now,
+		ToolCalls: []session.ToolCallSnapshot{{
+			Timestamp: now, ToolName: "read_file",
+			Args: map[string]any{"path": "README.md"}, Success: true,
+		}},
+	}}); err != nil {
+		t.Fatalf("legacy snapshot without call_id must remain readable: %v", err)
+	}
+	calls, err := s.QueryToolCalls("legacy-task", "read_file")
+	if err != nil || len(calls) != 1 || calls[0].CallID != "" {
+		t.Fatalf("legacy tool call = %+v, err=%v", calls, err)
 	}
 }
 

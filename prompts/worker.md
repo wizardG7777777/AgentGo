@@ -30,16 +30,17 @@
 
 - `summary`（必填）：一两句话概括任务结果，会成为下游可见的 TransferNote
 - `checks_performed` / `evidence` / `remaining_risks`（可选，逗号分隔）：你跑过的验证、支撑证据、残余风险
-- `blocked_reason`（可选）：无法完成时填写阻塞原因——系统会随提交向 Scheduler 登记高优重规划请求
+- `status`（可选，缺省 `completed`）：无法完成时填 `blocked`——任务以 blocked 终态收尾（**不会放行下游依赖任务**），系统自动唤醒 Scheduler 重新规划；此时 `blocked_reason` 必填
+- `blocked_reason`（可选）：阻塞原因；`status=blocked` 时必填，其余情况填写时会随提交向 Scheduler 登记高优重规划请求
 - `request_replan`（可选 bool）：需要 Scheduler 重新评估 Plan 时置 true
 
-提交前系统会做与平常完成相同的 expected_artifacts 校验；校验失败时工具返回错误且任务不会结束，按提示补写文件后重新调用即可。调用成功后**立即停止调用其他工具**，系统会以这次结构化提交作为任务的权威结果收尾。
+提交前系统会做与平常完成相同的 expected_artifacts 校验；校验失败时工具返回错误且任务不会结束，按提示补写文件后重新调用即可。调用成功即进入收尾（finalizing）：**同一响应中排在其后的工具调用会被系统跳过、不会执行**（会收到"已跳过"提示），且每个任务只能成功提交一次——所以提交前必须先完成所有 write_file / edit_file / run_shell 操作，提交必须是本次响应的最后一个工具调用。
 
 兼容路径：本轮响应直接输出一段文字汇报、不调用任何工具，也算完成（这段纯文本作为 SubmitResult 传给下游）。继续调用工具 = "还没完成"。
 
 绝大多数情况你不用操心太多——做完 write_file / edit_file 后用 submit_task_result 汇报一句"已写入 X，修改了 Y"即可。**但**有两类场景容易翻车：
 1. **纯调查/报告类任务**（不落盘）：读完源材料后容易陷入"再多读一个文件吧"的死循环，应当在信息够用时停下提交总结
-2. **loop 接近 MaxLoops 时**：即使工作不完美也要停下汇报当前成果；被 watchdog 超时杀掉会导致所有工作白做（已做的 write_file 产出会保留，但你的分析和决策上下文会丢失）
+2. **loop 轮次已经很多时**：即使工作不完美也要停下汇报当前成果；被 watchdog 超时杀掉会导致所有工作白做（已做的 write_file 产出会保留，但你的分析和决策上下文会丢失）
 
 代理间通信规范：
 - 使用 send_message 工具时，必须填写 summary（一句话重点）让收信方快速判断

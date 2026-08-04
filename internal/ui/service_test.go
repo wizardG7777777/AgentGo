@@ -356,8 +356,8 @@ func TestHub_SubscribeGetsSnapshotSync(t *testing.T) {
 		PollBoard: func() []BoardTask {
 			return []BoardTask{{ID: "task-1", Desc: "演示任务", Status: "pending"}}
 		},
-		ModeGet:    func() string { return "plan" },
-		SessionGet: func() SessionInfo { return SessionInfo{ID: "sess-1", Status: "active"} },
+		ExecModeGet: func() string { return "strict" },
+		SessionGet:  func() SessionInfo { return SessionInfo{ID: "sess-1", Status: "active"} },
 	})
 
 	// 等 hub 的轮询循环完成至少一次快照刷新
@@ -377,8 +377,8 @@ func TestHub_SubscribeGetsSnapshotSync(t *testing.T) {
 	if len(snap.Tasks) != 1 || snap.Tasks[0].ID != "task-1" {
 		t.Fatalf("Tasks = %+v", snap.Tasks)
 	}
-	if snap.Mode != "plan" {
-		t.Fatalf("Mode = %q，期望 plan", snap.Mode)
+	if snap.ExecMode != "strict" {
+		t.Fatalf("ExecMode = %q，期望 strict", snap.ExecMode)
 	}
 	if snap.Session.ID != "sess-1" {
 		t.Fatalf("Session = %+v", snap.Session)
@@ -466,8 +466,8 @@ func TestHub_SnapshotAssembly(t *testing.T) {
 		PollBoard: func() []BoardTask {
 			return []BoardTask{{ID: "t1", Desc: "任务一", Status: "processing", Agents: []string{"worker-1"}}}
 		},
-		ModeGet:    func() string { return "immediate" },
-		SessionGet: func() SessionInfo { return SessionInfo{ID: "sess-9", TaskCount: 2} },
+		TopoModeGet: func() string { return "solo" },
+		SessionGet:  func() SessionInfo { return SessionInfo{ID: "sess-9", TaskCount: 2} },
 	})
 
 	waitFor(t, "快照轮询生效", func() bool { return len(h.Snapshot().Agents) == 2 })
@@ -479,8 +479,8 @@ func TestHub_SnapshotAssembly(t *testing.T) {
 	if len(snap.Tasks) != 1 || snap.Tasks[0].Agents[0] != "worker-1" {
 		t.Fatalf("Tasks = %+v", snap.Tasks)
 	}
-	if snap.Mode != "immediate" {
-		t.Fatalf("Mode = %q", snap.Mode)
+	if snap.TopoMode != "solo" {
+		t.Fatalf("TopoMode = %q", snap.TopoMode)
 	}
 	if snap.Session.ID != "sess-9" || snap.Session.TaskCount != 2 {
 		t.Fatalf("Session = %+v", snap.Session)

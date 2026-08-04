@@ -21,11 +21,11 @@ func (m *mockDepStore) GetTask(taskID string) (*model.Task, error) {
 	}
 	return nil, store.ErrTaskNotFound
 }
-func (m *mockDepStore) AppendArtifact(taskID string, path string) error           { return nil }
+func (m *mockDepStore) AppendArtifact(taskID string, path string) error { return nil }
 func (m *mockDepStore) AppendArtifactWithMeta(taskID string, path string, meta model.ArtifactMeta) error {
 	return nil
 }
-func (m *mockDepStore) GetToolCallHistory(taskID string) []store.ToolCallRecord   { return nil }
+func (m *mockDepStore) GetToolCallHistory(taskID string) []store.ToolCallRecord { return nil }
 func (m *mockDepStore) ScanPendingByEventSource(source, eventType string) []*model.Task {
 	return nil
 }

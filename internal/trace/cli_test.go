@@ -19,16 +19,9 @@ import (
 )
 
 func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
-	planCtx := &PlanTraceContext{
-		PlanID: "plan-1", PlanRevision: 3, ExecutionStateVersion: 5,
-		AcceptanceSpecRevision: 2, GraphDigest: "digest-3",
-	}
 	transition := &Transition{
 		PrevStatus: "processing", NewStatus: "failed", Cause: "test-cause",
 		CancelSource: "scheduler", RetryCount: 2,
-	}
-	planEvent := func(kind EventKind, reason string) Event {
-		return Event{Kind: kind, Reason: reason, Plan: planCtx}
 	}
 	cases := []struct {
 		name string
@@ -49,12 +42,14 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"tool_call", Event{Kind: KindToolCall, Tool: "read_file", CallID: "call-1", Args: map[string]any{"path": "a.go"}}, []string{"tool=read_file", "call_id=call-1", `args={"path":"a.go"}`}},
 		{"tool_result", Event{Kind: KindToolResult, Tool: "read_file", CallID: "call-1", Args: map[string]any{"path": "a.go"}, DurationMS: 8, ResultLen: 99}, []string{"tool=read_file", "duration=8ms", "call_id=call-1", `args={"path":"a.go"}`, "result_len=99"}},
 		{"history_compaction", Event{Kind: KindHistoryCompaction, PromptTokensBefore: 100, PromptTokensAfter: 60, Strategy: "summary", KeptEntries: 4}, []string{"tokens_before=100", "tokens_after=60", "strategy=summary", "kept_entries=4"}},
-		{"history_truncated", Event{Kind: KindHistoryTruncated, PromptTokensBefore: 200, PromptTokensAfter: 80, Strategy: "drop_middle", KeptEntries: 5}, []string{"tokens_before=200", "tokens_after=80", "strategy=drop_middle", "kept_entries=5"}},
-		{"token_stats", Event{Kind: KindTokenStats, CallCount: 3, PromptTokens: 10, CompletionTokens: 5, TotalPromptTokens: 30, TotalCompletionTokens: 15}, []string{"call=3", "prompt_tokens=10", "completion_tokens=5", "total_prompt_tokens=30", "total_completion_tokens=15"}},
+		{"context_manifest_built", Event{Kind: KindContextManifestBuilt, PromptTokens: 4321, HistoryEntries: 6, PromptBuildID: "pb-abc123def456", Description: `[{"id":"system_prompt","source":"agent-prompt"}]`}, []string{"est_prompt_tokens=4321", "history_entries=6", "build=pb-abc123def456", `sections="[{`}},
+		{"prompt_compiled", Event{Kind: KindPromptCompiled, TaskID: "t1", PromptBuildID: "pb-abc123def456", Description: `[{"id":"agent_role","digest":"abc123def456","in_message":true}]`}, []string{"build=pb-abc123def456", `components="[{`}},
+		{"agent_audit_started", Event{Kind: KindAgentAuditStarted, TaskID: "t1", Description: `{"agents":3,"snapshot_digest":"abc123def456","warnings":0}`}, []string{`summary="{\"agents\":3`}},
+		{"agent_audit_warning", Event{Kind: KindAgentAuditWarning, TaskID: "t1", Description: `{"agent":"explorer","type":"route_missing"}`}, []string{`summary="{\"agent\":\"explorer\"`}},
+		{"agent_audit_completed", Event{Kind: KindAgentAuditCompleted, TaskID: "t1", Reason: "completed", Description: `{"agents":3,"warnings":1}`}, []string{`reason="completed"`, `summary="{\"agents\":3`}},
 		{"file_written", Event{Kind: KindFileWritten, Tool: "write_file", Path: "a.go", Bytes: 42, Hash: "full-hash"}, []string{"path=a.go", "bytes=42", "hash=full-hash", "tool=write_file"}},
 		{"file_write_queued", Event{Kind: KindFileWriteQueued, Path: "a.go", QueueLen: 2, WaitMS: 15, Description: "acquired"}, []string{"path=a.go", "queue_len=2", "wait_ms=15", `desc="acquired"`}},
 		{"progress_notify", Event{Kind: KindProgressNotify, NotifyType: "halfway"}, []string{"notify_type=halfway"}},
-		{"memory_context_inject", Event{Kind: KindMemoryContextInject, NotifyType: "team_snapshot", Path: "team_snapshot:worker-1", OutputLen: 128}, []string{"source=team_snapshot", "key=team_snapshot:worker-1", "runes=128"}},
 		{"workspace_materialized", Event{Kind: KindWorkspaceMaterialized, Path: "/proj/.agentgo/workspaces/t1"}, []string{"path=/proj/.agentgo/workspaces/t1"}},
 		{"workspace_merged", Event{Kind: KindWorkspaceMerged, Description: "fast_forward=2 auto_merged=1"}, []string{`desc="fast_forward=2 auto_merged=1"`}},
 		{"workspace_merge_conflict", Event{Kind: KindWorkspaceMergeConflict, Path: "/proj/a.go", Description: "regions=2"}, []string{"path=/proj/a.go", `desc="regions=2"`}},
@@ -65,16 +60,42 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"shell_timeout_pending", Event{Kind: KindShellTimeoutPending, ShellTimeout: &ShellTimeout{Command: "go test", ElapsedSec: 30, PreviousWaits: 1, StdoutExcerpt: "partial"}}, []string{"elapsed=30s", "waits=1", `stdout="partial"`}},
 		{"shell_timeout_resolved", Event{Kind: KindShellTimeoutResolved, ShellTimeout: &ShellTimeout{Command: "go test", ElapsedSec: 60, PreviousWaits: 2, Decision: "wait", ExtraSeconds: 20}}, []string{"elapsed=60s", "waits=2", "decision=wait", "extra=20s"}},
 		{"reactor_spawn_depth_exceeded", Event{Kind: KindReactorSpawnDepthExceeded, Depth: 6, Reason: "too deep"}, []string{"depth=6", `reason="too deep"`}},
-		{"replan_requested", planEvent(KindReplanRequested, "terminal fact"), []string{`reason="terminal fact"`, "plan=plan-1"}},
-		{"replan_coalesced", planEvent(KindReplanCoalesced, "two requests"), []string{`reason="two requests"`, "plan_revision=3"}},
-		{"replan_decided", planEvent(KindReplanDecided, "apply_plan_patch"), []string{`reason="apply_plan_patch"`, "state_version=5"}},
-		{"acceptance_completed", Event{Kind: KindAcceptanceCompleted, Plan: planCtx, Acceptance: &AcceptanceTraceContext{AcceptanceRunID: "run-1", ResultID: "result-1", SpecID: "spec-1", SpecRevision: 2, TargetRevision: 3, TargetGraphDigest: "digest-3", RunnerTaskID: "runner-task", RunnerKind: "verifier", Verdict: "pass", Status: "valid", Reason: "all green"}}, []string{"plan=plan-1", "acceptance_run=run-1", "result=result-1", "spec=spec-1", "spec_revision=2", "target_revision=3", "target_digest=digest-3", "runner_task=runner-task", "runner_kind=verifier", "verdict=pass", "status=valid", `acceptance_reason="all green"`}},
-		{"plan_revision_changed", planEvent(KindPlanRevisionChanged, "replacement"), []string{`reason="replacement"`, "graph_digest=digest-3"}},
-		{"plan_paused", planEvent(KindPlanPaused, "budget"), []string{`reason="budget"`, "acceptance_revision=2"}},
-		{"plan_terminal", planEvent(KindPlanTerminal, "pass"), []string{`reason="pass"`, "plan=plan-1"}},
+		{"runtime_loop_fuse_triggered", Event{Kind: KindRuntimeLoopFuseTriggered, Loop: 10000, Reason: "fuse"}, []string{"loop=10000", `reason="fuse"`}},
+		{"task_finalizing", Event{Kind: KindTaskFinalizing, TaskID: "t1", Transition: &Transition{PrevStatus: "processing", NewStatus: "blocked"}}, []string{"status=blocked"}},
+		{"tool_call_skipped", Event{Kind: KindToolCallSkipped, TaskID: "t1", Tool: "write_file", CallID: "call-9", Reason: "task_finalizing"}, []string{"tool=write_file", "call_id=call-9", `reason="task_finalizing"`}},
+		{"task_result_committed", Event{Kind: KindTaskResultCommitted, TaskID: "t1", Reason: "缺权限", Transition: &Transition{PrevStatus: "processing", NewStatus: "blocked", Cause: "agent_reported_blocked"}}, []string{"prev=processing", "new=blocked", "cause=agent_reported_blocked", `reason="缺权限"`}},
+		{"execution_lease_frozen", Event{Kind: KindExecutionLeaseFrozen, TaskID: "t1", Lease: &LeasePayload{Digest: "abc123def456", BusinessTools: 3, ControlTools: 1, Model: "deepseek-r1", Workspace: "workspace", Synthetic: true, Attempt: 1}}, []string{"digest=abc123def456", "biz=3 ctl=1", "model=deepseek-r1", "workspace=workspace", "synthetic=true"}},
+		{"execution_lease_rejected", Event{Kind: KindExecutionLeaseRejected, TaskID: "t1", Reason: "节点能力工具子集越界", Lease: &LeasePayload{Cause: "节点能力工具子集越界", Missing: []string{"web_fetch"}}}, []string{"missing=[web_fetch]", `cause="节点能力工具子集越界"`, `reason="节点能力工具子集越界"`}},
+		{"execution_lease_reused", Event{Kind: KindExecutionLeaseReused, TaskID: "t1", Lease: &LeasePayload{Digest: "abc123def456", BusinessTools: 2, ControlTools: 2, Attempt: 1}}, []string{"digest=abc123def456", "biz=2 ctl=2"}},
+		{"execution_lease_revoked", Event{Kind: KindExecutionLeaseRevoked, TaskID: "t1", Lease: &LeasePayload{Digest: "abc123def456", BusinessTools: 3, ControlTools: 1, Cause: "finalizing_accepted"}}, []string{"digest=abc123def456", "biz=3 ctl=1", `cause="finalizing_accepted"`}},
+		{"graph_submitted", Event{Kind: KindGraphSubmitted, GraphID: "graph-1", Description: "revision=1"}, []string{"graph=graph-1", `desc="revision=1"`}},
+		{"graph_submission_rejected", Event{Kind: KindGraphSubmissionRejected, GraphID: "graph-1", Error: "校验失败"}, []string{"graph=graph-1", `error="校验失败"`}},
+		{"node_activation_created", Event{Kind: KindNodeActivationCreated, GraphID: "graph-1", NodeID: "implement", ActivationID: "implement@2"}, []string{"graph=graph-1", "node=implement", "activation=implement@2"}},
+		{"graph_transition_selected", Event{Kind: KindGraphTransitionSelected, GraphID: "graph-1", NodeID: "verify", ActivationID: "verify@1", Description: "next[1] -> implement"}, []string{"graph=graph-1", "node=verify", "activation=verify@1", `desc="next[1] -> implement"`}},
+		{"graph_ended", Event{Kind: KindGraphEnded, GraphID: "graph-1", Reason: "节点无出路"}, []string{"graph=graph-1", `reason="节点无出路"`}},
+		{"graph_join_resolved", Event{Kind: KindGraphJoinResolved, GraphID: "graph-1", NodeID: "merge", ActivationID: "merge@1", Description: "生效入边 2/2"}, []string{"graph=graph-1", "node=merge", "activation=merge@1", `desc="生效入边 2/2"`}},
+		{"graph_wait_started", Event{Kind: KindGraphWaitStarted, GraphID: "graph-1", NodeID: "wait", ActivationID: "wait@1", Description: "event=deploy.done"}, []string{"graph=graph-1", "node=wait", "activation=wait@1", `desc="event=deploy.done"`}},
+		{"graph_wait_resumed", Event{Kind: KindGraphWaitResumed, GraphID: "graph-1", NodeID: "wait", ActivationID: "wait@1", Description: "event=deploy.done"}, []string{"graph=graph-1", "node=wait", "activation=wait@1", `desc="event=deploy.done"`}},
+		{"graph_approval_decided", Event{Kind: KindGraphApprovalDecided, GraphID: "graph-1", NodeID: "approve", ActivationID: "approve@1", Description: "approved"}, []string{"graph=graph-1", "node=approve", "activation=approve@1", `desc="approved"`}},
+		{"graph_change_requested", Event{Kind: KindGraphChangeRequested, GraphID: "graph-1", NodeID: "implement", ActivationID: "implement@2", TaskID: "task-1", Reason: "route_missing", Description: "verify 无可用路由"}, []string{"graph=graph-1", "node=implement", "activation=implement@2", `reason="route_missing"`, `desc="verify 无可用路由"`}},
+		{"graph_revision_committed", Event{Kind: KindGraphRevisionCommitted, GraphID: "graph-1", Description: "new_revision=2 upsert=[implement]"}, []string{"graph=graph-1", `desc="new_revision=2 upsert=[implement]"`}},
+		{"task_memory_created", Event{Kind: KindTaskMemoryCreated, Description: `{"version":1,"actions":0}`}, []string{`sections="{\"version\":1`}},
+		{"task_memory_updated", Event{Kind: KindTaskMemoryUpdated, Loop: 2, Description: `{"version":3,"actions":2}`}, []string{`sections="{\"version\":3`}},
+		{"task_memory_checkpointed", Event{Kind: KindTaskMemoryCheckpointed, Loop: -1, Reason: "terminal:completed", Description: `{"version":5,"sealed":true}`}, []string{`reason="terminal:completed"`, `sections="{\"version\":5`}},
+		{"session_memory_promotion_proposed", Event{Kind: KindSessionMemoryPromotionProposed, TaskID: "t1", Reason: "completed", Description: `{"version":5,"sealed":true}`}, []string{`reason="completed"`, `summary="{\"version\":5`}},
+		{"session_memory_promotion_decided", Event{Kind: KindSessionMemoryPromotionDecided, TaskID: "t1", Reason: "completed", Description: `{"decided":"promoted","entries":2}`}, []string{`reason="completed"`, `summary="{\"decided\":\"promoted\"`}},
+		{"memory_recalled", Event{Kind: KindMemoryRecalled, TaskID: "t2", Description: `{"entries":2,"keys":["task_result:result:t1:confirmed"]}`}, []string{`summary="{\"entries\":2`}},
+		{"memory_entry_state_changed", Event{Kind: KindMemoryEntryStateChanged, TaskID: "t1", Description: `{"key":"decision:ab12","new_state":"superseded"}`}, []string{`summary="{\"key\":\"decision:ab12\"`}},
+		{"suggestions_returned", Event{Kind: KindSuggestionsReturned, TaskID: "t1", Suggestion: &SuggestionPayload{SuggestionID: "require-read-before-write:read_before_write:ab12cd34", ReasonCode: "read_before_write", Retryable: true, Offered: 1, Filtered: 1, FilterReason: "finalizing", RepeatCount: 2}}, []string{"reason_code=read_before_write", "retryable=true", "offered=1", "filtered=1", "filter=finalizing", "repeat=2"}},
+		{"suggestion_disposition", Event{Kind: KindSuggestionDisposition, TaskID: "t1", Suggestion: &SuggestionPayload{SuggestionID: "require-read-before-write:read_before_write:ab12cd34", ReasonCode: "read_before_write", Disposition: "adopted"}}, []string{"id=require-read-before-write:read_before_write:ab12cd34", "disposition=adopted", "reason_code=read_before_write"}},
+		{"effect_prepared", Event{Kind: KindEffectPrepared, TaskID: "t1", Effect: &EffectPayload{EffectID: "t1-1", Kind: "file_write", Policy: "verify_first", Status: "prepared", Target: "/proj/a.go", ArgsDigest: "ab12cd34ef56"}}, []string{"effect=t1-1", "kind=file_write", "policy=verify_first", "target=/proj/a.go"}},
+		{"effect_settled", Event{Kind: KindEffectSettled, TaskID: "t1", Effect: &EffectPayload{EffectID: "t1-2", Kind: "shell", Policy: "manual_only", Status: "settled", Target: "cmd:ab12cd34ef56", ResultSummary: "exit_code=0 outcome=success"}}, []string{"effect=t1-2", "kind=shell", "policy=manual_only", `result="exit_code=0 outcome=success"`}},
+		{"effect_unknown", Event{Kind: KindEffectUnknown, TaskID: "t1", Effect: &EffectPayload{EffectID: "t1-3", Kind: "message", Policy: "manual_only", Status: "unknown", Target: "worker-1", Reason: "进程在副作用执行窗口退出"}}, []string{"effect=t1-3", "kind=message", `reason="进程在副作用执行窗口退出"`}},
+		{"effect_recovery_decided", Event{Kind: KindEffectRecoveryDecided, TaskID: "t1", Effect: &EffectPayload{EffectID: "t1-1", Kind: "file_write", Policy: "verify_first", Decision: "verified_settled", Reason: "文件 hash 与账载一致"}}, []string{"effect=t1-1", "decision=verified_settled", `reason="文件 hash 与账载一致"`}},
+		{"acceptance_completed", Event{Kind: KindAcceptanceCompleted, GraphID: "graph-1", NodeID: "verify", ActivationID: "verify@1", TaskID: "task-9", Acceptance: &AcceptancePayload{Verdict: "pass", Status: "disputed", Checked: 2, Reason: "命令未在该任务的 shell 账中找到"}}, []string{"graph=graph-1", "node=verify", "activation=verify@1", "verdict=pass", "verify=disputed", "checked=2", `reason="命令未在该任务的 shell 账中找到"`}},
 	}
-	if len(cases) != 37 {
-		t.Fatalf("test inventory has %d built-in EventKinds, want 37", len(cases))
+	if len(cases) != 65 {
+		t.Fatalf("test inventory has %d built-in EventKinds, want 65", len(cases))
 	}
 	seen := make(map[string]struct{}, len(cases))
 	for _, tc := range cases {
@@ -127,8 +148,18 @@ func TestFormatEventDetailsFallbacks(t *testing.T) {
 	if !strings.Contains(parseErr, `error="invalid JSON"`) {
 		t.Fatalf("parse error details hidden: %q", parseErr)
 	}
-	if got := formatEventDetails(Event{Kind: KindPlanPaused}); got != "" {
-		t.Fatalf("nil optional Plan payload should stay empty, got %q", got)
+	// V6 legacy 姿态：旧 JSONL 里的 plan_/replan_ 事件行按未知 kind 优雅渲染——
+	// 不崩、原样展示 kind 字符串，通用字段（reason 等）仍可见，不做专用格式化。
+	//（acceptance_completed 已于 G1b 重新启用为 Graph 验收核验事件，不再是
+	// legacy kind，渲染语料见 TestFormatEventDetailsAllBuiltInKinds。）
+	for _, legacyKind := range []string{"plan_terminal", "plan_paused", "replan_requested"} {
+		got := formatEventDetails(Event{Kind: EventKind(legacyKind), Reason: "terminal fact"})
+		if !strings.Contains(got, `reason="terminal fact"`) {
+			t.Fatalf("legacy kind %q 的通用字段未展示: %q", legacyKind, got)
+		}
+		if strings.Contains(got, "plan=") || strings.Contains(got, "plan_revision=") {
+			t.Fatalf("legacy kind %q 不应再有 Plan 专用格式化: %q", legacyKind, got)
+		}
 	}
 }
 
@@ -210,20 +241,18 @@ func TestSummarizeLifecycleAndCounters(t *testing.T) {
 	}
 }
 
-func TestTaskAggregationAcrossRetryFilesAndPlan(t *testing.T) {
+func TestTaskAggregationAcrossRetryFiles(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 7, 18, 2, 0, 0, 0, time.UTC)
-	planID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 	taskID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
-	plan := &PlanTraceContext{PlanID: planID, PlanRevision: 1, ExecutionStateVersion: 2}
 
 	writeTraceFixture(t, dir, base, taskID, []Event{
-		{Timestamp: base, Kind: KindTaskPublished, TaskID: taskID, Plan: plan},
+		{Timestamp: base, Kind: KindTaskPublished, TaskID: taskID},
 		{Timestamp: base, Kind: KindLLMCallStart, TaskID: taskID, Loop: 0},
 		{Timestamp: base, Kind: KindToolCall, TaskID: taskID, Tool: "read_file", CallID: "first-fragment"},
 		{Timestamp: base, Kind: KindTaskRetry, TaskID: taskID, AttemptNo: 1},
 	})
-	// Retry 分片没有 Plan payload；Plan 聚合仍须因完整 TaskID 成员关系纳入。
+	// Retry 分片与首片按完整 TaskID 归并为同一任务组。
 	writeTraceFixture(t, dir, base.Add(time.Second), taskID, []Event{
 		{Timestamp: base, Kind: KindTaskClaimed, TaskID: taskID},
 		{Timestamp: base, Kind: KindLLMCallStart, TaskID: taskID, Loop: 0},
@@ -249,7 +278,7 @@ func TestTaskAggregationAcrossRetryFilesAndPlan(t *testing.T) {
 	}
 
 	var list bytes.Buffer
-	if err := CLI([]string{"list"}, dir, &list); err != nil {
+	if err := CLI([]string{"list"}, dir, "", &list); err != nil {
 		t.Fatalf("list: %v", err)
 	}
 	if !strings.Contains(list.String(), "共 1 个任务") || strings.Count(list.String(), shortIdentifier(taskID)) != 1 {
@@ -257,7 +286,7 @@ func TestTaskAggregationAcrossRetryFilesAndPlan(t *testing.T) {
 	}
 
 	var show bytes.Buffer
-	if err := CLI([]string{"show", taskID}, dir, &show); err != nil {
+	if err := CLI([]string{"show", taskID}, dir, "", &show); err != nil {
 		t.Fatalf("show: %v", err)
 	}
 	for _, want := range []string{"Trace Files: 2", "Events: 9", "first-fragment", "second-fragment", "loops=2", "tool=write_file"} {
@@ -267,16 +296,6 @@ func TestTaskAggregationAcrossRetryFilesAndPlan(t *testing.T) {
 	}
 	if strings.Index(show.String(), "first-fragment") > strings.Index(show.String(), "second-fragment") {
 		t.Fatalf("equal timestamps were not sorted by filename then line:\n%s", show.String())
-	}
-
-	var planOut bytes.Buffer
-	if err := CLI([]string{"plan", planID}, dir, &planOut); err != nil {
-		t.Fatalf("plan: %v", err)
-	}
-	for _, want := range []string{"Tasks: 1", "Trace Files: 2", "Events: 9", "first-fragment", "second-fragment"} {
-		if !strings.Contains(planOut.String(), want) {
-			t.Errorf("plan missing retry fragment evidence %q:\n%s", want, planOut.String())
-		}
 	}
 }
 
@@ -302,7 +321,7 @@ func TestPhysicalFileWithMultipleTaskIDsIsSplit(t *testing.T) {
 		id, own, other string
 	}{{firstID, "ONLY-FIRST", "ONLY-SECOND"}, {secondID, "ONLY-SECOND", "ONLY-FIRST"}} {
 		var out bytes.Buffer
-		if err := CLI([]string{"show", tc.id}, dir, &out); err != nil {
+		if err := CLI([]string{"show", tc.id}, dir, "", &out); err != nil {
 			t.Fatalf("show %s: %v", tc.id, err)
 		}
 		if !strings.Contains(out.String(), tc.own) || strings.Contains(out.String(), tc.other) {
@@ -327,9 +346,8 @@ func TestParseErrorAttributionAndSyntheticFileGroups(t *testing.T) {
 	t.Run("single Task file attributes parse error", func(t *testing.T) {
 		dir := t.TempDir()
 		taskID := "dddddddd-1111-1111-1111-111111111111"
-		planID := "dddddddd-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 		writeRawTraceFixture(t, dir, base, "dddddddd", []string{
-			marshalLine(Event{Timestamp: base, Kind: KindToolCall, TaskID: taskID, CallID: "VALID", Plan: &PlanTraceContext{PlanID: planID}}),
+			marshalLine(Event{Timestamp: base, Kind: KindToolCall, TaskID: taskID, CallID: "VALID"}),
 			`{"broken":`,
 			marshalLine(Event{Timestamp: base.Add(time.Second), Kind: KindToolCall, TaskID: taskID, CallID: "AFTER"}),
 		})
@@ -342,7 +360,7 @@ func TestParseErrorAttributionAndSyntheticFileGroups(t *testing.T) {
 			t.Fatalf("summary=%+v, want malformed with one error", summary)
 		}
 		var out bytes.Buffer
-		if err := CLI([]string{"show", taskID}, dir, &out); err != nil {
+		if err := CLI([]string{"show", taskID}, dir, "", &out); err != nil {
 			t.Fatal(err)
 		}
 		for _, want := range []string{"WARNING: timeline incomplete", "<parse_error>", `error="invalid JSON:`} {
@@ -355,13 +373,6 @@ func TestParseErrorAttributionAndSyntheticFileGroups(t *testing.T) {
 		afterPos := strings.Index(out.String(), "call_id=AFTER")
 		if validPos < 0 || parsePos <= validPos || afterPos <= parsePos {
 			t.Fatalf("parse error lost its physical line position:\n%s", out.String())
-		}
-		var planOut bytes.Buffer
-		if err := CLI([]string{"plan", planID}, dir, &planOut); err != nil {
-			t.Fatal(err)
-		}
-		if !strings.Contains(planOut.String(), "WARNING: timeline incomplete") || !strings.Contains(planOut.String(), "<parse_error>") {
-			t.Fatalf("relevant Plan issue was not reported:\n%s", planOut.String())
 		}
 	})
 
@@ -383,7 +394,7 @@ func TestParseErrorAttributionAndSyntheticFileGroups(t *testing.T) {
 				t.Fatalf("group %s records=%d summary=%+v", group.displayID(), len(group.records), summarizeTask(group))
 			}
 			var out bytes.Buffer
-			if err := CLI([]string{"show", group.taskID}, dir, &out); err != nil {
+			if err := CLI([]string{"show", group.taskID}, dir, "", &out); err != nil {
 				t.Fatal(err)
 			}
 			if !strings.Contains(out.String(), "WARNING: timeline incomplete") || strings.Contains(out.String(), "<parse_error>") {
@@ -475,139 +486,18 @@ func TestReadEventStreamSupportsLongLinesAndReturnsPartialEvents(t *testing.T) {
 	}
 }
 
-func TestLatestPlanContextMergesMonotonicVersionsWithoutStaleDigest(t *testing.T) {
-	planID := "plan-monotonic"
-	events := []Event{
-		{Plan: &PlanTraceContext{PlanID: planID, PlanRevision: 3, ExecutionStateVersion: 8, AcceptanceSpecRevision: 2, GraphDigest: "digest-3"}},
-		// 后发的 partial context 只推进 execution state，不能清空图信息。
-		{Plan: &PlanTraceContext{PlanID: planID, ExecutionStateVersion: 9}},
-		// 更晚到达的旧 snapshot 不能让 header 版本回退。
-		{Plan: &PlanTraceContext{PlanID: planID, PlanRevision: 2, ExecutionStateVersion: 7, AcceptanceSpecRevision: 1, GraphDigest: "digest-2"}},
-	}
-	got := latestPlanContext(events, planID)
-	if got == nil || got.PlanRevision != 3 || got.ExecutionStateVersion != 9 ||
-		got.AcceptanceSpecRevision != 2 || got.GraphDigest != "digest-3" {
-		t.Fatalf("merged Plan context=%+v", got)
-	}
-
-	// 若确实观察到更高图 revision、但该 revision 尚无 digest，就不能把旧图
-	// digest 错配到新 revision。
-	events = append(events, Event{Plan: &PlanTraceContext{PlanID: planID, PlanRevision: 4, ExecutionStateVersion: 9}})
-	got = latestPlanContext(events, planID)
-	if got == nil || got.PlanRevision != 4 || got.GraphDigest != "" {
-		t.Fatalf("higher partial revision reused stale digest: %+v", got)
-	}
-}
-
-func TestCmdPlanAggregatesAcrossTaskFiles(t *testing.T) {
-	dir := t.TempDir()
-	base := time.Date(2026, 7, 18, 3, 0, 0, 0, time.UTC)
-	planID := "11111111-1111-1111-1111-111111111111"
-	planCtx := func(rev, state int64, digest string) *PlanTraceContext {
-		return &PlanTraceContext{PlanID: planID, PlanRevision: rev, ExecutionStateVersion: state, AcceptanceSpecRevision: 1, GraphDigest: digest}
-	}
-	writeTraceFixture(t, dir, base, planID, []Event{
-		{Timestamp: base, Kind: KindToolCall, TaskID: planID, Tool: "provision_agent_team", CallID: "controller-first"},
-		// 根 Task 本身没有 Plan payload，仍须因 TaskID==PlanID 纳入。
-		{Timestamp: base.Add(3 * time.Second), Kind: KindReplanDecided, TaskID: planID, Reason: "start_acceptance"},
-	})
-	workerID := "22222222-2222-2222-2222-222222222222"
-	writeTraceFixture(t, dir, base.Add(time.Second), workerID, []Event{
-		{Timestamp: base.Add(time.Second), Kind: KindPlanRevisionChanged, TaskID: workerID, Reason: "publish worker", Plan: planCtx(1, 1, "digest-1")},
-		{Timestamp: base.Add(2 * time.Second), Kind: KindToolCall, TaskID: workerID, Tool: "read_file", CallID: "worker-middle"},
-	})
-	acceptanceID := "33333333-3333-3333-3333-333333333333"
-	writeTraceFixture(t, dir, base.Add(4*time.Second), acceptanceID, []Event{
-		{Timestamp: base.Add(4 * time.Second), Kind: KindAcceptanceCompleted, TaskID: acceptanceID, Plan: planCtx(2, 5, "digest-2"), Acceptance: &AcceptanceTraceContext{AcceptanceRunID: "run-1", ResultID: "result-1", Verdict: "pass", Status: "valid"}},
-	})
-	otherID := "44444444-4444-4444-4444-444444444444"
-	writeTraceFixture(t, dir, base.Add(5*time.Second), otherID, []Event{
-		{Timestamp: base.Add(5 * time.Second), Kind: KindPlanPaused, TaskID: otherID, Reason: "SHOULD_NOT_APPEAR", Plan: &PlanTraceContext{PlanID: "99999999-9999-9999-9999-999999999999"}},
-	})
-	// 完全无关的坏文件不能阻断或污染目标 Plan。
-	writeRawTraceFixture(t, dir, base.Add(6*time.Second), "deadbeef", []string{`{"broken":`})
-
-	var out bytes.Buffer
-	if err := CLI([]string{"plan", "11111111"}, dir, &out); err != nil {
-		t.Fatalf("CLI plan: %v", err)
-	}
-	got := out.String()
-	for _, want := range []string{
-		"Plan: " + planID, "Tasks: 3", "Events: 5", "Revision: 2", "State Version: 5",
-		"Latest Acceptance: status=valid verdict=pass run=run-1 result=result-1",
-		"task=11111111", "task=22222222", "task=33333333",
-		"controller-first", "worker-middle", "acceptance_run=run-1",
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("plan output missing %q:\n%s", want, got)
-		}
-	}
-	if strings.Contains(got, "SHOULD_NOT_APPEAR") || strings.Contains(got, "task=44444444") {
-		t.Fatalf("other Plan leaked into output:\n%s", got)
-	}
-	if strings.Contains(got, "timeline incomplete") || strings.Contains(got, "deadbeef") {
-		t.Fatalf("unrelated malformed file polluted target Plan:\n%s", got)
-	}
-	controllerPos := strings.Index(got, "controller-first")
-	workerPos := strings.Index(got, "worker-middle")
-	acceptancePos := strings.Index(got, "acceptance_run=run-1")
-	if controllerPos < 0 || workerPos <= controllerPos || acceptancePos <= workerPos {
-		t.Fatalf("events not globally time-sorted:\n%s", got)
-	}
-}
-
-func TestCmdPlanIDResolutionAmbiguousExactAndMissing(t *testing.T) {
-	dir := t.TempDir()
-	base := time.Date(2026, 7, 18, 3, 30, 0, 0, time.UTC)
-	firstPlanID := "aaaaaaaa-1111-1111-1111-111111111111"
-	secondPlanID := "aaaaaaaa-2222-2222-2222-222222222222"
-	writeTraceFixture(t, dir, base, "bbbbbbbb-1111-1111-1111-111111111111", []Event{{
-		Timestamp: base, Kind: KindPlanPaused, TaskID: "bbbbbbbb-1111-1111-1111-111111111111",
-		Reason: "first-plan", Plan: &PlanTraceContext{PlanID: firstPlanID},
-	}})
-	writeTraceFixture(t, dir, base.Add(time.Second), "cccccccc-2222-2222-2222-222222222222", []Event{{
-		Timestamp: base.Add(time.Second), Kind: KindPlanPaused, TaskID: "cccccccc-2222-2222-2222-222222222222",
-		Reason: "second-plan", Plan: &PlanTraceContext{PlanID: secondPlanID},
-	}})
-
-	var ambiguous bytes.Buffer
-	if err := CLI([]string{"plan", "aaaaaaaa"}, dir, &ambiguous); err != nil {
-		t.Fatalf("ambiguous plan prefix: %v", err)
-	}
-	for _, want := range []string{"找到 2 个匹配的 Plan", firstPlanID, secondPlanID} {
-		if !strings.Contains(ambiguous.String(), want) {
-			t.Errorf("ambiguous output missing %q:\n%s", want, ambiguous.String())
-		}
-	}
-
-	var exact bytes.Buffer
-	if err := CLI([]string{"plan", firstPlanID}, dir, &exact); err != nil {
-		t.Fatalf("exact plan ID: %v", err)
-	}
-	if !strings.Contains(exact.String(), "Plan: "+firstPlanID) || strings.Contains(exact.String(), "second-plan") {
-		t.Fatalf("exact Plan selection leaked another Plan:\n%s", exact.String())
-	}
-
-	var missing bytes.Buffer
-	err := CLI([]string{"plan", "deadbeef"}, dir, &missing)
-	if err == nil || !strings.Contains(err.Error(), "未找到匹配 plan_id=deadbeef") {
-		t.Fatalf("missing Plan error=%v", err)
-	}
-}
-
-func TestCmdShowUsesFullTaskIDAndShowsPlanHeader(t *testing.T) {
+func TestCmdShowUsesFullTaskID(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 7, 18, 4, 0, 0, 0, time.UTC)
 	firstID := "abcdef12-1111-1111-1111-111111111111"
 	secondID := "abcdef12-2222-2222-2222-222222222222"
 	writeTraceFixture(t, dir, base, firstID, []Event{{Timestamp: base, Kind: KindError, TaskID: firstID, Error: "first-only"}})
 	writeTraceFixture(t, dir, base.Add(time.Second), secondID, []Event{{
-		Timestamp: base.Add(time.Second), Kind: KindHistoryTruncated, TaskID: secondID, AgentID: "worker", Loop: 0,
+		Timestamp: base.Add(time.Second), Kind: KindHistoryCompaction, TaskID: secondID, AgentID: "worker", Loop: 0,
 		PromptTokensBefore: 100, PromptTokensAfter: 50,
-		Plan: &PlanTraceContext{PlanID: "plan-full", PlanRevision: 2, ExecutionStateVersion: 3, AcceptanceSpecRevision: 1, GraphDigest: "digest-full"},
 	}})
 	var ambiguous bytes.Buffer
-	if err := CLI([]string{"show", "abcdef12"}, dir, &ambiguous); err != nil {
+	if err := CLI([]string{"show", "abcdef12"}, dir, "", &ambiguous); err != nil {
 		t.Fatalf("CLI show ambiguous prefix: %v", err)
 	}
 	for _, want := range []string{"找到 2 个匹配的任务", firstID, secondID} {
@@ -616,11 +506,11 @@ func TestCmdShowUsesFullTaskIDAndShowsPlanHeader(t *testing.T) {
 		}
 	}
 	var out bytes.Buffer
-	if err := CLI([]string{"show", secondID}, dir, &out); err != nil {
+	if err := CLI([]string{"show", secondID}, dir, "", &out); err != nil {
 		t.Fatalf("CLI show: %v", err)
 	}
 	got := out.String()
-	for _, want := range []string{"Plan: plan-full", "Graph Digest: digest-full", "history_truncated", "loop=0", "tokens_after=50"} {
+	for _, want := range []string{"history_compaction", "loop=0", "tokens_after=50"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("show output missing %q:\n%s", want, got)
 		}
@@ -642,16 +532,25 @@ func TestMatchTaskGroupsSyntheticIDNeverSilentlyShadowsPrefix(t *testing.T) {
 	}
 }
 
-func TestTraceCLIUsageIncludesPlan(t *testing.T) {
+func TestTraceCLIUsage(t *testing.T) {
 	var out bytes.Buffer
-	if err := CLI([]string{"help"}, t.TempDir(), &out); err != nil {
+	if err := CLI([]string{"help"}, t.TempDir(), "", &out); err != nil {
 		t.Fatalf("help: %v", err)
 	}
-	if !strings.Contains(out.String(), "plan <plan_id>") {
-		t.Fatalf("help missing plan command:\n%s", out.String())
+	for _, want := range []string{"show <task_id>", "stats [task|agent]"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("help missing %q:\n%s", want, out.String())
+		}
 	}
-	if err := CLI([]string{"plan"}, t.TempDir(), &out); err == nil || !strings.Contains(err.Error(), "plan <plan_id>") {
-		t.Fatalf("missing plan ID error=%v", err)
+	// V6：plan 子命令已随 Plan 控制面删除，按未知子命令报错。
+	if err := CLI([]string{"plan", "anything"}, t.TempDir(), "", &out); err == nil ||
+		!strings.Contains(err.Error(), "unknown trace subcommand") {
+		t.Fatalf("plan 子命令应报未知子命令错误，err=%v", err)
+	}
+	// stats 分组维度只余 task / agent；plan 维度已删除。
+	if err := CLI([]string{"stats", "plan"}, t.TempDir(), "", &out); err == nil ||
+		!strings.Contains(err.Error(), "stats [task|agent]") {
+		t.Fatalf("stats plan 应报用法错误，err=%v", err)
 	}
 }
 
@@ -782,23 +681,18 @@ func eventKindValuesFromSource(t *testing.T) map[string]struct{} {
 }
 
 // TestCmdStatsAggregatesTokens 验证 stats 子命令：token 取自 llm_call_end
-// 逐次调用事件（不读累计型 token_stats，避免重复计数），并支持
-// task / agent / plan 三种分组维度。
+// 逐次调用事件（唯一的 token 账本），并支持 task / agent 两种分组维度。
 func TestCmdStatsAggregatesTokens(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 7, 22, 1, 0, 0, 0, time.UTC)
-	planID := "11111111-1111-1111-1111-111111111111"
-	planCtx := &PlanTraceContext{PlanID: planID, PlanRevision: 1, ExecutionStateVersion: 1}
 
 	taskA := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 	writeTraceFixture(t, dir, base, taskA, []Event{
-		{Timestamp: base, Kind: KindTaskPublished, TaskID: taskA, Description: "任务A", Plan: planCtx},
+		{Timestamp: base, Kind: KindTaskPublished, TaskID: taskA, Description: "任务A"},
 		{Timestamp: base.Add(time.Second), Kind: KindTaskClaimed, TaskID: taskA, AgentID: "worker-1"},
 		{Timestamp: base.Add(2 * time.Second), Kind: KindLLMCallEnd, TaskID: taskA, AgentID: "worker-1", Loop: 0, PromptTokens: 1000, CompletionTokens: 150},
 		{Timestamp: base.Add(3 * time.Second), Kind: KindTaskRetry, TaskID: taskA, AgentID: "worker-1", AttemptNo: 1},
 		{Timestamp: base.Add(4 * time.Second), Kind: KindLLMCallEnd, TaskID: taskA, AgentID: "worker-1", Loop: 0, PromptTokens: 2000, CompletionTokens: 200},
-		// token_stats 是累计值，stats 不得纳入（否则 prompt 会虚高 6000）。
-		{Timestamp: base.Add(5 * time.Second), Kind: KindTokenStats, TaskID: taskA, AgentID: "worker-1", PromptTokens: 2000, CompletionTokens: 200, TotalPromptTokens: 6000, TotalCompletionTokens: 700, CallCount: 2},
 		{Timestamp: base.Add(6 * time.Second), Kind: KindTaskCompleted, TaskID: taskA, AgentID: "worker-1"},
 	})
 	taskB := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
@@ -820,7 +714,7 @@ func TestCmdStatsAggregatesTokens(t *testing.T) {
 
 	// 默认 task 视图：session 总计 + 每任务一行。
 	var taskOut bytes.Buffer
-	if err := CLI([]string{"stats"}, dir, &taskOut); err != nil {
+	if err := CLI([]string{"stats"}, dir, "", &taskOut); err != nil {
 		t.Fatalf("CLI stats: %v", err)
 	}
 	got := taskOut.String()
@@ -834,13 +728,10 @@ func TestCmdStatsAggregatesTokens(t *testing.T) {
 			t.Errorf("stats task output missing %q:\n%s", want, got)
 		}
 	}
-	if strings.Contains(got, "6.0k") || strings.Contains(got, "9.5k") {
-		t.Errorf("token_stats 累计值被误计入 stats:\n%s", got)
-	}
 
 	// agent 视图：worker-1 聚合 2 次调用 / prompt 3.0k。
 	var agentOut bytes.Buffer
-	if err := CLI([]string{"stats", "agent"}, dir, &agentOut); err != nil {
+	if err := CLI([]string{"stats", "agent"}, dir, "", &agentOut); err != nil {
 		t.Fatalf("CLI stats agent: %v", err)
 	}
 	got = agentOut.String()
@@ -851,18 +742,8 @@ func TestCmdStatsAggregatesTokens(t *testing.T) {
 		t.Errorf("stats agent output missing worker-1 prompt 3.0k:\n%s", got)
 	}
 
-	// plan 视图：任务A 归入 plan 短 ID，任务B 归入 (no-plan)。
-	var planOut bytes.Buffer
-	if err := CLI([]string{"stats", "plan"}, dir, &planOut); err != nil {
-		t.Fatalf("CLI stats plan: %v", err)
-	}
-	got = planOut.String()
-	if !strings.Contains(got, "11111111") || !strings.Contains(got, "(no-plan)") {
-		t.Errorf("stats plan output missing plan buckets:\n%s", got)
-	}
-
 	// 非法分组维度必须报错。
-	if err := CLI([]string{"stats", "bogus"}, dir, &bytes.Buffer{}); err == nil {
+	if err := CLI([]string{"stats", "bogus"}, dir, "", &bytes.Buffer{}); err == nil {
 		t.Fatal("stats bogus groupBy should fail")
 	}
 }
@@ -870,7 +751,7 @@ func TestCmdStatsAggregatesTokens(t *testing.T) {
 func TestCmdStatsEmptyDir(t *testing.T) {
 	dir := t.TempDir()
 	var out bytes.Buffer
-	if err := CLI([]string{"stats"}, dir, &out); err != nil {
+	if err := CLI([]string{"stats"}, dir, "", &out); err != nil {
 		t.Fatalf("CLI stats on empty dir: %v", err)
 	}
 	if !strings.Contains(out.String(), "没有 LLM 调用记录") {
@@ -910,7 +791,7 @@ func TestCmdStatsAnomalies(t *testing.T) {
 	})
 
 	var out bytes.Buffer
-	if err := CLI([]string{"stats"}, dir, &out); err != nil {
+	if err := CLI([]string{"stats"}, dir, "", &out); err != nil {
 		t.Fatalf("CLI stats: %v", err)
 	}
 	got := out.String()
@@ -938,7 +819,7 @@ func TestCmdStatsNoAnomaliesWhenHealthy(t *testing.T) {
 		})
 	}
 	var out bytes.Buffer
-	if err := CLI([]string{"stats"}, dir, &out); err != nil {
+	if err := CLI([]string{"stats"}, dir, "", &out); err != nil {
 		t.Fatalf("CLI stats: %v", err)
 	}
 	if strings.Contains(out.String(), "异常提示:") {
@@ -987,7 +868,7 @@ func TestCmdStatsReReadMetric(t *testing.T) {
 	})
 
 	var out bytes.Buffer
-	if err := CLI([]string{"stats"}, dir, &out); err != nil {
+	if err := CLI([]string{"stats"}, dir, "", &out); err != nil {
 		t.Fatalf("CLI stats: %v", err)
 	}
 	got := out.String()

@@ -29,7 +29,7 @@ func newExecModeTestBundle(t *testing.T, modeStore *modes.Store, projectRoot str
 	cfg.ProjectRoot = projectRoot
 
 	bundle := New(s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
-		nil, nil, nil, nil, nil, modeStore)
+		nil, nil, nil, nil, nil, modeStore, nil, nil, nil)
 
 	task := &model.Task{Description: "exec 模式装配测试任务", EventType: "__scheduler__"}
 	if err := s.PublishTask(task); err != nil {
@@ -57,7 +57,7 @@ func TestSchedulerStrictWriteFileFailsClosed(t *testing.T) {
 		}},
 	}}}
 	bundle, _, task := newExecModeTestBundle(t,
-		modes.NewStore(modes.GateImmediate, modes.ExecStrict, modes.TopoSolo), dir, mockLLM)
+		modes.NewStore(modes.ExecStrict, modes.TopoSolo), dir, mockLLM)
 
 	content := executeOneRound(t, bundle, task)
 	if !strings.Contains(content, "Interaction 服务不可用") {
@@ -79,7 +79,7 @@ func TestSchedulerStrictRunShellFailsClosed(t *testing.T) {
 		}},
 	}}}
 	bundle, _, task := newExecModeTestBundle(t,
-		modes.NewStore(modes.GateImmediate, modes.ExecStrict, modes.TopoTeam), t.TempDir(), mockLLM)
+		modes.NewStore(modes.ExecStrict, modes.TopoTeam), t.TempDir(), mockLLM)
 
 	content := executeOneRound(t, bundle, task)
 	if !strings.Contains(content, "Interaction 服务不可用") {
@@ -99,7 +99,7 @@ func TestSchedulerNormalWriteFilePassthrough(t *testing.T) {
 		}},
 	}}}
 	bundle, _, task := newExecModeTestBundle(t,
-		modes.NewStore(modes.GateImmediate, modes.ExecNormal, modes.TopoTeam), dir, mockLLM)
+		modes.NewStore(modes.ExecNormal, modes.TopoTeam), dir, mockLLM)
 
 	content := executeOneRound(t, bundle, task)
 	if !strings.Contains(content, "文件已写入") {

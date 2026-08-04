@@ -50,6 +50,10 @@ type Service struct {
 	waitMu       sync.Mutex
 	waiters      map[string]map[int]chan Request
 	nextWaiterID int
+
+	// resolvedMu 保护 onResolved（C5c 图审批桥等运行时适配器的终态挂点）。
+	resolvedMu sync.RWMutex
+	onResolved func(Request)
 }
 
 // WithSessionIDProvider supplies the active runtime Session for adapters that
@@ -86,6 +90,27 @@ func NewService(store Store, options ...ServiceOption) *Service {
 
 // Store 返回注入的权威 Store，主要用于 Bootstrap 生命周期装配。
 func (s *Service) Store() Store { return s.store }
+
+// SetOnResolved 注册请求进入终态（resolved/cancelled/expired/failed/
+// interrupted）后的回调挂点；fn 为 nil 时清除。单槽位——后注册者覆盖先注册者
+// （需要多路扇出时请使用 Subscribe）。回调在迁移调用方的 goroutine 内、事件
+// 扇出之后同步触发，收到的是深拷贝；实现方不得在回调内调用 Service 的任何
+// 迁移方法（需要重入驱动其他子系统时请自行起 goroutine，避免锁序纠缠）。
+func (s *Service) SetOnResolved(fn func(Request)) {
+	s.resolvedMu.Lock()
+	defer s.resolvedMu.Unlock()
+	s.onResolved = fn
+}
+
+// fireResolved 触发终态回调（nil 安全；回调收到深拷贝，与事件订阅者同纪律）。
+func (s *Service) fireResolved(request Request) {
+	s.resolvedMu.RLock()
+	fn := s.onResolved
+	s.resolvedMu.RUnlock()
+	if fn != nil {
+		fn(CloneRequest(request))
+	}
+}
 
 // CurrentSessionID returns the provider's current value. It is intentionally
 // read at request creation time so a later Session switch cannot retag an
@@ -410,6 +435,9 @@ func (s *Service) transition(
 		return Request{}, err
 	}
 	s.publish(Event{Kind: EventStateChanged, Request: updated, PreviousState: previous, At: now})
+	if target.IsTerminal() {
+		s.fireResolved(updated)
+	}
 	return updated, nil
 }
 
