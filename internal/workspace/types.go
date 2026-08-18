@@ -30,6 +30,7 @@ import (
 	"sort"
 	"sync"
 
+	"agentgo/internal/pathutil"
 	"agentgo/internal/roster"
 	"agentgo/internal/trace"
 )
@@ -235,6 +236,9 @@ func NewManager(projectRoot string, r roster.Roster) *Manager {
 
 // absRoot 把根路径归一为绝对路径；Abs 失败（极罕见）时退化为 Clean 后的原值。
 func absRoot(root string) string {
+	if canonical, err := pathutil.CanonicalizeRoot(root); err == nil {
+		return canonical
+	}
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return filepath.Clean(root)

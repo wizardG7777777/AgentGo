@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"agentgo/internal/pathutil"
 )
 
 // baselineDirName 是 workspace 根下保存基线原始副本的目录名。
@@ -31,7 +33,11 @@ func (m *Manager) workspaceRoot(taskID string) (string, error) {
 
 // relPath 把主根绝对路径换算为相对主根的路径；主根外路径返回 ok=false。
 func (m *Manager) relPath(absMainPath string) (string, bool) {
-	rel, err := filepath.Rel(m.projectRoot, absMainPath)
+	canonical, err := pathutil.ValidatePath(absMainPath, m.projectRoot)
+	if err != nil {
+		return "", false
+	}
+	rel, err := filepath.Rel(m.projectRoot, canonical)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", false
 	}

@@ -19,9 +19,10 @@ import (
 //     纯函数调用，可忽略。**更重要**的是禁用所有 hook 时工具行为仍然
 //     正确——这是回归测试的关键
 //
-//   - **不匹配 run_shell**：当前 internal/tools/shell.go 没有 path 参数，
-//     run_shell 的命令字符串通过 sh -c 解析自身路径，hook 无法在调用前
-//     截获路径。如未来 run_shell 引入 working_dir 参数，再扩展 Matches 集
+//   - **不匹配 run_shell**：run_shell 的 working_dir 受活动 workspace 影响，
+//     本静态 Gate 不持有 per-Runner ActiveView；internal/tools/shell.go 在进入
+//     Interaction 与 exec 前按当前允许根做同款 canonical 路径校验。命令正文
+//     通过 sh/PowerShell 自行解析绝对路径，仍不属于本路径 Gate 的保证面
 //
 //   - **path 缺失或非字符串 → Abort**（用户决议）：file 系工具没有 path
 //     参数是不合法调用。hook 拒绝比让工具自己报错更早、更显式

@@ -82,15 +82,14 @@ func TestPathBoundaryHook_AbsolutePathInsideRootContinue(t *testing.T) {
 	}
 }
 
-func TestPathBoundaryHook_EmptyProjectRootContinues(t *testing.T) {
-	// projectRoot 为空 → pathutil.ValidatePath 直接返回 nil error，hook Continue
+func TestPathBoundaryHook_EmptyProjectRootAborts(t *testing.T) {
 	h := NewPathBoundaryHook("")
 	d := h.Run(hook.ToolHookContext{
 		ToolName: "read_file",
 		Args:     map[string]any{"path": "/anywhere/file.md"},
 	})
-	if d.Action != hook.Continue {
-		t.Errorf("Action = %v, want Continue when projectRoot is empty", d.Action)
+	if d.Action != hook.Abort {
+		t.Errorf("Action = %v, want Abort when projectRoot is empty", d.Action)
 	}
 }
 

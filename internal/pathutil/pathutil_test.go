@@ -61,15 +61,67 @@ func TestValidatePath_SensitiveFile(t *testing.T) {
 	}
 }
 
-func TestValidatePath_EmptyRoot(t *testing.T) {
+func TestValidatePath_EmptyRootFailsClosed(t *testing.T) {
 	path := filepath.Join("some", "relative", "path.txt")
 
-	result, err := ValidatePath(path, "")
-	if err != nil {
-		t.Fatalf("空根目录应允许任何路径，但得到错误: %v", err)
+	if _, err := ValidatePath(path, ""); err == nil {
+		t.Fatal("空根目录必须 fail-closed")
 	}
-	if result != path {
-		t.Errorf("期望原样返回路径 %s，得到: %s", path, result)
+}
+
+func TestValidatePath_RejectsSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "outside-link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	if _, err := ValidatePath(filepath.Join(link, "secret.txt"), root); err == nil || !strings.Contains(err.Error(), "超出项目根目录") {
+		t.Fatalf("symlink escape should be rejected, got %v", err)
+	}
+	// 新文件路径也必须解析现存 symlink 祖先，不能因目标尚不存在而漏过。
+	if _, err := ValidatePath(filepath.Join(link, "new.txt"), root); err == nil || !strings.Contains(err.Error(), "超出项目根目录") {
+		t.Fatalf("nonexistent target through escaping symlink should be rejected, got %v", err)
+	}
+}
+
+func TestValidatePath_AllowsSymlinkWithinRootAndReturnsCanonicalPath(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real")
+	if err := os.Mkdir(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(realDir, "file.txt")
+	if err := os.WriteFile(target, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "inside-link")
+	if err := os.Symlink(realDir, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	got, err := ValidatePath(filepath.Join(link, "file.txt"), root)
+	if err != nil {
+		t.Fatalf("inside symlink should be allowed: %v", err)
+	}
+	want, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("canonical path = %q, want %q", got, want)
+	}
+}
+
+func TestValidatePath_ProtectsProjectShellRules(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, ".agentgo", "project_rules.yaml")
+	if _, err := ValidatePath(path, root); err == nil || !strings.Contains(err.Error(), "安全控制文件") {
+		t.Fatalf("project shell rules must be protected, got %v", err)
 	}
 }
 
@@ -117,7 +169,11 @@ func TestValidatePath_RelativeJoinedAgainstProjectRoot(t *testing.T) {
 		t.Fatalf("相对路径应被 join 到 projectRoot 下，但得到错误: %v", err)
 	}
 
-	expected, _ := filepath.Abs(filepath.Join(root, "docs", "foo"))
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := filepath.Join(canonicalRoot, "docs", "foo")
 	if result != expected {
 		t.Errorf("期望解析为 %s，实际: %s", expected, result)
 	}

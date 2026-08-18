@@ -32,8 +32,10 @@ func openAgentJournal(t *testing.T) *effect.Journal {
 func TestProcessTask_IsolationMergeEffectJournal(t *testing.T) {
 	s, r, _ := setup()
 	j := openAgentJournal(t)
-	mainRoot := t.TempDir()
-	mgr := &countingManager{real: workspace.NewManager(mainRoot, nil)}
+	rawRoot := t.TempDir()
+	realManager := workspace.NewManager(rawRoot, nil)
+	mainRoot := realManager.ProjectRoot()
+	mgr := &countingManager{real: realManager}
 	swapper := workspace.NewSwapper(mainRoot)
 
 	const agentID = "agent-iso"

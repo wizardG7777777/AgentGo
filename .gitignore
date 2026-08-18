@@ -63,6 +63,7 @@ setting.test-concurrent.yaml
 # 本地烟测用配置（含明文 API key / search key），不入库
 test_invest.yaml
 test_invest_reactors.yaml
+setting.openrouter.yaml
 
 # Agent 中间产出 + 历史归档目录
 artifacts/

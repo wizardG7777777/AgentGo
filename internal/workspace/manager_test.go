@@ -19,7 +19,8 @@ func newTestManager(t *testing.T) (*Manager, string) {
 	t.Helper()
 	root := t.TempDir()
 	// nil roster：跳过声明（仅测试用，见 Manager 注释）。
-	return NewManager(root, nil), root
+	m := NewManager(root, nil)
+	return m, m.ProjectRoot()
 }
 
 func writeMain(t *testing.T, root, rel, content string) string {
