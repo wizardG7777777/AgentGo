@@ -3,10 +3,24 @@ package tui
 import (
 	"fmt"
 	"strings"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
-// renderStatusBar draws the bottom help/status bar.
-func renderStatusBar(t Theme, w int, focus FocusState, view ViewState, interactionTextMode bool) string {
+// statusInfo 是状态栏左侧系统信息段（原顶栏内容，inline 重构图顶栏并入
+// 状态栏单行）。
+type statusInfo struct {
+	execMode, topoMode string
+	sessionID          string
+	graphCount         int
+	interactionPending int
+	totalTokens        int64
+}
+
+// renderStatusBar draws the bottom status bar: 左段 = 焦点/视图 + 系统信息，
+// 右段 = 键位 hints。宽度不足时先裁 hints（trim 大的先裁），再按 tokens →
+// graphs → session → modes 的顺序裁左段信息项，保证始终单行不折行。
+func renderStatusBar(t Theme, w int, focus FocusState, view ViewState, interactionTextMode bool, info statusInfo) string {
 	if w < 20 {
 		return ""
 	}
@@ -19,59 +33,87 @@ func renderStatusBar(t Theme, w int, focus FocusState, view ViewState, interacti
 		parts = append(parts, t.StatusKey.Render(" INPUT "))
 	case FocusInteraction:
 		parts = append(parts, t.StatusKey.Render(" INTERACTION "))
-	case FocusSidebar:
-		parts = append(parts, t.StatusKey.Render(" SIDEBAR "))
 	case FocusMain:
 		parts = append(parts, t.StatusKey.Render(" MAIN "))
 	}
 
 	// View indicator
 	switch view {
-	case ViewDashboard:
-		parts = append(parts, t.StatusVal.Render("Dashboard"))
-	case ViewAgentDetail:
-		parts = append(parts, t.StatusVal.Render("Agent Detail"))
+	case ViewGraph:
+		parts = append(parts, t.StatusVal.Render("Graph"))
+	case ViewNodeDetail:
+		parts = append(parts, t.StatusVal.Render("Node Detail"))
 	case ViewChat:
-		parts = append(parts, t.StatusVal.Render("Messages"))
+		parts = append(parts, t.StatusVal.Render("Chat"))
 	case ViewResult:
 		parts = append(parts, t.StatusVal.Render("Result"))
-	case ViewActivity:
-		parts = append(parts, t.StatusVal.Render("Activity"))
-	case ViewLogs:
-		parts = append(parts, t.StatusVal.Render("Logs"))
-	case ViewTrace:
-		parts = append(parts, t.StatusVal.Render("Trace"))
 	}
 
 	sep := t.StatusVal.Render(" │ ")
-
-	// Context-sensitive hints——从 keymap 声明表按当前上下文渲染，
-	// 与 /help 热键区共用同一张表（键位只有一个事实源）。
-	hints := statusHints(t, focus, view, interactionTextMode)
-
 	left := strings.Join(parts, sep)
 
-	// 宽度不足时按 trim 优先级裁剪 hints（数值大的先裁，0 = 始终保留），
-	// 保证状态栏始终单行不折行：新增的全局 hints 在窄终端先让位。
-	var right string
+	// 系统信息段（原顶栏）：可裁项按重要性升序排列，宽度不足时从前往后丢。
+	type infoItem struct {
+		text string
+	}
+	execMode, topoMode := info.execMode, info.topoMode
+	if execMode == "" {
+		execMode = "normal"
+	}
+	if topoMode == "" {
+		topoMode = "team"
+	}
+	items := []infoItem{}
+	if info.totalTokens > 0 {
+		items = append(items, infoItem{t.HeaderMeta.Render(" tokens: " + formatTokens(info.totalTokens) + " ")})
+	}
+	items = append(items, infoItem{t.HeaderMeta.Render(fmt.Sprintf(" %d graphs ", info.graphCount))})
+	if info.sessionID != "" {
+		items = append(items, infoItem{t.HeaderMeta.Render(" sess:" + shortID(info.sessionID) + " ")})
+	}
+	items = append(items, infoItem{t.HeaderMeta.Render(fmt.Sprintf(" %s/%s ", execMode, topoMode))})
+
+	hints := statusHints(t, focus, view, interactionTextMode)
 	for {
-		right = joinStatusHints(hints)
-		if w-lipglossWidth(left)-lipglossWidth(right) >= 1 {
-			break
+		infoLine := left
+		for _, item := range items {
+			infoLine += sep + item.text
 		}
-		if !dropTrimmableHint(&hints) {
-			break // 没有可裁的条目：保持原样（与裁剪前行为一致）
+		if info.interactionPending > 0 {
+			infoLine += sep + lipgloss.NewStyle().
+				Foreground(lipgloss.Color("196")).
+				Bold(true).
+				Render(fmt.Sprintf(" ◆ %d interaction ", info.interactionPending))
 		}
+		right := joinStatusHints(hints)
+		if w-lipglossWidth(infoLine)-lipglossWidth(right) >= 1 {
+			gap := w - lipglossWidth(infoLine) - lipglossWidth(right)
+			if gap < 1 {
+				gap = 1
+			}
+			line := infoLine + strings.Repeat(" ", gap) + right
+			return t.StatusStyle.Width(w).Render(line)
+		}
+		if dropTrimmableHint(&hints) {
+			continue
+		}
+		if len(items) > 0 {
+			items = items[:len(items)-1]
+			continue
+		}
+		// 左段固定部分（focus/view）也放不下：硬截断右段 hints。
+		avail := w - lipglossWidth(infoLine) - 1
+		if avail < 0 {
+			avail = 0
+		}
+		right = truncateDisplay(right, avail)
+		gap := w - lipglossWidth(infoLine) - lipglossWidth(right)
+		if gap < 1 {
+			gap = 1
+		}
+		line := infoLine + strings.Repeat(" ", gap) + right
+		return t.StatusStyle.Width(w).Render(line)
 	}
-
-	// Pad middle
-	gap := w - lipglossWidth(left) - lipglossWidth(right)
-	if gap < 1 {
-		gap = 1
-	}
-
-	line := left + strings.Repeat(" ", gap) + right
-	return t.StatusStyle.Width(w).Render(line)
 }
 
 // statusHint 是一条已渲染的状态栏提示。
@@ -87,13 +129,11 @@ func statusHints(t Theme, focus FocusState, view ViewState, interactionTextMode 
 	switch focus {
 	case FocusInteraction:
 		active[ctxInteraction] = true
-	case FocusSidebar:
-		active[ctxSidebar] = true
 	case FocusMain:
-		if view == ViewDashboard {
+		if view == ViewGraph {
 			active[ctxMain] = true
-		} else if view == ViewAgentDetail {
-			active[ctxAgentDetail] = true
+		} else if view == ViewNodeDetail {
+			active[ctxNodeDetail] = true
 		}
 	case FocusInput:
 		if interactionTextMode {
@@ -112,14 +152,13 @@ func statusHints(t Theme, focus FocusState, view ViewState, interactionTextMode 
 			continue
 		}
 		hint := e.hint
-		// Esc 在 Interaction 中只退出焦点/文本输入；详情/结果/诊断视图是
-		// 返回；其余顶层视图才是取消最近请求。
+		// Esc 在 Interaction 中只退出焦点/文本输入；全屏视图（节点详情/结果）
+		// 是返回；其余顶层视图才是取消最近请求。
 		if e.id == "esc" {
 			switch {
 			case focus == FocusInteraction || interactionTextMode:
 				hint = "return"
-			case view == ViewAgentDetail || view == ViewResult ||
-				view == ViewActivity || view == ViewLogs || view == ViewTrace:
+			case view == ViewNodeDetail || view == ViewResult:
 				hint = "back"
 			}
 		}

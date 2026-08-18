@@ -4,225 +4,209 @@ import (
 	"strings"
 	"testing"
 
+	"agentgo/internal/ui"
+
 	"github.com/charmbracelet/lipgloss"
 )
 
-func TestFormatTokens(t *testing.T) {
-	tests := []struct {
-		input int64
-		want  string
-	}{
-		{0, "0"},
-		{500, "500"},
-		{999, "999"},
-		{1000, "1.0k"},
-		{1500, "1.5k"},
-		{15000, "15.0k"},
-		{999999, "1000.0k"},
-		{1000000, "1.0M"},
-		{2500000, "2.5M"},
-	}
-	for _, tc := range tests {
-		got := formatTokens(tc.input)
-		if got != tc.want {
-			t.Errorf("formatTokens(%d) = %q, want %q", tc.input, got, tc.want)
+func TestRenderGraphDashboard_PlanningState(t *testing.T) {
+	result := renderGraphDashboard(DefaultTheme(), 100, 24, nil, -1, -1, 0,
+		"scheduler-1 · tool: submit_graph", []ui.AgentTurn{{
+			ID: "turn-1", AgentID: "scheduler-1", TaskID: "task-1", Loop: 0,
+			Status: "streaming", Reasoning: "先检查仓库，再决定下一步。", Text: "正在检查仓库",
+		}})
+	for _, want := range []string{"Scheduler · Planning", "scheduler-1", "submit_graph", "Raw Reasoning", "先检查仓库", "正在检查仓库"} {
+		if !strings.Contains(result, want) {
+			t.Fatalf("planning dashboard missing %q: %q", want, result)
 		}
 	}
 }
 
-func TestRenderDashboard_Empty(t *testing.T) {
-	theme := DefaultTheme()
-	result := renderDashboard(theme, 120, 40, nil)
-
-	if !strings.Contains(result, "No agents") {
-		t.Error("empty dashboard should show 'No agents' placeholder")
+func TestRenderGraphDashboard_ShowsNodesStatusesAndEdges(t *testing.T) {
+	graph := GraphInfo{
+		GraphID: "research", Status: "running", Revision: 2, StateVersion: 9, Root: "collect",
+		Nodes: []ui.GraphNodeView{
+			{NodeID: "collect", Title: "Collect sources", Kind: "agent", Status: "completed", Root: true, ActivationID: "collect@1"},
+			{NodeID: "verify", Title: "Verify claims", Kind: "acceptance", Status: "running", ActivationID: "verify@1", AgentID: "verifier-1"},
+			{NodeID: "finish", Title: "Finish", Kind: "end", Status: "inactive"},
+		},
+		Edges: []ui.GraphEdgeView{
+			{From: "collect", To: "verify", Traversed: true},
+			{From: "verify", To: "finish", When: "pass", Current: true, Traversed: true},
+		},
+	}
+	result := renderGraphDashboard(DefaultTheme(), 120, 34, &graph, 1, 0, 1, "", nil)
+	for _, want := range []string{
+		"Graph · research", "revision 2", "Collect sources", "completed",
+		"START collect", "END finish", "Verify claims", "running", "verifier-1",
+		"verify [pass] → finish",
+	} {
+		if !strings.Contains(result, want) {
+			t.Fatalf("graph dashboard missing %q: %q", want, result)
+		}
+	}
+	if !strings.Contains(result, "║") || !strings.Contains(result, "┃") {
+		t.Fatalf("graph dashboard should distinguish traversed and current paths: %q", result)
 	}
 }
 
-func TestRenderDashboard_TooSmall(t *testing.T) {
-	theme := DefaultTheme()
-	result := renderDashboard(theme, 5, 2, nil)
-	if result != "" {
-		t.Error("should return empty for too-small dimensions")
+func TestRenderGraphDashboard_DrawsBranchAndJoinTopology(t *testing.T) {
+	graph := GraphInfo{
+		GraphID: "branching", Status: "running", Root: "start",
+		Nodes: []ui.GraphNodeView{
+			{NodeID: "start", Title: "Start", Kind: "controller", Status: "completed", Root: true},
+			{NodeID: "source_a", Title: "Source A", Kind: "agent", Status: "completed"},
+			{NodeID: "source_b", Title: "Source B", Kind: "agent", Status: "running"},
+			{NodeID: "source_c", Title: "Source C", Kind: "agent", Status: "ready"},
+			{NodeID: "merge", Title: "Merge", Kind: "controller", Status: "inactive"},
+			{NodeID: "done", Title: "Done", Kind: "end", Status: "inactive"},
+		},
+		Edges: []ui.GraphEdgeView{
+			{From: "start", To: "source_a", Traversed: true, Current: true},
+			{From: "start", To: "source_b", Traversed: true},
+			{From: "start", To: "source_c"},
+			{From: "source_a", To: "merge", When: "ready"},
+			{From: "source_b", To: "merge", When: "ready"},
+			{From: "source_c", To: "merge", When: "ready"},
+			{From: "merge", To: "done"},
+		},
 	}
-}
 
-func TestRenderDashboard_SingleAgent(t *testing.T) {
-	theme := DefaultTheme()
-	agents := []AgentInfo{
-		{ID: "worker-1", Type: "worker", State: "processing", CurrentTaskDesc: "coding"},
+	result := renderGraphDashboard(DefaultTheme(), 150, 55, &graph, 2, 0, 1, "", nil)
+	lines := strings.Split(result, "\n")
+	startLine := lineContaining(lines, "START ✓ Start")
+	branchLine := lineContaining(lines, "Source A")
+	mergeLine := lineContaining(lines, "Merge")
+	endLine := lineContaining(lines, "END ○ Done")
+	if startLine < 0 || branchLine < 0 || mergeLine < 0 || endLine < 0 {
+		t.Fatalf("topology is missing an endpoint or layer: %q", result)
 	}
-	result := renderDashboard(theme, 120, 40, agents)
-
-	if !strings.Contains(result, "worker-1") {
-		t.Error("should show agent ID")
+	if !(startLine < branchLine && branchLine < mergeLine && mergeLine < endLine) {
+		t.Fatalf("layers are not ordered start → branches → join → end: %q", result)
 	}
-	if !strings.Contains(result, "Dashboard") {
-		t.Error("should show title")
+	for _, want := range []string{"Source A", "Source B", "Source C", "source_a [ready] → merge"} {
+		if !strings.Contains(result, want) {
+			t.Fatalf("branching topology missing %q: %q", want, result)
+		}
 	}
-}
-
-func TestRenderDashboard_MultipleAgents(t *testing.T) {
-	theme := DefaultTheme()
-	agents := []AgentInfo{
-		{ID: "worker-1", Type: "worker", State: "idle"},
-		{ID: "worker-2", Type: "worker", State: "processing", CurrentTaskDesc: "doing stuff"},
-		{ID: "explorer-1", Type: "explore", State: "idle"},
+	if strings.Count(result, "▼") < 5 {
+		t.Fatalf("branch and join connectors are not visible: %q", result)
 	}
-	result := renderDashboard(theme, 120, 40, agents)
-
-	for _, ag := range agents {
-		if !strings.Contains(result, ag.ID) {
-			t.Errorf("should show agent %s", ag.ID)
+	if !strings.Contains(result, "━") {
+		t.Fatalf("current execution edge should use a heavy path: %q", result)
+	}
+	for index, line := range lines {
+		if width := lipgloss.Width(line); width > 150 {
+			t.Fatalf("branching topology line %d width=%d, want <=150: %q", index, width, line)
 		}
 	}
 }
 
-func TestRenderAgentCard_Processing(t *testing.T) {
-	theme := DefaultTheme()
-	ag := AgentInfo{
-		ID:               "worker-1",
-		Type:             "worker",
-		State:            "processing",
-		CurrentTaskDesc:  "modifying main.go",
-		CallCount:        5,
-		PromptTokens:     10000,
-		CompletionTokens: 2000,
+func TestRenderGraphDashboard_LabelsBackEdge(t *testing.T) {
+	graph := GraphInfo{
+		GraphID: "retry-loop", Status: "running", Root: "start",
+		Nodes: []ui.GraphNodeView{
+			{NodeID: "start", Title: "Start", Kind: "controller", Status: "completed", Root: true},
+			{NodeID: "work", Title: "Work", Kind: "agent", Status: "running"},
+			{NodeID: "done", Title: "Done", Kind: "end", Status: "inactive"},
+		},
+		Edges: []ui.GraphEdgeView{
+			{From: "start", To: "work", Traversed: true},
+			{From: "work", To: "start", When: "retry", Traversed: true, Current: true},
+			{From: "work", To: "done", When: "pass"},
+			{From: "work", To: "removed_node", When: "historical", Traversed: true},
+		},
 	}
-	card := renderAgentCard(theme, ag, 36)
 
-	if !strings.Contains(card, "worker-1") {
-		t.Error("card should contain agent ID")
-	}
-	if !strings.Contains(card, "processing") {
-		t.Error("card should contain state")
-	}
-	if !strings.Contains(card, "modifying main.go") {
-		t.Error("card should contain task description")
-	}
-	if !strings.Contains(card, "12.0k") {
-		t.Error("card should contain token stats")
-	}
-}
-
-func TestRenderAgentCard_Idle(t *testing.T) {
-	theme := DefaultTheme()
-	ag := AgentInfo{ID: "explorer-1", Type: "explore", State: "idle"}
-	card := renderAgentCard(theme, ag, 36)
-
-	if !strings.Contains(card, "idle") {
-		t.Error("card should show idle state")
-	}
-	if strings.Contains(card, "tokens") {
-		t.Error("idle card should not show token stats when CallCount=0")
-	}
-}
-
-func TestRenderAgentCard_MailboxPending(t *testing.T) {
-	theme := DefaultTheme()
-	ag := AgentInfo{ID: "w-1", Type: "worker", State: "idle", MailboxPending: 3}
-	card := renderAgentCard(theme, ag, 36)
-
-	if !strings.Contains(card, "3 pending") {
-		t.Error("card should show mailbox pending count")
-	}
-}
-
-func TestRenderAgentCard_WaitingInteraction(t *testing.T) {
-	theme := DefaultTheme()
-	ag := AgentInfo{ID: "w-1", Type: "worker", State: "waiting_interaction"}
-	card := renderAgentCard(theme, ag, 36)
-
-	if !strings.Contains(card, "waiting interaction") {
-		t.Error("card should show waiting interaction state")
-	}
-}
-
-func TestRenderAgentCard_TaskDescTruncation(t *testing.T) {
-	theme := DefaultTheme()
-	longDesc := strings.Repeat("x", 100)
-	ag := AgentInfo{ID: "w-1", Type: "worker", State: "processing", CurrentTaskDesc: longDesc, CallCount: 1, PromptTokens: 1}
-	card := renderAgentCard(theme, ag, 36)
-
-	if !strings.Contains(card, "…") {
-		t.Error("long task desc should be truncated with …")
-	}
-}
-
-func TestRenderAgentCard_WideTaskDescTruncation(t *testing.T) {
-	theme := DefaultTheme()
-	ag := AgentInfo{
-		ID:              "w-1",
-		Type:            "worker",
-		State:           "processing",
-		CurrentTaskDesc: strings.Repeat("修复🙂", 20),
-		CallCount:       1,
-		PromptTokens:    1,
-	}
-	card := renderAgentCard(theme, ag, 36)
-
-	if !strings.Contains(card, "…") {
-		t.Error("wide task desc should be truncated with …")
-	}
-	maxWidth := lipgloss.Width(strings.Split(card, "\n")[0])
-	for i, line := range strings.Split(card, "\n") {
-		if got := lipgloss.Width(line); got > maxWidth {
-			t.Fatalf("line %d visual width = %d, want <= %d: %q", i, got, maxWidth, line)
+	result := renderGraphDashboard(DefaultTheme(), 110, 40, &graph, 1, 0, 1, "", nil)
+	for _, want := range []string{
+		"START", "END", "work [retry] ↩ start", "work [pass] → done",
+		"history work → removed_node",
+	} {
+		if !strings.Contains(result, want) {
+			t.Fatalf("cyclic topology missing %q: %q", want, result)
 		}
 	}
 }
 
-func TestRenderAgentCard_ActivityTool(t *testing.T) {
-	theme := DefaultTheme()
-	ag := AgentInfo{
-		ID:              "w-1",
-		Type:            "worker",
-		State:           "processing",
-		Phase:           "tooling",
-		Loop:            3,
-		LastTool:        "read_file",
-		ToolCallCount:   2,
-		ActivityAge:     "now",
-		LastModelText:   "I am reading the file",
-		CurrentTaskDesc: "inspect source",
-	}
-	card := renderAgentCard(theme, ag, 44)
-
-	if !strings.Contains(card, "tool: read_file") {
-		t.Error("card should show current tool activity")
-	}
-	if !strings.Contains(card, "tooling") {
-		t.Error("card should show activity phase")
-	}
-	if !strings.Contains(card, "loop 3") {
-		t.Error("card should show loop")
-	}
-	if !strings.Contains(card, "2 tools") {
-		t.Error("card should show tool count")
+func TestNodeStatusVisual_AllGraphStates(t *testing.T) {
+	for _, status := range []string{
+		"inactive", "ready", "running", "waiting", "completed",
+		"blocked", "failed", "cancelled", "skipped",
+	} {
+		icon, style := nodeStatusVisual(DefaultTheme(), status)
+		if icon == "" || style.Render(status) == "" {
+			t.Fatalf("status %q has no visual", status)
+		}
 	}
 }
 
-func TestRenderAgentCard_ActivityModelText(t *testing.T) {
-	theme := DefaultTheme()
-	ag := AgentInfo{
-		ID:            "w-1",
-		Type:          "worker",
-		State:         "processing",
-		LastModelText: "Comparing the current implementation with tests",
+func TestRenderGraphDashboard_BoundsWideText(t *testing.T) {
+	graph := graphFixture("graph-wide", "running", "running", "waiting")
+	graph.Nodes[0].Title = strings.Repeat("整理长中文节点标题🙂", 12)
+	graph.Nodes[1].Title = strings.Repeat("等待审批与外部事件", 12)
+	result := renderGraphDashboard(DefaultTheme(), 72, 22, &graph, 0, 0, 1, "", nil)
+	lines := strings.Split(result, "\n")
+	if len(lines) > 22 {
+		t.Fatalf("rendered lines=%d, want <=22", len(lines))
 	}
-	card := renderAgentCard(theme, ag, 60)
-
-	if !strings.Contains(card, "Comparing the current implementation") {
-		t.Error("card should show recent model text when no tool is active")
+	for index, line := range lines {
+		if width := lipgloss.Width(line); width > 72 {
+			t.Fatalf("line %d width=%d, want <=72: %q", index, width, line)
+		}
 	}
 }
 
-func TestTruncateRunes_UsesCellWidth(t *testing.T) {
-	result := truncateRunes("处理🙂任务", 6)
-	if got := lipgloss.Width(result); got > 6 {
-		t.Fatalf("visual width = %d, want <= 6", got)
+func TestRenderGraphDashboard_KeepsSelectedNodeVisible(t *testing.T) {
+	graph := graphFixture("graph-many", "running",
+		"inactive", "inactive", "inactive", "inactive", "inactive", "running")
+	graph.Nodes[0].Title = "FIRST-NODE-MARKER"
+	graph.Nodes[len(graph.Nodes)-1].Title = "SELECTED-NODE-MARKER"
+
+	result := renderGraphDashboard(DefaultTheme(), 72, 13, &graph, len(graph.Nodes)-1, 0, 1, "", nil)
+	if !strings.Contains(result, "SELECTED-NODE-MARKER") {
+		t.Fatalf("selected node row should stay visible: %q", result)
 	}
-	if !strings.Contains(result, "…") {
-		t.Error("wide text should be truncated")
+	if strings.Contains(result, "FIRST-NODE-MARKER") {
+		t.Fatalf("off-screen first row should not replace selected row: %q", result)
 	}
+	if lines := strings.Count(result, "\n") + 1; lines > 13 {
+		t.Fatalf("rendered lines=%d, want <=13", lines)
+	}
+}
+
+func TestRenderGraphDashboard_TooSmall(t *testing.T) {
+	if got := renderGraphDashboard(DefaultTheme(), 5, 2, nil, -1, -1, 0, "", nil); got != "" {
+		t.Fatalf("too-small dashboard should be empty, got %q", got)
+	}
+}
+
+func TestRenderGraphDashboard_MinimumWidthStaysBounded(t *testing.T) {
+	graph := GraphInfo{
+		GraphID: "narrow", Status: "running", Root: "start",
+		Nodes: []ui.GraphNodeView{
+			{NodeID: "start", Title: "Very long root title", Kind: "controller", Status: "running", Root: true},
+			{NodeID: "done", Title: "Done", Kind: "end", Status: "inactive"},
+		},
+		Edges: []ui.GraphEdgeView{{From: "start", To: "done", Current: true, Traversed: true}},
+	}
+	result := renderGraphDashboard(DefaultTheme(), 10, 10, &graph, 0, 0, 1, "", nil)
+	lines := strings.Split(result, "\n")
+	if len(lines) > 10 {
+		t.Fatalf("rendered lines=%d, want <=10", len(lines))
+	}
+	for index, line := range lines {
+		if width := lipgloss.Width(line); width > 10 {
+			t.Fatalf("line %d width=%d, want <=10: %q", index, width, line)
+		}
+	}
+}
+
+func lineContaining(lines []string, text string) int {
+	for index, line := range lines {
+		if strings.Contains(line, text) {
+			return index
+		}
+	}
+	return -1
 }

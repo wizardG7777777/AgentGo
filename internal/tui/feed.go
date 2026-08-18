@@ -11,7 +11,6 @@ import (
 
 const (
 	tuiOutputLimit = 200
-	tuiLogLimit    = 500
 	tuiTraceLimit  = 1000
 )
 
@@ -25,27 +24,19 @@ func feedOutputFromEvent(ev output.Event, at time.Time) ui.FeedOutput {
 	}
 	return ui.FeedOutput{
 		Kind: kind, AgentID: ev.AgentID, TaskID: ev.TaskID, StreamID: ev.StreamID,
-		Loop: ev.Loop, Text: ev.Text, Done: ev.Done, Error: ev.Error, At: at,
+		Loop: ev.Loop, Text: ev.Text, Reasoning: ev.Reasoning,
+		Done: ev.Done, Error: ev.Error, At: at,
 	}
 }
 
 func (m *AppModel) restoreFeed(feed ui.FeedSnapshot) {
 	m.feedOutputs = append([]ui.FeedOutput(nil), feed.Outputs...)
-	m.logs = append([]ui.LogItem(nil), feed.Logs...)
 	m.traces = append([]ui.TraceEvent(nil), feed.Traces...)
-	for _, item := range feed.Outputs {
-		switch item.Kind {
-		case "text":
-			m.messages = append(m.messages, StyledMsg{Text: item.Text, Kind: MsgAgent, At: item.At, AgentID: item.AgentID})
-		case "stream":
-			if item.StreamID != "" {
-				m.upsertConversationStream(item)
-			}
-		}
-	}
-	if len(m.messages) > maxMessages {
-		m.messages = m.messages[len(m.messages)-maxMessages:]
-	}
+	// inline 重构：快照中的 text/stream 输出不再回填消息流——定稿轮次经
+	// replayTurns 统一回放进 scrollback，活动区（m.messages）只接纳恢复
+	// 之后新到达的实时流；恢复点上的在途流（进程重启 / Session 冻结现场）
+	// 已死，其最终状态由后续 TurnsChanged 账本给出。
+	m.messages = nil
 }
 
 func (m *AppModel) recordFeedOutput(item ui.FeedOutput) {
@@ -63,16 +54,6 @@ func (m *AppModel) recordFeedOutput(item ui.FeedOutput) {
 	}
 }
 
-func (m *AppModel) appendLog(item ui.LogItem) {
-	if item.At.IsZero() {
-		item.At = time.Now()
-	}
-	m.logs = append(m.logs, item)
-	if len(m.logs) > tuiLogLimit {
-		m.logs = append([]ui.LogItem(nil), m.logs[len(m.logs)-tuiLogLimit:]...)
-	}
-}
-
 func (m *AppModel) appendTrace(event ui.TraceEvent) {
 	m.traces = append(m.traces, event)
 	if len(m.traces) > tuiTraceLimit {
@@ -80,31 +61,13 @@ func (m *AppModel) appendTrace(event ui.TraceEvent) {
 	}
 }
 
-func (m *AppModel) upsertConversationStream(item ui.FeedOutput) {
-	text := item.Text
-	if item.Error != "" {
-		if text != "" {
-			text += "\n"
-		}
-		text += "[stream error] " + item.Error
-	}
-	for i := range m.messages {
-		if m.messages[i].StreamID == item.StreamID {
-			m.messages[i].Text = text
-			m.messages[i].AgentID = item.AgentID
-			m.messages[i].At = item.At
-			return
-		}
-	}
-	m.messages = append(m.messages, StyledMsg{
-		Text: text, Kind: MsgAgent, At: item.At, AgentID: item.AgentID, StreamID: item.StreamID,
-	})
-}
-
-func (m *AppModel) outputsForAgent(agentID string) []ui.FeedOutput {
+func (m *AppModel) outputsForNode(node GraphNodeInfo) []ui.FeedOutput {
 	out := make([]ui.FeedOutput, 0)
+	if node.TaskID == "" {
+		return out
+	}
 	for _, item := range m.feedOutputs {
-		if item.AgentID == agentID {
+		if item.TaskID == node.TaskID {
 			out = append(out, item)
 		}
 	}
@@ -141,6 +104,9 @@ func (m *AppModel) upsertTurnEvent(ev output.Event, at time.Time) {
 		if ev.Text != "" || m.turns[i].Text == "" {
 			m.turns[i].Text = ev.Text
 		}
+		if ev.Reasoning != "" || m.turns[i].Reasoning == "" {
+			m.turns[i].Reasoning = ev.Reasoning
+		}
 		if ev.Error != "" {
 			m.turns[i].Error = ev.Error
 		}
@@ -170,6 +136,7 @@ func (m *AppModel) upsertTurnEvent(ev output.Event, at time.Time) {
 		TaskID:      ev.TaskID,
 		Loop:        ev.Loop,
 		Text:        ev.Text,
+		Reasoning:   ev.Reasoning,
 		Status:      status,
 		ToolCalls:   append([]string(nil), ev.ToolCalls...),
 		StartedAt:   at,
@@ -178,40 +145,30 @@ func (m *AppModel) upsertTurnEvent(ev output.Event, at time.Time) {
 	})
 }
 
-func (m *AppModel) turnsForAgent(agentID string) []ui.AgentTurn {
+func (m *AppModel) turnsForNode(node GraphNodeInfo) []ui.AgentTurn {
 	out := make([]ui.AgentTurn, 0)
+	if node.TaskID == "" {
+		return out
+	}
 	for _, turn := range m.turns {
-		if turn.AgentID == agentID {
+		if turn.TaskID == node.TaskID {
 			out = append(out, turn)
 		}
 	}
 	return out
 }
 
-func (m *AppModel) tracesForAgent(agentID string) []ui.TraceEvent {
+func (m *AppModel) tracesForNode(graph GraphInfo, node GraphNodeInfo) []ui.TraceEvent {
 	out := make([]ui.TraceEvent, 0)
 	for _, event := range m.traces {
-		if event.AgentID == agentID {
+		byTask := node.TaskID != "" && event.TaskID == node.TaskID
+		byActivation := event.GraphID == graph.GraphID && event.NodeID == node.NodeID &&
+			(node.ActivationID == "" || event.ActivationID == "" || event.ActivationID == node.ActivationID)
+		if byTask || byActivation {
 			out = append(out, event)
 		}
 	}
 	return out
-}
-
-func renderConversationWithActivity(t Theme, w, h int, messages []StyledMsg, result *StyledMsg, agents []AgentInfo) string {
-	active := activeAgents(agents)
-	if len(active) == 0 || h < 12 {
-		return renderChat(t, w, h, messages, result)
-	}
-	activityH := len(active) + 2
-	if activityH > 7 {
-		activityH = 7
-	}
-	chatH := h - activityH - 1
-	if chatH < 5 {
-		return renderChat(t, w, h, messages, result)
-	}
-	return renderChat(t, w, chatH, messages, result) + "\n" + renderLiveActivity(t, w, activityH, active)
 }
 
 func activeAgents(agents []AgentInfo) []AgentInfo {
@@ -243,16 +200,19 @@ func renderLiveActivity(t Theme, w, h int, agents []AgentInfo) string {
 	return title + "\n" + divider + "\n" + strings.Join(lines, "\n")
 }
 
-func renderAgentWorkbench(
+func renderNodeWorkbench(
 	t Theme,
 	w, h int,
-	info AgentInfo,
+	graph GraphInfo,
+	node GraphNodeInfo,
+	info *AgentInfo,
 	turns []ui.AgentTurn,
 	outputs []ui.FeedOutput,
 	traces []ui.TraceEvent,
+	activationIndex, activationTotal int,
 	scrollFromBottom int,
 ) string {
-	fixed, history, viewportH := agentWorkbenchParts(t, w, h, info, turns, outputs, traces)
+	fixed, history, viewportH := nodeWorkbenchParts(t, w, h, graph, node, info, turns, outputs, traces, activationIndex, activationTotal)
 	if viewportH <= 0 {
 		if len(fixed) > h {
 			fixed = fixed[:h]
@@ -275,45 +235,86 @@ func renderAgentWorkbench(
 	return strings.Join(append(fixed, visible...), "\n")
 }
 
-func agentWorkbenchMaxScroll(
+func nodeWorkbenchMaxScroll(
 	t Theme,
 	w, h int,
-	info AgentInfo,
+	graph GraphInfo,
+	node GraphNodeInfo,
+	info *AgentInfo,
 	turns []ui.AgentTurn,
 	outputs []ui.FeedOutput,
 	traces []ui.TraceEvent,
+	activationIndex, activationTotal int,
 ) int {
-	_, history, viewportH := agentWorkbenchParts(t, w, h, info, turns, outputs, traces)
+	_, history, viewportH := nodeWorkbenchParts(t, w, h, graph, node, info, turns, outputs, traces, activationIndex, activationTotal)
 	return maxInt(0, len(history)-viewportH)
 }
 
-func agentWorkbenchParts(
+func nodeWorkbenchParts(
 	t Theme,
 	w, h int,
-	info AgentInfo,
+	graph GraphInfo,
+	node GraphNodeInfo,
+	info *AgentInfo,
 	turns []ui.AgentTurn,
 	outputs []ui.FeedOutput,
 	traces []ui.TraceEvent,
+	activationIndex, activationTotal int,
 ) (fixed []string, history []string, viewportH int) {
-	title := t.MdH2.Render(truncateDisplay(fmt.Sprintf("  %s Agent: %s", t.IconAgent, info.ID), w))
-	meta := fmt.Sprintf("  %s · task %s · loop %d · %s · %d tools",
-		info.State, shortID(info.CurrentTaskID), info.Loop, info.Phase, info.ToolCallCount)
+	// 预留两格安全边距，防止恰好满宽的 CJK 标题让终端多折一行物理行。
+	w = maxInt(1, w-2)
+	icon, statusStyle := nodeStatusVisual(t, node.Status)
+	title := t.MdH2.Render(truncateDisplay(fmt.Sprintf("  %s Node · %s", icon, node.Title), w))
+	meta := fmt.Sprintf("  graph %s · node %s · %s · %s · activation %s",
+		graph.GraphID, node.NodeID, node.Kind, statusStyle.Render(node.Status), node.ActivationID)
+	// activation 历史位置（回边重进会产生多条）；多于一页时提示 ←→ 可切换。
+	if activationTotal > 0 && activationIndex >= 0 {
+		meta += fmt.Sprintf(" (%d/%d)", activationIndex+1, activationTotal)
+		if activationTotal > 1 {
+			meta += " ←→"
+		}
+	}
 	divider := t.MdDivider.Render(strings.Repeat("─", w))
 	fixed = []string{title, t.SidebarDim.Render(truncateDisplay(meta, w)), divider}
 	if h <= len(fixed) {
 		return fixed, nil, 0
 	}
 
-	if active := activeToolLines(t, w, info.ActiveTools); len(active) > 0 {
+	activityInfo := AgentInfo{CurrentTaskID: node.TaskID}
+	if info != nil {
+		activityInfo = *info
+		agentMeta := fmt.Sprintf("  executor %s · %s · loop %d · %s · %d tools",
+			info.ID, info.State, info.Loop, info.Phase, info.ToolCallCount)
+		fixed = append(fixed, t.SidebarDim.Render(truncateDisplay(agentMeta, w)))
+		// 等待/阻塞信息常驻：waiting 节点挂了执行者卡片后，「在等什么」
+		// 不能被卡片遮蔽（无卡片的回退行 nodeContextLine 已自带这些字段）。
+		if line := waitLine(node); line != "" {
+			fixed = append(fixed, t.SidebarDim.Render(truncateDisplay("  "+line, w)))
+		}
+	} else {
+		fixed = append(fixed, t.SidebarDim.Render(truncateDisplay(nodeContextLine(node), w)))
+	}
+	if node.Reason != "" {
+		fixed = append(fixed, t.MsgError.Render(truncateDisplay("  "+node.Reason, w)))
+	}
+	if active := activeToolLines(t, w, activityInfo.ActiveTools); len(active) > 0 {
 		fixed = append(fixed, t.MdH2.Render("  Active Tools"))
 		fixed = append(fixed, tailLines(active, 2)...)
 	}
 	if hasDecisionTrace(traces) {
-		fixed = append(fixed, t.MdH2.Render("  Recent Decisions"))
+		fixed = append(fixed, t.MdH2.Render("  Recent Activity"))
 		fixed = append(fixed, tailLines(recentDecisionLines(t, w, traces), 3)...)
 	}
 
-	history = turnHistoryLines(t, w, turns, outputs, info)
+	history = turnHistoryLines(t, w, turns, outputs, activityInfo)
+	resultDisplay := node.ResultSummary
+	if resultDisplay == "" {
+		resultDisplay = node.ResultRef // 兼容旧图：历史 result_ref 字段存展示摘要
+	}
+	if resultDisplay != "" {
+		history = append(history, t.MdH2.Render("  Node Result"),
+			t.MsgInfo.Render(truncateDisplay("  "+resultDisplay, w)))
+	}
 	if final := latestResultLines(t, w, outputs); len(final) > 0 {
 		history = append(history, t.MdH2.Render("  Final Result"))
 		history = append(history, final...)
@@ -325,8 +326,54 @@ func agentWorkbenchParts(
 	return fixed, history, viewportH
 }
 
+// waitLine 渲染节点的等待/阻塞上下文（等待事件、审批号、子图、deadline）。
+// node.Status ∈ {waiting, blocked} 或这些字段非空时应常驻 fixed 区；
+// 全部为空时返回空串（调用方不渲染空行）。
+func waitLine(node GraphNodeInfo) string {
+	parts := make([]string, 0, 4)
+	if node.WaitEvent != "" {
+		parts = append(parts, "waiting for "+node.WaitEvent)
+	}
+	if node.RequestID != "" {
+		parts = append(parts, "approval "+node.RequestID)
+	}
+	if node.ChildGraphID != "" {
+		parts = append(parts, "subgraph "+node.ChildGraphID)
+	}
+	if node.WaitDeadline != nil {
+		parts = append(parts, "deadline "+node.WaitDeadline.Format("15:04:05"))
+	}
+	return strings.Join(parts, " · ")
+}
+
+func nodeContextLine(node GraphNodeInfo) string {
+	parts := make([]string, 0, 4)
+	if node.AgentID != "" {
+		parts = append(parts, "executor "+node.AgentID)
+	}
+	if node.TaskID != "" {
+		parts = append(parts, "task "+shortID(node.TaskID))
+	}
+	if node.WaitEvent != "" {
+		parts = append(parts, "waiting for "+node.WaitEvent)
+	}
+	if node.RequestID != "" {
+		parts = append(parts, "approval "+node.RequestID)
+	}
+	if node.ChildGraphID != "" {
+		parts = append(parts, "subgraph "+node.ChildGraphID)
+	}
+	if node.WaitDeadline != nil {
+		parts = append(parts, "deadline "+node.WaitDeadline.Format("15:04:05"))
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "no executor assigned")
+	}
+	return "  " + strings.Join(parts, " · ")
+}
+
 func turnHistoryLines(t Theme, w int, turns []ui.AgentTurn, outputs []ui.FeedOutput, info AgentInfo) []string {
-	lines := []string{t.MdH2.Render(fmt.Sprintf("  Turn History · %d turns", len(turns)))}
+	lines := []string{t.MdH2.Render(fmt.Sprintf("  Execution History · %d turns", len(turns)))}
 	if len(turns) == 0 {
 		lines = append(lines, agentOutputLines(t, w, outputs, info)...)
 		return lines
@@ -350,6 +397,10 @@ func turnHistoryLines(t Theme, w int, turns []ui.AgentTurn, outputs []ui.FeedOut
 		header := fmt.Sprintf("  %s Loop %d · %s · task %s%s",
 			icon, turn.Loop, turn.Status, shortID(turn.TaskID), timeText)
 		lines = append(lines, t.MsgLog.Render(truncateDisplay(header, w)))
+		if strings.TrimSpace(turn.Reasoning) != "" {
+			lines = append(lines, t.StateInteraction.Render("  Raw Reasoning"))
+			lines = append(lines, rawReasoningLines(t, w, turn.Reasoning, "  ")...)
+		}
 		textLines := wrapWorkbenchText(t, w, turn.Text)
 		if len(textLines) == 0 {
 			textLines = []string{t.SidebarDim.Render("  （本轮没有公开文本）")}
@@ -383,7 +434,7 @@ func tailLines(lines []string, limit int) []string {
 func hasDecisionTrace(traces []ui.TraceEvent) bool {
 	for _, event := range traces {
 		if event.Kind == "tool_call" || event.Kind == "tool_result" ||
-			strings.HasPrefix(event.Kind, "plan_") || strings.HasPrefix(event.Kind, "replan_") ||
+			strings.HasPrefix(event.Kind, "graph_") || strings.HasPrefix(event.Kind, "node_") ||
 			event.Kind == "acceptance_completed" || event.Kind == "error" {
 			return true
 		}
@@ -430,7 +481,10 @@ func agentOutputLines(t Theme, w int, outputs []ui.FeedOutput, info AgentInfo) [
 		lines = wrapWorkbenchText(t, w, info.LastModelText)
 	}
 	if len(lines) == 0 {
-		message := "Waiting for model output..."
+		message := "No model output for this node."
+		if info.ID != "" {
+			message = "Waiting for model output..."
+		}
 		if len(info.ActiveTools) > 0 {
 			message = "Model turn contains tool calls; see Active Tools below."
 		}
@@ -476,7 +530,7 @@ func recentDecisionLines(t Theme, w int, traces []ui.TraceEvent) []string {
 	for i := len(traces) - 1; i >= 0; i-- {
 		event := traces[i]
 		include := event.Kind == "tool_call" || event.Kind == "tool_result" ||
-			strings.HasPrefix(event.Kind, "plan_") || strings.HasPrefix(event.Kind, "replan_") ||
+			strings.HasPrefix(event.Kind, "graph_") || strings.HasPrefix(event.Kind, "node_") ||
 			event.Kind == "acceptance_completed" || event.Kind == "error"
 		if !include {
 			continue
@@ -528,99 +582,6 @@ func latestResultLines(t Theme, w int, outputs []ui.FeedOutput) []string {
 		}
 	}
 	return nil
-}
-
-func renderActivityView(t Theme, w, h int, agents []AgentInfo, traces []ui.TraceEvent) string {
-	title := t.MdH2.Render("  Cross-Agent Activity")
-	divider := t.MdDivider.Render(strings.Repeat("─", w))
-	var lines []string
-	for _, ag := range activeAgents(agents) {
-		lines = append(lines, t.MsgInfo.Render(truncateDisplay(fmt.Sprintf("● %-18s %-18s %s", ag.ID, ag.Phase, agentDoingText(ag)), w)))
-	}
-	lines = append(lines, traceLines(t, w, traces, true)...)
-	return renderFeedPage(title, divider, lines, h)
-}
-
-func renderLogsView(t Theme, w, h int, logs []ui.LogItem) string {
-	title := t.MdH2.Render("  Diagnostic Logs")
-	divider := t.MdDivider.Render(strings.Repeat("─", w))
-	lines := make([]string, 0, len(logs))
-	for _, item := range logs {
-		text := item.Text
-		if !looksTimestamped(text) {
-			text = item.At.Format("15:04:05") + " " + text
-		}
-		lines = append(lines, t.MsgLog.Render(truncateDisplay(text, w)))
-	}
-	return renderFeedPage(title, divider, lines, h)
-}
-
-func renderTraceView(t Theme, w, h int, traces []ui.TraceEvent) string {
-	title := t.MdH2.Render("  Trace / Tool Calls")
-	divider := t.MdDivider.Render(strings.Repeat("─", w))
-	return renderFeedPage(title, divider, traceLines(t, w, traces, false), h)
-}
-
-func renderFeedPage(title, divider string, lines []string, h int) string {
-	maxLines := h - 2
-	if maxLines < 1 {
-		maxLines = 1
-	}
-	if len(lines) > maxLines {
-		lines = lines[len(lines)-maxLines:]
-	}
-	for len(lines) < maxLines {
-		lines = append([]string{""}, lines...)
-	}
-	return title + "\n" + divider + "\n" + strings.Join(lines, "\n")
-}
-
-func traceLines(t Theme, w int, traces []ui.TraceEvent, activityOnly bool) []string {
-	lines := make([]string, 0, len(traces))
-	for _, event := range traces {
-		if activityOnly && !isActivityTrace(event.Kind) {
-			continue
-		}
-		agentID := event.AgentID
-		if agentID == "" {
-			agentID = "system"
-		}
-		detail := event.Message
-		if event.Tool != "" {
-			detail = "tool=" + event.Tool + firstWithPrefix(detail, " · ")
-		}
-		if event.ArgsSummary != "" {
-			detail += firstWithPrefix(event.ArgsSummary, " · args=")
-		}
-		if event.Outcome != "" {
-			detail += firstWithPrefix(event.Outcome, " · ")
-		}
-		if event.DurationMS > 0 {
-			detail += fmt.Sprintf(" · %dms", event.DurationMS)
-		}
-		line := fmt.Sprintf("%s [%s] %-22s %s", event.At.Format("15:04:05"), agentID, event.Kind, detail)
-		lines = append(lines, t.MsgLog.Render(truncateDisplay(line, w)))
-	}
-	return lines
-}
-
-func isActivityTrace(kind string) bool {
-	return strings.HasPrefix(kind, "task_") || strings.HasPrefix(kind, "agent_state_") ||
-		strings.HasPrefix(kind, "llm_call_") || strings.HasPrefix(kind, "shell_") ||
-		strings.HasPrefix(kind, "interaction_") ||
-		kind == "tool_call" || kind == "tool_result" || kind == "file_written" ||
-		kind == "progress_notify" || kind == "error" || strings.HasPrefix(kind, "plan_")
-}
-
-func firstWithPrefix(value, prefix string) string {
-	if value == "" {
-		return ""
-	}
-	return prefix + value
-}
-
-func looksTimestamped(text string) bool {
-	return len(text) >= 10 && text[4] == '/' && text[7] == '/'
 }
 
 func wrapDisplay(text string, width int) []string {

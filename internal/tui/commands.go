@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -55,7 +56,11 @@ func (m *AppModel) handleCommand(line string) bool {
 		m.steerAgent(agentID, msg)
 
 	case "/new":
-		m.newSession()
+		if len(parts) >= 2 && strings.ToLower(parts[1]) == "force" {
+			m.newSessionForce()
+		} else {
+			m.newSession()
+		}
 
 	case "/doctor":
 		if len(parts) < 2 || parts[1] != "agents" {
@@ -64,29 +69,35 @@ func (m *AppModel) handleCommand(line string) bool {
 		}
 		m.requestAgentAudit()
 
+	case "/event":
+		if len(parts) < 3 {
+			m.appendMsg("[event] 用法: /event <graph-id> <事件名> [数据JSON] — 向图的 wait_event 节点投递外部事件", MsgWarn)
+			return false
+		}
+		var data map[string]any
+		if len(parts) > 3 {
+			if err := json.Unmarshal([]byte(strings.Join(parts[3:], " ")), &data); err != nil {
+				m.appendMsg(fmt.Sprintf("[event] 数据不是合法 JSON 对象: %v", err), MsgError)
+				return false
+			}
+		}
+		m.emitGraphEvent(parts[1], parts[2], data)
+
 	case "/session":
 		if len(parts) < 2 {
-			m.listSessions()
+			// 无参打开会话选择面板（↑/↓ 选择，Enter 切换，Esc 关闭）。
+			m.openSessionPicker()
 		} else {
 			m.switchSession(parts[1])
 		}
 
-	case "/dashboard", "/dash":
-		m.view = ViewDashboard
-		m.appendMsg("[view] 切换到仪表板视图", MsgInfo)
+	case "/graph":
+		m.view = ViewGraph
+		m.appendMsg("[view] 切换到执行图视图", MsgInfo)
 
 	case "/chat":
 		m.view = ViewChat
-		m.appendMsg("[view] 切换到消息视图", MsgInfo)
-
-	case "/activity":
-		m.view = ViewActivity
-
-	case "/logs":
-		m.view = ViewLogs
-
-	case "/trace":
-		m.view = ViewTrace
+		m.appendMsg("[view] 切换到会话视图", MsgInfo)
 
 	case "/detail", "/result":
 		if m.lastResult == nil {
@@ -97,12 +108,12 @@ func (m *AppModel) handleCommand(line string) bool {
 		m.resultScroll = 0
 		m.appendMsg("[view] 切换到完整结果视图", MsgInfo)
 
-	case "/agent":
+	case "/node":
 		if len(parts) < 2 {
-			m.appendMsg("[agent] 用法: /agent <id> — 查看代理详情", MsgWarn)
+			m.appendMsg("[node] 用法: /node <id> — 查看当前图的节点详情", MsgWarn)
 			return false
 		}
-		m.selectAgentByID(parts[1])
+		m.selectNodeByID(parts[1])
 
 	default:
 		m.appendMsg(fmt.Sprintf("[command] 未知命令: %s (输入 /help 查看帮助)", cmd), MsgWarn)
@@ -124,7 +135,13 @@ func (m *AppModel) showStatus() {
 
 	var lines []string
 	lines = append(lines, "── 系统状态 ──")
-	lines = append(lines, fmt.Sprintf("  Agents: %d", len(snap.Agents)))
+	lines = append(lines, fmt.Sprintf("  Graphs: %d", len(snap.Graphs)))
+	for _, graph := range snap.Graphs {
+		completed, active := graphProgress(graph)
+		lines = append(lines, fmt.Sprintf("  Graph %s: %s  nodes=%d/%d completed  active=%d",
+			graph.GraphID, graph.Status, completed, len(graph.Nodes), active))
+	}
+	lines = append(lines, fmt.Sprintf("  Runtime agents: %d", len(snap.Agents)))
 	lines = append(lines, fmt.Sprintf("  Tasks: pending=%d  processing=%d  completed=%d  failed=%d",
 		counts[string(model.TaskStatusPending)],
 		counts[string(model.TaskStatusProcessing)],
@@ -283,6 +300,21 @@ func (m *AppModel) steerAgent(agentID, msg string) {
 	m.appendMsg(fmt.Sprintf("[steer] 已发送指导给 %s", agentID), MsgInfo)
 }
 
+// emitGraphEvent 经控制面向指定图的 wait_event 节点投递外部事件（/event）。
+// 事件是时点信号：节点未在等待或所属 Session 冻结时到达视为未发生，
+// 由 Runtime 内部闸门静默忽略（这里回报的是"已投递"，不保证命中）。
+func (m *AppModel) emitGraphEvent(graphID, event string, data map[string]any) {
+	if m.deps.Controller == nil {
+		m.appendMsg("[event] 控制面未初始化", MsgError)
+		return
+	}
+	if err := m.deps.Controller.EmitGraphEvent(graphID, event, data); err != nil {
+		m.appendMsg(fmt.Sprintf("[event] %v", err), MsgError)
+		return
+	}
+	m.appendMsg(fmt.Sprintf("[event] 已投递事件 %q → 图 %s（节点未在等待时事件被忽略）", event, graphID), MsgInfo)
+}
+
 func (m *AppModel) newSession() {
 	if m.deps.Controller == nil {
 		m.appendMsg("[session] Session 管理器未初始化", MsgError)
@@ -301,29 +333,30 @@ func (m *AppModel) newSession() {
 	m.appendMsg(fmt.Sprintf("[session] 新 Session 已创建: %s", id), MsgInfo)
 }
 
-func (m *AppModel) listSessions() {
+// resetSessionViews 在 Session 发生切换（强制新建 / 切换）成功后清空本地
+// 会话相关视图：消息流、完整结果与结果滚动位置都不跨 Session（B3）。
+// /new 普通新建是连续语义，只清结果视图，不调用本函数。
+func (m *AppModel) resetSessionViews() {
+	m.messages = nil
+	m.lastResult = nil
+	m.resultScroll = 0
+}
+
+// newSessionForce 终止当前 Session 的全部运行内容（任务取消、Graph 终结、
+// Team 回收）后开新 Session。与 /new 的连续语义不同，这是破坏性重置：
+// 本地消息流一并清空，旧 Session 以全终态快照归档。
+func (m *AppModel) newSessionForce() {
 	if m.deps.Controller == nil {
 		m.appendMsg("[session] Session 管理器未初始化", MsgError)
 		return
 	}
-	sessions, err := m.deps.Controller.ListSessions()
+	id, err := m.deps.Controller.NewSessionForce()
 	if err != nil {
-		m.appendMsg(fmt.Sprintf("[session] 列表失败: %v", err), MsgError)
+		m.appendMsg(fmt.Sprintf("[session] 强制新建失败: %v", err), MsgError)
 		return
 	}
-	if len(sessions) == 0 {
-		m.appendMsg("[session] 无 Session 记录", MsgInfo)
-		return
-	}
-
-	var lines []string
-	lines = append(lines, "── Sessions ──")
-	for i, s := range sessions {
-		first := truncateDisplay(s.FirstUserInput, 50)
-		lines = append(lines, fmt.Sprintf("  %d. %s [%s] %s",
-			i+1, s.ID, s.CreatedAt, first))
-	}
-	m.appendMsg(strings.Join(lines, "\n"), MsgInfo)
+	m.resetSessionViews()
+	m.appendMsg(fmt.Sprintf("[session] 已终止旧 Session 运行内容并创建新 Session: %s", id), MsgInfo)
 }
 
 func (m *AppModel) switchSession(numStr string) {
@@ -352,22 +385,41 @@ func (m *AppModel) switchSession(numStr string) {
 		m.appendMsg(fmt.Sprintf("[session] 已是当前 Session: %s", target.ID), MsgInfo)
 		return
 	}
-	// B3：结果不跨 session——切换成功后清空结果视图
-	m.lastResult = nil
-	m.resultScroll = 0
+	// B3：消息流与结果不跨 session——切换成功后清空本地会话视图
+	//（与会话选择面板的切换成功路径共用同一清理）。
+	m.resetSessionViews()
 	m.appendMsg(fmt.Sprintf("[session] 已切换到 %s", target.ID), MsgInfo)
+	m.appendMsg("[session] 历史上下文已恢复；非终态任务已阻断（不自动续跑），输入新提示词继续", MsgInfo)
 }
 
-func (m *AppModel) selectAgentByID(id string) {
-	for i, ag := range m.agents {
-		if strings.HasPrefix(ag.ID, id) {
-			m.selectedAgent = i
-			m.view = ViewAgentDetail
-			m.appendMsg(fmt.Sprintf("[agent] 查看代理 %s", ag.ID), MsgInfo)
-			return
+func (m *AppModel) selectNodeByID(id string) {
+	if !m.ensureSelectedGraph() {
+		m.appendMsg("[node] 当前还没有执行图", MsgWarn)
+		return
+	}
+	graph := &m.graphs[m.selectedGraph]
+	matches := make([]int, 0, 1)
+	for index, node := range graph.Nodes {
+		if node.NodeID == id {
+			matches = []int{index}
+			break
+		}
+		if strings.HasPrefix(node.NodeID, id) {
+			matches = append(matches, index)
 		}
 	}
-	m.appendMsg(fmt.Sprintf("[agent] 未找到以 %s 开头的代理", id), MsgWarn)
+	if len(matches) == 0 {
+		m.appendMsg(fmt.Sprintf("[node] 图 %s 中未找到以 %s 开头的节点", graph.GraphID, id), MsgWarn)
+		return
+	}
+	if len(matches) > 1 {
+		m.appendMsg(fmt.Sprintf("[node] 前缀 %s 匹配多个节点，请输入更完整的 ID", id), MsgWarn)
+		return
+	}
+	m.selectedNode = matches[0]
+	m.nodeDetailScroll = 0
+	m.view = ViewNodeDetail
+	m.appendMsg(fmt.Sprintf("[node] 查看 %s/%s", graph.GraphID, graph.Nodes[matches[0]].NodeID), MsgInfo)
 }
 
 // helpText 由 ui.CommandCatalog 生成——命令目录是两个前端（TUI / WebUI）

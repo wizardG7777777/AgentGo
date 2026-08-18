@@ -15,8 +15,8 @@ import (
 	"github.com/charmbracelet/x/term"
 
 	"agentgo/internal/interaction"
-	"agentgo/internal/model"
 	"agentgo/internal/output"
+	"agentgo/internal/trace"
 	"agentgo/internal/ui"
 )
 
@@ -27,12 +27,12 @@ type turnsChangedMsg []ui.AgentTurn
 type snapshotSyncMsg ui.Snapshot
 type agentsChangedMsg struct {
 	agents []AgentInfo
-	tasks  []*model.Task
+	graphs []GraphInfo
+	tasks  []ui.BoardTask
 	// Session 级 token 累计（Hub 轮询节拍随 AgentsChanged 携带）
 	sessionPromptTokens     int64
 	sessionCompletionTokens int64
 }
-type systemMsg ui.LogItem
 type outputMsg output.Event
 type traceMsg ui.TraceEvent
 
@@ -68,13 +68,6 @@ func forwardUpdates(ctx context.Context, obs ui.Observer, p *tea.Program) {
 				p.Send(snapshotSyncMsg(u.Snapshot))
 			case ui.KindOutputResult, ui.KindOutputText, ui.KindOutputStream, ui.KindOutputTurn:
 				p.Send(outputMsg(u.Output))
-			case ui.KindLogLine:
-				for _, line := range strings.Split(u.LogLine, "\n") {
-					line = strings.TrimSpace(line)
-					if line != "" {
-						p.Send(systemMsg(ui.LogItem{Text: line, At: u.At}))
-					}
-				}
 			case ui.KindInteractionsChanged:
 				p.Send(interactionsChangedMsg(u.Interactions))
 			case ui.KindTurnsChanged:
@@ -82,7 +75,8 @@ func forwardUpdates(ctx context.Context, obs ui.Observer, p *tea.Program) {
 			case ui.KindAgentsChanged:
 				p.Send(agentsChangedMsg{
 					agents:                  u.Agents,
-					tasks:                   boardTasksToModel(u.Tasks),
+					graphs:                  u.Graphs,
+					tasks:                   u.Tasks,
 					sessionPromptTokens:     u.SessionPromptTokens,
 					sessionCompletionTokens: u.SessionCompletionTokens,
 				})
@@ -93,32 +87,15 @@ func forwardUpdates(ctx context.Context, obs ui.Observer, p *tea.Program) {
 	}
 }
 
-// boardTasksToModel 把 Hub 快照的 BoardTask 列表转回渲染层使用的
-// []*model.Task（只填看板展示所需字段；Status 字符串还原为 TaskStatus）。
-func boardTasksToModel(bts []ui.BoardTask) []*model.Task {
-	if len(bts) == 0 {
-		return nil
-	}
-	tasks := make([]*model.Task, 0, len(bts))
-	for _, bt := range bts {
-		tasks = append(tasks, &model.Task{
-			ID:          bt.ID,
-			Description: bt.Desc,
-			Status:      model.TaskStatus(bt.Status),
-			EventType:   bt.EventType,
-			Agents:      bt.Agents,
-			Priority:    bt.Priority,
-			CreatedAt:   bt.CreatedAt,
-		})
-	}
-	return tasks
-}
-
 // ── App model ──
 
 const (
-	maxMessages    = 500
-	maxHotMessages = 30
+	maxMessages = 500
+	// replayMaxTurns / replayMaxLines 是 Session 恢复回放的上限：快照同步或
+	// Session 切换时只把最近 N 条定稿轮次（总行数受限）回放进 scrollback，
+	// 更早历史永远可查 turns.jsonl 与 ./agentgo trace。
+	replayMaxTurns = 50
+	replayMaxLines = 2000
 	// quitWarnWindow 是 Ctrl+C 强退警告的有效窗口：窗口内第二次按下即
 	// RequestQuit + tea.Quit。必须与 bootstrap SIGINT 哨兵的 3 秒窗口
 	// 一致（第二次信号 os.Exit(130) 强杀），两边语义才对齐。
@@ -147,31 +124,51 @@ type AppModel struct {
 	// history 是输入提交历史（环形缓冲容量 100，仅内存）；
 	// 输入框首行 ↑ / 末行 ↓ 浏览，见 keymap.go input-history 条目。
 	history inputHistory
-	// pasteBurst 把 Windows ConPTY 退化出的高速 KeyRunes + Enter 流
+	// pasteBurst 把 Windows 的粘贴投递形态（高速 KeyRunes + Enter 流）
 	// 重组为一次粘贴；普通 Enter 仍立即提交。
 	pasteBurst pasteBurstState
 
-	// Agent data（由 Hub 的 SnapshotSync / AgentsChanged 更新刷新）
+	// Runtime data（由 Hub 的 SnapshotSync / AgentsChanged 更新刷新）。
+	// Agent 卡片只用于解析选中节点的执行者；一级导航由 Graph/Node 驱动。
 	agents        []AgentInfo
-	tasks         []*model.Task
-	selectedAgent int // index in agents list, -1 = none
+	graphs        []GraphInfo
+	tasks         []ui.BoardTask // 任务看板缓存（activation 历史归组的数据源）
+	selectedGraph int            // index in graphs, -1 = none
+	selectedNode  int            // index in selected graph's Nodes, -1 = none
+	// selectedActivation 是节点详情中选中 activation 在 activation 历史
+	// 列表里的下标；负值表示跟随节点当前 activation（回边重进自动跟到新
+	// 运行）。打开详情 / 节点身份变化时重置为 -1。
+	selectedActivation int
 
 	// Session 级 token 累计（Hub 累加器下发；含已销毁 ad-hoc 团队的消耗。
 	// 为零时顶栏回退到对存活 agent 卡片求和——兼容未装配累加器的轻量 Hub）。
 	sessionPromptTokens     int64
 	sessionCompletionTokens int64
 
-	// Messages
+	// Messages：inline 重构后 m.messages 只容纳「活动区」条目——进行中的
+	// 流式轮次（StreamID 非空）。已定稿内容（轮次、系统消息、终态报告）
+	// 一律经 pendingEmit 排放到终端 scrollback，不再回填消息流。
 	messages     []StyledMsg
 	lastResult   *StyledMsg
 	resultScroll int
 	feedOutputs  []ui.FeedOutput
 	turns        []ui.AgentTurn
-	// agentDetailScroll 是 Agent 轮次历史相对底部的行偏移；0 表示自动
+	// nodeDetailScroll 是节点轮次历史相对底部的行偏移；0 表示自动
 	// 跟随最新轮次，向上滚动后保持当前位置，End 恢复跟随。
-	agentDetailScroll int
-	logs              []ui.LogItem
-	traces            []ui.TraceEvent
+	nodeDetailScroll int
+	traces           []ui.TraceEvent
+
+	// pendingEmit 是待排放到 scrollback 的渲染行队列。仅在 ViewChat（inline
+	// 主态）由 Update 出口统一 flush（tea.Println 在 alt screen 下会被丢弃，
+	// 全屏视图期间产生的行先攒着，回 Chat 时补排）。
+	pendingEmit []string
+	// emittedTurnIDs 是已排放轮次（StreamID / Turn.ID）去重集：TurnsChanged
+	// 全量重载（启动重复、Session 切换、切回旧 Session、加载失败重试）与
+	// 实时 KindTurn 排放在此汇合，保证同一轮次只进一次 scrollback。
+	emittedTurnIDs map[string]bool
+	// sessionID 是本地记录的当前 Session（TurnsChanged 到达时经 Hub 快照
+	// 对比识别 Session 边界，触发会话视图重置 + 账本回放）。
+	sessionID string
 
 	// Interaction。Hub 每次下发完整 pending 列表；第 0 项是当前条目。
 	interactions             []ui.InteractionItem
@@ -186,6 +183,10 @@ type AppModel struct {
 	// quitWarnUntil 非零表示 Ctrl+C 强退警告生效中（3 秒窗口，输入区上方
 	// 渲染一行警告）；窗口内第二次 Ctrl+C 直接强退。
 	quitWarnUntil time.Time
+
+	// sessionPicker 是 /session 无参打开的会话选择面板（模态覆盖层）；
+	// open 期间按键由面板独占分发（仅 Ctrl+C 透传全局强退）。
+	sessionPicker sessionPickerState
 }
 
 var errInputEOF = errors.New("tui input EOF")
@@ -237,9 +238,9 @@ func runWithIO(ctx context.Context, deps Deps, input io.Reader, output io.Writer
 		// （Windows 为 CONIN$）；否则调用方提供的 EOF 永远不可达。
 		opts = append(opts, tea.WithInput(&eofErrorReader{r: input}))
 	}
-	if outputTTY {
-		opts = append(opts, tea.WithAltScreen())
-	}
+	// inline 重构（2026-08）：主态不再进 alternate screen——已定稿内容经
+	// tea.Println 排放到终端 scrollback，滚轮翻阅 / 文本选择复制归还终端。
+	// 全屏视图（Graph / NodeDetail / Result）经 EnterAltScreen 动态进出。
 	p := tea.NewProgram(m, opts...)
 	// 注册强杀恢复点：SIGINT 哨兵（bootstrap）在 os.Exit 前经 RunForceCleanup
 	// 调 p.Kill，尽力恢复终端——bubbletea 捕获 SIGINT 后若事件循环卡死，
@@ -270,10 +271,14 @@ func newAppModel(deps Deps) AppModel {
 	m := AppModel{
 		deps:          deps,
 		theme:         DefaultTheme(),
-		view:          ViewDashboard,
+		view:          ViewChat,
 		focus:         FocusInput,
 		input:         ta,
-		selectedAgent: -1,
+		selectedGraph: -1,
+		selectedNode:  -1,
+		// selectedActivation 负值 = 跟随节点当前 activation。
+		selectedActivation: -1,
+		emittedTurnIDs:     make(map[string]bool),
 	}
 	if strings.TrimSpace(deps.InitialResult) != "" {
 		m.appendMsg(deps.InitialResult, MsgResult)
@@ -287,7 +292,49 @@ func (m AppModel) Init() tea.Cmd {
 
 // ── Update ──
 
+// Update 是 bubbletea 入口：业务逻辑在 update 里，出口统一收集待排放行
+// （pendingEmit） flush 到 scrollback——仅在 ViewChat 主态排放；全屏视图
+// 期间行继续攒着（tea.Println 在 alt screen 下会被丢弃），回 Chat 时补排。
+// 出口同时检测全屏层进出：进入 Graph/节点详情/结果时进 alt screen 并捕获
+// 鼠标（滚轮滚动全屏内容），回 Chat 时退出——终端 scrollback 的原生滚轮
+// 翻页只在 Chat 主态生效。
 func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	prevView := m.view
+	next, cmd := m.update(msg)
+	nm := next.(AppModel)
+	var cmds []tea.Cmd
+	if cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	if prevView != nm.view {
+		cmds = append(cmds, viewTransitionCmds(prevView, nm.view)...)
+	}
+	if emitCmd := nm.flushEmitCmd(); emitCmd != nil {
+		cmds = append(cmds, emitCmd)
+	}
+	return nm, tea.Batch(cmds...)
+}
+
+// fullscreenView 报告视图是否为全屏层（Graph/节点详情/结果）。全屏层在
+// alt screen 中渲染、捕获鼠标滚轮；Chat 是唯一的 inline 主态。
+func fullscreenView(v ViewState) bool {
+	return v == ViewGraph || v == ViewNodeDetail || v == ViewResult
+}
+
+// viewTransitionCmds 返回视图迁移需要的终端命令：进入全屏层时进 alt
+// screen 并捕获鼠标（滚轮滚动全屏内容），离开时退出——终端 scrollback
+// 的原生滚轮翻页只在 Chat 主态生效。全屏层之间互切不产生命令。
+func viewTransitionCmds(prev, next ViewState) []tea.Cmd {
+	switch {
+	case !fullscreenView(prev) && fullscreenView(next):
+		return []tea.Cmd{tea.EnterAltScreen, tea.EnableMouseCellMotion}
+	case fullscreenView(prev) && !fullscreenView(next):
+		return []tea.Cmd{tea.ExitAltScreen, tea.DisableMouse}
+	}
+	return nil
+}
+
+func (m AppModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
 	case tea.WindowSizeMsg:
@@ -299,21 +346,25 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case snapshotSyncMsg:
 		// 订阅建立后的第一条更新：全量初始化本地状态。
 		snap := ui.Snapshot(msg)
-		m.agents = snap.Agents
-		m.tasks = boardTasksToModel(snap.Tasks)
+		m.replaceRuntimeState(snap.Agents, snap.Graphs)
+		m.tasks = append([]ui.BoardTask(nil), snap.Tasks...)
 		m.replaceInteractions(snap.PendingInteractions)
 		m.restoreFeed(snap.Feed)
 		m.replaceTurns(snap.Turns)
 		m.sessionPromptTokens = snap.SessionPromptTokens
 		m.sessionCompletionTokens = snap.SessionCompletionTokens
+		m.sessionID = snap.Session.ID
+		// inline 重构：回放最近定稿轮次到 scrollback（启动 / -resume）；
+		// 结果恢复的排放在时序上晚于轮次回放。
+		m.replayTurns(snap.Turns)
 		if m.lastResult == nil && snap.LastResult != nil && strings.TrimSpace(snap.LastResult.Text) != "" {
 			m.appendMsg(snap.LastResult.Text, MsgResult)
 		}
 		return m, nil
 
 	case agentsChangedMsg:
-		m.agents = msg.agents
-		m.tasks = msg.tasks
+		m.replaceRuntimeState(msg.agents, msg.graphs)
+		m.tasks = append([]ui.BoardTask(nil), msg.tasks...)
 		m.sessionPromptTokens = msg.sessionPromptTokens
 		m.sessionCompletionTokens = msg.sessionCompletionTokens
 		return m, nil
@@ -325,16 +376,32 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case turnsChangedMsg:
-		m.replaceTurns([]ui.AgentTurn(msg))
-		m.agentDetailScroll = 0
-		return m, nil
-
-	case systemMsg:
-		m.appendLog(ui.LogItem(msg))
+		newTurns := []ui.AgentTurn(msg)
+		// KindTurnsChanged 只在 Session 边界（启动装载 / /new / /session
+		// 切换）携带全量账本广播，Hub 快照的 Session.ID 此时已指向新
+		// Session。边界上重置会话视图并回放账本（已排放轮次经
+		// emittedTurnIDs 自动去重；切回旧 Session 时天然零回放）。
+		if sid := m.snapshot().Session.ID; sid != m.sessionID {
+			m.sessionSwitchReset(sid)
+			m.replayTurns(newTurns)
+		}
+		m.replaceTurns(newTurns)
+		m.nodeDetailScroll = 0
 		return m, nil
 
 	case traceMsg:
-		m.appendTrace(ui.TraceEvent(msg))
+		ev := ui.TraceEvent(msg)
+		m.appendTrace(ev)
+		// 图到达终态时在 scrollback 留一行提示：Chat 主态直接可见，全屏
+		// 期间攒在队列里回 Chat 补排。经 end 节点完成时 Reason 为空；失败
+		// 终态（节点无出路 / 任务发布失败）Reason 载中文原因。
+		if ev.Kind == string(trace.KindGraphEnded) {
+			hint := fmt.Sprintf("[graph] %s 已 completed，/graph 查看", shortID(ev.GraphID))
+			if ev.Message != "" {
+				hint = fmt.Sprintf("[graph] %s 失败：%s，/graph 查看", shortID(ev.GraphID), ev.Message)
+			}
+			m.emitRaw([]string{m.theme.SidebarDim.Render(hint)})
+		}
 		return m, nil
 
 	case outputMsg:
@@ -346,16 +413,16 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.upsertTurnEvent(ev, time.Now())
 		} else if ev.Kind == output.KindTurn {
 			m.upsertTurnEvent(ev, time.Now())
+			m.emitCompletedTurn(ev)
 		} else if ev.Kind == output.KindResult {
 			m.recordFeedOutput(feedOutputFromEvent(ev, time.Now()))
 			m.appendMsg(ev.Text, MsgResult)
-			// 完成结果是用户请求的最终回复，不是另一条诊断日志。实时到达时
-			// 主动打开完整结果页；后续 status/log 事件只更新消息流，不会把
-			// 用户重新推回日志页。输入焦点保持不变，避免打断正在输入的文本。
-			m.view = ViewResult
+			// inline 重构：终态报告全文已随 appendMsg 排放到 scrollback，不再
+			// 自动切结果视图抢屏打断输入；/result 仍可手动全屏查看。
+			m.emitRaw([]string{m.theme.SidebarDim.Render("[result] 任务完成，/result 可全屏查看")})
 		} else {
 			m.recordFeedOutput(feedOutputFromEvent(ev, time.Now()))
-			m.appendMsg(ev.Text, MsgAgent)
+			m.emitStyledMsg(StyledMsg{Text: ev.Text, Kind: MsgAgent, At: time.Now(), AgentID: ev.AgentID})
 		}
 		return m, nil
 
@@ -381,6 +448,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyPasteBurstFlush(m.pasteBurst.flushIfDue(now))
 		return m, m.armPasteBurstTick(now)
 
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -393,12 +463,48 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// handleMouse 处理全屏层的鼠标滚轮（进入全屏层时经 EnableMouseCellMotion
+// 捕获；Chat 主态不捕获鼠标，滚轮由终端原生翻 scrollback）。滚轮方向与
+// 键盘 ↑/↓ 语义对齐：Graph 移动节点选择（图内容随选择滚动），节点详情与
+// 结果视图滚动内容，步长 3 行。
+func (m AppModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	wheelDelta := 0
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		wheelDelta = -1
+	case tea.MouseButtonWheelDown:
+		wheelDelta = 1
+	default:
+		return m, nil
+	}
+	switch m.view {
+	case ViewGraph:
+		m.moveSelectedNode(wheelDelta)
+	case ViewNodeDetail:
+		// nodeDetailScroll 是相对底部的偏移：0 跟随最新，上翻增大。
+		m.nodeDetailScroll -= wheelDelta * 3
+		m.clampNodeDetailScroll()
+	case ViewResult:
+		m.resultScroll += wheelDelta * 3
+		m.clampResultScroll()
+	}
+	return m, nil
+}
+
 func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// 整段粘贴（bracketed paste）：bubbletea 把一整段粘贴作为一个
-	// KeyRunes{Paste:true} 事件投递，其中的换行是 rune 而不是 Enter
-	// 键。必须在任何按键分发之前拦截，否则粘贴文本中的 '\r'/'\n'
-	// 会被当成逐次提交；同时无论当前焦点在哪都把文本写入输入框
-	// （粘贴的意图永远是输入，焦点在侧栏/交互面板时不能静默丢弃）。
+	// 会话选择面板（/session 无参打开）是模态的：打开期间全部按键由面板
+	// 独占分发（↑/↓ 移动、Enter 切换、Esc 关闭），可打印字符与粘贴都不会
+	// 落入输入框；仅 Ctrl+C 透传给下方的全局强退逻辑，模态下仍保留退出通道。
+	if m.sessionPicker.open && msg.String() != keyCtrlC {
+		return m.handleSessionPickerKey(msg)
+	}
+	// 整段粘贴（bracketed paste，macOS/Linux 的终端投递路径）：bubbletea
+	// 把一整段粘贴作为一个 KeyRunes{Paste:true} 事件投递，其中的换行是
+	// rune 而不是 Enter 键。必须在任何按键分发之前拦截，否则粘贴文本中
+	// 的 '\r'/'\n' 会被当成逐次提交；同时无论当前焦点在哪都把文本写入
+	// 输入框（粘贴的意图永远是输入，焦点在侧栏/交互面板时不能静默丢弃）。
+	// Windows 的终端投递路径是高速 KeyRunes + Enter 流，由下方 pasteBurst
+	// 状态机重组为一次完整粘贴——两条路径并列，均为正式通道。
 	if msg.Paste {
 		m.applyPasteBurstFlush(m.pasteBurst.flushBeforeBoundary())
 		m.pasteBurst.clearAfterExplicitPaste()
@@ -481,21 +587,20 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case keyCtrlL:
-		// Ctrl+L 清屏：只清空消息流显示——不动运行中任务、结果视图、
-		// 输入框与交互请求，也不发任何请求（纯本地渲染操作，零副作用）。
-		m.messages = nil
-		m.appendMsg("[界面] 消息流已清空", MsgLog)
-		return m, nil
+		// Ctrl+L 清可见屏（终端清屏后重绘）：scrollback 历史保留可翻，
+		// 运行中任务、结果视图、输入框与交互请求都不受影响（纯本地渲染
+		// 操作，零副作用）。
+		return m, tea.ClearScreen
 
 	case keyCtrlV:
 		// Ctrl+V 主动读系统剪贴板整体插入（textarea 内置 Paste 绑定
 		// 返回剪贴板读取 cmd；读回的多行文本经 pasteMsg 分行插入，
-		// 换行不会触发提交）。这是 Windows 上的可靠粘贴路径：终端
-		// 逐键注入剪贴板内容时 '\r'/'\n' 会被当成 Enter 逐行提交，
-		// 而应用主动读剪贴板完全绕开终端投递。macOS 终端拦截
-		// Cmd+V 后以 bracketed paste 投递，走上方 msg.Paste 分支，
-		// 两条路径等效。粘贴的意图永远是输入——任意焦点都重定向
-		// 到输入框。
+		// 换行不会触发提交）。粘贴的三条正式通道并列：macOS/Linux
+		// 终端拦截 Cmd+V / Ctrl+Shift+V 后以 bracketed paste 投递
+		// （走上方 msg.Paste 分支）；Windows 终端以高速 KeyRunes+Enter
+		// 流投递（经 pasteBurst 重组）；Ctrl+V 由应用侧直接读剪贴板，
+		// 完全绕开终端投递差异，全平台可用。粘贴的意图永远是输入——
+		// 任意焦点都重定向到输入框。
 		m.setFocus(FocusInput)
 		prevHeight := m.input.Height()
 		var cmd tea.Cmd
@@ -519,11 +624,10 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.setFocus(FocusInput)
 			return m, nil
 		}
-		// 详情/结果/诊断视图里 Esc 永远归"返回"，不触发请求取消。
-		if m.view == ViewAgentDetail || m.view == ViewResult ||
-			m.view == ViewActivity || m.view == ViewLogs || m.view == ViewTrace {
-			m.view = ViewDashboard
-			m.agentDetailScroll = 0
+		// 全屏视图（节点详情/结果）里 Esc 永远归"返回"，不触发请求取消。
+		if m.view == ViewNodeDetail || m.view == ViewResult {
+			m.view = ViewGraph
+			m.nodeDetailScroll = 0
 			return m, nil
 		}
 		// 顶层视图（Dashboard / Chat，任意 focus）：Esc = 取消最近一棵
@@ -567,13 +671,13 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.resultScroll++
 			m.clampResultScroll()
 			return m, nil
-		case keyPgUp, keyCtrlB:
+		case keyPgUp:
 			m.resultScroll -= pageStep
 			if m.resultScroll < 0 {
 				m.resultScroll = 0
 			}
 			return m, nil
-		case keyPgDown, keyCtrlF:
+		case keyPgDown:
 			m.resultScroll += pageStep
 			m.clampResultScroll()
 			return m, nil
@@ -603,13 +707,13 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.interactionOption++
 			}
 			return m, nil
-		case keyPgUp, keyCtrlB:
+		case keyPgUp:
 			m.interactionPromptScroll -= interactionPromptPageLines
 			if m.interactionPromptScroll < 0 {
 				m.interactionPromptScroll = 0
 			}
 			return m, nil
-		case keyPgDown, keyCtrlF:
+		case keyPgDown:
 			m.interactionPromptScroll += interactionPromptPageLines
 			maxOffset := interactionPromptMaxScroll(*req, m.width)
 			if m.interactionPromptScroll > maxOffset {
@@ -640,70 +744,66 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Sidebar navigation
-	if m.focus == FocusSidebar {
-		switch key {
-		case keyUp:
-			m.moveSelectedAgent(-1)
-			return m, nil
-		case keyDown:
-			m.moveSelectedAgent(1)
-			return m, nil
-		case keyEnter:
-			if m.ensureSelectedAgent() {
-				m.view = ViewAgentDetail
-				m.agentDetailScroll = 0
-			}
-			return m, nil
-		}
-	}
-
-	// Agent 详情主面板：轮次历史按相对底部偏移滚动。0 始终跟随最新；
+	// 节点详情主面板：轮次历史按相对底部偏移滚动。0 始终跟随最新；
 	// 用户上翻后新轮次不会抢走当前位置，End 明确恢复自动跟随。
-	if m.focus == FocusMain && m.view == ViewAgentDetail {
+	// ←→ 在节点的 activation 历史间切换（回边重进的旧运行）。
+	if m.focus == FocusMain && m.view == ViewNodeDetail {
 		pageStep := maxInt(1, m.layout.MainH-8)
 		switch key {
+		case keyLeft:
+			m.moveSelectedActivation(-1)
+			return m, nil
+		case keyRight:
+			m.moveSelectedActivation(1)
+			return m, nil
 		case keyUp:
-			m.agentDetailScroll++
-			m.clampAgentDetailScroll()
+			m.nodeDetailScroll++
+			m.clampNodeDetailScroll()
 			return m, nil
 		case keyDown:
-			if m.agentDetailScroll > 0 {
-				m.agentDetailScroll--
+			if m.nodeDetailScroll > 0 {
+				m.nodeDetailScroll--
 			}
 			return m, nil
-		case keyPgUp, keyCtrlB:
-			m.agentDetailScroll += pageStep
-			m.clampAgentDetailScroll()
+		case keyPgUp:
+			m.nodeDetailScroll += pageStep
+			m.clampNodeDetailScroll()
 			return m, nil
-		case keyPgDown, keyCtrlF:
-			m.agentDetailScroll -= pageStep
-			if m.agentDetailScroll < 0 {
-				m.agentDetailScroll = 0
+		case keyPgDown:
+			m.nodeDetailScroll -= pageStep
+			if m.nodeDetailScroll < 0 {
+				m.nodeDetailScroll = 0
 			}
 			return m, nil
 		case keyHome:
-			m.agentDetailScroll = m.maxAgentDetailScroll()
+			m.nodeDetailScroll = m.maxNodeDetailScroll()
 			return m, nil
 		case keyEnd:
-			m.agentDetailScroll = 0
+			m.nodeDetailScroll = 0
 			return m, nil
 		}
 	}
 
-	// Dashboard 主面板导航
-	if m.focus == FocusMain && m.view == ViewDashboard {
+	// Graph Dashboard 主面板导航
+	if m.focus == FocusMain && m.view == ViewGraph {
 		switch key {
 		case keyUp:
-			m.moveSelectedAgent(-1)
+			m.moveSelectedNode(-1)
 			return m, nil
 		case keyDown:
-			m.moveSelectedAgent(1)
+			m.moveSelectedNode(1)
+			return m, nil
+		case keyLeft:
+			m.moveSelectedGraph(-1)
+			return m, nil
+		case keyRight:
+			m.moveSelectedGraph(1)
 			return m, nil
 		case keyEnter:
-			if m.ensureSelectedAgent() {
-				m.view = ViewAgentDetail
-				m.agentDetailScroll = 0
+			if m.ensureSelectedNode() {
+				m.view = ViewNodeDetail
+				m.nodeDetailScroll = 0
+				m.selectedActivation = -1
 			}
 			return m, nil
 		}
@@ -712,7 +812,7 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Input mode
 	if m.focus == FocusInput {
 		switch key {
-		case keyCtrlJ, keyAltEnter:
+		case keyCtrlJ:
 			prevHeight := m.input.Height()
 			m.input.InsertRune('\n')
 			m.reflowInputLayoutFrom(prevHeight)
@@ -846,65 +946,279 @@ func (m AppModel) commitInputSubmit() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *AppModel) ensureSelectedAgent() bool {
-	if len(m.agents) == 0 {
-		m.selectedAgent = -1
+func (m *AppModel) replaceRuntimeState(agents []AgentInfo, graphs []GraphInfo) {
+	oldGraphID, oldNodeID, oldActivationID := "", "", ""
+	if graph := m.selectedGraphView(); graph != nil {
+		oldGraphID = graph.GraphID
+	}
+	if node := m.selectedNodeView(); node != nil {
+		oldNodeID, oldActivationID = node.NodeID, node.ActivationID
+	}
+
+	m.agents = append([]AgentInfo(nil), agents...)
+	m.graphs = cloneGraphViews(graphs)
+	for graphIndex := range m.graphs {
+		for nodeIndex := range m.graphs[graphIndex].Nodes {
+			node := &m.graphs[graphIndex].Nodes[nodeIndex]
+			if node.AgentID != "" || node.TaskID == "" {
+				continue
+			}
+			for _, agent := range m.agents {
+				if agent.CurrentTaskID == node.TaskID {
+					node.AgentID = agent.ID
+					break
+				}
+			}
+		}
+	}
+	if len(graphs) == 0 {
+		m.selectedGraph, m.selectedNode = -1, -1
+		m.selectedActivation = -1
+		if m.view == ViewNodeDetail {
+			m.view = ViewGraph
+		}
+		return
+	}
+
+	m.selectedGraph = -1
+	sameGraph := false
+	for index := range graphs {
+		if graphs[index].GraphID == oldGraphID {
+			m.selectedGraph = index
+			sameGraph = true
+			break
+		}
+	}
+	if m.selectedGraph < 0 {
+		m.selectedGraph = preferredGraphIndex(graphs)
+	}
+
+	m.selectedNode = -1
+	graph := m.selectedGraphView()
+	if graph != nil {
+		// Exact activation identity wins. If a back-edge has produced a new
+		// activation, retain the selected logical node and follow its new run.
+		if sameGraph {
+			for index := range graph.Nodes {
+				node := graph.Nodes[index]
+				if node.NodeID == oldNodeID && node.ActivationID == oldActivationID {
+					m.selectedNode = index
+					break
+				}
+			}
+			if m.selectedNode < 0 {
+				for index := range graph.Nodes {
+					if graph.Nodes[index].NodeID == oldNodeID {
+						m.selectedNode = index
+						break
+					}
+				}
+			}
+		}
+		if m.selectedNode < 0 {
+			m.selectedNode = preferredNodeIndex(graph.Nodes)
+		}
+	}
+	if m.selectedNode < 0 && m.view == ViewNodeDetail {
+		m.view = ViewGraph
+	}
+	// 节点身份变化（身份恢复失败/节点切换）时 activation 选择回到
+	// 「跟随当前」；同一节点的轮询刷新保留用户正在浏览的历史 activation。
+	newGraphID, newNodeID := "", ""
+	if graph := m.selectedGraphView(); graph != nil {
+		newGraphID = graph.GraphID
+	}
+	if node := m.selectedNodeView(); node != nil {
+		newNodeID = node.NodeID
+	}
+	if newGraphID != oldGraphID || newNodeID != oldNodeID {
+		m.selectedActivation = -1
+	}
+	m.clampNodeDetailScroll()
+}
+
+func cloneGraphViews(graphs []GraphInfo) []GraphInfo {
+	if len(graphs) == 0 {
+		return nil
+	}
+	cloned := make([]GraphInfo, len(graphs))
+	for index, graph := range graphs {
+		cloned[index] = graph
+		cloned[index].Nodes = append([]ui.GraphNodeView(nil), graph.Nodes...)
+		cloned[index].Edges = append([]ui.GraphEdgeView(nil), graph.Edges...)
+		for nodeIndex := range cloned[index].Nodes {
+			if graph.Nodes[nodeIndex].WaitDeadline != nil {
+				deadline := *graph.Nodes[nodeIndex].WaitDeadline
+				cloned[index].Nodes[nodeIndex].WaitDeadline = &deadline
+			}
+		}
+	}
+	return cloned
+}
+
+func (m *AppModel) selectedGraphView() *GraphInfo {
+	return graphAt(m.graphs, m.selectedGraph)
+}
+
+func (m *AppModel) selectedNodeView() *GraphNodeInfo {
+	graph := m.selectedGraphView()
+	if graph == nil || m.selectedNode < 0 || m.selectedNode >= len(graph.Nodes) {
+		return nil
+	}
+	return &graph.Nodes[m.selectedNode]
+}
+
+func (m *AppModel) ensureSelectedGraph() bool {
+	if len(m.graphs) == 0 {
+		m.selectedGraph, m.selectedNode = -1, -1
 		return false
 	}
-	if m.selectedAgent < 0 {
-		m.selectedAgent = 0
-	}
-	if m.selectedAgent >= len(m.agents) {
-		m.selectedAgent = len(m.agents) - 1
+	if m.selectedGraph < 0 || m.selectedGraph >= len(m.graphs) {
+		m.selectedGraph = preferredGraphIndex(m.graphs)
+		m.selectedNode = preferredNodeIndex(m.graphs[m.selectedGraph].Nodes)
 	}
 	return true
 }
 
-func (m *AppModel) moveSelectedAgent(delta int) {
-	if len(m.agents) == 0 {
-		m.selectedAgent = -1
-		return
+func (m *AppModel) ensureSelectedNode() bool {
+	if !m.ensureSelectedGraph() {
+		return false
 	}
-	if m.selectedAgent < 0 {
-		m.selectedAgent = 0
-		return
+	nodes := m.graphs[m.selectedGraph].Nodes
+	if len(nodes) == 0 {
+		m.selectedNode = -1
+		return false
 	}
-	if m.selectedAgent >= len(m.agents) {
-		m.selectedAgent = len(m.agents) - 1
-		return
+	if m.selectedNode < 0 || m.selectedNode >= len(nodes) {
+		m.selectedNode = preferredNodeIndex(nodes)
 	}
+	return true
+}
 
-	next := m.selectedAgent + delta
+func (m *AppModel) moveSelectedGraph(delta int) {
+	if !m.ensureSelectedGraph() {
+		return
+	}
+	next := m.selectedGraph + delta
 	if next < 0 {
 		next = 0
 	}
-	if next >= len(m.agents) {
-		next = len(m.agents) - 1
+	if next >= len(m.graphs) {
+		next = len(m.graphs) - 1
 	}
-	if next != m.selectedAgent {
-		m.selectedAgent = next
-		m.agentDetailScroll = 0
+	if next == m.selectedGraph {
+		return
+	}
+	m.selectedGraph = next
+	m.selectedNode = preferredNodeIndex(m.graphs[next].Nodes)
+	m.nodeDetailScroll = 0
+}
+
+func (m *AppModel) moveSelectedNode(delta int) {
+	if !m.ensureSelectedNode() {
+		return
+	}
+	nodes := m.graphs[m.selectedGraph].Nodes
+	next := m.selectedNode + delta
+	if next < 0 {
+		next = 0
+	}
+	if next >= len(nodes) {
+		next = len(nodes) - 1
+	}
+	if next != m.selectedNode {
+		m.selectedNode = next
+		m.nodeDetailScroll = 0
 	}
 }
 
-func (m *AppModel) maxAgentDetailScroll() int {
-	if m.selectedAgent < 0 || m.selectedAgent >= len(m.agents) {
+func preferredGraphIndex(graphs []GraphInfo) int {
+	if len(graphs) == 0 {
+		return -1
+	}
+	priority := map[string]int{
+		"running": 0, "paused": 1, "pending": 2,
+		"failed": 3, "completed": 4, "cancelled": 5,
+	}
+	best, bestPriority := 0, 99
+	for index, graph := range graphs {
+		p, ok := priority[graph.Status]
+		if !ok {
+			p = 98
+		}
+		if p < bestPriority {
+			best, bestPriority = index, p
+		}
+	}
+	return best
+}
+
+func preferredNodeIndex(nodes []GraphNodeInfo) int {
+	if len(nodes) == 0 {
+		return -1
+	}
+	priority := map[string]int{
+		"running": 0, "waiting": 1, "blocked": 2, "failed": 3,
+		"ready": 4, "inactive": 5, "completed": 6, "cancelled": 7, "skipped": 8,
+	}
+	best, bestPriority := 0, 99
+	for index, node := range nodes {
+		p, ok := priority[node.Status]
+		if !ok {
+			p = 98
+		}
+		if p < bestPriority {
+			best, bestPriority = index, p
+		}
+	}
+	return best
+}
+
+func (m *AppModel) agentForNode(node GraphNodeInfo) *AgentInfo {
+	for index := range m.agents {
+		if node.AgentID != "" && m.agents[index].ID == node.AgentID {
+			return &m.agents[index]
+		}
+	}
+	for index := range m.agents {
+		if node.TaskID != "" && m.agents[index].CurrentTaskID == node.TaskID {
+			return &m.agents[index]
+		}
+	}
+	for turnIndex := len(m.turns) - 1; turnIndex >= 0; turnIndex-- {
+		turn := m.turns[turnIndex]
+		if node.TaskID == "" || turn.TaskID != node.TaskID || turn.AgentID == "" {
+			continue
+		}
+		for agentIndex := range m.agents {
+			if m.agents[agentIndex].ID == turn.AgentID {
+				return &m.agents[agentIndex]
+			}
+		}
+	}
+	return nil
+}
+
+func (m *AppModel) maxNodeDetailScroll() int {
+	graph := m.selectedGraphView()
+	node, acts, actIndex, ok := m.selectedActivationView()
+	if graph == nil || !ok {
 		return 0
 	}
-	ag := m.agents[m.selectedAgent]
-	return agentWorkbenchMaxScroll(
-		m.theme, m.layout.MainW, m.layout.MainH, ag,
-		m.turnsForAgent(ag.ID), m.outputsForAgent(ag.ID), m.tracesForAgent(ag.ID),
+	return nodeWorkbenchMaxScroll(
+		m.theme, m.layout.MainW, m.layout.MainH, *graph, node, m.agentForNode(node),
+		m.turnsForNode(node), m.outputsForNode(node), m.tracesForNode(*graph, node),
+		actIndex, len(acts),
 	)
 }
 
-func (m *AppModel) clampAgentDetailScroll() {
-	maxScroll := m.maxAgentDetailScroll()
-	if m.agentDetailScroll > maxScroll {
-		m.agentDetailScroll = maxScroll
+func (m *AppModel) clampNodeDetailScroll() {
+	maxScroll := m.maxNodeDetailScroll()
+	if m.nodeDetailScroll > maxScroll {
+		m.nodeDetailScroll = maxScroll
 	}
-	if m.agentDetailScroll < 0 {
-		m.agentDetailScroll = 0
+	if m.nodeDetailScroll < 0 {
+		m.nodeDetailScroll = 0
 	}
 }
 
@@ -917,12 +1231,10 @@ func (m *AppModel) cycleFocusReverse() {
 }
 
 func (m *AppModel) cycleFocusBy(delta int) {
+	// 焦点环：Input → (有待决 Interaction 时) Interaction → Main。
 	order := []FocusState{FocusInput}
 	if len(m.interactions) > 0 {
 		order = append(order, FocusInteraction)
-	}
-	if !m.layout.Compact {
-		order = append(order, FocusSidebar)
 	}
 	order = append(order, FocusMain)
 
@@ -946,9 +1258,6 @@ func (m *AppModel) setFocus(focus FocusState) {
 		m.input.Focus()
 	} else {
 		m.input.Blur()
-	}
-	if focus == FocusSidebar && m.selectedAgent < 0 && len(m.agents) > 0 {
-		m.selectedAgent = 0
 	}
 }
 
@@ -1164,7 +1473,7 @@ func (m *AppModel) reflowInputLayoutFrom(prevHeight int) {
 		return
 	}
 
-	base := calcLayout(m.width, m.height, m.view, inputMinHeight)
+	base := calcLayout(m.width, m.height, inputMinHeight)
 	inputW := base.MainW - 4
 	if base.Compact {
 		inputW = m.width - 4
@@ -1173,14 +1482,14 @@ func (m *AppModel) reflowInputLayoutFrom(prevHeight int) {
 		inputW = 1
 	}
 
-	panelH := m.interactionPanelHeight()
+	panelH := m.interactionPanelHeight() + m.sessionPickerHeight()
 	m.input.MaxHeight = m.maxTextareaHeight()
 	m.input.SetWidth(inputW)
 	m.input.SetHeight(m.desiredTextareaHeight())
 
 	areaH := renderedLineCount(m.input.View())
 	extras := m.inputAreaExtraHeight()
-	maxAreaH := m.height - headerHeight - statusBarHeight - minBodyHeight - panelH
+	maxAreaH := m.height - statusBarHeight - minBodyHeight - panelH
 	if maxAreaH < inputMinHeight {
 		maxAreaH = inputMinHeight
 	}
@@ -1194,7 +1503,7 @@ func (m *AppModel) reflowInputLayoutFrom(prevHeight int) {
 		areaH = renderedLineCount(m.input.View())
 	}
 	areaH += extras
-	m.layout = calcLayout(m.width, m.height, m.view, areaH, panelH)
+	m.layout = calcLayout(m.width, m.height, areaH, panelH)
 
 	if m.input.Height() != prevHeight {
 		m.clampResultScroll()
@@ -1203,8 +1512,8 @@ func (m *AppModel) reflowInputLayoutFrom(prevHeight int) {
 
 func (m AppModel) maxTextareaHeight() int {
 	maxH := inputMaxHeight
-	available := m.height - headerHeight - statusBarHeight - minBodyHeight -
-		m.interactionPanelHeight() - m.inputAreaExtraHeight()
+	available := m.height - statusBarHeight - minBodyHeight -
+		m.interactionPanelHeight() - m.sessionPickerHeight() - m.inputAreaExtraHeight()
 	if available < inputMinHeight {
 		return inputMinHeight
 	}
@@ -1303,18 +1612,152 @@ func (m AppModel) quitWarnActive() bool {
 	return !m.quitWarnUntil.IsZero() && time.Now().Before(m.quitWarnUntil)
 }
 
+// appendMsg 是本地通知（命令反馈、系统提示）的统一入口。inline 重构后
+// 非 Result 消息一律渲染成行进入待排放队列（最终落进终端 scrollback），
+// 不再回填消息流；MsgResult 仍登记 lastResult（/result 视图数据源），
+// 同时把全文排放到 scrollback（终态不再自动切视图抢屏）。
 func (m *AppModel) appendMsg(text string, kind MsgKind) {
 	if kind == MsgResult {
-		formatted := formatMarkdown(m.theme, text, m.width-4)
+		formatted := formatMarkdown(m.theme, text, m.emitWidth()-4)
 		m.lastResult = &StyledMsg{Text: formatted, Kind: kind, At: time.Now()}
 		m.resultScroll = 0
+		header := m.theme.MsgTimestamp.Render(time.Now().Format("15:04:05")+" ") +
+			m.theme.ResultTitle.Render("✓ Task Complete")
+		m.emitRaw(append([]string{header}, strings.Split(formatted, "\n")...))
 		return
 	}
+	m.emitStyledMsg(StyledMsg{Text: text, Kind: kind, At: time.Now()})
+}
 
-	m.messages = append(m.messages, StyledMsg{Text: text, Kind: kind, At: time.Now()})
-	if len(m.messages) > maxMessages {
-		m.messages = m.messages[len(m.messages)-maxMessages:]
+// emitWidth 是排放/渲染用的终端宽度；WindowSizeMsg 未到达时回退 80。
+func (m AppModel) emitWidth() int {
+	if m.width >= 10 {
+		return m.width
 	}
+	return 80
+}
+
+// emitStyledMsg 渲染一条消息进入待排放队列。
+func (m *AppModel) emitStyledMsg(msg StyledMsg) {
+	m.pendingEmit = append(m.pendingEmit, styledMsgLines(m.theme, m.emitWidth(), msg)...)
+}
+
+// emitRaw 把已渲染的行原样追加进待排放队列。
+func (m *AppModel) emitRaw(lines []string) {
+	m.pendingEmit = append(m.pendingEmit, lines...)
+}
+
+// flushEmitCmd 在 Update 出口把待排放行打包为逐行 tea.Println 命令。
+// 仅 ViewChat 主态排放：tea.Println 在 alt screen 下会被丢弃，全屏视图
+// 期间行继续攒在队列里，回到 Chat 时补排。
+func (m *AppModel) flushEmitCmd() tea.Cmd {
+	if m.view != ViewChat || len(m.pendingEmit) == 0 {
+		return nil
+	}
+	lines := append([]string(nil), m.pendingEmit...)
+	m.pendingEmit = m.pendingEmit[:0]
+	cmds := make([]tea.Cmd, len(lines))
+	for i, line := range lines {
+		cmds[i] = tea.Println(line)
+	}
+	return tea.Sequence(cmds...)
+}
+
+// turnLines 渲染一个定稿轮次的排放行：正文 + 工具调用名 + 错误。
+// emitCompletedTurn（实时 KindTurn）与 replayTurns（账本回放）共用。
+func (m AppModel) turnLines(at time.Time, agentID, text, reasoning string, toolCalls []string, errText string) []string {
+	if errText != "" {
+		if text != "" {
+			text += "\n"
+		}
+		text += "[error] " + errText
+	}
+	lines := styledMsgLines(m.theme, m.emitWidth(), StyledMsg{
+		Text: text, Reasoning: reasoning, Kind: MsgAgent, At: at, AgentID: agentID,
+	})
+	if len(toolCalls) > 0 {
+		toolsText := "  tools: " + strings.Join(toolCalls, " → ")
+		for _, line := range wrapDisplay(toolsText, maxInt(1, m.emitWidth()-2)) {
+			lines = append(lines, m.theme.MsgLog.Render("  "+strings.TrimSpace(line)))
+		}
+	}
+	return lines
+}
+
+// emitCompletedTurn 在实时 KindTurn（不可变完成轮次）到达时排放该轮，
+// 并把对应流式条目移出活动区。
+func (m *AppModel) emitCompletedTurn(ev output.Event) {
+	if ev.StreamID != "" {
+		for i := range m.messages {
+			if m.messages[i].StreamID == ev.StreamID {
+				m.messages = append(m.messages[:i], m.messages[i+1:]...)
+				break
+			}
+		}
+		if m.emittedTurnIDs[ev.StreamID] {
+			return
+		}
+		m.emittedTurnIDs[ev.StreamID] = true
+	}
+	m.emitRaw(m.turnLines(time.Now(), ev.AgentID, ev.Text, ev.Reasoning, ev.ToolCalls, ev.Error))
+}
+
+// replayTurns 把 Session 账本中最近若干定稿轮次回放进 scrollback
+// （启动 / -resume / Session 切换）。streaming 条目不回放（冻结现场，
+// 其最终状态由后续事件给出）；已排放过的轮次经 emittedTurnIDs 去重。
+func (m *AppModel) replayTurns(turns []ui.AgentTurn) {
+	var done []ui.AgentTurn
+	for _, turn := range turns {
+		if turn.Status == "completed" || turn.Status == "failed" {
+			done = append(done, turn)
+		}
+	}
+	if len(done) > replayMaxTurns {
+		done = done[len(done)-replayMaxTurns:]
+	}
+	var lines []string
+	for _, turn := range done {
+		if turn.ID != "" {
+			if m.emittedTurnIDs[turn.ID] {
+				continue
+			}
+			m.emittedTurnIDs[turn.ID] = true
+		}
+		at := turn.CompletedAt
+		if at.IsZero() {
+			at = turn.StartedAt
+		}
+		if at.IsZero() {
+			at = time.Now()
+		}
+		lines = append(lines, m.turnLines(at, turn.AgentID, turn.Text, turn.Reasoning, turn.ToolCalls, turn.Error)...)
+	}
+	if len(lines) == 0 {
+		return
+	}
+	if len(lines) > replayMaxLines {
+		lines = lines[len(lines)-replayMaxLines:]
+		lines = append([]string{m.theme.SidebarDim.Render("… 更早历史见 turns.jsonl 与 ./agentgo trace")}, lines...)
+	}
+	m.emitRaw(append([]string{m.theme.SidebarDim.Render("── 最近会话记录 ──")}, lines...))
+}
+
+// sessionSwitchReset 在 Session 边界（/new、/session 切换）重置本地会话
+// 视图：活动区、feed、trace、结果都不跨 Session；scrollback 里留一行
+// 分隔标记，保持线性历史可辨识。
+func (m *AppModel) sessionSwitchReset(sid string) {
+	m.sessionID = sid
+	m.messages = nil
+	m.feedOutputs = nil
+	m.traces = nil
+	m.lastResult = nil
+	m.resultScroll = 0
+	m.nodeDetailScroll = 0
+	label := sid
+	if label == "" {
+		label = "(no session)"
+	}
+	m.emitRaw([]string{m.theme.SidebarDim.Render("── session " + shortID(label) + " ──")})
 }
 
 func (m *AppModel) upsertStream(ev output.Event) {
@@ -1332,13 +1775,15 @@ func (m *AppModel) upsertStream(ev output.Event) {
 	for i := range m.messages {
 		if m.messages[i].StreamID == ev.StreamID {
 			m.messages[i].Text = text
+			m.messages[i].Reasoning = ev.Reasoning
 			m.messages[i].AgentID = ev.AgentID
 			m.messages[i].At = time.Now()
 			return
 		}
 	}
 	m.messages = append(m.messages, StyledMsg{
-		Text: text, Kind: MsgAgent, At: time.Now(), AgentID: ev.AgentID, StreamID: ev.StreamID,
+		Text: text, Reasoning: ev.Reasoning, Kind: MsgAgent, At: time.Now(),
+		AgentID: ev.AgentID, StreamID: ev.StreamID,
 	})
 	if len(m.messages) > maxMessages {
 		m.messages = m.messages[len(m.messages)-maxMessages:]
@@ -1354,7 +1799,9 @@ func (m *AppModel) clampResultScroll() {
 	if contentH < 1 {
 		contentH = 1
 	}
-	maxOffset := len(strings.Split(m.lastResult.Text, "\n")) - contentH
+	maxOffset := len(resultDetailBodyLines(
+		m.theme, m.layout.MainW, m.lastResult, m.latestSchedulerTurns(),
+	)) - contentH
 	if maxOffset < 0 {
 		maxOffset = 0
 	}
@@ -1407,39 +1854,16 @@ func (m AppModel) View() string {
 
 	var sections []string
 
-	// 1. Header（模式 / Session 读自 Hub 最新快照，而非直读组件）
-	snap := m.snapshot()
-	sessionID := snap.Session.ID
-	// Session 级 token 总计：优先取 Hub 累加器（含已销毁 ad-hoc 团队的
-	// 消耗）；累加器未装配（轻量 Hub / 测试 fake）时回退为对存活 agent
-	// 卡片求和。
-	totalTokens := m.sessionPromptTokens + m.sessionCompletionTokens
-	if totalTokens == 0 {
-		for _, ag := range m.agents {
-			totalTokens += ag.PromptTokens + ag.CompletionTokens
-		}
-	}
-	header := renderHeader(m.theme, m.layout, snap.ExecMode, snap.TopoMode,
-		sessionID, len(m.agents), len(m.interactions), totalTokens)
-	sections = append(sections, header)
+	// 1. Body（无侧边栏：主面板全宽；Chat 为活跃流尾部，自适应高度）
+	sections = append(sections, m.renderMainContent())
 
-	// 2. Body (sidebar + main)
-	sidebar := ""
-	if !m.layout.Compact {
-		sidebar = renderSidebar(m.theme, m.layout, m.agents, m.tasks,
-			m.selectedAgent, m.focus)
+	// 3. Session 选择面板（/session，模态覆盖层）叠在主面板与输入区之间。
+	if m.sessionPicker.open {
+		sections = append(sections, renderSessionPicker(
+			m.theme, m.width, m.sessionPicker, m.currentSessionID()))
 	}
 
-	mainContent := m.renderMainContent()
-
-	if sidebar != "" {
-		body := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, mainContent)
-		sections = append(sections, body)
-	} else {
-		sections = append(sections, mainContent)
-	}
-
-	// 3. Interaction 面板与输入框始终同时显示；完整列表的第 0 项
+	// 4. Interaction 面板与输入框始终同时显示；完整列表的第 0 项
 	// 是当前请求，其余项由队列计数提示。
 	if req := m.activeInteraction(); req != nil {
 		sections = append(sections, renderInteractionPanel(
@@ -1448,12 +1872,12 @@ func (m AppModel) View() string {
 		))
 	}
 
-	// 4. 强退警告行（Ctrl+C 3 秒窗口内显示，紧邻输入区上方）
+	// 5. 强退警告行（Ctrl+C 3 秒窗口内显示，紧邻输入区上方）
 	if m.quitWarnActive() {
 		sections = append(sections, renderQuitWarn(m.theme, m.width))
 	}
 
-	// 5. Input area。即使存在 pending Interaction，普通英文和数字仍归
+	// 6. Input area。即使存在 pending Interaction，普通英文和数字仍归
 	// textarea；只有显式切到 Interaction 焦点才解释为面板操作。
 	inputView := m.input.View()
 	if !m.interactionTextMode {
@@ -1465,9 +1889,26 @@ func (m AppModel) View() string {
 		m.interactionTextMode, m.interactionTextLabel)
 	sections = append(sections, inputArea)
 
-	// 6. Status bar
+	// 7. Status bar（系统信息并入：exec/topo、session、graphs、tokens）
+	snap := m.snapshot()
+	// Session 级 token 总计：优先取 Hub 累加器（含已销毁 ad-hoc 团队的
+	// 消耗）；累加器未装配（轻量 Hub / 测试 fake）时回退为对存活 agent
+	// 卡片求和。
+	totalTokens := m.sessionPromptTokens + m.sessionCompletionTokens
+	if totalTokens == 0 {
+		for _, ag := range m.agents {
+			totalTokens += ag.PromptTokens + ag.CompletionTokens
+		}
+	}
 	sections = append(sections, renderStatusBar(m.theme, m.width,
-		m.focus, m.view, m.interactionTextMode))
+		m.focus, m.view, m.interactionTextMode, statusInfo{
+			execMode:           snap.ExecMode,
+			topoMode:           snap.TopoMode,
+			sessionID:          snap.Session.ID,
+			graphCount:         len(m.graphs),
+			interactionPending: len(m.interactions),
+			totalTokens:        totalTokens,
+		}))
 
 	return strings.Join(sections, "\n")
 }
@@ -1477,40 +1918,83 @@ func (m AppModel) renderMainContent() string {
 	h := m.layout.MainH
 
 	switch m.view {
-	case ViewDashboard:
-		return renderDashboard(m.theme, w, h, m.agents)
+	case ViewGraph:
+		return renderGraphDashboard(m.theme, w, h, m.selectedGraphView(),
+			m.selectedNode, m.selectedGraph, len(m.graphs),
+			m.schedulerActivity(), m.latestSchedulerTurns())
 
-	case ViewAgentDetail:
-		if m.selectedAgent >= 0 && m.selectedAgent < len(m.agents) {
-			ag := m.agents[m.selectedAgent]
-			return renderAgentWorkbench(
-				m.theme, w, h, ag, m.turnsForAgent(ag.ID),
-				m.outputsForAgent(ag.ID), m.tracesForAgent(ag.ID), m.agentDetailScroll,
+	case ViewNodeDetail:
+		graph := m.selectedGraphView()
+		node, acts, actIndex, ok := m.selectedActivationView()
+		if graph != nil && ok {
+			return renderNodeWorkbench(
+				m.theme, w, h, *graph, node, m.agentForNode(node),
+				m.turnsForNode(node), m.outputsForNode(node),
+				m.tracesForNode(*graph, node), actIndex, len(acts), m.nodeDetailScroll,
 			)
 		}
-		return renderDashboard(m.theme, w, h, m.agents)
+		return renderGraphDashboard(m.theme, w, h, m.selectedGraphView(),
+			m.selectedNode, m.selectedGraph, len(m.graphs),
+			m.schedulerActivity(), m.latestSchedulerTurns())
 
 	case ViewChat:
-		// Show only recent messages
-		msgs := m.messages
-		if len(msgs) > maxHotMessages {
-			msgs = msgs[len(msgs)-maxHotMessages:]
-		}
-		return renderConversationWithActivity(m.theme, w, h, msgs, m.lastResult, m.agents)
+		// inline 主态：活动区只渲染进行中的流式轮次尾部 + Live Activity，
+		// 高度自适应；已定稿内容已排放到终端 scrollback。
+		return renderChatActive(m.theme, w, h, m.messages, m.agents)
 
 	case ViewResult:
-		return renderResultDetail(m.theme, w, h, m.lastResult, m.resultScroll)
-
-	case ViewActivity:
-		return renderActivityView(m.theme, w, h, m.agents, m.traces)
-
-	case ViewLogs:
-		return renderLogsView(m.theme, w, h, m.logs)
-
-	case ViewTrace:
-		return renderTraceView(m.theme, w, h, m.traces)
+		return renderResultDetail(m.theme, w, h, m.lastResult, m.latestSchedulerTurns(), m.resultScroll)
 
 	default:
-		return renderDashboard(m.theme, w, h, m.agents)
+		return renderGraphDashboard(m.theme, w, h, m.selectedGraphView(),
+			m.selectedNode, m.selectedGraph, len(m.graphs),
+			m.schedulerActivity(), m.latestSchedulerTurns())
 	}
+}
+
+func (m AppModel) schedulerActivity() string {
+	for _, agent := range m.agents {
+		if agent.Type != "scheduler" {
+			continue
+		}
+		doing := agentDoingText(agent)
+		if doing == "" {
+			doing = agent.Phase
+		}
+		if doing == "" {
+			doing = agent.State
+		}
+		return agent.ID + " · " + doing
+	}
+	return ""
+}
+
+func (m AppModel) latestSchedulerTurns() []ui.AgentTurn {
+	schedulerIDs := make(map[string]bool)
+	for _, agent := range m.agents {
+		if agent.Type == "scheduler" {
+			schedulerIDs[agent.ID] = true
+		}
+	}
+	isScheduler := func(agentID string) bool {
+		return schedulerIDs[agentID] || strings.HasPrefix(strings.ToLower(agentID), "scheduler")
+	}
+	latestTaskID := ""
+	for i := len(m.turns) - 1; i >= 0; i-- {
+		if isScheduler(m.turns[i].AgentID) {
+			latestTaskID = m.turns[i].TaskID
+			break
+		}
+	}
+	turns := make([]ui.AgentTurn, 0)
+	for _, turn := range m.turns {
+		if !isScheduler(turn.AgentID) {
+			continue
+		}
+		if latestTaskID != "" && turn.TaskID != latestTaskID {
+			continue
+		}
+		turns = append(turns, turn)
+	}
+	return turns
 }

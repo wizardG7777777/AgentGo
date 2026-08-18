@@ -5,193 +5,155 @@ import (
 	"testing"
 	"time"
 
+	"agentgo/internal/ui"
+
 	"github.com/charmbracelet/lipgloss"
 )
 
-func TestRenderChat_Empty(t *testing.T) {
-	theme := DefaultTheme()
-	result := renderChat(theme, 80, 20, nil, nil)
+// ── styledMsgLines：单条消息渲染（排放与活动区共用的样式事实源）──
 
-	if !strings.Contains(result, "Messages") {
-		t.Error("should show title")
-	}
-}
-
-func TestRenderChat_TooSmall(t *testing.T) {
-	theme := DefaultTheme()
-	result := renderChat(theme, 5, 1, nil, nil)
-	if result != "" {
-		t.Error("should return empty for too-small dimensions")
-	}
-}
-
-func TestRenderChat_WithMessages(t *testing.T) {
+func TestStyledMsgLines_Kinds(t *testing.T) {
 	theme := DefaultTheme()
 	now := time.Now()
-	msgs := []StyledMsg{
-		{Text: "system log entry", Kind: MsgLog, At: now},
-		{Text: "info message", Kind: MsgInfo, At: now},
-		{Text: "warning!", Kind: MsgWarn, At: now},
-		{Text: "error occurred", Kind: MsgError, At: now},
-	}
-	result := renderChat(theme, 80, 20, msgs, nil)
-
-	if !strings.Contains(result, "system log") {
-		t.Error("should show log message")
-	}
-	if !strings.Contains(result, "info message") {
-		t.Error("should show info message")
-	}
-	if !strings.Contains(result, "warning!") {
-		t.Error("should show warning")
-	}
-	if !strings.Contains(result, "error occurred") {
-		t.Error("should show error")
+	for _, tc := range []struct {
+		kind MsgKind
+		text string
+	}{
+		{MsgLog, "system log entry"},
+		{MsgInfo, "info message"},
+		{MsgWarn, "warning!"},
+		{MsgError, "error occurred"},
+	} {
+		lines := styledMsgLines(theme, 80, StyledMsg{Text: tc.text, Kind: tc.kind, At: now})
+		if len(lines) == 0 || !strings.Contains(strings.Join(lines, "\n"), tc.text) {
+			t.Errorf("kind=%d: rendered lines missing %q", tc.kind, tc.text)
+		}
 	}
 }
 
-func TestRenderChat_ResultSkipped(t *testing.T) {
-	theme := DefaultTheme()
-	now := time.Now()
-	msgs := []StyledMsg{
-		{Text: "normal msg", Kind: MsgInfo, At: now},
-		{Text: "result text", Kind: MsgResult, At: now},
-	}
-	result := renderChat(theme, 80, 20, msgs, nil)
-
-	// Result messages should be skipped from the message list
-	// (they're shown as pinned lastResult instead)
-	if strings.Count(result, "result text") > 0 {
-		// Result kind messages are filtered in the loop
-		// This test just verifies the filtering works
-	}
-}
-
-func TestRenderChat_WithLastResult(t *testing.T) {
-	theme := DefaultTheme()
-	now := time.Now()
-	lastResult := &StyledMsg{Text: "task completed successfully", Kind: MsgResult, At: now}
-	result := renderChat(theme, 80, 20, nil, lastResult)
-
-	if !strings.Contains(result, "Task Complete") {
-		t.Error("should show result card header")
-	}
-}
-
-func TestRenderChat_LastResultStaysPinnedWhenLogsOverflow(t *testing.T) {
-	theme := DefaultTheme()
-	now := time.Now()
-	lastResult := &StyledMsg{Text: "explicit final reply", Kind: MsgResult, At: now}
-	msgs := make([]StyledMsg, 0, 100)
-	for i := 0; i < 100; i++ {
-		msgs = append(msgs, StyledMsg{Text: "noisy diagnostic log", Kind: MsgLog, At: now})
-	}
-
-	result := renderChat(theme, 80, 14, msgs, lastResult)
-	if !strings.Contains(result, "explicit final reply") {
-		t.Fatal("日志溢出不应再把最近结果卡从消息页裁掉")
-	}
-	if len(strings.Split(result, "\n")) > 14 {
-		t.Fatal("保留结果卡后仍必须遵守终端高度约束")
-	}
-}
-
-func TestRenderChat_Timestamps(t *testing.T) {
+func TestStyledMsgLines_TimestampAndAgentPrefix(t *testing.T) {
 	theme := DefaultTheme()
 	now := time.Date(2026, 5, 26, 14, 30, 45, 0, time.UTC)
-	msgs := []StyledMsg{
-		{Text: "timed message", Kind: MsgInfo, At: now},
-	}
-	result := renderChat(theme, 80, 20, msgs, nil)
-
-	if !strings.Contains(result, "14:30:45") {
+	lines := styledMsgLines(theme, 80, StyledMsg{
+		Text: "agent output", Kind: MsgAgent, At: now, AgentID: "worker-1",
+	})
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "14:30:45") {
 		t.Error("should show timestamp in HH:MM:SS format")
 	}
-}
-
-func TestRenderChat_AgentAttribution(t *testing.T) {
-	theme := DefaultTheme()
-	msgs := []StyledMsg{
-		{Text: "agent output", Kind: MsgAgent, At: time.Now(), AgentID: "worker-1"},
-	}
-	result := renderChat(theme, 80, 20, msgs, nil)
-
-	if !strings.Contains(result, "[worker-1]") {
-		t.Error("should show agent ID prefix for agent messages")
+	if !strings.Contains(joined, "[worker-1]") {
+		t.Error("should show agent ID prefix")
 	}
 }
 
-func TestRenderChat_LongLineWrapsWithoutContentLoss(t *testing.T) {
+func TestStyledMsgLines_LongLineWrapsWithoutContentLoss(t *testing.T) {
 	theme := DefaultTheme()
 	longLine := strings.Repeat("x", 200)
-	msgs := []StyledMsg{
-		{Text: longLine, Kind: MsgInfo, At: time.Now()},
-	}
-	result := renderChat(theme, 80, 20, msgs, nil)
-
-	if strings.Contains(result, "…") || strings.Count(result, "x") != len(longLine) {
+	lines := styledMsgLines(theme, 80, StyledMsg{Text: longLine, Kind: MsgInfo, At: time.Now()})
+	joined := strings.Join(lines, "\n")
+	if strings.Contains(joined, "…") || strings.Count(joined, "x") != len(longLine) {
 		t.Error("long lines should wrap instead of being truncated")
 	}
 }
 
-func TestRenderChat_WideLineWrapsWithinCellWidth(t *testing.T) {
+func TestStyledMsgLines_WideLineWrapsWithinCellWidth(t *testing.T) {
 	theme := DefaultTheme()
-	msgs := []StyledMsg{
-		{Text: strings.Repeat("处理🙂", 20), Kind: MsgInfo, At: time.Now(), AgentID: "worker-1"},
-	}
-	result := renderChat(theme, 40, 8, msgs, nil)
-
-	if strings.Contains(result, "…") {
+	lines := styledMsgLines(theme, 40, StyledMsg{
+		Text: strings.Repeat("处理🙂", 20), Kind: MsgInfo, At: time.Now(), AgentID: "worker-1",
+	})
+	if strings.Contains(strings.Join(lines, "\n"), "…") {
 		t.Error("wide lines should wrap instead of being truncated")
 	}
-	for i, line := range strings.Split(result, "\n") {
+	for i, line := range lines {
 		if got := lipgloss.Width(line); got > 40 {
 			t.Fatalf("line %d visual width = %d, want <= 40: %q", i, got, line)
 		}
 	}
 }
 
-func TestRenderChat_HeightConstraint(t *testing.T) {
+func TestStyledMsgLines_Reasoning(t *testing.T) {
+	theme := DefaultTheme()
+	lines := styledMsgLines(theme, 80, StyledMsg{
+		Text: "正文", Reasoning: "先想清楚再回答", Kind: MsgAgent, At: time.Now(), AgentID: "worker-1",
+	})
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "Reasoning") || !strings.Contains(joined, "先想清楚再回答") {
+		t.Fatalf("reasoning block missing: %q", joined)
+	}
+}
+
+// ── renderChatActive：Chat 主态活动区（活跃流尾部 + Live Activity）──
+
+func TestRenderChatActive_IdleReturnsEmpty(t *testing.T) {
+	theme := DefaultTheme()
+	if got := renderChatActive(theme, 80, 20, nil, nil); got != "" {
+		t.Fatalf("idle activity area should be empty, got %q", got)
+	}
+}
+
+func TestRenderChatActive_TooSmall(t *testing.T) {
+	theme := DefaultTheme()
+	msgs := []StyledMsg{{Text: "streaming", Kind: MsgAgent, At: time.Now(), StreamID: "s1"}}
+	if got := renderChatActive(theme, 5, 1, msgs, nil); got != "" {
+		t.Error("should return empty for too-small dimensions")
+	}
+}
+
+func TestRenderChatActive_OnlyStreamsRendered(t *testing.T) {
+	theme := DefaultTheme()
+	now := time.Now()
+	msgs := []StyledMsg{
+		// 非流条目（无 StreamID）不应出现在活动区：定稿内容已排放。
+		{Text: "finalized message", Kind: MsgInfo, At: now},
+		{Text: "streaming chunk", Kind: MsgAgent, At: now, AgentID: "worker-1", StreamID: "s1"},
+	}
+	result := renderChatActive(theme, 80, 20, msgs, nil)
+	if strings.Contains(result, "finalized message") {
+		t.Error("non-stream message should not render in activity area")
+	}
+	if !strings.Contains(result, "streaming chunk") {
+		t.Error("active stream should render in activity area")
+	}
+}
+
+func TestRenderChatActive_HeightConstraint(t *testing.T) {
 	theme := DefaultTheme()
 	var msgs []StyledMsg
-	for i := 0; i < 100; i++ {
-		msgs = append(msgs, StyledMsg{Text: "msg", Kind: MsgInfo, At: time.Now()})
+	for i := 0; i < 10; i++ {
+		msgs = append(msgs, StyledMsg{
+			Text: strings.Repeat("line\n", 20), Kind: MsgAgent, At: time.Now(), StreamID: "s",
+		})
 	}
-	result := renderChat(theme, 80, 10, msgs, nil)
-
-	lines := strings.Split(result, "\n")
-	// Should not exceed height (10 lines)
-	if len(lines) > 10 {
-		t.Errorf("lines = %d, should be ≤ 10", len(lines))
+	result := renderChatActive(theme, 80, 10, msgs, nil)
+	if lines := strings.Split(result, "\n"); len(lines) > 10 {
+		t.Errorf("activity area lines = %d, should be ≤ maxH 10", len(lines))
 	}
 }
 
-func TestRenderMiniResult_Basic(t *testing.T) {
+func TestRenderChatActive_KeepsTailWhenOverflowing(t *testing.T) {
 	theme := DefaultTheme()
-	msg := StyledMsg{Text: "result text here", Kind: MsgResult, At: time.Now()}
-	result := renderMiniResult(theme, msg, 60)
-
-	if !strings.Contains(result, "Task Complete") {
-		t.Error("should contain header")
+	msgs := []StyledMsg{{
+		Text: "first\nsecond\nthird\nfourth", Kind: MsgAgent, At: time.Now(), StreamID: "s1",
+	}}
+	result := renderChatActive(theme, 80, 2, msgs, nil)
+	if strings.Contains(result, "first") {
+		t.Error("overflowing activity area should drop the head (bottom-aligned)")
 	}
-	if !strings.Contains(result, "result text here") {
-		t.Error("should contain result text")
+	if !strings.Contains(result, "fourth") {
+		t.Error("overflowing activity area should keep the tail")
 	}
 }
 
-func TestRenderMiniResult_Truncation(t *testing.T) {
+func TestRenderChatActive_LiveActivityShown(t *testing.T) {
 	theme := DefaultTheme()
-	longText := strings.Join(make([]string, 20), "line\n")
-	msg := StyledMsg{Text: longText, Kind: MsgResult, At: time.Now()}
-	result := renderMiniResult(theme, msg, 60)
-
-	if !strings.Contains(result, "truncated") {
-		t.Error("long result should show truncation notice")
-	}
-	if !strings.Contains(result, "/detail") || !strings.Contains(result, "/result") {
-		t.Error("truncation notice should point to full-result commands")
+	agents := []AgentInfo{{ID: "worker-1", State: "processing", Phase: "streaming"}}
+	result := renderChatActive(theme, 80, 20, nil, agents)
+	if !strings.Contains(result, "worker-1") {
+		t.Error("live activity section should list active agents")
 	}
 }
+
+// ── renderResultDetail（保留：/result 全屏视图）──
 
 func TestRenderResultDetail_FullResult(t *testing.T) {
 	theme := DefaultTheme()
@@ -200,7 +162,7 @@ func TestRenderResultDetail_FullResult(t *testing.T) {
 		Kind: MsgResult,
 		At:   time.Now(),
 	}
-	result := renderResultDetail(theme, 80, 12, msg, 0)
+	result := renderResultDetail(theme, 80, 12, msg, nil, 0)
 
 	if !strings.Contains(result, "Task Result") {
 		t.Error("should show result view title")
@@ -217,12 +179,27 @@ func TestRenderResultDetail_ScrollOffset(t *testing.T) {
 		Kind: MsgResult,
 		At:   time.Now(),
 	}
-	result := renderResultDetail(theme, 80, 7, msg, 2)
+	result := renderResultDetail(theme, 80, 7, msg, nil, 2)
 
 	if strings.Contains(result, "line 1") {
 		t.Error("offset result view should skip earlier lines")
 	}
 	if !strings.Contains(result, "line 3") {
 		t.Error("offset result view should show scrolled content")
+	}
+}
+
+func TestRenderResultDetail_PreservesRawReasoningBeforeFinalAnswer(t *testing.T) {
+	theme := DefaultTheme()
+	msg := &StyledMsg{Text: "最终回答", Kind: MsgResult, At: time.Now()}
+	turns := []ui.AgentTurn{{
+		AgentID: "scheduler-1", TaskID: "task-1", Loop: 2, Status: "completed",
+		Reasoning: "第一步：检查提交。\n第二步：汇总差异。",
+	}}
+	result := renderResultDetail(theme, 100, 20, msg, turns, 0)
+	for _, want := range []string{"Raw Reasoning · Loop 2", "第一步：检查提交", "第二步：汇总差异", "Final Answer", "最终回答"} {
+		if !strings.Contains(result, want) {
+			t.Fatalf("result detail missing %q: %q", want, result)
+		}
 	}
 }

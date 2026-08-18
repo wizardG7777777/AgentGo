@@ -6,9 +6,11 @@ import (
 	"unicode"
 )
 
-// Windows Terminal / ConPTY 在无法透传 bracketed paste 时，会把剪贴板内容
-// 退化为高速 KeyRunes + Enter 事件流。pasteBurstState 把这类事件先缓冲为
-// 一次完整粘贴，避免其中的 Enter 走普通提交路径。
+// Windows 平台的粘贴投递路径：Windows Terminal / ConPTY 不透传 bracketed
+// paste，终端把剪贴板内容作为高速 KeyRunes + Enter 事件流投递——这是
+// Windows 上正式的粘贴投递形态，与 macOS/Linux 的 bracketed paste 事件
+// 并列。pasteBurstState 是该投递形态在应用侧的正式重组器：把这类事件
+// 先缓冲为一次完整粘贴，避免其中的 Enter 走普通提交路径。
 //
 // 三个时间窗口分别承担不同职责：
 //   - charInterval：首个 ASCII 字符的候选窗口；第二个高速字符到达即判为 burst；

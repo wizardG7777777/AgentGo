@@ -3,25 +3,23 @@ package tui
 import "testing"
 
 func TestCalcLayout_NormalWidth(t *testing.T) {
-	l := calcLayout(120, 40, ViewDashboard)
+	l := calcLayout(120, 40)
 
 	if l.Compact {
 		t.Error("expected normal mode at width=120, got compact")
 	}
-	if l.SidebarW != sidebarMinWidth {
-		t.Errorf("SidebarW = %d, want %d", l.SidebarW, sidebarMinWidth)
-	}
-	if l.HeaderH != headerHeight {
-		t.Errorf("HeaderH = %d, want %d", l.HeaderH, headerHeight)
-	}
 	if l.StatusH != statusBarHeight {
 		t.Errorf("StatusH = %d, want %d", l.StatusH, statusBarHeight)
 	}
-	if l.MainX != l.SidebarW+1 {
-		t.Errorf("MainX = %d, want %d", l.MainX, l.SidebarW+1)
+	if l.MainY != 0 {
+		t.Errorf("MainY = %d, want 0（顶栏已并入状态栏，body 从第 0 行起）", l.MainY)
 	}
-	if l.MainW <= 0 {
-		t.Errorf("MainW = %d, should be positive", l.MainW)
+	// 无侧边栏：主面板始终全宽。
+	if l.MainX != 0 {
+		t.Errorf("MainX = %d, want 0", l.MainX)
+	}
+	if l.MainW != 120 {
+		t.Errorf("MainW = %d, want 120（全宽）", l.MainW)
 	}
 	if l.MainH <= 0 {
 		t.Errorf("MainH = %d, should be positive", l.MainH)
@@ -29,13 +27,10 @@ func TestCalcLayout_NormalWidth(t *testing.T) {
 }
 
 func TestCalcLayout_CompactMode(t *testing.T) {
-	l := calcLayout(60, 30, ViewDashboard)
+	l := calcLayout(60, 30)
 
 	if !l.Compact {
 		t.Error("expected compact mode at width=60")
-	}
-	if l.SidebarW != 0 {
-		t.Errorf("SidebarW = %d, want 0 in compact mode", l.SidebarW)
 	}
 	if l.MainX != 0 {
 		t.Errorf("MainX = %d, want 0 in compact mode", l.MainX)
@@ -46,29 +41,22 @@ func TestCalcLayout_CompactMode(t *testing.T) {
 }
 
 func TestCalcLayout_CompactThreshold(t *testing.T) {
-	justBelow := calcLayout(compactThreshold-1, 30, ViewDashboard)
+	justBelow := calcLayout(compactThreshold-1, 30)
 	if !justBelow.Compact {
 		t.Errorf("width=%d should be compact", compactThreshold-1)
 	}
 
-	atThreshold := calcLayout(compactThreshold, 30, ViewDashboard)
+	atThreshold := calcLayout(compactThreshold, 30)
 	if atThreshold.Compact {
 		t.Errorf("width=%d should NOT be compact", compactThreshold)
 	}
 }
 
-func TestCalcLayout_WideSidebarExpansion(t *testing.T) {
-	l := calcLayout(150, 40, ViewDashboard)
-	if l.SidebarW != sidebarMaxWidth {
-		t.Errorf("SidebarW = %d, want %d at width=150", l.SidebarW, sidebarMaxWidth)
-	}
-}
-
 func TestCalcLayout_VerticalDistribution(t *testing.T) {
-	l := calcLayout(120, 40, ViewDashboard)
+	l := calcLayout(120, 40)
 
-	// header(1) + body + input(3) + status(1) = 40
-	expectedBody := 40 - headerHeight - inputHeight - statusBarHeight
+	// body + input(3) + status(1) = 40（顶栏已并入状态栏）
+	expectedBody := 40 - inputHeight - statusBarHeight
 	if l.MainH != expectedBody {
 		t.Errorf("MainH = %d, want %d", l.MainH, expectedBody)
 	}
@@ -78,9 +66,9 @@ func TestCalcLayout_VerticalDistribution(t *testing.T) {
 }
 
 func TestCalcLayout_DynamicInputHeight(t *testing.T) {
-	l := calcLayout(120, 40, ViewDashboard, 8)
+	l := calcLayout(120, 40, 8)
 
-	expectedBody := 40 - headerHeight - 8 - statusBarHeight
+	expectedBody := 40 - 8 - statusBarHeight
 	if l.InputH != 8 {
 		t.Errorf("InputH = %d, want 8", l.InputH)
 	}
@@ -93,7 +81,7 @@ func TestCalcLayout_DynamicInputHeight(t *testing.T) {
 }
 
 func TestCalcLayout_TinyTerminal(t *testing.T) {
-	l := calcLayout(10, 5, ViewDashboard)
+	l := calcLayout(10, 5)
 
 	if l.MainW < 1 {
 		t.Errorf("MainW = %d, should be at least 1", l.MainW)
@@ -104,7 +92,7 @@ func TestCalcLayout_TinyTerminal(t *testing.T) {
 }
 
 func TestCalcLayout_InteractionStacksAboveInput(t *testing.T) {
-	l := calcLayout(120, 40, ViewDashboard, 4, 7)
+	l := calcLayout(120, 40, 4, 7)
 	if l.InteractionH != 7 {
 		t.Fatalf("InteractionH = %d, want 7", l.InteractionH)
 	}

@@ -51,7 +51,7 @@ func TestRenderInteractionPanel_LongPromptCanPageWithoutLosingOptions(t *testing
 
 	first := renderInteractionPanel(DefaultTheme(), 80, req, 0, 0, 0, true)
 	if !strings.Contains(first, "问题第1行") || strings.Contains(first, "问题第9行") ||
-		!strings.Contains(first, "PgUp/PgDn 翻页") || !strings.Contains(first, "执行") {
+		!strings.Contains(first, pageKeysDisplay+" 翻页") || !strings.Contains(first, "执行") {
 		t.Fatalf("first prompt page is incomplete:\n%s", first)
 	}
 	last := renderInteractionPanel(DefaultTheme(), 80, req, 0, 99, 0, true)

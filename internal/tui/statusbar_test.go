@@ -41,7 +41,7 @@ func TestLipglossWidth_Unicode(t *testing.T) {
 
 func TestRenderStatusBar_Narrow(t *testing.T) {
 	theme := DefaultTheme()
-	result := renderStatusBar(theme, 15, FocusInput, ViewDashboard, false)
+	result := renderStatusBar(theme, 15, FocusInput, ViewGraph, false, statusInfo{})
 	if result != "" {
 		t.Error("should return empty for width < 20")
 	}
@@ -56,11 +56,10 @@ func TestRenderStatusBar_FocusLabels(t *testing.T) {
 	}{
 		{FocusInput, "INPUT"},
 		{FocusInteraction, "INTERACTION"},
-		{FocusSidebar, "SIDEBAR"},
 		{FocusMain, "MAIN"},
 	}
 	for _, tc := range tests {
-		result := renderStatusBar(theme, 100, tc.focus, ViewDashboard, false)
+		result := renderStatusBar(theme, 100, tc.focus, ViewGraph, false, statusInfo{})
 		if result == "" {
 			t.Errorf("focus=%d: empty result", tc.focus)
 			continue
@@ -80,23 +79,27 @@ func TestRenderStatusBar_ViewLabels(t *testing.T) {
 		view ViewState
 		want string
 	}{
-		{ViewDashboard, "Dashboard"},
-		{ViewAgentDetail, "Agent Detail"},
-		{ViewChat, "Messages"},
+		{ViewGraph, "Graph"},
+		{ViewNodeDetail, "Node Detail"},
+		{ViewChat, "Chat"},
 		{ViewResult, "Result"},
 	}
 	for _, tc := range tests {
-		result := renderStatusBar(theme, 100, FocusInput, tc.view, false)
+		result := renderStatusBar(theme, 100, FocusInput, tc.view, false, statusInfo{})
 		if result == "" {
 			t.Errorf("view=%d: empty result", tc.view)
+			continue
+		}
+		if !strings.Contains(result, tc.want) {
+			t.Errorf("view=%d: status bar missing %q: %q", tc.view, tc.want, result)
 		}
 	}
 }
 
 func TestRenderStatusBar_InteractionHints(t *testing.T) {
 	theme := DefaultTheme()
-	interactionFocus := renderStatusBar(theme, 120, FocusInteraction, ViewDashboard, false)
-	inputFocus := renderStatusBar(theme, 120, FocusInput, ViewDashboard, false)
+	interactionFocus := renderStatusBar(theme, 120, FocusInteraction, ViewGraph, false, statusInfo{})
+	inputFocus := renderStatusBar(theme, 120, FocusInput, ViewGraph, false, statusInfo{})
 	if !strings.Contains(interactionFocus, "select") || !strings.Contains(interactionFocus, "submit") {
 		t.Error("Interaction focus should include selection and submit hints")
 	}
@@ -105,22 +108,12 @@ func TestRenderStatusBar_InteractionHints(t *testing.T) {
 	}
 }
 
-func TestRenderStatusBar_SidebarHints(t *testing.T) {
+func TestRenderStatusBar_MainGraphHints(t *testing.T) {
 	theme := DefaultTheme()
-	sb := renderStatusBar(theme, 120, FocusSidebar, ViewDashboard, false)
-	input := renderStatusBar(theme, 120, FocusInput, ViewDashboard, false)
+	result := renderStatusBar(theme, 140, FocusMain, ViewGraph, false, statusInfo{})
 
-	if len(sb) <= len(input) {
-		t.Error("sidebar-focused status bar should include ↑↓/Enter hints")
-	}
-}
-
-func TestRenderStatusBar_MainAgentHints(t *testing.T) {
-	theme := DefaultTheme()
-	result := renderStatusBar(theme, 140, FocusMain, ViewDashboard, false)
-
-	if !strings.Contains(result, "agent") {
-		t.Error("main dashboard status bar should include agent navigation hint")
+	if !strings.Contains(result, "node") || !strings.Contains(result, "graph") {
+		t.Error("graph dashboard status bar should include node and graph navigation hints")
 	}
 	if !strings.Contains(result, "view") {
 		t.Error("main dashboard status bar should include view hint")
@@ -129,7 +122,7 @@ func TestRenderStatusBar_MainAgentHints(t *testing.T) {
 
 func TestRenderStatusBar_ResultHints(t *testing.T) {
 	theme := DefaultTheme()
-	result := renderStatusBar(theme, 140, FocusMain, ViewResult, false)
+	result := renderStatusBar(theme, 140, FocusMain, ViewResult, false, statusInfo{})
 
 	if !strings.Contains(result, "scroll") {
 		t.Error("result view status bar should include scroll hint")
@@ -139,21 +132,9 @@ func TestRenderStatusBar_ResultHints(t *testing.T) {
 	}
 }
 
-func TestRenderStatusBar_ResultHintsRespectSidebarFocus(t *testing.T) {
-	theme := DefaultTheme()
-	result := renderStatusBar(theme, 140, FocusSidebar, ViewResult, false)
-
-	if !strings.Contains(result, "select") {
-		t.Error("sidebar-focused result status bar should keep select hint")
-	}
-	if strings.Contains(result, "scroll") {
-		t.Error("sidebar-focused result status bar should not show scroll hint")
-	}
-}
-
 func TestRenderStatusBar_ResultHintsDoNotStealInputFocus(t *testing.T) {
 	theme := DefaultTheme()
-	result := renderStatusBar(theme, 140, FocusInput, ViewResult, false)
+	result := renderStatusBar(theme, 140, FocusInput, ViewResult, false, statusInfo{})
 	if strings.Contains(result, "scroll") || strings.Contains(result, "page") {
 		t.Error("input-focused result view must keep arrows for the textarea")
 	}

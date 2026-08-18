@@ -10,13 +10,10 @@ import (
 type ViewState int
 
 const (
-	ViewDashboard   ViewState = iota // All agents in a card grid
-	ViewAgentDetail                  // Selected agent's output stream
-	ViewChat                         // System message history
-	ViewResult                       // Full task result
-	ViewActivity                     // Human-readable cross-agent activity
-	ViewLogs                         // Raw diagnostic logs
-	ViewTrace                        // Structured trace/tool events
+	ViewChat       ViewState = iota // 会话视图（默认）：inline 排放流 + 活跃轮次尾部
+	ViewGraph                       // 执行图全屏视图（/graph 进入）
+	ViewNodeDetail                  // Selected graph node and its execution activity
+	ViewResult                      // Full task result
 )
 
 // FocusState tracks which panel has keyboard focus.
@@ -25,8 +22,7 @@ type FocusState int
 const (
 	FocusInput       FocusState = iota // Text editor (default)
 	FocusInteraction                   // Structured user interaction
-	FocusSidebar                       // Agent list navigation
-	FocusMain                          // Main content area
+	FocusMain                          // Main content area (graph/node navigation)
 )
 
 // MsgKind determines message styling.
@@ -43,17 +39,23 @@ const (
 
 // StyledMsg is a message with kind, timestamp, and optional agent attribution.
 type StyledMsg struct {
-	Text     string
-	Kind     MsgKind
-	At       time.Time
-	AgentID  string // non-empty for agent-attributed messages
-	StreamID string // non-empty for replace-in-place LLM stream snapshots
+	Text      string
+	Reasoning string
+	Kind      MsgKind
+	At        time.Time
+	AgentID   string // non-empty for agent-attributed messages
+	StreamID  string // non-empty for replace-in-place LLM stream snapshots
 }
 
-// AgentInfo 是单个代理的运行状态快照（仪表板/侧边栏渲染用）。
+// AgentInfo 是单个代理的运行状态快照（仪表板渲染用）。
 // 自 UI Hub 接入起，它只是 ui.AgentCard 的别名——数据由 Hub 轮询产生，
 // 渲染代码因此完全不需要改动。
 type AgentInfo = ui.AgentCard
+
+// GraphInfo / GraphNodeInfo keep rendering code independent from GraphStore.
+// The UI Hub owns the authoritative frontend projection.
+type GraphInfo = ui.GraphView
+type GraphNodeInfo = ui.GraphNodeView
 
 // Deps aggregates all external dependencies for the TUI.
 //
@@ -76,12 +78,6 @@ type Layout struct {
 	// Overall
 	Width, Height int
 
-	// Header
-	HeaderY, HeaderH int
-
-	// Sidebar
-	SidebarX, SidebarY, SidebarW, SidebarH int
-
 	// Main content
 	MainX, MainY, MainW, MainH int
 
@@ -94,15 +90,12 @@ type Layout struct {
 	// Status bar
 	StatusY, StatusH int
 
-	// Compact mode (no sidebar, header collapses)
+	// Compact mode (narrow terminal)
 	Compact bool
 }
 
 const (
-	sidebarMinWidth  = 24
-	sidebarMaxWidth  = 32
 	compactThreshold = 80
-	headerHeight     = 1
 	statusBarHeight  = 1
 	inputMinHeight   = 3
 	inputMaxHeight   = 15

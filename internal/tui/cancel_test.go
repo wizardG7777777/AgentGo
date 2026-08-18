@@ -26,12 +26,17 @@ func TestCancelTask_DelegatesToControllerAndRendersSuccess(t *testing.T) {
 	}
 }
 
-// D2：Controller.CancelTask 返回的错误（未找到/歧义/plan 守卫拒绝）原样渲染给用户。
+// D2：Controller.CancelTask 返回的错误（未找到/歧义/plan 守卫拒绝）完整渲染给用户。
+// inline 重构后排放路径按终端宽度折行重排，断言改为忽略布局空白后的内容
+// 包含——保证的是「不吞字、不改字」，而不是逐字布局。
 func TestCancelTask_RendersErrorsVerbatim(t *testing.T) {
 	cases := map[string]string{
 		"not-found": "未找到以 zzzz 开头的任务",
 		"ambiguous": "找到 2 个匹配的任务，请使用更长的任务 ID 区分:\n  aaaa0000-x\n  aaaa1111-y",
 		"guard":     "cancel_task 被拒绝：任务 x 由 Plan p 的控制器托管，外部调用方不能取消",
+	}
+	compact := func(s string) string {
+		return strings.Join(strings.Fields(s), "")
 	}
 	for name, msg := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -40,8 +45,17 @@ func TestCancelTask_RendersErrorsVerbatim(t *testing.T) {
 			m := newAppModel(deps)
 			m.cancelTask("aaaa")
 
-			if got := lastMessageText(&m); !strings.Contains(got, msg) {
-				t.Fatalf("错误未原样渲染: got %q, want contains %q", got, msg)
+			// 逐行核对：原始换行结构会被排放路径重排（每行带时间戳前缀、
+			// 长行折行），但每一行的内容都必须完整出现。
+			got := compact(lastMessageText(&m))
+			for _, line := range strings.Split(msg, "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				if !strings.Contains(got, compact(line)) {
+					t.Fatalf("错误未完整渲染（缺行 %q）: got %q", line, got)
+				}
 			}
 		})
 	}

@@ -22,34 +22,45 @@ func TestRestoreFeedKeepsDiagnosticsSeparateAndRestoresStreams(t *testing.T) {
 		Traces: []ui.TraceEvent{{Kind: "tool_call", AgentID: "worker-2", Tool: "read_file", At: at}},
 	})
 
-	if len(m.logs) != 1 || len(m.traces) != 1 {
-		t.Fatalf("diagnostic feed was not restored: logs=%d traces=%d", len(m.logs), len(m.traces))
+	// TUI 不再渲染诊断视图（/logs /trace 已移除）：快照里的原始日志不落地，
+	// traces 仅作节点详情 Recent Activity 的数据源恢复。
+	if len(m.traces) != 1 {
+		t.Fatalf("trace feed was not restored: traces=%d", len(m.traces))
 	}
-	conversation := make([]string, 0, len(m.messages))
-	for _, msg := range m.messages {
-		conversation = append(conversation, msg.Text)
+	// inline 重构：恢复点上的旧输出不回填消息流——活动区（m.messages）只
+	// 接纳恢复之后新到达的实时流，定稿轮次由 replayTurns 统一回放。
+	if len(m.messages) != 0 {
+		t.Fatalf("restoreFeed 不应回填消息流: messages=%d", len(m.messages))
 	}
-	joined := strings.Join(conversation, "\n")
+	if len(m.feedOutputs) != 2 {
+		t.Fatalf("feed outputs was not restored: feedOutputs=%d", len(m.feedOutputs))
+	}
+	var texts []string
+	for _, o := range m.feedOutputs {
+		texts = append(texts, o.Text)
+	}
+	joined := strings.Join(texts, "\n")
 	if !strings.Contains(joined, "阶段性说明") || !strings.Contains(joined, "正在生成") {
-		t.Fatalf("recoverable agent output missing from conversation: %q", joined)
+		t.Fatalf("recoverable agent output missing from feed outputs: %q", joined)
 	}
-	if strings.Contains(joined, "raw diagnostic") || strings.Contains(joined, "read_file") {
-		t.Fatalf("logs or traces leaked into conversation: %q", joined)
+	emitted := strings.Join(m.pendingEmit, "\n")
+	if strings.Contains(emitted, "raw diagnostic") || strings.Contains(emitted, "read_file") {
+		t.Fatalf("logs or traces leaked into emit queue: %q", emitted)
 	}
 }
 
-func TestRecordFeedOutputUpsertsStreamAndFiltersByAgent(t *testing.T) {
+func TestRecordFeedOutputUpsertsStreamAndFiltersByNodeTask(t *testing.T) {
 	m := newAppModel(testDeps())
-	m.recordFeedOutput(ui.FeedOutput{Kind: "stream", AgentID: "worker-1", StreamID: "s-1", Text: "a"})
-	m.recordFeedOutput(ui.FeedOutput{Kind: "stream", AgentID: "worker-1", StreamID: "s-1", Text: "ab", Done: true})
-	m.recordFeedOutput(ui.FeedOutput{Kind: "text", AgentID: "worker-2", Text: "other"})
+	m.recordFeedOutput(ui.FeedOutput{Kind: "stream", AgentID: "worker-1", TaskID: "task-1", StreamID: "s-1", Text: "a"})
+	m.recordFeedOutput(ui.FeedOutput{Kind: "stream", AgentID: "worker-1", TaskID: "task-1", StreamID: "s-1", Text: "ab", Done: true})
+	m.recordFeedOutput(ui.FeedOutput{Kind: "text", AgentID: "worker-1", TaskID: "task-2", Text: "other node"})
 
 	if got := len(m.feedOutputs); got != 2 {
 		t.Fatalf("stream snapshots should replace in place, got %d records", got)
 	}
-	worker := m.outputsForAgent("worker-1")
-	if len(worker) != 1 || worker[0].Text != "ab" || !worker[0].Done {
-		t.Fatalf("unexpected per-agent stream: %+v", worker)
+	nodeOutputs := m.outputsForNode(GraphNodeInfo{TaskID: "task-1"})
+	if len(nodeOutputs) != 1 || nodeOutputs[0].Text != "ab" || !nodeOutputs[0].Done {
+		t.Fatalf("unexpected per-node stream: %+v", nodeOutputs)
 	}
 }
 
@@ -87,36 +98,65 @@ func TestUpsertTurnEventKeepsEveryLoopAndFreezesTerminalTurn(t *testing.T) {
 	}
 }
 
-func TestRenderAgentWorkbenchShowsOnlySelectedAgent(t *testing.T) {
+func TestNodeActivityFiltersByTaskAndActivation(t *testing.T) {
+	m := newAppModel(testDeps())
+	node := GraphNodeInfo{NodeID: "work", TaskID: "task-2", ActivationID: "work@2"}
+	graph := GraphInfo{GraphID: "g-1"}
+	m.turns = []ui.AgentTurn{
+		{ID: "old-task", AgentID: "worker-1", TaskID: "task-1"},
+		{ID: "selected", AgentID: "worker-1", TaskID: "task-2"},
+	}
+	m.traces = []ui.TraceEvent{
+		{Kind: "tool_call", TaskID: "task-1", GraphID: "g-1", NodeID: "work", ActivationID: "work@1"},
+		{Kind: "tool_call", TaskID: "task-2"},
+		{Kind: "node_activation_created", GraphID: "g-1", NodeID: "work", ActivationID: "work@2"},
+		{Kind: "node_activation_created", GraphID: "g-2", NodeID: "work", ActivationID: "work@2"},
+	}
+
+	turns := m.turnsForNode(node)
+	traces := m.tracesForNode(graph, node)
+	if len(turns) != 1 || turns[0].ID != "selected" {
+		t.Fatalf("node turns leaked across tasks: %+v", turns)
+	}
+	if len(traces) != 2 || traces[0].TaskID != "task-2" || traces[1].ActivationID != "work@2" {
+		t.Fatalf("node traces leaked across activations or graphs: %+v", traces)
+	}
+}
+
+func TestRenderNodeWorkbenchShowsSelectedNodeActivity(t *testing.T) {
 	at := time.Date(2026, 7, 20, 10, 0, 0, 0, time.UTC)
-	view := renderAgentWorkbench(DefaultTheme(), 100, 24,
-		AgentInfo{ID: "worker-1", State: "processing", Phase: "model", CurrentTaskID: "task-1"},
+	graph := GraphInfo{GraphID: "g-1", Status: "running"}
+	node := GraphNodeInfo{NodeID: "collect", Title: "Collect", Kind: "agent", Status: "running", TaskID: "task-1", ActivationID: "collect@1", AgentID: "worker-1"}
+	info := AgentInfo{ID: "worker-1", State: "processing", Phase: "model", CurrentTaskID: "task-1"}
+	view := renderNodeWorkbench(DefaultTheme(), 100, 24, graph, node, &info,
 		[]ui.AgentTurn{{
 			ID: "turn-1", AgentID: "worker-1", TaskID: "task-1", Loop: 1,
 			Text: "worker one output", Status: "completed", CompletedAt: at,
 		}},
 		nil,
 		[]ui.TraceEvent{{Kind: "tool_call", AgentID: "worker-1", Tool: "read_file", At: at}},
-		0,
+		0, 1, 0,
 	)
 
-	if !strings.Contains(view, "Turn History") || !strings.Contains(view, "Recent Decisions") ||
+	if !strings.Contains(view, "Execution History") || !strings.Contains(view, "Recent Activity") ||
 		!strings.Contains(view, "worker one output") || !strings.Contains(view, "read_file") {
-		t.Fatalf("agent workbench missing output or trace: %q", view)
+		t.Fatalf("node workbench missing output or trace: %q", view)
 	}
-	if strings.Contains(view, "Controller State") {
-		t.Fatalf("ordinary agent should not render scheduler control facet: %q", view)
+	if !strings.Contains(view, "graph g-1") || !strings.Contains(view, "collect@1") {
+		t.Fatalf("node identity missing: %q", view)
 	}
 }
 
-func TestRenderSchedulerWorkbenchKeepsAllTurns(t *testing.T) {
+func TestRenderNodeWorkbenchKeepsAllExecutionTurns(t *testing.T) {
 	at := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
-	view := renderAgentWorkbench(DefaultTheme(), 120, 48,
-		AgentInfo{
-			ID: "scheduler-1", Type: "scheduler", State: "processing", Phase: "tooling",
-			CurrentTaskID: "controller-1", Loop: 8, ToolCallCount: 12,
-			ActiveTools: []ui.AgentToolActivity{{CallID: "active-1", Tool: "ensure_acceptance_run", StartedAt: at}},
-		},
+	graph := GraphInfo{GraphID: "g-plan", Status: "running", Revision: 3}
+	node := GraphNodeInfo{NodeID: "plan", Title: "Plan work", Kind: "controller", Status: "running", TaskID: "controller-1", ActivationID: "plan@1", AgentID: "scheduler-1"}
+	info := AgentInfo{
+		ID: "scheduler-1", Type: "scheduler", State: "processing", Phase: "tooling",
+		CurrentTaskID: "controller-1", Loop: 8, ToolCallCount: 12,
+		ActiveTools: []ui.AgentToolActivity{{CallID: "active-1", Tool: "ensure_acceptance_run", StartedAt: at}},
+	}
+	view := renderNodeWorkbench(DefaultTheme(), 120, 48, graph, node, &info,
 		[]ui.AgentTurn{
 			{
 				ID: "old", AgentID: "scheduler-1", TaskID: "controller-1", Loop: 7,
@@ -135,13 +175,13 @@ func TestRenderSchedulerWorkbenchKeepsAllTurns(t *testing.T) {
 			{Kind: "tool_call", AgentID: "scheduler-1", Loop: 8, Tool: "get_acceptance_evidence", CallID: "call-1", Outcome: "running", At: at},
 			{Kind: "tool_result", AgentID: "scheduler-1", Loop: 8, Tool: "get_acceptance_evidence", CallID: "call-1", Outcome: "success", ArgsSummary: `{"result_id":"result-4"}`, DurationMS: 2, At: at.Add(time.Second)},
 		},
-		0,
+		0, 1, 0,
 	)
 
 	for _, want := range []string{
-		"Turn History", "old verbose narration", "current decision", "checking acceptance",
+		"Execution History", "old verbose narration", "current decision", "checking acceptance",
 		"Active Tools", "ensure_acceptance_run",
-		"Recent Decisions", "get_acceptance_evidence", "Final Result", "final answer",
+		"Recent Activity", "get_acceptance_evidence", "Final Result", "final answer",
 	} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("scheduler workbench missing %q: %q", want, view)
@@ -149,7 +189,31 @@ func TestRenderSchedulerWorkbenchKeepsAllTurns(t *testing.T) {
 	}
 }
 
-func TestRenderAgentWorkbenchScrollsFromNewestToOldest(t *testing.T) {
+func TestRenderNodeWorkbenchExplainsWaitingAndFailureContext(t *testing.T) {
+	deadline := time.Date(2026, 8, 6, 15, 4, 5, 0, time.UTC)
+	view := renderNodeWorkbench(DefaultTheme(), 90, 20,
+		GraphInfo{GraphID: "g-wait", Status: "running"},
+		GraphNodeInfo{
+			NodeID: "approval", Title: "Approve release", Kind: "approval", Status: "waiting",
+			ActivationID: "approval@1", RequestID: "request-1", WaitEvent: "release.approved",
+			WaitDeadline: &deadline, Reason: "等待用户确认发布范围",
+		}, nil, nil, nil,
+		[]ui.TraceEvent{{
+			Kind: "graph_wait_started", GraphID: "g-wait", NodeID: "approval",
+			ActivationID: "approval@1", Message: "event=release.approved",
+		}}, 0, 1, 0)
+
+	for _, want := range []string{
+		"waiting", "release.approved", "request-1", "15:04:05",
+		"等待用户确认发布范围", "graph_wait_started",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("waiting node detail missing %q: %q", want, view)
+		}
+	}
+}
+
+func TestRenderNodeWorkbenchScrollsFromNewestToOldest(t *testing.T) {
 	at := time.Date(2026, 7, 28, 11, 0, 0, 0, time.UTC)
 	turns := make([]ui.AgentTurn, 0, 12)
 	for i := 1; i <= 12; i++ {
@@ -160,12 +224,14 @@ func TestRenderAgentWorkbenchScrollsFromNewestToOldest(t *testing.T) {
 		})
 	}
 	info := AgentInfo{ID: "worker-1", State: "processing", Phase: "model", CurrentTaskID: "task-1", Loop: 12}
-	maxScroll := agentWorkbenchMaxScroll(DefaultTheme(), 80, 16, info, turns, nil, nil)
+	graph := GraphInfo{GraphID: "g-1", Status: "running"}
+	node := GraphNodeInfo{NodeID: "work", Title: "Work", Kind: "agent", Status: "running", TaskID: "task-1", ActivationID: "work@1", AgentID: "worker-1"}
+	maxScroll := nodeWorkbenchMaxScroll(DefaultTheme(), 80, 16, graph, node, &info, turns, nil, nil, 0, 1)
 	if maxScroll <= 0 {
 		t.Fatal("足够长的轮次历史应产生可滚动区域")
 	}
-	latest := renderAgentWorkbench(DefaultTheme(), 80, 16, info, turns, nil, nil, 0)
-	oldest := renderAgentWorkbench(DefaultTheme(), 80, 16, info, turns, nil, nil, maxScroll)
+	latest := renderNodeWorkbench(DefaultTheme(), 80, 16, graph, node, &info, turns, nil, nil, 0, 1, 0)
+	oldest := renderNodeWorkbench(DefaultTheme(), 80, 16, graph, node, &info, turns, nil, nil, 0, 1, maxScroll)
 	if !strings.Contains(latest, "轮次正文-L") || strings.Contains(latest, "轮次正文-A") {
 		t.Fatalf("自动跟随应定位到最新轮次: %q", latest)
 	}

@@ -40,11 +40,11 @@ func TestHandleKey_PasteMsgNormalizesCRLF(t *testing.T) {
 	}
 }
 
-// 焦点在侧栏/主面板时粘贴不能静默丢弃：粘贴的意图永远是输入，
+// 焦点在主面板时粘贴不能静默丢弃：粘贴的意图永远是输入，
 // 应切回输入框焦点并写入文本。
 func TestHandleKey_PasteMsgRetargetsFocusToInput(t *testing.T) {
 	m := newAppModel(testDeps())
-	m.setFocus(FocusSidebar)
+	m.setFocus(FocusMain)
 	m.agents = []AgentInfo{{ID: "a1"}}
 
 	result, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hello\nworld"), Paste: true})
@@ -54,7 +54,7 @@ func TestHandleKey_PasteMsgRetargetsFocusToInput(t *testing.T) {
 		t.Fatalf("粘贴应把焦点切回输入框，实际 %v", updated.focus)
 	}
 	if got := updated.input.Value(); got != "hello\nworld" {
-		t.Fatalf("焦点在侧栏时粘贴不得丢弃，得到 %q", got)
+		t.Fatalf("焦点在主面板时粘贴不得丢弃，得到 %q", got)
 	}
 }
 
@@ -101,11 +101,11 @@ func TestHandleKey_CtrlVReturnsClipboardCmd(t *testing.T) {
 	}
 }
 
-// 焦点在侧栏时 Ctrl+V 同样生效：粘贴的意图永远是输入，应切回
+// 焦点在主面板时 Ctrl+V 同样生效：粘贴的意图永远是输入，应切回
 // 输入框焦点再读剪贴板。
 func TestHandleKey_CtrlVRetargetsFocusToInput(t *testing.T) {
 	m := newAppModel(testDeps())
-	m.setFocus(FocusSidebar)
+	m.setFocus(FocusMain)
 	m.agents = []AgentInfo{{ID: "a1"}}
 
 	result, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlV})

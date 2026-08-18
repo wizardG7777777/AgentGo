@@ -3,7 +3,7 @@ package tui
 // calcLayout computes panel dimensions from terminal size and view state.
 // rows[0] is the input area height; rows[1], when present, is the Interaction
 // panel height. The two lower panels stack instead of overlapping.
-func calcLayout(w, h int, view ViewState, rows ...int) Layout {
+func calcLayout(w, h int, rows ...int) Layout {
 	l := Layout{Width: w, Height: h}
 	l.Compact = w < compactThreshold
 	inputH := inputMinHeight
@@ -18,9 +18,7 @@ func calcLayout(w, h int, view ViewState, rows ...int) Layout {
 		interactionH = rows[1]
 	}
 
-	// Vertical split: header | body | interaction? | input | status.
-	l.HeaderY = 0
-	l.HeaderH = headerHeight
+	// Vertical split: body | interaction? | input | status（顶栏已并入状态栏）。
 	l.StatusY = h - statusBarHeight
 	l.StatusH = statusBarHeight
 	l.InputY = l.StatusY - inputH
@@ -28,34 +26,17 @@ func calcLayout(w, h int, view ViewState, rows ...int) Layout {
 	l.InteractionY = l.InputY - interactionH
 	l.InteractionH = interactionH
 
-	bodyY := l.HeaderY + l.HeaderH
+	bodyY := 0
 	bodyH := l.InteractionY - bodyY
 	if bodyH < 1 {
 		bodyH = 1
 	}
 
-	if l.Compact {
-		// No sidebar in compact mode
-		l.SidebarW = 0
-		l.MainX = 0
-		l.MainY = bodyY
-		l.MainW = w
-		l.MainH = bodyH
-	} else {
-		// Sidebar on the left
-		l.SidebarW = sidebarMinWidth
-		if w > 140 {
-			l.SidebarW = sidebarMaxWidth
-		}
-		l.SidebarX = 0
-		l.SidebarY = bodyY
-		l.SidebarH = bodyH
-
-		l.MainX = l.SidebarW + 1 // +1 for border
-		l.MainY = bodyY
-		l.MainW = w - l.MainX
-		l.MainH = bodyH
-	}
+	// 无侧边栏：主面板始终全宽。
+	l.MainX = 0
+	l.MainY = bodyY
+	l.MainW = w
+	l.MainH = bodyH
 
 	if l.MainW < 1 {
 		l.MainW = 1

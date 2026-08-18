@@ -40,9 +40,13 @@ func TestMatchCommands_UnknownPrefixEmpty(t *testing.T) {
 }
 
 func TestMatchCommands_AliasPrefix(t *testing.T) {
-	got := matchCommands("/dash")
-	if len(got) != 1 || got[0].Name != "dashboard" {
-		t.Fatalf("\"/dash\" 应命中 dashboard，得到 %+v", got)
+	got := matchCommands("/det")
+	if len(got) != 1 || got[0].Name != "result" {
+		t.Fatalf("\"/det\" 应经别名 detail 命中 result，得到 %+v", got)
+	}
+	// /dashboard 已由 /graph 取代并退役，旧前缀不应再有提示。
+	if got := matchCommands("/dash"); len(got) != 0 {
+		t.Fatalf("\"/dash\" 已退役，不应有提示，得到 %+v", got)
 	}
 }
 
@@ -95,20 +99,23 @@ func TestHelpText_CoversWholeCatalog(t *testing.T) {
 	}
 }
 
-// 命令反馈（错误提示、/mode、/cancel 等）写在消息流里；默认视图是
-// 仪表板（不渲染消息流），执行命令后若视图未变必须切到消息视图，
-// 否则反馈不可见——用户曾因此误以为命令系统整体失效。
+// 命令反馈（错误提示、/mode、/cancel 等）经 pendingEmit 排放到 scrollback；
+// Graph 全屏视图下排放会被攒住（alt screen 中 tea.Println 丢弃），执行命令
+// 后若视图未变必须切回 Chat 视图，否则反馈不可见——用户曾因此误以为命令
+// 系统整体失效。
 
 func enterKey(t *testing.T, m AppModel, line string) AppModel {
 	t.Helper()
 	m.input.SetValue(line)
-	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	// 走内部 update：外层 Update 出口会 flush 抽干 pendingEmit（排放生效路径
+	// 由 TestFlushEmitCmd 覆盖），测试断言的是「渲染进待排放队列」的状态。
+	result, _ := m.update(tea.KeyMsg{Type: tea.KeyEnter})
 	return firePendingSubmit(t, result.(AppModel))
 }
 
 func TestCommand_UnknownCommandSwitchesToChatView(t *testing.T) {
 	m := newAppModel(testDeps())
-	m.view = ViewDashboard
+	m.view = ViewGraph
 
 	m = enterKey(t, m, "/command")
 
@@ -116,13 +123,13 @@ func TestCommand_UnknownCommandSwitchesToChatView(t *testing.T) {
 		t.Fatalf("未知命令反馈后视图 = %d, want ViewChat（反馈需可见）", m.view)
 	}
 	if got := lastMessageText(&m); !strings.Contains(got, "未知命令") {
-		t.Fatalf("消息流应包含未知命令提示: %q", got)
+		t.Fatalf("排放队列应包含未知命令提示: %q", got)
 	}
 }
 
 func TestCommand_ModeFeedbackSwitchesToChatView(t *testing.T) {
 	m := newAppModel(testDeps())
-	m.view = ViewDashboard
+	m.view = ViewGraph
 
 	m = enterKey(t, m, "/mode")
 
@@ -130,7 +137,7 @@ func TestCommand_ModeFeedbackSwitchesToChatView(t *testing.T) {
 		t.Fatalf("/mode 反馈后视图 = %d, want ViewChat", m.view)
 	}
 	if got := lastMessageText(&m); !strings.Contains(got, "模式") {
-		t.Fatalf("消息流应包含模式切换反馈: %q", got)
+		t.Fatalf("排放队列应包含模式切换反馈: %q", got)
 	}
 }
 
@@ -138,10 +145,10 @@ func TestCommand_ViewCommandKeepsOwnView(t *testing.T) {
 	m := newAppModel(testDeps())
 	m.view = ViewChat
 
-	m = enterKey(t, m, "/dashboard")
+	m = enterKey(t, m, "/graph")
 
-	if m.view != ViewDashboard {
-		t.Fatalf("/dashboard 后视图 = %d, want ViewDashboard（视图命令不受回退影响）", m.view)
+	if m.view != ViewGraph {
+		t.Fatalf("/graph 后视图 = %d, want ViewGraph（视图命令不受回退影响）", m.view)
 	}
 }
 

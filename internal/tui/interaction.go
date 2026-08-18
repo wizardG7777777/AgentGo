@@ -57,7 +57,7 @@ func renderInteractionPanel(t Theme, w int, req ui.InteractionItem, selected, pr
 	}
 	if len(promptLines) > interactionPromptPageLines {
 		lines = append(lines, t.InteractionQueue.Render(fmt.Sprintf(
-			"问题 %d-%d/%d  PgUp/PgDn 翻页", promptScroll+1, promptEnd, len(promptLines))))
+			"问题 %d-%d/%d  "+pageKeysDisplay+" 翻页", promptScroll+1, promptEnd, len(promptLines))))
 	}
 
 	for i, option := range req.Options {
