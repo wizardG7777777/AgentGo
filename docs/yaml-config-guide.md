@@ -71,12 +71,12 @@ tool_profiles:
 ```
 
 - key 是 profile 名，value 是工具名列表
-- 工具名必须在 [internal/tools](../internal/tools/) 注册（如 `read_file` / `write_file` / `run_shell` / `publish_task` / `send_message` / `request_user_input` / `request_replan` / `submit_acceptance_result`；完整列表见 [tool-profiles.md](tool-profiles.md)）
+- 工具名必须在 [internal/tools](../internal/tools/) 注册（如 `read_file` / `write_file` / `run_shell` / `publish_task` / `send_message` / `request_user_input` / `request_replan` / `submit_task_result`；完整列表见 [tool-profiles.md](tool-profiles.md)）
 - 拼错或写不存在的工具名 → 启动期报错
 
 ### 1.3 `agents:` — 预热 Agent kind 列表（可选）
 
-省略 `agents:` 时进入 Scheduler-only 模式：启动快照中没有子 Agent，也不会伪造一个默认 worker。任务需要专门能力时，Scheduler 从 AgentTemplate provision 实例后再发布 Task。
+省略 `agents:` 时进入 Scheduler-only 模式：启动快照中没有子 Agent，也不会伪造一个默认 worker。Graph 节点需要专门能力时，Scheduler 先决定 `graph_id`，带同一个 `graph_id` 从 AgentTemplate provision 实例，下一轮读取真实 route 后再提交 Graph。
 
 配置 `agents:` 则保持原有预热语义。每个 kind 的字段：
 
@@ -170,11 +170,11 @@ limits:
 - `system_prompt` 与 `system_prompt_file` 恰好一个；文件路径相对配置的模板目录解析，并且不能以绝对路径、反斜杠、`..` 或符号链接越界；digest 记录解析后的 prompt 内容，不记录路径文字。
 - `model` 为空时在加载期解析为 `llm.default_model`（或 Scheduler model）并进入 digest；存在 ready TeamSpec 时改变全局默认模型会被视为模板内容漂移。
 - 外部模板不能声明 namespace；完整 ref 由来源组成，例如 `project/reviewer@1`。
-- `limits` 可省略；默认为 `10 / 3 / 4000 / 16000 / 4`（按示例字段顺序），显式值必须大于零。`limits.max_replicas` 控制该模板 Team 的副本上限。
+- `limits` 可省略；`task_max_retries / enforce_compact_token_threshold / max_replicas` 默认为 `3 / 4000 / 4`，显式值必须大于零。`agent_max_loops` 与 `context_limit` 已于 V6 移除，显式设置会报迁移诊断。
 - 工具名拼错或包含 Scheduler 独占 DAG 工具会在启动期失败；YAML 未知字段和同一文件中的第二个 YAML document 也会被拒绝。
 - 同 namespace 的 `name@version` 不能重复，内置 ref 不能覆盖。Catalog 为每个模板计算 digest，持久化 TeamSpec 记录 ref+digest 用于恢复校验。
 
-Scheduler 不能先发布一个没有消费者的 route 再尝试创建 Agent。`provision_agent_team` 只有在 Team 与 route ready 后才成功返回，Scheduler 随后再用该真实 route 调 `publish_task`；容量、加载或实例化失败发生在 Task 发布前，不留下孤儿 pending Task。完整生命周期见 [AgentTemplate.md](activate/AgentTemplate.md)。
+Scheduler 不能先提交引用虚构 route 的 Graph 再尝试创建 Agent。Graph-first 时先决定合法 `graph_id`，以该 ID 调 `provision_agent_team`；工具只有在 Team 已绑定 `graph:<id>` 且 route ready 后才成功返回。Scheduler 下一轮读取真实 route 并写入 Graph 节点，`submit_graph` / `patch_graph` 会对 route scope 与 capability fail-closed 校验。origin Scheduler task 终态不回收 Graph Team，`graph_ended` 才回收；省略 `graph_id` 仅是 legacy task-owned 路径。完整生命周期见 [AgentTemplate.md](activate/AgentTemplate.md)。
 
 ### 1.6 `infra:` — 运行时基础设施（可选，全有默认）
 
@@ -199,7 +199,7 @@ infra:
 - `default_timeout_sec` 只约束任务被领取后的单次执行租约，以 `StartedAt` 为起点；它不是排队超时。
 - `default_concurrency` 是"一个任务允许几个 Agent 同时认领执行"的兜底值，**只**对未显式指定 `max_concurrency` 的非 plan 发布路径生效：scheduler 经 `publish_task` 发布的任务与验收 runner 任务默认恒为 1（单交付物任务的正确语义）。把它调成 >1 不会让系统吞吐变大，只会让多个 Agent 重复执行同一任务并互相覆盖产出。
 - `pending_alert_grace_sec` 以当前 `PendingSince` 为起点。有合法 route 时超期只发一次告警，任务继续排队。
-- `unroutable_grace_sec` 从 Watchdog 首次确认“任务已满足依赖且可认领，但没有兼容 route”时独立计时；超期后任务进入 `blocked`。依赖等待与 Plan 暂停期间不累计这段时间。
+- `unroutable_grace_sec` 从 Watchdog 首次确认“任务已满足依赖且可认领，但没有兼容 route”时独立计时；超期后任务进入 `blocked`。依赖等待期间不累计这段时间。
 
 ### 1.7 `ui:` — 前端与 Web Dashboard（可选）
 
@@ -209,30 +209,31 @@ ui:
   web:
     listen: "127.0.0.1:8399" # 启用 web 时必须是合法 host:port
     token: ""                 # 非 loopback 监听时必填；请使用独立随机 token
-    auto_open: true            # 省略时也为 true
+    auto_open: false           # 省略时也为 false；需要时显式设为 true
 ```
 
 - `tui` 与 `web` 可并存；只启用 `web` 时为 headless 模式，进程等待关闭信号而不进入 TUI。
 - Web Dashboard 通过 HTTP + SSE 提供观测和受控操作（输入、取消、回答 pending Interaction、模式/Session 切换），不是只读页面。回答使用 `expected_version` 与稳定 `option_id`；服务端动作路由不暴露给浏览器。pending 列表覆盖当前进程内全部仍在等待的请求，`SessionID` 只作创建审计归属，切换 `/session` 不会过滤它们。
 - `web.listen` 为 `127.0.0.1`、`localhost` 或 `::1` 时 token 可为空；绑定 `0.0.0.0`、`::`、LAN 或公网地址时，`token` 为空会被启动校验拒绝。
-- `auto_open` 是三态字段：未设置等于 `true`，显式 `false` 关闭自动打开浏览器。`/healthz` 可用于就绪检查。
+- `auto_open` 是三态字段：未设置等于 `false`，显式 `true` 才自动打开浏览器。`/healthz` 可用于就绪检查。
 - token 仅保护 Dashboard 管理面，不能替代也不能复用 `llm.api_key`。Dashboard 不写入 LLM 配置或密钥。
 
 ### 1.8 顶层杂项字段
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
-| `project_root` | `"."` | 项目根路径；reactor 写文件 / 路径校验的边界 |
+| `project_root` | `"."` | 项目根路径；启动时统一解析为存在的 canonical 绝对目录，空值/不可访问目录拒绝启动；文件工具会解析 symlink 后校验真实目标仍在根内 |
 | `max_subtask_depth` | `1` | 任务递归派发深度上限 |
 | `shell_timeout_sec` | `30` | run_shell 默认超时 |
 | `shell_blacklist` / `shell_greylist` | `[]` | 追加到默认 shell 拦截规则 |
+| `allow_project_shell_rule_removals` | `false` | 是否允许 `.agentgo/project_rules.yaml` 删除系统默认或主配置追加的黑/灰名单；这是受信任主配置的显式降级开关，默认项目规则只能追加 |
 | `hashline_enabled` | `true` | §7 hashline 行哈希增强 |
 | `transfer_note_max_tokens` | `3000` | TransferNote 单条最大 token |
 | `progress_notify_enabled` | `true` | 进度通知开关 |
 | `agent_idle_threshold` | `0` | 空闲退出阈值；0=永不空闲退出 |
 | `session_retention_days` | `30` | 已关闭 session 归档阈值 |
 | `session_archive_max` | `50` | 归档上限 |
-| `session_resume_max_idle_sec` | `3600` | 自动恢复 active-session 时允许的快照最大闲置秒数；超限的非终态任务转为 `blocked`，显式 `--resume` 可确认恢复；0=关闭保护；最大 `9223372036` |
+| `session_resume_max_idle_sec` | `3600` | **已废弃**（2026-08 起启动永远是全新 Session，不再自动恢复；进入历史会话时非终态任务一律阻断为 `blocked`）。保留解析仅为配置兼容，设置无效 |
 | `session_snapshot_interval_sec` | `30` | 运行期完整快照间隔，用于限制崩溃后的副作用重放窗口；0=仅在 Session 切换/关闭时保存；最大 `9223372036` |
 | `search_api_provider` / `search_api_url` / `search_api_key` | — | 网络搜索 provider |
 | `startup_probe` | `""` | `"tcp"` / `"off"`；其它值校验失败 |
@@ -290,13 +291,12 @@ reactors:
 task_published / task_claimed / task_submitted / task_completed
 text_only_submission / task_retry / task_failed / task_blocked / task_cancelled
 llm_call_start / llm_call_end / tool_call / tool_result
-history_compaction / history_truncated
+history_compaction
 file_written / file_write_queued / progress_notify
 error / agent_state_changed
 shell_executed
 reactor_spawn_depth_exceeded
-replan_requested / replan_coalesced / replan_decided / plan_revision_changed
-acceptance_completed / plan_paused / plan_terminal
+workspace_materialized / workspace_merged / workspace_merge_conflict / workspace_cleaned
 ```
 
 写不在表里的 EventKind 启动期直接报错。注意 `shell_timeout_pending` /

@@ -4,5 +4,9 @@
 enabled = false
 
 # The Vercel MCP server is registered globally, but is not relevant to AgentGo.
+# `url` must be repeated here (matching the global definition) so Codex can still
+# determine the transport type for this override table — a bare `enabled = false`
+# fails config validation with "invalid transport".
 [mcp_servers.vercel]
+url = "https://mcp.vercel.com"
 enabled = false

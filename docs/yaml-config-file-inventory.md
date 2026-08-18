@@ -307,7 +307,7 @@ general.yaml (最详尽中文模板, ~171行)
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `project_root` | string | `"."` | 项目根目录（顶层字段，不在 infra 内） |
+| `project_root` | string | `"."` | 项目根目录（顶层字段，不在 infra 内）；启动时 canonicalize，空值/不可访问目录拒绝启动 |
 | `infra.watchdog.interval_sec` | int | 30 | watchdog 健康检查间隔 |
 | `infra.mail_notifier.enabled` | bool | true | 是否启用 agent 间邮件通知 |
 | `infra.mail_notifier.interval_sec` | int | 60 | 邮件轮询间隔 |
@@ -333,6 +333,7 @@ general.yaml (最详尽中文模板, ~171行)
 | `shell_timeout_sec` | int | 60 | shell 命令超时 |
 | `shell_blacklist` | string[] | `[]` | 禁止执行的命令 |
 | `shell_greylist` | string[] | `[]` | 需确认才能执行的命令 |
+| `allow_project_shell_rule_removals` | bool | `false` | 是否显式允许项目规则删除系统默认或主配置追加的黑/灰名单；默认只能追加 |
 | `search_api_provider` | string | `"serper"` | 搜索 API 提供商 |
 | `search_api_url` | string | — | 搜索 API 端点 |
 | `search_api_key` | string | — | 搜索 API 密钥（支持 `${ENV_VAR}`） |

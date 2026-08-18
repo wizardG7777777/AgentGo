@@ -31,9 +31,9 @@ tool_profiles:
     - list_dir
     - grep_search
     - glob_search
-    - run_shell
+    - web_search
+    - web_fetch
     - submit_task_result
-    - request_replan
 
 agents:
   - kind: worker
@@ -56,7 +56,7 @@ agents:
     task_max_retries: 2
     enforce_compact_token_threshold: 3000
     context_limit: 12000
-    description: 正式验收代理，运行检查并提交结构化证据。
+    description: 正式验收代理，读取交付物与上游证据并提交结构化结论。
 ```
 
 如果声明了 `agents:`，每个 `agents[*]` 必须在 `profile` 和 `tools` 中恰选一个：
@@ -89,11 +89,11 @@ agents:
 | `run_shell` | ShellGroup | 执行命令 |
 | `web_search` | WebGroup | 网络搜索 |
 | `web_fetch` | WebGroup | 获取网页内容 |
-| `publish_task` | MetaGroup | 发布兼容子任务；计划内普通 Agent 不可用它改图 |
+| `publish_task` | MetaGroup | 发布 legacy/恢复兼容子任务；Graph 节点普通 Agent 不可用它改图 |
 | `send_message` | MetaGroup | 发送 Agent 消息 |
 | `request_user_input` | MetaGroup | 创建 2–8 选项的普通 `agent_question`，等待后只返回 `request_id`、稳定 `option_id` 与 `text` |
 | `request_replan` | PlanControlGroup | 提交事实，请 Scheduler 重新评估编排（非图任务发布通用 replan 唤醒任务） |
-| `submit_task_result` | PlanControlGroup | 普通执行节点的结构化提交（Graph acceptance runner 经 `verdict`/`event` 提交验收结论） |
+| `submit_task_result` | PlanControlGroup | 普通执行节点的结构化提交（Graph acceptance runner 以 `verdict=pass|fixable|failed` 提交结论；completed 结果省略 `event`） |
 
 以下 Plan 工具已随 V6（C6a/C6b）全部删除，不要再写入 profile：
 
@@ -103,8 +103,8 @@ agents:
 
 - `cancel_task`
 - `list_agent_templates`：查询内置、user 和 project Catalog；不代表这些 Agent 已经运行
-- `provision_agent_team`：从模板创建一个或多个真实运行实例并注册 ready route；Scheduler 随后再用 `publish_task` 发布首轮 Task
-- `report_done`：只兼容空/只读 Plan；不能代替正式验收
+- `provision_agent_team`：从模板创建一个或多个真实运行实例并注册 ready route；Graph-first 时先决定并显式传 `graph_id`，下一轮把返回的真实 route 写入该 Graph 节点
+- `report_done`：legacy `publish_task` batch 的显式收尾；Graph 由节点转移到 `end` 收尾
 - `report_progress`
 - `probe_directory`
 
@@ -112,18 +112,18 @@ agents:
 
 Interaction Service 本身不是可由 profile 授予的特权 effect 通道，但 MetaGroup 的 `request_user_input` 是可授权 Agent tool。它只接受 `prompt` 与 `options_json`：后者必须是 2–8 项 JSON 数组，每项仅允许 `{id,label,description?,requires_text?}`；未知字段（尤其 ActionRef/Resolution/Metadata）拒绝。该适配器固定创建 `Kind=choice` / `Purpose=agent_question`，只把 `request_id`、稳定 `option_id` 与 `text` 返回 Agent。Scheduler 使用无 allowlist registry，Interaction Service 可用时自动获得它；普通 runner 必须在 profile 或内联 `tools` 中列出。
 
-Plan 与 Shell 的边界不变：Scheduler 用 `submit_plan_for_review` 持久化计划评审事实；`plan_review` / `plan_pause` 的选项和 Shell 的 `shell_command` authorization 仍由受信任控制面创建并执行 effect。前端只能提交稳定 Option ID，不得接触服务端 `ActionRef`，Agent 也不得通过普通聊天、`request_user_input` 或任何其他 tool 推断、代替或制造这些特权选择。
+Graph approval 与 Shell authorization 是两条独立边界：Graph 执行前审阅用 `approval` 节点及 `graph_approval` Interaction；灰名单命令使用精确绑定的 `shell_command` Interaction。前端只能提交稳定 Option ID，不得接触服务端 `ActionRef`，Agent 也不得通过普通聊天、`request_user_input` 或任何其他 tool 推断、代替或制造这些特权选择。
 
-## 3. 动态 DAG 权限边界
+## 3. Graph 权限边界
 
-一个执行节点对应一个 Task，但 Agent profile 只决定“这个 Task 可以调用哪些工具”，不决定 DAG 权限或 Scheduler 唤醒权限。
+一个 Graph activation 对应一个 Task，但 Agent profile 只决定“这个 Task 可以调用哪些工具”，不决定 Graph 修改权限或 Scheduler 唤醒权限。
 
-- Scheduler 是计划内拓扑的唯一决策者。
-- 普通计划节点需要增加、替换或拆分任务时调用 `request_replan`。
-- Task 关键终态会自动唤醒 Scheduler，与 Agent kind、`event_type` 和 profile 无关。
-- 普通 Agent 即使 profile 中错误地包含 `publish_task`，计划内调用仍会被控制面拒绝。
-- 未纳入 Plan 的兼容工作流仍可显式授予 `publish_task`。
-- 用户 Reactor 对计划内来源的 `publish_task` / `spawn_agent` / isolated `invoke_llm` 意图会转换为 `request_replan`。
+- Scheduler 通过 `submit_graph` / `patch_graph` 决定拓扑；普通节点不能直接修改 GraphDocument。
+- 普通 Graph 节点需要增加、替换或拆分任务时调用 `request_replan`，由 graph change 唤醒 Scheduler 裁决。
+- Task 终态由 `graph-terminal-feed` 回填 Runtime 并推进转移，与 Agent kind、`event_type` 和 profile 无关。
+- 普通 Agent 即使 profile 中错误地包含 `publish_task`，也不能把新 Task 伪装成当前 Graph 的节点 activation。
+- 未纳入 Graph 的 legacy/恢复兼容工作流仍可显式授予 `publish_task`。
+- 用户 Reactor 只能发布任务或消息让主循环自然推进，不得直接写 Graph 状态或驱动节点状态迁移。
 
 默认 Worker profile 因此不需要 `publish_task`。详细不变量见 [`archived/DynamicDAG.md`](archived/DynamicDAG.md)（V6 前历史文档）。
 
@@ -135,22 +135,24 @@ AgentTemplate 和 `tool_profiles` 不是同一层复用机制：
 - AgentTemplate 是完整且可版本化的实例化定义，包含能力标签、真实 tools、模型、提示词、运行边界与容量；
 - 外部模板必须直接列 `tools`，v1 不允许引用主配置 profile，避免模板从 user/project 目录移动后权限含义发生隐式变化；
 - 模板的 `capabilities` 只是 Scheduler 选型提示，不会授予任何权限；runtime allowlist 仍以 `tools` 为准；
-- 模板不能包含 Scheduler 独占的拓扑控制工具。普通模板需要增删节点时只能 `request_replan`；verifier 模板适合持有 `submit_task_result`（经 `verdict`/`event` 提交验收结论）。
+- 模板不能包含 Scheduler 独占的拓扑控制工具。普通模板需要增删节点时只能 `request_replan`；verifier 模板适合持有 `submit_task_result`（经 `verdict=pass|fixable|failed` 提交验收结论，completed 结果省略 `event`）。
 
 内置模板提供三组保守能力：`builtin/generalist@1` 用于实现，`builtin/explorer@1` 用于只读调查，`builtin/verifier@1` 用于正式验收。项目可以在 `agent-templates/` 中添加更专业的 `project/*` 模板，但不能覆盖内置 ref。
 
-Scheduler-only 启动时，Catalog 中存在模板不代表已经存在 route。Scheduler 必须先 provision 实例，取得真实 route 后再发布 Task；不能把模板名、capability 或预期 kind 当作 `event_type` 猜测。详见 [`activate/AgentTemplate.md`](activate/AgentTemplate.md)。
+Scheduler-only 启动时，Catalog 中存在模板不代表已经存在 route。Graph-first 时 Scheduler 必须先决定合法 `graph_id`，带同一 ID provision 实例，下一轮取得真实 route 后再提交引用它的 Graph；不能把模板名、capability 或预期 kind 当作 `event_type` 猜测。Team 绑定 `graph:<id>` 并存活到 `graph_ended`，origin Scheduler task 终态不会撤销该 route；省略 `graph_id` 仅是 legacy task-owned 路径。`submit_graph` / `patch_graph` 会对 route owner scope 与 capability fail-closed 校验。详见 [`activate/AgentTemplate.md`](activate/AgentTemplate.md)。
 
 ## 4. 验收 Profile（Graph acceptance 节点 runner）
 
-验收 Agent 至少需要：
+验收 Agent 的工具面必须落在以下闭集：
 
-1. `submit_task_result`（用 `verdict` 字段提交 pass/fail/fixable 等结论，写 `Results["verdict"]` 供 `$.verdict` 边条件；图按 event 路由时同名结论同时填 `event`）；
-2. 验收判据实际需要的检查工具，例如 `run_shell`、`read_file` 或 `web_fetch`；
-3. 可选的 `request_replan`，用于把失败事实交回 Scheduler。
+1. `submit_task_result`（用 `verdict` 字段提交 `pass` / `fixable` / `failed` 结论，写 `Results["verdict"]` 供 `$.verdict` 精确边条件；completed 结果必须省略 `event`，无法判定时用 `status=blocked`）；
+2. 验收判据实际需要的 read/list/grep/glob/web 工具。除此之外的工具（包括写入、Shell、消息、发任务、用户交互、`request_replan` 和当前未实现的 MCP）一律拒绝；CLI/Shell 检查由实现节点下游、无文件写工具的普通 checker agent 执行后经 Graph 数据流传入。
 
-自定义的是验收 runner 与判据；验收结论驱动图边路由由 Graph Runtime 统一完成（C6b 起不再有服务端验收核验器与熔断）。
-`run_shell` 不是 OS 级只读沙箱；验收 Agent 的“不修改被验收对象”还需要 prompt 纪律与命令策略，不应仅根据没有 `write_file`/`edit_file` 就宣称强隔离。灰名单命令会创建与原始 command、matched pattern、working directory、AgentID 和 TaskID 精确绑定的 `shell_command` authorization Interaction；只有 `allow_once` 或 `allow_session` 的受信任 effect 完成后才会执行原命令，`deny` / `guidance` 不执行。
+自定义的是验收 runner 与判据；验收结论驱动图边路由由 Graph Runtime 统一完成。验收 agent 可经 `submit_task_result.cited_evidence` 复制任务描述中已展示且实际消费的稳定 EvidenceRef；不得按展示顺序构造或把 CallID/ResultRef 当作 EvidenceRef。服务端做谱系核验，越谱系引用（disputed）会使 verdict 不被采信、节点 failed 并唤醒 Graph change；不引用不影响采信。
+
+`submit_graph` / `patch_graph` 会对 acceptance 的**实际工具面**做正向闭集校验：route 必须含 `submit_task_result`，且 route 保证工具或 per-node 明确收窄后的工具集合只能包含 `read_file`、`list_dir`、`grep_search`、`glob_search`、`web_search`、`web_fetch`、`submit_task_result`；acceptance 也不得路由给 Scheduler。该约束是工具面隔离，不是 OS sandbox；只读工具仍受各自网络与文件边界约束。
+
+Evidence 只证明调用及其结果，不证明同一节点内“最后一次写入之后”的时序。判据要求可证明的新鲜测试/构建时，必须使用 `implement → checker → acceptance`，由 Graph 因果边证明 checker 晚于实现，不能让 verifier 从 Evidence 展示顺序、CallID 或时间戳猜测。
 
 ## 5. 能力感知路由
 
@@ -173,7 +175,7 @@ Board Snapshot 的 `resources.agent_capabilities` 只列出**已经运行**的 A
 - `system_prompt_file` 必须存在且可读。
 - `task_max_retries`、`enforce_compact_token_threshold`、`context_limit` 都必须为正数；`agent_max_loops` 已于 V6 移除（显式设置报迁移诊断）。
 - Scheduler 的工具集和系统提示词由 `internal/scheduler` 固定；`scheduler:` 可覆盖模型、`enforce_compact_token_threshold` 与 `context_limit`。
-- 不要定义空 profile 作为“无工具”权限；当前 allowlist 的空集合保留为兼容语义。要做最小权限 Agent，请至少列出它确实需要的工具。
+- 空 profile 会在配置校验阶段被拒绝；ToolRegistry 的非 nil 空 allowlist 语义是“拒绝全部”，不会再 fail-open。要做最小权限 Agent，请至少列出它确实需要的工具。
 - 外部 AgentTemplate 一文件一个模板，直接列 tools；`system_prompt` / `system_prompt_file` 恰选一个，ref、版本、digest 和容量在加载期校验。
 
 典型错误：
@@ -198,7 +200,7 @@ agents:
 - AgentTemplate Catalog 与 Team 生命周期：`internal/agenttemplate/`、`internal/team/`
 - allowlist 注册：`internal/agent/tool_registry.go`
 - 工具名权威清单：`internal/tools/known_tools.go`
-- 动态 Plan 工具：`internal/tools/plan_control.go`
+- 控制面工具（`submit_task_result` / `request_replan`）：`internal/tools/plan_control.go`
 - 用户决定协议：[`design/interaction.md`](design/interaction.md)；其中只有受限的 `request_user_input` 提问适配器属于 tool allowlist
 - 配置测试：`internal/config/config_v4_test.go`
 

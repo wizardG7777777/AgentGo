@@ -155,7 +155,7 @@ infra:
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `project_root` | string | `.` | 项目根目录 |
+| `project_root` | string | `.` | 项目根目录；启动时 canonicalize，空值/不可访问目录拒绝启动 |
 | `max_subtask_depth` | int | 3 | publish_task 嵌套深度上限 |
 | `shell_timeout_sec` | int | 300 | shell 命令超时 |
 | `transfer_note_max_tokens` | int | 500 | transfer note 截断阈值 |
@@ -165,10 +165,11 @@ infra:
 | `search_api_provider` | string | `""` | 搜索 API 提供商 |
 | `shell_blacklist` | []string | `[]` | shell 命令黑名单 |
 | `shell_greylist` | []string | `[]` | shell 命令灰名单 |
+| `allow_project_shell_rule_removals` | bool | `false` | 显式允许项目规则删除系统默认或主配置追加的黑/灰名单（安全降级开关） |
 | `reactors_file` | string | `""` | 用户 Reactor 配置文件路径 |
 | `session_retention_days` | int | 30 | 已关闭 session 归档阈值 |
 | `session_archive_max` | int | 50 | 最大归档数 |
-| `session_resume_max_idle_sec` | int | 3600 | 自动恢复快照闲置上限；超限非终态任务转为 blocked，0=关闭，最大 9223372036 |
+| `session_resume_max_idle_sec` | int | 3600 | **已废弃**（2026-08 起启动永远新会话、不再自动恢复；进入历史会话非终态任务一律 blocked）。保留解析仅为兼容，设置无效 |
 | `session_snapshot_interval_sec` | int | 30 | 运行期完整快照间隔；0=关闭周期保存，最大 9223372036 |
 | `startup_probe` | object | — | 启动探针配置 |
 

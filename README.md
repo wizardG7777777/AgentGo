@@ -1,6 +1,6 @@
 # AgentGo
 
-AgentGo 是一个 Go 1.25 编写的多 Agent 编排系统。Scheduler 接收用户输入，按需组建或使用预热的 Agent Team，执行 Task-backed 动态 DAG，并以正式验收决定 Plan 是否完成。
+AgentGo 是一个 Go 1.25 编写的多 Agent 编排系统。Scheduler 接收用户输入，按需组建或使用预热的 Agent Team，以持久化 Graph 编排执行任务，验收结论由 Graph acceptance 节点给出。
 
 它提供两种可同时启用的前端：Bubble Tea TUI 与 Web Dashboard。前端通过 UI Hub 订阅同一套运行时状态；Web Dashboard 还提供提交输入、取消任务、回答结构化 Interaction、切换模式和 Session 的受控操作接口。
 
@@ -13,8 +13,7 @@ README 是运行手册；架构和历史设计不要混为一谈。
 | 配置字段与校验规则 | [config.example.yaml](config.example.yaml)、[YAML 配置指南](docs/yaml-config-guide.md) |
 | 系统组件和启动/关停顺序 | [Archtechture.md](Archtechture.md) |
 | Trace 命令、字段和排错 | [TraceGuide.md](TraceGuide.md) |
-| 动态 Plan 的不变量 | [DynamicDAG.md](docs/activate/DynamicDAG.md) |
-| 用户选择、Plan/Shell 与前端交互契约 | [Interaction 设计](docs/design/interaction.md) |
+| 用户选择、Graph approval/Shell 与前端交互契约 | [Interaction 设计](docs/design/interaction.md) |
 | 按需 Agent Team | [AgentTemplate.md](docs/activate/AgentTemplate.md) |
 | 已知限制与历史归档 | [docs/activate/README.md](docs/activate/README.md)、[KNOWN_ISSUES.md](docs/activate/KNOWN_ISSUES.md) |
 
@@ -82,7 +81,7 @@ ui:
   frontends: [web]
   web:
     listen: "127.0.0.1:8399"
-    auto_open: true
+    auto_open: false
 ```
 
 然后运行：
@@ -107,11 +106,11 @@ WebUI 按信息层级分为四个顶层视图：
 
 ### Web Dashboard 的安全边界
 
-Web Dashboard 不是只读页面：它可提交输入、取消 Task、发送引导、回答 Plan/Shell/Agent question 等 pending Interaction、切换模式和 Session。因此：
+Web Dashboard 不是只读页面：它可提交输入、取消 Task、发送引导、回答 Graph approval/Shell/Agent question 等 pending Interaction、切换模式和 Session。因此：
 
 - 仅本机使用时保留 `127.0.0.1:8399`，可不设 `ui.web.token`。
 - 监听 `0.0.0.0`、`::` 或公网/局域网地址时，`ui.web.token` 是启动校验的必填项；使用独立的随机 token，绝不要复用 LLM API key。
-- `ui.web.auto_open` 未设置时默认为 `true`；服务启动后会打开系统默认浏览器。设为 `false` 可关闭。
+- `ui.web.auto_open` 未设置时默认为 `false`；服务启动后不会自动打开浏览器。需要自动打开时显式设为 `true`。
 
 带 token 的客户端可在 Dashboard 提示框输入，或使用 `?token=...` 打开地址。健康检查 `/healthz` 不要求 token，其他 API 均受 token 保护。
 
@@ -123,8 +122,9 @@ agentgo -skip-startup-probe         # 跳过启动期 LLM TCP 探测
 agentgo -resume <session-prefix>    # 恢复之前保存的 Session
 agentgo trace list                  # 列出最近 Task
 agentgo trace show <task-id>        # 查看一个 Task 的事件时间线
-agentgo trace plan <plan-id>        # 聚合动态 DAG Plan 的跨 Task 时间线
-agentgo trace stats [task|agent|plan]  # 聚合 session 内 LLM 调用与 token 消耗（含浪费口径与异常提示）
+agentgo trace graph [graph-id]      # 列出已知 Graph，或查看一个 Graph 的生命周期时间线
+agentgo trace node <graph-id>/<node-id>  # 查看单个节点的事件（按 activation 分组）
+agentgo trace stats [task|agent]    # 聚合 session 内 LLM 调用与 token 消耗（含浪费口径与异常提示）
 ```
 
 TUI 斜杠命令：
@@ -133,16 +133,17 @@ TUI 斜杠命令：
 | --- | --- |
 | `/help`、`/status` | 查看帮助和运行状态 |
 | `/cancel <id-prefix>` | 取消 Task |
-| `/mode` | 切换三轴模式（gate 轴仅 `immediate`） |
+| `/mode` | 切换两轴模式（exec 权限轴 / topo 拓扑轴） |
 | `/steer <agent-id> <msg>` | 给 Agent 发送纠偏消息 |
-| `/new`、`/session [num]` | 新建、列出或切换 Session |
-| `/dashboard`、`/chat`、`/result`、`/agent <id-prefix>` | 切换总览、会话、最终结果或单 Agent 工作台 |
-| `/activity`、`/logs`、`/trace` | 查看跨 Agent 实时动向、原始日志或结构化 Trace/工具调用 |
+| `/new [force]`、`/session [id]` | 新建（force = 终止当前 Session 全部运行内容）、切换 Session；`/session` 无参打开选择面板 |
+| `/doctor agents` | 审计代理身份与实际权限的一致性 |
+| `/graph`、`/chat` | 切换执行图（全屏）、会话（inline 主态）视图 |
+| `/result`、`/node <id>` | 查看最终结果或当前图的节点详情 |
 | `/quit` | 保存快照并退出 |
 
-TUI 的 `/chat` 会在空间允许时附带紧凑的 Live Activity 区；在 `/dashboard` 选中 Agent 后进入的详情页则是该 Agent 的独立工作台。长文本按终端单元格宽度换行，不再用单行截断代替正文。`/activity`、`/logs`、`/trace` 中按 Esc 返回总览，不会误触发取消请求。
+TUI 是两层渲染模型：默认 `/chat` 为 inline 主态——定稿的轮次、系统反馈与最终结果全文经 `tea.Println` 排放进终端 scrollback，鼠标滚轮翻阅与文本选择复制归还终端，进行中内容只剩输入框上方的活动区（流式轮次 + Live Activity）；`/graph`、`/result`、节点详情为全屏层，进入时切 alternate screen 并捕获鼠标滚轮（滚动全屏内容），返回 `/chat` 时退出。全屏层中按 Esc 返回上一层，不会误触发取消请求。在 `/graph` 选中节点后进入的详情页是该节点的独立工作台（activation 历史、轮次、输出、Recent Activity）。长文本按终端单元格宽度换行，不再用单行截断代替正文。原始日志/Trace 不进 TUI，诊断走 `agentgo trace` CLI。
 
-Graph approval/Shell 控制面或 Agent 的 `request_user_input` 需要用户决定时，TUI 显示通用 Interaction 面板：Tab 切换焦点，`↑/↓` 选择，`PgUp/PgDn` 翻动较长的问题正文，Enter 提交；要求补充文本的选项会进入普通输入框。动作不绑定裸英文字母或裸数字，正常输入不会被截获。TUI/Web 展示当前进程内全部 pending 请求；`SessionID` 只作创建审计归属，切换 `/session` 不会隐藏仍在运行任务的问题。
+Graph approval/Shell 控制面或 Agent 的 `request_user_input` 需要用户决定时，TUI 显示通用 Interaction 面板：Tab 切换焦点，`↑/↓` 选择，`PgUp/PgDn` 翻动较长的问题正文，Enter 提交；要求补充文本的选项会进入普通输入框。动作不绑定裸英文字母或裸数字，正常输入不会被截获。TUI/Web 展示当前进程内全部 pending 请求；切换 `/session` 会中断被冻结 Session 的 pending 请求（切回时为 interrupted 终态，不再显示）。
 
 灰名单 Shell 命令使用 `shell_command` authorization Interaction，稳定选项为 `allow_once` / `deny` / `guidance` / `allow_session`。其中 `allow_session` 名称为兼容协议 ID，实际把服务端捕获的原始匹配规则加入**当前进程、本次运行**的 whitelist；切换 AgentGo `/session` 不会清空，退出后不持久化。
 
@@ -165,7 +166,7 @@ Scheduler Agent --> submit_graph / publish_task --> Task-backed DAG / Graph Runt
               Gate -> Tool execution -> Trace / Session persistence
 ```
 
-- `internal/graph` 维护 JSON 图契约、activation 模型与 durable 恢复；验收经 acceptance 节点 + `submit_task_result` 的 `verdict`/`event` 契约驱动边路由。
+- `internal/graph` 维护 JSON 图契约、activation 模型与 durable 恢复；验收经 acceptance 节点 + `submit_task_result.verdict`（`pass` / `fixable` / `failed`）驱动精确路径路由，completed 结果省略 `event`。
 - `internal/runner` 承载预热或按需创建的 Agent；`internal/agenttemplate` 与 `internal/team` 负责模板及运行时 Team。
 - `internal/gate` 在工具/邮箱动作前做决策；`internal/reactor` 订阅状态变化，计划内只可请求 Scheduler 重规划。
 - `internal/session`、`internal/trace` 保存 Session、快照和 JSONL 事件；重试可能产生多个 trace 分片，CLI 会按完整 TaskID 重组。

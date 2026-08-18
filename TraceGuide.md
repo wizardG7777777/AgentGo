@@ -172,7 +172,7 @@ activation_id:               节点的一次进入（<nodeID>@<n>，回边新建
 
 ### 2.6 AcceptanceTraceContext 子结构体（已于 V6 随 Plan 控制面删除）
 
-Plan 时代的验收身份子结构已删除；V6 验收语义由 Graph acceptance 节点承担（`submit_task_result` 的 `verdict`/`event` 契约），相关事实看 `graph_` 分片与任务终态事件。
+Plan 时代的验收身份子结构已删除；V6 验收语义由 Graph acceptance 节点承担（completed 业务结论经 `submit_task_result.verdict` 提交并省略 `event`），相关事实看 `graph_` 分片与任务终态事件。
 
 ### 2.7 内置 EventKind
 

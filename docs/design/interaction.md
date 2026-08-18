@@ -4,7 +4,7 @@
 >
 > 领域模型：[`internal/interaction`](../../internal/interaction)
 >
-> Plan 装配：[`internal/bootstrap/interaction_runtime.go`](../../internal/bootstrap/interaction_runtime.go)
+> 装配：[`internal/bootstrap/interaction_runtime.go`](../../internal/bootstrap/interaction_runtime.go)
 >
 > Shell 装配：[`internal/shell/intercept.go`](../../internal/shell/intercept.go)
 >
@@ -12,15 +12,15 @@
 
 ## 1. 目标与边界
 
-Interaction 是运行时向用户提出结构化问题、并安全消费回答的统一协议。它服务于 Plan 评审、Plan 暂停选择、Shell 精确命令授权、strict 执行模式下的文件写入授权，也允许 Agent 通过受限的 `request_user_input` 适配器提出普通结构化问题。
+Interaction 是运行时向用户提出结构化问题、并安全消费回答的统一协议。它服务于 Graph approval、Shell 精确命令授权、strict 执行模式下的文件写入授权，也允许 Agent 通过受限的 `request_user_input` 适配器提出普通结构化问题。
 
 Interaction 只拥有“用户选择”事实，不直接拥有领域执行事实：
 
-- Plan 图、状态、版本、暂停原因、预算和 `ExecutionOverride` 由 PlanStore 持有；
+- Graph 定义、状态、版本与 activation 由 GraphStore 持有；
 - Task 状态与取消由 TaskStore 持有；
 - Shell 是否执行由被拦截的原始调用及其服务端闭包持有；
 - TUI 和 Web 只负责展示安全投影并提交回答，不能指定要执行的服务端动作；
-- `request_user_input` 只能创建 `Purpose=agent_question` 的普通 choice 并把回答返回等待中的 Agent，不能携带 `ActionRef` 或触发 Plan/Shell effect；
+- `request_user_input` 只能创建 `Purpose=agent_question` 的普通 choice 并把回答返回等待中的 Agent，不能携带 `ActionRef` 或触发 Graph/Shell effect；
 - Scheduler 或其他 LLM 不能从普通用户文本猜测选择，也不能代替用户回答。
 
 因此，Interaction Service 不是 Agent 可编排的特权 effect 通道、旧式提示通道或前端本地状态机；Agent 可见的只是严格收窄的提问适配器。等待回答的 Agent 统一显示为 `waiting_interaction`。
@@ -34,11 +34,11 @@ Interaction 只拥有“用户选择”事实，不直接拥有领域执行事�
 | `ID` | 稳定请求 ID |
 | `Version` | 从 1 开始、每次状态变化递增的 CAS 版本 |
 | `SessionID` | 请求创建时的审计归属；不用于隐藏仍在运行的请求或限定前端可见范围 |
-| `Kind` / `Purpose` | 回答形态与业务用途，例如 `choice/plan_pause` |
+| `Kind` / `Purpose` | 回答形态与业务用途，例如 `choice/agent_question` |
 | `Prompt` | 面向用户的问题正文 |
 | `Options[].ID` | 稳定协议标识，不是易变的显示序号或快捷键 |
 | `Options[].RequiresText` | 选择该项时是否必须补充文本 |
-| `Origin` / `Subject` | 请求来源，以及 Plan、Task、ToolCall、版本和 digest 绑定 |
+| `Origin` / `Subject` | 请求来源，以及 Graph、Task、ToolCall、版本和 digest 绑定 |
 | `Resolution` / `Metadata` | 仅供受信任服务端路由与复核的执行信息 |
 | `State` / `Response` | 当前生命周期与已接受回答 |
 
@@ -193,5 +193,5 @@ Web：
 7. Agent 普通提问只返回 `request_id`、稳定 `option_id` 与 `text`，不能携带或选择服务端 ActionRef；
 8. 等待、退出、取消与过期路径都能到达明确终态或 fail closed；
 9. TUI 动作不得使用裸字母或裸数字键；
-10. Plan 持久化恢复必须从 PlanStore 事实重建，不能从 UI 缓存反推；
+10. Graph 持久化恢复必须从 GraphStore 事实重建，不能从 UI 缓存反推；
 11. 新路径同时覆盖 Service、领域 handler、UI Hub、TUI/Web 和竞态/断连测试。

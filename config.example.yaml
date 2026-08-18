@@ -57,11 +57,9 @@ tool_profiles:
     - list_dir
     - grep_search
     - glob_search
-    - run_shell
     - web_search
     - web_fetch
-    - submit_task_result             # Graph acceptance 节点 runner 经它提交 verdict/event 结论
-    - request_replan                 # 验收失败时请求 Scheduler 决定是否返工
+    - submit_task_result             # acceptance runner 经 verdict=pass|fixable|failed 提交结论
 
 # ============================================================
 # Scheduler 配置（独立块）
@@ -141,8 +139,10 @@ agents:
     task_max_retries: 2
     enforce_compact_token_threshold: 3000
     description: |
-      正式验收代理（Graph acceptance 节点 runner）。执行只读检查、测试与构建，
-      并通过 submit_task_result 的 verdict/event 字段提交验收结论。
+      正式验收代理（Graph acceptance 节点 runner）。读取交付物、消费上游
+      Result/Evidence，并通过 submit_task_result.verdict 提交 pass/fixable/failed；
+      completed 结果省略 event，证据不足时提交 status=blocked；
+      需要 CLI/Shell 的检查由普通 checker agent 执行后经图数据流传入。
 
 # ============================================================
 # 运行时基础设施
@@ -174,15 +174,15 @@ infra:
 # 公网 IP）时必须设置 web.token，否则启动校验拒绝——本系统具备 shell
 # 执行能力，其管理面无鉴权暴露到局域网/公网等同于开放命令执行入口。
 # web.token 为空 = 不启用鉴权（仅限 loopback 监听）。
-# web.auto_open 缺省 true：Dashboard 启动成功后自动用系统默认浏览器打开
-# 控制台地址（token 非空时地址自带 ?token=）；显式 false 关闭。
+# web.auto_open 缺省 false：Dashboard 启动成功后不自动打开系统浏览器；
+# 需要时显式设置 true（token 非空时地址自带 ?token=）。
 # ============================================================
 # ui:
 #   frontends: [tui, web]
 #   web:
 #     listen: "127.0.0.1:8399"
 #     token: ""
-#     auto_open: true
+#     auto_open: false
 
 # ============================================================
 # 启动期可观测性
@@ -198,6 +198,9 @@ max_subtask_depth: 3
 shell_timeout_sec: 60
 shell_blacklist: []
 shell_greylist: []
+# 默认 false：项目内 .agentgo/project_rules.yaml 只能追加 Shell 规则，不能删除
+# 系统默认或主配置追加的黑/灰名单。仅受信任主配置明确承担风险时才设 true。
+allow_project_shell_rule_removals: false
 search_api_provider: duckduckgo_html
 search_api_url: ""
 search_api_key: ""
@@ -220,7 +223,7 @@ agent_idle_threshold: 0
 # ============================================================
 session_retention_days: 30        # 已关闭 session 超过此天数则归档
 session_archive_max: 50           # 归档上限，超过删除最旧
-session_resume_max_idle_sec: 3600 # 自动恢复快照超过此闲置时间时阻断非终态任务；0=关闭保护
+session_resume_max_idle_sec: 3600 # 已废弃（启动永远新会话、不再自动恢复）；保留仅为配置兼容，设置无效
 session_snapshot_interval_sec: 30 # 运行期完整快照间隔，限制崩溃后的副作用重放窗口；0=禁用周期保存
 
 # ============================================================
@@ -233,7 +236,7 @@ session_snapshot_interval_sec: 30 # 运行期完整快照间隔，限制崩溃�
 # 动态 DAG 的 Reactor 示例见 reactors.program-verify.yaml：Task 终态已有内置唤醒，
 # 示例用非终态的重试压力提交 request_replan，由 Scheduler 决定是否调整图。
 # 本示例预热了 acceptance.verify；省略它时 Scheduler 可按需 provision builtin/verifier@1。
-# 自定义验收 Agent 或模板必须显式加入 submit_task_result（经 verdict/event 提交结论）。
+# 自定义验收 Agent 或模板必须显式加入 submit_task_result（经 verdict 提交结论）。
 # ============================================================
 # reactors_file: reactors.yaml
 

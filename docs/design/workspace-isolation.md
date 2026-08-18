@@ -30,7 +30,7 @@ Scheduler 把一个目标拆成多个并行节点时，节点之间可能写同�
 
 1. **声明式触发**：隔离不是全局模式，而是 DAG 节点级声明——Scheduler 在 publish_task 时传 `isolation: "workspace"`，落在 `model.NodeCapability.Isolation`，与 tools/model 同一容器、同一守卫（仅 Scheduler 计划控制面可写）。不声明的节点零开销，行为与引入前完全一致。
 2. **自动合并优先，Scheduler 裁决兜底**：任务成功终态由控制面（不经 LLM）把 dirty set 合并回主根——fast-forward 与三路自动合并覆盖绝大多数情形；无法自动解决的冲突不落地、任务置 failed 并自动 RequestReplan，由 Scheduler 看到冲突证据后裁决（改派、串行化或人工上报）。LLM 不参与合并动作本身。
-3. **shell 尽力隔离**：`run_shell` 默认工作目录切到 workspace 根，但命令里写主根绝对路径不可完全阻止——**工具写全隔离，shell 尽力隔离**。这是有意接受的残余风险（§7），不为它引入沙箱依赖。
+3. **shell 尽力隔离**：`run_shell` 默认工作目录切到 workspace 根，显式 `working_dir` 也必须留在同一任务 workspace 内；但命令正文写主根绝对路径仍不可完全阻止——**工具写全隔离，shell cwd 强约束，命令副作用仍是宿主能力**。这是有意接受的残余风险（§7），不为它虚构沙箱保证。
 4. **workspace 在 projectRoot 内**：目录固定在 `<projectRoot>/.agentgo/workspaces/<taskID>/`。在根内则路径边界校验（pathutil）、trace、会话归档的天然覆盖范围内，无需第二套边界规则；`.agentgo/` 本就是系统运行目录，与 sessions/traces/state 同级。
 
 ## 3. overlay 语义
@@ -39,7 +39,7 @@ Scheduler 把一个目标拆成多个并行节点时，节点之间可能写同�
 
 - **读穿透主根**：workspace 中已有副本（本任务先前写过）读副本；未命中读主根实时内容——主根在任务执行期的新写入对该任务可见，不存在"快照过期"。
 - **写落副本**：`write_file` 的新文件直接落 workspace；`edit_file` 对已有文件先 copy-on-write——从主根复制基线进 workspace，并在 manifest（`.workspace-manifest.json`）记录基线 SHA256，作为合并时的三方之一。
-- **路径边界不变**：`pathutil.ValidatePath` 永远面对主根逻辑路径（`Swapper.Get()` 恒返回主根），overlay 解析发生在校验之后——隔离不放宽任何边界。
+- **路径边界不变**：启动期把项目根 canonicalize；`pathutil.ValidatePath` 解析目标的现存 symlink/路径别名后校验真实位置仍在根内，再交给 overlay——隔离不放宽任何边界。
 
 ## 4. 合并协议
 
@@ -61,7 +61,7 @@ Scheduler 把一个目标拆成多个并行节点时，节点之间可能写同�
 
 | 触点 | 隔离语义 |
 |---|---|
-| publish_task | 新增可选参数 `isolation`，唯一合法值 `"workspace"`；守卫/校验与 tools/model 同款（仅 Scheduler 计划控制面可写，非法值报错），落 `Task.Capability.Isolation` 并克隆投影到 PlanNode |
+| publish_task | 新增可选参数 `isolation`，唯一合法值 `"workspace"`；守卫/校验与 tools/model 同款（仅 Scheduler 计划控制面可写，非法值报错），落 `Task.Capability.Isolation` 并投影进 board snapshot 的任务摘要 |
 | GraphDigest | `Isolation.Mode` 纳入 digest（nil ≡ 空 ≡ Mode 空串）——隔离改变执行边界，视同图变更，旧验收随之失效 |
 | pathutil | 边界校验永远面对主根逻辑路径，overlay 解析在校验之后；workspace 目录本身在 projectRoot 内，天然不越界 |
 | roster | 执行期写 workspace 副本按 taskID 目录天然互斥，不占主根声明；**合并期**逐文件 `TryClaim` 主根路径，与其他写入方同一协议 |
@@ -79,6 +79,6 @@ Scheduler 把一个目标拆成多个并行节点时，节点之间可能写同�
 
 ## 7. 残余风险与后续方向
 
-- **shell 写主根绝对路径**（有意接受）：`run_shell` 默认 cwd 切到 workspace 根，相对路径写自然落副本；但命令显式写主根绝对路径会穿透隔离。缓解只到"尽力"：提示词引导相对路径、合并协议兜住工具写。要彻底封堵需 OS 级沙箱（namespace/容器），当前不引入。
+- **shell 写主根绝对路径**（有意接受）：`run_shell` 默认 cwd 与显式 `working_dir` 都被限制在 workspace 内，相对路径写自然落副本；但命令正文显式写主根绝对路径仍会穿透隔离。要彻底封堵需 OS 级沙箱（namespace/容器），当前不引入。
 - **读穿透的可见性不对称**：隔离任务读得到主根执行期新内容（含其他并行节点已合并的产出），但其他任务读不到它未合并的副本——这是隔离的本义，但意味着"先产出中间文件供同伴消费"的协作模式必须经合并点，不能靠执行期偷看。
 - **后续方向**：workspace 差分随任务结果上报（board snapshot 展示 dirty set 摘要）；冲突区域的 LLM 辅助裁决建议（作为 replan 证据的附件，仍由 Scheduler 决策）；`IsolationSpec` 预留扩展位（如 `Mode: "snapshot"` 只读快照），容器类型无需变更。

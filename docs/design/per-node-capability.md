@@ -8,9 +8,9 @@
 >
 > 执行面：[`internal/agent`](../../internal/agent)（processTask / ToolSwapper）
 >
-> 观测面：[`internal/scheduler/snapshot.go`](../../internal/scheduler/snapshot.go)、[`internal/plan/digest.go`](../../internal/plan/digest.go)、[`internal/trace`](../../internal/trace)
+> 观测面：[`internal/scheduler/snapshot.go`](../../internal/scheduler/snapshot.go)、[`internal/graph/digest.go`](../../internal/graph/digest.go)、[`internal/trace`](../../internal/trace)
 >
-> 对照设计：[`interaction.md`](interaction.md)（plan_review 呈现契约）
+> 对照设计：[`interaction.md`](interaction.md)（graph_approval 呈现契约）
 
 ## 1. 动机
 
@@ -22,9 +22,9 @@ kind 级白名单回答的是"这只 agent 一生能用什么工具"；但一次
 
 同一条 DAG 里，"逐文件格式转换"与"裁决两个方案孰优"对模型能力的要求差一个数量级。kind 级模型配置只能整条路由一刀切；节点级 model 覆盖让机械重复节点跑便宜模型、判断密集节点跑旗舰模型，按节点分配 token 预算。
 
-### 1.3 plan_review 从看拓扑升级为看爆炸半径
+### 1.3 审批从看拓扑升级为看爆炸半径
 
-gate=plan 模式下，用户审批的不再只是"做哪几步、什么顺序"，还包括"每一步拿什么工具、用什么模型"。审批语义从拓扑审查升级为爆炸半径审查，这也是节点能力必须进 board snapshot 与 plan_review 呈现的原因。
+带 approval 节点的图里，用户审批的不再只是"做哪几步、什么顺序"，还包括"每一步拿什么工具、用什么模型"。审批语义从拓扑审查升级为爆炸半径审查，这也是节点能力必须进 board snapshot 与 approval 呈现的原因。
 
 ## 2. 核心不变式
 
@@ -38,11 +38,11 @@ gate=plan 模式下，用户审批的不再只是"做哪几步、什么顺序"�
 
 | 面 | 机制 |
 |---|---|
-| 发布 | `publish_task` 增加可选参数 `tools`（逗号分隔工具名子集）与 `model`（模型名），**仅 Scheduler 计划控制面可设置**（`PlanMutationSource=scheduler`，Worker/Reactor 携带即拒绝）；工具名经 `AllToolNames` 静态校验，明显不自洽的伴生组合（写不带读、无执行类工具）只在返回文本里软警告；声明随 Task 持久化为 `model.NodeCapability{Tools, Model}`，并克隆投影到 PlanNode |
+| 发布 | `publish_task` 增加可选参数 `tools`（逗号分隔工具名子集）与 `model`（模型名），**仅 Scheduler 计划控制面可设置**（内置装配只对 Scheduler 注入 `AllowNodeCapability`，Worker/Reactor 携带即拒绝）；工具名经 `AllToolNames` 静态校验，明显不自洽的伴生组合（写不带读、无执行类工具）只在返回文本里软警告；声明随 Task 持久化为 `model.NodeCapability{Tools, Model}`，并投影进 board snapshot 的任务摘要 |
 | 模型 | Runner 认领后当次以 `Capability.Model` 替换执行模型，任务终态恢复原值；发布面不维护模型清单，模型名是否可用由 LLM 端点决定 |
 | 路由 | `QueryAvailable(eventType, agentID)` 按认领方过滤——子集越界的任务对该 runner 不可见；`ClaimTask` 落锁前的 `CanClaim` 守卫叠加同一检查，双保险。白名单事实源：静态 runner 的生效 `AllowedTools` / spawn ad-hoc 继承的 base kind / 动态 Team route 全部 ready listener 的能力交集；identity 无法解析时 fail-closed 拒绝；Scheduler 自身跳过（topo=solo 亲自执行的语义） |
 | 执行 | `processTask` 经 `ToolSwapper` 把 executor 的工具注册表换入过滤视图，保证"LLM 只见子集"；executor 不支持按任务过滤或子集 ⊄ 注册全集时任务直接失败（`capability_violation`），不降级执行——这是 Store 预过滤之后的第二道防线 |
-| 观测 | Capability 进 board snapshot 的 PlanNode 摘要与 plan_review 呈现；**纳入 GraphDigest**（tools 顺序无关、自动去重，空声明 ≡ 无声明）——能力变化视同图变更，会使旧验收 PASS 作废；发布事件的 trace 记录携带能力声明 |
+| 观测 | Capability 进 board snapshot 的任务摘要与 graph approval 呈现；**纳入 GraphDigest**（tools 顺序无关、自动去重，空声明 ≡ 无声明）——能力变化视同图变更，会使旧验收 PASS 作废；发布事件的 trace 记录携带能力声明 |
 
 ## 4. 路由饥饿语义
 

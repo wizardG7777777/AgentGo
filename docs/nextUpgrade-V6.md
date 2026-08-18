@@ -236,7 +236,7 @@ LLM 文本只是原始记忆材料之一，不能自动成为 confirmed 事实�
 
 3. Agent 身份、Prompt、执行 Route 和工具权限仍有较强绑定。为了得到不同工具组合而新增多个 Agent kind 会造成配置膨胀，但若彻底删除执行器能力上限，又会让 Scheduler 生成的节点声明同时变成不受约束的自我授权。
 
-4. 当前路径和 workspace 约束主要保护 AgentGo 自身工具。符号链接、Windows junction、竞争替换和 host Shell 仍需要更严格的边界；用户批准命令也不等同于命令已经处于安全沙箱。
+4. 路径和 workspace 约束主要保护 AgentGo 自身工具。当前实现已统一 canonical `project_root` 并在文件工具路径上解析现存 symlink/路径别名后做真实 containment；竞争替换（TOCTOU）、平台特有 junction/reparse point 以及 host Shell 命令正文仍需要更强的 OS 边界。用户批准命令也不等同于命令已经处于安全沙箱。
 
 5. workspace 的本质是写时复制与冲突隔离，不是 OS 级安全沙箱。任务读取自己的修改、跨文件一致性和多文件合并仍需要更清晰的事务语义。
 
@@ -414,7 +414,7 @@ LLM 文本只是原始记忆材料之一，不能自动成为 confirmed 事实�
     },
     "implement": {
       "kind": "agent",
-      "task": { "title": "实施修改", "output_schema": "agentgo.change-set/v1" },
+      "task": { "title": "实施修改" },
       "status": "inactive",
       "executor": null,
       "execution": null,
@@ -422,7 +422,7 @@ LLM 文本只是原始记忆材料之一，不能自动成为 confirmed 事实�
     },
     "verify": {
       "kind": "agent",
-      "task": { "title": "验证修改", "output_schema": "agentgo.verification/v1" },
+      "task": { "title": "验证修改" },
       "status": "inactive",
       "executor": null,
       "execution": null,
