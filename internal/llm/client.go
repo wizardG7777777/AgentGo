@@ -53,7 +53,11 @@ type ToolCall struct {
 
 // Response 是解析后的 LLM 响应。
 type Response struct {
-	Content      string
+	Content string
+	// Reasoning is the provider's plaintext reasoning exactly as returned by the
+	// API. It is normalized from reasoning, reasoning_content, or readable
+	// reasoning_details blocks; ExtraFields remains the protocol authority.
+	Reasoning    string
 	ToolCalls    []ToolCall
 	FinishReason FinishReason
 	Usage        struct {
@@ -71,13 +75,15 @@ type Client interface {
 }
 
 // StreamEvent is a transport-level snapshot emitted while a streaming Chat
-// Completions response is being accumulated. Only answer content is exposed;
-// provider reasoning fields remain private protocol metadata in ExtraFields.
+// Completions response is being accumulated. Content and provider-supplied raw
+// reasoning are independent accumulated streams so UIs can label them clearly.
 type StreamEvent struct {
-	ContentDelta       string
-	AccumulatedContent string
-	Done               bool
-	Error              string
+	ContentDelta         string
+	AccumulatedContent   string
+	ReasoningDelta       string
+	AccumulatedReasoning string
+	Done                 bool
+	Error                string
 }
 
 type streamHandlerKey struct{}
@@ -105,8 +111,8 @@ func modelOverrideFromContext(ctx context.Context) string {
 }
 
 // WithStreamHandler installs an optional synchronous observer for streamed
-// answer text. The handler must return quickly; callers that need throttling or
-// fan-out should coalesce snapshots before publishing them to a UI.
+// reasoning and answer text. The handler must return quickly; callers that need
+// throttling or fan-out should coalesce snapshots before publishing them to a UI.
 func WithStreamHandler(ctx context.Context, handler func(StreamEvent)) context.Context {
 	if handler == nil {
 		return ctx
@@ -295,6 +301,7 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 			result.ExtraFields[k] = json.RawMessage(raw)
 		}
 	}
+	result.Reasoning = ReasoningText(result.ExtraFields)
 
 	return result, nil
 }
@@ -317,10 +324,12 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 
 	var acc openai.ChatCompletionAccumulator
 	var accumulatedContent string
+	var accumulatedReasoning string
 	// The SDK accumulator intentionally ignores JSON metadata. Keep string
-	// deltas (notably reasoning_content) by concatenation and retain the last
-	// raw value for other extension-field shapes.
+	// deltas by concatenation, append array-valued extension chunks in order,
+	// and retain the last raw value for other extension-field shapes.
 	extraStrings := make(map[string]string)
+	extraArrays := make(map[string][]json.RawMessage)
 	extraRaw := make(map[string]json.RawMessage)
 	for stream.Next() {
 		chunk := stream.Current()
@@ -332,26 +341,35 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 		}
 		for _, choice := range chunk.Choices {
 			delta := choice.Delta
-			if delta.Content != "" {
-				accumulatedContent += delta.Content
-				if handler != nil {
-					handler(StreamEvent{
-						ContentDelta:       delta.Content,
-						AccumulatedContent: accumulatedContent,
-					})
-				}
-			}
+			chunkExtras := make(map[string]json.RawMessage, len(delta.JSON.ExtraFields))
 			for key, field := range delta.JSON.ExtraFields {
 				raw := field.Raw()
 				if raw == "" {
 					continue
 				}
+				chunkExtras[key] = json.RawMessage(raw)
 				var fragment string
 				if err := json.Unmarshal([]byte(raw), &fragment); err == nil {
 					extraStrings[key] += fragment
 					continue
 				}
+				var fragments []json.RawMessage
+				if err := json.Unmarshal([]byte(raw), &fragments); err == nil {
+					extraArrays[key] = append(extraArrays[key], fragments...)
+					continue
+				}
 				extraRaw[key] = json.RawMessage(raw)
+			}
+			reasoningDelta := ReasoningText(chunkExtras)
+			accumulatedContent += delta.Content
+			accumulatedReasoning += reasoningDelta
+			if handler != nil && (delta.Content != "" || reasoningDelta != "") {
+				handler(StreamEvent{
+					ContentDelta:         delta.Content,
+					AccumulatedContent:   accumulatedContent,
+					ReasoningDelta:       reasoningDelta,
+					AccumulatedReasoning: accumulatedReasoning,
+				})
 			}
 		}
 	}
@@ -391,10 +409,17 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 	}
 	result.Usage.PromptTokens = int(acc.Usage.PromptTokens)
 	result.Usage.CompletionTokens = int(acc.Usage.CompletionTokens)
-	if len(extraStrings)+len(extraRaw) > 0 {
-		result.ExtraFields = make(map[string]json.RawMessage, len(extraStrings)+len(extraRaw))
+	if len(extraStrings)+len(extraArrays)+len(extraRaw) > 0 {
+		result.ExtraFields = make(map[string]json.RawMessage, len(extraStrings)+len(extraArrays)+len(extraRaw))
 		for key, value := range extraRaw {
 			result.ExtraFields[key] = value
+		}
+		for key, value := range extraArrays {
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				return emitFailure(&ErrBadResponse{Err: fmt.Errorf("流式扩展数组字段 %q 聚合失败: %w", key, err)})
+			}
+			result.ExtraFields[key] = encoded
 		}
 		for key, value := range extraStrings {
 			encoded, err := json.Marshal(value)
@@ -404,8 +429,14 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 			result.ExtraFields[key] = encoded
 		}
 	}
+	result.Reasoning = ReasoningText(result.ExtraFields)
+	if result.Reasoning == "" {
+		result.Reasoning = accumulatedReasoning
+	}
 	if handler != nil {
-		handler(StreamEvent{AccumulatedContent: result.Content, Done: true})
+		handler(StreamEvent{
+			AccumulatedContent: result.Content, AccumulatedReasoning: result.Reasoning, Done: true,
+		})
 	}
 	return result, nil
 }

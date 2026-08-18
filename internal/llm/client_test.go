@@ -169,7 +169,11 @@ func TestSDKClient_StreamingAccumulatesContentUsageAndExtras(t *testing.T) {
 	if got := string(resp.ExtraFields["reasoning_content"]); got != `"思考"` {
 		t.Fatalf("reasoning_content = %s, want %q", got, "思考")
 	}
-	if len(events) != 3 || events[0].AccumulatedContent != "你" || events[1].AccumulatedContent != "你好" || !events[2].Done {
+	if resp.Reasoning != "思考" {
+		t.Fatalf("normalized reasoning = %q, want %q", resp.Reasoning, "思考")
+	}
+	if len(events) != 3 || events[0].AccumulatedContent != "你" || events[0].AccumulatedReasoning != "思" ||
+		events[1].AccumulatedContent != "你好" || events[1].AccumulatedReasoning != "思考" || !events[2].Done {
 		t.Fatalf("stream events = %+v", events)
 	}
 	if requestBody["stream"] != true || requestBody["reasoning_effort"] != "high" {
@@ -178,6 +182,51 @@ func TestSDKClient_StreamingAccumulatesContentUsageAndExtras(t *testing.T) {
 	streamOptions, ok := requestBody["stream_options"].(map[string]any)
 	if !ok || streamOptions["include_usage"] != true {
 		t.Fatalf("stream_options = %#v", requestBody["stream_options"])
+	}
+}
+
+func TestSDKClient_StreamingExposesOpenRouterReasoningDetails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		frames := []string{
+			`{"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"deepseek/deepseek-v4-flash","choices":[{"index":0,"delta":{"role":"assistant","reasoning_details":[{"type":"reasoning.text","text":"先检查", "id":"r1","index":0}]},"finish_reason":null}]}`,
+			`{"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"deepseek/deepseek-v4-flash","choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.text","text":"再汇总", "id":"r2","index":1}]},"finish_reason":null}]}`,
+			`{"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"deepseek/deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"最终答案"},"finish_reason":null}]}`,
+			`{"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"deepseek/deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			`{"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"deepseek/deepseek-v4-flash","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}`,
+		}
+		for _, frame := range frames {
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", frame)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	client := NewSDKClientWithConfig(server.URL, "key", "deepseek/deepseek-v4-flash", "", 30*time.Second, ClientConfig{
+		ReasoningEffort: "high",
+		Stream:          true,
+	})
+	var events []StreamEvent
+	ctx := WithStreamHandler(context.Background(), func(event StreamEvent) { events = append(events, event) })
+	resp, err := client.Chat(ctx, []Message{{Role: "user", Content: "检查仓库"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Content != "最终答案" || resp.Reasoning != "先检查再汇总" {
+		t.Fatalf("response content/reasoning = %+v", resp)
+	}
+	var details []json.RawMessage
+	if err := json.Unmarshal(resp.ExtraFields["reasoning_details"], &details); err != nil || len(details) != 2 {
+		t.Fatalf("reasoning_details not preserved in order: raw=%s err=%v", resp.ExtraFields["reasoning_details"], err)
+	}
+	if len(events) != 4 || events[0].AccumulatedReasoning != "先检查" ||
+		events[1].AccumulatedReasoning != "先检查再汇总" || events[2].AccumulatedContent != "最终答案" ||
+		events[2].AccumulatedReasoning != "先检查再汇总" || !events[3].Done {
+		t.Fatalf("reasoning stream events = %+v", events)
 	}
 }
 
@@ -611,6 +660,9 @@ func TestSDKClient_Chat_ExtractExtraFields(t *testing.T) {
 	}
 	if got != "We should greet the user." {
 		t.Errorf("reasoning_content = %q, want %q", got, "We should greet the user.")
+	}
+	if resp.Reasoning != "We should greet the user." {
+		t.Errorf("normalized reasoning = %q", resp.Reasoning)
 	}
 }
 
