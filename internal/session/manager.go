@@ -13,15 +13,21 @@ import (
 // SessionManager 管理 Session 生命周期。
 // 所有公开方法并发安全（内部 sync.Mutex）。
 //
-// Session 语义（B3 决策，2026-07-18 固化）：
-//   - session 切换是【日志/观测边界】，不是运行时边界：公告板任务、邮箱、
-//     花名册、team 的运行时状态跨 session 连续，不随切换重置；
-//   - 切换前由调用方（bootstrap.System.NewSession/SwitchSession）把运行时
-//     快照刷新到旧 Session 目录；切换后 trace writer、system.log、team
-//     store 的持久化位置经 OnSwitch 钩子迁移到新 Session；
-//   - SwitchTo 故意【不】恢复目标 Session 的 snapshot.json——运行时状态连续
-//     意味着恢复会把旧工作负载复制一份进正在运行的系统。历史 Session 的
-//     snapshot 仅在进程重启 resume 时由 bootstrap 读取。
+// Session 语义（2026-08 隔离化，取代 B3 连续语义）：
+//   - session 是【完整的运行时隔离边界】：公告板任务、邮箱、花名册、team
+//     运行时与 Graph 推进按 session 隔离，内容不互通；
+//   - 切换由调用方（bootstrap.System.NewSession/SwitchSession/NewSessionForce）
+//     执行「冻结 → 切换 → 解冻」：当前 session 的运行时停驻并归档快照到其
+//     目录，随后从目标 session 的 snapshot.json 整体重建运行时——SwitchTo
+//     本身【不】碰运行时，只迁移 session 身份与持久化绑定（trace writer、
+//     system.log、team store、Session Memory 经 OnSwitch 钩子迁移）；
+//   - 历史 Session 的 snapshot.json 有两类读者：进程重启 --resume（bootstrap）
+//     与 session 解冻（System.thawSessionLocked），两者语义刻意对齐；
+//   - 启动永远是全新 Session（2026-08 起）：initSession 不再读 active-session
+//     自动恢复，旧请求绝不自动重跑；进入历史会话（--resume / 解冻）时恢复
+//     历史上下文但把非终态任务阻断为 blocked，续跑由用户提交新提示词驱动；
+//   - 空会话（从未提交实际任务：TaskCount==0 且 FirstUserInput==""）在退出/
+//     切走/下次启动清扫时被丢弃，不占用历史列表。
 type SessionManager struct {
 	mu             sync.Mutex
 	baseDir        string         // ~/.agentgo/sessions/
@@ -66,43 +72,18 @@ func NewSessionManagerWithResume(baseDir string, cfg SessionConfig, resumeID str
 
 // NewSessionManager 创建并初始化 SessionManager。
 // 1. 创建 baseDir（如不存在）
-// 2. 读取 active-session 文件
-// 3. 若指向有效 Session 目录 → 恢复该 Session
-// 4. 否则 → 调用 CreateNew()
-// 5. 任何初始化错误 → 返回 nil current 的 SessionManager（降级模式），不返回 error
+// 2. 永远创建全新 Session（不读 active-session 自动恢复；恢复旧会话走
+//    --resume 的 initSessionByID 或运行时 SwitchTo）
+// 3. 任何初始化错误 → 返回 nil current 的 SessionManager（降级模式），不返回 error
 func NewSessionManager(baseDir string, cfg SessionConfig) (*SessionManager, error) {
 	return NewSessionManagerWithResume(baseDir, cfg, "")
 }
 
-// initSession 尝试恢复已有 Session 或创建新 Session。
+// initSession 永远创建全新 Session（2026-08 起不再读 active-session 自动恢复
+// 上次会话——旧请求绝不随进程启动自动重跑；恢复旧会话的入口是 --resume 的
+// initSessionByID 与运行时 SwitchTo）。active-session 指针仍每步写入，但只
+// 服务于进程外消费者（agentgo trace CLI 的 ActiveSessionLogsDir）。
 func (sm *SessionManager) initSession() error {
-	activeFile := filepath.Join(sm.baseDir, "active-session")
-	data, err := os.ReadFile(activeFile)
-	if err == nil && len(data) > 0 {
-		// TrimSpace：手工编辑 active-session 容易留下尾部换行，
-		// 不修剪会拼出不存在的 sess-<id>\n 目录而静默新建 Session。
-		sessionID := strings.TrimSpace(string(data))
-		sessDir := filepath.Join(sm.baseDir, "sess-"+sessionID)
-		metaPath := filepath.Join(sessDir, "metadata.json")
-
-		// 检查 Session 目录和 metadata.json 是否存在
-		if info, statErr := os.Stat(sessDir); statErr == nil && info.IsDir() {
-			if _, loadErr := os.Stat(metaPath); loadErr == nil {
-				if sess, err := sm.loadSession(sessionID, sessDir); err == nil {
-					if err := sm.activateLoadedSession(sess); err != nil {
-						return err
-					}
-					return nil
-				} else {
-					log.Printf("[WARNING] active-session metadata 加载失败: %v", err)
-				}
-			}
-		}
-		// active-session 指向无效目录，记录警告并创建新 Session
-		log.Printf("[WARNING] active-session 指向无效目录 %s，创建新 Session", sessDir)
-	}
-
-	// 创建新 Session
 	sess, err := sm.createSessionDir()
 	if err != nil {
 		return err
@@ -703,6 +684,117 @@ func (sm *SessionManager) List() ([]Metadata, error) {
 	})
 
 	return result, nil
+}
+
+// isEmptyMetadata 判定空会话：从未提交过实际任务（无用户提示词）。
+// TaskCount/FirstUserInput 由 SendUserText 投递 EventUserInput 前写入，
+// 斜杠命令不计数，因此该判据精确等于「没有任何实际性任务被提交过」。
+func isEmptyMetadata(meta Metadata) bool {
+	return meta.TaskCount == 0 && meta.FirstUserInput == ""
+}
+
+// DiscardSessionIfEmpty 删除一个非当前活跃的空会话目录（含其全部持久化
+// 内容）。会话非空、不存在、或就是当前活跃会话时返回 (false, nil)。
+// 空判定除 metadata 外还核对快照任务数：metadata 计数只覆盖标准输入路径，
+// 快照里有任务（任何旁路注入）即视为非空，双保险防误删。
+// 调用方负责确保目标会话没有任何打开的文件句柄（Windows RemoveAll 前提）。
+func (sm *SessionManager) DiscardSessionIfEmpty(sessionID string) (bool, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sessionID == "" || (sm.current != nil && sm.current.ID == sessionID) {
+		return false, nil
+	}
+	sessDir := filepath.Join(sm.baseDir, "sess-"+sessionID)
+	meta, err := LoadMetadata(filepath.Join(sessDir, "metadata.json"))
+	if err != nil {
+		// 目录不存在或 metadata 损坏：无可丢弃（损坏目录保留，交人工排查）
+		return false, nil
+	}
+	if !isEmptyMetadata(*meta) {
+		return false, nil
+	}
+	if snap, err := LoadSnapshot(filepath.Join(sessDir, "snapshot.json")); err == nil && snap != nil && len(snap.Tasks) > 0 {
+		return false, nil
+	}
+	if err := os.RemoveAll(sessDir); err != nil {
+		return false, fmt.Errorf("删除空会话目录失败: %w", err)
+	}
+	return true, nil
+}
+
+// SweepEmptySessions 清理全部非当前活跃的空会话（崩溃无优雅退出时遗留的
+// 空会话由此兜底），返回删除数。逐条失败仅 WARNING，不阻断启动。
+func (sm *SessionManager) SweepEmptySessions() int {
+	metas, err := sm.List()
+	if err != nil {
+		log.Printf("[WARNING] 空会话清扫：列出 Session 失败: %v", err)
+		return 0
+	}
+	removed := 0
+	for _, meta := range metas {
+		if !isEmptyMetadata(meta) {
+			continue
+		}
+		discarded, err := sm.DiscardSessionIfEmpty(meta.SessionID)
+		if err != nil {
+			log.Printf("[WARNING] 空会话清扫：丢弃 %s 失败: %v", meta.SessionID, err)
+			continue
+		}
+		if discarded {
+			removed++
+		}
+	}
+	return removed
+}
+
+// DiscardCurrentIfEmpty 在 Shutdown 关闭全部句柄（Close 之后）调用：当前
+// 会话为空则删除其目录，并把 active-session 指针改写到最近一个剩余会话
+// （没有剩余会话则删除指针文件）。空判定与 DiscardSessionIfEmpty 同标准
+// （metadata + 快照任务双保险）。指针只服务进程外的 trace CLI，不再承担
+// 恢复职责。非空返回 (false, nil)；删除/指针改写失败返回 error（调用方
+// 降级为 WARNING，不阻断退出）。
+func (sm *SessionManager) DiscardCurrentIfEmpty() (bool, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sm.current == nil || !isEmptyMetadata(sm.current.Metadata) {
+		return false, nil
+	}
+	if snap, err := LoadSnapshot(filepath.Join(sm.current.Dir, "snapshot.json")); err == nil && snap != nil && len(snap.Tasks) > 0 {
+		return false, nil
+	}
+	if err := os.RemoveAll(sm.current.Dir); err != nil {
+		return false, fmt.Errorf("删除空会话目录失败: %w", err)
+	}
+
+	// 指针改写：direct glob（sm.current 仍是已删除会话，不能走 List 的
+	// current 过滤——List 无过滤，可直接复用）。
+	matches, err := filepath.Glob(filepath.Join(sm.baseDir, "sess-*", "metadata.json"))
+	if err != nil {
+		return true, fmt.Errorf("枚举剩余 Session 失败: %w", err)
+	}
+	var latest *Metadata
+	for _, path := range matches {
+		meta, err := LoadMetadata(path)
+		if err != nil {
+			continue
+		}
+		if latest == nil || meta.CreatedAt > latest.CreatedAt {
+			latest = meta
+		}
+	}
+	activeFile := filepath.Join(sm.baseDir, "active-session")
+	if latest == nil {
+		if err := os.Remove(activeFile); err != nil && !os.IsNotExist(err) {
+			return true, fmt.Errorf("删除 active-session 指针失败: %w", err)
+		}
+		return true, nil
+	}
+	if err := sm.writeActiveSession(latest.SessionID); err != nil {
+		return true, fmt.Errorf("改写 active-session 指针失败: %w", err)
+	}
+	return true, nil
 }
 
 // ActiveSessionLogsDir 返回 sessionsRoot 下 active-session 指向的 Session 的

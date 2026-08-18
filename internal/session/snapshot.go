@@ -67,15 +67,22 @@ type TaskSnapshot struct {
 	PendingSince   string                          `json:"pending_since,omitempty"`
 	StartedAt      string                          `json:"started_at,omitempty"`
 	CompletedAt    string                          `json:"completed_at,omitempty"`
-	// GraphID / NodeID / ActivationID 是 V6 Graph 归属身份（见 model.Task
+	// GraphID / NodeID / ActivationID / GraphNodeKind 是 V6 Graph 归属身份（见 model.Task
 	// 同名字段）。纯增量字段：旧版本快照没有它们，Unmarshal 得空串，按
-	// 「非图任务」降级，因此不提升 currentSnapshotVersion。
+	// 「未知旧节点角色」降级，因此不提升 currentSnapshotVersion。
 	// 必须随快照走：恢复后 graph-terminal-feed 凭 GraphID 回填引擎、
 	// graphBoard 凭 (GraphID, ActivationID) 幂等去重；丢失会让在途图
-	// 节点永久等不到终态事实。
-	GraphID      string `json:"graph_id,omitempty"`
-	NodeID       string `json:"node_id,omitempty"`
-	ActivationID string `json:"activation_id,omitempty"`
+	// 节点永久等不到终态事实。旧 GraphNodeKind 为空时租约只授予
+	// submit_task_result，绝不按 route 猜测并注入 request_replan。
+	GraphID       string `json:"graph_id,omitempty"`
+	NodeID        string `json:"node_id,omitempty"`
+	ActivationID  string `json:"activation_id,omitempty"`
+	GraphNodeKind string `json:"graph_node_kind,omitempty"`
+	// RouteScope is the durable runtime route-authorization owner. Old
+	// snapshots omit it and the claim layer derives the legacy-equivalent
+	// graph/task scope from GraphID/ParentTaskID, so this additive field does
+	// not require a snapshot version bump.
+	RouteScope string `json:"route_scope,omitempty"`
 	// Capability 是任务的节点能力声明（工具子集 / 模型覆盖）的快照形式。
 	// 纯增量字段：旧版本快照没有它，Unmarshal 得 nil，按"无节点能力约束"处理，
 	// 因此不提升 currentSnapshotVersion（与 ArtifactMeta/ToolCalls 同策略）。

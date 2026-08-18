@@ -17,7 +17,7 @@ func TestTurnLedgerRoundTripAndSessionBoundary(t *testing.T) {
 	at := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	first := TurnRecord{
 		ID: "turn-1", AgentID: "worker-1", TaskID: "task-1", Loop: 1,
-		Text: "第一行\n第二行", Status: "completed",
+		Text: "第一行\n第二行", Reasoning: "原始思考第一步\n原始思考第二步", Status: "completed",
 		ToolCalls: []string{"read_file", "write_file"},
 		StartedAt: at, CompletedAt: at.Add(time.Second),
 	}
@@ -48,8 +48,9 @@ func TestTurnLedgerRoundTripAndSessionBoundary(t *testing.T) {
 	if got[0].SessionID != firstID || got[1].SessionID != firstID {
 		t.Fatalf("轮次归属错误: %+v", got)
 	}
-	if got[0].Text != first.Text || !reflect.DeepEqual(got[0].ToolCalls, first.ToolCalls) {
-		t.Fatalf("多行正文或工具名未原样恢复: %+v", got[0])
+	if got[0].Text != first.Text || got[0].Reasoning != first.Reasoning ||
+		!reflect.DeepEqual(got[0].ToolCalls, first.ToolCalls) {
+		t.Fatalf("正文、思维链或工具名未原样恢复: %+v", got[0])
 	}
 	secondTurns, err := sm.LoadTurns(secondSession.ID)
 	if err != nil {

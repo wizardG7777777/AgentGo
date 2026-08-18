@@ -151,7 +151,10 @@ func TestNewSessionManager_CreatesNewSession(t *testing.T) {
 	}
 }
 
-func TestNewSessionManager_RecoverExistingSession(t *testing.T) {
+// 2026-08 二期：启动永远是全新 Session——第二次 NewSessionManager 不得
+// 恢复 active-session 指向的旧会话（旧请求绝不随启动自动重跑）；旧目录
+// 保留（丢弃空会话是 SweepEmptySessions/Shutdown 的职责，不在构造路径）。
+func TestNewSessionManager_AlwaysStartsFreshSession(t *testing.T) {
 	dir := t.TempDir()
 	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
 
@@ -165,19 +168,33 @@ func TestNewSessionManager_RecoverExistingSession(t *testing.T) {
 		t.Fatalf("Close failed: %v", err)
 	}
 
-	// Create a new SessionManager — should recover the existing session
+	// Create a new SessionManager — must start a brand-new session
 	sm2, err := NewSessionManager(dir, cfg)
 	if err != nil {
 		t.Fatalf("second NewSessionManager failed: %v", err)
 	}
 	if sm2.Current() == nil {
-		t.Fatal("expected non-nil current session after recovery")
+		t.Fatal("expected non-nil current session")
 	}
-	if sm2.Current().ID != originalID {
-		t.Errorf("recovered session ID = %q, want %q", sm2.Current().ID, originalID)
+	if sm2.Current().ID == originalID {
+		t.Errorf("启动不应恢复旧会话 %q，应新建", originalID)
 	}
 	if sm2.Current().Metadata.Status != "active" {
-		t.Errorf("recovered status = %q, want active", sm2.Current().Metadata.Status)
+		t.Errorf("new session status = %q, want active", sm2.Current().Metadata.Status)
+	}
+	if sm2.Current().RecoveredSnapshot != nil {
+		t.Error("全新会话不应携带 RecoveredSnapshot")
+	}
+	// active-session 指针改写为新会话；旧目录保留可经 --resume / 切换进入。
+	data, err := os.ReadFile(filepath.Join(dir, "active-session"))
+	if err != nil {
+		t.Fatalf("ReadFile active-session failed: %v", err)
+	}
+	if string(data) != sm2.Current().ID {
+		t.Errorf("active-session = %q, want 新会话 %q", string(data), sm2.Current().ID)
+	}
+	if info, err := os.Stat(filepath.Join(dir, "sess-"+originalID)); err != nil || !info.IsDir() {
+		t.Errorf("旧会话目录应保留: err=%v", err)
 	}
 }
 
@@ -636,6 +653,8 @@ func TestLoadSnapshot_NilSession_ReturnsNil(t *testing.T) {
 	}
 }
 
+// 2026-08 二期：普通启动（NewSessionManager）永远新建会话、不恢复快照；
+// 快照恢复只走 --resume 入口（NewSessionManagerWithResume）。
 func TestStartupRecovery_WithSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
@@ -645,6 +664,7 @@ func TestStartupRecovery_WithSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSessionManager failed: %v", err)
 	}
+	originalID := sm1.Current().ID
 	ts := []TaskSnapshot{
 		{ID: "task-recover", Description: "recoverable", Status: "pending", CreatedAt: "2026-04-15T10:00:00Z"},
 	}
@@ -652,22 +672,34 @@ func TestStartupRecovery_WithSnapshot(t *testing.T) {
 		t.Fatalf("SaveSnapshot failed: %v", err)
 	}
 
-	// Create a new SessionManager — should recover the session AND the snapshot
+	// 普通启动：全新会话，无 RecoveredSnapshot。
 	sm2, err := NewSessionManager(dir, cfg)
 	if err != nil {
 		t.Fatalf("second NewSessionManager failed: %v", err)
 	}
-	if sm2.Current() == nil {
-		t.Fatal("expected non-nil current session")
+	if sm2.Current() == nil || sm2.Current().ID == originalID {
+		t.Fatalf("普通启动应新建会话，实际 current=%+v", sm2.Current())
 	}
-	if sm2.Current().RecoveredSnapshot == nil {
-		t.Fatal("expected RecoveredSnapshot to be set on startup recovery")
+	if sm2.Current().RecoveredSnapshot != nil {
+		t.Fatal("普通启动不应恢复快照")
 	}
-	if len(sm2.Current().RecoveredSnapshot.Tasks) != 1 {
-		t.Fatalf("RecoveredSnapshot.Tasks len = %d, want 1", len(sm2.Current().RecoveredSnapshot.Tasks))
+
+	// --resume 入口：恢复指定会话与其快照。
+	sm3, err := NewSessionManagerWithResume(dir, cfg, originalID)
+	if err != nil {
+		t.Fatalf("NewSessionManagerWithResume failed: %v", err)
 	}
-	if sm2.Current().RecoveredSnapshot.Tasks[0].ID != "task-recover" {
-		t.Errorf("RecoveredSnapshot.Tasks[0].ID = %q, want %q", sm2.Current().RecoveredSnapshot.Tasks[0].ID, "task-recover")
+	if sm3.Current() == nil || sm3.Current().ID != originalID {
+		t.Fatalf("--resume 应进入原会话 %s，实际 %+v", originalID, sm3.Current())
+	}
+	if sm3.Current().RecoveredSnapshot == nil {
+		t.Fatal("expected RecoveredSnapshot to be set on --resume")
+	}
+	if len(sm3.Current().RecoveredSnapshot.Tasks) != 1 {
+		t.Fatalf("RecoveredSnapshot.Tasks len = %d, want 1", len(sm3.Current().RecoveredSnapshot.Tasks))
+	}
+	if sm3.Current().RecoveredSnapshot.Tasks[0].ID != "task-recover" {
+		t.Errorf("RecoveredSnapshot.Tasks[0].ID = %q, want %q", sm3.Current().RecoveredSnapshot.Tasks[0].ID, "task-recover")
 	}
 }
 
@@ -962,8 +994,9 @@ func TestSwitchTo_WithSnapshot(t *testing.T) {
 	}
 }
 
-// TestInitSession_ActiveSessionTrailingNewline 验证 active-session 文件带尾部
-// 换行（手工编辑常见）时 resume 仍命中原 Session，而不是静默新建一个。
+// TestInitSession_ActiveSessionTrailingNewline 2026-08 二期：启动不再读
+// active-session 恢复——即使指针有效（含手工编辑留下的尾部换行）也一律新建
+// 会话；旧会话只能经 --resume（initSessionByID）或运行时 SwitchTo 进入。
 func TestInitSession_ActiveSessionTrailingNewline(t *testing.T) {
 	dir := t.TempDir()
 	cfg := SessionConfig{RetentionDays: 30, ArchiveMax: 50, Enabled: true}
@@ -988,10 +1021,19 @@ func TestInitSession_ActiveSessionTrailingNewline(t *testing.T) {
 		t.Fatalf("second NewSessionManager failed: %v", err)
 	}
 	if sm2.Current() == nil {
-		t.Fatal("expected non-nil current session after resume")
+		t.Fatal("expected non-nil current session")
 	}
-	if sm2.Current().ID != wantID {
-		t.Errorf("resumed session ID = %q, want %q（尾部换行导致静默新建）", sm2.Current().ID, wantID)
+	if sm2.Current().ID == wantID {
+		t.Errorf("启动不应恢复 active-session 指向的旧会话 %q，应新建", wantID)
+	}
+
+	// --resume 入口仍按显式 ID 进入旧会话（ID 参数不经过 active-session 文件）。
+	sm3, err := NewSessionManagerWithResume(dir, cfg, wantID)
+	if err != nil {
+		t.Fatalf("NewSessionManagerWithResume failed: %v", err)
+	}
+	if sm3.Current() == nil || sm3.Current().ID != wantID {
+		t.Errorf("--resume 应进入 %q，实际 %+v", wantID, sm3.Current())
 	}
 }
 

@@ -177,6 +177,7 @@ const (
 	HistEventTaskCompleted = "task_completed"
 	HistEventTaskFailed    = "task_failed"
 	HistEventTaskRetry     = "task_retry"
+	HistEventTaskCancelled = "task_cancelled" // /new force 批量取消（Replay 前向兼容：未知类型静默跳过）
 	HistEventRosterClaim   = "roster_claim"
 	HistEventRosterRelease = "roster_release"
 	HistEventMailSent      = "mail_sent"

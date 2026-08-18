@@ -12,8 +12,9 @@ import (
 
 const turnLedgerFile = "turns.jsonl"
 
-// TurnRecord 是一次 LLM 调用公开输出的 Session 级不可变记录。
-// Text 只保存 assistant 对外可见正文；不保存 reasoning、工具参数或结果。
+// TurnRecord 是一次 LLM 调用用户可见输出的 Session 级不可变记录。
+// Text 保存 assistant 正文；Reasoning 保存 provider 返回的原始明文思维链。
+// 工具参数和工具结果仍不复制到轮次账本。
 type TurnRecord struct {
 	ID          string    `json:"id"`
 	SessionID   string    `json:"session_id"`
@@ -21,6 +22,7 @@ type TurnRecord struct {
 	TaskID      string    `json:"task_id"`
 	Loop        int       `json:"loop"`
 	Text        string    `json:"text"`
+	Reasoning   string    `json:"reasoning,omitempty"`
 	Status      string    `json:"status"` // completed | failed
 	ToolCalls   []string  `json:"tool_calls,omitempty"`
 	StartedAt   time.Time `json:"started_at"`
