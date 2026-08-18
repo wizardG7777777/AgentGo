@@ -1079,6 +1079,27 @@ func formatEventDetails(ev Event) string {
 	case KindTaskCancelled:
 		parts = appendTaskTransition(parts, ev.Transition, false, true)
 		parts = appendReason(parts, "reason", ev.Reason)
+	case KindTeamGraphBound:
+		// Graph-scoped Team 建立：GraphID 是资源所有权边界，TaskID 仅是
+		// 发起 provision 的 Scheduler task 来源，不是 Team 的生命周期 owner。
+		if ev.GraphID != "" {
+			parts = append(parts, fmt.Sprintf("graph=%s", ev.GraphID))
+		}
+		if ev.TaskID != "" {
+			parts = append(parts, fmt.Sprintf("origin_task=%s", ev.TaskID))
+		}
+		if ev.Description != "" {
+			parts = append(parts, fmt.Sprintf("desc=%q", truncate(ev.Description, 200)))
+		}
+	case KindTeamStopped:
+		// Graph 终态回收 Team：同时展示 Graph 归属和 durable stop 原因。
+		if ev.GraphID != "" {
+			parts = append(parts, fmt.Sprintf("graph=%s", ev.GraphID))
+		}
+		if ev.Description != "" {
+			parts = append(parts, fmt.Sprintf("desc=%q", truncate(ev.Description, 200)))
+		}
+		parts = appendReason(parts, "reason", ev.Reason)
 	case KindTaskRetry:
 		parts = appendTaskTransition(parts, ev.Transition, true, false)
 		if ev.AttemptNo > 0 {

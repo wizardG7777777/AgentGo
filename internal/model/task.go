@@ -72,13 +72,24 @@ type Task struct {
 	PartialOutput string // 执行中的部分输出，用于流式进度展示
 	Depth         int    // 子任务嵌套深度，根任务为 0
 
-	// GraphID / NodeID / ActivationID 是 V6 Graph 归属身份：本任务由 Graph
+	// GraphID / NodeID / ActivationID / GraphNodeKind 是 V6 Graph 归属身份：本任务由 Graph
 	// Runtime 为图 graph_id 的节点 node_id 的某次 activation（<nodeID>@<n>）
 	// 发布时写入，终态后由 graph-terminal-feed Reactor 凭它回填引擎
-	// （OnTaskTerminal 的幂等身份）。普通任务三字段皆空。
-	GraphID      string `json:"graph_id,omitempty"`
-	NodeID       string `json:"node_id,omitempty"`
-	ActivationID string `json:"activation_id,omitempty"`
+	// （OnTaskTerminal 的幂等身份）。GraphNodeKind 还供 ExecutionLease 按
+	// 真实节点角色派生控制通道，不能由可覆盖的 EventType/route 猜测。普通任务
+	// 四字段皆空；旧 Graph 快照缺少 GraphNodeKind 时执行层按最小权限处理。
+	GraphID       string `json:"graph_id,omitempty"`
+	NodeID        string `json:"node_id,omitempty"`
+	ActivationID  string `json:"activation_id,omitempty"`
+	GraphNodeKind string `json:"graph_node_kind,omitempty"`
+	// RouteScope freezes the runtime route-authorization owner used at both
+	// publish validation and claim time (for example "graph:<graph_id>" or
+	// "task:<controller_task_id>"). It is deliberately separate from lineage:
+	// ParentTaskID/GraphID remain provenance, while this field is the durable
+	// authority that prevents a listener registered for another Graph/request
+	// from claiming the Task. Older snapshots derive the same scope from
+	// GraphID/ParentTaskID when this field is empty.
+	RouteScope string `json:"route_scope,omitempty"`
 
 	// Capability 是本任务（DAG 节点）的能力声明。由 Scheduler 在 publish_task
 	// 时按节点指定：Tools 非空表示当次任务只允许使用该工具子集（必须 ⊆ 认领
@@ -120,8 +131,9 @@ type Task struct {
 	// 旧会话快照 / 旧 artifacts.jsonl 没有元数据时该字段为 nil/缺 key，
 	// 消费方按"无元数据"降级即可。
 	//
-	// 写入路径：record-artifact Reactor 读落盘文件计算后调
-	// Store.AppendArtifactWithMeta；查询路径：GetTask 等读 API 的克隆体上
+	// 写入路径：LocalWriteGroup 在 write/edit 返回前同步调
+	// Store.AppendArtifactWithMeta，异步 record-artifact Reactor 仅兼容补登；
+	// 查询路径：GetTask 等读 API 的克隆体上
 	// 直接取 task.ArtifactMeta[path]。同一文件被重复写入时保留最新一次的
 	// 元数据（last-wins，与 artifacts.jsonl 重放语义一致）。
 	ArtifactMeta map[string]ArtifactMeta `json:"artifact_meta,omitempty"`
@@ -195,8 +207,8 @@ const IsolationModeWorkspace = "workspace"
 // IsolationSpec 声明节点的执行隔离方式。Mode 目前唯一合法值为
 // IsolationModeWorkspace（"workspace"）：认领该任务的 Runner 在写时复制
 // overlay 中执行——读穿透主根、写落任务专属 workspace
-//（.agentgo/workspaces/<taskID>/），任务成功终态由控制面合并回主根
-//（自动三路合并优先，冲突交 Scheduler 裁决兜底）。
+// （.agentgo/workspaces/<taskID>/），任务成功终态由控制面合并回主根
+// （自动三路合并优先，冲突交 Scheduler 裁决兜底）。
 type IsolationSpec struct {
 	Mode string `json:"mode,omitempty"`
 }

@@ -15,8 +15,8 @@ const (
 	// 并被记录到 ResultSnapshot 供重启恢复。
 	KindResult
 	// KindStream is an ephemeral, replace-in-place snapshot of an in-flight LLM
-	// answer. Text always contains the complete accumulated answer so slow UI
-	// subscribers may safely drop older snapshots without losing characters.
+	// answer. Text and Reasoning contain complete accumulated snapshots so slow
+	// UI subscribers may safely drop older events without losing characters.
 	KindStream
 	// KindTurn 是一次 LLM 调用完成后的不可变轮次事实。与 KindStream 的
 	// 临时快照不同，它必须按 Agent/Task/Loop 追加到 Session 轮次账本，
@@ -31,6 +31,9 @@ type Event struct {
 	AgentID   string
 	SessionID string
 	Text      string
+	// Reasoning is raw plaintext reasoning returned by the provider. It is kept
+	// separate from Text so frontends can label it and final answers stay clean.
+	Reasoning string
 	StreamID  string
 	TaskID    string
 	Loop      int

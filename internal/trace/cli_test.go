@@ -37,6 +37,8 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"task_failed", Event{Kind: KindTaskFailed, Reason: "failed", Transition: transition}, []string{"retry=2", `reason="failed"`}},
 		{"task_blocked", Event{Kind: KindTaskBlocked, Reason: "no compatible route", Transition: &Transition{PrevStatus: "pending", NewStatus: "blocked", Cause: "system_blocked"}}, []string{"prev=pending", "new=blocked", "cause=system_blocked", `reason="no compatible route"`}},
 		{"task_cancelled", Event{Kind: KindTaskCancelled, Reason: "cancelled", Transition: transition}, []string{"source=scheduler", "cause=test-cause", `reason="cancelled"`}},
+		{"team_graph_bound", Event{Kind: KindTeamGraphBound, TaskID: "origin-task-1", GraphID: "graph-1", Description: "team_id=team-1 event_type=team:audit replicas=2 reused=false"}, []string{"graph=graph-1", "origin_task=origin-task-1", `desc="team_id=team-1 event_type=team:audit replicas=2 reused=false"`}},
+		{"team_stopped", Event{Kind: KindTeamStopped, GraphID: "graph-1", Reason: "graph_completed", Description: "team_id=team-1 event_type=team:audit"}, []string{"graph=graph-1", `desc="team_id=team-1 event_type=team:audit"`, `reason="graph_completed"`}},
 		{"llm_call_start", Event{Kind: KindLLMCallStart, HistoryEntries: 4, ToolCallsCount: 7}, []string{"history_entries=4", "tools=7"}},
 		{"llm_call_end", Event{Kind: KindLLMCallEnd, DurationMS: 12, PromptTokens: 13, CompletionTokens: 14, ToolCallsCount: 1, FinishReason: "tool_calls"}, []string{"duration=12ms", "prompt_tokens=13", "completion_tokens=14", "tool_calls=1", "finish_reason=tool_calls"}},
 		{"tool_call", Event{Kind: KindToolCall, Tool: "read_file", CallID: "call-1", Args: map[string]any{"path": "a.go"}}, []string{"tool=read_file", "call_id=call-1", `args={"path":"a.go"}`}},
@@ -94,8 +96,8 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"effect_recovery_decided", Event{Kind: KindEffectRecoveryDecided, TaskID: "t1", Effect: &EffectPayload{EffectID: "t1-1", Kind: "file_write", Policy: "verify_first", Decision: "verified_settled", Reason: "文件 hash 与账载一致"}}, []string{"effect=t1-1", "decision=verified_settled", `reason="文件 hash 与账载一致"`}},
 		{"acceptance_completed", Event{Kind: KindAcceptanceCompleted, GraphID: "graph-1", NodeID: "verify", ActivationID: "verify@1", TaskID: "task-9", Acceptance: &AcceptancePayload{Verdict: "pass", Status: "disputed", Checked: 2, Reason: "命令未在该任务的 shell 账中找到"}}, []string{"graph=graph-1", "node=verify", "activation=verify@1", "verdict=pass", "verify=disputed", "checked=2", `reason="命令未在该任务的 shell 账中找到"`}},
 	}
-	if len(cases) != 65 {
-		t.Fatalf("test inventory has %d built-in EventKinds, want 65", len(cases))
+	if len(cases) != 67 {
+		t.Fatalf("test inventory has %d built-in EventKinds, want 67", len(cases))
 	}
 	seen := make(map[string]struct{}, len(cases))
 	for _, tc := range cases {

@@ -66,6 +66,12 @@ const (
 	KindTaskBlocked   EventKind = "task_blocked"   // 系统确认任务不可继续后的终态（无路由 / runtime fuse）
 	KindTaskCancelled EventKind = "task_cancelled" // 外部 cancel（cancel_task 工具、watchdog、用户 /cancel）
 
+	// AgentTemplate Team lifecycle. Graph-bound Teams emit the GraphID so the
+	// graph trace can prove that resource binding predates node claims and that
+	// cleanup follows graph_ended rather than the provisioning task terminal.
+	KindTeamGraphBound EventKind = "team_graph_bound"
+	KindTeamStopped    EventKind = "team_stopped"
+
 	// KindRuntimeLoopFuseTriggered：emergency loop fuse 触发（V6，见
 	// docs/nextUpgrade-V6.md §5 升级思路 8）。固定轮数上限删除后，ReAct 循环
 	// 不再因到达轮数终止；本事件只在循环计数越过程序缺陷防御兜底
@@ -226,8 +232,8 @@ const (
 	// KindGraphEnded：图到达终态。经 end 节点完成时 Reason 为空；
 	// 失败终态（节点无出路 / 任务发布失败）时 Reason 载中文原因。
 	KindGraphEnded EventKind = "graph_ended"
-	// KindGraphJoinResolved：join 节点满足就绪条件完成归并（全部入边源的
-	// 最新 activation 终态且 ≥1 条入边已 RecordTransition 生效）。
+	// KindGraphJoinResolved：join 节点满足就绪条件完成归并（每个必需输入
+	// 端口均有实际选中边绑定到同一目标 activation；旧无端口图保留兼容 barrier）。
 	// payload：GraphID / NodeID / ActivationID，Description 载入边计数
 	// （生效入边 X/Y）。
 	KindGraphJoinResolved EventKind = "graph_join_resolved"
@@ -438,24 +444,24 @@ type SuggestionPayload struct {
 
 // EffectPayload 是 effect_prepared / effect_settled / effect_unknown /
 // effect_recovery_decided 事件（V6 §4 H2b）的 sub-payload。只载标识与摘要
-//（effect_id / kind / policy / target / args_digest / result_summary），
+// （effect_id / kind / policy / target / args_digest / result_summary），
 // 不含完整参数/命令——与 Effect Journal 账本同一脱敏纪律。
 type EffectPayload struct {
-	EffectID      string `json:"effect_id,omitempty"`       // <taskID>-<seq>
-	Kind          string `json:"kind,omitempty"`            // file_write / file_edit / shell / message / workspace_merge
-	Policy        string `json:"policy,omitempty"`          // safe_replay / verify_first / manual_only / never_replay
-	Status        string `json:"status,omitempty"`          // prepared / dispatched / settled / unknown
-	Target        string `json:"target,omitempty"`          // 目标摘要：路径 / "cmd:<digest>" / 收件人
-	ArgsDigest    string `json:"args_digest,omitempty"`     // 参数 sha256 前 12
-	ResultSummary string `json:"result_summary,omitempty"`  // exit code / bytes+hash / 合并结果
-	Decision      string `json:"decision,omitempty"`        // recovery 裁决结论
-	Reason        string `json:"reason,omitempty"`          // unknown 原因 / 裁决依据
+	EffectID      string `json:"effect_id,omitempty"`      // <taskID>-<seq>
+	Kind          string `json:"kind,omitempty"`           // file_write / file_edit / shell / message / workspace_merge
+	Policy        string `json:"policy,omitempty"`         // safe_replay / verify_first / manual_only / never_replay
+	Status        string `json:"status,omitempty"`         // prepared / dispatched / settled / unknown
+	Target        string `json:"target,omitempty"`         // 目标摘要：路径 / "cmd:<digest>" / 收件人
+	ArgsDigest    string `json:"args_digest,omitempty"`    // 参数 sha256 前 12
+	ResultSummary string `json:"result_summary,omitempty"` // exit code / bytes+hash / 合并结果
+	Decision      string `json:"decision,omitempty"`       // recovery 裁决结论
+	Reason        string `json:"reason,omitempty"`         // unknown 原因 / 裁决依据
 }
 
 // AcceptancePayload 是 acceptance_completed 事件（G1b 服务端核验）的
 // sub-payload。只载结论性字段——自报 verdict、核验 status
-//（valid/disputed/unverifiable）、实际核验条数与原因摘要；不含证据正文
-//（命令串、hash 等属核验输入，与 Effect 同一脱敏纪律）。
+// （valid/disputed/unverifiable）、实际核验条数与原因摘要；不含证据正文
+// （命令串、hash 等属核验输入，与 Effect 同一脱敏纪律）。
 type AcceptancePayload struct {
 	Verdict string `json:"verdict,omitempty"` // 验收 agent 自报结论（pass/fail/fixable/...）
 	Status  string `json:"status"`            // 核验结论：valid / disputed / unverifiable

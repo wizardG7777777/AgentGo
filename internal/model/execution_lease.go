@@ -21,9 +21,10 @@ import (
 //   - RouteCeiling：认领 Runner 的工具注册全集（rt.AllowedTools 装配产物）。
 //   - Policy：exec=readonly 从 BusinessTools 剔除写工具（write_file /
 //     edit_file / run_shell）；exec=strict 保留工具但记 ApprovalRequired=true
-//     （逐次审批语义不变）；控制通道按节点角色派生（Graph agent 节点 =
-//     {submit_task_result, request_replan}，非图执行任务 = {submit_task_result}，
-//     scheduler 控制面任务 = {report_done}）。
+//     （逐次审批语义不变）；控制通道按持久化 Graph 节点角色派生
+//     （controller/agent = {submit_task_result, request_replan}，acceptance 与
+//     GraphNodeKind 为空的旧快照 = {submit_task_result}，非图 scheduler 控制面
+//     = {report_done}）。
 //
 // 生命周期：首次认领冻结（execution_lease_frozen）→ RetryRollback 后重认领
 // 复用（execution_lease_reused，Digest 与工具面不变）→ 任务终态（含
