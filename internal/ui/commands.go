@@ -37,20 +37,18 @@ func (c CommandSpec) Usage() string {
 func CommandCatalog() []CommandSpec {
 	return []CommandSpec{
 		{Name: "help", Desc: "显示命令帮助", Scope: ScopeShared},
-		{Name: "status", Desc: "查看系统状态（代理 / 任务 / 模式）", Scope: ScopeShared},
+		{Name: "status", Desc: "查看系统状态（图 / 节点 / 模式）", Scope: ScopeShared},
 		{Name: "cancel", Args: "<task-id>", Desc: "取消任务（ID 可只输前缀）", Scope: ScopeShared},
 		{Name: "mode", Args: "[exec|topo <值>]", Desc: "切换工作模式（exec 权限轴 / topo 拓扑轴）", Scope: ScopeShared},
 		{Name: "steer", Args: "<agent-id> <消息>", Desc: "向代理发送指导", Scope: ScopeShared},
-		{Name: "new", Desc: "创建新 Session", Scope: ScopeShared},
-		{Name: "session", Args: "[编号]", Desc: "列出 / 切换 Session", Scope: ScopeShared},
+		{Name: "new", Args: "[force]", Desc: "创建新 Session（force = 终止当前 Session 全部运行内容）", Scope: ScopeShared},
+		{Name: "session", Args: "[编号]", Desc: "切换 Session（无参打开选择面板，带编号直接切换）", Scope: ScopeShared},
 		{Name: "doctor", Args: "agents", Desc: "审计代理身份与实际权限的一致性（只读，结果回显到消息流）", Scope: ScopeShared},
-		{Name: "dashboard", Aliases: []string{"dash"}, Desc: "切换到仪表板视图", Scope: ScopeTUI},
-		{Name: "chat", Desc: "切换到消息视图", Scope: ScopeTUI},
-		{Name: "activity", Desc: "查看跨代理实时动态", Scope: ScopeTUI},
-		{Name: "logs", Desc: "查看原始系统日志", Scope: ScopeTUI},
-		{Name: "trace", Desc: "查看 Trace 与工具调用", Scope: ScopeTUI},
+		{Name: "event", Args: "<graph-id> <事件名> [数据JSON]", Desc: "向图的 wait_event 节点投递外部事件（未在等待则忽略）", Scope: ScopeShared},
+		{Name: "graph", Desc: "切换到执行图全屏视图", Scope: ScopeTUI},
+		{Name: "chat", Desc: "返回会话视图（退出全屏）", Scope: ScopeTUI},
 		{Name: "result", Aliases: []string{"detail"}, Desc: "查看完整任务结果", Scope: ScopeTUI},
-		{Name: "agent", Args: "<id>", Desc: "查看代理详情", Scope: ScopeTUI},
+		{Name: "node", Args: "<id>", Desc: "查看当前图的节点详情", Scope: ScopeTUI},
 		{Name: "quit", Desc: "退出系统", Scope: ScopeTUI},
 	}
 }

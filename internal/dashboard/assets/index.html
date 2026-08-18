@@ -661,6 +661,17 @@ async function runCommand(line) {
         toast("代理审计任务已创建：" + (d.task_id || "-") + "，报告将作为任务结果回显", false);
         break;
       }
+      case "event": {
+        if (!args[0] || !args[1]) { toast("用法：/event <graph-id> <事件名> [数据JSON]", true); return; }
+        let evData = null;
+        if (args.length > 2) {
+          try { evData = JSON.parse(args.slice(2).join(" ")); }
+          catch (e) { toast("数据不是合法 JSON：" + e.message, true); return; }
+        }
+        await postJSON("/api/graphs/event", { graph_id: args[0], event: args[1], data: evData });
+        toast(`已投递事件 "${args[1]}" → 图 ${args[0]}（节点未在等待时事件被忽略）`, false);
+        break;
+      }
       case "new": {
         const d = await postJSON("/api/session/new");
         if (d.session_id) $("session").textContent = d.session_id;

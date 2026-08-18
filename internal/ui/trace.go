@@ -18,21 +18,24 @@ import (
 // trace.Event 本身体积大且字段随 kind 高度稀疏（Args map、ShellExec 子结构等），
 // 全量透传给浏览器没有收益——完整事件永远在 trace JSONL 里可查。
 type TraceEvent struct {
-	Kind                   string    `json:"kind"`
-	TaskID                 string    `json:"task_id,omitempty"`
-	AgentID                string    `json:"agent_id,omitempty"`
-	Loop                   int       `json:"loop,omitempty"`
-	Tool                   string    `json:"tool,omitempty"`
-	CallID                 string    `json:"call_id,omitempty"`
-	ArgsSummary            string    `json:"args_summary,omitempty"`
-	Outcome                string    `json:"outcome,omitempty"` // running | success | error
-	ResultLen              int       `json:"result_len,omitempty"`
-	Message                string    `json:"message,omitempty"` // Error / Reason / Description 首个非空
-	Path                   string    `json:"path,omitempty"`    // file_written 等文件事件
-	DurationMS             int64     `json:"duration_ms,omitempty"`
-	PromptTokens           int       `json:"prompt_tokens,omitempty"`
-	CompletionTokens       int       `json:"completion_tokens,omitempty"`
-	At                     time.Time `json:"at"`
+	Kind             string    `json:"kind"`
+	TaskID           string    `json:"task_id,omitempty"`
+	AgentID          string    `json:"agent_id,omitempty"`
+	GraphID          string    `json:"graph_id,omitempty"`
+	NodeID           string    `json:"node_id,omitempty"`
+	ActivationID     string    `json:"activation_id,omitempty"`
+	Loop             int       `json:"loop,omitempty"`
+	Tool             string    `json:"tool,omitempty"`
+	CallID           string    `json:"call_id,omitempty"`
+	ArgsSummary      string    `json:"args_summary,omitempty"`
+	Outcome          string    `json:"outcome,omitempty"` // running | success | error
+	ResultLen        int       `json:"result_len,omitempty"`
+	Message          string    `json:"message,omitempty"` // Error / Reason / Description 首个非空
+	Path             string    `json:"path,omitempty"`    // file_written 等文件事件
+	DurationMS       int64     `json:"duration_ms,omitempty"`
+	PromptTokens     int       `json:"prompt_tokens,omitempty"`
+	CompletionTokens int       `json:"completion_tokens,omitempty"`
+	At               time.Time `json:"at"`
 }
 
 // ProjectTraceEvent 把 trace.Event 投影为 TraceEvent（导出以便 dashboard
@@ -53,6 +56,9 @@ func ProjectTraceEvent(ev trace.Event) TraceEvent {
 		Kind:             string(ev.Kind),
 		TaskID:           ev.TaskID,
 		AgentID:          ev.AgentID,
+		GraphID:          ev.GraphID,
+		NodeID:           ev.NodeID,
+		ActivationID:     ev.ActivationID,
 		Loop:             ev.Loop,
 		Tool:             ev.Tool,
 		CallID:           ev.CallID,

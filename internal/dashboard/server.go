@@ -124,6 +124,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/session/new", s.handlePostSessionNew)
 	mux.HandleFunc("/api/session/switch", s.handlePostSessionSwitch)
 	mux.HandleFunc("/api/doctor/agents", s.handlePostDoctorAgents)
+	mux.HandleFunc("/api/graphs/event", s.handlePostGraphEvent)
 	return s.authMiddleware(mux)
 }
 
@@ -248,6 +249,32 @@ func writeControlError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeJSONError(w, http.StatusBadRequest, err.Error())
+}
+
+// handlePostGraphEvent 投递图外部事件：{graph_id, event, data?} →
+// Controller.EmitGraphEvent。时点信号语义：未命中 waiting 的 wait_event
+// 节点（未等待 / 图终态 / 会话冻结）时静默忽略，仍返回 ok。
+func (s *Server) handlePostGraphEvent(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r) || !s.controlAvailable(w) {
+		return
+	}
+	var body struct {
+		GraphID string         `json:"graph_id"`
+		Event   string         `json:"event"`
+		Data    map[string]any `json:"data"`
+	}
+	if !decodeControlBody(w, r, &body) {
+		return
+	}
+	if strings.TrimSpace(body.GraphID) == "" || strings.TrimSpace(body.Event) == "" {
+		writeJSONError(w, http.StatusBadRequest, "graph_id 与 event 不能为空")
+		return
+	}
+	if err := s.controller.EmitGraphEvent(body.GraphID, body.Event, body.Data); err != nil {
+		writeControlError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // handlePostInput 投递用户输入：{text} → Controller.SendUserText。
@@ -453,8 +480,24 @@ func writeInteractionError(w http.ResponseWriter, request ui.InteractionResult, 
 }
 
 // handlePostSessionNew 创建并切换到新 Session：→ {session_id}。
+// 可选请求体 {force: true}：先终止当前 Session 的全部运行内容再新建。
 func (s *Server) handlePostSessionNew(w http.ResponseWriter, r *http.Request) {
 	if !requirePost(w, r) || !s.controlAvailable(w) {
+		return
+	}
+	var body struct {
+		Force bool `json:"force"`
+	}
+	if r.ContentLength > 0 && !decodeControlBody(w, r, &body) {
+		return
+	}
+	if body.Force {
+		id, err := s.controller.NewSessionForce()
+		if err != nil {
+			writeControlError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"session_id": id})
 		return
 	}
 	id, err := s.controller.NewSession()
@@ -562,6 +605,7 @@ type updateWire struct {
 	Interactions *[]ui.InteractionItem `json:"interactions,omitempty"`
 	Agents       []ui.AgentCard        `json:"agents,omitempty"`
 	Tasks        []ui.BoardTask        `json:"tasks,omitempty"`
+	Graphs       []ui.GraphView        `json:"graphs,omitempty"`
 	Turns        *[]ui.AgentTurn       `json:"turns,omitempty"`
 	Snapshot     *ui.Snapshot          `json:"snapshot,omitempty"`
 	Trace        *ui.TraceEvent        `json:"trace,omitempty"`
@@ -621,6 +665,7 @@ func encodeUpdate(u ui.Update) ([]byte, error) {
 	case ui.KindAgentsChanged:
 		w.Agents = u.Agents
 		w.Tasks = u.Tasks
+		w.Graphs = u.Graphs
 	case ui.KindTraceEvent:
 		w.Trace = &u.Trace
 	}

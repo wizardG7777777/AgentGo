@@ -73,7 +73,7 @@ func TestCommandCatalog_SharedSetComplete(t *testing.T) {
 }
 
 func TestCommandCatalog_LayeredTUIViewsComplete(t *testing.T) {
-	for _, name := range []string{"activity", "logs", "trace"} {
+	for _, name := range []string{"graph", "node"} {
 		c, ok := MatchCommand(name)
 		if !ok {
 			t.Fatalf("目录缺少分层视图命令 /%s", name)
@@ -85,16 +85,19 @@ func TestCommandCatalog_LayeredTUIViewsComplete(t *testing.T) {
 }
 
 func TestMatchCommand_Alias(t *testing.T) {
-	c, ok := MatchCommand("dash")
-	if !ok || c.Name != "dashboard" {
-		t.Fatalf("别名 dash 应解析到 dashboard，得到 %+v, %v", c, ok)
-	}
-	c, ok = MatchCommand("DETAIL") // 大小写不敏感
+	c, ok := MatchCommand("DETAIL") // 大小写不敏感
 	if !ok || c.Name != "result" {
 		t.Fatalf("别名 detail 应解析到 result，得到 %+v, %v", c, ok)
 	}
 	if _, ok = MatchCommand("command"); ok {
 		t.Fatal("/command 不是有效命令，不应解析成功（占位符曾误导用户输入它）")
+	}
+	// 已退役的命令不应再解析：/dashboard 由 /graph 取代，诊断三视图
+	// （/activity /logs /trace）已移除，诊断统一走 trace CLI 与 Web。
+	for _, retired := range []string{"dashboard", "dash", "activity", "logs", "trace"} {
+		if _, ok = MatchCommand(retired); ok {
+			t.Fatalf("/%s 已退役，不应再解析成功", retired)
+		}
 	}
 }
 

@@ -50,6 +50,11 @@ type Controller interface {
 	SetTopoMode(mode string) error
 	// NewSession 创建并切换到新 Session，返回新 Session ID。
 	NewSession() (string, error)
+	// NewSessionForce 强制终止当前 Session 的全部运行内容（存活 Graph
+	// 终结、非终态任务取消、spawn 拆除、pending Interaction 中断、
+	// Roster/Mailbox 清空）后创建新 Session，返回新 Session ID。
+	// 与 NewSession 的连续语义不同，这是破坏性重置。
+	NewSessionForce() (string, error)
 	// SwitchSession 切换到指定 Session；changed=false 表示目标已经是当前
 	// Session，调用是无副作用 no-op。
 	SwitchSession(id string) (changed bool, err error)
@@ -63,6 +68,10 @@ type Controller interface {
 	// 运行模式/路由状态）的任务，返回审计任务 ID；审计报告作为普通任务
 	// 结果回显。无 Scheduler 或装配缺失时返回中文错误。
 	RequestAgentAudit() (taskID string, err error)
+	// EmitGraphEvent 向指定图的 wait_event 节点投递外部事件
+	// （/event 与 Web POST /api/graphs/event 的后端）。时点信号语义：
+	// 未命中等待中节点时静默忽略，不视为错误。
+	EmitGraphEvent(graphID, event string, data map[string]any) error
 	// RequestQuit 请求退出系统。
 	RequestQuit()
 }
@@ -165,6 +174,28 @@ func (h *Hub) NewSession() (string, error) {
 	return h.deps.SessionNew()
 }
 
+// NewSessionForce 委托注入的强制新建入口（bootstrap System.NewSessionForce）：
+// 终止当前 Session 的全部运行内容后开新 Session，破坏性重置。
+func (h *Hub) NewSessionForce() (string, error) {
+	if h.deps.SessionNewForce == nil {
+		return "", notAssembled("SessionNewForce")
+	}
+	return h.deps.SessionNewForce()
+}
+
+// ResetSessionObservations 在 /new force 终止当前 Session 后调用：清空进程内
+// 实时窗口（feed），并把 session 级 token 累加器归零——它们属于刚终结的
+// Session，不带入新 Session。轮次账本（turns）由 ensureTurnsSession 在下一次
+// 轮询发现 Session ID 变化时重载，无需在此处理。
+func (h *Hub) ResetSessionObservations() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.feed = FeedSnapshot{}
+	h.sessionPromptTokens = 0
+	h.sessionCompletionTokens = 0
+	h.sessionCallCount = 0
+}
+
 // SwitchSession 委托注入的 Session 切换入口。
 func (h *Hub) SwitchSession(id string) (bool, error) {
 	if h.deps.SessionSwitch == nil {
@@ -206,4 +237,14 @@ func (h *Hub) RequestQuit() {
 		return
 	}
 	h.deps.QuitFn()
+}
+
+// EmitGraphEvent 委托注入的图外部事件入口（graph.Runtime.OnExternalEvent）。
+// 命中与否的判定（waiting 匹配 / 终态忽略 / 冻结吞掉）全部在 Runtime
+// 内部闸门完成，Hub 与调用方不感知。
+func (h *Hub) EmitGraphEvent(graphID, event string, data map[string]any) error {
+	if h.deps.EmitGraphEvent == nil {
+		return notAssembled("EmitGraphEvent")
+	}
+	return h.deps.EmitGraphEvent(graphID, event, data)
 }

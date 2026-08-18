@@ -30,15 +30,15 @@ func TestHubTurnHistoryUpsertsStreamsAndPersistsCompletedTurns(t *testing.T) {
 
 	outCh <- output.Event{
 		Kind: output.KindStream, StreamID: "turn-1", AgentID: "worker-1",
-		TaskID: "task-1", Loop: 1, Text: "第",
+		TaskID: "task-1", Loop: 1, Text: "第", Reasoning: "先",
 	}
 	outCh <- output.Event{
 		Kind: output.KindStream, StreamID: "turn-1", AgentID: "worker-1",
-		TaskID: "task-1", Loop: 1, Text: "第一轮完整正文",
+		TaskID: "task-1", Loop: 1, Text: "第一轮完整正文", Reasoning: "先分析再执行",
 	}
 	outCh <- output.Event{
 		Kind: output.KindTurn, StreamID: "turn-1", AgentID: "worker-1",
-		TaskID: "task-1", Loop: 1, Text: "第一轮完整正文",
+		TaskID: "task-1", Loop: 1, Text: "第一轮完整正文", Reasoning: "先分析再执行",
 		ToolCalls: []string{"read_file"}, Done: true,
 	}
 	outCh <- output.Event{
@@ -53,12 +53,18 @@ func TestHubTurnHistoryUpsertsStreamsAndPersistsCompletedTurns(t *testing.T) {
 		return len(snap.Turns) == 2 && len(appended) == 2
 	})
 	got := h.Snapshot().Turns
-	if got[0].ID != "turn-1" || got[0].Text != "第一轮完整正文" ||
+	if got[0].ID != "turn-1" || got[0].Text != "第一轮完整正文" || got[0].Reasoning != "先分析再执行" ||
 		got[0].Status != "completed" || len(got[0].ToolCalls) != 1 {
 		t.Fatalf("同轮流式快照未原位合并并冻结: %+v", got[0])
 	}
 	if got[1].AgentID != "scheduler-1" || got[1].Loop != 2 {
 		t.Fatalf("Scheduler 轮次未走共享历史链路: %+v", got[1])
+	}
+	mu.Lock()
+	persistedReasoning := appended[0].Reasoning
+	mu.Unlock()
+	if persistedReasoning != "先分析再执行" {
+		t.Fatalf("完成轮次未持久化 reasoning: %q", persistedReasoning)
 	}
 
 	// 重复终态事件不得重复追加账本。

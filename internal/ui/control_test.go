@@ -259,8 +259,9 @@ func TestController_CancelLatestRequest(t *testing.T) {
 func TestController_Sessions(t *testing.T) {
 	var switched string
 	h := NewHub(Deps{
-		SessionNew:    func() (string, error) { return "sess-new", nil },
-		SessionSwitch: func(id string) (bool, error) { switched = id; return true, nil },
+		SessionNew:      func() (string, error) { return "sess-new", nil },
+		SessionNewForce: func() (string, error) { return "sess-force", nil },
+		SessionSwitch:   func(id string) (bool, error) { switched = id; return true, nil },
 		SessionList: func() ([]SessionInfo, error) {
 			return []SessionInfo{{ID: "sess-1"}, {ID: "sess-2"}}, nil
 		},
@@ -269,6 +270,10 @@ func TestController_Sessions(t *testing.T) {
 	id, err := h.NewSession()
 	if err != nil || id != "sess-new" {
 		t.Fatalf("NewSession = %q, %v", id, err)
+	}
+	id, err = h.NewSessionForce()
+	if err != nil || id != "sess-force" {
+		t.Fatalf("NewSessionForce = %q, %v", id, err)
 	}
 	if changed, err := h.SwitchSession("sess-1"); err != nil || !changed || switched != "sess-1" {
 		t.Fatalf("SwitchSession changed=%v err=%v switched=%q", changed, err, switched)
@@ -282,6 +287,9 @@ func TestController_Sessions(t *testing.T) {
 	h = NewHub(Deps{})
 	if _, err := h.NewSession(); !errors.Is(err, ErrNotAssembled) {
 		t.Fatalf("NewSession err = %v", err)
+	}
+	if _, err := h.NewSessionForce(); !errors.Is(err, ErrNotAssembled) {
+		t.Fatalf("NewSessionForce err = %v", err)
 	}
 	if _, err := h.SwitchSession("x"); !errors.Is(err, ErrNotAssembled) {
 		t.Fatalf("SwitchSession err = %v", err)
@@ -300,4 +308,23 @@ func TestController_RequestQuit(t *testing.T) {
 	}
 	// 未装配时静默忽略，不得 panic
 	NewHub(Deps{}).RequestQuit()
+}
+
+func TestController_EmitGraphEvent(t *testing.T) {
+	var gotGraph, gotEvent string
+	var gotData map[string]any
+	h := NewHub(Deps{EmitGraphEvent: func(graphID, event string, data map[string]any) error {
+		gotGraph, gotEvent, gotData = graphID, event, data
+		return nil
+	}})
+	if err := h.EmitGraphEvent("g-1", "deploy.done", map[string]any{"ok": true}); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if gotGraph != "g-1" || gotEvent != "deploy.done" || gotData["ok"] != true {
+		t.Fatalf("委托入参错误: %q %q %v", gotGraph, gotEvent, gotData)
+	}
+	// 未装配返回 ErrNotAssembled。
+	if err := NewHub(Deps{}).EmitGraphEvent("g-1", "e", nil); !errors.Is(err, ErrNotAssembled) {
+		t.Fatalf("err = %v，期望 ErrNotAssembled", err)
+	}
 }

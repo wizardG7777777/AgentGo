@@ -35,6 +35,7 @@ type fakeController struct {
 	topoModeErr         error
 	newSessID           string
 	newSessErr          error
+	newForceCalls       int
 	switchID            string
 	switchChanged       bool
 	switchErr           error
@@ -47,6 +48,10 @@ type fakeController struct {
 	auditTaskID         string
 	auditErr            error
 	auditCalls          int
+	graphEventGraphID   string
+	graphEventName      string
+	graphEventData      map[string]any
+	graphEventErr       error
 	quitCalled          bool
 }
 
@@ -82,6 +87,11 @@ func (f *fakeController) SetTopoMode(mode string) error {
 
 func (f *fakeController) NewSession() (string, error) { return f.newSessID, f.newSessErr }
 
+func (f *fakeController) NewSessionForce() (string, error) {
+	f.newForceCalls++
+	return f.newSessID, f.newSessErr
+}
+
 func (f *fakeController) SwitchSession(id string) (bool, error) {
 	f.switchID = id
 	return f.switchChanged, f.switchErr
@@ -107,6 +117,11 @@ func (f *fakeController) RespondInteraction(_ context.Context, input interaction
 func (f *fakeController) RequestAgentAudit() (string, error) {
 	f.auditCalls++
 	return f.auditTaskID, f.auditErr
+}
+
+func (f *fakeController) EmitGraphEvent(graphID, event string, data map[string]any) error {
+	f.graphEventGraphID, f.graphEventName, f.graphEventData = graphID, event, data
+	return f.graphEventErr
 }
 
 func (f *fakeController) RequestQuit() { f.quitCalled = true }
@@ -164,6 +179,20 @@ func TestControlEndpoints_MapToController(t *testing.T) {
 		}
 		if body["ok"] != true {
 			t.Fatalf("body=%v", body)
+		}
+	})
+
+	t.Run("graphs/event", func(t *testing.T) {
+		status, body := post(t, ts, "/api/graphs/event", "", `{"graph_id":"g-1","event":"deploy.done","data":{"ok":true}}`)
+		if status != http.StatusOK {
+			t.Fatalf("status=%d body=%v", status, body)
+		}
+		if fc.graphEventGraphID != "g-1" || fc.graphEventName != "deploy.done" || fc.graphEventData["ok"] != true {
+			t.Fatalf("映射入参错误: %+v", fc)
+		}
+		// graph_id / event 为空应 400。
+		if status, _ := post(t, ts, "/api/graphs/event", "", `{"graph_id":"","event":""}`); status != http.StatusBadRequest {
+			t.Fatalf("空参数应 400，实际 %d", status)
 		}
 	})
 
@@ -241,6 +270,25 @@ func TestControlEndpoints_MapToController(t *testing.T) {
 		status, body := post(t, ts, "/api/session/new", "", "")
 		if status != http.StatusOK || body["session_id"] != "sess-new" {
 			t.Fatalf("status=%d body=%v", status, body)
+		}
+	})
+
+	t.Run("session/new force", func(t *testing.T) {
+		before := fc.newForceCalls
+		status, body := post(t, ts, "/api/session/new", "", `{"force":true}`)
+		if status != http.StatusOK || fc.newForceCalls != before+1 {
+			t.Fatalf("status=%d newForceCalls=%d, want 递增 1", status, fc.newForceCalls)
+		}
+		if body["session_id"] != "sess-new" {
+			t.Fatalf("body=%v", body)
+		}
+	})
+
+	t.Run("session/new 空 body 不走 force", func(t *testing.T) {
+		before := fc.newForceCalls
+		status, _ := post(t, ts, "/api/session/new", "", "")
+		if status != http.StatusOK || fc.newForceCalls != before {
+			t.Fatalf("空 body 不应走 force 路径: status=%d newForceCalls=%d", status, fc.newForceCalls)
 		}
 	})
 

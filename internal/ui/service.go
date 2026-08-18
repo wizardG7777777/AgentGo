@@ -48,6 +48,8 @@ type Deps struct {
 	PollAgents func() []AgentCard
 	// PollBoard 返回当前任务看板。
 	PollBoard func() []BoardTask
+	// PollGraphs 返回 GraphStore 当前全部图的前端安全投影。
+	PollGraphs func() []GraphView
 	// PollInterval 是快照轮询间隔；<=0 时使用 DefaultPollInterval。
 	PollInterval time.Duration
 	// ExecModeGet 返回当前执行权限模式（"normal" / "strict" / "readonly" / "yolo"）。
@@ -94,6 +96,9 @@ type Deps struct {
 	TopoModeSet func(mode string) error
 	// SessionNew 创建并切换到新 Session，返回新 Session ID。
 	SessionNew func() (string, error)
+	// SessionNewForce 强制终止当前 Session 的全部运行内容后创建新
+	// Session（/new force；破坏性重置，详见 bootstrap System.NewSessionForce）。
+	SessionNewForce func() (string, error)
 	// SessionSwitch 切换到指定 Session；changed=false 表示同 Session no-op。
 	SessionSwitch func(id string) (changed bool, err error)
 	// SessionList 返回全部 Session 信息。
@@ -105,6 +110,12 @@ type Deps struct {
 	// /doctor agents），返回审计任务 ID。审计包（各 agent 的身份/prompt
 	// 摘要/真实工具面/运行模式/路由状态 + 只读指令）由装配方构建。
 	RequestAgentAudit func() (taskID string, err error)
+	// EmitGraphEvent 向指定图投递外部事件（graph.Runtime.OnExternalEvent）：
+	// 命中 status=waiting 且事件名相同的 wait_event 节点即以其 data 为
+	// Result 结算。事件是时点信号、无持久收件箱——节点未在等待、图已终态
+	// 或所属 Session 冻结时到达均视为未发生（由 Runtime 内部闸门处理，
+	// 调用方无法也无需区分命中与否）。
+	EmitGraphEvent func(graphID, event string, data map[string]any) error
 	// QuitFn 是退出入口（对应 tui 的 /quit → CancelFn）。
 	QuitFn func()
 }
@@ -256,6 +267,7 @@ func (h *Hub) Run(ctx context.Context) {
 				Kind:                    KindAgentsChanged,
 				Agents:                  snap.Agents,
 				Tasks:                   snap.Tasks,
+				Graphs:                  snap.Graphs,
 				SessionPromptTokens:     snap.SessionPromptTokens,
 				SessionCompletionTokens: snap.SessionCompletionTokens,
 				SessionCallCount:        snap.SessionCallCount,
@@ -359,7 +371,8 @@ func feedOutputFromEvent(ev output.Event, at time.Time) FeedOutput {
 	}
 	return FeedOutput{
 		Kind: kind, AgentID: ev.AgentID, TaskID: ev.TaskID, StreamID: ev.StreamID,
-		Loop: ev.Loop, Text: ev.Text, Done: ev.Done, Error: ev.Error, At: at,
+		Loop: ev.Loop, Text: ev.Text, Reasoning: ev.Reasoning,
+		Done: ev.Done, Error: ev.Error, At: at,
 	}
 }
 
@@ -467,6 +480,9 @@ func (h *Hub) recordTurnEvent(ev output.Event, sessionID string, at time.Time) {
 	if ev.Text != "" || turn.Text == "" {
 		turn.Text = ev.Text
 	}
+	if ev.Reasoning != "" || turn.Reasoning == "" {
+		turn.Reasoning = ev.Reasoning
+	}
 	if ev.Error != "" {
 		turn.Error = ev.Error
 	}
@@ -504,6 +520,7 @@ func (h *Hub) queueDetachedTurn(ev output.Event, sessionID string, at time.Time)
 		TaskID:      ev.TaskID,
 		Loop:        ev.Loop,
 		Text:        ev.Text,
+		Reasoning:   ev.Reasoning,
 		Status:      status,
 		ToolCalls:   append([]string(nil), ev.ToolCalls...),
 		StartedAt:   at,
@@ -574,6 +591,9 @@ func (h *Hub) refreshSnapshot() bool {
 	}
 	if h.deps.PollBoard != nil {
 		snap.Tasks = h.deps.PollBoard()
+	}
+	if h.deps.PollGraphs != nil {
+		snap.Graphs = h.deps.PollGraphs()
 	}
 	if h.deps.ExecModeGet != nil {
 		snap.ExecMode = h.deps.ExecModeGet()

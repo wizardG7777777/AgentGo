@@ -44,20 +44,22 @@ type ResultItem struct {
 // string kind so Web/TUI snapshots can rebuild per-agent workbenches after a
 // reconnect without replaying edge-triggered updates.
 type FeedOutput struct {
-	Kind     string    `json:"kind"` // "result" | "text" | "stream"
-	AgentID  string    `json:"agent_id,omitempty"`
-	TaskID   string    `json:"task_id,omitempty"`
-	StreamID string    `json:"stream_id,omitempty"`
-	Loop     int       `json:"loop,omitempty"`
-	Text     string    `json:"text"`
-	Done     bool      `json:"done,omitempty"`
-	Error    string    `json:"error,omitempty"`
-	At       time.Time `json:"at"`
+	Kind      string    `json:"kind"` // "result" | "text" | "stream"
+	AgentID   string    `json:"agent_id,omitempty"`
+	TaskID    string    `json:"task_id,omitempty"`
+	StreamID  string    `json:"stream_id,omitempty"`
+	Loop      int       `json:"loop,omitempty"`
+	Text      string    `json:"text"`
+	Reasoning string    `json:"reasoning,omitempty"`
+	Done      bool      `json:"done,omitempty"`
+	Error     string    `json:"error,omitempty"`
+	At        time.Time `json:"at"`
 }
 
-// AgentTurn 是一次 LLM 调用的公开输出事实。streaming 记录只在进程内
+// AgentTurn 是一次 LLM 调用的用户可见输出事实。streaming 记录只在进程内
 // 原位更新；completed/failed 记录由 Session turns.jsonl 持久化且不可变。
-// ToolCalls 仅含工具名，完整参数和结果仍以 trace 为准。
+// Reasoning 是 provider 返回的原始明文思维链；ToolCalls 仅含工具名，完整参数
+// 和结果仍以 trace 为准。
 type AgentTurn struct {
 	ID          string    `json:"id"`
 	SessionID   string    `json:"session_id,omitempty"`
@@ -65,6 +67,7 @@ type AgentTurn struct {
 	TaskID      string    `json:"task_id,omitempty"`
 	Loop        int       `json:"loop"`
 	Text        string    `json:"text"`
+	Reasoning   string    `json:"reasoning,omitempty"`
 	Status      string    `json:"status"` // streaming | completed | failed
 	ToolCalls   []string  `json:"tool_calls,omitempty"`
 	StartedAt   time.Time `json:"started_at"`
@@ -100,8 +103,8 @@ const (
 	KindOutputResult
 	// KindOutputText 是普通代理输出（对应 output.KindText）。
 	KindOutputText
-	// KindOutputStream is a replace-in-place snapshot of an in-flight model
-	// answer (corresponding to output.KindStream).
+	// KindOutputStream is a replace-in-place snapshot of in-flight model
+	// reasoning and answer text (corresponding to output.KindStream).
 	KindOutputStream
 	// KindOutputTurn 是一次 LLM 调用完成后的不可变轮次事实。
 	KindOutputTurn
@@ -157,7 +160,7 @@ func (k UpdateKind) String() string {
 //   - KindTurnsChanged      → Turns（完整 Session 轮次列表）
 //   - KindLogLine           → LogLine
 //   - KindInteractionsChanged → Interactions（完整 pending 列表）
-//   - KindAgentsChanged     → Agents + Tasks
+//   - KindAgentsChanged     → Agents + Tasks + Graphs
 //   - KindTraceEvent        → Trace
 type Update struct {
 	Kind    UpdateKind
@@ -167,6 +170,7 @@ type Update struct {
 	Interactions []InteractionItem
 	Agents       []AgentCard // KindAgentsChanged
 	Tasks        []BoardTask // KindAgentsChanged
+	Graphs       []GraphView // KindAgentsChanged
 	Turns        []AgentTurn // KindTurnsChanged
 	// Session 级 token 累计（KindAgentsChanged 随轮询节拍携带，语义同
 	// Snapshot.SessionPromptTokens 等字段；其它 Kind 为零值）。
@@ -239,27 +243,87 @@ type AgentToolActivity struct {
 
 // BoardTask 是任务看板 / 侧边栏需要的一行任务信息，由 model.Task 映射而来。
 type BoardTask struct {
-	ID        string    `json:"id"`
-	Desc      string    `json:"desc"`
-	Status    string    `json:"status"`
-	EventType string    `json:"event_type"`
-	Agents    []string  `json:"agents"`
-	Priority  int       `json:"priority"`
-	CreatedAt time.Time `json:"created_at"`
+	ID           string    `json:"id"`
+	Desc         string    `json:"desc"`
+	Status       string    `json:"status"`
+	EventType    string    `json:"event_type"`
+	Agents       []string  `json:"agents"`
+	Priority     int       `json:"priority"`
+	CreatedAt    time.Time `json:"created_at"`
+	GraphID      string    `json:"graph_id,omitempty"`
+	NodeID       string    `json:"node_id,omitempty"`
+	ActivationID string    `json:"activation_id,omitempty"`
 }
 
 // BoardTaskFromModel 把 model.Task 映射为 BoardTask，供 bootstrap 装配
 // PollBoard 时使用（也便于测试直接构造）。
 func BoardTaskFromModel(t model.Task) BoardTask {
 	return BoardTask{
-		ID:        t.ID,
-		Desc:      t.Description,
-		Status:    string(t.Status),
-		EventType: t.EventType,
-		Agents:    t.Agents,
-		Priority:  t.Priority,
-		CreatedAt: t.CreatedAt,
+		ID:           t.ID,
+		Desc:         t.Description,
+		Status:       string(t.Status),
+		EventType:    t.EventType,
+		Agents:       t.Agents,
+		Priority:     t.Priority,
+		CreatedAt:    t.CreatedAt,
+		GraphID:      t.GraphID,
+		NodeID:       t.NodeID,
+		ActivationID: t.ActivationID,
 	}
+}
+
+// GraphView 是 GraphStore 权威状态面向前端的只读投影。它只包含展示、
+// 选择节点和关联执行活动所需的信息；完整 GraphDocument 仍由 GraphStore
+// 持有，前端不能通过该投影修改图定义或运行状态。
+type GraphView struct {
+	GraphID      string          `json:"graph_id"`
+	Revision     int64           `json:"revision"`
+	StateVersion int64           `json:"state_version"`
+	Status       string          `json:"status"`
+	Root         string          `json:"root"`
+	Digest       string          `json:"digest,omitempty"`
+	Degraded     bool            `json:"degraded,omitempty"`
+	SessionID    string          `json:"session_id,omitempty"` // 图的 session 归属（空串 = 尚未归并的历史图）
+	Nodes        []GraphNodeView `json:"nodes"`
+	Edges        []GraphEdgeView `json:"edges"`
+}
+
+// GraphNodeView 是当前节点及其最新 activation 的前端安全状态。回边重进时
+// ActivationID 会变化，因此前端选择身份必须使用 graph_id + node_id +
+// activation_id，而不能只按 AgentID 绑定。
+type GraphNodeView struct {
+	NodeID             string     `json:"node_id"`
+	Kind               string     `json:"kind"`
+	Title              string     `json:"title"`
+	Description        string     `json:"description,omitempty"`
+	Status             string     `json:"status"`
+	Root               bool       `json:"root,omitempty"`
+	AgentID            string     `json:"agent_id,omitempty"`
+	TaskID             string     `json:"task_id,omitempty"`
+	ActivationID       string     `json:"activation_id,omitempty"`
+	DefinitionRevision int64      `json:"definition_revision,omitempty"`
+	Phase              string     `json:"phase,omitempty"`
+	ResultRef          string     `json:"result_ref,omitempty"`
+	ResultSummary      string     `json:"result_summary,omitempty"`
+	Reason             string     `json:"reason,omitempty"`
+	WaitEvent          string     `json:"wait_event,omitempty"`
+	WaitDeadline       *time.Time `json:"wait_deadline,omitempty"`
+	RequestID          string     `json:"request_id,omitempty"`
+	ChildGraphID       string     `json:"child_graph_id,omitempty"`
+}
+
+// GraphEdgeView 同时表示当前定义中的边和 GraphStore 已持久化的选择事实。
+// Traversed 表示至少有一次 activation 经过该边；Current 表示当前来源
+// activation 选择了该边。
+type GraphEdgeView struct {
+	From               string `json:"from"`
+	To                 string `json:"to"`
+	Index              int    `json:"index"`
+	When               string `json:"when,omitempty"`
+	Traversed          bool   `json:"traversed,omitempty"`
+	Current            bool   `json:"current,omitempty"`
+	SourceActivationID string `json:"source_activation_id,omitempty"`
+	TargetActivationID string `json:"target_activation_id,omitempty"`
 }
 
 // SessionInfo 是 Session 列表 / 当前 Session 的展示信息，
@@ -294,6 +358,7 @@ func SessionInfoFromMetadata(m session.Metadata) SessionInfo {
 type Snapshot struct {
 	Agents              []AgentCard       `json:"agents"`
 	Tasks               []BoardTask       `json:"tasks"`
+	Graphs              []GraphView       `json:"graphs"`
 	ExecMode            string            `json:"exec_mode"` // "normal" | "strict" | "readonly" | "yolo"（由注入的 ExecModeGet 决定）
 	TopoMode            string            `json:"topo_mode"` // "team" | "solo"（由注入的 TopoModeGet 决定）
 	Session             SessionInfo       `json:"session"`
