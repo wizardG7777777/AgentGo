@@ -7,6 +7,9 @@
 //   - 双响应形态：一次性 JSON 与 SSE 流式（stream: true 步骤），均严格按
 //     OpenAI Chat Completions wire 格式产出（含 tool_calls 与 usage）；
 //   - 可脚本化异常：HTTP 错误（429/500/401 等）与 finish_reason=length 截断；
+//   - 工具结果占位：响应中任意字符串可用
+//     {{latest_tool_result.<field>}} 引用当前请求最近一条 tool message
+//     的 JSON content，供随机 runtime 身份串联后续脚本步骤；
 //   - 请求记录：每个到达的请求留存原始体、车道、模型、工具清单与命中步骤，
 //     供评测断言请求形态。
 //
@@ -19,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -219,8 +223,8 @@ func (s *Server) Records() []RecordedRequest {
 
 // chatRequest 是请求体的最小解码（只取记录与响应所需的字段）。
 type chatRequest struct {
-	Model    string `json:"model"`
-	Stream   bool   `json:"stream"`
+	Model    string            `json:"model"`
+	Stream   bool              `json:"stream"`
 	Messages []json.RawMessage `json:"messages"`
 	Tools    []struct {
 		Function struct {
@@ -228,6 +232,13 @@ type chatRequest struct {
 		} `json:"function"`
 	} `json:"tools"`
 }
+
+type chatMessage struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+var latestToolResultPlaceholder = regexp.MustCompile(`\{\{latest_tool_result\.([A-Za-z0-9_.-]+)\}\}`)
 
 // handle 是唯一的 HTTP 入口：任何 POST 都按 chat completion 处理
 // （openai-go 会把 base_url 拼成 <base>/chat/completions，这里不校验路径，
@@ -268,6 +279,12 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	if step != nil {
 		resp = step.Respond
 	}
+	expanded, err := expandResponse(resp, req.Messages)
+	if err != nil {
+		http.Error(w, "fake-llm 展开响应占位符失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	resp = expanded
 	if resp.Error != nil {
 		writeError(w, resp.Error)
 		return
@@ -277,6 +294,156 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeOneShot(w, req.Model, resp, seq)
+}
+
+// expandResponse 对响应规格做脱离原脚本的深拷贝，并递归展开其中
+// 的 latest_tool_result 字符串占位符。不就地改脚本：repeat 步骤每次
+// 都必须基于本次请求的工具结果重新展开。
+func expandResponse(resp ResponseSpec, messages []json.RawMessage) (ResponseSpec, error) {
+	encoded, _ := json.Marshal(resp)
+	if !strings.Contains(string(encoded), "{{latest_tool_result.") {
+		return resp, nil
+	}
+	latest, err := latestToolResult(messages)
+	if err != nil {
+		return ResponseSpec{}, err
+	}
+	expand := func(raw string) (string, error) {
+		return expandString(raw, latest)
+	}
+
+	out := resp
+	if out.Text, err = expand(out.Text); err != nil {
+		return ResponseSpec{}, err
+	}
+	if out.FinishReason, err = expand(out.FinishReason); err != nil {
+		return ResponseSpec{}, err
+	}
+	if resp.Error != nil {
+		copyError := *resp.Error
+		if copyError.Body, err = expand(copyError.Body); err != nil {
+			return ResponseSpec{}, err
+		}
+		out.Error = &copyError
+	}
+	out.ToolCalls = make([]ToolCallSpec, len(resp.ToolCalls))
+	for i, call := range resp.ToolCalls {
+		out.ToolCalls[i] = call
+		if out.ToolCalls[i].ID, err = expand(call.ID); err != nil {
+			return ResponseSpec{}, err
+		}
+		if out.ToolCalls[i].Name, err = expand(call.Name); err != nil {
+			return ResponseSpec{}, err
+		}
+		args, err := expandValue(call.Arguments, latest)
+		if err != nil {
+			return ResponseSpec{}, err
+		}
+		if args != nil {
+			out.ToolCalls[i].Arguments = args.(map[string]any)
+		} else {
+			out.ToolCalls[i].Arguments = nil
+		}
+	}
+	return out, nil
+}
+
+// latestToolResult 从当前 Chat Completions 请求中反向找最近一条
+// role=tool 消息，并要求 content 是 JSON object。没有工具消息时返回
+// nil；只有响应真正含占位符时才会因字段缺失报错。
+func latestToolResult(messages []json.RawMessage) (map[string]any, error) {
+	for i := len(messages) - 1; i >= 0; i-- {
+		var msg chatMessage
+		if err := json.Unmarshal(messages[i], &msg); err != nil || msg.Role != "tool" {
+			continue
+		}
+		var content string
+		if err := json.Unmarshal(msg.Content, &content); err != nil {
+			return nil, fmt.Errorf("最近 tool message content 不是字符串")
+		}
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(content), &doc); err != nil {
+			return nil, fmt.Errorf("最近 tool message content 不是 JSON object: %w", err)
+		}
+		return doc, nil
+	}
+	return nil, nil
+}
+
+func expandValue(value any, latest map[string]any) (any, error) {
+	switch v := value.(type) {
+	case string:
+		return expandString(v, latest)
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, item := range v {
+			expanded, err := expandValue(item, latest)
+			if err != nil {
+				return nil, err
+			}
+			out[key] = expanded
+		}
+		return out, nil
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			expanded, err := expandValue(item, latest)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = expanded
+		}
+		return out, nil
+	default:
+		return v, nil
+	}
+}
+
+func expandString(raw string, latest map[string]any) (string, error) {
+	var expandErr error
+	out := latestToolResultPlaceholder.ReplaceAllStringFunc(raw, func(match string) string {
+		if expandErr != nil {
+			return match
+		}
+		parts := latestToolResultPlaceholder.FindStringSubmatch(match)
+		value, ok := lookupField(latest, parts[1])
+		if !ok {
+			expandErr = fmt.Errorf("最近工具 JSON 缺少字段 %q", parts[1])
+			return match
+		}
+		switch typed := value.(type) {
+		case string:
+			return typed
+		case nil:
+			return "null"
+		default:
+			data, err := json.Marshal(typed)
+			if err != nil {
+				expandErr = fmt.Errorf("序列化最近工具 JSON 字段 %q: %w", parts[1], err)
+				return match
+			}
+			return string(data)
+		}
+	})
+	return out, expandErr
+}
+
+func lookupField(doc map[string]any, path string) (any, bool) {
+	if doc == nil {
+		return nil, false
+	}
+	var current any = doc
+	for _, part := range strings.Split(path, ".") {
+		object, ok := current.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		current, ok = object[part]
+		if !ok {
+			return nil, false
+		}
+	}
+	return current, true
 }
 
 // pickLocked 按序选择第一个可命中的步骤：一次性步骤被消费后跳过，

@@ -121,6 +121,48 @@ func (r *MemoryRoster) ReleaseAll(agentID string) error {
 	return nil
 }
 
+// ReleaseAllClaims 清空全部 claims 与 agentFiles 索引，使 Roster 回到
+// 刚构造状态。waiter 簿记一并清理：先向所有等待队列中的 waiter 发送
+// 释放信号（与 notifyFirstWaiter 同样的 buffered-1 非阻塞发送），再清空
+// waiters——等待中的 WaitForRelease 因此全部返回 nil，按约定重试
+// TryClaim 时文件已全部空闲；只清 map 不发信号会让 waiter 挂到超时，
+// 构成等待者泄漏。
+//
+// history emit 与 ReleaseAll 同惯例：每个被释放的 claim 一条
+// roster_release 事件。用途：/new force——会话快照落盘后的运行时清扫。
+func (r *MemoryRoster) ReleaseAllClaims() {
+	r.mu.Lock()
+
+	type releasedClaim struct {
+		agentID  string
+		filePath string
+	}
+	released := make([]releasedClaim, 0, len(r.claims))
+	for fp, claim := range r.claims {
+		released = append(released, releasedClaim{agentID: claim.AgentID, filePath: fp})
+	}
+	r.claims = make(map[string]model.Claim)
+	r.agentFiles = make(map[string][]string)
+	// 先唤醒全部 waiter 再清表，防止等待者泄漏。
+	for fp, q := range r.waiters {
+		for _, w := range q {
+			select {
+			case w.ch <- struct{}{}:
+			default:
+			}
+		}
+		delete(r.waiters, fp)
+	}
+	r.mu.Unlock()
+
+	for _, rc := range released {
+		r.emitHistory(session.HistEventRosterRelease, map[string]any{
+			"agent_id":  rc.agentID,
+			"file_path": rc.filePath,
+		})
+	}
+}
+
 func (r *MemoryRoster) IsOccupied(filePath string) (string, bool, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

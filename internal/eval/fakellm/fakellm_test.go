@@ -203,6 +203,80 @@ default: {text: "兜底"}
 	}
 }
 
+func TestScript_LatestToolResultPlaceholderRecursivelyExpandsResponseStrings(t *testing.T) {
+	script, err := ParseScript([]byte(`
+steps:
+  - match: {contains: ["bind route"]}
+    repeat: true
+    respond:
+      text: "using {{latest_tool_result.event_type}}"
+      tool_calls:
+        - name: submit_graph
+          arguments:
+            graph: '{"graph_id":"{{latest_tool_result.graph.id}}","route":"{{latest_tool_result.event_type}}"}'
+            labels: ["team={{latest_tool_result.team_id}}", "stable"]
+default: {text: "fallback"}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(script)
+	defer srv.Close()
+
+	messages := []map[string]any{
+		{"role": "user", "content": "bind route"},
+		{"role": "tool", "tool_call_id": "provision", "content": `{"event_type":"team:abc-123","team_id":"abc-123","graph":{"id":"g-dynamic"}}`},
+	}
+	code, body := postRaw(t, srv.URL(), map[string]any{"messages": messages})
+	if code != http.StatusOK {
+		t.Fatalf("占位符响应状态码 = %d（%s）", code, body)
+	}
+	choice := decodeChoice(t, body)
+	if choice.Message.Content != "using team:abc-123" || len(choice.Message.ToolCalls) != 1 {
+		t.Fatalf("展开后响应不符: %+v", choice)
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(choice.Message.ToolCalls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("工具参数不是 JSON: %v", err)
+	}
+	if args["graph"] != `{"graph_id":"g-dynamic","route":"team:abc-123"}` {
+		t.Fatalf("graph 占位符未展开: %#v", args["graph"])
+	}
+	labels, ok := args["labels"].([]any)
+	if !ok || len(labels) != 2 || labels[0] != "team=abc-123" {
+		t.Fatalf("嵌套 slice 占位符未展开: %#v", args["labels"])
+	}
+	// repeat 步骤不得被首次展开就地污染；第二个工具结果应生成新 route。
+	messages[1]["content"] = `{"event_type":"team:def-456","team_id":"def-456","graph":{"id":"g-second"}}`
+	_, body = postRaw(t, srv.URL(), map[string]any{"messages": messages})
+	choice = decodeChoice(t, body)
+	if choice.Message.Content != "using team:def-456" ||
+		!strings.Contains(choice.Message.ToolCalls[0].Function.Arguments, "team:def-456") {
+		t.Fatalf("repeat 步骤复用了旧展开值: %+v", choice)
+	}
+	if got := script.Steps[0].Respond.Text; got != "using {{latest_tool_result.event_type}}" {
+		t.Fatalf("原脚本被就地改写: %q", got)
+	}
+}
+
+func TestScript_LatestToolResultPlaceholderMissingFieldFailsClosed(t *testing.T) {
+	script, err := ParseScript([]byte(`
+steps:
+  - respond: {text: "{{latest_tool_result.event_type}}"}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(script)
+	defer srv.Close()
+	code, body := postRaw(t, srv.URL(), map[string]any{
+		"messages": []map[string]any{{"role": "user", "content": "no tool result"}},
+	})
+	if code != http.StatusInternalServerError || !strings.Contains(string(body), "event_type") {
+		t.Fatalf("缺字段应 fail-closed: code=%d body=%s", code, body)
+	}
+}
+
 func TestServer_Records(t *testing.T) {
 	srv := NewServer(&Script{})
 	defer srv.Close()

@@ -83,7 +83,7 @@ func TestStore_UnwritableDirReturnsError(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := NewStore(filepath.Join(blocker, "taskmem")) // 父路径是文件 → MkdirAll 失败
-	m, _, _ := s.LoadOrCreate("task-x")
+	m := New("task-x")
 	m.Goal = "g"
 	if err := s.Save(m); err == nil {
 		t.Fatal("目录不可写时 Save 应返回错误")

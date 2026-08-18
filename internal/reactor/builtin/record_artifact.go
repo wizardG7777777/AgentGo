@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"agentgo/internal/model"
+	"agentgo/internal/pathutil"
 	"agentgo/internal/reactor"
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
@@ -24,9 +25,10 @@ import (
 //   - 数据来源：直接读 trace.Event.Path / TaskID（v4 需从 Args["path"] 读）
 //   - 失败语义：Async + 失败仅记日志（v4 hook 也是吞错，只是路径不同）
 //
-// 为什么 Async：
-//   - artifact 列表写入对主流程不阻塞（task 已经完成 write_file 工具）
-//   - 失败影响仅是 task.Artifacts 缺一条记录，非系统不变量
+// 为什么仍保留 Async：LocalWriteGroup 已在工具返回前同步登记
+// artifact ledger，这里只作兼容观察器（含 shell expected_artifacts
+// 补登）。它可重复命中 Store 的幂等键，但不再承担 write/edit
+// 的正确性权威，也不得用其异步时序解释 Graph Evidence。
 type RecordArtifactReactor struct {
 	store       store.StoreHookView
 	projectRoot string
@@ -57,7 +59,8 @@ func (r *RecordArtifactReactor) Subscribe() []trace.EventKind {
 }
 
 // Run 按事件类型分派：
-//   - KindFileWritten：登记写工具产物（路径 + 落盘重算的 sha256/bytes）。
+//   - KindFileWritten：幂等复核写工具已同步登记的产物
+//     （路径 + 落盘重算的 sha256/bytes）。
 //   - KindShellExecuted：shell 写事实补登——shell 命令（如 Set-Content）
 //     写文件不产生 file_written 事件，任务声明的 ExpectedArtifacts 若已
 //     在盘上出现，补登进 artifact 账本。没有这一步，shell 写产物的任务会
@@ -65,8 +68,9 @@ func (r *RecordArtifactReactor) Subscribe() []trace.EventKind {
 //     验收 file_hash 证据链也因账本缺失而断裂（2026-07-27 真实运行事故）。
 //
 // store == nil 时静默 no-op（测试 / 最小注册场景）。
-// 路径为空 / 任务不存在等失败均吞错——artifact 记录是 best-effort 的审计记录，
-// 不能反向阻塞主流程（Async Reactor 也无法阻塞）。
+// 路径为空 / 任务不存在等失败均吞错——本 Reactor 是
+// best-effort 观察器，不反向阻塞主流程；write/edit 的正确性
+// 由 LocalWriteGroup 同步登记路径保证。
 func (r *RecordArtifactReactor) Run(ev trace.Event) error {
 	if r.store == nil {
 		return nil
@@ -170,6 +174,11 @@ var _ reactor.Reactor = (*RecordArtifactReactor)(nil)
 func normalizeArtifactPath(absPath, projectRoot string) string {
 	cleaned := filepath.Clean(absPath)
 	if projectRoot != "" {
+		if canonicalRoot, err := pathutil.CanonicalizeRoot(projectRoot); err == nil {
+			if rel, err := filepath.Rel(canonicalRoot, cleaned); err == nil && !strings.HasPrefix(rel, "..") {
+				return filepath.ToSlash(rel)
+			}
+		}
 		if rel, err := filepath.Rel(projectRoot, cleaned); err == nil && !strings.HasPrefix(rel, "..") {
 			return filepath.ToSlash(rel)
 		}

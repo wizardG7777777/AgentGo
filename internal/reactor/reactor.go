@@ -76,6 +76,22 @@ type CtxReactor interface {
 	RunWithContext(ctx context.Context, ev trace.Event) error
 }
 
+// ReliableAsyncReactor marks control-plane async work that must never be
+// discarded by the observational async semaphore. Calls are appended to a
+// dedicated serial FIFO worker, so Dispatch remains non-blocking, nested
+// trace.Emit calls cannot deadlock the worker, and bursts do not create one
+// goroutine per event. Queued and running calls both participate in Quiesce.
+// Implementations must subscribe to low-frequency lifecycle events and remain
+// idempotent because the reliable queue is intentionally non-dropping.
+type ReliableAsyncReactor interface {
+	ReliableAsync() bool
+}
+
+type reliableCall struct {
+	reactor Reactor
+	event   trace.Event
+}
+
 // Registry 是 Reactor 注册与分发器。与 gate.Registry 对称但语义不同：
 //   - 单一输入类型（trace.Event）vs Gate 的接口式 Context
 //   - Dispatch 无返回值 vs Gate 的 Decision
@@ -89,8 +105,12 @@ type Registry struct {
 	// ── E4：async 在途治理（关停 + 背压）──
 	ctx    context.Context    // 派生给 async Reactor 的可取消 ctx，Quiesce 时取消
 	cancel context.CancelFunc // 幂等；NewRegistry 之后永不为 nil
-	wg     sync.WaitGroup     // 在途 async goroutine 计数（Quiesce 据此排空）
+	wg     sync.WaitGroup     // 已接受 async 调用计数（包括可靠 lane 排队项）
 	sem    chan struct{}      // 在途上限令牌桶：容量即上限，满即丢弃（背压）
+	// inFlight 同时覆盖有界观测 lane，以及可靠控制 lane 中
+	// queued + running 的全部调用。用于 Quiesce 超时时返回真实
+	// 未排空数；sem 只能代表前者。
+	inFlight atomic.Int64
 	// dropped 只因背压上限被丢弃的 async 分发计数（可观测指标）；
 	// Quiesce 之后的静默丢弃不计入。
 	dropped atomic.Int64
@@ -99,6 +119,16 @@ type Registry struct {
 	// （WaitGroup 要求计数为零时的 Add 必须先于 Wait 完成）。
 	qmu      sync.Mutex
 	quiesced bool // Quiesce 后置 true，之后的 async 分发静默丢弃
+
+	// 可靠控制 lane 是一个懒启动的串行 FIFO worker。队列只在
+	// reliableMu 下读写；worker 执行 Reactor 时不持锁，因此 Reactor 内部
+	// nested trace.Emit 可以立即回队，不会反向等待自身。
+	reliableOnce       sync.Once
+	reliableStarted    atomic.Bool
+	reliableMu         sync.Mutex
+	reliableQueue      []reliableCall
+	reliableWake       chan struct{}
+	reliableWorkerDone chan struct{}
 }
 
 // DefaultMaxAsyncInFlight 是 async Reactor 同时在途的默认上限（E4）。
@@ -123,10 +153,12 @@ func newRegistry(maxAsyncInFlight int) *Registry {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Registry{
-		reactorsByKind: make(map[trace.EventKind][]Reactor),
-		ctx:            ctx,
-		cancel:         cancel,
-		sem:            make(chan struct{}, maxAsyncInFlight),
+		reactorsByKind:     make(map[trace.EventKind][]Reactor),
+		ctx:                ctx,
+		cancel:             cancel,
+		sem:                make(chan struct{}, maxAsyncInFlight),
+		reliableWake:       make(chan struct{}, 1),
+		reliableWorkerDone: make(chan struct{}),
 	}
 }
 
@@ -184,8 +216,9 @@ func (r *Registry) Register(reactor Reactor) error {
 // 行为约定（§6.6.6）：
 //   - Sync Reactor 按 Priority 顺序串行执行；任一失败仅 trace 记录后继续
 //     （主流程语义：不可 Abort，所以失败必须吞）
-//   - Async Reactor 立即起独立 goroutine 执行；panic 被 recover 后仅 log；
-//     主流程不等待 Async 完成
+//   - 普通 Async Reactor 立即起独立 goroutine 执行；ReliableAsyncReactor
+//     进入专用单 worker FIFO；两者 panic 均被 recover 后仅 log，主流程
+//     都不等待 Async 完成
 //   - Async 在途数有上限（DefaultMaxAsyncInFlight）：满载即丢弃并记 WARN，
 //     Dispatch 调用方永不阻塞；Quiesce 之后 async 分发静默丢弃（E4）
 //   - 单个 Reactor panic 不影响其他 Reactor
@@ -217,6 +250,10 @@ func (r *Registry) Dispatch(ev trace.Event) {
 // （系统关停中，新异步工作已无生命周期保障；不计入 DroppedAsync，避免关停
 // 期间刷 WARN）。
 func (r *Registry) dispatchAsync(rt Reactor, ev trace.Event) {
+	if reliable, ok := rt.(ReliableAsyncReactor); ok && reliable.ReliableAsync() {
+		r.dispatchReliableAsync(rt, ev)
+		return
+	}
 	r.qmu.Lock()
 	if r.quiesced {
 		r.qmu.Unlock()
@@ -232,21 +269,93 @@ func (r *Registry) dispatchAsync(rt Reactor, ev trace.Event) {
 		return
 	}
 	r.wg.Add(1)
+	r.inFlight.Add(1)
 	r.qmu.Unlock()
 
 	go func() {
 		defer r.wg.Done()
+		defer r.inFlight.Add(-1)
 		defer func() { <-r.sem }()
 		r.runAsync(r.ctx, rt, ev)
 	}()
+}
+
+// dispatchReliableAsync is the non-dropping control-plane counterpart of
+// dispatchAsync. It deliberately does not acquire sem; lifecycle correctness
+// cannot depend on spare capacity in the user/observability async pool. Calls
+// are accounted before enqueue so Quiesce observes queued and running work.
+func (r *Registry) dispatchReliableAsync(rt Reactor, ev trace.Event) {
+	r.qmu.Lock()
+	if r.quiesced {
+		r.qmu.Unlock()
+		return
+	}
+	r.wg.Add(1)
+	r.inFlight.Add(1)
+	r.reliableOnce.Do(func() {
+		r.reliableStarted.Store(true)
+		go r.runReliableWorker()
+	})
+	r.reliableMu.Lock()
+	r.reliableQueue = append(r.reliableQueue, reliableCall{reactor: rt, event: ev})
+	r.reliableMu.Unlock()
+	r.qmu.Unlock()
+
+	r.wakeReliableWorker()
+}
+
+// runReliableWorker executes the reliable lane serially in enqueue order.
+// It never holds reliableMu while invoking user/control-plane code: a Reactor
+// may emit another trace event, enqueue it behind the current call, and return.
+func (r *Registry) runReliableWorker() {
+	defer close(r.reliableWorkerDone)
+	for {
+		call, ok := r.popReliableCall()
+		if ok {
+			r.runAsync(r.ctx, call.reactor, call.event)
+			r.inFlight.Add(-1)
+			r.wg.Done()
+			continue
+		}
+
+		r.qmu.Lock()
+		quiesced := r.quiesced
+		r.qmu.Unlock()
+		if quiesced {
+			return
+		}
+		<-r.reliableWake
+	}
+}
+
+func (r *Registry) popReliableCall() (reliableCall, bool) {
+	r.reliableMu.Lock()
+	defer r.reliableMu.Unlock()
+	if len(r.reliableQueue) == 0 {
+		return reliableCall{}, false
+	}
+	call := r.reliableQueue[0]
+	r.reliableQueue[0] = reliableCall{}
+	r.reliableQueue = r.reliableQueue[1:]
+	if len(r.reliableQueue) == 0 {
+		r.reliableQueue = nil
+	}
+	return call, true
+}
+
+func (r *Registry) wakeReliableWorker() {
+	select {
+	case r.reliableWake <- struct{}{}:
+	default:
+	}
 }
 
 // Quiesce 关停 Async 分发并等待在途排空（E4）。
 //
 // 步骤：先置 quiesced 标志（之后的 async 分发静默丢弃），再取消 registry
 // 派生 ctx 打断实现了 CtxReactor 的在途工作（LLM / spawn 调用随 ctx 中断），
-// 最后带超时等待在途 goroutine 全部退出。返回值是超时后仍在运行的 async
-// 数量（0 = 全部排空），调用方应对非零值记 WARN。
+// 最后带超时等待已接受的 async 调用全部排空。返回值是超时后仍在
+// queued + running 的 async 数量（0 = 全部排空），调用方应对非零值记 WARN。
 //
 // 语义约定：
 //   - 幂等，可重复调用；nil Registry 返回 0。
@@ -262,10 +371,16 @@ func (r *Registry) Quiesce(timeout time.Duration) (remaining int) {
 	r.qmu.Unlock()
 
 	r.cancel()
+	if r.reliableStarted.Load() {
+		r.wakeReliableWorker()
+	}
 
 	done := make(chan struct{})
 	go func() {
 		r.wg.Wait()
+		if r.reliableStarted.Load() {
+			<-r.reliableWorkerDone
+		}
 		close(done)
 	}()
 	if timeout <= 0 {
@@ -276,10 +391,9 @@ func (r *Registry) Quiesce(timeout time.Duration) (remaining int) {
 	case <-done:
 		return 0
 	case <-time.After(timeout):
-		// len(sem) == 当前在途数（每个在途 goroutine 持有一个令牌）。
-		// 等待 goroutine 会在在途最终排空时退出；进程关停路径下即使有
-		// 永久卡死的 Reactor，泄漏也以进程退出为界。
-		return len(r.sem)
+		// 可靠 async lane 刻意绕过 sem，inFlight 会同时计入
+		// queued + running，避免上层误以为可以关闭 Team/Graph store。
+		return int(r.inFlight.Load())
 	}
 }
 

@@ -527,6 +527,79 @@ func (r *Registry) Unregister(agentID string) bool {
 	return true
 }
 
+// ResetAll 清空全部 mailbox 及其未读消息、recovered claim 状态与别名，
+// 使 Registry 回到刚构造状态；hookRunner 与 historyEmitter 装配保留——
+// 两者是启动期注入的外部依赖，不是按会话累积的运行时状态。
+//
+// 与 ImportSnapshot 的关系：ImportSnapshot(nil) 不是「替换为全空」语义——
+// 它只做追加/新建，对空输入是纯 no-op，从不清空既有邮箱，因此整体清空
+// 只能由本方法承担，不存在两套重复实现。
+//
+// 丢弃语义：未读消息随 boxes 一并释放（channel 由 GC 回收），Mailbox 的
+// 消费方（Runner Drain）均为非阻塞读取，不存在悬挂在 channel 上的接收方。
+// 不发 history 事件。用途：/new force——会话快照落盘后的运行时清扫。
+func (r *Registry) ResetAll() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.boxes = make(map[string]*Mailbox)
+	r.aliases = make(map[string]string)
+	r.recoveredUnclaimed = make(map[string]string)
+	r.recoveredClaimed = make(map[string]string)
+}
+
+// clearMessages 清空本邮箱的未读消息与 recent 观察环。
+// 持 inboxMu 排空 channel（与 TrySend/Drain 同锁，投递方只会阻塞不会 panic），
+// recent 环由 recentMu 独立保护，置空前先清零引用以便 GC。
+func (mb *Mailbox) clearMessages() {
+	mb.inboxMu.Lock()
+	defer mb.inboxMu.Unlock()
+	mb.drainUnreadLocked()
+	mb.recentMu.Lock()
+	for i := range mb.recent {
+		mb.recent[i] = Message{}
+	}
+	mb.recent = mb.recent[:0]
+	mb.recentMu.Unlock()
+}
+
+// ClearAllMessages 清空全部邮箱的未读消息与 recent 观察环，并清空
+// recoveredUnclaimed / recoveredClaimed 两张表（recovered 邮箱同属旧
+// session 状态）；但**保留** boxes 注册与 aliases 别名——这是与 ResetAll
+// 的本质差异：ResetAll 把三张表整体抹除、Registry 回到刚构造状态，静态
+// Runner 持有的 *Mailbox 指针随之永久失联（send_message 报「未知收件人」、
+// MailNotifier 扫不到）；本方法只清内容、不动路由，静态 Runner 的邮箱仍然
+// 可达、可继续收发。
+//
+// 使用场景：
+//   - session 冻结/解冻：替换邮箱内容而不拆除注册，恢复出的运行时面对空邮箱；
+//   - /new force：会话快照落盘后清空未读，但静态 Runner 的邮箱必须继续存活。
+//
+// 并发纪律：持 r.mu 期间按 agentID 排序逐邮箱取 inboxMu，锁序
+// （Registry.mu → Mailbox.inboxMu → recentMu）与 ImportSnapshot 一致，
+// 不存在与投递路径的锁序反转。recovered 表清空后，相应邮箱仍留在 boxes
+// 中，ClaimRecovered 对其返回 ErrRecoveredMailboxConflict（active 态）。
+func (r *Registry) ClearAllMessages() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	ids := make([]string, 0, len(r.boxes))
+	for id := range r.boxes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		r.boxes[id].clearMessages()
+	}
+	r.recoveredUnclaimed = make(map[string]string)
+	r.recoveredClaimed = make(map[string]string)
+}
+
 // ScanNonEmpty 返回所有有未读消息的邮箱状态（agentID + eventType + 消息数量
 // + 最大邮件链深度）。MaxChainDepth 在 Phase 2 加入，由 MailNotifier 用于
 // 在 wake task 上设置 task.MailChainDepth。

@@ -4,15 +4,22 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"agentgo/internal/trace"
 )
+
+type reliableAsyncStub struct{ *stubReactor }
+
+func (r *reliableAsyncStub) ReliableAsync() bool { return true }
 
 // ctxAwareStub 实现 CtxReactor：断言 Registry 的 async 路径优先走
 // RunWithContext，并把派生 ctx 交给动作层（invoke_llm 式动作的模拟）。
@@ -134,6 +141,244 @@ func TestDispatchAsync_BackpressureDropsAndNeverBlocks(t *testing.T) {
 	close(release)
 	if rem := reg.Quiesce(3 * time.Second); rem != 0 {
 		t.Fatalf("放行后 Quiesce remaining=%d，期望 0", rem)
+	}
+}
+
+func TestDispatchReliableAsyncBypassesSaturatedLossyPool(t *testing.T) {
+	reg := newRegistry(1)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	if err := reg.Register(newStubR("lossy-blocker", 500, false, []trace.EventKind{trace.KindLLMCallStart},
+		func(trace.Event) error {
+			close(started)
+			<-release
+			return nil
+		})); err != nil {
+		t.Fatal(err)
+	}
+	ran := make(chan struct{})
+	reliable := &reliableAsyncStub{newStubR("reliable-control", 100, false,
+		[]trace.EventKind{trace.KindTaskCompleted}, func(trace.Event) error {
+			close(ran)
+			return nil
+		})}
+	if err := reg.Register(reliable); err != nil {
+		t.Fatal(err)
+	}
+	reg.Dispatch(trace.Event{Kind: trace.KindLLMCallStart})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("lossy pool blocker did not start")
+	}
+
+	reg.Dispatch(trace.Event{Kind: trace.KindTaskCompleted})
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("reliable async lifecycle event was blocked or dropped by saturated lossy pool")
+	}
+	if got := reg.DroppedAsync(); got != 0 {
+		t.Fatalf("reliable dispatch incremented DroppedAsync=%d", got)
+	}
+	close(release)
+	if remaining := reg.Quiesce(time.Second); remaining != 0 {
+		t.Fatalf("Quiesce remaining=%d", remaining)
+	}
+}
+
+func TestDispatchReliableAsyncBurstUsesSingleFIFOOutputWorker(t *testing.T) {
+	reg := newRegistry(1)
+	const eventCount = 1000
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startOnce sync.Once
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	var orderMu sync.Mutex
+	order := make([]int, 0, eventCount)
+
+	reliable := &reliableAsyncStub{newStubR("reliable-fifo", 100, false,
+		[]trace.EventKind{trace.KindTaskCompleted}, func(ev trace.Event) error {
+			current := active.Add(1)
+			for {
+				observed := maxActive.Load()
+				if current <= observed || maxActive.CompareAndSwap(observed, current) {
+					break
+				}
+			}
+			startOnce.Do(func() { close(started) })
+			<-release
+			id, err := strconv.Atoi(ev.TaskID)
+			if err != nil {
+				return err
+			}
+			orderMu.Lock()
+			order = append(order, id)
+			orderMu.Unlock()
+			active.Add(-1)
+			return nil
+		})}
+	if err := reg.Register(reliable); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeGoroutines := runtime.NumGoroutine()
+	reg.Dispatch(trace.Event{Kind: trace.KindTaskCompleted, TaskID: "0"})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("reliable FIFO worker did not start")
+	}
+
+	startedAt := time.Now()
+	for i := 1; i < eventCount; i++ {
+		reg.Dispatch(trace.Event{Kind: trace.KindTaskCompleted, TaskID: strconv.Itoa(i)})
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("reliable burst enqueue blocked Dispatch for %v", elapsed)
+	}
+	// All handlers are blocked on release. A goroutine-per-event implementation
+	// would leave roughly eventCount goroutines here; the FIFO lane adds one.
+	if got := runtime.NumGoroutine(); got > beforeGoroutines+16 {
+		t.Fatalf("reliable burst grew goroutines with event count: before=%d after=%d", beforeGoroutines, got)
+	}
+
+	close(release)
+	if remaining := reg.Quiesce(5 * time.Second); remaining != 0 {
+		t.Fatalf("Quiesce remaining=%d", remaining)
+	}
+	if got := maxActive.Load(); got != 1 {
+		t.Fatalf("reliable lane max concurrent handlers=%d, want serial 1", got)
+	}
+	orderMu.Lock()
+	defer orderMu.Unlock()
+	if len(order) != eventCount {
+		t.Fatalf("reliable executions=%d, want %d", len(order), eventCount)
+	}
+	for i, got := range order {
+		if got != i {
+			t.Fatalf("reliable FIFO order[%d]=%d, want %d", i, got, i)
+		}
+	}
+	if got := reg.DroppedAsync(); got != 0 {
+		t.Fatalf("reliable burst incremented DroppedAsync=%d", got)
+	}
+}
+
+func TestDispatchReliableAsyncNestedTraceEmitDoesNotDeadlock(t *testing.T) {
+	reg := newRegistry(1)
+	originalDispatcher := trace.DefaultDispatcher()
+	trace.SetDefaultDispatcher(reg)
+	t.Cleanup(func() { trace.SetDefaultDispatcher(originalDispatcher) })
+
+	var orderMu sync.Mutex
+	var order []string
+	nestedDone := make(chan struct{})
+	reliable := &reliableAsyncStub{newStubR("reliable-nested", 100, false,
+		[]trace.EventKind{trace.KindTaskCompleted, trace.KindTaskFailed}, func(ev trace.Event) error {
+			switch ev.Kind {
+			case trace.KindTaskCompleted:
+				orderMu.Lock()
+				order = append(order, "outer-start")
+				orderMu.Unlock()
+				trace.Emit(trace.Event{Kind: trace.KindTaskFailed, TaskID: "nested"})
+				orderMu.Lock()
+				order = append(order, "outer-end")
+				orderMu.Unlock()
+			case trace.KindTaskFailed:
+				orderMu.Lock()
+				order = append(order, "nested")
+				orderMu.Unlock()
+				close(nestedDone)
+			}
+			return nil
+		})}
+	if err := reg.Register(reliable); err != nil {
+		t.Fatal(err)
+	}
+
+	reg.Dispatch(trace.Event{Kind: trace.KindTaskCompleted, TaskID: "outer"})
+	select {
+	case <-nestedDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("nested trace.Emit deadlocked reliable FIFO worker")
+	}
+	if remaining := reg.Quiesce(time.Second); remaining != 0 {
+		t.Fatalf("Quiesce remaining=%d", remaining)
+	}
+	orderMu.Lock()
+	got := fmt.Sprint(order)
+	orderMu.Unlock()
+	if got != "[outer-start outer-end nested]" {
+		t.Fatalf("nested reliable order=%s", got)
+	}
+}
+
+func TestQuiesceTimeoutCountsReliableAsyncWork(t *testing.T) {
+	reg := newRegistry(1)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	reliable := &reliableAsyncStub{newStubR("reliable-blocker", 100, false,
+		[]trace.EventKind{trace.KindTaskCompleted}, func(trace.Event) error {
+			close(started)
+			<-release
+			return nil
+		})}
+	if err := reg.Register(reliable); err != nil {
+		t.Fatal(err)
+	}
+	reg.Dispatch(trace.Event{Kind: trace.KindTaskCompleted})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("reliable async reactor did not start")
+	}
+
+	if remaining := reg.Quiesce(20 * time.Millisecond); remaining != 1 {
+		t.Fatalf("Quiesce timeout remaining=%d, want 1 reliable in-flight reactor", remaining)
+	}
+	close(release)
+	if remaining := reg.Quiesce(time.Second); remaining != 0 {
+		t.Fatalf("Quiesce after release remaining=%d, want 0", remaining)
+	}
+}
+
+func TestQuiesceTimeoutCountsReliableQueuedAndRunningThenDrains(t *testing.T) {
+	reg := newRegistry(1)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startOnce sync.Once
+	var ran atomic.Int32
+	reliable := &reliableAsyncStub{newStubR("reliable-queued", 100, false,
+		[]trace.EventKind{trace.KindTaskCompleted}, func(trace.Event) error {
+			startOnce.Do(func() { close(started) })
+			<-release
+			ran.Add(1)
+			return nil
+		})}
+	if err := reg.Register(reliable); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		reg.Dispatch(trace.Event{Kind: trace.KindTaskCompleted, TaskID: strconv.Itoa(i)})
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("reliable async reactor did not start")
+	}
+
+	if remaining := reg.Quiesce(20 * time.Millisecond); remaining != 3 {
+		t.Fatalf("Quiesce timeout remaining=%d, want 3 queued+running reliable calls", remaining)
+	}
+	close(release)
+	if remaining := reg.Quiesce(time.Second); remaining != 0 {
+		t.Fatalf("second Quiesce remaining=%d, want 0", remaining)
+	}
+	if got := ran.Load(); got != 3 {
+		t.Fatalf("reliable calls executed=%d, want 3", got)
 	}
 }
 
