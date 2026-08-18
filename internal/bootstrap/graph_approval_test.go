@@ -47,8 +47,8 @@ func newGraphApprovalEnv(t *testing.T) *graphApprovalEnv {
 
 // bridgeApprovalGraphJSON 审批分流图：root(agent) → ap(approval)
 //
-//	--event approved--> ok(agent) --> finish(end)
-//	--event rejected--> ng(agent) --> finish(end)
+//	--event approved--> ok(agent) --> finish_ok(end)
+//	--event rejected--> ng(agent) --> finish_ng(end)
 const bridgeApprovalGraphJSON = `{
   "schema": "agentgo.graph/v1", "graph_id": "g-appr-bridge", "revision": 1, "state_version": 0,
   "root": "root", "status": "pending",
@@ -61,10 +61,11 @@ const bridgeApprovalGraphJSON = `{
         {"to":"ng","when":{"event":"rejected"}}
       ]},
     "ok": {"kind":"agent","task":{"title":"执行上线"},"status":"inactive","executor":null,"execution":null,
-      "next":[{"to":"finish"}]},
+      "next":[{"to":"finish_ok"}]},
     "ng": {"kind":"agent","task":{"title":"打回修改"},"status":"inactive","executor":null,"execution":null,
-      "next":[{"to":"finish"}]},
-    "finish": {"kind":"end","task":{"title":"收尾"},"status":"inactive","executor":null,"execution":null,"next":[]}
+      "next":[{"to":"finish_ng"}]},
+    "finish_ok": {"kind":"end","task":{"title":"批准收尾"},"status":"inactive","executor":null,"execution":null,"next":[]},
+    "finish_ng": {"kind":"end","task":{"title":"拒绝收尾"},"status":"inactive","executor":null,"execution":null,"next":[]}
   }
 }`
 
@@ -156,9 +157,9 @@ func TestGraphApprovalBridgeApproved(t *testing.T) {
 	}
 	g, _ := env.graphs.Get("g-appr-bridge")
 	ap := g.Nodes["ap"]
-	if ap.Status != graph.NodeCompleted || !strings.Contains(ap.Execution.ResultRef, `"approved"`) ||
-		!strings.Contains(ap.Execution.ResultRef, "可以上线") {
-		t.Errorf("ap 应 completed 且 Result 载 approved/文本: status=%s result_ref=%s", ap.Status, ap.Execution.ResultRef)
+	if ap.Status != graph.NodeCompleted || !strings.Contains(ap.Execution.ResultSummary, `"approved"`) ||
+		!strings.Contains(ap.Execution.ResultSummary, "可以上线") {
+		t.Errorf("ap 应 completed 且 Result 载 approved/文本: status=%s result_ref=%s", ap.Status, ap.Execution.ResultSummary)
 	}
 
 	// ok 跑完 → 图 completed。
@@ -186,8 +187,8 @@ func TestGraphApprovalBridgeRejected(t *testing.T) {
 		t.Error("拒绝不应路由 ok")
 	}
 	g, _ := env.graphs.Get("g-appr-bridge")
-	if ap := g.Nodes["ap"]; ap.Status != graph.NodeCompleted || !strings.Contains(ap.Execution.ResultRef, `"rejected"`) {
-		t.Errorf("ap 应 completed 且 Result 载 rejected: status=%s result_ref=%s", ap.Status, ap.Execution.ResultRef)
+	if ap := g.Nodes["ap"]; ap.Status != graph.NodeCompleted || !strings.Contains(ap.Execution.ResultSummary, `"rejected"`) {
+		t.Errorf("ap 应 completed 且 Result 载 rejected: status=%s result_ref=%s", ap.Status, ap.Execution.ResultSummary)
 	}
 }
 
@@ -205,9 +206,9 @@ func TestGraphApprovalBridgeCancelled(t *testing.T) {
 	})
 	g, _ := env.graphs.Get("g-appr-bridge")
 	ap := g.Nodes["ap"]
-	if ap.Status != graph.NodeCompleted || !strings.Contains(ap.Execution.ResultRef, `"rejected"`) ||
-		!strings.Contains(ap.Execution.ResultRef, "取消") || !strings.Contains(ap.Execution.ResultRef, "用户撤销了本次审批") {
-		t.Errorf("取消应映射为 rejected 且载明原因: status=%s result_ref=%s", ap.Status, ap.Execution.ResultRef)
+	if ap.Status != graph.NodeCompleted || !strings.Contains(ap.Execution.ResultSummary, `"rejected"`) ||
+		!strings.Contains(ap.Execution.ResultSummary, "取消") || !strings.Contains(ap.Execution.ResultSummary, "用户撤销了本次审批") {
+		t.Errorf("取消应映射为 rejected 且载明原因: status=%s result_ref=%s", ap.Status, ap.Execution.ResultSummary)
 	}
 }
 
@@ -260,7 +261,7 @@ func TestGraphApprovalBridgeIdempotentRecovery(t *testing.T) {
 	}
 
 	// 4) rearm：请求仍在（非终态）→ 不重复创建。
-	rearmPendingGraphApprovals(env.graphs, env.gw)
+	rearmPendingGraphApprovals(env.graphs, env.gw, nil)
 	if got := countPending(); got != 1 {
 		t.Errorf("rearm 不应重复创建非终态请求，实际 %d 个", got)
 	}
@@ -326,7 +327,7 @@ func TestGraphApprovalBridgeRearmAfterRestart(t *testing.T) {
 		t.Fatalf("resume 不应在新服务里创建请求，实际 %d 个", len(requests))
 	}
 	// rearm 补登记：同确定性 requestID 的请求出现在新服务里。
-	rearmPendingGraphApprovals(gs2, gw2)
+	rearmPendingGraphApprovals(gs2, gw2, nil)
 	request, err := svc2.Get(context.Background(), requestID)
 	if err != nil {
 		t.Fatalf("rearm 应以原 requestID 补登记请求: %v", err)

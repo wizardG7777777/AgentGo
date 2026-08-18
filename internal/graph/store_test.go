@@ -391,6 +391,11 @@ func TestStorePatchRevalidatesSemantics(t *testing.T) {
 		"非end节点无next": {UpsertNodes: []NodeDefUpsert{
 			{ID: "a", Kind: KindAgent, Task: &NodeTask{Title: "做 A"}},
 		}},
+		"join不透传ready事件": {UpsertNodes: []NodeDefUpsert{
+			{ID: "a", Kind: KindJoin, Task: &NodeTask{Title: "汇合"}, Next: []Transition{{
+				To: "b", When: &Condition{Event: EventReady},
+			}}},
+		}},
 		"删除不存在节点": {RemoveNodes: []string{"zzz"}},
 		"upsert空节点ID": {UpsertNodes: []NodeDefUpsert{
 			{ID: "", Kind: KindEnd, Task: &NodeTask{Title: "X"}},
@@ -408,6 +413,48 @@ func TestStorePatchRevalidatesSemantics(t *testing.T) {
 	}
 	if d, _ := s.Digest("g1"); d != d0 {
 		t.Errorf("全部拒绝后 digest 不得变化")
+	}
+}
+
+// TestRecoverLegacyJoinEventContract 保证 authoring 加固不改写 durable 历史：
+// 老版本已经接受的 join→ready 图仍可恢复并供 trace/read_graph 审计；只有新建
+// 或 patch 定义时才要求修正为 join→completed。
+func TestRecoverLegacyJoinEventContract(t *testing.T) {
+	root := t.TempDir()
+	doc := &GraphDocument{
+		Schema: SchemaV1, GraphID: "g-legacy-join-ready", Revision: 1,
+		Root: "join", Status: GraphPending,
+		Nodes: map[string]Node{
+			"join": {
+				Kind: KindJoin, Task: &NodeTask{Title: "旧汇合"}, Status: NodeInactive,
+				Next: []Transition{{To: "done", When: &Condition{Event: EventReady}}},
+			},
+			"done": {Kind: KindEnd, Task: &NodeTask{Title: "结束"}, Status: NodeInactive},
+		},
+	}
+	graphDir := filepath.Join(root, doc.GraphID)
+	if err := os.MkdirAll(graphDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	line, _, _, err := buildJournalLine(1, journalKindSubmit, doc, submitPayload{Doc: doc}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(graphDir, journalFileName), append(line, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := NewStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.Recover(); err != nil {
+		t.Fatalf("旧 join→ready durable 图应保持可恢复: %v", err)
+	}
+	got, ok := s.Get(doc.GraphID)
+	if !ok || got.Nodes["join"].Next[0].When.Event != EventReady {
+		t.Fatalf("恢复应原样保留旧定义用于审计: ok=%v graph=%+v", ok, got)
 	}
 }
 
@@ -579,7 +626,7 @@ func TestStorePersistenceRoundTrip(t *testing.T) {
 
 	rev, err := s.PatchGraph("graph-123", 1, DefinitionPatch{UpsertNodes: []NodeDefUpsert{
 		{ID: "implement", Kind: KindAgent,
-			Task: &NodeTask{Title: "实施修改 v2", OutputSchema: "agentgo.change-set/v1"},
+			Task: &NodeTask{Title: "实施修改 v2", Description: "提交 result object"},
 			Next: []Transition{{To: "verify", When: &Condition{Event: EventCompleted}}}},
 	}})
 	mustMutate(t, err)
@@ -607,7 +654,7 @@ func TestStorePersistenceRoundTrip(t *testing.T) {
 	// 恢复后可立即正常读写
 	rev, err = ns.PatchGraph("graph-123", got.Revision, DefinitionPatch{UpsertNodes: []NodeDefUpsert{
 		{ID: "implement", Kind: KindAgent,
-			Task: &NodeTask{Title: "实施修改 v3", OutputSchema: "agentgo.change-set/v1"},
+			Task: &NodeTask{Title: "实施修改 v3", Description: "提交 result object"},
 			Next: []Transition{{To: "verify", When: &Condition{Event: EventCompleted}}}},
 	}})
 	mustMutate(t, err)

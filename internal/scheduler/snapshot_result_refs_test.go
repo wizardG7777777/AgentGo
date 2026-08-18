@@ -8,7 +8,9 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"agentgo/internal/agent"
 	"agentgo/internal/config"
+	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
 )
@@ -86,6 +88,32 @@ func TestBuildBoardJSON_ResultRefsAreBoundedStableAndSorted(t *testing.T) {
 	stored, err := s.GetTask(task.ID)
 	if err != nil || stored.Results["a-short"] != short || stored.Results["z-long"] != long {
 		t.Fatalf("building the hot projection mutated cold Results: task=%+v err=%v", stored, err)
+	}
+}
+
+func TestBuildBoardJSON_HidesStructuredResultCarrier(t *testing.T) {
+	s := store.NewMemoryTaskStore(make(chan model.Event, 8), 8, 1, 60)
+	task := &model.Task{ID: "structured-result-task", Description: "structured result"}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("worker-a", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordResultField(s, task.ID, agent.StructuredResultStorageKey, `{"coverage":"gap"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SubmitResult("worker-a", task.ID, "权威结果正文"); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := BuildBoardJSON(s, &config.Config{}, testModeSnap(), model.Event{}, SnapshotSources{})
+	snap := snapshotTaskByID(t, parseSnapshot(t, raw), task.ID)
+	if len(snap.ResultRefs) != 1 || snap.ResultRefs[0].AgentID != "worker-a" {
+		t.Fatalf("内部 carrier 不得伪装成第二份 Agent 结果: %+v", snap.ResultRefs)
+	}
+	if strings.Contains(raw, agent.StructuredResultStorageKey) {
+		t.Fatal("热快照不得泄漏内部结构化结果 carrier")
 	}
 }
 
@@ -229,6 +257,82 @@ func TestBuildBoardJSON_LegacyVisibilityMatchesRequestTree(t *testing.T) {
 	}
 	if snapshot.Resources.BusyWorkers != 1 {
 		t.Fatalf("task filtering corrupted global resource accounting: %+v", snapshot.Resources)
+	}
+}
+
+func TestBuildBoardJSON_GraphVisibilityIncludesSameGraphResultRefsOnly(t *testing.T) {
+	s := store.NewMemoryTaskStore(make(chan model.Event, 32), 64, 4, 60)
+	controller := &model.Task{
+		ID:           "graph-controller",
+		Description:  "summarize",
+		EventType:    "__scheduler__",
+		GraphID:      "g-current",
+		NodeID:       "summarize",
+		ActivationID: "summarize@1",
+	}
+	if err := s.PublishTask(controller); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("scheduler", controller.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	sameGraph := &model.Task{
+		ID: "same-graph-result", GraphID: controller.GraphID,
+		NodeID: "investigate", ActivationID: "investigate@1",
+	}
+	completeSnapshotResultTask(t, s, sameGraph, map[string]string{"worker": "same graph evidence"})
+	crossGraph := &model.Task{ID: "cross-graph-result", GraphID: "g-other"}
+	completeSnapshotResultTask(t, s, crossGraph, map[string]string{"worker": "CROSS-GRAPH-SECRET"})
+	legacyDescendant := &model.Task{ID: "legacy-descendant", ParentTaskID: controller.ID}
+	completeSnapshotResultTask(t, s, legacyDescendant, map[string]string{"worker": "LEGACY-SECRET"})
+
+	raw := BuildBoardJSON(s, &config.Config{}, testModeSnap(), model.Event{}, SnapshotSources{
+		CurrentControllerTaskID: controller.ID,
+		CurrentGraphID:          controller.GraphID,
+	})
+	snapshot := parseSnapshot(t, raw)
+	if len(snapshot.Tasks) != 2 {
+		t.Fatalf("Graph snapshot tasks=%+v, want controller + same-Graph result only", snapshot.Tasks)
+	}
+	_ = snapshotTaskByID(t, snapshot, controller.ID)
+	resultTask := snapshotTaskByID(t, snapshot, sameGraph.ID)
+	if len(resultTask.ResultRefs) != 1 || resultTask.ResultRefs[0].AgentID != "worker" ||
+		resultTask.ResultRefs[0].Excerpt != "same graph evidence" {
+		t.Fatalf("same-Graph result_refs missing or malformed: %+v", resultTask.ResultRefs)
+	}
+	for _, leaked := range []string{crossGraph.ID, legacyDescendant.ID, "CROSS-GRAPH-SECRET", "LEGACY-SECRET"} {
+		if strings.Contains(raw, leaked) {
+			t.Fatalf("Graph snapshot leaked cross-scope value %q: %s", leaked, raw)
+		}
+	}
+}
+
+func TestBuildBoardJSON_GraphAgentSnapshotDoesNotLeakCrossGraphCurrentTask(t *testing.T) {
+	s := store.NewMemoryTaskStore(make(chan model.Event, 16), 32, 1, 60)
+	controller := &model.Task{ID: "controller", EventType: "__scheduler__", GraphID: "g-current"}
+	foreign := &model.Task{ID: "foreign-running", Description: "CROSS-GRAPH-SECRET", GraphID: "g-other"}
+	for _, task := range []*model.Task{controller, foreign} {
+		if err := s.PublishTask(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.ClaimTask("worker-1", foreign.ID); err != nil {
+		t.Fatal(err)
+	}
+	mb := mailbox.NewRegistry(4)
+	mb.Register("worker-1", "")
+
+	raw := BuildBoardJSON(s, &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}, testModeSnap(), model.Event{}, SnapshotSources{
+		CurrentGraphID: controller.GraphID,
+		MBRegistry:     mb,
+	})
+	if strings.Contains(raw, foreign.ID) || strings.Contains(raw, foreign.Description) {
+		t.Fatalf("Graph agent snapshot leaked cross-Graph current task: %s", raw)
+	}
+	snap := parseSnapshot(t, raw)
+	if len(snap.Resources.Agents) != 1 || snap.Resources.Agents[0].ID != "worker-1" || snap.Resources.Agents[0].CurrentTaskID != "" {
+		t.Fatalf("global worker should remain visible without foreign task details: %+v", snap.Resources.Agents)
 	}
 }
 

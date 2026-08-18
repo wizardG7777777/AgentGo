@@ -477,8 +477,8 @@ func TestBuildBoardJSON_ControllerSnapshotHidesOtherScopesTeams(t *testing.T) {
 		key, eventType, ownerID string
 	}{
 		{key: "static:research", eventType: "research"},
-		{key: "team:a", eventType: "team:a", ownerID: "ctrl-a"},
-		{key: "team:b", eventType: "team:b", ownerID: "ctrl-b"},
+		{key: "team:a", eventType: "team:a", ownerID: model.TaskRouteScope("ctrl-a")},
+		{key: "team:b", eventType: "team:b", ownerID: model.TaskRouteScope("ctrl-b")},
 	} {
 		if err := reg.RegisterRoute(route.key, route.eventType, route.ownerID, 1, route.key, []string{"read_file"}); err != nil {
 			t.Fatal(err)

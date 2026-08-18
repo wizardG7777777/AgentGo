@@ -211,9 +211,9 @@ type WebUIConfig struct {
 	AutoOpen *bool `yaml:"auto_open,omitempty" json:"auto_open,omitempty"`
 }
 
-// AutoOpenEnabled 报告是否启用"启动后自动打开浏览器"（缺省为开）。
+// AutoOpenEnabled 报告是否启用"启动后自动打开浏览器"（缺省为关）。
 func (c WebUIConfig) AutoOpenEnabled() bool {
-	return c.AutoOpen == nil || *c.AutoOpen
+	return c.AutoOpen != nil && *c.AutoOpen
 }
 
 // HasFrontend 报告指定前端是否启用（frontends 去重后的成员判断）。
@@ -295,6 +295,10 @@ type Config struct {
 	// Shell 命令拦截配置（追加到默认规则）
 	ShellBlacklist []string `yaml:"shell_blacklist" json:"shell_blacklist"`
 	ShellGreylist  []string `yaml:"shell_greylist" json:"shell_greylist"`
+	// AllowProjectShellRuleRemovals 是受信任主配置中的显式降级开关。
+	// false（默认）时 .agentgo/project_rules.yaml 只能追加规则，不能移除系统
+	// 默认或主配置追加的黑/灰名单；true 时才恢复旧 remove 语义。
+	AllowProjectShellRuleRemovals bool `yaml:"allow_project_shell_rule_removals,omitempty" json:"allow_project_shell_rule_removals,omitempty"`
 
 	// ToolProfiles 命名工具集：profile_name → [tool_name, ...]
 	// 由 agents[*].profile 引用。直接列工具走 agents[*].tools 字段。
@@ -309,9 +313,10 @@ type Config struct {
 	SessionRetentionDays int `yaml:"session_retention_days" json:"session_retention_days"`
 	// SessionArchiveMax 是最大归档 Session 数。超过此数量时删除最旧的归档。
 	SessionArchiveMax int `yaml:"session_archive_max" json:"session_archive_max"`
-	// SessionResumeMaxIdleSec 是自动恢复 active-session 时允许的快照最大闲置时间。
-	// 超过该时间的非终态任务会 fail-closed 为 blocked；显式 --resume 视为人工确认并绕过。
-	// 0 表示关闭陈旧恢复保护。
+	// SessionResumeMaxIdleSec 已废弃（2026-08）：启动永远是全新 Session，
+	// 不再自动恢复 active-session，陈旧恢复保护随之移除；进入历史会话
+	// （--resume / 运行时切换）时非终态任务一律阻断为 blocked，不自动续跑。
+	// 字段保留解析/校验仅为配置兼容，设置它不再产生任何行为。
 	SessionResumeMaxIdleSec int `yaml:"session_resume_max_idle_sec" json:"session_resume_max_idle_sec"`
 	// SessionSnapshotIntervalSec 是运行期完整快照间隔；0 表示只在切换/关闭时保存。
 	SessionSnapshotIntervalSec int `yaml:"session_snapshot_interval_sec" json:"session_snapshot_interval_sec"`
@@ -371,6 +376,7 @@ func ptrTo[T any](v T) *T { return &v }
 
 func DefaultConfig() *Config {
 	return &Config{
+		ProjectRoot: ".",
 		Scheduler: SchedulerKind{
 			EnforceCompactTokenThreshold: DefaultSchedulerCompactTokenThreshold,
 		},
@@ -625,8 +631,12 @@ func (c *Config) Validate() error {
 		if k.Profile == "" {
 			continue
 		}
-		if _, ok := c.ToolProfiles[k.Profile]; !ok {
+		resolved, ok := c.ToolProfiles[k.Profile]
+		if !ok {
 			return fmt.Errorf("agents[%d] (kind=%q) 引用了不存在的 profile: %q", i, k.Kind, k.Profile)
+		}
+		if len(resolved) == 0 {
+			return fmt.Errorf("agents[%d] (kind=%q) 引用了空 profile %q：空工具白名单不允许；请至少声明任务所需工具", i, k.Kind, k.Profile)
 		}
 	}
 

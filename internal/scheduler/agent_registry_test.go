@@ -75,8 +75,15 @@ func TestAgentRegistryRequiresEveryListenerOnSharedRouteToBeCapable(t *testing.T
 	if tools, ok := reg.RouteCapabilities("verify"); !ok || len(tools) != 0 {
 		t.Fatalf("shared route guaranteed tools=%v ok=%v, want empty ready route", tools, ok)
 	}
+	if tools, ok := reg.RouteCapabilityEnvelopeForPlan("", "verify"); !ok || len(tools) != 3 ||
+		!containsAll(tools, []string{"read_file", "run_shell", "submit_task_result"}) {
+		t.Fatalf("shared route capability envelope=%v ok=%v, want all possible listener tools", tools, ok)
+	}
 	if _, ok := reg.RouteCapabilities("missing"); ok {
 		t.Fatal("missing route reported capabilities")
+	}
+	if _, ok := reg.RouteCapabilityEnvelopeForPlan("", "missing"); ok {
+		t.Fatal("missing route reported a capability envelope")
 	}
 }
 
@@ -102,8 +109,82 @@ func TestAgentRegistryOwnerScopedViewsKeepStaticRoutesGlobalAndTeamsPrivate(t *t
 	if _, ok := reg.RouteCapabilitiesForPlan("ctrl-a", "team:b"); ok {
 		t.Fatal("ctrl-b Team capabilities leaked into ctrl-a view")
 	}
+	if _, ok := reg.RouteCapabilityEnvelopeForPlan("ctrl-a", "team:b"); ok {
+		t.Fatal("ctrl-b Team capability envelope leaked into ctrl-a view")
+	}
 	if caps, ok := reg.RouteCapabilitiesForPlan("ctrl-b", "research"); !ok || !containsAll(caps, []string{"read_file"}) {
 		t.Fatalf("global static capabilities unavailable to ctrl-b: caps=%v ok=%v", caps, ok)
+	}
+}
+
+func TestAgentRegistryClaimIdentityRejectsForeignListenerOnCollidingEventType(t *testing.T) {
+	reg := NewAgentRegistry()
+	registrations := []struct {
+		key, owner, agent string
+	}{
+		{key: "static:shared", agent: "static-1"},
+		{key: "team:a", owner: "graph:a", agent: "team-a-1"},
+		{key: "team:b", owner: "graph:b", agent: "team-b-1"},
+	}
+	for _, registration := range registrations {
+		if err := reg.RegisterRoute(registration.key, "team:shared", registration.owner, 1,
+			registration.key, []string{"read_file"}); err != nil {
+			t.Fatalf("RegisterRoute(%s): %v", registration.key, err)
+		}
+		if err := reg.BindRouteClaimants(registration.key, []string{registration.agent}); err != nil {
+			t.Fatalf("BindRouteClaimants(%s): %v", registration.key, err)
+		}
+	}
+
+	if reg.CanAgentClaimRoute("static-1", "graph:a", "team:shared") {
+		t.Fatal("static EventType collision must not enter private team:<id> route")
+	}
+	if !reg.CanAgentClaimRoute("team-a-1", "graph:a", "team:shared") {
+		t.Fatal("same-scope Team listener should be eligible")
+	}
+	if reg.CanAgentClaimRoute("team-b-1", "graph:a", "team:shared") {
+		t.Fatal("foreign Team listener sharing EventType must not enter graph:a claim queue")
+	}
+	if reg.CanAgentClaimRoute("unknown", "graph:a", "team:shared") ||
+		reg.CanAgentClaimRoute("team-a-1", "graph:a", "other") {
+		t.Fatal("unknown identity or wrong event type must fail closed")
+	}
+	if reg.CanRouteForPlan("graph:c", "team:shared") {
+		t.Fatal("a static collision alone must not make a private Team route visible")
+	}
+	if err := reg.RegisterRoute("static:global", "global-shared", "", 1, "global", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.BindRouteClaimants("static:global", []string{"global-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if !reg.CanAgentClaimRoute("global-1", "graph:any", "global-shared") {
+		t.Fatal("non-Team static route should remain global across Graph scopes")
+	}
+	if !reg.UnregisterRoute("team:a") || reg.CanAgentClaimRoute("team-a-1", "graph:a", "team:shared") {
+		t.Fatal("unregistered route must revoke its concrete claimant identities")
+	}
+}
+
+func TestAgentRegistryBindRouteClaimantsValidatesFrozenCardinality(t *testing.T) {
+	reg := NewAgentRegistry()
+	if err := reg.RegisterRoute("team:x", "team:x", "graph:x", 2, "x", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.BindRouteClaimants("team:x", []string{"only-one"}); err == nil {
+		t.Fatal("claimant count mismatch should be rejected")
+	}
+	if err := reg.BindRouteClaimants("team:x", []string{"same", "same"}); err == nil {
+		t.Fatal("duplicate concrete claimant should be rejected")
+	}
+	if err := reg.BindRouteClaimants("missing", []string{"agent"}); err == nil {
+		t.Fatal("binding an unknown route should be rejected")
+	}
+	if err := reg.BindRouteClaimants("team:x", []string{"left", "right"}); err != nil {
+		t.Fatalf("valid claimant binding: %v", err)
+	}
+	if err := reg.BindRouteClaimants("team:x", []string{"new-left", "new-right"}); err == nil {
+		t.Fatal("claimant identities should be frozen after the first binding")
 	}
 }
 

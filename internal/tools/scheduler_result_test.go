@@ -114,6 +114,38 @@ func TestSchedulerGroup_GetTaskResultUnicodePaginationAndDigest(t *testing.T) {
 	}
 }
 
+func TestSchedulerGroup_GetTaskResultHidesStructuredCarrier(t *testing.T) {
+	s, controller := newLegacyResultFixture(t, 32)
+	target := &model.Task{ID: "structured-result", Description: "structured", ParentTaskID: controller.ID}
+	if err := s.PublishTask(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("worker-a", target.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordResultField(s, target.ID, agent.StructuredResultStorageKey, `{"coverage":"gap"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SubmitResult("worker-a", target.ID, "权威结果正文"); err != nil {
+		t.Fatal(err)
+	}
+	registry := newResultToolRegistry(SchedulerGroup{Store: s, Holder: &fakeHolder{id: controller.ID}})
+
+	page, err := dispatchResultPage(t, registry, map[string]any{"task_id": target.ID})
+	if err != nil {
+		t.Fatalf("省略 agent_id 时应自动选择唯一真实 Agent 结果: %v", err)
+	}
+	if page.AgentID != "worker-a" || page.Content != "权威结果正文" {
+		t.Fatalf("读取到了错误结果: %+v", page)
+	}
+	_, err = dispatchResultPage(t, registry, map[string]any{
+		"task_id": target.ID, "agent_id": agent.StructuredResultStorageKey,
+	})
+	if err == nil || !strings.Contains(err.Error(), "内部结构化结果 carrier") {
+		t.Fatalf("显式读取 carrier 应被拒绝，实际 err=%v", err)
+	}
+}
+
 func TestSchedulerGroup_GetTaskResultClampsPageAndValidatesBounds(t *testing.T) {
 	s, controller := newLegacyResultFixture(t, 32)
 	result := strings.Repeat("界", maxTaskResultPageRunes+50)
@@ -192,8 +224,88 @@ func TestSchedulerGroup_GetTaskResultRejectsNonTerminalResults(t *testing.T) {
 	}
 }
 
-// 可见性（C6b）：Scheduler 只能读取自己 SchedulerBatch / ParentTaskID 谱系
-// 内的任务结果（store.LegacyRequestTaskIDs）；谱系外的任务一律拒绝。
+func TestSchedulerGroup_GetTaskResultGraphScope(t *testing.T) {
+	s := store.NewMemoryTaskStore(make(chan model.Event, 32), 64, 4, 60)
+	controller := &model.Task{
+		ID:           "graph-controller",
+		Description:  "summarize graph results",
+		EventType:    "__scheduler__",
+		GraphID:      "g-current",
+		NodeID:       "summarize",
+		ActivationID: "summarize@1",
+	}
+	if err := s.PublishTask(controller); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("scheduler", controller.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	sameGraph := &model.Task{
+		ID:           "same-graph-result",
+		GraphID:      controller.GraphID,
+		NodeID:       "investigate",
+		ActivationID: "investigate@1",
+	}
+	publishCompletedResultTask(t, s, sameGraph, map[string]string{"worker": "same graph evidence"})
+
+	registry := newResultToolRegistry(SchedulerGroup{Store: s, Holder: &fakeHolder{id: controller.ID}})
+	page, err := dispatchResultPage(t, registry, map[string]any{"task_id": sameGraph.ID})
+	if err != nil {
+		t.Fatalf("same-Graph terminal result should be readable: %v", err)
+	}
+	if page.Content != "same graph evidence" {
+		t.Fatalf("unexpected same-Graph result: %+v", page)
+	}
+}
+
+func TestSchedulerGroup_GetTaskResultGraphScopeRejectsCrossScopeTasks(t *testing.T) {
+	s := store.NewMemoryTaskStore(make(chan model.Event, 32), 64, 4, 60)
+	controller := &model.Task{
+		ID:           "graph-controller",
+		EventType:    "__scheduler__",
+		GraphID:      "g-current",
+		NodeID:       "summarize",
+		ActivationID: "summarize@1",
+	}
+	if err := s.PublishTask(controller); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("scheduler", controller.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	crossGraph := &model.Task{ID: "cross-graph", GraphID: "g-other", ParentTaskID: controller.ID}
+	publishCompletedResultTask(t, s, crossGraph, map[string]string{"worker": "other graph secret"})
+	legacyDescendant := &model.Task{ID: "legacy-descendant", ParentTaskID: controller.ID}
+	publishCompletedResultTask(t, s, legacyDescendant, map[string]string{"worker": "legacy secret"})
+	processingPeer := &model.Task{ID: "processing-peer", GraphID: controller.GraphID, MaxConcurrency: 2}
+	if err := s.PublishTask(processingPeer); err != nil {
+		t.Fatal(err)
+	}
+	for _, agentID := range []string{"peer-a", "peer-b"} {
+		if err := s.ClaimTask(agentID, processingPeer.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SubmitResult("peer-a", processingPeer.ID, "partial graph result"); err != nil {
+		t.Fatal(err)
+	}
+
+	registry := newResultToolRegistry(SchedulerGroup{Store: s, Holder: &fakeHolder{id: controller.ID}})
+	for _, taskID := range []string{crossGraph.ID, legacyDescendant.ID} {
+		_, err := registry.Dispatch(context.Background(), mkCall("get_task_result", map[string]any{"task_id": taskID}))
+		if err == nil || !strings.Contains(err.Error(), "不属于当前 Graph g-current") {
+			t.Fatalf("Graph caller must not read cross-scope task %s: %v", taskID, err)
+		}
+	}
+	if _, err := registry.Dispatch(context.Background(), mkCall("get_task_result", map[string]any{"task_id": processingPeer.ID})); err == nil || !strings.Contains(err.Error(), "Results 仅在终态后") {
+		t.Fatalf("same-Graph processing result must remain unreadable: %v", err)
+	}
+}
+
+// 可见性（C6b）：legacy Scheduler 只能读取自己 SchedulerBatch / ParentTaskID
+// 谱系内的非 Graph 任务结果（store.LegacyRequestTaskIDs）；其他 scope 一律拒绝。
 func TestSchedulerGroup_GetTaskResultLegacyScope(t *testing.T) {
 	s, controller := newLegacyResultFixture(t, 64)
 	samePlan := &model.Task{ID: "same-plan", ParentTaskID: controller.ID}
@@ -209,6 +321,8 @@ func TestSchedulerGroup_GetTaskResultLegacyScope(t *testing.T) {
 	publishCompletedResultTask(t, s, unrelated, map[string]string{"worker": "secret"})
 	labelOnly := &model.Task{ID: "label-only", BatchID: controller.ID, Dependencies: []string{samePlan.ID}}
 	publishCompletedResultTask(t, s, labelOnly, map[string]string{"worker": "label"})
+	graphDescendant := &model.Task{ID: "graph-descendant", GraphID: "g-isolated", ParentTaskID: controller.ID}
+	publishCompletedResultTask(t, s, graphDescendant, map[string]string{"worker": "graph secret"})
 
 	registry := newResultToolRegistry(SchedulerGroup{Store: s, Holder: &fakeHolder{id: controller.ID}})
 	for _, taskID := range []string{samePlan.ID, batchOnly.ID, descendant.ID} {
@@ -220,6 +334,9 @@ func TestSchedulerGroup_GetTaskResultLegacyScope(t *testing.T) {
 		if _, err := registry.Dispatch(context.Background(), mkCall("get_task_result", map[string]any{"task_id": taskID})); err == nil || !strings.Contains(err.Error(), "batch/lineage") {
 			t.Fatalf("unrelated legacy task %s should be rejected: %v", taskID, err)
 		}
+	}
+	if _, err := registry.Dispatch(context.Background(), mkCall("get_task_result", map[string]any{"task_id": graphDescendant.ID})); err == nil || !strings.Contains(err.Error(), "不属于当前 legacy Scheduler scope") {
+		t.Fatalf("legacy caller must not cross into Graph scope through ParentTaskID: %v", err)
 	}
 }
 

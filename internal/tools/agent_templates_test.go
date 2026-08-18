@@ -185,3 +185,56 @@ func TestAgentTemplateGroupRejectsMalformedReplicaCount(t *testing.T) {
 		t.Fatal("malformed replica count reached runtime provisioner")
 	}
 }
+
+func TestAgentTemplateGroupBindsGraphOwnershipAndInheritsCurrentGraph(t *testing.T) {
+	catalog, err := agenttemplate.Load(agenttemplate.LoadOptions{
+		DefaultModel: "test-model", ValidateTools: ValidateToolNames,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 16), 32, 1, 60)
+	root := newProcessingController(t, taskStore)
+	provisioner := &recordingTemplateProvisioner{}
+	group := AgentTemplateGroup{
+		Catalog: catalog, Provisioner: provisioner, Store: taskStore,
+		Holder: &fakeHolder{id: root.ID},
+	}
+	if _, err := group.provision(context.Background(), map[string]any{
+		"template_ref": "builtin/generalist@1", "purpose": "graph work", "graph_id": "g-owned",
+	}); err != nil {
+		t.Fatalf("root Graph provision: %v", err)
+	}
+	if provisioner.last.GraphID != "g-owned" {
+		t.Fatalf("GraphID not forwarded: %+v", provisioner.last)
+	}
+
+	graphController := &model.Task{
+		Description: "graph controller", EventType: "__scheduler__", GraphID: "g-active",
+	}
+	if err := taskStore.PublishTask(graphController); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskStore.ClaimTask("scheduler", graphController.ID); err != nil {
+		t.Fatal(err)
+	}
+	group.Holder = &fakeHolder{id: graphController.ID}
+	if _, err := group.provision(context.Background(), map[string]any{
+		"template_ref": "builtin/explorer@1", "purpose": "expand graph",
+	}); err != nil {
+		t.Fatalf("inherit current Graph: %v", err)
+	}
+	if provisioner.last.GraphID != "g-active" {
+		t.Fatalf("current Graph not inherited: %+v", provisioner.last)
+	}
+	if _, err := group.provision(context.Background(), map[string]any{
+		"template_ref": "builtin/explorer@1", "purpose": "wrong graph", "graph_id": "g-other",
+	}); err == nil || !strings.Contains(err.Error(), "拒绝跨 Graph") {
+		t.Fatalf("cross-Graph provision err=%v", err)
+	}
+	if _, err := group.provision(context.Background(), map[string]any{
+		"template_ref": "builtin/explorer@1", "purpose": "bad graph", "graph_id": "bad graph!",
+	}); err == nil || !strings.Contains(err.Error(), "graph_id") {
+		t.Fatalf("invalid GraphID err=%v", err)
+	}
+}

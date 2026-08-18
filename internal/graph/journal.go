@@ -37,18 +37,29 @@ const (
 	journalKindExecutionStatus = "execution_status"
 	// journalKindTransition 是边选择生效记录（RecordTransition，V6 §6-17）。
 	journalKindTransition = "transition"
+	// journalKindActivationResult 是 activation 级不可变完整 Result。它先于
+	// 节点终态落盘，使随后任一 TransitionRecord.ResultRef 都必可解引用。
+	journalKindActivationResult = "activation_result"
+
+	// journalIntegrityVersion 是新写 journal 的链式完整性格式。旧记录没有
+	// 该字段，恢复时只作为 legacy 前缀兼容；一旦进入此版本，后续记录不得
+	// 再降级为无摘要格式。
+	journalIntegrityVersion = 1
 )
 
 // journalEntry 是一条 append-only 变更日志。Digest 记录应用本条后的执行
 // 语义摘要，恢复时逐条重算对照（含日志尾，V6 §6-13）。
 type journalEntry struct {
-	Seq          int64           `json:"seq"`
-	Kind         string          `json:"kind"`
-	Revision     int64           `json:"revision"`
-	StateVersion int64           `json:"state_version"`
-	Digest       string          `json:"digest"`
-	At           time.Time       `json:"at"`
-	Payload      json.RawMessage `json:"payload"`
+	Seq              int64           `json:"seq"`
+	Kind             string          `json:"kind"`
+	Revision         int64           `json:"revision"`
+	StateVersion     int64           `json:"state_version"`
+	Digest           string          `json:"digest"`
+	At               time.Time       `json:"at"`
+	Payload          json.RawMessage `json:"payload"`
+	IntegrityVersion int             `json:"integrity_version,omitempty"`
+	PreviousDigest   string          `json:"previous_digest,omitempty"`
+	EntryDigest      string          `json:"entry_digest,omitempty"`
 }
 
 // 各 kind 的类型化 payload。
@@ -87,29 +98,70 @@ type executionStatusPayload struct {
 	To        NodeStatus `json:"to"`
 }
 
+type activationResultPayload = ActivationResult
+
 // transitionPayload 是 transition 记录的 payload，与 TransitionRecord 同形
 // （定义见 store.go）。
 
-// buildJournalLine 构造一条 journal 记录（含应用后摘要）并序列化为一行。
-func buildJournalLine(seq int64, kind string, doc *GraphDocument, payload any) ([]byte, string, error) {
+// buildJournalLine 构造一条 journal 记录并序列化为一行。Digest 继续表示
+// Graph 定义语义摘要；EntryDigest 则覆盖本记录的身份、payload、时间与前一
+// 条 EntryDigest，防止不进入 GraphDocument 的 Result/Transition 账本被合法
+// JSON 位翻后静默重放。
+func buildJournalLine(seq int64, kind string, doc *GraphDocument, payload any, previousDigest string) ([]byte, string, string, error) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return nil, "", fmt.Errorf("graph: 编码 journal payload: %w", err)
+		return nil, "", "", fmt.Errorf("graph: 编码 journal payload: %w", err)
 	}
-	digest := ComputeDigest(doc)
-	line, err := json.Marshal(journalEntry{
-		Seq:          seq,
-		Kind:         kind,
-		Revision:     doc.Revision,
-		StateVersion: doc.StateVersion,
-		Digest:       digest,
-		At:           time.Now().UTC(),
-		Payload:      raw,
-	})
+	entry := journalEntry{
+		Seq:              seq,
+		Kind:             kind,
+		Revision:         doc.Revision,
+		StateVersion:     doc.StateVersion,
+		Digest:           ComputeDigest(doc),
+		At:               time.Now().UTC(),
+		Payload:          raw,
+		IntegrityVersion: journalIntegrityVersion,
+		PreviousDigest:   previousDigest,
+	}
+	entry.EntryDigest = computeJournalEntryDigest(&entry)
+	line, err := json.Marshal(entry)
 	if err != nil {
-		return nil, "", fmt.Errorf("graph: 编码 journal 记录: %w", err)
+		return nil, "", "", fmt.Errorf("graph: 编码 journal 记录: %w", err)
 	}
-	return line, digest, nil
+	return line, entry.Digest, entry.EntryDigest, nil
+}
+
+// journalDigestInput 排除 EntryDigest 自身，避免循环；其余恢复语义与审计
+// 字段全部纳入。Payload 保留 durable 原始字节，Result 的不可变性是字节级。
+type journalDigestInput struct {
+	Domain           string          `json:"domain"`
+	IntegrityVersion int             `json:"integrity_version"`
+	Seq              int64           `json:"seq"`
+	Kind             string          `json:"kind"`
+	Revision         int64           `json:"revision"`
+	StateVersion     int64           `json:"state_version"`
+	Digest           string          `json:"digest"`
+	At               time.Time       `json:"at"`
+	PreviousDigest   string          `json:"previous_digest"`
+	Payload          json.RawMessage `json:"payload"`
+}
+
+func computeJournalEntryDigest(entry *journalEntry) string {
+	if entry == nil {
+		return ""
+	}
+	return hashCanonical(journalDigestInput{
+		Domain:           "agentgo.graph.journal/v1",
+		IntegrityVersion: entry.IntegrityVersion,
+		Seq:              entry.Seq,
+		Kind:             entry.Kind,
+		Revision:         entry.Revision,
+		StateVersion:     entry.StateVersion,
+		Digest:           entry.Digest,
+		At:               entry.At,
+		PreviousDigest:   entry.PreviousDigest,
+		Payload:          entry.Payload,
+	})
 }
 
 // journalSink 抽象 journal 落盘（append+fsync / 压缩截断 / 关闭），
@@ -179,7 +231,10 @@ func (w *journalWriter) close() error {
 // snapshot
 // ============================================================
 
-const snapshotVersion = 1
+const (
+	snapshotVersionLegacy = 1
+	snapshotVersion       = 2
+)
 
 // snapshotFile 是 snapshot.json 的内容：完整 GraphDocument + 持久化游标。
 // Transitions 与 ActivationSeq 是 Graph Runtime 的 entry 级簿记（不属于
@@ -193,25 +248,34 @@ type snapshotFile struct {
 	StateVersion int64          `json:"state_version"`
 	Digest       string         `json:"digest"`
 	Doc          *GraphDocument `json:"doc"`
+	// ChainDigest 是 seq 对应的最后一条 journal EntryDigest；IntegrityDigest
+	// 覆盖本快照游标、完整 Doc 与排序后的全部 entry 级账本。Digest 仍只保留
+	// 既有的定义语义含义，避免破坏读取 API。
+	ChainDigest     string `json:"chain_digest,omitempty"`
+	IntegrityDigest string `json:"integrity_digest,omitempty"`
 
-	Transitions   []TransitionRecord `json:"transitions,omitempty"`    // 已生效边选择（排序后全量）
-	ActivationSeq map[string]int     `json:"activation_seq,omitempty"` // node_id → 已分配的最大 activation 序号
+	Transitions       []TransitionRecord `json:"transitions,omitempty"`        // 已生效边选择（排序后全量）
+	ActivationResults []ActivationResult `json:"activation_results,omitempty"` // activation 级完整 Result（按 ref 排序）
+	ActivationSeq     map[string]int     `json:"activation_seq,omitempty"`     // node_id → 已分配的最大 activation 序号
 }
 
 // compactLocked 压缩：写新 snapshot（含当前 seq）→ 截断 journal → 计数清零。
 // 调用方持 e.mu；失败返回错误，由调用方标记 degraded。
 func (e *entry) compactLocked() error {
 	snap := &snapshotFile{
-		Version:       snapshotVersion,
-		GraphID:       e.doc.GraphID,
-		Seq:           e.seq,
-		Revision:      e.doc.Revision,
-		StateVersion:  e.doc.StateVersion,
-		Digest:        e.digest,
-		Doc:           e.doc,
-		Transitions:   sortedTransitionRecords(e.transitions),
-		ActivationSeq: maps.Clone(e.activationSeq),
+		Version:           snapshotVersion,
+		GraphID:           e.doc.GraphID,
+		Seq:               e.seq,
+		Revision:          e.doc.Revision,
+		StateVersion:      e.doc.StateVersion,
+		Digest:            e.digest,
+		Doc:               e.doc,
+		ChainDigest:       e.chainDigest,
+		Transitions:       sortedTransitionRecords(e.transitions),
+		ActivationResults: sortedActivationResults(e.activationResults),
+		ActivationSeq:     maps.Clone(e.activationSeq),
 	}
+	snap.IntegrityDigest = computeSnapshotIntegrityDigest(snap)
 	if err := writeSnapshotAtomic(filepath.Join(e.dir, snapshotFileName), snap); err != nil {
 		return err
 	}
@@ -232,7 +296,10 @@ func writeSnapshotAtomic(path string, snap *snapshotFile) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("graph: 创建 snapshot 目录: %w", err)
 	}
-	data, err := json.MarshalIndent(snap, "", "  ")
+	// 不用 MarshalIndent：ActivationResult.Result / EdgeInput.Result 是
+	// json.RawMessage，缩进器会改写其权威字节，导致 snapshot 压缩前后同一
+	// stable ResultRef 解出不同内容。紧凑编码同时保持跨平台确定性。
+	data, err := json.Marshal(snap)
 	if err != nil {
 		return fmt.Errorf("graph: 编码 snapshot: %w", err)
 	}

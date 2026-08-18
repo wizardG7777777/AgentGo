@@ -46,9 +46,11 @@ func LoadProjectRules(projectRoot string) (*ProjectRules, error) {
 	return &rules, nil
 }
 
-// MergeRules 合并默认规则 + 全局自定义 + 项目级补丁
-// 优先级：默认规则 < 全局自定义 < 项目级 add < 项目级 remove
-func MergeRules(defaultRules, globalCustom []string, patch RulePatch) []string {
+// MergeRules 合并默认规则 + 全局自定义 + 项目级补丁。
+// allowProtectedRemovals=false 时，项目规则的 remove 不能删除系统默认规则或
+// 受信任主配置追加的规则，因此项目文件对安全基线只有追加权。只有受信任
+// 主配置显式开启降级开关时，才允许恢复旧的“基线规则也可删除”语义。
+func MergeRules(defaultRules, globalCustom []string, patch RulePatch, allowProtectedRemovals bool) []string {
 	// 1. 基础：默认规则 + 全局自定义
 	merged := make([]string, 0, len(defaultRules)+len(globalCustom)+len(patch.Add))
 	merged = append(merged, defaultRules...)
@@ -56,6 +58,13 @@ func MergeRules(defaultRules, globalCustom []string, patch RulePatch) []string {
 
 	// 2. 去重集合
 	ruleSet := make(map[string]bool)
+	protected := make(map[string]bool, len(defaultRules)+len(globalCustom))
+	for _, r := range defaultRules {
+		protected[r] = true
+	}
+	for _, r := range globalCustom {
+		protected[r] = true
+	}
 	for _, r := range merged {
 		ruleSet[r] = true
 	}
@@ -67,6 +76,9 @@ func MergeRules(defaultRules, globalCustom []string, patch RulePatch) []string {
 
 	// 4. 应用 remove 补丁
 	for _, r := range patch.Remove {
+		if protected[r] && !allowProtectedRemovals {
+			continue
+		}
 		delete(ruleSet, r)
 	}
 
@@ -81,7 +93,7 @@ func MergeRules(defaultRules, globalCustom []string, patch RulePatch) []string {
 
 // BuildFilter 从配置和项目规则构建 CommandFilter
 // 便捷函数，封装整个规则加载和合并流程
-func BuildFilter(projectRoot string, shellBlacklist, shellGreylist []string) (*CommandFilter, error) {
+func BuildFilter(projectRoot string, shellBlacklist, shellGreylist []string, allowProjectRuleRemovals bool) (*CommandFilter, error) {
 	// 加载项目级规则
 	projectRules, err := LoadProjectRules(projectRoot)
 	if err != nil {
@@ -93,6 +105,7 @@ func BuildFilter(projectRoot string, shellBlacklist, shellGreylist []string) (*C
 		DefaultBlacklist,
 		shellBlacklist,
 		projectRules.ShellRules.Blacklist,
+		allowProjectRuleRemovals,
 	)
 
 	// 合并灰名单
@@ -100,6 +113,7 @@ func BuildFilter(projectRoot string, shellBlacklist, shellGreylist []string) (*C
 		DefaultGreylist,
 		shellGreylist,
 		projectRules.ShellRules.Greylist,
+		allowProjectRuleRemovals,
 	)
 
 	return NewCommandFilter(blacklist, greylist), nil

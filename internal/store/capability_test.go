@@ -171,6 +171,31 @@ func TestClaimTask_CapabilityBlocked(t *testing.T) {
 	}
 }
 
+func TestRouteScopeCheckerFiltersQueryAndBlocksDirectClaim(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	wantScope := model.GraphRouteScope("g-owned")
+	s.SetCapabilityChecker(func(_ string, task *model.Task) error {
+		if task.RouteScope != wantScope {
+			return fmt.Errorf("route scope %q is not %q", task.RouteScope, wantScope)
+		}
+		return nil
+	})
+	owned := &model.Task{ID: "owned", GraphID: "g-owned", EventType: "team:work", RouteScope: wantScope}
+	foreign := &model.Task{ID: "foreign", GraphID: "g-foreign", EventType: "team:work", RouteScope: model.GraphRouteScope("g-foreign")}
+	for _, task := range []*model.Task{owned, foreign} {
+		if err := s.PublishTask(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	visible, err := s.QueryAvailable("team:work", "team-agent")
+	if err != nil || len(visible) != 1 || visible[0].ID != owned.ID {
+		t.Fatalf("scope-filtered query=%+v err=%v", visible, err)
+	}
+	if err := s.ClaimTask("team-agent", foreign.ID); !errors.Is(err, ErrTaskClaimBlocked) {
+		t.Fatalf("cross-scope direct claim err=%v, want ErrTaskClaimBlocked", err)
+	}
+}
+
 // 依赖统一要求 completed：依赖处于其他终态（failed）时认领被拒，
 // 不再有「依赖终态即可」的放宽路径。
 func TestClaimTask_FailedDependencyRejected(t *testing.T) {
@@ -232,6 +257,8 @@ func TestCloneTask_CapabilityDeepCopy(t *testing.T) {
 func TestSnapshot_CapabilityRoundTrip(t *testing.T) {
 	src, _ := newTestStore(10, 100)
 	withCap := &model.Task{Description: "带能力", EventType: "code",
+		GraphID: "g-snapshot", NodeID: "verify", ActivationID: "verify@1", GraphNodeKind: "acceptance",
+		RouteScope: model.GraphRouteScope("g-snapshot"),
 		Capability: &model.NodeCapability{Tools: []string{"read_file", "grep_search"}, Model: "m-node"}}
 	noCap := &model.Task{Description: "无能力", EventType: "code"}
 	for _, task := range []*model.Task{withCap, noCap} {
@@ -277,6 +304,13 @@ func TestSnapshot_CapabilityRoundTrip(t *testing.T) {
 	}
 	if got.Capability.Model != "m-node" {
 		t.Fatalf("Capability.Model 往返后 = %q，want m-node", got.Capability.Model)
+	}
+	if got.RouteScope != model.GraphRouteScope("g-snapshot") {
+		t.Fatalf("RouteScope 往返后 = %q", got.RouteScope)
+	}
+	if got.GraphID != "g-snapshot" || got.NodeID != "verify" || got.ActivationID != "verify@1" || got.GraphNodeKind != "acceptance" {
+		t.Fatalf("Graph 角色身份快照往返后不完整: graph=%q node=%q activation=%q kind=%q",
+			got.GraphID, got.NodeID, got.ActivationID, got.GraphNodeKind)
 	}
 
 	plain, err := dst.GetTask(noCap.ID)

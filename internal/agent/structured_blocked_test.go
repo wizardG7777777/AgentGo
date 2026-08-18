@@ -160,6 +160,7 @@ func TestFinalizationShortCircuitStructuredBlockedGraphTask(t *testing.T) {
 		Status:        SubmitStatusBlocked,
 		Event:         "ready",
 		Verdict:       "pass",
+		ResultJSON:    `{"missing_dependency":"catalog","retryable":true}`,
 	})
 
 	if got.Status != model.TaskStatusBlocked {
@@ -170,6 +171,13 @@ func TestFinalizationShortCircuitStructuredBlockedGraphTask(t *testing.T) {
 	}
 	if _, ok := got.Results["verdict"]; ok {
 		t.Error("blocked 收尾不应写 Results[\"verdict\"]")
+	}
+	structured, err := DecodeStructuredResult(got.Results[StructuredResultStorageKey])
+	if err != nil {
+		t.Fatalf("blocked 结构化 result 必须先于终态 durable: %v", err)
+	}
+	if structured["missing_dependency"] != "catalog" || structured["retryable"] != true {
+		t.Fatalf("blocked 结构化 result 未类型保真: %#v", structured)
 	}
 	if wake := findReplanWakeTask(t, s, got.ID); wake != nil {
 		t.Errorf("图任务不应发布 replan 唤醒任务，实际 %+v", wake)

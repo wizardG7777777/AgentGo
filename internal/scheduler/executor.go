@@ -187,10 +187,14 @@ func (e *SchedulerExecutor) Execute(
 	}
 	if e.AgentRegistry != nil {
 		// Multiple static kinds may share the default queue. Publish-time routing
-		// can only rely on tools guaranteed across every possible claimant. The
-		// owner scope is the current controller task itself: its dynamic Teams
-		// plus all global static routes are visible.
-		workerCaps, hasWorkerRoute = e.AgentRegistry.RouteCapabilitiesForPlan(task.ID, "")
+		// can only rely on tools guaranteed across every possible claimant. Graph
+		// controllers use their durable GraphID as the owner scope; legacy
+		// controllers retain their task ID scope.
+		ownerScope := model.TaskRouteScope(task.ID)
+		if task.GraphID != "" {
+			ownerScope = model.GraphRouteScope(task.GraphID)
+		}
+		workerCaps, hasWorkerRoute = e.AgentRegistry.RouteCapabilitiesForPlan(ownerScope, "")
 	}
 	var workerCapability *AgentCapabilityInfo
 	if hasWorkerRoute {
@@ -211,6 +215,7 @@ func (e *SchedulerExecutor) Execute(
 		ToolHealth:                  e.ToolHealth,
 		PendingDownstreamTasks:      e.buildPendingDownstreamInfo(downstream),
 		CurrentControllerTaskID:     task.ID,
+		CurrentGraphID:              task.GraphID,
 	})
 
 	// 注入为 IncomingMail 风格的 history entry，与 mailbox 注入对称

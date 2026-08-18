@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"sort"
 )
 
 // ComputeDigest 计算图的执行语义摘要（sha256，hex 编码）。
@@ -29,12 +30,79 @@ func ComputeDigest(doc *GraphDocument) string {
 	for id, node := range doc.Nodes {
 		canonical.Nodes[id] = canonicalizeNode(node)
 	}
-	buf, err := json.Marshal(canonical)
+	return hashCanonical(canonical)
+}
+
+// hashCanonical 对只含 JSON 可序列化字段的内部规范结构求 sha256。调用方
+// 必须先决定哪些字节属于权威语义；编码失败仅可能来自编程错误，返回空串让
+// 上层完整性校验 fail-closed。
+func hashCanonical(value any) string {
+	buf, err := json.Marshal(value)
 	if err != nil {
-		return "" // 规范化结构不含不可序列化内容，理论不可达
+		return ""
 	}
 	sum := sha256.Sum256(buf)
 	return hex.EncodeToString(sum[:])
+}
+
+type activationSequenceDigestEntry struct {
+	NodeID string `json:"node_id"`
+	Seq    int    `json:"seq"`
+}
+
+// snapshotIntegrityInput 是 snapshot v2 的完整性权威：不仅覆盖定义摘要，
+// 还覆盖完整运行态 Doc、边选择、activation Result/Evidence 与序号表。
+type snapshotIntegrityInput struct {
+	Domain            string                          `json:"domain"`
+	Version           int                             `json:"version"`
+	GraphID           string                          `json:"graph_id"`
+	Seq               int64                           `json:"seq"`
+	Revision          int64                           `json:"revision"`
+	StateVersion      int64                           `json:"state_version"`
+	Digest            string                          `json:"digest"`
+	ChainDigest       string                          `json:"chain_digest"`
+	Doc               *GraphDocument                  `json:"doc"`
+	Transitions       []TransitionRecord              `json:"transitions"`
+	ActivationResults []ActivationResult              `json:"activation_results"`
+	ActivationSeq     []activationSequenceDigestEntry `json:"activation_seq"`
+}
+
+func computeSnapshotIntegrityDigest(snap *snapshotFile) string {
+	if snap == nil {
+		return ""
+	}
+	seq := make([]activationSequenceDigestEntry, 0, len(snap.ActivationSeq))
+	for nodeID, n := range snap.ActivationSeq {
+		seq = append(seq, activationSequenceDigestEntry{NodeID: nodeID, Seq: n})
+	}
+	sort.Slice(seq, func(i, j int) bool { return seq[i].NodeID < seq[j].NodeID })
+	transitions := append([]TransitionRecord(nil), snap.Transitions...)
+	sort.Slice(transitions, func(i, j int) bool {
+		a, b := transitions[i], transitions[j]
+		if a.SourceActivationID != b.SourceActivationID {
+			return a.SourceActivationID < b.SourceActivationID
+		}
+		if a.TransitionID != b.TransitionID {
+			return a.TransitionID < b.TransitionID
+		}
+		return a.TargetNodeID < b.TargetNodeID
+	})
+	results := append([]ActivationResult(nil), snap.ActivationResults...)
+	sort.Slice(results, func(i, j int) bool { return results[i].Ref < results[j].Ref })
+	return hashCanonical(snapshotIntegrityInput{
+		Domain:            "agentgo.graph.snapshot/v2",
+		Version:           snap.Version,
+		GraphID:           snap.GraphID,
+		Seq:               snap.Seq,
+		Revision:          snap.Revision,
+		StateVersion:      snap.StateVersion,
+		Digest:            snap.Digest,
+		ChainDigest:       snap.ChainDigest,
+		Doc:               snap.Doc,
+		Transitions:       transitions,
+		ActivationResults: results,
+		ActivationSeq:     seq,
+	})
 }
 
 // canonicalDoc 是 digest 的规范化输入：仅执行语义字段。
@@ -76,17 +144,17 @@ type canonicalSubgraph struct {
 
 // canonicalCapability 与 Capability 同形，omitempty 把空值与缺省归一。
 type canonicalCapability struct {
-	Tools     []string           `json:"tools,omitempty"`
-	Model     string             `json:"model,omitempty"`
-	Isolation string             `json:"isolation,omitempty"`
-	Budget    map[string]float64 `json:"budget,omitempty"`
+	Tools     []string `json:"tools,omitempty"`
+	Model     string   `json:"model,omitempty"`
+	Isolation string   `json:"isolation,omitempty"`
 }
 
 // canonicalTransition 与 Transition 同形，Value 经解码重编码规范化。
 type canonicalTransition struct {
-	To         string              `json:"to"`
-	Activation string              `json:"activation,omitempty"`
-	When       *canonicalCondition `json:"when,omitempty"`
+	To          string              `json:"to"`
+	Activation  string              `json:"activation,omitempty"`
+	TargetInput string              `json:"target_input,omitempty"`
+	When        *canonicalCondition `json:"when,omitempty"`
 }
 
 // canonicalCondition 的 omitempty 保证事件形态与条件形态序列化互不污染。
@@ -102,14 +170,17 @@ func canonicalizeNode(node Node) canonicalNode {
 	cn := canonicalNode{Kind: node.Kind}
 
 	// 全空的 task 与缺省等价，归一为 nil
-	if node.Task != nil && *node.Task != (NodeTask{}) {
+	if node.Task != nil && (node.Task.Title != "" || node.Task.Description != "" ||
+		len(node.Task.RequiredInputs) > 0 || len(node.Task.RequiredEvidence) > 0) {
 		task := *node.Task
+		task.RequiredInputs = append([]string(nil), node.Task.RequiredInputs...)
+		task.RequiredEvidence = append([]EvidenceRequirement(nil), node.Task.RequiredEvidence...)
 		cn.Task = &task
 	}
 
 	// 全空的 capability 与缺省等价，归一为 nil
 	if c := node.Capability; c != nil &&
-		(len(c.Tools) > 0 || c.Model != "" || c.Isolation != "" || len(c.Budget) > 0) {
+		(len(c.Tools) > 0 || c.Model != "" || c.Isolation != "") {
 		cc := &canonicalCapability{
 			Model:     c.Model,
 			Isolation: c.Isolation,
@@ -117,19 +188,13 @@ func canonicalizeNode(node Node) canonicalNode {
 		if len(c.Tools) > 0 {
 			cc.Tools = append([]string(nil), c.Tools...)
 		}
-		if len(c.Budget) > 0 {
-			cc.Budget = make(map[string]float64, len(c.Budget))
-			for k, v := range c.Budget {
-				cc.Budget[k] = v
-			}
-		}
 		cn.Capability = cc
 	}
 
 	// nil 与空切片归一为 []（next 是必序列化字段）
 	cn.Next = make([]canonicalTransition, 0, len(node.Next))
 	for _, tr := range node.Next {
-		ct := canonicalTransition{To: tr.To, Activation: tr.Activation}
+		ct := canonicalTransition{To: tr.To, Activation: tr.Activation, TargetInput: tr.TargetInput}
 		if tr.When != nil {
 			ct.When = &canonicalCondition{
 				Event:    tr.When.Event,

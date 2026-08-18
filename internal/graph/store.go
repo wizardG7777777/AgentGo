@@ -1,15 +1,18 @@
 package graph
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // 本文件实现 V6 §6 第 9–14 条的 GraphStore：内存中的有类型 GraphDocument
@@ -123,10 +126,17 @@ type TransitionRecord struct {
 	SourceActivationID string `json:"source_activation_id"`
 	TransitionID       int    `json:"transition_id"` // 源节点 next 下标
 	TargetNodeID       string `json:"target_node_id"`
+	// TargetInput 冻结源边写入目标 activation 的输入端口；readiness 只读取
+	// durable record，不在恢复时重新解释可能已 patch 的定义。
+	TargetInput string `json:"target_input,omitempty"`
 	// TargetActivationID 在边选择 durable 时一并冻结。目标若已有在途
 	// activation 则指向它；否则预留下一个单调 ID。恢复不再根据目标当前
 	// status 猜测这条边是否已经创建过新 activation。
 	TargetActivationID string `json:"target_activation_id,omitempty"`
+	// Input 是这条实际生效转移绑定的源 activation 输出（数据流图持久化
+	// InputRef，见 types.go EdgeInput）：与边选择同条 journal 记录落盘。
+	// 历史 journal 记录无此字段（nil），消费方按"仅有来源标识"回落。
+	Input *EdgeInput `json:"input,omitempty"`
 }
 
 // transitionPayload 是 transition journal 记录的 payload，与 TransitionRecord 同形。
@@ -143,7 +153,7 @@ type transitionKey struct {
 func sortedTransitionRecords(set map[transitionKey]TransitionRecord) []TransitionRecord {
 	out := make([]TransitionRecord, 0, len(set))
 	for _, rec := range set {
-		out = append(out, rec)
+		out = append(out, cloneTransitionRecord(rec))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		a, b := out[i], out[j]
@@ -156,6 +166,92 @@ func sortedTransitionRecords(set map[transitionKey]TransitionRecord) []Transitio
 		return a.TargetNodeID < b.TargetNodeID
 	})
 	return out
+}
+
+func cloneTransitionRecord(in TransitionRecord) TransitionRecord {
+	out := in
+	if in.Input != nil {
+		input := *in.Input
+		input.EvidenceRefs = append([]string(nil), in.Input.EvidenceRefs...)
+		input.Result = append(json.RawMessage(nil), in.Input.Result...)
+		input.Evidence = make([]EvidenceEntry, len(in.Input.Evidence))
+		for i := range in.Input.Evidence {
+			input.Evidence[i] = cloneEvidenceEntry(in.Input.Evidence[i])
+		}
+		out.Input = &input
+	}
+	return out
+}
+
+// activationResultRef 是 activation 级 Result 的稳定身份。graph_id 与
+// activation_id 都已经过各自权威校验，引用只作不透明字符串比较/解引用。
+func activationResultRef(graphID, activationID string) string {
+	return "graph-result:" + graphID + ":" + activationID
+}
+
+func sortedActivationResults(set map[string]ActivationResult) []ActivationResult {
+	refs := make([]string, 0, len(set))
+	for ref := range set {
+		refs = append(refs, ref)
+	}
+	sort.Strings(refs)
+	out := make([]ActivationResult, 0, len(refs))
+	for _, ref := range refs {
+		out = append(out, cloneActivationResult(set[ref]))
+	}
+	return out
+}
+
+func cloneActivationResult(in ActivationResult) ActivationResult {
+	out := in
+	out.Result = append(json.RawMessage(nil), in.Result...)
+	out.Evidence = make([]EvidenceEntry, len(in.Evidence))
+	for i := range in.Evidence {
+		out.Evidence[i] = cloneEvidenceEntry(in.Evidence[i])
+	}
+	return out
+}
+
+func cloneEvidenceEntry(in EvidenceEntry) EvidenceEntry {
+	out := in
+	if in.Success != nil {
+		value := *in.Success
+		out.Success = &value
+	}
+	if in.ExitCode != nil {
+		value := *in.ExitCode
+		out.ExitCode = &value
+	}
+	return out
+}
+
+func sameActivationResult(a, b ActivationResult) bool {
+	if a.Ref != b.Ref || a.NodeID != b.NodeID || a.ActivationID != b.ActivationID ||
+		!bytes.Equal(a.Result, b.Result) || len(a.Evidence) != len(b.Evidence) {
+		return false
+	}
+	for i := range a.Evidence {
+		if !sameEvidenceEntry(a.Evidence[i], b.Evidence[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameEvidenceEntry(a, b EvidenceEntry) bool {
+	if a.Ref != b.Ref || a.Kind != b.Kind || a.Summary != b.Summary ||
+		a.CallID != b.CallID || a.ToolName != b.ToolName ||
+		a.Command != b.Command || a.CommandTruncated != b.CommandTruncated ||
+		a.Path != b.Path || a.PathTruncated != b.PathTruncated {
+		return false
+	}
+	if (a.Success == nil) != (b.Success == nil) || (a.ExitCode == nil) != (b.ExitCode == nil) {
+		return false
+	}
+	if a.Success != nil && *a.Success != *b.Success {
+		return false
+	}
+	return a.ExitCode == nil || *a.ExitCode == *b.ExitCode
 }
 
 // ============================================================
@@ -206,8 +302,9 @@ type GraphSummary struct {
 	Root         string
 	NodeCount    int
 	Digest       string
-	Seq          int64 // 已落盘的 journal 最大 seq
-	Degraded     bool  // 是否处于 persistence-degraded
+	Seq          int64  // 已落盘的 journal 最大 seq
+	Degraded     bool   // 是否处于 persistence-degraded
+	SessionID    string // 图的 session 归属（空串表示尚未归并的历史图）
 }
 
 // Store 是 GraphDocument 的内存主索引 + 持久化协调器。同一图的变更经
@@ -231,6 +328,7 @@ type entry struct {
 	journal        journalSink
 	seq            int64  // 已落盘的 journal 最大 seq
 	digest         string // 已落盘状态的执行语义摘要
+	chainDigest    string // 已落盘 journal 的链式完整性头（snapshot 会冻结）
 	journalEntries int64  // 距上次 snapshot 的 journal 条目数（压缩阈值）
 	journalBytes   int64  // 距上次 snapshot 的 journal 字节数（压缩阈值，近似）
 	degraded       error  // 非 nil 即 persistence-degraded（记录首个失败）
@@ -238,8 +336,9 @@ type entry struct {
 
 	// Graph Runtime 的 entry 级簿记（不属 GraphDocument 契约；snapshot 存
 	// 全量、journal 逐条重放，压缩截断后仍可重建，见 journal.go/recover.go）：
-	transitions   map[transitionKey]TransitionRecord // 已生效边选择（V6 §6-17 幂等身份）
-	activationSeq map[string]int                     // node_id → 已分配的最大 activation 序号（V6 §6-16）
+	transitions       map[transitionKey]TransitionRecord // 已生效边选择（V6 §6-17 幂等身份）
+	activationResults map[string]ActivationResult        // result_ref → activation 级完整 Result
+	activationSeq     map[string]int                     // node_id → 已分配的最大 activation 序号（V6 §6-16）
 }
 
 // NewStore 创建以 dir 为持久化根的 Store（布局 <dir>/<graph_id>/snapshot.json
@@ -305,6 +404,7 @@ func (s *Store) List() []GraphSummary {
 			Digest:       e.digest,
 			Seq:          e.seq,
 			Degraded:     e.degraded != nil,
+			SessionID:    e.doc.SessionID,
 		})
 		e.mu.RUnlock()
 	}
@@ -404,7 +504,7 @@ func (s *Store) SubmitGraph(doc *GraphDocument) error {
 		}
 		return fmt.Errorf("graph: 创建 journal: %w", err)
 	}
-	line, digest, err := buildJournalLine(1, journalKindSubmit, parsed, submitPayload{Doc: parsed})
+	line, digest, chainDigest, err := buildJournalLine(1, journalKindSubmit, parsed, submitPayload{Doc: parsed}, "")
 	if err != nil {
 		_ = jw.close()
 		return err
@@ -414,15 +514,17 @@ func (s *Store) SubmitGraph(doc *GraphDocument) error {
 		return fmt.Errorf("graph: 提交事实落盘失败: %w", err)
 	}
 	s.entries[parsed.GraphID] = &entry{
-		doc:            parsed,
-		journal:        jw,
-		seq:            1,
-		digest:         digest,
-		journalEntries: 1,
-		journalBytes:   int64(len(line)) + 1,
-		dir:            dir,
-		transitions:    make(map[transitionKey]TransitionRecord),
-		activationSeq:  activationSeqFromDoc(parsed),
+		doc:               parsed,
+		journal:           jw,
+		seq:               1,
+		digest:            digest,
+		chainDigest:       chainDigest,
+		journalEntries:    1,
+		journalBytes:      int64(len(line)) + 1,
+		dir:               dir,
+		transitions:       make(map[transitionKey]TransitionRecord),
+		activationResults: make(map[string]ActivationResult),
+		activationSeq:     activationSeqFromDoc(parsed),
 	}
 	return nil
 }
@@ -445,6 +547,9 @@ func (s *Store) PatchGraph(graphID string, baseRevision int64, patch DefinitionP
 			return err
 		}
 		if err := applyPatch(c, &patch); err != nil {
+			return err
+		}
+		if err := validateAuthoringSemantics(c); err != nil {
 			return err
 		}
 		c.Revision++
@@ -538,6 +643,11 @@ func (s *Store) SetExecution(graphID, nodeID string, exec Execution, stateVersio
 	if strings.TrimSpace(exec.Phase) == "" {
 		return fmt.Errorf("graph: execution.phase 不能为空")
 	}
+	if exec.ActivationID != "" {
+		if owner, _, ok := parseActivationID(exec.ActivationID); !ok || owner != nodeID {
+			return fmt.Errorf("graph: execution.activation_id %q 不属于节点 %q", exec.ActivationID, nodeID)
+		}
+	}
 	return s.mutate(graphID, journalKindExecution, executionPayload{NodeID: nodeID, Execution: exec}, false,
 		func(c *GraphDocument) error {
 			if err := checkStateVersion(c, nodeID, stateVersion); err != nil {
@@ -585,6 +695,9 @@ func (s *Store) SetExecutionAndStatus(graphID, nodeID string, exec Execution, to
 	if strings.TrimSpace(exec.ActivationID) == "" {
 		return fmt.Errorf("graph: execution.activation_id 不能为空（Graph Runtime 写入必须携带 activation 上下文）")
 	}
+	if owner, _, ok := parseActivationID(exec.ActivationID); !ok || owner != nodeID {
+		return fmt.Errorf("graph: execution.activation_id %q 不属于节点 %q", exec.ActivationID, nodeID)
+	}
 	return s.mutate(graphID, journalKindExecutionStatus,
 		executionStatusPayload{NodeID: nodeID, Execution: exec, To: to}, false,
 		func(c *GraphDocument) error {
@@ -613,16 +726,13 @@ func (s *Store) SetExecutionAndStatus(graphID, nodeID string, exec Execution, to
 // *TransitionExistsError（errors.Is 匹配 ErrTransitionExists）——调用方
 // 应先 HasTransition 查询再决定是否激活目标，重复记录是防御性兜底。
 func (s *Store) RecordTransition(graphID string, rec TransitionRecord, stateVersion int64) error {
-	if strings.TrimSpace(rec.SourceNodeID) == "" || strings.TrimSpace(rec.SourceActivationID) == "" ||
-		strings.TrimSpace(rec.TargetNodeID) == "" {
-		return fmt.Errorf("graph: 边选择记录的 source_node_id/source_activation_id/target_node_id 均不能为空")
-	}
-	if rec.TransitionID < 0 {
-		return fmt.Errorf("graph: 边选择记录的 transition_id 不能为负: %d", rec.TransitionID)
-	}
+	rec = cloneTransitionRecord(rec)
 	return s.mutate(graphID, journalKindTransition, transitionPayload(rec), false,
 		func(c *GraphDocument) error {
 			if err := checkStateVersion(c, "", stateVersion); err != nil {
+				return err
+			}
+			if err := validateTransitionRecord(graphID, c, rec, nil, false); err != nil {
 				return err
 			}
 			c.StateVersion++
@@ -639,7 +749,7 @@ func (s *Store) HasTransition(graphID, sourceActivationID string, transitionID i
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	rec, ok := e.transitions[transitionKey{sourceActivationID, transitionID}]
-	return rec, ok
+	return cloneTransitionRecord(rec), ok
 }
 
 // Transitions 返回图已生效的边选择记录（确定顺序，见 sortedTransitionRecords）。
@@ -651,6 +761,265 @@ func (s *Store) Transitions(graphID string) []TransitionRecord {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return sortedTransitionRecords(e.transitions)
+}
+
+// RecordActivationResult 在任一边选择前持久化 activation 的完整 Result 与
+// 可解引用证据。身份是 (graph_id, activation_id) 的确定函数；重复写入完全
+// 相同内容幂等，试图用同一 activation 改写结果则 fail-closed。
+//
+// 该 entry 级记录不改变 GraphDocument/state_version，但占用独立 journal seq，
+// 并随 snapshot 压缩保留。
+func (s *Store) RecordActivationResult(graphID string, rec ActivationResult) error {
+	wantRef := activationResultRef(graphID, rec.ActivationID)
+	if rec.Ref == "" {
+		rec.Ref = wantRef
+	}
+	rec = cloneActivationResult(rec)
+	return s.mutate(graphID, journalKindActivationResult, activationResultPayload(rec), false,
+		func(c *GraphDocument) error {
+			if err := validateActivationResultRecord(graphID, c, rec, true); err != nil {
+				return err
+			}
+			return nil // entry 级簿记，不改变 GraphDocument/state_version
+		})
+}
+
+func validateEvidenceEntryBounds(ev EvidenceEntry) error {
+	checks := []struct {
+		name  string
+		value string
+		max   int
+	}{
+		{"ref", ev.Ref, EvidenceIdentityMaxRunes},
+		{"kind", ev.Kind, MaxIDLength},
+		{"summary", ev.Summary, EvidenceSummaryMaxRunes},
+		{"call_id", ev.CallID, EvidenceIdentityMaxRunes},
+		{"tool_name", ev.ToolName, EvidenceIdentityMaxRunes},
+		{"command", ev.Command, EvidenceCommandMaxRunes},
+		{"path", ev.Path, EvidencePathMaxRunes},
+	}
+	for _, check := range checks {
+		if utf8.RuneCountInString(check.value) > check.max {
+			return fmt.Errorf("%s 超过 %d rune 上限", check.name, check.max)
+		}
+	}
+	return nil
+}
+
+// validateActivationResultRecord 是 live 写入、journal 重放与 snapshot 恢复
+// 共用的单记录校验。Result 是路由/数据流权威，必须为 JSON object；仅
+// json.Valid 不足以阻止数组、标量或重复 object key 混入。
+func validateActivationResultRecord(graphID string, doc *GraphDocument, rec ActivationResult, requireNode bool) error {
+	if strings.TrimSpace(rec.NodeID) == "" || strings.TrimSpace(rec.ActivationID) == "" {
+		return fmt.Errorf("graph: activation result 的 node_id/activation_id 均不能为空")
+	}
+	if owner, _, ok := parseActivationID(rec.ActivationID); !ok || owner != rec.NodeID {
+		return fmt.Errorf("graph: activation result 的 activation_id %q 不属于节点 %q", rec.ActivationID, rec.NodeID)
+	}
+	if requireNode {
+		if doc == nil {
+			return fmt.Errorf("graph: activation result %s 校验时缺少 GraphDocument", rec.Ref)
+		}
+		if _, ok := doc.Nodes[rec.NodeID]; !ok {
+			return fmt.Errorf("%w: 图 %s 节点 %s", ErrNodeNotFound, graphID, rec.NodeID)
+		}
+	}
+	wantRef := activationResultRef(graphID, rec.ActivationID)
+	if rec.Ref != wantRef {
+		return fmt.Errorf("graph: activation result ref %q 与稳定引用 %q 不一致", rec.Ref, wantRef)
+	}
+	if err := validateJSONObject(rec.Result, MaxDocumentBytes, "activation result "+rec.Ref+" 的 result"); err != nil {
+		return err
+	}
+	seenEvidence := make(map[string]EvidenceEntry, len(rec.Evidence))
+	for i, ev := range rec.Evidence {
+		if strings.TrimSpace(ev.Ref) == "" || strings.TrimSpace(ev.Kind) == "" {
+			return fmt.Errorf("graph: activation result %s 的 evidence[%d] ref/kind 不能为空", rec.Ref, i)
+		}
+		if err := validateEvidenceEntryBounds(ev); err != nil {
+			return fmt.Errorf("graph: activation result %s 的 evidence[%d] 非法: %w", rec.Ref, i, err)
+		}
+		if previous, exists := seenEvidence[ev.Ref]; exists && !sameEvidenceEntry(previous, ev) {
+			return fmt.Errorf("graph: activation result %s 内 EvidenceRef %q 对应不一致的结构化证据", rec.Ref, ev.Ref)
+		}
+		seenEvidence[ev.Ref] = ev
+	}
+	return nil
+}
+
+func validateJSONObject(raw json.RawMessage, maxBytes int, label string) error {
+	if len(raw) == 0 || !json.Valid(raw) {
+		return fmt.Errorf("graph: %s 不是合法 JSON object", label)
+	}
+	if len(raw) > maxBytes {
+		return fmt.Errorf("graph: %s 为 %d 字节，超过上限 %d", label, len(raw), maxBytes)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return fmt.Errorf("graph: %s 必须是 JSON object", label)
+	}
+	if path, key, duplicate := findDuplicateKey(raw); duplicate {
+		return fmt.Errorf("graph: %s 含重复键 %q（path=%s）", label, key, path)
+	}
+	return nil
+}
+
+// validateActivationResultAgainstLedger 保证 ResultRef 与 EvidenceRef 都是
+// 不可变身份。同一 ResultRef 的完全相同重放可幂等；内容冲突 fail-closed。
+func validateActivationResultAgainstLedger(rec ActivationResult, ledger map[string]ActivationResult) error {
+	evidenceByRef := make(map[string]EvidenceEntry)
+	for ref, existing := range ledger {
+		if ref == rec.Ref {
+			if sameActivationResult(existing, rec) {
+				return nil
+			}
+			return fmt.Errorf("graph: activation result %s 已存在且内容不一致，拒绝改写", rec.Ref)
+		}
+		for _, evidence := range existing.Evidence {
+			if previous, ok := evidenceByRef[evidence.Ref]; ok && !sameEvidenceEntry(previous, evidence) {
+				return fmt.Errorf("graph: ledger 中 EvidenceRef %q 已对应不一致的结构化证据", evidence.Ref)
+			}
+			evidenceByRef[evidence.Ref] = evidence
+		}
+	}
+	for _, evidence := range rec.Evidence {
+		if previous, ok := evidenceByRef[evidence.Ref]; ok && !sameEvidenceEntry(previous, evidence) {
+			return fmt.Errorf("graph: EvidenceRef %q 已由其它 activation 绑定不同结构化证据", evidence.Ref)
+		}
+	}
+	return nil
+}
+
+// validateTransitionRecord 校验 durable 边身份及其可选数据流绑定。allowLegacy
+// 只允许旧记录省略 TargetActivationID/Input；一旦携带 ResultRef，始终要求它
+// 等于来源 activation 的稳定引用且能解到同源不可变 Result。
+func validateTransitionRecord(graphID string, doc *GraphDocument, rec TransitionRecord, results map[string]ActivationResult, allowLegacy bool) error {
+	if strings.TrimSpace(rec.SourceNodeID) == "" || strings.TrimSpace(rec.SourceActivationID) == "" ||
+		strings.TrimSpace(rec.TargetNodeID) == "" {
+		return fmt.Errorf("graph: 边选择记录的 source_node_id/source_activation_id/target_node_id 均不能为空")
+	}
+	if rec.TransitionID < 0 {
+		return fmt.Errorf("graph: 边选择记录的 transition_id 不能为负: %d", rec.TransitionID)
+	}
+	if owner, _, ok := parseActivationID(rec.SourceActivationID); !ok || owner != rec.SourceNodeID {
+		return fmt.Errorf("graph: 边选择记录的 source_activation_id %q 不属于节点 %q", rec.SourceActivationID, rec.SourceNodeID)
+	}
+	if rec.TargetActivationID == "" {
+		if !allowLegacy {
+			return fmt.Errorf("graph: 边选择记录缺少 target_activation_id")
+		}
+	} else if owner, _, ok := parseActivationID(rec.TargetActivationID); !ok || owner != rec.TargetNodeID {
+		return fmt.Errorf("graph: 边选择记录的 target_activation_id %q 不属于节点 %q", rec.TargetActivationID, rec.TargetNodeID)
+	}
+	if doc != nil {
+		if _, ok := doc.Nodes[rec.SourceNodeID]; !ok {
+			return fmt.Errorf("%w: 图 %s 来源节点 %s", ErrNodeNotFound, graphID, rec.SourceNodeID)
+		}
+		if _, ok := doc.Nodes[rec.TargetNodeID]; !ok {
+			return fmt.Errorf("%w: 图 %s 目标节点 %s", ErrNodeNotFound, graphID, rec.TargetNodeID)
+		}
+	}
+	if rec.TargetInput != "" && (len(rec.TargetInput) > MaxIDLength || !idCharset.MatchString(rec.TargetInput)) {
+		return fmt.Errorf("graph: 边选择记录的 target_input %q 非法", rec.TargetInput)
+	}
+	if rec.Input == nil {
+		if allowLegacy {
+			return nil
+		}
+		return fmt.Errorf("graph: 边选择记录缺少 durable Input/ResultRef")
+	}
+	input := rec.Input
+	maxSummaryRunes := InputSummaryMaxRunes + utf8.RuneCountInString("…（已截断）")
+	if utf8.RuneCountInString(input.Summary) > maxSummaryRunes {
+		return fmt.Errorf("graph: 边选择记录的 input.summary 超过 %d rune 上限", maxSummaryRunes)
+	}
+	if input.Truncated && len(input.Result) > 0 {
+		return fmt.Errorf("graph: 边选择记录的 input 同时声明 truncated 与内联 result")
+	}
+	if len(input.Result) > 0 {
+		if err := validateJSONObject(input.Result, InputInlineMaxBytes, "边选择记录的 input.result"); err != nil {
+			return err
+		}
+	}
+	evidenceByRef := make(map[string]EvidenceEntry, len(input.Evidence))
+	for i, evidence := range input.Evidence {
+		if strings.TrimSpace(evidence.Ref) == "" || strings.TrimSpace(evidence.Kind) == "" {
+			return fmt.Errorf("graph: 边选择记录的 input.evidence[%d] ref/kind 不能为空", i)
+		}
+		if err := validateEvidenceEntryBounds(evidence); err != nil {
+			return fmt.Errorf("graph: 边选择记录的 input.evidence[%d] 非法: %w", i, err)
+		}
+		if previous, ok := evidenceByRef[evidence.Ref]; ok && !sameEvidenceEntry(previous, evidence) {
+			return fmt.Errorf("graph: 边选择记录内 EvidenceRef %q 对应不一致的结构化证据", evidence.Ref)
+		}
+		evidenceByRef[evidence.Ref] = evidence
+	}
+	seenRefs := make(map[string]struct{}, len(input.EvidenceRefs))
+	for _, ref := range input.EvidenceRefs {
+		if strings.TrimSpace(ref) == "" || utf8.RuneCountInString(ref) > EvidenceIdentityMaxRunes {
+			return fmt.Errorf("graph: 边选择记录含非法 EvidenceRef %q", ref)
+		}
+		if _, duplicate := seenRefs[ref]; duplicate {
+			return fmt.Errorf("graph: 边选择记录重复引用 EvidenceRef %q", ref)
+		}
+		seenRefs[ref] = struct{}{}
+		if _, ok := evidenceByRef[ref]; !ok && !allowLegacy {
+			return fmt.Errorf("graph: 边选择记录的 EvidenceRef %q 缺少对应结构化证据", ref)
+		}
+	}
+	if input.ResultRef == "" {
+		if allowLegacy {
+			return nil
+		}
+		return fmt.Errorf("graph: 边选择记录缺少 input.result_ref")
+	}
+	wantRef := activationResultRef(graphID, rec.SourceActivationID)
+	if input.ResultRef != wantRef {
+		return fmt.Errorf("graph: 边选择记录的 input.result_ref %q 与来源稳定引用 %q 不一致", input.ResultRef, wantRef)
+	}
+	if results == nil {
+		return nil // live 路径稍后在 entry 锁内对实际 Result ledger 复核。
+	}
+	stored, ok := results[input.ResultRef]
+	if !ok {
+		return fmt.Errorf("graph: 边选择记录的 input.result_ref %q 不可解引用", input.ResultRef)
+	}
+	if stored.NodeID != rec.SourceNodeID || stored.ActivationID != rec.SourceActivationID {
+		return fmt.Errorf("graph: 边选择记录的 input.result_ref %q 来源不一致", input.ResultRef)
+	}
+	if len(input.Result) > 0 && !bytes.Equal(input.Result, stored.Result) {
+		return fmt.Errorf("graph: 边选择记录的内联 result 与 %q 的不可变 Result 不一致", input.ResultRef)
+	}
+	storedEvidence := make(map[string]EvidenceEntry, len(stored.Evidence))
+	for _, evidence := range stored.Evidence {
+		storedEvidence[evidence.Ref] = evidence
+	}
+	for ref, evidence := range evidenceByRef {
+		if authoritative, ok := storedEvidence[ref]; !ok || !sameEvidenceEntry(authoritative, evidence) {
+			return fmt.Errorf("graph: 边选择记录的 EvidenceRef %q 与来源 activation Result 谱系不一致", ref)
+		}
+	}
+	return nil
+}
+
+func sameTransitionRecord(a, b TransitionRecord) bool {
+	return reflect.DeepEqual(a, b)
+}
+
+// ResolveActivationResult 解引用一份 activation 级完整 Result。返回深拷贝，
+// 调用方修改不会污染 Store；ref 不属于该 graph 或尚未落盘时 ok=false。
+func (s *Store) ResolveActivationResult(graphID, ref string) (ActivationResult, bool) {
+	e, ok := s.lookup(graphID)
+	if !ok {
+		return ActivationResult{}, false
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	rec, ok := e.activationResults[ref]
+	if !ok {
+		return ActivationResult{}, false
+	}
+	return cloneActivationResult(rec), true
 }
 
 // NextActivationID 返回节点下一个 activation_id（<nodeID>@<n>，n 为该节点
@@ -735,6 +1104,15 @@ func (e *entry) mutateLocked(kind string, payload any, revalidate bool, applyFn 
 	if e.degraded != nil {
 		return &DegradedError{GraphID: e.doc.GraphID, Err: e.degraded}
 	}
+	if kind == journalKindActivationResult {
+		rec := ActivationResult(payload.(activationResultPayload))
+		if err := validateActivationResultAgainstLedger(rec, e.activationResults); err != nil {
+			return err
+		}
+		if previous, exists := e.activationResults[rec.Ref]; exists && sameActivationResult(previous, rec) {
+			return nil
+		}
+	}
 	cand, err := cloneDoc(e.doc)
 	if err != nil {
 		return err
@@ -742,9 +1120,29 @@ func (e *entry) mutateLocked(kind string, payload any, revalidate bool, applyFn 
 	if err := applyFn(cand); err != nil {
 		return err
 	}
+	// Execution 会把独立 ledger 的引用冻结进 GraphDocument；若只在重启时
+	// 校验，live 进程可先观察/消费 dangling Input 或 Settlement。新写一律
+	// strict，legacy inline 仅由 recovery 的显式兼容路径放行。
+	switch kind {
+	case journalKindExecution:
+		p := payload.(executionPayload)
+		if err := validateExecutionLedgerBindings(e.doc.GraphID, p.NodeID, p.Execution,
+			e.transitions, e.activationResults, false); err != nil {
+			return fmt.Errorf("graph: execution ledger 绑定非法: %w", err)
+		}
+	case journalKindExecutionStatus:
+		p := payload.(executionStatusPayload)
+		if err := validateExecutionLedgerBindings(e.doc.GraphID, p.NodeID, p.Execution,
+			e.transitions, e.activationResults, false); err != nil {
+			return fmt.Errorf("graph: execution_status ledger 绑定非法: %w", err)
+		}
+	}
 	// 边选择幂等身份的前置校验（entry 级簿记，必须在 journal append 前拦截）
 	if kind == journalKindTransition {
 		rec := TransitionRecord(payload.(transitionPayload))
+		if err := validateTransitionRecord(e.doc.GraphID, cand, rec, e.activationResults, false); err != nil {
+			return err
+		}
 		key := transitionKey{rec.SourceActivationID, rec.TransitionID}
 		if _, dup := e.transitions[key]; dup {
 			return &TransitionExistsError{GraphID: e.doc.GraphID, Record: rec}
@@ -758,7 +1156,7 @@ func (e *entry) mutateLocked(kind string, payload any, revalidate bool, applyFn 
 			return err
 		}
 	}
-	line, digest, err := buildJournalLine(e.seq+1, kind, cand, payload)
+	line, digest, chainDigest, err := buildJournalLine(e.seq+1, kind, cand, payload, e.chainDigest)
 	if err != nil {
 		return err
 	}
@@ -769,6 +1167,7 @@ func (e *entry) mutateLocked(kind string, payload any, revalidate bool, applyFn 
 	e.doc = cand
 	e.seq++
 	e.digest = digest
+	e.chainDigest = chainDigest
 	e.journalEntries++
 	e.journalBytes += int64(len(line)) + 1
 	e.noteBookkeepingLocked(kind, payload)
@@ -788,7 +1187,7 @@ func (e *entry) noteBookkeepingLocked(kind string, payload any) {
 	switch kind {
 	case journalKindTransition:
 		rec := TransitionRecord(payload.(transitionPayload))
-		e.transitions[transitionKey{rec.SourceActivationID, rec.TransitionID}] = rec
+		e.transitions[transitionKey{rec.SourceActivationID, rec.TransitionID}] = cloneTransitionRecord(rec)
 		noteActivation(e.activationSeq, rec.TargetNodeID, rec.TargetActivationID)
 	case journalKindExecution:
 		p := payload.(executionPayload)
@@ -796,6 +1195,10 @@ func (e *entry) noteBookkeepingLocked(kind string, payload any) {
 	case journalKindExecutionStatus:
 		p := payload.(executionStatusPayload)
 		noteActivation(e.activationSeq, p.NodeID, p.Execution.ActivationID)
+	case journalKindActivationResult:
+		rec := ActivationResult(payload.(activationResultPayload))
+		e.activationResults[rec.Ref] = cloneActivationResult(rec)
+		noteActivation(e.activationSeq, rec.NodeID, rec.ActivationID)
 	}
 }
 

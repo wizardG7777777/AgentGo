@@ -10,7 +10,8 @@ import (
 // validUIBase 返回一份最小合法 Config（Scheduler-only 模式），测试只改 ui 块。
 func validUIBase() *Config {
 	return &Config{
-		LLM: LLMConfig{DefaultModel: "gpt-test"},
+		LLM:         LLMConfig{DefaultModel: "gpt-test"},
+		ProjectRoot: ".",
 		UI: UIConfig{
 			Frontends: []string{"tui"},
 			Web:       WebUIConfig{Listen: "127.0.0.1:8399"},

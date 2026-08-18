@@ -8,6 +8,8 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/graph"
+	"agentgo/internal/model"
+	"agentgo/internal/store"
 	"agentgo/internal/trace"
 )
 
@@ -31,7 +33,7 @@ func (b *fakeGraphBoard) LookupGraphTask(graphID, activationID, _ string) (graph
 	defer b.mu.Unlock()
 	for _, spec := range b.specs {
 		if spec.GraphID == graphID && spec.ActivationID == activationID {
-			return graph.GraphTaskSnapshot{TaskID: "task-" + spec.ActivationID}, true, nil
+			return graph.GraphTaskSnapshot{TaskID: "task-" + spec.ActivationID, NodeKind: spec.NodeKind}, true, nil
 		}
 	}
 	return graph.GraphTaskSnapshot{}, false, nil
@@ -60,7 +62,10 @@ func newGraphControlEnv(t *testing.T) (GraphControlGroup, *graph.Store, *fakeGra
 	t.Cleanup(func() { _ = gs.Close() })
 	board := &fakeGraphBoard{}
 	rt := graph.NewRuntime(gs, board)
-	return GraphControlGroup{Runtime: rt, Store: gs}, gs, board
+	return GraphControlGroup{
+		Runtime: rt, Store: gs,
+		RouteValidator: fakeRouteValidator{routes: map[string][]string{"": {}}},
+	}, gs, board
 }
 
 // graphToolGraphJSON 最小合法图：root(controller) → implement(agent) → finish(end)。
@@ -82,6 +87,8 @@ const graphToolGraphJSON = `{
 // 到 __scheduler__），返回值携带 graph_id 与 root activation。
 func TestSubmitGraphSuccess(t *testing.T) {
 	g, gs, board := newGraphControlEnv(t)
+	finalizer := &graphFinalizationRecorder{}
+	g.FinalizationNotifier = finalizer
 	reply, err := g.submitGraph(context.Background(), map[string]any{"graph": graphToolGraphJSON})
 	if err != nil {
 		t.Fatalf("submit_graph 应成功: %v", err)
@@ -100,11 +107,20 @@ func TestSubmitGraphSuccess(t *testing.T) {
 	if !ok || doc.Revision != 1 || doc.Status != graph.GraphRunning {
 		t.Errorf("图应已 durable 为 revision=1 running: ok=%v doc=%+v", ok, doc)
 	}
+	if !finalizer.marked {
+		t.Fatal("submit_graph 完整成功后必须标记 origin Scheduler task finalizing")
+	}
 }
+
+type graphFinalizationRecorder struct{ marked bool }
+
+func (r *graphFinalizationRecorder) MarkTaskFinalized() { r.marked = true }
 
 // submit_graph 校验失败：返回「图校验失败」+ 校验阶段/路径的中文错误。
 func TestSubmitGraphValidationFailure(t *testing.T) {
 	g, _, board := newGraphControlEnv(t)
+	finalizer := &graphFinalizationRecorder{}
+	g.FinalizationNotifier = finalizer
 	bad := `{"schema":"agentgo.graph/v1","graph_id":"g-bad","revision":1,"state_version":0,"root":"ghost","status":"pending","nodes":{}}`
 	_, err := g.submitGraph(context.Background(), map[string]any{"graph": bad})
 	if err == nil {
@@ -118,6 +134,234 @@ func TestSubmitGraphValidationFailure(t *testing.T) {
 	}
 	if _, err := g.submitGraph(context.Background(), map[string]any{"graph": "  "}); err == nil {
 		t.Error("空 graph 参数应报错")
+	}
+	if finalizer.marked {
+		t.Fatal("submit_graph 失败时不得标记 finalizing，Scheduler 必须仍可修正重试")
+	}
+}
+
+func TestSubmitGraphValidatesGraphScopedRoutesBeforePersistence(t *testing.T) {
+	g, gs, board := newGraphControlEnv(t)
+	teamGraph := strings.Replace(graphToolGraphJSON,
+		`"implement": {"kind":"agent","task":{"title":"实施修改"},`,
+		`"implement": {"kind":"agent","task":{"title":"实施修改"},"metadata":{"route":"team:impl"},"capability":{"tools":["read_file"]},`, 1)
+	g.RouteValidator = fakeRouteValidator{
+		routes:      map[string][]string{"team:impl": {"read_file", "submit_task_result"}},
+		ownerScopes: map[string]string{"team:impl": model.GraphRouteScope("g-tool-basic")},
+	}
+	if _, err := g.submitGraph(context.Background(), map[string]any{"graph": teamGraph}); err != nil {
+		t.Fatalf("same-Graph Team route should pass: %v", err)
+	}
+	if board.count() != 1 {
+		t.Fatalf("root should activate after route validation, count=%d", board.count())
+	}
+
+	other, otherStore, otherBoard := newGraphControlEnv(t)
+	other.RouteValidator = fakeRouteValidator{
+		routes:      map[string][]string{"team:impl": {"read_file"}},
+		ownerScopes: map[string]string{"team:impl": model.GraphRouteScope("g-other")},
+	}
+	if _, err := other.submitGraph(context.Background(), map[string]any{"graph": teamGraph}); err == nil || !strings.Contains(err.Error(), "图路由校验失败") {
+		t.Fatalf("cross-Graph route err=%v", err)
+	}
+	if _, ok := otherStore.Get("g-tool-basic"); ok || otherBoard.count() != 0 {
+		t.Fatal("route rejection persisted or activated the Graph")
+	}
+
+	_ = gs // keep the successful Store authority explicit in this test.
+}
+
+func TestSubmitGraphFailsClosedWithoutRouteAuthority(t *testing.T) {
+	g, gs, board := newGraphControlEnv(t)
+	g.RouteValidator = nil
+	_, err := g.submitGraph(context.Background(), map[string]any{"graph": graphToolGraphJSON})
+	if err == nil || !strings.Contains(err.Error(), "fail-closed") || !strings.Contains(err.Error(), "runtime route") {
+		t.Fatalf("missing route authority err=%v", err)
+	}
+	if _, ok := gs.Get("g-tool-basic"); ok || board.count() != 0 {
+		t.Fatal("fail-closed route rejection persisted or activated graph")
+	}
+}
+
+func TestSubmitGraphAcceptanceCapabilityIsStructurallyReadOnly(t *testing.T) {
+	const base = `{
+  "schema":"agentgo.graph/v1","graph_id":"g-acceptance-cap","revision":1,"state_version":0,
+  "root":"verify","status":"pending","nodes":{
+    "verify":{"kind":"acceptance","task":{"title":"独立验收","description":"判据：读取交付物并确认内容满足任务要求"},"status":"inactive","executor":null,"execution":null,
+      "next":[{"to":"done","when":{"path":"$.verdict","operator":"eq","value":"pass"}}]},
+    "done":{"kind":"end","task":{"title":"收官"},"status":"inactive","executor":null,"execution":null,"next":[]}
+  }}`
+
+	for _, denied := range []string{
+		"run_shell", "write_file", "edit_file", "publish_task",
+		"send_message", "request_user_input", "request_replan",
+	} {
+		denied := denied
+		t.Run("route 含闭集外工具 "+denied+" 时拒绝", func(t *testing.T) {
+			g, gs, board := newGraphControlEnv(t)
+			g.RouteValidator = fakeRouteValidator{routes: map[string][]string{
+				graph.RouteAcceptance: {"read_file", denied, "submit_task_result"},
+			}}
+			_, err := g.submitGraph(context.Background(), map[string]any{"graph": base})
+			if err == nil || !strings.Contains(err.Error(), denied) || !strings.Contains(err.Error(), "只读闭集外") {
+				t.Fatalf("acceptance 含 %s 应 fail-closed，实际 err=%v", denied, err)
+			}
+			if _, ok := gs.Get("g-acceptance-cap"); ok || board.count() != 0 {
+				t.Fatal("能力拒绝后不应持久化或激活 Graph")
+			}
+		})
+	}
+
+	t.Run("route 交集安全但任一 listener 可能越权时按并集拒绝", func(t *testing.T) {
+		g, gs, board := newGraphControlEnv(t)
+		g.RouteValidator = fakeRouteValidator{
+			routes: map[string][]string{
+				graph.RouteAcceptance: {"read_file", "submit_task_result"},
+			},
+			envelopes: map[string][]string{
+				graph.RouteAcceptance: {"read_file", "send_message", "submit_task_result"},
+			},
+		}
+		_, err := g.submitGraph(context.Background(), map[string]any{"graph": base})
+		if err == nil || !strings.Contains(err.Error(), "send_message") || !strings.Contains(err.Error(), "只读闭集外") {
+			t.Fatalf("acceptance 应按 listener 能力并集拒绝隐藏的副作用工具，实际 err=%v", err)
+		}
+		if _, ok := gs.Get("g-acceptance-cap"); ok || board.count() != 0 {
+			t.Fatal("能力并集拒绝后不应持久化或激活 Graph")
+		}
+	})
+
+	t.Run("per-node capability 排除 Shell 后允许", func(t *testing.T) {
+		g, _, board := newGraphControlEnv(t)
+		g.RouteValidator = fakeRouteValidator{routes: map[string][]string{
+			graph.RouteAcceptance: {"read_file", "run_shell", "submit_task_result"},
+		}}
+		narrowed := strings.Replace(base,
+			`"kind":"acceptance","task":{"title":"独立验收","description":"判据：读取交付物并确认内容满足任务要求"}`,
+			`"kind":"acceptance","task":{"title":"独立验收","description":"判据：读取交付物并确认内容满足任务要求"},"capability":{"tools":["read_file","submit_task_result"]}`,
+			1)
+		if _, err := g.submitGraph(context.Background(), map[string]any{"graph": narrowed}); err != nil {
+			t.Fatalf("节点工具面已收窄为只读时应允许：%v", err)
+		}
+		if board.count() != 1 {
+			t.Fatalf("root acceptance 应发布一项任务，实际 %d", board.count())
+		}
+	})
+
+	t.Run("per-node capability 不得裁掉 verdict 提交工具", func(t *testing.T) {
+		g, gs, board := newGraphControlEnv(t)
+		g.RouteValidator = fakeRouteValidator{routes: map[string][]string{
+			graph.RouteAcceptance: {"read_file", "submit_task_result"},
+		}}
+		withoutSubmit := strings.Replace(base,
+			`"kind":"acceptance","task":{"title":"独立验收","description":"判据：读取交付物并确认内容满足任务要求"}`,
+			`"kind":"acceptance","task":{"title":"独立验收","description":"判据：读取交付物并确认内容满足任务要求"},"capability":{"tools":["read_file"]}`,
+			1)
+		_, err := g.submitGraph(context.Background(), map[string]any{"graph": withoutSubmit})
+		if err == nil || !strings.Contains(err.Error(), "实际工具面缺少 submit_task_result") {
+			t.Fatalf("节点裁掉 verdict 提交工具应 fail-closed，实际 err=%v", err)
+		}
+		if _, ok := gs.Get("g-acceptance-cap"); ok || board.count() != 0 {
+			t.Fatal("能力拒绝后不应持久化或激活 Graph")
+		}
+	})
+
+	t.Run("Scheduler 不能兼任 acceptance", func(t *testing.T) {
+		g, _, _ := newGraphControlEnv(t)
+		g.RouteValidator = fakeRouteValidator{routes: map[string][]string{
+			graph.RouteAcceptance: {"read_file", "submit_task_result"},
+		}}
+		schedulerRoute := strings.Replace(base,
+			`"kind":"acceptance","task":{"title":"独立验收","description":"判据：读取交付物并确认内容满足任务要求"}`,
+			`"kind":"acceptance","task":{"title":"独立验收","description":"判据：读取交付物并确认内容满足任务要求"},"metadata":{"route":"__scheduler__"}`,
+			1)
+		_, err := g.submitGraph(context.Background(), map[string]any{"graph": schedulerRoute})
+		if err == nil || !strings.Contains(err.Error(), "不得路由到 Scheduler") {
+			t.Fatalf("Scheduler acceptance 应拒绝，实际 err=%v", err)
+		}
+	})
+}
+
+func TestGraphControllerControlPlaneIsBoundToCurrentGraph(t *testing.T) {
+	g, _, _ := newGraphControlEnv(t)
+	if _, err := g.submitGraph(context.Background(), map[string]any{"graph": graphToolGraphJSON}); err != nil {
+		t.Fatal(err)
+	}
+	tasks := store.NewMemoryTaskStore(nil, 8, 1, 60)
+	current := &model.Task{ID: "graph-controller", EventType: graph.RouteScheduler, GraphID: "g-tool-basic"}
+	if err := tasks.PublishTask(current); err != nil {
+		t.Fatal(err)
+	}
+	g.TaskStore = tasks
+	g.Holder = &fakeHolder{id: current.ID}
+
+	if _, err := g.readGraph(context.Background(), map[string]any{"graph_id": current.GraphID}); err != nil {
+		t.Fatalf("same-Graph read should pass: %v", err)
+	}
+	if _, err := g.readGraph(context.Background(), map[string]any{"graph_id": "g-other"}); err == nil || !strings.Contains(err.Error(), "target_graph_id=g-other") {
+		t.Fatalf("cross-Graph read err=%v", err)
+	}
+	if _, err := g.patchGraph(context.Background(), map[string]any{
+		"graph_id": "g-other", "base_revision": 1, "patch": `{"upsert_nodes":[]}`,
+	}); err == nil || !strings.Contains(err.Error(), "target_graph_id=g-other") {
+		t.Fatalf("cross-Graph patch err=%v", err)
+	}
+	otherGraph := strings.Replace(graphToolGraphJSON, "g-tool-basic", "g-other", 1)
+	if _, err := g.submitGraph(context.Background(), map[string]any{"graph": otherGraph}); err == nil || !strings.Contains(err.Error(), "Graph controller 禁止 submit_graph") {
+		t.Fatalf("Graph controller new submit err=%v", err)
+	}
+}
+
+func TestSubmitGraphRejectsParentGraphTeamRouteInsideInlineSubgraph(t *testing.T) {
+	g, gs, board := newGraphControlEnv(t)
+	g.RouteValidator = fakeRouteValidator{
+		routes:      map[string][]string{"team:child": {"read_file"}},
+		ownerScopes: map[string]string{"team:child": model.GraphRouteScope("g-inline-team")},
+	}
+	raw := `{
+  "schema":"agentgo.graph/v1","graph_id":"g-inline-team","revision":1,"state_version":0,
+  "root":"nested","status":"pending","nodes":{
+    "nested":{"kind":"subgraph","task":{"title":"nested"},"status":"inactive","executor":null,"execution":null,
+      "subgraph":{"root":"work","nodes":{
+        "work":{"kind":"agent","task":{"title":"child work"},"status":"inactive","executor":null,"execution":null,
+          "metadata":{"route":"team:child"},"capability":{"tools":["read_file"]},"next":[{"to":"end"}]},
+        "end":{"kind":"end","task":{"title":"child end"},"status":"inactive","executor":null,"execution":null,"next":[]}
+      }},"next":[{"to":"done"}]},
+    "done":{"kind":"end","task":{"title":"done"},"status":"inactive","executor":null,"execution":null,"next":[]}
+  }
+}`
+	_, err := g.submitGraph(context.Background(), map[string]any{"graph": raw})
+	if err == nil || !strings.Contains(err.Error(), "内联 subgraph") || !strings.Contains(err.Error(), "不继承父 Graph") {
+		t.Fatalf("parent-Graph Team route in inline subgraph err=%v", err)
+	}
+	if _, ok := gs.Get("g-inline-team"); ok || board.count() != 0 {
+		t.Fatal("inline subgraph route rejection persisted or activated the Graph")
+	}
+}
+
+func TestSubmitGraphAllowsGlobalRouteInsideInlineSubgraph(t *testing.T) {
+	g, _, board := newGraphControlEnv(t)
+	g.RouteValidator = fakeRouteValidator{
+		routes:      map[string][]string{"global:reader": {"read_file"}},
+		ownerScopes: map[string]string{"global:reader": ""},
+	}
+	raw := `{
+  "schema":"agentgo.graph/v1","graph_id":"g-inline-global","revision":1,"state_version":0,
+  "root":"nested","status":"pending","nodes":{
+    "nested":{"kind":"subgraph","task":{"title":"nested"},"status":"inactive","executor":null,"execution":null,
+      "subgraph":{"root":"work","nodes":{
+        "work":{"kind":"agent","task":{"title":"child work"},"status":"inactive","executor":null,"execution":null,
+          "metadata":{"route":"global:reader"},"capability":{"tools":["read_file"]},"next":[{"to":"end"}]},
+        "end":{"kind":"end","task":{"title":"child end"},"status":"inactive","executor":null,"execution":null,"next":[]}
+      }},"next":[{"to":"done"}]},
+    "done":{"kind":"end","task":{"title":"done"},"status":"inactive","executor":null,"execution":null,"next":[]}
+  }
+}`
+	if _, err := g.submitGraph(context.Background(), map[string]any{"graph": raw}); err != nil {
+		t.Fatalf("global inline-subgraph route should pass: %v", err)
+	}
+	if board.count() != 1 || board.last().GraphID != "g-inline-global/nested@1" {
+		t.Fatalf("inline subgraph root task mismatch: count=%d last=%+v", board.count(), board.last())
 	}
 }
 
@@ -230,6 +474,26 @@ func TestPatchGraphRevisionConflict(t *testing.T) {
 		"graph_id": "g-tool-basic", "base_revision": 2, "patch": "{不是json",
 	}); err == nil || !strings.Contains(err.Error(), "解码失败") {
 		t.Errorf("非法 patch JSON 应报解码错误，实际：%v", err)
+	}
+}
+
+func TestPatchGraphRejectsCrossGraphTeamRouteWithoutRevisionChange(t *testing.T) {
+	g, gs, _ := newGraphControlEnv(t)
+	if _, err := g.submitGraph(context.Background(), map[string]any{"graph": graphToolGraphJSON}); err != nil {
+		t.Fatal(err)
+	}
+	g.RouteValidator = fakeRouteValidator{
+		routes:      map[string][]string{"team:foreign": {"read_file"}},
+		ownerScopes: map[string]string{"team:foreign": model.GraphRouteScope("g-other")},
+	}
+	patch := `{"upsert_nodes":[{"id":"implement","kind":"agent","task":{"title":"foreign"},"capability":{"tools":["read_file"]},"metadata":{"route":"team:foreign"},"next":[{"to":"finish"}]}]}`
+	if _, err := g.patchGraph(context.Background(), map[string]any{
+		"graph_id": "g-tool-basic", "base_revision": 1, "patch": patch,
+	}); err == nil || !strings.Contains(err.Error(), "图路由校验失败") {
+		t.Fatalf("cross-Graph patch err=%v", err)
+	}
+	if doc, _ := gs.Get("g-tool-basic"); doc.Revision != 1 {
+		t.Fatalf("rejected route patch changed revision to %d", doc.Revision)
 	}
 }
 

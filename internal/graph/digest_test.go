@@ -49,7 +49,7 @@ func TestDigestChangesOnDefinitionChange(t *testing.T) {
 		"graph_id变化": func(doc *GraphDocument) { doc.GraphID = "graph-456" },
 		"task变化": func(doc *GraphDocument) {
 			n := doc.Nodes["implement"]
-			n.Task = &NodeTask{Title: "实施修改 v2", OutputSchema: "agentgo.change-set/v1"}
+			n.Task = &NodeTask{Title: "实施修改 v2", Description: "返回结构化覆盖度字段"}
 			doc.Nodes["implement"] = n
 		},
 		"capability变化": func(doc *GraphDocument) {

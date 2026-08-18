@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// exampleDocJSON 是 docs/nextUpgrade-V6.md §6 第 4 条拓扑的初始提交形态
-// （含 verify → implement 回边；runtime-owned 字段保持初始值）。
+// exampleDocJSON 是根节点循环修复图的初始提交形态。root 的初始
+// activation 不算入边，verify → root 是它唯一的静态生产边。
 const exampleDocJSON = `{
   "schema": "agentgo.graph/v1",
   "graph_id": "graph-123",
@@ -27,7 +27,7 @@ const exampleDocJSON = `{
     },
     "implement": {
       "kind": "agent",
-      "task": { "title": "实施修改", "output_schema": "agentgo.change-set/v1" },
+      "task": { "title": "实施修改" },
       "status": "inactive",
       "executor": null,
       "execution": null,
@@ -35,13 +35,13 @@ const exampleDocJSON = `{
     },
     "verify": {
       "kind": "agent",
-      "task": { "title": "验证修改", "output_schema": "agentgo.verification/v1" },
+      "task": { "title": "验证修改" },
       "status": "inactive",
       "executor": null,
       "execution": null,
       "next": [
         { "to": "finish", "when": { "path": "$.verdict", "operator": "eq", "value": "pass" } },
-        { "to": "implement", "activation": "new", "when": { "path": "$.verdict", "operator": "eq", "value": "fixable" } }
+        { "to": "root", "activation": "new", "when": { "path": "$.verdict", "operator": "eq", "value": "fixable" } }
       ]
     },
     "finish": {
@@ -139,8 +139,8 @@ func TestExampleDocumentParses(t *testing.T) {
 		t.Fatalf("verify 应有 2 条转移，实际为 %d", len(verify.Next))
 	}
 	back := verify.Next[1]
-	if back.To != "implement" || back.Activation != ActivationNew {
-		t.Errorf("回边转移应为 implement + activation=new，实际为 to=%q activation=%q", back.To, back.Activation)
+	if back.To != "root" || back.Activation != ActivationNew {
+		t.Errorf("回边转移应为 root + activation=new，实际为 to=%q activation=%q", back.To, back.Activation)
 	}
 	if back.When == nil || back.When.Path != "$.verdict" || back.When.Operator != OpEq {
 		t.Errorf("回边条件形态解码错误: %+v", back.When)
@@ -204,6 +204,132 @@ func TestValidConditionForms(t *testing.T) {
 		if _, err := ParseAndValidate([]byte(doc)); err != nil {
 			t.Errorf("%s: 应通过校验: %v", name, err)
 		}
+	}
+}
+
+// TestJoinOutgoingEventContract 锁定 barrier 的事件边界：上游 event 只负责
+// 选中入边，join 自身不会透传它；join 成功出边只能依赖 completed/always，
+// 或显式检查按目标输入端口归并的 Result 路径。
+func TestJoinOutgoingEventContract(t *testing.T) {
+	const template = `{
+      "schema":"agentgo.graph/v1","graph_id":"g-join-authoring","revision":0,"state_version":0,
+      "root":"work","status":"pending","nodes":{
+        "work":{"kind":"agent","task":{"title":"调查"},"status":"inactive",
+          "next":[{"to":"join","when":{"event":"ready"}}]},
+        "join":{"kind":"join","task":{"title":"汇合"},"status":"inactive",
+          "next":[{"to":"done","when":JOIN_WHEN}]},
+        "done":{"kind":"end","task":{"title":"结束"},"status":"inactive","next":[]}
+      }
+    }`
+	build := func(when string) string {
+		return strings.Replace(template, "JOIN_WHEN", when, 1)
+	}
+
+	for name, when := range map[string]string{
+		"completed": `{"event":"completed"}`,
+		"always":    `{"event":"always"}`,
+		"结果路径":      `{"path":"$.work.event","operator":"eq","value":"ready"}`,
+	} {
+		if _, err := ParseAndValidate([]byte(build(when))); err != nil {
+			t.Errorf("%s: join 合法出边应通过校验: %v", name, err)
+		}
+	}
+
+	for _, event := range []string{EventReady, EventPass, EventFailed, EventBlocked, EventTimeout} {
+		_, err := ParseAndValidate([]byte(build(`{"event":"` + event + `"}`)))
+		if err == nil {
+			t.Errorf("join event=%q 永远不可匹配，应在提交前拒绝", event)
+			continue
+		}
+		var ve *ValidationError
+		if !errors.As(err, &ve) || ve.Stage != "转移" || !strings.Contains(err.Error(), "不透传上游 event") {
+			t.Errorf("join event=%q 应返回明确的 authoring 诊断，实际: %v", event, err)
+		}
+	}
+}
+
+// TestAcceptanceAuthoringContract 验收判据和路由在建图时即 fail-closed：
+// completed 业务结论只能是 $.verdict eq 三值，Runtime 失败另走
+// failed/blocked 事件兜底。
+func TestAcceptanceAuthoringContract(t *testing.T) {
+	const template = `{
+	  "schema":"agentgo.graph/v1","graph_id":"g-acceptance-authoring","revision":1,"state_version":0,
+	  "root":"verify","status":"pending","nodes":{
+	    "verify":{"kind":"acceptance","task":{"title":"验收","description":"必须通过指定检查"},"status":"inactive","next":[TRANSITION]},
+	    "done":{"kind":"end","task":{"title":"收官"},"status":"inactive","next":[]}
+	  }
+	}`
+	build := func(transition string) string {
+		return strings.Replace(template, "TRANSITION", transition, 1)
+	}
+	for _, verdict := range []string{"pass", "fixable", "failed"} {
+		transition := `{"to":"done","when":{"path":"$.verdict","operator":"eq","value":"` + verdict + `"}}`
+		if _, err := ParseAndValidate([]byte(build(transition))); err != nil {
+			t.Errorf("verdict=%s 应是合法业务路由: %v", verdict, err)
+		}
+	}
+	for _, event := range []string{EventFailed, EventBlocked} {
+		transition := `{"to":"done","when":{"event":"` + event + `"}}`
+		if _, err := ParseAndValidate([]byte(build(transition))); err != nil {
+			t.Errorf("Runtime event=%s 应是合法兜底路由: %v", event, err)
+		}
+	}
+	invalid := map[string]string{
+		"无条件":             `{"to":"done"}`,
+		"event_pass":      `{"to":"done","when":{"event":"pass"}}`,
+		"event_fixable":   `{"to":"done","when":{"event":"fixable"}}`,
+		"event_completed": `{"to":"done","when":{"event":"completed"}}`,
+		"event_always":    `{"to":"done","when":{"event":"always"}}`,
+		"verdict_in":      `{"to":"done","when":{"path":"$.verdict","operator":"in","value":["pass","failed"]}}`,
+		"legacy_fail":     `{"to":"done","when":{"path":"$.verdict","operator":"eq","value":"fail"}}`,
+		"verdict_blocked": `{"to":"done","when":{"path":"$.verdict","operator":"eq","value":"blocked"}}`,
+		"其它路径":            `{"to":"done","when":{"path":"$.ok","operator":"eq","value":true}}`,
+	}
+	for name, transition := range invalid {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseAndValidate([]byte(build(transition))); err == nil {
+				t.Fatal("会绕过 verdict 权威的 acceptance 出边应被拒绝")
+			}
+		})
+	}
+}
+
+func TestAcceptanceRequiresExplicitCriterion(t *testing.T) {
+	const noTask = `{
+	  "schema":"agentgo.graph/v1","graph_id":"g-acceptance-task","revision":1,"state_version":0,
+	  "root":"verify","status":"pending","nodes":{
+	    "verify":{"kind":"acceptance","status":"inactive","next":[{"to":"done","when":{"path":"$.verdict","operator":"eq","value":"pass"}}]},
+	    "done":{"kind":"end","task":{"title":"收官"},"status":"inactive","next":[]}
+	  }
+	}`
+	assertInvalid(t, "acceptance 无 task", noTask, "节点", "必须携带 task")
+	blankDescription := strings.Replace(noTask, `"kind":"acceptance",`,
+		`"kind":"acceptance","task":{"title":"验收","description":"   "},`, 1)
+	assertInvalid(t, "acceptance 无判据", blankDescription, "节点", "验收判据")
+}
+
+// TestRequiredInputsRejectExtraPort 显式端口表是完整输入契约：所有入边都
+// 必须写入已声明端口。额外端口不会参与 barrier，却会预留新的 activation，
+// 因此在 authoring 阶段 fail-closed；同一端口也只允许一个生产者。
+func TestRequiredInputsRejectExtraPort(t *testing.T) {
+	const invalid = `{
+	  "schema":"agentgo.graph/v1","graph_id":"g-extra-port","revision":1,"state_version":0,
+	  "root":"root","status":"pending","nodes":{
+	    "root":{"kind":"router","task":{"title":"扇出"},"status":"inactive","next":[{"to":"a"},{"to":"b"}]},
+	    "a":{"kind":"agent","task":{"title":"主来源"},"status":"inactive","next":[{"to":"join","target_input":"selected"}]},
+	    "b":{"kind":"agent","task":{"title":"额外来源"},"status":"inactive","next":[{"to":"join","target_input":"optional"}]},
+	    "join":{"kind":"join","task":{"title":"汇合","required_inputs":["selected"]},"status":"inactive","next":[{"to":"done"}]},
+	    "done":{"kind":"end","task":{"title":"结束"},"status":"inactive","next":[]}
+	  }
+	}`
+	_, err := ParseAndValidate([]byte(invalid))
+	if err == nil || !strings.Contains(err.Error(), "未列入") {
+		t.Fatalf("额外 target_input 应被明确拒绝，实际 %v", err)
+	}
+
+	shared := strings.Replace(invalid, `"target_input":"optional"`, `"target_input":"selected"`, 1)
+	if _, err := ParseAndValidate([]byte(shared)); err == nil || !strings.Contains(err.Error(), "单赋值") {
+		t.Fatalf("两个来源共享 required port 应被拒绝，实际 %v", err)
 	}
 }
 
@@ -399,6 +525,11 @@ func TestRejectNodeSemantics(t *testing.T) {
 		doc := mutate(t, tinyDocJSON, `{ "title": "做 A" }`, `{ "title": "  " }`)
 		assertInvalid(t, "task.title 为空", doc, "节点", "task.title")
 	})
+	t.Run("output_schema已删除按未知字段拒绝", func(t *testing.T) {
+		doc := mutate(t, tinyDocJSON, `{ "title": "做 A" }`,
+			`{ "title": "做 A", "output_schema": "agentgo.result/v1" }`)
+		assertInvalid(t, "output_schema 未知字段", doc, "未知字段", "output_schema")
+	})
 }
 
 // TestRejectCapabilityShape 阶段 9：capability 与 executor 结构形状。
@@ -408,10 +539,12 @@ func TestRejectCapabilityShape(t *testing.T) {
 			`"capability": { "isolation": "docker" }, "next": [{ "to": "b" }]`)
 		assertInvalid(t, "isolation 非法", doc, "能力", "docker")
 	})
-	t.Run("budget负值", func(t *testing.T) {
+	t.Run("budget已删除按未知字段拒绝", func(t *testing.T) {
 		doc := mutate(t, tinyDocJSON, `"next": [{ "to": "b" }]`,
-			`"capability": { "budget": { "max_tokens": -5 } }, "next": [{ "to": "b" }]`)
-		assertInvalid(t, "budget 负值", doc, "能力", "非负有限")
+			`"capability": { "budget": { "max_tokens": 5 } }, "next": [{ "to": "b" }]`)
+		// capability.budget 占位字段已删除（从无 Runtime 消费者），
+		// DisallowUnknownFields 应按未知字段拒绝，杜绝「预算已生效」虚假契约。
+		assertInvalid(t, "budget 未知字段", doc, "未知字段", "budget")
 	})
 	t.Run("tools含空串", func(t *testing.T) {
 		doc := mutate(t, tinyDocJSON, `"next": [{ "to": "b" }]`,

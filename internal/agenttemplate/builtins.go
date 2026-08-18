@@ -49,11 +49,11 @@ func builtinDefinitions() []unresolvedTemplate {
 		{
 			Name:         "verifier",
 			Version:      1,
-			Description:  "正式验收代理：不授予文件写工具，独立运行检查、测试和构建，并提交结构化验收结果。",
-			Capabilities: []string{"acceptance-verification", "test-execution", "evidence-validation"},
+			Description:  "正式验收代理：无文件写工具、无 Shell，独立读取交付物与上游证据、做判断并提交结构化验收结论。",
+			Capabilities: []string{"acceptance-verification", "evidence-review", "fact-checking"},
 			Tools: []string{
-				"read_file", "list_dir", "grep_search", "glob_search", "run_shell",
-				"web_search", "web_fetch", "submit_task_result", "request_replan",
+				"read_file", "list_dir", "grep_search", "glob_search",
+				"web_search", "web_fetch", "submit_task_result",
 			},
 			SystemPrompt: verifierPrompt,
 			Limits: fixedLimits(Limits{

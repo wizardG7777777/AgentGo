@@ -9,7 +9,7 @@ package runner
 //	| 工具 | 自动注入的依赖 |
 //	|---|---|
 //	| read_file / list_dir / grep_search / glob_search | Workdir + FileStateCache |
-//	| write_file / edit_file | + Roster（文件级写锁，附 RosterWaitTimeoutSec）；strict 审批 WrapHandler 在 runner.New 装配；+ EffectJournal（H2b 副作用账本，nil 不记账） |
+//	| write_file / edit_file | + Roster（文件级写锁，附 RosterWaitTimeoutSec）+ StoreHookView（同步 artifact ledger）；strict 审批 WrapHandler 在 runner.New 装配；+ EffectJournal（H2b 副作用账本，nil 不记账） |
 //	| run_shell | + interaction.Service + SessionID + shell.CommandFilter + ShellTimeoutSec + Modes（exec 轴短路）；验收角色（白名单含 run_shell 且不含写工具）再注入 shell.AcceptanceHardeningGreylist；workdir 实现 tools.ActiveViewer 时（*workspace.Swapper）注入 ActiveViewer；+ EffectJournal |
 //	| publish_task | + Store + TaskHolder + MaxSubtaskDepth |
 //	| request_user_input | + interaction.Service + SessionID + TaskHolder |
@@ -24,6 +24,7 @@ package runner
 import (
 	"agentgo/internal/agent"
 	"agentgo/internal/shell"
+	"agentgo/internal/store"
 	"agentgo/internal/tools"
 )
 
@@ -60,12 +61,19 @@ func resolveToolGroups(
 	// 按任务写时复制隔离：workdir 实现 ActiveViewer 时（*workspace.Swapper）
 	// 把它注入 shell 组；未实现时 ActiveViewer=nil，run_shell 默认目录恒为主根。
 	activeViewer, _ := workdir.(tools.ActiveViewer)
+	artifactStore := deps.StoreView
+	if artifactStore == nil {
+		// 生产 MemoryTaskStore 同时实现 TaskStore/StoreHookView；该回退
+		// 让精简装配也不会遗漏写工具的同步 artifact ledger。
+		artifactStore, _ = deps.Store.(store.StoreHookView)
+	}
 	return []tools.ToolGroup{
 		readGroup,
 		tools.LocalWriteGroup{
 			LocalReadGroup: readGroup,
 			Roster:         deps.Roster,
 			AgentID:        instanceID,
+			ArtifactStore:  artifactStore,
 			WaitTimeoutSec: deps.RosterWaitTimeoutSec,
 			EffectJournal:  deps.EffectJournal,
 		},

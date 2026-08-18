@@ -36,6 +36,14 @@ import (
 // （与 exec-mode-guard Gate 的拦截面一致）。
 var leaseWriteTools = []string{"write_file", "edit_file", "run_shell"}
 
+// acceptanceLeaseAllowedTools 是 acceptance 在执行租约层的最终正向闭集。
+// Graph 提交校验和 route 装配是前置防线；这里同时校验新计算与恢复复用的
+// durable Lease，防止旧快照或篡改租约把写入/Shell/协调工具带回 verifier。
+var acceptanceLeaseAllowedTools = map[string]struct{}{
+	"read_file": {}, "list_dir": {}, "grep_search": {}, "glob_search": {},
+	"web_search": {}, "web_fetch": {}, "submit_task_result": {},
+}
+
 // acquireExecutionLease 是 processTask 的租约入口：任务已有冻结租约时复用
 // （emit reused）；否则按计算规则构造候选、经 store 原子冻结（emit frozen）。
 // 返回 (nil, rejection) 表示租约计算 fail-closed（显式声明越界或无换入
@@ -45,6 +53,10 @@ func (a *Agent) acquireExecutionLease(task *model.Task) (*model.ExecutionLease, 
 	// 复用：任务上已有冻结租约（重试重认领 / 进程重启恢复 / 同一 claim 窗口
 	// 内被并发认领方先冻结）——不重新计算，Digest 与工具面不变。
 	if task.Lease != nil {
+		if rejection := validateLeaseForTaskRole(task, task.Lease); rejection != "" {
+			a.emitExecutionLeaseRejected(task, task.Lease, rejection, nil)
+			return nil, rejection
+		}
 		log.Printf("[agent %s] 任务 %s 复用既有执行租约（digest=%s，attempt=%d）",
 			a.ID, task.ID, task.Lease.Digest, task.Lease.Attempt)
 		trace.Emit(trace.Event{
@@ -61,17 +73,7 @@ func (a *Agent) acquireExecutionLease(task *model.Task) (*model.ExecutionLease, 
 		// fail-closed：emit rejected（含缺失清单），调用方走既有
 		// blocked / capability_violation 路径终止任务，不降级执行。
 		missing := leaseMissingTools(a.ToolSwapper, task)
-		log.Printf("[agent %s] 任务 %s 执行租约被拒绝: %s", a.ID, task.ID, rejection)
-		trace.Emit(trace.Event{
-			Kind:    trace.KindExecutionLeaseRejected,
-			TaskID:  task.ID,
-			AgentID: a.ID,
-			Reason:  rejection,
-			Lease: &trace.LeasePayload{
-				Cause:   rejection,
-				Missing: missing,
-			},
-		})
+		a.emitExecutionLeaseRejected(task, nil, rejection, missing)
 		return nil, rejection
 	}
 
@@ -84,6 +86,10 @@ func (a *Agent) acquireExecutionLease(task *model.Task) (*model.ExecutionLease, 
 	}
 	if !frozen {
 		// 并发/重试窗口内已被先冻结：复用既有的那份（emit reused）。
+		if rejection := validateLeaseForTaskRole(task, effective); rejection != "" {
+			a.emitExecutionLeaseRejected(task, effective, rejection, nil)
+			return nil, rejection
+		}
 		log.Printf("[agent %s] 任务 %s 复用既有执行租约（digest=%s，attempt=%d）",
 			a.ID, task.ID, effective.Digest, effective.Attempt)
 		trace.Emit(trace.Event{
@@ -122,6 +128,7 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 		Attempt:  task.RetryCount + 1,
 		FrozenAt: time.Now().UTC(),
 	}
+	schedulerControlPlane := task.GraphID == "" && task.EventType == "__scheduler__"
 
 	// --- NodeRequirement ∩ RouteCeiling → BusinessTools ---
 	explicit := task.Capability != nil && len(task.Capability.Tools) > 0
@@ -129,8 +136,8 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 	case explicit && a.ToolSwapper == nil:
 		return nil, fmt.Sprintf("节点能力要求工具子集 %v，但 executor 不支持按任务工具过滤（Agent.ToolSwapper 未装配），不降级执行",
 			task.Capability.Tools)
-	case explicit && task.EventType == "__scheduler__":
-		// scheduler 控制面任务保持记录型租约语义（见下方同名分支）：即使
+	case explicit && schedulerControlPlane:
+		// 非图 scheduler 控制面任务保持记录型租约语义（见下方同名分支）：即使
 		// swapper 已装配（V6 §2 起供 prompt 编译/审计观测），也不换入
 		// 过滤视图——显式声明无法被 honoring，fail-closed（与 swapper
 		// 未装配时代的拒绝行为一致）。
@@ -142,11 +149,15 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 				missing, task.Capability.Tools)
 		}
 		lease.BusinessTools = model.SortedCopy(task.Capability.Tools)
-	case a.ToolSwapper == nil || task.EventType == "__scheduler__":
-		// 控制面 agent（scheduler）：保持其现有工具装配不变（它即控制面），
+	case a.ToolSwapper == nil || schedulerControlPlane:
+		// 非图控制面 agent（scheduler）：保持其现有工具装配不变（它即控制面），
 		// BusinessTools=nil 表示无裁剪面——只生成 Lease 记录，不换入视图。
+		// ToolSwapper=nil 的自定义 executor 没有可换入的 LLM 工具 registry，
+		// 同样只记录角色控制协议；显式 capability 仍在前一分支 fail-closed。
 		// V6 §2 起 scheduler 也装配 ToolSwapper（供 prompt 编译与 /doctor
-		// agents 审计读取工具面），但 __scheduler__ 任务的租约语义不变。
+		// agents 审计读取工具面），但仅非图 __scheduler__ 任务保留该语义；
+		// 有 ToolSwapper 的 Graph controller 必须像普通节点一样形成并应用
+		// 精确业务工具面。
 		lease.Synthetic = true
 	default:
 		// 合成节点能力：未显式声明时需求 = 目标 Route ceiling 全量
@@ -183,6 +194,9 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 
 	// --- 节点角色派生控制通道 ---
 	lease.ControlTools = deriveControlTools(task)
+	if rejection := validateLeaseForTaskRole(task, lease); rejection != "" {
+		return nil, rejection
+	}
 
 	// --- 冻结模型 / 隔离 / 超时 ---
 	lease.Model = a.Model
@@ -197,15 +211,80 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 	return lease, ""
 }
 
-// deriveControlTools 按节点角色派生控制通道：Graph agent 节点需要
-// submit_task_result + request_replan（graph change 流）；非图执行任务只有
-// submit_task_result；scheduler 控制面任务的收尾通道是 report_done。
+// validateLeaseForTaskRole 校验冻结租约没有越过持久化 Graph 角色。所有
+// Graph 任务的 ControlTools 必须精确等于当前角色派生集合；acceptance 以及
+// 无法证明角色的旧/未知 kind 还要对 ToolUnion 应用 verifier 正向闭集。
+func validateLeaseForTaskRole(task *model.Task, lease *model.ExecutionLease) string {
+	if task == nil || lease == nil || task.GraphID == "" {
+		return ""
+	}
+	expectedControl := deriveControlTools(task)
+	if !sameExactToolSet(lease.ControlTools, expectedControl) {
+		return fmt.Sprintf("Graph 节点角色 %q 的冻结租约控制工具=%v，期望精确为 %v",
+			task.GraphNodeKind, lease.ControlTools, expectedControl)
+	}
+	if task.GraphNodeKind == "controller" || task.GraphNodeKind == "agent" {
+		return ""
+	}
+	for _, name := range lease.ToolUnion() {
+		if _, ok := acceptanceLeaseAllowedTools[name]; !ok {
+			return fmt.Sprintf("Graph 节点角色 %q 的冻结租约包含只读闭集外工具 %q",
+				task.GraphNodeKind, name)
+		}
+	}
+	return ""
+}
+
+func sameExactToolSet(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	seen := make(map[string]struct{}, len(got))
+	for _, name := range got {
+		if _, duplicate := seen[name]; duplicate {
+			return false
+		}
+		seen[name] = struct{}{}
+	}
+	for _, name := range want {
+		if _, ok := seen[name]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *Agent) emitExecutionLeaseRejected(task *model.Task, lease *model.ExecutionLease, rejection string, missing []string) {
+	log.Printf("[agent %s] 任务 %s 执行租约被拒绝: %s", a.ID, task.ID, rejection)
+	payload := &trace.LeasePayload{Cause: rejection, Missing: missing}
+	if lease != nil {
+		payload = leaseTracePayload(lease, rejection)
+		payload.Missing = missing
+	}
+	trace.Emit(trace.Event{
+		Kind: trace.KindExecutionLeaseRejected, TaskID: task.ID, AgentID: a.ID,
+		Reason: rejection, Lease: payload,
+	})
+}
+
+// deriveControlTools 按持久化 Graph 节点角色派生控制通道：controller/agent
+// 需要 submit_task_result + request_replan；acceptance 只能提交终态，不得
+// 请求改图。GraphNodeKind 为空的旧快照或未知未来类型按最小权限只给
+// submit_task_result，绝不从可自定义的 EventType/route 猜测角色。非图
+// scheduler 控制面才使用 report_done。
 func deriveControlTools(task *model.Task) []string {
+	if task.GraphID != "" {
+		switch task.GraphNodeKind {
+		case "controller", "agent":
+			return []string{"request_replan", "submit_task_result"}
+		case "acceptance", "":
+			return []string{"submit_task_result"}
+		default:
+			return []string{"submit_task_result"}
+		}
+	}
 	if task.EventType == "__scheduler__" {
 		return []string{"report_done"}
-	}
-	if task.GraphID != "" {
-		return []string{"request_replan", "submit_task_result"}
 	}
 	return []string{"submit_task_result"}
 }
@@ -258,10 +337,14 @@ func (a *Agent) revokeLeaseOnFinalizing(taskID string) {
 	})
 }
 
-// leaseViewNeedsSwap 报告租约工具视图是否真正收窄了注册全集：视图并集
-// 覆盖全部注册名时换入是恒等变换，跳过以保持「无能力声明任务零开销」。
-func leaseViewNeedsSwap(full *ToolRegistry, lease *model.ExecutionLease) bool {
-	if full == nil || lease == nil || lease.BusinessTools == nil {
+// leaseViewNeedsSwap 报告租约工具视图是否真正收窄了注册全集。BusinessTools
+// 为 nil 只有非图 scheduler 控制面表示“记录型、不裁剪”；任何 Graph Task
+// （含旧快照空 kind）都必须按 ToolUnion 换入，避免 nil 被解释成注册全集泄露。
+func leaseViewNeedsSwap(full *ToolRegistry, task *model.Task, lease *model.ExecutionLease) bool {
+	if full == nil || lease == nil {
+		return false
+	}
+	if lease.BusinessTools == nil && (task == nil || task.GraphID == "") {
 		return false
 	}
 	union := lease.ToolUnion()

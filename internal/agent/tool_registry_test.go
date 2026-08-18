@@ -42,6 +42,26 @@ func TestToolRegistry_Register_And_Defs(t *testing.T) {
 	}
 }
 
+func TestToolRegistryAllowlistDistinguishesNilAndEmpty(t *testing.T) {
+	register := func(r *ToolRegistry) {
+		r.Register("read_file", "读取文件", nil, func(context.Context, map[string]any) (string, error) {
+			return "", nil
+		})
+	}
+
+	compat := NewToolRegistryWithAllowlist(nil)
+	register(compat)
+	if compat.RegisteredCount() != 1 {
+		t.Fatalf("nil allowlist should retain explicit compatibility semantics, got %d tools", compat.RegisteredCount())
+	}
+
+	denyAll := NewToolRegistryWithAllowlist([]string{})
+	register(denyAll)
+	if denyAll.RegisteredCount() != 0 {
+		t.Fatalf("empty allowlist must deny all tools, got %d", denyAll.RegisteredCount())
+	}
+}
+
 func TestToolRegistry_Dispatch_Success(t *testing.T) {
 	r := NewToolRegistry()
 	r.Register("echo", "回显", nil, func(ctx context.Context, args map[string]any) (string, error) {

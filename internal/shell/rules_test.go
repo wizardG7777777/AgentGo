@@ -8,18 +8,18 @@ import (
 	"testing"
 )
 
-func TestMergeRules_Basic(t *testing.T) {
+func TestMergeRules_ProtectsDefaultsByDefault(t *testing.T) {
 	defaultRules := []string{`rm -rf /`, `mkfs`}
 	globalCustom := []string{`dangerous_cmd`, `rm -rf /`} // 重复项
 	patch := RulePatch{
 		Add:    []string{`project_specific`},
-		Remove: []string{`mkfs`},
+		Remove: []string{`mkfs`, `dangerous_cmd`},
 	}
 
-	result := MergeRules(defaultRules, globalCustom, patch)
+	result := MergeRules(defaultRules, globalCustom, patch, false)
 	sort.Strings(result)
 
-	expected := []string{`dangerous_cmd`, `project_specific`, `rm -rf /`}
+	expected := []string{`dangerous_cmd`, `mkfs`, `project_specific`, `rm -rf /`}
 	if !reflect.DeepEqual(result, expected) {
 		t.Errorf("MergeRules() = %v, want %v", result, expected)
 	}
@@ -27,13 +27,13 @@ func TestMergeRules_Basic(t *testing.T) {
 
 func TestMergeRules_Empty(t *testing.T) {
 	// 全部为空
-	result := MergeRules(nil, nil, RulePatch{})
+	result := MergeRules(nil, nil, RulePatch{}, false)
 	if len(result) != 0 {
 		t.Errorf("期望空切片，得到 %v", result)
 	}
 
 	// 只有默认值
-	result = MergeRules([]string{`a`, `b`}, nil, RulePatch{})
+	result = MergeRules([]string{`a`, `b`}, nil, RulePatch{}, false)
 	sort.Strings(result)
 	expected := []string{`a`, `b`}
 	if !reflect.DeepEqual(result, expected) {
@@ -48,7 +48,7 @@ func TestMergeRules_RemoveNonExistent(t *testing.T) {
 		Remove: []string{`c`}, // 不存在
 	}
 
-	result := MergeRules(defaultRules, nil, patch)
+	result := MergeRules(defaultRules, nil, patch, false)
 	sort.Strings(result)
 
 	expected := []string{`a`, `b`}
@@ -65,7 +65,7 @@ func TestMergeRules_AddAndRemovePriority(t *testing.T) {
 		Remove: []string{`same_rule`}, // 同名规则先加后删
 	}
 
-	result := MergeRules([]string{`default`}, nil, patch)
+	result := MergeRules([]string{`default`}, nil, patch, false)
 
 	// same_rule 应该被移除
 	expected := []string{`default`}
@@ -81,7 +81,7 @@ func TestMergeRules_DuplicateRemoval(t *testing.T) {
 	defaultRules := []string{`rule1`, `rule2`}
 	globalCustom := []string{`rule2`, `rule3`} // rule2 重复
 
-	result := MergeRules(defaultRules, globalCustom, RulePatch{})
+	result := MergeRules(defaultRules, globalCustom, RulePatch{}, false)
 	sort.Strings(result)
 
 	// 结果不应有重复
@@ -179,7 +179,7 @@ func TestBuildFilter(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// 无项目规则时
-	filter, err := BuildFilter(tmpDir, []string{`global_custom`}, nil)
+	filter, err := BuildFilter(tmpDir, []string{`global_custom`}, nil, false)
 	if err != nil {
 		t.Fatalf("BuildFilter 失败: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestBuildFilter(t *testing.T) {
 	}
 }
 
-func TestBuildFilter_WithProjectRules(t *testing.T) {
+func TestBuildFilter_ProjectCannotRemoveDefaultRulesByDefault(t *testing.T) {
 	// 创建临时目录和规则文件
 	tmpDir := t.TempDir()
 	content := `
@@ -214,7 +214,7 @@ shell_rules:
 	}
 
 	// 构建过滤器
-	filter, err := BuildFilter(tmpDir, []string{`global_custom`}, nil)
+	filter, err := BuildFilter(tmpDir, []string{`global_custom`}, nil, false)
 	if err != nil {
 		t.Fatalf("BuildFilter 失败: %v", err)
 	}
@@ -231,10 +231,58 @@ shell_rules:
 		t.Errorf("项目级 add 应生效，得到 action=%s", action)
 	}
 
-	// 验证项目级 remove 生效（默认的 rm -rf / 被移除）
+	// 默认规则受保护：项目级 remove 不得放开 rm -rf /。
 	action, _ = filter.Check("rm -rf /")
-	if action == "block" {
-		t.Error("rm -rf / 应被项目级 remove 移除，但仍被拦截")
+	if action != "block" {
+		t.Error("rm -rf / 是系统默认黑名单，不得被项目规则移除")
+	}
+}
+
+func TestBuildFilter_TrustedConfigCanExplicitlyAllowDefaultRemoval(t *testing.T) {
+	tmpDir := t.TempDir()
+	content := `
+shell_rules:
+  blacklist:
+    remove:
+      - "rm\\s+-rf\\s+/"
+`
+	rulesPath := filepath.Join(tmpDir, ".agentgo", "project_rules.yaml")
+	if err := os.MkdirAll(filepath.Dir(rulesPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rulesPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	filter, err := BuildFilter(tmpDir, nil, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action, _ := filter.Check("rm -rf /"); action == "block" {
+		t.Fatal("trusted opt-in should restore project removal semantics")
+	}
+}
+
+func TestBuildFilter_ProjectCannotRemoveTrustedCustomRulesByDefault(t *testing.T) {
+	tmpDir := t.TempDir()
+	content := `
+shell_rules:
+  blacklist:
+    remove:
+      - "operator-protected"
+`
+	rulesPath := filepath.Join(tmpDir, ".agentgo", "project_rules.yaml")
+	if err := os.MkdirAll(filepath.Dir(rulesPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rulesPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	filter, err := BuildFilter(tmpDir, []string{`operator-protected`}, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action, _ := filter.Check("operator-protected"); action != "block" {
+		t.Fatal("项目规则不得删除受信任主配置追加的黑名单")
 	}
 }
 
@@ -258,7 +306,7 @@ shell_rules:
 	}
 
 	// 构建过滤器（含灰名单）
-	filter, err := BuildFilter(tmpDir, nil, []string{`global_grey`})
+	filter, err := BuildFilter(tmpDir, nil, []string{`global_grey`}, false)
 	if err != nil {
 		t.Fatalf("BuildFilter 失败: %v", err)
 	}
@@ -275,10 +323,10 @@ shell_rules:
 		t.Errorf("项目级灰名单 add 应生效，得到 action=%s", action)
 	}
 
-	// 验证项目级灰名单 remove 生效（默认的 git push 被移除）
+	// 默认灰名单同样受保护，项目规则不能静默取消人工授权。
 	action, _ = filter.Check("git push origin main")
-	if action == "ask" {
-		t.Error("git push 应被项目级 remove 移除，但仍会请求 Interaction")
+	if action != "ask" {
+		t.Error("git push 是系统默认灰名单，应继续请求 Interaction")
 	}
 }
 
@@ -294,7 +342,7 @@ func TestBuildFilter_InvalidProjectRules(t *testing.T) {
 	}
 
 	// BuildFilter 应传播错误
-	_, err := BuildFilter(tmpDir, nil, nil)
+	_, err := BuildFilter(tmpDir, nil, nil, false)
 	if err == nil {
 		t.Error("无效项目规则应返回错误")
 	}
@@ -304,7 +352,7 @@ func TestBuildFilter_EmptyRules(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// 全部为空
-	filter, err := BuildFilter(tmpDir, nil, nil)
+	filter, err := BuildFilter(tmpDir, nil, nil, false)
 	if err != nil {
 		t.Fatalf("BuildFilter 失败: %v", err)
 	}

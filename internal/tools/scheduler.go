@@ -75,7 +75,7 @@ func (g SchedulerGroup) Register(r *agent.ToolRegistry) {
 
 	r.Register(
 		"cancel_task",
-		"取消一个尚未完成的任务（pending 或 processing 状态）",
+		"取消一个尚未完成的任务（pending 或 processing 状态）；Graph controller 只能取消同一 Graph 内的任务",
 		schema.Object().
 			String("task_id", "要取消的任务 ID", true).
 			String("reason", "取消原因（用于日志和审计）", false).
@@ -86,7 +86,7 @@ func (g SchedulerGroup) Register(r *agent.ToolRegistry) {
 	if g.Holder != nil {
 		r.Register(
 			"get_task_result",
-			"按需分页读取 board result_refs 指向的完整任务结果。只在 excerpt 不足以支持当前决策时调用；不要机械读取所有任务。",
+			"按需分页读取当前 Graph 或 legacy request scope 内 board result_refs 指向的完整任务结果。只在 excerpt 不足以支持当前决策时调用；不要机械读取所有任务。",
 			schema.Object().
 				String("task_id", "result_refs 所属任务 ID", true).
 				String("agent_id", "结果生产者 ID；任务只有一份结果时可省略", false).
@@ -99,6 +99,7 @@ func (g SchedulerGroup) Register(r *agent.ToolRegistry) {
 		r.Register(
 			"report_done",
 			"向用户报告最终结果，表示当前请求处理完毕。"+
+				"Graph task 不可调用；图到达 end 后由 graph_ended 终态通知统一汇报。"+
 				"调用前会校验 SchedulerBatch；"+
 				"调用后会清空 SchedulerBatch 并打印事实校对块（task.Artifacts）。",
 			schema.Object().
@@ -169,11 +170,20 @@ func (g SchedulerGroup) getTaskResult(_ context.Context, args map[string]any) (s
 
 	agentIDs := make([]string, 0, len(target.Results))
 	for id := range target.Results {
+		if id == agent.StructuredResultStorageKey {
+			continue // Graph bridge 内部 carrier，不作为可分页的 Agent 正文暴露。
+		}
 		agentIDs = append(agentIDs, id)
 	}
 	sort.Strings(agentIDs)
+	if len(agentIDs) == 0 {
+		return "", fmt.Errorf("任务 %s 当前没有可读取的 Agent 结果正文", taskID)
+	}
 	agentID, _ := args["agent_id"].(string)
 	agentID = strings.TrimSpace(agentID)
+	if agentID == agent.StructuredResultStorageKey {
+		return "", fmt.Errorf("agent_id=%s 是系统内部结构化结果 carrier，不可直接读取", agentID)
+	}
 	if agentID == "" {
 		if len(agentIDs) != 1 {
 			return "", fmt.Errorf("任务 %s 有多份结果，请指定 agent_id（可选值: %s）", taskID, strings.Join(agentIDs, ", "))
@@ -218,12 +228,26 @@ func (g SchedulerGroup) getTaskResult(_ context.Context, args map[string]any) (s
 	return string(data), nil
 }
 
-// authorizeTaskResultRead mirrors the task visibility of BuildBoardJSON: a
-// Scheduler root may read only tasks inside its own SchedulerBatch /
-// ParentTaskID lineage（C6b 起 Plan 控制面已删除，legacy 谱系检查是唯一路径）。
+// authorizeTaskResultRead keeps Graph and legacy result scopes disjoint:
+//   - a Scheduler Graph node may read only tasks with the exact same non-empty
+//     GraphID;
+//   - a legacy Scheduler root may read only tasks inside its own SchedulerBatch /
+//     ParentTaskID lineage.
+//
+// Graph ownership must not be inferred from ParentTaskID or any routing label:
+// GraphID is the durable execution-contract identity.
 func (g SchedulerGroup) authorizeTaskResultRead(current, target *model.Task) error {
 	if err := validateTaskResultCaller(current); err != nil {
 		return err
+	}
+	if current.GraphID != "" {
+		if target.GraphID != "" && target.GraphID == current.GraphID {
+			return nil
+		}
+		return fmt.Errorf("get_task_result 被拒绝：任务 %s 不属于当前 Graph %s", target.ID, current.GraphID)
+	}
+	if target.GraphID != "" {
+		return fmt.Errorf("get_task_result 被拒绝：Graph 任务 %s 不属于当前 legacy Scheduler scope", target.ID)
 	}
 	tasks, err := g.Store.ScanAll()
 	if err != nil {
@@ -247,13 +271,31 @@ func validateTaskResultCaller(current *model.Task) error {
 	return nil
 }
 
-// cancelTask 是 cancel_task 工具的实现。状态转换全部委托 GuardedCancel
-// GuardedCancel（D2：TUI /cancel 也走同一路径），这里只保留参数解析
-// 与成功消息格式，行为与抽取前一致。
+// cancelTask 是 cancel_task 工具的 Scheduler 包装层。Graph controller 只能
+// 取消 exact same GraphID 的任务；通过授权后，状态转换仍全部委托 GuardedCancel。
+// TUI /cancel 直接调用 GuardedCancel，不受 Scheduler Graph scope 约束。
 func (g SchedulerGroup) cancelTask(ctx context.Context, args map[string]any) (string, error) {
 	taskID, _ := args["task_id"].(string)
 	if taskID == "" {
 		return "", fmt.Errorf("缺少 task_id 参数")
+	}
+	if g.Holder != nil {
+		currentID := strings.TrimSpace(g.Holder.Get())
+		if currentID != "" {
+			current, err := g.Store.GetTask(currentID)
+			if err != nil {
+				return "", fmt.Errorf("读取当前 scheduler 任务失败: %w", err)
+			}
+			if current.GraphID != "" {
+				target, err := g.Store.GetTask(taskID)
+				if err != nil {
+					return "", fmt.Errorf("取消任务失败 (id=%s): %w", taskID, err)
+				}
+				if target.GraphID != current.GraphID {
+					return "", fmt.Errorf("cancel_task 被拒绝：任务 %s 不属于当前 Graph %s", taskID, current.GraphID)
+				}
+			}
+		}
 	}
 	reason, _ := args["reason"].(string)
 	if err := GuardedCancel(ctx, g.Store, taskID, "scheduler"); err != nil {
@@ -266,8 +308,9 @@ func (g SchedulerGroup) cancelTask(ctx context.Context, args map[string]any) (st
 // 先尝试 pending→cancelled，失败时尝试 processing→cancelled，取消来源记为
 // source（"scheduler" / "user"）。
 //
-// C6b 起 Plan 归属守卫（controller 租约 / membership 复查 / 外部调用方拦截）
-// 已随其整包删除：任何调用方都是直接两段式转换。
+// C6b 起旧 Plan 归属守卫（controller 租约 / membership 复查 / 外部调用方拦截）
+// 已随其整包删除；Scheduler Graph scope 在 cancelTask 包装层单独校验，TUI
+// 等直接调用方仍走不带 scope 的两段式转换。
 //
 // 错误消息保持「取消任务失败 (id=...): ...」措辞，调用方不应再包装。
 func GuardedCancel(_ context.Context, s store.TaskStore, targetTaskID, source string) error {
@@ -284,18 +327,21 @@ func GuardedCancel(_ context.Context, s store.TaskStore, targetTaskID, source st
 	return nil
 }
 
-// reportDone 是 report_done 工具的实现。包含三段逻辑：
+// reportDone 是 report_done 工具的实现。包含四段逻辑：
 //
-//  1. **硬性提前拦截**：从 holder 拿到当前 scheduler task ID，读 task.SchedulerBatch，
+//  1. **Graph 硬拒绝**：Graph task 不得直接向用户宣告整个请求完成；图到达 end
+//     后由 graph_ended 终态通知统一汇报。
+//
+//  2. **硬性提前拦截**：从 holder 拿到当前 scheduler task ID，读 task.SchedulerBatch，
 //     扫描每个子任务的状态。任一未到终态（completed/failed/cancelled）→ 拒绝调用，
 //     返回 LLM 可读的错误消息（这与旧 Scheduler.toolReportDone 的硬拦截一致）。
 //
-//  2. **事实校对**：从 task.Artifacts 直接构造一段"实际写入文件清单"，与 LLM 的 summary
+//  3. **事实校对**：从 task.Artifacts 直接构造一段"实际写入文件清单"，与 LLM 的 summary
 //     并列打印到 stdout。LLM 即使在 summary 里编造产物，用户也能从事实校对块看出矛盾。
 //     这是修复历史问题"Scheduler report_done 不基于 task.Artifacts 真实清单"
 //     的关键路径，从 internal/scheduler/scheduler.go::buildArtifactsReport 迁移而来。
 //
-//  3. **清空 batch**：调 store.ClearSchedulerBatch 让下一轮 reactLoop 看到干净状态。
+//  4. **清空 batch**：调 store.ClearSchedulerBatch 让下一轮 reactLoop 看到干净状态。
 func (g SchedulerGroup) reportDone(ctx context.Context, args map[string]any) (string, error) {
 	summary, _ := args["summary"].(string)
 
@@ -308,6 +354,12 @@ func (g SchedulerGroup) reportDone(ctx context.Context, args map[string]any) (st
 	currentTask, err := g.Store.GetTask(currentID)
 	if err != nil {
 		return "", fmt.Errorf("读取当前 scheduler 任务失败: %w", err)
+	}
+	if currentTask.GraphID != "" {
+		return "", fmt.Errorf(
+			"report_done 被拒绝：当前任务属于 Graph %s；Graph controller 请用 submit_task_result 提交当前节点结果（需要事件边时填写 event），再等待图到达 end 后由 graph_ended 终态通知统一汇报",
+			currentTask.GraphID,
+		)
 	}
 	batch := currentTask.SchedulerBatch
 

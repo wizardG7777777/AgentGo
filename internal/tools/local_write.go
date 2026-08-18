@@ -11,6 +11,7 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/effect"
+	"agentgo/internal/model"
 	"agentgo/internal/pathutil"
 	"agentgo/internal/roster"
 	"agentgo/internal/tools/hashline"
@@ -28,17 +29,78 @@ import (
 // 两个工具都在调用 Roster.TryClaim 获取文件写入权之后才读取文件内容，
 // 严格遵循「先锁后读」的顺序，避免 TOCTOU 竞态。
 //
-// C5 迁移：原 Store / ProjectRoot 字段以及 recordArtifact 方法已删除。
-// 写入产物事实流的登记现由 record-artifact Reactor（订阅 KindFileWritten）
-// 接管，详见 internal/reactor/builtin/record_artifact.go。
+// ArtifactStore 是写工具的正确性依赖：任务内 write/edit 在返回成功前
+// 必须把产物事实同步登记。record-artifact Async Reactor 仍作兼容观察器，
+// 但不再是 task.Artifacts / Graph artifact Evidence 的正确性权威。
 type LocalWriteGroup struct {
 	LocalReadGroup               // embed: 继承 Workdir + Cache
 	Roster         roster.Roster // required
 	AgentID        string        // required
-	WaitTimeoutSec int           // §8.3：文件冲突排队等待秒数，0 = 不排队（旧行为）
+	ArtifactStore  interface {
+		AppendArtifactWithMeta(taskID string, path string, meta model.ArtifactMeta) error
+	}
+	WaitTimeoutSec int // §8.3：文件冲突排队等待秒数，0 = 不排队（旧行为）
 	// EffectJournal 是 V6 §4 H2b 副作用账本（internal/effect）；
 	// nil 时 write_file/edit_file 不记账（行为与引入账本前完全一致）。
 	EffectJournal *effect.Journal
+}
+
+// requireArtifactLedger 在产生文件副作用前确认任务级 ledger 已装配。
+// 无 task ID 表示工具在脱离 Agent 任务的局部调用中运行（主要用于
+// 工具单测），没有可关联的 task.Artifacts，因此保持原行为。
+func (g LocalWriteGroup) requireArtifactLedger(ctx context.Context) error {
+	if agent.TaskIDFromContext(ctx) != "" && g.ArtifactStore == nil {
+		return fmt.Errorf("artifact ledger 未装配：拒绝在无法登记产物证据时写入文件")
+	}
+	return nil
+}
+
+// recordArtifact 在写工具返回前同步、幂等地登记产物事实。
+// logicalPath 是主根账目坐标；即使文件实际落在 workspace overlay，
+// Graph 下游也应消费稳定的项目相对路径。
+func (g LocalWriteGroup) recordArtifact(ctx context.Context, logicalPath string, content []byte) error {
+	taskID := agent.TaskIDFromContext(ctx)
+	if taskID == "" {
+		return nil
+	}
+	if g.ArtifactStore == nil {
+		return fmt.Errorf("artifact ledger 未装配")
+	}
+	root := ""
+	if g.Workdir != nil {
+		root = g.Workdir.Get()
+	}
+	rel := normalizeWrittenArtifactPath(logicalPath, root)
+	meta := model.ArtifactMeta{SHA256: computeSHA256(content), Bytes: int64(len(content))}
+	if err := g.ArtifactStore.AppendArtifactWithMeta(taskID, rel, meta); err != nil {
+		return fmt.Errorf("登记产物证据失败 task=%s path=%s: %w", taskID, rel, err)
+	}
+	return nil
+}
+
+// normalizeWrittenArtifactPath 与兼容 Reactor 的路径归一规则保持一致，
+// 使同步登记和稍后到达的异步观察命中同一个幂等键。
+func normalizeWrittenArtifactPath(absPath, projectRoot string) string {
+	cleaned := filepath.Clean(absPath)
+	if projectRoot != "" {
+		// ValidatePath 返回 canonical 绝对路径，因此 root 也必须
+		// 使用同一权威规则规范化后再 Rel（特别是 macOS /var ->
+		// /private/var 与配置中的相对 project_root）。
+		if canonicalRoot, err := pathutil.CanonicalizeRoot(projectRoot); err == nil {
+			if rel, err := filepath.Rel(canonicalRoot, cleaned); err == nil && !strings.HasPrefix(rel, "..") {
+				return filepath.ToSlash(rel)
+			}
+		}
+		if rel, err := filepath.Rel(projectRoot, cleaned); err == nil && !strings.HasPrefix(rel, "..") {
+			return filepath.ToSlash(rel)
+		}
+		if rootAbs, err := filepath.Abs(projectRoot); err == nil {
+			if rel, err := filepath.Rel(rootAbs, cleaned); err == nil && !strings.HasPrefix(rel, "..") {
+				return filepath.ToSlash(rel)
+			}
+		}
+	}
+	return filepath.ToSlash(cleaned)
 }
 
 // Register 把 write_file / edit_file 注册到 r。
@@ -161,6 +223,9 @@ func (g LocalWriteGroup) writeFile(ctx context.Context, args map[string]any) (st
 	if path == "" {
 		return "", fmt.Errorf("缺少 path 参数")
 	}
+	if err := g.requireArtifactLedger(ctx); err != nil {
+		return "", err
+	}
 
 	projectRoot := ""
 	if g.Workdir != nil {
@@ -222,6 +287,9 @@ func (g LocalWriteGroup) writeFile(ctx context.Context, args map[string]any) (st
 	if g.Cache != nil {
 		g.Cache.Invalidate(path)
 	}
+	if err := g.recordArtifact(ctx, logicalPath, []byte(content)); err != nil {
+		return "", err
+	}
 
 	// Trace：file_written 事件（可审计的落盘记录）。
 	// Path 保持主根逻辑路径——record-artifact / 验收的账目坐标恒为主根。
@@ -238,9 +306,6 @@ func (g LocalWriteGroup) writeFile(ctx context.Context, args map[string]any) (st
 		writeEv.Description = fmt.Sprintf("写时复制隔离：落点 %s，任务成功终态合并回主根", path)
 	}
 	trace.Emit(writeEv)
-
-	// Artifacts：由 record-artifact Reactor（订阅 KindFileWritten）记录到
-	// task.Artifacts，详见 internal/reactor/builtin/record_artifact.go。
 
 	result := fmt.Sprintf("文件已写入: %s (%d 字节)", logicalPath, len(content))
 	if isolated {
@@ -266,6 +331,9 @@ func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (str
 
 	if path == "" {
 		return "", fmt.Errorf("缺少 path 参数")
+	}
+	if err := g.requireArtifactLedger(ctx); err != nil {
+		return "", err
 	}
 	if oldStr == "" {
 		return "", fmt.Errorf("缺少 old_str 参数")
@@ -363,6 +431,9 @@ func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (str
 	if g.Cache != nil {
 		g.Cache.Invalidate(path)
 	}
+	if err := g.recordArtifact(ctx, logicalPath, []byte(newContent)); err != nil {
+		return "", err
+	}
 
 	// Trace：file_written 事件（edit 也算一次落盘）。
 	// Path 保持主根逻辑路径——record-artifact / 验收的账目坐标恒为主根。
@@ -379,8 +450,6 @@ func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (str
 		writeEv.Description = fmt.Sprintf("写时复制隔离：落点 %s，任务成功终态合并回主根", path)
 	}
 	trace.Emit(writeEv)
-
-	// Artifacts：由 record-artifact Reactor（订阅 KindFileWritten）记录到 task.Artifacts。
 
 	oldLen := len(content)
 	newLen := len(newContent)

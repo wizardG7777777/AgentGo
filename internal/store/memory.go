@@ -1,11 +1,13 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +28,9 @@ var (
 	ErrTaskNotPending    = errors.New("task is not in pending state")
 	ErrTaskNotProcessing = errors.New("task is not in processing state")
 	ErrTaskClaimBlocked  = errors.New("task claim blocked by control plane")
+	// ErrStoreQuiesced 是静默围栏的哨兵错误：公告板处于 session 冻结的
+	// 静默窗口期间，全部任务状态迁移入口以此错误拒绝（见 EnterQuiesce）。
+	ErrStoreQuiesced = errors.New("公告板静默中（session 冻结窗口）：任务状态迁移被围栏拒绝")
 )
 
 type MemoryTaskStore struct {
@@ -42,9 +47,10 @@ type MemoryTaskStore struct {
 	toolCalls map[string]map[string][]ToolCallRecord
 	// artifactLog 是 task.Artifacts 的追加式持久化日志。可选——nil 时整个
 	// 持久化路径退化为纯内存行为（单测默认走这条路径，bootstrap 显式注入）。
-	// 写入路径：AppendArtifact 先成功更新内存 task.Artifacts，再异步追加 log；
-	// log 写入失败只打印 warning，不回滚内存状态——这保证"内存是真相来源"，
-	// 下次启动最多丢失最后一条 record，不会出现"task 声称成功但 artifact 凭空消失"。
+	// 写入路径在 s.mu 内先追加 log 并 FlushPending，fsync
+	// 成功后再提交内存；任一日志错误向上返回且不改
+	// task.Artifacts，因此调用方可安全重试。Graph
+	// Evidence 声称 durable，不允许只有进程内证据却返回成功。
 	artifactLog *ArtifactLog
 	// historyEmitter 是事件溯源日志的发射接口。可选——nil 时跳过所有事件发射。
 	// 通过 SetHistoryEmitter 注入，避免对 session.HistoryLog 的硬依赖。
@@ -52,6 +58,11 @@ type MemoryTaskStore struct {
 	// capabilityChecker 是按认领方过滤节点能力任务的检查器。可选——nil 时
 	// QueryAvailable 不做能力过滤（兼容旧装配）。由 bootstrap 注入。
 	capabilityChecker CapabilityChecker
+	// quiesced 是静默围栏标记（s.mu 保护）。true 期间全部任务状态迁移入口
+	// （发布 / 认领 / 终态提交 / 重试回滚）持锁后第一站直接以
+	// ErrStoreQuiesced 拒绝——不改状态、不发事件、不发 history。
+	// 窗口边界与动机见 EnterQuiesce 注释。
+	quiesced bool
 }
 
 // SetTaskTiming updates Task timing through the Store lock. It is primarily
@@ -211,8 +222,12 @@ func (s *MemoryTaskStore) PublishTask(task *model.Task) error {
 		task.ID = uuid.New().String()
 	}
 	s.mu.RLock()
+	quiesceErr := s.quiesceErrorLocked("PublishTask")
 	_, alreadyPublished := s.tasks[task.ID]
 	s.mu.RUnlock()
+	if quiesceErr != nil {
+		return quiesceErr
+	}
 	if alreadyPublished {
 		return fmt.Errorf("%w: %s", ErrTaskAlreadyExists, task.ID)
 	}
@@ -308,16 +323,19 @@ func (s *MemoryTaskStore) PublishTask(task *model.Task) error {
 
 func (s *MemoryTaskStore) ClaimTask(agentID string, taskID string) error {
 	s.mu.Lock()
+	if err := s.quiesceErrorLocked("ClaimTask"); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 
 	task, ok := s.tasks[taskID]
 	if !ok {
 		s.mu.Unlock()
 		return ErrTaskNotFound
 	}
-	// 节点能力双保险（与 QueryAvailable 同条件）：任务声明了工具子集且已注入
-	// 检查器时，按认领方身份判定（不变式：节点工具集 ⊆ 认领 runner 白名单）。
-	if s.capabilityChecker != nil && agentID != "" &&
-		task.Capability != nil && len(task.Capability.Tools) > 0 {
+	// 认领双保险（与 QueryAvailable 同条件）：显式能力任务以及
+	// Graph/动态 Team 路由任务都要在落锁前重做控制面校验。
+	if s.capabilityChecker != nil && agentID != "" && taskRequiresClaimCheck(task) {
 		if err := s.capabilityChecker(agentID, cloneTask(task)); err != nil {
 			s.mu.Unlock()
 			return fmt.Errorf("%w: %v", ErrTaskClaimBlocked, err)
@@ -389,6 +407,10 @@ func (s *MemoryTaskStore) FreezeTaskLease(taskID string, candidate *model.Execut
 // 租约（Revoked=true）。幂等——重复撤销返回 newlyRevoked=false。
 func (s *MemoryTaskStore) RevokeTaskLease(taskID string) (*model.ExecutionLease, bool, error) {
 	s.mu.Lock()
+	if err := s.quiesceErrorLocked("RevokeTaskLease"); err != nil {
+		s.mu.Unlock()
+		return nil, false, err
+	}
 	task, ok := s.tasks[taskID]
 	if !ok {
 		s.mu.Unlock()
@@ -443,7 +465,23 @@ func leaseTracePayload(lease *model.ExecutionLease, cause string) *trace.LeasePa
 }
 
 func (s *MemoryTaskStore) SubmitResult(agentID string, taskID string, result string) error {
+	return s.submitResultWithFields(agentID, taskID, result, nil, "SubmitResult")
+}
+
+// SubmitResultWithFields 把结构化字段与 agent 正文放在同一临界区写入，并
+// 沿用 SubmitResult 的认领校验和完成语义。取消/失败若先获得锁，本操作在
+// 写入任何字段前返回 ErrTaskNotProcessing；本操作先获得锁时，终态快照
+// 一次性包含 fields、正文与 completed 状态。
+func (s *MemoryTaskStore) SubmitResultWithFields(agentID string, taskID string, result string, fields map[string]string) error {
+	return s.submitResultWithFields(agentID, taskID, result, fields, "SubmitResultWithFields")
+}
+
+func (s *MemoryTaskStore) submitResultWithFields(agentID string, taskID string, result string, fields map[string]string, operation string) error {
 	s.mu.Lock()
+	if err := s.quiesceErrorLocked(operation); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 
 	task, ok := s.tasks[taskID]
 	if !ok {
@@ -460,6 +498,10 @@ func (s *MemoryTaskStore) SubmitResult(agentID string, taskID string, result str
 		return ErrAgentNotInTask
 	}
 
+	for key, value := range fields {
+		task.Results[key] = value
+	}
+	// agent 正文是权威结果键；即使调用方错误地传入同名 field，也不得覆盖。
 	task.Results[agentID] = result
 	outputLen := len(result)
 
@@ -498,6 +540,9 @@ func (s *MemoryTaskStore) SubmitResult(agentID string, taskID string, result str
 func (s *MemoryTaskStore) RecordResultField(taskID string, key string, value string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.quiesceErrorLocked("RecordResultField"); err != nil {
+		return err
+	}
 	task, ok := s.tasks[taskID]
 	if !ok {
 		return ErrTaskNotFound
@@ -506,6 +551,27 @@ func (s *MemoryTaskStore) RecordResultField(taskID string, key string, value str
 		return ErrTaskNotProcessing
 	}
 	task.Results[key] = value
+	return nil
+}
+
+// RecordResultFields 原子写入结构化终态字段：状态检查与全部 map 更新在同一
+// 临界区完成，调用方不会观察到 event 已写而 custom result 尚未写的半状态。
+func (s *MemoryTaskStore) RecordResultFields(taskID string, fields map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.quiesceErrorLocked("RecordResultFields"); err != nil {
+		return err
+	}
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return ErrTaskNotFound
+	}
+	if task.Status != model.TaskStatusProcessing {
+		return ErrTaskNotProcessing
+	}
+	for key, value := range fields {
+		task.Results[key] = value
+	}
 	return nil
 }
 
@@ -521,6 +587,10 @@ func (s *MemoryTaskStore) TransitionStateWithCancelSource(taskID string, from, t
 
 func (s *MemoryTaskStore) transitionState(taskID string, from, to model.TaskStatus, cancelSource string) error {
 	s.mu.Lock()
+	if err := s.quiesceErrorLocked("TransitionState"); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	task, ok := s.tasks[taskID]
 	if !ok {
 		s.mu.Unlock()
@@ -595,6 +665,10 @@ func (s *MemoryTaskStore) transitionState(taskID string, from, to model.TaskStat
 // 与 TransitionState 不同，此方法会设置 task.Error 字段，确保错误信息持久化到 Store。
 func (s *MemoryTaskStore) FailTask(agentID string, taskID string, reason string) error {
 	s.mu.Lock()
+	if err := s.quiesceErrorLocked("FailTask"); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 
 	task, ok := s.tasks[taskID]
 	if !ok {
@@ -634,6 +708,10 @@ func (s *MemoryTaskStore) FailTask(agentID string, taskID string, reason string)
 // 与 FailTask 不同，此方法不需要 agentID 参数，直接清空所有代理。
 func (s *MemoryTaskStore) FailTaskBySystem(taskID string, reason string) error {
 	s.mu.Lock()
+	if err := s.quiesceErrorLocked("FailTaskBySystem"); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	task, ok := s.tasks[taskID]
 	if !ok {
 		s.mu.Unlock()
@@ -676,6 +754,10 @@ func (s *MemoryTaskStore) FailTaskBySystem(taskID string, reason string) error {
 // TransitionState because that generic state primitive has no error payload.
 func (s *MemoryTaskStore) BlockTaskBySystem(taskID string, reason string) error {
 	s.mu.Lock()
+	if err := s.quiesceErrorLocked("BlockTaskBySystem"); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	task, ok := s.tasks[taskID]
 	if !ok {
 		s.mu.Unlock()
@@ -727,7 +809,22 @@ func (s *MemoryTaskStore) BlockTaskBySystem(taskID string, reason string) error 
 // 来源。任务 ctx 经 cancelRegistry 取消；trace 文件不在这里关闭——调用方
 // （agent processTask）有自己的 defer CloseTask。
 func (s *MemoryTaskStore) BlockProcessingTaskBySystem(taskID string, reason string, cause string) error {
+	return s.blockProcessingTask(taskID, "", "", nil, reason, cause, false, "BlockProcessingTaskBySystem")
+}
+
+// CommitBlockedResult 把结构化字段、agent 正文、blocked 原因与终态迁移
+// 放在同一临界区。这样并发 cancelled/failed 只能完整胜出或完整失败，不会
+// 在错误终态上遗留可被 Graph 的 $.custom 条件命中的半份结果。
+func (s *MemoryTaskStore) CommitBlockedResult(agentID string, taskID string, result string, fields map[string]string, reason string, cause string) error {
+	return s.blockProcessingTask(taskID, agentID, result, fields, reason, cause, true, "CommitBlockedResult")
+}
+
+func (s *MemoryTaskStore) blockProcessingTask(taskID string, agentID string, result string, fields map[string]string, reason string, cause string, withResult bool, operation string) error {
 	s.mu.Lock()
+	if err := s.quiesceErrorLocked(operation); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	task, ok := s.tasks[taskID]
 	if !ok {
 		s.mu.Unlock()
@@ -736,6 +833,24 @@ func (s *MemoryTaskStore) BlockProcessingTaskBySystem(taskID string, reason stri
 	if task.Status != model.TaskStatusProcessing {
 		s.mu.Unlock()
 		return ErrTaskNotProcessing
+	}
+	if withResult {
+		found := false
+		for _, assigned := range task.Agents {
+			if assigned == agentID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			s.mu.Unlock()
+			return ErrAgentNotInTask
+		}
+		for key, value := range fields {
+			task.Results[key] = value
+		}
+		// 与成功提交一致，agent 正文键拥有最终覆盖权。
+		task.Results[agentID] = result
 	}
 
 	task.Error = reason
@@ -767,6 +882,10 @@ func (s *MemoryTaskStore) BlockProcessingTaskBySystem(taskID string, reason stri
 
 func (s *MemoryTaskStore) RetryRollback(agentID string, taskID string, reason string) error {
 	s.mu.Lock()
+	if err := s.quiesceErrorLocked("RetryRollback"); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 
 	task, ok := s.tasks[taskID]
 	if !ok {
@@ -891,11 +1010,9 @@ func (s *MemoryTaskStore) QueryAvailable(eventType, agentID string) ([]*model.Ta
 		if task.EventType != eventType {
 			continue
 		}
-		// 节点能力过滤：任务声明了工具子集且已注入检查器时，按认领方身份
-		// 判定（不变式：节点工具集 ⊆ 认领 runner 白名单）。agentID 为空串的
-		// 探测性查询无认领方身份，跳过本过滤（与 nil checker 同语义）。
-		if s.capabilityChecker != nil && agentID != "" &&
-			task.Capability != nil && len(task.Capability.Tools) > 0 {
+		// 与 ClaimTask 共用同一控制面检查：能力越界或路由 owner
+		// scope 不匹配的任务对该认领方不可见。匿名探测仍跳过。
+		if s.capabilityChecker != nil && agentID != "" && taskRequiresClaimCheck(task) {
 			if err := s.capabilityChecker(agentID, cloneTask(task)); err != nil {
 				continue
 			}
@@ -914,6 +1031,16 @@ func (s *MemoryTaskStore) QueryAvailable(eventType, agentID string) ([]*model.Ta
 	})
 
 	return result, nil
+}
+
+func taskRequiresClaimCheck(task *model.Task) bool {
+	if task == nil {
+		return false
+	}
+	if task.EventType == "__scheduler__" || task.RouteScope != "" || task.GraphID != "" || strings.HasPrefix(task.EventType, "team:") {
+		return true
+	}
+	return task.Capability != nil && len(task.Capability.Tools) > 0
 }
 
 func (s *MemoryTaskStore) GetTask(taskID string) (*model.Task, error) {
@@ -962,13 +1089,12 @@ func (s *MemoryTaskStore) GetDependencyResults(taskID string) (map[string]string
 //
 // 持久化语义（2026-04-12 Artifacts 持久化专题）：
 //
-//   - 内存写入在 s.mu 写锁下完成，与其他 Store 方法保持互斥
-//   - 如果 artifactLog 非 nil 且本次是一次**新**路径（去重未命中），
-//     追加一条 JSONL record 到日志。log 写入在 Store 锁**外**进行，
-//     避免 fsync 阻塞其他 goroutine 的读写
-//   - 日志写入失败只打印 warning，不回滚内存状态——参见 artifactLog 字段
-//     的注释（内存是真相来源）
-//   - 去重命中的路径不写 log（不必要的 IO + 让 Replay 更快）
+//   - s.mu 同时串行化 durable log 追加与内存提交，防止相同路径
+//     并发追加或看到未落账的中间态
+//   - artifactLog 非 nil 时先追加 JSONL；追加/同步失败直接返回，
+//     内存不变，下次调用不会被去重误判为已耐久化
+//   - 日志 append + fsync 成功后才更新 task.Artifacts/ArtifactMeta；去重命中且
+//     meta 未变时不重复写 log
 func (s *MemoryTaskStore) AppendArtifact(taskID string, path string) error {
 	return s.AppendArtifactWithMeta(taskID, path, model.ArtifactMeta{})
 }
@@ -983,31 +1109,40 @@ func (s *MemoryTaskStore) AppendArtifact(taskID string, path string) error {
 // meta 为零值或未变化时保持纯 no-op——旧调用方（无 meta）行为与从前一致。
 func (s *MemoryTaskStore) AppendArtifactWithMeta(taskID string, path string, meta model.ArtifactMeta) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	task, ok := s.tasks[taskID]
 	if !ok {
-		s.mu.Unlock()
 		return ErrTaskNotFound
 	}
 	// 去重检查
 	for _, existing := range task.Artifacts {
 		if existing == path {
 			if meta.IsZero() || task.ArtifactMeta[path] == meta {
-				s.mu.Unlock()
 				return nil // 已存在且无新元数据——不写 log
 			}
-			// 重复写入产生了新 hash：更新元数据并补写日志（下方统一处理）
+			// 重复写入产生了新 hash：先补写 durable 日志，
+			// 成功后再更新内存。失败时保留旧 meta，重试仍会进入此分支。
+			if s.artifactLog != nil {
+				if err := s.artifactLog.AppendWithMeta(taskID, path, meta); err != nil {
+					return fmt.Errorf("追加 artifact log 失败 task=%s path=%s: %w", taskID, path, err)
+				}
+				if err := s.artifactLog.FlushPending(); err != nil {
+					return fmt.Errorf("同步 artifact log 失败 task=%s path=%s: %w", taskID, path, err)
+				}
+			}
 			if task.ArtifactMeta == nil {
 				task.ArtifactMeta = make(map[string]model.ArtifactMeta)
 			}
 			task.ArtifactMeta[path] = meta
-			logRef := s.artifactLog
-			s.mu.Unlock()
-			if logRef != nil {
-				if err := logRef.AppendWithMeta(taskID, path, meta); err != nil {
-					log.Printf("[store] WARN artifact log 写入失败 task=%s path=%s: %v", taskID, path, err)
-				}
-			}
 			return nil
+		}
+	}
+	if s.artifactLog != nil {
+		if err := s.artifactLog.AppendWithMeta(taskID, path, meta); err != nil {
+			return fmt.Errorf("追加 artifact log 失败 task=%s path=%s: %w", taskID, path, err)
+		}
+		if err := s.artifactLog.FlushPending(); err != nil {
+			return fmt.Errorf("同步 artifact log 失败 task=%s path=%s: %w", taskID, path, err)
 		}
 	}
 	task.Artifacts = append(task.Artifacts, path)
@@ -1016,16 +1151,6 @@ func (s *MemoryTaskStore) AppendArtifactWithMeta(taskID string, path string, met
 			task.ArtifactMeta = make(map[string]model.ArtifactMeta)
 		}
 		task.ArtifactMeta[path] = meta
-	}
-	logRef := s.artifactLog
-	s.mu.Unlock()
-
-	// 锁外写日志，避免 fsync 阻塞其他 Store 操作
-	if logRef != nil {
-		if err := logRef.AppendWithMeta(taskID, path, meta); err != nil {
-			// 不回滚内存状态——内存是真相来源
-			log.Printf("[store] WARN artifact log 写入失败 task=%s path=%s: %v", taskID, path, err)
-		}
 	}
 	return nil
 }
@@ -1147,8 +1272,8 @@ func (s *MemoryTaskStore) AppendToolCall(taskID string, rec ToolCallRecord) erro
 }
 
 // QueryToolCalls 返回指定任务的工具调用历史。
-// toolName == "" 时返回该任务的全部记录（按写入顺序合并各 toolName 的切片，
-// 然后按 Timestamp 升序排序）；否则只返回匹配 toolName 的记录切片。
+// toolName == "" 时返回该任务的全部记录（合并各 toolName 的切片后，按
+// Timestamp + durable 调用身份稳定排序）；否则只返回匹配 toolName 的记录切片。
 //
 // 任务不存在时返回 (nil, nil)——hook 需要容忍这种情形（例如任务刚被淘汰）。
 // 返回值是内部数据的浅拷贝，调用方可以安全遍历或修改。
@@ -1185,10 +1310,39 @@ func (s *MemoryTaskStore) QueryToolCalls(taskID string, toolName string) ([]Tool
 			dst = append(dst, cloneToolCallRecord(rec))
 		}
 	}
-	sort.Slice(dst, func(i, j int) bool {
-		return dst[i].Timestamp.Before(dst[j].Timestamp)
+	sort.SliceStable(dst, func(i, j int) bool {
+		if !dst[i].Timestamp.Equal(dst[j].Timestamp) {
+			return dst[i].Timestamp.Before(dst[j].Timestamp)
+		}
+		return toolCallOrderingKey(dst[i]) < toolCallOrderingKey(dst[j])
 	})
 	return dst, nil
+}
+
+// toolCallOrderingKey 为相同 Timestamp 的并行工具调用提供确定性次序。不能
+// 依赖 byTool map 的遍历顺序；CallID 是首选身份，兼容旧快照的空 CallID 时再由
+// 其余 durable 内容打破平局。JSON 对 string-key map 的编码顺序稳定。
+func toolCallOrderingKey(rec ToolCallRecord) string {
+	payload := struct {
+		CallID   string         `json:"call_id,omitempty"`
+		AgentID  string         `json:"agent_id,omitempty"`
+		ToolName string         `json:"tool_name"`
+		Args     map[string]any `json:"args,omitempty"`
+		Success  bool           `json:"success"`
+		ExitCode *int           `json:"exit_code,omitempty"`
+	}{
+		CallID: rec.CallID, AgentID: rec.AgentID, ToolName: rec.ToolName,
+		Args: rec.Args, Success: rec.Success, ExitCode: rec.ExitCode,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		// 正常工具参数均为 JSON 值；测试桩若放入不可编码值，仍以不含 Args
+		// 的 durable 字段提供确定性退化次序。
+		return strings.Join([]string{
+			rec.CallID, rec.AgentID, rec.ToolName, strconv.FormatBool(rec.Success),
+		}, "\x00")
+	}
+	return string(encoded)
 }
 
 func cloneToolCallRecord(rec ToolCallRecord) ToolCallRecord {
@@ -1328,6 +1482,89 @@ func (s *MemoryTaskStore) emitHistory(eventType string, payload map[string]any) 
 	}
 }
 
+// CancelAllNonTerminal 把当前全部 pending / processing 任务批量转为 cancelled
+// 终态，返回实际取消的任务数。blocked 已是终态不动；completed / failed /
+// cancelled 不动。
+//
+// 单任务语义与 TransitionStateWithCancelSource 对齐，差别仅在锁内一次性
+// 遍历（不为每个任务重新取锁）：terminal 集合登记（addTerminal，含依赖感知
+// FIFO 淘汰）、cancelRegistry.CancelWithSource、终态撤销执行租约；解锁后
+// 逐任务补发 execution_lease_revoked trace 与 EventTaskCancelled 公告板事件，
+// 并按任务 emit task_cancelled history。来源集合只含 pending / processing，
+// 两者向 cancelled 均为合法迁移，无需再经 IsValidTransition 校验。
+//
+// 用途：/new force——会话快照落盘后强制终止当前全部运行时任务。
+func (s *MemoryTaskStore) CancelAllNonTerminal(cancelSource string) int {
+	s.mu.Lock()
+	if s.quiesced {
+		// 签名无 error 无法向上传递围栏拒绝：静默窗口内本就不该走到这里
+		// （冻结协议用 cancelRegistry.Reset()，/new force 不进静默窗口），
+		// 记 WARNING 并返回 0，绝不产生迁移与事件。
+		s.mu.Unlock()
+		log.Printf("[公告板] WARNING: 静默窗口内拒绝批量终止（CancelAllNonTerminal），返回 0")
+		return 0
+	}
+	type cancelledTask struct {
+		id           string
+		revokedLease *model.ExecutionLease
+	}
+
+	now := time.Now()
+	cancelled := make([]cancelledTask, 0)
+	for taskID, task := range s.tasks {
+		if task.Status != model.TaskStatusPending && task.Status != model.TaskStatusProcessing {
+			continue
+		}
+		task.Status = model.TaskStatusCancelled
+		task.PendingSince = time.Time{}
+		task.CompletedAt = now
+		task.Agents = make([]string, 0) // 清理残留代理，与单任务终态路径一致
+		s.addTerminal(taskID)
+		if s.cancelRegistry != nil {
+			if cancelSource != "" {
+				s.cancelRegistry.CancelWithSource(taskID, cancelSource)
+			} else {
+				s.cancelRegistry.Cancel(taskID)
+			}
+		}
+		// V6 §4 H1：终态撤销执行租约（已撤销/无租约时返回 nil 不发事件）。
+		cancelled = append(cancelled, cancelledTask{id: taskID, revokedLease: s.revokeLeaseLocked(task)})
+	}
+	s.mu.Unlock()
+
+	// 与单任务终态路径同纪律：租约撤销事件与公告板事件都在锁外补发。
+	for _, ct := range cancelled {
+		emitLeaseRevoked(ct.id, ct.revokedLease, "terminal:"+string(model.TaskStatusCancelled))
+		s.sendEvent(model.Event{Type: model.EventTaskCancelled, TaskID: ct.id})
+		s.emitHistory(session.HistEventTaskCancelled, map[string]any{
+			"task_id":       ct.id,
+			"cancel_source": cancelSource,
+		})
+	}
+	return len(cancelled)
+}
+
+// PurgeAll 锁内清空任务表与全部按任务索引的派生状态——toolCalls 账本、
+// completed 终态 FIFO 集合、cancel registry 条目（经 Reset 取消并清理全部
+// per-task context）。任务自携带的 ReadSet / Artifacts / Lease 随任务表一并
+// 释放，Store 回到刚构造的空状态，evictSafe / addTerminal 等内部簿记因
+// completed 清空而自然自洽。
+//
+// 不发任何公告板 / history 事件：本方法用于会话快照已落盘后的内存清扫
+// （/new force），调用方保证旧任务不再有消费者。Close 语义不变——PurgeAll
+// 后同一 Store 可继续 PublishTask 复用。
+func (s *MemoryTaskStore) PurgeAll() {
+	s.mu.Lock()
+	s.tasks = make(map[string]*model.Task)
+	s.completed = make([]string, 0)
+	s.toolCalls = make(map[string]map[string][]ToolCallRecord)
+	// 与其他 Store 方法同锁序（Store 锁内调用 registry，registry 不回调 Store）。
+	if s.cancelRegistry != nil {
+		s.cancelRegistry.Reset()
+	}
+	s.mu.Unlock()
+}
+
 // ExportSnapshot 导出当前 store 中的全部任务为 []session.TaskSnapshot。
 //
 // 终态任务也必须保留：非终态 DAG 节点可能依赖一个已完成节点，若恢复时丢掉
@@ -1373,6 +1610,8 @@ func (s *MemoryTaskStore) ExportSnapshot() []session.TaskSnapshot {
 			GraphID:           task.GraphID,
 			NodeID:            task.NodeID,
 			ActivationID:      task.ActivationID,
+			GraphNodeKind:     task.GraphNodeKind,
+			RouteScope:        task.RouteScope,
 			Capability:        exportCapability(task.Capability),
 			Lease:             exportLease(task.Lease),
 			LastHistory:       append([]byte(nil), task.LastHistory...),
@@ -1388,7 +1627,18 @@ func (s *MemoryTaskStore) ExportSnapshot() []session.TaskSnapshot {
 func (s *MemoryTaskStore) ImportSnapshot(tasks []session.TaskSnapshot) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.importSnapshotLocked(tasks)
+}
 
+// importSnapshotLocked 是 ImportSnapshot / ReplaceSnapshot 共用的锁内导入
+// 主体：先清空任务表、completed 终态 FIFO 与 toolCalls 账本，再逐条快照
+// 重建任务，最后按 CompletedAt 重建终态 FIFO 并做依赖感知淘汰。
+// 调用方必须已持有 s.mu。
+//
+// 刻意不触碰 cancelRegistry：进程恢复路径（bootstrap restoreRuntimeSnapshot）
+// 在全新 registry 上运行，无需清理；session 切换的原位替换由 ReplaceSnapshot
+// 在调用本方法前先行 Reset（见该方法注释）。
+func (s *MemoryTaskStore) importSnapshotLocked(tasks []session.TaskSnapshot) error {
 	// 清空现有状态
 	s.tasks = make(map[string]*model.Task)
 	s.completed = make([]string, 0)
@@ -1492,6 +1742,8 @@ func (s *MemoryTaskStore) ImportSnapshot(tasks []session.TaskSnapshot) error {
 			GraphID:           snap.GraphID,
 			NodeID:            snap.NodeID,
 			ActivationID:      snap.ActivationID,
+			GraphNodeKind:     snap.GraphNodeKind,
+			RouteScope:        snap.RouteScope,
 			Capability:        importCapability(snap.Capability),
 			Lease:             importLease(snap.Lease),
 			LastHistory:       append([]byte(nil), snap.LastHistory...),
@@ -1532,6 +1784,88 @@ func (s *MemoryTaskStore) ImportSnapshot(tasks []session.TaskSnapshot) error {
 	}
 	s.evictSafe()
 	return nil
+}
+
+// ReplaceSnapshot 用给定快照整体替换公告板（session 解冻时的原位替换原语）。
+// 语义是"整体替换"而非"合并"：单锁内先把 cancelRegistry 复位（与 PurgeAll
+// 同纪律——旧任务属于被冻结的 session，其 per-task cancel context 不得泄漏
+// 进新公告板），再经 importSnapshotLocked 导入快照任务，完整继承其不变量
+// （processing 重排回 pending、finalizing 已撤销租约的隔离为 blocked、
+// EventSource→ParentTaskID 旧快照升级、终态 FIFO 重建与依赖感知淘汰、
+// 快照内重复 ID 后者覆盖前者）。
+//
+// 事件语义（调查结论）：不发任何公告板 / history 事件。任务的可认领性
+// 不依赖事件——QueryAvailable 是对任务表的轮询全量扫描，agent 主循环
+// 周期轮询 + sleep，没有任何事件订阅；sendEvent 只在终态 / 重试迁移时
+// 通知 Activator，连 PublishTask 发布新任务都不发事件。进程恢复路径
+// （restoreRuntimeSnapshot → ImportSnapshot）就不发任何事件，任务由
+// Runner 下一轮轮询自然认领；ReplaceSnapshot 与之完全同理——替换进去的
+// pending 任务在下一轮 QueryAvailable 中自然可见，无需也无法经事件唤醒。
+func (s *MemoryTaskStore) ReplaceSnapshot(tasks []session.TaskSnapshot) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 与 PurgeAll 同锁序（Store 锁内调用 registry，registry 不回调 Store）。
+	if s.cancelRegistry != nil {
+		s.cancelRegistry.Reset()
+	}
+	return s.importSnapshotLocked(tasks)
+}
+
+// EnterQuiesce 让公告板进入静默窗口（session 冻结协议的围栏）。
+//
+// 动机与窗口边界：冻结流程由 bootstrap 编排层单线程驱动——
+// ① EnterQuiesce → ② 导出旧 session 快照 → ③ cancelRegistry.Reset()
+// 取消全部任务 context → ④ 切换 session → ⑤ ReplaceSnapshot(目标任务集)
+// → ⑥ ExitQuiesce。被 Reset 取消的旧 session agent 会在 ctx.Done 后
+// 迟到提交终态（cancelled / failed / completed）；这些提交一旦生效，
+// 会把旧 session 任务改成终态并发出误导性公告板事件（graph feed /
+// team 回收会被误触发），因此窗口内全部状态迁移入口在持锁后第一站
+// 以 ErrStoreQuiesced 拒绝——不改任何状态、不发任何事件、不发 history。
+// 退出静默后板已整体替换，迟到提交自然因 task 不存在而报错，围栏不再
+// 需要。已在静默开始前持锁进入的迁移在锁内串行完成，天然先于围栏生效。
+//
+// 围栏只挡状态迁移入口（PublishTask / ClaimTask / SubmitResult /
+// TransitionState 系 / FailTask 系 / BlockTaskBySystem 系 / RetryRollback /
+// CancelAllNonTerminal / RecordResultField / RevokeTaskLease）：
+//   - 只读方法（QueryAvailable / GetTask / ScanAll / ExportSnapshot 等）
+//     不受限——编排层要在窗口内导出快照；
+//   - 执行账本写（AppendOutput / AppendToolCall / RecordLastHistory /
+//     AppendArtifact / FreezeTaskLease 等）不受限——Reset 前存活 agent
+//     的正常执行路径不应被注入错误；
+//   - 整体替换（ReplaceSnapshot / ImportSnapshot / PurgeAll）不受限——
+//     ReplaceSnapshot 正是解冻路径的第⑤步。
+//
+// 幂等：重复 Enter 不 panic（仅首次记日志）。进入/退出的单线程编排纪律
+// 由调用方（bootstrap snapshotMu 临界区）保证。
+func (s *MemoryTaskStore) EnterQuiesce() {
+	s.mu.Lock()
+	if !s.quiesced {
+		s.quiesced = true
+		log.Printf("[公告板] 进入静默窗口：任务状态迁移围栏已启用")
+	}
+	s.mu.Unlock()
+}
+
+// ExitQuiesce 退出静默窗口，恢复全部状态迁移入口。幂等：重复 Exit 不
+// panic（仅真正退出时记日志）。
+func (s *MemoryTaskStore) ExitQuiesce() {
+	s.mu.Lock()
+	if s.quiesced {
+		s.quiesced = false
+		log.Printf("[公告板] 退出静默窗口：任务状态迁移围栏已解除")
+	}
+	s.mu.Unlock()
+}
+
+// quiesceErrorLocked 在持锁状态下检查静默围栏：静默期间返回包装
+// ErrStoreQuiesced、带操作名的中文错误，否则返回 nil。全部状态迁移入口
+// 在持锁后第一站调用——被拒时不改状态、不发事件、不发 history。
+func (s *MemoryTaskStore) quiesceErrorLocked(op string) error {
+	if !s.quiesced {
+		return nil
+	}
+	return fmt.Errorf("%w：%s", ErrStoreQuiesced, op)
 }
 
 // copyStrings 返回字符串切片的副本。nil 输入返回空切片。

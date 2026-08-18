@@ -4,10 +4,12 @@ package bootstrap
 // 静态 agent / spawn ad-hoc 继承 / 动态 Team route 交集 / fail-closed / scheduler 跳过。
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	"agentgo/internal/model"
+	"agentgo/internal/scheduler"
 	"agentgo/internal/store"
 )
 
@@ -54,7 +56,11 @@ func TestCapabilityRegistry_SpawnAdhocInheritsBaseKind(t *testing.T) {
 
 func TestCapabilityRegistry_DynamicTeamRouteIntersection(t *testing.T) {
 	reg := newCapabilityRegistry()
-	reg.routeCaps = func(eventType string) ([]string, bool) {
+	reg.routeAllows = func(_ string, eventType string, _ ...string) bool { return eventType == "team:research" }
+	reg.routeAgentAllows = func(agentID, _ string, eventType string) bool {
+		return agentID == "team-agent-1" && eventType == "team:research"
+	}
+	reg.routeCaps = func(_ string, eventType string) ([]string, bool) {
 		if eventType == "team:research" {
 			return []string{"read_file", "web_fetch"}, true
 		}
@@ -70,6 +76,97 @@ func TestCapabilityRegistry_DynamicTeamRouteIntersection(t *testing.T) {
 	teamTask.Capability.Tools = []string{"run_shell"}
 	if err := check("team-agent-1", teamTask); err == nil {
 		t.Fatal("超出 route 能力交集应拒绝")
+	}
+}
+
+func TestCapabilityRegistry_EnforcesGraphRouteScopeAtClaimTime(t *testing.T) {
+	reg := newCapabilityRegistry()
+	reg.routeAllows = func(ownerScope, eventType string, required ...string) bool {
+		return ownerScope == model.GraphRouteScope("g-a") && eventType == "team:research"
+	}
+	reg.routeAgentAllows = func(agentID, ownerScope, eventType string) bool {
+		return agentID == "team-agent" && ownerScope == model.GraphRouteScope("g-a") && eventType == "team:research"
+	}
+	check := reg.checker()
+
+	allowed := &model.Task{ID: "same-graph", GraphID: "g-a", RouteScope: model.GraphRouteScope("g-a"), EventType: "team:research"}
+	if err := check("team-agent", allowed); err != nil {
+		t.Fatalf("same-Graph Team route should be claimable: %v", err)
+	}
+	for _, task := range []*model.Task{
+		{ID: "wrong-graph", GraphID: "g-b", RouteScope: model.GraphRouteScope("g-b"), EventType: "team:research"},
+		{ID: "missing-owner", EventType: "team:research"},
+	} {
+		if err := check("team-agent", task); err == nil || !strings.Contains(err.Error(), "fail-closed") {
+			t.Fatalf("cross/missing scope task %s err=%v", task.ID, err)
+		}
+	}
+
+	// Backward compatibility is safe: old snapshots without RouteScope derive
+	// the same exact owner from GraphID rather than becoming globally visible.
+	legacy := &model.Task{ID: "legacy-snapshot", GraphID: "g-a", EventType: "team:research"}
+	if err := check("team-agent", legacy); err != nil {
+		t.Fatalf("legacy Graph task should derive the same scope: %v", err)
+	}
+}
+
+func TestCapabilityRegistry_ForeignListenerCollisionCannotQueryOrClaim(t *testing.T) {
+	routes := scheduler.NewAgentRegistry()
+	const eventType = "team:shared"
+	registrations := []struct {
+		key, owner, agent string
+	}{
+		{key: "static:collision", agent: "static-collision-1"},
+		{key: "team:a", owner: model.GraphRouteScope("g-a"), agent: "team-a-1"},
+		{key: "team:b", owner: model.GraphRouteScope("g-b"), agent: "team-b-1"},
+	}
+	for _, registration := range registrations {
+		if err := routes.RegisterRoute(registration.key, eventType, registration.owner, 1,
+			registration.key, []string{"read_file"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := routes.BindRouteClaimants(registration.key, []string{registration.agent}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reg := newCapabilityRegistry()
+	reg.routeAllows = routes.CanRouteForPlan
+	reg.routeAgentAllows = routes.CanAgentClaimRoute
+	reg.routeCaps = routes.RouteCapabilitiesForPlan
+	s := store.NewMemoryTaskStore(nil, 100, 1, 300)
+	s.SetCapabilityChecker(store.CapabilityChecker(reg.checker()))
+	for _, task := range []*model.Task{
+		{ID: "task-a", GraphID: "g-a", RouteScope: model.GraphRouteScope("g-a"), EventType: eventType},
+		{ID: "task-b", GraphID: "g-b", RouteScope: model.GraphRouteScope("g-b"), EventType: eventType},
+	} {
+		if err := s.PublishTask(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	visible, err := s.QueryAvailable(eventType, "team-b-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(visible) != 1 || visible[0].ID != "task-b" {
+		t.Fatalf("foreign listener visibility=%+v, want only task-b", visible)
+	}
+	visible, err = s.QueryAvailable(eventType, "static-collision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(visible) != 0 {
+		t.Fatalf("static EventType collision saw private Team tasks: %+v", visible)
+	}
+	if err := s.ClaimTask("team-b-1", "task-a"); !errors.Is(err, store.ErrTaskClaimBlocked) {
+		t.Fatalf("foreign direct ClaimTask err=%v, want ErrTaskClaimBlocked", err)
+	}
+	if err := s.ClaimTask("static-collision-1", "task-a"); !errors.Is(err, store.ErrTaskClaimBlocked) {
+		t.Fatalf("static collision direct ClaimTask err=%v, want ErrTaskClaimBlocked", err)
+	}
+	if err := s.ClaimTask("team-a-1", "task-a"); err != nil {
+		t.Fatalf("same-scope ClaimTask: %v", err)
 	}
 }
 
@@ -89,8 +186,49 @@ func TestCapabilityRegistry_UnknownAgentFailsClosed(t *testing.T) {
 // scheduler 无白名单 registry：topo=solo 亲自执行时跳过检查。
 func TestCapabilityRegistry_SchedulerSkipped(t *testing.T) {
 	reg := newCapabilityRegistry()
+	reg.schedulerAgentID = "scheduler"
 	if err := reg.checker()("scheduler", capableTask("write_file", "run_shell")); err != nil {
 		t.Fatalf("scheduler 应跳过能力检查: %v", err)
+	}
+	controller := &model.Task{ID: "controller", GraphID: "g", RouteScope: model.GraphRouteScope("g"), EventType: "__scheduler__"}
+	if err := reg.checker()("scheduler", controller); err != nil {
+		t.Fatalf("built-in Graph controller route should remain claimable by scheduler: %v", err)
+	}
+	teamTask := &model.Task{ID: "team", GraphID: "g", RouteScope: model.GraphRouteScope("g"), EventType: "team:x"}
+	if err := reg.checker()("scheduler", teamTask); err == nil {
+		t.Fatal("scheduler identity must not bypass scoped Team route membership")
+	}
+	root := &model.Task{ID: "root", EventType: "__scheduler__"}
+	if err := reg.checker()("scheduler-1", root); err == nil {
+		t.Fatal("scheduler-prefix impostor must not enter reserved __scheduler__ route")
+	}
+}
+
+func TestCapabilityRegistry_ReservedSchedulerRouteFiltersStoreQueryAndClaim(t *testing.T) {
+	reg := newCapabilityRegistry()
+	reg.schedulerAgentID = "scheduler"
+	s := store.NewMemoryTaskStore(nil, 100, 1, 300)
+	s.SetCapabilityChecker(store.CapabilityChecker(reg.checker()))
+	root := &model.Task{ID: "root-scheduler-task", EventType: "__scheduler__"}
+	if err := s.PublishTask(root); err != nil {
+		t.Fatal(err)
+	}
+	visible, err := s.QueryAvailable("__scheduler__", "scheduler-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(visible) != 0 {
+		t.Fatalf("scheduler-prefix impostor saw reserved tasks: %+v", visible)
+	}
+	if err := s.ClaimTask("scheduler-1", root.ID); !errors.Is(err, store.ErrTaskClaimBlocked) {
+		t.Fatalf("scheduler-prefix direct claim err=%v, want ErrTaskClaimBlocked", err)
+	}
+	visible, err = s.QueryAvailable("__scheduler__", "scheduler")
+	if err != nil || len(visible) != 1 || visible[0].ID != root.ID {
+		t.Fatalf("exact scheduler visibility=%+v err=%v", visible, err)
+	}
+	if err := s.ClaimTask("scheduler", root.ID); err != nil {
+		t.Fatalf("exact scheduler ClaimTask: %v", err)
 	}
 }
 

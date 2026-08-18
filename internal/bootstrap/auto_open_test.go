@@ -40,6 +40,8 @@ func TestMaybeAutoOpenBrowser_OpensWithToken(t *testing.T) {
 	cfg.UI.Frontends = []string{"web"}
 	cfg.UI.Web.Listen = boundAddr
 	cfg.UI.Web.Token = "t0ken 值"
+	on := true
+	cfg.UI.Web.AutoOpen = &on
 	s := &System{Config: cfg}
 	s.maybeAutoOpenBrowser(ctx)
 

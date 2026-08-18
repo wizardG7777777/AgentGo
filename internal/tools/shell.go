@@ -11,6 +11,7 @@ import (
 	"agentgo/internal/effect"
 	"agentgo/internal/interaction"
 	"agentgo/internal/modes"
+	"agentgo/internal/pathutil"
 	"agentgo/internal/shell"
 	"agentgo/internal/tools/schema"
 	"agentgo/internal/trace"
@@ -43,9 +44,9 @@ const defaultShellTimeoutSec = 30
 //   - InteractionWaitHook：交互等待钩子，进入/退出"等待用户回复"时各回调一次
 //     （true/false），供调用方接线 agent 状态机（waiting_interaction）；nil 为 no-op
 //   - ActiveViewer：按任务写时复制隔离的活动视图提供者（runner 装配的
-//     workspace.Swapper）；非 nil 且 ActiveView() 非 nil 时，LLM 未显式传
-//     working_dir 的默认执行目录切到 workspace 根（尽力隔离：命令写主根绝对
-//     路径不可完全阻止，属设计上有意接受的 shell 残余风险，见 workspace/types.go）
+//     workspace.Swapper）；非 nil 且 ActiveView() 非 nil 时，默认 cwd 与显式
+//     working_dir 都限制在 workspace 根内。命令正文写主根绝对路径仍不可完全
+//     阻止，属设计上有意接受的宿主 Shell 残余风险（见 workspace/types.go）
 type ShellGroup struct {
 	Workdir             WorkdirProvider
 	TimeoutSec          int
@@ -71,12 +72,10 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 
 	workdir := g.Workdir
 
-	// defaultWorkDir 是 LLM 未显式传 working_dir 时的默认执行目录：
-	// 隔离任务（ActiveViewer 有活动视图）切到 workspace 根——写倾向命令的
-	// 相对路径落点随之进 workspace；显式传 working_dir 时维持现状按主根
-	// 校验（shell 残余风险，有意接受）。无视图时回退主根（Workdir.Get），
-	// 与旧行为完全一致。
-	defaultWorkDir := func() string {
+	// allowedWorkDirRoot 是当前调用唯一允许的 cwd 根：隔离任务严格限定在
+	// workspace 视图内，普通任务限定在项目根内。它只约束进程 cwd；命令正文
+	// 仍可引用宿主绝对路径，因此 run_shell 依然是宿主机高权限能力而非沙箱。
+	allowedWorkDirRoot := func() string {
 		if g.ActiveViewer != nil {
 			if view := g.ActiveViewer.ActiveView(); view != nil {
 				return view.Root()
@@ -86,6 +85,21 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 			return workdir.Get()
 		}
 		return ""
+	}
+	resolveWorkingDir := func(args map[string]any) (string, error) {
+		root := allowedWorkDirRoot()
+		if root == "" {
+			return "", fmt.Errorf("Shell 工作目录边界未配置，拒绝执行")
+		}
+		raw, _ := args["working_dir"].(string)
+		if raw == "" {
+			raw = "."
+		}
+		resolved, err := pathutil.ValidatePath(raw, root)
+		if err != nil {
+			return "", fmt.Errorf("Shell working_dir 被拒绝: %w", err)
+		}
+		return resolved, nil
 	}
 
 	rawFn := func(ctx context.Context, args map[string]any) (string, error) {
@@ -102,10 +116,11 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 			effectiveTimeoutSec = v
 		}
 
-		// 确定工作目录：args 优先，其次默认目录（隔离时 workspace 根，否则主根）。
-		workingDir, _ := args["working_dir"].(string)
-		if workingDir == "" {
-			workingDir = defaultWorkDir()
+		// wrappedFn 已把目录 canonicalize；这里再次 fail-closed，避免未来新增
+		// 包装路径时绕过工作目录边界。
+		workingDir, err := resolveWorkingDir(args)
+		if err != nil {
+			return "", err
 		}
 
 		timeout := time.Duration(effectiveTimeoutSec) * time.Second
@@ -197,17 +212,12 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 
 	authorizedFn := shell.WrapShellTool(rawFn, filter, g.Interactions, g.SessionID,
 		g.AgentID, g.InteractionWaitHook, g.Modes)
-	// Interaction 必须绑定实际执行目录，而不是只看到用户是否显式传参。
-	// 在进入拦截器前复制参数并补齐默认目录（隔离时 workspace 根，否则
-	// Workdir fallback），避免修改 LLM 调用方持有的 map。
+	// Interaction 必须绑定 canonical 实际执行目录，而不是用户原始字符串。
+	// 在进入拦截器前统一解析显式/默认目录，避免授权目录与真实 cwd 分叉。
 	wrappedFn := func(ctx context.Context, args map[string]any) (string, error) {
-		workingDir, _ := args["working_dir"].(string)
-		if workingDir != "" {
-			return authorizedFn(ctx, args)
-		}
-		dir := defaultWorkDir()
-		if dir == "" {
-			return authorizedFn(ctx, args)
+		dir, err := resolveWorkingDir(args)
+		if err != nil {
+			return "", err
 		}
 		resolvedArgs := make(map[string]any, len(args)+1)
 		for key, value := range args {
@@ -219,11 +229,11 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 
 	params := schema.Object().
 		String("command", "要执行的 shell 命令", true).
-		String("working_dir", "执行命令的工作目录，留空时使用代理当前工作目录", false).
+		String("working_dir", "执行命令的工作目录；普通任务必须位于 project_root 内，workspace 隔离任务必须位于该任务 workspace 内；留空使用当前允许根", false).
 		Int("timeout_sec", "本次执行的超时秒数，留空时使用配置默认值", false).
 		Build()
 
-	r.Register("run_shell", "在指定目录下执行 shell 命令，返回 stdout、stderr 和 exit code"+shellDialectNote(), params, wrappedFn)
+	r.Register("run_shell", "[宿主机高权限能力，不是 OS 沙箱] 在受限工作目录下执行 shell 命令；命令正文仍可访问宿主绝对路径、网络和子进程。返回 stdout、stderr 和 exit code"+shellDialectNote(), params, wrappedFn)
 }
 
 // shellCommand 根据当前操作系统返回合适的 shell 执行器和参数。

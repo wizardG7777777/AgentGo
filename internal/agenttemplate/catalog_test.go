@@ -67,6 +67,27 @@ func TestLoadBuiltinsAndCatalogCopies(t *testing.T) {
 	if !reflect.DeepEqual(gotRefs, wantRefs) {
 		t.Fatalf("List refs = %v, want %v", gotRefs, wantRefs)
 	}
+	verifier, err := catalog.Resolve("builtin/verifier@1")
+	if err != nil {
+		t.Fatalf("Resolve verifier: %v", err)
+	}
+	wantVerifierTools := []string{
+		"read_file", "list_dir", "grep_search", "glob_search",
+		"web_search", "web_fetch", "submit_task_result",
+	}
+	if !reflect.DeepEqual(verifier.Tools, wantVerifierTools) {
+		t.Fatalf("builtin verifier tools = %v, want closed read-only set %v", verifier.Tools, wantVerifierTools)
+	}
+	for _, stale := range []string{"使用 request_replan", "MCP 类只读工具", "是否发生在最后一次写入之后"} {
+		if strings.Contains(verifier.SystemPrompt, stale) {
+			t.Errorf("builtin verifier prompt contains stale authority/freshness claim %q", stale)
+		}
+	}
+	for _, want := range []string{"Evidence 只证明这次调用发生过", "implement → checker → acceptance", "blocked 终态就是交回 Scheduler 的唯一通道"} {
+		if !strings.Contains(verifier.SystemPrompt, want) {
+			t.Errorf("builtin verifier prompt missing closed-tool/causality contract %q", want)
+		}
+	}
 
 	first, err := catalog.Resolve("builtin/generalist@1")
 	if err != nil {

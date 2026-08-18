@@ -68,6 +68,10 @@ type System struct {
 	// 提交/查询图。
 	GraphStore   *graph.Store
 	GraphRuntime *graph.Runtime
+	// graphApprovalGW 是 approval 节点与 Interaction 服务之间的网关（C5c）；
+	// session 解冻后为该 session 的 waiting approval 节点补登记 Interaction。
+	// nil 表示 approval 桥未装配（Interactions 或 GraphRuntime 缺失）。
+	graphApprovalGW *graphApprovalGateway
 	// Interactions is the authoritative structured human-response service shared
 	// by Scheduler/Graph approval, Shell and every UI frontend.
 	Interactions *interaction.Service
@@ -212,6 +216,13 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("v4 配置校验失败: %w", err)
 	}
+	// 所有运行时边界共享同一 canonical 项目根：统一相对根、symlink 与
+	// macOS /var → /private/var 等路径别名，禁止各子系统自行解释原始字符串。
+	canonicalProjectRoot, err := pathutil.CanonicalizeRoot(cfg.ProjectRoot)
+	if err != nil {
+		return nil, fmt.Errorf("project_root 初始化失败: %w", err)
+	}
+	cfg.ProjectRoot = canonicalProjectRoot
 
 	// Step 1.06: 项目级单实例锁（E7）——两个 agentgo 进程共用同一 .agentgo
 	//             目录会互踩共享状态（session 固定 .tmp 原子写名冲突、trace GC
@@ -282,6 +293,14 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// 开启 history.jsonl 事件溯源（默认关闭，由 bootstrap 显式启用）
 	if sessMgr != nil && sessMgr.Current() != nil {
 		sessMgr.EnableHistoryLog()
+	}
+	// 空会话清扫：崩溃（无优雅退出）遗留的空会话目录由启动期兜底删除
+	// （优雅退出/切走时的空会话分别在 Shutdown 与切换成功后丢弃）。
+	// 此刻历史 Session 无任何句柄占用，与 RunArchive 同窗口，删除安全。
+	if sessMgr != nil {
+		if removed := sessMgr.SweepEmptySessions(); removed > 0 {
+			log.Printf("[启动] 已清理 %d 个空会话（从未提交实际任务）", removed)
+		}
 	}
 	recoveredSnap := currentRecoveredSnapshot(sessMgr)
 
@@ -592,10 +611,19 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// Step 3.9.1: V6 Graph 运行桥接（C5a，graph_runtime.go）——图持久化恢复、
 	// 执行引擎与任务终态回填 Reactor（graph-terminal-feed）。必须在
 	// dispatcher 挂载前完成注册（restoreRuntimeBeforeReactorActivation）。
+	// sessionIDProvider 闭包惰性取 sessMgr 当前 session：提交图盖章归属、
+	// 恢复时归并无归属历史图；sessMgr 为 nil（无 Session 模式）时归空串。
 	graphStore, graphRuntime, err := wireGraphRuntime(
-		cfg, taskStore, reactorReg, effectJournal, unresolvedEffectTaskReasons(effectRecoveryDecisions))
+		cfg, taskStore, reactorReg, effectJournal,
+		func() string { return currentSessionIDFromMgr(sessMgr) },
+		unresolvedEffectTaskReasons(effectRecoveryDecisions))
 	if err != nil {
 		return nil, err
+	}
+	if migrated, migrateErr := migrateV1TeamGraphBindings(teamStore, graphStore); migrateErr != nil {
+		return nil, fmt.Errorf("迁移 Agent TeamStore v1 Graph 归属失败（按 fail-closed 拒绝启动）: %w", migrateErr)
+	} else if migrated {
+		log.Println("[启动] Agent TeamStore v1 已按 durable Graph route 引用迁移到 v2")
 	}
 	// 注：用户 reactor + spawn.Manager + trace.SetDefaultDispatcher 推迟到
 	// RunnerDeps 构造完成后（见 Step 8 末尾），因为 spawn.Manager 需要 RunnerDeps
@@ -631,6 +659,13 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		if err := agentRegistry.RegisterRoute("static:"+kind.Kind, kind.EventType, "", kind.Replicas, role, caps); err != nil {
 			return nil, fmt.Errorf("注册静态 Agent route kind=%q 失败: %w", kind.Kind, err)
 		}
+		claimants := make([]string, kind.Replicas)
+		for i := range claimants {
+			claimants[i] = fmt.Sprintf("%s-%d", kind.Kind, i+1)
+		}
+		if err := agentRegistry.BindRouteClaimants("static:"+kind.Kind, claimants); err != nil {
+			return nil, fmt.Errorf("绑定静态 Agent route kind=%q 认领者失败: %w", kind.Kind, err)
+		}
 	}
 	for _, sa := range agentRegistry.Specialized() {
 		desc := sa.Role
@@ -646,6 +681,16 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// workspace 孤儿清扫：终态 / 失踪任务的残留目录由 watchdog 周期兜底
 	// （合并成功的正常清理由执行面负责；nil-safe 字段注入，不改 New 签名）。
 	w.WorkspaceManager = wsMgr
+	// 冻结 session workspace 豁免重建：豁免表是 Watchdog 的纯进程内状态，
+	// 进程重启即丢失——此刻 SessionMgr（Step 1.3）与 Watchdog 均已就绪，
+	// 而公告板尚空、Watchdog 未启动（Start 才跑巡检），在此登记最安全：
+	// 枚举 sess-*/snapshot.json，把非当前活跃 session 快照里的非终态任务
+	// 重新豁免（其 workspace 归冻结 session 所有，解冻重排后以同一 taskID
+	// 复用），防止 cleanupWorkspaceOrphans 把它们误判孤儿清掉。
+	// sessMgr 为 nil（无 Session 模式）时跳过——无冻结 session 可言。
+	if sessMgr != nil {
+		w.ExemptWorkspaces(rebuildFrozenWorkspaceExemptions(sessDir, currentSessionIDFromMgr(sessMgr)))
+	}
 
 	// Step 6.5: 校验 profile 中的工具名拼写（v4：不再在此预解析 worker/explorer profile，
 	//             各 kind 的 profile 解析延后到 buildAgentRuntime）
@@ -715,15 +760,12 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	graphApprovalGW := wireGraphApprovalBridge(interactionService, graphRuntime)
 	wireGraphToolBridge(cfg.ProjectRoot, graphRuntime)
 
-	// Step 7.4.2: V6 Graph acceptance 服务端核验桥（G1b，graph_acceptance.go）——
-	// acceptance 节点 completed 终态结算时核验验收 agent 自报的
-	// Results["evidence"]（command 对 Effect Journal shell 账逐字比对 +
-	// exit code、file_hash 边界内重算 sha256、task_status 词表）；disputed/
-	// unverifiable 不采信 verdict（节点 failed + graph change 唤醒任务交
-	// Scheduler 裁决）。effectJournal 为 nil 时核验器按 unverifiable 保守
-	// 处理（不误判 valid）。与 approval/tool 桥同批注入：启动后第一批验收
-	// 任务终态必须已装配。
-	wireGraphAcceptanceBridge(cfg.ProjectRoot, effectJournal, taskStore, graphRuntime)
+	// Step 7.4.2: V6 Graph acceptance 桥（graph_acceptance.go）——acceptance
+	// 节点 completed 终态的谱系核验是引擎内生行为（引用越谱系即 disputed，
+	// 数据全部来自图内 durable 事实）；此处注入 disputed 时的 graph change
+	// 唤醒器（__scheduler__ 唤醒任务交 Scheduler 裁决）。与 approval/tool
+	// 桥同批注入：启动后第一批验收任务终态必须已装配。
+	wireGraphAcceptanceBridge(taskStore, graphRuntime)
 
 	// Step 4.5: 创建 TUI 双通道（日志与 Agent 输出分离，避免竞争）
 	statusCh := make(chan string, 1024)      // 日志/进度消息
@@ -783,7 +825,8 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// Step 8: 创建执行代理（v4 §11.6.1 唯一路径——按 kind × replicas 实例化统一 Runner）
 	// 共享 RunnerDeps 一次构造、所有 kind/replica 共用
 	// searchProvider 已在 Step 6.8 构造，复用同一实例（避免重复 fallback 日志）。
-	shellFilter, fErr := shell.BuildFilter(cfg.ProjectRoot, cfg.ShellBlacklist, cfg.ShellGreylist)
+	shellFilter, fErr := shell.BuildFilter(cfg.ProjectRoot, cfg.ShellBlacklist, cfg.ShellGreylist,
+		cfg.AllowProjectShellRuleRemovals)
 	if fErr != nil {
 		shellFilter = shell.NewCommandFilter(shell.DefaultBlacklist, shell.DefaultGreylist)
 		fmt.Printf("[启动] WARNING: shell 过滤器规则加载失败，使用默认规则: %v\n", fErr)
@@ -871,7 +914,8 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		}
 	}
 
-	// Step 8.2: 构造按 controller 任务归属的 AgentTemplate TeamManager。它与静态
+	// Step 8.2: 构造 AgentTemplate TeamManager。legacy Team 按 controller task
+	// 归属，Graph-first Team 按 durable GraphID 归属；两者与静态
 	// cfg.Agents 共用 RunnerDeps，但只在 System.Start 后恢复/启动动态 Team。
 	teamLLMFactory := team.LLMFactory(func(model string) llm.Client {
 		return buildKindLLMClient(cfg.LLM, model)
@@ -880,6 +924,15 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		deps, teamLLMFactory, templateCatalog, teamStore,
 		agentRegistry, cfg.AgentTemplates.MaxRuntimeAgents,
 	)
+	if err := teamMgr.SetGraphStateResolver(func(graphID string) (string, bool, bool) {
+		doc, ok := graphStore.Get(graphID)
+		if !ok || doc == nil {
+			return "", false, false
+		}
+		return string(doc.Status), doc.Status.IsTerminal(), true
+	}); err != nil {
+		return nil, fmt.Errorf("注入 AgentTemplate Graph 生命周期解析器失败: %w", err)
+	}
 	if err := reactorReg.Register(teamMgr); err != nil {
 		return nil, fmt.Errorf("注册 AgentTemplate TeamManager 失败: %w", err)
 	}
@@ -897,6 +950,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		effectJournal, // H2b：scheduler 工具面与 workspace 合并的副作用账本
 	)
 	if sched.Agent != nil {
+		capReg.schedulerAgentID = sched.Agent.ID
 		sched.Agent.Activity = activity
 		sched.Agent.StreamOutput = streamOutput
 		activity.RegisterAgent(sched.Agent.ID, "scheduler")
@@ -930,13 +984,16 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// 能力注册表动态来源接线：
 	//   - spawn ad-hoc agent：KindOf 解析 base kind，白名单继承静态 kind
 	//     （spawn/types.go：AllowedTools 不可 override、始终来自 base kind）；
-	//   - 动态 Team：RouteCapabilities 给出该 eventType 全部 ready listener
-	//     的能力交集，与 team runner 白名单同出 tmpl.Tools（team 事件类型按
-	//     Team 唯一，交集天然只覆盖该 Team 的 listener）。
+	//   - 动态 Team：RouteCapabilitiesForPlan 给出 owner scope 内该
+	//     eventType 全部 ready listener 的能力交集，与 team runner 白名单
+	//     同出 tmpl.Tools；CanAgentClaimRoute 再核对具体 listener 身份，避免
+	//     EventType 碰撞时外域 listener 偷领。
 	// 两级来源就绪后把 checker 注入 store（A 方注入点）：QueryAvailable 过滤
 	// 与 ClaimTask 落锁前检查的双保险自此对显式声明 capability 的任务生效。
 	capReg.kindOf = spawnMgr.KindOf
-	capReg.routeCaps = agentRegistry.RouteCapabilities
+	capReg.routeCaps = agentRegistry.RouteCapabilitiesForPlan
+	capReg.routeAllows = agentRegistry.CanRouteForPlan
+	capReg.routeAgentAllows = agentRegistry.CanAgentClaimRoute
 	taskStore.SetCapabilityChecker(store.CapabilityChecker(capReg.checker()))
 
 	// Step 8.6: 用户 YAML reactor（v5 Phase 5 S1-S6）
@@ -1011,6 +1068,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		Scheduler:           sched,
 		GraphStore:          graphStore,
 		GraphRuntime:        graphRuntime,
+		graphApprovalGW:     graphApprovalGW,
 		Interactions:        interactionService,
 		Activity:            activity,
 		Runners:             runners,
@@ -1025,32 +1083,27 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		releaseInstanceLock: releaseLock,
 		outputDone:          outputDone,
 	}
-	var staleResumeBlocks []staleResumeBlock
+	var resumeBlocks []resumeBlock
 	if recoveredSnap != nil {
-		// Effect Journal 是副作用恢复的权威源。任一保持 unknown
-		// 的裁决都先把同 TaskID 非终态快照 quarantine 为 blocked，
-		// 再应用通用 stale resume guard。显式 --resume 也不能绕过
-		// unknown Effect，否则 processing 任务会静默重放 Shell/消息。
-		var effectBlocks []staleResumeBlock
+		// 仅 --resume 会走到这里（启动永远新建 Session，自动恢复已移除）。
+		// Effect Journal 是副作用恢复的权威源：任一保持 unknown 的裁决先把
+		// 同 TaskID 非终态快照 quarantine 为 blocked（原因更具体），再应用
+		// 通用 no-auto-run 守卫——进入会话不再自动续跑，剩余非终态任务全部
+		// 阻断为 blocked，续跑由用户提交新提示词驱动。
+		var effectBlocks []resumeBlock
 		recoveredSnap, effectBlocks = protectUnknownEffectResume(recoveredSnap, effectRecoveryDecisions, time.Now())
-		staleResumeBlocks = append(staleResumeBlocks, effectBlocks...)
+		resumeBlocks = append(resumeBlocks, effectBlocks...)
 		if len(effectBlocks) > 0 {
 			log.Printf("[resume] Effect Journal unknown 裁决已隔离 %d 个非终态任务，未自动重跑", len(effectBlocks))
 		}
-		var staleBlocks []staleResumeBlock
-		recoveredSnap, staleBlocks = prepareRecoveredSnapshot(
-			sys,
-			recoveredSnap,
-			opts.ResumeSessionID != "",
-			time.Duration(cfg.SessionResumeMaxIdleSec)*time.Second,
-			time.Now(),
-		)
-		staleResumeBlocks = append(staleResumeBlocks, staleBlocks...)
-		if len(staleBlocks) > 0 {
-			log.Printf("[resume] 陈旧自动恢复保护已阻断 %d 个非终态任务；如需确认恢复，请显式使用 --resume <session-id>", len(staleBlocks))
+		var guardBlocks []resumeBlock
+		recoveredSnap, guardBlocks = guardRecoveredSnapshotNoAutoResume(recoveredSnap, time.Now())
+		resumeBlocks = append(resumeBlocks, guardBlocks...)
+		if len(guardBlocks) > 0 {
+			log.Printf("[resume] 已阻断 %d 个非终态任务（进入会话不再自动续跑）；请提交新提示词继续", len(guardBlocks))
 		}
 	}
-	if err := restoreRuntimeBeforeReactorActivation(sys, recoveredSnap, staleResumeBlocks, reactorReg); err != nil {
+	if err := restoreRuntimeBeforeReactorActivation(sys, recoveredSnap, resumeBlocks, reactorReg); err != nil {
 		return nil, fmt.Errorf("恢复 Plan/Task 运行时状态失败: %w", err)
 	}
 	// V6 Graph：快照导入完成后恢复非终态图的执行。时序是硬约束——board 的
@@ -1058,8 +1111,14 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// 提前 Resume 会把崩溃前已发布的任务误判缺失而重复发布（详见函数注释）。
 	resumeNonTerminalGraphs(sys)
 	// C5c：重启后为 waiting 的 approval 节点补登记 Interaction（内存服务不跨
-	// 重启；确定性 requestID + Get 去重保证幂等）。
-	rearmPendingGraphApprovals(sys.GraphStore, graphApprovalGW)
+	// 重启；确定性 requestID + Get 去重保证幂等）。2026-08 起会话模式下历史
+	// 图已全量停驻、不再有任何推进入口，其审批不复活——only 传空集；
+	// 无 Session 模式传 nil 全量补登记（行为同今）。
+	var startupRearmOnly map[string]bool
+	if currentSessionID() != "" {
+		startupRearmOnly = make(map[string]bool)
+	}
+	rearmPendingGraphApprovals(sys.GraphStore, graphApprovalGW, startupRearmOnly)
 	log.Println("[启动] Reactor 系统初始化完成（record-artifact, task-end-callback, trace-history-event, read-set-write, runtime-anomaly, graph-terminal-feed, spawn-manager）")
 	if recoveredSnap != nil {
 		log.Printf("[resume] 已恢复 session snapshot: tasks=%d mailboxes=%d scheduler_history=%d",
@@ -1128,6 +1187,17 @@ func (s *System) buildUIHub() *ui.Hub {
 				board = append(board, ui.BoardTaskFromModel(*t))
 			}
 			return board
+		},
+		PollGraphs: func() []ui.GraphView {
+			// 图可见性按 session 隔离：只投影当前 session 拥有的图；无 session
+			// 上下文时回退全量（与恢复面空串=全量语义一致）。
+			sessionID := ""
+			if s.SessionMgr != nil {
+				if cur := s.SessionMgr.Current(); cur != nil {
+					sessionID = cur.Metadata.SessionID
+				}
+			}
+			return graphViewsForUI(s.GraphStore, sessionID)
 		},
 		ExecModeGet: func() string {
 			return s.Scheduler.Modes.GetExec().String()
@@ -1219,10 +1289,19 @@ func (s *System) buildUIHub() *ui.Hub {
 			return nil
 		},
 		SessionNew:         s.NewSession,
+		SessionNewForce:    s.NewSessionForce,
 		SessionSwitch:      s.SwitchSession,
 		ResolveInteraction: s.resolveInteraction,
 		// /doctor agents（V6 §2 P1b）：只读代理审计任务创建入口。
 		RequestAgentAudit: s.RequestAgentAudit,
+		// /event 与 Web POST /api/graphs/event：外部事件注入 wait_event
+		// 节点。冻结吞掉 / 终态忽略 / 重复幂等全由 Runtime 内部闸门负责。
+		EmitGraphEvent: func(graphID, event string, data map[string]any) error {
+			if s.GraphRuntime == nil {
+				return fmt.Errorf("图运行时未装配")
+			}
+			return s.GraphRuntime.OnExternalEvent(graphID, event, data)
+		},
 		SessionList: func() ([]ui.SessionInfo, error) {
 			if s.SessionMgr == nil {
 				return nil, fmt.Errorf("session 管理器未初始化")
@@ -1378,8 +1457,8 @@ func (s *System) startDashboard(ctx context.Context) {
 	s.maybeAutoOpenBrowser(ctx)
 }
 
-// maybeAutoOpenBrowser 在 Dashboard 真正开始监听后，用系统默认浏览器打开
-// 控制台地址（ui.web.auto_open 缺省为开）。整个动作异步执行，失败仅 WARN——
+// maybeAutoOpenBrowser 在 Dashboard 真正开始监听后，按配置用系统默认浏览器打开
+// 控制台地址（ui.web.auto_open 缺省为关）。整个动作异步执行，失败仅 WARN——
 // 浏览器拉不起来不影响系统本身。token 非空时地址带 ?token=（loopback 管理
 // 台面，省去用户手输；URL 经 QueryEscape）。
 func (s *System) maybeAutoOpenBrowser(ctx context.Context) {
@@ -1861,6 +1940,19 @@ func (s *System) shutdown() error {
 	if s.LogFile != nil {
 		if err := s.LogFile.Close(); err != nil {
 			fmt.Printf("[关闭] WARNING: system.log 关闭失败: %v\n", err)
+		}
+	}
+	// 空会话丢弃：当且仅当会话从未提交过实际任务（无用户提示词）才删除其
+	// 目录；非空会话全部保留，可经 /session 历史查看或恢复。必须放在全部
+	// 指向会话目录的句柄（history/trace/dumper/system.log）关闭之后——
+	// Windows 的 RemoveAll 不容许句柄占用；memory/team store 无常驻句柄。
+	// 此时 system.log 已关，输出走 fmt 到 stderr。失败仅告警：遗留的空
+	// 目录由下次启动的 SweepEmptySessions 兜底。
+	if s.SessionMgr != nil {
+		if discarded, err := s.SessionMgr.DiscardCurrentIfEmpty(); err != nil {
+			fmt.Printf("[关闭] WARNING: 空会话丢弃失败（由下次启动清扫兜底）: %v\n", err)
+		} else if discarded {
+			fmt.Println("[关闭] 空会话（未提交实际任务）已丢弃")
 		}
 	}
 	// 释放单实例锁（E7，幂等）。放在最后——锁守护的 .agentgo 资源（日志、

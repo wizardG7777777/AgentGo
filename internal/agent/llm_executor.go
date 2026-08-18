@@ -425,6 +425,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 			return ExecuteResult{
 				Output:           resp.Content,
 				AssistantContent: resp.Content,
+				Reasoning:        resp.Reasoning,
 				ToolCalled:       false,
 				PromptTokens:     resp.Usage.PromptTokens,
 				CompletionTokens: resp.Usage.CompletionTokens,
@@ -621,6 +622,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 			Output:           output.String(),
 			ToolCalled:       true,
 			AssistantContent: resp.Content,
+			Reasoning:        resp.Reasoning,
 			ToolCalls:        resp.ToolCalls,
 			ToolResults:      toolResults,
 			PromptTokens:     resp.Usage.PromptTokens,

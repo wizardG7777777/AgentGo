@@ -192,7 +192,7 @@ func renderOutputContract(controlTools []string) string {
 	}
 	switch {
 	case has("submit_task_result"):
-		return "任务收尾须经 submit_task_result 提交结构化结果（status/summary/event/verdict）"
+		return "任务收尾须经 submit_task_result 提交结构化结果（status/summary/event/verdict；自定义路由字段放入 result JSON object）"
 	case has("report_done"):
 		return "任务收尾可经 report_done 显式汇报；自然文本回复即最终答案"
 	default:

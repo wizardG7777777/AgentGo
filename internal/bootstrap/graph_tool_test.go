@@ -148,8 +148,8 @@ func TestGraphToolNodeEndToEnd(t *testing.T) {
 		t.Fatal("图应存在")
 	}
 	toolNode := g.Nodes["t"]
-	if toolNode.Status != graph.NodeCompleted || !strings.Contains(toolNode.Execution.ResultRef, "hello graph") {
-		t.Errorf("tool 节点应 completed 且 Result 载文件内容: status=%s result_ref=%s", toolNode.Status, toolNode.Execution.ResultRef)
+	if toolNode.Status != graph.NodeCompleted || !strings.Contains(toolNode.Execution.ResultSummary, "hello graph") {
+		t.Errorf("tool 节点应 completed 且 Result 载文件内容: status=%s result_ref=%s", toolNode.Status, toolNode.Execution.ResultSummary)
 	}
 	if g.Status != graph.GraphCompleted {
 		t.Errorf("图应为 completed，实际 %s", g.Status)

@@ -221,13 +221,19 @@ func wireGraphApprovalBridge(interactions *interaction.Service, rt *graph.Runtim
 // 不补登记审批请求就会在重启后凭空消失。确定性 requestID + Get 去重保证
 // 幂等；既有请求已到终态（决议在崩溃窗口丢失）时立即补回填一次。
 // 单图/单节点失败只记 WARNING，不阻断启动。
-func rearmPendingGraphApprovals(gs *graph.Store, gw *graphApprovalGateway) {
+// only 非空时只处理集合内的图（session 解冻路径按归属过滤）；nil = 全量
+// （进程启动恢复路径，此时非当前 session 的图已停驻，其 approval 不会
+// 被推进，一并补登记无害且与启动语义一致）。
+func rearmPendingGraphApprovals(gs *graph.Store, gw *graphApprovalGateway, only map[string]bool) {
 	if gs == nil || gw == nil {
 		return
 	}
 	rearmed := 0
 	for _, sum := range gs.List() {
 		if sum.Status.IsTerminal() {
+			continue
+		}
+		if only != nil && !only[sum.GraphID] {
 			continue
 		}
 		doc, ok := gs.Get(sum.GraphID)

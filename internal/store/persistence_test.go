@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -269,6 +270,62 @@ func TestMemoryTaskStore_ArtifactLogIntegration(t *testing.T) {
 	}
 	if len(rebuilt[task.ID]) != 2 {
 		t.Errorf("日志中 task.ID artifacts = %v, want 2", rebuilt[task.ID])
+	}
+}
+
+// durable artifact 日志失败时不得先改内存：否则同一路径重试会
+// 命中去重，从此不再补写日志。关闭 log 是稳定、跨平台的失败注入点。
+func TestMemoryTaskStore_ArtifactLogFailureLeavesRetryableState(t *testing.T) {
+	dir := t.TempDir()
+	closedLog, err := OpenArtifactLog(dir)
+	if err != nil {
+		t.Fatalf("OpenArtifactLog: %v", err)
+	}
+	s := NewMemoryTaskStore(nil, 16, 1, 60)
+	s.SetArtifactLog(closedLog)
+	task := &model.Task{Description: "durable artifact retry"}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := closedLog.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	meta := model.ArtifactMeta{SHA256: "abc123", Bytes: 7}
+	err = s.AppendArtifactWithMeta(task.ID, "out/report.md", meta)
+	if !errors.Is(err, ErrArtifactLogClosed) {
+		t.Fatalf("关闭日志的写入失败必须向上返回，实际: %v", err)
+	}
+	got, getErr := s.GetTask(task.ID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if len(got.Artifacts) != 0 || len(got.ArtifactMeta) != 0 {
+		t.Fatalf("日志失败后内存必须保持未提交，才能重试: artifacts=%v meta=%v", got.Artifacts, got.ArtifactMeta)
+	}
+
+	retryLog, err := OpenArtifactLog(dir)
+	if err != nil {
+		t.Fatalf("重开 ArtifactLog: %v", err)
+	}
+	t.Cleanup(func() { _ = retryLog.Close() })
+	s.SetArtifactLog(retryLog)
+	if err := s.AppendArtifactWithMeta(task.ID, "out/report.md", meta); err != nil {
+		t.Fatalf("恢复 ledger 后同一写入应可安全重试: %v", err)
+	}
+	got, err = s.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Artifacts) != 1 || got.Artifacts[0] != "out/report.md" || got.ArtifactMeta["out/report.md"] != meta {
+		t.Fatalf("重试后内存与 durable ledger 应同步提交: %+v", got)
+	}
+	replayed, err := retryLog.Replay()
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if len(replayed[task.ID]) != 1 || replayed[task.ID][0] != "out/report.md" {
+		t.Fatalf("重试后 durable log 缺少 artifact: %v", replayed[task.ID])
 	}
 }
 

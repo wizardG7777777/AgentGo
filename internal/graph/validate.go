@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -54,6 +53,11 @@ func validateGraphID(graphID string) error {
 	return nil
 }
 
+// ValidateGraphID exposes the canonical Graph identity validation to control
+// planes that must reserve Graph-scoped resources before the full document is
+// submitted (for example provision_agent_team).
+func ValidateGraphID(graphID string) error { return validateGraphID(graphID) }
+
 // ValidationError 是带校验阶段与 JSON 路径的结构化校验错误。
 type ValidationError struct {
 	Stage string // 校验阶段名，如 "重复键"
@@ -82,10 +86,13 @@ func newErr(stage, path, format string, args ...any) *ValidationError {
 //     revision/state_version 非负、节点数/单节点 next 数/ID 长度上限；
 //  5. root：唯一、非空、指向存在的节点；
 //  6. 转移：next.to 引用存在、when 仅两种形态、operator 枚举、activation 仅 "new"；
+//     authoring 期另校验节点类型可产生的事件（如 join 不透传上游 event）；
 //  7. 可达性：所有节点必须能从 root 到达（允许回边，不做无环校验）；
 //  8. 节点语义：kind 枚举、end 无 next、非 end 必有 next、task.title 非空；
-//  9. 能力形状：isolation 仅允许 "workspace"、tools 无空项、budget 数值非负有限、
-//     executor 形状（type 仅 "agent"、agent_id 非空）；
+//  9. 能力形状：isolation 仅允许 "workspace"、tools 无空项、
+//     executor 形状（type 仅 "agent"、agent_id 非空）。遗留 capability.budget
+//     与 task.output_schema 由阶段 2 的 DisallowUnknownFields 按未知字段拒绝——
+//     两个占位都没有 Runtime 消费者，删除以避免虚假契约；
 //  10. 初始字段所有权：图必须 pending、state_version=0；节点必须
 //     inactive 且 executor/execution 为 null。
 func ParseAndValidate(data []byte) (*GraphDocument, error) {
@@ -121,6 +128,9 @@ func ParseAndValidate(data []byte) (*GraphDocument, error) {
 
 	// 阶段 4–9：与 JSON 形态无关的语义校验链（抽出供 GraphStore 复用）
 	if err := validateSemantics(&doc); err != nil {
+		return nil, err
+	}
+	if err := validateAuthoringSemantics(&doc); err != nil {
 		return nil, err
 	}
 
@@ -243,7 +253,7 @@ func validateRuntimeState(doc *GraphDocument) error {
 		settlement := node.Execution.Settlement
 		path := "nodes." + id + ".execution.settlement"
 		switch settlement.Status {
-		case NodeCompleted, NodeFailed, NodeBlocked:
+		case NodeCompleted, NodeFailed, NodeBlocked, NodeCancelled:
 		default:
 			return newErr("运行状态", path+".status", "节点 %q 的结算状态 %q 非法", id, settlement.Status)
 		}
@@ -251,13 +261,17 @@ func validateRuntimeState(doc *GraphDocument) error {
 			return newErr("运行状态", path+".status", "节点 %q 当前状态 %q 与结算状态 %q 不一致", id, node.Status, settlement.Status)
 		}
 		switch settlement.Continuation {
-		case SettlementContinueTransitions, SettlementContinueGraphComplete, SettlementContinueGraphFail:
+		case SettlementContinueTransitions, SettlementContinueGraphComplete, SettlementContinueGraphFail, SettlementContinueNone:
 		default:
 			return newErr("运行状态", path+".continuation", "节点 %q 的结算续跑动作 %q 非法", id, settlement.Continuation)
 		}
-		var result map[string]any
-		if len(settlement.Result) == 0 || json.Unmarshal(settlement.Result, &result) != nil || result == nil {
-			return newErr("运行状态", path+".result", "节点 %q 的结算 Result 必须是合法 JSON 对象", id)
+		if settlement.ResultRef == "" {
+			var result map[string]any
+			if len(settlement.Result) == 0 || json.Unmarshal(settlement.Result, &result) != nil || result == nil {
+				return newErr("运行状态", path+".result", "节点 %q 的结算必须携带 ResultRef，或为旧记录携带合法 JSON 对象 Result", id)
+			}
+		} else if strings.TrimSpace(settlement.ResultRef) != settlement.ResultRef {
+			return newErr("运行状态", path+".result_ref", "节点 %q 的结算 ResultRef 不得携带首尾空白", id)
 		}
 		if settlement.Continuation == SettlementContinueGraphFail && strings.TrimSpace(settlement.Reason) == "" {
 			return newErr("运行状态", path+".reason", "节点 %q 的 graph_fail 结算必须携带原因", id)
@@ -318,12 +332,160 @@ func validateTransitions(doc *GraphDocument) error {
 			if tr.Activation != "" && tr.Activation != ActivationNew {
 				return newErr("转移", path+".activation", "%s 的 activation 仅允许 %q，实际为 %q", path, ActivationNew, tr.Activation)
 			}
+			if tr.TargetInput != "" {
+				if len(tr.TargetInput) > MaxIDLength || !idCharset.MatchString(tr.TargetInput) {
+					return newErr("转移", path+".target_input", "%s 的 target_input %q 非法（仅允许字母、数字与 . _ : -，长度 ≤ %d）", path, tr.TargetInput, MaxIDLength)
+				}
+				target := doc.Nodes[tr.To]
+				if target.Kind != KindJoin && target.Kind != KindAcceptance {
+					return newErr("转移", path+".target_input", "%s 仅在目标为 join / acceptance 时可声明 target_input，目标 %q 类型为 %s", path, tr.To, target.Kind)
+				}
+			}
 			if tr.When != nil {
 				if err := validateCondition(path+".when", tr.When); err != nil {
 					return err
 				}
 			}
 		}
+	}
+	return nil
+}
+
+// validateAuthoringSemantics 校验只适用于新提交/patch 的定义约束。它与
+// validateSemantics 分开，避免升级后新增的 authoring 规则让已经 durable 的
+// 历史 Graph 无法 Recover；旧图仍按其冻结契约恢复，新定义则 fail-closed。
+func validateAuthoringSemantics(doc *GraphDocument) error {
+	return validateAuthoringNodes(doc.Nodes, "nodes")
+}
+
+func validateAuthoringNodes(nodes map[string]Node, prefix string) error {
+	type inboundEdge struct {
+		source string
+		index  int
+		input  string
+	}
+	inbound := make(map[string][]inboundEdge)
+	for _, sourceID := range sortedNodeKeys(nodes) {
+		for i, tr := range nodes[sourceID].Next {
+			inbound[tr.To] = append(inbound[tr.To], inboundEdge{source: sourceID, index: i, input: tr.TargetInput})
+		}
+	}
+	for _, id := range sortedNodeKeys(nodes) {
+		node := nodes[id]
+		path := prefix + "." + id
+		edges := inbound[id]
+		if node.Kind != KindJoin && node.Kind != KindAcceptance && len(edges) > 1 {
+			edge := edges[1]
+			return newErr("转移", fmt.Sprintf("%s.%s.next[%d]", prefix, edge.source, edge.index),
+				"%s 是非 barrier 节点，但存在 %d 条静态入边；普通节点的 Input 在首次激活时冻结，当前仅允许单一生产边。条件分支请保持各自后续/各自 end，等待 generation/correlation token 后再开放 OR mux", path, len(edges))
+		}
+		if node.Kind == KindJoin || node.Kind == KindAcceptance {
+			required := []string(nil)
+			if node.Task != nil {
+				required = node.Task.RequiredInputs
+			}
+			if len(required) == 0 && len(edges) > 1 {
+				for _, edge := range edges {
+					if edge.input == "" {
+						return newErr("转移", fmt.Sprintf("%s.%s.next[%d].target_input", prefix, edge.source, edge.index),
+							"%s 有多条直接入边；每条入边都必须用唯一 target_input 声明端口（不同端口构成 AND barrier），也可在目标 task.required_inputs 显式列出必需端口", path)
+					}
+				}
+			}
+			if len(required) > 0 {
+				allowed := make(map[string]struct{}, len(required))
+				for _, input := range required {
+					allowed[input] = struct{}{}
+				}
+				supplied := make(map[string]inboundEdge, len(edges))
+				for _, edge := range edges {
+					if edge.input == "" {
+						return newErr("转移", fmt.Sprintf("%s.%s.next[%d].target_input", prefix, edge.source, edge.index),
+							"指向 %s 的入边必须声明 target_input；目标要求端口 %v", path, required)
+					}
+					if _, ok := allowed[edge.input]; !ok {
+						return newErr("转移", fmt.Sprintf("%s.%s.next[%d].target_input", prefix, edge.source, edge.index),
+							"指向 %s 的入边端口 %q 未列入目标 task.required_inputs %v；条件分支须保持各自后续/各自 end，OR mux 待 generation/correlation token 后再开放", path, edge.input, required)
+					}
+					if previous, exists := supplied[edge.input]; exists {
+						return newErr("转移", fmt.Sprintf("%s.%s.next[%d].target_input", prefix, edge.source, edge.index),
+							"指向 %s 的端口 %q 已由 %s.%s.next[%d] 声明；输入端口是单赋值，条件分支须保持各自后续/各自 end，OR mux 待 generation/correlation token 后再开放", path, edge.input, prefix, previous.source, previous.index)
+					}
+					supplied[edge.input] = edge
+				}
+				for _, input := range required {
+					if _, ok := supplied[input]; !ok {
+						return newErr("节点", path+".task.required_inputs", "%s 要求输入端口 %q，但没有任何入边写入该端口", path, input)
+					}
+				}
+			}
+			if len(required) == 0 {
+				seenPort := make(map[string]inboundEdge, len(edges))
+				for _, edge := range edges {
+					if edge.input == "" {
+						continue
+					}
+					if previous, exists := seenPort[edge.input]; exists {
+						return newErr("转移", fmt.Sprintf("%s.%s.next[%d].target_input", prefix, edge.source, edge.index),
+							"指向 %s 的端口 %q 已由 %s.%s.next[%d] 声明；输入端口是单赋值，条件分支须保持各自后续/各自 end，OR mux 待 generation/correlation token 后再开放", path, edge.input, prefix, previous.source, previous.index)
+					}
+					seenPort[edge.input] = edge
+				}
+			}
+		}
+		if node.Kind == KindJoin {
+			for i, tr := range node.Next {
+				if tr.When == nil || tr.When.Event == "" || tr.When.Event == EventCompleted || tr.When.Event == EventAlways {
+					continue
+				}
+				edgePath := fmt.Sprintf("%s.next[%d].when.event", path, i)
+				return newErr("转移", edgePath,
+					"%s=%q 永远无法匹配：join 节点不透传上游 event，成功汇合只产生终态事件 %q；请改用 event=%q/always，或用 path 条件检查按目标输入端口归并的结果",
+					edgePath, tr.When.Event, EventCompleted, EventCompleted)
+			}
+		}
+		if node.Kind == KindAcceptance {
+			for i, tr := range node.Next {
+				if err := validateAcceptanceOutgoingTransition(fmt.Sprintf("%s.next[%d]", path, i), tr); err != nil {
+					return err
+				}
+			}
+		}
+		if node.Subgraph != nil {
+			if err := validateAuthoringNodes(node.Subgraph.Nodes, path+".subgraph.nodes"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// validateAcceptanceOutgoingTransition 禁止 acceptance 用无条件、always 或
+// completed 边绕过 verdict。completed 的业务结论只允许精确比较
+// $.verdict；Runtime 自身产生的 failed/blocked 终态可以用同名事件边
+// 收敛。二者分属业务结论和基础设施失败，不共用事件词。
+func validateAcceptanceOutgoingTransition(path string, tr Transition) error {
+	if tr.When == nil {
+		return newErr("转移", path+".when", "%s 的 acceptance 出边必须显式按 $.verdict 路由，或处理 Runtime failed/blocked 事件，不能无条件放行", path)
+	}
+	when := tr.When
+	if when.Event != "" {
+		switch when.Event {
+		case EventFailed, EventBlocked:
+			return nil
+		default:
+			return newErr("转移", path+".when.event", "%s 的 acceptance 事件边只允许 Runtime 产生的 failed/blocked；业务结论必须走 $.verdict eq", path)
+		}
+	}
+	if when.Path != "$.verdict" || when.Operator != OpEq {
+		return newErr("转移", path+".when", "%s 的 acceptance 路径边必须用 $.verdict eq <pass|fixable|failed>，不得使用 in 或按其它字段放行", path)
+	}
+	var verdict string
+	if err := json.Unmarshal(when.Value, &verdict); err != nil {
+		return newErr("转移", path+".when.value", "%s 的 acceptance verdict eq 值必须是字符串", path)
+	}
+	if !isValidAcceptanceVerdict(verdict) {
+		return newErr("转移", path+".when.value", "%s 引用了非法 acceptance verdict %q（仅 pass/fixable/failed）", path, verdict)
 	}
 	return nil
 }
@@ -412,8 +574,52 @@ func validateNodeSemantics(doc *GraphDocument) error {
 		} else if len(node.Next) == 0 {
 			return newErr("节点", path+".next", "非 end 节点 %q（%s）的 next 不能为空", id, node.Kind)
 		}
-		if node.Task != nil && strings.TrimSpace(node.Task.Title) == "" {
-			return newErr("节点", path+".task.title", "节点 %q 的 task.title 不能为空", id)
+		requiresTask := node.Kind == KindController || node.Kind == KindAgent || node.Kind == KindAcceptance
+		if requiresTask && node.Task == nil {
+			return newErr("节点", path+".task", "节点 %q（%s）必须携带 task 与非空 title", id, node.Kind)
+		}
+		if node.Task != nil {
+			if strings.TrimSpace(node.Task.Title) == "" {
+				return newErr("节点", path+".task.title", "节点 %q 的 task.title 不能为空", id)
+			}
+			if node.Kind == KindAcceptance && strings.TrimSpace(node.Task.Description) == "" {
+				return newErr("节点", path+".task.description", "acceptance 节点 %q 的 task.description 必须写明可执行的验收判据", id)
+			}
+			if len(node.Task.RequiredInputs) > 0 && node.Kind != KindJoin && node.Kind != KindAcceptance {
+				return newErr("节点", path+".task.required_inputs", "required_inputs 仅允许 join / acceptance 节点声明，节点 %q 类型为 %s", id, node.Kind)
+			}
+			seen := make(map[string]struct{}, len(node.Task.RequiredInputs))
+			for i, input := range node.Task.RequiredInputs {
+				reqPath := fmt.Sprintf("%s.task.required_inputs[%d]", path, i)
+				if strings.TrimSpace(input) == "" {
+					return newErr("节点", reqPath, "%s 不能为空", reqPath)
+				}
+				if len(input) > MaxIDLength || !idCharset.MatchString(input) {
+					return newErr("节点", reqPath, "%s 的输入端口 %q 非法（仅允许字母、数字与 . _ : -，长度 ≤ %d）", reqPath, input, MaxIDLength)
+				}
+				if _, dup := seen[input]; dup {
+					return newErr("节点", reqPath, "%s 重复声明输入端口 %q", reqPath, input)
+				}
+				seen[input] = struct{}{}
+			}
+			if len(node.Task.RequiredEvidence) > 0 && node.Kind != KindAcceptance {
+				return newErr("节点", path+".task.required_evidence", "required_evidence 仅允许 acceptance 节点声明，节点 %q 类型为 %s", id, node.Kind)
+			}
+			evidenceSeen := make(map[string]struct{}, len(node.Task.RequiredEvidence))
+			for i, req := range node.Task.RequiredEvidence {
+				reqPath := fmt.Sprintf("%s.task.required_evidence[%d]", path, i)
+				if _, ok := seen[req.Input]; !ok {
+					return newErr("节点", reqPath+".input", "%s.input=%q 必须引用 required_inputs 中已声明的端口", reqPath, req.Input)
+				}
+				if strings.TrimSpace(req.Kind) == "" {
+					return newErr("节点", reqPath+".kind", "%s.kind 不能为空", reqPath)
+				}
+				key := req.Input + "\x00" + req.Kind
+				if _, dup := evidenceSeen[key]; dup {
+					return newErr("节点", reqPath, "%s 重复声明 input=%q kind=%q", reqPath, req.Input, req.Kind)
+				}
+				evidenceSeen[key] = struct{}{}
+			}
 		}
 	}
 	return nil
@@ -492,12 +698,6 @@ func validateCapabilityShape(doc *GraphDocument) error {
 			for i, tool := range cap.Tools {
 				if strings.TrimSpace(tool) == "" {
 					return newErr("能力", fmt.Sprintf("%s.capability.tools[%d]", path, i), "capability.tools 不得含空字符串")
-				}
-			}
-			for _, name := range sortedBudgetKeys(cap.Budget) {
-				v := cap.Budget[name]
-				if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
-					return newErr("能力", path+".capability.budget."+name, "capability.budget.%s 必须是非负有限数值，实际为 %v", name, v)
 				}
 			}
 		}
@@ -712,14 +912,4 @@ func sortedNodeKeys(nodes map[string]Node) []string {
 	}
 	sort.Strings(ids)
 	return ids
-}
-
-// sortedBudgetKeys 返回排序后的 budget 键，保证校验错误位置确定。
-func sortedBudgetKeys(budget map[string]float64) []string {
-	keys := make([]string, 0, len(budget))
-	for k := range budget {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
 }

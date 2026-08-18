@@ -13,7 +13,7 @@ import (
 	"agentgo/internal/trace"
 )
 
-type staleResumeTraceCapture struct {
+type resumeTraceCapture struct {
 	events []trace.Event
 }
 
@@ -77,15 +77,18 @@ func TestUnresolvedEffectTaskReasonsKeepsOnlyUnknownDecisions(t *testing.T) {
 	}
 }
 
-func (c *staleResumeTraceCapture) Dispatch(event trace.Event) {
+func (c *resumeTraceCapture) Dispatch(event trace.Event) {
 	c.events = append(c.events, event)
 }
 
-func TestProtectStaleAutomaticResume(t *testing.T) {
+// 2026-08 二期：进入会话（--resume / 解冻）不再自动续跑——恢复快照中的全部
+// 非终态任务无条件阻断为 blocked（与 saved_at 新旧无关、无显式恢复豁免），
+// 终态任务与邮箱快照原样保留（邮箱属历史上下文，只有任务不重新派发）。
+func TestGuardRecoveredSnapshotNoAutoResume(t *testing.T) {
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	original := &session.Snapshot{
-		Version: 3,
-		SavedAt: now.Add(-2 * time.Hour).Format(time.RFC3339Nano),
+		Version: 4,
+		SavedAt: now.Add(-2 * time.Minute).Format(time.RFC3339Nano),
 		Tasks: []session.TaskSnapshot{
 			{
 				ID: "pending", Status: string(model.TaskStatusPending), PendingSince: now.Add(-2 * time.Hour).Format(time.RFC3339Nano),
@@ -103,20 +106,25 @@ func TestProtectStaleAutomaticResume(t *testing.T) {
 		}},
 	}
 
-	got, protected := protectStaleAutomaticResume(original, false, time.Hour, now)
-	if len(protected) != 2 {
-		t.Fatalf("protected=%d, want 2", len(protected))
+	got, blocks := guardRecoveredSnapshotNoAutoResume(original, now)
+	if len(blocks) != 2 {
+		t.Fatalf("blocks=%d, want 2", len(blocks))
+	}
+	for _, b := range blocks {
+		if b.Cause != "no_auto_resume" {
+			t.Fatalf("block cause=%q, want no_auto_resume", b.Cause)
+		}
 	}
 	if got == original {
-		t.Fatal("陈旧保护不应原地改写 SessionManager 持有的恢复快照")
+		t.Fatal("守卫不应原地改写 SessionManager 持有的恢复快照")
 	}
 	for _, index := range []int{0, 1} {
 		task := got.Tasks[index]
 		if task.Status != string(model.TaskStatusBlocked) {
 			t.Fatalf("task %s status=%s, want blocked", task.ID, task.Status)
 		}
-		if !strings.Contains(task.Error, "stale_resume_guard") {
-			t.Fatalf("task %s error=%q, want stale_resume_guard", task.ID, task.Error)
+		if !strings.Contains(task.Error, "no_auto_resume") {
+			t.Fatalf("task %s error=%q, want no_auto_resume", task.ID, task.Error)
 		}
 		if len(task.Agents) != 0 || task.PendingSince != "" || task.CompletedAt == "" {
 			t.Fatalf("task %s terminal fields not normalized: %+v", task.ID, task)
@@ -132,92 +140,32 @@ func TestProtectStaleAutomaticResume(t *testing.T) {
 		t.Fatal("原始快照被改写")
 	}
 	if original.Tasks[0].Lease.Revoked || original.Tasks[1].Lease.Revoked {
-		t.Fatal("陈旧保护不得通过共享 Lease 指针改写原始快照")
+		t.Fatal("守卫不得通过共享 Lease 指针改写原始快照")
 	}
-	if len(got.Mailboxes) != 0 {
-		t.Fatalf("陈旧自动恢复不应重放 mailbox: %#v", got.Mailboxes)
-	}
-	if len(original.Mailboxes) != 1 {
-		t.Fatal("原始 mailbox 快照被改写")
+	if len(got.Mailboxes) != 1 {
+		t.Fatalf("邮箱属历史上下文应原样保留: %#v", got.Mailboxes)
 	}
 }
 
-func TestProtectStaleAutomaticResumeBypassesFreshExplicitAndDisabled(t *testing.T) {
-	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	fresh := &session.Snapshot{
-		SavedAt: now.Add(-30 * time.Minute).Format(time.RFC3339Nano),
-		Tasks:   []session.TaskSnapshot{{ID: "pending", Status: string(model.TaskStatusPending)}},
+func TestGuardRecoveredSnapshotNoAutoResumeEdgeCases(t *testing.T) {
+	if got, blocks := guardRecoveredSnapshotNoAutoResume(nil, time.Now()); got != nil || len(blocks) != 0 {
+		t.Fatalf("nil 快照应原样返回: got=%v blocks=%d", got, len(blocks))
 	}
-	if got, blocks := protectStaleAutomaticResume(fresh, false, time.Hour, now); got != fresh || len(blocks) != 0 {
-		t.Fatalf("fresh snapshot changed: got=%p want=%p protected=%d", got, fresh, len(blocks))
+	terminalOnly := &session.Snapshot{Tasks: []session.TaskSnapshot{
+		{ID: "done", Status: string(model.TaskStatusCompleted)},
+		{ID: "stopped", Status: string(model.TaskStatusCancelled)},
+	}}
+	got, blocks := guardRecoveredSnapshotNoAutoResume(terminalOnly, time.Now())
+	if len(blocks) != 0 {
+		t.Fatalf("全终态快照不应产生阻断: %#v", blocks)
 	}
-
-	old := &session.Snapshot{
-		SavedAt: now.Add(-2 * time.Hour).Format(time.RFC3339Nano),
-		Tasks:   []session.TaskSnapshot{{ID: "pending", Status: string(model.TaskStatusPending)}},
-	}
-	if got, blocks := protectStaleAutomaticResume(old, true, time.Hour, now); got != old || len(blocks) != 0 {
-		t.Fatalf("explicit resume must bypass guard: got=%p want=%p protected=%d", got, old, len(blocks))
-	}
-	if got, blocks := protectStaleAutomaticResume(old, false, 0, now); got != old || len(blocks) != 0 {
-		t.Fatalf("disabled guard changed snapshot: got=%p want=%p protected=%d", got, old, len(blocks))
+	if got.Tasks[0].Status != string(model.TaskStatusCompleted) || got.Tasks[1].Status != string(model.TaskStatusCancelled) {
+		t.Fatalf("终态任务不得受影响: %+v", got.Tasks)
 	}
 }
 
-func TestProtectStaleAutomaticResumeFailsClosedOnInvalidSavedAt(t *testing.T) {
-	snap := &session.Snapshot{
-		SavedAt: "not-a-time",
-		Tasks:   []session.TaskSnapshot{{ID: "pending", Status: string(model.TaskStatusPending)}},
-	}
-	got, protected := protectStaleAutomaticResume(snap, false, time.Hour, time.Now())
-	if len(protected) != 1 || got.Tasks[0].Status != string(model.TaskStatusBlocked) {
-		t.Fatalf("invalid saved_at must fail closed: protected=%d task=%+v", len(protected), got.Tasks[0])
-	}
-	if !strings.Contains(got.Tasks[0].Error, "saved_at") {
-		t.Fatalf("reason must explain invalid saved_at: %q", got.Tasks[0].Error)
-	}
-}
-
-func TestProtectStaleAutomaticResumeFailsClosedOnClearlyFutureSavedAt(t *testing.T) {
-	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	snap := &session.Snapshot{
-		SavedAt: now.Add(2 * time.Minute).Format(time.RFC3339Nano),
-		Tasks:   []session.TaskSnapshot{{ID: "pending", Status: string(model.TaskStatusPending)}},
-	}
-	got, protected := protectStaleAutomaticResume(snap, false, time.Hour, now)
-	if len(protected) != 1 || got.Tasks[0].Status != string(model.TaskStatusBlocked) {
-		t.Fatalf("future saved_at must fail closed: protected=%d task=%+v", len(protected), got.Tasks[0])
-	}
-	if !strings.Contains(got.Tasks[0].Error, "超前") {
-		t.Fatalf("reason must explain future saved_at: %q", got.Tasks[0].Error)
-	}
-}
-
-// C6b 起 prepareRecoveredSnapshot 只做陈旧自动恢复守卫：不再有 Plan 终态事实
-// overlay（控制面已随其整包删除），陈旧快照中的非终态任务一律阻断。
-func TestPrepareRecoveredSnapshotAppliesStaleGuardWithoutOverlay(t *testing.T) {
-	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	snap := &session.Snapshot{
-		SavedAt: now.Add(-2 * time.Hour).Format(time.RFC3339Nano),
-		Tasks: []session.TaskSnapshot{{
-			ID: "work-pending", Status: string(model.TaskStatusPending),
-			PendingSince: now.Add(-2 * time.Hour).Format(time.RFC3339Nano),
-		}},
-	}
-	prepared, blocks := prepareRecoveredSnapshot(&System{}, snap, false, time.Hour, now)
-	if len(blocks) != 1 {
-		t.Fatalf("陈旧快照的非终态任务应被阻断: %#v", blocks)
-	}
-	if got := prepared.Tasks[0]; got.Status != string(model.TaskStatusBlocked) || !strings.Contains(got.Error, "stale_resume_guard") {
-		t.Fatalf("stale guard 未生效: %+v", got)
-	}
-	if snap.Tasks[0].Status != string(model.TaskStatusPending) {
-		t.Fatal("原始快照被改写")
-	}
-}
-
-func TestEmitStaleResumeBlocksWritesBlockedTerminalTruth(t *testing.T) {
-	capture := &staleResumeTraceCapture{}
+func TestEmitResumeBlocksWritesBlockedTerminalTruth(t *testing.T) {
+	capture := &resumeTraceCapture{}
 	traceDir := t.TempDir()
 	writer, err := trace.NewWriter(traceDir, 0)
 	if err != nil {
@@ -233,19 +181,19 @@ func TestEmitStaleResumeBlocksWritesBlockedTerminalTruth(t *testing.T) {
 		_ = writer.Close()
 	})
 
-	emitStaleResumeBlocks([]staleResumeBlock{{
+	emitResumeBlocks([]resumeBlock{{
 		TaskID:     "task-stale",
 		PrevStatus: string(model.TaskStatusProcessing),
-		Reason:     "stale_resume_guard: test",
+		Reason:     "no_auto_resume: test",
 	}})
 
 	if len(capture.events) != 0 {
-		t.Fatalf("stale recovery audit reached Reactor dispatcher: events=%d", len(capture.events))
+		t.Fatalf("resume audit reached Reactor dispatcher: events=%d", len(capture.events))
 	}
 	content := readJSONLContents(t, traceDir)
-	for _, want := range []string{"task_blocked", "task-stale", "stale_resume_guard", "processing", "blocked"} {
+	for _, want := range []string{"task_blocked", "task-stale", "no_auto_resume", "processing", "blocked"} {
 		if !strings.Contains(content, want) {
-			t.Fatalf("physical stale resume trace missing %q: %s", want, content)
+			t.Fatalf("physical resume trace missing %q: %s", want, content)
 		}
 	}
 }
@@ -255,8 +203,8 @@ func TestEmitStaleResumeBlocksWritesBlockedTerminalTruth(t *testing.T) {
 func TestRestoreRuntimeBeforeReactorActivationSuppressesReconcileDispatch(t *testing.T) {
 	taskStore := store.NewMemoryTaskStore(make(chan model.Event, 4), 32, 1, 60)
 
-	preexisting := &staleResumeTraceCapture{}
-	runtimeDispatcher := &staleResumeTraceCapture{}
+	preexisting := &resumeTraceCapture{}
+	runtimeDispatcher := &resumeTraceCapture{}
 	previousWriter := trace.Default()
 	previousDispatcher := trace.DefaultDispatcher()
 	trace.SetDefault(nil)
@@ -291,8 +239,8 @@ func TestRestoreRuntimeBeforeReactorActivationSuppressesReconcileDispatch(t *tes
 }
 
 func TestRestoreRuntimeBeforeReactorActivationFailureLeavesDispatcherDetached(t *testing.T) {
-	preexisting := &staleResumeTraceCapture{}
-	runtimeDispatcher := &staleResumeTraceCapture{}
+	preexisting := &resumeTraceCapture{}
+	runtimeDispatcher := &resumeTraceCapture{}
 	previousWriter := trace.Default()
 	previousDispatcher := trace.DefaultDispatcher()
 	trace.SetDefault(nil)

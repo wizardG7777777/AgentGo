@@ -75,8 +75,14 @@ func (f *fakeOverlayer) WritePath(absMainPath string) (string, error) {
 
 func newOverlayGroups(t *testing.T) (LocalWriteGroup, *recordingRoster, *fakeOverlayer, string, string) {
 	t.Helper()
-	mainRoot := t.TempDir()
-	overlayDir := t.TempDir()
+	mainRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlayDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	rr := &recordingRoster{}
 	ov := &fakeOverlayer{mainRoot: mainRoot, overlayDir: overlayDir}
 	g := LocalWriteGroup{
@@ -306,8 +312,9 @@ func TestRunShell_DefaultWorkdirFollowsActiveView(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run_shell(无视图): %v", err)
 	}
-	if !containsFold(out, mainRoot) {
-		t.Fatalf("无视图时默认目录应为主根 %s，实际输出:\n%s", mainRoot, out)
+	mainCanonical := swapper.MainRoot()
+	if !containsFold(out, mainCanonical) {
+		t.Fatalf("无视图时默认目录应为主根 %s，实际输出:\n%s", mainCanonical, out)
 	}
 
 	// 有视图：默认目录为 workspace 视图根（真实 Manager 物化，
@@ -328,13 +335,11 @@ func TestRunShell_DefaultWorkdirFollowsActiveView(t *testing.T) {
 		t.Fatalf("有视图时默认目录应为视图根 %s，实际输出:\n%s", view.Root(), out)
 	}
 
-	// 显式传 working_dir 时维持现状（按主根坐标，不随视图切换）。
-	out, err = dispatchRunShell(context.Background(), group,
+	// 隔离视图生效时，显式 working_dir 也只能位于该任务 workspace 内，
+	// 不能切回主根绕过隔离。
+	_, err = dispatchRunShell(context.Background(), group,
 		map[string]any{"command": cwdCmd, "working_dir": mainRoot})
-	if err != nil {
-		t.Fatalf("run_shell(显式 working_dir): %v", err)
-	}
-	if !containsFold(out, mainRoot) {
-		t.Fatalf("显式 working_dir 应生效为 %s，实际输出:\n%s", mainRoot, out)
+	if err == nil || !strings.Contains(err.Error(), "working_dir 被拒绝") {
+		t.Fatalf("隔离任务显式切回主根必须拒绝，实际 err=%v", err)
 	}
 }

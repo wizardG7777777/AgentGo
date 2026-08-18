@@ -12,7 +12,6 @@ import (
 	"strings"
 	"testing"
 
-	"agentgo/internal/effect"
 	"agentgo/internal/graph"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
@@ -21,11 +20,11 @@ import (
 
 // bridgeAcceptanceGraphJSON 验收回边图：implement(agent) → verify(acceptance)
 //
-//	--event pass--> finish(end)
-//	--event fixable, activation:new--> implement（回边）
+//	--{$.verdict eq pass}--> finish(end)
+//	--{$.verdict eq fixable, activation:new}--> implement（回边）
 //
-// verify 的结果经 Results["event"] 键驱动事件形态转移条件（验收 agent 按
-// prompt 契约经 submit_task_result 写入，测试以 runGraphNodeWithEvent 模拟）。
+// verify 的结果经 Results["verdict"] 驱动路径条件（验收 agent 按 prompt
+// 契约经 submit_task_result 写入，测试以 runAcceptanceNode 模拟）。
 const bridgeAcceptanceGraphJSON = `{
   "schema": "agentgo.graph/v1",
   "graph_id": "g-bridge-acc",
@@ -36,8 +35,8 @@ const bridgeAcceptanceGraphJSON = `{
       "next":[{"to":"verify"}]},
     "verify": {"kind":"acceptance","task":{"title":"验收修改","description":"判据：编译通过且行为正确"},"status":"inactive","executor":null,"execution":null,
       "next":[
-        {"to":"finish","when":{"event":"pass"}},
-        {"to":"implement","activation":"new","when":{"event":"fixable"}}
+        {"to":"finish","when":{"path":"$.verdict","operator":"eq","value":"pass"}},
+        {"to":"implement","activation":"new","when":{"path":"$.verdict","operator":"eq","value":"fixable"}}
       ]},
     "finish": {"kind":"end","task":{"title":"形成结果"},"status":"inactive","executor":null,"execution":null,"next":[]}
   }
@@ -67,13 +66,19 @@ func TestGraphBridgeAcceptanceEndToEnd(t *testing.T) {
 	if verify1.EventType != "acceptance.verify" {
 		t.Errorf("verify（acceptance）任务 EventType = %q，应路由 acceptance.verify", verify1.EventType)
 	}
-	if verify1.Description != "验收修改\n\n判据：编译通过且行为正确" {
-		t.Errorf("verify 任务描述应携带验收判据，实际 %q", verify1.Description)
+	wantDescPrefix := "验收修改\n\n判据：编译通过且行为正确"
+	if !strings.HasPrefix(verify1.Description, wantDescPrefix) {
+		t.Errorf("verify 任务描述应以验收判据开头，实际 %q", verify1.Description)
+	}
+	// 数据流注入：验收任务应携带 implement@1 的上游输入绑定（来源标识 + 有界摘要）。
+	if !strings.Contains(verify1.Description, "来自节点 implement（activation implement@1）") ||
+		!strings.Contains(verify1.Description, "第一版修改") {
+		t.Errorf("verify 任务描述应注入 implement@1 的上游输入绑定，实际 %q", verify1.Description)
 	}
 	if verify1.GraphID != "g-bridge-acc" || verify1.NodeID != "verify" {
 		t.Errorf("verify 任务应携带图身份 GraphID/NodeID，实际 GraphID=%q NodeID=%q", verify1.GraphID, verify1.NodeID)
 	}
-	runGraphNodeWithEvent(t, env.tasks, "verifier-1", verify1.ID, "判据未全通过", "fixable")
+	runAcceptanceNode(t, env.tasks, "verifier-1", verify1.ID, "判据未全通过", "fixable", "")
 	var impl2 *model.Task
 	eventually(t, "verify@1 判定 fixable 后 implement 应经回边获得 @2 新 activation", func() bool {
 		impl2 = findGraphTask(env.tasks, "g-bridge-acc", "implement", "implement@2")
@@ -93,7 +98,7 @@ func TestGraphBridgeAcceptanceEndToEnd(t *testing.T) {
 	if verify2.EventType != "acceptance.verify" {
 		t.Errorf("verify@2 任务 EventType = %q，应路由 acceptance.verify", verify2.EventType)
 	}
-	runGraphNodeWithEvent(t, env.tasks, "verifier-1", verify2.ID, "全部判据通过", "pass")
+	runAcceptanceNode(t, env.tasks, "verifier-1", verify2.ID, "全部判据通过", "pass", "")
 	eventually(t, "图应到达 completed", func() bool {
 		g, ok := env.graphs.Get("g-bridge-acc")
 		return ok && g.Status == graph.GraphCompleted
@@ -114,7 +119,7 @@ func TestGraphBridgeAcceptanceEndToEnd(t *testing.T) {
 }
 
 // ============================================================
-// G1b：acceptance 服务端核验端到端（真实 store + feed + journal）
+// 谱系核验端到端（真实 store + feed + 数据流证据组装）
 // ============================================================
 
 // bridgeAcceptanceVerifyGraphJSON verdict 路由验收图：implement(agent) →
@@ -138,41 +143,22 @@ const bridgeAcceptanceVerifyGraphJSON = `{
   }
 }`
 
-// newGraphAcceptanceVerifyEnv 装配带 G1b 服务端核验的集成环境：在
-// newGraphBridgeEnv 之上打开真实 Effect Journal 并经
-// wireGraphAcceptanceBridge 注入核验器 + graph change 唤醒器（生产装配路径）。
-func newGraphAcceptanceVerifyEnv(t *testing.T) (*graphBridgeEnv, *effect.Journal, string) {
-	t.Helper()
-	env := newGraphBridgeEnv(t)
-	j, err := effect.OpenJournal(t.TempDir())
-	if err != nil {
-		t.Fatalf("打开 Effect Journal: %v", err)
-	}
-	t.Cleanup(func() { _ = j.Close() })
-	projectRoot := t.TempDir()
-	wireGraphAcceptanceBridge(projectRoot, j, env.tasks, env.runtime)
-	return env, j, projectRoot
-}
-
-// runAcceptanceNode 模拟验收 runner 走 G1b 真实收尾路径（与 agent
-// finalization 同序）：认领 → RecordResultField 写 verdict / evidence →
-// SubmitResult → trace.Emit 终态事件（feed 异步回填触发服务端核验）。
-func runAcceptanceNode(t *testing.T, s *store.MemoryTaskStore, claimAs, taskID, result, verdict, evidenceJSON string) {
+// runAcceptanceNode 模拟验收 runner 的真实收尾路径（与 agent finalization
+// 同序）：认领 → 原子提交 verdict / cited_evidence + 正文 + completed →
+// trace.Emit 终态事件（feed 异步回填触发谱系核验）。
+func runAcceptanceNode(t *testing.T, s *store.MemoryTaskStore, claimAs, taskID, result, verdict, citedEvidence string) {
 	t.Helper()
 	if err := s.ClaimTask(claimAs, taskID); err != nil {
 		t.Fatalf("认领任务 %s: %v", taskID, err)
 	}
+	fields := make(map[string]string, 2)
 	if verdict != "" {
-		if err := store.RecordResultField(s, taskID, "verdict", verdict); err != nil {
-			t.Fatalf("写入 Results[verdict]: %v", err)
-		}
+		fields["verdict"] = verdict
 	}
-	if evidenceJSON != "" {
-		if err := store.RecordResultField(s, taskID, "evidence", evidenceJSON); err != nil {
-			t.Fatalf("写入 Results[evidence]: %v", err)
-		}
+	if citedEvidence != "" {
+		fields["cited_evidence"] = citedEvidence
 	}
-	if err := s.SubmitResult(claimAs, taskID, result); err != nil {
+	if err := s.SubmitResultWithFields(claimAs, taskID, result, fields); err != nil {
 		t.Fatalf("提交任务 %s 结果: %v", taskID, err)
 	}
 	trace.Emit(trace.Event{Kind: trace.KindTaskCompleted, TaskID: taskID})
@@ -214,11 +200,40 @@ func findSchedulerWake(s *store.MemoryTaskStore, marker string) *model.Task {
 	return nil
 }
 
-// TestGraphBridgeAcceptanceVerifyValidEndToEnd 真证据路：验收任务自报
-// verdict=pass 且 command 证据与该任务的真实 shell 账一致 → 服务端核验
-// valid → 按 verdict 路由收官；acceptance_completed 事件载 valid。
-func TestGraphBridgeAcceptanceVerifyValidEndToEnd(t *testing.T) {
-	env, journal, projectRoot := newGraphAcceptanceVerifyEnv(t)
+// driveToAcceptanceVerify 推进 g-bridge-acc-g1b 到 verify@1 任务已发布：
+// implement@1 带一条真实 shell 调用记录（内容寻址的稳定 EvidenceRef）终态。
+func driveToAcceptanceVerify(t *testing.T, env *graphBridgeEnv) (implTaskID, verifyTaskID string) {
+	t.Helper()
+	impl := mustFindGraphTask(t, env.tasks, "g-bridge-acc-g1b", "implement", "implement@1")
+	exit0 := 0
+	if err := env.tasks.AppendToolCall(impl.ID, storeToolCall("go test ./...", exit0)); err != nil {
+		t.Fatalf("AppendToolCall: %v", err)
+	}
+	runTaskToCompleted(t, env.tasks, "runner-1", impl.ID, "修改完成")
+	var verify *model.Task
+	eventually(t, "implement@1 终态后 verify@1 验收任务应被自动发布", func() bool {
+		verify = findGraphTask(env.tasks, "g-bridge-acc-g1b", "verify", "verify@1")
+		return verify != nil
+	})
+	return impl.ID, verify.ID
+}
+
+// storeToolCall 构造一条真实 shell 调用记录（数据流证据来源）。
+func storeToolCall(command string, exit int) store.ToolCallRecord {
+	return store.ToolCallRecord{
+		ToolName: "run_shell",
+		Args:     map[string]any{"command": command},
+		Success:  true, ExitCode: &exit,
+	}
+}
+
+// TestGraphBridgeAcceptanceLineageValidEndToEnd 谱系内引用路：验收任务自报
+// verdict=pass 并引用上游输入谱系内的证据（实现者的真实 shell 调用记录经
+// 数据流到达）→ 核验 valid → 按 verdict 路由收官；acceptance_completed 载
+// valid。
+func TestGraphBridgeAcceptanceLineageValidEndToEnd(t *testing.T) {
+	env := newGraphBridgeEnv(t)
+	wireGraphAcceptanceBridge(env.tasks, env.runtime) // 生产装配路径：disputed 唤醒器
 	doc, err := graph.ParseAndValidate([]byte(bridgeAcceptanceVerifyGraphJSON))
 	if err != nil {
 		t.Fatalf("解析图: %v", err)
@@ -226,22 +241,29 @@ func TestGraphBridgeAcceptanceVerifyValidEndToEnd(t *testing.T) {
 	if err := env.runtime.SubmitGraph(doc); err != nil {
 		t.Fatalf("SubmitGraph 应成功: %v", err)
 	}
+	implTaskID, verifyTaskID := driveToAcceptanceVerify(t, env)
 
-	impl := mustFindGraphTask(t, env.tasks, "g-bridge-acc-g1b", "implement", "implement@1")
-	runTaskToCompleted(t, env.tasks, "runner-1", impl.ID, "修改完成")
-	var verify *model.Task
-	eventually(t, "implement@1 终态后 verify@1 验收任务应被自动发布", func() bool {
-		verify = findGraphTask(env.tasks, "g-bridge-acc-g1b", "verify", "verify@1")
-		return verify != nil
-	})
+	// 验收任务描述的上游输入段应列出实现者证据引用（数据流注入）。
+	verify, err := env.tasks.GetTask(verifyTaskID)
+	if err != nil || verify == nil {
+		t.Fatalf("verify 任务应存在: %v", err)
+	}
+	impl, err := env.tasks.GetTask(implTaskID)
+	if err != nil || impl == nil {
+		t.Fatalf("implement 任务应存在: %v", err)
+	}
+	evidence := assembleTaskEvidence(env.tasks, impl)
+	if len(evidence) == 0 {
+		t.Fatal("implement 任务应产生稳定 EvidenceRef")
+	}
+	upstreamRef := evidence[0].Ref
+	if !strings.Contains(verify.Description, upstreamRef) {
+		t.Fatalf("verify 任务描述应注入上游证据引用 %s: %q", upstreamRef, verify.Description)
+	}
 
-	// 验收 runner 真实执行过 go test ./...（Effect Journal 落账），随后自报
-	// verdict=pass + 同命令 command 证据。
-	settleShellEffect(t, journal, verify.ID, "go test ./...", projectRoot, 0)
-	runAcceptanceNode(t, env.tasks, "verifier-1", verify.ID, "全部判据通过", "pass",
-		`[{"criterion":"测试通过","type":"command","value":"go test ./..."}]`)
+	runAcceptanceNode(t, env.tasks, "verifier-1", verifyTaskID, "全部判据通过", "pass", upstreamRef)
 
-	eventually(t, "核验 valid 后图应到达 completed", func() bool {
+	eventually(t, "谱系核验 valid 后图应到达 completed", func() bool {
 		g, ok := env.graphs.Get("g-bridge-acc-g1b")
 		return ok && g.Status == graph.GraphCompleted
 	})
@@ -255,12 +277,13 @@ func TestGraphBridgeAcceptanceVerifyValidEndToEnd(t *testing.T) {
 	}
 }
 
-// TestGraphBridgeAcceptanceVerifyDisputedEndToEnd 假证据路：验收任务自报
-// verdict=pass 但 command 证据在 shell 账中查无记录 → 服务端核验 disputed
-// → 不采信 verdict：verify 节点 failed、finish 永不激活、图 failed（无
-// 匹配出路）、graph change 唤醒任务发布、acceptance_completed 载 disputed。
-func TestGraphBridgeAcceptanceVerifyDisputedEndToEnd(t *testing.T) {
-	env, _, _ := newGraphAcceptanceVerifyEnv(t)
+// TestGraphBridgeAcceptanceOutOfLineageDisputedEndToEnd 越谱系引用路：验收
+// 任务自报 verdict=pass 但引用不属于其输入谱系的证据 → disputed 不采信：
+// verify 节点 failed、finish 永不激活、图 failed（无匹配出路）、graph
+// change 唤醒任务发布、acceptance_completed 载 disputed。
+func TestGraphBridgeAcceptanceOutOfLineageDisputedEndToEnd(t *testing.T) {
+	env := newGraphBridgeEnv(t)
+	wireGraphAcceptanceBridge(env.tasks, env.runtime) // 生产装配路径：disputed 唤醒器
 	doc, err := graph.ParseAndValidate([]byte(bridgeAcceptanceVerifyGraphJSON))
 	if err != nil {
 		t.Fatalf("解析图: %v", err)
@@ -268,18 +291,10 @@ func TestGraphBridgeAcceptanceVerifyDisputedEndToEnd(t *testing.T) {
 	if err := env.runtime.SubmitGraph(doc); err != nil {
 		t.Fatalf("SubmitGraph 应成功: %v", err)
 	}
+	_, verifyTaskID := driveToAcceptanceVerify(t, env)
 
-	impl := mustFindGraphTask(t, env.tasks, "g-bridge-acc-g1b", "implement", "implement@1")
-	runTaskToCompleted(t, env.tasks, "runner-1", impl.ID, "修改完成")
-	var verify *model.Task
-	eventually(t, "implement@1 终态后 verify@1 验收任务应被自动发布", func() bool {
-		verify = findGraphTask(env.tasks, "g-bridge-acc-g1b", "verify", "verify@1")
-		return verify != nil
-	})
-
-	// 验收 runner 自报 pass 但证据造假（shell 账中无 go test ./... 记录）。
-	runAcceptanceNode(t, env.tasks, "verifier-1", verify.ID, "全部判据通过", "pass",
-		`[{"criterion":"测试通过","type":"command","value":"go test ./..."}]`)
+	// 验收 runner 自报 pass 但引用越出谱系（编造的证据身份）。
+	runAcceptanceNode(t, env.tasks, "verifier-1", verifyTaskID, "全部判据通过", "pass", "ev:伪造:9")
 
 	eventually(t, "核验 disputed 后图应到达 failed（自报 pass 不放行）", func() bool {
 		g, ok := env.graphs.Get("g-bridge-acc-g1b")
@@ -305,7 +320,7 @@ func TestGraphBridgeAcceptanceVerifyDisputedEndToEnd(t *testing.T) {
 	}
 	// 唤醒任务不得携带图身份（防 feed 误回填），且挂来源任务。
 	wake := findSchedulerWake(env.tasks, "[graph-change-request: g-bridge-acc-g1b/verify@1/change]")
-	if wake != nil && (wake.GraphID != "" || wake.ParentTaskID != verify.ID) {
+	if wake != nil && (wake.GraphID != "" || wake.ParentTaskID != verifyTaskID) {
 		t.Errorf("唤醒任务形态不符: GraphID=%q ParentTaskID=%q", wake.GraphID, wake.ParentTaskID)
 	}
 }

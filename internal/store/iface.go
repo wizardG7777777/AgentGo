@@ -1,9 +1,11 @@
 package store
 
 import (
+	"fmt"
 	"time"
 
 	"agentgo/internal/model"
+	"agentgo/internal/session"
 )
 
 // ToolCallRecord 记录一次工具调用的事实快照。
@@ -98,12 +100,13 @@ type TaskStore interface {
 	ScanAll() ([]*model.Task, error)
 }
 
-// CapabilityChecker 按认领方身份判定其是否满足任务的节点能力要求
-// （model.Task.Capability）。返回非 nil error 表示该 agent 不可认领此任务：
+// CapabilityChecker 按认领方身份判定其是否满足任务的节点能力与
+// runtime route owner scope 要求。返回非 nil error 表示该 agent 不可认领此任务：
 // QueryAvailable 会把它从该 agent 的可见集合中过滤掉。
 //
-// 由 bootstrap 经 SetCapabilityChecker 注入（典型实现：agentID → runner 工具
-// 白名单，校验 task.Capability.Tools ⊆ 白名单）；nil 时不过滤（兼容旧装配）。
+// 由 bootstrap 经 SetCapabilityChecker 注入（典型实现：先校验 RouteScope +
+// EventType 可路由，再校验 task.Capability.Tools ⊆ 白名单）；nil 时
+// 不过滤（兼容旧装配）。
 // agentID 为空串的探测性查询不调用本检查（无认领方身份，无从判定）。
 type CapabilityChecker func(agentID string, task *model.Task) error
 
@@ -127,16 +130,72 @@ type resultFieldRecorder interface {
 	RecordResultField(taskID string, key string, value string) error
 }
 
+// resultFieldsRecorder 是结构化终态字段的原子批量写接口。Graph 路由依赖
+// event/verdict/cited_evidence/custom result 同一终态快照，不能容忍逐项写入
+// 后半途失败留下可被错误命中的半份事实。
+type resultFieldsRecorder interface {
+	RecordResultFields(taskID string, fields map[string]string) error
+}
+
+// resultWithFieldsSubmitter 是结构化成功终态的原子提交接口。fields、agent
+// 正文和 SubmitResult 的状态迁移必须在同一 Store 临界区内完成，避免取消/
+// 失败抢先落终态后留下可被 Graph 路由消费的 event 或自定义字段。
+type resultWithFieldsSubmitter interface {
+	SubmitResultWithFields(agentID string, taskID string, result string, fields map[string]string) error
+}
+
+// blockedResultCommitter 是结构化 blocked 终态的原子提交接口。它把自定义
+// fields、agent 正文、blocked 原因与 processing -> blocked 迁移作为一个
+// 不可分割的 Store 操作提交。
+type blockedResultCommitter interface {
+	CommitBlockedResult(agentID string, taskID string, result string, fields map[string]string, reason string, cause string) error
+}
+
 // RecordResultField 向任务的 Results 写入一个键值（不改变任务状态）。
-// 用途：submit_task_result 的 event 参数在 SubmitResult 前落 Results["event"]，
-// 供 V6 Graph 转移求值（graph-terminal-feed 把 Results 全量并入 TerminalFact.Result，
-// 引擎的 eventNameOf 优先采用 "event" 键做事件形态匹配）。
+// 只保留给非终态的独立字段记录；submit_task_result 的终态字段必须走
+// SubmitResultWithFields / CommitBlockedResult，与状态迁移原子提交。
 // Store 不支持该可选能力时静默成功（兼容旧装配；调用方只依赖尽力而为）。
 func RecordResultField(s TaskStore, taskID string, key string, value string) error {
 	if st, ok := s.(resultFieldRecorder); ok {
 		return st.RecordResultField(taskID, key, value)
 	}
 	return nil
+}
+
+// RecordResultFields 在任务仍为 processing 时原子写入一组结果字段。
+// 空集合是 no-op。结构化终态路径必须使用本函数；Store 不实现批量接口时
+// fail-closed，而不是退化为可能部分成功的逐字段写入。
+func RecordResultFields(s TaskStore, taskID string, fields map[string]string) error {
+	if len(fields) == 0 {
+		return nil
+	}
+	if st, ok := s.(resultFieldsRecorder); ok {
+		return st.RecordResultFields(taskID, fields)
+	}
+	return fmt.Errorf("TaskStore %T 不支持原子 RecordResultFields", s)
+}
+
+// SubmitResultWithFields 原子提交结构化字段、agent 正文与成功结果。没有
+// fields 时退化为既有 SubmitResult；存在字段而 Store 不支持原子接口时
+// fail-closed，绝不先写字段再调用 SubmitResult。
+func SubmitResultWithFields(s TaskStore, agentID string, taskID string, result string, fields map[string]string) error {
+	if len(fields) == 0 {
+		return s.SubmitResult(agentID, taskID, result)
+	}
+	if st, ok := s.(resultWithFieldsSubmitter); ok {
+		return st.SubmitResultWithFields(agentID, taskID, result, fields)
+	}
+	return fmt.Errorf("TaskStore %T 不支持原子 SubmitResultWithFields", s)
+}
+
+// CommitBlockedResult 原子提交结构化 fields、agent 正文、blocked 原因与
+// blocked 终态。blocked 即使没有自定义字段，也必须通过该接口提交正文与
+// 终态，避免 cancelled/failed 竞争后遗留结果半状态。
+func CommitBlockedResult(s TaskStore, agentID string, taskID string, result string, fields map[string]string, reason string, cause string) error {
+	if st, ok := s.(blockedResultCommitter); ok {
+		return st.CommitBlockedResult(agentID, taskID, result, fields, reason, cause)
+	}
+	return fmt.Errorf("TaskStore %T 不支持原子 CommitBlockedResult", s)
 }
 
 // leaseFreezer 是可选接口：支持原子冻结任务执行租约的 Store
@@ -171,4 +230,85 @@ func RevokeTaskLease(s TaskStore, taskID string) (*model.ExecutionLease, bool, e
 		return st.RevokeTaskLease(taskID)
 	}
 	return nil, false, nil
+}
+
+// nonTerminalAllCanceler 是可选接口：支持批量终止全部非终态任务的 Store
+// （MemoryTaskStore 实现）。与 resultFieldRecorder 同模式——不扩张
+// TaskStore 主接口，保持测试 fake 与旧装配兼容。
+type nonTerminalAllCanceler interface {
+	CancelAllNonTerminal(cancelSource string) int
+}
+
+// CancelAllNonTerminal 把全部 pending/processing 任务转为 cancelled 终态
+// （/new force 的批量终止），返回取消数量。Store 不支持该可选能力时返回
+// 错误——强制新建语义要求确实终止，不能静默降级。
+func CancelAllNonTerminal(s TaskStore, cancelSource string) (int, error) {
+	if st, ok := s.(nonTerminalAllCanceler); ok {
+		return st.CancelAllNonTerminal(cancelSource), nil
+	}
+	return 0, fmt.Errorf("store 不支持批量终止（CancelAllNonTerminal）")
+}
+
+// allPurger 是可选接口：支持清空全部任务及按任务索引派生状态的 Store
+// （MemoryTaskStore 实现）。同模式不扩张 TaskStore 主接口。
+type allPurger interface {
+	PurgeAll()
+}
+
+// PurgeAll 清空公告板全部任务（/new force 在旧 Session 快照落盘后的内存
+// 清扫）。Store 不支持该可选能力时返回错误。
+func PurgeAll(s TaskStore) error {
+	if st, ok := s.(allPurger); ok {
+		st.PurgeAll()
+		return nil
+	}
+	return fmt.Errorf("store 不支持整体清空（PurgeAll）")
+}
+
+// snapshotReplacer 是可选接口：支持用快照整体原位替换公告板的 Store
+// （MemoryTaskStore 实现）。与 resultFieldRecorder 同模式——不扩张
+// TaskStore 主接口，保持测试 fake 与旧装配兼容。
+type snapshotReplacer interface {
+	ReplaceSnapshot(tasks []session.TaskSnapshot) error
+}
+
+// ReplaceSnapshot 用给定快照整体替换公告板任务表（session 切换解冻时的
+// 原位替换：清空现有任务及按任务索引的派生状态后，导入目标 session 的
+// 快照任务）。Store 不支持该可选能力时返回错误——整体替换语义要求确实
+// 生效，不能静默降级。
+func ReplaceSnapshot(s TaskStore, tasks []session.TaskSnapshot) error {
+	if st, ok := s.(snapshotReplacer); ok {
+		return st.ReplaceSnapshot(tasks)
+	}
+	return fmt.Errorf("store 不支持公告板整体替换（ReplaceSnapshot）")
+}
+
+// quiesceController 是可选接口：支持进入/退出静默围栏的 Store
+// （MemoryTaskStore 实现）。与 resultFieldRecorder 同模式——不扩张
+// TaskStore 主接口，保持测试 fake 与旧装配兼容。
+type quiesceController interface {
+	EnterQuiesce()
+	ExitQuiesce()
+}
+
+// EnterQuiesce 让公告板进入静默窗口（session 冻结第①步）：窗口内全部
+// 任务状态迁移入口被围栏拒绝（ErrStoreQuiesced），只读与整体替换不受限。
+// Store 不支持该可选能力时返回错误——冻结协议要求围栏确实生效。
+func EnterQuiesce(s TaskStore) error {
+	if st, ok := s.(quiesceController); ok {
+		st.EnterQuiesce()
+		return nil
+	}
+	return fmt.Errorf("store 不支持静默围栏（EnterQuiesce）")
+}
+
+// ExitQuiesce 让公告板退出静默窗口（session 冻结第⑥步，在
+// ReplaceSnapshot 完成之后调用），恢复全部状态迁移入口。
+// Store 不支持该可选能力时返回错误。
+func ExitQuiesce(s TaskStore) error {
+	if st, ok := s.(quiesceController); ok {
+		st.ExitQuiesce()
+		return nil
+	}
+	return fmt.Errorf("store 不支持静默围栏（ExitQuiesce）")
 }

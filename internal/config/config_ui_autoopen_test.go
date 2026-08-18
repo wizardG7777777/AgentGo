@@ -6,11 +6,11 @@ import (
 	"testing"
 )
 
-// TestWebUIConfig_AutoOpenDefault 验证 auto_open 未设置时默认开启（nil 三态）。
+// TestWebUIConfig_AutoOpenDefault 验证 auto_open 未设置时默认关闭（nil 三态）。
 func TestWebUIConfig_AutoOpenDefault(t *testing.T) {
 	var c WebUIConfig
-	if !c.AutoOpenEnabled() {
-		t.Fatal("auto_open 未设置时应默认开启")
+	if c.AutoOpenEnabled() {
+		t.Fatal("auto_open 未设置时应默认关闭")
 	}
 }
 

@@ -19,7 +19,9 @@ import (
 
 // TestTextOnlyResult_StructuralSnapshotRoundTrip 模拟完整重启闭环：
 // boot1 接线回调 → 经回调路径产生 text-only 结果 → saveRuntimeSnapshot 落盘；
-// boot2 在同一 session 目录新建 System 并从 snapshot 播种，断言恢复出的结果
+// boot2 经 --resume 入口（NewSessionManagerWithResume——2026-08 二期起启动
+// 永远新建 Session，进入历史会话只走显式入口）在同一 session 目录新建
+// System 并从 snapshot 播种，断言恢复出的结果
 // 正文/路径与产生时一致（Restored 标记置位），且全程无 system.log 参与。
 func TestTextOnlyResult_StructuralSnapshotRoundTrip(t *testing.T) {
 	root := t.TempDir()
@@ -73,10 +75,10 @@ func TestTextOnlyResult_StructuralSnapshotRoundTrip(t *testing.T) {
 		t.Fatalf("测试前置条件失败：不应存在 system.log (err=%v)", statErr)
 	}
 
-	// ---- boot 2：同一 session 目录新建 System，从 snapshot 播种 ----
-	sm2, err := session.NewSessionManager(sessDir, session.SessionConfig{Enabled: true})
+	// ---- boot 2：经 --resume 入口进入同一 session，从 snapshot 播种 ----
+	sm2, err := session.NewSessionManagerWithResume(sessDir, session.SessionConfig{Enabled: true}, sm1.Current().ID)
 	if err != nil {
-		t.Fatalf("NewSessionManager boot2: %v", err)
+		t.Fatalf("NewSessionManagerWithResume boot2: %v", err)
 	}
 	t.Cleanup(func() { _ = sm2.Close() })
 

@@ -8,6 +8,8 @@ package bootstrap
 // 图收官 + graph_ended 事件落 graph_ 分片）。
 
 import (
+	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,9 +17,15 @@ import (
 	"testing"
 	"time"
 
+	"agentgo/internal/agent"
+	"agentgo/internal/config"
 	"agentgo/internal/graph"
+	"agentgo/internal/llm"
+	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/reactor"
+	"agentgo/internal/roster"
+	"agentgo/internal/scheduler"
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
 )
@@ -426,4 +434,212 @@ func TestGraphBridgeEventEdgeMismatchFails(t *testing.T) {
 	if tsk := findGraphTask(env.tasks, "g-bridge-event", "report", "report@1"); tsk != nil {
 		t.Error("事件不匹配时 report 任务不应被发布")
 	}
+}
+
+// bridgeControllerEventGraphJSON 专门锁定 controller 的角色接缝：controller
+// 路由为 __scheduler__，但仍须经 submit_task_result(event=ready) 推进条件边。
+const bridgeControllerEventGraphJSON = `{
+  "schema": "agentgo.graph/v1",
+  "graph_id": "g-bridge-controller-event",
+  "revision": 1, "state_version": 0,
+  "root": "summarize", "status": "pending",
+  "nodes": {
+    "summarize": {"kind":"controller","task":{"title":"裁决覆盖度","description":"完成后调用 submit_task_result 并上报 event=ready"},"status":"inactive","executor":null,"execution":null,
+      "next":[{"to":"finish","when":{"event":"ready"}}]},
+    "finish": {"kind":"end","task":{"title":"收官"},"status":"inactive","executor":null,"execution":null,"next":[]}
+  }
+}`
+
+// TestGraphControllerSubmitTaskResultEventEndToEnd 走完整真实链路：Graph Runtime
+// 发布 controller task → Scheduler Agent 认领 → 真实 ToolRegistry dispatch
+// submit_task_result → SubmitState/finalization 收尾写 Results[event] →
+// graph-terminal-feed 推进 ready 边 → end。它防止 prompt 声称可提交、实际装配
+// 却漏掉工具的契约再次分叉。
+func TestGraphControllerSubmitTaskResultEventEndToEnd(t *testing.T) {
+	env := newGraphBridgeEnv(t)
+	doc, err := graph.ParseAndValidate([]byte(bridgeControllerEventGraphJSON))
+	if err != nil {
+		t.Fatalf("解析图: %v", err)
+	}
+	if err := env.runtime.SubmitGraph(doc); err != nil {
+		t.Fatalf("SubmitGraph 应成功: %v", err)
+	}
+
+	controllerTask := mustFindGraphTask(t, env.tasks, "g-bridge-controller-event", "summarize", "summarize@1")
+	if controllerTask.EventType != "__scheduler__" {
+		t.Fatalf("controller task EventType=%q, want __scheduler__", controllerTask.EventType)
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.ProjectRoot = t.TempDir()
+	cfg.Agents = []config.AgentKind{{Kind: "worker", Replicas: 1}}
+	fake := &planGateScriptedLLM{responses: []llm.Response{{
+		ToolCalls: []llm.ToolCall{{
+			ID:   "controller-submit-1",
+			Name: "submit_task_result",
+			Arguments: map[string]any{
+				"summary": "五路结果已到齐，覆盖度充分",
+				"event":   "ready",
+			},
+		}},
+	}}}
+	bundle := scheduler.New(
+		env.tasks, roster.NewMemoryRoster(), fake, nil, cfg,
+		nil, mailbox.NewRegistry(8), nil, nil, nil, nil, nil, nil, nil, nil,
+		io.Discard, io.Discard, nil, env.runtime, env.graphs, nil,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		bundle.Agent.Run(ctx)
+	}()
+	eventually(t, "Graph controller 应经结构化 event 推进图到 completed", func() bool {
+		g, ok := env.graphs.Get("g-bridge-controller-event")
+		return ok && g.Status == graph.GraphCompleted
+	})
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Scheduler Agent 未在取消后退出")
+	}
+
+	completedTask, err := env.tasks.GetTask(controllerTask.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completedTask.Status != model.TaskStatusCompleted {
+		t.Fatalf("controller task status=%s, want completed", completedTask.Status)
+	}
+	if got := completedTask.Results["event"]; got != "ready" {
+		t.Fatalf("controller Results[event]=%q, want ready（results=%v）", got, completedTask.Results)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("结构化 finalization 应只需一次 LLM 调用，实际 calls=%d log=%v", fake.calls, fake.callLog)
+	}
+	graphShardContains(t, env.traceDir, "g-bridge-controller-event", "graph_ended")
+}
+
+const bridgeStructuredResultRouterGraphJSON = `{
+  "schema": "agentgo.graph/v1",
+  "graph_id": "g-bridge-structured-router",
+  "revision": 1, "state_version": 0,
+  "root": "judge", "status": "pending",
+  "nodes": {
+    "judge": {"kind":"controller","task":{"title":"裁决覆盖度","description":"用 result 提交 coverage 等结构化字段"},"status":"inactive","executor":null,"execution":null,
+      "next":[{"to":"route_coverage"}]},
+    "route_coverage": {"kind":"router","task":{"title":"按 coverage 分流"},"status":"inactive","executor":null,"execution":null,
+      "next":[
+        {"to":"route_retry","when":{"path":"$.coverage","operator":"eq","value":"gap"}},
+        {"to":"coverage_mismatch","when":{"path":"$.coverage","operator":"ne","value":"gap"}}
+      ]},
+    "route_retry": {"kind":"router","task":{"title":"校验数字字段"},"status":"inactive","executor":null,"execution":null,
+      "next":[
+        {"to":"route_ready","when":{"path":"$.retry_count","operator":"eq","value":2}},
+        {"to":"retry_mismatch","when":{"path":"$.retry_count","operator":"ne","value":2}}
+      ]},
+    "route_ready": {"kind":"router","task":{"title":"校验布尔字段"},"status":"inactive","executor":null,"execution":null,
+      "next":[
+        {"to":"route_score","when":{"path":"$.ready","operator":"eq","value":true}},
+        {"to":"ready_mismatch","when":{"path":"$.ready","operator":"ne","value":true}}
+      ]},
+    "route_score": {"kind":"router","task":{"title":"校验嵌套字段"},"status":"inactive","executor":null,"execution":null,
+      "next":[
+        {"to":"gap_done","when":{"path":"$.metrics.score","operator":"eq","value":0.75}},
+        {"to":"score_mismatch","when":{"path":"$.metrics.score","operator":"ne","value":0.75}}
+      ]},
+    "gap_done": {"kind":"end","task":{"title":"缺口分支"},"status":"inactive","executor":null,"execution":null,"next":[]},
+    "coverage_mismatch": {"kind":"end","task":{"title":"coverage 类型错误分支"},"status":"inactive","executor":null,"execution":null,"next":[]},
+    "retry_mismatch": {"kind":"end","task":{"title":"retry_count 类型错误分支"},"status":"inactive","executor":null,"execution":null,"next":[]},
+    "ready_mismatch": {"kind":"end","task":{"title":"ready 类型错误分支"},"status":"inactive","executor":null,"execution":null,"next":[]},
+    "score_mismatch": {"kind":"end","task":{"title":"score 类型错误分支"},"status":"inactive","executor":null,"execution":null,"next":[]}
+  }
+}`
+
+// TestGraphControllerStructuredResultRoutesEndToEnd 证明普通 controller 不靠
+// white-box TerminalFact 注入，即可通过 submit_task_result.result 产生真正的
+// JSON Result，驱动 router 的 $.coverage 条件。carrier 内同时放入 number、
+// bool、嵌套 object，锁住类型保真接线而不把它们降格成字符串。
+func TestGraphControllerStructuredResultRoutesEndToEnd(t *testing.T) {
+	env := newGraphBridgeEnv(t)
+	doc, err := graph.ParseAndValidate([]byte(bridgeStructuredResultRouterGraphJSON))
+	if err != nil {
+		t.Fatalf("解析图: %v", err)
+	}
+	if err := env.runtime.SubmitGraph(doc); err != nil {
+		t.Fatalf("SubmitGraph 应成功: %v", err)
+	}
+
+	controllerTask := mustFindGraphTask(t, env.tasks, "g-bridge-structured-router", "judge", "judge@1")
+	cfg := config.DefaultConfig()
+	cfg.ProjectRoot = t.TempDir()
+	cfg.Agents = []config.AgentKind{{Kind: "worker", Replicas: 1}}
+	fake := &planGateScriptedLLM{responses: []llm.Response{{
+		ToolCalls: []llm.ToolCall{{
+			ID:   "controller-structured-1",
+			Name: "submit_task_result",
+			Arguments: map[string]any{
+				"summary": "发现覆盖缺口",
+				"result": map[string]any{
+					"coverage":    "gap",
+					"retry_count": 2,
+					"ready":       true,
+					"metrics":     map[string]any{"score": 0.75},
+				},
+			},
+		}},
+	}}}
+	bundle := scheduler.New(
+		env.tasks, roster.NewMemoryRoster(), fake, nil, cfg,
+		nil, mailbox.NewRegistry(8), nil, nil, nil, nil, nil, nil, nil, nil,
+		io.Discard, io.Discard, nil, env.runtime, env.graphs, nil,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		bundle.Agent.Run(ctx)
+	}()
+	eventually(t, "自定义 coverage 应驱动 router 命中 gap_done", func() bool {
+		g, ok := env.graphs.Get("g-bridge-structured-router")
+		if !ok || g.Status != graph.GraphCompleted || g.Nodes["gap_done"].Status != graph.NodeCompleted {
+			return false
+		}
+		for _, id := range []string{"coverage_mismatch", "retry_mismatch", "ready_mismatch", "score_mismatch"} {
+			if g.Nodes[id].Status != graph.NodeCancelled {
+				return false
+			}
+		}
+		return true
+	})
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Scheduler Agent 未在取消后退出")
+	}
+
+	completedTask, err := env.tasks.GetTask(controllerTask.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := completedTask.Results[agent.StructuredResultStorageKey]
+	structured, err := agent.DecodeStructuredResult(raw)
+	if err != nil {
+		t.Fatalf("结构化 carrier 未 durable: %v（raw=%q）", err, raw)
+	}
+	if structured["coverage"] != "gap" || structured["retry_count"] != float64(2) || structured["ready"] != true {
+		t.Fatalf("结构化标量未类型保真: %#v", structured)
+	}
+	metrics, ok := structured["metrics"].(map[string]any)
+	if !ok || metrics["score"] != float64(0.75) {
+		t.Fatalf("嵌套结构未类型保真: %#v", structured)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("结构化 finalization 应只需一次 LLM 调用，实际 calls=%d log=%v", fake.calls, fake.callLog)
+	}
+	graphShardContains(t, env.traceDir, "g-bridge-structured-router", "graph_ended")
 }

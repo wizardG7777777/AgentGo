@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -23,6 +24,8 @@ type fakeBoard struct {
 	seq          int
 	failOn       map[string]error // nodeID → 发布失败错误
 	snapshots    map[string]GraphTaskSnapshot
+	terminateErr map[string]error // graphID → 终态 Task 清理失败
+	terminated   []string
 }
 
 func newFakeBoard() *fakeBoard {
@@ -41,7 +44,7 @@ func (b *fakeBoard) PublishGraphTask(spec TaskSpec) (string, error) {
 	b.seq++
 	id := fmt.Sprintf("task-%d", b.seq)
 	b.byActivation[spec.GraphID+"\x00"+spec.ActivationID] = id
-	b.snapshots[spec.GraphID+"\x00"+spec.ActivationID] = GraphTaskSnapshot{TaskID: id}
+	b.snapshots[spec.GraphID+"\x00"+spec.ActivationID] = GraphTaskSnapshot{TaskID: id, NodeKind: spec.NodeKind}
 	b.specs = append(b.specs, spec)
 	return id, nil
 }
@@ -51,6 +54,13 @@ func (b *fakeBoard) LookupGraphTask(graphID, activationID, _ string) (GraphTaskS
 	defer b.mu.Unlock()
 	snapshot, ok := b.snapshots[graphID+"\x00"+activationID]
 	return snapshot, ok, nil
+}
+
+func (b *fakeBoard) TerminateGraphTasks(graphID string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.terminated = append(b.terminated, graphID)
+	return b.terminateErr[graphID]
 }
 
 func (b *fakeBoard) count() int {
@@ -111,6 +121,20 @@ func nodeOf(t *testing.T, s *Store, graphID, nodeID string) Node {
 	return n
 }
 
+// activationResultOf 取得已持久化的 activation 终态对象；新记录
+// 只在 Execution/Settlement 保留稳定引用，测试不应再读 legacy 内联 Result。
+func activationResultOf(t *testing.T, s *Store, graphID, ref string) ActivationResult {
+	t.Helper()
+	if ref == "" {
+		t.Fatal("activation ResultRef 不得为空")
+	}
+	result, ok := s.ResolveActivationResult(graphID, ref)
+	if !ok {
+		t.Fatalf("activation ResultRef %q 应可解引用", ref)
+	}
+	return result
+}
+
 func graphStatusOf(t *testing.T, s *Store, graphID string) GraphStatus {
 	t.Helper()
 	return mustGet(t, s, graphID).Status
@@ -136,7 +160,7 @@ const linearGraphJSON = `{
 // root(controller) → implement(agent) → verify(agent)
 //
 //	--{$.verdict eq pass}--> finish(end)
-//	--{$.verdict eq fixable, activation:new}--> implement（回边）
+//	--{$.verdict eq fixable, activation:new}--> root（回边）
 const backEdgeGraphJSON = `{
   "schema": "agentgo.graph/v1",
   "graph_id": "g-back",
@@ -150,7 +174,7 @@ const backEdgeGraphJSON = `{
     "verify": {"kind":"agent","task":{"title":"验证修改"},"status":"inactive","executor":null,"execution":null,
       "next":[
         {"to":"finish","when":{"path":"$.verdict","operator":"eq","value":"pass"}},
-        {"to":"implement","activation":"new","when":{"path":"$.verdict","operator":"eq","value":"fixable"}}
+		{"to":"root","activation":"new","when":{"path":"$.verdict","operator":"eq","value":"fixable"}}
       ]},
     "finish": {"kind":"end","task":{"title":"形成结果"},"status":"inactive","executor":null,"execution":null,"next":[]}
   }
@@ -211,7 +235,7 @@ func TestRuntimeLinearGraph(t *testing.T) {
 		t.Fatalf("图应为 completed，实际 %s", st)
 	}
 	impl := nodeOf(t, s, "g-linear", "implement")
-	if impl.Status != NodeCompleted || !strings.Contains(impl.Execution.ResultRef, "files") {
+	if impl.Status != NodeCompleted || !strings.Contains(impl.Execution.ResultSummary, "files") {
 		t.Errorf("implement 应 completed 且 result_ref 载结果摘要: %+v", impl.Execution)
 	}
 	fin := nodeOf(t, s, "g-linear", "finish")
@@ -220,6 +244,58 @@ func TestRuntimeLinearGraph(t *testing.T) {
 	}
 	if b.count() != 2 {
 		t.Errorf("end 不应发任务，任务总数应为 2，实际 %d", b.count())
+	}
+}
+
+func TestRuntimeGraphFailureDurablyCancelsLiveSiblingNodes(t *testing.T) {
+	s, rt, b := newTestRuntime(t)
+	const raw = `{
+  "schema":"agentgo.graph/v1","graph_id":"g-terminal-siblings","revision":1,"state_version":0,
+  "root":"root","status":"pending","nodes":{
+    "root":{"kind":"agent","task":{"title":"root"},"status":"inactive","executor":null,"execution":null,
+      "next":[{"to":"a"},{"to":"b"}]},
+    "a":{"kind":"agent","task":{"title":"a"},"status":"inactive","executor":null,"execution":null,
+	  "next":[{"to":"done_a","when":{"event":"completed"}}]},
+    "b":{"kind":"agent","task":{"title":"b"},"status":"inactive","executor":null,"execution":null,
+	  "next":[{"to":"done_b","when":{"event":"completed"}}]},
+    "done_a":{"kind":"end","task":{"title":"done a"},"status":"inactive","executor":null,"execution":null,"next":[]},
+    "done_b":{"kind":"end","task":{"title":"done b"},"status":"inactive","executor":null,"execution":null,"next":[]}
+  }
+}`
+	mustSubmitRuntime(t, rt, raw)
+	mustTerminal(t, rt, TerminalFact{
+		GraphID: "g-terminal-siblings", NodeID: "root", ActivationID: "root@1",
+		TaskID: b.byActivation["g-terminal-siblings\x00root@1"], Status: NodeCompleted,
+	})
+	if len(b.specsFor("a")) != 1 || len(b.specsFor("b")) != 1 {
+		t.Fatalf("fan-out did not activate both siblings: %+v", b.specs)
+	}
+	err := rt.OnTaskTerminal(TerminalFact{
+		GraphID: "g-terminal-siblings", NodeID: "a", ActivationID: "a@1",
+		TaskID: b.byActivation["g-terminal-siblings\x00a@1"], Status: NodeFailed,
+	})
+	if err == nil || !strings.Contains(err.Error(), "无任何匹配的出路") {
+		t.Fatalf("failing branch should retain its diagnostic: %v", err)
+	}
+	doc := mustGet(t, s, "g-terminal-siblings")
+	if doc.Status != GraphFailed {
+		t.Fatalf("Graph status=%s, want failed", doc.Status)
+	}
+	for _, id := range []string{"b", "done_a", "done_b"} {
+		node := doc.Nodes[id]
+		if node.Status != NodeCancelled {
+			t.Fatalf("unfinished sibling %s status=%s, want cancelled", id, node.Status)
+		}
+		if node.Execution != nil && (node.Execution.Settlement == nil || node.Execution.Settlement.Continuation != SettlementContinueNone) {
+			t.Fatalf("running sibling %s missing durable no-op cancellation settlement: %+v", id, node.Execution)
+		}
+	}
+
+	// Re-open validates the on-disk document and proves terminal recovery cannot
+	// resurrect the cancelled sibling activation.
+	s = reopenStore(t, s)
+	if got := mustGet(t, s, "g-terminal-siblings"); got.Status != GraphFailed || got.Nodes["b"].Status != NodeCancelled {
+		t.Fatalf("reopened terminal Graph is incoherent: %+v", got)
 	}
 }
 
@@ -234,37 +310,42 @@ func TestRuntimeBackEdge(t *testing.T) {
 	mustTerminal(t, rt, TerminalFact{GraphID: "g-back", NodeID: "root", ActivationID: "root@1", TaskID: "task-1", Status: NodeCompleted})
 	mustTerminal(t, rt, TerminalFact{GraphID: "g-back", NodeID: "implement", ActivationID: "implement@1", TaskID: "task-2", Status: NodeCompleted})
 
-	// verify 判定 fixable → implement 获得 @2 新 activation 与新 task。
+	// verify 判定 fixable → root 获得 @2 新 activation 与新 task。
 	mustTerminal(t, rt, TerminalFact{
 		GraphID: "g-back", NodeID: "verify", ActivationID: "verify@1", TaskID: "task-3",
 		Status: NodeCompleted, Result: map[string]any{"verdict": "fixable"},
 	})
-	implSpecs := b.specsFor("implement")
-	if len(implSpecs) != 2 {
-		t.Fatalf("implement 应收到 2 次发布，实际 %d", len(implSpecs))
+	rootSpecs := b.specsFor("root")
+	if len(rootSpecs) != 2 {
+		t.Fatalf("root 应收到 2 次发布，实际 %d", len(rootSpecs))
 	}
-	if implSpecs[0].ActivationID != "implement@1" || implSpecs[1].ActivationID != "implement@2" {
-		t.Errorf("两次 activation 应为 implement@1 / implement@2: %+v", implSpecs)
+	if rootSpecs[0].ActivationID != "root@1" || rootSpecs[1].ActivationID != "root@2" {
+		t.Errorf("两次 activation 应为 root@1 / root@2: %+v", rootSpecs)
 	}
 	// 两个 activation 的 task 各自独立（绝不重开旧 task）。
-	t1 := b.byActivation["g-back\x00implement@1"]
-	t2 := b.byActivation["g-back\x00implement@2"]
+	t1 := b.byActivation["g-back\x00root@1"]
+	t2 := b.byActivation["g-back\x00root@2"]
 	if t1 == "" || t2 == "" || t1 == t2 {
 		t.Errorf("两个 activation 应有各自独立的 task: %q / %q", t1, t2)
 	}
-	// 旧节点状态不被重写：verify 仍 completed，implement 以新 activation running。
+	// 旧节点状态不被重写：verify 仍 completed，root 以新 activation running。
 	if n := nodeOf(t, s, "g-back", "verify"); n.Status != NodeCompleted {
 		t.Errorf("verify 应保持 completed，实际 %s", n.Status)
 	}
-	if n := nodeOf(t, s, "g-back", "implement"); n.Status != NodeRunning || n.Execution.ActivationID != "implement@2" {
-		t.Errorf("implement 应以 @2 running: status=%s execution=%+v", n.Status, n.Execution)
+	if n := nodeOf(t, s, "g-back", "root"); n.Status != NodeRunning || n.Execution.ActivationID != "root@2" {
+		t.Errorf("root 应以 @2 running: status=%s execution=%+v", n.Status, n.Execution)
 	}
 	if _, ok := s.HasTransition("g-back", "verify@1", 1); !ok {
 		t.Errorf("回边 (verify@1, next[1]) 应已记录")
 	}
 
-	// implement@2 完成 → verify 也获得新 activation verify@2（序号单调，不重号）。
-	mustTerminal(t, rt, TerminalFact{GraphID: "g-back", NodeID: "implement", ActivationID: "implement@2", TaskID: t2, Status: NodeCompleted})
+	// root@2 完成后产生 implement@2，再完成它才产生 verify@2。
+	mustTerminal(t, rt, TerminalFact{GraphID: "g-back", NodeID: "root", ActivationID: "root@2", TaskID: t2, Status: NodeCompleted})
+	impl2 := b.byActivation["g-back\x00implement@2"]
+	if impl2 == "" {
+		t.Fatal("root@2 应发布 implement@2")
+	}
+	mustTerminal(t, rt, TerminalFact{GraphID: "g-back", NodeID: "implement", ActivationID: "implement@2", TaskID: impl2, Status: NodeCompleted})
 	if n := nodeOf(t, s, "g-back", "verify"); n.Execution == nil || n.Execution.ActivationID != "verify@2" {
 		t.Fatalf("verify 应获得新 activation verify@2: %+v", n.Execution)
 	}
@@ -277,11 +358,11 @@ func TestRuntimeBackEdge(t *testing.T) {
 	if st := graphStatusOf(t, s, "g-back"); st != GraphCompleted {
 		t.Fatalf("图应为 completed，实际 %s", st)
 	}
-	if got := len(b.byActivation); got != 6 { // root@1 implement@1/@2 verify@1/@2 + 无 end 任务 → 5 个任务型 activation
+	if got := len(b.byActivation); got != 6 {
 		t.Logf("activation 计数: %d（信息性）", got)
 	}
-	if b.count() != 5 {
-		t.Errorf("任务总数应为 5（root + implement×2 + verify×2），实际 %d", b.count())
+	if b.count() != 6 {
+		t.Errorf("任务总数应为 6（root×2 + implement×2 + verify×2），实际 %d", b.count())
 	}
 }
 
@@ -299,13 +380,19 @@ func TestEvalCondition(t *testing.T) {
 		want   bool
 	}{
 		{"when 缺省恒真", nil, NodeCompleted, nil, true},
+		{"when 缺省对 blocked 仍恒真", nil, NodeBlocked, nil, true},
+		{"when 缺省对 failed 仍恒真", nil, NodeFailed, nil, true},
 		{"always 恒真", &Condition{Event: EventAlways}, NodeFailed, nil, true},
 		{"事件回落终态 completed 命中", &Condition{Event: EventCompleted}, NodeCompleted, nil, true},
 		{"事件回落终态不命中", &Condition{Event: EventPass}, NodeCompleted, nil, false},
 		{"事件回落 failed 命中", &Condition{Event: EventFailed}, NodeFailed, nil, true},
 		{"事件回落 blocked 命中", &Condition{Event: EventBlocked}, NodeBlocked, nil, true},
-		{"Result event 覆盖终态映射", &Condition{Event: EventFixable}, NodeCompleted, map[string]any{"event": "fixable"}, true},
-		{"Result event 覆盖后不再回落", &Condition{Event: EventCompleted}, NodeCompleted, map[string]any{"event": "fixable"}, false},
+		{"completed Result event 细分终态映射", &Condition{Event: EventFixable}, NodeCompleted, map[string]any{"event": "fixable"}, true},
+		{"completed Result event 细分后不再回落", &Condition{Event: EventCompleted}, NodeCompleted, map[string]any{"event": "fixable"}, false},
+		{"failed 不允许 Result event 伪装 completed", &Condition{Event: EventCompleted}, NodeFailed, map[string]any{"event": "completed"}, false},
+		{"failed 无视 Result event 并命中真实终态", &Condition{Event: EventFailed}, NodeFailed, map[string]any{"event": "completed"}, true},
+		{"blocked 不允许 Result event 伪装 pass", &Condition{Event: EventPass}, NodeBlocked, map[string]any{"event": "pass"}, false},
+		{"blocked 无视 Result event 并命中真实终态", &Condition{Event: EventBlocked}, NodeBlocked, map[string]any{"event": "pass"}, true},
 		{"eq 字符串命中", &Condition{Path: "$.verdict", Operator: OpEq, Value: raw(`"pass"`)}, NodeCompleted, map[string]any{"verdict": "pass"}, true},
 		{"eq 字符串不命中", &Condition{Path: "$.verdict", Operator: OpEq, Value: raw(`"pass"`)}, NodeCompleted, map[string]any{"verdict": "fixable"}, false},
 		{"eq 路径缺失为 false", &Condition{Path: "$.verdict", Operator: OpEq, Value: raw(`"pass"`)}, NodeCompleted, map[string]any{}, false},
@@ -329,6 +416,65 @@ func TestEvalCondition(t *testing.T) {
 				t.Errorf("evalCondition(%+v, %s, %v) = %v，应 %v", tc.when, tc.status, tc.result, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRuntimeCompletedEdgeDoesNotActivateOnBlockedPredecessor(t *testing.T) {
+	const doc = `{
+  "schema":"agentgo.graph/v1","graph_id":"g-completed-only","revision":1,"state_version":0,
+  "root":"work","status":"pending","nodes":{
+    "work":{"kind":"agent","task":{"title":"执行工作"},"status":"inactive","executor":null,"execution":null,
+      "next":[
+        {"to":"summarize","when":{"event":"completed"}},
+        {"to":"blocked_end","when":{"event":"blocked"}}
+      ]},
+    "summarize":{"kind":"controller","task":{"title":"只汇总成功结果"},"status":"inactive","executor":null,"execution":null,
+      "next":[{"to":"done"}]},
+    "blocked_end":{"kind":"end","task":{"title":"阻塞收口"},"status":"inactive","executor":null,"execution":null,"next":[]},
+    "done":{"kind":"end","task":{"title":"完成"},"status":"inactive","executor":null,"execution":null,"next":[]}
+  }
+}`
+	s, rt, b := newTestRuntime(t)
+	mustSubmitRuntime(t, rt, doc)
+
+	mustTerminal(t, rt, TerminalFact{
+		GraphID: "g-completed-only", NodeID: "work", ActivationID: "work@1",
+		TaskID: "task-1", Status: NodeBlocked, Result: map[string]any{"event": "completed"},
+	})
+
+	if got := b.specsFor("summarize"); len(got) != 0 {
+		t.Fatalf("blocked 前驱不应通过 when:completed 激活 summarize，实际发布 %+v", got)
+	}
+	if summarize := nodeOf(t, s, "g-completed-only", "summarize"); summarize.Status != NodeCancelled || summarize.Execution != nil {
+		t.Fatalf("summarize 未被 completed 边激活，并应在 Graph 收官时 cancelled 且无 activation，实际 status=%s execution=%+v",
+			summarize.Status, summarize.Execution)
+	}
+	if _, fired := s.HasTransition("g-completed-only", "work@1", 0); fired {
+		t.Fatal("blocked 前驱错误选择了 when:completed 边")
+	}
+	if rec, fired := s.HasTransition("g-completed-only", "work@1", 1); !fired || rec.TargetNodeID != "blocked_end" {
+		t.Fatalf("blocked 分支未按显式条件生效：fired=%v record=%+v", fired, rec)
+	}
+}
+
+func TestRuntimeOrdinaryFanInRejectedUntilGenerationToken(t *testing.T) {
+	const doc = `{
+  "schema":"agentgo.graph/v1","graph_id":"g-fanin-or","revision":1,"state_version":0,
+  "root":"root","status":"pending","nodes":{
+    "root":{"kind":"controller","task":{"title":"并行启动"},"status":"inactive","executor":null,"execution":null,
+      "next":[{"to":"a"},{"to":"b"}]},
+    "a":{"kind":"agent","task":{"title":"调查 A"},"status":"inactive","executor":null,"execution":null,
+      "next":[{"to":"summarize"}]},
+    "b":{"kind":"agent","task":{"title":"调查 B"},"status":"inactive","executor":null,"execution":null,
+      "next":[{"to":"summarize"}]},
+    "summarize":{"kind":"controller","task":{"title":"普通 fan-in 汇总"},"status":"inactive","executor":null,"execution":null,
+      "next":[{"to":"done"}]},
+    "done":{"kind":"end","task":{"title":"完成"},"status":"inactive","executor":null,"execution":null,"next":[]}
+  }
+}`
+	_, err := ParseAndValidate([]byte(doc))
+	if err == nil || !strings.Contains(err.Error(), "非 barrier 节点") || !strings.Contains(err.Error(), "generation/correlation token") {
+		t.Fatalf("普通节点的多入边 OR 应在 authoring 阶段 fail-closed，实际 %v", err)
 	}
 }
 
@@ -418,14 +564,14 @@ func TestRuntimeCrashRecovery(t *testing.T) {
 	rt1 := NewRuntime(s1, b1)
 	mustSubmitRuntime(t, rt1, backEdgeGraphJSON)
 
-	// 走到 verify@1 判定 fixable（implement@2 已发布、在途）后「崩溃」。
+	// 走到 verify@1 判定 fixable（root@2 已发布、在途）后「崩溃」。
 	mustTerminal(t, rt1, TerminalFact{GraphID: "g-back", NodeID: "root", ActivationID: "root@1", TaskID: "task-1", Status: NodeCompleted})
 	mustTerminal(t, rt1, TerminalFact{GraphID: "g-back", NodeID: "implement", ActivationID: "implement@1", TaskID: "task-2", Status: NodeCompleted})
 	mustTerminal(t, rt1, TerminalFact{
 		GraphID: "g-back", NodeID: "verify", ActivationID: "verify@1", TaskID: "task-3",
 		Status: NodeCompleted, Result: map[string]any{"verdict": "fixable"},
 	})
-	taskOfImpl2 := b1.byActivation["g-back\x00implement@2"]
+	taskOfRoot2 := b1.byActivation["g-back\x00root@2"]
 	closeStore(t, s1)
 
 	// 重启：NewStore + Recover + 新 Runtime + ResumeGraph。
@@ -438,13 +584,13 @@ func TestRuntimeCrashRecovery(t *testing.T) {
 		t.Fatalf("Recover 应无告警: %v", err)
 	}
 	b2 := newFakeBoard()
-	b2.byActivation["g-back\x00implement@2"] = taskOfImpl2
-	b2.snapshots["g-back\x00implement@2"] = GraphTaskSnapshot{TaskID: taskOfImpl2}
+	b2.byActivation["g-back\x00root@2"] = taskOfRoot2
+	b2.snapshots["g-back\x00root@2"] = GraphTaskSnapshot{TaskID: taskOfRoot2}
 	rt2 := NewRuntime(s2, b2)
 	if err := rt2.ResumeGraph("g-back"); err != nil {
 		t.Fatalf("ResumeGraph 应成功: %v", err)
 	}
-	// implement@2 在途（running 且带 activation）：不重发任务。
+	// root@2 在途（running 且带 activation）：不重发任务。
 	if b2.count() != 0 {
 		t.Fatalf("在途节点不应重发任务，实际补发 %d 个", b2.count())
 	}
@@ -453,8 +599,13 @@ func TestRuntimeCrashRecovery(t *testing.T) {
 		t.Errorf("恢复后边选择记录应为 3 条（root@1、implement@1、verify@1），实际 %d", got)
 	}
 
-	// 继续走完：implement@2 → verify@2（序号不重号）→ pass → completed。
-	mustTerminal(t, rt2, TerminalFact{GraphID: "g-back", NodeID: "implement", ActivationID: "implement@2", TaskID: taskOfImpl2, Status: NodeCompleted})
+	// 继续走完：root@2 → implement@2 → verify@2 → pass → completed。
+	mustTerminal(t, rt2, TerminalFact{GraphID: "g-back", NodeID: "root", ActivationID: "root@2", TaskID: taskOfRoot2, Status: NodeCompleted})
+	implSpecs := b2.specsFor("implement")
+	if len(implSpecs) != 1 || implSpecs[0].ActivationID != "implement@2" {
+		t.Fatalf("恢复后 root@2 应产生 implement@2: %+v", implSpecs)
+	}
+	mustTerminal(t, rt2, TerminalFact{GraphID: "g-back", NodeID: "implement", ActivationID: "implement@2", TaskID: b2.byActivation["g-back\x00implement@2"], Status: NodeCompleted})
 	verifySpecs := b2.specsFor("verify")
 	if len(verifySpecs) != 1 || verifySpecs[0].ActivationID != "verify@2" {
 		t.Fatalf("恢复后 verify 应获得不重号的 verify@2: %+v", verifySpecs)
@@ -643,6 +794,30 @@ func TestResumeEndSettlementFinalizesGraph(t *testing.T) {
 }
 
 func TestTerminalSettlementRejectsNonJSONAndOversizedResults(t *testing.T) {
+	assertDurableFailure := func(t *testing.T, s *Store, err error, want string) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "执行 fail-closed") {
+			t.Fatalf("不可持久 Result 应明确 fail-closed: %v", err)
+		}
+		root := nodeOf(t, s, "g-linear", "root")
+		if root.Status != NodeFailed || root.Execution == nil || root.Execution.Settlement == nil || root.Execution.ResultRef == "" {
+			t.Fatalf("不可持久 Result 必须把节点 durable 结算为 failed: %+v", root)
+		}
+		if st := graphStatusOf(t, s, "g-linear"); st != GraphFailed {
+			t.Fatalf("不可持久 Result 必须把 Graph durable 结算为 failed，实际 %s", st)
+		}
+		fallback := activationResultOf(t, s, "g-linear", root.Execution.ResultRef)
+		if len(fallback.Result) == 0 || len(fallback.Result) > MaxDocumentBytes || !strings.Contains(string(fallback.Result), "result_unstorable") {
+			t.Fatalf("节点应保留有界、可解引用的错误 Result: %+v", fallback)
+		}
+		s = reopenStore(t, s)
+		if err := NewRuntime(s, newFakeBoard()).ResumeGraph("g-linear"); err != nil {
+			t.Fatalf("重启恢复 durable failed Graph 应为空操作: %v", err)
+		}
+		if st := graphStatusOf(t, s, "g-linear"); st != GraphFailed {
+			t.Fatalf("重启后应保持 failed，实际 %s", st)
+		}
+	}
 	t.Run("non-json", func(t *testing.T) {
 		s, rt, _ := newTestRuntime(t)
 		mustSubmitRuntime(t, rt, linearGraphJSON)
@@ -650,12 +825,7 @@ func TestTerminalSettlementRejectsNonJSONAndOversizedResults(t *testing.T) {
 			GraphID: "g-linear", NodeID: "root", ActivationID: "root@1", TaskID: "task-1",
 			Status: NodeCompleted, Result: map[string]any{"bad": make(chan int)},
 		})
-		if err == nil || !strings.Contains(err.Error(), "序列化") {
-			t.Fatalf("非 JSON Result 应明确拒绝: %v", err)
-		}
-		if nodeOf(t, s, "g-linear", "root").Status != NodeRunning {
-			t.Fatal("Result 无法 durable 时不得先落 terminal")
-		}
+		assertDurableFailure(t, s, err, "无法序列化")
 	})
 	t.Run("oversized", func(t *testing.T) {
 		s, rt, _ := newTestRuntime(t)
@@ -664,11 +834,70 @@ func TestTerminalSettlementRejectsNonJSONAndOversizedResults(t *testing.T) {
 			GraphID: "g-linear", NodeID: "root", ActivationID: "root@1", TaskID: "task-1",
 			Status: NodeCompleted, Result: map[string]any{"large": strings.Repeat("x", MaxDocumentBytes+1)},
 		})
-		if err == nil || !strings.Contains(err.Error(), "durable settlement 上限") {
-			t.Fatalf("超大 Result 应明确 fail-closed: %v", err)
+		assertDurableFailure(t, s, err, "超过 durable activation Result 上限")
+	})
+	t.Run("join-merged-oversized", func(t *testing.T) {
+		s, rt, b := newTestRuntime(t)
+		mustSubmitRuntime(t, rt, `{
+		  "schema":"agentgo.graph/v1","graph_id":"g-join-oversized","revision":1,"state_version":0,
+		  "root":"root","status":"pending","nodes":{
+		    "root":{"kind":"agent","task":{"title":"拆分"},"status":"inactive","next":[{"to":"a"},{"to":"b"}]},
+		    "a":{"kind":"agent","task":{"title":"A"},"status":"inactive","next":[{"to":"join","target_input":"a"}]},
+		    "b":{"kind":"agent","task":{"title":"B"},"status":"inactive","next":[{"to":"join","target_input":"b"}]},
+		    "join":{"kind":"join","task":{"title":"汇合","required_inputs":["a","b"]},"status":"inactive","next":[{"to":"done"}]},
+		    "done":{"kind":"end","task":{"title":"收官"},"status":"inactive","next":[]}
+		  }
+		}`)
+		mustTerminal(t, rt, TerminalFact{
+			GraphID: "g-join-oversized", NodeID: "root", ActivationID: "root@1",
+			TaskID: b.byActivation["g-join-oversized\x00root@1"], Status: NodeCompleted,
+		})
+		branchBlob := strings.Repeat("x", MaxDocumentBytes/2+1024)
+		mustTerminal(t, rt, TerminalFact{
+			GraphID: "g-join-oversized", NodeID: "a", ActivationID: "a@1",
+			TaskID: b.byActivation["g-join-oversized\x00a@1"], Status: NodeCompleted,
+			Result: map[string]any{"blob": branchBlob},
+		})
+		err := rt.OnTaskTerminal(TerminalFact{
+			GraphID: "g-join-oversized", NodeID: "b", ActivationID: "b@1",
+			TaskID: b.byActivation["g-join-oversized\x00b@1"], Status: NodeCompleted,
+			Result: map[string]any{"blob": branchBlob},
+		})
+		if err == nil || !strings.Contains(err.Error(), "超过 durable activation Result 上限") {
+			t.Fatalf("join 的合并 Result 超限应 fail-closed: %v", err)
 		}
-		if nodeOf(t, s, "g-linear", "root").Status != NodeRunning {
-			t.Fatal("超大 Result 不得产生不可恢复的 terminal 记录")
+		join := nodeOf(t, s, "g-join-oversized", "join")
+		if join.Status != NodeFailed || graphStatusOf(t, s, "g-join-oversized") != GraphFailed {
+			t.Fatalf("join/Graph 应 durable failed: join=%+v graph=%s", join, graphStatusOf(t, s, "g-join-oversized"))
+		}
+		activationResultOf(t, s, "g-join-oversized", join.Execution.ResultRef)
+		s = reopenStore(t, s)
+		if err := NewRuntime(s, newFakeBoard()).ResumeGraph("g-join-oversized"); err != nil {
+			t.Fatalf("重启后不得重跑超限 join: %v", err)
+		}
+	})
+	t.Run("end-input-oversized", func(t *testing.T) {
+		s := newTestStore(t)
+		mustSubmit(t, s, endSettlementRecoveryGraphJSON)
+		doc := mustGet(t, s, "g-end-settlement")
+		mustMutate(t, s.SetGraphStatus("g-end-settlement", GraphRunning, doc.StateVersion))
+		rt := NewRuntime(s, newFakeBoard())
+		rt.mu.Lock()
+		err := rt.activateEnd("g-end-settlement", "finish", map[string]any{
+			"blob": strings.Repeat("x", MaxDocumentBytes+1),
+		})
+		rt.mu.Unlock()
+		if err == nil || !strings.Contains(err.Error(), "超过 durable activation Result 上限") {
+			t.Fatalf("end 收官 Result 超限应 fail-closed: %v", err)
+		}
+		end := nodeOf(t, s, "g-end-settlement", "finish")
+		if end.Status != NodeFailed || graphStatusOf(t, s, "g-end-settlement") != GraphFailed {
+			t.Fatalf("end/Graph 应 durable failed: end=%+v graph=%s", end, graphStatusOf(t, s, "g-end-settlement"))
+		}
+		activationResultOf(t, s, "g-end-settlement", end.Execution.ResultRef)
+		s = reopenStore(t, s)
+		if err := NewRuntime(s, newFakeBoard()).ResumeGraph("g-end-settlement"); err != nil {
+			t.Fatalf("重启后不得重跑超限 end: %v", err)
 		}
 	})
 }
@@ -839,8 +1068,20 @@ func TestRecordTransitionDurable(t *testing.T) {
 	s := newTestStore(t)
 	mustSubmit(t, s, linearGraphJSON)
 
+	result := map[string]any{"ok": true}
+	raw, _ := json.Marshal(result)
+	resultRef := activationResultRef("g-linear", "root@1")
+	if err := s.RecordActivationResult("g-linear", ActivationResult{
+		Ref: resultRef, NodeID: "root", ActivationID: "root@1", Result: raw,
+	}); err != nil {
+		t.Fatalf("RecordActivationResult: %v", err)
+	}
 	doc := mustGet(t, s, "g-linear")
-	rec := TransitionRecord{SourceNodeID: "root", SourceActivationID: "root@1", TransitionID: 0, TargetNodeID: "implement"}
+	rec := TransitionRecord{
+		SourceNodeID: "root", SourceActivationID: "root@1", TransitionID: 0,
+		TargetNodeID: "implement", TargetActivationID: "implement@1",
+		Input: newEdgeInputWithRef(result, resultRef, nil),
+	}
 	if err := s.RecordTransition("g-linear", rec, doc.StateVersion); err != nil {
 		t.Fatalf("RecordTransition 应成功: %v", err)
 	}
@@ -926,10 +1167,10 @@ const patchJoinGraphJSON = `{
   "root":"root","status":"pending","nodes":{
     "root":{"kind":"router","task":{"title":"fanout"},"status":"inactive","executor":null,"execution":null,
       "next":[{"to":"a"},{"to":"b"}]},
-    "a":{"kind":"agent","task":{"title":"a"},"status":"inactive","executor":null,"execution":null,"next":[{"to":"join"}]},
+    "a":{"kind":"agent","task":{"title":"a"},"status":"inactive","executor":null,"execution":null,"next":[{"to":"join","target_input":"a"}]},
     "b":{"kind":"agent","task":{"title":"b"},"status":"inactive","executor":null,"execution":null,
-      "next":[{"to":"join","when":{"event":"completed"}},{"to":"other","when":{"event":"failed"}}]},
-    "join":{"kind":"join","task":{"title":"join"},"status":"inactive","executor":null,"execution":null,"next":[{"to":"finish"}]},
+      "next":[{"to":"join","target_input":"b","when":{"event":"completed"}},{"to":"other","when":{"event":"failed"}}]},
+    "join":{"kind":"join","task":{"title":"join","required_inputs":["a","b"]},"status":"inactive","executor":null,"execution":null,"next":[{"to":"finish"}]},
     "other":{"kind":"end","task":{"title":"other"},"status":"inactive","executor":null,"execution":null,"next":[]},
     "finish":{"kind":"end","task":{"title":"finish"},"status":"inactive","executor":null,"execution":null,"next":[]}
   }
@@ -939,7 +1180,9 @@ func TestJoinUsesFrozenSourceDefinitionAfterPatch(t *testing.T) {
 	s, rt, _ := newTestRuntime(t)
 	mustSubmitRuntime(t, rt, patchJoinGraphJSON)
 	if _, err := rt.PatchGraph("g-patch-join", 1, DefinitionPatch{UpsertNodes: []NodeDefUpsert{{
-		ID: "a", Kind: KindAgent, Task: &NodeTask{Title: "a-v2"}, Next: []Transition{{To: "other"}},
+		ID: "a", Kind: KindAgent, Task: &NodeTask{Title: "a-v2"}, Next: []Transition{
+			{To: "join", TargetInput: "a", When: &Condition{Event: EventFailed}},
+		},
 	}}}); err != nil {
 		t.Fatalf("PatchGraph: %v", err)
 	}
@@ -952,7 +1195,7 @@ func TestJoinUsesFrozenSourceDefinitionAfterPatch(t *testing.T) {
 	}
 	mustTerminal(t, rt, TerminalFact{GraphID: "g-patch-join", NodeID: "b", ActivationID: "b@1", TaskID: "task-2", Status: NodeCompleted, Result: map[string]any{"from": "b"}})
 	join := nodeOf(t, s, "g-patch-join", "join")
-	if join.Status != NodeCompleted || !strings.Contains(join.Execution.ResultRef, `"a"`) || !strings.Contains(join.Execution.ResultRef, `"b"`) {
+	if join.Status != NodeCompleted || !strings.Contains(join.Execution.ResultSummary, `"a"`) || !strings.Contains(join.Execution.ResultSummary, `"b"`) {
 		t.Fatalf("join 应按冻结入边合并 a/b: status=%s execution=%+v", join.Status, join.Execution)
 	}
 }
@@ -982,6 +1225,15 @@ func TestResumeRunningTaskRepublishesMissingAndBackfillsTerminal(t *testing.T) {
 			t.Fatalf("TaskStore 终态应回填并推进后继")
 		}
 	})
+	t.Run("node kind mismatch", func(t *testing.T) {
+		_, rt, b := newTestRuntime(t)
+		mustSubmitRuntime(t, rt, linearGraphJSON)
+		b.snapshots["g-linear\x00root@1"] = GraphTaskSnapshot{TaskID: "task-1", NodeKind: KindAcceptance}
+		err := rt.ResumeGraph("g-linear")
+		if err == nil || !strings.Contains(err.Error(), "Task 节点类型=acceptance") || !strings.Contains(err.Error(), "冻结定义=controller") {
+			t.Fatalf("恢复时非空 node kind 不一致应 fail-closed，实际 err=%v", err)
+		}
+	})
 }
 
 func TestResumeDurableBackEdgeCreatesReservedActivation(t *testing.T) {
@@ -995,9 +1247,21 @@ func TestResumeDurableBackEdgeCreatesReservedActivation(t *testing.T) {
 		t.Fatalf("构造 verify 终态: %v", err)
 	}
 	doc = mustGet(t, s, "g-back")
+	result := map[string]any{"verdict": "fixable"}
+	resultRef := activationResultRef("g-back", "verify@1")
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("序列化 verify Result: %v", err)
+	}
+	if err := s.RecordActivationResult("g-back", ActivationResult{
+		Ref: resultRef, NodeID: "verify", ActivationID: "verify@1", Result: raw,
+	}); err != nil {
+		t.Fatalf("构造 durable activation Result: %v", err)
+	}
 	if err := s.RecordTransition("g-back", TransitionRecord{
 		SourceNodeID: "verify", SourceActivationID: "verify@1", TransitionID: 1,
-		TargetNodeID: "implement", TargetActivationID: "implement@2",
+		TargetNodeID: "root", TargetActivationID: "root@2",
+		Input: newEdgeInputWithRef(result, resultRef, nil),
 	}, doc.StateVersion); err != nil {
 		t.Fatalf("构造 durable backedge: %v", err)
 	}
@@ -1006,13 +1270,13 @@ func TestResumeDurableBackEdgeCreatesReservedActivation(t *testing.T) {
 	if err := NewRuntime(s, b2).ResumeGraph("g-back"); err != nil {
 		t.Fatalf("ResumeGraph: %v", err)
 	}
-	impl := nodeOf(t, s, "g-back", "implement")
-	if impl.Status != NodeRunning || impl.Execution.ActivationID != "implement@2" || b2.count() != 1 {
-		t.Fatalf("durable 回边应补建 implement@2: count=%d node=%+v", b2.count(), impl)
+	root := nodeOf(t, s, "g-back", "root")
+	if root.Status != NodeRunning || root.Execution.ActivationID != "root@2" || b2.count() != 1 {
+		t.Fatalf("durable 回边应补建 root@2: count=%d node=%+v", b2.count(), root)
 	}
 }
 
-func TestResumeLegacyTransitionDoesNotReopenTerminalTarget(t *testing.T) {
+func TestResumeStableTransitionDoesNotReopenTerminalTarget(t *testing.T) {
 	s := newTestStore(t)
 	mustSubmit(t, s, tinyDocJSON)
 	mustMutate(t, s.SetGraphStatus("g1", GraphRunning, 0))
@@ -1022,11 +1286,24 @@ func TestResumeLegacyTransitionDoesNotReopenTerminalTarget(t *testing.T) {
 	}
 	write("a", "a@1", NodeReady)
 	write("a", "a@1", NodeRunning)
-	write("a", "a@1", NodeCompleted)
+	result := map[string]any{"ok": true}
+	raw, _ := json.Marshal(result)
+	resultRef := activationResultRef("g1", "a@1")
+	if err := s.RecordActivationResult("g1", ActivationResult{
+		Ref: resultRef, NodeID: "a", ActivationID: "a@1", Result: raw,
+	}); err != nil {
+		t.Fatalf("RecordActivationResult: %v", err)
+	}
 	doc := mustGet(t, s, "g1")
+	a := doc.Nodes["a"]
+	aExec := *a.Execution
+	aExec.ResultRef = resultRef
+	mustMutate(t, s.SetExecutionAndStatus("g1", "a", aExec, NodeCompleted, doc.StateVersion))
+	doc = mustGet(t, s, "g1")
 	mustMutate(t, s.RecordTransition("g1", TransitionRecord{
 		SourceNodeID: "a", SourceActivationID: "a@1", TransitionID: 0, TargetNodeID: "b",
-	}, doc.StateVersion)) // legacy：无 TargetActivationID
+		TargetActivationID: "b@1", Input: newEdgeInputWithRef(result, resultRef, nil),
+	}, doc.StateVersion))
 	write("b", "b@1", NodeReady)
 	write("b", "b@1", NodeRunning)
 	write("b", "b@1", NodeCompleted)
@@ -1036,6 +1313,6 @@ func TestResumeLegacyTransitionDoesNotReopenTerminalTarget(t *testing.T) {
 		t.Fatalf("ResumeGraph: %v", err)
 	}
 	if node := nodeOf(t, s, "g1", "b"); node.Execution.ActivationID != "b@1" || node.Status != NodeCompleted || b.count() != 0 {
-		t.Fatalf("legacy 边不得猜测并重开终态目标: count=%d node=%+v", b.count(), node)
+		t.Fatalf("已物化的 stable 边不得重开终态目标: count=%d node=%+v", b.count(), node)
 	}
 }

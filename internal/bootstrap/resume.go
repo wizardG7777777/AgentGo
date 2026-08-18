@@ -44,21 +44,19 @@ func currentRecoveredSnapshot(sm *session.SessionManager) *session.Snapshot {
 	return sm.Current().RecoveredSnapshot
 }
 
-// protectStaleAutomaticResume prevents an old active-session pointer from
-// silently replaying non-terminal work after a long process absence. The
-// snapshot timestamp represents the last durable runtime heartbeat because
-// Start also saves snapshots periodically. An explicit --resume is treated as
-// user confirmation and bypasses this guard.
-type staleResumeBlock struct {
+// resumeBlock 记录恢复守卫阻断的一条任务（writer-only 审计事件用）。
+// 2026-08 起进入会话（--resume / 解冻）不再自动续跑：非终态任务一律阻断
+// 为 blocked，续跑由用户提交新提示词驱动。
+type resumeBlock struct {
 	TaskID     string
 	PrevStatus string
 	Reason     string
 	Cause      string
 }
 
-func emitStaleResumeBlocks(blocks []staleResumeBlock) {
+func emitResumeBlocks(blocks []resumeBlock) {
 	// Recovery audit events must be writer-only. At this point bootstrap has
-	// already installed the Reactor dispatcher; routing a stale-resume block
+	// already installed the Reactor dispatcher; routing a resume block
 	// through trace.Emit could therefore publish work or spawn agents while the
 	// recovery guard is deliberately failing closed.
 	writer := trace.Default()
@@ -68,7 +66,7 @@ func emitStaleResumeBlocks(blocks []staleResumeBlock) {
 	for _, blocked := range blocks {
 		cause := blocked.Cause
 		if cause == "" {
-			cause = "stale_resume_guard"
+			cause = "no_auto_resume"
 		}
 		writer.Emit(trace.Event{
 			Kind:   trace.KindTaskBlocked,
@@ -85,10 +83,9 @@ func emitStaleResumeBlocks(blocks []staleResumeBlock) {
 }
 
 // protectUnknownEffectResume 把 Effect Journal 仍无法证明已 settled 的
-// TaskID 对应非终态快照改为 blocked quarantine。这个保护不受
-// --resume 影响：显式恢复只确认使用快照，不能把 unknown Shell/消息
-// 变成可静默重放的已知操作。
-func protectUnknownEffectResume(snap *session.Snapshot, decisions []effect.RecoveryDecision, now time.Time) (*session.Snapshot, []staleResumeBlock) {
+// TaskID 对应非终态快照改为 blocked quarantine。这个保护优先于通用
+// no-auto-run 守卫：unknown Shell/消息需要更具体的阻断原因。
+func protectUnknownEffectResume(snap *session.Snapshot, decisions []effect.RecoveryDecision, now time.Time) (*session.Snapshot, []resumeBlock) {
 	if snap == nil || len(decisions) == 0 {
 		return snap, nil
 	}
@@ -106,7 +103,7 @@ func protectUnknownEffectResume(snap *session.Snapshot, decisions []effect.Recov
 	guarded := *snap
 	guarded.Tasks = append([]session.TaskSnapshot(nil), snap.Tasks...)
 	completedAt := now.UTC().Format(time.RFC3339Nano)
-	var blocks []staleResumeBlock
+	var blocks []resumeBlock
 	for i := range guarded.Tasks {
 		task := &guarded.Tasks[i]
 		if model.IsTerminal(model.TaskStatus(task.Status)) {
@@ -124,7 +121,7 @@ func protectUnknownEffectResume(snap *session.Snapshot, decisions []effect.Recov
 			"effect_recovery_quarantine: 任务有 %d 条副作用结果仍 unknown（%s）；为避免重复 Shell/消息/合并，恢复时已阻断，需人工或 Scheduler 核验后 replan",
 			len(unknown), strings.Join(ids, ", "),
 		)
-		blocks = append(blocks, staleResumeBlock{
+		blocks = append(blocks, resumeBlock{
 			TaskID: task.ID, PrevStatus: task.Status, Reason: reason,
 			Cause: "effect_recovery_unknown",
 		})
@@ -173,70 +170,31 @@ func unresolvedEffectTaskReasons(decisions []effect.RecoveryDecision) map[string
 	return out
 }
 
-const snapshotFutureSkewTolerance = time.Minute
-
-// prepareRecoveredSnapshot applies the stale automatic-resume guard to the
-// recovered snapshot before any task fact is imported.
-func prepareRecoveredSnapshot(sys *System, snap *session.Snapshot, explicit bool, maxIdle time.Duration, now time.Time) (*session.Snapshot, []staleResumeBlock) {
+// guardRecoveredSnapshotNoAutoResume 把进入会话（--resume / 解冻）时恢复的
+// 快照中的全部非终态任务阻断为 blocked（2026-08 语义）：进程启动永远是全新
+// 会话，历史会话只经显式入口进入，且进入时不自动续跑——非终态任务作为
+// 历史事实保留在公告板上供 Scheduler 参考，续跑由用户提交新提示词驱动。
+// 浅拷贝语义与 protectUnknownEffectResume 一致：先复制 Tasks 再改写，
+// 不反向污染 SessionManager 持有的原始快照。
+func guardRecoveredSnapshotNoAutoResume(snap *session.Snapshot, now time.Time) (*session.Snapshot, []resumeBlock) {
 	if snap == nil {
 		return nil, nil
 	}
-	prepared := *snap
-	return protectStaleAutomaticResume(&prepared, explicit, maxIdle, now)
-}
-
-func protectStaleAutomaticResume(snap *session.Snapshot, explicit bool, maxIdle time.Duration, now time.Time) (*session.Snapshot, []staleResumeBlock) {
-	if snap == nil || explicit || maxIdle <= 0 {
-		return snap, nil
-	}
-
-	savedAt, err := time.Parse(time.RFC3339Nano, snap.SavedAt)
-	if err != nil {
-		savedAt, err = time.Parse(time.RFC3339, snap.SavedAt)
-	}
-	future := err == nil && savedAt.After(now.Add(snapshotFutureSkewTolerance))
-	stale := err != nil || future
-	if !stale {
-		stale = !now.Before(savedAt.Add(maxIdle))
-	}
-	if !stale {
-		return snap, nil
-	}
-
 	guarded := *snap
 	guarded.Tasks = append([]session.TaskSnapshot(nil), snap.Tasks...)
-	// Even a genuinely unread old message may wake an agent and recreate work.
-	// Automatic stale recovery therefore restores no mailbox payload; an
-	// explicit --resume remains the opt-in path for replaying unread mail.
-	guarded.Mailboxes = nil
 	completedAt := now.UTC().Format(time.RFC3339Nano)
-	reason := fmt.Sprintf(
-		"stale_resume_guard: 自动恢复快照已闲置超过 %s；为避免重放副作用，任务已阻断。确认需要恢复时请显式使用 --resume <session-id>",
-		maxIdle,
-	)
-	if err != nil {
-		reason = fmt.Sprintf(
-			"stale_resume_guard: 自动恢复快照的 saved_at=%q 无法验证；为避免重放副作用，任务已阻断。确认需要恢复时请显式使用 --resume <session-id>",
-			snap.SavedAt,
-		)
-	} else if future {
-		reason = fmt.Sprintf(
-			"stale_resume_guard: 自动恢复快照的 saved_at=%q 超前于当前时间超过 %s；为避免重放副作用，任务已阻断。确认需要恢复时请显式使用 --resume <session-id>",
-			snap.SavedAt,
-			snapshotFutureSkewTolerance,
-		)
-	}
-
-	var protected []staleResumeBlock
+	reason := "no_auto_resume: 进入会话不再自动续跑；请提交新提示词，Scheduler 将参考历史与公告板重新规划"
+	var blocks []resumeBlock
 	for i := range guarded.Tasks {
 		task := &guarded.Tasks[i]
 		if model.IsTerminal(model.TaskStatus(task.Status)) {
 			continue
 		}
-		protected = append(protected, staleResumeBlock{
+		blocks = append(blocks, resumeBlock{
 			TaskID:     task.ID,
 			PrevStatus: task.Status,
 			Reason:     reason,
+			Cause:      "no_auto_resume",
 		})
 		task.Status = string(model.TaskStatusBlocked)
 		task.Error = reason
@@ -245,7 +203,7 @@ func protectStaleAutomaticResume(snap *session.Snapshot, explicit bool, maxIdle 
 		task.CompletedAt = completedAt
 		revokeSnapshotLease(task)
 	}
-	return &guarded, protected
+	return &guarded, blocks
 }
 
 // restoreOrReconcileRuntime restores the shutdown Task snapshot when one
@@ -267,13 +225,13 @@ func restoreOrReconcileRuntime(sys *System, snap *session.Snapshot) error {
 // startup is deliberately failing closed. The dispatcher is installed only
 // after all durable facts and writer-only stale audit events have been settled
 // successfully.
-func restoreRuntimeBeforeReactorActivation(sys *System, snap *session.Snapshot, blocks []staleResumeBlock, dispatcher trace.Dispatcher) error {
+func restoreRuntimeBeforeReactorActivation(sys *System, snap *session.Snapshot, blocks []resumeBlock, dispatcher trace.Dispatcher) error {
 	trace.SetDefaultDispatcher(nil)
 	wireSessionMemory(sys)
 	if err := restoreOrReconcileRuntime(sys, snap); err != nil {
 		return err
 	}
-	emitStaleResumeBlocks(blocks)
+	emitResumeBlocks(blocks)
 	trace.SetDefaultDispatcher(dispatcher)
 	return nil
 }
@@ -524,41 +482,17 @@ func (s *System) resultSnapshotWithVersion() (*session.ResultSnapshot, uint64) {
 	return &cp, s.resultVersion
 }
 
-// resetResultIfVersion 仅在结果仍是切换前观察到的那一代时清空它，返回
-// 清空后的 generation。若有更新结果并发到达则保持新值不动。
-func (s *System) resetResultIfVersion(expected uint64) (uint64, bool) {
+// clearResult 清空当前结果快照。session 解冻路径专用：调用方已持 snapshotMu，
+// 与 recordResult/recordTextOnlyPersisted 串行（它们同样经 snapshotMu 进入），
+// 不存在并发新结果，无需 CAS 版本令牌。
+func (s *System) clearResult() {
 	if s == nil {
-		return 0, false
+		return
 	}
 	s.resultMu.Lock()
 	defer s.resultMu.Unlock()
-	if s.resultVersion != expected {
-		return s.resultVersion, false
-	}
 	s.lastResult = nil
 	s.resultVersion++
-	return s.resultVersion, true
-}
-
-// restoreResultIfVersion 是 resetResultIfVersion 的回滚 CAS：只有清空后没有
-// 新结果写入时才恢复旧值，避免失败回滚覆盖切换窗口内产生的新结果。
-func (s *System) restoreResultIfVersion(expected uint64, result *session.ResultSnapshot) bool {
-	if s == nil {
-		return false
-	}
-	s.resultMu.Lock()
-	defer s.resultMu.Unlock()
-	if s.resultVersion != expected {
-		return false
-	}
-	if result == nil {
-		s.lastResult = nil
-	} else {
-		cp := *result
-		s.lastResult = &cp
-	}
-	s.resultVersion++
-	return true
 }
 
 // loadInitialResult 决定启动时 TUI 的初始结果。唯一来源是上次 Shutdown 落盘的

@@ -83,3 +83,20 @@ func (r *TaskCancelRegistry) Remove(taskID string) {
 	delete(r.contexts, taskID)
 	delete(r.sources, taskID)
 }
+
+// Reset 取消并清理全部 per-task 条目，registry 回到刚构造状态。
+// 所有已创建的 cancel context 都会被 cancel（context 规范要求创建的
+// cancel context 必须被 cancel），cancels / contexts / sources 三张表
+// 一并清空（CancelWithSource 路径会把 sources 条目留到任务终态之后，
+// 整体清扫时必须覆盖）。用于 /new force 的整体运行时清扫。
+func (r *TaskCancelRegistry) Reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, cancel := range r.cancels {
+		cancel()
+	}
+	r.cancels = make(map[string]context.CancelFunc)
+	r.contexts = make(map[string]context.Context)
+	r.sources = make(map[string]string)
+}

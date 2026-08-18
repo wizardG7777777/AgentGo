@@ -9,14 +9,16 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/agenttemplate"
+	"agentgo/internal/graph"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
 	"agentgo/internal/tools/schema"
 )
 
 // AgentTemplateGroup exposes Scheduler-only discovery and provisioning. It
-// creates runtime Team resources, never DAG nodes; Scheduler must use the
-// returned event_type in a later publish_task call.
+// creates runtime Team resources, never Graph nodes. Graph-first callers bind
+// the Team to their chosen graph_id before using the returned event_type in a
+// node metadata.route; omitting graph_id preserves the legacy task scope.
 type AgentTemplateGroup struct {
 	Catalog     *agenttemplate.Catalog
 	Provisioner agenttemplate.Provisioner
@@ -33,10 +35,11 @@ func (g AgentTemplateGroup) Register(r *agent.ToolRegistry) {
 	if g.Provisioner == nil || g.Store == nil || g.Holder == nil {
 		return
 	}
-	r.Register("provision_agent_team", "从一个精确版本模板创建按发起 controller 任务归属的 Agent Team。成功返回 ready event_type；必须等下一轮读到真实返回值后再发布 Task，禁止猜测 route。",
+	r.Register("provision_agent_team", "从精确版本模板创建 Agent Team。Graph-first 路径必须预先选定 graph_id 并在本调用传入，Team 将存活到该 Graph 终态；省略 graph_id 仅保留 legacy task-scoped 语义。成功返回 ready event_type，必须等下一轮读到真实值后再写入节点 route，禁止猜测。",
 		schema.Object().
 			String("template_ref", "精确引用 namespace/name@version，例如 builtin/generalist@1", true).
 			String("purpose", "该 Team 的职责", true).
+			String("graph_id", "Graph-first 路径的全局唯一 Graph ID；必须与随后 submit_graph 的 graph_id 完全一致。Graph controller 内可省略以自动继承当前 Graph", false).
 			Int("replicas", "同质副本数，默认 1，受模板和进程预算限制", false).
 			Build(), g.provision)
 }
@@ -56,10 +59,24 @@ func (g AgentTemplateGroup) provision(ctx context.Context, args map[string]any) 
 	}
 	ref, _ := args["template_ref"].(string)
 	purpose, _ := args["purpose"].(string)
+	graphID, _ := args["graph_id"].(string)
 	ref = strings.TrimSpace(ref)
 	purpose = strings.TrimSpace(purpose)
+	graphID = strings.TrimSpace(graphID)
 	if ref == "" || purpose == "" {
 		return "", fmt.Errorf("template_ref and purpose are required")
+	}
+	if task.GraphID != "" {
+		if graphID == "" {
+			graphID = task.GraphID
+		} else if graphID != task.GraphID {
+			return "", fmt.Errorf("graph_id %q 与当前 Graph %q 不一致，拒绝跨 Graph provision", graphID, task.GraphID)
+		}
+	}
+	if graphID != "" {
+		if err := graph.ValidateGraphID(graphID); err != nil {
+			return "", fmt.Errorf("graph_id 非法: %w", err)
+		}
 	}
 	replicas := 1
 	if raw, exists := args["replicas"]; exists {
@@ -82,7 +99,7 @@ func (g AgentTemplateGroup) provision(ctx context.Context, args map[string]any) 
 		return "", fmt.Errorf("replicas must be between 1 and 32")
 	}
 	result, err := g.Provisioner.Provision(ctx, agenttemplate.ProvisionRequest{
-		ControllerTaskID: task.ID, TemplateRef: ref,
+		ControllerTaskID: task.ID, GraphID: graphID, TemplateRef: ref,
 		Purpose: purpose, Replicas: replicas,
 	})
 	if err != nil {

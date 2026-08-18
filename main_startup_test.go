@@ -139,32 +139,21 @@ startup_probe: "off"
 		t.Fatalf("stdout should contain shutdown message, got: %s", result.stdout)
 	}
 	// V6 Graph 运行桥接（C5a）装配冒烟：图持久化目录（与 artifacts 同基
-	// .agentgo/state/graphs）应真实创建，启动日志（system.log，启动期诊断
-	// 全部收敛到文件而非 stdout）应含桥接完成行。
+	// .agentgo/state/graphs）应真实创建。
 	if fi, err := os.Stat(filepath.Join(tmpDir, ".agentgo", "state", "graphs")); err != nil || !fi.IsDir() {
 		t.Fatalf("graph 持久化目录应在 project_root 下创建: err=%v", err)
 	}
-	var logCandidates []string
-	for _, pattern := range []string{
-		filepath.Join(tmpDir, ".agentgo", "system.log"),
-		filepath.Join(tmpDir, ".agentgo", "sessions", "*", "logs", "system.log"),
-	} {
-		matches, err := filepath.Glob(pattern)
-		if err != nil {
-			t.Fatalf("glob system.log: %v", err)
-		}
-		logCandidates = append(logCandidates, matches...)
+	// 2026-08 二期空会话丢弃冒烟：本次运行未提交任何用户输入，Session 是空
+	// 会话——Shutdown 应删除其目录（含其中 system.log），stdout 报告丢弃，
+	// sessions 根下不留 sess-* 残骸（active-session 指针一并删除）。
+	if !strings.Contains(result.stdout, "空会话（未提交实际任务）已丢弃") {
+		t.Fatalf("stdout 应报告空会话丢弃: %s", result.stdout)
 	}
-	bridgeLogged := false
-	for _, p := range logCandidates {
-		data, err := os.ReadFile(p)
-		if err == nil && strings.Contains(string(data), "Graph Runtime 桥接完成") {
-			bridgeLogged = true
-			break
-		}
+	if matches, err := filepath.Glob(filepath.Join(tmpDir, ".agentgo", "sessions", "sess-*")); err != nil || len(matches) != 0 {
+		t.Fatalf("空会话目录应被丢弃: matches=%v err=%v", matches, err)
 	}
-	if !bridgeLogged {
-		t.Fatalf("system.log 应含「Graph Runtime 桥接完成」启动行（candidates=%v）", logCandidates)
+	if _, err := os.Stat(filepath.Join(tmpDir, ".agentgo", "sessions", "active-session")); !os.IsNotExist(err) {
+		t.Fatalf("无剩余会话时 active-session 指针应删除: err=%v", err)
 	}
 }
 

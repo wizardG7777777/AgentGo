@@ -59,10 +59,12 @@ type Summary struct {
 }
 
 // ProvisionRequest asks the runtime to create or reuse one homogeneous team.
-// ControllerTaskID 即 Team 的归属（owner）：发起 provision 的 Scheduler
-// controller 任务 ID，Team 的生命周期挂在该任务的终态上。
+// ControllerTaskID is always retained as provisioning provenance. GraphID,
+// when non-empty, moves runtime ownership to that durable Graph; otherwise the
+// Team remains a legacy controller-task-scoped resource.
 type ProvisionRequest struct {
 	ControllerTaskID string
+	GraphID          string
 	TemplateRef      string
 	Purpose          string
 	Replicas         int
@@ -73,6 +75,7 @@ type ProvisionRequest struct {
 type ProvisionResult struct {
 	TeamID         string   `json:"team_id"`
 	EventType      string   `json:"event_type"`
+	GraphID        string   `json:"graph_id,omitempty"`
 	TemplateRef    string   `json:"template_ref"`
 	TemplateDigest string   `json:"template_digest"`
 	AgentIDs       []string `json:"agent_ids"`

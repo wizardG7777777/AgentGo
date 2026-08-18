@@ -46,6 +46,7 @@ type ExecuteResult struct {
 	ToolCalled       bool
 	Finalized        bool           // 由 FinalizationChecker 设置，表示任务已完成
 	AssistantContent string         // LLM 原始回复文本（assistant 消息的 content）
+	Reasoning        string         // provider 返回的原始明文思维链（若有）
 	ToolCalls        []llm.ToolCall // LLM 请求的工具调用列表
 	ToolResults      []ToolResult   // 每个 tool call 对应的执行结果
 	PromptTokens     int            // 本次 LLM 调用消耗的 prompt tokens
@@ -167,8 +168,12 @@ type Agent struct {
 
 	// IsUserFacing 标记此 agent 是否直接对话用户（典型为 scheduler）。
 	//
-	// true 时：任何"自然文本完成"路径（!result.ToolCalled）都会自动把 lastOutput
-	// 打印到 stdout，无需 LLM 显式调用 report_done。
+	// true 时：非 Graph 任务的"自然文本完成"路径
+	//（!result.ToolCalled）会自动把 lastOutput 写入用户结果通道，
+	// 无需 LLM 显式调用 report_done。Graph controller 的自然文本
+	// 只是当前节点 Result，必须等图到达 end 后由 graph_ended 唤醒的
+	// 独立非图 Scheduler task 统一向用户收官，不得中途写入
+	// ResultOutput。
 	//
 	// false 时（默认，worker / explorer 行为）：自然完成不打印——它们的输出由
 	// scheduler 通过 board snapshot / 依赖结果注入间接消费。
@@ -251,13 +256,15 @@ type Agent struct {
 
 // publishCompletedTurn 为一次 TaskExecutor 调用发布恰好一个不可变的
 // UI/Session 轮次事实。优先使用公开 assistant 文本；仅填写 Output 的自然
-// 文本 executor 保持兼容。工具参数/结果与 provider reasoning 元数据有意排除。
+// 文本 executor 保持兼容。工具参数/结果排除，provider 返回的明文 reasoning
+// 作为独立字段保留。
 func (a *Agent) publishCompletedTurn(
 	turnID, taskID string,
 	loop int,
 	result ExecuteResult,
 	execErr error,
 	lastStreamText string,
+	lastStreamReasoning string,
 ) {
 	if a == nil || a.StreamOutput == nil || turnID == "" {
 		return
@@ -268,6 +275,10 @@ func (a *Agent) publishCompletedTurn(
 	}
 	if text == "" {
 		text = lastStreamText
+	}
+	reasoning := result.Reasoning
+	if reasoning == "" {
+		reasoning = lastStreamReasoning
 	}
 	toolNames := make([]string, 0, len(result.ToolCalls))
 	for _, call := range result.ToolCalls {
@@ -286,6 +297,7 @@ func (a *Agent) publishCompletedTurn(
 		StreamID:  turnID,
 		Loop:      loop,
 		Text:      text,
+		Reasoning: reasoning,
 		Done:      true,
 		Error:     errText,
 		ToolCalls: toolNames,
@@ -333,8 +345,9 @@ func (a *Agent) emitTextOnlySubmissionIfNoArtifacts(taskID, content string, loop
 
 // emitTextOnlySubmissionIfNoArtifactsOpt 与上同，recordSnapshot=false 时仅
 // 落盘 + 发 trace 事件，不触发 OnTextOnlyPersisted 覆盖 ResultSnapshot——
-// 供 finalization 短路路径使用：report_done 已通过 ResultOutput 记录了权威
-// 结果，pre-tool 的 lastOutput 不应再覆盖它（A4×E8 接缝修复）。
+// 供两类内部文本使用：finalization 短路时 report_done 已记录权威结果，
+// Graph controller 自然完成时正文只是节点 Result；二者都不得再覆盖会话级
+// ResultSnapshot。
 func (a *Agent) emitTextOnlySubmissionIfNoArtifactsOpt(taskID, content string, loopsUsed int, recordSnapshot bool) {
 	if content == "" || a.Store == nil {
 		return
@@ -649,7 +662,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// 工具视图换入（Lease 驱动，取代旧直接读 task.Capability.Tools 的短路）：
 	// 视图 = BusinessTools ∪ ControlTools——显式声明漏带控制工具时节点仍能
 	// 收尾。并集覆盖注册全集时跳过换入（恒等变换，无能力声明任务零开销）。
-	if a.ToolSwapper != nil && leaseViewNeedsSwap(a.ToolSwapper.ToolRegistry(), lease) {
+	if a.ToolSwapper != nil && leaseViewNeedsSwap(a.ToolSwapper.ToolRegistry(), task, lease) {
 		full := a.ToolSwapper.ToolRegistry()
 		filtered := full.Filtered(lease.ToolUnion())
 		old := a.ToolSwapper.SwapToolRegistry(filtered)
@@ -803,7 +816,6 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 
 	// Layer 2: token 累计跟踪，用于触发摘要压缩
 	var totalPromptTokens int
-	summarized := false // 每次任务执行最多触发一次摘要压缩
 
 	compactThreshold := a.CompactTokenThreshold
 	if compactThreshold <= 0 {
@@ -814,6 +826,63 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		keepRecent = 3
 	}
 
+	// emitCancellation 统一处理两种取消观测窗口：循环顶部已经看到 ctx
+	// cancelled，以及 LLM/工具调用阻塞期间才发生取消、Execute 返回后才重新
+	// 获得控制权。后者过去会误入 handleFailure，导致 Store 已是 cancelled，
+	// trace 却没有 task_cancelled，CLI 仍把任务显示为 processing。
+	emitCancellation := func(loop int) {
+		cancelSource := CancelSourceFromContext(ctx)
+		if cancelSource == "" && a.CancelRegistry != nil {
+			cancelSource = a.CancelRegistry.Source(taskID)
+		}
+		if cancelSource != "" {
+			terminatingCause = "react_loop_exit:cancel:" + cancelSource
+		} else {
+			terminatingCause = "react_loop_exit:cancel"
+		}
+		enterTerminating(terminatingCause)
+		// FailTaskBySystem also cancels the task context so the worker exits.
+		// In that case the Store has already emitted the authoritative failed
+		// terminal event; emitting cancelled here would create contradictory
+		// terminal facts. A real cancellation has Store status cancelled and
+		// remains observable. Pending (retry) and other terminal states are
+		// likewise owned by their state-transition path.
+		emitCancelled := true
+		if current, getErr := a.Store.GetTask(taskID); getErr == nil && current != nil {
+			emitCancelled = current.Status == model.TaskStatusProcessing ||
+				current.Status == model.TaskStatusCancelled
+		}
+		if !emitCancelled {
+			return
+		}
+		reason := "context cancelled"
+		if err := ctx.Err(); err != nil {
+			reason = err.Error()
+		}
+		trace.Emit(trace.Event{
+			Kind:    trace.KindTaskCancelled,
+			TaskID:  taskID,
+			AgentID: a.ID,
+			Loop:    loop,
+			Reason:  reason,
+			Transition: &trace.Transition{
+				PrevStatus:   string(model.TaskStatusProcessing),
+				NewStatus:    string(model.TaskStatusCancelled),
+				CancelSource: cancelSource,
+			},
+		})
+	}
+	isAuthoritativeCancellation := func() bool {
+		if CancelSourceFromContext(ctx) != "" {
+			return true
+		}
+		if a.CancelRegistry != nil && a.CancelRegistry.Source(taskID) != "" {
+			return true
+		}
+		current, getErr := a.Store.GetTask(taskID)
+		return getErr == nil && current != nil && current.Status == model.TaskStatusCancelled
+	}
+
 	// V6：ReAct 循环不再有固定轮数上限（docs/nextUpgrade-V6.md §5 升级思路
 	// 5/6/8）。循环只经以下路径退出：结构化终态（自然完成 / finalization
 	// 短路）、ctx 取消（watchdog / 用户 / 系统）、错误处理（重试回滚或终止）、
@@ -822,43 +891,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	for i := 0; ; i++ {
 		select {
 		case <-ctx.Done():
-			// 2026-04-25 P1 #2：取消类终态 trace 事件。由外部（watchdog /
-			// cancel_task / 用户 /cancel / agent 关停）触发的 ctx 取消。
-			cancelSource := CancelSourceFromContext(ctx)
-			if cancelSource == "" && a.CancelRegistry != nil {
-				cancelSource = a.CancelRegistry.Source(taskID)
-			}
-			if cancelSource != "" {
-				terminatingCause = "react_loop_exit:cancel:" + cancelSource
-			} else {
-				terminatingCause = "react_loop_exit:cancel"
-			}
-			enterTerminating(terminatingCause)
-			// FailTaskBySystem also cancels the task context so the worker exits.
-			// In that case the Store has already emitted the authoritative failed
-			// terminal event; emitting cancelled here would create contradictory
-			// terminal facts. A real cancellation has Store status cancelled and
-			// remains observable. Pending (retry) and other terminal states are
-			// likewise owned by their state-transition path.
-			emitCancelled := true
-			if current, getErr := a.Store.GetTask(taskID); getErr == nil && current != nil {
-				emitCancelled = current.Status == model.TaskStatusProcessing ||
-					current.Status == model.TaskStatusCancelled
-			}
-			if emitCancelled {
-				trace.Emit(trace.Event{
-					Kind:    trace.KindTaskCancelled,
-					TaskID:  taskID,
-					AgentID: a.ID,
-					Loop:    i,
-					Reason:  ctx.Err().Error(),
-					Transition: &trace.Transition{
-						PrevStatus:   string(model.TaskStatusProcessing),
-						NewStatus:    string(model.TaskStatusCancelled),
-						CancelSource: cancelSource,
-					},
-				})
-			}
+			emitCancellation(i)
 			return
 		default:
 		}
@@ -909,7 +942,8 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			cause := "finalization_short_circuit"
 			submitEvent := ""
 			submitVerdict := ""
-			submitEvidenceItems := ""
+			submitCitedEvidence := ""
+			submitResultJSON := ""
 			submitStatus := ""
 			submitBlockedReason := ""
 			submitSummary := ""
@@ -919,7 +953,8 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					cause = "submit_task_result"
 					submitEvent = sub.Event
 					submitVerdict = sub.Verdict
-					submitEvidenceItems = sub.EvidenceItems
+					submitCitedEvidence = sub.CitedEvidence
+					submitResultJSON = sub.ResultJSON
 					submitStatus = sub.Status
 					submitBlockedReason = sub.BlockedReason
 					submitSummary = sub.Summary
@@ -930,12 +965,20 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				}
 			}
 			// 结构化 blocked（V6 §5）：与 completed 路径分岔——同一收尾事务内
-			// 先落 blocked 终态（durable）、再为**非图任务**发布 replan 唤醒任务；
+			// 原子落 fields + 正文 + blocked 终态（durable），再为**非图任务**
+			// 发布 replan 唤醒任务；
 			// 不走 workspace 合并 / SubmitResult（blocked 不是成功终态，隔离
 			// 副本不合并回主根），blocked 也永远不满足下游依赖。
 			if submitStatus == SubmitStatusBlocked {
+				// blocked 仍然是一份有结果的终态：自定义诊断/分流字段必须与
+				// 状态迁移同时 durable，Graph 才能在 explicit blocked 分支上消费。
+				// event/verdict 仍不写，避免伪装为成功事件或验收结论。
+				blockedFields := make(map[string]string, 1)
+				if submitResultJSON != "" {
+					blockedFields[StructuredResultStorageKey] = submitResultJSON
+				}
 				enterTerminating("react_loop_exit:agent_reported_blocked")
-				a.commitStructuredBlocked(task, taskMem, taskID, resultText, submitBlockedReason, submitSummary)
+				a.commitStructuredBlocked(task, taskMem, taskID, resultText, blockedFields, submitBlockedReason, submitSummary)
 				return
 			}
 			// 写时复制隔离：合并必须在 SubmitResult（标记 completed）之前完成。
@@ -945,41 +988,49 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				enterTerminating(terminatingCause)
 				return
 			}
-			// Graph 事件键（C5b）：submit_task_result 携带的 event 在 SubmitResult 前
-			// 写入 Results["event"]，graph-terminal-feed 随后把它并入 TerminalFact.Result
-			// 驱动事件形态转移条件。位置约束：必须在 workspace 合并成功之后（合并失败
-			// 任务转 failed，不应留下 ready 类事件键误导路由）、SubmitResult 之前
-			// （Results 键随完成快照一起对外可见）。Store 不支持时静默跳过。
+			// 自定义 Result carrier、三个专用协议字段、agent 正文与 completed
+			// 状态必须在同一 Store 临界区原子提交。字段只能在 workspace 合并
+			// 成功后进入终态快照；blocked 终态走上方专用原子分支。
+			structuredFields := make(map[string]string, 4)
+			if submitResultJSON != "" {
+				structuredFields[StructuredResultStorageKey] = submitResultJSON
+			}
+			// Graph 事件键（C5b）：submit_task_result 携带的 event 随 completed
+			// 快照一次性写入 Results["event"]，graph-terminal-feed 随后用它驱动
+			// 事件形态转移。Store 不支持原子提交或提交失败时任务 fail-closed。
 			if submitEvent != "" {
-				if err := store.RecordResultField(a.Store, taskID, "event", submitEvent); err != nil {
-					log.Printf("[agent %s] RecordResultField(event) error: %v", a.ID, err)
-				}
+				structuredFields["event"] = submitEvent
 			}
 			// Graph 验收键（C6b）：与 event 同理，submit_task_result 携带的
-			// verdict 在 SubmitResult 前写入 Results["verdict"]，驱动 acceptance
+			// verdict 与 completed 同时写入 Results["verdict"]，驱动 acceptance
 			// 节点的 $.verdict 路径形态转移条件。
 			if submitVerdict != "" {
-				if err := store.RecordResultField(a.Store, taskID, "verdict", submitVerdict); err != nil {
-					log.Printf("[agent %s] RecordResultField(verdict) error: %v", a.ID, err)
-				}
+				structuredFields["verdict"] = submitVerdict
 			}
-			// Graph 验收证据键（G1b）：evidence_items 的原始 JSON 数组写入
-			// Results["evidence"]，由 Graph Runtime 的服务端核验器逐条核验
-			// （缺失或核验不通过时 verdict 不被采信）。
-			if submitEvidenceItems != "" {
-				if err := store.RecordResultField(a.Store, taskID, "evidence", submitEvidenceItems); err != nil {
-					log.Printf("[agent %s] RecordResultField(evidence) error: %v", a.ID, err)
-				}
+			// Graph 验收证据引用键：cited_evidence 的逗号分隔引用清单写入
+			// Results["cited_evidence"]，由 Graph Runtime 的 acceptance 谱系
+			// 核验（越谱系引用时 verdict 不被采信）。
+			if submitCitedEvidence != "" {
+				structuredFields["cited_evidence"] = submitCitedEvidence
 			}
 			enterTerminating(terminatingCause)
-			if err := a.Store.SubmitResult(a.ID, taskID, resultText); err != nil {
-				log.Printf("[agent %s] SubmitResult error: %v", a.ID, err)
+			var submitErr error
+			if cause == "submit_task_result" {
+				submitErr = store.SubmitResultWithFields(a.Store, a.ID, taskID, resultText, structuredFields)
+			} else {
+				submitErr = a.Store.SubmitResult(a.ID, taskID, resultText)
+			}
+			if submitErr != nil {
+				log.Printf("[agent %s] SubmitResult error: %v", a.ID, submitErr)
 				trace.Emit(trace.Event{
 					Kind:    trace.KindError,
 					TaskID:  taskID,
 					AgentID: a.ID,
-					Error:   "SubmitResult failed: " + err.Error(),
+					Error:   "SubmitResult failed: " + submitErr.Error(),
 				})
+				if cause == "submit_task_result" {
+					a.handleStructuredTerminalCommitFailure(task, taskID, submitErr)
+				}
 			} else {
 				// 跨轮短路也要 emit，否则 trace list 将任务错标为 running/loops=0。
 				// LoopsUsed=i（不是 i+1）——本轮 LLM 调用尚未发生即短路退出。
@@ -1033,6 +1084,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		}
 		turnID := fmt.Sprintf("%s:%s:%d:%d", a.ID, taskID, i, time.Now().UnixNano())
 		lastStreamText := ""
+		lastStreamReasoning := ""
 		if a.Activity != nil || a.StreamOutput != nil {
 			lastPublished := time.Time{}
 			execCtx = llm.WithStreamHandler(execCtx, func(ev llm.StreamEvent) {
@@ -1042,7 +1094,10 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 						a.Activity.LLMDelta(a.ID, taskID, i, ev.AccumulatedContent)
 					}
 				}
-				if a.StreamOutput == nil || (ev.AccumulatedContent == "" && ev.Error == "") {
+				if ev.AccumulatedReasoning != "" {
+					lastStreamReasoning = ev.AccumulatedReasoning
+				}
+				if a.StreamOutput == nil || (ev.AccumulatedContent == "" && ev.AccumulatedReasoning == "" && ev.Error == "") {
 					return
 				}
 				now := time.Now()
@@ -1053,12 +1108,25 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				a.StreamOutput(output.Event{
 					Kind: output.KindStream, AgentID: a.ID, TaskID: taskID,
 					StreamID: turnID, Loop: i, Text: ev.AccumulatedContent,
-					Done: ev.Done, Error: ev.Error,
+					Reasoning: ev.AccumulatedReasoning,
+					Done:      ev.Done, Error: ev.Error,
 				})
 			})
 		}
 		result, execErr := a.Execute(execCtx, task, depResults, histCopy)
-		a.publishCompletedTurn(turnID, taskID, i, result, execErr, lastStreamText)
+		a.publishCompletedTurn(turnID, taskID, i, result, execErr, lastStreamText, lastStreamReasoning)
+
+		// 取消可能发生在 Execute 内部。此时循环顶部的 select 已经过去，
+		// 必须在把 context.Canceled 当成普通执行错误交给 handleFailure 之前
+		// 重新检查权威父 ctx，并补齐 task_cancelled 终态事实。
+		if ctx.Err() != nil && isAuthoritativeCancellation() {
+			a.Activity.LLMEnd(a.ID, taskID, i, "", 0, execErr)
+			// CM2：取消前保全本轮已结算的事实；finalize defer 会按 Store 中的
+			// cancelled 终态封存 Task Memory。
+			taskMem.checkpoint(a, taskID, i, "attempt_end")
+			emitCancellation(i)
+			return
+		}
 
 		if execErr != nil {
 			terminatingCause = "react_loop_exit:error"
@@ -1087,7 +1155,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			//     校对块），且 result.Output 在该路径下是工具 ack 串而非 summary
 			//
 			// 详见 Agent.IsUserFacing 字段注释。
-			if a.IsUserFacing && !result.ToolCalled && lastOutput != "" {
+			if a.IsUserFacing && task.GraphID == "" && !result.ToolCalled && lastOutput != "" {
 				// 结果块优先写 ResultOutput（KindResult 分类在产生处完成）；
 				// 未装配 ResultOutput 时回退 UserOutput（单 Writer 用法兼容）。
 				resultOut := a.ResultOutput
@@ -1140,6 +1208,21 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				a.handleFailure(task, taskID, &ErrRecoverable{Err: fmt.Errorf("%s", reason)}, history, manifestInfo)
 				return
 			}
+			// 磁盘兜底只证明文件当前存在，不会自动形成
+			// Graph artifact Evidence。在 SubmitResult 前逐项补登 durable
+			// ledger；失败按可恢复错误收口，任务不得进入 completed。
+			for _, recovered := range check.Recovered {
+				if err := a.Store.AppendArtifact(taskID, recovered); err != nil {
+					reason := fmt.Sprintf("磁盘恢复产物写入 durable artifact ledger 失败 path=%s: %v", recovered, err)
+					log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
+					trace.Emit(trace.Event{Kind: trace.KindError, TaskID: taskID, AgentID: a.ID, Error: reason})
+					terminatingCause = "react_loop_exit:error"
+					enterTerminating(terminatingCause)
+					taskMem.checkpoint(a, taskID, i, "attempt_end")
+					a.handleFailure(task, taskID, &ErrRecoverable{Err: fmt.Errorf("%s", reason)}, history, manifestInfo)
+					return
+				}
+			}
 			if len(check.Drifted) > 0 {
 				log.Printf("[agent %s] 任务 %s 路径漂移已容忍: %v", a.ID, taskID, check.Drifted)
 			}
@@ -1170,7 +1253,10 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					OutputLen: len(lastOutput),
 					LoopsUsed: i + 1,
 				})
-				a.emitTextOnlySubmissionIfNoArtifacts(taskID, lastOutput, i+1)
+				// Graph 节点的 text-only 正文是节点 Result，可以落盘审计，
+				// 但不得经 OnTextOnlyPersisted 覆盖会话级 ResultSnapshot；
+				// 只有非图任务（包括 graph_ended 唤醒）才是用户结果产生者。
+				a.emitTextOnlySubmissionIfNoArtifactsOpt(taskID, lastOutput, i+1, task.GraphID == "")
 				trace.Emit(trace.Event{
 					Kind:    trace.KindTaskCompleted,
 					TaskID:  taskID,
@@ -1219,20 +1305,22 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		// Layer 1: 清理旧的高输出工具结果
 		snipOldToolResults(history, keepRecent)
 
-		// Layer 2: token 累计超过阈值时触发摘要压缩（每次任务最多一次）
-		if !summarized && totalPromptTokens > compactThreshold {
+		// Layer 2: 本压缩周期内的 prompt token 累计超过阈值时压缩。
+		// 压缩后开启新的累计周期，长任务可以重复触发；旧实现每个任务只允许
+		// 一次，导致首次早压缩后 history 再次无界增长，47 轮调查最终把单任务
+		// prompt 消耗推到近百万 token。
+		if totalPromptTokens > compactThreshold {
 			tokensBefore := totalPromptTokens
-			entriesBefore := len(history)
 			// CM2：历史压缩前强制 checkpoint——即将被压缩的旧轮次其关键
 			// 事实须已沉淀进 Task Memory 并落盘。
 			taskMem.checkpoint(a, taskID, i, "history_compaction")
 			history = compressHistory(history, keepRecent)
-			summarized = true
+			totalPromptTokens = 0
 			strategy := fmt.Sprintf("summary+keep_recent=%d", keepRecent)
 			// CM1：回填压缩处置——后续轮次的 Manifest 中 history 段
 			// Disposition 记为 compressed:<strategy>。
 			manifestInfo.l2Strategy = strategy
-			log.Printf("[agent %s] 任务 %s 触发历史摘要压缩，当前 prompt tokens: %d", a.ID, taskID, totalPromptTokens)
+			log.Printf("[agent %s] 任务 %s 触发历史摘要压缩，本周期 prompt tokens: %d", a.ID, taskID, tokensBefore)
 			trace.Emit(trace.Event{
 				Kind:               trace.KindHistoryCompaction,
 				TaskID:             taskID,
@@ -1241,7 +1329,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				PromptTokensBefore: tokensBefore,
 				PromptTokensAfter:  0, // 实际值要等下次 LLM 调用才能拿到，这里只记录"压缩前"信号
 				Strategy:           strategy,
-				KeptEntries:        entriesBefore,
+				KeptEntries:        len(history),
 			})
 		}
 	}
@@ -1313,47 +1401,29 @@ type processingTaskBlocker interface {
 // completed，blocked 永远不满足依赖）。
 //
 // 收尾事务顺序（同一收尾路径内，终态先 durable）：
-//  1. 结果摘要保留在 task.Results[a.ID]（与 SubmitResult 同键位），阻塞原因
-//     由 store 写入 task.Error；event/verdict 键刻意不写——graph 的
-//     eventNameOf 让 Result["event"] 优先于终态映射，写入会把 blocked 节点
-//     错误路由成事件命中；
-//  2. processing → blocked（BlockProcessingTaskBySystem，cause=
-//     agent_reported_blocked 与系统兜底拦截区分）；Store 不支持该迁移时
-//     降级 failed——终态语义必须达成，不能让任务滞留 processing；
-//  3. 终态落盘后 emit task_result_committed（结构化 status/cause）；
-//  4. 非图任务发布通用 replan 唤醒任务（幂等键 <taskID>/replan）交
+//  1. Store 单临界区写入自定义 fields、task.Results[a.ID] 正文、task.Error
+//     阻塞原因并完成 processing -> blocked；event/verdict 键刻意不写；
+//  2. 终态落盘后 emit task_result_committed（结构化 status/cause）；
+//  3. 非图任务发布通用 replan 唤醒任务（幂等键 <taskID>/replan）交
 //     Scheduler 裁决；图任务由 graph-terminal-feed 回填驱动边路由。
 //     唤醒发布失败时终态事实保留，额外 emit error 事件。
-func (a *Agent) commitStructuredBlocked(task *model.Task, taskMem *taskMemRuntime, taskID, resultText, blockedReason, summary string) {
+func (a *Agent) commitStructuredBlocked(task *model.Task, taskMem *taskMemRuntime, taskID, resultText string, fields map[string]string, blockedReason, summary string) {
 	// blocked_reason 是 submit_task_result 经 schema 校验后的权威终态事实。
 	// 必须先写 Task Memory，再让 Store 发出 blocked 终态事件；异步
 	// Session promotion 随后等待 finalize 的 sealed checkpoint。
 	taskMem.recordBlockedReason(a, taskID, blockedReason)
 
-	// 结果摘要保留（best-effort，与 SubmitResult 同键位）：终态后公告板
-	// 快照与 Scheduler 仍能看到 agent 的自述与证据。
-	if err := store.RecordResultField(a.Store, taskID, a.ID, resultText); err != nil {
-		log.Printf("[agent %s] 任务 %s blocked 收尾写入结果摘要失败: %v", a.ID, taskID, err)
-	}
-
-	blocker, ok := a.Store.(processingTaskBlocker)
-	if !ok {
-		// Store 不支持 processing→blocked 时降级为 failed——终态语义必须达成，
-		// 不能让任务滞留 processing（与 runtime loop fuse 同款兜底）。
-		log.Printf("[agent %s] 任务 %s Store 不支持 BlockProcessingTaskBySystem，结构化 blocked 降级 FailTask", a.ID, taskID)
-		a.terminateTask(task, taskID, "agent 自报 blocked（store 不支持 blocked 迁移，降级 failed）: "+blockedReason, "agent_reported_blocked")
-		return
-	}
-	if err := blocker.BlockProcessingTaskBySystem(taskID, blockedReason, "agent_reported_blocked"); err != nil {
-		// 迁移失败（如并发取消已先落终态）：终态事实归竞态获胜方，不补发
-		// 唤醒任务，只留错误账本。
-		log.Printf("[agent %s] 任务 %s 结构化 blocked 终态迁移失败: %v", a.ID, taskID, err)
+	if err := store.CommitBlockedResult(a.Store, a.ID, taskID, resultText, fields, blockedReason, "agent_reported_blocked"); err != nil {
+		// 原子提交失败（包括并发取消已先落终态）：终态事实归竞态获胜方，
+		// 不补发唤醒任务，也不会遗留正文或 carrier 半状态。
+		log.Printf("[agent %s] 任务 %s 结构化 blocked 原子提交失败: %v", a.ID, taskID, err)
 		trace.Emit(trace.Event{
 			Kind:    trace.KindError,
 			TaskID:  taskID,
 			AgentID: a.ID,
-			Error:   "结构化 blocked 终态迁移失败: " + err.Error(),
+			Error:   "结构化 blocked 原子提交失败: " + err.Error(),
 		})
+		a.handleStructuredTerminalCommitFailure(task, taskID, err)
 		return
 	}
 
@@ -1380,6 +1450,14 @@ func (a *Agent) commitStructuredBlocked(task *model.Task, taskMem *taskMemRuntim
 			Error:   "blocked 终态已落盘，但 replan 唤醒任务发布失败: " + err.Error(),
 		})
 	}
+}
+
+// handleStructuredTerminalCommitFailure 只在结构化终态原子提交未生效时
+// 尝试把仍为 processing 的任务 fail-closed。若 cancelled/failed 已在竞争中
+// 先落终态，FailTask 会拒绝迁移，terminateTask 不会伪造 task_failed trace。
+func (a *Agent) handleStructuredTerminalCommitFailure(task *model.Task, taskID string, commitErr error) {
+	reason := fmt.Sprintf("结构化终态原子提交失败: %v", commitErr)
+	a.terminateTask(task, taskID, reason, "structured_result_persist_failed")
 }
 
 func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, history []HistoryEntry, manifestInfo *manifestSideInfo) {
@@ -1456,6 +1534,9 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 func (a *Agent) terminateTask(task *model.Task, taskID string, reason string, cause string) {
 	if err := a.Store.FailTask(a.ID, taskID, reason); err != nil {
 		log.Printf("[agent %s] FailTask error: %v", a.ID, err)
+		// 并发取消/阻塞/完成已经成为权威终态时，不能继续 emit 一个并未
+		// durable 的 failed 事实，也不能发送伪造的崩溃报告。
+		return
 	}
 	// 2026-04-25 P1 #2：失败终态 trace 事件。在此前 trace 只记 task_submitted /
 	// task_completed 两种成功终态，非成功路径对 trace reader 完全不可见。
@@ -1752,9 +1833,14 @@ func buildHistorySummary(history []HistoryEntry) string {
 				fmt.Fprintf(&sb, "[%s] ", tc.Name)
 			}
 		}
-		// 包含 assistant 内容（LLM 推理），截断到 200 字符
-		if entry.AssistantContent != "" {
-			content := entry.AssistantContent
+		// 包含 assistant 内容（LLM 推理）；重复 L2 压缩时，上一轮生成的
+		// summary 存在 Output 而没有 AssistantContent，必须把它继续折叠进
+		// 新摘要，不能在第二次压缩时静默丢掉更早的历史。
+		content := entry.AssistantContent
+		if content == "" && !entry.ToolCalled {
+			content = entry.Output
+		}
+		if content != "" {
 			if len(content) > 200 {
 				content = content[:200] + "..."
 			}

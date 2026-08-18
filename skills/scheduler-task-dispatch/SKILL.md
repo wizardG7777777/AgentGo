@@ -1,6 +1,6 @@
 ---
 name: scheduler-task-dispatch
-description: Guide AgentGo Scheduler agents to classify requests, choose live agent routes, build dependency-safe task DAGs, generate AgentKind or Reactor configuration, and respect Plan user-decision boundaries. Use when routing a user request, publishing dependent tasks, selecting or provisioning capabilities, configuring Scheduler dispatch, or diagnosing dispatch failures.
+description: Guide AgentGo Scheduler agents to apply Graph-first request routing, choose live agent routes, build durable GraphDocument execution contracts, provision capabilities, and respect Interaction and Graph ownership boundaries.
 ---
 
 # Scheduler Task Dispatch Skill
@@ -12,8 +12,8 @@ description: Guide AgentGo Scheduler agents to classify requests, choose live ag
 Scheduler 是 AgentGo 系统中唯一拥有完整工具能力的一等代理。其核心职责：
 
 1. **观察全局状态**：解析 Board Snapshot（tasks、resources、agents、agent_capabilities）
-2. **决策三选一**：A 类（闲聊/状态查询）→ 直接回答；B 类（只读操作）→ 自己调 tool；C 类（写文件/跑命令/复杂改造）→ publish_task 委派
-3. **生成执行代理配置表和 Reactor 规则**：将用户意图转化为结构化的任务分派和事件响应
+2. **Graph-first 决策**：所有用户请求都先表达为 Graph；简单请求退化为单个 controller 节点到 `end`，复杂请求再按真实数据依赖扩展节点、分支、barrier 与回边
+3. **编排节点与路由**：用 GraphDocument 表达节点、转移、验收与回边，再把 Agent 作为匹配 capability 的节点执行资源
 
 ### 1.1 用户 Interaction 边界
 
@@ -74,23 +74,21 @@ session_history:
 
 ---
 
-## 3. 决策层：A/B/C 三选一
+## 3. 决策层：Graph-first
 
-收到用户输入后，MUST 先判断请求类别：
+收到新用户输入后统一走 Graph，不再在 Direct 与 Graph 两条路径之间做前置选择：
 
-| 类别 | 定义 | 行动 | 示例 |
-|------|------|------|------|
-| **A** | 闲聊 / 系统状态查询 / 资源查询 | 直接自然语言回答。**MUST NOT publish_task** | "你好"、"worker-1 在做什么" |
-| **B** | 简单只读操作 | 自己调 read_file / list_dir / grep / glob / web_search / web_fetch | "读 main.go"、"grep TODO" |
-| **C** | 写文件 / 跑命令 / 多方向并行 / 复杂改造 | **publish_task 委派**给 Worker / Explorer | "修改 main.go 加日志"、"调研 docs/ 目录" |
-
-**默认假设：能自己干就自己干。** publish_task 至少多花一轮 LLM + 一次 worker poll 延迟。
+- 闲聊、快照状态或一次原子只读查询也要提交 Graph；最小形态是单个 controller 节点完成工作后转到 `end`。
+- 多步调查、Shell、写入、验证、外部研究、并行、条件分支、回边、审批或等待，按真实数据依赖扩展 Graph。
+- **只读不等于简单**：跨文件归纳、仓库审计、多来源调查都应建图，只是节点 capability 保持只读。
+- 建图前只允许为决定图形做一次轻量探测，MUST NOT 先做完主体工作再补装饰性 Graph。
+- 新用户请求 MUST NOT 用多个 `publish_task` 手工拼 DAG；`publish_task + report_done` 只保留为 legacy/恢复兼容路径。
 
 ---
 
 ## 4. 路由层：Event Type 选择逻辑
 
-当走到 C 类需委派时，按以下决策链选择 event_type：
+当 Graph 中的 agent/acceptance 节点需要执行 route 时，按以下决策链选择 `metadata.route`；legacy Task 的 `event_type` 使用同一套边界：
 
 ### 4.1 三步问自己
 
@@ -115,7 +113,7 @@ session_history:
 | `run_shell` | agent_capabilities 包含 "run_shell" |
 | `write_file` / `edit_file` | agent_capabilities 包含 "write_file" 和 "edit_file" |
 | `web_search` + `web_fetch`（只读） | agent_capabilities 包含两者；优先用 Explorer |
-| `submit_task_result` 的 `verdict`/`event`（Graph 验收） | MUST 路由到 acceptance.verify（或包含 submit_task_result 的验收 Agent） |
+| `submit_task_result.verdict`（Graph 验收，枚举 `pass/fixable/failed`） | MUST 路由到 acceptance.verify（或包含 submit_task_result 的验收 Agent） |
 
 ### 4.3 硬性约束
 
@@ -123,6 +121,21 @@ session_history:
 - **MUST NOT** 向不存在该 event_type 的队列发布——直接向用户说明无法完成的原因
 - **SHOULD** 当 `specialized_agents` 中 busy 等于 count 时，优先用另一个已存在且能力足够的 route；或 provision 新 Team
 - **MUST NOT** 给不具备 write_file/edit_file 的 route 声明 expected_artifacts
+
+### 4.4 Graph-scoped 动态 Team（铁律）
+
+Graph-first 请求需要动态能力时：
+
+1. Scheduler **MUST 先决定合法且全局唯一的 `graph_id`**；
+2. 调 `provision_agent_team` 时 **MUST 显式传同一个 `graph_id`**；
+3. 等下一轮读取返回的真实 `event_type`，再把它写入该 Graph 节点的 `metadata.route` 并 `submit_graph`；同一响应中 MUST NOT 猜 route；
+4. Team 从 provision 成功起归属 `graph:<graph_id>`。发起 provision 的 Scheduler task 终态不会回收它；只有 `graph_ended` 才停止实例并撤销 route；
+5. `submit_graph` / `patch_graph` 对产任务节点的 route owner scope 与 capability 做 fail-closed 校验。跨 Graph、legacy task-owned 或工具不足的 route 必须先修正，不能依赖 Watchdog 事后发现；
+6. 省略 `graph_id` 只用于 legacy `publish_task`；图内 controller 可省略以继承当前 Graph，但显式值不得指向另一个 Graph。
+
+相同 Graph 下相同 template ref、purpose 和副本数是幂等 provision；这允许多个 controller activation 复用同一 ready Team，而不会重复扩容。
+
+内联 subgraph 的运行时 `graph_id` 由父节点 activation 派生，不继承父 Graph 的私有 Team scope。内联子图只能使用全局静态 route；需要动态 Team 时，把节点留在父图，或拆成先有明确 `graph_id`、再按该 ID provision 的独立 Graph。
 
 ---
 
@@ -216,9 +229,24 @@ AgentGo 的 Reactor 系统订阅事件并在条件满足时自动触发下游任
 
 ---
 
-## 7. 依赖管理层
+## 7. Graph 依赖与 legacy 兼容
 
-### 7.1 发布顺序规则（铁律）
+新请求的依赖用 Graph `next` 转移表达；条件分流用 `when`，返工用 `activation:"new"` 回边。不需要为 Graph 节点手工传 Task UUID。
+
+- 当前 Runtime 尚无 flow generation / correlation token，因此 authoring 采用单赋值安全基线：除 `join` / `acceptance` 外，普通节点的静态入边数 MUST `<= 1`；条件分支各自拥有后续节点和 `end`，MUST NOT 先合入 OR mux。
+- `join` / `acceptance` 是 barrier：`task.required_inputs` 声明必须齐备的端口名，入边用 `target_input` 写入；每个 `target_input` MUST 恰有一条生产边。并行 AND 的每个必需来源 MUST 使用不同端口，MUST NOT 让互斥分支共享端口。
+- 成功汇合后，`join` 只发出 `completed`；规范形态是多个生产节点分别写入独立端口，再由 `join --completed--> summarize`。
+- 循环体可直接声明为 root，由 Runtime 隐式产生初始 activation；该节点只允许一条 `activation:"new"` 回边作为后续 activation 来源，MUST NOT 另造 start 与回边汇入同一普通节点。
+- controller 节点虽然路由到 `__scheduler__`，仍 MUST 用 `submit_task_result` 结算本节点。普通 agent/controller 的业务事件仍可供其自身路由；自定义 `$.path` 路由字段 MUST 放入 `result` object（如 `result={"coverage":"gap"}`），MUST NOT 只写在 summary/event。`report_done` 只属于非图 Scheduler 任务，Graph controller 调用会被硬拒绝。
+- acceptance 节点的 `task.title` 与 `task.description` MUST 非空，description 必须明确逐项验收标准。其 completed 结果 MUST 省略 `event`，只提交 `verdict=pass|fixable|failed`；业务出边只能用 `$.verdict eq` 精确匹配这三个值。
+- acceptance MUST NOT 使用无条件、`always`、`completed`、`pass` 或 `fixable` 事件作为业务出边；Runtime 自身 `failed` / `blocked` 事件只用于兜底。无法验收时提交 `status=blocked` 与 `blocked_reason`；`disputed` 是 Runtime 状态，不是 verifier 可提交的 verdict。
+- `when` 缺省是**无条件**，blocked/failed 到达时也可能选中。普通 agent/controller 的成功边须按其输出契约显式匹配；join 成功出边 MUST 匹配 `completed`；为 Runtime `blocked` / `failed` 单独设计失败、重试或 replan 路径。
+- 当前 MUST NOT 构造共享端口 OR、条件分支后的复杂汇流、嵌套图或复杂回环；这些形态等 generation/correlation token 能区分数据代际后再开放。
+- MUST NOT 把多条边直接指向普通 summarize 并假设它会等齐；MUST NOT 用无条件边把 blocked/failed 送入成功汇总。
+
+以下 UUID 依赖规则只适用于已有 legacy batch 的 `publish_task` 兼容路径。
+
+### 7.1 legacy 发布顺序规则（铁律）
 
 当任务 B 依赖任务 A 的产出时：
 
@@ -230,11 +258,11 @@ AgentGo 的 Reactor 系统订阅事件并在条件满足时自动触发下游任
 ⚠️ **MUST NOT** 在同一轮 reactLoop 中先发 B 后发 A。
 ⚠️ **MUST NOT** 在 dependencies 中使用占位符（如 "task-part1"、"A"、"<id>"）。
 
-### 7.2 并行无依赖任务
+### 7.2 legacy 并行无依赖任务
 
 无依赖关系的独立任务 SHOULD 在**同一轮 reactLoop 中并行发布**（多次 publish_task tool call）。
 
-### 7.3 依赖链示例
+### 7.3 legacy 依赖链示例
 
 ```
 用户请求："调查 docs/ 目录并产出报告"
@@ -288,7 +316,7 @@ AgentGo 的 Reactor 系统订阅事件并在条件满足时自动触发下游任
 
 - MUST 在引用文件时先扫 board snapshot 中所有 `task.artifacts` 字段
 - MUST 只引用真实存在的文件路径——禁止凭空声称未在 artifacts 中出现的文件
-- SHOULD 在调查/研究类任务完成后评估信息缺口，有缺口则追加任务而非急于收尾
+- SHOULD 在调查/研究 Graph 的 `end` 前设 controller 覆盖度裁决节点；有缺口时按 `read_graph` 得到的 revision 调 `patch_graph` 扩展尚未激活的后续图
 - MUST 在 report_done 的 summary 中只列 artifacts 中确认存在的文件
 
 ---
@@ -302,7 +330,7 @@ AgentGo 的 Reactor 系统订阅事件并在条件满足时自动触发下游任
 
 | 信号 | 推荐行动 |
 |------|---------|
-| 用户请求涉及 3+ 个独立子方向 | 并行发布多个 explore 任务 |
+| 用户请求涉及 3+ 个独立子方向 | 在 Graph 中 fan-out 多个 agent 节点，再用 join 收敛 |
 | 单个文件 >500 行 | 在 description 中按模块拆分，而非让 Agent 逐行读 |
 | 目录下 20+ 个同类型文件 | 按子目录或功能模块拆分任务 |
 | 用户说"简短/不用详细/不需要文档" | **不要 expected_artifacts**，让任务产出纯文本回复 |
@@ -330,38 +358,30 @@ AgentGo 的 Reactor 系统订阅事件并在条件满足时自动触发下游任
 |------|----------|----------|
 | Explorer 声明的 expected_artifacts 永远完成不了 | 任务 status = failed，RetryLoop | 检查 Capability 边界（§9）；cancel + 重新发布为两步 |
 | 依赖任务 ID 用了占位符 | publish_task 返回 Abort 错误 | 先发被依赖任务，从返回值读真实 UUID 后重新发布 |
-| 路由到不存在的 event_type | 任务 publish 被拒绝 | 检查 `specialized_agents`，使用已存在的类型或 provision |
+| Graph route 不存在、归属另一 Graph 或 capability 不足 | submit_graph / patch_graph 被 fail-closed 拒绝 | 使用当前 graph_id provision，读取真实 route，或收窄节点 tools 后重试 |
 | Explorer 任务完成后直接 report_done | pending_downstream_tasks 非空就被截断 | 先调用 report_progress，等下游清空后再 report_done |
 | 丢失用户的否定约束 | 子任务生成了用户明确拒绝的文件 | Section 11.3：改写 description 时逐字保留否定词 |
-| 多轮尝试后仍无法完成 | Plan 因预算/无进展进入暂停 | 结束当前回合并等待 `plan_pause` Interaction；不得从自由文本解释或代替用户选择 |
-| Scheduler-only 模式无路由 | runtime_mode == "scheduler_only" | 从 agent_templates 选择合适的模板 provision |
+| 节点多轮尝试后仍无进展 | 节点 blocked / graph change 唤醒 Scheduler | 先 `read_graph`，再用 `patch_graph` 调整未来图；需用户决定时走受信 Interaction |
+| Scheduler-only 模式无路由 | runtime_mode == "scheduler_only" | 先决定 graph_id，再从 agent_templates 选择模板并带 graph_id provision |
 
 ---
 
-## 附录 A：决策树速查卡
+## 附录 A：Graph-first 速查卡
 
 ```
 用户输入
   │
-  ├─ A类（闲聊/状态/资源查询）──→ 直接自然语言回答
-  │
-  ├─ B类（只读操作：读文件、搜索代码、查网页）
-  │     └──→ 自己调 tool（read_file / grep / web_search / web_fetch）
-  │
-  └─ C类（写文件 / 跑命令 / 复杂改造）
+  └─ 所有请求 ──→ submit_graph
         │
-        ├─ 纯只读调查？
-        │   ├─ 是 → event_type="explore"（❌ expected_artifacts）
-        │   └─ 否 → event_type=""（Worker）
+        ├─ 简单请求？ → 单个 controller 节点 → end
         │
-        ├─ 需要写文件？
-        │   └─ 是 → MUST event_type="" + 声明 expected_artifacts
+        ├─ 只读调查？ → 只读 agent 节点（跨文件/多来源仍建图）
         │
-        ├─ 需要跑 shell？
-        │   └─ 是 → MUST event_type=""
+        ├─ 需要写/Shell？ → 路由到具备对应 capability 的 agent 节点
         │
-        └─ 有依赖？
-            └─ 先发被依赖任务 → 读 UUID → 再发依赖方任务
+        ├─ 多方向 AND？ → fan-out → 独立 target_input → join → controller
+        │
+        └─ 改变状态/正确性声明？ → acceptance 以 $.verdict 精确分支 / 必要时回边
 ```
 
 ## 附录 B：与 AgentGo 架构的对应关系
@@ -369,10 +389,10 @@ AgentGo 的 Reactor 系统订阅事件并在条件满足时自动触发下游任
 | 本 Skill 章节 | AgentGo 代码位置 | 现有配置文件 |
 |--------------|-----------------|-------------|
 | §2 Board Snapshot | `internal/scheduler/scheduler.go` | — |
-| §3 A/B/C 决策树 | Scheduler system prompt | — |
+| §3 Graph-first 决策 | Scheduler system prompt | — |
 | §4 Event Type 路由 | `internal/suggest/` | `setting.yaml → agents[].event_type` |
 | §5 AgentKind 配置 | `internal/config/config.go` → `AgentKind` | `setting.yaml → agents[]` |
 | §6 Reactor 绑定 | `internal/reactor/` | `general_reactor.yaml`, `reactors_file` |
-| §7 依赖管理 | `internal/tools/meta.go` → `publish_task` | `max_subtask_depth` |
+| §7 Graph 依赖 / legacy 兼容 | `internal/graph/`, `internal/tools/graph_control.go`, `internal/tools/meta.go` | `max_subtask_depth` 仅 legacy |
 | §9 能力边界 | `internal/gate/` | `tool_profiles` |
 | §1.1 Interaction 边界 | `internal/interaction/`, `internal/bootstrap/interaction_runtime.go`, `internal/tools/` 的 MetaGroup | `modes.gate`, `tool_profiles` |

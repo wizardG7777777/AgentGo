@@ -34,6 +34,7 @@ type routeRecord struct {
 	count        int
 	role         string
 	capabilities []string
+	claimantIDs  []string
 }
 
 type fakeRoutes struct {
@@ -61,6 +62,18 @@ func (r *fakeRoutes) RegisterRoute(key, eventType, ownerScope string, count int,
 		capabilities: append([]string(nil), capabilities...),
 	}
 	r.registers++
+	return nil
+}
+
+func (r *fakeRoutes) BindRouteClaimants(key string, agentIDs []string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	record, ok := r.routes[key]
+	if !ok {
+		return errors.New("missing route")
+	}
+	record.claimantIDs = append([]string(nil), agentIDs...)
+	r.routes[key] = record
 	return nil
 }
 
@@ -157,7 +170,9 @@ func TestManagerProvisionIdempotenceLimitsShutdownAndRecovery(t *testing.T) {
 	}
 	routeSnapshot, registerCount := routes.snapshot()
 	route := routeSnapshot[first.EventType]
-	if route.ownerScope != controllerID || route.count != 2 || !contains(route.capabilities, "read_file") || contains(route.capabilities, "code-investigation") {
+	if route.ownerScope != model.TaskRouteScope(controllerID) || route.count != 2 ||
+		!contains(route.capabilities, "read_file") || contains(route.capabilities, "code-investigation") ||
+		len(route.claimantIDs) != 2 || route.claimantIDs[0] != first.AgentIDs[0] || route.claimantIDs[1] != first.AgentIDs[1] {
 		t.Fatalf("route must expose concrete tools and controller ownership, got %+v", route)
 	}
 
@@ -849,6 +864,194 @@ func TestManagerTerminalControllerReactorStopsTeamAndRecoverySkipsIt(t *testing.
 	recovered.Shutdown()
 }
 
+func TestManagerGraphTeamSurvivesControllerAndStopsAtGraphTerminal(t *testing.T) {
+	catalog := testCatalog(t)
+	durable := NewMemoryStore()
+	routes := newFakeRoutes()
+	manager := testManager(t, catalog, durable, routes, 2)
+	graphStatus := "running"
+	graphExists := true
+	if err := manager.SetGraphStateResolver(func(graphID string) (string, bool, bool) {
+		if graphID != "g-team-lifecycle" || !graphExists {
+			return "", false, false
+		}
+		return graphStatus, graphStatus == "completed" || graphStatus == "failed" || graphStatus == "cancelled", true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	controllerID := newControllerTask(t, manager.deps.Store, "graph owner")
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Shutdown()
+	result, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
+		ControllerTaskID: controllerID, GraphID: "g-team-lifecycle",
+		TemplateRef: "builtin/explorer@1", Purpose: "inspect", Replicas: 1,
+	})
+	if err != nil {
+		t.Fatalf("Provision graph Team: %v", err)
+	}
+	registered, _ := routes.snapshot()
+	if got := registered[result.EventType].ownerScope; got != model.GraphRouteScope("g-team-lifecycle") {
+		t.Fatalf("route owner=%q, want Graph scope", got)
+	}
+
+	terminalControllerTask(t, manager.deps.Store, controllerID, model.TaskStatusCompleted)
+	if err := manager.Run(trace.Event{Kind: trace.KindTaskCompleted, TaskID: controllerID}); err != nil {
+		t.Fatal(err)
+	}
+	if manager.ActiveCount() != 1 {
+		t.Fatalf("controller terminal tore down Graph Team; active=%d", manager.ActiveCount())
+	}
+	if got, _ := durable.Get(result.TeamID); got.Status != StatusReady {
+		t.Fatalf("Graph Team stopped with origin controller: %+v", got)
+	}
+
+	graphStatus = "completed"
+	if err := manager.Run(trace.Event{Kind: trace.KindGraphEnded, GraphID: "g-team-lifecycle"}); err != nil {
+		t.Fatal(err)
+	}
+	if manager.ActiveCount() != 0 {
+		t.Fatalf("graph terminal left active Team: %d", manager.ActiveCount())
+	}
+	if got, _ := durable.Get(result.TeamID); got.Status != StatusStopped || got.StopReason != "graph_terminal:completed" {
+		t.Fatalf("Graph Team durable terminal mismatch: %+v", got)
+	}
+	if current, _ := routes.snapshot(); len(current) != 0 {
+		t.Fatalf("graph terminal left route: %+v", current)
+	}
+}
+
+func TestManagerStopsGraphBindingOrphanWhenSubmissionNeverBecameDurable(t *testing.T) {
+	catalog := testCatalog(t)
+	durable := NewMemoryStore()
+	routes := newFakeRoutes()
+	manager := testManager(t, catalog, durable, routes, 1)
+	if err := manager.SetGraphStateResolver(func(string) (string, bool, bool) {
+		return "", false, false // provision happened, but submit_graph was rejected
+	}); err != nil {
+		t.Fatal(err)
+	}
+	controllerID := newControllerTask(t, manager.deps.Store, "orphan binding")
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Shutdown()
+	result, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
+		ControllerTaskID: controllerID, GraphID: "g-never-submitted",
+		TemplateRef: "builtin/explorer@1", Purpose: "inspect", Replicas: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalControllerTask(t, manager.deps.Store, controllerID, model.TaskStatusFailed)
+	if err := manager.Run(trace.Event{Kind: trace.KindTaskFailed, TaskID: controllerID}); err != nil {
+		t.Fatal(err)
+	}
+	if manager.ActiveCount() != 0 {
+		t.Fatalf("orphan Graph binding left active agents: %d", manager.ActiveCount())
+	}
+	if got, _ := durable.Get(result.TeamID); got.Status != StatusStopped || got.StopReason != "graph_binding_orphan" {
+		t.Fatalf("orphan Graph Team durable state=%+v", got)
+	}
+	if registered, _ := routes.snapshot(); len(registered) != 0 {
+		t.Fatalf("orphan Graph binding left route: %+v", registered)
+	}
+}
+
+func TestManagerLifecycleReactorUsesReliableAsyncDispatch(t *testing.T) {
+	manager := &Manager{}
+	if manager.IsSync() || !manager.ReliableAsync() {
+		t.Fatal("Team lifecycle reactor must use the non-dropping reliable async lane")
+	}
+}
+
+func TestManagerRejectsProvisionForTerminalGraph(t *testing.T) {
+	catalog := testCatalog(t)
+	durable := NewMemoryStore()
+	routes := newFakeRoutes()
+	manager := testManager(t, catalog, durable, routes, 1)
+	if err := manager.SetGraphStateResolver(func(graphID string) (string, bool, bool) {
+		if graphID == "g-already-ended" {
+			return "completed", true, true
+		}
+		return "", false, false
+	}); err != nil {
+		t.Fatal(err)
+	}
+	controllerID := newControllerTask(t, manager.deps.Store, "terminal graph provision")
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Shutdown()
+
+	_, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
+		ControllerTaskID: controllerID, GraphID: "g-already-ended",
+		TemplateRef: "builtin/explorer@1", Purpose: "must not leak", Replicas: 1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "terminal graph") {
+		t.Fatalf("terminal Graph provision err=%v, want fail-closed rejection", err)
+	}
+	if manager.ActiveCount() != 0 {
+		t.Fatalf("terminal Graph provision started %d agents", manager.ActiveCount())
+	}
+	if specs, listErr := durable.List(); listErr != nil || len(specs) != 0 {
+		t.Fatalf("terminal Graph provision persisted specs=%+v err=%v", specs, listErr)
+	}
+	if registered, _ := routes.snapshot(); len(registered) != 0 {
+		t.Fatalf("terminal Graph provision registered routes: %+v", registered)
+	}
+}
+
+func TestManagerRecoveryUsesGraphStatusInsteadOfControllerTerminal(t *testing.T) {
+	catalog := testCatalog(t)
+	taskStore := store.NewMemoryTaskStore(nil, 100, 1, 30)
+	controllerID := newControllerTask(t, taskStore, "old graph controller")
+	terminalControllerTask(t, taskStore, controllerID, model.TaskStatusCompleted)
+	durable := NewMemoryStore()
+	spec := testSpec("graph-recovery", controllerID, "recover")
+	spec.GraphID = "g-recovery"
+	tmpl, err := catalog.Resolve(spec.TemplateRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec.TemplateDigest = tmpl.Digest
+	if _, _, err := durable.Ensure(spec); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := testManagerWithStore(t, catalog, taskStore, durable, newFakeRoutes(), 2)
+	if err := manager.SetGraphStateResolver(func(string) (string, bool, bool) {
+		return "running", false, true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatalf("recover nonterminal Graph Team: %v", err)
+	}
+	if manager.ActiveCount() != spec.Replicas {
+		t.Fatalf("recovered active=%d, want %d", manager.ActiveCount(), spec.Replicas)
+	}
+	manager.Shutdown()
+
+	terminal := testManagerWithStore(t, catalog, taskStore, durable, newFakeRoutes(), 2)
+	if err := terminal.SetGraphStateResolver(func(string) (string, bool, bool) {
+		return "failed", true, true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := terminal.Start(context.Background()); err != nil {
+		t.Fatalf("terminal recovery: %v", err)
+	}
+	defer terminal.Shutdown()
+	if terminal.ActiveCount() != 0 {
+		t.Fatalf("terminal Graph recovered agents: %d", terminal.ActiveCount())
+	}
+	if got, _ := durable.Get(spec.ID); got.Status != StatusStopped || got.StopReason != "graph_terminal:failed" {
+		t.Fatalf("terminal Graph recovery mismatch: %+v", got)
+	}
+}
+
 func TestManagerShutdownRemovesDynamicRuntimeSurfaces(t *testing.T) {
 	catalog := testCatalog(t)
 	taskStore := store.NewMemoryTaskStore(nil, 100, 1, 30)
@@ -970,7 +1173,7 @@ func newControllerTask(t *testing.T, taskStore store.TaskStore, description stri
 }
 
 // terminalControllerTask 把 controller 任务沿合法迁移推进到指定终态
-//（completed 需经 processing；cancelled/failed 可从 pending 直达）。
+// （completed 需经 processing；cancelled/failed 可从 pending 直达）。
 func terminalControllerTask(t *testing.T, taskStore store.TaskStore, taskID string, to model.TaskStatus) {
 	t.Helper()
 	task, err := taskStore.GetTask(taskID)

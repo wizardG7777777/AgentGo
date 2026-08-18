@@ -25,9 +25,10 @@ import (
 //     发布成功后置 running 并 durable task_id；
 //   - router：激活即同步求值自己的 next（以上游 Result 为输入），不发任务；
 //   - end：激活即图完成（completed + graph_ended 事件）；
-//   - join：就绪性纯推导（不加持久状态）——全部入边源的最新 activation
-//     终态且 ≥1 条入边已 RecordTransition 生效时归并完成；全部源终态但
-//     无入边生效时置 skipped（终态，不触发 next）；
+//   - join：就绪性纯推导（不加持久状态）——每个 required input port 均有
+//     一条实际选中边绑定到同一目标 activation 后归并完成；端口为单赋值，
+//     并行来源使用不同端口表示 AND。旧无端口图仅在恢复时保留“全部静态源
+//     终态”的兼容 barrier；
 //   - wait_event：durable 挂起 waiting，OnExternalEvent 命中事件名时
 //     以事件 data 为 Result 完成并求值转移；
 //   - tool：durable executing 后同步调 ToolExecutor，成功/失败分别落
@@ -40,13 +41,12 @@ import (
 //   - acceptance（C5c 起）：发任务型节点——与 controller/agent 同路径经
 //     board 发布验收任务（默认路由 acceptance.verify，metadata["route"] 可
 //     覆盖），验收判据由节点 task.title/description 携带；验收 agent 按
-//     prompt 契约检查后经 submit_task_result 写 Results（verdict/event），
-//     终态经既有 feed 回填 TerminalFact。G1b 起注入 AcceptanceVerifier
-//     时引擎在结算前对 Results["evidence"] 做服务端核验（见
-//     acceptance.go）：valid 按 verdict 正常转移，disputed/unverifiable
-//     不采信 verdict（节点 failed + graph change 唤醒）；未注入保持
-//     C5c 契约自报行为。Plan 时代的熔断器仍未迁移，连续 disputed 靠
-//     Scheduler 经 graph change 流裁决。
+//     prompt 契约检查后经 submit_task_result 提交 completed，Result 只允许
+//     verdict=pass/fixable/failed 三值，业务 event 不被采信；blocked 直接
+//     使用任务状态且不填 verdict。终态经 feed 回填 TerminalFact 后，
+//     acceptance.go 在结算前做证据谱系和必需证据核验：valid 按
+//     $.verdict 转移；disputed / evidence_missing / invalid_verdict 均不
+//     采信自报结论，并按 failed 或 blocked 结算后唤醒 graph change。
 //
 // 崩溃一致性纪律：activation 事实、任务发布结果、节点终态都经
 // Store.SetExecutionAndStatus 单条 journal 记录生效；边选择经
@@ -71,13 +71,35 @@ type TaskBoard interface {
 	LookupGraphTask(graphID, activationID, expectedTaskID string) (GraphTaskSnapshot, bool, error)
 }
 
+// GraphTaskTerminator is the optional control-plane half of TaskBoard. The
+// Runtime invokes it after the Graph terminal status is durable and before it
+// emits graph_ended, so Task state closure remains part of the Graph main flow
+// instead of being driven by a Reactor response. Implementations must be
+// idempotent: startup recovery may invoke the same operation again to close
+// the crash window between the two durable stores.
+//
+// A termination failure cannot roll back the already-durable Graph outcome.
+// Runtime records the failure as a trace error and still emits graph_ended so
+// route/Team teardown is not skipped; startup reconciliation retries cleanup.
+type GraphTaskTerminator interface {
+	TerminateGraphTasks(graphID string) error
+}
+
 // GraphTaskSnapshot 是恢复期从 TaskBoard 查询到的最小任务事实。非终态任务
 // 的 TerminalStatus 为空；终态只允许 completed/failed/blocked。Result 是
 // TaskStore 持有的完整结构化结果，用于在 Graph journal 落后时补结算。
 type GraphTaskSnapshot struct {
-	TaskID         string
+	TaskID string
+	// NodeKind 是 Task 发布时冻结的 Graph 节点类型。空值只可能来自旧快照；
+	// Runtime 对非空值与当前 activation 的冻结定义做一致性校验，防止恢复时
+	// 把 acceptance 等角色错认成普通执行节点。
+	NodeKind       NodeKind
 	TerminalStatus NodeStatus
 	Result         map[string]any
+	// Evidence 是任务终态时随快照携带的可观察证据（由公告板桥按
+	// ToolCallRecord + Artifacts 组装）：恢复对账路径的 acceptance 谱系
+	// 核验与 feed 路径同构，凭它取得 verifier 自身证据。
+	Evidence []EvidenceEntry
 }
 
 // TaskSpec 是一次节点任务发布的完整描述。
@@ -85,12 +107,22 @@ type TaskSpec struct {
 	GraphID      string
 	NodeID       string
 	ActivationID string
-	Title        string
-	Description  string
-	Route        string // 认领路由（resolveRoute 解析结果 = runner event_type）
-	Tools        []string
-	Model        string
-	Isolation    string
+	// NodeKind 随 activation 冻结并持久化到 model.Task，供执行租约按真实
+	// Graph 角色派生控制通道；不能从 route 猜测（acceptance 可自定义 route）。
+	NodeKind    NodeKind
+	Title       string
+	Description string
+	Route       string // 认领路由（resolveRoute 解析结果 = runner event_type）
+	Tools       []string
+	Model       string
+	Isolation   string
+	// Inputs 是本 activation 的持久化输入绑定（数据流）：发布时随任务描述
+	// 注入执行上下文（有界摘要 + 证据引用），任务文本冻结后与图内事实一致。
+	Inputs []InputBinding
+	// RequiredEvidence 与 MissingEvidence 让任务桥把 acceptance 的证据契约和
+	// 当前可解引用缺口显式注入 verifier；缺口存在时 verifier 应 blocked。
+	RequiredEvidence []EvidenceRequirement
+	MissingEvidence  []EvidenceRequirement
 }
 
 // 节点类型 → 默认认领路由（runner event_type）的映射常量。
@@ -132,6 +164,10 @@ type TerminalFact struct {
 	TaskID       string
 	Status       NodeStatus     // 仅接受 completed / failed / blocked
 	Result       map[string]any // 结构化结果本体（转移求值的输入）
+	// Evidence 是该任务终态时由回填方（bootstrap feed）从其 ToolCallRecord
+	// 与 Artifacts 组装的可观察证据条目；结算时随 Execution 持久化，
+	// 并经 EdgeInput.EvidenceRefs 进入下游输入谱系。非任务型节点恒空。
+	Evidence []EvidenceEntry
 }
 
 // ToolExecutor 是 Graph Runtime 对工具执行能力的最小依赖（与 TaskBoard
@@ -174,21 +210,40 @@ type Runtime struct {
 	toolExec ToolExecutor    // nil 时 tool 节点激活即 failed（中文错误）
 	approval ApprovalGateway // nil 时 approval 节点保持「尚未实现」挂起
 
-	// acceptVerifier 是 acceptance 节点 completed 终态的服务端核验器
-	//（G1b，acceptance.go）：nil 时保持 C5c 契约自报行为（不核验）。
-	// changeWaker 是核验 disputed/unverifiable 时的 graph change 唤醒器：
-	// nil 时只发 graph_change_requested 审计事件，不发布唤醒任务。
-	acceptVerifier AcceptanceVerifier
-	changeWaker    GraphChangeWaker
+	// acceptVerifier 已退役（G1b 机器格式契约核验随旧证据契约删除）：
+	// acceptance 节点 completed 终态现在一律走引擎内生谱系核验
+	//（acceptance.go 判定矩阵），changeWaker 是 disputed 时的 graph change
+	// 唤醒器：nil 时只发 graph_change_requested 审计事件，不发布唤醒任务。
+	changeWaker GraphChangeWaker
+
+	// sessionIDProvider 提供当前活跃 session ID（Session 生命周期隔离）：
+	// 提交落图时给 doc.SessionID 盖章，恢复后归并无归属历史图。惰性求值，
+	// session 切换后自动取到新值；nil 时行为同今（归属恒为空串）。
+	sessionIDProvider func() string
 
 	// results 是节点最新 Result 的纯内存缓存（graphID → nodeID → Result），
-	// 供 join 归并取已生效源的结果本体。Result 本体尚未持久化（已知限制，
-	// 随 Result 持久化切片解决），重启后缓存丢失，join 归并值退化为源的
-	// result_ref 摘要字符串。图到终态即 eviction（join 只在图运行中就绪）。
+	// 只作进程内便捷读取。权威数据是 activation Result Store；重启、join、
+	// router 与大结果恢复均通过稳定 ResultRef 解引用，绝不回退展示摘要。
+	// 图到终态即 eviction。
 	results map[string]map[string]map[string]any
 	// waitTimers 只是进程内唤醒器；权威 deadline 存在 Execution.WaitDeadline
 	// 并随 activation durable。恢复时按该 deadline 重建 timer 或立即超时。
 	waitTimers map[string]*time.Timer
+
+	// suspended 是被停驻图的纯内存闸门（Session 生命周期隔离，见
+	// runtime_suspend.go）：停驻图的终态事实/审批裁决/外部事件/子图终态
+	// 回调输入被吞掉，wait timer 全部停走；图数据与 journal 保持不动。
+	// 不进 Store、进程重启即丢失——启动恢复后由控制面按 session 归属重建。
+	suspended map[string]struct{}
+	// pendingApprovals 暂存停驻期间到达的审批裁决（key 见 approvalKey）。
+	// 审批裁决无 durable 面可重建（审批网关以 requestID 幂等去重，恢复不
+	// 重发），必须内存暂存、解冻后回放，否则 waiting approval 节点永久悬挂。
+	pendingApprovals map[string]approvalDecision
+
+	// synchronousSteps 只统计一次外部 Runtime 调用中不会让出控制权的机械
+	// activation（router/join/end/tool）。它不是业务 activation 预算；任务型
+	// Agent 每次发布即让出，跨任务回边不累计。
+	synchronousSteps int
 
 	mu sync.Mutex
 }
@@ -199,10 +254,12 @@ type Runtime struct {
 // 可选注入（保持本签名兼容）。
 func NewRuntime(store *Store, board TaskBoard) *Runtime {
 	return &Runtime{
-		store:      store,
-		board:      board,
-		results:    make(map[string]map[string]map[string]any),
-		waitTimers: make(map[string]*time.Timer),
+		store:            store,
+		board:            board,
+		results:          make(map[string]map[string]map[string]any),
+		waitTimers:       make(map[string]*time.Timer),
+		suspended:        make(map[string]struct{}),
+		pendingApprovals: make(map[string]approvalDecision),
 	}
 }
 
@@ -220,12 +277,21 @@ func (rt *Runtime) SetApprovalGateway(gw ApprovalGateway) {
 	rt.approval = gw
 }
 
+// SetSessionIDProvider 注入当前活跃 session 的取值器（构造后、使用前调用）；
+// nil 时行为同今——提交不盖章、归并为空操作。
+func (rt *Runtime) SetSessionIDProvider(fn func() string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.sessionIDProvider = fn
+}
+
 // SubmitGraph 校验并提交一张图（durable），随后激活 root。
 // 校验/落盘失败时发 graph_submission_rejected 事件并原样返回错误；
 // root 激活失败（如未实现节点类型）时图已提交，错误一并返回。
 func (rt *Runtime) SubmitGraph(doc *GraphDocument) error {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+	rt.synchronousSteps = 0
 	return rt.submitGraphLocked(doc)
 }
 
@@ -255,6 +321,11 @@ func (rt *Runtime) submitGraphLocked(doc *GraphDocument) error {
 	graphID := ""
 	if doc != nil {
 		graphID = doc.GraphID
+	}
+	// Session 归属盖章：仅填充空值，不覆盖显式归属（如调用方已声明
+	// session_id 的场景）；provider 为 nil 时保持空串（行为同今）。
+	if doc != nil && doc.SessionID == "" && rt.sessionIDProvider != nil {
+		doc.SessionID = rt.sessionIDProvider()
 	}
 	if err := rt.store.SubmitGraph(doc); err != nil {
 		trace.Emit(trace.Event{Kind: trace.KindGraphSubmissionRejected, GraphID: graphID, Error: err.Error()})
@@ -287,6 +358,7 @@ func (rt *Runtime) submitGraphLocked(doc *GraphDocument) error {
 func (rt *Runtime) OnTaskTerminal(f TerminalFact) error {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+	rt.synchronousSteps = 0
 	doc, err := rt.graph(f.GraphID)
 	if err != nil {
 		return err
@@ -294,6 +366,13 @@ func (rt *Runtime) OnTaskTerminal(f TerminalFact) error {
 	if doc.Status.IsTerminal() {
 		log.Printf("[graph] DEBUG 图 %s 已是终态 %q，忽略迟到的终态事实（节点 %s activation %s）",
 			f.GraphID, doc.Status, f.NodeID, f.ActivationID)
+		return nil
+	}
+	if rt.isSuspendedLocked(f.GraphID) {
+		// 停驻闸门：吞掉不推进。任务终态在公告板上有权威事实，解冻恢复时
+		// 经 reconcileTaskLocked 对账回填（与 graph-terminal-feed 同语义）。
+		log.Printf("[graph] DEBUG 图 %s 已停驻，吞掉终态事实（节点 %s activation %s，状态 %s）；解冻时经公告板对账回填",
+			f.GraphID, f.NodeID, f.ActivationID, f.Status)
 		return nil
 	}
 	node, ok := doc.Nodes[f.NodeID]
@@ -323,16 +402,37 @@ func (rt *Runtime) OnTaskTerminal(f TerminalFact) error {
 		return fmt.Errorf("graph: 终态事实的节点状态 %q 非法（仅接受 completed/failed/blocked）", f.Status)
 	}
 
-	// G1b：acceptance 节点 completed 且已注入核验器时走服务端核验结算
-	//（valid 放行 / disputed·unverifiable 不采信自报 verdict，见
-	// acceptance.go）。failed/blocked 终态无 verdict 可采信，不核验。
-	if activeNode.Kind == KindAcceptance && f.Status == NodeCompleted && rt.acceptVerifier != nil {
-		return rt.settleAcceptanceLocked(f, *ex)
+	// 数据流证据：终态任务的可观察证据随 Execution 持久化（同一本
+	// execution 经 settle 落盘，证据与终态同条 journal 记录生效）。
+	exec := *ex
+	hydrateExecutionEvidence(&exec)
+	if len(f.Evidence) > 0 {
+		exec.Evidence = appendEvidenceUnique(exec.Evidence, f.Evidence...)
+		hydrateExecutionEvidence(&exec)
+	}
+
+	// acceptance 节点 completed 终态一律走引擎内生谱系核验（acceptance.go
+	// 判定矩阵：引用越谱系即 disputed 判死，不引用不判死）。failed/blocked
+	// 终态无 verdict 可采信，不核验。
+	terminalResult := f.Result
+	if activeNode.Kind == KindAcceptance {
+		if f.Status == NodeCompleted {
+			return rt.settleAcceptanceLocked(f, exec)
+		}
+		// failed/blocked 的路由权威是任务状态，不是 Agent 在
+		// Result 中自填的业务结论。剔除 verdict/event 后，边求值
+		// 才会稳定回落到 Runtime 产生的 failed/blocked 事件。
+		terminalResult = make(map[string]any, len(f.Result))
+		for key, value := range f.Result {
+			if key != "verdict" && key != "event" {
+				terminalResult[key] = value
+			}
+		}
 	}
 
 	// durable 写 Result 摘要 + 节点终态，随后走统一结算路径（转移求值 +
 	// 目标激活 + join 就绪重推导）。
-	return rt.settleNodeLocked(f.GraphID, f.NodeID, *ex, f.Status, f.Result)
+	return rt.settleNodeLocked(f.GraphID, f.NodeID, exec, f.Status, terminalResult)
 }
 
 // OnExternalEvent 投递一个外部事件：匹配该图中 status=waiting 且
@@ -345,12 +445,19 @@ func (rt *Runtime) OnTaskTerminal(f TerminalFact) error {
 func (rt *Runtime) OnExternalEvent(graphID, event string, data map[string]any) error {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+	rt.synchronousSteps = 0
 	doc, err := rt.graph(graphID)
 	if err != nil {
 		return err
 	}
 	if doc.Status.IsTerminal() {
 		log.Printf("[graph] DEBUG 图 %s 已是终态 %q，忽略外部事件 %q", graphID, doc.Status, event)
+		return nil
+	}
+	if rt.isSuspendedLocked(graphID) {
+		// 停驻闸门：外部事件无 durable 面对账，吞掉即视为冻结期间未发生
+		//（与进程停止期间的事件语义一致——事件是时点信号，不排队）。
+		log.Printf("[graph] DEBUG 图 %s 已停驻，吞掉外部事件 %q（视为冻结期间未发生）", graphID, event)
 		return nil
 	}
 	if strings.TrimSpace(event) == "" {
@@ -394,9 +501,28 @@ func (rt *Runtime) OnExternalEvent(graphID, event string, data map[string]any) e
 // 在途的 waiting approval 节点，以 Result={event: approved|rejected, text}
 // 完成节点（配合下游 when event approved/rejected 条件）并走转移求值。
 // 过期 activation 或节点已离开 waiting 的重复/迟到裁决忽略（返回 nil）。
+//
+// 停驻闸门：图已停驻时不推进，裁决暂存 pendingApprovals（审批裁决无
+// durable 面可重建——恢复侧因 RequestID 已记录不重发请求，直接吞掉会让
+// waiting approval 节点永久悬挂），解冻时经 ResumeGraphsForSession 回放。
 func (rt *Runtime) OnApprovalDecided(graphID, nodeID, activationID string, approved bool, text string) error {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+	rt.synchronousSteps = 0
+	if rt.isSuspendedLocked(graphID) {
+		rt.pendingApprovals[approvalKeyOf(graphID, nodeID, activationID)] = approvalDecision{
+			graphID: graphID, nodeID: nodeID, activationID: activationID, approved: approved, text: text,
+		}
+		log.Printf("[graph] DEBUG 图 %s 已停驻，暂存审批裁决（节点 %s activation %s），解冻后回放",
+			graphID, nodeID, activationID)
+		return nil
+	}
+	return rt.onApprovalDecidedLocked(graphID, nodeID, activationID, approved, text)
+}
+
+// onApprovalDecidedLocked 是 OnApprovalDecided 的锁内实现（调用方须持
+// rt.mu）；解冻回放复用本路径（activation/状态守卫天然过滤过期项）。
+func (rt *Runtime) onApprovalDecidedLocked(graphID, nodeID, activationID string, approved bool, text string) error {
 	doc, err := rt.graph(graphID)
 	if err != nil {
 		return err
@@ -475,20 +601,34 @@ func (rt *Runtime) writeTerminalContinuationLocked(graphID, nodeID string, exec 
 	}
 	raw, err := json.Marshal(result)
 	if err != nil {
-		return fmt.Errorf("graph: 序列化图 %s 节点 %s activation %s 的终态 Result: %w", graphID, nodeID, exec.ActivationID, err)
+		return rt.failUnstorableTerminalResultLocked(graphID, nodeID, exec, status,
+			fmt.Sprintf("终态 Result 无法序列化为 JSON object: %v", err))
 	}
 	if len(raw) > MaxDocumentBytes {
-		return fmt.Errorf("graph: 图 %s 节点 %s activation %s 的终态 Result 为 %d 字节，超过 durable settlement 上限 %d；拒绝落终态以避免写入不可恢复的超大 journal",
-			graphID, nodeID, exec.ActivationID, len(raw), MaxDocumentBytes)
+		return rt.failUnstorableTerminalResultLocked(graphID, nodeID, exec, status,
+			fmt.Sprintf("终态 Result 为 %d 字节，超过 durable activation Result 上限 %d", len(raw), MaxDocumentBytes))
 	}
 	// 经 JSON 往返得到与 durable 字节一致、且不再受调用方后续修改影响的缓存。
 	var durableResult map[string]any
 	if err := json.Unmarshal(raw, &durableResult); err != nil || durableResult == nil {
-		return fmt.Errorf("graph: 图 %s 节点 %s activation %s 的终态 Result 不是 JSON 对象", graphID, nodeID, exec.ActivationID)
+		return rt.failUnstorableTerminalResultLocked(graphID, nodeID, exec, status,
+			"终态 Result 不是 JSON object")
 	}
-	exec.ResultRef = summarizeResult(durableResult)
+	resultRecord := ActivationResult{
+		Ref: activationResultRef(graphID, exec.ActivationID), NodeID: nodeID,
+		ActivationID: exec.ActivationID, Result: append(json.RawMessage(nil), raw...),
+		Evidence: append([]EvidenceEntry(nil), exec.Evidence...),
+	}
+	// Result Store 必须先于 terminal/transition durable：一旦随后边记录引用
+	// ResultRef，重启与 snapshot 压缩后都必须已经可解引用。两记录间崩溃只
+	// 留下一条无害的孤立 Result；任务公告板对账会幂等补写 terminal。
+	if err := rt.store.RecordActivationResult(graphID, resultRecord); err != nil {
+		return err
+	}
+	exec.ResultRef = resultRecord.Ref
+	exec.ResultSummary = summarizeResult(durableResult)
 	exec.Settlement = &TerminalSettlement{
-		Status: status, Result: append(json.RawMessage(nil), raw...),
+		Status: status, ResultRef: resultRecord.Ref,
 		Continuation: continuation, Reason: reason,
 	}
 	if err := rt.writeNode(graphID, nodeID, exec, status); err != nil {
@@ -499,6 +639,42 @@ func (rt *Runtime) writeTerminalContinuationLocked(graphID, nodeID string, exec 
 	}
 	rt.results[graphID][nodeID] = durableResult
 	return nil
+}
+
+// failUnstorableTerminalResultLocked 把无法持久化的业务 Result 转换为有界、
+// 可恢复的系统错误 Result，再将当前节点与 Graph durable fail。不能只返回
+// marshal/size 错误：调用方已经处于 running，裸返回会制造永久僵尸节点。
+func (rt *Runtime) failUnstorableTerminalResultLocked(graphID, nodeID string, exec Execution, originalStatus NodeStatus, detail string) error {
+	reason := fmt.Sprintf("图 %s 节点 %s activation %s 的 %s；已拒绝业务终态 %s 并执行 fail-closed",
+		graphID, nodeID, exec.ActivationID, detail, originalStatus)
+	fallback := map[string]any{
+		"error": reason, "original_status": string(originalStatus),
+		"verify_status": "result_unstorable",
+	}
+	raw, _ := json.Marshal(fallback) // 固定小对象，序列化不可失败。
+	ref := activationResultRef(graphID, exec.ActivationID)
+	if existing, ok := rt.store.ResolveActivationResult(graphID, ref); ok {
+		// 极窄崩溃窗口兼容：Result 已先落盘但 terminal 尚未写时，不改写不可变
+		// 记录；节点失败原因仍由 Settlement.Reason 与 ResultSummary 持久化。
+		ref = existing.Ref
+	} else if err := rt.store.RecordActivationResult(graphID, ActivationResult{
+		Ref: ref, NodeID: nodeID, ActivationID: exec.ActivationID, Result: raw,
+		Evidence: append([]EvidenceEntry(nil), exec.Evidence...),
+	}); err != nil {
+		return errors.Join(rt.failGraph(graphID, reason), fmt.Errorf("graph: %s；错误 Result 落盘失败: %w", reason, err))
+	}
+	exec.ResultRef = ref
+	exec.ResultSummary = summarizeResult(fallback)
+	exec.Settlement = &TerminalSettlement{
+		Status: NodeFailed, ResultRef: ref,
+		Continuation: SettlementContinueGraphFail, Reason: reason,
+	}
+	writeErr := rt.writeNode(graphID, nodeID, exec, NodeFailed)
+	if rt.results[graphID] == nil {
+		rt.results[graphID] = make(map[string]map[string]any)
+	}
+	rt.results[graphID][nodeID] = fallback
+	return errors.Join(writeErr, rt.failGraph(graphID, reason), fmt.Errorf("graph: %s", reason))
 }
 
 // evalTransitionsLocked 按节点 next 顺序求值转移（V6 §6-17）：
@@ -519,6 +695,26 @@ func (rt *Runtime) evalTransitionsLocked(graphID, nodeID, activationID string, s
 	if node.Execution != nil && node.Execution.ActivationID == activationID {
 		node = nodeForExecution(node, *node.Execution)
 	}
+	// 数据流绑定：本 activation 的完整证据与稳定 ResultRef 随每条生效边
+	// 进入 EdgeInput。老 journal/测试可能直接构造 Settlement 而未先写
+	// ActivationResult，此处在任何 transition 前做幂等补写。
+	var srcEvidence []EvidenceEntry
+	if node.Execution != nil && node.Execution.ActivationID == activationID {
+		srcEvidence = node.Execution.Evidence
+	}
+	resultRef := activationResultRef(graphID, activationID)
+	if _, ok := rt.store.ResolveActivationResult(graphID, resultRef); !ok {
+		raw, marshalErr := json.Marshal(result)
+		if marshalErr != nil {
+			return fmt.Errorf("graph: 序列化图 %s activation %s 的边输入 Result: %w", graphID, activationID, marshalErr)
+		}
+		if err := rt.store.RecordActivationResult(graphID, ActivationResult{
+			Ref: resultRef, NodeID: nodeID, ActivationID: activationID,
+			Result: raw, Evidence: append([]EvidenceEntry(nil), srcEvidence...),
+		}); err != nil {
+			return err
+		}
+	}
 	var targets []TransitionRecord
 	everMatched := false
 	for i, tr := range node.Next {
@@ -529,10 +725,15 @@ func (rt *Runtime) evalTransitionsLocked(graphID, nodeID, activationID string, s
 		if _, fired := rt.store.HasTransition(graphID, activationID, i); fired {
 			continue
 		}
-		rec, err := rt.newTransitionRecordLocked(graphID, nodeID, activationID, i, tr.To)
+		rec, err := rt.newTransitionRecordLocked(graphID, nodeID, activationID, i, tr.To, tr.TargetInput)
 		if err != nil {
 			return err
 		}
+		if detail := rt.inputBindingConflictDetail(graphID, rec); detail != "" {
+			reason := "数据流输入单赋值冲突：" + detail
+			return errors.Join(rt.failGraph(graphID, reason), fmt.Errorf("graph: %s", reason))
+		}
+		rec.Input = newEdgeInputWithRef(result, resultRef, srcEvidence)
 		sv, err := rt.stateVersion(graphID)
 		if err != nil {
 			return err
@@ -560,20 +761,33 @@ func (rt *Runtime) evalTransitionsLocked(graphID, nodeID, activationID string, s
 	// 逐一激活目标（转移记录已 durable；此处的崩溃窗口由 ResumeGraph 兜底）。
 	var errs []error
 	for _, rec := range targets {
+		current, err := rt.graph(graphID)
+		if err != nil {
+			errs = append(errs, err)
+			break
+		}
+		if current.Status.IsTerminal() {
+			break // 早到的 end/失败分支已收官，不得在终态 Graph 内再激活兄弟。
+		}
 		if err := rt.activateRecordedTransitionLocked(graphID, rec, result); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	// 结算可能让某些 join 的最后一个入边源进入终态：重推导全图 join 就绪性
 	// （覆盖「最后结算的源没有指向 join 的生效边」的就绪与 skipped 两种情形）。
-	errs = append(errs, rt.evaluateJoinsLocked(graphID))
+	if current, err := rt.graph(graphID); err != nil {
+		errs = append(errs, err)
+	} else if !current.Status.IsTerminal() {
+		errs = append(errs, rt.evaluateJoinsLocked(graphID))
+		errs = append(errs, rt.evaluateAcceptancesLocked(graphID))
+	}
 	return errors.Join(errs...)
 }
 
 // newTransitionRecordLocked 在边选择落盘前冻结它指向的 activation。目标已有
 // 在途 activation 时加入该 activation；否则复用尚未物化的 durable 预留，
 // 或预留下一个新 ID。TargetActivationID 与边选择同条 journal 记录落盘。
-func (rt *Runtime) newTransitionRecordLocked(graphID, sourceNodeID, sourceActivationID string, transitionID int, targetNodeID string) (TransitionRecord, error) {
+func (rt *Runtime) newTransitionRecordLocked(graphID, sourceNodeID, sourceActivationID string, transitionID int, targetNodeID, targetInput string) (TransitionRecord, error) {
 	doc, err := rt.graph(graphID)
 	if err != nil {
 		return TransitionRecord{}, err
@@ -603,8 +817,68 @@ func (rt *Runtime) newTransitionRecordLocked(graphID, sourceNodeID, sourceActiva
 		SourceActivationID: sourceActivationID,
 		TransitionID:       transitionID,
 		TargetNodeID:       targetNodeID,
+		TargetInput:        targetInput,
 		TargetActivationID: targetActivationID,
 	}, nil
+}
+
+// inputBindingConflictDetail 防御绕过 authoring 校验进入的旧图/损坏记录。
+// 普通节点的 activation 只能冻结一份输入；join/acceptance 的每个逻辑端口
+// 只能绑定一次。没有 generation/correlation token 时，不同静态生产者也
+// 不得在不同 activation 轮流占用同一普通输入/端口，否则迟到边会被误认成
+// 下一轮数据。
+func (rt *Runtime) inputBindingConflictDetail(graphID string, candidate TransitionRecord) string {
+	doc, err := rt.graph(graphID)
+	if err != nil {
+		return err.Error()
+	}
+	target, ok := doc.Nodes[candidate.TargetNodeID]
+	if !ok {
+		return fmt.Sprintf("目标节点 %s 不存在", candidate.TargetNodeID)
+	}
+	if target.Execution != nil {
+		target = nodeForExecution(target, *target.Execution)
+	}
+	barrier := target.Kind == KindJoin || target.Kind == KindAcceptance
+	logicalPort := candidate.TargetInput
+	if barrier && logicalPort == "" {
+		logicalPort = candidate.SourceNodeID // 旧无端口 barrier：每个来源视作独立端口
+	}
+	for _, existing := range rt.store.Transitions(graphID) {
+		if existing.TargetNodeID != candidate.TargetNodeID ||
+			(existing.SourceActivationID == candidate.SourceActivationID && existing.TransitionID == candidate.TransitionID) {
+			continue
+		}
+		if barrier {
+			existingPort := existing.TargetInput
+			if existingPort == "" {
+				existingPort = existing.SourceNodeID
+			}
+			if existingPort != logicalPort {
+				continue
+			}
+			if existing.TargetActivationID == candidate.TargetActivationID {
+				return fmt.Sprintf("barrier %s activation %s 的端口 %q 已由 %s/%s 绑定，不能再由 %s/%s 写入",
+					candidate.TargetNodeID, candidate.TargetActivationID, logicalPort,
+					existing.SourceNodeID, existing.SourceActivationID, candidate.SourceNodeID, candidate.SourceActivationID)
+			}
+			if existing.SourceNodeID != candidate.SourceNodeID || existing.TransitionID != candidate.TransitionID {
+				return fmt.Sprintf("barrier %s 的端口 %q 曾由生产边 %s.next[%d] 写入；缺少 generation/correlation token 时不能改由 %s.next[%d] 写入下一 activation",
+					candidate.TargetNodeID, logicalPort, existing.SourceNodeID, existing.TransitionID, candidate.SourceNodeID, candidate.TransitionID)
+			}
+			continue
+		}
+		if existing.TargetActivationID == candidate.TargetActivationID {
+			return fmt.Sprintf("普通节点 %s activation %s 已冻结来自 %s/%s 的输入，不能再绑定 %s/%s",
+				candidate.TargetNodeID, candidate.TargetActivationID,
+				existing.SourceNodeID, existing.SourceActivationID, candidate.SourceNodeID, candidate.SourceActivationID)
+		}
+		if existing.SourceNodeID != candidate.SourceNodeID || existing.TransitionID != candidate.TransitionID {
+			return fmt.Sprintf("普通节点 %s 曾由生产边 %s.next[%d] 激活；缺少 generation/correlation token 时不能把生产边切换为 %s.next[%d]",
+				candidate.TargetNodeID, existing.SourceNodeID, existing.TransitionID, candidate.SourceNodeID, candidate.TransitionID)
+		}
+	}
+	return ""
 }
 
 // pendingTargetActivationID 返回 durable transition 已预留、但目标节点尚未
@@ -667,6 +941,17 @@ func (rt *Runtime) activateRecordedTransitionLocked(graphID string, rec Transiti
 				graphID, rec.TargetNodeID, node.Execution.ActivationID, rec.TargetActivationID)
 		}
 	}
+	// 仅在确实需要补物化目标时解引用；已物化目标幂等跳过，不因历史边缺少
+	// 新 ResultRef 而误判。新记录优先走 activation Result Store，大结果和
+	// 回边覆盖旧 Execution 后仍能精确恢复；旧记录只接受完整内联 Result。
+	if input == nil {
+		input, err = rt.resolveTransitionResult(graphID, rec)
+		if err != nil {
+			reason := fmt.Sprintf("补激活边 %s[%d] -> %s 时输入不可恢复: %v",
+				rec.SourceActivationID, rec.TransitionID, rec.TargetNodeID, err)
+			return errors.Join(rt.failGraph(graphID, reason), fmt.Errorf("graph: %s", reason))
+		}
+	}
 	return rt.activateLocked(graphID, rec.TargetNodeID, input)
 }
 
@@ -689,12 +974,122 @@ func (rt *Runtime) activateRecordedTransitionLocked(graphID string, rec Transiti
 //   - join 就绪性按节点状态 + Transitions 重推导（含 C3 遗留的 waiting join）；
 //   - 已记录转移但目标 activation 尚未物化（两记录间的崩溃窗口）按记录
 //     冻结的 TargetActivationID 补激活；旧 journal 无该字段时仅补 inactive。
-//     上游 Result 本体不可恢复，router 目标仅 always/已记录边可确定性重放
-//     （已知限制，随 Result 持久化切片解决）。
+//     生效边 durable 绑定的内联 Result 随补激活重建（EdgeInput），router
+//     目标可精确重放条件；仅历史记录无内联或超大截断时按 always/已记录
+//     边兜底。
+//
+// ResumeGraph 恢复一张图（幂等；进程重启后由 bootstrap 逐张调用）。
+// 已停驻的图忽略——停驻图的解冻必须走 ResumeGraphsForSession（解除闸门 +
+// 对账 + 回放审批裁决的整体动作），单独恢复会在闸门仍在时补发任务。
 func (rt *Runtime) ResumeGraph(graphID string) error {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+	rt.synchronousSteps = 0
+	if rt.isSuspendedLocked(graphID) {
+		log.Printf("[graph] DEBUG 图 %s 已停驻，忽略单独恢复（解冻须走 ResumeGraphsForSession）", graphID)
+		return nil
+	}
 	return rt.resumeGraphLocked(graphID)
+}
+
+// CancelGraphTree durably cancels graphID and every materialized descendant
+// subgraph. It is idempotent: terminal graphs keep their existing outcome, but
+// are still traversed so an older/incomplete snapshot with a terminal ancestor
+// cannot resume a live descendant after restart.
+//
+// Descendants are cancelled post-order and do not settle their parent
+// subgraph nodes: the whole tree is already being torn down, so feeding a
+// synthetic failed result upward could select transitions while cancellation
+// is in progress. If the requested root itself newly becomes cancelled, its
+// enclosing (non-cancelled) parent is notified exactly once through the normal
+// subgraph completion guard.
+func (rt *Runtime) CancelGraphTree(graphID, reason string) error {
+	graphID = strings.TrimSpace(graphID)
+	if graphID == "" {
+		return fmt.Errorf("graph: graph_id 不能为空")
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "Graph cancelled by control plane"
+	}
+
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	_, cleanupErr, err := rt.cancelGraphTreeLocked(graphID, reason, true, make(map[string]struct{}))
+	return errors.Join(cleanupErr, err)
+}
+
+// TerminateAll 取消 Store 中全部非终态图（含各自的物化子图闭包），返回本次
+// 由在途迁移为 cancelled 的 graph ID 列表（按 ID 排序，结果确定）。供
+// 「/new force」等控制面一次性终止当前 session 全部图运行时使用。
+//
+// 逐图复用 cancelGraphTreeLocked 的完整收尾语义：子图树后序取消且不向上
+// 结算父节点、未收官节点 durable 取消、wait timer 停走、公告板任务尽力
+// 清理，每张新终结的图照常发 graph_ended 事件（下游 team.Manager 靠它回收
+// team），reason 经事件 Reason 字段与节点取消结果记录。notifyParent 恒为
+// false：全部在途图都在拆除中，子图取消若向上结算父节点，合成结果可能在
+// 拆除进行中选中转移。
+//
+// 幂等：快照时已终态的图跳过（保留既有终态结局，不重复发事件），连续调用
+// 第二次返回空。seen 集跨树共享：顶层图取消时其物化子图已在同一棵树的后序
+// 遍历中取消并登记，主循环扫到该子图 ID 时直接短路，不会重复清理公告板或
+// 重复发事件。单图失败只记日志、不中断其余图的终止（控制面 best-effort；
+// 公告板清理失败已由 terminateGraphTasksLocked 记日志，启动恢复时重试）。
+func (rt *Runtime) TerminateAll(reason string) []string {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "All Graphs terminated by control plane"
+	}
+
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+
+	// live 记录快照时在途的图：返回列表按「快照在途 → 本次 cancelled」的
+	// 真实迁移收集，树遍历中连带取消的物化子图同样计入。顶层图按 ID 排序后
+	// 恒先于其子图处理（子图 ID 以父图 ID 为前缀），父树取消后子图经 seen
+	// 短路，主循环的调用顺序不影响结果。
+	snapshot := rt.store.List()
+	live := make(map[string]struct{}, len(snapshot))
+	for _, summary := range snapshot {
+		if !summary.Status.IsTerminal() {
+			live[summary.GraphID] = struct{}{}
+		}
+	}
+
+	seen := make(map[string]struct{}, len(snapshot))
+	for _, summary := range snapshot {
+		if _, ok := live[summary.GraphID]; !ok {
+			continue
+		}
+		if _, _, err := rt.cancelGraphTreeLocked(summary.GraphID, reason, false, seen); err != nil {
+			log.Printf("[graph] ERROR: TerminateAll 终止图 %s 失败（继续终止其余图）: %v", summary.GraphID, err)
+		}
+	}
+
+	terminated := make([]string, 0, len(live))
+	for graphID := range live {
+		if doc, ok := rt.store.Get(graphID); ok && doc.Status == GraphCancelled {
+			terminated = append(terminated, graphID)
+		}
+	}
+	sort.Strings(terminated)
+	return terminated
+}
+
+// GraphsForSession 返回归属于 sessionID 的图 ID 列表（按 ID 排序，结果
+// 确定；Store.List 已按 graph_id 排序）。空串匹配无归属的历史图。
+//
+// 纯内存查询：Store.List 自带并发安全，故不持 rt.mu，避免与引擎变更串行
+// 争抢。供 bootstrap 在恢复/回填时按 session 归属过滤——本切片只提供
+// 查询面，不改任何恢复/回填流程。
+func (rt *Runtime) GraphsForSession(sessionID string) []string {
+	var out []string
+	for _, sum := range rt.store.List() {
+		if sum.SessionID == sessionID {
+			out = append(out, sum.GraphID)
+		}
+	}
+	return out
 }
 
 // resumeGraphLocked 是 ResumeGraph 的锁内实现（调用方须持 rt.mu）；
@@ -715,6 +1110,12 @@ func (rt *Runtime) resumeGraphLocked(graphID string) error {
 		doc, err = rt.graph(graphID)
 		if err != nil {
 			return err
+		}
+	}
+	for _, rec := range rt.store.Transitions(graphID) {
+		if detail := rt.inputBindingConflictDetail(graphID, rec); detail != "" {
+			reason := "恢复时发现 durable 数据流输入单赋值冲突：" + detail
+			return errors.Join(rt.failGraph(graphID, reason), fmt.Errorf("graph: %s", reason))
 		}
 	}
 	var errs []error
@@ -836,12 +1237,15 @@ func (rt *Runtime) resumeGraphLocked(graphID string) error {
 
 	// join 就绪性按节点状态 + Transitions 重推导（崩溃恢复不改变推导输入）。
 	errs = append(errs, rt.evaluateJoinsLocked(graphID))
+	// acceptance 的 data-ready 同口径重评估（data-wait 中迟到的入边绑定
+	// 可能已在崩溃前 durable）。
+	errs = append(errs, rt.evaluateAcceptancesLocked(graphID))
 	return errors.Join(errs...)
 }
 
-// resumeTerminalSettlementLocked 用 terminal 节点同条 durable 记录中的完整
-// Result 与 continuation 补完崩溃窗口。旧 journal 没有 Settlement 时不猜；
-// 新记录的所有动作都可幂等重放。
+// resumeTerminalSettlementLocked 用 terminal 节点同条 durable 记录中的
+// ResultRef 与 continuation 补完崩溃窗口。旧 journal 可回落到内联
+// Result；没有 Settlement 时不猜。新记录的所有动作都可幂等重放。
 func (rt *Runtime) resumeTerminalSettlementLocked(graphID, nodeID string, exec Execution) error {
 	doc, err := rt.graph(graphID)
 	if err != nil {
@@ -859,8 +1263,18 @@ func (rt *Runtime) resumeTerminalSettlementLocked(graphID, nodeID string, exec E
 		return fmt.Errorf("graph: 图 %s 节点 %s activation %s 的状态 %q 与 durable settlement %q 不一致",
 			graphID, nodeID, exec.ActivationID, node.Status, settlement.Status)
 	}
+	raw := settlement.Result // legacy fallback
+	if settlement.ResultRef != "" {
+		stored, ok := rt.store.ResolveActivationResult(graphID, settlement.ResultRef)
+		if !ok || stored.NodeID != nodeID || stored.ActivationID != exec.ActivationID {
+			reason := fmt.Sprintf("图 %s 节点 %s activation %s 的 durable settlement ResultRef %q 不可解引用或来源不一致",
+				graphID, nodeID, exec.ActivationID, settlement.ResultRef)
+			return errors.Join(rt.failGraph(graphID, reason), fmt.Errorf("graph: %s", reason))
+		}
+		raw = stored.Result
+	}
 	var result map[string]any
-	if err := json.Unmarshal(settlement.Result, &result); err != nil || result == nil {
+	if err := json.Unmarshal(raw, &result); err != nil || result == nil {
 		return fmt.Errorf("graph: 解码图 %s 节点 %s activation %s 的 durable settlement Result 失败: %v",
 			graphID, nodeID, exec.ActivationID, err)
 	}
@@ -875,6 +1289,8 @@ func (rt *Runtime) resumeTerminalSettlementLocked(graphID, nodeID string, exec E
 		return rt.completeGraph(graphID)
 	case SettlementContinueGraphFail:
 		return rt.failGraph(graphID, settlement.Reason)
+	case SettlementContinueNone:
+		return nil
 	default:
 		return fmt.Errorf("graph: 图 %s 节点 %s activation %s 的 durable settlement continuation %q 非法",
 			graphID, nodeID, exec.ActivationID, settlement.Continuation)
@@ -983,7 +1399,12 @@ func (rt *Runtime) activateLocked(graphID, nodeID string, input map[string]any) 
 // 写 activation 事实（ready），再发任务；发任务失败把节点标记 failed 并报错
 // （不出现「durable 说已激活但永远没有任务」）。路由与能力由 publishTask
 // 统一解析（acceptance 默认路由 acceptance.verify，见 resolveRoute）。
+// acceptance 是数据驱动的 barrier 节点，走 activateAcceptance 的 data-ready
+// 门控路径，不在此直接发任务。
 func (rt *Runtime) activateTaskNode(graphID, nodeID string, node Node) error {
+	if node.Kind == KindAcceptance {
+		return rt.activateAcceptance(graphID, nodeID, node)
+	}
 	exec, err := rt.activationFor(graphID, nodeID, node, phaseForKind(node.Kind))
 	if err != nil {
 		return err
@@ -993,6 +1414,154 @@ func (rt *Runtime) activateTaskNode(graphID, nodeID string, node Node) error {
 	}
 	rt.emitActivationCreated(graphID, nodeID, exec)
 	return rt.publishTask(graphID, nodeID, node, exec)
+}
+
+// activateAcceptance 激活 acceptance 节点：activation durable（ready）后不
+// 立即发任务——acceptance 的必需输入（入边源集合）须有生效且绑定到本
+// activation 的转移才进入 data-ready；未齐保持 data-wait，后续入边生效时
+// 由 evaluateAcceptancesLocked 重评估（结算与 ResumeGraph 的收尾挂钩）。
+// 单入边场景（implement→verify）边记录先于激活存在，评估立即就绪，行为
+// 与直接发任务一致。
+func (rt *Runtime) activateAcceptance(graphID, nodeID string, node Node) error {
+	exec, err := rt.activationFor(graphID, nodeID, node, phaseForKind(node.Kind))
+	if err != nil {
+		return err
+	}
+	if err := rt.writeNode(graphID, nodeID, exec, NodeReady); err != nil {
+		return err
+	}
+	rt.emitActivationCreated(graphID, nodeID, exec)
+	return rt.evaluateAcceptanceReadyLocked(graphID, nodeID)
+}
+
+// evaluateAcceptanceReadyLocked 评估 acceptance 节点的 data-ready：新图以
+// task.required_inputs 声明输入端口，每个端口至少有一条实际选中且绑定到
+// 当前 activation 的 TransitionRecord 即就绪。端口为单赋值；并行分支写
+// 不同端口，迟到输入不会提前发布。互斥 OR 暂不直接汇合。
+//
+// 兼容：root acceptance 无入边/无 required_inputs 可直接发布；旧单入边图
+// 等第一份绑定；旧多入边 durable 图仍按全部静态源终态且绑定的历史 barrier
+// 语义恢复（新 authoring 已拒绝这种歧义形态）。
+func (rt *Runtime) evaluateAcceptanceReadyLocked(graphID, nodeID string) error {
+	doc, err := rt.graph(graphID)
+	if err != nil {
+		return err
+	}
+	if doc.Status.IsTerminal() {
+		return nil
+	}
+	node, ok := doc.Nodes[nodeID]
+	if !ok {
+		return fmt.Errorf("%w: 图 %s 节点 %s", ErrNodeNotFound, graphID, nodeID)
+	}
+	if node.Kind != KindAcceptance || node.Status != NodeReady || node.Execution == nil || node.Execution.TaskID != "" {
+		return nil
+	}
+	exec := *node.Execution
+	exec.Input = rt.inputsFor(graphID, nodeID, exec.ActivationID)
+	required := rt.requiredInputPorts(graphID, doc, nodeID, node)
+	if len(required) > 0 {
+		if !inputPortsReady(exec.Input, required) {
+			return nil
+		}
+	} else {
+		sources := rt.inEdgeSources(graphID, doc, nodeID)
+		switch len(sources) {
+		case 0: // root acceptance：零输入就是完整输入集合
+		case 1:
+			if len(exec.Input) == 0 {
+				return nil
+			}
+		default:
+			if !rt.legacyBarrierReady(graphID, doc, nodeID, exec.ActivationID, sources) {
+				return nil
+			}
+		}
+	}
+	// 迟到的入边绑定可能晚于 activation 创建：发布前刷新输入快照，保证
+	// 任务注入与谱系核验看到发布时刻的完整事实。若输入确有变化，必须先把
+	// ready execution durable，再调用外部 TaskBoard：这样“任务已发布、
+	// running 尚未落盘”的崩溃窗口恢复时仍能用同一份完整输入对账。
+	hydrateExecutionEvidence(&exec)
+	if !reflect.DeepEqual(exec, *node.Execution) {
+		sv, err := rt.stateVersion(graphID)
+		if err != nil {
+			return err
+		}
+		if err := rt.store.SetExecution(graphID, nodeID, exec, sv); err != nil {
+			return err
+		}
+	}
+	node = nodeForExecution(node, exec)
+	return rt.publishTask(graphID, nodeID, node, exec)
+}
+
+func (rt *Runtime) requiredInputPorts(graphID string, doc *GraphDocument, targetID string, node Node) []string {
+	if node.Task != nil && len(node.Task.RequiredInputs) > 0 {
+		return append([]string(nil), node.Task.RequiredInputs...)
+	}
+	return rt.inEdgePorts(graphID, doc, targetID)
+}
+
+func inputPortsReady(inputs []InputBinding, required []string) bool {
+	bound := make(map[string]struct{}, len(inputs))
+	for _, in := range inputs {
+		if in.TargetInput != "" {
+			bound[in.TargetInput] = struct{}{}
+		}
+	}
+	for _, port := range required {
+		if _, ok := bound[port]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// legacyBarrierReady 只用于恢复旧多入边、无端口图。新提交/patch 已在
+// authoring 校验拒绝该歧义形态，运行时不再把它当作推荐建图方式。
+func (rt *Runtime) legacyBarrierReady(graphID string, doc *GraphDocument, targetID, targetActivationID string, sources []string) bool {
+	records := rt.store.Transitions(graphID)
+	for _, sourceID := range sources {
+		source := doc.Nodes[sourceID]
+		if !source.Status.IsTerminal() || source.Execution == nil {
+			return false
+		}
+		bound := false
+		for _, rec := range records {
+			if rec.SourceNodeID == sourceID && rec.SourceActivationID == source.Execution.ActivationID &&
+				rec.TargetNodeID == targetID && rec.TargetActivationID == targetActivationID {
+				bound = true
+				break
+			}
+		}
+		if !bound {
+			return false
+		}
+	}
+	return true
+}
+
+// evaluateAcceptancesLocked 重推导全图 acceptance 节点的 data-ready（与
+// evaluateJoinsLocked 同族：节点终态结算与 ResumeGraph 的收尾挂钩）。只
+// 处理 ready 且尚未发任务的 acceptance activation。
+func (rt *Runtime) evaluateAcceptancesLocked(graphID string) error {
+	doc, err := rt.graph(graphID)
+	if err != nil {
+		return err
+	}
+	if doc.Status.IsTerminal() {
+		return nil
+	}
+	var errs []error
+	for _, id := range sortedNodeIDs(doc) {
+		n := doc.Nodes[id]
+		if n.Kind != KindAcceptance || n.Status != NodeReady || n.Execution == nil || n.Execution.TaskID != "" {
+			continue
+		}
+		errs = append(errs, rt.evaluateAcceptanceReadyLocked(graphID, id))
+	}
+	return errors.Join(errs...)
 }
 
 // activateRouter 激活 router 节点：不发任务，激活即同步求值自己的 next
@@ -1010,9 +1579,21 @@ func (rt *Runtime) activateRouter(graphID, nodeID string, input map[string]any) 
 	if err != nil {
 		return err
 	}
+	if err := rt.consumeSynchronousStepLocked(graphID, nodeID, exec.ActivationID); err != nil {
+		return err
+	}
 	node = nodeForExecution(node, exec)
 	if err := rt.enterRunning(graphID, nodeID, node, exec); err != nil {
 		return err
+	}
+	if input == nil {
+		input, err = rt.resolveExecutionInput(graphID, exec)
+		if err != nil {
+			reason := fmt.Sprintf("router 节点 %s（activation %s）的 durable Input 不可解引用: %v", nodeID, exec.ActivationID, err)
+			return errors.Join(
+				rt.writeTerminalContinuationLocked(graphID, nodeID, exec, NodeFailed, map[string]any{"error": reason}, SettlementContinueGraphFail, reason),
+				rt.failGraph(graphID, reason), fmt.Errorf("graph: %s", reason))
+		}
 	}
 
 	// 先判定「完全无出路」以保留 router 的既有失败语义；真正的边选择统一
@@ -1051,9 +1632,21 @@ func (rt *Runtime) activateEnd(graphID, nodeID string, input map[string]any) err
 	if err != nil {
 		return err
 	}
+	if err := rt.consumeSynchronousStepLocked(graphID, nodeID, exec.ActivationID); err != nil {
+		return err
+	}
 	node = nodeForExecution(node, exec)
 	if err := rt.enterRunning(graphID, nodeID, node, exec); err != nil {
 		return err
+	}
+	if input == nil {
+		input, err = rt.resolveExecutionInput(graphID, exec)
+		if err != nil {
+			reason := fmt.Sprintf("end 节点 %s（activation %s）的 durable Input 不可解引用: %v", nodeID, exec.ActivationID, err)
+			return errors.Join(
+				rt.writeTerminalContinuationLocked(graphID, nodeID, exec, NodeFailed, map[string]any{"error": reason}, SettlementContinueGraphFail, reason),
+				rt.failGraph(graphID, reason), fmt.Errorf("graph: %s", reason))
+		}
 	}
 	if err := rt.writeTerminalContinuationLocked(graphID, nodeID, exec, NodeCompleted,
 		input, SettlementContinueGraphComplete, ""); err != nil {
@@ -1151,6 +1744,7 @@ func (rt *Runtime) scheduleWaitTimeoutLocked(graphID, nodeID string, exec Execut
 	rt.waitTimers[key] = time.AfterFunc(delay, func() {
 		rt.mu.Lock()
 		defer rt.mu.Unlock()
+		rt.synchronousSteps = 0
 		delete(rt.waitTimers, key)
 		if err := rt.settleWaitTimeoutLocked(graphID, nodeID, exec.ActivationID); err != nil {
 			log.Printf("[graph] WARNING: 图 %s 节点 %s activation %s 超时结算失败: %v",
@@ -1166,6 +1760,12 @@ func (rt *Runtime) settleWaitTimeoutLocked(graphID, nodeID, activationID string)
 		return err
 	}
 	if doc.Status.IsTerminal() {
+		return nil
+	}
+	if rt.isSuspendedLocked(graphID) {
+		// 停驻期间 timer 已停走：此为停走前已触发、等在 rt.mu 上的在途
+		// 回调。deadline 是 durable wall-clock，解冻恢复时按原 deadline
+		// 补结算（已过期则立即超时），此处直接吞掉。
 		return nil
 	}
 	node, ok := doc.Nodes[nodeID]
@@ -1203,6 +1803,9 @@ func (rt *Runtime) settleWaitTimeoutLocked(graphID, nodeID, activationID string)
 func (rt *Runtime) activateTool(graphID, nodeID string, node Node) error {
 	exec, err := rt.activationFor(graphID, nodeID, node, "executing")
 	if err != nil {
+		return err
+	}
+	if err := rt.consumeSynchronousStepLocked(graphID, nodeID, exec.ActivationID); err != nil {
 		return err
 	}
 	node = nodeForExecution(node, exec)
@@ -1404,6 +2007,12 @@ func (rt *Runtime) onChildGraphEnded(childID string, childStatus GraphStatus) er
 	if !ok {
 		return nil
 	}
+	if rt.isSuspendedLocked(parentID) {
+		// 停驻闸门：子图终态（如控制面冻结期取消子图）不推进父图。该事实
+		// 可自愈——解冻恢复时 ensureSubgraphLocked 见子图已终态会补结算。
+		log.Printf("[graph] DEBUG 父图 %s 已停驻，吞掉子图 %s 的终态回调（解冻恢复时补结算）", parentID, childID)
+		return nil
+	}
 	return rt.settleSubgraphParentLocked(parentID, nodeID, activationID, childID, childStatus)
 }
 
@@ -1448,9 +2057,11 @@ func (rt *Runtime) settleSubgraphParentLocked(parentID, nodeID, activationID, ch
 		status = NodeFailed
 	}
 	result := map[string]any{
-		"event":          event,
-		"child_graph_id": childID,
-		"child_result":   rt.childResultSummary(childID),
+		"event":                event,
+		"child_graph_id":       childID,
+		"child_result_ref":     rt.childResultRef(childID),
+		"child_result_summary": rt.childResultSummary(childID),
+		"child_result":         rt.childResultSummary(childID), // 兼容旧消费者
 	}
 	exec := *ex
 	if err := rt.writeNode(parentID, nodeID, exec, NodeRunning); err != nil {
@@ -1462,8 +2073,38 @@ func (rt *Runtime) settleSubgraphParentLocked(parentID, nodeID, activationID, ch
 	return rt.evalTransitionsLocked(parentID, nodeID, activationID, status, result)
 }
 
-// childResultSummary 取子图结果摘要：优先子图 end 节点的 result_ref
-// （最后一条转移的输入摘要），找不到时退化为子图终态串。
+// childResultRef 返回子图 end activation 的稳定 ResultRef。升级中间态可能
+// 仍把摘要写在 Execution.ResultRef；此时只在 activation Result Store 确认
+// 可解引用后才返回，绝不把摘要伪装成引用。
+func (rt *Runtime) childResultRef(childID string) string {
+	child, ok := rt.store.Get(childID)
+	if !ok {
+		return ""
+	}
+	for _, id := range sortedNodeIDs(child) {
+		n := child.Nodes[id]
+		activeNode := n
+		if n.Execution != nil {
+			activeNode = nodeForExecution(n, *n.Execution)
+		}
+		if activeNode.Kind != KindEnd || n.Execution == nil {
+			continue
+		}
+		if n.Execution.ResultRef != "" {
+			if _, ok := rt.store.ResolveActivationResult(childID, n.Execution.ResultRef); ok {
+				return n.Execution.ResultRef
+			}
+		}
+		ref := activationResultRef(childID, n.Execution.ActivationID)
+		if _, ok := rt.store.ResolveActivationResult(childID, ref); ok {
+			return ref
+		}
+	}
+	return ""
+}
+
+// childResultSummary 取子图 end activation 的展示摘要；新记录读取明确的
+// ResultSummary，升级中间态/旧记录才兼容回落或按稳定引用重新生成。
 func (rt *Runtime) childResultSummary(childID string) string {
 	child, ok := rt.store.Get(childID)
 	if !ok {
@@ -1475,8 +2116,19 @@ func (rt *Runtime) childResultSummary(childID string) string {
 		if n.Execution != nil {
 			activeNode = nodeForExecution(n, *n.Execution)
 		}
-		if activeNode.Kind == KindEnd && n.Execution != nil && n.Execution.ResultRef != "" {
-			return n.Execution.ResultRef
+		if activeNode.Kind == KindEnd && n.Execution != nil {
+			if n.Execution.ResultSummary != "" {
+				return n.Execution.ResultSummary
+			}
+			if n.Execution.ResultRef != "" {
+				if stored, ok := rt.store.ResolveActivationResult(childID, n.Execution.ResultRef); ok {
+					var result map[string]any
+					if json.Unmarshal(stored.Result, &result) == nil {
+						return summarizeResult(result)
+					}
+				}
+				return n.Execution.ResultRef // 旧记录：该字段历史上就是摘要
+			}
 		}
 	}
 	return string(child.Status)
@@ -1488,12 +2140,11 @@ func (rt *Runtime) childResultSummary(childID string) string {
 
 // evaluateJoinLocked 评估单个 join 节点的就绪性（readiness 纯推导，不加
 // 持久状态）：
-//   - 全部入边源节点（定义期静态集合）的最新 activation 均已终态，且 ≥1 条
-//     入边已 RecordTransition 生效 → 归并完成（Result 以源节点 ID 为键
-//     合并各已生效源的结果）并求值转移；
-//   - 全部源已终态但无入边生效 → 置 skipped（终态，不触发 next；仅从未
-//     激活过的 inactive join 可置 skipped）；
-//   - 否则保持现状（其它源终态后由结算路径重推导）。
+//   - 新图：每个 required input port 恰有一条实际选中边绑定到同一目标
+//     activation 后归并完成；不同端口是 AND，每个端口都是单赋值；
+//   - 兼容旧无端口图：全部静态源终态且至少一条入边生效时归并；全部源
+//     终态但无入边生效时置 skipped（终态，不触发 next）；
+//   - 否则保持现状，后续边生效或恢复收尾时再次纯推导。
 //
 // 可处理的状态：inactive（首次）、ready（就绪结算中途崩溃，就绪性单调，
 // 重评估仍就绪）、completed/failed/blocked（回边后再就绪，新 activation）、
@@ -1519,8 +2170,17 @@ func (rt *Runtime) evaluateJoinLocked(graphID, joinID string) error {
 		return nil // running/skipped/cancelled 不就绪评估
 	}
 	sources := rt.inEdgeSources(graphID, doc, joinID)
-	allTerminal, fired, merged := rt.joinReadiness(graphID, doc, joinID, sources)
-	if !allTerminal {
+	targetActivationID := rt.pendingTargetActivationID(graphID, joinID, node)
+	if node.Execution != nil && (node.Status == NodeReady || node.Status == NodeWaiting) {
+		targetActivationID = node.Execution.ActivationID
+	}
+	requiredPorts := rt.requiredInputPorts(graphID, doc, joinID, node)
+	ready, fired, merged, err := rt.joinReadiness(graphID, doc, joinID, targetActivationID, sources, requiredPorts)
+	if err != nil {
+		reason := fmt.Sprintf("join 节点 %s 无法解引用输入: %v", joinID, err)
+		return errors.Join(rt.failGraph(graphID, reason), fmt.Errorf("graph: %s", reason))
+	}
+	if !ready {
 		return nil
 	}
 	if len(fired) == 0 {
@@ -1543,6 +2203,9 @@ func (rt *Runtime) evaluateJoinLocked(graphID, joinID string) error {
 	if err != nil {
 		return err
 	}
+	if err := rt.consumeSynchronousStepLocked(graphID, joinID, exec.ActivationID); err != nil {
+		return err
+	}
 	if node.Status == NodeWaiting {
 		// C3 挂起遗留：复用原 activation，waiting → running。
 		if err := rt.writeNode(graphID, joinID, exec, NodeRunning); err != nil {
@@ -1556,12 +2219,16 @@ func (rt *Runtime) evaluateJoinLocked(graphID, joinID string) error {
 	if err := rt.writeTerminalLocked(graphID, joinID, exec, NodeCompleted, merged); err != nil {
 		return err
 	}
+	total := len(sources)
+	if len(requiredPorts) > 0 {
+		total = len(requiredPorts)
+	}
 	trace.Emit(trace.Event{
 		Kind:         trace.KindGraphJoinResolved,
 		GraphID:      graphID,
 		NodeID:       joinID,
 		ActivationID: exec.ActivationID,
-		Description:  fmt.Sprintf("生效入边 %d/%d", len(fired), len(sources)),
+		Description:  fmt.Sprintf("生效输入 %d/%d", len(fired), total),
 	})
 	return rt.evalTransitionsLocked(graphID, joinID, exec.ActivationID, NodeCompleted, merged)
 }
@@ -1595,41 +2262,64 @@ func (rt *Runtime) evaluateJoinsLocked(graphID string) error {
 	return errors.Join(errs...)
 }
 
-// joinReadiness 推导 join 的就绪输入：全部入边源的最新 activation 是否均
-// 已终态、哪些源有生效入边（已 RecordTransition）、归并的 Result
-// （源节点 ID → 结果本体；结果本体未持久化，内存缓存缺失时退化为源的
-// result_ref 摘要字符串，随 Result 持久化切片解决）。
-func (rt *Runtime) joinReadiness(graphID string, doc *GraphDocument, joinID string, sources []string) (allTerminal bool, fired []string, merged map[string]any) {
-	records := rt.store.Transitions(graphID)
-	for _, sid := range sources {
-		if !doc.Nodes[sid].Status.IsTerminal() {
-			return false, nil, nil
-		}
-	}
-	merged = make(map[string]any, len(sources))
-	for _, sid := range sources {
-		sn := doc.Nodes[sid]
-		if sn.Execution == nil || sn.Execution.ActivationID == "" {
-			continue
-		}
-		sourceFired := false
-		for _, rec := range records {
-			if rec.SourceActivationID == sn.Execution.ActivationID && rec.TargetNodeID == joinID {
-				sourceFired = true
+// joinReadiness 以目标 activation 的实际输入端口推导 barrier：requiredPorts
+// 非空时每个端口至少一条实际选中边；空时只为旧图保留静态源 barrier。
+// 归并键优先使用 target_input（数据流端口），旧记录回落 source_node_id。
+// Result 必须来自 activation Result Store 或旧记录的完整内联值，绝不回退到
+// 展示摘要 ResultRef。
+func (rt *Runtime) joinReadiness(graphID string, doc *GraphDocument, joinID, targetActivationID string, sources, requiredPorts []string) (ready bool, fired []string, merged map[string]any, err error) {
+	if targetActivationID == "" {
+		allSourcesTerminal := len(sources) > 0
+		for _, sourceID := range sources {
+			if !doc.Nodes[sourceID].Status.IsTerminal() {
+				allSourcesTerminal = false
 				break
 			}
 		}
-		if !sourceFired {
-			continue
+		if allSourcesTerminal || (len(sources) == 0 && len(requiredPorts) == 0) {
+			return true, nil, map[string]any{}, nil
 		}
-		fired = append(fired, sid)
-		if live, ok := rt.results[graphID][sid]; ok {
-			merged[sid] = live
-		} else {
-			merged[sid] = sn.Execution.ResultRef
+		return false, nil, nil, nil
+	}
+	inputs := rt.inputsFor(graphID, joinID, targetActivationID)
+	if len(requiredPorts) > 0 {
+		if !inputPortsReady(inputs, requiredPorts) {
+			return false, nil, nil, nil
+		}
+	} else {
+		for _, sourceID := range sources {
+			if !doc.Nodes[sourceID].Status.IsTerminal() {
+				return false, nil, nil, nil
+			}
 		}
 	}
-	return true, fired, merged
+
+	merged = make(map[string]any, len(inputs))
+	for _, rec := range rt.store.Transitions(graphID) {
+		if rec.TargetNodeID != joinID || rec.TargetActivationID != targetActivationID {
+			continue
+		}
+		value, resolveErr := rt.resolveTransitionResult(graphID, rec)
+		if resolveErr != nil {
+			return false, nil, nil, resolveErr
+		}
+		key := rec.TargetInput
+		if key == "" {
+			key = rec.SourceNodeID
+		}
+		fired = append(fired, key)
+		if previous, exists := merged[key]; exists {
+			switch list := previous.(type) {
+			case []any:
+				merged[key] = append(list, value)
+			default:
+				merged[key] = []any{previous, value}
+			}
+		} else {
+			merged[key] = value
+		}
+	}
+	return true, fired, merged, nil
 }
 
 // inEdgeSources 计算 join 对当前各 source activation 可见的入边集合：有
@@ -1667,12 +2357,42 @@ func (rt *Runtime) inEdgeSources(graphID string, doc *GraphDocument, joinID stri
 	return out
 }
 
+// inEdgePorts 推导目标节点的输入端口契约：优先读取各来源当前 activation
+// 冻结 Definition.Next，另把已 durable TransitionRecord.TargetInput 纳入，
+// 防止 patch 后丢失在途 activation 的端口。不同端口构成 AND barrier；端口
+// 是单赋值，当前不允许多条候选入边共享端口。
+func (rt *Runtime) inEdgePorts(graphID string, doc *GraphDocument, targetID string) []string {
+	set := make(map[string]struct{})
+	for _, id := range sortedNodeIDs(doc) {
+		node := doc.Nodes[id]
+		if node.Execution != nil {
+			node = nodeForExecution(node, *node.Execution)
+		}
+		for _, tr := range node.Next {
+			if tr.To == targetID && tr.TargetInput != "" {
+				set[tr.TargetInput] = struct{}{}
+			}
+		}
+	}
+	for _, rec := range rt.store.Transitions(graphID) {
+		if rec.TargetNodeID == targetID && rec.TargetInput != "" {
+			set[rec.TargetInput] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for port := range set {
+		out = append(out, port)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // publishTask 发布节点任务：成功则 durable task_id 并置 running；失败则
 // 节点标记 failed、图置 failed 并返回中文错误。恢复路径以同一 activation
 // 补发（TaskBoard 幂等键去重）。
 func (rt *Runtime) publishTask(graphID, nodeID string, node Node, exec Execution) error {
 	node = nodeForExecution(node, exec)
-	spec := taskSpecFor(graphID, nodeID, node, exec)
+	spec := rt.taskSpecFor(graphID, nodeID, node, exec)
 	if rt.board == nil {
 		reason := fmt.Sprintf("节点 %s（activation %s）需要发布任务但 TaskBoard 未配置", nodeID, exec.ActivationID)
 		return errors.Join(
@@ -1696,22 +2416,44 @@ func (rt *Runtime) publishTask(graphID, nodeID string, node Node, exec Execution
 	return rt.writeNode(graphID, nodeID, exec, NodeRunning)
 }
 
+func (rt *Runtime) taskSpecFor(graphID, nodeID string, node Node, exec Execution) TaskSpec {
+	spec := taskSpecFor(graphID, nodeID, node, exec)
+	// TaskSpec 是一次性发布副本：大 Result 在 GraphDocument/TransitionRecord
+	// 中仍只保留有界内联 + ResultRef，此处按引用临时展开给任务桥，由桥的总
+	// 上下文上限决定实际注入量，不把全文重复写回 Graph journal。
+	for i := range spec.Inputs {
+		if spec.Inputs[i].ResultRef == "" {
+			continue
+		}
+		if stored, ok := rt.store.ResolveActivationResult(graphID, spec.Inputs[i].ResultRef); ok {
+			spec.Inputs[i].Result = append(json.RawMessage(nil), stored.Result...)
+		}
+	}
+	if node.Kind == KindAcceptance {
+		spec.MissingEvidence = rt.missingEvidenceRequirements(graphID, exec, spec.RequiredEvidence)
+	}
+	return spec
+}
+
 func taskSpecFor(graphID, nodeID string, node Node, exec Execution) TaskSpec {
 	spec := TaskSpec{
 		GraphID:      graphID,
 		NodeID:       nodeID,
 		ActivationID: exec.ActivationID,
+		NodeKind:     node.Kind,
 		Route:        resolveRoute(node),
 	}
 	if node.Task != nil {
 		spec.Title = node.Task.Title
 		spec.Description = node.Task.Description
+		spec.RequiredEvidence = append([]EvidenceRequirement(nil), node.Task.RequiredEvidence...)
 	}
 	if c := node.Capability; c != nil {
 		spec.Tools = c.Tools
 		spec.Model = c.Model
 		spec.Isolation = c.Isolation
 	}
+	spec.Inputs = append([]InputBinding(nil), exec.Input...)
 	return spec
 }
 
@@ -1735,7 +2477,7 @@ func (rt *Runtime) reconcileTaskLocked(graphID, nodeID string, node Node, exec E
 		return fmt.Errorf("graph: 查询图 %s 节点 %s activation %s 的任务: %w", graphID, nodeID, exec.ActivationID, err)
 	}
 	if !found {
-		taskID, err := rt.board.PublishGraphTask(taskSpecFor(graphID, nodeID, node, exec))
+		taskID, err := rt.board.PublishGraphTask(rt.taskSpecFor(graphID, nodeID, node, exec))
 		if err != nil {
 			return fmt.Errorf("graph: 恢复补发图 %s 节点 %s activation %s 的任务: %w", graphID, nodeID, exec.ActivationID, err)
 		}
@@ -1748,6 +2490,10 @@ func (rt *Runtime) reconcileTaskLocked(graphID, nodeID string, node Node, exec E
 			return err
 		}
 		return rt.store.SetExecution(graphID, nodeID, exec, sv)
+	}
+	if snapshot.NodeKind != "" && snapshot.NodeKind != node.Kind {
+		return fmt.Errorf("graph: 图 %s 节点 %s activation %s 的 Task 节点类型=%s，与冻结定义=%s 不一致",
+			graphID, nodeID, exec.ActivationID, snapshot.NodeKind, node.Kind)
 	}
 	taskID := snapshot.TaskID
 	if taskID == "" {
@@ -1783,13 +2529,22 @@ func (rt *Runtime) reconcileTaskLocked(graphID, nodeID string, node Node, exec E
 	fact := TerminalFact{
 		GraphID: graphID, NodeID: nodeID, ActivationID: exec.ActivationID,
 		TaskID: taskID, Status: snapshot.TerminalStatus, Result: snapshot.Result,
+		Evidence: snapshot.Evidence,
 	}
 	if node.Status == NodeReady {
 		if err := rt.writeNode(graphID, nodeID, exec, NodeRunning); err != nil {
 			return err
 		}
 	}
-	if node.Kind == KindAcceptance && fact.Status == NodeCompleted && rt.acceptVerifier != nil {
+	// 与正常 OnTaskTerminal 路径同构：先恢复输入谱系，再合并本任务证据。
+	// 覆盖会丢失上游 lineage；而 recovery 若据此重写已先落盘的不可变
+	// ActivationResult，还会制造“同 activation 改写结果”冲突。
+	hydrateExecutionEvidence(&exec)
+	if len(fact.Evidence) > 0 {
+		exec.Evidence = appendEvidenceUnique(exec.Evidence, fact.Evidence...)
+		hydrateExecutionEvidence(&exec)
+	}
+	if node.Kind == KindAcceptance && fact.Status == NodeCompleted {
 		return rt.settleAcceptanceLocked(fact, exec)
 	}
 	return rt.settleNodeLocked(graphID, nodeID, exec, fact.Status, fact.Result)
@@ -1799,10 +2554,10 @@ func (rt *Runtime) reconcileTaskLocked(graphID, nodeID string, node Node, exec E
 // 转移条件求值
 // ============================================================
 
-// evalCondition 求值一条转移条件。when 缺省恒真；事件形态先取
-// Result["event"]（非空字符串），缺省回落终态映射
-// （completed/failed/blocked），"always" 恒真；条件形态对 Result 按
-// $.field[.subfield] 路径取值后应用 eq/ne/in/exists。
+// evalCondition 求值一条转移条件。when 缺省恒真；事件形态中 failed /
+// blocked 终态是绝对路由权威，只有 completed 才允许 Result["event"]
+// （非空字符串）细分业务事件，缺省回落 completed；"always" 恒真；
+// 条件形态对 Result 按 $.field[.subfield] 路径取值后应用 eq/ne/in/exists。
 //
 // 路径缺失语义（与 jq 的 null 语义对齐）：eq=false、ne=true、in=false、
 // exists=false；exists 只判断键存在性（值为 null 也算存在）。
@@ -1831,21 +2586,22 @@ func evalCondition(when *Condition, status NodeStatus, result map[string]any) bo
 	return false
 }
 
-// eventNameOf 求事件形态的当前事件名：Result["event"]（非空字符串）优先，
-// 缺省回落节点终态映射（completed/failed/blocked）。
+// eventNameOf 求事件形态的当前事件名。failed / blocked 终态绝对优先，
+// 防止节点用 Result["event"] 伪装成功；仅 completed 允许非空 event 细分
+// 业务事件，缺省回落 completed。
 func eventNameOf(status NodeStatus, result map[string]any) string {
-	if result != nil {
-		if s, ok := result["event"].(string); ok && s != "" {
-			return s
-		}
-	}
 	switch status {
-	case NodeCompleted:
-		return EventCompleted
 	case NodeFailed:
 		return EventFailed
 	case NodeBlocked:
 		return EventBlocked
+	case NodeCompleted:
+		if result != nil {
+			if s, ok := result["event"].(string); ok && s != "" {
+				return s
+			}
+		}
+		return EventCompleted
 	}
 	return string(status)
 }
@@ -1922,6 +2678,226 @@ func summarizeResult(result map[string]any) string {
 	return string(data)
 }
 
+// summarizeBounded 生成数据流绑定的有界摘要：JSON 序列化后按 rune 截断
+// （上限 InputSummaryMaxRunes），供 EdgeInput.Summary / 任务注入使用。
+func summarizeBounded(result map[string]any, maxRunes int) string {
+	if len(result) == 0 {
+		return ""
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		return ""
+	}
+	r := []rune(string(data))
+	if len(r) > maxRunes {
+		return string(r[:maxRunes]) + "…（已截断）"
+	}
+	return string(r)
+}
+
+// newEdgeInput 为一条生效转移构造持久化输入绑定：完整 Result 不超过
+// InputInlineMaxBytes 时内联，否则只携带摘要与证据引用（Truncated）。
+// 返回指针永不为 nil——空结果也显式绑定（"绑定过"与"历史记录无字段"
+// 由 nil 区分）。
+func newEdgeInput(result map[string]any, evidence []EvidenceEntry) *EdgeInput {
+	return newEdgeInputWithRef(result, "", evidence)
+}
+
+func newEdgeInputWithRef(result map[string]any, resultRef string, evidence []EvidenceEntry) *EdgeInput {
+	if result == nil {
+		result = map[string]any{}
+	}
+	in := &EdgeInput{
+		Summary:   summarizeBounded(result, InputSummaryMaxRunes),
+		ResultRef: resultRef,
+		Evidence:  append([]EvidenceEntry(nil), evidence...),
+	}
+	for _, e := range evidence {
+		if e.Ref != "" && !containsString(in.EvidenceRefs, e.Ref) {
+			in.EvidenceRefs = append(in.EvidenceRefs, e.Ref)
+		}
+	}
+	if raw, err := json.Marshal(result); err == nil && len(raw) <= InputInlineMaxBytes {
+		in.Result = json.RawMessage(append([]byte(nil), raw...))
+	} else {
+		in.Truncated = true
+	}
+	return in
+}
+
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+func appendEvidenceUnique(dst []EvidenceEntry, entries ...EvidenceEntry) []EvidenceEntry {
+	seen := make(map[string]struct{}, len(dst)+len(entries))
+	for _, evidence := range dst {
+		if evidence.Ref != "" {
+			seen[evidence.Ref] = struct{}{}
+		}
+	}
+	for _, evidence := range entries {
+		if evidence.Ref == "" {
+			continue
+		}
+		if _, exists := seen[evidence.Ref]; exists {
+			continue
+		}
+		seen[evidence.Ref] = struct{}{}
+		dst = append(dst, evidence)
+	}
+	return dst
+}
+
+// hydrateExecutionEvidence 把输入绑定中的完整 EvidenceEntry 聚合进本
+// activation 的输出谱系。EvidenceRefs 兼容历史只引用记录，但没有对应
+// EvidenceEntry 的引用仍视为不可解引用，acceptance 不会采信。
+func hydrateExecutionEvidence(exec *Execution) {
+	if exec == nil {
+		return
+	}
+	for _, in := range exec.Input {
+		exec.Evidence = appendEvidenceUnique(exec.Evidence, in.Evidence...)
+		for _, ref := range in.EvidenceRefs {
+			if ref != "" && !containsString(exec.EvidenceRefs, ref) {
+				exec.EvidenceRefs = append(exec.EvidenceRefs, ref)
+			}
+		}
+	}
+	for _, evidence := range exec.Evidence {
+		if evidence.Ref != "" && !containsString(exec.EvidenceRefs, evidence.Ref) {
+			exec.EvidenceRefs = append(exec.EvidenceRefs, evidence.Ref)
+		}
+	}
+}
+
+func (rt *Runtime) resolveTransitionResult(graphID string, rec TransitionRecord) (map[string]any, error) {
+	if rec.Input != nil && rec.Input.ResultRef != "" {
+		stored, ok := rt.store.ResolveActivationResult(graphID, rec.Input.ResultRef)
+		if !ok {
+			return nil, fmt.Errorf("ResultRef %s 不可解引用", rec.Input.ResultRef)
+		}
+		if stored.NodeID != rec.SourceNodeID || stored.ActivationID != rec.SourceActivationID {
+			return nil, fmt.Errorf("ResultRef %s 来源为 %s/%s，与边来源 %s/%s 不一致",
+				rec.Input.ResultRef, stored.NodeID, stored.ActivationID, rec.SourceNodeID, rec.SourceActivationID)
+		}
+		var result map[string]any
+		if err := json.Unmarshal(stored.Result, &result); err != nil || result == nil {
+			return nil, fmt.Errorf("ResultRef %s 的完整 Result 非 JSON 对象: %v", rec.Input.ResultRef, err)
+		}
+		return result, nil
+	}
+	if rec.Input != nil && len(rec.Input.Result) > 0 {
+		var result map[string]any
+		if err := json.Unmarshal(rec.Input.Result, &result); err != nil || result == nil {
+			return nil, fmt.Errorf("边 %s -> %s 的内联 Result 非 JSON 对象: %v", rec.SourceActivationID, rec.TargetNodeID, err)
+		}
+		return result, nil
+	}
+	return nil, fmt.Errorf("边 %s -> %s 没有可解引用 ResultRef 或完整内联 Result", rec.SourceActivationID, rec.TargetNodeID)
+}
+
+func (rt *Runtime) resolveExecutionInput(graphID string, exec Execution) (map[string]any, error) {
+	if len(exec.Input) == 0 {
+		return map[string]any{}, nil
+	}
+	if len(exec.Input) == 1 {
+		in := exec.Input[0]
+		rec := TransitionRecord{
+			SourceNodeID: in.SourceNodeID, SourceActivationID: in.SourceActivationID,
+			TargetActivationID: exec.ActivationID,
+			Input:              &EdgeInput{ResultRef: in.ResultRef, Result: in.Result},
+		}
+		return rt.resolveTransitionResult(graphID, rec)
+	}
+	merged := make(map[string]any, len(exec.Input))
+	for _, in := range exec.Input {
+		rec := TransitionRecord{
+			SourceNodeID: in.SourceNodeID, SourceActivationID: in.SourceActivationID,
+			TargetActivationID: exec.ActivationID,
+			Input:              &EdgeInput{ResultRef: in.ResultRef, Result: in.Result},
+		}
+		value, err := rt.resolveTransitionResult(graphID, rec)
+		if err != nil {
+			return nil, err
+		}
+		key := in.TargetInput
+		if key == "" {
+			key = in.SourceNodeID
+		}
+		merged[key] = value
+	}
+	return merged, nil
+}
+
+// inputsFor 推导一个 activation 的持久化输入绑定集：全部指向
+// (nodeID, activationID) 的已生效 TransitionRecord，按
+// (SourceNodeID, SourceActivationID, TransitionID) 升序输出。历史记录
+// 无 Input 字段时只保留来源标识。activation 创建时快照进 Execution.Input，
+// 恢复路径从同一 durable 记录重建，二者同源。
+func (rt *Runtime) inputsFor(graphID, nodeID, activationID string) []InputBinding {
+	var out []InputBinding
+	for _, rec := range rt.store.Transitions(graphID) {
+		if rec.TargetNodeID != nodeID || rec.TargetActivationID != activationID {
+			continue
+		}
+		b := InputBinding{
+			SourceNodeID: rec.SourceNodeID, SourceActivationID: rec.SourceActivationID,
+			TargetInput: rec.TargetInput,
+		}
+		if rec.Input != nil {
+			b.Summary = rec.Input.Summary
+			b.ResultRef = rec.Input.ResultRef
+			b.Evidence = append([]EvidenceEntry(nil), rec.Input.Evidence...)
+			b.EvidenceRefs = append([]string(nil), rec.Input.EvidenceRefs...)
+			if len(rec.Input.Result) > 0 {
+				b.Result = append(json.RawMessage(nil), rec.Input.Result...)
+			}
+			b.Truncated = rec.Input.Truncated
+		}
+		out = append(out, b)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].SourceNodeID != out[j].SourceNodeID {
+			return out[i].SourceNodeID < out[j].SourceNodeID
+		}
+		return out[i].SourceActivationID < out[j].SourceActivationID
+	})
+	return out
+}
+
+// ============================================================
+// 紧急保险丝（只防御单次调用内的同步机械节点死循环，不可配置）
+// ============================================================
+
+// EmergencySynchronousStepFuse 是一次外部 Runtime 调用内允许的同步机械
+// activation 数。它不跨 OnTaskTerminal 调用累计，因此长 /goal 中 Agent
+// 回边可以产生任意多次 activation；只拦截 router/join/end/tool 不让出控制
+// 权的程序性自旋，防止递归耗尽栈。
+const EmergencySynchronousStepFuse = 128
+
+func (rt *Runtime) consumeSynchronousStepLocked(graphID, nodeID, activationID string) error {
+	rt.synchronousSteps++
+	if rt.synchronousSteps <= EmergencySynchronousStepFuse {
+		return nil
+	}
+	detail := fmt.Sprintf("一次 Runtime 调用内同步机械节点 activation 超过紧急上限 %d（当前 %s/%s）；判定为程序性同步死循环，Graph 已持久化 failed",
+		EmergencySynchronousStepFuse, nodeID, activationID)
+	log.Printf("[graph] ERROR 图 %s %s", graphID, detail)
+	// 先 durable 终结 Graph，再发通用 graph-change wake。已有 transition 即使
+	// 指向未物化 activation，也因 Graph terminal 不会在重启后继续自转。
+	failErr := rt.failGraph(graphID, detail)
+	rt.wakeGraphChange(TerminalFact{
+		GraphID: graphID, NodeID: nodeID, ActivationID: activationID,
+	}, "synchronous_activation_fuse", detail)
+	return errors.Join(failErr, fmt.Errorf("graph: %s", detail))
+}
+
 // ============================================================
 // 内部辅助（调用方须持 rt.mu）
 // ============================================================
@@ -1933,7 +2909,9 @@ func (rt *Runtime) activationFor(graphID, nodeID string, node Node, phase string
 	if node.Execution != nil && node.Execution.ActivationID != "" {
 		switch node.Status {
 		case NodeReady, NodeRunning, NodeWaiting:
-			return *node.Execution, nil
+			exec := *node.Execution
+			hydrateExecutionEvidence(&exec)
+			return exec, nil
 		}
 	}
 	id := rt.pendingTargetActivationID(graphID, nodeID, node)
@@ -1954,6 +2932,10 @@ func (rt *Runtime) activationFor(graphID, nodeID string, node Node, phase string
 		DefinitionRevision: doc.Revision,
 		Definition:         definitionFromNode(node),
 	}
+	// 数据流：activation 创建即快照其持久化输入绑定（与边选择记录同源，
+	// 恢复重建结果一致）。
+	exec.Input = rt.inputsFor(graphID, nodeID, id)
+	hydrateExecutionEvidence(&exec)
 	if node.Kind == KindWaitEvent && node.Wait != nil && node.Wait.TimeoutSec > 0 {
 		deadline := time.Now().UTC().Add(time.Duration(node.Wait.TimeoutSec) * time.Second)
 		exec.WaitDeadline = &deadline
@@ -2079,13 +3061,26 @@ func (rt *Runtime) failGraph(graphID, reason string) error {
 	if doc.Status.IsTerminal() {
 		return nil
 	}
+	descendantCleanupErr, err := rt.cancelDescendantGraphsLocked(graphID,
+		fmt.Sprintf("ancestor Graph %s failed: %s", graphID, reason))
+	if err != nil {
+		return errors.Join(descendantCleanupErr, err)
+	}
+	if err := rt.cancelUnfinishedNodesLocked(graphID, "Graph failed: "+reason); err != nil {
+		return errors.Join(descendantCleanupErr, err)
+	}
+	doc, err = rt.graph(graphID)
+	if err != nil {
+		return err
+	}
 	if err := rt.store.SetGraphStatus(graphID, GraphFailed, doc.StateVersion); err != nil {
 		return err
 	}
 	rt.cancelGraphWaitTimersLocked(graphID)
+	cleanupErr := errors.Join(descendantCleanupErr, rt.terminateGraphTasksLocked(graphID))
 	trace.Emit(trace.Event{Kind: trace.KindGraphEnded, GraphID: graphID, Reason: reason})
 	delete(rt.results, graphID)
-	return rt.onChildGraphEnded(graphID, GraphFailed)
+	return errors.Join(cleanupErr, rt.onChildGraphEnded(graphID, GraphFailed))
 }
 
 // completeGraph 把图置 completed 并发 graph_ended 事件。
@@ -2098,13 +3093,187 @@ func (rt *Runtime) completeGraph(graphID string) error {
 	if doc.Status.IsTerminal() {
 		return nil
 	}
+	descendantCleanupErr, err := rt.cancelDescendantGraphsLocked(graphID,
+		fmt.Sprintf("ancestor Graph %s completed", graphID))
+	if err != nil {
+		return errors.Join(descendantCleanupErr, err)
+	}
+	if err := rt.cancelUnfinishedNodesLocked(graphID, "Graph completed"); err != nil {
+		return errors.Join(descendantCleanupErr, err)
+	}
+	doc, err = rt.graph(graphID)
+	if err != nil {
+		return err
+	}
 	if err := rt.store.SetGraphStatus(graphID, GraphCompleted, doc.StateVersion); err != nil {
 		return err
 	}
 	rt.cancelGraphWaitTimersLocked(graphID)
+	cleanupErr := errors.Join(descendantCleanupErr, rt.terminateGraphTasksLocked(graphID))
 	trace.Emit(trace.Event{Kind: trace.KindGraphEnded, GraphID: graphID})
 	delete(rt.results, graphID)
-	return rt.onChildGraphEnded(graphID, GraphCompleted)
+	return errors.Join(cleanupErr, rt.onChildGraphEnded(graphID, GraphCompleted))
+}
+
+// cancelUnfinishedNodesLocked durably closes every activation that cannot
+// continue once the Graph has decided its terminal outcome. This happens
+// before graph status + graph_ended, so every observer sees a coherent
+// terminal document rather than a terminal Graph containing running siblings.
+// Caller must hold rt.mu.
+func (rt *Runtime) cancelUnfinishedNodesLocked(graphID, reason string) error {
+	doc, err := rt.graph(graphID)
+	if err != nil {
+		return err
+	}
+	for _, nodeID := range sortedNodeIDs(doc) {
+		current, err := rt.graph(graphID)
+		if err != nil {
+			return err
+		}
+		node := current.Nodes[nodeID]
+		// blocked is a settled diagnostic/replan fact even though the node state
+		// machine permits blocked -> ready. Preserve it when another branch/end
+		// closes the Graph; only genuinely unfinished work is cancelled.
+		if node.Status.IsTerminal() || node.Status == NodeBlocked {
+			continue
+		}
+		if node.Execution == nil || strings.TrimSpace(node.Execution.ActivationID) == "" {
+			if err := rt.store.SetNodeStatus(graphID, nodeID, NodeCancelled, current.StateVersion); err != nil {
+				return fmt.Errorf("graph: 收官时取消未激活节点 %s/%s: %w", graphID, nodeID, err)
+			}
+			continue
+		}
+		result := map[string]any{"status": "cancelled", "reason": reason}
+		if err := rt.writeTerminalContinuationLocked(graphID, nodeID, *node.Execution, NodeCancelled,
+			result, SettlementContinueNone, reason); err != nil {
+			return fmt.Errorf("graph: 收官时取消在途节点 %s/%s: %w", graphID, nodeID, err)
+		}
+	}
+	return nil
+}
+
+// cancelDescendantGraphsLocked terminates every materialized child tree while
+// leaving graphID itself untouched. It is used by completeGraph/failGraph
+// before the parent outcome is committed. Caller must hold rt.mu.
+func (rt *Runtime) cancelDescendantGraphsLocked(graphID, reason string) (cleanupErr error, err error) {
+	doc, err := rt.graph(graphID)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]struct{}{graphID: {}}
+	var cleanupErrs []error
+	for _, childID := range materializedChildGraphIDs(doc) {
+		if _, exists := rt.store.Get(childID); !exists {
+			// The child ID is durable before child submission. A crash in that
+			// narrow window legitimately leaves no child Graph to cancel.
+			continue
+		}
+		_, childCleanupErr, childErr := rt.cancelGraphTreeLocked(childID, reason, false, seen)
+		if childCleanupErr != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("graph: 收官时清理子图 %s 任务: %w", childID, childCleanupErr))
+		}
+		if childErr != nil {
+			return errors.Join(cleanupErrs...), fmt.Errorf("graph: 收官时取消子图 %s: %w", childID, childErr)
+		}
+	}
+	return errors.Join(cleanupErrs...), nil
+}
+
+// cancelGraphTreeLocked is the post-order implementation shared by the public
+// recovery/control-plane API and parent complete/fail teardown. newlyCancelled
+// reports whether graphID itself crossed into GraphCancelled during this call.
+// Caller must hold rt.mu.
+func (rt *Runtime) cancelGraphTreeLocked(graphID, reason string, notifyParent bool, seen map[string]struct{}) (newlyCancelled bool, cleanupErr error, err error) {
+	if _, ok := seen[graphID]; ok {
+		return false, nil, nil
+	}
+	seen[graphID] = struct{}{}
+
+	doc, err := rt.graph(graphID)
+	if err != nil {
+		return false, nil, err
+	}
+	var cleanupErrs []error
+	for _, childID := range materializedChildGraphIDs(doc) {
+		if _, exists := rt.store.Get(childID); !exists {
+			continue
+		}
+		_, childCleanupErr, childErr := rt.cancelGraphTreeLocked(childID, reason, false, seen)
+		if childCleanupErr != nil {
+			cleanupErrs = append(cleanupErrs, childCleanupErr)
+		}
+		if childErr != nil {
+			return false, errors.Join(cleanupErrs...), childErr
+		}
+	}
+
+	// Repair older terminal documents as well: before sibling teardown existed,
+	// a terminal Graph could retain ready/running/waiting nodes.
+	if err := rt.cancelUnfinishedNodesLocked(graphID, reason); err != nil {
+		return false, errors.Join(cleanupErrs...), err
+	}
+	doc, err = rt.graph(graphID)
+	if err != nil {
+		return false, errors.Join(cleanupErrs...), err
+	}
+	if doc.Status.IsTerminal() {
+		cleanupErrs = append(cleanupErrs, rt.terminateGraphTasksLocked(graphID))
+		return false, errors.Join(cleanupErrs...), nil
+	}
+	if err := rt.store.SetGraphStatus(graphID, GraphCancelled, doc.StateVersion); err != nil {
+		return false, errors.Join(cleanupErrs...), err
+	}
+	rt.cancelGraphWaitTimersLocked(graphID)
+	cleanupErrs = append(cleanupErrs, rt.terminateGraphTasksLocked(graphID))
+	trace.Emit(trace.Event{Kind: trace.KindGraphEnded, GraphID: graphID, Reason: reason})
+	delete(rt.results, graphID)
+	var parentErr error
+	if notifyParent {
+		parentErr = rt.onChildGraphEnded(graphID, GraphCancelled)
+	}
+	return true, errors.Join(cleanupErrs...), parentErr
+}
+
+// terminateGraphTasksLocked closes TaskBoard work owned by a terminal Graph.
+// Caller holds rt.mu and the Graph status is already durable. The operation is
+// deliberately best-effort across the GraphStore/TaskStore boundary: failure
+// cannot undo the Graph decision, but it is made explicit before graph_ended
+// and is retried by bootstrap recovery on the next start.
+func (rt *Runtime) terminateGraphTasksLocked(graphID string) error {
+	terminator, ok := rt.board.(GraphTaskTerminator)
+	if !ok || terminator == nil {
+		return nil
+	}
+	if err := terminator.TerminateGraphTasks(graphID); err != nil {
+		log.Printf("[graph] ERROR: 终态图 %s 清理公告板任务失败（已持久化的 Graph 终态不回滚）: %v", graphID, err)
+		trace.Emit(trace.Event{
+			Kind: trace.KindError, GraphID: graphID,
+			Error: fmt.Sprintf("终态图清理公告板任务失败（启动恢复将重试）: %v", err),
+		})
+		return err
+	}
+	return nil
+}
+
+func materializedChildGraphIDs(doc *GraphDocument) []string {
+	if doc == nil {
+		return nil
+	}
+	set := make(map[string]struct{})
+	for _, node := range doc.Nodes {
+		if node.Execution == nil {
+			continue
+		}
+		if childID := strings.TrimSpace(node.Execution.ChildGraphID); childID != "" {
+			set[childID] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for childID := range set {
+		out = append(out, childID)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // graph 读图（不存在返回 ErrGraphNotFound 包装错误）。

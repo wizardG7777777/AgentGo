@@ -41,12 +41,23 @@ type capabilityRegistry struct {
 	mu      sync.RWMutex
 	byAgent map[string][]string
 	byKind  map[string][]string
+	// schedulerAgentID is the exact built-in Scheduler identity. The
+	// "__scheduler__" route is reserved and never authorized by a string
+	// prefix, because static kind names are user-controlled.
+	schedulerAgentID string
 
 	// kindOf 解析 spawn ad-hoc agent 的 base kind（spawn.Manager.KindOf）；nil 跳过。
 	kindOf func(agentID string) string
-	// routeCaps 查询某 eventType 全部 ready listener 的能力交集
-	// （scheduler.AgentRegistry.RouteCapabilities）；nil 跳过。
-	routeCaps func(eventType string) ([]string, bool)
+	// routeCaps 查询 owner scope 可见的某 eventType ready listener 能力交集
+	// （scheduler.AgentRegistry.RouteCapabilitiesForPlan）；nil 跳过。
+	routeCaps func(ownerScope, eventType string) ([]string, bool)
+	// routeAllows 是带 owner scope 的 runtime 路由权威。Graph/Team
+	// 任务在认领时必须与提交时使用同一可见域。
+	routeAllows func(ownerScope, eventType string, requiredTools ...string) bool
+	// routeAgentAllows 进一步证明当前 agentID 确实是该 owner scope 下
+	// eventType 的具体 listener；仅证明 route 存在不能防止同名 listener
+	// 跨 scope 偷领。
+	routeAgentAllows func(agentID, ownerScope, eventType string) bool
 }
 
 func newCapabilityRegistry() *capabilityRegistry {
@@ -79,16 +90,54 @@ func (r *capabilityRegistry) checker() CapabilityChecker {
 }
 
 func (r *capabilityRegistry) check(agentID string, task *model.Task) error {
-	// 只约束显式声明了 tools 子集的任务；无能力声明的任务认领行为完全不变。
-	if task == nil || task.Capability == nil || len(task.Capability.Tools) == 0 {
+	if task == nil {
 		return nil
 	}
-	// scheduler 自身不在白名单 registry 内：topo=solo 时它亲自执行任务，
-	// 其工具面由 scheduler 固定装配而非 kind 声明——跳过检查（solo 语义）。
-	if agentID == "scheduler" {
+	isScheduler := r.schedulerAgentID != "" && agentID == r.schedulerAgentID
+	var required []string
+	if task.Capability != nil {
+		required = task.Capability.Tools
+	}
+	ownerScope := task.RouteScope
+	if ownerScope == "" {
+		// Additive snapshot compatibility: older snapshots did not persist the
+		// frozen owner but retain enough provenance to derive it exactly.
+		if task.GraphID != "" {
+			ownerScope = model.GraphRouteScope(task.GraphID)
+		} else if task.ParentTaskID != "" {
+			ownerScope = model.TaskRouteScope(task.ParentTaskID)
+		}
+	}
+	// __scheduler__ is a reserved built-in route, including ordinary root
+	// Scheduler tasks with no Graph/RouteScope. A user-configured static kind
+	// whose instance ID merely starts with "scheduler-" must never enter it.
+	if task.EventType == "__scheduler__" {
+		if !isScheduler {
+			return fmt.Errorf("reserved scheduler route identity check failed: agent %q is not built-in scheduler %q for task %s, fail-closed",
+				agentID, r.schedulerAgentID, task.ID)
+		}
 		return nil
 	}
-	required := task.Capability.Tools
+	if ownerScope != "" || strings.HasPrefix(task.EventType, "team:") {
+		if r.routeAllows == nil || !r.routeAllows(ownerScope, task.EventType, required...) {
+			return fmt.Errorf("runtime 路由作用域校验失败: task %s route=%q owner_scope=%q 对 agent %q 不可认领，按 fail-closed 拒绝",
+				task.ID, task.EventType, ownerScope, agentID)
+		}
+		if r.routeAgentAllows == nil || !r.routeAgentAllows(agentID, ownerScope, task.EventType) {
+			return fmt.Errorf("runtime 路由认领者身份校验失败: agent %q 不属于 task %s 的 route=%q owner_scope=%q，按 fail-closed 拒绝",
+				agentID, task.ID, task.EventType, ownerScope)
+		}
+	}
+	// scheduler 自身不在白名单 registry 内：topo=solo 时它亲自执行普通任务，
+	// 其工具面由 scheduler 固定装配而非 kind 声明——仅跳过工具检查。若任务
+	// 带 route scope，上面的具体 listener 身份检查仍然生效。
+	if isScheduler {
+		return nil
+	}
+	// 无工具子集时，路由作用域校验已完成，无需再解析认领者白名单。
+	if len(required) == 0 {
+		return nil
+	}
 
 	r.mu.RLock()
 	allowed, ok := r.byAgent[agentID]
@@ -109,12 +158,12 @@ func (r *capabilityRegistry) check(agentID string, task *model.Task) error {
 		}
 	}
 
-	// 动态 Team（及其他已注册 route）：按任务路由目标的能力交集判定。
-	// 认领者必然是该 route 的 listener（eventType 匹配由认领层保证），
-	// 交集语义保证「任意 listener 赢认领都满足 ⊆」。team 事件类型按 Team
-	// 唯一（team:<id>），不做归属 scope 过滤也不会跨 Team 串扰。
+	// 动态 Team（及其他已注册 route）：按 owner scope 内任务路由目标的
+	// 能力交集判定。具体认领者身份已由 routeAgentAllows 证明；交集语义
+	// 保证同一 scope 内「任意 listener 赢认领都满足 ⊆」，同时不会把
+	// EventType 碰撞的其他 scope listener 纳入能力计算。
 	if r.routeCaps != nil {
-		if allowed, ok := r.routeCaps(task.EventType); ok {
+		if allowed, ok := r.routeCaps(ownerScope, task.EventType); ok {
 			return capabilitySubsetError(agentID, task, required, allowed)
 		}
 	}

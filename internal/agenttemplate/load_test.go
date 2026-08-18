@@ -221,6 +221,10 @@ func TestLoadRejectsDuplicateUnknownAndControlTools(t *testing.T) {
 		{name: "publish", tools: "[publish_task]", validator: func([]string) error { return nil }, match: "reserved"},
 		{name: "scheduler control", tools: "[report_done]", validator: func([]string) error { return nil }, match: "reserved"},
 		{name: "team provisioning", tools: "[provision_agent_team]", validator: func([]string) error { return nil }, match: "reserved"},
+		{name: "scheduler result read", tools: "[get_task_result]", validator: func([]string) error { return nil }, match: "reserved"},
+		{name: "graph submit", tools: "[submit_graph]", validator: func([]string) error { return nil }, match: "reserved"},
+		{name: "graph read", tools: "[read_graph]", validator: func([]string) error { return nil }, match: "reserved"},
+		{name: "graph patch", tools: "[patch_graph]", validator: func([]string) error { return nil }, match: "reserved"},
 		{name: "runtime unknown", tools: "[not_registered]", validator: func([]string) error { return validatorErr }, match: validatorErr.Error()},
 	} {
 		tc := tc
@@ -242,21 +246,22 @@ system_prompt: test
 	}
 }
 
-func TestLoadAllowsReplanAndTaskResultSubmission(t *testing.T) {
+func TestLoadAllowsOrdinaryWorkerControlTools(t *testing.T) {
 	t.Parallel()
 
-	// request_replan / submit_task_result 是工作代理可持有的计划控制面工具
-	//（verifier 模板契约），不在保留清单内，模板可声明。
+	// request_replan / submit_task_result 是普通工作代理可持有的控制面工具，
+	// 不在模板加载器的保留清单内。正式 acceptance verifier 另由 Graph
+	// 提交校验与 ExecutionLease 正向闭集拒绝 request_replan。
 	dir := t.TempDir()
-	content := `name: custom-verifier
+	content := `name: custom-worker
 version: 1
-description: Custom verifier
+description: Custom worker
 tools: [read_file, request_replan, submit_task_result]
-system_prompt: verify
+system_prompt: work
 `
-	writeTestFile(t, filepath.Join(dir, "verifier.yaml"), content)
+	writeTestFile(t, filepath.Join(dir, "worker.yaml"), content)
 	if _, err := Load(LoadOptions{ProjectDirs: []string{dir}, DefaultModel: "test-model", ValidateTools: func([]string) error { return nil }}); err != nil {
-		t.Fatalf("Load verifier template: %v", err)
+		t.Fatalf("Load worker template: %v", err)
 	}
 }
 

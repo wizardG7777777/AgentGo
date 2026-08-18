@@ -68,11 +68,13 @@ func TestSchedulerGroup_Register_NoHolderSkipsReportDone(t *testing.T) {
 
 func TestSchedulerGroup_CancelTask_PendingTask(t *testing.T) {
 	s := newFakeStore()
+	schedTask := &model.Task{Description: "scheduler request", EventType: "__scheduler__"}
+	s.PublishTask(schedTask)
 	// fakeStore.PublishTask 把 status 置为 pending
 	parent := &model.Task{Description: "to cancel"}
 	s.PublishTask(parent)
 
-	g := SchedulerGroup{Store: s, Holder: &fakeHolder{id: "sched"}}
+	g := SchedulerGroup{Store: s, Holder: &fakeHolder{id: schedTask.ID}}
 	reg := agent.NewToolRegistry()
 	g.Register(reg)
 
@@ -97,6 +99,87 @@ func TestSchedulerGroup_CancelTask_MissingTaskID(t *testing.T) {
 	_, err := reg.Dispatch(context.Background(), mkCall("cancel_task", map[string]any{}))
 	if err == nil || !strings.Contains(err.Error(), "task_id") {
 		t.Errorf("expected missing task_id error, got %v", err)
+	}
+}
+
+func TestSchedulerGroup_CancelTask_GraphControllerAllowsSameGraph(t *testing.T) {
+	s, _ := newGuardedCancelStore(t)
+	controller := &model.Task{
+		ID: "controller-1", Description: "graph controller", EventType: "__scheduler__",
+		GraphID: "graph-a", NodeID: "controller", ActivationID: "controller@1",
+	}
+	target := &model.Task{
+		ID: "target-1", Description: "same graph target", EventType: "worker",
+		GraphID: "graph-a", NodeID: "work", ActivationID: "work@1",
+	}
+	if err := s.PublishTask(controller); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PublishTask(target); err != nil {
+		t.Fatal(err)
+	}
+
+	g := SchedulerGroup{Store: s, Holder: &fakeHolder{id: controller.ID}}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	if _, err := reg.Dispatch(context.Background(), mkCall("cancel_task", map[string]any{
+		"task_id": target.ID,
+		"reason":  "same graph cleanup",
+	})); err != nil {
+		t.Fatalf("same-Graph cancel_task should succeed: %v", err)
+	}
+	got, err := s.GetTask(target.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.TaskStatusCancelled {
+		t.Fatalf("target status = %s, want cancelled", got.Status)
+	}
+}
+
+func TestSchedulerGroup_CancelTask_GraphControllerRejectsOtherScopes(t *testing.T) {
+	tests := []struct {
+		name          string
+		targetGraphID string
+	}{
+		{name: "different graph", targetGraphID: "graph-b"},
+		{name: "legacy task", targetGraphID: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, _ := newGuardedCancelStore(t)
+			controller := &model.Task{
+				ID: "controller-1", Description: "graph controller", EventType: "__scheduler__",
+				GraphID: "graph-a", NodeID: "controller", ActivationID: "controller@1",
+			}
+			target := &model.Task{ID: "target-1", Description: "out of scope", GraphID: tt.targetGraphID}
+			if err := s.PublishTask(controller); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.PublishTask(target); err != nil {
+				t.Fatal(err)
+			}
+
+			g := SchedulerGroup{Store: s, Holder: &fakeHolder{id: controller.ID}}
+			reg := agent.NewToolRegistry()
+			g.Register(reg)
+
+			_, err := reg.Dispatch(context.Background(), mkCall("cancel_task", map[string]any{
+				"task_id": target.ID,
+				"reason":  "out of scope",
+			}))
+			if err == nil || !strings.Contains(err.Error(), "不属于当前 Graph graph-a") {
+				t.Fatalf("expected exact-Graph rejection, got %v", err)
+			}
+			got, getErr := s.GetTask(target.ID)
+			if getErr != nil {
+				t.Fatal(getErr)
+			}
+			if got.Status != model.TaskStatusPending {
+				t.Fatalf("rejected target status = %s, want pending", got.Status)
+			}
+		})
 	}
 }
 
@@ -199,6 +282,42 @@ func TestSchedulerGroup_ReportDone_NoHolderError(t *testing.T) {
 	}))
 	if err == nil || !strings.Contains(err.Error(), "无法获取当前 scheduler") {
 		t.Errorf("expected holder error, got %v", err)
+	}
+}
+
+func TestSchedulerGroup_ReportDone_GraphTaskRejectedWithoutSideEffects(t *testing.T) {
+	s := newSchedTestStore()
+	schedTask := &model.Task{Description: "graph controller", GraphID: "graph-a"}
+	s.PublishTask(schedTask)
+	child := &model.Task{ID: "c1", Status: model.TaskStatusPending}
+	s.tasks[child.ID] = child
+	s.AppendSchedulerBatch(schedTask.ID, child.ID)
+
+	var output strings.Builder
+	notifier := &fakeFinalizationNotifier{}
+	g := SchedulerGroup{
+		Store:                s,
+		Holder:               &fakeHolder{id: schedTask.ID},
+		FinalizationNotifier: notifier,
+		ResultOutput:         &output,
+	}
+	reg := agent.NewToolRegistry()
+	g.Register(reg)
+
+	_, err := reg.Dispatch(context.Background(), mkCall("report_done", map[string]any{
+		"summary": "premature graph summary",
+	}))
+	if err == nil || !strings.Contains(err.Error(), "当前任务属于 Graph graph-a") {
+		t.Fatalf("expected Graph report_done rejection, got %v", err)
+	}
+	if notifier.marked {
+		t.Fatal("Graph report_done rejection must not finalize the scheduler loop")
+	}
+	if output.Len() != 0 {
+		t.Fatalf("Graph report_done rejection must not write result output: %q", output.String())
+	}
+	if got := s.tasks[schedTask.ID].SchedulerBatch; len(got) != 1 || got[0] != child.ID {
+		t.Fatalf("Graph report_done rejection must preserve SchedulerBatch, got %v", got)
 	}
 }
 

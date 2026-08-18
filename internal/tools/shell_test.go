@@ -115,16 +115,29 @@ func TestRunShell_Timeout(t *testing.T) {
 func TestRunShell_WorkingDirectories(t *testing.T) {
 	// ls 在 PowerShell 中是 Get-ChildItem 的别名，两个平台都可用。
 	t.Run("override", func(t *testing.T) {
-		override := t.TempDir()
+		fallback := t.TempDir()
+		override := filepath.Join(fallback, "subdir")
+		if err := os.Mkdir(override, 0o755); err != nil {
+			t.Fatal(err)
+		}
 		if err := os.WriteFile(filepath.Join(override, "override.txt"), []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		group, _ := newTestShellGroup(t, t.TempDir(), emptyFilter())
+		group, _ := newTestShellGroup(t, fallback, emptyFilter())
 		out, err := dispatchRunShell(context.Background(), group, map[string]any{
 			"command": "ls", "working_dir": override,
 		})
 		if err != nil || !strings.Contains(out, "override.txt") {
 			t.Fatalf("out=%q err=%v", out, err)
+		}
+	})
+	t.Run("outside root rejected", func(t *testing.T) {
+		group, _ := newTestShellGroup(t, t.TempDir(), emptyFilter())
+		_, err := dispatchRunShell(context.Background(), group, map[string]any{
+			"command": "pwd", "working_dir": t.TempDir(),
+		})
+		if err == nil || !strings.Contains(err.Error(), "working_dir 被拒绝") {
+			t.Fatalf("outside working_dir should be rejected, got %v", err)
 		}
 	})
 	t.Run("fallback", func(t *testing.T) {
@@ -162,9 +175,13 @@ func TestRunShell_InteractionAllowAndFallbackDirectoryBinding(t *testing.T) {
 		done <- result{out: out, err: err}
 	}()
 	request := waitToolInteraction(t, service)
-	if request.Metadata[shell.MetadataWorkingDir] != fallback {
+	canonicalFallback, err := filepath.EvalSymlinks(fallback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Metadata[shell.MetadataWorkingDir] != canonicalFallback {
 		t.Fatalf("Interaction working_dir = %q, want fallback %q",
-			request.Metadata[shell.MetadataWorkingDir], fallback)
+			request.Metadata[shell.MetadataWorkingDir], canonicalFallback)
 	}
 	if request.SessionID != "session-tools-test" || request.Origin.AgentID != "test-agent" {
 		t.Fatalf("request = %+v", request)

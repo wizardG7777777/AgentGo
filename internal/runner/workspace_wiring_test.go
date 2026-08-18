@@ -92,8 +92,8 @@ func TestNewWiresWorkspaceFieldsToAgent(t *testing.T) {
 	if !ok || swapper == nil {
 		t.Fatalf("Agent.WorkspaceActivator 应为 *workspace.Swapper，实际 %T", a.WorkspaceActivator)
 	}
-	if swapper.Get() != mainRoot {
-		t.Fatalf("Swapper 主根 = %s，want %s", swapper.Get(), mainRoot)
+	if swapper.Get() != mgr.ProjectRoot() {
+		t.Fatalf("Swapper 主根 = %s，want 规范化根 %s", swapper.Get(), mgr.ProjectRoot())
 	}
 
 	// 第二个 Runner 同 deps 再构造一次：每个 Runner 拿到独立 Swapper 实例，

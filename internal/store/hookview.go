@@ -21,13 +21,15 @@ type StoreHookView interface {
 	GetTask(taskID string) (*model.Task, error)
 
 	// AppendArtifact 把文件路径追加到任务产物清单。
-	// 由 record-artifact Reactor（订阅 KindFileWritten）调用。
+	// 由自然完成 / submit_task_result 的磁盘恢复路径以及
+	// record-artifact 兼容 Reactor 调用。
 	// path 应当是相对项目根的相对路径，由调用方负责标准化。
 	AppendArtifact(taskID string, path string) error
 
 	// AppendArtifactWithMeta 与 AppendArtifact 同义，但顺带登记产物的内容
-	// 元数据（sha256/bytes）。由 record-artifact Reactor 在读取落盘文件
-	// 计算后调用；meta 为零值时与 AppendArtifact 行为完全一致。
+	// 元数据（sha256/bytes）。LocalWriteGroup 在 write/edit 成功返回前
+	// 同步调用；record-artifact Reactor 的重复调用只作兼容观察。
+	// meta 为零值时与 AppendArtifact 行为完全一致。
 	AppendArtifactWithMeta(taskID string, path string, meta model.ArtifactMeta) error
 
 	// GetToolCallHistory 返回任务的完整工具调用历史，按时间升序。

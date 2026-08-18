@@ -59,7 +59,7 @@ func TestPlanControlGroupRegisterRules(t *testing.T) {
 		t.Error("Store+Holder 注入时 request_replan 必须恒注册")
 	}
 	if names["submit_task_result"] {
-		t.Error("未注入提交通道时不应注册 submit_task_result（scheduler 装配形态）")
+		t.Error("未注入提交通道时不应注册 submit_task_result（不完整装配）")
 	}
 	if got := registered(PlanControlGroup{Holder: holder}); len(got) != 0 {
 		t.Errorf("Store 为 nil 时整个组不注册，实际 %v", got)

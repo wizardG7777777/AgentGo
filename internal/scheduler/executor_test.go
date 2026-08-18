@@ -240,6 +240,68 @@ func TestSchedulerExecutor_InjectsBoardSnapshotIntoHistory(t *testing.T) {
 	}
 }
 
+func TestSchedulerExecutor_GraphScopeDrivesSnapshotAndDynamicRoutes(t *testing.T) {
+	s := store.NewMemoryTaskStore(make(chan model.Event, 32), 64, 2, 60)
+	controller := &model.Task{
+		ID:           "graph-controller",
+		Description:  "summarize",
+		EventType:    "__scheduler__",
+		GraphID:      "g-current",
+		NodeID:       "summarize",
+		ActivationID: "summarize@1",
+	}
+	if err := s.PublishTask(controller); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("scheduler", controller.ID); err != nil {
+		t.Fatal(err)
+	}
+	sameGraph := &model.Task{ID: "same-graph-task", GraphID: controller.GraphID}
+	completeSnapshotResultTask(t, s, sameGraph, map[string]string{"worker": "graph result"})
+
+	registry := NewAgentRegistry()
+	for _, route := range []struct {
+		key, eventType, owner string
+		capabilities          []string
+	}{
+		{key: "graph-default", owner: model.GraphRouteScope(controller.GraphID), capabilities: []string{"graph_default_tool"}},
+		{key: "legacy-default", owner: model.TaskRouteScope(controller.ID), capabilities: []string{"legacy_default_tool"}},
+		{key: "graph-team", eventType: "team:graph", owner: model.GraphRouteScope(controller.GraphID), capabilities: []string{"read_file"}},
+		{key: "legacy-team", eventType: "team:legacy", owner: model.TaskRouteScope(controller.ID), capabilities: []string{"read_file"}},
+		{key: "other-team", eventType: "team:other", owner: model.GraphRouteScope("g-other"), capabilities: []string{"read_file"}},
+	} {
+		if err := registry.RegisterRoute(route.key, route.eventType, route.owner, 1, route.key, route.capabilities); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var calls int32
+	var capturedHistory []agent.HistoryEntry
+	exec := &SchedulerExecutor{
+		Inner:         makeInnerExecutor(&calls, &capturedHistory),
+		Store:         s,
+		Cfg:           &config.Config{},
+		AgentRegistry: registry,
+	}
+	if _, err := exec.Execute(context.Background(), controller, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(capturedHistory) != 1 {
+		t.Fatalf("captured history len=%d, want 1", len(capturedHistory))
+	}
+	mail := capturedHistory[0].IncomingMail
+	for _, want := range []string{sameGraph.ID, "graph result", "graph_default_tool", "team:graph"} {
+		if !strings.Contains(mail, want) {
+			t.Fatalf("Graph-scoped Scheduler snapshot omitted %q: %s", want, mail)
+		}
+	}
+	for _, leaked := range []string{"legacy_default_tool", "team:legacy", "team:other"} {
+		if strings.Contains(mail, leaked) {
+			t.Fatalf("Graph-scoped Scheduler snapshot leaked route %q: %s", leaked, mail)
+		}
+	}
+}
+
 // TestSchedulerExecutor_ModesStoreLiveSwitch 验证 SchedulerExecutor 每次 Execute
 // 重读两轴 store：运行期切换 exec / topo 轴后，下一次快照立即反映新值。
 func TestSchedulerExecutor_ModesStoreLiveSwitch(t *testing.T) {

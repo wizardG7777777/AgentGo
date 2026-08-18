@@ -17,6 +17,8 @@ import (
 	"agentgo/internal/effect"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
+	"agentgo/internal/model"
+	"agentgo/internal/store"
 )
 
 // openToolJournal 打开临时目录下的 Effect Journal 并登记 Windows 句柄清理。
@@ -34,12 +36,26 @@ func taskCtx(agentID, taskID string) context.Context {
 	return agent.WithAgentContext(context.Background(), agentID, taskID, 0)
 }
 
+func attachArtifactTask(t *testing.T, g *LocalWriteGroup, taskID string) {
+	t.Helper()
+	taskStore := store.NewMemoryTaskStore(nil, 8, 1, 60)
+	if err := taskStore.PublishTask(&model.Task{ID: taskID, Description: "effect journal artifact"}); err != nil {
+		t.Fatalf("发布 artifact 测试任务: %v", err)
+	}
+	g.ArtifactStore = taskStore
+}
+
 func TestWriteFile_EffectJournalVerifyFirst(t *testing.T) {
 	j := openToolJournal(t)
 	g, _, tmp := newWriteGroup(t, nil)
 	g.EffectJournal = j
+	attachArtifactTask(t, &g, "task-1")
 
-	target := filepath.Join(tmp, "out.txt")
+	canonicalRoot, err := filepath.EvalSymlinks(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(canonicalRoot, "out.txt")
 	content := "effect journal 测试内容"
 	if _, err := g.writeFile(taskCtx("agent-1", "task-1"), map[string]any{
 		"path": target, "content": content,
@@ -78,6 +94,7 @@ func TestEditFile_EffectJournalVerifyFirst(t *testing.T) {
 	j := openToolJournal(t)
 	g, _, tmp := newWriteGroup(t, nil)
 	g.EffectJournal = j
+	attachArtifactTask(t, &g, "task-2")
 
 	target := filepath.Join(tmp, "edit.txt")
 	if err := os.WriteFile(target, []byte("旧内容"), 0o644); err != nil {
@@ -201,6 +218,7 @@ func TestEffectJournalFailureDegrades(t *testing.T) {
 
 	g, _, tmp := newWriteGroup(t, nil)
 	g.EffectJournal = j
+	attachArtifactTask(t, &g, "task-5")
 	target := filepath.Join(tmp, "degrade.txt")
 	if _, err := g.writeFile(taskCtx("agent-1", "task-5"), map[string]any{
 		"path": target, "content": "账本挂了也要写",

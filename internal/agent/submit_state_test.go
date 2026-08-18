@@ -2,12 +2,27 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"agentgo/internal/model"
+	"agentgo/internal/store"
 	"agentgo/internal/trace"
 )
+
+type failingResultFieldsStore struct {
+	store.TaskStore
+	err error
+}
+
+func (s *failingResultFieldsStore) SubmitResultWithFields(string, string, string, map[string]string) error {
+	return s.err
+}
+
+func (s *failingResultFieldsStore) CommitBlockedResult(string, string, string, map[string]string, string, string) error {
+	return s.err
+}
 
 func TestStructuredSubmissionFormat(t *testing.T) {
 	sub := &StructuredSubmission{
@@ -133,9 +148,9 @@ func TestFinalizationShortCircuitConsumesSubmitState(t *testing.T) {
 	}
 }
 
-// Graph 事件键（C5b）：结构化提交携带 Event 时，finalization 短路分支在
-// SubmitResult 前把 event 写入 task.Results["event"]（Graph 转移求值的驱动
-// 事实）；未携带时 Results 不含 "event" 键。
+// Graph 事件键（C5b）：结构化提交携带 Event 时，finalization 短路分支把
+// event 与 completed 状态原子写入 task.Results（Graph 转移求值驱动事实）；
+// 未携带时 Results 不含 "event" 键。
 func TestFinalizationShortCircuitWritesGraphEventResult(t *testing.T) {
 	setupTraceWriter(t)
 	s, r, _ := setup()
@@ -175,9 +190,151 @@ func TestFinalizationShortCircuitWritesGraphEventResult(t *testing.T) {
 	}
 }
 
-// Graph 验收键（C6b）：结构化提交携带 Verdict 时，finalization 短路分支在
-// SubmitResult 前把 verdict 写入 task.Results["verdict"]（acceptance 节点
-// $.verdict 路径形态转移条件的驱动事实）；未携带时 Results 不含 "verdict" 键。
+// 自定义 result object 在 finalization 短路时以单一内部 carrier 落盘；
+// Task.Results 仍保持 map[string]string，Graph bridge 负责类型保真展开。
+func TestFinalizationShortCircuitWritesStructuredResultCarrier(t *testing.T) {
+	setupTraceWriter(t)
+	s, r, _ := setup()
+
+	task := &model.Task{Description: "graph structured submit", EventType: "code", GraphID: "g-1"}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	const agentID = "agent-structured"
+	if err := s.ClaimTask(agentID, task.ID); err != nil {
+		t.Fatalf("ClaimTask: %v", err)
+	}
+
+	state := NewSubmitState()
+	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+		state.Put(&StructuredSubmission{
+			TaskID: task.ID, Summary: "覆盖度已裁决",
+			ResultJSON: `{"coverage":"gap","metrics":{"score":2,"ready":true}}`,
+		})
+		return ExecuteResult{Output: "progress", ToolCalled: true}, nil
+	}
+	ag := NewAgent(agentID, "code", s, r, executor)
+	ag.FinalizationChecker = &flipFinalizationChecker{}
+	ag.SubmitState = state
+	ag.TextOnlyReportsDir = t.TempDir()
+	ag.processTask(context.Background(), task.ID)
+
+	got, err := s.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := got.Results[StructuredResultStorageKey]
+	decoded, err := DecodeStructuredResult(raw)
+	if err != nil {
+		t.Fatalf("carrier 解码失败: %v（raw=%q）", err, raw)
+	}
+	if decoded["coverage"] != "gap" {
+		t.Fatalf("carrier 未保留 coverage: %+v", decoded)
+	}
+	if _, leaked := got.Results["coverage"]; leaked {
+		t.Fatal("字符串型 Task.Results 不应平铺自定义字段；须由 Graph bridge 解码")
+	}
+}
+
+func TestFinalizationShortCircuitStructuredFieldsFailClosed(t *testing.T) {
+	traceDir := setupTraceWriter(t)
+	base, r, _ := setup()
+	task := &model.Task{Description: "graph structured submit", EventType: "code", GraphID: "g-1"}
+	if err := base.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	const agentID = "agent-structured-fail"
+	if err := base.ClaimTask(agentID, task.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	state := NewSubmitState()
+	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+		state.Put(&StructuredSubmission{
+			TaskID: task.ID, Summary: "覆盖度已裁决", Event: "ready",
+			ResultJSON: `{"coverage":"gap"}`,
+		})
+		return ExecuteResult{Output: "progress", ToolCalled: true}, nil
+	}
+	writeErr := errors.New("模拟结构化字段存储故障")
+	ag := NewAgent(agentID, "code", &failingResultFieldsStore{TaskStore: base, err: writeErr}, r, executor)
+	ag.FinalizationChecker = &flipFinalizationChecker{}
+	ag.SubmitState = state
+	ag.TextOnlyReportsDir = t.TempDir()
+	ag.processTask(context.Background(), task.ID)
+
+	got, err := base.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.TaskStatusFailed || !strings.Contains(got.Error, writeErr.Error()) {
+		t.Fatalf("结构化字段落盘失败必须 fail-closed，实际 status=%s error=%q", got.Status, got.Error)
+	}
+	if _, ok := got.Results[StructuredResultStorageKey]; ok {
+		t.Fatal("原子写入失败不得留下 Result carrier")
+	}
+	if _, ok := got.Results["event"]; ok {
+		t.Fatal("原子写入失败不得留下 event 半状态")
+	}
+	if _, ok := got.Results[agentID]; ok {
+		t.Fatal("结构化字段失败后不得再 SubmitResult 伪装 completed")
+	}
+	events := p1fixesReadTraceEvents(t, traceDir)
+	tr := findTransition(events, trace.KindTaskFailed, task.ID)
+	if tr == nil || tr.Cause != "structured_result_persist_failed" {
+		t.Fatalf("失败 trace 应记录 structured_result_persist_failed，实际 %+v", tr)
+	}
+}
+
+func TestFinalizationShortCircuitStructuredBlockedCommitFailClosed(t *testing.T) {
+	traceDir := setupTraceWriter(t)
+	base, r, _ := setup()
+	task := &model.Task{Description: "graph structured blocked", EventType: "code", GraphID: "g-1"}
+	if err := base.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	const agentID = "agent-structured-blocked-fail"
+	if err := base.ClaimTask(agentID, task.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	state := NewSubmitState()
+	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+		state.Put(&StructuredSubmission{
+			TaskID: task.ID, Summary: "缺少目录", Status: SubmitStatusBlocked,
+			BlockedReason: "上游未提供目录", ResultJSON: `{"missing":"catalog"}`,
+		})
+		return ExecuteResult{Output: "progress", ToolCalled: true}, nil
+	}
+	writeErr := errors.New("模拟 blocked 原子提交故障")
+	ag := NewAgent(agentID, "code", &failingResultFieldsStore{TaskStore: base, err: writeErr}, r, executor)
+	ag.FinalizationChecker = &flipFinalizationChecker{}
+	ag.SubmitState = state
+	ag.TextOnlyReportsDir = t.TempDir()
+	ag.processTask(context.Background(), task.ID)
+
+	got, err := base.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.TaskStatusFailed || !strings.Contains(got.Error, writeErr.Error()) {
+		t.Fatalf("blocked 原子提交失败必须 fail-closed，实际 status=%s error=%q", got.Status, got.Error)
+	}
+	for _, key := range []string{StructuredResultStorageKey, agentID, "event", "verdict"} {
+		if _, ok := got.Results[key]; ok {
+			t.Fatalf("blocked 原子提交失败不得遗留字段 %q: %#v", key, got.Results)
+		}
+	}
+	events := p1fixesReadTraceEvents(t, traceDir)
+	tr := findTransition(events, trace.KindTaskFailed, task.ID)
+	if tr == nil || tr.Cause != "structured_result_persist_failed" {
+		t.Fatalf("失败 trace 应记录 structured_result_persist_failed，实际 %+v", tr)
+	}
+}
+
+// Graph 验收键（C6b）：结构化提交携带 Verdict 时，finalization 短路分支把
+// verdict 与 completed 状态原子写入 task.Results（acceptance 节点
+// $.verdict 路径的驱动事实）；未携带时 Results 不含 "verdict" 键。
 func TestFinalizationShortCircuitWritesVerdictResult(t *testing.T) {
 	setupTraceWriter(t)
 	s, r, _ := setup()
@@ -270,9 +427,10 @@ func TestFinalizationShortCircuitWithoutSubmissionKeepsCompatBehavior(t *testing
 	}
 }
 
-// Graph 验收证据键（G1b）：结构化提交携带 EvidenceItems 时，finalization
-// 短路分支在 SubmitResult 前把原始 JSON 数组写入 task.Results["evidence"]
-// （Graph Runtime 服务端核验器的输入）；未携带时 Results 不含 "evidence" 键。
+// Graph 验收证据引用键：结构化提交携带 CitedEvidence 时，finalization
+// 短路分支在 SubmitResult 前把逗号分隔引用清单写入
+// task.Results["cited_evidence"]（Graph Runtime acceptance 谱系核验的输入）；
+// 未携带时 Results 不含 "cited_evidence" 键。
 func TestFinalizationShortCircuitWritesEvidenceResult(t *testing.T) {
 	setupTraceWriter(t)
 	s, r, _ := setup()
@@ -286,10 +444,10 @@ func TestFinalizationShortCircuitWritesEvidenceResult(t *testing.T) {
 		t.Fatalf("ClaimTask: %v", err)
 	}
 
-	const evidenceJSON = `[{"criterion":"测试通过","type":"command","value":"go test ./..."}]`
+	const cited = "ev:task-impl:1, ev:task-impl:2"
 	state := NewSubmitState()
 	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
-		state.Put(&StructuredSubmission{TaskID: task.ID, Summary: "验收完成", Verdict: "pass", EvidenceItems: evidenceJSON})
+		state.Put(&StructuredSubmission{TaskID: task.ID, Summary: "验收完成", Verdict: "pass", CitedEvidence: cited})
 		return ExecuteResult{Output: "progress", ToolCalled: true}, nil
 	}
 	ag := NewAgent(agentID, "verify", s, r, executor)
@@ -305,8 +463,8 @@ func TestFinalizationShortCircuitWritesEvidenceResult(t *testing.T) {
 	if got.Status != model.TaskStatusCompleted {
 		t.Fatalf("任务状态 = %s，期望 completed", got.Status)
 	}
-	if got.Results["evidence"] != evidenceJSON {
-		t.Errorf("Results[\"evidence\"] = %q，期望原样 JSON 数组（服务端核验输入）", got.Results["evidence"])
+	if got.Results["cited_evidence"] != cited {
+		t.Errorf("Results[\"cited_evidence\"] = %q，期望引用清单（谱系核验输入）", got.Results["cited_evidence"])
 	}
 	if got.Results["verdict"] != "pass" {
 		t.Errorf("Results[\"verdict\"] = %q，期望 pass", got.Results["verdict"])

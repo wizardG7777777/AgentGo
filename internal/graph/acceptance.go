@@ -1,26 +1,34 @@
 package graph
 
-// 本文件是 G1b 验收服务端核验的引擎侧契约与结算集成：
-//   - EvidenceItem / VerifyOutcome / AcceptanceVerifier：acceptance 节点终态
-//     结算时对 verifier 自报证据（Results["evidence"] JSON 数组）做服务端
-//     核验的最小依赖接口（与 ToolExecutor / ApprovalGateway 同风格注入）；
-//   - GraphChangeWaker：核验 disputed/unverifiable 时的「graph change 唤醒」
-//     最小依赖接口——不采信自报 verdict 后由实现方按既有 graph change
-//     机制（C5d：审计事件 + __scheduler__ 唤醒任务）交 Scheduler 裁决；
-//   - Runtime.settleAcceptanceLocked：acceptance 节点 completed 终态的
-//     核验结算路径（valid 放行 / disputed·unverifiable 不采信）。
+// 本文件是 acceptance 节点终态结算的谱系核验（数据流时代的验收判定矩阵，
+// 取代 G1b 的机器格式契约核验——command/file_hash/task_status 逐字比对已随
+// 旧证据契约退役，详见 docs/design/scheduler-prompt-and-acceptance-redesign.md §4）：
 //
-// 行为契约（未注入 AcceptanceVerifier 时保持 C5c 现行为——verdict 契约自报，
-// 引擎不做任何服务端核验）：
-//   - valid：按自报 verdict 正常结算（转移求值不变）；
-//   - disputed（证据核验失败）/ unverifiable（无证据、证据非法或类型未知）：
-//     不采信自报 verdict——节点终态 failed（Result 不含 verdict/event 键，
-//     自报结论移入 disputed_verdict，verdict 驱动的边条件不会命中），发
-//     graph_change_requested 审计事件 + graph change 唤醒（注入 waker 时），
-//     绝不按自报 verdict 放行。
+// 判定矩阵（仅 acceptance 节点 completed 终态时进入；failed/blocked 无
+// verdict 可采信，走统一结算）：
+//   - verifier 经 submit_task_result 的 cited_evidence 参数引用自己实际消费
+//     过的证据（EvidenceRef，逗号分隔）；服务端只做**谱系核验**：每个引用
+//     必须属于本 acceptance activation 的上游 Input 谱系（各 InputBinding.
+//     EvidenceRefs 的并集），或属于 verifier 自己本次任务产生的证据
+//     （Execution.Evidence）——越谱系引用即造假实锤；
+//   - valid（全部引用在谱系内，或未引用）：按自报 verdict 正常结算；
+//   - disputed（任一引用越谱系）：不采信自报 verdict——节点终态 failed
+//     （Result 不保留原始业务路由字段，自报结论移入 disputed_verdict，
+//     越谱系引用记入 disputed_citations，verdict 驱动的边条件不会命中），
+//     发 graph_change_requested 审计事件 + graph change 唤醒（注入 waker
+//     时），绝不按自报 verdict 放行；
+//   - 不引用证据不是过错：verdict 正常采信（无「unverifiable 判死」——
+//     旧保守默认随证据格式契约一并退役）。
+//
+// 与 G1b 的本质差异：核验对象是「引用是否来自本次验收真实可见的数据」，
+// 而不是「自报文本是否与账本尊逐字一致」——身份由系统按调用或内容事实
+// 签发为不透明稳定引用，不依赖查询序数或 LLM 的格式纪律。
+//
+// GraphChangeWaker：disputed 时的「graph change 唤醒」最小依赖接口——
+// 不采信自报 verdict 后由实现方按既有 graph change 机制（审计事件 +
+// __scheduler__ 唤醒任务）交 Scheduler 裁决。
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -28,64 +36,23 @@ import (
 	"agentgo/internal/trace"
 )
 
-// 证据类型（EvidenceItem.Type 的合法取值）。
+// 核验结论（trace AcceptancePayload.Status 的取值）。
 const (
-	// EvidenceTypeCommand：value 是本次任务真实执行过的命令串（逐字，可去
-	// 首尾空白）；服务端对照 Effect Journal 该任务的 shell 账核验。
-	EvidenceTypeCommand = "command"
-	// EvidenceTypeFileHash：value 是项目内文件路径（仅记录实际 hash）或
-	// "路径=sha256"（重算比对，一致才过）。
-	EvidenceTypeFileHash = "file_hash"
-	// EvidenceTypeTaskStatus：value 是裸状态词（completed / failed /
-	// blocked / cancelled / pass / fail），逐字命中词表才过。
-	EvidenceTypeTaskStatus = "task_status"
+	// AcceptValid：全部引用在谱系内（或无引用），按自报 verdict 正常转移。
+	AcceptValid = "valid"
+	// AcceptDisputed：至少一个引用越出谱系，不采信自报 verdict。
+	AcceptDisputed = "disputed"
+	// AcceptEvidenceMissing：节点契约要求的输入证据缺失或不可解引用；即使
+	// verifier 自报 pass 也按 blocked 结算并唤醒图变更。
+	AcceptEvidenceMissing = "evidence_missing"
+	// AcceptInvalidVerdict：completed acceptance 缺少合法 verdict，或 event
+	// 字段依然存在。协议错误不允许经无条件/completed 边伪装通过。
+	AcceptInvalidVerdict = "invalid_verdict"
 )
-
-// 核验结论（VerifyOutcome.Status 的合法取值）。
-const (
-	// VerifyValid：全部证据核验通过，按自报 verdict 正常转移。
-	VerifyValid = "valid"
-	// VerifyDisputed：至少一条证据核验失败，不采信自报 verdict。
-	VerifyDisputed = "disputed"
-	// VerifyUnverifiable：缺少可核验证据（无 evidence / JSON 非法 / 类型
-	// 未知 / 核验设施不可用），保守处理同 disputed。
-	VerifyUnverifiable = "unverifiable"
-)
-
-// EvidenceItem 是验收 agent 经 Results["evidence"] 自报的一条机器可核验
-// 证据（JSON 数组元素）。Criterion 是判据名（人类可读，定位用）；Type 决定
-// 服务端核验方式；ExpectExit 是 command 证据的可选期望退出码（缺省 0）。
-type EvidenceItem struct {
-	Criterion  string `json:"criterion"`
-	Type       string `json:"type"`
-	Value      string `json:"value"`
-	ExpectExit *int   `json:"expect_exit,omitempty"`
-}
-
-// VerifyOutcome 是一次服务端核验的结论。Checked 是实际完成核验的证据条数
-// （disputed/unverifiable 时可能小于总条数——首条失败即短路）。Reason 是
-// 人类可读的原因摘要（disputed 时必须含「哪条证据为何失败」），不含证据正文。
-type VerifyOutcome struct {
-	Status  string // valid / disputed / unverifiable
-	Reason  string
-	Checked int
-}
-
-// AcceptanceVerifier 是 Graph Runtime 对验收证据服务端核验能力的最小依赖
-// （与 TaskBoard / ToolExecutor 同风格的解耦接口）。taskID 是 acceptance
-// 节点本次 activation 的任务 ID（核验 command 证据时据此查该任务的
-// Effect Journal shell 账）。
-//
-// 实现要求：VerifyAcceptance 在 Runtime 锁内同步调用，不得回调 Runtime 的
-// 任何公开方法（sync.Mutex 不可重入，会死锁）；返回 error 表示核验器自身
-// 故障，引擎按 unverifiable 保守处理（不误判 valid）。
-type AcceptanceVerifier interface {
-	VerifyAcceptance(taskID string, verdict string, evidence []EvidenceItem) (VerifyOutcome, error)
-}
 
 // GraphChangeWaker 是 Graph Runtime 对「graph change 唤醒」能力的最小依赖
-// （可选注入）。acceptance 核验 disputed/unverifiable 时调用——实现方按
-// C5d 既有机制发布 __scheduler__ 唤醒任务（幂等键 <graphID>/<activationID>/change），
+// （可选注入）。acceptance 谱系核验 disputed 时调用——实现方按既有 graph
+// change 机制发布 __scheduler__ 唤醒任务（幂等键 <graphID>/<activationID>/change），
 // 交 Scheduler 用 patch_graph 裁决。未注入时只发 graph_change_requested
 // 审计事件（图仍按节点 failed 结算）。
 type GraphChangeWaker interface {
@@ -99,16 +66,8 @@ type GraphChangeWakeSpec struct {
 	NodeID       string
 	ActivationID string
 	TaskID       string
-	Reason       string // 结构化原因码（acceptance_disputed / acceptance_unverifiable）
+	Reason       string // 结构化原因码（acceptance_disputed）
 	Detail       string // 人类可读的原因摘要（不含证据正文）
-}
-
-// SetAcceptanceVerifier 注入 acceptance 节点的证据核验器（构造后、使用前
-// 调用）。nil（未注入）时保持 C5c 现行为：verdict 契约自报，引擎不核验。
-func (rt *Runtime) SetAcceptanceVerifier(v AcceptanceVerifier) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	rt.acceptVerifier = v
 }
 
 // SetChangeWaker 注入 graph change 唤醒器（构造后、使用前调用）。
@@ -118,36 +77,80 @@ func (rt *Runtime) SetChangeWaker(w GraphChangeWaker) {
 	rt.changeWaker = w
 }
 
-// settleAcceptanceLocked 是 acceptance 节点 completed 终态的核验结算路径
-// （调用方须持 rt.mu；仅在已注入 AcceptanceVerifier 时由 OnTaskTerminal
-// 分派进入）：
-//  1. 从 Result 取 verdict 与 evidence（Results["evidence"] JSON 数组；
-//     缺失/空白按无证据处理，JSON 非法直接 unverifiable，不再调核验器）；
-//  2. 调核验器；核验器自身故障按 unverifiable 保守处理；
+// settleAcceptanceLocked 是 acceptance 节点 completed 终态的谱系核验结算
+// 路径（调用方须持 rt.mu；exec 已携带本任务的 Evidence，见 OnTaskTerminal）：
+//  1. 从 Result 取 verdict 与 cited_evidence（逗号分隔的 EvidenceRef 清单）；
+//  2. 谱系核验：引用 ∈ 上游 Input 谱系 ∪ 本任务自身证据 → valid；
+//     任一越谱系 → disputed；
 //  3. 无论结论如何先发 acceptance_completed 审计事件（不含证据正文）；
-//  4. valid 按原状结算；disputed/unverifiable 不采信 verdict——Result
-//     剔除自报 verdict/event（防 $.verdict / event 边条件命中未核验结论），
+//  4. valid 按原状结算；disputed 不采信 verdict——Result 不保留原始
+//     业务路由字段（防 $.verdict 边条件命中未核验结论），
 //     节点置 failed，发 graph change 唤醒后走统一结算。
 func (rt *Runtime) settleAcceptanceLocked(f TerminalFact, exec Execution) error {
-	verdict, _ := f.Result["verdict"].(string)
-
-	var outcome VerifyOutcome
-	var evidence []EvidenceItem
-	evidenceRaw, _ := f.Result["evidence"].(string)
-	switch {
-	case strings.TrimSpace(evidenceRaw) == "":
-		// 无 evidence：调核验器（由实现方给出 unverifiable 的权威措辞；
-		//  nil 切片原样传递）。
-		outcome = rt.callAcceptanceVerifier(f.TaskID, verdict, nil)
-	case json.Unmarshal([]byte(evidenceRaw), &evidence) != nil:
-		outcome = VerifyOutcome{
-			Status: VerifyUnverifiable,
-			Reason: "Results[\"evidence\"] 不是合法 JSON 数组，无法核验",
+	verdict, verdictErr := validateAcceptanceVerdictResult(f.Result)
+	if verdictErr != "" {
+		reason := fmt.Sprintf("验收节点 %s（activation %s）提交的 completed 结果违反 verdict 契约：%s",
+			f.NodeID, f.ActivationID, verdictErr)
+		trace.Emit(trace.Event{
+			Kind: trace.KindAcceptanceCompleted, GraphID: f.GraphID, NodeID: f.NodeID,
+			ActivationID: f.ActivationID, TaskID: f.TaskID,
+			Acceptance: &trace.AcceptancePayload{
+				Verdict: verdict, Status: AcceptInvalidVerdict, Checked: 0, Reason: reason,
+			},
+		})
+		rt.wakeGraphChange(f, "acceptance_invalid_verdict", reason)
+		return rt.settleNodeLocked(f.GraphID, f.NodeID, exec, NodeFailed, map[string]any{
+			"error": reason, "invalid_verdict": verdict,
+			"verify_status": AcceptInvalidVerdict,
+		})
+	}
+	doc, err := rt.graph(f.GraphID)
+	if err != nil {
+		return err
+	}
+	node, ok := doc.Nodes[f.NodeID]
+	if !ok {
+		return fmt.Errorf("%w: 图 %s 节点 %s", ErrNodeNotFound, f.GraphID, f.NodeID)
+	}
+	node = nodeForExecution(node, exec)
+	var requirements []EvidenceRequirement
+	if node.Task != nil {
+		requirements = node.Task.RequiredEvidence
+	}
+	missing := rt.missingEvidenceRequirements(f.GraphID, exec, requirements)
+	if len(missing) > 0 {
+		detail := formatEvidenceRequirements(missing)
+		reason := "验收必需证据缺失或不可解引用: " + detail
+		trace.Emit(trace.Event{
+			Kind: trace.KindAcceptanceCompleted, GraphID: f.GraphID, NodeID: f.NodeID,
+			ActivationID: f.ActivationID, TaskID: f.TaskID,
+			Acceptance: &trace.AcceptancePayload{
+				Verdict: verdict, Status: AcceptEvidenceMissing, Checked: 0, Reason: reason,
+			},
+		})
+		rt.wakeGraphChange(f, "acceptance_evidence_missing", reason)
+		return rt.settleNodeLocked(f.GraphID, f.NodeID, exec, NodeBlocked, map[string]any{
+			"error": reason, "blocked_reason": reason,
+			"missing_evidence": detail, "disputed_verdict": verdict,
+			"verify_status": AcceptEvidenceMissing,
+		})
+	}
+	cited := splitCitedEvidence(f.Result["cited_evidence"])
+	allowed := rt.acceptanceEvidenceLineage(f.GraphID, exec)
+	var outOfLineage []string
+	for _, ref := range cited {
+		if _, ok := allowed[ref]; !ok {
+			outOfLineage = append(outOfLineage, ref)
 		}
-	default:
-		outcome = rt.callAcceptanceVerifier(f.TaskID, verdict, evidence)
 	}
 
+	status := AcceptValid
+	reason := ""
+	if len(outOfLineage) > 0 {
+		status = AcceptDisputed
+		reason = fmt.Sprintf("引用证据越出本 activation 的输入谱系（不属于上游绑定证据，也不属于本任务自身证据）：%s",
+			strings.Join(outOfLineage, ", "))
+	}
 	trace.Emit(trace.Event{
 		Kind:         trace.KindAcceptanceCompleted,
 		GraphID:      f.GraphID,
@@ -156,44 +159,165 @@ func (rt *Runtime) settleAcceptanceLocked(f TerminalFact, exec Execution) error 
 		TaskID:       f.TaskID,
 		Acceptance: &trace.AcceptancePayload{
 			Verdict: verdict,
-			Status:  outcome.Status,
-			Checked: outcome.Checked,
-			Reason:  outcome.Reason,
+			Status:  status,
+			Checked: len(cited),
+			Reason:  reason,
 		},
 	})
 
-	if outcome.Status == VerifyValid {
+	if status == AcceptValid {
 		return rt.settleNodeLocked(f.GraphID, f.NodeID, exec, NodeCompleted, f.Result)
 	}
 
-	// disputed / unverifiable：不采信自报 verdict。Result 只保留核验事实——
-	// 自报的 verdict/event 键剔除（否则 $.verdict / event 边条件会把未核验
-	// 结论当作路由输入），原结论留 disputed_verdict 供审计。
-	reason := fmt.Sprintf("验收节点 %s（activation %s）证据核验 %s：%s（自报 verdict=%q 不采信）",
-		f.NodeID, f.ActivationID, outcome.Status, outcome.Reason, verdict)
+	// disputed：不采信自报 verdict。Result 只保留核验事实，不保留
+	// 原始业务路由字段（否则 $.verdict 边条件会把越谱系结论当作
+	// 路由输入）；原结论留 disputed_verdict 供审计。
+	failReason := fmt.Sprintf("验收节点 %s（activation %s）谱系核验 disputed：%s（自报 verdict=%q 不采信）",
+		f.NodeID, f.ActivationID, reason, verdict)
 	result := map[string]any{
-		"error":            reason,
-		"disputed_verdict": verdict,
-		"verify_status":    outcome.Status,
+		"error":              failReason,
+		"disputed_verdict":   verdict,
+		"disputed_citations": strings.Join(outOfLineage, ","),
+		"verify_status":      AcceptDisputed,
 	}
-	rt.wakeGraphChange(f, "acceptance_"+outcome.Status, outcome.Reason)
+	rt.wakeGraphChange(f, "acceptance_disputed", reason)
 	return rt.settleNodeLocked(f.GraphID, f.NodeID, exec, NodeFailed, result)
 }
 
-// callAcceptanceVerifier 调核验器并把核验器故障归一为 unverifiable
-// （V6 原则：核验设施不可用时绝不误判 valid）。
-func (rt *Runtime) callAcceptanceVerifier(taskID, verdict string, evidence []EvidenceItem) VerifyOutcome {
-	outcome, err := rt.acceptVerifier.VerifyAcceptance(taskID, verdict, evidence)
-	if err != nil {
-		return VerifyOutcome{Status: VerifyUnverifiable, Reason: "核验器执行失败: " + err.Error()}
+// validateAcceptanceVerdictResult 校验 acceptance 的 completed 输出协议。
+// verdict 必须是 prompt 契约枚举 pass/fixable/failed。验收业务
+// 结论只能经 $.verdict 路由；completed 结果出现 event 一律视为
+// 协议错误，避免同一结论同时有两个权威字段。
+func validateAcceptanceVerdictResult(result map[string]any) (string, string) {
+	raw, exists := result["verdict"]
+	if !exists {
+		return "", "缺少必填字符串字段 verdict"
 	}
-	return outcome
+	verdict, ok := raw.(string)
+	if !ok || verdict == "" || strings.TrimSpace(verdict) != verdict || !isValidAcceptanceVerdict(verdict) {
+		return verdict, fmt.Sprintf("verdict 必须是 pass/fixable/failed 之一，实际为 %q", verdict)
+	}
+	if _, hasEvent := result["event"]; hasEvent {
+		return verdict, "completed acceptance 结果不得携带 event；业务结论只能经 $.verdict 路由"
+	}
+	return verdict, ""
 }
 
-// wakeGraphChange 发 graph change 唤醒（C5d 既有机制）：先 emit
-// graph_change_requested 审计事件，再经注入的 waker 发布 __scheduler__
-// 唤醒任务。waker 未注入或发布失败只记日志——节点 failed 终态不因此推翻
-// （与 reactor 错误「仅记日志，绝不中断主流程」同一纪律）。
+func isValidAcceptanceVerdict(verdict string) bool {
+	switch verdict {
+	case "pass", "fixable", "failed":
+		return true
+	default:
+		return false
+	}
+}
+
+// acceptanceEvidenceLineage 计算 acceptance activation 的合法证据谱系：
+// 上游 Input 各绑定的 EvidenceRefs 并集（经数据流到达的上游证据），加上
+// 本 activation 自身任务产生的证据（verifier 获准执行的只读核验事实）。
+func (rt *Runtime) acceptanceEvidenceLineage(graphID string, exec Execution) map[string]struct{} {
+	allowed := make(map[string]struct{})
+	for _, in := range exec.Input {
+		for _, evidence := range rt.resolvableInputEvidence(graphID, in) {
+			allowed[evidence.Ref] = struct{}{}
+		}
+	}
+	for _, e := range exec.Evidence {
+		allowed[e.Ref] = struct{}{}
+	}
+	return allowed
+}
+
+// resolvableInputEvidence 返回同时存在于 InputBinding 与其 ResultRef 指向的
+// activation 记录中的 EvidenceEntry。只有 Ref 字符串、没有结构化条目或
+// ResultRef 不可解引用时返回空，防止「猜中 ID」冒充消费过证据。
+func (rt *Runtime) resolvableInputEvidence(graphID string, in InputBinding) []EvidenceEntry {
+	if in.ResultRef == "" || len(in.Evidence) == 0 {
+		return nil
+	}
+	stored, ok := rt.store.ResolveActivationResult(graphID, in.ResultRef)
+	if !ok || stored.NodeID != in.SourceNodeID || stored.ActivationID != in.SourceActivationID {
+		return nil
+	}
+	byRef := make(map[string]EvidenceEntry, len(stored.Evidence))
+	for _, evidence := range stored.Evidence {
+		if evidence.Ref != "" && evidence.Kind != "" {
+			byRef[evidence.Ref] = evidence
+		}
+	}
+	var out []EvidenceEntry
+	for _, evidence := range in.Evidence {
+		storedEvidence, exists := byRef[evidence.Ref]
+		if !exists || storedEvidence.Kind != evidence.Kind || evidence.Kind == "" {
+			continue
+		}
+		out = appendEvidenceUnique(out, storedEvidence)
+	}
+	return out
+}
+
+func (rt *Runtime) missingEvidenceRequirements(graphID string, exec Execution, requirements []EvidenceRequirement) []EvidenceRequirement {
+	var missing []EvidenceRequirement
+	for _, requirement := range requirements {
+		found := false
+		for _, in := range exec.Input {
+			if in.TargetInput != requirement.Input {
+				continue
+			}
+			for _, evidence := range rt.resolvableInputEvidence(graphID, in) {
+				if evidence.Kind == requirement.Kind {
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			missing = append(missing, requirement)
+		}
+	}
+	return missing
+}
+
+func formatEvidenceRequirements(requirements []EvidenceRequirement) string {
+	parts := make([]string, 0, len(requirements))
+	for _, requirement := range requirements {
+		parts = append(parts, fmt.Sprintf("input=%s kind=%s", requirement.Input, requirement.Kind))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// splitCitedEvidence 解析 cited_evidence 提交值（逗号分隔的 EvidenceRef
+// 清单；兼容 []any 形态），去空白、去空项。
+func splitCitedEvidence(raw any) []string {
+	var items []string
+	switch v := raw.(type) {
+	case string:
+		items = strings.Split(v, ",")
+	case []string:
+		items = v
+	case []any:
+		for _, it := range v {
+			if s, ok := it.(string); ok {
+				items = append(items, s)
+			}
+		}
+	}
+	var out []string
+	for _, it := range items {
+		if s := strings.TrimSpace(it); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// wakeGraphChange 发 graph change 唤醒：先 emit graph_change_requested 审计
+// 事件，再经注入的 waker 发布 __scheduler__ 唤醒任务。waker 未注入或发布
+// 失败只记日志——节点 failed 终态不因此推翻（与 reactor 错误「仅记日志，
+// 绝不中断主流程」同一纪律）。
 func (rt *Runtime) wakeGraphChange(f TerminalFact, reasonCode, detail string) {
 	trace.Emit(trace.Event{
 		Kind: trace.KindGraphChangeRequested, TaskID: f.TaskID,

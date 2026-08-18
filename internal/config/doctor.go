@@ -159,8 +159,8 @@ func scanPromptToolNames(promptText string) []string {
 }
 
 // resolveAllowlist 解析该 kind 的实际工具白名单：tools 直列优先，否则按
-// profile 引用 tool_profiles 表。返回 (nil, nil) 表示"允许全部工具"
-// （ResolveToolProfile 的空 profile 名语义，向后兼容）。
+// profile 引用 tool_profiles 表。返回 (nil, nil) 只保留给未经过 Config.Validate
+// 的兼容调用；生产配置会拒绝缺失或空 profile，非 nil 空 allowlist 也不会全开。
 func (k *AgentKind) resolveAllowlist(profiles map[string][]string) ([]string, error) {
 	if len(k.Tools) > 0 {
 		return k.Tools, nil

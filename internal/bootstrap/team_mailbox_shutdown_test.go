@@ -91,6 +91,10 @@ func newShutdownMailboxTestEnv(t *testing.T) *shutdownMailboxTestEnv {
 		manager.Shutdown()
 		t.Fatalf("NewSessionManager: %v", err)
 	}
+	// 标记为非空会话（2026-08 二期：空会话在 Shutdown 时被丢弃）——生产上
+	// team 邮箱流量必以用户提交过任务为前提，此处等效模拟。
+	sm.RecordFirstInput("persist shutdown unread mail")
+	sm.IncrementTaskCount()
 	sessionDir := sm.Current().Dir
 	sys := &System{
 		Store: taskStore, Roster: r, MailboxRegistry: mailboxes,

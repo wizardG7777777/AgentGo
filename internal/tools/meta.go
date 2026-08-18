@@ -44,10 +44,29 @@ type BatchTracker interface {
 // Team route owned by another request scope cannot create an invalid Task.
 // Isolated compatibility paths may leave it nil.
 //
-// CanRouteForPlan 的第一参数是路由归属 scope ID（controller 任务 ID；
-// 空串 = 全局）。
+// CanRouteForPlan 的第一参数是命名空间化的路由归属 scope ID（legacy
+// controller 使用 task:<id>，Graph controller 使用 graph:<id>）；
+// 空串 = 全局。
 type RouteValidator interface {
 	CanRouteForPlan(ownerScopeID, eventType string, requiredTools ...string) bool
+}
+
+// RouteCapabilityResolver 返回某个 owner scope 下，指定 route 的每个可认领
+// listener 都保证具备的工具集合。Graph acceptance 提交校验用它计算节点
+// capability 收窄后的实际工具面，结构性拒绝带写能力或 Shell 的 verifier。
+// AgentRegistry 实现本接口；只实现 RouteValidator 的旧测试替身仍可服务于
+// 非 acceptance 路由。
+type RouteCapabilityResolver interface {
+	RouteCapabilitiesForPlan(ownerScopeID, eventType string) ([]string, bool)
+}
+
+// RouteCapabilityEnvelopeResolver 返回某个 owner scope 下，指定 route 的任一
+// 可认领 listener **可能拥有**的工具并集。必需能力用上面的交集证明；禁止能力
+// / 正向闭集必须用并集证明，否则一个低权限 listener 会把另一个高权限
+// listener 的额外工具从交集中隐藏。Graph acceptance 在没有 per-node 精确收窄
+// 时要求本接口；AgentRegistry 实现它。
+type RouteCapabilityEnvelopeResolver interface {
+	RouteCapabilityEnvelopeForPlan(ownerScopeID, eventType string) ([]string, bool)
 }
 
 // MetaGroup 注册任务发布与代理间通信工具。
@@ -174,15 +193,26 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 		if err != nil {
 			return "", fmt.Errorf("读取父任务失败: %w", err)
 		}
+		if parentTask.GraphID != "" {
+			return "", fmt.Errorf("Graph 节点禁止调用 publish_task 创建脱图任务（graph_id=%s）；请用 submit_task_result 推进当前节点，或用 request_replan 请求 Scheduler 通过 patch_graph 修改执行图", parentTask.GraphID)
+		}
 		parentDepth = parentTask.Depth
 	} else if g.LineageHolder != nil {
 		// Scheduler 不受子任务深度限制，但仍必须留下真实父任务，
-		// 保持 ParentTaskID 谱系关联；controller 任务 ID 即路由归属 scope。
+		// 保持 ParentTaskID 谱系关联。动态路由归属使用显式 namespace：
+		// Graph controller 共享 graph scope，legacy controller 使用 task scope。
 		parentID = g.LineageHolder.Get()
 		if parentID == "" {
 			return "", fmt.Errorf("无法获取当前任务上下文")
 		}
-		parentOwnerID = parentID
+		parentTask, err := g.Store.GetTask(parentID)
+		if err != nil {
+			return "", fmt.Errorf("读取当前 Scheduler 任务失败: %w", err)
+		}
+		if parentTask.GraphID != "" {
+			return "", fmt.Errorf("Graph controller 禁止调用 publish_task 创建脱图任务（graph_id=%s）；请先 read_graph，再用当前 revision 调 patch_graph 扩展图", parentTask.GraphID)
+		}
+		parentOwnerID = model.TaskRouteScope(parentID)
 	}
 
 	if g.RouteValidator != nil && !g.RouteValidator.CanRouteForPlan(parentOwnerID, eventType) {
@@ -209,6 +239,7 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 		ReplyToAgentID: g.AgentID,
 		BatchID:        parentID,
 		Depth:          childDepth,
+		RouteScope:     parentOwnerID,
 		// 单交付物任务的语义默认是"执行一次"。未显式指定时显式置 1，
 		// 不落进 store 的 default_concurrency 兜底——该配置是兼容层，
 		// 大于 1 会让多个 Agent 重复执行同一任务（2026-07-22 排查）。

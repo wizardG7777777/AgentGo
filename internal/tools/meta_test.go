@@ -85,11 +85,12 @@ type fakeHolder struct{ id string }
 func (f *fakeHolder) Get() string { return f.id }
 
 // fakeRouteValidator 模拟运行时路由权威：routes 是 event_type → 保证工具的
-// 映射；ownerScopes 是 event_type → 归属 scope ID（controller 任务 ID）的映射，
-// 空串表示全局路由。CanRouteForPlan 第一参数是发布方的归属 scope（Scheduler
-// 经 LineageHolder 传 controller 任务 ID；Worker 发布时传 ""）。
+// 映射；ownerScopes 是 event_type → 命名空间化归属 scope ID 的映射，空串表示
+// 全局路由。CanRouteForPlan 第一参数是发布方的 task:/graph: scope；Worker
+// 发布时传 ""。
 type fakeRouteValidator struct {
 	routes      map[string][]string
+	envelopes   map[string][]string
 	ownerScopes map[string]string
 }
 
@@ -111,6 +112,23 @@ func (f fakeRouteValidator) CanRouteForPlan(ownerScopeID, eventType string, requ
 		}
 	}
 	return true
+}
+
+func (f fakeRouteValidator) RouteCapabilitiesForPlan(ownerScopeID, eventType string) ([]string, bool) {
+	if !f.CanRouteForPlan(ownerScopeID, eventType) {
+		return nil, false
+	}
+	return append([]string(nil), f.routes[eventType]...), true
+}
+
+func (f fakeRouteValidator) RouteCapabilityEnvelopeForPlan(ownerScopeID, eventType string) ([]string, bool) {
+	if !f.CanRouteForPlan(ownerScopeID, eventType) {
+		return nil, false
+	}
+	if tools, ok := f.envelopes[eventType]; ok {
+		return append([]string(nil), tools...), true
+	}
+	return append([]string(nil), f.routes[eventType]...), true
 }
 
 // ---- Register counting tests ----
@@ -207,8 +225,8 @@ func TestPublishTask_SchedulerRejectsMissingRuntimeRoute(t *testing.T) {
 	}
 }
 
-// 动态 Team 路由按归属 scope（controller 任务 ID）绑定：别的 scope 拥有的
-// team 路由对当前请求不可见；本 scope 拥有的路由与全局静态路由照常可用。
+// 动态 Team 路由按命名空间化归属 scope 绑定：别的 scope 拥有的 team 路由
+// 对当前请求不可见；本 scope 拥有的路由与全局静态路由照常可用。
 func TestPublishTask_DynamicRouteIsBoundToCurrentScopeWhileStaticRouteRemainsGlobal(t *testing.T) {
 	s := newFakeStore()
 	controller := &model.Task{ID: "controller-b", Depth: 0, Status: model.TaskStatusProcessing}
@@ -219,7 +237,10 @@ func TestPublishTask_DynamicRouteIsBoundToCurrentScopeWhileStaticRouteRemainsGlo
 			"team:owned-by-b": {"read_file"},
 			"static:global":   {"read_file"},
 		},
-		ownerScopes: map[string]string{"team:owned-by-a": "controller-a", "team:owned-by-b": "controller-b"},
+		ownerScopes: map[string]string{
+			"team:owned-by-a": model.TaskRouteScope("controller-a"),
+			"team:owned-by-b": model.TaskRouteScope("controller-b"),
+		},
 	}
 	g := MetaGroup{
 		Store: s, LineageHolder: &fakeHolder{id: controller.ID}, RouteValidator: routes,
@@ -253,6 +274,55 @@ func TestPublishTask_DynamicRouteIsBoundToCurrentScopeWhileStaticRouteRemainsGlo
 		if created.EventSource != controller.ID || created.ParentTaskID != controller.ID {
 			t.Fatalf("published task lost controller lineage: %+v", created)
 		}
+		if created.RouteScope != model.TaskRouteScope(controller.ID) {
+			t.Fatalf("published task lost durable route scope: %+v", created)
+		}
+	}
+}
+
+func TestPublishTask_GraphControllerCannotCreateOffGraphTask(t *testing.T) {
+	s := newFakeStore()
+	controller := &model.Task{
+		ID: "same-raw-id", GraphID: "same-raw-id",
+		EventType: "__scheduler__", Status: model.TaskStatusProcessing,
+	}
+	s.tasks[controller.ID] = controller
+	registry := agent.NewToolRegistry()
+	MetaGroup{
+		Store: s, LineageHolder: &fakeHolder{id: controller.ID},
+	}.Register(registry)
+
+	_, err := registry.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description": "same Graph work", "event_type": "team:graph-owned",
+	}))
+	if err == nil || !strings.Contains(err.Error(), "Graph controller 禁止") || !strings.Contains(err.Error(), "patch_graph") {
+		t.Fatalf("Graph controller off-graph publish err=%v", err)
+	}
+	if len(s.createCalls) != 0 {
+		t.Fatalf("Graph controller published off-graph tasks: %+v", s.createCalls)
+	}
+}
+
+func TestPublishTask_GraphWorkerCannotCreateOffGraphTask(t *testing.T) {
+	s := newFakeStore()
+	parent := &model.Task{
+		ID: "graph-work", GraphID: "g-owned", NodeID: "work", ActivationID: "work@1",
+		Depth: 1, Status: model.TaskStatusProcessing,
+	}
+	s.tasks[parent.ID] = parent
+	registry := agent.NewToolRegistry()
+	MetaGroup{
+		Store: s, Holder: &fakeHolder{id: parent.ID}, MaxDepth: 3, AgentID: "worker-1",
+	}.Register(registry)
+
+	_, err := registry.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
+		"description": "hidden child",
+	}))
+	if err == nil || !strings.Contains(err.Error(), "Graph 节点禁止") || !strings.Contains(err.Error(), "request_replan") {
+		t.Fatalf("Graph worker off-graph publish err=%v", err)
+	}
+	if len(s.createCalls) != 0 {
+		t.Fatalf("Graph worker published off-graph tasks: %+v", s.createCalls)
 	}
 }
 

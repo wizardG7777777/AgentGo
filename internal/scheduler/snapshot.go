@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"agentgo/internal/agent"
 	"agentgo/internal/agenttemplate"
 	"agentgo/internal/config"
 	"agentgo/internal/mailbox"
@@ -229,8 +230,13 @@ type SnapshotSources struct {
 	// nil 或空时该段被 omitempty 省略。
 	PendingDownstreamTasks []PendingDownstreamTask
 	// CurrentControllerTaskID 是当前 controller（scheduler root）任务 ID。
-	// 非空时快照只暴露当前请求树，并作为动态 Team 路由的归属 scope。
+	// CurrentGraphID 为空时，非空的 controller ID 让快照只暴露当前 legacy
+	// 请求树，并作为动态 Team 路由的归属 scope。
 	CurrentControllerTaskID string
+	// CurrentGraphID 是当前 Scheduler Graph controller 节点所属的 Graph。
+	// 非空时它优先于 CurrentControllerTaskID：任务只暴露完全相同 GraphID 的
+	// Graph scope，动态 Team 路由也按 GraphID 归属过滤。
+	CurrentGraphID string
 }
 
 // PendingDownstreamTask 是下游待处理任务的描述信息。
@@ -267,7 +273,18 @@ func BuildBoardJSON(
 ) string {
 	allTasks, _ := s.ScanAll()
 	tasks := allTasks
-	if sources.CurrentControllerTaskID != "" {
+	if sources.CurrentGraphID != "" {
+		// GraphID 是 V6 Graph 的 durable ownership identity。Graph controller
+		// 只能观察同图任务；ParentTaskID / BatchID 等 legacy/routing 字段不得
+		// 扩大这个边界。
+		filtered := make([]*model.Task, 0, len(allTasks))
+		for _, task := range allTasks {
+			if task != nil && task.GraphID == sources.CurrentGraphID {
+				filtered = append(filtered, task)
+			}
+		}
+		tasks = filtered
+	} else if sources.CurrentControllerTaskID != "" {
 		// 只暴露当前请求树，不暴露无关 root 或历史会话留存的任务，
 		// 让 board 与 get_task_result 的可见域口径一致。
 		visible := store.LegacyRequestTaskIDs(allTasks, sources.CurrentControllerTaskID)
@@ -349,12 +366,17 @@ func BuildBoardJSON(
 	}
 	available := max(workerCount-busyWorkers, 0)
 
-	// 动态 Team 路由的归属 scope 即当前 controller 任务 ID：快照只暴露全局
-	// 静态 route 与归属当前 controller 的 Team；空串时只见全局路由。
+	// Graph controller 使用 GraphID 作为动态 Team owner scope；legacy controller
+	// 仍使用 task ID。快照只暴露全局静态 route 与当前 scope 的 Team。
 	snapshotOwnerID := sources.CurrentControllerTaskID
+	if sources.CurrentGraphID != "" {
+		snapshotOwnerID = model.GraphRouteScope(sources.CurrentGraphID)
+	} else {
+		snapshotOwnerID = model.TaskRouteScope(snapshotOwnerID)
+	}
 
 	// 构造 agents 列表（来自 mailbox.Registry + roster + store 的反向映射）。
-	agents := buildAgentSnapshotsForPlan(allTasks, sources.MBRegistry, sources.Roster, sources.WorkerProfiles, sources.AgentRegistry, snapshotOwnerID)
+	agents := buildAgentSnapshotsForPlan(tasks, sources.MBRegistry, sources.Roster, sources.WorkerProfiles, sources.AgentRegistry, snapshotOwnerID)
 
 	// 构造特化代理聚合视图。归属 scope 之外的动态 Team 不暴露；
 	// 无 controller 的兼容/诊断 snapshot 仍使用完整 registry。
@@ -480,6 +502,9 @@ func splitSnapshotIDs(raw string) []string {
 func sortedResultAgentIDs(results map[string]string) []string {
 	ids := make([]string, 0, len(results))
 	for id := range results {
+		if id == agent.StructuredResultStorageKey {
+			continue // Graph bridge 专用 carrier，不是第二个执行者结果。
+		}
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)

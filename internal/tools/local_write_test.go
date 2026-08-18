@@ -318,6 +318,95 @@ type captureStore struct {
 	artifacts []string
 }
 
+type failingArtifactLedger struct{ err error }
+
+func (f failingArtifactLedger) AppendArtifactWithMeta(string, string, model.ArtifactMeta) error {
+	return f.err
+}
+
+func TestWriteFileSynchronouslyRecordsArtifactWithMeta(t *testing.T) {
+	g, _, tmp := newWriteGroup(t, nil)
+	taskStore := store.NewMemoryTaskStore(nil, 8, 1, 60)
+	task := &model.Task{Description: "同步 artifact ledger", EventType: "code"}
+	if err := taskStore.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	g.ArtifactStore = taskStore
+	ctx := agent.WithAgentContext(context.Background(), "agent-1", task.ID, 1)
+	content := "在返回前登记"
+	if _, err := g.writeFile(ctx, map[string]any{"path": "out/report.md", "content": content}); err != nil {
+		t.Fatalf("writeFile: %v", err)
+	}
+
+	got, err := taskStore.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Artifacts) != 1 || got.Artifacts[0] != "out/report.md" {
+		t.Fatalf("写工具返回时 artifact ledger 尚未可见: %+v", got.Artifacts)
+	}
+	wantMeta := model.ArtifactMeta{SHA256: computeSHA256([]byte(content)), Bytes: int64(len(content))}
+	if got.ArtifactMeta["out/report.md"] != wantMeta {
+		t.Fatalf("artifact meta=%+v，want %+v", got.ArtifactMeta["out/report.md"], wantMeta)
+	}
+	if data, err := os.ReadFile(filepath.Join(tmp, "out", "report.md")); err != nil || string(data) != content {
+		t.Fatalf("文件落盘结果错误: data=%q err=%v", data, err)
+	}
+}
+
+func TestEditFileSynchronouslyUpdatesArtifactMeta(t *testing.T) {
+	g, _, tmp := newWriteGroup(t, nil)
+	taskStore := store.NewMemoryTaskStore(nil, 8, 1, 60)
+	task := &model.Task{Description: "同步 edit artifact ledger", EventType: "code"}
+	if err := taskStore.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	g.ArtifactStore = taskStore
+	path := filepath.Join(tmp, "out.md")
+	if err := os.WriteFile(path, []byte("旧内容"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := agent.WithAgentContext(context.Background(), "agent-1", task.ID, 1)
+	if _, err := g.editFile(ctx, map[string]any{"path": "out.md", "old_str": "旧", "new_str": "新"}); err != nil {
+		t.Fatalf("editFile: %v", err)
+	}
+
+	got, err := taskStore.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantContent := "新内容"
+	wantMeta := model.ArtifactMeta{SHA256: computeSHA256([]byte(wantContent)), Bytes: int64(len(wantContent))}
+	if len(got.Artifacts) != 1 || got.Artifacts[0] != "out.md" || got.ArtifactMeta["out.md"] != wantMeta {
+		t.Fatalf("edit 返回时未同步更新 artifact/meta: artifacts=%v meta=%+v", got.Artifacts, got.ArtifactMeta)
+	}
+}
+
+func TestWriteFileArtifactLedgerFailureFailsClosed(t *testing.T) {
+	g, _, tmp := newWriteGroup(t, nil)
+	g.ArtifactStore = failingArtifactLedger{err: fmt.Errorf("模拟 ledger 写入失败")}
+	ctx := agent.WithAgentContext(context.Background(), "agent-1", "task-ledger-fail", 1)
+	_, err := g.writeFile(ctx, map[string]any{"path": "out.md", "content": "已落盘但不得报成功"})
+	if err == nil || !strings.Contains(err.Error(), "登记产物证据失败") {
+		t.Fatalf("artifact ledger 失败必须向工具调用者报错: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(tmp, "out.md")); statErr != nil {
+		t.Fatalf("底层写入已成功的事实不应被伪装为未发生: %v", statErr)
+	}
+}
+
+func TestWriteFileTaskContextWithoutArtifactLedgerRejectsBeforeSideEffect(t *testing.T) {
+	g, _, tmp := newWriteGroup(t, nil)
+	ctx := agent.WithAgentContext(context.Background(), "agent-1", "task-no-ledger", 1)
+	_, err := g.writeFile(ctx, map[string]any{"path": "out.md", "content": "不应写入"})
+	if err == nil || !strings.Contains(err.Error(), "artifact ledger 未装配") {
+		t.Fatalf("任务写工具缺少 ledger 必须 fail-closed: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(tmp, "out.md")); !os.IsNotExist(statErr) {
+		t.Fatalf("装配缺失应在文件副作用前拒绝: %v", statErr)
+	}
+}
+
 func newCaptureStore(taskID string) *captureStore {
 	return &captureStore{taskID: taskID}
 }
@@ -353,11 +442,11 @@ func (c *captureStore) QueryAvailable(string, string) ([]*model.Task, error)    
 func (c *captureStore) GetTask(string) (*model.Task, error)                        { return nil, nil }
 func (c *captureStore) GetDependencyResults(string) (map[string]string, error)     { return nil, nil }
 func (c *captureStore) GetDependencyArtifacts(string) (map[string][]string, error) { return nil, nil }
-func (c *captureStore) RecordLastResponse(string, string) error           { return nil }
-func (c *captureStore) ScanAll() ([]*model.Task, error)                   { return nil, nil }
-func (c *captureStore) AppendToolCall(string, store.ToolCallRecord) error { return nil }
-func (c *captureStore) AppendSchedulerBatch(string, string) error         { return nil }
-func (c *captureStore) ClearSchedulerBatch(string) error                  { return nil }
+func (c *captureStore) RecordLastResponse(string, string) error                    { return nil }
+func (c *captureStore) ScanAll() ([]*model.Task, error)                            { return nil, nil }
+func (c *captureStore) AppendToolCall(string, store.ToolCallRecord) error          { return nil }
+func (c *captureStore) AppendSchedulerBatch(string, string) error                  { return nil }
+func (c *captureStore) ClearSchedulerBatch(string) error                           { return nil }
 func (c *captureStore) QueryToolCalls(string, string) ([]store.ToolCallRecord, error) {
 	return nil, nil
 }

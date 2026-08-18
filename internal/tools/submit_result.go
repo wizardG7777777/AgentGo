@@ -2,8 +2,14 @@ package tools
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"agentgo/internal/agent"
@@ -12,10 +18,35 @@ import (
 	"agentgo/internal/trace"
 )
 
+const (
+	// structuredResultMaxBytes 与 Graph 小结果内联上限对齐：结构化路由事实
+	// 应保持紧凑；大内容必须走 artifact / evidence 引用，不得塞入控制字段。
+	structuredResultMaxBytes  = graph.InputInlineMaxBytes
+	structuredResultMaxKeys   = 64
+	structuredResultMaxDepth  = 16
+	structuredResultKeyMaxLen = 64
+)
+
+var structuredResultReservedKeys = map[string]struct{}{
+	"status":                         {},
+	"event":                          {},
+	"verdict":                        {},
+	"cited_evidence":                 {},
+	agent.StructuredResultStorageKey: {},
+}
+
+var submitTaskResultAllowedArgs = map[string]struct{}{
+	"summary": {}, "checks_performed": {}, "evidence": {},
+	"remaining_risks": {}, "status": {}, "blocked_reason": {},
+	"request_replan": {}, "event": {}, "verdict": {},
+	"cited_evidence": {}, "result": {},
+}
+
 // submitTaskResult 是 submit_task_result 工具的实现：普通执行节点的结构化提交通道。
 //
-// 与"自然完成"（本轮不调工具、输出纯文本）相比，它把 摘要/已做检查/证据/残余风险/
-// 阻塞原因/自述终态 结构化，由 agent 的 finalization 短路分支渲染为权威结果块：
+// 与"自然完成"（本轮不调工具、输出纯文本）相比，它把 摘要/自定义 JSON Result/
+// 已做检查/证据/残余风险/阻塞原因/自述终态 结构化，由 agent 的 finalization
+// 短路分支渲染并持久化为权威结果：
 //   - 先跑与自然完成同源的 ExpectedArtifacts 合约校验；缺失时返回错误且不标记
 //     finalized——LLM 在本轮 ReAct 循环内补写文件后可重新调用；
 //   - 校验通过后写入 agent.SubmitState 并 MarkTaskFinalized，下一轮 loop 顶部短路
@@ -30,25 +61,38 @@ import (
 //     同机制，幂等键 <taskID>/replan），让 Scheduler 在任务终态后重新决策；
 //     图任务由 graph-terminal-feed 终态回填驱动边路由，跳过不登记。
 //
-// 拒绝对象：controller / scheduler 任务（指引用 report_done）。
+// 拒绝对象：不属于 Graph 的 scheduler 任务（指引用 report_done）。Graph
+// controller 的 EventType 同样是 __scheduler__，但必须通过本工具提交 event /
+// 自定义 result 等结构化节点结果；acceptance 则提交 verdict，不能被角色名
+// 一并拒绝。
 func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]any) (string, error) {
 	taskID := g.Holder.Get()
 	if taskID == "" {
 		return "", fmt.Errorf("无法获取当前任务上下文")
 	}
+	// Task.Results 同时以 agent_id 保存权威正文，并以固定键保存 Graph 协议
+	// 字段。两者同名时无论采用哪种覆盖顺序都会破坏一份事实，必须在进入
+	// finalizing 前拒绝。
+	if _, reserved := structuredResultReservedKeys[g.AgentID]; reserved {
+		return "", fmt.Errorf("当前 agent_id %q 与 submit_task_result 的系统结果键冲突，无法安全提交结构化终态", g.AgentID)
+	}
 	task, err := g.Store.GetTask(taskID)
 	if err != nil {
 		return "", fmt.Errorf("读取当前任务失败: %w", err)
 	}
-	// 角色拒绝：控制面节点有专用提交通道，不能混用普通节点通道。
-	if task.EventType == "__scheduler__" {
-		return "", fmt.Errorf("submit_task_result 仅面向普通执行节点；controller/scheduler 任务请使用 report_done")
+	// 非图 scheduler 才有 report_done 专用汇报通道。Graph controller 必须
+	// 使用本通道，否则 Results["event"] 无法进入 Runtime 的边条件求值。
+	if task.EventType == "__scheduler__" && task.GraphID == "" {
+		return "", fmt.Errorf("submit_task_result 仅面向执行节点（含 Graph controller）；非图 scheduler 任务请使用 report_done")
 	}
 	// 唯一终态提交者：已 finalized（本任务已成功提交过一次）后拒绝重复提交，
 	// 不改变任何既有状态。经窄接口探测——旧装配的 notifier 不实现 IsFinalized
 	// 时退化为不检查（重复 Put 以最新一次为准的旧行为）。
 	if checker, ok := g.FinalizationNotifier.(interface{ IsFinalized() bool }); ok && checker.IsFinalized() {
 		return "", fmt.Errorf("任务已提交结构化结果并进入收尾（finalizing）：submit_task_result 每次任务只能成功提交一次，本次重复调用被拒绝")
+	}
+	if err := validateSubmitTaskResultArgs(args); err != nil {
+		return "", err
 	}
 
 	summary, _ := args["summary"].(string)
@@ -67,18 +111,38 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 	}
 	verdict, _ := args["verdict"].(string)
 	verdict = strings.TrimSpace(verdict)
-	// evidence_items（G1b）：Graph acceptance 节点验收任务的机器可核验证据，
-	// 原样（JSON 数组字符串）经 StructuredSubmission 写入 Results["evidence"]，
-	// 由 Graph Runtime 的服务端核验器逐条核验。提交时做轻量形态校验
-	//（必须是合法 JSON 数组）——非法输入在此拒绝、任务保持未 finalized，
-	// agent 本轮内可修正后重新提交；类型与逐字纪律的服务端核验在图侧进行。
-	evidenceItems, _ := args["evidence_items"].(string)
-	if trimmed := strings.TrimSpace(evidenceItems); trimmed != "" {
-		var arr []json.RawMessage
-		if err := json.Unmarshal([]byte(trimmed), &arr); err != nil {
-			return "", fmt.Errorf("evidence_items 必须是合法 JSON 数组（[{\"criterion\":...,\"type\":\"command|file_hash|task_status\",\"value\":...}]），解析失败: %v", err)
+	if verdict != "" {
+		switch verdict {
+		case "pass", "fixable", "failed":
+		default:
+			return "", fmt.Errorf("verdict 只接受 pass / fixable / failed，实际值 %q", verdict)
 		}
-		evidenceItems = trimmed
+		if eventName != "" {
+			return "", fmt.Errorf("verdict 与 event 互斥：acceptance 业务结论只能通过 $.verdict 路由，不得同时提交 event")
+		}
+	}
+	// cited_evidence：Graph acceptance 节点验收任务引用的证据清单（逗号分隔
+	// 的不透明稳定 EvidenceRef），经 StructuredSubmission 写入
+	// Results["cited_evidence"]，由 Graph Runtime 做谱系核验（引用必须属于
+	// 该 activation 的上游 Input 谱系或本任务自身证据）。提交时做轻量形态
+	// 校验（逐项非空）——谱系核验在图侧进行。
+	citedEvidence, _ := args["cited_evidence"].(string)
+	if trimmed := strings.TrimSpace(citedEvidence); trimmed != "" {
+		for _, ref := range strings.Split(trimmed, ",") {
+			if strings.TrimSpace(ref) == "" {
+				return "", fmt.Errorf("cited_evidence 含空白引用项：应为逗号分隔的不透明稳定 EvidenceRef 清单")
+			}
+		}
+		citedEvidence = trimmed
+	}
+
+	// result 是 Agent 可供 Graph 路由和下游数据流消费的自定义 JSON object。
+	// 专用 event/verdict/cited_evidence/status 键必须走各自参数，防止绕过其
+	// 词表、谱系和终态校验；其余字段在 Graph 终态回填时类型保真地展开到
+	// Result 顶层，因此可直接被 $.coverage / $.metrics.score 等条件读取。
+	resultJSON, err := normalizeStructuredResult(args, g.AgentID)
+	if err != nil {
+		return "", err
 	}
 
 	// status 自述终态：缺省 completed；blocked 必须附 blocked_reason；
@@ -94,6 +158,9 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 		if strings.TrimSpace(blockedReason) == "" {
 			return "", fmt.Errorf("status=blocked 时必须填写 blocked_reason 说明阻塞原因")
 		}
+		if verdict != "" || eventName != "" {
+			return "", fmt.Errorf("status=blocked 时不得填写 verdict/event；blocked 是任务终态，由 Runtime 的 blocked 兜底边处理")
+		}
 	default:
 		return "", fmt.Errorf("status 只接受 completed / blocked（failed、cancelled 由系统路径产生，不接受自报），实际值 %q", status)
 	}
@@ -103,6 +170,9 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 	check := agent.CheckExpectedArtifactsWithDisk(g.Store, task.ID, g.ArtifactResolver)
 	if len(check.Missing) > 0 {
 		return "", fmt.Errorf("submit_task_result 被拒绝：%s", agent.BuildArtifactFailureReason(check))
+	}
+	if err := g.recordRecoveredArtifacts(task.ID, check.Recovered); err != nil {
+		return "", fmt.Errorf("submit_task_result 被拒绝：磁盘恢复的预期产物未能写入 durable artifact ledger: %w", err)
 	}
 
 	g.SubmitState.Put(&agent.StructuredSubmission{
@@ -116,7 +186,8 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 		Status:          status,
 		Event:           eventName,
 		Verdict:         verdict,
-		EvidenceItems:   evidenceItems,
+		CitedEvidence:   citedEvidence,
+		ResultJSON:      resultJSON,
 	})
 	g.FinalizationNotifier.MarkTaskFinalized()
 
@@ -165,4 +236,171 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 	}
 
 	return "结构化结果已提交：系统将以本次提交作为任务权威结果收尾（渲染文本随依赖结果传递给下游任务）。请停止调用其他工具，直接结束本轮。" + replanNote, nil
+}
+
+// recordRecoveredArtifacts 把 expected_artifacts 磁盘兜底命中的文件
+// 在进入 finalizing 前补登到 durable ledger。仅 stat 成功不足以
+// 形成 Graph artifact Evidence；必须同步固化路径与当前内容身份。
+// 多个文件中途失败可安全重试：Store 以 path+latest meta 幂等。
+func (g PlanControlGroup) recordRecoveredArtifacts(taskID string, recovered []string) error {
+	if len(recovered) == 0 {
+		return nil
+	}
+	ledger, ok := g.Store.(interface {
+		AppendArtifactWithMeta(taskID string, path string, meta model.ArtifactMeta) error
+	})
+	if !ok {
+		return fmt.Errorf("TaskStore 不支持 AppendArtifactWithMeta")
+	}
+	if g.ArtifactResolver == nil {
+		return fmt.Errorf("ArtifactResolver 未装配")
+	}
+	for _, expected := range recovered {
+		physical := g.ArtifactResolver(taskID, expected)
+		meta, err := recoveredArtifactMeta(physical)
+		if err != nil {
+			return fmt.Errorf("读取恢复产物 %s 失败: %w", expected, err)
+		}
+		path := filepath.ToSlash(filepath.Clean(expected))
+		if err := ledger.AppendArtifactWithMeta(taskID, path, meta); err != nil {
+			return fmt.Errorf("登记恢复产物 %s 失败: %w", path, err)
+		}
+	}
+	return nil
+}
+
+// recoveredArtifactMeta 流式计算大产物内容身份，避免 os.ReadFile
+// 按文件大小无界分配内存。显式 Close 使 Windows TempDir/工作区
+// 清理不会被本路径留下的句柄阻塞。
+func recoveredArtifactMeta(path string) (model.ArtifactMeta, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return model.ArtifactMeta{}, err
+	}
+	h := sha256.New()
+	bytesCopied, copyErr := io.Copy(h, f)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return model.ArtifactMeta{}, copyErr
+	}
+	if closeErr != nil {
+		return model.ArtifactMeta{}, closeErr
+	}
+	return model.ArtifactMeta{SHA256: hex.EncodeToString(h.Sum(nil)), Bytes: bytesCopied}, nil
+}
+
+func validateSubmitTaskResultArgs(args map[string]any) error {
+	unknown := make([]string, 0)
+	for key := range args {
+		if _, ok := submitTaskResultAllowedArgs[key]; !ok {
+			unknown = append(unknown, key)
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	sort.Strings(unknown)
+	return fmt.Errorf("submit_task_result 含未知参数 %s：请只使用工具 schema 声明的字段", strings.Join(unknown, ", "))
+}
+
+// normalizeStructuredResult 校验 result object 的形状、键、深度和体积，并
+// 返回无空白、稳定键序的 JSON 文本。不存在 result 时返回空串；显式空 object
+// 返回 "{}"，两者语义可审计地区分。
+func normalizeStructuredResult(args map[string]any, agentID string) (string, error) {
+	raw, present := args["result"]
+	if !present {
+		return "", nil
+	}
+	result, ok := raw.(map[string]any)
+	if !ok || result == nil {
+		return "", fmt.Errorf("result 必须是 JSON object；数组、字符串、数字、布尔或 null 均不接受")
+	}
+	if len(result) > structuredResultMaxKeys {
+		return "", fmt.Errorf("result 顶层字段数 %d 超过上限 %d", len(result), structuredResultMaxKeys)
+	}
+	if agentID == agent.StructuredResultStorageKey {
+		return "", fmt.Errorf("当前 agent_id 与系统结构化结果保留键冲突，无法安全提交 result")
+	}
+	if err := validateStructuredResultValue(result, 1, agentID, true); err != nil {
+		return "", err
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		return "", fmt.Errorf("result 不是可序列化的 JSON object: %w", err)
+	}
+	if len(data) > structuredResultMaxBytes {
+		return "", fmt.Errorf("result 规范化后大小 %d 字节超过上限 %d 字节；大内容请写入 artifact 并在 evidence 中引用", len(data), structuredResultMaxBytes)
+	}
+
+	// 再解码一次，拒绝 MarshalJSON 等自定义类型生成的非 object 载荷，并把
+	// int/json.Number 等 Go 测试输入归一为 Graph 条件求值使用的 JSON 类型。
+	normalized, err := agent.DecodeStructuredResult(string(data))
+	if err != nil {
+		return "", fmt.Errorf("result 规范化失败: %w", err)
+	}
+	data, err = json.Marshal(normalized)
+	if err != nil {
+		return "", fmt.Errorf("result 规范化失败: %w", err)
+	}
+	return string(data), nil
+}
+
+func validateStructuredResultValue(value any, depth int, agentID string, topLevel bool) error {
+	if depth > structuredResultMaxDepth {
+		return fmt.Errorf("result JSON 嵌套深度超过上限 %d", structuredResultMaxDepth)
+	}
+	switch v := value.(type) {
+	case map[string]any:
+		if len(v) > structuredResultMaxKeys {
+			return fmt.Errorf("result object 字段数 %d 超过单层上限 %d", len(v), structuredResultMaxKeys)
+		}
+		for key, child := range v {
+			if !isStructuredResultKey(key) {
+				return fmt.Errorf("result 字段名 %q 非法：必须是最长 %d 字节的 ASCII 标识符（字母或下划线开头，仅含字母、数字、下划线）", key, structuredResultKeyMaxLen)
+			}
+			if topLevel {
+				if _, reserved := structuredResultReservedKeys[key]; reserved {
+					return fmt.Errorf("result 顶层字段 %q 是系统保留键；请使用 submit_task_result 的同名专用参数", key)
+				}
+				if key == agentID {
+					return fmt.Errorf("result 顶层字段 %q 与当前 agent_id 冲突，会覆盖权威结果正文", key)
+				}
+			}
+			if err := validateStructuredResultValue(child, depth+1, agentID, false); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if err := validateStructuredResultValue(child, depth+1, agentID, false); err != nil {
+				return err
+			}
+		}
+	case nil, string, bool, float64, float32,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64, json.Number:
+		// json.Marshal 在下一步负责拒绝 NaN、Inf 和越界数字。
+	default:
+		return fmt.Errorf("result 包含 JSON 不支持的值类型 %T", value)
+	}
+	return nil
+}
+
+func isStructuredResultKey(key string) bool {
+	if key == "" || len(key) > structuredResultKeyMaxLen {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if i == 0 {
+			if c != '_' && (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') {
+				return false
+			}
+			continue
+		}
+		if c != '_' && (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
 }

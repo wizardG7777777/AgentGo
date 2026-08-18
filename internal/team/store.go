@@ -14,7 +14,12 @@ import (
 	"time"
 )
 
-const teamStateVersion = 1
+const (
+	legacyTeamStateVersion = 1
+	// v2 adds lifecycle-critical TeamSpec.GraphID ownership. Old binaries must
+	// reject v2 instead of silently decoding Graph Teams as task-owned Teams.
+	teamStateVersion = 2
+)
 
 type persistentState struct {
 	Version          int                 `json:"version"`
@@ -26,9 +31,10 @@ type persistentState struct {
 // detached state, then fsynced to a temporary file and atomically renamed. The
 // in-memory view advances only after the durable replace succeeds.
 type Store struct {
-	mu    sync.RWMutex
-	path  string
-	state persistentState
+	mu                     sync.RWMutex
+	path                   string
+	state                  persistentState
+	legacyMigrationPending bool
 }
 
 func NewMemoryStore() *Store {
@@ -52,13 +58,101 @@ func OpenStore(path string) (*Store, error) {
 	if err := json.Unmarshal(data, &s.state); err != nil {
 		return nil, fmt.Errorf("decode team store: %w", err)
 	}
-	if s.state.Version != teamStateVersion {
+	switch s.state.Version {
+	case legacyTeamStateVersion:
+		// V1 predates GraphID, but some ready Teams were provisioned for an
+		// already-durable Graph. Do not guess task ownership before GraphStore is
+		// available: keep the file at v1 and make mutations fail closed until the
+		// bootstrap reconciliation supplies authoritative Graph references.
+		s.legacyMigrationPending = true
+	case teamStateVersion:
+	default:
 		return nil, fmt.Errorf("unsupported team store version %d", s.state.Version)
 	}
 	if err := normalizePersistentState(&s.state); err != nil {
 		return nil, fmt.Errorf("validate team store: %w", err)
 	}
 	return s, nil
+}
+
+// MigrateV1GraphBindings durably upgrades a v1 store after GraphStore recovery.
+// Ready Teams with one exact durable Graph reference become Graph-owned; this
+// includes terminal Graphs, which Manager will durably stop during recovery.
+// Teams with no reference remain legacy task-owned. The whole migration is one
+// atomic replace. An ambiguous/error result writes nothing and leaves every
+// mutation fenced, so a restart can retry against the same v1 facts.
+func (s *Store) MigrateV1GraphBindings(resolve GraphBindingResolver) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.legacyMigrationPending {
+		return false, nil
+	}
+	if resolve == nil {
+		return false, ErrLegacyMigrationRequired
+	}
+
+	next, err := cloneState(s.state)
+	if err != nil {
+		return false, err
+	}
+	if next.Version != legacyTeamStateVersion {
+		return false, fmt.Errorf("%w: in-memory version=%d", ErrLegacyMigrationRequired, next.Version)
+	}
+
+	teamIDs := make([]string, 0, len(next.Teams))
+	for id := range next.Teams {
+		teamIDs = append(teamIDs, id)
+	}
+	sort.Strings(teamIDs)
+	for _, id := range teamIDs {
+		spec := next.Teams[id]
+		if strings.TrimSpace(spec.GraphID) != "" {
+			return false, fmt.Errorf("%w: v1 team %s unexpectedly contains graph_id %q",
+				ErrLegacyMigrationRequired, id, spec.GraphID)
+		}
+		if spec.Status != StatusReady {
+			continue
+		}
+		candidates, resolveErr := resolve(spec.EventType)
+		if resolveErr != nil {
+			return false, fmt.Errorf("resolve v1 team %s graph ownership: %w", id, resolveErr)
+		}
+		unique := make(map[string]struct{}, len(candidates))
+		for _, candidate := range candidates {
+			if graphID := strings.TrimSpace(candidate); graphID != "" {
+				unique[graphID] = struct{}{}
+			}
+		}
+		graphIDs := make([]string, 0, len(unique))
+		for graphID := range unique {
+			graphIDs = append(graphIDs, graphID)
+		}
+		sort.Strings(graphIDs)
+		switch len(graphIDs) {
+		case 0:
+			// No Graph authority claims this private route: preserve the v1
+			// task-owned lifecycle exactly.
+		case 1:
+			spec.GraphID = graphIDs[0]
+			next.Teams[id] = spec
+		default:
+			return false, fmt.Errorf("%w: ready team %s event_type=%q is referenced by graphs %s",
+				ErrLegacyGraphAmbiguous, id, spec.EventType, strings.Join(graphIDs, ","))
+		}
+	}
+
+	next.Version = teamStateVersion
+	if err := normalizePersistentState(&next); err != nil {
+		return false, fmt.Errorf("normalize migrated team store: %w", err)
+	}
+	if s.path != "" {
+		if err := writeStateAtomic(s.path, &next); err != nil {
+			return false, fmt.Errorf("migrate team store v1 to v%d: %w", teamStateVersion, err)
+		}
+	}
+	s.state = next
+	s.legacyMigrationPending = false
+	return true, nil
 }
 
 func newPersistentState() persistentState {
@@ -84,7 +178,7 @@ func normalizePersistentState(state *persistentState) error {
 		if err := validateSpec(spec); err != nil {
 			return fmt.Errorf("team %s: %w", id, err)
 		}
-		key := idempotencyKey(spec.ControllerTaskID, spec.TemplateRef, spec.Purpose, spec.Replicas)
+		key := idempotencyKey(spec)
 		if previous, exists := rebuilt[key]; exists && previous != id {
 			return fmt.Errorf("teams %s and %s have duplicate idempotency identity", previous, id)
 		}
@@ -97,8 +191,8 @@ func normalizePersistentState(state *persistentState) error {
 }
 
 // Ensure atomically creates spec or returns the existing idempotent team. The
-// idempotency identity is (controller task, template ref, purpose, replicas):
-// repeated provisioning by the same controller task reuses the ready team.
+// identity is (lifecycle owner, template ref, purpose, replicas): Graph-owned
+// Teams can be reused by later controller activations in the same Graph.
 func (s *Store) Ensure(spec TeamSpec) (TeamSpec, bool, error) {
 	if err := validateSpec(spec); err != nil {
 		return TeamSpec{}, false, err
@@ -106,7 +200,7 @@ func (s *Store) Ensure(spec TeamSpec) (TeamSpec, bool, error) {
 	var out TeamSpec
 	created := false
 	err := s.update(func(state *persistentState) error {
-		key := idempotencyKey(spec.ControllerTaskID, spec.TemplateRef, spec.Purpose, spec.Replicas)
+		key := idempotencyKey(spec)
 		if id, ok := state.IdempotencyIndex[key]; ok {
 			existing, exists := state.Teams[id]
 			if !exists {
@@ -192,9 +286,9 @@ func (s *Store) SetStatus(teamID string, status Status, reason string) (TeamSpec
 	return out, err
 }
 
-// StopController marks every ready team owned by controllerTaskID stopped in
-// one durable commit. The returned records are the complete set for that
-// controller after the mutation.
+// StopController marks every legacy task-owned Team stopped in one durable
+// commit. Graph-owned Teams retain ControllerTaskID only as provenance and are
+// deliberately excluded.
 func (s *Store) StopController(controllerTaskID, reason string) ([]TeamSpec, error) {
 	if strings.TrimSpace(controllerTaskID) == "" {
 		return nil, fmt.Errorf("controller task id is required")
@@ -203,7 +297,33 @@ func (s *Store) StopController(controllerTaskID, reason string) ([]TeamSpec, err
 	err := s.update(func(state *persistentState) error {
 		now := time.Now().UTC()
 		for id, spec := range state.Teams {
-			if spec.ControllerTaskID != controllerTaskID {
+			if spec.GraphID != "" || spec.ControllerTaskID != controllerTaskID {
+				continue
+			}
+			if spec.Status != StatusStopped || spec.StopReason != reason {
+				spec.Status = StatusStopped
+				spec.StopReason = reason
+				spec.UpdatedAt = now
+				state.Teams[id] = spec
+			}
+			out = append(out, spec)
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+		return nil
+	})
+	return out, err
+}
+
+// StopGraph marks every Team owned by graphID stopped in one durable commit.
+func (s *Store) StopGraph(graphID, reason string) ([]TeamSpec, error) {
+	if strings.TrimSpace(graphID) == "" {
+		return nil, fmt.Errorf("graph id is required")
+	}
+	var out []TeamSpec
+	err := s.update(func(state *persistentState) error {
+		now := time.Now().UTC()
+		for id, spec := range state.Teams {
+			if spec.GraphID != graphID {
 				continue
 			}
 			if spec.Status != StatusStopped || spec.StopReason != reason {
@@ -229,6 +349,9 @@ func (s *Store) StopController(controllerTaskID, reason string) ([]TeamSpec, err
 func (s *Store) RebindDir(newPath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.legacyMigrationPending {
+		return ErrLegacyMigrationRequired
+	}
 	if newPath != "" {
 		// s.state 在 OpenStore/update 出口均已 normalize，可直接落盘。
 		if err := writeStateAtomic(newPath, &s.state); err != nil {
@@ -242,6 +365,9 @@ func (s *Store) RebindDir(newPath string) error {
 func (s *Store) update(fn func(*persistentState) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.legacyMigrationPending {
+		return ErrLegacyMigrationRequired
+	}
 	next, err := cloneState(s.state)
 	if err != nil {
 		return err
@@ -350,15 +476,22 @@ func validStatus(status Status) bool {
 	return status == StatusReady || status == StatusStopped
 }
 
-func idempotencyKey(controllerTaskID, templateRef, purpose string, replicas int) string {
+func idempotencyKey(spec TeamSpec) string {
+	ownerKind := "task"
+	ownerID := strings.TrimSpace(spec.ControllerTaskID)
+	if graphID := strings.TrimSpace(spec.GraphID); graphID != "" {
+		ownerKind = "graph"
+		ownerID = graphID
+	}
 	payload, _ := json.Marshal(struct {
-		ControllerTaskID string `json:"controller_task_id"`
-		TemplateRef      string `json:"template_ref"`
-		Purpose          string `json:"purpose"`
-		Replicas         int    `json:"replicas"`
+		OwnerKind   string `json:"owner_kind"`
+		OwnerID     string `json:"owner_id"`
+		TemplateRef string `json:"template_ref"`
+		Purpose     string `json:"purpose"`
+		Replicas    int    `json:"replicas"`
 	}{
-		ControllerTaskID: strings.TrimSpace(controllerTaskID), TemplateRef: strings.TrimSpace(templateRef),
-		Purpose: strings.TrimSpace(purpose), Replicas: replicas,
+		OwnerKind: ownerKind, OwnerID: ownerID, TemplateRef: strings.TrimSpace(spec.TemplateRef),
+		Purpose: strings.TrimSpace(spec.Purpose), Replicas: spec.Replicas,
 	})
 	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:])

@@ -1145,6 +1145,31 @@ func TestQueryToolCalls_FilterByToolName(t *testing.T) {
 	}
 }
 
+func TestQueryToolCallsEqualTimestampHasDeterministicTieBreak(t *testing.T) {
+	s, _ := newTestStore(10, 100)
+	task := publishTestTask(t, s, "test")
+	stamp := time.Now()
+	// 故意逆序写入不同 toolName（底层按 toolName 分 map 存放）；全量查询不能
+	// 依赖 map 遍历顺序，也不能只比较相等 Timestamp。
+	for _, rec := range []ToolCallRecord{
+		{Timestamp: stamp, CallID: "call-z", AgentID: "b", ToolName: "write_file", Args: map[string]any{"path": "z"}},
+		{Timestamp: stamp, CallID: "call-a", AgentID: "a", ToolName: "read_file", Args: map[string]any{"path": "a"}},
+	} {
+		if err := s.AppendToolCall(task.ID, rec); err != nil {
+			t.Fatalf("AppendToolCall: %v", err)
+		}
+	}
+	for i := 0; i < 20; i++ {
+		all, err := s.QueryToolCalls(task.ID, "")
+		if err != nil || len(all) != 2 {
+			t.Fatalf("QueryToolCalls: calls=%+v err=%v", all, err)
+		}
+		if all[0].CallID != "call-a" || all[1].CallID != "call-z" {
+			t.Fatalf("相同 Timestamp 必须按稳定身份排序，实际=%q,%q", all[0].CallID, all[1].CallID)
+		}
+	}
+}
+
 func TestQueryToolCalls_NonExistentTask(t *testing.T) {
 	s, _ := newTestStore(10, 100)
 	got, err := s.QueryToolCalls("nonexistent-id", "")

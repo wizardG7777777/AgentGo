@@ -45,7 +45,7 @@ func main() {
 
 	configPath := flag.String("config", "setting.yaml", "配置文件路径")
 	skipStartupProbe := flag.Bool("skip-startup-probe", false, "跳过启动期 TCP probe（等价于 startup_probe: off）")
-	resumeSessionID := flag.String("resume", "", "恢复指定 Session（完整 ID 或唯一前缀）")
+	resumeSessionID := flag.String("resume", "", "进入指定 Session（完整 ID 或唯一前缀；不自动续跑任务，需提交新提示词继续）")
 	flag.Parse()
 
 	// 判断用户是否显式指定了 -config

@@ -45,9 +45,10 @@ type syncFile interface {
 //     (b) 距首个未同步条目超过 interval——定时 goroutine 执行；
 //     (c) Close——停机前兜底同步。
 //
-// 耐久性窗口：机器级崩溃（掉电/内核 panic）最多丢失最后 interval（200ms）
-// 内已 Append 的记录；进程崩溃不丢（字节已在 OS 页缓存）。对
-// artifacts.jsonl 观测日志属可接受代价。
+// 耐久性边界：直接 ArtifactLog.Append 仍可用 group-commit，但
+// MemoryTaskStore.AppendArtifactWithMeta 把 artifact 作为 Graph correctness
+// authority，因此每次 append 后立即调 FlushPending，只有 fsync 成功
+// 才提交内存 task.Artifacts。生产终态路径不存在 200ms 掉电窗口。
 //
 // 生产读取路径核查（2026-07-18 grep）：artifacts.jsonl 仅 Replay 读取，
 // 且生产仅 bootstrap 启动时在导入任务前调用一次（F12 另案跟踪时序问题），
@@ -133,6 +134,27 @@ func (c *artifactGroupCommitter) append(data []byte) error {
 	return nil
 }
 
+// syncPending 是 correctness 调用方的耐久性屏障：只在存在
+// 未同步记录时执行一次 fsync。append 恰好触发满批同步、
+// timer 先一步同步或前一个 barrier 已清空 pending 时均为 no-op，
+// 避免 Windows/NTFS 上的双重 fsync。失败时保留 pending，重试
+// 可再次同步已写入字节。
+func (c *artifactGroupCommitter) syncPending() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return ErrArtifactLogClosed
+	}
+	if c.pending == 0 {
+		return nil
+	}
+	if err := c.file.Sync(); err != nil {
+		return fmt.Errorf("fsync artifact log 失败: %w", err)
+	}
+	c.pending = 0
+	return nil
+}
+
 // close 兜底 fsync（仅当还有未同步条目）、停止定时 goroutine 并等待其
 // 退出（无泄漏），最后关闭文件。幂等。
 func (c *artifactGroupCommitter) close() error {
@@ -175,10 +197,10 @@ func (c *artifactGroupCommitter) close() error {
 //     写入交错（即便单行 JSON < 4KB 在 POSIX 上理论上是原子 write，
 //     Windows 上不保证，所以依然上锁）。
 //
-//   - **崩溃安全（C3 起为 group-commit）**：Append write-through 到 OS
-//     （进程崩溃不丢），fsync 按批触发（满 32 条 / 200ms / Close）。
-//     机器级崩溃最多丢失最后 200ms 的记录——详见
-//     artifactGroupCommitter 文档。
+//   - **崩溃安全**：Append write-through 到 OS；直接调用可按批
+//     fsync（满 32 条 / 200ms / Close）。MemoryTaskStore 的权威产物
+//     路径在 append 后立即 FlushPending，屏障成功后才改内存并
+//     允许任务终态，因此不接受 group-commit 的掉电窗口。
 //
 //   - **不压缩**：MVP 规模下日志增长可控（100 任务/天 × 3 artifact/任务 ×
 //     1 年 ≈ 10 万行 / 10 MB）。等到真的超过 100 MB 或重放时间 > 1s 时
@@ -293,6 +315,15 @@ func (l *ArtifactLog) AppendWithMeta(taskID string, path string, meta model.Arti
 	l.rememberMetaLocked(taskID, path, meta)
 	l.gc.mu.Unlock()
 	return nil
+}
+
+// FlushPending 把当前未同步的 artifact records 立即 fsync。
+// pending 已被满批/timer 清空时是 no-op，不会产生第二次 fsync。
+func (l *ArtifactLog) FlushPending() error {
+	if l == nil || l.gc == nil {
+		return fmt.Errorf("artifact log 未初始化")
+	}
+	return l.gc.syncPending()
 }
 
 // rememberMetaLocked 把一条元数据写入内存索引（last-wins：同一文件重复

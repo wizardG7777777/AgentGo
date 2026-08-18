@@ -69,13 +69,261 @@ func TestSchedulerSystemPrompt_ModeContractUsesOnlyCurrentAxes(t *testing.T) {
 
 func TestSchedulerSystemPrompt_ReadGraphBeforePatch(t *testing.T) {
 	for _, phrase := range []string{
-		`submit_graph / read_graph / patch_graph`,
 		`read_graph：按 graph_id 读取权威 GraphDocument 与当前 revision`,
-		`修改前必须调用 read_graph`,
-		`冲突时再次调用 read_graph`,
+		`patch_graph：以 base_revision CAS`,
+		`修改前必须 read_graph 获取权威 revision`,
+		`冲突时再次 read_graph`,
 	} {
 		if !strings.Contains(schedulerSystemPrompt, phrase) {
 			t.Errorf("schedulerSystemPrompt 缺少 read_graph CAS 指引 %q", phrase)
+		}
+	}
+}
+
+// TestSchedulerSystemPrompt_GraphFirstForDurableWork locks the unified-Graph
+// lifecycle (v7): every new user request must form a Graph — there is no
+// parallel direct-answer path; topology choices are dependency-first.
+func TestSchedulerSystemPrompt_GraphFirstForDurableWork(t *testing.T) {
+	for _, phrase := range []string{
+		`每个新用户请求都必须形成 Graph`,
+		`没有与 Graph 并列的"直接回答"路径`,
+		`不得在建图前完成主体工作`,
+		`依赖优先于并行`,
+		`最小 Graph（一个工作节点 + end）`,
+		`legacy/恢复兼容`,
+	} {
+		if !strings.Contains(schedulerSystemPrompt, phrase) {
+			t.Errorf("schedulerSystemPrompt 缺少统一 Graph 生命周期指引 %q", phrase)
+		}
+	}
+
+	for _, stale := range []string{
+		`默认假设：能自己干就自己干`,
+		`只有 C 类才委派`,
+		`单个任务直发不值得建图`,
+		`直接回答路径（不建图）`,
+		`一次原子只读查询`,
+		`工具调用上限是一次`,
+	} {
+		if strings.Contains(schedulerSystemPrompt, stale) {
+			t.Errorf("schedulerSystemPrompt 仍含已删除的 D 路径旧指引 %q", stale)
+		}
+	}
+}
+
+func TestSchedulerSystemPrompt_GraphScopedTeamLifecycle(t *testing.T) {
+	for _, phrase := range []string{
+		`先决定合法且全局唯一的 graph_id`,
+		`用同一个 graph_id 调 provision_agent_team`,
+		`Team 从 provision 成功起绑定 graph:<id>`,
+		`Scheduler task 即使先终态也不会回收 Team`,
+		`只有该 Graph 的 graph_ended 才会停止实例并撤销 route`,
+		`省略 graph_id 只允许 legacy publish_task`,
+		`跨 Graph、task-owned 或工具子集越界都 fail-closed`,
+		`不主动使用 subgraph`,
+	} {
+		if !strings.Contains(schedulerSystemPrompt, phrase) {
+			t.Errorf("schedulerSystemPrompt 缺少 Graph-scoped Team 契约 %q", phrase)
+		}
+	}
+
+	if strings.Contains(schedulerSystemPrompt, `按当前 controller 任务归属创建 Team`) {
+		t.Error("schedulerSystemPrompt 仍把 Graph Team 错误绑定到 origin controller task")
+	}
+}
+
+func TestSchedulerSystemPrompt_GraphFanInAndConditionsAreExplicit(t *testing.T) {
+	for _, phrase := range []string{
+		`无 flow generation/correlation token 的单赋值安全基线`,
+		`所有非 barrier 节点最多一条静态入边`,
+		`条件分支必须各自保留后续与 end`,
+		`禁止共享下游普通节点形成 OR mux`,
+		`when 缺省即无条件`,
+		`blocked/failed 等终态到达时照样选中`,
+		`join 是 Runtime 内建 barrier`,
+		`不会把上游 event 提升`,
+		`成功汇合时自身终态事件固定回落为 completed`,
+		`join → summarize`,
+		`不得写 ready/pass`,
+		`禁止让错误终态通过无条件边误入成功分支`,
+		`task.required_inputs 列出必须齐备的端口名`,
+		`每个 target_input 只能有一条生产边`,
+		`并行 AND 使用不同端口`,
+		`互斥候选不得共享端口`,
+		`target_input 只允许指向 join / acceptance`,
+		`root 的首次 activation 由 Runtime 隐式创建`,
+		`activation="new" 回边`,
+		`"next":[{"to":"done","when":{"event":"completed"}}]`,
+		`上游失败应在上游节点自己的 next 直接以 event=failed/blocked 绕过 router 到 repair`,
+		`router 激活后以自身 completed 终态求值 next`,
+		`$.status eq "failed"`,
+	} {
+		if !strings.Contains(schedulerSystemPrompt, phrase) {
+			t.Errorf("schedulerSystemPrompt 缺少 Graph fan-in/条件边界 %q", phrase)
+		}
+	}
+	for _, stale := range []string{
+		`普通 fan-in 是 first-arrival/OR`,
+		`互斥条件分支写入同一个端口`,
+		`互斥候选边共享端口`,
+		`"route":{"kind":"router","task":{"title":"按调查结论分流"},"status":"inactive","executor":null,"execution":null,"next":[{"to":"gap_fix","when":{"path":"$.coverage","operator":"eq","value":"gap"}},{"to":"done","when":{"path":"$.coverage","operator":"eq","value":"ok"}},{"to":"repair","when":{"event":"failed"}}]}`,
+	} {
+		if strings.Contains(schedulerSystemPrompt, stale) {
+			t.Errorf("schedulerSystemPrompt 仍包含不安全的 OR mux 指引 %q", stale)
+		}
+	}
+}
+
+func TestSchedulerSystemPrompt_AcceptanceUsesVerdictOnly(t *testing.T) {
+	for _, phrase := range []string{
+		`task.title 必须非空`,
+		`task.description 必须非空并逐项写明验收标准`,
+		`verdict 只允许 pass / fixable / failed`,
+		`completed 业务结论只读取 $.verdict`,
+		`completed 结果必须省略 event`,
+		`acceptance 出边禁止无条件、always、completed、pass/fixable 事件条件`,
+		`Runtime failed/blocked 兜底事件`,
+		`status=blocked 与 blocked_reason`,
+		`disputed 是 Runtime 核验状态，不是 verifier 可提交的 verdict`,
+		`"path":"$.verdict","operator":"eq","value":"pass"`,
+		`"path":"$.verdict","operator":"eq","value":"fixable"`,
+		`"path":"$.verdict","operator":"eq","value":"failed"`,
+	} {
+		if !strings.Contains(schedulerSystemPrompt, phrase) {
+			t.Errorf("schedulerSystemPrompt 缺少 acceptance verdict-only 契约 %q", phrase)
+		}
+	}
+	for _, stale := range []string{
+		`验收 agent 以 submit_task_result 的 verdict/event 回报`,
+		`verdict（及 event）提交结论`,
+		`"to":"done","when":{"event":"pass"}`,
+		`"to":"impl","when":{"event":"fixable"}`,
+	} {
+		if strings.Contains(schedulerSystemPrompt, stale) {
+			t.Errorf("schedulerSystemPrompt 仍包含 acceptance 事件 verdict 契约 %q", stale)
+		}
+	}
+}
+
+func TestSchedulerPromptVersionSingleAssignmentVerdict(t *testing.T) {
+	const want = "embedded:v7.5-unified-graph-terminal-report"
+	if schedulerPromptVersion != want {
+		t.Fatalf("schedulerPromptVersion = %q，期望 %q", schedulerPromptVersion, want)
+	}
+}
+
+func TestSchedulerSystemPrompt_AcceptanceUsesClosedToolsAndGraphCausality(t *testing.T) {
+	for _, phrase := range []string{
+		`只读闭集`,
+		`无消息/发任务/用户交互/request_replan`,
+		`Evidence 只证明实现者或 checker 的工具调用事实`,
+		`不证明节点内“最后一次写入之后”的先后关系`,
+		`implement → checker → acceptance`,
+		`Graph 因果边而非证据时间戳负责证明先后`,
+		`当前工具名闭集不包含 MCP`,
+	} {
+		if !strings.Contains(schedulerSystemPrompt, phrase) {
+			t.Errorf("schedulerSystemPrompt 缺少 verifier 闭集/因果新鲜度契约 %q", phrase)
+		}
+	}
+	if strings.Contains(schedulerSystemPrompt, `实现者在**最后一次写入之后**执行判据要求的命令`) {
+		t.Error("schedulerSystemPrompt 仍宣称 Evidence 能证明实现节点内的最后写入顺序")
+	}
+}
+
+func TestSchedulerSystemPrompt_StructuredRoutesAndMechanicalFuse(t *testing.T) {
+	for _, phrase := range []string{
+		`自定义 path 条件字段必须放进 result object`,
+		`result={"coverage":"gap"}`,
+		`不能把 coverage 只写在 summary 或 event 中`,
+		`无任何匹配出路则整张图 failed`,
+		`EvidenceRef 是系统按调用或内容身份签发的不透明稳定引用`,
+		`合法的跨任务回边和长目标不设 activation 次数上限`,
+		`同步机械级联`,
+	} {
+		if !strings.Contains(schedulerSystemPrompt, phrase) {
+			t.Errorf("schedulerSystemPrompt 缺少结构化路由/机械保险丝指引 %q", phrase)
+		}
+	}
+	for _, stale := range []string{
+		`activation 次数达到 32`,
+		`emergency fuse（32 次）`,
+		`ev:<taskID>:<seq>`,
+	} {
+		if strings.Contains(schedulerSystemPrompt, stale) {
+			t.Errorf("schedulerSystemPrompt 仍含过期数据流契约 %q", stale)
+		}
+	}
+}
+
+func TestSchedulerSystemPrompt_GraphControllerScopeBoundaries(t *testing.T) {
+	for _, phrase := range []string{
+		`Graph controller 的控制面被硬绑定到当前 Graph`,
+		`禁止 submit_graph 新图`,
+		`publish_task 脱图任务`,
+		`report_done 提前收尾`,
+		`cancel_task 也只能取消 exact same GraphID`,
+		`最终用 submit_task_result 结算当前 controller 节点`,
+	} {
+		if !strings.Contains(schedulerSystemPrompt, phrase) {
+			t.Errorf("schedulerSystemPrompt 缺少 Graph controller 作用域边界 %q", phrase)
+		}
+	}
+}
+
+// TestSchedulerSystemPrompt_NoDirectAnswerPath v7 起 D（直接回答）路径删除：
+// 闲聊、状态回答与简单查询同样走最小 Graph，直接路径不得以例外形式复活。
+func TestSchedulerSystemPrompt_NoDirectAnswerPath(t *testing.T) {
+	for _, phrase := range []string{
+		`没有与 Graph 并列的"直接回答"路径`,
+		`闲聊、状态回答和简单查询也使用最小 Graph`,
+		`能力不可用 + 替代方案`,
+		`新用户请求中 **pending_downstream_tasks** 不存在或为空，绝不构成绕过 Graph 的许可`,
+		`只有 trigger 明确是 graph_ended`,
+		`Graph 的最终自然语言汇报只发生在 graph_ended 终态唤醒`,
+	} {
+		if !strings.Contains(schedulerSystemPrompt, phrase) {
+			t.Errorf("schedulerSystemPrompt 缺少统一 Graph 路径声明 %q", phrase)
+		}
+	}
+	for _, stale := range []string{
+		`直接回答路径（不建图）`,
+		`一次原子只读查询`,
+		`工具调用上限是一次`,
+		`立即停止扩展直接路径`,
+		`用户请求依赖不可用工具时，直接以自然语言说明情况`,
+		`tasks 中没有 failed → 直接答"正常"`,
+		`如果 **pending_downstream_tasks** 不存在或为空，且没有其它在途工作，用自然语言汇报最终结果收尾`,
+	} {
+		if strings.Contains(schedulerSystemPrompt, stale) {
+			t.Errorf("schedulerSystemPrompt 仍含已删除的直接路径指引 %q", stale)
+		}
+	}
+}
+
+func TestSchedulerSystemPrompt_SoloUsesControllerGraph(t *testing.T) {
+	for _, phrase := range []string{
+		`仍调用 submit_graph`,
+		`controller 节点（缺省路由 __scheduler__）`,
+		`不得使用无人认领的 agent/acceptance 节点`,
+	} {
+		if !strings.Contains(schedulerSystemPrompt, phrase) {
+			t.Errorf("schedulerSystemPrompt 缺少 solo Graph 指引 %q", phrase)
+		}
+	}
+}
+
+func TestSchedulerSystemPrompt_ExecModesConstrainGraphPlanning(t *testing.T) {
+	for _, phrase := range []string{
+		`readonly：write_file / edit_file / run_shell 会被 Gate 硬拒绝`,
+		`不得提交依赖这三个工具的节点`,
+		`/mode exec normal`,
+		`strict：写文件与 run_shell 会进入精确绑定的授权 Interaction`,
+		`不得用 Graph approval 节点伪造或绕过`,
+		`yolo：只改变灰名单 Shell 的自动放行策略`,
+	} {
+		if !strings.Contains(schedulerSystemPrompt, phrase) {
+			t.Errorf("schedulerSystemPrompt 缺少 exec mode 的 Graph 规划边界 %q", phrase)
 		}
 	}
 }
@@ -197,9 +445,9 @@ func TestSchedulerSystemPrompt_UnavailableToolsGuidance(t *testing.T) {
 		t.Error("unavailable_tools guidance should mention web_fetch as an example")
 	}
 
-	// Verify guidance to explain alternatives in natural language.
-	if !strings.Contains(sectionText, "自然语言说明") {
-		t.Error("unavailable_tools guidance should instruct direct natural-language explanation")
+	// 能力不足也必须进入统一 Graph，由最小 controller 形成说明结果。
+	if !strings.Contains(sectionText, "仍提交最小 controller → end") || !strings.Contains(sectionText, "替代方案") {
+		t.Error("unavailable_tools guidance should keep capability explanation inside the unified Graph path")
 	}
 }
 

@@ -220,6 +220,24 @@ func TestCompressHistory_NoCompressWhenFewEntries(t *testing.T) {
 	}
 }
 
+func TestCompressHistory_RepeatedCompactionPreservesPriorSummary(t *testing.T) {
+	first := []HistoryEntry{
+		{AssistantContent: "early finding"},
+		{AssistantContent: "middle finding"},
+		{AssistantContent: "recent finding"},
+	}
+	compressed := compressHistory(first, 1)
+	if !strings.Contains(compressed[0].Output, "early finding") {
+		t.Fatalf("首次摘要缺少早期事实: %q", compressed[0].Output)
+	}
+
+	compressed = append(compressed, HistoryEntry{AssistantContent: "latest finding"})
+	compressed = compressHistory(compressed, 1)
+	if !strings.Contains(compressed[0].Output, "early finding") {
+		t.Fatalf("重复压缩不应丢掉上一轮摘要中的早期事实: %q", compressed[0].Output)
+	}
+}
+
 func TestIsContextOverflow(t *testing.T) {
 	tests := []struct {
 		name     string

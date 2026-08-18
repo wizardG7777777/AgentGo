@@ -73,11 +73,15 @@ var defaultLimits = Limits{
 var forbiddenTemplateTools = map[string]struct{}{
 	"publish_task":         {},
 	"cancel_task":          {},
+	"get_task_result":      {},
 	"report_done":          {},
 	"report_progress":      {},
 	"probe_directory":      {},
 	"list_agent_templates": {},
 	"provision_agent_team": {},
+	"submit_graph":         {},
+	"read_graph":           {},
+	"patch_graph":          {},
 }
 
 // Load builds a new immutable catalog. Built-ins are always present. Missing

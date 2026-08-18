@@ -63,6 +63,57 @@ func TestAgent_SuccessfulExecution(t *testing.T) {
 	}
 }
 
+func TestAgentNaturalCompletionPersistsDiskRecoveredArtifactBeforeTerminal(t *testing.T) {
+	root := t.TempDir()
+	content := []byte("旧尝试留在磁盘的产物")
+	if err := os.WriteFile(filepath.Join(root, "out.md"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	artifactLog, err := store.OpenArtifactLog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = artifactLog.Close() })
+	s := store.NewMemoryTaskStore(nil, 16, 1, 60)
+	s.SetArtifactLog(artifactLog)
+	r := roster.NewMemoryRoster()
+	task := &model.Task{
+		Description: "natural completion disk recovery", EventType: "code",
+		GraphID: "g-recovered", NodeID: "implement", ActivationID: "implement@1",
+		ExpectedArtifacts: []string{"out.md"},
+	}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("agent-1", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	executor := func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+		return ExecuteResult{Output: "自然文本收尾", ToolCalled: false}, nil
+	}
+	ag := NewAgent("agent-1", "code", s, r, executor)
+	ag.ArtifactResolver = func(string, string) string { return filepath.Join(root, "out.md") }
+	ag.processTask(context.Background(), task.ID)
+
+	got, err := s.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.TaskStatusCompleted {
+		t.Fatalf("磁盘恢复产物完成耐久化后应正常收尾: status=%s error=%s", got.Status, got.Error)
+	}
+	if len(got.Artifacts) != 1 || got.Artifacts[0] != "out.md" {
+		t.Fatalf("自然完成路径在 SubmitResult 前未补登 artifact: %v", got.Artifacts)
+	}
+	replayed, err := artifactLog.Replay()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replayed[task.ID]) != 1 || replayed[task.ID][0] != "out.md" {
+		t.Fatalf("自然完成路径的 recovered artifact 未耐久化: %v", replayed[task.ID])
+	}
+}
+
 func TestAgent_RecoverableError(t *testing.T) {
 	s, r, _ := setup()
 

@@ -28,16 +28,22 @@ const SchemaV1 = "agentgo.graph/v1"
 // 字段所有权（由 GraphStore 的角色分离变更 API + CAS 强制，见 store.go）：
 //   - Scheduler：写定义字段（Nodes 内的 Kind / Task / Capability / Next、Root、Revision）；
 //   - Graph Runtime：写 Status（图与节点）与 StateVersion；
+//   - Graph Runtime：提交落图时给 SessionID 盖章（此后只读，见 runtime.go）；
 //   - 调度与认领系统：写节点的 Executor；
 //   - Agent Loop / Harness：写节点的 Execution（结果与证据引用）。
 type GraphDocument struct {
-	Schema       string          `json:"schema"`        // 必须恰为 "agentgo.graph/v1"
-	GraphID      string          `json:"graph_id"`      // 图 ID，非空，字符集见校验链
-	Revision     int64           `json:"revision"`      // 定义版本：任务定义/节点/连接/执行要求变化时 +1
-	StateVersion int64           `json:"state_version"` // 状态版本：认领/进度/结果/审批/边选择变化时 +1
-	Root         string          `json:"root"`          // 唯一的根节点 ID，必须指向真实节点
-	Status       GraphStatus     `json:"status"`        // 图状态（Graph Runtime 写）
-	Nodes        map[string]Node `json:"nodes"`         // 节点表，键为节点 ID
+	Schema       string      `json:"schema"`        // 必须恰为 "agentgo.graph/v1"
+	GraphID      string      `json:"graph_id"`      // 图 ID，非空，字符集见校验链
+	Revision     int64       `json:"revision"`      // 定义版本：任务定义/节点/连接/执行要求变化时 +1
+	StateVersion int64       `json:"state_version"` // 状态版本：认领/进度/结果/审批/边选择变化时 +1
+	Root         string      `json:"root"`          // 唯一的根节点 ID，必须指向真实节点
+	Status       GraphStatus `json:"status"`        // 图状态（Graph Runtime 写）
+	// SessionID 是图的 session 归属（Session 生命周期隔离）：Graph Runtime
+	// 提交时经可注入的 sessionIDProvider 盖章；不属于执行语义，不进入
+	// digest（digest.go 的 canonicalDoc 不收录本字段）。历史图可为空串；
+	// 2026-08 起空归属图不再归并给当前 session，启动时按僵尸图停驻。
+	SessionID string          `json:"session_id,omitempty"`
+	Nodes     map[string]Node `json:"nodes"` // 节点表，键为节点 ID
 }
 
 // Node 是图中的一个节点。同一节点对象同时承载定义与运行状态，
@@ -84,17 +90,31 @@ type NodeDefinition struct {
 
 // NodeTask 描述节点的任务目标与输出契约。
 type NodeTask struct {
-	Title        string `json:"title"`                   // 任务标题，非空
-	Description  string `json:"description,omitempty"`   // 任务描述（可选）
-	OutputSchema string `json:"output_schema,omitempty"` // 结构化结果 schema 标识（可选）
+	Title       string `json:"title"`                 // 任务标题，非空
+	Description string `json:"description,omitempty"` // 任务描述（可选）
+	// RequiredInputs 显式声明 join / acceptance 的必需目标输入端口。
+	// 非空时 Runtime 只在每个端口均被一条实际选中的转移绑定到当前
+	// activation 后进入 data-ready；端口是单赋值，并行来源使用不同端口。
+	// 互斥分支当前保持各自后续/各自 end，不能共享端口；OR mux
+	// 等待 generation/correlation token 后再开放。空时仅保留旧单
+	// 入边/历史图兼容语义。
+	RequiredInputs []string `json:"required_inputs,omitempty"`
+	// RequiredEvidence 声明 acceptance 对某个输入端口所需的可解引用证据种类。
+	// 输入端口齐备但证据缺失时仍发布 verifier 任务并显式注入缺口；verifier
+	// 必须 blocked，若仍自报 completed/pass，Runtime 不予采信。
+	RequiredEvidence []EvidenceRequirement `json:"required_evidence,omitempty"`
+}
+
+type EvidenceRequirement struct {
+	Input string `json:"input"`
+	Kind  string `json:"kind"`
 }
 
 // Capability 声明节点的能力需求；本轮只做结构形状校验，工具名/模型名校验留给后续。
 type Capability struct {
-	Tools     []string           `json:"tools,omitempty"`     // 工具名子集（名字校验留给后续）
-	Model     string             `json:"model,omitempty"`     // 模型名覆盖
-	Isolation string             `json:"isolation,omitempty"` // 执行隔离，仅允许 "workspace"
-	Budget    map[string]float64 `json:"budget,omitempty"`    // 预算项，数值必须非负有限
+	Tools     []string `json:"tools,omitempty"`     // 工具名子集（名字校验留给后续）
+	Model     string   `json:"model,omitempty"`     // 模型名覆盖
+	Isolation string   `json:"isolation,omitempty"` // 执行隔离，仅允许 "workspace"
 }
 
 // IsolationWorkspace 是 capability.isolation 唯一合法值。
@@ -142,7 +162,21 @@ type Execution struct {
 	ActivationID       string          `json:"activation_id,omitempty"`       // 激活 ID（回边重进节点时每次新建）
 	DefinitionRevision int64           `json:"definition_revision,omitempty"` // 本 activation 冻结定义所属 revision
 	Definition         *NodeDefinition `json:"definition,omitempty"`          // 本 activation 的定义快照
-	ResultRef          string          `json:"result_ref,omitempty"`          // 结构化结果引用
+	// ResultRef 是 activation 级完整 Result 的稳定引用，可交给 Store.
+	// ResolveActivationResult 解引用；ResultSummary 仅供 UI/日志展示。两者严禁
+	// 混用，否则大结果、子图和重启恢复会把截断摘要误当数据引用。
+	ResultRef     string `json:"result_ref,omitempty"`
+	ResultSummary string `json:"result_summary,omitempty"`
+	// Input 是本 activation 的持久化输入绑定集（数据流图语义）：activation
+	// 创建时从指向本 activation 的已生效 TransitionRecord.Input 推导并随
+	// activation 事实落盘，恢复后绑定不变。普通节点由实际选中边传入；
+	// barrier 型输入按 target_input 端口由 join（或 acceptance 的 data-ready
+	// 门控）归集，不依赖静态来源的 first-arrival 推断。
+	Input []InputBinding `json:"input,omitempty"`
+	// Evidence 是本 activation 终态结算时随 Settlement 持久化的可观察证据
+	// 条目（任务型节点：由终态事实携带的工具调用事实与 artifact 引用组装；
+	// 非任务型节点恒空）。EvidenceRefs 保留其 Ref 列表便于轻量引用。
+	Evidence []EvidenceEntry `json:"evidence,omitempty"`
 	// Settlement 是节点终态与其后续结算动作的 durable 输入。它与节点终态
 	// 同条 execution_status journal 记录落盘；若进程死在终态落盘后、边选择或
 	// Graph 收官前，ResumeGraph 用它幂等续跑，不能依赖截断的 ResultRef 猜条件。
@@ -160,6 +194,97 @@ type Execution struct {
 	ChildGraphID string `json:"child_graph_id,omitempty"`
 }
 
+// ============================================================
+// 数据流（Result→Input 绑定与证据）
+// ============================================================
+
+// InputInlineMaxBytes 是 EdgeInput / InputBinding 内联完整 Result 的字节
+// 上限；超限只携带摘要与证据引用（Truncated=true）。
+const InputInlineMaxBytes = 32 << 10 // 32 KiB
+
+// InputSummaryMaxRunes 是输入绑定有界摘要的 rune 上限。
+const InputSummaryMaxRunes = 2048
+
+// EvidenceSummaryMaxRunes 是单条证据摘要的 rune 上限。
+const EvidenceSummaryMaxRunes = 200
+
+// EvidenceCommandMaxRunes / EvidencePathMaxRunes 是结构化证据字段的独立
+// 上限。命令与路径不能被压进 200-rune 展示摘要，否则 verifier 无法核对真实
+// 退出事实或读取 artifact；超限时保留显式 truncated 标志，禁止静默截断。
+const (
+	EvidenceIdentityMaxRunes = 512
+	EvidenceCommandMaxRunes  = 4096
+	EvidencePathMaxRunes     = 4096
+)
+
+// EdgeInput 是一条实际生效转移绑定的源 activation 输出（数据流图的持久化
+// InputRef）：与边选择同条 TransitionRecord journal 记录落盘，恢复后绑定
+// 不变。Result 在不超过 InputInlineMaxBytes 时内联完整 durable Result；
+// 超限时 Truncated=true、Result 为空；消费方必须以 ResultRef 解引用完整
+// activation Result（证据另由 Evidence/EvidenceRefs 保持谱系），不得把
+// 展示 Summary 当作原始数据。
+type EdgeInput struct {
+	Summary string `json:"summary,omitempty"`
+	// ResultRef 指向 activation 级 durable Result Store；大结果不内联时仍可
+	// 在重启、回边覆盖源节点最新 Execution 后精确解引用。
+	ResultRef    string          `json:"result_ref,omitempty"`
+	Evidence     []EvidenceEntry `json:"evidence,omitempty"`
+	EvidenceRefs []string        `json:"evidence_refs,omitempty"`
+	Result       json.RawMessage `json:"result,omitempty"`
+	Truncated    bool            `json:"truncated,omitempty"`
+}
+
+// InputBinding 是目标 activation 的一份持久化输入绑定：activation 创建时
+// 从指向本 activation 的已生效 TransitionRecord.Input 推导，随 activation
+// 事实落盘。fan-out 的多个命中下游共享同一来源绑定；多上游输入必须经
+// join 归并（或 acceptance 的 data-ready 门控），不得以截断摘要代替完整
+// durable Result 充当归并值。
+type InputBinding struct {
+	SourceNodeID       string          `json:"source_node_id"`
+	SourceActivationID string          `json:"source_activation_id"`
+	TargetInput        string          `json:"target_input,omitempty"`
+	Summary            string          `json:"summary,omitempty"`
+	ResultRef          string          `json:"result_ref,omitempty"`
+	Evidence           []EvidenceEntry `json:"evidence,omitempty"`
+	EvidenceRefs       []string        `json:"evidence_refs,omitempty"`
+	Result             json.RawMessage `json:"result,omitempty"`
+	Truncated          bool            `json:"truncated,omitempty"`
+}
+
+// ActivationResult 是按 activation 保存的完整、不可变 Result 与证据事实。
+// GraphDocument.Node.Execution 只保存节点最新 activation，因此回边会覆盖旧
+// Execution；该记录属于 Store 的 entry 级簿记，并随 journal/snapshot 压缩
+// 恢复。TransitionRecord.Input.ResultRef 是其稳定消费者引用。
+type ActivationResult struct {
+	Ref          string          `json:"ref"`
+	NodeID       string          `json:"node_id"`
+	ActivationID string          `json:"activation_id"`
+	Result       json.RawMessage `json:"result"`
+	Evidence     []EvidenceEntry `json:"evidence,omitempty"`
+}
+
+// EvidenceEntry 是随 activation 终态结算持久化的一条可观察证据。结构化字段
+// 是 verifier 的消费权威，Summary 只是有界展示兜底；Ref 由调用/内容身份稳定
+// 生成，绝不使用查询序数。Success 用指针区分“调用失败(false)”与 artifact 等
+// “不适用(nil)”。
+type EvidenceEntry struct {
+	Ref     string `json:"ref"`
+	Kind    string `json:"kind"` // shell / file_write / file_edit / read / web / artifact / 其它工具名
+	Summary string `json:"summary,omitempty"`
+
+	CallID   string `json:"call_id,omitempty"`
+	ToolName string `json:"tool_name,omitempty"`
+	Success  *bool  `json:"success,omitempty"`
+
+	Command          string `json:"command,omitempty"`
+	CommandTruncated bool   `json:"command_truncated,omitempty"`
+	ExitCode         *int   `json:"exit_code,omitempty"`
+
+	// Path 对 file/read 工具表示其目标路径，对 kind=artifact 表示完整产物路径。
+	Path          string `json:"path,omitempty"`
+	PathTruncated bool   `json:"path_truncated,omitempty"`
+}
+
 // SettlementContinuation 声明节点终态落盘后仍须完成的 durable 动作。
 type SettlementContinuation string
 
@@ -170,24 +295,34 @@ const (
 	SettlementContinueGraphComplete SettlementContinuation = "graph_complete"
 	// SettlementContinueGraphFail 用于控制面失败：补写 Graph failed。
 	SettlementContinueGraphFail SettlementContinuation = "graph_fail"
+	// SettlementContinueNone 用于 Graph 整体终态时被取消的其余
+	// activation：取消事实需要 durable，但不得再选边或驱动 Graph。
+	SettlementContinueNone SettlementContinuation = "none"
 )
 
-// TerminalSettlement 是一次 terminal activation 的可恢复结算事实。Result
-// 保存完整 JSON 对象而非展示用摘要；Reason 只供 graph_fail 续跑复原诊断。
+// TerminalSettlement 是一次 terminal activation 的可恢复结算事实。新记录
+// 以 ResultRef 引用 activation Result Store 的完整 JSON 对象；Reason 供
+// graph_fail 与 Graph 终态取消诊断。
 // 该记录会保留在 Execution 中，后续 ResumeGraph 重放靠 TransitionRecord /
 // Graph 终态自然幂等，不需要另写一个易产生新崩溃窗口的 cleared 标记。
 type TerminalSettlement struct {
-	Status       NodeStatus             `json:"status"`
-	Result       json.RawMessage        `json:"result"`
+	Status NodeStatus `json:"status"`
+	// ResultRef 指向 activation Result Store 的完整终态对象。Result 只用于
+	// 恢复升级前的旧 journal；新记录不再把完整对象复制进 GraphDocument。
+	ResultRef    string                 `json:"result_ref,omitempty"`
+	Result       json.RawMessage        `json:"result,omitempty"`
 	Continuation SettlementContinuation `json:"continuation"`
 	Reason       string                 `json:"reason,omitempty"`
 }
 
 // Transition 是节点的一条出边。
 type Transition struct {
-	To         string     `json:"to"`                   // 目标节点 ID，必须指向存在的节点
-	Activation string     `json:"activation,omitempty"` // 激活方式，仅允许 "new"（缺省即沿用常规激活）
-	When       *Condition `json:"when,omitempty"`       // 转移条件，缺省表示无条件
+	To         string `json:"to"`                   // 目标节点 ID，必须指向存在的节点
+	Activation string `json:"activation,omitempty"` // 激活方式，仅允许 "new"（缺省即沿用常规激活）
+	// TargetInput 是目标 join / acceptance 的输入端口。并行必需输入使用不同
+	// 单赋值端口；互斥分支当前保持各自后续/各自 end。
+	TargetInput string     `json:"target_input,omitempty"`
+	When        *Condition `json:"when,omitempty"` // 转移条件，缺省表示无条件
 }
 
 // ActivationNew 是 transition.activation 唯一合法值：

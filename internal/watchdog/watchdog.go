@@ -21,34 +21,44 @@ import (
 // scheduler.AgentRegistry satisfies it without making watchdog depend on the
 // scheduler package.
 //
-// C6b 注：方法签名中的 planID 是 scheduler 侧路由鉴权的历史形参（watchdog
-// 已无 Plan 概念，恒传空串）；watchdog 自身只按 eventType 判定路由存在性。
+// ownerScope is the same namespaced task/Graph ownership used by publish-time
+// validation. Watchdog must not pass an empty scope for dynamic Teams.
 type PlanRouteRegistry interface {
-	CanRouteForPlan(planID, eventType string, requiredTools ...string) bool
+	CanRouteForPlan(ownerScope, eventType string, requiredTools ...string) bool
 }
 
 // RouteResolver answers whether a pending Task has a runtime listener that may
 // claim it. It intentionally reports route existence only; worker busy/idle
 // capacity is not inferred here.
 type RouteResolver interface {
-	HasRunnableRoute(eventType string) bool
+	HasRunnableRoute(task *model.Task) bool
 }
 
 // RouteResolverFunc adapts a function to RouteResolver.
-type RouteResolverFunc func(eventType string) bool
+type RouteResolverFunc func(task *model.Task) bool
 
-func (f RouteResolverFunc) HasRunnableRoute(eventType string) bool {
-	return f != nil && f(eventType)
+func (f RouteResolverFunc) HasRunnableRoute(task *model.Task) bool {
+	return f != nil && task != nil && f(task)
 }
 
 // NewRuntimeRouteResolver adapts AgentRegistry while preserving the built-in
 // Scheduler route, which is not registered alongside ordinary worker routes.
 func NewRuntimeRouteResolver(registry PlanRouteRegistry) RouteResolver {
-	return RouteResolverFunc(func(eventType string) bool {
-		if eventType == "__scheduler__" {
+	return RouteResolverFunc(func(task *model.Task) bool {
+		if task.EventType == "__scheduler__" {
 			return true
 		}
-		return registry != nil && registry.CanRouteForPlan("", eventType)
+		ownerScope := task.RouteScope
+		if ownerScope == "" && task.GraphID != "" {
+			ownerScope = model.GraphRouteScope(task.GraphID)
+		} else if ownerScope == "" && task.ParentTaskID != "" {
+			ownerScope = model.TaskRouteScope(task.ParentTaskID)
+		}
+		var required []string
+		if task.Capability != nil {
+			required = task.Capability.Tools
+		}
+		return registry != nil && registry.CanRouteForPlan(ownerScope, task.EventType, required...)
 	})
 }
 
@@ -89,6 +99,14 @@ type Watchdog struct {
 	// 顺带清扫孤儿 workspace（任务不存在或已达终态的任务目录）。
 	// nil 时跳过——保持既有测试与最小装配行为不变。
 	WorkspaceManager WorkspaceCleaner
+
+	// workspaceExemptions 是 workspace 清扫豁免集（taskID 集合）。豁免属于
+	// 「冻结 session 的非终态任务」：冻结后任务不在活跃公告板上，但其
+	// workspace 目录归冻结 session 所有（解冻重排后以同一 taskID 重排回
+	// pending 复用），没有豁免会被 cleanupWorkspaceOrphans 误判孤儿清掉。
+	// 豁免是纯进程内状态，进程重启后由 bootstrap 枚举冻结 session 快照重建。
+	exemptMu            sync.Mutex
+	workspaceExemptions map[string]struct{}
 
 	pendingMu           sync.Mutex
 	pendingObservations map[string]pendingObservation
@@ -298,7 +316,7 @@ func (w *Watchdog) checkPendingTask(task *model.Task) {
 		w.clearPendingObservation(task.ID)
 		return
 	}
-	if !w.RouteResolver.HasRunnableRoute(task.EventType) {
+	if !w.RouteResolver.HasRunnableRoute(task) {
 		w.checkUnroutableTask(task)
 		return
 	}
@@ -643,10 +661,60 @@ func (w *Watchdog) cleanupStaleClaims(tasks []*model.Task) {
 	}
 }
 
+// ExemptWorkspaces 把 taskID 加入 workspace 清扫豁免集（幂等，并发安全）。
+// 豁免属于「冻结 session 的非终态任务」：session 冻结归档后这些任务不在
+// 活跃公告板上，但其 workspace 归冻结 session 所有，解冻重排后以同一
+// taskID 复用——登记豁免防止 cleanupWorkspaceOrphans 按孤儿误清。
+// 空串 ID 忽略；nil 接收者安全（无 Session/测试装配路径）。
+func (w *Watchdog) ExemptWorkspaces(taskIDs []string) {
+	if w == nil || len(taskIDs) == 0 {
+		return
+	}
+	w.exemptMu.Lock()
+	defer w.exemptMu.Unlock()
+	if w.workspaceExemptions == nil {
+		w.workspaceExemptions = make(map[string]struct{}, len(taskIDs))
+	}
+	for _, id := range taskIDs {
+		if id == "" {
+			continue
+		}
+		w.workspaceExemptions[id] = struct{}{}
+	}
+}
+
+// ClearWorkspaceExemptions 把 taskID 移出 workspace 清扫豁免集（幂等，
+// 并发安全）：任务已解冻重排回活跃公告板，恢复常规存活/终态判定。
+// nil 接收者安全。
+func (w *Watchdog) ClearWorkspaceExemptions(taskIDs []string) {
+	if w == nil || len(taskIDs) == 0 {
+		return
+	}
+	w.exemptMu.Lock()
+	defer w.exemptMu.Unlock()
+	for _, id := range taskIDs {
+		delete(w.workspaceExemptions, id)
+	}
+}
+
+// IsWorkspaceExempt 报告 taskID 是否在 workspace 清扫豁免集中（并发安全）。
+// 供观测/调试与跨包断言使用；nil 接收者安全。
+func (w *Watchdog) IsWorkspaceExempt(taskID string) bool {
+	if w == nil {
+		return false
+	}
+	w.exemptMu.Lock()
+	defer w.exemptMu.Unlock()
+	_, ok := w.workspaceExemptions[taskID]
+	return ok
+}
+
 // cleanupWorkspaceOrphans 清扫孤儿 workspace：ListOrphans 列出全部任务目录，
 // 逐个对照 TaskStore——任务不存在（已被淘汰）或已达终态（含 failed/cancelled
 // 的崩溃残留）的目录由 Manager.Cleanup 移除；任务仍活跃（pending/processing）
 // 的目录保留，可能是正在执行或可重试的隔离任务。
+// 豁免集中的 taskID 无条件跳过（豁免优先于一切存活/终态判断）：豁免属于
+// 「冻结 session 的非终态任务」，其 workspace 归冻结 session 所有。
 // WorkspaceManager 为 nil 时整体跳过（nil-safe，行为与注入前一致）。
 func (w *Watchdog) cleanupWorkspaceOrphans() {
 	mgr := w.WorkspaceManager
@@ -659,6 +727,10 @@ func (w *Watchdog) cleanupWorkspaceOrphans() {
 		return
 	}
 	for _, taskID := range orphans {
+		if w.IsWorkspaceExempt(taskID) {
+			log.Printf("[watchdog] workspace 命中冻结 session 豁免，跳过清理 (task=%s)", taskID)
+			continue
+		}
 		task, err := w.Store.GetTask(taskID)
 		switch {
 		case err != nil || task == nil:

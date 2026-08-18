@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
@@ -121,7 +122,7 @@ func TestComputeExecutionLease_SyntheticGrant(t *testing.T) {
 func TestComputeExecutionLease_GraphNodeSyntheticGrant(t *testing.T) {
 	s, _, _ := setup()
 	ag, _, _ := newLeaseAgent("agent-lease", "code", s, "read_file", "write_file")
-	task := &model.Task{ID: "t-graph-syn", EventType: "code", GraphID: "g1", NodeID: "n1", ActivationID: "n1@1"}
+	task := &model.Task{ID: "t-graph-syn", EventType: "code", GraphID: "g1", NodeID: "n1", ActivationID: "n1@1", GraphNodeKind: "agent"}
 	lease, rejection := ag.computeExecutionLease(task)
 	if rejection != "" || !lease.Synthetic {
 		t.Fatalf("Graph 未声明节点应走合成规则: rejection=%q synthetic=%t", rejection, lease.Synthetic)
@@ -178,7 +179,7 @@ func TestComputeExecutionLease_ControlToolsByRole(t *testing.T) {
 	s, _, _ := setup()
 	ag, _, _ := newLeaseAgent("agent-lease", "code", s, "read_file")
 
-	graphTask := &model.Task{ID: "t-g", EventType: "code", GraphID: "g1"}
+	graphTask := &model.Task{ID: "t-g", EventType: "code", GraphID: "g1", GraphNodeKind: "agent"}
 	lease, _ := ag.computeExecutionLease(graphTask)
 	if strings.Join(lease.ControlTools, ",") != "request_replan,submit_task_result" {
 		t.Fatalf("Graph 节点 ControlTools = %v", lease.ControlTools)
@@ -194,6 +195,73 @@ func TestComputeExecutionLease_ControlToolsByRole(t *testing.T) {
 	lease, _ = ag.computeExecutionLease(schedTask)
 	if strings.Join(lease.ControlTools, ",") != "report_done" {
 		t.Fatalf("scheduler 控制面任务 ControlTools = %v，want [report_done]", lease.ControlTools)
+	}
+
+	graphController := &model.Task{ID: "t-gc", EventType: "__scheduler__", GraphID: "g1", GraphNodeKind: "controller"}
+	lease, _ = ag.computeExecutionLease(graphController)
+	if strings.Join(lease.ControlTools, ",") != "request_replan,submit_task_result" {
+		t.Fatalf("Graph controller ControlTools = %v，want [request_replan submit_task_result]", lease.ControlTools)
+	}
+
+	for _, tc := range []struct {
+		name string
+		task *model.Task
+	}{
+		{name: "acceptance 默认 route", task: &model.Task{ID: "t-a", EventType: "acceptance.verify", GraphID: "g1", GraphNodeKind: "acceptance"}},
+		{name: "acceptance 自定义 route", task: &model.Task{ID: "t-ac", EventType: "verify.custom", GraphID: "g1", GraphNodeKind: "acceptance"}},
+		{name: "旧快照默认 route", task: &model.Task{ID: "t-old", EventType: "acceptance.verify", GraphID: "g1"}},
+		{name: "旧快照自定义 route", task: &model.Task{ID: "t-old-custom", EventType: "verify.custom", GraphID: "g1"}},
+		{name: "未知未来类型", task: &model.Task{ID: "t-future", EventType: "verify.custom", GraphID: "g1", GraphNodeKind: "future_kind"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := ag.computeExecutionLease(tc.task)
+			if strings.Join(got.ControlTools, ",") != "submit_task_result" {
+				t.Fatalf("最小权限 Graph 角色 ControlTools = %v，want [submit_task_result]", got.ControlTools)
+			}
+		})
+	}
+}
+
+func TestComputeExecutionLease_AcceptanceRejectsBusinessToolOutsideClosedSet(t *testing.T) {
+	s, _, _ := setup()
+	ag, _, _ := newLeaseAgent("verifier", "verify.custom", s,
+		"read_file", "run_shell", "submit_task_result")
+	lease, rejection := ag.computeExecutionLease(&model.Task{
+		ID: "t-unsafe-acceptance", EventType: "verify.custom", GraphID: "g1", GraphNodeKind: "acceptance",
+		Capability: &model.NodeCapability{Tools: []string{"read_file", "run_shell"}},
+	})
+	if lease != nil || !strings.Contains(rejection, `只读闭集外工具 "run_shell"`) {
+		t.Fatalf("新计算的 acceptance 租约含 Shell 应 fail-closed: lease=%+v rejection=%q", lease, rejection)
+	}
+}
+
+func TestAcquireExecutionLease_RejectsLegacyGraphControlEscalation(t *testing.T) {
+	s, _, _ := setup()
+	ag, _, _ := newLeaseAgent("verifier", "verify.custom", s,
+		"read_file", "request_replan", "submit_task_result")
+	for _, tc := range []struct {
+		name string
+		kind string
+	}{
+		{name: "已知 acceptance", kind: "acceptance"},
+		{name: "旧快照空 kind", kind: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := &model.ExecutionLease{
+				TaskID: "t-old-control", Attempt: 1,
+				BusinessTools: []string{"read_file"},
+				ControlTools:  []string{"request_replan", "submit_task_result"},
+			}
+			old.Digest = old.ComputeDigest()
+			task := &model.Task{
+				ID: "t-old-control", EventType: "verify.custom", GraphID: "g1",
+				GraphNodeKind: tc.kind, Lease: old,
+			}
+			lease, rejection := ag.acquireExecutionLease(task)
+			if lease != nil || !strings.Contains(rejection, "期望精确为 [submit_task_result]") {
+				t.Fatalf("旧 Graph 租约不得复用 request_replan: lease=%+v rejection=%q", lease, rejection)
+			}
+		})
 	}
 }
 
@@ -473,6 +541,115 @@ func TestProcessTask_LeaseViewIsBusinessUnionControl(t *testing.T) {
 	}
 	if strings.Join(names, ",") != "read_file,submit_task_result" {
 		t.Fatalf("LLM 视野应为业务∪控制 = [read_file submit_task_result]，实际 %v", names)
+	}
+}
+
+func TestProcessTask_GraphControllerExplicitLeaseFiltersSchedulerTools(t *testing.T) {
+	s, _, _ := setup()
+	ag, _, mock := newLeaseAgent("scheduler", "__scheduler__", s,
+		"read_file", "request_replan", "submit_task_result", "report_done", "submit_graph", "patch_graph")
+	task := &model.Task{
+		ID: "t-graph-controller", Description: "完成简单图节点", EventType: "__scheduler__",
+		GraphID: "g-controller", NodeID: "root", ActivationID: "root@1", GraphNodeKind: "controller",
+		Capability: &model.NodeCapability{Tools: []string{"read_file"}},
+	}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatalf("PublishTask: %v", err)
+	}
+	if err := s.ClaimTask(ag.ID, task.ID); err != nil {
+		t.Fatalf("ClaimTask: %v", err)
+	}
+	ag.processTask(context.Background(), task.ID)
+	if mock.calls != 1 {
+		t.Fatalf("合法 Graph controller 应执行一次 LLM，实际 %d", mock.calls)
+	}
+	var names []string
+	for _, def := range mock.toolDefs[0] {
+		names = append(names, def.Name)
+	}
+	if got := strings.Join(names, ","); got != "read_file,request_replan,submit_task_result" {
+		t.Fatalf("Graph controller LLM 工具面=%q，want 精确业务+Graph 控制通道", got)
+	}
+	for _, forbidden := range []string{"report_done", "submit_graph", "patch_graph"} {
+		if slices.Contains(names, forbidden) {
+			t.Fatalf("Graph controller 显式租约不得看见 %s: %v", forbidden, names)
+		}
+	}
+	got, err := s.GetTask(task.ID)
+	if err != nil || got.Lease == nil {
+		t.Fatalf("Graph controller 租约应持久化: task=%+v err=%v", got, err)
+	}
+	if strings.Join(got.Lease.BusinessTools, ",") != "read_file" ||
+		strings.Join(got.Lease.ControlTools, ",") != "request_replan,submit_task_result" {
+		t.Fatalf("Graph controller 冻结租约不符: %+v", got.Lease)
+	}
+}
+
+func TestProcessTask_CustomRouteAcceptanceRejectsPreloadedUnsafeLeaseBeforeLLM(t *testing.T) {
+	s, _, _ := setup()
+	ag, _, mock := newLeaseAgent("verifier", "verify.custom", s,
+		"read_file", "run_shell", "submit_task_result")
+	old := &model.ExecutionLease{
+		TaskID: "t-old-acceptance", Attempt: 1,
+		BusinessTools: []string{"read_file", "run_shell"},
+		ControlTools:  []string{"submit_task_result"},
+	}
+	old.Digest = old.ComputeDigest()
+	task := &model.Task{
+		ID: "t-old-acceptance", Description: "验收", EventType: "verify.custom",
+		GraphID: "g1", NodeID: "verify", ActivationID: "verify@1", GraphNodeKind: "acceptance",
+		Lease: old,
+	}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatalf("PublishTask: %v", err)
+	}
+	if err := s.ClaimTask(ag.ID, task.ID); err != nil {
+		t.Fatalf("ClaimTask: %v", err)
+	}
+	ag.processTask(context.Background(), task.ID)
+	got, err := s.GetTask(task.ID)
+	if err != nil || got == nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if got.Status != model.TaskStatusFailed || !strings.Contains(got.Error, `只读闭集外工具 "run_shell"`) {
+		t.Fatalf("预置不安全 acceptance 租约应 capability_violation: status=%s error=%q", got.Status, got.Error)
+	}
+	if mock.calls != 0 || len(mock.toolDefs) != 0 {
+		t.Fatalf("拒绝必须发生在 LLM/工具可见之前: calls=%d toolDefs=%v", mock.calls, mock.toolDefs)
+	}
+}
+
+func TestProcessTask_LegacyGraphNilBusinessLeaseStillFiltersToControlUnion(t *testing.T) {
+	s, _, _ := setup()
+	ag, _, mock := newLeaseAgent("legacy-worker", "legacy.custom", s,
+		"read_file", "run_shell", "submit_task_result")
+	old := &model.ExecutionLease{
+		TaskID: "t-legacy-graph", Attempt: 1,
+		BusinessTools: nil,
+		ControlTools:  []string{"submit_task_result"},
+	}
+	old.Digest = old.ComputeDigest()
+	task := &model.Task{
+		ID: "t-legacy-graph", Description: "旧 Graph 节点", EventType: "legacy.custom",
+		GraphID: "g-old", NodeID: "work", ActivationID: "work@1", GraphNodeKind: "",
+		Lease: old,
+	}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatalf("PublishTask: %v", err)
+	}
+	if err := s.ClaimTask(ag.ID, task.ID); err != nil {
+		t.Fatalf("ClaimTask: %v", err)
+	}
+	ag.processTask(context.Background(), task.ID)
+	if mock.calls != 1 || len(mock.toolDefs) != 1 {
+		t.Fatalf("安全 legacy Graph 任务应执行一次且有工具视图: calls=%d defs=%v", mock.calls, mock.toolDefs)
+	}
+	var names []string
+	for _, def := range mock.toolDefs[0] {
+		names = append(names, def.Name)
+	}
+	if strings.Join(names, ",") != "submit_task_result" {
+		t.Fatalf("BusinessTools=nil 的旧 Graph Task 只能看见控制并集，实际 %v", names)
 	}
 }
 

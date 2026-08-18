@@ -1,7 +1,8 @@
 package bootstrap
 
 // 本文件是 C5b 的 bootstrap 级装配冒烟：scheduler.New 以真实 GraphRuntime/
-// GraphStore 装配后，Scheduler 工具注册表中必须含 submit_graph / patch_graph
+// GraphStore 装配后，Scheduler 工具注册表中必须含 submit_graph / patch_graph，
+// 也必须含 Graph controller 的结构化收尾通道 submit_task_result
 // （跨包握手断言——各包单测都绿不代表装配接上）。
 
 import (
@@ -26,7 +27,7 @@ func TestSchedulerGraphToolsAssembled(t *testing.T) {
 	taskStore := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	reactorReg := reactor.NewRegistry()
 	t.Cleanup(func() { reactorReg.Quiesce(0) })
-	gs, rt, err := wireGraphRuntime(cfg, taskStore, reactorReg, nil)
+	gs, rt, err := wireGraphRuntime(cfg, taskStore, reactorReg, nil, nil)
 	if err != nil {
 		t.Fatalf("wireGraphRuntime 应成功: %v", err)
 	}
@@ -45,7 +46,7 @@ func TestSchedulerGraphToolsAssembled(t *testing.T) {
 	for _, d := range bundle.ToolReg.Defs() {
 		registered[d.Name] = true
 	}
-	for _, name := range []string{"submit_graph", "read_graph", "patch_graph"} {
+	for _, name := range []string{"submit_graph", "read_graph", "patch_graph", "submit_task_result"} {
 		if !registered[name] {
 			t.Errorf("Scheduler 工具注册表应含 %s（C5b 图控制面）", name)
 		}

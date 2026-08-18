@@ -67,3 +67,52 @@ func TestAgent_NaturalCompletion_FallsBackToUserOutput(t *testing.T) {
 		t.Errorf("UserOutput = %q, want 含结果块与最终文本（ResultOutput nil 回退）", got)
 	}
 }
+
+// Graph controller 的自然文本是节点 Result，不是整张图的用户
+// 结果。它仍应以 completed 结算节点，但必须保持 ResultOutput
+// 静默；最终回复由 graph_ended 唤醒的非图 Scheduler task 产生。
+func TestAgent_GraphControllerNaturalCompletion_DoesNotWriteUserResult(t *testing.T) {
+	s, r, _ := setup()
+	task := &model.Task{
+		Description:   "graph controller node",
+		EventType:     "__scheduler__",
+		GraphID:       "g-controller-output",
+		NodeID:        "root",
+		ActivationID:  "root@1",
+		GraphNodeKind: "controller",
+	}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("scheduler", task.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+		return ExecuteResult{Output: "INTERNAL-GRAPH-CONTROLLER-RESULT", ToolCalled: false}, nil
+	}
+
+	var userOut, resultOut strings.Builder
+	ag := NewAgent("scheduler", "__scheduler__", s, r, executor)
+	ag.IsUserFacing = true
+	ag.UserOutput = &userOut
+	ag.ResultOutput = &resultOut
+	ag.TextOnlyReportsDir = t.TempDir()
+	persisted := 0
+	ag.OnTextOnlyPersisted = func(_, _ string) { persisted++ }
+	ag.processTask(context.Background(), task.ID)
+
+	if userOut.Len() != 0 || resultOut.Len() != 0 {
+		t.Fatalf("Graph controller 不得提前写用户结果: user=%q result=%q", userOut.String(), resultOut.String())
+	}
+	if persisted != 0 {
+		t.Fatalf("Graph controller 不得经 text-only 回调覆盖会话 ResultSnapshot，实际回调 %d 次", persisted)
+	}
+	got, err := s.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.TaskStatusCompleted || got.LastResponse != "INTERNAL-GRAPH-CONTROLLER-RESULT" {
+		t.Fatalf("Graph controller 节点仍应正常结算: status=%s last=%q", got.Status, got.LastResponse)
+	}
+}

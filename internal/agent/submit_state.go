@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 )
@@ -14,6 +16,13 @@ const (
 	// store 进入 blocked 终态（cause=agent_reported_blocked），永远不满足
 	// 下游依赖；非图任务在终态落盘后由收尾路径发布 replan 唤醒任务。
 	SubmitStatusBlocked = "blocked"
+
+	// StructuredResultStorageKey 是 Task.Results 中保存自定义结构化结果的
+	// 内部 carrier 键。Task.Results 的持久化契约仍是 map[string]string，
+	// 因此 submit_task_result 的 result JSON object 先以 canonical JSON
+	// 存在本键下；Graph terminal feed 再解码并把其字段类型保真地展开到
+	// TerminalFact.Result 顶层。用户提交的 result 不得占用本键。
+	StructuredResultStorageKey = "__agentgo_structured_result_v1"
 )
 
 // StructuredSubmission 是 submit_task_result 工具写入的一次结构化提交。
@@ -40,11 +49,32 @@ type StructuredSubmission struct {
 	// acceptance 节点的路径形态转移条件（$.verdict eq ...）。
 	// 与 Event 一样不参与 Format 渲染。
 	Verdict string
-	// EvidenceItems 是机器可核验证据（可选，JSON 数组字符串，G1b）：非空时由
-	// agent 在 SubmitResult 前原样写入 task.Results["evidence"]，由 V6 Graph
-	// acceptance 节点的服务端核验器逐条核验——核验不通过或缺失时 Verdict
-	// 不被采信。与 Verdict 一样不参与 Format 渲染（机器核验通道，不是结果正文）。
-	EvidenceItems string
+	// CitedEvidence 是验收结论引用的证据清单（可选，逗号分隔的不透明稳定
+	// EvidenceRef）：非空时由 agent 在 SubmitResult 前写入
+	// task.Results["cited_evidence"]，由 V6 Graph acceptance 节点做谱系核验
+	// ——引用必须属于该 acceptance activation 的上游 Input 谱系或本任务自身
+	// 证据，越谱系引用会使 verdict 不被采信（disputed）。与 Verdict 一样
+	// 不参与 Format 渲染（核验通道，不是结果正文）。
+	CitedEvidence string
+	// ResultJSON 是 result 参数经边界校验和 JSON 规范化后的 object 文本。
+	// 空串表示调用方没有提交自定义结构化字段；"{}" 表示显式提交空 object。
+	// 它不参与 Format 渲染，而是在 finalization 时写入
+	// Results[StructuredResultStorageKey]，供 Graph 条件与数据流消费。
+	ResultJSON string
+}
+
+// DecodeStructuredResult 解码 Task.Results 内部 carrier 中的 JSON object。
+// 编解码协议集中在 agent 包，避免 Graph bridge 复制内部键或把 object 错当
+// 普通字符串。输入必须是 object；null、数组和标量一律拒绝。
+func DecodeStructuredResult(raw string) (map[string]any, error) {
+	var result map[string]any
+	if err := json.Unmarshal([]byte(raw), &result); err != nil {
+		return nil, fmt.Errorf("解码结构化结果: %w", err)
+	}
+	if result == nil {
+		return nil, fmt.Errorf("结构化结果必须是 JSON object")
+	}
+	return result, nil
 }
 
 // Format 把结构化提交渲染为 markdown 结果块：summary 在前，

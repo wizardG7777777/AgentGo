@@ -15,8 +15,8 @@ type ToolFunc func(ctx context.Context, args map[string]any) (string, error)
 // ToolRegistry 管理代理可用的工具集。构造后只读，无需并发保护。
 //
 // 支持可选的工具白名单（allowedTools）：
-//   - allowedTools == nil：允许所有工具注册（向后兼容，等价于原始 NewToolRegistry）
-//   - allowedTools != nil：Register 时静默跳过不在白名单中的工具，
+//   - allowedTools == nil：允许所有工具注册（仅供明确的兼容/控制面调用）
+//   - allowedTools != nil（包括空切片）：Register 时静默跳过不在白名单中的工具，
 //     使其不出现在 Defs() 返回值中，LLM 不知道它的存在
 //
 // 设计背景见 nextUpgrade_v3.md §9.1 工具集分层配置（Tool Set Profiles）。
@@ -35,13 +35,14 @@ func NewToolRegistry() *ToolRegistry {
 
 // NewToolRegistryWithAllowlist 创建一个带白名单过滤的 ToolRegistry。
 // allowed 中列出的工具名才会被 Register 接受；不在列表中的工具会被静默跳过。
-// allowed 为空切片或 nil 时等价于 NewToolRegistry()（允许全部）。
+// nil 表示明确兼容“允许全部”；非 nil 空切片表示“一个工具也不允许”，避免
+// 安全配置中的空 allowlist fail-open。
 func NewToolRegistryWithAllowlist(allowed []string) *ToolRegistry {
 	r := &ToolRegistry{
 		tools: make(map[string]ToolFunc),
 		defs:  make([]llm.ToolDef, 0),
 	}
-	if len(allowed) > 0 {
+	if allowed != nil {
 		r.allowedTools = make(map[string]bool, len(allowed))
 		for _, name := range allowed {
 			r.allowedTools[name] = true

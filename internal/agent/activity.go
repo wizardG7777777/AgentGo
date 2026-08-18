@@ -150,9 +150,9 @@ func (t *ActivityTracker) LLMEnd(agentID, taskID string, loop int, text string, 
 	s.LastActivityAt = time.Now()
 }
 
-// LLMDelta refreshes the live model preview while a streamed response is in
-// flight. It deliberately receives answer content only; reasoning metadata is
-// never exposed through the activity/UI path.
+// LLMDelta refreshes the compact agent-card preview while a streamed response
+// is in flight. Raw reasoning travels through output.KindStream instead so the
+// detailed TUI can label it without replacing the concise activity summary.
 func (t *ActivityTracker) LLMDelta(agentID, taskID string, loop int, text string) {
 	if t == nil || agentID == "" || text == "" {
 		return

@@ -58,6 +58,9 @@ func TestLoadConfig_V4Sample(t *testing.T) {
 
 func TestWatchdogPendingGraceDefaultsAndYAMLDecode(t *testing.T) {
 	defaults := DefaultConfig()
+	if defaults.ProjectRoot != "." {
+		t.Fatalf("default project_root = %q, want .", defaults.ProjectRoot)
+	}
 	if got := defaults.Infra.Watchdog.PendingAlertGraceSec; got != 300 {
 		t.Fatalf("default pending_alert_grace_sec = %d, want 300", got)
 	}
@@ -79,6 +82,23 @@ func TestWatchdogPendingGraceDefaultsAndYAMLDecode(t *testing.T) {
 	}
 	if got := cfg.Infra.Watchdog.UnroutableGraceSec; got != 29 {
 		t.Fatalf("decoded unroutable_grace_sec = %d, want 29", got)
+	}
+}
+
+func TestValidateRejectsEmptyToolProfile(t *testing.T) {
+	prompt := filepath.Join(t.TempDir(), "prompt.md")
+	if err := os.WriteFile(prompt, []byte("test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.LLM.DefaultModel = "test-model"
+	cfg.ToolProfiles = map[string][]string{"none": {}}
+	cfg.Agents = []AgentKind{{
+		Kind: "worker", Replicas: 1, Profile: "none", SystemPromptFile: prompt,
+		TaskMaxRetries: 1, EnforceCompactTokenThreshold: 1,
+	}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "空 profile") {
+		t.Fatalf("empty tool profile should fail closed, got %v", err)
 	}
 }
 
@@ -501,8 +521,8 @@ func TestValidate_StaticAgentsStillRequireSchedulerModel(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Agents = []AgentKind{{
 		Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
-		SystemPromptFile: filepath.ToSlash(filepath.Join("..", "..", "prompts", "worker.md")),
-		TaskMaxRetries: 1,
+		SystemPromptFile:             filepath.ToSlash(filepath.Join("..", "..", "prompts", "worker.md")),
+		TaskMaxRetries:               1,
 		EnforceCompactTokenThreshold: 1,
 	}}
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "Scheduler 配置缺少模型") {

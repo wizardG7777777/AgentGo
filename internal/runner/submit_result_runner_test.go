@@ -123,7 +123,10 @@ func TestResolveToolGroups_WiresSubmitChannelToPlanControlGroup(t *testing.T) {
 func TestRunnerFinalizingFenceSkipsTrailingToolCalls(t *testing.T) {
 	root := t.TempDir()
 	taskStore := store.NewMemoryTaskStore(nil, 32, 1, 60)
-	task := &model.Task{Description: "fence e2e", EventType: "code"}
+	task := &model.Task{
+		Description: "fence e2e", EventType: "code",
+		ExpectedArtifacts: []string{"before.txt"},
+	}
 	if err := taskStore.PublishTask(task); err != nil {
 		t.Fatal(err)
 	}
@@ -176,6 +179,13 @@ func TestRunnerFinalizingFenceSkipsTrailingToolCalls(t *testing.T) {
 	}
 	if got.Status != model.TaskStatusCompleted {
 		t.Fatalf("任务应以 completed 收尾，实际 %s（error: %s）", got.Status, got.Error)
+	}
+	if len(got.Artifacts) != 1 || got.Artifacts[0] != "before.txt" {
+		t.Fatalf("write_file 与 submit_task_result 在同一 LLM 响应时，终态前必须已同步登记 artifact：%v", got.Artifacts)
+	}
+	meta := got.ArtifactMeta["before.txt"]
+	if meta.SHA256 == "" || meta.Bytes != int64(len("提交前写入")) {
+		t.Fatalf("同步 artifact Evidence 元数据缺失: %+v", meta)
 	}
 	// 提交前的 write_file 真实落盘。
 	if data, err := os.ReadFile(filepath.Join(root, "before.txt")); err != nil || string(data) != "提交前写入" {

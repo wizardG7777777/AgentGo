@@ -19,7 +19,7 @@ func newTestWatchdog() (*Watchdog, store.TaskStore, chan model.Event) {
 	cfg.Infra.Store.DefaultTimeoutSec = 300
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	r := roster.NewMemoryRoster()
-	w := New(s, cfg, ch, r, nil, RouteResolverFunc(func(string) bool { return true }))
+	w := New(s, cfg, ch, r, nil, RouteResolverFunc(func(*model.Task) bool { return true }))
 	return w, s, ch
 }
 
@@ -78,28 +78,63 @@ func watchdogAlerts(events []model.Event) []model.Event {
 type fakePlanRouteRegistry struct {
 	available bool
 	calls     int
+	owner     string
+	eventType string
+	required  []string
 }
 
-func (f *fakePlanRouteRegistry) CanRouteForPlan(_, _ string, _ ...string) bool {
+func (f *fakePlanRouteRegistry) CanRouteForPlan(owner, eventType string, required ...string) bool {
 	f.calls++
+	f.owner = owner
+	f.eventType = eventType
+	f.required = append([]string(nil), required...)
 	return f.available
 }
 
 func TestRuntimeRouteResolverPreservesBuiltInSchedulerRoute(t *testing.T) {
 	registry := &fakePlanRouteRegistry{}
 	resolver := NewRuntimeRouteResolver(registry)
-	if !resolver.HasRunnableRoute("__scheduler__") {
+	if !resolver.HasRunnableRoute(&model.Task{EventType: "__scheduler__"}) {
 		t.Fatal("built-in scheduler route must be runnable without AgentRegistry registration")
 	}
 	if registry.calls != 0 {
 		t.Fatalf("scheduler route unexpectedly queried registry %d times", registry.calls)
 	}
-	if resolver.HasRunnableRoute("missing") {
+	if resolver.HasRunnableRoute(&model.Task{EventType: "missing"}) {
 		t.Fatal("unregistered ordinary route reported runnable")
 	}
 	registry.available = true
-	if !resolver.HasRunnableRoute("explore") {
+	if !resolver.HasRunnableRoute(&model.Task{EventType: "explore"}) {
 		t.Fatal("registered ordinary route reported unavailable")
+	}
+}
+
+func TestRuntimeRouteResolverUsesNamespacedTaskAndGraphScope(t *testing.T) {
+	registry := &fakePlanRouteRegistry{available: true}
+	resolver := NewRuntimeRouteResolver(registry)
+	legacy := &model.Task{
+		EventType: "team:legacy", ParentTaskID: "controller-1",
+		Capability: &model.NodeCapability{Tools: []string{"read_file"}},
+	}
+	if !resolver.HasRunnableRoute(legacy) {
+		t.Fatal("legacy Team route should be runnable")
+	}
+	if registry.owner != model.TaskRouteScope("controller-1") || registry.eventType != "team:legacy" ||
+		len(registry.required) != 1 || registry.required[0] != "read_file" {
+		t.Fatalf("legacy route probe mismatch: owner=%q event=%q required=%v", registry.owner, registry.eventType, registry.required)
+	}
+
+	graphTask := &model.Task{EventType: "team:graph", GraphID: "g1"}
+	if !resolver.HasRunnableRoute(graphTask) {
+		t.Fatal("Graph Team route should be runnable")
+	}
+	if registry.owner != model.GraphRouteScope("g1") || registry.eventType != "team:graph" {
+		t.Fatalf("Graph route probe mismatch: owner=%q event=%q", registry.owner, registry.eventType)
+	}
+
+	explicit := &model.Task{EventType: "team:explicit", GraphID: "g-provenance", RouteScope: model.GraphRouteScope("g-frozen")}
+	if !resolver.HasRunnableRoute(explicit) || registry.owner != model.GraphRouteScope("g-frozen") {
+		t.Fatalf("durable RouteScope must override provenance fallback: owner=%q", registry.owner)
 	}
 }
 
@@ -273,7 +308,7 @@ func TestWatchdog_RetryRearmsClaimAlertFromNewPendingLease(t *testing.T) {
 
 func TestWatchdog_UnroutableTaskBlocksAfterIndependentGrace(t *testing.T) {
 	w, s, ch := newTestWatchdog()
-	w.RouteResolver = RouteResolverFunc(func(string) bool { return false })
+	w.RouteResolver = RouteResolverFunc(func(*model.Task) bool { return false })
 	w.Config.Infra.Watchdog.UnroutableGraceSec = 10
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	w.now = func() time.Time { return now }
@@ -311,7 +346,7 @@ func TestWatchdog_UnroutableTaskBlocksAfterIndependentGrace(t *testing.T) {
 
 func TestWatchdog_DependencyWaitDoesNotConsumeNoRouteGrace(t *testing.T) {
 	w, s, _ := newTestWatchdog()
-	w.RouteResolver = RouteResolverFunc(func(eventType string) bool { return eventType == "" })
+	w.RouteResolver = RouteResolverFunc(func(task *model.Task) bool { return task.EventType == "" })
 	w.Config.Infra.Watchdog.UnroutableGraceSec = 10
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	w.now = func() time.Time { return now }
