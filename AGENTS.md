@@ -17,11 +17,6 @@ go test ./internal/store/         # 单包测试
 go test -run TestName ./internal/agent/   # 单个测试
 ./agentgo -config setting.yaml    # 启动（另有 -skip-startup-probe、-resume <sessionID> 进入历史会话，不自动续跑）
 ./agentgo config doctor           # 校验配置 + prompt 承诺工具与实际 allowlist 对账
-# 行为评测（独立开发工具，先 go build -o agentgo-eval ./cmd/agentgo-eval；eval/ 资产不入库）：
-./agentgo-eval preflight          # 凭证前置检查：env 变量注入 + LLM 密钥真实端点探测
-./agentgo-eval run [-smoke]       # 跑黄金任务套件并与基线对比（-binary 指定被测二进制，默认探测 ./agentgo）
-./agentgo-eval record / promote   # 录制基线候选 / review 后晋升 accepted baseline（失败候选拒绝晋升）
-./agentgo-eval offline            # 离线 fake-LLM E2E：脚本化假端点驱动真实主链，断言 trace 事实与禁止行为
 ```
 
 任务级 trace 调试入口：`./agentgo trace list / show / stats / graph / node`（不启动主系统），文件位置与事件字段详见 `TraceGuide.md`。无 Makefile / linter，只用标准 Go 工具链；测试假定 LF 行尾（`.gitattributes` 强制）。

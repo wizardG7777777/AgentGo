@@ -2,7 +2,7 @@
 
 > 版本：V6 Draft
 > 日期：2026-07-29
-> 范围：LLM 调用、Prompt、Context/Memory、Harness、Agent Loop、Graph、Eval/Trace
+> 范围：LLM 调用、Prompt、Context/Memory、Harness、Agent Loop、Graph、验证/Trace
 
 这份文档是一份面向产品行为和系统架构的升级说明，不是字段级协议、代码改造清单或测试手册。它只回答三个问题：AgentGo 目前还缺什么、V6 准备怎样升级、升级完成后会得到什么。
 
@@ -10,10 +10,10 @@ AgentGo 已经具备多 Agent、ReAct、工具调用、Memory、Gate、Reactor�
 
 ```text
 LLM 调用 → Prompt → Context/Memory → Harness → Agent Loop → Graph
-                                                    ↘ Eval/Trace
+                                                    ↘ 验证/Trace
 ```
 
-这不是一组互相替代的层。Graph 负责组织多个节点及其局部 Agent Loop；Loop 仍依赖 Harness、Context、Prompt 和 LLM 调用完成实际工作；Eval/Trace 则横跨所有层，提供验证与审计证据。
+这不是一组互相替代的层。Graph 负责组织多个节点及其局部 Agent Loop；Loop 仍依赖 Harness、Context、Prompt 和 LLM 调用完成实际工作；测试与 Trace 则横跨所有层，提供验证与审计证据。
 
 V6 统一遵守以下原则：
 
@@ -116,7 +116,7 @@ V6 统一遵守以下原则：
 
 7. Scheduler 审计是显式、可选且可能消耗 token 的语义检查，不是启动门槛，也不冒充确定性的证明。每条 warning 应指出 Agent、冲突类型、相关 Prompt 摘要或片段以及实际权限证据；审计结果允许因模型判断不同而变化。它不能检查或修复 Scheduler 自身能否启动，Scheduler 与 solo 路径的最小装配仍由普通代码和开发期测试保证。
 
-8. 离线评测负责验证审计快照、命令路由、warning 结构和权限不被自动修改；真实模型能否稳定识别身份—权限冲突则由开发阶段的 Live Behavior 评测观察。二者不阻止普通用户启动 AgentGo。
+8. 所属包测试负责验证审计快照、命令路由、warning 结构和权限不被自动修改；真实模型能否稳定识别身份—权限冲突只能由外部软件工程基准观察。二者都不应影响普通用户启动 AgentGo。
 
 9. Trace 默认只记录 Prompt 组成、版本和摘要；完整正文只在显式、受控的开发诊断中保存，并进行敏感信息处理。Scheduler 审计记录命令发起、被检查 Agent、warning 摘要和所依据的能力快照摘要，不默认复制所有 Agent 的完整 Prompt。
 
@@ -307,7 +307,7 @@ LLM 文本只是原始记忆材料之一，不能自动成为 confirmed 事实�
 
 8. 可恢复的拒绝会携带明确、合法且有界的下一步，减少模型猜测和无效重试；不可恢复的拒绝则准确升级到用户、blocked、replan 或 terminal，而不会伪造一条看似可行的建议。
 
-9. Suggestions 不会扩大节点权限、自动执行副作用或形成无限恢复循环，并可以通过 Trace 与离线评测验证其实际效果。
+9. Suggestions 不会扩大节点权限、自动执行副作用或形成无限恢复循环，并可以通过 Trace 与所属包测试验证其实际效果。
 
 ---
 
@@ -345,7 +345,7 @@ LLM 文本只是原始记忆材料之一，不能自动成为 confirmed 事实�
 
 7. Agent Loop 将 Harness 返回的 Suggestion 作为一种结构化观察，而不是必须执行的命令。模型可以采纳合法建议或选择其他允许动作；重复出现相同拒绝原因与目标时计入 no-progress。系统先提示 Agent 收敛，再限制高成本探索，最终要求提交完成或明确阻塞；持续无进展时由控制面结束本轮并请求 replan。
 
-8. 循环次数继续作为 Trace、Eval 和周期性 checkpoint 的观测指标，但不再作为正常终止条件。系统可以每隔若干轮刷新 Task Memory、持久化 checkpoint 并检查进展；这里的轮数只是检查间隔。实现层可保留一个不可由普通配置调低的极高 emergency fuse，用于防御程序缺陷造成的真正死循环；触发时记录运行时异常并进入 `blocked/replan`，不得自动重跑相同 Task。
+8. 循环次数继续作为 Trace 和周期性 checkpoint 的观测指标，但不再作为正常终止条件。系统可以每隔若干轮刷新 Task Memory、持久化 checkpoint 并检查进展；这里的轮数只是检查间隔。实现层可保留一个不可由普通配置调低的极高 emergency fuse，用于防御程序缺陷造成的真正死循环；触发时记录运行时异常并进入 `blocked/replan`，不得自动重跑相同 Task。
 
 9. 重试必须复用 Task 开始时冻结的 Prompt、调用契约、兼容补丁和关键上下文策略。若这些契约确需改变，应当创建新节点或通过 replan 进入新 revision。
 
@@ -491,11 +491,11 @@ LLM 文本只是原始记忆材料之一，不能自动成为 confirmed 事实�
 
 ---
 
-## 7. Eval / Trace
+## 7. 验证 / Trace
 
-Eval 用来回答“升级是否真的改善了系统”，Trace 用来回答“一次运行实际发生了什么，以及为什么发生”。二者横跨前六章，但都不能成为第二套运行状态。V6 对本章设置一条明确的完成标准：
+测试用来验证架构和基础设施不变量，外部软件工程基准用来回答真实任务能力，Trace 用来回答“一次运行实际发生了什么，以及为什么发生”。这些验证手段横跨前六章，但都不能成为第二套运行状态。V6 对本章设置一条明确的完成标准：
 
-> 前六章新增的稳定事实，如果没有可关联、可脱敏、可查询、可测试的 Trace，就不算完成；已经删除的机制，如果仍在新 Trace、CLI、Dashboard、Reactor 订阅或 Eval 指标中出现，也不算删除完成。
+> 前六章新增的稳定事实，如果没有可关联、可脱敏、可查询、可测试的 Trace，就不算完成；已经删除的机制，如果仍在新 Trace、CLI、Dashboard、Reactor 订阅或统计指标中出现，也不算删除完成。
 
 ### 现有不足
 
@@ -515,11 +515,11 @@ Eval 用来回答“升级是否真的改善了系统”，Trace 用来回答“
 
 8. 当前事件和 CLI 仍内置 `replan_*`、`plan_revision_changed`、`plan_paused`、`plan_terminal`、`PlanTraceContext`、`trace plan` 和 `stats plan`；Loop Trace 也仍把 MaxLoops 作为 retry 与失败原因。这些都与第 5、6 章已经决定删除的固定循环上限和 Plan 控制面冲突。
 
-9. 当前 `agentgo eval` 直接编入普通 AgentGo 二进制，`run/record` 会先探测真实端点并使用真实模型，尚没有不联网的 fake-LLM Offline E2E 主链。与此同时，suite、fixture、baseline 和报告整体位于被忽略的 `eval/` 目录，无秘密的行为契约也无法随代码版本审阅。
+9. 曾经内置的行为评测依赖本地玩具任务、忽略目录中的 suite/fixture/baseline 与单次真实模型运行，既不能代表真实软件工程能力，也不能替代架构和基础设施的不变量测试；该工具链现已删除。
 
-10. 当前 baseline 只按模型、Prompt hash、配置 hash 和 Git commit 区分，每个 case 主要是单次运行与固定比例带。Eval 还用最大 Loop 序号近似循环数，用 `task_published` 统计 DAG Subtasks，用 `replan_requested` 统计 Replans；这些指标既不精确，也延续了 V5 的 Plan/DAG/MaxLoops 语义。
+10. 旧 baseline 只按模型、Prompt hash、配置 hash 和 Git commit 区分，每个 case 主要是单次运行与固定比例带；还用最大 Loop 序号近似循环数，用 `task_published` 统计 DAG Subtasks，用 `replan_requested` 统计 Replans。这些指标既不精确，也延续了 V5 的 Plan/DAG/MaxLoops 语义。
 
-11. Trace 写入失败目前只告警，Eval 收割又允许跳过损坏文件。若没有独立的完整性状态，`event_absent` 可能只是证据丢失，却被误判为“禁止行为没有发生”。
+11. 旧评测收割允许跳过损坏的 Trace 文件。若外部检查没有独立的完整性状态，`event_absent` 可能只是证据丢失，却被误判为“禁止行为没有发生”。
 
 ### 升级思路
 
@@ -532,7 +532,7 @@ V6 将 Trace 定义为“权威事实的脱敏审计投影”，不再把 Trace 
                 │
                 ├─ 完整 Domain Event / Outbox → Reactor 与运行时响应
                 │
-                └─ 脱敏 Trace Projection      → CLI / UI / Eval / 排障
+                └─ 脱敏 Trace Projection      → CLI / UI / 测试 / 排障
 ```
 
 1. Task/Attempt 状态以 TaskStore 和 checkpoint 为准；Graph JSON、revision 与 `state_version` 以 GraphStore 的内存状态、snapshot 和变更日志为准。
@@ -543,7 +543,7 @@ V6 将 Trace 定义为“权威事实的脱敏审计投影”，不再把 Trace 
 
 4. Graph revision、Activation、边选择、Join、审批、节点结果和 Effect intent 等关键事实，必须先完成对应权威日志的 durable commit，再产生 Trace 投影。Trace 的时间戳不取代 Graph `state_version`、Attempt/Turn 序号和 Effect 状态顺序。
 
-5. Trace 写入失败不回滚已经提交的业务事实，但必须将运行标记为 `trace_degraded`，向用户显示告警，并让依赖 Trace 的 Eval 结果进入 `trace_incomplete`。Reactor 仍从完整 Domain Event 接收事实，不能依赖脱敏后的 JSONL。
+5. Trace 写入失败不回滚已经提交的业务事实，但必须将运行标记为 `trace_degraded`，向用户显示告警，并让依赖 Trace 的测试或外部检查明确失败。Reactor 仍从完整 Domain Event 接收事实，不能依赖脱敏后的 JSONL。
 
 #### 7.2 统一事件信封与存储范围
 
@@ -567,7 +567,7 @@ payload_digest / redaction_policy / payload
 
 并非每条事件都要填写所有 ID，但每条事件必须声明自己的作用域，准备、执行、结算、恢复等阶段必须复用同一组稳定身份。Writer 不再因为缺少 `TaskID` 丢弃 Graph、Session、Interaction 或 Invocation 事件。
 
-物理存储仍可使用 Session 下的分段 JSONL，但分片只是一种落盘方式，不再代表逻辑归属。CLI 通过 Envelope 的关联 ID 聚合，不依赖文件名猜测一张 Graph 或一次 Attempt。每个分片记录 schema、序号范围、校验摘要和关闭状态；Eval 只读取当前 `run_id + suite_case_id + graph_id` 的完整 bundle，不再扫描并混合所有 Session 与 legacy JSONL。
+物理存储仍可使用 Session 下的分段 JSONL，但分片只是一种落盘方式，不再代表逻辑归属。CLI 通过 Envelope 的关联 ID 聚合，不依赖文件名猜测一张 Graph 或一次 Attempt。每个分片记录 schema、序号范围、校验摘要和关闭状态；测试与诊断工具必须读取边界明确的完整 bundle，不得扫描并混合所有 Session 与 legacy JSONL。
 
 流式 token、UI snapshot、普通进度刷新和尚未提交的 Memory 候选不逐条进入 durable Trace；它们在形成 settled Turn、Memory checkpoint、Effect 状态或 Graph 状态变化后再记录稳定事实，避免 Trace 自身成为新的高频负担。
 
@@ -604,7 +604,7 @@ payload_digest / redaction_policy / payload
 
 #### 7.4 明确停止跟踪的旧内容
 
-V6 的新 Writer、CLI、Dashboard、Reactor 订阅与 Eval 聚合必须同时停止使用下列旧语义：
+V6 的新 Writer、CLI、Dashboard、Reactor 订阅与统计聚合必须同时停止使用下列旧语义：
 
 | V5 内容 | V6 处理 |
 |---|---|
@@ -617,10 +617,10 @@ V6 的新 Writer、CLI、Dashboard、Reactor 订阅与 Eval 聚合必须同时�
 | `memory_context_inject` 独立事件 | 其信息并入 Context Manifest；Process snapshot 仍可见，但不再被误认为长期 Memory |
 | 绑定固定 `context_limit` 的 `history_truncated` | 改为 Context Manifest 中的选择、压缩、引用和排除原因；上下文适配仍可观察，但不再表达已删除的固定配置硬限 |
 | Agent 级 `token_stats` 累计事件 | 改为 Invocation 级 Usage reservation/settlement/unknown；Task、Node、Graph 与 Session 汇总从账本推导 |
-| Task `Dependencies`、`Subtasks` 和 `Replans` 作为整张图的拓扑与核心 Eval 指标 | Graph 拓扑只认 Node、Transition、Join、Router 与 Activation；指标改为 Activation、Graph change、committed revision 和 transition。Task 前置关系若仍用于执行，不得冒充完整 Graph |
+| Task `Dependencies`、`Subtasks` 和 `Replans` 作为整张图的拓扑与核心指标 | Graph 拓扑只认 Node、Transition、Join、Router 与 Activation；指标改为 Activation、Graph change、committed revision 和 transition。Task 前置关系若仍用于执行，不得冒充完整 Graph |
 | 默认 Trace 中的完整工具 `Args`、Shell command/output 和完整 Prompt dump | 改为 schema-aware redaction、摘要与受控引用；完整诊断资料只进入显式开发通道，使用独立开关、目录、权限与保留策略 |
 
-V6 可以保留只读 legacy decoder 以查看旧 JSONL，但必须显示 `legacy / coverage=partial`，不能把旧 Plan 事件自动解释成新的 Graph 事实，也不能将它们并入 V6 Dashboard、Reactor 白名单、baseline 或 Release gate。能读取历史不等于继续跟踪旧机制。
+V6 可以保留只读 legacy decoder 以查看旧 JSONL，但必须显示 `legacy / coverage=partial`，不能把旧 Plan 事件自动解释成新的 Graph 事实，也不能将它们并入 V6 Dashboard、Reactor 白名单或当前统计。能读取历史不等于继续跟踪旧机制。
 
 #### 7.5 Trace 查询入口
 
@@ -639,29 +639,28 @@ agentgo trace stats [session|graph|node|agent|model]
 
 `trace graph` 按 revision 与 `state_version` 展示 Node/Activation/Transition/Join/Approval/Acceptance/恢复时间线；`trace explain` 沿 `causation_id`、`authority_ref` 和相关 Manifest 说明“为何路由、为何拒绝、为何裁剪、为何恢复”。每个视图都显示 `complete / partial / degraded`，避免把缺失证据误当成没有发生。
 
-#### 7.6 分层 Eval 与 Release 边界
+#### 7.6 验证与 Release 边界
 
 | 评测层 | 主要验证内容 | 是否联网或调用真实模型 | 普通 Release 是否携带 |
 |---|---|---:|---:|
 | Contract Tests | schema、状态机、字段所有权、Prompt 顺序、Context/Memory 晋升、Lease/Gate/Effect、Graph CAS 与恢复不变量 | 否 | 不携带测试二进制与 fixture |
-| Offline fake-LLM E2E | 用 scripted/fake endpoint 驱动真实 Prompt → Context → Harness → Loop → Graph 主链，验证 Trace 事实与禁止行为 | 否 | 否 |
 | Recovery / Platform / Security | Effect 崩溃窗口、Graph journal 重放、Trace 缺口、race、symlink/junction、Windows/macOS/Linux 差异 | 否 | 否 |
-| Live Behavior | 真实模型完成代表性任务的成功率、里程碑、无进展、重复副作用、usage、时延与费用 | 是 | 否 |
+| External Software Benchmark | 在受版本控制的真实软件工程任务上衡量成功率、里程碑、禁止行为、usage、时延与费用 | 是 | 否 |
 | Live Compatibility | 仅验证 `thinking`、`tool_use`、`structure_output` 及确有失败证据的最小补丁 | 是 | 否 |
 
-1. 从普通 AgentGo 二进制删除 `eval preflight/run/record` 路由。Contract 与 Offline E2E 由开发/CI 测试运行；Live Behavior 与 Compatibility Lab 进入独立开发工具 `agentgo-eval`，不作为正常 Release 产物发布。
+1. 仓库不提供内置行为评测命令、玩具任务套件或基线录制器。Contract、Recovery、Platform 与 Security 由所属包测试和集成测试负责；真实模型能力只能由外部软件工程基准验证。
 
 2. 正常 Release 只保留生产 Trace 查询器、权威运行账本和已经资格化的最小兼容补丁；不包含 compatibility suite、sentinel tool、judge、fixture、trial 状态机、baseline 录制器或真实模型跑批命令。普通启动不得为了评测产生 LLM Invocation。
 
-3. 无秘密的 suite、fixture、fake-LLM 脚本、judge schema 和 accepted baseline manifest 进入开发/CI 的版本管理，但由构建和打包规则排除在 Release 外。密钥、原始模型响应、用户数据、完整 Prompt、完整 Trace 和机器缓存继续保存在仓库外或明确忽略的运行目录。
+3. 外部基准若存在，其任务、判据与基线必须独立版本化并与 Release 构建隔离。密钥、原始模型响应、用户数据、完整 Prompt、完整 Trace 和机器缓存继续保存在仓库外或明确忽略的运行目录。
 
-4. Offline case 使用确定性结果和精确断言。Live Behavior 对同一 case 运行多个 rollout，报告成功率、语义里程碑、禁止行为、结构化结束、重复 Effect、no-progress 以及中位/P95 的调用、usage、时延和费用；不再用单次结果与固定 ±30% 掩盖随机性。
+4. 外部行为基准对同一 case 运行多个 rollout，报告成功率、语义里程碑、禁止行为、结构化结束、重复 Effect、no-progress 以及中位/P95 的调用、usage、时延和费用；不使用单次结果与固定比例带掩盖随机性。
 
 5. Live 入口在执行前展示请求上限、completion token 上限、预算与可能费用。GPT 与官方 DeepSeek V4 的三功能兼容性只在开发阶段验证；缺少凭证、未运行、目标不在资格范围或证据过期都不能默认为 pass。
 
-6. `record` 只生成 baseline candidate。只有必需 case 全部运行、Trace 完整、结果满足准入条件并经过显式 review/promote 后，才能成为 accepted baseline；失败或不完整运行不能覆盖现有基线。
+6. 外部基准的失败或不完整运行不得覆盖 accepted baseline；基线更新必须经过显式 review。
 
-#### 7.7 Fingerprint、比较与指标
+#### 7.7 外部基准的 Fingerprint、比较与指标
 
 完整 Run Fingerprint 用于复现来源，至少记录：
 
@@ -679,7 +678,7 @@ Graph schema + relevant Graph digest
 Usage policy + AccountingProfile digest
 ```
 
-`provider` 不进入 fingerprint。Git commit 是 provenance，不应因为候选版本与 baseline 的 commit 不同就直接跳过回归比较。
+`provider` 不进入 fingerprint。Git commit 是 provenance，不应因为候选版本与外部基线的 commit 不同就直接跳过回归比较。
 
 比较时再从 Run Fingerprint 中选择当前指标必须相同的 cohort，并显式声明本次有意改变的 variant。例如：行为正确性不因价格表变化失去可比性；时延要求平台和运行器接近；token 要求模型 usage 口径与调用契约一致；美元成本要求 AccountingProfile 一致。未声明的关键差异报告为 `not_comparable`，而不是强行混组或静默跳过。
 
@@ -689,7 +688,7 @@ Usage policy + AccountingProfile digest
 pass / fail / skipped / blocked / unqualified / not_comparable / trace_incomplete
 ```
 
-`skipped`、`unqualified` 和 `trace_incomplete` 都不能满足对应 Release gate。基于 Trace 的 judge 必须先验证 schema、事件 ID、scope sequence、分片摘要、开始/关闭状态和 writer health；证据不完整时不得用 `event_absent` 判定通过。
+外部基准中的 `skipped`、`unqualified` 和 `trace_incomplete` 都不能满足对应准入条件。基于 Trace 的外部判据必须先验证 schema、事件 ID、scope sequence、分片摘要、开始/关闭状态和 writer health；证据不完整时不得用 `event_absent` 判定通过。
 
 核心准入指标关注：
 
@@ -710,14 +709,14 @@ LLM 调用数、Turn 数、wall time、usage、费用、Suggestion 采用率、n
 1. 有版本的事件 payload、稳定关联 ID 与默认脱敏策略；
 2. 在权威事实提交后产生 Trace 投影，且不会因 Trace 失败改变业务结果；
 3. 至少一个 CLI/UI 查询入口能够沿关联 ID 找到该事实；
-4. Contract 或 Offline E2E 验证事件存在、顺序、引用、恢复行为和敏感字段缺失；
-5. Eval 能区分事实没有发生、Trace 不完整和旧 schema 无法证明三种情况。
+4. Contract 或所属包集成测试验证事件存在、顺序、引用、恢复行为和敏感字段缺失；
+5. 测试与诊断工具能区分事实没有发生、Trace 不完整和旧 schema 无法证明三种情况。
 
 删除旧机制时必须同时完成：
 
 1. 删除生产 emitter 和 Domain Event 依赖；
 2. 删除新 schema 中的旧字段、事件常量与 Reactor 订阅；
-3. 删除 CLI/Dashboard 的当前视图和 Eval 聚合指标；
+3. 删除 CLI/Dashboard 的当前视图和相关聚合指标；
 4. 增加“V6 不再发出该事件”的 absence test；
 5. 如需读取历史，只保留隔离的 legacy decoder，不把旧事实迁入当前指标。
 
@@ -727,12 +726,12 @@ LLM 调用数、Turn 数、wall time、usage、费用、Suggestion 采用率、n
 
 2. Prompt 编译、Context 裁剪、Memory 晋升、ExecutionLease、Suggestions、Loop checkpoint、Graph 路由和恢复都具备稳定证据；同时 Trace 不替代任何权威 Store 或 Journal。
 
-3. V6 新运行不会再产生 Plan、MaxLoops、provider、DeepSeek-R1 资格和旧 DAG 指标；历史记录仍可隔离查看，但不会污染当前 Dashboard、Reactor、Eval 或 Release gate。
+3. V6 新运行不会再产生 Plan、MaxLoops、provider、DeepSeek-R1 资格和旧 DAG 指标；历史记录仍可隔离查看，但不会污染当前 Dashboard、Reactor 或统计口径。
 
-4. 大多数回归可以在不联网、不消耗 token 的 Contract 与 Offline E2E 中发现；Live Behavior 和 Compatibility 成为显式、限额、可说明费用的开发活动。
+4. 架构与基础设施回归由不联网、不消耗 token 的 Contract 和所属包集成测试发现；真实任务能力与 Compatibility 由显式、限额、可说明费用的外部开发活动验证。
 
 5. 正常 AgentGo Release 不再携带真实模型跑批、compatibility suite、sentinel、judge、fixture、trial 状态机和 baseline 录制逻辑，生产程序只保留必要运行能力与脱敏排障入口。
 
-6. 报告能够区分真实行为回归、随机波动、受控 variant、环境漂移、资格缺失和 Trace 不完整，不再把 skipped、unknown 或证据丢失误报为 pass。
+6. 外部基准报告能够区分真实行为回归、随机波动、受控 variant、环境漂移、资格缺失和 Trace 不完整，不再把 skipped、unknown 或证据丢失误报为 pass。
 
 7. 删除机制与新增机制采用同一套 Trace 覆盖验收：该跟踪的事实可以查到，不该继续存在的旧概念在新事件、查询和指标中彻底消失。

@@ -71,12 +71,7 @@ artifacts/
 
 # 本地编译产物（go build ./. 默认输出到仓库根的同名二进制）
 /agentgo
-/agentgo-eval
 
 # 外部/无关项目目录
 systemTest/
 config.program-upgrade-small.yaml
-
-# 行为评测资产（套件/模板/基线/报告/运行现场；随功能迭代频繁变动，暂不入库）
-# 模板只写 ${VAR} 占位符，密钥一律走环境变量
-/eval/

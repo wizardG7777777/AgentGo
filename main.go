@@ -35,11 +35,10 @@ func main() {
 		os.Exit(config.CLI(os.Args[2:], os.Stdout, os.Stderr))
 	}
 
-	// eval 子命令族已于 V6 移出 Release 二进制（docs/nextUpgrade-V6.md §7.6）：
-	// 行为评测（preflight/run/record）改由独立开发工具 agentgo-eval 承载
-	// （cmd/agentgo-eval）。显式拒绝，避免 "eval" 被当作游离参数静默启动主系统。
+	// eval 子命令及其独立开发工具均已删除。这里继续显式拒绝，避免 "eval"
+	// 被当作游离参数而静默启动主系统。
 	if len(os.Args) >= 2 && os.Args[1] == "eval" {
-		fmt.Fprintf(os.Stderr, "[错误] eval 子命令已于 V6 移出本二进制：行为评测请使用独立开发工具 agentgo-eval（go build -o agentgo-eval ./cmd/agentgo-eval）\n")
+		fmt.Fprintln(os.Stderr, "[错误] eval 子命令已删除；项目不再提供内置行为评测工具")
 		os.Exit(2)
 	}
 

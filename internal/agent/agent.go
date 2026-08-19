@@ -508,8 +508,8 @@ func (a *Agent) run(ctx context.Context, ready func()) {
 // 进入 blocked 终态并登记 replan，绝不自动重跑同一 Task。
 //
 // 它不是正常终止条件——正常 Loop 由结构化终态、用户/系统取消、任务
-// deadline 与 token/成本预算共同约束；循环计数本身继续作为 trace/eval 的
-// 观测指标存在。本常量故意不暴露任何 YAML/配置入口，不可调低；测试可经
+// deadline 与 token/成本预算共同约束；循环计数本身继续作为 trace 的观测
+// 指标存在。本常量故意不暴露任何 YAML/配置入口，不可调低；测试可经
 // Agent.loopFuse 未导出字段覆盖。
 const emergencyLoopFuse = 10000
 

@@ -39,7 +39,6 @@ main.go（子命令 trace / config 分流；否则 -config 等 flags）
 | `internal/config` | YAML/JSON 配置加载，仅支持 v4 schema；v3 顶层字段静默忽略 |
 | `internal/dashboard` | Web 前端：内嵌 SPA、`/api/snapshot`、`/api/events` SSE、Interaction 响应端点；Bearer/?token= 鉴权，非 loopback 强制 token |
 | `internal/effect` | V6 Effect Journal：副作用 prepared/settled/unknown append-only 账本，ReplayPolicy 声明，启动 Recover 按策略裁决 |
-| `internal/eval` | 行为评测体系（`cmd/agentgo-eval`）：preflight 凭证检查、黄金任务黑盒驱动、Run Fingerprint 基线对比、`fakellm` 离线 E2E |
 | `internal/gate` | 统一 Gate 注册表。Phase 路由：`tool:preCall` / `tool:postCall` / `mailbox:beforeSend` / `mailbox:beforeDeliver` / `mailbox:beforeWake` |
 | `internal/graph` | V6 JSON Graph：GraphDocument 即执行契约（校验/digest）、GraphStore 持久化（snapshot+journal/Recover）、Runtime 引擎（activation 模型、十类节点） |
 | `internal/hook` | 遗留 Hook 接口与内置实现，现作为 Gate 的适配层（内置 Gate 实现存放于此） |

@@ -255,9 +255,8 @@ activation 的返工、复验或局部重试。二者不要因为都表现为“
 
 - prompt 是反引号原始字符串常量，正文**禁止出现反引号**；
 - 每次正文变更递增 `schedulerPromptVersion`（`scheduler.go:42`）；
-- 验证手段：`agentgo-eval run` 黄金任务套件基线对比（prompt 重构前后各一遍），
-  `agentgo-eval offline` 可断言"依赖链任务不被拍平成总分"等图形事实
-  （KNOWN_ISSUES:139 指出无行为基线，eval 是对症工具）。
+- 验证手段：运行 Scheduler、Graph 与 acceptance 的定向测试及全仓测试；涉及
+  跨包装配时，再用真实二进制完成 implement → acceptance 冒烟并核对 Trace 事实。
 
 ## 4. 验收机制重设计（核心变更）
 
@@ -351,7 +350,7 @@ EvidenceRef。服务端只核对引用是否来自该 acceptance activation 的�
 ### 4.5 程序性同步死循环保险丝（非业务预算）
 
 `fixable → implement` 等跨任务回边不设 activation 次数上限；合法的长目标可以
-产生任意多次 activation，次数只用于 Trace/Eval 观测。`Capability.Budget` 与
+产生任意多次 activation，次数只用于 Trace 观测。`Capability.Budget` 与
 `budget.max_activations` 均不进入 schema。
 
 Runtime 只保留不可配置的 **同步机械级联保险丝**：它限制一次 Runtime 调用内
@@ -451,7 +450,7 @@ tool 节点放行 run_shell 的治理问题（记录备查）：
 | 7 | tool 节点语义章节重写（探测退场、检查点定位） | 同上一并 |
 | 8 | KNOWN_ISSUES 更新：:78 风险关闭、:90 保守默认改写 | `docs/activate/KNOWN_ISSUES.md` |
 | 9 | 测试：Result→Input、结构化路由、输入端口 barrier、EvidenceRef 谱系、大结果与恢复、同步级联保险丝 | 各对应 _test.go |
-| 10 | 交付冒烟：真二进制走 implement → acceptance 闭环；agentgo-eval run 基线对比 | 交付约定（AGENTS.md） |
+| 10 | 交付冒烟：真二进制走 implement → acceptance 闭环并核对 Trace 事实 | 交付约定（AGENTS.md） |
 
 跨平台纪律提醒（AGENTS.md 硬约束）：测试文件句柄先 Close 再 TempDir 清理；
 路径只用 filepath.Join；行尾 LF；新输入通路建在 Bubble Tea MVU 内（本方案不涉及）。
