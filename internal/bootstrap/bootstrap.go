@@ -483,6 +483,9 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// 隔离 resolver 在那里接上（hook 是指针，注册后经同一指针调用，装配期无并发）。
 	expectedHashHook := builtin.NewValidateExpectedHashHook()
 	lineAnchorsHook := builtin.NewValidateLineAnchorsHook()
+	// scheduler 收口审查：Graphs / Interactions / SessionID 依赖在后续步骤
+	// 建成后接线（同上方 resolver 的惰性接线模式，装配期无并发）。
+	schedulerClosureHook := builtin.NewSchedulerClosureHook(taskStore)
 	for _, h := range []hook.ToolHook{
 		builtin.NewExecModeGuardHook(modeStore),
 		builtin.NewPathBoundaryHook(cfg.ProjectRoot),
@@ -491,12 +494,13 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		builtin.NewDependencyValidatorHook(storeView),
 		builtin.NewEnforceExpectedArtifactsHook(storeView, cfg.ProjectRoot),
 		lineAnchorsHook,
+		schedulerClosureHook,
 	} {
 		if err := gateReg.Register(gate.WrapToolHook(h)); err != nil {
 			return nil, fmt.Errorf("注册 %s 失败: %w", h.Name(), err)
 		}
 	}
-	log.Println("[启动] Tool 域 Gate 注册完成（exec-mode-guard, path-boundary, validate-expected-hash, validate-line-anchors, require-read-before-write, dependency-validator, enforce-expected-artifacts）")
+	log.Println("[启动] Tool 域 Gate 注册完成（exec-mode-guard, path-boundary, validate-expected-hash, validate-line-anchors, require-read-before-write, dependency-validator, enforce-expected-artifacts, scheduler-closure-review）")
 
 	// Step 3: 初始化花名册
 	r := roster.NewMemoryRoster()
@@ -750,6 +754,12 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// 与全部前端共享同一个 CAS 状态机；UI 只消费安全投影，不持有回复通道。
 	interactionService := interaction.NewService(interaction.NewMemoryStore(),
 		interaction.WithSessionIDProvider(currentSessionID))
+
+	// scheduler 收口审查 Gate 的惰性接线：graphStore（Step 3.9.1）与
+	// interactionService / currentSessionID（Step 7.4）此时才存在。
+	schedulerClosureHook.Graphs = graphStore
+	schedulerClosureHook.Interactions = interactionService
+	schedulerClosureHook.SessionID = currentSessionID
 
 	// Step 7.4.1: V6 Graph approval/tool 桥（C5c，graph_approval.go /
 	// graph_tool.go）——approval 节点经 Interaction 服务请求人工裁决
