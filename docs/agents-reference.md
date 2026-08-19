@@ -68,7 +68,7 @@ main.go（子命令 trace / config 分流；否则 -config 等 flags）
 | `internal/tui` | Bubble Tea TUI；两层渲染（inline scrollback 主态 + Graph/详情/结果全屏层）；键位事实源在 `keymap.go` |
 | `internal/ui` | TUI/Web 共享 Hub、安全快照与斜杠命令目录；轮次历史不受有界诊断 feed 淘汰 |
 | `internal/output` | 类型化输出通道事件（文本 / 流式快照 / 不可变完成轮次 / 任务结果） |
-| `internal/watchdog` | 周期健康检查、级联取消、roster 清理、超时检测、panic 自动重启 |
+| `internal/watchdog` | 周期健康检查、级联取消、roster 清理、超时告警（只告警不杀死）、panic 自动重启 |
 | `internal/webtool` | Web 搜索 + URL 抓取，SSRF 防护，搜索后端可插拔 |
 | `internal/workspace` | 按任务写时复制执行隔离：Manager / View（overlay）/ Swapper；`types.go` 为冻结契约 |
 

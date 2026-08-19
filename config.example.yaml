@@ -161,7 +161,7 @@ infra:
     event_channel_buffer: 64
     fifo_limit: 100
     default_concurrency: 1       # 任务级认领上限的兜底值（仅影响未显式指定的非 plan 发布路径）；>1 会让多个 Agent 重复执行同一任务
-    default_timeout_sec: 300       # 单次 processing 执行的默认超时
+    default_timeout_sec: 3600      # 任务级预期执行时长（秒）；超过由 watchdog 发超时告警（只告警，不杀死任务）
   roster:
     wait_timeout_sec: 30
 

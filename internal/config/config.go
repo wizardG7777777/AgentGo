@@ -177,7 +177,8 @@ type StoreConfig struct {
 	EventChannelBuffer int `yaml:"event_channel_buffer" json:"event_channel_buffer"`
 	FIFOLimit          int `yaml:"fifo_limit" json:"fifo_limit"`
 	DefaultConcurrency int `yaml:"default_concurrency" json:"default_concurrency"`
-	// DefaultTimeoutSec 是单次 processing 执行租约的任务级默认超时。
+	// DefaultTimeoutSec 是任务级预期执行时长（秒）：processing 超过它由
+	// watchdog 发超时告警（2026-08-19 起只告警、不杀死任务）。
 	// pending 的告警/无 route 宽限分别由 WatchdogConfig 控制，不能复用执行超时。
 	// v3 旧名 cfg.DefaultTimeoutSec，已下沉到 Infra.Store 块下，与 store 容量参数同居。
 	DefaultTimeoutSec int `yaml:"default_timeout_sec" json:"default_timeout_sec"`
@@ -403,7 +404,7 @@ func DefaultConfig() *Config {
 				EventChannelBuffer: 64,
 				FIFOLimit:          100,
 				DefaultConcurrency: 2,
-				DefaultTimeoutSec:  300,
+				DefaultTimeoutSec:  3600,
 			},
 			Roster: RosterConfig{WaitTimeoutSec: 30},
 		},

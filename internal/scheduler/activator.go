@@ -143,15 +143,16 @@ func (h *SessionHistory) ImportSnapshot(entries []session.SessionInputSnapshot) 
 	return nil
 }
 
-// SchedulerTaskTimeoutSec 是 scheduler task 的超时值。
+// SchedulerTaskTimeoutSec 是 scheduler task 的预期执行时长。
 //
 // 之所以不设 0：MemoryTaskStore.PublishTask 会把 TimeoutSeconds<=0 的字段
-// 替换为 cfg.DefaultTimeoutSec（默认 300 秒），那对 scheduler 来说太短。
-// 这里显式设大数值（24 小时）绕过这个 default —— scheduler agent 可以等待
-// 用户多轮交互、worker 跑长任务，watchdog 不应主动杀它。
+// 替换为 cfg.DefaultTimeoutSec（默认 1 小时）。scheduler agent 要等待用户
+// 多轮交互、worker 跑长任务，不应触发 watchdog 超时告警，这里显式设大
+// 数值（24 小时）绕过这个 default（2026-08-19 起 watchdog 超时只告警、
+// 不杀死任务）。
 //
-// 1 天上限是工程兜底：如果 scheduler 真的卡了 24 小时，让 watchdog 介入
-// 比无限等待更安全。
+// 1 天上限是工程兜底：scheduler 真的运行了 24 小时，至少有一条告警浮出，
+// 比无限静默更可观测。
 const SchedulerTaskTimeoutSec = 86400 // 24 小时
 
 // Activator 是 EventCh 与 scheduler agent 之间的桥梁。

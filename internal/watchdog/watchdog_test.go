@@ -165,27 +165,70 @@ func TestWatchdog_PrunesObservationForTaskNoLongerInStore(t *testing.T) {
 	}
 }
 
-func TestWatchdog_TimeoutDetection(t *testing.T) {
-	w, s, _ := newTestWatchdog()
+// 2026-08-19 起 watchdog 不再杀死超时任务：超时只触发一次性告警
+// （EventWatchdogAlert / reason_code=processing_overtime），任务保持
+// processing 继续运行。杀死 LLM 调用层卡死的职责在 llm 层自身的超时。
+func TestWatchdog_OvertimeWarnsOnceWithoutKilling(t *testing.T) {
+	w, s, ch := newTestWatchdog()
 
 	task := &model.Task{
-		Description:    "timeout task",
-		TimeoutSeconds: 1, // 1 second timeout
+		Description:    "overtime task",
+		TimeoutSeconds: 1, // 1 秒预期时长
 	}
 	s.PublishTask(task)
 	s.ClaimTask("agent-1", task.ID)
 
-	// Manipulate StartedAt to simulate timeout
+	// 回拨 StartedAt 模拟超时
 	setTaskTiming(t, s, task.ID, time.Time{}, time.Now().Add(-5*time.Second))
 
 	inspectAll(w)
 
 	got, _ := s.GetTask(task.ID)
-	if got.Status != model.TaskStatusFailed {
-		t.Errorf("status = %s, want failed (timeout)", got.Status)
+	if got.Status != model.TaskStatusProcessing {
+		t.Fatalf("status = %s, want processing（watchdog 不再杀超时任务）", got.Status)
 	}
-	if got.Error == "" {
-		t.Error("task.Error is empty, want timeout reason")
+	alerts := watchdogAlerts(drainEvents(ch))
+	if len(alerts) != 1 || alerts[0].Payload["reason_code"] != "processing_overtime" {
+		t.Fatalf("alerts = %+v, want 恰好一条 processing_overtime", alerts)
+	}
+
+	// 同一执行租约再次巡检不重复告警
+	inspectAll(w)
+	if alerts := watchdogAlerts(drainEvents(ch)); len(alerts) != 0 {
+		t.Fatalf("同一租约重复告警: %+v", alerts)
+	}
+}
+
+// 重试回滚后重新认领会换得新 StartedAt（新执行租约），超时告警应重新武装。
+func TestWatchdog_OvertimeWarningRearmsOnRetry(t *testing.T) {
+	w, s, ch := newTestWatchdog()
+
+	task := &model.Task{Description: "retry rearm", TimeoutSeconds: 1}
+	s.PublishTask(task)
+	s.ClaimTask("agent-1", task.ID)
+	setTaskTiming(t, s, task.ID, time.Time{}, time.Now().Add(-5*time.Second))
+
+	inspectAll(w)
+	if alerts := watchdogAlerts(drainEvents(ch)); len(alerts) != 1 {
+		t.Fatalf("首次告警 = %+v, want 1 条", alerts)
+	}
+
+	if err := s.RetryRollback("agent-1", task.ID, "retry"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("agent-2", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetTask(task.ID)
+	if got.Status != model.TaskStatusProcessing {
+		t.Fatalf("precondition: status = %s, want processing after re-claim", got.Status)
+	}
+	setTaskTiming(t, s, task.ID, time.Time{}, got.StartedAt.Add(-5*time.Second))
+
+	inspectAll(w)
+	alerts := watchdogAlerts(drainEvents(ch))
+	if len(alerts) != 1 || alerts[0].Payload["reason_code"] != "processing_overtime" {
+		t.Fatalf("重试后告警应重新武装, alerts = %+v", alerts)
 	}
 }
 

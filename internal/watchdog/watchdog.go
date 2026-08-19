@@ -93,7 +93,7 @@ type Watchdog struct {
 	Config        *config.Config
 	EventCh       chan<- model.Event
 	Roster        roster.Roster
-	MailRegistry  *mailbox.Registry // 2026-04-25 P1：超时/级联取消时向 task.EventSource 汇报
+	MailRegistry  *mailbox.Registry // 超时告警 / 级联取消时向 task.ReplyToAgentID（或 legacy EventSource）汇报
 	RouteResolver RouteResolver
 	// WorkspaceManager 是 workspace 控制面（nil-safe）：注入后每个巡检周期
 	// 顺带清扫孤儿 workspace（任务不存在或已达终态的任务目录）。
@@ -110,7 +110,14 @@ type Watchdog struct {
 
 	pendingMu           sync.Mutex
 	pendingObservations map[string]pendingObservation
-	now                 func() time.Time
+
+	// overtimeWarned 记录已发超时告警的 processing 任务（taskID → 该次执行
+	// 租约的 StartedAt）：同一租约只告警一次；任务重试换得新 StartedAt 后
+	// 自动重新武装。纯进程内状态，每次巡检按当前 processing 集合 prune。
+	overtimeMu     sync.Mutex
+	overtimeWarned map[string]time.Time
+
+	now func() time.Time
 }
 
 // New 构造 Watchdog。mbReg 为 nil 时 sendCrashReport 会静默跳过——保持向后兼容
@@ -161,7 +168,7 @@ func (w *Watchdog) inspect() {
 	for _, task := range tasks {
 		w.checkTask(task)
 	}
-	w.prunePendingObservations(tasks)
+	w.pruneObservations(tasks)
 
 	// 花名册兜底清理：清除不属于任何活跃代理的残留声明
 	w.cleanupStaleClaims(tasks)
@@ -187,19 +194,20 @@ func (w *Watchdog) checkTask(task *model.Task) {
 }
 
 func (w *Watchdog) checkProcessingTask(task *model.Task) {
-	// 超时检测：processing 时间 > timeout * 1.1
+	// 超时告警（2026-08-19 起只告警、不杀死）：processing 超过预期时长
+	// （task.TimeoutSeconds，默认 1 小时）时发结构化告警 + 日志 + 汇报邮件，
+	// 任务继续运行。watchdog 不再直接终止任何任务——LLM 调用层的卡死由
+	// llm 层自身的超时兜底；watchdog 退化为哨兵：观测运行时长、对异常分支
+	// 发警告，是否干预交给人或上级 Agent。
 	if task.TimeoutSeconds > 0 && !task.StartedAt.IsZero() {
-		threshold := time.Duration(float64(task.TimeoutSeconds)*1.1) * time.Second
+		threshold := time.Duration(task.TimeoutSeconds) * time.Second
 		elapsed := time.Since(task.StartedAt)
-		if elapsed > threshold {
-			log.Printf("[watchdog] task %s timeout detected (elapsed: %v, threshold: %v)", task.ID, elapsed, threshold)
-			reason := fmt.Sprintf("任务超时：已运行 %v，阈值 %v", elapsed.Round(time.Second), threshold)
-			if err := w.Store.FailTaskBySystem(task.ID, reason); err != nil {
-				log.Printf("[watchdog] FailTaskBySystem task %s failed: %v", task.ID, err)
-			}
-			w.sendAlert(task.ID)
-			w.sendCrashReport(task, reason, elapsed)
-			return
+		if elapsed > threshold && w.markProcessingOvertime(task.ID, task.StartedAt) {
+			log.Printf("[watchdog] task %s 运行超时告警 (elapsed: %v, 预期: %v)", task.ID, elapsed.Round(time.Second), threshold)
+			reason := fmt.Sprintf("processing_overtime: 任务已运行 %v，超过预期时长 %v；watchdog 不干预，请人工或上级代理检查",
+				elapsed.Round(time.Second), threshold)
+			w.sendStructuredAlert(task.ID, "processing_overtime", reason)
+			w.sendOvertimeWarning(task, reason, elapsed, threshold)
 		}
 	}
 
@@ -284,7 +292,7 @@ func (w *Watchdog) checkPendingTask(task *model.Task) {
 			if err := w.blockPendingTask(task.ID, reason); err != nil {
 				log.Printf("[watchdog] block downstream task %s after dependency %s blocked failed: %v", task.ID, depID, err)
 			} else {
-				w.sendPendingAlert(task.ID, "dependency_blocked", reason)
+				w.sendStructuredAlert(task.ID, "dependency_blocked", reason)
 				log.Printf("[watchdog] task %s blocked because dependency %s is blocked", task.ID, depID)
 			}
 			w.clearPendingObservation(task.ID)
@@ -352,7 +360,7 @@ func (w *Watchdog) checkUnroutableTask(task *model.Task) {
 		task.EventType, elapsed.Round(time.Second))
 	if !observation.alerted {
 		w.markPendingAlerted(task.ID, pendingObservationUnroutable, observation.since)
-		w.sendPendingAlert(task.ID, "no_compatible_route", reason)
+		w.sendStructuredAlert(task.ID, "no_compatible_route", reason)
 	}
 
 	if err := w.blockPendingTask(task.ID, reason); err != nil {
@@ -407,7 +415,7 @@ func (w *Watchdog) checkRoutableQueueWait(task *model.Task) {
 		"claim_starvation: compatible route exists for event_type=%q but current pending lease has waited %v; task remains pending",
 		task.EventType, elapsed.Round(time.Second))
 	w.markPendingAlerted(task.ID, pendingObservationRoutable, observation.since)
-	w.sendPendingAlert(task.ID, "claim_starvation", reason)
+	w.sendStructuredAlert(task.ID, "claim_starvation", reason)
 	log.Printf("[watchdog] task %s pending with runnable route: %s", task.ID, reason)
 }
 
@@ -442,11 +450,33 @@ func (w *Watchdog) clearPendingObservation(taskID string) {
 	w.pendingMu.Unlock()
 }
 
-func (w *Watchdog) prunePendingObservations(tasks []*model.Task) {
+// markProcessingOvertime 记录并报告该 (taskID, StartedAt) 执行租约是否首次
+// 触发超时告警：首次返回 true（调用方据此发告警），同租约重复巡检返回 false。
+func (w *Watchdog) markProcessingOvertime(taskID string, startedAt time.Time) bool {
+	w.overtimeMu.Lock()
+	defer w.overtimeMu.Unlock()
+	if w.overtimeWarned == nil {
+		w.overtimeWarned = make(map[string]time.Time)
+	}
+	if prev, ok := w.overtimeWarned[taskID]; ok && prev.Equal(startedAt) {
+		return false
+	}
+	w.overtimeWarned[taskID] = startedAt
+	return true
+}
+
+func (w *Watchdog) pruneObservations(tasks []*model.Task) {
 	pending := make(map[string]struct{}, len(tasks))
+	processing := make(map[string]time.Time)
 	for _, task := range tasks {
-		if task != nil && task.Status == model.TaskStatusPending {
+		if task == nil {
+			continue
+		}
+		if task.Status == model.TaskStatusPending {
 			pending[task.ID] = struct{}{}
+		}
+		if task.Status == model.TaskStatusProcessing {
+			processing[task.ID] = task.StartedAt
 		}
 	}
 	w.pendingMu.Lock()
@@ -456,6 +486,15 @@ func (w *Watchdog) prunePendingObservations(tasks []*model.Task) {
 		}
 	}
 	w.pendingMu.Unlock()
+	// 超时告警标记随任务离开 processing（终态/淘汰）或换租约（StartedAt
+	// 变化）而失效——后者正是重试后告警重新武装的通道。
+	w.overtimeMu.Lock()
+	for taskID, startedAt := range w.overtimeWarned {
+		if cur, ok := processing[taskID]; !ok || !cur.Equal(startedAt) {
+			delete(w.overtimeWarned, taskID)
+		}
+	}
+	w.overtimeMu.Unlock()
 }
 
 func (w *Watchdog) currentTime() time.Time {
@@ -508,7 +547,7 @@ func (w *Watchdog) sendAlert(taskID string) {
 	}
 }
 
-func (w *Watchdog) sendPendingAlert(taskID, reasonCode, reason string) {
+func (w *Watchdog) sendStructuredAlert(taskID, reasonCode, reason string) {
 	select {
 	case w.EventCh <- model.Event{
 		Type:   model.EventWatchdogAlert,
@@ -522,26 +561,53 @@ func (w *Watchdog) sendPendingAlert(taskID, reasonCode, reason string) {
 	}
 }
 
-// sendCrashReport 在 watchdog 外部杀掉任务时，向显式 ReplyToAgentID（或仍可
-// 路由的 legacy EventSource）发一封结构化崩溃汇报邮件，补齐上级侧
-// "为什么死"的上下文。
+// sendCrashReport 在 watchdog 外部终止任务时（级联取消），向显式
+// ReplyToAgentID（或仍可路由的 legacy EventSource）发一封结构化崩溃汇报
+// 邮件，补齐上级侧 "为什么死"的上下文。
 //
 // 与 agent.sendCrashReport 对称——agent 负责"自己死了告诉上级"，watchdog 负责
 // "外部判定你死了告诉上级"。两者并存，从两个视角覆盖任务终态的可观测性。
+func (w *Watchdog) sendCrashReport(task *model.Task, reason string, elapsed time.Duration) {
+	if task == nil {
+		return
+	}
+	summary := fmt.Sprintf("watchdog 判定任务 %s 死亡：%s", shortID(task.ID), truncate(reason, 60))
+	headline := fmt.Sprintf("Watchdog 外部终止了任务 %s。", task.ID)
+	judgment := fmt.Sprintf("Watchdog 判定: %s", reason)
+	w.mailTaskReport(task, summary, headline, judgment, elapsed)
+}
+
+// sendOvertimeWarning 在任务超过预期时长仍运行时发超时告警邮件——与
+// sendCrashReport 的关键区别：任务没有被终止，仍在运行（2026-08-19 起
+// watchdog 不再杀死超时任务）。上级 Agent 或人可据此检查该分支是否异常。
+func (w *Watchdog) sendOvertimeWarning(task *model.Task, reason string, elapsed, threshold time.Duration) {
+	if task == nil {
+		return
+	}
+	summary := fmt.Sprintf("watchdog 超时告警：任务 %s 已运行 %v（预期 %v），未终止",
+		shortID(task.ID), elapsed.Round(time.Second), threshold)
+	headline := fmt.Sprintf("任务 %s 运行超过预期时长（%v > %v），watchdog 未终止它，任务仍在运行。",
+		task.ID, elapsed.Round(time.Second), threshold)
+	judgment := fmt.Sprintf("Watchdog 告警: %s", reason)
+	w.mailTaskReport(task, summary, headline, judgment, elapsed)
+}
+
+// mailTaskReport 是 sendCrashReport / sendOvertimeWarning 的共用装配：
+// 解析收件人 → 重读任务最新状态 → 拼装正文 → 发送。
 //
 // 静默跳过的情形：
 //   - MailRegistry 未注入（测试场景 / 配置关闭）
 //   - task 为 nil（防御）
 //   - ReplyToAgentID 与 legacy EventSource 都无法解析为当前可路由邮箱
-func (w *Watchdog) sendCrashReport(task *model.Task, reason string, elapsed time.Duration) {
+func (w *Watchdog) mailTaskReport(task *model.Task, summary, headline, judgment string, elapsed time.Duration) {
 	if w.MailRegistry == nil || task == nil {
 		return
 	}
 
 	taskID := task.ID
 
-	// 重读一次拿最新的 Agents / Artifacts（刚刚的 FailTaskBySystem / TransitionState
-	// 可能更新了状态字段；Artifacts 则可能是 worker 临死前写下的）。
+	// 重读一次拿最新的 Agents / Artifacts（刚刚的状态迁移可能更新了状态字段；
+	// Artifacts 则可能是 worker 最近写下的）。
 	if fresh, err := w.Store.GetTask(taskID); err == nil && fresh != nil {
 		task = fresh
 	}
@@ -556,11 +622,8 @@ func (w *Watchdog) sendCrashReport(task *model.Task, reason string, elapsed time
 		desc = string([]rune(desc)[:100]) + "..."
 	}
 
-	short := shortID(taskID)
-	summary := fmt.Sprintf("watchdog 判定任务 %s 死亡：%s", short, truncate(reason, 60))
-
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "Watchdog 外部杀掉了任务 %s。\n", taskID)
+	fmt.Fprintf(&sb, "%s\n", headline)
 	fmt.Fprintf(&sb, "任务描述: %s\n", desc)
 
 	if len(task.Agents) > 0 {
@@ -569,11 +632,11 @@ func (w *Watchdog) sendCrashReport(task *model.Task, reason string, elapsed time
 		sb.WriteString("执行代理: <无，任务从未被认领>\n")
 	}
 
-	fmt.Fprintf(&sb, "Watchdog 判定: %s\n", reason)
+	fmt.Fprintf(&sb, "%s\n", judgment)
 	fmt.Fprintf(&sb, "elapsed: %v\n", elapsed.Round(time.Second))
 
-	// 最近 3 条工具调用（"死前最后动作"）。用 StoreHookView.GetToolCallHistory
-	// 弱耦合获取——MemoryTaskStore 已实现该接口（store/hookview.go:71 编译期断言）。
+	// 最近 3 条工具调用。用 StoreHookView.GetToolCallHistory 弱耦合获取——
+	// MemoryTaskStore 已实现该接口（store/hookview.go:71 编译期断言）。
 	// 未实现的 Store 降级为不输出这段 body。
 	if v, ok := w.Store.(store.StoreHookView); ok {
 		if history := v.GetToolCallHistory(taskID); len(history) > 0 {
@@ -581,7 +644,7 @@ func (w *Watchdog) sendCrashReport(task *model.Task, reason string, elapsed time
 			if start < 0 {
 				start = 0
 			}
-			sb.WriteString("\n死前最近工具调用:\n")
+			sb.WriteString("\n最近工具调用:\n")
 			for _, rec := range history[start:] {
 				fmt.Fprintf(&sb, "  %s %s (agent=%s success=%v)\n",
 					rec.Timestamp.Format("15:04:05"), rec.ToolName, rec.AgentID, rec.Success)
@@ -594,7 +657,6 @@ func (w *Watchdog) sendCrashReport(task *model.Task, reason string, elapsed time
 		for _, p := range task.Artifacts {
 			fmt.Fprintf(&sb, "  - %s\n", p)
 		}
-		sb.WriteString("（代理并非完全没干活——可考虑接收漂移产物或据此调整下一次发布。）\n")
 	} else {
 		sb.WriteString("\n已落盘文件: 无\n")
 	}
@@ -609,9 +671,9 @@ func (w *Watchdog) sendCrashReport(task *model.Task, reason string, elapsed time
 		SentAt:   time.Now(),
 	}
 	if err := w.MailRegistry.Send(msg); err != nil {
-		log.Printf("[watchdog] 发送崩溃汇报给 %s 失败: %v", recipient, err)
+		log.Printf("[watchdog] 发送任务报告邮件给 %s 失败: %v", recipient, err)
 	} else {
-		log.Printf("[watchdog] 已向 %s 汇报任务 %s 死亡 (%s)", recipient, short, truncate(reason, 40))
+		log.Printf("[watchdog] 已向 %s 发送任务 %s 报告 (%s)", recipient, shortID(taskID), truncate(summary, 40))
 	}
 }
 

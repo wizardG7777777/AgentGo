@@ -6,6 +6,8 @@
 
 2026-08-19 Graph artifact Evidence 异步登记竞态已修复：`write_file` / `edit_file` 现在返回前同步、幂等地写入路径与 sha256/bytes，artifact log 追加或 fsync 失败会 fail-closed 且保持可重试状态，不再接受 group-commit 的掉电窗口；`submit_task_result` 与自然完成的磁盘恢复项也会在终态前补登 ledger。异步 record-artifact Reactor 仅保留为兼容观察器。回归见 `internal/tools/local_write_test.go`、`internal/tools/submit_result_test.go`、`internal/agent/agent_test.go`、`internal/store/persistence_test.go`、`internal/store/persistence_groupcommit_test.go` 与 `internal/runner/submit_result_runner_test.go`。
 
+2026-08-19 Flask SWE 评测（8 题批量）暴露的 watchdog 超时误杀已修复：`default_timeout_sec=300` 默认使每个节点任务 330s 即被 watchdog 杀死，4/8 题中招——两道验收节点在修复已全绿后被杀（图内误判 runtime failed）、两道实现节点在接近完成时被杀。watchdog 不再终止任何任务或进程：超时（预期时长 `default_timeout_sec`，默认改为 3600 秒）只发一次性结构化告警（`watchdog_alert` / `processing_overtime`）+ 日志 + 汇报邮件，任务继续运行；级联取消等依赖终态传播保持不变。回归见 `internal/watchdog/watchdog_test.go`（`TestWatchdog_OvertimeWarnsOnceWithoutKilling` / `TestWatchdog_OvertimeWarningRearmsOnRetry`）与 `internal/watchdog/crash_report_test.go`。
+
 ## 运行与安全
 
 ### LLM 凭证不会在启动期完全验证
