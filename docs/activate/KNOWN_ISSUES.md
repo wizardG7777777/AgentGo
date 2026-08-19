@@ -8,6 +8,8 @@
 
 2026-08-19 Flask SWE 评测（8 题批量）暴露的 watchdog 超时误杀已修复：`default_timeout_sec=300` 默认使每个节点任务 330s 即被 watchdog 杀死，4/8 题中招——两道验收节点在修复已全绿后被杀（图内误判 runtime failed）、两道实现节点在接近完成时被杀。watchdog 不再终止任何任务或进程：超时（预期时长 `default_timeout_sec`，默认改为 3600 秒）只发一次性结构化告警（`watchdog_alert` / `processing_overtime`）+ 日志 + 汇报邮件，任务继续运行；级联取消等依赖终态传播保持不变。回归见 `internal/watchdog/watchdog_test.go`（`TestWatchdog_OvertimeWarnsOnceWithoutKilling` / `TestWatchdog_OvertimeWarningRearmsOnRetry`）与 `internal/watchdog/crash_report_test.go`。
 
+2026-08-19 同批复测暴露的四项编排缺陷已修复：(1) Graph controller 节点租约越权——scheduler 把执行节点声明为 controller 后被路由回自己，经合成授予拿到完整注册工具面并亲自修改业务代码，架空验收链；现 controller 的 `BusinessTools` 恒为空集（新算与快照复用双路校验），图校验期拒绝 controller 声明 `capability.tools`。(2) Scheduler 直答逃逸——scheduler 不建图、不发任务、空答复直接收口（5 轮调查后零交付）。现分两层：空响应（无文本且无工具调用）一律视为异常轮次，注入提醒继续，连续 3 次按可恢复错误收口重试；新增 `scheduler-closure-review` Gate 在 report_done preCall 审查收口——零图/零 delegated 任务/零 pending 交互时，空 summary 直接拒绝，非空直答须二次确认后放行并记 `scheduler_direct_answer` 日志。(3) 占位图防线——实测 title="t"/description="d" 的占位图通过校验并被真实派发；现 controller/agent/acceptance 节点的 title/description 为单个 ASCII 字母/数字时校验拒绝（单字中文不受影响，阈值刻意保守只拦占位符）。回归见 `internal/agent/empty_response_test.go`、`internal/hook/builtin/scheduler_closure_test.go`、`internal/graph/validate_test.go`（`TestRejectPlaceholderNodeText` / `TestRejectControllerCapabilityTools`）与 `internal/agent/execution_lease_test.go`。
+
 ## 运行与安全
 
 ### LLM 凭证不会在启动期完全验证

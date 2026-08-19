@@ -453,8 +453,8 @@ func TestAcceptanceReadyInputsDurableBeforePublish(t *testing.T) {
 	mustSubmitRuntime(t, rt1, `{
 	  "schema":"agentgo.graph/v1","graph_id":"g-acc-ready-crash","revision":1,"state_version":0,
 	  "root":"a","status":"pending","nodes":{
-	    "a":{"kind":"agent","task":{"title":"A"},"status":"inactive","next":[{"to":"b"},{"to":"verify","target_input":"a"}]},
-	    "b":{"kind":"agent","task":{"title":"B"},"status":"inactive","next":[{"to":"verify","target_input":"b"}]},
+	    "a":{"kind":"agent","task":{"title":"节点A"},"status":"inactive","next":[{"to":"b"},{"to":"verify","target_input":"a"}]},
+	    "b":{"kind":"agent","task":{"title":"节点B"},"status":"inactive","next":[{"to":"verify","target_input":"b"}]},
 	    "verify":{"kind":"acceptance","task":{"title":"验收","description":"A/B 都必须完成","required_inputs":["a","b"]},"status":"inactive","next":[{"to":"done","when":{"path":"$.verdict","operator":"eq","value":"pass"}}]},
 	    "done":{"kind":"end","task":{"title":"收官"},"status":"inactive","next":[]}
 	  }

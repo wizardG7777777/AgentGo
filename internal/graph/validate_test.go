@@ -171,9 +171,9 @@ func TestBackEdgeAccepted(t *testing.T) {
       "root": "a",
       "status": "pending",
       "nodes": {
-        "a": { "kind": "agent", "task": { "title": "A" }, "status": "inactive",
+        "a": { "kind": "agent", "task": { "title": "节点A" }, "status": "inactive",
                "next": [{ "to": "b" }] },
-        "b": { "kind": "agent", "task": { "title": "B" }, "status": "inactive",
+        "b": { "kind": "agent", "task": { "title": "节点B" }, "status": "inactive",
                "next": [
                  { "to": "a", "activation": "new", "when": { "event": "fixable" } },
                  { "to": "c", "when": { "event": "pass" } }
@@ -449,7 +449,7 @@ func TestRejectRootAndReferences(t *testing.T) {
           "schema": "agentgo.graph/v1", "graph_id": "g1", "revision": 0, "state_version": 0,
           "root": "a", "status": "pending",
           "nodes": {
-            "a": { "kind": "agent", "task": { "title": "A" }, "status": "inactive", "next": [{ "to": "b" }] },
+            "a": { "kind": "agent", "task": { "title": "节点A" }, "status": "inactive", "next": [{ "to": "b" }] },
             "b": { "kind": "end", "status": "inactive", "next": [] },
             "c": { "kind": "end", "status": "inactive", "next": [] }
           }
@@ -602,4 +602,56 @@ func TestRejectSchedulerOwnedRuntimeFields(t *testing.T) {
 			`"status": "inactive", "execution": {"phase":"done","activation_id":"a@9"},`, 1)
 		assertInvalid(t, "execution", doc, "字段所有权", "execution")
 	})
+}
+
+// TestRejectPlaceholderNodeText 占位符防线（2026-08-19 SWE 占位图事故：
+// title="t"/description="d" 的图通过校验并被真实派发执行）：
+// controller/agent/acceptance 节点的 title/description 不得为单个 ASCII
+// 字母/数字；单字中文（「源」）与正常文本不受影响。
+func TestRejectPlaceholderNodeText(t *testing.T) {
+	mkGraph := func(kind, title, desc string) string {
+		task := `"task":{"title":"` + title + `"}`
+		if desc != "" {
+			task = `"task":{"title":"` + title + `","description":"` + desc + `"}`
+		}
+		return `{"schema":"agentgo.graph/v1","graph_id":"g-ph","revision":0,"state_version":0,
+          "root":"a","status":"pending",
+          "nodes":{"a":{"kind":"` + kind + `",` + task + `,"status":"inactive","next":[{"to":"z"}]},
+                   "z":{"kind":"end","task":{"title":"收官"},"status":"inactive","next":[]}}}`
+	}
+	t.Run("title单ASCII占位符", func(t *testing.T) {
+		assertInvalid(t, "title 占位符", mkGraph("agent", "t", ""), "节点", "疑似占位符")
+	})
+	t.Run("description单ASCII占位符", func(t *testing.T) {
+		assertInvalid(t, "description 占位符", mkGraph("agent", "实现登录", "d"), "节点", "疑似占位符")
+	})
+	t.Run("controller的title占位符", func(t *testing.T) {
+		assertInvalid(t, "controller title 占位符", mkGraph("controller", "x", ""), "节点", "疑似占位符")
+	})
+	t.Run("单字中文title合法", func(t *testing.T) {
+		mustParse(t, mkGraph("agent", "源", ""))
+	})
+	t.Run("正常title与desc合法", func(t *testing.T) {
+		mustParse(t, mkGraph("agent", "修复 IPv6 解析", "在 app.py 中拆分 host 与 port"))
+	})
+	t.Run("end节点title不受影响", func(t *testing.T) {
+		mustParse(t, `{"schema":"agentgo.graph/v1","graph_id":"g-ph-end","revision":0,"state_version":0,
+          "root":"a","status":"pending",
+          "nodes":{"a":{"kind":"agent","task":{"title":"做事"},"status":"inactive","next":[{"to":"z"}]},
+                   "z":{"kind":"end","task":{"title":"z"},"status":"inactive","next":[]}}}`)
+	})
+}
+
+// TestRejectControllerCapabilityTools controller 是纯控制面，不得声明
+// capability.tools（租约层强制置空，图提交期 fail-closed）。
+func TestRejectControllerCapabilityTools(t *testing.T) {
+	doc := `{"schema":"agentgo.graph/v1","graph_id":"g-ctl-cap","revision":0,"state_version":0,
+      "root":"c","status":"pending",
+      "nodes":{"c":{"kind":"controller","task":{"title":"汇总裁决"},"status":"inactive",
+        "capability":{"tools":["read_file"]},"next":[{"to":"z"}]},
+        "z":{"kind":"end","task":{"title":"收官"},"status":"inactive","next":[]}}}`
+	assertInvalid(t, "controller capability.tools", doc, "能力", "不得声明 capability.tools")
+	// agent 节点声明 capability.tools 不受影响
+	agentDoc := strings.Replace(doc, `"kind":"controller"`, `"kind":"agent"`, 1)
+	mustParse(t, agentDoc)
 }

@@ -582,6 +582,17 @@ func validateNodeSemantics(doc *GraphDocument) error {
 			if strings.TrimSpace(node.Task.Title) == "" {
 				return newErr("节点", path+".task.title", "节点 %q 的 task.title 不能为空", id)
 			}
+			// 占位符防线（2026-08-19 SWE 实测：title="t"/description="d" 的
+			// 占位图通过校验并被真实派发执行，explorer 收到乱码任务）。只拦
+			// 「单个 ASCII 字母/数字」这种铁定无信息的占位符——单字中文
+			// （如「源」「迁」）与一切正常标题不受影响；阈值宁可漏过也不
+			// 误伤，避免防御机制本身成为新的错误源。
+			if requiresTask && isPlaceholderToken(node.Task.Title) {
+				return newErr("节点", path+".task.title", "节点 %q（%s）的 task.title=%q 疑似占位符，请填写有意义的任务标题", id, node.Kind, node.Task.Title)
+			}
+			if requiresTask && node.Task.Description != "" && isPlaceholderToken(node.Task.Description) {
+				return newErr("节点", path+".task.description", "节点 %q（%s）的 task.description=%q 疑似占位符，请写明该节点要做什么", id, node.Kind, node.Task.Description)
+			}
 			if node.Kind == KindAcceptance && strings.TrimSpace(node.Task.Description) == "" {
 				return newErr("节点", path+".task.description", "acceptance 节点 %q 的 task.description 必须写明可执行的验收判据", id)
 			}
@@ -623,6 +634,17 @@ func validateNodeSemantics(doc *GraphDocument) error {
 		}
 	}
 	return nil
+}
+
+// isPlaceholderToken 报告 s 去空白后是否为单个 ASCII 字母/数字（占位符特征）。
+// 只匹配 ASCII——单字中文（「源」「迁」）携带真实语义，不误伤。
+func isPlaceholderToken(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) != 1 {
+		return false
+	}
+	c := s[0]
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
 // validateNodesKindSpecs 实现阶段 8.5：类型专属规格校验。
@@ -699,6 +721,12 @@ func validateCapabilityShape(doc *GraphDocument) error {
 				if strings.TrimSpace(tool) == "" {
 					return newErr("能力", fmt.Sprintf("%s.capability.tools[%d]", path, i), "capability.tools 不得含空字符串")
 				}
+			}
+			// controller 是纯控制面（读上游结果、裁决、路由），不持有业务
+			// 工具——声明了也无法兑现（租约层强制置空），图提交期 fail-closed
+			//（2026-08-19 SWE 实测：scheduler 借 controller 节点自修业务代码）。
+			if node.Kind == KindController && len(cap.Tools) > 0 {
+				return newErr("能力", path+".capability.tools", "controller 节点 %q 不得声明 capability.tools（纯控制面无业务工具），实际为 %v", id, cap.Tools)
 			}
 		}
 		if ex := node.Executor; ex != nil {

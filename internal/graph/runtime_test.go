@@ -254,9 +254,9 @@ func TestRuntimeGraphFailureDurablyCancelsLiveSiblingNodes(t *testing.T) {
   "root":"root","status":"pending","nodes":{
     "root":{"kind":"agent","task":{"title":"root"},"status":"inactive","executor":null,"execution":null,
       "next":[{"to":"a"},{"to":"b"}]},
-    "a":{"kind":"agent","task":{"title":"a"},"status":"inactive","executor":null,"execution":null,
+    "a":{"kind":"agent","task":{"title":"节点a"},"status":"inactive","executor":null,"execution":null,
 	  "next":[{"to":"done_a","when":{"event":"completed"}}]},
-    "b":{"kind":"agent","task":{"title":"b"},"status":"inactive","executor":null,"execution":null,
+    "b":{"kind":"agent","task":{"title":"节点b"},"status":"inactive","executor":null,"execution":null,
 	  "next":[{"to":"done_b","when":{"event":"completed"}}]},
     "done_a":{"kind":"end","task":{"title":"done a"},"status":"inactive","executor":null,"execution":null,"next":[]},
     "done_b":{"kind":"end","task":{"title":"done b"},"status":"inactive","executor":null,"execution":null,"next":[]}
@@ -842,8 +842,8 @@ func TestTerminalSettlementRejectsNonJSONAndOversizedResults(t *testing.T) {
 		  "schema":"agentgo.graph/v1","graph_id":"g-join-oversized","revision":1,"state_version":0,
 		  "root":"root","status":"pending","nodes":{
 		    "root":{"kind":"agent","task":{"title":"拆分"},"status":"inactive","next":[{"to":"a"},{"to":"b"}]},
-		    "a":{"kind":"agent","task":{"title":"A"},"status":"inactive","next":[{"to":"join","target_input":"a"}]},
-		    "b":{"kind":"agent","task":{"title":"B"},"status":"inactive","next":[{"to":"join","target_input":"b"}]},
+		    "a":{"kind":"agent","task":{"title":"节点A"},"status":"inactive","next":[{"to":"join","target_input":"a"}]},
+		    "b":{"kind":"agent","task":{"title":"节点B"},"status":"inactive","next":[{"to":"join","target_input":"b"}]},
 		    "join":{"kind":"join","task":{"title":"汇合","required_inputs":["a","b"]},"status":"inactive","next":[{"to":"done"}]},
 		    "done":{"kind":"end","task":{"title":"收官"},"status":"inactive","next":[]}
 		  }
@@ -1167,8 +1167,8 @@ const patchJoinGraphJSON = `{
   "root":"root","status":"pending","nodes":{
     "root":{"kind":"router","task":{"title":"fanout"},"status":"inactive","executor":null,"execution":null,
       "next":[{"to":"a"},{"to":"b"}]},
-    "a":{"kind":"agent","task":{"title":"a"},"status":"inactive","executor":null,"execution":null,"next":[{"to":"join","target_input":"a"}]},
-    "b":{"kind":"agent","task":{"title":"b"},"status":"inactive","executor":null,"execution":null,
+    "a":{"kind":"agent","task":{"title":"节点a"},"status":"inactive","executor":null,"execution":null,"next":[{"to":"join","target_input":"a"}]},
+    "b":{"kind":"agent","task":{"title":"节点b"},"status":"inactive","executor":null,"execution":null,
       "next":[{"to":"join","target_input":"b","when":{"event":"completed"}},{"to":"other","when":{"event":"failed"}}]},
     "join":{"kind":"join","task":{"title":"join","required_inputs":["a","b"]},"status":"inactive","executor":null,"execution":null,"next":[{"to":"finish"}]},
     "other":{"kind":"end","task":{"title":"other"},"status":"inactive","executor":null,"execution":null,"next":[]},

@@ -1319,7 +1319,7 @@ func TestValidateKindSpecs(t *testing.T) {
 		return `{"schema":"agentgo.graph/v1","graph_id":"g-v","revision":1,"state_version":0,"root":"n","status":"pending","nodes":{` +
 			`"n":{` + rootNode + `},"finish":{"kind":"end","task":{"title":"尾"},"status":"inactive","executor":null,"execution":null,"next":[]}}}`
 	}
-	base := `"kind":"%s","task":{"title":"t"},"status":"inactive","executor":null,"execution":null,%s"next":[{"to":"finish"}]`
+	base := `"kind":"%s","task":{"title":"任务t"},"status":"inactive","executor":null,"execution":null,%s"next":[{"to":"finish"}]`
 
 	cases := []struct {
 		name string
@@ -1340,7 +1340,7 @@ func TestValidateKindSpecs(t *testing.T) {
 			[]string{"内联子图非法", "root 指向不存在的节点"}},
 		{"subgraph 内联不可达", fmt.Sprintf(base, "subgraph",
 			`"subgraph":{"root":"v","nodes":{
-			  "v":{"kind":"agent","task":{"title":"v"},"status":"inactive","executor":null,"execution":null,"next":[{"to":"e"}]},
+			  "v":{"kind":"agent","task":{"title":"任务v"},"status":"inactive","executor":null,"execution":null,"next":[{"to":"e"}]},
 			  "e":{"kind":"end","task":{"title":"e"},"status":"inactive","executor":null,"execution":null,"next":[]},
 			  "orphan":{"kind":"end","task":{"title":"o"},"status":"inactive","executor":null,"execution":null,"next":[]}}},`),
 			[]string{"内联子图非法", "无法从 root"}},
@@ -1354,12 +1354,12 @@ func TestValidateKindSpecs(t *testing.T) {
 
 	// 合法形状通过：wait_event/tool/subgraph 各一。
 	okDoc := `{"schema":"agentgo.graph/v1","graph_id":"g-ok","revision":1,"state_version":0,"root":"r","status":"pending","nodes":{
-	  "r":{"kind":"agent","task":{"title":"t"},"status":"inactive","executor":null,"execution":null,"next":[{"to":"w"},{"to":"t"},{"to":"s"}]},
-	  "w":{"kind":"wait_event","task":{"title":"t"},"status":"inactive","executor":null,"execution":null,"wait":{"event":"e","timeout_sec":30},"next":[{"to":"fw"}]},
-	  "t":{"kind":"tool","task":{"title":"t"},"status":"inactive","executor":null,"execution":null,"tool":{"name":"read_file","args":{"p":1}},"next":[{"to":"ft"}]},
-	  "s":{"kind":"subgraph","task":{"title":"t"},"status":"inactive","executor":null,"execution":null,
+	  "r":{"kind":"agent","task":{"title":"任务t"},"status":"inactive","executor":null,"execution":null,"next":[{"to":"w"},{"to":"t"},{"to":"s"}]},
+	  "w":{"kind":"wait_event","task":{"title":"任务t"},"status":"inactive","executor":null,"execution":null,"wait":{"event":"e","timeout_sec":30},"next":[{"to":"fw"}]},
+	  "t":{"kind":"tool","task":{"title":"任务t"},"status":"inactive","executor":null,"execution":null,"tool":{"name":"read_file","args":{"p":1}},"next":[{"to":"ft"}]},
+	  "s":{"kind":"subgraph","task":{"title":"任务t"},"status":"inactive","executor":null,"execution":null,
 	    "subgraph":{"root":"v","nodes":{
-	      "v":{"kind":"agent","task":{"title":"v"},"status":"inactive","executor":null,"execution":null,"next":[{"to":"e"}]},
+	      "v":{"kind":"agent","task":{"title":"任务v"},"status":"inactive","executor":null,"execution":null,"next":[{"to":"e"}]},
 	      "e":{"kind":"end","task":{"title":"e"},"status":"inactive","executor":null,"execution":null,"next":[]}}},
 	    "next":[{"to":"fs"}]},
 	  "fw":{"kind":"end","task":{"title":"fw"},"status":"inactive","executor":null,"execution":null,"next":[]},
@@ -1415,7 +1415,7 @@ func TestValidateSubgraphDepth(t *testing.T) {
 func TestValidateGraphIDSegments(t *testing.T) {
 	doc := func(id string) string {
 		return `{"schema":"agentgo.graph/v1","graph_id":"` + id + `","revision":1,"state_version":0,"root":"a","status":"pending","nodes":{` +
-			`"a":{"kind":"end","task":{"title":"t"},"status":"inactive","executor":null,"execution":null,"next":[]}}}`
+			`"a":{"kind":"end","task":{"title":"任务t"},"status":"inactive","executor":null,"execution":null,"next":[]}}}`
 	}
 	for _, id := range []string{"g1", "g-sub/check@1", "a/b/c/d", "g.1/s_2@v2"} {
 		if _, err := ParseAndValidate([]byte(doc(id))); err != nil {
@@ -1438,7 +1438,7 @@ const kindSpecDocJSON = `{
   "nodes": {
     "w": {"kind":"wait_event","task":{"title":"w"},"status":"inactive","executor":null,"execution":null,
       "wait":{"event":"deploy.done","timeout_sec":60},"next":[{"to":"t"}]},
-    "t": {"kind":"tool","task":{"title":"t"},"status":"inactive","executor":null,"execution":null,
+    "t": {"kind":"tool","task":{"title":"任务t"},"status":"inactive","executor":null,"execution":null,
       "tool":{"name":"read_file","args":{"path":"a.go"}},"next":[{"to":"s"}]},
     "s": {"kind":"subgraph","task":{"title":"s"},"status":"inactive","executor":null,"execution":null,
       "subgraph":{"root":"v","nodes":{
