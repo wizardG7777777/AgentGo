@@ -86,7 +86,7 @@ func TestWatchdogPendingGraceDefaultsAndYAMLDecode(t *testing.T) {
 }
 
 func TestValidateRejectsEmptyToolProfile(t *testing.T) {
-	prompt := filepath.Join(t.TempDir(), "prompt.md")
+	prompt := filepath.ToSlash(filepath.Join(t.TempDir(), "prompt.md"))
 	if err := os.WriteFile(prompt, []byte("test"), 0o600); err != nil {
 		t.Fatal(err)
 	}
