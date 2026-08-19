@@ -1,0 +1,90 @@
+# AgentGo SWE 评测专用配置（v4 schema）
+#
+# 用途：以 Flask 真实仓库为对象的中等项目行为评测（SWE 式红→绿任务）。
+# 这是一个**模板**：__AGENTGO_ROOT__/__PROJECT_ROOT__/__PORT__/__TOKEN__ 四个
+# 占位符由 harness（/tmp/agentgo-swe/harness/run_task.sh）在每次运行时渲染。
+#
+# 密钥约定：api_key 引用环境变量 OPENROUTER_API_KEY，本文件不落任何明文密钥；
+# 运行前必须 export OPENROUTER_API_KEY（harness 会检查其非空，不校验格式）。
+#
+# 评测纪律：
+# - 全部 agent（explorer/worker/verifier + scheduler）统一使用
+#   deepseek/deepseek-v4-flash-0731，保证可比性。
+# - 全程禁止联网搜索：所有 profile 均不含 web_search/web_fetch；
+#   跑后审计 trace 确认零 web 调用。
+llm:
+  base_url: https://openrouter.ai/api/v1
+  api_key: ${OPENROUTER_API_KEY}
+  default_model: deepseek/deepseek-v4-flash-0731
+  timeout_sec: 300
+  stream: true
+
+tool_profiles:
+  swe_explorer:                       # 只读调查：无写、无 shell、无网络
+    - read_file
+    - list_dir
+    - grep_search
+    - glob_search
+    - send_message
+    - request_replan
+    - submit_task_result
+  swe_worker:                         # 执行：文件读写 + shell，无网络
+    - read_file
+    - list_dir
+    - grep_search
+    - glob_search
+    - write_file
+    - edit_file
+    - run_shell
+    - send_message
+    - request_replan
+    - submit_task_result
+  swe_verifier:                       # 验收：只读 + 提交判定（无 shell/网络）
+    - read_file
+    - list_dir
+    - grep_search
+    - glob_search
+    - submit_task_result
+
+agents:
+  - kind: explorer
+    replicas: 4
+    event_type: ""
+    profile: swe_explorer
+    system_prompt_file: __AGENTGO_ROOT__/prompts/swe/explorer.md
+    model: deepseek/deepseek-v4-flash-0731
+    task_max_retries: 3
+    enforce_compact_token_threshold: 60000
+    description: 只读调查代理：定位缺陷、解释行为、梳理调用关系；无写/shell/网络。
+  - kind: worker
+    replicas: 2
+    event_type: ""
+    profile: swe_worker
+    system_prompt_file: __AGENTGO_ROOT__/prompts/swe/worker.md
+    model: deepseek/deepseek-v4-flash-0731
+    task_max_retries: 3
+    enforce_compact_token_threshold: 60000
+    description: 通用执行代理：调查、修改代码、运行 pytest 验证；无网络工具。
+  - kind: verifier
+    replicas: 2
+    event_type: ""
+    profile: swe_verifier
+    system_prompt_file: __AGENTGO_ROOT__/prompts/swe/verifier.md
+    model: deepseek/deepseek-v4-flash-0731
+    task_max_retries: 3
+    enforce_compact_token_threshold: 60000
+    description: 验收代理：按节点验收标准核验上游证据与仓库状态；无 shell/网络。
+
+scheduler:
+  model: deepseek/deepseek-v4-flash-0731
+
+project_root: "__PROJECT_ROOT__"
+startup_probe: "off"
+shell_timeout_sec: 300
+
+ui:
+  frontends: [web]
+  web:
+    listen: "127.0.0.1:__PORT__"
+    token: "__TOKEN__"
+    auto_open: false
