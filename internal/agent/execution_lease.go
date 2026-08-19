@@ -166,6 +166,17 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 		lease.BusinessTools = model.SortedCopy(ceiling)
 	}
 
+	// Graph controller 是纯控制面（读上游结果、裁决、路由），不得持有任何
+	// 业务工具——无论认领方是谁、节点有无显式 capability 声明。置空切片
+	// （非 nil——nil 是「无裁剪面」语义）使 ToolUnion 只剩控制通道，避免
+	// scheduler 认领时经合成授予把其注册全集（含写工具）泄露给节点
+	// （2026-08-19 SWE 实测：scheduler 借 controller 节点自行修改业务代码，
+	// 架空验收链与节点纪律）。新图的 controller+capability.tools 声明在
+	// 图校验期 fail-closed，这里是旧快照/直接构造路径的兜底。
+	if task.GraphID != "" && task.GraphNodeKind == "controller" {
+		lease.BusinessTools = []string{}
+	}
+
 	// --- Policy ∩ ---
 	// exec=readonly：从 BusinessTools 剔除写工具与 run_shell（Gate 硬拒之外
 	// 再把它们移出 LLM 视野）；exec=strict：工具面不变，记 ApprovalRequired。
@@ -224,6 +235,12 @@ func validateLeaseForTaskRole(task *model.Task, lease *model.ExecutionLease) str
 			task.GraphNodeKind, lease.ControlTools, expectedControl)
 	}
 	if task.GraphNodeKind == "controller" || task.GraphNodeKind == "agent" {
+		// controller 是纯控制面：除控制通道外不得持有任何业务工具
+		// （新算路径在 computeExecutionLease 已强制置空，这里拦旧快照/篡改租约）。
+		if task.GraphNodeKind == "controller" && len(lease.BusinessTools) > 0 {
+			return fmt.Sprintf("Graph 节点角色 %q 的冻结租约不得持有业务工具，实际=%v",
+				task.GraphNodeKind, lease.BusinessTools)
+		}
 		return ""
 	}
 	for _, name := range lease.ToolUnion() {

@@ -544,6 +544,9 @@ func TestProcessTask_LeaseViewIsBusinessUnionControl(t *testing.T) {
 	}
 }
 
+// Graph controller 是纯控制面：即便节点显式声明了业务工具（旧版图可能如此），
+// 租约层也必须把它剥到只剩控制通道——LLM 视野只有 request_replan +
+// submit_task_result，scheduler 认领也不例外（2026-08-19 SWE 越权事故回归锁）。
 func TestProcessTask_GraphControllerExplicitLeaseFiltersSchedulerTools(t *testing.T) {
 	s, _, _ := setup()
 	ag, _, mock := newLeaseAgent("scheduler", "__scheduler__", s,
@@ -567,10 +570,10 @@ func TestProcessTask_GraphControllerExplicitLeaseFiltersSchedulerTools(t *testin
 	for _, def := range mock.toolDefs[0] {
 		names = append(names, def.Name)
 	}
-	if got := strings.Join(names, ","); got != "read_file,request_replan,submit_task_result" {
-		t.Fatalf("Graph controller LLM 工具面=%q，want 精确业务+Graph 控制通道", got)
+	if got := strings.Join(names, ","); got != "request_replan,submit_task_result" {
+		t.Fatalf("Graph controller LLM 工具面=%q，want 仅控制通道 [request_replan submit_task_result]", got)
 	}
-	for _, forbidden := range []string{"report_done", "submit_graph", "patch_graph"} {
+	for _, forbidden := range []string{"read_file", "report_done", "submit_graph", "patch_graph"} {
 		if slices.Contains(names, forbidden) {
 			t.Fatalf("Graph controller 显式租约不得看见 %s: %v", forbidden, names)
 		}
@@ -579,9 +582,9 @@ func TestProcessTask_GraphControllerExplicitLeaseFiltersSchedulerTools(t *testin
 	if err != nil || got.Lease == nil {
 		t.Fatalf("Graph controller 租约应持久化: task=%+v err=%v", got, err)
 	}
-	if strings.Join(got.Lease.BusinessTools, ",") != "read_file" ||
+	if len(got.Lease.BusinessTools) != 0 ||
 		strings.Join(got.Lease.ControlTools, ",") != "request_replan,submit_task_result" {
-		t.Fatalf("Graph controller 冻结租约不符: %+v", got.Lease)
+		t.Fatalf("Graph controller 冻结租约不符（业务工具必须为空）: %+v", got.Lease)
 	}
 }
 
