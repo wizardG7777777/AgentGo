@@ -454,7 +454,9 @@ func TestPreservation_SingleRoundCompletion(t *testing.T) {
 		result string
 	}{
 		{"simple result", "hello world"},
-		{"empty result", ""},
+		// 2026-08-19 起空结果（无文本且无工具调用）不再是合法完成——空响应
+		// 守卫会注入提醒并要求重答（见 empty_response_test.go），原
+		// "empty result" 用例随之退役。
 		{"long result", "this is a longer result with special chars: !@#$%^&*()"},
 		{"unicode result", "结果：成功完成任务"},
 		{"multiline result", "line1\nline2\nline3"},

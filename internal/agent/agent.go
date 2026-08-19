@@ -513,6 +513,11 @@ func (a *Agent) run(ctx context.Context, ready func()) {
 // Agent.loopFuse 未导出字段覆盖。
 const emergencyLoopFuse = 10000
 
+// maxEmptyResponseStreak 是空响应守卫的连续上限：LLM 某一轮既无文本又无
+// 工具调用即为空响应（异常轮次），注入提醒后继续；连续达到该次数仍空，
+// 按可恢复错误收口重试。阈值 3：容忍偶发的模型/provider 抖动，同时有界。
+const maxEmptyResponseStreak = 3
+
 // loopFuseLimit 返回本 Agent 生效的 fuse 值：未设置测试覆盖时恒为
 // emergencyLoopFuse。
 func (a *Agent) loopFuseLimit() int {
@@ -888,6 +893,12 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// 短路）、ctx 取消（watchdog / 用户 / 系统）、错误处理（重试回滚或终止）、
 	// 以及循环顶部 emergency fuse 对程序性死循环的兜底。循环计数 i 继续用于
 	// trace / turns / 进度观测，不再是终止条件。
+	//
+	// emptyStreak：空响应（无文本且无工具调用）的连续计数。空响应是异常
+	// 轮次而非成果（2026-08-19 SWE 实测：模型只吐 reasoning、content 为空，
+	// 若按自然完成收口，scheduler 会"什么都没做就结束"）。连续
+	// maxEmptyResponseStreak 轮仍空按可恢复错误收口（重试换上下文）。
+	emptyStreak := 0
 	for i := 0; ; i++ {
 		select {
 		case <-ctx.Done():
@@ -1144,6 +1155,37 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		// §11.7.3 TokenStats 内存计数器累计——仅作 UI 实时视图数据源。
 		// V6 起不再 emit token_stats 事件（与 llm_call_end 重复的第二账本已删除）。
 		a.AddTokenStats(int64(result.PromptTokens), int64(result.CompletionTokens))
+
+		// 空响应守卫：本轮未调用任何工具且正文为空——异常轮次，不收口。
+		// 注入提醒继续循环；连续 maxEmptyResponseStreak 轮仍空按可恢复错误
+		// 收口（重试换上下文）。任何正常轮次（有文本或有工具调用）清零计数。
+		if !result.ToolCalled && !result.Finalized && strings.TrimSpace(result.Output) == "" {
+			emptyStreak++
+			log.Printf("[agent %s] 任务 %s 第 %d 轮空响应（无文本且无工具调用），连续 %d/%d",
+				a.ID, taskID, i, emptyStreak, maxEmptyResponseStreak)
+			trace.Emit(trace.Event{
+				Kind:    trace.KindError,
+				TaskID:  taskID,
+				AgentID: a.ID,
+				Loop:    i,
+				Error:   fmt.Sprintf("empty_response：第 %d 轮空响应（连续 %d/%d）", i, emptyStreak, maxEmptyResponseStreak),
+			})
+			if emptyStreak >= maxEmptyResponseStreak {
+				terminatingCause = "react_loop_exit:empty_response"
+				a.Activity.LLMEnd(a.ID, taskID, i, "", 0, fmt.Errorf("模型连续 %d 轮空响应", emptyStreak))
+				enterTerminating(terminatingCause)
+				taskMem.checkpoint(a, taskID, i, "attempt_end")
+				a.handleFailure(task, taskID, &ErrRecoverable{
+					Err: fmt.Errorf("模型连续 %d 轮返回空响应（无文本且无工具调用）", emptyStreak),
+				}, history, manifestInfo)
+				return
+			}
+			history = append(history, HistoryEntry{
+				IncomingMail: "<system-reminder>你上一轮的回复为空（没有文本内容，也没有工具调用）。这是不允许的：请调用工具继续工作，或给出非空的最终答复。</system-reminder>",
+			})
+			continue
+		}
+		emptyStreak = 0
 
 		// 终止条件：LLM 没有调用工具（自然完成），或 Executor 返回 Finalized=true（finalization tool 信号）
 		if !result.ToolCalled || result.Finalized {
