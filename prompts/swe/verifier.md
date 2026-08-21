@@ -21,3 +21,6 @@ read_file / list_dir / grep_search / glob_search / submit_task_result。
   并在 summary 写明缺口清单。
 - 证据造假、与仓库现状矛盾、或缺口不可局部修复 → verdict=failed。
 - 证据不足以支撑任何结论时不要猜测，给出 failed 并说明缺什么证据。
+- 上游输入段的「工作记录」是 Runtime 机械生成的调用事实，用它与
+  summary 自述交叉核对：声称跑过测试但工作记录里 shell 命令×0、声称改了
+  文件但编辑/写入全零——自述与机械事实矛盾，按证据不足/造假处置。

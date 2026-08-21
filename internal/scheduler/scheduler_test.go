@@ -111,24 +111,32 @@ func TestSchedulerSystemPrompt_GraphFirstForDurableWork(t *testing.T) {
 	}
 }
 
-func TestSchedulerSystemPrompt_GraphScopedTeamLifecycle(t *testing.T) {
+func TestSchedulerSystemPrompt_StaticRoutingTemplatesShelved(t *testing.T) {
 	for _, phrase := range []string{
-		`先决定合法且全局唯一的 graph_id`,
-		`用同一个 graph_id 调 provision_agent_team`,
-		`Team 从 provision 成功起绑定 graph:<id>`,
-		`Scheduler task 即使先终态也不会回收 Team`,
-		`只有该 Graph 的 graph_ended 才会停止实例并撤销 route`,
-		`省略 graph_id 只允许 legacy publish_task`,
-		`跨 Graph、task-owned 或工具子集越界都 fail-closed`,
+		`静态路由纪律`,
+		`resources.specialized_agents / agent_capabilities 中实际列出的静态 route`,
+		`controller→__scheduler__、agent→""、acceptance→acceptance.verify`,
+		`metadata.route 显式覆盖优先`,
+		`route 在 graph:<id> owner scope 下 ready 且 capability 覆盖节点 tools`,
+		`不得提交一张注定无人认领的图`,
 		`不主动使用 subgraph`,
 	} {
 		if !strings.Contains(schedulerSystemPrompt, phrase) {
-			t.Errorf("schedulerSystemPrompt 缺少 Graph-scoped Team 契约 %q", phrase)
+			t.Errorf("schedulerSystemPrompt 缺少静态路由纪律 %q", phrase)
 		}
 	}
 
-	if strings.Contains(schedulerSystemPrompt, `按当前 controller 任务归属创建 Team`) {
-		t.Error("schedulerSystemPrompt 仍把 Graph Team 错误绑定到 origin controller task")
+	// agent_templates 动态组队机制 2026-08-20 起默认搁置（v7.6）：provision
+	// 教程必须从正文绝迹，否则 scheduler 会尝试调用未注册的工具。
+	for _, stale := range []string{
+		`provision_agent_team`,
+		`list_agent_templates`,
+		`AgentTemplate 动态组队纪律`,
+		`先检查 agent_templates 并按需 provision`,
+	} {
+		if strings.Contains(schedulerSystemPrompt, stale) {
+			t.Errorf("schedulerSystemPrompt 仍含已搁置的模板组队指引 %q", stale)
+		}
 	}
 }
 
@@ -205,10 +213,78 @@ func TestSchedulerSystemPrompt_AcceptanceUsesVerdictOnly(t *testing.T) {
 	}
 }
 
-func TestSchedulerPromptVersionSingleAssignmentVerdict(t *testing.T) {
-	const want = "embedded:v7.5-unified-graph-terminal-report"
+func TestSchedulerPromptVersionTerminalContractV2(t *testing.T) {
+	const want = "embedded:v8.2-upstream-intervention"
 	if schedulerPromptVersion != want {
 		t.Fatalf("schedulerPromptVersion = %q，期望 %q", schedulerPromptVersion, want)
+	}
+}
+
+// v8.2（2026-08-21）上游零产出介入裁决节：触发通道、升序档位与反机械重开
+// 纪律必须出现在正文中。
+func TestSchedulerSystemPrompt_V82UpstreamIntervention(t *testing.T) {
+	for _, phrase := range []string{
+		"节点介入裁决",
+		"上游零产出介入",
+		"上游返工（首选）",
+		"修正后返工",
+		"controller 亲自补位",
+		"降级 / 诚实失败",
+		"不得机械重开同一节点而不补充新信息",
+		"超时告警介入",
+		"[watchdog-alert: <taskID>]",
+		"send_message steer 收敛",
+	} {
+		if !strings.Contains(schedulerSystemPrompt, phrase) {
+			t.Errorf("schedulerSystemPrompt 缺少 v8.2 介入裁决短语 %q", phrase)
+		}
+	}
+}
+
+// v8.1（2026-08-21）第四轮 SWE 复测后的 doctrine 补强：失败路径默认带返工、
+// 建图前禁止亲自多轮调查、大图骨架先行。三条新纪律必须出现在正文中。
+func TestSchedulerSystemPrompt_V81Doctrine(t *testing.T) {
+	for _, phrase := range []string{
+		"失败路径也是拓扑",
+		"activation=\"new\" 回边",
+		"failed → end 意味着放弃",
+		"不包括亲自调查仓库",
+		"调查节点开头的最小图",
+		"骨架先行",
+		"patch_graph 逐次扩展",
+	} {
+		if !strings.Contains(schedulerSystemPrompt, phrase) {
+			t.Errorf("schedulerSystemPrompt 缺少 v8.1 doctrine 短语 %q", phrase)
+		}
+	}
+}
+
+// Graph 终态契约 v2（2026-08-20，docs/design/graph-terminal-contract-v2.md）：
+// agent/controller 禁止 event、出边仅系统事件、业务分支走 path 条件 + 输出契约。
+func TestSchedulerSystemPrompt_TerminalContractV2(t *testing.T) {
+	for _, phrase := range []string{
+		`"schema":"agentgo.graph/v2"`,
+		`禁止提交 event 参数`,
+		`仅允许系统事件 completed/failed/blocked/always`,
+		`业务分支的唯一合法通道`,
+		`输出契约`,
+		`<output-contract>`,
+		`无匹配出路会被拒绝并要求执行者重交`,
+		`[graph-change-request: .../no-outlet]`,
+	} {
+		if !strings.Contains(schedulerSystemPrompt, phrase) {
+			t.Errorf("schedulerSystemPrompt 缺少终态契约 v2 指引 %q", phrase)
+		}
+	}
+	for _, stale := range []string{
+		`完成时报 event=ready`,
+		`写入专用 Results["event"]`,
+		`事件名仅允许 ready/completed/fixable/failed/blocked/pass/approved/rejected/timeout/always`,
+		`"schema":"agentgo.graph/v1"`,
+	} {
+		if strings.Contains(schedulerSystemPrompt, stale) {
+			t.Errorf("schedulerSystemPrompt 仍含 v1 自由事件指引 %q", stale)
+		}
 	}
 }
 
@@ -233,9 +309,9 @@ func TestSchedulerSystemPrompt_AcceptanceUsesClosedToolsAndGraphCausality(t *tes
 
 func TestSchedulerSystemPrompt_StructuredRoutesAndMechanicalFuse(t *testing.T) {
 	for _, phrase := range []string{
-		`自定义 path 条件字段必须放进 result object`,
+		`业务路由字段必须放进 result object`,
 		`result={"coverage":"gap"}`,
-		`不能把 coverage 只写在 summary 或 event 中`,
+		`不能把 coverage 只写在 summary 中`,
 		`无任何匹配出路则整张图 failed`,
 		`EvidenceRef 是系统按调用或内容身份签发的不透明稳定引用`,
 		`合法的跨任务回边和长目标不设 activation 次数上限`,

@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -266,8 +267,67 @@ func (a *Activator) handleEvent(evt model.Event) {
 		default:
 			// 已有未消费的信号，无需重复发送
 		}
+		if evt.Type == model.EventWatchdogAlert {
+			// 2026-08-21 SWE-010：watchdog 告警此前只翻译为这个无差别信号——
+			// 它只服务 waitForBatchTerminal 的 legacy batch 等待路径，Graph
+			// 编排下 scheduler 由唤醒任务驱动，告警机制性不可达（四轮
+			// session-access-tracking worker 打转 20 分钟无人介入的根因）。
+			// 现在同时以 __scheduler__ 唤醒任务把超时事实交 Scheduler 裁决。
+			a.publishWatchdogWake(evt.TaskID)
+		}
 
 	default:
 		// 其他事件类型（如 EventTickerWakeup、EventTaskRetry）不需要 Activator 处理
 	}
+}
+
+// publishWatchdogWake 发布 watchdog 超时告警的 scheduler 唤醒任务
+// （2026-08-21 SWE-010）。描述含幂等标记 [watchdog-alert: <taskID>] 与
+// 超时事实（graph 归属/运行时长/描述）；同一 taskID 已有未终态的同标记
+// 唤醒任务时跳过——watchdog 对同一任务一次性告警，retry rearm 后的新告警
+// 若旧唤醒尚未消费无需重复排队。
+func (a *Activator) publishWatchdogWake(taskID string) {
+	if taskID == "" {
+		return
+	}
+	marker := "[watchdog-alert: " + taskID + "]"
+	if tasks, err := a.Store.ScanAll(); err == nil {
+		for _, t := range tasks {
+			if t == nil || t.EventType != "__scheduler__" {
+				continue
+			}
+			if (t.Status == model.TaskStatusPending || t.Status == model.TaskStatusProcessing) && strings.Contains(t.Description, marker) {
+				return
+			}
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(marker + " 节点任务运行超时（watchdog 只告警不干预），请按「节点介入裁决」的超时告警指引裁决。")
+	if task, err := a.Store.GetTask(taskID); err == nil && task != nil {
+		b.WriteString(" 超时任务: id=" + taskID)
+		if task.GraphID != "" {
+			b.WriteString(fmt.Sprintf(", graph=%s node=%s", task.GraphID, task.NodeID))
+		}
+		if !task.StartedAt.IsZero() {
+			b.WriteString(fmt.Sprintf(", 已运行 %v（预期 %d 秒）", time.Since(task.StartedAt).Round(time.Second), task.TimeoutSeconds))
+		}
+		desc := task.Description
+		if len([]rune(desc)) > 120 {
+			desc = string([]rune(desc)[:120]) + "…"
+		}
+		b.WriteString(", 描述: " + desc)
+	}
+	wake := &model.Task{
+		Description:    b.String(),
+		EventType:      "__scheduler__",
+		EventSource:    "watchdog",
+		TimeoutSeconds: SchedulerTaskTimeoutSec,
+		MaxConcurrency: 1,
+	}
+	if err := a.Store.PublishTask(wake); err != nil {
+		log.Printf("[scheduler-activator] 发布 watchdog 唤醒任务失败: %v", err)
+		return
+	}
+	log.Printf("[scheduler-activator] 已发布 watchdog 唤醒任务: id=%s, 超时任务=%s", wake.ID, taskID)
 }

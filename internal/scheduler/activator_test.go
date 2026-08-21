@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -151,6 +152,84 @@ func TestActivator_EventWatchdogAlert_BroadcastsBatchUpdate(t *testing.T) {
 	case <-batchCh:
 	case <-time.After(100 * time.Millisecond):
 		t.Error("expected batch update signal for EventWatchdogAlert")
+	}
+}
+
+// TestActivator_EventWatchdogAlert_PublishesWakeTask（2026-08-21 SWE-010）：
+// watchdog 告警除 legacy batch 信号外，还必须以 __scheduler__ 唤醒任务把
+// 超时事实交 Scheduler 裁决——描述含幂等标记、graph 归属与时长事实；
+// 同一超时任务的重复告警在旧唤醒未消费前不重复发布。
+func TestActivator_EventWatchdogAlert_PublishesWakeTask(t *testing.T) {
+	ch := make(chan model.Event, 16)
+	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
+	batchCh := make(chan struct{}, 4)
+	a := NewActivator(s, ch, batchCh, nil)
+
+	// 超时任务本体：图节点任务，已运行一段时间
+	overtime := &model.Task{
+		ID: "task-overtime", Description: "修复 sessions.py 的 accessed 标记",
+		EventType: "", GraphID: "g-x", NodeID: "impl", TimeoutSeconds: 3600,
+	}
+	if err := s.PublishTask(overtime); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("worker-1", overtime.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	a.handleEvent(model.Event{Type: model.EventWatchdogAlert, TaskID: overtime.ID})
+
+	tasks, err := s.ScanAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wake *model.Task
+	for _, task := range tasks {
+		if task.EventType == "__scheduler__" {
+			wake = task
+		}
+	}
+	if wake == nil {
+		t.Fatal("watchdog 告警应发布 __scheduler__ 唤醒任务")
+	}
+	for _, want := range []string{"[watchdog-alert: " + overtime.ID + "]", "graph=g-x", "node=impl", "超时告警指引"} {
+		if !strings.Contains(wake.Description, want) {
+			t.Errorf("唤醒任务描述缺少 %q: %s", want, wake.Description)
+		}
+	}
+	if wake.EventSource != "watchdog" {
+		t.Errorf("EventSource 应标记 watchdog: %q", wake.EventSource)
+	}
+
+	// 幂等：旧唤醒未消费时，同一超时任务的重复告警不再发布
+	a.handleEvent(model.Event{Type: model.EventWatchdogAlert, TaskID: overtime.ID})
+	count := 0
+	tasks, _ = s.ScanAll()
+	for _, task := range tasks {
+		if task.EventType == "__scheduler__" && strings.Contains(task.Description, "[watchdog-alert: ") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("同一超时任务的唤醒任务应幂等，实际 %d 个", count)
+	}
+}
+
+// TestActivator_EventWatchdogAlert_EmptyTaskID 空 TaskID 不发布唤醒任务
+// （防御：事件形状异常时不制造垃圾任务）。
+func TestActivator_EventWatchdogAlert_EmptyTaskID(t *testing.T) {
+	ch := make(chan model.Event, 4)
+	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
+	batchCh := make(chan struct{}, 1)
+	a := NewActivator(s, ch, batchCh, nil)
+
+	a.handleEvent(model.Event{Type: model.EventWatchdogAlert, TaskID: ""})
+
+	tasks, _ := s.ScanAll()
+	for _, task := range tasks {
+		if task.EventType == "__scheduler__" {
+			t.Errorf("空 TaskID 不应发布唤醒任务: %+v", task)
+		}
 	}
 }
 
