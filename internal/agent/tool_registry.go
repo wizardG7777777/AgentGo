@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"agentgo/internal/llm"
+	"agentgo/internal/store"
 	"agentgo/internal/suggest"
 )
 
@@ -87,6 +88,14 @@ func (r *ToolRegistry) WrapHandler(name string, wrapper func(ToolFunc) ToolFunc)
 func (r *ToolRegistry) Dispatch(ctx context.Context, call llm.ToolCall) (string, error) {
 	fn, ok := r.tools[call.Name]
 	if !ok {
+		// 2026-08-21 SWE-009：模型往 tool_call 名字段泄漏 DSML 等标记产生的
+		// 畸形名（200+ 字符、含空白/控制字符/标记字符），回执不回灌原名——
+		// 原名全文进下一轮上下文只会加深模型格式紊乱；改用与账本一致的
+		// 确定性占位并附格式提醒，给模型一次自愈锚点。合法名走 Did-You-Mean。
+		if !store.IsWellFormedToolName(call.Name) {
+			return "", fmt.Errorf("未知工具: %s（原工具名含非法标记字符，已省略）；工具调用必须以 function calling 提交，工具名须为注册工具之一，禁止输出任何标记文本",
+				store.MalformedToolNamePlaceholder(call.Name))
+		}
 		// §10 Did-You-Mean：工具名 typo 时，在当前 kind 已注册工具名中找候选。
 		toolNames := make([]string, 0, len(r.tools))
 		for name := range r.tools {

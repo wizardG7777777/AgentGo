@@ -862,6 +862,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		SessionID:             currentSessionID,
 		Modes:                 modeStore,         // 与 scheduler / UI Hub 同一实例：exec 轴驱动 strict/yolo
 		EffectJournal:         effectJournal,     // H2b 副作用账本；nil（初始化失败）时埋点降级不记账
+		OutletChecker:         graphRuntime,      // 终态契约 v2 提交期出路检查（Step 3.9.1 装配的 *graph.Runtime）
 		UserOutput:            newTextWriter(""), // 共享兜底（team/spawn ad-hoc runner）；静态 runner 在下方按实例标记
 		StreamOutput:          streamOutput,
 		TaskEndCallbacks:      taskEndReactor,
@@ -949,12 +950,20 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 
 	// Step 5: Scheduler 在 TeamManager 构造后装配，因而模板发现和动态
 	// provision 工具拿到的是同一个 runtime authority。
+	// agent_templates.enabled=false（默认）时模板机制整体搁置：Scheduler
+	// 拿到 nil catalog，list_agent_templates / provision_agent_team 不注册、
+	// 资源快照不含 agent_templates，图节点只路由静态 YAML Agent。
+	// TeamManager 仍持有真实 catalog，保证将来重新开放时恢复路径不变。
 	// 两轴模式 store：初值来自 cfg.Modes（缺省 normal/team），
 	// 已在 Step 2.5 创建（exec-mode-guard Gate 注入）；
 	// 同一实例注入 scheduler（快照消费）与 UI Hub（两轴运行时切换）。
+	schedCatalog := templateCatalog
+	if !cfg.AgentTemplates.Enabled {
+		schedCatalog = nil
+	}
 	sched := scheduler.New(
 		taskStore, r, schedulerLLM, eventCh, cfg, cancelRegistry, mbRegistry, interactionService,
-		gateReg, storeView, recordToolCall, agentRegistry, templateCatalog, teamMgr,
+		gateReg, storeView, recordToolCall, agentRegistry, schedCatalog, teamMgr,
 		memoryStore, newTextWriter("scheduler"), resultWriter, modeStore,
 		graphRuntime, graphStore, // C5b：submit_graph / patch_graph 的图控制面注入
 		effectJournal, // H2b：scheduler 工具面与 workspace 合并的副作用账本
@@ -963,6 +972,9 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		capReg.schedulerAgentID = sched.Agent.ID
 		sched.Agent.Activity = activity
 		sched.Agent.StreamOutput = streamOutput
+		// SWE-001 兜底 1：纯文本自然退出的零证据收口审查（与 report_done
+		// 的 closure Gate 同一实例，confirmed 状态两路径共享）。
+		sched.Agent.NaturalExitReviewer = schedulerClosureHook
 		activity.RegisterAgent(sched.Agent.ID, "scheduler")
 	}
 	sched.SchedulerExec.ToolHealth = toolHealth

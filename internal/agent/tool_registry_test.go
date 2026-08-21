@@ -96,6 +96,47 @@ func TestToolRegistry_Dispatch_UnknownTool(t *testing.T) {
 	}
 }
 
+// TestToolRegistry_Dispatch_MalformedToolName（2026-08-21 SWE-009）：模型往
+// tool_call 名字段泄漏 DSML 等标记的畸形名，回执不回灌原名——改用与账本
+// 一致的确定性占位并附格式提醒；合法 typo 名仍走 Did-You-Mean 建议。
+func TestToolRegistry_Dispatch_MalformedToolName(t *testing.T) {
+	r := NewToolRegistry()
+	r.Register("grep_search", "搜索", nil, func(ctx context.Context, args map[string]any) (string, error) {
+		return "ok", nil
+	})
+
+	cases := []struct {
+		name    string
+		rawName string
+	}{
+		{"DSML 长名", "grep_search>\n<｜DSML｜parameter pattern>path</｜DSML｜parameter>\n</｜DSML｜invoke>"},
+		{"含换行控制符", "read_file\n<script>"},
+		{"超长名", strings.Repeat("a", 200)},
+		{"CJK 名", "读文件"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := r.Dispatch(context.Background(), llm.ToolCall{ID: "c1", Name: tc.rawName})
+			if err == nil {
+				t.Fatal("畸形名应报错")
+			}
+			msg := err.Error()
+			if strings.Contains(msg, tc.rawName) {
+				t.Errorf("回执不得回灌原始畸形名: %q", msg)
+			}
+			if !strings.Contains(msg, "malformed:") || !strings.Contains(msg, "标记字符") {
+				t.Errorf("回执应含确定性占位与格式提醒: %q", msg)
+			}
+		})
+	}
+
+	// 合法 typo 名不受影响，仍给出 Did-You-Mean 建议
+	_, err := r.Dispatch(context.Background(), llm.ToolCall{ID: "c2", Name: "grep_searh"})
+	if err == nil || !strings.Contains(err.Error(), "grep_searh") {
+		t.Errorf("合法 typo 名应保留原名与建议: %v", err)
+	}
+}
+
 func TestToolRegistry_Dispatch_ToolError(t *testing.T) {
 	r := NewToolRegistry()
 	r.Register("fail_tool", "总是失败", nil, func(ctx context.Context, args map[string]any) (string, error) {

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"agentgo/internal/effect"
+	"agentgo/internal/hook"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/memory"
@@ -126,6 +127,10 @@ type Agent struct {
 	Mailbox             *mailbox.Mailbox                  // 代理间通信收件箱，可选
 	MailRegistry        *mailbox.Registry                 // 邮箱注册表，用于 DrainWithAck 自动回执
 	FinalizationChecker FinalizationChecker               // 可选；用于 finalization tool 信号检查
+	// NaturalExitReviewer 审查非图 scheduler 任务的纯文本自然退出收口
+	// （2026-08-20 SWE-001 兜底 1，端口定义见 internal/hook/natural_exit.go）；
+	// bootstrap 仅为 scheduler 装配，nil 时不审查（单测直构与 worker 默认路径）。
+	NaturalExitReviewer hook.NaturalExitReviewer
 	// SubmitState 暂存 submit_task_result 工具写入的结构化提交（已通过 ExpectedArtifacts 校验、待消费）。
 	// finalization 短路分支 Take 命中时以其渲染文本替代 lastOutput 收尾（Cause=submit_task_result）；
 	// nil 或 Take 未命中时走 report_done 兼容路径（lastOutput），行为与旧版完全一致。
@@ -518,6 +523,11 @@ const emergencyLoopFuse = 10000
 // 按可恢复错误收口重试。阈值 3：容忍偶发的模型/provider 抖动，同时有界。
 const maxEmptyResponseStreak = 3
 
+// maxUnstructuredExitNudges 是图节点任务纯文本自然退出的提醒次数上限：
+// 每次文本退出注入「必须用 submit_task_result 收口」提醒，超过次数仍文本
+// 退出按可恢复错误收口重试（2026-08-20 SWE-001 兜底 2）。
+const maxUnstructuredExitNudges = 2
+
 // loopFuseLimit 返回本 Agent 生效的 fuse 值：未设置测试覆盖时恒为
 // emergencyLoopFuse。
 func (a *Agent) loopFuseLimit() int {
@@ -899,6 +909,11 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// 若按自然完成收口，scheduler 会"什么都没做就结束"）。连续
 	// maxEmptyResponseStreak 轮仍空按可恢复错误收口（重试换上下文）。
 	emptyStreak := 0
+	// unstructuredExitStreak：图节点任务纯文本自然退出（有文本、零工具
+	// 调用、未走 submit_task_result）的计数（2026-08-20 SWE-001 兜底 2）。
+	// 图节点契约要求结构化收口，文本退出 = 未提交：提醒
+	// maxUnstructuredExitNudges 次后仍文本退出按可恢复错误收口。
+	unstructuredExitStreak := 0
 	for i := 0; ; i++ {
 		select {
 		case <-ctx.Done():
@@ -1144,6 +1159,8 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			a.Activity.LLMEnd(a.ID, taskID, i, "", 0, execErr)
 			enterTerminating(terminatingCause)
 			// CM2：Attempt 结束前立即 checkpoint（含 L3 压缩前的状态保全）。
+			// SWE-001 预防 3：终止原因同步入 Task Memory，重试接手可见。
+			taskMem.recordAttemptEnd(a, taskID, execErr.Error())
 			taskMem.checkpoint(a, taskID, i, "attempt_end")
 			a.handleFailure(task, taskID, execErr, history, manifestInfo)
 			return
@@ -1174,6 +1191,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				terminatingCause = "react_loop_exit:empty_response"
 				a.Activity.LLMEnd(a.ID, taskID, i, "", 0, fmt.Errorf("模型连续 %d 轮空响应", emptyStreak))
 				enterTerminating(terminatingCause)
+				taskMem.recordAttemptEnd(a, taskID, fmt.Sprintf("模型连续 %d 轮空响应（无文本且无工具调用）", emptyStreak))
 				taskMem.checkpoint(a, taskID, i, "attempt_end")
 				a.handleFailure(task, taskID, &ErrRecoverable{
 					Err: fmt.Errorf("模型连续 %d 轮返回空响应（无文本且无工具调用）", emptyStreak),
@@ -1186,6 +1204,74 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			continue
 		}
 		emptyStreak = 0
+
+		// SWE-001 纯文本自然退出审查（2026-08-20）：只作用于 !result.ToolCalled
+		// 且未经 finalization 信号的文本收口轮——result.Finalized 是
+		// submit_task_result/report_done 的结构化收口，不经此审查；空响应已被
+		// 上方守卫拦截。
+		if !result.ToolCalled && !result.Finalized {
+			// 兜底 2（图节点任务）：契约要求 submit_task_result 结构化收口，
+			// 纯文本退出 = 未提交。提醒后继续；提醒 maxUnstructuredExitNudges
+			// 次仍文本退出按可恢复错误收口（重试换上下文，耗尽即 failed）。
+			if task.GraphID != "" {
+				unstructuredExitStreak++
+				if unstructuredExitStreak > maxUnstructuredExitNudges {
+					reason := fmt.Sprintf("图节点任务连续 %d 次纯文本退出，未使用 submit_task_result 结构化收口", unstructuredExitStreak)
+					log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
+					trace.Emit(trace.Event{
+						Kind: trace.KindError, TaskID: taskID, AgentID: a.ID,
+						Error: "unstructured_exit: " + reason,
+					})
+					terminatingCause = "react_loop_exit:unstructured_exit"
+					enterTerminating(terminatingCause)
+					taskMem.recordAttemptEnd(a, taskID, reason)
+					taskMem.checkpoint(a, taskID, i, "attempt_end")
+					a.handleFailure(task, taskID, &ErrRecoverable{Err: fmt.Errorf("%s", reason)}, history, manifestInfo)
+					return
+				}
+				log.Printf("[agent %s] 任务 %s 图节点纯文本退出被拒（第 %d/%d 次提醒），要求 submit_task_result 收口",
+					a.ID, taskID, unstructuredExitStreak, maxUnstructuredExitNudges)
+				history = append(history, HistoryEntry{
+					IncomingMail: fmt.Sprintf("<system-reminder>本任务是 Graph 节点任务，收尾必须调用 submit_task_result 提交结构化结果（status/summary，以及节点声明的 event 或 acceptance 的 verdict）；纯文本回复不会被接受（第 %d/%d 次提醒）。</system-reminder>",
+						unstructuredExitStreak, maxUnstructuredExitNudges),
+				})
+				continue
+			}
+			// 兜底 1（scheduler 根任务）：零证据收口审查——与 report_done 的
+			// scheduler-closure-review Gate 同语义（零图/零 delegated 任务/
+			// 零 pending 交互时第一次拒绝要求确认，第二次放行记
+			// scheduler_direct_answer），但挂在终态判别处、与收口路径无关。
+			//
+			// 2026-08-21 SWE-008 三态升级：放行与否看 toolFailed（本任务是否
+			// 存在工具调用失败记录，ToolCallRecord.Success==false，账本机械
+			// 事实，不看正文一个字）。纯问答（无失败记录）出口保留；有失败
+			// 记录时第二次拒绝改格式提醒，第三次 Retry 换上下文——四轮取证：
+			// 三起「直答」全是长 JSON 损坏后的工具调用格式崩盘，放行即把
+			// DSML 残片落盘为正式答复。
+			if a.NaturalExitReviewer != nil {
+				toolFailed := a.hasToolCallFailure(taskID)
+				decision := a.NaturalExitReviewer.ReviewNaturalExit(ctx, task, lastOutput, toolFailed)
+				switch {
+				case decision.Retry:
+					reason := "零证据直答连续未收口且存在工具失败记录，换上下文重试（疑工具调用格式崩盘）"
+					log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
+					trace.Emit(trace.Event{
+						Kind: trace.KindError, TaskID: taskID, AgentID: a.ID,
+						Error: "closure_retry: " + reason,
+					})
+					terminatingCause = "react_loop_exit:closure_format_retry"
+					enterTerminating(terminatingCause)
+					taskMem.recordAttemptEnd(a, taskID, reason)
+					taskMem.checkpoint(a, taskID, i, "attempt_end")
+					a.handleFailure(task, taskID, &ErrRecoverable{Err: fmt.Errorf("%s", reason)}, history, manifestInfo)
+					return
+				case !decision.Allow:
+					log.Printf("[agent %s] 任务 %s 纯文本收口被零证据审查拒绝，注入提醒继续", a.ID, taskID)
+					history = append(history, HistoryEntry{IncomingMail: decision.Nudge})
+					continue
+				}
+			}
+		}
 
 		// 终止条件：LLM 没有调用工具（自然完成），或 Executor 返回 Finalized=true（finalization tool 信号）
 		if !result.ToolCalled || result.Finalized {
@@ -1246,6 +1332,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				terminatingCause = "react_loop_exit:error"
 				enterTerminating(terminatingCause)
 				// CM2：Attempt 结束前立即 checkpoint。
+				taskMem.recordAttemptEnd(a, taskID, reason)
 				taskMem.checkpoint(a, taskID, i, "attempt_end")
 				a.handleFailure(task, taskID, &ErrRecoverable{Err: fmt.Errorf("%s", reason)}, history, manifestInfo)
 				return
@@ -1260,6 +1347,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					trace.Emit(trace.Event{Kind: trace.KindError, TaskID: taskID, AgentID: a.ID, Error: reason})
 					terminatingCause = "react_loop_exit:error"
 					enterTerminating(terminatingCause)
+					taskMem.recordAttemptEnd(a, taskID, reason)
 					taskMem.checkpoint(a, taskID, i, "attempt_end")
 					a.handleFailure(task, taskID, &ErrRecoverable{Err: fmt.Errorf("%s", reason)}, history, manifestInfo)
 					return
@@ -1500,6 +1588,28 @@ func (a *Agent) commitStructuredBlocked(task *model.Task, taskMem *taskMemRuntim
 func (a *Agent) handleStructuredTerminalCommitFailure(task *model.Task, taskID string, commitErr error) {
 	reason := fmt.Sprintf("结构化终态原子提交失败: %v", commitErr)
 	a.terminateTask(task, taskID, reason, "structured_result_persist_failed")
+}
+
+// hasToolCallFailure 报告本任务是否已存在工具调用失败记录
+//（ToolCallRecord.Success==false，2026-08-21 SWE-008 三态状态机的 S2 状态位）。
+// 账本机械事实：submit_graph 校验失败、未知工具、Gate Abort 都算；任务级
+// 单调（跨 attempt 累计，不清零）——attempt 2 仍可见 attempt 1 的失败，
+// 堵住「重试后先成功一次再崩盘」的放行漏洞。查询失败时保守返回 false
+//（不放大故障面：证据缺失退回既有首拒次放语义）。
+func (a *Agent) hasToolCallFailure(taskID string) bool {
+	if a.Store == nil {
+		return false
+	}
+	recs, err := a.Store.QueryToolCalls(taskID, "")
+	if err != nil {
+		return false
+	}
+	for _, rec := range recs {
+		if !rec.Success {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, history []HistoryEntry, manifestInfo *manifestSideInfo) {

@@ -43,6 +43,11 @@ type closureInteractionPeek interface {
 // 后者是验收节点的语义职责。依赖（Graphs / Interactions / SessionID）为 nil
 // 时跳过对应证据源而非 fail-closed，不制造新的故障面。
 //
+// report_done 路径刻意不加 toolFailed 前提（2026-08-21 SWE-008）：能成功
+// 调用 report_done 的模型恰恰证明其工具调用格式能力未崩（崩盘的定义就是
+// 「调不成任何工具」）；格式崩盘嫌疑只存在于零工具调用的纯文本路径
+// （ReviewNaturalExit 的三态语义）。
+//
 // Phase: PreCall, Priority: 500（默认层——不早于路径/模式类硬 Gate，
 // 收口审查与工具参数合法性无关）。
 type SchedulerClosureHook struct {
@@ -52,13 +57,13 @@ type SchedulerClosureHook struct {
 	SessionID    func() string
 
 	mu        sync.Mutex
-	confirmed map[string]bool // taskID → 已被推回确认过一次（第二次放行）
+	confirmed map[string]int // taskID → 纯文本/report_done 已被推回的次数
 }
 
 // NewSchedulerClosureHook 构造收口审查 hook；Graphs / Interactions /
 // SessionID 可在 bootstrap 后续步骤装配（指针字段，注册后接线，装配期无并发）。
 func NewSchedulerClosureHook(s store.TaskStore) *SchedulerClosureHook {
-	return &SchedulerClosureHook{Store: s, confirmed: make(map[string]bool)}
+	return &SchedulerClosureHook{Store: s, confirmed: make(map[string]int)}
 }
 
 // Name 返回 hook 唯一标识。
@@ -108,12 +113,10 @@ func (h *SchedulerClosureHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecis
 	}
 
 	h.mu.Lock()
-	already := h.confirmed[task.ID]
-	if !already {
-		h.confirmed[task.ID] = true
-	}
+	count := h.confirmed[task.ID]
+	h.confirmed[task.ID] = count + 1
 	h.mu.Unlock()
-	if already {
+	if count >= 1 {
 		log.Printf("[gate %s] 任务 %s 零证据直答经确认放行（scheduler_direct_answer）", h.Name(), task.ID)
 		return hook.ToolHookDecision{Action: hook.Continue}
 	}
@@ -131,6 +134,89 @@ func (h *SchedulerClosureHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecis
 			),
 		},
 	}
+}
+
+// ReviewNaturalExit 实现 hook.NaturalExitReviewer（2026-08-20 SWE-001 兜底 1，
+// 2026-08-21 SWE-008 升级为三态状态机）：
+// 纯文本自然退出路径（react_loop_exit:natural → text_only_submission）不经任何
+// 工具调用，PreCall 的 Run 结构性够不到；本方法挂在 processTask 终态判别处，
+// 与 Run 共享同一份零证据判定与 confirmed 计数。
+//
+// 三态语义（exitCount = confirmed[task.ID]，此前已被推回的次数）：
+//   - exitCount=0 → 拒绝 + 通用 nudge（纯问答直接答复 / 有工作 submit_graph）；
+//   - exitCount=1 且 toolFailed=false（纯问答场景）→ 放行记
+//     scheduler_direct_answer——模型已被提醒过一次且本任务从未发生工具失败，
+//     它的第二次答复视为确认后的合法直答；
+//   - exitCount=1 且 toolFailed=true（工作场景，疑格式崩盘）→ 拒绝 + 格式
+//     提醒——SWE-008 取证：三起「直答」全是长 JSON 损坏后的工具调用格式崩盘
+//     （DSML/自造标记），放行即把残片落盘为正式答复；
+//   - exitCount≥2 且 toolFailed=true → Retry=true 交 agent 按可恢复错误重试
+//     换上下文（换干净上下文是模型格式能力自救的唯一有效通道），本方法同时
+//     把退出计数清零，新 attempt 重获完整提醒梯度；防无限循环由 agent 侧
+//     MaxRetries 全局上限兜底。
+//
+// output 恒非空（空响应已被上游守卫拦截），无「空 summary 永不豁免」分支。
+func (h *SchedulerClosureHook) ReviewNaturalExit(ctx context.Context, task *model.Task, _ string, toolFailed bool) hook.NaturalExitDecision {
+	if h.Store == nil || task == nil {
+		return hook.NaturalExitDecision{Allow: true}
+	}
+	// 与 Run 相同的审查范围：只查非图 scheduler 控制面任务。
+	if task.EventType != "__scheduler__" || task.GraphID != "" {
+		return hook.NaturalExitDecision{Allow: true}
+	}
+	if h.hasClosureEvidence(ctx, task) {
+		return hook.NaturalExitDecision{Allow: true}
+	}
+
+	h.mu.Lock()
+	count := h.confirmed[task.ID]
+	h.confirmed[task.ID] = count + 1
+	if count >= 2 && toolFailed {
+		// 重试前清零：新 attempt 从 exitCount=0 重新获得完整提醒梯度。
+		delete(h.confirmed, task.ID)
+	}
+	h.mu.Unlock()
+
+	switch {
+	case count == 0:
+		return hook.NaturalExitDecision{
+			Allow: false,
+			Nudge: "<system-reminder>你的上次答复未被接受：本次请求没有留下任何工作痕迹（无图、无 delegated 任务、无 pending 交互）。" +
+				"若确认这是纯问答、无需建图执行，请再次直接给出最终答复（将再次审查并放行）；" +
+				"若有实际工作要做，请用 submit_graph 建图把工作委派出去。</system-reminder>",
+		}
+	case count == 1 && !toolFailed:
+		log.Printf("[gate %s] 任务 %s 零证据直答经确认放行（scheduler_direct_answer，纯文本路径）", h.Name(), task.ID)
+		return hook.NaturalExitDecision{Allow: true}
+	case count == 1 && toolFailed:
+		return hook.NaturalExitDecision{
+			Allow: false,
+			Nudge: "<system-reminder>你的上次答复未被接受：本次请求没有留下任何工作痕迹，且本任务此前发生过工具调用失败。" +
+				"如果你刚才试图调用工具但调用未被识别——不要在正文中输出任何 XML/标记文本（如 DSML、<tool_call> 等），" +
+				"直接以系统工具调用格式重新提交（例如 submit_graph，可先提交仅含 root+end 的骨架图再逐次扩展）；" +
+				"再次纯文本回复将被放弃并换上下文重试。</system-reminder>",
+		}
+	case count >= 2 && toolFailed:
+		// 连续纯文本退出且存在工具失败记录：提醒已无意义，换上下文重试。
+		log.Printf("[gate %s] 任务 %s 零证据直答连续 %d 次且存在工具失败记录，转可恢复重试（疑工具调用格式崩盘）",
+			h.Name(), task.ID, count)
+		return hook.NaturalExitDecision{Retry: true}
+	default:
+		// count>=2 且 toolFailed=false：理论不可达（count=1 时已放行终态），
+		// 防御性按放行处理——防御分支不得引入比可达分支更严格的行为。
+		log.Printf("[gate %s] 任务 %s 零证据直答经确认放行（scheduler_direct_answer，纯文本路径，防御分支）", h.Name(), task.ID)
+		return hook.NaturalExitDecision{Allow: true}
+	}
+}
+
+// ResetExitCount 清零指定任务的纯文本退出计数。agent 在 ReviewNaturalExit
+// 返回 Retry=true 并走 ErrRecoverable 重试时调用——新 attempt 从 exitCount=0
+// 重新获得完整提醒梯度（本方法的 default 分支已先行清零，此入口供 agent
+// 显式调用与测试对账，幂等）。
+func (h *SchedulerClosureHook) ResetExitCount(taskID string) {
+	h.mu.Lock()
+	delete(h.confirmed, taskID)
+	h.mu.Unlock()
 }
 
 // hasClosureEvidence 报告本任务是否已留下工作痕迹（三个证据源任一命中）。
