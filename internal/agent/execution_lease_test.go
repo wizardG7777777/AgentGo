@@ -34,11 +34,29 @@ func newLeaseToolRegistry(names ...string) *ToolRegistry {
 }
 
 // newLeaseAgent 构造带可换入 executor 的测试 Agent（注册全集 = toolNames）。
+// submit_task_result 在工具清单中时注册为「标记 finalizing」的执行体并装配
+// checker：2026-08-20 SWE-001 起图节点任务纯文本退出被拒，图任务测试经
+// mock.submitResultFirstCall=true 走结构化收口（真实装配的镜像）。
 func newLeaseAgent(agentID, eventType string, s store.TaskStore, toolNames ...string) (*Agent, *LLMExecutor, *capMockClient) {
 	mock := &capMockClient{}
-	exec := NewSwappableLLMExecutor(mock, newLeaseToolRegistry(toolNames...), nil, nil, nil, "")
+	holder := NewFinalizationHolder()
+	reg := NewToolRegistry()
+	for _, name := range toolNames {
+		if name == "submit_task_result" {
+			reg.Register(name, name+" 工具", nil, func(context.Context, map[string]any) (string, error) {
+				holder.MarkTaskFinalized()
+				return "ok", nil
+			})
+			continue
+		}
+		reg.Register(name, name+" 工具", nil, leaseNoop)
+	}
+	exec := NewSwappableLLMExecutor(mock, reg, nil, nil, nil, "")
+	exec.SetFinalizationChecker(holder)
 	ag := NewAgent(agentID, eventType, s, nil, exec.Execute)
 	ag.ToolSwapper = exec
+	// 与 runner 生产装配镜像：executor fence 与 agent 循环顶部短路共用同一 holder。
+	ag.FinalizationChecker = holder
 	return ag, exec, mock
 }
 
@@ -562,6 +580,7 @@ func TestProcessTask_GraphControllerExplicitLeaseFiltersSchedulerTools(t *testin
 	if err := s.ClaimTask(ag.ID, task.ID); err != nil {
 		t.Fatalf("ClaimTask: %v", err)
 	}
+	mock.submitResultFirstCall = true // 图节点任务须结构化收口（SWE-001）
 	ag.processTask(context.Background(), task.ID)
 	if mock.calls != 1 {
 		t.Fatalf("合法 Graph controller 应执行一次 LLM，实际 %d", mock.calls)
@@ -643,6 +662,7 @@ func TestProcessTask_LegacyGraphNilBusinessLeaseStillFiltersToControlUnion(t *te
 	if err := s.ClaimTask(ag.ID, task.ID); err != nil {
 		t.Fatalf("ClaimTask: %v", err)
 	}
+	mock.submitResultFirstCall = true // 图节点任务须结构化收口（SWE-001）
 	ag.processTask(context.Background(), task.ID)
 	if mock.calls != 1 || len(mock.toolDefs) != 1 {
 		t.Fatalf("安全 legacy Graph 任务应执行一次且有工具视图: calls=%d defs=%v", mock.calls, mock.toolDefs)

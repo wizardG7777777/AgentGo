@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -60,6 +62,11 @@ var submitTaskResultAllowedArgs = map[string]struct{}{
 //     对非图任务额外发布一份 __scheduler__ 唤醒任务（与 request_replan 工具
 //     同机制，幂等键 <taskID>/replan），让 Scheduler 在任务终态后重新决策；
 //     图任务由 graph-terminal-feed 终态回填驱动边路由，跳过不登记。
+//   - 终态契约 v2（schema v2 图任务，注入 OutletChecker 时）：event 参数
+//     废弃、verdict 仅限 acceptance（均为参数级错误，不计入两击）；终态落盘
+//     前经 CheckActivationOutlet 预求值出边——无匹配时首击拒绝（不
+//     finalizing，可修正重交），第二击节点 failed + no-outlet 唤醒 Scheduler，
+//     任务置 failed 并返回不可重试错误。
 //
 // 拒绝对象：不属于 Graph 的 scheduler 任务（指引用 report_done）。Graph
 // controller 的 EventType 同样是 __scheduler__，但必须通过本工具提交 event /
@@ -95,6 +102,12 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 		return "", err
 	}
 
+	// 终态契约 v2：属于 schema v2 图的任务在提交期接受追加约束（event 废弃、
+	// verdict 仅限 acceptance、终态落盘前出路匹配检查）。图不存在 / v1 图 /
+	// 未注入 OutletChecker 时按 v1 语义处理（行为与引入前逐字节一致）。
+	v2Graph := task.GraphID != "" && g.OutletChecker != nil &&
+		g.OutletChecker.GraphSchema(task.GraphID) == graph.SchemaV2
+
 	summary, _ := args["summary"].(string)
 	if strings.TrimSpace(summary) == "" {
 		return "", fmt.Errorf("summary 不能为空：请用一两句话概括任务结果")
@@ -106,6 +119,9 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 	requestReplan, _ := args["request_replan"].(bool)
 	eventName, _ := args["event"].(string)
 	eventName = strings.TrimSpace(eventName)
+	if v2Graph && eventName != "" {
+		return "", fmt.Errorf("event 参数在终态契约 v2 已废弃：v2 图任务的业务路由一律改用 result 数据字段 + 出边 path 条件，请把路由信息放进 result（参数级错误，不计入出路检查两击）")
+	}
 	if task.GraphID != "" && eventName != "" && !graph.IsValidEventName(eventName) {
 		return "", fmt.Errorf("event %q 不属于 Graph 事件词表（仅允许 ready/completed/fixable/failed/blocked/pass/approved/rejected/timeout/always）", eventName)
 	}
@@ -119,6 +135,9 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 		}
 		if eventName != "" {
 			return "", fmt.Errorf("verdict 与 event 互斥：acceptance 业务结论只能通过 $.verdict 路由，不得同时提交 event")
+		}
+		if v2Graph && task.GraphNodeKind != string(graph.KindAcceptance) {
+			return "", fmt.Errorf("verdict 仅允许 acceptance 节点任务提交（当前节点类型 %q）：v2 图普通节点的业务路由改用 result 数据字段 + path 条件（参数级错误，不计入出路检查两击）", task.GraphNodeKind)
 		}
 	}
 	// cited_evidence：Graph acceptance 节点验收任务引用的证据清单（逗号分隔
@@ -173,6 +192,27 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 	}
 	if err := g.recordRecoveredArtifacts(task.ID, check.Recovered); err != nil {
 		return "", fmt.Errorf("submit_task_result 被拒绝：磁盘恢复的预期产物未能写入 durable artifact ledger: %w", err)
+	}
+
+	// 终态契约 v2 提交期出路检查（终态落盘前）：用该 activation 冻结定义的
+	// 出边对「status 镜像事件 + result 数据」预求值。首击拒绝时不 finalizing、
+	// 不产生任何终态写入（agent 可修正重交）；第二击升级时 runtime 已把节点
+	// 置 failed 并发布 no-outlet 唤醒任务，此处同步把任务置 failed 并返回
+	// 不可重试的终态错误。v1 图与非图任务不检查（v1 无匹配仍由回填时
+	// fail-closed）。
+	if v2Graph {
+		evalResult := buildOutletEvalResult(resultJSON, verdict, citedEvidence, status)
+		if err := g.OutletChecker.CheckActivationOutlet(task.GraphID, task.NodeID, task.ActivationID, status, evalResult); err != nil {
+			var outletErr *graph.OutletError
+			if errors.As(err, &outletErr) && outletErr.Escalated {
+				reason := fmt.Sprintf("终态契约 v2 两击升级：节点 %s（activation %s）两次提交均无匹配出路（contract_no_outlet），已升级 Scheduler 裁决", task.NodeID, task.ActivationID)
+				if failErr := g.Store.FailTask(g.AgentID, taskID, reason); failErr != nil {
+					// 任务已被外部置终态（取消/看门狗）时忽略：终态唯一即可。
+					log.Printf("[tools] 任务 %s 两击升级后 FailTask 未生效（可能已被外部置终态）: %v", taskID, failErr)
+				}
+			}
+			return "", err
+		}
 	}
 
 	g.SubmitState.Put(&agent.StructuredSubmission{
@@ -287,6 +327,31 @@ func recoveredArtifactMeta(path string) (model.ArtifactMeta, error) {
 		return model.ArtifactMeta{}, closeErr
 	}
 	return model.ArtifactMeta{SHA256: hex.EncodeToString(h.Sum(nil)), Bytes: bytesCopied}, nil
+}
+
+// buildOutletEvalResult 构造与 graph-terminal-feed 同形态的终态 Result，
+// 供终态契约 v2 提交期出路预求值：自定义 result 字段类型保真地展开到顶层；
+// completed 终态另带 verdict / cited_evidence 协议键（blocked 落盘口径不带
+// 这两个键，预求值保持一致）。resultJSON 已经 normalizeStructuredResult 校验，
+// 解码失败只可能为空串，按无自定义字段处理。
+func buildOutletEvalResult(resultJSON, verdict, citedEvidence, status string) map[string]any {
+	result := map[string]any{}
+	if resultJSON != "" {
+		if structured, err := agent.DecodeStructuredResult(resultJSON); err == nil {
+			for k, v := range structured {
+				result[k] = v
+			}
+		}
+	}
+	if status == agent.SubmitStatusCompleted {
+		if verdict != "" {
+			result["verdict"] = verdict
+		}
+		if citedEvidence != "" {
+			result["cited_evidence"] = citedEvidence
+		}
+	}
+	return result
 }
 
 func validateSubmitTaskResultArgs(args map[string]any) error {

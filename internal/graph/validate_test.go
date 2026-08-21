@@ -376,7 +376,9 @@ func TestRejectMalformedInputs(t *testing.T) {
 // TestRejectBasicFields 阶段 4：schema / graph_id / 版本号 / 数量上限。
 func TestRejectBasicFields(t *testing.T) {
 	t.Run("schema错误", func(t *testing.T) {
-		doc := mutate(t, tinyDocJSON, `"agentgo.graph/v1"`, `"agentgo.graph/v2"`)
+		// 终态契约 v2 起 "agentgo.graph/v2" 成为合法值，本用例改为断言
+		// 第三值被拒；合法值清单随错误消息列出（含 v1）。
+		doc := mutate(t, tinyDocJSON, `"agentgo.graph/v1"`, `"agentgo.graph/v3"`)
 		assertInvalid(t, "schema 错误", doc, "基本字段", "agentgo.graph/v1")
 	})
 	t.Run("schema缺失", func(t *testing.T) {
@@ -654,4 +656,132 @@ func TestRejectControllerCapabilityTools(t *testing.T) {
 	// agent 节点声明 capability.tools 不受影响
 	agentDoc := strings.Replace(doc, `"kind":"controller"`, `"kind":"agent"`, 1)
 	mustParse(t, agentDoc)
+}
+
+// ============================================================
+// schema v2（终态契约 v2 切片 1：建图校验，§4 边条件规则）
+// ============================================================
+
+// v2WorkerDocTemplate 是 v2 单工作节点图模板：KIND / DESCRIPTION /
+// TRANSITION 三处占位，work → done。
+const v2WorkerDocTemplate = `{
+  "schema":"agentgo.graph/v2","graph_id":"g-v2","revision":0,"state_version":0,
+  "root":"work","status":"pending","nodes":{
+    "work":{"kind":"KIND","task":{"title":"实施修改","description":"DESCRIPTION"},"status":"inactive","next":[TRANSITION]},
+    "done":{"kind":"end","task":{"title":"收官"},"status":"inactive","next":[]}
+  }
+}`
+
+// buildV2WorkerDoc 替换模板占位构造一份 v2 图文档。
+func buildV2WorkerDoc(kind, description, transition string) string {
+	doc := strings.Replace(v2WorkerDocTemplate, "KIND", kind, 1)
+	doc = strings.Replace(doc, "DESCRIPTION", description, 1)
+	return strings.Replace(doc, "TRANSITION", transition, 1)
+}
+
+// TestV2MinimalDocumentParses v2 最小合法文档：agent 出边用 path 条件做业务
+// 路由，且 task.description 以输出契约形式声明了被引用字段。
+func TestV2MinimalDocumentParses(t *testing.T) {
+	doc := mustParse(t, buildV2WorkerDoc("agent",
+		"在 app.py 实施修复；输出契约：result 必须包含字段 coverage，合法取值 ok/gap",
+		`{"to":"done","when":{"path":"$.coverage","operator":"eq","value":"gap"}}`))
+	if doc.Schema != SchemaV2 {
+		t.Errorf("schema 应为 %q，实际为 %q", SchemaV2, doc.Schema)
+	}
+}
+
+// TestV2SchemaThirdValueRejected schema 只接受 v1/v2 两个封闭值，第三值拒绝
+// 且错误消息列出全部合法值。
+func TestV2SchemaThirdValueRejected(t *testing.T) {
+	doc := strings.Replace(buildV2WorkerDoc("agent", "实施修改并汇报结果", `{"to":"done"}`),
+		`"agentgo.graph/v2"`, `"agentgo.graph/v3"`, 1)
+	assertInvalid(t, "schema 第三值", doc, "基本字段", `"agentgo.graph/v1" 或 "agentgo.graph/v2"`)
+}
+
+// TestV2WorkerEventVocabulary v2 废弃 agent/controller 的业务事件名：出边
+// event 只允许系统事件 completed/failed/blocked/always；ready/pass/fixable/
+// approved/rejected/timeout 在建图期一律拒绝（阶段「事件词表」）。
+func TestV2WorkerEventVocabulary(t *testing.T) {
+	for _, kind := range []string{"agent", "controller"} {
+		for _, event := range []string{EventCompleted, EventFailed, EventBlocked, EventAlways} {
+			doc := buildV2WorkerDoc(kind, "实施修改并汇报结果", `{"to":"done","when":{"event":"`+event+`"}}`)
+			if _, err := ParseAndValidate([]byte(doc)); err != nil {
+				t.Errorf("%s event=%q 是 v2 合法系统事件，应通过: %v", kind, event, err)
+			}
+		}
+		for _, event := range []string{EventReady, EventPass, EventFixable, EventApproved, EventRejected, EventTimeout} {
+			doc := buildV2WorkerDoc(kind, "实施修改并汇报结果", `{"to":"done","when":{"event":"`+event+`"}}`)
+			assertInvalid(t, kind+" event="+event, doc, "事件词表", "业务路由请改用 result 数据字段 + path 条件")
+		}
+	}
+}
+
+// TestV2OutputContractDeclaration v2 输出契约声明：agent/controller 出边
+// path 条件引用的根字段必须以子串形式出现在 task.description 中（刻意简单
+// 的子串约定）；when 为 nil 或纯系统事件边不受此限。
+func TestV2OutputContractDeclaration(t *testing.T) {
+	pathEdge := `{"to":"done","when":{"path":"$.coverage","operator":"eq","value":"gap"}}`
+
+	t.Run("字段未声明", func(t *testing.T) {
+		doc := buildV2WorkerDoc("agent", "在 app.py 实施修复并汇报结果", pathEdge)
+		assertInvalid(t, "输出契约缺失", doc, "输出契约", `result 字段 "coverage"`)
+	})
+	t.Run("字段已声明", func(t *testing.T) {
+		doc := buildV2WorkerDoc("agent", "在 app.py 实施修复；输出契约：result 必须包含字段 coverage，合法取值 ok/gap", pathEdge)
+		mustParse(t, doc)
+	})
+	t.Run("controller同样受限", func(t *testing.T) {
+		doc := buildV2WorkerDoc("controller", "汇总各 worker 结果并裁决路由", pathEdge)
+		assertInvalid(t, "controller 输出契约缺失", doc, "输出契约", `result 字段 "coverage"`)
+	})
+	t.Run("嵌套路径只看根字段", func(t *testing.T) {
+		edge := `{"to":"done","when":{"path":"$.stats.coverage","operator":"exists"}}`
+		doc := buildV2WorkerDoc("agent", "输出契约：result 必须包含字段 stats（统计对象）", edge)
+		mustParse(t, doc)
+	})
+	t.Run("无条件边不受限", func(t *testing.T) {
+		doc := buildV2WorkerDoc("agent", "实施修改并汇报结果", `{"to":"done"}`)
+		mustParse(t, doc)
+	})
+}
+
+// TestV2AcceptanceContractUnchanged acceptance 的 verdict 契约在 v2 下原样
+// 沿用：completed 业务结论只能 $.verdict eq 三值，Runtime failed/blocked
+// 事件边兜底，其余形态一律拒绝。
+func TestV2AcceptanceContractUnchanged(t *testing.T) {
+	const template = `{
+	  "schema":"agentgo.graph/v2","graph_id":"g-v2-acc","revision":1,"state_version":0,
+	  "root":"verify","status":"pending","nodes":{
+	    "verify":{"kind":"acceptance","task":{"title":"验收","description":"必须通过指定检查"},"status":"inactive","next":[TRANSITION]},
+	    "done":{"kind":"end","task":{"title":"收官"},"status":"inactive","next":[]}
+	  }
+	}`
+	build := func(transition string) string {
+		return strings.Replace(template, "TRANSITION", transition, 1)
+	}
+	for _, verdict := range []string{"pass", "fixable", "failed"} {
+		transition := `{"to":"done","when":{"path":"$.verdict","operator":"eq","value":"` + verdict + `"}}`
+		if _, err := ParseAndValidate([]byte(build(transition))); err != nil {
+			t.Errorf("v2 verdict=%s 应是合法业务路由: %v", verdict, err)
+		}
+	}
+	for _, event := range []string{EventFailed, EventBlocked} {
+		transition := `{"to":"done","when":{"event":"` + event + `"}}`
+		if _, err := ParseAndValidate([]byte(build(transition))); err != nil {
+			t.Errorf("v2 Runtime event=%s 应是合法兜底路由: %v", event, err)
+		}
+	}
+	invalid := map[string]string{
+		"无条件":          `{"to":"done"}`,
+		"event_pass":   `{"to":"done","when":{"event":"pass"}}`,
+		"event_always": `{"to":"done","when":{"event":"always"}}`,
+		"verdict_in":   `{"to":"done","when":{"path":"$.verdict","operator":"in","value":["pass","failed"]}}`,
+	}
+	for name, transition := range invalid {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseAndValidate([]byte(build(transition))); err == nil {
+				t.Fatal("v2 下绕过 verdict 权威的 acceptance 出边应被拒绝")
+			}
+		})
+	}
 }

@@ -15,11 +15,24 @@ import (
 type capMockClient struct {
 	toolDefs [][]llm.ToolDef
 	calls    int
+	// submitResultFirstCall 为首轮响应注入 submit_task_result 工具调用
+	// （2026-08-20 SWE-001 起图节点任务纯文本退出被拒，图任务测试需要
+	// 结构化收口路径；配合 newLeaseAgent 的 finalizing 标记执行体）。
+	submitResultFirstCall bool
 }
 
 func (m *capMockClient) Chat(ctx context.Context, messages []llm.Message, tools []llm.ToolDef) (llm.Response, error) {
 	m.calls++
 	m.toolDefs = append(m.toolDefs, append([]llm.ToolDef(nil), tools...))
+	if m.submitResultFirstCall && m.calls == 1 {
+		return llm.Response{
+			ToolCalls: []llm.ToolCall{{
+				ID: "call-submit-1", Name: "submit_task_result",
+				Arguments: map[string]any{"status": "completed", "summary": "done"},
+			}},
+			FinishReason: llm.FinishReasonToolCalls,
+		}, nil
+	}
 	return llm.Response{Content: "done"}, nil
 }
 

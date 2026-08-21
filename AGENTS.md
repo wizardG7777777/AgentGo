@@ -29,6 +29,7 @@ go test -run TestName ./internal/agent/   # 单个测试
 - Graph 当前采用**无 flow generation/correlation token 的单赋值安全基线**：所有非 barrier 节点最多一条静态入边；join / acceptance 的每个 `target_input` 也只能有一条生产边，并行 AND 必须使用不同端口。条件分支各自保留后续与 `end`，禁止共享端口 OR 或汇入同一普通节点；循环体可直接作为 root（隐式初始 activation + 唯一回边）。复杂 OR mux 等 generation/correlation token 落地后再开放；`join →` 下游只能匹配 `completed`。
 - Acceptance 节点必须有非空 `task.title` 和写明逐项验收标准的非空 `task.description`。completed 业务结论只通过 `$.verdict` 精确 `eq` 路由，verdict 枚举为 `pass` / `fixable` / `failed`，completed 结果必须省略 `event`。acceptance 出边禁止无条件、`always`、`completed`、`pass`/`fixable` 事件条件；只允许 `$.verdict eq ...` 业务分支及 Runtime `failed` / `blocked` 兜底事件。证据或能力不足时提交 `status=blocked`；`disputed` 是 Runtime 核验状态，不是 verifier verdict。
 - `submit_task_result` 提交即 finalizing（后续工具调用被 fence），同一任务唯一终态提交者；`status=blocked` 需同填 `blocked_reason`。自定义 Graph path 路由字段必须放在 `result` object（如 `result={"coverage":"gap"}`），不能只写 summary/event；结构化终态字段原子落盘失败时任务 fail-closed。
+- **Graph 终态契约 v2（2026-08-20，`docs/design/graph-terminal-contract-v2.md`）**：新图 `schema` 恰为 `agentgo.graph/v2`；agent/controller 节点**禁止提交 `event`**，出边仅允许 `completed/failed/blocked/always` 系统事件或 result 数据字段 path 条件（字段须在该节点 `task.description` 的输出契约中声明）；提交期出路预求值 + 两击协议（首击拒绝可重交，次击节点 failed 并唤醒 `[graph-change-request: .../no-outlet]` 交 Scheduler 裁决）；输出契约由 runtime 机械派生并钉入 `TaskMemory.Constraints`。v1 存量图按 v1 语义跑完，legacy `publish_task` 的 event 语义 strict 渐进不变。
 - Graph 任务必须把冻结节点类型从 `TaskSpec.NodeKind` 持久化到 `Task.GraphNodeKind` 与 Session 快照；ExecutionLease 只给 controller/agent 注入 `request_replan`，acceptance、旧快照空 kind 与未知 kind 只给 `submit_task_result`，不得从可自定义 route 推断角色；恢复时非空 kind 与 activation 冻结定义不一致必须 fail-closed。新算与复用的 acceptance/未知角色 Lease 都必须通过 read/list/grep/glob/web/submit 正向闭集，Graph Lease 即使 `BusinessTools=nil` 也只能换入 `ToolUnion`，不能泄露完整 registry。
 - Graph Result 按 activation 存入 durable Result Store，实际生效边只冻结稳定 `ResultRef`、有界内联值、目标端口与结构化 Evidence；EvidenceRef 按调用/内容身份稳定生成，不得依赖展示序数。合法跨任务回边无 activation 次数上限，emergency fuse 只限制单次 Runtime 调用内不让出控制权的同步机械级联。
 - Effect Journal 红线：prepared 未 settled 的副作用恢复时标 unknown，**不得静默重跑**。
@@ -91,6 +92,8 @@ AgentGo 同等支持 Windows / macOS / Linux。以下每一条都曾在生产坏
 - `docs/design/workspace-isolation.md` — 按任务写时复制执行隔离（overlay / 合并协议 / 触点表）设计
 - `docs/design/session-isolation.md` — Session 生命周期隔离（冻结/切换/解冻协议、Graph 归属、保留策略交互）设计
 - `docs/design/tui-inline-scrollback.md` — TUI 两层渲染模型（inline scrollback + 全屏层）设计与实现记录
+- `docs/design/graph-terminal-contract-v2.md` — Graph 终态契约 v2（封闭 status、event 废弃、数据流路由、两击升级协议）设计
 - `docs/activate/KNOWN_ISSUES.md` — 当前限制、验证缺口与可复现的开放问题
+- `docs/test-issues/` — 集成测试与 SWE 测试问题的阶段化管理（文件名以 `YYYY-MM-DD-HHMM-` 开头；问题用 `SWE-NNN` 跨文档稳定引用；每阶段修复完毕重跑 8 题 Flask 批测作回归证据）
 - `docs/tool-profiles.md` — 工具 profile / agent 声明 schema
 - `docs/archived/` — 历史 RFC 与已完成的升级计划

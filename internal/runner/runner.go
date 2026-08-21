@@ -93,6 +93,10 @@ type RunnerDeps struct {
 	// 装配注入）：写工具 / run_shell / send_message / workspace 合并经它记录
 	// prepared/settled。nil 时全部埋点降级为不记账（行为与引入账本前一致）。
 	EffectJournal *effect.Journal
+	// OutletChecker 是终态契约 v2 的提交期出路检查器（*graph.Runtime，
+	// bootstrap 装配注入）：schema v2 图任务的 submit_task_result 在终态
+	// 落盘前做出路匹配检查（两击协议）。nil 时不检查（行为与引入前一致）。
+	OutletChecker tools.OutletChecker
 	// UserOutput 是用户可见内容的输出目标。非 nil 时，agent 的 IsUserFacing 输出
 	// 和 scheduler 的 report_done 会写入此处，而不是直接 fmt.Printf。
 	UserOutput io.Writer

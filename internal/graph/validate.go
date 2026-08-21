@@ -82,7 +82,8 @@ func newErr(stage, path, format string, args ...any) *ValidationError {
 //  2. JSON 语法 + 类型化解码（DisallowUnknownFields，未知核心字段在此拒绝；
 //     extensions 内的 RawMessage 不受限）；
 //  3. 重复 object key 检测（encoding/json 不查重，独立流式走查并报出路径）；
-//  4. 基本字段：schema 恰为 "agentgo.graph/v1"、graph_id 非空且字符集合法、
+//  4. 基本字段：schema 恰为 "agentgo.graph/v1" 或 "agentgo.graph/v2"、
+//     graph_id 非空且字符集合法、
 //     revision/state_version 非负、节点数/单节点 next 数/ID 长度上限；
 //  5. root：唯一、非空、指向存在的节点；
 //  6. 转移：next.to 引用存在、when 仅两种形态、operator 枚举、activation 仅 "new"；
@@ -281,9 +282,11 @@ func validateRuntimeState(doc *GraphDocument) error {
 }
 
 // validateBasics 实现阶段 4：schema、graph_id、版本号与数量/长度上限。
+// schema 只接受 SchemaV1 / SchemaV2 两个封闭值；v2 文档的追加约束（事件
+// 词表、输出契约声明）在 authoring 阶段按版本分流，见 validateAuthoringNodes。
 func validateBasics(doc *GraphDocument) error {
-	if doc.Schema != SchemaV1 {
-		return newErr("基本字段", "schema", "schema 必须恰为 %q，实际为 %q", SchemaV1, doc.Schema)
+	if doc.Schema != SchemaV1 && doc.Schema != SchemaV2 {
+		return newErr("基本字段", "schema", "schema 必须恰为 %q 或 %q，实际为 %q", SchemaV1, SchemaV2, doc.Schema)
 	}
 	if err := validateGraphID(doc.GraphID); err != nil {
 		return newErr("基本字段", "graph_id", "%s", err.Error())
@@ -354,11 +357,12 @@ func validateTransitions(doc *GraphDocument) error {
 // validateAuthoringSemantics 校验只适用于新提交/patch 的定义约束。它与
 // validateSemantics 分开，避免升级后新增的 authoring 规则让已经 durable 的
 // 历史 Graph 无法 Recover；旧图仍按其冻结契约恢复，新定义则 fail-closed。
+// schema v2 文档在此追加终态契约 v2 的边条件规则（v1 文档不受限）。
 func validateAuthoringSemantics(doc *GraphDocument) error {
-	return validateAuthoringNodes(doc.Nodes, "nodes")
+	return validateAuthoringNodes(doc.Nodes, "nodes", doc.Schema == SchemaV2)
 }
 
-func validateAuthoringNodes(nodes map[string]Node, prefix string) error {
+func validateAuthoringNodes(nodes map[string]Node, prefix string, v2 bool) error {
 	type inboundEdge struct {
 		source string
 		index  int
@@ -451,8 +455,15 @@ func validateAuthoringNodes(nodes map[string]Node, prefix string) error {
 				}
 			}
 		}
+		if v2 && (node.Kind == KindAgent || node.Kind == KindController) {
+			for i, tr := range node.Next {
+				if err := validateV2WorkerOutgoingTransition(fmt.Sprintf("%s.next[%d]", path, i), id, node, tr); err != nil {
+					return err
+				}
+			}
+		}
 		if node.Subgraph != nil {
-			if err := validateAuthoringNodes(node.Subgraph.Nodes, path+".subgraph.nodes"); err != nil {
+			if err := validateAuthoringNodes(node.Subgraph.Nodes, path+".subgraph.nodes", v2); err != nil {
 				return err
 			}
 		}
@@ -488,6 +499,58 @@ func validateAcceptanceOutgoingTransition(path string, tr Transition) error {
 		return newErr("转移", path+".when.value", "%s 引用了非法 acceptance verdict %q（仅 pass/fixable/failed）", path, verdict)
 	}
 	return nil
+}
+
+// v2WorkerSystemEvents 是 schema v2 文档中 agent/controller 节点出边允许的
+// 系统事件集（终态契约 v2 §4）：节点 status 的镜像加无条件 always，用于
+// 不需要业务语义的边（如失败兜底）。业务结论不再用事件名表达，一律走
+// result 数据字段 + path 条件。
+var v2WorkerSystemEvents = map[string]struct{}{
+	EventCompleted: {},
+	EventFailed:    {},
+	EventBlocked:   {},
+	EventAlways:    {},
+}
+
+// validateV2WorkerOutgoingTransition 实现终态契约 v2 §4 对 agent/controller
+// 出边的两条追加约束（仅 schema v2 文档适用，v1 文档逐字节沿用旧规则）：
+//   - 事件词表：when.event 只允许系统事件 completed/failed/blocked/always；
+//     ready/pass/fixable/approved/rejected/timeout 一律拒绝；
+//   - 输出契约：path 条件引用的根字段名（"$." 后第一段）必须以子串形式
+//     出现在该节点 task.description 中——刻意简单的 v1 版声明约定，拒绝
+//     「边引用了生产者没承诺的字段」。when 为 nil 或纯系统事件边不受此限。
+func validateV2WorkerOutgoingTransition(path, id string, node Node, tr Transition) error {
+	if tr.When == nil {
+		return nil
+	}
+	if tr.When.Event != "" {
+		if _, ok := v2WorkerSystemEvents[tr.When.Event]; !ok {
+			return newErr("事件词表", path+".when.event",
+				"%s 的 event %q 不是 schema v2 系统事件：%s 节点出边只允许 completed/failed/blocked/always；业务路由请改用 result 数据字段 + path 条件",
+				path, tr.When.Event, node.Kind)
+		}
+		return nil
+	}
+	field := pathRootField(tr.When.Path)
+	desc := ""
+	if node.Task != nil {
+		desc = node.Task.Description
+	}
+	if !strings.Contains(desc, field) {
+		return newErr("输出契约", path+".when.path",
+			"节点 %s 的出边 %s 引用了 result 字段 %q，但其 task.description 未声明该字段——请在描述中写明输出契约（本节点 result 必须包含哪些字段及合法取值）",
+			id, path, field)
+	}
+	return nil
+}
+
+// pathRootField 提取 "$.a.b" 形态路径的根字段名（"$." 后第一段）。
+func pathRootField(path string) string {
+	rest := strings.TrimPrefix(path, "$.")
+	if i := strings.IndexByte(rest, '.'); i >= 0 {
+		return rest[:i]
+	}
+	return rest
 }
 
 // validateCondition 校验 when 只允许两种形态：事件形态或条件形态。

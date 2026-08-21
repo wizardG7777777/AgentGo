@@ -22,6 +22,15 @@ import (
 // 与 request_replan 的 Plan 控制面路径；本组剩余 submit_task_result 与
 // request_replan，验收语义由 V6 Graph acceptance 节点 + submit_task_result 的
 // verdict-only 契约承担（event 只供普通 Graph 节点事件路由）。
+// OutletChecker 是 submit_task_result 对 Graph Runtime 提交期出路检查能力
+// 的最小依赖（终态契约 v2，docs/design/graph-terminal-contract-v2.md §5/§6）。
+// *graph.Runtime 直接实现；nil 时不做提交期检查（行为与引入前一致）。
+// GraphSchema 在图不存在时返回空串（按非 v2 处理）。
+type OutletChecker interface {
+	GraphSchema(graphID string) string
+	CheckActivationOutlet(graphID, nodeID, activationID string, status string, result map[string]any) error
+}
+
 type PlanControlGroup struct {
 	Store   store.TaskStore
 	Holder  TaskHolder
@@ -35,6 +44,10 @@ type PlanControlGroup struct {
 	// ArtifactResolver 是 submit_task_result 的 expected-artifacts 磁盘兜底
 	// 解析器（runner 装配注入）。nil 时校验退化为纯账本比对。
 	ArtifactResolver agent.ArtifactPhysicalResolver
+	// OutletChecker 是终态契约 v2 的提交期出路检查器（bootstrap/runner/
+	// scheduler 装配注入 *graph.Runtime）。nil 时 v2 图任务不做提交期
+	// 出路检查与 event 废弃拦截（行为与引入前一致）。
+	OutletChecker OutletChecker
 }
 
 func (g PlanControlGroup) Register(r *agent.ToolRegistry) {
@@ -61,7 +74,7 @@ func (g PlanControlGroup) Register(r *agent.ToolRegistry) {
 			"propertyNames":        map[string]any{"pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"},
 			"additionalProperties": true,
 		}
-		r.Register("submit_task_result", "以结构化字段提交当前执行节点的最终结果并结束任务，Graph controller 节点也使用本工具；只有非图 scheduler 任务改用 report_done。summary 必填（一两句话概括结果，会随依赖结果传递给下游任务）；result 可选，必须是紧凑 JSON object，其字段类型保真地进入 Graph Result 顶层，供 $.coverage 等条件路由及下游数据流消费，status/event/verdict/cited_evidence 为系统保留键，必须使用各自专用参数；checks_performed/evidence/remaining_risks 为逗号分隔的可选清单；status 可选（缺省 completed）：status=blocked 表示任务无法完成、以 blocked 终态收尾并自动唤醒 Scheduler 重新规划（blocked 终态不会放行下游依赖任务），此时 blocked_reason 必填；无法完成但不算 blocked 时也可只填 blocked_reason（会随提交向 Scheduler 登记高优 ReplanRequest），request_replan=true 仅请求重规划；event 可选——本结果对应的事件名，写入 Results[\"event\"] 供 V6 Graph 边条件 {event: ...} 匹配，必须属于 Graph 事件词表，仅当任务属于一张图且下游按事件路由时才需要填；verdict 仅用于 acceptance，固定为 pass/fixable/failed，且与 event 互斥。提交前系统会执行 expected_artifacts 校验，缺失时返回错误且不结束任务。调用成功即进入收尾（finalizing）：同一响应中排在其后的工具调用会被系统跳过不执行，因此提交前必须先完成所有写操作；每个任务只能成功提交一次。",
+		r.Register("submit_task_result", "以结构化字段提交当前执行节点的最终结果并结束任务，Graph controller 节点也使用本工具；只有非图 scheduler 任务改用 report_done。summary 必填（一两句话概括结果，会随依赖结果传递给下游任务）；result 可选，必须是紧凑 JSON object，其字段类型保真地进入 Graph Result 顶层，供 $.coverage 等条件路由及下游数据流消费，status/event/verdict/cited_evidence 为系统保留键，必须使用各自专用参数；checks_performed/evidence/remaining_risks 为逗号分隔的可选清单；status 可选（缺省 completed）：status=blocked 表示任务无法完成、以 blocked 终态收尾并自动唤醒 Scheduler 重新规划（blocked 终态不会放行下游依赖任务），此时 blocked_reason 必填；无法完成但不算 blocked 时也可只填 blocked_reason（会随提交向 Scheduler 登记高优 ReplanRequest），request_replan=true 仅请求重规划；event 已废弃——agentgo.graph/v2 图任务禁止携带（业务路由一律把字段写入 result object，供 {path: ...} 边条件求值；仅 v1 存量图与 legacy publish_task 路径保留旧语义）；verdict 仅用于 acceptance，固定为 pass/fixable/failed。提交前系统会执行 expected_artifacts 校验与出路预求值，缺失产物或无匹配出路时返回错误且不结束任务（可修正后重交，同一 activation 两次无匹配将升级 Scheduler 裁决）。调用成功即进入收尾（finalizing）：同一响应中排在其后的工具调用会被系统跳过不执行，因此提交前必须先完成所有写操作；每个任务只能成功提交一次。",
 			params,
 			g.submitTaskResult)
 	}

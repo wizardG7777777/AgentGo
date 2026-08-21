@@ -66,9 +66,23 @@ type GraphChangeWakeSpec struct {
 	NodeID       string
 	ActivationID string
 	TaskID       string
-	Reason       string // 结构化原因码（acceptance_disputed）
+	Reason       string // 结构化原因码（acceptance_disputed / contract_no_outlet）
 	Detail       string // 人类可读的原因摘要（不含证据正文）
+	// MarkerKind 区分唤醒任务的幂等标记（<graphID>/<activationID>/<kind>）：
+	// 空串 = "change"（request_replan 图路径与 acceptance 谱系核验共用查重）；
+	// WakeMarkerNoOutlet = 终态契约 v2 两击升级的独立标记；
+	// WakeMarkerWritebackFailed = SWE-002 终态回填失败回落的独立标记。
+	MarkerKind string
 }
+
+// WakeMarkerNoOutlet 是终态契约 v2 两击升级唤醒的幂等标记种类：
+// [graph-change-request: <graphID>/<activationID>/no-outlet]。
+const WakeMarkerNoOutlet = "no-outlet"
+
+// WakeMarkerWritebackFailed 是终态回填失败回落唤醒的幂等标记种类（SWE-002
+// 第三层防线）：[graph-change-request: <graphID>/<activationID>/writeback-failed]。
+// 与 change / no-outlet 标记互不查重，同一 activation 可同时挂多种唤醒。
+const WakeMarkerWritebackFailed = "writeback-failed"
 
 // SetChangeWaker 注入 graph change 唤醒器（构造后、使用前调用）。
 func (rt *Runtime) SetChangeWaker(w GraphChangeWaker) {
@@ -319,6 +333,12 @@ func splitCitedEvidence(raw any) []string {
 // 失败只记日志——节点 failed 终态不因此推翻（与 reactor 错误「仅记日志，
 // 绝不中断主流程」同一纪律）。
 func (rt *Runtime) wakeGraphChange(f TerminalFact, reasonCode, detail string) {
+	rt.wakeGraphChangeKind(f, reasonCode, detail, "")
+}
+
+// wakeGraphChangeKind 是 wakeGraphChange 的带幂等标记种类变体：markerKind
+// 为空沿用默认 "change" 标记；终态契约 v2 两击升级使用 WakeMarkerNoOutlet。
+func (rt *Runtime) wakeGraphChangeKind(f TerminalFact, reasonCode, detail, markerKind string) {
 	trace.Emit(trace.Event{
 		Kind: trace.KindGraphChangeRequested, TaskID: f.TaskID,
 		GraphID: f.GraphID, NodeID: f.NodeID, ActivationID: f.ActivationID,
@@ -331,7 +351,7 @@ func (rt *Runtime) wakeGraphChange(f TerminalFact, reasonCode, detail string) {
 	}
 	if err := rt.changeWaker.WakeGraphChange(GraphChangeWakeSpec{
 		GraphID: f.GraphID, NodeID: f.NodeID, ActivationID: f.ActivationID,
-		TaskID: f.TaskID, Reason: reasonCode, Detail: detail,
+		TaskID: f.TaskID, Reason: reasonCode, Detail: detail, MarkerKind: markerKind,
 	}); err != nil {
 		log.Printf("[graph] ERROR 图 %s 节点 %s graph change 唤醒任务发布失败: %v",
 			f.GraphID, f.NodeID, err)
