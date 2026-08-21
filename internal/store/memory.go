@@ -45,6 +45,9 @@ type MemoryTaskStore struct {
 	// toolCalls 记录每个任务的工具调用历史。二级索引 taskID -> toolName -> records
 	// 避免 hook 在每次工具调用前做 O(N) 全量扫描。
 	toolCalls map[string]map[string][]ToolCallRecord
+	// malformedToolNames 是畸形工具名清洗的告警去重集（占位 → 已告警），
+	// 随 AppendToolCall 持锁访问。同一垃圾名只告警一次，避免刷日志。
+	malformedToolNames map[string]struct{}
 	// artifactLog 是 task.Artifacts 的追加式持久化日志。可选——nil 时整个
 	// 持久化路径退化为纯内存行为（单测默认走这条路径，bootstrap 显式注入）。
 	// 写入路径在 s.mu 内先追加 log 并 FlushPending，fsync
@@ -1255,6 +1258,9 @@ func (s *MemoryTaskStore) ClearSchedulerBatch(taskID string) error {
 //
 // 写入路径必须在写锁下执行——llm_executor 在并行 goroutine 中调用工具
 // （一个 LLM 响应可能同时跑多个 tool call），每个 goroutine 都会触发本方法。
+//
+// 落库前清洗畸形工具名（SWE-002 第二层防线）：模型泄漏 DSML 标记产生的
+// 垃圾名替换为确定性占位（sanitizeToolNameForLedger），合法名逐字节不动。
 func (s *MemoryTaskStore) AppendToolCall(taskID string, rec ToolCallRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1262,6 +1268,7 @@ func (s *MemoryTaskStore) AppendToolCall(taskID string, rec ToolCallRecord) erro
 	if _, ok := s.tasks[taskID]; !ok {
 		return ErrTaskNotFound
 	}
+	rec.ToolName = s.sanitizeToolNameForLedger(taskID, rec.ToolName)
 	byTool, ok := s.toolCalls[taskID]
 	if !ok {
 		byTool = make(map[string][]ToolCallRecord)

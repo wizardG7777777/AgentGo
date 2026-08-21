@@ -69,6 +69,8 @@ type TaskStore interface {
 	// AppendToolCall 追加一条工具调用记录到指定任务的历史。
 	// 由 llm_executor.go 在每次 tools.Dispatch 之后自动写入（包括被 hook Abort 的调用）。
 	// hook 系统通过 StoreHookView.GetToolCallHistory 查询这些记录做事实校对。
+	// 实现方在持久化前清洗畸形工具名（含控制字符/空白/标记字符或超 64 rune 的
+	// 名字替换为确定性 malformed: 占位，SWE-002）；合法名逐字节不动。
 	AppendToolCall(taskID string, rec ToolCallRecord) error
 
 	// QueryToolCalls 返回指定任务的工具调用历史。
