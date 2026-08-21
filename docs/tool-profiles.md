@@ -102,8 +102,8 @@ agents:
 以下工具由 Scheduler 内置装配，不通过 profile 配置：
 
 - `cancel_task`
-- `list_agent_templates`：查询内置、user 和 project Catalog；不代表这些 Agent 已经运行
-- `provision_agent_team`：从模板创建一个或多个真实运行实例并注册 ready route；Graph-first 时先决定并显式传 `graph_id`，下一轮把返回的真实 route 写入该 Graph 节点
+- `list_agent_templates`：查询内置、user 和 project Catalog；不代表这些 Agent 已经运行。**2026-08-20 起 `agent_templates.enabled` 缺省 `false`，默认不注册本工具**
+- `provision_agent_team`：从模板创建一个或多个真实运行实例并注册 ready route；Graph-first 时先决定并显式传 `graph_id`，下一轮把返回的真实 route 写入该 Graph 节点。**同上，默认搁置不注册**
 - `report_done`：legacy `publish_task` batch 的显式收尾；Graph 由节点转移到 `end` 收尾
 - `report_progress`
 - `probe_directory`

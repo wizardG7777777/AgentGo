@@ -16,6 +16,9 @@
 #   保证可比性。
 # - 全程禁止联网搜索：所有 profile 均不含 web_search/web_fetch；
 #   跑后审计 trace 确认零 web 调用。
+# - agent_templates 动态组队机制默认关闭（2026-08-20 起搁置）：图节点只
+#   路由本文件声明的静态 kind——agent 节点缺省走 worker（event_type ""
+#   默认队列），只读调查路由 explore，验收路由 acceptance.verify。
 llm:
   base_url: __BASE_URL__
   api_key: ${AGENTGO_SWE_API_KEY}
@@ -53,7 +56,7 @@ tool_profiles:
 agents:
   - kind: explorer
     replicas: 4
-    event_type: ""
+    event_type: "explore"
     profile: swe_explorer
     system_prompt_file: __AGENTGO_ROOT__/prompts/swe/explorer.md
     model: __MODEL__
@@ -71,7 +74,7 @@ agents:
     description: 通用执行代理：调查、修改代码、运行 pytest 验证；无网络工具。
   - kind: verifier
     replicas: 2
-    event_type: ""
+    event_type: "acceptance.verify"
     profile: swe_verifier
     system_prompt_file: __AGENTGO_ROOT__/prompts/swe/verifier.md
     model: __MODEL__

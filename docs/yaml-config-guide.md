@@ -174,6 +174,8 @@ limits:
 - 工具名拼错或包含 Scheduler 独占 DAG 工具会在启动期失败；YAML 未知字段和同一文件中的第二个 YAML document 也会被拒绝。
 - 同 namespace 的 `name@version` 不能重复，内置 ref 不能覆盖。Catalog 为每个模板计算 digest，持久化 TeamSpec 记录 ref+digest 用于恢复校验。
 
+> **2026-08-20 起模板机制默认搁置**：`agent_templates.enabled` 缺省 `false`，Scheduler 不注册 `list_agent_templates` / `provision_agent_team`，资源快照不含 `agent_templates`，图节点只能路由 `agents:` 声明的静态 kind（静态路由纪律见 Scheduler 提示词）。机制在静态 Agent 流程验证稳定前有意搁置，显式 `enabled: true` 仅恢复工具注册（提示词组队教程尚未恢复）。以下流程描述仅在开启后适用。
+
 Scheduler 不能先提交引用虚构 route 的 Graph 再尝试创建 Agent。Graph-first 时先决定合法 `graph_id`，以该 ID 调 `provision_agent_team`；工具只有在 Team 已绑定 `graph:<id>` 且 route ready 后才成功返回。Scheduler 下一轮读取真实 route 并写入 Graph 节点，`submit_graph` / `patch_graph` 会对 route scope 与 capability fail-closed 校验。origin Scheduler task 终态不回收 Graph Team，`graph_ended` 才回收；省略 `graph_id` 仅是 legacy task-owned 路径。完整生命周期见 [AgentTemplate.md](activate/AgentTemplate.md)。
 
 ### 1.6 `infra:` — 运行时基础设施（可选，全有默认）

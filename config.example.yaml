@@ -82,15 +82,21 @@ scheduler:
 #   topo: team
 
 # ============================================================
-# AgentTemplate（可选）
+# AgentTemplate（可选；2026-08-20 起整套机制默认搁置）
 #
-# 不配置目录也始终提供：
+# enabled 缺省 false：Scheduler 不注册 list_agent_templates /
+# provision_agent_team，图节点只路由下方 agents: 声明的静态 kind。
+# 模板机制在静态 Agent 流程验证稳定前有意搁置；显式 enabled: true
+# 可重新开放工具注册（提示词组队教程尚未恢复，仅供机制实验）。
+#
+# 开启后不配置目录也始终提供：
 #   builtin/generalist@1 / builtin/explorer@1 / builtin/verifier@1
 # user_dirs 中模板获得 user/ namespace，project_dirs 获得 project/ namespace。
 # 项目模板推荐放在可 git 评审的 agent-templates/，不要放进通常被忽略的 .agentgo/。
 # 每个 YAML 文件只定义一个模板；schema 见 docs/activate/AgentTemplate.md。
 # ============================================================
 # agent_templates:
+#   enabled: false
 #   user_dirs:
 #     - /Users/me/.config/agentgo/templates
 #   project_dirs:
@@ -100,9 +106,9 @@ scheduler:
 # ============================================================
 # 预热 Agent kind 列表（可选：kind × replicas，同 kind 内完全同质）
 #
-# 整段 agents: 都可以省略。此时启动快照中真实 worker 数量为 0，Scheduler
-# 会先用 list_agent_templates / provision_agent_team 创建真实 route，再发布下一轮 Task。
-# 保留本段则在启动时创建常驻 Agent，适合已知的高频角色或降低首任务延迟。
+# 整段 agents: 都可以省略，但模板机制搁置期间这意味着没有任何可认领
+# 任务的 route，Scheduler 将无人可用——图节点只能路由这里声明的静态
+# kind，请按角色需要保留本段（降低首任务延迟之外的另一层必要性）。
 # ============================================================
 agents:
   - kind: worker

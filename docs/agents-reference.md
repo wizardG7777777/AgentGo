@@ -127,7 +127,7 @@ main.go（子命令 trace / config 分流；否则 -config 等 flags）
 | Meta | `publish_task` `send_message` `request_user_input` |
 | PlanControl | `submit_task_result` `request_replan` |
 | Scheduler 专属 | `cancel_task` `get_task_result` `report_done` `report_progress` `probe_directory` |
-| AgentTemplate（Scheduler 专属） | `list_agent_templates` `provision_agent_team` |
+| AgentTemplate（Scheduler 专属；2026-08-20 起 `agent_templates.enabled` 缺省 `false`，默认搁置不注册） | `list_agent_templates` `provision_agent_team` |
 
 普通 Runner 的工具来自 `tool_profiles` 或 `agents[].tools`；Scheduler 专属组不走 profile。`publish_task` 另接受可选 `tools`（逗号分隔子集）、`model` 与 `isolation`（唯一合法值 `"workspace"`）参数（仅 Scheduler 计划控制面可设置），为单个 DAG 节点声明能力覆盖（`model.NodeCapability`）：认领 Runner 当次换入过滤后的工具视图并临时替换模型，任务结束恢复；`isolation:"workspace"` 节点在写时复制 overlay 中执行（写落 `.agentgo/workspaces/<taskID>/`），成功终态自动合并回主根，冲突 → failed + 通用 replan 唤醒（`docs/design/workspace-isolation.md`）。节点工具集必须 ⊆ 某条现存路由的白名单——`QueryAvailable` 按认领方过滤 + `ClaimTask` 落锁前 capability checker 叠加检查（fail-closed），越界任务对所有 Runner 不可见，滞留至 Watchdog `claim_starvation` 告警后由 Scheduler 修复。
 

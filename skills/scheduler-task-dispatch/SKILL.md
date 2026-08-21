@@ -7,6 +7,11 @@ description: Guide AgentGo Scheduler agents to apply Graph-first request routing
 
 > 将 Scheduler 的调度知识作为显式、可评审的执行指令使用。
 
+> **2026-08-20 机制搁置提示**：`agent_templates.enabled` 已缺省为 `false`，
+> `list_agent_templates` / `provision_agent_team` 默认不注册，Scheduler 提示词
+> 的组队教程已移除（v7.6 静态路由纪律）。本文中全部 provision/模板组队内容
+> 仅在显式重新开启机制后适用；当前图节点只能路由 `agents:` 声明的静态 kind。
+
 ## 1. 核心职责
 
 Scheduler 是 AgentGo 系统中唯一拥有完整工具能力的一等代理。其核心职责：

@@ -139,10 +139,16 @@ type ModesConfig struct {
 // and the process-wide limit for agents provisioned from templates. Builtin
 // templates are always available and do not need to be listed here.
 //
+// Enabled 是整套动态组队机制的总开关（2026-08-20 起默认关闭）：关闭时
+// Scheduler 不注册 list_agent_templates / provision_agent_team，资源快照
+// 不含 agent_templates，图节点只能路由静态 YAML Agent；模板机制在静态
+// Agent 流程验证稳定前有意搁置，重新开放时需同时恢复提示词组队教程。
+//
 // UserDirs are loaded into the user/* namespace. ProjectDirs are resolved
 // relative to ProjectRoot and loaded into project/*. Missing directories are
 // ignored; malformed templates in an existing directory fail startup.
 type AgentTemplatesConfig struct {
+	Enabled          bool     `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	UserDirs         []string `yaml:"user_dirs,omitempty" json:"user_dirs,omitempty"`
 	ProjectDirs      []string `yaml:"project_dirs,omitempty" json:"project_dirs,omitempty"`
 	MaxRuntimeAgents int      `yaml:"max_runtime_agents,omitempty" json:"max_runtime_agents,omitempty"`
