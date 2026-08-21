@@ -449,9 +449,12 @@ func TestGraphBoardMissingTaskEffectPoliciesAllFailClosed(t *testing.T) {
 
 // fakeTerminalSink 记录收到的 TerminalFact（实现 graphTerminalSink）。
 type fakeTerminalSink struct {
-	mu    sync.Mutex
-	facts []graph.TerminalFact
-	err   error
+	mu       sync.Mutex
+	facts    []graph.TerminalFact
+	err      error
+	fbErr    error
+	fbFacts  []graph.TerminalFact
+	fbCauses []error
 }
 
 type taskCancelledCapture struct {
@@ -513,6 +516,21 @@ func (f *fakeTerminalSink) OnTaskTerminal(fact graph.TerminalFact) error {
 	defer f.mu.Unlock()
 	f.facts = append(f.facts, fact)
 	return f.err
+}
+
+// FailTerminalWriteback 记录回落调用（SWE-002 第三层防线的 fake 实现）。
+func (f *fakeTerminalSink) FailTerminalWriteback(fact graph.TerminalFact, cause error) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fbFacts = append(f.fbFacts, fact)
+	f.fbCauses = append(f.fbCauses, cause)
+	return f.fbErr
+}
+
+func (f *fakeTerminalSink) fbCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.fbFacts)
 }
 
 func (f *fakeTerminalSink) count() int {
@@ -695,18 +713,50 @@ func TestGraphFeedResultMergesTaskResults(t *testing.T) {
 	}
 }
 
-// TestGraphFeedSinkError 验证引擎错误原样返回（由 Registry 的 reliable async 路径
-// 记录结构化错误，feed 自身不吞咽也不放大）。
+// TestGraphFeedSinkError 验证 OnTaskTerminal 报错时 feed 走 SWE-002 回落：
+// 以同一终态事实与原始 cause 调 FailTerminalWriteback；回落成功即终态事实
+// 已有处置（节点 failed + 唤醒），Run 返回 nil。
 func TestGraphFeedSinkError(t *testing.T) {
 	s := store.NewMemoryTaskStore(nil, 100, 1, 300)
-	sink := &fakeTerminalSink{err: errors.New("图不存在")}
+	sinkErr := errors.New("图不存在")
+	sink := &fakeTerminalSink{err: sinkErr}
 	feed := newGraphFeedReactor(s, sink)
 	id := publishGraphTask(t, s, "g-1", "root", "root@1")
 	if err := s.TransitionState(id, model.TaskStatusPending, model.TaskStatusCancelled); err != nil {
 		t.Fatalf("置 cancelled: %v", err)
 	}
-	if err := feed.Run(trace.Event{Kind: trace.KindTaskCancelled, TaskID: id}); err == nil {
-		t.Error("引擎返回错误时 Run 应原样返回该错误")
+	if err := feed.Run(trace.Event{Kind: trace.KindTaskCancelled, TaskID: id}); err != nil {
+		t.Fatalf("回落成功时 Run 应返回 nil（终态事实已处置）: %v", err)
+	}
+	if sink.fbCount() != 1 {
+		t.Fatalf("回填失败应触发 1 次回落，实际 %d", sink.fbCount())
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if sink.fbFacts[0].GraphID != "g-1" || sink.fbFacts[0].NodeID != "root" || sink.fbFacts[0].ActivationID != "root@1" || sink.fbFacts[0].TaskID != id {
+		t.Errorf("回落收到的终态事实身份不符: %+v", sink.fbFacts[0])
+	}
+	if !errors.Is(sink.fbCauses[0], sinkErr) {
+		t.Errorf("回落收到的 cause 应为 OnTaskTerminal 原始错误 %v，实际 %v", sinkErr, sink.fbCauses[0])
+	}
+}
+
+// TestGraphFeedSinkFallbackError 验证回落自身再失败（persistence-degraded
+// 情形）：Run 返回合并错误交 Registry 记日志，终态事实只剩告警。
+func TestGraphFeedSinkFallbackError(t *testing.T) {
+	s := store.NewMemoryTaskStore(nil, 100, 1, 300)
+	sink := &fakeTerminalSink{err: errors.New("证据越界拒写"), fbErr: errors.New("图持久化降级")}
+	feed := newGraphFeedReactor(s, sink)
+	id := publishGraphTask(t, s, "g-1", "root", "root@1")
+	if err := s.TransitionState(id, model.TaskStatusPending, model.TaskStatusCancelled); err != nil {
+		t.Fatalf("置 cancelled: %v", err)
+	}
+	err := feed.Run(trace.Event{Kind: trace.KindTaskCancelled, TaskID: id})
+	if err == nil {
+		t.Fatal("回落也失败时 Run 应返回合并错误")
+	}
+	if !strings.Contains(err.Error(), "证据越界拒写") || !strings.Contains(err.Error(), "图持久化降级") {
+		t.Errorf("合并错误应同时含回填失败与回落失败原因: %v", err)
 	}
 }
 

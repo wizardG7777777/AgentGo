@@ -123,6 +123,10 @@ type TaskSpec struct {
 	// 当前可解引用缺口显式注入 verifier；缺口存在时 verifier 应 blocked。
 	RequiredEvidence []EvidenceRequirement
 	MissingEvidence  []EvidenceRequirement
+	// OutputContract 是终态契约 v2 的输出契约定界块（<output-contract>…），
+	// 发布时由 Runtime 从本 activation 冻结出边机械派生（§5）；v1 图与无
+	// path 条件节点恒为空串，任务桥不注入。
+	OutputContract string
 }
 
 // 节点类型 → 默认认领路由（runner event_type）的映射常量。
@@ -221,6 +225,12 @@ type Runtime struct {
 	// session 切换后自动取到新值；nil 时行为同今（归属恒为空串）。
 	sessionIDProvider func() string
 
+	// workLogProvider 按来源 Task ID 聚合渲染该任务的工具调用工作记录
+	//（2026-08-21 上游摘要）：转移结算时调用一次、渲染结果随 EdgeInput
+	// 冻结——下游任务发布时只读冻结文本，绝不按 task_id 回查源账本
+	//（与「禁止 inspect_task_calls 旁路」红线同源）。nil 时 WorkLog 恒空。
+	workLogProvider func(taskID string) string
+
 	// results 是节点最新 Result 的纯内存缓存（graphID → nodeID → Result），
 	// 只作进程内便捷读取。权威数据是 activation Result Store；重启、join、
 	// router 与大结果恢复均通过稳定 ResultRef 解引用，绝不回退展示摘要。
@@ -283,6 +293,15 @@ func (rt *Runtime) SetSessionIDProvider(fn func() string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	rt.sessionIDProvider = fn
+}
+
+// SetWorkLogProvider 注入上游工作记录的聚合渲染器（构造后、使用前调用）。
+// 转移结算时对来源 Task ID 调用一次，渲染文本随 EdgeInput.WorkLog 冻结；
+// nil 时行为同今（WorkLog 恒空，老图与测试直构路径不受影响）。
+func (rt *Runtime) SetWorkLogProvider(fn func(taskID string) string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.workLogProvider = fn
 }
 
 // SubmitGraph 校验并提交一张图（durable），随后激活 root。
@@ -699,8 +718,17 @@ func (rt *Runtime) evalTransitionsLocked(graphID, nodeID, activationID string, s
 	// 进入 EdgeInput。老 journal/测试可能直接构造 Settlement 而未先写
 	// ActivationResult，此处在任何 transition 前做幂等补写。
 	var srcEvidence []EvidenceEntry
+	srcTaskID := ""
 	if node.Execution != nil && node.Execution.ActivationID == activationID {
 		srcEvidence = node.Execution.Evidence
+		srcTaskID = node.Execution.TaskID
+	}
+	// 上游工作记录（2026-08-21）：按来源 Task 聚合渲染一次，随每条生效边
+	// 冻结进 EdgeInput——同一 activation 的多条边共享同一文本；无 provider
+	// 或来源无 Task（内建节点/直构测试）时为空。
+	workLog := ""
+	if rt.workLogProvider != nil && srcTaskID != "" {
+		workLog = rt.workLogProvider(srcTaskID)
 	}
 	resultRef := activationResultRef(graphID, activationID)
 	if _, ok := rt.store.ResolveActivationResult(graphID, resultRef); !ok {
@@ -734,6 +762,7 @@ func (rt *Runtime) evalTransitionsLocked(graphID, nodeID, activationID string, s
 			return errors.Join(rt.failGraph(graphID, reason), fmt.Errorf("graph: %s", reason))
 		}
 		rec.Input = newEdgeInputWithRef(result, resultRef, srcEvidence)
+		rec.Input.WorkLog = workLog
 		sv, err := rt.stateVersion(graphID)
 		if err != nil {
 			return err
@@ -2432,6 +2461,14 @@ func (rt *Runtime) taskSpecFor(graphID, nodeID string, node Node, exec Execution
 	if node.Kind == KindAcceptance {
 		spec.MissingEvidence = rt.missingEvidenceRequirements(graphID, exec, spec.RequiredEvidence)
 	}
+	// 终态契约 v2 §5：任务发布时从本 activation 冻结定义的出边机械派生
+	// 输出契约（随任务描述钉入 TaskMemory）。v1 图不注入（零行为变化）；
+	// 无 path 条件出边时 RenderOutputContract 返回空串，任务桥自然跳过。
+	// 派生以冻结定义为准：patch_graph 只影响后续 activation，重进发布的新
+	// 任务按当时冻结定义重新派生。
+	if doc, ok := rt.store.Get(graphID); ok && doc.Schema == SchemaV2 {
+		spec.OutputContract = RenderOutputContract(nodeForExecution(node, exec).Next)
+	}
 	return spec
 }
 
@@ -2859,6 +2896,7 @@ func (rt *Runtime) inputsFor(graphID, nodeID, activationID string) []InputBindin
 				b.Result = append(json.RawMessage(nil), rec.Input.Result...)
 			}
 			b.Truncated = rec.Input.Truncated
+			b.WorkLog = rec.Input.WorkLog
 		}
 		out = append(out, b)
 	}

@@ -267,11 +267,24 @@ func (b *graphBoard) missingTaskEffectFence(taskID string) (string, string) {
 // 保留来源、摘要、ResultRef 与截断事实，完整大数据应由 artifact/evidence 承载。
 const graphTaskInputMaxRunes = 96 * 1024
 
-// graphTaskDescription 组装图任务描述。完整 Result 与 Evidence 都只能取自
-// TaskSpec.Inputs 中已经随目标 activation 冻结的 InputBinding；发布时禁止按
-// task_id 回查源 TaskStore，否则恢复/淘汰/并行时序会改变下游实际看到的数据，
-// 也会重新制造 inspect_task_calls 式旁路。
+// graphTaskDescription 组装图任务描述：数据流注入
+// （graphTaskDescriptionWithInputs）之后，把终态契约 v2 的输出契约定界块
+// 追加到任务描述尾部（「## 上游输入」段之后，不破坏既有段落）。契约是
+// 系统级收口纪律，必须完整随任务冻结，因此不占用 graphTaskInputMaxRunes
+// 的上游注入上限；空契约（v1 图/无 path 条件节点）原样返回。
 func graphTaskDescription(spec graph.TaskSpec) string {
+	desc := graphTaskDescriptionWithInputs(spec)
+	if strings.TrimSpace(spec.OutputContract) == "" {
+		return desc
+	}
+	return desc + "\n\n" + spec.OutputContract
+}
+
+// graphTaskDescriptionWithInputs 组装图任务描述的数据流部分。完整 Result
+// 与 Evidence 都只能取自 TaskSpec.Inputs 中已经随目标 activation 冻结的
+// InputBinding；发布时禁止按 task_id 回查源 TaskStore，否则恢复/淘汰/
+// 并行时序会改变下游实际看到的数据，也会重新制造 inspect_task_calls 式旁路。
+func graphTaskDescriptionWithInputs(spec graph.TaskSpec) string {
 	base := spec.Title
 	if spec.Description != "" {
 		base = spec.Title + "\n\n" + spec.Description
@@ -335,6 +348,13 @@ func graphTaskDescription(spec graph.TaskSpec) string {
 				truncated = true
 			}
 			appendPart("\n结果摘要: " + summary)
+		}
+		// 上游工作记录（2026-08-21 上游摘要）：转移结算时随 EdgeInput 冻结
+		// 的机械事实（工具统计/文件清单），供下游与 verifier 交叉核对上游
+		// 自述——声称「已验证」但 shell×0 即证据不足。摘要只是事实不是
+		// verdict；空串（无 provider / 内建节点 / 老图）跳过整行。
+		if in.WorkLog != "" {
+			appendPart("\n工作记录（Runtime 机械生成）: " + strings.ReplaceAll(in.WorkLog, "\n", "\n  "))
 		}
 		if in.ResultRef != "" {
 			appendPart("\n稳定 ResultRef: " + in.ResultRef + "（绑定身份；不是可猜测的结果正文）")
@@ -434,6 +454,10 @@ func resolveEvidenceRefs(inputs []graph.InputBinding) map[string]graph.EvidenceE
 // （*graph.Runtime 满足）；单测用 fake 注入。
 type graphTerminalSink interface {
 	OnTaskTerminal(f graph.TerminalFact) error
+	// FailTerminalWriteback 是 OnTaskTerminal 失败的回落（SWE-002）：把该
+	// activation 节点显式置 failed 并唤醒 Scheduler 裁决，保证终态事实
+	// 永远有处置路径。
+	FailTerminalWriteback(f graph.TerminalFact, cause error) error
 }
 
 // graphFeedReactor 把任务终态事件回填给 Graph Runtime：取终态任务的图身份
@@ -816,7 +840,7 @@ func (r *graphFeedReactor) Run(ev trace.Event) error {
 			ev.TaskID, ev.Kind, task.Status)
 		return nil
 	}
-	return r.sink.OnTaskTerminal(graph.TerminalFact{
+	fact := graph.TerminalFact{
 		GraphID:      task.GraphID,
 		NodeID:       task.NodeID,
 		ActivationID: task.ActivationID,
@@ -824,7 +848,23 @@ func (r *graphFeedReactor) Run(ev trace.Event) error {
 		Status:       status,
 		Result:       graphTaskResult(task),
 		Evidence:     assembleTaskEvidence(r.store, task),
-	})
+	}
+	if err := r.sink.OnTaskTerminal(fact); err != nil {
+		// 终态事实不许无处置（SWE-002 第三层防线）：回落把节点显式置 failed
+		// 并经 GraphChangeWakeSpec 发布幂等 writeback-failed 唤醒任务，交
+		// Scheduler 裁决。刻意不做盲重试——确定性数据错误（如证据越界拒写）
+		// 重试必然复发；瞬时 IO 失败经「节点 failed + 转移求值/Scheduler
+		// 重激活」是更诚实的恢复路径。
+		if fbErr := r.sink.FailTerminalWriteback(fact, err); fbErr != nil {
+			log.Printf("[graph] ERROR 任务 %s（图 %s 节点 %s activation %s）终态回填失败: %v；回落处置返回错误: %v——若节点未能置 failed，终态事实仅剩本日志，persistence-degraded 另有 fail-closed 告警",
+				task.ID, task.GraphID, task.NodeID, task.ActivationID, err, fbErr)
+			return errors.Join(err, fbErr)
+		}
+		log.Printf("[graph] WARN 任务 %s（图 %s 节点 %s activation %s）终态回填失败: %v；已交回落处置（activation 在途则置 failed 并发 writeback-failed 唤醒；图已终态/activation 过期则安全 no-op）",
+			task.ID, task.GraphID, task.NodeID, task.ActivationID, err)
+		return nil
+	}
+	return nil
 }
 
 // ============================================================
@@ -894,7 +934,7 @@ func evidenceCallEntry(ref string, call store.ToolCallRecord) graph.EvidenceEntr
 	success := call.Success
 	entry := graph.EvidenceEntry{
 		Ref: ref, Kind: evidenceKindOf(call.ToolName), Summary: evidenceCallSummary(call),
-		CallID: call.CallID, ToolName: call.ToolName, Success: &success,
+		CallID: call.CallID, ToolName: evidenceToolNameOf(call.ToolName), Success: &success,
 	}
 	arg := func(key string) string {
 		value, _ := call.Args[key].(string)
@@ -982,8 +1022,18 @@ func stableEvidenceRef(taskID, kind, identity string) string {
 	return fmt.Sprintf("ev:%s:%s:%x", taskID, kind, sum[:16])
 }
 
+// evidenceKindMaxRunes 是证据 kind 保留自定义工具名的长度上限（与落库清洗
+// 的合法名上限同口径；store 侧 kind 硬上限是 MaxIDLength=128）。
+const evidenceKindMaxRunes = 64
+
 // evidenceKindOf 把工具名归并为证据种类（shell/file_write/file_edit/read/web/
 // artifact 之外保留原工具名，便于下游按种类粗筛）。
+//
+// fallthrough 不再原样透传（SWE-002 第一层防线）：字符形状非法（空、非字母
+// 开头、含 [a-zA-Z0-9_.:-] 之外字符——如模型 DSML 泄漏产生的畸形「工具名」）
+// 一律归一为 "unknown"；形状合法但超 64 rune 按 boundedEvidenceValue 截断。
+// kind 受 store validateEvidenceEntryBounds 的 MaxIDLength=128 约束，原样透传
+// 会让整条 activation result 被拒写、终态事实丢失。
 func evidenceKindOf(toolName string) string {
 	switch toolName {
 	case "run_shell":
@@ -997,7 +1047,25 @@ func evidenceKindOf(toolName string) string {
 	case "web_search", "web_fetch":
 		return "web"
 	}
-	return toolName
+	if !store.IsToolNameCharsetLegal(toolName) {
+		return "unknown"
+	}
+	bounded, _ := boundedEvidenceValue(toolName, evidenceKindMaxRunes)
+	return bounded
+}
+
+// evidenceToolNameOf 归一证据条目的 tool_name 字段（SWE-002 第一层防线）：
+// 不合法（空、超 64 rune、含字符集外字符）替换为确定性占位
+// malformed:<sha256(raw)前12hex>——同一垃圾名永远同一占位，不同垃圾名可区分；
+// 合法但超 EvidenceIdentityMaxRunes 时按 boundedEvidenceValue 截断（当前合法
+// 名 ≤ 64 rune，此分支是防御兜底）。原始垃圾名不进证据层——trace 的工具调用
+// 事件仍保留原始 ToolCall 可对账。
+func evidenceToolNameOf(raw string) string {
+	if !store.IsWellFormedToolName(raw) {
+		return store.MalformedToolNamePlaceholder(raw)
+	}
+	bounded, _ := boundedEvidenceValue(raw, graph.EvidenceIdentityMaxRunes)
+	return bounded
 }
 
 // evidenceCallSummary 生成单条工具调用的有界摘要：shell 含命令与退出码，
@@ -1121,6 +1189,9 @@ func wireGraphRuntime(cfg *config.Config, taskStore store.TaskStore, reactorReg 
 	}
 	rt := graph.NewRuntime(gs, newGraphBoardWithEffects(taskStore, effectJournal, recoveryQuarantine...))
 	rt.SetSessionIDProvider(sessionIDProvider)
+	// 上游工作记录（2026-08-21 上游摘要）：转移结算时按来源 Task ID 聚合
+	// ToolCallRecord 并随 EdgeInput 冻结；下游任务发布只读冻结文本。
+	rt.SetWorkLogProvider(newGraphWorkLogProvider(taskStore))
 	// 上面的 gs.Recover 只负责把历史图从磁盘读回内存。2026-08 起启动永远是
 	// 全新 Session 且进入会话不自动续跑：会话模式下全部历史图（含无归属
 	// 图，以及 --resume 会话自己的图）一次性停驻——吞终态事件、停 wait

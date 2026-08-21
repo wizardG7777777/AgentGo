@@ -23,6 +23,11 @@ import (
 // SchemaV1 是首版 GraphDocument 的 schema 标识，必须逐字匹配。
 const SchemaV1 = "agentgo.graph/v1"
 
+// SchemaV2 是终态契约 v2（封闭终态 + 数据流路由）的 schema 标识，必须逐字
+// 匹配。v2 废弃 agent/controller 出边的业务事件名，业务路由全走 result
+// 数据字段 + path 条件（权威设计见 docs/design/graph-terminal-contract-v2.md）。
+const SchemaV2 = "agentgo.graph/v2"
+
 // GraphDocument 是整张图的类型化模型（JSON 对外契约 + 进程内读写对象）。
 //
 // 字段所有权（由 GraphStore 的角色分离变更 API + CAS 强制，见 store.go）：
@@ -32,7 +37,7 @@ const SchemaV1 = "agentgo.graph/v1"
 //   - 调度与认领系统：写节点的 Executor；
 //   - Agent Loop / Harness：写节点的 Execution（结果与证据引用）。
 type GraphDocument struct {
-	Schema       string      `json:"schema"`        // 必须恰为 "agentgo.graph/v1"
+	Schema       string      `json:"schema"`        // 必须恰为 SchemaV1 或 SchemaV2
 	GraphID      string      `json:"graph_id"`      // 图 ID，非空，字符集见校验链
 	Revision     int64       `json:"revision"`      // 定义版本：任务定义/节点/连接/执行要求变化时 +1
 	StateVersion int64       `json:"state_version"` // 状态版本：认领/进度/结果/审批/边选择变化时 +1
@@ -192,6 +197,26 @@ type Execution struct {
 	// ChildGraphID 是 subgraph 节点物化出的子图 ID
 	// （<父图ID>/<父节点activationID>；空表示尚未物化）。
 	ChildGraphID string `json:"child_graph_id,omitempty"`
+	// OutletCheck 是终态契约 v2 提交期出路检查的两击持久态（仅 schema v2 图
+	// 的任务型节点使用）。随 Execution durable（与 execution_status journal
+	// 记录同条生效），崩溃恢复不丢；activation 以 "new" 重进时随 Execution
+	// 整体替换自然归零。
+	OutletCheck *OutletCheckState `json:"outlet_check,omitempty"`
+}
+
+// OutletCheckState 是终态契约 v2（docs/design/graph-terminal-contract-v2.md §6）
+// 两击升级协议的按 activation 持久化计数态：「无匹配出路」的提交按 activation
+// 计数，参数级错误（携带 event、status 越界、verdict 用于非 acceptance）不计入。
+type OutletCheckState struct {
+	// Strikes 是「无匹配出路」提交的次数：1 = 首击（已拒绝、可修正重交）；
+	// 2 = 第二击（已升级 Scheduler 裁决）。
+	Strikes int `json:"strikes,omitempty"`
+	// FirstSubmission 是首击提交（status + result）的有界摘要，第二击的失败
+	// 原因需对账两次提交内容。
+	FirstSubmission string `json:"first_submission,omitempty"`
+	// Escalated 为 true 表示第二击已升级（节点 failed + no-outlet 唤醒已发）；
+	// 后续提交幂等拒绝，不重复升级、不重复唤醒。
+	Escalated bool `json:"escalated,omitempty"`
 }
 
 // ============================================================
@@ -232,6 +257,11 @@ type EdgeInput struct {
 	EvidenceRefs []string        `json:"evidence_refs,omitempty"`
 	Result       json.RawMessage `json:"result,omitempty"`
 	Truncated    bool            `json:"truncated,omitempty"`
+	// WorkLog 是来源 activation 对应 Task 的工具调用工作记录（2026-08-21
+	// 上游摘要）：转移结算时由 Runtime 经注入的 provider 一次性聚合渲染并
+	// 随本记录冻结——下游据此感知「上游实际做了什么」（机械事实，非上游
+	// 自述），空串表示无 provider 或来源无调用记录可述。
+	WorkLog string `json:"work_log,omitempty"`
 }
 
 // InputBinding 是目标 activation 的一份持久化输入绑定：activation 创建时
@@ -249,6 +279,9 @@ type InputBinding struct {
 	EvidenceRefs       []string        `json:"evidence_refs,omitempty"`
 	Result             json.RawMessage `json:"result,omitempty"`
 	Truncated          bool            `json:"truncated,omitempty"`
+	// WorkLog 透传自 TransitionRecord.Input.WorkLog（来源 Task 的工具调用
+	// 工作记录，转移结算时冻结）。随本绑定落盘，恢复后不变。
+	WorkLog string `json:"work_log,omitempty"`
 }
 
 // ActivationResult 是按 activation 保存的完整、不可变 Result 与证据事实。
