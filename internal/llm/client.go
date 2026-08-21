@@ -269,8 +269,11 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
 				log.Printf("[llm] tool call %q 参数 JSON 解析失败: %v (raw: %s)",
 					tc.Function.Name, err, tc.Function.Arguments)
+				// 载荷尺寸入错（2026-08-20 SWE-001 预防 1）：长 JSON 是损坏
+				// 主因，重试交接时该事实帮助模型决定分批提交。
 				return Response{}, &ErrBadResponse{
-					Err: fmt.Errorf("tool call %q 参数解析失败: %w", tc.Function.Name, err),
+					Err: fmt.Errorf("tool call %q 参数解析失败（载荷 %d 字符）: %w",
+						tc.Function.Name, len([]rune(tc.Function.Arguments)), err),
 				}
 			}
 		}
@@ -396,7 +399,9 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 		args := make(map[string]any)
 		if tc.Function.Arguments != "" {
 			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-				return emitFailure(&ErrBadResponse{Err: fmt.Errorf("流式 tool call %q 参数解析失败: %w", tc.Function.Name, err)})
+				// 与非流式同口径：载荷尺寸入错（2026-08-20 SWE-001 预防 1）。
+				return emitFailure(&ErrBadResponse{Err: fmt.Errorf("流式 tool call %q 参数解析失败（载荷 %d 字符）: %w",
+					tc.Function.Name, len([]rune(tc.Function.Arguments)), err)})
 			}
 		}
 		toolCalls = append(toolCalls, ToolCall{ID: tc.ID, Name: tc.Function.Name, Arguments: args})

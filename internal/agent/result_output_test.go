@@ -71,7 +71,10 @@ func TestAgent_NaturalCompletion_FallsBackToUserOutput(t *testing.T) {
 // Graph controller 的自然文本是节点 Result，不是整张图的用户
 // 结果。它仍应以 completed 结算节点，但必须保持 ResultOutput
 // 静默；最终回复由 graph_ended 唤醒的非图 Scheduler task 产生。
-func TestAgent_GraphControllerNaturalCompletion_DoesNotWriteUserResult(t *testing.T) {
+// 2026-08-20 SWE-001 起图节点任务纯文本自然退出被拒（须 submit_task_result
+// 结构化收口）；本测试经 Finalized 信号模拟结构化收口完成，验证图 controller
+// 结算不污染用户级结果面。
+func TestAgent_GraphControllerFinalizedCompletion_DoesNotWriteUserResult(t *testing.T) {
 	s, r, _ := setup()
 	task := &model.Task{
 		Description:   "graph controller node",
@@ -89,7 +92,8 @@ func TestAgent_GraphControllerNaturalCompletion_DoesNotWriteUserResult(t *testin
 	}
 
 	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
-		return ExecuteResult{Output: "INTERNAL-GRAPH-CONTROLLER-RESULT", ToolCalled: false}, nil
+		// Finalized 模拟 submit_task_result 已被接受（图节点任务的结构化收口）。
+		return ExecuteResult{Output: "INTERNAL-GRAPH-CONTROLLER-RESULT", ToolCalled: false, Finalized: true}, nil
 	}
 
 	var userOut, resultOut strings.Builder

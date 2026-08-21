@@ -301,7 +301,9 @@ func TestProcessTask_IsolationMergeConflictGraphTaskSkipsReplanWake(t *testing.T
 	}
 
 	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
-		return ExecuteResult{Output: "done"}, nil
+		// Finalized 模拟 submit_task_result 已被接受（SWE-001 起图节点纯文本
+		// 退出被拒），使流程抵达合并点。
+		return ExecuteResult{Output: "done", Finalized: true}, nil
 	}
 	ag := NewAgent(agentID, "code", s, r, exec)
 	ag.WorkspaceManager = mgr

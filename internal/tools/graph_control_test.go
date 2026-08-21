@@ -511,3 +511,51 @@ func TestGraphControlGroupRegistersAllTools(t *testing.T) {
 		}
 	}
 }
+
+// submit_graph 长 JSON 防线（2026-08-20 SWE-001 预防 1）：
+//   - JSON 语法期失败：错误必须附带「骨架图 + patch_graph 逐次扩展」分批建议；
+//   - 载荷超 graphJSONAdviseThreshold 但合法：正常接受，返回值附温和提醒；
+//   - 阈值下无提醒（中小图不受打扰）。
+func TestSubmitGraphSyntaxFailureCarriesBatchAdvice(t *testing.T) {
+	g, _, _ := newGraphControlEnv(t)
+	// 语法损坏的图 JSON（节点定义半截截断）
+	broken := `{"schema":"agentgo.graph/v1","graph_id":"g-broken","revision":1,"state_version":0,"root":"work","status":"pending","nodes":{"work":{"kind":"agent","task":{"title":"执行`
+	_, err := g.submitGraph(context.Background(), map[string]any{"graph": broken})
+	if err == nil {
+		t.Fatal("语法损坏应拒绝")
+	}
+	if !strings.Contains(err.Error(), "JSON语法") {
+		t.Fatalf("应报 JSON 语法阶段: %v", err)
+	}
+	if !strings.Contains(err.Error(), "骨架图") || !strings.Contains(err.Error(), "patch_graph") {
+		t.Fatalf("语法期失败应附分批建议: %v", err)
+	}
+}
+
+func TestSubmitGraphLargePayloadAdvisory(t *testing.T) {
+	g, _, _ := newGraphControlEnv(t)
+	// 合法但超阈值的载荷：长描述垫大（rune 计）
+	bigDesc := strings.Repeat("实施", graphJSONAdviseThreshold/2+100)
+	big := strings.Replace(graphToolGraphJSON, `"graph_id": "g-tool-basic"`, `"graph_id": "g-tool-big"`, 1)
+	big = strings.Replace(big, `"title":"实施修改"`, `"title":"`+bigDesc+`"`, 1)
+	if len([]rune(big)) <= graphJSONAdviseThreshold {
+		t.Fatalf("测试资产错误：载荷 %d 未超阈值", len([]rune(big)))
+	}
+	reply, err := g.submitGraph(context.Background(), map[string]any{"graph": big})
+	if err != nil {
+		t.Fatalf("超阈值合法图仍应接受: %v", err)
+	}
+	if !strings.Contains(reply, "风险区") || !strings.Contains(reply, "骨架图") {
+		t.Errorf("超阈值应附温和提醒: %s", reply)
+	}
+
+	// 阈值以下：无提醒（与既有成功路径逐字节一致）
+	g2, _, _ := newGraphControlEnv(t)
+	reply2, err := g2.submitGraph(context.Background(), map[string]any{"graph": graphToolGraphJSON})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(reply2, "风险区") {
+		t.Errorf("阈值以下不应有提醒: %s", reply2)
+	}
+}

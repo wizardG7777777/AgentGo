@@ -287,3 +287,38 @@ func TestApplyTurn_SealedRejectsUpdate(t *testing.T) {
 		t.Errorf("Sealed 后 Facts 不应增长, got %+v", m.Facts)
 	}
 }
+
+// ApplyAttemptEnd（2026-08-20 SWE-001 预防 3）：attempt 终止原因有界入 Failures
+// 尾部，重试接手可见；同形同因去重，Sealed 拒写。
+func TestApplyAttemptEnd(t *testing.T) {
+	m := New("t-attempt")
+	v0 := m.Version
+	if !ApplyAttemptEnd(m, "流式 tool call 参数解析失败（载荷 30124 字符）") {
+		t.Fatal("首次写入应生效")
+	}
+	if m.Version != v0+1 || len(m.Failures) != 1 ||
+		!strings.Contains(m.Failures[0], "attempt 终止") || !strings.Contains(m.Failures[0], "载荷 30124") {
+		t.Fatalf("终止原因未按预期入账: %+v", m.Failures)
+	}
+	// 同形同因去重（不刷屏、不调版本）
+	if ApplyAttemptEnd(m, "流式 tool call 参数解析失败（载荷 30124 字符）") {
+		t.Fatal("相同终止原因应去重")
+	}
+	if len(m.Failures) != 1 || m.Version != v0+1 {
+		t.Fatalf("去重后不应变化: %+v", m)
+	}
+	// 不同原因计入新条目
+	if !ApplyAttemptEnd(m, "context deadline exceeded") || len(m.Failures) != 2 {
+		t.Fatalf("新终止原因应入账: %+v", m.Failures)
+	}
+	// Sealed 拒写
+	m.Sealed = true
+	if ApplyAttemptEnd(m, "不应写入") {
+		t.Fatal("Sealed 后应拒绝更新")
+	}
+	// 空串不入账
+	m.Sealed = false
+	if ApplyAttemptEnd(m, "   ") {
+		t.Fatal("空白原因不应入账")
+	}
+}

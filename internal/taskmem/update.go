@@ -176,6 +176,29 @@ func ApplyBlockedReason(m *TaskMemory, reason string) bool {
 	return true
 }
 
+// ApplyAttemptEnd 把一次 attempt 的终止原因记入 Failures 尾部（2026-08-20
+// SWE-001：重试接手时让模型看到「上一次是怎么死的」，避免把重试误读为
+// 全新对话）。caption 有界截断；与 ApplyTurn 同款去重游标去抖。仅实质
+// 变化时递增版本。
+func ApplyAttemptEnd(m *TaskMemory, cause string) bool {
+	if m == nil || m.Sealed {
+		return false
+	}
+	cause = strings.TrimSpace(cause)
+	if cause == "" {
+		return false
+	}
+	before := len(m.Failures)
+	appendFailure(m, "attempt 终止: "+truncateRunes(cause, errTextMaxRunes), time.Now())
+	if len(m.Failures) == before {
+		return false
+	}
+	enforceBudgets(m)
+	m.Version++
+	m.UpdatedAt = time.Now()
+	return true
+}
+
 // findFile 返回路径在 Files 中的下标，未找到返回 -1。
 func findFile(m *TaskMemory, path string) int {
 	for i := range m.Files {

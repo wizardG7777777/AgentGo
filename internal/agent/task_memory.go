@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strings"
 
+	"agentgo/internal/graph"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
@@ -119,8 +120,24 @@ func (a *Agent) initTaskMemory(task *model.Task) *taskMemRuntime {
 }
 
 // taskMemInitialConstraints 从任务契约提取约束（capability 覆盖与预期产物）。
+// 2026-08-20 SWE-001：补收口契约约束——图节点任务必须经 submit_task_result
+// 结构化收口（纯文本退出不被接受），acceptance 另有 verdict 契约。约束由
+// 系统从持久化任务事实（GraphID/GraphNodeKind）派生写入，模型不可改写；
+// 渲染时每轮随 Task Memory 注入，压缩碰不到它。
+// 终态契约 v2 §5：图节点任务描述尾部的 <output-contract> 定界块逐行钉入
+// Constraints（与收口/验收契约并存）；严格按定界标记解析，v1 图与非图
+// 节点任务无此块自然跳过。
 func taskMemInitialConstraints(task *model.Task) []string {
 	var out []string
+	if task.GraphID != "" {
+		out = append(out, "收口契约: 本任务是 Graph 节点任务，收尾必须经 submit_task_result 提交结构化结果（status/summary/event/verdict），纯文本回复不会被接受")
+		if task.GraphNodeKind == "acceptance" {
+			out = append(out, "验收契约: verdict 只填 pass/fixable/failed；completed 结果必须省略 event；证据或能力不足时提交 status=blocked 与 blocked_reason")
+		}
+		for _, line := range graph.ExtractOutputContract(task.Description) {
+			out = append(out, "输出契约: "+line)
+		}
+	}
 	if task.Capability != nil {
 		if len(task.Capability.Tools) > 0 {
 			out = append(out, "工具子集: "+strings.Join(task.Capability.Tools, ","))
@@ -136,6 +153,23 @@ func taskMemInitialConstraints(task *model.Task) []string {
 		out = append(out, "预期产物: "+strings.Join(task.ExpectedArtifacts, ","))
 	}
 	return out
+}
+
+// recordAttemptEnd 把本 attempt 的终止原因写入 Task Memory（有界截断，
+// 去重防抖），重试接手时随渲染注入——模型由此看到「上一次是怎么死的」，
+// 不再把重试误读为全新问答（2026-08-20 SWE-001 预防 3）。落盘失败降级
+// 为进程内继续，不阻断失败处理主路径。
+func (rt *taskMemRuntime) recordAttemptEnd(a *Agent, taskID, cause string) {
+	if rt == nil || rt.mem == nil {
+		return
+	}
+	if !taskmem.ApplyAttemptEnd(rt.mem, cause) {
+		return
+	}
+	if err := rt.store.Save(rt.mem); err != nil {
+		log.Printf("[agent %s] 任务 %s attempt 终止原因写入 Task Memory 失败（继续内存态）: %v", a.ID, taskID, err)
+	}
+	rt.refreshCarrier()
 }
 
 // refreshCarrier 重新渲染注入文本并刷新 ctx 载体（幂等——内容不变时

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -753,4 +754,35 @@ func keysOfAny(m map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// 2026-08-20 SWE-001 预防 1：tool call 参数 JSON 解析失败时错误携带载荷
+// 字符数——重试交接（Task Memory）据此提醒模型分批提交。
+func TestSDKClient_BrokenToolCallArgsCarriesPayloadSize(t *testing.T) {
+	broken := `{"graph": {"nodes": {"a": ` // 半截 JSON
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := openaiResponseWithFinish("", []map[string]any{
+			{
+				"id":   "call_broken",
+				"type": "function",
+				"function": map[string]any{
+					"name":      "submit_graph",
+					"arguments": broken,
+				},
+			},
+		}, "tool_calls")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewSDKClient(server.URL, "test-key", "gpt-4o", "", 30*time.Second)
+	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "build graph"}}, nil)
+	if err == nil {
+		t.Fatal("损坏参数必须报错")
+	}
+	want := "载荷 " + strconv.Itoa(len([]rune(broken))) + " 字符"
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("错误应含 %q，实际: %v", want, err)
+	}
 }

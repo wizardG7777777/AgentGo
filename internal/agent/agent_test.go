@@ -89,7 +89,9 @@ func TestAgentNaturalCompletionPersistsDiskRecoveredArtifactBeforeTerminal(t *te
 		t.Fatal(err)
 	}
 	executor := func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
-		return ExecuteResult{Output: "自然文本收尾", ToolCalled: false}, nil
+		// Finalized 模拟 submit_task_result 已被接受：2026-08-20 SWE-001 起
+		// 图节点任务纯文本退出被拒，本测试走 finalization 信号收口分支。
+		return ExecuteResult{Output: "自然文本收尾", ToolCalled: false, Finalized: true}, nil
 	}
 	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.ArtifactResolver = func(string, string) string { return filepath.Join(root, "out.md") }
