@@ -26,6 +26,9 @@ llm:
   default_model: __MODEL__
   protocol: __PROTOCOL__
   timeout_sec: 300
+  # DeepSeek 等 thinking-by-default 模型在 thinking 模式拒绝 forced tool_choice
+  # （Scheduler 阶段门控依赖它），评测统一关闭 reasoning。
+  reasoning_effort: none
   stream: true
 
 tool_profiles:

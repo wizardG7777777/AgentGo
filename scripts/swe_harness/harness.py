@@ -104,6 +104,9 @@ def probe_request(model: str, probe_name: str, nonce: str, protocol: str) -> dic
         return {
             "model": model,
             "input": f"Call the required function exactly once with nonce {nonce}.",
+            # thinking 模式会拒绝 forced tool_choice（DeepSeek 实测 HTTP 400），
+            # 探针只验证 typed function-call 能力，显式关闭 reasoning。
+            "reasoning": {"effort": "none"},
             "tools": [tool],
             "tool_choice": {"type": "function", "name": probe_name},
             "max_output_tokens": 256,
