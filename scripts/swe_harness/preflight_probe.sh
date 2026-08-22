@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 AGENTGO_ROOT="${SWE_AGENTGO_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
-KEY_VAR="${SWE_KEY_VAR:-SWE_API_KEY}"
+KEY_VAR="SWE_API_KEY"
 BASE_URL="${SWE_BASE_URL:-https://openrouter.ai/api/v1}"
 MODEL="${SWE_MODEL:-openai/gpt-5.6-luna}"
 PROTOCOL="${SWE_PROTOCOL:-responses}"
