@@ -75,3 +75,10 @@ artifacts/
 # 外部/无关项目目录
 systemTest/
 config.program-upgrade-small.yaml
+
+# Python 字节码缓存（scripts/swe_harness 本地运行产物）
+__pycache__/
+*.pyc
+
+# rapid property test 失败用例的本地生成物
+internal/probe/testdata/rapid/
