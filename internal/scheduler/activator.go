@@ -2,20 +2,36 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
 	"sync"
 	"time"
 
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
+	"agentgo/internal/policycatalog"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/session"
 	"agentgo/internal/store"
+	"agentgo/internal/taskcontract"
+	"agentgo/internal/trace"
+
+	"github.com/google/uuid"
 )
 
 // sessionHistoryDefaultCap 是 SessionHistory 默认 ring buffer 容量。
 // 16 条足够覆盖一次会话的最近上下文，超出后丢弃最旧的。
 const sessionHistoryDefaultCap = 16
+
+var schedulerPolicyCatalog = func() *policycatalog.Catalog {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		panic("初始化 framework PolicyCatalog 失败: " + err.Error())
+	}
+	return catalog
+}()
 
 // SessionInput 是用户在本会话中提交的一条输入记录。
 //
@@ -23,8 +39,9 @@ const sessionHistoryDefaultCap = 16
 // 时取出最近 N 条作为 LLM 的"对话历史"上下文 —— 让 scheduler 知道
 // "用户之前问过什么、最近一条对应了哪个 scheduler task"。
 type SessionInput struct {
-	Text            string    // 用户原始输入文本
-	SchedulerTaskID string    // 由 Activator publish 的 scheduler task ID
+	Text            string // 用户原始输入文本
+	SchedulerTaskID string // 由 Activator publish 的 scheduler task ID
+	RunID           runcontract.RunID
 	SubmittedAt     time.Time // 用户提交时刻（接收到 EventUserInput 的时间）
 }
 
@@ -104,6 +121,7 @@ func (h *SessionHistory) ExportSnapshot() []session.SessionInputSnapshot {
 		out = append(out, session.SessionInputSnapshot{
 			Text:            entry.Text,
 			SchedulerTaskID: entry.SchedulerTaskID,
+			RunID:           entry.RunID,
 			SubmittedAt:     entry.SubmittedAt.UTC().Format(time.RFC3339Nano),
 		})
 	}
@@ -131,6 +149,7 @@ func (h *SessionHistory) ImportSnapshot(entries []session.SessionInputSnapshot) 
 			h.entries[h.cap-1] = SessionInput{
 				Text:            snap.Text,
 				SchedulerTaskID: snap.SchedulerTaskID,
+				RunID:           snap.RunID,
 				SubmittedAt:     submittedAt,
 			}
 			continue
@@ -138,6 +157,7 @@ func (h *SessionHistory) ImportSnapshot(entries []session.SessionInputSnapshot) 
 		h.entries = append(h.entries, SessionInput{
 			Text:            snap.Text,
 			SchedulerTaskID: snap.SchedulerTaskID,
+			RunID:           snap.RunID,
 			SubmittedAt:     submittedAt,
 		})
 	}
@@ -155,6 +175,11 @@ func (h *SessionHistory) ImportSnapshot(entries []session.SessionInputSnapshot) 
 // 1 天上限是工程兜底：scheduler 真的运行了 24 小时，至少有一条告警浮出，
 // 比无限静默更可观测。
 const SchedulerTaskTimeoutSec = 86400 // 24 小时
+
+const (
+	defaultRunFinalizationReserve = 5 * time.Minute
+	defaultRunRecoveryReserve     = 15 * time.Minute
+)
 
 // Activator 是 EventCh 与 scheduler agent 之间的桥梁。
 //
@@ -236,12 +261,46 @@ func (a *Activator) handleEvent(evt model.Event) {
 		}
 		// 创建一个 scheduler task。EventType="__scheduler__" 让 scheduler agent
 		// 通过 EventType 严格匹配认领。
+		now := time.Now().UTC()
+		run := evt.RunContract
+		if run == nil {
+			run = &runcontract.RunContract{
+				Schema:              runcontract.SchemaV1,
+				RunID:               runcontract.RunID("run-" + uuid.NewString()),
+				DeadlineAt:          now.Add(time.Duration(SchedulerTaskTimeoutSec) * time.Second),
+				FinalizationReserve: defaultRunFinalizationReserve,
+				RecoveryReserve:     defaultRunRecoveryReserve,
+				BudgetProfile:       "interactive/v1",
+				CreatedAt:           now,
+			}
+		} else {
+			copy := *run
+			run = &copy
+		}
+		if err := run.ValidateAt(now); err != nil {
+			log.Printf("[scheduler-activator] 创建 RunContract 失败: %v", err)
+			return
+		}
+		progressProfile, ok := schedulerPolicyCatalog.ProgressContract(policycatalog.ProgressCoordinationV1)
+		if !ok {
+			log.Printf("[scheduler-activator] framework coordination ProgressContract 缺失")
+			return
+		}
+		if _, ok := schedulerPolicyCatalog.ContextPolicy(policycatalog.ContextDefaultCurrent); !ok {
+			log.Printf("[scheduler-activator] framework default ContextPolicy 缺失")
+			return
+		}
 		task := &model.Task{
-			Description:    text,
-			EventType:      "__scheduler__",
-			EventSource:    "user",
-			TimeoutSeconds: SchedulerTaskTimeoutSec, // 24 小时（详见常量注释）
-			MaxConcurrency: 1,                       // 同一时刻只允许一个 scheduler 在处理同一请求
+			RunID:            run.RunID,
+			RunContract:      run,
+			RunPhase:         runcontract.PhaseExecution,
+			ProgressContract: &progressProfile.Contract,
+			ContextPolicyRef: policycatalog.ContextDefaultCurrent,
+			Description:      text,
+			EventType:        "__scheduler__",
+			EventSource:      "user",
+			TimeoutSeconds:   SchedulerTaskTimeoutSec, // 24 小时（详见常量注释）
+			MaxConcurrency:   1,                       // 同一时刻只允许一个 scheduler 在处理同一请求
 		}
 		if err := a.Store.PublishTask(task); err != nil {
 			log.Printf("[scheduler-activator] 发布 scheduler task 失败: %v", err)
@@ -254,6 +313,7 @@ func (a *Activator) handleEvent(evt model.Event) {
 			a.History.Append(SessionInput{
 				Text:            text,
 				SchedulerTaskID: task.ID,
+				RunID:           run.RunID,
 				SubmittedAt:     time.Now(),
 			})
 		}
@@ -275,6 +335,22 @@ func (a *Activator) handleEvent(evt model.Event) {
 			// 现在同时以 __scheduler__ 唤醒任务把超时事实交 Scheduler 裁决。
 			a.publishWatchdogWake(evt.TaskID)
 		}
+
+	case model.EventWatchdogObservation:
+		// 新 Loop 的 Watchdog 只提供 typed 观察事实。这里投影到 Trace/UI，
+		// 刻意不 publish Scheduler task、不发 batch wake、不改变 Task 状态。
+		if evt.Observation == nil || evt.TaskID == "" {
+			return
+		}
+		description := "{}"
+		if raw, err := json.Marshal(evt.Payload); err == nil {
+			description = string(raw)
+		}
+		trace.Emit(trace.Event{
+			Kind: trace.KindWatchdogObservation, TaskID: evt.TaskID,
+			RunID: string(evt.Observation.RunID), AttemptID: evt.Observation.AttemptID,
+			Reason: string(evt.Observation.Kind), Description: description,
+		})
 
 	default:
 		// 其他事件类型（如 EventTickerWakeup、EventTaskRetry）不需要 Activator 处理
@@ -303,14 +379,16 @@ func (a *Activator) publishWatchdogWake(taskID string) {
 	}
 
 	var b strings.Builder
+	var sourceTask *model.Task
 	b.WriteString(marker + " 节点任务运行超时（watchdog 只告警不干预），请按「节点介入裁决」的超时告警指引裁决。")
 	if task, err := a.Store.GetTask(taskID); err == nil && task != nil {
+		sourceTask = task
 		b.WriteString(" 超时任务: id=" + taskID)
 		if task.GraphID != "" {
 			b.WriteString(fmt.Sprintf(", graph=%s node=%s", task.GraphID, task.NodeID))
 		}
 		if !task.StartedAt.IsZero() {
-			b.WriteString(fmt.Sprintf(", 已运行 %v（预期 %d 秒）", time.Since(task.StartedAt).Round(time.Second), task.TimeoutSeconds))
+			b.WriteString(fmt.Sprintf(", 已运行 %v（预期 %s）", time.Since(task.StartedAt).Round(time.Second), task.ExpectedDuration))
 		}
 		desc := task.Description
 		if len([]rune(desc)) > 120 {
@@ -319,11 +397,20 @@ func (a *Activator) publishWatchdogWake(taskID string) {
 		b.WriteString(", 描述: " + desc)
 	}
 	wake := &model.Task{
-		Description:    b.String(),
-		EventType:      "__scheduler__",
-		EventSource:    "watchdog",
-		TimeoutSeconds: SchedulerTaskTimeoutSec,
-		MaxConcurrency: 1,
+		Description:      b.String(),
+		EventType:        "__scheduler__",
+		EventSource:      "watchdog",
+		ExpectedDuration: time.Duration(SchedulerTaskTimeoutSec) * time.Second,
+		MaxConcurrency:   1,
+	}
+	if sourceTask != nil {
+		if err := taskcontract.Inherit(sourceTask, wake, loopcontract.WorkCoordination); err != nil {
+			log.Printf("[scheduler-activator] watchdog 唤醒继承 RunContract 失败: %v", err)
+			return
+		}
+		if wake.RunContract != nil {
+			wake.RunPhase = runcontract.PhaseRecovery
+		}
 	}
 	if err := a.Store.PublishTask(wake); err != nil {
 		log.Printf("[scheduler-activator] 发布 watchdog 唤醒任务失败: %v", err)

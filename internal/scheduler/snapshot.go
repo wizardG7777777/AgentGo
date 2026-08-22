@@ -28,6 +28,11 @@ const (
 	maxBoardResultExcerptTotalRunes = 4096
 	maxTaskProgressTailRunes        = 1000
 	maxTaskLastResponseRunes        = 1200
+	// Scheduler board 是 L3 生成的 hot runtime snapshot，不是无界邮箱正文。
+	// 保守留出 L2 message envelope/JSON escaping 空间，确保进入 16KiB/4K-token
+	// RuntimeSnapshot cap 前已完成确定性投影；L2 仍保留最终 hard cap。
+	maxBoardSnapshotBytes           = 8 << 10
+	maxBoardSnapshotEstimatedTokens = 3 << 10
 )
 
 // boardSnapshot 是 scheduler agent 在每轮 reactLoop 看到的当前控制域 JSON 结构。
@@ -48,6 +53,15 @@ type boardSnapshot struct {
 	Resources              resourceInfo                `json:"resources"`
 	SessionHistory         []sessionEntry              `json:"session_history,omitempty"`
 	PendingDownstreamTasks []pendingDownstreamSnapshot `json:"pending_downstream_tasks,omitempty"`
+	Projection             *boardProjection            `json:"projection,omitempty"`
+}
+
+type boardProjection struct {
+	Applied         bool     `json:"applied"`
+	Level           string   `json:"level"`
+	OriginalBytes   int      `json:"original_bytes"`
+	OriginalTokens  int      `json:"original_estimated_tokens"`
+	OmittedSections []string `json:"omitted_sections,omitempty"`
 }
 
 // pendingDownstreamSnapshot 是 board snapshot 中"下游待处理任务"的一行。
@@ -428,6 +442,162 @@ func BuildBoardJSON(
 	}
 	data, _ := json.MarshalIndent(bs, "", "  ")
 	return string(data)
+}
+
+// BuildBoundedBoardJSON 是 Scheduler LLM 的生产 hot-state 入口。完整
+// BuildBoardJSON 继续服务诊断/测试与冷读取；只有进入 L2 的动态副本做确定性投影。
+func BuildBoundedBoardJSON(
+	s store.TaskStore,
+	cfg *config.Config,
+	modeSnap modes.Snapshot,
+	trigger model.Event,
+	sources SnapshotSources,
+) string {
+	full := BuildBoardJSON(s, cfg, modeSnap, trigger, sources)
+	var snapshot boardSnapshot
+	if err := json.Unmarshal([]byte(full), &snapshot); err != nil {
+		return full
+	}
+	return marshalBoundedBoardSnapshot(snapshot)
+}
+
+func marshalBoundedBoardSnapshot(snapshot boardSnapshot) string {
+	encode := func(value boardSnapshot) []byte {
+		data, _ := json.MarshalIndent(value, "", "  ")
+		return data
+	}
+	data := encode(snapshot)
+	originalBytes, originalTokens := len(data), estimateBoardTokens(data)
+	if boardSnapshotFits(data) {
+		return string(data)
+	}
+
+	projected := snapshot
+	projected.SessionHistory = nil
+	projected.Resources.Agents = nil
+	projected.Resources.AgentTemplates = nil
+	if len(projected.Resources.AgentCapabilities) > 0 {
+		projected.Resources.SpecializedAgents = nil
+	}
+	for i := range projected.Tasks {
+		projected.Tasks[i].Description = truncateText(projected.Tasks[i].Description, 512)
+		projected.Tasks[i].Error = truncateText(projected.Tasks[i].Error, 512)
+	}
+	for i := range projected.PendingDownstreamTasks {
+		projected.PendingDownstreamTasks[i].Description = truncateText(projected.PendingDownstreamTasks[i].Description, 256)
+	}
+	for i := range projected.Resources.AgentCapabilities {
+		projected.Resources.AgentCapabilities[i].Description = truncateText(projected.Resources.AgentCapabilities[i].Description, 160)
+	}
+	projected.Projection = &boardProjection{
+		Applied: true, Level: "hot-control/v1", OriginalBytes: originalBytes,
+		OriginalTokens:  originalTokens,
+		OmittedSections: []string{"session_history", "agent_instances", "agent_templates", "duplicate_specialized_agents"},
+	}
+	data = encode(projected)
+	if boardSnapshotFits(data) {
+		return string(data)
+	}
+
+	projected.Projection.Level = "hot-control-aggressive/v1"
+	for i := range projected.Tasks {
+		projected.Tasks[i].Description = truncateText(projected.Tasks[i].Description, 256)
+		projected.Tasks[i].Error = truncateText(projected.Tasks[i].Error, 256)
+	}
+	for i := range projected.Resources.AgentCapabilities {
+		projected.Resources.AgentCapabilities[i].Description = ""
+		if len(projected.Resources.AgentCapabilities[i].Capabilities) > 16 {
+			projected.Resources.AgentCapabilities[i].Capabilities =
+				append([]string(nil), projected.Resources.AgentCapabilities[i].Capabilities[:16]...)
+		}
+	}
+	for i := range projected.PendingDownstreamTasks {
+		projected.PendingDownstreamTasks[i].Description = truncateText(projected.PendingDownstreamTasks[i].Description, 128)
+	}
+	data = encode(projected)
+	if boardSnapshotFits(data) {
+		return string(data)
+	}
+
+	projected.Projection.Level = "hot-control-emergency/v1"
+	projected.Projection.OmittedSections = append(projected.Projection.OmittedSections,
+		"older_tasks", "capability_tail", "downstream_tail")
+	if len(projected.Tasks) > 8 {
+		projected.Tasks = emergencyBoardTasks(projected.Tasks, 8)
+	}
+	for i := range projected.Tasks {
+		projected.Tasks[i].Description = truncateText(projected.Tasks[i].Description, 80)
+		projected.Tasks[i].Error = truncateText(projected.Tasks[i].Error, 120)
+		if len(projected.Tasks[i].Dependencies) > 8 {
+			projected.Tasks[i].Dependencies = append([]string(nil), projected.Tasks[i].Dependencies[:8]...)
+		}
+		if len(projected.Tasks[i].ResultRefs) > 4 {
+			projected.Tasks[i].ResultRefs = append([]taskResultRef(nil), projected.Tasks[i].ResultRefs[:4]...)
+		}
+		for j := range projected.Tasks[i].ResultRefs {
+			projected.Tasks[i].ResultRefs[j].Excerpt = ""
+			projected.Tasks[i].ResultRefs[j].Truncated = true
+		}
+	}
+	if len(projected.Resources.AgentCapabilities) > 8 {
+		projected.Resources.AgentCapabilities =
+			append([]agentCapabilitySnapshot(nil), projected.Resources.AgentCapabilities[:8]...)
+	}
+	for i := range projected.Resources.AgentCapabilities {
+		if len(projected.Resources.AgentCapabilities[i].Capabilities) > 12 {
+			projected.Resources.AgentCapabilities[i].Capabilities =
+				append([]string(nil), projected.Resources.AgentCapabilities[i].Capabilities[:12]...)
+		}
+	}
+	if len(projected.PendingDownstreamTasks) > 8 {
+		projected.PendingDownstreamTasks =
+			append([]pendingDownstreamSnapshot(nil), projected.PendingDownstreamTasks[:8]...)
+	}
+	return string(encode(projected))
+}
+
+func emergencyBoardTasks(tasks []taskSnapshot, limit int) []taskSnapshot {
+	if limit <= 0 || len(tasks) <= limit {
+		return append([]taskSnapshot(nil), tasks...)
+	}
+	selected := make(map[int]struct{}, limit)
+	// 当前请求域中的 Scheduler root 是 Graph/Task lineage 的控制锚，不能因
+	// “保留最近任务”而被较新的 worker 节点挤掉。
+	for i := len(tasks) - 1; i >= 0 && len(selected) < limit; i-- {
+		if tasks[i].EventType == "__scheduler__" {
+			selected[i] = struct{}{}
+		}
+	}
+	for i := len(tasks) - 1; i >= 0 && len(selected) < limit; i-- {
+		selected[i] = struct{}{}
+	}
+	out := make([]taskSnapshot, 0, len(selected))
+	for i, task := range tasks {
+		if _, ok := selected[i]; ok {
+			out = append(out, task)
+		}
+	}
+	return out
+}
+
+func boardSnapshotFits(data []byte) bool {
+	return len(data) <= maxBoardSnapshotBytes && estimateBoardTokens(data) <= maxBoardSnapshotEstimatedTokens
+}
+
+func estimateBoardTokens(data []byte) int {
+	byBytes := (len(data) + 2) / 3
+	runes := utf8.RuneCount(data)
+	asciiRunes := 0
+	for _, value := range string(data) {
+		if value <= 0x7f {
+			asciiRunes++
+		}
+	}
+	mixed := (asciiRunes+2)/3 + (runes - asciiRunes)
+	if mixed > byBytes {
+		return mixed
+	}
+	return byBytes
 }
 
 // allocateTaskResultExcerpts distributes one small budget across all visible

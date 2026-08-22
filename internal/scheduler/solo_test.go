@@ -213,19 +213,13 @@ func TestSoloPublishTaskBlocked_SendMessageAllowed(t *testing.T) {
 	}
 }
 
-// TestSchedulerSystemPrompt_ContainsSoloGuidance 验证 system prompt 含 solo 指引。
-//
-// prompt 是构建期静态常量，solo/team 两种模式的指引都写在其中；运行期模式切换
-// 的生效路径 = 每轮注入的 board 快照 topo_mode 字段（由 Modes 实时读取，
-// 已有 TestSchedulerExecutor_ModesStoreLiveSwitch 覆盖）+ 本静态条件指引。
+// TestSchedulerSystemPrompt_ContainsSoloGuidance 验证 draft-edit phase 含 solo 指引。
 func TestSchedulerSystemPrompt_ContainsSoloGuidance(t *testing.T) {
+	prompt := schedulerPromptForPhase("scheduler:draft-edit")
 	for _, want := range []string{
-		"topo_mode（编排拓扑轴）",
-		"solo",
-		"唯一的执行者",
-		"禁止调用 publish_task",
+		"topo_mode=solo", "唯一执行资源", "controller", "不得调用 legacy publish_task",
 	} {
-		if !strings.Contains(schedulerSystemPrompt, want) {
+		if !strings.Contains(prompt, want) {
 			t.Errorf("scheduler system prompt 缺少 solo 指引要素 %q", want)
 		}
 	}

@@ -4,11 +4,14 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"agentgo/internal/graph"
 	"agentgo/internal/hook"
 	"agentgo/internal/interaction"
 	"agentgo/internal/model"
+	"agentgo/internal/policycatalog"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
 )
 
@@ -34,6 +37,37 @@ func publishSchedulerTask(t *testing.T, s store.TaskStore, id string) {
 	if err := s.PublishTask(&model.Task{ID: id, Description: "用户请求", EventType: "__scheduler__"}); err != nil {
 		t.Fatalf("PublishTask: %v", err)
 	}
+}
+
+func publishNewRunSchedulerTask(t *testing.T, s store.TaskStore, id string) *model.Task {
+	t.Helper()
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	progress, ok := catalog.ProgressContract(policycatalog.ProgressCoordinationV1)
+	if !ok {
+		t.Fatal("缺少 coordination ProgressContract")
+	}
+	now := time.Now().UTC()
+	run := &runcontract.RunContract{
+		Schema: runcontract.SchemaV1, RunID: runcontract.RunID("run-" + id), CreatedAt: now,
+		DeadlineAt: now.Add(time.Hour), FinalizationReserve: time.Minute,
+		RecoveryReserve: time.Minute, BudgetProfile: "test/v1",
+	}
+	task := &model.Task{
+		ID: id, Description: "用户请求", EventType: "__scheduler__", EventSource: "user",
+		RunID: run.RunID, RunContract: run, RunPhase: runcontract.PhaseExecution,
+		ProgressContract: &progress.Contract, ContextPolicyRef: policycatalog.ContextDefaultCurrent,
+	}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := s.GetTask(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stored
 }
 
 func closureCtx(taskID, summary string) hook.ToolHookContext {
@@ -93,6 +127,30 @@ func TestSchedulerClosure_ZeroEvidenceDirectAnswerNeedsConfirm(t *testing.T) {
 	}
 }
 
+func TestSchedulerClosure_NewRunNeverUsesDirectAnswerBackdoor(t *testing.T) {
+	h, s := newClosureFixture(t)
+	task := publishNewRunSchedulerTask(t, s, "t-new-run")
+	for i := 0; i < 2; i++ {
+		decision := h.Run(closureCtx(task.ID, "直接答复"))
+		if decision.Action != hook.Abort || decision.ReasonCode != "scheduler_graph_required" {
+			t.Fatalf("新 Run 第 %d 次 report_done 不得经确认放行: %+v", i+1, decision)
+		}
+	}
+	first := h.ReviewNaturalExit(context.Background(), task, "直接答复", false)
+	if first.Allow || first.Retry || !strings.Contains(first.Nudge, "create_graph_draft") {
+		t.Fatalf("新 Run 第一次纯文本退出应拒绝并要求建图: %+v", first)
+	}
+	second := h.ReviewNaturalExit(context.Background(), task, "直接答复", false)
+	if second.Allow || !second.Retry {
+		t.Fatalf("新 Run 第二次纯文本退出应换 Attempt，不得完成: %+v", second)
+	}
+
+	task.RunPhase = runcontract.PhaseFinalization
+	if decision := h.ReviewNaturalExit(context.Background(), task, "图终态汇报", false); !decision.Allow {
+		t.Fatalf("finalization 阶段自然汇报应放行: %+v", decision)
+	}
+}
+
 func TestSchedulerClosure_EvidencePassesImmediately(t *testing.T) {
 	t.Run("有图", func(t *testing.T) {
 		h, s := newClosureFixture(t)
@@ -144,7 +202,7 @@ func TestSchedulerClosure_ReviewNaturalExitZeroEvidenceConfirmOnce(t *testing.T)
 	}
 	// 零证据：第一次拒绝并给出出路说明
 	d1 := h.ReviewNaturalExit(context.Background(), task, "直接答复", false)
-	if d1.Allow || !strings.Contains(d1.Nudge, "纯问答") || !strings.Contains(d1.Nudge, "submit_graph") {
+	if d1.Allow || !strings.Contains(d1.Nudge, "纯问答") || !strings.Contains(d1.Nudge, "create_graph_draft") {
 		t.Fatalf("零证据第一次应拒绝且 Nudge 含出路: %+v", d1)
 	}
 	// 第二次确认放行
@@ -219,7 +277,7 @@ func TestSchedulerClosure_ReviewNaturalExitThreeStates(t *testing.T) {
 		}
 		// 第 1 次：通用拒绝（与无失败记录同）
 		d1 := h.ReviewNaturalExit(ctx, task, "残片", true)
-		if d1.Allow || d1.Retry || !strings.Contains(d1.Nudge, "submit_graph") {
+		if d1.Allow || d1.Retry || !strings.Contains(d1.Nudge, "create_graph_draft") {
 			t.Fatalf("第 1 次应通用拒绝: %+v", d1)
 		}
 		// 第 2 次：格式提醒（不放行、不重试）
@@ -237,7 +295,7 @@ func TestSchedulerClosure_ReviewNaturalExitThreeStates(t *testing.T) {
 		}
 		// 清零后第 4 次回到首拒梯度（新 attempt 语义）
 		d4 := h.ReviewNaturalExit(ctx, task, "残片", true)
-		if d4.Allow || d4.Retry || !strings.Contains(d4.Nudge, "submit_graph") {
+		if d4.Allow || d4.Retry || !strings.Contains(d4.Nudge, "create_graph_draft") {
 			t.Fatalf("计数清零后应回到首拒: %+v", d4)
 		}
 	})

@@ -36,8 +36,8 @@ type NaturalExitDecision struct {
 //
 // toolFailed 表示本任务是否已存在工具调用失败记录（ToolCallRecord.Success==false，
 // 由 agent 在调用前查询 store 传入）：
-//   - false（纯问答场景）：第一次拒绝、同一任务第二次确认放行并记
-//     scheduler_direct_answer 日志；
+//   - 新 Run execution/recovery：每个请求必须形成 Graph，纯文本永不放行；
+//   - legacy 且 false（纯问答场景）：第一次拒绝、同一任务第二次确认放行；
 //   - true（工作场景，疑格式崩盘）：拒绝放行，改为格式提醒，再次纯文本则
 //     返回 Retry=true 交 agent 重试换上下文。
 //

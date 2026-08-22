@@ -71,6 +71,52 @@ func TestBuildBoardJSON_ResourcesDefault(t *testing.T) {
 	}
 }
 
+func TestMarshalBoundedBoardSnapshotProjectsOversizedHotState(t *testing.T) {
+	large := boardSnapshot{
+		ExecMode: "normal", TopoMode: "team", Trigger: triggerInfo{Type: "ticker_wakeup"},
+		Resources: resourceInfo{RuntimeMode: "agent_team", WorkerCount: 8, AvailableWorkers: 8},
+	}
+	for i := 0; i < 20; i++ {
+		eventType := "worker"
+		if i == 0 {
+			eventType = "__scheduler__"
+		}
+		large.Tasks = append(large.Tasks, taskSnapshot{
+			ID: fmt.Sprintf("task-%02d", i), Description: strings.Repeat("任务说明", 800),
+			Status: "pending", EventType: eventType,
+		})
+		large.Resources.Agents = append(large.Resources.Agents, agentSnapshot{
+			ID: fmt.Sprintf("worker-%02d", i), Type: "worker", CurrentTaskDesc: strings.Repeat("执行", 80),
+		})
+	}
+	large.Resources.AgentCapabilities = []agentCapabilitySnapshot{{
+		AgentType: "worker", Description: strings.Repeat("能力", 400),
+		Capabilities: []string{
+			"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref",
+			"write_file", "edit_file", "run_shell", "send_message", "request_replan",
+			"submit_task_result", "extra-1", "extra-2", "extra-3", "extra-4", "extra-5",
+			"extra-6", "extra-7", "extra-8", "extra-9",
+		},
+	}}
+	large.SessionHistory = []sessionEntry{{Text: strings.Repeat("历史", 2000)}}
+
+	out := marshalBoundedBoardSnapshot(large)
+	if !boardSnapshotFits([]byte(out)) {
+		t.Fatalf("投影后的 hot board 仍超出 L3 预算: bytes=%d tokens=%d", len(out), estimateBoardTokens([]byte(out)))
+	}
+	parsed := parseSnapshot(t, out)
+	if parsed.Projection == nil || !parsed.Projection.Applied || parsed.Projection.OriginalBytes <= len(out) {
+		t.Fatalf("board projection 缺少可审计元数据: %+v", parsed.Projection)
+	}
+	if parsed.Resources.WorkerCount != 8 || len(parsed.Tasks) == 0 || len(parsed.Tasks) > 8 ||
+		parsed.Tasks[0].ID != "task-00" || parsed.Tasks[len(parsed.Tasks)-1].ID != "task-19" {
+		t.Fatalf("board projection 丢失核心控制事实: %+v", parsed)
+	}
+	if len(parsed.Resources.Agents) != 0 || len(parsed.SessionHistory) != 0 {
+		t.Fatalf("board projection 未移除重复 hot 展示段: %+v", parsed.Resources)
+	}
+}
+
 func TestBuildBoardJSON_SchedulerOnlySeparatesTemplatesFromReadyRoutes(t *testing.T) {
 	s := store.NewMemoryTaskStore(make(chan model.Event, 8), 16, 1, 60)
 	catalog, err := agenttemplate.Load(agenttemplate.LoadOptions{

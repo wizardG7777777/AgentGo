@@ -9,6 +9,7 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/agenttemplate"
 	"agentgo/internal/config"
+	"agentgo/internal/contextcontract"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
@@ -203,7 +204,7 @@ func (e *SchedulerExecutor) Execute(
 			Description:  workerDesc,
 		}
 	}
-	snapshot := BuildBoardJSON(e.Store, e.Cfg, modeSnap, trigger, SnapshotSources{
+	snapshot := BuildBoundedBoardJSON(e.Store, e.Cfg, modeSnap, trigger, SnapshotSources{
 		MBRegistry:                  e.MBRegistry,
 		Roster:                      e.Roster,
 		History:                     e.History,
@@ -222,7 +223,10 @@ func (e *SchedulerExecutor) Execute(
 	historyWithSnap := make([]agent.HistoryEntry, 0, len(history)+1)
 	historyWithSnap = append(historyWithSnap, history...)
 	historyWithSnap = append(historyWithSnap, agent.HistoryEntry{
-		IncomingMail: snapshot,
+		IncomingMail:             snapshot,
+		IncomingContextKind:      contextcontract.FragmentRuntimeSnapshot,
+		IncomingContextSection:   contextcontract.SectionRuntimeControl,
+		IncomingContextAuthority: contextcontract.AuthorityInformational,
 	})
 
 	// 5. 调底层 LLM Execute

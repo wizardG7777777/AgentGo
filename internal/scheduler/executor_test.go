@@ -9,6 +9,7 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
+	"agentgo/internal/contextcontract"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
@@ -231,6 +232,11 @@ func TestSchedulerExecutor_InjectsBoardSnapshotIntoHistory(t *testing.T) {
 	mail := capturedHistory[0].IncomingMail
 	if mail == "" {
 		t.Fatal("IncomingMail should be non-empty")
+	}
+	if capturedHistory[0].IncomingContextKind != contextcontract.FragmentRuntimeSnapshot ||
+		capturedHistory[0].IncomingContextSection != contextcontract.SectionRuntimeControl ||
+		capturedHistory[0].IncomingContextAuthority != contextcontract.AuthorityInformational {
+		t.Fatalf("Scheduler board 未携带 typed L2 binding: %+v", capturedHistory[0])
 	}
 	if !strings.Contains(mail, `"worker_count": 2`) {
 		t.Errorf("snapshot should contain worker_count, got: %s", mail)

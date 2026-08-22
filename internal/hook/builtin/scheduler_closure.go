@@ -10,6 +10,7 @@ import (
 	"agentgo/internal/hook"
 	"agentgo/internal/interaction"
 	"agentgo/internal/model"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
 )
 
@@ -30,7 +31,7 @@ type closureInteractionPeek interface {
 // 直接收口，用户请求零交付且无任何机制拦截）。
 //
 // 收口契约：report_done 时本会话必须已留下至少一项工作痕迹——
-//   - 当前 session 存在图（submit_graph 落过图），或
+//   - 当前 session 存在图（start_graph 已落 Execution），或
 //   - 公告板存在 delegated 任务（非 __scheduler__ 任务），或
 //   - 存在 pending Interaction（已向用户提问，等待回答）。
 //
@@ -92,6 +93,16 @@ func (h *SchedulerClosureHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecis
 	if task.EventType != "__scheduler__" || task.GraphID != "" {
 		return hook.ToolHookDecision{Action: hook.Continue}
 	}
+	if requiresGraphBeforeClosure(task) && !h.hasGraphEvidence() {
+		return hook.ToolHookDecision{
+			Action: hook.Abort, HookName: h.Name(), ReasonCode: "scheduler_graph_required",
+			AbortReason: "report_done 被拒绝：新 Run 在 execution/recovery 阶段必须先形成并启动持久化 Graph；直接答复不是合法收口路径。",
+			Suggestions: []hook.Suggestion{
+				hook.NewSuggestion(h.Name(), "scheduler_graph_required", hctx.ToolName, true,
+					hook.ToolCallAction("create_graph_draft", nil, "创建新的事务化 GraphDraft")),
+			},
+		}
+	}
 	if h.hasClosureEvidence(hctx.Ctx, task) {
 		return hook.ToolHookDecision{Action: hook.Continue}
 	}
@@ -102,11 +113,11 @@ func (h *SchedulerClosureHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecis
 			Action:   hook.Abort,
 			HookName: h.Name(),
 			AbortReason: "report_done 被拒绝：本次请求没有产生任何图、任务或交互，且 summary 为空——" +
-				"没有可汇报的内容。若有工作要做请 submit_graph 建图；若这是纯问答，请给出非空的直接答复。",
+				"没有可汇报的内容。若有工作要做请从 create_graph_draft 开始事务化建图；若这是纯问答，请给出非空的直接答复。",
 			ReasonCode: "report_done_empty_summary",
 			Suggestions: []hook.Suggestion{
 				hook.NewSuggestion(h.Name(), "report_done_empty_summary", hctx.ToolName, true,
-					hook.ToolCallAction("submit_graph", nil, "有实际工作时：构建任务图并执行"),
+					hook.ToolCallAction("create_graph_draft", nil, "有实际工作时：创建不可执行 Draft"),
 				),
 			},
 		}
@@ -125,11 +136,11 @@ func (h *SchedulerClosureHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecis
 		HookName: h.Name(),
 		AbortReason: "report_done 收口审查：本次请求没有留下任何工作痕迹（无图、无 delegated 任务、无 pending 交互）。" +
 			"若确认这是纯问答、无需建图执行，请再次调用 report_done 给出直接答复（将再次审查并放行）；" +
-			"否则请 submit_graph 建图把工作委派出去。",
+			"否则请从 create_graph_draft 开始建图。",
 		ReasonCode: "scheduler_zero_evidence_closure",
 		Suggestions: []hook.Suggestion{
 			hook.NewSuggestion(h.Name(), "scheduler_zero_evidence_closure", hctx.ToolName, true,
-				hook.ToolCallAction("submit_graph", nil, "有实际工作时：构建任务图并执行"),
+				hook.ToolCallAction("create_graph_draft", nil, "有实际工作时：创建不可执行 Draft"),
 				hook.ToolCallAction("report_done", nil, "确认纯问答时：再次调用 report_done 给出直接答复"),
 			),
 		},
@@ -143,7 +154,7 @@ func (h *SchedulerClosureHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecis
 // 与 Run 共享同一份零证据判定与 confirmed 计数。
 //
 // 三态语义（exitCount = confirmed[task.ID]，此前已被推回的次数）：
-//   - exitCount=0 → 拒绝 + 通用 nudge（纯问答直接答复 / 有工作 submit_graph）；
+//   - exitCount=0 → 拒绝 + 通用 nudge（纯问答直接答复 / 有工作 create_graph_draft）；
 //   - exitCount=1 且 toolFailed=false（纯问答场景）→ 放行记
 //     scheduler_direct_answer——模型已被提醒过一次且本任务从未发生工具失败，
 //     它的第二次答复视为确认后的合法直答；
@@ -164,7 +175,14 @@ func (h *SchedulerClosureHook) ReviewNaturalExit(ctx context.Context, task *mode
 	if task.EventType != "__scheduler__" || task.GraphID != "" {
 		return hook.NaturalExitDecision{Allow: true}
 	}
-	if h.hasClosureEvidence(ctx, task) {
+	if task.RunPhase == runcontract.PhaseFinalization || task.EventSource == "graph-ended" {
+		return hook.NaturalExitDecision{Allow: true}
+	}
+	if requiresGraphBeforeClosure(task) {
+		if h.hasGraphEvidence() {
+			return hook.NaturalExitDecision{Allow: true}
+		}
+	} else if h.hasClosureEvidence(ctx, task) {
 		return hook.NaturalExitDecision{Allow: true}
 	}
 
@@ -176,6 +194,17 @@ func (h *SchedulerClosureHook) ReviewNaturalExit(ctx context.Context, task *mode
 		delete(h.confirmed, task.ID)
 	}
 	h.mu.Unlock()
+	if requiresGraphBeforeClosure(task) {
+		if count == 0 {
+			return hook.NaturalExitDecision{
+				Nudge: "<system-reminder>你的纯文本答复未被接受：新 Run 必须形成持久化 Graph，execution/recovery 阶段没有直接答复出口。请从 create_graph_draft 开始；不要在正文中描述计划。</system-reminder>",
+			}
+		}
+		h.mu.Lock()
+		delete(h.confirmed, task.ID)
+		h.mu.Unlock()
+		return hook.NaturalExitDecision{Retry: true}
+	}
 
 	switch {
 	case count == 0:
@@ -183,7 +212,7 @@ func (h *SchedulerClosureHook) ReviewNaturalExit(ctx context.Context, task *mode
 			Allow: false,
 			Nudge: "<system-reminder>你的上次答复未被接受：本次请求没有留下任何工作痕迹（无图、无 delegated 任务、无 pending 交互）。" +
 				"若确认这是纯问答、无需建图执行，请再次直接给出最终答复（将再次审查并放行）；" +
-				"若有实际工作要做，请用 submit_graph 建图把工作委派出去。</system-reminder>",
+				"若有实际工作要做，请从 create_graph_draft 开始事务化建图。</system-reminder>",
 		}
 	case count == 1 && !toolFailed:
 		log.Printf("[gate %s] 任务 %s 零证据直答经确认放行（scheduler_direct_answer，纯文本路径）", h.Name(), task.ID)
@@ -193,7 +222,7 @@ func (h *SchedulerClosureHook) ReviewNaturalExit(ctx context.Context, task *mode
 			Allow: false,
 			Nudge: "<system-reminder>你的上次答复未被接受：本次请求没有留下任何工作痕迹，且本任务此前发生过工具调用失败。" +
 				"如果你刚才试图调用工具但调用未被识别——不要在正文中输出任何 XML/标记文本（如 DSML、<tool_call> 等），" +
-				"直接以系统工具调用格式重新提交（例如 submit_graph，可先提交仅含 root+end 的骨架图再逐次扩展）；" +
+				"直接以系统工具调用格式重新提交（新请求从 create_graph_draft 开始，再用原生 patch_graph_draft 分批构造）；" +
 				"再次纯文本回复将被放弃并换上下文重试。</system-reminder>",
 		}
 	case count >= 2 && toolFailed:
@@ -209,6 +238,27 @@ func (h *SchedulerClosureHook) ReviewNaturalExit(ctx context.Context, task *mode
 	}
 }
 
+func requiresGraphBeforeClosure(task *model.Task) bool {
+	return task != nil && task.EventType == "__scheduler__" && task.GraphID == "" &&
+		task.RunContract != nil && task.RunPhase != runcontract.PhaseFinalization && task.EventSource != "graph-ended"
+}
+
+func (h *SchedulerClosureHook) hasGraphEvidence() bool {
+	if h.Graphs == nil {
+		return false
+	}
+	sid := ""
+	if h.SessionID != nil {
+		sid = h.SessionID()
+	}
+	for _, candidate := range h.Graphs.List() {
+		if candidate.SessionID == sid {
+			return true
+		}
+	}
+	return false
+}
+
 // ResetExitCount 清零指定任务的纯文本退出计数。agent 在 ReviewNaturalExit
 // 返回 Retry=true 并走 ErrRecoverable 重试时调用——新 attempt 从 exitCount=0
 // 重新获得完整提醒梯度（本方法的 default 分支已先行清零，此入口供 agent
@@ -222,16 +272,8 @@ func (h *SchedulerClosureHook) ResetExitCount(taskID string) {
 // hasClosureEvidence 报告本任务是否已留下工作痕迹（三个证据源任一命中）。
 func (h *SchedulerClosureHook) hasClosureEvidence(ctx context.Context, task *model.Task) bool {
 	// 图证据：当前 session 存在图（无 Session 模式退化为「任意图」）
-	if h.Graphs != nil {
-		sid := ""
-		if h.SessionID != nil {
-			sid = h.SessionID()
-		}
-		for _, g := range h.Graphs.List() {
-			if g.SessionID == sid {
-				return true
-			}
-		}
+	if h.hasGraphEvidence() {
+		return true
 	}
 	// 任务证据：公告板存在 delegated 任务。公告板随 session 切换整体换板
 	// （ReplaceSnapshot），天然按 session 隔离，无需再过滤 session。

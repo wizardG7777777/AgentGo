@@ -9,9 +9,11 @@ import (
 	"time"
 
 	"agentgo/internal/config"
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/roster"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
 	"agentgo/internal/workspace"
@@ -32,6 +34,12 @@ type PlanRouteRegistry interface {
 // capacity is not inferred here.
 type RouteResolver interface {
 	HasRunnableRoute(task *model.Task) bool
+}
+
+// ProgressReader 是 Watchdog 对 L4 authority 的只读窄接口。Watchdog 只读取
+// 最新 checkpoint 判断 liveness，不写 checkpoint，也不迁移 Task 状态。
+type ProgressReader interface {
+	LoadCheckpoint(taskID string) (*loopcontract.ProgressCheckpoint, bool, error)
 }
 
 // RouteResolverFunc adapts a function to RouteResolver.
@@ -76,6 +84,11 @@ type pendingObservation struct {
 	alerted bool
 }
 
+type progressObservationKey struct {
+	taskID string
+	kind   model.WatchdogObservationKind
+}
+
 // WorkspaceCleaner 是 Watchdog 清扫孤儿 workspace 所需的最小控制面接口。
 // *workspace.Manager 天然满足（见下方编译期断言）；测试可注入 fake。
 type WorkspaceCleaner interface {
@@ -94,7 +107,11 @@ type Watchdog struct {
 	EventCh       chan<- model.Event
 	Roster        roster.Roster
 	MailRegistry  *mailbox.Registry // 超时告警 / 级联取消时向 task.ReplyToAgentID（或 legacy EventSource）汇报
+	SessionID     func() string     // 当前 Session identity；新 Run 报告邮件 envelope 使用
 	RouteResolver RouteResolver
+	// ProgressReader 读取 L4 durable checkpoint。nil 时新任务仍不会回退到
+	// TimeoutSeconds；超过 heartbeat lease 后只报告 checkpoint missing。
+	ProgressReader ProgressReader
 	// WorkspaceManager 是 workspace 控制面（nil-safe）：注入后每个巡检周期
 	// 顺带清扫孤儿 workspace（任务不存在或已达终态的任务目录）。
 	// nil 时跳过——保持既有测试与最小装配行为不变。
@@ -116,6 +133,11 @@ type Watchdog struct {
 	// 自动重新武装。纯进程内状态，每次巡检按当前 processing 集合 prune。
 	overtimeMu     sync.Mutex
 	overtimeWarned map[string]time.Time
+
+	// progressObserved 对同一 Task/typed fault 保存最近一次事实指纹。Checkpoint
+	// 更新或 Attempt/deadline 变化后可重新报告，轮询本身不会刷屏。
+	progressMu       sync.Mutex
+	progressObserved map[progressObservationKey]string
 
 	now func() time.Time
 }
@@ -194,21 +216,13 @@ func (w *Watchdog) checkTask(task *model.Task) {
 }
 
 func (w *Watchdog) checkProcessingTask(task *model.Task) {
-	// 超时告警（2026-08-19 起只告警、不杀死）：processing 超过预期时长
-	// （task.TimeoutSeconds，默认 1 小时）时发结构化告警 + 日志 + 汇报邮件，
-	// 任务继续运行。watchdog 不再直接终止任何任务——LLM 调用层的卡死由
-	// llm 层自身的超时兜底；watchdog 退化为哨兵：观测运行时长、对异常分支
-	// 发警告，是否干预交给人或上级 Agent。
-	if task.TimeoutSeconds > 0 && !task.StartedAt.IsZero() {
-		threshold := time.Duration(task.TimeoutSeconds) * time.Second
-		elapsed := time.Since(task.StartedAt)
-		if elapsed > threshold && w.markProcessingOvertime(task.ID, task.StartedAt) {
-			log.Printf("[watchdog] task %s 运行超时告警 (elapsed: %v, 预期: %v)", task.ID, elapsed.Round(time.Second), threshold)
-			reason := fmt.Sprintf("processing_overtime: 任务已运行 %v，超过预期时长 %v；watchdog 不干预，请人工或上级代理检查",
-				elapsed.Round(time.Second), threshold)
-			w.sendStructuredAlert(task.ID, "processing_overtime", reason)
-			w.sendOvertimeWarning(task, reason, elapsed, threshold)
-		}
+	// 新 Loop 只读取 checkpoint heartbeat 与绝对 deadline，发布 typed
+	// observation；不发送会被 Activator 翻译成文本 Task 的 legacy alert，
+	// 更不抢 L4 的 Reminder/Rollover/Blocked 状态迁移权。
+	if task.RunContract != nil || task.ProgressContract != nil {
+		w.observeLoopLiveness(task)
+	} else {
+		w.checkLegacyExpectedDuration(task)
 	}
 
 	// 级联取消：依赖任务失败或被取消
@@ -234,6 +248,221 @@ func (w *Watchdog) checkProcessingTask(task *model.Task) {
 			w.sendCrashReport(task, reason, time.Since(task.StartedAt))
 			return
 		}
+	}
+}
+
+// checkLegacyExpectedDuration 保留旧 Task 的一次性兼容告警。阈值只读取已
+// 迁移的 ExpectedDuration；TimeoutSeconds 不再是运行时控制输入。
+func (w *Watchdog) checkLegacyExpectedDuration(task *model.Task) {
+	if task.ExpectedDuration > 0 && !task.StartedAt.IsZero() {
+		threshold := task.ExpectedDuration
+		elapsed := nonNegativeDuration(w.currentTime().Sub(task.StartedAt))
+		if elapsed > threshold && w.markProcessingOvertime(task.ID, task.StartedAt) {
+			log.Printf("[watchdog] legacy task %s 超过 ExpectedDuration 告警 (elapsed: %v, 预期: %v)", task.ID, elapsed.Round(time.Second), threshold)
+			reason := fmt.Sprintf("processing_overtime: 任务已运行 %v，超过预期时长 %v；watchdog 不干预，请人工或上级代理检查",
+				elapsed.Round(time.Second), threshold)
+			w.sendStructuredAlert(task.ID, "processing_overtime", reason)
+			w.sendOvertimeWarning(task, reason, elapsed, threshold)
+		}
+	}
+}
+
+func (w *Watchdog) observeLoopLiveness(task *model.Task) {
+	now := w.currentTime()
+	lease := w.progressHeartbeatLease()
+	if w.ProgressReader == nil {
+		w.observeUnavailableCheckpoint(task, now, lease, model.WatchdogCheckpointMissing)
+		return
+	}
+	checkpoint, ok, err := w.ProgressReader.LoadCheckpoint(task.ID)
+	if err != nil {
+		log.Printf("[watchdog] task %s 读取 ProgressCheckpoint 失败: %v", task.ID, err)
+		w.observeUnavailableCheckpoint(task, now, lease, model.WatchdogCheckpointReadError)
+		return
+	}
+	if !ok || checkpoint == nil {
+		w.observeUnavailableCheckpoint(task, now, lease, model.WatchdogCheckpointMissing)
+		return
+	}
+	if err := validateObservedCheckpoint(task, checkpoint); err != nil {
+		log.Printf("[watchdog] task %s ProgressCheckpoint 无效: %v", task.ID, err)
+		observation := model.WatchdogObservation{
+			Kind: model.WatchdogHeartbeatStalled, TaskID: task.ID,
+			RunID: task.RunID, AttemptID: task.AttemptID,
+			CheckpointID: checkpoint.CheckpointID, CheckpointState: model.WatchdogCheckpointInvalid,
+			CheckpointUpdatedAt: checkpoint.UpdatedAt, HeartbeatLease: lease,
+			InterventionStage: checkpoint.InterventionStage, ObservedAt: now,
+		}
+		fingerprint := checkpoint.CheckpointID + "|invalid|" + checkpoint.UpdatedAt.UTC().Format(time.RFC3339Nano)
+		w.publishProgressObservation(observation, fingerprint)
+		return
+	}
+	if task.AttemptID != "" && checkpoint.AttemptID != task.AttemptID {
+		// claim/retry 与 LoopStore rollover 分属两个 authority；短暂不一致是
+		// 合法装配窗口。Watchdog 不读取旧 Attempt deadline，只有窗口超过
+		// heartbeat lease 才报告 old_attempt。
+		w.observeUnavailableCheckpoint(task, now, lease, model.WatchdogCheckpointOldAttempt)
+		return
+	}
+
+	if nonNegativeDuration(now.Sub(checkpoint.UpdatedAt)) > lease {
+		observation := model.WatchdogObservation{
+			Kind: model.WatchdogHeartbeatStalled, TaskID: task.ID,
+			RunID: checkpoint.RunID, AttemptID: checkpoint.AttemptID,
+			CheckpointID: checkpoint.CheckpointID, CheckpointState: model.WatchdogCheckpointStale,
+			CheckpointUpdatedAt: checkpoint.UpdatedAt, HeartbeatLease: lease,
+			InterventionStage: checkpoint.InterventionStage, ObservedAt: now,
+		}
+		fingerprint := checkpoint.CheckpointID + "|stale|" + checkpoint.UpdatedAt.UTC().Format(time.RFC3339Nano)
+		w.publishProgressObservation(observation, fingerprint)
+	}
+
+	if deadline, riskAt, ok := mostUrgentDeadlineRisk(checkpoint, now); ok {
+		observation := model.WatchdogObservation{
+			Kind: model.WatchdogHardDeadlineRisk, TaskID: task.ID,
+			RunID: checkpoint.RunID, AttemptID: checkpoint.AttemptID,
+			CheckpointID: checkpoint.CheckpointID, CheckpointState: model.WatchdogCheckpointAvailable,
+			CheckpointUpdatedAt: checkpoint.UpdatedAt, HeartbeatLease: lease,
+			InterventionStage: checkpoint.InterventionStage,
+			DeadlineScope:     deadline.Scope, DeadlineState: deadlineObservationState(deadline, now), RiskAt: riskAt,
+			HardDeadlineAt: deadline.HardDeadlineAt, ObservedAt: now,
+		}
+		fingerprint := checkpoint.AttemptID + "|" + string(deadline.Scope) + "|" +
+			deadline.HardDeadlineAt.UTC().Format(time.RFC3339Nano) + "|" + riskAt.UTC().Format(time.RFC3339Nano) +
+			"|" + string(observation.DeadlineState)
+		w.publishProgressObservation(observation, fingerprint)
+	}
+}
+
+func (w *Watchdog) observeUnavailableCheckpoint(task *model.Task, now time.Time, lease time.Duration, state model.WatchdogCheckpointState) {
+	if task == nil || task.StartedAt.IsZero() || nonNegativeDuration(now.Sub(task.StartedAt)) <= lease {
+		return
+	}
+	observation := model.WatchdogObservation{
+		Kind: model.WatchdogHeartbeatStalled, TaskID: task.ID,
+		RunID: task.RunID, AttemptID: task.AttemptID,
+		CheckpointState: state, HeartbeatLease: lease, ObservedAt: now,
+	}
+	fingerprint := task.AttemptID + "|" + string(state) + "|" + task.StartedAt.UTC().Format(time.RFC3339Nano)
+	w.publishProgressObservation(observation, fingerprint)
+}
+
+func validateObservedCheckpoint(task *model.Task, checkpoint *loopcontract.ProgressCheckpoint) error {
+	if task == nil || checkpoint == nil {
+		return fmt.Errorf("task/checkpoint 为空")
+	}
+	if err := checkpoint.Validate(); err != nil {
+		return err
+	}
+	if checkpoint.TaskID != task.ID {
+		return fmt.Errorf("checkpoint task_id=%q 与 task=%q 不一致", checkpoint.TaskID, task.ID)
+	}
+	if task.RunID != "" && checkpoint.RunID != task.RunID {
+		return fmt.Errorf("checkpoint run_id=%q 与 task run_id=%q 不一致", checkpoint.RunID, task.RunID)
+	}
+	return nil
+}
+
+func mostUrgentDeadlineRisk(checkpoint *loopcontract.ProgressCheckpoint, now time.Time) (runcontract.DeadlineBudget, time.Time, bool) {
+	if checkpoint == nil {
+		return runcontract.DeadlineBudget{}, time.Time{}, false
+	}
+	deadlines := []runcontract.DeadlineBudget{checkpoint.Deadlines.Attempt}
+	if checkpoint.Deadlines.Activation != nil {
+		deadlines = append(deadlines, *checkpoint.Deadlines.Activation)
+	}
+	if checkpoint.Deadlines.Graph != nil {
+		deadlines = append(deadlines, *checkpoint.Deadlines.Graph)
+	}
+	deadlines = append(deadlines, checkpoint.Deadlines.Run)
+
+	var selected runcontract.DeadlineBudget
+	var selectedRiskAt time.Time
+	found := false
+	for _, deadline := range deadlines {
+		riskAt := deadlineRiskAt(deadline)
+		if riskAt.IsZero() || now.Before(riskAt) {
+			continue
+		}
+		// 多个层级同时进入风险窗时，最早的 hard deadline 最紧急；这样
+		// Attempt 到达风险窗后会自然覆盖先前的 Run/Graph reserve 告警。
+		if !found || deadline.HardDeadlineAt.Before(selected.HardDeadlineAt) {
+			selected = deadline
+			selectedRiskAt = riskAt
+			found = true
+		}
+	}
+	return selected, selectedRiskAt, found
+}
+
+func deadlineRiskAt(deadline runcontract.DeadlineBudget) time.Time {
+	if deadline.HardDeadlineAt.IsZero() {
+		return time.Time{}
+	}
+	if !deadline.InterventionAt.IsZero() && !deadline.InterventionAt.After(deadline.HardDeadlineAt) {
+		return deadline.InterventionAt
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	reserve := deadline.FinalizationReserve
+	if deadline.RecoveryReserve > maxDuration-reserve {
+		// 非法溢出输入不允许把风险窗回绕到未来；退化为 hard deadline 本身。
+		return deadline.HardDeadlineAt
+	}
+	reserve += deadline.RecoveryReserve
+	return deadline.HardDeadlineAt.Add(-reserve)
+}
+
+func deadlineObservationState(deadline runcontract.DeadlineBudget, now time.Time) model.WatchdogDeadlineState {
+	if now.Before(deadline.HardDeadlineAt) {
+		return model.WatchdogDeadlineAtRisk
+	}
+	return model.WatchdogDeadlineExceeded
+}
+
+func (w *Watchdog) progressHeartbeatLease() time.Duration {
+	seconds := 0
+	if w.Config != nil {
+		seconds = w.Config.Infra.Watchdog.ProgressHeartbeatGraceSec
+	}
+	if seconds <= 0 {
+		seconds = 120
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (w *Watchdog) publishProgressObservation(observation model.WatchdogObservation, fingerprint string) {
+	key := progressObservationKey{taskID: observation.TaskID, kind: observation.Kind}
+	w.progressMu.Lock()
+	if w.progressObserved == nil {
+		w.progressObserved = make(map[progressObservationKey]string)
+	}
+	if w.progressObserved[key] == fingerprint {
+		w.progressMu.Unlock()
+		return
+	}
+	w.progressObserved[key] = fingerprint
+	w.progressMu.Unlock()
+
+	payload := map[string]string{
+		"reason_code":        string(observation.Kind),
+		"checkpoint_state":   string(observation.CheckpointState),
+		"intervention_stage": string(observation.InterventionStage),
+	}
+	if observation.CheckpointID != "" {
+		payload["checkpoint_id"] = observation.CheckpointID
+	}
+	if observation.DeadlineScope != "" {
+		payload["deadline_scope"] = string(observation.DeadlineScope)
+		payload["deadline_state"] = string(observation.DeadlineState)
+		payload["hard_deadline_at"] = observation.HardDeadlineAt.UTC().Format(time.RFC3339Nano)
+		payload["risk_at"] = observation.RiskAt.UTC().Format(time.RFC3339Nano)
+	}
+	select {
+	case w.EventCh <- model.Event{
+		Type: model.EventWatchdogObservation, TaskID: observation.TaskID,
+		Payload: payload, Observation: &observation,
+	}:
+	default:
 	}
 }
 
@@ -495,6 +724,13 @@ func (w *Watchdog) pruneObservations(tasks []*model.Task) {
 		}
 	}
 	w.overtimeMu.Unlock()
+	w.progressMu.Lock()
+	for key := range w.progressObserved {
+		if _, ok := processing[key.taskID]; !ok {
+			delete(w.progressObserved, key)
+		}
+	}
+	w.progressMu.Unlock()
 }
 
 func (w *Watchdog) currentTime() time.Time {
@@ -669,6 +905,13 @@ func (w *Watchdog) mailTaskReport(task *model.Task, summary, headline, judgment 
 		Summary:  summary,
 		Content:  sb.String(),
 		SentAt:   time.Now(),
+	}
+	if task.RunID != "" {
+		msg.SourceTaskID = task.ID
+		msg.RunID = task.RunID
+		if w.SessionID != nil {
+			msg.SessionID = w.SessionID()
+		}
 	}
 	if err := w.MailRegistry.Send(msg); err != nil {
 		log.Printf("[watchdog] 发送任务报告邮件给 %s 失败: %v", recipient, err)

@@ -6,8 +6,12 @@ import (
 	"testing"
 	"time"
 
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
+	"agentgo/internal/policycatalog"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
+	"agentgo/internal/taskcontract"
 )
 
 // ---- handleEvent 单测（不启动 goroutine） ----
@@ -46,6 +50,13 @@ func TestActivator_EventUserInput_PublishesSchedulerTask(t *testing.T) {
 	}
 	if task.MaxConcurrency != 1 {
 		t.Errorf("expected MaxConcurrency=1, got %d", task.MaxConcurrency)
+	}
+	if task.ProgressContract == nil || task.ProgressContract.Ref.ContractID != policycatalog.ProgressCoordinationV1 {
+		t.Fatalf("root Scheduler Task 未冻结 coordination ProgressContract: %+v", task.ProgressContract)
+	}
+	if task.ContextPolicyRef != policycatalog.ContextDefaultCurrent {
+		t.Fatalf("新 root Scheduler Task ContextPolicy=%q，期望 current=%q",
+			task.ContextPolicyRef, policycatalog.ContextDefaultCurrent)
 	}
 }
 
@@ -170,6 +181,10 @@ func TestActivator_EventWatchdogAlert_PublishesWakeTask(t *testing.T) {
 		ID: "task-overtime", Description: "修复 sessions.py 的 accessed 标记",
 		EventType: "", GraphID: "g-x", NodeID: "impl", TimeoutSeconds: 3600,
 	}
+	if err := taskcontract.Start(overtime, loopcontract.WorkCodeChange, "test-watchdog/v1",
+		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.PublishTask(overtime); err != nil {
 		t.Fatal(err)
 	}
@@ -199,6 +214,10 @@ func TestActivator_EventWatchdogAlert_PublishesWakeTask(t *testing.T) {
 	}
 	if wake.EventSource != "watchdog" {
 		t.Errorf("EventSource 应标记 watchdog: %q", wake.EventSource)
+	}
+	if wake.RunID != overtime.RunID || wake.RunContract == nil || wake.ContextPolicyRef == "" ||
+		wake.ProgressContract == nil || wake.RunPhase != runcontract.PhaseRecovery {
+		t.Fatalf("watchdog 唤醒必须继承完整 recovery binding: %+v", wake)
 	}
 
 	// 幂等：旧唤醒未消费时，同一超时任务的重复告警不再发布

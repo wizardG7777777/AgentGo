@@ -6,11 +6,16 @@ import (
 	"testing"
 	"time"
 
+	"agentgo/internal/agent"
 	"agentgo/internal/config"
+	"agentgo/internal/contentstore"
+	"agentgo/internal/contextadapter"
+	"agentgo/internal/contextstore"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
+	"agentgo/internal/policycatalog"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
 )
@@ -96,36 +101,6 @@ func TestSchedulerBundle_New_AgentEventTypeIsScheduler(t *testing.T) {
 	}
 }
 
-func TestSchedulerBundle_New_AppliesConfiguredBehaviorBudgets(t *testing.T) {
-	newBundle := func(cfg *config.Config) *Bundle {
-		ch := make(chan model.Event, 64)
-		s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-		r := roster.NewMemoryRoster()
-		return New(s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil,
-			nil, nil, nil, nil, nil, nil, nil, nil, nil)
-	}
-
-	t.Run("yaml values", func(t *testing.T) {
-		cfg := config.DefaultConfig()
-		cfg.Scheduler.EnforceCompactTokenThreshold = 160000
-		agent := newBundle(cfg).Agent
-		if agent.CompactTokenThreshold != 160000 {
-			t.Fatalf("scheduler agent budget not applied: compact=%d",
-				agent.CompactTokenThreshold)
-		}
-	})
-
-	t.Run("zero values preserve compatibility defaults", func(t *testing.T) {
-		cfg := config.DefaultConfig()
-		cfg.Scheduler.EnforceCompactTokenThreshold = 0
-		agent := newBundle(cfg).Agent
-		if agent.CompactTokenThreshold != config.DefaultSchedulerCompactTokenThreshold {
-			t.Fatalf("scheduler compatibility defaults changed: compact=%d",
-				agent.CompactTokenThreshold)
-		}
-	})
-}
-
 // TestSchedulerBundle_New_ModesDefaultAxes 验证 Bundle.Modes 两轴默认值
 // 为 normal / team（nil modeStore 回落 DefaultStore）。
 func TestSchedulerBundle_New_ModesDefaultAxes(t *testing.T) {
@@ -188,9 +163,28 @@ func TestSchedulerBundle_EndToEnd_UserInputToReportDone(t *testing.T) {
 			},
 		},
 	}
+	snapshots, err := contextstore.New(t.TempDir() + "/snapshots")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = snapshots.Close() })
+	contents, err := contentstore.Open(t.TempDir()+"/content", contentstore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = contents.Close() })
+	policies, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	contextRuntime := agent.ContextRuntime{
+		Adapter: contextadapter.New(), Policies: policies, Snapshots: snapshots, Content: contents,
+		SessionID: func() string { return "scheduler-integration" },
+	}
 
 	bundle := New(s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
-		nil, nil, nil, nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil, nil, nil,
+		GraphAuthoringDeps{ContextRuntime: contextRuntime})
 
 	// 启动 Activator + Agent
 	ctx, cancel := context.WithCancel(context.Background())

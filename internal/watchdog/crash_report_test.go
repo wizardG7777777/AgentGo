@@ -6,10 +6,12 @@ import (
 	"time"
 
 	"agentgo/internal/config"
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
+	"agentgo/internal/taskcontract"
 )
 
 // 2026-04-25 P1 行为测试：验证 watchdog 超时告警/级联取消时向任务的显式
@@ -87,6 +89,21 @@ func TestWatchdog_SendsOvertimeWarning_OnTimeout(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("未找到 from=watchdog 的超时告警邮件；共收到 %d 条：%+v", len(msgs), msgs)
+	}
+}
+
+func TestWatchdogReportCarriesRunAndSessionEnvelope(t *testing.T) {
+	w, _, _, schedBox := newWatchdogWithMailbox(t)
+	w.SessionID = func() string { return "session-watchdog" }
+	task := &model.Task{ID: "watchdog-run-source", Description: "new Run", ReplyToAgentID: "scheduler"}
+	if err := taskcontract.Start(task, loopcontract.WorkInvestigation, "test-watchdog-mail/v1",
+		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	w.sendCrashReport(task, "结构化故障", time.Second)
+	msgs := schedBox.DrainRunWithAck(nil, task.RunID, "session-watchdog", "consumer")
+	if len(msgs) != 1 || msgs[0].SourceTaskID != task.ID || msgs[0].RunID != task.RunID || msgs[0].SessionID != "session-watchdog" {
+		t.Fatalf("watchdog envelope 错误: %+v", msgs)
 	}
 }
 
