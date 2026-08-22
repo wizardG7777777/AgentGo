@@ -146,25 +146,35 @@ func TestHandleMouse_ChatAndClickIgnored(t *testing.T) {
 	}
 }
 
-// graph_ended trace 事件在 scrollback 留提示行：完成时 Reason 为空报
-// completed，失败终态透出中文原因。
+// graph_ended trace 事件在 scrollback 留提示行：新事件展示 typed outcome，
+// 旧事件才按 Message 回退；blocked/cancelled 绝不能显示 completed。
 func TestTraceMsg_GraphEndedHint(t *testing.T) {
-	m := newAppModel(testDeps())
-	next, _ := m.update(traceMsg(ui.TraceEvent{Kind: "graph_ended", GraphID: "g-abcdef12-commits"}))
-	m = next.(AppModel)
-	if got := emitJoined(m); !strings.Contains(got, "g-abcdef") || !strings.Contains(got, "completed") {
-		t.Fatalf("完成提示行应含图短 ID 与 completed: %q", got)
+	render := func(ev ui.TraceEvent) string {
+		m := newAppModel(testDeps())
+		next, _ := m.update(traceMsg(ev))
+		return emitJoined(next.(AppModel))
 	}
-
-	next, _ = m.update(traceMsg(ui.TraceEvent{Kind: "graph_ended", GraphID: "g-abcdef12-commits", Message: "节点 analyze-1 无出路"}))
-	m = next.(AppModel)
-	if got := emitJoined(m); !strings.Contains(got, "失败：节点 analyze-1 无出路") {
-		t.Fatalf("失败提示行应透出原因: %q", got)
+	legacySuccess := render(ui.TraceEvent{Kind: "graph_ended", GraphID: "g-abcdef12-commits"})
+	if !strings.Contains(legacySuccess, "g-abcdef") || !strings.Contains(legacySuccess, "outcome=success") {
+		t.Fatalf("legacy 成功提示行应含图短 ID 与 success: %q", legacySuccess)
+	}
+	legacyFailure := render(ui.TraceEvent{
+		Kind: "graph_ended", GraphID: "g-abcdef12-commits", Message: "节点 analyze-1 无出路",
+	})
+	if !strings.Contains(legacyFailure, "outcome=failed：节点 analyze-1 无出路") {
+		t.Fatalf("legacy 失败提示行应透出原因: %q", legacyFailure)
+	}
+	for _, outcome := range []string{"failed", "blocked", "cancelled"} {
+		got := render(ui.TraceEvent{Kind: "graph_ended", GraphID: "g-abcdef12-commits", Outcome: outcome})
+		if !strings.Contains(got, "outcome="+outcome) || strings.Contains(got, "completed") {
+			t.Errorf("typed %s 提示行不得显示 completed: %q", outcome, got)
+		}
 	}
 
 	// 非 graph_ended 事件不产生提示行
+	m := newAppModel(testDeps())
 	pendingBefore := len(m.pendingEmit)
-	next, _ = m.update(traceMsg(ui.TraceEvent{Kind: "tool_call", AgentID: "worker-1", Tool: "read_file"}))
+	next, _ := m.update(traceMsg(ui.TraceEvent{Kind: "tool_call", AgentID: "worker-1", Tool: "read_file"}))
 	m = next.(AppModel)
 	if len(m.pendingEmit) != pendingBefore {
 		t.Fatal("普通 trace 事件不应产生排放行")

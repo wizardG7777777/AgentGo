@@ -40,9 +40,9 @@ func renderGraphDashboard(
 	}
 	title := t.MdH2.Render(truncateDisplay(titleText, w))
 	meta := truncateDisplay(t.SidebarDim.Render(fmt.Sprintf(
-		"  revision %d · state %d · %d/%d completed · %d active · %s",
+		"  revision %d · state %d · %d/%d completed · %d active · %s%s",
 		graph.Revision, graph.StateVersion, completed, len(graph.Nodes), active,
-		nodeStatusSummary(*graph))), w)
+		nodeStatusSummary(*graph), graphOutcomeSummary(*graph))), w)
 
 	if len(graph.Nodes) == 0 {
 		return title + "\n" + meta + "\n\n" + lipgloss.Place(
@@ -61,6 +61,13 @@ func renderGraphDashboard(
 		lines = lines[:h]
 	}
 	return strings.Join(lines, "\n")
+}
+
+func graphOutcomeSummary(graph GraphInfo) string {
+	if strings.TrimSpace(graph.Outcome) == "" {
+		return ""
+	}
+	return " · outcome=" + graph.Outcome
 }
 
 func renderSchedulerPlanning(t Theme, w, h int, activity string, turns []ui.AgentTurn) string {
@@ -132,6 +139,8 @@ func graphStatusVisual(t Theme, status string) (string, lipgloss.Style) {
 		return "Ⅱ", t.StateInteraction
 	case "completed":
 		return "✓", t.TaskCompleted
+	case "blocked":
+		return "!", t.StateInteraction
 	case "failed":
 		return "×", t.TaskFailed
 	case "cancelled":

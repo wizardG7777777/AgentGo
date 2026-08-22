@@ -141,6 +141,35 @@ func TestNodeStatusVisual_AllGraphStates(t *testing.T) {
 	}
 }
 
+func TestGraphStatusVisual_AllTerminalStates(t *testing.T) {
+	for _, status := range []string{"completed", "failed", "blocked", "cancelled"} {
+		icon, style := graphStatusVisual(DefaultTheme(), status)
+		if icon == "" || icon == "○" || style.Render(status) == "" {
+			t.Fatalf("Graph terminal status %q 未获得专属 visual", status)
+		}
+	}
+}
+
+func TestRenderGraphDashboardPreservesTypedTerminalOutcome(t *testing.T) {
+	for _, test := range []struct {
+		status  string
+		outcome string
+	}{
+		{status: "failed", outcome: "failed"},
+		{status: "blocked", outcome: "blocked"},
+		{status: "cancelled", outcome: "cancelled"},
+	} {
+		graph := GraphInfo{GraphID: "g-" + test.outcome, Status: test.status, Outcome: test.outcome, Root: "end"}
+		view := renderGraphDashboard(DefaultTheme(), 90, 12, &graph, -1, 0, 1, "", nil)
+		if !strings.Contains(view, test.status) || !strings.Contains(view, "outcome="+test.outcome) {
+			t.Errorf("Graph %s/%s 图卡投影不完整: %q", test.status, test.outcome, view)
+		}
+		if strings.Contains(view, "outcome=success") {
+			t.Errorf("Graph %s/%s 被折叠为 success: %q", test.status, test.outcome, view)
+		}
+	}
+}
+
 func TestRenderGraphDashboard_BoundsWideText(t *testing.T) {
 	graph := graphFixture("graph-wide", "running", "running", "waiting")
 	graph.Nodes[0].Title = strings.Repeat("整理长中文节点标题🙂", 12)

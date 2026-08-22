@@ -243,32 +243,44 @@ type AgentToolActivity struct {
 
 // BoardTask 是任务看板 / 侧边栏需要的一行任务信息，由 model.Task 映射而来。
 type BoardTask struct {
-	ID           string    `json:"id"`
-	Desc         string    `json:"desc"`
-	Status       string    `json:"status"`
-	EventType    string    `json:"event_type"`
-	Agents       []string  `json:"agents"`
-	Priority     int       `json:"priority"`
-	CreatedAt    time.Time `json:"created_at"`
-	GraphID      string    `json:"graph_id,omitempty"`
-	NodeID       string    `json:"node_id,omitempty"`
-	ActivationID string    `json:"activation_id,omitempty"`
+	ID            string    `json:"id"`
+	Desc          string    `json:"desc"`
+	Status        string    `json:"status"`
+	EventType     string    `json:"event_type"`
+	Agents        []string  `json:"agents"`
+	Priority      int       `json:"priority"`
+	CreatedAt     time.Time `json:"created_at"`
+	RunID         string    `json:"run_id,omitempty"`
+	RunPhase      string    `json:"run_phase,omitempty"`
+	AttemptID     string    `json:"attempt_id,omitempty"`
+	AttemptNo     int       `json:"attempt_no,omitempty"`
+	OutcomeRef    string    `json:"outcome_ref,omitempty"`
+	GraphID       string    `json:"graph_id,omitempty"`
+	NodeID        string    `json:"node_id,omitempty"`
+	ActivationID  string    `json:"activation_id,omitempty"`
+	GraphNodeKind string    `json:"graph_node_kind,omitempty"`
 }
 
 // BoardTaskFromModel 把 model.Task 映射为 BoardTask，供 bootstrap 装配
 // PollBoard 时使用（也便于测试直接构造）。
 func BoardTaskFromModel(t model.Task) BoardTask {
 	return BoardTask{
-		ID:           t.ID,
-		Desc:         t.Description,
-		Status:       string(t.Status),
-		EventType:    t.EventType,
-		Agents:       t.Agents,
-		Priority:     t.Priority,
-		CreatedAt:    t.CreatedAt,
-		GraphID:      t.GraphID,
-		NodeID:       t.NodeID,
-		ActivationID: t.ActivationID,
+		ID:            t.ID,
+		Desc:          t.Description,
+		Status:        string(t.Status),
+		EventType:     t.EventType,
+		Agents:        t.Agents,
+		Priority:      t.Priority,
+		CreatedAt:     t.CreatedAt,
+		RunID:         string(t.RunID),
+		RunPhase:      string(t.RunPhase),
+		AttemptID:     t.AttemptID,
+		AttemptNo:     t.AttemptNo,
+		OutcomeRef:    t.OutcomeRef,
+		GraphID:       t.GraphID,
+		NodeID:        t.NodeID,
+		ActivationID:  t.ActivationID,
+		GraphNodeKind: t.GraphNodeKind,
 	}
 }
 
@@ -277,9 +289,11 @@ func BoardTaskFromModel(t model.Task) BoardTask {
 // 持有，前端不能通过该投影修改图定义或运行状态。
 type GraphView struct {
 	GraphID      string          `json:"graph_id"`
+	RunID        string          `json:"run_id,omitempty"`
 	Revision     int64           `json:"revision"`
 	StateVersion int64           `json:"state_version"`
 	Status       string          `json:"status"`
+	Outcome      string          `json:"outcome,omitempty"` // success|failed|blocked|cancelled；legacy/运行中为空
 	Root         string          `json:"root"`
 	Digest       string          `json:"digest,omitempty"`
 	Degraded     bool            `json:"degraded,omitempty"`

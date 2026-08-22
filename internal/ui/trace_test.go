@@ -68,6 +68,19 @@ func TestProjectTraceEventAddsSafeDecisionContext(t *testing.T) {
 	}
 }
 
+func TestProjectTraceEventPreservesGraphOutcome(t *testing.T) {
+	for _, outcome := range []string{"success", "failed", "blocked", "cancelled"} {
+		got := ProjectTraceEvent(trace.Event{Kind: trace.KindGraphEnded, GraphID: "g-typed", GraphOutcome: outcome})
+		if got.Outcome != outcome {
+			t.Errorf("GraphOutcome=%s 投影为 %s", outcome, got.Outcome)
+		}
+	}
+	legacy := ProjectTraceEvent(trace.Event{Kind: trace.KindGraphEnded, GraphID: "g-legacy", Reason: "失败原因"})
+	if legacy.Outcome != "failed" {
+		t.Fatalf("legacy graph_ended 应按 Reason 回退 failed，实际 %s", legacy.Outcome)
+	}
+}
+
 // TestHub_EmitTraceEventMessagePriority Message 摘要按 Error → Reason → Description 取首个非空。
 func TestHub_EmitTraceEventMessagePriority(t *testing.T) {
 	cases := []struct {

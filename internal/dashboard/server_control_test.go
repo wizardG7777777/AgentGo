@@ -10,8 +10,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"agentgo/internal/interaction"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/ui"
 )
 
@@ -20,6 +22,7 @@ import (
 type fakeController struct {
 	userText            string
 	userTextErr         error
+	runContract         *runcontract.RunContract
 	cancelPrefix        string
 	cancelTaskID        string
 	cancelErr           error
@@ -57,6 +60,12 @@ type fakeController struct {
 
 func (f *fakeController) SendUserText(_ context.Context, text string) error {
 	f.userText = text
+	return f.userTextErr
+}
+
+func (f *fakeController) SendUserTextWithRunContract(_ context.Context, text string, contract *runcontract.RunContract) error {
+	f.userText = text
+	f.runContract = contract
 	return f.userTextErr
 }
 
@@ -179,6 +188,26 @@ func TestControlEndpoints_MapToController(t *testing.T) {
 		}
 		if body["ok"] != true {
 			t.Fatalf("body=%v", body)
+		}
+	})
+
+	t.Run("input with frozen run contract", func(t *testing.T) {
+		now := time.Now().UTC()
+		bodyJSON, err := json.Marshal(map[string]any{
+			"text": "SWE bounded task",
+			"run_contract": runcontract.RunContract{
+				Schema: runcontract.SchemaV1, RunID: "run-swe-1", CreatedAt: now,
+				DeadlineAt: now.Add(19 * time.Minute), RecoveryReserve: 90 * time.Second,
+				FinalizationReserve: 30 * time.Second, BudgetProfile: "swe/v1",
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		status, response := post(t, ts, "/api/input", "", string(bodyJSON))
+		if status != http.StatusOK || response["ok"] != true || fc.userText != "SWE bounded task" ||
+			fc.runContract == nil || fc.runContract.RunID != "run-swe-1" || fc.runContract.BudgetProfile != "swe/v1" {
+			t.Fatalf("RunContract 未原样进入控制器: status=%d response=%v contract=%+v", status, response, fc.runContract)
 		}
 	})
 

@@ -95,6 +95,7 @@ func TestCmdGraphCompleteTimeline(t *testing.T) {
 	for _, want := range []string{
 		"Graph: deploy-pipeline",
 		"Status: completed", // graph_ended（无 Reason）校准 snapshot 的 running
+		"Outcome: legacy",
 		"Revision: 3", "StateVersion: 41", "Digest: abcdef123456",
 		"Events: 6", "Shards: 2", "Coverage: complete",
 		"graph_submitted", "node_activation_created", "graph_transition_selected",
@@ -396,8 +397,8 @@ func TestGraphShardFileNameSanitizes(t *testing.T) {
 	}{
 		{"graph-1234abcd", "graph_graph-12.jsonl"}, // 无前敌对字符：沿用旧名
 		{"g1", "graph_g1.jsonl"},
-		{"g1/check@1", "graph_g1~check.jsonl"}, // 子图：/ → ~
-		{"a:bcdefg", "graph_a~bcdefg.jsonl"},   // Windows 非法字符 : → ~
+		{"g1/check@1", "graph_g1~check.jsonl"},              // 子图：/ → ~
+		{"a:bcdefg", "graph_a~bcdefg.jsonl"},                // Windows 非法字符 : → ~
 		{"deploy-pipeline/check@1", "graph_deploy-p.jsonl"}, // 前 8 位无 /：父子同片
 	} {
 		if got := graphShardFileName(tc.graphID); got != tc.want {
@@ -448,5 +449,47 @@ func TestScanGraphStateDirNested(t *testing.T) {
 	// graph_id 不符的 snapshot 视为不可读（degraded）。
 	if _, ok, err := readGraphSnapshotHead(entry.snapshotPath, "g1/other@1"); err == nil || ok {
 		t.Fatalf("graph_id 不符应报错: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestGraphFactsTypedTerminalOutcomeNeverCollapsesToCompleted(t *testing.T) {
+	for _, test := range []struct {
+		outcome string
+		want    string
+	}{
+		{outcome: "success", want: "completed"},
+		{outcome: "failed", want: "failed"},
+		{outcome: "blocked", want: "blocked"},
+		{outcome: "cancelled", want: "cancelled"},
+		{outcome: "corrupt", want: "invalid_outcome"},
+	} {
+		records := []traceEventRecord{{event: Event{
+			Kind: KindGraphEnded, GraphID: "g-typed", GraphOutcome: test.outcome,
+		}}}
+		status, _, _, _ := graphFactsFromEvents(records)
+		if status != test.want {
+			t.Errorf("graph_outcome=%s 投影 status=%s，want %s", test.outcome, status, test.want)
+		}
+		// trace 的新终态晚于旧 snapshot；blocked/cancelled 不得被旧 completed 覆盖。
+		if got := resolveGraphStatus(status, "completed"); got != test.want {
+			t.Errorf("event=%s snapshot=completed 合并为 %s", test.want, got)
+		}
+	}
+}
+
+func TestCmdGraphDisplaysTypedOutcome(t *testing.T) {
+	traceDir := t.TempDir()
+	base := time.Date(2026, 8, 22, 1, 2, 3, 0, time.UTC)
+	writeGraphShard(t, traceDir, "graph_g-typed.jsonl", []Event{
+		{Timestamp: base, Kind: KindGraphSubmitted, GraphID: "g-typed", Description: "revision=1 digest=aaaa"},
+		{Timestamp: base.Add(time.Second), Kind: KindGraphEnded, GraphID: "g-typed", GraphOutcome: "blocked"},
+	})
+	var out bytes.Buffer
+	if err := CLI([]string{"graph", "g-typed"}, traceDir, "", &out); err != nil {
+		t.Fatalf("trace graph: %v", err)
+	}
+	if got := out.String(); !strings.Contains(got, "Status: blocked") || !strings.Contains(got, "Outcome: blocked") ||
+		strings.Contains(got, "Status: completed") {
+		t.Fatalf("typed blocked outcome 显示错误:\n%s", got)
 	}
 }

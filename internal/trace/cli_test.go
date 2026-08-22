@@ -63,6 +63,7 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"shell_timeout_resolved", Event{Kind: KindShellTimeoutResolved, ShellTimeout: &ShellTimeout{Command: "go test", ElapsedSec: 60, PreviousWaits: 2, Decision: "wait", ExtraSeconds: 20}}, []string{"elapsed=60s", "waits=2", "decision=wait", "extra=20s"}},
 		{"reactor_spawn_depth_exceeded", Event{Kind: KindReactorSpawnDepthExceeded, Depth: 6, Reason: "too deep"}, []string{"depth=6", `reason="too deep"`}},
 		{"runtime_loop_fuse_triggered", Event{Kind: KindRuntimeLoopFuseTriggered, Loop: 10000, Reason: "fuse"}, []string{"loop=10000", `reason="fuse"`}},
+		{"watchdog_observation", Event{Kind: KindWatchdogObservation, TaskID: "t1", RunID: "run-1", AttemptID: "attempt-1", Reason: "checkpoint_stale", Description: `{"age_seconds":30}`}, []string{`reason="checkpoint_stale"`, `desc="{\"age_seconds\":30}"`}},
 		{"task_finalizing", Event{Kind: KindTaskFinalizing, TaskID: "t1", Transition: &Transition{PrevStatus: "processing", NewStatus: "blocked"}}, []string{"status=blocked"}},
 		{"tool_call_skipped", Event{Kind: KindToolCallSkipped, TaskID: "t1", Tool: "write_file", CallID: "call-9", Reason: "task_finalizing"}, []string{"tool=write_file", "call_id=call-9", `reason="task_finalizing"`}},
 		{"task_result_committed", Event{Kind: KindTaskResultCommitted, TaskID: "t1", Reason: "缺权限", Transition: &Transition{PrevStatus: "processing", NewStatus: "blocked", Cause: "agent_reported_blocked"}}, []string{"prev=processing", "new=blocked", "cause=agent_reported_blocked", `reason="缺权限"`}},
@@ -74,7 +75,7 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"graph_submission_rejected", Event{Kind: KindGraphSubmissionRejected, GraphID: "graph-1", Error: "校验失败"}, []string{"graph=graph-1", `error="校验失败"`}},
 		{"node_activation_created", Event{Kind: KindNodeActivationCreated, GraphID: "graph-1", NodeID: "implement", ActivationID: "implement@2"}, []string{"graph=graph-1", "node=implement", "activation=implement@2"}},
 		{"graph_transition_selected", Event{Kind: KindGraphTransitionSelected, GraphID: "graph-1", NodeID: "verify", ActivationID: "verify@1", Description: "next[1] -> implement"}, []string{"graph=graph-1", "node=verify", "activation=verify@1", `desc="next[1] -> implement"`}},
-		{"graph_ended", Event{Kind: KindGraphEnded, GraphID: "graph-1", Reason: "节点无出路"}, []string{"graph=graph-1", `reason="节点无出路"`}},
+		{"graph_ended", Event{Kind: KindGraphEnded, GraphID: "graph-1", GraphOutcome: "failed", Reason: "节点无出路"}, []string{"graph=graph-1", "outcome=failed", `reason="节点无出路"`}},
 		{"graph_join_resolved", Event{Kind: KindGraphJoinResolved, GraphID: "graph-1", NodeID: "merge", ActivationID: "merge@1", Description: "生效入边 2/2"}, []string{"graph=graph-1", "node=merge", "activation=merge@1", `desc="生效入边 2/2"`}},
 		{"graph_wait_started", Event{Kind: KindGraphWaitStarted, GraphID: "graph-1", NodeID: "wait", ActivationID: "wait@1", Description: "event=deploy.done"}, []string{"graph=graph-1", "node=wait", "activation=wait@1", `desc="event=deploy.done"`}},
 		{"graph_wait_resumed", Event{Kind: KindGraphWaitResumed, GraphID: "graph-1", NodeID: "wait", ActivationID: "wait@1", Description: "event=deploy.done"}, []string{"graph=graph-1", "node=wait", "activation=wait@1", `desc="event=deploy.done"`}},
@@ -96,8 +97,8 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"effect_recovery_decided", Event{Kind: KindEffectRecoveryDecided, TaskID: "t1", Effect: &EffectPayload{EffectID: "t1-1", Kind: "file_write", Policy: "verify_first", Decision: "verified_settled", Reason: "文件 hash 与账载一致"}}, []string{"effect=t1-1", "decision=verified_settled", `reason="文件 hash 与账载一致"`}},
 		{"acceptance_completed", Event{Kind: KindAcceptanceCompleted, GraphID: "graph-1", NodeID: "verify", ActivationID: "verify@1", TaskID: "task-9", Acceptance: &AcceptancePayload{Verdict: "pass", Status: "disputed", Checked: 2, Reason: "命令未在该任务的 shell 账中找到"}}, []string{"graph=graph-1", "node=verify", "activation=verify@1", "verdict=pass", "verify=disputed", "checked=2", `reason="命令未在该任务的 shell 账中找到"`}},
 	}
-	if len(cases) != 67 {
-		t.Fatalf("test inventory has %d built-in EventKinds, want 67", len(cases))
+	if len(cases) != 68 {
+		t.Fatalf("test inventory has %d built-in EventKinds, want 68", len(cases))
 	}
 	seen := make(map[string]struct{}, len(cases))
 	for _, tc := range cases {

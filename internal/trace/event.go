@@ -79,6 +79,9 @@ const (
 	// replan，绝不自动重跑同一 Task。它是运行时异常信号，不是正常终止条件。
 	// payload：Loop=触发时的循环计数，Reason=兜底说明。
 	KindRuntimeLoopFuseTriggered EventKind = "runtime_loop_fuse_triggered"
+	// KindWatchdogObservation 是新 Loop 的只读 liveness 观测；不会直接迁移
+	// Task 或合成 Scheduler 文本任务。
+	KindWatchdogObservation EventKind = "watchdog_observation"
 
 	// === V6 §5 结构化收尾（finalizing fence + 结构化 blocked）===
 
@@ -109,9 +112,9 @@ const (
 	// 上下文压缩
 	KindHistoryCompaction EventKind = "history_compaction"
 
-	// KindContextManifestBuilt：每轮 LLM 调用前的 Context Manifest 影子账本
-	// （V6 §3 CM1，docs/nextUpgrade-V6.md）。每轮 LLM 调用恰好一条，带 TaskID
-	// 落任务分片。payload：
+	// KindContextManifestBuilt：每轮 LLM 调用前已 durable 的 L2
+	// ContextSnapshot/Manifest 投影；legacy 调用可能仍只有旧 Manifest 摘要。
+	// 每轮 LLM 调用恰好一条，带 TaskID 落任务分片。payload：
 	//   - Loop：ReAct 循环轮次（transfer-note 压缩调用为 -1，与 llm_call_start 同口径）
 	//   - PromptTokens：Manifest 估算的总 prompt tokens（rune/3 口径）
 	//   - HistoryEntries：本轮历史条数
@@ -482,11 +485,14 @@ type Event struct {
 	// 发射方显式填写的值不被覆盖。无活跃 Session（trace 落 .agentgo/traces/）
 	// 时保持空，omitempty 不输出。
 	SessionID string `json:"session_id,omitempty"`
+	RunID     string `json:"run_id,omitempty"`
+	AttemptID string `json:"attempt_id,omitempty"`
+	TurnID    string `json:"turn_id,omitempty"`
+	ActionID  string `json:"action_id,omitempty"`
 	// InvocationID 关联同一次 LLM 调用产生的一组事件（llm_call_start /
 	// llm_call_end / context_manifest_built），由 LLMExecutor.Execute 每次调用
-	// 生成，格式 <taskID前8>-<loop>-<seq>（seq 为 executor 级单调计数，重试
-	// 产生的同 (task,loop) 重复调用借此区分）。Attempt/Turn 身份本轮刻意
-	// 不加——Loop 序号已可关联同任务各轮，见 llm_executor.go 发射处注释。
+	// 按 <turnID>/invocation-<seq> 生成；Attempt/Turn lineage 与 executor 单调
+	// 序号共同防止重试/恢复后撞 durable ContextSnapshot identity。
 	InvocationID string `json:"invocation_id,omitempty"`
 
 	// --- 通用字段 ---
@@ -524,10 +530,25 @@ type Event struct {
 	ToolCallsCount   int    `json:"tool_calls_count,omitempty"`
 	FinishReason     string `json:"finish_reason,omitempty"`
 	DurationMS       int64  `json:"duration_ms,omitempty"`
+	// Invocation failure 的稳定分类字段。Error 仅供展示，控制流不得解析它。
+	FailureKind    string `json:"failure_kind,omitempty"`
+	FailurePhase   string `json:"failure_phase,omitempty"`
+	FailureOrigin  string `json:"failure_origin,omitempty"`
+	TimeoutScope   string `json:"timeout_scope,omitempty"`
+	ProviderCode   string `json:"provider_code,omitempty"`
+	HTTPStatus     int    `json:"http_status,omitempty"`
+	UsageState     string `json:"usage_state,omitempty"`
+	Partial        bool   `json:"partial,omitempty"`
+	RecoveryAction string `json:"recovery_action,omitempty"`
 	// PromptBuildID 是 V6 §2 P1a 的 prompt_build_id：prompt_compiled 事件
 	// 载 Build.ID；context_manifest_built 事件并入同 attempt 冻结的
 	// Build.ID（prompt_bound 不独立成事件，避免同频双账本）。
 	PromptBuildID string `json:"prompt_build_id,omitempty"`
+	// ToolRouterSnapshotID 证明本次 advertise 与 dispatch 使用同一冻结工具视图。
+	ToolRouterSnapshotID string `json:"tool_router_snapshot_id,omitempty"`
+	// ContextSnapshotID/ContextPolicyRef 绑定本次真实发送内容的 L2 durable authority。
+	ContextSnapshotID string `json:"context_snapshot_id,omitempty"`
+	ContextPolicyRef  string `json:"context_policy_ref,omitempty"`
 
 	// --- 工具调用字段 ---
 	Tool      string         `json:"tool,omitempty"`
@@ -564,6 +585,7 @@ type Event struct {
 	// TaskID 为空而 GraphID 非空的事件由 Writer 归入 graph_<graph_id前8位>.jsonl
 	// 分片（与 task 分片同目录）；两者皆空的事件丢弃。
 	GraphID      string `json:"graph_id,omitempty"`
+	GraphOutcome string `json:"graph_outcome,omitempty"`
 	NodeID       string `json:"node_id,omitempty"`
 	ActivationID string `json:"activation_id,omitempty"`
 }

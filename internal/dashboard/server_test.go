@@ -64,8 +64,11 @@ func (f *fakeObserver) push(u ui.Update) {
 
 func testSnapshot() ui.Snapshot {
 	return ui.Snapshot{
-		Agents:     []ui.AgentCard{{ID: "worker-1", Type: "worker", State: "processing", Loop: 2}},
-		Tasks:      []ui.BoardTask{{ID: "task-1", Desc: "演示任务", Status: "processing"}},
+		Agents: []ui.AgentCard{{ID: "worker-1", Type: "worker", State: "processing", Loop: 2}},
+		Tasks: []ui.BoardTask{{
+			ID: "task-1", Desc: "演示任务", Status: "processing", RunID: "run-1",
+			AttemptID: "task-1/attempt-1", AttemptNo: 1, OutcomeRef: "outcome:sha256:test",
+		}},
 		ExecMode:   "strict",
 		TopoMode:   "team",
 		Session:    ui.SessionInfo{ID: "sess-1", Status: "active"},
@@ -110,7 +113,11 @@ func TestSnapshotEndpoint(t *testing.T) {
 			State string `json:"state"`
 		} `json:"agents"`
 		Tasks []struct {
-			ID string `json:"id"`
+			ID         string `json:"id"`
+			RunID      string `json:"run_id"`
+			AttemptID  string `json:"attempt_id"`
+			AttemptNo  int    `json:"attempt_no"`
+			OutcomeRef string `json:"outcome_ref"`
 		} `json:"tasks"`
 		Mode     json.RawMessage `json:"mode"`
 		ExecMode string          `json:"exec_mode"`
@@ -131,6 +138,10 @@ func TestSnapshotEndpoint(t *testing.T) {
 	}
 	if len(body.Tasks) != 1 || body.Tasks[0].ID != "task-1" {
 		t.Fatalf("tasks = %+v", body.Tasks)
+	}
+	if body.Tasks[0].RunID != "run-1" || body.Tasks[0].AttemptID != "task-1/attempt-1" ||
+		body.Tasks[0].AttemptNo != 1 || body.Tasks[0].OutcomeRef != "outcome:sha256:test" {
+		t.Fatalf("SWE task identity = %+v", body.Tasks[0])
 	}
 	if len(body.Mode) != 0 || body.ExecMode != "strict" || body.TopoMode != "team" || body.Session.ID != "sess-1" {
 		t.Fatalf("obsolete mode=%s exec/topo=%q/%q session=%+v", body.Mode, body.ExecMode, body.TopoMode, body.Session)
@@ -181,6 +192,32 @@ func TestEncodeUpdate_InteractionsChangedFullList(t *testing.T) {
 	}
 	if !strings.Contains(string(empty), `"interactions":[]`) {
 		t.Fatalf("空列表必须显式编码为 []: %s", empty)
+	}
+}
+
+func TestEncodeUpdatePreservesGraphTerminalStatuses(t *testing.T) {
+	data, err := encodeUpdate(ui.Update{
+		Kind: ui.KindAgentsChanged,
+		Graphs: []ui.GraphView{
+			{GraphID: "g-failed", Status: "failed", Outcome: "failed"},
+			{GraphID: "g-blocked", Status: "blocked", Outcome: "blocked"},
+			{GraphID: "g-cancelled", Status: "cancelled", Outcome: "cancelled"},
+		},
+		At: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frame struct {
+		Graphs []ui.GraphView `json:"graphs"`
+	}
+	if err := json.Unmarshal(data, &frame); err != nil {
+		t.Fatal(err)
+	}
+	if len(frame.Graphs) != 3 || frame.Graphs[0].Status != "failed" || frame.Graphs[0].Outcome != "failed" ||
+		frame.Graphs[1].Status != "blocked" || frame.Graphs[1].Outcome != "blocked" ||
+		frame.Graphs[2].Status != "cancelled" || frame.Graphs[2].Outcome != "cancelled" {
+		t.Fatalf("Dashboard GraphStatus 投影发生折叠: %s", data)
 	}
 }
 
@@ -472,8 +509,11 @@ func TestIndexContainsLayeredViewsAndAgentWorkbench(t *testing.T) {
 	html := string(indexHTML)
 	for _, marker := range []string{
 		`data-view="overview"`, `data-view="agents"`, `data-view="activity"`, `data-view="trace"`,
-		`id="agentTabs"`, `id="agentOutput"`, `id="agentActivity"`, `id="activityBody"`,
+		`id="agentTabs"`, `id="agentOutput"`, `id="agentActivity"`, `id="activityBody"`, `id="graphCards"`,
 		`完整轮次输出`, `Trace / 工具调用 / 系统日志`, `snap.feed`, `state.turns`,
+		`state.graphs = snap.graphs || []`, `data-graph-outcome="${esc(outcome)}"`,
+		`if (t.graph_id) bits.push("graph=" + t.graph_id)`,
+		`if (t.outcome) bits.push("outcome=" + t.outcome)`,
 	} {
 		if !strings.Contains(html, marker) {
 			t.Errorf("首页缺少分层 UI 标记 %q", marker)

@@ -1106,14 +1106,31 @@ func formatEventDetails(ev Event) string {
 			parts = append(parts, fmt.Sprintf("attempt=%d", ev.AttemptNo))
 		}
 		parts = appendReason(parts, "reason", ev.Reason)
+		if ev.FailureKind != "" {
+			parts = append(parts, fmt.Sprintf("failure=%s recovery=%s", ev.FailureKind, ev.RecoveryAction))
+		}
 	case KindLLMCallStart:
 		parts = append(parts, fmt.Sprintf("history_entries=%d tools=%d", ev.HistoryEntries, ev.ToolCallsCount))
+		if ev.ContextSnapshotID != "" {
+			parts = append(parts, fmt.Sprintf("snapshot=%s policy=%s tools_snapshot=%s",
+				ev.ContextSnapshotID, ev.ContextPolicyRef, ev.ToolRouterSnapshotID))
+		}
 	case KindLLMCallEnd:
 		parts = append(parts, fmt.Sprintf("duration=%dms", ev.DurationMS))
 		parts = append(parts, fmt.Sprintf("prompt_tokens=%d completion_tokens=%d tool_calls=%d",
 			ev.PromptTokens, ev.CompletionTokens, ev.ToolCallsCount))
 		if ev.FinishReason != "" {
 			parts = append(parts, fmt.Sprintf("finish_reason=%s", ev.FinishReason))
+		}
+		if ev.FailureKind != "" {
+			parts = append(parts, fmt.Sprintf("failure=%s phase=%s origin=%s scope=%s",
+				ev.FailureKind, ev.FailurePhase, ev.FailureOrigin, ev.TimeoutScope))
+			if ev.ProviderCode != "" || ev.HTTPStatus != 0 {
+				parts = append(parts, fmt.Sprintf("provider_code=%s http_status=%d", ev.ProviderCode, ev.HTTPStatus))
+			}
+			if ev.UsageState != "" || ev.Partial {
+				parts = append(parts, fmt.Sprintf("usage_state=%s partial=%t", ev.UsageState, ev.Partial))
+			}
 		}
 		if ev.Error != "" {
 			parts = append(parts, fmt.Sprintf("error=%q", truncate(ev.Error, 80)))
@@ -1155,10 +1172,13 @@ func formatEventDetails(ev Event) string {
 		parts = append(parts, fmt.Sprintf("tokens_before=%d tokens_after=%d strategy=%s kept_entries=%d",
 			ev.PromptTokensBefore, ev.PromptTokensAfter, ev.Strategy, ev.KeptEntries))
 	case KindContextManifestBuilt:
-		// CM1 影子账本：est_prompt_tokens 是 rune/3 估算总量（实测由同轮
-		// llm_call_end 对账）；Description 是逐段 JSON 摘要，截断展示。
-		// prompt_build_id（P1a）是本轮上下文绑定的冻结 Build 身份。
+		// L2 durable Snapshot：估算量与真实 WireItems 同源；Description 是
+		// metadata-only Manifest 摘要。legacy 事件可能没有 SnapshotID。
 		parts = append(parts, fmt.Sprintf("est_prompt_tokens=%d history_entries=%d", ev.PromptTokens, ev.HistoryEntries))
+		if ev.ContextSnapshotID != "" {
+			parts = append(parts, fmt.Sprintf("snapshot=%s policy=%s tools_snapshot=%s",
+				ev.ContextSnapshotID, ev.ContextPolicyRef, ev.ToolRouterSnapshotID))
+		}
 		if ev.PromptBuildID != "" {
 			parts = append(parts, fmt.Sprintf("build=%s", ev.PromptBuildID))
 		}
@@ -1372,6 +1392,9 @@ func formatEventDetails(ev Event) string {
 		}
 		if ev.ActivationID != "" {
 			parts = append(parts, fmt.Sprintf("activation=%s", ev.ActivationID))
+		}
+		if ev.GraphOutcome != "" {
+			parts = append(parts, fmt.Sprintf("outcome=%s", ev.GraphOutcome))
 		}
 		if ev.Description != "" {
 			parts = append(parts, fmt.Sprintf("desc=%q", truncate(ev.Description, 200)))
@@ -1689,7 +1712,10 @@ type graphSnapshotHead struct {
 	StateVersion int64  `json:"state_version"`
 	Digest       string `json:"digest"`
 	Doc          *struct {
-		Status string `json:"status"`
+		Status  string `json:"status"`
+		Outcome *struct {
+			Outcome string `json:"outcome"`
+		} `json:"outcome,omitempty"`
 	} `json:"doc"`
 }
 
@@ -1899,11 +1925,24 @@ func graphFactsFromEvents(records []traceEventRecord) (status string, revision i
 		case KindGraphSubmissionRejected:
 			status = "submission_rejected"
 		case KindGraphEnded:
-			// graph_ended：经 end 节点完成时 Reason 为空；失败终态 Reason 载原因。
-			if ev.Reason == "" {
+			// 新事件使用 typed business outcome；旧事件才回退 Reason 猜测。
+			switch ev.GraphOutcome {
+			case "success":
 				status = "completed"
-			} else {
+			case "failed":
 				status = "failed"
+			case "blocked":
+				status = "blocked"
+			case "cancelled":
+				status = "cancelled"
+			default:
+				if ev.GraphOutcome != "" {
+					status = "invalid_outcome"
+				} else if ev.Reason == "" {
+					status = "completed"
+				} else {
+					status = "failed"
+				}
 			}
 		}
 	}
@@ -1911,9 +1950,12 @@ func graphFactsFromEvents(records []traceEventRecord) (status string, revision i
 }
 
 // resolveGraphStatus 合并事件与 snapshot 两个来源的图状态：终态
-// （completed/failed）一旦出现以它为准（snapshot 可能旧于 trace，trace
+// （completed/failed/blocked/cancelled）一旦出现以它为准（snapshot 可能旧于 trace，trace
 // 也可能已被 GC 而只剩 snapshot）；否则 snapshot 优先，事件兜底。
 func resolveGraphStatus(eventStatus, snapStatus string) string {
+	if eventStatus == "invalid_outcome" {
+		return eventStatus
+	}
 	if isTerminalGraphStatus(eventStatus) {
 		return eventStatus
 	}
@@ -1929,7 +1971,24 @@ func resolveGraphStatus(eventStatus, snapStatus string) string {
 	return "unknown"
 }
 
-func isTerminalGraphStatus(s string) bool { return s == "completed" || s == "failed" }
+func isTerminalGraphStatus(s string) bool {
+	return s == "completed" || s == "failed" || s == "blocked" || s == "cancelled"
+}
+
+func graphOutcomeFromEvents(records []traceEventRecord) string {
+	outcome := ""
+	for _, record := range records {
+		if record.event.Kind != KindGraphEnded {
+			continue
+		}
+		if record.event.GraphOutcome == "" {
+			outcome = "legacy"
+		} else {
+			outcome = record.event.GraphOutcome
+		}
+	}
+	return outcome
+}
 
 // truncateDigest12 与 internal/graph 的 truncateDigest 同口径（前 12 位）。
 func truncateDigest12(d string) string {
@@ -1943,6 +2002,7 @@ func truncateDigest12(d string) string {
 type graphHeader struct {
 	id           string
 	status       string
+	outcome      string
 	revision     string
 	stateVersion string
 	digest       string
@@ -1963,7 +2023,7 @@ type graphHeader struct {
 // degraded 优先于 partial。
 func buildGraphHeader(id string, set *graphEventSet, entry graphStateEntry, scan *graphScan) graphHeader {
 	h := graphHeader{
-		id: id, status: "unknown", revision: "unknown", stateVersion: "unknown", digest: "unknown",
+		id: id, status: "unknown", outcome: "unknown", revision: "unknown", stateVersion: "unknown", digest: "unknown",
 	}
 	var records []traceEventRecord
 	if set != nil {
@@ -1972,6 +2032,7 @@ func buildGraphHeader(id string, set *graphEventSet, entry graphStateEntry, scan
 		records = set.records
 	}
 	eventStatus, eventRev, hasEventRev, eventDigest := graphFactsFromEvents(records)
+	eventOutcome := graphOutcomeFromEvents(records)
 
 	head, snapOK, snapErr := readGraphSnapshotHead(entry.snapshotPath, id)
 	snapStatus := ""
@@ -1988,9 +2049,15 @@ func buildGraphHeader(id string, set *graphEventSet, entry graphStateEntry, scan
 		}
 		if head.Doc != nil {
 			snapStatus = head.Doc.Status
+			if head.Doc.Outcome != nil && head.Doc.Outcome.Outcome != "" {
+				h.outcome = head.Doc.Outcome.Outcome
+			}
 		}
 	}
 	h.status = resolveGraphStatus(eventStatus, snapStatus)
+	if eventOutcome != "" {
+		h.outcome = eventOutcome
+	}
 	if !h.fromSnapshot {
 		if hasEventRev {
 			h.revision = strconv.FormatInt(eventRev, 10)
@@ -2027,6 +2094,7 @@ func printGraphHeader(out io.Writer, h graphHeader) {
 	fmt.Fprintf(out, " Graph: %s\n", h.id)
 	fmt.Fprintf(out, " Status: %s  Revision: %s  StateVersion: %s  Digest: %s\n",
 		h.status, h.revision, h.stateVersion, h.digest)
+	fmt.Fprintf(out, " Outcome: %s\n", h.outcome)
 	fmt.Fprintf(out, " Events: %d  Shards: %d  Coverage: %s\n", h.events, h.shards, h.coverage)
 	fmt.Fprintln(out, "════════════════════════════════════════════════════════════════════════════════")
 	if h.rebuilt {

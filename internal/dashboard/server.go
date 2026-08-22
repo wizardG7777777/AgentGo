@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	"agentgo/internal/interaction"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/ui"
 )
 
@@ -283,7 +285,8 @@ func (s *Server) handlePostInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Text string `json:"text"`
+		Text        string                   `json:"text"`
+		RunContract *runcontract.RunContract `json:"run_contract,omitempty"`
 	}
 	if !decodeControlBody(w, r, &body) {
 		return
@@ -296,7 +299,19 @@ func (s *Server) handlePostInput(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "斜杠命令必须通过命令控制接口执行，不能提交为普通任务")
 		return
 	}
-	if err := s.controller.SendUserText(r.Context(), body.Text); err != nil {
+	var err error
+	if body.RunContract != nil {
+		if sender, ok := s.controller.(interface {
+			SendUserTextWithRunContract(context.Context, string, *runcontract.RunContract) error
+		}); ok {
+			err = sender.SendUserTextWithRunContract(r.Context(), body.Text, body.RunContract)
+		} else {
+			err = fmt.Errorf("当前控制器不支持 RunContract")
+		}
+	} else {
+		err = s.controller.SendUserText(r.Context(), body.Text)
+	}
+	if err != nil {
 		writeControlError(w, err)
 		return
 	}

@@ -392,13 +392,19 @@ func (m AppModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case traceMsg:
 		ev := ui.TraceEvent(msg)
 		m.appendTrace(ev)
-		// 图到达终态时在 scrollback 留一行提示：Chat 主态直接可见，全屏
-		// 期间攒在队列里回 Chat 补排。经 end 节点完成时 Reason 为空；失败
-		// 终态（节点无出路 / 任务发布失败）Reason 载中文原因。
+		// 图到达终态时优先显示 typed business outcome；旧事件才回退 Message。
 		if ev.Kind == string(trace.KindGraphEnded) {
-			hint := fmt.Sprintf("[graph] %s 已 completed，/graph 查看", shortID(ev.GraphID))
-			if ev.Message != "" {
-				hint = fmt.Sprintf("[graph] %s 失败：%s，/graph 查看", shortID(ev.GraphID), ev.Message)
+			outcome := ev.Outcome
+			if outcome == "" {
+				if ev.Message == "" {
+					outcome = "success"
+				} else {
+					outcome = "failed"
+				}
+			}
+			hint := fmt.Sprintf("[graph] %s outcome=%s，/graph 查看", shortID(ev.GraphID), outcome)
+			if ev.Message != "" && outcome != "success" {
+				hint = fmt.Sprintf("[graph] %s outcome=%s：%s，/graph 查看", shortID(ev.GraphID), outcome, ev.Message)
 			}
 			m.emitRaw([]string{m.theme.SidebarDim.Render(hint)})
 		}

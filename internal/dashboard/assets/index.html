@@ -31,6 +31,7 @@
   section.view-panel.active { display:block; }
   section h2 { font-size:13px; margin:0 0 8px; color:var(--dim); font-weight:600; }
   #agents { grid-column:1; } #tasks { grid-column:2; }
+  #graphs { grid-column:1 / -1; }
   #result { grid-column:1 / -1; border-color:rgba(63,185,111,.65); }
   #stream { grid-column:1; } #interactions { grid-column:2; }
 	#agentWorkbench, #activity { grid-column:1 / -1; }
@@ -45,6 +46,11 @@
   .badge { display:inline-block; padding:0 8px; border-radius:9px; font-size:11px; margin-left:6px; }
   .st-idle { background:rgba(138,146,163,.18); color:var(--dim); }
   .st-processing { background:rgba(79,156,249,.18); color:var(--accent); }
+  .st-running, .st-pending, .st-paused { background:rgba(79,156,249,.18); color:var(--accent); }
+  .st-completed { background:rgba(63,185,111,.18); color:var(--ok); }
+  .st-failed { background:rgba(224,93,93,.18); color:var(--err); }
+  .st-blocked { background:rgba(217,161,59,.18); color:var(--warn); }
+  .st-cancelled { background:rgba(138,146,163,.18); color:var(--dim); }
   .st-waiting_interaction { background:rgba(217,161,59,.18); color:var(--warn); }
   .st-terminating { background:rgba(224,93,93,.18); color:var(--err); }
   .card .kv { color:var(--dim); margin-top:4px; }
@@ -79,7 +85,7 @@
   .activity-agents { display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:7px; margin-bottom:10px; }
   @media (max-width:900px) {
     main { grid-template-columns:1fr; }
-    #agents, #tasks, #result, #stream, #interactions, #agentWorkbench, #activity { grid-column:1; }
+    #agents, #tasks, #graphs, #result, #stream, #interactions, #agentWorkbench, #activity { grid-column:1; }
     .workbench-grid { grid-template-columns:1fr; }
     header { flex-wrap:wrap; }
   }
@@ -159,6 +165,7 @@
 <main>
   <section id="agents" class="view-panel active" data-view-panel="overview"><h2>代理</h2><div id="agentCards" class="cards"><div class="empty">加载中…</div></div></section>
   <section id="tasks" class="view-panel active" data-view-panel="overview"><h2>任务看板</h2><div id="taskBoard"><div class="empty">加载中…</div></div></section>
+	<section id="graphs" class="view-panel active" data-view-panel="overview"><h2>执行图</h2><div id="graphCards" class="cards"><div class="empty">加载中…</div></div></section>
 	<section id="result" class="view-panel active" data-view-panel="overview"><h2>最近完成回复</h2><div id="resultBody"><div class="empty">尚无完成结果</div></div></section>
   <section id="interactions" class="view-panel active" data-view-panel="overview"><h2>等待回应</h2><div id="interactionList"><div class="empty">当前没有等待回应</div></div></section>
   <section id="agentWorkbench" class="view-panel" data-view-panel="agents">
@@ -193,7 +200,7 @@ function askToken() {
 
 // ---------- 本地状态 ----------
 const state = {
-  agents: [], tasks: [], interactions: [], result: null,
+  agents: [], tasks: [], graphs: [], interactions: [], result: null,
   turns: [],
   feed: { outputs: [], logs: [], traces: [] },
   activeAgent: "", agentOutputFollow: true, view: "overview",
@@ -250,6 +257,20 @@ function renderAgents() {
       <div class="kv">活动 <b>${esc(a.activity_age || "-")}</b>${a.last_error ? ' · <span style="color:var(--err)">' + esc(a.last_error) + "</span>" : ""}</div>
       <div class="kv"><button class="btn small" data-open-agent="${esc(a.id)}">查看实时输出</button><button class="btn small" data-steer="${esc(a.id)}">引导</button></div>
     </div>`).join("");
+}
+function renderGraphs() {
+  const el = $("graphCards");
+  if (!state.graphs.length) { el.innerHTML = '<div class="empty">暂无执行图</div>'; return; }
+  const terminal = { completed: 1, failed: 1, blocked: 1, cancelled: 1 };
+  el.innerHTML = state.graphs.map(g => {
+    const status = g.status || "unknown";
+    const outcome = g.outcome || (terminal[status] ? "legacy/unknown" : "-");
+    return `<div class="card graph-card" data-graph-status="${esc(status)}" data-graph-outcome="${esc(outcome)}">
+      <div><span class="cid">${esc(g.graph_id || "-")}</span><span class="badge st-${esc(status)}">${esc(status)}</span></div>
+      <div class="kv">outcome <b>${esc(outcome)}</b> · revision <b>${g.revision || 0}</b> · state <b>${g.state_version || 0}</b></div>
+      <div class="kv">root <b>${esc(g.root || "-")}</b>${g.degraded ? ' · <span style="color:var(--err)">degraded</span>' : ""}</div>
+    </div>`;
+  }).join("");
 }
 function renderResult() {
 	const el = $("resultBody");
@@ -316,6 +337,8 @@ function ensureActiveAgent() {
 }
 function traceText(t) {
   const bits = [t.kind || "trace"];
+  if (t.graph_id) bits.push("graph=" + t.graph_id);
+  if (t.outcome) bits.push("outcome=" + t.outcome);
   if (t.tool) bits.push("tool=" + t.tool);
   if (t.task_id) bits.push("task=" + t.task_id);
   if (t.loop) bits.push("loop=" + t.loop);
@@ -382,7 +405,7 @@ function renderActivity() {
   $("activityBody").innerHTML = liveHTML + (traces.length ? traces.map(activityHTML).join("") : '<div class="empty">暂无结构化活动</div>');
 }
 function renderAll() {
-  renderAgents(); renderTasks(); renderInteractions(); renderResult();
+  renderAgents(); renderTasks(); renderGraphs(); renderInteractions(); renderResult();
   renderAgentWorkbench(); renderActivity(); renderDiagnostics();
 }
 
@@ -863,6 +886,7 @@ function applySnapshot(snap) {
   renderHeader(snap);
   state.agents = snap.agents || [];
   state.tasks = snap.tasks || [];
+  state.graphs = snap.graphs || [];
   state.interactions = snap.pending_interactions || [];
   state.result = snap.last_result || null;
   state.turns = Array.isArray(snap.turns) ? snap.turns : [];
@@ -878,8 +902,8 @@ function applyUpdate(u) {
   switch (u.kind) {
     case "SnapshotSync": applySnapshot(u.snapshot); break;
     case "AgentsChanged":
-      state.agents = u.agents || []; state.tasks = u.tasks || [];
-      renderAgents(); renderTasks(); renderVisibleFeeds(); break;
+      state.agents = u.agents || []; state.tasks = u.tasks || []; state.graphs = u.graphs || [];
+      renderAgents(); renderTasks(); renderGraphs(); renderVisibleFeeds(); break;
     case "InteractionsChanged":
       state.interactions = u.interactions || [];
       renderInteractions(); break;

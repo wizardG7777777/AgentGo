@@ -549,10 +549,17 @@ func recentDecisionLines(t Theme, w int, traces []ui.TraceEvent) []string {
 		switch event.Outcome {
 		case "success":
 			icon = "✓"
-		case "error":
+		case "error", "failed":
 			icon = "✗"
+		case "blocked":
+			icon = "!"
+		case "cancelled":
+			icon = "⊘"
 		case "running":
 			icon = "…"
+		}
+		if event.Outcome != "" && strings.HasPrefix(event.Kind, "graph_") {
+			detail += " · outcome=" + event.Outcome
 		}
 		if event.ArgsSummary != "" {
 			detail += " · " + event.ArgsSummary

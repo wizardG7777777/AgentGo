@@ -28,7 +28,7 @@ type TraceEvent struct {
 	Tool             string    `json:"tool,omitempty"`
 	CallID           string    `json:"call_id,omitempty"`
 	ArgsSummary      string    `json:"args_summary,omitempty"`
-	Outcome          string    `json:"outcome,omitempty"` // running | success | error
+	Outcome          string    `json:"outcome,omitempty"` // tool: running|success|error；graph: success|failed|blocked|cancelled
 	ResultLen        int       `json:"result_len,omitempty"`
 	Message          string    `json:"message,omitempty"` // Error / Reason / Description 首个非空
 	Path             string    `json:"path,omitempty"`    // file_written 等文件事件
@@ -79,6 +79,15 @@ func ProjectTraceEvent(ev trace.Event) TraceEvent {
 			projected.Outcome = "error"
 		} else {
 			projected.Outcome = "success"
+		}
+	case trace.KindGraphEnded:
+		projected.Outcome = ev.GraphOutcome
+		if projected.Outcome == "" { // legacy graph_ended
+			if ev.Reason == "" {
+				projected.Outcome = "success"
+			} else {
+				projected.Outcome = "failed"
+			}
 		}
 	}
 	return projected

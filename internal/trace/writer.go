@@ -89,6 +89,19 @@ func (w *Writer) SessionID() string {
 	return w.sessionID
 }
 
+// StampSession 把 Writer 当前绑定的 SessionID 盖到事件副本上。包级 Emit 在
+// 写盘与 Reactor 派发前调用，使两条消费者看到完全相同的 correlation；直接
+// Writer.Emit 仍保留内部兜底盖戳。
+func (w *Writer) StampSession(event Event) Event {
+	if w == nil || event.SessionID != "" {
+		return event
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	event.SessionID = w.sessionID
+	return event
+}
+
 // SetOnDegraded 设置进入降级态（首次连续写失败）时的回调（V6 §7.1）。
 // 回调在锁外触发，必须非阻塞且不得回调 Writer 方法；nil 表示只落 marker 文件。
 func (w *Writer) SetOnDegraded(cb func(error)) {
@@ -405,6 +418,7 @@ func Emit(event Event) {
 	d := defaultDispatcher
 	defaultMu.RUnlock()
 	if w != nil {
+		event = w.StampSession(event)
 		w.Emit(event)
 	}
 	if d != nil {

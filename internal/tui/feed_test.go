@@ -189,6 +189,18 @@ func TestRenderNodeWorkbenchKeepsAllExecutionTurns(t *testing.T) {
 	}
 }
 
+func TestRecentDecisionLinesPreserveGraphTerminalOutcome(t *testing.T) {
+	for _, outcome := range []string{"failed", "blocked", "cancelled"} {
+		lines := recentDecisionLines(DefaultTheme(), 100, []ui.TraceEvent{{
+			Kind: "graph_ended", GraphID: "g-typed", Outcome: outcome,
+		}})
+		got := strings.Join(lines, "\n")
+		if !strings.Contains(got, "outcome="+outcome) || strings.Contains(got, "completed") {
+			t.Errorf("Graph outcome=%s 决策行发生错误投影: %q", outcome, got)
+		}
+	}
+}
+
 func TestRenderNodeWorkbenchExplainsWaitingAndFailureContext(t *testing.T) {
 	deadline := time.Date(2026, 8, 6, 15, 4, 5, 0, time.UTC)
 	view := renderNodeWorkbench(DefaultTheme(), 90, 20,

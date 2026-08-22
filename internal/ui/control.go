@@ -11,6 +11,7 @@ import (
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
+	"agentgo/internal/runcontract"
 )
 
 // ErrNotAssembled 表示控制面对应的注入函数未装配（Deps 中为 nil）。
@@ -84,6 +85,12 @@ var _ Controller = (*Hub)(nil)
 // 再投递 EventUserInput 事件（Payload {"text": text}；5 秒发送超时由
 // 注入的 SendUserEvent 实现方保证）。
 func (h *Hub) SendUserText(ctx context.Context, text string) error {
+	return h.SendUserTextWithRunContract(ctx, text, nil)
+}
+
+// SendUserTextWithRunContract 是 bounded API/harness 的正式请求入口。nil contract
+// 保持 TUI/普通 Web 输入的默认交互 profile；非 nil 由 Activator 再做权威校验。
+func (h *Hub) SendUserTextWithRunContract(ctx context.Context, text string, contract *runcontract.RunContract) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -98,10 +105,15 @@ func (h *Hub) SendUserText(ctx context.Context, text string) error {
 		return notAssembled("SendUserEvent")
 	}
 	h.deps.RecordUserInput(text)
-	return h.deps.SendUserEvent(model.Event{
+	event := model.Event{
 		Type:    model.EventUserInput,
 		Payload: map[string]string{"text": text},
-	})
+	}
+	if contract != nil {
+		copy := *contract
+		event.RunContract = &copy
+	}
+	return h.deps.SendUserEvent(event)
 }
 
 // CancelTask 委托注入的受守卫取消入口（前缀解析与 plan 守卫由装配方完成）。
@@ -223,7 +235,7 @@ func (h *Hub) RespondInteraction(ctx context.Context, input interaction.ResolveI
 
 // RequestAgentAudit 委托注入的审计任务创建入口（审计包构建、只读指令与
 // 发布由装配方完成），返回审计任务 ID。结果回收走普通任务结果通道
-//（scheduler 完成后经 ResultOutput → OutputCh → feed），UI 层无额外路径。
+// （scheduler 完成后经 ResultOutput → OutputCh → feed），UI 层无额外路径。
 func (h *Hub) RequestAgentAudit() (string, error) {
 	if h.deps.RequestAgentAudit == nil {
 		return "", notAssembled("RequestAgentAudit")

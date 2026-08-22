@@ -317,6 +317,36 @@ func TestEmit_FillsTimestampBeforeDispatch(t *testing.T) {
 	}
 }
 
+func TestEmit_StampsSameSessionBeforePersistAndDispatch(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := NewWriter(dir, 0)
+	w.SetSessionID("session-correlated")
+	dispatcher := &captureDispatcher{}
+
+	originalWriter := Default()
+	originalDispatcher := DefaultDispatcher()
+	SetDefault(w)
+	SetDefaultDispatcher(dispatcher)
+	defer func() {
+		w.Close()
+		SetDefault(originalWriter)
+		SetDefaultDispatcher(originalDispatcher)
+	}()
+
+	Emit(Event{Kind: KindTaskFailed, TaskID: "session-dispatch", RunID: "run-1"})
+	if dispatcher.ev.SessionID != "session-correlated" {
+		t.Fatalf("dispatcher SessionID=%q", dispatcher.ev.SessionID)
+	}
+	files := listTraceFiles(t, dir)
+	if len(files) != 1 {
+		t.Fatalf("trace files=%d", len(files))
+	}
+	events := readEvents(t, filepath.Join(dir, files[0]))
+	if len(events) != 1 || events[0].SessionID != dispatcher.ev.SessionID {
+		t.Fatalf("persist/dispatch SessionID 不一致: persisted=%+v dispatched=%+v", events, dispatcher.ev)
+	}
+}
+
 func TestSetDefault_NilIsNoop(t *testing.T) {
 	SetDefault(nil)
 	Emit(Event{Kind: KindTaskClaimed, TaskID: "should-be-noop"}) // must not panic
