@@ -20,10 +20,12 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
+	"agentgo/internal/contentstore"
 	"agentgo/internal/effect"
 	"agentgo/internal/gate"
 	"agentgo/internal/interaction"
 	"agentgo/internal/llm"
+	"agentgo/internal/loopstore"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/memory"
 	"agentgo/internal/model"
@@ -54,9 +56,10 @@ type RunnerDeps struct {
 	LLMClient llm.Client
 	// GateReg 是 v5 Phase 1 引入的统一 Gate 注册表（取代 v4 *hook.ToolHookRegistry）。
 	// 跨 Tool / Mailbox 域复用单一 Registry，详见 ReactiveSystem.md §4.4。
-	GateReg        *gate.Registry
-	StoreView      store.StoreHookView
-	RecordToolCall func(string, store.ToolCallRecord)
+	GateReg                 *gate.Registry
+	StoreView               store.StoreHookView
+	RecordToolCall          func(string, store.ToolCallRecord)
+	DurableToolCallRecorder func(string, store.ToolCallRecord) error
 	// 注：AgentHookReg / AgentStoreView / AgentRosterView 在 v5 Phase 4 (MM7) 后整体删除——
 	// AgentHook 子系统已被 trace.Event + Reactor 取代。
 	// Memory 是 v5 Phase 1 引入的 Memory System 共享存储（MemoryManageSystem.md MM5）。
@@ -65,6 +68,12 @@ type RunnerDeps struct {
 	// TaskMemStore 是 V6 §3 Task Memory（CM2，internal/taskmem）的共享存储。
 	// 为 nil 时 Agent 的 Task Memory 链路整链关闭（不创建/更新/注入）。
 	TaskMemStore *taskmem.Store
+	LoopStore    *loopstore.Store
+	// ContentStore 是 L3 ContentRef 权威。生产 bootstrap 始终注入；nil 只供
+	// 不涉及 Context 外置的隔离单测/legacy 构造。
+	ContentStore *contentstore.Store
+	// ContextRuntime 是 L2 唯一编译/快照 authority。生产必须注入。
+	ContextRuntime agent.ContextRuntime
 	// RouteValidator is the shared runtime route authority. It lets every
 	// publish_task caller enforce Plan-private Team ownership, not only the
 	// Scheduler. Nil preserves compatibility for isolated runner tests.
@@ -91,7 +100,7 @@ type RunnerDeps struct {
 	WorkspaceManager *workspace.Manager
 	// EffectJournal 是 V6 §4 H2b 共享副作用账本（internal/effect，bootstrap
 	// 装配注入）：写工具 / run_shell / send_message / workspace 合并经它记录
-	// prepared/settled。nil 时全部埋点降级为不记账（行为与引入账本前一致）。
+	// prepared/settled。生产恒非 nil；nil 只保留给无副作用 legacy/隔离测试。
 	EffectJournal *effect.Journal
 	// OutletChecker 是终态契约 v2 的提交期出路检查器（*graph.Runtime，
 	// bootstrap 装配注入）：schema v2 图任务的 submit_task_result 在终态
@@ -128,6 +137,25 @@ type Runner struct {
 	lifecycleMu           sync.Mutex
 	closed                bool
 	unregisterTaskEndHook func()
+}
+
+// ValidatePromptCompatibility 在 Runner 产生邮箱、Activity 注册或 goroutine
+// 之前验证其冻结 L1 静态 Prompt 能被当前 L2 policy 完整表示。调用方负责在
+// Bootstrap / Team Provision / ad-hoc Spawn 的事务准备阶段执行本函数。
+func ValidatePromptCompatibility(ctx context.Context, rt config.AgentRuntimeConfig, deps RunnerDeps) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	profileID := rt.InstanceID
+	if strings.TrimSpace(profileID) == "" {
+		profileID = rt.Kind
+	}
+	if err := deps.ContextRuntime.ValidateStaticPrompt(ctx, agent.StaticPromptProfile{
+		ProfileID: profileID, SystemPrompt: rt.SystemPrompt, TeamAwareness: rt.TeamAwareness,
+	}); err != nil {
+		return fmt.Errorf("Runner %s Prompt/Context 契约预检失败: %w", profileID, err)
+	}
+	return nil
 }
 
 // New 用 AgentRuntimeConfig + RunnerDeps 构造 Runner。
@@ -198,6 +226,8 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	// system_prompt_file 内容 sha256 前 12（文件在启动期一次性读入，
 	// 与 rt.SystemPrompt 同字节）。
 	llmExec.SetPromptVersion("file:" + prompt.DigestText(rt.SystemPrompt))
+	llmExec.SetContextRuntime(deps.ContextRuntime)
+	llmExec.SetDurableToolCallRecorder(deps.DurableToolCallRecorder)
 	// finalizing fence：submit_task_result 被接受后，同一响应中排在其后的
 	// 工具调用不再 dispatch（executor 与提交通道共享同一 finHolder）。
 	llmExec.SetFinalizationChecker(finHolder)
@@ -230,8 +260,6 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	// 源自全局 agent_idle_threshold；构造点未赋值时为零值 = 永不空闲退出，
 	// 与旧硬编码 0 行为一致）。
 	a.IdleThreshold = rt.IdleThreshold
-	a.CompactTokenThreshold = rt.EnforceCompactTokenThreshold
-	a.CompactKeepRecent = 3 // v3 数值（§11.5.4）
 	a.ProgressNotifyEnabled = deps.ProgressNotifyEnabled
 	a.Activity = deps.Activity
 	if deps.Activity != nil {
@@ -242,6 +270,7 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 		deps.Activity.RegisterAgent(rt.InstanceID, agentType)
 	}
 	a.Model = rt.Model
+	a.SessionID = deps.SessionID
 	a.OnTaskStart = func(taskID string) { holder.Set(taskID); finHolder.Set(taskID) }
 	a.FinalizationChecker = finHolder
 	a.SubmitState = submitState
@@ -288,6 +317,8 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	}
 	a.Memory = deps.Memory
 	a.TaskMemStore = deps.TaskMemStore
+	a.LoopStore = deps.LoopStore
+	a.ContentStore = deps.ContentStore
 	// V6 §4 H1：exec 轴模式源注入（ExecutionLease 的 Policy 交集输入）。
 	a.Modes = deps.Modes
 	a.UserOutput = deps.UserOutput

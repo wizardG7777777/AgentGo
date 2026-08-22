@@ -853,6 +853,17 @@ type runtimeActivation struct {
 }
 
 func (m *Manager) prepare(spec TeamSpec, tmpl *agenttemplate.Template) (runtimePreparation, error) {
+	preflightRT := config.AgentRuntimeConfig{
+		InstanceID: "team-preflight:" + spec.ID, Kind: "template:" + tmpl.Name,
+		EventType: spec.EventType, AllowedTools: append([]string(nil), tmpl.Tools...),
+		Model: tmpl.Model, SystemPrompt: tmpl.SystemPrompt,
+		TaskMaxRetries: tmpl.TaskMaxRetries,
+		TeamAwareness: fmt.Sprintf("Template team %s has %d homogeneous replicas for: %s",
+			tmpl.Ref, spec.Replicas, spec.Purpose),
+	}
+	if err := runner.ValidatePromptCompatibility(m.parentCtx, preflightRT, m.deps); err != nil {
+		return runtimePreparation{}, fmt.Errorf("team %s L1/L2 runtime contract: %w", spec.ID, err)
+	}
 	clients := make([]llm.Client, spec.Replicas)
 	for i := range clients {
 		clients[i] = m.llmFactory(tmpl.Model)
@@ -902,8 +913,7 @@ func (m *Manager) materializePrepared(prep runtimePreparation, claimRecoveredMai
 			InstanceID: agentIDs[i], Kind: "template:" + prep.tmpl.Name,
 			EventType: prep.spec.EventType, AllowedTools: append([]string(nil), prep.tmpl.Tools...),
 			Model: prep.tmpl.Model, SystemPrompt: prep.tmpl.SystemPrompt,
-			TaskMaxRetries:               prep.tmpl.TaskMaxRetries,
-			EnforceCompactTokenThreshold: prep.tmpl.EnforceCompactTokenThreshold,
+			TaskMaxRetries: prep.tmpl.TaskMaxRetries,
 			TeamAwareness: fmt.Sprintf("Template team %s has %d homogeneous replicas for: %s",
 				prep.tmpl.Ref, prep.spec.Replicas, prep.spec.Purpose),
 		}

@@ -67,9 +67,12 @@ func TestWatchdogPendingGraceDefaultsAndYAMLDecode(t *testing.T) {
 	if got := defaults.Infra.Watchdog.UnroutableGraceSec; got != 300 {
 		t.Fatalf("default unroutable_grace_sec = %d, want 300", got)
 	}
+	if got := defaults.Infra.Watchdog.ProgressHeartbeatGraceSec; got != 120 {
+		t.Fatalf("default progress_heartbeat_grace_sec = %d, want 120", got)
+	}
 
 	path := filepath.Join(t.TempDir(), "watchdog.yaml")
-	data := []byte("infra:\n  watchdog:\n    pending_alert_grace_sec: 17\n    unroutable_grace_sec: 29\n")
+	data := []byte("infra:\n  watchdog:\n    progress_heartbeat_grace_sec: 41\n    pending_alert_grace_sec: 17\n    unroutable_grace_sec: 29\n")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -83,6 +86,23 @@ func TestWatchdogPendingGraceDefaultsAndYAMLDecode(t *testing.T) {
 	if got := cfg.Infra.Watchdog.UnroutableGraceSec; got != 29 {
 		t.Fatalf("decoded unroutable_grace_sec = %d, want 29", got)
 	}
+	if got := cfg.Infra.Watchdog.ProgressHeartbeatGraceSec; got != 41 {
+		t.Fatalf("decoded progress_heartbeat_grace_sec = %d, want 41", got)
+	}
+}
+
+func TestValidateWatchdogProgressHeartbeatGrace(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.LLM.DefaultModel = "test-model"
+	cfg.Infra.Watchdog.ProgressHeartbeatGraceSec = -1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "progress_heartbeat_grace_sec") {
+		t.Fatalf("负 checkpoint lease 应被拒绝，得到 %v", err)
+	}
+	cfg.Infra.Watchdog.ProgressHeartbeatGraceSec = 120
+	cfg.Infra.Store.DefaultTimeoutSec = -1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "default_timeout_sec") {
+		t.Fatalf("负 legacy ExpectedDuration 别名应被拒绝，得到 %v", err)
+	}
 }
 
 func TestValidateRejectsEmptyToolProfile(t *testing.T) {
@@ -95,7 +115,7 @@ func TestValidateRejectsEmptyToolProfile(t *testing.T) {
 	cfg.ToolProfiles = map[string][]string{"none": {}}
 	cfg.Agents = []AgentKind{{
 		Kind: "worker", Replicas: 1, Profile: "none", SystemPromptFile: prompt,
-		TaskMaxRetries: 1, EnforceCompactTokenThreshold: 1,
+		TaskMaxRetries: 1,
 	}}
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "空 profile") {
 		t.Fatalf("empty tool profile should fail closed, got %v", err)
@@ -240,12 +260,11 @@ func TestValidate_RejectsBackslashPath(t *testing.T) {
 	cfg := &Config{
 		Agents: []AgentKind{
 			{
-				Kind:                         "worker",
-				Replicas:                     1,
-				Profile:                      "any",
-				SystemPromptFile:             `prompts\worker.md`, // 反斜杠！
-				TaskMaxRetries:               3,
-				EnforceCompactTokenThreshold: 4000,
+				Kind:             "worker",
+				Replicas:         1,
+				Profile:          "any",
+				SystemPromptFile: `prompts\worker.md`, // 反斜杠！
+				TaskMaxRetries:   3,
 			},
 		},
 		ToolProfiles: map[string][]string{"any": {"read_file"}},
@@ -259,8 +278,8 @@ func TestValidate_RejectsBackslashPath(t *testing.T) {
 func TestValidate_RejectsDuplicateKind(t *testing.T) {
 	cfg := &Config{
 		Agents: []AgentKind{
-			{Kind: "worker", Replicas: 1, Profile: "p", SystemPromptFile: "x", TaskMaxRetries: 1, EnforceCompactTokenThreshold: 1},
-			{Kind: "worker", Replicas: 1, Profile: "p", SystemPromptFile: "x", TaskMaxRetries: 1, EnforceCompactTokenThreshold: 1},
+			{Kind: "worker", Replicas: 1, Profile: "p", SystemPromptFile: "x", TaskMaxRetries: 1},
+			{Kind: "worker", Replicas: 1, Profile: "p", SystemPromptFile: "x", TaskMaxRetries: 1},
 		},
 		ToolProfiles: map[string][]string{"p": {"read_file"}},
 	}
@@ -273,7 +292,7 @@ func TestValidate_RejectsDuplicateKind(t *testing.T) {
 func TestValidate_RejectsEmptyKind(t *testing.T) {
 	cfg := &Config{
 		Agents: []AgentKind{
-			{Kind: "", Replicas: 1, Profile: "p", SystemPromptFile: "x", TaskMaxRetries: 1, EnforceCompactTokenThreshold: 1},
+			{Kind: "", Replicas: 1, Profile: "p", SystemPromptFile: "x", TaskMaxRetries: 1},
 		},
 		ToolProfiles: map[string][]string{"p": {"read_file"}},
 	}
@@ -289,7 +308,7 @@ func TestValidate_ProfileToolsMutex(t *testing.T) {
 			{
 				Kind: "w", Replicas: 1,
 				Profile: "p", Tools: []string{"read_file"}, // 同时给两者
-				SystemPromptFile: "x", TaskMaxRetries: 1, EnforceCompactTokenThreshold: 1,
+				SystemPromptFile: "x", TaskMaxRetries: 1,
 			},
 		},
 		ToolProfiles: map[string][]string{"p": {"read_file"}},
@@ -301,7 +320,7 @@ func TestValidate_ProfileToolsMutex(t *testing.T) {
 
 // TestValidate_StartupProbeInvalid 校验 startup_probe 取值。
 func TestValidate_StartupProbeInvalid(t *testing.T) {
-	cfg := &Config{StartupProbe: "ping"} // "tcp" / "off" 之外
+	cfg := &Config{StartupProbe: "ping"} // "tool" / "tcp" / "off" 之外
 	if err := cfg.Validate(); err == nil {
 		t.Error("应当拒绝 startup_probe=ping")
 	}
@@ -322,15 +341,15 @@ func TestValidate_SchedulerOnlyRequiresAndAcceptsModel(t *testing.T) {
 	}
 }
 
-func TestSchedulerBehaviorDefaultsAndYAMLOverrides(t *testing.T) {
+func TestSchedulerCompactThresholdRemovedWithMigrationDiagnostic(t *testing.T) {
 	defaults := DefaultConfig()
 	if defaults.Scheduler.AgentMaxLoops != 0 {
 		t.Fatalf("default scheduler.agent_max_loops=%d want 0（V6 起不再填充默认值）",
 			defaults.Scheduler.AgentMaxLoops)
 	}
-	if defaults.Scheduler.EnforceCompactTokenThreshold != DefaultSchedulerCompactTokenThreshold {
-		t.Fatalf("default scheduler.enforce_compact_token_threshold=%d want %d",
-			defaults.Scheduler.EnforceCompactTokenThreshold, DefaultSchedulerCompactTokenThreshold)
+	if defaults.Scheduler.EnforceCompactTokenThreshold != 0 {
+		t.Fatalf("default scheduler.enforce_compact_token_threshold=%d want 0",
+			defaults.Scheduler.EnforceCompactTokenThreshold)
 	}
 	if defaults.Scheduler.ContextLimit != 0 {
 		t.Fatalf("default scheduler.context_limit=%d want 0（V6 起不再填充默认值）",
@@ -346,11 +365,8 @@ func TestSchedulerBehaviorDefaultsAndYAMLOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("scheduler behavior overrides should validate: %v", err)
-	}
-	if cfg.Scheduler.EnforceCompactTokenThreshold != 160000 {
-		t.Fatalf("scheduler overrides not decoded: %+v", cfg.Scheduler)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "已移除") {
+		t.Fatalf("旧 scheduler compact threshold 应给迁移诊断: %v", err)
 	}
 
 	modelOnlyPath := filepath.Join(t.TempDir(), "scheduler-model-only.yaml")
@@ -362,7 +378,7 @@ func TestSchedulerBehaviorDefaultsAndYAMLOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	if modelOnly.Scheduler.AgentMaxLoops != 0 ||
-		modelOnly.Scheduler.EnforceCompactTokenThreshold != DefaultSchedulerCompactTokenThreshold ||
+		modelOnly.Scheduler.EnforceCompactTokenThreshold != 0 ||
 		modelOnly.Scheduler.ContextLimit != 0 {
 		t.Fatalf("model-only scheduler block lost compatibility defaults: %+v", modelOnly.Scheduler)
 	}
@@ -394,7 +410,6 @@ func TestValidate_AgentMaxLoopsMigrationDiagnostic(t *testing.T) {
 		cfg.Agents = []AgentKind{{
 			Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
 			SystemPromptFile: prompt, AgentMaxLoops: 10, TaskMaxRetries: 1,
-			EnforceCompactTokenThreshold: 1,
 		}}
 		err := cfg.Validate()
 		if err == nil || !strings.Contains(err.Error(), "agent_max_loops") ||
@@ -424,7 +439,6 @@ func TestValidate_AgentMaxLoopsMigrationDiagnostic(t *testing.T) {
 		cfg.Agents = []AgentKind{{
 			Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
 			SystemPromptFile: prompt, TaskMaxRetries: 1,
-			EnforceCompactTokenThreshold: 1,
 		}}
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("未设置 agent_max_loops 应通过校验，got %v", err)
@@ -459,7 +473,6 @@ func TestValidate_ContextLimitMigrationDiagnostic(t *testing.T) {
 		cfg.Agents = []AgentKind{{
 			Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
 			SystemPromptFile: prompt, ContextLimit: 16000, TaskMaxRetries: 1,
-			EnforceCompactTokenThreshold: 1,
 		}}
 		err := cfg.Validate()
 		if err == nil || !strings.Contains(err.Error(), "context_limit") ||
@@ -489,7 +502,6 @@ func TestValidate_ContextLimitMigrationDiagnostic(t *testing.T) {
 		cfg.Agents = []AgentKind{{
 			Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
 			SystemPromptFile: prompt, TaskMaxRetries: 1,
-			EnforceCompactTokenThreshold: 1,
 		}}
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("未设置 context_limit 应通过校验，got %v", err)
@@ -521,9 +533,8 @@ func TestValidate_StaticAgentsStillRequireSchedulerModel(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Agents = []AgentKind{{
 		Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
-		SystemPromptFile:             filepath.ToSlash(filepath.Join("..", "..", "prompts", "worker.md")),
-		TaskMaxRetries:               1,
-		EnforceCompactTokenThreshold: 1,
+		SystemPromptFile: filepath.ToSlash(filepath.Join("..", "..", "prompts", "worker.md")),
+		TaskMaxRetries:   1,
 	}}
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "Scheduler 配置缺少模型") {
 		t.Fatalf("static Agent model cannot replace the Scheduler/template default model, got %v", err)
@@ -542,7 +553,6 @@ func TestValidate_StaticAgentNeedsOwnOrLLMDefaultModel(t *testing.T) {
 	cfg.Agents = []AgentKind{{
 		Kind: "worker", Replicas: 1, Tools: []string{"read_file"},
 		SystemPromptFile: prompt, TaskMaxRetries: 1,
-		EnforceCompactTokenThreshold: 1,
 	}}
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agents[0].model") {
 		t.Fatalf("scheduler.model must not silently become the static Agent model, got %v", err)
@@ -588,7 +598,6 @@ agents:
     replicas: 1
     system_prompt_file: prompts/w.md
     task_max_retries: 3
-    enforce_compact_token_threshold: 4000
 infra:
   watchdog:
     interval_sec: 30
@@ -629,7 +638,6 @@ agents:
     replicas: 1
     system_prompt_file: prompts/w.md
     task_max_retries: 3
-    enforce_compact_token_threshold: 4000
 infra:
   watchdog:
     interval_sec: 30
@@ -670,7 +678,6 @@ agents:
     replicas: 1
     system_prompt_file: prompts/w.md
     task_max_retries: 3
-    enforce_compact_token_threshold: 4000
 infra:
   watchdog:
     interval_sec: 30

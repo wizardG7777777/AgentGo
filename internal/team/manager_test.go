@@ -11,9 +11,11 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/agenttemplate"
+	"agentgo/internal/contextadapter"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
+	"agentgo/internal/policycatalog"
 	reactorbuiltin "agentgo/internal/reactor/builtin"
 	"agentgo/internal/roster"
 	"agentgo/internal/runner"
@@ -26,6 +28,36 @@ type idleLLM struct{}
 
 func (idleLLM) Chat(context.Context, []llm.Message, []llm.ToolDef) (llm.Response, error) {
 	return llm.Response{}, errors.New("idle test LLM must not be called")
+}
+
+func TestManagerPrepareRejectsOversizedTemplatePromptBeforeClients(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientCalls := 0
+	manager := &Manager{
+		deps: runner.RunnerDeps{ContextRuntime: agent.ContextRuntime{
+			Adapter: contextadapter.New(), Policies: catalog,
+		}},
+		llmFactory: func(string) llm.Client {
+			clientCalls++
+			return idleLLM{}
+		},
+		parentCtx: context.Background(),
+	}
+	_, err = manager.prepare(TeamSpec{
+		ID: "team-oversized", EventType: "team:oversized", Purpose: "验证", Replicas: 2,
+	}, &agenttemplate.Template{
+		Ref: "builtin/oversized@1", Name: "oversized", SystemPrompt: strings.Repeat("策", 22<<10),
+	})
+	if err == nil || !strings.Contains(err.Error(), "L1/L2 runtime contract") ||
+		!strings.Contains(err.Error(), "fragment_limit_exceeded") {
+		t.Fatalf("Team 必须在创建 client/Runner 前拒绝超限 Prompt: %v", err)
+	}
+	if clientCalls != 0 {
+		t.Fatalf("Prompt 预检失败后不应创建 LLM clients，calls=%d", clientCalls)
+	}
 }
 
 type routeRecord struct {

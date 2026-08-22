@@ -75,8 +75,10 @@ type AgentKind struct {
 	// AgentMaxLoops 已于 V6 移除（固定循环上限不再是终止条件，见
 	// docs/nextUpgrade-V6.md §5 升级思路 5/6/8）。结构体保留该字段仅为让旧
 	// YAML 仍能解析，Validate() 会对非零值返回明确的迁移诊断错误。
-	AgentMaxLoops                int `yaml:"agent_max_loops" json:"agent_max_loops"`
-	TaskMaxRetries               int `yaml:"task_max_retries" json:"task_max_retries"`
+	AgentMaxLoops  int `yaml:"agent_max_loops" json:"agent_max_loops"`
+	TaskMaxRetries int `yaml:"task_max_retries" json:"task_max_retries"`
+	// EnforceCompactTokenThreshold 已由 Context v3 的 Snapshot-pressure
+	// projection 取代；保留解析位只为给旧 YAML 明确迁移诊断。
 	EnforceCompactTokenThreshold int `yaml:"enforce_compact_token_threshold" json:"enforce_compact_token_threshold"`
 	// ContextLimit 已于 V6 移除（固定上下文硬限截断层与 history_truncated 事件
 	// 一并删除，见 docs/nextUpgrade-V6.md §7.4；上下文适配由 L2 压缩与 L3 溢出
@@ -100,14 +102,8 @@ type AgentKind struct {
 	Description string `yaml:"description,omitempty" json:"description,omitempty"`
 }
 
-const (
-	// DefaultSchedulerCompactTokenThreshold 保持 Agent 层历史压缩的既有回退值。
-	DefaultSchedulerCompactTokenThreshold = 80000
-)
-
 // SchedulerKind scheduler 独立块（v4 §11.5.5）。
-// 工具集 / 系统提示词 / replicas 仍由 internal/scheduler 固定；模型与影响
-// ReAct 历史压缩预算的参数允许覆盖，零值回落内置默认。
+// 工具集 / 系统提示词 / replicas 仍由 internal/scheduler 固定；模型可覆盖。
 type SchedulerKind struct {
 	Model string `yaml:"model,omitempty" json:"model,omitempty"`
 	// AgentMaxLoops 已于 V6 移除（与 agents[*].agent_max_loops 同步删除）。
@@ -165,6 +161,9 @@ type InfraConfig struct {
 
 type WatchdogConfig struct {
 	IntervalSec int `yaml:"interval_sec" json:"interval_sec"`
+	// ProgressHeartbeatGraceSec 是新 Loop 的 checkpoint lease。超过此窗口
+	// Watchdog 只发布 typed heartbeat_stalled observation，不迁移 Task 状态。
+	ProgressHeartbeatGraceSec int `yaml:"progress_heartbeat_grace_sec" json:"progress_heartbeat_grace_sec"`
 	// PendingAlertGraceSec is the age of one pending queue lease after which Watchdog
 	// reports claim starvation. A runnable route is only alerted, never failed.
 	PendingAlertGraceSec int `yaml:"pending_alert_grace_sec" json:"pending_alert_grace_sec"`
@@ -183,10 +182,9 @@ type StoreConfig struct {
 	EventChannelBuffer int `yaml:"event_channel_buffer" json:"event_channel_buffer"`
 	FIFOLimit          int `yaml:"fifo_limit" json:"fifo_limit"`
 	DefaultConcurrency int `yaml:"default_concurrency" json:"default_concurrency"`
-	// DefaultTimeoutSec 是任务级预期执行时长（秒）：processing 超过它由
-	// watchdog 发超时告警（2026-08-19 起只告警、不杀死任务）。
-	// pending 的告警/无 route 宽限分别由 WatchdogConfig 控制，不能复用执行超时。
-	// v3 旧名 cfg.DefaultTimeoutSec，已下沉到 Infra.Store 块下，与 store 容量参数同居。
+	// DefaultTimeoutSec 保留旧配置键，实际只填充 Task.ExpectedDuration（SLO/UI）。
+	// 它不生成 deadline；新 Loop 的控制权来自 RunContract/ProgressCheckpoint。
+	// Deprecated: 配置键 default_timeout_sec 仅作兼容别名。
 	DefaultTimeoutSec int `yaml:"default_timeout_sec" json:"default_timeout_sec"`
 }
 
@@ -240,14 +238,13 @@ func (c UIConfig) HasFrontend(name string) bool {
 // 本结构的 Model 字段仅作为运行时元数据使用——主要用途是 HistoryEntry.Model 记录
 // （详见 nextUpgrade_v4.md §11.7.3 模型切换基准重置）与运行时日志。
 type AgentRuntimeConfig struct {
-	InstanceID                   string
-	Kind                         string
-	EventType                    string
-	AllowedTools                 []string
-	Model                        string
-	SystemPrompt                 string
-	TaskMaxRetries               int
-	EnforceCompactTokenThreshold int
+	InstanceID     string
+	Kind           string
+	EventType      string
+	AllowedTools   []string
+	Model          string
+	SystemPrompt   string
+	TaskMaxRetries int
 	// IdleThreshold 对应全局 agent_idle_threshold：agent 连续 N 次空闲轮询后
 	// 退出 goroutine；0 = 永不空闲退出（生产推荐，见 Config.AgentIdleThreshold）。
 	// AgentKind 没有 per-kind 覆盖字段，各 AgentRuntimeConfig 构造点统一填全局值；
@@ -383,10 +380,8 @@ func ptrTo[T any](v T) *T { return &v }
 
 func DefaultConfig() *Config {
 	return &Config{
-		ProjectRoot: ".",
-		Scheduler: SchedulerKind{
-			EnforceCompactTokenThreshold: DefaultSchedulerCompactTokenThreshold,
-		},
+		ProjectRoot:                ".",
+		Scheduler:                  SchedulerKind{},
 		ShellTimeoutSec:            30,
 		MaxSubtaskDepth:            1,
 		ProgressNotifyEnabled:      true, // §8.6 进度通知默认启用
@@ -401,9 +396,10 @@ func DefaultConfig() *Config {
 		},
 		Infra: InfraConfig{
 			Watchdog: WatchdogConfig{
-				IntervalSec:          30,
-				PendingAlertGraceSec: 300,
-				UnroutableGraceSec:   300,
+				IntervalSec:               30,
+				ProgressHeartbeatGraceSec: 120,
+				PendingAlertGraceSec:      300,
+				UnroutableGraceSec:        300,
 			},
 			MailNotifier: MailNotifierConfig{Enabled: true, IntervalSec: 5},
 			Store: StoreConfig{
@@ -672,14 +668,17 @@ func (c *Config) Validate() error {
 		// 事件）一并删除，上下文适配由 L2 压缩与 L3 溢出重试承担。零值视为未设置。
 		if k.ContextLimit != 0 {
 			return fmt.Errorf("agents[%d] (kind=%q).context_limit=%d 已于 V6 移除："+
-				"固定上下文硬限已删除，上下文适配由历史压缩（enforce_compact_token_threshold）与溢出重试承担；"+
+				"固定上下文硬限已删除，上下文适配由版本化 Context policy、ContentRef 与 Snapshot-pressure projection 承担；"+
 				"请从配置中删除该字段", i, k.Kind, k.ContextLimit)
 		}
 		if k.TaskMaxRetries <= 0 {
 			return fmt.Errorf("agents[%d] (kind=%q).task_max_retries 必须 > 0", i, k.Kind)
 		}
-		if k.EnforceCompactTokenThreshold <= 0 {
-			return fmt.Errorf("agents[%d] (kind=%q).enforce_compact_token_threshold 必须 > 0", i, k.Kind)
+		if k.EnforceCompactTokenThreshold != 0 {
+			return fmt.Errorf("agents[%d] (kind=%q).enforce_compact_token_threshold=%d 已移除："+
+				"累计完整 Prompt Token 会重复计算静态 system/tool schema 并造成频繁有损压缩；"+
+				"Context v3 现按当前 Snapshot section 压力从 Raw History 派生 replay 视图，请删除该字段",
+				i, k.Kind, k.EnforceCompactTokenThreshold)
 		}
 	}
 
@@ -692,11 +691,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Scheduler.ContextLimit != 0 {
 		return fmt.Errorf("scheduler.context_limit=%d 已于 V6 移除："+
-			"固定上下文硬限已删除，上下文适配由历史压缩（enforce_compact_token_threshold）与溢出重试承担；"+
+			"固定上下文硬限已删除，上下文适配由版本化 Context policy、ContentRef 与 Snapshot-pressure projection 承担；"+
 			"请从配置中删除该字段", c.Scheduler.ContextLimit)
 	}
-	if c.Scheduler.EnforceCompactTokenThreshold < 0 {
-		return fmt.Errorf("scheduler.enforce_compact_token_threshold=%d 不能为负", c.Scheduler.EnforceCompactTokenThreshold)
+	if c.Scheduler.EnforceCompactTokenThreshold != 0 {
+		return fmt.Errorf("scheduler.enforce_compact_token_threshold=%d 已移除：Scheduler phase Prompt 不再按累计完整 Prompt spend 压缩 Raw History；请删除该字段",
+			c.Scheduler.EnforceCompactTokenThreshold)
 	}
 
 	// 规则 10：scheduler.model 出现时必须为非空字符串。空整块 / 空 model 字段则缺省回落 LLM.DefaultModel
@@ -714,6 +714,18 @@ func (c *Config) Validate() error {
 	}
 	if int64(c.SessionSnapshotIntervalSec) > maxSessionDurationSeconds {
 		return fmt.Errorf("session_snapshot_interval_sec=%d 超出 time.Duration 可表示范围", c.SessionSnapshotIntervalSec)
+	}
+	if c.Infra.Watchdog.ProgressHeartbeatGraceSec < 0 {
+		return fmt.Errorf("infra.watchdog.progress_heartbeat_grace_sec=%d 不能为负", c.Infra.Watchdog.ProgressHeartbeatGraceSec)
+	}
+	if int64(c.Infra.Watchdog.ProgressHeartbeatGraceSec) > maxSessionDurationSeconds {
+		return fmt.Errorf("infra.watchdog.progress_heartbeat_grace_sec=%d 超出 time.Duration 可表示范围", c.Infra.Watchdog.ProgressHeartbeatGraceSec)
+	}
+	if c.Infra.Store.DefaultTimeoutSec < 0 {
+		return fmt.Errorf("infra.store.default_timeout_sec=%d 不能为负（该 legacy 键只填充 ExpectedDuration）", c.Infra.Store.DefaultTimeoutSec)
+	}
+	if int64(c.Infra.Store.DefaultTimeoutSec) > maxSessionDurationSeconds {
+		return fmt.Errorf("infra.store.default_timeout_sec=%d 超出 time.Duration 可表示范围", c.Infra.Store.DefaultTimeoutSec)
 	}
 
 	if err := c.validateUI(); err != nil {
@@ -827,8 +839,8 @@ func isLoopbackHost(host string) bool {
 // validateStartupProbe 校验 startup_probe / 失败动作字段取值合法。
 // 字段缺失（空串）等价于默认值，不报错。
 func (c *Config) validateStartupProbe() error {
-	if c.StartupProbe != "" && c.StartupProbe != "tcp" && c.StartupProbe != "off" {
-		return fmt.Errorf("startup_probe=%q 取值无效（仅允许 \"tcp\" / \"off\"）", c.StartupProbe)
+	if c.StartupProbe != "" && c.StartupProbe != "tcp" && c.StartupProbe != "tool" && c.StartupProbe != "off" {
+		return fmt.Errorf("startup_probe=%q 取值无效（仅允许 \"tool\" / \"tcp\" / \"off\"）", c.StartupProbe)
 	}
 	if c.StartupProbeFailureAction != "" &&
 		c.StartupProbeFailureAction != "warn" &&

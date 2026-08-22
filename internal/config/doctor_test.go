@@ -230,7 +230,6 @@ agents:
     profile: worker_ro
     system_prompt_file: ` + filepath.ToSlash(promptPath) + `
     task_max_retries: 2
-    enforce_compact_token_threshold: 1000
 `
 	if err := os.WriteFile(yamlPath, []byte(yamlContent), 0o644); err != nil {
 		t.Fatalf("写入 yaml 失败: %v", err)
@@ -272,7 +271,6 @@ agents:
     tools: [read_file]
     system_prompt_file: ` + promptRef + `
     task_max_retries: 2
-    enforce_compact_token_threshold: 1000
 `
 		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 			t.Fatalf("写入 yaml 失败: %v", err)

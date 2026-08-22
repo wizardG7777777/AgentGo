@@ -121,7 +121,6 @@ agents:
     tools: [read_file]
     system_prompt_file: ` + filepath.ToSlash(promptPath) + `
     task_max_retries: 1
-    enforce_compact_token_threshold: 4000
 startup_probe: "off"
 `)
 	if err := os.WriteFile(cfgPath, cfg, 0o644); err != nil {
