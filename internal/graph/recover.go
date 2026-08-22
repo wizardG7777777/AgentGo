@@ -658,6 +658,20 @@ func applyJournalRecord(doc *GraphDocument, je *journalEntry) (*GraphDocument, e
 		}
 		doc.Revision++
 		doc.StateVersion++
+	case journalKindDefinitionAdopted:
+		if doc == nil {
+			return nil, fmt.Errorf("definition_adopted 记录前缺少 submit")
+		}
+		var p definitionAdoptPayload
+		if err := json.Unmarshal(je.Payload, &p); err != nil {
+			return nil, fmt.Errorf("解析 definition_adopted payload: %w", err)
+		}
+		if p.Definition == nil {
+			return nil, fmt.Errorf("definition_adopted payload 缺少 definition")
+		}
+		if err := applyDefinitionAdoption(doc, p.Definition); err != nil {
+			return nil, err
+		}
 	case journalKindNodeStatus:
 		var p nodeStatusPayload
 		if err := json.Unmarshal(je.Payload, &p); err != nil {
@@ -705,6 +719,28 @@ func applyJournalRecord(doc *GraphDocument, je *journalEntry) (*GraphDocument, e
 			return nil, fmt.Errorf("解析 graph_status payload: %w", err)
 		}
 		doc.Status = p.To
+		doc.StateVersion++
+	case journalKindGraphOutcome:
+		if doc == nil {
+			return nil, fmt.Errorf("graph_outcome 记录前缺少 submit")
+		}
+		var p graphOutcomePayload
+		if err := json.Unmarshal(je.Payload, &p); err != nil {
+			return nil, fmt.Errorf("解析 graph_outcome payload: %w", err)
+		}
+		status := p.Outcome.Status()
+		if status == "" {
+			return nil, fmt.Errorf("graph_outcome 含非法 outcome=%q", p.Outcome.Outcome)
+		}
+		if doc.Outcome != nil {
+			return nil, fmt.Errorf("graph_outcome 重复提交：既有 outcome=%q，新 outcome=%q", doc.Outcome.Outcome, p.Outcome.Outcome)
+		}
+		if !IsValidGraphStatusTransition(doc.Status, status) {
+			return nil, fmt.Errorf("graph_outcome 非法状态迁移：%s -> %s", doc.Status, status)
+		}
+		outcome := p.Outcome
+		doc.Outcome = &outcome
+		doc.Status = status
 		doc.StateVersion++
 	case journalKindExecutionStatus:
 		var p executionStatusPayload

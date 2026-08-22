@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"agentgo/internal/runcontract"
 	"agentgo/internal/trace"
 )
 
@@ -95,6 +96,7 @@ type GraphTaskSnapshot struct {
 	// 把 acceptance 等角色错认成普通执行节点。
 	NodeKind       NodeKind
 	TerminalStatus NodeStatus
+	OutcomeRef     string
 	Result         map[string]any
 	// Evidence 是任务终态时随快照携带的可观察证据（由公告板桥按
 	// ToolCallRecord + Artifacts 组装）：恢复对账路径的 acceptance 谱系
@@ -104,9 +106,14 @@ type GraphTaskSnapshot struct {
 
 // TaskSpec 是一次节点任务发布的完整描述。
 type TaskSpec struct {
-	GraphID      string
-	NodeID       string
-	ActivationID string
+	GraphID                 string
+	DefinitionDigestVersion string
+	RunID                   runcontract.RunID
+	RunContract             *runcontract.RunContract
+	ProgressContractRef     string
+	ContextPolicyRef        string
+	NodeID                  string
+	ActivationID            string
 	// NodeKind 随 activation 冻结并持久化到 model.Task，供执行租约按真实
 	// Graph 角色派生控制通道；不能从 route 猜测（acceptance 可自定义 route）。
 	NodeKind    NodeKind
@@ -126,7 +133,8 @@ type TaskSpec struct {
 	// OutputContract 是终态契约 v2 的输出契约定界块（<output-contract>…），
 	// 发布时由 Runtime 从本 activation 冻结出边机械派生（§5）；v1 图与无
 	// path 条件节点恒为空串，任务桥不注入。
-	OutputContract string
+	OutputContract      string
+	TypedOutputContract *NodeOutputContract
 }
 
 // 节点类型 → 默认认领路由（runner event_type）的映射常量。
@@ -615,6 +623,13 @@ func (rt *Runtime) writeTerminalLocked(graphID, nodeID string, exec Execution, s
 // 唯一落盘入口。Settlement 永久保留；重启后的重复续跑由 TransitionRecord 与
 // Graph 终态幂等，不另写 cleared 标记，避免制造新的两记录崩溃窗口。
 func (rt *Runtime) writeTerminalContinuationLocked(graphID, nodeID string, exec Execution, status NodeStatus, result map[string]any, continuation SettlementContinuation, reason string) error {
+	return rt.writeTerminalContinuationWithOutcomeLocked(graphID, nodeID, exec, status,
+		result, continuation, "", reason)
+}
+
+func (rt *Runtime) writeTerminalContinuationWithOutcomeLocked(graphID, nodeID string,
+	exec Execution, status NodeStatus, result map[string]any, continuation SettlementContinuation,
+	outcome EndOutcome, reason string) error {
 	if result == nil {
 		result = map[string]any{}
 	}
@@ -648,7 +663,7 @@ func (rt *Runtime) writeTerminalContinuationLocked(graphID, nodeID string, exec 
 	exec.ResultSummary = summarizeResult(durableResult)
 	exec.Settlement = &TerminalSettlement{
 		Status: status, ResultRef: resultRecord.Ref,
-		Continuation: continuation, Reason: reason,
+		Continuation: continuation, Outcome: outcome, Reason: reason,
 	}
 	if err := rt.writeNode(graphID, nodeID, exec, status); err != nil {
 		return err
@@ -1316,6 +1331,8 @@ func (rt *Runtime) resumeTerminalSettlementLocked(graphID, nodeID string, exec E
 		return rt.evalTransitionsLocked(graphID, nodeID, exec.ActivationID, settlement.Status, result)
 	case SettlementContinueGraphComplete:
 		return rt.completeGraph(graphID)
+	case SettlementContinueGraphOutcome:
+		return rt.commitEndOutcome(graphID, nodeID, exec, settlement.Outcome, settlement.Reason)
 	case SettlementContinueGraphFail:
 		return rt.failGraph(graphID, settlement.Reason)
 	case SettlementContinueNone:
@@ -1677,11 +1694,19 @@ func (rt *Runtime) activateEnd(graphID, nodeID string, input map[string]any) err
 				rt.failGraph(graphID, reason), fmt.Errorf("graph: %s", reason))
 		}
 	}
-	if err := rt.writeTerminalContinuationLocked(graphID, nodeID, exec, NodeCompleted,
-		input, SettlementContinueGraphComplete, ""); err != nil {
+	outcome := node.EndOutcome
+	if outcome == "" {
+		outcome = EndSuccess // legacy GraphDocument compatibility
+	}
+	if !outcome.IsValid() {
+		reason := fmt.Sprintf("end 节点 %s 声明非法 outcome=%q", nodeID, outcome)
+		return errors.Join(rt.failGraph(graphID, reason), fmt.Errorf("graph: %s", reason))
+	}
+	if err := rt.writeTerminalContinuationWithOutcomeLocked(graphID, nodeID, exec, NodeCompleted,
+		input, SettlementContinueGraphOutcome, outcome, ""); err != nil {
 		return err
 	}
-	return rt.completeGraph(graphID)
+	return rt.commitEndOutcome(graphID, nodeID, exec, outcome, "")
 }
 
 // suspendUnimplemented 兜底处理未获执行语义的节点类型：activation 事实
@@ -2079,14 +2104,24 @@ func (rt *Runtime) settleSubgraphParentLocked(parentID, nodeID, activationID, ch
 			childID, nodeID, ex.ChildGraphID)
 		return nil
 	}
-	event := EventCompleted
-	status := NodeCompleted
-	if childStatus != GraphCompleted {
-		event = EventFailed
-		status = NodeFailed
+	event, status := EventCompleted, NodeCompleted
+	switch childStatus {
+	case GraphCompleted:
+	case GraphBlocked:
+		event, status = EventBlocked, NodeBlocked
+	case GraphFailed, GraphCancelled:
+		event, status = EventFailed, NodeFailed
+	default:
+		return fmt.Errorf("graph: 子图 %s 终态 status=%q 非法", childID, childStatus)
+	}
+	childOutcome := childOutcomeFromStatus(childStatus)
+	if child, ok := rt.store.Get(childID); ok && child.Outcome != nil {
+		childOutcome = child.Outcome.Outcome
 	}
 	result := map[string]any{
 		"event":                event,
+		"child_status":         string(childStatus),
+		"child_outcome":        string(childOutcome),
 		"child_graph_id":       childID,
 		"child_result_ref":     rt.childResultRef(childID),
 		"child_result_summary": rt.childResultSummary(childID),
@@ -2100,6 +2135,21 @@ func (rt *Runtime) settleSubgraphParentLocked(parentID, nodeID, activationID, ch
 		return err
 	}
 	return rt.evalTransitionsLocked(parentID, nodeID, activationID, status, result)
+}
+
+func childOutcomeFromStatus(status GraphStatus) EndOutcome {
+	switch status {
+	case GraphCompleted:
+		return EndSuccess
+	case GraphFailed:
+		return EndFailed
+	case GraphBlocked:
+		return EndBlocked
+	case GraphCancelled:
+		return EndCancelled
+	default:
+		return ""
+	}
 }
 
 // childResultRef 返回子图 end activation 的稳定 ResultRef。升级中间态可能
@@ -2447,6 +2497,14 @@ func (rt *Runtime) publishTask(graphID, nodeID string, node Node, exec Execution
 
 func (rt *Runtime) taskSpecFor(graphID, nodeID string, node Node, exec Execution) TaskSpec {
 	spec := taskSpecFor(graphID, nodeID, node, exec)
+	if doc, ok := rt.store.Get(graphID); ok {
+		spec.DefinitionDigestVersion = doc.DefinitionDigestVersion
+		spec.RunID = doc.RunID
+		if doc.RunContract != nil {
+			run := *doc.RunContract
+			spec.RunContract = &run
+		}
+	}
 	// TaskSpec 是一次性发布副本：大 Result 在 GraphDocument/TransitionRecord
 	// 中仍只保留有界内联 + ResultRef，此处按引用临时展开给任务桥，由桥的总
 	// 上下文上限决定实际注入量，不把全文重复写回 Graph journal。
@@ -2473,19 +2531,23 @@ func (rt *Runtime) taskSpecFor(graphID, nodeID string, node Node, exec Execution
 }
 
 func taskSpecFor(graphID, nodeID string, node Node, exec Execution) TaskSpec {
+	effective := nodeForExecution(node, exec)
 	spec := TaskSpec{
-		GraphID:      graphID,
-		NodeID:       nodeID,
-		ActivationID: exec.ActivationID,
-		NodeKind:     node.Kind,
-		Route:        resolveRoute(node),
+		GraphID:             graphID,
+		NodeID:              nodeID,
+		ActivationID:        exec.ActivationID,
+		NodeKind:            effective.Kind,
+		Route:               resolveRoute(effective),
+		ProgressContractRef: effective.ProgressContractRef,
+		ContextPolicyRef:    effective.ContextPolicyRef,
+		TypedOutputContract: effective.OutputContract,
 	}
-	if node.Task != nil {
-		spec.Title = node.Task.Title
-		spec.Description = node.Task.Description
-		spec.RequiredEvidence = append([]EvidenceRequirement(nil), node.Task.RequiredEvidence...)
+	if effective.Task != nil {
+		spec.Title = effective.Task.Title
+		spec.Description = effective.Task.Description
+		spec.RequiredEvidence = append([]EvidenceRequirement(nil), effective.Task.RequiredEvidence...)
 	}
-	if c := node.Capability; c != nil {
+	if c := effective.Capability; c != nil {
 		spec.Tools = c.Tools
 		spec.Model = c.Model
 		spec.Isolation = c.Isolation
@@ -3017,15 +3079,19 @@ func (rt *Runtime) freezePatchedActivationsLocked(graphID string, patch Definiti
 
 func definitionFromNode(node Node) *NodeDefinition {
 	return &NodeDefinition{
-		Kind:       node.Kind,
-		Task:       node.Task,
-		Capability: node.Capability,
-		Next:       node.Next,
-		Wait:       node.Wait,
-		Tool:       node.Tool,
-		Subgraph:   node.Subgraph,
-		Metadata:   node.Metadata,
-		Extensions: node.Extensions,
+		Kind:                node.Kind,
+		Task:                node.Task,
+		Capability:          node.Capability,
+		Next:                node.Next,
+		Wait:                node.Wait,
+		Tool:                node.Tool,
+		Subgraph:            node.Subgraph,
+		EndOutcome:          node.EndOutcome,
+		OutputContract:      node.OutputContract,
+		ProgressContractRef: node.ProgressContractRef,
+		ContextPolicyRef:    node.ContextPolicyRef,
+		Metadata:            node.Metadata,
+		Extensions:          node.Extensions,
 	}
 }
 
@@ -3043,6 +3109,10 @@ func nodeForExecution(node Node, exec Execution) Node {
 	node.Wait = def.Wait
 	node.Tool = def.Tool
 	node.Subgraph = def.Subgraph
+	node.EndOutcome = def.EndOutcome
+	node.OutputContract = def.OutputContract
+	node.ProgressContractRef = def.ProgressContractRef
+	node.ContextPolicyRef = def.ContextPolicyRef
 	node.Metadata = def.Metadata
 	node.Extensions = def.Extensions
 	return node
@@ -3111,14 +3181,75 @@ func (rt *Runtime) failGraph(graphID, reason string) error {
 	if err != nil {
 		return err
 	}
-	if err := rt.store.SetGraphStatus(graphID, GraphFailed, doc.StateVersion); err != nil {
+	record := GraphOutcomeRecord{
+		Outcome: EndFailed, Source: "runtime_failure", Reason: reason,
+		DefinitionRevision: doc.Revision, CommittedAt: time.Now().UTC(),
+	}
+	if err := rt.store.CommitGraphOutcome(graphID, record, doc.StateVersion); err != nil {
 		return err
 	}
 	rt.cancelGraphWaitTimersLocked(graphID)
 	cleanupErr := errors.Join(descendantCleanupErr, rt.terminateGraphTasksLocked(graphID))
-	trace.Emit(trace.Event{Kind: trace.KindGraphEnded, GraphID: graphID, Reason: reason})
+	trace.Emit(trace.Event{Kind: trace.KindGraphEnded, GraphID: graphID, GraphOutcome: string(EndFailed), Reason: reason})
 	delete(rt.results, graphID)
 	return errors.Join(cleanupErr, rt.onChildGraphEnded(graphID, GraphFailed))
+}
+
+// commitEndOutcome 将 end activation 的业务 outcome、GraphStatus 和 graph_ended
+// 投影收敛在同一条 durable outcome 事实之后。Caller 必须持 rt.mu。
+func (rt *Runtime) commitEndOutcome(graphID, nodeID string, exec Execution, outcome EndOutcome, reason string) error {
+	if !outcome.IsValid() {
+		return fmt.Errorf("graph: 非法 EndOutcome %q", outcome)
+	}
+	doc, err := rt.graph(graphID)
+	if err != nil {
+		return err
+	}
+	if doc.Status.IsTerminal() {
+		if doc.Outcome != nil && doc.Outcome.Outcome == outcome {
+			return nil
+		}
+		return fmt.Errorf("graph: 图 %s 已以 status=%s 终结，无法提交 outcome=%s", graphID, doc.Status, outcome)
+	}
+	if reason == "" && outcome != EndSuccess {
+		reason = "Graph end outcome=" + string(outcome)
+	}
+	descendantCleanupErr, err := rt.cancelDescendantGraphsLocked(graphID,
+		fmt.Sprintf("ancestor Graph %s outcome=%s", graphID, outcome))
+	if err != nil {
+		return errors.Join(descendantCleanupErr, err)
+	}
+	if err := rt.cancelUnfinishedNodesLocked(graphID, "Graph outcome: "+string(outcome)); err != nil {
+		return errors.Join(descendantCleanupErr, err)
+	}
+	doc, err = rt.graph(graphID)
+	if err != nil {
+		return err
+	}
+	node, ok := doc.Nodes[nodeID]
+	if !ok || node.Execution == nil || node.Execution.ActivationID != exec.ActivationID {
+		return fmt.Errorf("graph: end 节点 %s/%s 缺少匹配的 durable execution", graphID, nodeID)
+	}
+	// writeTerminalContinuationWithOutcomeLocked 按值接收 exec；首次收官时
+	// caller 手里的副本尚未携带刚落盘的 ResultRef/Settlement。outcome 必须
+	// 从 Store 当前 activation 快照取证，不能把空引用写进 durable record。
+	exec = *node.Execution
+	record := GraphOutcomeRecord{
+		Outcome: outcome, Source: "end", EndNodeID: nodeID,
+		EndActivationID: exec.ActivationID, ResultRef: exec.ResultRef,
+		Reason: reason, DefinitionRevision: exec.DefinitionRevision,
+		CommittedAt: time.Now().UTC(),
+	}
+	if err := rt.store.CommitGraphOutcome(graphID, record, doc.StateVersion); err != nil {
+		return err
+	}
+	rt.cancelGraphWaitTimersLocked(graphID)
+	cleanupErr := errors.Join(descendantCleanupErr, rt.terminateGraphTasksLocked(graphID))
+	trace.Emit(trace.Event{
+		Kind: trace.KindGraphEnded, GraphID: graphID, GraphOutcome: string(outcome), Reason: reason,
+	})
+	delete(rt.results, graphID)
+	return errors.Join(cleanupErr, rt.onChildGraphEnded(graphID, record.Status()))
 }
 
 // completeGraph 把图置 completed 并发 graph_ended 事件。
@@ -3143,12 +3274,18 @@ func (rt *Runtime) completeGraph(graphID string) error {
 	if err != nil {
 		return err
 	}
-	if err := rt.store.SetGraphStatus(graphID, GraphCompleted, doc.StateVersion); err != nil {
+	// 只服务旧 settlement continuation 的恢复兼容；新旧 GraphDocument 的
+	// end 激活均走 commitEndOutcome（空 end_outcome 按 success）。
+	record := GraphOutcomeRecord{
+		Outcome: EndSuccess, Source: "legacy_end",
+		DefinitionRevision: doc.Revision, CommittedAt: time.Now().UTC(),
+	}
+	if err := rt.store.CommitGraphOutcome(graphID, record, doc.StateVersion); err != nil {
 		return err
 	}
 	rt.cancelGraphWaitTimersLocked(graphID)
 	cleanupErr := errors.Join(descendantCleanupErr, rt.terminateGraphTasksLocked(graphID))
-	trace.Emit(trace.Event{Kind: trace.KindGraphEnded, GraphID: graphID})
+	trace.Emit(trace.Event{Kind: trace.KindGraphEnded, GraphID: graphID, GraphOutcome: string(EndSuccess)})
 	delete(rt.results, graphID)
 	return errors.Join(cleanupErr, rt.onChildGraphEnded(graphID, GraphCompleted))
 }
@@ -3258,12 +3395,16 @@ func (rt *Runtime) cancelGraphTreeLocked(graphID, reason string, notifyParent bo
 		cleanupErrs = append(cleanupErrs, rt.terminateGraphTasksLocked(graphID))
 		return false, errors.Join(cleanupErrs...), nil
 	}
-	if err := rt.store.SetGraphStatus(graphID, GraphCancelled, doc.StateVersion); err != nil {
+	record := GraphOutcomeRecord{
+		Outcome: EndCancelled, Source: "control_plane", Reason: reason,
+		DefinitionRevision: doc.Revision, CommittedAt: time.Now().UTC(),
+	}
+	if err := rt.store.CommitGraphOutcome(graphID, record, doc.StateVersion); err != nil {
 		return false, errors.Join(cleanupErrs...), err
 	}
 	rt.cancelGraphWaitTimersLocked(graphID)
 	cleanupErrs = append(cleanupErrs, rt.terminateGraphTasksLocked(graphID))
-	trace.Emit(trace.Event{Kind: trace.KindGraphEnded, GraphID: graphID, Reason: reason})
+	trace.Emit(trace.Event{Kind: trace.KindGraphEnded, GraphID: graphID, GraphOutcome: string(EndCancelled), Reason: reason})
 	delete(rt.results, graphID)
 	var parentErr error
 	if notifyParent {

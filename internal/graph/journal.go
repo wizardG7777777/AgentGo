@@ -25,12 +25,14 @@ var (
 
 // journal 条目类型。
 const (
-	journalKindSubmit      = "submit"
-	journalKindPatch       = "patch"
-	journalKindNodeStatus  = "node_status"
-	journalKindExecutor    = "executor"
-	journalKindExecution   = "execution"
-	journalKindGraphStatus = "graph_status"
+	journalKindSubmit            = "submit"
+	journalKindPatch             = "patch"
+	journalKindNodeStatus        = "node_status"
+	journalKindExecutor          = "executor"
+	journalKindExecution         = "execution"
+	journalKindGraphStatus       = "graph_status"
+	journalKindGraphOutcome      = "graph_outcome"
+	journalKindDefinitionAdopted = "definition_adopted"
 	// journalKindExecutionStatus 是 Graph Runtime 的原子「execution + 节点状态」
 	// 变更（SetExecutionAndStatus）：activation 创建、任务发布成功、节点终态
 	// 与挂起都必须是单条 durable 记录，拆成两条会留下崩溃窗口。
@@ -88,6 +90,14 @@ type executionPayload struct {
 
 type graphStatusPayload struct {
 	To GraphStatus `json:"to"`
+}
+
+type graphOutcomePayload struct {
+	Outcome GraphOutcomeRecord `json:"outcome"`
+}
+
+type definitionAdoptPayload struct {
+	Definition *GraphDocument `json:"definition"`
 }
 
 // executionStatusPayload 是 execution_status 记录的 payload：execution 与

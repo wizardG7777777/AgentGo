@@ -17,7 +17,11 @@ package graph
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
+
+	"agentgo/internal/runcontract"
 )
 
 // SchemaV1 是首版 GraphDocument 的 schema 标识，必须逐字匹配。
@@ -37,12 +41,22 @@ const SchemaV2 = "agentgo.graph/v2"
 //   - 调度与认领系统：写节点的 Executor；
 //   - Agent Loop / Harness：写节点的 Execution（结果与证据引用）。
 type GraphDocument struct {
-	Schema       string      `json:"schema"`        // 必须恰为 SchemaV1 或 SchemaV2
-	GraphID      string      `json:"graph_id"`      // 图 ID，非空，字符集见校验链
-	Revision     int64       `json:"revision"`      // 定义版本：任务定义/节点/连接/执行要求变化时 +1
-	StateVersion int64       `json:"state_version"` // 状态版本：认领/进度/结果/审批/边选择变化时 +1
-	Root         string      `json:"root"`          // 唯一的根节点 ID，必须指向真实节点
-	Status       GraphStatus `json:"status"`        // 图状态（Graph Runtime 写）
+	Schema      string                   `json:"schema"`   // 必须恰为 SchemaV1 或 SchemaV2
+	GraphID     string                   `json:"graph_id"` // 图 ID，非空，字符集见校验链
+	RunID       runcontract.RunID        `json:"run_id,omitempty"`
+	RunContract *runcontract.RunContract `json:"run_contract,omitempty"`
+	// Definition* 与 ContractDigest 把已启动 Execution 绑定到 AuthoringStore 中
+	// 唯一 immutable Definition。legacy 图为空；新 start/recovery 不得根据当前
+	// Nodes 反推或猜测来源 Definition。
+	DefinitionDigestVersion string              `json:"definition_digest_version,omitempty"`
+	DefinitionDigest        string              `json:"definition_digest,omitempty"`
+	ContractDigest          string              `json:"contract_digest,omitempty"`
+	SourceProposalID        string              `json:"source_proposal_id,omitempty"`
+	Revision                int64               `json:"revision"`      // 定义版本：任务定义/节点/连接/执行要求变化时 +1
+	StateVersion            int64               `json:"state_version"` // 状态版本：认领/进度/结果/审批/边选择变化时 +1
+	Root                    string              `json:"root"`          // 唯一的根节点 ID，必须指向真实节点
+	Status                  GraphStatus         `json:"status"`        // 图状态（Graph Runtime 写）
+	Outcome                 *GraphOutcomeRecord `json:"outcome,omitempty"`
 	// SessionID 是图的 session 归属（Session 生命周期隔离）：Graph Runtime
 	// 提交时经可注入的 sessionIDProvider 盖章；不属于执行语义，不进入
 	// digest（digest.go 的 canonicalDoc 不收录本字段）。历史图可为空串；
@@ -51,17 +65,49 @@ type GraphDocument struct {
 	Nodes     map[string]Node `json:"nodes"` // 节点表，键为节点 ID
 }
 
+// RequiresTypedTaskOutcome 区分 legacy Execution 与 authoring Definition。
+// 四个 binding 全空才是 legacy；部分绑定或未知版本属于损坏状态，调用方
+// 必须 fail-closed，不能退回 Task 文本终态。
+func (d *GraphDocument) RequiresTypedTaskOutcome() (bool, error) {
+	if d == nil {
+		return false, fmt.Errorf("graph document 为空")
+	}
+	values := []string{d.DefinitionDigestVersion, d.DefinitionDigest, d.ContractDigest, d.SourceProposalID}
+	nonEmpty := 0
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			nonEmpty++
+		}
+	}
+	if nonEmpty == 0 {
+		return false, nil
+	}
+	if nonEmpty != len(values) {
+		return false, fmt.Errorf("graph %s 的 authoring binding 不完整", d.GraphID)
+	}
+	if d.DefinitionDigestVersion != GraphDefinitionDigestVersionV1 {
+		return false, fmt.Errorf("graph %s 的 authoring digest version=%q 未知", d.GraphID, d.DefinitionDigestVersion)
+	}
+	return true, nil
+}
+
 // Node 是图中的一个节点。同一节点对象同时承载定义与运行状态，
 // 各字段的写入者固定（见 GraphDocument 注释）。
 type Node struct {
 	// ---- 定义字段（Scheduler 写，进入 digest） ----
-	Kind       NodeKind      `json:"kind"`                 // 节点类型，首批 10 种枚举
-	Task       *NodeTask     `json:"task,omitempty"`       // 任务目标与输出契约
-	Capability *Capability   `json:"capability,omitempty"` // 能力需求（本轮只做结构校验）
-	Next       []Transition  `json:"next"`                 // 后续转移；end 必须为空，非 end 必须非空
-	Wait       *WaitSpec     `json:"wait,omitempty"`       // wait_event 专属：事件等待声明
-	Tool       *ToolSpec     `json:"tool,omitempty"`       // tool 专属：工具调用声明
-	Subgraph   *SubgraphSpec `json:"subgraph,omitempty"`   // subgraph 专属：内联子图
+	Kind           NodeKind            `json:"kind"`                  // 节点类型，首批 10 种枚举
+	Task           *NodeTask           `json:"task,omitempty"`        // 任务目标与输出契约
+	Capability     *Capability         `json:"capability,omitempty"`  // 能力需求（本轮只做结构校验）
+	Next           []Transition        `json:"next"`                  // 后续转移；end 必须为空，非 end 必须非空
+	Wait           *WaitSpec           `json:"wait,omitempty"`        // wait_event 专属：事件等待声明
+	Tool           *ToolSpec           `json:"tool,omitempty"`        // tool 专属：工具调用声明
+	Subgraph       *SubgraphSpec       `json:"subgraph,omitempty"`    // subgraph 专属：内联子图
+	EndOutcome     EndOutcome          `json:"end_outcome,omitempty"` // end 专属；legacy 空值按 success
+	OutputContract *NodeOutputContract `json:"output_contract,omitempty"`
+	// Policy refs 来自 immutable GraphDefinition，并随 Activation 冻结。Runtime
+	// 不解析其正文，只把 ref 传给 TaskBoard 由共享 PolicyCatalog 解引用。
+	ProgressContractRef string `json:"progress_contract_ref,omitempty"`
+	ContextPolicyRef    string `json:"context_policy_ref,omitempty"`
 
 	// ---- 运行状态字段（非 Scheduler 写，不进入 digest） ----
 	Status    NodeStatus `json:"status"`    // 节点状态（Graph Runtime 写）
@@ -82,15 +128,19 @@ type Node struct {
 // 影响任务路由，恢复补发时必须与首次激活保持一致；extensions 则保持对外
 // activation 审计的完整性。
 type NodeDefinition struct {
-	Kind       NodeKind                   `json:"kind"`
-	Task       *NodeTask                  `json:"task,omitempty"`
-	Capability *Capability                `json:"capability,omitempty"`
-	Next       []Transition               `json:"next"`
-	Wait       *WaitSpec                  `json:"wait,omitempty"`
-	Tool       *ToolSpec                  `json:"tool,omitempty"`
-	Subgraph   *SubgraphSpec              `json:"subgraph,omitempty"`
-	Metadata   map[string]string          `json:"metadata,omitempty"`
-	Extensions map[string]json.RawMessage `json:"extensions,omitempty"`
+	Kind                NodeKind                   `json:"kind"`
+	Task                *NodeTask                  `json:"task,omitempty"`
+	Capability          *Capability                `json:"capability,omitempty"`
+	Next                []Transition               `json:"next"`
+	Wait                *WaitSpec                  `json:"wait,omitempty"`
+	Tool                *ToolSpec                  `json:"tool,omitempty"`
+	Subgraph            *SubgraphSpec              `json:"subgraph,omitempty"`
+	EndOutcome          EndOutcome                 `json:"end_outcome,omitempty"`
+	OutputContract      *NodeOutputContract        `json:"output_contract,omitempty"`
+	ProgressContractRef string                     `json:"progress_contract_ref,omitempty"`
+	ContextPolicyRef    string                     `json:"context_policy_ref,omitempty"`
+	Metadata            map[string]string          `json:"metadata,omitempty"`
+	Extensions          map[string]json.RawMessage `json:"extensions,omitempty"`
 }
 
 // NodeTask 描述节点的任务目标与输出契约。
@@ -326,6 +376,9 @@ const (
 	SettlementContinueTransitions SettlementContinuation = "transitions"
 	// SettlementContinueGraphComplete 用于 end 节点：补写 Graph completed。
 	SettlementContinueGraphComplete SettlementContinuation = "graph_complete"
+	// SettlementContinueGraphOutcome 用于 typed end：按 Settlement.Outcome 提交
+	// GraphOutcomeRecord + GraphStatus。
+	SettlementContinueGraphOutcome SettlementContinuation = "graph_outcome"
 	// SettlementContinueGraphFail 用于控制面失败：补写 Graph failed。
 	SettlementContinueGraphFail SettlementContinuation = "graph_fail"
 	// SettlementContinueNone 用于 Graph 整体终态时被取消的其余
@@ -345,6 +398,7 @@ type TerminalSettlement struct {
 	ResultRef    string                 `json:"result_ref,omitempty"`
 	Result       json.RawMessage        `json:"result,omitempty"`
 	Continuation SettlementContinuation `json:"continuation"`
+	Outcome      EndOutcome             `json:"outcome,omitempty"`
 	Reason       string                 `json:"reason,omitempty"`
 }
 
@@ -444,6 +498,52 @@ func (k NodeKind) IsValid() bool {
 	return false
 }
 
+// EndOutcome 是 end 节点声明的业务结果；禁止从节点 ID/title 推断。
+type EndOutcome string
+
+const (
+	EndSuccess   EndOutcome = "success"
+	EndFailed    EndOutcome = "failed"
+	EndBlocked   EndOutcome = "blocked"
+	EndCancelled EndOutcome = "cancelled"
+)
+
+func (o EndOutcome) IsValid() bool {
+	switch o {
+	case EndSuccess, EndFailed, EndBlocked, EndCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// GraphOutcomeRecord 将 Graph 生命周期终态与业务 outcome durable 绑定。
+type GraphOutcomeRecord struct {
+	Outcome            EndOutcome `json:"outcome"`
+	Source             string     `json:"source"` // end | runtime_failure | control_plane | legacy_end
+	EndNodeID          string     `json:"end_node_id,omitempty"`
+	EndActivationID    string     `json:"end_activation_id,omitempty"`
+	ResultRef          string     `json:"result_ref,omitempty"`
+	Reason             string     `json:"reason,omitempty"`
+	DefinitionRevision int64      `json:"definition_revision"`
+	CommittedAt        time.Time  `json:"committed_at"`
+}
+
+func (o GraphOutcomeRecord) Status() GraphStatus {
+	switch o.Outcome {
+	case EndSuccess:
+		return GraphCompleted
+	case EndFailed:
+		return GraphFailed
+	case EndBlocked:
+		return GraphBlocked
+	case EndCancelled:
+		return GraphCancelled
+	default:
+		return ""
+	}
+}
+
 // ============================================================
 // 图状态枚举与状态机
 // ============================================================
@@ -457,13 +557,14 @@ const (
 	GraphPaused    GraphStatus = "paused"
 	GraphCompleted GraphStatus = "completed"
 	GraphFailed    GraphStatus = "failed"
+	GraphBlocked   GraphStatus = "blocked"
 	GraphCancelled GraphStatus = "cancelled"
 )
 
 // IsValid 报告图状态是否是合法枚举值。
 func (s GraphStatus) IsValid() bool {
 	switch s {
-	case GraphPending, GraphRunning, GraphPaused, GraphCompleted, GraphFailed, GraphCancelled:
+	case GraphPending, GraphRunning, GraphPaused, GraphCompleted, GraphFailed, GraphBlocked, GraphCancelled:
 		return true
 	}
 	return false
@@ -472,7 +573,7 @@ func (s GraphStatus) IsValid() bool {
 // IsTerminal 报告图状态是否为终态（终态无任何出边）。
 func (s GraphStatus) IsTerminal() bool {
 	switch s {
-	case GraphCompleted, GraphFailed, GraphCancelled:
+	case GraphCompleted, GraphFailed, GraphBlocked, GraphCancelled:
 		return true
 	}
 	return false
@@ -481,8 +582,8 @@ func (s GraphStatus) IsTerminal() bool {
 // graphStatusTransitions 是图状态机的合法迁移表；缺项的 from 即终态。
 var graphStatusTransitions = map[GraphStatus][]GraphStatus{
 	GraphPending: {GraphRunning, GraphCancelled},
-	GraphRunning: {GraphPaused, GraphCompleted, GraphFailed, GraphCancelled},
-	GraphPaused:  {GraphRunning, GraphFailed, GraphCancelled},
+	GraphRunning: {GraphPaused, GraphCompleted, GraphFailed, GraphBlocked, GraphCancelled},
+	GraphPaused:  {GraphRunning, GraphFailed, GraphBlocked, GraphCancelled},
 }
 
 // IsValidGraphStatusTransition 报告图状态迁移 from → to 是否合法。

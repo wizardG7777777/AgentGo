@@ -149,3 +149,102 @@ func TestDigestShape(t *testing.T) {
 		t.Errorf("nil 文档的 digest 应为空串，实际为 %q", got)
 	}
 }
+
+// TestDefinitionDigestCoversRootAndRoute 锁定新 GraphDefinition 摘要相对 legacy
+// execution 摘要补齐的两个现存语义字段：root 与 metadata.route。
+func TestDefinitionDigestCoversRootAndRoute(t *testing.T) {
+	base := mustParse(t, exampleDocJSON)
+	baseDigest := ComputeDefinitionDigest(base)
+
+	rootChanged := mustParse(t, exampleDocJSON)
+	rootChanged.Root = "implement"
+	if got := ComputeDefinitionDigest(rootChanged); got == baseDigest {
+		t.Fatal("GraphDefinition root 变化必须改变 definition digest")
+	}
+
+	routeChanged := mustParse(t, exampleDocJSON)
+	root := routeChanged.Nodes["root"]
+	root.Metadata = map[string]string{"route": "team:controller"}
+	routeChanged.Nodes["root"] = root
+	if got := ComputeDefinitionDigest(routeChanged); got == baseDigest {
+		t.Fatal("metadata.route 变化必须改变 definition digest")
+	}
+}
+
+// TestDefinitionDigestIgnoresRuntimeAndDisplayState 确认新摘要只覆盖 Definition：
+// 运行状态、展示标签和未知 extension 均不改变 definition identity。
+func TestDefinitionDigestIgnoresRuntimeAndDisplayState(t *testing.T) {
+	doc1 := mustParse(t, exampleDocJSON)
+	doc2 := mustParse(t, exampleDocJSON)
+	doc2.Status = GraphCompleted
+	doc2.StateVersion = 99
+
+	root := doc2.Nodes["root"]
+	root.Status = NodeFailed
+	root.Executor = &Executor{Type: ExecutorTypeAgent, AgentID: "agent-x"}
+	root.Execution = &Execution{Phase: "done", ActivationID: "root@9"}
+	root.Metadata = map[string]string{"label": "仅展示"}
+	root.Extensions = map[string]json.RawMessage{"future": json.RawMessage(`{"x":1}`)}
+	doc2.Nodes["root"] = root
+
+	if d1, d2 := ComputeDefinitionDigest(doc1), ComputeDefinitionDigest(doc2); d1 != d2 {
+		t.Fatalf("运行/展示状态不得改变 definition digest:\n  d1=%s\n  d2=%s", d1, d2)
+	}
+}
+
+// TestDefinitionDigestNormalizesRouteWhitespace route 的 Runtime 语义会先
+// TrimSpace；摘要采用相同边界归一，避免仅首尾空白制造不同 Definition 身份。
+func TestDefinitionDigestNormalizesRouteWhitespace(t *testing.T) {
+	doc1 := mustParse(t, exampleDocJSON)
+	doc2 := mustParse(t, exampleDocJSON)
+
+	n1 := doc1.Nodes["implement"]
+	n1.Metadata = map[string]string{"route": "team:impl"}
+	doc1.Nodes["implement"] = n1
+	n2 := doc2.Nodes["implement"]
+	n2.Metadata = map[string]string{"route": "  team:impl\t"}
+	doc2.Nodes["implement"] = n2
+
+	if d1, d2 := ComputeDefinitionDigest(doc1), ComputeDefinitionDigest(doc2); d1 != d2 {
+		t.Fatalf("route 首尾空白归一后应为同一 definition digest:\n  d1=%s\n  d2=%s", d1, d2)
+	}
+}
+
+// TestLegacyDigestRemainsDefinitionBlind 把 legacy 行为锁住，防止后续为
+// GraphDefinition 补字段时误改历史 journal/snapshot 摘要算法。
+func TestLegacyDigestRemainsDefinitionBlind(t *testing.T) {
+	base := mustParse(t, exampleDocJSON)
+	changed := mustParse(t, exampleDocJSON)
+	changed.Root = "implement"
+	root := changed.Nodes["root"]
+	root.Metadata = map[string]string{"route": "team:controller"}
+	changed.Nodes["root"] = root
+
+	if before, after := ComputeDigest(base), ComputeDigest(changed); before != after {
+		t.Fatalf("legacy ComputeDigest 不得因新增 Definition 字段覆盖而改变:\n  before=%s\n  after=%s", before, after)
+	}
+	if ComputeDefinitionDigest(base) == ComputeDefinitionDigest(changed) {
+		t.Fatal("新 definition digest 必须检测到 legacy 摘要刻意忽略的 root/route 变化")
+	}
+}
+
+// TestDefinitionDigestShapeAndDomain 验证新摘要形状、nil 行为及版本化 domain
+// 与 legacy 摘要隔离。
+func TestDefinitionDigestShapeAndDomain(t *testing.T) {
+	doc := mustParse(t, exampleDocJSON)
+	got := ComputeDefinitionDigest(doc)
+	if len(got) != 64 {
+		t.Fatalf("definition digest 应为 64 位 hex，实际长度 %d", len(got))
+	}
+	for _, r := range got {
+		if !strings.ContainsRune("0123456789abcdef", r) {
+			t.Fatalf("definition digest 含非 hex 字符 %q", r)
+		}
+	}
+	if got == ComputeDigest(doc) {
+		t.Fatal("版本化 definition digest 必须与 legacy execution digest 使用不同 domain")
+	}
+	if nilDigest := ComputeDefinitionDigest(nil); nilDigest != "" {
+		t.Fatalf("nil GraphDocument 的 definition digest 应为空，实际 %q", nilDigest)
+	}
+}

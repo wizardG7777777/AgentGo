@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 )
 
@@ -263,16 +264,20 @@ func sameEvidenceEntry(a, b EvidenceEntry) bool {
 // 存在经 DefinitionPatch 写运行字段的途径（V6 §6-9 的强制点：Scheduler
 // 不能整图覆盖伪造 completed 或占用者身份）。
 type NodeDefUpsert struct {
-	ID         string                     `json:"id"`
-	Kind       NodeKind                   `json:"kind"`
-	Task       *NodeTask                  `json:"task,omitempty"`
-	Capability *Capability                `json:"capability,omitempty"`
-	Next       []Transition               `json:"next"`
-	Wait       *WaitSpec                  `json:"wait,omitempty"`
-	Tool       *ToolSpec                  `json:"tool,omitempty"`
-	Subgraph   *SubgraphSpec              `json:"subgraph,omitempty"`
-	Metadata   map[string]string          `json:"metadata,omitempty"`
-	Extensions map[string]json.RawMessage `json:"extensions,omitempty"`
+	ID                  string                     `json:"id"`
+	Kind                NodeKind                   `json:"kind"`
+	Task                *NodeTask                  `json:"task,omitempty"`
+	Capability          *Capability                `json:"capability,omitempty"`
+	Next                []Transition               `json:"next"`
+	Wait                *WaitSpec                  `json:"wait,omitempty"`
+	Tool                *ToolSpec                  `json:"tool,omitempty"`
+	Subgraph            *SubgraphSpec              `json:"subgraph,omitempty"`
+	EndOutcome          EndOutcome                 `json:"end_outcome,omitempty"`
+	OutputContract      *NodeOutputContract        `json:"output_contract,omitempty"`
+	ProgressContractRef string                     `json:"progress_contract_ref,omitempty"`
+	ContextPolicyRef    string                     `json:"context_policy_ref,omitempty"`
+	Metadata            map[string]string          `json:"metadata,omitempty"`
+	Extensions          map[string]json.RawMessage `json:"extensions,omitempty"`
 }
 
 // DefinitionPatch 是一次定义面变更，按固定顺序应用：删除节点 → upsert
@@ -465,6 +470,30 @@ func (s *Store) lookupForMutation(graphID string) (*entry, error) {
 // submit 全量写入 journal 并 fsync 成功后才入内存索引——关键事实先
 // durable 再对外确认（V6 §6-12）。落盘失败时图不入索引，直接返回错误。
 func (s *Store) SubmitGraph(doc *GraphDocument) error {
+	if doc != nil && (doc.DefinitionDigestVersion != "" || doc.DefinitionDigest != "" ||
+		doc.ContractDigest != "" || doc.SourceProposalID != "") {
+		return fmt.Errorf("graph: legacy SubmitGraph 不得伪造 Authoring Definition 绑定；请走 Draft/Commit/Start adapter")
+	}
+	return s.submitGraph(doc, true)
+}
+
+// createExecution 从 AuthoringStore 已提交的 immutable Definition 创建一张
+// 尚未激活的 GraphExecution。与 legacy SubmitGraph 的区别：保留 Definition
+// revision，并强制 durable definition/contract 绑定；本方法只写 submit 事实，
+// 不把图置 running、不创建 root Activation。
+func (s *Store) createExecution(doc *GraphDocument) error {
+	if doc == nil {
+		return fmt.Errorf("graph: 创建 Execution 的文档为 nil")
+	}
+	if doc.Revision <= 0 || strings.TrimSpace(doc.DefinitionDigestVersion) == "" ||
+		strings.TrimSpace(doc.DefinitionDigest) == "" || strings.TrimSpace(doc.ContractDigest) == "" ||
+		strings.TrimSpace(doc.SourceProposalID) == "" {
+		return fmt.Errorf("graph: Authoring Execution 必须绑定正 revision、definition digest/version、contract digest 与 source proposal")
+	}
+	return s.submitGraph(doc, false)
+}
+
+func (s *Store) submitGraph(doc *GraphDocument, normalizeRevision bool) error {
 	if doc == nil {
 		return fmt.Errorf("graph: 提交的文档为 nil")
 	}
@@ -476,8 +505,11 @@ func (s *Store) SubmitGraph(doc *GraphDocument) error {
 	if err != nil {
 		return err
 	}
-	// 初始版本归一：revision 从 1 开始，state_version 从 0 开始。
-	parsed.Revision = 1
+	// legacy 提交从 revision=1 开始；Authoring Execution 保留 immutable
+	// Definition revision。两条路径的运行 state_version 都从 0 开始。
+	if normalizeRevision {
+		parsed.Revision = 1
+	}
 	parsed.StateVersion = 0
 
 	dir, err := s.graphDir(parsed.GraphID)
@@ -561,6 +593,70 @@ func (s *Store) PatchGraph(graphID string, baseRevision int64, patch DefinitionP
 		return 0, err
 	}
 	return newRevision, nil
+}
+
+// adoptDefinition 把已由 Authoring Compiler/Store commit 的新 immutable
+// Definition revision 原子换入运行图；旧 Activation 继续读取 Execution.Definition，
+// 只有未来 Activation 读取更新后的 Nodes。运行中的 root 不允许改变。
+func (s *Store) adoptDefinition(graphID string, baseRevision int64, baseDigest string, definition *GraphDocument) error {
+	if definition == nil {
+		return fmt.Errorf("graph: adopt Definition 不能为空")
+	}
+	return s.mutate(graphID, journalKindDefinitionAdopted,
+		definitionAdoptPayload{Definition: definition}, true, func(c *GraphDocument) error {
+			if c.Revision != baseRevision {
+				return &RevisionConflictError{GraphID: graphID, Base: baseRevision, Current: c.Revision}
+			}
+			if c.DefinitionDigest != baseDigest {
+				return fmt.Errorf("graph: 当前 Execution definition digest=%s 与 Change base=%s 不一致", c.DefinitionDigest, baseDigest)
+			}
+			if c.Status.IsTerminal() {
+				return fmt.Errorf("graph: 终态 Execution %s 不接受新 Definition", graphID)
+			}
+			if definition.GraphID != graphID || definition.Revision != baseRevision+1 || definition.Root != c.Root {
+				return fmt.Errorf("graph: 新 Definition identity/revision/root 与运行中 Execution 不一致")
+			}
+			if definition.SessionID != c.SessionID || definition.RunID != c.RunID || !reflect.DeepEqual(definition.RunContract, c.RunContract) {
+				return fmt.Errorf("graph: 新 Definition 不得改变 Session/Run identity")
+			}
+			for id, old := range c.Nodes {
+				if _, kept := definition.Nodes[id]; !kept && old.Execution != nil {
+					return fmt.Errorf("graph: 新 Definition 不能删除已有 activation 的节点 %q", id)
+				}
+			}
+			if err := applyDefinitionAdoption(c, definition); err != nil {
+				return err
+			}
+			if err := validateAuthoringSemantics(c); err != nil {
+				return err
+			}
+			return nil
+		})
+}
+
+func applyDefinitionAdoption(current, definition *GraphDocument) error {
+	if current == nil || definition == nil {
+		return fmt.Errorf("graph: Definition adoption 输入为空")
+	}
+	nodes := make(map[string]Node, len(definition.Nodes))
+	for id, next := range definition.Nodes {
+		if old, exists := current.Nodes[id]; exists {
+			next.Status, next.Executor, next.Execution = old.Status, old.Executor, old.Execution
+		} else {
+			next.Status, next.Executor, next.Execution = NodeInactive, nil, nil
+		}
+		nodes[id] = next
+	}
+	current.Schema = definition.Schema
+	current.Revision = definition.Revision
+	current.Root = definition.Root
+	current.Nodes = nodes
+	current.DefinitionDigestVersion = definition.DefinitionDigestVersion
+	current.DefinitionDigest = definition.DefinitionDigest
+	current.ContractDigest = definition.ContractDigest
+	current.SourceProposalID = definition.SourceProposalID
+	current.StateVersion++
+	return nil
 }
 
 // validatePatchRuntimeSafety 只拦截无法保留既有 activation 身份的操作：已有
@@ -668,6 +764,9 @@ func (s *Store) SetExecution(graphID, nodeID string, exec Execution, stateVersio
 // SetGraphStatus 是 Graph Runtime 写图状态的入口：图状态机校验 +
 // state_version CAS；仅 state_version+1。
 func (s *Store) SetGraphStatus(graphID string, to GraphStatus, stateVersion int64) error {
+	if to == GraphBlocked {
+		return fmt.Errorf("graph: blocked 必须通过 CommitGraphOutcome 原子提交，禁止只写 GraphStatus")
+	}
 	return s.mutate(graphID, journalKindGraphStatus, graphStatusPayload{To: to}, false,
 		func(c *GraphDocument) error {
 			if err := checkStateVersion(c, "", stateVersion); err != nil {
@@ -681,6 +780,41 @@ func (s *Store) SetGraphStatus(graphID string, to GraphStatus, stateVersion int6
 			c.StateVersion++
 			return nil
 		})
+}
+
+// CommitGraphOutcome 将业务 outcome 与派生 GraphStatus 放在同一条 journal 记录
+// 和同一次内存变更中。新 typed end 必须使用本入口；SetGraphStatus 只保留
+// legacy/runtime 兼容。
+func (s *Store) CommitGraphOutcome(graphID string, outcome GraphOutcomeRecord, stateVersion int64) error {
+	status := outcome.Status()
+	if status == "" || !outcome.Outcome.IsValid() {
+		return fmt.Errorf("graph: 非法 EndOutcome %q", outcome.Outcome)
+	}
+	if outcome.CommittedAt.IsZero() {
+		outcome.CommittedAt = time.Now().UTC()
+	}
+	return s.mutate(graphID, journalKindGraphOutcome, graphOutcomePayload{Outcome: outcome}, false, func(c *GraphDocument) error {
+		if c.StateVersion != stateVersion {
+			return &StateVersionConflictError{GraphID: graphID, Base: stateVersion, Current: c.StateVersion}
+		}
+		if c.Outcome != nil {
+			if c.Outcome.Outcome == outcome.Outcome && c.Outcome.EndActivationID == outcome.EndActivationID {
+				return nil
+			}
+			return fmt.Errorf("graph: 图 %s 已提交不同 outcome=%s", graphID, c.Outcome.Outcome)
+		}
+		if !IsValidGraphStatusTransition(c.Status, status) {
+			return fmt.Errorf("%w: graph %s %s -> %s", ErrInvalidTransition, graphID, c.Status, status)
+		}
+		copy := outcome
+		c.Outcome = &copy
+		c.Status = status
+		c.StateVersion++
+		if err := validateRuntimeState(c); err != nil {
+			return fmt.Errorf("graph: outcome 运行状态非法: %w", err)
+		}
+		return nil
+	})
 }
 
 // SetExecutionAndStatus 是 Graph Runtime 写「execution + 节点状态」的原子入口
@@ -1258,6 +1392,10 @@ func applyPatch(doc *GraphDocument, patch *DefinitionPatch) error {
 		n.Wait = up.Wait
 		n.Tool = up.Tool
 		n.Subgraph = up.Subgraph
+		n.EndOutcome = up.EndOutcome
+		n.OutputContract = up.OutputContract
+		n.ProgressContractRef = up.ProgressContractRef
+		n.ContextPolicyRef = up.ContextPolicyRef
 		n.Metadata = up.Metadata
 		n.Extensions = up.Extensions
 		doc.Nodes[up.ID] = n

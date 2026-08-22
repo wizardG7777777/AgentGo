@@ -5,7 +5,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"sort"
+	"strings"
 )
+
+// DefinitionDigestVersionV1 是 GraphDefinition 摘要的算法版本。调用方在
+// 持久化 definition_digest 时必须同时持久化本版本，不能只保存裸 hash 后在
+// 恢复期猜算法。它与 legacy ComputeDigest 使用不同的 domain，后者仍服务于
+// 已落盘 Graph journal/snapshot，二者不得混用。
+const DefinitionDigestVersionV1 = "agentgo.graph-definition-digest/v1"
 
 // ComputeDigest 计算图的执行语义摘要（sha256，hex 编码）。
 //
@@ -29,6 +36,39 @@ func ComputeDigest(doc *GraphDocument) string {
 	}
 	for id, node := range doc.Nodes {
 		canonical.Nodes[id] = canonicalizeNode(node)
+	}
+	return hashCanonical(canonical)
+}
+
+// ComputeDefinitionDigest 计算不可变 GraphDefinition 的版本化语义摘要。
+//
+// 与 legacy ComputeDigest 的边界：
+//   - ComputeDigest 是既有 Graph execution journal/snapshot 的兼容摘要，不能
+//     改变字段集合或 domain；
+//   - ComputeDefinitionDigest 用于 Draft commit/start 的 expected_digest，必须
+//     覆盖一切会改变未来执行的定义事实。
+//
+// 当前类型已存在的执行语义全部纳入：schema、graph_id、revision、root，以及
+// 节点 kind/task/capability/next/wait/tool/subgraph 和 metadata.route。节点
+// status/executor/execution、图 state_version/status、展示 metadata 与未知
+// extensions 不属于 Definition，故排除。后续 EndOutcome、GraphContract digest、
+// ProgressContractRef、ContextPolicyRef 落入领域类型时，必须在下方独立的
+// canonicalDefinitionDoc/canonicalDefinitionNode 中显式增加字段，并升级摘要
+// 版本；不得借修改 legacy canonicalDoc 偷渡。
+func ComputeDefinitionDigest(doc *GraphDocument) string {
+	if doc == nil {
+		return ""
+	}
+	canonical := canonicalDefinitionDoc{
+		Domain:   DefinitionDigestVersionV1,
+		Schema:   doc.Schema,
+		GraphID:  doc.GraphID,
+		Revision: doc.Revision,
+		Root:     doc.Root,
+		Nodes:    make(map[string]canonicalDefinitionNode, len(doc.Nodes)),
+	}
+	for id, node := range doc.Nodes {
+		canonical.Nodes[id] = canonicalizeDefinitionNode(node)
 	}
 	return hashCanonical(canonical)
 }
@@ -113,6 +153,21 @@ type canonicalDoc struct {
 	Nodes    map[string]canonicalNode `json:"nodes"`
 }
 
+// canonicalDefinitionDoc 与 canonicalDoc 刻意分离。前者是新事务化
+// GraphDefinition 的可演进摘要输入；后者的字段集合已经成为历史 journal 的
+// 兼容契约，不能为了补字段而原地扩张。
+type canonicalDefinitionDoc struct {
+	Domain   string                             `json:"domain"`
+	Schema   string                             `json:"schema"`
+	GraphID  string                             `json:"graph_id"`
+	Revision int64                              `json:"revision"`
+	Root     string                             `json:"root"`
+	Nodes    map[string]canonicalDefinitionNode `json:"nodes"`
+
+	// 后续 GraphContractDigest/PolicyRefs 应作为有类型字段加入这里并升级
+	// DefinitionDigestVersion；不要用 map[string]any 形成不可审计的摘要扩展口。
+}
+
 // canonicalNode 只保留定义字段；status/executor/execution/metadata/extensions 被丢弃。
 type canonicalNode struct {
 	Kind       NodeKind              `json:"kind"`
@@ -122,6 +177,21 @@ type canonicalNode struct {
 	Wait       *canonicalWait        `json:"wait,omitempty"`
 	Tool       *canonicalTool        `json:"tool,omitempty"`
 	Subgraph   *canonicalSubgraph    `json:"subgraph,omitempty"`
+}
+
+// canonicalDefinitionNode 覆盖当前 Node 的全部执行定义。Route 从
+// metadata.route 单独提升为有类型字段：metadata 其余键只用于展示/检索，不能
+// 因标签变化让 Definition 身份漂移。未来 EndOutcome 与 per-node policy refs
+// 进入 Node 领域类型后，应在这里显式增列并升级摘要版本。
+type canonicalDefinitionNode struct {
+	Kind       NodeKind                     `json:"kind"`
+	Task       *NodeTask                    `json:"task,omitempty"`
+	Capability *canonicalCapability         `json:"capability,omitempty"`
+	Next       []canonicalTransition        `json:"next"`
+	Wait       *canonicalWait               `json:"wait,omitempty"`
+	Tool       *canonicalTool               `json:"tool,omitempty"`
+	Subgraph   *canonicalDefinitionSubgraph `json:"subgraph,omitempty"`
+	Route      string                       `json:"route,omitempty"`
 }
 
 // canonicalWait 与 WaitSpec 同形（event 必填序列化，timeout_sec 空值归一）。
@@ -140,6 +210,13 @@ type canonicalTool struct {
 type canonicalSubgraph struct {
 	Root  string                   `json:"root"`
 	Nodes map[string]canonicalNode `json:"nodes"`
+}
+
+// canonicalDefinitionSubgraph 递归使用 definition 节点，确保内联子图中的
+// metadata.route 同样进入 Definition digest。
+type canonicalDefinitionSubgraph struct {
+	Root  string                             `json:"root"`
+	Nodes map[string]canonicalDefinitionNode `json:"nodes"`
 }
 
 // canonicalCapability 与 Capability 同形，omitempty 把空值与缺省归一。
@@ -223,6 +300,59 @@ func canonicalizeNode(node Node) canonicalNode {
 		}
 		cn.Subgraph = cs
 	}
+	return cn
+}
+
+// canonicalizeDefinitionNode 把节点归一到 GraphDefinition 摘要输入。实现与
+// legacy canonicalizeNode 独立，避免后续 Definition 演进意外改变历史摘要。
+func canonicalizeDefinitionNode(node Node) canonicalDefinitionNode {
+	cn := canonicalDefinitionNode{Kind: node.Kind}
+
+	if node.Task != nil && (node.Task.Title != "" || node.Task.Description != "" ||
+		len(node.Task.RequiredInputs) > 0 || len(node.Task.RequiredEvidence) > 0) {
+		task := *node.Task
+		task.RequiredInputs = append([]string(nil), node.Task.RequiredInputs...)
+		task.RequiredEvidence = append([]EvidenceRequirement(nil), node.Task.RequiredEvidence...)
+		cn.Task = &task
+	}
+
+	if c := node.Capability; c != nil &&
+		(len(c.Tools) > 0 || c.Model != "" || c.Isolation != "") {
+		cc := &canonicalCapability{Model: c.Model, Isolation: c.Isolation}
+		if len(c.Tools) > 0 {
+			cc.Tools = append([]string(nil), c.Tools...)
+		}
+		cn.Capability = cc
+	}
+
+	cn.Next = make([]canonicalTransition, 0, len(node.Next))
+	for _, tr := range node.Next {
+		ct := canonicalTransition{To: tr.To, Activation: tr.Activation, TargetInput: tr.TargetInput}
+		if tr.When != nil {
+			ct.When = &canonicalCondition{
+				Event: tr.When.Event, Path: tr.When.Path, Operator: tr.When.Operator,
+				Value: normalizeRaw(tr.When.Value),
+			}
+		}
+		cn.Next = append(cn.Next, ct)
+	}
+
+	if node.Wait != nil {
+		cn.Wait = &canonicalWait{Event: node.Wait.Event, TimeoutSec: node.Wait.TimeoutSec}
+	}
+	if node.Tool != nil {
+		cn.Tool = &canonicalTool{Name: node.Tool.Name, Args: node.Tool.Args}
+	}
+	if node.Subgraph != nil {
+		cs := &canonicalDefinitionSubgraph{
+			Root: node.Subgraph.Root, Nodes: make(map[string]canonicalDefinitionNode, len(node.Subgraph.Nodes)),
+		}
+		for id, sub := range node.Subgraph.Nodes {
+			cs.Nodes[id] = canonicalizeDefinitionNode(sub)
+		}
+		cn.Subgraph = cs
+	}
+	cn.Route = strings.TrimSpace(node.Metadata["route"])
 	return cn
 }
 

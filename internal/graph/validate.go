@@ -160,6 +160,9 @@ func validateInitialOwnership(doc *GraphDocument) error {
 	if doc.StateVersion != 0 {
 		return newErr("字段所有权", "state_version", "Scheduler 不得写运行版本：新图 state_version 必须为 0，实际为 %d", doc.StateVersion)
 	}
+	if doc.Outcome != nil {
+		return newErr("字段所有权", "outcome", "Scheduler 不得写 Graph 运行 outcome：新图必须为 null")
+	}
 	return validateInitialNodes(doc.Nodes, "nodes")
 }
 
@@ -243,6 +246,46 @@ func validateRuntimeState(doc *GraphDocument) error {
 	if !doc.Status.IsValid() {
 		return newErr("初始状态", "status", "非法图状态 %q", doc.Status)
 	}
+	if doc.Outcome != nil {
+		outcome := doc.Outcome
+		if !outcome.Outcome.IsValid() || outcome.Status() == "" {
+			return newErr("运行状态", "outcome.outcome", "Graph outcome %q 非法", outcome.Outcome)
+		}
+		if doc.Status != outcome.Status() {
+			return newErr("运行状态", "outcome", "Graph status=%q 与 outcome=%q 派生状态=%q 不一致", doc.Status, outcome.Outcome, outcome.Status())
+		}
+		if !doc.Status.IsTerminal() || outcome.CommittedAt.IsZero() || strings.TrimSpace(outcome.Source) == "" {
+			return newErr("运行状态", "outcome", "Graph outcome 必须属于终态并携带 source/committed_at")
+		}
+		switch outcome.Source {
+		case "end":
+			if strings.TrimSpace(outcome.EndNodeID) == "" || strings.TrimSpace(outcome.EndActivationID) == "" ||
+				strings.TrimSpace(outcome.ResultRef) == "" || outcome.DefinitionRevision <= 0 {
+				return newErr("运行状态", "outcome", "source=end 的 outcome 必须携带 end node/activation/result_ref/definition_revision")
+			}
+			node, ok := doc.Nodes[outcome.EndNodeID]
+			if !ok || node.Execution == nil || node.Execution.ActivationID != outcome.EndActivationID ||
+				node.Execution.ResultRef != outcome.ResultRef || node.Execution.DefinitionRevision != outcome.DefinitionRevision ||
+				nodeForExecution(node, *node.Execution).Kind != KindEnd {
+				return newErr("运行状态", "outcome", "source=end 的 outcome 谱系与 durable end activation 不一致")
+			}
+			settlement := node.Execution.Settlement
+			if settlement == nil || settlement.Continuation != SettlementContinueGraphOutcome || settlement.Outcome != outcome.Outcome {
+				return newErr("运行状态", "outcome", "source=end 的 outcome 与 end activation settlement 不一致")
+			}
+		case "runtime_failure", "control_plane":
+			if strings.TrimSpace(outcome.Reason) == "" {
+				return newErr("运行状态", "outcome.reason", "source=%s 的 outcome 必须携带原因", outcome.Source)
+			}
+		case "legacy_end":
+			// 升级旧 graph_complete settlement 时没有稳定 end activation 谱系，
+			// 只允许显式 legacy_end；后续新终态一律走 source=end。
+		default:
+			return newErr("运行状态", "outcome.source", "Graph outcome source=%q 非法", outcome.Source)
+		}
+	} else if doc.Status == GraphBlocked {
+		return newErr("运行状态", "outcome", "Graph status=blocked 必须携带 durable outcome")
+	}
 	for _, id := range sortedNodeIDs(doc) {
 		node := doc.Nodes[id]
 		if st := node.Status; !st.IsValid() {
@@ -262,7 +305,8 @@ func validateRuntimeState(doc *GraphDocument) error {
 			return newErr("运行状态", path+".status", "节点 %q 当前状态 %q 与结算状态 %q 不一致", id, node.Status, settlement.Status)
 		}
 		switch settlement.Continuation {
-		case SettlementContinueTransitions, SettlementContinueGraphComplete, SettlementContinueGraphFail, SettlementContinueNone:
+		case SettlementContinueTransitions, SettlementContinueGraphComplete,
+			SettlementContinueGraphOutcome, SettlementContinueGraphFail, SettlementContinueNone:
 		default:
 			return newErr("运行状态", path+".continuation", "节点 %q 的结算续跑动作 %q 非法", id, settlement.Continuation)
 		}
@@ -276,6 +320,13 @@ func validateRuntimeState(doc *GraphDocument) error {
 		}
 		if settlement.Continuation == SettlementContinueGraphFail && strings.TrimSpace(settlement.Reason) == "" {
 			return newErr("运行状态", path+".reason", "节点 %q 的 graph_fail 结算必须携带原因", id)
+		}
+		if settlement.Continuation == SettlementContinueGraphOutcome {
+			if !settlement.Outcome.IsValid() {
+				return newErr("运行状态", path+".outcome", "节点 %q 的 Graph outcome %q 非法", id, settlement.Outcome)
+			}
+		} else if settlement.Outcome != "" {
+			return newErr("运行状态", path+".outcome", "节点 %q 的 continuation=%q 不得携带 outcome", id, settlement.Continuation)
 		}
 	}
 	return nil
