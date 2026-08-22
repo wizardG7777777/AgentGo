@@ -24,8 +24,7 @@ func testOutputContract(t *testing.T) string {
 	return contract
 }
 
-// 契约块追加在任务描述尾部：「## 上游输入」段保持完整且契约块在其后出现；
-// 空契约（v1 图/无 path 条件节点）与无契约逐字节一致（零行为变化）。
+// 契约块追加在 objective/control 描述尾部；上游数据走 ContextInputs。
 func TestGraphTaskDescriptionAppendsOutputContract(t *testing.T) {
 	contract := testOutputContract(t)
 	spec := graph.TaskSpec{
@@ -40,24 +39,24 @@ func TestGraphTaskDescriptionAppendsOutputContract(t *testing.T) {
 	if !strings.HasPrefix(desc, "实现功能\n\n实现请求的功能") {
 		t.Errorf("描述应以原标题+描述开头: %q", desc)
 	}
-	upstream := strings.Index(desc, "## 上游输入")
 	block := strings.Index(desc, graph.OutputContractBegin)
-	if upstream < 0 {
-		t.Fatalf("「## 上游输入」段应保留: %q", desc)
-	}
-	if block < 0 || block < upstream {
-		t.Errorf("契约块应出现在「## 上游输入」段之后（upstream=%d block=%d）: %q", upstream, block, desc)
+	if block < 0 {
+		t.Errorf("契约块缺失: %q", desc)
 	}
 	if !strings.HasSuffix(desc, graph.OutputContractEnd) {
 		t.Errorf("契约块应为描述的最后一段: %q", desc)
 	}
-	if !strings.Contains(desc, "来自节点 probe（activation probe@1）") || !strings.Contains(desc, "coverage ∈ {ok, gap}") {
-		t.Errorf("既有段落与契约内容应并存: %q", desc)
+	if strings.Contains(desc, "第一版") || !strings.Contains(desc, "coverage ∈ {ok, gap}") {
+		t.Errorf("Description 只应保留 objective/contract: %q", desc)
+	}
+	inputs := graphTaskContextInputs(spec)
+	if len(inputs) != 1 || !strings.Contains(inputs[0].Content, "第一版") {
+		t.Errorf("上游数据未进入 typed ContextInputs: %+v", inputs)
 	}
 
 	plain := spec
 	plain.OutputContract = ""
-	if got, want := graphTaskDescription(plain), graphTaskDescriptionWithInputs(spec); got != want {
+	if got, want := graphTaskDescription(plain), "实现功能\n\n实现请求的功能"; got != want {
 		t.Errorf("空契约应与无契约逐字节一致（零行为变化）:\n got=%q\nwant=%q", got, want)
 	}
 }
@@ -86,5 +85,25 @@ func TestGraphBoardPublishFreezesOutputContract(t *testing.T) {
 	joined := strings.Join(lines, "\n")
 	if !strings.Contains(joined, "coverage ∈ {ok, gap}") || !strings.Contains(joined, "禁止提交 event") {
 		t.Errorf("钉入侧应能逐行取回契约内容，实际 %v", lines)
+	}
+}
+
+func TestGraphTaskDescriptionCombinesTypedAndOutletContracts(t *testing.T) {
+	spec := graph.TaskSpec{
+		Title: "实现功能", Description: "实现请求",
+		TypedOutputContract: &graph.NodeOutputContract{
+			SummaryRequired: true,
+			Fields:          []graph.OutputFieldContract{{Path: "$.changed", Type: "boolean", Required: true}},
+		},
+		OutputContract: testOutputContract(t),
+	}
+	desc := graphTaskDescription(spec)
+	for _, want := range []string{"<typed-output-contract>", `"path":"$.changed"`, `"type":"boolean"`, graph.OutputContractBegin} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("组合输出契约缺少 %q: %s", want, desc)
+		}
+	}
+	if strings.Index(desc, "<typed-output-contract>") > strings.Index(desc, graph.OutputContractBegin) {
+		t.Fatal("typed contract 应先于由边派生的 outlet contract")
 	}
 }

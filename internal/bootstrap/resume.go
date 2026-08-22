@@ -214,7 +214,18 @@ func guardRecoveredSnapshotNoAutoResume(snap *session.Snapshot, now time.Time) (
 func restoreOrReconcileRuntime(sys *System, snap *session.Snapshot) error {
 	wireTextOnlyResultPersistence(sys)
 	if snap != nil {
-		return restoreRuntimeSnapshot(sys, snap)
+		if err := restoreRuntimeSnapshot(sys, snap); err != nil {
+			return err
+		}
+	}
+	if sys != nil && sys.TaskOutcomeStore != nil && sys.GraphStore != nil {
+		authority := newGraphTaskOutcomeAuthority(sys.GraphStore, sys.TaskOutcomeStore, sys.LoopStore)
+		if err := authority.RecoverPendingIntents(sys.Store); err != nil {
+			return fmt.Errorf("恢复 pending TerminalIntent: %w", err)
+		}
+		if err := authority.ReconcileTasks(sys.Store); err != nil {
+			return fmt.Errorf("恢复 TaskOutcome 投影: %w", err)
+		}
 	}
 	return nil
 }
@@ -230,6 +241,9 @@ func restoreRuntimeBeforeReactorActivation(sys *System, snap *session.Snapshot, 
 	wireSessionMemory(sys)
 	if err := restoreOrReconcileRuntime(sys, snap); err != nil {
 		return err
+	}
+	if err := replayPendingTaskOutcomes(sys); err != nil {
+		return fmt.Errorf("重放 TaskOutcome delivery outbox: %w", err)
 	}
 	emitResumeBlocks(blocks)
 	trace.SetDefaultDispatcher(dispatcher)

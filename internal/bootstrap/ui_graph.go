@@ -43,6 +43,7 @@ func graphViewsForUI(store *graph.Store, sessionID string) []ui.GraphView {
 func graphViewForUI(doc *graph.GraphDocument, summary graph.GraphSummary, selected []graph.TransitionRecord) ui.GraphView {
 	view := ui.GraphView{
 		GraphID:      doc.GraphID,
+		RunID:        string(doc.RunID),
 		Revision:     doc.Revision,
 		StateVersion: doc.StateVersion,
 		Status:       string(doc.Status),
@@ -50,6 +51,9 @@ func graphViewForUI(doc *graph.GraphDocument, summary graph.GraphSummary, select
 		Digest:       summary.Digest,
 		Degraded:     summary.Degraded,
 		SessionID:    summary.SessionID,
+	}
+	if doc.Outcome != nil {
+		view.Outcome = string(doc.Outcome.Outcome)
 	}
 
 	order := graphNodeOrder(doc)

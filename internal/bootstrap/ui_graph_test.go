@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"agentgo/internal/graph"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/ui"
 )
 
@@ -142,5 +143,36 @@ func TestGraphViewsForUI_ProjectsSessionID(t *testing.T) {
 func TestGraphViewsForUI_NilStore(t *testing.T) {
 	if views := graphViewsForUI(nil, "sess-A"); len(views) != 0 {
 		t.Errorf("nil store 应返回空视图，实际 %d 张", len(views))
+	}
+}
+
+func TestGraphViewForUIProjectsTypedOutcome(t *testing.T) {
+	for _, test := range []struct {
+		outcome graph.EndOutcome
+		status  graph.GraphStatus
+	}{
+		{outcome: graph.EndFailed, status: graph.GraphFailed},
+		{outcome: graph.EndBlocked, status: graph.GraphBlocked},
+		{outcome: graph.EndCancelled, status: graph.GraphCancelled},
+	} {
+		doc := &graph.GraphDocument{
+			GraphID: "g-" + string(test.outcome), RunID: runcontract.RunID("run-swe-1"), Status: test.status,
+			Outcome: &graph.GraphOutcomeRecord{Outcome: test.outcome}, Nodes: map[string]graph.Node{},
+		}
+		view := graphViewForUI(doc, graph.GraphSummary{}, nil)
+		if view.RunID != "run-swe-1" || view.Status != string(test.status) || view.Outcome != string(test.outcome) {
+			t.Errorf("status=%s outcome=%s 投影为 status=%s outcome=%s",
+				test.status, test.outcome, view.Status, view.Outcome)
+		}
+		if view.Status == string(graph.GraphCompleted) || view.Outcome == string(graph.EndSuccess) {
+			t.Errorf("非成功终态被折叠为 completed/success: %+v", view)
+		}
+	}
+
+	legacy := graphViewForUI(&graph.GraphDocument{
+		GraphID: "g-legacy", Status: graph.GraphCompleted, Nodes: map[string]graph.Node{},
+	}, graph.GraphSummary{}, nil)
+	if legacy.Outcome != "" {
+		t.Fatalf("legacy nil outcome 应保持空值，实际 %q", legacy.Outcome)
 	}
 }

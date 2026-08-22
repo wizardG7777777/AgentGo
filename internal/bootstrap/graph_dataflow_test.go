@@ -1,9 +1,8 @@
 package bootstrap
 
 // 数据流（Result→Input 绑定）的 bootstrap 侧测试：
-//   - graphTaskDescription 把 activation 的持久化输入绑定渲染进任务描述
-//     （来源标识/完整内联 Result/有界摘要/可解引用证据/截断标记），
-//     无输入时保持原拼接待命；
+//   - graphTaskDescription 只保留 objective/control；graphTaskContextInputs 把
+//     Result/Evidence 变成独立 typed L2 端口；
 //   - assembleTaskEvidence 从 ToolCallRecord + Artifacts 组装稳定引用
 //     （基于 CallID/内容身份而非查询序数）的有界证据条目，超上限追加截断标记。
 
@@ -20,7 +19,7 @@ import (
 	"agentgo/internal/store"
 )
 
-func TestGraphTaskDescriptionRendersUpstreamInputs(t *testing.T) {
+func TestGraphTaskContextInputsSeparateDataFromDescription(t *testing.T) {
 	spec := graph.TaskSpec{
 		Title: "验收修改", Description: "判据：编译通过",
 		Inputs: []graph.InputBinding{
@@ -38,17 +37,22 @@ func TestGraphTaskDescriptionRendersUpstreamInputs(t *testing.T) {
 		},
 	}
 	desc := graphTaskDescription(spec)
-	if !strings.HasPrefix(desc, "验收修改\n\n判据：编译通过") {
-		t.Errorf("描述应以原标题+判据开头: %q", desc)
+	if desc != "验收修改\n\n判据：编译通过" {
+		t.Errorf("Description 只应包含 objective/control: %q", desc)
 	}
+	inputs := graphTaskContextInputs(spec)
+	if len(inputs) != 3 || inputs[0].Kind != model.TaskContextUpstreamResult ||
+		inputs[1].Kind != model.TaskContextUpstreamEvidence || inputs[2].Kind != model.TaskContextUpstreamResult {
+		t.Fatalf("Result typed inputs 形状错误: %+v", inputs)
+	}
+	joined := inputs[0].Content + inputs[1].Content + inputs[2].Content
 	for _, want := range []string{
-		"来自节点 implement（activation implement@1）", "目标输入端口: implementation", "结果摘要:", "第一版",
-		`"coverage":87`, `"ready":true`,
-		"证据引用: ev:task-1:1, ev:task-1:2",
-		"来自节点 probe（activation probe@2）", "超过内联上限",
+		`"source_node_id":"implement"`, `"source_activation_id":"implement@1"`,
+		`"target_input":"implementation"`, "第一版", `"coverage":87`, `"ready":true`,
+		`"source_node_id":"probe"`, `"truncated":true`,
 	} {
-		if !strings.Contains(desc, want) {
-			t.Errorf("描述应包含 %q: %q", want, desc)
+		if !strings.Contains(joined, want) {
+			t.Errorf("typed Result 应包含 %q: %q", want, joined)
 		}
 	}
 
@@ -59,7 +63,7 @@ func TestGraphTaskDescriptionRendersUpstreamInputs(t *testing.T) {
 	}
 }
 
-func TestGraphTaskDescriptionResolvesEvidenceWithoutSideChannelTool(t *testing.T) {
+func TestGraphTaskContextInputsCarriesEvidenceWithoutSideChannelTool(t *testing.T) {
 	s := store.NewMemoryTaskStore(nil, 100, 1, 300)
 	source := &model.Task{Description: "实现", Artifacts: []string{"out/report.md"}}
 	if err := s.PublishTask(source); err != nil {
@@ -83,41 +87,46 @@ func TestGraphTaskDescriptionResolvesEvidenceWithoutSideChannelTool(t *testing.T
 		Evidence:     evidence,
 		EvidenceRefs: []string{evidence[0].Ref, evidence[1].Ref, "ev:missing:call:deadbeef"},
 	}}}
-	desc := graphTaskDescription(spec)
+	inputs := graphTaskContextInputs(spec)
+	if len(inputs) != 2 || inputs[1].Kind != model.TaskContextUpstreamEvidence {
+		t.Fatalf("Evidence typed input 缺失: %+v", inputs)
+	}
+	content := inputs[1].Content
 	for _, want := range []string{
-		evidence[0].Ref, "[shell]", "go test ./...", "exit=0", "exit_code=0",
-		`call_id="call-check"`, `tool="run_shell"`, "success=true",
-		evidence[1].Ref, "[artifact]", `path="out/report.md"`,
-		"ev:missing:call:deadbeef", "[unresolved]", "不得据此判定通过",
+		evidence[0].Ref, `"kind":"shell"`, "go test ./...", `"exit_code":0`,
+		`"call_id":"call-check"`, `"tool_name":"run_shell"`, `"success":true`,
+		evidence[1].Ref, `"kind":"artifact"`, `"path":"out/report.md"`,
+		`"unresolved_evidence_refs":["ev:missing:call:deadbeef"]`,
 	} {
-		if !strings.Contains(desc, want) {
-			t.Errorf("冻结任务描述应包含可审阅证据 %q: %s", want, desc)
+		if !strings.Contains(content, want) {
+			t.Errorf("冻结 Evidence input 应包含 %q: %s", want, content)
 		}
 	}
-	if strings.Contains(desc, "read_graph") || strings.Contains(desc, "get_task_result") {
-		t.Errorf("数据流任务不得要求 verifier 使用旁路图查询工具: %s", desc)
+	if strings.Contains(content, "read_graph") || strings.Contains(content, "get_task_result") {
+		t.Errorf("数据流任务不得要求 verifier 使用旁路图查询工具: %s", content)
 	}
 }
 
-func TestGraphTaskDescriptionUsesDurableInputEvidenceWithoutSourceTask(t *testing.T) {
+func TestGraphTaskContextInputsUsesDurableEvidenceWithoutSourceTask(t *testing.T) {
 	entry := graph.EvidenceEntry{
 		Ref: "ev:gone-task:call:0123456789abcdef", Kind: "shell",
 		Summary: "命令: go test ./...（exit=0）",
 	}
-	desc := graphTaskDescription(graph.TaskSpec{Title: "恢复后验收", Inputs: []graph.InputBinding{{
+	inputs := graphTaskContextInputs(graph.TaskSpec{Title: "恢复后验收", Inputs: []graph.InputBinding{{
 		SourceNodeID: "checker", SourceActivationID: "checker@7",
 		ResultRef: "result:g-1:checker@7", Truncated: true,
 		Evidence: []graph.EvidenceEntry{entry}, EvidenceRefs: []string{entry.Ref},
 	}}})
+	content := inputs[0].Content + inputs[1].Content
 	for _, want := range []string{
-		"稳定 ResultRef: result:g-1:checker@7", entry.Ref, "[shell]", "go test ./...", "exit=0",
+		`"result_ref":"result:g-1:checker@7"`, entry.Ref, `"kind":"shell"`, "go test ./...",
 	} {
-		if !strings.Contains(desc, want) {
-			t.Errorf("源 Task 已淘汰时应直接消费 InputBinding 的 durable Evidence %q: %s", want, desc)
+		if !strings.Contains(content, want) {
+			t.Errorf("源 Task 已淘汰时应直接消费 InputBinding 的 durable Evidence %q: %s", want, content)
 		}
 	}
-	if strings.Contains(desc, "[unresolved]") {
-		t.Errorf("已随 InputBinding 持久化的 Evidence 不应依赖 TaskStore 再解析: %s", desc)
+	if strings.Contains(content, "unresolved_evidence_refs") {
+		t.Errorf("已随 InputBinding 持久化的 Evidence 不应标 unresolved: %s", content)
 	}
 }
 
@@ -181,10 +190,17 @@ func TestGraphBoardPublishFreezesResultAndResolvedEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTask: %v", err)
 	}
-	for _, want := range []string{`"coverage":91`, ref, "[shell]", "go build ./...", "exit=0", "exit_code=0"} {
-		if !strings.Contains(task.Description, want) {
-			t.Errorf("真实发布的冻结任务上下文缺少 %q: %s", want, task.Description)
+	joined := ""
+	for _, input := range task.ContextInputs {
+		joined += input.Content
+	}
+	for _, want := range []string{`"coverage":91`, ref, `"kind":"shell"`, "go build ./...", `"exit_code":0`} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("真实发布的冻结 typed input 缺少 %q: %s", want, joined)
 		}
+	}
+	if strings.Contains(task.Description, `"coverage":91`) {
+		t.Errorf("Graph Result 不得污染 Description: %s", task.Description)
 	}
 }
 
@@ -228,17 +244,19 @@ func TestAssembleTaskEvidenceRefStableAcrossQueryOrder(t *testing.T) {
 	}
 }
 
-func TestGraphTaskDescriptionInputSectionIsBounded(t *testing.T) {
-	large := strings.Repeat("界", graphTaskInputMaxRunes*2)
-	desc := graphTaskDescription(graph.TaskSpec{Title: "消费", Inputs: []graph.InputBinding{{
+func TestGraphTaskLargeInputStaysOutOfDescriptionForL2Budgeting(t *testing.T) {
+	large := strings.Repeat("界", 128<<10)
+	spec := graph.TaskSpec{Title: "消费", Inputs: []graph.InputBinding{{
 		SourceNodeID: "large", SourceActivationID: "large@1",
-		Summary: large,
-	}}})
-	if got := len([]rune(desc)); got > graphTaskInputMaxRunes+1024 {
-		t.Fatalf("输入注入必须有总量边界，实际 runes=%d", got)
+		Result: json.RawMessage(`{"content":"` + large + `"}`),
+	}}}
+	desc := graphTaskDescription(spec)
+	inputs := graphTaskContextInputs(spec)
+	if desc != "消费" || strings.Contains(desc, large[:128]) {
+		t.Fatalf("大输入不得拼入 Description/user_task: len=%d", len(desc))
 	}
-	if !strings.Contains(desc, "超过任务上下文注入上限") {
-		t.Errorf("截断必须显式说明且不得推荐旁路工具: %s", desc[len(desc)-200:])
+	if len(inputs) != 1 || inputs[0].Kind != model.TaskContextUpstreamResult || !strings.Contains(inputs[0].Content, large[:128]) {
+		t.Fatalf("大输入应完整交给 L2 typed port 决定 reference/drop: inputs=%d", len(inputs))
 	}
 }
 
@@ -322,13 +340,14 @@ func TestAssembleTaskEvidenceStructuredFieldsAreBounded(t *testing.T) {
 	if got := len([]rune(ev[1].Path)); got != graph.EvidencePathMaxRunes || !ev[1].PathTruncated {
 		t.Errorf("artifact path 边界/标志错误: runes=%d evidence=%+v", got, ev[1])
 	}
-	desc := graphTaskDescription(graph.TaskSpec{Title: "核验边界", Inputs: []graph.InputBinding{{
+	inputs := graphTaskContextInputs(graph.TaskSpec{Title: "核验边界", Inputs: []graph.InputBinding{{
 		SourceNodeID: "checker", SourceActivationID: "checker@1",
 		Evidence: ev, EvidenceRefs: []string{ev[0].Ref, ev[1].Ref},
 	}}})
-	for _, want := range []string{"success=false", "exit_code=17", "command_truncated=true", "path_truncated=true"} {
-		if !strings.Contains(desc, want) {
-			t.Errorf("冻结任务描述必须显式呈现结构化证据边界 %q", want)
+	content := inputs[1].Content
+	for _, want := range []string{`"success":false`, `"exit_code":17`, `"command_truncated":true`, `"path_truncated":true`} {
+		if !strings.Contains(content, want) {
+			t.Errorf("冻结 Evidence input 必须显式呈现结构化证据边界 %q", want)
 		}
 	}
 }

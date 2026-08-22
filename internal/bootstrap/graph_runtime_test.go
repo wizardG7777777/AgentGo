@@ -7,15 +7,19 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
 	"agentgo/internal/effect"
 	"agentgo/internal/graph"
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
 	"agentgo/internal/reactor"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/session"
 	"agentgo/internal/store"
+	"agentgo/internal/taskcontract"
 	"agentgo/internal/trace"
 )
 
@@ -966,8 +970,14 @@ func TestGraphEndWakeReactorPublishesExplicitSchedulerReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = gs.Close() })
+	binding := &model.Task{}
+	if err := taskcontract.Start(binding, loopcontract.WorkCoordination, "test-graph-finalization/v1",
+		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
 	doc := &graph.GraphDocument{
 		Schema: graph.SchemaV1, GraphID: "g-finished", Root: "done", Status: graph.GraphPending,
+		RunID: binding.RunID, RunContract: binding.RunContract,
 		Nodes: map[string]graph.Node{
 			"done": {Kind: graph.KindEnd, Task: &graph.NodeTask{Title: "完成"}, Status: graph.NodeInactive, Next: []graph.Transition{}},
 		},
@@ -1000,6 +1010,10 @@ func TestGraphEndWakeReactorPublishesExplicitSchedulerReply(t *testing.T) {
 	wake := all[0]
 	if wake.EventType != "__scheduler__" || wake.EventSource != graphEndEventSource || wake.GraphID != "" {
 		t.Fatalf("终态唤醒任务形状错误: EventType=%q EventSource=%q GraphID=%q", wake.EventType, wake.EventSource, wake.GraphID)
+	}
+	if wake.RunID != binding.RunID || wake.RunContract == nil || wake.ContextPolicyRef == "" ||
+		wake.ProgressContract == nil || wake.RunPhase != runcontract.PhaseFinalization {
+		t.Fatalf("graph-ended 唤醒必须继承完整 finalization binding: %+v", wake)
 	}
 	for _, want := range []string{"[graph-ended: g-finished/", "completed", "read_graph", "明确"} {
 		if !strings.Contains(wake.Description, want) {

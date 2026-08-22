@@ -4,8 +4,8 @@
 // 而非上游自述（声称「已修复并验证」但 read/edit/shell 全零即假成功的
 // 机械探测器）。数据来自 ToolCallRecord 账本（SWE-002 清洗后工具名已可信），
 // 转移结算时由 graph.Runtime 调用一次并随 EdgeInput 冻结——本文件只在
-// 结算时被调用，绝不在下游任务发布时按 task_id 回查（红线见
-// graphTaskDescriptionWithInputs 注释）。
+// 结算时被调用，绝不在下游任务发布时按 task_id 回查；下游只消费冻结的
+// TaskContextInput。
 //
 // 渲染纪律：Args 一律不进摘要（可能含文件正文，既膨胀又泄漏）；工具统计
 // 按次数降序至多 8 类；文件清单去重、各 ≤10 条；摘要只是事实，不是 verdict。
