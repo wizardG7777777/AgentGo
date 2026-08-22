@@ -81,8 +81,8 @@ func TestQuiesce_FencesAllTransitions(t *testing.T) {
 	} else {
 		t.Fatal("静默期间 RevokeTaskLease 应被拒绝，实际成功")
 	}
-	if n := s.CancelAllNonTerminal("test"); n != 0 {
-		t.Fatalf("静默期间 CancelAllNonTerminal 应返回 0，实际 %d", n)
+	if n, err := s.CancelAllNonTerminal("test"); !errors.Is(err, ErrStoreQuiesced) || n != 0 {
+		t.Fatalf("静默期间 CancelAllNonTerminal 应返回 0/ErrStoreQuiesced，实际 n=%d err=%v", n, err)
 	}
 
 	// 状态零变化：两个任务保持原状态、原认领、原重试计数、原租约

@@ -47,7 +47,8 @@ type TurnFacts struct {
 // （「重复读取或无新增证据的轮次不扩写」）。
 var readClassTools = map[string]bool{
 	"read_file": true, "list_dir": true, "grep_search": true, "glob_search": true,
-	"web_search": true, "web_fetch": true, "probe_directory": true, "get_task_result": true,
+	"web_search": true, "web_fetch": true, "read_content_ref": true,
+	"probe_directory": true, "get_task_result": true,
 }
 
 // ApplyTurn 把一个 settled Turn 的结构化事实滚动合并进 Task Memory，

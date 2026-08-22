@@ -16,6 +16,10 @@ import (
 // 由 hook 消费者自行决定是否计入统计。
 type ToolCallRecord struct {
 	Timestamp time.Time
+	RunID     string
+	AttemptID string
+	TurnID    string
+	ActionID  string
 	// CallID is the protocol-level identity supplied by the model. It lets
 	// downstream consumers join the durable ledger to the matching tool result
 	// without relying on timestamp or map iteration order. Empty is accepted for
@@ -29,6 +33,74 @@ type ToolCallRecord struct {
 	// line. Success alone is insufficient because run_shell returns non-zero
 	// command exits as a normal tool result.
 	ExitCode *int
+}
+
+// TerminalOutcomeIntent 是 TaskStore 在终态状态生效前交给 durable outcome
+// authority 的不可变候选。Task 已包含候选 status/result/error/completed_at，
+// ToolCalls 是同一 Store 临界区冻结的完整调用账，Hook 不得回调 TaskStore。
+type TerminalOutcomeIntent struct {
+	Task       *model.Task
+	ToolCalls  []ToolCallRecord
+	Cause      string
+	Summary    string
+	ReasonCode string
+}
+
+// TerminalOutcomeHook 返回稳定 OutcomeRef。空引用表示该 Task 属 legacy、
+// 不需要新 outcome 契约；非空引用由 Store 与终态状态一起写入 Task。
+type TerminalOutcomeHook func(TerminalOutcomeIntent) (string, error)
+
+type TerminalCheckpointBinding struct {
+	CheckpointRef   string
+	CheckpointState string
+}
+
+type TerminalOutcomeCoordinator interface {
+	PrepareTerminalIntent(TerminalOutcomeIntent) (string, error)
+	SettleTerminalIntent(intentRef string) (TerminalCheckpointBinding, error)
+	CommitTerminalOutcome(intentRef string, refreshed TerminalOutcomeIntent, binding TerminalCheckpointBinding) (string, error)
+}
+
+type terminalOutcomeHookSetter interface {
+	SetTerminalOutcomeHook(TerminalOutcomeHook)
+}
+
+type terminalOutcomeCoordinatorSetter interface {
+	SetTerminalOutcomeCoordinator(TerminalOutcomeCoordinator)
+}
+
+func SetTerminalOutcomeCoordinator(s TaskStore, coordinator TerminalOutcomeCoordinator) error {
+	setter, ok := s.(terminalOutcomeCoordinatorSetter)
+	if !ok {
+		return fmt.Errorf("TaskStore %T 不支持 TerminalOutcomeCoordinator", s)
+	}
+	setter.SetTerminalOutcomeCoordinator(coordinator)
+	return nil
+}
+
+// SetTerminalOutcomeHook 装配终态前置 durable hook。新生产路径不允许
+// TaskStore 缺少该窄端口；nil hook 仅供 legacy/测试显式清除。
+func SetTerminalOutcomeHook(s TaskStore, hook TerminalOutcomeHook) error {
+	setter, ok := s.(terminalOutcomeHookSetter)
+	if !ok {
+		return fmt.Errorf("TaskStore %T 不支持 TerminalOutcomeHook", s)
+	}
+	setter.SetTerminalOutcomeHook(hook)
+	return nil
+}
+
+type recoveredTaskOutcomeApplier interface {
+	ApplyRecoveredTaskOutcome(taskID, outcomeRef string, status model.TaskStatus, results map[string]string, reason string, committedAt time.Time) error
+}
+
+// ApplyRecoveredTaskOutcome 修复「outcome 已 fsync、Task/Session snapshot 尚未
+// 提交」的崩溃窗口。它只消费已验证的 durable outcome，不再次调用 hook。
+func ApplyRecoveredTaskOutcome(s TaskStore, taskID, outcomeRef string, status model.TaskStatus, results map[string]string, reason string, committedAt time.Time) error {
+	applier, ok := s.(recoveredTaskOutcomeApplier)
+	if !ok {
+		return fmt.Errorf("TaskStore %T 不支持恢复 TaskOutcome", s)
+	}
+	return applier.ApplyRecoveredTaskOutcome(taskID, outcomeRef, status, results, reason, committedAt)
 }
 
 type TaskStore interface {
@@ -114,6 +186,18 @@ type CapabilityChecker func(agentID string, task *model.Task) error
 
 type cancelSourceTransitioner interface {
 	TransitionStateWithCancelSource(taskID string, from, to model.TaskStatus, cancelSource string) error
+}
+
+type taskFailureWithCause interface {
+	FailTaskWithCause(agentID, taskID, reason, cause string) error
+}
+
+// FailTaskWithCause 保留 L4 的结构化终止原因；旧 Store 明确回落 FailTask。
+func FailTaskWithCause(s TaskStore, agentID, taskID, reason, cause string) error {
+	if typed, ok := s.(taskFailureWithCause); ok {
+		return typed.FailTaskWithCause(agentID, taskID, reason, cause)
+	}
+	return s.FailTask(agentID, taskID, reason)
 }
 
 // TransitionStateWithCancelSource keeps TaskStore compatibility while allowing
@@ -238,7 +322,7 @@ func RevokeTaskLease(s TaskStore, taskID string) (*model.ExecutionLease, bool, e
 // （MemoryTaskStore 实现）。与 resultFieldRecorder 同模式——不扩张
 // TaskStore 主接口，保持测试 fake 与旧装配兼容。
 type nonTerminalAllCanceler interface {
-	CancelAllNonTerminal(cancelSource string) int
+	CancelAllNonTerminal(cancelSource string) (int, error)
 }
 
 // CancelAllNonTerminal 把全部 pending/processing 任务转为 cancelled 终态
@@ -246,7 +330,7 @@ type nonTerminalAllCanceler interface {
 // 错误——强制新建语义要求确实终止，不能静默降级。
 func CancelAllNonTerminal(s TaskStore, cancelSource string) (int, error) {
 	if st, ok := s.(nonTerminalAllCanceler); ok {
-		return st.CancelAllNonTerminal(cancelSource), nil
+		return st.CancelAllNonTerminal(cancelSource)
 	}
 	return 0, fmt.Errorf("store 不支持批量终止（CancelAllNonTerminal）")
 }

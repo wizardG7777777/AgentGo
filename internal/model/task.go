@@ -1,8 +1,33 @@
 package model
 
-import "time"
+import (
+	"time"
+
+	"agentgo/internal/loopcontract"
+	"agentgo/internal/runcontract"
+)
 
 type TaskStatus string
+
+// TaskContextInputKind 是 L5/L3 交给 L2 的有类型上下文端口。它不使用
+// ContextFragment 类型，避免 model 反向依赖 ContextCompiler；L2 adapter 在
+// Invocation 前把它机械映射为对应 FragmentKind/Section。
+type TaskContextInputKind string
+
+const (
+	TaskContextUpstreamResult   TaskContextInputKind = "upstream_result"
+	TaskContextUpstreamEvidence TaskContextInputKind = "upstream_evidence"
+)
+
+func (k TaskContextInputKind) Valid() bool {
+	return k == TaskContextUpstreamResult || k == TaskContextUpstreamEvidence
+}
+
+type TaskContextInput struct {
+	Kind      TaskContextInputKind `json:"kind"`
+	SourceRef string               `json:"source_ref"`
+	Content   string               `json:"content"`
+}
 
 const (
 	TaskStatusPending    TaskStatus = "pending"
@@ -39,8 +64,28 @@ func IsTerminal(status TaskStatus) bool {
 }
 
 type Task struct {
-	ID             string
-	Description    string
+	ID string
+	// RunID/RunContract 是一次用户请求的冻结运行身份和预算契约。Graph/子任务
+	// 必须沿父链传递；旧任务为空时按 legacy/degraded 处理，不能伪造历史身份。
+	RunID       runcontract.RunID
+	RunContract *runcontract.RunContract
+	RunPhase    runcontract.Phase
+	// ProgressContract 是框架编译并冻结的 L4 进展契约。Scheduler 只能从
+	// framework catalog 选择；nil 表示 legacy/degraded Task，不启用 L4 enforcement。
+	ProgressContract *loopcontract.CompiledProgressContract
+	// ContextPolicyRef 是 L2 ContextCompiler 的冻结 policy identity。新任务必须
+	// 来自 framework catalog；旧任务空值按 legacy/degraded 处理，不能在重试中
+	// 静默切换 policy。
+	ContextPolicyRef string
+	// AttemptID/AttemptNo 由 Store 在 pending→processing 的认领边界生成。每次
+	// RetryRollback 后重新认领产生新 Attempt；同一 processing 任务的并发认领
+	// 不得改写。
+	AttemptID   string
+	AttemptNo   int
+	Description string
+	// ContextInputs 是与 Task objective 分离的冻结数据输入。Graph Result/Evidence
+	// 必须走这里进入 L2 upstream section，禁止再拼进 Description/user_task。
+	ContextInputs  []TaskContextInput `json:"context_inputs,omitempty"`
 	Priority       int
 	Dependencies   []string
 	Status         TaskStatus
@@ -51,11 +96,25 @@ type Task struct {
 	RetryCount     int
 	RetryReasons   []string
 	LastHistory    []byte // JSON 序列化的历史记录，重试时恢复上下文
+	// ExpectedDuration 只用于 SLO、UI 和 legacy Watchdog 兼容告警；它不是
+	// deadline，也不得触发取消、重试或 Task 状态迁移。新 Loop 的停止权威是
+	// RunContract/ProgressCheckpoint 中冻结的绝对 HardDeadlineAt。
+	ExpectedDuration time.Duration
+	// TimeoutSeconds 是旧快照/旧发布方的导入别名。Store 会把它迁移到
+	// ExpectedDuration；新控制流不得直接读取它推导 deadline。
+	// Deprecated: 仅用于 legacy import compatibility。
 	TimeoutSeconds int
 
 	// EventSource identifies the external trigger or legacy publisher label.
 	// It is not a parent edge and must never be assumed to be a mailbox ID.
 	EventSource string
+	// Intervention* 是 L4→L5 coordination wake 的冻结控制作用域。wake 自身
+	// 不是 Graph activation，故 GraphID/NodeID/ActivationID 必须保持空；这些
+	// 独立字段让 Scheduler 机械区分“非图请求重建 Draft”与“现有 Graph 变更裁决”，
+	// 禁止解析 Description marker 猜 lineage。
+	InterventionGraphID      string `json:"intervention_graph_id,omitempty"`
+	InterventionNodeID       string `json:"intervention_node_id,omitempty"`
+	InterventionActivationID string `json:"intervention_activation_id,omitempty"`
 	// ParentTaskID is the explicit task-lineage edge used for plan inheritance
 	// and topology inspection. Empty means this Task has no known parent.
 	ParentTaskID string
@@ -82,6 +141,12 @@ type Task struct {
 	NodeID        string `json:"node_id,omitempty"`
 	ActivationID  string `json:"activation_id,omitempty"`
 	GraphNodeKind string `json:"graph_node_kind,omitempty"`
+	// OutcomeRef 指向 L4 append-only TaskOutcome。新 authoring Graph 的终态
+	// 必须先 durable 提交该事实，再把引用与 Task 状态一起生效；legacy 为空。
+	OutcomeRef string `json:"outcome_ref,omitempty"`
+	// GraphDefinitionDigestVersion 非空表示任务来自 authoring Definition；
+	// ExecutionLease 据此移除 legacy controller 的 direct patch_graph 能力。
+	GraphDefinitionDigestVersion string `json:"graph_definition_digest_version,omitempty"`
 	// RouteScope freezes the runtime route-authorization owner used at both
 	// publish validation and claim time (for example "graph:<graph_id>" or
 	// "task:<controller_task_id>"). It is deliberately separate from lineage:
@@ -113,6 +178,12 @@ type Task struct {
 	// MailNotifier 在发布 wake task 时根据收件箱内未读邮件的最大 ChainDepth 设置该字段。
 	// Phase 2 引入；零值兼容现有任务。
 	MailChainDepth int
+	// MailboxTargetAgentID/MailboxSessionID 仅用于 mail-notifier 生成的定向
+	// 唤醒任务。TargetAgentID 是认领硬约束，避免同 event_type 的其它副本
+	// 抢走不属于自己的邮箱分区；SessionID 与 Task.RunID 一起绑定待消费邮件。
+	// 普通任务与旧快照两字段全空，不改变既有路由语义。
+	MailboxTargetAgentID string `json:"mailbox_target_agent_id,omitempty"`
+	MailboxSessionID     string `json:"mailbox_session_id,omitempty"`
 
 	// Artifacts 是任务执行期间通过 write_file/edit_file 实际写入的文件路径列表，
 	// 路径为相对项目根的相对路径，自动去重。
@@ -185,6 +256,9 @@ type Task struct {
 	StartedAt    time.Time
 	CompletedAt  time.Time
 }
+
+// Framework 拥有的 EventSource 稳定词表。跨层授权不得各自手写字符串。
+const TaskEventSourceLoopIntervention = "loop-intervention"
 
 // NodeCapability 是 DAG 节点级的能力声明，随 Task 携带。
 // 三方（model / store / agent）共用的统一契约，字段语义：

@@ -65,7 +65,10 @@ func TestCancelAllNonTerminal_MixedStates(t *testing.T) {
 		t.Fatalf("BlockTaskBySystem: %v", err)
 	}
 
-	n := s.CancelAllNonTerminal("session_force_close")
+	n, err := s.CancelAllNonTerminal("session_force_close")
+	if err != nil {
+		t.Fatalf("CancelAllNonTerminal: %v", err)
+	}
 	if n != 3 {
 		t.Fatalf("取消数量 = %d，期望 3（2 pending + 1 processing）", n)
 	}
@@ -127,13 +130,13 @@ func TestCancelAllNonTerminal_MixedStates(t *testing.T) {
 func TestCancelAllNonTerminal_EmptyAndNilRegistry(t *testing.T) {
 	s, _ := newTestStore(10, 100)
 
-	if n := s.CancelAllNonTerminal("src"); n != 0 {
+	if n, err := s.CancelAllNonTerminal("src"); err != nil || n != 0 {
 		t.Errorf("空 Store 取消数量应为 0，实际 %d", n)
 	}
 
 	// 未注入 cancel registry 时同样安全（nil 降级）
 	task := publishTestTask(t, s, "no-registry")
-	if n := s.CancelAllNonTerminal(""); n != 1 {
+	if n, err := s.CancelAllNonTerminal(""); err != nil || n != 1 {
 		t.Fatalf("取消数量应为 1，实际 %d", n)
 	}
 	if got, _ := s.GetTask(task.ID); got.Status != model.TaskStatusCancelled {
@@ -198,7 +201,7 @@ func TestProperty_CancelAllNonTerminal(t *testing.T) {
 		}
 
 		wantCancelled := len(liveIDs)
-		if got := s.CancelAllNonTerminal("pbt-source"); got != wantCancelled {
+		if got, err := s.CancelAllNonTerminal("pbt-source"); err != nil || got != wantCancelled {
 			return false
 		}
 

@@ -339,6 +339,26 @@ func TestLoadSnapshot_PreV4DropsAmbiguousMailboxMessages(t *testing.T) {
 	}
 }
 
+func TestLoadSnapshot_V4UnreadMailboxMessageKeepsLegacyEnvelope(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snapshot.json")
+	data := []byte(`{"version":4,"saved_at":"2026-07-19T04:06:00Z","tasks":[],"roster":{"claims":[]},"mailboxes":[{"owner_id":"worker-1","event_type":"worker","messages":[{"from":"scheduler","to":"worker-1","summary":"real unread v4","sent_at":"2026-07-19T04:05:00Z"}]}]}`)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Version != currentSnapshotVersion || len(loaded.Mailboxes) != 1 || len(loaded.Mailboxes[0].Messages) != 1 {
+		t.Fatalf("v4 unread message 应保留并升级: %+v", loaded)
+	}
+	msg := loaded.Mailboxes[0].Messages[0]
+	if msg.RunID != "" || msg.SourceTaskID != "" || msg.SessionID != "" {
+		t.Fatalf("v4 message 必须显式按 legacy 空 envelope 恢复: %+v", msg)
+	}
+}
+
 func TestSaveLoadSnapshot_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot.json")

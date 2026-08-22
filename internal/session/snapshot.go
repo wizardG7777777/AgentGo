@@ -5,6 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
+
+	"agentgo/internal/loopcontract"
+	"agentgo/internal/runcontract"
 )
 
 // currentSnapshotVersion is the current snapshot format version.
@@ -12,11 +16,13 @@ import (
 // Version 2 extends TaskSnapshot with scheduler/runtime fields required to
 // resume an in-flight task graph. Version 3 adds the current pending queue
 // lease timestamp. Version 4 changes MailboxSnapshot.Messages from the recent
-// observation ring to the actual unread queue. LoadSnapshot still accepts
+// observation ring to the actual unread queue. Version 5 adds the message
+// SourceTaskID/RunID/SessionID envelope used for per-Run mailbox partitions.
+// LoadSnapshot still accepts
 // older versions and upgrades them in memory so existing sessions remain
 // resumable; pre-v4 mailbox messages are dropped because their read/unread
 // state cannot be distinguished safely.
-const currentSnapshotVersion = 4
+const currentSnapshotVersion = 5
 
 const oldestSupportedSnapshotVersion = 1
 
@@ -33,40 +39,54 @@ type Snapshot struct {
 
 // TaskSnapshot 是单个 Task 的可序列化表示。
 type TaskSnapshot struct {
-	ID                string            `json:"id"`
-	Description       string            `json:"description"`
-	Priority          int               `json:"priority"`
-	Dependencies      []string          `json:"dependencies"`
-	Status            string            `json:"status"`
-	Agents            []string          `json:"agents"`
-	MaxConcurrency    int               `json:"max_concurrency"`
-	Results           map[string]string `json:"results"`
-	Error             string            `json:"error,omitempty"`
-	RetryCount        int               `json:"retry_count"`
-	RetryReasons      []string          `json:"retry_reasons"`
-	TimeoutSeconds    int               `json:"timeout_seconds"`
-	EventSource       string            `json:"event_source,omitempty"`
-	ParentTaskID      string            `json:"parent_task_id,omitempty"`
-	ReplyToAgentID    string            `json:"reply_to_agent_id,omitempty"`
-	BatchID           string            `json:"batch_id,omitempty"`
-	EventType         string            `json:"event_type,omitempty"`
-	TriggerRule       string            `json:"trigger_rule,omitempty"`
-	SystemPrompt      string            `json:"system_prompt,omitempty"`
-	Depth             int               `json:"depth"`
-	Artifacts         []string          `json:"artifacts,omitempty"`
-	ExpectedArtifacts []string          `json:"expected_artifacts,omitempty"`
+	ID               string                                 `json:"id"`
+	RunID            runcontract.RunID                      `json:"run_id,omitempty"`
+	RunContract      *runcontract.RunContract               `json:"run_contract,omitempty"`
+	RunPhase         runcontract.Phase                      `json:"run_phase,omitempty"`
+	ProgressContract *loopcontract.CompiledProgressContract `json:"progress_contract,omitempty"`
+	ContextPolicyRef string                                 `json:"context_policy_ref,omitempty"`
+	AttemptID        string                                 `json:"attempt_id,omitempty"`
+	AttemptNo        int                                    `json:"attempt_no,omitempty"`
+	Description      string                                 `json:"description"`
+	ContextInputs    []TaskContextInputSnapshot             `json:"context_inputs,omitempty"`
+	Priority         int                                    `json:"priority"`
+	Dependencies     []string                               `json:"dependencies"`
+	Status           string                                 `json:"status"`
+	Agents           []string                               `json:"agents"`
+	MaxConcurrency   int                                    `json:"max_concurrency"`
+	Results          map[string]string                      `json:"results"`
+	Error            string                                 `json:"error,omitempty"`
+	RetryCount       int                                    `json:"retry_count"`
+	RetryReasons     []string                               `json:"retry_reasons"`
+	// ExpectedDuration 是 canonical SLO hint，编码单位沿用 Go time.Duration
+	// （纳秒）。它不构成 deadline。TimeoutSeconds 仅接收旧快照。
+	ExpectedDuration time.Duration `json:"expected_duration,omitempty"`
+	// Deprecated: legacy snapshot import alias only.
+	TimeoutSeconds    int      `json:"timeout_seconds,omitempty"`
+	EventSource       string   `json:"event_source,omitempty"`
+	ParentTaskID      string   `json:"parent_task_id,omitempty"`
+	ReplyToAgentID    string   `json:"reply_to_agent_id,omitempty"`
+	BatchID           string   `json:"batch_id,omitempty"`
+	EventType         string   `json:"event_type,omitempty"`
+	TriggerRule       string   `json:"trigger_rule,omitempty"`
+	SystemPrompt      string   `json:"system_prompt,omitempty"`
+	Depth             int      `json:"depth"`
+	Artifacts         []string `json:"artifacts,omitempty"`
+	ExpectedArtifacts []string `json:"expected_artifacts,omitempty"`
 	// ArtifactMeta 是 Artifacts 的并行元数据（登记时刻的内容 hash/字节数）。
 	// 纯增量字段：旧版本快照没有它，Unmarshal 得 nil，按"无元数据"降级，
 	// 因此不提升 currentSnapshotVersion（与 LastHistory/ToolCalls 同策略）。
-	ArtifactMeta   map[string]ArtifactMetaSnapshot `json:"artifact_meta,omitempty"`
-	MailChainDepth int                             `json:"mail_chain_depth,omitempty"`
-	SchedulerBatch []string                        `json:"scheduler_batch,omitempty"`
-	LastResponse   string                          `json:"last_response,omitempty"`
-	PartialOutput  string                          `json:"partial_output,omitempty"`
-	CreatedAt      string                          `json:"created_at"`
-	PendingSince   string                          `json:"pending_since,omitempty"`
-	StartedAt      string                          `json:"started_at,omitempty"`
-	CompletedAt    string                          `json:"completed_at,omitempty"`
+	ArtifactMeta         map[string]ArtifactMetaSnapshot `json:"artifact_meta,omitempty"`
+	MailChainDepth       int                             `json:"mail_chain_depth,omitempty"`
+	MailboxTargetAgentID string                          `json:"mailbox_target_agent_id,omitempty"`
+	MailboxSessionID     string                          `json:"mailbox_session_id,omitempty"`
+	SchedulerBatch       []string                        `json:"scheduler_batch,omitempty"`
+	LastResponse         string                          `json:"last_response,omitempty"`
+	PartialOutput        string                          `json:"partial_output,omitempty"`
+	CreatedAt            string                          `json:"created_at"`
+	PendingSince         string                          `json:"pending_since,omitempty"`
+	StartedAt            string                          `json:"started_at,omitempty"`
+	CompletedAt          string                          `json:"completed_at,omitempty"`
 	// GraphID / NodeID / ActivationID / GraphNodeKind 是 V6 Graph 归属身份（见 model.Task
 	// 同名字段）。纯增量字段：旧版本快照没有它们，Unmarshal 得空串，按
 	// 「未知旧节点角色」降级，因此不提升 currentSnapshotVersion。
@@ -74,10 +94,12 @@ type TaskSnapshot struct {
 	// graphBoard 凭 (GraphID, ActivationID) 幂等去重；丢失会让在途图
 	// 节点永久等不到终态事实。旧 GraphNodeKind 为空时租约只授予
 	// submit_task_result，绝不按 route 猜测并注入 request_replan。
-	GraphID       string `json:"graph_id,omitempty"`
-	NodeID        string `json:"node_id,omitempty"`
-	ActivationID  string `json:"activation_id,omitempty"`
-	GraphNodeKind string `json:"graph_node_kind,omitempty"`
+	GraphID                      string `json:"graph_id,omitempty"`
+	NodeID                       string `json:"node_id,omitempty"`
+	ActivationID                 string `json:"activation_id,omitempty"`
+	GraphNodeKind                string `json:"graph_node_kind,omitempty"`
+	OutcomeRef                   string `json:"outcome_ref,omitempty"`
+	GraphDefinitionDigestVersion string `json:"graph_definition_digest_version,omitempty"`
 	// RouteScope is the durable runtime route-authorization owner. Old
 	// snapshots omit it and the claim layer derives the legacy-equivalent
 	// graph/task scope from GraphID/ParentTaskID, so this additive field does
@@ -100,6 +122,12 @@ type TaskSnapshot struct {
 	// snapshot so restoring a session cannot detach evidence from its Task
 	// identity.
 	ToolCalls []ToolCallSnapshot `json:"tool_calls,omitempty"`
+}
+
+type TaskContextInputSnapshot struct {
+	Kind      string `json:"kind"`
+	SourceRef string `json:"source_ref"`
+	Content   string `json:"content"`
 }
 
 // ArtifactMetaSnapshot 是 model.ArtifactMeta 的可序列化形式。
@@ -142,6 +170,10 @@ type LeaseSnapshot struct {
 // boundary owns this DTO and store performs the explicit conversion.
 type ToolCallSnapshot struct {
 	Timestamp string         `json:"timestamp,omitempty"`
+	RunID     string         `json:"run_id,omitempty"`
+	AttemptID string         `json:"attempt_id,omitempty"`
+	TurnID    string         `json:"turn_id,omitempty"`
+	ActionID  string         `json:"action_id,omitempty"`
 	CallID    string         `json:"call_id,omitempty"`
 	AgentID   string         `json:"agent_id,omitempty"`
 	ToolName  string         `json:"tool_name"`
@@ -171,21 +203,25 @@ type MailboxSnapshot struct {
 
 // MessageSnapshot 是单条消息的可序列化表示。
 type MessageSnapshot struct {
-	From       string `json:"from"`
-	To         string `json:"to"`
-	Content    string `json:"content"`
-	Summary    string `json:"summary"`
-	Type       string `json:"type"`
-	Priority   string `json:"priority"`
-	SentAt     string `json:"sent_at"`
-	ChainDepth int    `json:"chain_depth,omitempty"`
+	From         string            `json:"from"`
+	To           string            `json:"to"`
+	Content      string            `json:"content"`
+	Summary      string            `json:"summary"`
+	Type         string            `json:"type"`
+	Priority     string            `json:"priority"`
+	SentAt       string            `json:"sent_at"`
+	ChainDepth   int               `json:"chain_depth,omitempty"`
+	SourceTaskID string            `json:"source_task_id,omitempty"`
+	RunID        runcontract.RunID `json:"run_id,omitempty"`
+	SessionID    string            `json:"session_id,omitempty"`
 }
 
 // SessionInputSnapshot is the persistent form of scheduler.SessionInput.
 type SessionInputSnapshot struct {
-	Text            string `json:"text"`
-	SchedulerTaskID string `json:"scheduler_task_id"`
-	SubmittedAt     string `json:"submitted_at"`
+	Text            string            `json:"text"`
+	SchedulerTaskID string            `json:"scheduler_task_id"`
+	RunID           runcontract.RunID `json:"run_id,omitempty"`
+	SubmittedAt     string            `json:"submitted_at"`
 }
 
 // ResultSnapshot stores the latest user-visible task result for TUI resume.

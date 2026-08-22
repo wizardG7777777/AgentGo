@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,8 +41,10 @@ type MemoryTaskStore struct {
 	eventCh            chan<- model.Event
 	fifoLimit          int
 	defaultConcurrency int
-	defaultTimeoutSec  int
-	cancelRegistry     *TaskCancelRegistry
+	// defaultExpectedDurationSec 保留构造器旧参数的秒单位，但只为未声明的
+	// Task 填充 ExpectedDuration，不再生成 timeout/deadline。
+	defaultExpectedDurationSec int
+	cancelRegistry             *TaskCancelRegistry
 	// toolCalls 记录每个任务的工具调用历史。二级索引 taskID -> toolName -> records
 	// 避免 hook 在每次工具调用前做 O(N) 全量扫描。
 	toolCalls map[string]map[string][]ToolCallRecord
@@ -61,6 +64,11 @@ type MemoryTaskStore struct {
 	// capabilityChecker 是按认领方过滤节点能力任务的检查器。可选——nil 时
 	// QueryAvailable 不做能力过滤（兼容旧装配）。由 bootstrap 注入。
 	capabilityChecker CapabilityChecker
+	// terminalOutcomeHook 在任何终态状态写入前同步 fsync TaskOutcome；Hook
+	// 收到同一临界区冻结的 Task/ToolCalls，禁止回调本 Store。
+	terminalOutcomeHook        TerminalOutcomeHook
+	terminalOutcomeCoordinator TerminalOutcomeCoordinator
+	terminalFences             map[string]string
 	// quiesced 是静默围栏标记（s.mu 保护）。true 期间全部任务状态迁移入口
 	// （发布 / 认领 / 终态提交 / 重试回滚）持锁后第一站直接以
 	// ErrStoreQuiesced 拒绝——不改状态、不发事件、不发 history。
@@ -117,6 +125,28 @@ func (s *MemoryTaskStore) SetCancelRegistry(r *TaskCancelRegistry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cancelRegistry = r
+}
+
+func (s *MemoryTaskStore) SetTerminalOutcomeHook(hook TerminalOutcomeHook) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.terminalOutcomeHook = hook
+}
+
+func (s *MemoryTaskStore) SetTerminalOutcomeCoordinator(coordinator TerminalOutcomeCoordinator) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.terminalOutcomeCoordinator = coordinator
+	if s.terminalFences == nil {
+		s.terminalFences = make(map[string]string)
+	}
+}
+
+func (s *MemoryTaskStore) terminalFenceErrorLocked(taskID string) error {
+	if intentRef := s.terminalFences[taskID]; intentRef != "" {
+		return fmt.Errorf("task %s 已被 TerminalIntent %s fence", taskID, intentRef)
+	}
+	return nil
 }
 
 // SetHistoryEmitter 注入事件溯源日志发射器。nil 为合法——表示禁用事件发射。
@@ -201,15 +231,50 @@ func (s *MemoryTaskStore) RestoreArtifacts(rebuilt map[string][]string) (taskCou
 	return taskCount, artifactCount
 }
 
+const maxLegacyTimeoutSeconds = int64((time.Duration(1<<63 - 1)) / time.Second)
+
+func expectedDurationFromLegacyTimeout(seconds int) (time.Duration, error) {
+	if seconds < 0 {
+		return 0, fmt.Errorf("%d 秒不能为负", seconds)
+	}
+	if seconds == 0 {
+		return 0, nil
+	}
+	if int64(seconds) > maxLegacyTimeoutSeconds {
+		return 0, fmt.Errorf("%d 秒超出 time.Duration 可表示范围", seconds)
+	}
+	return time.Duration(seconds) * time.Second, nil
+}
+
+func expectedDurationFromSnapshot(snap session.TaskSnapshot) (time.Duration, error) {
+	if snap.ExpectedDuration < 0 {
+		return 0, fmt.Errorf("ExpectedDuration 不能为负")
+	}
+	if snap.ExpectedDuration > 0 {
+		return snap.ExpectedDuration, nil
+	}
+	duration, err := expectedDurationFromLegacyTimeout(snap.TimeoutSeconds)
+	if err != nil {
+		return 0, err
+	}
+	if duration > 0 {
+		log.Printf("[公告板] 从旧快照导入 task %s：TimeoutSeconds=%d 已迁移为 ExpectedDuration，不形成 deadline", snap.ID, snap.TimeoutSeconds)
+	}
+	return duration, nil
+}
+
+// NewMemoryTaskStore 的最后一个参数保留旧 API 名称/秒单位，实际只作为
+// ExpectedDuration 的默认 SLO；它不生成 timeout 或绝对 deadline。
 func NewMemoryTaskStore(eventCh chan<- model.Event, fifoLimit, defaultConcurrency, defaultTimeoutSec int) *MemoryTaskStore {
 	return &MemoryTaskStore{
-		tasks:              make(map[string]*model.Task),
-		completed:          make([]string, 0),
-		eventCh:            eventCh,
-		fifoLimit:          fifoLimit,
-		defaultConcurrency: defaultConcurrency,
-		defaultTimeoutSec:  defaultTimeoutSec,
-		toolCalls:          make(map[string]map[string][]ToolCallRecord),
+		tasks:                      make(map[string]*model.Task),
+		completed:                  make([]string, 0),
+		eventCh:                    eventCh,
+		fifoLimit:                  fifoLimit,
+		defaultConcurrency:         defaultConcurrency,
+		defaultExpectedDurationSec: defaultTimeoutSec,
+		toolCalls:                  make(map[string]map[string][]ToolCallRecord),
+		terminalFences:             make(map[string]string),
 	}
 }
 
@@ -235,6 +300,9 @@ func (s *MemoryTaskStore) PublishTask(task *model.Task) error {
 		return fmt.Errorf("%w: %s", ErrTaskAlreadyExists, task.ID)
 	}
 	now := time.Now()
+	if err := validatePublishedTaskContracts(task, now); err != nil {
+		return err
+	}
 	task.Status = model.TaskStatusPending
 	task.CreatedAt = now
 	task.PendingSince = now
@@ -244,9 +312,27 @@ func (s *MemoryTaskStore) PublishTask(task *model.Task) error {
 		task.MaxConcurrency = s.defaultConcurrency
 		log.Printf("[公告板] 任务 %s 未指定 MaxConcurrency，使用默认值 %d", task.ID, s.defaultConcurrency)
 	}
-	if task.TimeoutSeconds <= 0 {
-		task.TimeoutSeconds = s.defaultTimeoutSec
-		log.Printf("[公告板] 任务 %s 未指定 TimeoutSeconds，使用默认值 %d", task.ID, s.defaultTimeoutSec)
+	if task.ExpectedDuration < 0 {
+		return fmt.Errorf("task %s ExpectedDuration 不能为负", task.ID)
+	}
+	if task.TimeoutSeconds < 0 {
+		return fmt.Errorf("task %s legacy TimeoutSeconds 不能为负", task.ID)
+	}
+	if task.ExpectedDuration == 0 && task.TimeoutSeconds > 0 {
+		duration, err := expectedDurationFromLegacyTimeout(task.TimeoutSeconds)
+		if err != nil {
+			return fmt.Errorf("task %s legacy TimeoutSeconds 无效: %w", task.ID, err)
+		}
+		task.ExpectedDuration = duration
+		log.Printf("[公告板] 任务 %s 使用 legacy TimeoutSeconds=%d；已迁移为 ExpectedDuration，仅用于 SLO/兼容告警，不形成 deadline", task.ID, task.TimeoutSeconds)
+	}
+	if task.ExpectedDuration == 0 && s.defaultExpectedDurationSec > 0 {
+		duration, err := expectedDurationFromLegacyTimeout(s.defaultExpectedDurationSec)
+		if err != nil {
+			return fmt.Errorf("store 默认 ExpectedDuration 无效: %w", err)
+		}
+		task.ExpectedDuration = duration
+		log.Printf("[公告板] 任务 %s 未指定 ExpectedDuration，使用默认 SLO %v（不形成 deadline）", task.ID, duration)
 	}
 	if task.Results == nil {
 		task.Results = make(map[string]string)
@@ -303,6 +389,7 @@ func (s *MemoryTaskStore) PublishTask(task *model.Task) error {
 	published := trace.Event{
 		Kind:         trace.KindTaskPublished,
 		TaskID:       task.ID,
+		RunID:        string(task.RunID),
 		Description:  task.Description,
 		Dependencies: append([]string(nil), task.Dependencies...),
 		EventType:    task.EventType,
@@ -324,6 +411,50 @@ func (s *MemoryTaskStore) PublishTask(task *model.Task) error {
 	return nil
 }
 
+// validatePublishedTaskContracts 是所有发布方共享的四件套闸门。四件套全空是
+// 显式 legacy；任一新 Run 字段出现就必须 Run/Context/Progress 全部闭合，
+// 不能让遗漏发布方静默绕过 L2/L4/TaskOutcome。
+func validatePublishedTaskContracts(task *model.Task, now time.Time) error {
+	if task == nil {
+		return fmt.Errorf("发布 Task 不能为空")
+	}
+	if strings.TrimSpace(task.OutcomeRef) != "" {
+		return fmt.Errorf("新发布 Task %s 不得预置 outcome_ref", task.ID)
+	}
+	for i, input := range task.ContextInputs {
+		if !input.Kind.Valid() || strings.TrimSpace(input.SourceRef) == "" || strings.TrimSpace(input.Content) == "" {
+			return fmt.Errorf("Task %s context_inputs[%d] kind/source/content 无效", task.ID, i)
+		}
+	}
+	hasRunBinding := task.RunID != "" || task.RunContract != nil || task.RunPhase != "" ||
+		strings.TrimSpace(task.ContextPolicyRef) != "" || task.ProgressContract != nil
+	if !hasRunBinding {
+		if task.GraphDefinitionDigestVersion != "" {
+			return fmt.Errorf("authoring Graph Task %s 缺少 Run/Context/Progress binding", task.ID)
+		}
+		return nil
+	}
+	if task.RunID == "" || task.RunContract == nil || task.RunContract.RunID != task.RunID {
+		return fmt.Errorf("Task %s 的 RunID/RunContract binding 不完整", task.ID)
+	}
+	if !task.RunPhase.Valid() {
+		return fmt.Errorf("Task %s RunPhase=%q 无效", task.ID, task.RunPhase)
+	}
+	if err := task.RunContract.ValidatePhaseAt(now, task.RunPhase); err != nil {
+		return fmt.Errorf("Task %s RunContract 不可启动: %w", task.ID, err)
+	}
+	if strings.TrimSpace(task.ContextPolicyRef) == "" {
+		return fmt.Errorf("Task %s 缺少 ContextPolicyRef", task.ID)
+	}
+	if task.ProgressContract == nil {
+		return fmt.Errorf("Task %s 缺少 CompiledProgressContract", task.ID)
+	}
+	if err := task.ProgressContract.Validate(); err != nil {
+		return fmt.Errorf("Task %s ProgressContract 无效: %w", task.ID, err)
+	}
+	return nil
+}
+
 func (s *MemoryTaskStore) ClaimTask(agentID string, taskID string) error {
 	s.mu.Lock()
 	if err := s.quiesceErrorLocked("ClaimTask"); err != nil {
@@ -335,6 +466,15 @@ func (s *MemoryTaskStore) ClaimTask(agentID string, taskID string) error {
 	if !ok {
 		s.mu.Unlock()
 		return ErrTaskNotFound
+	}
+	if task.MailboxTargetAgentID != "" && task.MailboxTargetAgentID != agentID {
+		s.mu.Unlock()
+		return fmt.Errorf("%w: mailbox wake target=%s claimant=%s",
+			ErrTaskClaimBlocked, task.MailboxTargetAgentID, agentID)
+	}
+	if intentRef := s.terminalFences[taskID]; intentRef != "" {
+		s.mu.Unlock()
+		return fmt.Errorf("task %s 已被 TerminalIntent %s fence", taskID, intentRef)
 	}
 	// 认领双保险（与 QueryAvailable 同条件）：显式能力任务以及
 	// Graph/动态 Team 路由任务都要在落锁前重做控制面校验。
@@ -377,6 +517,8 @@ func (s *MemoryTaskStore) ClaimTask(agentID string, taskID string) error {
 		task.Status = model.TaskStatusProcessing
 		task.StartedAt = time.Now()
 		task.PendingSince = time.Time{}
+		task.AttemptNo++
+		task.AttemptID = fmt.Sprintf("%s/attempt-%d", task.ID, task.AttemptNo)
 	}
 	s.mu.Unlock()
 
@@ -397,6 +539,9 @@ func (s *MemoryTaskStore) FreezeTaskLease(taskID string, candidate *model.Execut
 	task, ok := s.tasks[taskID]
 	if !ok {
 		return nil, false, ErrTaskNotFound
+	}
+	if err := s.terminalFenceErrorLocked(taskID); err != nil {
+		return nil, false, err
 	}
 	if task.Lease != nil {
 		return cloneLease(task.Lease), false, nil
@@ -467,6 +612,147 @@ func leaseTracePayload(lease *model.ExecutionLease, cause string) *trace.LeasePa
 	}
 }
 
+// commitTerminalOutcomeLocked 在 Task 状态修改前调用。candidate 必须是完整
+// 候选快照；Hook 失败时 caller 原样返回，live Task 不得留下任何半状态。
+// Caller 必须持有 s.mu。
+func (s *MemoryTaskStore) commitTerminalOutcomeLocked(candidate *model.Task, cause, summary, reasonCode string) (string, error) {
+	intent := TerminalOutcomeIntent{
+		Task: cloneTask(candidate), ToolCalls: s.taskToolCallsLocked(candidate.ID),
+		Cause: cause, Summary: summary, ReasonCode: reasonCode,
+	}
+	if s.terminalOutcomeCoordinator != nil {
+		if existing := s.terminalFences[candidate.ID]; existing != "" {
+			return "", fmt.Errorf("task %s 已有 terminal intent %s 正在结算", candidate.ID, existing)
+		}
+		intentRef, err := s.terminalOutcomeCoordinator.PrepareTerminalIntent(intent)
+		if err != nil {
+			return "", fmt.Errorf("准备 durable TerminalIntent 失败: %w", err)
+		}
+		intentRef = strings.TrimSpace(intentRef)
+		if intentRef == "" {
+			return "", nil // coordinator 判定为 legacy
+		}
+		s.terminalFences[candidate.ID] = intentRef
+		liveBefore := s.tasks[candidate.ID]
+		expectedStatus := liveBefore.Status
+		expectedAttemptID, expectedAttemptNo := liveBefore.AttemptID, liveBefore.AttemptNo
+		expectedAgents := cloneStrings(liveBefore.Agents)
+		expectedResults := cloneStringMap(liveBefore.Results)
+		if s.cancelRegistry != nil {
+			s.cancelRegistry.CancelWithSource(candidate.ID, "terminal_intent")
+		}
+
+		// 严禁持 TaskStore 锁读取/等待 LoopStore。action settlement 与 Seal
+		// 在锁外完成；ToolCall/Artifact ledger 可在此期间写回。
+		s.mu.Unlock()
+		binding, settleErr := s.terminalOutcomeCoordinator.SettleTerminalIntent(intentRef)
+		s.mu.Lock()
+		if settleErr != nil {
+			return "", fmt.Errorf("TerminalIntent action/checkpoint settlement 失败: %w", settleErr)
+		}
+		live, ok := s.tasks[candidate.ID]
+		if !ok || live.Status != expectedStatus || live.AttemptID != expectedAttemptID || live.AttemptNo != expectedAttemptNo ||
+			!reflect.DeepEqual(live.Agents, expectedAgents) || !reflect.DeepEqual(live.Results, expectedResults) {
+			return "", fmt.Errorf("TerminalIntent %s 返回时 Task CAS 前提漂移", intentRef)
+		}
+		refreshed := intent
+		refreshed.ToolCalls = s.taskToolCallsLocked(candidate.ID)
+		refreshed.Task = cloneTask(candidate)
+		refreshed.Task.Artifacts = cloneStrings(live.Artifacts)
+		refreshed.Task.ArtifactMeta = cloneTask(live).ArtifactMeta
+		ref, commitErr := s.terminalOutcomeCoordinator.CommitTerminalOutcome(intentRef, refreshed, binding)
+		if commitErr != nil {
+			return "", fmt.Errorf("TerminalIntent 提交 TaskOutcome 失败: %w", commitErr)
+		}
+		delete(s.terminalFences, candidate.ID)
+		return strings.TrimSpace(ref), nil
+	}
+	if s.terminalOutcomeHook == nil {
+		return "", nil
+	}
+	ref, err := s.terminalOutcomeHook(intent)
+	if err != nil {
+		return "", fmt.Errorf("TaskOutcome durable commit 失败: %w", err)
+	}
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "", nil // hook 明确判定为 legacy
+	}
+	return ref, nil
+}
+
+// taskToolCallsLocked 返回稳定排序的完整调用事实。它与 QueryToolCalls("")
+// 同口径，但供终态 hook 在已持 Store 写锁时使用，避免自锁。
+func (s *MemoryTaskStore) taskToolCallsLocked(taskID string) []ToolCallRecord {
+	byTool := s.toolCalls[taskID]
+	total := 0
+	for _, records := range byTool {
+		total += len(records)
+	}
+	if total == 0 {
+		return nil
+	}
+	out := make([]ToolCallRecord, 0, total)
+	for _, records := range byTool {
+		for _, record := range records {
+			out = append(out, cloneToolCallRecord(record))
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].Timestamp.Equal(out[j].Timestamp) {
+			return out[i].Timestamp.Before(out[j].Timestamp)
+		}
+		return toolCallOrderingKey(out[i]) < toolCallOrderingKey(out[j])
+	})
+	return out
+}
+
+// ApplyRecoveredTaskOutcome 把已验证的 durable outcome 投影回公告板，不发
+// 终态事件，也不再次调用 hook。它修复 outcome fsync 与 Session 快照之间的
+// 崩溃窗口；不同引用或不同终态一律拒绝。
+func (s *MemoryTaskStore) ApplyRecoveredTaskOutcome(taskID, outcomeRef string, status model.TaskStatus, results map[string]string, reason string, committedAt time.Time) error {
+	taskID, outcomeRef = strings.TrimSpace(taskID), strings.TrimSpace(outcomeRef)
+	if taskID == "" || outcomeRef == "" || !model.IsTerminal(status) {
+		return fmt.Errorf("恢复 TaskOutcome 参数非法: task=%q ref=%q status=%q", taskID, outcomeRef, status)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return ErrTaskNotFound
+	}
+	if task.OutcomeRef != "" && task.OutcomeRef != outcomeRef {
+		return fmt.Errorf("task %s outcome_ref 冲突: existing=%s recovered=%s", taskID, task.OutcomeRef, outcomeRef)
+	}
+	if model.IsTerminal(task.Status) && task.Status != status {
+		return fmt.Errorf("task %s 终态冲突: snapshot=%s outcome=%s", taskID, task.Status, status)
+	}
+	task.OutcomeRef = outcomeRef
+	delete(s.terminalFences, taskID)
+	if results != nil {
+		task.Results = cloneStringMap(results)
+	}
+	if !model.IsTerminal(task.Status) {
+		task.Status = status
+		task.PendingSince = time.Time{}
+		task.StartedAt = time.Time{}
+		task.Agents = make([]string, 0)
+		if committedAt.IsZero() {
+			committedAt = time.Now().UTC()
+		}
+		task.CompletedAt = committedAt
+		if status != model.TaskStatusCompleted {
+			task.Error = reason
+		}
+		s.addTerminal(taskID)
+		if s.cancelRegistry != nil {
+			s.cancelRegistry.Cancel(taskID)
+		}
+		s.revokeLeaseLocked(task)
+	}
+	return nil
+}
+
 func (s *MemoryTaskStore) SubmitResult(agentID string, taskID string, result string) error {
 	return s.submitResultWithFields(agentID, taskID, result, nil, "SubmitResult")
 }
@@ -496,10 +782,39 @@ func (s *MemoryTaskStore) submitResultWithFields(agentID string, taskID string, 
 		return ErrTaskNotProcessing
 	}
 
-	if !s.removeAgent(task, agentID) {
+	found := false
+	for _, assigned := range task.Agents {
+		if assigned == agentID {
+			found = true
+			break
+		}
+	}
+	if !found {
 		s.mu.Unlock()
 		return ErrAgentNotInTask
 	}
+
+	becameTerminal := len(task.Agents) == 1
+	now := time.Now().UTC()
+	outcomeRef := ""
+	if becameTerminal {
+		candidate := cloneTask(task)
+		for key, value := range fields {
+			candidate.Results[key] = value
+		}
+		candidate.Results[agentID] = result
+		candidate.Status = model.TaskStatusCompleted
+		candidate.CompletedAt = now
+		candidate.Agents = make([]string, 0)
+		var err error
+		outcomeRef, err = s.commitTerminalOutcomeLocked(candidate, "agent_completed", result, "")
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
+	}
+
+	_ = s.removeAgent(task, agentID)
 
 	for key, value := range fields {
 		task.Results[key] = value
@@ -508,16 +823,15 @@ func (s *MemoryTaskStore) submitResultWithFields(agentID string, taskID string, 
 	task.Results[agentID] = result
 	outputLen := len(result)
 
-	becameTerminal := false
 	var revokedLease *model.ExecutionLease
-	if len(task.Agents) == 0 {
+	if becameTerminal {
 		task.Status = model.TaskStatusCompleted
-		task.CompletedAt = time.Now()
+		task.CompletedAt = now
+		task.OutcomeRef = outcomeRef
 		s.addTerminal(taskID)
 		if s.cancelRegistry != nil {
 			s.cancelRegistry.Remove(taskID)
 		}
-		becameTerminal = true
 		// V6 §4 H1：终态撤销执行租约（已撤销/无租约时返回 nil 不发事件）。
 		revokedLease = s.revokeLeaseLocked(task)
 	}
@@ -550,6 +864,9 @@ func (s *MemoryTaskStore) RecordResultField(taskID string, key string, value str
 	if !ok {
 		return ErrTaskNotFound
 	}
+	if err := s.terminalFenceErrorLocked(taskID); err != nil {
+		return err
+	}
 	if task.Status != model.TaskStatusProcessing {
 		return ErrTaskNotProcessing
 	}
@@ -568,6 +885,9 @@ func (s *MemoryTaskStore) RecordResultFields(taskID string, fields map[string]st
 	task, ok := s.tasks[taskID]
 	if !ok {
 		return ErrTaskNotFound
+	}
+	if err := s.terminalFenceErrorLocked(taskID); err != nil {
+		return err
 	}
 	if task.Status != model.TaskStatusProcessing {
 		return ErrTaskNotProcessing
@@ -599,6 +919,10 @@ func (s *MemoryTaskStore) transitionState(taskID string, from, to model.TaskStat
 		s.mu.Unlock()
 		return ErrTaskNotFound
 	}
+	if intentRef := s.terminalFences[taskID]; intentRef != "" {
+		s.mu.Unlock()
+		return fmt.Errorf("task %s 已被 TerminalIntent %s fence", taskID, intentRef)
+	}
 	if task.Status != from {
 		s.mu.Unlock()
 		return fmt.Errorf("task status is %s, expected %s", task.Status, from)
@@ -609,7 +933,38 @@ func (s *MemoryTaskStore) transitionState(taskID string, from, to model.TaskStat
 	}
 
 	var revokedLease *model.ExecutionLease
-	now := time.Now()
+	now := time.Now().UTC()
+	outcomeRef := ""
+	terminalReason := ""
+	terminalCause := "state_transition_" + string(to)
+	if model.IsTerminal(to) {
+		candidate := cloneTask(task)
+		candidate.Status = to
+		candidate.CompletedAt = now
+		candidate.PendingSince = time.Time{}
+		candidate.Agents = make([]string, 0)
+		if to != model.TaskStatusCompleted {
+			terminalReason = strings.TrimSpace(task.Error)
+			if to == model.TaskStatusCancelled && strings.TrimSpace(cancelSource) != "" {
+				terminalCause = strings.TrimSpace(cancelSource)
+				terminalReason = "Task cancelled by " + terminalCause
+			}
+			if terminalReason == "" {
+				terminalReason = "Task terminal status=" + string(to)
+			}
+			candidate.Error = terminalReason
+		}
+		summary := terminalReason
+		if summary == "" {
+			summary = "Task completed"
+		}
+		var err error
+		outcomeRef, err = s.commitTerminalOutcomeLocked(candidate, terminalCause, summary, terminalCause)
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
+	}
 	task.Status = to
 	if to == model.TaskStatusPending {
 		// A system-level requeue closes every old execution lease and starts a
@@ -630,6 +985,10 @@ func (s *MemoryTaskStore) transitionState(taskID string, from, to model.TaskStat
 
 	if model.IsTerminal(to) {
 		task.CompletedAt = now
+		task.OutcomeRef = outcomeRef
+		if outcomeRef != "" && to != model.TaskStatusCompleted && task.Error == "" {
+			task.Error = terminalReason
+		}
 		task.Agents = make([]string, 0) // 清理残留代理，防止已取消任务中的代理数据残留
 		s.addTerminal(taskID)
 		if s.cancelRegistry != nil {
@@ -667,6 +1026,10 @@ func (s *MemoryTaskStore) transitionState(taskID string, from, to model.TaskStat
 // FailTask 原子地将任务标记为失败，同时写入错误信息并移除代理。
 // 与 TransitionState 不同，此方法会设置 task.Error 字段，确保错误信息持久化到 Store。
 func (s *MemoryTaskStore) FailTask(agentID string, taskID string, reason string) error {
+	return s.FailTaskWithCause(agentID, taskID, reason, "agent_failure")
+}
+
+func (s *MemoryTaskStore) FailTaskWithCause(agentID string, taskID string, reason string, cause string) error {
 	s.mu.Lock()
 	if err := s.quiesceErrorLocked("FailTask"); err != nil {
 		s.mu.Unlock()
@@ -682,12 +1045,38 @@ func (s *MemoryTaskStore) FailTask(agentID string, taskID string, reason string)
 		s.mu.Unlock()
 		return ErrTaskNotProcessing
 	}
+	assigned := false
+	for _, current := range task.Agents {
+		if current == agentID {
+			assigned = true
+			break
+		}
+	}
+	if !assigned {
+		s.mu.Unlock()
+		return ErrAgentNotInTask
+	}
+	now := time.Now().UTC()
+	candidate := cloneTask(task)
+	candidate.Error = reason
+	candidate.Status = model.TaskStatusFailed
+	candidate.CompletedAt = now
+	candidate.Agents = make([]string, 0)
+	if strings.TrimSpace(cause) == "" {
+		cause = "agent_failure"
+	}
+	outcomeRef, err := s.commitTerminalOutcomeLocked(candidate, cause, reason, cause)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
 
-	s.removeAgent(task, agentID)
+	_ = s.removeAgent(task, agentID)
 
 	task.Error = reason
 	task.Status = model.TaskStatusFailed
-	task.CompletedAt = time.Now()
+	task.CompletedAt = now
+	task.OutcomeRef = outcomeRef
 	task.Agents = make([]string, 0)
 	s.addTerminal(taskID)
 	if s.cancelRegistry != nil {
@@ -724,10 +1113,22 @@ func (s *MemoryTaskStore) FailTaskBySystem(taskID string, reason string) error {
 		s.mu.Unlock()
 		return ErrTaskNotProcessing
 	}
+	now := time.Now().UTC()
+	candidate := cloneTask(task)
+	candidate.Error = reason
+	candidate.Status = model.TaskStatusFailed
+	candidate.CompletedAt = now
+	candidate.Agents = make([]string, 0)
+	outcomeRef, err := s.commitTerminalOutcomeLocked(candidate, "system_failure", reason, "system_failure")
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
 
 	task.Error = reason
 	task.Status = model.TaskStatusFailed
-	task.CompletedAt = time.Now()
+	task.CompletedAt = now
+	task.OutcomeRef = outcomeRef
 	task.Agents = make([]string, 0)
 	s.addTerminal(taskID)
 	if s.cancelRegistry != nil {
@@ -741,6 +1142,7 @@ func (s *MemoryTaskStore) FailTaskBySystem(taskID string, reason string) error {
 	trace.Emit(trace.Event{
 		Kind:   trace.KindTaskFailed,
 		TaskID: taskID,
+		RunID:  string(task.RunID),
 		Reason: reason,
 		Transition: &trace.Transition{
 			PrevStatus: string(model.TaskStatusProcessing),
@@ -770,11 +1172,24 @@ func (s *MemoryTaskStore) BlockTaskBySystem(taskID string, reason string) error 
 		s.mu.Unlock()
 		return ErrTaskNotPending
 	}
+	now := time.Now().UTC()
+	candidate := cloneTask(task)
+	candidate.Error = reason
+	candidate.Status = model.TaskStatusBlocked
+	candidate.PendingSince = time.Time{}
+	candidate.CompletedAt = now
+	candidate.Agents = make([]string, 0)
+	outcomeRef, err := s.commitTerminalOutcomeLocked(candidate, "system_blocked", reason, "system_blocked")
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
 
 	task.Error = reason
 	task.Status = model.TaskStatusBlocked
 	task.PendingSince = time.Time{}
-	task.CompletedAt = time.Now()
+	task.CompletedAt = now
+	task.OutcomeRef = outcomeRef
 	task.Agents = make([]string, 0)
 	s.addTerminal(taskID)
 	if s.cancelRegistry != nil {
@@ -789,6 +1204,7 @@ func (s *MemoryTaskStore) BlockTaskBySystem(taskID string, reason string) error 
 	trace.Emit(trace.Event{
 		Kind:   trace.KindTaskBlocked,
 		TaskID: taskID,
+		RunID:  string(task.RunID),
 		Reason: reason,
 		Transition: &trace.Transition{
 			PrevStatus: string(model.TaskStatusPending),
@@ -849,6 +1265,29 @@ func (s *MemoryTaskStore) blockProcessingTask(taskID string, agentID string, res
 			s.mu.Unlock()
 			return ErrAgentNotInTask
 		}
+	}
+	now := time.Now().UTC()
+	candidate := cloneTask(task)
+	if withResult {
+		for key, value := range fields {
+			candidate.Results[key] = value
+		}
+		candidate.Results[agentID] = result
+	}
+	candidate.Error = reason
+	candidate.Status = model.TaskStatusBlocked
+	candidate.CompletedAt = now
+	candidate.Agents = make([]string, 0)
+	summary := result
+	if strings.TrimSpace(summary) == "" {
+		summary = reason
+	}
+	outcomeRef, err := s.commitTerminalOutcomeLocked(candidate, cause, summary, cause)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	if withResult {
 		for key, value := range fields {
 			task.Results[key] = value
 		}
@@ -858,7 +1297,8 @@ func (s *MemoryTaskStore) blockProcessingTask(taskID string, agentID string, res
 
 	task.Error = reason
 	task.Status = model.TaskStatusBlocked
-	task.CompletedAt = time.Now()
+	task.CompletedAt = now
+	task.OutcomeRef = outcomeRef
 	task.Agents = make([]string, 0)
 	s.addTerminal(taskID)
 	if s.cancelRegistry != nil {
@@ -873,6 +1313,7 @@ func (s *MemoryTaskStore) blockProcessingTask(taskID string, agentID string, res
 	trace.Emit(trace.Event{
 		Kind:   trace.KindTaskBlocked,
 		TaskID: taskID,
+		RunID:  string(task.RunID),
 		Reason: reason,
 		Transition: &trace.Transition{
 			PrevStatus: string(model.TaskStatusProcessing),
@@ -894,6 +1335,10 @@ func (s *MemoryTaskStore) RetryRollback(agentID string, taskID string, reason st
 	if !ok {
 		s.mu.Unlock()
 		return ErrTaskNotFound
+	}
+	if intentRef := s.terminalFences[taskID]; intentRef != "" {
+		s.mu.Unlock()
+		return fmt.Errorf("task %s 已被 TerminalIntent %s fence", taskID, intentRef)
 	}
 	if task.Status != model.TaskStatusProcessing {
 		s.mu.Unlock()
@@ -956,6 +1401,10 @@ func (s *MemoryTaskStore) AppendOutput(agentID, taskID, chunk string) error {
 		s.mu.Unlock()
 		return ErrTaskNotFound
 	}
+	if err := s.terminalFenceErrorLocked(taskID); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	if task.Status != model.TaskStatusProcessing {
 		s.mu.Unlock()
 		return ErrTaskNotProcessing
@@ -1011,6 +1460,9 @@ func (s *MemoryTaskStore) QueryAvailable(eventType, agentID string) ([]*model.Ta
 		// 此前用 `eventType != "" && ...` 导致 worker 会顺手接走 explore 任务，
 		// 在 explore 任务因 expected_artifacts 失败重试时引发跨代理类型迁移。
 		if task.EventType != eventType {
+			continue
+		}
+		if task.MailboxTargetAgentID != "" && task.MailboxTargetAgentID != agentID {
 			continue
 		}
 		// 与 ClaimTask 共用同一控制面检查：能力越界或路由 owner
@@ -1493,62 +1945,46 @@ func (s *MemoryTaskStore) emitHistory(eventType string, payload map[string]any) 
 // 终态，返回实际取消的任务数。blocked 已是终态不动；completed / failed /
 // cancelled 不动。
 //
-// 单任务语义与 TransitionStateWithCancelSource 对齐，差别仅在锁内一次性
-// 遍历（不为每个任务重新取锁）：terminal 集合登记（addTerminal，含依赖感知
-// FIFO 淘汰）、cancelRegistry.CancelWithSource、终态撤销执行租约；解锁后
-// 逐任务补发 execution_lease_revoked trace 与 EventTaskCancelled 公告板事件，
-// 并按任务 emit task_cancelled history。来源集合只含 pending / processing，
-// 两者向 cancelled 均为合法迁移，无需再经 IsValidTransition 校验。
+// 先在读锁内冻结排序后的 live task IDs，再逐个复用单任务两阶段终态事务。
+// 禁止在 map range 期间调用会解锁的 terminal coordinator；并发状态变化由
+// 每个 Task 的 CAS/TerminalIntent fence 独立裁决。
 //
 // 用途：/new force——会话快照落盘后强制终止当前全部运行时任务。
-func (s *MemoryTaskStore) CancelAllNonTerminal(cancelSource string) int {
-	s.mu.Lock()
+func (s *MemoryTaskStore) CancelAllNonTerminal(cancelSource string) (int, error) {
+	s.mu.RLock()
 	if s.quiesced {
-		// 签名无 error 无法向上传递围栏拒绝：静默窗口内本就不该走到这里
-		// （冻结协议用 cancelRegistry.Reset()，/new force 不进静默窗口），
-		// 记 WARNING 并返回 0，绝不产生迁移与事件。
-		s.mu.Unlock()
-		log.Printf("[公告板] WARNING: 静默窗口内拒绝批量终止（CancelAllNonTerminal），返回 0")
-		return 0
+		s.mu.RUnlock()
+		return 0, ErrStoreQuiesced
 	}
-	type cancelledTask struct {
-		id           string
-		revokedLease *model.ExecutionLease
-	}
-
-	now := time.Now()
-	cancelled := make([]cancelledTask, 0)
+	ids := make([]string, 0)
 	for taskID, task := range s.tasks {
-		if task.Status != model.TaskStatusPending && task.Status != model.TaskStatusProcessing {
+		if task.Status == model.TaskStatusPending || task.Status == model.TaskStatusProcessing {
+			ids = append(ids, taskID)
+		}
+	}
+	s.mu.RUnlock()
+	sort.Strings(ids)
+
+	cancelled := 0
+	var errs []error
+	for _, taskID := range ids {
+		current, err := s.GetTask(taskID)
+		if err != nil || current == nil || model.IsTerminal(current.Status) {
+			if err != nil {
+				errs = append(errs, err)
+			}
 			continue
 		}
-		task.Status = model.TaskStatusCancelled
-		task.PendingSince = time.Time{}
-		task.CompletedAt = now
-		task.Agents = make([]string, 0) // 清理残留代理，与单任务终态路径一致
-		s.addTerminal(taskID)
-		if s.cancelRegistry != nil {
-			if cancelSource != "" {
-				s.cancelRegistry.CancelWithSource(taskID, cancelSource)
-			} else {
-				s.cancelRegistry.Cancel(taskID)
-			}
+		if err := s.TransitionStateWithCancelSource(taskID, current.Status, model.TaskStatusCancelled, cancelSource); err != nil {
+			errs = append(errs, fmt.Errorf("task %s: %w", taskID, err))
+			continue
 		}
-		// V6 §4 H1：终态撤销执行租约（已撤销/无租约时返回 nil 不发事件）。
-		cancelled = append(cancelled, cancelledTask{id: taskID, revokedLease: s.revokeLeaseLocked(task)})
-	}
-	s.mu.Unlock()
-
-	// 与单任务终态路径同纪律：租约撤销事件与公告板事件都在锁外补发。
-	for _, ct := range cancelled {
-		emitLeaseRevoked(ct.id, ct.revokedLease, "terminal:"+string(model.TaskStatusCancelled))
-		s.sendEvent(model.Event{Type: model.EventTaskCancelled, TaskID: ct.id})
+		cancelled++
 		s.emitHistory(session.HistEventTaskCancelled, map[string]any{
-			"task_id":       ct.id,
-			"cancel_source": cancelSource,
+			"task_id": taskID, "cancel_source": cancelSource,
 		})
 	}
-	return len(cancelled)
+	return cancelled, errors.Join(errs...)
 }
 
 // PurgeAll 锁内清空任务表与全部按任务索引的派生状态——toolCalls 账本、
@@ -1565,6 +2001,7 @@ func (s *MemoryTaskStore) PurgeAll() {
 	s.tasks = make(map[string]*model.Task)
 	s.completed = make([]string, 0)
 	s.toolCalls = make(map[string]map[string][]ToolCallRecord)
+	s.terminalFences = make(map[string]string)
 	// 与其他 Store 方法同锁序（Store 锁内调用 registry，registry 不回调 Store）。
 	if s.cancelRegistry != nil {
 		s.cancelRegistry.Reset()
@@ -1583,46 +2020,59 @@ func (s *MemoryTaskStore) ExportSnapshot() []session.TaskSnapshot {
 	var snaps []session.TaskSnapshot
 	for _, task := range s.tasks {
 		snap := session.TaskSnapshot{
-			ID:                task.ID,
-			Description:       task.Description,
-			Priority:          task.Priority,
-			Dependencies:      copyStrings(task.Dependencies),
-			Status:            string(task.Status),
-			Agents:            copyStrings(task.Agents),
-			MaxConcurrency:    task.MaxConcurrency,
-			Results:           copyStringMap(task.Results),
-			Error:             task.Error,
-			RetryCount:        task.RetryCount,
-			RetryReasons:      copyStrings(task.RetryReasons),
-			TimeoutSeconds:    task.TimeoutSeconds,
-			EventSource:       task.EventSource,
-			ParentTaskID:      task.ParentTaskID,
-			ReplyToAgentID:    task.ReplyToAgentID,
-			BatchID:           task.BatchID,
-			EventType:         task.EventType,
-			TriggerRule:       task.TriggerRule,
-			SystemPrompt:      task.SystemPrompt,
-			Depth:             task.Depth,
-			Artifacts:         copyStrings(task.Artifacts),
-			ExpectedArtifacts: copyStrings(task.ExpectedArtifacts),
-			ArtifactMeta:      exportArtifactMeta(task.ArtifactMeta),
-			MailChainDepth:    task.MailChainDepth,
-			SchedulerBatch:    copyStrings(task.SchedulerBatch),
-			LastResponse:      task.LastResponse,
-			PartialOutput:     task.PartialOutput,
-			CreatedAt:         formatTime(task.CreatedAt),
-			PendingSince:      formatTime(task.PendingSince),
-			StartedAt:         formatTime(task.StartedAt),
-			CompletedAt:       formatTime(task.CompletedAt),
-			GraphID:           task.GraphID,
-			NodeID:            task.NodeID,
-			ActivationID:      task.ActivationID,
-			GraphNodeKind:     task.GraphNodeKind,
-			RouteScope:        task.RouteScope,
-			Capability:        exportCapability(task.Capability),
-			Lease:             exportLease(task.Lease),
-			LastHistory:       append([]byte(nil), task.LastHistory...),
-			ToolCalls:         exportToolCallSnapshots(s.toolCalls[task.ID]),
+			ID:                           task.ID,
+			RunID:                        task.RunID,
+			RunContract:                  cloneRunContract(task.RunContract),
+			RunPhase:                     task.RunPhase,
+			ProgressContract:             cloneProgressContract(task.ProgressContract),
+			ContextPolicyRef:             task.ContextPolicyRef,
+			AttemptID:                    task.AttemptID,
+			AttemptNo:                    task.AttemptNo,
+			Description:                  task.Description,
+			ContextInputs:                exportTaskContextInputs(task.ContextInputs),
+			Priority:                     task.Priority,
+			Dependencies:                 copyStrings(task.Dependencies),
+			Status:                       string(task.Status),
+			Agents:                       copyStrings(task.Agents),
+			MaxConcurrency:               task.MaxConcurrency,
+			Results:                      copyStringMap(task.Results),
+			Error:                        task.Error,
+			RetryCount:                   task.RetryCount,
+			RetryReasons:                 copyStrings(task.RetryReasons),
+			ExpectedDuration:             task.ExpectedDuration,
+			TimeoutSeconds:               task.TimeoutSeconds,
+			EventSource:                  task.EventSource,
+			ParentTaskID:                 task.ParentTaskID,
+			ReplyToAgentID:               task.ReplyToAgentID,
+			BatchID:                      task.BatchID,
+			EventType:                    task.EventType,
+			TriggerRule:                  task.TriggerRule,
+			SystemPrompt:                 task.SystemPrompt,
+			Depth:                        task.Depth,
+			Artifacts:                    copyStrings(task.Artifacts),
+			ExpectedArtifacts:            copyStrings(task.ExpectedArtifacts),
+			ArtifactMeta:                 exportArtifactMeta(task.ArtifactMeta),
+			MailChainDepth:               task.MailChainDepth,
+			MailboxTargetAgentID:         task.MailboxTargetAgentID,
+			MailboxSessionID:             task.MailboxSessionID,
+			SchedulerBatch:               copyStrings(task.SchedulerBatch),
+			LastResponse:                 task.LastResponse,
+			PartialOutput:                task.PartialOutput,
+			CreatedAt:                    formatTime(task.CreatedAt),
+			PendingSince:                 formatTime(task.PendingSince),
+			StartedAt:                    formatTime(task.StartedAt),
+			CompletedAt:                  formatTime(task.CompletedAt),
+			GraphID:                      task.GraphID,
+			NodeID:                       task.NodeID,
+			ActivationID:                 task.ActivationID,
+			GraphNodeKind:                task.GraphNodeKind,
+			OutcomeRef:                   task.OutcomeRef,
+			GraphDefinitionDigestVersion: task.GraphDefinitionDigestVersion,
+			RouteScope:                   task.RouteScope,
+			Capability:                   exportCapability(task.Capability),
+			Lease:                        exportLease(task.Lease),
+			LastHistory:                  append([]byte(nil), task.LastHistory...),
+			ToolCalls:                    exportToolCallSnapshots(s.toolCalls[task.ID]),
 		}
 		snaps = append(snaps, snap)
 	}
@@ -1650,6 +2100,7 @@ func (s *MemoryTaskStore) importSnapshotLocked(tasks []session.TaskSnapshot) err
 	s.tasks = make(map[string]*model.Task)
 	s.completed = make([]string, 0)
 	s.toolCalls = make(map[string]map[string][]ToolCallRecord)
+	s.terminalFences = make(map[string]string)
 
 	type terminalEntry struct {
 		id          string
@@ -1675,6 +2126,10 @@ func (s *MemoryTaskStore) importSnapshotLocked(tasks []session.TaskSnapshot) err
 		toolCalls, err := importToolCallSnapshots(snap.ToolCalls)
 		if err != nil {
 			return fmt.Errorf("parse tool calls for task %s: %w", snap.ID, err)
+		}
+		expectedDuration, err := expectedDurationFromSnapshot(snap)
+		if err != nil {
+			return fmt.Errorf("parse expected duration for task %s: %w", snap.ID, err)
 		}
 
 		status := model.TaskStatus(snap.Status)
@@ -1715,45 +2170,58 @@ func (s *MemoryTaskStore) importSnapshotLocked(tasks []session.TaskSnapshot) err
 		}
 
 		task := &model.Task{
-			ID:                snap.ID,
-			Description:       snap.Description,
-			Priority:          snap.Priority,
-			Dependencies:      copyStrings(snap.Dependencies),
-			Status:            status,
-			Agents:            agents,
-			MaxConcurrency:    snap.MaxConcurrency,
-			Results:           copyStringMap(snap.Results),
-			Error:             taskError,
-			RetryCount:        snap.RetryCount,
-			RetryReasons:      copyStrings(snap.RetryReasons),
-			TimeoutSeconds:    snap.TimeoutSeconds,
-			EventSource:       snap.EventSource,
-			ParentTaskID:      snap.ParentTaskID,
-			ReplyToAgentID:    snap.ReplyToAgentID,
-			BatchID:           snap.BatchID,
-			EventType:         snap.EventType,
-			TriggerRule:       snap.TriggerRule,
-			SystemPrompt:      snap.SystemPrompt,
-			Depth:             snap.Depth,
-			Artifacts:         copyStrings(snap.Artifacts),
-			ExpectedArtifacts: copyStrings(snap.ExpectedArtifacts),
-			ArtifactMeta:      importArtifactMeta(snap.ArtifactMeta),
-			MailChainDepth:    snap.MailChainDepth,
-			SchedulerBatch:    copyStrings(snap.SchedulerBatch),
-			LastResponse:      snap.LastResponse,
-			PartialOutput:     snap.PartialOutput,
-			CreatedAt:         createdAt,
-			PendingSince:      pendingSince,
-			StartedAt:         startedAt,
-			CompletedAt:       completedAt,
-			GraphID:           snap.GraphID,
-			NodeID:            snap.NodeID,
-			ActivationID:      snap.ActivationID,
-			GraphNodeKind:     snap.GraphNodeKind,
-			RouteScope:        snap.RouteScope,
-			Capability:        importCapability(snap.Capability),
-			Lease:             importLease(snap.Lease),
-			LastHistory:       append([]byte(nil), snap.LastHistory...),
+			ID:                           snap.ID,
+			RunID:                        snap.RunID,
+			RunContract:                  cloneRunContract(snap.RunContract),
+			RunPhase:                     snap.RunPhase,
+			ProgressContract:             cloneProgressContract(snap.ProgressContract),
+			ContextPolicyRef:             snap.ContextPolicyRef,
+			AttemptID:                    snap.AttemptID,
+			AttemptNo:                    snap.AttemptNo,
+			Description:                  snap.Description,
+			ContextInputs:                importTaskContextInputs(snap.ContextInputs),
+			Priority:                     snap.Priority,
+			Dependencies:                 copyStrings(snap.Dependencies),
+			Status:                       status,
+			Agents:                       agents,
+			MaxConcurrency:               snap.MaxConcurrency,
+			Results:                      copyStringMap(snap.Results),
+			Error:                        taskError,
+			RetryCount:                   snap.RetryCount,
+			RetryReasons:                 copyStrings(snap.RetryReasons),
+			ExpectedDuration:             expectedDuration,
+			TimeoutSeconds:               snap.TimeoutSeconds,
+			EventSource:                  snap.EventSource,
+			ParentTaskID:                 snap.ParentTaskID,
+			ReplyToAgentID:               snap.ReplyToAgentID,
+			BatchID:                      snap.BatchID,
+			EventType:                    snap.EventType,
+			TriggerRule:                  snap.TriggerRule,
+			SystemPrompt:                 snap.SystemPrompt,
+			Depth:                        snap.Depth,
+			Artifacts:                    copyStrings(snap.Artifacts),
+			ExpectedArtifacts:            copyStrings(snap.ExpectedArtifacts),
+			ArtifactMeta:                 importArtifactMeta(snap.ArtifactMeta),
+			MailChainDepth:               snap.MailChainDepth,
+			MailboxTargetAgentID:         snap.MailboxTargetAgentID,
+			MailboxSessionID:             snap.MailboxSessionID,
+			SchedulerBatch:               copyStrings(snap.SchedulerBatch),
+			LastResponse:                 snap.LastResponse,
+			PartialOutput:                snap.PartialOutput,
+			CreatedAt:                    createdAt,
+			PendingSince:                 pendingSince,
+			StartedAt:                    startedAt,
+			CompletedAt:                  completedAt,
+			GraphID:                      snap.GraphID,
+			NodeID:                       snap.NodeID,
+			ActivationID:                 snap.ActivationID,
+			GraphNodeKind:                snap.GraphNodeKind,
+			OutcomeRef:                   snap.OutcomeRef,
+			GraphDefinitionDigestVersion: snap.GraphDefinitionDigestVersion,
+			RouteScope:                   snap.RouteScope,
+			Capability:                   importCapability(snap.Capability),
+			Lease:                        importLease(snap.Lease),
+			LastHistory:                  append([]byte(nil), snap.LastHistory...),
 		}
 		// LeaseSnapshot 不冗余存 TaskID（与所属任务同一快照条目），导入时回填。
 		if task.Lease != nil {
@@ -1791,6 +2259,28 @@ func (s *MemoryTaskStore) importSnapshotLocked(tasks []session.TaskSnapshot) err
 	}
 	s.evictSafe()
 	return nil
+}
+
+func exportTaskContextInputs(input []model.TaskContextInput) []session.TaskContextInputSnapshot {
+	if input == nil {
+		return nil
+	}
+	out := make([]session.TaskContextInputSnapshot, len(input))
+	for i, item := range input {
+		out[i] = session.TaskContextInputSnapshot{Kind: string(item.Kind), SourceRef: item.SourceRef, Content: item.Content}
+	}
+	return out
+}
+
+func importTaskContextInputs(input []session.TaskContextInputSnapshot) []model.TaskContextInput {
+	if input == nil {
+		return nil
+	}
+	out := make([]model.TaskContextInput, len(input))
+	for i, item := range input {
+		out[i] = model.TaskContextInput{Kind: model.TaskContextInputKind(item.Kind), SourceRef: item.SourceRef, Content: item.Content}
+	}
+	return out
 }
 
 // ReplaceSnapshot 用给定快照整体替换公告板（session 解冻时的原位替换原语）。
@@ -2042,6 +2532,10 @@ func exportToolCallSnapshots(byTool map[string][]ToolCallRecord) []session.ToolC
 		}
 		out[i] = session.ToolCallSnapshot{
 			Timestamp: timestamp,
+			RunID:     record.RunID,
+			AttemptID: record.AttemptID,
+			TurnID:    record.TurnID,
+			ActionID:  record.ActionID,
 			CallID:    record.CallID,
 			AgentID:   record.AgentID,
 			ToolName:  record.ToolName,
@@ -2072,6 +2566,10 @@ func importToolCallSnapshots(snapshots []session.ToolCallSnapshot) (map[string][
 		}
 		record := ToolCallRecord{
 			Timestamp: timestamp,
+			RunID:     snapshot.RunID,
+			AttemptID: snapshot.AttemptID,
+			TurnID:    snapshot.TurnID,
+			ActionID:  snapshot.ActionID,
 			CallID:    snapshot.CallID,
 			AgentID:   snapshot.AgentID,
 			ToolName:  snapshot.ToolName,

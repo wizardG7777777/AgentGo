@@ -1,6 +1,10 @@
 package store
 
-import "agentgo/internal/model"
+import (
+	"agentgo/internal/loopcontract"
+	"agentgo/internal/model"
+	"agentgo/internal/runcontract"
+)
 
 // cloneTask returns a deep-enough immutable snapshot for all mutable fields on
 // model.Task. Store read APIs must never expose their internal Task pointers.
@@ -9,7 +13,10 @@ func cloneTask(src *model.Task) *model.Task {
 		return nil
 	}
 	dst := *src
+	dst.RunContract = cloneRunContract(src.RunContract)
+	dst.ProgressContract = cloneProgressContract(src.ProgressContract)
 	dst.Dependencies = cloneStrings(src.Dependencies)
+	dst.ContextInputs = cloneTaskContextInputs(src.ContextInputs)
 	dst.Agents = cloneStrings(src.Agents)
 	dst.RetryReasons = cloneStrings(src.RetryReasons)
 	dst.LastHistory = append([]byte(nil), src.LastHistory...)
@@ -45,6 +52,13 @@ func cloneTask(src *model.Task) *model.Task {
 	return &dst
 }
 
+func cloneTaskContextInputs(src []model.TaskContextInput) []model.TaskContextInput {
+	if src == nil {
+		return nil
+	}
+	return append([]model.TaskContextInput(nil), src...)
+}
+
 // cloneLease 深拷贝执行租约（V6 §4 H1）。克隆丢失会让读路径上的任务静默
 // 退化为「未冻结」，重认领时重复 emit frozen 事件并丢失 Revoked 状态。
 func cloneLease(src *model.ExecutionLease) *model.ExecutionLease {
@@ -73,6 +87,25 @@ func cloneStringMap(src map[string]string) map[string]string {
 		dst[k] = v
 	}
 	return dst
+}
+
+func cloneRunContract(src *runcontract.RunContract) *runcontract.RunContract {
+	if src == nil {
+		return nil
+	}
+	dst := *src
+	return &dst
+}
+
+func cloneProgressContract(src *loopcontract.CompiledProgressContract) *loopcontract.CompiledProgressContract {
+	if src == nil {
+		return nil
+	}
+	dst := *src
+	dst.Deliverables = append([]loopcontract.DeliverableRule(nil), src.Deliverables...)
+	dst.VerificationTargets = append([]loopcontract.VerificationRule(nil), src.VerificationTargets...)
+	dst.AcceptedSignals = append([]loopcontract.ProgressSignalRule(nil), src.AcceptedSignals...)
+	return &dst
 }
 
 func cloneToolArgs(src map[string]any) map[string]any {

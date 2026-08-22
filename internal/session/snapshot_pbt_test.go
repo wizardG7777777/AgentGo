@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"pgregory.net/rapid"
 )
@@ -115,6 +116,7 @@ func genTaskSnapshot(t *rapid.T, idx int) TaskSnapshot {
 		Results:           results,
 		RetryCount:        rapid.IntRange(0, 5).Draw(t, labelIdx("retryCount", idx)),
 		RetryReasons:      retryReasons,
+		ExpectedDuration:  time.Duration(rapid.IntRange(10, 600).Draw(t, labelIdx("expectedDuration", idx))) * time.Second,
 		TimeoutSeconds:    rapid.IntRange(10, 600).Draw(t, labelIdx("timeout", idx)),
 		Depth:             rapid.IntRange(0, 5).Draw(t, labelIdx("depth", idx)),
 		Artifacts:         artifacts,
