@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"agentgo/internal/invocation"
 )
 
 // openaiResponse 构造 OpenAI 格式的响应 JSON。
@@ -86,6 +88,42 @@ func TestSDKClient_ReasoningEffortIsSent(t *testing.T) {
 	}
 	if got := body["reasoning_effort"]; got != "max" {
 		t.Fatalf("reasoning_effort = %#v, want max", got)
+	}
+}
+
+func TestSDKClient_ContextBindingRequiresToolCall(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(openaiResponseWithFinish("", []map[string]any{{
+			"id": "call-1", "type": "function",
+			"function": map[string]any{"name": "create_graph_draft", "arguments": `{}`},
+		}}, "tool_calls"))
+	}))
+	defer server.Close()
+
+	binding := invocation.ContextBinding{
+		Schema: invocation.ContextBindingSchemaV1, InvocationID: "invocation-tool-required",
+		ContextSnapshotID: "snapshot-1", ContextPolicyID: "context:default/v5",
+		ToolRouterSnapshotID: "router-1", EncodedRequestDigest: "sha256:request",
+		OutputBudget: DefaultOutputBudget(), ToolChoice: invocation.ToolChoice{Mode: invocation.ToolChoiceRequired},
+	}
+	ctx, err := invocation.WithContextBinding(context.Background(), binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := NewSDKClient(server.URL, "test-key", "test-model", "", 30*time.Second)
+	_, err = client.Chat(ctx, []Message{{Role: "user", Content: "create graph"}}, []ToolDef{{
+		Name: "create_graph_draft", Parameters: map[string]any{"type": "object"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body["tool_choice"] != "required" {
+		t.Fatalf("ContextBinding required 未进入 provider wire: %+v", body["tool_choice"])
 	}
 }
 
