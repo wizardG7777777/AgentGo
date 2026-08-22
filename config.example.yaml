@@ -30,6 +30,7 @@ tool_profiles:
     - list_dir
     - grep_search
     - glob_search
+    - read_content_ref
     - write_file
     - edit_file
     - run_shell
@@ -46,6 +47,7 @@ tool_profiles:
     - list_dir
     - grep_search
     - glob_search
+    - read_content_ref
     - web_search
     - web_fetch
     - send_message
@@ -57,6 +59,7 @@ tool_profiles:
     - list_dir
     - grep_search
     - glob_search
+    - read_content_ref
     - web_search
     - web_fetch
     - submit_task_result             # acceptance runner 经 verdict=pass|fixable|failed 提交结论
@@ -67,7 +70,6 @@ tool_profiles:
 # ============================================================
 scheduler:
   model: gpt-4o                              # 可选，缺省回落 llm.default_model
-  enforce_compact_token_threshold: 80000     # 可选；累计 prompt token 的一次性压缩阈值，省略/0 = 80000
 
 # ============================================================
 # 两轴工作模式（可选；两轴正交可组合，字段为空 = 该轴取默认）
@@ -119,7 +121,6 @@ agents:
     model: gpt-4o                  # 覆盖 llm.default_model
     system_prompt_file: prompts/worker.md
     task_max_retries: 3
-    enforce_compact_token_threshold: 4000
     # description 给 scheduler 看的一句话角色说明，影响任务派发选择
     description: |
       通用工作代理。能读写文件、跑 shell、检索网络；
@@ -132,7 +133,6 @@ agents:
     model: gpt-4o-mini             # 调查类可用更便宜模型
     system_prompt_file: prompts/explorer.md
     task_max_retries: 3
-    enforce_compact_token_threshold: 3000
     description: |
       广度优先调研代理。不写文件，仅返回 Markdown 文字回复。
 
@@ -143,7 +143,6 @@ agents:
     model: gpt-4o-mini
     system_prompt_file: prompts/program_verifier.md
     task_max_retries: 2
-    enforce_compact_token_threshold: 3000
     description: |
       正式验收代理（Graph acceptance 节点 runner）。读取交付物、消费上游
       Result/Evidence，并通过 submit_task_result.verdict 提交 pass/fixable/failed；
@@ -158,6 +157,7 @@ project_root: "."
 infra:
   watchdog:
     interval_sec: 30
+    progress_heartbeat_grace_sec: 120  # 新 Loop checkpoint 超过此窗口未更新时，仅发布 typed liveness observation
     pending_alert_grace_sec: 300  # 有合法 route 但长期未领取：只告警，不终止任务
     unroutable_grace_sec: 300     # 无兼容 route 持续超过该时间：标记 blocked
   mail_notifier:
@@ -167,7 +167,7 @@ infra:
     event_channel_buffer: 64
     fifo_limit: 100
     default_concurrency: 1       # 任务级认领上限的兜底值（仅影响未显式指定的非 plan 发布路径）；>1 会让多个 Agent 重复执行同一任务
-    default_timeout_sec: 3600      # 任务级预期执行时长（秒）；超过由 watchdog 发超时告警（只告警，不杀死任务）
+    default_timeout_sec: 3600      # legacy 键：只填充 Task.ExpectedDuration（SLO/UI），不形成 deadline；新 Loop 由 RunContract 控制
   roster:
     wait_timeout_sec: 30
 
@@ -193,7 +193,7 @@ infra:
 # ============================================================
 # 启动期可观测性
 # ============================================================
-startup_probe: "tcp"               # "tcp"=DialTimeout 探测; "off"=跳过
+startup_probe: "tool"              # "tool"=TCP+真实 function call; "tcp"=仅连通; "off"=跳过
 startup_probe_timeout_sec: 5
 startup_probe_failure_action: "warn"  # "warn"=仅警告继续; "exit"=失败硬退出
 
@@ -257,7 +257,6 @@ session_snapshot_interval_sec: 30 # 运行期完整快照间隔，限制崩溃�
 #       profile: worker_standard
 #       system_prompt_file: prompts/worker.md
 #       task_max_retries: 3
-#       enforce_compact_token_threshold: 4000
 #     model: gpt-4o
 #
 #   - kind: worker-deep

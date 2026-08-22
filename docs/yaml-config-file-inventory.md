@@ -56,7 +56,6 @@ tool_profiles:
 
 scheduler:
   model: "deepseek-reasoner"
-  enforce_compact_token_threshold: 80000
 
 agents:
   - kind: worker
@@ -75,16 +74,16 @@ agents:
 
 project_root: "."
 infra:
-  watchdog:    { interval_sec: 30 }
+  watchdog:    { interval_sec: 30, progress_heartbeat_grace_sec: 120 }
   mail_notifier: { enabled: true, interval_sec: 60 }
   store:
     event_channel_buffer: 256
     fifo_limit: 100
     default_concurrency: 3
-    default_timeout_sec: 300
+    default_timeout_sec: 3600 # legacy 名称：只填充 ExpectedDuration，不形成 deadline
   roster: { wait_timeout_sec: 300 }
 
-startup_probe: "tcp"
+startup_probe: "tool"
 startup_probe_timeout_sec: 5
 startup_probe_failure_action: "warn"
 
@@ -177,7 +176,6 @@ search_api_key: "${SERPAPI_API_KEY}"
 **启用方式**: `./agentgo -config setting.test-concurrent.yaml`
 
 **其他值得注意的差异**（相对 setting.v4.yaml）:
-- `enforce_compact_token_threshold: 10000`（而非默认 4000）
 
 ---
 
@@ -288,7 +286,7 @@ general.yaml (最详尽中文模板, ~171行)
 | 配置项 | 类型 | 默认值 | 必需 | 说明 |
 |--------|------|--------|------|------|
 | `model` | string | 继承 `llm.default_model` | ❌ | scheduler 专用模型覆盖 |
-| `enforce_compact_token_threshold` | int | 80000 | ❌ | 单任务累计 prompt token 的一次性历史压缩阈值；0 使用默认值 |
+| `enforce_compact_token_threshold` | removed | — | ❌ | 显式设置报迁移诊断；Context v3 按 Snapshot pressure 投影 |
 
 ### 5.4 Agent 节点配置 (`agents[]:`)
 
@@ -301,7 +299,7 @@ general.yaml (最详尽中文模板, ~171行)
 | `model` | string | 继承 `llm.default_model` | ❌ | 覆盖该 kind 的模型 |
 | `system_prompt_file` | string | — | ✅ | 系统提示词文件路径 |
 | `task_max_retries` | int | 3 | ❌ | 任务失败最大重试次数 |
-| `enforce_compact_token_threshold` | int | 4000 | ❌ | 触发上下文压缩的 token 阈值 |
+| `enforce_compact_token_threshold` | removed | — | ❌ | AgentTemplate 中同样拒绝旧键 |
 
 ### 5.5 基础设施 (`infra:`)
 
@@ -309,19 +307,20 @@ general.yaml (最详尽中文模板, ~171行)
 |--------|------|--------|------|
 | `project_root` | string | `"."` | 项目根目录（顶层字段，不在 infra 内）；启动时 canonicalize，空值/不可访问目录拒绝启动 |
 | `infra.watchdog.interval_sec` | int | 30 | watchdog 健康检查间隔 |
+| `infra.watchdog.progress_heartbeat_grace_sec` | int | 120 | 新 Loop checkpoint lease；超期只发 typed liveness observation |
 | `infra.mail_notifier.enabled` | bool | true | 是否启用 agent 间邮件通知 |
 | `infra.mail_notifier.interval_sec` | int | 60 | 邮件轮询间隔 |
 | `infra.store.event_channel_buffer` | int | 256 | 事件通道缓冲区 |
 | `infra.store.fifo_limit` | int | 100 | FIFO 队列上限 |
 | `infra.store.default_concurrency` | int | 3 | 默认并发数 |
-| `infra.store.default_timeout_sec` | int | 300 | 默认任务超时 |
+| `infra.store.default_timeout_sec` | int | 3600 | legacy 配置名；仅填充 ExpectedDuration，不形成 deadline |
 | `infra.roster.wait_timeout_sec` | int | 300 | roster 等待超时 |
 
 ### 5.6 启动探针
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `startup_probe` | string | `"tcp"` | `"tcp"` 做 TCP 拨号探针，`"off"` 跳过 |
+| `startup_probe` | string | `"tool"` | `"tool"` 做 TCP + 真实 function call；`"tcp"` 仅连通，`"off"` 跳过 |
 | `startup_probe_timeout_sec` | int | 5 | 单次探针超时 |
 | `startup_probe_failure_action` | string | `"warn"` | `"warn"` = 警告后继续，`"exit"` = 失败即退出 |
 
@@ -370,7 +369,7 @@ general.yaml (最详尽中文模板, ~171行)
 
 ### ❌ 可选（有合理默认值）
 
-`llm.timeout_sec`(120), `scheduler.enforce_compact_token_threshold`(80000), `agents[].event_type`(""), `agents[].task_max_retries`(3), `agents[].enforce_compact_token_threshold`(4000), `infra.*`(见上表), `project_root`("."), `max_subtask_depth`(3), `shell_timeout_sec`(60), `shell_blacklist`([]), `shell_greylist`([]), `search_api_provider`("serper"), `startup_probe`("tcp"), `startup_probe_timeout_sec`(5), `startup_probe_failure_action`("warn")
+`llm.timeout_sec`(120), `agents[].event_type`(""), `agents[].task_max_retries`(3), `infra.*`(见上表), `project_root`("."), `max_subtask_depth`(3), `shell_timeout_sec`(60), `shell_blacklist`([]), `shell_greylist`([]), `search_api_provider`("serper"), `startup_probe`("tool"), `startup_probe_timeout_sec`(5), `startup_probe_failure_action`("warn")
 
 > V6 移除项（不再出现在默认值清单，显式设置报迁移诊断）：`llm.provider`、`scheduler.agent_max_loops`、`agents[].agent_max_loops`、`scheduler.context_limit`、`agents[].context_limit`。
 

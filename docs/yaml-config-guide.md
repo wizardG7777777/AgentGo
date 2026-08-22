@@ -59,12 +59,14 @@ llm:
 tool_profiles:
   worker_standard:
     - read_file
+    - read_content_ref
     - write_file
     - run_shell
     - send_message
     - request_user_input
   explorer_full:
     - read_file
+    - read_content_ref
     - web_search
     - send_message
     - request_user_input
@@ -91,7 +93,6 @@ agents:
     model: gpt-4o                        # 可选，覆盖 llm.default_model
     system_prompt_file: prompts/worker.md  # 必填，文件必须存在且可读
     task_max_retries: 3                  # 必填，> 0
-    enforce_compact_token_threshold: 4000  # 必填，> 0
     description: |                       # 可选，给 scheduler 看的一句话角色描述
       通用工作代理。能写文件、跑 shell。
 ```
@@ -102,7 +103,7 @@ agents:
 - `profile` / `tools` **恰好一个**非空（互斥）
 - `profile` 引用的名字必须在 `tool_profiles:` 里存在
 - `system_prompt_file` 路径必须存在且可读；**不能含反斜杠 `\`**（仅允许 forward slash，跨平台一致）
-- 两个行为参数（`task_max_retries` / `enforce_compact_token_threshold`）必须全部 `> 0`；`agent_max_loops` 与 `context_limit` 已于 V6 移除，显式设置报迁移诊断
+- `task_max_retries` 必须 `> 0`；`agent_max_loops`、`context_limit` 与 `enforce_compact_token_threshold` 已移除，显式设置报迁移诊断。
 
 **`description` 撰写建议**（影响 scheduler 派任质量）：
 - 单句话、动作导向："广度优先调研代理，不写文件，只返回 Markdown"
@@ -114,12 +115,11 @@ agents:
 ```yaml
 scheduler:
   model: gpt-4o
-  enforce_compact_token_threshold: 80000
 ```
 
 scheduler 的工具集 / system prompt / replicas 仍固定在 [internal/scheduler](../internal/scheduler/)，但模型和压缩预算可调：
 
-- `enforce_compact_token_threshold`：一个任务内累计 prompt token 达到阈值后触发一次 Layer 2 历史压缩；省略或 `0` 使用默认 `80000`。它不是模型厂商声明的 context window。
+- Context v3 不提供可配置的累计 Prompt 压缩阈值：Raw History 保持不可变，Replay 视图由冻结 Policy 按当前 Snapshot section 压力派生。
 
 显式负数会在启动校验中被拒绝。压缩阈值按单任务累计消耗计数；上下文溢出由 Layer 3 溢出重试兜底。`agent_max_loops` 与 `context_limit` 已于 V6 移除：Loop 不再有固定轮数上限（由结构化终态、取消、deadline 与预算约束，另有不可配置的 emergency fuse 兜底程序性死循环），也不再有固定上下文硬截断（适配由压缩与溢出重试承担）；旧配置显式设置这些字段会在启动校验报迁移诊断。
 
@@ -152,6 +152,7 @@ tools:
   - list_dir
   - grep_search
   - glob_search
+  - read_content_ref
   - run_shell
   - request_replan
 model: gpt-4o-mini
@@ -159,7 +160,6 @@ system_prompt: |
   只基于可复核事实审查当前任务；需要改图时调用 request_replan。
 limits:
   task_max_retries: 2
-  enforce_compact_token_threshold: 3000
   max_replicas: 2
 ```
 
@@ -170,7 +170,7 @@ limits:
 - `system_prompt` 与 `system_prompt_file` 恰好一个；文件路径相对配置的模板目录解析，并且不能以绝对路径、反斜杠、`..` 或符号链接越界；digest 记录解析后的 prompt 内容，不记录路径文字。
 - `model` 为空时在加载期解析为 `llm.default_model`（或 Scheduler model）并进入 digest；存在 ready TeamSpec 时改变全局默认模型会被视为模板内容漂移。
 - 外部模板不能声明 namespace；完整 ref 由来源组成，例如 `project/reviewer@1`。
-- `limits` 可省略；`task_max_retries / enforce_compact_token_threshold / max_replicas` 默认为 `3 / 4000 / 4`，显式值必须大于零。`agent_max_loops` 与 `context_limit` 已于 V6 移除，显式设置会报迁移诊断。
+- `limits` 可省略；`task_max_retries / max_replicas` 默认为 `3 / 4`，显式值必须大于零。旧的 loop/context/compact 三个限制键显式设置都会报迁移诊断。
 - 工具名拼错或包含 Scheduler 独占 DAG 工具会在启动期失败；YAML 未知字段和同一文件中的第二个 YAML document 也会被拒绝。
 - 同 namespace 的 `name@version` 不能重复，内置 ref 不能覆盖。Catalog 为每个模板计算 digest，持久化 TeamSpec 记录 ref+digest 用于恢复校验。
 
@@ -184,6 +184,7 @@ Scheduler 不能先提交引用虚构 route 的 Graph 再尝试创建 Agent。Gr
 infra:
   watchdog:
     interval_sec: 30
+    progress_heartbeat_grace_sec: 120 # 新 Loop checkpoint lease；超期只发布 typed liveness observation
     pending_alert_grace_sec: 300  # 有合法 route 但本轮 pending 过久：只告警
     unroutable_grace_sec: 300     # 持续无兼容 route：宽限期后标记 blocked
   mail_notifier:
@@ -193,12 +194,13 @@ infra:
     event_channel_buffer: 64
     fifo_limit: 100
     default_concurrency: 1       # 任务级认领上限兜底；>1 会让多个 Agent 重复执行同一任务
-    default_timeout_sec: 300        # 单次 processing 执行的默认超时
+    default_timeout_sec: 3600     # legacy 键：只填充 ExpectedDuration，不形成 deadline
   roster:
     wait_timeout_sec: 30
 ```
 
-- `default_timeout_sec` 只约束任务被领取后的单次执行租约，以 `StartedAt` 为起点；它不是排队超时。
+- `default_timeout_sec` 是兼容旧配置名的 SLO hint，只填充 `Task.ExpectedDuration`，供 UI 与 legacy Task 告警使用；它**不是** timeout/deadline，也不触发取消、重试或状态迁移。新 Loop 的停止权威是冻结在 `RunContract` / `ProgressCheckpoint` 中的绝对 `HardDeadlineAt`。
+- `progress_heartbeat_grace_sec` 是 Watchdog 对 durable checkpoint 的只读 lease。超期发布 `watchdog_observation`（`heartbeat_stalled`），但不替 L4 执行 Reminder、AttemptRollover、blocked 或 caller cancellation。
 - `default_concurrency` 是"一个任务允许几个 Agent 同时认领执行"的兜底值，**只**对未显式指定 `max_concurrency` 的非 plan 发布路径生效：scheduler 经 `publish_task` 发布的任务与验收 runner 任务默认恒为 1（单交付物任务的正确语义）。把它调成 >1 不会让系统吞吐变大，只会让多个 Agent 重复执行同一任务并互相覆盖产出。
 - `pending_alert_grace_sec` 以当前 `PendingSince` 为起点。有合法 route 时超期只发一次告警，任务继续排队。
 - `unroutable_grace_sec` 从 Watchdog 首次确认“任务已满足依赖且可认领，但没有兼容 route”时独立计时；超期后任务进入 `blocked`。依赖等待期间不累计这段时间。
@@ -238,7 +240,7 @@ ui:
 | `session_resume_max_idle_sec` | `3600` | **已废弃**（2026-08 起启动永远是全新 Session，不再自动恢复；进入历史会话时非终态任务一律阻断为 `blocked`）。保留解析仅为配置兼容，设置无效 |
 | `session_snapshot_interval_sec` | `30` | 运行期完整快照间隔，用于限制崩溃后的副作用重放窗口；0=仅在 Session 切换/关闭时保存；最大 `9223372036` |
 | `search_api_provider` / `search_api_url` / `search_api_key` | — | 网络搜索 provider |
-| `startup_probe` | `""` | `"tcp"` / `"off"`；其它值校验失败 |
+| `startup_probe` | `""`（等价 `tool`） | `"tool"`（TCP + 真实 function call）/ `"tcp"` / `"off"` |
 | `startup_probe_timeout_sec` | `0` | 不可负 |
 | `startup_probe_failure_action` | `""` | `"warn"` / `"exit"`；其它值校验失败 |
 | `reactors_file` | `""` | v5 用户 reactor 文件路径（见 §3） |

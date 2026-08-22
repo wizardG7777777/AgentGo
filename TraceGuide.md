@@ -533,7 +533,7 @@ grep '"kind":"llm_call_end"' <file>.jsonl | jq -s 'group_by(.agent_id) | map({ag
 grep '"kind":"history_compaction"' <file>.jsonl | jq '{prompt_tokens_before, kept_entries, strategy}'
 
 # 4. 如果 prompt_tokens 持续增长逼近模型窗口
-#    → 调低 enforce_compact_token_threshold 让压缩更早触发，或拆分任务缩短上下文
+#    → Context v3 会在新 Attempt 使用 aggressive Snapshot-pressure replay；检查 dropped/referenced Fragment 与 ContentRef
 ```
 
 ### 场景 D：排查"Agent 为何失败/取消"

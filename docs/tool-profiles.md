@@ -17,6 +17,7 @@ tool_profiles:
     - list_dir
     - grep_search
     - glob_search
+    - read_content_ref
     - write_file
     - edit_file
     - run_shell
@@ -31,6 +32,7 @@ tool_profiles:
     - list_dir
     - grep_search
     - glob_search
+    - read_content_ref
     - web_search
     - web_fetch
     - submit_task_result
@@ -43,7 +45,6 @@ agents:
     model: gpt-4o
     system_prompt_file: prompts/worker.md
     task_max_retries: 3
-    enforce_compact_token_threshold: 4000
     context_limit: 16000
     description: 通用执行代理，能修改代码和运行命令。
 
@@ -54,7 +55,6 @@ agents:
     model: gpt-4o-mini
     system_prompt_file: prompts/program_verifier.md
     task_max_retries: 2
-    enforce_compact_token_threshold: 3000
     context_limit: 12000
     description: 正式验收代理，读取交付物与上游证据并提交结构化结论。
 ```
@@ -70,7 +70,6 @@ agents:
     model: gpt-4o-mini
     system_prompt_file: prompts/explorer.md
     task_max_retries: 2
-    enforce_compact_token_threshold: 3000
     context_limit: 8000
 ```
 
@@ -84,6 +83,7 @@ agents:
 | `list_dir` | LocalReadGroup | 列出目录，可递归 |
 | `grep_search` | LocalReadGroup | 搜索文本 |
 | `glob_search` | LocalReadGroup | 按 glob 查找文件 |
+| `read_content_ref` | ContentRefGroup | 在冻结 ExecutionLease 与 scope 下分页读取 L2 外置正文 |
 | `write_file` | LocalWriteGroup | 创建或覆盖文件 |
 | `edit_file` | LocalWriteGroup | 精确编辑文件 |
 | `run_shell` | ShellGroup | 执行命令 |
@@ -150,7 +150,7 @@ Scheduler-only 启动时，Catalog 中存在模板不代表已经存在 route。
 
 自定义的是验收 runner 与判据；验收结论驱动图边路由由 Graph Runtime 统一完成。验收 agent 可经 `submit_task_result.cited_evidence` 复制任务描述中已展示且实际消费的稳定 EvidenceRef；不得按展示顺序构造或把 CallID/ResultRef 当作 EvidenceRef。服务端做谱系核验，越谱系引用（disputed）会使 verdict 不被采信、节点 failed 并唤醒 Graph change；不引用不影响采信。
 
-`submit_graph` / `patch_graph` 会对 acceptance 的**实际工具面**做正向闭集校验：route 必须含 `submit_task_result`，且 route 保证工具或 per-node 明确收窄后的工具集合只能包含 `read_file`、`list_dir`、`grep_search`、`glob_search`、`web_search`、`web_fetch`、`submit_task_result`；acceptance 也不得路由给 Scheduler。该约束是工具面隔离，不是 OS sandbox；只读工具仍受各自网络与文件边界约束。
+Graph compiler 会对 acceptance 的**实际工具面**做正向闭集校验：route 必须含 `submit_task_result`，且 route 保证工具或 per-node 明确收窄后的工具集合只能包含 `read_file`、`list_dir`、`grep_search`、`glob_search`、`web_search`、`web_fetch`、`read_content_ref`、`submit_task_result`；acceptance 也不得路由给 Scheduler。该约束是工具面隔离，不是 OS sandbox；`read_content_ref` 仍需当前 Task 的冻结 Lease 与 Session/Graph/Task scope，其他只读工具仍受各自网络与文件边界约束。
 
 Evidence 只证明调用及其结果，不证明同一节点内“最后一次写入之后”的时序。判据要求可证明的新鲜测试/构建时，必须使用 `implement → checker → acceptance`，由 Graph 因果边证明 checker 晚于实现，不能让 verifier 从 Evidence 展示顺序、CallID 或时间戳猜测。
 
@@ -173,8 +173,8 @@ Board Snapshot 的 `resources.agent_capabilities` 只列出**已经运行**的 A
 - `agents` 可以省略；一旦声明，每个 `kind` 仍须唯一且 `replicas >= 1`。
 - `profile` 必须存在于 `tool_profiles`；`profile` 与 `tools` 不能并存，也不能都缺失。
 - `system_prompt_file` 必须存在且可读。
-- `task_max_retries`、`enforce_compact_token_threshold`、`context_limit` 都必须为正数；`agent_max_loops` 已于 V6 移除（显式设置报迁移诊断）。
-- Scheduler 的工具集和系统提示词由 `internal/scheduler` 固定；`scheduler:` 可覆盖模型、`enforce_compact_token_threshold` 与 `context_limit`。
+- `task_max_retries` 必须为正数；`agent_max_loops`、`context_limit`、`enforce_compact_token_threshold` 均已移除并提供显式迁移诊断。
+- Scheduler 的工具集由真实 ExecutionLease 冻结，再按 Invocation phase 收窄 ToolRouter；`scheduler:` 只覆盖模型。
 - 空 profile 会在配置校验阶段被拒绝；ToolRegistry 的非 nil 空 allowlist 语义是“拒绝全部”，不会再 fail-open。要做最小权限 Agent，请至少列出它确实需要的工具。
 - 外部 AgentTemplate 一文件一个模板，直接列 tools；`system_prompt` / `system_prompt_file` 恰选一个，ref、版本、digest 和容量在加载期校验。
 

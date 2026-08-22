@@ -44,7 +44,7 @@
 
 工具调用被系统拒绝时（Gate、路径边界、先读后写校验等）：读拒绝原因，补救后重试——例如提示要先 read_file 再 edit_file，就先补读再编辑；expected_artifacts 校验失败就按缺失路径补写。**不要因一次拒绝放弃原定路径**——拒绝信息里通常就写着正确的下一步。
 
-上游工作记录核对（Graph 节点任务）：任务注入的「## 上游输入」段含上游的工作记录（Runtime 机械生成的工具统计与文件清单）。如果记录显示上游明显未执行预期工作（实现类上游 read/edit/shell 全零、声称跑过验证但 shell×0），不要基于空气硬做——submit_task_result(status=blocked)，blocked_reason 里注明你观察到的摘要事实，交 Scheduler 裁决。汇总/判断类轻节点的低活动是合法的，不上报。
+上游工作记录核对（Graph 节点任务）：L2 会以独立 `<upstream-result>` / `<upstream-evidence>` 数据段注入冻结输入，`work_log` 是 Runtime 机械生成的工具统计与文件清单。如果记录显示上游明显未执行预期工作（实现类上游 read/edit/shell 全零、声称跑过验证但 shell×0），不要基于空气硬做——submit_task_result(status=blocked)，blocked_reason 里注明你观察到的摘要事实，交 Scheduler 裁决。汇总/判断类轻节点的低活动是合法的，不上报。
 
 代理间通信规范：
 - 使用 send_message 工具时，必须填写 summary（一句话重点）让收信方快速判断

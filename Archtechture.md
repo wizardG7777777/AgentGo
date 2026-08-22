@@ -6,7 +6,7 @@
 
 | 包 | 一句话职责 |
 |---|---|
-| `agent` | ReAct 循环 + 三层历史压缩 + FileStateCache + Memory 注入入口 |
+| `agent` | ReAct 循环 + Context v3 Raw History/replay 投影 + FileStateCache + Memory 注入入口 |
 | `bootstrap` | 系统装配、启动顺序、kind×replica runner 实例化（含 `runtime_builder.go`） |
 | `config` | YAML/JSON 配置加载，**v4 唯一格式**：`llm:` / `scheduler:` / `agents:` / `infra:` / `tool_profiles:` / `reactors_file:` 等顶层块 |
 | `gate` | **统一 Gate 注册表**（v5 替代 v4 三套 HookRegistry）。Phase 路由：`tool:preCall/postCall` / `mailbox:beforeSend/Deliver/Wake`，10 个内置 Gate |
@@ -18,7 +18,7 @@
 | `model` | `Task` / `Event` / `Claim` 数据结构。`Task` 含 `Artifacts` / `ExpectedArtifacts` / `LastResponse` / `MailChainDepth` / `SchedulerBatch` / `ReadSet` |
 | `modes` | exec / topo 两轴模式存储（gate 轴已于 V6 移除；执行前审阅改由 Graph approval 节点承担） |
 | `pathutil` | 路径越界 + 敏感文件模式拦截 |
-| `probe` | 启动期 TCP probe + 工具可用性探针（`web_search`/`web_fetch` 检测） |
+| `probe` | 启动期 TCP + 真实 function-call capability probe + 工具可用性探针 |
 | `reactor` | **Reactor 注册表**（v5，新增）。订阅 `trace.Event` 的 `Kind`，4 个内置 reactor + `userdef/` 用户 YAML 加载器 |
 | `roster` | 文件级 `TryClaim/Release/ReleaseAll/IsOccupied/ListByAgent` |
 | `runner` | **统一执行代理外壳**（v5，**取代 v4 `internal/worker` + `internal/explorer`，两包已删**）。`runner.New(rt, deps)` 按 `AgentRuntimeConfig` 实例化 |
@@ -55,7 +55,7 @@
 - **任务数据流**：`Task.Artifacts`（`record-artifact` reactor 在 `KindFileWritten` 上自动追加，路径相对项目根）、`Task.ExpectedArtifacts`（发布者硬合约，由 `enforce-expected-artifacts` Gate 与 `agent.checkExpectedArtifacts` 双重把守）、`Task.LastResponse`（无条件持久化用于失败诊断）、`Task.MailChainDepth`（邮件链跳数）、`Task.SchedulerBatch`（scheduler 当前 reactLoop 跟踪的子任务 ID 列表）、`Task.ReadSet`（v5 Phase 6 新增，由 `read-set-write` reactor 在 `KindToolResult{tool=read_file}` 上写入；`require-read-before-write` Gate 改读 ReadSet 而不再反查 ToolCallHistory）。
 - **TaskCancelRegistry**：per-task cancel context，看门狗/调度器把任务转为 terminal 状态时自动取消正在执行的代理（通过 `ctx.Done()` 即时感知）。
 - **崩溃汇报**：任务最终失败时 agent 自动调用 `sendCrashReport`，向 `task.EventSource` 发送 `priority=high` 邮件，附 expected vs actual artifacts、最后一次 LLM 响应原文。
-- **三层历史压缩**：Layer 1 `snipOldToolResults`（无 LLM 开销，逐轮清理旧工具输出）；Layer 2 `compressHistory`（超过 `enforce_compact_token_threshold` 时摘要）；Layer 3 context overflow 时 `keepRecent=1` 激进压缩 + `RetryRollback`。压缩事件 `KindHistoryCompaction` / `KindHistoryTruncated` 由 `trace-history-event` reactor 计数。
+- **Context v3 replay 投影**：Raw History 不可变；L2 按当前 Snapshot section 压力生成有界 replay，Optional reasoning 可 dropped，RequiredExact 在工具 dispatch 前完成 representability gate；context overflow 只请求 aggressive projection + 新 Attempt。Shell/Web 大结果先写 Task-scope ContentStore，再以预览 + ContentRef 回放。
 - **Trace 系统 Schema B**：`internal/trace.Event` 是 fat struct，包含 `Transition` / `ShellExec` / `ShellTimeout` / `Lease` / `Suggestion` / `Effect` / `Acceptance` 可选指针载荷与 V6 Graph Runtime 顶层字段，旧字段保留不动。EventKind 覆盖任务/Agent 状态机、Graph 生命周期、验收核验、执行租约与副作用账目等审计事件。`SetDefaultDispatcher(reactorReg)` 让 `trace.Emit` 同时驱动 Reactor 链路。物理 JSONL 在 Session 活跃时落盘到 `.agentgo/sessions/sess-<id>/logs/`，否则写入 `.agentgo/traces/`，默认保留 100 个文件；Task 重试可能跨多个分片。`agentgo trace list/show/graph/node/stats` 会按完整 `task_id` 重组逻辑任务并自动定向到 active session 的 `logs/`，其中 `graph <graph_id>` 聚合单个 Graph 的生命周期时间线。可通过 `AGENTGO_DUMP_PROMPTS=1` 启用 prompt dump。
 - **LLM 请求策略与流式调用**：`internal/llm` 在统一工厂层应用 `reasoning_effort` 与 `stream`，因此 Scheduler、静态/动态 Agent、spawn Agent 和 Reactor LLM 共享同一请求策略（V6 起统一 OpenAI-compatible Chat Completions，无 provider 分支）。SSE 路径先聚合完整文本、工具调用参数、usage 与未知扩展字段，再返回普通 `Response`；UI 收到带稳定 `stream_id` 的累积快照。未知扩展字段经 ExtraFields 透传往返（如 `reasoning_content`）。详见 §"LLM 请求路径与 ExtraFields 透传"。
 
@@ -576,52 +576,20 @@ internal/
 - **失败信息写入**：将失败原因写入公告板的任务重试原因字段，供后续审计和调度器决策参考
 - **资源清理**：代理失败后清理本次执行中占用的临时资源（如未完成的文件写入、未关闭的连接），然后回到空闲等待状态
 
-## 三层历史压缩机制
+## Context v3 Raw History / Replay Projection
 
-**位置**: `internal/agent/agent.go` (Layer 1), `internal/agent/history.go` (Layer 2, 3)
+**位置**：`internal/agent/history_projection.go`、`internal/contextadapter`、`internal/contentstore`。
 
-为应对复杂任务中 LLM 上下文可能超过模型限制的问题，Agent 实现了三层递进式历史压缩策略：
+系统不再按累计完整 Prompt Token 修改 History，也不再使用 `snipOldToolResults` / `compressHistory` / `keepRecent=1` 三层有损压缩：
 
-### Layer 1: 旧工具结果清理（`snipOldToolResults`）
+1. settled Turn 作为 Raw History 保持不可变；
+2. 每次 Invocation 前，L2 按当前 `conversation_history` 与 `tool_results` section 使用率重新派生 replay 视图；
+3. 压力不足时全部保留；接近预算时只在视图中以有界、带 digest/TurnID 的索引替代较旧轮次，索引每次从 Raw History 生成，不递归压缩旧摘要；
+4. Optional `reasoning` 超限记录 `DispositionDropped`，不终止 Agent；RequiredExact provider 字段在 Response commit、任何工具执行之前证明可重放；
+5. 大 ToolResult 先持久化到 Task-scope ContentStore，History 只保存 `ref_id`、原始尺寸/digest 与首尾预览，可用 `read_content_ref` 分页；
+6. provider `context_window_exceeded` 创建新 Attempt 并请求 aggressive replay projection，不改写 Raw History。
 
-**触发时机**: 每轮 ReAct 循环自动执行，无 LLM 开销
-
-**策略**: 
-- 清理前序轮次中输出长度超过 1000 字符的工具结果
-- 保留 tool call 记录，但将结果替换为 `"[已清理，共 X 字符]"`
-- 最近一轮的工具结果完整保留
-
-**目的**: 控制历史累积速度，不影响 LLM 对工具调用链的感知
-
-### Layer 2: Token 阈值压缩（`compressHistory`）
-
-**触发时机**: `totalPromptTokens > CompactTokenThreshold`（默认 80000）
-
-**策略**:
-1. 保留最近 `CompactKeepRecent` 条（默认 3 条）完整历史
-2. 对更早的历史调用 LLM 生成摘要：
-   - 系统消息保留
-   - 工具调用历史摘要化为 `"第 X-Y 轮：执行了 {tool1, tool2, ...}，结果概述..."`
-3. 摘要作为系统消息插入，标记为 `[历史摘要]`
-
-### Layer 3: Context Overflow 激进压缩（`handleFailure` 内）
-
-**触发时机**: LLM 返回 413/429 等 context overflow 错误
-
-**策略**:
-- `keepRecent=1`：仅保留最后 1 条完整历史
-- 其余全部摘要化
-- 触发 `RetryRollback`，以压缩后的历史重试
-
-**目的**: 紧急止损，确保任务不因上下文超限而彻底失败
-
-### 压缩策略对比
-
-| 层级 | 触发条件 | LLM 开销 | 压缩强度 | 用户感知 |
-|------|---------|---------|---------|---------|
-| Layer 1 | 每轮自动 | 无 | 轻（仅长输出）| 无 |
-| Layer 2 | Token 阈值 | 有（摘要调用）| 中（保留最近 N 条）| 轻微（看到摘要）|
-| Layer 3 | Context 溢出 | 有（摘要调用）| 激进（仅保留 1 条）| 明显（重试提示）|
+Context v3 同时冻结 model window、completion reserve、protocol overhead 与 Invocation OutputBudget；SDK 实际上限取 L2 reserve、L4 剩余预算与模型安全上限的最小值。旧 `enforce_compact_token_threshold` 配置已删除，显式设置返回迁移诊断。
 
 # 公告板
 公告板是一个信息存储桶，主公告板在程序启动的时候就存在，并且存储调度器和执行代理，以及更多后续启动的所有的Agent传递的消息。
@@ -939,7 +907,7 @@ Scheduler agent (Phase 3 后) 与 worker / explorer 共享同一套 `Mailbox.Dra
 |---|---|---|
 | 1 | 配置加载 | `config.LoadConfig(path, explicit)` + `cfg.Validate()`（v4 §11.5.3 12 条规则） |
 | 1.1 | 启动 banner | `printStartupBanner(stdout, configPath, cfg)` —— 逐 kind 摘要 + 脱敏 api_key |
-| 1.2 | 启动期 TCP probe | `startupProbe(stdout, cfg)` —— best-effort；`startup_probe_failure_action=exit` 改为硬退出；`-skip-startup-probe` 整体跳过 |
+| 1.2 | 启动期 provider probe | `startupProbe(stdout, cfg)`：`tool` 执行 TCP + 真实 function call schema/arguments；`tcp` 仅连通；`off`/`-skip-startup-probe` 跳过 |
 | 1.3 | Session 管理器 | `session.NewSessionManager(...)` + `history.jsonl` 溯源 |
 | 1.5 | Trace 系统 | `trace.NewWriter(traceDir, 100)` + `trace.SetDefault()`；Session 活跃时 `traceDir = sessMgr.LogDir()` |
 | 1.6 | Prompt Dumper | 条件启用（`AGENTGO_DUMP_PROMPTS=1`） |
@@ -1154,7 +1122,6 @@ llm:                                # 全局 LLM 默认值
 
 scheduler:                          # Scheduler 是内置单例；模型与运行预算可覆盖
   model: "qwen3-max"
-  enforce_compact_token_threshold: 80000
 
 agents:                             # AgentKind 列表 —— 取代 v3 的 worker_count + explorer 二分
   - kind: worker
@@ -1163,7 +1130,6 @@ agents:                             # AgentKind 列表 —— 取代 v3 的 work
     model: "qwen3.6-plus"           # 可选，per-kind 覆盖 llm.default_model
     system_prompt_file: "prompts/worker.md"
     task_max_retries: 3
-    enforce_compact_token_threshold: 80000
     description: "通用任务执行代理，能读写文件、跑命令、发邮件"  # 给 scheduler 看的语义提示
   - kind: explorer
     replicas: 1
@@ -1222,8 +1188,8 @@ session_archive_max:    50
 session_resume_max_idle_sec: 3600   # 已废弃（启动永远新会话、不再自动恢复）；保留仅为配置兼容，设置无效
 session_snapshot_interval_sec: 30   # 运行期快照心跳；显式 0 仅保留切换/关闭快照
 
-# 启动期 TCP probe（best-effort 连通性检查）
-startup_probe: ""                   # 空 / "off" / "auto"
+# 启动期 provider capability probe
+startup_probe: "tool"               # tool / tcp / off
 startup_probe_timeout_sec: 5
 startup_probe_failure_action: "warn" # "warn"（默认）或 "exit"
 ```
@@ -1241,7 +1207,7 @@ Session 恢复遵守以下安全边界（2026-08 二期「不自动续跑」）�
 | `model` | per-kind 模型覆盖（空则用 `llm.default_model`） |
 | `system_prompt_file` | 必填，提示词文件路径；resolves 相对当前 cwd 或绝对路径 |
 | `task_max_retries` | 任务级重试上限（v3 时代的 worker/explorer/scheduler hardcoded constant 已被此字段取代） |
-| `enforce_compact_token_threshold` | Layer 2 历史压缩触发阈值（prompt tokens） |
+| `enforce_compact_token_threshold` | 已删除；显式设置报迁移诊断，Context v3 按 Snapshot pressure 投影 |
 | `description` | 给 scheduler 看的一句话角色描述（拼入 board snapshot 的 `agent_capabilities` 段） |
 
 `internal/config/config.go` 在 v4 之外还保留一个**仅内部使用**的 `AgentRuntimeConfig` 结构，由 `bootstrap.runtime_builder.buildAgentRuntime(kind, replicaIdx)` 合成并注入 `runner.New(rt, deps)`。`AgentRuntimeConfig` 不出现在 YAML 中。
@@ -1270,7 +1236,7 @@ Session 恢复遵守以下安全边界（2026-08 二期「不自动续跑」）�
 | Agent 结构体 | `internal/agent/agent.go` | `type Agent struct` |
 | ReAct 主循环 | `internal/agent/agent.go` | `processTask()` |
 | Memory 注入入口（v5） | `internal/agent/memory_context.go` | `injectMemoryContext()` |
-| 三层历史压缩 | `internal/agent/agent.go` + `history.go` | `snipOldToolResults()` / `compressHistory()` |
+| Context replay 投影 | `internal/agent/history_projection.go` + `internal/contextadapter` | Raw History → Snapshot-pressure replay / ContentRef |
 | LLMExecutor | `internal/agent/llm_executor.go` | `NewLLMExecutor()` / `Execute()` |
 | ToolRegistry | `internal/agent/registry.go` | `type ToolRegistry struct` / `NewToolRegistryWithAllowlist()` |
 

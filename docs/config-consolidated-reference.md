@@ -102,7 +102,6 @@ agents:
     model: gpt-4o                        # 可选，覆盖 llm.default_model
     system_prompt_file: prompts/worker.md  # 必填，文件须存在且可读
     task_max_retries: 3                  # 必填，> 0
-    enforce_compact_token_threshold: 4000  # 必填，> 0
     description: |                       # 可选，给 scheduler 看的一句话角色描述
       通用工作代理。能写文件、跑 shell。
 ```
@@ -120,14 +119,13 @@ agents:
 - `profile` / `tools` **恰好一个**非空（互斥）
 - `profile` 引用的名字必须在 `tool_profiles:` 中存在
 - `system_prompt_file` 路径须存在且可读；不能含反斜杠 `\`
-- 两个行为参数（`task_max_retries` / `enforce_compact_token_threshold`）全部 `> 0`（`context_limit` 已于 V6 移除，显式设置报迁移诊断）
+- `task_max_retries > 0`；旧 loop/context/compact 限制键已移除，显式设置报迁移诊断。
 
 ### 2.4 `scheduler:` — Scheduler 配置（可选）
 
 ```yaml
 scheduler:
   model: gpt-4o
-  enforce_compact_token_threshold: 80000 # 省略/0 = 80000
 ```
 
 Scheduler 在 v5 是 `agent.Agent` 一等代理实例（Phase 3 重构后保持），工具集 = Worker 全集 + SchedulerGroup + MetaGroup。循环和历史预算复用同一 `agent.Agent.processTask` 实现。
@@ -138,7 +136,9 @@ Scheduler 在 v5 是 `agent.Agent` 一等代理实例（Phase 3 重构后保持�
 infra:
   watchdog:
     interval_sec: 30
-    max_stall_sec: 300
+    progress_heartbeat_grace_sec: 120
+    pending_alert_grace_sec: 300
+    unroutable_grace_sec: 300
   mail_notifier:
     interval_sec: 5
     max_chain_depth: 3
@@ -146,7 +146,7 @@ infra:
     event_channel_buffer: 100
     fifo_limit: 1000
     default_concurrency: 5
-    default_timeout_sec: 600
+    default_timeout_sec: 3600 # legacy 名称：只填充 ExpectedDuration，不形成 deadline
   roster:
     enabled: true
 ```
@@ -215,7 +215,7 @@ infra:
 | TUI | —（自动） | Bubble Tea，替代旧 CLI |
 | Spawn | `reactors_file`（通过 reactor） | ad-hoc agent 创建与销毁 |
 | MailNotifier | `infra.mail_notifier` | 默认启用，含防邮件爆炸机制 |
-| 三层历史压缩 | `enforce_compact_token_threshold` | 自动触发 |
+| Context replay | Context v3 Policy | Raw History → Snapshot-pressure projection，非用户可扩大的累计阈值 |
 
 ### ⚠️ 部分实现 / ❌ 未实现（配置中避免依赖）
 
@@ -278,7 +278,6 @@ agents:
     profile: worker_standard
     system_prompt_file: prompts/worker.md
     task_max_retries: 3
-    enforce_compact_token_threshold: 4000
     description: |
       通用工作代理。能读写文件、跑 shell、检索网络；
       适合落盘类执行任务，不擅长纯调研。
@@ -289,18 +288,18 @@ agents:
     profile: explorer_full
     system_prompt_file: prompts/explorer.md
     task_max_retries: 2
-    enforce_compact_token_threshold: 4000
     description: |
       广度优先调研代理。不写文件，仅返回 Markdown 文字回复。
 
 scheduler:
   model: gpt-4o
-  enforce_compact_token_threshold: 80000
 
 infra:
   watchdog:
     interval_sec: 30
-    max_stall_sec: 300
+    progress_heartbeat_grace_sec: 120
+    pending_alert_grace_sec: 300
+    unroutable_grace_sec: 300
   mail_notifier:
     interval_sec: 5
     max_chain_depth: 3

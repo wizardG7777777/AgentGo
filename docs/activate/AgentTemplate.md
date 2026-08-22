@@ -89,7 +89,6 @@ model: gpt-4o
 system_prompt_file: prompts/rust-migrator.md
 limits:
   task_max_retries: 3
-  enforce_compact_token_threshold: 4000
   max_replicas: 2
 ```
 
@@ -102,7 +101,7 @@ limits:
 - `tools`：必填、非空；每项必须是 AgentGo 已注册的真实工具名，trim 后不能为空或重复。真正权限只由该 allowlist 决定。
 - `model`：可选；空时在加载期解析为 `llm.default_model`（或 Scheduler model）并进入 digest。因此存在 ready TeamSpec 时改变全局默认模型也属于能力定义漂移，需要按恢复规则处理。
 - `system_prompt` / `system_prompt_file`：恰好填写一个。文件路径相对该来源的模板目录解析；解析后的 prompt 内容进入 digest，路径本身不进入。绝对路径、反斜杠、`..` 和符号链接越界都会被拒绝。
-- `limits`：可选；默认值依次为 `task_max_retries: 3`、`enforce_compact_token_threshold: 4000`、`max_replicas: 4`。显式值必须为正数，其中 `max_replicas` 限制单个 Team 请求的副本数。`agent_max_loops` 与 `context_limit` 已于 V6 移除——旧模板显式设置这些字段会在加载期报迁移诊断错误。
+- `limits`：只保留 `task_max_retries`（默认 3）与 `max_replicas`（默认 4）。旧 `agent_max_loops` / `context_limit` / `enforce_compact_token_threshold` 都会返回迁移诊断；Context fitting 由 framework Context v3 Policy 统一拥有。
 
 外部模板不能获得 Scheduler 独占的 Graph 控制工具。普通模板遇到需要改图的事实应调用 `request_replan`；用作 acceptance route 的验收模板还必须通过 Graph 提交时的只读闭集校验，只能通过 `submit_task_result.verdict`（以及适用的证据字段）提交节点结果，无法判断时提交 `status=blocked`，completed 结果省略 `event`。
 
