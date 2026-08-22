@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"agentgo/internal/mailbox"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/trace"
 )
 
@@ -68,15 +69,14 @@ func (r *callReactor) runSendMessage(ev trace.Event) error {
 	if priority == "" {
 		priority = "normal"
 	}
-	return r.sender.Send(mailbox.Message{
-		From:     "reactor:call",
-		To:       to,
-		Content:  content,
-		Summary:  truncateForSummary(content, 120),
-		Type:     msgType,
-		Priority: priority,
-		SentAt:   time.Now(),
-	})
+	msg := mailbox.Message{
+		From: "reactor:call", To: to, Content: content,
+		Summary: truncateForSummary(content, 120), Type: msgType, Priority: priority, SentAt: time.Now(),
+	}
+	if ev.RunID != "" {
+		msg.SourceTaskID, msg.RunID, msg.SessionID = ev.TaskID, runcontract.RunID(ev.RunID), ev.SessionID
+	}
+	return r.sender.Send(msg)
 }
 
 // supportedCallTools 是 call: 动作的白名单。loader 用此 set 启动期校验。

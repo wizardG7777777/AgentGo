@@ -1,13 +1,16 @@
 package mailbox
 
 import (
-	"agentgo/internal/session"
 	"errors"
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	"agentgo/internal/runcontract"
+	"agentgo/internal/session"
 )
 
 // 消息类型常量。
@@ -36,11 +39,35 @@ type Message struct {
 	Priority string    // 优先级：low / normal / high
 	SentAt   time.Time // 发送时间
 
+	// SourceTaskID/RunID/SessionID 是消息的冻结来源 envelope。新 Run 消息
+	// 必须同时携带 SourceTaskID+RunID；SessionID 在有 Session 的装配中绑定
+	// 当前会话，无 Session 模式可为空。三者全空是唯一 legacy 兼容形态。
+	SourceTaskID string
+	RunID        runcontract.RunID
+	SessionID    string
+
 	// ChainDepth 是邮件链跳数。用户 /steer 投递的初始邮件为 0；
 	// worker 通过 send_message 触发的邮件继承"自己当前任务的 MailChainDepth + 1"。
 	// 超过 cfg.MailChainMaxDepth 的邮件由 ChainDepthLimitHook 在 BeforeSend 阶段拒绝。
 	// Phase 2 引入；零值兼容现有调用方（既有测试不需要修改）。
 	ChainDepth int
+}
+
+// ValidateEnvelope 拒绝半绑定消息。旧消息三字段全空可继续作为显式 legacy；
+// 一旦出现任何来源字段，就必须至少具备 RunID+SourceTaskID，防止 notifier
+// 把无法归属的正文混入其它 Run。
+func (m Message) ValidateEnvelope() error {
+	hasRun := m.RunID != ""
+	hasSource := strings.TrimSpace(m.SourceTaskID) != ""
+	hasSession := strings.TrimSpace(m.SessionID) != ""
+	if !hasRun && !hasSource && !hasSession {
+		return nil
+	}
+	if !hasRun || !hasSource {
+		return fmt.Errorf("mailbox message envelope 不完整: run_id=%q source_task_id=%q session_id=%q",
+			m.RunID, m.SourceTaskID, m.SessionID)
+	}
+	return nil
 }
 
 // recentBufferSize 是 Mailbox.recent 环形缓冲的容量。
@@ -113,6 +140,10 @@ func (mb *Mailbox) Len() int {
 // 注意：channel 写入失败时不追加 recent —— 这确保 recent 中的消息都是
 // 真实"投递成功"的。
 func (mb *Mailbox) TrySend(msg Message) bool {
+	if err := msg.ValidateEnvelope(); err != nil {
+		log.Printf("[mailbox] 拒绝投递到 %s 的半绑定消息: %v", mb.ownerID, err)
+		return false
+	}
 	mb.inboxMu.Lock()
 	defer mb.inboxMu.Unlock()
 
@@ -190,6 +221,25 @@ func (mb *Mailbox) Drain() []Message {
 	mb.inboxMu.Lock()
 	defer mb.inboxMu.Unlock()
 	return mb.drainUnreadLocked()
+}
+
+// DrainRunWithAck 只消费指定 (RunID, SessionID) 分区，未命中的邮件按原 FIFO
+// 顺序留在信箱。legacy Task 传空 RunID/SessionID，只会消费三字段全空的旧消息。
+// ackSourceTaskID 是当前消费 Task 的身份，供自动 ack 建立新的来源 envelope。
+func (mb *Mailbox) DrainRunWithAck(registry *Registry, runID runcontract.RunID, sessionID, ackSourceTaskID string) []Message {
+	mb.inboxMu.Lock()
+	all := mb.drainUnreadLocked()
+	matched := make([]Message, 0, len(all))
+	for _, msg := range all {
+		if msg.RunID == runID && msg.SessionID == sessionID {
+			matched = append(matched, msg)
+			continue
+		}
+		mb.ch <- msg
+	}
+	mb.inboxMu.Unlock()
+	mb.sendQuestionAcks(registry, matched, ackSourceTaskID, runID, sessionID)
+	return matched
 }
 
 // drainUnreadLocked 按 FIFO 排空未读队列。调用方必须已持有 inboxMu。
@@ -295,8 +345,15 @@ func (mb *Mailbox) filterRecent(pred func(Message) bool) {
 // 隐式全量自动 ack。
 func (mb *Mailbox) DrainWithAck(registry *Registry) []Message {
 	msgs := mb.Drain()
+	mb.sendQuestionAcks(registry, msgs, "", "", "")
+	return msgs
+}
+
+func (mb *Mailbox) sendQuestionAcks(registry *Registry, msgs []Message, sourceTaskID string,
+	runID runcontract.RunID, sessionID string,
+) {
 	if registry == nil || len(msgs) == 0 {
-		return msgs
+		return
 	}
 	for _, m := range msgs {
 		if m.Type != MsgTypeQuestion {
@@ -311,9 +368,17 @@ func (mb *Mailbox) DrainWithAck(registry *Registry) []Message {
 			Content:  fmt.Sprintf("消息已读 (original type=%s)", m.Type),
 			SentAt:   time.Now(),
 		}
+		if runID != "" {
+			ack.RunID, ack.SourceTaskID, ack.SessionID = runID, sourceTaskID, sessionID
+		} else if m.RunID != "" {
+			// 旧 DrainWithAck 没有当前消费 Task identity，不能冒用原发件人的
+			// SourceTaskID 伪造 ACK 来源。生产 Agent 必须走 DrainRunWithAck；
+			// 这里对 new-Run question 明确跳过自动 ACK。
+			log.Printf("[mailbox] 跳过缺少消费 Task identity 的 new-Run 自动 ACK (owner=%s run=%s)", mb.ownerID, m.RunID)
+			continue
+		}
 		_ = registry.Send(ack) // 回执发送失败不阻塞主流程
 	}
-	return msgs
 }
 
 // truncate 截断字符串到指定 rune 长度，超出部分用 "..." 代替。
@@ -386,6 +451,10 @@ type MailboxStatus struct {
 	EventType     string
 	Count         int
 	MaxChainDepth int
+	RunID         runcontract.RunID
+	SessionID     string
+	SourceTaskIDs []string
+	WakeWorthy    bool
 }
 
 // Register 为指定 agentID 创建并注册 Mailbox。eventType 为代理的任务类型（"" = worker, "explore" = explorer）。
@@ -600,24 +669,70 @@ func (r *Registry) ClearAllMessages() {
 	r.recoveredClaimed = make(map[string]string)
 }
 
-// ScanNonEmpty 返回所有有未读消息的邮箱状态（agentID + eventType + 消息数量
-// + 最大邮件链深度）。MaxChainDepth 在 Phase 2 加入，由 MailNotifier 用于
-// 在 wake task 上设置 task.MailChainDepth。
+// ScanNonEmpty 返回所有有未读消息的邮箱分区。分区键为
+// (agentID, RunID, SessionID)，因此 notifier 永远不会把不同 Run 的邮件合并
+// 成同一 wake Task。SourceTaskIDs 保留该 Run 分区内按首次出现排序的来源任务。
 func (r *Registry) ScanNonEmpty() []MailboxStatus {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	var result []MailboxStatus
-	for id, mb := range r.boxes {
-		if n := mb.Len(); n > 0 {
-			result = append(result, MailboxStatus{
-				AgentID:       id,
-				EventType:     mb.eventType,
-				Count:         n,
-				MaxChainDepth: mb.MaxChainDepth(),
-			})
+	for _, mb := range r.boxes {
+		result = append(result, mb.partitionStatuses()...)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].AgentID != result[j].AgentID {
+			return result[i].AgentID < result[j].AgentID
+		}
+		if result[i].RunID != result[j].RunID {
+			return result[i].RunID < result[j].RunID
+		}
+		return result[i].SessionID < result[j].SessionID
+	})
+	return result
+}
+
+func (mb *Mailbox) partitionStatuses() []MailboxStatus {
+	msgs := mb.snapshotUnread()
+	type partitionKey struct {
+		runID     runcontract.RunID
+		sessionID string
+	}
+	type partition struct {
+		status MailboxStatus
+		seen   map[string]struct{}
+	}
+	byKey := make(map[partitionKey]*partition)
+	order := make([]partitionKey, 0)
+	for _, msg := range msgs {
+		key := partitionKey{runID: msg.RunID, sessionID: msg.SessionID}
+		part := byKey[key]
+		if part == nil {
+			part = &partition{status: MailboxStatus{
+				AgentID: mb.ownerID, EventType: mb.eventType,
+				RunID: msg.RunID, SessionID: msg.SessionID,
+			}, seen: make(map[string]struct{})}
+			byKey[key] = part
+			order = append(order, key)
+		}
+		part.status.Count++
+		if msg.ChainDepth > part.status.MaxChainDepth {
+			part.status.MaxChainDepth = msg.ChainDepth
+		}
+		if msg.Type == MsgTypeQuestion || msg.Type == MsgTypeSteer || msg.Priority == PriorityHigh {
+			part.status.WakeWorthy = true
+		}
+		if source := strings.TrimSpace(msg.SourceTaskID); source != "" {
+			if _, exists := part.seen[source]; !exists {
+				part.seen[source] = struct{}{}
+				part.status.SourceTaskIDs = append(part.status.SourceTaskIDs, source)
+			}
 		}
 	}
-	return result
+	out := make([]MailboxStatus, 0, len(order))
+	for _, key := range order {
+		out = append(out, byKey[key].status)
+	}
+	return out
 }
 
 // ScanAll 返回所有已注册邮箱的状态快照（包括空邮箱）。
@@ -671,6 +786,9 @@ func (r *Registry) RegisterAlias(alias, targetID string) {
 // 当 hookRunner 未挂接（nil）时，所有 hook 调用被跳过，行为与 Phase 1
 // 字节级一致 —— 这是 V9 回归验证的基础。
 func (r *Registry) Send(msg Message) error {
+	if err := msg.ValidateEnvelope(); err != nil {
+		return err
+	}
 	runner := r.snapshotHookRunner()
 
 	// BeforeSend hook 决策
@@ -705,10 +823,13 @@ func (r *Registry) Send(msg Message) error {
 			mb.TrySend(msg)
 		}
 		r.emitHistory(session.HistEventMailSent, map[string]any{
-			"from":    msg.From,
-			"to":      msg.To,
-			"type":    msg.Type,
-			"summary": msg.Summary,
+			"from":           msg.From,
+			"to":             msg.To,
+			"type":           msg.Type,
+			"summary":        msg.Summary,
+			"run_id":         msg.RunID,
+			"source_task_id": msg.SourceTaskID,
+			"session_id":     msg.SessionID,
 		})
 		return nil
 	}
@@ -725,10 +846,13 @@ func (r *Registry) Send(msg Message) error {
 	}
 	mb.TrySend(msg)
 	r.emitHistory(session.HistEventMailSent, map[string]any{
-		"from":    msg.From,
-		"to":      msg.To,
-		"type":    msg.Type,
-		"summary": msg.Summary,
+		"from":           msg.From,
+		"to":             msg.To,
+		"type":           msg.Type,
+		"summary":        msg.Summary,
+		"run_id":         msg.RunID,
+		"source_task_id": msg.SourceTaskID,
+		"session_id":     msg.SessionID,
 	})
 	return nil
 }
@@ -814,6 +938,18 @@ func (r *Registry) lookup(id string) (*Mailbox, bool) {
 	return mb, ok
 }
 
+// CanonicalAgentID 把 alias 解析为真实 mailbox owner。notifier/steer 控制面
+// 用真实 owner 与 Task.Agents 对账，避免 alias 导致无法建立来源 correlation。
+func (r *Registry) CanonicalAgentID(id string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if canonical, ok := r.aliases[id]; ok {
+		id = canonical
+	}
+	_, ok := r.boxes[id]
+	return id, ok
+}
+
 // ExportSnapshot 导出所有已注册邮箱的快照。Messages 只包含 channel 中
 // 尚未 Drain 的真实未读邮件；recent 是观察环，包含已读历史，不属于可恢复状态。
 // 为保持既有序列化约定，Messages 仍按“最新在前”存储；ImportSnapshot
@@ -830,14 +966,17 @@ func (r *Registry) ExportSnapshot() []session.MailboxSnapshot {
 		for i, msg := range unreadMsgs {
 			// unreadMsgs 最旧在前；持久化 schema 约定最新在前。
 			msgSnaps[len(unreadMsgs)-1-i] = session.MessageSnapshot{
-				From:       msg.From,
-				To:         msg.To,
-				Content:    msg.Content,
-				Summary:    msg.Summary,
-				Type:       msg.Type,
-				Priority:   msg.Priority,
-				SentAt:     msg.SentAt.UTC().Format(time.RFC3339),
-				ChainDepth: msg.ChainDepth,
+				From:         msg.From,
+				To:           msg.To,
+				Content:      msg.Content,
+				Summary:      msg.Summary,
+				Type:         msg.Type,
+				Priority:     msg.Priority,
+				SentAt:       msg.SentAt.UTC().Format(time.RFC3339),
+				ChainDepth:   msg.ChainDepth,
+				SourceTaskID: msg.SourceTaskID,
+				RunID:        msg.RunID,
+				SessionID:    msg.SessionID,
 			}
 		}
 		snaps = append(snaps, session.MailboxSnapshot{
@@ -877,6 +1016,10 @@ func prepareSnapshotImport(snaps []session.MailboxSnapshot) ([]mailboxSnapshotIm
 			messages[len(snap.Messages)-1-i] = Message{
 				From: ms.From, To: ms.To, Content: ms.Content, Summary: ms.Summary,
 				Type: ms.Type, Priority: ms.Priority, SentAt: sentAt, ChainDepth: ms.ChainDepth,
+				SourceTaskID: ms.SourceTaskID, RunID: ms.RunID, SessionID: ms.SessionID,
+			}
+			if err := messages[len(snap.Messages)-1-i].ValidateEnvelope(); err != nil {
+				return nil, fmt.Errorf("invalid message envelope for mailbox %s: %w", snap.OwnerID, err)
 			}
 		}
 		prepared = append(prepared, mailboxSnapshotImport{

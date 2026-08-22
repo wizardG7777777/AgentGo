@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"agentgo/internal/llm"
+	"agentgo/internal/runcontract"
 )
 
 // LLMFactory 用 model 名构造 llm.Client。bootstrap 通常用 buildKindLLMClient
@@ -37,11 +38,12 @@ type SpawnRequest struct {
 	BaseKind               string
 	Override               RuntimeOverride
 	InitialTaskDescription string
-	Lifecycle              string // "one_shot" 是 v5 仅支持的值；空串等同 one_shot
-	SourceTaskID           string // 触发 spawn 的上游任务，也是 initial Task 的显式 parent
-	ReplyToAgentID         string // 接收 initial Task 生命周期汇报的上游代理邮箱
-	BatchID                string // 继承触发事件的批次；空时回退 SourceTaskID
-	Depth                  int    // 本次 spawn 后的 reactor 深度；根事件触发 spawn 时为 1
+	Lifecycle              string            // "one_shot" 是 v5 仅支持的值；空串等同 one_shot
+	SourceTaskID           string            // 触发 spawn 的上游任务，也是 initial Task 的显式 parent
+	SourceRunID            runcontract.RunID // 新 Run trace 携带的来源身份；非空时 source Task 必须可解引用且一致
+	ReplyToAgentID         string            // 接收 initial Task 生命周期汇报的上游代理邮箱
+	BatchID                string            // 继承触发事件的批次；空时回退 SourceTaskID
+	Depth                  int               // 本次 spawn 后的 reactor 深度；根事件触发 spawn 时为 1
 }
 
 // RuntimeOverride 描述 spawn_agent.override 中允许覆盖的字段子集。
@@ -50,11 +52,10 @@ type SpawnRequest struct {
 // 标记 system prompt 是否被显式覆盖（区分"override 了空串"与"未 override"）。
 // V6 起不再含循环上限与上下文硬限覆盖（两者均已删除）。
 type RuntimeOverride struct {
-	SystemPrompt                 string
-	SystemPromptSet              bool
-	Model                        string
-	TaskMaxRetries               int
-	EnforceCompactTokenThreshold int
+	SystemPrompt    string
+	SystemPromptSet bool
+	Model           string
+	TaskMaxRetries  int
 }
 
 // SpawnHost 是 reactor.userdef.spawn_agent 消费的 spawn 接口。

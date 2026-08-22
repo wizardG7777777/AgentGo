@@ -227,6 +227,18 @@ func TestRequestReplan_GraphTaskSkipsPublish(t *testing.T) {
 	}
 }
 
+func TestRequestReplan_NewRunRequiresResolvableSourceTask(t *testing.T) {
+	st := newReplanWakeStore()
+	r := loadRequestReplan(t, requestReplanYAML, Deps{Store: st})
+	err := r.Run(trace.Event{Kind: trace.KindTaskFailed, TaskID: "missing-task", RunID: "run-new"})
+	if err == nil || !strings.Contains(err.Error(), "不可解引用") {
+		t.Fatalf("新 Run source 丢失必须 fail-closed: %v", err)
+	}
+	if wakes := wakeTasks(t, st); len(wakes) != 0 {
+		t.Fatalf("source 丢失时不得发布 recovery Task: %+v", wakes)
+	}
+}
+
 func TestRequestReplan_WhenFiltersBeforePublish(t *testing.T) {
 	cap := installTraceCapture(t, trace.KindTaskPublished)
 	st := newReplanWakeStore()
@@ -267,8 +279,8 @@ type failingWakeStore struct {
 	scanErr    error
 }
 
-func (f *failingWakeStore) PublishTask(*model.Task) error     { return f.publishErr }
-func (f *failingWakeStore) ScanAll() ([]*model.Task, error)   { return nil, f.scanErr }
+func (f *failingWakeStore) PublishTask(*model.Task) error   { return f.publishErr }
+func (f *failingWakeStore) ScanAll() ([]*model.Task, error) { return nil, f.scanErr }
 func (f *failingWakeStore) GetTask(string) (*model.Task, error) {
 	return nil, errors.New("未找到")
 }

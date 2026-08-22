@@ -22,13 +22,12 @@ func defaultBase(t *testing.T) (config.AgentKind, map[string][]string) {
 	prompt := filepath.Join(dir, "sys.md")
 	writeFile(t, prompt, "BASE SYSTEM PROMPT")
 	return config.AgentKind{
-		Kind:                         "explorer",
-		EventType:                    "explore",
-		Tools:                        []string{"read_file", "list_dir"},
-		SystemPromptFile:             prompt,
-		Model:                        "gpt-base",
-		TaskMaxRetries:               3,
-		EnforceCompactTokenThreshold: 50000,
+		Kind:             "explorer",
+		EventType:        "explore",
+		Tools:            []string{"read_file", "list_dir"},
+		SystemPromptFile: prompt,
+		Model:            "gpt-base",
+		TaskMaxRetries:   3,
 	}, nil
 }
 
@@ -51,7 +50,7 @@ func TestBuildAdhocRuntime_NoOverride_InheritsAll(t *testing.T) {
 	if rt.Model != "gpt-base" {
 		t.Errorf("Model=%q want gpt-base (base wins, llm default unused)", rt.Model)
 	}
-	if rt.TaskMaxRetries != 3 || rt.EnforceCompactTokenThreshold != 50000 {
+	if rt.TaskMaxRetries != 3 {
 		t.Errorf("base numeric fields not inherited: %+v", rt)
 	}
 	if len(rt.AllowedTools) != 2 {
@@ -82,9 +81,6 @@ func TestBuildAdhocRuntime_Override_AppliesNonZero(t *testing.T) {
 		t.Errorf("TaskMaxRetries not overridden: %d", rt.TaskMaxRetries)
 	}
 	// 未 override 的字段保持 base
-	if rt.EnforceCompactTokenThreshold != 50000 {
-		t.Errorf("EnforceCompactTokenThreshold should stay base=50000, got %d", rt.EnforceCompactTokenThreshold)
-	}
 }
 
 func TestBuildAdhocRuntime_ModelFallbackChain(t *testing.T) {

@@ -4,8 +4,11 @@ import (
 	"fmt"
 	"strings"
 
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
 	"agentgo/internal/reactor"
+	"agentgo/internal/runcontract"
+	"agentgo/internal/taskcontract"
 	"agentgo/internal/trace"
 )
 
@@ -121,8 +124,21 @@ func (r *requestReplanReactor) Run(ev trace.Event) error {
 		return fmt.Errorf("request_replan[%s]: event has no source task id", r.name)
 	}
 
-	// 图身份识别：GetTask 失败（任务已淘汰等）按非图任务处理，请求不丢。
-	if src, err := r.store.GetTask(ev.TaskID); err == nil && src != nil && src.GraphID != "" {
+	// 图身份识别与 Run binding 都以 source Task 为权威。旧 trace 没有 RunID
+	// 时允许已淘汰 Task 走 legacy；新 Run 的 source 丢失或身份不一致必须
+	// fail-closed，不能发布一条全空 binding 的伪 legacy recovery Task。
+	src, sourceErr := r.store.GetTask(ev.TaskID)
+	if ev.RunID != "" {
+		if sourceErr != nil || src == nil {
+			return fmt.Errorf("request_replan[%s]: 新 Run %s 的 source Task %s 不可解引用: %v",
+				r.name, ev.RunID, ev.TaskID, sourceErr)
+		}
+		if string(src.RunID) != ev.RunID {
+			return fmt.Errorf("request_replan[%s]: source Task RunID=%s 与事件 RunID=%s 不一致",
+				r.name, src.RunID, ev.RunID)
+		}
+	}
+	if src != nil && src.GraphID != "" {
 		trace.Emit(trace.Event{
 			Kind:   trace.KindError,
 			TaskID: ev.TaskID,
@@ -164,6 +180,14 @@ func (r *requestReplanReactor) Run(ev trace.Event) error {
 		EventSource:    "replan-request",
 		ParentTaskID:   ev.TaskID,
 		MaxConcurrency: 1,
+	}
+	if src != nil {
+		if err := taskcontract.Inherit(src, wake, loopcontract.WorkCoordination); err != nil {
+			return fmt.Errorf("request_replan[%s]: inherit RunContract: %w", r.name, err)
+		}
+		if wake.RunContract != nil {
+			wake.RunPhase = runcontract.PhaseRecovery
+		}
 	}
 	if err := r.store.PublishTask(wake); err != nil {
 		return fmt.Errorf("request_replan[%s]: publish wake task: %w", r.name, err)

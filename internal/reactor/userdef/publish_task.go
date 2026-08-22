@@ -1,9 +1,13 @@
 package userdef
 
 import (
+	"errors"
 	"fmt"
 
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
+	"agentgo/internal/store"
+	"agentgo/internal/taskcontract"
 	"agentgo/internal/trace"
 )
 
@@ -72,6 +76,40 @@ func (r *publishTaskReactor) Run(ev trace.Event) error {
 		ParentTaskID:   ev.TaskID,
 		ReplyToAgentID: ev.AgentID,
 		BatchID:        batchID,
+	}
+	var parent *model.Task
+	reader, readable := r.store.(interface {
+		GetTask(string) (*model.Task, error)
+	})
+	if readable && ev.TaskID != "" {
+		var getErr error
+		parent, getErr = reader.GetTask(ev.TaskID)
+		if getErr != nil {
+			if ev.RunID != "" || !errors.Is(getErr, store.ErrTaskNotFound) {
+				return fmt.Errorf("publish_task[%s]: read parent RunContract: %w", r.name, getErr)
+			}
+			// 无 RunID 的旧 trace 允许 source 已被淘汰；保持全空 binding 的
+			// 显式 legacy 兼容，不伪造新的 Run 身份。
+			parent = nil
+		}
+	}
+	if ev.RunID != "" {
+		if ev.TaskID == "" || !readable || parent == nil {
+			return fmt.Errorf("publish_task[%s]: 新 Run %s 缺少可解引用 source Task", r.name, ev.RunID)
+		}
+		if string(parent.RunID) != ev.RunID {
+			return fmt.Errorf("publish_task[%s]: source Task RunID=%s 与事件 RunID=%s 不一致",
+				r.name, parent.RunID, ev.RunID)
+		}
+	}
+	if parent != nil {
+		workClass := loopcontract.WorkInvestigation
+		if parent.ProgressContract != nil {
+			workClass = parent.ProgressContract.WorkClass
+		}
+		if err := taskcontract.Inherit(parent, task, workClass); err != nil {
+			return fmt.Errorf("publish_task[%s]: inherit RunContract: %w", r.name, err)
+		}
 	}
 	if err := r.store.PublishTask(task); err != nil {
 		return fmt.Errorf("publish_task[%s]: store.PublishTask: %w", r.name, err)

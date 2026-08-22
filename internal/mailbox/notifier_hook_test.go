@@ -146,13 +146,14 @@ func TestNotifier_BeforeWake_DoesNotBreakInlineDedup(t *testing.T) {
 	mb1.TrySend(Message{From: "a", Content: "x"})
 	mb2.TrySend(Message{From: "a", Content: "y"})
 
-	// 永远 Continue 的 runner，确保 inline EventType 去重仍然生效
+	// 永远 Continue 的 runner；定向 wake 按 agent 分区，第二次 scan 才做
+	// (agent,Run) 幂等，不能跨 agent 合并。
 	reg.AttachHookRunner(&mockHookRunner{})
 
 	n.scan()
 	tasks, _ := s.ScanAll()
-	if len(tasks) != 1 {
-		t.Fatalf("inline EventType 去重应仍然生效（同 type 只发 1 个），实际: %d", len(tasks))
+	if len(tasks) != 2 {
+		t.Fatalf("同 type 的两个 agent 应各发 1 个定向 wake，实际: %d", len(tasks))
 	}
 }
 

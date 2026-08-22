@@ -9,8 +9,10 @@ import (
 	"github.com/google/uuid"
 
 	"agentgo/internal/config"
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
 	"agentgo/internal/runner"
+	"agentgo/internal/taskcontract"
 	"agentgo/internal/trace"
 )
 
@@ -87,7 +89,7 @@ func (m *Manager) SetParentContext(ctx context.Context) {
 //
 // ctx 参数：用于 reactor 触发时的请求上下文（取消语义，例如父事件 timeout）。
 // 真正绑定到 runner 的 ctx 派生自 m.parentCtx，与 ctx 无关——避免 reactor 短生命周期取消把 runner 拖死。
-func (m *Manager) Spawn(_ context.Context, req SpawnRequest) (string, string, error) {
+func (m *Manager) Spawn(ctx context.Context, req SpawnRequest) (string, string, error) {
 	if req.Lifecycle != "" && req.Lifecycle != "one_shot" {
 		return "", "", fmt.Errorf("spawn_agent: lifecycle %q not implemented (v5.x; only one_shot)", req.Lifecycle)
 	}
@@ -123,6 +125,9 @@ func (m *Manager) Spawn(_ context.Context, req SpawnRequest) (string, string, er
 	if err != nil {
 		return "", "", fmt.Errorf("spawn_agent: build runtime: %w", err)
 	}
+	if err := runner.ValidatePromptCompatibility(ctx, rt, m.deps); err != nil {
+		return "", "", fmt.Errorf("spawn_agent: L1/L2 runtime contract: %w", err)
+	}
 
 	// 构造独立 LLMClient（per-spawn）
 	kindLLM := m.llmFactory(rt.Model)
@@ -143,6 +148,38 @@ func (m *Manager) Spawn(_ context.Context, req SpawnRequest) (string, string, er
 		ReplyToAgentID: req.ReplyToAgentID,
 		BatchID:        batchID,
 		Depth:          req.Depth,
+	}
+	var sourceTask *model.Task
+	reader, readable := m.publisher.(interface {
+		GetTask(string) (*model.Task, error)
+	})
+	if req.SourceRunID != "" && (req.SourceTaskID == "" || !readable) {
+		return "", "", fmt.Errorf("spawn_agent: 新 Run %s 缺少可解引用 source Task", req.SourceRunID)
+	}
+	if readable && req.SourceTaskID != "" {
+		var getErr error
+		sourceTask, getErr = reader.GetTask(req.SourceTaskID)
+		if getErr != nil {
+			return "", "", fmt.Errorf("spawn_agent: read source RunContract: %w", getErr)
+		}
+	}
+	if req.SourceRunID != "" {
+		if sourceTask == nil {
+			return "", "", fmt.Errorf("spawn_agent: 新 Run %s 的 source Task %s 不存在", req.SourceRunID, req.SourceTaskID)
+		}
+		if sourceTask.RunID != req.SourceRunID {
+			return "", "", fmt.Errorf("spawn_agent: source Task RunID=%s 与事件 RunID=%s 不一致",
+				sourceTask.RunID, req.SourceRunID)
+		}
+	}
+	workClass := loopcontract.WorkInvestigation
+	if sourceTask != nil && sourceTask.ProgressContract != nil {
+		workClass = sourceTask.ProgressContract.WorkClass
+	}
+	if sourceTask != nil {
+		if err := taskcontract.Inherit(sourceTask, task, workClass); err != nil {
+			return "", "", fmt.Errorf("spawn_agent: inherit RunContract: %w", err)
+		}
 	}
 
 	// F9：closed 检查、initial_task 发布、active spawn 登记、wg.Add 必须在

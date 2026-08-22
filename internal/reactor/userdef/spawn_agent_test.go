@@ -61,7 +61,7 @@ reactors:
 	}
 	if err := rs[0].Run(trace.Event{
 		Kind: trace.KindTaskFailed, TaskID: "T-1", AgentID: "worker-1",
-		BatchID: "batch-1", Reason: "rate limit",
+		RunID: "run-1", BatchID: "batch-1", Reason: "rate limit",
 	}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -78,6 +78,9 @@ reactors:
 	}
 	if got.SourceTaskID != "T-1" {
 		t.Errorf("SourceTaskID=%q", got.SourceTaskID)
+	}
+	if got.SourceRunID != "run-1" {
+		t.Errorf("SourceRunID=%q", got.SourceRunID)
 	}
 	if got.ReplyToAgentID != "worker-1" || got.BatchID != "batch-1" {
 		t.Fatalf("spawn request routing metadata = %+v", got)

@@ -467,6 +467,28 @@ reactors:
 	}
 }
 
+func TestPublishTask_NewRunRequiresResolvableSourceTask(t *testing.T) {
+	dir := t.TempDir()
+	writePrompt(t, dir, "p.md", "x ${event.task.id}")
+	yamlData := []byte(`
+reactors:
+  - on: task_failed
+    publish_task: { kind: x, description: { file: ./p.md } }
+`)
+	store := &fakeStore{}
+	rs, err := Load(yamlData, dir, dir, Deps{Store: store})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	err = rs[0].Run(trace.Event{Kind: trace.KindTaskFailed, TaskID: "T", RunID: "run-new"})
+	if err == nil || !strings.Contains(err.Error(), "可解引用 source Task") {
+		t.Fatalf("新 Run 缺少 source lookup authority 必须 fail-closed: %v", err)
+	}
+	if tasks := store.snapshot(); len(tasks) != 0 {
+		t.Fatalf("source 丢失时不得发布 Task: %+v", tasks)
+	}
+}
+
 // spawn_agent 已在 S6 实现，相关测试见 spawn_agent_test.go。
 // via_translator 仅在 spawn_agent.initial_task.description 下生效，相关测试见
 // spawn_agent_test.go 的 ViaTranslator 用例。

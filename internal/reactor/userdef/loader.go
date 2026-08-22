@@ -292,7 +292,6 @@ func buildSpawnAgent(name string, kind trace.EventKind, when *whenCond, a *Spawn
 		}
 		override.Model = a.Override.Model
 		override.TaskMaxRetries = a.Override.TaskMaxRetries
-		override.EnforceCompactTokenThreshold = a.Override.EnforceCompactTokenThreshold
 		if a.Override.SystemPrompt != nil {
 			tpl, err := loadPrompt(*a.Override.SystemPrompt, descBaseDir, projectRoot)
 			if err != nil {
@@ -375,10 +374,10 @@ func validateSpawnOverride(o SpawnOverride) error {
 	case o.ContextLimit != 0:
 		// V6 迁移诊断：固定上下文硬限已删除，显式设置即报错，不静默忽略。
 		return fmt.Errorf("spawn_agent.override.context_limit was removed in V6: context fitting is handled by history compaction and overflow retry, not a fixed hard cap; delete this field")
+	case o.EnforceCompactTokenThreshold != 0:
+		return fmt.Errorf("spawn_agent.override.enforce_compact_token_threshold was removed: Context v3 derives replay projection from current Snapshot pressure; delete this field")
 	case o.TaskMaxRetries < 0:
 		return fmt.Errorf("spawn_agent.override.task_max_retries must be >= 0")
-	case o.EnforceCompactTokenThreshold < 0:
-		return fmt.Errorf("spawn_agent.override.enforce_compact_token_threshold must be >= 0")
 	}
 	return nil
 }

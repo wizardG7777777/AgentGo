@@ -7,11 +7,18 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"agentgo/internal/agent"
 	"agentgo/internal/config"
+	"agentgo/internal/contextadapter"
 	"agentgo/internal/llm"
+	"agentgo/internal/loopcontract"
+	"agentgo/internal/model"
+	"agentgo/internal/policycatalog"
 	"agentgo/internal/runner"
 	"agentgo/internal/store"
+	"agentgo/internal/taskcontract"
 	"agentgo/internal/trace"
 )
 
@@ -179,6 +186,32 @@ func TestManager_Spawn_RejectsNilDependencies(t *testing.T) {
 	}
 }
 
+func TestManagerSpawnRejectsOversizedPromptBeforeRunner(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks := store.NewMemoryTaskStore(nil, 8, 1, 60)
+	cfg := &config.Config{
+		LLM:    config.LLMConfig{DefaultModel: "fake-model"},
+		Agents: []config.AgentKind{{Kind: "explorer", Tools: []string{"read_file"}}},
+	}
+	m := NewManager(cfg, runner.RunnerDeps{ContextRuntime: agent.ContextRuntime{
+		Adapter: contextadapter.New(), Policies: catalog,
+	}}, fakeLLMFactory, tasks)
+	_, _, err = m.Spawn(context.Background(), SpawnRequest{
+		BaseKind: "explorer", InitialTaskDescription: "检查",
+		Override: RuntimeOverride{SystemPromptSet: true, SystemPrompt: strings.Repeat("策", 22<<10)},
+	})
+	if err == nil || !strings.Contains(err.Error(), "L1/L2 runtime contract") ||
+		!strings.Contains(err.Error(), "fragment_limit_exceeded") {
+		t.Fatalf("ad-hoc Spawn 必须在 Runner/Task 副作用前拒绝超限 Prompt: %v", err)
+	}
+	if all, _ := tasks.ScanAll(); len(all) != 0 {
+		t.Fatalf("Prompt 预检失败后不应发布 initial task: %+v", all)
+	}
+}
+
 func TestManager_Spawn_PublishesInitialTaskDepth(t *testing.T) {
 	cfg := &config.Config{
 		LLM: config.LLMConfig{DefaultModel: "fake-model"},
@@ -189,6 +222,14 @@ func TestManager_Spawn_PublishesInitialTaskDepth(t *testing.T) {
 		}},
 	}
 	taskStore := store.NewMemoryTaskStore(nil, 0, 1, 60)
+	source := &model.Task{ID: "source-task-1", Description: "来源任务"}
+	if err := taskcontract.Start(source, loopcontract.WorkInvestigation, "test-spawn/v1",
+		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskStore.PublishTask(source); err != nil {
+		t.Fatal(err)
+	}
 	parent, cancelParent := context.WithCancel(context.Background())
 	cancelParent()
 	m := NewManager(cfg, runner.RunnerDeps{Store: taskStore}, fakeLLMFactory, taskStore)
@@ -198,6 +239,7 @@ func TestManager_Spawn_PublishesInitialTaskDepth(t *testing.T) {
 		BaseKind:               "explorer",
 		InitialTaskDescription: "x",
 		SourceTaskID:           "source-task-1",
+		SourceRunID:            source.RunID,
 		ReplyToAgentID:         "worker-1",
 		BatchID:                "batch-1",
 		Depth:                  4,
@@ -216,6 +258,9 @@ func TestManager_Spawn_PublishesInitialTaskDepth(t *testing.T) {
 	}
 	if task.ParentTaskID != "source-task-1" || task.ReplyToAgentID != "worker-1" || task.BatchID != "batch-1" {
 		t.Fatalf("spawned task routing metadata = %+v", task)
+	}
+	if task.RunID != source.RunID || task.RunContract == nil || task.ContextPolicyRef == "" || task.ProgressContract == nil {
+		t.Fatalf("spawned task 未继承完整 Run binding: %+v", task)
 	}
 	if got := m.ActiveCount(); got != 1 {
 		t.Fatalf("ActiveCount=%d want 1 before terminal cleanup", got)

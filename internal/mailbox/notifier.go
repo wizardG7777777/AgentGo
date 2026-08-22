@@ -1,12 +1,16 @@
 package mailbox
 
 import (
+	"fmt"
 	"log"
 	"strings"
 	"time"
 
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
+	"agentgo/internal/taskcontract"
 )
 
 // MailNotifier 是邮差 goroutine，定期扫描信箱，为有未读消息的空闲代理发布唤醒任务。
@@ -48,6 +52,18 @@ func (n *MailNotifier) Run(ctx interface{ Done() <-chan struct{} }) {
 // 当所有 BeforeWake hook 都没有返回 WakeDescription 时使用。
 const defaultWakeDescription = "你收到了来自其他代理的消息，请查看收件箱并根据消息内容采取行动。"
 
+type mailWakeKey struct {
+	agentID   string
+	eventType string
+	runID     runcontract.RunID
+	sessionID string
+}
+
+type activeMailRunKey struct {
+	agentID string
+	runID   runcontract.RunID
+}
+
 // scan 扫描所有非空信箱，为需要唤醒的代理发布唤醒任务。
 //
 // Phase 2 改动：
@@ -69,13 +85,32 @@ func (n *MailNotifier) scan() {
 		return
 	}
 
-	// 收集已有的 mail-notifier pending 任务的 EventType 集合（inline 去重，
-	// D4 双重防御的内层）
-	pendingNotifyTypes := make(map[string]bool)
+	// 新 wake 按 (agent, event_type, Run, Session) 精确去重。旧版本 wake 没有
+	// target/run，只能继续作为该 event_type 的 legacy 全局占位；它绝不能
+	// 压住带 RunID 的新分区。
+	pendingPartitions := make(map[mailWakeKey]bool)
+	legacyPendingTypes := make(map[string]bool)
+	activeRuns := make(map[activeMailRunKey]bool)
 	for _, task := range allTasks {
-		if task.EventSource == "mail-notifier" && task.Status == model.TaskStatusPending {
-			pendingNotifyTypes[task.EventType] = true
+		if task == nil {
+			continue
 		}
+		if task.Status == model.TaskStatusProcessing && task.RunID != "" {
+			for _, agentID := range task.Agents {
+				activeRuns[activeMailRunKey{agentID: agentID, runID: task.RunID}] = true
+			}
+		}
+		if task.EventSource != "mail-notifier" || model.IsTerminal(task.Status) {
+			continue
+		}
+		if task.MailboxTargetAgentID == "" && task.RunID == "" {
+			legacyPendingTypes[task.EventType] = true
+			continue
+		}
+		pendingPartitions[mailWakeKey{
+			agentID: task.MailboxTargetAgentID, eventType: task.EventType,
+			runID: task.RunID, sessionID: task.MailboxSessionID,
+		}] = true
 	}
 
 	// 读取当前挂接的 hook runner（可能为 nil → 退化为 noop）
@@ -87,14 +122,26 @@ func (n *MailNotifier) scan() {
 			continue
 		}
 
-		// inline 去重：该 EventType 已有 pending 的唤醒任务
-		if pendingNotifyTypes[status.EventType] {
+		key := mailWakeKey{agentID: status.AgentID, eventType: status.EventType, runID: status.RunID, sessionID: status.SessionID}
+		if pendingPartitions[key] || (status.RunID == "" && legacyPendingTypes[status.EventType]) {
+			continue
+		}
+		if status.RunID != "" && !status.WakeWorthy {
+			// 与旧 WakeWorthyFilter 同一固定规则，但直接在当前 Run 分区上
+			// 机械判定，避免读取跨 Run recent ring。普通 info/reply/ack 等待
+			// 目标 Agent 下一次同 Run Task 自然 drain，不制造寄生 LLM 调用。
+			continue
+		}
+		if status.RunID != "" && activeRuns[activeMailRunKey{agentID: status.AgentID, runID: status.RunID}] {
+			// 目标 Agent 已在同 Run 内执行，会在下一轮顶部消费该分区；不再
+			// 排一个完成后才会执行的冗余 wake。
 			continue
 		}
 
-		// BeforeWake hook 决策（D4 镜像防御 + D2 累加 description）
+		// legacy 邮件继续使用既有 hook 链；新 Run 分区不调用读取整个 recent
+		// ring 的旧 hook，避免 wake description 把其它 Run 的摘要带入 L2。
 		description := defaultWakeDescription
-		if runner != nil {
+		if status.RunID == "" && runner != nil {
 			abort, reason, hookName, wakeDesc := runner.BeforeWake(
 				status.AgentID, status.EventType, status.Count,
 			)
@@ -106,15 +153,39 @@ func (n *MailNotifier) scan() {
 			if wakeDesc != "" {
 				description = wakeDesc
 			}
+		} else if status.RunID != "" {
+			description = fmt.Sprintf(
+				"你在 Run %s 中收到了 %d 条代理消息；只消费当前 Run/Session 的邮箱分区并完成协调，不得读取或处理其它 Run 的邮件。",
+				status.RunID, status.Count)
 		}
 
-		// 发布唤醒任务
+		// 发布 agent+Run 定向唤醒任务。
 		wakeTask := &model.Task{
-			Description:    description,
-			EventType:      status.EventType,
-			EventSource:    "mail-notifier",
-			Priority:       10, // 高优先级，优先被领取
-			MailChainDepth: status.MaxChainDepth,
+			Description:          description,
+			EventType:            status.EventType,
+			EventSource:          "mail-notifier",
+			Priority:             10, // 高优先级，优先被领取
+			MailChainDepth:       status.MaxChainDepth,
+			MailboxTargetAgentID: status.AgentID,
+			MailboxSessionID:     status.SessionID,
+			MaxConcurrency:       1,
+		}
+		if status.RunID != "" {
+			source, sourceErr := n.resolveRunSource(status)
+			if sourceErr != nil {
+				log.Printf("[mail-notifier] Run 分区拒绝唤醒 (agent=%s run=%s): %v", status.AgentID, status.RunID, sourceErr)
+				continue
+			}
+			wakeTask.ParentTaskID = source.ID
+			if err := taskcontract.Inherit(source, wakeTask, loopcontract.WorkCoordination); err != nil {
+				log.Printf("[mail-notifier] Run 分区继承契约失败 (agent=%s run=%s): %v", status.AgentID, status.RunID, err)
+				continue
+			}
+			if wakeTask.RunID != status.RunID {
+				log.Printf("[mail-notifier] Run 分区来源不一致 (agent=%s status_run=%s source_run=%s)",
+					status.AgentID, status.RunID, wakeTask.RunID)
+				continue
+			}
 		}
 		if err := n.store.PublishTask(wakeTask); err != nil {
 			log.Printf("[mail-notifier] 发布唤醒任务失败 (agent=%s): %v", status.AgentID, err)
@@ -123,7 +194,26 @@ func (n *MailNotifier) scan() {
 				status.AgentID, status.EventType, status.Count, status.MaxChainDepth, wakeTask.ID)
 		}
 
-		// 标记该 EventType 已发布，避免同类型重复
-		pendingNotifyTypes[status.EventType] = true
+		pendingPartitions[key] = true
 	}
+}
+
+func (n *MailNotifier) resolveRunSource(status MailboxStatus) (*model.Task, error) {
+	if status.RunID == "" {
+		return nil, fmt.Errorf("legacy 分区没有 Run source")
+	}
+	var failures []string
+	for _, taskID := range status.SourceTaskIDs {
+		task, err := n.store.GetTask(taskID)
+		if err != nil || task == nil {
+			failures = append(failures, fmt.Sprintf("%s:%v", taskID, err))
+			continue
+		}
+		if task.RunID != status.RunID || task.RunContract == nil || task.ProgressContract == nil || strings.TrimSpace(task.ContextPolicyRef) == "" {
+			failures = append(failures, fmt.Sprintf("%s:binding不一致", taskID))
+			continue
+		}
+		return task, nil
+	}
+	return nil, fmt.Errorf("没有可解引用且完整的 source Task（sources=%v failures=%v）", status.SourceTaskIDs, failures)
 }

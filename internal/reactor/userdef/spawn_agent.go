@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"agentgo/internal/runcontract"
 	"agentgo/internal/spawn"
 	"agentgo/internal/trace"
 )
@@ -79,6 +80,7 @@ func (r *spawnAgentReactor) run(ctx context.Context, ev trace.Event) error {
 		InitialTaskDescription: desc,
 		Lifecycle:              r.lifecycle,
 		SourceTaskID:           ev.TaskID,
+		SourceRunID:            runcontract.RunID(ev.RunID),
 		ReplyToAgentID:         ev.AgentID,
 		BatchID:                ev.BatchID,
 		Depth:                  ev.Depth + 1,

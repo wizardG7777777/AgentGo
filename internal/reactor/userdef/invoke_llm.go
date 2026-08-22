@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"agentgo/internal/mailbox"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/trace"
 )
 
@@ -192,13 +193,11 @@ func (s *sendMessageSinkImpl) dispatch(ev trace.Event, llmOutput string) error {
 		return fmt.Errorf("send_message: rendered 'to' is empty")
 	}
 	msg := mailbox.Message{
-		From:     "reactor:" + s.msgType,
-		To:       to,
-		Content:  llmOutput,
-		Summary:  truncateForSummary(llmOutput, 120),
-		Type:     s.msgType,
-		Priority: s.priority,
-		SentAt:   time.Now(),
+		From: "reactor:" + s.msgType, To: to, Content: llmOutput,
+		Summary: truncateForSummary(llmOutput, 120), Type: s.msgType, Priority: s.priority, SentAt: time.Now(),
+	}
+	if ev.RunID != "" {
+		msg.SourceTaskID, msg.RunID, msg.SessionID = ev.TaskID, runcontract.RunID(ev.RunID), ev.SessionID
 	}
 	return s.sender.Send(msg)
 }

@@ -87,17 +87,18 @@ func TestNotifier_Dedup(t *testing.T) {
 	mb1.TrySend(Message{From: "a", Content: "x"})
 	mb2.TrySend(Message{From: "a", Content: "y"})
 
-	// 第一次 scan：应发布 1 个唤醒任务（同 EventType="" 去重）
+	// 第一次 scan：每个目标 agent 的 legacy 分区各发布一个定向 wake；
+	// 不能再让同 EventType 的一个 wake 误领另一个 agent 的邮箱。
 	n.scan()
 	tasks, _ := s.ScanAll()
-	if len(tasks) != 1 {
-		t.Fatalf("同 EventType 去重后应只有 1 个唤醒任务，实际: %d", len(tasks))
+	if len(tasks) != 2 {
+		t.Fatalf("两个目标 agent 应各有 1 个唤醒任务，实际: %d", len(tasks))
 	}
 
 	// 第二次 scan：pending 任务仍在，不应重复发布
 	n.scan()
 	tasks, _ = s.ScanAll()
-	if len(tasks) != 1 {
+	if len(tasks) != 2 {
 		t.Fatalf("去重后不应重复发布，实际: %d", len(tasks))
 	}
 }
