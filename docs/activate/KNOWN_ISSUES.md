@@ -1,6 +1,41 @@
 # KNOWN_ISSUES — 当前限制与验证缺口
 
-最后核对：2026-08-19。
+最后核对：2026-08-22。
+
+## 2026-08-22 五层架构修复的当前开放项
+
+本轮已落地 Invocation/Context/Effect/Loop/Graph 的主要 canonical contract、
+durable Store 和生产接线，并通过 full/race/vet/build、harness 单测与真实二进制；但以下
+仍是当前发布判断中的真实开放项：
+
+- **L5 legacy 退出**：新图已走 Draft/Definition/commit/start、ChangeProposal、
+  typed outcome/outbox；旧 `submit_graph`/direct `patch_graph` 仍保留受限兼容面，
+  尚未达到无生产调用方的删除门。
+- **L3 Effect unknown 人工边界**：两阶段 TerminalIntent 在 bounded settlement
+  window 到期后只把仍未返回的 L4 action 标为 `ActionUnknown` 并 Seal checkpoint；
+  它不会篡改、重放或自动补偿 Effect Journal 中的 prepared/unknown 外部副作用。
+  这类 Effect 仍需按 Effect authority 进行人工核验。
+- **基础层/L2 provider 证据**：Context v7/Replay v2、动态 OutputBudget 与
+  `startup_probe=tool` fixture 已接入；仍开放真实 tokenizer 与更多 provider-specific
+  SSE/usage fixture，不把一个 OpenAI-compatible 后端外推成所有后端能力。
+- **SWE-015…019 实现已关闭**：Response replay、Raw History projection、Attempt/
+  deadline、Scheduler phase Prompt/ToolRouter、真实 Lease、Tool batch/ToolResultRef
+  已完成，并通过 full/race/vet/build/真实二进制验证。完成记录见
+  [`第六轮 0/8 分层诊断`](../test-issues/2026-08-22-1510-swe-round6-zero-of-eight-layered-diagnosis.md) 第12节。
+- **SWE-020…026 实现已落地**：versioned harness、typed/bounded runtime snapshot、
+  Context v7、Run/Attempt 与 Invocation-failure 进展分离、simple Graph/current
+  transaction、typed Proposal Acceptance、Graph intervention scope 已进入生产主链；
+  仍需一批8题证明跨题稳定性，当前不标 external-closed。
+- **验证横切面**：仓库内 SWE harness 与最新 `automatic-options` 单题已实际运行。
+  最新脱敏结果为 `architecture_ok=true / task_resolved=false`：首轮 Prompt 2463
+  tokens，GraphDraft 第1次调用产生，Definition revision=1、typed outcome=blocked，Graph activation
+  TaskOutcome 全部 commit/ACK，已知架构事故为零；Worker 未产生源码写入，Judge
+  仍为 failed。按门禁没有运行8题，因此 SWE-011～019 仍不能用外部证据关闭。
+  详见 [`主链修复与单题门禁`](../test-issues/2026-08-22-2258-swe-mainline-repair-and-single-gate.md)。
+  三平台 CI 仍是发布层开放证据。
+
+统一状态与后续顺序见
+[`SWE 架构修复统一实施路线图`](../design/swe-architecture-repair-roadmap.md)。
 
 本文件只记录当前仍会影响使用、开发或发布判断的限制。2026-07-18 UI Hub 改造的 41 项问题均已修复，原始核查与测试证据已归档至 [ui-hub-remediation-2026-07-18.md](../archived/ui-hub-remediation-2026-07-18.md)。2026-07-20 验收事实核验失败循环与级联取消事故已修复，证据归档至 [acceptance-fact-verification-and-cascade-incident-2026-07-20.md](../archived/acceptance-fact-verification-and-cascade-incident-2026-07-20.md)。2026-07-21 artifact 路径归一化缺陷导致的验收马拉松事故已修复，证据归档至 [artifact-path-normalization-incident-2026-07-21.md](../archived/artifact-path-normalization-incident-2026-07-21.md)。2026-07-21 验收空转（6 次 AcceptanceRun）与 Scheduler 篡改工作区事故已修复，证据归档至 [acceptance-spin-and-env-mutation-incident-2026-07-21.md](../archived/acceptance-spin-and-env-mutation-incident-2026-07-21.md)。2026-07-22 浪费可观测化专项落地：TUI 顶栏新增 session 级 token 总计（Hub 进程级累加器喂入，ad-hoc 团队销毁后消耗不隐形）；trace CLI 新增 stats 子命令（task/agent/plan 三维度 token 聚合 + 浪费口径 + 异常提示，见 TraceGuide §3.4）；watchdog 为 pending 级联取消补发 task_cancelled 事件（此前排队中的级联取消在 trace 中不可见）；修正 detectAnomalies 第 9 条从不命中的死检查（cancel_source 实际值为 dependency_failure）。2026-07-27 Windows ConPTY 长多行粘贴被固定 100ms Enter 防抖切成多条请求的问题已修复，状态机与回归证据归档至 [windows-tui-multiline-paste-incident-2026-07-27.md](../archived/windows-tui-multiline-paste-incident-2026-07-27.md)。2026-07-27 shell 旁路写入（`run_shell` 写文件不产生 `file_written` 事件）导致 artifact 账本缺失、`expected_artifacts` 校验假阴性的问题已修复：record-artifact Reactor 现订阅 `KindShellExecuted`，成功命令后对任务声明的 ExpectedArtifacts 做盘后补登（幂等、workspace 感知、回归测试见 `internal/reactor/builtin/record_artifact_test.go`）。2026-07-27 plan 楔死事故（验收目标含失败节点：验收 runner 认领闸要求 completed 而永远 pending、supersede 不改写 acceptance 节点依赖边被 digest 校验回滚、run 创建零预警）已修复：验收 runner（AcceptanceRunID 非空）依赖只需终态、supersede 改写全部剩余当前节点依赖边、EnsureAcceptanceRun 追加 `acceptance_target_incomplete` PlanWarning，回归见 `internal/plan/supersede_redirect_test.go`、`internal/store/claim_acceptance_runner_test.go`、`internal/bootstrap/supersede_wedge_test.go`。2026-07-28 验收证据类型混挂（verifier 把 command 佐证证据挂到 file_hash criterion，连续三次真实运行复现）已修复：类型化 criterion 的证据纯度违例消息改为指明违例证据 ID 与修正指引，verifier 指引文本补 typed-criterion purity 规则，回归见 `internal/plan/acceptance_evidence_purity_test.go`。2026-07-28 Agent 工作台跨轮输出被最新一轮覆盖的问题已修复：Scheduler 与普通 Agent 现共用不可变完成轮次事件和 Session `turns.jsonl` 账本，TUI/Web 可恢复并浏览全部轮次；证据归档至 [agent-turn-history-loss-incident-2026-07-28.md](../archived/agent-turn-history-loss-incident-2026-07-28.md)。2026-07-29 验收 verifier 的 command 证据在 Windows 上误读 UTF-8 中文文件（PowerShell 对无 BOM 文件按系统 ANSI/GBK 解码，子串断言全部误 fail；行为评测全量首跑 long-form-write 连续两轮验收因此翻车，verifier 自述「文档实际含全部标题」仍被迫判 fail）已修复：内置 verifier 指引补充「内容断言优先 read_file/file_hash 证据；必须 command 证据时显式带 -Encoding UTF8」（`internal/agenttemplate/prompts/verifier.md`）。2026-07-29 expected-artifacts 校验「账本失忆」空转（重试/替代任务换新任务 ID 后 artifact 账本为空，前次尝试写好的文件明明在盘上却连撞提交拒绝，eval smoke 实测 worker 空转 4 轮 + 一次重试回滚）已修复：校验增加磁盘兜底——账本缺失的预期项经 `agent.NewArtifactPhysicalResolver` 解析后 stat，盘上存在（非目录）即转入 `ArtifactCheckResult.Recovered` 视为满足；resolver 为 nil 时退化为纯账本比对，装配点见 `internal/runner/runner.go` 与 `internal/runner/dependency_map.go`。截至本次核对，没有把已修复条目重新列为开放缺陷。
 
@@ -10,7 +45,7 @@
 
 2026-08-19 同批复测暴露的四项编排缺陷已修复：(1) Graph controller 节点租约越权——scheduler 把执行节点声明为 controller 后被路由回自己，经合成授予拿到完整注册工具面并亲自修改业务代码，架空验收链；现 controller 的 `BusinessTools` 恒为空集（新算与快照复用双路校验），图校验期拒绝 controller 声明 `capability.tools`。(2) Scheduler 直答逃逸——scheduler 不建图、不发任务、空答复直接收口（5 轮调查后零交付）。现分两层：空响应（无文本且无工具调用）一律视为异常轮次，注入提醒继续，连续 3 次按可恢复错误收口重试；新增 `scheduler-closure-review` Gate 在 report_done preCall 审查收口——零图/零 delegated 任务/零 pending 交互时，空 summary 直接拒绝，非空直答须二次确认后放行并记 `scheduler_direct_answer` 日志。(3) 占位图防线——实测 title="t"/description="d" 的占位图通过校验并被真实派发；现 controller/agent/acceptance 节点的 title/description 为单个 ASCII 字母/数字时校验拒绝（单字中文不受影响，阈值刻意保守只拦占位符）。回归见 `internal/agent/empty_response_test.go`、`internal/hook/builtin/scheduler_closure_test.go`、`internal/graph/validate_test.go`（`TestRejectPlaceholderNodeText` / `TestRejectControllerCapabilityTools`）与 `internal/agent/execution_lease_test.go`。
 
-2026-08-20 第三轮 Flask SWE 复测（Nebius DeepSeek-V4-Flash）暴露的模板装配漏接已按「机制搁置」处置：Scheduler 现场 provision 的图节点执行 Team 全部字段取自内嵌 `builtin/generalist@1` 模板（`internal/team/manager.go` 物化段），YAML kind 的 prompt / 工具闭集 / `enforce_compact_token_threshold` 被整体绕过——模板写死阈值 4000 导致 worker 每个 loop 历史被压到 4 条的「失忆循环」（单节点 123 轮零写入、两题 400+ 调用），模板自带 web 工具击穿禁网纪律，通用 prompt 导致不守 `submit_task_result` 协议。处置：`agent_templates.enabled` 缺省 `false`，Scheduler 不再注册 `list_agent_templates` / `provision_agent_team`、资源快照不含模板，图节点只路由静态 YAML Agent；Scheduler 提示词 provision 教程全部移除、改为静态路由纪律（v7.6）。TeamManager 与 catalog 装配保留，重新开放机制时需同时恢复提示词组队教程、修正内嵌模板 limits（4000/3000 过低）与 web 工具授予。回归见 `internal/bootstrap/agent_template_runtime_test.go`（`TestBootstrapTemplateToolsGatedByEnabledFlag`）与 `internal/scheduler/scheduler_test.go`（`TestSchedulerSystemPrompt_StaticRoutingTemplatesShelved`）。
+2026-08-20 第三轮 Flask SWE 复测（Nebius DeepSeek-V4-Flash）暴露的模板装配漏接已按「机制搁置」处置：Scheduler 现场 provision 的图节点执行 Team 全部字段取自内嵌 `builtin/generalist@1` 模板，模板写死的累计压缩阈值导致「失忆循环」，模板自带 web 工具又击穿禁网纪律。当前 `agent_templates.enabled` 仍缺省 `false`；2026-08-22 Context v3 修复已从 AgentTemplate schema 删除 `enforce_compact_token_threshold`（旧模板显式设置报迁移诊断），因此重新开放时只需重新评审 phase Prompt、静态 route 与 web 工具授权，不得恢复模板私有 Context 阈值。
 
 2026-08-20 同批复测暴露的「纯文本自然退出绕过一切收口」（SWE-001）已按兜底+预防分层修复：ReAct 循环「有文本、零工具调用」的自然退出路径不经任何工具调用，挂在 `report_done` 上的收口 Gate 对它结构性不可达（scheduler 两题 graph=0 零交付逃逸、worker/verifier 节点不调 `submit_task_result` 假完成、scheduler 处理图变更请求时 134KB 文本不调 `patch_graph`）。修复：①scheduler 根任务的零证据收口审查移到 processTask 终态判别处（新端口 `hook.NaturalExitReviewer`，实现复用 `SchedulerClosureHook` 并与 Gate 共享 confirmed 状态——report_done 与纯文本两路径同一「拒绝一次、确认放行」语义）；②图节点任务纯文本退出视为未提交，注入 submit_task_result 提醒（上限 2 次）后按可恢复错误收口；③收口契约由系统从 GraphID/GraphNodeKind 派生钉入 `TaskMemory.Constraints`（每轮渲染注入、压缩不可达）；④`taskmem.ApplyAttemptEnd` 把 attempt 终止原因有界写入 Failures，重试接手可见；⑤长 JSON 防线：`submit_graph` 语法期失败强制附「骨架图 + patch_graph 逐次扩展」建议、载荷超 8000 rune 附温和提醒、LLM 层 tool_call 参数解析失败错误携带载荷字符数。回归见 `internal/agent/natural_exit_review_test.go`、`internal/hook/builtin/scheduler_closure_test.go`（ReviewNaturalExit 四例）、`internal/agent/task_memory_contract_test.go`、`internal/taskmem/update_test.go`（TestApplyAttemptEnd）、`internal/tools/graph_control_test.go`（长 JSON 两例）与 `internal/llm/client_test.go`（载荷尺寸一例）；5 个旧图任务文本收口测试已更正为结构化收口路径。问题台账与阶段管理见 `docs/test-issues/`。
 
@@ -102,7 +137,7 @@
 
 验收机制已于数据流重构中整体换代（设计：`docs/design/scheduler-prompt-and-acceptance-redesign.md` §4）：
 
-- **数据流绑定**：源 activation 终态先把完整 Result/Evidence 写入 activation 级 durable Result Store；每条实际生效转移再把稳定 `ResultRef`、≤32KiB 内联值、目标输入端口和结构化 EvidenceEntry 绑定给目标 activation（`TransitionRecord.Input` → `Execution.Input`）。下游任务自动注入「## 上游输入」；EvidenceRef 由 CallID+调用内容或 artifact 身份稳定生成，不依赖展示序数。router/join/恢复路径按 ResultRef 精确解引用，大结果与回边覆盖旧 Execution 后仍可恢复。
+- **数据流绑定**：源 activation 终态先把完整 Result/Evidence 写入 activation 级 durable Result Store；每条实际生效转移再把稳定 `ResultRef`、≤32KiB 内联值、目标输入端口和结构化 EvidenceEntry 绑定给目标 activation（`TransitionRecord.Input` → `Execution.Input`）。下游任务通过 typed `Task.ContextInputs` 进入 L2 `upstream_result/upstream_evidence`，不再拼入 Description；EvidenceRef 由 CallID+调用内容或 artifact 身份稳定生成，不依赖展示序数。router/join/恢复路径按 ResultRef 精确解引用。
 - **谱系核验判定矩阵**（`internal/graph/acceptance.go`）：验收 agent 经 `submit_task_result` 的 `cited_evidence`（逗号分隔 EvidenceRef）引用其实际消费的证据；服务端只核**谱系**——引用 ∈ 该 acceptance activation 的上游 Input 谱系 ∪ verifier 自身任务证据。越谱系引用 = disputed：不采信 verdict（节点 failed + graph change 唤醒）；**不引用不判死**（旧 `unverifiable` 判死与 command/file_hash/task_status 逐字格式契约整体删除，G1b 注入式 `AcceptanceVerifier` 退役）。
 - **data-ready 端口门控**：join / acceptance 的 `required_inputs` 是目标输入端口；入边通过 `target_input` 绑定，并行必需来源使用不同端口，每个端口只有一条生产边。acceptance 可用 `required_evidence` 声明端口所需证据 kind；缺口随任务注入且 Runtime 不采信 pass。
 - **当前 authoring 安全基线**：Runtime 尚无 flow generation/correlation token，因此非 barrier 节点最多一条静态入边，join / acceptance 端口也是单赋值；条件分支各自保留后续与 `end`，不支持共享端口 OR 或重新汇入同一普通节点。循环体可直接作为 root（隐式初始 activation + 唯一回边）。复杂 OR mux / 跨代汇流是 future token 能力，不属于当前 Scheduler 可生成拓扑。

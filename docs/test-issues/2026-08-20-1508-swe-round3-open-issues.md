@@ -118,7 +118,7 @@ graph=0 逃逸 session 中 Gate 日志为 0）。
 3. `graph-terminal-feed` 失败必须重试或把节点显式推进 failed 并唤醒
    scheduler 裁决，禁止静默丢终态。
 
-## SWE-003 长 JSON 生成失控 + 工具名污染（P1，阶段 3，**partially-fixed(2026-08-20)**）
+## SWE-003 长 JSON 生成失控 + 工具名污染（P1，阶段 3，**partially-fixed；残余拆分归档(2026-08-22)**）
 
 **已落地（预防 1，检测提醒）**：
 - `submit_graph` JSON 语法期失败的错误回执强制附带分批建议（「先交
@@ -135,6 +135,13 @@ graph=0 逃逸 session 中 Gate 日志为 0）。
 2. 流式早夭检测（生成中途发现 args JSON 已崩即提前中断，省整轮超时）；
 3. structured output / response_format 对长 JSON 的约束效果评估。
 
+**2026-08-22 重分类**：第 2 项流式 hard cap/早夭正式并入
+[`Context Snapshot / Item Budget`](../design/context-snapshot-item-budget.md)，完整
+Graph JSON 生成路径并入 [`Graph Draft / Commit / Start`](../design/graph-draft-commit-start.md)，
+malformed 后无界重试并入
+[`Loop Progress Contract / Checkpoint / Deadline`](../design/loop-progress-checkpoint-and-deadline.md)。
+第 3 项只保留为 provider structured-output capability 实验，不成为框架安全前提。
+
 **现象**：DeepSeek-V4-Flash 单次 completion 冲到 16K–31K tokens 时
 `submit_graph` 载荷 JSON 语法全部损坏（三次失败三种坏法：invalid char
 ')' / '?' / ']'），是 automatic-options / teardown-callbacks 两题 graph=0
@@ -147,7 +154,7 @@ parameter...`），既浪费两段共 271s，又是 SWE-002 的污染源。
 2. 工具名清洗与 SWE-002 第 2 条同一处落地；
 3. 评估 LLM 层 structured output / response_format 对长 JSON 的约束效果。
 
-## SWE-004 图设计死胡同与终态语义（P1，阶段 3，**partially-fixed(2026-08-21)**）
+## SWE-004 图设计死胡同与终态语义（P1，阶段 3，**既有修复保持；残余并入 SWE-012(2026-08-22)**）
 
 **设计已定稿（2026-08-20）**：`docs/design/graph-terminal-contract-v2.md`
 ——封闭终态 status 三值、图任务 event 废弃、业务路由全走数据字段、
@@ -179,6 +186,13 @@ outcome 落账另列；子问题 1（无返工回边）仍为提示词 doctrine 
 
 **残余敞口**：子问题 1（failed 边无返工回边）与子问题 3（end outcome
 落账）不在本期——前者随 scheduler 提示词重构专场，后者另列设计。
+
+**2026-08-22 重分类**：子问题 1 的 doctrine 与结构覆盖进入 GraphContract/
+Proposal Acceptance；子问题 3 已由
+[`Graph Draft / Commit / Start`](../design/graph-draft-commit-start.md) 的 typed
+EndOutcome、GraphStatus 推导和 Outcome/Recovery/UI 切片吸收。SWE-004 不再建立
+独立残余设计。相关生产实现已经落地；在 SWE-012 完成定义与外部回归满足前，
+状态为 `subsumed-by-SWE-012 / implementation-landed / validation-open`。
 
 **现象**（scheduler 生成图的设计缺陷，属提示词域）：
 - failed 边只去 end 死节点、无返工回边——session-access-tracking 中 checker
