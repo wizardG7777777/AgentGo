@@ -217,8 +217,8 @@ func TestComputeExecutionLease_ControlToolsByRole(t *testing.T) {
 
 	graphController := &model.Task{ID: "t-gc", EventType: "__scheduler__", GraphID: "g1", GraphNodeKind: "controller"}
 	lease, _ = ag.computeExecutionLease(graphController)
-	if strings.Join(lease.ControlTools, ",") != "request_replan,submit_task_result" {
-		t.Fatalf("Graph controller ControlTools = %v，want [request_replan submit_task_result]", lease.ControlTools)
+	if strings.Join(lease.ControlTools, ",") != "patch_graph,read_graph,request_replan,submit_task_result" {
+		t.Fatalf("Graph controller ControlTools = %v", lease.ControlTools)
 	}
 
 	for _, tc := range []struct {
@@ -563,12 +563,12 @@ func TestProcessTask_LeaseViewIsBusinessUnionControl(t *testing.T) {
 }
 
 // Graph controller 是纯控制面：即便节点显式声明了业务工具（旧版图可能如此），
-// 租约层也必须把它剥到只剩控制通道——LLM 视野只有 request_replan +
-// submit_task_result，scheduler 认领也不例外（2026-08-19 SWE 越权事故回归锁）。
+// 租约层也必须剥掉业务工具，只保留 runtime read/legacy patch/replan/submit
+// 控制通道，scheduler 认领也不例外。
 func TestProcessTask_GraphControllerExplicitLeaseFiltersSchedulerTools(t *testing.T) {
 	s, _, _ := setup()
 	ag, _, mock := newLeaseAgent("scheduler", "__scheduler__", s,
-		"read_file", "request_replan", "submit_task_result", "report_done", "submit_graph", "patch_graph")
+		"read_file", "read_graph", "request_replan", "submit_task_result", "report_done", "submit_graph", "patch_graph")
 	task := &model.Task{
 		ID: "t-graph-controller", Description: "完成简单图节点", EventType: "__scheduler__",
 		GraphID: "g-controller", NodeID: "root", ActivationID: "root@1", GraphNodeKind: "controller",
@@ -589,10 +589,11 @@ func TestProcessTask_GraphControllerExplicitLeaseFiltersSchedulerTools(t *testin
 	for _, def := range mock.toolDefs[0] {
 		names = append(names, def.Name)
 	}
-	if got := strings.Join(names, ","); got != "request_replan,submit_task_result" {
-		t.Fatalf("Graph controller LLM 工具面=%q，want 仅控制通道 [request_replan submit_task_result]", got)
+	slices.Sort(names)
+	if got := strings.Join(names, ","); got != "patch_graph,read_graph,request_replan,submit_task_result" {
+		t.Fatalf("Graph controller LLM 工具面=%q，want runtime 控制通道", got)
 	}
-	for _, forbidden := range []string{"read_file", "report_done", "submit_graph", "patch_graph"} {
+	for _, forbidden := range []string{"read_file", "report_done", "submit_graph"} {
 		if slices.Contains(names, forbidden) {
 			t.Fatalf("Graph controller 显式租约不得看见 %s: %v", forbidden, names)
 		}
@@ -602,8 +603,19 @@ func TestProcessTask_GraphControllerExplicitLeaseFiltersSchedulerTools(t *testin
 		t.Fatalf("Graph controller 租约应持久化: task=%+v err=%v", got, err)
 	}
 	if len(got.Lease.BusinessTools) != 0 ||
-		strings.Join(got.Lease.ControlTools, ",") != "request_replan,submit_task_result" {
+		strings.Join(got.Lease.ControlTools, ",") != "patch_graph,read_graph,request_replan,submit_task_result" {
 		t.Fatalf("Graph controller 冻结租约不符（业务工具必须为空）: %+v", got.Lease)
+	}
+}
+
+func TestAuthoringGraphControllerLeaseHidesLegacyPatchGraph(t *testing.T) {
+	task := &model.Task{
+		GraphID: "g-authoring", GraphNodeKind: "controller",
+		GraphDefinitionDigestVersion: "agentgo.graph-authoring-definition-digest/v1",
+	}
+	got := deriveControlTools(task)
+	if strings.Join(got, ",") != "read_graph,request_replan,submit_task_result" {
+		t.Fatalf("authoring controller 控制面=%v，不应暴露 legacy patch_graph", got)
 	}
 }
 

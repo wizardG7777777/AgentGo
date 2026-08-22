@@ -154,7 +154,7 @@ func TestProcessTask_NonGraphWorkerTextExitUnchanged(t *testing.T) {
 }
 
 // TestProcessTask_SchedulerRootTextExitRetryOnFormatCollapse 审查返回 Retry=true
-//（疑工具调用格式崩盘）时按可恢复错误回滚 pending 重试，不得记 completed
+// （疑工具调用格式崩盘）时按可恢复错误回滚 pending 重试，不得记 completed
 // （2026-08-21 SWE-008 三态状态机的 LOOP 接线）。
 func TestProcessTask_SchedulerRootTextExitRetryOnFormatCollapse(t *testing.T) {
 	s, r, _ := setup()

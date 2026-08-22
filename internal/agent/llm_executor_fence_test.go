@@ -55,7 +55,7 @@ func skippedEvents(events []trace.Event) []trace.Event {
 }
 
 // [submit_task_result, write_file, run_shell] 同一响应：后两者不执行
-//（磁盘无产物、shell 未跑、ToolCallRecord 只记真实执行的提交调用），
+// （磁盘无产物、shell 未跑、ToolCallRecord 只记真实执行的提交调用），
 // 各自收到「已跳过」提示并产生一条 tool_call_skipped。
 func TestFinalizingFence_SkipsTrailingToolCalls(t *testing.T) {
 	traceDir := setupTraceWriter(t)

@@ -24,6 +24,14 @@ func (s *failingResultFieldsStore) CommitBlockedResult(string, string, string, m
 	return s.err
 }
 
+func (s *failingResultFieldsStore) FreezeTaskLease(taskID string, lease *model.ExecutionLease) (*model.ExecutionLease, bool, error) {
+	return store.FreezeTaskLease(s.TaskStore, taskID, lease)
+}
+
+func (s *failingResultFieldsStore) RevokeTaskLease(taskID string) (*model.ExecutionLease, bool, error) {
+	return store.RevokeTaskLease(s.TaskStore, taskID)
+}
+
 func TestStructuredSubmissionFormat(t *testing.T) {
 	sub := &StructuredSubmission{
 		TaskID:          "t1",

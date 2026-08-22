@@ -74,8 +74,8 @@ func TestProcessTask_InvocationIDCorrelatesTripleEvents(t *testing.T) {
 			t.Errorf("loop %d 三事件 InvocationID 不一致: manifest=%q start=%q end=%q",
 				loop, tr.manifest, tr.start, tr.end)
 		}
-		// 格式 <taskID前8>-<loop>-<seq>
-		wantPrefix := fmt.Sprintf("%s-%d-", task.ID[:8], loop)
+		// 格式 <AttemptID>/turn-N/invocation-seq，跨重试/恢复不碰撞。
+		wantPrefix := fmt.Sprintf("%s/attempt-1/turn-%d/invocation-", task.ID, loop+1)
 		if got := tr.start; len(got) <= len(wantPrefix) || got[:len(wantPrefix)] != wantPrefix {
 			t.Errorf("loop %d InvocationID = %q, 期望前缀 %q", loop, got, wantPrefix)
 		}

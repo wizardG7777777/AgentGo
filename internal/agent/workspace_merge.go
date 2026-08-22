@@ -67,15 +67,27 @@ func (a *Agent) mergeWorkspaceBeforeComplete(ctx context.Context, task *model.Ta
 	// H2b Effect Journal：合并是状态迁移（Policy=never_replay——禁止自动
 	// 重放，冲突走 replan），执行前先落账（prepared）。Target 载任务 ID
 	//（workspace 坐标由 taskID 唯一确定）。
-	effID := a.effectPrepare(effect.KindWorkspaceMerge, taskID, taskID,
+	effID, journalErr := a.effectPrepare(effect.KindWorkspaceMerge, taskID, taskID,
 		effectDigest12([]byte(taskID+"|"+a.ID)), effect.PolicyNeverReplay)
+	if journalErr != nil {
+		// Prepare 未 durable，必须在 MergeTask 之前拒绝；
+		// MayHaveHappened=false 证明本次没有进入 workspace 合并边界。
+		a.failWorkspaceMerge(task, taskID,
+			"effect_authority: workspace 合并意图落账失败: "+journalErr.Error(), nil)
+		return false
+	}
 
 	result, err := mgr.MergeTask(ctx, taskID, a.ID)
 	switch {
 	case err != nil:
 		// 合并执行返回错误：主根是否被部分改写不可知 → unknown。
-		a.effectMarkUnknown(effID, "合并执行错误: "+err.Error())
+		journalErr := a.effectMarkUnknown(effID, "合并执行错误: "+err.Error())
 		log.Printf("[agent %s] 任务 %s workspace 合并失败: %v", a.ID, taskID, err)
+		if journalErr != nil {
+			a.failWorkspaceMerge(task, taskID,
+				"effect_authority: workspace 合并可能已发生且 unknown 落账失败: "+journalErr.Error(), nil)
+			return false
+		}
 		a.failWorkspaceMerge(task, taskID,
 			fmt.Sprintf("workspace_conflict: 合并执行失败: %v", err), nil)
 		return false
@@ -86,8 +98,14 @@ func (a *Agent) mergeWorkspaceBeforeComplete(ctx context.Context, task *model.Ta
 			regions += len(rep.Conflicts)
 		}
 		// 冲突结果已知（未合并，现场保留走 replan）——记 settled 载冲突摘要。
-		a.effectSettle(effID, fmt.Sprintf("conflict: files=%d regions=%d（未合并，任务转 failed 走 replan）",
-			len(conflicted), regions))
+		if journalErr := a.effectSettle(effID,
+			fmt.Sprintf("conflict: files=%d regions=%d（未合并，任务转 failed 走 replan）",
+				len(conflicted), regions), false); journalErr != nil {
+			a.failWorkspaceMerge(task, taskID,
+				"effect_authority: workspace 合并冲突结算落账失败: "+journalErr.Error(),
+				&mergeConflictDetail{paths: conflicted, regions: regions})
+			return false
+		}
 		log.Printf("[agent %s] 任务 %s workspace 合并冲突（%d 个文件，%d 处冲突区域）: %v",
 			a.ID, taskID, len(conflicted), regions, conflicted)
 		a.failWorkspaceMerge(task, taskID,
@@ -100,7 +118,13 @@ func (a *Agent) mergeWorkspaceBeforeComplete(ctx context.Context, task *model.Ta
 	// 合并成功：清理任务 workspace。Cleanup 失败不阻断完成——合并已落盘，
 	// 孤儿目录交 Watchdog 经 ListOrphans 清扫。
 	merged := mergeOutcomeSummary(result)
-	a.effectSettle(effID, "merged: "+merged)
+	if journalErr := a.effectSettle(effID, "merged: "+merged, true); journalErr != nil {
+		// 主根已发生合并，但权威结算不可证明：保留 workspace 现场，
+		// 任务 fail-closed，禁止 SubmitResult 和自动重放。
+		a.failWorkspaceMerge(task, taskID,
+			"effect_authority: workspace 合并可能已发生但 settle 落账失败: "+journalErr.Error(), nil)
+		return false
+	}
 	if err := mgr.Cleanup(taskID); err != nil {
 		log.Printf("[agent %s] 任务 %s workspace 合并成功后清理失败（不阻断，交 Watchdog 清扫）: %v",
 			a.ID, taskID, err)

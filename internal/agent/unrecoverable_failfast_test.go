@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
 	"agentgo/internal/trace"
@@ -22,9 +23,9 @@ import (
 // 无限重试 166+ 次（~25 分钟空转）。当时 ErrUnrecoverable 已分类正确，但 handleFailure
 // 在某些路径下仍然回到 RetryRollback。
 //
-// 当前 handleFailure（agent.go:723-814）通过 errors.As(execErr, &ErrRecoverable) 二分
-// 判定，凡不可恢复的（含 ErrUnrecoverable + 任何其他类型）一律走 terminateTask；
-// 此前的 §9.3 修复早已生效，§9.4 诊断映射叠加在终止 reason 之上。
+// 当前 handleFailure 优先提取 canonical InvocationFailure 并由 L4 policy 决策；
+// 只有完全没有 canonical fact 时才读取 ErrRecoverable 兼容标记。不可恢复事实
+// 一律走 terminateTask，§9.4 诊断映射叠加在终止 reason 之上。
 //
 // 本测试是该路径的端到端不变量护栏：未来若有人重构 handleFailure 把
 // errors.As 顺序写反、或在不可恢复分支增加 retry 早返点，本测试会立即变红。
@@ -122,5 +123,35 @@ func TestUnrecoverable_FailsFastWithoutRetry(t *testing.T) {
 	if strings.Contains(failed.Reason, "401 unauthorized") {
 		t.Errorf("Reason 含裸 SDK 错误串——说明 reason 没经过 diagnoseLLMError 转换；\n  reason = %q",
 			failed.Reason)
+	}
+}
+
+// 外层兼容包装不得覆盖 canonical FailureKind。即使两层旧 wrapper 都叫
+// Recoverable，auth_failure 仍必须直接失败。
+func TestCanonicalFailureOverridesRecoverableWrappers(t *testing.T) {
+	s, r, _ := setup()
+	task := &model.Task{Description: "canonical auth failure", EventType: "code"}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("agent-canonical", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	failure := invocation.NewFailure(invocation.FailureAuth,
+		invocation.PhaseResponseHeaders, invocation.OriginProvider, errors.New("unauthorized"))
+	executor := func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+		return ExecuteResult{}, &ErrRecoverable{Err: &llm.ErrRecoverable{
+			Err: errors.New("legacy says retry"), Failure: failure,
+		}}
+	}
+	ag := NewAgent("agent-canonical", "code", s, r, executor)
+	ag.MaxRetries = 5
+	ag.processTask(context.Background(), task.ID)
+	after, err := s.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != model.TaskStatusFailed || after.RetryCount != 0 {
+		t.Fatalf("canonical auth_failure 被兼容 wrapper 覆盖: status=%s retry=%d", after.Status, after.RetryCount)
 	}
 }

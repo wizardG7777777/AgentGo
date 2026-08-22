@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"time"
 
 	"agentgo/internal/model"
@@ -41,7 +42,7 @@ var leaseWriteTools = []string{"write_file", "edit_file", "run_shell"}
 // durable Lease，防止旧快照或篡改租约把写入/Shell/协调工具带回 verifier。
 var acceptanceLeaseAllowedTools = map[string]struct{}{
 	"read_file": {}, "list_dir": {}, "grep_search": {}, "glob_search": {},
-	"web_search": {}, "web_fetch": {}, "submit_task_result": {},
+	"web_search": {}, "web_fetch": {}, "read_content_ref": {}, "submit_task_result": {},
 }
 
 // acquireExecutionLease 是 processTask 的租约入口：任务已有冻结租约时复用
@@ -76,13 +77,26 @@ func (a *Agent) acquireExecutionLease(task *model.Task) (*model.ExecutionLease, 
 		a.emitExecutionLeaseRejected(task, nil, rejection, missing)
 		return nil, rejection
 	}
+	// 新 Run/Graph 不允许退回 store.FreezeTaskLease 的进程内兼容实现；
+	// durable freezer 是 L3 authority 的装配前提。legacy 无 Run/Graph 的精简
+	// fake 仍可沿旧兼容路径执行。
+	if task.RunContract != nil || task.RunID != "" || task.ContextPolicyRef != "" {
+		if _, ok := a.Store.(interface {
+			FreezeTaskLease(string, *model.ExecutionLease) (*model.ExecutionLease, bool, error)
+		}); !ok {
+			rejection := "新运行契约要求 durable ExecutionLease Store，当前 TaskStore 不支持 FreezeTaskLease"
+			a.emitExecutionLeaseRejected(task, candidate, rejection, nil)
+			return nil, rejection
+		}
+	}
 
 	effective, frozen, err := store.FreezeTaskLease(a.Store, task.ID, candidate)
 	if err != nil {
-		// 冻结落库失败不阻断执行：候选租约降级为进程内事实（与旧无租约
-		// 行为等价），仅记日志。Digest 由确定性计算保证，重试时同输入同值。
-		log.Printf("[agent %s] 任务 %s 执行租约冻结落库失败（降级为进程内租约）: %v", a.ID, task.ID, err)
-		return candidate, ""
+		// ExecutionLease 是 L3 action authority。写失败后继续拿进程内候选执行
+		// 会让恢复、ToolRouter 与 Effect 边界失去同一冻结事实，必须 fail-closed。
+		rejection := fmt.Sprintf("执行租约冻结落库失败，拒绝无 durable authority 的执行: %v", err)
+		a.emitExecutionLeaseRejected(task, candidate, rejection, nil)
+		return nil, rejection
 	}
 	if !frozen {
 		// 并发/重试窗口内已被先冻结：复用既有的那份（emit reused）。
@@ -123,25 +137,20 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 		ceiling = a.ToolSwapper.ToolRegistry().Names()
 	}
 
+	attemptNo := task.AttemptNo
+	if attemptNo <= 0 {
+		attemptNo = task.RetryCount + 1
+	}
 	lease = &model.ExecutionLease{
 		TaskID:   task.ID,
-		Attempt:  task.RetryCount + 1,
+		Attempt:  attemptNo,
 		FrozenAt: time.Now().UTC(),
 	}
-	schedulerControlPlane := task.GraphID == "" && task.EventType == "__scheduler__"
-
 	// --- NodeRequirement ∩ RouteCeiling → BusinessTools ---
 	explicit := task.Capability != nil && len(task.Capability.Tools) > 0
 	switch {
 	case explicit && a.ToolSwapper == nil:
 		return nil, fmt.Sprintf("节点能力要求工具子集 %v，但 executor 不支持按任务工具过滤（Agent.ToolSwapper 未装配），不降级执行",
-			task.Capability.Tools)
-	case explicit && schedulerControlPlane:
-		// 非图 scheduler 控制面任务保持记录型租约语义（见下方同名分支）：即使
-		// swapper 已装配（V6 §2 起供 prompt 编译/审计观测），也不换入
-		// 过滤视图——显式声明无法被 honoring，fail-closed（与 swapper
-		// 未装配时代的拒绝行为一致）。
-		return nil, fmt.Sprintf("节点能力要求工具子集 %v，但任务路由到 scheduler 控制面（记录型租约，不换入过滤视图），不降级执行",
 			task.Capability.Tools)
 	case explicit:
 		if missing := a.ToolSwapper.ToolRegistry().Missing(task.Capability.Tools); len(missing) > 0 {
@@ -149,15 +158,11 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 				missing, task.Capability.Tools)
 		}
 		lease.BusinessTools = model.SortedCopy(task.Capability.Tools)
-	case a.ToolSwapper == nil || schedulerControlPlane:
-		// 非图控制面 agent（scheduler）：保持其现有工具装配不变（它即控制面），
-		// BusinessTools=nil 表示无裁剪面——只生成 Lease 记录，不换入视图。
-		// ToolSwapper=nil 的自定义 executor 没有可换入的 LLM 工具 registry，
-		// 同样只记录角色控制协议；显式 capability 仍在前一分支 fail-closed。
-		// V6 §2 起 scheduler 也装配 ToolSwapper（供 prompt 编译与 /doctor
-		// agents 审计读取工具面），但仅非图 __scheduler__ 任务保留该语义；
-		// 有 ToolSwapper 的 Graph controller 必须像普通节点一样形成并应用
-		// 精确业务工具面。
+	case a.ToolSwapper == nil:
+		// 没有 registry 换入面的 legacy/custom executor 只能形成记录型租约；
+		// 显式 capability 已在前一分支 fail-closed。生产 Scheduler 注入
+		// ToolSwapper，必须像其它 Agent 一样冻结真实 Route ceiling，随后由
+		// phase-specific ToolRouter 逐 Invocation 收窄。
 		lease.Synthetic = true
 	default:
 		// 合成节点能力：未显式声明时需求 = 目标 Route ceiling 全量
@@ -205,9 +210,6 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 
 	// --- 节点角色派生控制通道 ---
 	lease.ControlTools = deriveControlTools(task)
-	if rejection := validateLeaseForTaskRole(task, lease); rejection != "" {
-		return nil, rejection
-	}
 
 	// --- 冻结模型 / 隔离 / 超时 ---
 	lease.Model = a.Model
@@ -219,6 +221,9 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 	}
 
 	lease.Digest = lease.ComputeDigest()
+	if rejection := validateLeaseForTaskRole(task, lease); rejection != "" {
+		return nil, rejection
+	}
 	return lease, ""
 }
 
@@ -226,7 +231,30 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 // Graph 任务的 ControlTools 必须精确等于当前角色派生集合；acceptance 以及
 // 无法证明角色的旧/未知 kind 还要对 ToolUnion 应用 verifier 正向闭集。
 func validateLeaseForTaskRole(task *model.Task, lease *model.ExecutionLease) string {
-	if task == nil || lease == nil || task.GraphID == "" {
+	if task == nil || lease == nil {
+		return ""
+	}
+	strictIdentity := task.RunContract != nil || task.RunID != "" || task.ContextPolicyRef != ""
+	if lease.TaskID != "" && lease.TaskID != task.ID {
+		return fmt.Sprintf("冻结租约 task_id=%q 与当前任务=%q 不一致", lease.TaskID, task.ID)
+	}
+	if strictIdentity && lease.TaskID == "" {
+		return "新运行契约的冻结租约缺少 task_id"
+	}
+	if strictIdentity && lease.Attempt <= 0 {
+		return fmt.Sprintf("冻结租约 attempt=%d 非法", lease.Attempt)
+	}
+	if lease.Revoked {
+		return "冻结租约已 revoked，不得再次执行"
+	}
+	if strings.TrimSpace(lease.Digest) == "" {
+		if strictIdentity {
+			return "新运行契约的冻结租约缺少 digest"
+		}
+	} else if lease.Digest != lease.ComputeDigest() {
+		return fmt.Sprintf("冻结租约 digest=%q 与执行语义不一致", lease.Digest)
+	}
+	if task.GraphID == "" {
 		return ""
 	}
 	expectedControl := deriveControlTools(task)
@@ -293,6 +321,12 @@ func deriveControlTools(task *model.Task) []string {
 	if task.GraphID != "" {
 		switch task.GraphNodeKind {
 		case "controller", "agent":
+			if task.GraphNodeKind == "controller" {
+				if task.GraphDefinitionDigestVersion != "" {
+					return []string{"read_graph", "request_replan", "submit_task_result"}
+				}
+				return []string{"patch_graph", "read_graph", "request_replan", "submit_task_result"}
+			}
 			return []string{"request_replan", "submit_task_result"}
 		case "acceptance", "":
 			return []string{"submit_task_result"}

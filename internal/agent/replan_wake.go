@@ -14,7 +14,10 @@ import (
 	"log"
 	"strings"
 
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
+	"agentgo/internal/runcontract"
+	"agentgo/internal/taskcontract"
 )
 
 // replanRequestMarker 是通用 replan 唤醒任务描述中的幂等标记；查重按该
@@ -68,6 +71,12 @@ func (a *Agent) publishReplanWakeTask(task *model.Task, taskID, reasonCode, deta
 		EventSource:    "replan-request",
 		ParentTaskID:   task.ID,
 		MaxConcurrency: 1, // 同一时刻只允许一个 Scheduler 处理同一请求
+	}
+	if err := taskcontract.Inherit(task, wake, loopcontract.WorkCoordination); err != nil {
+		return fmt.Errorf("继承 replan RunContract: %w", err)
+	}
+	if wake.RunContract != nil {
+		wake.RunPhase = runcontract.PhaseRecovery
 	}
 	if err := a.Store.PublishTask(wake); err != nil {
 		log.Printf("[agent %s] 任务 %s 发布 replan 唤醒任务失败（任务本身终态不受影响）: %v", a.ID, taskID, err)

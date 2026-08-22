@@ -138,3 +138,100 @@ func TestProcessTask_IsolationMergeConflictEffectJournal(t *testing.T) {
 		t.Fatalf("冲突结果已知，应 settled 载 conflict 摘要: %+v", e)
 	}
 }
+
+// workspace merge 的 Prepare 失败必须在 MergeTask 前阻断。
+func TestProcessTask_IsolationMergePrepareFailureStopsMerge(t *testing.T) {
+	s, r, _ := setup()
+	j := openAgentJournal(t)
+	if err := j.Close(); err != nil {
+		t.Fatalf("Close journal: %v", err)
+	}
+	mainRoot := t.TempDir()
+	mgr := &countingManager{real: workspace.NewManager(mainRoot, nil)}
+	swapper := workspace.NewSwapper(mainRoot)
+	taskID := publishIsolationTask(t, s, "agent-iso")
+
+	ag := NewAgent("agent-iso", "code", s, r,
+		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+			return ExecuteResult{Output: "done"}, nil
+		})
+	ag.WorkspaceManager = mgr
+	ag.WorkspaceActivator = swapper
+	ag.EffectJournal = j
+	ag.processTask(context.Background(), taskID)
+
+	if mgr.mergeCalls != 0 {
+		t.Fatalf("Prepare 失败后不得进入 MergeTask，实际 %d", mgr.mergeCalls)
+	}
+	task, err := s.GetTask(taskID)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if task.Status != model.TaskStatusFailed || !strings.Contains(task.Error, "may_have_happened=false") {
+		t.Fatalf("任务应因 Prepare authority 失败收口: status=%s error=%q", task.Status, task.Error)
+	}
+}
+
+// closingMergeManager 在真实合并已落盘后关闭 Journal，精确构造
+// “副作用已发生、Settle authority 失败”的窗口。
+type closingMergeManager struct {
+	base    *countingManager
+	journal *effect.Journal
+}
+
+func (m *closingMergeManager) Materialize(taskID string) (*workspace.View, error) {
+	return m.base.Materialize(taskID)
+}
+
+func (m *closingMergeManager) MergeTask(ctx context.Context, taskID, agentID string) (*workspace.MergeResult, error) {
+	result, err := m.base.MergeTask(ctx, taskID, agentID)
+	if err == nil {
+		_ = m.journal.Close()
+	}
+	return result, err
+}
+
+func (m *closingMergeManager) Cleanup(taskID string) error { return m.base.Cleanup(taskID) }
+
+func TestProcessTask_IsolationMergeSettleFailureIsAuthorityFailure(t *testing.T) {
+	s, r, _ := setup()
+	j := openAgentJournal(t)
+	rawRoot := t.TempDir()
+	realManager := workspace.NewManager(rawRoot, nil)
+	mainRoot := realManager.ProjectRoot()
+	base := &countingManager{real: realManager}
+	mgr := &closingMergeManager{base: base, journal: j}
+	swapper := workspace.NewSwapper(mainRoot)
+	taskID := publishIsolationTask(t, s, "agent-iso")
+	target := filepath.Join(mainRoot, "settle-failed.txt")
+
+	ag := NewAgent("agent-iso", "code", s, r,
+		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+			wsPath, err := swapper.WritePath(target)
+			if err != nil {
+				return ExecuteResult{}, err
+			}
+			if err := os.WriteFile(wsPath, []byte("已合并但未结算"), 0o644); err != nil {
+				return ExecuteResult{}, err
+			}
+			return ExecuteResult{Output: "done"}, nil
+		})
+	ag.WorkspaceManager = mgr
+	ag.WorkspaceActivator = swapper
+	ag.EffectJournal = j
+	ag.processTask(context.Background(), taskID)
+
+	if base.mergeCalls != 1 || base.cleanupCalls != 0 {
+		t.Fatalf("Settle 失败时应保留 workspace 现场: merge=%d cleanup=%d", base.mergeCalls, base.cleanupCalls)
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != "已合并但未结算" {
+		t.Fatalf("真实合并已发生: data=%q err=%v", data, err)
+	}
+	task, err := s.GetTask(taskID)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if task.Status != model.TaskStatusFailed || !strings.Contains(task.Error, "may_have_happened=true") {
+		t.Fatalf("Settle 失败应以 authority failure 阻断 completed: status=%s error=%q", task.Status, task.Error)
+	}
+}

@@ -113,7 +113,7 @@ func (r *ToolRegistry) Dispatch(ctx context.Context, call llm.ToolCall) (string,
 
 // Defs 返回所有已注册工具的定义，用于传给 LLM。
 func (r *ToolRegistry) Defs() []llm.ToolDef {
-	return r.defs
+	return append([]llm.ToolDef(nil), r.defs...)
 }
 
 // Names 返回全部已注册工具名（排序）。供 ExecutionLease 计算把认领方的

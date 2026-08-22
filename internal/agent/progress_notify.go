@@ -10,6 +10,7 @@ import (
 
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
+	"agentgo/internal/model"
 	"agentgo/internal/trace"
 )
 
@@ -127,11 +128,16 @@ func (a *Agent) progressNotify(_ context.Context, taskID string, loopIndex int, 
 			log.Printf("[agent %s] progressNotify panic 被恢复: %v", a.ID, r)
 		}
 	}()
+	var sourceTask *model.Task
+	if a.Store != nil {
+		sourceTask, _ = a.Store.GetTask(taskID)
+	}
 
 	// 1. 文件写入检测
 	if !flags.notifiedFileWrite {
 		if files := detectFileWrite(result); len(files) > 0 {
 			msg := buildFileWriteMsg(a.ID, files, loopIndex)
+			a.bindTaskMailEnvelope(&msg, sourceTask)
 			if err := a.MailRegistry.Send(msg); err != nil {
 				log.Printf("[agent %s] 进度通知(file_write)发送失败: %v", a.ID, err)
 			}
@@ -150,6 +156,7 @@ func (a *Agent) progressNotify(_ context.Context, taskID string, loopIndex int, 
 	if !flags.notifiedSubtask {
 		if detectSubtaskPublish(result) {
 			msg := buildSubtaskMsg(a.ID, loopIndex)
+			a.bindTaskMailEnvelope(&msg, sourceTask)
 			if err := a.MailRegistry.Send(msg); err != nil {
 				log.Printf("[agent %s] 进度通知(subtask)发送失败: %v", a.ID, err)
 			}

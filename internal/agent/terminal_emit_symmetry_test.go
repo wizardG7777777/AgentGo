@@ -12,7 +12,7 @@ import (
 //
 // 守护的不变量（缺一即视为"装配漏接"）：
 //
-//  1. 每个 a.Store.FailTask(...) 调用所在的函数体内必须存在
+//  1. 每个 store.FailTaskWithCause(...) 调用所在的函数体内必须存在
 //     trace.Emit{Kind: trace.KindTaskFailed} 调用——保证 panic-recovery /
 //     terminateTask 等所有失败路径对 trace 观察者可见。
 //  2. processTask 函数体内每个 case <-ctx.Done(): 终结分支必须伴随
@@ -136,7 +136,7 @@ func TestTerminalEmitSymmetry(t *testing.T) {
 		t.Fatalf("AST 扫描未发现任何 trace.Emit 调用——测试本身可能损坏，请检查 isTraceEmit/extractEmitKind 是否仍匹配当前 agent.go 写法")
 	}
 	if len(fails) == 0 {
-		t.Fatalf("AST 扫描未发现任何 a.Store.FailTask 调用——若属意删除该路径请同步评审本不变量；若不是请检查 isFailTaskCall 匹配规则")
+		t.Fatalf("AST 扫描未发现任何 store.FailTaskWithCause 调用——若属意删除该路径请同步评审本不变量；若不是请检查 isFailTaskCall 匹配规则")
 	}
 }
 
@@ -176,17 +176,14 @@ func extractEmitKind(call *ast.CallExpr) string {
 	return ""
 }
 
-// isFailTaskCall 匹配形如 something.Store.FailTask(...) 的调用。
+// isFailTaskCall 匹配统一终态适配器 store.FailTaskWithCause(...)。
 func isFailTaskCall(call *ast.CallExpr) bool {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok || sel.Sel.Name != "FailTask" {
+	if !ok || sel.Sel.Name != "FailTaskWithCause" {
 		return false
 	}
-	inner, ok := sel.X.(*ast.SelectorExpr)
-	if !ok {
-		return false
-	}
-	return inner.Sel.Name == "Store"
+	pkg, ok := sel.X.(*ast.Ident)
+	return ok && pkg.Name == "store"
 }
 
 // isCtxDoneCase 判定 CommClause 是否为 `case <-ctx.Done():` 形态。
