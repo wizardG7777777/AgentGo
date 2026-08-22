@@ -6,8 +6,11 @@ import (
 	"strings"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
+	"agentgo/internal/taskcontract"
 	"agentgo/internal/tools/schema"
 	"agentgo/internal/trace"
 )
@@ -148,6 +151,12 @@ func (g PlanControlGroup) requestGenericReplan(_ context.Context, task *model.Ta
 		ParentTaskID:   task.ID,
 		MaxConcurrency: 1, // 同一时刻只允许一个 Scheduler 处理同一请求
 	}
+	if err := taskcontract.Inherit(task, wake, loopcontract.WorkCoordination); err != nil {
+		return "", fmt.Errorf("继承 replan RunContract: %w", err)
+	}
+	if wake.RunContract != nil {
+		wake.RunPhase = runcontract.PhaseRecovery
+	}
 	if err := g.Store.PublishTask(wake); err != nil {
 		return "", fmt.Errorf("发布 replan 唤醒任务失败: %w", err)
 	}
@@ -209,6 +218,12 @@ func (g PlanControlGroup) requestGraphChange(task *model.Task, args map[string]a
 		EventSource:    "graph-change-request",
 		ParentTaskID:   task.ID,
 		MaxConcurrency: 1, // 与用户请求一致：同一时刻只允许一个 Scheduler 处理同一请求
+	}
+	if err := taskcontract.Inherit(task, wake, loopcontract.WorkCoordination); err != nil {
+		return "", fmt.Errorf("继承 graph change RunContract: %w", err)
+	}
+	if wake.RunContract != nil {
+		wake.RunPhase = runcontract.PhaseRecovery
 	}
 	if err := g.Store.PublishTask(wake); err != nil {
 		return "", fmt.Errorf("发布 graph change 唤醒任务失败: %w", err)

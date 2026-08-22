@@ -5,8 +5,9 @@
 //   - 通过 Group 封装依赖，减少 make*Tool 函数签名的混乱
 //   - 通过组合不同的 Group 即可为代理裁剪能力（Explorer 不组合 LocalWriteGroup → 编译期保证只读）
 //
-// 5 个标准 Group：
+// 标准 Group：
 //   - LocalReadGroup：read_file / list_dir / grep_search / glob_search（Worker + Explorer 共享）
+//   - ContentRefGroup：read_content_ref（冻结 Lease + Session/Graph/Task scope 显式解引用）
 //   - LocalWriteGroup：write_file / edit_file（仅 Worker，嵌入 LocalReadGroup 复用依赖）
 //   - WebGroup：web_search / web_fetch（Worker + Explorer 共享）
 //   - ShellGroup：run_shell（仅 Worker，含审批拦截链）

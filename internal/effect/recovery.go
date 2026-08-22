@@ -90,16 +90,32 @@ func (FileHashVerifier) Verify(e *Effect) VerifyResult {
 	return VerifyResult{Matched: true, Verifiable: true, Detail: "文件 hash 与账载一致"}
 }
 
-// Recover 在启动 Replay 之后执行崩溃恢复裁决，返回逐条未解决
+// Recover 是 legacy 兼容投影。Deprecated：生产恢复必须使用
+// RecoverStrict，避免权威写失败只落日志却继续启动。
+func (j *Journal) Recover(verifier Verifier) []RecoveryDecision {
+	decisions, err := j.RecoverStrict(verifier)
+	if err != nil {
+		log.Printf("[EffectJournal] ERROR 恢复因权威失败被阻断: %v", err)
+	}
+	return decisions
+}
+
+// RecoverStrict 在启动 Replay 之后执行崩溃恢复裁决，返回逐条未解决
 // Effect 裁决清单，供 bootstrap 对对应非终态任务做 quarantine。
 // prepared/dispatched 首先 durable 转 unknown；已是 unknown 的条目也会在
 // 每次启动重新裁决并返回，直到 verify_first 可证明已生效而
 // settle，避免第二次启动遗忘未处理 unknown。verifier 为 nil 时所有
-// verify_first 按「无法核验」处理。
-func (j *Journal) Recover(verifier Verifier) []RecoveryDecision {
+// verify_first 按「无法核验」处理。任何 MarkUnknown/Settle 写失败
+// 都返回 typed AuthorityError，调用方必须停止新执行。
+func (j *Journal) RecoverStrict(verifier Verifier) ([]RecoveryDecision, error) {
 	// 先持锁快照待裁决目标（prepared/dispatched/unknown），再逐条走公开的
 	// MarkUnknown/Settle——避免在遍历索引时嵌套改索引。
 	j.mu.Lock()
+	if j.poison != nil {
+		err := j.poison
+		j.mu.Unlock()
+		return nil, NewAuthorityError(AuthorityPhaseRead, "", true, err)
+	}
 	var pending []*Effect
 	for _, id := range j.order {
 		e := j.index[id]
@@ -128,7 +144,7 @@ func (j *Journal) Recover(verifier Verifier) []RecoveryDecision {
 				decisions = append(decisions, d)
 				emitRecoveryDecided(e, d)
 				log.Printf("[EffectJournal] WARN 恢复标记 unknown 失败 (id=%s): %v——对应任务仍进入 quarantine", e.ID, err)
-				continue
+				return decisions, NewAuthorityError(AuthorityPhaseUnknown, e.ID, true, err)
 			}
 			e.Status = StatusUnknown
 			e.UnknownReason = markReason
@@ -152,6 +168,9 @@ func (j *Journal) Recover(verifier Verifier) []RecoveryDecision {
 					log.Printf("[EffectJournal] WARN 恢复核验落账失败 (id=%s): %v", e.ID, err)
 					d.Decision = DecisionKeptUnknownUnverifiable
 					d.Reason = "核验一致但 settle 落账失败: " + err.Error()
+					decisions = append(decisions, d)
+					emitRecoveryDecided(e, d)
+					return decisions, NewAuthorityError(AuthorityPhaseSettle, e.ID, true, err)
 				}
 			case res.Verifiable:
 				d.Decision = DecisionKeptUnknownMismatch
@@ -178,7 +197,7 @@ func (j *Journal) Recover(verifier Verifier) []RecoveryDecision {
 				d.EffectID, d.Kind, d.Policy, d.Target, d.Decision, d.Reason)
 		}
 	}
-	return decisions
+	return decisions, nil
 }
 
 // emitRecoveryDecided 发送 effect_recovery_decided 事件（含结论与依据）。

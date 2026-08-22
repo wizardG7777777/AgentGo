@@ -37,6 +37,7 @@ func registerAllGroupsFully(t *testing.T, r *agent.ToolRegistry) {
 
 	RegisterGroups(r,
 		LocalReadGroup{Workdir: &DefaultWorkdir{ProjectRoot: t.TempDir()}},
+		ContentRefGroup{},
 		LocalWriteGroup{
 			LocalReadGroup: LocalReadGroup{Workdir: &DefaultWorkdir{ProjectRoot: t.TempDir()}},
 			Roster:         &recordingRoster{},
@@ -64,6 +65,7 @@ func registerAllGroupsFully(t *testing.T, r *agent.ToolRegistry) {
 		// GraphControlGroup 无条件注册两个工具（nil 依赖在调用时报明确中文
 		// 错误），全量并集守护按零依赖装配即可。
 		GraphControlGroup{},
+		GraphAuthoringGroup{},
 	)
 }
 

@@ -17,9 +17,6 @@ import (
 	"agentgo/internal/trace"
 )
 
-// shellOutputLimit 限制 run_shell 单次输出的最大字符数，超过则保留尾部。
-const shellOutputLimit = 10000
-
 // defaultShellTimeoutSec 当未显式配置 TimeoutSec 时的默认超时（秒）。
 const defaultShellTimeoutSec = 30
 
@@ -136,14 +133,19 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 		// H2b Effect Journal：命令执行前先落账（prepared）。Target 只载命令
 		// digest（脱敏：完整命令不进账本），Policy=manual_only——命令副作用
 		// 不可盲目重放，恢复裁决不自动执行任何动作。
-		effID := effectPrepare(g.EffectJournal, ctx, g.AgentID,
+		effID, err := effectPrepare(g.EffectJournal, ctx, g.AgentID,
 			effect.KindShell, "cmd:"+digest12([]byte(command)),
 			digest12([]byte(command+"\n"+workingDir)), effect.PolicyManualOnly)
+		if err != nil {
+			return "", err
+		}
 
 		start := time.Now()
 		output, err := cmd.CombinedOutput()
 		durationMS := time.Since(start).Milliseconds()
-		outStr := truncateKeepTail(string(output), shellOutputLimit)
+		// 完整 stdout/stderr 交给 L3 ToolResult envelope 持久化；本工具不在
+		// ContentStore 之前做不可恢复截断。
+		outStr := string(output)
 
 		// 每次真实执行（成功/非零退出/超时/启动失败）都恰好 emit 一条
 		// shell_executed 事件（D4：该 Kind 此前有 schema/CLI 渲染/Reactor
@@ -168,8 +170,10 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 				execEv.Error = fmt.Sprintf("命令执行超时（%d 秒）", effectiveTimeoutSec)
 				trace.Emit(execEv)
 				// 超时时进程已被杀，但已执行部分产生的副作用不可知 → unknown。
-				effectMarkUnknown(g.EffectJournal, effID,
-					fmt.Sprintf("命令超时（%d 秒），已执行部分的副作用不可知", effectiveTimeoutSec))
+				if journalErr := effectMarkUnknown(g.EffectJournal, effID,
+					fmt.Sprintf("命令超时（%d 秒），已执行部分的副作用不可知", effectiveTimeoutSec)); journalErr != nil {
+					return "", journalErr
+				}
 				return "", fmt.Errorf("命令执行超时（%d 秒）: %s", effectiveTimeoutSec, command)
 			}
 			if exitErr, ok := err.(*exec.ExitError); ok {
@@ -179,7 +183,10 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 				execEv.Error = err.Error()
 				trace.Emit(execEv)
 				// 启动失败（进程未运行）——结果已知：未产生进程副作用。
-				effectSettle(g.EffectJournal, effID, "启动失败，未执行: "+err.Error())
+				if journalErr := effectSettle(g.EffectJournal, effID,
+					"启动失败，未执行: "+err.Error(), false); journalErr != nil {
+					return "", journalErr
+				}
 				return "", fmt.Errorf("启动命令失败: %w", err)
 			}
 		}
@@ -192,8 +199,11 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 		}
 		trace.Emit(execEv)
 
-		effectSettle(g.EffectJournal, effID, fmt.Sprintf("exit_code=%d outcome=%s duration_ms=%d out_bytes=%d out_sha256=%s",
-			exitCode, execEv.ShellExec.Outcome, durationMS, len(output), digest12(output)))
+		if err := effectSettle(g.EffectJournal, effID,
+			fmt.Sprintf("exit_code=%d outcome=%s duration_ms=%d out_bytes=%d out_sha256=%s",
+				exitCode, execEv.ShellExec.Outcome, durationMS, len(output), digest12(output)), true); err != nil {
+			return "", err
+		}
 
 		return fmt.Sprintf("exit_code: %d\nstdout+stderr:\n%s", exitCode, outStr), nil
 	}
@@ -261,15 +271,4 @@ func shellDialectNote() string {
 	return "\n\n当前环境：" + runtime.GOOS + "，命令由 POSIX sh（sh -c）解释。" +
 		"\n- 使用 POSIX sh 语法，不要假设 bash 专有特性（[[ ]]、数组等）可用" +
 		"\n- 系统会硬拒绝写文件的重定向（>、>> 等）：这类命令不会执行，直接报错；写文件一律使用 write_file / edit_file 工具"
-}
-
-// truncateKeepTail 截断字符串，保留尾部 limit 个字符。
-// 当 len(output) <= limit 时原样返回；否则保留最后 limit 个字符并在前面添加截断提示。
-func truncateKeepTail(output string, limit int) string {
-	if len(output) <= limit {
-		return output
-	}
-	truncated := len(output) - limit
-	return fmt.Sprintf("[截断提示] 原始输出共 %d 字符，已截断前 %d 字符，仅保留最后 %d 字符\n%s",
-		len(output), truncated, limit, output[truncated:])
 }

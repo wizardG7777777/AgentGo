@@ -13,6 +13,9 @@ var AllToolNames = []string{
 	"grep_search",
 	"glob_search",
 
+	// ContentRefGroup
+	"read_content_ref",
+
 	// LocalWriteGroup
 	"write_file",
 	"edit_file",
@@ -48,6 +51,22 @@ var AllToolNames = []string{
 	"submit_graph",
 	"read_graph",
 	"patch_graph",
+
+	// GraphAuthoringGroup（新 root Scheduler 的事务化 L5 控制面）
+	"create_graph_draft",
+	"configure_simple_graph_draft",
+	"patch_graph_draft",
+	"read_graph_draft",
+	"validate_graph_draft",
+	"validate_current_graph_draft",
+	"commit_graph_draft",
+	"commit_current_graph_draft",
+	"start_graph",
+	"start_current_graph",
+	"propose_graph_change",
+	"read_graph_change",
+	"validate_graph_change",
+	"commit_graph_change",
 }
 
 // ValidateToolNames 校验给定的工具名列表是否全部在 AllToolNames 中。

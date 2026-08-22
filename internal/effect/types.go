@@ -1,6 +1,6 @@
 // Package effect 实现 V6 §4 H2b Effect Journal：副作用执行前记录意图
-//（prepared），执行后记录结果（settled/unknown），并声明可重放性
-//（ReplayPolicy）。崩溃恢复以冻结 Lease + Journal + 实际外部状态共同裁决——
+// （prepared），执行后记录结果（settled/unknown），并声明可重放性
+// （ReplayPolicy）。崩溃恢复以冻结 Lease + Journal + 实际外部状态共同裁决——
 // 无法证明幂等的未知 Shell/消息/外部操作不得静默重跑（详见
 // docs/nextUpgrade-V6.md §4 升级思路 13–14）。
 //
@@ -9,11 +9,76 @@
 // internal/store/persistence.go 的 artifacts.jsonl，但刻意不做
 // group-commit——prepared→settled 间隙正是崩溃窗口，必须逐条耐久）。
 //
-// 降级纪律（与 trace 同一纪律）：埋点处 journal 为 nil 或 Prepare/Settle
-// 失败时只记日志告警，绝不阻断副作用本身——账本是观测设施，不是执行门槛。
+// 权威边界纪律：Effect Journal 不是观测设施，而是副作用的
+// durable authority。Prepare 必须在副作用前成功；副作用已执行后
+// Settle/MarkUnknown 写失败必须向上返回 may_have_happened=true 的
+// AuthorityError，不得降级为日志后继续，也不得自动重放。
 package effect
 
-import "time"
+import (
+	"errors"
+	"fmt"
+	"time"
+)
+
+// ErrAuthorityUnavailable 标识 Effect Journal 这一 durable authority
+// 未能完成指定阶段。调用方应使用 errors.Is/As 分类，
+// 不应解析错误字符串。
+var ErrAuthorityUnavailable = errors.New("effect journal authority 不可用")
+
+// AuthorityPhase 是权威写失败所在的 Effect 生命周期阶段。
+type AuthorityPhase string
+
+const (
+	AuthorityPhasePrepare AuthorityPhase = "prepare"
+	AuthorityPhaseSettle  AuthorityPhase = "settle"
+	AuthorityPhaseUnknown AuthorityPhase = "unknown"
+	AuthorityPhaseRead    AuthorityPhase = "read"
+)
+
+// AuthorityError 是对执行面暴露的 typed authority failure。
+// MayHaveHappened=false 表示副作用尚未进入执行，可以安全拒绝；
+// true 表示外部世界可能已变更，只能阻断并核验，禁止自动重放。
+type AuthorityError struct {
+	Phase           AuthorityPhase
+	EffectID        string
+	MayHaveHappened bool
+	Cause           error
+}
+
+func (e *AuthorityError) Error() string {
+	if e == nil {
+		return ErrAuthorityUnavailable.Error()
+	}
+	msg := fmt.Sprintf("%s: phase=%s may_have_happened=%t", ErrAuthorityUnavailable, e.Phase, e.MayHaveHappened)
+	if e.EffectID != "" {
+		msg += " effect_id=" + e.EffectID
+	}
+	if e.Cause != nil {
+		msg += ": " + e.Cause.Error()
+	}
+	return msg
+}
+
+func (e *AuthorityError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+func (e *AuthorityError) Is(target error) bool {
+	return target == ErrAuthorityUnavailable
+}
+
+// NewAuthorityError 统一构造执行面 authority failure。cause 为 nil
+// 时仍保留 typed identity，避免 nil 权威被当成成功。
+func NewAuthorityError(phase AuthorityPhase, effectID string, mayHaveHappened bool, cause error) *AuthorityError {
+	return &AuthorityError{
+		Phase: phase, EffectID: effectID,
+		MayHaveHappened: mayHaveHappened, Cause: cause,
+	}
+}
 
 // Kind 是副作用类别。
 type Kind string
@@ -61,11 +126,11 @@ const argsDigestLen = 12
 // sha256 前 12。文件类埋点的 ArgsDigest 取「将落盘内容」的 sha256 前 12，
 // 使 verify_first 恢复裁决能与盘上事实比对。
 type Effect struct {
-	ID            string `json:"id"`          // <taskID>-<seq>，per-task 单调，由 Journal.Prepare 分配
-	TaskID        string `json:"task_id"`     // 产生副作用的任务
-	Kind          Kind   `json:"kind"`        // 副作用类别
-	Target        string `json:"target"`      // 目标摘要：路径 / "cmd:<digest>" / 收件人 / 合并任务 ID
-	ArgsDigest    string `json:"args_digest"` // 参数 sha256 前 12（不存完整参数——默认脱敏）
+	ID            string       `json:"id"`          // <taskID>-<seq>，per-task 单调，由 Journal.Prepare 分配
+	TaskID        string       `json:"task_id"`     // 产生副作用的任务
+	Kind          Kind         `json:"kind"`        // 副作用类别
+	Target        string       `json:"target"`      // 目标摘要：路径 / "cmd:<digest>" / 收件人 / 合并任务 ID
+	ArgsDigest    string       `json:"args_digest"` // 参数 sha256 前 12（不存完整参数——默认脱敏）
 	Policy        ReplayPolicy `json:"policy"`
 	Status        Status       `json:"status"`
 	ResultSummary string       `json:"result_summary,omitempty"` // exit code / bytes+hash / 合并结果

@@ -237,6 +237,7 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 	trace.Emit(trace.Event{
 		Kind:    trace.KindTaskFinalizing,
 		TaskID:  task.ID,
+		RunID:   string(task.RunID),
 		AgentID: g.AgentID,
 		Transition: &trace.Transition{
 			PrevStatus: string(model.TaskStatusProcessing),

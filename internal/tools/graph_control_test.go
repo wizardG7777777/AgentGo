@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -409,6 +410,42 @@ func TestReadGraphReturnsCurrentAuthority(t *testing.T) {
 	}
 }
 
+func TestReadGraphProjectsTypedTerminalOutcome(t *testing.T) {
+	for _, outcome := range []string{"failed", "blocked", "cancelled"} {
+		t.Run(outcome, func(t *testing.T) {
+			g, _, _ := newGraphControlEnv(t)
+			graphID := "g-read-outcome-" + outcome
+			raw := strings.Replace(graphToolGraphJSON, "g-tool-basic", graphID, 1)
+			raw = strings.Replace(raw,
+				`"kind":"end","task":{"title":"收官"}`,
+				`"kind":"end","task":{"title":"收官"},"end_outcome":"`+outcome+`"`, 1)
+			if _, err := g.submitGraph(context.Background(), map[string]any{"graph": raw}); err != nil {
+				t.Fatalf("提交 typed outcome 图: %v", err)
+			}
+			for _, fact := range []graph.TerminalFact{
+				{GraphID: graphID, NodeID: "root", ActivationID: "root@1", TaskID: "task-root@1", Status: graph.NodeCompleted},
+				{GraphID: graphID, NodeID: "implement", ActivationID: "implement@1", TaskID: "task-implement@1", Status: graph.NodeCompleted},
+			} {
+				if err := g.Runtime.OnTaskTerminal(fact); err != nil {
+					t.Fatalf("推进图到 typed end: %v", err)
+				}
+			}
+			reply, err := g.readGraph(context.Background(), map[string]any{"graph_id": graphID})
+			if err != nil {
+				t.Fatalf("read_graph: %v", err)
+			}
+			for _, want := range []string{
+				`"status": "` + outcome + `"`,
+				`"outcome": {`, `"outcome": "` + outcome + `"`, `"source": "end"`,
+			} {
+				if !strings.Contains(reply, want) {
+					t.Errorf("read_graph 缺少 %s：%s", want, reply)
+				}
+			}
+		})
+	}
+}
+
 // patch_graph 成功路径：upsert 节点定义 → new_revision=2，且只影响未来转移
 // 求值（在途 root activation 不受影响）；成功后 emit graph_revision_committed
 // 审计事件（C5d，载 new_revision 与 patch 摘要）。
@@ -512,11 +549,9 @@ func TestGraphControlGroupRegistersAllTools(t *testing.T) {
 	}
 }
 
-// submit_graph 长 JSON 防线（2026-08-20 SWE-001 预防 1）：
-//   - JSON 语法期失败：错误必须附带「骨架图 + patch_graph 逐次扩展」分批建议；
-//   - 载荷超 graphJSONAdviseThreshold 但合法：正常接受，返回值附温和提醒；
-//   - 阈值下无提醒（中小图不受打扰）。
-func TestSubmitGraphSyntaxFailureCarriesBatchAdvice(t *testing.T) {
+// legacy submit_graph 的语法错误只返回事实，不再建议提交可立即执行的半成品
+// root/end 图；新图分批构造由 GraphDraft 工具承担。
+func TestSubmitGraphSyntaxFailureDoesNotSuggestExecutableSkeleton(t *testing.T) {
 	g, _, _ := newGraphControlEnv(t)
 	// 语法损坏的图 JSON（节点定义半截截断）
 	broken := `{"schema":"agentgo.graph/v1","graph_id":"g-broken","revision":1,"state_version":0,"root":"work","status":"pending","nodes":{"work":{"kind":"agent","task":{"title":"执行`
@@ -527,35 +562,16 @@ func TestSubmitGraphSyntaxFailureCarriesBatchAdvice(t *testing.T) {
 	if !strings.Contains(err.Error(), "JSON语法") {
 		t.Fatalf("应报 JSON 语法阶段: %v", err)
 	}
-	if !strings.Contains(err.Error(), "骨架图") || !strings.Contains(err.Error(), "patch_graph") {
-		t.Fatalf("语法期失败应附分批建议: %v", err)
+	if strings.Contains(err.Error(), "骨架") || strings.Contains(err.Error(), "root+end") {
+		t.Fatalf("legacy 错误不得再建议可执行半成品图: %v", err)
 	}
 }
 
-func TestSubmitGraphLargePayloadAdvisory(t *testing.T) {
-	g, _, _ := newGraphControlEnv(t)
-	// 合法但超阈值的载荷：长描述垫大（rune 计）
-	bigDesc := strings.Repeat("实施", graphJSONAdviseThreshold/2+100)
-	big := strings.Replace(graphToolGraphJSON, `"graph_id": "g-tool-basic"`, `"graph_id": "g-tool-big"`, 1)
-	big = strings.Replace(big, `"title":"实施修改"`, `"title":"`+bigDesc+`"`, 1)
-	if len([]rune(big)) <= graphJSONAdviseThreshold {
-		t.Fatalf("测试资产错误：载荷 %d 未超阈值", len([]rune(big)))
-	}
-	reply, err := g.submitGraph(context.Background(), map[string]any{"graph": big})
-	if err != nil {
-		t.Fatalf("超阈值合法图仍应接受: %v", err)
-	}
-	if !strings.Contains(reply, "风险区") || !strings.Contains(reply, "骨架图") {
-		t.Errorf("超阈值应附温和提醒: %s", reply)
-	}
-
-	// 阈值以下：无提醒（与既有成功路径逐字节一致）
-	g2, _, _ := newGraphControlEnv(t)
-	reply2, err := g2.submitGraph(context.Background(), map[string]any{"graph": graphToolGraphJSON})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(reply2, "风险区") {
-		t.Errorf("阈值以下不应有提醒: %s", reply2)
+func TestGraphControlGroupCanHideLegacySubmit(t *testing.T) {
+	registry := agent.NewToolRegistry()
+	GraphControlGroup{DisableSubmitGraph: true}.Register(registry)
+	names := registry.Names()
+	if slices.Contains(names, "submit_graph") || !slices.Contains(names, "read_graph") || !slices.Contains(names, "patch_graph") {
+		t.Fatalf("新 root registry 应隐藏 submit、保留 runtime read/patch compatibility: %v", names)
 	}
 }

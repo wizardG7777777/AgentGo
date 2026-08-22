@@ -4,10 +4,12 @@ package tools
 //   - write_file / edit_file 产生 verify_first 账（ArgsDigest = 落盘内容 hash 前 12）；
 //   - run_shell 产生 manual_only 账（Target 只载命令 digest，脱敏）；
 //   - send_message 产生 manual_only 账；
-//   - 账本失败（journal 已关闭）降级不阻断副作用本身。
+//   - Prepare 失败在副作用前 fail-closed；Settle 失败暴露 typed
+//     may_have_happened authority error。
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -204,9 +206,8 @@ func TestSendMessage_EffectJournalManualOnly(t *testing.T) {
 	}
 }
 
-// TestEffectJournalFailureDegrades 覆盖降级纪律：journal 已关闭（落账必然
-// 失败）时副作用本身照常完成——账本是观测设施，不是执行门槛。
-func TestEffectJournalFailureDegrades(t *testing.T) {
+// Prepare 失败时必须在文件副作用前 fail-closed。
+func TestEffectJournalPrepareFailureStopsWrite(t *testing.T) {
 	dir := t.TempDir()
 	j, err := effect.OpenJournal(dir)
 	if err != nil {
@@ -220,13 +221,49 @@ func TestEffectJournalFailureDegrades(t *testing.T) {
 	g.EffectJournal = j
 	attachArtifactTask(t, &g, "task-5")
 	target := filepath.Join(tmp, "degrade.txt")
-	if _, err := g.writeFile(taskCtx("agent-1", "task-5"), map[string]any{
-		"path": target, "content": "账本挂了也要写",
-	}); err != nil {
-		t.Fatalf("账本失败不应阻断写入: %v", err)
+	_, err = g.writeFile(taskCtx("agent-1", "task-5"), map[string]any{
+		"path": target, "content": "账本挂了禁止写",
+	})
+	if !errors.Is(err, effect.ErrAuthorityUnavailable) {
+		t.Fatalf("Prepare 失败应返回 typed authority error: %v", err)
 	}
-	data, err := os.ReadFile(target)
-	if err != nil || string(data) != "账本挂了也要写" {
-		t.Fatalf("文件应正常落盘: data=%q err=%v", data, err)
+	var authorityErr *effect.AuthorityError
+	if !errors.As(err, &authorityErr) || authorityErr.MayHaveHappened || authorityErr.Phase != effect.AuthorityPhasePrepare {
+		t.Fatalf("Prepare authority error 应 may_have_happened=false: %#v", authorityErr)
+	}
+	if _, statErr := os.Stat(target); !os.IsNotExist(statErr) {
+		t.Fatalf("Prepare 失败后不得创建目标文件: %v", statErr)
+	}
+}
+
+// 副作用已发生但 Settle 权威写失败时，不得返回工具成功；
+// typed 错误必须明确 may_have_happened=true，上层只能核验，不能重放。
+func TestEffectJournalSettleFailureReportsMayHaveHappened(t *testing.T) {
+	j := openToolJournal(t)
+	e := effect.Effect{
+		TaskID: "task-settle", Kind: effect.KindFileWrite, Target: "/logical/out.txt",
+		ArgsDigest: "abcdef123456", Policy: effect.PolicyVerifyFirst,
+	}
+	if err := j.Prepare(&e); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	target := filepath.Join(t.TempDir(), "out.txt")
+	if err := os.WriteFile(target, []byte("已发生"), 0o644); err != nil {
+		t.Fatalf("模拟文件副作用: %v", err)
+	}
+	if err := j.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	err := effectSettle(j, e.ID, "bytes=9", true)
+	if !errors.Is(err, effect.ErrAuthorityUnavailable) {
+		t.Fatalf("Settle 失败应返 typed authority error: %v", err)
+	}
+	var authorityErr *effect.AuthorityError
+	if !errors.As(err, &authorityErr) || !authorityErr.MayHaveHappened ||
+		authorityErr.Phase != effect.AuthorityPhaseSettle || authorityErr.EffectID != e.ID {
+		t.Fatalf("Settle authority error 必须标记 may_have_happened=true: %#v", authorityErr)
+	}
+	if data, readErr := os.ReadFile(target); readErr != nil || string(data) != "已发生" {
+		t.Fatalf("权威错误不得虚构副作用未发生: data=%q err=%v", data, readErr)
 	}
 }

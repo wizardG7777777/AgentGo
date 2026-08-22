@@ -264,28 +264,38 @@ func (g LocalWriteGroup) writeFile(ctx context.Context, args map[string]any) (st
 
 	// H2b Effect Journal：执行前先落账（prepared），ArgsDigest 取将落盘
 	// 内容的 sha256 前 12——恢复裁决据此与盘上事实比对（verify_first）。
-	effID := effectPrepare(g.EffectJournal, ctx, g.AgentID,
+	effID, err := effectPrepare(g.EffectJournal, ctx, g.AgentID,
 		effect.KindFileWrite, logicalPath, digest12([]byte(content)), effect.PolicyVerifyFirst)
+	if err != nil {
+		return "", err
+	}
 
 	// 确保父目录存在
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		effectMarkUnknown(g.EffectJournal, effID, "创建目录失败: "+err.Error())
+		if journalErr := effectMarkUnknown(g.EffectJournal, effID, "创建目录失败: "+err.Error()); journalErr != nil {
+			return "", journalErr
+		}
 		return "", fmt.Errorf("创建目录失败: %w", err)
 	}
 
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		// 写入返回错误时盘上可能残留部分内容——结果不可知，标 unknown
 		// 交恢复裁决（核验盘上 hash 定论），不静默定论。
-		effectMarkUnknown(g.EffectJournal, effID, "写入返回错误: "+err.Error())
+		if journalErr := effectMarkUnknown(g.EffectJournal, effID, "写入返回错误: "+err.Error()); journalErr != nil {
+			return "", journalErr
+		}
 		return "", fmt.Errorf("写入文件失败: %w", err)
 	}
 	contentHash := computeSHA256([]byte(content))
-	effectSettle(g.EffectJournal, effID, fmt.Sprintf("bytes=%d sha256=%s", len(content), contentHash))
 
 	// 写入后使缓存失效（键为最终物理路径，与 read_file 的 Get/Put 键一致）
 	if g.Cache != nil {
 		g.Cache.Invalidate(path)
+	}
+	if err := effectSettle(g.EffectJournal, effID,
+		fmt.Sprintf("bytes=%d sha256=%s", len(content), contentHash), true); err != nil {
+		return "", err
 	}
 	if err := g.recordArtifact(ctx, logicalPath, []byte(content)); err != nil {
 		return "", err
@@ -417,19 +427,27 @@ func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (str
 
 	// H2b Effect Journal：newContent 已确定、写盘前先落账（prepared），
 	// ArgsDigest 取替换后全文的 sha256 前 12——恢复裁决据此与盘上事实比对。
-	effID := effectPrepare(g.EffectJournal, ctx, g.AgentID,
+	effID, err := effectPrepare(g.EffectJournal, ctx, g.AgentID,
 		effect.KindFileEdit, logicalPath, digest12([]byte(newContent)), effect.PolicyVerifyFirst)
+	if err != nil {
+		return "", err
+	}
 
 	if err := os.WriteFile(path, []byte(newContent), 0644); err != nil {
-		effectMarkUnknown(g.EffectJournal, effID, "写入返回错误: "+err.Error())
+		if journalErr := effectMarkUnknown(g.EffectJournal, effID, "写入返回错误: "+err.Error()); journalErr != nil {
+			return "", journalErr
+		}
 		return "", fmt.Errorf("写入文件失败: %w", err)
 	}
 	newHash := computeSHA256([]byte(newContent))
-	effectSettle(g.EffectJournal, effID, fmt.Sprintf("bytes=%d sha256=%s", len(newContent), newHash))
 
 	// 写入后使缓存失效（键为最终物理路径，与 read_file 的 Get/Put 键一致）
 	if g.Cache != nil {
 		g.Cache.Invalidate(path)
+	}
+	if err := effectSettle(g.EffectJournal, effID,
+		fmt.Sprintf("bytes=%d sha256=%s", len(newContent), newHash), true); err != nil {
+		return "", err
 	}
 	if err := g.recordArtifact(ctx, logicalPath, []byte(newContent)); err != nil {
 		return "", err

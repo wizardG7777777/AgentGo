@@ -30,7 +30,6 @@ func extractDomain(rawURL string) string {
 const (
 	defaultTimeout   = 30 * time.Second
 	maxResponseBytes = 1 << 20 // 1MB
-	maxOutputChars   = 10000
 )
 
 // userAgent 避免被简单的 bot 检测拦截
@@ -147,9 +146,6 @@ func FetchURLWithMode(ctx context.Context, rawURL string, mode string) (string, 
 		text = ExtractArticle(htmlStr)
 	}
 
-	if len(text) > maxOutputChars {
-		text = text[:maxOutputChars] + "\n... (截断)"
-	}
 	if prefix != "" {
 		return prefix + text, nil
 	}

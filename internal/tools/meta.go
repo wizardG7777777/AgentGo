@@ -10,9 +10,11 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/effect"
 	"agentgo/internal/interaction"
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
+	"agentgo/internal/taskcontract"
 	"agentgo/internal/tools/schema"
 )
 
@@ -182,6 +184,7 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 	eventType, _ := args["event_type"].(string)
 
 	parentID := ""
+	var parentTask *model.Task
 	parentOwnerID := "" // Worker 任务不再携带控制面归属：固定空串（全局）
 	parentDepth := -1   // Scheduler 模式下 childDepth = 0
 	if g.Holder != nil {
@@ -189,7 +192,8 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 		if parentID == "" {
 			return "", fmt.Errorf("无法获取当前任务上下文")
 		}
-		parentTask, err := g.Store.GetTask(parentID)
+		var err error
+		parentTask, err = g.Store.GetTask(parentID)
 		if err != nil {
 			return "", fmt.Errorf("读取父任务失败: %w", err)
 		}
@@ -205,7 +209,8 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 		if parentID == "" {
 			return "", fmt.Errorf("无法获取当前任务上下文")
 		}
-		parentTask, err := g.Store.GetTask(parentID)
+		var err error
+		parentTask, err = g.Store.GetTask(parentID)
 		if err != nil {
 			return "", fmt.Errorf("读取当前 Scheduler 任务失败: %w", err)
 		}
@@ -336,6 +341,29 @@ func (g MetaGroup) publishTask(ctx context.Context, args map[string]any) (string
 			return "", fmt.Errorf("依赖任务 %s 不存在（meta 层兜底校验）", depID)
 		}
 	}
+	if parentTask != nil {
+		workClass := loopcontract.WorkInvestigation
+		var declaredTools []string
+		if task.Capability != nil {
+			declaredTools = task.Capability.Tools
+		}
+		for _, name := range declaredTools {
+			switch name {
+			case "write_file", "edit_file":
+				workClass = loopcontract.WorkCodeChange
+			case "run_shell":
+				if workClass != loopcontract.WorkCodeChange {
+					workClass = loopcontract.WorkVerification
+				}
+			}
+		}
+		if len(task.ExpectedArtifacts) > 0 {
+			workClass = loopcontract.WorkCodeChange
+		}
+		if err := taskcontract.Inherit(parentTask, task, workClass); err != nil {
+			return "", fmt.Errorf("继承子任务 RunContract: %w", err)
+		}
+	}
 
 	// 能力边界硬校验：explore 任务由只读 Explorer 执行，无写权限，
 	// 不能声明 expected_artifacts，否则会陷入"声称完成→校验失败→重试"死循环。
@@ -391,7 +419,7 @@ func nodeCapabilityWarnings(capTools []string) []string {
 	}
 	// 收尾通道提示：子集不含任何执行类工具（读/写/web/shell）时，节点只能
 	// 以纯文字响应收尾；若发布方期待它操作文件或网络，结果必然落空。
-	execTools := []string{"read_file", "list_dir", "grep_search", "glob_search", "write_file", "edit_file", "web_search", "web_fetch", "run_shell"}
+	execTools := []string{"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref", "write_file", "edit_file", "web_search", "web_fetch", "run_shell"}
 	hasExec := false
 	for _, name := range execTools {
 		if set[name] {
@@ -440,10 +468,12 @@ func (g MetaGroup) sendMessage(ctx context.Context, args map[string]any) (string
 	// 读当前任务的 MailChainDepth 作为新邮件链深度的起点。
 	// 不存在 / 出错时退化为 0，与"用户 /steer 投递的初始邮件"等价。
 	chainDepth := 0
+	var sourceTask *model.Task
 	if g.Holder != nil && g.Store != nil {
 		if taskID := g.Holder.Get(); taskID != "" {
 			if task, err := g.Store.GetTask(taskID); err == nil && task != nil {
 				chainDepth = task.MailChainDepth + 1
+				sourceTask = task
 			}
 		}
 	}
@@ -458,19 +488,33 @@ func (g MetaGroup) sendMessage(ctx context.Context, args map[string]any) (string
 		SentAt:     time.Now(),
 		ChainDepth: chainDepth,
 	}
+	if sourceTask != nil && sourceTask.RunID != "" {
+		msg.SourceTaskID = sourceTask.ID
+		msg.RunID = sourceTask.RunID
+		if g.SessionID != nil {
+			msg.SessionID = g.SessionID()
+		}
+	}
 	// H2b Effect Journal：发送前先落账（prepared）。Target 只载收件人，
 	// ArgsDigest 是 路由+正文 的 digest（脱敏：正文不进账本）；
 	// Policy=manual_only——外部消息不得重发，恢复裁决不自动执行任何动作。
-	effID := effectPrepare(g.EffectJournal, ctx, g.AgentID,
+	effID, err := effectPrepare(g.EffectJournal, ctx, g.AgentID,
 		effect.KindMessage, to,
 		digest12([]byte(g.AgentID+"->"+to+"\n"+content)), effect.PolicyManualOnly)
-	if err := g.MBRegistry.Send(msg); err != nil {
-		// 发送返回错误：广播场景可能已部分投递，外部状态不可知 → unknown。
-		effectMarkUnknown(g.EffectJournal, effID, "发送返回错误: "+err.Error())
+	if err != nil {
 		return "", err
 	}
-	effectSettle(g.EffectJournal, effID,
-		fmt.Sprintf("已受理（type=%s priority=%s to=%s）", msgType, priority, to))
+	if err := g.MBRegistry.Send(msg); err != nil {
+		// 发送返回错误：广播场景可能已部分投递，外部状态不可知 → unknown。
+		if journalErr := effectMarkUnknown(g.EffectJournal, effID, "发送返回错误: "+err.Error()); journalErr != nil {
+			return "", journalErr
+		}
+		return "", err
+	}
+	if err := effectSettle(g.EffectJournal, effID,
+		fmt.Sprintf("已受理（type=%s priority=%s to=%s）", msgType, priority, to), true); err != nil {
+		return "", err
+	}
 	if to == "*" {
 		return "消息已广播给所有代理", nil
 	}

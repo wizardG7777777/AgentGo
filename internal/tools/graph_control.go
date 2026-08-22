@@ -38,20 +38,29 @@ type GraphControlGroup struct {
 	// report_done 把“图已提交”冒充为用户最终结果。提交失败时
 	// 不标记，保留 Scheduler 修正后重试的机会。
 	FinalizationNotifier FinalizationNotifier
+	// DisableSubmitGraph 用于新 root Scheduler registry：保留 read_graph 与
+	// controller 兼容 patch_graph，但不再向新请求暴露一体化 submit→activate。
+	// 零值保留 legacy 测试/兼容装配。
+	DisableSubmitGraph bool
+	// PatchControllerOnly 使 patch_graph 只服务于 legacy Graph controller；
+	// root Scheduler 与事务化 Definition 必须走 GraphChangeProposal。
+	PatchControllerOnly bool
 }
 
 func (g GraphControlGroup) Register(r *agent.ToolRegistry) {
-	r.Register("submit_graph",
-		"提交一张 V6 JSON GraphDocument 作为多节点编排的执行契约，校验通过后立即 durable 并激活 root 节点。"+
-			"这是需要执行工作的 Graph-first 主控制面：多步调查、Shell、写入、验证、并行、分支、回边、审批与等待均应在图内表达；publish_task 仅保留 legacy/恢复兼容。"+
-			"graph 参数是完整 JSON：schema 恰为 \"agentgo.graph/v2\"，graph_id 全局唯一（重复提交拒绝），root 指向唯一起点节点；"+
-			"节点 kind ∈ controller/agent/router/end/join/wait_event/tool/approval/subgraph/acceptance；"+
-			"边条件 when 只两形态：{event: completed|failed|blocked|always}（agent/controller 出边仅这四个系统事件可用）或 {path: \"$.字段\", operator: eq|ne|in|exists, value: ...}（业务分支的唯一通道，字段须在该节点 description 的输出契约中声明），缺省无条件。"+
-			"认领路由规则：节点 metadata.route 显式覆盖优先；缺省 controller→__scheduler__（由你认领）、agent→默认队列（\"\"）、acceptance→acceptance.verify。"+
-			"agent/controller 节点禁止提交 event；业务路由字段写入 result object，提交期系统预求值出边，无匹配将被拒绝并要求重交。"+
-			"校验失败返回含阶段与 JSON 路径的中文错误；提交后节点任务自动发布到公告板、终态自动推进，你等待 graph_ended 或中间唤醒即可，不得替图内节点执行工作。",
-		schema.Object().String("graph", "完整的 JSON GraphDocument（schema/graph_id/root/nodes 必填；nodes 内每节点含 kind/task/next）", true).Build(),
-		g.submitGraph)
+	if !g.DisableSubmitGraph {
+		r.Register("submit_graph",
+			"提交一张 V6 JSON GraphDocument 作为多节点编排的执行契约，校验通过后立即 durable 并激活 root 节点。"+
+				"这是需要执行工作的 Graph-first 主控制面：多步调查、Shell、写入、验证、并行、分支、回边、审批与等待均应在图内表达；publish_task 仅保留 legacy/恢复兼容。"+
+				"graph 参数是完整 JSON：schema 恰为 \"agentgo.graph/v2\"，graph_id 全局唯一（重复提交拒绝），root 指向唯一起点节点；"+
+				"节点 kind ∈ controller/agent/router/end/join/wait_event/tool/approval/subgraph/acceptance；"+
+				"边条件 when 只两形态：{event: completed|failed|blocked|always}（agent/controller 出边仅这四个系统事件可用）或 {path: \"$.字段\", operator: eq|ne|in|exists, value: ...}（业务分支的唯一通道，字段须在该节点 description 的输出契约中声明），缺省无条件。"+
+				"认领路由规则：节点 metadata.route 显式覆盖优先；缺省 controller→__scheduler__（由你认领）、agent→默认队列（\"\"）、acceptance→acceptance.verify。"+
+				"agent/controller 节点禁止提交 event；业务路由字段写入 result object，提交期系统预求值出边，无匹配将被拒绝并要求重交。"+
+				"校验失败返回含阶段与 JSON 路径的中文错误；提交后节点任务自动发布到公告板、终态自动推进，你等待 graph_ended 或中间唤醒即可，不得替图内节点执行工作。",
+			schema.Object().String("graph", "完整的 JSON GraphDocument（schema/graph_id/root/nodes 必填；nodes 内每节点含 kind/task/next）", true).Build(),
+			g.submitGraph)
+	}
 
 	r.Register("read_graph",
 		"读取一张已提交图的当前权威快照，返回 revision、state_version、图/节点状态、当前 activation/task_id/result_ref 与定义面。"+
@@ -94,12 +103,6 @@ func (g GraphControlGroup) readGraph(_ context.Context, args map[string]any) (st
 	return string(raw), nil
 }
 
-// graphJSONAdviseThreshold 是 submit_graph 载荷的温和提醒阈值（rune）。
-// 2026-08-20 SWE-001 预防 1：取 8000——实测成功落盘的图 2727–5762 字符
-// （6–11 节点），允许中大型图直接提交；若同类长 JSON 损坏仍复现，按
-// 既定计划收紧到 6000 再评估。
-const graphJSONAdviseThreshold = 8000
-
 // submitGraph 流程：ParseAndValidate（失败返回含阶段/路径的中文校验错误）→
 // Runtime.SubmitGraph（durable + root 激活）→ 读回 root activation 信息返回。
 func (g GraphControlGroup) submitGraph(_ context.Context, args map[string]any) (string, error) {
@@ -116,13 +119,16 @@ func (g GraphControlGroup) submitGraph(_ context.Context, args map[string]any) (
 	doc, err := graph.ParseAndValidate([]byte(raw))
 	if err != nil {
 		// *graph.ValidationError 自带「校验[阶段]」前缀与出错路径，原样透出。
-		// 2026-08-20 SWE-001 预防 1：JSON 语法期失败附带分批建议——长 JSON
-		// 是损坏主因（实测断裂偏移 2062–6462），骨架 + patch 扩展绕开长输出。
-		var ve *graph.ValidationError
-		if errors.As(err, &ve) && ve.Stage == "JSON语法" {
-			return "", fmt.Errorf("图校验失败: %w（提示：长 JSON 易损坏，可先提交仅含 root+end 的骨架图，再经 patch_graph 逐次扩展节点）", err)
-		}
 		return "", fmt.Errorf("图校验失败: %w", err)
+	}
+	if originTask, taskErr := g.currentSchedulerTask(); taskErr != nil {
+		return "", taskErr
+	} else if originTask != nil {
+		doc.RunID = originTask.RunID
+		if originTask.RunContract != nil {
+			run := *originTask.RunContract
+			doc.RunContract = &run
+		}
 	}
 	if err := g.validateRoutes(doc.GraphID, doc.Nodes, "nodes"); err != nil {
 		trace.Emit(trace.Event{Kind: trace.KindGraphSubmissionRejected, GraphID: doc.GraphID, Error: err.Error()})
@@ -152,11 +158,6 @@ func (g GraphControlGroup) submitGraph(_ context.Context, args map[string]any) (
 	}
 	msg := fmt.Sprintf("图已提交并激活: graph_id=%s revision=1 root=%s root_activation=%s（root 任务已按路由发布到公告板；后续节点终态会经 graph-terminal-feed 自动推进，图终态见 graph_ended 事件）",
 		doc.GraphID, doc.Root, activation)
-	// 2026-08-20 SWE-001 预防 1：载荷超阈值时附温和提醒（不拒绝——中大型
-	// 图允许直接提交，靠 Scheduler 智能自行选择分批时机）。
-	if n := len([]rune(raw)); n > graphJSONAdviseThreshold {
-		msg += fmt.Sprintf("（提示：本次图载荷 %d 字符，已超 %d 字符风险区；后续大型图建议先交仅含 root+end 的骨架图、再经 patch_graph 逐次扩展，降低长 JSON 损坏风险）", n, graphJSONAdviseThreshold)
-	}
 	return msg, nil
 }
 
@@ -172,6 +173,21 @@ func (g GraphControlGroup) patchGraph(_ context.Context, args map[string]any) (s
 	graphID = strings.TrimSpace(graphID)
 	if graphID == "" {
 		return "", fmt.Errorf("graph_id 不能为空")
+	}
+	if g.PatchControllerOnly {
+		task, err := g.currentSchedulerTask()
+		if err != nil {
+			return "", err
+		}
+		if task == nil || task.GraphID == "" || task.GraphID != graphID {
+			return "", fmt.Errorf("patch_graph 仅保留给 exact same legacy Graph controller；新 root Scheduler 请用 GraphChangeProposal")
+		}
+		if g.Store == nil {
+			return "", fmt.Errorf("patch_graph 无法核对 Graph Definition 来源")
+		}
+		if doc, ok := g.Store.Get(graphID); !ok || doc.DefinitionDigest != "" {
+			return "", fmt.Errorf("事务化 Graph 禁止 direct patch_graph；请 request_replan 后由 Scheduler 提交 GraphChangeProposal")
+		}
 	}
 	if err := g.authorizeGraphTarget("patch_graph", graphID); err != nil {
 		return "", err
@@ -319,11 +335,11 @@ func (g GraphControlGroup) validateAcceptanceCapabilities(ownerScope, route stri
 	}
 	allowed := map[string]struct{}{
 		"read_file": {}, "list_dir": {}, "grep_search": {}, "glob_search": {},
-		"web_search": {}, "web_fetch": {}, "submit_task_result": {},
+		"web_search": {}, "web_fetch": {}, "read_content_ref": {}, "submit_task_result": {},
 	}
 	for _, tool := range effective {
 		if _, ok := allowed[tool]; !ok {
-			return fmt.Errorf("图路由校验失败: %s 的 acceptance 实际工具面含只读闭集外工具 %q；verifier 只允许 read/list/grep/glob/web 与 submit_task_result，不得持有写入、Shell、消息、发任务、用户交互或重规划工具；需要命令检查时改由 checker agent 经数据流提供证据", path, tool)
+			return fmt.Errorf("图路由校验失败: %s 的 acceptance 实际工具面含只读闭集外工具 %q；verifier 只允许 read/list/grep/glob/web/read_content_ref 与 submit_task_result，不得持有写入、Shell、消息、发任务、用户交互或重规划工具；需要命令检查时改由 checker agent 经数据流提供证据", path, tool)
 		}
 	}
 	return nil

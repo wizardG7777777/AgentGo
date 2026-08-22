@@ -3,6 +3,7 @@ package effect
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -238,7 +239,15 @@ func TestRecoverMarkUnknownFailureStillReturnsQuarantineDecision(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	decisions := j.Recover(FileHashVerifier{})
+	decisions, recoverErr := j.RecoverStrict(FileHashVerifier{})
+	if !errors.Is(recoverErr, ErrAuthorityUnavailable) {
+		t.Fatalf("strict recovery 应因 MarkUnknown 权威写失败被阻断: %v", recoverErr)
+	}
+	var authorityErr *AuthorityError
+	if !errors.As(recoverErr, &authorityErr) || !authorityErr.MayHaveHappened ||
+		authorityErr.Phase != AuthorityPhaseUnknown {
+		t.Fatalf("recovery authority error 应标记副作用可能已发生: %#v", authorityErr)
+	}
 	if len(decisions) != 1 || decisions[0].EffectID != id ||
 		decisions[0].Decision != DecisionKeptUnknownUnverifiable {
 		t.Fatalf("MarkUnknown 失败也应返回 fail-closed 裁决: %+v", decisions)

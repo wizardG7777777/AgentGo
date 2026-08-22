@@ -1,10 +1,14 @@
 package effect
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
-	"strings"
+	"runtime"
 	"testing"
+	"time"
 )
 
 // openTestJournal 打开临时目录下的 journal 并登记 Windows 句柄清理
@@ -93,7 +97,7 @@ func TestJournalSettleLifecycle(t *testing.T) {
 	}
 }
 
-func TestJournalMarkUnknownIdempotent(t *testing.T) {
+func TestJournalMarkUnknownRejectsDuplicateTransition(t *testing.T) {
 	j := openTestJournal(t, t.TempDir())
 	e := Effect{TaskID: "task-1", Kind: KindShell, Target: "cmd:ee", ArgsDigest: "ee", Policy: PolicyManualOnly}
 	if err := j.Prepare(&e); err != nil {
@@ -106,16 +110,9 @@ func TestJournalMarkUnknownIdempotent(t *testing.T) {
 	if got[0].Status != StatusUnknown || got[0].UnknownReason != "命令超时" {
 		t.Fatalf("unknown 状态/原因未记录: %+v", got[0])
 	}
-	// 重复标记幂等——不产生重复账本行。
-	if err := j.MarkUnknown(e.ID, "命令超时"); err != nil {
-		t.Fatalf("重复 MarkUnknown 应幂等: %v", err)
-	}
-	data, err := os.ReadFile(j.Path())
-	if err != nil {
-		t.Fatalf("读取账本: %v", err)
-	}
-	if n := strings.Count(string(data), `"op":"unknown"`); n != 1 {
-		t.Fatalf("unknown 账本行应只有 1 行，实际 %d", n)
+	// 重复 transition 会隐藏上层重复结算缺陷，必须拒绝。
+	if err := j.MarkUnknown(e.ID, "命令再次超时"); err == nil {
+		t.Fatal("重复 MarkUnknown 应拒绝")
 	}
 }
 
@@ -168,43 +165,48 @@ func TestJournalReplayRebuildsIndexAndContinuesSeq(t *testing.T) {
 	}
 }
 
-func TestJournalReplayToleratesCorruptLines(t *testing.T) {
-	dir := t.TempDir()
-	func() {
-		j, err := OpenJournal(dir)
+func TestJournalReplayFailsClosedOnBrokenAuthorityChain(t *testing.T) {
+	now := time.Now().UTC()
+	prepared := Effect{
+		ID: "task-1-1", TaskID: "task-1", Kind: KindFileWrite,
+		Target: "/p/a.go", ArgsDigest: "11", Policy: PolicyVerifyFirst,
+		Status: StatusPrepared, PreparedAt: now,
+	}
+	line := func(rec record) string {
+		data, err := json.Marshal(rec)
 		if err != nil {
-			t.Fatalf("OpenJournal: %v", err)
+			t.Fatalf("序列化测试账本行: %v", err)
 		}
-		defer j.Close()
-		e := Effect{TaskID: "task-1", Kind: KindFileWrite, Target: "/p/a.go", ArgsDigest: "11", Policy: PolicyVerifyFirst}
-		if err := j.Prepare(&e); err != nil {
-			t.Fatalf("Prepare: %v", err)
-		}
-	}()
-	// 追加损坏行与孤儿 settle 行。
-	f, err := os.OpenFile(filepath.Join(dir, journalFileName), os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		t.Fatalf("打开账本追加: %v", err)
+		return string(data) + "\n"
 	}
-	if _, err := f.WriteString("这不是 JSON\n{\"op\":\"settle\",\"id\":\"ghost-1\"}\n{\"op\":\"bogus\"}\n"); err != nil {
-		t.Fatalf("写损坏行: %v", err)
+	prepareLine := line(record{Op: opPrepare, Effect: &prepared})
+	tests := map[string]string{
+		"JSON 损坏":    "这不是 JSON\n",
+		"孤儿 settle":  line(record{Op: opSettle, ID: "ghost-1", At: now}),
+		"孤儿 unknown": line(record{Op: opUnknown, ID: "ghost-1", Reason: "unknown", At: now}),
+		"未知操作":       line(record{Op: "bogus"}),
+		"重复 prepare": prepareLine + prepareLine,
+		"重复 settle":  prepareLine + line(record{Op: opSettle, ID: prepared.ID, At: now}) + line(record{Op: opSettle, ID: prepared.ID, At: now}),
+		"重复 unknown": prepareLine + line(record{Op: opUnknown, ID: prepared.ID, Reason: "first", At: now}) + line(record{Op: opUnknown, ID: prepared.ID, Reason: "second", At: now}),
+		"不连续 seq": func() string {
+			gap := prepared
+			gap.ID = "task-1-2"
+			return line(record{Op: opPrepare, Effect: &gap})
+		}(),
+		"未知字段": `{"op":"settle","id":"ghost-1","unexpected":true}` + "\n",
 	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("关闭账本: %v", err)
-	}
-
-	j := openTestJournal(t, dir)
-	got := j.Query("task-1")
-	if len(got) != 1 || got[0].Status != StatusPrepared {
-		t.Fatalf("损坏行容错后应只重建 1 条 prepared: %+v", got)
-	}
-	// 孤儿 settle 不影响续号。
-	e := Effect{TaskID: "task-1", Kind: KindFileEdit, Target: "/p/a.go", ArgsDigest: "22", Policy: PolicyVerifyFirst}
-	if err := j.Prepare(&e); err != nil {
-		t.Fatalf("Prepare: %v", err)
-	}
-	if e.ID != "task-1-2" {
-		t.Fatalf("续号应为 task-1-2，实际 %s", e.ID)
+	for name, content := range tests {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, journalFileName)
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatalf("写入测试账本: %v", err)
+			}
+			if j, err := OpenJournal(dir); err == nil {
+				_ = j.Close()
+				t.Fatal("损坏权威链应使 OpenJournal fail-closed")
+			}
+		})
 	}
 }
 
@@ -237,5 +239,139 @@ func TestJournalPrepareRequiresTaskID(t *testing.T) {
 	e := Effect{Kind: KindFileWrite, Target: "/p", ArgsDigest: "x", Policy: PolicyVerifyFirst}
 	if err := j.Prepare(&e); err == nil {
 		t.Fatal("缺 TaskID 的 Prepare 应报错（无法分配幂等身份）")
+	}
+}
+
+func TestJournalFilePermissionIsPrivate(t *testing.T) {
+	j := openTestJournal(t, t.TempDir())
+	if runtime.GOOS == "windows" {
+		return // Windows 的 os.FileMode 不投影 ACL，Chmod 仍在生产路径执行。
+	}
+	info, err := os.Stat(j.Path())
+	if err != nil {
+		t.Fatalf("Stat journal: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("effect journal 权限 = %04o，want 0600", got)
+	}
+}
+
+type faultJournalFile struct {
+	shortWrite    bool
+	writeErr      error
+	syncErr       error
+	failWriteCall int
+	failSyncCall  int
+	writeCalls    int
+	syncCalls     int
+	closed        bool
+}
+
+func (f *faultJournalFile) Write(p []byte) (int, error) {
+	f.writeCalls++
+	failing := f.failWriteCall == 0 || f.writeCalls == f.failWriteCall
+	if failing && f.shortWrite && len(p) > 0 {
+		return len(p) - 1, f.writeErr
+	}
+	if failing {
+		return len(p), f.writeErr
+	}
+	return len(p), nil
+}
+
+func (f *faultJournalFile) Sync() error {
+	f.syncCalls++
+	if f.failSyncCall == 0 || f.syncCalls == f.failSyncCall {
+		return f.syncErr
+	}
+	return nil
+}
+func (f *faultJournalFile) Close() error {
+	f.closed = true
+	return nil
+}
+
+func TestJournalSettleFsyncFailurePoisonsPreparedAuthority(t *testing.T) {
+	file := &faultJournalFile{syncErr: io.ErrUnexpectedEOF, failSyncCall: 2}
+	j := newFaultJournal(file)
+	t.Cleanup(func() { _ = j.Close() })
+	e := Effect{
+		TaskID: "task-settle-poison", Kind: KindFileWrite, Target: "/p/a.go",
+		ArgsDigest: "abcdef123456", Policy: PolicyVerifyFirst,
+	}
+	if err := j.Prepare(&e); err != nil {
+		t.Fatalf("Prepare 应在首次 fsync 成功: %v", err)
+	}
+	if err := j.Settle(e.ID, "bytes=1"); !errors.Is(err, ErrJournalPoisoned) {
+		t.Fatalf("第二次 fsync 失败应 poison: %v", err)
+	}
+	if _, err := j.QueryStrict(e.TaskID); !errors.Is(err, ErrJournalPoisoned) {
+		t.Fatalf("Settle poison 后严格读应失败: %v", err)
+	}
+	if _, err := j.RecoverStrict(nil); !errors.Is(err, ErrAuthorityUnavailable) || !errors.Is(err, ErrJournalPoisoned) {
+		t.Fatalf("Settle poison 后严格恢复应阻断: %v", err)
+	}
+}
+
+func newFaultJournal(file journalFile) *Journal {
+	return &Journal{
+		file: file, path: "fault://effects.jsonl",
+		index: make(map[string]*Effect), maxSeq: make(map[string]int),
+	}
+}
+
+func TestJournalWriteOrSyncFailurePoisonsAllAuthorityAccess(t *testing.T) {
+	tests := map[string]*faultJournalFile{
+		"短写":       {shortWrite: true},
+		"write 错误": {writeErr: io.ErrUnexpectedEOF},
+		"fsync 错误": {syncErr: io.ErrUnexpectedEOF},
+	}
+	for name, file := range tests {
+		t.Run(name, func(t *testing.T) {
+			j := newFaultJournal(file)
+			t.Cleanup(func() { _ = j.Close() })
+			e := Effect{
+				TaskID: "task-poison", Kind: KindFileWrite, Target: "/p/a.go",
+				ArgsDigest: "abcdef123456", Policy: PolicyVerifyFirst,
+			}
+			err := j.Prepare(&e)
+			if !errors.Is(err, ErrJournalPoisoned) {
+				t.Fatalf("Prepare 应 poison journal: %v", err)
+			}
+			if e.ID != "" || e.Status != "" || !e.PreparedAt.IsZero() {
+				t.Fatalf("落账失败不得向调用方暴露未 durable 身份: %+v", e)
+			}
+			if err := j.Health(); !errors.Is(err, ErrJournalPoisoned) {
+				t.Fatalf("Health 应返回 poison: %v", err)
+			}
+			if _, err := j.QueryStrict("task-poison"); !errors.Is(err, ErrJournalPoisoned) {
+				t.Fatalf("QueryStrict 应在 poison 后失败: %v", err)
+			}
+			if got := j.Query("task-poison"); got != nil {
+				t.Fatalf("legacy Query 不得把 poison 后的局部索引当权威值: %+v", got)
+			}
+			if err := j.Settle("task-poison-1", "done"); !errors.Is(err, ErrJournalPoisoned) {
+				t.Fatalf("poison 后 Settle 应稳定失败: %v", err)
+			}
+			if err := j.MarkUnknown("task-poison-1", "unknown"); !errors.Is(err, ErrJournalPoisoned) {
+				t.Fatalf("poison 后 MarkUnknown 应稳定失败: %v", err)
+			}
+		})
+	}
+}
+
+func TestRequireJournalIsExplicitProductionAssemblyGate(t *testing.T) {
+	if err := RequireJournal(nil); !errors.Is(err, ErrAuthorityUnavailable) || !errors.Is(err, ErrJournalRequired) {
+		t.Fatalf("nil Journal 应返回 typed 装配错误: %v", err)
+	}
+	j := openTestJournal(t, t.TempDir())
+	if err := RequireJournal(j); err != nil {
+		t.Fatalf("健康 Journal 应通过装配校验: %v", err)
+	}
+	if err := j.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := RequireJournal(j); !errors.Is(err, ErrAuthorityUnavailable) || !errors.Is(err, ErrJournalClosed) {
+		t.Fatalf("已关闭 Journal 不得通过生产装配: %v", err)
 	}
 }
