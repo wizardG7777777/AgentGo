@@ -2,13 +2,13 @@
 #
 # 用途：以 Flask 真实仓库为对象的中等项目行为评测（SWE 式红→绿任务）。
 # 这是一个**模板**：__AGENTGO_ROOT__/__PROJECT_ROOT__/__PORT__/__TOKEN__/
-# __BASE_URL__/__MODEL__ 六个占位符由 harness（/tmp/agentgo-swe/harness/
-# run_task.sh）在每次运行时渲染。
+# __BASE_URL__/__MODEL__ 六个占位符由仓库内 `scripts/swe_harness/run_task.sh`
+# 在每次运行时渲染；`/tmp/agentgo-swe` 只保存题目数据和运行产物。
 #
 # 换模型供应商只需设三个环境变量（均有默认值，默认即 OpenRouter + DeepSeek）：
 #   SWE_BASE_URL   供应商的 OpenAI 兼容端点（默认 https://openrouter.ai/api/v1）
 #   SWE_MODEL      模型名，全角色统一（默认 deepseek/deepseek-v4-flash-0731）
-#   AGENTGO_SWE_API_KEY  供应商密钥（必填，harness 只查非空，不校验格式）
+#   AGENTGO_SWE_API_KEY  供应商密钥（必填；真实 function-call probe 负责能力验证）
 # 本文件不落任何明文密钥。
 #
 # 评测纪律：
@@ -32,6 +32,7 @@ tool_profiles:
     - list_dir
     - grep_search
     - glob_search
+    - read_content_ref
     - send_message
     - request_replan
     - submit_task_result
@@ -40,6 +41,7 @@ tool_profiles:
     - list_dir
     - grep_search
     - glob_search
+    - read_content_ref
     - write_file
     - edit_file
     - run_shell
@@ -51,6 +53,7 @@ tool_profiles:
     - list_dir
     - grep_search
     - glob_search
+    - read_content_ref
     - submit_task_result
 
 agents:
@@ -60,8 +63,7 @@ agents:
     profile: swe_explorer
     system_prompt_file: __AGENTGO_ROOT__/prompts/swe/explorer.md
     model: __MODEL__
-    task_max_retries: 3
-    enforce_compact_token_threshold: 60000
+    task_max_retries: 5
     description: 只读调查代理：定位缺陷、解释行为、梳理调用关系；无写/shell/网络。
   - kind: worker
     replicas: 2
@@ -69,8 +71,7 @@ agents:
     profile: swe_worker
     system_prompt_file: __AGENTGO_ROOT__/prompts/swe/worker.md
     model: __MODEL__
-    task_max_retries: 3
-    enforce_compact_token_threshold: 60000
+    task_max_retries: 5
     description: 通用执行代理：调查、修改代码、运行 pytest 验证；无网络工具。
   - kind: verifier
     replicas: 2
@@ -78,15 +79,16 @@ agents:
     profile: swe_verifier
     system_prompt_file: __AGENTGO_ROOT__/prompts/swe/verifier.md
     model: __MODEL__
-    task_max_retries: 3
-    enforce_compact_token_threshold: 60000
+    task_max_retries: 5
     description: 验收代理：按节点验收标准核验上游证据与仓库状态；无 shell/网络。
 
 scheduler:
   model: __MODEL__
 
 project_root: "__PROJECT_ROOT__"
-startup_probe: "off"
+startup_probe: "tool"
+startup_probe_timeout_sec: 45
+startup_probe_failure_action: "exit"
 shell_timeout_sec: 300
 
 ui:
