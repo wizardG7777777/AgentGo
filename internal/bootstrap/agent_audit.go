@@ -23,10 +23,13 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"agentgo/internal/config"
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
 	"agentgo/internal/prompt"
+	"agentgo/internal/taskcontract"
 	"agentgo/internal/trace"
 )
 
@@ -34,7 +37,7 @@ import (
 const agentAuditPromptExcerptRunes = 200
 
 // agentAuditPendingLimit 是 agentAuditReactor 待补记 meta 的 FIFO 容量
-//（审计由用户显式触发，正常远低于此；溢出时丢弃最旧一条，只影响
+// （审计由用户显式触发，正常远低于此；溢出时丢弃最旧一条，只影响
 // agent_audit_completed 补记，不影响审计任务本身）。
 const agentAuditPendingLimit = 32
 
@@ -226,6 +229,10 @@ func (s *System) RequestAgentAudit() (string, error) {
 		EventType:      "__scheduler__",
 		EventSource:    "agent-audit",
 		MaxConcurrency: 1, // 同一时刻只跑一个审计
+	}
+	if err := taskcontract.Start(task, loopcontract.WorkVerification, "agent-audit/v1",
+		30*time.Minute, 3*time.Minute, 5*time.Minute); err != nil {
+		return "", fmt.Errorf("创建代理审计 RunContract: %w", err)
 	}
 	if err := s.Store.PublishTask(task); err != nil {
 		return "", fmt.Errorf("发布代理审计任务失败: %w", err)

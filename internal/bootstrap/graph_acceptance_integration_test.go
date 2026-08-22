@@ -70,10 +70,13 @@ func TestGraphBridgeAcceptanceEndToEnd(t *testing.T) {
 	if !strings.HasPrefix(verify1.Description, wantDescPrefix) {
 		t.Errorf("verify 任务描述应以验收判据开头，实际 %q", verify1.Description)
 	}
-	// 数据流注入：验收任务应携带 implement@1 的上游输入绑定（来源标识 + 有界摘要）。
-	if !strings.Contains(verify1.Description, "来自节点 implement（activation implement@1）") ||
-		!strings.Contains(verify1.Description, "第一版修改") {
-		t.Errorf("verify 任务描述应注入 implement@1 的上游输入绑定，实际 %q", verify1.Description)
+	// 数据流通过 typed ContextInputs 进入 L2，不再污染 Description/user_task。
+	if len(verify1.ContextInputs) == 0 || verify1.ContextInputs[0].Kind != model.TaskContextUpstreamResult ||
+		!strings.Contains(verify1.ContextInputs[0].Content, "第一版修改") {
+		t.Errorf("verify 任务应冻结 implement@1 typed input，实际 %+v", verify1.ContextInputs)
+	}
+	if strings.Contains(verify1.Description, "第一版修改") {
+		t.Errorf("上游 Result 不得拼入 Description: %q", verify1.Description)
 	}
 	if verify1.GraphID != "g-bridge-acc" || verify1.NodeID != "verify" {
 		t.Errorf("verify 任务应携带图身份 GraphID/NodeID，实际 GraphID=%q NodeID=%q", verify1.GraphID, verify1.NodeID)
@@ -243,7 +246,7 @@ func TestGraphBridgeAcceptanceLineageValidEndToEnd(t *testing.T) {
 	}
 	implTaskID, verifyTaskID := driveToAcceptanceVerify(t, env)
 
-	// 验收任务描述的上游输入段应列出实现者证据引用（数据流注入）。
+	// 验收任务的 typed Evidence input 应列出实现者证据引用。
 	verify, err := env.tasks.GetTask(verifyTaskID)
 	if err != nil || verify == nil {
 		t.Fatalf("verify 任务应存在: %v", err)
@@ -257,8 +260,12 @@ func TestGraphBridgeAcceptanceLineageValidEndToEnd(t *testing.T) {
 		t.Fatal("implement 任务应产生稳定 EvidenceRef")
 	}
 	upstreamRef := evidence[0].Ref
-	if !strings.Contains(verify.Description, upstreamRef) {
-		t.Fatalf("verify 任务描述应注入上游证据引用 %s: %q", upstreamRef, verify.Description)
+	joinedInputs := ""
+	for _, input := range verify.ContextInputs {
+		joinedInputs += input.Content
+	}
+	if !strings.Contains(joinedInputs, upstreamRef) {
+		t.Fatalf("verify typed input 应注入上游证据引用 %s: %q", upstreamRef, joinedInputs)
 	}
 
 	runAcceptanceNode(t, env.tasks, "verifier-1", verifyTaskID, "全部判据通过", "pass", upstreamRef)

@@ -18,8 +18,11 @@ import (
 	"strings"
 
 	"agentgo/internal/graph"
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
+	"agentgo/internal/taskcontract"
 )
 
 // ============================================================
@@ -28,7 +31,8 @@ import (
 
 // graphChangeWaker 按 C5d 既有 graph change 机制发布 __scheduler__ 唤醒任务。
 type graphChangeWaker struct {
-	store store.TaskStore
+	store  store.TaskStore
+	graphs *graph.Store
 }
 
 // graphChangeWakeMarkerKind 按种类构造唤醒任务描述中的幂等标记（与
@@ -87,6 +91,25 @@ func (w graphChangeWaker) WakeGraphChange(spec graph.GraphChangeWakeSpec) error 
 		ParentTaskID:   spec.TaskID,
 		MaxConcurrency: 1, // 同一时刻只允许一个 Scheduler 处理同一请求
 	}
+	var parent *model.Task
+	if spec.TaskID != "" {
+		parent, _ = w.store.GetTask(spec.TaskID)
+	}
+	if w.graphs != nil {
+		if doc, ok := w.graphs.Get(spec.GraphID); ok && doc != nil {
+			if parent == nil {
+				parent = &model.Task{RunID: doc.RunID, RunContract: doc.RunContract}
+			}
+		}
+	}
+	if parent != nil {
+		if err := taskcontract.Inherit(parent, wake, loopcontract.WorkCoordination); err != nil {
+			return fmt.Errorf("graph change 唤醒继承 RunContract: %w", err)
+		}
+		if wake.RunContract != nil {
+			wake.RunPhase = runcontract.PhaseRecovery
+		}
+	}
 	if err := w.store.PublishTask(wake); err != nil {
 		return fmt.Errorf("发布 graph change 唤醒任务失败: %w", err)
 	}
@@ -103,6 +126,10 @@ func (w graphChangeWaker) WakeGraphChange(spec graph.GraphChangeWakeSpec) error 
 //
 // 调用时序约束：与 graph approval/tool 桥同批（resumeNonTerminalGraphs 之前）——
 // 恢复路径不触发 OnTaskTerminal，但启动后第一批验收任务终态必须已注入。
-func wireGraphAcceptanceBridge(taskStore store.TaskStore, rt *graph.Runtime) {
-	rt.SetChangeWaker(graphChangeWaker{store: taskStore})
+func wireGraphAcceptanceBridge(taskStore store.TaskStore, rt *graph.Runtime, graphs ...*graph.Store) {
+	var graphStore *graph.Store
+	if len(graphs) > 0 {
+		graphStore = graphs[0]
+	}
+	rt.SetChangeWaker(graphChangeWaker{store: taskStore, graphs: graphStore})
 }

@@ -15,6 +15,9 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/agenttemplate"
 	"agentgo/internal/config"
+	"agentgo/internal/contentstore"
+	"agentgo/internal/contextadapter"
+	"agentgo/internal/contextstore"
 	"agentgo/internal/dashboard"
 	"agentgo/internal/effect"
 	"agentgo/internal/gate"
@@ -23,14 +26,18 @@ import (
 	"agentgo/internal/hook/builtin"
 	"agentgo/internal/interaction"
 	"agentgo/internal/llm"
+	"agentgo/internal/loopstore"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/memory"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
+	"agentgo/internal/outcomestore"
 	"agentgo/internal/output"
 	"agentgo/internal/pathutil"
+	"agentgo/internal/policycatalog"
 	"agentgo/internal/probe"
 	"agentgo/internal/prompt"
+	"agentgo/internal/proposalacceptance"
 	"agentgo/internal/reactor"
 	reactorbuiltin "agentgo/internal/reactor/builtin"
 	"agentgo/internal/reactor/userdef"
@@ -68,6 +75,11 @@ type System struct {
 	// 提交/查询图。
 	GraphStore   *graph.Store
 	GraphRuntime *graph.Runtime
+	// GraphAuthoringStore/Runtime 是 Draft→Definition→Execution 的事务控制面；
+	// 与 GraphStore 物理分离，pending Definition 不会被 Runtime 恢复为 running。
+	GraphAuthoringStore   *graph.AuthoringStore
+	GraphAuthoringRuntime *graph.AuthoringRuntime
+	GraphPolicyCatalog    *policycatalog.Catalog
 	// graphApprovalGW 是 approval 节点与 Interaction 服务之间的网关（C5c）；
 	// session 解冻后为该 session 的 waiting approval 节点补登记 Interaction。
 	// nil 表示 approval 桥未装配（Interactions 或 GraphRuntime 缺失）。
@@ -87,9 +99,19 @@ type System struct {
 	// agentAudit 是审计任务终态的补记 Reactor（agent_audit_completed）；
 	// 进程内 FIFO meta，nil 表示未注册（审计任务可发布但无 completed 补记）。
 	agentAudit *agentAuditReactor
-	// EffectJournal 是 V6 §4 H2b 副作用账本（internal/effect），Shutdown 时需
-	// Close；nil 表示账本已禁用（初始化失败，全部埋点降级不记账）。
+	// EffectJournal 是 V6 §4 H2b 副作用 durable authority，Shutdown 时需
+	// Close；生产 Bootstrap 初始化失败即返回错误，成功 System 中恒非 nil。
 	EffectJournal *effect.Journal
+	// LoopStore 是 L4 action/settlement/checkpoint 的 fail-closed 权威。
+	LoopStore *loopstore.Store
+	// TaskOutcomeStore 是所有新 Run Task 的 append-only 终态与 delivery outbox 权威。
+	TaskOutcomeStore *outcomestore.Store
+	// ContentStore 是 L3 大正文/ContentRef 的持久化与授权解引用权威。
+	// 新执行不允许在初始化失败时降级为无 Store 模式。
+	ContentStore *contentstore.Store
+	// ContextSnapshotStore 是 L2 已编译 Snapshot/Manifest metadata 的
+	// append-only 权威；模型请求正文不进入本 Store。
+	ContextSnapshotStore *contextstore.Store
 	// artifactReplay 是启动时从 ArtifactLog 重放出的 taskID→artifacts 映射（F12）。
 	// store 构造时还没有任何任务，立即恢复会全部 miss；由 restoreRuntimeSnapshot
 	// 在 Task 快照导入后消费。RestoreArtifacts 是覆盖式恢复（rebuilt 为完整去重
@@ -375,6 +397,51 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	cancelRegistry := store.NewTaskCancelRegistry()
 	taskStore.SetCancelRegistry(cancelRegistry)
 	log.Println("[启动] 公告板初始化完成")
+	loopStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "loop")
+	loopStateStore, loopStoreErr := loopstore.Open(loopStorePath)
+	if loopStoreErr != nil {
+		return nil, fmt.Errorf("初始化 L4 LoopStore 失败（新执行必须 fail-closed）: %w", loopStoreErr)
+	}
+	defer func() {
+		if !bootstrapCompleted {
+			_ = loopStateStore.Close()
+		}
+	}()
+	log.Printf("[启动] L4 LoopStore 已启用 (dir=%s)", loopStorePath)
+	outcomeStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "task-outcomes")
+	taskOutcomeStore, outcomeStoreErr := outcomestore.New(outcomeStorePath)
+	if outcomeStoreErr != nil {
+		return nil, fmt.Errorf("初始化 TaskOutcomeStore 失败（新执行必须 fail-closed）: %w", outcomeStoreErr)
+	}
+	defer func() {
+		if !bootstrapCompleted {
+			_ = taskOutcomeStore.Close()
+		}
+	}()
+	log.Printf("[启动] TaskOutcomeStore 已启用 (dir=%s)", outcomeStorePath)
+	contentStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "content")
+	contentStateStore, contentStoreErr := contentstore.Open(contentStorePath, contentstore.Options{})
+	if contentStoreErr != nil {
+		_ = loopStateStore.Close()
+		return nil, fmt.Errorf("初始化 L3 ContentStore 失败（新执行必须 fail-closed）: %w", contentStoreErr)
+	}
+	defer func() {
+		if !bootstrapCompleted {
+			_ = contentStateStore.Close()
+		}
+	}()
+	log.Printf("[启动] L3 ContentStore 已启用 (dir=%s)", contentStorePath)
+	contextSnapshotPath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "context-snapshots")
+	contextSnapshotStore, contextSnapshotErr := contextstore.New(contextSnapshotPath)
+	if contextSnapshotErr != nil {
+		return nil, fmt.Errorf("初始化 L2 ContextSnapshotStore 失败（新执行必须 fail-closed）: %w", contextSnapshotErr)
+	}
+	defer func() {
+		if !bootstrapCompleted {
+			_ = contextSnapshotStore.Close()
+		}
+	}()
+	log.Printf("[启动] L2 ContextSnapshotStore 已启用 (dir=%s)", contextSnapshotPath)
 
 	// 节点能力注册表（per-node NodeCapability 认领检查的事实源）：
 	// 此处先建空表并注入 checker 闭包，白名单在下方 Step 8 创建静态
@@ -429,38 +496,47 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// Step 2.4: Effect Journal（V6 §4 H2b，副作用账本）。
 	//
 	// .agentgo/state/effects.jsonl：副作用执行前记 prepared、执行后记
-	// settled/unknown，崩溃恢复以账本 + 实际外部状态共同裁决。与 artifact
-	// log 同一降级姿态：初始化失败只打印 warning——账本是观测设施，
-	// 不能让磁盘问题阻塞 CLI 启动（nil 时全部埋点不记账）。
+	// settled/unknown，崩溃恢复以账本 + 实际外部状态共同裁决。它是副作用
+	// durable authority，不是观测设施：初始化、replay、恢复或健康检查失败
+	// 都拒绝启动新执行，生产绝不注入 nil Journal。
 	//
 	// 恢复裁决在此处同步执行：trace writer 已就位（Step 1.5）而 Reactor
 	// dispatcher 尚未挂载（末段才 SetDefaultDispatcher），effect_* 事件
 	// 只落 trace 分片，不会触发任何 Reactor 副作用——与下方运行时状态
 	// 恢复前 detach dispatcher 是同一防护意图。
 	effectJournal, ejErr := effect.OpenJournal(artifactLogDir)
-	var effectRecoveryDecisions []effect.RecoveryDecision
 	if ejErr != nil {
-		fmt.Printf("[启动] WARNING: effect journal 初始化失败 (dir=%s): %v —— 副作用账本已禁用\n", artifactLogDir, ejErr)
-		effectJournal = nil
-	} else {
-		decisions := effectJournal.Recover(effect.FileHashVerifier{})
-		effectRecoveryDecisions = decisions
-		if len(decisions) > 0 {
-			unknownCount := 0
-			for _, d := range decisions {
-				if d.Decision != effect.DecisionVerifiedSettled {
-					unknownCount++
-				}
-			}
-			log.Printf("[启动] Effect Journal 恢复裁决完成：%d 条待裁决（核验一致转 settled %d 条，保持 unknown %d 条）",
-				len(decisions), len(decisions)-unknownCount, unknownCount)
-			if unknownCount > 0 {
-				// unknown 清单必须向用户可见（控制台 + system.log + trace 事件三通道）。
-				fmt.Printf("[启动] WARNING: %d 条副作用在崩溃窗口结果不可知（unknown），未自动重跑；请经 trace show <task_id> 查看 effect_* 事件人工裁决\n", unknownCount)
+		return nil, fmt.Errorf("初始化 Effect Journal 失败（副作用 authority 不允许降级）: %w", ejErr)
+	}
+	if err := effect.RequireJournal(effectJournal); err != nil {
+		_ = effectJournal.Close()
+		return nil, fmt.Errorf("Effect Journal authority 不健康: %w", err)
+	}
+	defer func() {
+		if !bootstrapCompleted {
+			_ = effectJournal.Close()
+		}
+	}()
+	decisions, recoveryErr := effectJournal.RecoverStrict(effect.FileHashVerifier{})
+	if recoveryErr != nil {
+		_ = effectJournal.Close()
+		return nil, fmt.Errorf("Effect Journal 恢复失败（fail-closed）: %w", recoveryErr)
+	}
+	effectRecoveryDecisions := decisions
+	if len(decisions) > 0 {
+		unknownCount := 0
+		for _, d := range decisions {
+			if d.Decision != effect.DecisionVerifiedSettled {
+				unknownCount++
 			}
 		}
-		log.Printf("[启动] Effect Journal 已启用 (log=%s)", effectJournal.Path())
+		log.Printf("[启动] Effect Journal 恢复裁决完成：%d 条待裁决（核验一致转 settled %d 条，保持 unknown %d 条）",
+			len(decisions), len(decisions)-unknownCount, unknownCount)
+		if unknownCount > 0 {
+			fmt.Printf("[启动] WARNING: %d 条副作用在崩溃窗口结果不可知（unknown），未自动重跑；请经 trace show <task_id> 查看 effect_* 事件人工裁决\n", unknownCount)
+		}
 	}
+	log.Printf("[启动] Effect Journal authority 已启用 (log=%s)", effectJournal.Path())
 
 	// Step 2.5: 初始化统一 Gate 系统（v5 Phase 1，ReactiveSystem.md §4.4）
 	//
@@ -475,6 +551,9 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	var storeView store.StoreHookView = taskStore
 	recordToolCall := func(taskID string, rec store.ToolCallRecord) {
 		_ = taskStore.AppendToolCall(taskID, rec)
+	}
+	durableToolCallRecorder := func(taskID string, rec store.ToolCallRecord) error {
+		return taskStore.AppendToolCall(taskID, rec)
 	}
 	// 注册 7 个 Tool 域 Gate（impl 仍是 hook.ToolHook 接口，通过 adapter 包装）。
 	// 注：v5 Phase 4 起 record-artifact 已迁移为 Reactor（订阅 KindFileWritten），
@@ -617,13 +696,46 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// dispatcher 挂载前完成注册（restoreRuntimeBeforeReactorActivation）。
 	// sessionIDProvider 闭包惰性取 sessMgr 当前 session：提交图盖章归属、
 	// 恢复时归并无归属历史图；sessMgr 为 nil（无 Session 模式）时归空串。
-	graphStore, graphRuntime, err := wireGraphRuntime(
-		cfg, taskStore, reactorReg, effectJournal,
+	graphPolicies, err := policycatalog.NewDefault()
+	if err != nil {
+		return nil, fmt.Errorf("创建 Graph policy catalog 失败: %w", err)
+	}
+	contextRuntime := agent.ContextRuntime{
+		Adapter: contextadapter.New(), Policies: graphPolicies,
+		Snapshots: contextSnapshotStore, Content: contentStateStore,
+		SessionID: func() string { return currentSessionIDFromMgr(sessMgr) },
+	}
+	// Scheduler Prompt 是内置静态 L1 产物，启动期已经完全可知。必须在
+	// Graph/Runner 运行时装配前用真实 L2 编码路径证明它符合 current policy；
+	// 不能等第一个用户 Task 认领后才暴露 deterministic contract failure。
+	if err := contextRuntime.ValidateStaticPrompt(context.Background(), agent.StaticPromptProfile{
+		ProfileID: "scheduler", ContextPolicyRef: policycatalog.ContextDefaultCurrent,
+		SystemPrompt: scheduler.SystemPrompt(),
+	}); err != nil {
+		return nil, fmt.Errorf("Scheduler L1/L2 启动契约不兼容: %w", err)
+	}
+	log.Printf("[启动] L1/L2 静态 Prompt 预检通过：kind=scheduler ContextPolicy=%s",
+		policycatalog.ContextDefaultCurrent)
+	graphStore, graphRuntime, err := wireGraphRuntimeWithOutcome(
+		cfg, taskStore, reactorReg, effectJournal, graphPolicies,
 		func() string { return currentSessionIDFromMgr(sessMgr) },
+		taskOutcomeStore, loopStateStore,
 		unresolvedEffectTaskReasons(effectRecoveryDecisions))
 	if err != nil {
 		return nil, err
 	}
+	graphAuthoringStore, err := graph.NewAuthoringStore(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "graph-authoring"))
+	if err != nil {
+		return nil, fmt.Errorf("创建 Graph AuthoringStore 失败: %w", err)
+	}
+	graphAuthoringRuntime := &graph.AuthoringRuntime{Authoring: graphAuthoringStore, Runtime: graphRuntime}
+	if err := graphAuthoringRuntime.ReconcileCommittedDefinitions(); err != nil {
+		return nil, fmt.Errorf("恢复 Graph Definition adoption 失败（fail-closed）: %w", err)
+	}
+	graphDefinitionCompiler := graph.DefinitionCompiler{Policies: graphPolicies}
+	// Acceptance 在独立 client 创建后注入；在此之前尚无工具可触发 Compiler。
+	log.Printf("[启动] Graph Authoring 已装配（state=%s；等待独立 Proposal Acceptance 接线）",
+		filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "graph-authoring"))
 	if migrated, migrateErr := migrateV1TeamGraphBindings(teamStore, graphStore); migrateErr != nil {
 		return nil, fmt.Errorf("迁移 Agent TeamStore v1 Graph 归属失败（按 fail-closed 拒绝启动）: %w", migrateErr)
 	} else if migrated {
@@ -641,6 +753,37 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// internal/scheduler.New 从同一 cfg.Scheduler 读取。
 	// 缺省回落 cfg.LLM.DefaultModel。LLM endpoint / api_key 与 worker 共享。
 	schedulerLLM := buildKindLLMClient(cfg.LLM, cfg.Scheduler.Model)
+	proposalModel := cfg.Scheduler.Model
+	for _, kind := range cfg.Agents {
+		if kind.EventType == graph.RouteAcceptance && strings.TrimSpace(kind.Model) != "" {
+			proposalModel = kind.Model
+			break
+		}
+	}
+	proposalLLM := buildKindLLMClient(cfg.LLM, proposalModel)
+	proposalVerifier, err := proposalacceptance.New(
+		proposalLLM,
+		proposalacceptance.RequestTextResolverFunc(func(ctx context.Context, requestRef string) (string, error) {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			task, getErr := taskStore.GetTask(strings.TrimSpace(requestRef))
+			if getErr != nil || task == nil {
+				return "", fmt.Errorf("读取原始 Scheduler request %s: %w", requestRef, getErr)
+			}
+			if task.GraphID != "" || task.EventType != "__scheduler__" {
+				return "", fmt.Errorf("request_ref=%s 不是 origin Scheduler task", requestRef)
+			}
+			return task.Description, nil
+		}),
+		contextSnapshotStore,
+		proposalacceptance.Options{},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("创建独立 Graph Proposal Verifier 失败: %w", err)
+	}
+	graphDefinitionCompiler.Acceptance = proposalVerifier
+	log.Printf("[启动] Graph Proposal Acceptance 已装配（model=%s，独立 prompt，空工具面）", proposalModel)
 
 	// Step 5.5: 构造特化代理注册表（Sprint 3 #7 Scheduler 分配感知）
 	// v4：扫描 cfg.Agents，把每个静态 kind 注册为 ready route；EventType != ""
@@ -682,6 +825,8 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 
 	// Step 6: 创建看门狗（先于 scheduler 创建）。
 	w := watchdog.New(taskStore, cfg, eventCh, r, mbRegistry, watchdog.NewRuntimeRouteResolver(agentRegistry))
+	w.SessionID = func() string { return currentSessionIDFromMgr(sessMgr) }
+	w.ProgressReader = loopStateStore
 	// workspace 孤儿清扫：终态 / 失踪任务的残留目录由 watchdog 周期兜底
 	// （合并成功的正常清理由执行面负责；nil-safe 字段注入，不改 New 签名）。
 	w.WorkspaceManager = wsMgr
@@ -775,7 +920,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// 数据全部来自图内 durable 事实）；此处注入 disputed 时的 graph change
 	// 唤醒器（__scheduler__ 唤醒任务交 Scheduler 裁决）。与 approval/tool
 	// 桥同批注入：启动后第一批验收任务终态必须已装配。
-	wireGraphAcceptanceBridge(taskStore, graphRuntime)
+	wireGraphAcceptanceBridge(taskStore, graphRuntime, graphStore)
 
 	// Step 4.5: 创建 TUI 双通道（日志与 Agent 输出分离，避免竞争）
 	statusCh := make(chan string, 1024)      // 日志/进度消息
@@ -845,33 +990,37 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// 晋升器从它读终态 Task Memory 并回写 PromotedAt 幂等标记。
 	taskMemStore := taskmem.NewStore(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "taskmem"))
 	deps := runner.RunnerDeps{
-		Store:                 taskStore,
-		Roster:                r,
-		GateReg:               gateReg,
-		StoreView:             storeView,
-		RecordToolCall:        recordToolCall,
-		Memory:                memoryStore,
-		TaskMemStore:          taskMemStore,
-		RouteValidator:        agentRegistry,
-		Activity:              activity,
-		MBRegistry:            mbRegistry,
-		CancelRegistry:        cancelRegistry,
-		SearchProvider:        searchProvider,
-		ShellFilter:           shellFilter,
-		Interactions:          interactionService,
-		SessionID:             currentSessionID,
-		Modes:                 modeStore,         // 与 scheduler / UI Hub 同一实例：exec 轴驱动 strict/yolo
-		EffectJournal:         effectJournal,     // H2b 副作用账本；nil（初始化失败）时埋点降级不记账
-		OutletChecker:         graphRuntime,      // 终态契约 v2 提交期出路检查（Step 3.9.1 装配的 *graph.Runtime）
-		UserOutput:            newTextWriter(""), // 共享兜底（team/spawn ad-hoc runner）；静态 runner 在下方按实例标记
-		StreamOutput:          streamOutput,
-		TaskEndCallbacks:      taskEndReactor,
-		ProjectRoot:           cfg.ProjectRoot,
-		RosterWaitTimeoutSec:  cfg.Infra.Roster.WaitTimeoutSec,
-		ShellTimeoutSec:       cfg.ShellTimeoutSec,
-		MaxSubtaskDepth:       cfg.MaxSubtaskDepth,
-		ProgressNotifyEnabled: cfg.ProgressNotifyEnabled,
-		HashlineEnabled:       *cfg.HashlineEnabled,
+		Store:                   taskStore,
+		Roster:                  r,
+		GateReg:                 gateReg,
+		StoreView:               storeView,
+		RecordToolCall:          recordToolCall,
+		DurableToolCallRecorder: durableToolCallRecorder,
+		Memory:                  memoryStore,
+		TaskMemStore:            taskMemStore,
+		LoopStore:               loopStateStore,
+		ContentStore:            contentStateStore,
+		ContextRuntime:          contextRuntime,
+		RouteValidator:          agentRegistry,
+		Activity:                activity,
+		MBRegistry:              mbRegistry,
+		CancelRegistry:          cancelRegistry,
+		SearchProvider:          searchProvider,
+		ShellFilter:             shellFilter,
+		Interactions:            interactionService,
+		SessionID:               currentSessionID,
+		Modes:                   modeStore,         // 与 scheduler / UI Hub 同一实例：exec 轴驱动 strict/yolo
+		EffectJournal:           effectJournal,     // H2b 副作用 authority；生产 Bootstrap 已验证非 nil/healthy
+		OutletChecker:           graphRuntime,      // 终态契约 v2 提交期出路检查（Step 3.9.1 装配的 *graph.Runtime）
+		UserOutput:              newTextWriter(""), // 共享兜底（team/spawn ad-hoc runner）；静态 runner 在下方按实例标记
+		StreamOutput:            streamOutput,
+		TaskEndCallbacks:        taskEndReactor,
+		ProjectRoot:             cfg.ProjectRoot,
+		RosterWaitTimeoutSec:    cfg.Infra.Roster.WaitTimeoutSec,
+		ShellTimeoutSec:         cfg.ShellTimeoutSec,
+		MaxSubtaskDepth:         cfg.MaxSubtaskDepth,
+		ProgressNotifyEnabled:   cfg.ProgressNotifyEnabled,
+		HashlineEnabled:         *cfg.HashlineEnabled,
 	}
 	// workspace 控制面注入（B 线握手缝 runtime_builder.withWorkspaceManager）：
 	// 全部 kind × replica 的 Runner 共享进程级唯一 Manager；认领声明
@@ -893,6 +1042,15 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 			rt, rtErr := buildAgentRuntime(kind, cfg.LLM, cfg.ToolProfiles, cfg.Agents, i, cfg.AgentIdleThreshold)
 			if rtErr != nil {
 				return nil, fmt.Errorf("kind=%q replica=%d 运行时构造失败: %w", kind.Kind, i, rtErr)
+			}
+			// 同 kind 的静态 Prompt/TeamAwareness 在各 replica 间相同；首个
+			// replica 用真实 L2 编码路径做一次装配门禁，失败时拒绝整个启动。
+			if i == 1 {
+				if err := runner.ValidatePromptCompatibility(context.Background(), rt, deps); err != nil {
+					return nil, fmt.Errorf("kind=%q L1/L2 启动契约不兼容: %w", kind.Kind, err)
+				}
+				log.Printf("[启动] L1/L2 静态 Prompt 预检通过：kind=%s ContextPolicy=%s",
+					kind.Kind, policycatalog.ContextDefaultCurrent)
 			}
 			if err := tools.ValidateToolNames(rt.AllowedTools); err != nil {
 				return nil, fmt.Errorf("kind=%q replica=%d 工具名校验失败: %w", kind.Kind, i, err)
@@ -967,11 +1125,17 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		memoryStore, newTextWriter("scheduler"), resultWriter, modeStore,
 		graphRuntime, graphStore, // C5b：submit_graph / patch_graph 的图控制面注入
 		effectJournal, // H2b：scheduler 工具面与 workspace 合并的副作用账本
+		scheduler.GraphAuthoringDeps{
+			Store: graphAuthoringStore, Runtime: graphAuthoringRuntime, Compiler: graphDefinitionCompiler,
+			ContextRuntime: contextRuntime, DurableToolCallRecorder: durableToolCallRecorder,
+		},
 	)
 	if sched.Agent != nil {
 		capReg.schedulerAgentID = sched.Agent.ID
 		sched.Agent.Activity = activity
 		sched.Agent.StreamOutput = streamOutput
+		sched.Agent.LoopStore = loopStateStore
+		sched.Agent.ContentStore = contentStateStore
 		// SWE-001 兜底 1：纯文本自然退出的零证据收口审查（与 report_done
 		// 的 closure Gate 同一实例，confirmed 状态两路径共享）。
 		sched.Agent.NaturalExitReviewer = schedulerClosureHook
@@ -1045,7 +1209,9 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 			Store: taskStore,
 			LLMFactory: func(model string) userdef.LLMCompleter {
 				// 独立 reactor LLM client：不复用主 agent client，避免共享 history / system prompt 状态。
-				return userdef.NewLLMCompleter(buildKindLLMClient(cfg.LLM, model))
+				return userdef.NewLLMCompleter(buildKindLLMClient(cfg.LLM, model), userdef.LLMContextDeps{
+					Adapter: contextadapter.New(), Policies: graphPolicies, Snapshots: contextSnapshotStore,
+				})
 			},
 			Mailbox:        mbRegistry,
 			KindEventTypes: kindEventTypes,
@@ -1075,35 +1241,42 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	mailNotifier := mailbox.NewMailNotifier(mbRegistry, taskStore, notifierInterval)
 
 	sys = &System{
-		Config:              cfg,
-		Store:               taskStore,
-		Roster:              r,
-		EventCh:             eventCh,
-		Watchdog:            w,
-		CancelRegistry:      cancelRegistry,
-		MailboxRegistry:     mbRegistry,
-		MailNotifier:        mailNotifier,
-		ArtifactLog:         artifactLog,   // 可能为 nil（OpenArtifactLog 失败时），Shutdown 会判空
-		EffectJournal:       effectJournal, // 可能为 nil（OpenJournal 失败时），Shutdown 会判空
-		artifactReplay:      artifactReplay,
-		SessionMgr:          sessMgr, // 可能为 nil（Session 初始化失败时），Shutdown 会判空
-		Scheduler:           sched,
-		GraphStore:          graphStore,
-		GraphRuntime:        graphRuntime,
-		graphApprovalGW:     graphApprovalGW,
-		Interactions:        interactionService,
-		Activity:            activity,
-		Runners:             runners,
-		ReactorRegistry:     reactorReg,
-		AgentTemplates:      templateCatalog,
-		TeamManager:         teamMgr,
-		TeamStore:           teamStore,
-		agentAuditEntries:   auditEntries,
-		StatusCh:            statusCh,
-		OutputCh:            outputCh,
-		LogFile:             logFileHolder,
-		releaseInstanceLock: releaseLock,
-		outputDone:          outputDone,
+		Config:                cfg,
+		Store:                 taskStore,
+		Roster:                r,
+		EventCh:               eventCh,
+		Watchdog:              w,
+		CancelRegistry:        cancelRegistry,
+		MailboxRegistry:       mbRegistry,
+		MailNotifier:          mailNotifier,
+		ArtifactLog:           artifactLog, // 可能为 nil（OpenArtifactLog 失败时），Shutdown 会判空
+		EffectJournal:         effectJournal,
+		LoopStore:             loopStateStore,
+		TaskOutcomeStore:      taskOutcomeStore,
+		ContentStore:          contentStateStore,
+		ContextSnapshotStore:  contextSnapshotStore,
+		artifactReplay:        artifactReplay,
+		SessionMgr:            sessMgr, // 可能为 nil（Session 初始化失败时），Shutdown 会判空
+		Scheduler:             sched,
+		GraphStore:            graphStore,
+		GraphRuntime:          graphRuntime,
+		GraphAuthoringStore:   graphAuthoringStore,
+		GraphAuthoringRuntime: graphAuthoringRuntime,
+		GraphPolicyCatalog:    graphPolicies,
+		graphApprovalGW:       graphApprovalGW,
+		Interactions:          interactionService,
+		Activity:              activity,
+		Runners:               runners,
+		ReactorRegistry:       reactorReg,
+		AgentTemplates:        templateCatalog,
+		TeamManager:           teamMgr,
+		TeamStore:             teamStore,
+		agentAuditEntries:     auditEntries,
+		StatusCh:              statusCh,
+		OutputCh:              outputCh,
+		LogFile:               logFileHolder,
+		releaseInstanceLock:   releaseLock,
+		outputDone:            outputDone,
 	}
 	var resumeBlocks []resumeBlock
 	if recoveredSnap != nil {
@@ -1291,7 +1464,7 @@ func (s *System) buildUIHub() *ui.Hub {
 			}
 			return cancelLatestActiveRequest(ctx, s.Store)
 		},
-		SteerSend: s.MailboxRegistry.Send,
+		SteerSend: func(msg mailbox.Message) error { return sendSteerWithTaskEnvelope(s, msg) },
 		// /mode 两轴切换：exec / topo 轴由 Hub 解析成规范化小写串后到这里
 		// 写回 modes.Store（再解析一次做防御性校验）。
 		ExecModeSet: func(mode string) error {
@@ -1919,6 +2092,32 @@ func (s *System) shutdown() error {
 	} else if snapshotErr != nil {
 		log.Printf("[关闭] ERROR: 最终 Session 快照保存失败，动态 Team 邮箱保留且未注销: %v", snapshotErr)
 	}
+	// LoopStore 是 L4 settlement/checkpoint 权威；所有 Agent 停止后先关闭，确保
+	// Windows 测试清理前释放 per-task journal 句柄。
+	if s.LoopStore != nil {
+		if err := s.LoopStore.Close(); err != nil {
+			log.Printf("[关闭] WARNING: LoopStore 关闭失败: %v", err)
+		}
+	}
+	if s.TaskOutcomeStore != nil {
+		if err := s.TaskOutcomeStore.Close(); err != nil {
+			log.Printf("[关闭] WARNING: TaskOutcomeStore 关闭失败: %v", err)
+		}
+	}
+	// Snapshot Store 不含正文，但 journal 仍持有 Windows 文件句柄；Agent 停止
+	// 后先关闭，再关闭 ContentStore。
+	if s.ContextSnapshotStore != nil {
+		if err := s.ContextSnapshotStore.Close(); err != nil {
+			log.Printf("[关闭] WARNING: ContextSnapshotStore 关闭失败: %v", err)
+		}
+	}
+	// ContentStore 是 L3 ContentRef 权威；所有 Agent 与 Reactor 停止后关闭
+	// 生命周期 fence。Store 不持有常驻文件句柄，Close 仍钉住 Windows 清理纪律。
+	if s.ContentStore != nil {
+		if err := s.ContentStore.Close(); err != nil {
+			log.Printf("[关闭] WARNING: ContentStore 关闭失败: %v", err)
+		}
+	}
 	if closer, ok := s.Store.(interface{ Close() error }); ok {
 		if err := closer.Close(); err != nil {
 			log.Printf("[关闭] WARNING: Task store 关闭失败: %v", err)
@@ -1930,6 +2129,11 @@ func (s *System) shutdown() error {
 	if s.GraphStore != nil {
 		if err := s.GraphStore.Close(); err != nil {
 			log.Printf("[关闭] WARNING: Graph store 关闭失败: %v", err)
+		}
+	}
+	if s.GraphAuthoringStore != nil {
+		if err := s.GraphAuthoringStore.Close(); err != nil {
+			log.Printf("[关闭] WARNING: Graph authoring store 关闭失败: %v", err)
 		}
 	}
 	// 关闭 trace 写入器，flush 所有打开的文件句柄

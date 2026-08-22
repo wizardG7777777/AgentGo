@@ -9,15 +9,28 @@ package bootstrap
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"agentgo/internal/graph"
+	"agentgo/internal/loopcontract"
+	"agentgo/internal/model"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
+	"agentgo/internal/taskcontract"
 )
 
 // TestGraphChangeWaker 唤醒任务：发布到 __scheduler__ 队列（含幂等标记、
 // 不带图身份、ParentTaskID 挂来源任务）；同 marker 重复唤醒幂等查重。
 func TestGraphChangeWaker(t *testing.T) {
 	s := store.NewMemoryTaskStore(nil, 100, 1, 300)
+	source := &model.Task{ID: "task-v", Description: "验收来源任务"}
+	if err := taskcontract.Start(source, loopcontract.WorkVerification, "test-graph-recovery/v1",
+		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PublishTask(source); err != nil {
+		t.Fatal(err)
+	}
 	w := graphChangeWaker{store: s}
 	spec := graph.GraphChangeWakeSpec{
 		GraphID: "g-1", NodeID: "verify", ActivationID: "verify@1",
@@ -30,10 +43,18 @@ func TestGraphChangeWaker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tasks) != 1 {
-		t.Fatalf("应发布 1 个唤醒任务，实际 %d", len(tasks))
+	if len(tasks) != 2 {
+		t.Fatalf("来源任务之外应发布 1 个唤醒任务，实际总数 %d", len(tasks))
 	}
-	wake := tasks[0]
+	var wake *model.Task
+	for _, task := range tasks {
+		if task.EventSource == "graph-change-request" {
+			wake = task
+		}
+	}
+	if wake == nil {
+		t.Fatal("未找到 graph change 唤醒任务")
+	}
 	if wake.EventType != "__scheduler__" || wake.EventSource != "graph-change-request" {
 		t.Errorf("唤醒任务路由不符: EventType=%q EventSource=%q", wake.EventType, wake.EventSource)
 	}
@@ -46,14 +67,18 @@ func TestGraphChangeWaker(t *testing.T) {
 	if wake.ParentTaskID != "task-v" || wake.MaxConcurrency != 1 {
 		t.Errorf("唤醒任务应挂来源任务且 MaxConcurrency=1: %+v", wake)
 	}
+	if wake.RunID != source.RunID || wake.RunContract == nil || wake.ContextPolicyRef == "" ||
+		wake.ProgressContract == nil || wake.RunPhase != runcontract.PhaseRecovery {
+		t.Fatalf("graph change 唤醒必须继承完整 recovery binding: %+v", wake)
+	}
 
 	// 同一 activation 重复唤醒：幂等查重，不重复发布。
 	if err := w.WakeGraphChange(spec); err != nil {
 		t.Fatalf("重复 WakeGraphChange: %v", err)
 	}
 	tasks, _ = s.ScanAll()
-	if len(tasks) != 1 {
-		t.Fatalf("重复唤醒应幂等查重（仍 1 个任务），实际 %d", len(tasks))
+	if len(tasks) != 2 {
+		t.Fatalf("重复唤醒应幂等查重（来源 + 唤醒共 2 个任务），实际 %d", len(tasks))
 	}
 }
 

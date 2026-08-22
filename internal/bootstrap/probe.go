@@ -2,13 +2,14 @@ package bootstrap
 
 // probe.go 实现 nextUpgrade_v4.md §9.5 启动期可观测性：
 //   - printStartupBanner：在 probe 之前打印配置摘要 banner（§9.5.1）
-//   - startupProbe：对 cfg.LLM.BaseURL 的 host:port 做 TCP DialTimeout（§9.5）
+//   - startupProbe：TCP 连通性 + 可选真实 streaming function-call capability
 //
 // 边界明示：probe 是 advisory 不是 authoritative——失败仅 warning（默认）；
 // startup_probe="off" 跳过；startup_probe_failure_action="exit" 改为硬退出。
 // best-effort 局限（mTLS / L4 LB 后端不健康 / CDN / WAF 等）见 §9.5.2。
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -17,6 +18,10 @@ import (
 	"time"
 
 	"agentgo/internal/config"
+	"agentgo/internal/invocation"
+	"agentgo/internal/llm"
+
+	"github.com/google/uuid"
 )
 
 // printStartupBanner 在配置校验通过后、运行 probe 之前打印配置摘要。
@@ -104,7 +109,8 @@ func intToStr(n int) string {
 	return string(buf[i:])
 }
 
-// startupProbe 对 cfg.LLM.BaseURL 的 host:port 做 TCP DialTimeout。
+// startupProbe 先检查 TCP；startup_probe=tool（空值的新默认）继续执行真实
+// function calling。tcp 只保留给明确选择的 legacy/advisory 场景。
 //
 // 行为分支：
 //   - cfg.StartupProbe == "off"：直接返回 nil，跳过
@@ -132,21 +138,100 @@ func startupProbe(w io.Writer, cfg *config.Config) error {
 		timeout = 5 * time.Second
 	}
 
-	fmt.Fprintf(w, "=== Startup LLM Probe (level=tcp, timeout=%s) ===\n", timeout)
+	level := cfg.StartupProbe
+	if level == "" {
+		level = "tool"
+	}
+	fmt.Fprintf(w, "=== Startup LLM Probe (level=%s, timeout=%s) ===\n", level, timeout)
 	start := time.Now()
 	conn, dialErr := net.DialTimeout("tcp", target, timeout)
 	elapsed := time.Since(start)
 	if dialErr != nil {
 		fmt.Fprintf(w, "  [FAIL] %s  (%v): %s\n", target, elapsed.Round(time.Millisecond), dialErr)
 		fmt.Fprintln(w, "         This is a best-effort connectivity check. If you believe the endpoint is")
-		fmt.Fprintln(w, "         reachable (e.g. mTLS / corporate gateway / CI mock), set startup_probe: off")
+		fmt.Fprintln(w, "         reachable (e.g. mTLS / corporate gateway / CI mock), use startup_probe: tcp/off only when tool capability is intentionally verified elsewhere")
 		fmt.Fprintln(w, "         in setting.yaml. Auth/model validity is always verified at first runtime call.")
 		return dialErr
 	}
 	_ = conn.Close()
 	fmt.Fprintf(w, "  [OK]   %s  (3-way handshake %v)\n", target, elapsed.Round(time.Millisecond))
-	fmt.Fprintln(w, "  best-effort connectivity check; auth/model validity verified at first runtime call")
+	if cfg.StartupProbe == "tcp" {
+		fmt.Fprintln(w, "  legacy TCP-only check; function calling 尚未验证")
+		return nil
+	}
+	if err := startupToolCapabilityProbe(w, cfg, timeout); err != nil {
+		return err
+	}
 	return nil
+}
+
+func startupToolCapabilityProbe(w io.Writer, cfg *config.Config, timeout time.Duration) error {
+	model := cfg.Scheduler.Model
+	if model == "" {
+		model = cfg.LLM.DefaultModel
+	}
+	budget := invocation.OutputBudget{
+		MaxContentBytes: 4 << 10, MaxReasoningBytes: 8 << 10, MaxExtraFieldBytes: 8 << 10,
+		MaxToolNameBytes: 128, MaxToolArgumentsBytes: 4 << 10, MaxToolCalls: 1,
+		MaxToolArgumentsTotalBytes: 4 << 10, MaxResponseBytes: 16 << 10, MaxCompletionTokens: 256,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	started := time.Now()
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		probeName := "agentgo_capability_probe_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
+		client := llm.NewSDKClientWithConfig(cfg.LLM.BaseURL, cfg.LLM.APIKey, model, "", timeout, llm.ClientConfig{
+			Stream: cfg.LLM.Stream, ReasoningEffort: cfg.LLM.ReasoningEffort,
+			ForcedToolName: probeName, OutputBudget: budget,
+		})
+		response, err := llm.InvokeLegacy(ctx, client, []llm.Message{{
+			Role: "user", Content: "Call the provided function exactly once. Do not answer with text.",
+		}}, []llm.ToolDef{{
+			Name: probeName, Description: "Prove function-calling compatibility with an empty JSON object.",
+			Parameters: map[string]any{
+				"type": "object", "additionalProperties": false,
+				"properties": map[string]any{},
+			},
+		}})
+		if err != nil {
+			lastErr = err
+			if attempt < maxAttempts && retryableCapabilityProbeFailure(err) && ctx.Err() == nil {
+				fmt.Fprintf(w, "  [RETRY] function-call capability attempt=%d/%d: %v\n", attempt, maxAttempts, err)
+				continue
+			}
+			fmt.Fprintf(w, "  [FAIL] function-call capability (%v): %v\n", time.Since(started).Round(time.Millisecond), err)
+			return fmt.Errorf("provider function-call capability probe 失败: %w", err)
+		}
+		if len(response.ToolCalls) != 1 || response.ToolCalls[0].Name != probeName ||
+			len(response.ToolCalls[0].Arguments) != 0 || response.FinishReason != "tool_calls" {
+			return fmt.Errorf("provider function-call capability 不兼容: calls=%d finish_reason=%s",
+				len(response.ToolCalls), response.FinishReason)
+		}
+		fmt.Fprintf(w, "  [OK]   streaming=%t function-call schema/arguments attempts=%d (%v)\n",
+			cfg.LLM.Stream, attempt, time.Since(started).Round(time.Millisecond))
+		return nil
+	}
+	return fmt.Errorf("provider function-call capability probe 失败: %w", lastErr)
+}
+
+// retryableCapabilityProbeFailure 只允许重采样无法形成能力结论的临时失败。
+// 文本回复、错误工具名、错误参数和错误 finish reason 会走上面的协议校验并立即
+// fail-closed；因此重试不会把不兼容 provider 偶然包装成兼容。
+func retryableCapabilityProbeFailure(err error) bool {
+	failure, ok := invocation.FromError(err)
+	if !ok {
+		return false
+	}
+	switch failure.Kind {
+	case invocation.FailureOutputTruncated, invocation.FailureMalformedResponse,
+		invocation.FailureRequestTimeout, invocation.FailureTransport,
+		invocation.FailureRateLimited, invocation.FailureProviderUnavailable:
+		return true
+	default:
+		return false
+	}
 }
 
 // extractHostPort 把 https://dashscope.aliyuncs.com/compatible-mode/v1

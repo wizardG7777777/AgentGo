@@ -109,16 +109,15 @@ func buildAgentRuntime(
 	}
 
 	rt := config.AgentRuntimeConfig{
-		InstanceID:                   fmt.Sprintf("%s-%d", kind.Kind, replicaIndex),
-		Kind:                         kind.Kind,
-		EventType:                    kind.EventType,
-		AllowedTools:                 allowed,
-		Model:                        model,
-		SystemPrompt:                 string(promptBytes),
-		TaskMaxRetries:               kind.TaskMaxRetries,
-		EnforceCompactTokenThreshold: kind.EnforceCompactTokenThreshold,
-		TeamAwareness:                teamAwareness,
-		IdleThreshold:                idleThreshold,
+		InstanceID:     fmt.Sprintf("%s-%d", kind.Kind, replicaIndex),
+		Kind:           kind.Kind,
+		EventType:      kind.EventType,
+		AllowedTools:   allowed,
+		Model:          model,
+		SystemPrompt:   string(promptBytes),
+		TaskMaxRetries: kind.TaskMaxRetries,
+		TeamAwareness:  teamAwareness,
+		IdleThreshold:  idleThreshold,
 	}
 	return rt, nil
 }
@@ -215,10 +214,9 @@ func buildSchedulerRuntime(sched config.SchedulerKind, llmCfg config.LLMConfig) 
 		model = llmCfg.DefaultModel
 	}
 	return config.AgentRuntimeConfig{
-		InstanceID:                   "scheduler",
-		Kind:                         "scheduler",
-		Model:                        model,
-		EnforceCompactTokenThreshold: sched.EnforceCompactTokenThreshold,
+		InstanceID: "scheduler",
+		Kind:       "scheduler",
+		Model:      model,
 		// AllowedTools / SystemPrompt 仍由 internal/scheduler 内部决定。
 	}
 }
