@@ -1,7 +1,7 @@
 # SWE 架构修复统一实施路线图
 
-> 状态：SWE-015…026 implementation landed，repository validation passed / single-task architecture passed / 8-task gate blocked<br>
-> 日期：2026-08-22<br>
+> 状态：SWE-015…028 implementation landed，repository validation passed / single-task architecture+task passed / 8-task pending<br>
+> 日期：2026-08-23<br>
 > 适用范围：第五、六轮 Flask SWE 分层诊断及其残余问题<br>
 > 上位规范：[`五层工程架构规范`](five-layer-engineering-architecture.md)<br>
 > 问题总账：[`第五轮 SWE 分层诊断`](../test-issues/2026-08-21-2329-swe-round5-layered-diagnosis.md)；
@@ -33,12 +33,12 @@ Store、桥接字符串和不同 deadline 口径。
 | 范围 | 当前状态 | 已进入仓库的权威 | 尚未满足的退出条件 |
 |---|---|---|---|
 | Wave 1 identity / run | 生产主链已接入 | `RunContract`、Run/Attempt/Turn/Action identity、durable TerminalIntent/TaskOutcome、OutcomeRef、terminal adapter 与 delivery outbox 已贯穿 Task/Session/Graph | 外部 E2E 与多 rollout 验证 |
-| Invocation | Response/Replay/L4 同源预算已接入 | ContextBinding 冻结 OutputBudget；RequiredExact per-field cap；Tool count/args total；partial no-dispatch | 外部 provider 多 rollout |
-| L2 Context | Context v7/Replay v2 production default | mixed estimator、Optional/RequiredExact、32K completion、92K input、可选 reasoning 字节容器、bounded runtime snapshot | 真实 tokenizer 与 provider matrix |
+| Invocation | Responses typed-item 主链已接入 | 显式 protocol；message/reasoning/function_call 信封；ContextBinding OutputBudget；required-nonce probe；partial no-dispatch | 外部 provider 多 rollout；Chat compatibility 退出 |
+| L2 Context | Context v8/Replay v3 production default | v1–v7 digest 保留、Responses `assistant_response_items` RequiredExact carrier、32K completion、92K input、bounded runtime snapshot | 真实 tokenizer 与 provider matrix |
 | L3 Harness | versioned harness 与 Scheduler capability contract 已闭合 | 仓库脚本、真实双层 probe、RunContract、typed terminal、安全 snapshot、完整 ToolResult ContentStore | 外部 provider 多样性 |
-| L4 Loop | SWE-016/017/023 边界已修复 | 6 Attempts、唯一 Deadline Compiler、Invocation failure 中性进展、typed intervention scope | 多题 recovery rollout |
+| L4 Loop | SWE-016/017/023/028 边界已修复 | 6 Attempts、唯一 Deadline Compiler、Invocation failure 中性进展、typed intervention scope、exploration→exact deliverable phase | 多题 recovery rollout |
 | L5 Graph | simple/current transaction 与 typed Context data port 已接入 | framework-owned simple Graph、零参数 validate/commit/start、Task.ContextInputs、typed outcome/outbox | generation/correlation token 仍不开放；legacy 仍待退役 |
-| Docs / issue ledger | 已建立，持续同步 | 五层规范、正式设计、路线图、第5/6轮及单题门禁总账 | 只按各问题 closure matrix 关闭 SWE-011～026 |
+| Docs / issue ledger | 已建立，持续同步 | 五层规范、正式设计、路线图、第5/6轮及 Responses 单题总账 | 只按各问题 closure matrix 关闭 SWE-011～028 |
 
 当前迁移采用“canonical contract → durable authority → production cutover → legacy
 删除”的顺序。任何暂时并存的旧路径都必须保留在上表的“尚未满足”列中，不能
@@ -48,13 +48,13 @@ Store、桥接字符串和不同 deadline 口径。
 
 | 归属 | 当前遗留 | 下一实施/验证门 |
 |---|---|---|
-| 基础层 Model Invocation | provider capability/structured code fixtures；兼容 wrapper 删除 | provider 对照 + SWE-014 |
+| 基础层 Model Invocation | Responses typed items 已 cutover；Chat compatibility 未删 | provider 对照 + SWE-014/027；compat 调用归零 |
 | L1 Prompt | 单体约 52.9KiB Prompt 已退出生产；core + phase task-control prompt，各阶段只见对应工具 | 外部 cohort 统计，不再是实现缺口 |
 | L2 Context | v7 Optional/RequiredExact、Raw History projection 与动态 reserve 已落地 | 真实 tokenizer、更多 provider replay fixture |
 | L3 Harness | repo harness、双层 tool probe、真实 Lease、phase Router、typed terminal 已落地 | 外部 provider fixture 扩展 |
 | L4 Loop | final Attempt 权利、deadline、failure-neutral progress 与 intervention scope 已钉住 | 外部多题 recovery rollout |
 | L5 Graph | simple/current transaction 已落地；legacy submit/patch 未删 | 调用计数归零、migration tests、SWE-012 |
-| Validation / Trace 横切 | full/race/vet/build、真实二进制、仓库 harness 与单题双指标已完成 | 单题 task resolved 后的一批8题、三平台 CI |
+| Validation / Trace 横切 | full/race/vet/build、真实二进制、仓库 harness 与单题双门已完成 | 一批8题、三平台 CI |
 | 横切关注点 | legacy adapter、权限最小可见面与跨平台恢复证据 | 调用计数、migration tests、outbox replay/ack、lease/prompt bytes 对账 |
 
 特别说明：正式两阶段 TerminalIntent 已保证新 ProgressContract Task 先 Seal 再
@@ -73,15 +73,15 @@ Store、桥接字符串和不同 deadline 口径。
   focused race tests；Mailbox Run/Session 分区、定向 wake/claim/drain/ACK、steer
   与 Trace Session correlation tests；
 - `go test ./...`、`go test -race ./...`、`go vet ./...`、`go build -o agentgo .`；
-- 仓库 SWE harness 13项 Python 单测、`git diff --check`；
+- 仓库 SWE harness 14项 Python 单测、`git diff --check`；
 - 真实二进制 startup function-call probe、RunContract 注入、Graph
   Draft/Definition/StartIntent/typed outcome 与 TaskOutcome delivery ACK。
 
-第六轮真实 provider 8题为0/8；修复后的最新 `automatic-options` 新 Run 已证明
-架构门通过：`architecture_ok=true`、首轮2463 tokens、GraphDraft call index=1、
-typed blocked、Graph TaskOutcome 全 ACK、known incidents=0；但 Worker 零写入，
-`task_resolved=false`。按门禁未运行8题。证据见
-[`主链修复与单题门禁`](../test-issues/2026-08-22-2258-swe-mainline-repair-and-single-gate.md)。
+第六轮 DeepSeek 8题为0/8；Responses cutover 后最新 `automatic-options` 新 Run 已
+同时通过双门：`architecture_ok=true`、`task_resolved=true`、首轮2205 tokens、
+GraphDraft call index=1、typed success、Graph TaskOutcome 全 ACK、known incidents=0、
+Judge 494 passed。证据见
+[`Responses 主链与单题成功`](../test-issues/2026-08-23-0109-responses-mainline-and-single-task-success.md)。
 
 ## 2. 输入设计与问题映射
 
@@ -108,6 +108,8 @@ typed blocked、Graph TaskOutcome 全 ACK、known incidents=0；但 Worker 零�
 | SWE-024 | L5 Graph | framework simple Graph 与 current-transaction cursor |
 | SWE-025 | L5 Proposal Acceptance | exact typed verdict tool 与三标量 wire contract |
 | SWE-026 | L4→L5 | intervention Graph/Node/Activation typed control scope |
+| SWE-027 | Model Invocation/L2 | Responses typed-item/SSE、required-argument probe、typed replay、正文不提升为工具 |
+| SWE-028 | L4/L3 | verification exploration 超额进入 exact submit deliverable phase，不直接 blocked |
 
 ## 3. 实施总原则
 
@@ -774,6 +776,8 @@ external hard kill
 | SWE-017 | 唯一 Deadline Compiler，Recovery/Finalization 使用合法阶段窗口 |
 | SWE-018 | Scheduler core/phase Prompt 与 phase ToolRouter；外部 cohort 作为效果证据 |
 | SWE-019 | 真实 Lease、function-call probe、batch cap、advertise/dispatch 同源 phase Router |
+| SWE-027 | Responses typed item + required nonce probe + DSML message no-dispatch + 真实 provider E2E |
+| SWE-028 | novel evidence 不 blocked + exact deliverable ToolRouter + acceptance success E2E |
 
 任何 issue 的设计完成、shadow 通过或包单测通过都不足以关闭。
 
@@ -822,10 +826,10 @@ canonical contract、durable authority 和主要 production cutover 已完成，
 10. `docs/activate/KNOWN_ISSUES.md` 只保留仍可复现的真实开放问题；
 11. `AGENTS.md` 仅在运行时契约实际落地后按切片同步，不提前宣称目标设计已实现。
 
-当前状态为“主链实现与仓库验证完成，单题架构门通过，任务正确率门未通过，
-legacy 退出与8题证据开放”。两阶段 TerminalIntent、统一 Invocation、Context v7、
-Loop checkpoint/intervention、simple Graph/current transaction 与仓库 harness 已完成
-代码收口；SWE-011～026 仍按各自外部 closure 条件保持 validation-open。已有
-full/race/vet/build/真实二进制与最新 provider 新 Run，不再使用 compile-only 作为
-完成证据；但 `automatic-options` 未 resolved，故未运行8题，也不能把路线图标为
+当前状态为“Responses 主链实现与仓库验证完成，单题架构门与任务正确率门均通过，
+legacy 退出与8题证据开放”。两阶段 TerminalIntent、typed Invocation、Context v8、
+Loop checkpoint/intervention/deliverable phase、simple Graph/current transaction 与仓库
+harness 已完成代码收口；SWE-011～028 仍按各自外部 closure 条件保持
+validation-open。已有 full/race/vet/build/真实二进制与最新 provider success Run，
+不再使用 compile-only 作为完成证据；尚未运行本阶段8题，路线图仍不能标为
 Implemented。

@@ -90,9 +90,9 @@ func prepareProviderExtra(input CompileInput, turnID string, messageIndex int, k
 	if err != nil {
 		return contextcompiler.PreparedFragment{}, requirement, err
 	}
-	kind := contextcontract.FragmentAssistantExtraField
-	if input.ReplayPolicy.Version >= 2 && isReasoningProviderField(key) {
-		kind = contextcontract.FragmentAssistantReasoning
+	kind := providerFieldFragmentKind(input.ReplayPolicy.Version, key)
+	if kind == "" {
+		kind = contextcontract.FragmentAssistantExtraField
 	}
 	rule, ok := input.BudgetPolicy.FragmentRule(kind)
 	if !ok {
@@ -135,12 +135,15 @@ func prepareProviderExtra(input CompileInput, turnID string, messageIndex int, k
 	return prepared, requirement, nil
 }
 
-func isReasoningProviderField(key string) bool {
+func providerFieldFragmentKind(version int, key string) contextcontract.FragmentKind {
+	if version >= 3 && key == llm.ResponsesOutputItemsExtraField() {
+		return contextcontract.FragmentAssistantResponseItems
+	}
 	switch key {
 	case "reasoning", "reasoning_content", "reasoning_details":
-		return true
+		return contextcontract.FragmentAssistantReasoning
 	default:
-		return false
+		return ""
 	}
 }
 
@@ -162,9 +165,9 @@ func deriveInvocationOutputBudget(policy contextcontract.ContextBudgetPolicy,
 		if requirement != contextcontract.ReplayRequiredExact {
 			continue
 		}
-		kind := contextcontract.FragmentAssistantExtraField
-		if isReasoningProviderField(field) {
-			kind = contextcontract.FragmentAssistantReasoning
+		kind := providerFieldFragmentKind(replay.Version, field)
+		if kind == "" {
+			kind = contextcontract.FragmentAssistantExtraField
 		}
 		rule, ok := policy.FragmentRule(kind)
 		if !ok || rule.MaxSerializedBytes <= 0 {

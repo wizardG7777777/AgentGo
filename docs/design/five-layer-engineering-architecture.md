@@ -14,7 +14,7 @@
 |---|---|---|
 | Model Invocation 基础层 | typed failure、ContextBinding 唯一入口、L2/L4 动态 OutputBudget、SSE字段/Tool批次硬限、partial no-dispatch | 真实 provider/SWE 多 rollout |
 | L1 Prompt | 冻结 Scheduler core prompt + 每 Invocation phase task-control prompt；Graph-first 保持 | 固定模型长期 cohort 指标 |
-| L2 Context | Context v7/Replay v2、32K completion、Response representability、Raw History projection、ContentStore/ToolResultRef | 真实 tokenizer/model capability profile 精细化 |
+| L2 Context | Context v8/Replay v3、Responses typed-item representability、32K completion、Raw History projection、ContentStore/ToolResultRef | 真实 tokenizer/model capability profile 精细化 |
 | L3 Harness | 仓库 SWE harness、双层 function-call probe、真实 Lease、phase ToolRouter、typed terminal/snapshot | Effect unknown 仍需人工裁决；workspace 仍非 OS sandbox |
 | L4 Loop | 6 Attempts、统一 Deadline Compiler、Invocation-failure 中性进展、typed intervention scope、Progress/Terminal 主链 | 多题长时统计 |
 | L5 Graph | framework simple Graph、current validate/commit/start、Change、typed Outcome/Result/Evidence | 复杂 OR/generation token 仍关闭；legacy submit/patch 未删 |
@@ -135,9 +135,10 @@ Model Invocation 不计入五层，但必须有独立边界，否则 API/SDK 问
 
 ### 5.1 拥有
 
-- OpenAI-compatible Chat Completions 请求与响应类型。
+- OpenAI Responses typed-item 请求/响应/SSE；Chat Completions 仅作显式兼容适配。
 - openai-go SDK 配置、HTTP timeout、SSE 聚合和连接错误。
-- 模型返回的 content、reasoning、tool call、finish reason 和 usage 解析。
+- 模型返回的 message、reasoning、function/custom tool item、终态和 usage 解析；
+  自由正文不得提升为行动。
 - 单次请求的模型覆盖、输出上限、流式累计上限和协议兼容处理。
 - API 错误的传输级分类：recoverable、unrecoverable、bad response。
 
@@ -151,16 +152,18 @@ Model Invocation 不计入五层，但必须有独立边界，否则 API/SDK 问
 
 ### 5.3 当前映射
 
-- `internal/llm/client.go`
+- `internal/llm/client.go`、`internal/llm/responses_client.go`、`internal/llm/protocol.go`
 - `internal/config` 的 `llm:` 配置
 - `internal/bootstrap/runtime_builder.go` 的客户端构造
 
 ### 5.4 当前不足与提升要点
 
-当前已由 ContextBinding 冻结 completion/output/tool batch 预算，SDK 流式累计
-阶段早夭，L4 action reservation 进一步收紧本次 completion；typed failure 端到端
-保持。后续提升点是把通用 `openai-compatible/default` 细分成经真实 fixture 验证的
-model capability/tokenizer profile，而不是恢复自由文本 provider 分支。
+当前已由 `llm.protocol` 冻结 Responses/Chat wire，Responses 主链以 typed output
+item 作为行动身份，并由 ContextBinding 冻结 completion/output/tool batch 预算；
+SDK 流式累计阶段早夭，L4 action reservation 进一步收紧本次 completion，typed
+failure 端到端保持。后续提升点是继续扩充真实 model capability/tokenizer profile，
+并在 compatibility 调用归零后删除 Chat adapter，而不是恢复正文解析或 provider
+名称分支。
 
 ## 6. L1 Prompt Engineering
 
@@ -296,7 +299,7 @@ Harness 能力快照、上游 Result/Evidence、Mailbox 和预算。<br>
 4. Session Memory 的查询、过滤、渲染和 trace 发射也放在 Agent 包中。
 5. L1 Prompt、L2 动态 Context 与 L3 tool schema 的最终边界直到
    `LLMExecutor.Execute` 才临时汇合，难以独立测试完整请求预算。
-6. 已由 Response commit gate + Replay v2 关闭坏响应到下一轮的非法中间态；
+6. 已由 Response commit gate + Replay v3 关闭坏响应/typed item 到下一轮的非法中间态；
    context overflow 使用 aggressive replay projection，不修改 Raw History。
 
 ### 7.7 提升要点

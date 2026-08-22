@@ -44,6 +44,11 @@ func printStartupBanner(w io.Writer, configPath string, cfg *config.Config) {
 	if cfg.LLM.DefaultModel != "" {
 		fmt.Fprintf(w, "Default Model:    %s\n", cfg.LLM.DefaultModel)
 	}
+	protocol := cfg.LLM.Protocol
+	if protocol == "" {
+		protocol = string(llm.ProtocolResponses)
+	}
+	fmt.Fprintf(w, "LLM Protocol:     %s\n", protocol)
 	if cfg.LLM.TimeoutSec > 0 {
 		fmt.Fprintf(w, "Timeout:          %ds\n", cfg.LLM.TimeoutSec)
 	}
@@ -182,17 +187,25 @@ func startupToolCapabilityProbe(w io.Writer, cfg *config.Config, timeout time.Du
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		probeName := "agentgo_capability_probe_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
+		probeNonce := "nonce_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+		protocol := llm.Protocol(cfg.LLM.Protocol)
+		if protocol == "" {
+			protocol = llm.ProtocolResponses
+		}
 		client := llm.NewSDKClientWithConfig(cfg.LLM.BaseURL, cfg.LLM.APIKey, model, "", timeout, llm.ClientConfig{
-			Stream: cfg.LLM.Stream, ReasoningEffort: cfg.LLM.ReasoningEffort,
+			Protocol: protocol, Stream: cfg.LLM.Stream, ReasoningEffort: cfg.LLM.ReasoningEffort,
 			ForcedToolName: probeName, OutputBudget: budget,
 		})
 		response, err := llm.InvokeLegacy(ctx, client, []llm.Message{{
-			Role: "user", Content: "Call the provided function exactly once. Do not answer with text.",
+			Role: "user", Content: "Call the provided function exactly once with nonce " + probeNonce + ". Do not answer with text.",
 		}}, []llm.ToolDef{{
-			Name: probeName, Description: "Prove function-calling compatibility with an empty JSON object.",
+			Name: probeName, Description: "Prove function-calling compatibility with one required nonce argument.",
 			Parameters: map[string]any{
 				"type": "object", "additionalProperties": false,
-				"properties": map[string]any{},
+				"properties": map[string]any{
+					"nonce": map[string]any{"type": "string", "const": probeNonce},
+				},
+				"required": []any{"nonce"},
 			},
 		}})
 		if err != nil {
@@ -205,12 +218,13 @@ func startupToolCapabilityProbe(w io.Writer, cfg *config.Config, timeout time.Du
 			return fmt.Errorf("provider function-call capability probe 失败: %w", err)
 		}
 		if len(response.ToolCalls) != 1 || response.ToolCalls[0].Name != probeName ||
-			len(response.ToolCalls[0].Arguments) != 0 || response.FinishReason != "tool_calls" {
+			len(response.ToolCalls[0].Arguments) != 1 || response.ToolCalls[0].Arguments["nonce"] != probeNonce ||
+			response.FinishReason != "tool_calls" {
 			return fmt.Errorf("provider function-call capability 不兼容: calls=%d finish_reason=%s",
 				len(response.ToolCalls), response.FinishReason)
 		}
-		fmt.Fprintf(w, "  [OK]   streaming=%t function-call schema/arguments attempts=%d (%v)\n",
-			cfg.LLM.Stream, attempt, time.Since(started).Round(time.Millisecond))
+		fmt.Fprintf(w, "  [OK]   protocol=%s streaming=%t typed function-call/required-arguments attempts=%d (%v)\n",
+			protocol, cfg.LLM.Stream, attempt, time.Since(started).Round(time.Millisecond))
 		return nil
 	}
 	return fmt.Errorf("provider function-call capability probe 失败: %w", lastErr)

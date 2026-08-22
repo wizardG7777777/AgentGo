@@ -5,10 +5,11 @@
 # __BASE_URL__/__MODEL__ 六个占位符由仓库内 `scripts/swe_harness/run_task.sh`
 # 在每次运行时渲染；`/tmp/agentgo-swe` 只保存题目数据和运行产物。
 #
-# 换模型供应商只需设三个环境变量（均有默认值，默认即 OpenRouter + DeepSeek）：
+# 换模型供应商只需设四个环境变量（默认即 OpenRouter Responses + Luna）：
 #   SWE_BASE_URL   供应商的 OpenAI 兼容端点（默认 https://openrouter.ai/api/v1）
-#   SWE_MODEL      模型名，全角色统一（默认 deepseek/deepseek-v4-flash-0731）
-#   AGENTGO_SWE_API_KEY  供应商密钥（必填；真实 function-call probe 负责能力验证）
+#   SWE_MODEL      模型名，全角色统一（默认 openai/gpt-5.6-luna）
+#   SWE_PROTOCOL   responses（新主链）或 chat_completions（显式兼容）
+#   SWE_KEY_VAR    注入密钥的环境变量名（默认 OPENROUTER_API_KEY）
 # 本文件不落任何明文密钥。
 #
 # 评测纪律：
@@ -21,8 +22,9 @@
 #   默认队列），只读调查路由 explore，验收路由 acceptance.verify。
 llm:
   base_url: __BASE_URL__
-  api_key: ${AGENTGO_SWE_API_KEY}
+  api_key: ${__KEY_VAR__}
   default_model: __MODEL__
+  protocol: __PROTOCOL__
   timeout_sec: 300
   stream: true
 

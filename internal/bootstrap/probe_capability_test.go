@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -30,6 +31,12 @@ func TestStartupToolProbeExercisesRealFunctionCalling(t *testing.T) {
 		choice, _ := body["tool_choice"].(map[string]any)
 		function, _ := choice["function"].(map[string]any)
 		probeName, _ := function["name"].(string)
+		tool, _ := tools[0].(map[string]any)
+		functionDef, _ := tool["function"].(map[string]any)
+		parameters, _ := functionDef["parameters"].(map[string]any)
+		properties, _ := parameters["properties"].(map[string]any)
+		nonceDef, _ := properties["nonce"].(map[string]any)
+		probeNonce, _ := nonceDef["const"].(string)
 		if choice["type"] != "function" || !strings.HasPrefix(probeName, "agentgo_capability_probe_") {
 			t.Fatalf("probe 未强制 exact function tool_choice: %+v", body["tool_choice"])
 		}
@@ -41,7 +48,7 @@ func TestStartupToolProbeExercisesRealFunctionCalling(t *testing.T) {
 					"role": "assistant", "content": "",
 					"tool_calls": []any{map[string]any{
 						"id": "call-probe", "type": "function",
-						"function": map[string]any{"name": probeName, "arguments": `{}`},
+						"function": map[string]any{"name": probeName, "arguments": fmt.Sprintf(`{"nonce":%q}`, probeNonce)},
 					}},
 				},
 			}},
@@ -51,14 +58,61 @@ func TestStartupToolProbeExercisesRealFunctionCalling(t *testing.T) {
 	defer server.Close()
 	cfg := &config.Config{
 		StartupProbe: "tool", StartupProbeTimeoutSec: 5,
-		LLM: config.LLMConfig{BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model"},
+		LLM: config.LLMConfig{BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions"},
 	}
 	var output bytes.Buffer
 	if err := startupProbe(&output, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), "function-call schema/arguments") {
+	if !strings.Contains(output.String(), "typed function-call/required-arguments") {
 		t.Fatalf("probe 输出未证明 tool capability: %s", output.String())
+	}
+}
+
+func TestStartupToolProbeUsesResponsesTypedItemMainline(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("Responses probe path=%q", r.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		choice, _ := body["tool_choice"].(map[string]any)
+		name, _ := choice["name"].(string)
+		tools, _ := body["tools"].([]any)
+		tool, _ := tools[0].(map[string]any)
+		parameters, _ := tool["parameters"].(map[string]any)
+		properties, _ := parameters["properties"].(map[string]any)
+		nonceDef, _ := properties["nonce"].(map[string]any)
+		nonce, _ := nonceDef["const"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "resp-probe", "object": "response", "status": "completed",
+			"output": []any{map[string]any{
+				"type": "function_call", "id": "fc-1", "call_id": "call-1", "status": "completed",
+				"name": name, "arguments": fmt.Sprintf(`{"nonce":%q}`, nonce),
+			}},
+			"usage": map[string]any{
+				"input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+				"input_tokens_details":  map[string]any{"cached_tokens": 0},
+				"output_tokens_details": map[string]any{"reasoning_tokens": 0},
+			},
+		})
+	}))
+	defer server.Close()
+	cfg := &config.Config{
+		StartupProbe: "tool", StartupProbeTimeoutSec: 5,
+		LLM: config.LLMConfig{
+			BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "responses",
+		},
+	}
+	var output bytes.Buffer
+	if err := startupProbe(&output, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "protocol=responses") {
+		t.Fatalf("未报告 Responses probe 证据: %s", output.String())
 	}
 }
 
@@ -72,13 +126,20 @@ func TestStartupToolProbeRetriesInconclusiveTruncationWithinFrozenDeadline(t *te
 		choice, _ := body["tool_choice"].(map[string]any)
 		function, _ := choice["function"].(map[string]any)
 		probeName, _ := function["name"].(string)
+		tools, _ := body["tools"].([]any)
+		tool, _ := tools[0].(map[string]any)
+		functionDef, _ := tool["function"].(map[string]any)
+		parameters, _ := functionDef["parameters"].(map[string]any)
+		properties, _ := parameters["properties"].(map[string]any)
+		nonceDef, _ := properties["nonce"].(map[string]any)
+		probeNonce, _ := nonceDef["const"].(string)
 		w.Header().Set("Content-Type", "application/json")
 		finishReason := "tool_calls"
 		message := map[string]any{
 			"role": "assistant", "content": "",
 			"tool_calls": []any{map[string]any{
 				"id": "call-probe", "type": "function",
-				"function": map[string]any{"name": probeName, "arguments": `{}`},
+				"function": map[string]any{"name": probeName, "arguments": fmt.Sprintf(`{"nonce":%q}`, probeNonce)},
 			}},
 		}
 		if calls.Add(1) == 1 {
@@ -96,7 +157,7 @@ func TestStartupToolProbeRetriesInconclusiveTruncationWithinFrozenDeadline(t *te
 	defer server.Close()
 	cfg := &config.Config{
 		StartupProbe: "tool", StartupProbeTimeoutSec: 5,
-		LLM: config.LLMConfig{BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model"},
+		LLM: config.LLMConfig{BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions"},
 	}
 	var output bytes.Buffer
 	if err := startupToolCapabilityProbe(&output, cfg, time.Second); err != nil {
@@ -123,7 +184,7 @@ func TestStartupToolProbeRejectsTextOnlyProvider(t *testing.T) {
 	defer server.Close()
 	cfg := &config.Config{
 		StartupProbe: "tool", StartupProbeTimeoutSec: 5,
-		LLM: config.LLMConfig{BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model"},
+		LLM: config.LLMConfig{BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions"},
 	}
 	if err := startupProbe(&bytes.Buffer{}, cfg); err == nil || !strings.Contains(err.Error(), "function-call capability 不兼容") {
 		t.Fatalf("text-only provider 应被 capability gate 拒绝: %v", err)
@@ -136,7 +197,7 @@ func TestStartupToolProbeRejectsWrongFunctionIdentity(t *testing.T) {
 		toolName  string
 		arguments string
 	}{
-		{name: "wrong name", toolName: "other_probe", arguments: `{}`},
+		{name: "wrong name", toolName: "other_probe", arguments: `{"nonce":"wrong"}`},
 		{name: "unexpected arguments", toolName: "agentgo_capability_probe_wrong", arguments: `{"unexpected":"x"}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -167,7 +228,7 @@ func TestStartupToolProbeRejectsWrongFunctionIdentity(t *testing.T) {
 			defer server.Close()
 			cfg := &config.Config{
 				StartupProbe: "tool", StartupProbeTimeoutSec: 5,
-				LLM: config.LLMConfig{BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model"},
+				LLM: config.LLMConfig{BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions"},
 			}
 			if err := startupProbe(&bytes.Buffer{}, cfg); err == nil || !strings.Contains(err.Error(), "function-call capability 不兼容") {
 				t.Fatalf("错误 function identity 应被拒绝: %v", err)
@@ -184,7 +245,7 @@ func TestStartupToolProbeRejectsProviderErrorAndTimeout(t *testing.T) {
 		defer server.Close()
 		cfg := &config.Config{
 			StartupProbe: "tool", LLM: config.LLMConfig{
-				BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model",
+				BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions",
 			},
 		}
 		if err := startupToolCapabilityProbe(&bytes.Buffer{}, cfg, time.Second); err == nil {
@@ -201,7 +262,7 @@ func TestStartupToolProbeRejectsProviderErrorAndTimeout(t *testing.T) {
 		defer server.Close()
 		cfg := &config.Config{
 			StartupProbe: "tool", LLM: config.LLMConfig{
-				BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model",
+				BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions",
 			},
 		}
 		if err := startupToolCapabilityProbe(&bytes.Buffer{}, cfg, 20*time.Millisecond); err == nil {

@@ -574,6 +574,44 @@ func TestAdapterV7WidensOptionalReasoningBytesWithoutChangingWindowSplit(t *test
 	}
 }
 
+func TestAdapterV8TypesResponsesOutputItemsWithoutMutatingV7(t *testing.T) {
+	input := adapterTestInput(t)
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v8, _ := catalog.ContextPolicy(policycatalog.ContextDefaultV8)
+	replay, _ := catalog.ProviderReplayPolicy(v8.ReplayPolicyRef)
+	input.BudgetPolicy, input.ReplayPolicy, input.ReplayPolicyRef = v8.Policy, replay.Policy, replay.Ref
+	input.History = []SettledTurn{{
+		TurnID: "turn-responses",
+		Assistant: llm.Message{Role: "assistant", ExtraFields: map[string]json.RawMessage{
+			llm.ResponsesOutputItemsExtraField(): json.RawMessage(`[{"type":"function_call","call_id":"c1","name":"read_file","arguments":"{}"}]`),
+		}},
+	}}
+	result, err := New().Compile(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, item := range result.Snapshot.Manifest.Items {
+		if item.Kind == contextcontract.FragmentAssistantResponseItems {
+			found = true
+			if item.Disposition != contextcontract.DispositionInline {
+				t.Fatalf("Responses carrier disposition=%s", item.Disposition)
+			}
+		}
+	}
+	if !found || result.OutputBudget.MaxExtraFieldBytesByName[llm.ResponsesOutputItemsExtraField()] <= 0 {
+		t.Fatalf("v8 未形成 typed Responses carrier/budget: manifest=%+v budget=%+v",
+			result.Snapshot.Manifest.Items, result.OutputBudget)
+	}
+	v7, _ := catalog.ContextPolicy(policycatalog.ContextDefaultV7)
+	if _, leaked := v7.Policy.FragmentRules[contextcontract.FragmentAssistantResponseItems]; leaked {
+		t.Fatal("Responses fragment rule 污染历史 v7")
+	}
+}
+
 func TestAdapterV3FreezesInvocationBudgetFromCompletionReserveAndReplayPolicy(t *testing.T) {
 	input := adapterTestInput(t)
 	catalog, err := policycatalog.NewDefault()

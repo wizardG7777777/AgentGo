@@ -25,23 +25,23 @@ import (
 
 // LLMConfig 全局 LLM 默认值（v4 §11.4）。
 // per-kind 通过 AgentKind.Model 覆盖默认模型；BaseURL/APIKey/TimeoutSec 共用。
-// Provider 字段已于 V6 移除（AgentGo 只实现 OpenAI-compatible Chat Completions，
-// 不再按 provider 分支做请求变换）；结构体保留该字段仅为让旧 YAML 仍能解析，
-// Validate() 会对非空值返回明确的迁移诊断错误。
+// Provider 字段已于 V6 移除：协议由 llm.protocol 显式冻结，不再按供应商名称
+// 推断请求变换；结构体保留该字段仅为让旧 YAML 仍能解析，Validate() 会对
+// 非空值返回明确的迁移诊断错误。
 type LLMConfig struct {
 	BaseURL      string `yaml:"base_url" json:"base_url"`
 	APIKey       string `yaml:"api_key" json:"api_key"`
 	DefaultModel string `yaml:"default_model" json:"default_model"`
 	TimeoutSec   int    `yaml:"timeout_sec" json:"timeout_sec"`
-	Provider     string `yaml:"provider,omitempty" json:"provider,omitempty"`
-	// ReasoningEffort maps to the OpenAI Chat Completions reasoning_effort
-	// request parameter. Empty means omit the parameter and let the selected
-	// model/provider choose its default. Validation accepts the union of values
-	// currently documented by OpenAI models.
+	// Protocol 冻结 Model Invocation wire：responses 是新主链；
+	// chat_completions 只作显式兼容，不允许运行中自动回退。
+	Protocol string `yaml:"protocol,omitempty" json:"protocol,omitempty"`
+	Provider string `yaml:"provider,omitempty" json:"provider,omitempty"`
+	// ReasoningEffort 映射 Responses reasoning.effort；显式兼容协议映射
+	// Chat Completions reasoning_effort。空值表示交给模型默认。
 	ReasoningEffort string `yaml:"reasoning_effort,omitempty" json:"reasoning_effort,omitempty"`
-	// Stream switches the SDK transport to Chat Completions SSE streaming. The
-	// client still returns one fully accumulated Response so ReAct/tool semantics
-	// remain unchanged while live deltas can be observed by the UI.
+	// Stream 启用所选 protocol 的 SSE。客户端只在完整 typed output item 完成后
+	// 返回 Response，partial 参数永不 dispatch；UI 可观察独立正文/reasoning delta。
 	Stream bool `yaml:"stream" json:"stream"`
 }
 
@@ -380,6 +380,7 @@ func ptrTo[T any](v T) *T { return &v }
 
 func DefaultConfig() *Config {
 	return &Config{
+		LLM:                        LLMConfig{Protocol: "responses"},
 		ProjectRoot:                ".",
 		Scheduler:                  SchedulerKind{},
 		ShellTimeoutSec:            30,
@@ -543,8 +544,11 @@ func (c *Config) Validate() error {
 	// llm.provider 已于 V6 移除：读到旧字段必须给出明确的迁移诊断，
 	// 不允许静默忽略或回退（V6 升级决议，见 docs/nextUpgrade-V6.md）。
 	if c.LLM.Provider != "" {
-		return fmt.Errorf("llm.provider=%q 已于 V6 移除：AgentGo 只实现 OpenAI-compatible Chat Completions 请求路径，"+
-			"不再区分 provider 适配分支；请从配置中删除 llm.provider 字段", c.LLM.Provider)
+		return fmt.Errorf("llm.provider=%q 已于 V6 移除：请用 llm.protocol 显式选择 responses / chat_completions，"+
+			"不得从 provider 名称推断 wire 行为；请删除 llm.provider 字段", c.LLM.Provider)
+	}
+	if c.LLM.Protocol != "" && c.LLM.Protocol != "responses" && c.LLM.Protocol != "chat_completions" {
+		return fmt.Errorf("llm.protocol=%q 无效；仅允许 responses / chat_completions", c.LLM.Protocol)
 	}
 
 	if c.LLM.ReasoningEffort != "" && !isOpenAIReasoningEffort(c.LLM.ReasoningEffort) {

@@ -5,21 +5,26 @@ import (
 	"time"
 
 	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/runcontract"
 )
 
 func defaultReplayProfiles() ([]ReplayProfile, error) {
-	makePolicy := func(ref string, version int) contextcontract.ProviderReplayPolicy {
+	makePolicy := func(ref string, version int, responsesItems bool) contextcontract.ProviderReplayPolicy {
+		fields := map[string]contextcontract.ReplayRequirement{
+			// reasoning_content/reasoning_details 是已知 provider 的协议状态，
+			// 必须逐字节重放；普通 reasoning 只是可选观察数据。
+			"reasoning_content": contextcontract.ReplayRequiredExact,
+			"reasoning_details": contextcontract.ReplayRequiredExact,
+			"reasoning":         contextcontract.ReplayOptional,
+		}
+		if responsesItems {
+			fields[llm.ResponsesOutputItemsExtraField()] = contextcontract.ReplayRequiredExact
+		}
 		return contextcontract.ProviderReplayPolicy{
 			Schema: contextcontract.ProviderReplaySchemaV1, PolicyID: ref, Version: version,
-			Fields: map[string]contextcontract.ReplayRequirement{
-				// reasoning_content/reasoning_details 是已知 provider 的协议状态，
-				// 必须逐字节重放；普通 reasoning 只是可选观察数据。
-				"reasoning_content": contextcontract.ReplayRequiredExact,
-				"reasoning_details": contextcontract.ReplayRequiredExact,
-				"reasoning":         contextcontract.ReplayOptional,
-			},
+			Fields: fields,
 			// ToolResult 外置保留 assistant tool call / tool result 的 call identity、
 			// 数量和顺序；这是 OpenAI-compatible tool exchange 的已验证结构变换。
 			GroupTransforms: []contextcontract.ReplayTransform{{
@@ -38,8 +43,9 @@ func defaultReplayProfiles() ([]ReplayProfile, error) {
 		}
 	}
 	policies := []contextcontract.ProviderReplayPolicy{
-		makePolicy(ReplayOpenAICompatibleV1, 1),
-		makePolicy(ReplayOpenAICompatibleV2, 2),
+		makePolicy(ReplayOpenAICompatibleV1, 1, false),
+		makePolicy(ReplayOpenAICompatibleV2, 2, false),
+		makePolicy(ReplayOpenAICompatibleV3, 3, true),
 	}
 	profiles := make([]ReplayProfile, 0, len(policies))
 	for _, policy := range policies {
@@ -125,6 +131,14 @@ func defaultContextProfiles() ([]ContextProfile, error) {
 			systemSectionBytes: 96 << 10, systemSectionTokens: 24 << 10,
 			reasoningBytes: 192 << 10, reasoningTokens: 32 << 10,
 		},
+		{
+			ref: ContextDefaultV8, replayRef: ReplayOpenAICompatibleV3, version: 8,
+			// v8 只新增 Responses typed output-item RequiredExact carrier；v7 的
+			// window/fragment 数值和历史 digest 原样保留。
+			promptComponentBytes: 64 << 10, promptComponentTokens: 16 << 10,
+			systemSectionBytes: 96 << 10, systemSectionTokens: 24 << 10,
+			reasoningBytes: 192 << 10, reasoningTokens: 32 << 10,
+		},
 	}
 	profiles := make([]ContextProfile, 0, len(specs))
 	for _, spec := range specs {
@@ -151,13 +165,30 @@ func defaultContextProfile(spec contextPolicySpec) (ContextProfile, error) {
 		providerReplay.MaxEstimatedTokens = 48 << 10
 		atomicGroupRules[contextcontract.AtomicAssistantProviderReplay] = providerReplay
 	}
+	if spec.version >= 8 {
+		providerReplay := atomicGroupRules[contextcontract.AtomicAssistantProviderReplay]
+		providerReplay.MaxSerializedBytes = 256 << 10
+		providerReplay.MaxEstimatedTokens = 64 << 10
+		atomicGroupRules[contextcontract.AtomicAssistantProviderReplay] = providerReplay
+	}
+	fragmentRules := defaultFragmentRules(spec.promptComponentBytes, spec.promptComponentTokens,
+		spec.reasoningBytes, spec.reasoningTokens)
+	if spec.version >= 8 {
+		fragmentRules[contextcontract.FragmentAssistantResponseItems] = contextcontract.FragmentBudgetRule{
+			MaxSerializedBytes: 256 << 10, MaxEstimatedTokens: 64 << 10,
+			AllowedDispositions: []contextcontract.Disposition{
+				contextcontract.DispositionInline, contextcontract.DispositionRejected,
+				contextcontract.DispositionQuarantined,
+			},
+			RetentionClass: contextcontract.RetentionTaskLifetime, Priority: 100,
+		}
+	}
 	policy := contextcontract.ContextBudgetPolicy{
-		Schema:     contextcontract.PolicySchemaV1,
-		PolicyID:   spec.ref,
-		Version:    spec.version,
-		ModelClass: "openai-compatible/default",
-		FragmentRules: defaultFragmentRules(spec.promptComponentBytes, spec.promptComponentTokens,
-			spec.reasoningBytes, spec.reasoningTokens),
+		Schema:                contextcontract.PolicySchemaV1,
+		PolicyID:              spec.ref,
+		Version:               spec.version,
+		ModelClass:            "openai-compatible/default",
+		FragmentRules:         fragmentRules,
 		AtomicGroupRules:      atomicGroupRules,
 		SectionBudgets:        defaultSectionBudgets(spec.systemSectionBytes, spec.systemSectionTokens),
 		SnapshotInputBudget:   snapshotBudget,

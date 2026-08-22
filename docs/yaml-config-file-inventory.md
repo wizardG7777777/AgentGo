@@ -260,8 +260,9 @@ general.yaml (最详尽中文模板, ~171行)
 | `base_url` | string | — | ✅ | API 端点地址 |
 | `api_key` | string | — | ✅ | API 密钥，支持 `${ENV_VAR}` 环境变量引用 |
 | `default_model` | string | — | ✅ | 全局默认模型，所有 agent 的后备 |
+| `protocol` | string | `responses` | ❌ | `responses` 新主链；`chat_completions` 显式兼容；禁止按 provider 名称或正文自动回退 |
 | `timeout_sec` | int | 120 | ❌ | 单次 LLM 请求超时秒数 |
-| ~~`provider`~~ | — | — | — | **V6 已移除**：AgentGo 只实现 OpenAI-compatible Chat Completions；旧配置保留该字段会在 Validate 返回迁移诊断错误 |
+| ~~`provider`~~ | — | — | — | **V6 已移除**：协议由 `llm.protocol` 显式冻结；旧配置保留 provider 会返回迁移诊断错误 |
 
 ### 5.2 工具配置集 (`tool_profiles:`)
 

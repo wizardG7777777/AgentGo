@@ -16,7 +16,7 @@ import harness  # noqa: E402
 
 def probe_response(name=harness.PROBE_NAME, arguments=None, finish="tool_calls"):
     if arguments is None:
-        arguments = {}
+        arguments = {"nonce": harness.PROBE_NONCE}
     return {
         "choices": [{
             "finish_reason": finish,
@@ -55,23 +55,52 @@ class HarnessContractTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             harness.run_provider_probe(
                 "https://provider.invalid/v1", "secret", "model", attempts=1, sleep_sec=0,
-                transport=lambda *_: (200, text_only),
+                protocol="chat_completions", transport=lambda *_: (200, text_only),
             )
         with self.assertRaises(RuntimeError):
             harness.run_provider_probe(
                 "https://provider.invalid/v1", "secret", "model", attempts=1, sleep_sec=0,
+                protocol="chat_completions",
                 transport=lambda *_: (_ for _ in ()).throw(RuntimeError("offline")),
             )
 
     def test_provider_probe_accepts_exact_transport_result(self):
         def transport(_endpoint, _key, body, _timeout):
             name = body["tool_choice"]["function"]["name"]
-            return 200, probe_response(name=name)
+            nonce = body["tools"][0]["function"]["parameters"]["properties"]["nonce"]["const"]
+            return 200, probe_response(name=name, arguments={"nonce": nonce})
 
         harness.run_provider_probe(
             "https://provider.invalid/v1", "secret", "model", attempts=1, sleep_sec=0,
-            transport=transport,
+            protocol="chat_completions", transport=transport,
         )
+
+    def test_responses_provider_probe_requires_typed_item_and_nonce(self):
+        def transport(endpoint, _key, body, _timeout):
+            self.assertTrue(endpoint.endswith("/responses"))
+            name = body["tool_choice"]["name"]
+            nonce = body["tools"][0]["parameters"]["properties"]["nonce"]["const"]
+            return 200, {
+                "id": "resp-1", "status": "completed",
+                "output": [{
+                    "type": "function_call", "call_id": "call-1", "name": name,
+                    "arguments": json.dumps({"nonce": nonce}),
+                }],
+            }
+
+        harness.run_provider_probe(
+            "https://provider.invalid/v1", "secret", "model", protocol="responses",
+            attempts=1, sleep_sec=0, transport=transport,
+        )
+
+        text_only = {"id": "resp-2", "status": "completed", "output": [{
+            "type": "message", "content": [{"type": "output_text", "text": "call tool"}],
+        }]}
+        with self.assertRaises(RuntimeError):
+            harness.run_provider_probe(
+                "https://provider.invalid/v1", "secret", "model", protocol="responses",
+                attempts=1, sleep_sec=0, transport=lambda *_: (200, text_only),
+            )
 
     def test_snapshot_projection_preserves_terminal_outcomes(self):
         for status, outcome in (

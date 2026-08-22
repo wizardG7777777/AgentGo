@@ -466,6 +466,7 @@ func validateGroups(input CompileInput, prepared map[string]PreparedFragment) (
 func validateProviderReplay(input CompileInput, prepared PreparedFragment, group *contextcontract.ProtocolAtomicGroup) error {
 	fragment := prepared.Fragment
 	providerKind := fragment.Kind == contextcontract.FragmentAssistantReasoning ||
+		fragment.Kind == contextcontract.FragmentAssistantResponseItems ||
 		fragment.Kind == contextcontract.FragmentAssistantExtraField
 	if !providerKind {
 		if prepared.ProviderField != "" {
@@ -737,7 +738,8 @@ func wireKindCompatible(fragment contextcontract.FragmentKind, wire contextcontr
 		return wire == contextcontract.WireSystemMessage || wire == contextcontract.WireUserMessage
 	case contextcontract.FragmentAssistantContent, contextcontract.FragmentAssistantToolCall:
 		return wire == contextcontract.WireAssistantMessage
-	case contextcontract.FragmentAssistantReasoning, contextcontract.FragmentAssistantExtraField:
+	case contextcontract.FragmentAssistantReasoning, contextcontract.FragmentAssistantResponseItems,
+		contextcontract.FragmentAssistantExtraField:
 		return wire == contextcontract.WireAssistantMessage || wire == contextcontract.WireProviderExtra
 	case contextcontract.FragmentToolResult:
 		return wire == contextcontract.WireToolMessage

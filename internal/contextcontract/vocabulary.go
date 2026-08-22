@@ -5,23 +5,24 @@ package contextcontract
 type FragmentKind string
 
 const (
-	FragmentPromptComponent      FragmentKind = "prompt_component"
-	FragmentSystemOutputContract FragmentKind = "system_output_contract"
-	FragmentUserTask             FragmentKind = "user_task"
-	FragmentTaskControlContext   FragmentKind = "task_control_context"
-	FragmentUpstreamResult       FragmentKind = "upstream_result"
-	FragmentUpstreamEvidence     FragmentKind = "upstream_evidence"
-	FragmentAssistantContent     FragmentKind = "assistant_content"
-	FragmentAssistantReasoning   FragmentKind = "assistant_reasoning"
-	FragmentAssistantExtraField  FragmentKind = "assistant_extra_field"
-	FragmentAssistantToolCall    FragmentKind = "assistant_tool_call"
-	FragmentToolResult           FragmentKind = "tool_result"
-	FragmentTaskMemory           FragmentKind = "task_memory"
-	FragmentSessionMemory        FragmentKind = "session_memory"
-	FragmentMailboxMessage       FragmentKind = "mailbox_message"
-	FragmentInteractionDecision  FragmentKind = "interaction_decision"
-	FragmentRuntimeSnapshot      FragmentKind = "runtime_snapshot"
-	FragmentToolDefinition       FragmentKind = "tool_definition"
+	FragmentPromptComponent        FragmentKind = "prompt_component"
+	FragmentSystemOutputContract   FragmentKind = "system_output_contract"
+	FragmentUserTask               FragmentKind = "user_task"
+	FragmentTaskControlContext     FragmentKind = "task_control_context"
+	FragmentUpstreamResult         FragmentKind = "upstream_result"
+	FragmentUpstreamEvidence       FragmentKind = "upstream_evidence"
+	FragmentAssistantContent       FragmentKind = "assistant_content"
+	FragmentAssistantReasoning     FragmentKind = "assistant_reasoning"
+	FragmentAssistantResponseItems FragmentKind = "assistant_response_items"
+	FragmentAssistantExtraField    FragmentKind = "assistant_extra_field"
+	FragmentAssistantToolCall      FragmentKind = "assistant_tool_call"
+	FragmentToolResult             FragmentKind = "tool_result"
+	FragmentTaskMemory             FragmentKind = "task_memory"
+	FragmentSessionMemory          FragmentKind = "session_memory"
+	FragmentMailboxMessage         FragmentKind = "mailbox_message"
+	FragmentInteractionDecision    FragmentKind = "interaction_decision"
+	FragmentRuntimeSnapshot        FragmentKind = "runtime_snapshot"
+	FragmentToolDefinition         FragmentKind = "tool_definition"
 )
 
 // KnownFragmentKinds 返回封闭词表的副本。
@@ -35,6 +36,7 @@ func KnownFragmentKinds() []FragmentKind {
 		FragmentUpstreamEvidence,
 		FragmentAssistantContent,
 		FragmentAssistantReasoning,
+		FragmentAssistantResponseItems,
 		FragmentAssistantExtraField,
 		FragmentAssistantToolCall,
 		FragmentToolResult,
@@ -52,7 +54,8 @@ func (k FragmentKind) Valid() bool {
 	switch k {
 	case FragmentPromptComponent, FragmentSystemOutputContract, FragmentUserTask,
 		FragmentTaskControlContext, FragmentUpstreamResult, FragmentUpstreamEvidence,
-		FragmentAssistantContent, FragmentAssistantReasoning, FragmentAssistantExtraField,
+		FragmentAssistantContent, FragmentAssistantReasoning, FragmentAssistantResponseItems,
+		FragmentAssistantExtraField,
 		FragmentAssistantToolCall, FragmentToolResult, FragmentTaskMemory,
 		FragmentSessionMemory, FragmentMailboxMessage, FragmentInteractionDecision,
 		FragmentRuntimeSnapshot, FragmentToolDefinition:

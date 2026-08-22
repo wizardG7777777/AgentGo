@@ -43,11 +43,12 @@ func (g LocalReadGroup) Register(r *agent.ToolRegistry) {
 		g.readFile,
 	)
 
-	r.Register("list_dir", "列出目录内容，可选递归深度",
+	r.RegisterWithDefaults("list_dir", "列出目录内容；省略 path 时列出项目根目录，可选递归深度",
 		schema.Object().
-			String("path", "目录路径", true).
+			String("path", "目录路径；省略时默认为项目根目录 .", false).
 			Int("depth", "递归深度，默认 1（仅当前目录）；>1 时输出树形", false).
 			Build(),
+		map[string]any{"path": "."},
 		g.listDir,
 	)
 

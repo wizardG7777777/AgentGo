@@ -504,8 +504,9 @@ func decideProgressPolicy(contract loopcontract.CompiledProgressContract, task *
 	policy := contract.Policy
 	exhausted := checkpoint.NoProgressTurns >= policy.MaxNoProgressTurns ||
 		checkpoint.NoProgressDuration >= policy.MaxNoProgressDuration ||
-		usageAtLimit(checkpoint.NoProgressUsage, policy.MaxNoProgressUsage) ||
-		(policy.MaxExplorationTurns > 0 && checkpoint.ExplorationTurnsSinceDeliverable > policy.MaxExplorationTurns)
+		usageAtLimit(checkpoint.NoProgressUsage, policy.MaxNoProgressUsage)
+	explorationLimitReached := policy.MaxExplorationTurns > 0 &&
+		checkpoint.ExplorationTurnsSinceDeliverable > policy.MaxExplorationTurns
 	decision := loopPolicyDecision{}
 	var reason loopcontract.InterventionReason
 	switch {
@@ -514,6 +515,15 @@ func decideProgressPolicy(contract loopcontract.CompiledProgressContract, task *
 		decision.Blocked = true
 		decision.Intervention = true
 		reason = loopcontract.InterventionNoProgressBudget
+	case explorationLimitReached:
+		// Novel evidence is real progress and must never be mislabeled as exhausted.
+		// Crossing the exploration allowance enters a mechanically forced delivery
+		// phase: the next ToolRouter exposes only submit_task_result with exact
+		// tool_choice, so the Agent must commit pass/fixable/blocked instead of
+		// continuing to browse indefinitely.
+		checkpoint.InterventionStage = loopcontract.StageReminder
+		decision.Reminder = progressDeliverableRequiredMarker + " " +
+			renderProgressReminder(contract, *checkpoint, "deliverable_required")
 	case checkpoint.NoProgressTurns >= policy.InterventionAfterTurns ||
 		(checkpoint.NoProgressTurns >= policy.RolloverAfterTurns &&
 			checkpoint.AttemptRolloverCount >= policy.MaxAttemptRollovers):

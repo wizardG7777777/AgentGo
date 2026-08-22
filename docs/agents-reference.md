@@ -136,7 +136,7 @@ main.go（子命令 trace / config 分流；否则 -config 等 flags）
 
 ## 配置细节（v4 schema，唯一支持的格式）
 
-`setting.yaml`（或 `.json`）顶层块：`llm:`（base_url/api_key/default_model/timeout_sec/reasoning_effort/stream）、`scheduler:`（仅 model 可覆盖）、`agents:`（kind/replicas/profile 或 tools/model/system_prompt_file/task_max_retries/event_type/description）、`infra:`（watchdog/mail_notifier/store/roster）、`modes:`（exec/topo 两轴；`gate` 键已移除，设任何非空值报迁移诊断）、`ui:`（frontends: [tui, web]，web.listen/token）、`tool_profiles:`、`reactors_file:`，以及杂项（`project_root`、`max_subtask_depth`、`shell_timeout_sec`、`shell_blacklist`、`shell_greylist`、`session_retention_days` 等）。完整示例见 `config.example.yaml`。
+`setting.yaml`（或 `.json`）顶层块：`llm:`（base_url/api_key/default_model/protocol/timeout_sec/reasoning_effort/stream；protocol 缺省 `responses`，旧端点显式 `chat_completions`）、`scheduler:`（仅 model 可覆盖）、`agents:`（kind/replicas/profile 或 tools/model/system_prompt_file/task_max_retries/event_type/description）、`infra:`（watchdog/mail_notifier/store/roster）、`modes:`（exec/topo 两轴；`gate` 键已移除，设任何非空值报迁移诊断）、`ui:`（frontends: [tui, web]，web.listen/token）、`tool_profiles:`、`reactors_file:`，以及杂项（`project_root`、`max_subtask_depth`、`shell_timeout_sec`、`shell_blacklist`、`shell_greylist`、`session_retention_days` 等）。完整示例见 `config.example.yaml`。
 
 > 移除的配置字段：`agent_max_loops`、`context_limit` 与 `enforce_compact_token_threshold` 均显式报迁移诊断。Loop 由结构化进展/预算/deadline 控制；Context 由 v3 policy、ContentRef 与 Snapshot-pressure replay projection 控制，Scheduler/模板不能自行扩大或改写。
 

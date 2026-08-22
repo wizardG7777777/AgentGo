@@ -1,22 +1,24 @@
 # Context Snapshot / Item Budget 架构
 
-> 状态：Accepted Design，Context v7 implementation complete / single-task architecture verified<br>
-> 日期：2026-08-22<br>
+> 状态：Accepted Design，Context v8 + Responses typed replay implementation complete / single-task verified<br>
+> 日期：2026-08-23<br>
 > 归属：L2 Context Engineering<br>
 > 对应问题：SWE-013<br>
 > 上位规范：[`五层工程架构规范`](five-layer-engineering-architecture.md)<br>
 > 关联设计：[`Loop Progress Contract / Checkpoint / Deadline`](loop-progress-checkpoint-and-deadline.md)<br>
 > 统一路线图：[`SWE 架构修复统一实施路线图`](swe-architecture-repair-roadmap.md)
 
-## 0.1 2026-08-22 实施状态
+## 0.1 2026-08-23 实施状态
 
-### Context v3–v7 / Replay v2 修订
+### Context v3–v8 / Replay v2–v3 修订
 
 最新外部单题继续冻结历史 policy ref，并把新 Run 默认推进到
-`context:default/v7`：v4 修正 mixed ASCII/Unicode estimator；v5 扩大
+`context:default/v8`：v4 修正 mixed ASCII/Unicode estimator；v5 扩大
 RequiredExact reasoning；v6 在128K窗口内冻结92K input + 32K completion + 4K
 protocol overhead；v7 放宽 optional reasoning 字节容器，避免131078-byte观察字段
-使同响应 typed verdict 丢失。v1–v6 均保留原 digest/恢复语义，不原地改写。
+使同响应 typed verdict 丢失；v8 新增 Replay v3 与独立
+`assistant_response_items` RequiredExact carrier。v1–v7 均保留原
+digest/恢复语义，不原地改写。
 
 第六轮 SWE 的 SWE-015 证明 v2 仍允许“当前 Invocation 接受、下一轮无法
 replay”的非法中间态。正式修订保留 v1/v2 digest 语义，新增
@@ -26,6 +28,9 @@ replay”的非法中间态。正式修订保留 v1/v2 digest 语义，新增
   `assistant_reasoning + dropped`，不产生 WireItem，也不终止 Agent；
 - `reasoning_content/reasoning_details` 为 RequiredExact：Response commit 在任何
   Tool dispatch/History commit 前用真实下一轮 envelope 证明可表示；
+- Responses 的有序 message/reasoning/function_call 完成 items 编码为保留 carrier，
+  同样按 RequiredExact 在 dispatch 前证明可 replay；下一轮还原为 typed items 和
+  `function_call_output`，不降级成 assistant extra 或自由正文；
 - ContextBinding 冻结 Invocation OutputBudget；SDK 取 L2 completion reserve、
   L4 当前 action 剩余预算与绝对安全上限的最小值；
 - v3 显式声明 128K-token model window、16K completion reserve 与 4K protocol

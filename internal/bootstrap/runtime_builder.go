@@ -26,8 +26,8 @@ import (
 // kindModel 为空字符串时回落 LLMConfig.DefaultModel——这是 v4 §11.4 注释中
 // "Model 缺省回落 LLM.DefaultModel" 的实际落地点。
 //
-// V6 起请求路径统一为 OpenAI-compatible Chat Completions，不再按 provider 分支；
-// llm.provider 字段已在 config.Validate() 中拒绝（迁移诊断）。
+// 请求协议由 llm.protocol 冻结：Responses 为新主链，Chat Completions 为显式
+// 兼容；不再按 provider 名称分支。llm.provider 在 Validate 中拒绝。
 func buildKindLLMClient(llmCfg config.LLMConfig, kindModel string) llm.Client {
 	model := kindModel
 	if model == "" {
@@ -37,6 +37,10 @@ func buildKindLLMClient(llmCfg config.LLMConfig, kindModel string) llm.Client {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
+	protocol := llm.Protocol(llmCfg.Protocol)
+	if protocol == "" {
+		protocol = llm.ProtocolResponses
+	}
 	return llm.NewSDKClientWithConfig(
 		llmCfg.BaseURL,
 		llmCfg.APIKey,
@@ -44,6 +48,7 @@ func buildKindLLMClient(llmCfg config.LLMConfig, kindModel string) llm.Client {
 		"", // system prompt 由 runner / scheduler 自管，不在 client 层注入
 		timeout,
 		llm.ClientConfig{
+			Protocol:        protocol,
 			ReasoningEffort: llmCfg.ReasoningEffort,
 			Stream:          llmCfg.Stream,
 		},

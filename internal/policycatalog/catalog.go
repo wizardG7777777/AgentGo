@@ -16,11 +16,13 @@ const (
 	ContextDefaultV5 = "context:default/v5"
 	ContextDefaultV6 = "context:default/v6"
 	ContextDefaultV7 = "context:default/v7"
+	ContextDefaultV8 = "context:default/v8"
 	// ContextDefaultCurrent 是所有新 Run/Invocation 的 framework 默认引用。
 	// 历史任务必须继续使用其已冻结的具体版本，禁止在恢复时把 v1 偷换为该别名。
-	ContextDefaultCurrent    = ContextDefaultV7
+	ContextDefaultCurrent    = ContextDefaultV8
 	ReplayOpenAICompatibleV1 = "provider-replay:openai-compatible/v1"
 	ReplayOpenAICompatibleV2 = "provider-replay:openai-compatible/v2"
+	ReplayOpenAICompatibleV3 = "provider-replay:openai-compatible/v3"
 
 	ProgressCodeChangeV1    = "progress:code-change/v1"
 	ProgressInvestigationV1 = "progress:investigation/v1"

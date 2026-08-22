@@ -137,6 +137,18 @@ func TestPathBoundary_Suggestion(t *testing.T) {
 	}
 }
 
+func TestPathBoundaryInvalidArgumentsSuggestionIsRetryable(t *testing.T) {
+	h := NewPathBoundaryHook(t.TempDir())
+	d := h.Run(hook.ToolHookContext{Phase: hook.PhasePreCall, TaskID: "t1", ToolName: "read_file", Args: map[string]any{}})
+	if d.Action != hook.Abort {
+		t.Fatalf("Action=%v，期望 Abort", d.Action)
+	}
+	s := assertSingleSuggestion(t, d, ReasonInvalidToolArguments, true)
+	if len(s.Actions) != 0 {
+		t.Fatalf("目标路径未知时不得猜工具参数: %+v", s.Actions)
+	}
+}
+
 func TestExecModeGuard_Suggestion(t *testing.T) {
 	h := NewExecModeGuardHook(readonlyStore())
 	d := h.Run(hook.ToolHookContext{Phase: hook.PhasePreCall, TaskID: "t1", ToolName: "write_file"})

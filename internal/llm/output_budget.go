@@ -131,6 +131,16 @@ func (c *outputBudgetCounter) addContent(fragment string) error {
 	return c.checkTotal()
 }
 
+func (c *outputBudgetCounter) addReasoning(fragment string) error {
+	n := int64(len([]byte(fragment)))
+	c.reasoningBytes += n
+	c.totalBytes += n
+	if c.reasoningBytes > c.budget.MaxReasoningBytes {
+		return outputLimitError("reasoning", c.reasoningBytes, c.budget.MaxReasoningBytes, c.phase)
+	}
+	return c.checkTotal()
+}
+
 func (c *outputBudgetCounter) addExtra(key, raw, reasoning string) error {
 	n := int64(len([]byte(raw)))
 	c.extraBytes[key] += n

@@ -111,7 +111,8 @@ func dispositionAllowedForKind(kind FragmentKind, disposition Disposition) bool 
 		return disposition == DispositionInline || disposition == DispositionSummarized ||
 			disposition == DispositionReferenced || disposition == DispositionDropped ||
 			disposition == DispositionRejected
-	case FragmentAssistantContent, FragmentAssistantReasoning, FragmentAssistantExtraField:
+	case FragmentAssistantContent, FragmentAssistantReasoning, FragmentAssistantResponseItems,
+		FragmentAssistantExtraField:
 		return disposition == DispositionInline || disposition == DispositionSummarized ||
 			disposition == DispositionReferenced || disposition == DispositionDropped ||
 			disposition == DispositionRejected || disposition == DispositionQuarantined
@@ -323,6 +324,9 @@ func (p ContextBudgetPolicy) Validate() error {
 		return fmt.Errorf("context policy %s 含未知 fragment kind=%q", p.PolicyID, unknownFragmentKinds[0])
 	}
 	for _, kind := range KnownFragmentKinds() {
+		if kind == FragmentAssistantResponseItems && p.Version < 8 {
+			continue
+		}
 		rule, ok := p.FragmentRules[kind]
 		if !ok {
 			return fmt.Errorf("context policy %s 缺少 fragment rule=%s", p.PolicyID, kind)

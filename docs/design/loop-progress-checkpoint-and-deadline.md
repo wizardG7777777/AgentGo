@@ -1,14 +1,14 @@
 # Loop Progress Contract / Checkpoint / Deadline 架构
 
-> 状态：Accepted Design，SWE-016/017/023/026 implementation complete / single-task architecture verified<br>
-> 日期：2026-08-22<br>
+> 状态：Accepted Design，SWE-016/017/023/026/028 implementation complete / Responses single-task verified<br>
+> 日期：2026-08-23<br>
 > 归属：L4 Loop Engineering<br>
 > 对应问题：SWE-011<br>
 > 上位规范：[`五层工程架构规范`](five-layer-engineering-architecture.md)<br>
 > 关联设计：[`Graph Draft / Commit / Start`](graph-draft-commit-start.md)<br>
 > 统一路线图：[`SWE 架构修复统一实施路线图`](swe-architecture-repair-roadmap.md)
 
-## 0.1 2026-08-22 实施状态
+## 0.1 2026-08-23 实施状态
 
 ### SWE-016 / SWE-017 边界修订
 
@@ -31,6 +31,10 @@
   截断/畸形伪装成 Agent 空转；
 - intervention wake 持久化独立 Graph/Node/Activation control scope；wake 自身
   GraphID 保持空，Scheduler 据 typed scope 区分新 Draft 与现有 Graph recovery。
+- verification/investigation 的 novel evidence 超出 exploration allowance 时不再
+  假冒 `no_progress_budget_exhausted`；L4 写入 delivery-required control fact，下一
+  Invocation 的 L3 ToolRouter 只暴露并 exact-force `submit_task_result`，机械阻止
+  继续浏览，同时保留 pass/fixable/blocked 的结构化交付权。
 
 已进入生产主链：版本化 Run/Attempt identity、ProgressContract catalog/compiler、
 TurnSettlementDelta/ProgressEvaluator、append-only LoopStore、action reservation 与
@@ -50,9 +54,9 @@ fsync TaskOutcome/outbox 并提交 Task 终态。崩溃后在 dispatcher/Runner 
 恢复 pending intent。`current_unsealed` 仅保留为历史/兼容 schema 状态，新
 ProgressContract Task 的正式 coordinator 不再以它提交终态。
 
-full/race/vet/build、真实二进制与最新 Flask 单题已重跑；最新 Run 的已知架构事故
-为零，Graph task Outcome/ACK 完整。任务因 Worker 未产生写入而被 code-change
-ProgressContract typed blocked，8题未运行，因此 SWE-011 仍按多题 closure 条件
+full/race/vet/build、真实二进制与最新 Flask Responses 单题已重跑；最新 Run 的已知
+架构事故为零，Graph task Outcome/ACK 完整，Worker、Acceptance 与 typed Graph
+success 全链通过，Judge 494 passed。8题尚未运行，因此 SWE-011 仍按多题 closure 条件
 保持 `implementation-landed / validation-open`。
 
 ## 1. 决策摘要

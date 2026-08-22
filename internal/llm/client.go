@@ -61,8 +61,11 @@ type Response struct {
 	// Reasoning is the provider's plaintext reasoning exactly as returned by the
 	// API. It is normalized from reasoning, reasoning_content, or readable
 	// reasoning_details blocks; ExtraFields remains the protocol authority.
-	Reasoning    string
-	ToolCalls    []ToolCall
+	Reasoning string
+	ToolCalls []ToolCall
+	// Items 是服务端结构化信封经反序列化后的有序输出。它是行动身份的唯一
+	// Model Invocation 权威；Content/Reasoning/ToolCalls 是下游兼容投影。
+	Items        []OutputItem
 	FinishReason FinishReason
 	Usage        struct {
 		PromptTokens     int
@@ -132,6 +135,7 @@ func streamHandlerFromContext(ctx context.Context) func(StreamEvent) {
 // ClientConfig controls standard request behavior shared by every AgentGo LLM
 // client created from the global llm block.
 type ClientConfig struct {
+	Protocol        Protocol
 	ReasoningEffort string
 	Stream          bool
 	// ForcedToolName 只用于能力探针等机械协议调用；普通 Agent 留空并由模型
@@ -142,11 +146,11 @@ type ClientConfig struct {
 	OutputBudget invocation.OutputBudget
 }
 
-// SDKClient 通过 openai-go 官方 SDK 实现 Client 接口。
-// 请求路径统一为 OpenAI-compatible Chat Completions（V6 起不再按 provider 分支）。
+// SDKClient 通过 openai-go 官方 SDK 实现 Client 接口。生产请求 protocol 在
+// 构造时冻结；Responses 为新主链，Chat Completions 只作显式兼容。
 type SDKClient struct {
 	client       openai.Client
-	model        openai.ChatModel
+	model        string
 	systemPrompt string
 	request      ClientConfig
 }
@@ -185,15 +189,23 @@ func NewSDKClientWithConfig(baseURL, apiKey, model, systemPrompt string, timeout
 
 	return &SDKClient{
 		client:       client,
-		model:        openai.ChatModel(model),
+		model:        model,
 		systemPrompt: systemPrompt,
 		request:      request,
 	}
 }
 
 func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDef) (Response, error) {
+	if c.request.Protocol == ProtocolResponses {
+		return c.responses(ctx, messages, tools)
+	}
+	// 空 protocol 只为直接构造客户端的旧测试/API 保留 Chat Completions
+	// 兼容；生产 Runtime 必须由配置传入已冻结 protocol。
+	if c.request.Protocol != "" && c.request.Protocol != ProtocolChatCompletions {
+		return Response{}, fmt.Errorf("SDKClient 未知 protocol=%q", c.request.Protocol)
+	}
 	params := openai.ChatCompletionNewParams{
-		Model: c.model,
+		Model: openai.ChatModel(c.model),
 	}
 	outputBudget := outputBudgetFromContext(ctx, c.request.OutputBudget)
 	params.MaxCompletionTokens = openai.Int(outputBudget.MaxCompletionTokens)
@@ -368,6 +380,7 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 	result := Response{
 		Content:      choice.Message.Content,
 		ToolCalls:    toolCalls,
+		Items:        chatCompletionOutputItems(choice.Message.Content, "", toolCalls),
 		FinishReason: finishReason,
 	}
 	result.Usage.PromptTokens = int(completion.Usage.PromptTokens)
@@ -386,6 +399,7 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 		}
 	}
 	result.Reasoning = ReasoningText(result.ExtraFields)
+	result.Items = chatCompletionOutputItems(result.Content, result.Reasoning, result.ToolCalls)
 
 	return result, nil
 }
@@ -564,6 +578,7 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 	if result.Reasoning == "" {
 		result.Reasoning = accumulatedReasoning
 	}
+	result.Items = chatCompletionOutputItems(result.Content, result.Reasoning, result.ToolCalls)
 	if handler != nil {
 		handler(StreamEvent{
 			AccumulatedContent: result.Content, AccumulatedReasoning: result.Reasoning, Done: true,
@@ -614,6 +629,9 @@ func convertMessage(m Message) (openai.ChatCompletionMessageParamUnion, error) {
 		if len(m.ExtraFields) > 0 {
 			extras := make(map[string]any, len(m.ExtraFields))
 			for k, v := range m.ExtraFields {
+				if k == responsesOutputItemsExtraField {
+					continue
+				}
 				// json.RawMessage 实现了 json.Marshaler，openai-go 会原样写出
 				extras[k] = v
 			}
@@ -626,6 +644,21 @@ func convertMessage(m Message) (openai.ChatCompletionMessageParamUnion, error) {
 		log.Printf("[llm] 错误: 遇到未知消息 role=%q", m.Role)
 		return openai.ChatCompletionMessageParamUnion{}, &ErrUnknownRole{Role: m.Role}
 	}
+}
+
+func chatCompletionOutputItems(content, reasoning string, toolCalls []ToolCall) []OutputItem {
+	items := make([]OutputItem, 0, 2+len(toolCalls))
+	if reasoning != "" {
+		items = append(items, OutputItem{Kind: OutputItemReasoning, Reasoning: reasoning})
+	}
+	if content != "" {
+		items = append(items, OutputItem{Kind: OutputItemMessage, Text: content})
+	}
+	for i := range toolCalls {
+		call := toolCalls[i]
+		items = append(items, OutputItem{Kind: OutputItemFunctionCall, ID: call.ID, ToolCall: &call})
+	}
+	return items
 }
 
 // parseFinishReason 将 API 返回的 finish_reason 字符串映射为枚举值。

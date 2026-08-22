@@ -11,9 +11,10 @@ WT="$TESTBED/worktrees/$TASK_ID"
 RUN="$TESTBED/runs/$TASK_ID"
 BIN="${AGENTGO_BIN:-$AGENTGO_ROOT/agentgo}"
 PROMPT="${SWE_PROMPT_DIR:-$TESTBED/harness/prompts}/$TASK_ID.md"
-KEY_VAR="${SWE_KEY_VAR:-AGENTGO_SWE_API_KEY}"
+KEY_VAR="${SWE_KEY_VAR:-OPENROUTER_API_KEY}"
 BASE_URL="${SWE_BASE_URL:-https://openrouter.ai/api/v1}"
-MODEL="${SWE_MODEL:-deepseek/deepseek-v4-flash-0731}"
+MODEL="${SWE_MODEL:-openai/gpt-5.6-luna}"
+PROTOCOL="${SWE_PROTOCOL:-responses}"
 
 [ -d "$WT" ] || { echo "worktree 不存在: $WT（先跑 prepare_task.sh）" >&2; exit 1; }
 [ -f "$PROMPT" ] || { echo "prompt 不存在: $PROMPT" >&2; exit 1; }
@@ -28,7 +29,8 @@ TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 
 sed -e "s|__PROJECT_ROOT__|$WT|" -e "s|__PORT__|$PORT|" -e "s|__TOKEN__|$TOKEN|" \
     -e "s|__AGENTGO_ROOT__|$AGENTGO_ROOT|" -e "s|__BASE_URL__|$BASE_URL|" \
-    -e "s|__MODEL__|$MODEL|" "$AGENTGO_ROOT/setting.swe-flask.yaml" > "$RUN/setting.yaml"
+    -e "s|__MODEL__|$MODEL|" -e "s|__PROTOCOL__|$PROTOCOL|" \
+    -e "s|__KEY_VAR__|$KEY_VAR|" "$AGENTGO_ROOT/setting.swe-flask.yaml" > "$RUN/setting.yaml"
 
 BASE="http://127.0.0.1:$PORT"
 START=$(date +%s)
@@ -48,7 +50,7 @@ if [ "$ready" != 1 ]; then
   kill -9 "$PID" 2>/dev/null || true
   exit 1
 fi
-grep -q '\[OK\].*function-call schema/arguments' "$RUN/agentgo.log" || {
+grep -q '\[OK\].*typed function-call/required-arguments' "$RUN/agentgo.log" || {
   echo "SPAWN_ERROR: 产品 function-call probe 没有成功证据" >&2
   kill "$PID" 2>/dev/null || true
   exit 1

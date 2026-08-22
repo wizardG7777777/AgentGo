@@ -24,8 +24,8 @@ import (
 //     Interaction 与 exec 前按当前允许根做同款 canonical 路径校验。命令正文
 //     通过 sh/PowerShell 自行解析绝对路径，仍不属于本路径 Gate 的保证面
 //
-//   - **path 缺失或非字符串 → Abort**（用户决议）：file 系工具没有 path
-//     参数是不合法调用。hook 拒绝比让工具自己报错更早、更显式
+//   - **path 缺失或非字符串 → invalid_tool_arguments**：这是 Agent 可按
+//     schema 自修的参数错误，不得伪装成不可重试的真实边界越权
 //
 // Phase: PreCall, Priority: 10（系统级最早，与 hookSystem.md §5.2 的
 // 0-100 系统强制段对齐）。
@@ -78,8 +78,8 @@ func (h *PathBoundaryHook) Matches(toolName string) bool {
 //   - pathutil.ValidatePath 返回 error（越界 / 敏感文件）→ Abort
 //   - 其他情况 → Continue
 //
-// 四类 Abort 统一使用 ReasonPathOutOfBoundary 原因码：路径类拒绝没有唯一
-// 安全恢复方案（H2a 过滤纪律），不给工具动作建议，只标记升级 user。
+// 参数形态错误使用 retryable invalid_tool_arguments；只有已提供路径真实越界/
+// 命中敏感边界时才使用不可重试的 path_out_of_boundary 并升级 user。
 func (h *PathBoundaryHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecision {
 	field, ok := pathFieldByTool[hctx.ToolName]
 	if !ok {
@@ -87,17 +87,17 @@ func (h *PathBoundaryHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecision 
 	}
 	rawPath, exists := hctx.Args[field]
 	if !exists {
-		return h.abortOutOfBoundary(h.missingFieldReason(hctx, field), hctx.ToolName)
+		return h.abortInvalidArguments(h.missingFieldReason(hctx, field), hctx.ToolName)
 	}
 	pathStr, ok := rawPath.(string)
 	if !ok {
-		return h.abortOutOfBoundary(
+		return h.abortInvalidArguments(
 			fmt.Sprintf("工具 %s 的 %s 参数类型必须是 string，收到 %T", hctx.ToolName, field, rawPath),
 			hctx.ToolName,
 		)
 	}
 	if pathStr == "" {
-		return h.abortOutOfBoundary(
+		return h.abortInvalidArguments(
 			fmt.Sprintf("工具 %s 的 %s 参数不能为空", hctx.ToolName, field),
 			hctx.ToolName,
 		)
@@ -106,6 +106,18 @@ func (h *PathBoundaryHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecision 
 		return h.abortOutOfBoundary(fmt.Sprintf("路径校验失败: %v", err), pathStr)
 	}
 	return hook.ToolHookDecision{Action: hook.Continue}
+}
+
+func (h *PathBoundaryHook) abortInvalidArguments(reason, target string) hook.ToolHookDecision {
+	return hook.ToolHookDecision{
+		Action:      hook.Abort,
+		HookName:    h.Name(),
+		AbortReason: reason,
+		ReasonCode:  ReasonInvalidToolArguments,
+		Suggestions: []hook.Suggestion{
+			hook.NewSuggestion(h.Name(), ReasonInvalidToolArguments, target, true),
+		},
+	}
 }
 
 // abortOutOfBoundary 构造路径类拒绝的统一 Abort 决策：不可自动重试，

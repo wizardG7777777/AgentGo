@@ -83,6 +83,24 @@ func TestToolRegistry_Dispatch_Success(t *testing.T) {
 	}
 }
 
+func TestToolRegistryNormalizeCallAppliesDeclaredDefaultsWithoutMutatingProviderArgs(t *testing.T) {
+	r := NewToolRegistry()
+	r.RegisterWithDefaults("list_dir", "list", nil, map[string]any{"path": ".", "depth": 1},
+		func(context.Context, map[string]any) (string, error) { return "", nil })
+	original := llm.ToolCall{ID: "call-1", Name: "list_dir", Arguments: map[string]any{"depth": 2}}
+	normalized := r.NormalizeCall(original)
+	if normalized.Arguments["path"] != "." || normalized.Arguments["depth"] != 2 {
+		t.Fatalf("normalized=%+v", normalized.Arguments)
+	}
+	if _, mutated := original.Arguments["path"]; mutated {
+		t.Fatal("NormalizeCall 不得修改 provider 原始参数 map")
+	}
+	filtered := r.Filtered([]string{"list_dir"})
+	if got := filtered.NormalizeCall(llm.ToolCall{Name: "list_dir"}).Arguments["path"]; got != "." {
+		t.Fatalf("过滤 Lease 丢失工具默认值: %v", got)
+	}
+}
+
 func TestToolRegistry_Dispatch_UnknownTool(t *testing.T) {
 	r := NewToolRegistry()
 

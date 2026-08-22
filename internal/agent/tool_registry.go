@@ -24,13 +24,15 @@ type ToolFunc func(ctx context.Context, args map[string]any) (string, error)
 type ToolRegistry struct {
 	tools        map[string]ToolFunc
 	defs         []llm.ToolDef
+	defaults     map[string]map[string]any
 	allowedTools map[string]bool // nil = 允许全部
 }
 
 func NewToolRegistry() *ToolRegistry {
 	return &ToolRegistry{
-		tools: make(map[string]ToolFunc),
-		defs:  make([]llm.ToolDef, 0),
+		tools:    make(map[string]ToolFunc),
+		defs:     make([]llm.ToolDef, 0),
+		defaults: make(map[string]map[string]any),
 	}
 }
 
@@ -40,8 +42,9 @@ func NewToolRegistry() *ToolRegistry {
 // 安全配置中的空 allowlist fail-open。
 func NewToolRegistryWithAllowlist(allowed []string) *ToolRegistry {
 	r := &ToolRegistry{
-		tools: make(map[string]ToolFunc),
-		defs:  make([]llm.ToolDef, 0),
+		tools:    make(map[string]ToolFunc),
+		defs:     make([]llm.ToolDef, 0),
+		defaults: make(map[string]map[string]any),
 	}
 	if allowed != nil {
 		r.allowedTools = make(map[string]bool, len(allowed))
@@ -55,6 +58,13 @@ func NewToolRegistryWithAllowlist(allowed []string) *ToolRegistry {
 // Register 注册一个工具。应在代理启动前调用，运行时不再修改。
 // 如果 ToolRegistry 设置了白名单且 name 不在白名单中，注册被静默跳过。
 func (r *ToolRegistry) Register(name, description string, params map[string]any, fn ToolFunc) {
+	r.RegisterWithDefaults(name, description, params, nil, fn)
+}
+
+// RegisterWithDefaults 注册一个带确定性参数默认值的工具。默认值属于 L3
+// Tool 契约，只能用于 schema 已声明为可省略且语义唯一的字段；规范化发生在
+// Gate、Effect、Trace 与账本之前，所有下游看到相同的有效参数。
+func (r *ToolRegistry) RegisterWithDefaults(name, description string, params map[string]any, defaults map[string]any, fn ToolFunc) {
 	if r.allowedTools != nil && !r.allowedTools[name] {
 		return
 	}
@@ -64,6 +74,32 @@ func (r *ToolRegistry) Register(name, description string, params map[string]any,
 		Description: description,
 		Parameters:  params,
 	})
+	if len(defaults) > 0 {
+		copyDefaults := make(map[string]any, len(defaults))
+		for key, value := range defaults {
+			copyDefaults[key] = value
+		}
+		r.defaults[name] = copyDefaults
+	}
+}
+
+// NormalizeCall 返回填入工具声明默认值的新调用，不修改 provider 原 map。
+func (r *ToolRegistry) NormalizeCall(call llm.ToolCall) llm.ToolCall {
+	defaults := r.defaults[call.Name]
+	if len(defaults) == 0 {
+		return call
+	}
+	arguments := make(map[string]any, len(call.Arguments)+len(defaults))
+	for key, value := range call.Arguments {
+		arguments[key] = value
+	}
+	for key, value := range defaults {
+		if _, exists := arguments[key]; !exists {
+			arguments[key] = value
+		}
+	}
+	call.Arguments = arguments
+	return call
 }
 
 // RegisteredCount 返回已注册的工具数量。
@@ -164,8 +200,9 @@ func (r *ToolRegistry) Filtered(allow []string) *ToolRegistry {
 		allowed[name] = true
 	}
 	view := &ToolRegistry{
-		tools: make(map[string]ToolFunc, len(allow)),
-		defs:  make([]llm.ToolDef, 0, len(allow)),
+		tools:    make(map[string]ToolFunc, len(allow)),
+		defs:     make([]llm.ToolDef, 0, len(allow)),
+		defaults: make(map[string]map[string]any, len(allow)),
 	}
 	for name, fn := range r.tools {
 		if allowed[name] {
@@ -176,6 +213,16 @@ func (r *ToolRegistry) Filtered(allow []string) *ToolRegistry {
 		if allowed[def.Name] {
 			view.defs = append(view.defs, def)
 		}
+	}
+	for name, defaults := range r.defaults {
+		if !allowed[name] {
+			continue
+		}
+		copyDefaults := make(map[string]any, len(defaults))
+		for key, value := range defaults {
+			copyDefaults[key] = value
+		}
+		view.defaults[name] = copyDefaults
 	}
 	return view
 }

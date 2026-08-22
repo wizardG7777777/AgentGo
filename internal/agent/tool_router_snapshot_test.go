@@ -101,6 +101,28 @@ func TestSchedulerInvocationToolPolicyMovesThroughAuthoringPhases(t *testing.T) 
 	}
 }
 
+func TestGraphDeliverablePhaseForcesSubmitTaskResult(t *testing.T) {
+	full := NewToolRegistry()
+	for _, name := range []string{"read_file", "grep_search", "submit_task_result"} {
+		full.Register(name, name, map[string]any{"type": "object"}, func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	}
+	task := replayGateTask("task-deliverable", nil)
+	task.GraphID = "graph-1"
+	policy := deriveInvocationToolPolicy(task, []HistoryEntry{{SystemNotice: progressDeliverableRequiredMarker}}, full)
+	if policy.Phase != "agent:deliverable-submit" || policy.MaxCalls != 1 ||
+		!sameExactToolSet(policy.Registry.Names(), []string{"submit_task_result"}) {
+		t.Fatalf("deliverable phase 工具面错误: phase=%s tools=%v", policy.Phase, policy.Registry.Names())
+	}
+	router, err := FreezeToolRouterSnapshotWithPolicy(policy.Registry, policy.Phase, policy.MaxCalls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	choice := invocationToolChoice(router)
+	if choice.Mode != invocation.ToolChoiceFunction || choice.Name != "submit_task_result" {
+		t.Fatalf("deliverable phase 未冻结 exact submit: %+v", choice)
+	}
+}
+
 func TestSchedulerPhaseDoesNotAdvanceOnFailedAuthoringTool(t *testing.T) {
 	full := NewToolRegistry()
 	for _, name := range []string{"create_graph_draft", "configure_simple_graph_draft", "read_graph_draft", "patch_graph_draft", "validate_graph_draft"} {

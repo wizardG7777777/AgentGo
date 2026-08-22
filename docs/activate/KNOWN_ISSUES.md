@@ -1,8 +1,8 @@
 # KNOWN_ISSUES — 当前限制与验证缺口
 
-最后核对：2026-08-22。
+最后核对：2026-08-23。
 
-## 2026-08-22 五层架构修复的当前开放项
+## 2026-08-23 五层架构修复的当前开放项
 
 本轮已落地 Invocation/Context/Effect/Loop/Graph 的主要 canonical contract、
 durable Store 和生产接线，并通过 full/race/vet/build、harness 单测与真实二进制；但以下
@@ -15,23 +15,28 @@ durable Store 和生产接线，并通过 full/race/vet/build、harness 单测�
   window 到期后只把仍未返回的 L4 action 标为 `ActionUnknown` 并 Seal checkpoint；
   它不会篡改、重放或自动补偿 Effect Journal 中的 prepared/unknown 外部副作用。
   这类 Effect 仍需按 Effect authority 进行人工核验。
-- **基础层/L2 provider 证据**：Context v7/Replay v2、动态 OutputBudget 与
-  `startup_probe=tool` fixture 已接入；仍开放真实 tokenizer 与更多 provider-specific
-  SSE/usage fixture，不把一个 OpenAI-compatible 后端外推成所有后端能力。
+- **基础层/L2 provider 证据**：Responses typed-item/SSE、Context v8/Replay v3、
+  动态 OutputBudget 与 required-nonce `startup_probe=tool` 已接入；OpenRouter Luna
+  单题已通过，但仍开放真实 tokenizer 与更多 provider-specific SSE/usage fixture，
+  不把一个 provider/model 外推成所有后端能力。
 - **SWE-015…019 实现已关闭**：Response replay、Raw History projection、Attempt/
   deadline、Scheduler phase Prompt/ToolRouter、真实 Lease、Tool batch/ToolResultRef
   已完成，并通过 full/race/vet/build/真实二进制验证。完成记录见
   [`第六轮 0/8 分层诊断`](../test-issues/2026-08-22-1510-swe-round6-zero-of-eight-layered-diagnosis.md) 第12节。
 - **SWE-020…026 实现已落地**：versioned harness、typed/bounded runtime snapshot、
-  Context v7、Run/Attempt 与 Invocation-failure 进展分离、simple Graph/current
+  Context v8、Run/Attempt 与 Invocation-failure 进展分离、simple Graph/current
   transaction、typed Proposal Acceptance、Graph intervention scope 已进入生产主链；
   仍需一批8题证明跨题稳定性，当前不标 external-closed。
+- **SWE-027/028 已修复并获单题证据**：Responses typed-item 主链消除了正文工具
+  猜测，verification 新证据超出 exploration allowance 后改为 exact
+  `submit_task_result` 交付阶段，不再直接 blocked。仍需一批8题验证跨题稳定性。
 - **验证横切面**：仓库内 SWE harness 与最新 `automatic-options` 单题已实际运行。
-  最新脱敏结果为 `architecture_ok=true / task_resolved=false`：首轮 Prompt 2463
-  tokens，GraphDraft 第1次调用产生，Definition revision=1、typed outcome=blocked，Graph activation
-  TaskOutcome 全部 commit/ACK，已知架构事故为零；Worker 未产生源码写入，Judge
-  仍为 failed。按门禁没有运行8题，因此 SWE-011～019 仍不能用外部证据关闭。
-  详见 [`主链修复与单题门禁`](../test-issues/2026-08-22-2258-swe-mainline-repair-and-single-gate.md)。
+  最新脱敏结果为 `architecture_ok=true / task_resolved=true`：OpenRouter Responses
+  + Luna，94 秒，首轮 Prompt 2205 tokens，GraphDraft 第1次调用产生，revision=1、
+  3 activations、typed outcome=success、TaskOutcome 全部 commit/ACK、known incidents=0，
+  Judge 为 resolved（494 passed）。尚未运行本阶段8题，因此 SWE-011～028 仍不能
+  仅凭单题标记 external-closed。详见
+  [`Responses 主链与单题成功`](../test-issues/2026-08-23-0109-responses-mainline-and-single-task-success.md)。
   三平台 CI 仍是发布层开放证据。
 
 统一状态与后续顺序见

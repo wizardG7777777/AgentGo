@@ -207,6 +207,27 @@ func TestProgressPolicyReminderRolloverThenTypedIntervention(t *testing.T) {
 	}
 }
 
+func TestNovelVerificationEvidenceEntersForcedDeliverablePhaseInsteadOfBlocked(t *testing.T) {
+	task := enforcementTask(t)
+	task.GraphID = "graph-verification"
+	contract := *task.ProgressContract
+	contract.Policy.MaxExplorationTurns = 2
+	now := time.Now().UTC()
+	checkpoint := loopcontract.ProgressCheckpoint{
+		Schema: loopcontract.CheckpointSchemaV1, CheckpointID: "checkpoint-verification", Version: 4,
+		RunID: task.RunID, GraphID: task.GraphID, TaskID: task.ID, AttemptID: "attempt-1",
+		Contract: contract.Ref, LastAnyProgressAt: now, LastDeliverableProgressAt: now.Add(-time.Minute),
+		ExplorationTurnsSinceDeliverable: 3, InterventionStage: loopcontract.StageRunning,
+		Deadlines: loopcontract.DeadlineSet{}, UpdatedAt: now,
+	}
+	decision, command := decideProgressPolicy(contract, task, &checkpoint)
+	if decision.Blocked || decision.Intervention || command != nil ||
+		!strings.Contains(decision.Reminder, progressDeliverableRequiredMarker) ||
+		checkpoint.InterventionStage != loopcontract.StageReminder {
+		t.Fatalf("novel evidence 被错误阻断: decision=%+v command=%+v checkpoint=%+v", decision, command, checkpoint)
+	}
+}
+
 func TestFrameworkAttemptRolloverPersistsReminderAndProgressState(t *testing.T) {
 	taskStore := store.NewMemoryTaskStore(nil, 32, 1, 60)
 	task := enforcementTask(t)

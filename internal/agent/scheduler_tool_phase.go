@@ -14,6 +14,8 @@ import (
 
 const defaultToolCallsPerResponse = 16
 
+const progressDeliverableRequiredMarker = "[progress-deliverable-required]"
+
 type invocationToolPolicy struct {
 	Registry *ToolRegistry
 	Phase    string
@@ -34,6 +36,8 @@ func invocationToolChoice(router ToolRouterSnapshot) invocation.ToolChoice {
 		return invocation.ToolChoice{Mode: invocation.ToolChoiceFunction, Name: "start_current_graph"}
 	case "scheduler:draft-edit", "scheduler:recovery":
 		return invocation.ToolChoice{Mode: invocation.ToolChoiceRequired}
+	case "agent:deliverable-submit":
+		return invocation.ToolChoice{Mode: invocation.ToolChoiceFunction, Name: "submit_task_result"}
 	default:
 		return invocation.ToolChoice{Mode: invocation.ToolChoiceAuto}
 	}
@@ -41,6 +45,13 @@ func invocationToolChoice(router ToolRouterSnapshot) invocation.ToolChoice {
 
 func deriveInvocationToolPolicy(task *model.Task, history []HistoryEntry, full *ToolRegistry) invocationToolPolicy {
 	policy := invocationToolPolicy{Registry: full, Phase: "default", MaxCalls: defaultToolCallsPerResponse}
+	if task != nil && full != nil && task.GraphID != "" && historyRequiresDeliverableSubmit(history) {
+		return invocationToolPolicy{
+			Registry: full.Filtered([]string{"submit_task_result"}),
+			Phase:    "agent:deliverable-submit",
+			MaxCalls: 1,
+		}
+	}
 	if task == nil || full == nil || task.GraphID != "" || task.EventType != "__scheduler__" ||
 		task.RunContract == nil || strings.TrimSpace(task.ContextPolicyRef) == "" {
 		return policy
@@ -77,6 +88,15 @@ func deriveInvocationToolPolicy(task *model.Task, history []HistoryEntry, full *
 	// durable tool result 进入下一 phase，避免同批副作用与 revision CAS 竞态。
 	policy.MaxCalls = 1
 	return policy
+}
+
+func historyRequiresDeliverableSubmit(history []HistoryEntry) bool {
+	for index := len(history) - 1; index >= 0; index-- {
+		if strings.Contains(history[index].SystemNotice, progressDeliverableRequiredMarker) {
+			return true
+		}
+	}
+	return false
 }
 
 type graphAuthoringStage string

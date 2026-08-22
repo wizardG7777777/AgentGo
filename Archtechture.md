@@ -12,7 +12,7 @@
 | `gate` | **统一 Gate 注册表**（v5 替代 v4 三套 HookRegistry）。Phase 路由：`tool:preCall/postCall` / `mailbox:beforeSend/Deliver/Wake`，10 个内置 Gate |
 | `hook` | 旧 Hook 接口仍作为 LLMExecutor 与 Gate 之间的适配层保留；Agent Hook 子系统已空（team-awareness 删除）；Tool/Mailbox builtin 文件夹保留为兼容 surface |
 | `interaction` | 通用结构化人机交互：稳定 Option ID、Version CAS、`pending → resolving → resolved` 两阶段协议，以及 Graph approval/Shell 受信任 effect 与普通 `agent_question` 路由 |
-| `llm` | LLM 客户端（统一 OpenAI-compatible Chat Completions，V6 移除 Provider 适配层）+ `reasoning_effort` + SSE 聚合 + `Message.ExtraFields` 透传机制 |
+| `llm` | Model Invocation：OpenAI Responses typed-item 主链 + 显式 Chat Completions 兼容适配、`reasoning_effort`、SSE 聚合、required-exact output-item replay |
 | `mailbox` | 异步信箱、Notifier、recent ring-buffer（容量 16）、TeamSnapshot |
 | `memory` | **Memory System**（v5）。`Store` 接口 + `ProcessStore` 内存实现（`ScopeProcess`），`ScopeSession` / `ScopeProject` v5.x 预留。替代 v4 team-awareness Hook |
 | `model` | `Task` / `Event` / `Claim` 数据结构。`Task` 含 `Artifacts` / `ExpectedArtifacts` / `LastResponse` / `MailChainDepth` / `SchedulerBatch` / `ReadSet` |
@@ -57,7 +57,7 @@
 - **崩溃汇报**：任务最终失败时 agent 自动调用 `sendCrashReport`，向 `task.EventSource` 发送 `priority=high` 邮件，附 expected vs actual artifacts、最后一次 LLM 响应原文。
 - **Context v3 replay 投影**：Raw History 不可变；L2 按当前 Snapshot section 压力生成有界 replay，Optional reasoning 可 dropped，RequiredExact 在工具 dispatch 前完成 representability gate；context overflow 只请求 aggressive projection + 新 Attempt。Shell/Web 大结果先写 Task-scope ContentStore，再以预览 + ContentRef 回放。
 - **Trace 系统 Schema B**：`internal/trace.Event` 是 fat struct，包含 `Transition` / `ShellExec` / `ShellTimeout` / `Lease` / `Suggestion` / `Effect` / `Acceptance` 可选指针载荷与 V6 Graph Runtime 顶层字段，旧字段保留不动。EventKind 覆盖任务/Agent 状态机、Graph 生命周期、验收核验、执行租约与副作用账目等审计事件。`SetDefaultDispatcher(reactorReg)` 让 `trace.Emit` 同时驱动 Reactor 链路。物理 JSONL 在 Session 活跃时落盘到 `.agentgo/sessions/sess-<id>/logs/`，否则写入 `.agentgo/traces/`，默认保留 100 个文件；Task 重试可能跨多个分片。`agentgo trace list/show/graph/node/stats` 会按完整 `task_id` 重组逻辑任务并自动定向到 active session 的 `logs/`，其中 `graph <graph_id>` 聚合单个 Graph 的生命周期时间线。可通过 `AGENTGO_DUMP_PROMPTS=1` 启用 prompt dump。
-- **LLM 请求策略与流式调用**：`internal/llm` 在统一工厂层应用 `reasoning_effort` 与 `stream`，因此 Scheduler、静态/动态 Agent、spawn Agent 和 Reactor LLM 共享同一请求策略（V6 起统一 OpenAI-compatible Chat Completions，无 provider 分支）。SSE 路径先聚合完整文本、工具调用参数、usage 与未知扩展字段，再返回普通 `Response`；UI 收到带稳定 `stream_id` 的累积快照。未知扩展字段经 ExtraFields 透传往返（如 `reasoning_content`）。详见 §"LLM 请求路径与 ExtraFields 透传"。
+- **LLM 请求策略与流式调用**：`internal/llm` 在统一工厂层应用冻结的 `protocol`、`reasoning_effort` 与 `stream`。Responses 为新主链：SSE 的 message/reasoning/function_call output item 分型是行动权威，只有完成的 typed function call 才能 dispatch；正文中的 DSML/XML 永远只是 message。完成 output items 作为 RequiredExact carrier 经 L2 replay；Chat Completions 仅由配置显式选择兼容，不按 provider 名称推断。UI 仍收到带稳定 `stream_id` 的正文/reasoning 独立累积快照。
 
 **未启动 / 待设计**：
 - ScopeSession / ScopeProject 持久化记忆（v5.x 排期）
@@ -345,11 +345,16 @@ bootstrap.go:
 
 ---
 
-# LLM 请求路径与 ExtraFields 透传（2026-04-25 落地；V6 起统一 OpenAI-compatible Chat Completions，Provider 层已移除）
+# LLM 请求路径、Responses typed items 与兼容 replay（2026-08-23）
 
 ## 背景
 
-`internal/llm/client.go` 用 openai-go v3 官方 SDK 作为 HTTP/认证/重试基座。openai-go 是 OpenAI 官方的**强类型** SDK——响应 struct 的字段 = OpenAI 当前 schema；第三方 provider 对 OpenAI 协议的**非兼容扩展**会被默默吞掉：
+`internal/llm` 用 openai-go v3 官方 SDK 作为 HTTP/认证/重试基座。当前以
+`llm.protocol=responses` 为生产默认；`chat_completions` 是显式兼容面。
+Responses 服务端以 output item type 区分 message/reasoning/function_call，客户端
+只做强类型反序列化，不从正文猜行动。
+
+历史 Chat compatibility 仍需处理第三方 provider 非标准字段：
 
 - **DeepSeek V4 thinking 模式**：响应 `message` 里多一个 `reasoning_content` 字段，**并要求下一轮请求把它原样送回**，否则返回 400 `The "reasoning_content" in the thinking mode must be passed back`。openai-go 的 `ChatCompletionMessage` 没有这个字段 → 字段在接收时丢失；`ChatCompletionAssistantMessageParam` 也没有 → 回写时更不可能带上。结果第一轮成功，第二轮必崩（2026-04-24 日志）。
 - **DeepSeek R1 (deepseek-reasoner)**：要求**相反**——下一轮请求必须删除历史 assistant 消息里的 `reasoning_content`，否则同样 400。
@@ -357,7 +362,19 @@ bootstrap.go:
 
 "每遇到一个模型加一个 if/else" 走不通。本架构用 ExtraFields 通用透传机制把「保留即可」类差异收敛到可维护的边界上，**保留 openai-go 基座不变**。
 
-## 层 1：ExtraFields 通用透传（零预知）
+## Responses 主链：typed output item
+
+- `response.output_item.done.item.type` 是 message/reasoning/function_call 的唯一身份；
+- `response.function_call_arguments.delta` 只做流式预算与一致性检查，最终
+  `output_item.done` 才可 dispatch；
+- completed output items 原样编码到 `agentgo_responses_output_items`，由 L2
+  RequiredExact gate 证明下一轮可表示，再还原为 reasoning/function_call/
+  function_call_output item；
+- 未知 item、重复 done、delta/done 参数不一致、incomplete/failed 均在工具执行前
+  fail-closed；
+- message 内的 DSML、XML 或伪工具文本不会被正则转换为工具调用。
+
+## Chat compatibility：ExtraFields 通用透传
 
 覆盖"保留即可"类扩展——不需要 AgentGo 理解任何字段语义。
 
@@ -368,7 +385,11 @@ bootstrap.go:
 
 **覆盖范围**：DeepSeek V4 的 `reasoning_content`、provider 自定义元数据等所有"只要原样回传就行"的扩展。无需编写任何模型专属代码。
 
-## 层 2：Provider 插件（**已于 V6 移除**）——原 `Provider` 接口（`PrepareMessages` / `RequestOptions`）、注册表与 openai / openrouter / deepseek-v4 / deepseek-r1 四个内置实现已整体删除；V6 起只保留统一 OpenAI-compatible Chat Completions 请求路径，`llm.provider` 字段在 Validate 返回迁移诊断错误。层 1 ExtraFields 透传保留。
+## Provider 名称分支（**已于 V6 移除**）
+
+原 `Provider` 接口与按供应商名称选择变换的注册表已删除。现在只允许配置
+`llm.protocol: responses|chat_completions`；协议在客户端构造时冻结，不允许运行中
+静默回退。`llm.provider` 继续返回迁移诊断错误。
 
 ## 配置（v4 schema）
 
@@ -377,10 +398,11 @@ llm:
   default_model: ...
   base_url: ...
   api_key: ...
+  protocol: responses
   timeout_sec: ...
 ```
 
-`bootstrap.go` 经 `runtime_builder.buildKindLLMClient` 统一构造 `llm.Client` 注入所有调用点（V6 起不再传 provider）。per-kind 模型区分由 `model` 名（同一 endpoint 下选不同模型）承担。
+`bootstrap.go` 经 `runtime_builder.buildKindLLMClient` 统一构造 `llm.Client` 注入所有调用点。per-kind 模型区分由 `model` 名承担；protocol 进程内统一冻结。
 
 ## 为什么不直接丢弃 openai-go
 

@@ -14,9 +14,10 @@ llm:
   base_url: https://api.openai.com/v1
   api_key: ${OPENAI_API_KEY}       # 支持 ${ENV_VAR} 环境变量替换（os.ExpandEnv）
   default_model: gpt-4o
+  protocol: responses              # 新主链；旧 provider 才显式写 chat_completions
   timeout_sec: 120
   # reasoning_effort: medium        # 仅为支持该参数的模型启用；可选值见 docs/yaml-config-guide.md
-  stream: true                      # Chat Completions SSE；Agent/UI 原位显示完整累积快照
+  stream: true                      # Responses SSE；Agent/UI 原位显示完整累积快照
 
 # ============================================================
 # 工具集白名单（命名复用层）

@@ -40,18 +40,21 @@ llm:
   base_url: https://api.openai.com/v1   # 可选；空时使用 OpenAI 官方端点
   api_key: ${OPENAI_API_KEY}            # 可选；空时 SDK 读 OPENAI_API_KEY
   default_model: gpt-4o                 # 推荐必填；Scheduler/模板/静态 Agent 的默认
+  protocol: responses                   # 缺省；旧端点才显式 chat_completions
   timeout_sec: 120                      # 可选；省略时 runtime 使用 60 秒
   # reasoning_effort: medium            # 仅为支持该参数的模型启用；空值表示不发送
-  stream: true                          # 可选；启用 Chat Completions SSE
+  stream: true                          # 可选；启用所选 protocol 的 SSE
 ```
 
 **关键点**：
 - `${ENV_VAR}` 形式的环境变量替换走 `os.ExpandEnv`，发生在 unmarshal 之前——可以替换 YAML 中**任何**字段的值，不止 api_key
 - Scheduler-only 至少要能解析出模型：通常填写 `llm.default_model`，也可由 `scheduler.model` 覆盖
 - `base_url` 为空时 SDK 使用 OpenAI 官方端点；`api_key` 为空时 SDK 尝试读取 `OPENAI_API_KEY`。生产配置仍建议显式写成上面的形式，便于审查实际 provider 边界
+- `protocol` 只允许 `responses` / `chat_completions`，运行中不自动回退。Responses
+  只把 typed `function_call` item 当作工具行动，正文标记永不执行
 - `reasoning_effort` 接受 OpenAI 当前公开取值的并集：`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`；具体模型可能只支持其中一部分，不支持时由上游 API 返回模型级错误
 - `stream: true` 对所有经统一 LLM 工厂创建的调用生效，包括 Scheduler、预热 Agent、模板/Team Agent、one-shot spawn Agent 和用户 Reactor 的 `invoke_llm`
-- 流式文本会以同一 `stream_id` 的累积快照推送到 TUI/Web；工具调用会先完整聚合名称和 JSON 参数，再交给 Agent 执行，避免半截参数触发工具
+- 流式正文/reasoning 会以同一 `stream_id` 的独立累积快照推送到 TUI/Web；工具调用只有在完整 typed output item 完成后才交给 Agent，避免半截参数触发工具
 
 ### 1.2 `tool_profiles:` — 命名工具集（推荐）
 

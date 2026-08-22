@@ -58,6 +58,9 @@ func TestLoadConfig_V4Sample(t *testing.T) {
 
 func TestWatchdogPendingGraceDefaultsAndYAMLDecode(t *testing.T) {
 	defaults := DefaultConfig()
+	if defaults.LLM.Protocol != "responses" {
+		t.Fatalf("default llm.protocol=%q, want responses", defaults.LLM.Protocol)
+	}
 	if defaults.ProjectRoot != "." {
 		t.Fatalf("default project_root = %q, want .", defaults.ProjectRoot)
 	}
@@ -146,7 +149,7 @@ func TestValidateReasoningEffortRejectsUnknownValue(t *testing.T) {
 
 func TestLoadConfigDecodesStreamingRequestPolicy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "llm.yaml")
-	data := []byte("llm:\n  default_model: gpt-test\n  reasoning_effort: high\n  stream: true\n")
+	data := []byte("llm:\n  default_model: gpt-test\n  protocol: chat_completions\n  reasoning_effort: high\n  stream: true\n")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -154,8 +157,17 @@ func TestLoadConfigDecodesStreamingRequestPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.LLM.ReasoningEffort != "high" || !cfg.LLM.Stream {
+	if cfg.LLM.Protocol != "chat_completions" || cfg.LLM.ReasoningEffort != "high" || !cfg.LLM.Stream {
 		t.Fatalf("LLM request policy = %+v", cfg.LLM)
+	}
+}
+
+func TestValidateRejectsUnknownLLMProtocol(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.LLM.DefaultModel = "gpt-test"
+	cfg.LLM.Protocol = "text_guessing"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "llm.protocol") {
+		t.Fatalf("未知 protocol 未被拒绝: %v", err)
 	}
 }
 

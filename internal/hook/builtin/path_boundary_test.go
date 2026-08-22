@@ -172,6 +172,9 @@ func TestPathBoundaryHook_MissingPathArgAbort(t *testing.T) {
 	if d.Action != hook.Abort {
 		t.Errorf("Action = %v, want Abort when path missing", d.Action)
 	}
+	if d.ReasonCode != ReasonInvalidToolArguments || len(d.Suggestions) != 1 || !d.Suggestions[0].Retryable {
+		t.Fatalf("缺参必须是可自修的 invalid_tool_arguments: %+v", d)
+	}
 }
 
 func TestPathBoundaryHook_NonStringPathAbort(t *testing.T) {
@@ -192,6 +195,9 @@ func TestPathBoundaryHook_NonStringPathAbort(t *testing.T) {
 			if d.Action != hook.Abort {
 				t.Errorf("Action = %v, want Abort for non-string path %T", d.Action, v)
 			}
+			if d.ReasonCode != ReasonInvalidToolArguments {
+				t.Fatalf("非字符串参数 reason=%q", d.ReasonCode)
+			}
 		})
 	}
 }
@@ -204,6 +210,9 @@ func TestPathBoundaryHook_EmptyStringPathAbort(t *testing.T) {
 	})
 	if d.Action != hook.Abort {
 		t.Errorf("Action = %v, want Abort for empty path", d.Action)
+	}
+	if d.ReasonCode != ReasonInvalidToolArguments {
+		t.Fatalf("空参数 reason=%q", d.ReasonCode)
 	}
 }
 

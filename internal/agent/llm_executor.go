@@ -768,6 +768,10 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 					return
 				}
 
+				// L3 参数规范化必须先于 Trace/Gate/Effect/账本。只有 Tool Registry
+				// 显式声明的安全默认值会被填入；不得从正文或别名猜参数。
+				c = toolRouter.Registry.NormalizeCall(c)
+
 				argsLog := truncateForLog(c.Arguments, 120)
 				log.Printf("[agent %s] task=%s loop=%d tool=%s args=%s", agentID, task.ID, loopNum, c.Name, argsLog)
 				activity.ToolStarted(agentID, task.ID, loopNum, c.ID, c.Name)

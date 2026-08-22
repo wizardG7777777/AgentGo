@@ -1,7 +1,7 @@
 # Invocation Failure / Loop Recovery 契约
 
-> 状态：Accepted Design，SWE-019/020/025 implementation complete / single-provider architecture verified<br>
-> 日期：2026-08-22<br>
+> 状态：Accepted Design，SWE-019/020/025/027 implementation complete / Responses single-task verified<br>
+> 日期：2026-08-23<br>
 > 归属：Model Invocation 基础层 + L4 Loop Engineering<br>
 > 对应问题：SWE-014<br>
 > 上位规范：[`五层工程架构规范`](five-layer-engineering-architecture.md)<br>
@@ -9,7 +9,7 @@
 > [`Loop Progress Contract / Checkpoint / Deadline`](loop-progress-checkpoint-and-deadline.md)<br>
 > 统一路线图：[`SWE 架构修复统一实施路线图`](swe-architecture-repair-roadmap.md)
 
-## 0.1 2026-08-22 实施状态
+## 0.1 2026-08-23 实施状态
 
 SWE-019 修订已接入：`OutputBudget` 新增 tool-call count 与 arguments-total；
 `ContextBinding` 携带由 Context v7 completion reserve/Replay v2 派生的动态预算，
@@ -17,7 +17,13 @@ L4 action reservation 再取剩余预算最小值。新 Run 的 Scheduler 不再
 record-only Lease，而是冻结真实 registry ceiling，并按 draft-create/configure/
 validate/commit/start/recovery/final-report phase 生成同源 advertise/dispatch
 ToolRouter；每个 Scheduler 响应只允许一个阶段动作。`startup_probe=tool` 真实执行
-function-call schema/arguments fixture，text-only provider 不再被“ping 成功”误判兼容。
+Responses typed function-call + required nonce fixture；text-only、错误 call identity
+或空参数 provider 不再被“ping 成功”误判兼容。
+
+SWE-027 已把 Model Invocation 新主链切换为 OpenAI Responses typed output items：
+message/reasoning/function_call 分型由服务端信封决定，正文不作工具语义识别；
+partial argument delta 只计预算并与 final item 对账，完成 item 通过 L2 RequiredExact
+carrier 原样 replay。Chat Completions 仅保留显式 compatibility protocol。
 
 已进入生产主链：封闭 `InvocationFailure`/FailureKind/phase/origin/scope、Cause
 保留、typed RecoveryDecision、request/caller/attempt deadline 区分、SSE 与非流式
@@ -32,7 +38,7 @@ L4 决策中优先，兼容 `ErrRecoverable` 只在没有 canonical failure 的�
 
 Proposal Acceptance 已改成 exact typed verdict tool，最终 wire 只要求
 `verdict`，非 pass 再要求有界 `issue_code/message`；framework 生成稳定 ref。
-仓库 full/race/vet/build、真实二进制和最新 provider 单题架构门已通过。仍开放
+仓库 full/race/vet/build、真实二进制和最新 provider 单题双门已通过。仍开放
 多 provider structured code/capability fixture、兼容 wrapper 删除、三平台与8题
 rollout；故外部 closure 仍保持 validation-open。
 

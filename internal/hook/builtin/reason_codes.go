@@ -17,8 +17,11 @@ const (
 	// ReasonMissingExpectedArtifacts：写入路径不在任务声明的
 	// expected_artifacts 内（应改写声明中的缺失产物路径）。
 	ReasonMissingExpectedArtifacts = "missing_expected_artifacts"
+	// ReasonInvalidToolArguments：工具参数缺失、类型错误或空值；调用者可按
+	// schema/拒绝说明自行修正，不等同于真实路径越界。
+	ReasonInvalidToolArguments = "invalid_tool_arguments"
 	// ReasonPathOutOfBoundary：路径越出项目根边界 / 命中敏感文件 / 路径
-	// 参数缺失或形态非法。
+	// 边界违规。
 	ReasonPathOutOfBoundary = "path_out_of_boundary"
 	// ReasonExecModePrefix：exec 模式拦截的前缀，实际原因码为
 	// "exec_mode_" + 模式名（readonly / strict）。

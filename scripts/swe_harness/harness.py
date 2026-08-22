@@ -25,6 +25,7 @@ import uuid
 RUN_SCHEMA = "agentgo.run-contract/v1"
 RESULT_SCHEMA = "agentgo.swe-result/v2"
 PROBE_NAME = "agentgo_capability_probe_test"
+PROBE_NONCE = "nonce_test_7f3a"
 TERMINAL_TASK = {"completed", "failed", "blocked", "cancelled"}
 TERMINAL_GRAPH = {"completed", "failed", "blocked", "cancelled"}
 TERMINAL_OUTCOME = {"success", "failed", "blocked", "cancelled"}
@@ -86,23 +87,38 @@ def build_run_contract(task_id: str, timeout_sec: int, now: dt.datetime | None =
     }
 
 
-def probe_request(model: str, probe_name: str) -> dict:
+def probe_request(model: str, probe_name: str, nonce: str, protocol: str) -> dict:
+    tool = {
+        "type": "function",
+        "name": probe_name,
+        "description": "Prove typed function calling with one required nonce.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"nonce": {"type": "string", "const": nonce}},
+            "required": ["nonce"],
+        },
+        "strict": True,
+    }
+    if protocol == "responses":
+        return {
+            "model": model,
+            "input": f"Call the required function exactly once with nonce {nonce}.",
+            "tools": [tool],
+            "tool_choice": {"type": "function", "name": probe_name},
+            "max_output_tokens": 256,
+            "stream": False,
+        }
     return {
         "model": model,
         "messages": [{
             "role": "user",
-            "content": "Call the provided function exactly once. Do not answer with text.",
+            "content": f"Call the provided function exactly once with nonce {nonce}. Do not answer with text.",
         }],
         "tools": [{
             "type": "function",
             "function": {
-                "name": probe_name,
-                "description": "Prove function-calling compatibility with an empty JSON object.",
-                "parameters": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {},
-                },
+                key: value for key, value in tool.items() if key != "type"
             },
         }],
         "tool_choice": {"type": "function", "function": {"name": probe_name}},
@@ -111,7 +127,27 @@ def probe_request(model: str, probe_name: str) -> dict:
     }
 
 
-def validate_probe_response(payload: dict, probe_name: str = PROBE_NAME) -> tuple[bool, str]:
+def validate_probe_response(payload: dict, probe_name: str = PROBE_NAME,
+                            nonce: str = PROBE_NONCE, protocol: str = "chat_completions") -> tuple[bool, str]:
+    if protocol == "responses":
+        if not isinstance(payload, dict) or payload.get("status") != "completed":
+            return False, f"Responses status={payload.get('status') if isinstance(payload, dict) else None!r}"
+        output = payload.get("output")
+        calls = [item for item in output if isinstance(item, dict) and item.get("type") == "function_call"] \
+            if isinstance(output, list) else []
+        if len(calls) != 1:
+            return False, f"function_call item 数量={len(calls)}，期望 1"
+        call = calls[0]
+        if call.get("name") != probe_name or not call.get("call_id"):
+            return False, "function_call name/call_id 不匹配"
+        raw_args = call.get("arguments")
+        try:
+            arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except json.JSONDecodeError:
+            return False, "工具参数不是合法 JSON"
+        if arguments != {"nonce": nonce}:
+            return False, "工具参数未逐值回传必填 nonce"
+        return True, "ok"
     choices = payload.get("choices") if isinstance(payload, dict) else None
     if not isinstance(choices, list) or len(choices) != 1:
         return False, "provider 未返回唯一 choice"
@@ -131,8 +167,8 @@ def validate_probe_response(payload: dict, probe_name: str = PROBE_NAME) -> tupl
         arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
     except json.JSONDecodeError:
         return False, "工具参数不是合法 JSON"
-    if arguments != {}:
-        return False, "工具参数不是严格空 JSON object"
+    if arguments != {"nonce": nonce}:
+        return False, "工具参数未逐值回传必填 nonce"
     return True, "ok"
 
 
@@ -171,11 +207,15 @@ def curl_probe_transport(endpoint: str, api_key: str, body: dict, timeout_sec: i
                 pass
 
 
-def run_provider_probe(base_url: str, api_key: str, model: str, timeout_sec: int = 45,
-                       attempts: int = 3, sleep_sec: int = 15, transport=None) -> None:
-    endpoint = base_url.rstrip("/") + "/chat/completions"
+def run_provider_probe(base_url: str, api_key: str, model: str, protocol: str = "responses",
+                       timeout_sec: int = 45, attempts: int = 3, sleep_sec: int = 15,
+                       transport=None) -> None:
+    if protocol not in {"responses", "chat_completions"}:
+        raise ValueError(f"未知 probe protocol={protocol}")
+    endpoint = base_url.rstrip("/") + ("/responses" if protocol == "responses" else "/chat/completions")
     probe_name = "agentgo_capability_probe_" + uuid.uuid4().hex[:8]
-    request_body = probe_request(model, probe_name)
+    nonce = "nonce_" + uuid.uuid4().hex[:12]
+    request_body = probe_request(model, probe_name, nonce, protocol)
     transport = transport or curl_probe_transport
     last_reason = "未知错误"
     for attempt in range(1, attempts + 1):
@@ -184,7 +224,7 @@ def run_provider_probe(base_url: str, api_key: str, model: str, timeout_sec: int
             if status != 200:
                 last_reason = f"HTTP {status}"
                 raise RuntimeError(last_reason)
-            ok, reason = validate_probe_response(payload, probe_name)
+            ok, reason = validate_probe_response(payload, probe_name, nonce, protocol)
             if ok:
                 return
             last_reason = reason
@@ -586,8 +626,8 @@ def summarize_runs(runs_dir: str, batch_start: float) -> list[dict]:
 
 
 def command_probe(args: argparse.Namespace) -> None:
-    run_provider_probe(args.base_url, os.environ[args.key_var], args.model, args.timeout)
-    print(json.dumps({"probe": "passed", "model": args.model}, ensure_ascii=False))
+    run_provider_probe(args.base_url, os.environ[args.key_var], args.model, args.protocol, args.timeout)
+    print(json.dumps({"probe": "passed", "model": args.model, "protocol": args.protocol}, ensure_ascii=False))
 
 
 def command_inject(args: argparse.Namespace) -> None:
@@ -647,6 +687,7 @@ def parser() -> argparse.ArgumentParser:
     probe.add_argument("--base-url", required=True)
     probe.add_argument("--model", required=True)
     probe.add_argument("--key-var", required=True)
+    probe.add_argument("--protocol", choices=("responses", "chat_completions"), default="responses")
     probe.add_argument("--timeout", type=int, default=45)
     probe.set_defaults(func=command_probe)
 

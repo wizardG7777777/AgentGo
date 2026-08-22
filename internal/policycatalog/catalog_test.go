@@ -6,6 +6,7 @@ import (
 
 	"agentgo/internal/contextcontract"
 	"agentgo/internal/graph"
+	"agentgo/internal/llm"
 	"agentgo/internal/loopcontract"
 )
 
@@ -37,10 +38,10 @@ func TestDefaultCatalogValidAndResolvesGraphPolicies(t *testing.T) {
 	if got := catalog.ProgressRefs(); !reflect.DeepEqual(got, wantProgressRefs) {
 		t.Fatalf("ProgressRefs=%v，want=%v", got, wantProgressRefs)
 	}
-	if got := catalog.ContextRefs(); !reflect.DeepEqual(got, []string{ContextDefaultV1, ContextDefaultV2, ContextDefaultV3, ContextDefaultV4, ContextDefaultV5, ContextDefaultV6, ContextDefaultV7}) {
+	if got := catalog.ContextRefs(); !reflect.DeepEqual(got, []string{ContextDefaultV1, ContextDefaultV2, ContextDefaultV3, ContextDefaultV4, ContextDefaultV5, ContextDefaultV6, ContextDefaultV7, ContextDefaultV8}) {
 		t.Fatalf("ContextRefs=%v", got)
 	}
-	if got := catalog.ReplayRefs(); !reflect.DeepEqual(got, []string{ReplayOpenAICompatibleV1, ReplayOpenAICompatibleV2}) {
+	if got := catalog.ReplayRefs(); !reflect.DeepEqual(got, []string{ReplayOpenAICompatibleV1, ReplayOpenAICompatibleV2, ReplayOpenAICompatibleV3}) {
 		t.Fatalf("ReplayRefs=%v", got)
 	}
 }
@@ -61,7 +62,7 @@ func TestDefaultContextAndReplayPoliciesAreVersionedAndClosed(t *testing.T) {
 	if contextProfile.ReplayPolicyRef != ReplayOpenAICompatibleV1 {
 		t.Fatalf("Context profile replay ref=%q", contextProfile.ReplayPolicyRef)
 	}
-	if len(contextProfile.Policy.FragmentRules) != len(contextcontract.KnownFragmentKinds()) ||
+	if len(contextProfile.Policy.FragmentRules) != len(contextcontract.KnownFragmentKinds())-1 ||
 		len(contextProfile.Policy.AtomicGroupRules) != len(contextcontract.KnownAtomicGroupKinds()) ||
 		len(contextProfile.Policy.SectionBudgets) != len(contextcontract.KnownContextSections()) {
 		t.Fatal("默认 Context policy 未完整覆盖封闭词表")
@@ -77,6 +78,13 @@ func TestDefaultContextAndReplayPoliciesAreVersionedAndClosed(t *testing.T) {
 	}
 	if _, guessed := replay.Policy.Fields["vendor_unknown_field"]; guessed {
 		t.Fatal("未知 provider field 不得在默认 policy 中猜测放行")
+	}
+	if _, leaked := replay.Policy.Fields[llm.ResponsesOutputItemsExtraField()]; leaked {
+		t.Fatal("Responses carrier 不得改写历史 replay v1 digest")
+	}
+	responsesReplay, ok := catalog.ProviderReplayPolicy(ReplayOpenAICompatibleV3)
+	if !ok || responsesReplay.Policy.Fields[llm.ResponsesOutputItemsExtraField()] != contextcontract.ReplayRequiredExact {
+		t.Fatalf("Replay v3 缺少 Responses RequiredExact carrier: %+v", responsesReplay)
 	}
 }
 
@@ -113,8 +121,12 @@ func TestDefaultContextV2WidensStaticPromptWithoutMutatingV1(t *testing.T) {
 	if !ok {
 		t.Fatal("未找到当前 Context v7")
 	}
-	if ContextDefaultCurrent != ContextDefaultV7 {
-		t.Fatalf("新运行默认 Context=%q，期望 v7", ContextDefaultCurrent)
+	v8, ok := catalog.ContextPolicy(ContextDefaultV8)
+	if !ok {
+		t.Fatal("未找到当前 Context v8")
+	}
+	if ContextDefaultCurrent != ContextDefaultV8 {
+		t.Fatalf("新运行默认 Context=%q，期望 v8", ContextDefaultCurrent)
 	}
 	v1Prompt := v1.Policy.FragmentRules[contextcontract.FragmentPromptComponent]
 	v2Prompt := v2.Policy.FragmentRules[contextcontract.FragmentPromptComponent]
@@ -141,6 +153,15 @@ func TestDefaultContextV2WidensStaticPromptWithoutMutatingV1(t *testing.T) {
 		v7.Policy.FragmentRules[contextcontract.FragmentAssistantReasoning].MaxSerializedBytes != 192<<10 ||
 		v7.Digest == v6.Digest {
 		t.Fatalf("v7 optional reasoning 字节容器错误: %+v", v7.Policy)
+	}
+	if v8.Policy.Version != 8 || v8.ReplayPolicyRef != ReplayOpenAICompatibleV3 ||
+		v8.Policy.CompletionReserve != v7.Policy.CompletionReserve ||
+		v8.Policy.FragmentRules[contextcontract.FragmentAssistantResponseItems].RetentionClass != contextcontract.RetentionTaskLifetime ||
+		v8.Digest == v7.Digest {
+		t.Fatalf("v8 Responses typed replay policy 错误: %+v", v8)
+	}
+	if _, leaked := v7.Policy.FragmentRules[contextcontract.FragmentAssistantResponseItems]; leaked {
+		t.Fatal("v8 Responses fragment rule 污染了历史 v7 digest")
 	}
 	if v3.Policy.Version != 3 || v3.ReplayPolicyRef != ReplayOpenAICompatibleV2 ||
 		v3.Policy.FragmentRules[contextcontract.FragmentPromptComponent].MaxSerializedBytes != 64<<10 {
