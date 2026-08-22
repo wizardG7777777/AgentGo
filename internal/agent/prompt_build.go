@@ -135,7 +135,7 @@ func (a *Agent) compilePromptBuild(task *model.Task, depResults map[string]strin
 	}
 	parts = append(parts, prompt.Component{
 		ID: prompt.ComponentOutputContract, Version: promptVersionSubmitContract,
-		Text: renderOutputContract(controlTools), InMessage: false,
+		Text: renderOutputContract(task, controlTools), InMessage: false,
 	})
 
 	return prompt.Compile(parts)
@@ -150,7 +150,13 @@ func renderTaskObjective(task *model.Task, depResults map[string]string) string 
 	sb.WriteString(task.Description)
 	if len(depResults) > 0 {
 		sb.WriteString("\n\n--- 前置任务结果 ---\n")
-		for depID, result := range depResults {
+		keys := make([]string, 0, len(depResults))
+		for depID := range depResults {
+			keys = append(keys, depID)
+		}
+		sort.Strings(keys)
+		for _, depID := range keys {
+			result := depResults[depID]
 			sb.WriteString(fmt.Sprintf("[%s] %s\n", depID, result))
 		}
 	}
@@ -181,7 +187,7 @@ func promptToolNames(swapper ToolRegistrySwapper, lease *model.ExecutionLease) [
 
 // renderOutputContract 渲染 output_contract 组件正文：按控制通道工具派生
 // 的结果提交协议简述（身份/观测用，不进入消息字节）。
-func renderOutputContract(controlTools []string) string {
+func renderOutputContract(task *model.Task, controlTools []string) string {
 	has := func(name string) bool {
 		for _, t := range controlTools {
 			if t == name {
@@ -192,7 +198,13 @@ func renderOutputContract(controlTools []string) string {
 	}
 	switch {
 	case has("submit_task_result"):
-		return "任务收尾须经 submit_task_result 提交结构化结果（status/summary/event/verdict；自定义路由字段放入 result JSON object）"
+		if task != nil && task.GraphNodeKind == "acceptance" {
+			return "任务收尾须经 submit_task_result 提交结构化结果；completed 验收结论仅用 verdict=pass|fixable|failed 与 cited_evidence，证据不足用 status=blocked；禁止 event"
+		}
+		if task != nil && task.GraphID != "" {
+			return "任务收尾须经 submit_task_result 提交结构化结果（status/summary）；业务路由字段只放入 result JSON object，禁止 event；阻塞必须给 blocked_reason"
+		}
+		return "任务收尾须经 submit_task_result 提交结构化结果（status/summary/result；阻塞必须给 blocked_reason）"
 	case has("report_done"):
 		return "任务收尾可经 report_done 显式汇报；自然文本回复即最终答案"
 	default:

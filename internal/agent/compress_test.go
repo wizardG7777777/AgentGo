@@ -1,262 +1,40 @@
 package agent
 
 import (
+	"context"
 	"errors"
-	"strings"
 	"testing"
 
-	"agentgo/internal/llm"
+	"agentgo/internal/invocation"
 )
 
-// makeEntry 创建一个包含指定工具调用的 HistoryEntry。
-func makeEntry(toolName, content string) HistoryEntry {
-	return HistoryEntry{
-		Output:           "output",
-		ToolCalled:       true,
-		AssistantContent: "thinking about " + toolName,
-		ToolCalls: []llm.ToolCall{
-			{ID: "call_" + toolName, Name: toolName, Arguments: map[string]any{"path": "/tmp"}},
-		},
-		ToolResults: []ToolResult{
-			{ToolCallID: "call_" + toolName, Content: content},
-		},
-	}
-}
-
-func TestSnipOldToolResults(t *testing.T) {
-	// 5 个 run_shell 调用，keepRecent=3 → 前 2 个应被清空
-	history := []HistoryEntry{
-		makeEntry("run_shell", "output-1"),
-		makeEntry("run_shell", "output-2"),
-		makeEntry("run_shell", "output-3"),
-		makeEntry("run_shell", "output-4"),
-		makeEntry("run_shell", "output-5"),
-	}
-
-	snipOldToolResults(history, 3)
-
-	// 前 2 个应被清空（结构化墓碑：含工具名、目标与原长度，见 snipStub）
-	for i := 0; i < 2; i++ {
-		got := history[i].ToolResults[0].Content
-		if !strings.HasPrefix(got, "[已清空] run_shell") {
-			t.Errorf("history[%d] content = %q, want structured snip stub", i, got)
-		}
-		if !strings.Contains(got, "原 8 字符") {
-			t.Errorf("history[%d] stub should carry original length, got %q", i, got)
-		}
-		if !strings.Contains(got, "/tmp") {
-			t.Errorf("history[%d] stub should carry target path, got %q", i, got)
-		}
-	}
-	// 后 3 个应保持不变
-	for i := 2; i < 5; i++ {
-		got := history[i].ToolResults[0].Content
-		if strings.HasPrefix(got, "[已清空]") {
-			t.Errorf("history[%d] content should NOT be snipped, got %q", i, got)
-		}
-	}
-
-	// 验证 ToolCallID 仍然保留
-	if history[0].ToolResults[0].ToolCallID != "call_run_shell" {
-		t.Errorf("ToolCallID was modified, got %q", history[0].ToolResults[0].ToolCallID)
-	}
-}
-
-// TestSnipStub 验证结构化墓碑的元数据提取：目标取 path/command/pattern/task_id
-// 首个非空；超长目标截断到 60 字符；nil Arguments 安全。
-func TestSnipStub(t *testing.T) {
-	stub := snipStub("read_file", map[string]any{"path": "internal/agent/agent.go"}, 8432)
-	for _, want := range []string{"[已清空] read_file internal/agent/agent.go", "原 8432 字符", "force_full=true"} {
-		if !strings.Contains(stub, want) {
-			t.Errorf("stub missing %q: %q", want, stub)
-		}
-	}
-
-	longPath := strings.Repeat("a", 80)
-	stub = snipStub("read_file", map[string]any{"path": longPath}, 10)
-	if !strings.Contains(stub, strings.Repeat("a", 57)+"...") {
-		t.Errorf("stub should truncate target to 60 chars: %q", stub)
-	}
-
-	stub = snipStub("run_shell", nil, 100)
-	if !strings.HasPrefix(stub, "[已清空] run_shell（原 100 字符）") {
-		t.Errorf("nil args should yield tool-only stub: %q", stub)
-	}
-
-	stub = snipStub("run_shell", map[string]any{"command": "go test ./..."}, 50)
-	if !strings.Contains(stub, "run_shell go test ./...") {
-		t.Errorf("stub should prefer command for run_shell: %q", stub)
-	}
-}
-
-func TestSnipOldToolResults_PreservesNonTargetTools(t *testing.T) {
-	history := []HistoryEntry{
-		makeEntry("write_file", "wrote something"),
-		makeEntry("write_file", "wrote more"),
-		makeEntry("write_file", "wrote even more"),
-		makeEntry("write_file", "wrote again"),
-		makeEntry("write_file", "wrote last"),
-	}
-
-	snipOldToolResults(history, 3)
-
-	// write_file 不在目标工具列表中，全部应保持原样
-	for i, entry := range history {
-		if strings.HasPrefix(entry.ToolResults[0].Content, "[已清空]") {
-			t.Errorf("history[%d] write_file content should NOT be snipped", i)
-		}
-	}
-}
-
-func TestSnipOldToolResults_GetTaskResultPagesAreBoundedPerTool(t *testing.T) {
-	history := []HistoryEntry{
-		makeEntry("get_task_result", "page-1"),
-		makeEntry("read_file", "read-1"),
-		makeEntry("get_task_result", "page-2"),
-		makeEntry("get_task_result", "page-3"),
-		makeEntry("read_file", "read-2"),
-		makeEntry("get_task_result", "page-4"),
-		makeEntry("get_task_result", "page-5"),
-	}
-
-	snipOldToolResults(history, 2)
-
-	for _, index := range []int{0, 2, 3} {
-		if got := history[index].ToolResults[0].Content; !strings.HasPrefix(got, "[已清空] get_task_result") {
-			t.Errorf("history[%d] old get_task_result page=%q", index, got)
-		}
-		if got := history[index].ToolResults[0].ToolCallID; got != "call_get_task_result" {
-			t.Errorf("history[%d] ToolCallID changed: %q", index, got)
-		}
-	}
-	for _, index := range []int{5, 6} {
-		if got := history[index].ToolResults[0].Content; strings.HasPrefix(got, "[已清空]") {
-			t.Errorf("history[%d] recent get_task_result page was snipped", index)
-		}
-	}
-	for _, index := range []int{1, 4} {
-		if got := history[index].ToolResults[0].Content; strings.HasPrefix(got, "[已清空]") {
-			t.Errorf("history[%d] read_file should use its own keepRecent counter", index)
-		}
-	}
-}
-
-func TestBuildHistorySummary(t *testing.T) {
-	history := []HistoryEntry{
-		makeEntry("read_file", "file content"),
-		makeEntry("grep_search", "search results"),
-		{
-			Output:           "final output",
-			ToolCalled:       false,
-			AssistantContent: "done thinking",
-		},
-	}
-
-	summary := buildHistorySummary(history)
-
-	if !strings.Contains(summary, "步骤 1:") {
-		t.Error("summary should contain '步骤 1:'")
-	}
-	if !strings.Contains(summary, "步骤 2:") {
-		t.Error("summary should contain '步骤 2:'")
-	}
-	if !strings.Contains(summary, "[read_file]") {
-		t.Error("summary should contain tool name [read_file]")
-	}
-	if !strings.Contains(summary, "=== 历史摘要 ===") {
-		t.Error("summary should contain header")
-	}
-}
-
-func TestBuildHistorySummary_TruncatesLongContent(t *testing.T) {
-	longContent := strings.Repeat("x", 300)
-	history := []HistoryEntry{
-		{
-			Output:           "output",
-			ToolCalled:       false,
-			AssistantContent: longContent,
-		},
-	}
-
-	summary := buildHistorySummary(history)
-
-	if strings.Contains(summary, strings.Repeat("x", 250)) {
-		t.Error("summary should truncate long assistant content")
-	}
-	if !strings.Contains(summary, "...") {
-		t.Error("summary should contain '...' for truncated content")
-	}
-}
-
-func TestCompressHistory(t *testing.T) {
-	history := make([]HistoryEntry, 10)
-	for i := 0; i < 10; i++ {
-		history[i] = makeEntry("read_file", "content-"+string(rune('0'+i)))
-	}
-
-	result := compressHistory(history, 3)
-
-	if len(result) != 4 {
-		t.Fatalf("compressHistory should return 4 entries, got %d", len(result))
-	}
-	if !strings.Contains(result[0].Output, "=== 历史摘要 ===") {
-		t.Error("first entry should be summary")
-	}
-	if result[0].ToolCalled {
-		t.Error("summary entry should have ToolCalled=false")
-	}
-}
-
-func TestCompressHistory_NoCompressWhenFewEntries(t *testing.T) {
-	history := []HistoryEntry{
-		makeEntry("read_file", "content-1"),
-		makeEntry("read_file", "content-2"),
-	}
-
-	result := compressHistory(history, 3)
-
-	if len(result) != 2 {
-		t.Fatalf("compressHistory should not compress when len <= keepRecent, got %d entries", len(result))
-	}
-}
-
-func TestCompressHistory_RepeatedCompactionPreservesPriorSummary(t *testing.T) {
-	first := []HistoryEntry{
-		{AssistantContent: "early finding"},
-		{AssistantContent: "middle finding"},
-		{AssistantContent: "recent finding"},
-	}
-	compressed := compressHistory(first, 1)
-	if !strings.Contains(compressed[0].Output, "early finding") {
-		t.Fatalf("首次摘要缺少早期事实: %q", compressed[0].Output)
-	}
-
-	compressed = append(compressed, HistoryEntry{AssistantContent: "latest finding"})
-	compressed = compressHistory(compressed, 1)
-	if !strings.Contains(compressed[0].Output, "early finding") {
-		t.Fatalf("重复压缩不应丢掉上一轮摘要中的早期事实: %q", compressed[0].Output)
-	}
-}
-
 func TestIsContextOverflow(t *testing.T) {
+	contextWindow := invocation.NewFailure(invocation.FailureContextWindowExceeded,
+		invocation.PhaseResponseHeaders, invocation.OriginProvider,
+		errors.New("context window exceeded"))
+	requestTimeout := invocation.NewFailure(invocation.FailureRequestTimeout,
+		invocation.PhaseRequestSend, invocation.OriginTransport,
+		context.DeadlineExceeded)
 	tests := []struct {
 		name     string
 		err      error
 		expected bool
 	}{
-		{"contains length", errors.New("finish_reason=length"), true},
-		{"contains 截断", errors.New("响应被截断"), true},
-		{"contains context", errors.New("context window exceeded"), true},
+		{"仅含 length 文本", errors.New("finish_reason=length"), false},
+		{"仅含截断文本", errors.New("响应被截断"), false},
+		{"仅含 context 文本", errors.New("context window exceeded"), false},
+		{"typed context window", contextWindow, true},
+		{"request deadline 阴性", requestTimeout, false},
 		{"normal error", errors.New("rate limit exceeded"), false},
 		{"auth error", errors.New("invalid api key"), false},
-		{"wrapped with length", &ErrRecoverable{Err: errors.New("max_tokens length exceeded")}, true},
+		{"wrapped typed context window", &ErrRecoverable{Err: contextWindow}, true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := isContextOverflow(tt.err)
+			got := invocation.IsContextWindowExceeded(tt.err)
 			if got != tt.expected {
-				t.Errorf("isContextOverflow(%q) = %v, want %v", tt.err, got, tt.expected)
+				t.Errorf("IsContextWindowExceeded(%q) = %v, want %v", tt.err, got, tt.expected)
 			}
 		})
 	}

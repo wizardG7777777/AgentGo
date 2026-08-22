@@ -544,7 +544,7 @@ func TestBuildMessagesInjectsTrustedTaskContext(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			messages := buildMessages("task-specific system prompt", tt.task, nil, nil, "")
+			messages := buildLegacyMessages("task-specific system prompt", tt.task, nil, nil, "")
 			var userContent string
 			for _, message := range messages {
 				if message.Role == "user" && userContent == "" {

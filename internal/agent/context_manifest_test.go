@@ -160,7 +160,7 @@ func TestBuildContextManifest_FirstRoundSections(t *testing.T) {
 		{Name: "write_file", Description: "写入文件"},
 	}
 
-	m := buildContextManifest(ctx, "系统提示", task, depResults, history, "", toolDefs)
+	m := buildLegacyContextManifest(ctx, "系统提示", task, depResults, history, "", toolDefs)
 
 	// 段齐全与登记顺序：契约层 → 任务 → 依赖 → 历史流注入段 → 工具协议。
 	wantOrder := []string{
@@ -230,7 +230,7 @@ func TestBuildContextManifest_SystemPromptOverride(t *testing.T) {
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-2", 0)
 	task := &model.Task{ID: "task-2", Description: "d", SystemPrompt: "覆盖提示"}
 
-	m := buildContextManifest(ctx, "覆盖提示", task, nil, nil, "", nil)
+	m := buildLegacyContextManifest(ctx, "覆盖提示", task, nil, nil, "", nil)
 	item := manifestItemByID(m, ManifestSectionSystemPrompt)
 	if item == nil {
 		t.Fatal("缺少 system_prompt 段")
@@ -257,7 +257,7 @@ func TestBuildContextManifest_RetryRound(t *testing.T) {
 			ToolResults: []ToolResult{{ToolCallID: "c1", Content: "文件内容"}}},
 	}
 
-	m := buildContextManifest(ctx, "sys", task, nil, history, "", nil)
+	m := buildLegacyContextManifest(ctx, "sys", task, nil, history, "", nil)
 
 	injected := manifestItemByID(m, ManifestSectionInjectedSegment)
 	if injected == nil {
@@ -293,7 +293,7 @@ func TestBuildContextManifest_CompressionDispositions(t *testing.T) {
 
 	// L1 墓碑 → snipped。
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-4", 3)
-	m := buildContextManifest(ctx, "sys", task, nil, bodyWithTombstone, "", nil)
+	m := buildLegacyContextManifest(ctx, "sys", task, nil, bodyWithTombstone, "", nil)
 	if got := manifestItemByID(m, ManifestSectionHistory).Disposition; got != DispositionSnipped {
 		t.Errorf("L1 墓碑应判 snipped, 实际 %q", got)
 	}
@@ -301,7 +301,7 @@ func TestBuildContextManifest_CompressionDispositions(t *testing.T) {
 	// L2 strategy 回填 → compressed:summary+keep_recent=3（strategy 一并记录）。
 	ctx2, info2 := manifestTestSideCtx("task-4", 4)
 	info2.l2Strategy = "summary+keep_recent=3"
-	m2 := buildContextManifest(ctx2, "sys", task, nil, bodyWithTombstone, "", nil)
+	m2 := buildLegacyContextManifest(ctx2, "sys", task, nil, bodyWithTombstone, "", nil)
 	if got := manifestItemByID(m2, ManifestSectionHistory).Disposition; got != "compressed:summary+keep_recent=3" {
 		t.Errorf("L2 应判 compressed:summary+keep_recent=3, 实际 %q", got)
 	}
@@ -310,14 +310,14 @@ func TestBuildContextManifest_CompressionDispositions(t *testing.T) {
 	ctx3, info3 := manifestTestSideCtx("task-4", 5)
 	info3.l2Strategy = "summary+keep_recent=3"
 	info3.l3Truncated = true
-	m3 := buildContextManifest(ctx3, "sys", task, nil, bodyWithTombstone, "", nil)
+	m3 := buildLegacyContextManifest(ctx3, "sys", task, nil, bodyWithTombstone, "", nil)
 	if got := manifestItemByID(m3, ManifestSectionHistory).Disposition; got != DispositionTruncated {
 		t.Errorf("L3 应判 truncated, 实际 %q", got)
 	}
 
 	// 无压缩 → included。
 	ctx4 := WithAgentContext(context.Background(), "agent-1", "task-4", 0)
-	m4 := buildContextManifest(ctx4, "sys", task, nil, []HistoryEntry{{Output: "普通输出"}}, "", nil)
+	m4 := buildLegacyContextManifest(ctx4, "sys", task, nil, []HistoryEntry{{Output: "普通输出"}}, "", nil)
 	if got := manifestItemByID(m4, ManifestSectionHistory).Disposition; got != DispositionIncluded {
 		t.Errorf("无压缩应判 included, 实际 %q", got)
 	}

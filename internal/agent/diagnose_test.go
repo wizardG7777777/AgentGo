@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 )
 
@@ -55,11 +56,14 @@ func TestDiagnoseLLMError_InsufficientQuota(t *testing.T) {
 }
 
 func TestDiagnoseLLMError_ContextLengthExceeded(t *testing.T) {
+	failure := invocation.NewFailure(invocation.FailureContextWindowExceeded,
+		invocation.PhaseResponseHeaders, invocation.OriginProvider, errors.New("context rejected"))
 	execErr := &llm.ErrUnrecoverable{
 		Err:        errors.New("413 request entity too large"),
 		StatusCode: 413,
 		Code:       "context_length_exceeded",
 		Message:    "This model's maximum context length is 8192 tokens",
+		Failure:    failure,
 	}
 	history := []HistoryEntry{
 		{AssistantContent: strings.Repeat("a", 3000)},
@@ -71,6 +75,17 @@ func TestDiagnoseLLMError_ContextLengthExceeded(t *testing.T) {
 	}
 	if !strings.Contains(got, "tokens") {
 		t.Errorf("expected token count in diagnosis, got: %s", got)
+	}
+}
+
+func TestDiagnoseLLMError_ContextTextWithoutCanonicalKindDoesNotMatch(t *testing.T) {
+	execErr := &llm.ErrUnrecoverable{
+		Err: errors.New("maximum context length exceeded"), Code: "context_length_exceeded",
+		Message: "maximum context length exceeded",
+	}
+	got := diagnoseLLMError(execErr, nil, "gpt-4")
+	if strings.Contains(got, "上下文上限") {
+		t.Fatalf("缺少 canonical FailureKind 时不得靠字符串识别 context overflow: %s", got)
 	}
 }
 

@@ -13,21 +13,29 @@ import (
 	"sync"
 	"time"
 
+	"agentgo/internal/contentstore"
+	"agentgo/internal/contextcontract"
 	"agentgo/internal/effect"
 	"agentgo/internal/hook"
+	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
+	"agentgo/internal/loopcontrol"
+	"agentgo/internal/loopstore"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/memory"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
 	"agentgo/internal/output"
 	"agentgo/internal/roster"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
 	"agentgo/internal/taskmem"
 	"agentgo/internal/trace"
 )
 
-// ErrRecoverable wraps an error to indicate it is recoverable (should trigger retry rollback).
+// ErrRecoverable 是无 canonical InvocationFailure 的旧执行器/非 Invocation
+// 校验错误兼容标记。错误链一旦含 InvocationFailure，L4 必须忽略本类型并只按
+// FailureKind 决策。
 type ErrRecoverable struct {
 	Err error
 }
@@ -43,15 +51,18 @@ type ToolResult struct {
 
 // ExecuteResult holds the result of a single TaskExecutor invocation.
 type ExecuteResult struct {
-	Output           string
-	ToolCalled       bool
-	Finalized        bool           // 由 FinalizationChecker 设置，表示任务已完成
-	AssistantContent string         // LLM 原始回复文本（assistant 消息的 content）
-	Reasoning        string         // provider 返回的原始明文思维链（若有）
-	ToolCalls        []llm.ToolCall // LLM 请求的工具调用列表
-	ToolResults      []ToolResult   // 每个 tool call 对应的执行结果
-	PromptTokens     int            // 本次 LLM 调用消耗的 prompt tokens
-	CompletionTokens int            // 本次 LLM 调用消耗的 completion tokens
+	InvocationID       string
+	ContextSnapshotID  string
+	InvocationDuration time.Duration
+	Output             string
+	ToolCalled         bool
+	Finalized          bool           // 由 FinalizationChecker 设置，表示任务已完成
+	AssistantContent   string         // LLM 原始回复文本（assistant 消息的 content）
+	Reasoning          string         // provider 返回的原始明文思维链（若有）
+	ToolCalls          []llm.ToolCall // LLM 请求的工具调用列表
+	ToolResults        []ToolResult   // 每个 tool call 对应的执行结果
+	PromptTokens       int            // 本次 LLM 调用消耗的 prompt tokens
+	CompletionTokens   int            // 本次 LLM 调用消耗的 completion tokens
 	// ExtraFields 是 assistant 消息里 openai-go 未识别的字段（如 DeepSeek V4 的
 	// reasoning_content）。由 LLM 客户端透传上来，agent 应把它挂到 HistoryEntry
 	// 上，buildMessages 下一轮重建 assistant 消息时原样回写给 API。
@@ -67,16 +78,24 @@ type ExecuteResult struct {
 //   - CompletionTokens：同上，本轮 completion 实测值
 //   - Model：产生该回复时使用的模型名（不同模型 tokenizer 不同，跨模型实测值不可比）
 type HistoryEntry struct {
-	Output           string                     `json:"output"`
-	ToolCalled       bool                       `json:"tool_called"`
-	AssistantContent string                     `json:"assistant_content"`
-	ToolCalls        []llm.ToolCall             `json:"tool_calls"`
-	ToolResults      []ToolResult               `json:"tool_results"`
-	ExtraFields      map[string]json.RawMessage `json:"extra_fields,omitempty"`      // 层 1 通用透传：assistant 消息的非标字段
-	IncomingMail     string                     `json:"incoming_mail,omitempty"`     // 非空时为收到的代理间邮件，注入为 user 角色消息
-	PromptTokens     int                        `json:"prompt_tokens,omitempty"`     // §11.7.3 实测锚定：本轮 LLM 调用的实测 prompt tokens
-	CompletionTokens int                        `json:"completion_tokens,omitempty"` // §11.7.3 实测锚定：本轮 completion tokens
-	Model            string                     `json:"model,omitempty"`             // §11.7.3 模型切换基准重置：产生该条回复时使用的模型名
+	TurnID            string                     `json:"turn_id,omitempty"`
+	Output            string                     `json:"output"`
+	ToolCalled        bool                       `json:"tool_called"`
+	AssistantContent  string                     `json:"assistant_content"`
+	ToolCalls         []llm.ToolCall             `json:"tool_calls"`
+	ToolResults       []ToolResult               `json:"tool_results"`
+	ExtraFields       map[string]json.RawMessage `json:"extra_fields,omitempty"`       // 层 1 通用透传：assistant 消息的非标字段
+	IncomingMail      string                     `json:"incoming_mail,omitempty"`      // 非空时为收到的代理间邮件，注入为 user 角色消息
+	SystemNotice      string                     `json:"system_notice,omitempty"`      // L4/L1 控制提醒，注入为 system，禁止伪装成 user
+	PromptTokens      int                        `json:"prompt_tokens,omitempty"`      // §11.7.3 实测锚定：本轮 LLM 调用的实测 prompt tokens
+	CompletionTokens  int                        `json:"completion_tokens,omitempty"`  // §11.7.3 实测锚定：本轮 completion tokens
+	Model             string                     `json:"model,omitempty"`              // §11.7.3 模型切换基准重置：产生该条回复时使用的模型名
+	ContextProjection string                     `json:"context_projection,omitempty"` // L2 replay projection control
+	// IncomingContext* 让 L3/L4 生成的控制面输入显式声明 L2 类型；空值只为
+	// 历史记录保留 marker-based 兼容分类。正文仍在 IncomingMail，避免复制。
+	IncomingContextKind      contextcontract.FragmentKind   `json:"incoming_context_kind,omitempty"`
+	IncomingContextSection   contextcontract.ContextSection `json:"incoming_context_section,omitempty"`
+	IncomingContextAuthority contextcontract.Authority      `json:"incoming_context_authority,omitempty"`
 }
 
 // TaskExecutor is a pluggable function that executes a task.
@@ -104,13 +123,11 @@ type Agent struct {
 	// processTask 经它换入过滤视图、任务结束恢复；nil 表示 executor 不支持
 	// 按任务过滤——携带工具子集的任务将 fail-closed 终止（无法保证
 	// "LLM 只见子集"的隔离语义时不降级执行）。与 Execute 一样在装配期注入。
-	ToolSwapper           ToolRegistrySwapper
-	MaxRetries            int // 最大重试次数，0 表示不限制
-	PollInterval          time.Duration
-	IdleThreshold         int // 连续空轮询退出阈值，0 表示禁用
-	CancelRegistry        *store.TaskCancelRegistry
-	CompactTokenThreshold int // Layer 2 触发阈值（prompt tokens），默认 80000
-	CompactKeepRecent     int // 压缩时保留最近 N 条历史，默认 3
+	ToolSwapper    ToolRegistrySwapper
+	MaxRetries     int // 最大重试次数，0 表示不限制
+	PollInterval   time.Duration
+	IdleThreshold  int // 连续空轮询退出阈值，0 表示禁用
+	CancelRegistry *store.TaskCancelRegistry
 	// Model 是该 Agent 当前生效的模型名，用于 HistoryEntry.Model 记录。
 	// nextUpgrade_v4.md §11.7.3：跨模型实测值不可比，压缩阈值估算
 	// 仅锚定当前模型一致的最近一条 PromptTokens > 0 条目。空串时退化为粗略估算。
@@ -126,6 +143,7 @@ type Agent struct {
 	FileCache           *FileStateCache                   // Agent 级别的文件读取缓存，可选
 	Mailbox             *mailbox.Mailbox                  // 代理间通信收件箱，可选
 	MailRegistry        *mailbox.Registry                 // 邮箱注册表，用于 DrainWithAck 自动回执
+	SessionID           func() string                     // 当前 Session identity；mail 分区消费与消息 envelope 使用
 	FinalizationChecker FinalizationChecker               // 可选；用于 finalization tool 信号检查
 	// NaturalExitReviewer 审查非图 scheduler 任务的纯文本自然退出收口
 	// （2026-08-20 SWE-001 兜底 1，端口定义见 internal/hook/natural_exit.go）；
@@ -237,6 +255,13 @@ type Agent struct {
 	// 存储。nil 时整链路关闭：不创建/更新/注入/checkpoint，行为与之前
 	// 完全一致。装配见 runner.New（deps.TaskMemStore）。
 	TaskMemStore *taskmem.Store
+	// LoopStore 是 L4 Progress/Delta/Checkpoint 的 append-only 权威。新生产
+	// execution 必须注入；TaskMemory 不能替代它。
+	LoopStore *loopstore.Store
+	// ContentStore 是 L3 大正文/ContentRef 的持久化与授权解引用权威。
+	// 新生产执行由 bootstrap 必须注入；nil 仅保留给隔离单测/legacy 构造。
+	// L2 决定是否外置，Agent 不得凭 Ref 绕过 Lease 直接读取正文。
+	ContentStore *contentstore.Store
 
 	// Modes 是 exec 轴模式源（V6 §4 H1 ExecutionLease 的 Policy 交集输入）：
 	// exec=readonly 时租约从 BusinessTools 剔除写工具与 run_shell；
@@ -273,6 +298,13 @@ func (a *Agent) publishCompletedTurn(
 ) {
 	if a == nil || a.StreamOutput == nil || turnID == "" {
 		return
+	}
+	// 被 Invocation hard cap/协议边界拒绝的 partial 只允许作为实时 stream 观察，
+	// 不得固化成 Session 的正式 assistant/reasoning 历史。失败轮仍以空正文和
+	// typed Error 结算，保留审计身份。
+	if failure, ok := invocation.FromError(execErr); ok && failure.Partial {
+		lastStreamText = ""
+		lastStreamReasoning = ""
 	}
 	text := result.AssistantContent
 	if text == "" && !result.ToolCalled {
@@ -537,6 +569,23 @@ func (a *Agent) loopFuseLimit() int {
 	return emergencyLoopFuse
 }
 
+// attemptHardDeadline 从冻结 RunContract 派生当前兼容期 Attempt 的绝对硬截止。
+// ProgressCheckpoint 接管后本 helper 将读取 checkpoint.Deadlines.Attempt；当前先
+// 保证 operation 不跨过 recovery/finalization 保留窗口。旧 Task 无 RunContract
+// 时保持 legacy 行为，不从 TimeoutSeconds 猜硬 deadline。
+func attemptHardDeadline(task *model.Task) (time.Time, bool) {
+	if task == nil || task.RunContract == nil {
+		return time.Time{}, false
+	}
+	compiled, err := runcontract.CompileDeadlines(runcontract.DeadlineCompileInput{
+		Contract: *task.RunContract, Phase: task.RunPhase, Graph: task.GraphID != "", Now: time.Now().UTC(),
+	})
+	if err != nil {
+		return time.Time{}, false
+	}
+	return compiled.Attempt.HardDeadlineAt, true
+}
+
 func (a *Agent) processTask(ctx context.Context, taskID string) {
 	task, err := a.Store.GetTask(taskID)
 	if err != nil {
@@ -616,13 +665,14 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			enterTerminating(terminatingCause)
 			// 终止任务，避免卡在 processing 状态
 			reason := fmt.Sprintf("agent panic: %v", rec)
-			if err := a.Store.FailTask(a.ID, taskID, reason); err != nil {
+			if err := store.FailTaskWithCause(a.Store, a.ID, taskID, reason, "agent_panic"); err != nil {
 				log.Printf("[agent %s] panic 恢复后 FailTask error: %v", a.ID, err)
 			}
 			// §11.8 S11：panic-recovery 路径补 KindTaskFailed emit。
 			trace.Emit(trace.Event{
 				Kind:    trace.KindTaskFailed,
 				TaskID:  taskID,
+				RunID:   string(task.RunID),
 				AgentID: a.ID,
 				Reason:  reason,
 				Transition: &trace.Transition{
@@ -645,6 +695,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	trace.Emit(trace.Event{
 		Kind:    trace.KindTaskClaimed,
 		TaskID:  taskID,
+		RunID:   string(task.RunID),
 		AgentID: a.ID,
 		Transition: &trace.Transition{
 			PrevStatus: string(model.TaskStatusPending),
@@ -674,6 +725,9 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		a.terminateTask(task, taskID, leaseReject, "capability_violation")
 		return
 	}
+	// task 是 Store 返回的执行期克隆；把刚冻结/复用的权威 lease 挂到该克隆，
+	// 供同一 Attempt 的 L2 ContextSnapshot 绑定 ExecutionLeaseRef。
+	task.Lease = lease
 	// 工具视图换入（Lease 驱动，取代旧直接读 task.Capability.Tools 的短路）：
 	// 视图 = BusinessTools ∪ ControlTools——显式声明漏带控制工具时节点仍能
 	// 收尾。并集覆盖注册全集时跳过换入（恒等变换，无能力声明任务零开销）。
@@ -829,18 +883,6 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	log.Printf("[agent %s] 任务 %s prompt 已编译冻结：build=%s 组件=%d digest=%s",
 		a.ID, taskID, promptBuild.ID, len(promptBuild.Components), promptBuild.Digest)
 
-	// Layer 2: token 累计跟踪，用于触发摘要压缩
-	var totalPromptTokens int
-
-	compactThreshold := a.CompactTokenThreshold
-	if compactThreshold <= 0 {
-		compactThreshold = 80000
-	}
-	keepRecent := a.CompactKeepRecent
-	if keepRecent <= 0 {
-		keepRecent = 3
-	}
-
 	// emitCancellation 统一处理两种取消观测窗口：循环顶部已经看到 ctx
 	// cancelled，以及 LLM/工具调用阻塞期间才发生取消、Execute 返回后才重新
 	// 获得控制权。后者过去会误入 handleFailure，导致 Store 已是 cancelled，
@@ -877,6 +919,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		trace.Emit(trace.Event{
 			Kind:    trace.KindTaskCancelled,
 			TaskID:  taskID,
+			RunID:   string(task.RunID),
 			AgentID: a.ID,
 			Loop:    loop,
 			Reason:  reason,
@@ -897,6 +940,21 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		current, getErr := a.Store.GetTask(taskID)
 		return getErr == nil && current != nil && current.Status == model.TaskStatusCancelled
 	}
+	loopProgress, loopProgressErr := a.initLoopProgress(task)
+	if loopProgressErr != nil {
+		if ctx.Err() != nil && isAuthoritativeCancellation() {
+			emitCancellation(-1)
+			return
+		}
+		reason := "L4 ProgressCheckpoint 初始化/恢复失败: " + loopProgressErr.Error()
+		terminatingCause = "react_loop_exit:progress_authority_failure"
+		enterTerminating(terminatingCause)
+		a.blockForLoopControl(task, taskID, reason, "progress_authority_failure")
+		return
+	}
+	if loopProgress != nil {
+		defer loopProgress.finalize(a, taskID)
+	}
 
 	// V6：ReAct 循环不再有固定轮数上限（docs/nextUpgrade-V6.md §5 升级思路
 	// 5/6/8）。循环只经以下路径退出：结构化终态（自然完成 / finalization
@@ -914,12 +972,29 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// 图节点契约要求结构化收口，文本退出 = 未提交：提醒
 	// maxUnstructuredExitNudges 次后仍文本退出按可恢复错误收口。
 	unstructuredExitStreak := 0
+	attemptDeadline, hasAttemptDeadline := attemptHardDeadline(task)
+	if loopProgress != nil {
+		attemptDeadline = loopProgress.checkpoint.Deadlines.Attempt.HardDeadlineAt
+		hasAttemptDeadline = true
+	}
 	for i := 0; ; i++ {
 		select {
 		case <-ctx.Done():
 			emitCancellation(i)
 			return
 		default:
+		}
+		if hasAttemptDeadline && !time.Now().Before(attemptDeadline) {
+			cause := invocation.ErrAttemptDeadline
+			failure := invocation.NewFailure(invocation.FailureAttemptDeadline,
+				invocation.PhaseRequestSend, invocation.OriginRuntime, cause)
+			failure.TimeoutScope = invocation.TimeoutAttempt
+			terminatingCause = "react_loop_exit:attempt_deadline"
+			enterTerminating(terminatingCause)
+			taskMem.recordAttemptEnd(a, taskID, cause.Error())
+			taskMem.checkpoint(a, taskID, i, "attempt_end")
+			a.handleFailure(task, taskID, failure, history, manifestInfo)
+			return
 		}
 
 		// emergency fuse：循环计数越过兜底阈值，判定为程序缺陷造成的真死循环。
@@ -936,7 +1011,11 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		// 排水信箱：将收到的代理间消息注入历史，作为 user 角色消息；同时向发信方自动发送回执
 		hasNewMail := false
 		if a.Mailbox != nil {
-			if msgs := a.Mailbox.DrainWithAck(a.MailRegistry); len(msgs) > 0 {
+			mailSessionID := task.MailboxSessionID
+			if task.RunID != "" && task.EventSource != "mail-notifier" && a.SessionID != nil {
+				mailSessionID = a.SessionID()
+			}
+			if msgs := a.Mailbox.DrainRunWithAck(a.MailRegistry, task.RunID, mailSessionID, task.ID); len(msgs) > 0 {
 				history = append(history, HistoryEntry{
 					IncomingMail: formatMailMessages(msgs),
 				})
@@ -1063,6 +1142,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				trace.Emit(trace.Event{
 					Kind:      trace.KindTaskSubmitted,
 					TaskID:    taskID,
+					RunID:     string(task.RunID),
 					AgentID:   a.ID,
 					OutputLen: len(resultText),
 					LoopsUsed: i,
@@ -1073,6 +1153,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				trace.Emit(trace.Event{
 					Kind:    trace.KindTaskCompleted,
 					TaskID:  taskID,
+					RunID:   string(task.RunID),
 					AgentID: a.ID,
 					Transition: &trace.Transition{
 						PrevStatus: string(model.TaskStatusProcessing),
@@ -1086,6 +1167,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					trace.Emit(trace.Event{
 						Kind:    trace.KindTaskResultCommitted,
 						TaskID:  taskID,
+						RunID:   string(task.RunID),
 						AgentID: a.ID,
 						Transition: &trace.Transition{
 							PrevStatus: string(model.TaskStatusProcessing),
@@ -1102,13 +1184,23 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		histCopy := make([]HistoryEntry, len(history))
 		copy(histCopy, history)
 
-		// 注入 agentID、taskID、循环轮次到 context，供 llm_executor 和工具层日志/trace 使用
+		// 注入 agent/task/loop 与稳定 Run/Attempt/Turn identity。legacy Task 缺
+		// AttemptID 时使用确定性兼容身份，不用 wall-clock 伪造控制面 identity。
 		a.Activity.LoopStarted(a.ID, taskID, i)
+		attemptID := task.AttemptID
+		if attemptID == "" {
+			attemptNo := task.AttemptNo
+			if attemptNo <= 0 {
+				attemptNo = task.RetryCount + 1
+			}
+			attemptID = fmt.Sprintf("%s/legacy-attempt-%d", taskID, attemptNo)
+		}
+		turnID := fmt.Sprintf("%s/turn-%d", attemptID, i+1)
 		execCtx := WithAgentContext(ctx, a.ID, taskID, i)
+		execCtx = WithExecutionIdentity(execCtx, string(task.RunID), attemptID, turnID)
 		if a.Activity != nil {
 			execCtx = WithActivityContext(execCtx, a.Activity)
 		}
-		turnID := fmt.Sprintf("%s:%s:%d:%d", a.ID, taskID, i, time.Now().UnixNano())
 		lastStreamText := ""
 		lastStreamReasoning := ""
 		if a.Activity != nil || a.StreamOutput != nil {
@@ -1139,18 +1231,122 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				})
 			})
 		}
-		result, execErr := a.Execute(execCtx, task, depResults, histCopy)
+		executeCtx := execCtx
+		var cancelExecute context.CancelFunc
+		if hasAttemptDeadline {
+			executeCtx, cancelExecute = context.WithDeadlineCause(execCtx, attemptDeadline, invocation.ErrAttemptDeadline)
+		}
+		actionStartedAt := time.Now().UTC()
+		if loopProgress != nil {
+			var reserveErr error
+			var actionOutputBudget invocation.OutputBudget
+			_, actionStartedAt, actionOutputBudget, reserveErr = loopProgress.reserveModelAction(turnID)
+			if reserveErr != nil {
+				if cancelExecute != nil {
+					cancelExecute()
+				}
+				if ctx.Err() != nil && isAuthoritativeCancellation() {
+					emitCancellation(i)
+					return
+				}
+				reason := "L4 model action 预算预留失败: " + reserveErr.Error()
+				terminatingCause = "react_loop_exit:progress_authority_failure"
+				enterTerminating(terminatingCause)
+				a.blockForLoopControl(task, taskID, reason, "progress_authority_failure")
+				return
+			}
+			executeCtx, reserveErr = invocation.WithOutputBudget(executeCtx, actionOutputBudget)
+			if reserveErr != nil {
+				if cancelExecute != nil {
+					cancelExecute()
+				}
+				reason := "L4 model action OutputBudget 冻结失败: " + reserveErr.Error()
+				enterTerminating("react_loop_exit:progress_authority_failure")
+				a.blockForLoopControl(task, taskID, reason, "progress_authority_failure")
+				return
+			}
+			executeCtx = withToolActionBoundary(executeCtx, loopProgress)
+		}
+		result, execErr := a.Execute(executeCtx, task, depResults, histCopy)
+		if cancelExecute != nil {
+			cancelExecute()
+		}
 		a.publishCompletedTurn(turnID, taskID, i, result, execErr, lastStreamText, lastStreamReasoning)
+		policyDecision := loopPolicyDecision{}
+		var progressErr error
+		callerCancelled := ctx.Err() != nil && isAuthoritativeCancellation()
+		if loopProgress != nil {
+			policyDecision, progressErr = loopProgress.settleTurn(a, task, turnID,
+				actionStartedAt, result, execErr, !callerCancelled)
+		}
 
 		// 取消可能发生在 Execute 内部。此时循环顶部的 select 已经过去，
 		// 必须在把 context.Canceled 当成普通执行错误交给 handleFailure 之前
 		// 重新检查权威父 ctx，并补齐 task_cancelled 终态事实。
-		if ctx.Err() != nil && isAuthoritativeCancellation() {
+		if callerCancelled {
 			a.Activity.LLMEnd(a.ID, taskID, i, "", 0, execErr)
 			// CM2：取消前保全本轮已结算的事实；finalize defer 会按 Store 中的
 			// cancelled 终态封存 Task Memory。
 			taskMem.checkpoint(a, taskID, i, "attempt_end")
 			emitCancellation(i)
+			return
+		}
+		if progressErr != nil {
+			reason := "L4 Turn settlement/checkpoint 失败: " + progressErr.Error()
+			terminatingCause = "react_loop_exit:progress_authority_failure"
+			enterTerminating(terminatingCause)
+			a.blockForLoopControl(task, taskID, reason, "progress_authority_failure")
+			return
+		}
+		if policyDecision.Rollover {
+			if result.ToolCalled {
+				history = append(history, historyEntryFromResult(result, a.Model, turnID))
+			}
+			if policyDecision.Reminder != "" {
+				history = append(history, HistoryEntry{SystemNotice: policyDecision.Reminder})
+			}
+			taskMem.applySettledTurn(a, taskID, result, i)
+			a.saveHistory(task, history)
+			if err := a.Store.RetryRollback(a.ID, taskID, "l4_no_progress_attempt_rollover"); err != nil {
+				reason := "L4 AttemptRollover 失败: " + err.Error()
+				terminatingCause = "react_loop_exit:progress_authority_failure"
+				enterTerminating(terminatingCause)
+				a.blockForLoopControl(task, taskID, reason, "progress_authority_failure")
+				return
+			}
+			trace.Emit(trace.Event{
+				Kind: trace.KindTaskRetry, TaskID: taskID, RunID: string(task.RunID), AgentID: a.ID,
+				Reason: "l4_no_progress_attempt_rollover", AttemptNo: task.AttemptNo,
+				Transition: &trace.Transition{
+					PrevStatus: string(model.TaskStatusProcessing), NewStatus: string(model.TaskStatusPending),
+					Cause: "l4_no_progress_attempt_rollover", RetryCount: task.RetryCount + 1,
+				},
+			})
+			return
+		}
+		if policyDecision.Intervention {
+			cause := "loop_intervention_required"
+			reasonPrefix := "no_progress_intervention_required"
+			if policyDecision.Blocked {
+				cause = "no_progress_budget_exhausted"
+				reasonPrefix = "no_progress_budget_exhausted"
+			}
+			reason := fmt.Sprintf("%s: turns=%d duration=%s model_calls=%d exploration=%d checkpoint=%s", reasonPrefix,
+				loopProgress.checkpoint.NoProgressTurns, loopProgress.checkpoint.NoProgressDuration,
+				loopProgress.checkpoint.NoProgressUsage.ModelCalls,
+				loopProgress.checkpoint.ExplorationTurnsSinceDeliverable,
+				loopProgress.checkpoint.CheckpointID)
+			terminatingCause = "react_loop_exit:" + cause
+			enterTerminating(terminatingCause)
+			a.blockForLoopControl(task, taskID, reason, cause)
+			return
+		}
+		var authorityErr *loopAuthorityError
+		if errors.As(execErr, &authorityErr) {
+			reason := authorityErr.Error()
+			terminatingCause = "react_loop_exit:progress_authority_failure"
+			enterTerminating(terminatingCause)
+			a.blockForLoopControl(task, taskID, reason, "progress_authority_failure")
 			return
 		}
 
@@ -1167,7 +1363,6 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		}
 
 		lastOutput = result.Output
-		totalPromptTokens += result.PromptTokens
 
 		// §11.7.3 TokenStats 内存计数器累计——仅作 UI 实时视图数据源。
 		// V6 起不再 emit token_stats 事件（与 llm_call_end 重复的第二账本已删除）。
@@ -1379,6 +1574,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				trace.Emit(trace.Event{
 					Kind:      trace.KindTaskSubmitted,
 					TaskID:    taskID,
+					RunID:     string(task.RunID),
 					AgentID:   a.ID,
 					OutputLen: len(lastOutput),
 					LoopsUsed: i + 1,
@@ -1390,6 +1586,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				trace.Emit(trace.Event{
 					Kind:    trace.KindTaskCompleted,
 					TaskID:  taskID,
+					RunID:   string(task.RunID),
 					AgentID: a.ID,
 					Transition: &trace.Transition{
 						PrevStatus: string(model.TaskStatusProcessing),
@@ -1411,6 +1608,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		// 的 token 估算使用。Model 字段为空串时（Agent
 		// 未注入模型名）退化为 v3 行为——估算时不做模型一致性筛选。
 		history = append(history, HistoryEntry{
+			TurnID:           turnID,
 			Output:           result.Output,
 			ToolCalled:       result.ToolCalled,
 			AssistantContent: result.AssistantContent,
@@ -1421,6 +1619,9 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			CompletionTokens: result.CompletionTokens,
 			Model:            a.Model,
 		})
+		if policyDecision.Reminder != "" {
+			history = append(history, HistoryEntry{SystemNotice: policyDecision.Reminder})
+		}
 
 		// 进度通知：在 history append 之后、PhaseLoopPost 之前发送
 		a.progressNotify(ctx, taskID, i, result, &pFlags)
@@ -1432,36 +1633,6 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		// 注：MM7 之后 PhaseLoopPost AgentHook 调用点已删除——观察类需求走 trace.Emit
 		// （ReactLoop 的逐轮节奏可通过 KindLLMCallEnd / KindToolResult 等事件还原）。
 
-		// Layer 1: 清理旧的高输出工具结果
-		snipOldToolResults(history, keepRecent)
-
-		// Layer 2: 本压缩周期内的 prompt token 累计超过阈值时压缩。
-		// 压缩后开启新的累计周期，长任务可以重复触发；旧实现每个任务只允许
-		// 一次，导致首次早压缩后 history 再次无界增长，47 轮调查最终把单任务
-		// prompt 消耗推到近百万 token。
-		if totalPromptTokens > compactThreshold {
-			tokensBefore := totalPromptTokens
-			// CM2：历史压缩前强制 checkpoint——即将被压缩的旧轮次其关键
-			// 事实须已沉淀进 Task Memory 并落盘。
-			taskMem.checkpoint(a, taskID, i, "history_compaction")
-			history = compressHistory(history, keepRecent)
-			totalPromptTokens = 0
-			strategy := fmt.Sprintf("summary+keep_recent=%d", keepRecent)
-			// CM1：回填压缩处置——后续轮次的 Manifest 中 history 段
-			// Disposition 记为 compressed:<strategy>。
-			manifestInfo.l2Strategy = strategy
-			log.Printf("[agent %s] 任务 %s 触发历史摘要压缩，本周期 prompt tokens: %d", a.ID, taskID, tokensBefore)
-			trace.Emit(trace.Event{
-				Kind:               trace.KindHistoryCompaction,
-				TaskID:             taskID,
-				AgentID:            a.ID,
-				Loop:               i,
-				PromptTokensBefore: tokensBefore,
-				PromptTokensAfter:  0, // 实际值要等下次 LLM 调用才能拿到，这里只记录"压缩前"信号
-				Strategy:           strategy,
-				KeptEntries:        len(history),
-			})
-		}
 	}
 }
 
@@ -1560,6 +1731,7 @@ func (a *Agent) commitStructuredBlocked(task *model.Task, taskMem *taskMemRuntim
 	trace.Emit(trace.Event{
 		Kind:    trace.KindTaskResultCommitted,
 		TaskID:  taskID,
+		RunID:   string(task.RunID),
 		AgentID: a.ID,
 		Reason:  blockedReason,
 		Transition: &trace.Transition{
@@ -1591,11 +1763,11 @@ func (a *Agent) handleStructuredTerminalCommitFailure(task *model.Task, taskID s
 }
 
 // hasToolCallFailure 报告本任务是否已存在工具调用失败记录
-//（ToolCallRecord.Success==false，2026-08-21 SWE-008 三态状态机的 S2 状态位）。
+// （ToolCallRecord.Success==false，2026-08-21 SWE-008 三态状态机的 S2 状态位）。
 // 账本机械事实：submit_graph 校验失败、未知工具、Gate Abort 都算；任务级
 // 单调（跨 attempt 累计，不清零）——attempt 2 仍可见 attempt 1 的失败，
 // 堵住「重试后先成功一次再崩盘」的放行漏洞。查询失败时保守返回 false
-//（不放大故障面：证据缺失退回既有首拒次放语义）。
+// （不放大故障面：证据缺失退回既有首拒次放语义）。
 func (a *Agent) hasToolCallFailure(taskID string) bool {
 	if a.Store == nil {
 		return false
@@ -1613,19 +1785,66 @@ func (a *Agent) hasToolCallFailure(taskID string) bool {
 }
 
 func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, history []HistoryEntry, manifestInfo *manifestSideInfo) {
-	var recoverable *ErrRecoverable
-	if errors.As(execErr, &recoverable) {
-		// Layer 3: 如果是上下文溢出错误，在重试前激进压缩历史
-		overflow := isContextOverflow(execErr)
+	canonicalFailure, hasCanonicalFailure := invocation.FromError(execErr)
+	legacyRecoverable := false
+	if !hasCanonicalFailure {
+		var recoverable *ErrRecoverable
+		legacyRecoverable = errors.As(execErr, &recoverable)
+	}
+	recoveryDecision := loopcontrol.RecoveryDecision{}
+	if hasCanonicalFailure {
+		recoveryDecision = loopcontrol.DecideInvocationFailure(canonicalFailure)
+	}
+	if recoveryDecision.Action == loopcontrol.RecoveryBlock {
+		reason, reasonCode := blockedInvocationTerminal(canonicalFailure, execErr)
+		if blocker, ok := a.Store.(processingTaskBlocker); ok {
+			if err := blocker.BlockProcessingTaskBySystem(taskID, reason, reasonCode); err != nil {
+				log.Printf("[agent %s] 任务 %s Invocation blocked 落盘失败（reason_code=%s）: %v",
+					a.ID, taskID, reasonCode, err)
+				a.terminateTask(task, taskID, reason, reasonCode+"_commit_failed")
+			}
+		} else {
+			a.terminateTask(task, taskID, reason, reasonCode)
+		}
+		a.sendCrashReport(task, taskID, reason)
+		return
+	}
+	if (!hasCanonicalFailure && legacyRecoverable) ||
+		(hasCanonicalFailure && recoveryDecision.IsRetryPath()) {
+		// 只有 Invocation 基础层明确分类为 context_window_exceeded 时，才请求
+		// 当前兼容路径做 L2 Context 恢复。request timeout/output truncated/
+		// malformed response 均不得通过字符串误触发压缩。
+		overflow := recoveryDecision.Action == loopcontrol.RecoveryRebuildContext
 		if overflow {
-			log.Printf("[agent %s] 任务 %s 检测到上下文溢出，执行激进压缩", a.ID, taskID)
-			snipOldToolResults(history, 1)        // 激进清理：只保留最近 1 条
-			history = compressHistory(history, 1) // 激进压缩：只保留最近 1 条
+			log.Printf("[agent %s] 任务 %s 检测到上下文溢出，下一 Attempt 使用激进 replay 投影（Raw History 保持不变）", a.ID, taskID)
+			history = append(history, HistoryEntry{ContextProjection: "aggressive"})
 			// CM1：回填 L3 处置——本 attempt 随后的 LLM 调用的 Manifest 中
 			// history 段 Disposition 记为 truncated。
 			if manifestInfo != nil {
 				manifestInfo.l3Truncated = true
 			}
+		}
+
+		// RetryRollback 会结束当前 Attempt 并允许下一次 claim 创建新 Attempt；
+		// 必须在状态回到 pending 前证明 future slot 存在，禁止先创建 attempt-3
+		// 再由 initLoopProgress 事后阻断（SWE-016 外部回归）。
+		allowed, usedAttempts, attemptLimit, budgetErr := a.futureAttemptBudgetAvailable(task)
+		if budgetErr != nil {
+			reason := "future Attempt 预算门禁失败: " + budgetErr.Error()
+			a.saveHistory(task, history)
+			a.blockForLoopControl(task, taskID, reason, "progress_authority_failure")
+			return
+		}
+		if !allowed {
+			reason := fmt.Sprintf("Run attempts 预算已耗尽，当前 Attempt 保留完整执行权但不能再创建新 Attempt: used=%d limit=%d",
+				usedAttempts, attemptLimit)
+			a.saveHistory(task, history)
+			if err := a.requestAttemptBudgetIntervention(task); err != nil {
+				a.blockForLoopControl(task, taskID, reason+"；typed intervention 写入失败: "+err.Error(), "progress_authority_failure")
+				return
+			}
+			a.blockForLoopControl(task, taskID, reason, "loop_intervention_required")
+			return
 		}
 
 		// 预判是否即将 terminate。
@@ -1653,9 +1872,10 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 			}
 		} else {
 			// 2026-04-25 P1 #2：重试 trace 事件（可恢复错误路径）。
-			trace.Emit(trace.Event{
+			retryEvent := trace.Event{
 				Kind:      trace.KindTaskRetry,
 				TaskID:    taskID,
+				RunID:     string(task.RunID),
 				AgentID:   a.ID,
 				Reason:    "recoverable_error: " + execErr.Error(),
 				AttemptNo: task.RetryCount,
@@ -1665,7 +1885,14 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 					Cause:      "recoverable_error",
 					RetryCount: task.RetryCount,
 				},
-			})
+			}
+			if hasCanonicalFailure {
+				retryEvent.FailureKind = string(canonicalFailure.Kind)
+				retryEvent.FailurePhase = string(canonicalFailure.Phase)
+				retryEvent.TimeoutScope = string(canonicalFailure.TimeoutScope)
+				retryEvent.RecoveryAction = string(recoveryDecision.Action)
+			}
+			trace.Emit(retryEvent)
 		}
 	} else {
 		// 不可恢复错误：诊断原因后终止 + 崩溃汇报（V6 CM4 起不再生成
@@ -1673,6 +1900,26 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 		reason := diagnoseLLMError(execErr, history, a.Model)
 		log.Printf("[agent %s] 任务 %s 不可恢复错误：%s", a.ID, taskID, reason)
 		a.terminateTask(task, taskID, reason, "non_recoverable_error")
+	}
+}
+
+// blockedInvocationTerminal 把 canonical failure 与 L4 终态原因分开编码。
+// RecoveryBlock 不等于 deadline：ContextCompiler 的 deterministic rejection
+// 同样需要 blocked，但必须保留 L2 根因，不能伪造 timeout authority。
+func blockedInvocationTerminal(failure *invocation.Failure, execErr error) (string, string) {
+	if failure == nil {
+		return fmt.Sprintf("Invocation 被 L4 恢复策略阻断：%v", execErr), "invocation_blocked"
+	}
+	switch failure.Kind {
+	case invocation.FailureAttemptDeadline, invocation.FailureActivationDeadline:
+		return fmt.Sprintf("Invocation 被 L4 deadline 阻断：kind=%s scope=%s: %v",
+			failure.Kind, failure.TimeoutScope, execErr), "invocation_deadline"
+	case invocation.FailureContextAssembly:
+		return fmt.Sprintf("Context 装配被 L2 policy 拒绝：kind=%s scope=%s: %v",
+			failure.Kind, failure.TimeoutScope, execErr), "context_assembly_rejected"
+	default:
+		return fmt.Sprintf("Invocation 被 L4 恢复策略阻断：kind=%s scope=%s: %v",
+			failure.Kind, failure.TimeoutScope, execErr), "invocation_blocked"
 	}
 }
 
@@ -1684,7 +1931,7 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 // cause 是 trace.Transition.Cause 的结构化原因 enum（v5 Phase 2 引入），让 Reactor when
 // 条件能精确匹配 runtime_loop_fuse / non_recoverable_error 等分支。
 func (a *Agent) terminateTask(task *model.Task, taskID string, reason string, cause string) {
-	if err := a.Store.FailTask(a.ID, taskID, reason); err != nil {
+	if err := store.FailTaskWithCause(a.Store, a.ID, taskID, reason, cause); err != nil {
 		log.Printf("[agent %s] FailTask error: %v", a.ID, err)
 		// 并发取消/阻塞/完成已经成为权威终态时，不能继续 emit 一个并未
 		// durable 的 failed 事实，也不能发送伪造的崩溃报告。
@@ -1699,6 +1946,7 @@ func (a *Agent) terminateTask(task *model.Task, taskID string, reason string, ca
 	trace.Emit(trace.Event{
 		Kind:    trace.KindTaskFailed,
 		TaskID:  taskID,
+		RunID:   string(task.RunID),
 		AgentID: a.ID,
 		Reason:  reason,
 		Transition: &trace.Transition{
@@ -1779,6 +2027,7 @@ func (a *Agent) sendCrashReport(task *model.Task, taskID string, reason string) 
 		Content:  body,
 		SentAt:   time.Now(),
 	}
+	a.bindTaskMailEnvelope(&msg, task)
 	if err := a.MailRegistry.Send(msg); err != nil {
 		log.Printf("[agent %s] 发送崩溃汇报失败: %v", a.ID, err)
 	} else {
@@ -1794,6 +2043,7 @@ func diagnoseLLMError(execErr error, history []HistoryEntry, model string) strin
 	if !errors.As(execErr, &unrecov) {
 		return execErr.Error()
 	}
+	canonicalFailure, hasCanonicalFailure := invocation.FromError(execErr)
 
 	// 轻量估算当前历史 token 长度（用于 context_length_exceeded 提示）
 	estTokens := 0
@@ -1807,6 +2057,8 @@ func diagnoseLLMError(execErr error, history []HistoryEntry, model string) strin
 
 	msgLower := strings.ToLower(unrecov.Message)
 	switch {
+	case hasCanonicalFailure && canonicalFailure.Kind == invocation.FailureContextWindowExceeded:
+		return fmt.Sprintf("请求超出模型上下文上限。当前历史长度约 %d tokens；下一 Attempt 将由 Context v3 使用更紧的 Snapshot-pressure replay 投影。", estTokens)
 	// Go 优先级 && > ||，下面两个分支等价；显式括号让"或"的两侧在视觉上对齐，
 	// 防止维护者误读为 (Code=="model_not_found" || strings.Contains(...,"model")) && strings.Contains(...,"not found")。
 	case unrecov.Code == "model_not_found" ||
@@ -1820,8 +2072,6 @@ func diagnoseLLMError(execErr error, history []HistoryEntry, model string) strin
 		return fmt.Sprintf("端点返回 404。请检查 setting.yaml 中的 base_url 是否包含正确的 API 路径（如 %s）。", unrecov.Endpoint)
 	case unrecov.StatusCode == 404:
 		return fmt.Sprintf("无法连接到 %s。请检查网络连通性或 base_url 配置。", unrecov.Endpoint)
-	case unrecov.Code == "context_length_exceeded":
-		return fmt.Sprintf("请求超出模型上下文上限。当前历史长度约 %d tokens，请考虑调低 enforce_compact_token_threshold 让压缩更早触发，或拆分任务缩短上下文。", estTokens)
 	default:
 		return fmt.Sprintf("LLM 调用失败: %s (status=%d, code=%s)。完整响应: %s", unrecov.Message, unrecov.StatusCode, unrecov.Code, unrecov.Err.Error())
 	}
@@ -1915,119 +2165,6 @@ func NewAgent(id, eventType string, s store.TaskStore, r roster.Roster, exec Tas
 // String returns a description of the agent for logging.
 func (a *Agent) String() string {
 	return fmt.Sprintf("Agent[%s, type=%s]", a.ID, a.EventType)
-}
-
-// --- 历史压缩（3 层） ---
-
-// snipTargetTools 是 Layer 1 清理目标工具名称集合。
-var snipTargetTools = map[string]bool{
-	"run_shell":       true,
-	"read_file":       true,
-	"grep_search":     true,
-	"glob_search":     true,
-	"get_task_result": true,
-}
-
-// snipStub 生成结构化墓碑（2026-07-22 分层记忆 v2 M1 层）。
-// 旧占位符 "[已清空，内容过长]" 只告知"被清了"，模型不知道清的是哪个文件、
-// 原内容多大、怎么取回，重读决策是盲目的（explorer 重读浪费事故，实测同
-// 文件最多被读 12 次）。墓碑携带工具名 + 目标（path/command/pattern）+
-// 原内容长度 + 取回指引，让模型的重读决策从盲目变成知情；并优先引导它
-// 回顾自己在 assistant 消息里写的笔记（笔记不被 Layer-1 清理）。
-func snipStub(toolName string, args map[string]any, originalLen int) string {
-	target := ""
-	for _, key := range []string{"path", "command", "pattern", "task_id"} {
-		if v, ok := args[key].(string); ok && v != "" {
-			target = v
-			break
-		}
-	}
-	if runes := []rune(target); len(runes) > 60 {
-		target = string(runes[:57]) + "..."
-	}
-	desc := toolName
-	if target != "" {
-		desc += " " + target
-	}
-	return fmt.Sprintf("[已清空] %s（原 %d 字符）：内容已被历史压缩清理；请先回顾你在前文写的笔记，确需内容可重新调用 %s（read_file 命中缓存时仅返回摘要，需全文传 force_full=true）",
-		desc, originalLen, toolName)
-}
-
-// snipOldToolResults 清理历史中旧的高输出工具结果（Layer 1）。
-// 对每种目标工具，保留最近 keepRecent 条结果不变，更早的结果用结构化墓碑
-// 替换 Content（见 snipStub）。直接修改 history 切片中的 ToolResults。
-func snipOldToolResults(history []HistoryEntry, keepRecent int) {
-	// 从后往前遍历，保留最近 keepRecent 条，清理更早的
-	seen := make(map[string]int)
-	for i := len(history) - 1; i >= 0; i-- {
-		entry := &history[i]
-		for j := 0; j < len(entry.ToolCalls) && j < len(entry.ToolResults); j++ {
-			name := entry.ToolCalls[j].Name
-			if !snipTargetTools[name] {
-				continue
-			}
-			seen[name]++
-			if seen[name] > keepRecent {
-				entry.ToolResults[j].Content = snipStub(name, entry.ToolCalls[j].Arguments, len(entry.ToolResults[j].Content))
-			}
-		}
-	}
-}
-
-// buildHistorySummary 从历史条目中构建文本摘要（不调用 LLM）。
-func buildHistorySummary(history []HistoryEntry) string {
-	var sb strings.Builder
-	sb.WriteString("=== 历史摘要 ===\n")
-	for i, entry := range history {
-		fmt.Fprintf(&sb, "步骤 %d: ", i+1)
-		if entry.ToolCalled && len(entry.ToolCalls) > 0 {
-			for _, tc := range entry.ToolCalls {
-				fmt.Fprintf(&sb, "[%s] ", tc.Name)
-			}
-		}
-		// 包含 assistant 内容（LLM 推理）；重复 L2 压缩时，上一轮生成的
-		// summary 存在 Output 而没有 AssistantContent，必须把它继续折叠进
-		// 新摘要，不能在第二次压缩时静默丢掉更早的历史。
-		content := entry.AssistantContent
-		if content == "" && !entry.ToolCalled {
-			content = entry.Output
-		}
-		if content != "" {
-			if len(content) > 200 {
-				content = content[:200] + "..."
-			}
-			sb.WriteString(content)
-		}
-		sb.WriteString("\n")
-	}
-	return sb.String()
-}
-
-// compressHistory 将旧历史条目压缩为一条摘要，保留最近 keepRecent 条（Layer 2）。
-// 如果历史条目数不超过 keepRecent，不做任何压缩。
-func compressHistory(history []HistoryEntry, keepRecent int) []HistoryEntry {
-	if len(history) <= keepRecent {
-		return history
-	}
-	oldEntries := history[:len(history)-keepRecent]
-	recentEntries := history[len(history)-keepRecent:]
-
-	summaryText := buildHistorySummary(oldEntries)
-	summaryEntry := HistoryEntry{
-		Output:     summaryText,
-		ToolCalled: false,
-	}
-
-	result := make([]HistoryEntry, 0, 1+keepRecent)
-	result = append(result, summaryEntry)
-	result = append(result, recentEntries...)
-	return result
-}
-
-// isContextOverflow 检查错误是否表示上下文溢出（Layer 3）。
-func isContextOverflow(err error) bool {
-	msg := err.Error()
-	return strings.Contains(msg, "length") || strings.Contains(msg, "截断") || strings.Contains(msg, "context")
 }
 
 // ArtifactCheckResult 描述 ExpectedArtifacts 校验的结果。

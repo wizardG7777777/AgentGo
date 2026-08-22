@@ -264,9 +264,9 @@ func TestProcessTask_TaskMemoryResumeAcrossAttempts(t *testing.T) {
 	}
 }
 
-// TestProcessTask_TaskMemoryCompactionCheckpoint：L2 历史压缩前强制
-// checkpoint（reason=history_compaction）。
-func TestProcessTask_TaskMemoryCompactionCheckpoint(t *testing.T) {
+// TestProcessTask_TaskMemoryNoLongerCompactsFromRepeatedPromptSpend：完整
+// prompt token 的重复计费不得再触发 Raw History 压缩/checkpoint。
+func TestProcessTask_TaskMemoryNoLongerCompactsFromRepeatedPromptSpend(t *testing.T) {
 	dir := captureTraceToDir(t)
 	s, r, _ := setup()
 	tmStore := taskmem.NewStore(t.TempDir())
@@ -292,7 +292,6 @@ func TestProcessTask_TaskMemoryCompactionCheckpoint(t *testing.T) {
 		func(taskID string, rec store.ToolCallRecord) { _ = s.AppendToolCall(taskID, rec) }, "")
 	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.TaskMemStore = tmStore
-	ag.CompactTokenThreshold = 1 // 首轮即触发 L2
 	ag.processTask(context.Background(), task.ID)
 
 	found := false
@@ -301,8 +300,8 @@ func TestProcessTask_TaskMemoryCompactionCheckpoint(t *testing.T) {
 			found = true
 		}
 	}
-	if !found {
-		t.Error("L2 压缩前应发出 reason=history_compaction 的 checkpoint")
+	if found {
+		t.Error("重复 prompt spend 不得再触发 history_compaction checkpoint")
 	}
 }
 

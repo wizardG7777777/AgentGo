@@ -262,7 +262,7 @@ func TestContextManifest_SessionMemorySection(t *testing.T) {
 	staleInfo := newManifestSideInfo(time.Now())
 	staleInfo.recordMemorySectionUpdatedAt(markerSessionMemory, time.Now().Add(-time.Hour))
 	ctx := withManifestSideInfo(context.Background(), staleInfo)
-	m := buildContextManifest(ctx, "prompt", task, nil, history, "", nil)
+	m := buildLegacyContextManifest(ctx, "prompt", task, nil, history, "", nil)
 	var sec *ContextItem
 	for i := range m.Items {
 		if m.Items[i].ID == ManifestSectionSessionMemory {
@@ -286,7 +286,7 @@ func TestContextManifest_SessionMemorySection(t *testing.T) {
 	liveInfo := newManifestSideInfo(time.Now().Add(-time.Hour))
 	liveInfo.recordMemorySectionUpdatedAt(markerSessionMemory, time.Now())
 	ctx2 := withManifestSideInfo(context.Background(), liveInfo)
-	m2 := buildContextManifest(ctx2, "prompt", task, nil, history, "", nil)
+	m2 := buildLegacyContextManifest(ctx2, "prompt", task, nil, history, "", nil)
 	for i := range m2.Items {
 		if m2.Items[i].ID == ManifestSectionSessionMemory && m2.Items[i].Freshness != FreshnessLive {
 			t.Errorf("任务开始后更新的条目应判 live, got %s", m2.Items[i].Freshness)

@@ -65,6 +65,7 @@ const (
 	// 的预算注入已随预算系统删除），词表占位以保持文档 §3 段清单完整。
 	ManifestSectionBudgetWarning      = "budget_warning"
 	ManifestSectionValidationFeedback = "validation_feedback"
+	ManifestSectionLoopReminder       = "loop_reminder"
 	ManifestSectionToolsSchema        = "tools_schema"
 	// ManifestSectionInjectedSegment 收纳未识别的 IncomingMail 注入段
 	// （scheduler 的 board snapshot JSON 等）。
@@ -361,9 +362,10 @@ const (
 	markerHistorySummary     = "=== 历史摘要 ==="
 )
 
-// buildContextManifest 在 LLM 调用前对同一份装配输入生成影子账本。
+// buildLegacyContextManifest 只为无 Run identity 的旧快照生成兼容影子账本。
+// 新生产调用由 ContextCompiler 从同一 WireItem 同时生成请求与 Snapshot。
 // 这是 CM1 的唯一装配入口：逐项 Register 后 Seal。不改变任何消息内容。
-func buildContextManifest(
+func buildLegacyContextManifest(
 	ctx context.Context,
 	effectivePrompt string,
 	task *model.Task,
@@ -425,6 +427,11 @@ func buildContextManifest(
 	tombstoneDetected := false
 	for i := range history {
 		entry := &history[i]
+		if entry.SystemNotice != "" {
+			b.Register(ManifestSectionLoopReminder, SourceControlPlane, ScopeTask,
+				AuthorityAuthoritative, FreshnessLive, DispositionIncluded, entry.SystemNotice)
+			continue
+		}
 		if entry.IncomingMail != "" {
 			classifyInjection(b, entry.IncomingMail, side)
 			continue

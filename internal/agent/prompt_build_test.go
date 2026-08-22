@@ -46,7 +46,7 @@ func TestCompilePromptBuild_ByteIdenticalWithBuildMessages(t *testing.T) {
 	}
 	build := ag.compilePromptBuild(task, nil, lease)
 
-	msgs := buildMessages("系统提示全文", task, nil, nil, "团队感知文本")
+	msgs := buildLegacyMessages("系统提示全文", task, nil, nil, "团队感知文本")
 	if len(msgs) != 2 || msgs[0].Role != "system" || msgs[1].Role != "user" {
 		t.Fatalf("buildMessages 形态不符预期: %+v", msgs)
 	}
@@ -129,7 +129,7 @@ func findComponent(t *testing.T, build prompt.Build, id string) prompt.Component
 }
 
 // TestCompilePromptBuild_StableAndOverride 验证：同输入重编译 Build.ID 稳定
-//（重试复用的基础）；task.SystemPrompt 覆盖时是另一个 Build。
+// （重试复用的基础）；task.SystemPrompt 覆盖时是另一个 Build。
 func TestCompilePromptBuild_StableAndOverride(t *testing.T) {
 	s, _, _ := setup()
 	ag, _, _ := newPromptBuildAgent("agent-pb", "code", s, "", "系统提示", "read_file")
@@ -153,7 +153,7 @@ func TestCompilePromptBuild_StableAndOverride(t *testing.T) {
 		t.Fatalf("覆盖路径 agent_role 身份不符: %+v", role)
 	}
 	// 覆盖路径的 Build.Text 仍与 buildMessages 一致。
-	msgs := buildMessages("任务级 system prompt 覆盖", overridden, nil, nil, "")
+	msgs := buildLegacyMessages("任务级 system prompt 覆盖", overridden, nil, nil, "")
 	if b3.Text != msgs[0].Content+msgs[1].Content {
 		t.Fatal("覆盖路径 Build.Text 应与 buildMessages 逐字节一致")
 	}
@@ -250,8 +250,8 @@ func TestProcessTask_PromptBuildRetryReusesSameID(t *testing.T) {
 }
 
 // TestProcessTask_PromptBuildSchedulerControlPlane 验证 scheduler 控制面路径：
-// 带 swapper（观测用）的 __scheduler__ 任务仍保持记录型租约，tool_guidance
-// 回退到注册全集。
+// 带 swapper 的生产 Scheduler 冻结真实 registry ceiling；每轮再由
+// phase-specific ToolRouter 收窄。
 func TestProcessTask_PromptBuildSchedulerControlPlane(t *testing.T) {
 	s, _, _ := setup()
 	ag, _, _ := newPromptBuildAgent("scheduler", "__scheduler__", s, "", "调度器提示",
@@ -262,8 +262,8 @@ func TestProcessTask_PromptBuildSchedulerControlPlane(t *testing.T) {
 	if rejection != "" {
 		t.Fatalf("控制面租约不应被拒绝: %s", rejection)
 	}
-	if !lease.Synthetic || lease.BusinessTools != nil {
-		t.Fatalf("控制面租约应保持记录型（Synthetic 且无裁剪面）: %+v", lease)
+	if !lease.Synthetic || !sameExactToolSet(lease.BusinessTools, []string{"read_file", "publish_task", "report_done"}) {
+		t.Fatalf("控制面租约应冻结真实 registry ceiling: %+v", lease)
 	}
 	build := ag.compilePromptBuild(task, nil, lease)
 	tg := findComponent(t, build, prompt.ComponentToolGuidance)
