@@ -72,7 +72,7 @@ func TestLoadBuiltinsAndCatalogCopies(t *testing.T) {
 		t.Fatalf("Resolve verifier: %v", err)
 	}
 	wantVerifierTools := []string{
-		"read_file", "list_dir", "grep_search", "glob_search",
+		"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref",
 		"web_search", "web_fetch", "submit_task_result",
 	}
 	if !reflect.DeepEqual(verifier.Tools, wantVerifierTools) {
@@ -133,7 +133,7 @@ func TestTemplateDigestCoversResolvedExecutionContract(t *testing.T) {
 	base := Template{
 		Description: "description", Capabilities: []string{"a", "b"},
 		Tools: []string{"read_file", "run_shell"}, Model: "model-a", SystemPrompt: "prompt",
-		Limits: Limits{TaskMaxRetries: 2, EnforceCompactTokenThreshold: 3, MaxReplicas: 5},
+		Limits: Limits{TaskMaxRetries: 2, MaxReplicas: 5},
 	}
 	baseDigest, err := templateDigest(base)
 	if err != nil {
@@ -141,14 +141,13 @@ func TestTemplateDigestCoversResolvedExecutionContract(t *testing.T) {
 	}
 
 	mutations := map[string]func(*Template){
-		"description":       func(v *Template) { v.Description = "changed" },
-		"capabilities":      func(v *Template) { v.Capabilities = []string{"changed"} },
-		"tools":             func(v *Template) { v.Tools = []string{"read_file"} },
-		"model":             func(v *Template) { v.Model = "model-b" },
-		"prompt":            func(v *Template) { v.SystemPrompt = "changed" },
-		"task retries":      func(v *Template) { v.TaskMaxRetries++ },
-		"compact threshold": func(v *Template) { v.EnforceCompactTokenThreshold++ },
-		"maximum replicas":  func(v *Template) { v.MaxReplicas++ },
+		"description":      func(v *Template) { v.Description = "changed" },
+		"capabilities":     func(v *Template) { v.Capabilities = []string{"changed"} },
+		"tools":            func(v *Template) { v.Tools = []string{"read_file"} },
+		"model":            func(v *Template) { v.Model = "model-b" },
+		"prompt":           func(v *Template) { v.SystemPrompt = "changed" },
+		"task retries":     func(v *Template) { v.TaskMaxRetries++ },
+		"maximum replicas": func(v *Template) { v.MaxReplicas++ },
 	}
 	for name, mutate := range mutations {
 		name, mutate := name, mutate

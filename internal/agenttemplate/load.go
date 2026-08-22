@@ -61,9 +61,8 @@ type unresolvedLimits struct {
 }
 
 var defaultLimits = Limits{
-	TaskMaxRetries:               3,
-	EnforceCompactTokenThreshold: 4000,
-	MaxReplicas:                  4,
+	TaskMaxRetries: 3,
+	MaxReplicas:    4,
 }
 
 // Tools that can mutate or finalize the DAG/control plane are never grantable
@@ -355,6 +354,9 @@ func resolveLimits(in unresolvedLimits) (Limits, error) {
 	if in.ContextLimit != nil {
 		return Limits{}, fmt.Errorf("limits.context_limit was removed in V6: context fitting is handled by history compaction and overflow retry, not a fixed hard cap; delete this field from the template")
 	}
+	if in.EnforceCompactTokenThreshold != nil {
+		return Limits{}, fmt.Errorf("limits.enforce_compact_token_threshold was removed: Context v3 derives replay projection from current Snapshot pressure and preserves Raw History; delete this field from the template")
+	}
 	out := defaultLimits
 	values := []struct {
 		name     string
@@ -362,7 +364,6 @@ func resolveLimits(in unresolvedLimits) (Limits, error) {
 		value    *int
 	}{
 		{"limits.task_max_retries", in.TaskMaxRetries, &out.TaskMaxRetries},
-		{"limits.enforce_compact_token_threshold", in.EnforceCompactTokenThreshold, &out.EnforceCompactTokenThreshold},
 		{"limits.max_replicas", in.MaxReplicas, &out.MaxReplicas},
 	}
 	for _, item := range values {
@@ -379,9 +380,8 @@ func resolveLimits(in unresolvedLimits) (Limits, error) {
 
 func fixedLimits(in Limits) unresolvedLimits {
 	return unresolvedLimits{
-		TaskMaxRetries:               intPtr(in.TaskMaxRetries),
-		EnforceCompactTokenThreshold: intPtr(in.EnforceCompactTokenThreshold),
-		MaxReplicas:                  intPtr(in.MaxReplicas),
+		TaskMaxRetries: intPtr(in.TaskMaxRetries),
+		MaxReplicas:    intPtr(in.MaxReplicas),
 	}
 }
 

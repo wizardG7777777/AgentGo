@@ -37,7 +37,6 @@ tools: [read_file]
 system_prompt_file: prompt.md
 limits:
   task_max_retries: 1
-  enforce_compact_token_threshold: 2500
   max_replicas: 3
 `)
 
@@ -61,7 +60,7 @@ limits:
 	if writer.Namespace != NamespaceUser || writer.Model != "custom-model" || writer.MaxReplicas != 2 {
 		t.Fatalf("writer metadata = %#v", writer)
 	}
-	if writer.TaskMaxRetries != defaultLimits.TaskMaxRetries || writer.EnforceCompactTokenThreshold != defaultLimits.EnforceCompactTokenThreshold {
+	if writer.TaskMaxRetries != defaultLimits.TaskMaxRetries {
 		t.Fatalf("writer defaults not applied: %#v", writer.Limits)
 	}
 
@@ -72,7 +71,7 @@ limits:
 	if auditor.SystemPrompt != "Prompt loaded from a file.\n" {
 		t.Fatalf("resolved prompt = %q", auditor.SystemPrompt)
 	}
-	if auditor.TaskMaxRetries != 1 || auditor.EnforceCompactTokenThreshold != 2500 || !filepath.IsAbs(auditor.SourceFile) {
+	if auditor.TaskMaxRetries != 1 || !filepath.IsAbs(auditor.SourceFile) {
 		t.Fatalf("auditor metadata = %#v", auditor)
 	}
 
@@ -429,6 +428,24 @@ limits:
 	_, err := Load(LoadOptions{UserDirs: []string{dir}, DefaultModel: "test-model", ValidateTools: func([]string) error { return nil }})
 	if err == nil || !strings.Contains(err.Error(), "context_limit") || !strings.Contains(err.Error(), "removed in V6") {
 		t.Fatalf("Load legacy context_limit error = %v, want V6 migration diagnostic", err)
+	}
+}
+
+func TestLoadRejectsRemovedCompactTokenThreshold(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "legacy.yaml"), `
+name: legacy-compact
+version: 1
+description: Legacy compact template
+tools: [read_file]
+system_prompt: test
+limits:
+  enforce_compact_token_threshold: 4000
+`)
+	_, err := Load(LoadOptions{UserDirs: []string{dir}, DefaultModel: "test-model", ValidateTools: func([]string) error { return nil }})
+	if err == nil || !strings.Contains(err.Error(), "enforce_compact_token_threshold") || !strings.Contains(err.Error(), "was removed") {
+		t.Fatalf("legacy compact threshold 应返回迁移诊断: %v", err)
 	}
 }
 

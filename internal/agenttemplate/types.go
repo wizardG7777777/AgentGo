@@ -16,9 +16,8 @@ const (
 // that may be requested from the template.
 // V6 起不含循环上限与上下文硬限（两者均已删除，见 docs/nextUpgrade-V6.md §5/§7.4）。
 type Limits struct {
-	TaskMaxRetries               int `yaml:"task_max_retries" json:"task_max_retries"`
-	EnforceCompactTokenThreshold int `yaml:"enforce_compact_token_threshold" json:"enforce_compact_token_threshold"`
-	MaxReplicas                  int `yaml:"max_replicas" json:"max_replicas"`
+	TaskMaxRetries int `yaml:"task_max_retries" json:"task_max_retries"`
+	MaxReplicas    int `yaml:"max_replicas" json:"max_replicas"`
 }
 
 // Template is a fully resolved, validated and immutable-by-contract template.
