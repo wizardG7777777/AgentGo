@@ -9,7 +9,7 @@
 #   SWE_BASE_URL   供应商的 OpenAI 兼容端点（默认 https://openrouter.ai/api/v1）
 #   SWE_MODEL      模型名，全角色统一（默认 openai/gpt-5.6-luna）
 #   SWE_PROTOCOL   responses（新主链）或 chat_completions（显式兼容）
-#   SWE_KEY_VAR    注入密钥的环境变量名（默认 OPENROUTER_API_KEY）
+#   SWE_KEY_VAR    注入密钥的环境变量名（默认 SWE_API_KEY）
 # 本文件不落任何明文密钥。
 #
 # 评测纪律：

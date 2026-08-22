@@ -6,10 +6,11 @@ metadata、prompts、隔离 worktree 与原始运行产物；不得再维护另�
 
 环境变量：
 
-- `AGENTGO_SWE_API_KEY`：外部 provider 密钥，仅进程环境读取；
-- `SWE_BASE_URL` / `SWE_MODEL`：统一 provider/model；
+- `SWE_API_KEY`：外部 provider 密钥，仅进程环境读取（`SWE_KEY_VAR` 可换变量名）；
+- `SWE_BASE_URL` / `SWE_MODEL` / `SWE_PROTOCOL`：统一 provider/model/协议；
 - `SWE_TESTBED`：默认 `/tmp/agentgo-swe`；
-- `SWE_TASKS_FILE` / `SWE_PROMPT_DIR` / `SWE_FLASK_REPO`：外部题目数据位置。
+- `SWE_TASKS_FILE` / `SWE_PROMPT_DIR` / `SWE_FLASK_REPO`：外部题目数据位置；
+- `SWE_AGENTGO_ROOT` / `SWE_AGENTGO_BIN`：AgentGo 仓库根与二进制位置（默认取仓库内构建产物）。
 
 单题：
 
