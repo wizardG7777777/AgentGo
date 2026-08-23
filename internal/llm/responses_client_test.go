@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -42,7 +43,7 @@ func TestResponsesClientFunctionCallUsesTypedEnvelope(t *testing.T) {
 	defer server.Close()
 
 	client := NewSDKClientWithConfig(server.URL, "key", "gpt-test", "", 30*time.Second, ClientConfig{
-		Protocol: ProtocolResponses, ForcedToolName: "list_dir",
+		Protocol: ProtocolResponses, ToolChoice: invocation.ToolChoice{Mode: invocation.ToolChoiceAuto},
 	})
 	response, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "list"}}, []ToolDef{{
 		Name: "list_dir", Parameters: map[string]any{"type": "object", "properties": map[string]any{}},
@@ -63,14 +64,52 @@ func TestResponsesClientFunctionCallUsesTypedEnvelope(t *testing.T) {
 	if got := body["parallel_tool_calls"]; got != false {
 		t.Fatalf("parallel_tool_calls=%#v, want false", got)
 	}
-	choice, _ := body["tool_choice"].(map[string]any)
-	if choice["type"] != "function" || choice["name"] != "list_dir" {
+	if body["tool_choice"] != "auto" {
 		t.Fatalf("tool_choice=%#v", body["tool_choice"])
 	}
 	tools, _ := body["tools"].([]any)
 	tool, _ := tools[0].(map[string]any)
 	if tool["strict"] != false {
 		t.Fatalf("tool strict=%#v, want false", tool["strict"])
+	}
+}
+
+func TestResponsesContextBindingOverridesReasoningForExactSubmit(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(responsesFixture([]map[string]any{{
+			"type": "function_call", "id": "fc-submit", "call_id": "call-submit", "status": "completed",
+			"name": "submit_task_result", "arguments": `{"status":"completed","summary":"done"}`,
+		}}))
+	}))
+	defer server.Close()
+	binding := invocation.ContextBinding{
+		Schema: invocation.ContextBindingSchemaV1, InvocationID: "invocation-submit",
+		ContextSnapshotID: "snapshot-submit", ContextPolicyID: "context:default/v8",
+		ToolRouterSnapshotID: "router-submit", EncodedRequestDigest: "sha256:submit",
+		OutputBudget: DefaultOutputBudget(), ReasoningEffort: "none",
+		ToolChoice: invocation.ToolChoice{Mode: invocation.ToolChoiceFunction, Name: "submit_task_result"},
+	}
+	ctx, err := invocation.WithContextBinding(context.Background(), binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := NewSDKClientWithConfig(server.URL, "key", "deepseek-v4-flash", "", 30*time.Second, ClientConfig{
+		Protocol: ProtocolResponses, ReasoningEffort: "low",
+	})
+	if _, err := client.Chat(ctx, []Message{{Role: "user", Content: "submit"}}, []ToolDef{{
+		Name: "submit_task_result", Parameters: map[string]any{"type": "object"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	reasoning, _ := body["reasoning"].(map[string]any)
+	choice, _ := body["tool_choice"].(map[string]any)
+	if reasoning["effort"] != "none" || choice["type"] != "function" || choice["name"] != "submit_task_result" {
+		t.Fatalf("终态提交 wire 未冻结 reasoning=none + exact submit: reasoning=%#v choice=%#v", body["reasoning"], body["tool_choice"])
 	}
 }
 
@@ -158,7 +197,8 @@ func TestResponsesReplayPreservesTypedItemsAndCallOutput(t *testing.T) {
 	defer server.Close()
 
 	rawItems, _ := json.Marshal([]json.RawMessage{
-		json.RawMessage(`{"type":"reasoning","id":"rs-1","summary":[],"encrypted_content":"opaque","status":"completed"}`),
+		json.RawMessage(`{"type":"message","id":"msg-empty","role":"assistant","content":[],"status":"completed"}`),
+		json.RawMessage(`{"type":"reasoning","id":"rs-1","summary":[],"content":[],"encrypted_content":"opaque","status":"completed"}`),
 		json.RawMessage(`{"type":"function_call","id":"fc-1","call_id":"call-1","name":"list_dir","arguments":"{}","status":"completed"}`),
 	})
 	client := NewSDKClientWithConfig(server.URL, "key", "gpt-test", "", 30*time.Second, ClientConfig{Protocol: ProtocolResponses})
@@ -181,9 +221,21 @@ func TestResponsesReplayPreservesTypedItemsAndCallOutput(t *testing.T) {
 		}
 		types = append(types, itemType)
 	}
-	want := []string{"message", "reasoning", "function_call", "function_call_output"}
+	want := []string{"message", "message", "reasoning", "function_call", "function_call_output"}
 	if fmt.Sprint(types) != fmt.Sprint(want) {
 		t.Fatalf("input types=%v, want %v", types, want)
+	}
+	for index, field := range []string{"content", "summary", "content"} {
+		itemIndex := 1
+		if index > 0 {
+			itemIndex = 2
+		}
+		item, _ := input[itemIndex].(map[string]any)
+		value, present := item[field]
+		list, isList := value.([]any)
+		if !present || !isList || len(list) != 0 {
+			t.Fatalf("input[%d].%s=%#v present=%v，应原样保留空 required 集合", itemIndex, field, value, present)
+		}
 	}
 }
 
@@ -202,5 +254,135 @@ func TestResponsesRejectsUnknownOutputItemBeforeDispatch(t *testing.T) {
 	failure, ok := invocation.FromError(err)
 	if !ok || failure.Kind != invocation.FailureMalformedResponse {
 		t.Fatalf("failure=%+v err=%v", failure, err)
+	}
+}
+
+// 该测试只在显式授权的外部回归中运行，用 DeepSeek 官方 Responses 端点钉住
+// “空 message content + function_call + function_call_output”的真实无状态重放。
+func TestDeepSeekLiveResponsesReplayPreservesEmptyMessageContent(t *testing.T) {
+	if os.Getenv("AGENTGO_LIVE_DEEPSEEK") != "1" {
+		t.Skip("仅在显式外部 DeepSeek 协议回归中运行")
+	}
+	baseURL, apiKey, model := os.Getenv("SWE_BASE_URL"), os.Getenv("SWE_API_KEY"), os.Getenv("SWE_MODEL")
+	if baseURL == "" || apiKey == "" {
+		t.Fatal("SWE_BASE_URL/SWE_API_KEY 未设置")
+	}
+	if model != "deepseek-v4-flash" {
+		t.Fatalf("外部协议回归只允许 deepseek-v4-flash，当前=%q", model)
+	}
+	tool := ToolDef{
+		Name: "agentgo_live_replay_probe", Description: "Return the required nonce.",
+		Parameters: map[string]any{
+			"type": "object", "additionalProperties": false,
+			"properties": map[string]any{"nonce": map[string]any{"type": "string", "const": "live-replay"}},
+			"required":   []any{"nonce"},
+		},
+	}
+	first := NewSDKClientWithConfig(baseURL, apiKey, model, "", 60*time.Second, ClientConfig{
+		Protocol: ProtocolResponses, Stream: true, ReasoningEffort: "low",
+		ToolChoice: invocation.ToolChoice{Mode: invocation.ToolChoiceAuto},
+	})
+	firstResponse, err := first.Chat(context.Background(), []Message{{
+		Role: "user", Content: "Call the required function exactly once with nonce live-replay.",
+	}}, []ToolDef{tool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstResponse.ToolCalls) != 1 || firstResponse.ToolCalls[0].Name != tool.Name {
+		t.Fatalf("首轮未形成唯一目标工具调用: %+v", firstResponse.ToolCalls)
+	}
+	carrier := firstResponse.ExtraFields[ResponsesOutputItemsExtraField()]
+	var rawItems []json.RawMessage
+	if err := json.Unmarshal(carrier, &rawItems); err != nil || len(rawItems) == 0 {
+		t.Fatalf("首轮 typed carrier 无效: items=%d err=%v", len(rawItems), err)
+	}
+	rawItems = append([]json.RawMessage{json.RawMessage(
+		`{"type":"message","id":"msg-agentgo-empty","role":"assistant","content":[],"status":"completed"}`,
+	)}, rawItems...)
+	carrier, err = json.Marshal(rawItems)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay := NewSDKClientWithConfig(baseURL, apiKey, model, "", 60*time.Second, ClientConfig{
+		Protocol: ProtocolResponses, Stream: true, ReasoningEffort: "low",
+	})
+	secondResponse, err := replay.Chat(context.Background(), []Message{
+		{Role: "user", Content: "Call the required function exactly once with nonce live-replay."},
+		{Role: "assistant", Content: firstResponse.Content, ToolCalls: firstResponse.ToolCalls,
+			ExtraFields: map[string]json.RawMessage{ResponsesOutputItemsExtraField(): carrier}},
+		{Role: "tool", ToolCallID: firstResponse.ToolCalls[0].ID, Content: "live-replay-ok"},
+	}, []ToolDef{tool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondResponse.FinishReason != FinishReasonStop || len(secondResponse.ToolCalls) != 0 {
+		t.Fatalf("第二轮未形成文本终态: finish=%s calls=%d", secondResponse.FinishReason, len(secondResponse.ToolCalls))
+	}
+}
+
+func TestDeepSeekLiveDeliverableOverrideEscapesHistoricalTools(t *testing.T) {
+	if os.Getenv("AGENTGO_LIVE_DEEPSEEK") != "1" {
+		t.Skip("仅在显式外部 DeepSeek 协议回归中运行")
+	}
+	baseURL, apiKey, model := os.Getenv("SWE_BASE_URL"), os.Getenv("SWE_API_KEY"), os.Getenv("SWE_MODEL")
+	if baseURL == "" || apiKey == "" || model != "deepseek-v4-flash" {
+		t.Fatal("需要真实 deepseek-v4-flash 的 SWE_BASE_URL/SWE_API_KEY/SWE_MODEL")
+	}
+	readTool := ToolDef{
+		Name: "read_file", Description: "Read one file.",
+		Parameters: map[string]any{
+			"type": "object", "additionalProperties": false,
+			"properties": map[string]any{"path": map[string]any{"type": "string", "const": "README.md"}},
+			"required":   []any{"path"},
+		},
+	}
+	first := NewSDKClientWithConfig(baseURL, apiKey, model, "", 60*time.Second, ClientConfig{
+		Protocol: ProtocolResponses, Stream: true, ReasoningEffort: "low",
+		ToolChoice: invocation.ToolChoice{Mode: invocation.ToolChoiceAuto},
+	})
+	firstResponse, err := first.Chat(context.Background(), []Message{{
+		Role: "user", Content: "Call read_file once for README.md. Do not answer with text.",
+	}}, []ToolDef{readTool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstResponse.ToolCalls) == 0 {
+		t.Fatalf("首轮未形成 read_file: %+v", firstResponse)
+	}
+	messages := []Message{
+		{Role: "user", Content: "Call read_file once for README.md. Do not answer with text."},
+		{Role: "assistant", Content: firstResponse.Content, ToolCalls: firstResponse.ToolCalls,
+			ExtraFields: firstResponse.ExtraFields},
+	}
+	for _, call := range firstResponse.ToolCalls {
+		messages = append(messages, Message{Role: "tool", ToolCallID: call.ID, Content: "README content observed"})
+	}
+	messages = append(messages, Message{Role: "user", Content: "Now submit the final task result."})
+	submitTool := ToolDef{
+		Name: "submit_task_result", Description: "Submit the terminal task result.",
+		Parameters: map[string]any{
+			"type": "object", "additionalProperties": false,
+			"properties": map[string]any{
+				"status":  map[string]any{"type": "string", "const": "completed"},
+				"summary": map[string]any{"type": "string"},
+			},
+			"required": []any{"status", "summary"},
+		},
+	}
+	deliver := NewSDKClientWithConfig(baseURL, apiKey, model, "", 60*time.Second, ClientConfig{
+		Protocol: ProtocolResponses, Stream: true, ReasoningEffort: "none",
+		ToolChoice: invocation.ToolChoice{Mode: invocation.ToolChoiceFunction, Name: submitTool.Name},
+	})
+	response, err := deliver.Chat(context.Background(), messages, []ToolDef{submitTool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.ToolCalls) == 0 {
+		t.Fatalf("终态轮未返回 submit_task_result: %+v", response)
+	}
+	for _, call := range response.ToolCalls {
+		if call.Name != submitTool.Name {
+			t.Fatalf("none+exact 未逃离历史工具偏好: %+v", response.ToolCalls)
+		}
 	}
 }

@@ -104,11 +104,11 @@ def probe_request(model: str, probe_name: str, nonce: str, protocol: str) -> dic
         return {
             "model": model,
             "input": f"Call the required function exactly once with nonce {nonce}.",
-            # thinking 模式会拒绝 forced tool_choice（DeepSeek 实测 HTTP 400），
-            # 探针只验证 typed function-call 能力，显式关闭 reasoning。
-            "reasoning": {"effort": "none"},
+            # 真实验证 thinking + auto-singleton；DeepSeek thinking 会拒绝
+            # exact/required choice，但 auto 仍必须返回下方 typed nonce call。
+            "reasoning": {"effort": "low"},
             "tools": [tool],
-            "tool_choice": {"type": "function", "name": probe_name},
+            "tool_choice": "auto",
             "max_output_tokens": 256,
             "stream": False,
         }
@@ -124,7 +124,8 @@ def probe_request(model: str, probe_name: str, nonce: str, protocol: str) -> dic
                 key: value for key, value in tool.items() if key != "type"
             },
         }],
-        "tool_choice": {"type": "function", "function": {"name": probe_name}},
+        "tool_choice": "auto",
+        "reasoning_effort": "low",
         "max_tokens": 256,
         "stream": False,
     }
@@ -138,18 +139,18 @@ def validate_probe_response(payload: dict, probe_name: str = PROBE_NAME,
         output = payload.get("output")
         calls = [item for item in output if isinstance(item, dict) and item.get("type") == "function_call"] \
             if isinstance(output, list) else []
-        if len(calls) != 1:
-            return False, f"function_call item 数量={len(calls)}，期望 1"
-        call = calls[0]
-        if call.get("name") != probe_name or not call.get("call_id"):
-            return False, "function_call name/call_id 不匹配"
-        raw_args = call.get("arguments")
-        try:
-            arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-        except json.JSONDecodeError:
-            return False, "工具参数不是合法 JSON"
-        if arguments != {"nonce": nonce}:
-            return False, "工具参数未逐值回传必填 nonce"
+        if not calls:
+            return False, "function_call item 数量=0，期望至少 1"
+        for call in calls:
+            if call.get("name") != probe_name or not call.get("call_id"):
+                return False, "function_call name/call_id 不匹配"
+            raw_args = call.get("arguments")
+            try:
+                arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except json.JSONDecodeError:
+                return False, "工具参数不是合法 JSON"
+            if arguments != {"nonce": nonce}:
+                return False, "工具参数未逐值回传必填 nonce"
         return True, "ok"
     choices = payload.get("choices") if isinstance(payload, dict) else None
     if not isinstance(choices, list) or len(choices) != 1:
@@ -159,19 +160,20 @@ def validate_probe_response(payload: dict, probe_name: str = PROBE_NAME,
         return False, f"finish_reason={choice.get('finish_reason')!r}，期望 tool_calls"
     message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
     calls = message.get("tool_calls")
-    if not isinstance(calls, list) or len(calls) != 1:
-        return False, f"tool_calls 数量={len(calls) if isinstance(calls, list) else 0}，期望 1"
-    call = calls[0] if isinstance(calls[0], dict) else {}
-    function = call.get("function") if isinstance(call.get("function"), dict) else {}
-    if function.get("name") != probe_name:
-        return False, f"工具名={function.get('name')!r}，期望 {probe_name}"
-    raw_args = function.get("arguments")
-    try:
-        arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-    except json.JSONDecodeError:
-        return False, "工具参数不是合法 JSON"
-    if arguments != {"nonce": nonce}:
-        return False, "工具参数未逐值回传必填 nonce"
+    if not isinstance(calls, list) or not calls:
+        return False, "tool_calls 数量=0，期望至少 1"
+    for call in calls:
+        call = call if isinstance(call, dict) else {}
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        if function.get("name") != probe_name:
+            return False, f"工具名={function.get('name')!r}，期望 {probe_name}"
+        raw_args = function.get("arguments")
+        try:
+            arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except json.JSONDecodeError:
+            return False, "工具参数不是合法 JSON"
+        if arguments != {"nonce": nonce}:
+            return False, "工具参数未逐值回传必填 nonce"
     return True, "ok"
 
 
@@ -387,8 +389,30 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
     failures = collections.Counter(
         event.get("failure_kind") for event in llm_ends if event.get("failure_kind")
     )
+    # Provider 返回多个 tool calls 本身不再是事故：机械阶段会只 dispatch
+    # 首个并为其余 call_id 写 skipped result，final-report 则允许串行执行多个
+    # 只读调用。真正的回归是“非 final-report 的 Scheduler 单动作阶段实际
+    # dispatch 了多个工具”。phase 来自冻结 Context manifest，而不是正文猜测。
+    scheduler_phases = {}
+    for event in events:
+        if event.get("kind") != "context_manifest_built" or event.get("task_id") not in scheduler_task_ids:
+            continue
+        try:
+            manifest = json.loads(event.get("description") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            manifest = []
+        for fragment in manifest if isinstance(manifest, list) else []:
+            source_ref = fragment.get("source_ref", "") if isinstance(fragment, dict) else ""
+            if source_ref.startswith("prompt-phase:"):
+                scheduler_phases[event.get("turn_id", "")] = source_ref.removeprefix("prompt-phase:")
+                break
+    dispatched_by_turn = collections.Counter(
+        event.get("turn_id", "") for event in events
+        if event.get("kind") == "tool_call" and event.get("task_id") in scheduler_task_ids
+    )
     scheduler_batches = [
-        event for event in scheduler_ends if int(event.get("tool_calls_count") or 0) > 1
+        turn_id for turn_id, count in dispatched_by_turn.items()
+        if count > 1 and scheduler_phases.get(turn_id) != "scheduler:final-report"
     ]
     create_calls = [
         event for event in events
@@ -402,6 +426,14 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
     error_text = "\n".join(str(event.get("error", "")) for event in events if event.get("error"))
     known = {
         "fragment_limit_exceeded": "fragment_limit_exceeded" in error_text,
+        # provider 400 表示冻结请求 wire 本身不合法，属于 Invocation/Context
+        # 架构事故，不能因为 Graph 正常进入 failed 终态就计为 architecture_ok。
+        "provider_invalid_request": any(
+            event.get("failure_kind") == "invalid_request" for event in llm_ends
+        ),
+        "invocation_output_limit_exceeded": any(
+            event.get("failure_kind") == "output_limit_exceeded" for event in llm_ends
+        ),
         "premature_attempt_exhaustion": "attempt" in error_text.lower() and "exhaust" in error_text.lower(),
         "invalid_recovery_deadline": "recovery" in error_text.lower() and "deadline" in error_text.lower() and "invalid" in error_text.lower(),
         "scheduler_tool_batch_exceeded": bool(scheduler_batches),

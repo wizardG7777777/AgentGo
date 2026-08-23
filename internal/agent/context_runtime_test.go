@@ -338,6 +338,25 @@ func TestLLMExecutorPersistsLargeToolResultBeforeHistoryProjection(t *testing.T)
 	}
 }
 
+func TestExternalizedToolResultEnvelopeStaysBelowFragmentCapAfterJSONEscaping(t *testing.T) {
+	runtime := newAgentTestContextRuntime(t)
+	task := replayGateTask("task-escaped-tool-result", []string{"large_output"})
+	raw := strings.Repeat(`{"quoted":"\\path\\value"}`+"\n", 4096)
+	result, err := runtime.externalizeToolResult(context.Background(), task,
+		llm.ToolCall{ID: "large", Name: "large_output"}, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len([]byte(result)) >= 48<<10 {
+		t.Fatalf("转义后 envelope=%dB 不得超过 L2 tool-result fragment cap", len([]byte(result)))
+	}
+	var envelope toolResultReferenceEnvelope
+	if err := json.Unmarshal([]byte(result), &envelope); err != nil || envelope.RefID == "" ||
+		envelope.OriginalBytes != len([]byte(raw)) {
+		t.Fatalf("外部化 envelope 不完整: %+v err=%v", envelope, err)
+	}
+}
+
 func replayGateTask(id string, tools []string) *model.Task {
 	now := time.Now().UTC()
 	return &model.Task{

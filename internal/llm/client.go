@@ -46,6 +46,9 @@ type ToolDef struct {
 	Name        string
 	Description string
 	Parameters  map[string]any // JSON Schema
+	// Strict 只在 schema 已经满足 provider strict 子集时开启。普通
+	// AgentGo 工具保持 false；启动 nonce capability probe 使用 true。
+	Strict bool
 }
 
 // ToolCall 是 LLM 返回的结构化工具调用请求。
@@ -138,12 +141,41 @@ type ClientConfig struct {
 	Protocol        Protocol
 	ReasoningEffort string
 	Stream          bool
-	// ForcedToolName 只用于能力探针等机械协议调用；普通 Agent 留空并由模型
-	// 按冻结 ToolRouter 自主选择。非空时 wire 使用 exact function tool_choice。
-	ForcedToolName string
+	// ToolChoice 只用于启动能力探针等无 ContextBinding 的机械协议调用。
+	// 生产 Agent 由冻结 ContextBinding 覆盖它；探针使用 auto + 单工具，
+	// 避免 thinking provider 拒绝 exact/required tool_choice。
+	ToolChoice invocation.ToolChoice
 	// OutputBudget 是单次响应的冻结硬上限。零值使用 Model Invocation 的版本化
 	// 安全默认值，不能解释为无限。
 	OutputBudget invocation.OutputBudget
+}
+
+// effectiveToolChoice 把生产 ContextBinding 视为最高权威；ClientConfig
+// 只服务于启动探针等显式 legacy 入口。空值等价于 auto。
+func effectiveToolChoice(ctx context.Context, configured invocation.ToolChoice) invocation.ToolChoice {
+	if binding, ok := invocation.ContextBindingFrom(ctx); ok && binding.ToolChoice.Mode != "" {
+		return binding.ToolChoice
+	}
+	if configured.Mode != "" {
+		return configured
+	}
+	return invocation.ToolChoice{Mode: invocation.ToolChoiceAuto}
+}
+
+func effectiveReasoningEffort(ctx context.Context, configured string) string {
+	if binding, ok := invocation.ContextBindingFrom(ctx); ok && binding.ReasoningEffort != "" {
+		return binding.ReasoningEffort
+	}
+	return configured
+}
+
+func hasToolDefinition(tools []ToolDef, name string) bool {
+	for _, tool := range tools {
+		if tool.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // SDKClient 通过 openai-go 官方 SDK 实现 Client 接口。生产请求 protocol 在
@@ -213,11 +245,11 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 	if m := modelOverrideFromContext(ctx); m != "" {
 		params.Model = openai.ChatModel(m)
 	}
-	if c.request.ReasoningEffort != "" {
+	if reasoningEffort := effectiveReasoningEffort(ctx, c.request.ReasoningEffort); reasoningEffort != "" {
 		// ReasoningEffort is a string-backed SDK type. Casting keeps AgentGo
 		// aligned with newly documented OpenAI values (for example "max") even
 		// when the generated SDK constants lag the API specification.
-		params.ReasoningEffort = shared.ReasoningEffort(c.request.ReasoningEffort)
+		params.ReasoningEffort = shared.ReasoningEffort(reasoningEffort)
 	}
 
 	// 插入 system prompt（使用 system 角色以兼容 Dashscope 等非 OpenAI 后端）
@@ -240,49 +272,32 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 			OfFunction: &openai.ChatCompletionFunctionToolParam{
 				Function: shared.FunctionDefinitionParam{
 					Name:        t.Name,
+					Strict:      openai.Bool(t.Strict),
 					Description: openai.String(t.Description),
 					Parameters:  shared.FunctionParameters(t.Parameters),
 				},
 			},
 		})
 	}
-	if c.request.ForcedToolName != "" {
-		found := false
-		for _, tool := range tools {
-			if tool.Name == c.request.ForcedToolName {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return Response{}, fmt.Errorf("forced tool_choice=%q 不在本次 ToolRouter 定义中", c.request.ForcedToolName)
-		}
-		params.ToolChoice = openai.ToolChoiceOptionFunctionToolChoice(
-			openai.ChatCompletionNamedToolChoiceFunctionParam{Name: c.request.ForcedToolName})
+	toolChoice := effectiveToolChoice(ctx, c.request.ToolChoice)
+	if err := toolChoice.Validate(); err != nil {
+		return Response{}, fmt.Errorf("tool_choice 无效: %w", err)
 	}
-	if binding, ok := invocation.ContextBindingFrom(ctx); ok && binding.ToolChoice.Mode != "" &&
-		binding.ToolChoice.Mode != invocation.ToolChoiceAuto {
+	if toolChoice.Mode != invocation.ToolChoiceAuto {
 		if len(tools) == 0 {
-			return Response{}, fmt.Errorf("tool_choice=%s 但本次 ToolRouter 为空", binding.ToolChoice.Mode)
+			return Response{}, fmt.Errorf("tool_choice=%s 但本次 ToolRouter 为空", toolChoice.Mode)
 		}
-		switch binding.ToolChoice.Mode {
+		switch toolChoice.Mode {
 		case invocation.ToolChoiceRequired:
 			params.ToolChoice = openai.ChatCompletionToolChoiceOptionUnionParam{
 				OfAuto: openai.String(string(openai.ChatCompletionToolChoiceOptionAutoRequired)),
 			}
 		case invocation.ToolChoiceFunction:
-			found := false
-			for _, tool := range tools {
-				if tool.Name == binding.ToolChoice.Name {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return Response{}, fmt.Errorf("ContextBinding forced tool_choice=%q 不在本次 ToolRouter 定义中", binding.ToolChoice.Name)
+			if !hasToolDefinition(tools, toolChoice.Name) {
+				return Response{}, fmt.Errorf("forced tool_choice=%q 不在本次 ToolRouter 定义中", toolChoice.Name)
 			}
 			params.ToolChoice = openai.ToolChoiceOptionFunctionToolChoice(
-				openai.ChatCompletionNamedToolChoiceFunctionParam{Name: binding.ToolChoice.Name})
+				openai.ChatCompletionNamedToolChoiceFunctionParam{Name: toolChoice.Name})
 		}
 	}
 

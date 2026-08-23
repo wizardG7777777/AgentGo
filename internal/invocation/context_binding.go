@@ -61,6 +61,10 @@ type ContextBinding struct {
 	EncodedRequestDigest string       `json:"encoded_request_digest"`
 	OutputBudget         OutputBudget `json:"output_budget"`
 	ToolChoice           ToolChoice   `json:"tool_choice,omitempty"`
+	// ReasoningEffort 是本次 Invocation 的显式 wire override。空值使用
+	// 全局模型配置；机械终态提交可冻结 none，避免 thinking provider
+	// 拒绝 exact tool choice，不影响前面业务轮次的 thinking。
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 func (b ContextBinding) Validate() error {
@@ -90,6 +94,18 @@ func (b ContextBinding) Validate() error {
 	}
 	if err := b.ToolChoice.Validate(); err != nil {
 		return err
+	}
+	if b.ReasoningEffort != "" {
+		valid := false
+		for _, value := range []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"} {
+			if b.ReasoningEffort == value {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			return fmt.Errorf("Invocation reasoning_effort=%q 无效", b.ReasoningEffort)
+		}
 	}
 	return nil
 }

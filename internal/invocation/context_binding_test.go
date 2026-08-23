@@ -54,6 +54,22 @@ func TestToolChoiceValidationIsClosed(t *testing.T) {
 	}
 }
 
+func TestContextBindingReasoningEffortOverrideIsClosed(t *testing.T) {
+	binding := ContextBinding{
+		Schema: ContextBindingSchemaV1, InvocationID: "invocation-reasoning",
+		ContextSnapshotID: "snapshot-1", ContextPolicyID: "context:default/v8",
+		ToolRouterSnapshotID: "tool-router-1", EncodedRequestDigest: "sha256:request",
+		OutputBudget: testBindingOutputBudget(), ReasoningEffort: "none",
+	}
+	if err := binding.Validate(); err != nil {
+		t.Fatalf("合法的 per-invocation reasoning override 被拒绝: %v", err)
+	}
+	binding.ReasoningEffort = "ultra"
+	if err := binding.Validate(); err == nil {
+		t.Fatal("未知 reasoning override 不得进入 provider wire")
+	}
+}
+
 func testBindingOutputBudget() OutputBudget {
 	return OutputBudget{
 		MaxContentBytes: 100, MaxReasoningBytes: 100, MaxExtraFieldBytes: 100,

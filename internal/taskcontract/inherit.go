@@ -87,7 +87,7 @@ func Inherit(parent, child *model.Task, workClass loopcontract.WorkClass) error 
 func progressRefFor(workClass loopcontract.WorkClass) (string, error) {
 	switch workClass {
 	case loopcontract.WorkCodeChange:
-		return policycatalog.ProgressCodeChangeV1, nil
+		return policycatalog.ProgressCodeChangeCurrent, nil
 	case loopcontract.WorkInvestigation:
 		return policycatalog.ProgressInvestigationV1, nil
 	case loopcontract.WorkVerification:

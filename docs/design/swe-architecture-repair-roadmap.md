@@ -36,7 +36,7 @@ Store、桥接字符串和不同 deadline 口径。
 | Invocation | Responses typed-item 主链已接入 | 显式 protocol；message/reasoning/function_call 信封；ContextBinding OutputBudget；required-nonce probe；partial no-dispatch | 外部 provider 多 rollout；Chat compatibility 退出 |
 | L2 Context | Context v8/Replay v3 production default | v1–v7 digest 保留、Responses `assistant_response_items` RequiredExact carrier、32K completion、92K input、bounded runtime snapshot | 真实 tokenizer 与 provider matrix |
 | L3 Harness | versioned harness 与 Scheduler capability contract 已闭合 | 仓库脚本、真实双层 probe、RunContract、typed terminal、安全 snapshot、完整 ToolResult ContentStore | 外部 provider 多样性 |
-| L4 Loop | SWE-016/017/023/028 边界已修复 | 6 Attempts、唯一 Deadline Compiler、Invocation failure 中性进展、typed intervention scope、exploration→exact deliverable phase | 多题 recovery rollout |
+| L4 Loop | SWE-016/017/023/028/032 边界已修复 | 6 Attempts、唯一 Deadline Compiler、Invocation failure 中性进展、typed intervention scope、exploration→auto-singleton + L3 required-action deliverable phase、code-change/v3 4/10/18/24 阈值 | 多题 recovery rollout |
 | L5 Graph | simple/current transaction 与 typed Context data port 已接入 | framework-owned simple Graph、零参数 validate/commit/start、Task.ContextInputs、typed outcome/outbox | generation/correlation token 仍不开放；legacy 仍待退役 |
 | Docs / issue ledger | 已建立，持续同步 | 五层规范、正式设计、路线图、第5/6轮及 Responses 单题总账 | 只按各问题 closure matrix 关闭 SWE-011～028 |
 
@@ -73,15 +73,19 @@ Store、桥接字符串和不同 deadline 口径。
   focused race tests；Mailbox Run/Session 分区、定向 wake/claim/drain/ACK、steer
   与 Trace Session correlation tests；
 - `go test ./...`、`go test -race ./...`、`go vet ./...`、`go build -o agentgo .`；
-- 仓库 SWE harness 14项 Python 单测、`git diff --check`；
+- 仓库 SWE harness 18 项 Python 单测、`git diff --check`；
 - 真实二进制 startup function-call probe、RunContract 注入、Graph
   Draft/Definition/StartIntent/typed outcome 与 TaskOutcome delivery ACK。
 
-第六轮 DeepSeek 8题为0/8；Responses cutover 后最新 `automatic-options` 新 Run 已
-同时通过双门：`architecture_ok=true`、`task_resolved=true`、首轮2205 tokens、
-GraphDraft call index=1、typed success、Graph TaskOutcome 全 ACK、known incidents=0、
-Judge 494 passed。证据见
-[`Responses 主链与单题成功`](../test-issues/2026-08-23-0109-responses-mainline-and-single-task-success.md)。
+第六轮 DeepSeek 8题为0/8；Responses cutover 与 SWE-029…032 修复后，最终
+冻结二进制的真实 `deepseek-v4-flash` thinking 完整批次达到
+`architecture_ok=8/8`、Judge resolved 5/8。三道未解题均 known incidents=0，
+属模型未产出补丁。受影响路径独立
+复跑中 `automatic-options` 494/494、`ipv6-server-name` 493/493、
+`teardown-callbacks` 495/495、`session-access-tracking` 490/490，均 typed success
+且 TaskOutcome 全 ACK。证据见
+[`Responses 主链与单题成功`](../test-issues/2026-08-23-0109-responses-mainline-and-single-task-success.md)
+与 [`DeepSeek Responses 精确重放事故`](../test-issues/2026-08-23-0500-deepseek-responses-exact-replay.md)。
 
 ## 2. 输入设计与问题映射
 
@@ -106,10 +110,13 @@ Judge 494 passed。证据见
 | SWE-022 | L2/Invocation | Context v4–v7 tokenizer/replay/completion/reasoning 预算版本化 |
 | SWE-023 | L4 Loop | Run 总预算、6 Attempts、Invocation-failure 中性进展 |
 | SWE-024 | L5 Graph | framework simple Graph 与 current-transaction cursor |
-| SWE-025 | L5 Proposal Acceptance | exact typed verdict tool 与三标量 wire contract |
+| SWE-025 | L5 Proposal Acceptance | singleton typed verdict tool 与三标量 wire contract |
 | SWE-026 | L4→L5 | intervention Graph/Node/Activation typed control scope |
 | SWE-027 | Model Invocation/L2 | Responses typed-item/SSE、required-argument probe、typed replay、正文不提升为工具 |
-| SWE-028 | L4/L3 | verification exploration 超额进入 exact submit deliverable phase，不直接 blocked |
+| SWE-028 | L4/L3 | verification exploration 超额进入 auto-singleton + L3 required-action submit phase，不直接 blocked |
+| SWE-029 | Model Invocation/L2 | DeepSeek Responses required 空字段 raw exact replay |
+| SWE-030/031 | Model Invocation/L3 | auto + singleton + L3 required-action 替代 exact/required choice；provider fan-out 只 dispatch 首个并为余下 call_id 保留 skipped result |
+| SWE-032 | L4 Loop | rollover 用尽不再提前 intervention；新 code-change Task 冻结 v3，v1/v2 保留供历史恢复 |
 
 ## 3. 实施总原则
 

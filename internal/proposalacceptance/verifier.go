@@ -161,7 +161,9 @@ func (v *Verifier) EvaluateProposal(ctx context.Context, input graph.ProposalAcc
 	if err != nil {
 		return graph.ProposalAcceptanceDecision{}, fmt.Errorf("proposal verifier Invocation binding 失败: %w", err)
 	}
-	binding.ToolChoice = invocation.ToolChoice{Mode: invocation.ToolChoiceFunction, Name: proposalVerdictToolName}
+	// DeepSeek thinking 拒绝 exact/required tool_choice。verdict ToolRouter 只暴露
+	// 一个 schema tool，wire 使用 auto，下方 response gate 仍强制至少一个 typed verdict。
+	binding.ToolChoice = invocation.ToolChoice{Mode: invocation.ToolChoiceAuto}
 
 	response, err := llm.Invoke(evalCtx, v.client, llm.InvocationRequest{
 		Binding: binding, Messages: compiled.Messages, Tools: compiled.Tools,
@@ -175,10 +177,17 @@ func (v *Verifier) EvaluateProposal(ctx context.Context, input graph.ProposalAcc
 	if evalCtx.Err() != nil {
 		return graph.ProposalAcceptanceDecision{}, context.Cause(evalCtx)
 	}
-	if response.FinishReason != llm.FinishReasonToolCalls || strings.TrimSpace(response.Content) != "" ||
-		len(response.ToolCalls) != 1 || response.ToolCalls[0].Name != proposalVerdictToolName {
-		return graph.ProposalAcceptanceDecision{}, fmt.Errorf("proposal verifier 未返回唯一 typed verdict tool call")
+	if response.FinishReason != llm.FinishReasonToolCalls || strings.TrimSpace(response.Content) != "" || len(response.ToolCalls) == 0 {
+		return graph.ProposalAcceptanceDecision{}, fmt.Errorf("proposal verifier 未返回 typed verdict tool call")
 	}
+	for index, call := range response.ToolCalls {
+		if call.Name != proposalVerdictToolName {
+			return graph.ProposalAcceptanceDecision{}, fmt.Errorf(
+				"proposal verifier tool_calls[%d]=%q，期望 %q", index, call.Name, proposalVerdictToolName)
+		}
+	}
+	// DeepSeek 等 provider 可能忽略 parallel_tool_calls=false。该调用无后续
+	// provider replay，因此按 provider 顺序只消费首个 verdict；其余调用不会 dispatch。
 	output, err := parseVerifierArguments(response.ToolCalls[0].Arguments, v.maxOutput)
 	if err != nil {
 		return graph.ProposalAcceptanceDecision{}, err

@@ -530,6 +530,11 @@ type Event struct {
 	ToolCallsCount   int    `json:"tool_calls_count,omitempty"`
 	FinishReason     string `json:"finish_reason,omitempty"`
 	DurationMS       int64  `json:"duration_ms,omitempty"`
+	// ToolChoice/Reasoning 是脱敏的 provider request 控制面，用于证明
+	// thinking 兼容降级是否真正进入 wire；不包含 prompt/参数/密钥。
+	ToolChoiceMode  string `json:"tool_choice_mode,omitempty"`
+	ToolChoiceName  string `json:"tool_choice_name,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	// Invocation failure 的稳定分类字段。Error 仅供展示，控制流不得解析它。
 	FailureKind    string `json:"failure_kind,omitempty"`
 	FailurePhase   string `json:"failure_phase,omitempty"`

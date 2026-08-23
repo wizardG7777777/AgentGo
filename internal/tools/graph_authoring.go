@@ -260,7 +260,7 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 	if input.ExecutionClass == graph.ExecutionMutating {
 		contract.RequiredEffects = []string{"file_write"}
 		workBindings.Effects = []string{"file_write"}
-		workProgress = policycatalog.ProgressCodeChangeV1
+		workProgress = policycatalog.ProgressCodeChangeCurrent
 		workTools = append(workTools, "write_file", "edit_file", "run_shell")
 	}
 

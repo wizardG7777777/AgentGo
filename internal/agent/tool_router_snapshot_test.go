@@ -2,7 +2,7 @@ package agent
 
 import (
 	"context"
-	"errors"
+	"strings"
 	"testing"
 
 	"agentgo/internal/invocation"
@@ -32,6 +32,17 @@ func TestFreezeToolRouterSnapshotBindsVisibleAndRuntimeView(t *testing.T) {
 	}
 }
 
+func TestAutoSingletonPhaseRejectsMismatchedToolRouter(t *testing.T) {
+	registry := NewToolRegistry()
+	registry.Register("read_file", "读取", map[string]any{"type": "object"},
+		func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	if _, err := FreezeToolRouterSnapshotWithPolicy(
+		registry, "scheduler:draft-create", defaultToolCallsPerResponse,
+	); err == nil || !strings.Contains(err.Error(), "auto-singleton") {
+		t.Fatalf("错误工具面不得借 required 扩大行动权: %v", err)
+	}
+}
+
 func TestSchedulerInvocationToolPolicyMovesThroughAuthoringPhases(t *testing.T) {
 	full := NewToolRegistry()
 	for _, name := range []string{
@@ -45,7 +56,7 @@ func TestSchedulerInvocationToolPolicyMovesThroughAuthoringPhases(t *testing.T) 
 	task := replayGateTask("task-phase-policy", nil)
 	task.EventType, task.EventSource, task.Description = "__scheduler__", "user", "请求"
 	initial := deriveInvocationToolPolicy(task, nil, full)
-	if initial.Phase != "scheduler:draft-create" || initial.MaxCalls != 1 ||
+	if initial.Phase != "scheduler:draft-create" || initial.MaxCalls != defaultToolCallsPerResponse ||
 		!sameExactToolSet(initial.Registry.Names(), []string{"create_graph_draft"}) {
 		t.Fatalf("初始 Scheduler phase 工具面错误: phase=%s tools=%v", initial.Phase, initial.Registry.Names())
 	}
@@ -53,8 +64,8 @@ func TestSchedulerInvocationToolPolicyMovesThroughAuthoringPhases(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if choice := invocationToolChoice(initialRouter); choice.Mode != invocation.ToolChoiceFunction || choice.Name != "create_graph_draft" {
-		t.Fatalf("draft-create 未冻结 exact ToolChoice: %+v", choice)
+	if choice := invocationToolChoice(initialRouter); choice.Mode != invocation.ToolChoiceAuto || choice.Name != "" {
+		t.Fatalf("draft-create 未冻结 auto-singleton ToolChoice: %+v", choice)
 	}
 	edited := deriveInvocationToolPolicy(task, []HistoryEntry{{
 		ToolCalls:   []llm.ToolCall{{ID: "c1", Name: "create_graph_draft"}},
@@ -68,8 +79,8 @@ func TestSchedulerInvocationToolPolicyMovesThroughAuthoringPhases(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if choice := invocationToolChoice(editedRouter); choice.Mode != invocation.ToolChoiceFunction || choice.Name != "configure_simple_graph_draft" {
-		t.Fatalf("draft-configure 未冻结 exact ToolChoice: %+v", choice)
+	if choice := invocationToolChoice(editedRouter); choice.Mode != invocation.ToolChoiceAuto || choice.Name != "" {
+		t.Fatalf("draft-configure 未冻结 auto-singleton ToolChoice: %+v", choice)
 	}
 	validate := deriveInvocationToolPolicy(task, []HistoryEntry{
 		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "create_graph_draft"}}, ToolResults: []ToolResult{{ToolCallID: "c1", Content: `{"proposal_id":"p1"}`}}},
@@ -95,7 +106,8 @@ func TestSchedulerInvocationToolPolicyMovesThroughAuthoringPhases(t *testing.T) 
 	}
 	task.EventSource = "graph-ended"
 	final := deriveInvocationToolPolicy(task, nil, full)
-	if final.Phase != "scheduler:final-report" || final.Registry.Missing([]string{"read_graph"}) != nil ||
+	if final.Phase != "scheduler:final-report" || final.MaxCalls != defaultToolCallsPerResponse ||
+		final.Registry.Missing([]string{"read_graph"}) != nil ||
 		containsToolName(final.Registry.Names(), "create_graph_draft") {
 		t.Fatalf("Final report phase 工具面错误: phase=%s tools=%v", final.Phase, final.Registry.Names())
 	}
@@ -109,7 +121,7 @@ func TestGraphDeliverablePhaseForcesSubmitTaskResult(t *testing.T) {
 	task := replayGateTask("task-deliverable", nil)
 	task.GraphID = "graph-1"
 	policy := deriveInvocationToolPolicy(task, []HistoryEntry{{SystemNotice: progressDeliverableRequiredMarker}}, full)
-	if policy.Phase != "agent:deliverable-submit" || policy.MaxCalls != 1 ||
+	if policy.Phase != "agent:deliverable-submit" || policy.MaxCalls != defaultToolCallsPerResponse ||
 		!sameExactToolSet(policy.Registry.Names(), []string{"submit_task_result"}) {
 		t.Fatalf("deliverable phase 工具面错误: phase=%s tools=%v", policy.Phase, policy.Registry.Names())
 	}
@@ -120,6 +132,32 @@ func TestGraphDeliverablePhaseForcesSubmitTaskResult(t *testing.T) {
 	choice := invocationToolChoice(router)
 	if choice.Mode != invocation.ToolChoiceFunction || choice.Name != "submit_task_result" {
 		t.Fatalf("deliverable phase 未冻结 exact submit: %+v", choice)
+	}
+}
+
+func TestDeliverableHistoryProjectionDropsHistoricalToolsButKeepsControlNotices(t *testing.T) {
+	history := []HistoryEntry{
+		{AssistantContent: "调查", ToolCalls: []llm.ToolCall{{ID: "read", Name: "read_file"}},
+			ToolResults: []ToolResult{{ToolCallID: "read", Content: "source"}}},
+		{SystemNotice: progressDeliverableRequiredMarker + " 请提交"},
+		{SystemNotice: "<loop-reminder>stop exploring</loop-reminder>",
+			ToolCalls: []llm.ToolCall{{ID: "grep", Name: "grep_search"}}},
+	}
+	projected := deliverableHistoryProjection(history)
+	if len(projected) != 2 || !strings.Contains(projected[0].SystemNotice, progressDeliverableRequiredMarker) ||
+		len(projected[0].ToolCalls) != 0 || len(projected[1].ToolCalls) != 0 ||
+		projected[0].AssistantContent != "" || projected[1].AssistantContent != "" {
+		t.Fatalf("强制交付投影不得携带历史工具偏好: %+v", projected)
+	}
+}
+
+func TestDeliverablePhasePromptRevokesHistoricalToolGuidance(t *testing.T) {
+	for _, required := range []string{
+		"only legal action", "submit_task_result", "unavailable now", "Do not answer with text",
+	} {
+		if !strings.Contains(agentDeliverablePhasePrompt, required) {
+			t.Fatalf("强制交付 phase contract 缺少 %q", required)
+		}
 	}
 }
 
@@ -136,6 +174,36 @@ func TestSchedulerPhaseDoesNotAdvanceOnFailedAuthoringTool(t *testing.T) {
 	}}, full)
 	if policy.Phase != "scheduler:draft-create" || !sameExactToolSet(policy.Registry.Names(), []string{"create_graph_draft"}) {
 		t.Fatalf("失败 create 错误推进了 phase: phase=%s tools=%v", policy.Phase, policy.Registry.Names())
+	}
+}
+
+func TestSchedulerPhaseIgnoresProviderDuplicateSkippedResult(t *testing.T) {
+	history := []HistoryEntry{
+		{
+			ToolCalls: []llm.ToolCall{{ID: "create-1", Name: "create_graph_draft"}, {ID: "create-2", Name: "create_graph_draft"}},
+			ToolResults: []ToolResult{
+				{ToolCallID: "create-1", Content: `{"proposal_id":"p1"}`},
+				{ToolCallID: "create-2", Content: "已跳过：auto-singleton 阶段只执行首个工具调用"},
+			},
+		},
+		{
+			ToolCalls: []llm.ToolCall{{ID: "configure-1", Name: "configure_simple_graph_draft"}, {ID: "configure-2", Name: "configure_simple_graph_draft"}},
+			ToolResults: []ToolResult{
+				{ToolCallID: "configure-1", Content: `{"draft_revision":2}`},
+				{ToolCallID: "configure-2", Content: "已跳过: auto-singleton duplicate"},
+			},
+		},
+		{
+			ToolCalls: []llm.ToolCall{{ID: "validate-1", Name: "validate_current_graph_draft"}, {ID: "validate-2", Name: "validate_current_graph_draft"}},
+			ToolResults: []ToolResult{
+				{ToolCallID: "validate-1", Content: `{"accepted":true}`},
+				{ToolCallID: "validate-2", Content: "已跳过：auto-singleton duplicate"},
+			},
+		},
+	}
+	phase, tools := graphAuthoringPolicy(history)
+	if phase != "scheduler:draft-commit" || !sameExactToolSet(tools, []string{"commit_current_graph_draft"}) {
+		t.Fatalf("provider duplicate skipped result 不得把 accepted Draft 退回 configure: phase=%s tools=%v", phase, tools)
 	}
 }
 
@@ -178,7 +246,7 @@ func TestLoopInterventionWakeStartsFreshAuthoringTransaction(t *testing.T) {
 	}
 }
 
-func TestSchedulerToolBatchRejectedBeforeAnyDispatch(t *testing.T) {
+func TestSchedulerAutoSingletonBatchDispatchesOnlyFirstCall(t *testing.T) {
 	runtime := newAgentTestContextRuntime(t)
 	mock := &mockLLMClient{responses: []llm.Response{{ToolCalls: []llm.ToolCall{
 		{ID: "c1", Name: "create_graph_draft", Arguments: map[string]any{}},
@@ -195,13 +263,29 @@ func TestSchedulerToolBatchRejectedBeforeAnyDispatch(t *testing.T) {
 	task := replayGateTask("task-scheduler-batch", []string{"create_graph_draft"})
 	task.EventType, task.EventSource = "__scheduler__", "user"
 	ctx := WithExecutionIdentity(context.Background(), string(task.RunID), task.AttemptID, task.AttemptID+"/turn-1")
-	_, err := executor.Execute(ctx, task, nil, nil)
-	failure, ok := invocation.FromError(err)
-	if !ok || failure.Kind != invocation.FailureMalformedResponse || !errors.Is(failure, failure.Cause) {
-		t.Fatalf("Scheduler 多动作批次未形成 malformed_response: err=%v failure=%+v", err, failure)
+	result, err := executor.Execute(ctx, task, nil, nil)
+	if err != nil {
+		t.Fatalf("auto-singleton provider fan-out 不应被拒绝: %v", err)
 	}
-	if runs != 0 {
-		t.Fatalf("批次校验失败后仍执行了 %d 个工具", runs)
+	if runs != 1 || len(result.ToolResults) != 2 ||
+		!strings.Contains(result.ToolResults[1].Content, "首个工具调用") {
+		t.Fatalf("应只 dispatch 首个并为重复 call_id 返回 skipped result: runs=%d result=%+v", runs, result)
+	}
+}
+
+func TestSchedulerAutoSingletonRejectsTextOnlyPhaseResponse(t *testing.T) {
+	router := ToolRouterSnapshot{Phase: "scheduler:draft-create", MaxCalls: defaultToolCallsPerResponse}
+	if err := validateToolCallBatch(router, nil); err == nil || !strings.Contains(err.Error(), "未返回必需") {
+		t.Fatalf("auto wire 不得让正文越过机械阶段: %v", err)
+	}
+}
+
+func TestSchedulerRecoveryAllowsProviderFanoutButKeepsSingleDispatchPolicy(t *testing.T) {
+	if !phaseDispatchesOnlyFirstTool("scheduler:recovery") || !phaseRequiresToolCall("scheduler:recovery") {
+		t.Fatal("recovery 必须要求工具调用且只 dispatch 首个")
+	}
+	if phaseDispatchesOnlyFirstTool("scheduler:final-report") {
+		t.Fatal("final-report 的纯读批次应全部串行执行")
 	}
 }
 

@@ -26,9 +26,10 @@ llm:
   default_model: __MODEL__
   protocol: __PROTOCOL__
   timeout_sec: 300
-  # DeepSeek 等 thinking-by-default 模型在 thinking 模式拒绝 forced tool_choice
-  # （Scheduler 阶段门控依赖它），评测统一关闭 reasoning。
-  reasoning_effort: none
+  # SWE 主链显式开启 reasoning。大多数机械阶段使用 auto + singleton
+  # ToolRouter + L3 required-action gate；Graph 最终交付仅在该次 invocation 覆盖为
+  # reasoning=none + exact submit_task_result，以逃离 provider 对历史工具的粘滞重放。
+  reasoning_effort: low
   stream: true
 
 tool_profiles:

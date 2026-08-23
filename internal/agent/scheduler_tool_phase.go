@@ -16,6 +16,12 @@ const defaultToolCallsPerResponse = 16
 
 const progressDeliverableRequiredMarker = "[progress-deliverable-required]"
 
+const agentDeliverablePhasePrompt = `<agent-phase name="deliverable-submit">
+This is a mechanical terminal handoff. The only legal action in this invocation is one typed submit_task_result call.
+All read, grep, list, shell, edit, web, messaging, and replan tools from earlier role instructions are unavailable now; do not emit their names even if they appeared earlier.
+Use the authoritative task objective, upstream input, output contract, and TaskMemory already present to submit completed, failed, or blocked. Do not answer with text.
+</agent-phase>`
+
 type invocationToolPolicy struct {
 	Registry *ToolRegistry
 	Phase    string
@@ -24,23 +30,60 @@ type invocationToolPolicy struct {
 
 func invocationToolChoice(router ToolRouterSnapshot) invocation.ToolChoice {
 	switch router.Phase {
-	case "scheduler:draft-create":
-		return invocation.ToolChoice{Mode: invocation.ToolChoiceFunction, Name: "create_graph_draft"}
-	case "scheduler:draft-configure":
-		return invocation.ToolChoice{Mode: invocation.ToolChoiceFunction, Name: "configure_simple_graph_draft"}
-	case "scheduler:draft-validate":
-		return invocation.ToolChoice{Mode: invocation.ToolChoiceFunction, Name: "validate_current_graph_draft"}
-	case "scheduler:draft-commit":
-		return invocation.ToolChoice{Mode: invocation.ToolChoiceFunction, Name: "commit_current_graph_draft"}
-	case "scheduler:start":
-		return invocation.ToolChoice{Mode: invocation.ToolChoiceFunction, Name: "start_current_graph"}
-	case "scheduler:draft-edit", "scheduler:recovery":
-		return invocation.ToolChoice{Mode: invocation.ToolChoiceRequired}
+	case "scheduler:draft-create", "scheduler:draft-configure", "scheduler:draft-validate",
+		"scheduler:draft-commit", "scheduler:start":
+		// DeepSeek thinking 同时拒绝 exact/required，但支持 auto + tools。
+		// ToolRouter 已机械收窄为唯一工具，L3 response gate 另外
+		// 强制本轮必须至少返回一个该工具调用，不允许正文逃逸。
+		return invocation.ToolChoice{Mode: invocation.ToolChoiceAuto}
 	case "agent:deliverable-submit":
+		// 真实 DeepSeek 会在 auto 下继续返回历史 grep/read 工具，
+		// 而 exact + thinking 又被 API 400。该轮仅做结构化终态提交，
+		// LLMExecutor 同时冻结 reasoning=none，因此可安全使用 exact submit。
 		return invocation.ToolChoice{Mode: invocation.ToolChoiceFunction, Name: "submit_task_result"}
+	case "scheduler:draft-edit", "scheduler:recovery":
+		// 多工具阶段同样使用 auto wire，由 L3 response gate 强制
+		// 至少一个授权工具调用，避免 thinking + required 被 provider 400。
+		return invocation.ToolChoice{Mode: invocation.ToolChoiceAuto}
 	default:
 		return invocation.ToolChoice{Mode: invocation.ToolChoiceAuto}
 	}
+}
+
+// mechanicalSingletonPhase 标识“逻辑上必须且只允许一个工具动作”的机械阶段。
+// 这些阶段在 wire 上使用 auto + singleton ToolRouter。Provider 即使
+// 忽略 parallel_tool_calls=false 并返回多个调用，L3 也只 dispatch 第一个，
+// 后续 call_id 获得可重放的 skipped result，不会形成第二个副作用。
+func mechanicalSingletonPhase(phase string) bool {
+	_, ok := mechanicalSingletonTool(phase)
+	return ok
+}
+
+func mechanicalSingletonTool(phase string) (string, bool) {
+	switch phase {
+	case "scheduler:draft-create":
+		return "create_graph_draft", true
+	case "scheduler:draft-configure":
+		return "configure_simple_graph_draft", true
+	case "scheduler:draft-validate":
+		return "validate_current_graph_draft", true
+	case "scheduler:draft-commit":
+		return "commit_current_graph_draft", true
+	case "scheduler:start":
+		return "start_current_graph", true
+	case "agent:deliverable-submit":
+		return "submit_task_result", true
+	default:
+		return "", false
+	}
+}
+
+func phaseRequiresToolCall(phase string) bool {
+	return mechanicalSingletonPhase(phase) || phase == "scheduler:draft-edit" || phase == "scheduler:recovery"
+}
+
+func phaseDispatchesOnlyFirstTool(phase string) bool {
+	return mechanicalSingletonPhase(phase) || phase == "scheduler:draft-edit" || phase == "scheduler:recovery"
 }
 
 func deriveInvocationToolPolicy(task *model.Task, history []HistoryEntry, full *ToolRegistry) invocationToolPolicy {
@@ -49,7 +92,7 @@ func deriveInvocationToolPolicy(task *model.Task, history []HistoryEntry, full *
 		return invocationToolPolicy{
 			Registry: full.Filtered([]string{"submit_task_result"}),
 			Phase:    "agent:deliverable-submit",
-			MaxCalls: 1,
+			MaxCalls: defaultToolCallsPerResponse,
 		}
 	}
 	if task == nil || full == nil || task.GraphID != "" || task.EventType != "__scheduler__" ||
@@ -84,9 +127,15 @@ func deriveInvocationToolPolicy(task *model.Task, history []HistoryEntry, full *
 	}
 	policy.Registry = full.Filtered(allow)
 	policy.Phase = phase
-	// Authoring/recovery/final-report 均采用一次响应一个控制面动作；模型根据
-	// durable tool result 进入下一 phase，避免同批副作用与 revision CAS 竞态。
+	// Authoring/recovery 逻辑上只 dispatch 一个控制面动作。
+	// singleton 阶段允许 provider wire 返回有界 fan-out，由 L3 duplicate
+	// fence 仅执行首个；final-report 只含读工具，允许有界串行批次；
+	// 多工具 edit/recovery 含状态变更，同样只 dispatch 首个并为其余 call_id
+	// 生成 skipped output，而不在 SSE 第二个 item 时拒绝整个响应。
 	policy.MaxCalls = 1
+	if phaseDispatchesOnlyFirstTool(phase) || phase == "scheduler:final-report" {
+		policy.MaxCalls = defaultToolCallsPerResponse
+	}
 	return policy
 }
 
@@ -97,6 +146,27 @@ func historyRequiresDeliverableSubmit(history []HistoryEntry) bool {
 		}
 	}
 	return false
+}
+
+// deliverableHistoryProjection 只用于终态提交 Invocation。Raw History 始终
+// 保持不变；本次 L2 投影剔除旧 assistant tool calls/results，避免 DeepSeek
+// 在 exact submit 下仍继续产生已撤下的 read/grep 工具。TaskMemory、任务目标、
+// 上游输入与 output contract 由各自的 L2 fragment 独立注入，不依赖这些旧轮次。
+func deliverableHistoryProjection(history []HistoryEntry) []HistoryEntry {
+	projected := make([]HistoryEntry, 0, len(history))
+	for _, entry := range history {
+		if notice := strings.TrimSpace(entry.SystemNotice); notice != "" {
+			projected = append(projected, HistoryEntry{SystemNotice: notice})
+		}
+	}
+	return projected
+}
+
+// unsuccessfulToolResult 兼容历史已持久的半角/全角中文冒号。
+// skipped call 只是为 provider call_id 补齐 replay output，不得驱动阶段迁移。
+func unsuccessfulToolResult(content string) bool {
+	return content == "" || strings.HasPrefix(content, "错误:") ||
+		strings.HasPrefix(content, "已跳过:") || strings.HasPrefix(content, "已跳过：")
 }
 
 type graphAuthoringStage string
@@ -123,7 +193,7 @@ func graphAuthoringPolicy(history []HistoryEntry) (string, []string) {
 		}
 		for _, call := range entry.ToolCalls {
 			content, ok := results[call.ID]
-			if !ok || content == "" || strings.HasPrefix(content, "错误:") || strings.HasPrefix(content, "已跳过:") {
+			if !ok || unsuccessfulToolResult(content) {
 				continue
 			}
 			switch call.Name {
@@ -168,6 +238,9 @@ func graphAuthoringPolicy(history []HistoryEntry) (string, []string) {
 }
 
 func validateToolCallBatch(router ToolRouterSnapshot, calls []llm.ToolCall) error {
+	if phaseRequiresToolCall(router.Phase) && len(calls) == 0 {
+		return fmt.Errorf("auto tool phase=%s 未返回必需的工具调用", router.Phase)
+	}
 	if len(calls) > router.MaxCalls {
 		return fmt.Errorf("tool call batch 数量 %d 超过 phase=%s 上限 %d", len(calls), router.Phase, router.MaxCalls)
 	}

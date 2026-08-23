@@ -460,6 +460,13 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		if e.phasePromptResolver != nil {
 			phasePrompt = e.phasePromptResolver(toolRouter.Phase)
 		}
+		if toolRouter.Phase == "agent:deliverable-submit" {
+			phasePrompt = agentDeliverablePhasePrompt
+		}
+		modelHistory := history
+		if toolRouter.Phase == "agent:deliverable-submit" {
+			modelHistory = deliverableHistoryProjection(history)
+		}
 		if contextRuntime.ready() {
 			leaseRef := ""
 			if task.Lease != nil && task.Lease.Digest != "" {
@@ -467,7 +474,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 			}
 			compiled, compileErr := contextRuntime.compileAndPersist(ctx, contextCompileRequest{
 				Task: task, EffectivePrompt: effectivePrompt, TeamAwareness: e.teamAwareness,
-				DependencyResult: depResults, History: history, TaskMemory: taskMemCarrierFromContext(ctx),
+				DependencyResult: depResults, History: modelHistory, TaskMemory: taskMemCarrierFromContext(ctx),
 				ToolRouter: toolRouter, AttemptID: attemptIDForTrace, InvocationID: invocationID,
 				PhasePrompt: phasePrompt, PhasePromptRef: toolRouter.Phase,
 				PromptBuildRef: promptBuildRef, PromptBuild: frozenPromptBuild, ExecutionLeaseRef: leaseRef,
@@ -500,6 +507,9 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				}
 			}
 			binding.ToolChoice = invocationToolChoice(toolRouter)
+			if toolRouter.Phase == "agent:deliverable-submit" {
+				binding.ReasoningEffort = "none"
+			}
 			if bindErr = binding.Validate(); bindErr != nil {
 				return ExecuteResult{InvocationID: invocationID},
 					contextAssemblyFailure(ctx, invocationID, task.ContextPolicyRef, bindErr)
@@ -517,12 +527,12 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				cause := fmt.Errorf("任务缺少完整 L2 ContextRuntime 装配")
 				return ExecuteResult{InvocationID: invocationID}, contextAssemblyFailure(ctx, invocationID, task.ContextPolicyRef, cause)
 			}
-			messages = buildLegacyMessages(effectivePrompt, task, depResults, history, e.teamAwareness)
+			messages = buildLegacyMessages(effectivePrompt, task, depResults, modelHistory, e.teamAwareness)
 			if carrier := taskMemCarrierFromContext(ctx); carrier != nil && carrier.dropped == "" && carrier.text != "" {
 				messages = insertTaskMemMessage(messages, carrier.text)
 			}
 			toolDefs = toolRouter.Defs
-			manifest := buildLegacyContextManifest(ctx, effectivePrompt, task, depResults, history, e.teamAwareness, toolDefs)
+			manifest := buildLegacyContextManifest(ctx, effectivePrompt, task, depResults, modelHistory, e.teamAwareness, toolDefs)
 			manifestTokens = manifest.TotalEstimatedTokens
 			manifestDescription = manifest.SummaryJSON()
 		}
@@ -539,7 +549,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 			ContextSnapshotID:    contextSnapshotID,
 			ContextPolicyRef:     contextPolicyRef,
 			PromptTokens:         manifestTokens,
-			HistoryEntries:       len(history),
+			HistoryEntries:       len(modelHistory),
 			Description:          manifestDescription,
 			PromptBuildID:        promptBuildRef,
 		}
@@ -551,6 +561,12 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		activity.LLMStart(agentIDForTrace, task.ID, loopForTrace, len(toolDefs))
 
 		// Trace：LLM 调用开始
+		toolChoiceMode, toolChoiceName, reasoningEffort := "", "", ""
+		if invocationBinding != nil {
+			toolChoiceMode = string(invocationBinding.ToolChoice.Mode)
+			toolChoiceName = invocationBinding.ToolChoice.Name
+			reasoningEffort = invocationBinding.ReasoningEffort
+		}
 		trace.Emit(trace.Event{
 			Kind:                 trace.KindLLMCallStart,
 			TaskID:               task.ID,
@@ -563,8 +579,11 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 			ToolRouterSnapshotID: toolRouter.ID,
 			ContextSnapshotID:    contextSnapshotID,
 			ContextPolicyRef:     contextPolicyRef,
-			HistoryEntries:       len(history),
+			HistoryEntries:       len(modelHistory),
 			ToolCallsCount:       len(toolDefs),
+			ToolChoiceMode:       toolChoiceMode,
+			ToolChoiceName:       toolChoiceName,
+			ReasoningEffort:      reasoningEffort,
 		})
 		// Prompt dump（仅在 --dump-prompts 启用时写入）
 		trace.DumpRequest(task.ID, loopForTrace, messages, len(toolDefs))
@@ -735,6 +754,24 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				actionID := turnIDForTrace + "/tool-" + c.ID
 				if turnIDForTrace == "" {
 					actionID = task.ID + "/legacy-tool-" + c.ID
+				}
+				// auto + singleton 是 DeepSeek thinking 可消费的 provider wire
+				// 表达。某些 thinking provider 会忽略 parallel_tool_calls=false
+				// 并返回重复调用。阶段权威仍只允许一个动作：执行首个，
+				// 为后续 call_id 生成 skipped result 以保持 Responses 无状态重放完整。
+				if idx > 0 && phaseDispatchesOnlyFirstTool(toolRouter.Phase) {
+					content := "已跳过：当前机械阶段只执行 provider 顺序中的首个工具调用"
+					trace.Emit(trace.Event{
+						Kind: trace.KindToolCallSkipped, TaskID: task.ID, RunID: runIDForTrace,
+						AttemptID: attemptIDForTrace, TurnID: turnIDForTrace, ActionID: actionID,
+						AgentID: agentID, Loop: loopNum, Tool: c.Name, CallID: c.ID,
+						Reason: "phase_single_action_fanout",
+					})
+					results[idx] = indexedResult{toolResult: ToolResult{
+						ToolCallID: c.ID, Content: content,
+					}, output: fmt.Sprintf("[%s] %s\n", c.Name, content)}
+					completedResults = idx + 1
+					return
 				}
 				// finalizing fence：submit_task_result 被接受（MarkTaskFinalized）
 				// 后，同一响应中排在其后的工具调用一律跳过——不 dispatch、不产生

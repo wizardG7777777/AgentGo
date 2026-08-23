@@ -40,7 +40,7 @@ class HarnessContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             harness.build_run_contract("too-short", 239, now)
 
-    def test_probe_requires_exact_function_call(self):
+    def test_probe_requires_typed_auto_singleton_call(self):
         self.assertEqual(harness.validate_probe_response(probe_response()), (True, "ok"))
         for payload in (
             {"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]},
@@ -64,9 +64,11 @@ class HarnessContractTest(unittest.TestCase):
                 transport=lambda *_: (_ for _ in ()).throw(RuntimeError("offline")),
             )
 
-    def test_provider_probe_accepts_exact_transport_result(self):
+    def test_provider_probe_accepts_auto_singleton_transport_result(self):
         def transport(_endpoint, _key, body, _timeout):
-            name = body["tool_choice"]["function"]["name"]
+            self.assertEqual(body["tool_choice"], "auto")
+            self.assertEqual(body["reasoning_effort"], "low")
+            name = body["tools"][0]["function"]["name"]
             nonce = body["tools"][0]["function"]["parameters"]["properties"]["nonce"]["const"]
             return 200, probe_response(name=name, arguments={"nonce": nonce})
 
@@ -78,7 +80,9 @@ class HarnessContractTest(unittest.TestCase):
     def test_responses_provider_probe_requires_typed_item_and_nonce(self):
         def transport(endpoint, _key, body, _timeout):
             self.assertTrue(endpoint.endswith("/responses"))
-            name = body["tool_choice"]["name"]
+            self.assertEqual(body["tool_choice"], "auto")
+            self.assertEqual(body["reasoning"], {"effort": "low"})
+            name = body["tools"][0]["name"]
             nonce = body["tools"][0]["parameters"]["properties"]["nonce"]["const"]
             return 200, {
                 "id": "resp-1", "status": "completed",
@@ -101,6 +105,32 @@ class HarnessContractTest(unittest.TestCase):
                 "https://provider.invalid/v1", "secret", "model", protocol="responses",
                 attempts=1, sleep_sec=0, transport=lambda *_: (200, text_only),
             )
+
+    def test_probe_accepts_provider_auto_singleton_fanout(self):
+        chat = probe_response()
+        chat["choices"][0]["message"]["tool_calls"].append({
+            "function": {
+                "name": harness.PROBE_NAME,
+                "arguments": json.dumps({"nonce": harness.PROBE_NONCE}),
+            },
+        })
+        self.assertEqual(harness.validate_probe_response(chat), (True, "ok"))
+
+        responses = {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call", "call_id": f"call-{index}",
+                    "name": harness.PROBE_NAME,
+                    "arguments": json.dumps({"nonce": harness.PROBE_NONCE}),
+                }
+                for index in range(2)
+            ],
+        }
+        self.assertEqual(
+            harness.validate_probe_response(responses, protocol="responses"),
+            (True, "ok"),
+        )
 
     def test_snapshot_projection_preserves_terminal_outcomes(self):
         for status, outcome in (
@@ -230,16 +260,81 @@ class HarnessContractTest(unittest.TestCase):
             log = root / ".agentgo" / "sessions" / "s1" / "logs" / "trace.jsonl"
             log.parent.mkdir(parents=True)
             events = [
+                {"ts": "0", "kind": "context_manifest_built", "run_id": "run-1",
+                 "task_id": "scheduler", "turn_id": "turn-1",
+                 "description": json.dumps([{"source_ref": "prompt-phase:scheduler:draft-edit"}])},
                 {"ts": "1", "kind": "llm_call_end", "run_id": "run-1", "task_id": "scheduler",
+                 "turn_id": "turn-1",
                  "prompt_tokens": 3847, "completion_tokens": 100, "tool_calls_count": 2},
                 {"ts": "2", "kind": "tool_call", "run_id": "run-1", "task_id": "scheduler",
-                 "tool": "create_graph_draft"},
+                 "turn_id": "turn-1", "tool": "create_graph_draft"},
+                {"ts": "3", "kind": "tool_call", "run_id": "run-1", "task_id": "scheduler",
+                 "turn_id": "turn-1", "tool": "patch_graph_draft"},
             ]
             log.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
             metrics, _ = harness.trace_metrics(root, "run-1", {"scheduler"})
             self.assertEqual(metrics["first_scheduler_prompt_tokens"], 3847)
             self.assertEqual(metrics["first_graph_draft_call_index"], 1)
             self.assertTrue(metrics["known_incidents"]["scheduler_tool_batch_exceeded"])
+
+    def test_trace_metrics_allows_final_report_read_batch_and_skipped_phase_fanout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / ".agentgo" / "sessions" / "s1" / "logs" / "trace.jsonl"
+            log.parent.mkdir(parents=True)
+            events = [
+                {"ts": "1", "kind": "context_manifest_built", "run_id": "run-1",
+                 "task_id": "scheduler", "turn_id": "final",
+                 "description": json.dumps([{"source_ref": "prompt-phase:scheduler:final-report"}])},
+                {"ts": "2", "kind": "llm_call_end", "run_id": "run-1", "task_id": "scheduler",
+                 "turn_id": "final", "tool_calls_count": 2},
+                {"ts": "3", "kind": "tool_call", "run_id": "run-1", "task_id": "scheduler",
+                 "turn_id": "final", "tool": "read_graph"},
+                {"ts": "4", "kind": "tool_call", "run_id": "run-1", "task_id": "scheduler",
+                 "turn_id": "final", "tool": "read_content_ref"},
+                {"ts": "5", "kind": "context_manifest_built", "run_id": "run-1",
+                 "task_id": "scheduler", "turn_id": "create",
+                 "description": json.dumps([{"source_ref": "prompt-phase:scheduler:draft-create"}])},
+                {"ts": "6", "kind": "llm_call_end", "run_id": "run-1", "task_id": "scheduler",
+                 "turn_id": "create", "tool_calls_count": 2},
+                {"ts": "7", "kind": "tool_call", "run_id": "run-1", "task_id": "scheduler",
+                 "turn_id": "create", "tool": "create_graph_draft"},
+                {"ts": "8", "kind": "tool_call_skipped", "run_id": "run-1", "task_id": "scheduler",
+                 "turn_id": "create", "tool": "create_graph_draft",
+                 "reason": "phase_single_action_fanout"},
+            ]
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+            metrics, _ = harness.trace_metrics(root, "run-1", {"scheduler"})
+            self.assertFalse(metrics["known_incidents"]["scheduler_tool_batch_exceeded"])
+
+    def test_trace_metrics_marks_provider_invalid_request_as_architecture_incident(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / ".agentgo" / "sessions" / "s1" / "logs" / "trace.jsonl"
+            log.parent.mkdir(parents=True)
+            event = {
+                "ts": "1", "kind": "llm_call_end", "run_id": "run-1", "task_id": "worker",
+                "failure_kind": "invalid_request", "http_status": 400,
+                "error": "input: missing field `content`",
+            }
+            log.write_text(json.dumps(event) + "\n", encoding="utf-8")
+            metrics, _ = harness.trace_metrics(root, "run-1", {"scheduler"})
+            self.assertEqual(metrics["invocation_failures"], {"invalid_request": 1})
+            self.assertTrue(metrics["known_incidents"]["provider_invalid_request"])
+
+    def test_trace_metrics_marks_output_limit_failure_as_architecture_incident(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / ".agentgo" / "sessions" / "s1" / "logs" / "trace.jsonl"
+            log.parent.mkdir(parents=True)
+            event = {
+                "ts": "1", "kind": "llm_call_end", "run_id": "run-1", "task_id": "verifier",
+                "failure_kind": "output_limit_exceeded",
+                "error": "tool_calls.count actual=3 limit=1",
+            }
+            log.write_text(json.dumps(event) + "\n", encoding="utf-8")
+            metrics, _ = harness.trace_metrics(root, "run-1", {"scheduler"})
+            self.assertTrue(metrics["known_incidents"]["invocation_output_limit_exceeded"])
 
     def test_finalize_keeps_architecture_and_task_verdict_separate(self):
         with tempfile.TemporaryDirectory() as directory:

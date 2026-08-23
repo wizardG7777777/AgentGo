@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -19,14 +20,15 @@ import (
 )
 
 type fakeVerifierClient struct {
-	content  string
-	err      error
-	wait     bool
-	calls    int
-	messages []llm.Message
-	tools    []llm.ToolDef
-	binding  invocation.ContextBinding
-	started  chan struct{}
+	content    string
+	err        error
+	wait       bool
+	calls      int
+	messages   []llm.Message
+	tools      []llm.ToolDef
+	binding    invocation.ContextBinding
+	started    chan struct{}
+	duplicates int
 }
 
 func (f *fakeVerifierClient) Chat(ctx context.Context, messages []llm.Message, tools []llm.ToolDef) (llm.Response, error) {
@@ -49,10 +51,17 @@ func (f *fakeVerifierClient) Chat(ctx context.Context, messages []llm.Message, t
 		if err := json.Unmarshal([]byte(f.content), &arguments); err != nil {
 			arguments = map[string]any{"raw_output": f.content}
 		}
-		return llm.Response{
-			FinishReason: llm.FinishReasonToolCalls,
-			ToolCalls:    []llm.ToolCall{{ID: "proposal-verdict", Name: proposalVerdictToolName, Arguments: arguments}},
-		}, nil
+		count := f.duplicates
+		if count < 1 {
+			count = 1
+		}
+		calls := make([]llm.ToolCall, count)
+		for index := range calls {
+			calls[index] = llm.ToolCall{
+				ID: fmt.Sprintf("proposal-verdict-%d", index), Name: proposalVerdictToolName, Arguments: arguments,
+			}
+		}
+		return llm.Response{FinishReason: llm.FinishReasonToolCalls, ToolCalls: calls}, nil
 	}
 	return llm.Response{Content: f.content, FinishReason: llm.FinishReasonStop}, nil
 }
@@ -141,8 +150,8 @@ func TestVerifierPassUsesCompiledContextEmptyToolsAndFrameworkRef(t *testing.T) 
 	if client.calls != 3 || len(client.tools) != 1 || client.tools[0].Name != proposalVerdictToolName {
 		t.Fatalf("Verifier 调用/工具面错误: calls=%d tools=%d", client.calls, len(client.tools))
 	}
-	if client.binding.ToolChoice.Mode != invocation.ToolChoiceFunction || client.binding.ToolChoice.Name != proposalVerdictToolName {
-		t.Fatalf("Verifier 未冻结 exact verdict ToolChoice: %+v", client.binding.ToolChoice)
+	if client.binding.ToolChoice.Mode != invocation.ToolChoiceAuto || client.binding.ToolChoice.Name != "" {
+		t.Fatalf("Verifier 未冻结 auto-singleton verdict ToolChoice: %+v", client.binding.ToolChoice)
 	}
 	if len(client.messages) != 4 || client.messages[0].Role != "system" ||
 		!strings.Contains(client.messages[0].Content, "独立 Graph Proposal Verifier") {
@@ -171,6 +180,19 @@ func TestVerifierPassUsesCompiledContextEmptyToolsAndFrameworkRef(t *testing.T) 
 			!strings.Contains(snapshot.ToolRouterSnapshotID, "proposal-verifier-verdict") {
 			t.Fatalf("Snapshot policy/tool router 未冻结: %+v", snapshot)
 		}
+	}
+}
+
+func TestVerifierAcceptsProviderDuplicateAutoSingletonVerdicts(t *testing.T) {
+	rawRequest := "请调查并回答问题"
+	client := &fakeVerifierClient{content: `{"verdict":"pass"}`, duplicates: 3}
+	verifier, _ := newTestVerifier(t, client, rawRequest, Options{})
+	decision, err := verifier.EvaluateProposal(context.Background(), proposalFixture(rawRequest))
+	if err != nil {
+		t.Fatalf("provider auto-singleton fan-out 不应阻断 proposal acceptance: %v", err)
+	}
+	if decision.Verdict != graph.ProposalAcceptancePass || client.calls != 1 {
+		t.Fatalf("应按 provider 顺序消费首个 verdict: decision=%+v calls=%d", decision, client.calls)
 	}
 }
 

@@ -335,7 +335,9 @@ func defaultSectionBudgets(systemBytes, systemTokens int64) map[contextcontract.
 
 func defaultProgressProfiles() ([]ProgressProfile, error) {
 	profiles := []loopcontract.CompiledProgressContract{
-		progressCodeChange(),
+		progressCodeChangeV1(),
+		progressCodeChangeV2(),
+		progressCodeChangeV3(),
 		progressInvestigation(),
 		progressVerification(),
 		progressCoordination(),
@@ -351,7 +353,7 @@ func defaultProgressProfiles() ([]ProgressProfile, error) {
 	return out, nil
 }
 
-func progressCodeChange() loopcontract.CompiledProgressContract {
+func progressCodeChangeV1() loopcontract.CompiledProgressContract {
 	return loopcontract.CompiledProgressContract{
 		Schema: loopcontract.CompiledSchemaV1,
 		Ref: loopcontract.ProgressContractRef{
@@ -380,6 +382,28 @@ func progressCodeChange() loopcontract.CompiledProgressContract {
 				CompletionTokens: 160_000, ModelCalls: 12, ToolActions: 48, Attempts: 2}),
 		RunBudgetRef: "run-budget:framework/v1",
 	}
+}
+
+func progressCodeChangeV2() loopcontract.CompiledProgressContract {
+	contract := progressCodeChangeV1()
+	contract.Ref = loopcontract.ProgressContractRef{
+		ContractID: ProgressCodeChangeV2, PolicyRef: "bounded_code_change/v2",
+	}
+	contract.Policy = progressPolicy("bounded_code_change/v2", 4, 8, 12, 16, 20*time.Minute, 4, 1,
+		runcontract.BudgetLimit{WallTime: 20 * time.Minute, PromptTokens: 1_000_000,
+			CompletionTokens: 200_000, ModelCalls: 16, ToolActions: 64, Attempts: 2})
+	return contract
+}
+
+func progressCodeChangeV3() loopcontract.CompiledProgressContract {
+	contract := progressCodeChangeV2()
+	contract.Ref = loopcontract.ProgressContractRef{
+		ContractID: ProgressCodeChangeV3, PolicyRef: "bounded_code_change/v3",
+	}
+	contract.Policy = progressPolicy("bounded_code_change/v3", 4, 10, 18, 24, 25*time.Minute, 4, 1,
+		runcontract.BudgetLimit{WallTime: 25 * time.Minute, PromptTokens: 1_500_000,
+			CompletionTokens: 300_000, ModelCalls: 24, ToolActions: 96, Attempts: 2})
+	return contract
 }
 
 func progressInvestigation() loopcontract.CompiledProgressContract {

@@ -442,7 +442,7 @@ func projectExecuteResult(a *Agent, task *model.Task, result ExecuteResult, delt
 	}
 	for _, call := range result.ToolCalls {
 		content := results[call.ID]
-		success := content != "" && !strings.HasPrefix(content, "错误:") && !strings.HasPrefix(content, "已跳过:")
+		success := !unsuccessfulToolResult(content)
 		switch call.Name {
 		case "write_file", "edit_file":
 			if !success {
@@ -518,15 +518,21 @@ func decideProgressPolicy(contract loopcontract.CompiledProgressContract, task *
 	case explorationLimitReached:
 		// Novel evidence is real progress and must never be mislabeled as exhausted.
 		// Crossing the exploration allowance enters a mechanically forced delivery
-		// phase: the next ToolRouter exposes only submit_task_result with exact
-		// tool_choice, so the Agent must commit pass/fixable/blocked instead of
+		// phase: the next ToolRouter exposes only submit_task_result；L3 收窄
+		// model-visible history，Model Invocation 对该机械提交轮使用 none+exact，
+		// 所以 Agent 必须提交 pass/fixable/blocked，而不是
 		// continuing to browse indefinitely.
 		checkpoint.InterventionStage = loopcontract.StageReminder
 		decision.Reminder = progressDeliverableRequiredMarker + " " +
 			renderProgressReminder(contract, *checkpoint, "deliverable_required")
-	case checkpoint.NoProgressTurns >= policy.InterventionAfterTurns ||
-		(checkpoint.NoProgressTurns >= policy.RolloverAfterTurns &&
-			checkpoint.AttemptRolloverCount >= policy.MaxAttemptRollovers):
+	case checkpoint.NoProgressTurns >= policy.InterventionAfterTurns &&
+		task != nil && task.GraphID != "" && hasRecentDeliverableProgress(contract, *checkpoint):
+		// 已有文件/结构化结果等契约认可的交付时，阈值的意义是
+		// 停止继续调查并提交，而不是把已完成的工作标为 blocked。
+		checkpoint.InterventionStage = loopcontract.StageReminder
+		decision.Reminder = progressDeliverableRequiredMarker + " " +
+			renderProgressReminder(contract, *checkpoint, "deliverable_required_after_progress")
+	case checkpoint.NoProgressTurns >= policy.InterventionAfterTurns:
 		checkpoint.InterventionStage = loopcontract.StageInterventionRequired
 		decision.Intervention = true
 		reason = loopcontract.InterventionNoProgressStalled
@@ -548,6 +554,23 @@ func decideProgressPolicy(contract loopcontract.CompiledProgressContract, task *
 	checkpoint.LastInterventionAt = checkpoint.UpdatedAt
 	command := buildLoopIntervention(contract, task, *checkpoint, reason)
 	return decision, &command
+}
+
+func hasRecentDeliverableProgress(contract loopcontract.CompiledProgressContract,
+	checkpoint loopcontract.ProgressCheckpoint,
+) bool {
+	deliverableKinds := make(map[loopcontract.ProgressSignalKind]struct{})
+	for _, rule := range contract.AcceptedSignals {
+		if rule.Deliverable {
+			deliverableKinds[rule.Kind] = struct{}{}
+		}
+	}
+	for _, fingerprint := range checkpoint.RecentFingerprints {
+		if _, ok := deliverableKinds[fingerprint.Kind]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func renderProgressReminder(contract loopcontract.CompiledProgressContract,

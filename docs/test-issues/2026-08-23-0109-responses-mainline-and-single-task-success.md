@@ -84,7 +84,8 @@ message/reasoning/tool-call 分型稳定。
 - `MaxExplorationTurns` 从 hard-block 条件移出；
 - 超额后生成结构化 delivery-required control notice；
 - 下一 Invocation 的 ToolRouter 进入 `agent:deliverable-submit`，只暴露
-  `submit_task_result`，并冻结 exact function `tool_choice`；
+  `submit_task_result`。当时 wire 冻结 exact function `tool_choice`；SWE-030/031
+  后已替换为 auto + singleton + L3 required-action gate；
 - 因此 Agent 必须提交 pass/fixable/blocked，不能继续无限读取，也不会因真实
   knowledge progress 被误杀。
 

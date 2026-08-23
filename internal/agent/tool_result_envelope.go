@@ -12,7 +12,13 @@ import (
 	"agentgo/internal/model"
 )
 
-const toolResultInlinePreviewBytes = 16 << 10
+const (
+	toolResultExternalizeThresholdBytes = 16 << 10
+	// preview 会再进入 JSON string，引号/反斜杠/控制字符最坏可数倍
+	// 膨胀。4 KiB 的首尾总量可使 encoded envelope 稳定低于 L2 48 KiB
+	// tool-result fragment cap；完整内容始终可通过 ContentRef 分页读取。
+	toolResultInlinePreviewBytes = 4 << 10
+)
 
 type toolResultReferenceEnvelope struct {
 	Schema        string `json:"schema"`
@@ -26,7 +32,7 @@ type toolResultReferenceEnvelope struct {
 }
 
 func (r ContextRuntime) externalizeToolResult(ctx context.Context, task *model.Task, call llm.ToolCall, result string) (string, error) {
-	if len([]byte(result)) <= toolResultInlinePreviewBytes || r.Content == nil || task == nil {
+	if len([]byte(result)) <= toolResultExternalizeThresholdBytes || r.Content == nil || task == nil {
 		return result, nil
 	}
 	expiresAt := time.Time{}

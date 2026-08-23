@@ -10,6 +10,7 @@ import (
 	"agentgo/internal/invocation"
 
 	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared"
 )
@@ -46,8 +47,8 @@ func (c *SDKClient) responsesParams(ctx context.Context, messages []Message, too
 		Include:           []responses.ResponseIncludable{responses.ResponseIncludableReasoningEncryptedContent},
 		Truncation:        responses.ResponseNewParamsTruncationDisabled,
 	}
-	if c.request.ReasoningEffort != "" {
-		params.Reasoning = shared.ReasoningParam{Effort: shared.ReasoningEffort(c.request.ReasoningEffort)}
+	if reasoningEffort := effectiveReasoningEffort(ctx, c.request.ReasoningEffort); reasoningEffort != "" {
+		params.Reasoning = shared.ReasoningParam{Effort: shared.ReasoningEffort(reasoningEffort)}
 	}
 	input, err := convertResponsesMessages(c.systemPrompt, messages)
 	if err != nil {
@@ -59,10 +60,10 @@ func (c *SDKClient) responsesParams(ctx context.Context, messages []Message, too
 			Name: tool.Name, Description: openai.String(tool.Description), Parameters: tool.Parameters,
 			// AgentGo 的现有 schema 允许可选字段和 L3 默认参数；关闭服务端 strict
 			// 不等于放松 Harness，最终参数仍由 typed decoder、ToolRouter 与 Gate 校验。
-			Strict: openai.Bool(false),
+			Strict: openai.Bool(tool.Strict),
 		}})
 	}
-	choice, err := responseToolChoice(ctx, c.request.ForcedToolName, tools)
+	choice, err := responseToolChoice(ctx, c.request.ToolChoice, tools)
 	if err != nil {
 		return responses.ResponseNewParams{}, err
 	}
@@ -70,38 +71,27 @@ func (c *SDKClient) responsesParams(ctx context.Context, messages []Message, too
 	return params, nil
 }
 
-func responseToolChoice(ctx context.Context, forced string, tools []ToolDef) (responses.ResponseNewParamsToolChoiceUnion, error) {
-	find := func(name string) bool {
-		for _, tool := range tools {
-			if tool.Name == name {
-				return true
-			}
-		}
-		return false
+func responseToolChoice(ctx context.Context, configured invocation.ToolChoice, tools []ToolDef) (responses.ResponseNewParamsToolChoiceUnion, error) {
+	choice := effectiveToolChoice(ctx, configured)
+	if err := choice.Validate(); err != nil {
+		return responses.ResponseNewParamsToolChoiceUnion{}, fmt.Errorf("tool_choice 无效: %w", err)
 	}
-	if forced != "" {
-		if !find(forced) {
-			return responses.ResponseNewParamsToolChoiceUnion{}, fmt.Errorf("forced tool_choice=%q 不在本次 ToolRouter 定义中", forced)
-		}
-		return responses.ResponseNewParamsToolChoiceUnion{OfFunctionTool: &responses.ToolChoiceFunctionParam{Name: forced}}, nil
-	}
-	binding, ok := invocation.ContextBindingFrom(ctx)
-	if !ok || binding.ToolChoice.Mode == "" || binding.ToolChoice.Mode == invocation.ToolChoiceAuto {
+	if choice.Mode == invocation.ToolChoiceAuto {
 		return responses.ResponseNewParamsToolChoiceUnion{OfToolChoiceMode: openai.Opt(responses.ToolChoiceOptionsAuto)}, nil
 	}
 	if len(tools) == 0 {
-		return responses.ResponseNewParamsToolChoiceUnion{}, fmt.Errorf("tool_choice=%s 但本次 ToolRouter 为空", binding.ToolChoice.Mode)
+		return responses.ResponseNewParamsToolChoiceUnion{}, fmt.Errorf("tool_choice=%s 但本次 ToolRouter 为空", choice.Mode)
 	}
-	switch binding.ToolChoice.Mode {
+	switch choice.Mode {
 	case invocation.ToolChoiceRequired:
 		return responses.ResponseNewParamsToolChoiceUnion{OfToolChoiceMode: openai.Opt(responses.ToolChoiceOptionsRequired)}, nil
 	case invocation.ToolChoiceFunction:
-		if !find(binding.ToolChoice.Name) {
-			return responses.ResponseNewParamsToolChoiceUnion{}, fmt.Errorf("ContextBinding forced tool_choice=%q 不在本次 ToolRouter 定义中", binding.ToolChoice.Name)
+		if !hasToolDefinition(tools, choice.Name) {
+			return responses.ResponseNewParamsToolChoiceUnion{}, fmt.Errorf("forced tool_choice=%q 不在本次 ToolRouter 定义中", choice.Name)
 		}
-		return responses.ResponseNewParamsToolChoiceUnion{OfFunctionTool: &responses.ToolChoiceFunctionParam{Name: binding.ToolChoice.Name}}, nil
+		return responses.ResponseNewParamsToolChoiceUnion{OfFunctionTool: &responses.ToolChoiceFunctionParam{Name: choice.Name}}, nil
 	default:
-		return responses.ResponseNewParamsToolChoiceUnion{}, fmt.Errorf("未知 tool_choice mode=%q", binding.ToolChoice.Mode)
+		return responses.ResponseNewParamsToolChoiceUnion{}, fmt.Errorf("未知 tool_choice mode=%q", choice.Mode)
 	}
 }
 
@@ -127,9 +117,9 @@ func convertResponsesMessages(systemPrompt string, messages []Message) (response
 					return nil, responsesProtocolError("L2 replay 的 Responses output items 无效", err)
 				}
 				for index, rawItem := range rawItems {
-					var item responses.ResponseInputItemUnionParam
-					if err := json.Unmarshal(rawItem, &item); err != nil {
-						return nil, responsesProtocolError(fmt.Sprintf("Responses replay item[%d] 无法反序列化", index), err)
+					item, err := exactResponsesReplayItem(rawItem, index)
+					if err != nil {
+						return nil, err
 					}
 					input = append(input, item)
 				}
@@ -163,6 +153,47 @@ func convertResponsesMessages(systemPrompt string, messages []Message) (response
 		}
 	}
 	return input, nil
+}
+
+// exactResponsesReplayItem 先按 Responses 强类型信封校验服务端 output item，
+// 再通过 SDK 的 raw override 原样放回下一轮 input。不能把 output struct 普通
+// 反序列化后再序列化：SDK 的 omitzero 会删除服务端明确返回的空 required 字段
+// （例如 message.content=[]），使无状态 provider 在第二轮拒绝 replay。
+func exactResponsesReplayItem(rawItem json.RawMessage, index int) (responses.ResponseInputItemUnionParam, error) {
+	var header struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(rawItem, &header); err != nil {
+		return responses.ResponseInputItemUnionParam{}, responsesProtocolError(
+			fmt.Sprintf("Responses replay item[%d] 信封无效", index), err)
+	}
+	var typed responses.ResponseInputItemUnionParam
+	if err := json.Unmarshal(rawItem, &typed); err != nil {
+		return responses.ResponseInputItemUnionParam{}, responsesProtocolError(
+			fmt.Sprintf("Responses replay item[%d] 无法反序列化", index), err)
+	}
+	switch header.Type {
+	case "message":
+		if typed.OfMessage == nil && typed.OfInputMessage == nil && typed.OfOutputMessage == nil {
+			return responses.ResponseInputItemUnionParam{}, responsesProtocolError(
+				fmt.Sprintf("Responses replay item[%d] message 未形成强类型变体", index), nil)
+		}
+	case "reasoning":
+		if typed.OfReasoning == nil {
+			return responses.ResponseInputItemUnionParam{}, responsesProtocolError(
+				fmt.Sprintf("Responses replay item[%d] reasoning 未形成强类型变体", index), nil)
+		}
+	case "function_call":
+		if typed.OfFunctionCall == nil {
+			return responses.ResponseInputItemUnionParam{}, responsesProtocolError(
+				fmt.Sprintf("Responses replay item[%d] function_call 未形成强类型变体", index), nil)
+		}
+	default:
+		return responses.ResponseInputItemUnionParam{}, responsesProtocolError(
+			fmt.Sprintf("Responses replay item[%d] type=%q 不在 AgentGo profile", index, header.Type), nil)
+	}
+	exact := append(json.RawMessage(nil), rawItem...)
+	return param.Override[responses.ResponseInputItemUnionParam](exact), nil
 }
 
 func (c *SDKClient) responsesStreaming(ctx context.Context, params responses.ResponseNewParams) (Response, error) {

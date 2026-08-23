@@ -21,7 +21,8 @@ func TestDefaultCatalogValidAndResolvesGraphPolicies(t *testing.T) {
 		t.Fatalf("Catalog.Validate: %v", err)
 	}
 	if !catalog.HasContextPolicy(ContextDefaultV1) ||
-		!catalog.HasProgressContract(ProgressCodeChangeV1) {
+		!catalog.HasProgressContract(ProgressCodeChangeV1) ||
+		!catalog.HasProgressContract(ProgressCodeChangeCurrent) {
 		t.Fatal("Graph PolicyResolver 未识别默认 Context/Progress ref")
 	}
 	if catalog.HasContextPolicy("context:unknown/v1") ||
@@ -31,6 +32,8 @@ func TestDefaultCatalogValidAndResolvesGraphPolicies(t *testing.T) {
 
 	wantProgressRefs := []string{
 		ProgressCodeChangeV1,
+		ProgressCodeChangeV2,
+		ProgressCodeChangeV3,
 		ProgressCoordinationV1,
 		ProgressInvestigationV1,
 		ProgressVerificationV1,
@@ -192,6 +195,8 @@ func TestProgressProfilesCoverFourWorkClasses(t *testing.T) {
 	}
 	want := map[string]loopcontract.WorkClass{
 		ProgressCodeChangeV1:    loopcontract.WorkCodeChange,
+		ProgressCodeChangeV2:    loopcontract.WorkCodeChange,
+		ProgressCodeChangeV3:    loopcontract.WorkCodeChange,
 		ProgressInvestigationV1: loopcontract.WorkInvestigation,
 		ProgressVerificationV1:  loopcontract.WorkVerification,
 		ProgressCoordinationV1:  loopcontract.WorkCoordination,
@@ -215,6 +220,53 @@ func TestProgressProfilesCoverFourWorkClasses(t *testing.T) {
 			profile.Contract.Policy.MaxNoProgressUsage.ModelCalls <= 0 {
 			t.Fatalf("profile=%s 含无界 no-progress policy", ref)
 		}
+	}
+}
+
+func TestCodeChangeV2ExpandsThinkingModelInvestigationWithoutMutatingV1(t *testing.T) {
+	catalog, err := NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1, ok := catalog.ProgressContract(ProgressCodeChangeV1)
+	if !ok {
+		t.Fatal("缺少历史 code-change/v1")
+	}
+	v2, ok := catalog.ProgressContract(ProgressCodeChangeV2)
+	if !ok {
+		t.Fatal("缺少当前 code-change/v2")
+	}
+	if v1.Contract.Policy.ReminderAfterTurns != 3 || v1.Contract.Policy.RolloverAfterTurns != 6 ||
+		v1.Contract.Policy.InterventionAfterTurns != 9 || v1.Contract.Policy.MaxNoProgressTurns != 12 ||
+		v1.Contract.Policy.MaxNoProgressUsage.ModelCalls != 12 {
+		t.Fatalf("历史 v1 被就地改写: %+v", v1.Contract.Policy)
+	}
+	if v2.Contract.Policy.ReminderAfterTurns != 4 || v2.Contract.Policy.RolloverAfterTurns != 8 ||
+		v2.Contract.Policy.InterventionAfterTurns != 12 || v2.Contract.Policy.MaxNoProgressTurns != 16 ||
+		v2.Contract.Policy.MaxNoProgressUsage.ModelCalls != 16 || v2.Digest == v1.Digest {
+		t.Fatalf("v2 预算/身份未独立冻结: v1=%+v v2=%+v", v1, v2)
+	}
+}
+
+func TestCodeChangeV3CoversObservedThinkingTailWithoutMutatingOlderProfiles(t *testing.T) {
+	catalog, err := NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2, _ := catalog.ProgressContract(ProgressCodeChangeV2)
+	v3, ok := catalog.ProgressContract(ProgressCodeChangeV3)
+	if !ok {
+		t.Fatal("缺少当前 code-change/v3")
+	}
+	if v2.Contract.Policy.InterventionAfterTurns != 12 || v2.Contract.Policy.MaxNoProgressTurns != 16 ||
+		v2.Contract.Policy.MaxNoProgressUsage.ModelCalls != 16 {
+		t.Fatalf("v2 被就地改写: %+v", v2.Contract.Policy)
+	}
+	if v3.Contract.Policy.ReminderAfterTurns != 4 || v3.Contract.Policy.RolloverAfterTurns != 10 ||
+		v3.Contract.Policy.InterventionAfterTurns != 18 || v3.Contract.Policy.MaxNoProgressTurns != 24 ||
+		v3.Contract.Policy.MaxNoProgressUsage.ModelCalls != 24 || v3.Digest == v2.Digest ||
+		ProgressCodeChangeCurrent != ProgressCodeChangeV3 {
+		t.Fatalf("v3 预算/当前别名错误: v2=%+v v3=%+v current=%s", v2, v3, ProgressCodeChangeCurrent)
 	}
 }
 

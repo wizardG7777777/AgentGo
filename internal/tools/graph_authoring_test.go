@@ -97,7 +97,7 @@ func TestConfigureSimpleGraphDraftBuildsFrameworkOwnedAcceptedShape(t *testing.T
 	if draft.DraftRevision != 2 || draft.Candidate.Root != "work" || draft.Contract.ExecutionClass != graph.ExecutionMutating ||
 		!draft.Contract.RequiresAcceptance || len(draft.Contract.RequiredEffects) != 1 ||
 		work.Kind != graph.KindAgent || work.Metadata["authoring_template"] != "simple-task/v1" ||
-		work.ProgressContractRef != policycatalog.ProgressCodeChangeV1 ||
+		work.ProgressContractRef != policycatalog.ProgressCodeChangeCurrent ||
 		acceptance.Kind != graph.KindAcceptance || acceptance.ProgressContractRef != policycatalog.ProgressVerificationV1 ||
 		len(draft.Candidate.Nodes) != 9 {
 		t.Fatalf("simple task graph 未由 framework 完整生成: %+v", draft)

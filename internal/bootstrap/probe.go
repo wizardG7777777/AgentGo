@@ -177,7 +177,7 @@ func startupToolCapabilityProbe(w io.Writer, cfg *config.Config, timeout time.Du
 	}
 	budget := invocation.OutputBudget{
 		MaxContentBytes: 4 << 10, MaxReasoningBytes: 8 << 10, MaxExtraFieldBytes: 8 << 10,
-		MaxToolNameBytes: 128, MaxToolArgumentsBytes: 4 << 10, MaxToolCalls: 1,
+		MaxToolNameBytes: 128, MaxToolArgumentsBytes: 4 << 10, MaxToolCalls: 16,
 		MaxToolArgumentsTotalBytes: 4 << 10, MaxResponseBytes: 16 << 10, MaxCompletionTokens: 256,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -194,12 +194,13 @@ func startupToolCapabilityProbe(w io.Writer, cfg *config.Config, timeout time.Du
 		}
 		client := llm.NewSDKClientWithConfig(cfg.LLM.BaseURL, cfg.LLM.APIKey, model, "", timeout, llm.ClientConfig{
 			Protocol: protocol, Stream: cfg.LLM.Stream, ReasoningEffort: cfg.LLM.ReasoningEffort,
-			ForcedToolName: probeName, OutputBudget: budget,
+			ToolChoice: invocation.ToolChoice{Mode: invocation.ToolChoiceAuto}, OutputBudget: budget,
 		})
 		response, err := llm.InvokeLegacy(ctx, client, []llm.Message{{
 			Role: "user", Content: "Call the provided function exactly once with nonce " + probeNonce + ". Do not answer with text.",
 		}}, []llm.ToolDef{{
 			Name: probeName, Description: "Prove function-calling compatibility with one required nonce argument.",
+			Strict: true,
 			Parameters: map[string]any{
 				"type": "object", "additionalProperties": false,
 				"properties": map[string]any{
@@ -217,9 +218,14 @@ func startupToolCapabilityProbe(w io.Writer, cfg *config.Config, timeout time.Du
 			fmt.Fprintf(w, "  [FAIL] function-call capability (%v): %v\n", time.Since(started).Round(time.Millisecond), err)
 			return fmt.Errorf("provider function-call capability probe 失败: %w", err)
 		}
-		if len(response.ToolCalls) != 1 || response.ToolCalls[0].Name != probeName ||
-			len(response.ToolCalls[0].Arguments) != 1 || response.ToolCalls[0].Arguments["nonce"] != probeNonce ||
-			response.FinishReason != "tool_calls" {
+		compatible := len(response.ToolCalls) > 0 && response.FinishReason == "tool_calls"
+		for _, call := range response.ToolCalls {
+			if call.Name != probeName || len(call.Arguments) != 1 || call.Arguments["nonce"] != probeNonce {
+				compatible = false
+				break
+			}
+		}
+		if !compatible {
 			return fmt.Errorf("provider function-call capability 不兼容: calls=%d finish_reason=%s",
 				len(response.ToolCalls), response.FinishReason)
 		}

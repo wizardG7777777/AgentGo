@@ -11,6 +11,7 @@ import (
 	"agentgo/internal/contentstore"
 	"agentgo/internal/contextadapter"
 	"agentgo/internal/contextstore"
+	"agentgo/internal/graph"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
@@ -122,22 +123,22 @@ func TestSchedulerBundle_New_ModesDefaultAxes(t *testing.T) {
 	}
 }
 
-// TestSchedulerBundle_EndToEnd_UserInputToReportDone 是一个端到端集成测试。
+// TestSchedulerBundle_EndToEnd_UserInputCreatesGraphDraft 是一个端到端集成测试。
 //
 // 它模拟一个完整的请求循环：
 //  1. CLI 发送 EventUserInput（"hello"）到 eventCh
 //  2. Activator 接收事件，PublishTask 一个 EventType="__scheduler__" 的 task
 //  3. Scheduler agent poll 到该 task，进入 processTask
-//  4. SchedulerExecutor 调用 mock LLM
-//  5. mock LLM 直接返回 report_done 工具调用
-//  6. SchedulerGroup.report_done 把 summary 打印到 stdout，scheduler task 完成
+//  4. phase ToolRouter 只暴露 create_graph_draft 并冻结 required choice
+//  5. mock LLM 返回 create_graph_draft 工具调用
+//  6. GraphAuthoringStore 持久化归属当前 Scheduler task 的 Draft
 //
-// 这是 scheduler-as-agent 架构的最小验证，证明：
+// 这是 Graph-first scheduler-as-agent 架构的最小验证，证明：
 //   - Activator 桥能把 EventCh 翻译成 task
 //   - scheduler agent 能 poll 到并处理 scheduler-only task
-//   - 完整 ToolGroup 集成能正常 dispatch report_done
-//   - SchedulerGroup.report_done 能从 holder 拿到 task ID 并清空 batch
-func TestSchedulerBundle_EndToEnd_UserInputToReportDone(t *testing.T) {
+//   - auto-singleton + L3 required-action 不会放松 ToolRouter 权威
+//   - Graph authoring 生产装配确实连到 durable Store
+func TestSchedulerBundle_EndToEnd_UserInputCreatesGraphDraft(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	r := roster.NewMemoryRoster()
@@ -149,15 +150,13 @@ func TestSchedulerBundle_EndToEnd_UserInputToReportDone(t *testing.T) {
 
 	mockLLM := &scriptedLLM{
 		responses: []llm.Response{
-			// 第一轮：直接调 report_done
+			// 第一轮：按 auto-singleton 调用唯一构图工具。
 			{
 				ToolCalls: []llm.ToolCall{
 					{
-						ID:   "call_1",
-						Name: "report_done",
-						Arguments: map[string]any{
-							"summary": "用户问的是 hello，已回应",
-						},
+						ID:        "call_1",
+						Name:      "create_graph_draft",
+						Arguments: map[string]any{},
 					},
 				},
 			},
@@ -181,10 +180,18 @@ func TestSchedulerBundle_EndToEnd_UserInputToReportDone(t *testing.T) {
 		Adapter: contextadapter.New(), Policies: policies, Snapshots: snapshots, Content: contents,
 		SessionID: func() string { return "scheduler-integration" },
 	}
+	authoringStore, err := graph.NewAuthoringStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = authoringStore.Close() })
 
 	bundle := New(s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
 		nil, nil, nil, nil, nil, nil, nil, nil, nil,
-		GraphAuthoringDeps{ContextRuntime: contextRuntime})
+		GraphAuthoringDeps{
+			Store: authoringStore, Compiler: graph.DefinitionCompiler{Policies: policies},
+			ContextRuntime: contextRuntime,
+		})
 
 	// 启动 Activator + Agent
 	ctx, cancel := context.WithCancel(context.Background())
@@ -201,18 +208,20 @@ func TestSchedulerBundle_EndToEnd_UserInputToReportDone(t *testing.T) {
 		Payload: map[string]string{"text": "hello"},
 	}
 
-	// 等待 scheduler 处理完（轮询任务状态）
+	// 等待 Scheduler 首个构图动作真实落盘。
 	deadline := time.Now().Add(5 * time.Second)
 	var schedTask *model.Task
+	var draft *graph.GraphDraft
 	for time.Now().Before(deadline) {
 		tasks, _ := s.ScanAll()
 		for _, task := range tasks {
-			if task.EventType == "__scheduler__" && task.Status == model.TaskStatusCompleted {
+			if task.EventType == "__scheduler__" {
 				schedTask = task
+				draft, _ = authoringStore.GetDraft("graph-proposal-" + task.ID)
 				break
 			}
 		}
-		if schedTask != nil {
+		if schedTask != nil && draft != nil {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -221,14 +230,13 @@ func TestSchedulerBundle_EndToEnd_UserInputToReportDone(t *testing.T) {
 	cancel()
 	wg.Wait()
 
-	if schedTask == nil {
+	if schedTask == nil || draft == nil {
 		// 打印当前 store 状态便于诊断
 		tasks, _ := s.ScanAll()
-		t.Fatalf("scheduler task did not reach completed within 5s. Current tasks: %+v", tasks)
+		t.Fatalf("scheduler task did not persist GraphDraft within 5s. Current tasks: %+v", tasks)
 	}
-
-	// 验证 batch 已清空（report_done 的副作用）
-	if len(schedTask.SchedulerBatch) != 0 {
-		t.Errorf("SchedulerBatch should be cleared after report_done, got %v", schedTask.SchedulerBatch)
+	if draft.OwnerTaskID != schedTask.ID || draft.ProposalID != "graph-proposal-"+schedTask.ID ||
+		draft.GraphID != "graph-"+schedTask.ID {
+		t.Fatalf("GraphDraft 归属/稳定身份错误: task=%s draft=%+v", schedTask.ID, draft)
 	}
 }

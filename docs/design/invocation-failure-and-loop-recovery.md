@@ -36,7 +36,7 @@ production source 不再直接调用 `Client.Chat`。canonical `InvocationFailur
 L4 决策中优先，兼容 `ErrRecoverable` 只在没有 canonical failure 的显式 legacy/
 本地 Loop 路径生效，`isContextOverflow` 与字符串分类已退出生产控制流。
 
-Proposal Acceptance 已改成 exact typed verdict tool，最终 wire 只要求
+Proposal Acceptance 已改成 auto + singleton typed verdict tool + local required-action gate，最终 wire 只要求
 `verdict`，非 pass 再要求有界 `issue_code/message`；framework 生成稳定 ref。
 仓库 full/race/vet/build、真实二进制和最新 provider 单题双门已通过。仍开放
 多 provider structured code/capability fixture、兼容 wrapper 删除、三平台与8题

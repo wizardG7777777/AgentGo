@@ -31,6 +31,13 @@ func FreezeToolRouterSnapshotWithPolicy(registry *ToolRegistry, phase string, ma
 		return ToolRouterSnapshot{}, fmt.Errorf("ToolRouterSnapshot 缺少 ToolRegistry")
 	}
 	defs := registry.Defs()
+	if expected, singleton := mechanicalSingletonTool(phase); singleton {
+		if len(defs) != 1 || defs[0].Name != expected {
+			return ToolRouterSnapshot{}, fmt.Errorf(
+				"auto-singleton phase=%s 工具面必须精确为 [%s]，实际=%v",
+				phase, expected, registry.Names())
+		}
+	}
 	if maxCalls <= 0 {
 		return ToolRouterSnapshot{}, fmt.Errorf("ToolRouterSnapshot max_calls=%d 非法", maxCalls)
 	}

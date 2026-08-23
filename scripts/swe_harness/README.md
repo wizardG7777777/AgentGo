@@ -12,6 +12,12 @@ metadata、prompts、隔离 worktree 与原始运行产物；不得再维护另�
 - `SWE_TASKS_FILE` / `SWE_PROMPT_DIR` / `SWE_FLASK_REPO`：外部题目数据位置；
 - `SWE_AGENTGO_ROOT` / `SWE_AGENTGO_BIN`：AgentGo 仓库根与二进制位置（默认取仓库内构建产物）。
 
+当前 SWE 全局契约固定 `reasoning_effort=low`（thinking 仍开启），双层能力探针与
+Scheduler/Proposal 机械阶段使用 `tool_choice=auto` + singleton ToolRouter +
+L3 required-action gate。Graph 最终交付是狭义例外：历史投影收窄后，仅该次
+Invocation 覆盖为 `reasoning_effort=none` + exact `submit_task_result`；不按
+provider/model 名称分支，其余业务推理仍走 thinking。
+
 单题：
 
 ```bash

@@ -28,17 +28,22 @@ func TestStartupToolProbeExercisesRealFunctionCalling(t *testing.T) {
 		if len(tools) != 1 {
 			t.Fatalf("probe 未携带真实 tool schema: %+v", body)
 		}
-		choice, _ := body["tool_choice"].(map[string]any)
-		function, _ := choice["function"].(map[string]any)
-		probeName, _ := function["name"].(string)
 		tool, _ := tools[0].(map[string]any)
 		functionDef, _ := tool["function"].(map[string]any)
+		probeName, _ := functionDef["name"].(string)
+		if functionDef["strict"] != true {
+			t.Fatalf("Chat probe required-nonce schema 未开启 strict: %#v", functionDef["strict"])
+		}
 		parameters, _ := functionDef["parameters"].(map[string]any)
 		properties, _ := parameters["properties"].(map[string]any)
 		nonceDef, _ := properties["nonce"].(map[string]any)
 		probeNonce, _ := nonceDef["const"].(string)
-		if choice["type"] != "function" || !strings.HasPrefix(probeName, "agentgo_capability_probe_") {
-			t.Fatalf("probe 未强制 exact function tool_choice: %+v", body["tool_choice"])
+		// Chat Completions auto 是 SDK 缺省 wire，不强求显式字段。
+		if choice, present := body["tool_choice"]; present && choice != "auto" {
+			t.Fatalf("probe 未使用 auto-singleton tool_choice: %+v", choice)
+		}
+		if !strings.HasPrefix(probeName, "agentgo_capability_probe_") {
+			t.Fatalf("probe singleton tool 名错误: %q", probeName)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id": "probe", "object": "chat.completion", "created": 1, "model": "test-model",
@@ -46,10 +51,16 @@ func TestStartupToolProbeExercisesRealFunctionCalling(t *testing.T) {
 				"index": 0, "finish_reason": "tool_calls",
 				"message": map[string]any{
 					"role": "assistant", "content": "",
-					"tool_calls": []any{map[string]any{
-						"id": "call-probe", "type": "function",
-						"function": map[string]any{"name": probeName, "arguments": fmt.Sprintf(`{"nonce":%q}`, probeNonce)},
-					}},
+					"tool_calls": []any{
+						map[string]any{
+							"id": "call-probe-1", "type": "function",
+							"function": map[string]any{"name": probeName, "arguments": fmt.Sprintf(`{"nonce":%q}`, probeNonce)},
+						},
+						map[string]any{
+							"id": "call-probe-2", "type": "function",
+							"function": map[string]any{"name": probeName, "arguments": fmt.Sprintf(`{"nonce":%q}`, probeNonce)},
+						},
+					},
 				},
 			}},
 			"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
@@ -78,10 +89,15 @@ func TestStartupToolProbeUsesResponsesTypedItemMainline(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
-		choice, _ := body["tool_choice"].(map[string]any)
-		name, _ := choice["name"].(string)
 		tools, _ := body["tools"].([]any)
 		tool, _ := tools[0].(map[string]any)
+		name, _ := tool["name"].(string)
+		if tool["strict"] != true {
+			t.Fatalf("Responses probe required-nonce schema 未开启 strict: %#v", tool["strict"])
+		}
+		if body["tool_choice"] != "auto" {
+			t.Fatalf("Responses probe 未使用 auto-singleton: %#v", body["tool_choice"])
+		}
 		parameters, _ := tool["parameters"].(map[string]any)
 		properties, _ := parameters["properties"].(map[string]any)
 		nonceDef, _ := properties["nonce"].(map[string]any)
@@ -123,12 +139,10 @@ func TestStartupToolProbeRetriesInconclusiveTruncationWithinFrozenDeadline(t *te
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
-		choice, _ := body["tool_choice"].(map[string]any)
-		function, _ := choice["function"].(map[string]any)
-		probeName, _ := function["name"].(string)
 		tools, _ := body["tools"].([]any)
 		tool, _ := tools[0].(map[string]any)
 		functionDef, _ := tool["function"].(map[string]any)
+		probeName, _ := functionDef["name"].(string)
 		parameters, _ := functionDef["parameters"].(map[string]any)
 		properties, _ := parameters["properties"].(map[string]any)
 		nonceDef, _ := properties["nonce"].(map[string]any)
@@ -206,8 +220,9 @@ func TestStartupToolProbeRejectsWrongFunctionIdentity(t *testing.T) {
 				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 					t.Fatal(err)
 				}
-				choice, _ := body["tool_choice"].(map[string]any)
-				function, _ := choice["function"].(map[string]any)
+				tools, _ := body["tools"].([]any)
+				tool, _ := tools[0].(map[string]any)
+				function, _ := tool["function"].(map[string]any)
 				requestedName, _ := function["name"].(string)
 				toolName := test.toolName
 				if test.name == "unexpected arguments" {

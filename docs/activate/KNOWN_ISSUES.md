@@ -16,28 +16,41 @@ durable Store 和生产接线，并通过 full/race/vet/build、harness 单测�
   它不会篡改、重放或自动补偿 Effect Journal 中的 prepared/unknown 外部副作用。
   这类 Effect 仍需按 Effect authority 进行人工核验。
 - **基础层/L2 provider 证据**：Responses typed-item/SSE、Context v8/Replay v3、
-  动态 OutputBudget 与 required-nonce `startup_probe=tool` 已接入；OpenRouter Luna
-  单题已通过，但仍开放真实 tokenizer 与更多 provider-specific SSE/usage fixture，
-  不把一个 provider/model 外推成所有后端能力。
+  动态 OutputBudget 与 strict required-nonce `startup_probe=tool` 已接入。DeepSeek
+  `deepseek-v4-flash` 的空 `message.content=[]` 现经“typed 校验 + raw exact
+  override”跨轮保真，真实两轮 probe、Worker replay、thinking 单题与 8 题
+  批次均未再出现 provider `invalid_request`。真实 API 矩阵证明 thinking
+  拒绝 exact/required，但 auto + tools 成功；因此常规机械阶段使用 auto +
+  singleton + L3 required-action gate。Graph 最终交付对历史工具有粘滞重放，
+  经 live test 收窄为“交付历史投影 + phase contract + 单次 `reasoning=none`
+  + exact submit”。当前只保留更多 provider-specific SSE/usage fixture 与三平台
+  CI 作为发布级扩展证据；不把单个模型外推成所有后端能力。详见
+  [`DeepSeek Responses 精确重放事故与单题回归`](../test-issues/2026-08-23-0500-deepseek-responses-exact-replay.md)。
 - **SWE-015…019 实现已关闭**：Response replay、Raw History projection、Attempt/
   deadline、Scheduler phase Prompt/ToolRouter、真实 Lease、Tool batch/ToolResultRef
   已完成，并通过 full/race/vet/build/真实二进制验证。完成记录见
   [`第六轮 0/8 分层诊断`](../test-issues/2026-08-22-1510-swe-round6-zero-of-eight-layered-diagnosis.md) 第12节。
 - **SWE-020…026 实现已落地**：versioned harness、typed/bounded runtime snapshot、
   Context v8、Run/Attempt 与 Invocation-failure 进展分离、simple Graph/current
-  transaction、typed Proposal Acceptance、Graph intervention scope 已进入生产主链；
-  仍需一批8题证明跨题稳定性，当前不标 external-closed。
-- **SWE-027/028 已修复并获单题证据**：Responses typed-item 主链消除了正文工具
-  猜测，verification 新证据超出 exploration allowance 后改为 exact
-  `submit_task_result` 交付阶段，不再直接 blocked。仍需一批8题验证跨题稳定性。
-- **验证横切面**：仓库内 SWE harness 与最新 `automatic-options` 单题已实际运行。
-  最新脱敏结果为 `architecture_ok=true / task_resolved=true`：OpenRouter Responses
-  + Luna，94 秒，首轮 Prompt 2205 tokens，GraphDraft 第1次调用产生，revision=1、
-  3 activations、typed outcome=success、TaskOutcome 全部 commit/ACK、known incidents=0，
-  Judge 为 resolved（494 passed）。尚未运行本阶段8题，因此 SWE-011～028 仍不能
-  仅凭单题标记 external-closed。详见
-  [`Responses 主链与单题成功`](../test-issues/2026-08-23-0109-responses-mainline-and-single-task-success.md)。
-  三平台 CI 仍是发布层开放证据。
+  transaction、typed Proposal Acceptance、Graph intervention scope 已进入生产主链，
+  并获得一批8题真实运行证据。
+- **SWE-027/028 已修复并获多题证据**：Responses typed-item 主链消除了正文工具
+  猜测，verification 新证据超出 exploration allowance 后改为 auto-singleton + L3 required-action
+  `submit_task_result` 交付阶段，不再直接 blocked。
+- **SWE-032 实现与外部验证已关闭**：code-change/v1 在 rollover 用尽后于
+  第 7 轮提前 intervention，违反声明的 `InterventionAfterTurns=9`。状态机现只按
+  intervention 阈值介入；新 code-change Task 冻结 v3（4/10/18/24），v1/v2 保留供历史恢复。
+- **验证横切面**：仓库内 SWE harness 已分别实际运行 OpenRouter Luna 与 DeepSeek
+  真实 thinking 路径。最终冻结二进制的 DeepSeek 8 题完整批次为
+  `architecture_ok=8/8`、Judge resolved 5/8；三题未解均进入 typed blocked、
+  known incident=0，是模型未产出补丁的业务失败，不是 API/系统拦截。
+  同一最终二进制对受影响路径的独立复跑中，
+  `automatic-options` 为 494/494，`ipv6-server-name` 为 493/493，
+  `teardown-callbacks` 为 495/495，`session-access-tracking` 最终复跑为
+  490/490，均 `architecture_ok=true / task_resolved=true`；因此 8 题中只有
+  `pass-context-dispatch` 尚无业务 resolved 证据。
+  三平台 CI 仍是发布层开放证据。详见 [`Responses 主链与单题成功`](../test-issues/2026-08-23-0109-responses-mainline-and-single-task-success.md)
+  与 [`DeepSeek Responses 精确重放事故`](../test-issues/2026-08-23-0500-deepseek-responses-exact-replay.md)。
 
 统一状态与后续顺序见
 [`SWE 架构修复统一实施路线图`](../design/swe-architecture-repair-roadmap.md)。

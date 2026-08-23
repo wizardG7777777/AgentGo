@@ -91,6 +91,37 @@ func TestSDKClient_ReasoningEffortIsSent(t *testing.T) {
 	}
 }
 
+func TestSDKClient_ContextBindingOverridesReasoningEffort(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(openaiResponse("ok", nil))
+	}))
+	defer server.Close()
+	binding := invocation.ContextBinding{
+		Schema: invocation.ContextBindingSchemaV1, InvocationID: "invocation-reasoning-none",
+		ContextSnapshotID: "snapshot-1", ContextPolicyID: "context:default/v8",
+		ToolRouterSnapshotID: "router-1", EncodedRequestDigest: "sha256:request",
+		OutputBudget: DefaultOutputBudget(), ReasoningEffort: "none",
+	}
+	ctx, err := invocation.WithContextBinding(context.Background(), binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := NewSDKClientWithConfig(server.URL, "key", "gpt-test", "", 30*time.Second, ClientConfig{
+		ReasoningEffort: "low",
+	})
+	if _, err := client.Chat(ctx, []Message{{Role: "user", Content: "test"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := body["reasoning_effort"]; got != "none" {
+		t.Fatalf("ContextBinding reasoning override 未覆盖全局 low: %#v", got)
+	}
+}
+
 func TestSDKClient_ContextBindingRequiresToolCall(t *testing.T) {
 	var body map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

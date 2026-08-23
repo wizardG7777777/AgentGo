@@ -24,7 +24,13 @@ const (
 	ReplayOpenAICompatibleV2 = "provider-replay:openai-compatible/v2"
 	ReplayOpenAICompatibleV3 = "provider-replay:openai-compatible/v3"
 
-	ProgressCodeChangeV1    = "progress:code-change/v1"
+	ProgressCodeChangeV1 = "progress:code-change/v1"
+	ProgressCodeChangeV2 = "progress:code-change/v2"
+	ProgressCodeChangeV3 = "progress:code-change/v3"
+	// ProgressCodeChangeCurrent 只供新 Task/Graph authoring 选用；
+	// 历史 Task 必须继续使用已冻结的 v1。
+	ProgressCodeChangeCurrent = ProgressCodeChangeV3
+
 	ProgressInvestigationV1 = "progress:investigation/v1"
 	ProgressVerificationV1  = "progress:verification/v1"
 	ProgressCoordinationV1  = "progress:coordination/v1"

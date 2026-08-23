@@ -198,9 +198,15 @@ func TestProgressPolicyReminderRolloverThenTypedIntervention(t *testing.T) {
 	interventionCP.NoProgressTurns = 2
 	interventionCP.AttemptRolloverCount = 1
 	decision, command = decideProgressPolicy(contract, task, &interventionCP)
+	if decision.Intervention || decision.Blocked || decision.Rollover || command != nil ||
+		decision.Reminder == "" || interventionCP.InterventionStage != loopcontract.StageReminder {
+		t.Fatalf("rollover 用尽不得早于 intervention 阈值阻断: decision=%+v command=%+v", decision, command)
+	}
+	interventionCP.NoProgressTurns = 3
+	decision, command = decideProgressPolicy(contract, task, &interventionCP)
 	if !decision.Intervention || decision.Blocked || command == nil ||
 		interventionCP.InterventionStage != loopcontract.StageInterventionRequired {
-		t.Fatalf("Intervention 决策错误: decision=%+v command=%+v", decision, command)
+		t.Fatalf("Intervention 阈值决策错误: decision=%+v command=%+v", decision, command)
 	}
 	if err := command.Validate(); err != nil {
 		t.Fatalf("typed LoopInterventionRequested 无效: %v", err)
@@ -225,6 +231,39 @@ func TestNovelVerificationEvidenceEntersForcedDeliverablePhaseInsteadOfBlocked(t
 		!strings.Contains(decision.Reminder, progressDeliverableRequiredMarker) ||
 		checkpoint.InterventionStage != loopcontract.StageReminder {
 		t.Fatalf("novel evidence 被错误阻断: decision=%+v command=%+v checkpoint=%+v", decision, command, checkpoint)
+	}
+}
+
+func TestCompletedFileDeliverableEntersSubmitPhaseInsteadOfIntervention(t *testing.T) {
+	task := enforcementTask(t)
+	task.GraphID = "graph-code-change"
+	contract := *task.ProgressContract
+	contract.WorkClass = loopcontract.WorkCodeChange
+	contract.Policy.InterventionAfterTurns = 3
+	contract.Policy.MaxNoProgressTurns = 5
+	contract.AcceptedSignals = []loopcontract.ProgressSignalRule{{
+		Kind: loopcontract.SignalFileVersionChanged, IdentityScope: "**", Deliverable: true,
+	}}
+	checkpoint := loopcontract.ProgressCheckpoint{
+		Schema: loopcontract.CheckpointSchemaV1, CheckpointID: "checkpoint-file-deliverable", Version: 4,
+		RunID: task.RunID, GraphID: task.GraphID, TaskID: task.ID, AttemptID: "attempt-1",
+		Contract: contract.Ref, NoProgressTurns: 3, InterventionStage: loopcontract.StageRunning,
+		RecentFingerprints: []loopcontract.ProgressFingerprint{{
+			Kind: loopcontract.SignalFileVersionChanged, Identity: "src/flask/app.py", Digest: "sha256:changed",
+		}},
+		UpdatedAt: time.Now().UTC(),
+	}
+	decision, command := decideProgressPolicy(contract, task, &checkpoint)
+	if decision.Blocked || decision.Intervention || command != nil ||
+		!strings.Contains(decision.Reminder, progressDeliverableRequiredMarker) ||
+		checkpoint.InterventionStage != loopcontract.StageReminder {
+		t.Fatalf("已有文件交付的 Graph 任务应进入强制提交，不应 intervention: decision=%+v command=%+v", decision, command)
+	}
+
+	checkpoint.RecentFingerprints = nil
+	decision, command = decideProgressPolicy(contract, task, &checkpoint)
+	if !decision.Intervention || command == nil {
+		t.Fatalf("没有交付证据时仍应按契约 intervention: decision=%+v command=%+v", decision, command)
 	}
 }
 
