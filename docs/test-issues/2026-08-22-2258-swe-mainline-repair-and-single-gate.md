@@ -61,6 +61,9 @@ blocked；Judge 红态与 baseline 一致。
 只作为 `task` / `batch` 的内部固定阶段，正式入口收敛为 Python 子命令，仓库与
 `/tmp/agentgo-swe` 均不再保留 Bash 测试脚本或包装器。
 
+CLI stdout 固定区分目标红态、全量红态、AgentGo 执行与最终 Judge 四个阶段；每个
+pytest 阶段打印范围、判定目标和结构化计数，避免把两次独立基线误读成累计失败。
+
 - preflight 与每实例 startup probe 都发送真实 function schema；工具名随机化，
   只接受唯一 exact tool call、空参数和 `finish_reason=tool_calls`；
 - startup probe 在同一 45 秒总 deadline 内只对 typed 瞬时/截断失败有界重采样，

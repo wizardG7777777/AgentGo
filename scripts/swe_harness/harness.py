@@ -839,8 +839,8 @@ def setup_task(config: HarnessConfig, task: TaskSpec, target: Path | None = None
         "import importlib.metadata as m,sys; "
         "print(f'env-ok: flask={m.version(\"flask\")} pytest={m.version(\"pytest\")} py={sys.version.split()[0]}')",
     ], cwd=worktree)
-    print(info.stdout.decode("utf-8", errors="replace").strip())
-    print(f"worktree 就绪: {worktree}")
+    print("[环境准备] " + info.stdout.decode("utf-8", errors="replace").strip())
+    print(f"[环境准备] worktree 就绪: {worktree}")
     return worktree
 
 
@@ -888,12 +888,43 @@ def run_pytest(worktree: Path, junit_path: Path, log_path: Path,
     completed = run_command(command, cwd=worktree, check=False)
     output = completed.stdout + completed.stderr
     log_path.write_bytes(output)
-    tail = output.decode("utf-8", errors="replace").splitlines()[-3:]
-    if tail:
-        print("\n".join(tail))
     result = parse_junit(junit_path)
     result["exit_code"] = completed.returncode
+    result["summary_tail"] = output.decode("utf-8", errors="replace").splitlines()[-3:]
     return result
+
+
+def print_stage_header(task_id: str, index: int, total: int, title: str,
+                       scope: str, objective: str) -> None:
+    print(f"\n[第{index}/{total}阶段][{title}][task={task_id}]")
+    print(f"测试内容：{title}")
+    print(f"测试范围：{scope}")
+    print(f"判定目标：{objective}")
+
+
+def print_pytest_stage_result(result: dict, expectation: str) -> bool:
+    tail = result.get("summary_tail") or []
+    if tail:
+        print("pytest 原始摘要：")
+        print("\n".join(str(line) for line in tail))
+    if expectation == "red":
+        matched = int(result.get("failed") or 0) + int(result.get("errors") or 0) > 0
+        conclusion = "符合预期红态，目标缺陷已复现" if matched else "未形成预期红态，考题无效"
+    elif expectation == "green":
+        matched = (
+            int(result.get("failed") or 0) == 0
+            and int(result.get("errors") or 0) == 0
+            and int(result.get("passed") or 0) > 0
+        )
+        conclusion = "测试通过" if matched else "测试未通过"
+    else:
+        raise ValueError(f"未知 pytest 阶段期望: {expectation}")
+    print(
+        f"阶段结果：{conclusion}；tests={int(result.get('tests') or 0)} "
+        f"passed={int(result.get('passed') or 0)} failed={int(result.get('failed') or 0)} "
+        f"errors={int(result.get('errors') or 0)} skipped={int(result.get('skipped') or 0)}"
+    )
+    return matched
 
 
 def prepare_task(config: HarnessConfig, task: TaskSpec) -> dict:
@@ -907,25 +938,34 @@ def prepare_task(config: HarnessConfig, task: TaskSpec) -> dict:
         "commit", "-q", "-m", f"harness: 预置期望行为测试（考题 {task.task_id}）", "--", "tests/",
     ], cwd=worktree)
 
+    print_stage_header(
+        task.task_id, 1, 4, "目标测试红态确认",
+        " ".join(task.test_files),
+        "修复前至少出现 1 个 failed/error，证明目标缺陷可以稳定复现",
+    )
     red = run_pytest(
         worktree, run_dir / "targeted-baseline.junit.xml",
         run_dir / "targeted-baseline.pytest.log", task.test_files,
     )
-    if red["failed"] + red["errors"] == 0:
+    if not print_pytest_stage_result(red, "red"):
         raise RuntimeError(f"未确认红状态，考题 {task.task_id} 准备失败")
+    print_stage_header(
+        task.task_id, 2, 4, "全量测试红态基线",
+        "当前 Flask worktree 的完整 pytest 测试集",
+        "记录 Agent 执行前的全量基线；允许目标缺陷失败，但必须准确保存 failed/error 计数",
+    )
     baseline = run_pytest(
         worktree, run_dir / "baseline.junit.xml", run_dir / "baseline.pytest.log",
     )
+    if not print_pytest_stage_result(baseline, "red"):
+        raise RuntimeError(f"全量基线未保持红态，考题 {task.task_id} 准备失败")
     report = {
         key: baseline[key] for key in ("tests", "passed", "failed", "errors", "skipped", "exit_code")
     }
     report["note"] = "base 红态基线（agent 运行前全量 pytest）"
     atomic_json(run_dir / "baseline.json", report)
     (run_dir / "fix_sha").write_text(task.fix_sha + "\n", encoding="utf-8")
-    print(
-        f"考题 {task.task_id} 就绪：passed={baseline['passed']} "
-        f"failed={baseline['failed']} errors={baseline['errors']}"
-    )
+    print(f"阶段结论：考题 {task.task_id} 红态准备完成，进入 AgentGo 修复执行")
     return report
 
 
@@ -1049,6 +1089,11 @@ def run_task(config: HarnessConfig, task: TaskSpec, timeout_sec: int) -> dict:
     if not config.agentgo_bin.is_file():
         raise RuntimeError(f"AgentGo 二进制不存在: {config.agentgo_bin}")
 
+    print_stage_header(
+        task.task_id, 3, 4, "AgentGo 修复执行",
+        f"worktree={worktree}",
+        "完成 Graph commit/start、代码修改、Acceptance 与 typed Graph outcome，并安全收口进程",
+    )
     run_dir = config.run_dir(task.task_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     clean_run_outputs(run_dir)
@@ -1067,20 +1112,22 @@ def run_task(config: HarnessConfig, task: TaskSpec, timeout_sec: int) -> dict:
             stderr=subprocess.STDOUT,
             **popen_options,
         )
-        print(f"agentgo pid={process.pid} port={port}")
+        print(f"执行状态：AgentGo 已启动 pid={process.pid} port={port}")
         try:
             wait_for_agentgo(process, base_url, log_path)
             contract = inject_request(
                 base_url, token, str(prompt), task.task_id, timeout_sec,
                 str(run_dir / "run_contract.json"),
             )
-            print(json.dumps({"inject": 200, "run_id": contract["run_id"]}, ensure_ascii=False))
+            print("执行状态：RunContract 注入成功 " + json.dumps({
+                "inject": 200, "run_id": contract["run_id"],
+            }, ensure_ascii=False))
             monitor = monitor_run(
                 base_url, token, process.pid, contract["run_id"], started_at, timeout_sec,
                 str(run_dir / "snapshot.final.json"), poll_sec=3, terminal_grace_sec=30,
             )
             atomic_json(run_dir / "monitor.json", monitor)
-            print(json.dumps(monitor, ensure_ascii=False))
+            print("执行状态：Graph/进程监控终态 " + json.dumps(monitor, ensure_ascii=False))
             try:
                 status, snapshot = http_json(base_url + "/api/snapshot", token)
                 if status == 200:
@@ -1099,7 +1146,12 @@ def run_task(config: HarnessConfig, task: TaskSpec, timeout_sec: int) -> dict:
         str(worktree), run_id, True,
     )
     atomic_json(run_dir / "result.json", result)
-    print(json.dumps(result, ensure_ascii=False))
+    print(
+        f"阶段结果：AgentGo 执行结束；architecture_ok={result.get('architecture_ok', False)} "
+        f"graph_outcomes={result.get('graph_outcomes', [])} "
+        f"external_hard_kill={result.get('external_hard_kill', False)}"
+    )
+    print("运行结果明细：" + json.dumps(result, ensure_ascii=False))
     return result
 
 
@@ -1120,11 +1172,16 @@ def judge_task(config: HarnessConfig, task: TaskSpec) -> dict:
     worktree = config.worktree(task.task_id)
     run_dir = config.run_dir(task.task_id)
     run_dir.mkdir(parents=True, exist_ok=True)
+    print_stage_header(
+        task.task_id, 4, 4, "最终全量 Judge",
+        "AgentGo 修改后的完整 Flask pytest 测试集",
+        "failed=0、errors=0 且至少 1 个测试通过；同时检查测试文件未被篡改并生成 model.patch",
+    )
     pytest = run_pytest(
         worktree, run_dir / "judge.junit.xml", run_dir / "judge.pytest.log",
     )
-    verdict = "resolved" if pytest["failed"] == 0 and pytest["errors"] == 0 and pytest["passed"] > 0 \
-        else "failed"
+    pytest_green = print_pytest_stage_result(pytest, "green")
+    verdict = "resolved" if pytest_green else "failed"
     test_files = test_files_at_fix(config, task)
     tampered_files: list[str] = []
     for name in test_files:
@@ -1173,7 +1230,11 @@ def judge_task(config: HarnessConfig, task: TaskSpec) -> dict:
             else:
                 report["red_note"] = "红态轻于基线：部分修复但未全绿"
     atomic_json(run_dir / "judge.json", report)
-    print(json.dumps(report, ensure_ascii=False))
+    print(
+        f"阶段结论：最终 Judge verdict={report['verdict']} patch_lines={report['patch_lines']} "
+        f"tampered={report['tampered']}"
+    )
+    print("Judge 结构化结果：" + json.dumps(report, ensure_ascii=False))
     return report
 
 
@@ -1202,7 +1263,7 @@ def execute_task(config: HarnessConfig, task: TaskSpec, timeout_sec: int) -> dic
         str(config.run_dir(task.task_id) / "result.json"),
         str(config.run_dir(task.task_id) / "judge.json"),
     )
-    print(json.dumps({
+    print("任务最终结论：" + json.dumps({
         "architecture_ok": result.get("architecture_ok", False),
         "task_resolved": result.get("task_resolved", False),
         "judge_verdict": result.get("judge_verdict", "unknown"),
@@ -1237,11 +1298,17 @@ def require_api_key() -> str:
 
 
 def preflight_probe(config: HarnessConfig, timeout_sec: int = 45) -> None:
+    print("\n[前置检查][Provider typed function-call 能力探针]")
+    print(
+        f"检查内容：provider={config.base_url.rstrip('/')} "
+        f"protocol={config.protocol} model={config.model}"
+    )
+    print("判定目标：返回工具名、call_id 与 nonce 参数均正确的 typed function call")
     run_provider_probe(
         config.base_url, require_api_key(), config.model, config.protocol, timeout_sec,
     )
     print(
-        f"typed function-call 活探针通过: {config.base_url.rstrip('/')} "
+        f"检查结果：typed function-call 活探针通过；provider={config.base_url.rstrip('/')} "
         f"protocol={config.protocol} model={config.model}"
     )
 
@@ -1252,31 +1319,51 @@ def verify_candidates(config: HarnessConfig) -> dict[str, int]:
     lines: list[str] = []
     counts = collections.Counter()
     for task in load_tasks(config.tasks_file):
-        lines.append(f"=== {task.task_id} ({task.fix_sha}) {task.title}")
+        heading = f"=== {task.task_id} ({task.fix_sha}) {task.title}"
+        lines.append(heading)
+        print(f"\n{heading}")
         target = config.testbed / "worktrees" / f"verify-{task.task_id}"
         try:
             worktree = setup_task(config, task, target=target)
             run_dir = config.testbed / "runs" / f"verify-{task.task_id}"
+            print_stage_header(
+                task.task_id, 1, 3, "候选题干净基线",
+                "修复前提交的完整 pytest 测试集（尚未应用 golden tests）",
+                "failed=0 且 errors=0，排除环境或历史基线故障",
+            )
             clean = run_pytest(
                 worktree, run_dir / "clean.junit.xml", run_dir / "clean.pytest.log",
             )
-            if clean["failed"] + clean["errors"]:
+            clean_ok = print_pytest_stage_result(clean, "green")
+            if not clean_ok:
                 status = "ENV-FAIL"
                 detail = "干净 base 不全绿"
             else:
                 apply_fix_slice(config, task, worktree, "tests/")
+                print_stage_header(
+                    task.task_id, 2, 3, "候选题 golden tests 红态",
+                    "应用 golden tests 后的目标测试文件",
+                    "至少出现 1 个 failed/error，证明候选题能复现目标缺陷",
+                )
                 red = run_pytest(
                     worktree, run_dir / "red.junit.xml", run_dir / "red.pytest.log", task.test_files,
                 )
-                if red["failed"] + red["errors"] == 0:
+                red_ok = print_pytest_stage_result(red, "red")
+                if not red_ok:
                     status = "INVALID"
                     detail = "base+test patch 不红"
                 else:
                     apply_fix_slice(config, task, worktree, "src/")
+                    print_stage_header(
+                        task.task_id, 3, 3, "候选题 source fix 绿态",
+                        "应用 golden source fix 后的完整 pytest 测试集",
+                        "failed=0 且 errors=0，证明候选题存在有效官方修复",
+                    )
                     green = run_pytest(
                         worktree, run_dir / "green.junit.xml", run_dir / "green.pytest.log",
                     )
-                    if green["failed"] + green["errors"]:
+                    green_ok = print_pytest_stage_result(green, "green")
+                    if not green_ok:
                         status = "FIX-FAIL"
                         detail = "打完 fix 仍有失败"
                     else:
@@ -1304,6 +1391,7 @@ def command_probe(args: argparse.Namespace) -> int:
 
 def command_task(args: argparse.Namespace) -> int:
     config = HarnessConfig.from_env()
+    print(f"\n===== 启动单题任务：{args.task_id} =====")
     preflight_probe(config, args.probe_timeout)
     result = execute_task(config, find_task(config, args.task_id), args.timeout)
     return final_exit_code(result)
@@ -1318,7 +1406,10 @@ def command_batch(args: argparse.Namespace) -> int:
     runs_dir.mkdir(parents=True, exist_ok=True)
     (runs_dir / ".batch_start").write_text(str(batch_start) + "\n", encoding="utf-8")
     for task in tasks:
-        print(f"===== {dt.datetime.now().strftime('%H:%M:%S')} {task.task_id}: {task.title}")
+        print(
+            f"\n===== 批次任务 {dt.datetime.now().strftime('%H:%M:%S')} "
+            f"{task.task_id}: {task.title} ====="
+        )
         result = execute_task(config, task, args.timeout)
         if not result.get("architecture_ok"):
             print(f"架构门失败，停止批次: {task.task_id}", file=os.sys.stderr)

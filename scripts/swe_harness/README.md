@@ -42,6 +42,19 @@ python3 scripts/swe_harness/harness.py probe
 `prepare`、`run`、`judge` 是 `task` / `batch` 内部的固定阶段，不提供独立 CLI
 入口，避免绕过能力探针、终态采集或最终判题。
 
+每道题的终端输出固定标注四个阶段，并在 pytest 阶段同时打印测试内容、测试范围、
+判定目标、原始摘要以及 `tests/passed/failed/errors/skipped` 结构化计数：
+
+```text
+[第1/4阶段][目标测试红态确认]
+[第2/4阶段][全量测试红态基线]
+[第3/4阶段][AgentGo 修复执行]
+[第4/4阶段][最终全量 Judge]
+```
+
+前两阶段出现 `FAILED` 是题目有效性的预期红态；只有第四阶段是修复后的最终测试
+结论。Provider function-call 探针独立标为 `[前置检查]`，不混入四个任务阶段。
+
 验证所有候选题目的“干净基线绿 → test patch 红 → source fix 绿”语义：
 
 ```console

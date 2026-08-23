@@ -32,7 +32,8 @@ durable Store 和生产接线，并通过 full/race/vet/build、harness 单测�
   [`第六轮 0/8 分层诊断`](../test-issues/2026-08-22-1510-swe-round6-zero-of-eight-layered-diagnosis.md) 第12节。
 - **SWE-020…026 实现已落地**：versioned harness 已进一步收敛为单一 Python CLI
   （prepare/run/judge 仅为 task/batch 内部固定阶段，不再经过或暴露 Bash 式分段
-  入口；批次门失败返回非零退出码）、
+  入口；批次门失败返回非零退出码；stdout 以四阶段标签明确区分预期红态、Agent
+  执行与最终 Judge）、
   typed/bounded runtime snapshot、
   Context v8、Run/Attempt 与 Invocation-failure 进展分离、simple Graph/current
   transaction、typed Proposal Acceptance、Graph intervention scope 已进入生产主链，

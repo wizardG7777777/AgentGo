@@ -28,6 +28,29 @@ def probe_response(name=harness.PROBE_NAME, arguments=None, finish="tool_calls")
 
 
 class HarnessContractTest(unittest.TestCase):
+    def test_pytest_output_has_stage_scope_objective_and_structured_counts(self):
+        result = {
+            "tests": 133,
+            "passed": 132,
+            "failed": 1,
+            "errors": 0,
+            "skipped": 0,
+            "summary_tail": ["FAILED tests/test_basic.py::test_ipv6", "1 failed, 132 passed"],
+        }
+        with mock.patch("builtins.print") as printer:
+            harness.print_stage_header(
+                "ipv6-server-name", 1, 4, "目标测试红态确认",
+                "tests/test_basic.py", "至少出现 1 个 failed/error",
+            )
+            self.assertTrue(harness.print_pytest_stage_result(result, "red"))
+        rendered = "\n".join(str(call.args[0]) for call in printer.call_args_list)
+        for expected in (
+            "[第1/4阶段]", "目标测试红态确认", "测试范围：tests/test_basic.py",
+            "判定目标：至少出现 1 个 failed/error", "pytest 原始摘要",
+            "符合预期红态", "tests=133 passed=132 failed=1 errors=0 skipped=0",
+        ):
+            self.assertIn(expected, rendered)
+
     def test_cli_exposes_only_complete_transactions(self):
         root = harness.parser()
         subparsers = next(
