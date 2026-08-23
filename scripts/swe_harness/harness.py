@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
-"""AgentGo SWE 系统回归的无第三方依赖权威工具。
+"""AgentGo SWE 系统回归的无第三方依赖 Python 权威入口。
 
-本文件只处理运行契约、能力探针、终态判定和脱敏指标。Flask 题目、worktree、
-原始日志和凭证始终留在外部 testbed；输出不得包含 prompt、reasoning 或工具参数。
+本文件统一处理考题准备、进程编排、运行契约、能力探针、终态判定、Judge 和脱敏
+指标。Flask 题目、worktree、原始日志和凭证始终留在外部 testbed；输出不得包含
+prompt、reasoning 或工具参数。
 """
 
 from __future__ import annotations
 
 import argparse
 import collections
+import csv
 import datetime as dt
 import glob
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import ssl
 import subprocess
-import tempfile
 import time
 import urllib.error
 import urllib.request
 import uuid
+import xml.etree.ElementTree as ET
 
 
 RUN_SCHEMA = "agentgo.run-contract/v1"
@@ -30,6 +40,105 @@ TERMINAL_TASK = {"completed", "failed", "blocked", "cancelled"}
 TERMINAL_GRAPH = {"completed", "failed", "blocked", "cancelled"}
 TERMINAL_OUTCOME = {"success", "failed", "blocked", "cancelled"}
 NANOSECOND = 1_000_000_000
+TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+EXIT_HARNESS_FAILURE = 1
+EXIT_ARCHITECTURE_FAILURE = 2
+EXIT_TASK_FAILURE = 3
+
+
+class HarnessConfig:
+    """从统一 SWE_* 环境变量解析的运行配置。"""
+
+    def __init__(self, agentgo_root: Path, agentgo_bin: Path, testbed: Path,
+                 tasks_file: Path, prompt_dir: Path, flask_repo: Path,
+                 base_url: str, model: str, protocol: str):
+        self.agentgo_root = agentgo_root
+        self.agentgo_bin = agentgo_bin
+        self.testbed = testbed
+        self.tasks_file = tasks_file
+        self.prompt_dir = prompt_dir
+        self.flask_repo = flask_repo
+        self.base_url = base_url
+        self.model = model
+        self.protocol = protocol
+
+    @classmethod
+    def from_env(cls) -> "HarnessConfig":
+        repo_root = Path(__file__).resolve().parents[2]
+        agentgo_root = Path(os.environ.get("SWE_AGENTGO_ROOT", repo_root)).resolve()
+        testbed = Path(os.environ.get("SWE_TESTBED", "/tmp/agentgo-swe")).resolve()
+        binary_default = agentgo_root / ("agentgo.exe" if os.name == "nt" else "agentgo")
+        protocol = os.environ.get("SWE_PROTOCOL", "responses")
+        if protocol not in {"responses", "chat_completions"}:
+            raise ValueError(f"未知 SWE_PROTOCOL={protocol!r}")
+        return cls(
+            agentgo_root=agentgo_root,
+            agentgo_bin=Path(os.environ.get("SWE_AGENTGO_BIN", binary_default)).resolve(),
+            testbed=testbed,
+            tasks_file=Path(os.environ.get(
+                "SWE_TASKS_FILE", testbed / "harness" / "tasks.csv")).resolve(),
+            prompt_dir=Path(os.environ.get(
+                "SWE_PROMPT_DIR", testbed / "harness" / "prompts")).resolve(),
+            flask_repo=Path(os.environ.get(
+                "SWE_FLASK_REPO", "/Users/yanchenyu/Documents/PythonProjects/flask")).resolve(),
+            base_url=os.environ.get("SWE_BASE_URL", "https://openrouter.ai/api/v1"),
+            model=os.environ.get("SWE_MODEL", "openai/gpt-5.6-luna"),
+            protocol=protocol,
+        )
+
+    def worktree(self, task_id: str) -> Path:
+        return self.testbed / "worktrees" / validate_task_id(task_id)
+
+    def run_dir(self, task_id: str) -> Path:
+        return self.testbed / "runs" / validate_task_id(task_id)
+
+
+class TaskSpec:
+    def __init__(self, task_id: str, fix_sha: str, test_files: tuple[str, ...], title: str):
+        self.task_id = validate_task_id(task_id)
+        self.fix_sha = fix_sha
+        self.test_files = test_files
+        self.title = title
+
+
+def validate_task_id(task_id: str) -> str:
+    if not TASK_ID_PATTERN.fullmatch(task_id) or task_id in {".", ".."}:
+        raise ValueError(f"非法考题 ID: {task_id!r}")
+    return task_id
+
+
+def load_tasks(path: str | Path) -> list[TaskSpec]:
+    tasks: list[TaskSpec] = []
+    seen: set[str] = set()
+    with Path(path).open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        expected = {"task_id", "fix_sha", "test_files", "title"}
+        if not reader.fieldnames or not expected.issubset(reader.fieldnames):
+            raise ValueError(f"tasks.csv 缺少字段: {sorted(expected)}")
+        for row in reader:
+            task_id = validate_task_id((row.get("task_id") or "").strip())
+            if task_id in seen:
+                raise ValueError(f"tasks.csv 存在重复考题: {task_id}")
+            seen.add(task_id)
+            fix_sha = (row.get("fix_sha") or "").strip()
+            if not re.fullmatch(r"[0-9a-fA-F]{7,64}", fix_sha):
+                raise ValueError(f"考题 {task_id} 的 fix_sha 非法")
+            test_files = tuple(shlex.split(row.get("test_files") or ""))
+            if not test_files or any(
+                    Path(item).is_absolute() or ".." in Path(item).parts
+                    or not item.replace("\\", "/").startswith("tests/")
+                    for item in test_files):
+                raise ValueError(f"考题 {task_id} 的 test_files 非法")
+            tasks.append(TaskSpec(task_id, fix_sha, test_files, row.get("title") or ""))
+    return tasks
+
+
+def find_task(config: HarnessConfig, task_id: str) -> TaskSpec:
+    wanted = validate_task_id(task_id)
+    for task in load_tasks(config.tasks_file):
+        if task.task_id == wanted:
+            return task
+    raise ValueError(f"未知考题: {wanted}")
 
 
 def utc_now() -> dt.datetime:
@@ -177,39 +286,44 @@ def validate_probe_response(payload: dict, probe_name: str = PROBE_NAME,
     return True, "ok"
 
 
-def curl_probe_transport(endpoint: str, api_key: str, body: dict, timeout_sec: int) -> tuple[int, dict]:
-    paths = []
-    try:
-        for content in (
-            "Content-Type: application/json\nAuthorization: Bearer " + api_key + "\n",
-            json.dumps(body),
-            "",
+def verified_ssl_context() -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    # python.org 的 macOS Framework Python 可能没有执行 Install Certificates，
+    # 但系统仍维护 /etc/ssl/cert.pem。只补载系统 CA，绝不关闭证书校验。
+    if ssl.get_default_verify_paths().cafile is None:
+        for candidate in (
+            "/etc/ssl/cert.pem",
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
         ):
-            handle = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False)
-            os.chmod(handle.name, 0o600)
-            handle.write(content)
-            handle.close()
-            paths.append(handle.name)
-        command = [
-            "curl", "--silent", "--show-error", "--max-time", str(timeout_sec),
-            "--output", paths[2], "--write-out", "%{http_code}", "--request", "POST",
-            "--header", "@" + paths[0], "--data-binary", "@" + paths[1], endpoint,
-        ]
-        completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout_sec + 5)
-        if completed.returncode != 0:
-            raise RuntimeError(f"curl_exit_{completed.returncode}")
+            if Path(candidate).is_file():
+                context.load_verify_locations(cafile=candidate)
+                break
+    return context
+
+
+def urllib_probe_transport(endpoint: str, api_key: str, body: dict, timeout_sec: int) -> tuple[int, dict]:
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Authorization": "Bearer " + api_key,
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(
+                request, timeout=timeout_sec, context=verified_ssl_context()) as response:
+            payload = json.load(response)
+            return response.status, payload if isinstance(payload, dict) else {}
+    except urllib.error.HTTPError as error:
         try:
-            status = int(completed.stdout.strip())
-        except ValueError as error:
-            raise RuntimeError("curl 未返回 HTTP 状态") from error
-        payload = read_json(paths[2], {})
-        return status, payload
-    finally:
-        for path in paths:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+            payload = json.loads(error.read().decode("utf-8", errors="replace"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            payload = {}
+        return error.code, payload if isinstance(payload, dict) else {}
 
 
 def run_provider_probe(base_url: str, api_key: str, model: str, protocol: str = "responses",
@@ -221,7 +335,7 @@ def run_provider_probe(base_url: str, api_key: str, model: str, protocol: str = 
     probe_name = "agentgo_capability_probe_" + uuid.uuid4().hex[:8]
     nonce = "nonce_" + uuid.uuid4().hex[:12]
     request_body = probe_request(model, probe_name, nonce, protocol)
-    transport = transport or curl_probe_transport
+    transport = transport or urllib_probe_transport
     last_reason = "未知错误"
     for attempt in range(1, attempts + 1):
         try:
@@ -660,42 +774,443 @@ def summarize_runs(runs_dir: str, batch_start: float) -> list[dict]:
     return rows
 
 
-def command_probe(args: argparse.Namespace) -> None:
-    run_provider_probe(args.base_url, os.environ[args.key_var], args.model, args.protocol, args.timeout)
-    print(json.dumps({"probe": "passed", "model": args.model, "protocol": args.protocol}, ensure_ascii=False))
+def run_command(command: list[str], cwd: str | Path | None = None, check: bool = True,
+                input_data: bytes | None = None, timeout: int | None = None) -> subprocess.CompletedProcess:
+    completed = subprocess.run(
+        command,
+        cwd=str(cwd) if cwd is not None else None,
+        input=input_data,
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+    )
+    if check and completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).decode("utf-8", errors="replace").strip()
+        detail = detail[-1200:] if detail else "无输出"
+        raise RuntimeError(f"命令失败 exit={completed.returncode} program={Path(command[0]).name}: {detail}")
+    return completed
 
 
-def command_inject(args: argparse.Namespace) -> None:
-    contract = inject_request(args.base_url, args.token, args.prompt, args.task_id, args.timeout, args.contract)
-    print(json.dumps({"inject": 200, "run_id": contract["run_id"]}, ensure_ascii=False))
+def safe_remove_worktree(config: HarnessConfig, target: Path) -> None:
+    worktrees = (config.testbed / "worktrees").resolve()
+    if target.parent.resolve() != worktrees or target == worktrees:
+        raise ValueError(f"拒绝清理非考题 worktree: {target}")
+    run_command(
+        ["git", "-C", str(config.flask_repo), "worktree", "remove", "--force", str(target)],
+        check=False,
+    )
+    if target.is_symlink():
+        target.unlink()
+    elif target.exists():
+        shutil.rmtree(target)
 
 
-def command_monitor(args: argparse.Namespace) -> None:
-    monitor = monitor_run(args.base_url, args.token, args.pid, args.run_id, args.started_at,
-                          args.timeout, args.snapshot, args.poll, args.grace)
-    atomic_json(args.output, monitor)
-    print(json.dumps(monitor, ensure_ascii=False))
+def venv_python(worktree: Path) -> Path:
+    candidates = (
+        worktree / ".venv" / "bin" / "python",
+        worktree / ".venv" / "Scripts" / "python.exe",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError(f"虚拟环境 Python 不存在: {worktree / '.venv'}")
 
 
-def command_collect(args: argparse.Namespace) -> None:
-    result = collect_result(args.snapshot, args.monitor, args.project_root, args.run_id,
-                            args.startup_probe_passed)
-    atomic_json(args.output, result)
+def setup_task(config: HarnessConfig, task: TaskSpec, target: Path | None = None) -> Path:
+    worktree = target or config.worktree(task.task_id)
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    safe_remove_worktree(config, worktree)
+    run_command(["git", "clone", "--no-local", "--quiet", str(config.flask_repo), str(worktree)])
+    run_command(["git", "checkout", "--quiet", "--detach", task.fix_sha + "^"], cwd=worktree)
+    refs = run_command(["git", "for-each-ref", "--format=%(refname)"], cwd=worktree)
+    for ref in refs.stdout.decode("utf-8", errors="replace").splitlines():
+        if ref:
+            run_command(["git", "update-ref", "-d", ref], cwd=worktree)
+    run_command(["git", "reflog", "expire", "--expire=now", "--all"], cwd=worktree)
+    run_command(["git", "gc", "--prune=now", "--quiet"], cwd=worktree)
+    run_command(["git", "remote", "remove", "origin"], cwd=worktree, check=False)
+    run_command(
+        ["uv", "sync", "--frozen", "--no-default-groups", "--group", "tests", "--python", "3.13"],
+        cwd=worktree,
+    )
+    python = venv_python(worktree)
+    info = run_command([
+        str(python), "-c",
+        "import importlib.metadata as m,sys; "
+        "print(f'env-ok: flask={m.version(\"flask\")} pytest={m.version(\"pytest\")} py={sys.version.split()[0]}')",
+    ], cwd=worktree)
+    print(info.stdout.decode("utf-8", errors="replace").strip())
+    print(f"worktree 就绪: {worktree}")
+    return worktree
+
+
+def patch_from_fix(config: HarnessConfig, task: TaskSpec, pathspec: str) -> bytes:
+    completed = run_command([
+        "git", "-C", str(config.flask_repo), "show", task.fix_sha, "--", pathspec,
+    ])
+    if not completed.stdout:
+        raise RuntimeError(f"考题 {task.task_id} 的 {pathspec} patch 为空")
+    return completed.stdout
+
+
+def apply_fix_slice(config: HarnessConfig, task: TaskSpec, worktree: Path, pathspec: str) -> None:
+    run_command(["git", "apply", "-"], cwd=worktree,
+                input_data=patch_from_fix(config, task, pathspec))
+
+
+def parse_junit(path: Path) -> dict:
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError) as error:
+        raise RuntimeError(f"pytest 未产生合法 JUnit 报告: {path}") from error
+    suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+    tests = sum(int(suite.attrib.get("tests", 0)) for suite in suites)
+    failed = sum(int(suite.attrib.get("failures", 0)) for suite in suites)
+    errors = sum(int(suite.attrib.get("errors", 0)) for suite in suites)
+    skipped = sum(int(suite.attrib.get("skipped", 0)) for suite in suites)
+    return {
+        "tests": tests,
+        "passed": max(0, tests - failed - errors - skipped),
+        "failed": failed,
+        "errors": errors,
+        "skipped": skipped,
+    }
+
+
+def run_pytest(worktree: Path, junit_path: Path, log_path: Path,
+               test_files: tuple[str, ...] = ()) -> dict:
+    junit_path.parent.mkdir(parents=True, exist_ok=True)
+    junit_path.unlink(missing_ok=True)
+    command = [
+        str(venv_python(worktree)), "-m", "pytest", *test_files, "-q",
+        f"--junitxml={junit_path}",
+    ]
+    completed = run_command(command, cwd=worktree, check=False)
+    output = completed.stdout + completed.stderr
+    log_path.write_bytes(output)
+    tail = output.decode("utf-8", errors="replace").splitlines()[-3:]
+    if tail:
+        print("\n".join(tail))
+    result = parse_junit(junit_path)
+    result["exit_code"] = completed.returncode
+    return result
+
+
+def prepare_task(config: HarnessConfig, task: TaskSpec) -> dict:
+    worktree = setup_task(config, task)
+    run_dir = config.run_dir(task.task_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    apply_fix_slice(config, task, worktree, "tests/")
+    run_command(["git", "add", "-A", "--", "tests/"], cwd=worktree)
+    run_command([
+        "git", "-c", "user.name=agentgo-swe", "-c", "user.email=swe@harness.local",
+        "commit", "-q", "-m", f"harness: 预置期望行为测试（考题 {task.task_id}）", "--", "tests/",
+    ], cwd=worktree)
+
+    red = run_pytest(
+        worktree, run_dir / "targeted-baseline.junit.xml",
+        run_dir / "targeted-baseline.pytest.log", task.test_files,
+    )
+    if red["failed"] + red["errors"] == 0:
+        raise RuntimeError(f"未确认红状态，考题 {task.task_id} 准备失败")
+    baseline = run_pytest(
+        worktree, run_dir / "baseline.junit.xml", run_dir / "baseline.pytest.log",
+    )
+    report = {
+        key: baseline[key] for key in ("tests", "passed", "failed", "errors", "skipped", "exit_code")
+    }
+    report["note"] = "base 红态基线（agent 运行前全量 pytest）"
+    atomic_json(run_dir / "baseline.json", report)
+    (run_dir / "fix_sha").write_text(task.fix_sha + "\n", encoding="utf-8")
+    print(
+        f"考题 {task.task_id} 就绪：passed={baseline['passed']} "
+        f"failed={baseline['failed']} errors={baseline['errors']}"
+    )
+    return report
+
+
+def yaml_template_value(value: str | Path) -> str:
+    raw = str(value)
+    if "\n" in raw or "\r" in raw:
+        raise ValueError("SWE 配置值不得包含换行")
+    return raw.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def render_setting(config: HarnessConfig, worktree: Path, run_dir: Path,
+                   port: int, token: str) -> Path:
+    template_path = config.agentgo_root / "setting.swe-flask.yaml"
+    rendered = template_path.read_text(encoding="utf-8")
+    replacements = {
+        "__PROJECT_ROOT__": worktree,
+        "__PORT__": str(port),
+        "__TOKEN__": token,
+        "__AGENTGO_ROOT__": config.agentgo_root,
+        "__BASE_URL__": config.base_url,
+        "__MODEL__": config.model,
+        "__PROTOCOL__": config.protocol,
+        "__KEY_VAR__": "SWE_API_KEY",
+    }
+    for marker, value in replacements.items():
+        if marker not in rendered:
+            raise RuntimeError(f"SWE 配置模板缺少占位符 {marker}")
+        rendered = rendered.replace(marker, yaml_template_value(value))
+    remaining = sorted(set(re.findall(r"__[A-Z0-9_]+__", rendered)))
+    if remaining:
+        raise RuntimeError(f"SWE 配置模板仍有未解析占位符: {remaining}")
+    target = run_dir / "setting.yaml"
+    temp = target.with_suffix(".yaml.tmp")
+    temp.write_text(rendered, encoding="utf-8")
+    os.replace(temp, target)
+    return target
+
+
+def reserve_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def health_ready(url: str, timeout: float = 1.0) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return 200 <= response.status < 300
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def wait_for_agentgo(process: subprocess.Popen, base_url: str, log_path: Path,
+                     timeout_sec: int = 90) -> None:
+    deadline = time.monotonic() + timeout_sec
+    ready = False
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            break
+        if health_ready(base_url.rstrip("/") + "/healthz"):
+            ready = True
+            break
+        time.sleep(1)
+    if not ready:
+        raise RuntimeError(f"SPAWN_ERROR: healthz 未就绪，见 {log_path}")
+
+    marker = re.compile(r"\[OK\].*typed function-call/required-arguments")
+    while time.monotonic() < deadline:
+        try:
+            if marker.search(log_path.read_text(encoding="utf-8", errors="replace")):
+                return
+        except OSError:
+            pass
+        if process.poll() is not None:
+            break
+        time.sleep(0.2)
+    raise RuntimeError("SPAWN_ERROR: 产品 function-call probe 没有成功证据")
+
+
+def terminate_process(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+        process.wait(timeout=2)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+        process.wait(timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def clean_run_outputs(run_dir: Path) -> None:
+    for name in (
+        "result.json", "judge.json", "snapshot.final.json", "monitor.json",
+        "run_contract.json", "model.patch", "judge.junit.xml", "judge.pytest.log",
+    ):
+        (run_dir / name).unlink(missing_ok=True)
+
+
+def run_task(config: HarnessConfig, task: TaskSpec, timeout_sec: int) -> dict:
+    if timeout_sec < 240:
+        raise ValueError("timeout 必须至少 240 秒")
+    if not os.environ.get("SWE_API_KEY"):
+        raise RuntimeError("密钥环境变量 SWE_API_KEY 未设置")
+    worktree = config.worktree(task.task_id)
+    prompt = config.prompt_dir / f"{task.task_id}.md"
+    if not worktree.is_dir():
+        raise RuntimeError(f"worktree 不存在: {worktree}（先执行 prepare）")
+    if not prompt.is_file():
+        raise RuntimeError(f"prompt 不存在: {prompt}")
+    if not config.agentgo_bin.is_file():
+        raise RuntimeError(f"AgentGo 二进制不存在: {config.agentgo_bin}")
+
+    run_dir = config.run_dir(task.task_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    clean_run_outputs(run_dir)
+    port = reserve_port()
+    token = secrets.token_hex(16)
+    setting = render_setting(config, worktree, run_dir, port, token)
+    base_url = f"http://127.0.0.1:{port}"
+    started_at = time.time()
+    log_path = run_dir / "agentgo.log"
+    popen_options = {"start_new_session": True} if os.name == "posix" else {}
+    with log_path.open("wb") as log_handle:
+        process = subprocess.Popen(
+            [str(config.agentgo_bin), "-config", str(setting)],
+            cwd=worktree,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            **popen_options,
+        )
+        print(f"agentgo pid={process.pid} port={port}")
+        try:
+            wait_for_agentgo(process, base_url, log_path)
+            contract = inject_request(
+                base_url, token, str(prompt), task.task_id, timeout_sec,
+                str(run_dir / "run_contract.json"),
+            )
+            print(json.dumps({"inject": 200, "run_id": contract["run_id"]}, ensure_ascii=False))
+            monitor = monitor_run(
+                base_url, token, process.pid, contract["run_id"], started_at, timeout_sec,
+                str(run_dir / "snapshot.final.json"), poll_sec=3, terminal_grace_sec=30,
+            )
+            atomic_json(run_dir / "monitor.json", monitor)
+            print(json.dumps(monitor, ensure_ascii=False))
+            try:
+                status, snapshot = http_json(base_url + "/api/snapshot", token)
+                if status == 200:
+                    atomic_json(run_dir / "snapshot.final.json", snapshot)
+            except (OSError, urllib.error.URLError, json.JSONDecodeError):
+                pass
+        finally:
+            terminate_process(process)
+
+    contract = read_json(run_dir / "run_contract.json", {})
+    run_id = contract.get("run_id")
+    if not run_id:
+        raise RuntimeError("AgentGo 运行未产生 run_id")
+    result = collect_result(
+        str(run_dir / "snapshot.final.json"), str(run_dir / "monitor.json"),
+        str(worktree), run_id, True,
+    )
+    atomic_json(run_dir / "result.json", result)
     print(json.dumps(result, ensure_ascii=False))
+    return result
 
 
-def command_finalize(args: argparse.Namespace) -> None:
-    result = finalize_result(args.result, args.judge)
+def test_files_at_fix(config: HarnessConfig, task: TaskSpec) -> list[str]:
+    completed = run_command([
+        "git", "-C", str(config.flask_repo), "show", task.fix_sha,
+        "--name-only", "--format=", "--", "tests/",
+    ])
+    files = [line for line in completed.stdout.decode("utf-8", errors="replace").splitlines() if line]
+    for name in files:
+        path = Path(name)
+        if path.is_absolute() or ".." in path.parts or not name.replace("\\", "/").startswith("tests/"):
+            raise RuntimeError(f"fix commit 返回非法测试路径: {name!r}")
+    return files
+
+
+def judge_task(config: HarnessConfig, task: TaskSpec) -> dict:
+    worktree = config.worktree(task.task_id)
+    run_dir = config.run_dir(task.task_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    pytest = run_pytest(
+        worktree, run_dir / "judge.junit.xml", run_dir / "judge.pytest.log",
+    )
+    verdict = "resolved" if pytest["failed"] == 0 and pytest["errors"] == 0 and pytest["passed"] > 0 \
+        else "failed"
+    test_files = test_files_at_fix(config, task)
+    tampered_files: list[str] = []
+    for name in test_files:
+        expected = run_command([
+            "git", "-C", str(config.flask_repo), "cat-file", "-e", f"{task.fix_sha}:{name}",
+        ], check=False)
+        actual_path = worktree / name
+        if expected.returncode == 0:
+            expected_bytes = run_command([
+                "git", "-C", str(config.flask_repo), "show", f"{task.fix_sha}:{name}",
+            ]).stdout
+            actual_digest = hashlib.sha256(actual_path.read_bytes()).digest() if actual_path.is_file() else None
+            if actual_digest != hashlib.sha256(expected_bytes).digest():
+                tampered_files.append(name)
+        elif actual_path.exists():
+            tampered_files.append(name + "(应已删除)")
+    tampered = bool(tampered_files)
+    if tampered:
+        verdict = "test_tampered"
+        print("测试篡改检测: " + " ".join(tampered_files))
+
+    excludes = [":!.venv", ":!.agentgo", *(f":!{name}" for name in test_files)]
+    run_command(["git", "reset", "-q"], cwd=worktree, check=False)
+    run_command(["git", "add", "-A", "--", ".", *excludes], cwd=worktree)
+    patch = run_command(["git", "diff", "--cached", "--", ".", *excludes], cwd=worktree).stdout
+    (run_dir / "model.patch").write_bytes(patch)
+    patch_lines = len(patch.splitlines())
+    report = {
+        "verdict": verdict,
+        "tests": pytest["tests"],
+        "passed": pytest["passed"],
+        "failed": pytest["failed"],
+        "errors": pytest["errors"],
+        "skipped": pytest["skipped"],
+        "patch_lines": patch_lines,
+        "tampered": tampered,
+    }
+    baseline = read_json(run_dir / "baseline.json", {})
+    if all(key in baseline for key in ("passed", "failed", "errors")):
+        report["baseline"] = {key: baseline[key] for key in ("passed", "failed", "errors")}
+        if verdict == "failed":
+            if report["failed"] == baseline["failed"] and report["errors"] == baseline["errors"]:
+                report["red_note"] = "红态与基线完全一致：补丁未造成新增破坏（但也未修复）"
+            elif report["failed"] + report["errors"] > baseline["failed"] + baseline["errors"]:
+                report["red_note"] = "红态重于基线：补丁引入了新增破坏"
+            else:
+                report["red_note"] = "红态轻于基线：部分修复但未全绿"
+    atomic_json(run_dir / "judge.json", report)
+    print(json.dumps(report, ensure_ascii=False))
+    return report
+
+
+def final_exit_code(result: dict) -> int:
+    if not result.get("architecture_ok"):
+        return EXIT_ARCHITECTURE_FAILURE
+    if not result.get("task_resolved"):
+        return EXIT_TASK_FAILURE
+    return 0
+
+
+def batch_exit_code(rows: list[dict], expected_count: int) -> int:
+    if len(rows) != expected_count or any(
+            row.get("stale") or not row.get("architecture_ok") for row in rows):
+        return EXIT_ARCHITECTURE_FAILURE
+    if any(not row.get("task_resolved") for row in rows):
+        return EXIT_TASK_FAILURE
+    return 0
+
+
+def execute_task(config: HarnessConfig, task: TaskSpec, timeout_sec: int) -> dict:
+    prepare_task(config, task)
+    run_task(config, task, timeout_sec)
+    judge_task(config, task)
+    result = finalize_result(
+        str(config.run_dir(task.task_id) / "result.json"),
+        str(config.run_dir(task.task_id) / "judge.json"),
+    )
     print(json.dumps({
         "architecture_ok": result.get("architecture_ok", False),
         "task_resolved": result.get("task_resolved", False),
         "judge_verdict": result.get("judge_verdict", "unknown"),
     }, ensure_ascii=False))
+    return result
 
 
-def command_summarize(args: argparse.Namespace) -> None:
-    rows = summarize_runs(args.runs, args.batch_start)
-    atomic_json(args.output, rows)
+def print_summary(rows: list[dict]) -> None:
     resolved = sum(row["task_resolved"] and not row["stale"] for row in rows)
     architecture = sum(row["architecture_ok"] and not row["stale"] for row in rows)
     print(f"\ntask_resolved {resolved}/{len(rows)} architecture_ok {architecture}/{len(rows)}")
@@ -714,72 +1229,145 @@ def command_summarize(args: argparse.Namespace) -> None:
         )
 
 
+def require_api_key() -> str:
+    value = os.environ.get("SWE_API_KEY")
+    if not value:
+        raise RuntimeError("密钥环境变量 SWE_API_KEY 未设置")
+    return value
+
+
+def preflight_probe(config: HarnessConfig, timeout_sec: int = 45) -> None:
+    run_provider_probe(
+        config.base_url, require_api_key(), config.model, config.protocol, timeout_sec,
+    )
+    print(
+        f"typed function-call 活探针通过: {config.base_url.rstrip('/')} "
+        f"protocol={config.protocol} model={config.model}"
+    )
+
+
+def verify_candidates(config: HarnessConfig) -> dict[str, int]:
+    report_path = config.testbed / "harness" / "candidates_report.txt"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    counts = collections.Counter()
+    for task in load_tasks(config.tasks_file):
+        lines.append(f"=== {task.task_id} ({task.fix_sha}) {task.title}")
+        target = config.testbed / "worktrees" / f"verify-{task.task_id}"
+        try:
+            worktree = setup_task(config, task, target=target)
+            run_dir = config.testbed / "runs" / f"verify-{task.task_id}"
+            clean = run_pytest(
+                worktree, run_dir / "clean.junit.xml", run_dir / "clean.pytest.log",
+            )
+            if clean["failed"] + clean["errors"]:
+                status = "ENV-FAIL"
+                detail = "干净 base 不全绿"
+            else:
+                apply_fix_slice(config, task, worktree, "tests/")
+                red = run_pytest(
+                    worktree, run_dir / "red.junit.xml", run_dir / "red.pytest.log", task.test_files,
+                )
+                if red["failed"] + red["errors"] == 0:
+                    status = "INVALID"
+                    detail = "base+test patch 不红"
+                else:
+                    apply_fix_slice(config, task, worktree, "src/")
+                    green = run_pytest(
+                        worktree, run_dir / "green.junit.xml", run_dir / "green.pytest.log",
+                    )
+                    if green["failed"] + green["errors"]:
+                        status = "FIX-FAIL"
+                        detail = "打完 fix 仍有失败"
+                    else:
+                        status = "OK"
+                        detail = f"green passed={green['passed']}"
+        except Exception as error:
+            status = "ENV-FAIL"
+            detail = str(error)[:240]
+        counts[status] += 1
+        line = f"{status:8s} {task.task_id}: {detail}"
+        lines.append(line)
+        print(line)
+    lines.append("--- 汇总: " + " ".join(
+        f"{name}={counts[name]}" for name in ("OK", "INVALID", "ENV-FAIL", "FIX-FAIL")
+    ))
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return dict(counts)
+
+
+def command_probe(args: argparse.Namespace) -> int:
+    config = HarnessConfig.from_env()
+    preflight_probe(config, args.timeout)
+    return 0
+
+
+def command_task(args: argparse.Namespace) -> int:
+    config = HarnessConfig.from_env()
+    preflight_probe(config, args.probe_timeout)
+    result = execute_task(config, find_task(config, args.task_id), args.timeout)
+    return final_exit_code(result)
+
+
+def command_batch(args: argparse.Namespace) -> int:
+    config = HarnessConfig.from_env()
+    tasks = load_tasks(config.tasks_file)
+    preflight_probe(config, args.probe_timeout)
+    batch_start = time.time()
+    runs_dir = config.testbed / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    (runs_dir / ".batch_start").write_text(str(batch_start) + "\n", encoding="utf-8")
+    for task in tasks:
+        print(f"===== {dt.datetime.now().strftime('%H:%M:%S')} {task.task_id}: {task.title}")
+        result = execute_task(config, task, args.timeout)
+        if not result.get("architecture_ok"):
+            print(f"架构门失败，停止批次: {task.task_id}", file=os.sys.stderr)
+            break
+    selected = {task.task_id for task in tasks}
+    rows = [row for row in summarize_runs(str(runs_dir), batch_start) if row["task"] in selected]
+    atomic_json(runs_dir / "summary.json", rows)
+    print_summary(rows)
+    return batch_exit_code(rows, len(tasks))
+
+
+def command_verify_candidates(_args: argparse.Namespace) -> int:
+    counts = verify_candidates(HarnessConfig.from_env())
+    return 0 if counts.get("OK", 0) > 0 and sum(
+        count for name, count in counts.items() if name != "OK"
+    ) == 0 else EXIT_TASK_FAILURE
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(required=True)
 
-    probe = commands.add_parser("probe")
-    probe.add_argument("--base-url", required=True)
-    probe.add_argument("--model", required=True)
-    probe.add_argument("--key-var", required=True)
-    probe.add_argument("--protocol", choices=("responses", "chat_completions"), default="responses")
+    probe = commands.add_parser("probe", help="运行批次级真实 function-call 能力探针")
     probe.add_argument("--timeout", type=int, default=45)
     probe.set_defaults(func=command_probe)
 
-    inject = commands.add_parser("inject")
-    inject.add_argument("--base-url", required=True)
-    inject.add_argument("--token", required=True)
-    inject.add_argument("--prompt", required=True)
-    inject.add_argument("--task-id", required=True)
-    inject.add_argument("--timeout", type=int, required=True)
-    inject.add_argument("--contract", required=True)
-    inject.set_defaults(func=command_inject)
+    task = commands.add_parser("task", help="探针后完整执行 prepare -> run -> judge")
+    task.add_argument("task_id")
+    task.add_argument("--timeout", type=int, default=1200)
+    task.add_argument("--probe-timeout", type=int, default=45)
+    task.set_defaults(func=command_task)
 
-    monitor = commands.add_parser("monitor")
-    monitor.add_argument("--base-url", required=True)
-    monitor.add_argument("--token", required=True)
-    monitor.add_argument("--pid", type=int, required=True)
-    monitor.add_argument("--run-id", required=True)
-    monitor.add_argument("--started-at", type=float, required=True)
-    monitor.add_argument("--timeout", type=int, required=True)
-    monitor.add_argument("--snapshot", required=True)
-    monitor.add_argument("--output", required=True)
-    monitor.add_argument("--poll", type=int, default=3)
-    monitor.add_argument("--grace", type=int, default=30)
-    monitor.set_defaults(func=command_monitor)
+    batch = commands.add_parser("batch", help="探针后串行执行 tasks.csv 全部考题")
+    batch.add_argument("--timeout", type=int, default=1200)
+    batch.add_argument("--probe-timeout", type=int, default=45)
+    batch.set_defaults(func=command_batch)
 
-    collect = commands.add_parser("collect")
-    collect.add_argument("--snapshot", required=True)
-    collect.add_argument("--monitor", required=True)
-    collect.add_argument("--project-root", required=True)
-    collect.add_argument("--run-id", required=True)
-    collect.add_argument("--startup-probe-passed", action="store_true")
-    collect.add_argument("--output", required=True)
-    collect.set_defaults(func=command_collect)
-
-    finalize = commands.add_parser("finalize")
-    finalize.add_argument("--result", required=True)
-    finalize.add_argument("--judge", required=True)
-    finalize.set_defaults(func=command_finalize)
-
-    summarize = commands.add_parser("summarize")
-    summarize.add_argument("--runs", required=True)
-    summarize.add_argument("--batch-start", type=float, required=True)
-    summarize.add_argument("--output", required=True)
-    summarize.set_defaults(func=command_summarize)
+    verify = commands.add_parser("verify-candidates", help="验证候选题目的红到绿语义")
+    verify.set_defaults(func=command_verify_candidates)
     return root
 
 
 def main() -> int:
     args = parser().parse_args()
     try:
-        if args.func is command_probe and not os.environ.get(args.key_var):
-            raise RuntimeError(f"密钥环境变量 {args.key_var} 未设置")
-        args.func(args)
-        return 0
+        return int(args.func(args) or 0)
     except Exception as error:  # harness 顶层只打印有界类型/消息，绝不打印请求正文或凭证。
         print(f"SWE_HARNESS_ERROR: {error}", file=os.sys.stderr)
-        return 1
+        return EXIT_HARNESS_FAILURE
 
 
 if __name__ == "__main__":

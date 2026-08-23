@@ -2,7 +2,8 @@
 #
 # 用途：以 Flask 真实仓库为对象的中等项目行为评测（SWE 式红→绿任务）。
 # 这是一个**模板**：__AGENTGO_ROOT__/__PROJECT_ROOT__/__PORT__/__TOKEN__/
-# __BASE_URL__/__MODEL__ 六个占位符由仓库内 `scripts/swe_harness/run_task.sh`
+# __BASE_URL__/__MODEL__/__PROTOCOL__/__KEY_VAR__ 八个占位符由仓库内
+# `scripts/swe_harness/harness.py`
 # 在每次运行时渲染；`/tmp/agentgo-swe` 只保存题目数据和运行产物。
 #
 # 换模型供应商只需设四个环境变量（默认即 OpenRouter Responses + Luna）：
@@ -21,10 +22,10 @@
 #   路由本文件声明的静态 kind——agent 节点缺省走 worker（event_type ""
 #   默认队列），只读调查路由 explore，验收路由 acceptance.verify。
 llm:
-  base_url: __BASE_URL__
+  base_url: "__BASE_URL__"
   api_key: ${__KEY_VAR__}
-  default_model: __MODEL__
-  protocol: __PROTOCOL__
+  default_model: "__MODEL__"
+  protocol: "__PROTOCOL__"
   timeout_sec: 300
   # SWE 主链显式开启 reasoning。大多数机械阶段使用 auto + singleton
   # ToolRouter + L3 required-action gate；Graph 最终交付仅在该次 invocation 覆盖为
@@ -67,29 +68,29 @@ agents:
     replicas: 4
     event_type: "explore"
     profile: swe_explorer
-    system_prompt_file: __AGENTGO_ROOT__/prompts/swe/explorer.md
-    model: __MODEL__
+    system_prompt_file: "__AGENTGO_ROOT__/prompts/swe/explorer.md"
+    model: "__MODEL__"
     task_max_retries: 5
     description: 只读调查代理：定位缺陷、解释行为、梳理调用关系；无写/shell/网络。
   - kind: worker
     replicas: 2
     event_type: ""
     profile: swe_worker
-    system_prompt_file: __AGENTGO_ROOT__/prompts/swe/worker.md
-    model: __MODEL__
+    system_prompt_file: "__AGENTGO_ROOT__/prompts/swe/worker.md"
+    model: "__MODEL__"
     task_max_retries: 5
     description: 通用执行代理：调查、修改代码、运行 pytest 验证；无网络工具。
   - kind: verifier
     replicas: 2
     event_type: "acceptance.verify"
     profile: swe_verifier
-    system_prompt_file: __AGENTGO_ROOT__/prompts/swe/verifier.md
-    model: __MODEL__
+    system_prompt_file: "__AGENTGO_ROOT__/prompts/swe/verifier.md"
+    model: "__MODEL__"
     task_max_retries: 5
     description: 验收代理：按节点验收标准核验上游证据与仓库状态；无 shell/网络。
 
 scheduler:
-  model: __MODEL__
+  model: "__MODEL__"
 
 project_root: "__PROJECT_ROOT__"
 startup_probe: "tool"

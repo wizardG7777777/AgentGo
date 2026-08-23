@@ -301,7 +301,7 @@ Draft/Commit/Start，不因模型调用失败回退到一次性完整 Graph JSON
 
 ## 10. 外部 SWE Harness 观察项（非 L3 Harness Engineering）
 
-`run_task.sh` 把“root Task 已 blocked、所有 Agent idle”显示为
+当时已删除的 `run_task.sh` 把“root Task 已 blocked、所有 Agent idle”显示为
 `terminal=quiet`。Judge 的 failed verdict 是正确的，但 terminal 标签隐藏了
 `context_assembly_rejected`、`no_progress_budget_exhausted` 和
 `progress_authority_failure` 的区别。

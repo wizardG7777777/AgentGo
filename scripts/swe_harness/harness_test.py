@@ -28,6 +28,93 @@ def probe_response(name=harness.PROBE_NAME, arguments=None, finish="tool_calls")
 
 
 class HarnessContractTest(unittest.TestCase):
+    def test_cli_exposes_only_complete_transactions(self):
+        root = harness.parser()
+        subparsers = next(
+            action for action in root._actions
+            if isinstance(action, harness.argparse._SubParsersAction)
+        )
+        self.assertEqual(
+            set(subparsers.choices),
+            {"probe", "task", "batch", "verify-candidates"},
+        )
+        for removed in ("prepare", "run", "judge", "inject", "monitor", "collect", "finalize", "summarize"):
+            self.assertNotIn(removed, subparsers.choices)
+
+    def test_tasks_csv_uses_structured_parser_and_rejects_unsafe_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tasks = Path(directory) / "tasks.csv"
+            tasks.write_text(
+                "task_id,fix_sha,test_files,title\n"
+                'safe-task,abcdef1,"tests/test_a.py tests/test_b.py","title, with comma"\n',
+                encoding="utf-8",
+            )
+            loaded = harness.load_tasks(tasks)
+            self.assertEqual(loaded[0].task_id, "safe-task")
+            self.assertEqual(loaded[0].test_files, ("tests/test_a.py", "tests/test_b.py"))
+            self.assertEqual(loaded[0].title, "title, with comma")
+            tasks.write_text(
+                "task_id,fix_sha,test_files,title\n"
+                "../escape,abcdef1,tests/test_a.py,bad\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                harness.load_tasks(tasks)
+
+    def test_junit_parser_does_not_depend_on_pytest_terminal_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "pytest.xml"
+            report.write_text(
+                '<?xml version="1.0"?><testsuites>'
+                '<testsuite tests="10" failures="2" errors="1" skipped="3" />'
+                '</testsuites>',
+                encoding="utf-8",
+            )
+            self.assertEqual(harness.parse_junit(report), {
+                "tests": 10, "passed": 4, "failed": 2, "errors": 1, "skipped": 3,
+            })
+
+    def test_setting_renderer_replaces_all_markers_without_sed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "setting.swe-flask.yaml").write_text(
+                'root: "__PROJECT_ROOT__"\nport: __PORT__\ntoken: "__TOKEN__"\n'
+                'agentgo: "__AGENTGO_ROOT__"\nbase: "__BASE_URL__"\nmodel: "__MODEL__"\n'
+                'protocol: "__PROTOCOL__"\nkey: ${__KEY_VAR__}\n',
+                encoding="utf-8",
+            )
+            config = harness.HarnessConfig(
+                agentgo_root=root,
+                agentgo_bin=root / "agentgo",
+                testbed=root / "testbed",
+                tasks_file=root / "tasks.csv",
+                prompt_dir=root / "prompts",
+                flask_repo=root / "flask",
+                base_url="https://provider.invalid/v1",
+                model='model-"quoted',
+                protocol="responses",
+            )
+            run_dir = root / "run"
+            run_dir.mkdir()
+            rendered = harness.render_setting(config, root / "worktree", run_dir, 8123, "nonce")
+            content = rendered.read_text(encoding="utf-8")
+            self.assertNotRegex(content, r"__[A-Z0-9_]+__")
+            self.assertIn('model: "model-\\"quoted"', content)
+            self.assertIn("port: 8123", content)
+
+    def test_batch_exit_code_fails_when_any_gate_is_not_satisfied(self):
+        good = {"stale": False, "architecture_ok": True, "task_resolved": True}
+        self.assertEqual(harness.batch_exit_code([good], 1), 0)
+        self.assertEqual(harness.batch_exit_code([], 1), harness.EXIT_ARCHITECTURE_FAILURE)
+        self.assertEqual(
+            harness.batch_exit_code([{**good, "architecture_ok": False}], 1),
+            harness.EXIT_ARCHITECTURE_FAILURE,
+        )
+        self.assertEqual(
+            harness.batch_exit_code([{**good, "task_resolved": False}], 1),
+            harness.EXIT_TASK_FAILURE,
+        )
+
     def test_run_contract_leaves_external_and_phase_reserves(self):
         now = dt.datetime(2026, 8, 22, 1, 2, 3, tzinfo=dt.timezone.utc)
         contract = harness.build_run_contract("automatic-options", 1200, now)

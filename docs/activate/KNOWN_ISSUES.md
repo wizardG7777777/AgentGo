@@ -30,7 +30,10 @@ durable Store 和生产接线，并通过 full/race/vet/build、harness 单测�
   deadline、Scheduler phase Prompt/ToolRouter、真实 Lease、Tool batch/ToolResultRef
   已完成，并通过 full/race/vet/build/真实二进制验证。完成记录见
   [`第六轮 0/8 分层诊断`](../test-issues/2026-08-22-1510-swe-round6-zero-of-eight-layered-diagnosis.md) 第12节。
-- **SWE-020…026 实现已落地**：versioned harness、typed/bounded runtime snapshot、
+- **SWE-020…026 实现已落地**：versioned harness 已进一步收敛为单一 Python CLI
+  （prepare/run/judge 仅为 task/batch 内部固定阶段，不再经过或暴露 Bash 式分段
+  入口；批次门失败返回非零退出码）、
+  typed/bounded runtime snapshot、
   Context v8、Run/Attempt 与 Invocation-failure 进展分离、simple Graph/current
   transaction、typed Proposal Acceptance、Graph intervention scope 已进入生产主链，
   并获得一批8题真实运行证据。

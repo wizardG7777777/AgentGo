@@ -57,7 +57,9 @@ blocked；Judge 红态与 baseline 一致。
 
 ### 3.1 仓库内权威 Harness
 
-通用契约落在 `scripts/swe_harness/`；`/tmp/agentgo-swe/harness/*.sh` 只作薄包装。
+通用契约落在 `scripts/swe_harness/harness.py`；2026-08-23 起 prepare/run/judge
+只作为 `task` / `batch` 的内部固定阶段，正式入口收敛为 Python 子命令，仓库与
+`/tmp/agentgo-swe` 均不再保留 Bash 测试脚本或包装器。
 
 - preflight 与每实例 startup probe 都发送真实 function schema；工具名随机化，
   只接受唯一 exact tool call、空参数和 `finish_reason=tool_calls`；

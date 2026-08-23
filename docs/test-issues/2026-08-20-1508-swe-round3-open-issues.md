@@ -11,7 +11,9 @@
 > - 问题 ID：`SWE-NNN`，跨文档稳定引用，修复状态在新文档中更新；
 > - 状态：`open`（未动手）/ `in-progress` / `fixed(<commit 或日期>)` / `wontfix(原因)` / `watch`（不修，持续观察）；
 > - 阶段（stage）：修复分批依据，见文末阶段定义；每完成一个阶段，重跑
->   8 题 Flask 批测（`/tmp/agentgo-swe/harness/run_all.sh`）作为回归证据。
+>   8 题 Flask 批测作为回归证据。当前权威入口为
+>   `python3 scripts/swe_harness/harness.py batch --timeout 1200`；下文 `.sh`
+>   名称仅描述 2026-08-20 当时已经删除的实现。
 
 ## 背景
 
@@ -211,11 +213,11 @@ EndOutcome、GraphStatus 推导和 Outcome/Recovery/UI 切片吸收。SWE-004 �
 ## SWE-005 harness 契约缝隙（P1，阶段 1，**fixed(2026-08-20)**）
 
 **修复内容**（当日落地并逐条实测）：
-1. **test patch 提交态**：`prepare_task.sh` 应用 test patch 后立即以 harness
+1. **test patch 提交态**：当时的 `prepare_task.sh` 应用 test patch 后立即以 harness
    身份提交——`git status` 干净，`git checkout -- tests/` 退化为无害
    no-op（实测：执行三轮事故同款命令后 status 仍为空）；篡改检测阴性
    用例（真实改动测试文件）仍正确判 `test_tampered`，防线未削弱。
-2. **评测脱污**：`setup_task.sh` 由共享对象库的 `git worktree` 改为
+2. **评测脱污**：当时的 `setup_task.sh` 由共享对象库的 `git worktree` 改为
    `--no-local` 独立克隆，随后裁全部分支/标签引用 + reflog expire +
    `gc --prune=now` + 移除 origin remote——实测 `git show <fix-sha>` 已
    失败、fix^ 前历史完整保留、主仓库零接触；`.swe_fix_sha` 不再写入
@@ -233,7 +235,7 @@ EndOutcome、GraphStatus 推导和 Outcome/Recovery/UI 切片吸收。SWE-004 �
 恢复回归）+ teardown-callbacks 基线 + 全部 7 个脚本 `bash -n` 通过。
 
 **现象**（测试设施问题，非 AgentGo 本体）：
-1. `prepare_task.sh` 把 test patch 以**未提交工作区改动**预置，worker 在
+1. 当时的 `prepare_task.sh` 把 test patch 以**未提交工作区改动**预置，worker 在
    长时间自我怀疑后把「禁止修改 tests/」纪律用反，用
    `git checkout -- tests/` 回滚了 golden 测试（两题 test_tampered；
    讽刺的是两题 src 修复都做对了，一题与上游 fix 逐字节一致）；
