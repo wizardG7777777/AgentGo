@@ -128,6 +128,34 @@ func TestGraphBoardPublishWithoutCapability(t *testing.T) {
 	}
 }
 
+func TestGraphBoardPublishesFrozenRecoveryIdentity(t *testing.T) {
+	s := store.NewMemoryTaskStore(nil, 100, 1, 300)
+	b := newGraphBoard(s)
+	id, err := b.PublishGraphTask(graph.TaskSpec{
+		GraphID: "g-recovery", NodeID: "recovery", ActivationID: "recovery@1",
+		NodeKind: graph.KindController, ControllerRole: graph.ControllerRoleLoopRecovery,
+		RecoverySourceTaskID: "work-task", Title: "恢复裁决", Route: graph.RouteScheduler,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := s.GetTask(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.GraphControllerRole != string(graph.ControllerRoleLoopRecovery) ||
+		task.RecoverySourceTaskID != "work-task" || task.GraphNodeKind != string(graph.KindController) {
+		t.Fatalf("recovery role/source 未持久化到 Task: %+v", task)
+	}
+	if _, err := b.PublishGraphTask(graph.TaskSpec{
+		GraphID: "g-recovery", NodeID: "recovery", ActivationID: "recovery@1",
+		NodeKind: graph.KindController, ControllerRole: graph.ControllerRoleLoopRecovery,
+		RecoverySourceTaskID: "other-source", Title: "恢复裁决", Route: graph.RouteScheduler,
+	}); err == nil || !strings.Contains(err.Error(), "controller_role/source") {
+		t.Fatalf("同 activation 的 recovery source 漂移必须 fail-closed: %v", err)
+	}
+}
+
 func TestGraphTaskResultExpandsStructuredCarrierWithJSONTypes(t *testing.T) {
 	task := &model.Task{
 		ID:     "task-structured",

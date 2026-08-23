@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"agentgo/internal/config"
+	"agentgo/internal/graph"
 	"agentgo/internal/intervention"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/loopstore"
@@ -177,6 +178,65 @@ func TestLoopInterventionBridgeIsTaskScopedAndGraphDetached(t *testing.T) {
 		wake.InterventionActivationID != command1.ActivationID ||
 		!strings.Contains(wake.Description, "Graph graph-1") || !strings.Contains(wake.Description, "GraphChangeProposal") {
 		t.Fatalf("Graph command 被错误绑定或缺少 Scheduler 裁决指引: %+v", wake)
+	}
+}
+
+func TestLoopInterventionBridgeUsesGraphRecoveryControllerAndAcksItsOutcome(t *testing.T) {
+	tasks := newLoopInterventionTaskStore(t)
+	source, command := publishTerminalInterventionSource(t, tasks, "source-recovery-controller", true)
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordination, ok := catalog.ProgressContract(policycatalog.ProgressCoordinationV1)
+	if !ok {
+		t.Fatal("缺少 coordination ProgressContract")
+	}
+	recovery := &model.Task{
+		ID: "graph-recovery-controller", Description: "裁决恢复", EventType: "__scheduler__",
+		RunID: source.RunID, RunContract: source.RunContract, RunPhase: runcontract.PhaseRecovery,
+		ContextPolicyRef: source.ContextPolicyRef, ProgressContract: &coordination.Contract,
+		GraphID: source.GraphID, NodeID: "recovery", ActivationID: "recovery@1",
+		GraphNodeKind:        string(graph.KindController),
+		GraphControllerRole:  string(graph.ControllerRoleLoopRecovery),
+		RecoverySourceTaskID: source.ID, MaxConcurrency: 1,
+	}
+	if err := tasks.PublishTask(recovery); err != nil {
+		t.Fatal(err)
+	}
+	loops := &loopInterventionStoreFake{commands: map[string][]loopcontract.LoopInterventionRequested{
+		source.ID: {command},
+	}}
+	outcomes := newOutcomeDeliveryFake(source, false)
+	bridge, err := newLoopInterventionBridge(tasks, loops, outcomes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := bridge.Run(trace.Event{Kind: trace.KindTaskBlocked, TaskID: source.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tasks.GetTask(intervention.WakeTaskID(command.CommandID)); !errors.Is(err, store.ErrTaskNotFound) {
+		t.Fatalf("Graph recovery controller 已存在时不得再发布 detached wake: %v", err)
+	}
+	if len(loops.acks) != 0 {
+		t.Fatal("recovery controller 尚未形成 Outcome 时不得 Ack")
+	}
+
+	if err := tasks.ClaimTask("scheduler", recovery.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks.BlockProcessingTaskBySystem(recovery.ID, "裁决为 blocked", "recovery_decided"); err != nil {
+		t.Fatal(err)
+	}
+	recovery, _ = tasks.GetTask(recovery.ID)
+	outcomes.add(recovery, false)
+	if err := bridge.Run(trace.Event{Kind: trace.KindTaskBlocked, TaskID: recovery.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if len(loops.acks) != 1 || loops.acks[0].CommandID != command.CommandID ||
+		loops.acks[0].DecisionRef != recovery.OutcomeRef {
+		t.Fatalf("recovery controller durable Outcome 未确认原 intervention: %+v", loops.acks)
 	}
 }
 

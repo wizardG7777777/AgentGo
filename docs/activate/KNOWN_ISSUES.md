@@ -44,6 +44,15 @@ durable Store 和生产接线，并通过 full/race/vet/build、harness 单测�
 - **SWE-032 实现与外部验证已关闭**：code-change/v1 在 rollover 用尽后于
   第 7 轮提前 intervention，违反声明的 `InterventionAfterTurns=9`。状态机现只按
   intervention 阈值介入；新 code-change Task 冻结 v3（4/10/18/24），v1/v2 保留供历史恢复。
+- **SWE-033 已修复并获得外部验证**：第八轮三道失败题证明 typed
+  intervention 曾在 simple Graph 中直接进入 blocked end，Scheduler wake 到达时
+  Graph 已终态且无法 change/retry。新 simple Graph 加入 framework-owned
+  `loop_recovery` Controller，冻结 source Task 与 GraphChange 控制租约，按
+  `decision=retry|blocked` 创建新 Activation 或收官；SWE runner 同时新增
+  `loop_intervention_without_recovery` 架构事故门。full/race/vet/build、真实
+  `work@1→recovery@1→work@2`、三道历史失败题定向复跑均完成；其中
+  `context-push-order` 与 `session-access-tracking` 业务 resolved，
+  `pass-context-dispatch` 为模型业务失败但 recovery/terminal/ACK 架构链完整。
 - **验证横切面**：仓库内 SWE harness 已分别实际运行 OpenRouter Luna 与 DeepSeek
   真实 thinking 路径。最终冻结二进制的 DeepSeek 8 题完整批次为
   `architecture_ok=8/8`、Judge resolved 5/8；三题未解均进入 typed blocked、

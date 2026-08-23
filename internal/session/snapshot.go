@@ -98,6 +98,8 @@ type TaskSnapshot struct {
 	NodeID                       string `json:"node_id,omitempty"`
 	ActivationID                 string `json:"activation_id,omitempty"`
 	GraphNodeKind                string `json:"graph_node_kind,omitempty"`
+	GraphControllerRole          string `json:"graph_controller_role,omitempty"`
+	RecoverySourceTaskID         string `json:"recovery_source_task_id,omitempty"`
 	OutcomeRef                   string `json:"outcome_ref,omitempty"`
 	GraphDefinitionDigestVersion string `json:"graph_definition_digest_version,omitempty"`
 	// RouteScope is the durable runtime route-authorization owner. Old

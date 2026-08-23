@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"agentgo/internal/graph"
 	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
@@ -79,15 +80,30 @@ func mechanicalSingletonTool(phase string) (string, bool) {
 }
 
 func phaseRequiresToolCall(phase string) bool {
-	return mechanicalSingletonPhase(phase) || phase == "scheduler:draft-edit" || phase == "scheduler:recovery"
+	return mechanicalSingletonPhase(phase) || phase == "scheduler:draft-edit" ||
+		phase == "scheduler:recovery" || phase == "scheduler:graph-recovery"
 }
 
 func phaseDispatchesOnlyFirstTool(phase string) bool {
-	return mechanicalSingletonPhase(phase) || phase == "scheduler:draft-edit" || phase == "scheduler:recovery"
+	return mechanicalSingletonPhase(phase) || phase == "scheduler:draft-edit" ||
+		phase == "scheduler:recovery" || phase == "scheduler:graph-recovery"
 }
 
 func deriveInvocationToolPolicy(task *model.Task, history []HistoryEntry, full *ToolRegistry) invocationToolPolicy {
 	policy := invocationToolPolicy{Registry: full, Phase: "default", MaxCalls: defaultToolCallsPerResponse}
+	if task != nil && full != nil && task.GraphID != "" &&
+		task.GraphNodeKind == string(graph.KindController) &&
+		task.GraphControllerRole == string(graph.ControllerRoleLoopRecovery) {
+		allow := []string{
+			"commit_graph_change", "get_task_result", "propose_graph_change",
+			"read_content_ref", "read_graph", "read_graph_change",
+			"submit_task_result", "validate_graph_change",
+		}
+		return invocationToolPolicy{
+			Registry: full.Filtered(allow), Phase: "scheduler:graph-recovery",
+			MaxCalls: defaultToolCallsPerResponse,
+		}
+	}
 	if task != nil && full != nil && task.GraphID != "" && historyRequiresDeliverableSubmit(history) {
 		return invocationToolPolicy{
 			Registry: full.Filtered([]string{"submit_task_result"}),

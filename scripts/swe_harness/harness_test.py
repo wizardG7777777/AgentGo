@@ -364,6 +364,35 @@ class HarnessContractTest(unittest.TestCase):
             self.assertNotIn("must-not-leak", serialized)
             self.assertNotIn("result", serialized)
 
+    def test_loop_intervention_requires_graph_recovery_outcome(self):
+        source = {
+            "graph_id": "g-1", "node_id": "work", "activation_id": "work@1",
+            "reason_code": "loop_intervention_required", "status": "blocked",
+        }
+        self.assertEqual(
+            harness.missing_loop_recovery_sources([source], set()),
+            ["g-1/work@1/unknown"],
+        )
+        recovery = {
+            "graph_id": "g-1", "node_id": "recovery", "activation_id": "recovery@1",
+            "task_id": "recovery-task", "status": "completed",
+        }
+        source["task_id"] = "work-task"
+        self.assertEqual(harness.missing_loop_recovery_sources([source, recovery], {"work-task"}), [])
+        self.assertEqual(harness.missing_loop_recovery_sources([source, recovery], {"other-task"}),
+                         ["g-1/work@1/work-task"])
+        hard_blocked = {**source, "graph_id": "g-2", "reason_code": "no_progress_budget_exhausted"}
+        self.assertEqual(harness.missing_loop_recovery_sources([hard_blocked], set()), [])
+        recovery_intervention = {
+            **source, "task_id": "recovery-task", "node_id": "recovery",
+            "activation_id": "recovery@2",
+        }
+        self.assertEqual(
+            harness.missing_loop_recovery_sources(
+                [recovery_intervention], set(), {"recovery-task"},
+            ), [],
+        )
+
     def test_trace_metrics_detect_scheduler_batch_and_draft_call_index(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

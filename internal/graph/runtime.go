@@ -8,6 +8,7 @@ import (
 	"log"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -116,13 +117,19 @@ type TaskSpec struct {
 	ActivationID            string
 	// NodeKind 随 activation 冻结并持久化到 model.Task，供执行租约按真实
 	// Graph 角色派生控制通道；不能从 route 猜测（acceptance 可自定义 route）。
-	NodeKind    NodeKind
-	Title       string
-	Description string
-	Route       string // 认领路由（resolveRoute 解析结果 = runner event_type）
-	Tools       []string
-	Model       string
-	Isolation   string
+	NodeKind NodeKind
+	// ControllerRole 仅对 controller 有效，随 activation 定义冻结。loop_recovery
+	// controller 是 L5 的恢复裁决节点，不是普通 Scheduler/业务 Worker。
+	ControllerRole ControllerRole
+	// RecoverySourceTaskID 把恢复裁决 Task 精确绑定到触发它的终态 Graph Task；
+	// L4 intervention ACK 与 L3 结果读取授权不得解析文本反推该关系。
+	RecoverySourceTaskID string
+	Title                string
+	Description          string
+	Route                string // 认领路由（resolveRoute 解析结果 = runner event_type）
+	Tools                []string
+	Model                string
+	Isolation            string
 	// Inputs 是本 activation 的持久化输入绑定（数据流）：发布时随任务描述
 	// 注入执行上下文（有界摘要 + 证据引用），任务文本冻结后与图内事实一致。
 	Inputs []InputBinding
@@ -729,6 +736,9 @@ func (rt *Runtime) evalTransitionsLocked(graphID, nodeID, activationID string, s
 	if node.Execution != nil && node.Execution.ActivationID == activationID {
 		node = nodeForExecution(node, *node.Execution)
 	}
+	if err := validateRecoveryRetryBudget(node, activationID, status, result); err != nil {
+		return errors.Join(rt.failGraph(graphID, err.Error()), err)
+	}
 	// 数据流绑定：本 activation 的完整证据与稳定 ResultRef 随每条生效边
 	// 进入 EdgeInput。老 journal/测试可能直接构造 Settlement 而未先写
 	// ActivationResult，此处在任何 transition 前做幂等补写。
@@ -768,9 +778,15 @@ func (rt *Runtime) evalTransitionsLocked(graphID, nodeID, activationID string, s
 		if _, fired := rt.store.HasTransition(graphID, activationID, i); fired {
 			continue
 		}
-		rec, err := rt.newTransitionRecordLocked(graphID, nodeID, activationID, i, tr.To, tr.TargetInput)
+		rec, err := rt.newTransitionRecordLocked(graphID, nodeID, activationID, i, tr.To, tr.TargetInput, tr.ReplayInputs)
 		if err != nil {
 			return err
+		}
+		if rec.ReplayInputs {
+			rec.ReplayedInputs, err = rt.recoveryReplayInputs(graphID, rec)
+			if err != nil {
+				return err
+			}
 		}
 		if detail := rt.inputBindingConflictDetail(graphID, rec); detail != "" {
 			reason := "数据流输入单赋值冲突：" + detail
@@ -828,10 +844,29 @@ func (rt *Runtime) evalTransitionsLocked(graphID, nodeID, activationID string, s
 	return errors.Join(errs...)
 }
 
+func validateRecoveryRetryBudget(node Node, activationID string, status NodeStatus, result map[string]any) error {
+	if ControllerRoleOf(node) != ControllerRoleLoopRecovery || status != NodeCompleted || result["decision"] != "retry" {
+		return nil
+	}
+	limit, err := strconv.Atoi(strings.TrimSpace(node.Metadata[MetadataRecoveryMaxRetries]))
+	if err != nil || limit <= 0 {
+		return fmt.Errorf("graph: loop_recovery activation %s 缺少合法 recovery_max_retries", activationID)
+	}
+	_, sequence, ok := parseActivationID(activationID)
+	if !ok {
+		return fmt.Errorf("graph: loop_recovery activation_id=%q 非法", activationID)
+	}
+	if sequence > limit {
+		return fmt.Errorf("graph: loop_recovery retry 预算已耗尽：activation=%s limit=%d；必须提交 decision=blocked",
+			activationID, limit)
+	}
+	return nil
+}
+
 // newTransitionRecordLocked 在边选择落盘前冻结它指向的 activation。目标已有
 // 在途 activation 时加入该 activation；否则复用尚未物化的 durable 预留，
 // 或预留下一个新 ID。TargetActivationID 与边选择同条 journal 记录落盘。
-func (rt *Runtime) newTransitionRecordLocked(graphID, sourceNodeID, sourceActivationID string, transitionID int, targetNodeID, targetInput string) (TransitionRecord, error) {
+func (rt *Runtime) newTransitionRecordLocked(graphID, sourceNodeID, sourceActivationID string, transitionID int, targetNodeID, targetInput string, replayInputs bool) (TransitionRecord, error) {
 	doc, err := rt.graph(graphID)
 	if err != nil {
 		return TransitionRecord{}, err
@@ -862,6 +897,7 @@ func (rt *Runtime) newTransitionRecordLocked(graphID, sourceNodeID, sourceActiva
 		TransitionID:       transitionID,
 		TargetNodeID:       targetNodeID,
 		TargetInput:        targetInput,
+		ReplayInputs:       replayInputs,
 		TargetActivationID: targetActivationID,
 	}, nil
 }
@@ -996,7 +1032,40 @@ func (rt *Runtime) activateRecordedTransitionLocked(graphID string, rec Transiti
 			return errors.Join(rt.failGraph(graphID, reason), fmt.Errorf("graph: %s", reason))
 		}
 	}
-	return rt.activateLocked(graphID, rec.TargetNodeID, input)
+	return rt.activateLockedWithReplay(graphID, rec.TargetNodeID, input, rec.ReplayedInputs)
+}
+
+func (rt *Runtime) recoveryReplayInputs(graphID string, rec TransitionRecord) ([]InputBinding, error) {
+	doc, err := rt.graph(graphID)
+	if err != nil {
+		return nil, err
+	}
+	recovery, ok := doc.Nodes[rec.SourceNodeID]
+	if !ok || recovery.Execution == nil || recovery.Execution.ActivationID != rec.SourceActivationID ||
+		ControllerRoleOf(nodeForExecution(recovery, *recovery.Execution)) != ControllerRoleLoopRecovery {
+		return nil, fmt.Errorf("graph: replay_inputs 来源 %s/%s 不是当前 loop_recovery activation",
+			rec.SourceNodeID, rec.SourceActivationID)
+	}
+	var failure InputBinding
+	found := false
+	for _, input := range recovery.Execution.Input {
+		if input.TargetInput != "failure_context" {
+			continue
+		}
+		if found {
+			return nil, fmt.Errorf("graph: loop_recovery activation %s 存在多个 failure_context", rec.SourceActivationID)
+		}
+		failure, found = input, true
+	}
+	if !found || failure.SourceNodeID != rec.TargetNodeID {
+		return nil, fmt.Errorf("graph: loop_recovery retry 目标 %s 与 failure_context 来源 %s 不一致",
+			rec.TargetNodeID, failure.SourceNodeID)
+	}
+	source, ok := doc.Nodes[failure.SourceNodeID]
+	if !ok || source.Execution == nil || source.Execution.ActivationID != failure.SourceActivationID {
+		return nil, fmt.Errorf("graph: recovery source activation %s 不再可解引用", failure.SourceActivationID)
+	}
+	return cloneInputBindings(source.Execution.Input), nil
 }
 
 // ResumeGraph 在进程重启后恢复一张图的执行（Store.Recover 完成后调用）：
@@ -1402,6 +1471,10 @@ func (rt *Runtime) resumeWaitingLocked(graphID, nodeID string, node Node) error 
 // 重进入）。节点已 ready/running/waiting 说明激活事实已 durable（重复进入
 // 幂等忽略）。按 kind 分派执行语义。
 func (rt *Runtime) activateLocked(graphID, nodeID string, input map[string]any) error {
+	return rt.activateLockedWithReplay(graphID, nodeID, input, nil)
+}
+
+func (rt *Runtime) activateLockedWithReplay(graphID, nodeID string, input map[string]any, replay []InputBinding) error {
 	doc, err := rt.graph(graphID)
 	if err != nil {
 		return err
@@ -1419,7 +1492,7 @@ func (rt *Runtime) activateLocked(graphID, nodeID string, input map[string]any) 
 	}
 	switch node.Kind {
 	case KindController, KindAgent, KindAcceptance:
-		return rt.activateTaskNode(graphID, nodeID, node)
+		return rt.activateTaskNode(graphID, nodeID, node, replay)
 	case KindRouter:
 		return rt.activateRouter(graphID, nodeID, input)
 	case KindEnd:
@@ -1447,14 +1520,16 @@ func (rt *Runtime) activateLocked(graphID, nodeID string, input map[string]any) 
 // 统一解析（acceptance 默认路由 acceptance.verify，见 resolveRoute）。
 // acceptance 是数据驱动的 barrier 节点，走 activateAcceptance 的 data-ready
 // 门控路径，不在此直接发任务。
-func (rt *Runtime) activateTaskNode(graphID, nodeID string, node Node) error {
+func (rt *Runtime) activateTaskNode(graphID, nodeID string, node Node, replay []InputBinding) error {
 	if node.Kind == KindAcceptance {
-		return rt.activateAcceptance(graphID, nodeID, node)
+		return rt.activateAcceptance(graphID, nodeID, node, replay)
 	}
 	exec, err := rt.activationFor(graphID, nodeID, node, phaseForKind(node.Kind))
 	if err != nil {
 		return err
 	}
+	exec.Input = mergeInputBindings(exec.Input, replay)
+	hydrateExecutionEvidence(&exec)
 	if err := rt.writeNode(graphID, nodeID, exec, NodeReady); err != nil {
 		return err
 	}
@@ -1468,11 +1543,13 @@ func (rt *Runtime) activateTaskNode(graphID, nodeID string, node Node) error {
 // 由 evaluateAcceptancesLocked 重评估（结算与 ResumeGraph 的收尾挂钩）。
 // 单入边场景（implement→verify）边记录先于激活存在，评估立即就绪，行为
 // 与直接发任务一致。
-func (rt *Runtime) activateAcceptance(graphID, nodeID string, node Node) error {
+func (rt *Runtime) activateAcceptance(graphID, nodeID string, node Node, replay []InputBinding) error {
 	exec, err := rt.activationFor(graphID, nodeID, node, phaseForKind(node.Kind))
 	if err != nil {
 		return err
 	}
+	exec.Input = mergeInputBindings(exec.Input, replay)
+	hydrateExecutionEvidence(&exec)
 	if err := rt.writeNode(graphID, nodeID, exec, NodeReady); err != nil {
 		return err
 	}
@@ -1504,7 +1581,7 @@ func (rt *Runtime) evaluateAcceptanceReadyLocked(graphID, nodeID string) error {
 		return nil
 	}
 	exec := *node.Execution
-	exec.Input = rt.inputsFor(graphID, nodeID, exec.ActivationID)
+	exec.Input = mergeInputBindings(exec.Input, rt.inputsFor(graphID, nodeID, exec.ActivationID))
 	required := rt.requiredInputPorts(graphID, doc, nodeID, node)
 	if len(required) > 0 {
 		if !inputPortsReady(exec.Input, required) {
@@ -2481,6 +2558,20 @@ func (rt *Runtime) publishTask(graphID, nodeID string, node Node, exec Execution
 			fmt.Errorf("graph: %s", reason),
 		)
 	}
+	if spec.ControllerRole == ControllerRoleLoopRecovery {
+		sourceTaskID, err := rt.recoverySourceTaskID(graphID, spec)
+		if err != nil {
+			reason := fmt.Sprintf("恢复节点 %s（activation %s）无法绑定 intervention source Task: %v",
+				nodeID, exec.ActivationID, err)
+			return errors.Join(
+				rt.writeTerminalContinuationLocked(graphID, nodeID, exec, NodeFailed,
+					map[string]any{"error": reason}, SettlementContinueGraphFail, reason),
+				rt.failGraph(graphID, reason),
+				fmt.Errorf("graph: %s", reason),
+			)
+		}
+		spec.RecoverySourceTaskID = sourceTaskID
+	}
 	taskID, err := rt.board.PublishGraphTask(spec)
 	if err != nil {
 		reason := fmt.Sprintf("节点 %s（activation %s）任务发布失败: %v", nodeID, exec.ActivationID, err)
@@ -2493,6 +2584,35 @@ func (rt *Runtime) publishTask(graphID, nodeID string, node Node, exec Execution
 	}
 	exec.TaskID = taskID
 	return rt.writeNode(graphID, nodeID, exec, NodeRunning)
+}
+
+// recoverySourceTaskID 从 Graph 的冻结数据流绑定解析 recovery controller 的
+// 唯一来源 Task。它只消费 InputBinding/TaskBoard 权威事实，不解析模型文本。
+func (rt *Runtime) recoverySourceTaskID(graphID string, spec TaskSpec) (string, error) {
+	if rt.board == nil {
+		return "", fmt.Errorf("TaskBoard 未配置")
+	}
+	var sourceActivationID string
+	for _, input := range spec.Inputs {
+		if input.TargetInput != "failure_context" {
+			continue
+		}
+		if sourceActivationID != "" && sourceActivationID != input.SourceActivationID {
+			return "", fmt.Errorf("failure_context 存在多个来源 activation")
+		}
+		sourceActivationID = input.SourceActivationID
+	}
+	if sourceActivationID == "" {
+		return "", fmt.Errorf("缺少 failure_context InputBinding")
+	}
+	snapshot, found, err := rt.board.LookupGraphTask(graphID, sourceActivationID, "")
+	if err != nil {
+		return "", err
+	}
+	if !found || strings.TrimSpace(snapshot.TaskID) == "" || snapshot.TerminalStatus == "" {
+		return "", fmt.Errorf("来源 activation %s 缺少终态 Task authority", sourceActivationID)
+	}
+	return snapshot.TaskID, nil
 }
 
 func (rt *Runtime) taskSpecFor(graphID, nodeID string, node Node, exec Execution) TaskSpec {
@@ -2537,6 +2657,7 @@ func taskSpecFor(graphID, nodeID string, node Node, exec Execution) TaskSpec {
 		NodeID:              nodeID,
 		ActivationID:        exec.ActivationID,
 		NodeKind:            effective.Kind,
+		ControllerRole:      ControllerRoleOf(effective),
 		Route:               resolveRoute(effective),
 		ProgressContractRef: effective.ProgressContractRef,
 		ContextPolicyRef:    effective.ContextPolicyRef,
@@ -2963,6 +3084,46 @@ func (rt *Runtime) inputsFor(graphID, nodeID, activationID string) []InputBindin
 		out = append(out, b)
 	}
 	sort.Slice(out, func(i, j int) bool {
+		if out[i].SourceNodeID != out[j].SourceNodeID {
+			return out[i].SourceNodeID < out[j].SourceNodeID
+		}
+		return out[i].SourceActivationID < out[j].SourceActivationID
+	})
+	return out
+}
+
+func cloneInputBindings(inputs []InputBinding) []InputBinding {
+	out := make([]InputBinding, 0, len(inputs))
+	for _, input := range inputs {
+		cloned := input
+		cloned.Evidence = append([]EvidenceEntry(nil), input.Evidence...)
+		cloned.EvidenceRefs = append([]string(nil), input.EvidenceRefs...)
+		cloned.Result = append(json.RawMessage(nil), input.Result...)
+		out = append(out, cloned)
+	}
+	return out
+}
+
+func mergeInputBindings(base, extra []InputBinding) []InputBinding {
+	out := cloneInputBindings(base)
+	seen := make(map[string]struct{}, len(out)+len(extra))
+	keyOf := func(input InputBinding) string {
+		return input.SourceNodeID + "\x00" + input.SourceActivationID + "\x00" + input.TargetInput
+	}
+	for _, input := range out {
+		seen[keyOf(input)] = struct{}{}
+	}
+	for _, input := range cloneInputBindings(extra) {
+		if _, exists := seen[keyOf(input)]; exists {
+			continue
+		}
+		seen[keyOf(input)] = struct{}{}
+		out = append(out, input)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].TargetInput != out[j].TargetInput {
+			return out[i].TargetInput < out[j].TargetInput
+		}
 		if out[i].SourceNodeID != out[j].SourceNodeID {
 			return out[i].SourceNodeID < out[j].SourceNodeID
 		}

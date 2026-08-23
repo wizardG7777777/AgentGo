@@ -340,6 +340,31 @@ func TestSchedulerGroup_GetTaskResultLegacyScope(t *testing.T) {
 	}
 }
 
+func TestSchedulerGroup_GetTaskResultAllowsExactDetachedInterventionScope(t *testing.T) {
+	s := store.NewMemoryTaskStore(make(chan model.Event, 32), 16, 1, 60)
+	controller := &model.Task{
+		ID: "intervention-controller", Description: "recover", EventType: "__scheduler__",
+		InterventionGraphID: "g-1", InterventionNodeID: "work", InterventionActivationID: "work@1",
+	}
+	if err := s.PublishTask(controller); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("scheduler", controller.ID); err != nil {
+		t.Fatal(err)
+	}
+	target := &model.Task{ID: "graph-work", GraphID: "g-1", NodeID: "work", ActivationID: "work@1"}
+	publishCompletedResultTask(t, s, target, map[string]string{"worker": "blocked detail"})
+	other := &model.Task{ID: "graph-other", GraphID: "g-1", NodeID: "work", ActivationID: "work@2"}
+	publishCompletedResultTask(t, s, other, map[string]string{"worker": "other detail"})
+	registry := newResultToolRegistry(SchedulerGroup{Store: s, Holder: &fakeHolder{id: controller.ID}})
+	if _, err := dispatchResultPage(t, registry, map[string]any{"task_id": target.ID}); err != nil {
+		t.Fatalf("exact intervention scope 应能读取来源 Graph Task: %v", err)
+	}
+	if _, err := registry.Dispatch(context.Background(), mkCall("get_task_result", map[string]any{"task_id": other.ID})); err == nil || !strings.Contains(err.Error(), "intervention scope") {
+		t.Fatalf("intervention scope 不得读取其它 activation: %v", err)
+	}
+}
+
 func TestSchedulerGroup_GetTaskResultRejectsInactiveCallerAndEvictedResult(t *testing.T) {
 	s, controller := newLegacyResultFixture(t, 1)
 	first := &model.Task{ID: "evicted", ParentTaskID: controller.ID}

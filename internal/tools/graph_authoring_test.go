@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,6 +80,48 @@ func TestGraphAuthoringSchemasUseNativeObjectsAndArrays(t *testing.T) {
 	}
 }
 
+func TestGraphAuthoringAllowsOnlyTypedRecoveryControllerInsideGraph(t *testing.T) {
+	group, _ := newGraphAuthoringToolEnv(t)
+	recovery := &model.Task{
+		ID: "recovery-controller", Description: "恢复", EventType: "__scheduler__",
+		GraphID: "g-1", NodeID: "recovery", ActivationID: "recovery@1",
+		GraphNodeKind:        string(graph.KindController),
+		GraphControllerRole:  string(graph.ControllerRoleLoopRecovery),
+		RecoverySourceTaskID: "work-task",
+	}
+	if err := group.TaskStore.PublishTask(recovery); err != nil {
+		t.Fatal(err)
+	}
+	group.Holder = &fakeHolder{id: recovery.ID}
+	if _, err := group.currentRootSchedulerTask("propose_graph_change"); err != nil {
+		t.Fatalf("typed loop_recovery controller 应获得 GraphChange authority: %v", err)
+	}
+	if _, err := group.currentRootSchedulerTask("create_graph_draft"); err == nil {
+		t.Fatal("loop_recovery controller 不得借同一 authoring group 新建 GraphDraft")
+	}
+	if _, err := group.proposeGraphChange(context.Background(), map[string]any{
+		"graph_id": "g-other", "base_definition_revision": 1,
+		"base_definition_digest": "digest", "reason": "test",
+		"upsert_nodes": []any{map[string]any{"id": "x", "kind": "end"}},
+	}); err == nil || !strings.Contains(err.Error(), "只能修改当前 Graph") {
+		t.Fatalf("loop_recovery controller 不得跨 Graph: %v", err)
+	}
+
+	normal := &model.Task{
+		ID: "normal-controller", Description: "普通 controller", EventType: "__scheduler__",
+		GraphID: "g-1", NodeID: "controller", ActivationID: "controller@1",
+		GraphNodeKind: string(graph.KindController),
+	}
+	if err := group.TaskStore.PublishTask(normal); err != nil {
+		t.Fatal(err)
+	}
+	group.Holder = &fakeHolder{id: normal.ID}
+	if _, err := group.currentRootSchedulerTask("propose_graph_change"); err == nil ||
+		!strings.Contains(err.Error(), "loop_recovery controller") {
+		t.Fatalf("普通 Graph controller 不得获得 transactional GraphChange authority: %v", err)
+	}
+}
+
 func TestConfigureSimpleGraphDraftBuildsFrameworkOwnedAcceptedShape(t *testing.T) {
 	group, authoring := newGraphAuthoringToolEnv(t)
 	if _, err := group.createDraft(context.Background(), map[string]any{}); err != nil {
@@ -94,13 +137,33 @@ func TestConfigureSimpleGraphDraftBuildsFrameworkOwnedAcceptedShape(t *testing.T
 	}
 	work := draft.Candidate.Nodes["work"]
 	acceptance := draft.Candidate.Nodes["acceptance"]
+	recovery := draft.Candidate.Nodes["recovery"]
+	acceptanceRecovery := draft.Candidate.Nodes["acceptance-recovery"]
 	if draft.DraftRevision != 2 || draft.Candidate.Root != "work" || draft.Contract.ExecutionClass != graph.ExecutionMutating ||
 		!draft.Contract.RequiresAcceptance || len(draft.Contract.RequiredEffects) != 1 ||
 		work.Kind != graph.KindAgent || work.Metadata["authoring_template"] != "simple-task/v1" ||
 		work.ProgressContractRef != policycatalog.ProgressCodeChangeCurrent ||
 		acceptance.Kind != graph.KindAcceptance || acceptance.ProgressContractRef != policycatalog.ProgressVerificationV1 ||
-		len(draft.Candidate.Nodes) != 9 {
+		recovery.Kind != graph.KindController ||
+		recovery.Metadata[graph.MetadataControllerRole] != string(graph.ControllerRoleLoopRecovery) ||
+		recovery.Metadata[graph.MetadataRecoveryMaxRetries] != "2" ||
+		recovery.ProgressContractRef != policycatalog.ProgressCoordinationV1 ||
+		acceptanceRecovery.Kind != graph.KindController ||
+		acceptanceRecovery.Metadata[graph.MetadataControllerRole] != string(graph.ControllerRoleLoopRecovery) ||
+		acceptanceRecovery.Metadata[graph.MetadataRecoveryMaxRetries] != "2" ||
+		len(draft.Candidate.Nodes) != 15 {
 		t.Fatalf("simple task graph 未由 framework 完整生成: %+v", draft)
+	}
+	if len(work.Next) != 3 || work.Next[2].To != "recovery" ||
+		work.Next[2].TargetInput != "failure_context" || work.Next[2].When.Event != graph.EventBlocked ||
+		len(recovery.Next) != 4 || recovery.Next[0].To != "work" ||
+		!recovery.Next[0].ReplayInputs || recovery.Next[0].TargetInput != "" ||
+		len(acceptance.Next) != 5 || acceptance.Next[4].To != "acceptance-recovery" ||
+		acceptance.Next[4].TargetInput != "failure_context" ||
+		len(acceptanceRecovery.Next) != 4 || acceptanceRecovery.Next[0].To != "acceptance" ||
+		!acceptanceRecovery.Next[0].ReplayInputs {
+		t.Fatalf("simple task graph 未形成 blocked→recovery→work@new 正式路径: work=%+v recovery=%+v",
+			work.Next, recovery.Next)
 	}
 	if _, err := group.configureSimpleDraft(context.Background(), map[string]any{"execution_class": "mutating"}); err != nil {
 		t.Fatalf("同 execution_class 重放应幂等: %v", err)

@@ -391,8 +391,17 @@ func validateTransitions(doc *GraphDocument) error {
 					return newErr("转移", path+".target_input", "%s 的 target_input %q 非法（仅允许字母、数字与 . _ : -，长度 ≤ %d）", path, tr.TargetInput, MaxIDLength)
 				}
 				target := doc.Nodes[tr.To]
-				if target.Kind != KindJoin && target.Kind != KindAcceptance {
-					return newErr("转移", path+".target_input", "%s 仅在目标为 join / acceptance 时可声明 target_input，目标 %q 类型为 %s", path, tr.To, target.Kind)
+				if !acceptsNamedInputs(target) {
+					return newErr("转移", path+".target_input", "%s 仅在目标为 join / acceptance / loop_recovery controller 时可声明 target_input，目标 %q 类型为 %s", path, tr.To, target.Kind)
+				}
+			}
+			if tr.ReplayInputs {
+				if ControllerRoleOf(node) != ControllerRoleLoopRecovery {
+					return newErr("转移", path+".replay_inputs",
+						"%s 只有 loop_recovery controller 的 retry 边可以 replay_inputs", path)
+				}
+				if tr.TargetInput != "" {
+					return newErr("转移", path+".replay_inputs", "%s 的 replay_inputs 与 target_input 不能同时设置", path)
 				}
 			}
 			if tr.When != nil {
@@ -418,29 +427,35 @@ func validateAuthoringNodes(nodes map[string]Node, prefix string, v2 bool) error
 		source string
 		index  int
 		input  string
+		replay bool
 	}
 	inbound := make(map[string][]inboundEdge)
 	for _, sourceID := range sortedNodeKeys(nodes) {
 		for i, tr := range nodes[sourceID].Next {
-			inbound[tr.To] = append(inbound[tr.To], inboundEdge{source: sourceID, index: i, input: tr.TargetInput})
+			inbound[tr.To] = append(inbound[tr.To], inboundEdge{
+				source: sourceID, index: i, input: tr.TargetInput, replay: tr.ReplayInputs,
+			})
 		}
 	}
 	for _, id := range sortedNodeKeys(nodes) {
 		node := nodes[id]
 		path := prefix + "." + id
 		edges := inbound[id]
-		if node.Kind != KindJoin && node.Kind != KindAcceptance && len(edges) > 1 {
+		if !acceptsNamedInputs(node) && len(edges) > 1 {
 			edge := edges[1]
 			return newErr("转移", fmt.Sprintf("%s.%s.next[%d]", prefix, edge.source, edge.index),
 				"%s 是非 barrier 节点，但存在 %d 条静态入边；普通节点的 Input 在首次激活时冻结，当前仅允许单一生产边。条件分支请保持各自后续/各自 end，等待 generation/correlation token 后再开放 OR mux", path, len(edges))
 		}
-		if node.Kind == KindJoin || node.Kind == KindAcceptance {
+		if acceptsNamedInputs(node) {
 			required := []string(nil)
 			if node.Task != nil {
 				required = node.Task.RequiredInputs
 			}
 			if len(required) == 0 && len(edges) > 1 {
 				for _, edge := range edges {
+					if edge.replay {
+						continue
+					}
 					if edge.input == "" {
 						return newErr("转移", fmt.Sprintf("%s.%s.next[%d].target_input", prefix, edge.source, edge.index),
 							"%s 有多条直接入边；每条入边都必须用唯一 target_input 声明端口（不同端口构成 AND barrier），也可在目标 task.required_inputs 显式列出必需端口", path)
@@ -454,6 +469,9 @@ func validateAuthoringNodes(nodes map[string]Node, prefix string, v2 bool) error
 				}
 				supplied := make(map[string]inboundEdge, len(edges))
 				for _, edge := range edges {
+					if edge.replay {
+						continue
+					}
 					if edge.input == "" {
 						return newErr("转移", fmt.Sprintf("%s.%s.next[%d].target_input", prefix, edge.source, edge.index),
 							"指向 %s 的入边必须声明 target_input；目标要求端口 %v", path, required)
@@ -477,6 +495,9 @@ func validateAuthoringNodes(nodes map[string]Node, prefix string, v2 bool) error
 			if len(required) == 0 {
 				seenPort := make(map[string]inboundEdge, len(edges))
 				for _, edge := range edges {
+					if edge.replay {
+						continue
+					}
 					if edge.input == "" {
 						continue
 					}
@@ -485,6 +506,18 @@ func validateAuthoringNodes(nodes map[string]Node, prefix string, v2 bool) error
 							"指向 %s 的端口 %q 已由 %s.%s.next[%d] 声明；输入端口是单赋值，条件分支须保持各自后续/各自 end，OR mux 待 generation/correlation token 后再开放", path, edge.input, prefix, previous.source, previous.index)
 					}
 					seenPort[edge.input] = edge
+				}
+			}
+		}
+		if ControllerRoleOf(node) == ControllerRoleLoopRecovery {
+			for i, tr := range node.Next {
+				if !tr.ReplayInputs {
+					continue
+				}
+				if len(edges) != 1 || edges[0].source != tr.To || edges[0].input != "failure_context" {
+					return newErr("转移", fmt.Sprintf("%s.next[%d].replay_inputs", path, i),
+						"loop_recovery replay 边必须返回唯一 failure_context 来源节点；target=%s inbound=%v",
+						tr.To, edges)
 				}
 			}
 		}
@@ -710,8 +743,8 @@ func validateNodeSemantics(doc *GraphDocument) error {
 			if node.Kind == KindAcceptance && strings.TrimSpace(node.Task.Description) == "" {
 				return newErr("节点", path+".task.description", "acceptance 节点 %q 的 task.description 必须写明可执行的验收判据", id)
 			}
-			if len(node.Task.RequiredInputs) > 0 && node.Kind != KindJoin && node.Kind != KindAcceptance {
-				return newErr("节点", path+".task.required_inputs", "required_inputs 仅允许 join / acceptance 节点声明，节点 %q 类型为 %s", id, node.Kind)
+			if len(node.Task.RequiredInputs) > 0 && !acceptsNamedInputs(node) {
+				return newErr("节点", path+".task.required_inputs", "required_inputs 仅允许 join / acceptance / loop_recovery controller 声明，节点 %q 类型为 %s", id, node.Kind)
 			}
 			seen := make(map[string]struct{}, len(node.Task.RequiredInputs))
 			for i, input := range node.Task.RequiredInputs {
@@ -748,6 +781,11 @@ func validateNodeSemantics(doc *GraphDocument) error {
 		}
 	}
 	return nil
+}
+
+func acceptsNamedInputs(node Node) bool {
+	return node.Kind == KindJoin || node.Kind == KindAcceptance ||
+		(node.Kind == KindController && ControllerRoleOf(node) == ControllerRoleLoopRecovery)
 }
 
 // isPlaceholderToken 报告 s 去空白后是否为单个 ASCII 字母/数字（占位符特征）。
@@ -827,6 +865,22 @@ func validateCapabilityShape(doc *GraphDocument) error {
 	for _, id := range sortedNodeIDs(doc) {
 		node := doc.Nodes[id]
 		path := "nodes." + id
+		role := ControllerRoleOf(node)
+		if !role.IsValid() {
+			return newErr("能力", path+".metadata."+MetadataControllerRole,
+				"controller_role=%q 无效（仅允许 %q）", role, ControllerRoleLoopRecovery)
+		}
+		if role != ControllerRoleNone && node.Kind != KindController {
+			return newErr("能力", path+".metadata."+MetadataControllerRole,
+				"controller_role 只允许 controller 节点声明，节点 %q 类型为 %s", id, node.Kind)
+		}
+		if rawLimit := strings.TrimSpace(node.Metadata[MetadataRecoveryMaxRetries]); rawLimit != "" {
+			limit, err := strconv.Atoi(rawLimit)
+			if role != ControllerRoleLoopRecovery || err != nil || limit < 1 || limit > 4 {
+				return newErr("能力", path+".metadata."+MetadataRecoveryMaxRetries,
+					"recovery_max_retries 只允许 loop_recovery controller 声明 1..4，实际为 %q", rawLimit)
+			}
+		}
 		if cap := node.Capability; cap != nil {
 			if cap.Isolation != "" && cap.Isolation != IsolationWorkspace {
 				return newErr("能力", path+".capability.isolation", "capability.isolation 仅允许 %q，实际为 %q", IsolationWorkspace, cap.Isolation)

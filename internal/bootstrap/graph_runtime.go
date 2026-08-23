@@ -173,6 +173,8 @@ func (b *graphBoard) PublishGraphTask(spec graph.TaskSpec) (string, error) {
 		NodeID:                       spec.NodeID,
 		ActivationID:                 spec.ActivationID,
 		GraphNodeKind:                string(spec.NodeKind),
+		GraphControllerRole:          string(spec.ControllerRole),
+		RecoverySourceTaskID:         spec.RecoverySourceTaskID,
 		GraphDefinitionDigestVersion: spec.DefinitionDigestVersion,
 		RouteScope:                   model.GraphRouteScope(spec.GraphID),
 	}
@@ -201,6 +203,9 @@ func (b *graphBoard) PublishGraphTask(spec graph.TaskSpec) (string, error) {
 	// 显式冻结 execution；此时缺失的其它字段仍由 Store fail-closed。
 	if task.RunID != "" || task.RunContract != nil || task.ProgressContract != nil || task.ContextPolicyRef != "" {
 		task.RunPhase = runcontract.PhaseExecution
+		if spec.ControllerRole == graph.ControllerRoleLoopRecovery {
+			task.RunPhase = runcontract.PhaseRecovery
+		}
 	}
 	if len(spec.Tools) > 0 || spec.Model != "" || spec.Isolation != "" {
 		task.Capability = &model.NodeCapability{Tools: spec.Tools, Model: spec.Model}
@@ -222,12 +227,25 @@ func (b *graphBoard) PublishGraphTask(spec graph.TaskSpec) (string, error) {
 // Graph 角色复用。旧快照的 GraphNodeKind 为空时保留兼容：ExecutionLease 会
 // 按最小权限只授予 submit_task_result；非空但不同则恢复 fail-closed。
 func validateExistingGraphTaskKind(task *model.Task, spec graph.TaskSpec) error {
-	if task == nil || task.GraphNodeKind == "" {
+	if task == nil {
+		return nil
+	}
+	if task.GraphNodeKind == "" {
+		if spec.ControllerRole != graph.ControllerRoleNone || spec.RecoverySourceTaskID != "" {
+			return fmt.Errorf("图任务 %s/%s 的旧快照缺少 node_kind/controller_role/source，不能复用为 loop_recovery",
+				spec.GraphID, spec.ActivationID)
+		}
 		return nil
 	}
 	if task.GraphNodeKind != string(spec.NodeKind) {
 		return fmt.Errorf("图任务 %s/%s 的已持久化 node_kind=%s，与当前冻结定义=%s 不一致",
 			spec.GraphID, spec.ActivationID, task.GraphNodeKind, spec.NodeKind)
+	}
+	if task.GraphControllerRole != string(spec.ControllerRole) ||
+		task.RecoverySourceTaskID != spec.RecoverySourceTaskID {
+		return fmt.Errorf("图任务 %s/%s 的已持久化 controller_role/source=(%s,%s)，与当前冻结定义=(%s,%s) 不一致",
+			spec.GraphID, spec.ActivationID, task.GraphControllerRole, task.RecoverySourceTaskID,
+			spec.ControllerRole, spec.RecoverySourceTaskID)
 	}
 	return nil
 }

@@ -73,3 +73,10 @@ python3 -m unittest scripts/swe_harness/harness_test.py
 `2` 表示架构门失败，`3` 表示任务正确率门失败；批次不再在未达到目标时返回成功。
 批次遇到架构门失败会立即停止，普通任务正确率失败则继续完成剩余题目并在汇总后
 返回 `3`。
+
+架构门按 source Task 核验 L4→L5 恢复：任何 Graph TaskOutcome 的
+`reason_code=loop_intervention_required` 都必须存在一个已交付 Outcome 的
+`graph_controller_role=loop_recovery` Task，且其 `recovery_source_task_id` 精确指向
+该 source；缺失时记录 `loop_intervention_without_recovery` 并令
+`architecture_ok=false`。Recovery Controller 自身是有界裁决终点，不递归要求
+下一层 recovery。

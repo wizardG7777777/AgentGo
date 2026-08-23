@@ -246,6 +246,15 @@ func (g SchedulerGroup) authorizeTaskResultRead(current, target *model.Task) err
 		}
 		return fmt.Errorf("get_task_result 被拒绝：任务 %s 不属于当前 Graph %s", target.ID, current.GraphID)
 	}
+	if current.InterventionGraphID != "" {
+		if target.GraphID == current.InterventionGraphID &&
+			(current.InterventionNodeID == "" || target.NodeID == current.InterventionNodeID) &&
+			(current.InterventionActivationID == "" || target.ActivationID == current.InterventionActivationID) {
+			return nil
+		}
+		return fmt.Errorf("get_task_result 被拒绝：任务 %s 不属于 intervention scope %s/%s/%s",
+			target.ID, current.InterventionGraphID, current.InterventionNodeID, current.InterventionActivationID)
+	}
 	if target.GraphID != "" {
 		return fmt.Errorf("get_task_result 被拒绝：Graph 任务 %s 不属于当前 legacy Scheduler scope", target.ID)
 	}

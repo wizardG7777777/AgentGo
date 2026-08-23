@@ -101,6 +101,9 @@ func (rt *Runtime) CheckActivationOutlet(graphID, nodeID, activationID string, s
 
 	// 与 settle 同源的预求值：冻结定义出边 + 同一 evalCondition。
 	activeNode := nodeForExecution(node, *ex)
+	if err := validateRecoveryRetryBudget(activeNode, activationID, nodeStatus, result); err != nil {
+		return err
+	}
 	for _, tr := range activeNode.Next {
 		if evalCondition(tr.When, nodeStatus, result) {
 			return nil

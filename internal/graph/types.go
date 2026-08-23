@@ -408,8 +408,12 @@ type Transition struct {
 	Activation string `json:"activation,omitempty"` // 激活方式，仅允许 "new"（缺省即沿用常规激活）
 	// TargetInput 是目标 join / acceptance 的输入端口。并行必需输入使用不同
 	// 单赋值端口；互斥分支当前保持各自后续/各自 end。
-	TargetInput string     `json:"target_input,omitempty"`
-	When        *Condition `json:"when,omitempty"` // 转移条件，缺省表示无条件
+	TargetInput string `json:"target_input,omitempty"`
+	// ReplayInputs 仅允许 framework-owned loop_recovery controller 的 retry
+	// 边使用：新 Activation 复用被恢复节点上一 Activation 的冻结 InputBinding，
+	// 不重新解释或复制模型文本。
+	ReplayInputs bool       `json:"replay_inputs,omitempty"`
+	When         *Condition `json:"when,omitempty"` // 转移条件，缺省表示无条件
 }
 
 // ActivationNew 是 transition.activation 唯一合法值：
@@ -474,6 +478,27 @@ func IsValidOperator(op string) bool {
 
 // NodeKind 是节点类型，首批 10 种；未知类型拒绝。
 type NodeKind string
+
+// ControllerRole 是 controller 节点在 L5 内的冻结控制职责。它与可自定义
+// route 分离：route 只决定谁认领，role 决定 L3 可以授予哪些控制面工具。
+type ControllerRole string
+
+const (
+	ControllerRoleNone         ControllerRole = ""
+	ControllerRoleLoopRecovery ControllerRole = "loop_recovery"
+	MetadataControllerRole                    = "controller_role"
+	MetadataRecoveryMaxRetries                = "recovery_max_retries"
+)
+
+func (r ControllerRole) IsValid() bool {
+	return r == ControllerRoleNone || r == ControllerRoleLoopRecovery
+}
+
+// ControllerRoleOf 从冻结 Graph 节点定义读取控制职责。调用方不得从 title、
+// description、route 或节点 ID 猜测该身份。
+func ControllerRoleOf(node Node) ControllerRole {
+	return ControllerRole(strings.TrimSpace(node.Metadata[MetadataControllerRole]))
+}
 
 const (
 	KindController NodeKind = "controller"

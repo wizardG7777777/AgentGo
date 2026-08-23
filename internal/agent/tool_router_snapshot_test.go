@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"agentgo/internal/graph"
 	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
@@ -243,6 +244,34 @@ func TestLoopInterventionWakeStartsFreshAuthoringTransaction(t *testing.T) {
 	if recovery.Phase != "scheduler:recovery" || recovery.Registry.Missing([]string{"read_graph", "propose_graph_change"}) != nil ||
 		containsToolName(recovery.Registry.Names(), "create_graph_draft") {
 		t.Fatalf("Graph intervention 被错误路由到新 Draft: phase=%s tools=%v", recovery.Phase, recovery.Registry.Names())
+	}
+}
+
+func TestGraphRecoveryControllerUsesDedicatedSingleActionPhase(t *testing.T) {
+	full := NewToolRegistry()
+	for _, name := range []string{
+		"commit_graph_change", "get_task_result", "propose_graph_change", "read_content_ref",
+		"read_graph", "read_graph_change", "submit_task_result", "validate_graph_change",
+		"run_shell", "write_file", "report_done", "patch_graph",
+	} {
+		full.Register(name, name, map[string]any{"type": "object"}, func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	}
+	task := replayGateTask("graph-recovery-controller", nil)
+	task.EventType = "__scheduler__"
+	task.GraphID, task.NodeID, task.ActivationID = "g-1", "recovery", "recovery@1"
+	task.GraphNodeKind = string(graph.KindController)
+	task.GraphControllerRole = string(graph.ControllerRoleLoopRecovery)
+	task.RecoverySourceTaskID = "work-task"
+	task.RunPhase = runcontract.PhaseRecovery
+
+	policy := deriveInvocationToolPolicy(task, nil, full)
+	want := []string{
+		"commit_graph_change", "get_task_result", "propose_graph_change", "read_content_ref",
+		"read_graph", "read_graph_change", "submit_task_result", "validate_graph_change",
+	}
+	if policy.Phase != "scheduler:graph-recovery" || !sameExactToolSet(policy.Registry.Names(), want) ||
+		!phaseRequiresToolCall(policy.Phase) || !phaseDispatchesOnlyFirstTool(policy.Phase) {
+		t.Fatalf("Graph recovery phase/ToolRouter 不符: phase=%s tools=%v", policy.Phase, policy.Registry.Names())
 	}
 }
 

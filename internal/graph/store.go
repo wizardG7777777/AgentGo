@@ -130,6 +130,12 @@ type TransitionRecord struct {
 	// TargetInput 冻结源边写入目标 activation 的输入端口；readiness 只读取
 	// durable record，不在恢复时重新解释可能已 patch 的定义。
 	TargetInput string `json:"target_input,omitempty"`
+	// ReplayInputs 冻结 recovery retry 的输入复用语义；恢复时不得从最新
+	// Definition 重新猜测。
+	ReplayInputs bool `json:"replay_inputs,omitempty"`
+	// ReplayedInputs 是 recovery retry 在选择边时从被恢复 Activation 的
+	// Execution.Input 冻结复制的绑定；与本 TransitionRecord 同条 durable。
+	ReplayedInputs []InputBinding `json:"replayed_inputs,omitempty"`
 	// TargetActivationID 在边选择 durable 时一并冻结。目标若已有在途
 	// activation 则指向它；否则预留下一个单调 ID。恢复不再根据目标当前
 	// status 猜测这条边是否已经创建过新 activation。
@@ -171,6 +177,7 @@ func sortedTransitionRecords(set map[transitionKey]TransitionRecord) []Transitio
 
 func cloneTransitionRecord(in TransitionRecord) TransitionRecord {
 	out := in
+	out.ReplayedInputs = cloneInputBindings(in.ReplayedInputs)
 	if in.Input != nil {
 		input := *in.Input
 		input.EvidenceRefs = append([]string(nil), in.Input.EvidenceRefs...)
@@ -1055,6 +1062,35 @@ func validateTransitionRecord(graphID string, doc *GraphDocument, rec Transition
 	}
 	if rec.TargetInput != "" && (len(rec.TargetInput) > MaxIDLength || !idCharset.MatchString(rec.TargetInput)) {
 		return fmt.Errorf("graph: 边选择记录的 target_input %q 非法", rec.TargetInput)
+	}
+	if rec.ReplayInputs {
+		if rec.TargetInput != "" {
+			return fmt.Errorf("graph: replay_inputs 边不得同时声明 target_input")
+		}
+		if doc == nil {
+			return fmt.Errorf("graph: replay_inputs 边缺少 GraphDocument authority")
+		}
+		source := doc.Nodes[rec.SourceNodeID]
+		if source.Execution != nil && source.Execution.ActivationID == rec.SourceActivationID {
+			source = nodeForExecution(source, *source.Execution)
+		}
+		if source.Kind != KindController {
+			return fmt.Errorf("graph: replay_inputs 来源节点 %s 不是 controller", rec.SourceNodeID)
+		}
+		for i, binding := range rec.ReplayedInputs {
+			owner, _, ok := parseActivationID(binding.SourceActivationID)
+			if !ok || owner != binding.SourceNodeID {
+				return fmt.Errorf("graph: replayed_inputs[%d] source activation %q 无效", i, binding.SourceActivationID)
+			}
+			if binding.ResultRef != "" && results != nil {
+				stored, exists := results[binding.ResultRef]
+				if !exists || stored.NodeID != binding.SourceNodeID || stored.ActivationID != binding.SourceActivationID {
+					return fmt.Errorf("graph: replayed_inputs[%d] result_ref=%q 不可解引用或来源不一致", i, binding.ResultRef)
+				}
+			}
+		}
+	} else if len(rec.ReplayedInputs) > 0 {
+		return fmt.Errorf("graph: 非 replay_inputs 边不得携带 replayed_inputs")
 	}
 	if rec.Input == nil {
 		if allowLegacy {

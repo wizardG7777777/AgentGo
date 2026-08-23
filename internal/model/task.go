@@ -141,6 +141,11 @@ type Task struct {
 	NodeID        string `json:"node_id,omitempty"`
 	ActivationID  string `json:"activation_id,omitempty"`
 	GraphNodeKind string `json:"graph_node_kind,omitempty"`
+	// GraphControllerRole 是 controller activation 的冻结 L5 控制职责；空值为
+	// 普通 controller。RecoverySourceTaskID 只在 loop_recovery controller 上
+	// 非空，把恢复决策精确绑定到触发 intervention 的 Graph Task。
+	GraphControllerRole  string `json:"graph_controller_role,omitempty"`
+	RecoverySourceTaskID string `json:"recovery_source_task_id,omitempty"`
 	// OutcomeRef 指向 L4 append-only TaskOutcome。新 authoring Graph 的终态
 	// 必须先 durable 提交该事实，再把引用与 Task 状态一起生效；legacy 为空。
 	OutcomeRef string `json:"outcome_ref,omitempty"`

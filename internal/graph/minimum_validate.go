@@ -71,6 +71,18 @@ func validateMinimumDefinition(body GraphDefinitionBody) []ValidationIssue {
 				issues = append(issues, validationIssue("CONTEXT_POLICY_REF_REQUIRED", path+".context_policy_ref", true, "task-producing 节点必须绑定 ContextPolicyRef"))
 			}
 			issues = append(issues, validateTaskOutletCoverage(id, node)...)
+			if ControllerRole(node.Metadata[MetadataControllerRole]) == ControllerRoleLoopRecovery &&
+				!outputContractHasRequiredString(node.OutputContract, "$.decision") {
+				issues = append(issues, validationIssue("RECOVERY_DECISION_CONTRACT_REQUIRED",
+					path+".output_contract.fields", true,
+					"loop_recovery controller 必须声明 required string 字段 $.decision（retry|blocked）"))
+			}
+			if ControllerRole(node.Metadata[MetadataControllerRole]) == ControllerRoleLoopRecovery &&
+				(node.Task == nil || len(node.Task.RequiredInputs) != 1 || node.Task.RequiredInputs[0] != "failure_context") {
+				issues = append(issues, validationIssue("RECOVERY_FAILURE_CONTEXT_REQUIRED",
+					path+".task.required_inputs", true,
+					"loop_recovery controller 必须且只能声明 required input failure_context"))
+			}
 		}
 	}
 
@@ -101,6 +113,18 @@ func validateMinimumDefinition(body GraphDefinitionBody) []ValidationIssue {
 		issues = append(issues, validationIssue("ZERO_WORK_SUCCESS_PATH", "root", true, "存在未经过任何 work-producing activation 的 success 路径"))
 	}
 	return issues
+}
+
+func outputContractHasRequiredString(contract *NodeOutputContract, path string) bool {
+	if contract == nil {
+		return false
+	}
+	for _, field := range contract.Fields {
+		if field.Path == path && field.Type == "string" && field.Required {
+			return true
+		}
+	}
+	return false
 }
 
 func validateNodeOutputContract(path string, contract *NodeOutputContract) []ValidationIssue {

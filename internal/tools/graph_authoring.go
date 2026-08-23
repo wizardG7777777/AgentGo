@@ -283,12 +283,36 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 			Next: []graph.Transition{
 				{To: "acceptance", TargetInput: "work_result", When: &graph.Condition{Event: completed}},
 				{To: "work-failed", When: &graph.Condition{Event: failed}},
-				{To: "work-blocked", When: &graph.Condition{Event: blocked}},
+				{To: "recovery", TargetInput: "failure_context", When: &graph.Condition{Event: blocked}},
 			},
 			OutputContract:      &graph.NodeOutputContract{SummaryRequired: true},
 			ProgressContractRef: workProgress, ContextPolicyRef: policycatalog.ContextDefaultCurrent,
 			ContractBindings: workBindings,
 			Metadata:         map[string]string{"authoring_template": "simple-task/v1"},
+		},
+		"recovery": {
+			Kind: graph.KindController,
+			Task: &graph.NodeTask{
+				Title:          "裁决停滞执行的恢复路径",
+				Description:    "读取 failure_context 中冻结的 TaskOutcome、reason_code、checkpoint、工作记录与证据，裁决当前 Graph 是否应创建新的 work Activation。若现有 Definition 需要改变，只能先走 GraphChangeProposal 的 propose→validate→commit 事务；不得修改已终态的旧 Activation，不得亲自执行业务代码。最终必须调用 submit_task_result，并在 result.decision 写入 retry 或 blocked：retry 表示按最新 Definition 创建 work 的新 Activation，blocked 表示没有安全恢复输入并结束 Graph。",
+				RequiredInputs: []string{"failure_context"},
+			},
+			Next: []graph.Transition{
+				{To: "work", ReplayInputs: true, When: decisionEquals("retry")},
+				{To: "work-blocked", When: decisionEquals("blocked")},
+				{To: "recovery-failed", When: &graph.Condition{Event: failed}},
+				{To: "recovery-blocked", When: &graph.Condition{Event: blocked}},
+			},
+			OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Fields: []graph.OutputFieldContract{{
+				Path: "$.decision", Type: "string", Description: "retry|blocked", Required: true,
+			}}},
+			ProgressContractRef: policycatalog.ProgressCoordinationV1,
+			ContextPolicyRef:    policycatalog.ContextDefaultCurrent,
+			Metadata: map[string]string{
+				graph.MetadataControllerRole:     string(graph.ControllerRoleLoopRecovery),
+				graph.MetadataRecoveryMaxRetries: "2",
+				"authoring_template":             "simple-task/v1",
+			},
 		},
 		"acceptance": {
 			Kind: graph.KindAcceptance,
@@ -302,7 +326,7 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 				{To: "fixable", When: resultEquals("fixable")},
 				{To: "rejected", When: resultEquals("failed")},
 				{To: "acceptance-failed", When: &graph.Condition{Event: failed}},
-				{To: "acceptance-blocked", When: &graph.Condition{Event: blocked}},
+				{To: "acceptance-recovery", TargetInput: "failure_context", When: &graph.Condition{Event: blocked}},
 			},
 			OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Fields: []graph.OutputFieldContract{{
 				Path: "$.verdict", Type: "string", Description: "pass|fixable|failed", Required: true,
@@ -310,13 +334,41 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 			ProgressContractRef: policycatalog.ProgressVerificationV1,
 			ContextPolicyRef:    policycatalog.ContextDefaultCurrent,
 		},
-		"accepted":           simpleEnd("验收通过", graph.DefinitionEndSuccess),
-		"fixable":            simpleEnd("验收发现可修复缺口", graph.DefinitionEndFailed),
-		"rejected":           simpleEnd("验收失败", graph.DefinitionEndFailed),
-		"work-failed":        simpleEnd("执行失败", graph.DefinitionEndFailed),
-		"work-blocked":       simpleEnd("执行阻塞", graph.DefinitionEndBlocked),
-		"acceptance-failed":  simpleEnd("验收运行失败", graph.DefinitionEndFailed),
-		"acceptance-blocked": simpleEnd("验收运行阻塞", graph.DefinitionEndBlocked),
+		"acceptance-recovery": {
+			Kind: graph.KindController,
+			Task: &graph.NodeTask{
+				Title:          "裁决验收停滞的恢复路径",
+				Description:    "读取 failure_context 与原 acceptance 的冻结输入，裁决是否用新 Activation 重试验收。必要时先通过 GraphChangeProposal 修改未来 acceptance 的模型或定义；不得亲自验收或修改业务文件。最终调用 submit_task_result，并在 result.decision 写入 retry 或 blocked。",
+				RequiredInputs: []string{"failure_context"},
+			},
+			Next: []graph.Transition{
+				{To: "acceptance", ReplayInputs: true, When: decisionEquals("retry")},
+				{To: "acceptance-blocked", When: decisionEquals("blocked")},
+				{To: "acceptance-recovery-failed", When: &graph.Condition{Event: failed}},
+				{To: "acceptance-recovery-blocked", When: &graph.Condition{Event: blocked}},
+			},
+			OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Fields: []graph.OutputFieldContract{{
+				Path: "$.decision", Type: "string", Description: "retry|blocked", Required: true,
+			}}},
+			ProgressContractRef: policycatalog.ProgressCoordinationV1,
+			ContextPolicyRef:    policycatalog.ContextDefaultCurrent,
+			Metadata: map[string]string{
+				graph.MetadataControllerRole:     string(graph.ControllerRoleLoopRecovery),
+				graph.MetadataRecoveryMaxRetries: "2",
+				"authoring_template":             "simple-task/v1",
+			},
+		},
+		"accepted":                    simpleEnd("验收通过", graph.DefinitionEndSuccess),
+		"fixable":                     simpleEnd("验收发现可修复缺口", graph.DefinitionEndFailed),
+		"rejected":                    simpleEnd("验收失败", graph.DefinitionEndFailed),
+		"work-failed":                 simpleEnd("执行失败", graph.DefinitionEndFailed),
+		"work-blocked":                simpleEnd("执行阻塞", graph.DefinitionEndBlocked),
+		"recovery-failed":             simpleEnd("恢复裁决运行失败", graph.DefinitionEndFailed),
+		"recovery-blocked":            simpleEnd("恢复裁决自身阻塞", graph.DefinitionEndBlocked),
+		"acceptance-failed":           simpleEnd("验收运行失败", graph.DefinitionEndFailed),
+		"acceptance-blocked":          simpleEnd("验收运行阻塞", graph.DefinitionEndBlocked),
+		"acceptance-recovery-failed":  simpleEnd("验收恢复裁决运行失败", graph.DefinitionEndFailed),
+		"acceptance-recovery-blocked": simpleEnd("验收恢复裁决自身阻塞", graph.DefinitionEndBlocked),
 	}
 	updated, err := g.Store.PatchDraft(draft.ProposalID, draft.DraftRevision, graph.GraphDraftPatch{
 		Contract: &contract, Candidate: &candidate,
@@ -329,6 +381,10 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 
 func resultEquals(value string) *graph.Condition {
 	return &graph.Condition{Path: "$.verdict", Operator: graph.OpEq, Value: json.RawMessage(fmt.Sprintf("%q", value))}
+}
+
+func decisionEquals(value string) *graph.Condition {
+	return &graph.Condition{Path: "$.decision", Operator: graph.OpEq, Value: json.RawMessage(fmt.Sprintf("%q", value))}
 }
 
 func simpleEnd(title string, outcome graph.DefinitionEndOutcome) graph.GraphDefinitionNode {
@@ -631,6 +687,10 @@ func (g GraphAuthoringGroup) proposeGraphChange(_ context.Context, args map[stri
 	if err := decodeNativeGraphArgs(args, &input); err != nil {
 		return "", err
 	}
+	if task.GraphID != "" && strings.TrimSpace(input.GraphID) != task.GraphID {
+		return "", fmt.Errorf("loop_recovery controller 只能修改当前 Graph %s，目标为 %s",
+			task.GraphID, input.GraphID)
+	}
 	definition, ok := g.Store.GetDefinition(strings.TrimSpace(input.GraphID), input.BaseDefinitionRevision)
 	if !ok {
 		return "", fmt.Errorf("%w: %s@%d", graph.ErrDefinitionNotFound, input.GraphID, input.BaseDefinitionRevision)
@@ -764,9 +824,24 @@ func (g GraphAuthoringGroup) currentRootSchedulerTask(operation string) (*model.
 		return nil, fmt.Errorf("%s 读取当前 Scheduler task %s 失败: %w", operation, taskID, err)
 	}
 	if task.GraphID != "" {
-		return nil, fmt.Errorf("%s 仅允许 origin/root Scheduler 使用；当前任务属于 Graph %s", operation, task.GraphID)
+		if task.GraphNodeKind == string(graph.KindController) &&
+			task.GraphControllerRole == string(graph.ControllerRoleLoopRecovery) &&
+			strings.TrimSpace(task.RecoverySourceTaskID) != "" && recoveryGraphChangeOperation(operation) {
+			return task, nil
+		}
+		return nil, fmt.Errorf("%s 仅允许 origin/root Scheduler 或 loop_recovery controller 使用；当前任务属于 Graph %s role=%s",
+			operation, task.GraphID, task.GraphControllerRole)
 	}
 	return task, nil
+}
+
+func recoveryGraphChangeOperation(operation string) bool {
+	switch operation {
+	case "propose_graph_change", "read_graph_change", "validate_graph_change", "commit_graph_change":
+		return true
+	default:
+		return false
+	}
 }
 
 func (g GraphAuthoringGroup) ownedDraft(task *model.Task, proposalID string) (*graph.GraphDraft, error) {

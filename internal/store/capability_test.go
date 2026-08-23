@@ -260,8 +260,12 @@ func TestSnapshot_CapabilityRoundTrip(t *testing.T) {
 		GraphID: "g-snapshot", NodeID: "verify", ActivationID: "verify@1", GraphNodeKind: "acceptance",
 		RouteScope: model.GraphRouteScope("g-snapshot"),
 		Capability: &model.NodeCapability{Tools: []string{"read_file", "grep_search"}, Model: "m-node"}}
+	recovery := &model.Task{Description: "恢复裁决", EventType: "__scheduler__",
+		GraphID: "g-recovery", NodeID: "recovery", ActivationID: "recovery@1", GraphNodeKind: "controller",
+		GraphControllerRole: "loop_recovery", RecoverySourceTaskID: "work-task",
+		RouteScope: model.GraphRouteScope("g-recovery")}
 	noCap := &model.Task{Description: "无能力", EventType: "code"}
-	for _, task := range []*model.Task{withCap, noCap} {
+	for _, task := range []*model.Task{withCap, recovery, noCap} {
 		if err := src.PublishTask(task); err != nil {
 			t.Fatalf("PublishTask: %v", err)
 		}
@@ -279,8 +283,8 @@ func TestSnapshot_CapabilityRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatalf("unmarshal snapshot ids: %v", err)
 	}
-	if len(decoded) != 2 {
-		t.Fatalf("快照任务数 = %d，want 2", len(decoded))
+	if len(decoded) != 3 {
+		t.Fatalf("快照任务数 = %d，want 3", len(decoded))
 	}
 
 	var roundTripped = snaps
@@ -311,6 +315,13 @@ func TestSnapshot_CapabilityRoundTrip(t *testing.T) {
 	if got.GraphID != "g-snapshot" || got.NodeID != "verify" || got.ActivationID != "verify@1" || got.GraphNodeKind != "acceptance" {
 		t.Fatalf("Graph 角色身份快照往返后不完整: graph=%q node=%q activation=%q kind=%q",
 			got.GraphID, got.NodeID, got.ActivationID, got.GraphNodeKind)
+	}
+	recovered, err := dst.GetTask(recovery.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.GraphControllerRole != "loop_recovery" || recovered.RecoverySourceTaskID != "work-task" {
+		t.Fatalf("Graph recovery identity 快照往返后不完整: %+v", recovered)
 	}
 
 	plain, err := dst.GetTask(noCap.ID)

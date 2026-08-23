@@ -105,6 +105,58 @@ func TestProcessTaskBlocksWhenNoProgressBudgetExhausted(t *testing.T) {
 	}
 }
 
+func TestProcessTaskInterventionEndsOnlyCurrentGraphActivationWithTypedCommand(t *testing.T) {
+	taskStore := store.NewMemoryTaskStore(nil, 32, 1, 60)
+	if err := store.SetTerminalOutcomeHook(taskStore, func(intent store.TerminalOutcomeIntent) (string, error) {
+		return "outcome:" + intent.Task.ID, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	task := enforcementTask(t)
+	task.GraphID, task.NodeID, task.ActivationID, task.GraphNodeKind = "g-1", "work", "work@1", "agent"
+	task.ProgressContract.Policy.ReminderAfterTurns = 1
+	task.ProgressContract.Policy.RolloverAfterTurns = 1
+	task.ProgressContract.Policy.InterventionAfterTurns = 1
+	task.ProgressContract.Policy.MaxNoProgressTurns = 2
+	task.ProgressContract.Policy.MaxAttemptRollovers = 0
+	if err := taskStore.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskStore.ClaimTask("worker-intervention", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	progressStore, err := loopstore.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = progressStore.Close() })
+	agent := NewAgent("worker-intervention", "code", taskStore, roster.NewMemoryRoster(),
+		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+			return ExecuteResult{InvocationID: "inv-intervention", Output: "继续调查", ToolCalled: true}, nil
+		})
+	agent.LoopStore = progressStore
+	agent.processTask(context.Background(), task.ID)
+
+	got, err := taskStore.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.TaskStatusBlocked || got.OutcomeRef == "" ||
+		!strings.Contains(got.Error, "no_progress_intervention_required") {
+		t.Fatalf("L4 intervention 应终结当前 Activation 并保留 typed 原因: %+v", got)
+	}
+	commands, err := progressStore.PendingInterventionsForTask(task.ID)
+	if err != nil || len(commands) != 1 {
+		t.Fatalf("L4 intervention command 未 durable: commands=%+v err=%v", commands, err)
+	}
+	command := commands[0]
+	if command.GraphID != task.GraphID || command.NodeID != task.NodeID ||
+		command.ActivationID != task.ActivationID ||
+		command.ReasonCode != loopcontract.InterventionNoProgressStalled {
+		t.Fatalf("typed intervention lineage/reason 错误: %+v", command)
+	}
+}
+
 func TestCallerCancellationWinsOverNoProgressBlock(t *testing.T) {
 	cancelRegistry := store.NewTaskCancelRegistry()
 	taskStore := store.NewMemoryTaskStore(nil, 32, 1, 60)

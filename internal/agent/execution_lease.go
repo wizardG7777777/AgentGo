@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"agentgo/internal/graph"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
 	"agentgo/internal/store"
@@ -257,6 +258,16 @@ func validateLeaseForTaskRole(task *model.Task, lease *model.ExecutionLease) str
 	if task.GraphID == "" {
 		return ""
 	}
+	role := graph.ControllerRole(strings.TrimSpace(task.GraphControllerRole))
+	if !role.IsValid() || (role != graph.ControllerRoleNone && task.GraphNodeKind != string(graph.KindController)) {
+		return fmt.Sprintf("Graph controller_role=%q 与 node_kind=%q 不一致", role, task.GraphNodeKind)
+	}
+	if role == graph.ControllerRoleLoopRecovery && strings.TrimSpace(task.RecoverySourceTaskID) == "" {
+		return "loop_recovery controller 缺少 recovery_source_task_id"
+	}
+	if role != graph.ControllerRoleLoopRecovery && strings.TrimSpace(task.RecoverySourceTaskID) != "" {
+		return fmt.Sprintf("非 recovery Graph Task 不得携带 recovery_source_task_id=%q", task.RecoverySourceTaskID)
+	}
 	expectedControl := deriveControlTools(task)
 	if !sameExactToolSet(lease.ControlTools, expectedControl) {
 		return fmt.Sprintf("Graph 节点角色 %q 的冻结租约控制工具=%v，期望精确为 %v",
@@ -322,6 +333,13 @@ func deriveControlTools(task *model.Task) []string {
 		switch task.GraphNodeKind {
 		case "controller", "agent":
 			if task.GraphNodeKind == "controller" {
+				if task.GraphControllerRole == string(graph.ControllerRoleLoopRecovery) {
+					return []string{
+						"commit_graph_change", "get_task_result", "propose_graph_change",
+						"read_content_ref", "read_graph", "read_graph_change",
+						"submit_task_result", "validate_graph_change",
+					}
+				}
 				if task.GraphDefinitionDigestVersion != "" {
 					return []string{"read_graph", "request_replan", "submit_task_result"}
 				}

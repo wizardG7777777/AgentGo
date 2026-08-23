@@ -36,8 +36,8 @@ Store、桥接字符串和不同 deadline 口径。
 | Invocation | Responses typed-item 主链已接入 | 显式 protocol；message/reasoning/function_call 信封；ContextBinding OutputBudget；required-nonce probe；partial no-dispatch | 外部 provider 多 rollout；Chat compatibility 退出 |
 | L2 Context | Context v8/Replay v3 production default | v1–v7 digest 保留、Responses `assistant_response_items` RequiredExact carrier、32K completion、92K input、bounded runtime snapshot | 真实 tokenizer 与 provider matrix |
 | L3 Harness | versioned harness 与 Scheduler capability contract 已闭合 | 仓库脚本、真实双层 probe、RunContract、typed terminal、安全 snapshot、完整 ToolResult ContentStore | 外部 provider 多样性 |
-| L4 Loop | SWE-016/017/023/028/032 边界已修复 | 6 Attempts、唯一 Deadline Compiler、Invocation failure 中性进展、typed intervention scope、exploration→auto-singleton + L3 required-action deliverable phase、code-change/v3 4/10/18/24 阈值 | 多题 recovery rollout |
-| L5 Graph | simple/current transaction 与 typed Context data port 已接入 | framework-owned simple Graph、零参数 validate/commit/start、Task.ContextInputs、typed outcome/outbox | generation/correlation token 仍不开放；legacy 仍待退役 |
+| L4 Loop | SWE-016/017/023/028/032/033 主链已接入并验证 | 6 Attempts、唯一 Deadline Compiler、Invocation failure 中性进展、typed intervention、exploration→required-action deliverable phase、code-change/v3 4/10/18/24 阈值 | 更多 provider/cohort 统计 |
+| L5 Graph | simple/current transaction、typed Context data port 与 recovery controller 已验证 | framework-owned simple Graph、零参数 validate/commit/start、Task.ContextInputs、typed outcome/outbox、blocked→recovery→new Activation、Acceptance input replay | generation/correlation token 仍不开放；legacy 仍待退役 |
 | Docs / issue ledger | 已建立，持续同步 | 五层规范、正式设计、路线图、第5/6轮及 Responses 单题总账 | 只按各问题 closure matrix 关闭 SWE-011～028 |
 
 当前迁移采用“canonical contract → durable authority → production cutover → legacy
@@ -52,8 +52,8 @@ Store、桥接字符串和不同 deadline 口径。
 | L1 Prompt | 单体约 52.9KiB Prompt 已退出生产；core + phase task-control prompt，各阶段只见对应工具 | 外部 cohort 统计，不再是实现缺口 |
 | L2 Context | v7 Optional/RequiredExact、Raw History projection 与动态 reserve 已落地 | 真实 tokenizer、更多 provider replay fixture |
 | L3 Harness | repo harness、双层 tool probe、真实 Lease、phase Router、typed terminal 已落地 | 外部 provider fixture 扩展 |
-| L4 Loop | final Attempt 权利、deadline、failure-neutral progress 与 intervention scope 已钉住 | 外部多题 recovery rollout |
-| L5 Graph | simple/current transaction 已落地；legacy submit/patch 未删 | 调用计数归零、migration tests、SWE-012 |
+| L4 Loop | final Attempt 权利、deadline、failure-neutral progress 与 intervention scope 已钉住 | recovery controller 外部多题 rollout |
+| L5 Graph | simple/current transaction 与 framework recovery controller 已落地；legacy submit/patch 未删 | SWE-033 定向复跑、调用计数归零、migration tests、SWE-012 |
 | Validation / Trace 横切 | full/race/vet/build、真实二进制、仓库 harness 与单题双门已完成 | 一批8题、三平台 CI |
 | 横切关注点 | legacy adapter、权限最小可见面与跨平台恢复证据 | 调用计数、migration tests、outbox replay/ack、lease/prompt bytes 对账 |
 
@@ -117,6 +117,7 @@ Store、桥接字符串和不同 deadline 口径。
 | SWE-029 | Model Invocation/L2 | DeepSeek Responses required 空字段 raw exact replay |
 | SWE-030/031 | Model Invocation/L3 | auto + singleton + L3 required-action 替代 exact/required choice；provider fan-out 只 dispatch 首个并为余下 call_id 保留 skipped result |
 | SWE-032 | L4 Loop | rollover 用尽不再提前 intervention；新 code-change Task 冻结 v3，v1/v2 保留供历史恢复 |
+| SWE-033 | L4→L5/L3 | recoverable blocked 进入 framework recovery Controller；Outcome ACK 后按最新 Definition 创建新 Activation，缺失 recovery 进入架构事故门 |
 
 ## 3. 实施总原则
 

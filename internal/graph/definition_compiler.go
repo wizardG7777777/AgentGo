@@ -143,6 +143,16 @@ func normalizeDefinitionBody(in GraphDefinitionBody) GraphDefinitionBody {
 			} else {
 				node.Metadata["route"] = route
 			}
+			if role := strings.TrimSpace(node.Metadata[MetadataControllerRole]); role == "" {
+				delete(node.Metadata, MetadataControllerRole)
+			} else {
+				node.Metadata[MetadataControllerRole] = role
+			}
+			if limit := strings.TrimSpace(node.Metadata[MetadataRecoveryMaxRetries]); limit == "" {
+				delete(node.Metadata, MetadataRecoveryMaxRetries)
+			} else {
+				node.Metadata[MetadataRecoveryMaxRetries] = limit
+			}
 		}
 		node.OutputContract = normalizeNodeOutputContract(node.OutputContract)
 		node.ContractBindings = normalizeContractBindings(node.ContractBindings)

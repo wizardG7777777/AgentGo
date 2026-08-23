@@ -45,6 +45,17 @@ checkpoint 的 Watchdog liveness backstop。bridge 不以 `PublishTask` 当作�
 只有 wake 自身的 durable TaskOutcome delivery 完成后才 Ack 原 intervention。相关
 focused、恢复和包测试已通过；全仓 compile-only 已通过。
 
+2026-08-23 第八轮多题回归补全了此前缺失的 L5 消费语义：无交付进展的 Graph
+Activation 在 intervention 阈值以 `blocked[loop_intervention_required]` 结束当前
+Task，但 framework-owned simple Graph 不再把它直接解释为 Graph blocked；它进入
+带 `failure_context` 的 `loop_recovery` Controller。Controller 的 durable Outcome
+决定 `retry → 新 Activation` 或 `blocked → end`，并作为原 intervention ACK。
+因此“Task blocked”是当前 Activation 的终态，不再自动等于“Graph blocked”。
+需要重试 Acceptance 等数据驱动节点时，L5 的 `replay_inputs` TransitionRecord
+随边选择冻结复制原 Activation 输入；恢复次数由 recovery 节点 metadata 的
+framework 上限约束，Controller 自身 intervention 不递归。
+详见 SWE-033。
+
 两阶段 TerminalIntent 已进入生产主链：锁内 durable Prepare/fence 并取消当前
 执行 context；锁外在 `min(5s, Attempt hard deadline)` 内等待 action settlement，
 随后 Seal ProgressCheckpoint；仍未返回的 reservation 以同一 `terminal_seal`

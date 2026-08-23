@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 
+	"agentgo/internal/graph"
 	"agentgo/internal/intervention"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/loopstore"
@@ -241,10 +242,97 @@ func (b *loopInterventionBridge) RunWithContext(ctx context.Context, ev trace.Ev
 		// command 以该 wake 的 durable Outcome 吸收，禁止递归创建 wake 链。
 		return errors.Join(errs...)
 	}
+	// 新 Graph 的 loop recovery 由 L5 预编译 controller activation 消费，
+	// 不再创建第二个脱图 Scheduler wake。controller 的 durable Outcome delivery
+	// 同时作为原 intervention 的决策 ACK；其自身若也 no-progress，则吸收该
+	// nested command，禁止递归恢复链。
+	if task.GraphNodeKind == string(graph.KindController) &&
+		task.GraphControllerRole == string(graph.ControllerRoleLoopRecovery) &&
+		strings.TrimSpace(task.RecoverySourceTaskID) != "" {
+		if err := b.ackGraphRecoveryOutcome(ctx, task); err != nil {
+			errs = append(errs, err)
+		}
+		if err := b.absorbNestedWakeInterventions(ctx, task); err != nil {
+			errs = append(errs, err)
+		}
+		return errors.Join(errs...)
+	}
 	// 同一 terminal Task 也可能刚产生新的 intervention；只定向读取该 Task，
 	// 绝不全 Store Drain。
+	commands, err := b.loops.PendingInterventionsForTask(task.ID)
+	if err != nil {
+		return err
+	}
+	if len(commands) == 0 {
+		return nil
+	}
+	if task.GraphID != "" {
+		if recovery, err := b.graphRecoveryTaskForSource(task); err != nil {
+			return err
+		} else if recovery != nil {
+			if model.IsTerminal(recovery.Status) {
+				ready, readyErr := b.outcomeDelivered(recovery)
+				if readyErr != nil {
+					return readyErr
+				}
+				if ready {
+					return b.ackGraphRecoveryOutcome(ctx, recovery)
+				}
+			}
+			return nil
+		}
+	}
 	if _, err := b.pump.EnsureTask(ctx, task.ID); err != nil {
 		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+func (b *loopInterventionBridge) graphRecoveryTaskForSource(source *model.Task) (*model.Task, error) {
+	tasks, err := b.tasks.ScanAll()
+	if err != nil {
+		return nil, err
+	}
+	var found *model.Task
+	for _, task := range tasks {
+		if task == nil || task.GraphID != source.GraphID || task.RecoverySourceTaskID != source.ID ||
+			task.GraphNodeKind != string(graph.KindController) ||
+			task.GraphControllerRole != string(graph.ControllerRoleLoopRecovery) {
+			continue
+		}
+		if found != nil && found.ID != task.ID {
+			return nil, fmt.Errorf("Graph %s source Task %s 存在多个 loop_recovery controller: %s/%s",
+				source.GraphID, source.ID, found.ID, task.ID)
+		}
+		found = task
+	}
+	return found, nil
+}
+
+func (b *loopInterventionBridge) ackGraphRecoveryOutcome(ctx context.Context, recovery *model.Task) error {
+	source, err := b.tasks.GetTask(recovery.RecoverySourceTaskID)
+	if err != nil {
+		return fmt.Errorf("读取 loop_recovery source Task %s: %w", recovery.RecoverySourceTaskID, err)
+	}
+	if source == nil || source.GraphID != recovery.GraphID || !model.IsTerminal(source.Status) ||
+		strings.TrimSpace(source.OutcomeRef) == "" {
+		return fmt.Errorf("loop_recovery Task %s 的 source authority 不完整", recovery.ID)
+	}
+	commands, err := b.loops.PendingInterventionsForTask(source.ID)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, command := range commands {
+		if command.GraphID != recovery.GraphID || command.NodeID != source.NodeID ||
+			command.ActivationID != source.ActivationID || command.TaskID != source.ID {
+			errs = append(errs, fmt.Errorf("loop_recovery Task %s 与 command %s lineage 不一致",
+				recovery.ID, command.CommandID))
+			continue
+		}
+		if err := b.pump.Ack(ctx, source.ID, command.CommandID, recovery.OutcomeRef); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	return errors.Join(errs...)
 }

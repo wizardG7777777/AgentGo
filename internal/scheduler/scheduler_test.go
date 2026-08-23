@@ -39,6 +39,7 @@ func TestSchedulerPhasePromptsAreClosedAndBounded(t *testing.T) {
 		"scheduler:draft-commit":    {"durable transaction cursor", "commit_current_graph_draft", "不启动执行"},
 		"scheduler:start":           {"start_current_graph", "等待 graph-ended"},
 		"scheduler:recovery":        {"read_graph", "propose_graph_change", "不得重放未知副作用"},
+		"scheduler:graph-recovery":  {"failure_context", "propose_graph_change", "result.decision", "新的 work Activation"},
 		"scheduler:final-report":    {"read_graph", "get_task_result", "自然语言"},
 	}
 	for phase, wants := range tests {
@@ -74,7 +75,7 @@ func TestSchedulerCoreAndEveryPhasePassCurrentContextPolicy(t *testing.T) {
 	for _, phase := range []string{
 		"scheduler:draft-create", "scheduler:draft-configure", "scheduler:draft-validate",
 		"scheduler:draft-edit", "scheduler:draft-commit",
-		"scheduler:start", "scheduler:recovery", "scheduler:final-report",
+		"scheduler:start", "scheduler:recovery", "scheduler:graph-recovery", "scheduler:final-report",
 	} {
 		if err := runtime.ValidateStaticPrompt(context.Background(), agent.StaticPromptProfile{
 			ProfileID: "scheduler-phase-" + phase, ContextPolicyRef: policycatalog.ContextDefaultCurrent,
@@ -86,7 +87,7 @@ func TestSchedulerCoreAndEveryPhasePassCurrentContextPolicy(t *testing.T) {
 }
 
 func TestSchedulerPromptVersionTracksPhaseArchitecture(t *testing.T) {
-	const want = "embedded:v10.5-simple-authoring-context-v7"
+	const want = "embedded:v10.6-graph-recovery-controller"
 	if schedulerPromptVersion != want {
 		t.Fatalf("schedulerPromptVersion=%q want=%q", schedulerPromptVersion, want)
 	}

@@ -473,6 +473,25 @@ Harness Observation、取消和外部消息。<br>
    外部 harness deadline，并保证控制面有真实介入窗口。
 6. Loop 收口只产生 TaskOutcome；L5 adapter 再把它转换为 Graph TerminalFact。
 
+#### 9.6.1 Loop intervention 的正式跨层边界（2026-08-23）
+
+- L4 达到 `InterventionAfterTurns` 时，只终结当前 Activation Task，提交
+  `blocked[loop_intervention_required]` TaskOutcome 与 durable
+  `LoopInterventionRequested`；它不决定 Graph outcome，也不重开旧 Activation。
+- L5 必须消费该 typed reason。framework-owned simple Graph 将 `work blocked`
+  路由到 `controller_role=loop_recovery` 的 Controller，而不是直接进入 end。
+- recovery Controller 可以先以 GraphChangeProposal 修改未来 Definition，再用
+  `result.decision=retry|blocked` 裁决；retry 永远创建 `<node>@<N+1>`，不修改
+  `<node>@<N>` 的冻结 Prompt/Lease/Next。
+- 对带上游数据的 Acceptance retry，L5 以 durable `replay_inputs` 转移复制旧
+  Activation 的冻结 InputBinding/ResultRef/Evidence 到新 Activation；L2 只消费
+  新 TaskSpec 投影，不自行回忆旧输入。每个 recovery 节点有 framework 冻结的
+  有界 retry budget，超额必须 blocked，禁止 recovery 自递归。
+- L3 只按冻结 role/source 授予 recovery Controller 的 Graph read/change/submit
+  控制闭集，BusinessTools 恒为空；L2 只投影 `failure_context`，L1 只解释决策。
+- recovery TaskOutcome delivery 完成后才 ACK 原 intervention；缺少 recovery
+  Activation 是架构事故，不得因 Graph 最终 typed blocked 而判为正常。
+
 ### 9.7 完成标准
 
 - completed、blocked、failed、cancelled 互斥且只有一个终态提交者。
@@ -554,6 +573,9 @@ L5 是 AgentGo 的主协调层，负责多个局部 Loop、确定性节点和 Ev
 6. 为 v1 compatibility 设明确退出条件；所有新 Graph 只走 v2。
 7. 增加 Graph bridge 端到端测试，覆盖 TaskOutcome、Artifact flush、Evidence、
    ResultRef、边选择和 Graph terminal 的完整握手。
+8. 新 simple Graph 的 recoverable blocked 必须经过 framework-owned recovery
+   Controller；只有该 Controller 明确提交 `decision=blocked` 或自身 Runtime
+   failed/blocked 后，Graph 才能进入对应 end。
 
 ### 10.7 完成标准
 
@@ -562,6 +584,8 @@ L5 是 AgentGo 的主协调层，负责多个局部 Loop、确定性节点和 Ev
 - 回边不会复用旧 Task、Lease、TaskMemory 或 Attempt。
 - Graph 关键事实先 durable，再激活下游或发出 graph_ended。
 - Graph core 可以用 fake ports 完全离线测试。
+- `loop_intervention_required` 后 Graph 保持非终态，且能追踪 recovery Outcome、
+  GraphChange revision 与新 Activation；旧 Activation 永不复用。
 
 ## 11. Validation / Trace 横切面
 

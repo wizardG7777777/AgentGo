@@ -39,7 +39,7 @@ const schedulerMaxRetries = 5
 
 // schedulerPromptVersion 是 scheduler system prompt 的来源版本（V6 §2 P1a
 // prompt 编译 agent_role 组件的 Version 维度）。prompt 正文变更时递增。
-const schedulerPromptVersion = "embedded:v10.5-simple-authoring-context-v7"
+const schedulerPromptVersion = "embedded:v10.6-graph-recovery-controller"
 
 // SystemPrompt 返回 scheduler agent 的内嵌 system prompt 全文（只读）。
 // 供 /doctor agents 审计（V6 §2 P1b）构造 prompt 摘要/digest，以及任何
@@ -95,6 +95,10 @@ board snapshot 的 topo_mode=solo 时，唯一执行资源是 Scheduler：工作
 	case "scheduler:recovery":
 		return `<scheduler-phase name="recovery">
 本轮只执行一个 recovery/change 动作。先 read_graph/read_graph_change 获取当前 revision 与失败事实；需要修改 immutable Definition 时走 propose_graph_change→validate_graph_change→commit_graph_change，每轮一个动作。不得重放未知副作用，不得绕过 Graph 直发主体任务。
+</scheduler-phase>`
+	case "scheduler:graph-recovery":
+		return `<scheduler-phase name="graph-recovery">
+本轮只执行一个当前 Graph 的恢复控制动作。failure_context、Graph Result/Evidence、ProgressCheckpoint 与 read_graph 是权威；不得亲自修改业务文件。若需要改变未来 work Activation 的定义，依次使用 propose_graph_change→validate_graph_change→commit_graph_change，每轮一个动作，已终态的旧 Activation 始终冻结。裁决完成后必须调用 submit_task_result，并在 result.decision 中提交 retry 或 blocked：retry 让 Runtime 按最新 Definition 创建新的 work Activation；blocked 明确结束 Graph。不得只输出自然语言。
 </scheduler-phase>`
 	case "scheduler:final-report":
 		return `<scheduler-phase name="final-report">

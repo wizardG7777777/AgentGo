@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"agentgo/internal/graph"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
 	"agentgo/internal/store"
@@ -616,6 +617,25 @@ func TestAuthoringGraphControllerLeaseHidesLegacyPatchGraph(t *testing.T) {
 	got := deriveControlTools(task)
 	if strings.Join(got, ",") != "read_graph,request_replan,submit_task_result" {
 		t.Fatalf("authoring controller 控制面=%v，不应暴露 legacy patch_graph", got)
+	}
+}
+
+func TestLoopRecoveryControllerLeaseUsesTransactionalGraphControlOnly(t *testing.T) {
+	task := &model.Task{
+		GraphID: "g-recovery", GraphNodeKind: string(graph.KindController),
+		GraphControllerRole:          string(graph.ControllerRoleLoopRecovery),
+		RecoverySourceTaskID:         "source-work-task",
+		GraphDefinitionDigestVersion: "agentgo.graph-authoring-definition-digest/v1",
+	}
+	got := deriveControlTools(task)
+	want := "commit_graph_change,get_task_result,propose_graph_change,read_content_ref,read_graph,read_graph_change,submit_task_result,validate_graph_change"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("loop_recovery controller 控制面=%v，want %s", got, want)
+	}
+	for _, forbidden := range []string{"patch_graph", "report_done", "run_shell", "write_file", "edit_file"} {
+		if slices.Contains(got, forbidden) {
+			t.Fatalf("loop_recovery controller 不得获得 %s: %v", forbidden, got)
+		}
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 )
@@ -417,7 +418,27 @@ func validateExecutionLedgerBindings(graphID, nodeID string, exec Execution,
 			}
 		}
 		if matched == nil {
-			return fmt.Errorf("input[%d] 不对应任何同 target activation/port 的 durable transition", i)
+			for _, rec := range transitions {
+				if !rec.ReplayInputs || rec.TargetNodeID != nodeID || rec.TargetActivationID != exec.ActivationID {
+					continue
+				}
+				for _, replayed := range rec.ReplayedInputs {
+					if reflect.DeepEqual(binding, replayed) {
+						copy := rec
+						matched = &copy
+						break
+					}
+				}
+				if matched != nil {
+					break
+				}
+			}
+			if matched == nil {
+				return fmt.Errorf("input[%d] 不对应任何同 target activation/port 的 durable transition 或 recovery replay", i)
+			}
+		}
+		if matched.ReplayInputs {
+			continue
 		}
 		if matched.Input == nil || !inputBindingMatchesEdgeInput(binding, *matched.Input) {
 			return fmt.Errorf("input[%d] 与对应 durable transition.Input 不一致: binding=%+v transition_input=%+v", i, binding, matched.Input)

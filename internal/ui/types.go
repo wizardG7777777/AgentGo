@@ -259,28 +259,34 @@ type BoardTask struct {
 	NodeID        string    `json:"node_id,omitempty"`
 	ActivationID  string    `json:"activation_id,omitempty"`
 	GraphNodeKind string    `json:"graph_node_kind,omitempty"`
+	// GraphControllerRole/RecoverySourceTaskID 是安全的控制身份，不含结果正文、
+	// reasoning 或工具参数；外部系统测试据此核验 recovery 是否真实物化/交付。
+	GraphControllerRole  string `json:"graph_controller_role,omitempty"`
+	RecoverySourceTaskID string `json:"recovery_source_task_id,omitempty"`
 }
 
 // BoardTaskFromModel 把 model.Task 映射为 BoardTask，供 bootstrap 装配
 // PollBoard 时使用（也便于测试直接构造）。
 func BoardTaskFromModel(t model.Task) BoardTask {
 	return BoardTask{
-		ID:            t.ID,
-		Desc:          t.Description,
-		Status:        string(t.Status),
-		EventType:     t.EventType,
-		Agents:        t.Agents,
-		Priority:      t.Priority,
-		CreatedAt:     t.CreatedAt,
-		RunID:         string(t.RunID),
-		RunPhase:      string(t.RunPhase),
-		AttemptID:     t.AttemptID,
-		AttemptNo:     t.AttemptNo,
-		OutcomeRef:    t.OutcomeRef,
-		GraphID:       t.GraphID,
-		NodeID:        t.NodeID,
-		ActivationID:  t.ActivationID,
-		GraphNodeKind: t.GraphNodeKind,
+		ID:                   t.ID,
+		Desc:                 t.Description,
+		Status:               string(t.Status),
+		EventType:            t.EventType,
+		Agents:               t.Agents,
+		Priority:             t.Priority,
+		CreatedAt:            t.CreatedAt,
+		RunID:                string(t.RunID),
+		RunPhase:             string(t.RunPhase),
+		AttemptID:            t.AttemptID,
+		AttemptNo:            t.AttemptNo,
+		OutcomeRef:           t.OutcomeRef,
+		GraphID:              t.GraphID,
+		NodeID:               t.NodeID,
+		ActivationID:         t.ActivationID,
+		GraphNodeKind:        t.GraphNodeKind,
+		GraphControllerRole:  t.GraphControllerRole,
+		RecoverySourceTaskID: t.RecoverySourceTaskID,
 	}
 }
 

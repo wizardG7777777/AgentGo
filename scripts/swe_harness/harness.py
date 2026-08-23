@@ -635,6 +635,26 @@ def terminal_task_scope(tasks: list[dict], graphs: list[dict]) -> list[dict]:
     return tasks
 
 
+def missing_loop_recovery_sources(outcomes: list[dict], recovered_source_task_ids: set[str],
+                                  recovery_controller_task_ids: set[str] | None = None) -> list[str]:
+    recovery_controller_task_ids = recovery_controller_task_ids or set()
+    missing = []
+    for outcome in outcomes:
+        if not outcome.get("graph_id") or outcome.get("reason_code") != "loop_intervention_required":
+            continue
+        task_id = str(outcome.get("task_id") or "")
+        # loop_recovery controller 自身就是 L5 的有界裁决边界；它 no-progress
+        # 时沿 recovery-blocked end 收口并吸收 nested command，不递归创建恢复链。
+        if task_id in recovery_controller_task_ids:
+            continue
+        if task_id and task_id in recovered_source_task_ids:
+            continue
+        missing.append(
+            f"{outcome.get('graph_id')}/{outcome.get('activation_id') or 'unknown'}/{task_id or 'unknown'}"
+        )
+    return sorted(set(missing))
+
+
 def collect_result(snapshot_path: str, monitor_path: str, project_root: str, run_id: str,
                    startup_probe_passed: bool) -> dict:
     snapshot = read_json(snapshot_path, {})
@@ -651,6 +671,20 @@ def collect_result(snapshot_path: str, monitor_path: str, project_root: str, run
     contexts = context_metrics(state_dir)
     loops = loop_metrics(state_dir, run_id)
     known = dict(traces["known_incidents"])
+    outcome_task_ids = {str(outcome.get("task_id")) for outcome in outcomes if outcome.get("task_id")}
+    recovery_controller_task_ids = {
+        str(task.get("id")) for task in tasks
+        if task.get("graph_controller_role") == "loop_recovery" and task.get("id")
+    }
+    recovered_source_task_ids = {
+        str(task.get("recovery_source_task_id")) for task in tasks
+        if task.get("graph_controller_role") == "loop_recovery"
+        and task.get("id") in outcome_task_ids and task.get("recovery_source_task_id")
+    }
+    missing_recovery = missing_loop_recovery_sources(
+        outcomes, recovered_source_task_ids, recovery_controller_task_ids,
+    )
+    known["loop_intervention_without_recovery"] = bool(missing_recovery)
     graph_outcomes = [graph.get("outcome", "") for graph in graphs]
     authoring_events = count_jsonl(state_dir / "graph-authoring" / "authoring.jsonl")
     if any(
@@ -715,6 +749,7 @@ def collect_result(snapshot_path: str, monitor_path: str, project_root: str, run
             ),
             "effect_records": count_jsonl(state_dir / "effects.jsonl"),
             "artifact_records": count_jsonl(state_dir / "artifacts.jsonl"),
+            "loop_recovery_missing_sources": missing_recovery,
         },
         "known_incidents": known,
         "architecture_checks": architecture_checks,

@@ -132,6 +132,29 @@ func TestDefinitionCompilerAcceptsValidDefinition(t *testing.T) {
 	}
 }
 
+func TestDefinitionCompilerValidatesLoopRecoveryControllerRole(t *testing.T) {
+	compiler := DefinitionCompiler{Policies: validCompilerPolicies(), Acceptance: validProposalAcceptance()}
+	draft := validCompilerDraft()
+	work := draft.Candidate.Nodes["work"]
+	work.Metadata = map[string]string{MetadataControllerRole: string(ControllerRoleLoopRecovery)}
+	draft.Candidate.Nodes["work"] = work
+	result := compileDefinition(t, compiler, draft)
+	if !hasValidationCode(result.Report, "GRAPH_CAPABILITY_INVALID") {
+		t.Fatalf("agent 不得伪造 loop_recovery controller role: %+v", result.Report.Errors)
+	}
+
+	draft = validCompilerDraft()
+	work = draft.Candidate.Nodes["work"]
+	work.Kind = KindController
+	work.Capability = nil
+	work.Metadata = map[string]string{MetadataControllerRole: string(ControllerRoleLoopRecovery)}
+	draft.Candidate.Nodes["work"] = work
+	result = compileDefinition(t, compiler, draft)
+	if !hasValidationCode(result.Report, "RECOVERY_DECISION_CONTRACT_REQUIRED") {
+		t.Fatalf("loop_recovery controller 缺少 $.decision 契约应拒绝: %+v", result.Report.Errors)
+	}
+}
+
 func TestDefinitionCompilerReportCommitsThroughAuthoringStore(t *testing.T) {
 	store, err := NewAuthoringStore(t.TempDir())
 	if err != nil {
