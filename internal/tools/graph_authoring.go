@@ -255,13 +255,15 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 		RequiresAcceptance: true,
 	}
 	workBindings := graph.GraphContractBindings{Deliverables: []string{"primary-deliverable"}}
-	workProgress := policycatalog.ProgressInvestigationV1
+	workProgress := policycatalog.ProgressInvestigationCurrent
 	workTools := []string{"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref"}
 	if input.ExecutionClass == graph.ExecutionMutating {
-		contract.RequiredEffects = []string{"file_write"}
-		workBindings.Effects = []string{"file_write"}
+		contract.RequiredEffects = []string{"workspace-change"}
+		contract.RequiredChecks = []graph.ContractRequirement{{ID: "verification", Kind: "verification", Description: "最后一次代码改动后的 typed check 通过"}}
+		workBindings.Effects = []string{"workspace-change"}
+		workBindings.Checks = []string{"verification"}
 		workProgress = policycatalog.ProgressCodeChangeCurrent
-		workTools = append(workTools, "write_file", "edit_file", "run_shell")
+		workTools = append(workTools, "write_file", "edit_file", "run_shell", "run_check")
 	}
 
 	completed := graph.EventCompleted
@@ -294,7 +296,7 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 			Kind: graph.KindController,
 			Task: &graph.NodeTask{
 				Title:          "裁决停滞执行的恢复路径",
-				Description:    "读取 failure_context 中冻结的 TaskOutcome、reason_code、checkpoint、工作记录与证据，裁决当前 Graph 是否应创建新的 work Activation。若现有 Definition 需要改变，只能先走 GraphChangeProposal 的 propose→validate→commit 事务；不得修改已终态的旧 Activation，不得亲自执行业务代码。最终必须调用 submit_task_result，并在 result.decision 写入 retry 或 blocked：retry 表示按最新 Definition 创建 work 的新 Activation，blocked 表示没有安全恢复输入并结束 Graph。",
+				Description:    "读取 failure_context 中冻结的 TaskOutcome、reason_code、checkpoint、ObservationDelta、工作记录与证据，裁决当前 Graph 是否应创建新的 work Activation。若现有 Definition 需要改变，只能先走 GraphChangeProposal 的 propose→validate→commit 事务；不得修改已终态的旧 Activation，不得亲自执行业务代码。最终必须调用 submit_recovery_decision：retry 声明 changed_dimensions、strategy、first_required_action、expected_milestone，source 字段由 framework 自动绑定；blocked 必须说明 blocked_reason。没有可验证变化只能 blocked。",
 				RequiredInputs: []string{"failure_context"},
 			},
 			Next: []graph.Transition{
@@ -303,15 +305,17 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 				{To: "recovery-failed", When: &graph.Condition{Event: failed}},
 				{To: "recovery-blocked", When: &graph.Condition{Event: blocked}},
 			},
-			OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Fields: []graph.OutputFieldContract{{
-				Path: "$.decision", Type: "string", Description: "retry|blocked", Required: true,
-			}}},
-			ProgressContractRef: policycatalog.ProgressCoordinationV1,
+			OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Fields: []graph.OutputFieldContract{
+				{Path: "$.decision", Type: "string", Description: "retry|blocked", Required: true},
+				{Path: "$.recovery_delta", Type: "object", Description: graph.RecoveryDeltaSchemaV1},
+			}},
+			ProgressContractRef: policycatalog.ProgressCoordinationCurrent,
 			ContextPolicyRef:    policycatalog.ContextDefaultCurrent,
 			Metadata: map[string]string{
-				graph.MetadataControllerRole:     string(graph.ControllerRoleLoopRecovery),
-				graph.MetadataRecoveryMaxRetries: "2",
-				"authoring_template":             "simple-task/v1",
+				graph.MetadataControllerRole:      string(graph.ControllerRoleLoopRecovery),
+				graph.MetadataRecoveryMaxRetries:  "2",
+				graph.MetadataRecoveryDeltaSchema: graph.RecoveryDeltaSchemaV1,
+				"authoring_template":              "simple-task/v1",
 			},
 		},
 		"acceptance": {
@@ -331,14 +335,14 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 			OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Fields: []graph.OutputFieldContract{{
 				Path: "$.verdict", Type: "string", Description: "pass|fixable|failed", Required: true,
 			}}},
-			ProgressContractRef: policycatalog.ProgressVerificationV1,
+			ProgressContractRef: policycatalog.ProgressVerificationCurrent,
 			ContextPolicyRef:    policycatalog.ContextDefaultCurrent,
 		},
 		"acceptance-recovery": {
 			Kind: graph.KindController,
 			Task: &graph.NodeTask{
 				Title:          "裁决验收停滞的恢复路径",
-				Description:    "读取 failure_context 与原 acceptance 的冻结输入，裁决是否用新 Activation 重试验收。必要时先通过 GraphChangeProposal 修改未来 acceptance 的模型或定义；不得亲自验收或修改业务文件。最终调用 submit_task_result，并在 result.decision 写入 retry 或 blocked。",
+				Description:    "读取 failure_context、ObservationDelta 与原 acceptance 的冻结输入，裁决是否用新 Activation 重试验收。必要时先通过 GraphChangeProposal 修改未来 acceptance 的模型或定义；不得亲自验收或修改业务文件。最终调用 submit_recovery_decision；source 字段由 framework 自动绑定。",
 				RequiredInputs: []string{"failure_context"},
 			},
 			Next: []graph.Transition{
@@ -347,15 +351,17 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 				{To: "acceptance-recovery-failed", When: &graph.Condition{Event: failed}},
 				{To: "acceptance-recovery-blocked", When: &graph.Condition{Event: blocked}},
 			},
-			OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Fields: []graph.OutputFieldContract{{
-				Path: "$.decision", Type: "string", Description: "retry|blocked", Required: true,
-			}}},
-			ProgressContractRef: policycatalog.ProgressCoordinationV1,
+			OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Fields: []graph.OutputFieldContract{
+				{Path: "$.decision", Type: "string", Description: "retry|blocked", Required: true},
+				{Path: "$.recovery_delta", Type: "object", Description: graph.RecoveryDeltaSchemaV1},
+			}},
+			ProgressContractRef: policycatalog.ProgressCoordinationCurrent,
 			ContextPolicyRef:    policycatalog.ContextDefaultCurrent,
 			Metadata: map[string]string{
-				graph.MetadataControllerRole:     string(graph.ControllerRoleLoopRecovery),
-				graph.MetadataRecoveryMaxRetries: "2",
-				"authoring_template":             "simple-task/v1",
+				graph.MetadataControllerRole:      string(graph.ControllerRoleLoopRecovery),
+				graph.MetadataRecoveryMaxRetries:  "2",
+				graph.MetadataRecoveryDeltaSchema: graph.RecoveryDeltaSchemaV1,
+				"authoring_template":              "simple-task/v1",
 			},
 		},
 		"accepted":                    simpleEnd("验收通过", graph.DefinitionEndSuccess),

@@ -85,6 +85,8 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"task_memory_created", Event{Kind: KindTaskMemoryCreated, Description: `{"version":1,"actions":0}`}, []string{`sections="{\"version\":1`}},
 		{"task_memory_updated", Event{Kind: KindTaskMemoryUpdated, Loop: 2, Description: `{"version":3,"actions":2}`}, []string{`sections="{\"version\":3`}},
 		{"task_memory_checkpointed", Event{Kind: KindTaskMemoryCheckpointed, Loop: -1, Reason: "terminal:completed", Description: `{"version":5,"sealed":true}`}, []string{`reason="terminal:completed"`, `sections="{\"version\":5`}},
+		{"observation_delta_recorded", Event{Kind: KindObservationDeltaRecorded, TaskID: "t1", AttemptID: "t1/attempt-1", Description: `{"observation_delta_ref":"observation:sha256:abc","facts":1}`}, []string{`sections="{\"observation_delta_ref\"`}},
+		{"observation_checkpoint_failed", Event{Kind: KindObservationCheckpointFailed, TaskID: "t1", AttemptID: "t1/attempt-1", Reason: "control_invocation_preflight_failed", Description: "action=periodic"}, []string{`reason="control_invocation_preflight_failed"`, `sections="action=periodic"`}},
 		{"session_memory_promotion_proposed", Event{Kind: KindSessionMemoryPromotionProposed, TaskID: "t1", Reason: "completed", Description: `{"version":5,"sealed":true}`}, []string{`reason="completed"`, `summary="{\"version\":5`}},
 		{"session_memory_promotion_decided", Event{Kind: KindSessionMemoryPromotionDecided, TaskID: "t1", Reason: "completed", Description: `{"decided":"promoted","entries":2}`}, []string{`reason="completed"`, `summary="{\"decided\":\"promoted\"`}},
 		{"memory_recalled", Event{Kind: KindMemoryRecalled, TaskID: "t2", Description: `{"entries":2,"keys":["task_result:result:t1:confirmed"]}`}, []string{`summary="{\"entries\":2`}},
@@ -97,8 +99,8 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"effect_recovery_decided", Event{Kind: KindEffectRecoveryDecided, TaskID: "t1", Effect: &EffectPayload{EffectID: "t1-1", Kind: "file_write", Policy: "verify_first", Decision: "verified_settled", Reason: "文件 hash 与账载一致"}}, []string{"effect=t1-1", "decision=verified_settled", `reason="文件 hash 与账载一致"`}},
 		{"acceptance_completed", Event{Kind: KindAcceptanceCompleted, GraphID: "graph-1", NodeID: "verify", ActivationID: "verify@1", TaskID: "task-9", Acceptance: &AcceptancePayload{Verdict: "pass", Status: "disputed", Checked: 2, Reason: "命令未在该任务的 shell 账中找到"}}, []string{"graph=graph-1", "node=verify", "activation=verify@1", "verdict=pass", "verify=disputed", "checked=2", `reason="命令未在该任务的 shell 账中找到"`}},
 	}
-	if len(cases) != 68 {
-		t.Fatalf("test inventory has %d built-in EventKinds, want 68", len(cases))
+	if len(cases) != 70 {
+		t.Fatalf("test inventory has %d built-in EventKinds, want 70", len(cases))
 	}
 	seen := make(map[string]struct{}, len(cases))
 	for _, tc := range cases {

@@ -9,6 +9,7 @@ import (
 	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
+	"agentgo/internal/policycatalog"
 	"agentgo/internal/runcontract"
 )
 
@@ -50,7 +51,7 @@ func TestSchedulerInvocationToolPolicyMovesThroughAuthoringPhases(t *testing.T) 
 		"create_graph_draft", "configure_simple_graph_draft", "read_graph_draft", "patch_graph_draft", "validate_graph_draft",
 		"validate_current_graph_draft", "commit_graph_draft", "commit_current_graph_draft", "start_graph", "start_current_graph",
 		"read_graph", "get_task_result", "read_content_ref", "propose_graph_change", "read_graph_change",
-		"validate_graph_change", "commit_graph_change",
+		"validate_graph_change", "commit_graph_change", "report_done",
 	} {
 		full.Register(name, name, map[string]any{"type": "object"}, func(context.Context, map[string]any) (string, error) { return "ok", nil })
 	}
@@ -106,6 +107,7 @@ func TestSchedulerInvocationToolPolicyMovesThroughAuthoringPhases(t *testing.T) 
 		t.Fatalf("simple Validation rejection 应回到高层 configure: phase=%s tools=%v", reconfigure.Phase, reconfigure.Registry.Names())
 	}
 	task.EventSource = "graph-ended"
+	task.RunPhase, task.FinalReportGraphID = runcontract.PhaseFinalization, "g-final"
 	final := deriveInvocationToolPolicy(task, nil, full)
 	if final.Phase != "scheduler:final-report" || final.MaxCalls != defaultToolCallsPerResponse ||
 		final.Registry.Missing([]string{"read_graph"}) != nil ||
@@ -136,7 +138,7 @@ func TestGraphDeliverablePhaseForcesSubmitTaskResult(t *testing.T) {
 	}
 }
 
-func TestDeliverableHistoryProjectionDropsHistoricalToolsButKeepsControlNotices(t *testing.T) {
+func TestMechanicalControlHistoryProjectionDropsHistoricalToolsButKeepsControlNotices(t *testing.T) {
 	history := []HistoryEntry{
 		{AssistantContent: "调查", ToolCalls: []llm.ToolCall{{ID: "read", Name: "read_file"}},
 			ToolResults: []ToolResult{{ToolCallID: "read", Content: "source"}}},
@@ -144,7 +146,7 @@ func TestDeliverableHistoryProjectionDropsHistoricalToolsButKeepsControlNotices(
 		{SystemNotice: "<loop-reminder>stop exploring</loop-reminder>",
 			ToolCalls: []llm.ToolCall{{ID: "grep", Name: "grep_search"}}},
 	}
-	projected := deliverableHistoryProjection(history)
+	projected := mechanicalControlHistoryProjection(history)
 	if len(projected) != 2 || !strings.Contains(projected[0].SystemNotice, progressDeliverableRequiredMarker) ||
 		len(projected[0].ToolCalls) != 0 || len(projected[1].ToolCalls) != 0 ||
 		projected[0].AssistantContent != "" || projected[1].AssistantContent != "" {
@@ -251,7 +253,7 @@ func TestGraphRecoveryControllerUsesDedicatedSingleActionPhase(t *testing.T) {
 	full := NewToolRegistry()
 	for _, name := range []string{
 		"commit_graph_change", "get_task_result", "propose_graph_change", "read_content_ref",
-		"read_graph", "read_graph_change", "submit_task_result", "validate_graph_change",
+		"read_graph", "read_graph_change", "submit_recovery_decision", "validate_graph_change",
 		"run_shell", "write_file", "report_done", "patch_graph",
 	} {
 		full.Register(name, name, map[string]any{"type": "object"}, func(context.Context, map[string]any) (string, error) { return "ok", nil })
@@ -267,11 +269,134 @@ func TestGraphRecoveryControllerUsesDedicatedSingleActionPhase(t *testing.T) {
 	policy := deriveInvocationToolPolicy(task, nil, full)
 	want := []string{
 		"commit_graph_change", "get_task_result", "propose_graph_change", "read_content_ref",
-		"read_graph", "read_graph_change", "submit_task_result", "validate_graph_change",
+		"read_graph", "read_graph_change", "submit_recovery_decision", "validate_graph_change",
 	}
 	if policy.Phase != "scheduler:graph-recovery" || !sameExactToolSet(policy.Registry.Names(), want) ||
 		!phaseRequiresToolCall(policy.Phase) || !phaseDispatchesOnlyFirstTool(policy.Phase) {
 		t.Fatalf("Graph recovery phase/ToolRouter 不符: phase=%s tools=%v", policy.Phase, policy.Registry.Names())
+	}
+}
+
+func TestObservationCheckpointAndFinalReportUseClosedToolPhases(t *testing.T) {
+	full := NewToolRegistry()
+	for _, name := range []string{"record_observation_delta", "read_file", "submit_task_result", "read_graph", "get_task_result", "read_content_ref", "report_done"} {
+		full.Register(name, name, map[string]any{"type": "object"},
+			func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	}
+	worker := replayGateTask("worker-observation", nil)
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v4, ok := catalog.ProgressContract(policycatalog.ProgressCodeChangeV4)
+	if !ok {
+		t.Fatal("缺少 code-change/v4")
+	}
+	worker.ProgressContract = &v4.Contract
+	observation := deriveInvocationToolPolicy(worker, []HistoryEntry{{SystemNotice: observationCheckpointNotice("rollover", "冻结观察")}}, full)
+	if observation.Phase != "agent:observation-checkpoint" ||
+		observation.MaxCalls != defaultToolCallsPerResponse ||
+		!sameExactToolSet(observation.Registry.Names(), []string{"record_observation_delta"}) {
+		t.Fatalf("Observation phase 未收窄: phase=%s tools=%v", observation.Phase, observation.Registry.Names())
+	}
+	router, err := FreezeToolRouterSnapshotWithPolicy(observation.Registry, observation.Phase, observation.MaxCalls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if choice := invocationToolChoice(router); choice.Mode != invocation.ToolChoiceFunction || choice.Name != "record_observation_delta" {
+		t.Fatalf("Observation checkpoint Control lane 必须 exact typed action: %+v", choice)
+	}
+	if reasoningEffort, override := phaseReasoningEffortOverride(router.Phase); !override || reasoningEffort != "none" {
+		t.Fatalf("Observation Control lane 必须使用 reasoning=none: effort=%q override=%v", reasoningEffort, override)
+	}
+	if reasoningEffort, override := phaseReasoningEffortOverride("agent:deliverable-submit"); !override || reasoningEffort != "none" {
+		t.Fatalf("终态交付应保留 reasoning=none 狭义例外: effort=%q override=%v", reasoningEffort, override)
+	}
+
+	verification, ok := catalog.ProgressContract(policycatalog.ProgressVerificationV2)
+	if !ok {
+		t.Fatal("缺少 verification/v2")
+	}
+	acceptance := replayGateTask("acceptance-observation", nil)
+	acceptance.GraphID, acceptance.NodeID, acceptance.ActivationID = "g-1", "acceptance", "acceptance@1"
+	acceptance.GraphNodeKind = string(graph.KindAcceptance)
+	acceptance.ProgressContract = &verification.Contract
+	business := full.Filtered([]string{"read_file", "submit_task_result"})
+	executor := NewSwappableLLMExecutor(nil, full, nil, nil, nil, "")
+	executor.SwapToolRegistry(business)
+	businessView, frameworkAuthority := executor.invocationToolRegistries()
+	normal := deriveInvocationToolPolicyWithControl(acceptance, nil, businessView, frameworkAuthority)
+	if normal.Phase != "default" || !sameExactToolSet(normal.Registry.Names(), []string{"read_file", "submit_task_result"}) {
+		t.Fatalf("Acceptance 普通业务轮不得泄露 Observation control: phase=%s tools=%v", normal.Phase, normal.Registry.Names())
+	}
+	checkpoint := deriveInvocationToolPolicyWithControl(acceptance,
+		[]HistoryEntry{{SystemNotice: observationCheckpointNotice("periodic", "冻结观察")}}, businessView, frameworkAuthority)
+	if checkpoint.Phase != "agent:observation-checkpoint" ||
+		!sameExactToolSet(checkpoint.Registry.Names(), []string{"record_observation_delta"}) {
+		t.Fatalf("Acceptance checkpoint 必须从 framework authority 取得 exact control tool: phase=%s tools=%v",
+			checkpoint.Phase, checkpoint.Registry.Names())
+	}
+
+	failures := []HistoryEntry{
+		{SystemNotice: observationCheckpointNotice("periodic", "冻结观察")},
+		{SystemNotice: observationCheckpointFailureMarker + " provider response gate 失败"},
+		{SystemNotice: observationCheckpointFailureMarker + " 参数修正失败"},
+	}
+	if got := observationCheckpointFailureCount(failures); got != 2 {
+		t.Fatalf("Observation Invocation 失败未进入有界计数: got=%d", got)
+	}
+	for _, content := range []string{
+		"错误: invalid evidence", "错误：invalid evidence", "已跳过: duplicate", "已跳过：duplicate",
+	} {
+		if !unsuccessfulToolResult(content) {
+			t.Fatalf("Observation 失败回执前缀未兼容: %q", content)
+		}
+	}
+
+	report := replayGateTask("final-report", nil)
+	report.EventType, report.EventSource = "__scheduler__", "graph-ended"
+	report.RunPhase, report.FinalReportGraphID = runcontract.PhaseFinalization, "g-1"
+	finalReportNormal := deriveInvocationToolPolicy(report, nil, full)
+	wantNormal := []string{"get_task_result", "read_content_ref", "read_graph", "report_done"}
+	if finalReportNormal.Phase != "scheduler:final-report" || !sameExactToolSet(finalReportNormal.Registry.Names(), wantNormal) ||
+		!phaseRequiresToolCall(finalReportNormal.Phase) {
+		t.Fatalf("final-report 普通工具面错误: phase=%s tools=%v", finalReportNormal.Phase, finalReportNormal.Registry.Names())
+	}
+	withForeignMarker := deriveInvocationToolPolicy(report,
+		[]HistoryEntry{{SystemNotice: observationCheckpointNotice("continue", "不应作用于 final-report")}}, full)
+	if withForeignMarker.Phase != "scheduler:final-report" ||
+		!sameExactToolSet(withForeignMarker.Registry.Names(), wantNormal) {
+		t.Fatalf("final-report 结构化 scope 必须压过无关 Observation marker: phase=%s tools=%v",
+			withForeignMarker.Phase, withForeignMarker.Registry.Names())
+	}
+	forced := deriveInvocationToolPolicy(report, []HistoryEntry{{SystemNotice: progressDeliverableRequiredMarker}}, full)
+	if forced.Phase != "scheduler:final-report-submit" ||
+		!sameExactToolSet(forced.Registry.Names(), []string{"report_done"}) {
+		t.Fatalf("final-report 强制交付未收窄: phase=%s tools=%v", forced.Phase, forced.Registry.Names())
+	}
+	forcedAfterReads := deriveInvocationToolPolicy(report, []HistoryEntry{
+		{ToolCalls: []llm.ToolCall{{ID: "read-1", Name: "read_graph"}}},
+		{ToolCalls: []llm.ToolCall{{ID: "read-2", Name: "get_task_result"}},
+			ToolResults: []ToolResult{{ToolCallID: "read-2", Content: "[工具错误] 缺少 agent_id"}}},
+	}, full)
+	if forcedAfterReads.Phase != "scheduler:final-report-submit" ||
+		!sameExactToolSet(forcedAfterReads.Registry.Names(), []string{"report_done"}) {
+		t.Fatalf("final-report 两个补读 turn（含失败）后必须 exact report_done: phase=%s tools=%v",
+			forcedAfterReads.Phase, forcedAfterReads.Registry.Names())
+	}
+}
+
+func TestBusinessHistoryProjectionDropsObservationControlLane(t *testing.T) {
+	history := []HistoryEntry{
+		{TurnID: "business-1", AssistantContent: "调查", ToolCalls: []llm.ToolCall{{ID: "r", Name: "read_file"}}},
+		{TurnID: "control-1", ToolCalled: true,
+			ToolCalls:   []llm.ToolCall{{ID: "o", Name: "record_observation_delta"}},
+			ToolResults: []ToolResult{{ToolCallID: "o", Content: `{"observation_delta_ref":"observation:sha256:x"}`}}},
+		{TurnID: "business-2", AssistantContent: "继续实现"},
+	}
+	projected := businessHistoryProjection(history)
+	if len(projected) != 2 || projected[0].TurnID != "business-1" || projected[1].TurnID != "business-2" {
+		t.Fatalf("业务 replay 不得混入 Observation Control lane: %+v", projected)
 	}
 }
 
@@ -304,8 +429,28 @@ func TestSchedulerAutoSingletonBatchDispatchesOnlyFirstCall(t *testing.T) {
 
 func TestSchedulerAutoSingletonRejectsTextOnlyPhaseResponse(t *testing.T) {
 	router := ToolRouterSnapshot{Phase: "scheduler:draft-create", MaxCalls: defaultToolCallsPerResponse}
-	if err := validateToolCallBatch(router, nil); err == nil || !strings.Contains(err.Error(), "未返回必需") {
+	if err := validateToolCallBatch(router, nil); err == nil || !strings.Contains(err.Error(), "未返回必需") ||
+		!isActionContractViolation(err) {
 		t.Fatalf("auto wire 不得让正文越过机械阶段: %v", err)
+	}
+}
+
+func TestToolBatchSeparatesActionContractFromMalformedProtocol(t *testing.T) {
+	registry := NewToolRegistry()
+	registry.Register("record_observation_delta", "obs", map[string]any{"type": "object"},
+		func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	router, err := FreezeToolRouterSnapshotWithPolicy(registry, "agent:observation-checkpoint",
+		defaultToolCallsPerResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorized := validateToolCallBatch(router, []llm.ToolCall{{ID: "c1", Name: "read_file"}})
+	if unauthorized == nil || !isActionContractViolation(unauthorized) {
+		t.Fatalf("合法 response 中的错阶段工具应归 action contract: %v", unauthorized)
+	}
+	malformed := validateToolCallBatch(router, []llm.ToolCall{{ID: "c2", Name: "bad tool name"}})
+	if malformed == nil || isActionContractViolation(malformed) {
+		t.Fatalf("非法工具名仍应归 protocol malformed: %v", malformed)
 	}
 }
 

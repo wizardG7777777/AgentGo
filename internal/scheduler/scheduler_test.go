@@ -35,12 +35,12 @@ func TestSchedulerPhasePromptsAreClosedAndBounded(t *testing.T) {
 		"scheduler:draft-create":    {"create_graph_draft", "唯一动作"},
 		"scheduler:draft-configure": {"configure_simple_graph_draft", "execution_class", "底层 Graph AST"},
 		"scheduler:draft-validate":  {"validate_current_graph_draft", "独立 Proposal Acceptance"},
-		"scheduler:draft-edit":      {"patch_graph_draft", "context_policy_ref=context:default/v7", "普通节点最多一条静态入边", "verdict=pass|fixable|failed"},
+		"scheduler:draft-edit":      {"patch_graph_draft", "禁止在 Prompt 中猜版本号", "普通节点最多一条静态入边", "verdict=pass|fixable|failed"},
 		"scheduler:draft-commit":    {"durable transaction cursor", "commit_current_graph_draft", "不启动执行"},
 		"scheduler:start":           {"start_current_graph", "等待 graph-ended"},
 		"scheduler:recovery":        {"read_graph", "propose_graph_change", "不得重放未知副作用"},
-		"scheduler:graph-recovery":  {"failure_context", "propose_graph_change", "result.decision", "新的 work Activation"},
-		"scheduler:final-report":    {"read_graph", "get_task_result", "自然语言"},
+		"scheduler:graph-recovery":  {"failure_context", "propose_graph_change", "submit_recovery_decision", "framework 自动绑定"},
+		"scheduler:final-report":    {"GraphTerminalSummary", "get_task_result", "report_done"},
 	}
 	for phase, wants := range tests {
 		t.Run(phase, func(t *testing.T) {
@@ -87,7 +87,7 @@ func TestSchedulerCoreAndEveryPhasePassCurrentContextPolicy(t *testing.T) {
 }
 
 func TestSchedulerPromptVersionTracksPhaseArchitecture(t *testing.T) {
-	const want = "embedded:v10.6-graph-recovery-controller"
+	const want = "embedded:v10.7-observation-recovery-finalization"
 	if schedulerPromptVersion != want {
 		t.Fatalf("schedulerPromptVersion=%q want=%q", schedulerPromptVersion, want)
 	}

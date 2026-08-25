@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"agentgo/internal/model"
 	"agentgo/internal/policycatalog"
 	"agentgo/internal/roster"
+	"agentgo/internal/runbudget"
 	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
 )
@@ -76,7 +78,7 @@ func TestProcessTaskBlocksWhenNoProgressBudgetExhausted(t *testing.T) {
 	agent := NewAgent("worker-l4", "code", taskStore, roster.NewMemoryRoster(),
 		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
 			calls.Add(1)
-			return ExecuteResult{InvocationID: "inv-1", Output: "仍在考虑", ToolCalled: true}, nil
+			return ExecuteResult{InvocationID: "inv-1", ProviderCallStarted: true, Output: "仍在考虑", ToolCalled: true}, nil
 		})
 	agent.LoopStore = progressStore
 	agent.processTask(context.Background(), task.ID)
@@ -102,6 +104,29 @@ func TestProcessTaskBlocksWhenNoProgressBudgetExhausted(t *testing.T) {
 	commands, err := progressStore.PendingInterventions()
 	if err != nil || len(commands) != 1 || commands[0].ReasonCode != loopcontract.InterventionNoProgressBudget {
 		t.Fatalf("预算耗尽未 durable typed intervention: %+v err=%v", commands, err)
+	}
+}
+
+func TestProjectExecuteResultDoesNotTreatPipelineTailExitAsEvaluationPass(t *testing.T) {
+	taskStore := store.NewMemoryTaskStore(nil, 8, 1, 60)
+	task := &model.Task{ID: "pipeline-task", Status: model.TaskStatusProcessing}
+	if err := taskStore.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	agent := &Agent{Store: taskStore}
+	delta := loopcontract.TurnSettlementDelta{}
+	projectExecuteResult(agent, task, ExecuteResult{
+		ToolCalls: []llm.ToolCall{{
+			ID: "pipeline-call", Name: "run_shell",
+			Arguments: map[string]any{"command": "pytest -q 2>&1 | tail -20", "accept_last_pipeline_exit_code": true},
+		}},
+		ToolResults: []ToolResult{{
+			ToolCallID: "pipeline-call",
+			Content:    "exit_code: 0\nexit_code_scope: last_pipeline_command\nstdout+stderr:\n1 failed, 492 passed",
+		}},
+	}, &delta)
+	if len(delta.EvaluationChanges) != 1 || delta.EvaluationChanges[0].AfterVerdict != "ambiguous" {
+		t.Fatalf("pipeline 末段 exit=0 不得成为 evaluation pass: %+v", delta.EvaluationChanges)
 	}
 }
 
@@ -154,6 +179,51 @@ func TestProcessTaskInterventionEndsOnlyCurrentGraphActivationWithTypedCommand(t
 		command.ActivationID != task.ActivationID ||
 		command.ReasonCode != loopcontract.InterventionNoProgressStalled {
 		t.Fatalf("typed intervention lineage/reason 错误: %+v", command)
+	}
+}
+
+func TestUnknownInvocationRequestsTypedL5Intervention(t *testing.T) {
+	taskStore := store.NewMemoryTaskStore(nil, 32, 1, 60)
+	if err := store.SetTerminalOutcomeHook(taskStore, func(intent store.TerminalOutcomeIntent) (string, error) {
+		return "outcome:" + intent.Task.ID, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	task := enforcementTask(t)
+	task.GraphID, task.NodeID, task.ActivationID, task.GraphNodeKind = "g-unknown", "work", "work@1", "agent"
+	if err := taskStore.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskStore.ClaimTask("worker-unknown", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	progressStore, err := loopstore.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = progressStore.Close() })
+	agent := NewAgent("worker-unknown", "code", taskStore, roster.NewMemoryRoster(),
+		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+			failure := invocation.NewFailure(invocation.FailureUnknown,
+				invocation.PhaseResponseHeaders, invocation.OriginProvider, errors.New("future provider failure"))
+			return ExecuteResult{InvocationID: "inv-unknown", ProviderCallStarted: true}, failure
+		})
+	agent.LoopStore = progressStore
+	agent.processTask(context.Background(), task.ID)
+
+	got, err := taskStore.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.TaskStatusBlocked || got.OutcomeRef == "" ||
+		!strings.Contains(got.Error, "需要 L5 recovery 裁决") {
+		t.Fatalf("unknown Invocation 不得落入 non_recoverable failed: %+v", got)
+	}
+	commands, err := progressStore.PendingInterventionsForTask(task.ID)
+	if err != nil || len(commands) != 1 ||
+		commands[0].ReasonCode != loopcontract.InterventionUnsafeUnknown ||
+		commands[0].CheckpointRef == "" {
+		t.Fatalf("unknown Invocation 未形成 durable L4→L5 command: %+v err=%v", commands, err)
 	}
 }
 
@@ -509,6 +579,99 @@ func TestL4ReservationClampsPerCallCompletionBudget(t *testing.T) {
 	}
 }
 
+func TestL4ExplicitRunBudgetIsSharedAcrossActivationTasks(t *testing.T) {
+	loopAuthority, err := loopstore.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = loopAuthority.Close() })
+	runAuthority, err := runbudget.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runAuthority.Close() })
+	agent := NewAgent("worker-run-budget", "code", store.NewMemoryTaskStore(nil, 8, 1, 60), roster.NewMemoryRoster(), nil)
+	agent.LoopStore, agent.RunBudgetStore = loopAuthority, runAuthority
+
+	first := enforcementTask(t)
+	first.ID, first.AttemptID, first.ActivationID = "work-task-1", "work-task-1/attempt-1", "work@1"
+	first.GraphID, first.NodeID, first.GraphNodeKind = "g-budget", "work", "agent"
+	first.RunContract.BudgetProfile = "swe/v3"
+	first.RunContract.Budget = runcontract.BudgetLimit{ModelCalls: 1}
+	firstRuntime, err := agent.initLoopProgress(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := firstRuntime.reserveModelAction(first.AttemptID + "/turn-1"); err != nil {
+		t.Fatalf("第一个 Activation 应取得显式 Run grant: %v", err)
+	}
+
+	second := enforcementTask(t)
+	second.RunID, second.RunContract = first.RunID, first.RunContract
+	second.ID, second.AttemptID, second.ActivationID = "work-task-2", "work-task-2/attempt-1", "work@2"
+	second.GraphID, second.NodeID, second.GraphNodeKind = first.GraphID, first.NodeID, first.GraphNodeKind
+	secondRuntime, err := agent.initLoopProgress(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := secondRuntime.reserveModelAction(second.AttemptID + "/turn-1"); err == nil || !strings.Contains(err.Error(), "Run budget 已耗尽") {
+		t.Fatalf("同 Run 的新 Activation 不得重置显式 model_calls: %v", err)
+	}
+}
+
+func TestL4PreflightFailureDoesNotConsumeProviderModelCall(t *testing.T) {
+	loopAuthority, err := loopstore.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = loopAuthority.Close() })
+	runAuthority, err := runbudget.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runAuthority.Close() })
+	agent := NewAgent("worker-provider-accounting", "code", store.NewMemoryTaskStore(nil, 8, 1, 60), roster.NewMemoryRoster(), nil)
+	agent.LoopStore, agent.RunBudgetStore = loopAuthority, runAuthority
+
+	task := enforcementTask(t)
+	task.ID, task.AttemptID = "task-provider-accounting", "task-provider-accounting/attempt-1"
+	task.RunContract.Budget = runcontract.BudgetLimit{ModelCalls: 1}
+	runtime, err := agent.initLoopProgress(task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn1 := task.AttemptID + "/turn-1"
+	if _, _, _, err = runtime.reserveModelAction(turn1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = runtime.settleTurn(agent, task, turn1, time.Now().UTC(), ExecuteResult{},
+		errors.New("ToolRouter preflight failed"), false); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok, err := runAuthority.Snapshot(task.RunID)
+	if err != nil || !ok {
+		t.Fatalf("读取 RunBudget: ok=%t err=%v", ok, err)
+	}
+	if snapshot.Settled.ModelCalls != 0 || snapshot.Reserved.ModelCalls != 0 ||
+		runtime.checkpoint.CumulativeUsage.ModelCalls != 0 {
+		t.Fatalf("provider 前失败不得消费 model_calls: run=%+v checkpoint=%+v", snapshot, runtime.checkpoint.CumulativeUsage)
+	}
+
+	turn2 := task.AttemptID + "/turn-2"
+	if _, _, _, err = runtime.reserveModelAction(turn2); err != nil {
+		t.Fatalf("本地 preflight 失败后显式 provider slot 应仍可使用: %v", err)
+	}
+	if _, err = runtime.settleTurn(agent, task, turn2, time.Now().UTC(), ExecuteResult{
+		InvocationID: "inv-provider", ProviderCallStarted: true,
+	}, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok, err = runAuthority.Snapshot(task.RunID)
+	if err != nil || !ok || snapshot.Settled.ModelCalls != 1 || snapshot.Reserved.ModelCalls != 0 {
+		t.Fatalf("真实 provider 调用应恰结算一次: snapshot=%+v ok=%t err=%v", snapshot, ok, err)
+	}
+}
+
 func TestGraphAuthoringToolsAreCoordinationProgressSignals(t *testing.T) {
 	for _, name := range []string{
 		"create_graph_draft", "configure_simple_graph_draft", "read_graph_draft", "patch_graph_draft",
@@ -519,6 +682,94 @@ func TestGraphAuthoringToolsAreCoordinationProgressSignals(t *testing.T) {
 		if !isCoordinationTool(name) {
 			t.Errorf("Graph authoring/change tool %s 未映射为 coordination progress", name)
 		}
+	}
+}
+
+func TestCodeChangeV4ExplorationForcesDeliveryAndInterventionRequiresObservation(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := catalog.ProgressContract(policycatalog.ProgressCodeChangeV4)
+	if !ok {
+		t.Fatal("缺少 code-change/v4")
+	}
+	task := &model.Task{ID: "work", GraphID: "g", NodeID: "work", ActivationID: "work@1",
+		ProgressContract: &profile.Contract}
+	checkpoint := loopcontract.ProgressCheckpoint{ExplorationTurnsSinceDeliverable: 5}
+	decision, intervention := decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if intervention != nil || !strings.Contains(decision.Reminder, progressDeliverableRequiredMarker) {
+		t.Fatalf("超过 exploration 上限必须强制交付: decision=%+v intervention=%+v", decision, intervention)
+	}
+	checkpoint = loopcontract.ProgressCheckpoint{NoProgressTurns: 18}
+	decision, intervention = decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if intervention != nil || decision.ObservationAction != "intervention_stalled" ||
+		!strings.Contains(decision.Reminder, observationCheckpointRequiredMarker) {
+		t.Fatalf("无 Observation 时 intervention 必须先 checkpoint: decision=%+v intervention=%+v", decision, intervention)
+	}
+	checkpoint.ObservationDeltaRef = "observation:sha256:test"
+	decision, intervention = decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if !decision.Intervention || intervention == nil || intervention.ObservationDeltaRef != checkpoint.ObservationDeltaRef {
+		t.Fatalf("有 Observation 后 intervention 必须携带引用: decision=%+v intervention=%+v", decision, intervention)
+	}
+}
+
+func TestCodeChangeV5KnowledgeNeverForcesDeliveryAndEighthTurnCheckpoints(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := catalog.ProgressContract(policycatalog.ProgressCodeChangeV5)
+	if !ok {
+		t.Fatal("缺少 code-change/v5")
+	}
+	task := replayGateTask("v5-long-investigation", nil)
+	task.ProgressContract = &profile.Contract
+	checkpoint := loopcontract.ProgressCheckpoint{ExplorationTurnsSinceDeliverable: 100,
+		KnowledgeTurnsSinceObservation: 7, InterventionStage: loopcontract.StageRunning}
+	decision, intervention := decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if decision.Reminder != "" || decision.ObservationAction != "" || intervention != nil {
+		t.Fatalf("前 7 个知识 turn 不得强制交卷/检查点: %+v %+v", decision, intervention)
+	}
+	checkpoint.KnowledgeTurnsSinceObservation = 8
+	decision, intervention = decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if decision.ObservationAction != "periodic" || decision.Intervention || decision.Rollover || intervention != nil ||
+		!strings.Contains(decision.Reminder, "不得提交终态") {
+		t.Fatalf("第 8 个知识 turn 只应触发非终态 Observation: %+v %+v", decision, intervention)
+	}
+	checkpoint.KnowledgeTurnsSinceObservation = 0
+	checkpoint.ObservationStagnationCount = profile.Contract.Policy.MaxObservationStagnation
+	checkpoint.ObservationDeltaRef = "observation:sha256:stale"
+	decision, intervention = decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if !decision.Intervention || decision.ObservationAction != "observation_stalled" || intervention == nil ||
+		intervention.ReasonCode != loopcontract.InterventionObservationStalled {
+		t.Fatalf("连续无语义前进的 Observation 必须转交 L5 recovery，不得继续刷新新证据: %+v %+v", decision, intervention)
+	}
+}
+
+func TestFinalReportForcesExactDeliveryAfterTwoEvidenceTurns(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := catalog.ProgressContract(policycatalog.ProgressFinalReportV1)
+	if !ok {
+		t.Fatal("缺少 final-report/v1")
+	}
+	task := &model.Task{ID: "final-report", EventType: "__scheduler__", EventSource: "graph-ended",
+		FinalReportGraphID: "g", ProgressContract: &profile.Contract}
+	checkpoint := loopcontract.ProgressCheckpoint{ExplorationTurnsSinceDeliverable: 2}
+	decision, intervention := decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if intervention != nil || !strings.Contains(decision.Reminder, progressDeliverableRequiredMarker) {
+		t.Fatalf("两个 evidence turn 后必须强制 report_done: decision=%+v intervention=%+v", decision, intervention)
+	}
+	delta := loopcontract.TurnSettlementDelta{}
+	projectExecuteResult(&Agent{Store: store.NewMemoryTaskStore(nil, 8, 1, 60)}, task, ExecuteResult{
+		ToolCalls:   []llm.ToolCall{{ID: "graph-read", Name: "read_graph", Arguments: map[string]any{"graph_id": "g"}}},
+		ToolResults: []ToolResult{{ToolCallID: "graph-read", Content: `{"graph_id":"g","status":"blocked"}`}},
+	}, &delta)
+	if len(delta.EvidenceChanges) != 1 || delta.EvidenceChanges[0].Kind != "read_graph" {
+		t.Fatalf("final-report Graph 读取必须成为 knowledge evidence: %+v", delta.EvidenceChanges)
 	}
 }
 

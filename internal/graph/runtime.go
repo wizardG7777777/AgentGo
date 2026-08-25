@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"agentgo/internal/fulfillment"
 	"agentgo/internal/runcontract"
 	"agentgo/internal/trace"
 )
@@ -102,7 +103,8 @@ type GraphTaskSnapshot struct {
 	// Evidence 是任务终态时随快照携带的可观察证据（由公告板桥按
 	// ToolCallRecord + Artifacts 组装）：恢复对账路径的 acceptance 谱系
 	// 核验与 feed 路径同构，凭它取得 verifier 自身证据。
-	Evidence []EvidenceEntry
+	Evidence    []EvidenceEntry
+	Fulfillment *fulfillment.Record
 }
 
 // TaskSpec 是一次节点任务发布的完整描述。
@@ -111,6 +113,7 @@ type TaskSpec struct {
 	DefinitionDigestVersion string
 	RunID                   runcontract.RunID
 	RunContract             *runcontract.RunContract
+	RunBudgetPermitRef      string
 	ProgressContractRef     string
 	ContextPolicyRef        string
 	NodeID                  string
@@ -142,6 +145,7 @@ type TaskSpec struct {
 	// path 条件节点恒为空串，任务桥不注入。
 	OutputContract      string
 	TypedOutputContract *NodeOutputContract
+	FulfillmentContract *fulfillment.Contract
 }
 
 // 节点类型 → 默认认领路由（runner event_type）的映射常量。
@@ -186,7 +190,8 @@ type TerminalFact struct {
 	// Evidence 是该任务终态时由回填方（bootstrap feed）从其 ToolCallRecord
 	// 与 Artifacts 组装的可观察证据条目；结算时随 Execution 持久化，
 	// 并经 EdgeInput.EvidenceRefs 进入下游输入谱系。非任务型节点恒空。
-	Evidence []EvidenceEntry
+	Evidence    []EvidenceEntry
+	Fulfillment *fulfillment.Record
 }
 
 // ToolExecutor 是 Graph Runtime 对工具执行能力的最小依赖（与 TaskBoard
@@ -264,6 +269,10 @@ type Runtime struct {
 	// 审批裁决无 durable 面可重建（审批网关以 requestID 幂等去重，恢复不
 	// 重发），必须内存暂存、解冻后回放，否则 waiting approval 节点永久悬挂。
 	pendingApprovals map[string]approvalDecision
+	// runBudgetGate 是跨 Task 的 Run 级可用额度权威。L5 只查询/预留
+	// execution 启动资格，不从 Task-local ProgressCheckpoint 猜测余额。
+	runBudgetGate   RunBudgetGate
+	runStartPermits RunStartPermitAuthority
 
 	// synchronousSteps 只统计一次外部 Runtime 调用中不会让出控制权的机械
 	// activation（router/join/end/tool）。它不是业务 activation 预算；任务型
@@ -271,6 +280,16 @@ type Runtime struct {
 	synchronousSteps int
 
 	mu sync.Mutex
+}
+
+// RunBudgetGate 是 L5 retry 可行性检查所需的最小 Run authority。
+type RunBudgetGate interface {
+	CanReserve(runcontract.RunID, runcontract.BudgetUsage, time.Time) error
+}
+
+type RunStartPermitAuthority interface {
+	ReserveExecutionPermit(runcontract.RunID, string, string, time.Time, time.Time) (string, error)
+	ValidateExecutionPermit(runcontract.RunID, string, time.Time) error
 }
 
 // NewRuntime 创建 Graph Runtime。board 可为 nil——仅当图真正需要发布任务
@@ -300,6 +319,16 @@ func (rt *Runtime) SetApprovalGateway(gw ApprovalGateway) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	rt.approval = gw
+}
+
+// SetRunBudgetGate 注入跨 Scheduler/Activation 共享的 Run 预算权威。
+func (rt *Runtime) SetRunBudgetGate(gate RunBudgetGate) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.runBudgetGate = gate
+	if permits, ok := gate.(RunStartPermitAuthority); ok {
+		rt.runStartPermits = permits
+	}
 }
 
 // SetSessionIDProvider 注入当前活跃 session 的取值器（构造后、使用前调用）；
@@ -361,6 +390,10 @@ func (rt *Runtime) submitGraphLocked(doc *GraphDocument) error {
 	if doc != nil && doc.SessionID == "" && rt.sessionIDProvider != nil {
 		doc.SessionID = rt.sessionIDProvider()
 	}
+	if err := rt.validateSingleTopLevelGraphLocked(doc); err != nil {
+		trace.Emit(trace.Event{Kind: trace.KindGraphSubmissionRejected, GraphID: graphID, Error: err.Error()})
+		return err
+	}
 	if err := rt.store.SubmitGraph(doc); err != nil {
 		trace.Emit(trace.Event{Kind: trace.KindGraphSubmissionRejected, GraphID: graphID, Error: err.Error()})
 		return err
@@ -381,6 +414,23 @@ func (rt *Runtime) submitGraphLocked(doc *GraphDocument) error {
 		}
 	}
 	return rt.activateLocked(graphID, stored.Root, nil)
+}
+
+func (rt *Runtime) validateSingleTopLevelGraphLocked(doc *GraphDocument) error {
+	if rt == nil || rt.store == nil || doc == nil || doc.RunID == "" || rt.runtimeGraphIsChildLocked(doc.GraphID) {
+		return nil
+	}
+	for _, candidate := range rt.store.List() {
+		if candidate.GraphID == doc.GraphID || rt.runtimeGraphIsChildLocked(candidate.GraphID) {
+			continue
+		}
+		existing, ok := rt.store.Get(candidate.GraphID)
+		if ok && existing.RunID != "" && existing.RunID == doc.RunID {
+			return fmt.Errorf("graph: Run %s 已存在顶层业务 Graph %s，禁止启动第二个顶层 Graph %s；恢复必须使用 GraphChangeProposal",
+				doc.RunID, existing.GraphID, doc.GraphID)
+		}
+	}
+	return nil
 }
 
 // OnTaskTerminal 以任务终态事实驱动转移求值（V6 §6-15/17）。
@@ -443,6 +493,20 @@ func (rt *Runtime) OnTaskTerminal(f TerminalFact) error {
 	if len(f.Evidence) > 0 {
 		exec.Evidence = appendEvidenceUnique(exec.Evidence, f.Evidence...)
 		hydrateExecutionEvidence(&exec)
+	}
+	if f.Status == NodeCompleted && activeNode.ProgressContractRef == "progress:code-change/v5" {
+		contract := &fulfillment.Contract{RequireWorkspaceChange: true, RequiredCheckIDs: []string{"verification"}}
+		if f.Fulfillment == nil || f.Fulfillment.Validate(contract) != nil {
+			reason := "contract_fulfillment_missing：mutating activation 缺少真实 workspace change 或晚于最后改动的 verification check"
+			result := make(map[string]any, len(f.Result)+3)
+			for key, value := range f.Result {
+				result[key] = value
+			}
+			result["status"] = string(NodeBlocked)
+			result["reason_code"] = "contract_fulfillment_missing"
+			result["blocked_reason"] = reason
+			return rt.settleNodeLocked(f.GraphID, f.NodeID, exec, NodeBlocked, result)
+		}
 	}
 
 	// acceptance 节点 completed 终态一律走引擎内生谱系核验（acceptance.go
@@ -736,7 +800,7 @@ func (rt *Runtime) evalTransitionsLocked(graphID, nodeID, activationID string, s
 	if node.Execution != nil && node.Execution.ActivationID == activationID {
 		node = nodeForExecution(node, *node.Execution)
 	}
-	if err := validateRecoveryRetryBudget(node, activationID, status, result); err != nil {
+	if err := rt.validateRecoveryRetryContract(graphID, doc, node, activationID, status, result); err != nil {
 		return errors.Join(rt.failGraph(graphID, err.Error()), err)
 	}
 	// 数据流绑定：本 activation 的完整证据与稳定 ResultRef 随每条生效边
@@ -783,7 +847,7 @@ func (rt *Runtime) evalTransitionsLocked(graphID, nodeID, activationID string, s
 			return err
 		}
 		if rec.ReplayInputs {
-			rec.ReplayedInputs, err = rt.recoveryReplayInputs(graphID, rec)
+			rec.ReplayedInputs, err = rt.recoveryReplayInputs(graphID, rec, result)
 			if err != nil {
 				return err
 			}
@@ -1035,7 +1099,7 @@ func (rt *Runtime) activateRecordedTransitionLocked(graphID string, rec Transiti
 	return rt.activateLockedWithReplay(graphID, rec.TargetNodeID, input, rec.ReplayedInputs)
 }
 
-func (rt *Runtime) recoveryReplayInputs(graphID string, rec TransitionRecord) ([]InputBinding, error) {
+func (rt *Runtime) recoveryReplayInputs(graphID string, rec TransitionRecord, result map[string]any) ([]InputBinding, error) {
 	doc, err := rt.graph(graphID)
 	if err != nil {
 		return nil, err
@@ -1065,7 +1129,29 @@ func (rt *Runtime) recoveryReplayInputs(graphID string, rec TransitionRecord) ([
 	if !ok || source.Execution == nil || source.Execution.ActivationID != failure.SourceActivationID {
 		return nil, fmt.Errorf("graph: recovery source activation %s 不再可解引用", failure.SourceActivationID)
 	}
-	return cloneInputBindings(source.Execution.Input), nil
+	replayed := cloneInputBindings(source.Execution.Input)
+	activeRecovery := nodeForExecution(recovery, *recovery.Execution)
+	if strings.TrimSpace(activeRecovery.Metadata[MetadataRecoveryDeltaSchema]) == RecoveryDeltaSchemaV1 {
+		delta, err := decodeRecoveryDelta(result)
+		if err != nil {
+			return nil, err
+		}
+		if _, definitionChanged := stringSet(delta.ChangedDimensions)["definition"]; definitionChanged {
+			return replayed, nil
+		}
+		raw, err := json.Marshal(delta)
+		if err != nil {
+			return nil, fmt.Errorf("graph: 编码 recovery_directive: %w", err)
+		}
+		replayed = append(replayed, InputBinding{
+			SourceNodeID: rec.SourceNodeID, SourceActivationID: rec.SourceActivationID,
+			TargetInput: "recovery_directive",
+			Summary: fmt.Sprintf("strategy=%s first_action=%s milestone=%s",
+				delta.Strategy, delta.FirstRequiredAction, delta.ExpectedMilestone),
+			Result: raw,
+		})
+	}
+	return replayed, nil
 }
 
 // ResumeGraph 在进程重启后恢复一张图的执行（Store.Recover 完成后调用）：
@@ -2636,6 +2722,15 @@ func (rt *Runtime) taskSpecFor(graphID, nodeID string, node Node, exec Execution
 			spec.Inputs[i].Result = append(json.RawMessage(nil), stored.Result...)
 		}
 	}
+	for _, input := range spec.Inputs {
+		if input.TargetInput != "recovery_directive" || len(input.Result) == 0 {
+			continue
+		}
+		var delta RecoveryDelta
+		if json.Unmarshal(input.Result, &delta) == nil && strings.TrimSpace(delta.StartPermitRef) != "" {
+			spec.RunBudgetPermitRef = delta.StartPermitRef
+		}
+	}
 	if node.Kind == KindAcceptance {
 		spec.MissingEvidence = rt.missingEvidenceRequirements(graphID, exec, spec.RequiredEvidence)
 	}
@@ -2667,6 +2762,11 @@ func taskSpecFor(graphID, nodeID string, node Node, exec Execution) TaskSpec {
 		spec.Title = effective.Task.Title
 		spec.Description = effective.Task.Description
 		spec.RequiredEvidence = append([]EvidenceRequirement(nil), effective.Task.RequiredEvidence...)
+	}
+	if effective.ProgressContractRef == "progress:code-change/v5" {
+		spec.FulfillmentContract = &fulfillment.Contract{
+			RequireWorkspaceChange: true, RequiredCheckIDs: []string{"verification"},
+		}
 	}
 	if c := effective.Capability; c != nil {
 		spec.Tools = c.Tools
@@ -2749,7 +2849,8 @@ func (rt *Runtime) reconcileTaskLocked(graphID, nodeID string, node Node, exec E
 	fact := TerminalFact{
 		GraphID: graphID, NodeID: nodeID, ActivationID: exec.ActivationID,
 		TaskID: taskID, Status: snapshot.TerminalStatus, Result: snapshot.Result,
-		Evidence: snapshot.Evidence,
+		Evidence:    snapshot.Evidence,
+		Fulfillment: snapshot.Fulfillment,
 	}
 	if node.Status == NodeReady {
 		if err := rt.writeNode(graphID, nodeID, exec, NodeRunning); err != nil {

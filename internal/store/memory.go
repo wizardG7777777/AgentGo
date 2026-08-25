@@ -427,6 +427,7 @@ func validatePublishedTaskContracts(task *model.Task, now time.Time) error {
 		}
 	}
 	hasRunBinding := task.RunID != "" || task.RunContract != nil || task.RunPhase != "" ||
+		strings.TrimSpace(task.RunBudgetPermitRef) != "" ||
 		strings.TrimSpace(task.ContextPolicyRef) != "" || task.ProgressContract != nil
 	if !hasRunBinding {
 		if task.GraphDefinitionDigestVersion != "" {
@@ -1783,15 +1784,16 @@ func (s *MemoryTaskStore) QueryToolCalls(taskID string, toolName string) ([]Tool
 // 其余 durable 内容打破平局。JSON 对 string-key map 的编码顺序稳定。
 func toolCallOrderingKey(rec ToolCallRecord) string {
 	payload := struct {
-		CallID   string         `json:"call_id,omitempty"`
-		AgentID  string         `json:"agent_id,omitempty"`
-		ToolName string         `json:"tool_name"`
-		Args     map[string]any `json:"args,omitempty"`
-		Success  bool           `json:"success"`
-		ExitCode *int           `json:"exit_code,omitempty"`
+		CallID        string             `json:"call_id,omitempty"`
+		AgentID       string             `json:"agent_id,omitempty"`
+		ToolName      string             `json:"tool_name"`
+		Args          map[string]any     `json:"args,omitempty"`
+		Success       bool               `json:"success"`
+		ExitCode      *int               `json:"exit_code,omitempty"`
+		ExitCodeScope ShellExitCodeScope `json:"exit_code_scope,omitempty"`
 	}{
 		CallID: rec.CallID, AgentID: rec.AgentID, ToolName: rec.ToolName,
-		Args: rec.Args, Success: rec.Success, ExitCode: rec.ExitCode,
+		Args: rec.Args, Success: rec.Success, ExitCode: rec.ExitCode, ExitCodeScope: rec.ExitCodeScope,
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -2024,8 +2026,10 @@ func (s *MemoryTaskStore) ExportSnapshot() []session.TaskSnapshot {
 			RunID:                        task.RunID,
 			RunContract:                  cloneRunContract(task.RunContract),
 			RunPhase:                     task.RunPhase,
+			RunBudgetPermitRef:           task.RunBudgetPermitRef,
 			ProgressContract:             cloneProgressContract(task.ProgressContract),
 			ContextPolicyRef:             task.ContextPolicyRef,
+			FulfillmentContract:          cloneFulfillmentContract(task.FulfillmentContract),
 			AttemptID:                    task.AttemptID,
 			AttemptNo:                    task.AttemptNo,
 			Description:                  task.Description,
@@ -2068,6 +2072,7 @@ func (s *MemoryTaskStore) ExportSnapshot() []session.TaskSnapshot {
 			GraphNodeKind:                task.GraphNodeKind,
 			GraphControllerRole:          task.GraphControllerRole,
 			RecoverySourceTaskID:         task.RecoverySourceTaskID,
+			FinalReportGraphID:           task.FinalReportGraphID,
 			OutcomeRef:                   task.OutcomeRef,
 			GraphDefinitionDigestVersion: task.GraphDefinitionDigestVersion,
 			RouteScope:                   task.RouteScope,
@@ -2176,8 +2181,10 @@ func (s *MemoryTaskStore) importSnapshotLocked(tasks []session.TaskSnapshot) err
 			RunID:                        snap.RunID,
 			RunContract:                  cloneRunContract(snap.RunContract),
 			RunPhase:                     snap.RunPhase,
+			RunBudgetPermitRef:           snap.RunBudgetPermitRef,
 			ProgressContract:             cloneProgressContract(snap.ProgressContract),
 			ContextPolicyRef:             snap.ContextPolicyRef,
+			FulfillmentContract:          cloneFulfillmentContract(snap.FulfillmentContract),
 			AttemptID:                    snap.AttemptID,
 			AttemptNo:                    snap.AttemptNo,
 			Description:                  snap.Description,
@@ -2220,6 +2227,7 @@ func (s *MemoryTaskStore) importSnapshotLocked(tasks []session.TaskSnapshot) err
 			GraphNodeKind:                snap.GraphNodeKind,
 			GraphControllerRole:          snap.GraphControllerRole,
 			RecoverySourceTaskID:         snap.RecoverySourceTaskID,
+			FinalReportGraphID:           snap.FinalReportGraphID,
 			OutcomeRef:                   snap.OutcomeRef,
 			GraphDefinitionDigestVersion: snap.GraphDefinitionDigestVersion,
 			RouteScope:                   snap.RouteScope,
@@ -2535,17 +2543,18 @@ func exportToolCallSnapshots(byTool map[string][]ToolCallRecord) []session.ToolC
 			timestamp = record.Timestamp.UTC().Format(time.RFC3339Nano)
 		}
 		out[i] = session.ToolCallSnapshot{
-			Timestamp: timestamp,
-			RunID:     record.RunID,
-			AttemptID: record.AttemptID,
-			TurnID:    record.TurnID,
-			ActionID:  record.ActionID,
-			CallID:    record.CallID,
-			AgentID:   record.AgentID,
-			ToolName:  record.ToolName,
-			Args:      cloneToolArgs(record.Args),
-			Success:   record.Success,
-			ExitCode:  cloneIntPointer(record.ExitCode),
+			Timestamp:     timestamp,
+			RunID:         record.RunID,
+			AttemptID:     record.AttemptID,
+			TurnID:        record.TurnID,
+			ActionID:      record.ActionID,
+			CallID:        record.CallID,
+			AgentID:       record.AgentID,
+			ToolName:      record.ToolName,
+			Args:          cloneToolArgs(record.Args),
+			Success:       record.Success,
+			ExitCode:      cloneIntPointer(record.ExitCode),
+			ExitCodeScope: string(record.ExitCodeScope),
 		}
 	}
 	return out
@@ -2560,6 +2569,12 @@ func importToolCallSnapshots(snapshots []session.ToolCallSnapshot) (map[string][
 		if snapshot.ToolName == "" {
 			return nil, fmt.Errorf("tool call %d has empty tool_name", i)
 		}
+		exitScope := ShellExitCodeScope(snapshot.ExitCodeScope)
+		switch exitScope {
+		case "", ShellExitCodeScopeWholeCommand, ShellExitCodeScopeLastPipelineCommand:
+		default:
+			return nil, fmt.Errorf("tool call %d exit_code_scope=%q 无效", i, snapshot.ExitCodeScope)
+		}
 		timestamp := time.Time{}
 		var err error
 		if snapshot.Timestamp != "" {
@@ -2569,17 +2584,18 @@ func importToolCallSnapshots(snapshots []session.ToolCallSnapshot) (map[string][
 			}
 		}
 		record := ToolCallRecord{
-			Timestamp: timestamp,
-			RunID:     snapshot.RunID,
-			AttemptID: snapshot.AttemptID,
-			TurnID:    snapshot.TurnID,
-			ActionID:  snapshot.ActionID,
-			CallID:    snapshot.CallID,
-			AgentID:   snapshot.AgentID,
-			ToolName:  snapshot.ToolName,
-			Args:      cloneToolArgs(snapshot.Args),
-			Success:   snapshot.Success,
-			ExitCode:  cloneIntPointer(snapshot.ExitCode),
+			Timestamp:     timestamp,
+			RunID:         snapshot.RunID,
+			AttemptID:     snapshot.AttemptID,
+			TurnID:        snapshot.TurnID,
+			ActionID:      snapshot.ActionID,
+			CallID:        snapshot.CallID,
+			AgentID:       snapshot.AgentID,
+			ToolName:      snapshot.ToolName,
+			Args:          cloneToolArgs(snapshot.Args),
+			Success:       snapshot.Success,
+			ExitCode:      cloneIntPointer(snapshot.ExitCode),
+			ExitCodeScope: exitScope,
 		}
 		byTool[record.ToolName] = append(byTool[record.ToolName], record)
 	}

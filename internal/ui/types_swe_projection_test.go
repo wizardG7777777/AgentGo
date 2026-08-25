@@ -23,6 +23,13 @@ func TestBoardTaskFromModelProjectsSafeSWEIdentity(t *testing.T) {
 		got.GraphControllerRole != "loop_recovery" || got.RecoverySourceTaskID != "work-task" {
 		t.Fatalf("SWE 安全身份投影不完整: %+v", got)
 	}
+	report := BoardTaskFromModel(model.Task{
+		ID: "report", EventType: "__scheduler__", EventSource: "graph-ended",
+		FinalReportGraphID: "graph-report",
+	})
+	if report.FinalReportGraphID != "graph-report" {
+		t.Fatalf("final-report scope 投影丢失: %+v", report)
+	}
 	data, err := json.Marshal(got)
 	if err != nil {
 		t.Fatal(err)

@@ -322,6 +322,7 @@ func (s *Store) CommitIntent(intentRef string, finalCandidate outcome.TaskOutcom
 	}
 	base := intent.Intent.Candidate
 	base.CheckpointRef = normalized.CheckpointRef
+	base.ObservationDeltaRef = normalized.ObservationDeltaRef
 	base.CheckpointState = normalized.CheckpointState
 	base.CommittedAt = normalized.CommittedAt
 	baseNormalized, err := normalizeOutcome(base)

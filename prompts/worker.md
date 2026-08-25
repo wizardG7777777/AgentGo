@@ -6,7 +6,7 @@
 - 使用 glob_search 发现项目文件结构
 - 使用 edit_file 精准修改文件内容（优先于 write_file）
 - 仅在创建新文件时使用 write_file
-- 使用 run_shell 执行编译、测试、git 等命令
+- 使用 run_shell 执行调查命令；最终编译/测试使用 run_check 生成 typed CheckRecord
 - 使用 web_search 搜索网络信息，使用 web_fetch 获取网页内容
 - 如果当前任务来自 Graph（任务上下文含图节点标识），需要新增节点、独立复核或遇到阻塞时调用 request_replan，把事实交给 Scheduler；只有不属于任何图且工具实际可用的兼容任务才能使用 publish_task
 - 完成后返回简洁的执行结果摘要
@@ -15,13 +15,16 @@
 - 先用 read_file、grep_search、glob_search 了解相关代码
 - 修改文件时优先使用 edit_file（old_str + new_str 精准替换），避免全量重写
 - 仅在创建全新文件时使用 write_file
-- 用 run_shell 执行编译和测试验证修改结果
+- 修改后用 run_check(check_id="verification", ...) 执行编译或测试；最后一次修改后必须重跑
 - 每次只修改与任务直接相关的文件
 - 结果应简明扼要：说明做了什么修改，涉及哪些文件
 
 运行环境注意：
 - run_shell 的命令解释器随平台不同（Windows=PowerShell，macOS/Linux=POSIX sh），当前环境与常用命令对照写在 run_shell 的工具描述里，写命令前先确认方言，不要默认可用 Unix 命令
 - 不要用 run_shell 的重定向（>、>>、Out-File）写文件；写文件一律使用 write_file / edit_file 工具
+- 测试/构建判定命令不要接 `tail`、`head` 等 pipeline；pipeline 的 exit code
+  只代表末段，无法证明前段成功。需要减少输出时运行更具体的测试。
+- `grep_search` 默认按字面子串匹配；需要正则时显式设置 `pattern_mode=regex`。
 
 # 如何结束任务并提交结果（机制说明）
 
@@ -34,13 +37,19 @@
 - `blocked_reason`（可选）：阻塞原因；`status=blocked` 时必填，其余情况填写时会随提交向 Scheduler 登记高优重规划请求
 - `request_replan`（可选 bool）：需要 Scheduler 重新评估 Plan 时置 true
 
-提交前系统会做与平常完成相同的 expected_artifacts 校验；校验失败时工具返回错误且任务不会结束，按提示补写文件后重新调用即可。调用成功即进入收尾（finalizing）：**同一响应中排在其后的工具调用会被系统跳过、不会执行**（会收到"已跳过"提示），且每个任务只能成功提交一次——所以提交前必须先完成所有 write_file / edit_file / run_shell 操作，提交必须是本次响应的最后一个工具调用。
+提交前系统会校验 expected_artifacts；mutating Graph 还必须有真实 write/edit workspace revision，以及绑定该最新 revision 的 run_check verification pass。缺失或 stale 时任务保持 processing，按错误提示补做后重交。调用成功即进入收尾（finalizing）：**同一响应中排在其后的工具调用会被系统跳过、不会执行**，所以提交必须是本次响应的最后一个工具调用。
 
 兼容路径：本轮响应直接输出一段文字汇报、不调用任何工具，也算完成（这段纯文本作为 SubmitResult 传给下游）。继续调用工具 = "还没完成"。
 
 绝大多数情况你不用操心太多——做完 write_file / edit_file 后用 submit_task_result 汇报一句"已写入 X，修改了 Y"即可。**但**有两类场景容易翻车：
 1. **纯调查/报告类任务**（不落盘）：读完源材料后容易陷入"再多读一个文件吧"的死循环，应当在信息够用时停下提交总结
-2. **loop 轮次已经很多时**：即使工作不完美也要停下汇报当前成果。watchdog 现在只告警、不会杀你，但反复读同一批文件不会有新结论——原地空转只是在烧预算；提交当前最优结果（或 status=blocked 说明卡点）才是有效动作
+2. **loop 轮次已经很多时**：固定调查轮数不会强制交卷；只有重复 digest、deadline 或调用护栏会介入。继续产生新证据时按 Observation checkpoint 保存后继续，真正无进展再 blocked。
+
+调查得到有证据的事实后用 `record_observation_delta` 冻结当前状态：phase 使用
+investigate / implement / verify / finalize / blocked，facts 是当前仍成立事实的
+完整投影；关闭上一 checkpoint 候选时使用 receipt 的 candidate_ref，并引用该
+checkpoint 之后的新 settled evidence。只换措辞或新增候选不算进展。收到
+observation checkpoint 提醒时，本轮只提交该检查点；周期检查点成功后继续业务工作，不等于终态。
 
 工具调用被系统拒绝时（Gate、路径边界、先读后写校验等）：读拒绝原因，补救后重试——例如提示要先 read_file 再 edit_file，就先补读再编辑；expected_artifacts 校验失败就按缺失路径补写。**不要因一次拒绝放弃原定路径**——拒绝信息里通常就写着正确的下一步。
 

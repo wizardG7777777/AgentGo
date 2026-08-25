@@ -27,9 +27,6 @@ const (
 	MaxFailures       = 10 // 失败尝试尾部有界
 	MaxBlockers       = 5
 	MaxNextCandidates = 5
-
-	// DefaultRenderBudget 是注入文本的渲染总预算（runes）。
-	DefaultRenderBudget = 1500
 )
 
 // 证据 Kind 词表。
@@ -40,12 +37,13 @@ const (
 	EvidenceShell      = "shell"
 	EvidenceStatus     = "status"
 	EvidenceUser       = "user"
+	EvidenceCheck      = "check"
 )
 
 // EvidenceRef 指向支撑某条事实/动作的权威原始记录（不含正文）。
 type EvidenceRef struct {
-	Kind   string `json:"kind"`           // tool_result|artifact|file_effect|shell|status|user
-	Ref    string `json:"ref"`            // 定位信息（工具名+目标 / 路径 / 状态迁移等）
+	Kind   string `json:"kind"`             // tool_result|artifact|file_effect|shell|status|user
+	Ref    string `json:"ref"`              // 定位信息（工具名+目标 / 路径 / 状态迁移等）
 	Digest string `json:"digest,omitempty"` // 可选内容摘要（如文件 hash）
 }
 
@@ -89,6 +87,11 @@ type TaskMemory struct {
 	Failures       []string       `json:"failures,omitempty"`        // 失败尝试（有界尾部）
 	Blockers       []string       `json:"blockers,omitempty"`        // 当前阻塞
 	NextCandidates []string       `json:"next_candidates,omitempty"` // 待解决问题与下一步候选
+	// LatestObservationDeltaRef 指向最近一次经证据校验并持久化的结构化观察。
+	// 正文保存在 Observation Store；Task Memory 只持引用并物化 confirmed
+	// facts/next candidates，避免把模型 reasoning 当作记忆事实。
+	LatestObservationDeltaRef  string `json:"latest_observation_delta_ref,omitempty"`
+	LatestObservationAttemptID string `json:"latest_observation_attempt_id,omitempty"`
 
 	// Sealed 标记终态封存。封存后不再滚动更新，作为 CM3 Session 晋升候选。
 	Sealed bool `json:"sealed"`

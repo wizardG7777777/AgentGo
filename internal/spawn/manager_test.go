@@ -201,7 +201,7 @@ func TestManagerSpawnRejectsOversizedPromptBeforeRunner(t *testing.T) {
 	}}, fakeLLMFactory, tasks)
 	_, _, err = m.Spawn(context.Background(), SpawnRequest{
 		BaseKind: "explorer", InitialTaskDescription: "检查",
-		Override: RuntimeOverride{SystemPromptSet: true, SystemPrompt: strings.Repeat("策", 22<<10)},
+		Override: RuntimeOverride{SystemPromptSet: true, SystemPrompt: strings.Repeat("策", 1_100_000)},
 	})
 	if err == nil || !strings.Contains(err.Error(), "L1/L2 runtime contract") ||
 		!strings.Contains(err.Error(), "fragment_limit_exceeded") {

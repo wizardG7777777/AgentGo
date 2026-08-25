@@ -26,6 +26,7 @@ var AllToolNames = []string{
 
 	// ShellGroup
 	"run_shell",
+	"run_check",
 
 	// MetaGroup
 	"publish_task",
@@ -35,6 +36,8 @@ var AllToolNames = []string{
 	// PlanControlGroup（是否可见由 profile/内置 Scheduler 装配决定）
 	"submit_task_result",
 	"request_replan",
+	"record_observation_delta",
+	"submit_recovery_decision",
 
 	// SchedulerGroup（scheduler 专属，不走 profile 配置）
 	"cancel_task",

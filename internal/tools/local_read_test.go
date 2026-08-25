@@ -476,6 +476,31 @@ func TestGrepSearch_EmptyResult_HintsDiagnostics(t *testing.T) {
 	}
 }
 
+func TestGrepSearchPatternModeLiteralAndRegex(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "sample.txt"), []byte("alpha\nbeta\ngamma\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	group := LocalReadGroup{Workdir: &DefaultWorkdir{ProjectRoot: dir}}
+	literal, err := group.grepSearch(context.Background(), map[string]any{
+		"path": ".", "pattern": "alpha|beta", "pattern_mode": "literal",
+	})
+	if err != nil || !strings.Contains(literal, "未找到") {
+		t.Fatalf("literal 的 | 不得作为 alternation: %q err=%v", literal, err)
+	}
+	regex, err := group.grepSearch(context.Background(), map[string]any{
+		"path": ".", "pattern": "alpha|beta", "pattern_mode": "regex",
+	})
+	if err != nil || !strings.Contains(regex, "alpha") || !strings.Contains(regex, "beta") {
+		t.Fatalf("regex alternation 未生效: %q err=%v", regex, err)
+	}
+	if _, err := group.grepSearch(context.Background(), map[string]any{
+		"path": ".", "pattern": "[", "pattern_mode": "regex",
+	}); err == nil || !strings.Contains(err.Error(), "invalid_regex") {
+		t.Fatalf("非法 regex 必须 typed fail-closed: %v", err)
+	}
+}
+
 // TestGlobSearch_EmptyResult_HintsDiagnostics 对称覆盖 glob_search 空结果契约。
 func TestGlobSearch_EmptyResult_HintsDiagnostics(t *testing.T) {
 	tmp := t.TempDir()
@@ -655,14 +680,14 @@ func TestGlobSearch_Empty_DidYouMean(t *testing.T) {
 	}
 }
 
-// TestReadFile_TruncationNotice 验证 10000 字符截断时附带元数据公告
+// TestReadFile_TruncationNotice 验证 64 Ki 字符截断时附带元数据公告
 // （2026-07-22 闸 2）：本段原大小 + 续读行号指引。
 func TestReadFile_TruncationNotice(t *testing.T) {
 	tmp := t.TempDir()
 	fp := filepath.Join(tmp, "big.txt")
-	// 200 行 × 100 字符 = 20000 字符，必然触发截断。
+	// 1000 行 × 100 字符 = 100000 字符，必然触发截断。
 	var sb strings.Builder
-	for i := 0; i < 200; i++ {
+	for i := 0; i < 1000; i++ {
 		sb.WriteString(strings.Repeat("x", 99) + "\n")
 	}
 	if err := os.WriteFile(fp, []byte(sb.String()), 0o644); err != nil {
@@ -674,7 +699,7 @@ func TestReadFile_TruncationNotice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"[truncated to 10000 chars]", "已截断：本段原 20000 字符", "用 offset=", "续读"} {
+	for _, want := range []string{"[truncated to 65536 chars]", "已截断：本段原 100000 字符", "用 offset=", "续读"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("截断公告缺少 %q:\n%s", want, out[len(out)-300:])
 		}

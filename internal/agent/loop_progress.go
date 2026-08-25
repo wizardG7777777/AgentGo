@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -11,12 +12,16 @@ import (
 	"time"
 
 	"agentgo/internal/effect"
+	"agentgo/internal/graph"
 	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/loopprogress"
 	"agentgo/internal/model"
+	"agentgo/internal/policycatalog"
+	"agentgo/internal/runbudget"
 	"agentgo/internal/runcontract"
+	"agentgo/internal/store"
 )
 
 const (
@@ -25,12 +30,18 @@ const (
 )
 
 type loopProgressRuntime struct {
-	store         loopProgressStore
-	contract      loopcontract.CompiledProgressContract
-	runBudget     runcontract.BudgetLimit
-	checkpoint    loopcontract.ProgressCheckpoint
-	turnActions   map[string][]string
-	turnToolUsage map[string]runcontract.BudgetUsage
+	store               loopProgressStore
+	contract            loopcontract.CompiledProgressContract
+	activationBudget    runcontract.BudgetLimit
+	runBudgets          *runbudget.Store
+	runPhase            runbudget.Phase
+	checkpoint          loopcontract.ProgressCheckpoint
+	turnActions         map[string][]string
+	turnToolUsage       map[string]runcontract.BudgetUsage
+	turnRunReservations map[string]string
+	turnRunCallPermits  map[string]string
+	startPermitRef      string
+	startPermitClaimed  bool
 }
 
 // loopProgressStore 是 Agent 需要的最小 L4 authority 端口；*loopstore.Store
@@ -49,10 +60,11 @@ type loopProgressStore interface {
 }
 
 type toolActionHandle struct {
-	ActionID      string
-	ReservationID string
-	TurnID        string
-	StartedAt     time.Time
+	ActionID         string
+	ReservationID    string
+	RunReservationID string
+	TurnID           string
+	StartedAt        time.Time
 }
 
 type toolActionBoundary interface {
@@ -83,15 +95,30 @@ func (a *Agent) initLoopProgress(task *model.Task) (*loopProgressRuntime, error)
 	if err := task.ProgressContract.Validate(); err != nil {
 		return nil, fmt.Errorf("CompiledProgressContract 无效: %w", err)
 	}
+	if task.ProgressContract.RunBudgetRef == loopcontract.RunBudgetRefRunIDV1 && a.RunBudgetStore == nil {
+		return nil, fmt.Errorf("RunBudgetRef=%s 但 RunBudgetStore 未装配", task.ProgressContract.RunBudgetRef)
+	}
 
 	profileBudget := task.ProgressContract.Policy.MaxNoProgressUsage
-	if frameworkBudget, ok := runcontract.FrameworkBudgetProfile(task.RunContract.BudgetProfile); ok {
+	if frameworkBudget, ok := runcontract.FrameworkActivationBudgetProfile(task.RunContract.BudgetProfile); ok {
 		profileBudget = frameworkBudget
+	}
+	if a.RunBudgetStore != nil {
+		// RunContract.Budget 的可累加资源维度属于 Run 全局；wall_time 已由
+		// 绝对 deadline 执法，Attempts 属于当前 Activation 的 rollover。
+		globalLimit := task.RunContract.Budget
+		globalLimit.WallTime = 0
+		globalLimit.Attempts = 0
+		if err := a.RunBudgetStore.InitializeRun(*task.RunContract, globalLimit); err != nil {
+			return nil, fmt.Errorf("初始化 RunBudget authority: %w", err)
+		}
 	}
 	runtime := &loopProgressRuntime{
 		store: a.LoopStore, contract: *task.ProgressContract,
-		runBudget:   effectiveRunBudget(task.RunContract.Budget, profileBudget),
+		activationBudget: profileBudget, runBudgets: a.RunBudgetStore, runPhase: runBudgetPhase(task),
 		turnActions: make(map[string][]string), turnToolUsage: make(map[string]runcontract.BudgetUsage),
+		turnRunReservations: make(map[string]string), turnRunCallPermits: make(map[string]string),
+		startPermitRef: task.RunBudgetPermitRef,
 	}
 	checkpoint, ok, err := a.LoopStore.LoadCheckpoint(task.ID)
 	if err != nil {
@@ -129,15 +156,17 @@ func (a *Agent) initLoopProgress(task *model.Task) (*loopProgressRuntime, error)
 		return nil, fmt.Errorf("恢复的 ProgressCheckpoint lineage/contract 与 Task 不一致")
 	}
 	if checkpoint.AttemptID != task.AttemptID {
-		if runtime.runBudget.Attempts > 0 && checkpoint.CumulativeUsage.Attempts >= runtime.runBudget.Attempts {
-			return nil, fmt.Errorf("Run attempts 预算已耗尽，不能创建新 Attempt: used=%d limit=%d",
-				checkpoint.CumulativeUsage.Attempts, runtime.runBudget.Attempts)
+		if runtime.activationBudget.Attempts > 0 && checkpoint.CumulativeUsage.Attempts >= runtime.activationBudget.Attempts {
+			return nil, fmt.Errorf("Activation attempts 预算已耗尽，不能创建新 Attempt: used=%d limit=%d",
+				checkpoint.CumulativeUsage.Attempts, runtime.activationBudget.Attempts)
 		}
 		rollover := *checkpoint
 		rollover.Version++
 		rollover.CheckpointID = stableLoopID("checkpoint", task.ID, task.AttemptID,
 			fmt.Sprintf("%d", rollover.Version))
 		rollover.AttemptID = task.AttemptID
+		rollover.ObservationDeltaRef = ""
+		rollover.ObservationAttemptID = ""
 		rollover.AttemptRolloverCount++
 		usage, addErr := rollover.CumulativeUsage.Add(runcontract.BudgetUsage{Attempts: 1})
 		if addErr != nil {
@@ -153,9 +182,9 @@ func (a *Agent) initLoopProgress(task *model.Task) (*loopProgressRuntime, error)
 		checkpoint = &rollover
 	}
 	runtime.checkpoint = *checkpoint
-	if runtime.runBudget.Attempts > 0 && runtime.checkpoint.CumulativeUsage.Attempts > runtime.runBudget.Attempts {
-		return nil, fmt.Errorf("Run attempts 预算已耗尽: used=%d limit=%d",
-			runtime.checkpoint.CumulativeUsage.Attempts, runtime.runBudget.Attempts)
+	if runtime.activationBudget.Attempts > 0 && runtime.checkpoint.CumulativeUsage.Attempts > runtime.activationBudget.Attempts {
+		return nil, fmt.Errorf("Activation attempts 预算已耗尽: used=%d limit=%d",
+			runtime.checkpoint.CumulativeUsage.Attempts, runtime.activationBudget.Attempts)
 	}
 	return runtime, nil
 }
@@ -168,7 +197,7 @@ func (a *Agent) futureAttemptBudgetAvailable(task *model.Task) (bool, int64, int
 		return true, 0, 0, nil
 	}
 	profileBudget := task.ProgressContract.Policy.MaxNoProgressUsage
-	if frameworkBudget, ok := runcontract.FrameworkBudgetProfile(task.RunContract.BudgetProfile); ok {
+	if frameworkBudget, ok := runcontract.FrameworkActivationBudgetProfile(task.RunContract.BudgetProfile); ok {
 		profileBudget = frameworkBudget
 	}
 	limit := effectiveRunBudget(task.RunContract.Budget, profileBudget).Attempts
@@ -214,6 +243,34 @@ func (a *Agent) requestAttemptBudgetIntervention(task *model.Task) error {
 	return a.LoopStore.AppendIntervention(next, command)
 }
 
+// requestInvocationIntervention 把 Invocation policy 的
+// RecoveryRequestIntervene 落成与 no-progress 同一条 durable L4→L5 命令。
+// canonical failure 已随刚结算的 TurnSettlementDelta 冻结；command 通过
+// CheckpointRef 关联该失败事实，不复制 provider 原文。
+func (a *Agent) requestInvocationIntervention(task *model.Task) error {
+	if a == nil || task == nil || task.ProgressContract == nil || a.LoopStore == nil {
+		return fmt.Errorf("Invocation intervention 缺少 ProgressContract/LoopStore")
+	}
+	checkpoint, ok, err := a.LoopStore.LoadCheckpoint(task.ID)
+	if err != nil {
+		return err
+	}
+	if !ok || checkpoint == nil || checkpoint.AttemptID != task.AttemptID || checkpoint.Sealed {
+		return fmt.Errorf("Invocation intervention checkpoint 不可用或 lineage 不一致")
+	}
+	now := time.Now().UTC()
+	next := *checkpoint
+	next.Version++
+	next.CheckpointID = stableLoopID("checkpoint", task.ID, task.AttemptID,
+		fmt.Sprintf("%d-invocation-intervention", next.Version))
+	next.InterventionStage = loopcontract.StageInterventionRequired
+	next.InterventionCount++
+	next.LastInterventionAt = now
+	next.UpdatedAt = now
+	command := buildLoopIntervention(*task.ProgressContract, task, next, loopcontract.InterventionUnsafeUnknown)
+	return a.LoopStore.AppendIntervention(next, command)
+}
+
 func loopDeadlineSet(task *model.Task, now time.Time) (loopcontract.DeadlineSet, error) {
 	compiled, err := runcontract.CompileDeadlines(runcontract.DeadlineCompileInput{
 		Contract: *task.RunContract, Phase: task.RunPhase, Graph: task.GraphID != "", Now: now,
@@ -237,24 +294,77 @@ func (r *loopProgressRuntime) reserveModelAction(turnID string) (string, time.Ti
 		return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("没有足够时间预留下一次 model action")
 	}
 	actionID := stableLoopID("action", r.checkpoint.TaskID, r.checkpoint.AttemptID, turnID, "model")
-	remaining := remainingBudget(r.runBudget, r.checkpoint.CumulativeUsage)
-	if r.runBudget.ModelCalls > 0 && remaining.ModelCalls <= 0 {
-		return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Run model_calls 预算已耗尽")
+	useStartPermit := r.runBudgets != nil && r.startPermitRef != "" && !r.startPermitClaimed
+	if useStartPermit {
+		if err := r.runBudgets.ClaimExecutionPermit(r.checkpoint.RunID, r.startPermitRef,
+			actionID, r.checkpoint.TaskID, r.checkpoint.AttemptID, now); err != nil {
+			return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("认领 RecoveryStartPermit: %w", err)
+		}
+		r.startPermitClaimed = true
 	}
-	if r.runBudget.WallTime > 0 && remaining.WallTime <= 0 {
-		return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Run wall_time 预算已耗尽")
+	remaining := remainingBudget(r.activationBudget, r.checkpoint.CumulativeUsage)
+	if r.activationBudget.ModelCalls > 0 && remaining.ModelCalls <= 0 {
+		return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Activation model_calls 预算已耗尽")
+	}
+	if r.activationBudget.WallTime > 0 && remaining.WallTime <= 0 {
+		return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Activation wall_time 预算已耗尽")
 	}
 	promptLimit := remaining.PromptTokens
-	if promptLimit <= 0 && r.runBudget.PromptTokens > 0 {
-		return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Run prompt_tokens 预算已耗尽")
+	if promptLimit <= 0 && r.activationBudget.PromptTokens > 0 {
+		return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Activation prompt_tokens 预算已耗尽")
 	} else if promptLimit <= 0 {
 		promptLimit = defaultModelPromptReservation
 	}
 	completionLimit := remaining.CompletionTokens
-	if completionLimit <= 0 && r.runBudget.CompletionTokens > 0 {
-		return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Run completion_tokens 预算已耗尽")
+	if completionLimit <= 0 && r.activationBudget.CompletionTokens > 0 {
+		return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Activation completion_tokens 预算已耗尽")
 	} else if completionLimit <= 0 {
 		completionLimit = defaultModelCompletionReservation
+	}
+	if r.runBudgets != nil && r.runPhase == runbudget.PhaseExecution {
+		global, ok, err := r.runBudgets.Snapshot(r.checkpoint.RunID)
+		if err != nil {
+			return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("读取 RunBudget ledger: %w", err)
+		}
+		if !ok {
+			return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("读取 RunBudget ledger: RunID=%s 不存在", r.checkpoint.RunID)
+		}
+		used := global.PhaseSettled[runbudget.PhaseExecution]
+		// Snapshot.Reserved 是总量；精确 execution reservation 由 Store.Reserve
+		// 的原子检查兜底。这里仅用于把显式 token 余额下传 OutputBudget。
+		globalRemaining := remainingBudget(global.Limit, used)
+		if !useStartPermit && global.Limit.ModelCalls > 0 && globalRemaining.ModelCalls <= 0 {
+			return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Run model_calls 预算已耗尽")
+		}
+		if global.Limit.PromptTokens > 0 {
+			if globalRemaining.PromptTokens <= 0 {
+				return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Run prompt_tokens 预算已耗尽")
+			}
+			promptLimit = minPositiveInt64(promptLimit, globalRemaining.PromptTokens)
+		}
+		if global.Limit.CompletionTokens > 0 {
+			if globalRemaining.CompletionTokens <= 0 {
+				return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Run completion_tokens 预算已耗尽")
+			}
+			completionLimit = minPositiveInt64(completionLimit, globalRemaining.CompletionTokens)
+		}
+	}
+	runReservationID := stableLoopID("run-reservation", actionID)
+	if r.runBudgets != nil {
+		modelCallsCharge := int64(1)
+		if useStartPermit {
+			modelCallsCharge = 0
+		}
+		if err := r.runBudgets.Reserve(runbudget.Reservation{
+			Schema: runbudget.ReservationSchemaV1, ReservationID: runReservationID,
+			ActionID: actionID, RunID: r.checkpoint.RunID, TaskID: r.checkpoint.TaskID,
+			AttemptID: r.checkpoint.AttemptID, Phase: r.runPhase,
+			MaxCharge: runcontract.BudgetUsage{PromptTokens: promptLimit,
+				CompletionTokens: completionLimit, ModelCalls: modelCallsCharge},
+			ReservedAt: now, ExpiresAt: actionDeadline,
+		}); err != nil {
+			return "", time.Time{}, invocation.OutputBudget{}, err
+		}
 	}
 	reservation := loopcontract.ActionReservation{
 		Schema:        loopcontract.ReservationSchemaV1,
@@ -270,9 +380,18 @@ func (r *loopProgressRuntime) reserveModelAction(turnID string) (string, time.Ti
 		},
 	}
 	if err := r.store.AppendReservation(reservation); err != nil {
+		if r.runBudgets != nil {
+			_ = r.runBudgets.Cancel(r.checkpoint.RunID, runReservationID, actionID, time.Now().UTC())
+		}
 		return "", time.Time{}, invocation.OutputBudget{}, err
 	}
 	r.turnActions[turnID] = append(r.turnActions[turnID], actionID)
+	if r.runBudgets != nil {
+		r.turnRunReservations[turnID] = runReservationID
+		if useStartPermit {
+			r.turnRunCallPermits[turnID] = r.startPermitRef
+		}
+	}
 	outputBudget := llm.DefaultOutputBudget()
 	if completionLimit > 0 && completionLimit < outputBudget.MaxCompletionTokens {
 		outputBudget.MaxCompletionTokens = completionLimit
@@ -298,15 +417,26 @@ func (r *loopProgressRuntime) ReserveTool(ctx context.Context, task *model.Task,
 	if addErr != nil {
 		return toolActionHandle{}, fmt.Errorf("计算当前 Turn Tool usage: %w", addErr)
 	}
-	remaining := remainingBudget(r.runBudget, used)
-	if r.runBudget.ToolActions > 0 && remaining.ToolActions <= 0 {
-		return toolActionHandle{}, fmt.Errorf("Run tool_actions 预算已耗尽")
+	remaining := remainingBudget(r.activationBudget, used)
+	if r.activationBudget.ToolActions > 0 && remaining.ToolActions <= 0 {
+		return toolActionHandle{}, fmt.Errorf("Activation tool_actions 预算已耗尽")
 	}
-	if r.runBudget.WallTime > 0 && remaining.WallTime <= 0 {
-		return toolActionHandle{}, fmt.Errorf("Run wall_time 预算已耗尽")
+	if r.activationBudget.WallTime > 0 && remaining.WallTime <= 0 {
+		return toolActionHandle{}, fmt.Errorf("Activation wall_time 预算已耗尽")
 	}
 	actionID := boundedLoopIdentity(turnID + "/tool-" + call.ID)
 	reservationID := stableLoopID("reservation", actionID)
+	runReservationID := stableLoopID("run-reservation", actionID)
+	if r.runBudgets != nil {
+		if err := r.runBudgets.Reserve(runbudget.Reservation{
+			Schema: runbudget.ReservationSchemaV1, ReservationID: runReservationID,
+			ActionID: actionID, RunID: r.checkpoint.RunID, TaskID: task.ID,
+			AttemptID: task.AttemptID, Phase: r.runPhase,
+			MaxCharge: runcontract.BudgetUsage{ToolActions: 1}, ReservedAt: now, ExpiresAt: actionDeadline,
+		}); err != nil {
+			return toolActionHandle{}, err
+		}
+	}
 	reservation := loopcontract.ActionReservation{
 		Schema: loopcontract.ReservationSchemaV1, ReservationID: reservationID,
 		ReservedAt: now, ExpiresAt: actionDeadline,
@@ -321,10 +451,14 @@ func (r *loopProgressRuntime) ReserveTool(ctx context.Context, task *model.Task,
 		},
 	}
 	if err := r.store.AppendReservation(reservation); err != nil {
+		if r.runBudgets != nil {
+			_ = r.runBudgets.Cancel(r.checkpoint.RunID, runReservationID, actionID, time.Now().UTC())
+		}
 		return toolActionHandle{}, err
 	}
 	r.turnActions[turnID] = append(r.turnActions[turnID], actionID)
-	return toolActionHandle{ActionID: actionID, ReservationID: reservationID, TurnID: turnID, StartedAt: now}, nil
+	return toolActionHandle{ActionID: actionID, ReservationID: reservationID,
+		RunReservationID: runReservationID, TurnID: turnID, StartedAt: now}, nil
 }
 
 func (r *loopProgressRuntime) SettleTool(_ context.Context, task *model.Task, call llm.ToolCall,
@@ -352,6 +486,24 @@ func (r *loopProgressRuntime) SettleTool(_ context.Context, task *model.Task, ca
 		Usage:        runcontract.BudgetUsage{WallTime: settledAt.Sub(handle.StartedAt), ToolActions: 1},
 		SettledAt:    settledAt,
 	}
+	if r.runBudgets != nil {
+		runStatus := runbudget.SettlementSucceeded
+		switch status {
+		case loopcontract.ActionFailed:
+			runStatus = runbudget.SettlementFailed
+		case loopcontract.ActionUnknown:
+			runStatus = runbudget.SettlementUnknown
+		}
+		if err := r.runBudgets.Settle(runbudget.Settlement{
+			Schema:        runbudget.SettlementSchemaV1,
+			SettlementID:  stableLoopID("run-settlement", handle.ActionID),
+			ReservationID: handle.RunReservationID, ActionID: handle.ActionID,
+			RunID: r.checkpoint.RunID, Status: runStatus,
+			Usage: runcontract.BudgetUsage{ToolActions: 1}, SettledAt: settledAt,
+		}); err != nil {
+			return fmt.Errorf("结算 Run Tool budget: %w", err)
+		}
+	}
 	if err := r.store.AppendActionSettlement(settlement); err != nil {
 		return err
 	}
@@ -370,10 +522,11 @@ func (r *loopProgressRuntime) SettleTool(_ context.Context, task *model.Task, ca
 }
 
 type loopPolicyDecision struct {
-	Reminder     string
-	Rollover     bool
-	Intervention bool
-	Blocked      bool
+	Reminder          string
+	Rollover          bool
+	Intervention      bool
+	Blocked           bool
+	ObservationAction string
 }
 
 func (r *loopProgressRuntime) settleTurn(a *Agent, task *model.Task, turnID string,
@@ -388,12 +541,50 @@ func (r *loopProgressRuntime) settleTurn(a *Agent, task *model.Task, turnID stri
 			invocationWall = 0
 		}
 	}
+	modelCallsUsage := int64(0)
+	if result.ProviderCallStarted {
+		modelCallsUsage = 1
+	}
 	usage, err := (runcontract.BudgetUsage{
 		WallTime: invocationWall, PromptTokens: int64(result.PromptTokens),
-		CompletionTokens: int64(result.CompletionTokens), ModelCalls: 1,
+		CompletionTokens: int64(result.CompletionTokens), ModelCalls: modelCallsUsage,
 	}).Add(toolUsage)
 	if err != nil {
 		return loopPolicyDecision{}, err
+	}
+	if r.runBudgets != nil {
+		reservationID := r.turnRunReservations[turnID]
+		if reservationID == "" {
+			return loopPolicyDecision{}, fmt.Errorf("Turn %s 缺少 Run model reservation", turnID)
+		}
+		status := runbudget.SettlementSucceeded
+		if execErr != nil {
+			status = runbudget.SettlementFailed
+		}
+		runModelCallsUsage := modelCallsUsage
+		if r.turnRunCallPermits[turnID] != "" {
+			runModelCallsUsage = 0
+		}
+		if err := r.runBudgets.Settle(runbudget.Settlement{
+			Schema:        runbudget.SettlementSchemaV1,
+			SettlementID:  stableLoopID("run-settlement", actionIDs[0]),
+			ReservationID: reservationID, ActionID: actionIDs[0], RunID: task.RunID,
+			Status: status, Usage: runcontract.BudgetUsage{
+				PromptTokens: int64(result.PromptTokens), CompletionTokens: int64(result.CompletionTokens), ModelCalls: runModelCallsUsage,
+			}, SettledAt: settledAt,
+		}); err != nil {
+			return loopPolicyDecision{}, fmt.Errorf("结算 Run model budget: %w", err)
+		}
+		if permitRef := r.turnRunCallPermits[turnID]; permitRef != "" {
+			if err := r.runBudgets.Settle(runbudget.Settlement{
+				Schema:        runbudget.SettlementSchemaV1,
+				SettlementID:  stableLoopID("run-permit-settlement", actionIDs[0]),
+				ReservationID: permitRef, ActionID: actionIDs[0], RunID: task.RunID,
+				Status: status, Usage: runcontract.BudgetUsage{ModelCalls: modelCallsUsage}, SettledAt: settledAt,
+			}); err != nil {
+				return loopPolicyDecision{}, fmt.Errorf("结算 RecoveryStartPermit: %w", err)
+			}
+		}
 	}
 	delta := loopcontract.TurnSettlementDelta{
 		Schema:   loopcontract.DeltaSchemaV1,
@@ -428,7 +619,25 @@ func (r *loopProgressRuntime) settleTurn(a *Agent, task *model.Task, turnID stri
 	r.checkpoint = next
 	delete(r.turnActions, turnID)
 	delete(r.turnToolUsage, turnID)
+	delete(r.turnRunReservations, turnID)
+	delete(r.turnRunCallPermits, turnID)
 	return decision, nil
+}
+
+func runBudgetPhase(task *model.Task) runbudget.Phase {
+	if task == nil {
+		return runbudget.PhaseExecution
+	}
+	switch task.RunPhase {
+	case runcontract.PhaseRecovery:
+		return runbudget.PhaseRecovery
+	case runcontract.PhaseFinalization:
+		return runbudget.PhaseFinalization
+	}
+	if task.GraphID == "" {
+		return runbudget.PhaseCoordination
+	}
+	return runbudget.PhaseExecution
 }
 
 func projectExecuteResult(a *Agent, task *model.Task, result ExecuteResult, delta *loopcontract.TurnSettlementDelta) {
@@ -464,20 +673,64 @@ func projectExecuteResult(a *Agent, task *model.Task, result ExecuteResult, delt
 				})
 			}
 		case "run_shell":
+			// 新业务 contract 只接受 run_check 的 typed CheckRecord；普通 Shell
+			// exit=0 不再被提升为 verification pass。旧冻结 contract 保持兼容。
+			if task.ProgressContract != nil && task.ProgressContract.Policy.KnowledgeCheckpointAfterTurns > 0 {
+				continue
+			}
 			command, _ := call.Arguments["command"].(string)
 			verdict := "failed"
-			if code := parseRunShellExitCode(content); success && code != nil && *code == 0 {
+			scope := parseRunShellExitCodeScope(content)
+			if code := parseRunShellExitCode(content); success && code != nil && *code == 0 &&
+				scope != store.ShellExitCodeScopeLastPipelineCommand {
 				verdict = "pass"
+			} else if success && scope == store.ShellExitCodeScopeLastPipelineCommand {
+				verdict = "ambiguous"
 			}
 			delta.EvaluationChanges = append(delta.EvaluationChanges, loopcontract.EvaluationChange{
 				EvaluationID: "shell:" + digestText(command)[:16], AfterDigest: digestText(content),
 				AfterVerdict: verdict, Changed: true,
 			})
-		case "read_file", "list_dir", "grep_search", "glob_search", "web_search", "web_fetch", "read_content_ref":
+		case "run_check":
+			var receipt struct {
+				CheckID  string `json:"check_id"`
+				CheckRef string `json:"check_ref"`
+				Status   string `json:"status"`
+			}
+			if json.Unmarshal([]byte(content), &receipt) != nil || receipt.CheckID == "" {
+				continue
+			}
+			delta.EvaluationChanges = append(delta.EvaluationChanges, loopcontract.EvaluationChange{
+				EvaluationID: "declared-evaluator", AfterDigest: digestText(receipt.CheckRef + "\x00" + receipt.Status),
+				AfterVerdict: receipt.Status, Changed: true,
+			})
+		case "read_file", "list_dir", "grep_search", "glob_search", "web_search", "web_fetch", "read_content_ref",
+			"read_graph", "get_task_result":
 			if success {
 				delta.EvidenceChanges = append(delta.EvidenceChanges, loopcontract.EvidenceChange{
 					Kind: call.Name, Ref: toolEvidenceRef(call), Digest: digestText(content), Novel: true,
 				})
+			}
+		case "record_observation_delta":
+			if !success {
+				continue
+			}
+			var receipt struct {
+				Ref                  string `json:"observation_delta_ref"`
+				PreviousRef          string `json:"previous_ref"`
+				Phase                string `json:"phase"`
+				WorkspaceRevisionRef string `json:"workspace_revision_ref"`
+				LatestCheckRef       string `json:"latest_check_ref"`
+				ResolvedCandidates   int    `json:"resolved_candidates"`
+				SemanticAdvance      bool   `json:"semantic_advance"`
+			}
+			if json.Unmarshal([]byte(content), &receipt) == nil && strings.TrimSpace(receipt.Ref) != "" {
+				delta.ObservationDeltaRef = receipt.Ref
+				delta.ObservationChange = &loopcontract.ObservationChange{
+					Ref: receipt.Ref, PreviousRef: receipt.PreviousRef, Phase: receipt.Phase,
+					WorkspaceRevisionRef: receipt.WorkspaceRevisionRef, LatestCheckRef: receipt.LatestCheckRef,
+					ResolvedCandidates: receipt.ResolvedCandidates, SemanticAdvance: receipt.SemanticAdvance,
+				}
 			}
 		default:
 			if success && isCoordinationTool(call.Name) {
@@ -507,14 +760,40 @@ func decideProgressPolicy(contract loopcontract.CompiledProgressContract, task *
 		usageAtLimit(checkpoint.NoProgressUsage, policy.MaxNoProgressUsage)
 	explorationLimitReached := policy.MaxExplorationTurns > 0 &&
 		checkpoint.ExplorationTurnsSinceDeliverable > policy.MaxExplorationTurns
+	if contract.WorkClass == loopcontract.WorkFinalization && policy.MaxExplorationTurns > 0 {
+		// final-report 的“最多两个补读 turn”是硬上限：第二个新证据 settled
+		// 后，下一 Invocation 立即进入 exact report_done。code-change/v4 仍按
+		// “超过上限”语义给普通调查留出第 N 个完整 turn。
+		explorationLimitReached = checkpoint.ExplorationTurnsSinceDeliverable >= policy.MaxExplorationTurns
+	}
 	decision := loopPolicyDecision{}
 	var reason loopcontract.InterventionReason
 	switch {
+	case policy.MaxObservationStagnation > 0 &&
+		checkpoint.ObservationStagnationCount >= policy.MaxObservationStagnation:
+		checkpoint.InterventionStage = loopcontract.StageInterventionRequired
+		decision.Intervention = true
+		decision.ObservationAction = "observation_stalled"
+		reason = loopcontract.InterventionObservationStalled
 	case exhausted:
+		if taskUsesObservationCheckpoint(task) && checkpoint.ObservationDeltaRef == "" {
+			checkpoint.InterventionStage = loopcontract.StageReminder
+			decision.ObservationAction = "intervention_budget"
+			decision.Reminder = observationCheckpointNotice(decision.ObservationAction,
+				"提交有证据的 ObservationDelta 后按预算耗尽进入 intervention；不得继续普通工作。")
+			return decision, nil
+		}
 		checkpoint.InterventionStage = loopcontract.StageBlocked
 		decision.Blocked = true
 		decision.Intervention = true
 		reason = loopcontract.InterventionNoProgressBudget
+	case policy.KnowledgeCheckpointAfterTurns > 0 &&
+		checkpoint.KnowledgeTurnsSinceObservation >= policy.KnowledgeCheckpointAfterTurns:
+		checkpoint.InterventionStage = loopcontract.StageRunning
+		decision.ObservationAction = "periodic"
+		decision.Reminder = observationCheckpointNotice("periodic",
+			fmt.Sprintf("已累计 %d 个新知识 turn；冻结事实后继续业务工作，不得提交终态。",
+				checkpoint.KnowledgeTurnsSinceObservation))
 	case explorationLimitReached:
 		// Novel evidence is real progress and must never be mislabeled as exhausted.
 		// Crossing the exploration allowance enters a mechanically forced delivery
@@ -533,6 +812,13 @@ func decideProgressPolicy(contract loopcontract.CompiledProgressContract, task *
 		decision.Reminder = progressDeliverableRequiredMarker + " " +
 			renderProgressReminder(contract, *checkpoint, "deliverable_required_after_progress")
 	case checkpoint.NoProgressTurns >= policy.InterventionAfterTurns:
+		if taskUsesObservationCheckpoint(task) && checkpoint.ObservationDeltaRef == "" {
+			checkpoint.InterventionStage = loopcontract.StageReminder
+			decision.ObservationAction = "intervention_stalled"
+			decision.Reminder = observationCheckpointNotice(decision.ObservationAction,
+				"提交有证据的 ObservationDelta 后进入 intervention；不得继续普通工作。")
+			return decision, nil
+		}
 		checkpoint.InterventionStage = loopcontract.StageInterventionRequired
 		decision.Intervention = true
 		reason = loopcontract.InterventionNoProgressStalled
@@ -554,6 +840,39 @@ func decideProgressPolicy(contract loopcontract.CompiledProgressContract, task *
 	checkpoint.LastInterventionAt = checkpoint.UpdatedAt
 	command := buildLoopIntervention(contract, task, *checkpoint, reason)
 	return decision, &command
+}
+
+func taskUsesObservationCheckpoint(task *model.Task) bool {
+	if task == nil || task.ProgressContract == nil {
+		return false
+	}
+	if task.GraphControllerRole == string(graph.ControllerRoleLoopRecovery) {
+		return false
+	}
+	return task.ProgressContract.Policy.KnowledgeCheckpointAfterTurns > 0 ||
+		task.ProgressContract.Ref.ContractID == policycatalog.ProgressCodeChangeV4
+}
+
+func (r *loopProgressRuntime) appendObservationIntervention(task *model.Task,
+	reason loopcontract.InterventionReason) error {
+	if r == nil || task == nil || r.store == nil {
+		return fmt.Errorf("Observation intervention 缺少 Loop authority")
+	}
+	now := time.Now().UTC()
+	next := r.checkpoint
+	next.Version++
+	next.CheckpointID = stableLoopID("checkpoint", task.ID, task.AttemptID,
+		fmt.Sprintf("%d-observation-intervention", next.Version))
+	next.InterventionStage = loopcontract.StageInterventionRequired
+	next.InterventionCount++
+	next.LastInterventionAt = now
+	next.UpdatedAt = now
+	command := buildLoopIntervention(*task.ProgressContract, task, next, reason)
+	if err := r.store.AppendIntervention(next, command); err != nil {
+		return err
+	}
+	r.checkpoint = next
+	return nil
 }
 
 func hasRecentDeliverableProgress(contract loopcontract.CompiledProgressContract,
@@ -612,13 +931,15 @@ func buildLoopIntervention(contract loopcontract.CompiledProgressContract, task 
 		Schema: loopcontract.InterventionSchemaV1,
 		CommandID: stableLoopID("intervention", task.ID, checkpoint.AttemptID,
 			fmt.Sprintf("%d", checkpoint.InterventionCount), string(reason)),
-		RunID: task.RunID, GraphID: task.GraphID, NodeID: task.NodeID, ActivationID: task.ActivationID,
+		RunID: task.RunID, GraphID: task.GraphID, FinalReportGraphID: task.FinalReportGraphID,
+		NodeID: task.NodeID, ActivationID: task.ActivationID,
 		TaskID: task.ID, AttemptID: checkpoint.AttemptID, Contract: contract.Ref,
 		ReasonCode: reason, MissingMilestones: missing,
 		RepeatedSignals: append([]loopcontract.ProgressFingerprint(nil), checkpoint.RecentFingerprints...),
 		BudgetUsed:      checkpoint.CumulativeUsage,
 		BudgetRemaining: remaining,
-		CheckpointRef:   checkpoint.CheckpointID, RequestedAt: checkpoint.UpdatedAt,
+		CheckpointRef:   checkpoint.CheckpointID, ObservationDeltaRef: checkpoint.ObservationDeltaRef,
+		RequestedAt: checkpoint.UpdatedAt,
 	}
 }
 
@@ -634,8 +955,8 @@ func remainingBudget(limit runcontract.BudgetLimit, used runcontract.BudgetUsage
 	}
 }
 
-// effectiveRunBudget 把 request ingress 的显式 Run 上限与 framework profile
-// 逐维取更小正值；Run 零值沿用 profile，二者都零才表示该维尚未计费。
+// effectiveRunBudget 只供冻结 v1/v2 的本地 Attempt 恢复读取。模型/工具/token/
+// cost 的显式 Run 上限由 RunBudgetStore 统一仲裁，新主链不得再用本函数执法。
 func effectiveRunBudget(run, profile runcontract.BudgetLimit) runcontract.BudgetLimit {
 	return runcontract.BudgetLimit{
 		WallTime:         minPositiveDuration(run.WallTime, profile.WallTime),

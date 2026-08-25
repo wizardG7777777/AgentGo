@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"agentgo/internal/fulfillment"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/runcontract"
 )
@@ -39,25 +40,27 @@ type Snapshot struct {
 
 // TaskSnapshot 是单个 Task 的可序列化表示。
 type TaskSnapshot struct {
-	ID               string                                 `json:"id"`
-	RunID            runcontract.RunID                      `json:"run_id,omitempty"`
-	RunContract      *runcontract.RunContract               `json:"run_contract,omitempty"`
-	RunPhase         runcontract.Phase                      `json:"run_phase,omitempty"`
-	ProgressContract *loopcontract.CompiledProgressContract `json:"progress_contract,omitempty"`
-	ContextPolicyRef string                                 `json:"context_policy_ref,omitempty"`
-	AttemptID        string                                 `json:"attempt_id,omitempty"`
-	AttemptNo        int                                    `json:"attempt_no,omitempty"`
-	Description      string                                 `json:"description"`
-	ContextInputs    []TaskContextInputSnapshot             `json:"context_inputs,omitempty"`
-	Priority         int                                    `json:"priority"`
-	Dependencies     []string                               `json:"dependencies"`
-	Status           string                                 `json:"status"`
-	Agents           []string                               `json:"agents"`
-	MaxConcurrency   int                                    `json:"max_concurrency"`
-	Results          map[string]string                      `json:"results"`
-	Error            string                                 `json:"error,omitempty"`
-	RetryCount       int                                    `json:"retry_count"`
-	RetryReasons     []string                               `json:"retry_reasons"`
+	ID                  string                                 `json:"id"`
+	RunID               runcontract.RunID                      `json:"run_id,omitempty"`
+	RunContract         *runcontract.RunContract               `json:"run_contract,omitempty"`
+	RunPhase            runcontract.Phase                      `json:"run_phase,omitempty"`
+	RunBudgetPermitRef  string                                 `json:"run_budget_permit_ref,omitempty"`
+	ProgressContract    *loopcontract.CompiledProgressContract `json:"progress_contract,omitempty"`
+	ContextPolicyRef    string                                 `json:"context_policy_ref,omitempty"`
+	FulfillmentContract *fulfillment.Contract                  `json:"fulfillment_contract,omitempty"`
+	AttemptID           string                                 `json:"attempt_id,omitempty"`
+	AttemptNo           int                                    `json:"attempt_no,omitempty"`
+	Description         string                                 `json:"description"`
+	ContextInputs       []TaskContextInputSnapshot             `json:"context_inputs,omitempty"`
+	Priority            int                                    `json:"priority"`
+	Dependencies        []string                               `json:"dependencies"`
+	Status              string                                 `json:"status"`
+	Agents              []string                               `json:"agents"`
+	MaxConcurrency      int                                    `json:"max_concurrency"`
+	Results             map[string]string                      `json:"results"`
+	Error               string                                 `json:"error,omitempty"`
+	RetryCount          int                                    `json:"retry_count"`
+	RetryReasons        []string                               `json:"retry_reasons"`
 	// ExpectedDuration 是 canonical SLO hint，编码单位沿用 Go time.Duration
 	// （纳秒）。它不构成 deadline。TimeoutSeconds 仅接收旧快照。
 	ExpectedDuration time.Duration `json:"expected_duration,omitempty"`
@@ -100,6 +103,7 @@ type TaskSnapshot struct {
 	GraphNodeKind                string `json:"graph_node_kind,omitempty"`
 	GraphControllerRole          string `json:"graph_controller_role,omitempty"`
 	RecoverySourceTaskID         string `json:"recovery_source_task_id,omitempty"`
+	FinalReportGraphID           string `json:"final_report_graph_id,omitempty"`
 	OutcomeRef                   string `json:"outcome_ref,omitempty"`
 	GraphDefinitionDigestVersion string `json:"graph_definition_digest_version,omitempty"`
 	// RouteScope is the durable runtime route-authorization owner. Old
@@ -171,17 +175,18 @@ type LeaseSnapshot struct {
 // session cannot import store (store already imports session), so the snapshot
 // boundary owns this DTO and store performs the explicit conversion.
 type ToolCallSnapshot struct {
-	Timestamp string         `json:"timestamp,omitempty"`
-	RunID     string         `json:"run_id,omitempty"`
-	AttemptID string         `json:"attempt_id,omitempty"`
-	TurnID    string         `json:"turn_id,omitempty"`
-	ActionID  string         `json:"action_id,omitempty"`
-	CallID    string         `json:"call_id,omitempty"`
-	AgentID   string         `json:"agent_id,omitempty"`
-	ToolName  string         `json:"tool_name"`
-	Args      map[string]any `json:"args,omitempty"`
-	Success   bool           `json:"success"`
-	ExitCode  *int           `json:"exit_code,omitempty"`
+	Timestamp     string         `json:"timestamp,omitempty"`
+	RunID         string         `json:"run_id,omitempty"`
+	AttemptID     string         `json:"attempt_id,omitempty"`
+	TurnID        string         `json:"turn_id,omitempty"`
+	ActionID      string         `json:"action_id,omitempty"`
+	CallID        string         `json:"call_id,omitempty"`
+	AgentID       string         `json:"agent_id,omitempty"`
+	ToolName      string         `json:"tool_name"`
+	Args          map[string]any `json:"args,omitempty"`
+	Success       bool           `json:"success"`
+	ExitCode      *int           `json:"exit_code,omitempty"`
+	ExitCodeScope string         `json:"exit_code_scope,omitempty"`
 }
 
 // RosterSnapshot 是 Roster 的可序列化表示。

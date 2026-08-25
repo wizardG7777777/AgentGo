@@ -77,6 +77,13 @@ func validateMinimumDefinition(body GraphDefinitionBody) []ValidationIssue {
 					path+".output_contract.fields", true,
 					"loop_recovery controller 必须声明 required string 字段 $.decision（retry|blocked）"))
 			}
+			if schema := strings.TrimSpace(node.Metadata[MetadataRecoveryDeltaSchema]); schema != "" {
+				if schema != RecoveryDeltaSchemaV1 || !outputContractHasObject(node.OutputContract, "$.recovery_delta") {
+					issues = append(issues, validationIssue("RECOVERY_DELTA_CONTRACT_INVALID",
+						path+".output_contract.fields", true,
+						"recovery_delta_schema 必须是 agentgo.recovery-delta/v1，且声明 object 字段 $.recovery_delta"))
+				}
+			}
 			if ControllerRole(node.Metadata[MetadataControllerRole]) == ControllerRoleLoopRecovery &&
 				(node.Task == nil || len(node.Task.RequiredInputs) != 1 || node.Task.RequiredInputs[0] != "failure_context") {
 				issues = append(issues, validationIssue("RECOVERY_FAILURE_CONTEXT_REQUIRED",
@@ -121,6 +128,18 @@ func outputContractHasRequiredString(contract *NodeOutputContract, path string) 
 	}
 	for _, field := range contract.Fields {
 		if field.Path == path && field.Type == "string" && field.Required {
+			return true
+		}
+	}
+	return false
+}
+
+func outputContractHasObject(contract *NodeOutputContract, path string) bool {
+	if contract == nil {
+		return false
+	}
+	for _, field := range contract.Fields {
+		if field.Path == path && field.Type == "object" {
 			return true
 		}
 	}

@@ -141,13 +141,14 @@ func TestConfigureSimpleGraphDraftBuildsFrameworkOwnedAcceptedShape(t *testing.T
 	acceptanceRecovery := draft.Candidate.Nodes["acceptance-recovery"]
 	if draft.DraftRevision != 2 || draft.Candidate.Root != "work" || draft.Contract.ExecutionClass != graph.ExecutionMutating ||
 		!draft.Contract.RequiresAcceptance || len(draft.Contract.RequiredEffects) != 1 ||
+		len(draft.Contract.RequiredChecks) != 1 || draft.Contract.RequiredEffects[0] != "workspace-change" ||
 		work.Kind != graph.KindAgent || work.Metadata["authoring_template"] != "simple-task/v1" ||
 		work.ProgressContractRef != policycatalog.ProgressCodeChangeCurrent ||
-		acceptance.Kind != graph.KindAcceptance || acceptance.ProgressContractRef != policycatalog.ProgressVerificationV1 ||
+		acceptance.Kind != graph.KindAcceptance || acceptance.ProgressContractRef != policycatalog.ProgressVerificationCurrent ||
 		recovery.Kind != graph.KindController ||
 		recovery.Metadata[graph.MetadataControllerRole] != string(graph.ControllerRoleLoopRecovery) ||
 		recovery.Metadata[graph.MetadataRecoveryMaxRetries] != "2" ||
-		recovery.ProgressContractRef != policycatalog.ProgressCoordinationV1 ||
+		recovery.ProgressContractRef != policycatalog.ProgressCoordinationCurrent ||
 		acceptanceRecovery.Kind != graph.KindController ||
 		acceptanceRecovery.Metadata[graph.MetadataControllerRole] != string(graph.ControllerRoleLoopRecovery) ||
 		acceptanceRecovery.Metadata[graph.MetadataRecoveryMaxRetries] != "2" ||
@@ -202,7 +203,7 @@ func TestConfigureSimpleGraphDraftBuildsFrameworkOwnedAcceptedShape(t *testing.T
 	group.RouteValidator = fakeRouteValidator{routes: map[string][]string{
 		"": {
 			"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref",
-			"write_file", "edit_file", "run_shell", "submit_task_result",
+			"write_file", "edit_file", "run_shell", "run_check", "submit_task_result",
 		},
 		graph.RouteAcceptance: {
 			"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref", "submit_task_result",

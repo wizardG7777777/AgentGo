@@ -34,6 +34,10 @@ import xml.etree.ElementTree as ET
 
 RUN_SCHEMA = "agentgo.run-contract/v1"
 RESULT_SCHEMA = "agentgo.swe-result/v2"
+PYTEST_REPORT_SCHEMA = "agentgo.pytest-phase-report/v1"
+PYTEST_COUNT_SEMANTICS = "pytest-phase-overlap/v1"
+PYTEST_REPORT_ENV = "AGENTGO_SWE_PYTEST_REPORT"
+PYTEST_REPORTER_MODULE = "agentgo_swe_pytest_reporter"
 PROBE_NAME = "agentgo_capability_probe_test"
 PROBE_NONCE = "nonce_test_7f3a"
 TERMINAL_TASK = {"completed", "failed", "blocked", "cancelled"}
@@ -99,6 +103,40 @@ class TaskSpec:
         self.fix_sha = fix_sha
         self.test_files = test_files
         self.title = title
+
+
+class HarnessInfrastructureError(RuntimeError):
+    """不属于题目业务 verdict 的有类型运行基础设施失败。"""
+
+    def __init__(self, reason_code: str, stage: str, message: str,
+                 *, exit_code: int | None = None, log_path: Path | None = None):
+        self.reason_code = reason_code
+        self.stage = stage
+        self.exit_code = exit_code
+        self.log_path = log_path
+        super().__init__(f"{reason_code}: {safe_diagnostic(message)}")
+
+    def record(self, task_id: str) -> dict:
+        value = {
+            "schema": "agentgo.swe-infrastructure-error/v1",
+            "task": task_id,
+            "reason_code": self.reason_code,
+            "stage": self.stage,
+            "message": safe_diagnostic(str(self)),
+        }
+        if self.exit_code is not None:
+            value["exit_code"] = self.exit_code
+        if self.log_path is not None:
+            value["log_path"] = str(self.log_path)
+        return value
+
+
+def safe_diagnostic(value: object, max_chars: int = 800) -> str:
+    """生成可写 summary/终端的有界诊断，不保留可能的明文凭证。"""
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "<redacted-api-key>", text)
+    text = " ".join(part.strip() for part in text.splitlines() if part.strip())
+    return text if len(text) <= max_chars else text[:max_chars] + "…"
 
 
 def validate_task_id(task_id: str) -> str:
@@ -190,7 +228,7 @@ def build_run_contract(task_id: str, timeout_sec: int, now: dt.datetime | None =
         "deadline_at": format_time(deadline),
         "finalization_reserve": 30 * NANOSECOND,
         "recovery_reserve": 90 * NANOSECOND,
-        "budget_profile": "swe/v1",
+        "budget_profile": "swe/v3",
         "budget": {},
         "created_at": format_time(created),
     }
@@ -326,6 +364,28 @@ def urllib_probe_transport(endpoint: str, api_key: str, body: dict, timeout_sec:
         return error.code, payload if isinstance(payload, dict) else {}
 
 
+def provider_probe_infrastructure_error(status: int, payload: dict) -> HarnessInfrastructureError | None:
+    error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
+    code = str((error or {}).get("code") or "").strip()
+    suffix = f" code={code}" if code else ""
+    if status == 402:
+        return HarnessInfrastructureError(
+            "provider_quota_exhausted", "provider_preflight",
+            f"provider function-call probe HTTP 402{suffix}",
+        )
+    if status == 401:
+        return HarnessInfrastructureError(
+            "provider_auth_failed", "provider_preflight",
+            f"provider function-call probe HTTP 401{suffix}",
+        )
+    if status == 403:
+        return HarnessInfrastructureError(
+            "provider_permission_denied", "provider_preflight",
+            f"provider function-call probe HTTP 403{suffix}",
+        )
+    return None
+
+
 def run_provider_probe(base_url: str, api_key: str, model: str, protocol: str = "responses",
                        timeout_sec: int = 45, attempts: int = 3, sleep_sec: int = 15,
                        transport=None) -> None:
@@ -341,12 +401,16 @@ def run_provider_probe(base_url: str, api_key: str, model: str, protocol: str = 
         try:
             status, payload = transport(endpoint, api_key, request_body, timeout_sec)
             if status != 200:
+                if infrastructure_error := provider_probe_infrastructure_error(status, payload):
+                    raise infrastructure_error
                 last_reason = f"HTTP {status}"
                 raise RuntimeError(last_reason)
             ok, reason = validate_probe_response(payload, probe_name, nonce, protocol)
             if ok:
                 return
             last_reason = reason
+        except HarnessInfrastructureError:
+            raise
         except (OSError, TimeoutError, json.JSONDecodeError, subprocess.SubprocessError, RuntimeError) as error:
             if not last_reason.startswith("HTTP "):
                 last_reason = str(error)[:160] or type(error).__name__
@@ -386,6 +450,10 @@ def project_snapshot(snapshot: dict, run_id: str) -> dict:
     graphs = [graph for graph in snapshot.get("graphs", []) if graph.get("run_id") == run_id]
     graph_terminal = bool(graphs) and all(graph.get("status") in TERMINAL_GRAPH for graph in graphs)
     tasks_terminal = bool(tasks) and all(task.get("status") in TERMINAL_TASK for task in tasks)
+    final_reports = [task for task in tasks if task.get("final_report_graph_id")]
+    final_reports_terminal = bool(final_reports) and all(
+        task.get("status") in TERMINAL_TASK for task in final_reports
+    )
     return {
         "task_count": len(tasks),
         "task_statuses": [task.get("status", "") for task in tasks],
@@ -395,6 +463,9 @@ def project_snapshot(snapshot: dict, run_id: str) -> dict:
         "graph_outcomes": [graph.get("outcome", "") for graph in graphs],
         "graph_terminal": graph_terminal,
         "tasks_terminal": tasks_terminal,
+        "final_report_count": len(final_reports),
+        "final_report_statuses": [task.get("status", "") for task in final_reports],
+        "final_reports_terminal": final_reports_terminal,
         "pending_interactions": len(snapshot.get("pending_interactions") or []),
     }
 
@@ -435,7 +506,8 @@ def monitor_run(base_url: str, token: str, pid: int, run_id: str, started_at: fl
                 observed_activity = True
             next_candidate = ""
             if projection["graph_terminal"]:
-                next_candidate = "graph_terminal"
+                next_candidate = "graph_terminal" if projection["final_reports_terminal"] \
+                    else "graph_terminal_incomplete_final_report"
             elif projection["graph_count"] == 0 and projection["tasks_terminal"]:
                 next_candidate = "no_graph_terminal"
             if next_candidate != candidate:
@@ -457,6 +529,7 @@ def monitor_run(base_url: str, token: str, pid: int, run_id: str, started_at: fl
         "graph_statuses": last_projection.get("graph_statuses", []),
         "graph_outcomes": last_projection.get("graph_outcomes", []),
         "task_statuses": last_projection.get("task_statuses", []),
+        "final_report_statuses": last_projection.get("final_report_statuses", []),
     }
 
 
@@ -483,6 +556,9 @@ def safe_outcomes(state_dir: Path, run_id: str) -> tuple[list[dict], int]:
             "status": outcome.get("status", ""),
             "reason_code": outcome.get("reason_code", ""),
             "checkpoint_state": outcome.get("checkpoint_state", ""),
+            "fulfillment_present": isinstance(outcome.get("fulfillment"), dict),
+            "fulfillment_check_count": len((outcome.get("fulfillment") or {}).get("check_refs") or [])
+            if isinstance(outcome.get("fulfillment"), dict) else 0,
         }
     values = []
     for ref in sorted(commits):
@@ -507,9 +583,9 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
     # 首个并为其余 call_id 写 skipped result，final-report 则允许串行执行多个
     # 只读调用。真正的回归是“非 final-report 的 Scheduler 单动作阶段实际
     # dispatch 了多个工具”。phase 来自冻结 Context manifest，而不是正文猜测。
-    scheduler_phases = {}
+    turn_phases = {}
     for event in events:
-        if event.get("kind") != "context_manifest_built" or event.get("task_id") not in scheduler_task_ids:
+        if event.get("kind") != "context_manifest_built":
             continue
         try:
             manifest = json.loads(event.get("description") or "[]")
@@ -518,7 +594,7 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
         for fragment in manifest if isinstance(manifest, list) else []:
             source_ref = fragment.get("source_ref", "") if isinstance(fragment, dict) else ""
             if source_ref.startswith("prompt-phase:"):
-                scheduler_phases[event.get("turn_id", "")] = source_ref.removeprefix("prompt-phase:")
+                turn_phases[event.get("turn_id", "")] = source_ref.removeprefix("prompt-phase:")
                 break
     dispatched_by_turn = collections.Counter(
         event.get("turn_id", "") for event in events
@@ -526,7 +602,14 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
     )
     scheduler_batches = [
         turn_id for turn_id, count in dispatched_by_turn.items()
-        if count > 1 and scheduler_phases.get(turn_id) != "scheduler:final-report"
+        if count > 1 and turn_phases.get(turn_id) != "scheduler:final-report"
+    ]
+    final_report_scope_failures = [
+        event for event in events
+        if event.get("kind") == "tool_result"
+        and turn_phases.get(event.get("turn_id", "")) == "scheduler:final-report"
+        and event.get("tool") == "get_task_result"
+        and "被拒绝" in str(event.get("error", ""))
     ]
     create_calls = [
         event for event in events
@@ -538,6 +621,30 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
         created_at = create_calls[0].get("ts", "")
         first_create_index = sum(event.get("ts", "") <= created_at for event in scheduler_ends)
     error_text = "\n".join(str(event.get("error", "")) for event in events if event.get("error"))
+    observation_control_failures = [
+        event for event in events
+        if event.get("kind") == "observation_checkpoint_failed"
+    ]
+    max_observation_checkpoint_attempts = 0
+    current_observation_checkpoint_attempts = 0
+    max_observation_checkpoint_failures = 0
+    current_observation_checkpoint_failures = 0
+    for event in llm_ends:
+        if turn_phases.get(event.get("turn_id", "")) == "agent:observation-checkpoint":
+            current_observation_checkpoint_attempts += 1
+            max_observation_checkpoint_attempts = max(
+                max_observation_checkpoint_attempts, current_observation_checkpoint_attempts,
+            )
+            if event.get("error"):
+                current_observation_checkpoint_failures += 1
+                max_observation_checkpoint_failures = max(
+                    max_observation_checkpoint_failures, current_observation_checkpoint_failures,
+                )
+            else:
+                current_observation_checkpoint_failures = 0
+        else:
+            current_observation_checkpoint_attempts = 0
+            current_observation_checkpoint_failures = 0
     known = {
         "fragment_limit_exceeded": "fragment_limit_exceeded" in error_text,
         # provider 400 表示冻结请求 wire 本身不合法，属于 Invocation/Context
@@ -555,6 +662,20 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
             event.get("failure_kind") == "request_timeout" and event.get("recovery_action") == "rebuild_context"
             for event in llm_ends
         ),
+        "final_report_result_scope_failure": bool(final_report_scope_failures),
+        "recovery_contract_rejection": "recovery_delta" in error_text and any(
+            marker in error_text for marker in ("非法", "不一致", "缺少", "cannot unmarshal")
+        ),
+        "observation_checkpoint_retry_storm": max_observation_checkpoint_failures > 2,
+        "observation_checkpoint_attempt_limit_exceeded": max_observation_checkpoint_attempts > 2,
+        # provider 前的 Control Invocation preflight 失败不会产生
+        # context_manifest/llm_call_end，也不一定把 Task 置为终态。必须消费
+        # AgentGo 的 durable trace 事实，不能只从终态 Outcome 反推。
+        "control_checkpoint_unavailable": any(
+            event.get("reason") == "control_invocation_preflight_failed"
+            for event in observation_control_failures
+        ),
+        "reasoning_mode_replay_break": "reasoning_text" in error_text and "must be passed back" in error_text,
     }
     return {
         "model_calls": len(llm_ends),
@@ -564,6 +685,9 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
         "scheduler_model_calls": len(scheduler_ends),
         "first_graph_draft_call_index": first_create_index,
         "invocation_failures": dict(sorted(failures.items())),
+        "observation_checkpoint_failures": dict(sorted(collections.Counter(
+            str(event.get("reason") or "unknown") for event in observation_control_failures
+        ).items())),
         "known_incidents": known,
     }, events
 
@@ -589,10 +713,58 @@ def context_metrics(state_dir: Path) -> dict:
     }
 
 
+def run_budget_metrics(state_dir: Path, run_id: str) -> dict:
+    reservations = {}
+    settled_ids = set()
+    limit = {}
+    settled = collections.Counter()
+    phases = collections.defaultdict(collections.Counter)
+    present = False
+    for _, entry in iter_jsonl(str(state_dir / "run-budgets" / "run-budgets.jsonl")):
+        if entry.get("run_id") != run_id:
+            continue
+        present = True
+        kind = entry.get("kind")
+        if kind == "initialize":
+            limit = entry.get("limit") or {}
+        elif kind == "reserve" and isinstance(entry.get("reservation"), dict):
+            reservation = entry["reservation"]
+            reservations[str(reservation.get("reservation_id") or "")] = reservation
+        elif kind == "settle" and isinstance(entry.get("settlement"), dict):
+            value = entry["settlement"]
+            reservation_id = str(value.get("reservation_id") or "")
+            if reservation_id in settled_ids:
+                continue
+            settled_ids.add(reservation_id)
+            usage = value.get("usage") or {}
+            phase = str((reservations.get(reservation_id) or {}).get("phase") or "unknown")
+            for field in ("prompt_tokens", "completion_tokens", "model_calls", "tool_actions", "attempts", "cost_micros"):
+                amount = int(usage.get(field) or 0)
+                settled[field] += amount
+                phases[phase][field] += amount
+    active = {
+        reservation_id: value for reservation_id, value in reservations.items()
+        if reservation_id and reservation_id not in settled_ids
+    }
+    reserved = collections.Counter()
+    for reservation in active.values():
+        for field in ("prompt_tokens", "completion_tokens", "model_calls", "tool_actions", "attempts", "cost_micros"):
+            reserved[field] += int((reservation.get("max_charge") or {}).get(field) or 0)
+    return {
+        "present": present,
+        "limit": limit,
+        "settled": dict(settled),
+        "reserved": dict(reserved),
+        "active_reservations": len(active),
+        "phase_settled": {phase: dict(values) for phase, values in sorted(phases.items())},
+    }
+
+
 def loop_metrics(state_dir: Path, run_id: str) -> dict:
     attempts = set()
     interventions = 0
     max_no_progress = 0
+    max_observation_stagnation = 0
     sealed = 0
     records = 0
     for _, entry in iter_jsonl(str(state_dir / "loop" / "*.jsonl")):
@@ -605,6 +777,10 @@ def loop_metrics(state_dir: Path, run_id: str) -> dict:
             if checkpoint.get("attempt_id"):
                 attempts.add(checkpoint["attempt_id"])
             max_no_progress = max(max_no_progress, int(checkpoint.get("no_progress_turns") or 0))
+            max_observation_stagnation = max(
+                max_observation_stagnation,
+                int(checkpoint.get("observation_stagnation_count") or 0),
+            )
             interventions = max(interventions, int(checkpoint.get("intervention_count") or 0))
             sealed += int(checkpoint.get("sealed") is True)
         if matched:
@@ -613,6 +789,7 @@ def loop_metrics(state_dir: Path, run_id: str) -> dict:
         "records": records,
         "attempt_count": len(attempts),
         "max_no_progress_turns": max_no_progress,
+        "max_observation_stagnation_count": max_observation_stagnation,
         "max_intervention_count": interventions,
         "sealed_checkpoint_records": sealed,
     }
@@ -640,7 +817,9 @@ def missing_loop_recovery_sources(outcomes: list[dict], recovered_source_task_id
     recovery_controller_task_ids = recovery_controller_task_ids or set()
     missing = []
     for outcome in outcomes:
-        if not outcome.get("graph_id") or outcome.get("reason_code") != "loop_intervention_required":
+        if not outcome.get("graph_id") or outcome.get("reason_code") not in {
+            "loop_intervention_required", "no_progress_budget_exhausted", "observation_state_stalled",
+        }:
             continue
         task_id = str(outcome.get("task_id") or "")
         # loop_recovery controller 自身就是 L5 的有界裁决边界；它 no-progress
@@ -664,12 +843,14 @@ def collect_result(snapshot_path: str, monitor_path: str, project_root: str, run
     tasks = [task for task in snapshot.get("tasks", []) if task.get("run_id") == run_id]
     graphs = [graph for graph in snapshot.get("graphs", []) if graph.get("run_id") == run_id]
     terminal_tasks = terminal_task_scope(tasks, graphs)
+    final_report_tasks = [task for task in tasks if task.get("final_report_graph_id")]
     scheduler_ids = {task.get("id", "") for task in tasks if task.get("event_type") == "__scheduler__"}
     outcomes, pending_ack = safe_outcomes(state_dir, run_id)
     committed_refs = {outcome["outcome_ref"] for outcome in outcomes}
     traces, _ = trace_metrics(root, run_id, scheduler_ids)
     contexts = context_metrics(state_dir)
     loops = loop_metrics(state_dir, run_id)
+    run_budget = run_budget_metrics(state_dir, run_id)
     known = dict(traces["known_incidents"])
     outcome_task_ids = {str(outcome.get("task_id")) for outcome in outcomes if outcome.get("task_id")}
     recovery_controller_task_ids = {
@@ -685,7 +866,26 @@ def collect_result(snapshot_path: str, monitor_path: str, project_root: str, run
         outcomes, recovered_source_task_ids, recovery_controller_task_ids,
     )
     known["loop_intervention_without_recovery"] = bool(missing_recovery)
+    requires_run_budget = any(
+        str(((task.get("run_contract") or {}).get("budget_profile") or "")).endswith("/v3")
+        for task in tasks
+    )
+    known["run_budget_ledger_missing"] = requires_run_budget and not run_budget["present"]
+    known["run_budget_usage_mismatch"] = run_budget["present"] and (
+        int(run_budget["settled"].get("model_calls") or 0) != int(traces["model_calls"])
+    )
+    known["run_budget_reservation_leak"] = run_budget["present"] and int(run_budget["active_reservations"]) > 0
+    execution_usage = (run_budget.get("phase_settled") or {}).get("execution") or {}
+    known["run_budget_scope_reset"] = run_budget["present"] and any(
+        int((run_budget["limit"] or {}).get(field) or 0) > 0
+        and int(execution_usage.get(field) or 0) > int((run_budget["limit"] or {}).get(field) or 0)
+        for field in ("prompt_tokens", "completion_tokens", "model_calls", "tool_actions", "cost_micros")
+    )
+    known["control_checkpoint_unavailable"] = bool(known.get("control_checkpoint_unavailable")) or any(
+        value.get("reason_code") == "observation_checkpoint_failed" for value in outcomes
+    )
     graph_outcomes = [graph.get("outcome", "") for graph in graphs]
+    graph_ids = {str(graph.get("graph_id") or "") for graph in graphs if graph.get("graph_id")}
     authoring_events = count_jsonl(state_dir / "graph-authoring" / "authoring.jsonl")
     if any(
         value.get("task_id") in scheduler_ids and value.get("reason_code") == "progress_authority_failure"
@@ -705,6 +905,23 @@ def collect_result(snapshot_path: str, monitor_path: str, project_root: str, run
     # 映射正确性由 durable assessment 与 Go contract test 钉住，不再用
     # “有 authoring journal + 有 intervention”这一粗糙条件制造假阳性。
     known["authoring_false_no_progress"] = False
+    known["mutating_completed_without_fulfillment"] = any(
+        value.get("graph_id") and value.get("node_id") == "work"
+        and value.get("status") == "completed" and not value.get("fulfillment_present")
+        for value in outcomes
+    )
+    # Recovery Controller 已选择 retry 后，下一业务 Activation 才发现 execution
+    # window 关闭，说明 L5 没有在 decision commit 前消费 L4 phase feasibility。
+    # 新实现应在 submit_recovery_decision 当场拒绝 retry 并允许改交 blocked；
+    # 若事故仍进入 Graph settlement，architecture gate 必须失败。
+    known["recovery_retry_activation_unstartable"] = any(
+        graph.get("status") == "failed" and any(
+            "RunContract phase=execution 的剩余时间窗已耗尽" in str(node.get("reason") or "")
+            or "recovery_retry_unstartable" in str(node.get("reason") or "")
+            for node in graph.get("nodes", []) if isinstance(node, dict)
+        )
+        for graph in graphs
+    )
     architecture_checks = {
         "startup_function_probe": startup_probe_passed,
         "run_identity_visible": bool(monitor.get("run_identity_visible")),
@@ -722,8 +939,27 @@ def collect_result(snapshot_path: str, monitor_path: str, project_root: str, run
         "graph_task_outcomes_complete": bool(terminal_tasks) and all(
             task.get("outcome_ref") in committed_refs for task in terminal_tasks
         ),
+        "mutating_fulfillment_complete": not known["mutating_completed_without_fulfillment"],
         "task_outcome_delivery_acked": bool(outcomes) and pending_ack == 0 and all(
             outcome["delivery_acked"] for outcome in outcomes
+        ),
+        "final_report_present": bool(final_report_tasks),
+        "final_report_scope_bound": bool(final_report_tasks) and all(
+            task.get("final_report_graph_id") in graph_ids for task in final_report_tasks
+        ),
+        "final_report_terminal": bool(final_report_tasks) and all(
+            task.get("status") in TERMINAL_TASK for task in final_report_tasks
+        ),
+        "final_report_completed": bool(final_report_tasks) and all(
+            task.get("status") == "completed" for task in final_report_tasks
+        ),
+        "final_report_outcome_complete": bool(final_report_tasks) and all(
+            task.get("outcome_ref") in committed_refs for task in final_report_tasks
+        ),
+    }
+    infrastructure_conditions = {
+        "provider_quota_exhausted": int(
+            (traces.get("invocation_failures") or {}).get("provider_quota_exhausted") or 0
         ),
     }
     result = {
@@ -736,12 +972,14 @@ def collect_result(snapshot_path: str, monitor_path: str, project_root: str, run
         "graph_statuses": [graph.get("status", "") for graph in graphs],
         "graph_outcomes": graph_outcomes,
         "task_statuses": [task.get("status", "") for task in tasks],
+        "final_report_statuses": [task.get("status", "") for task in final_report_tasks],
         "task_outcomes": outcomes,
         "pending_outcome_delivery_count": pending_ack,
         "metrics": {
             **traces,
             "context": contexts,
             "loop": loops,
+            "run_budget": run_budget,
             "graph_authoring_events": authoring_events,
             "graph_revisions": [int(graph.get("revision") or 0) for graph in graphs],
             "graph_activations": sum(
@@ -752,6 +990,8 @@ def collect_result(snapshot_path: str, monitor_path: str, project_root: str, run
             "loop_recovery_missing_sources": missing_recovery,
         },
         "known_incidents": known,
+        "infrastructure_conditions": infrastructure_conditions,
+        "infrastructure_ok": not any(infrastructure_conditions.values()),
         "architecture_checks": architecture_checks,
         "architecture_ok": all(architecture_checks.values()),
     }
@@ -795,6 +1035,8 @@ def summarize_runs(runs_dir: str, batch_start: float) -> list[dict]:
             "verdict": judge.get("verdict", "unknown"),
             "architecture_ok": bool(result.get("architecture_ok")),
             "task_resolved": bool(result.get("task_resolved")),
+            "infrastructure_ok": bool(result.get("infrastructure_ok", True)),
+            "infrastructure_conditions": result.get("infrastructure_conditions") or {},
             "process_terminal": result.get("process_terminal", "unknown"),
             "graph_outcomes": result.get("graph_outcomes", []),
             "wall_sec": int(result.get("wall_sec") or 0),
@@ -809,8 +1051,90 @@ def summarize_runs(runs_dir: str, batch_start: float) -> list[dict]:
     return rows
 
 
+def infrastructure_error_record(task_id: str, error: Exception) -> dict:
+    if isinstance(error, HarnessInfrastructureError):
+        return error.record(task_id)
+    return {
+        "schema": "agentgo.swe-infrastructure-error/v1",
+        "task": task_id,
+        "reason_code": "harness_task_infrastructure_error",
+        "stage": "task_transaction",
+        "message": safe_diagnostic(error),
+    }
+
+
+def summarize_batch_runs(tasks: list[TaskSpec], runs_dir: str, batch_start: float,
+                         infrastructure_error: dict | None = None,
+                         stop_reason: str = "") -> list[dict]:
+    """只投影当前 batch；旧 result/judge 不进入 synthesized not-run 行。"""
+    current = {
+        row["task"]: row for row in summarize_runs(runs_dir, batch_start)
+        if not row.get("stale")
+    }
+    rows = []
+    for task in tasks:
+        if task.task_id in current:
+            row = dict(current[task.task_id])
+            same_task_infra = infrastructure_error if (
+                infrastructure_error and infrastructure_error.get("task") == task.task_id
+            ) else None
+            row["run_state"] = "completed_with_infrastructure_error" if same_task_infra else "completed"
+            row["infrastructure_error"] = same_task_infra
+            row["not_run_reason"] = ""
+            rows.append(row)
+            continue
+        if infrastructure_error and infrastructure_error.get("task") == task.task_id:
+            rows.append({
+                "task": task.task_id,
+                "verdict": "infrastructure_error",
+                "architecture_ok": None,
+                "task_resolved": None,
+                "infrastructure_ok": False,
+                "infrastructure_conditions": {
+                    str(infrastructure_error.get("reason_code") or "unknown"): 1,
+                },
+                "process_terminal": "startup_or_task_infrastructure_error",
+                "graph_outcomes": [],
+                "wall_sec": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "llm_calls": 0,
+                "patch_lines": 0,
+                "external_hard_kill": False,
+                "known_incidents": [],
+                "stale": False,
+                "run_state": "infrastructure_error",
+                "infrastructure_error": infrastructure_error,
+                "not_run_reason": "",
+            })
+            continue
+        rows.append({
+            "task": task.task_id,
+            "verdict": "not_run",
+            "architecture_ok": None,
+            "task_resolved": None,
+            "infrastructure_ok": None,
+            "infrastructure_conditions": {},
+            "process_terminal": "not_run",
+            "graph_outcomes": [],
+            "wall_sec": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "llm_calls": 0,
+            "patch_lines": 0,
+            "external_hard_kill": False,
+            "known_incidents": [],
+            "stale": False,
+            "run_state": "not_run",
+            "infrastructure_error": None,
+            "not_run_reason": stop_reason or "batch_stopped_before_task",
+        })
+    return rows
+
+
 def run_command(command: list[str], cwd: str | Path | None = None, check: bool = True,
-                input_data: bytes | None = None, timeout: int | None = None) -> subprocess.CompletedProcess:
+                input_data: bytes | None = None, timeout: int | None = None,
+                env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     completed = subprocess.run(
         command,
         cwd=str(cwd) if cwd is not None else None,
@@ -818,6 +1142,7 @@ def run_command(command: list[str], cwd: str | Path | None = None, check: bool =
         capture_output=True,
         check=False,
         timeout=timeout,
+        env=env,
     )
     if check and completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).decode("utf-8", errors="replace").strip()
@@ -893,37 +1218,98 @@ def apply_fix_slice(config: HarnessConfig, task: TaskSpec, worktree: Path, paths
                 input_data=patch_from_fix(config, task, pathspec))
 
 
-def parse_junit(path: Path) -> dict:
+def pytest_sidecar_path(junit_path: Path) -> Path:
+    suffix = ".junit.xml"
+    name = junit_path.name[:-len(suffix)] if junit_path.name.endswith(suffix) else junit_path.stem
+    return junit_path.with_name(name + ".pytest.json")
+
+
+def load_pytest_report(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"pytest 未产生合法机器计数报告: {path}") from error
+    if not isinstance(payload, dict) or payload.get("schema") != PYTEST_REPORT_SCHEMA:
+        raise RuntimeError(f"pytest 机器计数报告 schema 非法: {path}")
+    if payload.get("count_semantics") != PYTEST_COUNT_SEMANTICS:
+        raise RuntimeError(f"pytest 机器计数报告 count_semantics 非法: {path}")
+    numeric = ("collected", "passed", "failed", "errors", "skipped", "xfailed", "xpassed")
+    for key in numeric:
+        value = payload.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError(f"pytest 机器计数报告字段 {key} 非法: {path}")
+    phase_errors = payload.get("phase_errors")
+    if not isinstance(phase_errors, dict) or set(phase_errors) != {"collection", "setup", "teardown"}:
+        raise RuntimeError(f"pytest 机器计数报告 phase_errors 非法: {path}")
+    for key, value in phase_errors.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError(f"pytest 机器计数报告 phase_errors.{key} 非法: {path}")
+    if sum(phase_errors.values()) != payload["errors"]:
+        raise RuntimeError(f"pytest 机器计数报告 errors 与 phase_errors 不一致: {path}")
+    return {
+        "tests": payload["collected"],
+        "collected": payload["collected"],
+        "passed": payload["passed"],
+        "failed": payload["failed"],
+        "errors": payload["errors"],
+        "skipped": payload["skipped"],
+        "xfailed": payload["xfailed"],
+        "xpassed": payload["xpassed"],
+        "phase_errors": phase_errors,
+        "count_semantics": payload["count_semantics"],
+    }
+
+
+def validate_junit(path: Path, report: dict) -> None:
     try:
         root = ET.parse(path).getroot()
     except (OSError, ET.ParseError) as error:
         raise RuntimeError(f"pytest 未产生合法 JUnit 报告: {path}") from error
-    suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
-    tests = sum(int(suite.attrib.get("tests", 0)) for suite in suites)
-    failed = sum(int(suite.attrib.get("failures", 0)) for suite in suites)
-    errors = sum(int(suite.attrib.get("errors", 0)) for suite in suites)
-    skipped = sum(int(suite.attrib.get("skipped", 0)) for suite in suites)
-    return {
-        "tests": tests,
-        "passed": max(0, tests - failed - errors - skipped),
-        "failed": failed,
-        "errors": errors,
-        "skipped": skipped,
+    suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+    if not suites:
+        raise RuntimeError(f"pytest JUnit 报告缺少 testsuite: {path}")
+    try:
+        failed = sum(int(suite.attrib.get("failures", 0)) for suite in suites)
+        errors = sum(int(suite.attrib.get("errors", 0)) for suite in suites)
+        skipped = sum(int(suite.attrib.get("skipped", 0)) for suite in suites)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"pytest JUnit 报告计数字段非法: {path}") from error
+    expected = {
+        "failures": report["failed"],
+        "errors": report["errors"],
+        "skipped": report["skipped"] + report["xfailed"],
     }
+    actual = {"failures": failed, "errors": errors, "skipped": skipped}
+    if actual != expected:
+        raise RuntimeError(f"pytest JUnit 与机器计数报告冲突: actual={actual} expected={expected}")
 
 
 def run_pytest(worktree: Path, junit_path: Path, log_path: Path,
                test_files: tuple[str, ...] = ()) -> dict:
     junit_path.parent.mkdir(parents=True, exist_ok=True)
     junit_path.unlink(missing_ok=True)
+    report_path = pytest_sidecar_path(junit_path)
+    report_path.unlink(missing_ok=True)
+    environment = os.environ.copy()
+    reporter_dir = str(Path(__file__).resolve().parent)
+    current_pythonpath = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = reporter_dir + (os.pathsep + current_pythonpath if current_pythonpath else "")
+    environment[PYTEST_REPORT_ENV] = str(report_path)
     command = [
         str(venv_python(worktree)), "-m", "pytest", *test_files, "-q",
-        f"--junitxml={junit_path}",
+        "-p", PYTEST_REPORTER_MODULE, f"--junitxml={junit_path}",
     ]
-    completed = run_command(command, cwd=worktree, check=False)
+    completed = run_command(command, cwd=worktree, check=False, env=environment)
     output = completed.stdout + completed.stderr
     log_path.write_bytes(output)
-    result = parse_junit(junit_path)
+    result = load_pytest_report(report_path)
+    validate_junit(junit_path, result)
+    if completed.returncode in {2, 3, 4}:
+        raise RuntimeError(f"pytest 基础设施失败 exit={completed.returncode}: {log_path}")
+    if completed.returncode == 0 and (result["failed"] or result["errors"]):
+        raise RuntimeError("pytest exit=0 与机器计数中的 failed/errors 冲突")
+    if completed.returncode == 1 and not (result["failed"] or result["errors"]):
+        raise RuntimeError("pytest exit=1 但机器计数没有 failed/errors")
     result["exit_code"] = completed.returncode
     result["summary_tail"] = output.decode("utf-8", errors="replace").splitlines()[-3:]
     return result
@@ -955,9 +1341,10 @@ def print_pytest_stage_result(result: dict, expectation: str) -> bool:
     else:
         raise ValueError(f"未知 pytest 阶段期望: {expectation}")
     print(
-        f"阶段结果：{conclusion}；tests={int(result.get('tests') or 0)} "
+        f"阶段结果：{conclusion}；collected={int(result.get('collected') or result.get('tests') or 0)} "
         f"passed={int(result.get('passed') or 0)} failed={int(result.get('failed') or 0)} "
-        f"errors={int(result.get('errors') or 0)} skipped={int(result.get('skipped') or 0)}"
+        f"error_events={int(result.get('errors') or 0)} skipped={int(result.get('skipped') or 0)} "
+        f"xfailed={int(result.get('xfailed') or 0)} xpassed={int(result.get('xpassed') or 0)}"
     )
     return matched
 
@@ -995,7 +1382,10 @@ def prepare_task(config: HarnessConfig, task: TaskSpec) -> dict:
     if not print_pytest_stage_result(baseline, "red"):
         raise RuntimeError(f"全量基线未保持红态，考题 {task.task_id} 准备失败")
     report = {
-        key: baseline[key] for key in ("tests", "passed", "failed", "errors", "skipped", "exit_code")
+        key: baseline[key] for key in (
+            "tests", "collected", "passed", "failed", "errors", "skipped", "xfailed", "xpassed",
+            "phase_errors", "count_semantics", "exit_code",
+        )
     }
     report["note"] = "base 红态基线（agent 运行前全量 pytest）"
     atomic_json(run_dir / "baseline.json", report)
@@ -1053,6 +1443,37 @@ def health_ready(url: str, timeout: float = 1.0) -> bool:
         return False
 
 
+def startup_failure_from_log(log_path: Path) -> tuple[str, str]:
+    try:
+        content = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        return "agentgo_startup_failed", f"无法读取启动日志: {error}"
+    error_lines = [line.strip() for line in content.splitlines()
+                   if line.strip().startswith(("[错误]", "[FAIL]"))]
+    detail = error_lines[-1] if error_lines else "AgentGo 在 healthz 就绪前退出"
+    lowered = content.lower()
+    if re.search(r"\b402\b", content) or "insufficient balance" in lowered or "insufficient_quota" in lowered:
+        return "provider_quota_exhausted", detail
+    if re.search(r"\b401\b", content) or "invalid_api_key" in lowered:
+        return "provider_auth_failed", detail
+    if re.search(r"\b403\b", content):
+        return "provider_permission_denied", detail
+    if "startup" in lowered and "probe" in lowered:
+        return "startup_probe_failed", detail
+    return "agentgo_startup_failed", detail
+
+
+def raise_startup_failure(process: subprocess.Popen, log_path: Path, fallback: str) -> None:
+    reason_code, detail = startup_failure_from_log(log_path)
+    exit_code = process.poll()
+    if exit_code is None:
+        reason_code, detail = "healthz_timeout", fallback
+    raise HarnessInfrastructureError(
+        reason_code, "agentgo_startup", detail,
+        exit_code=exit_code, log_path=log_path,
+    )
+
+
 def wait_for_agentgo(process: subprocess.Popen, base_url: str, log_path: Path,
                      timeout_sec: int = 90) -> None:
     deadline = time.monotonic() + timeout_sec
@@ -1065,7 +1486,7 @@ def wait_for_agentgo(process: subprocess.Popen, base_url: str, log_path: Path,
             break
         time.sleep(1)
     if not ready:
-        raise RuntimeError(f"SPAWN_ERROR: healthz 未就绪，见 {log_path}")
+        raise_startup_failure(process, log_path, "AgentGo healthz 在启动窗口内未就绪")
 
     marker = re.compile(r"\[OK\].*typed function-call/required-arguments")
     while time.monotonic() < deadline:
@@ -1077,7 +1498,7 @@ def wait_for_agentgo(process: subprocess.Popen, base_url: str, log_path: Path,
         if process.poll() is not None:
             break
         time.sleep(0.2)
-    raise RuntimeError("SPAWN_ERROR: 产品 function-call probe 没有成功证据")
+    raise_startup_failure(process, log_path, "AgentGo 产品 function-call probe 没有成功证据")
 
 
 def terminate_process(process: subprocess.Popen) -> None:
@@ -1106,6 +1527,8 @@ def clean_run_outputs(run_dir: Path) -> None:
     for name in (
         "result.json", "judge.json", "snapshot.final.json", "monitor.json",
         "run_contract.json", "model.patch", "judge.junit.xml", "judge.pytest.log",
+        "judge.pytest.json",
+        "infrastructure_error.json",
     ):
         (run_dir / name).unlink(missing_ok=True)
 
@@ -1247,20 +1670,27 @@ def judge_task(config: HarnessConfig, task: TaskSpec) -> dict:
     report = {
         "verdict": verdict,
         "tests": pytest["tests"],
+        "collected": pytest["collected"],
         "passed": pytest["passed"],
         "failed": pytest["failed"],
         "errors": pytest["errors"],
         "skipped": pytest["skipped"],
+        "xfailed": pytest["xfailed"],
+        "xpassed": pytest["xpassed"],
+        "phase_errors": pytest["phase_errors"],
+        "count_semantics": pytest["count_semantics"],
         "patch_lines": patch_lines,
         "tampered": tampered,
     }
     baseline = read_json(run_dir / "baseline.json", {})
-    if all(key in baseline for key in ("passed", "failed", "errors")):
-        report["baseline"] = {key: baseline[key] for key in ("passed", "failed", "errors")}
+    comparison_keys = ("tests", "passed", "failed", "errors", "skipped", "xfailed", "xpassed")
+    if all(key in baseline for key in comparison_keys):
+        report["baseline"] = {key: baseline[key] for key in comparison_keys}
         if verdict == "failed":
-            if report["failed"] == baseline["failed"] and report["errors"] == baseline["errors"]:
+            if all(report[key] == baseline[key] for key in comparison_keys):
                 report["red_note"] = "红态与基线完全一致：补丁未造成新增破坏（但也未修复）"
-            elif report["failed"] + report["errors"] > baseline["failed"] + baseline["errors"]:
+            elif report["tests"] < baseline["tests"] or (
+                    report["failed"] + report["errors"] > baseline["failed"] + baseline["errors"]):
                 report["red_note"] = "红态重于基线：补丁引入了新增破坏"
             else:
                 report["red_note"] = "红态轻于基线：部分修复但未全绿"
@@ -1282,10 +1712,20 @@ def final_exit_code(result: dict) -> int:
 
 
 def batch_exit_code(rows: list[dict], expected_count: int) -> int:
-    if len(rows) != expected_count or any(
-            row.get("stale") or not row.get("architecture_ok") for row in rows):
+    if len(rows) != expected_count:
+        return EXIT_HARNESS_FAILURE
+    if any(row.get("run_state") in {"infrastructure_error", "completed_with_infrastructure_error"}
+           for row in rows):
+        return EXIT_HARNESS_FAILURE
+    if any(row.get("run_state", "completed") in {"completed", "completed_with_infrastructure_error"} and
+           not row.get("architecture_ok") for row in rows):
         return EXIT_ARCHITECTURE_FAILURE
-    if any(not row.get("task_resolved") for row in rows):
+    if any(row.get("run_state") == "not_run" for row in rows):
+        return EXIT_HARNESS_FAILURE
+    if any(row.get("stale") for row in rows):
+        return EXIT_HARNESS_FAILURE
+    if any(row.get("run_state", "completed") in {"completed", "completed_with_infrastructure_error"} and
+           not row.get("task_resolved") for row in rows):
         return EXIT_TASK_FAILURE
     return 0
 
@@ -1307,9 +1747,19 @@ def execute_task(config: HarnessConfig, task: TaskSpec, timeout_sec: int) -> dic
 
 
 def print_summary(rows: list[dict]) -> None:
-    resolved = sum(row["task_resolved"] and not row["stale"] for row in rows)
-    architecture = sum(row["architecture_ok"] and not row["stale"] for row in rows)
-    print(f"\ntask_resolved {resolved}/{len(rows)} architecture_ok {architecture}/{len(rows)}")
+    completed = [row for row in rows if row.get("run_state", "completed") in {
+        "completed", "completed_with_infrastructure_error",
+    }]
+    resolved = sum(row.get("task_resolved") is True for row in completed)
+    architecture = sum(row.get("architecture_ok") is True for row in completed)
+    infrastructure = sum(row.get("run_state") == "infrastructure_error" for row in rows)
+    not_run = sum(row.get("run_state") == "not_run" for row in rows)
+    batch_status = "complete" if len(completed) == len(rows) else "incomplete"
+    print(
+        f"\nbatch_status {batch_status} completed {len(completed)}/{len(rows)} "
+        f"task_resolved {resolved}/{len(completed)} architecture_ok {architecture}/{len(completed)} "
+        f"infrastructure_error {infrastructure} not_run {not_run}"
+    )
     for row in rows:
         flags = []
         if row["stale"]:
@@ -1318,8 +1768,14 @@ def print_summary(rows: list[dict]) -> None:
             flags.append("HARD_KILL")
         if row["known_incidents"]:
             flags.append("INCIDENT=" + ",".join(row["known_incidents"]))
+        if row.get("run_state") in {"infrastructure_error", "completed_with_infrastructure_error"}:
+            failure = row.get("infrastructure_error") or {}
+            flags.append("INFRA=" + str(failure.get("reason_code") or "unknown"))
+        if row.get("run_state") == "not_run":
+            flags.append("NOT_RUN=" + str(row.get("not_run_reason") or "batch_stopped"))
+        arch = "-" if row.get("architecture_ok") is None else str(row.get("architecture_ok"))
         print(
-            f"  {row['task']:24s} verdict={row['verdict']:13s} arch={str(row['architecture_ok']):5s} "
+            f"  {row['task']:24s} verdict={row['verdict']:20s} arch={arch:5s} "
             f"terminal={row['process_terminal']:18s} wall={row['wall_sec']:4d}s "
             f"calls={row['llm_calls']:3d} patch={row['patch_lines']:4d} {' '.join(flags)}"
         )
@@ -1440,19 +1896,61 @@ def command_batch(args: argparse.Namespace) -> int:
     runs_dir = config.testbed / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
     (runs_dir / ".batch_start").write_text(str(batch_start) + "\n", encoding="utf-8")
-    for task in tasks:
-        print(
-            f"\n===== 批次任务 {dt.datetime.now().strftime('%H:%M:%S')} "
-            f"{task.task_id}: {task.title} ====="
+    # 新批次开始即清空旧 summary authority；逐题历史文件仍保留，但只有
+    # mtime >= batch_start 的 result/judge 才能进入本轮投影。
+    atomic_json(runs_dir / "summary.json", [])
+    infrastructure_error = None
+    stop_reason = ""
+    try:
+        for task in tasks:
+            print(
+                f"\n===== 批次任务 {dt.datetime.now().strftime('%H:%M:%S')} "
+                f"{task.task_id}: {task.title} ====="
+            )
+            try:
+                result = execute_task(config, task, args.timeout)
+            except Exception as error:
+                infrastructure_error = infrastructure_error_record(task.task_id, error)
+                failure_dir = config.run_dir(task.task_id)
+                failure_dir.mkdir(parents=True, exist_ok=True)
+                atomic_json(failure_dir / "infrastructure_error.json", infrastructure_error)
+                stop_reason = "previous_infrastructure_error"
+                print(
+                    "SWE_HARNESS_ERROR: " + safe_diagnostic(error),
+                    file=os.sys.stderr,
+                )
+                break
+            if result.get("infrastructure_ok") is False:
+                conditions = result.get("infrastructure_conditions") or {}
+                reason_code = next((name for name, count in sorted(conditions.items()) if count),
+                                   "execution_environment_failed")
+                infrastructure_error = {
+                    "schema": "agentgo.swe-infrastructure-error/v1",
+                    "task": task.task_id,
+                    "reason_code": reason_code,
+                    "stage": "agentgo_execution",
+                    "message": f"AgentGo execution environment failed: {reason_code}",
+                }
+                atomic_json(config.run_dir(task.task_id) / "infrastructure_error.json",
+                            infrastructure_error)
+                stop_reason = "previous_infrastructure_error"
+                print(
+                    f"运行基础设施失败，停止批次: {task.task_id} reason={reason_code}",
+                    file=os.sys.stderr,
+                )
+                break
+            if not result.get("architecture_ok"):
+                stop_reason = "previous_architecture_gate"
+                print(f"架构门失败，停止批次: {task.task_id}", file=os.sys.stderr)
+                break
+    finally:
+        rows = summarize_batch_runs(
+            tasks, str(runs_dir), batch_start,
+            infrastructure_error=infrastructure_error,
+            stop_reason=stop_reason,
         )
-        result = execute_task(config, task, args.timeout)
-        if not result.get("architecture_ok"):
-            print(f"架构门失败，停止批次: {task.task_id}", file=os.sys.stderr)
-            break
-    selected = {task.task_id for task in tasks}
-    rows = [row for row in summarize_runs(str(runs_dir), batch_start) if row["task"] in selected]
-    atomic_json(runs_dir / "summary.json", rows)
-    print_summary(rows)
+        atomic_json(runs_dir / "summary.json", rows)
+        print_summary(rows)
     return batch_exit_code(rows, len(tasks))
 
 

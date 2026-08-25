@@ -224,6 +224,28 @@ func TestAdapterExternalizesOversizedToolResult(t *testing.T) {
 	}
 }
 
+func TestAdapterV9KeepsEightyKiBToolResultInlineWhenWindowHasRoom(t *testing.T) {
+	input := adapterTestInput(t)
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, _ := catalog.ContextPolicy(policycatalog.ContextDefaultV9)
+	replay, _ := catalog.ProviderReplayPolicy(profile.ReplayPolicyRef)
+	input.BudgetPolicy, input.ReplayPolicy, input.ReplayPolicyRef = profile.Policy, replay.Policy, replay.Ref
+	large := strings.Repeat("x", 80<<10)
+	input.History = []SettledTurn{{TurnID: "turn-v9", Assistant: llm.Message{Role: "assistant",
+		ToolCalls: []llm.ToolCall{{ID: "call-v9", Name: "read_file"}}},
+		ToolResults: []llm.Message{{Role: "tool", ToolCallID: "call-v9", Content: large}}}}
+	result, err := New().Compile(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.ExternalizedRefs) != 0 || !strings.Contains(result.Messages[len(result.Messages)-1].Content, large[:1024]) {
+		t.Fatalf("v9 容量充足时不应按固定 16/48 KiB 外置: refs=%v", result.ExternalizedRefs)
+	}
+}
+
 func TestAdapterRecognizesL3ToolResultReferenceWithoutReexternalizing(t *testing.T) {
 	input := adapterTestInput(t)
 	refID := "content:" + strings.Repeat("a", 64)

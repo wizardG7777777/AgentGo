@@ -112,6 +112,12 @@ func (p ProgressPolicy) Validate() error {
 	if p.MaxExplorationTurns < 0 {
 		return fmt.Errorf("max_exploration_turns 不能为负")
 	}
+	if p.KnowledgeCheckpointAfterTurns < 0 {
+		return fmt.Errorf("knowledge_checkpoint_after_turns 不能为负")
+	}
+	if p.KnowledgeCheckpointAfterTurns > 0 && p.MaxObservationStagnation <= 0 {
+		return fmt.Errorf("启用 knowledge checkpoint 时 max_observation_stagnation 必须 > 0")
+	}
 	if p.MaxAttemptRollovers < 0 {
 		return fmt.Errorf("max_attempt_rollovers 不能为负")
 	}
@@ -198,6 +204,16 @@ func (d TurnSettlementDelta) Validate() error {
 	for i, change := range d.ResultChanges {
 		if strings.TrimSpace(change.Field) == "" || strings.TrimSpace(change.AfterDigest) == "" {
 			return fmt.Errorf("result_changes[%d] 缺少 field/after_digest", i)
+		}
+	}
+	if d.ObservationChange != nil {
+		change := d.ObservationChange
+		if strings.TrimSpace(change.Ref) == "" || strings.TrimSpace(change.Phase) == "" ||
+			strings.TrimSpace(change.WorkspaceRevisionRef) == "" || change.ResolvedCandidates < 0 {
+			return fmt.Errorf("observation_change ref/phase/workspace/resolved 非法")
+		}
+		if d.ObservationDeltaRef != change.Ref {
+			return fmt.Errorf("observation_change.ref 与 observation_delta_ref 不一致")
 		}
 	}
 	return nil
@@ -298,8 +314,8 @@ func (c ProgressCheckpoint) Validate() error {
 		return fmt.Errorf("ProgressCheckpoint version 必须 > 0")
 	}
 	if c.LastDeltaSequence < 0 || c.NoProgressTurns < 0 || c.NoProgressDuration < 0 ||
-		c.ExplorationTurnsSinceDeliverable < 0 ||
-		c.InterventionCount < 0 || c.AttemptRolloverCount < 0 {
+		c.ExplorationTurnsSinceDeliverable < 0 || c.KnowledgeTurnsSinceObservation < 0 ||
+		c.ObservationStagnationCount < 0 || c.InterventionCount < 0 || c.AttemptRolloverCount < 0 {
 		return fmt.Errorf("ProgressCheckpoint 计数或 duration 不能为负")
 	}
 	if err := c.Contract.Validate(); err != nil {
@@ -577,7 +593,7 @@ func validateIdentity(name, value string) error {
 
 func validWorkClass(value WorkClass) bool {
 	switch value {
-	case WorkCodeChange, WorkInvestigation, WorkVerification, WorkCoordination, WorkExternalEffect:
+	case WorkCodeChange, WorkInvestigation, WorkVerification, WorkCoordination, WorkFinalization, WorkExternalEffect:
 		return true
 	default:
 		return false
@@ -589,7 +605,7 @@ func validProgressSignal(value ProgressSignalKind) bool {
 	case SignalFileVersionChanged, SignalArtifactRegistered, SignalArtifactVersionChanged,
 		SignalEvaluationChanged, SignalEvaluationPassed, SignalNovelEvidence,
 		SignalConfirmedFactAdded, SignalBlockerCleared, SignalInputRevisionAdvanced,
-		SignalResultFieldSet, SignalExternalEffectSettled:
+		SignalResultFieldSet, SignalExternalEffectSettled, SignalObservationStateAdvanced:
 		return true
 	default:
 		return false
@@ -637,7 +653,8 @@ func validInterventionStage(value InterventionStage) bool {
 func validInterventionReason(value InterventionReason) bool {
 	switch value {
 	case InterventionNoProgressBudget, InterventionNoProgressStalled, InterventionAttemptDeadline, InterventionActivationDeadline,
-		InterventionOscillation, InterventionUnsafeUnknown, InterventionCheckpointFailure, InterventionAttemptBudget:
+		InterventionOscillation, InterventionUnsafeUnknown, InterventionCheckpointFailure,
+		InterventionObservationStalled, InterventionAttemptBudget:
 		return true
 	default:
 		return false

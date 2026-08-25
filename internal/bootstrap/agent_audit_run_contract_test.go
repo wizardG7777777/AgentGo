@@ -25,7 +25,7 @@ func TestRequestAgentAuditStartsIndependentVerificationRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	if task.RunID == "" || task.RunContract == nil || task.ContextPolicyRef != policycatalog.ContextDefaultCurrent ||
-		task.ProgressContract == nil || task.ProgressContract.Ref.ContractID != policycatalog.ProgressVerificationV1 ||
+		task.ProgressContract == nil || task.ProgressContract.Ref.ContractID != policycatalog.ProgressVerificationCurrent ||
 		task.RunPhase != runcontract.PhaseExecution {
 		t.Fatalf("agent audit 必须创建完整独立 verification Run: %+v", task)
 	}

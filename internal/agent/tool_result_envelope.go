@@ -10,6 +10,7 @@ import (
 	"agentgo/internal/contextcontract"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
+	"agentgo/internal/policycatalog"
 )
 
 const (
@@ -32,6 +33,11 @@ type toolResultReferenceEnvelope struct {
 }
 
 func (r ContextRuntime) externalizeToolResult(ctx context.Context, task *model.Task, call llm.ToolCall, result string) (string, error) {
+	// Context v9 由 L2 按本次模型容量与 snapshot pressure 决定 inline/ref；
+	// L3 不再以固定 16 KiB 抢先把结果变成引用。
+	if task != nil && task.ContextPolicyRef == policycatalog.ContextDefaultV9 {
+		return result, nil
+	}
 	if len([]byte(result)) <= toolResultExternalizeThresholdBytes || r.Content == nil || task == nil {
 		return result, nil
 	}

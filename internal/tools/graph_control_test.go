@@ -313,6 +313,26 @@ func TestGraphControllerControlPlaneIsBoundToCurrentGraph(t *testing.T) {
 	}
 }
 
+func TestFinalReportReadGraphIsBoundToFrozenGraph(t *testing.T) {
+	g, _, _ := newGraphControlEnv(t)
+	if _, err := g.submitGraph(context.Background(), map[string]any{"graph": graphToolGraphJSON}); err != nil {
+		t.Fatal(err)
+	}
+	tasks := store.NewMemoryTaskStore(nil, 8, 1, 60)
+	current := newFinalReportTestTask(t, "final-report", "g-tool-basic")
+	current.EventType = graph.RouteScheduler
+	if err := tasks.PublishTask(current); err != nil {
+		t.Fatal(err)
+	}
+	g.TaskStore, g.Holder = tasks, &fakeHolder{id: current.ID}
+	if _, err := g.readGraph(context.Background(), map[string]any{"graph_id": current.FinalReportGraphID}); err != nil {
+		t.Fatalf("final-report 应能读取冻结 Graph: %v", err)
+	}
+	if _, err := g.readGraph(context.Background(), map[string]any{"graph_id": "g-other"}); err == nil || !strings.Contains(err.Error(), "final_report_graph_id") {
+		t.Fatalf("final-report 跨 Graph read 必须拒绝: %v", err)
+	}
+}
+
 func TestSubmitGraphRejectsParentGraphTeamRouteInsideInlineSubgraph(t *testing.T) {
 	g, gs, board := newGraphControlEnv(t)
 	g.RouteValidator = fakeRouteValidator{

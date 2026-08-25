@@ -14,6 +14,7 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/agenttemplate"
+	"agentgo/internal/checkstore"
 	"agentgo/internal/config"
 	"agentgo/internal/contentstore"
 	"agentgo/internal/contextadapter"
@@ -42,6 +43,7 @@ import (
 	reactorbuiltin "agentgo/internal/reactor/builtin"
 	"agentgo/internal/reactor/userdef"
 	"agentgo/internal/roster"
+	"agentgo/internal/runbudget"
 	"agentgo/internal/runner"
 	"agentgo/internal/scheduler"
 	"agentgo/internal/session"
@@ -103,12 +105,14 @@ type System struct {
 	// Close；生产 Bootstrap 初始化失败即返回错误，成功 System 中恒非 nil。
 	EffectJournal *effect.Journal
 	// LoopStore 是 L4 action/settlement/checkpoint 的 fail-closed 权威。
-	LoopStore *loopstore.Store
+	LoopStore      *loopstore.Store
+	RunBudgetStore *runbudget.Store
 	// TaskOutcomeStore 是所有新 Run Task 的 append-only 终态与 delivery outbox 权威。
 	TaskOutcomeStore *outcomestore.Store
 	// ContentStore 是 L3 大正文/ContentRef 的持久化与授权解引用权威。
 	// 新执行不允许在初始化失败时降级为无 Store 模式。
 	ContentStore *contentstore.Store
+	CheckStore   *checkstore.Store
 	// ContextSnapshotStore 是 L2 已编译 Snapshot/Manifest metadata 的
 	// append-only 权威；模型请求正文不进入本 Store。
 	ContextSnapshotStore *contextstore.Store
@@ -408,6 +412,17 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		}
 	}()
 	log.Printf("[启动] L4 LoopStore 已启用 (dir=%s)", loopStorePath)
+	runBudgetStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "run-budgets")
+	runBudgetStateStore, runBudgetStoreErr := runbudget.Open(runBudgetStorePath)
+	if runBudgetStoreErr != nil {
+		return nil, fmt.Errorf("初始化 RunBudgetStore 失败（显式 Run 预算必须 fail-closed）: %w", runBudgetStoreErr)
+	}
+	defer func() {
+		if !bootstrapCompleted {
+			_ = runBudgetStateStore.Close()
+		}
+	}()
+	log.Printf("[启动] RunBudgetStore 已启用 (dir=%s)", runBudgetStorePath)
 	outcomeStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "task-outcomes")
 	taskOutcomeStore, outcomeStoreErr := outcomestore.New(outcomeStorePath)
 	if outcomeStoreErr != nil {
@@ -431,6 +446,9 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		}
 	}()
 	log.Printf("[启动] L3 ContentStore 已启用 (dir=%s)", contentStorePath)
+	checkStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "checks")
+	checkStateStore := checkstore.New(checkStorePath)
+	log.Printf("[启动] L3 CheckStore 已启用 (dir=%s)", checkStorePath)
 	contextSnapshotPath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "context-snapshots")
 	contextSnapshotStore, contextSnapshotErr := contextstore.New(contextSnapshotPath)
 	if contextSnapshotErr != nil {
@@ -724,6 +742,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	if err != nil {
 		return nil, err
 	}
+	graphRuntime.SetRunBudgetGate(runBudgetStateStore)
 	graphAuthoringStore, err := graph.NewAuthoringStore(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "graph-authoring"))
 	if err != nil {
 		return nil, fmt.Errorf("创建 Graph AuthoringStore 失败: %w", err)
@@ -999,7 +1018,9 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		Memory:                  memoryStore,
 		TaskMemStore:            taskMemStore,
 		LoopStore:               loopStateStore,
+		RunBudgetStore:          runBudgetStateStore,
 		ContentStore:            contentStateStore,
+		CheckStore:              checkStateStore,
 		ContextRuntime:          contextRuntime,
 		RouteValidator:          agentRegistry,
 		Activity:                activity,
@@ -1135,7 +1156,11 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		sched.Agent.Activity = activity
 		sched.Agent.StreamOutput = streamOutput
 		sched.Agent.LoopStore = loopStateStore
+		sched.Agent.RunBudgetStore = runBudgetStateStore
 		sched.Agent.ContentStore = contentStateStore
+		sched.Agent.FinalizationFallback = func(_ context.Context, task *model.Task) (string, error) {
+			return renderGraphFinalizationFallback(task)
+		}
 		// SWE-001 兜底 1：纯文本自然退出的零证据收口审查（与 report_done
 		// 的 closure Gate 同一实例，confirmed 状态两路径共享）。
 		sched.Agent.NaturalExitReviewer = schedulerClosureHook
@@ -1252,8 +1277,10 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		ArtifactLog:           artifactLog, // 可能为 nil（OpenArtifactLog 失败时），Shutdown 会判空
 		EffectJournal:         effectJournal,
 		LoopStore:             loopStateStore,
+		RunBudgetStore:        runBudgetStateStore,
 		TaskOutcomeStore:      taskOutcomeStore,
 		ContentStore:          contentStateStore,
+		CheckStore:            checkStateStore,
 		ContextSnapshotStore:  contextSnapshotStore,
 		artifactReplay:        artifactReplay,
 		SessionMgr:            sessMgr, // 可能为 nil（Session 初始化失败时），Shutdown 会判空
@@ -2097,6 +2124,11 @@ func (s *System) shutdown() error {
 	if s.LoopStore != nil {
 		if err := s.LoopStore.Close(); err != nil {
 			log.Printf("[关闭] WARNING: LoopStore 关闭失败: %v", err)
+		}
+	}
+	if s.RunBudgetStore != nil {
+		if err := s.RunBudgetStore.Close(); err != nil {
+			log.Printf("[关闭] WARNING: RunBudgetStore 关闭失败: %v", err)
 		}
 	}
 	if s.TaskOutcomeStore != nil {

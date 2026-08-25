@@ -209,14 +209,16 @@ func (c *Config) Doctor() *DoctorReport {
 			// info 方向（白名单未声明）也无从枚举，跳过该 kind。
 			continue
 		}
+		declaredAllowlist := allowlist
+		effectiveAllowlist := EffectiveAgentTools(allowlist)
 
 		mentioned := scanPromptToolNames(string(content))
 		mentionedSet := make(map[string]bool, len(mentioned))
 		for _, name := range mentioned {
 			mentionedSet[name] = true
 		}
-		allowSet := make(map[string]bool, len(allowlist))
-		for _, name := range allowlist {
+		allowSet := make(map[string]bool, len(effectiveAllowlist))
+		for _, name := range effectiveAllowlist {
 			allowSet[name] = true
 		}
 
@@ -228,7 +230,7 @@ func (c *Config) Doctor() *DoctorReport {
 			}
 		}
 		// info：白名单已授权但 prompt 从未提及（按白名单声明顺序）
-		for _, name := range allowlist {
+		for _, name := range declaredAllowlist {
 			if !mentionedSet[name] {
 				rep.add(DiagInfo, k.Kind, fmt.Sprintf(
 					"白名单工具 %q 未在 prompt 中提及（能力未向模型声明，不强制要求）", name))

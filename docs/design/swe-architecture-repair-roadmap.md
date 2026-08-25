@@ -1,6 +1,6 @@
 # SWE 架构修复统一实施路线图
 
-> 状态：SWE-015…028 implementation landed，repository validation passed / single-task architecture+task passed / 8-task pending<br>
+> 状态：SWE-015…045 已有外部 closure；SWE-046…053 implementation landed / external validation pending<br>
 > 日期：2026-08-23<br>
 > 适用范围：第五、六轮 Flask SWE 分层诊断及其残余问题<br>
 > 上位规范：[`五层工程架构规范`](five-layer-engineering-architecture.md)<br>
@@ -73,19 +73,35 @@ Store、桥接字符串和不同 deadline 口径。
   focused race tests；Mailbox Run/Session 分区、定向 wake/claim/drain/ACK、steer
   与 Trace Session correlation tests；
 - `go test ./...`、`go test -race ./...`、`go vet ./...`、`go build -o agentgo .`；
-- 仓库 SWE harness 18 项 Python 单测、`git diff --check`；
+- 仓库 SWE harness 33 项 Python 单测、`git diff --check`；
 - 真实二进制 startup function-call probe、RunContract 注入、Graph
   Draft/Definition/StartIntent/typed outcome 与 TaskOutcome delivery ACK。
 
-第六轮 DeepSeek 8题为0/8；Responses cutover 与 SWE-029…032 修复后，最终
-冻结二进制的真实 `deepseek-v4-flash` thinking 完整批次达到
-`architecture_ok=8/8`、Judge resolved 5/8。三道未解题均 known incidents=0，
-属模型未产出补丁。受影响路径独立
-复跑中 `automatic-options` 494/494、`ipv6-server-name` 493/493、
-`teardown-callbacks` 495/495、`session-access-tracking` 490/490，均 typed success
-且 TaskOutcome 全 ACK。证据见
+第六轮 DeepSeek 8题为0/8；Responses cutover 及后续五层修复后，
+最终冻结二进制的真实 `deepseek-v4-flash` thinking 完整 cohort
+达到 `architecture_ok=8/8`、`task_resolved=6/8`。两道普通模型
+业务失败随后定向复跑均 resolved；原 cohort 统计不被改写。
+SWE-041～045 的 exploration/Context/fulfillment/recovery/Observation 事故形状均为零，
+所有 TaskOutcome 全 ACK。证据见
 [`Responses 主链与单题成功`](../test-issues/2026-08-23-0109-responses-mainline-and-single-task-success.md)
-与 [`DeepSeek Responses 精确重放事故`](../test-issues/2026-08-23-0500-deepseek-responses-exact-replay.md)。
+、[`DeepSeek Responses 精确重放事故`](../test-issues/2026-08-23-0500-deepseek-responses-exact-replay.md)、
+[`五层限制重组`](../test-issues/2026-08-24-0715-swe-layer-limit-recomposition.md)
+与 [`Observation thinking replay`](../test-issues/2026-08-24-0735-observation-thinking-replay.md)。
+
+后续单题再次暴露 Observation 状态退化、语义重复刷新 progress、过期 retry 与
+TerminalSummary 失真；SWE-046～050 已完成 repository implementation，等待指定
+监控任务重新编译并执行 8 题外部验证。记录见
+[`Observation 状态与 Recovery 可启动性`](../test-issues/2026-08-24-1100-observation-state-and-recovery-feasibility.md)。
+
+后续 cohort 证明 framework “Run 总预算”实际按 Task 重置、Observation
+auto-singleton 仍可能生成错阶段工具、Recovery 缺少可转交的 execution grant；
+SWE-051～053 已切换到 RunID durable Ledger、`swe/v3` 非收紧默认、独立 exact
+Observation Control Invocation 与 RecoveryStartPermit。再后续的 provider 402
+与 incomplete summary 暴露 SWE-054～056，现由 typed quota、unknown intervention
+和 batch finally transaction 收口。provider 恢复后的最终当前批次为完整 8/8：
+任务、架构、基础设施全部通过。记录见
+[`Run 预算与 Control lane`](../test-issues/2026-08-24-2205-run-budget-and-control-lane.md)
+与 [`Provider 额度与批次收口`](../test-issues/2026-08-25-1100-provider-quota-and-batch-finalization.md)。
 
 ## 2. 输入设计与问题映射
 
@@ -118,6 +134,18 @@ Store、桥接字符串和不同 deadline 口径。
 | SWE-030/031 | Model Invocation/L3 | auto + singleton + L3 required-action 替代 exact/required choice；provider fan-out 只 dispatch 首个并为余下 call_id 保留 skipped result |
 | SWE-032 | L4 Loop | rollover 用尽不再提前 intervention；新 code-change Task 冻结 v3，v1/v2 保留供历史恢复 |
 | SWE-033 | L4→L5/L3 | recoverable blocked 进入 framework recovery Controller；Outcome ACK 后按最新 Definition 创建新 Activation，缺失 recovery 进入架构事故门 |
+| SWE-045 | L3/L4/Invocation | 非终态 Observation 保持 thinking + auto-singleton，L3 强制 exact action；Invocation 失败进入两次有界 checkpoint 计数 |
+| SWE-046 | L2 Context | Observation v2 predecessor/candidate 状态与最新 TaskMemory 投影 |
+| SWE-047 | L4 Loop | Observation semantic advance 与连续 stale state intervention |
+| SWE-048 | L5 Graph | recovery retry 的 execution phase 可启动性预检 |
+| SWE-049 | L3/Invocation | phase action-contract rejection 与 malformed response 分离 |
+| SWE-050 | L2/L5 finalization | TerminalSummary v2 的 task-published/workspace/settlement 事实 |
+| SWE-051 | L4 / Run authority | RunID durable budget ledger、Activation-local progress 与显式 execution limit 分离 |
+| SWE-052 | L3/Invocation | Observation 独立 reasoning=none + exact Control Invocation，不混入业务 replay |
+| SWE-053 | L5/外部 Harness | RecoveryStartPermit 与 Run ledger/trace/terminal reservation 架构门 |
+| SWE-054 | L3/Invocation | provider quota/billing typed failure，与 429 rate limit 分离 |
+| SWE-055 | L4 Loop | RecoveryRequestIntervene/Cancel 穷尽执行，unknown durable 交 L5 |
+| SWE-056 | 外部 Harness | startup typed infra error、batch finally summary 与 current-run 状态行 |
 
 ## 3. 实施总原则
 
@@ -834,10 +862,9 @@ canonical contract、durable authority 和主要 production cutover 已完成，
 10. `docs/activate/KNOWN_ISSUES.md` 只保留仍可复现的真实开放问题；
 11. `AGENTS.md` 仅在运行时契约实际落地后按切片同步，不提前宣称目标设计已实现。
 
-当前状态为“Responses 主链实现与仓库验证完成，单题架构门与任务正确率门均通过，
-legacy 退出与8题证据开放”。两阶段 TerminalIntent、typed Invocation、Context v8、
-Loop checkpoint/intervention/deliverable phase、simple Graph/current transaction 与仓库
-harness 已完成代码收口；SWE-011～028 仍按各自外部 closure 条件保持
-validation-open。已有 full/race/vet/build/真实二进制与最新 provider success Run，
-不再使用 compile-only 作为完成证据；尚未运行本阶段8题，路线图仍不能标为
-Implemented。
+当前状态为“Responses/五层主链实现、仓库验证与外部架构门完成，
+legacy 退出仍开放”。已有 full/race/vet/build/真实二进制、DeepSeek 8 题
+`architecture_ok=8/8 / task_resolved=6/8` 以及两道失败题定向 resolved 证据，
+不再使用 compile-only 作为完成证据。由于 legacy Graph/Chat 退出、
+三平台 CI 与部分早期 issue closure 仍未全部满足，路线图整体仍不标为
+Implemented；SWE-041～045 子集已关闭。

@@ -92,6 +92,7 @@ func buildAgentRuntime(
 		return config.AgentRuntimeConfig{}, fmt.Errorf(
 			"kind=%q 既未声明 profile 也未声明 tools——必须二选一", kind.Kind)
 	}
+	allowed = config.EffectiveAgentTools(allowed)
 
 	// 读入 system prompt 文件
 	promptBytes, err := os.ReadFile(kind.SystemPromptFile)
@@ -106,6 +107,10 @@ func buildAgentRuntime(
 	if model == "" {
 		model = llmCfg.DefaultModel
 	}
+	capability, err := llmCfg.ResolveModelCapability(model)
+	if err != nil {
+		return config.AgentRuntimeConfig{}, fmt.Errorf("kind=%q 模型能力档案无效: %w", kind.Kind, err)
+	}
 
 	// 构建团队能力感知提示词：列出系统中所有 Agent 类型及其能力边界
 	teamAwareness, err := buildTeamAwareness(kind, allKinds, toolProfiles)
@@ -114,15 +119,18 @@ func buildAgentRuntime(
 	}
 
 	rt := config.AgentRuntimeConfig{
-		InstanceID:     fmt.Sprintf("%s-%d", kind.Kind, replicaIndex),
-		Kind:           kind.Kind,
-		EventType:      kind.EventType,
-		AllowedTools:   allowed,
-		Model:          model,
-		SystemPrompt:   string(promptBytes),
-		TaskMaxRetries: kind.TaskMaxRetries,
-		TeamAwareness:  teamAwareness,
-		IdleThreshold:  idleThreshold,
+		InstanceID:               fmt.Sprintf("%s-%d", kind.Kind, replicaIndex),
+		Kind:                     kind.Kind,
+		EventType:                kind.EventType,
+		AllowedTools:             allowed,
+		Model:                    model,
+		ModelContextWindowTokens: capability.ContextWindowTokens,
+		ModelMaxCompletionTokens: capability.MaxCompletionTokens,
+		ModelCapabilityDigest:    capability.Digest,
+		SystemPrompt:             string(promptBytes),
+		TaskMaxRetries:           kind.TaskMaxRetries,
+		TeamAwareness:            teamAwareness,
+		IdleThreshold:            idleThreshold,
 	}
 	return rt, nil
 }
@@ -218,10 +226,14 @@ func buildSchedulerRuntime(sched config.SchedulerKind, llmCfg config.LLMConfig) 
 	if model == "" {
 		model = llmCfg.DefaultModel
 	}
+	capability, _ := llmCfg.ResolveModelCapability(model)
 	return config.AgentRuntimeConfig{
-		InstanceID: "scheduler",
-		Kind:       "scheduler",
-		Model:      model,
+		InstanceID:               "scheduler",
+		Kind:                     "scheduler",
+		Model:                    model,
+		ModelContextWindowTokens: capability.ContextWindowTokens,
+		ModelMaxCompletionTokens: capability.MaxCompletionTokens,
+		ModelCapabilityDigest:    capability.Digest,
 		// AllowedTools / SystemPrompt 仍由 internal/scheduler 内部决定。
 	}
 }

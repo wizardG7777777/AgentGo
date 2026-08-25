@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 
@@ -26,6 +27,30 @@ type ToolRegistry struct {
 	defs         []llm.ToolDef
 	defaults     map[string]map[string]any
 	allowedTools map[string]bool // nil = 允许全部
+}
+
+// WithDefinitionParameters 返回只改写一个 model-visible schema 的克隆视图。
+// handler/defaults 与原 Registry 共享，Parameters 经 JSON 深拷贝，不能污染
+// 后续 Invocation 的冻结工具定义。
+func (r *ToolRegistry) WithDefinitionParameters(name string, mutate func(map[string]any)) *ToolRegistry {
+	if r == nil {
+		return nil
+	}
+	view := r.Filtered(r.Names())
+	for i := range view.defs {
+		if view.defs[i].Name != name {
+			continue
+		}
+		encoded, _ := json.Marshal(view.defs[i].Parameters)
+		var parameters map[string]any
+		_ = json.Unmarshal(encoded, &parameters)
+		if parameters == nil {
+			parameters = make(map[string]any)
+		}
+		mutate(parameters)
+		view.defs[i].Parameters = parameters
+	}
+	return view
 }
 
 func NewToolRegistry() *ToolRegistry {

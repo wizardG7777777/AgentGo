@@ -14,25 +14,32 @@ import (
 type FailureKind string
 
 const (
-	FailureRequestTimeout        FailureKind = "request_timeout"
-	FailureCallerCancelled       FailureKind = "caller_cancelled"
-	FailureAttemptDeadline       FailureKind = "attempt_deadline"
-	FailureActivationDeadline    FailureKind = "activation_deadline"
-	FailureTransport             FailureKind = "transport_failure"
-	FailureRateLimited           FailureKind = "rate_limited"
-	FailureProviderUnavailable   FailureKind = "provider_unavailable"
-	FailureContextWindowExceeded FailureKind = "context_window_exceeded"
-	FailureContextAssembly       FailureKind = "context_assembly_rejected"
-	FailureOutputTruncated       FailureKind = "output_truncated"
-	FailureOutputLimitExceeded   FailureKind = "output_limit_exceeded"
-	FailureMalformedResponse     FailureKind = "malformed_response"
-	FailureContentFiltered       FailureKind = "content_filtered"
-	FailureAuth                  FailureKind = "auth_failure"
-	FailurePermissionDenied      FailureKind = "permission_denied"
-	FailureModelUnavailable      FailureKind = "model_unavailable"
-	FailureInvalidRequest        FailureKind = "invalid_request"
-	FailureProtocolIncompatible  FailureKind = "protocol_incompatible"
-	FailureUnknown               FailureKind = "unknown"
+	FailureRequestTimeout     FailureKind = "request_timeout"
+	FailureCallerCancelled    FailureKind = "caller_cancelled"
+	FailureAttemptDeadline    FailureKind = "attempt_deadline"
+	FailureActivationDeadline FailureKind = "activation_deadline"
+	FailureTransport          FailureKind = "transport_failure"
+	FailureRateLimited        FailureKind = "rate_limited"
+	// FailureProviderQuotaExhausted 表示 provider 账户/项目的计费额度或余额
+	// 已耗尽。它不同于瞬时 429 rate limit，也不同于认证失败；同一 Run 内
+	// 重试或改 Context 都不会恢复，必须等待外部资源状态改变。
+	FailureProviderQuotaExhausted FailureKind = "provider_quota_exhausted"
+	FailureProviderUnavailable    FailureKind = "provider_unavailable"
+	FailureContextWindowExceeded  FailureKind = "context_window_exceeded"
+	FailureContextAssembly        FailureKind = "context_assembly_rejected"
+	FailureOutputTruncated        FailureKind = "output_truncated"
+	FailureOutputLimitExceeded    FailureKind = "output_limit_exceeded"
+	FailureMalformedResponse      FailureKind = "malformed_response"
+	// FailureActionContractRejected 表示 response 结构合法，但 ToolRouter/L3
+	// 阶段契约拒绝了动作。它不能混入 provider malformed_response。
+	FailureActionContractRejected FailureKind = "action_contract_rejected"
+	FailureContentFiltered        FailureKind = "content_filtered"
+	FailureAuth                   FailureKind = "auth_failure"
+	FailurePermissionDenied       FailureKind = "permission_denied"
+	FailureModelUnavailable       FailureKind = "model_unavailable"
+	FailureInvalidRequest         FailureKind = "invalid_request"
+	FailureProtocolIncompatible   FailureKind = "protocol_incompatible"
+	FailureUnknown                FailureKind = "unknown"
 )
 
 // Phase 标识失败发生在 Invocation 的哪个阶段。
@@ -181,9 +188,9 @@ func (f *Failure) Validate() error {
 func validFailureKind(kind FailureKind) bool {
 	switch kind {
 	case FailureRequestTimeout, FailureCallerCancelled, FailureAttemptDeadline, FailureActivationDeadline,
-		FailureTransport, FailureRateLimited, FailureProviderUnavailable,
+		FailureTransport, FailureRateLimited, FailureProviderQuotaExhausted, FailureProviderUnavailable,
 		FailureContextWindowExceeded, FailureContextAssembly, FailureOutputTruncated, FailureOutputLimitExceeded,
-		FailureMalformedResponse, FailureContentFiltered, FailureAuth,
+		FailureMalformedResponse, FailureActionContractRejected, FailureContentFiltered, FailureAuth,
 		FailurePermissionDenied, FailureModelUnavailable, FailureInvalidRequest,
 		FailureProtocolIncompatible, FailureUnknown:
 		return true

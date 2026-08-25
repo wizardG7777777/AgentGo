@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-// TestRender_BudgetRespected：渲染永不超预算；高优先级段（目标/阶段）
-// 在预算紧张时保留，低优先级段（失败尝试/下一步候选）先被裁掉。
+// TestRender_BudgetRespected：渲染永不超预算；高优先级当前状态
+// （目标/阶段/下一步）在预算紧张时先于历史动作保留。
 func TestRender_BudgetRespected(t *testing.T) {
 	m := New("task-1")
 	m.Goal = "实现一个非常重要的功能，需要多步完成"
@@ -21,7 +21,7 @@ func TestRender_BudgetRespected(t *testing.T) {
 	}
 	m.NextCandidates = []string{"候选甲", "候选乙"}
 
-	for _, budget := range []int{DefaultRenderBudget, 400, 200} {
+	for _, budget := range []int{1500, 400, 200} {
 		out := Render(m, budget)
 		if got := len([]rune(out)); got > budget {
 			t.Fatalf("budget=%d 时渲染 %d runes 超预算", budget, got)
@@ -34,16 +34,30 @@ func TestRender_BudgetRespected(t *testing.T) {
 		}
 	}
 	// 充足预算下各段齐全。
-	full := Render(m, DefaultRenderBudget)
+	full := Render(m, 1500)
 	for _, want := range []string{"目标:", "约束:", "阶段:", "已完成动作:", "失败尝试:", "下一步候选:"} {
 		if !strings.Contains(full, want) {
 			t.Errorf("充足预算下缺少段 %q: %q", want, full)
 		}
 	}
-	// 紧张预算下低优先级段先让位。
+	// 紧张预算下历史动作不得抢占当前下一步。
 	tight := Render(m, 200)
-	if strings.Contains(tight, "下一步候选:") && !strings.Contains(tight, "已完成动作:") {
-		t.Errorf("紧张预算下低优先级段不应抢占高优先级段: %q", tight)
+	if strings.Contains(tight, "已完成动作:") && !strings.Contains(tight, "下一步候选:") {
+		t.Errorf("紧张预算下历史动作不应抢占当前状态: %q", tight)
+	}
+}
+
+func TestRenderWithoutLocalBudgetIncludesCompleteBoundedState(t *testing.T) {
+	m := New("task-complete")
+	m.Goal = strings.Repeat("目标", 1000)
+	for i := 0; i < MaxActions; i++ {
+		m.Actions = append(m.Actions, ActionRecord{Caption: fmt.Sprintf("read_file-%02d", i)})
+	}
+	m.NextCandidates = []string{"实施修复", "运行 typed check"}
+	out := Render(m, 0)
+	if !strings.Contains(out, strings.Repeat("目标", 1000)) ||
+		!strings.Contains(out, "实施修复") || !strings.Contains(out, "read_file-00") {
+		t.Fatalf("无本地预算时必须完整渲染结构上已有状态: len=%d", len([]rune(out)))
 	}
 }
 
@@ -72,7 +86,7 @@ func TestRender_InferredFactsNotRendered(t *testing.T) {
 		{Text: "模型声称测试通过", Confirmed: false, UpdatedAt: time.Now()},
 		{Text: "用户决定: 走方案 B", Confirmed: true, UpdatedAt: time.Now()},
 	}
-	out := Render(m, DefaultRenderBudget)
+	out := Render(m, 1500)
 	if strings.Contains(out, "模型声称测试通过") {
 		t.Errorf("inferred 事实不得渲染: %q", out)
 	}
@@ -86,7 +100,7 @@ func TestRender_FileHashAbbreviated(t *testing.T) {
 	m := New("task-1")
 	m.Goal = "g"
 	m.Files = []FileVersion{{Path: "a.go", Hash: "0123456789abcdef", UpdatedAt: time.Now()}}
-	out := Render(m, DefaultRenderBudget)
+	out := Render(m, 1500)
 	if !strings.Contains(out, "a.go (hash:01234567)") {
 		t.Errorf("文件版本应带 hash 缩写: %q", out)
 	}

@@ -1200,7 +1200,8 @@ func formatEventDetails(ev Event) string {
 		if ev.Description != "" {
 			parts = append(parts, fmt.Sprintf("summary=%q", truncate(ev.Description, 200)))
 		}
-	case KindTaskMemoryCreated, KindTaskMemoryUpdated, KindTaskMemoryCheckpointed:
+	case KindTaskMemoryCreated, KindTaskMemoryUpdated, KindTaskMemoryCheckpointed,
+		KindObservationDeltaRecorded, KindObservationCheckpointFailed:
 		// CM2 Task Memory：Description 是段计数 JSON 摘要（不含正文）；
 		// checkpoint 事件带 Reason（history_compaction / attempt_end / terminal:*）。
 		parts = appendReason(parts, "reason", ev.Reason)
@@ -1482,7 +1483,8 @@ func eventCarriesLoop(kind EventKind) bool {
 	case KindLLMCallStart, KindLLMCallEnd, KindToolCall, KindToolResult,
 		KindHistoryCompaction, KindProgressNotify,
 		KindTaskCancelled, KindContextManifestBuilt,
-		KindTaskMemoryUpdated, KindTaskMemoryCheckpointed,
+		KindTaskMemoryUpdated, KindTaskMemoryCheckpointed, KindObservationDeltaRecorded,
+		KindObservationCheckpointFailed,
 		KindToolCallSkipped:
 		return true
 	default:

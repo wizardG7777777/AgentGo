@@ -178,7 +178,7 @@ func (rt *taskMemRuntime) refreshCarrier() {
 	if rt == nil || rt.mem == nil || rt.carrier == nil {
 		return
 	}
-	rt.carrier.text = taskmem.Render(rt.mem, taskmem.DefaultRenderBudget)
+	rt.carrier.text = taskmem.Render(rt.mem, 0)
 	rt.carrier.version = rt.mem.Version
 }
 
@@ -188,6 +188,14 @@ func (rt *taskMemRuntime) refreshCarrier() {
 func (rt *taskMemRuntime) applySettledTurn(a *Agent, taskID string, result ExecuteResult, loop int) {
 	if rt == nil || rt.mem == nil {
 		return
+	}
+	// record_observation_delta 在工具 handler 内直接更新共享 Store；先刷新
+	// 本地副本，避免随后用旧 TaskMemory 覆盖刚落盘的 Observation 投影。
+	if executeResultCalledTool(result, "record_observation_delta") {
+		if fresh, err := rt.store.Load(taskID); err == nil && fresh != nil {
+			rt.mem = fresh
+			rt.refreshCarrier()
+		}
 	}
 	facts := rt.collectTurnFacts(a, taskID, result)
 	if !taskmem.ApplyTurn(rt.mem, facts) {
@@ -205,6 +213,25 @@ func (rt *taskMemRuntime) applySettledTurn(a *Agent, taskID string, result Execu
 		Loop:        loop,
 		Description: rt.mem.SummaryJSON(),
 	})
+}
+
+func (rt *taskMemRuntime) observationRef(attemptID string) string {
+	if rt == nil || rt.mem == nil {
+		return ""
+	}
+	if attemptID != "" && rt.mem.LatestObservationAttemptID != attemptID {
+		return ""
+	}
+	return rt.mem.LatestObservationDeltaRef
+}
+
+func executeResultCalledTool(result ExecuteResult, name string) bool {
+	for _, call := range result.ToolCalls {
+		if call.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // checkpoint 强制落盘并 emit task_memory_checkpointed（历史压缩前 /
@@ -288,10 +315,11 @@ func (rt *taskMemRuntime) collectTurnFacts(a *Agent, taskID string, result Execu
 		contentByRecord := matchTaskMemToolRecordContent(delta, result)
 		for i, rec := range delta {
 			tf := taskmem.ToolCallFact{
-				Name:     rec.ToolName,
-				Target:   summarizeTaskMemTarget(rec.ToolName, rec.Args),
-				Success:  rec.Success,
-				ExitCode: rec.ExitCode,
+				Name:          rec.ToolName,
+				Target:        summarizeTaskMemTarget(rec.ToolName, rec.Args),
+				Success:       rec.Success,
+				ExitCode:      rec.ExitCode,
+				ExitCodeScope: string(rec.ExitCodeScope),
 			}
 			if content, matched := contentByRecord[i]; matched {
 				if !rec.Success {

@@ -426,6 +426,30 @@ func TestSDKClient_Chat_429_Recoverable(t *testing.T) {
 	}
 }
 
+func TestSDKClient_Chat_402_QuotaExhausted(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(402)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"message": "Insufficient Balance",
+				"type":    "unknown_error",
+				"code":    "invalid_request_error",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewSDKClient(server.URL+"/v1", "key", "gpt-4o", "", 30*time.Second)
+	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "test"}}, nil)
+	var unrecoverable *ErrUnrecoverable
+	if !errors.As(err, &unrecoverable) || unrecoverable.Failure == nil ||
+		unrecoverable.Failure.Kind != invocation.FailureProviderQuotaExhausted ||
+		unrecoverable.Failure.HTTPStatus != 402 {
+		t.Fatalf("HTTP 402 未分类为 provider_quota_exhausted: %T %+v", err, unrecoverable)
+	}
+}
+
 func TestSDKClient_Chat_500_Unrecoverable(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

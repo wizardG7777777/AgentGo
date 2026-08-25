@@ -109,6 +109,26 @@ func TestDetectRedirectWrite_Allowed(t *testing.T) {
 	}
 }
 
+func TestHasPipelineDistinguishesPipelineFromLiteralsAndLogicalOr(t *testing.T) {
+	tests := []struct {
+		command string
+		want    bool
+	}{
+		{"pytest -q 2>&1 | tail -20", true},
+		{"Get-Content a | Select-String error", true},
+		{"false || echo recovered", false},
+		{`echo "a | b"`, false},
+		{`echo a \| b`, false},
+		{"cat <<'EOF'\na | b\nEOF", false},
+		{"echo hi # a | b", false},
+	}
+	for _, test := range tests {
+		if got := HasPipeline(test.command); got != test.want {
+			t.Errorf("HasPipeline(%q)=%v want %v", test.command, got, test.want)
+		}
+	}
+}
+
 // 运行时白名单（allow_session）只能短路灰名单，不能覆盖重定向硬规则。
 func TestCommandFilter_RedirectWriteNotBypassedByWhitelist(t *testing.T) {
 	filter := NewCommandFilter(nil, []string{`^echo`})

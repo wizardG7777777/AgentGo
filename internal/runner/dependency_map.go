@@ -67,6 +67,7 @@ func resolveToolGroups(
 		// 让精简装配也不会遗漏写工具的同步 artifact ledger。
 		artifactStore, _ = deps.Store.(store.StoreHookView)
 	}
+	recoveryAuthority, _ := deps.OutletChecker.(tools.RecoveryDecisionAuthority)
 	return []tools.ToolGroup{
 		readGroup,
 		tools.ContentRefGroup{
@@ -94,6 +95,17 @@ func resolveToolGroups(
 			ActiveViewer:        activeViewer,
 			EffectJournal:       deps.EffectJournal,
 		},
+		tools.CheckGroup{
+			Shell: tools.ShellGroup{
+				Workdir: workdir, TimeoutSec: deps.ShellTimeoutSec, Interactions: deps.Interactions,
+				SessionID: deps.SessionID, AgentID: instanceID, Filter: deps.ShellFilter,
+				ExtraGreylist: acceptanceShellGreylist(allowedTools), Modes: deps.Modes,
+				InteractionWaitHook: interactionWaitHook, ActiveViewer: activeViewer,
+				EffectJournal: deps.EffectJournal,
+			},
+			TaskStore: deps.Store, Checks: deps.CheckStore, ContentStore: deps.ContentStore,
+			Holder: holder, SessionID: deps.SessionID,
+		},
 		tools.MetaGroup{
 			Store:               deps.Store,
 			Holder:              holder,
@@ -114,6 +126,12 @@ func resolveToolGroups(
 			SubmitState:          submitState,
 			ArtifactResolver:     agent.NewArtifactPhysicalResolver(deps.ProjectRoot, deps.WorkspaceManager),
 			OutletChecker:        deps.OutletChecker,
+			Checks:               deps.CheckStore,
+			RecoveryAuthority:    recoveryAuthority,
+			Checkpoints:          deps.LoopStore,
+		},
+		tools.ObservationGroup{
+			Store: deps.Store, TaskMem: deps.TaskMemStore, Holder: holder, AgentID: instanceID, Checks: deps.CheckStore,
 		},
 	}
 }

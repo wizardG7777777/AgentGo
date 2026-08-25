@@ -13,12 +13,23 @@ import (
 	"agentgo/internal/modes"
 	"agentgo/internal/pathutil"
 	"agentgo/internal/shell"
+	"agentgo/internal/store"
 	"agentgo/internal/tools/schema"
 	"agentgo/internal/trace"
 )
 
 // defaultShellTimeoutSec 当未显式配置 TimeoutSec 时的默认超时（秒）。
 const defaultShellTimeoutSec = 30
+
+func shellPipelineScope(args map[string]any) (bool, error) {
+	command, _ := args["command"].(string)
+	hasPipeline := shell.HasPipeline(command)
+	acceptLastPipelineStatus, _ := args["accept_last_pipeline_exit_code"].(bool)
+	if hasPipeline && !acceptLastPipelineStatus {
+		return true, fmt.Errorf("reason_code=shell_pipeline_exit_scope_ambiguous：检测到 Shell pipeline，默认退出码只代表最后一个管道段，不能证明整条命令成功；suggested_action=remove_pipeline。仅当末段状态就是明确判定目标时，才可设置 accept_last_pipeline_exit_code=true")
+	}
+	return hasPipeline, nil
+}
 
 // ShellGroup 注册 run_shell 工具，包含黑名单与 Interaction 灰名单授权链路。
 //
@@ -103,6 +114,10 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 		command, _ := args["command"].(string)
 		if command == "" {
 			return "", fmt.Errorf("缺少 command 参数")
+		}
+		hasPipeline, err := shellPipelineScope(args)
+		if err != nil {
+			return "", err
 		}
 
 		// 确定有效超时：args 优先，其次 Group 配置。
@@ -191,7 +206,12 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 			}
 		}
 
+		exitScope := store.ShellExitCodeScopeWholeCommand
+		if hasPipeline {
+			exitScope = store.ShellExitCodeScopeLastPipelineCommand
+		}
 		execEv.ShellExec.ExitCode = exitCode
+		execEv.ShellExec.ExitCodeScope = string(exitScope)
 		if exitCode == 0 {
 			execEv.ShellExec.Outcome = "success"
 		} else {
@@ -200,12 +220,17 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 		trace.Emit(execEv)
 
 		if err := effectSettle(g.EffectJournal, effID,
-			fmt.Sprintf("exit_code=%d outcome=%s duration_ms=%d out_bytes=%d out_sha256=%s",
-				exitCode, execEv.ShellExec.Outcome, durationMS, len(output), digest12(output)), true); err != nil {
+			fmt.Sprintf("exit_code=%d exit_code_scope=%s outcome=%s duration_ms=%d out_bytes=%d out_sha256=%s",
+				exitCode, exitScope, execEv.ShellExec.Outcome, durationMS, len(output), digest12(output)), true); err != nil {
 			return "", err
 		}
 
-		return fmt.Sprintf("exit_code: %d\nstdout+stderr:\n%s", exitCode, outStr), nil
+		warning := ""
+		if exitScope == store.ShellExitCodeScopeLastPipelineCommand {
+			warning = "\nwarning: pipeline detected; exit_code 只代表最后一个管道段，禁止据此声称整条测试/构建命令通过"
+		}
+		return fmt.Sprintf("exit_code: %d\nexit_code_scope: %s%s\nstdout+stderr:\n%s",
+			exitCode, exitScope, warning, outStr), nil
 	}
 
 	// 构造过滤器：未提供时使用默认黑/灰名单。
@@ -229,6 +254,9 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 		if err != nil {
 			return "", err
 		}
+		if _, err := shellPipelineScope(args); err != nil {
+			return "", err
+		}
 		resolvedArgs := make(map[string]any, len(args)+1)
 		for key, value := range args {
 			resolvedArgs[key] = value
@@ -241,9 +269,10 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 		String("command", "要执行的 shell 命令", true).
 		String("working_dir", "执行命令的工作目录；普通任务必须位于 project_root 内，workspace 隔离任务必须位于该任务 workspace 内；留空使用当前允许根", false).
 		Int("timeout_sec", "本次执行的超时秒数，留空时使用配置默认值", false).
+		Bool("accept_last_pipeline_exit_code", "命令含 pipeline 时必须显式为 true 才执行；表示你接受 exit_code 仅属于最后一个管道段，且不会把它当成整条测试/构建命令的通过证据", false).
 		Build()
 
-	r.Register("run_shell", "[宿主机高权限能力，不是 OS 沙箱] 在受限工作目录下执行 shell 命令；命令正文仍可访问宿主绝对路径、网络和子进程。返回 stdout、stderr 和 exit code"+shellDialectNote(), params, wrappedFn)
+	r.Register("run_shell", "[宿主机高权限能力，不是 OS 沙箱] 在受限工作目录下执行 shell 命令；命令正文仍可访问宿主绝对路径、网络和子进程。返回 stdout、stderr、exit_code 与 exit_code_scope；pipeline 默认拒绝，避免末段 exit=0 被误判为整条命令成功"+shellDialectNote(), params, wrappedFn)
 }
 
 // shellCommand 根据当前操作系统返回合适的 shell 执行器和参数。

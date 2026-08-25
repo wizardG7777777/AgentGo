@@ -4,6 +4,8 @@ package terminaladapter
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -64,7 +66,9 @@ func ToTerminalFact(ctx context.Context, record outcomestore.Record, deps Depend
 		"status", "summary", "reason_code", "reason", "_task_outcome_ref",
 		"_run_id", "_attempt_id", "_attempt_no", "_result_ref",
 		"_checkpoint_ref", "_artifact_refs",
+		"_observation_delta_ref", "_failure_fingerprint",
 		"_checkpoint_state",
+		"_fulfillment",
 	} {
 		delete(result, key)
 	}
@@ -87,11 +91,18 @@ func ToTerminalFact(ctx context.Context, record outcomestore.Record, deps Depend
 	if value.CheckpointRef != "" {
 		result["_checkpoint_ref"] = value.CheckpointRef
 	}
+	if value.ObservationDeltaRef != "" {
+		result["_observation_delta_ref"] = value.ObservationDeltaRef
+	}
+	result["_failure_fingerprint"] = terminalFailureFingerprint(value)
 	if value.CheckpointState != "" {
 		result["_checkpoint_state"] = value.CheckpointState
 	}
 	if len(value.ArtifactRefs) > 0 {
 		result["_artifact_refs"] = append([]string(nil), value.ArtifactRefs...)
+	}
+	if value.Fulfillment != nil {
+		result["_fulfillment"] = value.Fulfillment
 	}
 
 	evidence := durableEvidence(value.EvidenceFacts)
@@ -107,8 +118,18 @@ func ToTerminalFact(ctx context.Context, record outcomestore.Record, deps Depend
 	return graph.TerminalFact{
 		GraphID: value.GraphID, NodeID: value.NodeID, ActivationID: value.ActivationID,
 		TaskID: value.TaskID, Status: status, Result: result,
-		Evidence: append([]graph.EvidenceEntry(nil), evidence...),
+		Evidence:    append([]graph.EvidenceEntry(nil), evidence...),
+		Fulfillment: value.Fulfillment,
 	}, nil
+}
+
+func terminalFailureFingerprint(value outcome.TaskOutcome) string {
+	payload := strings.Join([]string{
+		value.GraphID, value.NodeID, value.ActivationID, value.CheckpointRef,
+		value.ObservationDeltaRef, value.ReasonCode,
+	}, "\x00")
+	sum := sha256.Sum256([]byte(payload))
+	return "failure:sha256:" + hex.EncodeToString(sum[:])
 }
 
 func durableEvidence(values []outcome.EvidenceFact) []graph.EvidenceEntry {

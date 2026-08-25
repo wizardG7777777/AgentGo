@@ -54,6 +54,12 @@ func TestRunContractPhaseWindows(t *testing.T) {
 	if err := contract.ValidatePhaseAt(created.Add(58*time.Minute), PhaseFinalization); err != nil {
 		t.Fatalf("finalization 应可使用最终 reserve: %v", err)
 	}
+	if got := contract.PhaseStartDeadline(PhaseExecution); !got.Equal(created.Add(45 * time.Minute)) {
+		t.Fatalf("execution start deadline=%s", got)
+	}
+	if got := contract.PhaseStartRemaining(created.Add(44*time.Minute), PhaseExecution); got != time.Minute {
+		t.Fatalf("execution start remaining=%s", got)
+	}
 }
 
 func TestBudgetUsageRejectsNegative(t *testing.T) {

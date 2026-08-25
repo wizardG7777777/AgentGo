@@ -27,6 +27,8 @@ llm:
   default_model: "__MODEL__"
   protocol: "__PROTOCOL__"
   timeout_sec: 300
+  default_context_window_tokens: 1048576
+  default_max_completion_tokens: 65536
   # SWE 主链显式开启 reasoning。大多数机械阶段使用 auto + singleton
   # ToolRouter + L3 required-action gate；Graph 最终交付仅在该次 invocation 覆盖为
   # reasoning=none + exact submit_task_result，以逃离 provider 对历史工具的粘滞重放。
@@ -52,6 +54,7 @@ tool_profiles:
     - write_file
     - edit_file
     - run_shell
+    - run_check
     - send_message
     - request_replan
     - submit_task_result

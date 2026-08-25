@@ -225,6 +225,12 @@ func (rt *Runtime) startCommittedExecution(doc *GraphDocument) (string, error) {
 		}
 		return activationID, nil
 	}
+	// 一个 Run 对应一个用户请求顶层 Graph。终态 Graph 后的恢复只能走
+	// GraphChangeProposal/新用户 Run，不能用另一个 GraphID 重新执行业务。
+	// subgraph 在父 activation 已冻结 ChildGraphID 后启动，按该 durable 事实豁免。
+	if err := rt.validateSingleTopLevelGraphLocked(doc); err != nil {
+		return "", err
+	}
 
 	if err := rt.store.createExecution(doc); err != nil {
 		trace.Emit(trace.Event{Kind: trace.KindGraphSubmissionRejected, GraphID: doc.GraphID, Error: err.Error()})
@@ -250,6 +256,21 @@ func (rt *Runtime) startCommittedExecution(doc *GraphDocument) (string, error) {
 		return "", fmt.Errorf("graph: Execution %s 启动后缺少 root Activation", doc.GraphID)
 	}
 	return activationID, nil
+}
+
+func (rt *Runtime) runtimeGraphIsChildLocked(graphID string) bool {
+	for _, candidate := range rt.store.List() {
+		doc, ok := rt.store.Get(candidate.GraphID)
+		if !ok {
+			continue
+		}
+		for _, childID := range materializedChildGraphIDs(doc) {
+			if childID == graphID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // AdoptCommittedDefinition 将 AuthoringStore 已 commit 的新 revision 换入当前

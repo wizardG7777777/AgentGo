@@ -42,6 +42,12 @@ llm:
   default_model: gpt-4o                 # 推荐必填；Scheduler/模板/静态 Agent 的默认
   protocol: responses                   # 缺省；旧端点才显式 chat_completions
   timeout_sec: 120                      # 可选；省略时 runtime 使用 60 秒
+  default_context_window_tokens: 1048576 # 缺省 1M；进入冻结 ModelCapability
+  default_max_completion_tokens: 65536  # 缺省 64K
+  model_capabilities:                   # 可选，按精确模型名覆盖
+    small-model:
+      context_window_tokens: 131072
+      max_completion_tokens: 16384
   # reasoning_effort: medium            # 仅为支持该参数的模型启用；空值表示不发送
   stream: true                          # 可选；启用所选 protocol 的 SSE
 ```
@@ -53,6 +59,8 @@ llm:
 - `protocol` 只允许 `responses` / `chat_completions`，运行中不自动回退。Responses
   只把 typed `function_call` item 当作工具行动，正文标记永不执行
 - `reasoning_effort` 接受 OpenAI 当前公开取值的并集：`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`；具体模型可能只支持其中一部分，不支持时由上游 API 返回模型级错误
+- Context v9 默认按 1M/64K 编译；`model_capabilities` 只按精确模型名覆盖，不按 provider 名称猜测。窗口必须大于 completion + 16384 protocol reserve。能力与 digest 冻结进 ExecutionLease，retry 不漂移。
+- 默认 Run profile 只统计 prompt/completion tokens，不以 token 数量停止任务；只有 RunContract 显式非零 token budget 才形成硬限制。时间、模型调用、工具动作和 Attempt 护栏仍生效。
 - `stream: true` 对所有经统一 LLM 工厂创建的调用生效，包括 Scheduler、预热 Agent、模板/Team Agent、one-shot spawn Agent 和用户 Reactor 的 `invoke_llm`
 - 流式正文/reasoning 会以同一 `stream_id` 的独立累积快照推送到 TUI/Web；工具调用只有在完整 typed output item 完成后才交给 Agent，避免半截参数触发工具
 

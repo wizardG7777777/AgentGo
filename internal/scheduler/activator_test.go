@@ -51,7 +51,7 @@ func TestActivator_EventUserInput_PublishesSchedulerTask(t *testing.T) {
 	if task.MaxConcurrency != 1 {
 		t.Errorf("expected MaxConcurrency=1, got %d", task.MaxConcurrency)
 	}
-	if task.ProgressContract == nil || task.ProgressContract.Ref.ContractID != policycatalog.ProgressCoordinationV1 {
+	if task.ProgressContract == nil || task.ProgressContract.Ref.ContractID != policycatalog.ProgressCoordinationCurrent {
 		t.Fatalf("root Scheduler Task 未冻结 coordination ProgressContract: %+v", task.ProgressContract)
 	}
 	if task.ContextPolicyRef != policycatalog.ContextDefaultCurrent {

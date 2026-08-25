@@ -12,6 +12,8 @@
 //   - WebGroup：web_search / web_fetch（Worker + Explorer 共享）
 //   - ShellGroup：run_shell（仅 Worker，含审批拦截链）
 //   - MetaGroup：publish_task / send_message（Worker、Explorer 各有不同变体）
+//   - ObservationGroup：record_observation_delta（结构化工作状态检查点）
+//   - CheckGroup：run_check（带 workspace revision 的 durable 检查）
 package tools
 
 import (

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/checkstore"
 	"agentgo/internal/config"
 	"agentgo/internal/contentstore"
 	"agentgo/internal/effect"
@@ -34,6 +35,7 @@ import (
 	"agentgo/internal/prompt"
 	reactorbuiltin "agentgo/internal/reactor/builtin"
 	"agentgo/internal/roster"
+	"agentgo/internal/runbudget"
 	"agentgo/internal/shell"
 	"agentgo/internal/store"
 	"agentgo/internal/taskmem"
@@ -67,11 +69,13 @@ type RunnerDeps struct {
 	Memory memory.Store
 	// TaskMemStore 是 V6 §3 Task Memory（CM2，internal/taskmem）的共享存储。
 	// 为 nil 时 Agent 的 Task Memory 链路整链关闭（不创建/更新/注入）。
-	TaskMemStore *taskmem.Store
-	LoopStore    *loopstore.Store
+	TaskMemStore   *taskmem.Store
+	LoopStore      *loopstore.Store
+	RunBudgetStore *runbudget.Store
 	// ContentStore 是 L3 ContentRef 权威。生产 bootstrap 始终注入；nil 只供
 	// 不涉及 Context 外置的隔离单测/legacy 构造。
 	ContentStore *contentstore.Store
+	CheckStore   *checkstore.Store
 	// ContextRuntime 是 L2 唯一编译/快照 authority。生产必须注入。
 	ContextRuntime agent.ContextRuntime
 	// RouteValidator is the shared runtime route authority. It lets every
@@ -198,7 +202,10 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 		agent.SetInteractionWaitState(a, holder.Get(), waiting)
 	}
 
-	toolReg := agent.NewToolRegistryWithAllowlist(rt.AllowedTools)
+	// ObservationDelta 是框架控制能力：新 Runner 自动注册，不要求用户在
+	// profile 重复声明。显式 Graph capability 仍会在 Lease 换入时决定本
+	// activation 是否可见，旧冻结 Graph 不会被就地扩权。
+	toolReg := agent.NewToolRegistryWithAllowlist(config.EffectiveAgentTools(rt.AllowedTools))
 
 	// §11.6.2 工具 → 依赖项映射由 dependency_map.go 集中管理；
 	// rt.AllowedTools 除注册剪枝外还用于验收角色的 shell 加固判定。
@@ -270,6 +277,9 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 		deps.Activity.RegisterAgent(rt.InstanceID, agentType)
 	}
 	a.Model = rt.Model
+	a.ModelContextWindowTokens = rt.ModelContextWindowTokens
+	a.ModelMaxCompletionTokens = rt.ModelMaxCompletionTokens
+	a.ModelCapabilityDigest = rt.ModelCapabilityDigest
 	a.SessionID = deps.SessionID
 	a.OnTaskStart = func(taskID string) { holder.Set(taskID); finHolder.Set(taskID) }
 	a.FinalizationChecker = finHolder
@@ -318,6 +328,7 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	a.Memory = deps.Memory
 	a.TaskMemStore = deps.TaskMemStore
 	a.LoopStore = deps.LoopStore
+	a.RunBudgetStore = deps.RunBudgetStore
 	a.ContentStore = deps.ContentStore
 	// V6 §4 H1：exec 轴模式源注入（ExecutionLease 的 Policy 交集输入）。
 	a.Modes = deps.Modes

@@ -42,7 +42,10 @@ type LLMConfig struct {
 	ReasoningEffort string `yaml:"reasoning_effort,omitempty" json:"reasoning_effort,omitempty"`
 	// Stream 启用所选 protocol 的 SSE。客户端只在完整 typed output item 完成后
 	// 返回 Response，partial 参数永不 dispatch；UI 可观察独立正文/reasoning delta。
-	Stream bool `yaml:"stream" json:"stream"`
+	Stream                     bool                             `yaml:"stream" json:"stream"`
+	DefaultContextWindowTokens int64                            `yaml:"default_context_window_tokens,omitempty" json:"default_context_window_tokens,omitempty"`
+	DefaultMaxCompletionTokens int64                            `yaml:"default_max_completion_tokens,omitempty" json:"default_max_completion_tokens,omitempty"`
+	ModelCapabilities          map[string]ModelCapabilityConfig `yaml:"model_capabilities,omitempty" json:"model_capabilities,omitempty"`
 }
 
 // OpenAIReasoningEfforts is the current union of reasoning-effort values
@@ -238,13 +241,16 @@ func (c UIConfig) HasFrontend(name string) bool {
 // 本结构的 Model 字段仅作为运行时元数据使用——主要用途是 HistoryEntry.Model 记录
 // （详见 nextUpgrade_v4.md §11.7.3 模型切换基准重置）与运行时日志。
 type AgentRuntimeConfig struct {
-	InstanceID     string
-	Kind           string
-	EventType      string
-	AllowedTools   []string
-	Model          string
-	SystemPrompt   string
-	TaskMaxRetries int
+	InstanceID               string
+	Kind                     string
+	EventType                string
+	AllowedTools             []string
+	Model                    string
+	ModelContextWindowTokens int64
+	ModelMaxCompletionTokens int64
+	ModelCapabilityDigest    string
+	SystemPrompt             string
+	TaskMaxRetries           int
 	// IdleThreshold 对应全局 agent_idle_threshold：agent 连续 N 次空闲轮询后
 	// 退出 goroutine；0 = 永不空闲退出（生产推荐，见 Config.AgentIdleThreshold）。
 	// AgentKind 没有 per-kind 覆盖字段，各 AgentRuntimeConfig 构造点统一填全局值；
@@ -554,6 +560,9 @@ func (c *Config) Validate() error {
 	if c.LLM.ReasoningEffort != "" && !isOpenAIReasoningEffort(c.LLM.ReasoningEffort) {
 		return fmt.Errorf("llm.reasoning_effort=%q 无效；允许值: %s",
 			c.LLM.ReasoningEffort, strings.Join(OpenAIReasoningEfforts, ", "))
+	}
+	if err := c.LLM.validateModelCapabilities(); err != nil {
+		return err
 	}
 
 	// 规则 9：所有 v4 路径字段不含反斜杠（路径风格红线）。

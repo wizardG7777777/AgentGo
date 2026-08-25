@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"agentgo/internal/agent"
+	"agentgo/internal/fulfillment"
 	"agentgo/internal/graph"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/loopstore"
@@ -140,6 +142,10 @@ func (a *graphTaskOutcomeAuthority) Commit(intent store.TerminalOutcomeIntent) (
 	if err != nil {
 		return "", err
 	}
+	observationRef, err := a.currentObservationRef(task)
+	if err != nil {
+		return "", err
+	}
 	reason, reasonCode := "", ""
 	if status != outcome.StatusCompleted {
 		reason = strings.TrimSpace(task.Error)
@@ -154,15 +160,25 @@ func (a *graphTaskOutcomeAuthority) Commit(intent store.TerminalOutcomeIntent) (
 			reasonCode = "task_" + string(status)
 		}
 	}
+	fulfillmentRecord, err := fulfillmentFromTask(task)
+	if err != nil {
+		return "", err
+	}
+	schema := outcome.SchemaV1
+	if task.FulfillmentContract != nil {
+		schema = outcome.SchemaV2
+	}
 	value := outcome.TaskOutcome{
-		Schema: outcome.SchemaV1, RunID: task.RunID,
+		Schema: schema, RunID: task.RunID,
 		GraphID: task.GraphID, NodeID: task.NodeID, ActivationID: task.ActivationID,
 		TaskID: task.ID, AttemptID: task.AttemptID, AttemptNo: task.AttemptNo,
 		Status: status, Summary: summary, Result: result,
 		TaskResults:  cloneTaskResults(task.Results),
 		EvidenceRefs: evidenceRefs, ArtifactRefs: artifactRefs,
 		EvidenceFacts: evidenceFacts, ArtifactFacts: artifactFacts,
-		ReasonCode: reasonCode, Reason: reason, CheckpointRef: checkpointRef, CheckpointState: checkpointState,
+		ReasonCode: reasonCode, Reason: reason, CheckpointRef: checkpointRef,
+		ObservationDeltaRef: observationRef, CheckpointState: checkpointState,
+		Fulfillment: fulfillmentRecord,
 		CommittedAt: task.CompletedAt,
 	}
 	record, err := a.outcomes.Commit(value)
@@ -239,6 +255,7 @@ func (a *graphTaskOutcomeAuthority) SettleTerminalIntent(intentRef string) (stor
 	}
 	return store.TerminalCheckpointBinding{
 		CheckpointRef: checkpoint.CheckpointID, CheckpointState: outcome.CheckpointStateSealed,
+		ObservationDeltaRef: checkpoint.ObservationDeltaRef,
 	}, nil
 }
 
@@ -248,11 +265,26 @@ func (a *graphTaskOutcomeAuthority) CommitTerminalOutcome(intentRef string, refr
 	if err != nil || !required {
 		return "", err
 	}
+	value.ObservationDeltaRef = binding.ObservationDeltaRef
 	record, err := a.outcomes.CommitIntent(intentRef, value, binding.CheckpointRef, binding.CheckpointState)
 	if err != nil {
 		return "", err
 	}
 	return record.OutcomeRef, nil
+}
+
+func (a *graphTaskOutcomeAuthority) currentObservationRef(task *model.Task) (string, error) {
+	if task == nil || task.ProgressContract == nil || strings.TrimSpace(task.AttemptID) == "" || a.checkpoints == nil {
+		return "", nil
+	}
+	checkpoint, ok, err := a.checkpoints.LoadCheckpoint(task.ID)
+	if err != nil {
+		return "", err
+	}
+	if !ok || checkpoint == nil || checkpoint.AttemptID != task.AttemptID {
+		return "", nil
+	}
+	return checkpoint.ObservationDeltaRef, nil
 }
 
 func (a *graphTaskOutcomeAuthority) buildOutcomeCandidate(intent store.TerminalOutcomeIntent) (outcome.TaskOutcome, bool, error) {
@@ -333,14 +365,44 @@ func (a *graphTaskOutcomeAuthority) buildOutcomeCandidate(intent store.TerminalO
 			reasonCode = "task_" + string(status)
 		}
 	}
+	fulfillmentRecord, fulfillmentErr := fulfillmentFromTask(task)
+	if fulfillmentErr != nil {
+		return outcome.TaskOutcome{}, true, fulfillmentErr
+	}
+	schema := outcome.SchemaV1
+	if task.FulfillmentContract != nil {
+		schema = outcome.SchemaV2
+	}
 	return outcome.TaskOutcome{
-		Schema: outcome.SchemaV1, RunID: task.RunID,
+		Schema: schema, RunID: task.RunID,
 		GraphID: task.GraphID, NodeID: task.NodeID, ActivationID: task.ActivationID,
 		TaskID: task.ID, AttemptID: task.AttemptID, AttemptNo: task.AttemptNo,
 		Status: status, Summary: summary, Result: result, TaskResults: cloneTaskResults(task.Results),
 		EvidenceRefs: evidenceRefs, ArtifactRefs: artifactRefs, EvidenceFacts: evidenceFacts, ArtifactFacts: artifactFacts,
 		ReasonCode: reasonCode, Reason: reason,
+		Fulfillment: fulfillmentRecord,
 	}, true, nil
+}
+
+func fulfillmentFromTask(task *model.Task) (*fulfillment.Record, error) {
+	if task == nil || task.FulfillmentContract == nil {
+		return nil, nil
+	}
+	raw := strings.TrimSpace(task.Results[agent.FulfillmentStorageKey])
+	if raw == "" {
+		if task.Status == model.TaskStatusCompleted {
+			return nil, fmt.Errorf("completed Task %s 缺少 fulfillment record", task.ID)
+		}
+		return nil, nil
+	}
+	var record fulfillment.Record
+	if err := json.Unmarshal([]byte(raw), &record); err != nil {
+		return nil, fmt.Errorf("解析 Task fulfillment: %w", err)
+	}
+	if err := record.Validate(task.FulfillmentContract); err != nil {
+		return nil, err
+	}
+	return &record, nil
 }
 
 func (a *graphTaskOutcomeAuthority) currentCheckpointRef(task *model.Task) (string, string, error) {
@@ -708,6 +770,7 @@ func outcomeEvidenceFact(entry graph.EvidenceEntry) outcome.EvidenceFact {
 		value := *entry.ExitCode
 		fact.ExitCode = &value
 	}
+	fact.ExitCodeScope = entry.ExitCodeScope
 	return fact
 }
 

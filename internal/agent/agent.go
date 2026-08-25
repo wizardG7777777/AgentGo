@@ -19,6 +19,7 @@ import (
 	"agentgo/internal/hook"
 	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/loopcontrol"
 	"agentgo/internal/loopstore"
 	"agentgo/internal/mailbox"
@@ -27,6 +28,7 @@ import (
 	"agentgo/internal/modes"
 	"agentgo/internal/output"
 	"agentgo/internal/roster"
+	"agentgo/internal/runbudget"
 	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
 	"agentgo/internal/taskmem"
@@ -54,15 +56,19 @@ type ExecuteResult struct {
 	InvocationID       string
 	ContextSnapshotID  string
 	InvocationDuration time.Duration
-	Output             string
-	ToolCalled         bool
-	Finalized          bool           // 由 FinalizationChecker 设置，表示任务已完成
-	AssistantContent   string         // LLM 原始回复文本（assistant 消息的 content）
-	Reasoning          string         // provider 返回的原始明文思维链（若有）
-	ToolCalls          []llm.ToolCall // LLM 请求的工具调用列表
-	ToolResults        []ToolResult   // 每个 tool call 对应的执行结果
-	PromptTokens       int            // 本次 LLM 调用消耗的 prompt tokens
-	CompletionTokens   int            // 本次 LLM 调用消耗的 completion tokens
+	// ProviderCallStarted 只在请求已经越过 L3 Invocation dispatch 边界后为
+	// true。ToolRouter/Context/Lease 等本地 preflight 失败不属于模型调用，
+	// RunBudget 与 L4 usage 不得仅因预留过 action slot 就把它记为 model_calls。
+	ProviderCallStarted bool
+	Output              string
+	ToolCalled          bool
+	Finalized           bool           // 由 FinalizationChecker 设置，表示任务已完成
+	AssistantContent    string         // LLM 原始回复文本（assistant 消息的 content）
+	Reasoning           string         // provider 返回的原始明文思维链（若有）
+	ToolCalls           []llm.ToolCall // LLM 请求的工具调用列表
+	ToolResults         []ToolResult   // 每个 tool call 对应的执行结果
+	PromptTokens        int            // 本次 LLM 调用消耗的 prompt tokens
+	CompletionTokens    int            // 本次 LLM 调用消耗的 completion tokens
 	// ExtraFields 是 assistant 消息里 openai-go 未识别的字段（如 DeepSeek V4 的
 	// reasoning_content）。由 LLM 客户端透传上来，agent 应把它挂到 HistoryEntry
 	// 上，buildMessages 下一轮重建 assistant 消息时原样回写给 API。
@@ -131,7 +137,10 @@ type Agent struct {
 	// Model 是该 Agent 当前生效的模型名，用于 HistoryEntry.Model 记录。
 	// nextUpgrade_v4.md §11.7.3：跨模型实测值不可比，压缩阈值估算
 	// 仅锚定当前模型一致的最近一条 PromptTokens > 0 条目。空串时退化为粗略估算。
-	Model string
+	Model                    string
+	ModelContextWindowTokens int64
+	ModelMaxCompletionTokens int64
+	ModelCapabilityDigest    string
 	// TokenStats 是 Agent 级别的累计 Token 消耗（§11.7.3），仅作 UI 实时视图
 	// 数据源，不写入 trace 账本。
 	// 运行期读写必须经 AddTokenStats / TokenStatsSnapshot（tokenMu 保护）——
@@ -149,6 +158,10 @@ type Agent struct {
 	// （2026-08-20 SWE-001 兜底 1，端口定义见 internal/hook/natural_exit.go）；
 	// bootstrap 仅为 scheduler 装配，nil 时不审查（单测直构与 worker 默认路径）。
 	NaturalExitReviewer hook.NaturalExitReviewer
+	// FinalizationFallback 由 L5 装配：final-report 的 L4 预算/介入触发时，
+	// 根据冻结 GraphTerminalSummary 生成确定性用户报告。它不得调用模型、
+	// 工具或修改 Graph；nil 时沿普通 blocked/intervention 路径。
+	FinalizationFallback func(context.Context, *model.Task) (string, error)
 	// SubmitState 暂存 submit_task_result 工具写入的结构化提交（已通过 ExpectedArtifacts 校验、待消费）。
 	// finalization 短路分支 Take 命中时以其渲染文本替代 lastOutput 收尾（Cause=submit_task_result）；
 	// nil 或 Take 未命中时走 report_done 兼容路径（lastOutput），行为与旧版完全一致。
@@ -258,6 +271,9 @@ type Agent struct {
 	// LoopStore 是 L4 Progress/Delta/Checkpoint 的 append-only 权威。新生产
 	// execution 必须注入；TaskMemory 不能替代它。
 	LoopStore *loopstore.Store
+	// RunBudgetStore 是按 RunID 共享的显式用户预算权威。LoopStore 的
+	// CumulativeUsage 只属于当前 Task/Activation，不能替代本 Store。
+	RunBudgetStore *runbudget.Store
 	// ContentStore 是 L3 大正文/ContentRef 的持久化与授权解引用权威。
 	// 新生产执行由 bootstrap 必须注入；nil 仅保留给隔离单测/legacy 构造。
 	// L2 决定是否外置，Agent 不得凭 Ref 绕过 Lease 直接读取正文。
@@ -817,6 +833,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// 是 Memory 段 live/stale 判定的比较基准。
 	manifestInfo := newManifestSideInfo(time.Now())
 	ctx = withManifestSideInfo(ctx, manifestInfo)
+	lastObservationProjectionCount := manifestInfo.historyProjectionCount
 
 	// CM2（V6 §3）：Task Memory 加载或创建（attempt 恢复=加载既有，继续
 	// 滚动；新建=初始化 Goal/Constraints 并落盘 + emit task_memory_created）。
@@ -1049,6 +1066,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			submitVerdict := ""
 			submitCitedEvidence := ""
 			submitResultJSON := ""
+			submitFulfillmentJSON := ""
 			submitStatus := ""
 			submitBlockedReason := ""
 			submitSummary := ""
@@ -1060,6 +1078,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					submitVerdict = sub.Verdict
 					submitCitedEvidence = sub.CitedEvidence
 					submitResultJSON = sub.ResultJSON
+					submitFulfillmentJSON = sub.FulfillmentJSON
 					submitStatus = sub.Status
 					submitBlockedReason = sub.BlockedReason
 					submitSummary = sub.Summary
@@ -1082,6 +1101,9 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				if submitResultJSON != "" {
 					blockedFields[StructuredResultStorageKey] = submitResultJSON
 				}
+				if submitFulfillmentJSON != "" {
+					blockedFields[FulfillmentStorageKey] = submitFulfillmentJSON
+				}
 				enterTerminating("react_loop_exit:agent_reported_blocked")
 				a.commitStructuredBlocked(task, taskMem, taskID, resultText, blockedFields, submitBlockedReason, submitSummary)
 				return
@@ -1099,6 +1121,9 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			structuredFields := make(map[string]string, 4)
 			if submitResultJSON != "" {
 				structuredFields[StructuredResultStorageKey] = submitResultJSON
+			}
+			if submitFulfillmentJSON != "" {
+				structuredFields[FulfillmentStorageKey] = submitFulfillmentJSON
 			}
 			// Graph 事件键（C5b）：submit_task_result 携带的 event 随 completed
 			// 快照一次性写入 Results["event"]，graph-terminal-feed 随后用它驱动
@@ -1298,7 +1323,142 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			a.blockForLoopControl(task, taskID, reason, "progress_authority_failure")
 			return
 		}
+
+		// Observation checkpoint 是 L2/L4 的机械接缝。marker 已在上一轮
+		// durable history 中冻结；本轮必须只调用 record_observation_delta，
+		// 成功后执行 marker 指定的 continue/rollover/intervention 动作。
+		if observationAction := pendingObservationCheckpointAction(history); observationAction != "" {
+			failureCountBefore := observationCheckpointFailureCount(history)
+			if result.ToolCalled {
+				history = append(history, historyEntryFromResult(result, a.Model, turnID))
+			}
+			taskMem.applySettledTurn(a, taskID, result, i)
+			if !observationCheckpointSucceeded(result) || taskMem.observationRef(task.AttemptID) == "" {
+				checkpointFailureReason := "observation_submission_invalid"
+				if !result.ProviderCallStarted {
+					checkpointFailureReason = "control_invocation_preflight_failed"
+				}
+				trace.Emit(trace.Event{
+					Kind: trace.KindObservationCheckpointFailed, TaskID: taskID,
+					RunID: string(task.RunID), AttemptID: task.AttemptID, TurnID: turnID,
+					AgentID: a.ID, Loop: i, Reason: checkpointFailureReason,
+					Description: "action=" + observationAction,
+				})
+				// response/tool-call gate 前的 Invocation 失败不会产生
+				// record_observation_delta ToolCall，仍必须纳入 checkpoint
+				// 自身的有界重试，不得落入普通 LLM retry 空转。
+				if observationCheckpointFailureCount(history) == failureCountBefore {
+					history = append(history, HistoryEntry{SystemNotice: observationCheckpointFailureMarker +
+						" 本次机械 checkpoint 未形成合法 ObservationDelta。"})
+				}
+				failures := observationCheckpointFailureCount(history)
+				if failures < 2 {
+					history = append(history, HistoryEntry{SystemNotice: "Observation 未通过机械校验；仍处于同一 checkpoint，请使用当前 evidence catalog 修正一次。"})
+					a.saveHistory(task, history)
+					continue
+				}
+				if observationAction == "periodic" {
+					history = append(history, HistoryEntry{SystemNotice: observationCheckpointAbandonedMarker +
+						" 周期性 Observation 两次失败；保留原始历史并恢复业务阶段，下一知识 turn 再尝试。"})
+					a.saveHistory(task, history)
+					continue
+				}
+				a.saveHistory(task, history)
+				reason := "Observation checkpoint 两次未形成 durable observation_delta_ref"
+				terminatingCause = "react_loop_exit:observation_checkpoint_failed"
+				enterTerminating(terminatingCause)
+				a.blockForLoopControl(task, taskID, reason, "observation_checkpoint_failed")
+				return
+			}
+			a.saveHistory(task, history)
+			taskMem.checkpoint(a, taskID, i, "observation_checkpoint")
+			lastObservationProjectionCount = manifestInfo.historyProjectionCount
+			effectiveObservationAction := observationAction
+			if policyDecision.ObservationAction == "observation_stalled" {
+				effectiveObservationAction = "observation_stalled"
+			}
+			switch effectiveObservationAction {
+			case "rollover":
+				if err := a.Store.RetryRollback(a.ID, taskID, "l4_no_progress_attempt_rollover"); err != nil {
+					reason := "L4 Observation 后 AttemptRollover 失败: " + err.Error()
+					terminatingCause = "react_loop_exit:progress_authority_failure"
+					enterTerminating(terminatingCause)
+					a.blockForLoopControl(task, taskID, reason, "progress_authority_failure")
+					return
+				}
+				trace.Emit(trace.Event{Kind: trace.KindTaskRetry, TaskID: taskID, RunID: string(task.RunID),
+					AgentID: a.ID, Reason: "l4_no_progress_attempt_rollover", AttemptNo: task.AttemptNo,
+					Transition: &trace.Transition{PrevStatus: string(model.TaskStatusProcessing),
+						NewStatus: string(model.TaskStatusPending), Cause: "l4_no_progress_attempt_rollover",
+						RetryCount: task.RetryCount + 1}})
+				return
+			case "intervention_budget", "intervention_stalled", "observation_stalled":
+				reasonCode := loopcontract.InterventionNoProgressStalled
+				reasonPrefix := "no_progress_intervention_required"
+				cause := "loop_intervention_required"
+				if effectiveObservationAction == "intervention_budget" {
+					reasonCode = loopcontract.InterventionNoProgressBudget
+					reasonPrefix = "no_progress_budget_exhausted"
+					cause = "no_progress_budget_exhausted"
+				} else if effectiveObservationAction == "observation_stalled" {
+					reasonCode = loopcontract.InterventionObservationStalled
+					reasonPrefix = "observation_state_stalled"
+					cause = "observation_state_stalled"
+				}
+				if effectiveObservationAction != "observation_stalled" {
+					if err := loopProgress.appendObservationIntervention(task, reasonCode); err != nil {
+						terminatingCause = "react_loop_exit:progress_authority_failure"
+						enterTerminating(terminatingCause)
+						a.blockForLoopControl(task, taskID, "Observation intervention 落盘失败: "+err.Error(), "progress_authority_failure")
+						return
+					}
+				}
+				reason := fmt.Sprintf("%s: turns=%d checkpoint=%s observation=%s", reasonPrefix,
+					loopProgress.checkpoint.NoProgressTurns, loopProgress.checkpoint.CheckpointID,
+					loopProgress.checkpoint.ObservationDeltaRef)
+				terminatingCause = "react_loop_exit:" + cause
+				enterTerminating(terminatingCause)
+				a.blockForLoopControl(task, taskID, reason, cause)
+				return
+			default:
+				continue
+			}
+		}
+
+		// 第一轮发生 L2 history projection 后，Raw History 仍保持不变；在任何
+		// 后续普通 Invocation 前先冻结一次 ObservationDelta。
+		if taskUsesObservationCheckpoint(task) && !result.Finalized &&
+			manifestInfo.historyProjectionCount > lastObservationProjectionCount && taskMem.observationRef(task.AttemptID) == "" {
+			if result.ToolCalled {
+				history = append(history, historyEntryFromResult(result, a.Model, turnID))
+			}
+			taskMem.applySettledTurn(a, taskID, result, i)
+			history = append(history, HistoryEntry{SystemNotice: observationCheckpointNotice("continue",
+				"L2 已开始有界 history projection；在继续普通工作前冻结当前事实和下一步。")})
+			a.saveHistory(task, history)
+			continue
+		}
+
+		if policyDecision.ObservationAction != "" {
+			if result.ToolCalled {
+				history = append(history, historyEntryFromResult(result, a.Model, turnID))
+			}
+			taskMem.applySettledTurn(a, taskID, result, i)
+			history = append(history, HistoryEntry{SystemNotice: policyDecision.Reminder})
+			a.saveHistory(task, history)
+			continue
+		}
 		if policyDecision.Rollover {
+			if taskUsesObservationCheckpoint(task) && taskMem.observationRef(task.AttemptID) == "" {
+				if result.ToolCalled {
+					history = append(history, historyEntryFromResult(result, a.Model, turnID))
+				}
+				taskMem.applySettledTurn(a, taskID, result, i)
+				history = append(history, HistoryEntry{SystemNotice: observationCheckpointNotice("rollover",
+					policyDecision.Reminder)})
+				a.saveHistory(task, history)
+				continue
+			}
 			if result.ToolCalled {
 				history = append(history, historyEntryFromResult(result, a.Model, turnID))
 			}
@@ -1336,6 +1496,19 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				loopProgress.checkpoint.NoProgressUsage.ModelCalls,
 				loopProgress.checkpoint.ExplorationTurnsSinceDeliverable,
 				loopProgress.checkpoint.CheckpointID)
+			if task.FinalReportGraphID != "" && a.FinalizationFallback != nil {
+				report, fallbackErr := a.FinalizationFallback(ctx, task)
+				if fallbackErr == nil && strings.TrimSpace(report) != "" {
+					terminatingCause = "react_loop_exit:finalization_fallback"
+					enterTerminating(terminatingCause)
+					if a.completeFinalizationFallback(task, report, i+1) {
+						taskSuccess = true
+						return
+					}
+				} else if fallbackErr != nil {
+					reason += "; finalization fallback 失败: " + fallbackErr.Error()
+				}
+			}
 			terminatingCause = "react_loop_exit:" + cause
 			enterTerminating(terminatingCause)
 			a.blockForLoopControl(task, taskID, reason, cause)
@@ -1351,6 +1524,17 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		}
 
 		if execErr != nil {
+			if task.FinalReportGraphID != "" && a.FinalizationFallback != nil {
+				report, fallbackErr := a.FinalizationFallback(ctx, task)
+				if fallbackErr == nil && strings.TrimSpace(report) != "" {
+					terminatingCause = "react_loop_exit:finalization_fallback"
+					enterTerminating(terminatingCause)
+					if a.completeFinalizationFallback(task, report, i+1) {
+						taskSuccess = true
+						return
+					}
+				}
+			}
 			terminatingCause = "react_loop_exit:error"
 			a.Activity.LLMEnd(a.ID, taskID, i, "", 0, execErr)
 			enterTerminating(terminatingCause)
@@ -1636,6 +1820,34 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	}
 }
 
+func (a *Agent) completeFinalizationFallback(task *model.Task, report string, loops int) bool {
+	if a == nil || task == nil || strings.TrimSpace(report) == "" {
+		return false
+	}
+	if err := a.Store.RecordLastResponse(task.ID, report); err != nil {
+		log.Printf("[agent %s] finalization fallback RecordLastResponse 失败: %v", a.ID, err)
+	}
+	if err := a.Store.SubmitResult(a.ID, task.ID, report); err != nil {
+		trace.Emit(trace.Event{Kind: trace.KindError, TaskID: task.ID, RunID: string(task.RunID),
+			AgentID: a.ID, Error: "finalization fallback SubmitResult failed: " + err.Error()})
+		return false
+	}
+	out := a.ResultOutput
+	if out == nil {
+		out = a.UserOutput
+	}
+	if out != nil {
+		fmt.Fprintf(out, "\n=== 任务完成（系统降级汇报）===\n%s\n================\n\n", report)
+	}
+	trace.Emit(trace.Event{Kind: trace.KindTaskSubmitted, TaskID: task.ID, RunID: string(task.RunID),
+		AgentID: a.ID, OutputLen: len(report), LoopsUsed: loops})
+	a.emitTextOnlySubmissionIfNoArtifactsOpt(task.ID, report, loops, true)
+	trace.Emit(trace.Event{Kind: trace.KindTaskCompleted, TaskID: task.ID, RunID: string(task.RunID),
+		AgentID: a.ID, Transition: &trace.Transition{PrevStatus: string(model.TaskStatusProcessing),
+			NewStatus: string(model.TaskStatusCompleted), Cause: "finalization_fallback"}})
+	return true
+}
+
 // tripRuntimeLoopFuse 是 emergency loop fuse 触发时的统一收口（V6，见
 // processTask 循环顶部）。它替代已删除的「MaxLoops 耗尽 → 交接备忘 →
 // 回滚重试」路径，语义刻意不同：
@@ -1809,6 +2021,35 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 		a.sendCrashReport(task, taskID, reason)
 		return
 	}
+	if recoveryDecision.Action == loopcontrol.RecoveryRequestIntervene {
+		// unknown 不是 non-recoverable 的同义词。L4 policy 已要求交 L5
+		// 裁决时，必须先 durable 写入 LoopInterventionRequested，再把当前
+		// Activation blocked；不得静默落入通用 failed。
+		a.saveHistory(task, history)
+		if err := a.requestInvocationIntervention(task); err != nil {
+			a.blockForLoopControl(task, taskID,
+				"Invocation intervention 落盘失败: "+err.Error(), "progress_authority_failure")
+			return
+		}
+		reason := fmt.Sprintf("Invocation 需要 L5 recovery 裁决：kind=%s phase=%s scope=%s",
+			canonicalFailure.Kind, canonicalFailure.Phase, canonicalFailure.TimeoutScope)
+		a.blockForLoopControl(task, taskID, reason, "loop_intervention_required")
+		return
+	}
+	if recoveryDecision.Action == loopcontrol.RecoveryCancel {
+		if err := store.TransitionStateWithCancelSource(a.Store, taskID,
+			model.TaskStatusProcessing, model.TaskStatusCancelled, "invocation_caller_cancelled"); err != nil {
+			a.terminateTask(task, taskID, "Invocation cancellation 落盘失败: "+err.Error(), "cancel_commit_failed")
+			return
+		}
+		trace.Emit(trace.Event{
+			Kind: trace.KindTaskCancelled, TaskID: taskID, RunID: string(task.RunID), AgentID: a.ID,
+			Reason: "invocation_caller_cancelled",
+			Transition: &trace.Transition{PrevStatus: string(model.TaskStatusProcessing),
+				NewStatus: string(model.TaskStatusCancelled), Cause: "invocation_caller_cancelled"},
+		})
+		return
+	}
 	if (!hasCanonicalFailure && legacyRecoverable) ||
 		(hasCanonicalFailure && recoveryDecision.IsRetryPath()) {
 		// 只有 Invocation 基础层明确分类为 context_window_exceeded 时，才请求
@@ -1836,7 +2077,7 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 			return
 		}
 		if !allowed {
-			reason := fmt.Sprintf("Run attempts 预算已耗尽，当前 Attempt 保留完整执行权但不能再创建新 Attempt: used=%d limit=%d",
+			reason := fmt.Sprintf("Activation attempts 预算已耗尽，当前 Attempt 保留完整执行权但不能再创建新 Attempt: used=%d limit=%d",
 				usedAttempts, attemptLimit)
 			a.saveHistory(task, history)
 			if err := a.requestAttemptBudgetIntervention(task); err != nil {
@@ -1911,6 +2152,9 @@ func blockedInvocationTerminal(failure *invocation.Failure, execErr error) (stri
 		return fmt.Sprintf("Invocation 被 L4 恢复策略阻断：%v", execErr), "invocation_blocked"
 	}
 	switch failure.Kind {
+	case invocation.FailureProviderQuotaExhausted:
+		return fmt.Sprintf("Provider 计费额度或余额已耗尽，当前 Run 无法继续：status=%d code=%s",
+			failure.HTTPStatus, failure.ProviderCode), "provider_quota_exhausted"
 	case invocation.FailureAttemptDeadline, invocation.FailureActivationDeadline:
 		return fmt.Sprintf("Invocation 被 L4 deadline 阻断：kind=%s scope=%s: %v",
 			failure.Kind, failure.TimeoutScope, execErr), "invocation_deadline"

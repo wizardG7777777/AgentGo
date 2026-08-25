@@ -21,11 +21,12 @@ const (
 // ToolCallFact 是一次工具调用的结构化事实（来自 ToolCallRecord 账本，
 // 不是模型自述）。
 type ToolCallFact struct {
-	Name     string // 工具名
-	Target   string // 目标摘要（路径 / 命令 / 收件人等，调用方预截断）
-	Success  bool   // 工具级成功（run_shell 的命令退出码见 ExitCode）
-	Err      string // 失败错误串（预截断）
-	ExitCode *int   // run_shell 的命令退出码；非零视为失败尝试
+	Name          string // 工具名
+	Target        string // 目标摘要（路径 / 命令 / 收件人等，调用方预截断）
+	Success       bool   // 工具级成功（run_shell 的命令退出码见 ExitCode）
+	Err           string // 失败错误串（预截断）
+	ExitCode      *int   // run_shell 的命令退出码；非零视为失败尝试
+	ExitCodeScope string // whole_command / last_pipeline_command；后者不是整条命令成功证明
 }
 
 // FileWrittenFact 是一次已确认的文件写入效果（file_written）。
@@ -140,7 +141,8 @@ func ApplyTurn(m *TaskMemory, facts TurnFacts) bool {
 
 // isShellFailure 判定 run_shell 的命令级失败（工具成功但退出码非零）。
 func isShellFailure(tc ToolCallFact) bool {
-	return tc.Name == "run_shell" && tc.Success && tc.ExitCode != nil && *tc.ExitCode != 0
+	return tc.Name == "run_shell" && tc.Success &&
+		((tc.ExitCode != nil && *tc.ExitCode != 0) || tc.ExitCodeScope == "last_pipeline_command")
 }
 
 // isBlockingErr 识别结构化阻塞信号：新 Gate/Suggestion 路径的
@@ -273,7 +275,11 @@ func actionEvidence(tc ToolCallFact) EvidenceRef {
 func failureCaption(tc ToolCallFact) string {
 	var sb strings.Builder
 	if tc.Name == "run_shell" && tc.Success && tc.ExitCode != nil {
-		fmt.Fprintf(&sb, "run_shell 命令失败 (exit=%d)", *tc.ExitCode)
+		if tc.ExitCodeScope == "last_pipeline_command" {
+			fmt.Fprintf(&sb, "run_shell 结果歧义 (exit=%d 仅代表管道末段)", *tc.ExitCode)
+		} else {
+			fmt.Fprintf(&sb, "run_shell 命令失败 (exit=%d)", *tc.ExitCode)
+		}
 	} else {
 		sb.WriteString(tc.Name + " 调用失败")
 	}

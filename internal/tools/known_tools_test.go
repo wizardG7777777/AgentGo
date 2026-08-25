@@ -6,10 +6,12 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/agenttemplate"
+	"agentgo/internal/graph"
 	"agentgo/internal/interaction"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
+	"agentgo/internal/taskmem"
 )
 
 // registerAllGroupsFully 用"能让每个 Group 注册其完整工具集"的最小依赖构造
@@ -45,6 +47,7 @@ func registerAllGroupsFully(t *testing.T, r *agent.ToolRegistry) {
 		},
 		WebGroup{Provider: &fakeSearchProvider{}},
 		ShellGroup{Workdir: &DefaultWorkdir{ProjectRoot: t.TempDir()}, AgentID: "agent-1"},
+		CheckGroup{},
 		MetaGroup{
 			Store: newFakeStore(), MBRegistry: mailbox.NewRegistry(8),
 			Interactions: interaction.NewService(nil), AgentID: "agent-1",
@@ -54,6 +57,11 @@ func registerAllGroupsFully(t *testing.T, r *agent.ToolRegistry) {
 			// submit_task_result 需提交通道注入才注册；全量并集守护按完整依赖装配。
 			FinalizationNotifier: &fakeFinalizationNotifier{},
 			SubmitState:          agent.NewSubmitState(),
+			RecoveryAuthority:    (*graph.Runtime)(nil),
+		},
+		ObservationGroup{
+			Store: taskStore, TaskMem: taskmem.NewStore(t.TempDir()),
+			Holder: &fakeHolder{id: "controller"}, AgentID: "agent-1",
 		},
 		SchedulerGroup{
 			Store: newFakeStore(), Holder: &fakeHolder{id: "sched"}, ProjectRoot: t.TempDir(),

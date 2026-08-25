@@ -1021,10 +1021,22 @@ func TestGraphEndWakeReactorPublishesExplicitSchedulerReply(t *testing.T) {
 	if err := gs.SetGraphStatus(doc.GraphID, graph.GraphCompleted, current.StateVersion); err != nil {
 		t.Fatal(err)
 	}
+	current, _ = gs.Get(doc.GraphID)
 	tasks := store.NewMemoryTaskStore(nil, 100, 1, 300)
+	if err := tasks.PublishTask(&model.Task{ID: "artifact-work", GraphID: doc.GraphID,
+		NodeID: "work", ActivationID: "work@1", GraphNodeKind: string(graph.KindAgent),
+		Artifacts: []string{"src/flask/ctx.py"}}); err != nil {
+		t.Fatal(err)
+	}
 	waker := newGraphEndWakeReactor(tasks, gs)
+	terminalSummary := waker.buildGraphTerminalSummary(current, "")
+	if terminalSummary.Schema != graphTerminalSummarySchemaV2 || !terminalSummary.WorkspaceChanged ||
+		terminalSummary.WorkspaceChangeTaskCount != 1 || terminalSummary.ArtifactCount != 1 {
+		t.Fatalf("TerminalSummary v2 必须携带累计 workspace 事实: %+v", terminalSummary)
+	}
 	for i := 0; i < 2; i++ {
-		if err := waker.Run(trace.Event{Kind: trace.KindGraphEnded, GraphID: doc.GraphID}); err != nil {
+		if err := waker.Run(trace.Event{Kind: trace.KindGraphEnded, GraphID: doc.GraphID,
+			Reason: "RAW_PROVIDER_ERROR_SHOULD_NOT_LEAK"}); err != nil {
 			t.Fatalf("Run #%d: %v", i+1, err)
 		}
 	}
@@ -1032,21 +1044,55 @@ func TestGraphEndWakeReactorPublishesExplicitSchedulerReply(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(all) != 1 {
-		t.Fatalf("重复 graph_ended 应只发布一条唤醒任务，实际 %d", len(all))
+	if len(all) != 2 {
+		t.Fatalf("重复 graph_ended 应只发布一条唤醒任务，含已有工作任务共 %d", len(all))
 	}
-	wake := all[0]
+	var wake *model.Task
+	for _, candidate := range all {
+		if candidate.EventSource == graphEndEventSource {
+			wake = candidate
+		}
+	}
+	if wake == nil {
+		t.Fatal("未找到 graph-ended final-report task")
+	}
 	if wake.EventType != "__scheduler__" || wake.EventSource != graphEndEventSource || wake.GraphID != "" {
 		t.Fatalf("终态唤醒任务形状错误: EventType=%q EventSource=%q GraphID=%q", wake.EventType, wake.EventSource, wake.GraphID)
 	}
+	if wake.FinalReportGraphID != doc.GraphID {
+		t.Fatalf("终态唤醒缺少冻结 final-report Graph scope: %+v", wake)
+	}
 	if wake.RunID != binding.RunID || wake.RunContract == nil || wake.ContextPolicyRef == "" ||
-		wake.ProgressContract == nil || wake.RunPhase != runcontract.PhaseFinalization {
+		wake.ProgressContract == nil || wake.ProgressContract.WorkClass != loopcontract.WorkFinalization ||
+		wake.RunPhase != runcontract.PhaseFinalization {
 		t.Fatalf("graph-ended 唤醒必须继承完整 finalization binding: %+v", wake)
+	}
+	if len(wake.ContextInputs) != 1 ||
+		!strings.HasPrefix(wake.ContextInputs[0].SourceRef, "graph-terminal-summary:") ||
+		!strings.Contains(wake.ContextInputs[0].Content, graphTerminalSummarySchemaV2) ||
+		strings.Contains(wake.Description, `"nodes"`) {
+		t.Fatalf("final-report 必须消费独立安全 TerminalSummary，不能嵌入完整 GraphDocument: %+v", wake)
+	}
+	if strings.Contains(wake.ContextInputs[0].Content, "RAW_PROVIDER_ERROR_SHOULD_NOT_LEAK") {
+		t.Fatal("GraphTerminalSummary 不得泄露原始错误正文")
+	}
+	if fallback, err := renderGraphFinalizationFallback(wake); err != nil ||
+		!strings.Contains(fallback, doc.GraphID) || !strings.Contains(fallback, "completed") {
+		t.Fatalf("确定性 finalization fallback 无效: %q err=%v", fallback, err)
 	}
 	for _, want := range []string{"[graph-ended: g-finished/", "completed", "read_graph", "明确"} {
 		if !strings.Contains(wake.Description, want) {
 			t.Errorf("唤醒描述缺少 %q: %s", want, wake.Description)
 		}
+	}
+}
+
+func TestGraphSettlementReasonCodeClassifiesUnstartableRecoveryRetry(t *testing.T) {
+	exec := &graph.Execution{ActivationID: "work@2", Settlement: &graph.TerminalSettlement{
+		Status: graph.NodeFailed, Reason: "Task x RunContract phase=execution 的剩余时间窗已耗尽",
+	}}
+	if got := graphSettlementReasonCode(exec); got != graph.RecoveryRetryUnstartableReasonCode {
+		t.Fatalf("settlement reason code=%q", got)
 	}
 }
 

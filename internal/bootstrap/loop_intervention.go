@@ -97,7 +97,8 @@ func (h loopInterventionHandler) HandleLoopIntervention(
 func validateLoopInterventionSource(source *model.Task, command loopcontract.LoopInterventionRequested) error {
 	if source == nil || source.ID != command.TaskID || source.RunID != command.RunID ||
 		source.GraphID != command.GraphID || source.NodeID != command.NodeID ||
-		source.ActivationID != command.ActivationID || source.AttemptID != command.AttemptID {
+		source.ActivationID != command.ActivationID || source.AttemptID != command.AttemptID ||
+		source.FinalReportGraphID != command.FinalReportGraphID {
 		return fmt.Errorf("LoopIntervention %s 与 source Task lineage 不一致", command.CommandID)
 	}
 	if !model.IsTerminal(source.Status) {
@@ -229,6 +230,28 @@ func (b *loopInterventionBridge) RunWithContext(ctx context.Context, ev trace.Ev
 	}
 
 	var errs []error
+	scope, scopeErr := model.ClassifyControlScope(task)
+	if scopeErr != nil {
+		return scopeErr
+	}
+	// final-report 是已终态 Graph 的只读交付控制面。它自己的 intervention
+	// 只确认已由 fallback/blocked 处理，绝不进入非图 authoring pump。
+	if scope == model.ControlScopeFinalReport {
+		commands, commandErr := b.loops.PendingInterventionsForTask(task.ID)
+		if commandErr != nil {
+			return commandErr
+		}
+		for _, command := range commands {
+			if command.FinalReportGraphID != task.FinalReportGraphID || command.GraphID != "" {
+				errs = append(errs, fmt.Errorf("final-report intervention %s scope 不一致", command.CommandID))
+				continue
+			}
+			if err := b.pump.Ack(ctx, task.ID, command.CommandID, task.OutcomeRef); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		return errors.Join(errs...)
+	}
 	// 若本 Task 本身是某条 coordination wake，先以它的 durable OutcomeRef
 	// 确认原 command；PublishTask 成功从不走这条 Ack 路径。
 	if task.EventSource == loopInterventionWakeSource {

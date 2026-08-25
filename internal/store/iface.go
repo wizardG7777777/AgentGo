@@ -8,6 +8,13 @@ import (
 	"agentgo/internal/session"
 )
 
+type ShellExitCodeScope string
+
+const (
+	ShellExitCodeScopeWholeCommand        ShellExitCodeScope = "whole_command"
+	ShellExitCodeScopeLastPipelineCommand ShellExitCodeScope = "last_pipeline_command"
+)
+
 // ToolCallRecord 记录一次工具调用的事实快照。
 // 由 llm_executor.go 在每次工具调用之后（无论成功、失败，还是被 hook Abort）
 // 自动写入公告板，供 hook 系统的 RequireReadBeforeWriteHook 等查询任务历史。
@@ -32,7 +39,8 @@ type ToolCallRecord struct {
 	// ExitCode is populated for run_shell from the tool's structured first
 	// line. Success alone is insufficient because run_shell returns non-zero
 	// command exits as a normal tool result.
-	ExitCode *int
+	ExitCode      *int
+	ExitCodeScope ShellExitCodeScope
 }
 
 // TerminalOutcomeIntent 是 TaskStore 在终态状态生效前交给 durable outcome
@@ -51,8 +59,9 @@ type TerminalOutcomeIntent struct {
 type TerminalOutcomeHook func(TerminalOutcomeIntent) (string, error)
 
 type TerminalCheckpointBinding struct {
-	CheckpointRef   string
-	CheckpointState string
+	CheckpointRef       string
+	CheckpointState     string
+	ObservationDeltaRef string
 }
 
 type TerminalOutcomeCoordinator interface {

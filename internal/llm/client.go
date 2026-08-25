@@ -761,6 +761,12 @@ func classifySDKError(ctx context.Context, err error) error {
 		case statusCode == 429:
 			failure.Kind = invocation.FailureRateLimited
 			return &ErrRecoverable{Err: err, Code: code, Message: message, Failure: failure}
+		case statusCode == 402,
+			normalized == "insufficient_quota",
+			normalized == "insufficient_balance",
+			normalized == "billing_hard_limit_reached",
+			normalized == "billing_not_active":
+			failure.Kind = invocation.FailureProviderQuotaExhausted
 		case statusCode == 502 || statusCode == 503 || statusCode == 504:
 			failure.Kind = invocation.FailureProviderUnavailable
 			return &ErrRecoverable{Err: err, Code: code, Message: message, Failure: failure}
@@ -856,6 +862,9 @@ func classifyStreamProviderError(raw string) error {
 		return &ErrUnrecoverable{Err: err, Code: code, Message: message, Failure: failure}
 	case "rate_limit_exceeded":
 		failure.Kind = invocation.FailureRateLimited
+	case "insufficient_quota", "insufficient_balance", "billing_hard_limit_reached", "billing_not_active":
+		failure.Kind = invocation.FailureProviderQuotaExhausted
+		return &ErrUnrecoverable{Err: err, Code: code, Message: message, Failure: failure}
 	case "invalid_api_key", "authentication_error":
 		failure.Kind = invocation.FailureAuth
 		return &ErrUnrecoverable{Err: err, Code: code, Message: message, Failure: failure}

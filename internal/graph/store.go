@@ -926,6 +926,10 @@ func (s *Store) RecordActivationResult(graphID string, rec ActivationResult) err
 }
 
 func validateEvidenceEntryBounds(ev EvidenceEntry) error {
+	if ev.ExitCodeScope != "" && ev.ExitCodeScope != "whole_command" &&
+		ev.ExitCodeScope != "last_pipeline_command" {
+		return fmt.Errorf("exit_code_scope=%q 无效", ev.ExitCodeScope)
+	}
 	checks := []struct {
 		name  string
 		value string

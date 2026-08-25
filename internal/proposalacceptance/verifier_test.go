@@ -314,7 +314,7 @@ func TestVerifierOversizedOutputReturnsError(t *testing.T) {
 }
 
 func TestVerifierContextOversizeFailsBeforeLLM(t *testing.T) {
-	rawRequest := strings.Repeat("request", 12<<10)
+	rawRequest := strings.Repeat("request", 600_000)
 	client := &fakeVerifierClient{content: `{"verdict":"pass"}`}
 	verifier, _ := newTestVerifier(t, client, rawRequest, Options{})
 	if _, err := verifier.EvaluateProposal(context.Background(), proposalFixture(rawRequest)); err == nil ||

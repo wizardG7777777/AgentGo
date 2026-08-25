@@ -17,9 +17,10 @@ const (
 	ContextDefaultV6 = "context:default/v6"
 	ContextDefaultV7 = "context:default/v7"
 	ContextDefaultV8 = "context:default/v8"
+	ContextDefaultV9 = "context:default/v9"
 	// ContextDefaultCurrent 是所有新 Run/Invocation 的 framework 默认引用。
 	// 历史任务必须继续使用其已冻结的具体版本，禁止在恢复时把 v1 偷换为该别名。
-	ContextDefaultCurrent    = ContextDefaultV8
+	ContextDefaultCurrent    = ContextDefaultV9
 	ReplayOpenAICompatibleV1 = "provider-replay:openai-compatible/v1"
 	ReplayOpenAICompatibleV2 = "provider-replay:openai-compatible/v2"
 	ReplayOpenAICompatibleV3 = "provider-replay:openai-compatible/v3"
@@ -27,13 +28,21 @@ const (
 	ProgressCodeChangeV1 = "progress:code-change/v1"
 	ProgressCodeChangeV2 = "progress:code-change/v2"
 	ProgressCodeChangeV3 = "progress:code-change/v3"
-	// ProgressCodeChangeCurrent 只供新 Task/Graph authoring 选用；
-	// 历史 Task 必须继续使用已冻结的 v1。
-	ProgressCodeChangeCurrent = ProgressCodeChangeV3
+	ProgressCodeChangeV4 = "progress:code-change/v4"
+	ProgressCodeChangeV5 = "progress:code-change/v5"
+	// ProgressCodeChangeCurrent 是所有新 Task/Graph authoring 的唯一选择。
+	ProgressCodeChangeCurrent = ProgressCodeChangeV5
 
-	ProgressInvestigationV1 = "progress:investigation/v1"
-	ProgressVerificationV1  = "progress:verification/v1"
-	ProgressCoordinationV1  = "progress:coordination/v1"
+	ProgressInvestigationV1      = "progress:investigation/v1"
+	ProgressInvestigationV2      = "progress:investigation/v2"
+	ProgressVerificationV1       = "progress:verification/v1"
+	ProgressVerificationV2       = "progress:verification/v2"
+	ProgressCoordinationV1       = "progress:coordination/v1"
+	ProgressCoordinationV2       = "progress:coordination/v2"
+	ProgressFinalReportV1        = "progress:final-report/v1"
+	ProgressInvestigationCurrent = ProgressInvestigationV2
+	ProgressVerificationCurrent  = ProgressVerificationV2
+	ProgressCoordinationCurrent  = ProgressCoordinationV2
 )
 
 // ContextProfile 把 L2 budget policy 与默认 provider replay policy 引用绑定。

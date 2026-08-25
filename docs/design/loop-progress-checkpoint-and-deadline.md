@@ -8,6 +8,32 @@
 > 关联设计：[`Graph Draft / Commit / Start`](graph-draft-commit-start.md)<br>
 > 统一路线图：[`SWE 架构修复统一实施路线图`](swe-architecture-repair-roadmap.md)
 
+## 0.0 2026-08-24 Run 作用域与控制额度修订
+
+SWE-051 证明旧实现虽把 profile 称为“Run 总预算”，实际却从
+`LoopStore.LoadCheckpoint(task.ID)` 的 Task-local `CumulativeUsage` 计算余额；
+Recovery 创建新 Activation/Task 后额度自动归零。正式边界修订为：
+
+- `ProgressCheckpoint.CumulativeUsage` 是 Activation-local 诊断/进展事实；
+- `model_calls` 只记录已经越过 L3 provider dispatch 的请求；本地 preflight
+  失败可以形成 no-progress/control incident，但不得消费 model-call usage；
+- `provider_quota_exhausted` 不进入 retry budget；它以外部资源 blocked 收口。
+  `FailureUnknown` 的 policy 若为 `request_intervention`，L4 必须写入同一
+  LoopStore command authority，不能用通用 failed 吞掉 policy 结果；
+- 显式 `RunContract.Budget` 的 model/tool/token/cost 由
+  `.agentgo/state/run-budgets` 的 append-only Ledger 按 RunID reservation/
+  settlement；wall time 仍由绝对 Run deadline，Attempt rollover 仍由 L4 局部契约；
+- `interactive/v3` / `swe/v3` 不把旧 64-per-Task 静默改成 64-per-Run；默认调用、
+  工具、token、cost 只记账，正常终止仍由 deadline、no-progress、Observation、
+  fulfillment 和 emergency fuse 决定；
+- 显式业务 limit 只约束 execution。coordination/recovery/finalization 使用独立
+  control entitlement 与冻结 Lease/ProgressContract/time reserve，不能调用业务工具；
+- Recovery retry 先从 Ledger 预留首个 execution model call，冻结
+  `RecoveryStartPermit`；目标 Activation 首轮 claim 到真实 action_id 后结算。
+
+因此“Run 预算耗尽”只允许来自共享 Ledger；Task-local 护栏必须使用
+`Activation ... budget exhausted`，不得再混用作用域名称。
+
 ## 0.1 2026-08-23 实施状态
 
 ### SWE-016 / SWE-017 边界修订

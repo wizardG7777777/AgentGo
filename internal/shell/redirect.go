@@ -63,6 +63,37 @@ func detectRedirectWrite(command string) string {
 	return ""
 }
 
+// HasPipeline 报告命令是否包含会把进程退出码折叠为“最后一个管道段”的
+// 真正 pipeline 操作符。它复用 redirect scanner 对引号、注释与 here-doc
+// 正文的剥离语义，并排除逻辑 OR（||）及转义后的字面竖线。
+//
+// run_shell 依赖它冻结 ExitCodeScope：POSIX sh 与 PowerShell 默认都只保证
+// 最后一个管道段的状态，不能把 exit=0 投影成整条测试命令通过。
+func HasPipeline(command string) bool {
+	cleaned, _ := scanRedirects(command)
+	for i := 0; i < len(cleaned); i++ {
+		if cleaned[i] != '|' {
+			continue
+		}
+		if (i > 0 && cleaned[i-1] == '|') || (i+1 < len(cleaned) && cleaned[i+1] == '|') {
+			continue
+		}
+		backslashes := 0
+		for j := i - 1; j >= 0 && (cleaned[j] == '\\' || cleaned[j] == '`'); j-- {
+			backslashes++
+		}
+		if backslashes%2 == 1 {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// HasFileRedirect 报告命令是否含写文件重定向。run_check 使用它保证检查工具
+// 只产生验证事实，不借检查通道改写业务文件。
+func HasFileRedirect(command string) bool { return detectRedirectWrite(command) != "" }
+
 // scanRedirects 第一阶段扫描：识别 > / >> / >| 等重定向操作符并判定目标；
 // 同时返回剥离引号内容与 here-doc 正文后的命令文本（供第二阶段正则匹配）。
 // detail 非空表示命中重定向写文件，此时 cleaned 是截断的部分结果（不再使用）。

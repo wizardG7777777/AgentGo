@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -107,7 +108,7 @@ func TestAuthoringRuntimeStartsCommittedDefinitionAndIsIdempotent(t *testing.T) 
 	if board.count() != 1 || board.specAt(0).RunID != definition.Body.RunID {
 		t.Fatalf("root Task 应发布一次并继承 RunID: count=%d spec=%+v", board.count(), board.specAt(0))
 	}
-	if board.specAt(0).DefinitionDigestVersion != GraphDefinitionDigestVersionV1 {
+	if board.specAt(0).DefinitionDigestVersion != GraphDefinitionDigestVersionCurrent {
 		t.Fatalf("authoring marker 未进入 TaskSpec: %+v", board.specAt(0))
 	}
 	if got, want := board.specAt(0).ProgressContractRef,
@@ -127,6 +128,32 @@ func TestAuthoringRuntimeStartsCommittedDefinitionAndIsIdempotent(t *testing.T) 
 	replayed, err := authoring.CompleteStart(first.Intent.StartID, 1, first.ExecutionRef)
 	if err != nil || replayed.Status != StartStarted || replayed.IntentRevision != first.Intent.IntentRevision {
 		t.Fatalf("CompleteStart 幂等重放失败: replayed=%+v err=%v", replayed, err)
+	}
+}
+
+func TestAuthoringRuntimeRejectsSecondTopLevelGraphInSameRun(t *testing.T) {
+	authoring, err := NewAuthoringStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = authoring.Close() })
+	executions, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = executions.Close() })
+	adapter := &AuthoringRuntime{Authoring: authoring, Runtime: NewRuntime(executions, newFakeBoard())}
+	first := commitRuntimeDefinition(t, authoring, "g-run-first", "proposal-run-first", 0)
+	second := commitRuntimeDefinition(t, authoring, "g-run-second", "proposal-run-second", 0)
+	if _, err := adapter.StartDefinition(context.Background(), startRequest(first, "start-run-first")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.StartDefinition(context.Background(), startRequest(second, "start-run-second")); err == nil ||
+		!strings.Contains(err.Error(), "第二个顶层 Graph") {
+		t.Fatalf("同 Run 第二个顶层 Graph 必须 fail-closed: %v", err)
+	}
+	if _, ok := executions.Get(second.GraphID); ok {
+		t.Fatal("被拒绝的第二个顶层 Graph 不得创建 Execution")
 	}
 }
 

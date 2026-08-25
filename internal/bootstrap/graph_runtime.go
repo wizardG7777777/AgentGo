@@ -12,6 +12,7 @@ package bootstrap
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -160,11 +161,13 @@ func (b *graphBoard) PublishGraphTask(spec graph.TaskSpec) (string, error) {
 	}
 
 	task := &model.Task{
-		ID:            reservedID,
-		RunID:         spec.RunID,
-		Description:   graphTaskDescription(spec),
-		ContextInputs: graphTaskContextInputs(spec),
-		EventType:     spec.Route,
+		ID:                  reservedID,
+		RunID:               spec.RunID,
+		RunBudgetPermitRef:  spec.RunBudgetPermitRef,
+		Description:         graphTaskDescription(spec),
+		ContextInputs:       graphTaskContextInputs(spec),
+		FulfillmentContract: spec.FulfillmentContract,
+		EventType:           spec.Route,
 		// 一次 Graph activation 对应一个确定性 Task/ExecutionLease，只允许
 		// 一个 Runner 执行。否则会继承公告板默认并发度，让多个 Team Agent
 		// 重复认领同一节点，首个提交后其余执行者只能收到 lease revoked。
@@ -278,6 +281,7 @@ func (b *graphBoard) LookupGraphTask(graphID, activationID, expectedTaskID strin
 					snapshot.OutcomeRef = task.OutcomeRef
 					snapshot.Result = fact.Result
 					snapshot.Evidence = fact.Evidence
+					snapshot.Fulfillment = fact.Fulfillment
 					return snapshot, true, nil
 				}
 			}
@@ -298,6 +302,7 @@ func (b *graphBoard) LookupGraphTask(graphID, activationID, expectedTaskID strin
 				TaskID: fact.TaskID, TerminalStatus: fact.Status,
 				OutcomeRef: outcomeRef,
 				Result:     fact.Result, Evidence: fact.Evidence,
+				Fulfillment: fact.Fulfillment,
 			}, true, nil
 		}
 	}
@@ -612,6 +617,49 @@ type graphEndWakeReactor struct {
 
 const graphEndEventSource = "graph-ended"
 
+const graphTerminalSummarySchemaV2 = "agentgo.graph-terminal-summary/v2"
+
+type graphTerminalNodeSummary struct {
+	NodeID               string   `json:"node_id"`
+	Kind                 string   `json:"kind"`
+	Status               string   `json:"status"`
+	ActivationID         string   `json:"activation_id,omitempty"`
+	TaskID               string   `json:"task_id,omitempty"`
+	ResultRef            string   `json:"result_ref,omitempty"`
+	EvidenceRefs         []string `json:"evidence_refs,omitempty"`
+	DefinitionRevision   int64    `json:"definition_revision,omitempty"`
+	TaskPublished        bool     `json:"task_published"`
+	SettlementReasonCode string   `json:"settlement_reason_code,omitempty"`
+}
+
+type graphTerminalSummary struct {
+	Schema                   string                         `json:"schema"`
+	GraphID                  string                         `json:"graph_id"`
+	RunID                    string                         `json:"run_id,omitempty"`
+	Revision                 int64                          `json:"revision"`
+	StateVersion             int64                          `json:"state_version"`
+	Status                   string                         `json:"status"`
+	Outcome                  string                         `json:"outcome"`
+	OutcomeSource            string                         `json:"outcome_source,omitempty"`
+	EndNodeID                string                         `json:"end_node_id,omitempty"`
+	EndActivationID          string                         `json:"end_activation_id,omitempty"`
+	ResultRef                string                         `json:"result_ref,omitempty"`
+	Reason                   string                         `json:"reason,omitempty"`
+	TerminalNodes            []graphTerminalNodeSummary     `json:"terminal_nodes,omitempty"`
+	RecoveryDecisions        []graphTerminalRecoverySummary `json:"recovery_decisions,omitempty"`
+	WorkspaceChanged         bool                           `json:"workspace_changed"`
+	WorkspaceChangeTaskCount int                            `json:"workspace_change_task_count"`
+	ArtifactCount            int                            `json:"artifact_count"`
+}
+
+type graphTerminalRecoverySummary struct {
+	NodeID              string `json:"node_id"`
+	ActivationID        string `json:"activation_id"`
+	Decision            string `json:"decision"`
+	ResultRef           string `json:"result_ref,omitempty"`
+	RecoveryDeltaDigest string `json:"recovery_delta_digest,omitempty"`
+}
+
 func newGraphEndWakeReactor(tasks store.TaskStore, graphs *graph.Store) *graphEndWakeReactor {
 	return &graphEndWakeReactor{tasks: tasks, graphs: graphs}
 }
@@ -656,23 +704,29 @@ func (r *graphEndWakeReactor) wakeLocked(graphID, reason string) error {
 			return nil
 		}
 	}
-	raw, err := json.Marshal(doc)
+	summary := r.buildGraphTerminalSummary(doc, reason)
+	raw, err := json.Marshal(summary)
 	if err != nil {
-		return fmt.Errorf("序列化图 %s 终态快照失败: %w", graphID, err)
+		return fmt.Errorf("序列化图 %s GraphTerminalSummary 失败: %w", graphID, err)
 	}
-	detail := truncateRunes(string(raw), 6000)
 	description := fmt.Sprintf(
-		"%s\n顶层图 %s 已到终态 %s（revision=%d state_version=%d）。\n原因：%s\n终态快照：%s\n处理指引：这是完成通知，不要重新执行图内工作。先用 read_graph 核对当前权威状态；然后基于节点结果向用户给出明确、耐久的最终回复。图失败时说明失败点与可恢复条件，图成功时说明实际完成结果。",
-		marker, doc.GraphID, doc.Status, doc.Revision, doc.StateVersion, graphEndReason(doc.Status, reason), detail)
+		"%s\n顶层图 %s 已到终态 %s（revision=%d state_version=%d）。\n处理指引：这是完成通知，禁止重新执行图内工作。GraphTerminalSummary 已通过独立 L2 数据段冻结；只在缺少必要事实时定向 read_graph/get_task_result，最后必须调用 report_done 给出明确结果。",
+		marker, doc.GraphID, doc.Status, doc.Revision, doc.StateVersion)
 	wake := &model.Task{
-		Description:      description,
-		EventType:        "__scheduler__",
-		EventSource:      graphEndEventSource,
-		ExpectedDuration: 24 * time.Hour,
-		MaxConcurrency:   1,
+		Description: description,
+		ContextInputs: []model.TaskContextInput{{
+			Kind:      model.TaskContextUpstreamResult,
+			SourceRef: fmt.Sprintf("graph-terminal-summary:%s/%d", doc.GraphID, doc.StateVersion),
+			Content:   "<graph-terminal-summary>" + string(raw) + "</graph-terminal-summary>",
+		}},
+		EventType:          "__scheduler__",
+		EventSource:        graphEndEventSource,
+		FinalReportGraphID: doc.GraphID,
+		ExpectedDuration:   24 * time.Hour,
+		MaxConcurrency:     1,
 	}
 	parent := &model.Task{RunID: doc.RunID, RunContract: doc.RunContract}
-	if err := taskcontract.Inherit(parent, wake, loopcontract.WorkCoordination); err != nil {
+	if err := taskcontract.Inherit(parent, wake, loopcontract.WorkFinalization); err != nil {
 		return fmt.Errorf("图 %s 终态唤醒继承 RunContract: %w", graphID, err)
 	}
 	if wake.RunContract != nil {
@@ -682,6 +736,178 @@ func (r *graphEndWakeReactor) wakeLocked(graphID, reason string) error {
 		return fmt.Errorf("发布图 %s 终态 Scheduler 唤醒任务失败: %w", graphID, err)
 	}
 	return nil
+}
+
+func (r *graphEndWakeReactor) buildGraphTerminalSummary(doc *graph.GraphDocument, reason string) graphTerminalSummary {
+	summary := graphTerminalSummary{
+		Schema: graphTerminalSummarySchemaV2, GraphID: doc.GraphID, RunID: string(doc.RunID),
+		Revision: doc.Revision, StateVersion: doc.StateVersion, Status: string(doc.Status),
+		Reason: safeGraphTerminalReason(doc, reason),
+	}
+	if doc.Outcome != nil {
+		summary.Outcome = string(doc.Outcome.Outcome)
+		summary.OutcomeSource = doc.Outcome.Source
+		summary.EndNodeID = doc.Outcome.EndNodeID
+		summary.EndActivationID = doc.Outcome.EndActivationID
+		summary.ResultRef = doc.Outcome.ResultRef
+	}
+	ids := make([]string, 0, len(doc.Nodes))
+	for id := range doc.Nodes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		node := doc.Nodes[id]
+		if node.Execution == nil || !node.Status.IsTerminal() {
+			continue
+		}
+		exec := node.Execution
+		summary.TerminalNodes = append(summary.TerminalNodes, graphTerminalNodeSummary{
+			NodeID: id, Kind: string(node.Kind), Status: string(node.Status),
+			ActivationID: exec.ActivationID, TaskID: exec.TaskID, ResultRef: exec.ResultRef,
+			EvidenceRefs: append([]string(nil), exec.EvidenceRefs...), DefinitionRevision: exec.DefinitionRevision,
+			TaskPublished: exec.TaskID != "", SettlementReasonCode: graphSettlementReasonCode(exec),
+		})
+		if graph.ControllerRoleOf(node) == graph.ControllerRoleLoopRecovery && exec.ResultRef != "" {
+			if stored, ok := r.graphs.ResolveActivationResult(doc.GraphID, exec.ResultRef); ok {
+				var result map[string]any
+				if json.Unmarshal(stored.Result, &result) == nil {
+					decision, _ := result["decision"].(string)
+					if decision != "retry" && decision != "blocked" {
+						decision = ""
+					}
+					entry := graphTerminalRecoverySummary{NodeID: id, ActivationID: exec.ActivationID,
+						Decision: decision, ResultRef: exec.ResultRef}
+					if raw, ok := result["recovery_delta"]; ok {
+						if encoded, marshalErr := json.Marshal(raw); marshalErr == nil {
+							sum := sha256.Sum256(encoded)
+							entry.RecoveryDeltaDigest = "sha256:" + hex.EncodeToString(sum[:])
+						}
+					}
+					if entry.Decision != "" {
+						summary.RecoveryDecisions = append(summary.RecoveryDecisions, entry)
+					}
+				}
+			}
+		}
+	}
+	if tasks, err := r.tasks.ScanAll(); err == nil {
+		for _, task := range tasks {
+			if task == nil || task.GraphID != doc.GraphID || len(task.Artifacts) == 0 {
+				continue
+			}
+			summary.WorkspaceChanged = true
+			summary.WorkspaceChangeTaskCount++
+			summary.ArtifactCount += len(task.Artifacts)
+		}
+	}
+	return summary
+}
+
+func graphSettlementReasonCode(exec *graph.Execution) string {
+	if exec == nil || exec.Settlement == nil {
+		return ""
+	}
+	reason := exec.Settlement.Reason
+	switch {
+	case strings.Contains(reason, graph.RecoveryRetryUnstartableReasonCode),
+		strings.Contains(reason, "RunContract phase=execution 的剩余时间窗已耗尽"):
+		return graph.RecoveryRetryUnstartableReasonCode
+	case strings.Contains(reason, "任务发布失败"):
+		return "activation_publish_failed"
+	case strings.Contains(reason, "contract_no_outlet"):
+		return "contract_no_outlet"
+	case reason != "":
+		return "runtime_failure"
+	default:
+		return ""
+	}
+}
+
+func safeGraphTerminalReason(doc *graph.GraphDocument, _ string) string {
+	if doc == nil {
+		return "Graph 终态摘要不可用"
+	}
+	outcome := "unknown"
+	if doc.Outcome != nil && doc.Outcome.Outcome.IsValid() {
+		outcome = string(doc.Outcome.Outcome)
+	}
+	switch doc.Status {
+	case graph.GraphCompleted:
+		return "Graph 已提交 typed success 终态；详细交付物按 ResultRef 定向读取"
+	case graph.GraphBlocked:
+		return "Graph 已提交 typed blocked 终态；阻塞点见终态 Activation 与 ResultRef"
+	case graph.GraphCancelled:
+		return "Graph 已提交 typed cancelled 终态；不会自动重启业务工作"
+	default:
+		return fmt.Sprintf("Graph 已提交 typed %s 终态（outcome=%s）；原始错误正文未进入摘要",
+			doc.Status, outcome)
+	}
+}
+
+func renderGraphFinalizationFallback(task *model.Task) (string, error) {
+	if task == nil || strings.TrimSpace(task.FinalReportGraphID) == "" {
+		return "", fmt.Errorf("finalization fallback 缺少 FinalReportGraphID")
+	}
+	var summary graphTerminalSummary
+	found := false
+	for _, input := range task.ContextInputs {
+		if !strings.HasPrefix(input.SourceRef, "graph-terminal-summary:") {
+			continue
+		}
+		body := strings.TrimSpace(input.Content)
+		body = strings.TrimPrefix(body, "<graph-terminal-summary>")
+		body = strings.TrimSuffix(body, "</graph-terminal-summary>")
+		if err := json.Unmarshal([]byte(body), &summary); err != nil {
+			return "", fmt.Errorf("解析 GraphTerminalSummary: %w", err)
+		}
+		found = true
+		break
+	}
+	if !found || summary.Schema != graphTerminalSummarySchemaV2 || summary.GraphID != task.FinalReportGraphID {
+		return "", fmt.Errorf("GraphTerminalSummary 缺失或 scope 不一致")
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Graph %s 已到终态 %s（outcome=%s，revision=%d，state_version=%d）。",
+		summary.GraphID, summary.Status, summary.Outcome, summary.Revision, summary.StateVersion)
+	if summary.EndNodeID != "" {
+		fmt.Fprintf(&b, " 终态节点为 %s", summary.EndNodeID)
+		if summary.EndActivationID != "" {
+			fmt.Fprintf(&b, "/%s", summary.EndActivationID)
+		}
+		b.WriteString("。")
+	}
+	if strings.TrimSpace(summary.Reason) != "" {
+		fmt.Fprintf(&b, " 原因：%s。", summary.Reason)
+	}
+	fmt.Fprintf(&b, " Workspace changed=%t，artifact_count=%d。",
+		summary.WorkspaceChanged, summary.ArtifactCount)
+	var failures []string
+	for _, node := range summary.TerminalNodes {
+		if node.Status == string(graph.NodeCompleted) {
+			continue
+		}
+		identity := node.NodeID
+		if node.ActivationID != "" {
+			identity = node.ActivationID
+		}
+		detail := identity + "=" + node.Status
+		if node.SettlementReasonCode != "" {
+			detail += "[" + node.SettlementReasonCode + "]"
+		}
+		if !node.TaskPublished && (node.Kind == string(graph.KindAgent) ||
+			node.Kind == string(graph.KindController) || node.Kind == string(graph.KindAcceptance)) {
+			detail += "[task_not_published]"
+		}
+		failures = append(failures, detail)
+	}
+	if len(failures) > 0 {
+		fmt.Fprintf(&b, " 未成功的 Activation：%s。", strings.Join(failures, "、"))
+	}
+	if summary.Outcome != string(graph.EndSuccess) {
+		b.WriteString(" 本次请求未成功完成；如需继续，应以新的用户输入启动新 Run，不会自动重启业务 Graph。")
+	}
+	return b.String(), nil
 }
 
 func graphEndWakeMarker(doc *graph.GraphDocument) string {
@@ -1051,6 +1277,7 @@ func evidenceCallEntry(ref string, call store.ToolCallRecord) graph.EvidenceEntr
 			exit := *call.ExitCode
 			entry.ExitCode = &exit
 		}
+		entry.ExitCodeScope = string(call.ExitCodeScope)
 	case "write_file", "edit_file", "read_file":
 		entry.Path, entry.PathTruncated = boundedEvidenceValue(arg("path"), graph.EvidencePathMaxRunes)
 	}
@@ -1078,15 +1305,16 @@ func boundedEvidenceValue(value string, maxRunes int) (string, bool) {
 // 仍然稳定。Timestamp 不参与身份，避免导入/精度归一导致引用漂移。
 func evidenceCallRef(taskID string, call store.ToolCallRecord) string {
 	payload := struct {
-		CallID   string         `json:"call_id,omitempty"`
-		AgentID  string         `json:"agent_id,omitempty"`
-		ToolName string         `json:"tool_name"`
-		Args     map[string]any `json:"args,omitempty"`
-		Success  bool           `json:"success"`
-		ExitCode *int           `json:"exit_code,omitempty"`
+		CallID        string                   `json:"call_id,omitempty"`
+		AgentID       string                   `json:"agent_id,omitempty"`
+		ToolName      string                   `json:"tool_name"`
+		Args          map[string]any           `json:"args,omitempty"`
+		Success       bool                     `json:"success"`
+		ExitCode      *int                     `json:"exit_code,omitempty"`
+		ExitCodeScope store.ShellExitCodeScope `json:"exit_code_scope,omitempty"`
 	}{
 		CallID: call.CallID, AgentID: call.AgentID, ToolName: call.ToolName,
-		Args: call.Args, Success: call.Success, ExitCode: call.ExitCode,
+		Args: call.Args, Success: call.Success, ExitCode: call.ExitCode, ExitCodeScope: call.ExitCodeScope,
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -1186,7 +1414,13 @@ func evidenceCallSummary(call store.ToolCallRecord) string {
 		if call.ExitCode != nil {
 			exit = fmt.Sprintf("%d", *call.ExitCode)
 		}
-		s = fmt.Sprintf("命令: %s（exit=%s）", arg("command"), exit)
+		scope := string(call.ExitCodeScope)
+		if scope == "" && call.ExitCode != nil {
+			scope = string(store.ShellExitCodeScopeWholeCommand)
+		} else if scope == "" {
+			scope = "?"
+		}
+		s = fmt.Sprintf("命令: %s（exit=%s scope=%s）", arg("command"), exit, scope)
 	case "write_file", "edit_file", "read_file":
 		s = fmt.Sprintf("路径: %s", arg("path"))
 	default:

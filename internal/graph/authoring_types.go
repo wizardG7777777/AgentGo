@@ -14,6 +14,8 @@ import (
 // 它以 ComputeDefinitionDigest 为现有 Graph 语义底座，并补入尚未投影到 Runtime
 // Node 的 EndOutcome、OutputContract、policy refs、Contract bindings 及 Run 身份。
 const GraphDefinitionDigestVersionV1 = "agentgo.graph-authoring-definition-digest/v1"
+const GraphDefinitionDigestVersionV2 = "agentgo.graph-authoring-definition-digest/v2"
+const GraphDefinitionDigestVersionCurrent = GraphDefinitionDigestVersionV2
 
 // Graph authoring 与 Graph execution 是两个持久化域：本文件只定义不可执行的
 // Draft/Definition/Proposal 对象，不复用 GraphDocument 的 status/state_version
@@ -415,6 +417,10 @@ func ComputeGraphContractDigest(contract GraphContract) string {
 // GraphDocument 后调用版本化 ComputeDefinitionDigest。它是 AuthoringStore、
 // compiler 和 start precondition 的共同摘要入口。
 func ComputeGraphDefinitionDigest(graphID string, revision int64, body GraphDefinitionBody) string {
+	return ComputeGraphDefinitionDigestVersion(GraphDefinitionDigestVersionCurrent, graphID, revision, body)
+}
+
+func ComputeGraphDefinitionDigestVersion(version, graphID string, revision int64, body GraphDefinitionBody) string {
 	doc := graphDocumentFromDefinition(graphID, revision, body)
 	extra := make(map[string]graphDefinitionNodeDigest, len(body.Nodes))
 	for id, node := range body.Nodes {
@@ -432,7 +438,7 @@ func ComputeGraphDefinitionDigest(graphID string, revision int64, body GraphDefi
 		RunContract    *runcontract.RunContract             `json:"run_contract,omitempty"`
 		Nodes          map[string]graphDefinitionNodeDigest `json:"nodes"`
 	}{
-		Domain: GraphDefinitionDigestVersionV1, DocumentDigest: ComputeDefinitionDigest(doc),
+		Domain: version, DocumentDigest: ComputeDefinitionDigest(doc),
 		RunID: body.RunID, RunContract: body.RunContract, Nodes: extra,
 	})
 }

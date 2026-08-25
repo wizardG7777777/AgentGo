@@ -289,10 +289,11 @@ func (b *ManifestBuilder) Seal() ContextManifest {
 // 写方（processTask / injectMemoryContext / handleFailure）与读方（executor）
 // 同在 ReAct 循环 goroutine 内串行执行，无需加锁。
 type manifestSideInfo struct {
-	taskStartedAt   time.Time
-	memoryUpdatedAt map[string]time.Time // "<team-snapshot>" / "<file-awareness>" → Entry.UpdatedAt
-	l2Strategy      string               // 非空 = 本 attempt 已发生 L2 摘要压缩（值=strategy）
-	l3Truncated     bool                 // 本 attempt 内 handleFailure 溢出分支已做 L3 激进压缩
+	taskStartedAt          time.Time
+	memoryUpdatedAt        map[string]time.Time // "<team-snapshot>" / "<file-awareness>" → Entry.UpdatedAt
+	l2Strategy             string               // 非空 = 本 attempt 已发生 L2 摘要压缩（值=strategy）
+	historyProjectionCount int                  // 本 attempt 实际发生 history projection 的次数
+	l3Truncated            bool                 // 本 attempt 内 handleFailure 溢出分支已做 L3 激进压缩
 	// depTaskMemDropped 非空 = 任务有依赖但 dep Task Memory 交接注入被跳过
 	// （store 未装配 / 加载失败），Manifest 登记 dep_task_memory dropped:<原因>。
 	depTaskMemDropped string

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -31,13 +32,15 @@ type LocalReadGroup struct {
 	HashlineEnabled bool                  // §7：默认 false，启动时由 cfg 注入
 }
 
+const readFileOutputMaxChars = 64 << 10
+
 // Register 把四个只读工具注册到 r。
 func (g LocalReadGroup) Register(r *agent.ToolRegistry) {
 	r.Register("read_file", "读取文件内容，支持按行切片。默认输出每行带有行哈希前缀（如 1#VK|content），可用作 edit_file 的 line_anchors 锚点。",
 		schema.Object().
 			String("path", "文件路径", true).
 			Int("offset", "起始行号（1-based），可选；不传则从文件开头读", false).
-			Int("limit", "读取行数上限，可选；分页建议每次 200 行左右（输出上限 10000 字符，页过大将被截断导致重叠重读）；不传则读到文件末尾或字符上限", false).
+			Int("limit", "读取行数上限，可选；大文件建议分页。单次输出上限 64 Ki 字符，完整结果再由 L2 按 Context 压力决定 inline/ref", false).
 			Bool("force_full", "缓存命中时仍强制返回全文。默认 false：同一文件重复读取且内容未变时仅返回摘要+hash（请先回顾你的笔记），防止为相同内容重复支付 prompt", false).
 			Build(),
 		g.readFile,
@@ -52,12 +55,14 @@ func (g LocalReadGroup) Register(r *agent.ToolRegistry) {
 		g.listDir,
 	)
 
-	r.Register("grep_search", "在目录内按文本模式搜索匹配行",
+	r.RegisterWithDefaults("grep_search", "在目录内搜索匹配行；pattern_mode 默认 literal（字面子串，字符 | 没有 alternation 含义），需要正则时必须显式设为 regex",
 		schema.Object().
-			String("pattern", "搜索的文本模式", true).
+			String("pattern", "搜索模式；literal 下按字面子串匹配，regex 下按 Go regexp 语法匹配", true).
+			Enum("pattern_mode", "匹配语法：literal=字面子串；regex=Go 正则表达式", []string{"literal", "regex"}, false).
 			String("path", "搜索的目录或文件路径", true).
 			Int("max_lines", "最大返回行数，默认 50", false).
 			Build(),
+		map[string]any{"pattern_mode": "literal"},
 		g.grepSearch,
 	)
 
@@ -206,18 +211,18 @@ func (g LocalReadGroup) readFile(ctx context.Context, args map[string]any) (stri
 		}
 	}
 
-	// 10000 字符截断（在切片之后）
+	// 64 Ki 字符安全上限（在切片之后）；不再用旧 10k 阈值制造高频重读。
 	truncated := false
-	if len(content) > 10000 {
+	if len(content) > readFileOutputMaxChars {
 		origChars := len(content)
 		// 带元数据的截断公告（2026-07-22 闸 2，参考 Codex "Warning: truncated
 		// (original token count: N)"）：给出本段原大小与续读行号，让模型用
 		// offset 精确续读，而不是重读全文或凭猜测续翻页。
-		nextLine := strings.Count(content[:10000], "\n") + 1
+		nextLine := strings.Count(content[:readFileOutputMaxChars], "\n") + 1
 		if hasOffset || hasLimit {
 			nextLine += startLine - 1
 		}
-		content = content[:10000] + fmt.Sprintf("\n... [已截断：本段原 %d 字符，仅显示前 10000；用 offset=%d 续读（分页建议每次 200 行左右）]", origChars, nextLine)
+		content = content[:readFileOutputMaxChars] + fmt.Sprintf("\n... [已截断：本段原 %d 字符，仅显示前 %d；用 offset=%d 续读]", origChars, readFileOutputMaxChars, nextLine)
 		truncated = true
 	}
 
@@ -249,7 +254,7 @@ func formatReadFileResult(path, content, hash string, startLine, endLine, totalL
 		}
 	}
 	if truncated {
-		sb.WriteString(" [truncated to 10000 chars]")
+		sb.WriteString(fmt.Sprintf(" [truncated to %d chars]", readFileOutputMaxChars))
 	}
 	if note != "" {
 		sb.WriteString(" [")
@@ -369,9 +374,26 @@ func writeTree(sb *strings.Builder, dir string, level, maxDepth int) error {
 // 与 list_dir 同属目录级操作：不做 workspace overlay（v1 决定），始终搜索主根视图。
 func (g LocalReadGroup) grepSearch(ctx context.Context, args map[string]any) (string, error) {
 	pattern, _ := args["pattern"].(string)
+	patternMode, _ := args["pattern_mode"].(string)
+	if patternMode == "" {
+		patternMode = "literal"
+	}
 	searchPath, _ := args["path"].(string)
 	if pattern == "" || searchPath == "" {
 		return "", fmt.Errorf("缺少 pattern 或 path 参数")
+	}
+	var matcher func(string) bool
+	switch patternMode {
+	case "literal":
+		matcher = func(line string) bool { return strings.Contains(line, pattern) }
+	case "regex":
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return "", fmt.Errorf("grep_search reason_code=invalid_regex：pattern=%q 不是合法 Go regexp: %w", pattern, err)
+		}
+		matcher = re.MatchString
+	default:
+		return "", fmt.Errorf("grep_search pattern_mode=%q 非法，仅允许 literal|regex", patternMode)
 	}
 	projectRoot := ""
 	if g.Workdir != nil {
@@ -418,7 +440,7 @@ func (g LocalReadGroup) grepSearch(ctx context.Context, args map[string]any) (st
 			if len(results) >= maxLines {
 				return filepath.SkipAll
 			}
-			if strings.Contains(line, pattern) {
+			if matcher(line) {
 				results = append(results, fmt.Sprintf("%s:%d: %s", path, i+1, line))
 			}
 		}
@@ -428,8 +450,8 @@ func (g LocalReadGroup) grepSearch(ctx context.Context, args map[string]any) (st
 	if len(results) == 0 {
 		base := fmt.Sprintf(
 			"未找到包含 %q 的行（扫描 %d 个文件，跳过 %d 个隐藏文件和 %d 个 >1MB 文件；max_lines=%d）。"+
-				"若意外为空：1) 先用 list_dir 确认 %q 下有目标文件；2) pattern 按字面子串匹配（非正则），检查大小写；3) 目标文件若 >1MB 会被跳过",
-			pattern, scannedFiles, skippedHidden, skippedLarge, maxLines, searchPath,
+				"若意外为空：1) 先用 list_dir 确认 %q 下有目标文件；2) 当前 pattern_mode=%s，literal 是非正则字面匹配，字符 | 没有 alternation 含义；3) 检查大小写；4) 目标文件若 >1MB 会被跳过",
+			pattern, scannedFiles, skippedHidden, skippedLarge, maxLines, searchPath, patternMode,
 		)
 		// §10 Did-You-Mean：文件名层候选——本次扫描的文件路径列表找相似文件名
 		hits := suggest.Suggest(pattern, allPaths, 3)

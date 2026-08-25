@@ -1,10 +1,9 @@
 // render.go 实现 Task Memory 的有界渲染（注入上下文用）。
 //
-// 段落优先级（V6 §3：Goal/Constraints > Phase > Blockers > confirmed Facts
-// > Files > Failures 尾部 > Next；已完成动作是工作记录主体，置于 Phase 之后）：
+// 段落优先级：当前 Observation 状态必须先于历史动作审计：
 //
-//	Goal/Constraints > Phase > Actions > Blockers > confirmed Facts
-//	> Files > Failures（尾部）> NextCandidates
+//	Goal/Constraints > Phase > Blockers > confirmed Facts > NextCandidates
+//	> Files > Failures（尾部）> Actions
 //
 // 预算执法：按优先级依次装填；列表段放不进剩余预算时从**最旧**条目开始
 // 省略（保留最近），整段一条都放不下则跳过低优先级段。inferred Facts
@@ -16,14 +15,15 @@ import (
 	"strings"
 )
 
-// Render 把 Task Memory 渲染为 ≤ budgetRunes 的注入文本。
-// budgetRunes <= 0 时使用 DefaultRenderBudget。
+// Render 把 Task Memory 渲染为注入文本。budgetRunes > 0 时仅供显式测试或
+// 上层调用者施加边界；<=0 表示完整渲染，由 L2 Context policy 按当前模型
+// capability 统一决定 inline/reference，TaskMemory 不再私设 1500-rune 瓶颈。
 func Render(m *TaskMemory, budgetRunes int) string {
 	if m == nil {
 		return ""
 	}
 	if budgetRunes <= 0 {
-		budgetRunes = DefaultRenderBudget
+		budgetRunes = int(^uint(0) >> 2)
 	}
 
 	header := fmt.Sprintf("<task-memory source=\"task-memory\" version=\"%d\">\n", m.Version)
@@ -59,12 +59,12 @@ func Render(m *TaskMemory, budgetRunes int) string {
 		title string
 		lines []string
 	}{
-		{"已完成动作:", actionLines(m)},
 		{"当前阻塞:", append([]string(nil), m.Blockers...)},
 		{"已确认事实:", confirmedFactLines(m)},
+		{"下一步候选:", append([]string(nil), m.NextCandidates...)},
 		{"文件与产物版本:", fileLines(m)},
 		{"失败尝试:", append([]string(nil), m.Failures...)},
-		{"下一步候选:", append([]string(nil), m.NextCandidates...)},
+		{"已完成动作:", actionLines(m)},
 	}
 	for _, sec := range sections {
 		if len(sec.lines) == 0 {

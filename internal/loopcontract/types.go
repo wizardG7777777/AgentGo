@@ -24,6 +24,10 @@ const (
 	InterventionSchemaV1     = "agentgo.loop-intervention/v1"
 )
 
+// RunBudgetRefRunIDV1 表示执行时必须用 Task.RunID 解引用共享 RunBudgetStore。
+// 它是 resolver identity，不是某个 profile 或 Task-local checkpoint。
+const RunBudgetRefRunIDV1 = "run-budget:run-id/v1"
+
 // WorkClass 是 Scheduler 可声明、框架负责解释的封闭工作类别。
 type WorkClass string
 
@@ -32,6 +36,7 @@ const (
 	WorkInvestigation  WorkClass = "investigation"
 	WorkVerification   WorkClass = "verification"
 	WorkCoordination   WorkClass = "coordination"
+	WorkFinalization   WorkClass = "finalization"
 	WorkExternalEffect WorkClass = "external_effect"
 )
 
@@ -39,17 +44,18 @@ const (
 type ProgressSignalKind string
 
 const (
-	SignalFileVersionChanged     ProgressSignalKind = "file_version_changed"
-	SignalArtifactRegistered     ProgressSignalKind = "artifact_registered"
-	SignalArtifactVersionChanged ProgressSignalKind = "artifact_version_changed"
-	SignalEvaluationChanged      ProgressSignalKind = "evaluation_changed"
-	SignalEvaluationPassed       ProgressSignalKind = "evaluation_passed"
-	SignalNovelEvidence          ProgressSignalKind = "novel_evidence"
-	SignalConfirmedFactAdded     ProgressSignalKind = "confirmed_fact_added"
-	SignalBlockerCleared         ProgressSignalKind = "blocker_cleared"
-	SignalInputRevisionAdvanced  ProgressSignalKind = "input_revision_advanced"
-	SignalResultFieldSet         ProgressSignalKind = "result_field_set"
-	SignalExternalEffectSettled  ProgressSignalKind = "external_effect_settled"
+	SignalFileVersionChanged       ProgressSignalKind = "file_version_changed"
+	SignalArtifactRegistered       ProgressSignalKind = "artifact_registered"
+	SignalArtifactVersionChanged   ProgressSignalKind = "artifact_version_changed"
+	SignalEvaluationChanged        ProgressSignalKind = "evaluation_changed"
+	SignalEvaluationPassed         ProgressSignalKind = "evaluation_passed"
+	SignalNovelEvidence            ProgressSignalKind = "novel_evidence"
+	SignalConfirmedFactAdded       ProgressSignalKind = "confirmed_fact_added"
+	SignalBlockerCleared           ProgressSignalKind = "blocker_cleared"
+	SignalInputRevisionAdvanced    ProgressSignalKind = "input_revision_advanced"
+	SignalResultFieldSet           ProgressSignalKind = "result_field_set"
+	SignalExternalEffectSettled    ProgressSignalKind = "external_effect_settled"
+	SignalObservationStateAdvanced ProgressSignalKind = "observation_state_advanced"
 )
 
 type DeliverableKind string
@@ -113,16 +119,18 @@ type ProgressSignalRule struct {
 
 // ProgressPolicy 是 framework policy catalog 解析后的有界策略。
 type ProgressPolicy struct {
-	PolicyRef               string                  `json:"policy_ref"`
-	ReminderAfterTurns      int                     `json:"reminder_after_turns"`
-	RolloverAfterTurns      int                     `json:"rollover_after_turns"`
-	InterventionAfterTurns  int                     `json:"intervention_after_turns"`
-	MaxNoProgressTurns      int                     `json:"max_no_progress_turns"`
-	MaxNoProgressDuration   time.Duration           `json:"max_no_progress_duration"`
-	MaxNoProgressUsage      runcontract.BudgetLimit `json:"max_no_progress_usage"`
-	MaxExplorationTurns     int                     `json:"max_exploration_turns"`
-	MaxAttemptRollovers     int                     `json:"max_attempt_rollovers"`
-	RecentFingerprintWindow int                     `json:"recent_fingerprint_window"`
+	PolicyRef                     string                  `json:"policy_ref"`
+	ReminderAfterTurns            int                     `json:"reminder_after_turns"`
+	RolloverAfterTurns            int                     `json:"rollover_after_turns"`
+	InterventionAfterTurns        int                     `json:"intervention_after_turns"`
+	MaxNoProgressTurns            int                     `json:"max_no_progress_turns"`
+	MaxNoProgressDuration         time.Duration           `json:"max_no_progress_duration"`
+	MaxNoProgressUsage            runcontract.BudgetLimit `json:"max_no_progress_usage"`
+	MaxExplorationTurns           int                     `json:"max_exploration_turns"`
+	KnowledgeCheckpointAfterTurns int                     `json:"knowledge_checkpoint_after_turns,omitempty"`
+	MaxObservationStagnation      int                     `json:"max_observation_stagnation,omitempty"`
+	MaxAttemptRollovers           int                     `json:"max_attempt_rollovers"`
+	RecentFingerprintWindow       int                     `json:"recent_fingerprint_window"`
 }
 
 // ProgressContractRef 是 Graph/Task/Activation 保存的稳定引用。
@@ -205,6 +213,18 @@ type ResultFieldChange struct {
 	AfterDigest  string `json:"after_digest"`
 }
 
+// ObservationChange 是 L2 durable Observation 状态在本 Turn 的机械投影。
+// SemanticAdvance 由 L2 Store 计算，模型不能用新措辞直接刷新它。
+type ObservationChange struct {
+	Ref                  string `json:"ref"`
+	PreviousRef          string `json:"previous_ref,omitempty"`
+	Phase                string `json:"phase"`
+	WorkspaceRevisionRef string `json:"workspace_revision_ref"`
+	LatestCheckRef       string `json:"latest_check_ref,omitempty"`
+	ResolvedCandidates   int    `json:"resolved_candidates,omitempty"`
+	SemanticAdvance      bool   `json:"semantic_advance"`
+}
+
 // TurnSettlementDelta 是一个 settled Turn 相对前一 durable cursor 的中性事实。
 // Failure 必须是 invocation.Failure 的值拷贝且 Cause 已清空；正文保留在各自
 // 权威 Store，本 DTO 只携带稳定引用和 digest。
@@ -234,6 +254,10 @@ type TurnSettlementDelta struct {
 	BlockerChanges    []BlockerChange     `json:"blocker_changes,omitempty"`
 	InputChanges      []InputChange       `json:"input_changes,omitempty"`
 	ResultChanges     []ResultFieldChange `json:"result_changes,omitempty"`
+	// ObservationDeltaRef 是本 Turn 通过 record_observation_delta 落下的
+	// durable 引用；正文不进入 L4 journal。
+	ObservationDeltaRef string             `json:"observation_delta_ref,omitempty"`
+	ObservationChange   *ObservationChange `json:"observation_change,omitempty"`
 
 	UsageDelta runcontract.BudgetUsage `json:"usage_delta"`
 	Failure    *invocation.Failure     `json:"failure,omitempty"`
@@ -322,6 +346,13 @@ type ProgressCheckpoint struct {
 	NoProgressUsage                  runcontract.BudgetUsage `json:"no_progress_usage"`
 	CumulativeUsage                  runcontract.BudgetUsage `json:"cumulative_usage"`
 	ExplorationTurnsSinceDeliverable int                     `json:"exploration_turns_since_deliverable"`
+	KnowledgeTurnsSinceObservation   int                     `json:"knowledge_turns_since_observation,omitempty"`
+	ObservationDeltaRef              string                  `json:"observation_delta_ref,omitempty"`
+	ObservationAttemptID             string                  `json:"observation_attempt_id,omitempty"`
+	ObservationPhase                 string                  `json:"observation_phase,omitempty"`
+	ObservationWorkspaceRevisionRef  string                  `json:"observation_workspace_revision_ref,omitempty"`
+	ObservationLatestCheckRef        string                  `json:"observation_latest_check_ref,omitempty"`
+	ObservationStagnationCount       int                     `json:"observation_stagnation_count,omitempty"`
 
 	InterventionStage    InterventionStage `json:"intervention_stage"`
 	LastInterventionAt   time.Time         `json:"last_intervention_at,omitempty"`
@@ -395,28 +426,31 @@ const (
 	InterventionOscillation        InterventionReason = "oscillation_detected"
 	InterventionUnsafeUnknown      InterventionReason = "unsafe_unknown"
 	InterventionCheckpointFailure  InterventionReason = "checkpoint_unavailable"
+	InterventionObservationStalled InterventionReason = "observation_state_stalled"
 	InterventionAttemptBudget      InterventionReason = "attempt_budget_exhausted"
 )
 
 // LoopInterventionRequested 是 L4 交给 L5 的 durable、有类型控制命令。
 type LoopInterventionRequested struct {
-	Schema            string                  `json:"schema"`
-	CommandID         string                  `json:"command_id"`
-	SessionID         string                  `json:"session_id,omitempty"`
-	RunID             runcontract.RunID       `json:"run_id"`
-	GraphID           string                  `json:"graph_id,omitempty"`
-	NodeID            string                  `json:"node_id,omitempty"`
-	ActivationID      string                  `json:"activation_id,omitempty"`
-	TaskID            string                  `json:"task_id"`
-	AttemptID         string                  `json:"attempt_id"`
-	Contract          ProgressContractRef     `json:"contract"`
-	ReasonCode        InterventionReason      `json:"reason_code"`
-	MissingMilestones []string                `json:"missing_milestones,omitempty"`
-	RepeatedSignals   []ProgressFingerprint   `json:"repeated_signals,omitempty"`
-	BudgetUsed        runcontract.BudgetUsage `json:"budget_used"`
-	BudgetRemaining   runcontract.BudgetLimit `json:"budget_remaining"`
-	CheckpointRef     string                  `json:"checkpoint_ref"`
-	RequestedAt       time.Time               `json:"requested_at"`
+	Schema              string                  `json:"schema"`
+	CommandID           string                  `json:"command_id"`
+	SessionID           string                  `json:"session_id,omitempty"`
+	RunID               runcontract.RunID       `json:"run_id"`
+	GraphID             string                  `json:"graph_id,omitempty"`
+	FinalReportGraphID  string                  `json:"final_report_graph_id,omitempty"`
+	NodeID              string                  `json:"node_id,omitempty"`
+	ActivationID        string                  `json:"activation_id,omitempty"`
+	TaskID              string                  `json:"task_id"`
+	AttemptID           string                  `json:"attempt_id"`
+	Contract            ProgressContractRef     `json:"contract"`
+	ReasonCode          InterventionReason      `json:"reason_code"`
+	MissingMilestones   []string                `json:"missing_milestones,omitempty"`
+	RepeatedSignals     []ProgressFingerprint   `json:"repeated_signals,omitempty"`
+	BudgetUsed          runcontract.BudgetUsage `json:"budget_used"`
+	BudgetRemaining     runcontract.BudgetLimit `json:"budget_remaining"`
+	CheckpointRef       string                  `json:"checkpoint_ref"`
+	ObservationDeltaRef string                  `json:"observation_delta_ref,omitempty"`
+	RequestedAt         time.Time               `json:"requested_at"`
 }
 
 // FreezeInvocationFailure 复制一次 canonical InvocationFailure 并清空只供

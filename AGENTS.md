@@ -6,7 +6,17 @@
 
 AgentGo 是一个 Go 多智能体任务编排系统：Scheduler（LLM 驱动的 `agent.Agent`）把请求分解为任务发到公告板，Runner 执行代理（`internal/runner`，按 kind 在 `setting.yaml` 声明）轮询认领并运行带工具调用的 ReAct 循环。v5 起为 Gate（动作前拦截）+ Reactor（状态变更后响应）反应式体系；V6 起以持久化 Graph 编排取代 Plan 运行时（`internal/plan` 已删），并引入 Execution Lease、Effect Journal、Task/Session Memory 与两轴模式。
 
-语言：Go 1.25 ｜ 模块名：`agentgo` ｜ 配置：`setting.yaml`（YAML/JSON，仅 v4 schema） ｜ LLM：OpenAI-compatible Chat Completions，经 `internal/llm` 统一实现。
+语言：Go 1.25 ｜ 模块名：`agentgo` ｜ 配置：`setting.yaml`（YAML/JSON，仅 v4 schema） ｜ LLM：OpenAI-compatible Responses 主链（Chat Completions 仅显式协议配置），经 `internal/llm` 统一实现。
+
+## 五层工程架构
+
+1. Prompt Engineering：定义模型的角色、指令、规则与输出契约。
+2. Context Engineering：编译本次模型调用应看到的任务、记忆、历史、工具与上游信息。
+3. Harness Engineering：通过 Tool、Execution Lease、Store、Effect 与执行环境向模型提供受控行动能力。
+4. Loop Engineering：管理单个 Agent Activation 的 Turn、Attempt、进展、重试、收敛与停止。
+5. **Graph Engineering**：编排多个 Agent、Loop 与节点的职责、Activation、Result/Evidence 及数据流。
+
+五层是工程责任域，不要与 Go 包一一对应；完整边界见 [`docs/design/five-layer-engineering-architecture.md`](docs/design/five-layer-engineering-architecture.md)。
 
 ## 构建、测试与调试命令
 
@@ -30,7 +40,11 @@ go test -run TestName ./internal/agent/   # 单个测试
 - Acceptance 节点必须有非空 `task.title` 和写明逐项验收标准的非空 `task.description`。completed 业务结论只通过 `$.verdict` 精确 `eq` 路由，verdict 枚举为 `pass` / `fixable` / `failed`，completed 结果必须省略 `event`。acceptance 出边禁止无条件、`always`、`completed`、`pass`/`fixable` 事件条件；只允许 `$.verdict eq ...` 业务分支及 Runtime `failed` / `blocked` 兜底事件。证据或能力不足时提交 `status=blocked`；`disputed` 是 Runtime 核验状态，不是 verifier verdict。
 - `submit_task_result` 提交即 finalizing（后续工具调用被 fence），同一任务唯一终态提交者；`status=blocked` 需同填 `blocked_reason`。自定义 Graph path 路由字段必须放在 `result` object（如 `result={"coverage":"gap"}`），不能只写 summary/event；结构化终态字段原子落盘失败时任务 fail-closed。
 - Scheduler create/configure/validate/commit/start 与 Proposal Acceptance 的机械调用使用 **`tool_choice=auto` + 唯一 ToolRouter + L3 required-action gate**，因 DeepSeek thinking 会拒绝 exact/required choice。L3 冻结时必须校验 phase→tool 精确映射；零 tool call 不得自然退出；provider 忽略 `parallel_tool_calls=false` 返回 fan-out 时只 dispatch 首个，其余 call_id 写 skipped result 以保持 Responses 重放完整。Graph 最终交付是经 live matrix 验证的狭义例外：L3 投影掉旧工具历史并注入 phase contract，Model Invocation 仅对该次调用覆盖为 `reasoning_effort=none` + exact `submit_task_result`。两条路径都不得恢复为按 provider/model 名称特判。
-- 新建 code-change Task/Graph 使用 `progress:code-change/v3`（`ProgressCodeChangeCurrent`）；v1/v2 只供历史冻结任务恢复，不得就地改写。v3 的 no-progress 阶段为 reminder=4 / rollover=10 / intervention=18 / hard=24；rollover 次数用尽不等于立即 intervention，必须继续到明示 `intervention_after_turns`。
+- 新建 code-change Task/Graph 使用 `progress:code-change/v5`（`ProgressCodeChangeCurrent`）：普通新证据不因固定 exploration 轮数强制交卷，每 8 个 knowledge turn 进入 `agentgo.observation-delta/v2` 状态 checkpoint；只有 phase/workspace/check 前进或用 checkpoint 之后的新证据关闭 predecessor candidate 才算 Observation 语义进展，连续两份未前进则以 `observation_state_stalled` 交 L5 recovery。no-progress 阶段仍为 reminder=4 / rollover=10 / intervention=18 / hard=24。
+- 新 Run 默认使用 `interactive/v3`（SWE 为 `swe/v3`）：默认 model/tool/token/cost 只记账，不把旧的 per-Task 调用护栏静默收紧成 per-Run 总量；用户显式 `RunContract.Budget` 由 `.agentgo/state/run-budgets` 的 durable Ledger 按 RunID 跨 Task 执法。`model_calls` 只在请求越过 L3 provider dispatch 边界后结算；ToolRouter/Context/Lease 本地 preflight 失败只关闭 reservation，不消费 provider call。coordination/recovery/finalization 是独立控制 phase，不消费业务 execution limit，但受各自 Lease/ProgressContract/deadline reserve 约束。Recovery retry 必须先冻结 `RecoveryStartPermit`，目标 Activation 首轮 claim 后才能调用模型。
+- Observation checkpoint 是独立 L3 Control Invocation：投影业务历史，只保留 TaskMemory/evidence authority，wire 使用 `reasoning=none` + exact `record_observation_delta`；工具从启动期 framework control registry 取得，不依赖 Acceptance/readonly 的普通业务 Lease，普通业务轮仍不得看到该工具。该 control ToolCall 不进入后续业务 Responses replay，正常 Worker thinking 不变。不要恢复成 thinking + auto-singleton，也不要按 provider/model 名称特判。
+- Provider HTTP 402/结构化 billing code 使用 `provider_quota_exhausted`，与可重试的 429 `rate_limited` 分开；quota 属于 Run 外部资源，当前 Activation blocked 等待新 Run，不得靠 retry、Context 重建或 Graph recovery 消耗更多调用。`RecoveryRequestIntervene` 必须形成 durable `LoopInterventionRequested`，不得落入 `non_recoverable_error`。
+- SWE batch summary 是当前 `.batch_start` 绑定的事务产物：无论 task/启动异常都在 `finally` 原子重写，并用 `completed` / `completed_with_infrastructure_error` / `infrastructure_error` / `not_run` 区分覆盖率；旧 result/judge 不得填充当前批次，incomplete batch 不得显示成普通 X/8 正确率。
 - **Graph 终态契约 v2（2026-08-20，`docs/design/graph-terminal-contract-v2.md`）**：新图 `schema` 恰为 `agentgo.graph/v2`；agent/controller 节点**禁止提交 `event`**，出边仅允许 `completed/failed/blocked/always` 系统事件或 result 数据字段 path 条件（字段须在该节点 `task.description` 的输出契约中声明）；提交期出路预求值 + 两击协议（首击拒绝可重交，次击节点 failed 并唤醒 `[graph-change-request: .../no-outlet]` 交 Scheduler 裁决）；输出契约由 runtime 机械派生并钉入 `TaskMemory.Constraints`。v1 存量图按 v1 语义跑完，legacy `publish_task` 的 event 语义 strict 渐进不变。
 - Graph 任务必须把冻结节点类型从 `TaskSpec.NodeKind` 持久化到 `Task.GraphNodeKind` 与 Session 快照；ExecutionLease 只给 controller/agent 注入 `request_replan`，acceptance、旧快照空 kind 与未知 kind 只给 `submit_task_result`，不得从可自定义 route 推断角色；恢复时非空 kind 与 activation 冻结定义不一致必须 fail-closed。新算与复用的 acceptance/未知角色 Lease 都必须通过 read/list/grep/glob/web/submit 正向闭集，Graph Lease 即使 `BusinessTools=nil` 也只能换入 `ToolUnion`，不能泄露完整 registry。
 - Graph Result 按 activation 存入 durable Result Store，实际生效边只冻结稳定 `ResultRef`、有界内联值、目标端口与结构化 Evidence；EvidenceRef 按调用/内容身份稳定生成，不得依赖展示序数。合法跨任务回边无 activation 次数上限，emergency fuse 只限制单次 Runtime 调用内不让出控制权的同步机械级联。

@@ -89,11 +89,13 @@ func progressRefFor(workClass loopcontract.WorkClass) (string, error) {
 	case loopcontract.WorkCodeChange:
 		return policycatalog.ProgressCodeChangeCurrent, nil
 	case loopcontract.WorkInvestigation:
-		return policycatalog.ProgressInvestigationV1, nil
+		return policycatalog.ProgressInvestigationCurrent, nil
 	case loopcontract.WorkVerification:
-		return policycatalog.ProgressVerificationV1, nil
+		return policycatalog.ProgressVerificationCurrent, nil
 	case loopcontract.WorkCoordination:
-		return policycatalog.ProgressCoordinationV1, nil
+		return policycatalog.ProgressCoordinationCurrent, nil
+	case loopcontract.WorkFinalization:
+		return policycatalog.ProgressFinalReportV1, nil
 	default:
 		return "", fmt.Errorf("未知 Task work_class=%q", workClass)
 	}

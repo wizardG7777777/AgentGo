@@ -365,6 +365,45 @@ func TestSchedulerGroup_GetTaskResultAllowsExactDetachedInterventionScope(t *tes
 	}
 }
 
+func TestSchedulerGroup_GetTaskResultAllowsFrozenFinalReportGraphScope(t *testing.T) {
+	s := store.NewMemoryTaskStore(make(chan model.Event, 32), 16, 1, 60)
+	finalReport := newFinalReportTestTask(t, "final-report", "g-finished")
+	if err := s.PublishTask(finalReport); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("scheduler", finalReport.ID); err != nil {
+		t.Fatal(err)
+	}
+	target := &model.Task{ID: "accepted", GraphID: "g-finished", NodeID: "acceptance", ActivationID: "acceptance@1"}
+	publishCompletedResultTask(t, s, target, map[string]string{"verifier": "accepted detail"})
+	other := &model.Task{ID: "other", GraphID: "g-other", NodeID: "work", ActivationID: "work@1"}
+	publishCompletedResultTask(t, s, other, map[string]string{"worker": "other secret"})
+	registry := newResultToolRegistry(SchedulerGroup{Store: s, Holder: &fakeHolder{id: finalReport.ID}})
+	if _, err := dispatchResultPage(t, registry, map[string]any{"task_id": target.ID}); err != nil {
+		t.Fatalf("final-report 应能读取冻结 Graph 的终态结果: %v", err)
+	}
+	if _, err := registry.Dispatch(context.Background(), mkCall("get_task_result", map[string]any{"task_id": other.ID})); err == nil || !strings.Contains(err.Error(), "final-report Graph") {
+		t.Fatalf("final-report 不得跨 Graph 读取: %v", err)
+	}
+}
+
+func TestSchedulerGroup_GetTaskResultRejectsGraphEndedWithoutFrozenScope(t *testing.T) {
+	s := store.NewMemoryTaskStore(make(chan model.Event, 8), 8, 1, 60)
+	current := newFinalReportTestTask(t, "legacy-final", "")
+	if err := s.PublishTask(current); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("scheduler", current.ID); err != nil {
+		t.Fatal(err)
+	}
+	target := &model.Task{ID: "graph-task", GraphID: "g-1"}
+	publishCompletedResultTask(t, s, target, map[string]string{"worker": "detail"})
+	registry := newResultToolRegistry(SchedulerGroup{Store: s, Holder: &fakeHolder{id: current.ID}})
+	if _, err := registry.Dispatch(context.Background(), mkCall("get_task_result", map[string]any{"task_id": target.ID})); err == nil || !strings.Contains(err.Error(), "缺少 final_report_graph_id") {
+		t.Fatalf("graph-ended 无冻结 scope 必须 fail-closed: %v", err)
+	}
+}
+
 func TestSchedulerGroup_GetTaskResultRejectsInactiveCallerAndEvictedResult(t *testing.T) {
 	s, controller := newLegacyResultFixture(t, 1)
 	first := &model.Task{ID: "evicted", ParentTaskID: controller.ID}

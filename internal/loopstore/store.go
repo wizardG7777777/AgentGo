@@ -1284,6 +1284,7 @@ func isCleanInitialCheckpoint(checkpoint loopcontract.ProgressCheckpoint) bool {
 		checkpoint.NoProgressUsage == (runcontract.BudgetUsage{}) &&
 		checkpoint.CumulativeUsage == (runcontract.BudgetUsage{Attempts: 1}) &&
 		checkpoint.ExplorationTurnsSinceDeliverable == 0 &&
+		checkpoint.KnowledgeTurnsSinceObservation == 0 &&
 		checkpoint.InterventionStage == loopcontract.StageRunning &&
 		checkpoint.InterventionCount == 0 && checkpoint.AttemptRolloverCount == 0 &&
 		len(checkpoint.RecentFingerprints) == 0
@@ -1298,6 +1299,7 @@ func sameCheckpointFactsForSeal(current, next loopcontract.ProgressCheckpoint) b
 		current.NoProgressUsage == next.NoProgressUsage &&
 		current.CumulativeUsage == next.CumulativeUsage &&
 		current.ExplorationTurnsSinceDeliverable == next.ExplorationTurnsSinceDeliverable &&
+		current.KnowledgeTurnsSinceObservation == next.KnowledgeTurnsSinceObservation &&
 		current.AttemptRolloverCount == next.AttemptRolloverCount &&
 		current.InterventionStage == next.InterventionStage &&
 		current.InterventionCount == next.InterventionCount &&
@@ -1313,6 +1315,7 @@ func sameCheckpointFactsForIntervention(current, next loopcontract.ProgressCheck
 		current.NoProgressUsage == next.NoProgressUsage &&
 		current.CumulativeUsage == next.CumulativeUsage &&
 		current.ExplorationTurnsSinceDeliverable == next.ExplorationTurnsSinceDeliverable &&
+		current.KnowledgeTurnsSinceObservation == next.KnowledgeTurnsSinceObservation &&
 		current.AttemptRolloverCount == next.AttemptRolloverCount
 }
 
@@ -1325,6 +1328,7 @@ func sameCheckpointFactsForRollover(current, next loopcontract.ProgressCheckpoin
 		current.NoProgressDuration != next.NoProgressDuration ||
 		current.NoProgressUsage != next.NoProgressUsage ||
 		current.ExplorationTurnsSinceDeliverable != next.ExplorationTurnsSinceDeliverable ||
+		current.KnowledgeTurnsSinceObservation != next.KnowledgeTurnsSinceObservation ||
 		current.InterventionCount != next.InterventionCount ||
 		!current.LastInterventionAt.Equal(next.LastInterventionAt) ||
 		next.AttemptRolloverCount != current.AttemptRolloverCount+1 {

@@ -97,6 +97,21 @@ func TestRunShell_NonZeroExit(t *testing.T) {
 	}
 }
 
+func TestRunShell_PipelineRequiresExplicitLastCommandScope(t *testing.T) {
+	group, _ := newTestShellGroup(t, t.TempDir(), emptyFilter())
+	command := "echo hello | cat"
+	if _, err := dispatchRunShell(context.Background(), group, map[string]any{"command": command}); err == nil || !strings.Contains(err.Error(), "accept_last_pipeline_exit_code") {
+		t.Fatalf("未确认末段语义的 pipeline 必须拒绝: %v", err)
+	}
+	out, err := dispatchRunShell(context.Background(), group, map[string]any{
+		"command": command, "accept_last_pipeline_exit_code": true,
+	})
+	if err != nil || !strings.Contains(out, "exit_code_scope: last_pipeline_command") ||
+		!strings.Contains(out, "禁止据此声称整条测试/构建命令通过") {
+		t.Fatalf("显式接受 pipeline 后必须返回歧义 scope: out=%q err=%v", out, err)
+	}
+}
+
 func TestRunShell_Timeout(t *testing.T) {
 	// sleep 在 PowerShell 中是 Start-Sleep 的别名，两个平台都可用。
 	group, _ := newTestShellGroup(t, t.TempDir(), emptyFilter())
@@ -326,12 +341,13 @@ func TestRunShell_DescriptionContainsDialect(t *testing.T) {
 	}
 	desc := defs[0].Description
 	if runtime.GOOS == "windows" {
-		if !strings.Contains(desc, "PowerShell") || !strings.Contains(desc, "write_file") {
+		if !strings.Contains(desc, "PowerShell") || !strings.Contains(desc, "write_file") ||
+			!strings.Contains(desc, "pipeline 默认拒绝") {
 			t.Errorf("Windows 描述缺 PowerShell 方言或写文件规则: %q", desc)
 		}
 		return
 	}
-	if !strings.Contains(desc, "POSIX sh") {
+	if !strings.Contains(desc, "POSIX sh") || !strings.Contains(desc, "pipeline 默认拒绝") {
 		t.Errorf("POSIX 描述缺 sh 方言说明: %q", desc)
 	}
 }

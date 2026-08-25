@@ -1,6 +1,7 @@
 package store
 
 import (
+	"agentgo/internal/fulfillment"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
 	"agentgo/internal/runcontract"
@@ -17,6 +18,7 @@ func cloneTask(src *model.Task) *model.Task {
 	dst.ProgressContract = cloneProgressContract(src.ProgressContract)
 	dst.Dependencies = cloneStrings(src.Dependencies)
 	dst.ContextInputs = cloneTaskContextInputs(src.ContextInputs)
+	dst.FulfillmentContract = cloneFulfillmentContract(src.FulfillmentContract)
 	dst.Agents = cloneStrings(src.Agents)
 	dst.RetryReasons = cloneStrings(src.RetryReasons)
 	dst.LastHistory = append([]byte(nil), src.LastHistory...)
@@ -50,6 +52,15 @@ func cloneTask(src *model.Task) *model.Task {
 	}
 	dst.Lease = cloneLease(src.Lease)
 	return &dst
+}
+
+func cloneFulfillmentContract(src *fulfillment.Contract) *fulfillment.Contract {
+	if src == nil {
+		return nil
+	}
+	copy := *src
+	copy.RequiredCheckIDs = cloneStrings(src.RequiredCheckIDs)
+	return &copy
 }
 
 func cloneTaskContextInputs(src []model.TaskContextInput) []model.TaskContextInput {

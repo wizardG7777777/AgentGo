@@ -34,14 +34,20 @@ func TestDefaultCatalogValidAndResolvesGraphPolicies(t *testing.T) {
 		ProgressCodeChangeV1,
 		ProgressCodeChangeV2,
 		ProgressCodeChangeV3,
+		ProgressCodeChangeV4,
+		ProgressCodeChangeV5,
 		ProgressCoordinationV1,
+		ProgressCoordinationV2,
+		ProgressFinalReportV1,
 		ProgressInvestigationV1,
+		ProgressInvestigationV2,
 		ProgressVerificationV1,
+		ProgressVerificationV2,
 	}
 	if got := catalog.ProgressRefs(); !reflect.DeepEqual(got, wantProgressRefs) {
 		t.Fatalf("ProgressRefs=%v，want=%v", got, wantProgressRefs)
 	}
-	if got := catalog.ContextRefs(); !reflect.DeepEqual(got, []string{ContextDefaultV1, ContextDefaultV2, ContextDefaultV3, ContextDefaultV4, ContextDefaultV5, ContextDefaultV6, ContextDefaultV7, ContextDefaultV8}) {
+	if got := catalog.ContextRefs(); !reflect.DeepEqual(got, []string{ContextDefaultV1, ContextDefaultV2, ContextDefaultV3, ContextDefaultV4, ContextDefaultV5, ContextDefaultV6, ContextDefaultV7, ContextDefaultV8, ContextDefaultV9}) {
 		t.Fatalf("ContextRefs=%v", got)
 	}
 	if got := catalog.ReplayRefs(); !reflect.DeepEqual(got, []string{ReplayOpenAICompatibleV1, ReplayOpenAICompatibleV2, ReplayOpenAICompatibleV3}) {
@@ -128,8 +134,13 @@ func TestDefaultContextV2WidensStaticPromptWithoutMutatingV1(t *testing.T) {
 	if !ok {
 		t.Fatal("未找到当前 Context v8")
 	}
-	if ContextDefaultCurrent != ContextDefaultV8 {
-		t.Fatalf("新运行默认 Context=%q，期望 v8", ContextDefaultCurrent)
+	v9, ok := catalog.ContextPolicy(ContextDefaultV9)
+	if !ok {
+		t.Fatal("未找到当前 Context v9")
+	}
+	if ContextDefaultCurrent != ContextDefaultV9 || v9.Policy.ModelContextWindow.EstimatedTokens != 1_048_576 ||
+		v9.Policy.CompletionReserve.EstimatedTokens != 65_536 || v9.Policy.SnapshotInputBudget.EstimatedTokens != 966_656 {
+		t.Fatalf("新运行默认 Context v9 档案错误: current=%q policy=%+v", ContextDefaultCurrent, v9.Policy)
 	}
 	v1Prompt := v1.Policy.FragmentRules[contextcontract.FragmentPromptComponent]
 	v2Prompt := v2.Policy.FragmentRules[contextcontract.FragmentPromptComponent]
@@ -197,9 +208,11 @@ func TestProgressProfilesCoverFourWorkClasses(t *testing.T) {
 		ProgressCodeChangeV1:    loopcontract.WorkCodeChange,
 		ProgressCodeChangeV2:    loopcontract.WorkCodeChange,
 		ProgressCodeChangeV3:    loopcontract.WorkCodeChange,
+		ProgressCodeChangeV4:    loopcontract.WorkCodeChange,
 		ProgressInvestigationV1: loopcontract.WorkInvestigation,
 		ProgressVerificationV1:  loopcontract.WorkVerification,
 		ProgressCoordinationV1:  loopcontract.WorkCoordination,
+		ProgressFinalReportV1:   loopcontract.WorkFinalization,
 	}
 	for ref, workClass := range want {
 		profile, ok := catalog.ProgressContract(ref)
@@ -264,9 +277,26 @@ func TestCodeChangeV3CoversObservedThinkingTailWithoutMutatingOlderProfiles(t *t
 	}
 	if v3.Contract.Policy.ReminderAfterTurns != 4 || v3.Contract.Policy.RolloverAfterTurns != 10 ||
 		v3.Contract.Policy.InterventionAfterTurns != 18 || v3.Contract.Policy.MaxNoProgressTurns != 24 ||
-		v3.Contract.Policy.MaxNoProgressUsage.ModelCalls != 24 || v3.Digest == v2.Digest ||
-		ProgressCodeChangeCurrent != ProgressCodeChangeV3 {
+		v3.Contract.Policy.MaxNoProgressUsage.ModelCalls != 24 || v3.Digest == v2.Digest {
 		t.Fatalf("v3 预算/当前别名错误: v2=%+v v3=%+v current=%s", v2, v3, ProgressCodeChangeCurrent)
+	}
+	v4, ok := catalog.ProgressContract(ProgressCodeChangeV4)
+	if !ok || v4.Digest == v3.Digest {
+		t.Fatalf("v4/当前别名错误: v3=%+v v4=%+v current=%s", v3, v4, ProgressCodeChangeCurrent)
+	}
+	foundEvidence := false
+	for _, signal := range v4.Contract.AcceptedSignals {
+		if signal.Kind == loopcontract.SignalNovelEvidence && !signal.Deliverable {
+			foundEvidence = true
+		}
+	}
+	if !foundEvidence {
+		t.Fatal("code-change/v4 必须把 NovelEvidence 作为非 deliverable knowledge progress")
+	}
+	v5, ok := catalog.ProgressContract(ProgressCodeChangeV5)
+	if !ok || ProgressCodeChangeCurrent != ProgressCodeChangeV5 || v5.Contract.Policy.MaxExplorationTurns != 0 ||
+		v5.Contract.Policy.KnowledgeCheckpointAfterTurns != 8 {
+		t.Fatalf("v5 必须删除 business exploration 强制交卷并启用 8-turn checkpoint: %+v", v5)
 	}
 }
 

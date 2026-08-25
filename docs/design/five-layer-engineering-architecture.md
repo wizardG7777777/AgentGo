@@ -1,6 +1,6 @@
 # AgentGo 五层工程架构规范
 
-> 状态：Accepted Architecture，Five-layer repair implementation complete / single-task architecture passed / 8-task validation pending<br>
+> 状态：Accepted Architecture，Five-layer repair implementation complete / external architecture 8/8 passed<br>
 > 日期：2026-08-21<br>
 > 性质：长期目标架构与责任边界，不是当前实现已经完全满足的声明<br>
 > 历史母本：[`docs/nextUpgrade-V6.md`](../nextUpgrade-V6.md)
@@ -14,13 +14,67 @@
 |---|---|---|
 | Model Invocation 基础层 | typed failure、ContextBinding 唯一入口、L2/L4 动态 OutputBudget、SSE字段/Tool批次硬限、partial no-dispatch | 真实 provider/SWE 多 rollout |
 | L1 Prompt | 冻结 Scheduler core prompt + 每 Invocation phase task-control prompt；Graph-first 保持 | 固定模型长期 cohort 指标 |
-| L2 Context | Context v8/Replay v3、Responses typed-item representability、32K completion、Raw History projection、ContentStore/ToolResultRef | 真实 tokenizer/model capability profile 精细化 |
+| L2 Context | Context v9/Replay v3、1M/64K 默认 ModelCapability、Raw History pressure projection | 真实 tokenizer 自动探测与更多模型档案 |
 | L3 Harness | 仓库 SWE harness、双层 function-call probe、真实 Lease、phase ToolRouter、typed terminal/snapshot | Effect unknown 仍需人工裁决；workspace 仍非 OS sandbox |
 | L4 Loop | 6 Attempts、统一 Deadline Compiler、Invocation-failure 中性进展、typed intervention scope、Progress/Terminal 主链 | 多题长时统计 |
 | L5 Graph | framework simple Graph、current validate/commit/start、Change、typed Outcome/Result/Evidence | 复杂 OR/generation token 仍关闭；legacy submit/patch 未删 |
-| Validation / Trace | contract/full/race/vet/build、真实二进制与单题 `architecture_ok=true` | 单题 task resolved、8题批测与三平台 CI |
+| Validation / Trace | contract/full/race/vet/build、真实二进制、8题 `architecture_ok=8/8`、失败题定向 resolved | 三平台 CI 与更多 provider cohort |
 
-本轮明确没有修改 `AGENTS.md`。
+`AGENTS.md` 只保留当前主链入口摘要；本文件仍是五层边界的完整权威。
+
+## 0.2 2026-08-24 Observation/Recovery/Finalization 实施快照
+
+- L1 已冻结 Worker 调查纪律、final-report 只读交付纪律与 RecoveryDelta retry
+  纪律；这些 Prompt 仍只解释机械契约。
+- L2/L3 已落地 `agentgo.observation-delta/v2` predecessor/candidate 状态、immutable Observation Store、
+  `record_observation_delta` exact checkpoint、literal/regex grep 与安全
+  `agentgo.graph-terminal-summary/v2`。synthetic acceptance/未知角色 Lease 会先
+  与只读正向闭集求交，不会因 framework 自动工具扩权或启动失败。
+- L4 新业务主链使用 `progress:code-change/v5`、`WorkFinalization` 与
+  `progress:final-report/v1`；rollover/首次历史投影/intervention 前冻结
+  Observation，final-report 两个补读 turn 后 exact `report_done`。
+- L5 已落地统一 ControlScope、单 Run 单顶层 Graph、
+  `agentgo.recovery-delta/v1`/`recovery_directive` 与确定性 finalization fallback。
+- full/race/vet/build、Python runner 单测、本地 Responses fake-provider 真实
+  二进制链与 DeepSeek 8 题 cohort 共同构成 closure authority；SWE-041～045
+  已关闭。
+
+## 0.3 2026-08-24 限制重组与大上下文实施快照
+
+- L2 新 Run 使用 `context:default/v9`，默认模型能力为 1M context / 64K
+  completion；精确模型名可覆盖。固定 16KiB ToolResult 外置与 128K 总窗口退出
+  新主链，容量由冻结 ModelCapability 派生。
+- Run profile `interactive/v3` / `swe/v3` 默认统计 model/tool/token/cost，但不以经验总量停止；
+  显式非零 execution model/tool/token/cost budget 仍为 Run 全局硬限制。
+- L4 business contract 升级到 code-change/v5、investigation/verification/
+  coordination v2，删除固定 exploration forced delivery；每 8 个新知识 turn
+  冻结 Observation 后继续工作。final-report 两读上限不变。
+- L3 新增 `run_check`、CheckStore 与 workspace revision。普通 run_shell 不再为
+  新 contract 证明 evaluation pass。
+- L4 TaskOutcome v2 与 L5 fulfillment 双门要求 mutating work 同时具备真实
+  write/edit revision 和晚于最后改动的 verification check；零补丁 success
+  fail-closed。
+- recovery 改用 `submit_recovery_decision`，模型不再复制 source refs/fingerprint。
+- Observation 是非终态的独立 Control Invocation：L2 投影旧业务 tool intent，
+  L3 使用 `reasoning=none + exact record_observation_delta`；control ToolCall 不进入
+  后续业务 Responses replay，正常业务 thinking 保持不变。工具来自启动期
+  framework control registry，不依赖角色普通业务 Lease；Acceptance/readonly
+  普通轮仍看不到它。Provider 后的格式失败进入两次有界计数，provider 前的
+  control preflight 故障形成 typed trace 事故。
+- 显式 `RunContract.Budget` 由 RunID 级 durable Ledger 跨 Task 执法；
+  ProgressCheckpoint 只保存 Activation-local progress/usage。业务 execution 与
+  coordination/recovery/finalization 控制 phase 分离，Recovery retry 必须持有并向
+  目标 Activation 传递 `RecoveryStartPermit`。
+- RunBudget `model_calls` 表示实际越过 provider dispatch 的调用；本地
+  ToolRouter/Context/Lease preflight 只占用并释放 reservation，settlement usage
+  为 0。模型动作尝试不得混入 provider 调用计数。
+- Provider quota/billing 是 L3 typed external-resource failure，不是 429、Prompt、
+  Context 或 Graph failure；L4 将其 blocked 等待外部状态变化。真正 unknown 的
+  Invocation 由 `RecoveryRequestIntervene` 形成 durable L4→L5 command，不能在
+  Agent 执行层退化为 non-recoverable failed。
+- 真实 DeepSeek 最终 8 题 cohort 为 `architecture_ok=8/8` /
+  `task_resolved=6/8`，两道普通模型失败定向复跑均 resolved；批次与
+  定向证据分开记账。
 
 ## 1. 背景
 
@@ -220,6 +274,11 @@ L1 负责稳定指令，不负责动态事实和权限执行。
 5. L1 不自行扩大 Context hard cap；但所有启动期已知的 Prompt Component 必须
    在 Bootstrap/Team/Spawn 装配门向 L2 current policy 证明可编码。不兼容时拒绝
    创建运行时，不能发布 Task 后再 blocked。
+6. Worker 的调查纪律必须与机械契约一致：grep 默认 literal、测试命令不用
+   pipeline/重定向，连续调查后记录 ObservationDelta 并转入行动或 blocked。
+7. final-report Prompt 只解释冻结 GraphTerminalSummary 并调用 `report_done`；
+   recovery Prompt 的 retry 必须声明 RecoveryDelta。两者都不得用自然文本替代
+   L3/L4/L5 的强制收口。
 
 ### 6.7 完成标准
 
@@ -255,6 +314,10 @@ Memory 同时触及 L2 和 L3，必须按“语义与存储”拆分：
 | Task Memory 如何压缩、替换、呈现 | L2 |
 | Memory 的文件格式、并发、fsync、索引和恢复 | L3 |
 | Store.Put/Query/Supersede/MarkStale 的原子执行 | L3 |
+
+ObservationDelta 也遵守该拆分：L2 定义 confirmed fact、EvidenceRef、下一步和
+Context 投影语义；L3 校验证据归属并以 append-only Store 原子保存。L4 只决定
+checkpoint 时机，L5 只把稳定 ref 绑定到新 Activation。
 
 L4 只触发“现在需要构建下一轮 Context”或“达到检查点”，不实现 Context
 压缩算法；L3 只保存和读取状态，不自行决定某条记忆应进入下一轮请求。
@@ -316,6 +379,15 @@ Harness 能力快照、上游 Result/Evidence、Mailbox 和预算。<br>
    均稳定，不调用真实模型。
 7. hard cap 的任何放宽或收紧都创建新 PolicyVersion；历史 Task 使用已冻结的
    具体 ref，新 Run 才能使用 `ContextDefaultCurrent`。禁止就地改写旧 policy。
+8. `agentgo.observation-delta/v2` 物化 predecessor、封闭 phase、当前 confirmed
+   facts、可关闭 candidate、workspace/check authority 与 framework 计算的
+   semantic advance；TaskMemory 用最新状态替换旧 Observation 投影，immutable
+   delta 仍 append-only。`agentgo.graph-terminal-summary/v2` 额外物化
+   task_published、settlement reason code 与累计 workspace/artifact 事实。
+   reasoning、工具参数、原始大正文和完整 GraphDocument 不得借两种载体进入 Context。
+9. TaskMemory 不再先以固定 1500 runes 截断；其结构化条目数仍有界，完整渲染
+   交 Context v9 按模型 capability 统一 inline/reference。当前 Observation
+   facts/next candidates 的优先级高于历史 action 审计。
 
 ### 7.8 完成标准
 
@@ -397,6 +469,15 @@ L3 是模型与真实世界之间不可绕过的执行边界。它提供一次�
 5. Domain Event/Outbox 在权威事实提交后产生；Trace 只消费脱敏投影，Reactor
    不再依赖 Trace JSON 作为唯一运行输入。
 6. 对权限、路径、Effect、Interaction 和 Store recovery 建立离线 contract tests。
+7. Shell 结果必须携带退出码作用域；pipeline 的末段 exit code 不得投影为整条
+   测试/构建成功，未显式接受末段语义时 fail-closed。
+8. framework control tool 不依赖用户 profile：business v2/v5 Graph agent
+   Lease 自动获得 `record_observation_delta`；已有 run_shell 权限可派生受约束
+   `run_check`，但 readonly/acceptance/recovery 不扩权。checkpoint phase
+   使用 thinking-preserving auto + singleton ToolRouter，由 L3 required-action gate
+   实现机械 exact action，并校验 Task/Attempt/Evidence lineage。
+9. `grep_search` 默认 literal，只有 `pattern_mode=regex` 才启用 Go regexp；非法
+   表达式与 shell pipeline 都提供稳定 reason code 并 fail-closed。
 
 ### 8.7 完成标准
 
@@ -491,6 +572,13 @@ Harness Observation、取消和外部消息。<br>
   控制闭集，BusinessTools 恒为空；L2 只投影 `failure_context`，L1 只解释决策。
 - recovery TaskOutcome delivery 完成后才 ACK 原 intervention；缺少 recovery
   Activation 是架构事故，不得因 Graph 最终 typed blocked 而判为正常。
+- business v2/v5 把新 Evidence digest 计为 knowledge progress，重复 digest
+  不计；不再按固定 exploration turn forced delivery。每 8 个新知识 turn 冻结
+  Observation 后继续；rollover、首次历史投影、blocked/intervention 前也必须
+  checkpoint，失败时保留 Raw History。
+- final-report 使用 `WorkFinalization` 与 `progress:final-report/v1`：最多两个
+  探索 turn，随后 exact `report_done`，不做普通 rollover；provider/格式失败由
+  L5 的确定性 TerminalSummary fallback 收口。
 
 ### 9.7 完成标准
 
@@ -576,6 +664,15 @@ L5 是 AgentGo 的主协调层，负责多个局部 Loop、确定性节点和 Ev
 8. 新 simple Graph 的 recoverable blocked 必须经过 framework-owned recovery
    Controller；只有该 Controller 明确提交 `decision=blocked` 或自身 Runtime
    failed/blocked 后，Graph 才能进入对应 end。
+9. graph-ended final-report Task 必须冻结目标 GraphID；只读工具按 exact scope
+   授权，完成通知本身进入 TaskOutcome/系统测试终态门，不能只靠 Description
+   marker 或排除控制面任务来假定成功。
+10. 统一 ControlScope 必须在任何通用 pump 前识别并吸收 FinalReport；同一 Run
+    只能 commit/start 一个顶层业务 Graph，子图与同图 revision 不计入该限制。
+11. 新 recovery Graph 的 retry 必须提交 `agentgo.recovery-delta/v1` 并匹配冻结
+    failure fingerprint。Definition 不变时把 delta 绑定为下一 Activation 的
+    `recovery_directive`；Definition 变化时必须证明 revision 前进。旧未声明 schema
+    的 Graph 继续按冻结旧契约执行。
 
 ### 10.7 完成标准
 

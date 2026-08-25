@@ -85,7 +85,7 @@ func (d *GraphDocument) RequiresTypedTaskOutcome() (bool, error) {
 	if nonEmpty != len(values) {
 		return false, fmt.Errorf("graph %s 的 authoring binding 不完整", d.GraphID)
 	}
-	if d.DefinitionDigestVersion != GraphDefinitionDigestVersionV1 {
+	if d.DefinitionDigestVersion != GraphDefinitionDigestVersionV1 && d.DefinitionDigestVersion != GraphDefinitionDigestVersionV2 {
 		return false, fmt.Errorf("graph %s 的 authoring digest version=%q 未知", d.GraphID, d.DefinitionDigestVersion)
 	}
 	return true, nil
@@ -362,6 +362,7 @@ type EvidenceEntry struct {
 	Command          string `json:"command,omitempty"`
 	CommandTruncated bool   `json:"command_truncated,omitempty"`
 	ExitCode         *int   `json:"exit_code,omitempty"`
+	ExitCodeScope    string `json:"exit_code_scope,omitempty"`
 
 	// Path 对 file/read 工具表示其目标路径，对 kind=artifact 表示完整产物路径。
 	Path          string `json:"path,omitempty"`
@@ -484,11 +485,29 @@ type NodeKind string
 type ControllerRole string
 
 const (
-	ControllerRoleNone         ControllerRole = ""
-	ControllerRoleLoopRecovery ControllerRole = "loop_recovery"
-	MetadataControllerRole                    = "controller_role"
-	MetadataRecoveryMaxRetries                = "recovery_max_retries"
+	ControllerRoleNone          ControllerRole = ""
+	ControllerRoleLoopRecovery  ControllerRole = "loop_recovery"
+	MetadataControllerRole                     = "controller_role"
+	MetadataRecoveryMaxRetries                 = "recovery_max_retries"
+	MetadataRecoveryDeltaSchema                = "recovery_delta_schema"
+	RecoveryDeltaSchemaV1                      = "agentgo.recovery-delta/v1"
 )
+
+// RecoveryDelta 是 loop_recovery decision=retry 的强制结构化增量。它由
+// Runtime 对照 failure_context 机械校验，并作为 recovery_directive 注入
+// 下一 Activation；不包含 reasoning 或原始工具正文。
+type RecoveryDelta struct {
+	Schema                    string   `json:"schema"`
+	SourceCheckpointRef       string   `json:"source_checkpoint_ref"`
+	SourceObservationDeltaRef string   `json:"source_observation_delta_ref,omitempty"`
+	FailureFingerprint        string   `json:"failure_fingerprint"`
+	ChangedDimensions         []string `json:"changed_dimensions"`
+	Strategy                  string   `json:"strategy"`
+	FirstRequiredAction       string   `json:"first_required_action"`
+	ExpectedMilestone         string   `json:"expected_milestone"`
+	// StartPermitRef 由 L5/RunBudget authority 预留并绑定，模型无权填写。
+	StartPermitRef string `json:"start_permit_ref,omitempty"`
+}
 
 func (r ControllerRole) IsValid() bool {
 	return r == ControllerRoleNone || r == ControllerRoleLoopRecovery

@@ -21,6 +21,7 @@ tool_profiles:
     - write_file
     - edit_file
     - run_shell
+    - run_check
     - web_search
     - web_fetch
     - send_message
@@ -81,12 +82,13 @@ agents:
 |---|---|---|
 | `read_file` | LocalReadGroup | 读取文件 |
 | `list_dir` | LocalReadGroup | 列出目录，可递归 |
-| `grep_search` | LocalReadGroup | 搜索文本 |
+| `grep_search` | LocalReadGroup | 搜索文本；`pattern_mode=literal|regex`，默认 literal，`|` 只有 regex 模式才表示 alternation |
 | `glob_search` | LocalReadGroup | 按 glob 查找文件 |
 | `read_content_ref` | ContentRefGroup | 在冻结 ExecutionLease 与 scope 下分页读取 L2 外置正文 |
 | `write_file` | LocalWriteGroup | 创建或覆盖文件 |
 | `edit_file` | LocalWriteGroup | 精确编辑文件 |
 | `run_shell` | ShellGroup | 执行命令 |
+| `run_check` | CheckGroup | 运行无 pipeline/重定向的 typed 检查，生成绑定 workspace revision 的 durable CheckRecord；仅从已有 run_shell 权限派生 |
 | `web_search` | WebGroup | 网络搜索 |
 | `web_fetch` | WebGroup | 获取网页内容 |
 | `publish_task` | MetaGroup | 发布 legacy/恢复兼容子任务；Graph 节点普通 Agent 不可用它改图 |
@@ -94,6 +96,12 @@ agents:
 | `request_user_input` | MetaGroup | 创建 2–8 选项的普通 `agent_question`，等待后只返回 `request_id`、稳定 `option_id` 与 `text` |
 | `request_replan` | PlanControlGroup | 提交事实，请 Scheduler 重新评估编排（非图任务发布通用 replan 唤醒任务） |
 | `submit_task_result` | PlanControlGroup | 普通执行节点的结构化提交（Graph acceptance runner 以 `verdict=pass|fixable|failed` 提交结论；completed 结果省略 `event`） |
+| `record_observation_delta` | ObservationGroup | 记录当前 Task/Attempt 的 confirmed facts、EvidenceRef 与下一步；framework 自动注入 business v2/v5 Graph agent Lease |
+| `submit_recovery_decision` | PlanControlGroup | recovery controller 专用 typed retry/blocked；source authority 由 framework 自动绑定 |
+
+`record_observation_delta` 是 framework control tool，不需要写入用户 profile。只有
+新冻结的 business v2/v5 Graph agent Lease 自动获得；历史 Lease 不扩大，
+acceptance、unknown role 与非 Graph task 也不会因此获得该能力。
 
 以下 Plan 工具已随 V6（C6a/C6b）全部删除，不要再写入 profile：
 

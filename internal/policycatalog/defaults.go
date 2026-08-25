@@ -139,6 +139,14 @@ func defaultContextProfiles() ([]ContextProfile, error) {
 			systemSectionBytes: 96 << 10, systemSectionTokens: 24 << 10,
 			reasoningBytes: 192 << 10, reasoningTokens: 32 << 10,
 		},
+		{
+			ref: ContextDefaultV9, replayRef: ReplayOpenAICompatibleV3, version: 9,
+			// v9 的实际容量由冻结 ModelCapability 覆盖；这里保存默认 1M/64K
+			// 档案，使静态 Prompt preflight 与无 Lease 工具也使用同一默认值。
+			promptComponentBytes: 4 << 20, promptComponentTokens: 966_656,
+			systemSectionBytes: 4 << 20, systemSectionTokens: 966_656,
+			reasoningBytes: 512 << 10, reasoningTokens: 65_536,
+		},
 	}
 	profiles := make([]ContextProfile, 0, len(specs))
 	for _, spec := range specs {
@@ -199,6 +207,9 @@ func defaultContextProfile(spec contextPolicySpec) (ContextProfile, error) {
 		policy.ModelContextWindow = &contextcontract.Budget{SerializedBytes: 640 << 10, EstimatedTokens: 128 << 10}
 		policy.ProtocolOverheadReserve = &contextcontract.Budget{SerializedBytes: 16 << 10, EstimatedTokens: 4 << 10}
 	}
+	if spec.version >= 9 {
+		policy = adaptiveContextPolicy(policy, 1_048_576, 65_536)
+	}
 	digest, err := policy.ComputeDigest()
 	if err != nil {
 		return ContextProfile{}, err
@@ -207,6 +218,43 @@ func defaultContextProfile(spec contextPolicySpec) (ContextProfile, error) {
 		Ref: policy.PolicyID, Digest: digest, Policy: policy,
 		ReplayPolicyRef: spec.replayRef,
 	}, nil
+}
+
+// AdaptContextPolicyForModel 把 v9 的规则按冻结模型能力展开。旧 policy 的数值
+// 属于历史 digest，必须原样返回。
+func AdaptContextPolicyForModel(policy contextcontract.ContextBudgetPolicy, windowTokens, completionTokens int64) contextcontract.ContextBudgetPolicy {
+	if policy.Version < 9 || windowTokens <= 0 || completionTokens <= 0 || windowTokens <= completionTokens+(16<<10) {
+		return policy
+	}
+	return adaptiveContextPolicy(policy, windowTokens, completionTokens)
+}
+
+func adaptiveContextPolicy(policy contextcontract.ContextBudgetPolicy, windowTokens, completionTokens int64) contextcontract.ContextBudgetPolicy {
+	const overheadTokens int64 = 16 << 10
+	inputTokens := windowTokens - completionTokens - overheadTokens
+	inputBytes := inputTokens * 4
+	completionBytes := completionTokens * 8
+	overheadBytes := overheadTokens * 4
+	windowBytes := inputBytes + completionBytes + overheadBytes
+	policy.SnapshotInputBudget = contextcontract.Budget{SerializedBytes: inputBytes, EstimatedTokens: inputTokens}
+	policy.CompletionReserve = contextcontract.Budget{SerializedBytes: completionBytes, EstimatedTokens: completionTokens}
+	policy.ModelContextWindow = &contextcontract.Budget{SerializedBytes: windowBytes, EstimatedTokens: windowTokens}
+	policy.ProtocolOverheadReserve = &contextcontract.Budget{SerializedBytes: overheadBytes, EstimatedTokens: overheadTokens}
+	policy.AbsoluteWireByteLimit = windowBytes
+	for kind, rule := range policy.FragmentRules {
+		rule.MaxSerializedBytes = inputBytes
+		rule.MaxEstimatedTokens = inputTokens
+		policy.FragmentRules[kind] = rule
+	}
+	for kind, rule := range policy.AtomicGroupRules {
+		rule.MaxSerializedBytes = inputBytes
+		rule.MaxEstimatedTokens = inputTokens
+		policy.AtomicGroupRules[kind] = rule
+	}
+	for section := range policy.SectionBudgets {
+		policy.SectionBudgets[section] = contextcontract.Budget{SerializedBytes: inputBytes, EstimatedTokens: inputTokens}
+	}
+	return policy
 }
 
 func defaultFragmentRules(promptComponentBytes, promptComponentTokens, reasoningBytes, reasoningTokens int64) map[contextcontract.FragmentKind]contextcontract.FragmentBudgetRule {
@@ -338,9 +386,15 @@ func defaultProgressProfiles() ([]ProgressProfile, error) {
 		progressCodeChangeV1(),
 		progressCodeChangeV2(),
 		progressCodeChangeV3(),
+		progressCodeChangeV4(),
+		progressCodeChangeV5(),
 		progressInvestigation(),
+		progressInvestigationV2(),
 		progressVerification(),
+		progressVerificationV2(),
 		progressCoordination(),
+		progressCoordinationV2(),
+		progressFinalReport(),
 	}
 	out := make([]ProgressProfile, 0, len(profiles))
 	for _, contract := range profiles {
@@ -406,6 +460,35 @@ func progressCodeChangeV3() loopcontract.CompiledProgressContract {
 	return contract
 }
 
+func progressCodeChangeV4() loopcontract.CompiledProgressContract {
+	contract := progressCodeChangeV3()
+	contract.Ref = loopcontract.ProgressContractRef{
+		ContractID: ProgressCodeChangeV4, PolicyRef: "bounded_code_change/v4",
+	}
+	contract.AcceptedSignals = append(contract.AcceptedSignals,
+		loopcontract.ProgressSignalRule{Kind: loopcontract.SignalNovelEvidence, IdentityScope: "**"},
+		loopcontract.ProgressSignalRule{Kind: loopcontract.SignalConfirmedFactAdded, IdentityScope: "**"})
+	contract.Policy.PolicyRef = "bounded_code_change/v4"
+	return contract
+}
+
+func progressCodeChangeV5() loopcontract.CompiledProgressContract {
+	contract := progressCodeChangeV4()
+	contract.Ref = loopcontract.ProgressContractRef{
+		ContractID: ProgressCodeChangeV5, PolicyRef: "bounded_code_change/v5",
+	}
+	contract.Policy.PolicyRef = "bounded_code_change/v5"
+	contract.Policy.MaxExplorationTurns = 0
+	contract.Policy.KnowledgeCheckpointAfterTurns = 8
+	contract.Policy.MaxObservationStagnation = 2
+	contract.RunBudgetRef = loopcontract.RunBudgetRefRunIDV1
+	contract.AcceptedSignals = append(contract.AcceptedSignals,
+		loopcontract.ProgressSignalRule{Kind: loopcontract.SignalObservationStateAdvanced, IdentityScope: "**"})
+	contract.Policy.MaxNoProgressUsage.PromptTokens = 0
+	contract.Policy.MaxNoProgressUsage.CompletionTokens = 0
+	return contract
+}
+
 func progressInvestigation() loopcontract.CompiledProgressContract {
 	return loopcontract.CompiledProgressContract{
 		Schema: loopcontract.CompiledSchemaV1,
@@ -428,6 +511,21 @@ func progressInvestigation() loopcontract.CompiledProgressContract {
 				CompletionTokens: 200_000, ModelCalls: 16, ToolActions: 64, Attempts: 2}),
 		RunBudgetRef: "run-budget:framework/v1",
 	}
+}
+
+func progressInvestigationV2() loopcontract.CompiledProgressContract {
+	contract := progressInvestigation()
+	contract.Ref = loopcontract.ProgressContractRef{ContractID: ProgressInvestigationV2, PolicyRef: "bounded_investigation/v2"}
+	contract.Policy.PolicyRef = "bounded_investigation/v2"
+	contract.Policy.MaxExplorationTurns = 0
+	contract.Policy.KnowledgeCheckpointAfterTurns = 8
+	contract.Policy.MaxObservationStagnation = 2
+	contract.RunBudgetRef = loopcontract.RunBudgetRefRunIDV1
+	contract.AcceptedSignals = append(contract.AcceptedSignals,
+		loopcontract.ProgressSignalRule{Kind: loopcontract.SignalObservationStateAdvanced, IdentityScope: "**"})
+	contract.Policy.MaxNoProgressUsage.PromptTokens = 0
+	contract.Policy.MaxNoProgressUsage.CompletionTokens = 0
+	return contract
 }
 
 func progressVerification() loopcontract.CompiledProgressContract {
@@ -458,6 +556,21 @@ func progressVerification() loopcontract.CompiledProgressContract {
 	}
 }
 
+func progressVerificationV2() loopcontract.CompiledProgressContract {
+	contract := progressVerification()
+	contract.Ref = loopcontract.ProgressContractRef{ContractID: ProgressVerificationV2, PolicyRef: "bounded_verification/v2"}
+	contract.Policy.PolicyRef = "bounded_verification/v2"
+	contract.Policy.MaxExplorationTurns = 0
+	contract.Policy.KnowledgeCheckpointAfterTurns = 8
+	contract.Policy.MaxObservationStagnation = 2
+	contract.RunBudgetRef = loopcontract.RunBudgetRefRunIDV1
+	contract.AcceptedSignals = append(contract.AcceptedSignals,
+		loopcontract.ProgressSignalRule{Kind: loopcontract.SignalObservationStateAdvanced, IdentityScope: "**"})
+	contract.Policy.MaxNoProgressUsage.PromptTokens = 0
+	contract.Policy.MaxNoProgressUsage.CompletionTokens = 0
+	return contract
+}
+
 func progressCoordination() loopcontract.CompiledProgressContract {
 	return loopcontract.CompiledProgressContract{
 		Schema: loopcontract.CompiledSchemaV1,
@@ -478,6 +591,43 @@ func progressCoordination() loopcontract.CompiledProgressContract {
 			runcontract.BudgetLimit{WallTime: 10 * time.Minute, PromptTokens: 400_000,
 				CompletionTokens: 80_000, ModelCalls: 8, ToolActions: 24, Attempts: 2}),
 		RunBudgetRef: "run-budget:framework/v1",
+	}
+}
+
+func progressCoordinationV2() loopcontract.CompiledProgressContract {
+	contract := progressCoordination()
+	contract.Ref = loopcontract.ProgressContractRef{ContractID: ProgressCoordinationV2, PolicyRef: "bounded_coordination/v2"}
+	contract.Policy.PolicyRef = "bounded_coordination/v2"
+	contract.Policy.MaxExplorationTurns = 0
+	contract.Policy.KnowledgeCheckpointAfterTurns = 8
+	contract.Policy.MaxObservationStagnation = 2
+	contract.RunBudgetRef = loopcontract.RunBudgetRefRunIDV1
+	contract.AcceptedSignals = append(contract.AcceptedSignals,
+		loopcontract.ProgressSignalRule{Kind: loopcontract.SignalObservationStateAdvanced, IdentityScope: "**"})
+	contract.Policy.MaxNoProgressUsage.PromptTokens = 0
+	contract.Policy.MaxNoProgressUsage.CompletionTokens = 0
+	return contract
+}
+
+func progressFinalReport() loopcontract.CompiledProgressContract {
+	return loopcontract.CompiledProgressContract{
+		Schema: loopcontract.CompiledSchemaV1,
+		Ref: loopcontract.ProgressContractRef{
+			ContractID: ProgressFinalReportV1, PolicyRef: "bounded_final_report/v1",
+		},
+		WorkClass: loopcontract.WorkFinalization,
+		Deliverables: []loopcontract.DeliverableRule{{
+			ID: "final-report", Kind: loopcontract.DeliverableStructuredResult, Required: true,
+		}},
+		AcceptedSignals: []loopcontract.ProgressSignalRule{
+			{Kind: loopcontract.SignalNovelEvidence, IdentityScope: "**"},
+			{Kind: loopcontract.SignalConfirmedFactAdded, IdentityScope: "**"},
+			{Kind: loopcontract.SignalResultFieldSet, Deliverable: true},
+		},
+		Policy: progressPolicy("bounded_final_report/v1", 1, 2, 4, 5, 5*time.Minute, 2, 0,
+			runcontract.BudgetLimit{WallTime: 5 * time.Minute, PromptTokens: 250_000,
+				CompletionTokens: 50_000, ModelCalls: 5, ToolActions: 12, Attempts: 1}),
+		RunBudgetRef: loopcontract.RunBudgetRefRunIDV1,
 	}
 }
 

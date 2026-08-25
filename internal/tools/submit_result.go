@@ -15,6 +15,8 @@ import (
 	"strings"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/checkstore"
+	"agentgo/internal/fulfillment"
 	"agentgo/internal/graph"
 	"agentgo/internal/model"
 	"agentgo/internal/trace"
@@ -183,6 +185,17 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 	default:
 		return "", fmt.Errorf("status 只接受 completed / blocked（failed、cancelled 由系统路径产生，不接受自报），实际值 %q", status)
 	}
+	if status == agent.SubmitStatusBlocked && g.Checkpoints != nil && task.ProgressContract != nil &&
+		task.ProgressContract.Policy.KnowledgeCheckpointAfterTurns > 0 {
+		checkpoint, ok, checkpointErr := g.Checkpoints.LoadCheckpoint(task.ID)
+		if checkpointErr != nil {
+			return "", fmt.Errorf("读取 blocked Observation checkpoint: %w", checkpointErr)
+		}
+		if ok && checkpoint != nil && checkpoint.AttemptID == task.AttemptID &&
+			checkpoint.KnowledgeTurnsSinceObservation > 0 && checkpoint.ObservationAttemptID != task.AttemptID {
+			return "", fmt.Errorf("reason_code=observation_checkpoint_required [observation-checkpoint-required action=blocked_submit] blocked 前必须先冻结当前 Attempt 的 ObservationDelta")
+		}
+	}
 
 	// ExpectedArtifacts 合约校验（与自然完成路径同源，含磁盘兜底）。缺失时
 	// 返回错误并保持未 finalized——本轮 ReAct 循环继续，LLM 补写后可再次调用。
@@ -192,6 +205,15 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 	}
 	if err := g.recordRecoveredArtifacts(task.ID, check.Recovered); err != nil {
 		return "", fmt.Errorf("submit_task_result 被拒绝：磁盘恢复的预期产物未能写入 durable artifact ledger: %w", err)
+	}
+	fulfillmentJSON := ""
+	if status == agent.SubmitStatusCompleted && task.FulfillmentContract != nil {
+		record, fulfillmentErr := g.buildFulfillment(task)
+		if fulfillmentErr != nil {
+			return "", fmt.Errorf("reason_code=contract_fulfillment_missing：submit_task_result 被拒绝：%w；请先完成真实文件修改并在最后一次修改后调用 run_check", fulfillmentErr)
+		}
+		encoded, _ := json.Marshal(record)
+		fulfillmentJSON = string(encoded)
 	}
 
 	// 终态契约 v2 提交期出路检查（终态落盘前）：用该 activation 冻结定义的
@@ -228,6 +250,7 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 		Verdict:         verdict,
 		CitedEvidence:   citedEvidence,
 		ResultJSON:      resultJSON,
+		FulfillmentJSON: fulfillmentJSON,
 	})
 	g.FinalizationNotifier.MarkTaskFinalized()
 
@@ -277,6 +300,48 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 	}
 
 	return "结构化结果已提交：系统将以本次提交作为任务权威结果收尾（渲染文本随依赖结果传递给下游任务）。请停止调用其他工具，直接结束本轮。" + replanNote, nil
+}
+
+func (g PlanControlGroup) buildFulfillment(task *model.Task) (fulfillment.Record, error) {
+	if task == nil || task.FulfillmentContract == nil {
+		return fulfillment.Record{}, nil
+	}
+	if g.Checks == nil {
+		return fulfillment.Record{}, fmt.Errorf("CheckStore 未装配")
+	}
+	workspaceRef, effectRefs, err := checkstore.WorkspaceRevision(task, g.Store)
+	if err != nil {
+		return fulfillment.Record{}, err
+	}
+	record := fulfillment.Record{
+		Schema: fulfillment.SchemaV1, WorkspaceRevisionRef: workspaceRef,
+		EffectRefs: append([]string(nil), effectRefs...),
+	}
+	for _, checkID := range task.FulfillmentContract.RequiredCheckIDs {
+		check, ok, checkErr := g.Checks.Latest(task.ID, task.AttemptID, checkID)
+		if checkErr != nil {
+			return fulfillment.Record{}, checkErr
+		}
+		if !ok {
+			return fulfillment.Record{}, fmt.Errorf("缺少 required check %q", checkID)
+		}
+		if check.Status != checkstore.StatusPass {
+			return fulfillment.Record{}, fmt.Errorf("required check %q 未通过", checkID)
+		}
+		if check.WorkspaceRevisionRef != workspaceRef {
+			return fulfillment.Record{}, fmt.Errorf("required check %q 已 stale：check=%s current=%s",
+				checkID, check.WorkspaceRevisionRef, workspaceRef)
+		}
+		record.CheckRefs = append(record.CheckRefs, check.CheckRef)
+		record.SatisfiedRequirementIDs = append(record.SatisfiedRequirementIDs, checkID)
+	}
+	if task.FulfillmentContract.RequireWorkspaceChange {
+		record.SatisfiedRequirementIDs = append(record.SatisfiedRequirementIDs, "workspace-change")
+	}
+	if err := record.Validate(task.FulfillmentContract); err != nil {
+		return fulfillment.Record{}, err
+	}
+	return record, nil
 }
 
 // recordRecoveredArtifacts 把 expected_artifacts 磁盘兜底命中的文件

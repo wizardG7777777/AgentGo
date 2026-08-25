@@ -81,9 +81,19 @@ func TestEvidenceCallEntrySanitizesGarbage(t *testing.T) {
 	}
 
 	// 合法名逐字节保留（已知工具名 kind 仍归并）。
-	legal := evidenceCallEntry("ev:t:call:4", store.ToolCallRecord{CallID: "c-4", ToolName: "run_shell", Args: map[string]any{"command": "ls"}, Success: true})
-	if legal.ToolName != "run_shell" || legal.Kind != "shell" {
+	legal := evidenceCallEntry("ev:t:call:4", store.ToolCallRecord{
+		CallID: "c-4", ToolName: "run_shell", Args: map[string]any{"command": "pytest -q | tail"},
+		Success: true, ExitCodeScope: store.ShellExitCodeScopeLastPipelineCommand,
+	})
+	if legal.ToolName != "run_shell" || legal.Kind != "shell" ||
+		legal.ExitCodeScope != string(store.ShellExitCodeScopeLastPipelineCommand) {
 		t.Errorf("合法名应原样保留且 kind 归并: %+v", legal)
+	}
+	rejected := evidenceCallEntry("ev:t:call:5", store.ToolCallRecord{
+		CallID: "c-5", ToolName: "run_shell", Args: map[string]any{"command": "pytest | tail"}, Success: false,
+	})
+	if !strings.Contains(rejected.Summary, "scope=?") || rejected.ExitCodeScope != "" {
+		t.Errorf("执行前拒绝的 pipeline 不得伪装 whole-command scope: %+v", rejected)
 	}
 }
 

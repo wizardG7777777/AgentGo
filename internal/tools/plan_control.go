@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/checkstore"
+	"agentgo/internal/graph"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
 	"agentgo/internal/runcontract"
@@ -34,6 +37,15 @@ type OutletChecker interface {
 	CheckActivationOutlet(graphID, nodeID, activationID string, status string, result map[string]any) error
 }
 
+type RecoveryDecisionAuthority interface {
+	BindRecoveryDeltaAuthority(graphID, nodeID, activationID string, partial graph.RecoveryDelta) (graph.RecoveryDelta, error)
+	ValidateRecoveryRetryStart(graphID, nodeID, activationID string, now time.Time) error
+}
+
+type ObservationCheckpointReader interface {
+	LoadCheckpoint(taskID string) (*loopcontract.ProgressCheckpoint, bool, error)
+}
+
 type PlanControlGroup struct {
 	Store   store.TaskStore
 	Holder  TaskHolder
@@ -50,7 +62,10 @@ type PlanControlGroup struct {
 	// OutletChecker 是终态契约 v2 的提交期出路检查器（bootstrap/runner/
 	// scheduler 装配注入 *graph.Runtime）。nil 时 v2 图任务不做提交期
 	// 出路检查与 event 废弃拦截（行为与引入前一致）。
-	OutletChecker OutletChecker
+	OutletChecker     OutletChecker
+	Checks            *checkstore.Store
+	RecoveryAuthority RecoveryDecisionAuthority
+	Checkpoints       ObservationCheckpointReader
 }
 
 func (g PlanControlGroup) Register(r *agent.ToolRegistry) {
@@ -80,6 +95,21 @@ func (g PlanControlGroup) Register(r *agent.ToolRegistry) {
 		r.Register("submit_task_result", "以结构化字段提交当前执行节点的最终结果并结束任务，Graph controller 节点也使用本工具；只有非图 scheduler 任务改用 report_done。summary 必填（一两句话概括结果，会随依赖结果传递给下游任务）；result 可选，必须是紧凑 JSON object，其字段类型保真地进入 Graph Result 顶层，供 $.coverage 等条件路由及下游数据流消费，status/event/verdict/cited_evidence 为系统保留键，必须使用各自专用参数；checks_performed/evidence/remaining_risks 为逗号分隔的可选清单；status 可选（缺省 completed）：status=blocked 表示任务无法完成、以 blocked 终态收尾并自动唤醒 Scheduler 重新规划（blocked 终态不会放行下游依赖任务），此时 blocked_reason 必填；无法完成但不算 blocked 时也可只填 blocked_reason（会随提交向 Scheduler 登记高优 ReplanRequest），request_replan=true 仅请求重规划；event 已废弃——agentgo.graph/v2 图任务禁止携带（业务路由一律把字段写入 result object，供 {path: ...} 边条件求值；仅 v1 存量图与 legacy publish_task 路径保留旧语义）；verdict 仅用于 acceptance，固定为 pass/fixable/failed。提交前系统会执行 expected_artifacts 校验与出路预求值，缺失产物或无匹配出路时返回错误且不结束任务（可修正后重交，同一 activation 两次无匹配将升级 Scheduler 裁决）。调用成功即进入收尾（finalizing）：同一响应中排在其后的工具调用会被系统跳过不执行，因此提交前必须先完成所有写操作；每个任务只能成功提交一次。",
 			params,
 			g.submitTaskResult)
+	}
+	if g.FinalizationNotifier != nil && g.SubmitState != nil && g.RecoveryAuthority != nil {
+		properties := map[string]any{
+			"decision":              map[string]any{"type": "string", "enum": []any{"retry", "blocked"}},
+			"changed_dimensions":    map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []any{"context", "definition", "model", "tools", "strategy", "input"}}},
+			"strategy":              map[string]any{"type": "string"},
+			"first_required_action": map[string]any{"type": "string"},
+			"expected_milestone":    map[string]any{"type": "string"},
+			"blocked_reason":        map[string]any{"type": "string"},
+			"summary":               map[string]any{"type": "string"},
+		}
+		r.Register("submit_recovery_decision", "提交当前 recovery controller 的强类型 retry/blocked 裁决；source checkpoint/observation/fingerprint 由 framework 自动绑定，模型不得复制。retry 在提交前机械验证下一 execution Activation 仍可启动；reason_code=recovery_retry_unstartable 时只允许改交 blocked", map[string]any{
+			"type": "object", "additionalProperties": false, "properties": properties,
+			"required": []any{"decision", "summary"},
+		}, g.submitRecoveryDecision)
 	}
 	r.Register("request_replan", "请求重新唤醒 Scheduler 评估当前任务编排；不会直接修改 DAG。图（Graph）节点任务调用时登记 graph change 请求并以 __scheduler__ 唤醒任务交给 Scheduler 用 patch_graph 裁决（同一 activation 的重复请求幂等）；非图任务登记通用 replan 唤醒任务（同一任务的重复请求幂等），由 Scheduler 裁决后续编排。",
 		schema.Object().String("reason_code", "结构化原因代码", true).

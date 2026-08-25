@@ -59,6 +59,16 @@ func (c RunContract) ValidatePhaseAt(now time.Time, phase Phase) error {
 	if !phase.Valid() {
 		return fmt.Errorf("Run phase=%q 无效", phase)
 	}
+	latestStart := c.PhaseStartDeadline(phase)
+	if !now.Before(latestStart) {
+		return fmt.Errorf("RunContract phase=%s 的剩余时间窗已耗尽", phase)
+	}
+	return nil
+}
+
+// PhaseStartDeadline 返回某阶段允许创建新 Task/Activation 的最后时刻。
+// 它只投影冻结 RunContract，不读取当前时钟。
+func (c RunContract) PhaseStartDeadline(phase Phase) time.Time {
 	latestStart := c.DeadlineAt.Add(-(c.FinalizationReserve + c.RecoveryReserve))
 	switch phase {
 	case PhaseRecovery:
@@ -66,10 +76,13 @@ func (c RunContract) ValidatePhaseAt(now time.Time, phase Phase) error {
 	case PhaseFinalization:
 		latestStart = c.DeadlineAt
 	}
-	if !now.Before(latestStart) {
-		return fmt.Errorf("RunContract phase=%s 的剩余时间窗已耗尽", phase)
-	}
-	return nil
+	return latestStart
+}
+
+// PhaseStartRemaining 返回从 now 到阶段启动截止点的剩余时长。负值表示
+// 阶段已经关闭；调用方不得把 recovery reserve 重新解释为 execution 时间。
+func (c RunContract) PhaseStartRemaining(now time.Time, phase Phase) time.Duration {
+	return c.PhaseStartDeadline(phase).Sub(now)
 }
 
 // Validate 校验预算上限。零值维度留给 framework profile 解析；负数永远非法。

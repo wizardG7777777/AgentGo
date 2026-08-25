@@ -16,6 +16,7 @@ import (
 	"agentgo/internal/agent"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
 	"agentgo/internal/tools/schema"
 )
@@ -246,6 +247,13 @@ func (g SchedulerGroup) authorizeTaskResultRead(current, target *model.Task) err
 		}
 		return fmt.Errorf("get_task_result 被拒绝：任务 %s 不属于当前 Graph %s", target.ID, current.GraphID)
 	}
+	if current.FinalReportGraphID != "" {
+		if target.GraphID == current.FinalReportGraphID {
+			return nil
+		}
+		return fmt.Errorf("get_task_result 被拒绝：任务 %s 不属于 final-report Graph %s",
+			target.ID, current.FinalReportGraphID)
+	}
 	if current.InterventionGraphID != "" {
 		if target.GraphID == current.InterventionGraphID &&
 			(current.InterventionNodeID == "" || target.NodeID == current.InterventionNodeID) &&
@@ -276,6 +284,28 @@ func validateTaskResultCaller(current *model.Task) error {
 			currentID = current.ID
 		}
 		return fmt.Errorf("get_task_result 被拒绝：调用方 %s 不是正在执行的 Scheduler 任务", currentID)
+	}
+	if err := validateFinalReportScope(current); err != nil {
+		return fmt.Errorf("get_task_result 被拒绝：%w", err)
+	}
+	return nil
+}
+
+func validateFinalReportScope(task *model.Task) error {
+	if task == nil {
+		return nil
+	}
+	finalSignal := task.EventSource == "graph-ended" || strings.TrimSpace(task.FinalReportGraphID) != "" ||
+		task.RunPhase == runcontract.PhaseFinalization
+	if !finalSignal {
+		return nil
+	}
+	if task.EventSource == "graph-ended" && strings.TrimSpace(task.FinalReportGraphID) == "" {
+		return fmt.Errorf("graph-ended final-report 缺少 final_report_graph_id")
+	}
+	scope, err := model.ClassifyControlScope(task)
+	if err != nil || scope != model.ControlScopeFinalReport {
+		return fmt.Errorf("final_report_graph_id=%q 与 task scope 不一致: %v", task.FinalReportGraphID, err)
 	}
 	return nil
 }
@@ -363,6 +393,9 @@ func (g SchedulerGroup) reportDone(ctx context.Context, args map[string]any) (st
 	currentTask, err := g.Store.GetTask(currentID)
 	if err != nil {
 		return "", fmt.Errorf("读取当前 scheduler 任务失败: %w", err)
+	}
+	if err := validateFinalReportScope(currentTask); err != nil {
+		return "", fmt.Errorf("report_done 被拒绝：%w", err)
 	}
 	if currentTask.GraphID != "" {
 		return "", fmt.Errorf(

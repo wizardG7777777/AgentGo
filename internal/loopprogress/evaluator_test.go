@@ -28,6 +28,7 @@ func testContract() loopcontract.CompiledProgressContract {
 			{Kind: loopcontract.SignalNovelEvidence, IdentityScope: "**"},
 			{Kind: loopcontract.SignalEvaluationChanged, IdentityScope: "focused_tests"},
 			{Kind: loopcontract.SignalEvaluationPassed, IdentityScope: "focused_tests"},
+			{Kind: loopcontract.SignalObservationStateAdvanced, IdentityScope: "**"},
 		},
 		Policy: loopcontract.ProgressPolicy{
 			PolicyRef: "bounded_code_change/v1", ReminderAfterTurns: 3,
@@ -37,6 +38,35 @@ func testContract() loopcontract.CompiledProgressContract {
 			MaxExplorationTurns:   4, MaxAttemptRollovers: 1, RecentFingerprintWindow: 16,
 		},
 		RunBudgetRef: "run-budget-1",
+	}
+}
+
+func TestEvaluateObservationStateRequiresSemanticAdvance(t *testing.T) {
+	base := time.Date(2026, 8, 22, 13, 30, 0, 0, time.UTC)
+	checkpoint := testCheckpoint(base)
+	first := testDelta(base, 1)
+	first.ObservationDeltaRef = "observation:sha256:first"
+	first.ObservationChange = &loopcontract.ObservationChange{
+		Ref: first.ObservationDeltaRef, Phase: "investigate",
+		WorkspaceRevisionRef: "workspace:empty", SemanticAdvance: true,
+	}
+	assessment, next, err := Evaluate(testContract(), checkpoint, first)
+	if err != nil || assessment.Class != loopcontract.ProgressCoordination ||
+		next.ObservationStagnationCount != 0 {
+		t.Fatalf("首个 Observation 状态应建立语义基线: assessment=%+v next=%+v err=%v", assessment, next, err)
+	}
+
+	stale := testDelta(base, 2)
+	stale.PreviousRef = next.CheckpointID
+	stale.ObservationDeltaRef = "observation:sha256:stale"
+	stale.ObservationChange = &loopcontract.ObservationChange{
+		Ref: stale.ObservationDeltaRef, PreviousRef: first.ObservationDeltaRef,
+		Phase: "investigate", WorkspaceRevisionRef: "workspace:empty", SemanticAdvance: false,
+	}
+	assessment, next, err = Evaluate(testContract(), next, stale)
+	if err != nil || assessment.Class != loopcontract.ProgressNone || assessment.ResetAnyProgressClock ||
+		next.ObservationStagnationCount != 1 {
+		t.Fatalf("只换措辞的 Observation 不得刷新进展: assessment=%+v next=%+v err=%v", assessment, next, err)
 	}
 }
 

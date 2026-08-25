@@ -3,6 +3,7 @@ package model
 import (
 	"time"
 
+	"agentgo/internal/fulfillment"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/runcontract"
 )
@@ -70,13 +71,17 @@ type Task struct {
 	RunID       runcontract.RunID
 	RunContract *runcontract.RunContract
 	RunPhase    runcontract.Phase
+	// RunBudgetPermitRef 是 L5 Recovery 在创建下一 execution Activation 前
+	// 预留的首个 model-call grant；仅目标 Task 可在首轮认领并消费。
+	RunBudgetPermitRef string
 	// ProgressContract 是框架编译并冻结的 L4 进展契约。Scheduler 只能从
 	// framework catalog 选择；nil 表示 legacy/degraded Task，不启用 L4 enforcement。
 	ProgressContract *loopcontract.CompiledProgressContract
 	// ContextPolicyRef 是 L2 ContextCompiler 的冻结 policy identity。新任务必须
 	// 来自 framework catalog；旧任务空值按 legacy/degraded 处理，不能在重试中
 	// 静默切换 policy。
-	ContextPolicyRef string
+	ContextPolicyRef    string
+	FulfillmentContract *fulfillment.Contract
 	// AttemptID/AttemptNo 由 Store 在 pending→processing 的认领边界生成。每次
 	// RetryRollback 后重新认领产生新 Attempt；同一 processing 任务的并发认领
 	// 不得改写。
@@ -115,6 +120,10 @@ type Task struct {
 	InterventionGraphID      string `json:"intervention_graph_id,omitempty"`
 	InterventionNodeID       string `json:"intervention_node_id,omitempty"`
 	InterventionActivationID string `json:"intervention_activation_id,omitempty"`
+	// FinalReportGraphID 是 graph-ended Scheduler 唤醒的冻结只读作用域。
+	// wake 自身不是 Graph activation，不能占用 GraphID；read_graph 与
+	// get_task_result 只允许读取此 Graph，禁止从 Description marker 猜目标。
+	FinalReportGraphID string `json:"final_report_graph_id,omitempty"`
 	// ParentTaskID is the explicit task-lineage edge used for plan inheritance
 	// and topology inspection. Empty means this Task has no known parent.
 	ParentTaskID string

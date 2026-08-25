@@ -270,7 +270,7 @@ func (a *Activator) handleEvent(evt model.Event) {
 				DeadlineAt:          now.Add(time.Duration(SchedulerTaskTimeoutSec) * time.Second),
 				FinalizationReserve: defaultRunFinalizationReserve,
 				RecoveryReserve:     defaultRunRecoveryReserve,
-				BudgetProfile:       "interactive/v1",
+				BudgetProfile:       "interactive/v3",
 				CreatedAt:           now,
 			}
 		} else {
@@ -281,7 +281,7 @@ func (a *Activator) handleEvent(evt model.Event) {
 			log.Printf("[scheduler-activator] 创建 RunContract 失败: %v", err)
 			return
 		}
-		progressProfile, ok := schedulerPolicyCatalog.ProgressContract(policycatalog.ProgressCoordinationV1)
+		progressProfile, ok := schedulerPolicyCatalog.ProgressContract(policycatalog.ProgressCoordinationCurrent)
 		if !ok {
 			log.Printf("[scheduler-activator] framework coordination ProgressContract 缺失")
 			return

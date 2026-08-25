@@ -25,8 +25,8 @@ import (
 )
 
 const (
-	contentRefToolDefaultLimit int64 = 8 << 10
-	contentRefToolMaxLimit     int64 = 16 << 10
+	contentRefToolDefaultLimit int64 = 32 << 10
+	contentRefToolMaxLimit     int64 = 64 << 10
 )
 
 // ContentRefGroup 注册 read_content_ref。ContentStore/TaskStore 是生产必填依赖；

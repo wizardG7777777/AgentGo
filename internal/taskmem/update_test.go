@@ -66,6 +66,20 @@ func TestApplyTurn_ShellNonZeroFailure(t *testing.T) {
 	}
 }
 
+func TestApplyTurn_PipelineTailExitIsAmbiguousFailure(t *testing.T) {
+	m := New("task-pipeline")
+	zero := 0
+	if !ApplyTurn(m, TurnFacts{ToolCalls: []ToolCallFact{{
+		Name: "run_shell", Target: "pytest -q | tail -20", Success: true,
+		ExitCode: &zero, ExitCodeScope: "last_pipeline_command",
+	}}}) {
+		t.Fatal("pipeline 歧义结果应写入失败事实")
+	}
+	if len(m.Failures) != 1 || !strings.Contains(m.Failures[0], "仅代表管道末段") {
+		t.Fatalf("pipeline 歧义未进入 Failures: %+v", m.Failures)
+	}
+}
+
 // TestApplyTurn_ModelClaimWithoutEvidence：无证据输入即无 Fact——模型文本声称
 // （"文件已改"、"测试通过"）不产生任何 Fact；只有 UserDecision（用户证据）
 // 自动成为 confirmed Fact。

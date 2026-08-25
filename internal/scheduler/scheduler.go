@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"io"
+	"strings"
 	"time"
 
 	"agentgo/internal/agent"
@@ -39,7 +40,7 @@ const schedulerMaxRetries = 5
 
 // schedulerPromptVersion 是 scheduler system prompt 的来源版本（V6 §2 P1a
 // prompt 编译 agent_role 组件的 Version 维度）。prompt 正文变更时递增。
-const schedulerPromptVersion = "embedded:v10.6-graph-recovery-controller"
+const schedulerPromptVersion = "embedded:v10.7-observation-recovery-finalization"
 
 // SystemPrompt 返回 scheduler agent 的内嵌 system prompt 全文（只读）。
 // 供 /doctor agents 审计（V6 §2 P1b）构造 prompt 摘要/digest，以及任何
@@ -53,7 +54,7 @@ const schedulerCorePrompt = `
 你的职责只有三类：
 1. 对新请求构造、校验、提交并启动 Graph；不在建图前亲自调查仓库或执行主体工作。
 2. 对 recovery/change 唤醒读取权威 Graph/Proposal 后作结构化裁决。
-3. 仅在 graph-ended 终态唤醒后读取 Graph 权威结果，并向用户给出自然语言最终答复。
+3. 仅在 graph-ended 终态唤醒后消费 GraphTerminalSummary，并通过 report_done 向用户提交最终答复。
 
 每轮只执行当前 <scheduler-phase> 允许的一个工具动作。工具 schema、ValidationReport、Graph Store、ResultRef/Evidence 与 board snapshot 是权威；自然语言计划、reasoning 和“已经完成”的自述都不是状态事实。工具返回后重新观察，再进入下一阶段。不得输出 DSML/XML 工具标记，不得发明工具名或参数。
 
@@ -78,7 +79,7 @@ func schedulerPromptForPhase(phase string) string {
 		return `<scheduler-phase name="draft-edit">
 simple-task ValidationReport 被拒绝或任务确需复杂拓扑时才进入本阶段。本轮只调用 read_graph_draft、patch_graph_draft 或 validate_graph_draft 之一。以结构化错误为依据使用小型 CAS patch，禁止一次提交完整 Graph JSON 字符串。
 
-最小合法图：root 是真实 work/controller 节点；分别为 completed/failed/blocked 提供 typed end 出口，end.next 为空并声明 success/failed/blocked outcome。所有 task-producing 节点必须声明非空 title/description、output_contract、progress_contract_ref 与 context_policy_ref=context:default/v7。progress ref 只能选 framework 的 code-change/investigation/verification/coordination v1。
+最小合法图：root 是真实 work/controller 节点；分别为 completed/failed/blocked 提供 typed end 出口，end.next 为空并声明 success/failed/blocked outcome。所有 task-producing 节点必须声明非空 title/description、output_contract；progress/context policy 由 framework current catalog 注入或由工具 schema 枚举，禁止在 Prompt 中猜版本号或显式选择历史 policy。
 
 当前单赋值基线：普通节点最多一条静态入边；fan-in 必须经 join/acceptance 且每个 target_input 只有一个生产者；join 成功下游只用 completed。条件分支必须互斥穷举，不与 always 混作兜底。agent/controller 的业务路由字段放 result object 并在 task.description 声明字段和值域，禁止 event。acceptance 必须逐项写验收标准，completed 只提交 verdict=pass|fixable|failed 并按 $.verdict 精确路由，另保留 Runtime failed/blocked 兜底。失败路径默认回到可修复节点或 repair；只有不可修复才 failed end。
 
@@ -98,11 +99,11 @@ board snapshot 的 topo_mode=solo 时，唯一执行资源是 Scheduler：工作
 </scheduler-phase>`
 	case "scheduler:graph-recovery":
 		return `<scheduler-phase name="graph-recovery">
-本轮只执行一个当前 Graph 的恢复控制动作。failure_context、Graph Result/Evidence、ProgressCheckpoint 与 read_graph 是权威；不得亲自修改业务文件。若需要改变未来 work Activation 的定义，依次使用 propose_graph_change→validate_graph_change→commit_graph_change，每轮一个动作，已终态的旧 Activation 始终冻结。裁决完成后必须调用 submit_task_result，并在 result.decision 中提交 retry 或 blocked：retry 让 Runtime 按最新 Definition 创建新的 work Activation；blocked 明确结束 Graph。不得只输出自然语言。
+	本轮只执行一个当前 Graph 的恢复控制动作。failure_context、Graph Result/Evidence、ProgressCheckpoint、ObservationDelta 与 read_graph 是权威；不得亲自修改业务文件。若需要改变未来 work Activation 的定义，依次使用 propose_graph_change→validate_graph_change→commit_graph_change，每轮一个动作，已终态的旧 Activation 始终冻结。裁决完成后必须调用 submit_recovery_decision：retry 只声明 changed_dimensions、strategy、first_required_action、expected_milestone，source checkpoint/observation/fingerprint 由 framework 自动绑定；blocked 必须说明 blocked_reason。retry 还受 framework 的 execution phase 可启动性预检；若返回 reason_code=recovery_retry_unstartable，必须立即改交 blocked，不得继续声称 retry。没有可验证增量只能 blocked；不得调用 submit_task_result 或只输出自然语言。
 </scheduler-phase>`
 	case "scheduler:final-report":
 		return `<scheduler-phase name="final-report">
-本轮先用 read_graph 核对 graph-ended 对应 Graph 的权威终态；excerpt 不足时才分页 get_task_result/read_content_ref。确认终态后不再调用构图工具，直接用自然语言向用户呈现结果、验证、风险或明确失败原因。
+	GraphTerminalSummary 是本轮默认权威输入。task_published、settlement_reason_code、workspace_changed 与 artifact_count 是报告执行/修改事实的唯一依据；不得把不存在的 TaskOutcome 推断为“已执行”，也不得在 workspace_changed=true 时声称零修改。只在摘要缺少用户报告所需事实时，定向调用 read_graph/get_task_result/read_content_ref；最多补读两个 evidence turn。最终必须调用 report_done，禁止自然文本退出、构图、改图或重新执行任何业务工作。
 </scheduler-phase>`
 	default:
 		return ""
@@ -273,8 +274,10 @@ func New(
 	// 终态契约 v2 提交期出路检查器：graphRuntime 为 nil（单测直构）时不注入，
 	// 避免把类型化 nil 包进接口后判空失效。
 	var outletChecker tools.OutletChecker
+	var recoveryAuthority tools.RecoveryDecisionAuthority
 	if graphRuntime != nil {
 		outletChecker = graphRuntime
+		recoveryAuthority = graphRuntime
 	}
 	var authoring GraphAuthoringDeps
 	if len(graphAuthoring) > 0 {
@@ -335,6 +338,7 @@ func New(
 			FinalizationNotifier: holder,
 			SubmitState:          submitState,
 			OutletChecker:        outletChecker,
+			RecoveryAuthority:    recoveryAuthority,
 		},
 		tools.AgentTemplateGroup{
 			Catalog: templateCatalog, Provisioner: templateProvisioner,
@@ -423,6 +427,16 @@ func New(
 	// daemon，因此保持硬编码 0（永不空闲退出）。配置值只作用于
 	// 由 runner.New 构造的任务执行类 agent。
 	a.IdleThreshold = 0 // 永不空闲退出（预制代理）
+	schedulerModel := strings.TrimSpace(cfg.Scheduler.Model)
+	if schedulerModel == "" {
+		schedulerModel = strings.TrimSpace(cfg.LLM.DefaultModel)
+	}
+	if capability, err := cfg.LLM.ResolveModelCapability(schedulerModel); err == nil {
+		a.Model = schedulerModel
+		a.ModelContextWindowTokens = capability.ContextWindowTokens
+		a.ModelMaxCompletionTokens = capability.MaxCompletionTokens
+		a.ModelCapabilityDigest = capability.Digest
+	}
 	a.OnTaskStart = func(taskID string) { holder.Set(taskID) }
 	a.OnTaskEnd = func(taskID string, success bool) { holder.Set("") }
 	a.FileCache = fileCache

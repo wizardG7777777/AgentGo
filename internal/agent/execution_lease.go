@@ -10,6 +10,7 @@ import (
 	"agentgo/internal/graph"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
+	"agentgo/internal/policycatalog"
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
 )
@@ -182,6 +183,19 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 	if task.GraphID != "" && task.GraphNodeKind == "controller" {
 		lease.BusinessTools = []string{}
 	}
+	// acceptance、旧快照空 kind 与未知未来角色使用只读正向闭集。对未显式
+	// capability 的 synthetic Lease，这是 Node role policy 与 Route ceiling 的
+	// 正式交集：framework 自动注册的 Observation 等控制能力不能因此让 verifier
+	// 启动失败或泄露给模型。显式声明不在此静默裁剪，继续由下方校验 fail-closed。
+	if task.GraphID != "" && task.GraphNodeKind != "agent" && task.GraphNodeKind != "controller" && !explicit {
+		kept := make([]string, 0, len(lease.BusinessTools))
+		for _, name := range lease.BusinessTools {
+			if _, ok := acceptanceLeaseAllowedTools[name]; ok {
+				kept = append(kept, name)
+			}
+		}
+		lease.BusinessTools = kept
+	}
 
 	// --- Policy ∩ ---
 	// exec=readonly：从 BusinessTools 剔除写工具与 run_shell（Gate 硬拒之外
@@ -214,6 +228,9 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 
 	// --- 冻结模型 / 隔离 / 超时 ---
 	lease.Model = a.Model
+	lease.ModelContextWindowTokens = a.ModelContextWindowTokens
+	lease.ModelMaxCompletionTokens = a.ModelMaxCompletionTokens
+	lease.ModelCapabilityDigest = a.ModelCapabilityDigest
 	if task.Capability != nil && task.Capability.Model != "" {
 		lease.Model = task.Capability.Model
 	}
@@ -337,7 +354,7 @@ func deriveControlTools(task *model.Task) []string {
 					return []string{
 						"commit_graph_change", "get_task_result", "propose_graph_change",
 						"read_content_ref", "read_graph", "read_graph_change",
-						"submit_task_result", "validate_graph_change",
+						"submit_recovery_decision", "validate_graph_change",
 					}
 				}
 				if task.GraphDefinitionDigestVersion != "" {
@@ -345,7 +362,12 @@ func deriveControlTools(task *model.Task) []string {
 				}
 				return []string{"patch_graph", "read_graph", "request_replan", "submit_task_result"}
 			}
-			return []string{"request_replan", "submit_task_result"}
+			tools := []string{"request_replan", "submit_task_result"}
+			if task.ProgressContract != nil && (task.ProgressContract.Policy.KnowledgeCheckpointAfterTurns > 0 ||
+				task.ProgressContract.Ref.ContractID == policycatalog.ProgressCodeChangeV4) {
+				tools = append(tools, "record_observation_delta")
+			}
+			return tools
 		case "acceptance", "":
 			return []string{"submit_task_result"}
 		default:

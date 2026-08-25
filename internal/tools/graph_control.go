@@ -360,6 +360,9 @@ func (g GraphControlGroup) currentSchedulerTask() (*model.Task, error) {
 	if err != nil {
 		return nil, fmt.Errorf("Graph 控制面读取当前 Scheduler task %s 失败: %w", taskID, err)
 	}
+	if err := validateFinalReportScope(task); err != nil {
+		return nil, fmt.Errorf("Graph 控制面 final-report scope 无效: %w", err)
+	}
 	return task, nil
 }
 
@@ -381,6 +384,10 @@ func (g GraphControlGroup) authorizeGraphTarget(operation, graphID string) error
 	}
 	if task != nil && task.GraphID != "" && task.GraphID != graphID {
 		return fmt.Errorf("Graph controller 禁止 %s 其他 Graph：current_graph_id=%s target_graph_id=%s；只能读取或修改当前执行契约", operation, task.GraphID, graphID)
+	}
+	if task != nil && task.FinalReportGraphID != "" && task.FinalReportGraphID != graphID {
+		return fmt.Errorf("graph-ended final-report 禁止 %s 其他 Graph：final_report_graph_id=%s target_graph_id=%s",
+			operation, task.FinalReportGraphID, graphID)
 	}
 	return nil
 }

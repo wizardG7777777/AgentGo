@@ -21,12 +21,12 @@ func TestValidatePromptCompatibilityGatesRunnerConstruction(t *testing.T) {
 	}}
 	runtime := config.AgentRuntimeConfig{
 		InstanceID: "worker-preflight", Kind: "worker",
-		SystemPrompt: strings.Repeat("策", 15<<10),
+		SystemPrompt: strings.Repeat("策", 256<<10),
 	}
 	if err := ValidatePromptCompatibility(context.Background(), runtime, deps); err != nil {
-		t.Fatalf("合法 v3 Prompt 不应阻断 Runner: %v", err)
+		t.Fatalf("合法 v9 大 Prompt 不应阻断 Runner: %v", err)
 	}
-	runtime.SystemPrompt = strings.Repeat("策", 22<<10)
+	runtime.SystemPrompt = strings.Repeat("策", 1_100_000)
 	err = ValidatePromptCompatibility(context.Background(), runtime, deps)
 	if err == nil || !strings.Contains(err.Error(), "Prompt/Context 契约预检失败") ||
 		!strings.Contains(err.Error(), "fragment_limit_exceeded") {

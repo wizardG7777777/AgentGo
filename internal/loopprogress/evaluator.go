@@ -251,6 +251,15 @@ func projectCandidates(delta loopcontract.TurnSettlementDelta) []candidate {
 			rejectReason: rejectReason,
 		})
 	}
+	if change := delta.ObservationChange; change != nil && change.SemanticAdvance {
+		digest := stableID("observation-state", change.WorkspaceRevisionRef,
+			change.LatestCheckRef, strconv.Itoa(change.ResolvedCandidates))
+		out = append(out, candidate{
+			fingerprint: fingerprint(loopcontract.SignalObservationStateAdvanced,
+				change.Phase, digest),
+			class: loopcontract.ProgressCoordination,
+		})
+	}
 	for _, settlement := range delta.EffectSettlements {
 		identity := settlement.Kind + ":" + settlement.Target
 		digest := firstNonEmpty(settlement.OutcomeDigest, settlement.Status)
@@ -368,6 +377,20 @@ func advanceCheckpoint(previous loopcontract.ProgressCheckpoint, delta loopcontr
 		return loopcontract.ProgressCheckpoint{}, fmt.Errorf("累计 usage 失败: %w", err)
 	}
 	next.CumulativeUsage = cumulative
+	if delta.ObservationDeltaRef != "" {
+		next.ObservationDeltaRef = delta.ObservationDeltaRef
+		next.ObservationAttemptID = delta.AttemptID
+		if delta.ObservationChange != nil {
+			next.ObservationPhase = delta.ObservationChange.Phase
+			next.ObservationWorkspaceRevisionRef = delta.ObservationChange.WorkspaceRevisionRef
+			next.ObservationLatestCheckRef = delta.ObservationChange.LatestCheckRef
+			if delta.ObservationChange.SemanticAdvance {
+				next.ObservationStagnationCount = 0
+			} else {
+				next.ObservationStagnationCount++
+			}
+		}
+	}
 
 	if assessment.ResetAnyProgressClock {
 		next.LastAnyProgressAt = delta.SettledAt
@@ -399,6 +422,10 @@ func advanceCheckpoint(previous loopcontract.ProgressCheckpoint, delta loopcontr
 		next.ExplorationTurnsSinceDeliverable = 0
 	} else if assessment.Class == loopcontract.ProgressKnowledge {
 		next.ExplorationTurnsSinceDeliverable++
+		next.KnowledgeTurnsSinceObservation++
+	}
+	if delta.ObservationDeltaRef != "" {
+		next.KnowledgeTurnsSinceObservation = 0
 	}
 	if err := next.Validate(); err != nil {
 		return loopcontract.ProgressCheckpoint{}, fmt.Errorf("生成的下一 Checkpoint 无效: %w", err)

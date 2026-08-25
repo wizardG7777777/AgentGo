@@ -93,7 +93,7 @@ grep '"kind":"tool_result"' "$TRACE_DIR/<file>.jsonl" | jq 'select(.error != nul
 
 ```
 ts          — 时间戳（ISO 8601）
-kind        — 事件类型（31 个内置系统 EventKind 之一；另允许 user.* 自定义事件）
+kind        — 事件类型（版本化内置系统 EventKind 之一；另允许 user.* 自定义事件）
 task_id     — 任务 ID（UUID）
 
 通用字段：
@@ -206,6 +206,26 @@ Plan 时代的验收身份子结构已删除；V6 验收语义由 Graph acceptan
 |---|---|---|
 | `tool_call` | 工具调用发起 | `tool`, `args`, `call_id` |
 | `tool_result` | 工具调用返回 | `tool`, `duration_ms`, `result_len`, `error` |
+
+#### Task Memory 与 Observation
+
+| Kind | 含义 | 关键字段 |
+|---|---|---|
+| `task_memory_created` | 创建有界 Task Memory | `task_id`, `description`（仅段计数） |
+| `task_memory_updated` | settled Turn 产生实质变化 | `task_id`, `loop`, `description`（仅段计数） |
+| `task_memory_checkpointed` | 压缩、Attempt 或终态前 checkpoint | `task_id`, `loop`, `reason` |
+| `observation_delta_recorded` | 当前 Attempt 的 ObservationDelta 已 durable | `task_id`, `attempt_id`, `description`（只含 ref 与 facts/next 计数） |
+| `observation_checkpoint_failed` | Observation Control Invocation 未形成 durable delta | `task_id`, `attempt_id`, `turn_id`, `reason`（provider 前 preflight / provider 后提交无效） |
+
+`llm_call_end.failure_kind=provider_quota_exhausted` 表示 provider 账户/项目的
+计费额度或余额已耗尽（HTTP 402 或结构化 billing code）。它不是瞬时 429
+`rate_limited`：当前 Run 不应重试；Task 以 `provider_quota_exhausted` blocked，
+等待外部资源恢复。`failure_kind=unknown` 若策略选择 `request_intervention`，应在
+LoopStore 形成 `unsafe_unknown` intervention，而不是直接变成
+`non_recoverable_error`。
+
+`observation_delta_recorded` 不含事实正文、reasoning、工具参数或原始 ToolResult；
+需要工作事实时通过 TaskMemory 投影或受 scope 约束的稳定 ref 查询。
 
 #### 文件操作（2 种）
 

@@ -23,6 +23,7 @@ const (
 	// 存在本键下；Graph terminal feed 再解码并把其字段类型保真地展开到
 	// TerminalFact.Result 顶层。用户提交的 result 不得占用本键。
 	StructuredResultStorageKey = "__agentgo_structured_result_v1"
+	FulfillmentStorageKey      = "__agentgo_fulfillment_v1"
 )
 
 // StructuredSubmission 是 submit_task_result 工具写入的一次结构化提交。
@@ -60,7 +61,8 @@ type StructuredSubmission struct {
 	// 空串表示调用方没有提交自定义结构化字段；"{}" 表示显式提交空 object。
 	// 它不参与 Format 渲染，而是在 finalization 时写入
 	// Results[StructuredResultStorageKey]，供 Graph 条件与数据流消费。
-	ResultJSON string
+	ResultJSON      string
+	FulfillmentJSON string
 }
 
 // DecodeStructuredResult 解码 Task.Results 内部 carrier 中的 JSON object。

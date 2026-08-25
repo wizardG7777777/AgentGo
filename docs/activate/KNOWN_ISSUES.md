@@ -1,6 +1,6 @@
 # KNOWN_ISSUES — 当前限制与验证缺口
 
-最后核对：2026-08-23。
+最后核对：2026-08-24。
 
 ## 2026-08-23 五层架构修复的当前开放项
 
@@ -53,17 +53,30 @@ durable Store 和生产接线，并通过 full/race/vet/build、harness 单测�
   `work@1→recovery@1→work@2`、三道历史失败题定向复跑均完成；其中
   `context-push-order` 与 `session-access-tracking` 业务 resolved，
   `pass-context-dispatch` 为模型业务失败但 recovery/terminal/ACK 架构链完整。
+- **SWE-034/035 已修复并获得外部验证**：`run_shell` pipeline 过去把
+  `tail` 的 exit=0 误投影为整条 pytest 通过；graph-ended final-report 又缺少冻结
+  Graph scope，`get_task_result` 被 legacy 授权拒绝且未进入架构门。现 pipeline
+  默认拒绝，显式执行冻结 last-command scope 且 L4 不判 pass；final-report 冻结
+  `FinalReportGraphID` 并进入 runner 终态/scope/Outcome 门。真实 DeepSeek 单题
+  已观察 pipeline 拒绝→无管道全量测试、final-report 同图结果读取成功、493 passed、
+  patch 18 行、双门通过。
+- **SWE-036 已修复并完成本地真实验证**：外部 SWE Python runner 曾以 JUnit
+  `tests-failures-errors-skipped` 推算 passed；pytest 的 call outcome 与
+  setup/teardown error 可重叠，导致 `teardown-callbacks` 把实际
+  `collected=495 / passed=476 / failed=19 / error_events=481` 错报为
+  `tests=957 / passed=457`。现由同进程 phase reporter 生成机器侧车，JUnit 仅作
+  traceback 与关键计数交叉校验；缺失/冲突 fail-closed。该问题属于外部评测观测，
+  不归入 AgentGo L1–L5。证据见
+  [`pytest 阶段重叠计数`](../test-issues/2026-08-24-0132-pytest-phase-overlap-counting.md)。
 - **验证横切面**：仓库内 SWE harness 已分别实际运行 OpenRouter Luna 与 DeepSeek
-  真实 thinking 路径。最终冻结二进制的 DeepSeek 8 题完整批次为
-  `architecture_ok=8/8`、Judge resolved 5/8；三题未解均进入 typed blocked、
-  known incident=0，是模型未产出补丁的业务失败，不是 API/系统拦截。
-  同一最终二进制对受影响路径的独立复跑中，
-  `automatic-options` 为 494/494，`ipv6-server-name` 为 493/493，
-  `teardown-callbacks` 为 495/495，`session-access-tracking` 最终复跑为
-  490/490，均 `architecture_ok=true / task_resolved=true`；因此 8 题中只有
-  `pass-context-dispatch` 尚无业务 resolved 证据。
+  真实 thinking 路径。当前冻结二进制的最终完整 cohort 为
+  `batch_status=complete`、`task_resolved=8/8`、`architecture_ok=8/8`、
+  `infrastructure_ok=8/8`，无 stale/infra/not-run、hard kill 或 known incident。
+  SWE-037～056 均已有外部 closure 证据，不再列为开放问题。
   三平台 CI 仍是发布层开放证据。详见 [`Responses 主链与单题成功`](../test-issues/2026-08-23-0109-responses-mainline-and-single-task-success.md)
-  与 [`DeepSeek Responses 精确重放事故`](../test-issues/2026-08-23-0500-deepseek-responses-exact-replay.md)。
+  、[`DeepSeek Responses 精确重放事故`](../test-issues/2026-08-23-0500-deepseek-responses-exact-replay.md)、
+  [`五层限制重组`](../test-issues/2026-08-24-0715-swe-layer-limit-recomposition.md)
+  与 [`Observation thinking replay`](../test-issues/2026-08-24-0735-observation-thinking-replay.md)。
 
 统一状态与后续顺序见
 [`SWE 架构修复统一实施路线图`](../design/swe-architecture-repair-roadmap.md)。

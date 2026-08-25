@@ -382,7 +382,7 @@ func (s *AuthoringStore) CommitDraft(proposalID string, expectedDraftRevision in
 	now := time.Now().UTC()
 	definition := GraphDefinition{
 		GraphID: draft.GraphID, Schema: normalized.Schema, Revision: definitionRevision,
-		DefinitionDigestVersion: GraphDefinitionDigestVersionV1, DefinitionDigest: digest,
+		DefinitionDigestVersion: GraphDefinitionDigestVersionCurrent, DefinitionDigest: digest,
 		SourceProposalID: proposalID, SessionID: draft.SessionID, OwnerTaskID: draft.OwnerTaskID,
 		Contract: draft.Contract, ContractDigest: contractDigest, ValidationReportRef: reportID,
 		Status: DefinitionPending, Body: normalized, CommittedAt: now,
@@ -713,7 +713,7 @@ func (s *AuthoringStore) CommitGraphChange(changeID string, expectedProposalRevi
 	now := time.Now().UTC()
 	definition := GraphDefinition{
 		GraphID: change.GraphID, Schema: report.NormalizedDefinition.Schema, Revision: newRevision,
-		DefinitionDigestVersion: GraphDefinitionDigestVersionV1, DefinitionDigest: digest,
+		DefinitionDigestVersion: GraphDefinitionDigestVersionCurrent, DefinitionDigest: digest,
 		SourceProposalID: changeID, SessionID: base.SessionID, OwnerTaskID: base.OwnerTaskID,
 		Contract: base.Contract, ContractDigest: base.ContractDigest, ValidationReportRef: reportID,
 		Status: DefinitionPending, Body: *report.NormalizedDefinition, CommittedAt: now,
@@ -1048,11 +1048,12 @@ func (s *AuthoringStore) validateRecoveredStateLocked() error {
 			if !definition.Status.IsValid() || definition.Revision != revision || definition.GraphID != graphID {
 				return fmt.Errorf("恢复 Definition %s@%d 身份/状态非法", graphID, revision)
 			}
-			if ComputeGraphDefinitionDigest(graphID, revision, definition.Body) != definition.DefinitionDigest {
-				return fmt.Errorf("恢复 Definition %s@%d digest 不一致", graphID, revision)
-			}
-			if definition.DefinitionDigestVersion != GraphDefinitionDigestVersionV1 {
+			if definition.DefinitionDigestVersion != GraphDefinitionDigestVersionV1 &&
+				definition.DefinitionDigestVersion != GraphDefinitionDigestVersionV2 {
 				return fmt.Errorf("恢复 Definition %s@%d digest version=%q 未知", graphID, revision, definition.DefinitionDigestVersion)
+			}
+			if ComputeGraphDefinitionDigestVersion(definition.DefinitionDigestVersion, graphID, revision, definition.Body) != definition.DefinitionDigest {
+				return fmt.Errorf("恢复 Definition %s@%d digest 不一致", graphID, revision)
 			}
 			if ComputeGraphContractDigest(definition.Contract) != definition.ContractDigest {
 				return fmt.Errorf("恢复 Definition %s@%d contract digest 不一致", graphID, revision)

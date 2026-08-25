@@ -151,6 +151,25 @@ func deriveInvocationOutputBudget(policy contextcontract.ContextBudgetPolicy,
 	replay contextcontract.ProviderReplayPolicy,
 ) invocation.OutputBudget {
 	budget := llm.DefaultOutputBudget()
+	if policy.Version < 9 {
+		budget.MaxContentBytes = 128 << 10
+		budget.MaxReasoningBytes = 256 << 10
+		budget.MaxExtraFieldBytes = 256 << 10
+		budget.MaxToolArgumentsBytes = 64 << 10
+		budget.MaxToolArgumentsTotalBytes = 128 << 10
+		budget.MaxResponseBytes = 512 << 10
+		budget.MaxCompletionTokens = 32 << 10
+	}
+	if policy.Version >= 9 {
+		reserve := policy.CompletionReserve
+		budget.MaxContentBytes = reserve.SerializedBytes
+		budget.MaxReasoningBytes = reserve.SerializedBytes
+		budget.MaxExtraFieldBytes = reserve.SerializedBytes
+		budget.MaxToolArgumentsBytes = reserve.SerializedBytes
+		budget.MaxToolArgumentsTotalBytes = reserve.SerializedBytes
+		budget.MaxResponseBytes = reserve.SerializedBytes
+		budget.MaxCompletionTokens = reserve.EstimatedTokens
+	}
 	if reserve := policy.CompletionReserve; reserve.SerializedBytes > 0 && reserve.SerializedBytes < budget.MaxResponseBytes {
 		budget.MaxResponseBytes = reserve.SerializedBytes
 	}
@@ -176,8 +195,11 @@ func deriveInvocationOutputBudget(policy contextcontract.ContextBudgetPolicy,
 		// 为 envelope 字段名、message index 与 JSON 结构保留 1 KiB；最终
 		// Response commit gate 仍用真实编码做精确证明。
 		limit := rule.MaxSerializedBytes - (1 << 10)
-		if limit <= 0 || limit > budget.MaxExtraFieldBytes {
+		if limit <= 0 {
 			limit = rule.MaxSerializedBytes
+		}
+		if limit > budget.MaxExtraFieldBytes {
+			limit = budget.MaxExtraFieldBytes
 		}
 		budget.MaxExtraFieldBytesByName[field] = limit
 	}

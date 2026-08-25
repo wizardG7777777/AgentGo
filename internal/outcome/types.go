@@ -10,10 +10,12 @@ import (
 	"strings"
 	"time"
 
+	"agentgo/internal/fulfillment"
 	"agentgo/internal/runcontract"
 )
 
 const SchemaV1 = "agentgo.task-outcome/v1"
+const SchemaV2 = "agentgo.task-outcome/v2"
 const TerminalIntentSchemaV1 = "agentgo.terminal-intent/v1"
 
 const (
@@ -63,6 +65,7 @@ type EvidenceFact struct {
 	Command          string `json:"command,omitempty"`
 	CommandTruncated bool   `json:"command_truncated,omitempty"`
 	ExitCode         *int   `json:"exit_code,omitempty"`
+	ExitCodeScope    string `json:"exit_code_scope,omitempty"`
 
 	Path          string `json:"path,omitempty"`
 	PathTruncated bool   `json:"path_truncated,omitempty"`
@@ -92,17 +95,19 @@ type TaskOutcome struct {
 	Result       json.RawMessage   `json:"result,omitempty"`
 	// TaskResults 保留 MemoryTaskStore 的精确字符串投影，用于修复 outcome
 	// fsync 后、Session snapshot 前崩溃的窗口；Graph 只消费 typed Result。
-	TaskResults     map[string]string `json:"task_results,omitempty"`
-	ResultRef       string            `json:"result_ref,omitempty"`
-	EvidenceRefs    []string          `json:"evidence_refs,omitempty"`
-	ArtifactRefs    []string          `json:"artifact_refs,omitempty"`
-	EvidenceFacts   []EvidenceFact    `json:"evidence_facts,omitempty"`
-	ArtifactFacts   []ArtifactFact    `json:"artifact_facts,omitempty"`
-	ReasonCode      string            `json:"reason_code,omitempty"`
-	Reason          string            `json:"reason,omitempty"`
-	CheckpointRef   string            `json:"checkpoint_ref,omitempty"`
-	CheckpointState string            `json:"checkpoint_state,omitempty"`
-	CommittedAt     time.Time         `json:"committed_at"`
+	TaskResults         map[string]string   `json:"task_results,omitempty"`
+	ResultRef           string              `json:"result_ref,omitempty"`
+	EvidenceRefs        []string            `json:"evidence_refs,omitempty"`
+	ArtifactRefs        []string            `json:"artifact_refs,omitempty"`
+	EvidenceFacts       []EvidenceFact      `json:"evidence_facts,omitempty"`
+	ArtifactFacts       []ArtifactFact      `json:"artifact_facts,omitempty"`
+	ReasonCode          string              `json:"reason_code,omitempty"`
+	Reason              string              `json:"reason,omitempty"`
+	CheckpointRef       string              `json:"checkpoint_ref,omitempty"`
+	ObservationDeltaRef string              `json:"observation_delta_ref,omitempty"`
+	CheckpointState     string              `json:"checkpoint_state,omitempty"`
+	Fulfillment         *fulfillment.Record `json:"fulfillment,omitempty"`
+	CommittedAt         time.Time           `json:"committed_at"`
 }
 
 // TerminalIntent 是终态 CAS 前的 durable fence。Candidate 尚未绑定 checkpoint
@@ -117,7 +122,8 @@ func (i TerminalIntent) Validate() error {
 	if i.Schema != TerminalIntentSchemaV1 || i.PreparedAt.IsZero() {
 		return fmt.Errorf("TerminalIntent schema/prepared_at 无效")
 	}
-	if !i.Candidate.CommittedAt.IsZero() || i.Candidate.CheckpointRef != "" || i.Candidate.CheckpointState != "" {
+	if !i.Candidate.CommittedAt.IsZero() || i.Candidate.CheckpointRef != "" ||
+		i.Candidate.ObservationDeltaRef != "" || i.Candidate.CheckpointState != "" {
 		return fmt.Errorf("TerminalIntent candidate 不得提前携带 checkpoint/committed_at")
 	}
 	probe := i.Candidate
@@ -131,8 +137,11 @@ func (i TerminalIntent) Validate() error {
 }
 
 func (o TaskOutcome) Validate() error {
-	if o.Schema != SchemaV1 {
+	if o.Schema != SchemaV1 && o.Schema != SchemaV2 {
 		return fmt.Errorf("TaskOutcome schema=%q，无效", o.Schema)
+	}
+	if o.Schema == SchemaV1 && o.Fulfillment != nil {
+		return fmt.Errorf("TaskOutcome v1 不得携带 fulfillment")
 	}
 	for name, value := range map[string]string{
 		"run_id": string(o.RunID), "task_id": o.TaskID,
@@ -149,6 +158,9 @@ func (o TaskOutcome) Validate() error {
 	}
 	if strings.TrimSpace(o.AttemptID) == "" && o.AttemptNo != 0 {
 		return fmt.Errorf("TaskOutcome 无 attempt_id 时 attempt_no 必须为 0")
+	}
+	if o.ObservationDeltaRef != "" && strings.TrimSpace(o.AttemptID) == "" {
+		return fmt.Errorf("TaskOutcome observation_delta_ref 必须绑定 attempt_id")
 	}
 	if o.Status == StatusCompleted && strings.TrimSpace(o.AttemptID) == "" {
 		return fmt.Errorf("completed TaskOutcome 必须携带 attempt_id")
@@ -244,6 +256,10 @@ func validateFacts(o TaskOutcome) error {
 			return fmt.Errorf("TaskOutcome evidence_facts 重复 ref=%s", fact.Ref)
 		}
 		evidence[fact.Ref] = struct{}{}
+		if fact.ExitCodeScope != "" && fact.ExitCodeScope != "whole_command" &&
+			fact.ExitCodeScope != "last_pipeline_command" {
+			return fmt.Errorf("TaskOutcome evidence_facts exit_code_scope=%q 无效", fact.ExitCodeScope)
+		}
 	}
 	if !sameRefSet(o.EvidenceRefs, evidence) {
 		return fmt.Errorf("TaskOutcome evidence_refs 与 evidence_facts 必须 exact-set 匹配")

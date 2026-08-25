@@ -182,6 +182,11 @@ type LLMExecutor struct {
 	sysPrompt               string
 	toolsMu                 sync.RWMutex
 	tools                   *ToolRegistry
+	// frameworkTools 是启动装配期注册全集的只读 authority。任务级
+	// ExecutionLease 只替换 tools 业务视图；Observation 等 framework-owned
+	// Control Invocation 必须从这里按 exact phase 重新派生，不能依赖角色业务
+	// Lease 是否暴露该工具，也不能把注册全集泄露回普通业务轮。
+	frameworkTools *ToolRegistry
 	// finalizationChecker 是 finalizing fence 的状态源（runner 装配注入与
 	// submit_task_result 提交通道共享的 FinalizationHolder）。非 nil 时，
 	// 每次具体工具 dispatch 前检查：已 finalized（submit_task_result 被接受）
@@ -334,6 +339,14 @@ func (e *LLMExecutor) ToolRegistry() *ToolRegistry {
 	return e.tools
 }
 
+// invocationToolRegistries 原子取得当前任务业务视图与启动期 framework
+// authority。两者只供一次 Invocation 冻结 ToolRouter，返回后均按只读使用。
+func (e *LLMExecutor) invocationToolRegistries() (business, framework *ToolRegistry) {
+	e.toolsMu.RLock()
+	defer e.toolsMu.RUnlock()
+	return e.tools, e.frameworkTools
+}
+
 // newLLMExecutor 是 LLMExecutor 的统一构造入口。storeView 当前未在 executor
 // 内部使用，仅透传以便未来扩展（如未来需要在 executor 内直接查询任务状态再启用）。
 func newLLMExecutor(
@@ -353,6 +366,7 @@ func newLLMExecutor(
 	return &LLMExecutor{
 		client:         client,
 		tools:          tools,
+		frameworkTools: tools,
 		gateReg:        gateReg,
 		recordToolCall: recordToolCall,
 		teamAwareness:  teamAwareness,
@@ -413,8 +427,8 @@ func NewSwappableLLMExecutor(
 func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
 	// 整个 Execute 使用同一份 registry 快照——任务边界换入的过滤视图对本次
 	// 调用自洽，不会在 Chat 与 Dispatch 之间被换走。
-	tools := e.ToolRegistry()
-	toolPolicy := deriveInvocationToolPolicy(task, history, tools)
+	tools, frameworkTools := e.invocationToolRegistries()
+	toolPolicy := deriveInvocationToolPolicyWithControl(task, history, tools, frameworkTools)
 	toolRouter, err := FreezeToolRouterSnapshotWithPolicy(toolPolicy.Registry, toolPolicy.Phase, toolPolicy.MaxCalls)
 	if err != nil {
 		return ExecuteResult{}, err
@@ -462,10 +476,18 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		}
 		if toolRouter.Phase == "agent:deliverable-submit" {
 			phasePrompt = agentDeliverablePhasePrompt
+		} else if toolRouter.Phase == "agent:observation-checkpoint" {
+			phasePrompt = observationCheckpointPhasePrompt
+		} else if toolRouter.Phase == "scheduler:final-report-submit" {
+			phasePrompt = finalReportSubmitPhasePrompt
 		}
-		modelHistory := history
-		if toolRouter.Phase == "agent:deliverable-submit" {
-			modelHistory = deliverableHistoryProjection(history)
+		// 正常业务链不重放 reasoning=none 的 Observation Control Invocation；
+		// 其 durable 结果由 TaskMemory 独立注入。
+		modelHistory := businessHistoryProjection(history)
+		if toolRouter.Phase == "agent:deliverable-submit" ||
+			toolRouter.Phase == "agent:observation-checkpoint" ||
+			toolRouter.Phase == "scheduler:final-report-submit" {
+			modelHistory = mechanicalControlHistoryProjection(modelHistory)
 		}
 		if contextRuntime.ready() {
 			leaseRef := ""
@@ -507,8 +529,8 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				}
 			}
 			binding.ToolChoice = invocationToolChoice(toolRouter)
-			if toolRouter.Phase == "agent:deliverable-submit" {
-				binding.ReasoningEffort = "none"
+			if reasoningEffort, override := phaseReasoningEffortOverride(toolRouter.Phase); override {
+				binding.ReasoningEffort = reasoningEffort
 			}
 			if bindErr = binding.Validate(); bindErr != nil {
 				return ExecuteResult{InvocationID: invocationID},
@@ -631,7 +653,8 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				event.FinishReason = failure.FinishReason
 			}
 			trace.Emit(event)
-			return ExecuteResult{InvocationID: invocationID, ContextSnapshotID: contextSnapshotID, InvocationDuration: llmDuration}, classifyError(err)
+			return ExecuteResult{InvocationID: invocationID, ContextSnapshotID: contextSnapshotID,
+				InvocationDuration: llmDuration, ProviderCallStarted: true}, classifyError(err)
 		}
 
 		// Response commit gate：在任何 Tool dispatch 和 History commit 之前证明
@@ -657,14 +680,21 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				})
 				return ExecuteResult{
 					InvocationID: invocationID, ContextSnapshotID: contextSnapshotID,
-					InvocationDuration: llmDuration, PromptTokens: resp.Usage.PromptTokens,
+					InvocationDuration: llmDuration, ProviderCallStarted: true,
+					PromptTokens:     resp.Usage.PromptTokens,
 					CompletionTokens: resp.Usage.CompletionTokens,
 				}, failure
 			}
 		}
 		if batchErr := validateToolCallBatch(toolRouter, resp.ToolCalls); batchErr != nil {
-			failure := invocation.NewFailure(invocation.FailureMalformedResponse,
-				invocation.PhaseToolCallValidate, invocation.OriginProtocol, batchErr)
+			failureKind := invocation.FailureMalformedResponse
+			origin := invocation.OriginProtocol
+			if isActionContractViolation(batchErr) {
+				failureKind = invocation.FailureActionContractRejected
+				origin = invocation.OriginRuntime
+			}
+			failure := invocation.NewFailure(failureKind,
+				invocation.PhaseToolCallValidate, origin, batchErr)
 			failure.UsageState = invocation.UsageSettled
 			failure.InvocationID = invocationID
 			failure.SnapshotID = contextSnapshotID
@@ -683,7 +713,8 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 			})
 			return ExecuteResult{
 				InvocationID: invocationID, ContextSnapshotID: contextSnapshotID,
-				InvocationDuration: llmDuration, PromptTokens: resp.Usage.PromptTokens,
+				InvocationDuration: llmDuration, ProviderCallStarted: true,
+				PromptTokens:     resp.Usage.PromptTokens,
 				CompletionTokens: resp.Usage.CompletionTokens,
 			}, failure
 		}
@@ -717,16 +748,17 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		// 无 tool calls → 任务完成
 		if len(resp.ToolCalls) == 0 {
 			return ExecuteResult{
-				InvocationID:       invocationID,
-				ContextSnapshotID:  contextSnapshotID,
-				InvocationDuration: llmDuration,
-				Output:             resp.Content,
-				AssistantContent:   resp.Content,
-				Reasoning:          resp.Reasoning,
-				ToolCalled:         false,
-				PromptTokens:       resp.Usage.PromptTokens,
-				CompletionTokens:   resp.Usage.CompletionTokens,
-				ExtraFields:        resp.ExtraFields,
+				InvocationID:        invocationID,
+				ContextSnapshotID:   contextSnapshotID,
+				InvocationDuration:  llmDuration,
+				ProviderCallStarted: true,
+				Output:              resp.Content,
+				AssistantContent:    resp.Content,
+				Reasoning:           resp.Reasoning,
+				ToolCalled:          false,
+				PromptTokens:        resp.Usage.PromptTokens,
+				CompletionTokens:    resp.Usage.CompletionTokens,
+				ExtraFields:         resp.ExtraFields,
 			}, nil
 		}
 
@@ -949,21 +981,24 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				//     由 toolErr == nil 决定
 				//   - Scheduler 工具不经过本路径，不被记录（hookSystem.md §11.1.3）
 				var exitCode *int
+				var exitCodeScope store.ShellExitCodeScope
 				if c.Name == "run_shell" && toolErr == nil {
 					exitCode = parseRunShellExitCode(result)
+					exitCodeScope = parseRunShellExitCodeScope(result)
 				}
 				if recordErr := e.recordToolCallFact(task.ID, store.ToolCallRecord{
-					Timestamp: time.Now(),
-					RunID:     runIDForTrace,
-					AttemptID: attemptIDForTrace,
-					TurnID:    turnIDForTrace,
-					ActionID:  actionID,
-					CallID:    c.ID,
-					AgentID:   agentID,
-					ToolName:  c.Name,
-					Args:      c.Arguments,
-					Success:   toolErr == nil,
-					ExitCode:  exitCode,
+					Timestamp:     time.Now(),
+					RunID:         runIDForTrace,
+					AttemptID:     attemptIDForTrace,
+					TurnID:        turnIDForTrace,
+					ActionID:      actionID,
+					CallID:        c.ID,
+					AgentID:       agentID,
+					ToolName:      c.Name,
+					Args:          c.Arguments,
+					Success:       toolErr == nil,
+					ExitCode:      exitCode,
+					ExitCodeScope: exitCodeScope,
 				}); recordErr != nil {
 					controlErr = &loopAuthorityError{Err: fmt.Errorf("ToolCallRecord durable 写失败: %w", recordErr)}
 				}
@@ -1004,18 +1039,19 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 
 		completedCalls := append([]llm.ToolCall(nil), resp.ToolCalls[:completedResults]...)
 		executeResult := ExecuteResult{
-			InvocationID:       invocationID,
-			ContextSnapshotID:  contextSnapshotID,
-			InvocationDuration: llmDuration,
-			Output:             output.String(),
-			ToolCalled:         completedResults > 0,
-			AssistantContent:   resp.Content,
-			Reasoning:          resp.Reasoning,
-			ToolCalls:          completedCalls,
-			ToolResults:        toolResults,
-			PromptTokens:       resp.Usage.PromptTokens,
-			CompletionTokens:   resp.Usage.CompletionTokens,
-			ExtraFields:        resp.ExtraFields,
+			InvocationID:        invocationID,
+			ContextSnapshotID:   contextSnapshotID,
+			InvocationDuration:  llmDuration,
+			ProviderCallStarted: true,
+			Output:              output.String(),
+			ToolCalled:          completedResults > 0,
+			AssistantContent:    resp.Content,
+			Reasoning:           resp.Reasoning,
+			ToolCalls:           completedCalls,
+			ToolResults:         toolResults,
+			PromptTokens:        resp.Usage.PromptTokens,
+			CompletionTokens:    resp.Usage.CompletionTokens,
+			ExtraFields:         resp.ExtraFields,
 		}
 		return executeResult, controlErr
 	}
@@ -1043,6 +1079,24 @@ func parseRunShellExitCode(result string) *int {
 		return nil
 	}
 	return &code
+}
+
+func parseRunShellExitCodeScope(result string) store.ShellExitCodeScope {
+	lines := strings.Split(result, "\n")
+	for _, line := range lines[:min(len(lines), 3)] {
+		value, ok := strings.CutPrefix(strings.TrimSpace(line), "exit_code_scope:")
+		if !ok {
+			continue
+		}
+		scope := store.ShellExitCodeScope(strings.TrimSpace(value))
+		switch scope {
+		case store.ShellExitCodeScopeWholeCommand, store.ShellExitCodeScopeLastPipelineCommand:
+			return scope
+		default:
+			return ""
+		}
+	}
+	return ""
 }
 
 // buildLegacyMessages 仅供无 Run identity 的旧快照与隔离测试兼容。

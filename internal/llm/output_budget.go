@@ -10,15 +10,15 @@ import (
 // defaultOutputBudget 是 Model Invocation 的第一版绝对安全上限。它不是 L2
 // Context 的最终分类型 policy；零配置也不得退化为无界累积。
 var defaultOutputBudget = invocation.OutputBudget{
-	MaxContentBytes:            128 << 10,
-	MaxReasoningBytes:          256 << 10,
-	MaxExtraFieldBytes:         256 << 10,
+	MaxContentBytes:            512 << 10,
+	MaxReasoningBytes:          512 << 10,
+	MaxExtraFieldBytes:         512 << 10,
 	MaxToolNameBytes:           512,
-	MaxToolArgumentsBytes:      64 << 10,
+	MaxToolArgumentsBytes:      512 << 10,
 	MaxToolCalls:               16,
-	MaxToolArgumentsTotalBytes: 128 << 10,
+	MaxToolArgumentsTotalBytes: 512 << 10,
 	MaxResponseBytes:           512 << 10,
-	MaxCompletionTokens:        32 << 10,
+	MaxCompletionTokens:        64 << 10,
 }
 
 func DefaultOutputBudget() invocation.OutputBudget { return defaultOutputBudget.Clone() }

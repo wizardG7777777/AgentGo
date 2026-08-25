@@ -36,6 +36,9 @@ func DecideInvocationFailure(failure *invocation.Failure) RecoveryDecision {
 	}
 	decision := RecoveryDecision{FailureKind: failure.Kind}
 	switch failure.Kind {
+	case invocation.FailureActionContractRejected:
+		decision.Action = RecoveryRetrySameSnapshot
+		decision.ReuseSnapshot = true
 	case invocation.FailureRequestTimeout, invocation.FailureTransport,
 		invocation.FailureRateLimited, invocation.FailureProviderUnavailable:
 		decision.Action = RecoveryRetrySameSnapshot
@@ -53,6 +56,11 @@ func DecideInvocationFailure(failure *invocation.Failure) RecoveryDecision {
 	case invocation.FailureAttemptDeadline, invocation.FailureActivationDeadline:
 		decision.Action = RecoveryBlock
 	case invocation.FailureContextAssembly:
+		decision.Action = RecoveryBlock
+	case invocation.FailureProviderQuotaExhausted:
+		// 余额/计费额度是 Run 外部资源。继续 retry、重建 Context 或让 Graph
+		// recovery 改策略都不会恢复；冻结为 blocked，等待操作者补充资源后
+		// 由新 Run 继续。
 		decision.Action = RecoveryBlock
 	case invocation.FailureAuth, invocation.FailurePermissionDenied,
 		invocation.FailureModelUnavailable, invocation.FailureInvalidRequest,

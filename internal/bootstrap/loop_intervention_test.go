@@ -20,6 +20,7 @@ import (
 	"agentgo/internal/reactor"
 	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
+	"agentgo/internal/taskcontract"
 	"agentgo/internal/trace"
 )
 
@@ -149,6 +150,51 @@ func TestLoopInterventionBridgeOrdersFeedWakeAndAck(t *testing.T) {
 	}
 	if _, err := tasks.GetTask(intervention.WakeTaskID(nested.CommandID)); !errors.Is(err, store.ErrTaskNotFound) {
 		t.Fatalf("intervention wake 不得递归创建下一层 wake: %v", err)
+	}
+}
+
+func TestFinalReportInterventionIsAckedWithoutCreatingBusinessGraphWake(t *testing.T) {
+	tasks := newLoopInterventionTaskStore(t)
+	source := &model.Task{ID: "final-report-source", EventType: "__scheduler__", EventSource: "graph-ended",
+		FinalReportGraphID: "g-finished", MaxConcurrency: 1}
+	if err := taskcontract.Start(source, loopcontract.WorkFinalization, "test-finalization/v1",
+		10*time.Minute, 30*time.Second, 90*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	source.RunPhase = runcontract.PhaseFinalization
+	if err := tasks.PublishTask(source); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks.ClaimTask("scheduler", source.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks.BlockProcessingTaskBySystem(source.ID, "final report stalled", "loop_intervention_required"); err != nil {
+		t.Fatal(err)
+	}
+	source, _ = tasks.GetTask(source.ID)
+	command := loopcontract.LoopInterventionRequested{
+		Schema: loopcontract.InterventionSchemaV1, CommandID: "final-report-command",
+		RunID: source.RunID, FinalReportGraphID: source.FinalReportGraphID,
+		TaskID: source.ID, AttemptID: source.AttemptID, Contract: source.ProgressContract.Ref,
+		ReasonCode: loopcontract.InterventionNoProgressStalled, CheckpointRef: "checkpoint-final-report",
+		RequestedAt: time.Now().UTC(),
+	}
+	loops := &loopInterventionStoreFake{commands: map[string][]loopcontract.LoopInterventionRequested{
+		source.ID: {command},
+	}}
+	outcomes := newOutcomeDeliveryFake(source, false)
+	bridge, err := newLoopInterventionBridge(tasks, loops, outcomes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bridge.Run(trace.Event{Kind: trace.KindTaskBlocked, TaskID: source.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if len(loops.acks) != 1 || loops.acks[0].CommandID != command.CommandID {
+		t.Fatalf("final-report intervention 未由同一 Outcome ACK: %+v", loops.acks)
+	}
+	if _, err := tasks.GetTask(intervention.WakeTaskID(command.CommandID)); !errors.Is(err, store.ErrTaskNotFound) {
+		t.Fatalf("final-report intervention 不得创建 detached wake/业务 Graph: %v", err)
 	}
 }
 

@@ -164,6 +164,10 @@ func (r ContextRuntime) compileAndPersist(ctx context.Context, request contextCo
 	if !ok {
 		return contextadapter.Result{}, fmt.Errorf("未知 ContextPolicyRef %q", policyRef)
 	}
+	if request.Task.Lease != nil {
+		contextProfile.Policy = policycatalog.AdaptContextPolicyForModel(contextProfile.Policy,
+			request.Task.Lease.ModelContextWindowTokens, request.Task.Lease.ModelMaxCompletionTokens)
+	}
 	replayProfile, ok := r.Policies.ProviderReplayPolicy(contextProfile.ReplayPolicyRef)
 	if !ok {
 		return contextadapter.Result{}, fmt.Errorf("ContextPolicy %q 引用未知 ReplayPolicy %q", policyRef, contextProfile.ReplayPolicyRef)
@@ -174,6 +178,7 @@ func (r ContextRuntime) compileAndPersist(ctx context.Context, request contextCo
 		if side := manifestSideInfoFromContext(ctx); side != nil {
 			side.l2Strategy = fmt.Sprintf("snapshot-pressure/v1:omitted=%d:retained=%d:aggressive=%t",
 				projection.OmittedEntries, projection.RetainedEntries, projection.Aggressive)
+			side.historyProjectionCount++
 		}
 		trace.Emit(trace.Event{
 			Kind: trace.KindHistoryCompaction, TaskID: request.Task.ID,

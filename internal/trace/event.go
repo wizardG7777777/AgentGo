@@ -190,7 +190,13 @@ const (
 	// payload：Loop（attempt_end/terminal 为 -1），Reason=checkpoint 原因
 	//（history_compaction / attempt_end / terminal:<status>），
 	// Description=JSON 段计数。
-	KindTaskMemoryCheckpointed EventKind = "task_memory_checkpointed"
+	KindTaskMemoryCheckpointed   EventKind = "task_memory_checkpointed"
+	KindObservationDeltaRecorded EventKind = "observation_delta_recorded"
+	// KindObservationCheckpointFailed 记录一次机械 Observation Control
+	// Invocation 未形成 durable delta。Reason 区分 provider 前的 framework
+	// control preflight 故障与 provider 返回后的结构化提交无效；周期性失败即使
+	// 恢复业务阶段也必须可观测，不能只靠终态 TaskOutcome 推断。
+	KindObservationCheckpointFailed EventKind = "observation_checkpoint_failed"
 
 	// === V6 §3 Session Memory（CM3，internal/memory/promotion.go +
 	// internal/bootstrap/session_promotion.go）生命周期事件 ===
@@ -392,6 +398,7 @@ type Transition struct {
 type ShellExec struct {
 	Command       string `json:"command"`
 	ExitCode      int    `json:"exit_code"`
+	ExitCodeScope string `json:"exit_code_scope,omitempty"`
 	DurationMS    int64  `json:"duration_ms"`
 	Outcome       string `json:"outcome"`                  // success / failure / timeout
 	StdoutExcerpt string `json:"stdout_excerpt,omitempty"` // 截断（前后各 N 字节），完整内容仍在 trace 文件

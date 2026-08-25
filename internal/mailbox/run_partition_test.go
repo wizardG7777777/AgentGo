@@ -135,7 +135,7 @@ func TestNotifierPublishesOneTargetedWakePerRun(t *testing.T) {
 	for runID, wake := range wakes {
 		if wake.MailboxTargetAgentID != "worker-1" || wake.MailboxSessionID != "s-1" ||
 			wake.RunContract == nil || wake.ContextPolicyRef != policycatalog.ContextDefaultCurrent ||
-			wake.ProgressContract == nil || wake.ProgressContract.Ref.ContractID != policycatalog.ProgressCoordinationV1 ||
+			wake.ProgressContract == nil || wake.ProgressContract.Ref.ContractID != policycatalog.ProgressCoordinationCurrent ||
 			wake.RunPhase != runcontract.PhaseExecution {
 			t.Fatalf("Run %s wake binding/target 错误: %+v", runID, wake)
 		}

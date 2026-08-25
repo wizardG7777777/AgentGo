@@ -389,13 +389,14 @@ func TestExportImport_RoundTripV3RuntimeFields(t *testing.T) {
 
 	history := []byte(`[{"output":"command completed","tool_called":true,"tool_calls":[{"id":"call-1","name":"run_shell"}]}]`)
 	task := &model.Task{
-		Description:    "formal acceptance task",
-		EventSource:    "controller-1",
-		EventType:      "verify",
-		SchedulerBatch: []string{"child-a", "child-b"},
-		LastHistory:    history,
-		LastResponse:   "latest acceptance response",
-		PartialOutput:  "streamed so far",
+		Description:        "formal final-report task",
+		EventSource:        "graph-ended",
+		EventType:          "__scheduler__",
+		SchedulerBatch:     []string{"child-a", "child-b"},
+		LastHistory:        history,
+		LastResponse:       "latest acceptance response",
+		PartialOutput:      "streamed so far",
+		FinalReportGraphID: "g-finished",
 	}
 	if err := s1.PublishTask(task); err != nil {
 		t.Fatalf("PublishTask: %v", err)
@@ -411,8 +412,9 @@ func TestExportImport_RoundTripV3RuntimeFields(t *testing.T) {
 			"command": "go test ./...",
 			"options": map[string]any{"env": []any{"CI=1", "COLOR=0"}},
 		},
-		Success:  true,
-		ExitCode: &exitCode,
+		Success:       true,
+		ExitCode:      &exitCode,
+		ExitCodeScope: ShellExitCodeScopeWholeCommand,
 	}); err != nil {
 		t.Fatalf("AppendToolCall: %v", err)
 	}
@@ -470,6 +472,9 @@ func TestExportImport_RoundTripV3RuntimeFields(t *testing.T) {
 	if got.PartialOutput != task.PartialOutput {
 		t.Errorf("PartialOutput = %q, want %q", got.PartialOutput, task.PartialOutput)
 	}
+	if got.FinalReportGraphID != task.FinalReportGraphID {
+		t.Errorf("FinalReportGraphID = %q, want %q", got.FinalReportGraphID, task.FinalReportGraphID)
+	}
 	if string(got.LastHistory) != string(history) {
 		t.Fatalf("LastHistory = %s, want %s", got.LastHistory, history)
 	}
@@ -479,7 +484,8 @@ func TestExportImport_RoundTripV3RuntimeFields(t *testing.T) {
 	}
 	call := calls[0]
 	if !call.Timestamp.Equal(callTime) || call.CallID != "call-1" || call.AgentID != "verifier-1" || !call.Success ||
-		call.Args["command"] != "go test ./..." || call.ExitCode == nil || *call.ExitCode != 0 {
+		call.Args["command"] != "go test ./..." || call.ExitCode == nil || *call.ExitCode != 0 ||
+		call.ExitCodeScope != ShellExitCodeScopeWholeCommand {
 		t.Fatalf("restored ToolCall mismatch: %+v", call)
 	}
 	env := call.Args["options"].(map[string]any)["env"].([]any)
@@ -496,6 +502,7 @@ func TestImportSnapshotRejectsInvalidToolCallFacts(t *testing.T) {
 	}{
 		{name: "empty tool name", call: session.ToolCallSnapshot{Timestamp: now}},
 		{name: "invalid timestamp", call: session.ToolCallSnapshot{ToolName: "run_shell", Timestamp: "not-a-time"}},
+		{name: "invalid exit scope", call: session.ToolCallSnapshot{ToolName: "run_shell", Timestamp: now, ExitCodeScope: "all-pipes"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _ := newTestStore(10, 100)

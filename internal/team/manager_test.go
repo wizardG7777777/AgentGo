@@ -49,7 +49,7 @@ func TestManagerPrepareRejectsOversizedTemplatePromptBeforeClients(t *testing.T)
 	_, err = manager.prepare(TeamSpec{
 		ID: "team-oversized", EventType: "team:oversized", Purpose: "验证", Replicas: 2,
 	}, &agenttemplate.Template{
-		Ref: "builtin/oversized@1", Name: "oversized", SystemPrompt: strings.Repeat("策", 22<<10),
+		Ref: "builtin/oversized@1", Name: "oversized", SystemPrompt: strings.Repeat("策", 1_100_000),
 	})
 	if err == nil || !strings.Contains(err.Error(), "L1/L2 runtime contract") ||
 		!strings.Contains(err.Error(), "fragment_limit_exceeded") {

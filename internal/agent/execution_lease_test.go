@@ -254,6 +254,26 @@ func TestComputeExecutionLease_AcceptanceRejectsBusinessToolOutsideClosedSet(t *
 	}
 }
 
+func TestComputeExecutionLease_SyntheticAcceptanceIntersectsRoleClosedSet(t *testing.T) {
+	s, _, _ := setup()
+	ag, _, _ := newLeaseAgent("verifier", "acceptance.verify", s,
+		"read_file", "run_shell", "record_observation_delta", "submit_task_result")
+	lease, rejection := ag.computeExecutionLease(&model.Task{
+		ID: "t-synthetic-acceptance", EventType: "acceptance.verify", GraphID: "g1", GraphNodeKind: "acceptance",
+	})
+	if rejection != "" || lease == nil {
+		t.Fatalf("synthetic acceptance 应先应用角色闭集: lease=%+v rejection=%q", lease, rejection)
+	}
+	for _, forbidden := range []string{"run_shell", "record_observation_delta"} {
+		if slices.Contains(lease.ToolUnion(), forbidden) {
+			t.Fatalf("synthetic acceptance 不得获得 %s: %+v", forbidden, lease)
+		}
+	}
+	if !slices.Contains(lease.ToolUnion(), "read_file") || !slices.Contains(lease.ToolUnion(), "submit_task_result") {
+		t.Fatalf("synthetic acceptance 丢失合法只读/提交能力: %+v", lease)
+	}
+}
+
 func TestAcquireExecutionLease_RejectsLegacyGraphControlEscalation(t *testing.T) {
 	s, _, _ := setup()
 	ag, _, _ := newLeaseAgent("verifier", "verify.custom", s,
@@ -628,7 +648,7 @@ func TestLoopRecoveryControllerLeaseUsesTransactionalGraphControlOnly(t *testing
 		GraphDefinitionDigestVersion: "agentgo.graph-authoring-definition-digest/v1",
 	}
 	got := deriveControlTools(task)
-	want := "commit_graph_change,get_task_result,propose_graph_change,read_content_ref,read_graph,read_graph_change,submit_task_result,validate_graph_change"
+	want := "commit_graph_change,get_task_result,propose_graph_change,read_content_ref,read_graph,read_graph_change,submit_recovery_decision,validate_graph_change"
 	if strings.Join(got, ",") != want {
 		t.Fatalf("loop_recovery controller 控制面=%v，want %s", got, want)
 	}
