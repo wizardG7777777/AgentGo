@@ -86,6 +86,7 @@ AgentGo 同等支持 Windows / macOS / Linux。以下每一条都曾在生产坏
 - **终端输入无跨 shell 的统一「提交」语义**。TUI 用 Bubble Tea `textarea`（Enter 提交，Ctrl+J 换行）；粘贴按平台分两条正式投递路径——macOS/Linux 终端以 bracketed paste 事件投递，Windows ConPTY 不透传 bracketed paste，以高速 `KeyRunes + Enter` 流投递，必须经 `internal/tui/paste_burst.go` 状态机重组（这是 Windows 的正式粘贴路径，禁止回退为固定 Enter 防抖）。任何新输入通路（Interaction、session 选择等）必须建在 Bubble Tea MVU 模型内，不用裸模式。Interaction 动作不得绑裸字母/数字键。
 - **Windows NTFS 上 fsync 频率更敏感**。append 密集的 JSONL 日志保持「每次 append  flush+sync」，但绝不在已经过一次 fsync 的路径里加第二次。
 - **SWE Harness 进程监控必须持有 `subprocess.Popen` 并用 `poll()` 查询生命周期**。禁止用 `os.kill(pid, 0)` 模拟 POSIX 存活探测；当前 Windows Python 会对不存在 PID 抛 `WinError 87`，并可能破坏仍在运行的被监控进程。批次 result/judge 新鲜度必须与 `.batch_start` marker 使用同一文件系统 mtime 权威，禁止拿独立 `time.time()` 与 NTFS mtime 做零容差边界比较。
+- **SWE Harness 渲染 v4 YAML 时，`Path` 占位符必须先归一为 forward slash**。Windows `project_root` 与 `agents[*].system_prompt_file` 同受配置红线约束；只转换 `Path` 类型，禁止顺手改写 URL、model、token 等普通字符串。
 - **新增 CI 时应同时跑 `ubuntu-latest` 与 `windows-latest`**——上述故障在 POSIX 上几乎全是静默的。
 
 ## 运行时文件访问边界（早期阶段，有意为之）

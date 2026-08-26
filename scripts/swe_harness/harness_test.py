@@ -399,6 +399,26 @@ class HarnessContractTest(unittest.TestCase):
             self.assertNotRegex(content, r"__[A-Z0-9_]+__")
             self.assertIn('model: "model-\\"quoted"', content)
             self.assertIn("port: 8123", content)
+            root_value = str(root).replace("\\", "/")
+            worktree_value = str(root / "worktree").replace("\\", "/")
+            self.assertIn(f'root: "{worktree_value}"', content)
+            self.assertIn(f'agentgo: "{root_value}"', content)
+            self.assertNotIn("\\", next(
+                line for line in content.splitlines() if line.startswith("root:")
+            ))
+            self.assertNotIn("\\", next(
+                line for line in content.splitlines() if line.startswith("agentgo:")
+            ))
+
+    def test_yaml_template_value_normalizes_only_path_values(self):
+        self.assertEqual(
+            harness.yaml_template_value(Path(r"C:\Users\tester\AgentGo")),
+            "C:/Users/tester/AgentGo",
+        )
+        self.assertEqual(
+            harness.yaml_template_value(r"literal\value"),
+            r"literal\\value",
+        )
 
     def test_batch_exit_code_fails_when_any_gate_is_not_satisfied(self):
         good = {"stale": False, "architecture_ok": True, "task_resolved": True}

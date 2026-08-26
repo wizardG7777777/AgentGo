@@ -1454,7 +1454,9 @@ def prepare_task(config: HarnessConfig, task: TaskSpec) -> dict:
 
 
 def yaml_template_value(value: str | Path) -> str:
-    raw = str(value)
+    # v4 配置路径跨平台统一使用 forward slash；只归一 Path，避免误改 URL、
+    # model、token 等普通字符串中的反斜杠语义。
+    raw = value.as_posix().replace("\\", "/") if isinstance(value, Path) else str(value)
     if "\n" in raw or "\r" in raw:
         raise ValueError("SWE 配置值不得包含换行")
     return raw.replace("\\", "\\\\").replace('"', '\\"')
