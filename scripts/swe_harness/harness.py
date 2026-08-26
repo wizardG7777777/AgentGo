@@ -2,8 +2,8 @@
 """AgentGo SWE 系统回归的无第三方依赖 Python 权威入口。
 
 本文件统一处理考题准备、进程编排、运行契约、能力探针、终态判定、Judge 和脱敏
-指标。Flask 题目、worktree、原始日志和凭证始终留在外部 testbed；输出不得包含
-prompt、reasoning 或工具参数。
+指标。受版本控制的 Flask 题目清单与 prompt 位于仓库 suite；Flask 源仓库、worktree、
+原始日志和凭证始终留在外部 testbed。输出不得包含 prompt、reasoning 或工具参数。
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ import signal
 import socket
 import ssl
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -48,6 +49,7 @@ TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 EXIT_HARNESS_FAILURE = 1
 EXIT_ARCHITECTURE_FAILURE = 2
 EXIT_TASK_FAILURE = 3
+DEFAULT_SUITE_DIR = Path(__file__).resolve().parent / "suites" / "flask-8"
 
 
 class HarnessConfig:
@@ -70,7 +72,12 @@ class HarnessConfig:
     def from_env(cls) -> "HarnessConfig":
         repo_root = Path(__file__).resolve().parents[2]
         agentgo_root = Path(os.environ.get("SWE_AGENTGO_ROOT", repo_root)).resolve()
-        testbed = Path(os.environ.get("SWE_TESTBED", "/tmp/agentgo-swe")).resolve()
+        testbed_default = (
+            Path(tempfile.gettempdir()) / "agentgo-swe"
+            if os.name == "nt" else Path("/tmp/agentgo-swe")
+        )
+        testbed = Path(os.environ.get("SWE_TESTBED", testbed_default)).resolve()
+        suite_dir = Path(os.environ.get("SWE_SUITE_DIR", DEFAULT_SUITE_DIR)).resolve()
         binary_default = agentgo_root / ("agentgo.exe" if os.name == "nt" else "agentgo")
         protocol = os.environ.get("SWE_PROTOCOL", "responses")
         if protocol not in {"responses", "chat_completions"}:
@@ -80,11 +87,11 @@ class HarnessConfig:
             agentgo_bin=Path(os.environ.get("SWE_AGENTGO_BIN", binary_default)).resolve(),
             testbed=testbed,
             tasks_file=Path(os.environ.get(
-                "SWE_TASKS_FILE", testbed / "harness" / "tasks.csv")).resolve(),
+                "SWE_TASKS_FILE", suite_dir / "tasks.csv")).resolve(),
             prompt_dir=Path(os.environ.get(
-                "SWE_PROMPT_DIR", testbed / "harness" / "prompts")).resolve(),
+                "SWE_PROMPT_DIR", suite_dir / "prompts")).resolve(),
             flask_repo=Path(os.environ.get(
-                "SWE_FLASK_REPO", "/Users/yanchenyu/Documents/PythonProjects/flask")).resolve(),
+                "SWE_FLASK_REPO", testbed / "upstream" / "flask")).resolve(),
             base_url=os.environ.get("SWE_BASE_URL", "https://openrouter.ai/api/v1"),
             model=os.environ.get("SWE_MODEL", "openai/gpt-5.6-luna"),
             protocol=protocol,

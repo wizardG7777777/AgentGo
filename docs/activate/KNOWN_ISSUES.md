@@ -1,6 +1,6 @@
 # KNOWN_ISSUES — 当前限制与验证缺口
 
-最后核对：2026-08-24。
+最后核对：2026-08-27。
 
 ## 2026-08-23 五层架构修复的当前开放项
 
@@ -77,6 +77,12 @@ durable Store 和生产接线，并通过 full/race/vet/build、harness 单测�
   、[`DeepSeek Responses 精确重放事故`](../test-issues/2026-08-23-0500-deepseek-responses-exact-replay.md)、
   [`五层限制重组`](../test-issues/2026-08-24-0715-swe-layer-limit-recomposition.md)
   与 [`Observation thinking replay`](../test-issues/2026-08-24-0735-observation-thinking-replay.md)。
+- **SWE-057 实现完成、Windows 实机验证待回填**：八题 `tasks.csv` 与 prompt
+  曾只存在于 `/tmp` testbed，导致其他机器即使取得 runner 也无法运行同一回归
+  cohort。现 `flask-8` suite 已与 runner 一同版本化，冻结完整上游 SHA，并使用
+  跨平台测试命令与 testbed 默认路径；本地 runner 契约测试已通过。Windows 机器
+  取得提交后的实际八题运行结果仍需回填，但这不属于 AgentGo L1–L5 主链事故。
+  详见 [`SWE-057 版本化回归套件`](../test-issues/2026-08-27-0109-versioned-swe-suite.md)。
 
 统一状态与后续顺序见
 [`SWE 架构修复统一实施路线图`](../design/swe-architecture-repair-roadmap.md)。

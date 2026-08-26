@@ -1,0 +1,14 @@
+{
+  "schema": "agentgo.swe-suite/v1",
+  "suite_id": "flask-8",
+  "title": "AgentGo Flask SWE 8-task regression baseline",
+  "task_count": 8,
+  "task_manifest": "tasks.csv",
+  "prompt_directory": "prompts",
+  "upstream": {
+    "vcs": "git",
+    "repository": "https://github.com/pallets/flask.git"
+  },
+  "python_version": "3.13",
+  "test_command": "uv run --no-sync python -m pytest -q"
+}

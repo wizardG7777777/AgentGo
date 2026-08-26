@@ -107,6 +107,27 @@ class HarnessContractTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 harness.load_tasks(tasks)
 
+    def test_versioned_default_suite_is_complete_and_cross_platform(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            config = harness.HarnessConfig.from_env()
+        suite = Path(harness.__file__).resolve().parent / "suites" / "flask-8"
+        self.assertEqual(config.tasks_file, (suite / "tasks.csv").resolve())
+        self.assertEqual(config.prompt_dir, (suite / "prompts").resolve())
+        self.assertEqual(config.flask_repo, (config.testbed / "upstream" / "flask").resolve())
+
+        metadata = json.loads((suite / "suite.json").read_text(encoding="utf-8"))
+        tasks = harness.load_tasks(config.tasks_file)
+        self.assertEqual(metadata["schema"], "agentgo.swe-suite/v1")
+        self.assertEqual(metadata["task_count"], len(tasks))
+        self.assertEqual(len(tasks), 8)
+        for task in tasks:
+            self.assertEqual(len(task.fix_sha), 40)
+            prompt = config.prompt_dir / f"{task.task_id}.md"
+            self.assertTrue(prompt.is_file(), task.task_id)
+            content = prompt.read_text(encoding="utf-8")
+            self.assertIn("uv run --no-sync python -m pytest -q", content)
+            self.assertNotIn(".venv/bin/python", content)
+
     def test_phase_counter_keeps_call_outcomes_and_phase_errors_separate(self):
         counter = pytest_reporter.PhaseCounter()
         for report in (

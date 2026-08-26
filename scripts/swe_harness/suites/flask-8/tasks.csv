@@ -1,0 +1,9 @@
+task_id,fix_sha,test_files,title
+automatic-options,e82db2ca3a22c9614c1987392c9cfaa8c6ce99ad,"tests/test_basic.py tests/test_blueprints.py tests/test_cli.py tests/test_views.py",Per-view automatic OPTIONS override
+context-push-order,53b8f08218796d95764c5252bccd8a50a173a6fb,tests/test_testing.py,Redirect session context push order
+ipv6-server-name,7203feabf723edae0286ae5dc64fec8ac4c91735,tests/test_basic.py,IPv6 SERVER_NAME parsing
+ipv6-session-txn,de8429ffda8cfb54db175529e2bae72a24e1fa7e,tests/test_testing.py,IPv6 session transaction cookies
+pass-context-dispatch,6a64969009bf1898bd302e6a9633f71942523f7f,"tests/test_reqctx.py tests/test_subclassing.py",Pass AppContext through request dispatch
+secret-key-rotation,fb54159861708558b5f5658ebdc14709d984361c,tests/test_basic.py,Session secret key rotation order
+session-access-tracking,c17f379390731543eea33a570a47bd4ef76a54fa,tests/test_basic.py,Session access tracking
+teardown-callbacks,fbb6f0bc4c60a0bada0e03c3480d0ccf30a3c1df,"tests/test_appctx.py tests/test_basic.py tests/test_blueprints.py tests/test_helpers.py tests/test_testing.py",Run all teardown callbacks
