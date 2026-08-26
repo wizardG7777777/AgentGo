@@ -1,6 +1,6 @@
 # SWE-057：Flask 八题回归套件未随 runner 版本化
 
-状态：**实现完成；Windows 实机八题验证待回填**。
+状态：**实现完成；Windows runner/suite 验证完成，实机八题业务结果待回填**。
 
 ## 现象
 
@@ -38,8 +38,12 @@ Tool Lease、Loop 或 Graph 创建之前，属于外部 SWE 评测基础设施�
 
 ## 验证
 
-- `python3 -m unittest scripts/swe_harness/harness_test.py`：43 项通过；
+- macOS 上传前 `python3 -m unittest scripts/swe_harness/harness_test.py`：43 项通过；
+- Windows 合并后 `py -3.13 -X utf8 -m unittest scripts/swe_harness/harness_test.py`：
+  48 项通过；
 - 默认配置能够解析仓库内八题，并核对每题完整 SHA、对应 prompt 和跨平台命令；
+- Windows 本地完整 Flask 克隆为非 shallow 仓库，八个 manifest `fix_sha` 均能解析为
+  commit；
 - `git diff --check`：通过；
 - Windows 实机八题回归：待远端提交被另一台机器拉取后执行并回填。
 

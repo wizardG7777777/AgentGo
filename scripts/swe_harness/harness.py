@@ -25,7 +25,7 @@ import signal
 import socket
 import ssl
 import subprocess
-import tempfile
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -50,6 +50,45 @@ EXIT_HARNESS_FAILURE = 1
 EXIT_ARCHITECTURE_FAILURE = 2
 EXIT_TASK_FAILURE = 3
 DEFAULT_SUITE_DIR = Path(__file__).resolve().parent / "suites" / "flask-8"
+REQUIRED_ENV_VARS = (
+    "SWE_API_KEY",
+    "SWE_BASE_URL",
+    "SWE_MODEL",
+)
+
+
+def required_environment_values() -> dict[str, str]:
+    """聚合校验 SWE 启动环境；只报告变量名，绝不回显变量值。"""
+    missing = [
+        name for name in REQUIRED_ENV_VARS
+        if not (os.environ.get(name) or "").strip()
+    ]
+    if missing:
+        rendered = "\n".join(f"- {name}" for name in missing)
+        raise RuntimeError(
+            "SWE 启动环境不完整，以下环境变量未设置或值为空：\n" + rendered
+        )
+    return {name: os.environ[name].strip() for name in REQUIRED_ENV_VARS}
+
+
+def default_swe_testbed(*, environ=None, platform_name: str | None = None,
+                        home: str | Path | None = None) -> Path:
+    """按平台标准用户数据目录推导持久化 SWE testbed，不硬编码用户名。"""
+    source = os.environ if environ is None else environ
+    platform_name = platform_name or sys.platform
+    if platform_name == "win32":
+        local_app_data = (source.get("LOCALAPPDATA") or "").strip()
+        if local_app_data:
+            return (Path(local_app_data) / "AgentGo" / "swe").resolve()
+        user_profile = (source.get("USERPROFILE") or "").strip()
+        user_home = Path(user_profile) if user_profile else Path(home or Path.home())
+        return (user_home / "AppData" / "Local" / "AgentGo" / "swe").resolve()
+    user_home = Path(home or Path.home())
+    if platform_name == "darwin":
+        return (user_home / "Library" / "Application Support" / "AgentGo" / "swe").resolve()
+    xdg_data_home = (source.get("XDG_DATA_HOME") or "").strip()
+    data_home = Path(xdg_data_home) if xdg_data_home else user_home / ".local" / "share"
+    return (data_home / "agentgo" / "swe").resolve()
 
 
 class HarnessConfig:
@@ -70,30 +109,42 @@ class HarnessConfig:
 
     @classmethod
     def from_env(cls) -> "HarnessConfig":
+        values = required_environment_values()
         repo_root = Path(__file__).resolve().parents[2]
-        agentgo_root = Path(os.environ.get("SWE_AGENTGO_ROOT", repo_root)).resolve()
-        testbed_default = (
-            Path(tempfile.gettempdir()) / "agentgo-swe"
-            if os.name == "nt" else Path("/tmp/agentgo-swe")
-        )
-        testbed = Path(os.environ.get("SWE_TESTBED", testbed_default)).resolve()
-        suite_dir = Path(os.environ.get("SWE_SUITE_DIR", DEFAULT_SUITE_DIR)).resolve()
+        agentgo_root = Path(
+            (os.environ.get("SWE_AGENTGO_ROOT") or "").strip() or repo_root
+        ).resolve()
+        testbed = Path(
+            (os.environ.get("SWE_TESTBED") or "").strip()
+            or default_swe_testbed()
+        ).resolve()
+        suite_dir = Path(
+            (os.environ.get("SWE_SUITE_DIR") or "").strip() or DEFAULT_SUITE_DIR
+        ).resolve()
         binary_default = agentgo_root / ("agentgo.exe" if os.name == "nt" else "agentgo")
-        protocol = os.environ.get("SWE_PROTOCOL", "responses")
+        protocol = (os.environ.get("SWE_PROTOCOL") or "").strip() or "responses"
         if protocol not in {"responses", "chat_completions"}:
             raise ValueError(f"未知 SWE_PROTOCOL={protocol!r}")
         return cls(
             agentgo_root=agentgo_root,
-            agentgo_bin=Path(os.environ.get("SWE_AGENTGO_BIN", binary_default)).resolve(),
+            agentgo_bin=Path(
+                (os.environ.get("SWE_AGENTGO_BIN") or "").strip() or binary_default
+            ).resolve(),
             testbed=testbed,
-            tasks_file=Path(os.environ.get(
-                "SWE_TASKS_FILE", suite_dir / "tasks.csv")).resolve(),
-            prompt_dir=Path(os.environ.get(
-                "SWE_PROMPT_DIR", suite_dir / "prompts")).resolve(),
-            flask_repo=Path(os.environ.get(
-                "SWE_FLASK_REPO", testbed / "upstream" / "flask")).resolve(),
-            base_url=os.environ.get("SWE_BASE_URL", "https://openrouter.ai/api/v1"),
-            model=os.environ.get("SWE_MODEL", "openai/gpt-5.6-luna"),
+            tasks_file=Path(
+                (os.environ.get("SWE_TASKS_FILE") or "").strip()
+                or suite_dir / "tasks.csv"
+            ).resolve(),
+            prompt_dir=Path(
+                (os.environ.get("SWE_PROMPT_DIR") or "").strip()
+                or suite_dir / "prompts"
+            ).resolve(),
+            flask_repo=Path(
+                (os.environ.get("SWE_FLASK_REPO") or "").strip()
+                or testbed / "upstream" / "flask"
+            ).resolve(),
+            base_url=values["SWE_BASE_URL"],
+            model=values["SWE_MODEL"],
             protocol=protocol,
         )
 
@@ -200,6 +251,15 @@ def atomic_json(path: str | Path, value: object) -> None:
     temp = target.with_name(target.name + ".tmp")
     temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(temp, target)
+
+
+def record_batch_start(runs_dir: str | Path) -> float:
+    """以 marker 的文件系统时间作为批次新鲜度边界，避免跨时钟精度竞态。"""
+    root = Path(runs_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    marker = root / ".batch_start"
+    marker.write_text(str(time.time()) + "\n", encoding="utf-8")
+    return marker.stat().st_mtime
 
 
 def read_json(path: str | Path, default: object | None = None):
@@ -477,17 +537,7 @@ def project_snapshot(snapshot: dict, run_id: str) -> dict:
     }
 
 
-def process_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-
-
-def monitor_run(base_url: str, token: str, pid: int, run_id: str, started_at: float,
+def monitor_run(base_url: str, token: str, process: subprocess.Popen, run_id: str, started_at: float,
                 timeout_sec: int, snapshot_path: str, poll_sec: int = 3,
                 terminal_grace_sec: int = 30) -> dict:
     candidate = ""
@@ -497,7 +547,9 @@ def monitor_run(base_url: str, token: str, pid: int, run_id: str, started_at: fl
     identity_projection_seen = False
     while True:
         elapsed = max(0, int(time.time() - started_at))
-        if not process_alive(pid):
+        # Popen.poll 是跨平台的进程句柄查询；Windows 上不得用 os.kill(pid, 0)
+        # 模拟 POSIX signal 0，否则可能终止被监控进程或抛出 WinError 87。
+        if process.poll() is not None:
             terminal = "process_exited"
             break
         if elapsed >= timeout_sec:
@@ -1588,7 +1640,7 @@ def run_task(config: HarnessConfig, task: TaskSpec, timeout_sec: int) -> dict:
                 "inject": 200, "run_id": contract["run_id"],
             }, ensure_ascii=False))
             monitor = monitor_run(
-                base_url, token, process.pid, contract["run_id"], started_at, timeout_sec,
+                base_url, token, process, contract["run_id"], started_at, timeout_sec,
                 str(run_dir / "snapshot.final.json"), poll_sec=3, terminal_grace_sec=30,
             )
             atomic_json(run_dir / "monitor.json", monitor)
@@ -1789,7 +1841,7 @@ def print_summary(rows: list[dict]) -> None:
 
 
 def require_api_key() -> str:
-    value = os.environ.get("SWE_API_KEY")
+    value = (os.environ.get("SWE_API_KEY") or "").strip()
     if not value:
         raise RuntimeError("密钥环境变量 SWE_API_KEY 未设置")
     return value
@@ -1899,10 +1951,8 @@ def command_batch(args: argparse.Namespace) -> int:
     config = HarnessConfig.from_env()
     tasks = load_tasks(config.tasks_file)
     preflight_probe(config, args.probe_timeout)
-    batch_start = time.time()
     runs_dir = config.testbed / "runs"
-    runs_dir.mkdir(parents=True, exist_ok=True)
-    (runs_dir / ".batch_start").write_text(str(batch_start) + "\n", encoding="utf-8")
+    batch_start = record_batch_start(runs_dir)
     # 新批次开始即清空旧 summary authority；逐题历史文件仍保留，但只有
     # mtime >= batch_start 的 result/judge 才能进入本轮投影。
     atomic_json(runs_dir / "summary.json", [])

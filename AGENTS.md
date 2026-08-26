@@ -31,6 +31,8 @@ go test -run TestName ./internal/agent/   # 单个测试
 
 任务级 trace 调试入口：`./agentgo trace list / show / stats / graph / node`（不启动主系统），文件位置与事件字段详见 `TraceGuide.md`。无 Makefile / linter，只用标准 Go 工具链；测试假定 LF 行尾（`.gitattributes` 强制）。
 
+SWE Harness 的 `probe` / `task` / `batch` / `verify-candidates` 启动前必须通过 provider 环境契约：`SWE_API_KEY`、`SWE_BASE_URL`、`SWE_MODEL` 共 3 项均非空。入口必须在任何网络、文件系统副作用或子进程启动前一次性报告全部缺项并 fail-closed；正式八题 manifest/prompt 位于受版本控制的 `scripts/swe_harness/suites/flask-8`，`SWE_SUITE_DIR` 与各路径变量只作可选覆盖。testbed 默认从 Windows `%LOCALAPPDATA%`（回退 `%USERPROFILE%`）、macOS 用户 Application Support 或 Linux `$XDG_DATA_HOME`（回退 `~/.local/share`）动态拼装，禁止硬编码用户名，完整说明见 `scripts/swe_harness/README.md`。
+
 ## 改代码前必知
 
 - 接口驱动、无全局状态：依赖全部经 `runner.RunnerDeps` 或 `scheduler.New` 注入。
@@ -83,6 +85,7 @@ AgentGo 同等支持 Windows / macOS / Linux。以下每一条都曾在生产坏
 - **行尾 LF，`.gitattributes` 强制**。不要对字面 `"\r\n"` 做比较；解析可能带 CRLF 的输入时在边界处 `strings.ReplaceAll(s, "\r\n", "\n")` 归一。
 - **终端输入无跨 shell 的统一「提交」语义**。TUI 用 Bubble Tea `textarea`（Enter 提交，Ctrl+J 换行）；粘贴按平台分两条正式投递路径——macOS/Linux 终端以 bracketed paste 事件投递，Windows ConPTY 不透传 bracketed paste，以高速 `KeyRunes + Enter` 流投递，必须经 `internal/tui/paste_burst.go` 状态机重组（这是 Windows 的正式粘贴路径，禁止回退为固定 Enter 防抖）。任何新输入通路（Interaction、session 选择等）必须建在 Bubble Tea MVU 模型内，不用裸模式。Interaction 动作不得绑裸字母/数字键。
 - **Windows NTFS 上 fsync 频率更敏感**。append 密集的 JSONL 日志保持「每次 append  flush+sync」，但绝不在已经过一次 fsync 的路径里加第二次。
+- **SWE Harness 进程监控必须持有 `subprocess.Popen` 并用 `poll()` 查询生命周期**。禁止用 `os.kill(pid, 0)` 模拟 POSIX 存活探测；当前 Windows Python 会对不存在 PID 抛 `WinError 87`，并可能破坏仍在运行的被监控进程。批次 result/judge 新鲜度必须与 `.batch_start` marker 使用同一文件系统 mtime 权威，禁止拿独立 `time.time()` 与 NTFS mtime 做零容差边界比较。
 - **新增 CI 时应同时跑 `ubuntu-latest` 与 `windows-latest`**——上述故障在 POSIX 上几乎全是静默的。
 
 ## 运行时文件访问边界（早期阶段，有意为之）

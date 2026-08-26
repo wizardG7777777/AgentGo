@@ -6,17 +6,38 @@
 和 `suite.json` 与 runner 一同受版本控制。testbed 只保存 Flask 源仓库、隔离
 worktree 与原始运行产物，不保存密钥。
 
-环境变量：
+## 启动必要条件
 
-- `SWE_API_KEY`：外部 provider 密钥，仅进程环境读取（固定变量名）；
-- `SWE_BASE_URL` / `SWE_MODEL` / `SWE_PROTOCOL`：统一 provider/model/协议；
-- `SWE_TESTBED`：POSIX 默认 `/tmp/agentgo-swe`，Windows 默认
-  `%TEMP%\\agentgo-swe`；
+Harness 使用 fail-closed 的 provider 环境契约。以下 3 个环境变量必填；任一变量
+未设置或仅含空白时，CLI 会在网络请求、目录创建、worktree 清理和子进程启动前
+一次性报告全部缺项并退出：
+
+- `SWE_API_KEY`：外部 provider 密钥，仅从进程环境读取，诊断不得回显值；
+- `SWE_BASE_URL`：OpenAI-compatible provider 基础 URL；
+- `SWE_MODEL`：所有 SWE 角色统一使用的模型名。
+
+其余变量都是可选覆盖项；未设置或为空时使用跨平台派生值：
+
+- `SWE_PROTOCOL`：默认 `responses`；仅显式兼容旧端点时设为 `chat_completions`；
+- `SWE_AGENTGO_ROOT`：默认从 `harness.py` 位置推导当前 AgentGo 仓库根；
+- `SWE_AGENTGO_BIN`：默认 `<SWE_AGENTGO_ROOT>/agentgo.exe`（Windows）或
+  `<SWE_AGENTGO_ROOT>/agentgo`（macOS/Linux）；
+- `SWE_TESTBED`：默认使用当前用户的标准数据目录——Windows 为
+  `%LOCALAPPDATA%\AgentGo\swe`（缺失时从 `%USERPROFILE%` 拼装），macOS 为
+  `~/Library/Application Support/AgentGo/swe`，Linux 为
+  `${XDG_DATA_HOME:-~/.local/share}/agentgo/swe`；
 - `SWE_SUITE_DIR`：默认仓库内 `scripts/swe_harness/suites/flask-8`；
-- `SWE_TASKS_FILE` / `SWE_PROMPT_DIR`：仅在运行自定义 suite 时覆盖默认清单与 prompt；
-- `SWE_FLASK_REPO`：Flask 完整本地 Git 仓库，默认
-  `<SWE_TESTBED>/upstream/flask`；
-- `SWE_AGENTGO_ROOT` / `SWE_AGENTGO_BIN`：AgentGo 仓库根与二进制位置（默认取仓库内构建产物）。
+- `SWE_TASKS_FILE`：默认 `<SWE_SUITE_DIR>/tasks.csv`；
+- `SWE_PROMPT_DIR`：默认 `<SWE_SUITE_DIR>/prompts`；
+- `SWE_FLASK_REPO`：默认 `<SWE_TESTBED>/upstream/flask`。
+
+正式八题的 manifest 与 prompt 已随仓库提供，不需要从外部 testbed 复制。执行
+`task` / `batch` / `verify-candidates` 前仍须准备包含目标 fix commit 的完整 Flask
+Git 仓库；仓库位于其他位置时设置 `SWE_FLASK_REPO` 即可。
+
+`AGENTGO_SWE_PYTEST_REPORT` 与 `PYTHONPATH` 是 Harness 在 pytest 阶段自行注入的内部
+变量，不属于用户启动契约。除必填 provider 环境外，机器还必须提供 Git、uv、Python 3.13、
+可执行的 AgentGo 二进制、可读的题目/prompt/Flask 数据以及可访问的 provider。
 
 生成配置使用 Context v9 默认能力档案（1M context / 64K completion）与
 `swe/v3` Run profile；model/tool/token/cost 全量记账但不作为默认经验硬停止条件，
@@ -40,19 +61,21 @@ provider/model 名称分支，其余业务推理仍走 thinking。
 仓库根目录构建当前二进制；POSIX 使用 `go build -o agentgo .`，Windows 使用
 `go build -o agentgo.exe .`。
 
-首次运行前准备 Flask 上游仓库。macOS / Linux：
+首次运行前准备 Flask 上游仓库。仓库位于默认 testbed 之外时，通过可选变量显式
+指向它。macOS / Linux 示例：
 
 ```console
-mkdir -p /tmp/agentgo-swe/upstream
-git clone https://github.com/pallets/flask.git /tmp/agentgo-swe/upstream/flask
+git clone https://github.com/pallets/flask.git "$HOME/src/flask"
+export SWE_FLASK_REPO="$HOME/src/flask"
 ```
 
 Windows PowerShell：
 
 ```powershell
-$testbed = Join-Path $env:TEMP "agentgo-swe"
-New-Item -ItemType Directory -Force (Join-Path $testbed "upstream") | Out-Null
-git clone https://github.com/pallets/flask.git (Join-Path $testbed "upstream/flask")
+$flaskRepo = Join-Path $env:LOCALAPPDATA "AgentGo\swe\upstream\flask"
+New-Item -ItemType Directory -Force (Split-Path -Parent $flaskRepo) | Out-Null
+git clone https://github.com/pallets/flask.git $flaskRepo
+$env:SWE_FLASK_REPO = $flaskRepo
 ```
 
 题目 prompt 使用跨平台的 `uv run --no-sync python -m pytest -q`。runner 会先用
@@ -65,11 +88,10 @@ git clone https://github.com/pallets/flask.git (Join-Path $testbed "upstream/fla
 python3 scripts/swe_harness/harness.py task automatic-options --timeout 1200
 ```
 
-Windows PowerShell 使用同一 Python 入口（若本机只提供 Python Launcher，可把
-`python` 换成 `py -3`）：
+Windows PowerShell 使用 Python Launcher：
 
 ```powershell
-python scripts/swe_harness/harness.py task automatic-options --timeout 1200
+py -3.13 -X utf8 scripts/swe_harness/harness.py task automatic-options --timeout 1200
 ```
 
 执行 `tasks.csv` 中的完整批次：
@@ -81,13 +103,19 @@ python3 scripts/swe_harness/harness.py batch --timeout 1200
 Windows PowerShell：
 
 ```powershell
-python scripts/swe_harness/harness.py batch --timeout 1200
+py -3.13 -X utf8 scripts/swe_harness/harness.py batch --timeout 1200
 ```
 
 独立运行能力探针：
 
 ```console
 python3 scripts/swe_harness/harness.py probe
+```
+
+Windows PowerShell：
+
+```powershell
+py -3.13 -X utf8 scripts/swe_harness/harness.py probe
 ```
 
 `prepare`、`run`、`judge` 是 `task` / `batch` 内部的固定阶段，不提供独立 CLI
@@ -127,10 +155,22 @@ JUnit 继续保存 traceback 和测试名，但不再用 `tests - failures - err
 python3 scripts/swe_harness/harness.py verify-candidates
 ```
 
+Windows PowerShell：
+
+```powershell
+py -3.13 -X utf8 scripts/swe_harness/harness.py verify-candidates
+```
+
 运行 harness 单元测试：
 
 ```console
 python3 -m unittest scripts/swe_harness/harness_test.py
+```
+
+Windows PowerShell：
+
+```powershell
+py -3.13 -X utf8 -m unittest scripts/swe_harness/harness_test.py
 ```
 
 `result.json` 使用 `agentgo.swe-result/v2`，分别报告 `architecture_ok` 与

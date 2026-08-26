@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
@@ -47,6 +48,120 @@ def pytest_payload(**overrides):
 
 
 class HarnessContractTest(unittest.TestCase):
+    def test_required_environment_reports_every_missing_or_blank_name_without_values(self):
+        environment = {
+            name: f"value-for-{name.lower()}"
+            for name in harness.REQUIRED_ENV_VARS
+        }
+        environment["SWE_API_KEY"] = "secret-that-must-not-be-rendered"
+        environment["SWE_MODEL"] = " \t"
+        del environment["SWE_BASE_URL"]
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(RuntimeError) as raised:
+                harness.required_environment_values()
+        message = str(raised.exception)
+        self.assertIn("SWE_MODEL", message)
+        self.assertIn("SWE_BASE_URL", message)
+        self.assertNotIn("SWE_API_KEY", message)
+        self.assertNotIn("secret-that-must-not-be-rendered", message)
+
+    def test_required_environment_reports_all_names_when_environment_is_empty(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(RuntimeError) as raised:
+                harness.required_environment_values()
+        message = str(raised.exception)
+        for name in harness.REQUIRED_ENV_VARS:
+            self.assertIn(f"- {name}", message)
+
+    def test_config_requires_explicit_environment_and_trims_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = {
+                "SWE_API_KEY": " secret ",
+                "SWE_BASE_URL": " https://provider.invalid/v1 ",
+                "SWE_MODEL": " model-name ",
+                "SWE_PROTOCOL": " responses ",
+                "SWE_TESTBED": f" {root / 'testbed'} ",
+                "SWE_TASKS_FILE": f" {root / 'tasks.csv'} ",
+                "SWE_PROMPT_DIR": f" {root / 'prompts'} ",
+                "SWE_FLASK_REPO": f" {root / 'flask'} ",
+                "SWE_AGENTGO_ROOT": f" {root / 'agentgo'} ",
+                "SWE_AGENTGO_BIN": f" {root / 'agentgo.exe'} ",
+            }
+            with mock.patch.dict(os.environ, environment, clear=True):
+                config = harness.HarnessConfig.from_env()
+            self.assertEqual(config.base_url, "https://provider.invalid/v1")
+            self.assertEqual(config.model, "model-name")
+            self.assertEqual(config.protocol, "responses")
+            self.assertEqual(config.testbed, (root / "testbed").resolve())
+            self.assertEqual(config.flask_repo, (root / "flask").resolve())
+            self.assertEqual(config.agentgo_bin, (root / "agentgo.exe").resolve())
+
+    def test_default_testbed_uses_platform_user_data_locations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            windows = harness.default_swe_testbed(
+                environ={"LOCALAPPDATA": str(root)}, platform_name="win32", home=root / "home",
+            )
+            windows_fallback = harness.default_swe_testbed(
+                environ={"USERPROFILE": str(root / "profile")},
+                platform_name="win32", home=root / "home",
+            )
+            macos = harness.default_swe_testbed(
+                environ={}, platform_name="darwin", home=root / "home",
+            )
+            linux_xdg = harness.default_swe_testbed(
+                environ={"XDG_DATA_HOME": str(root / "xdg")},
+                platform_name="linux", home=root / "home",
+            )
+            linux_fallback = harness.default_swe_testbed(
+                environ={}, platform_name="linux", home=root / "home",
+            )
+        self.assertEqual(windows, (root / "AgentGo" / "swe").resolve())
+        self.assertEqual(
+            windows_fallback,
+            (root / "profile" / "AppData" / "Local" / "AgentGo" / "swe").resolve(),
+        )
+        self.assertEqual(
+            macos,
+            (root / "home" / "Library" / "Application Support" / "AgentGo" / "swe").resolve(),
+        )
+        self.assertEqual(linux_xdg, (root / "xdg" / "agentgo" / "swe").resolve())
+        self.assertEqual(
+            linux_fallback,
+            (root / "home" / ".local" / "share" / "agentgo" / "swe").resolve(),
+        )
+
+    def test_config_derives_optional_values_from_repo_and_user_data(self):
+        environment = {
+            "SWE_API_KEY": "secret",
+            "SWE_BASE_URL": "https://provider.invalid/v1",
+            "SWE_MODEL": "model-name",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            if sys.platform == "win32":
+                environment["LOCALAPPDATA"] = directory
+                expected_testbed = root / "AgentGo" / "swe"
+            elif sys.platform == "darwin":
+                expected_testbed = root / "Library" / "Application Support" / "AgentGo" / "swe"
+            else:
+                environment["XDG_DATA_HOME"] = directory
+                expected_testbed = root / "agentgo" / "swe"
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(harness.Path, "home", return_value=root):
+                config = harness.HarnessConfig.from_env()
+        repo_root = Path(harness.__file__).resolve().parents[2]
+        testbed = expected_testbed.resolve()
+        binary_name = "agentgo.exe" if os.name == "nt" else "agentgo"
+        self.assertEqual(config.protocol, "responses")
+        self.assertEqual(config.agentgo_root, repo_root)
+        self.assertEqual(config.agentgo_bin, repo_root / binary_name)
+        self.assertEqual(config.testbed, testbed)
+        self.assertEqual(config.tasks_file, harness.DEFAULT_SUITE_DIR / "tasks.csv")
+        self.assertEqual(config.prompt_dir, harness.DEFAULT_SUITE_DIR / "prompts")
+        self.assertEqual(config.flask_repo, testbed / "upstream" / "flask")
+
     def test_pytest_output_has_stage_scope_objective_and_structured_counts(self):
         result = {
             "tests": 133,
@@ -108,8 +223,20 @@ class HarnessContractTest(unittest.TestCase):
                 harness.load_tasks(tasks)
 
     def test_versioned_default_suite_is_complete_and_cross_platform(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            config = harness.HarnessConfig.from_env()
+        environment = {
+            "SWE_API_KEY": "secret",
+            "SWE_BASE_URL": "https://provider.invalid/v1",
+            "SWE_MODEL": "model-name",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            if sys.platform == "win32":
+                environment["LOCALAPPDATA"] = directory
+            elif sys.platform != "darwin":
+                environment["XDG_DATA_HOME"] = directory
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(harness.Path, "home", return_value=root):
+                config = harness.HarnessConfig.from_env()
         suite = Path(harness.__file__).resolve().parent / "suites" / "flask-8"
         self.assertEqual(config.tasks_file, (suite / "tasks.csv").resolve())
         self.assertEqual(config.prompt_dir, (suite / "prompts").resolve())
@@ -324,7 +451,7 @@ class HarnessContractTest(unittest.TestCase):
                 harness.TaskSpec("infra", "b" * 40, (), "infra"),
                 harness.TaskSpec("later", "c" * 40, (), "later"),
             ]
-            batch_start = time.time()
+            batch_start = harness.record_batch_start(runs)
             done = runs / "done"
             done.mkdir()
             harness.atomic_json(done / "result.json", {
@@ -645,13 +772,32 @@ class HarnessContractTest(unittest.TestCase):
         self.assertEqual(harness.terminal_task_scope(tasks, []), tasks)
 
     def test_monitor_distinguishes_process_exit_and_hard_kill(self):
-        exited = harness.monitor_run("http://127.0.0.1:1", "token", 999_999_999, "run-1",
-                                     time.time(), 10, os.devnull, poll_sec=0, terminal_grace_sec=0)
+        exited_process = subprocess.Popen(
+            [sys.executable, "-c", "pass"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        exited_process.wait(timeout=10)
+        exited = harness.monitor_run(
+            "http://127.0.0.1:1", "token", exited_process, "run-1",
+            time.time(), 10, os.devnull, poll_sec=0, terminal_grace_sec=0,
+        )
         self.assertEqual(exited["process_terminal"], "process_exited")
-        killed = harness.monitor_run("http://127.0.0.1:1", "token", os.getpid(), "run-1",
-                                     time.time() - 2, 1, os.devnull, poll_sec=0, terminal_grace_sec=0)
-        self.assertEqual(killed["process_terminal"], "external_hard_kill")
-        self.assertTrue(killed["external_hard_kill"])
+
+        running_process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            killed = harness.monitor_run(
+                "http://127.0.0.1:1", "token", running_process, "run-1",
+                time.time() - 2, 1, os.devnull, poll_sec=0, terminal_grace_sec=0,
+            )
+            self.assertEqual(killed["process_terminal"], "external_hard_kill")
+            self.assertTrue(killed["external_hard_kill"])
+            self.assertIsNone(running_process.poll(), "监控探测不得终止仍在运行的子进程")
+        finally:
+            harness.terminate_process(running_process)
+        self.assertIsNotNone(running_process.poll())
 
     def test_monitor_graph_and_no_graph_terminals_do_not_use_quiet(self):
         graph_snapshot = {
@@ -662,10 +808,10 @@ class HarnessContractTest(unittest.TestCase):
             "graphs": [{"run_id": "run-1", "graph_id": "graph-1", "status": "completed", "outcome": "success"}],
             "pending_interactions": [],
         }
+        running_process = SimpleNamespace(poll=lambda: None)
         with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.object(harness, "process_alive", return_value=True), \
                 mock.patch.object(harness, "http_json", return_value=(200, graph_snapshot)):
-            result = harness.monitor_run("http://local", "token", 1, "run-1", time.time(), 10,
+            result = harness.monitor_run("http://local", "token", running_process, "run-1", time.time(), 10,
                                          str(Path(directory) / "snapshot.json"), poll_sec=0,
                                          terminal_grace_sec=0)
         self.assertEqual(result["process_terminal"], "graph_terminal")
@@ -678,9 +824,8 @@ class HarnessContractTest(unittest.TestCase):
             "pending_interactions": [],
         }
         with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.object(harness, "process_alive", return_value=True), \
                 mock.patch.object(harness, "http_json", return_value=(200, missing_final_report)):
-            result = harness.monitor_run("http://local", "token", 1, "run-1", time.time(), 10,
+            result = harness.monitor_run("http://local", "token", running_process, "run-1", time.time(), 10,
                                          str(Path(directory) / "snapshot.json"), poll_sec=0,
                                          terminal_grace_sec=0)
         self.assertEqual(result["process_terminal"], "graph_terminal_incomplete_final_report")
@@ -690,9 +835,8 @@ class HarnessContractTest(unittest.TestCase):
             "graphs": [], "pending_interactions": [],
         }
         with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.object(harness, "process_alive", return_value=True), \
                 mock.patch.object(harness, "http_json", return_value=(200, no_graph_snapshot)):
-            result = harness.monitor_run("http://local", "token", 1, "run-1", time.time(), 10,
+            result = harness.monitor_run("http://local", "token", running_process, "run-1", time.time(), 10,
                                          str(Path(directory) / "snapshot.json"), poll_sec=0,
                                          terminal_grace_sec=0)
         self.assertEqual(result["process_terminal"], "no_graph_terminal")
@@ -706,11 +850,11 @@ class HarnessContractTest(unittest.TestCase):
             ],
             "graphs": [], "pending_interactions": [],
         }
+        exiting_process = SimpleNamespace(poll=mock.Mock(side_effect=[None, 0]))
         with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.object(harness, "process_alive", side_effect=[True, False]), \
                 mock.patch.object(harness, "http_json", return_value=(200, snapshot)), \
                 mock.patch.object(harness.time, "sleep", return_value=None):
-            result = harness.monitor_run("http://local", "token", 1, "run-1", time.time(), 10,
+            result = harness.monitor_run("http://local", "token", exiting_process, "run-1", time.time(), 10,
                                          str(Path(directory) / "snapshot.json"), poll_sec=0,
                                          terminal_grace_sec=0)
         self.assertEqual(result["process_terminal"], "process_exited")

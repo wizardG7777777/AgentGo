@@ -4,13 +4,16 @@
 # 这是一个**模板**：__AGENTGO_ROOT__/__PROJECT_ROOT__/__PORT__/__TOKEN__/
 # __BASE_URL__/__MODEL__/__PROTOCOL__/__KEY_VAR__ 八个占位符由仓库内
 # `scripts/swe_harness/harness.py`
-# 在每次运行时渲染；`/tmp/agentgo-swe` 只保存题目数据和运行产物。
+# 在每次运行时渲染；正式题目清单与 prompt 位于仓库 suite，外部 `SWE_TESTBED`
+# 只保存 Flask 源仓库、隔离 worktree 和运行产物。
 #
-# 换模型供应商只需设四个环境变量（默认即 OpenRouter Responses + Luna）：
-#   SWE_BASE_URL   供应商的 OpenAI 兼容端点（默认 https://openrouter.ai/api/v1）
-#   SWE_MODEL      模型名，全角色统一（默认 openai/gpt-5.6-luna）
-#   SWE_PROTOCOL   responses（新主链）或 chat_completions（显式兼容）
+# 换模型供应商需显式设置下列三个环境变量；协议默认使用 responses，完整 Harness
+# 启动环境契约见
+# `scripts/swe_harness/README.md`：
+#   SWE_BASE_URL   供应商的 OpenAI 兼容端点
+#   SWE_MODEL      模型名，全角色统一
 #   SWE_API_KEY    注入密钥的环境变量（固定读取该变量名）
+# 可选 SWE_PROTOCOL 覆盖为 chat_completions 时才进入显式兼容链。
 # 本文件不落任何明文密钥。
 #
 # 评测纪律：
