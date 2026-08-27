@@ -1193,6 +1193,28 @@ class HarnessContractTest(unittest.TestCase):
             self.assertEqual(result["infrastructure_conditions"]["provider_quota_exhausted"], 1)
             self.assertNotIn("provider_quota_exhausted", result["known_incidents"])
 
+    def test_test_baseline_manifest_handles_crlf_changes_deletes_and_invalid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "tests").mkdir()
+            target = root / "tests" / "test_a.py"
+            target.write_bytes(b"line1\r\nline2\r\n")
+            files = ("tests/test_a.py", "tests/test_deleted.py")
+            manifest = harness.build_test_baseline_manifest(root, files)
+            self.assertEqual(harness.compare_test_baseline_manifest(root, files, manifest), [])
+            target.write_bytes(b"changed\r\n")
+            self.assertEqual(harness.compare_test_baseline_manifest(root, files, manifest), ["tests/test_a.py"])
+            target.unlink()
+            (root / "tests" / "test_deleted.py").mkdir()
+            self.assertEqual(set(harness.compare_test_baseline_manifest(root, files, manifest)),
+                             {"tests/test_a.py(被删除)", "tests/test_deleted.py(应已删除)"})
+            for bad in ({}, {"schema": "bad", "files": {}},
+                        {"schema": "agentgo.swe-test-baseline/v1", "files": {"x": {"exists": True}}},
+                        {"schema": "agentgo.swe-test-baseline/v1", "files": dict(manifest["files"], **{"tests/test_a.py": {"exists": True, "sha256": "bad"}})},
+                        {"schema": "agentgo.swe-test-baseline/v1", "files": dict(manifest["files"], **{"tests/test_deleted.py": {"exists": False, "sha256": "0"}})}):
+                with self.assertRaises(ValueError):
+                    harness.compare_test_baseline_manifest(root, files, bad)
+
 
 if __name__ == "__main__":
     unittest.main()

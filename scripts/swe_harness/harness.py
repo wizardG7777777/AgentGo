@@ -269,6 +269,43 @@ def read_json(path: str | Path, default: object | None = None):
         return {} if default is None else default
 
 
+def build_test_baseline_manifest(worktree: Path, test_files: tuple[str, ...]) -> dict:
+    files = {}
+    for name in test_files:
+        path = worktree / name
+        if path.is_file():
+            files[name] = {"exists": True, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        else:
+            files[name] = {"exists": False}
+    return {"schema": "agentgo.swe-test-baseline/v1", "files": files}
+
+
+def compare_test_baseline_manifest(worktree: Path, test_files: tuple[str, ...], manifest: object) -> list[str]:
+    if not isinstance(manifest, dict) or manifest.get("schema") != "agentgo.swe-test-baseline/v1":
+        raise ValueError("受保护测试基线 schema 无效")
+    files = manifest.get("files")
+    if not isinstance(files, dict) or set(files) != set(test_files):
+        raise ValueError("受保护测试基线文件集合不匹配")
+    changed = []
+    for name in test_files:
+        entry = files[name]
+        if not isinstance(entry, dict) or not isinstance(entry.get("exists"), bool):
+            raise ValueError(f"受保护测试基线条目无效: {name}")
+        if entry["exists"]:
+            digest = entry.get("sha256")
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError(f"受保护测试基线 sha256 无效: {name}")
+        elif "sha256" in entry:
+            raise ValueError(f"不存在文件不应携带 sha256: {name}")
+        path = worktree / name
+        exists = path.exists()
+        if exists != entry["exists"]:
+            changed.append(name + ("(被删除)" if entry["exists"] else "(应已删除)"))
+        elif exists and (not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != entry["sha256"]):
+            changed.append(name)
+    return changed
+
+
 def iter_jsonl(pattern: str):
     for path in sorted(glob.glob(pattern, recursive=True)):
         try:
@@ -1448,6 +1485,10 @@ def prepare_task(config: HarnessConfig, task: TaskSpec) -> dict:
     }
     report["note"] = "base 红态基线（agent 运行前全量 pytest）"
     atomic_json(run_dir / "baseline.json", report)
+    # Windows checkout 可能按 .gitattributes 产生 CRLF；保护基线必须记录
+    # 启动 Agent 前工作树的实际 raw bytes，不能拿 git-show 的 LF blob 比较。
+    atomic_json(run_dir / "test_baseline_manifest.json",
+                build_test_baseline_manifest(worktree, test_files_at_fix(config, task)))
     (run_dir / "fix_sha").write_text(task.fix_sha + "\n", encoding="utf-8")
     print(f"阶段结论：考题 {task.task_id} 红态准备完成，进入 AgentGo 修复执行")
     return report
@@ -1703,20 +1744,11 @@ def judge_task(config: HarnessConfig, task: TaskSpec) -> dict:
     verdict = "resolved" if pytest_green else "failed"
     test_files = test_files_at_fix(config, task)
     tampered_files: list[str] = []
-    for name in test_files:
-        expected = run_command([
-            "git", "-C", str(config.flask_repo), "cat-file", "-e", f"{task.fix_sha}:{name}",
-        ], check=False)
-        actual_path = worktree / name
-        if expected.returncode == 0:
-            expected_bytes = run_command([
-                "git", "-C", str(config.flask_repo), "show", f"{task.fix_sha}:{name}",
-            ]).stdout
-            actual_digest = hashlib.sha256(actual_path.read_bytes()).digest() if actual_path.is_file() else None
-            if actual_digest != hashlib.sha256(expected_bytes).digest():
-                tampered_files.append(name)
-        elif actual_path.exists():
-            tampered_files.append(name + "(应已删除)")
+    try:
+        tampered_files = compare_test_baseline_manifest(
+            worktree, test_files, read_json(run_dir / "test_baseline_manifest.json", None))
+    except ValueError as error:
+        raise HarnessInfrastructureError("test_baseline_manifest_invalid", "judge", str(error)) from error
     tampered = bool(tampered_files)
     if tampered:
         verdict = "test_tampered"

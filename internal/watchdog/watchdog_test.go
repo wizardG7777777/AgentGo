@@ -206,7 +206,10 @@ func TestWatchdog_OvertimeWarningRearmsOnRetry(t *testing.T) {
 	task := &model.Task{Description: "retry rearm", TimeoutSeconds: 1}
 	s.PublishTask(task)
 	s.ClaimTask("agent-1", task.ID)
-	setTaskTiming(t, s, task.ID, time.Time{}, time.Now().Add(-5*time.Second))
+	first, _ := s.GetTask(task.ID)
+	firstAttemptID := first.AttemptID
+	sharedStartedAt := time.Now().Add(-5 * time.Second)
+	setTaskTiming(t, s, task.ID, time.Time{}, sharedStartedAt)
 
 	inspectAll(w)
 	if alerts := watchdogAlerts(drainEvents(ch)); len(alerts) != 1 {
@@ -223,7 +226,11 @@ func TestWatchdog_OvertimeWarningRearmsOnRetry(t *testing.T) {
 	if got.Status != model.TaskStatusProcessing {
 		t.Fatalf("precondition: status = %s, want processing after re-claim", got.Status)
 	}
-	setTaskTiming(t, s, task.ID, time.Time{}, got.StartedAt.Add(-5*time.Second))
+	setTaskTiming(t, s, task.ID, time.Time{}, sharedStartedAt)
+	got, _ = s.GetTask(task.ID)
+	if got.AttemptID == "" || got.AttemptID == firstAttemptID {
+		t.Fatalf("重试后的 AttemptID 未变化: first=%q current=%q", firstAttemptID, got.AttemptID)
+	}
 
 	inspectAll(w)
 	alerts := watchdogAlerts(drainEvents(ch))

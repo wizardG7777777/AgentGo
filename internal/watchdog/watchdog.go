@@ -128,11 +128,10 @@ type Watchdog struct {
 	pendingMu           sync.Mutex
 	pendingObservations map[string]pendingObservation
 
-	// overtimeWarned 记录已发超时告警的 processing 任务（taskID → 该次执行
-	// 租约的 StartedAt）：同一租约只告警一次；任务重试换得新 StartedAt 后
-	// 自动重新武装。纯进程内状态，每次巡检按当前 processing 集合 prune。
+	// overtimeWarned 记录已发超时告警的 processing 任务及执行身份。优先用
+	// AttemptID，避免 Windows 时钟同 tick 时新租约与旧 StartedAt 相同。
 	overtimeMu     sync.Mutex
-	overtimeWarned map[string]time.Time
+	overtimeWarned map[string]overtimeIdentity
 
 	// progressObserved 对同一 Task/typed fault 保存最近一次事实指纹。Checkpoint
 	// 更新或 Attempt/deadline 变化后可重新报告，轮询本身不会刷屏。
@@ -140,6 +139,11 @@ type Watchdog struct {
 	progressObserved map[progressObservationKey]string
 
 	now func() time.Time
+}
+
+type overtimeIdentity struct {
+	AttemptID string
+	StartedAt time.Time
 }
 
 // New 构造 Watchdog。mbReg 为 nil 时 sendCrashReport 会静默跳过——保持向后兼容
@@ -257,7 +261,7 @@ func (w *Watchdog) checkLegacyExpectedDuration(task *model.Task) {
 	if task.ExpectedDuration > 0 && !task.StartedAt.IsZero() {
 		threshold := task.ExpectedDuration
 		elapsed := nonNegativeDuration(w.currentTime().Sub(task.StartedAt))
-		if elapsed > threshold && w.markProcessingOvertime(task.ID, task.StartedAt) {
+		if elapsed > threshold && w.markProcessingOvertime(task.ID, task.AttemptID, task.StartedAt) {
 			log.Printf("[watchdog] legacy task %s 超过 ExpectedDuration 告警 (elapsed: %v, 预期: %v)", task.ID, elapsed.Round(time.Second), threshold)
 			reason := fmt.Sprintf("processing_overtime: 任务已运行 %v，超过预期时长 %v；watchdog 不干预，请人工或上级代理检查",
 				elapsed.Round(time.Second), threshold)
@@ -679,24 +683,25 @@ func (w *Watchdog) clearPendingObservation(taskID string) {
 	w.pendingMu.Unlock()
 }
 
-// markProcessingOvertime 记录并报告该 (taskID, StartedAt) 执行租约是否首次
-// 触发超时告警：首次返回 true（调用方据此发告警），同租约重复巡检返回 false。
-func (w *Watchdog) markProcessingOvertime(taskID string, startedAt time.Time) bool {
+// markProcessingOvertime 按 AttemptID（旧快照才回退 StartedAt）记录并报告
+// 执行租约是否首次触发超时告警；同 Attempt 重复巡检返回 false。
+func (w *Watchdog) markProcessingOvertime(taskID, attemptID string, startedAt time.Time) bool {
 	w.overtimeMu.Lock()
 	defer w.overtimeMu.Unlock()
 	if w.overtimeWarned == nil {
-		w.overtimeWarned = make(map[string]time.Time)
+		w.overtimeWarned = make(map[string]overtimeIdentity)
 	}
-	if prev, ok := w.overtimeWarned[taskID]; ok && prev.Equal(startedAt) {
+	identity := overtimeIdentity{AttemptID: attemptID, StartedAt: startedAt}
+	if prev, ok := w.overtimeWarned[taskID]; ok && ((attemptID != "" && prev.AttemptID == attemptID) || (attemptID == "" && prev.AttemptID == "" && prev.StartedAt.Equal(startedAt))) {
 		return false
 	}
-	w.overtimeWarned[taskID] = startedAt
+	w.overtimeWarned[taskID] = identity
 	return true
 }
 
 func (w *Watchdog) pruneObservations(tasks []*model.Task) {
 	pending := make(map[string]struct{}, len(tasks))
-	processing := make(map[string]time.Time)
+	processing := make(map[string]overtimeIdentity)
 	for _, task := range tasks {
 		if task == nil {
 			continue
@@ -705,7 +710,7 @@ func (w *Watchdog) pruneObservations(tasks []*model.Task) {
 			pending[task.ID] = struct{}{}
 		}
 		if task.Status == model.TaskStatusProcessing {
-			processing[task.ID] = task.StartedAt
+			processing[task.ID] = overtimeIdentity{AttemptID: task.AttemptID, StartedAt: task.StartedAt}
 		}
 	}
 	w.pendingMu.Lock()
@@ -715,11 +720,11 @@ func (w *Watchdog) pruneObservations(tasks []*model.Task) {
 		}
 	}
 	w.pendingMu.Unlock()
-	// 超时告警标记随任务离开 processing（终态/淘汰）或换租约（StartedAt
-	// 变化）而失效——后者正是重试后告警重新武装的通道。
+	// 超时告警标记随任务离开 processing 或换 AttemptID 而失效；旧快照无
+	// AttemptID 时才比较 StartedAt，保证重试在 Windows 同 tick 仍重新武装。
 	w.overtimeMu.Lock()
-	for taskID, startedAt := range w.overtimeWarned {
-		if cur, ok := processing[taskID]; !ok || !cur.Equal(startedAt) {
+	for taskID, identity := range w.overtimeWarned {
+		if cur, ok := processing[taskID]; !ok || (identity.AttemptID != "" && cur.AttemptID != identity.AttemptID) || (identity.AttemptID == "" && (cur.AttemptID != "" || !cur.StartedAt.Equal(identity.StartedAt))) {
 			delete(w.overtimeWarned, taskID)
 		}
 	}

@@ -71,7 +71,7 @@ tool_profiles:
 
 agents:
   - kind: explorer
-    replicas: 4
+    replicas: 2
     event_type: "explore"
     profile: swe_explorer
     system_prompt_file: "__AGENTGO_ROOT__/prompts/swe/explorer.md"
@@ -87,7 +87,7 @@ agents:
     task_max_retries: 5
     description: 通用执行代理：调查、修改代码、运行 pytest 验证；无网络工具。
   - kind: verifier
-    replicas: 2
+    replicas: 1
     event_type: "acceptance.verify"
     profile: swe_verifier
     system_prompt_file: "__AGENTGO_ROOT__/prompts/swe/verifier.md"
