@@ -125,7 +125,7 @@ success 全链通过，Judge 494 passed。8题尚未运行，因此 SWE-011 仍�
 10. ProgressCheckpoint 或预算预留的权威写入失败时 fail-closed，不允许仅打日志
     后继续消耗资源。
 11. deadline 使用绝对时间并分层：operation < Attempt < Activation < Graph < Run；
-    外部 harness deadline 必须作为 `RunContract` 进入系统。
+    外部 Test Runner deadline 必须作为 `RunContract` 进入系统。
 12. `TimeoutSeconds` 不再同时表示预期时长、告警时间与硬 deadline；迁移后拆为
     `ExpectedDuration`、`InterventionAt`、`HardDeadlineAt` 和 reserve。
 13. no-progress 使用分级状态机：提醒 → Attempt rollover → 有类型介入请求 →
@@ -174,13 +174,13 @@ success 全链通过，Judge 494 passed。8题尚未运行，因此 SWE-011 仍�
 LLM invocation timeout = 300 秒
 shell timeout          = 300 秒
 Graph Task timeout     = 默认 3600 秒
-外部 SWE harness       = 1200 秒
+外部 SWE Test Runner   = 1200 秒
 Scheduler Task timeout = 86400 秒
 ```
 
 Graph Task 未显式提供 `TimeoutSeconds`，公告板补成默认 3600 秒；Watchdog 超过
 该值只告警、不取消。Agent 认领任务后也没有据此创建 Task deadline context。
-因此内部控制面还未开始介入，外部 harness 已在 1200 秒直接终止进程。
+因此内部控制面还未开始介入，外部 Test Runner 已在 1200 秒直接终止进程。
 
 ### 2.4 现有状态不能直接充当进展
 
@@ -642,7 +642,7 @@ type RunContract struct {
 }
 ```
 
-TUI/交互会话未指定 deadline 时由产品默认 profile 提供；SWE harness、API 客户端
+TUI/交互会话未指定 deadline 时由产品默认 profile 提供；SWE Test Runner、API 客户端
 或上层系统有明确时限时必须把绝对时间传入，不能只在外部 kill。
 
 ### 10.2 层级
@@ -950,7 +950,7 @@ Model Invocation 仍需流式输出上限和 malformed/DSML 早夭。本设计�
 - 定义 Run/Graph/Activation/Attempt deadline DTO；
 - 引入 action reservation；
 - operation timeout 从剩余预算派生；
-- SWE harness 在输入时传入 RunContract；
+- SWE Test Runner 在输入时传入 RunContract；
 - 保留外部 hard kill 作为失活保险。
 
 ### Slice 2：Progress Contract compiler
@@ -1100,7 +1100,7 @@ terminal decision。
 4. L4 只依据 Delta + Contract 产生可重放 Assessment；
 5. `ProgressCheckpoint` 在 retry、重启、重新认领后保持连续；
 6. action 前预算预留、action 后 settlement/checkpoint 顺序 fail-closed；
-7. deadline 层级与 RunContract 生效，外部 harness 不再是首个正常终止者；
+7. deadline 层级与 RunContract 生效，外部 Test Runner 不再是首个正常终止者；
 8. 分级干预能在 no-progress budget 内进入 Reminder/rollover/intervention/blocked；
 9. Watchdog 回归 liveness backstop，不再承担语义进展判断；
 10. Effect recovery 与 checkpoint replay 不发生副作用静默重放；

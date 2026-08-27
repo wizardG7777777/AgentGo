@@ -35,7 +35,7 @@ Store、桥接字符串和不同 deadline 口径。
 | Wave 1 identity / run | 生产主链已接入 | `RunContract`、Run/Attempt/Turn/Action identity、durable TerminalIntent/TaskOutcome、OutcomeRef、terminal adapter 与 delivery outbox 已贯穿 Task/Session/Graph | 外部 E2E 与多 rollout 验证 |
 | Invocation | Responses typed-item 主链已接入 | 显式 protocol；message/reasoning/function_call 信封；ContextBinding OutputBudget；required-nonce probe；partial no-dispatch | 外部 provider 多 rollout；Chat compatibility 退出 |
 | L2 Context | Context v8/Replay v3 production default | v1–v7 digest 保留、Responses `assistant_response_items` RequiredExact carrier、32K completion、92K input、bounded runtime snapshot | 真实 tokenizer 与 provider matrix |
-| L3 Harness | versioned harness 与 Scheduler capability contract 已闭合 | 仓库脚本、真实双层 probe、RunContract、typed terminal、安全 snapshot、完整 ToolResult ContentStore | 外部 provider 多样性 |
+| L3 Harness | versioned SWE Test Runner 与 Scheduler capability contract 已闭合 | 仓库脚本、真实双层 probe、RunContract、typed terminal、安全 snapshot、完整 ToolResult ContentStore | 外部 provider 多样性 |
 | L4 Loop | SWE-016/017/023/028/032/033 主链已接入并验证 | 6 Attempts、唯一 Deadline Compiler、Invocation failure 中性进展、typed intervention、exploration→required-action deliverable phase、code-change/v3 4/10/18/24 阈值 | 更多 provider/cohort 统计 |
 | L5 Graph | simple/current transaction、typed Context data port 与 recovery controller 已验证 | framework-owned simple Graph、零参数 validate/commit/start、Task.ContextInputs、typed outcome/outbox、blocked→recovery→new Activation、Acceptance input replay | generation/correlation token 仍不开放；legacy 仍待退役 |
 | Docs / issue ledger | 已建立，持续同步 | 五层规范、正式设计、路线图、第5/6轮及 Responses 单题总账 | 只按各问题 closure matrix 关闭 SWE-011～028 |
@@ -51,10 +51,10 @@ Store、桥接字符串和不同 deadline 口径。
 | 基础层 Model Invocation | Responses typed items 已 cutover；Chat compatibility 未删 | provider 对照 + SWE-014/027；compat 调用归零 |
 | L1 Prompt | 单体约 52.9KiB Prompt 已退出生产；core + phase task-control prompt，各阶段只见对应工具 | 外部 cohort 统计，不再是实现缺口 |
 | L2 Context | v7 Optional/RequiredExact、Raw History projection 与动态 reserve 已落地 | 真实 tokenizer、更多 provider replay fixture |
-| L3 Harness | repo harness、双层 tool probe、真实 Lease、phase Router、typed terminal 已落地 | 外部 provider fixture 扩展 |
+| L3 Harness | repo SWE Test Runner、双层 tool probe、真实 Lease、phase Router、typed terminal 已落地 | 外部 provider fixture 扩展 |
 | L4 Loop | final Attempt 权利、deadline、failure-neutral progress 与 intervention scope 已钉住 | recovery controller 外部多题 rollout |
 | L5 Graph | simple/current transaction 与 framework recovery controller 已落地；legacy submit/patch 未删 | SWE-033 定向复跑、调用计数归零、migration tests、SWE-012 |
-| Validation / Trace 横切 | full/race/vet/build、真实二进制、仓库 harness 与单题双门已完成 | 一批8题、三平台 CI |
+| Validation / Trace 横切 | full/race/vet/build、真实二进制、仓库 SWE Test Runner 与单题双门已完成 | 一批8题、三平台 CI |
 | 横切关注点 | legacy adapter、权限最小可见面与跨平台恢复证据 | 调用计数、migration tests、outbox replay/ack、lease/prompt bytes 对账 |
 
 特别说明：正式两阶段 TerminalIntent 已保证新 ProgressContract Task 先 Seal 再
@@ -73,7 +73,7 @@ Store、桥接字符串和不同 deadline 口径。
   focused race tests；Mailbox Run/Session 分区、定向 wake/claim/drain/ACK、steer
   与 Trace Session correlation tests；
 - `go test ./...`、`go test -race ./...`、`go vet ./...`、`go build -o agentgo .`；
-- 仓库 SWE harness 33 项 Python 单测、`git diff --check`；
+- 仓库 SWE Test Runner 33 项 Python 单测、`git diff --check`；
 - 真实二进制 startup function-call probe、RunContract 注入、Graph
   Draft/Definition/StartIntent/typed outcome 与 TaskOutcome delivery ACK。
 
@@ -121,7 +121,7 @@ Observation Control Invocation 与 RecoveryStartPermit。再后续的 provider 4
 | SWE-017 | L4 Loop | 唯一 Deadline Compiler 与合法 Recovery wake Checkpoint |
 | SWE-018 | L1 Prompt | Scheduler phase Prompt/行动收敛，先做 cohort 因果对照 |
 | SWE-019 | L3 Harness | Provider tool capability、真实 Scheduler Lease、阶段化 ToolRouter 与 batch cap |
-| SWE-020 | 外部 Harness / L3 观测 | 仓库内 versioned harness、RunContract、typed terminal 与双指标 |
+| SWE-020 | 外部 SWE Test Runner / L3 观测 | 仓库内 versioned SWE Test Runner、RunContract、typed terminal 与双指标 |
 | SWE-021 | L2 Context | typed/bounded RuntimeSnapshot 与 optional drop |
 | SWE-022 | L2/Invocation | Context v4–v7 tokenizer/replay/completion/reasoning 预算版本化 |
 | SWE-023 | L4 Loop | Run 总预算、6 Attempts、Invocation-failure 中性进展 |
@@ -142,10 +142,10 @@ Observation Control Invocation 与 RecoveryStartPermit。再后续的 provider 4
 | SWE-050 | L2/L5 finalization | TerminalSummary v2 的 task-published/workspace/settlement 事实 |
 | SWE-051 | L4 / Run authority | RunID durable budget ledger、Activation-local progress 与显式 execution limit 分离 |
 | SWE-052 | L3/Invocation | Observation 独立 reasoning=none + exact Control Invocation，不混入业务 replay |
-| SWE-053 | L5/外部 Harness | RecoveryStartPermit 与 Run ledger/trace/terminal reservation 架构门 |
+| SWE-053 | L5/外部 SWE Test Runner | RecoveryStartPermit 与 Run ledger/trace/terminal reservation 架构门 |
 | SWE-054 | L3/Invocation | provider quota/billing typed failure，与 429 rate limit 分离 |
 | SWE-055 | L4 Loop | RecoveryRequestIntervene/Cancel 穷尽执行，unknown durable 交 L5 |
-| SWE-056 | 外部 Harness | startup typed infra error、batch finally summary 与 current-run 状态行 |
+| SWE-056 | 外部 SWE Test Runner | startup typed infra error、batch finally summary 与 current-run 状态行 |
 
 ## 3. 实施总原则
 
@@ -170,7 +170,7 @@ Observation Control Invocation 与 RecoveryStartPermit。再后续的 provider 4
 ## 4. 目标运行链路
 
 ```text
-User/API/Harness
+User/API/SWE Test Runner
   │ RunContract
   ▼
 GraphDraft ── commit ──> GraphDefinition ── start ──> GraphExecution
@@ -247,13 +247,13 @@ SessionID
 
 | 类型 | 唯一权威建议 | 消费方 |
 |---|---|---|
-| RunContract/DeadlineBudget | `internal/runcontract` | L4、L5、harness |
+| RunContract/DeadlineBudget | `internal/runcontract` | L4、L5、SWE Test Runner |
 | InvocationContract/Failure/Usage | `internal/invocation` | llm adapter、L2、L4 |
 | ContextFragment/Snapshot/Policy | `internal/contextcontract` | compiler、agent、trace |
 | ProgressContract/Delta/Checkpoint | `internal/loopcontract` 或拆分小包 | L4、L3 adapters、L5 ref |
 | TaskOutcome | neutral outcome package | agent/store/Graph adapter |
 | TerminalFact | Graph terminal adapter | L5 Runtime |
-| EndOutcome/GraphStatus | `internal/graph` | Graph/UI/harness |
+| EndOutcome/GraphStatus | `internal/graph` | Graph/UI/SWE Test Runner |
 | ContentRef | `internal/contentstore` | L2/L3/Graph adapters |
 
 包名可在 Wave 1 评审时调整，但一个稳定概念不得同时在 `llm`、`agent`、`model`、
@@ -292,7 +292,7 @@ Invocation/L2    L4 Loop           L5 Graph
        TaskOutcome → TerminalFact → EndOutcome
                      │
                      ▼
-            Harness/UI/legacy cutover
+       SWE Test Runner/UI/legacy cutover
 ```
 
 Track A/B/C 可以在 Wave 1 后并行，但只能通过 canonical DTO/ref 协作。不得让某个
@@ -345,7 +345,7 @@ Track 为赶进度在本包复制对方尚未完成的类型。
 - request ingress 接受或生成 RunContract；
 - 使用绝对 deadline；
 - Graph/Activation/Attempt 先只计算 shadow budget；
-- SWE harness 能传入 Run deadline，但暂不依赖其终态。
+- SWE Test Runner 能传入 Run deadline，但暂不依赖其终态。
 
 ### 9.4 TaskOutcome/TerminalFact DTO
 
@@ -501,7 +501,7 @@ Track 为赶进度在本包复制对方尚未完成的类型。
 - TaskOutcome→TerminalFact 唯一 adapter；
 - transition 到 end 与 EndOutcome settlement 同一 durable 事务；
 - GraphStatus 推导 success/failed/blocked/cancelled；
-- graph-ended/UI/harness 使用 typed outcome；
+- graph-ended/UI/SWE Test Runner 使用 typed outcome；
 - `graph_done` 不再暗示业务成功。
 
 ### C6：退出条件
@@ -573,11 +573,11 @@ provider 名称推断。
 - L5 不读取 History 猜终态；
 - blocked/failed 路由与 Result/Evidence 同源。
 
-### Gate IV：Graph ↔ Harness/UI
+### Gate IV：Graph ↔ SWE Test Runner/UI
 
 - lifecycle terminal 与 business outcome 分离；
 - UI 展示 Draft/Definition/Execution/Outcome；
-- harness 可在 typed terminal 后提前 judge；
+- SWE Test Runner 可在 typed terminal 后提前 judge；
 - final user report 与 Graph outcome 一致。
 
 ## 15. Shadow、Cutover 与删除纪律
@@ -690,7 +690,7 @@ completed 再靠 Scheduler 文本更正。
 | Harness | Lease/ToolRouter、Effect、Artifact、Content Store recovery |
 | Loop | retry/cancel/deadline/progress/checkpoint/intervention/terminal |
 | Graph | Draft/CAS/commit/start/activation/change/outcome/recovery |
-| Adapter | TaskOutcome→TerminalFact、Graph→harness/UI、outbox |
+| Adapter | TaskOutcome→TerminalFact、Graph→SWE Test Runner/UI、outbox |
 | Cross-platform | Windows file handle/path/shell/compile，Linux/macOS runtime |
 
 所有纯函数 evaluator/compiler 测试不调用真实模型。provider capability 单独标记为
@@ -713,7 +713,7 @@ completed 再靠 Scheduler 文本更正。
 11. `git diff --check`；
 12. bug 切片同步更新 `docs/activate/KNOWN_ISSUES.md`。
 
-## 20. SWE harness 改造
+## 20. SWE Test Runner 改造
 
 ### 20.1 RunContract
 
@@ -806,7 +806,7 @@ external hard kill
 | SWE-011 | ProgressCheckpoint/enforcement + deadline/RunContract + no-progress SWE |
 | SWE-012 | Draft/Commit/Start + native authoring + EndOutcome + recovery E2E |
 | SWE-003 | 被吸收切片关闭，structured-output 实验结论落档；不要求 provider 必须支持 |
-| SWE-004 | SWE-012 typed EndOutcome/harness/UI 落地后关闭 residual |
+| SWE-004 | SWE-012 typed EndOutcome/SWE Test Runner/UI 落地后关闭 residual |
 | SWE-015 | Response commit + Replay v2 Optional/RequiredExact + Raw History 不变 |
 | SWE-016 | Attempt 只在 start/rollover 边界执法，最后 Attempt 保留完整 Turn 权利 |
 | SWE-017 | 唯一 Deadline Compiler，Recovery/Finalization 使用合法阶段窗口 |
@@ -856,7 +856,7 @@ canonical contract、durable authority 和主要 production cutover 已完成，
 4. 旧 message/error/Loop/Graph authoring/outcome 路径达到删除条件并退出；
 5. 所有持久化 schema、恢复、Session 和 legacy 测试通过；
 6. 全仓/race/vet/build/Windows/真实二进制验证通过；
-7. SWE harness 使用 RunContract 和 typed Graph outcome；
+7. SWE Test Runner 使用 RunContract 和 typed Graph outcome；
 8. 多 rollout 8 题回归达到约定正确性和成本门槛；
 9. 不再出现第五轮同型事故；
 10. `docs/activate/KNOWN_ISSUES.md` 只保留仍可复现的真实开放问题；

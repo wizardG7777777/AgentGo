@@ -15,7 +15,7 @@
 | Model Invocation 基础层 | typed failure、ContextBinding 唯一入口、L2/L4 动态 OutputBudget、SSE字段/Tool批次硬限、partial no-dispatch | 真实 provider/SWE 多 rollout |
 | L1 Prompt | 冻结 Scheduler core prompt + 每 Invocation phase task-control prompt；Graph-first 保持 | 固定模型长期 cohort 指标 |
 | L2 Context | Context v9/Replay v3、1M/64K 默认 ModelCapability、Raw History pressure projection | 真实 tokenizer 自动探测与更多模型档案 |
-| L3 Harness | 仓库 SWE harness、双层 function-call probe、真实 Lease、phase ToolRouter、typed terminal/snapshot | Effect unknown 仍需人工裁决；workspace 仍非 OS sandbox |
+| L3 Harness | 仓库 SWE Test Runner、双层 function-call probe、真实 Lease、phase ToolRouter、typed terminal/snapshot | Effect unknown 仍需人工裁决；workspace 仍非 OS sandbox |
 | L4 Loop | 6 Attempts、统一 Deadline Compiler、Invocation-failure 中性进展、typed intervention scope、Progress/Terminal 主链 | 多题长时统计 |
 | L5 Graph | framework simple Graph、current validate/commit/start、Change、typed Outcome/Result/Evidence | 复杂 OR/generation token 仍关闭；legacy submit/patch 未删 |
 | Validation / Trace | contract/full/race/vet/build、真实二进制、8题 `architecture_ok=8/8`、失败题定向 resolved | 三平台 CI 与更多 provider cohort |
@@ -551,7 +551,7 @@ Harness Observation、取消和外部消息。<br>
 4. 定义进展信号：新 Effect、Artifact、confirmed Fact、文件版本、Graph result
    字段、阻塞解除；重复读取或相同拒绝不算进展。
 5. 统一时间层级：单次 Invocation < 单次 action < Attempt deadline < Graph/
-   外部 harness deadline，并保证控制面有真实介入窗口。
+   外部 Test Runner deadline，并保证控制面有真实介入窗口。
 6. Loop 收口只产生 TaskOutcome；L5 adapter 再把它转换为 Graph TerminalFact。
 
 #### 9.6.1 Loop intervention 的正式跨层边界（2026-08-23）
@@ -706,7 +706,7 @@ Validation / Trace 不作为第六层。它验证五层并解释运行事实，�
 1. `trace.Emit` 仍同时驱动 Reactor，领域事件与脱敏审计投影没有完成解耦。
 2. Trace schema 仍是持续扩张的宽事件结构，跨层关联身份不完全统一。
 3. 失败流式调用的 usage、Prompt/Context/Lease 关联和完成状态可能不完整。
-4. 外部 SWE harness 能验证最终仓库结果，但与内部 deadline、watchdog 和
+4. 外部 SWE Test Runner 能验证最终仓库结果，但与内部 deadline、watchdog 和
    trace completeness 尚未形成同一 Run contract。
 
 ### 11.3 提升要点
@@ -807,7 +807,7 @@ Validation / Trace 不作为第六层。它验证五层并解释运行事实，�
 1. Model Invocation 增加 completion、reasoning、content、tool arguments 的硬
    预算和流式早夭；错误类型端到端保真。
 2. 修正 Loop 的错误分类，禁止 `strings.Contains("context")` 一类宽匹配。
-3. 统一 LLM、action、Attempt、watchdog 和外部 harness deadline 的层级。
+3. 统一 LLM、action、Attempt、watchdog 和外部 Test Runner deadline 的层级。
 4. 建立 ContextSnapshot 单一装配路径，避免 Manifest 与真实请求漂移。
 
 ### P1：拆除主要 God boundaries

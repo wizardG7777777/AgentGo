@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AgentGo SWE 系统回归的无第三方依赖 Python 权威入口。
+"""AgentGo SWE Test Runner 的无第三方依赖 Python 权威入口。
 
 本文件统一处理考题准备、进程编排、运行契约、能力探针、终态判定、Judge 和脱敏
 指标。受版本控制的 Flask 题目清单与 prompt 位于仓库 suite；Flask 源仓库、worktree、
@@ -24,6 +24,7 @@ import shutil
 import signal
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import time
@@ -46,7 +47,7 @@ TERMINAL_GRAPH = {"completed", "failed", "blocked", "cancelled"}
 TERMINAL_OUTCOME = {"success", "failed", "blocked", "cancelled"}
 NANOSECOND = 1_000_000_000
 TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
-EXIT_HARNESS_FAILURE = 1
+EXIT_SWE_TEST_RUNNER_FAILURE = 1
 EXIT_ARCHITECTURE_FAILURE = 2
 EXIT_TASK_FAILURE = 3
 DEFAULT_SUITE_DIR = Path(__file__).resolve().parent / "suites" / "flask-8"
@@ -91,7 +92,7 @@ def default_swe_testbed(*, environ=None, platform_name: str | None = None,
     return (data_home / "agentgo" / "swe").resolve()
 
 
-class HarnessConfig:
+class SWETestRunnerConfig:
     """从统一 SWE_* 环境变量解析的运行配置。"""
 
     def __init__(self, agentgo_root: Path, agentgo_bin: Path, testbed: Path,
@@ -108,7 +109,7 @@ class HarnessConfig:
         self.protocol = protocol
 
     @classmethod
-    def from_env(cls) -> "HarnessConfig":
+    def from_env(cls) -> "SWETestRunnerConfig":
         values = required_environment_values()
         repo_root = Path(__file__).resolve().parents[2]
         agentgo_root = Path(
@@ -163,7 +164,7 @@ class TaskSpec:
         self.title = title
 
 
-class HarnessInfrastructureError(RuntimeError):
+class SWETestRunnerInfrastructureError(RuntimeError):
     """不属于题目业务 verdict 的有类型运行基础设施失败。"""
 
     def __init__(self, reason_code: str, stage: str, message: str,
@@ -229,7 +230,7 @@ def load_tasks(path: str | Path) -> list[TaskSpec]:
     return tasks
 
 
-def find_task(config: HarnessConfig, task_id: str) -> TaskSpec:
+def find_task(config: SWETestRunnerConfig, task_id: str) -> TaskSpec:
     wanted = validate_task_id(task_id)
     for task in load_tasks(config.tasks_file):
         if task.task_id == wanted:
@@ -468,22 +469,22 @@ def urllib_probe_transport(endpoint: str, api_key: str, body: dict, timeout_sec:
         return error.code, payload if isinstance(payload, dict) else {}
 
 
-def provider_probe_infrastructure_error(status: int, payload: dict) -> HarnessInfrastructureError | None:
+def provider_probe_infrastructure_error(status: int, payload: dict) -> SWETestRunnerInfrastructureError | None:
     error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
     code = str((error or {}).get("code") or "").strip()
     suffix = f" code={code}" if code else ""
     if status == 402:
-        return HarnessInfrastructureError(
+        return SWETestRunnerInfrastructureError(
             "provider_quota_exhausted", "provider_preflight",
             f"provider function-call probe HTTP 402{suffix}",
         )
     if status == 401:
-        return HarnessInfrastructureError(
+        return SWETestRunnerInfrastructureError(
             "provider_auth_failed", "provider_preflight",
             f"provider function-call probe HTTP 401{suffix}",
         )
     if status == 403:
-        return HarnessInfrastructureError(
+        return SWETestRunnerInfrastructureError(
             "provider_permission_denied", "provider_preflight",
             f"provider function-call probe HTTP 403{suffix}",
         )
@@ -513,7 +514,7 @@ def run_provider_probe(base_url: str, api_key: str, model: str, protocol: str = 
             if ok:
                 return
             last_reason = reason
-        except HarnessInfrastructureError:
+        except SWETestRunnerInfrastructureError:
             raise
         except (OSError, TimeoutError, json.JSONDecodeError, subprocess.SubprocessError, RuntimeError) as error:
             if not last_reason.startswith("HTTP "):
@@ -1148,12 +1149,12 @@ def summarize_runs(runs_dir: str, batch_start: float) -> list[dict]:
 
 
 def infrastructure_error_record(task_id: str, error: Exception) -> dict:
-    if isinstance(error, HarnessInfrastructureError):
+    if isinstance(error, SWETestRunnerInfrastructureError):
         return error.record(task_id)
     return {
         "schema": "agentgo.swe-infrastructure-error/v1",
         "task": task_id,
-        "reason_code": "harness_task_infrastructure_error",
+        "reason_code": "swe_test_runner_task_infrastructure_error",
         "stage": "task_transaction",
         "message": safe_diagnostic(error),
     }
@@ -1247,7 +1248,17 @@ def run_command(command: list[str], cwd: str | Path | None = None, check: bool =
     return completed
 
 
-def safe_remove_worktree(config: HarnessConfig, target: Path) -> None:
+def retry_windows_readonly_removal(function, path: str, error: BaseException,
+                                   *, platform_name: str | None = None) -> None:
+    """清除 Windows Git object 的 ReadOnly 属性并只重试原失败操作一次。"""
+    current_platform = os.name if platform_name is None else platform_name
+    if current_platform != "nt" or not isinstance(error, PermissionError):
+        raise error
+    os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+    function(path)
+
+
+def safe_remove_worktree(config: SWETestRunnerConfig, target: Path) -> None:
     worktrees = (config.testbed / "worktrees").resolve()
     if target.parent.resolve() != worktrees or target == worktrees:
         raise ValueError(f"拒绝清理非考题 worktree: {target}")
@@ -1258,7 +1269,7 @@ def safe_remove_worktree(config: HarnessConfig, target: Path) -> None:
     if target.is_symlink():
         target.unlink()
     elif target.exists():
-        shutil.rmtree(target)
+        shutil.rmtree(target, onexc=retry_windows_readonly_removal)
 
 
 def venv_python(worktree: Path) -> Path:
@@ -1272,7 +1283,7 @@ def venv_python(worktree: Path) -> Path:
     raise RuntimeError(f"虚拟环境 Python 不存在: {worktree / '.venv'}")
 
 
-def setup_task(config: HarnessConfig, task: TaskSpec, target: Path | None = None) -> Path:
+def setup_task(config: SWETestRunnerConfig, task: TaskSpec, target: Path | None = None) -> Path:
     worktree = target or config.worktree(task.task_id)
     worktree.parent.mkdir(parents=True, exist_ok=True)
     safe_remove_worktree(config, worktree)
@@ -1300,7 +1311,7 @@ def setup_task(config: HarnessConfig, task: TaskSpec, target: Path | None = None
     return worktree
 
 
-def patch_from_fix(config: HarnessConfig, task: TaskSpec, pathspec: str) -> bytes:
+def patch_from_fix(config: SWETestRunnerConfig, task: TaskSpec, pathspec: str) -> bytes:
     completed = run_command([
         "git", "-C", str(config.flask_repo), "show", task.fix_sha, "--", pathspec,
     ])
@@ -1309,7 +1320,7 @@ def patch_from_fix(config: HarnessConfig, task: TaskSpec, pathspec: str) -> byte
     return completed.stdout
 
 
-def apply_fix_slice(config: HarnessConfig, task: TaskSpec, worktree: Path, pathspec: str) -> None:
+def apply_fix_slice(config: SWETestRunnerConfig, task: TaskSpec, worktree: Path, pathspec: str) -> None:
     run_command(["git", "apply", "-"], cwd=worktree,
                 input_data=patch_from_fix(config, task, pathspec))
 
@@ -1445,15 +1456,15 @@ def print_pytest_stage_result(result: dict, expectation: str) -> bool:
     return matched
 
 
-def prepare_task(config: HarnessConfig, task: TaskSpec) -> dict:
+def prepare_task(config: SWETestRunnerConfig, task: TaskSpec) -> dict:
     worktree = setup_task(config, task)
     run_dir = config.run_dir(task.task_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     apply_fix_slice(config, task, worktree, "tests/")
     run_command(["git", "add", "-A", "--", "tests/"], cwd=worktree)
     run_command([
-        "git", "-c", "user.name=agentgo-swe", "-c", "user.email=swe@harness.local",
-        "commit", "-q", "-m", f"harness: 预置期望行为测试（考题 {task.task_id}）", "--", "tests/",
+        "git", "-c", "user.name=agentgo-swe", "-c", "user.email=swe-test-runner@agentgo.local",
+        "commit", "-q", "-m", f"test-runner: 预置期望行为测试（考题 {task.task_id}）", "--", "tests/",
     ], cwd=worktree)
 
     print_stage_header(
@@ -1503,7 +1514,7 @@ def yaml_template_value(value: str | Path) -> str:
     return raw.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def render_setting(config: HarnessConfig, worktree: Path, run_dir: Path,
+def render_setting(config: SWETestRunnerConfig, worktree: Path, run_dir: Path,
                    port: int, token: str) -> Path:
     template_path = config.agentgo_root / "setting.swe-flask.yaml"
     rendered = template_path.read_text(encoding="utf-8")
@@ -1570,7 +1581,7 @@ def raise_startup_failure(process: subprocess.Popen, log_path: Path, fallback: s
     exit_code = process.poll()
     if exit_code is None:
         reason_code, detail = "healthz_timeout", fallback
-    raise HarnessInfrastructureError(
+    raise SWETestRunnerInfrastructureError(
         reason_code, "agentgo_startup", detail,
         exit_code=exit_code, log_path=log_path,
     )
@@ -1635,7 +1646,7 @@ def clean_run_outputs(run_dir: Path) -> None:
         (run_dir / name).unlink(missing_ok=True)
 
 
-def run_task(config: HarnessConfig, task: TaskSpec, timeout_sec: int) -> dict:
+def run_task(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> dict:
     if timeout_sec < 240:
         raise ValueError("timeout 必须至少 240 秒")
     if not os.environ.get("SWE_API_KEY"):
@@ -1715,7 +1726,7 @@ def run_task(config: HarnessConfig, task: TaskSpec, timeout_sec: int) -> dict:
     return result
 
 
-def test_files_at_fix(config: HarnessConfig, task: TaskSpec) -> list[str]:
+def test_files_at_fix(config: SWETestRunnerConfig, task: TaskSpec) -> list[str]:
     completed = run_command([
         "git", "-C", str(config.flask_repo), "show", task.fix_sha,
         "--name-only", "--format=", "--", "tests/",
@@ -1728,7 +1739,7 @@ def test_files_at_fix(config: HarnessConfig, task: TaskSpec) -> list[str]:
     return files
 
 
-def judge_task(config: HarnessConfig, task: TaskSpec) -> dict:
+def judge_task(config: SWETestRunnerConfig, task: TaskSpec) -> dict:
     worktree = config.worktree(task.task_id)
     run_dir = config.run_dir(task.task_id)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1748,7 +1759,7 @@ def judge_task(config: HarnessConfig, task: TaskSpec) -> dict:
         tampered_files = compare_test_baseline_manifest(
             worktree, test_files, read_json(run_dir / "test_baseline_manifest.json", None))
     except ValueError as error:
-        raise HarnessInfrastructureError("test_baseline_manifest_invalid", "judge", str(error)) from error
+        raise SWETestRunnerInfrastructureError("test_baseline_manifest_invalid", "judge", str(error)) from error
     tampered = bool(tampered_files)
     if tampered:
         verdict = "test_tampered"
@@ -1806,24 +1817,24 @@ def final_exit_code(result: dict) -> int:
 
 def batch_exit_code(rows: list[dict], expected_count: int) -> int:
     if len(rows) != expected_count:
-        return EXIT_HARNESS_FAILURE
+        return EXIT_SWE_TEST_RUNNER_FAILURE
     if any(row.get("run_state") in {"infrastructure_error", "completed_with_infrastructure_error"}
            for row in rows):
-        return EXIT_HARNESS_FAILURE
+        return EXIT_SWE_TEST_RUNNER_FAILURE
     if any(row.get("run_state", "completed") in {"completed", "completed_with_infrastructure_error"} and
            not row.get("architecture_ok") for row in rows):
         return EXIT_ARCHITECTURE_FAILURE
     if any(row.get("run_state") == "not_run" for row in rows):
-        return EXIT_HARNESS_FAILURE
+        return EXIT_SWE_TEST_RUNNER_FAILURE
     if any(row.get("stale") for row in rows):
-        return EXIT_HARNESS_FAILURE
+        return EXIT_SWE_TEST_RUNNER_FAILURE
     if any(row.get("run_state", "completed") in {"completed", "completed_with_infrastructure_error"} and
            not row.get("task_resolved") for row in rows):
         return EXIT_TASK_FAILURE
     return 0
 
 
-def execute_task(config: HarnessConfig, task: TaskSpec, timeout_sec: int) -> dict:
+def execute_task(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> dict:
     prepare_task(config, task)
     run_task(config, task, timeout_sec)
     judge_task(config, task)
@@ -1881,7 +1892,7 @@ def require_api_key() -> str:
     return value
 
 
-def preflight_probe(config: HarnessConfig, timeout_sec: int = 45) -> None:
+def preflight_probe(config: SWETestRunnerConfig, timeout_sec: int = 45) -> None:
     print("\n[前置检查][Provider typed function-call 能力探针]")
     print(
         f"检查内容：provider={config.base_url.rstrip('/')} "
@@ -1897,8 +1908,8 @@ def preflight_probe(config: HarnessConfig, timeout_sec: int = 45) -> None:
     )
 
 
-def verify_candidates(config: HarnessConfig) -> dict[str, int]:
-    report_path = config.testbed / "harness" / "candidates_report.txt"
+def verify_candidates(config: SWETestRunnerConfig) -> dict[str, int]:
+    report_path = config.testbed / "test-runner" / "candidates_report.txt"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
     counts = collections.Counter()
@@ -1968,13 +1979,13 @@ def verify_candidates(config: HarnessConfig) -> dict[str, int]:
 
 
 def command_probe(args: argparse.Namespace) -> int:
-    config = HarnessConfig.from_env()
+    config = SWETestRunnerConfig.from_env()
     preflight_probe(config, args.timeout)
     return 0
 
 
 def command_task(args: argparse.Namespace) -> int:
-    config = HarnessConfig.from_env()
+    config = SWETestRunnerConfig.from_env()
     print(f"\n===== 启动单题任务：{args.task_id} =====")
     preflight_probe(config, args.probe_timeout)
     result = execute_task(config, find_task(config, args.task_id), args.timeout)
@@ -1982,7 +1993,7 @@ def command_task(args: argparse.Namespace) -> int:
 
 
 def command_batch(args: argparse.Namespace) -> int:
-    config = HarnessConfig.from_env()
+    config = SWETestRunnerConfig.from_env()
     tasks = load_tasks(config.tasks_file)
     preflight_probe(config, args.probe_timeout)
     runs_dir = config.testbed / "runs"
@@ -2007,7 +2018,7 @@ def command_batch(args: argparse.Namespace) -> int:
                 atomic_json(failure_dir / "infrastructure_error.json", infrastructure_error)
                 stop_reason = "previous_infrastructure_error"
                 print(
-                    "SWE_HARNESS_ERROR: " + safe_diagnostic(error),
+                    "SWE_TEST_RUNNER_ERROR: " + safe_diagnostic(error),
                     file=os.sys.stderr,
                 )
                 break
@@ -2046,7 +2057,7 @@ def command_batch(args: argparse.Namespace) -> int:
 
 
 def command_verify_candidates(_args: argparse.Namespace) -> int:
-    counts = verify_candidates(HarnessConfig.from_env())
+    counts = verify_candidates(SWETestRunnerConfig.from_env())
     return 0 if counts.get("OK", 0) > 0 and sum(
         count for name, count in counts.items() if name != "OK"
     ) == 0 else EXIT_TASK_FAILURE
@@ -2080,9 +2091,9 @@ def main() -> int:
     args = parser().parse_args()
     try:
         return int(args.func(args) or 0)
-    except Exception as error:  # harness 顶层只打印有界类型/消息，绝不打印请求正文或凭证。
-        print(f"SWE_HARNESS_ERROR: {error}", file=os.sys.stderr)
-        return EXIT_HARNESS_FAILURE
+    except Exception as error:  # SWE Test Runner 顶层只打印有界类型/消息，绝不打印请求正文或凭证。
+        print(f"SWE_TEST_RUNNER_ERROR: {error}", file=os.sys.stderr)
+        return EXIT_SWE_TEST_RUNNER_FAILURE
 
 
 if __name__ == "__main__":

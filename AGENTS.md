@@ -31,7 +31,14 @@ go test -run TestName ./internal/agent/   # 单个测试
 
 任务级 trace 调试入口：`./agentgo trace list / show / stats / graph / node`（不启动主系统），文件位置与事件字段详见 `TraceGuide.md`。无 Makefile / linter，只用标准 Go 工具链；测试假定 LF 行尾（`.gitattributes` 强制）。
 
-SWE Harness 的 `probe` / `task` / `batch` / `verify-candidates` 启动前必须通过 provider 环境契约：`SWE_API_KEY`、`SWE_BASE_URL`、`SWE_MODEL` 共 3 项均非空。入口必须在任何网络、文件系统副作用或子进程启动前一次性报告全部缺项并 fail-closed；正式八题 manifest/prompt 位于受版本控制的 `scripts/swe_harness/suites/flask-8`，`SWE_SUITE_DIR` 与各路径变量只作可选覆盖。testbed 默认从 Windows `%LOCALAPPDATA%`（回退 `%USERPROFILE%`）、macOS 用户 Application Support 或 Linux `$XDG_DATA_HOME`（回退 `~/.local/share`）动态拼装，禁止硬编码用户名，完整说明见 `scripts/swe_harness/README.md`。
+SWE Test Runner 的 `probe` / `task` / `batch` / `verify-candidates` 启动前必须通过 provider 环境契约：`SWE_API_KEY`、`SWE_BASE_URL`、`SWE_MODEL` 共 3 项均非空。入口必须在任何网络、文件系统副作用或子进程启动前一次性报告全部缺项并 fail-closed；正式八题 manifest/prompt 位于受版本控制的 `scripts/swe_test_runner/suites/flask-8`，`SWE_SUITE_DIR` 与各路径变量只作可选覆盖。testbed 默认从 Windows `%LOCALAPPDATA%`（回退 `%USERPROFILE%`）、macOS 用户 Application Support 或 Linux `$XDG_DATA_HOME`（回退 `~/.local/share`）动态拼装，禁止硬编码用户名，完整说明见 `scripts/swe_test_runner/README.md`。
+
+### SWE 测试程序命名红线
+
+- 外部 SWE 测试程序的唯一正式名称是 **SWE Test Runner**。路径使用 `swe_test_runner`，Python 类型使用 `SWETestRunner...`，常量/诊断前缀使用 `SWE_TEST_RUNNER...`；入口固定为 `scripts/swe_test_runner/runner.py`。
+- **禁止**把任何外部 SWE 测试脚本、测试执行器、判题器、批次编排器、目录、类或新 reason code 命名为 `Harness` / `harness`。后续 Agent 新建或重命名 SWE 测试程序时必须使用 `SWE_TestRunner` 系列语义，不得重新引入 `swe_harness`、`harness.py`、`HarnessConfig` 等名称。
+- `Harness Engineering` / `L3 Harness` 是五层架构中 Tool、Execution Lease、Store、Effect 与执行环境的正式责任域，只能用于产品运行时架构，不能指代外部测试程序。
+- `docs/archived/`、`docs/test-issues/`、旧 trace/result 中已经记录的名称可作为历史事实保留；活动代码、规范文档和新产物不得复制这些旧名称。若必须兼容旧 schema 字段，应显式标记 legacy，并为新写入定义 `SWE_TestRunner` 名称。
 
 ## 改代码前必知
 
@@ -85,8 +92,9 @@ AgentGo 同等支持 Windows / macOS / Linux。以下每一条都曾在生产坏
 - **行尾 LF，`.gitattributes` 强制**。不要对字面 `"\r\n"` 做比较；解析可能带 CRLF 的输入时在边界处 `strings.ReplaceAll(s, "\r\n", "\n")` 归一。
 - **终端输入无跨 shell 的统一「提交」语义**。TUI 用 Bubble Tea `textarea`（Enter 提交，Ctrl+J 换行）；粘贴按平台分两条正式投递路径——macOS/Linux 终端以 bracketed paste 事件投递，Windows ConPTY 不透传 bracketed paste，以高速 `KeyRunes + Enter` 流投递，必须经 `internal/tui/paste_burst.go` 状态机重组（这是 Windows 的正式粘贴路径，禁止回退为固定 Enter 防抖）。任何新输入通路（Interaction、session 选择等）必须建在 Bubble Tea MVU 模型内，不用裸模式。Interaction 动作不得绑裸字母/数字键。
 - **Windows NTFS 上 fsync 频率更敏感**。append 密集的 JSONL 日志保持「每次 append  flush+sync」，但绝不在已经过一次 fsync 的路径里加第二次。
-- **SWE Harness 进程监控必须持有 `subprocess.Popen` 并用 `poll()` 查询生命周期**。禁止用 `os.kill(pid, 0)` 模拟 POSIX 存活探测；当前 Windows Python 会对不存在 PID 抛 `WinError 87`，并可能破坏仍在运行的被监控进程。批次 result/judge 新鲜度必须与 `.batch_start` marker 使用同一文件系统 mtime 权威，禁止拿独立 `time.time()` 与 NTFS mtime 做零容差边界比较。
-- **SWE Harness 渲染 v4 YAML 时，`Path` 占位符必须先归一为 forward slash**。Windows `project_root` 与 `agents[*].system_prompt_file` 同受配置红线约束；只转换 `Path` 类型，禁止顺手改写 URL、model、token 等普通字符串。
+- **SWE Test Runner 进程监控必须持有 `subprocess.Popen` 并用 `poll()` 查询生命周期**。禁止用 `os.kill(pid, 0)` 模拟 POSIX 存活探测；当前 Windows Python 会对不存在 PID 抛 `WinError 87`，并可能破坏仍在运行的被监控进程。批次 result/judge 新鲜度必须与 `.batch_start` marker 使用同一文件系统 mtime 权威，禁止拿独立 `time.time()` 与 NTFS mtime 做零容差边界比较。
+- **SWE Test Runner 渲染 v4 YAML 时，`Path` 占位符必须先归一为 forward slash**。Windows `project_root` 与 `agents[*].system_prompt_file` 同受配置红线约束；只转换 `Path` 类型，禁止顺手改写 URL、model、token 等普通字符串。
+- **SWE Test Runner 清理 disposable worktree 时必须处理 Windows Git object 的 ReadOnly 属性**：`shutil.rmtree` 使用 `onexc`，只对 Windows `PermissionError` 清除 ReadOnly 后重试原操作一次；非 Windows、非权限错误和重试失败全部原样 fail-closed，禁止 `ignore_errors` 或吞掉文件占用/真实 I/O 故障。回归必须包含同一路径连续两次清理。
 - **新增 CI 时应同时跑 `ubuntu-latest` 与 `windows-latest`**——上述故障在 POSIX 上几乎全是静默的。
 
 ## 运行时文件访问边界（早期阶段，有意为之）

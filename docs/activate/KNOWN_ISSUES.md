@@ -5,7 +5,7 @@
 ## 2026-08-23 五层架构修复的当前开放项
 
 本轮已落地 Invocation/Context/Effect/Loop/Graph 的主要 canonical contract、
-durable Store 和生产接线，并通过 full/race/vet/build、harness 单测与真实二进制；但以下
+durable Store 和生产接线，并通过 full/race/vet/build、SWE Test Runner 单测与真实二进制；但以下
 仍是当前发布判断中的真实开放项：
 
 - **L5 legacy 退出**：新图已走 Draft/Definition/commit/start、ChangeProposal、
@@ -30,7 +30,7 @@ durable Store 和生产接线，并通过 full/race/vet/build、harness 单测�
   deadline、Scheduler phase Prompt/ToolRouter、真实 Lease、Tool batch/ToolResultRef
   已完成，并通过 full/race/vet/build/真实二进制验证。完成记录见
   [`第六轮 0/8 分层诊断`](../test-issues/2026-08-22-1510-swe-round6-zero-of-eight-layered-diagnosis.md) 第12节。
-- **SWE-020…026 实现已落地**：versioned harness 已进一步收敛为单一 Python CLI
+- **SWE-020…026 实现已落地**：versioned SWE Test Runner 已进一步收敛为单一 Python CLI
   （prepare/run/judge 仅为 task/batch 内部固定阶段，不再经过或暴露 Bash 式分段
   入口；批次门失败返回非零退出码；stdout 以四阶段标签明确区分预期红态、Agent
   执行与最终 Judge）、
@@ -48,7 +48,7 @@ durable Store 和生产接线，并通过 full/race/vet/build、harness 单测�
   intervention 曾在 simple Graph 中直接进入 blocked end，Scheduler wake 到达时
   Graph 已终态且无法 change/retry。新 simple Graph 加入 framework-owned
   `loop_recovery` Controller，冻结 source Task 与 GraphChange 控制租约，按
-  `decision=retry|blocked` 创建新 Activation 或收官；SWE runner 同时新增
+  `decision=retry|blocked` 创建新 Activation 或收官；SWE Test Runner 同时新增
   `loop_intervention_without_recovery` 架构事故门。full/race/vet/build、真实
   `work@1→recovery@1→work@2`、三道历史失败题定向复跑均完成；其中
   `context-push-order` 与 `session-access-tracking` 业务 resolved，
@@ -57,10 +57,10 @@ durable Store 和生产接线，并通过 full/race/vet/build、harness 单测�
   `tail` 的 exit=0 误投影为整条 pytest 通过；graph-ended final-report 又缺少冻结
   Graph scope，`get_task_result` 被 legacy 授权拒绝且未进入架构门。现 pipeline
   默认拒绝，显式执行冻结 last-command scope 且 L4 不判 pass；final-report 冻结
-  `FinalReportGraphID` 并进入 runner 终态/scope/Outcome 门。真实 DeepSeek 单题
+  `FinalReportGraphID` 并进入 SWE Test Runner 终态/scope/Outcome 门。真实 DeepSeek 单题
   已观察 pipeline 拒绝→无管道全量测试、final-report 同图结果读取成功、493 passed、
   patch 18 行、双门通过。
-- **SWE-036 已修复并完成本地真实验证**：外部 SWE Python runner 曾以 JUnit
+- **SWE-036 已修复并完成本地真实验证**：外部 SWE Python Test Runner 曾以 JUnit
   `tests-failures-errors-skipped` 推算 passed；pytest 的 call outcome 与
   setup/teardown error 可重叠，导致 `teardown-callbacks` 把实际
   `collected=495 / passed=476 / failed=19 / error_events=481` 错报为
@@ -68,7 +68,7 @@ durable Store 和生产接线，并通过 full/race/vet/build、harness 单测�
   traceback 与关键计数交叉校验；缺失/冲突 fail-closed。该问题属于外部评测观测，
   不归入 AgentGo L1–L5。证据见
   [`pytest 阶段重叠计数`](../test-issues/2026-08-24-0132-pytest-phase-overlap-counting.md)。
-- **验证横切面**：仓库内 SWE harness 已分别实际运行 OpenRouter Luna 与 DeepSeek
+- **验证横切面**：仓库内 SWE Test Runner 已分别实际运行 OpenRouter Luna 与 DeepSeek
   真实 thinking 路径。当前冻结二进制的最终完整 cohort 为
   `batch_status=complete`、`task_resolved=8/8`、`architecture_ok=8/8`、
   `infrastructure_ok=8/8`，无 stale/infra/not-run、hard kill 或 known incident。
@@ -78,9 +78,9 @@ durable Store 和生产接线，并通过 full/race/vet/build、harness 单测�
   [`五层限制重组`](../test-issues/2026-08-24-0715-swe-layer-limit-recomposition.md)
   与 [`Observation thinking replay`](../test-issues/2026-08-24-0735-observation-thinking-replay.md)。
 - **SWE-057 实现完成、Windows 八题业务结果待回填**：八题 `tasks.csv` 与 prompt
-  曾只存在于 `/tmp` testbed，导致其他机器即使取得 runner 也无法运行同一回归
-  cohort。现 `flask-8` suite 已与 runner 一同版本化，冻结完整上游 SHA，并使用
-  跨平台测试命令与 testbed 默认路径；Windows runner/suite 的 49 项契约测试已
+  曾只存在于 `/tmp` testbed，导致其他机器即使取得 SWE Test Runner 也无法运行同一回归
+  cohort。现 `flask-8` suite 已与 SWE Test Runner 一同版本化，冻结完整上游 SHA，并使用
+  跨平台测试命令与 testbed 默认路径；Windows Test Runner/suite 的 49 项契约测试已
   通过，本地完整 Flask 克隆也能解析全部 8 个 fix SHA。首次单题暴露的 v4 路径
   反斜杠启动失败也已关闭：生成配置通过真实 config doctor，并以 healthz 200 完成
   无模型二进制启动。实际八题业务结果仍需回填，但这不属于 AgentGo L1–L5 主链事故。
@@ -91,9 +91,11 @@ durable Store 和生产接线，并通过 full/race/vet/build、harness 单测�
 
 本文件只记录当前仍会影响使用、开发或发布判断的限制。2026-07-18 UI Hub 改造的 41 项问题均已修复，原始核查与测试证据已归档至 [ui-hub-remediation-2026-07-18.md](../archived/ui-hub-remediation-2026-07-18.md)。2026-07-20 验收事实核验失败循环与级联取消事故已修复，证据归档至 [acceptance-fact-verification-and-cascade-incident-2026-07-20.md](../archived/acceptance-fact-verification-and-cascade-incident-2026-07-20.md)。2026-07-21 artifact 路径归一化缺陷导致的验收马拉松事故已修复，证据归档至 [artifact-path-normalization-incident-2026-07-21.md](../archived/artifact-path-normalization-incident-2026-07-21.md)。2026-07-21 验收空转（6 次 AcceptanceRun）与 Scheduler 篡改工作区事故已修复，证据归档至 [acceptance-spin-and-env-mutation-incident-2026-07-21.md](../archived/acceptance-spin-and-env-mutation-incident-2026-07-21.md)。2026-07-22 浪费可观测化专项落地：TUI 顶栏新增 session 级 token 总计（Hub 进程级累加器喂入，ad-hoc 团队销毁后消耗不隐形）；trace CLI 新增 stats 子命令（task/agent/plan 三维度 token 聚合 + 浪费口径 + 异常提示，见 TraceGuide §3.4）；watchdog 为 pending 级联取消补发 task_cancelled 事件（此前排队中的级联取消在 trace 中不可见）；修正 detectAnomalies 第 9 条从不命中的死检查（cancel_source 实际值为 dependency_failure）。2026-07-27 Windows ConPTY 长多行粘贴被固定 100ms Enter 防抖切成多条请求的问题已修复，状态机与回归证据归档至 [windows-tui-multiline-paste-incident-2026-07-27.md](../archived/windows-tui-multiline-paste-incident-2026-07-27.md)。2026-07-27 shell 旁路写入（`run_shell` 写文件不产生 `file_written` 事件）导致 artifact 账本缺失、`expected_artifacts` 校验假阴性的问题已修复：record-artifact Reactor 现订阅 `KindShellExecuted`，成功命令后对任务声明的 ExpectedArtifacts 做盘后补登（幂等、workspace 感知、回归测试见 `internal/reactor/builtin/record_artifact_test.go`）。2026-07-27 plan 楔死事故（验收目标含失败节点：验收 runner 认领闸要求 completed 而永远 pending、supersede 不改写 acceptance 节点依赖边被 digest 校验回滚、run 创建零预警）已修复：验收 runner（AcceptanceRunID 非空）依赖只需终态、supersede 改写全部剩余当前节点依赖边、EnsureAcceptanceRun 追加 `acceptance_target_incomplete` PlanWarning，回归见 `internal/plan/supersede_redirect_test.go`、`internal/store/claim_acceptance_runner_test.go`、`internal/bootstrap/supersede_wedge_test.go`。2026-07-28 验收证据类型混挂（verifier 把 command 佐证证据挂到 file_hash criterion，连续三次真实运行复现）已修复：类型化 criterion 的证据纯度违例消息改为指明违例证据 ID 与修正指引，verifier 指引文本补 typed-criterion purity 规则，回归见 `internal/plan/acceptance_evidence_purity_test.go`。2026-07-28 Agent 工作台跨轮输出被最新一轮覆盖的问题已修复：Scheduler 与普通 Agent 现共用不可变完成轮次事件和 Session `turns.jsonl` 账本，TUI/Web 可恢复并浏览全部轮次；证据归档至 [agent-turn-history-loss-incident-2026-07-28.md](../archived/agent-turn-history-loss-incident-2026-07-28.md)。2026-07-29 验收 verifier 的 command 证据在 Windows 上误读 UTF-8 中文文件（PowerShell 对无 BOM 文件按系统 ANSI/GBK 解码，子串断言全部误 fail；行为评测全量首跑 long-form-write 连续两轮验收因此翻车，verifier 自述「文档实际含全部标题」仍被迫判 fail）已修复：内置 verifier 指引补充「内容断言优先 read_file/file_hash 证据；必须 command 证据时显式带 -Encoding UTF8」（`internal/agenttemplate/prompts/verifier.md`）。2026-07-29 expected-artifacts 校验「账本失忆」空转（重试/替代任务换新任务 ID 后 artifact 账本为空，前次尝试写好的文件明明在盘上却连撞提交拒绝，eval smoke 实测 worker 空转 4 轮 + 一次重试回滚）已修复：校验增加磁盘兜底——账本缺失的预期项经 `agent.NewArtifactPhysicalResolver` 解析后 stat，盘上存在（非目录）即转入 `ArtifactCheckResult.Recovered` 视为满足；resolver 为 nil 时退化为纯账本比对，装配点见 `internal/runner/runner.go` 与 `internal/runner/dependency_map.go`。截至本次核对，没有把已修复条目重新列为开放缺陷。
 
-2026-08-26 Windows SWE Harness 进程监控误杀与 NTFS 批次时间边界竞态已修复：监控改为持有 `subprocess.Popen` 并通过 `poll()` 查询生命周期，不再调用 `os.kill(pid, 0)`；批次新鲜度改用 `.batch_start` 的实际文件系统 mtime。原因、实现与 Windows 回归证据归档至 [windows-swe-harness-process-monitor-incident-2026-08-26.md](../archived/windows-swe-harness-process-monitor-incident-2026-08-26.md)。
+2026-08-26 Windows SWE Test Runner 进程监控误杀与 NTFS 批次时间边界竞态已修复：监控改为持有 `subprocess.Popen` 并通过 `poll()` 查询生命周期，不再调用 `os.kill(pid, 0)`；批次新鲜度改用 `.batch_start` marker 的实际文件系统 mtime。归档文件名保留改名前的历史名称：[windows-swe-harness-process-monitor-incident-2026-08-26.md](../archived/windows-swe-harness-process-monitor-incident-2026-08-26.md)。
 
-2026-08-27 Windows SWE Harness v4 路径渲染缺陷已修复：`Path` 占位符统一转为 forward slash，`project_root` 与全部 `system_prompt_file` 不再携带反斜杠；普通字符串不参与路径归一。49 项 Harness 测试、真实 config doctor（错误 0）与无模型二进制 healthz 200 冒烟均通过，证据见 [SWE-057 版本化回归套件](../test-issues/2026-08-27-0109-versioned-swe-suite.md)。
+2026-08-27 Windows SWE Test Runner v4 路径渲染缺陷已修复：`Path` 占位符统一转为 forward slash，`project_root` 与全部 `system_prompt_file` 不再携带反斜杠；普通字符串不参与路径归一。49 项 Test Runner 测试、真实 config doctor（错误 0）与无模型二进制 healthz 200 冒烟均通过，证据见 [SWE-057 版本化回归套件](../test-issues/2026-08-27-0109-versioned-swe-suite.md)。
+
+2026-08-27 Windows SWE Test Runner 重复运行时的 ReadOnly worktree 清理失败已修复：删除回调只对 Windows `PermissionError` 清除 Git object 的 ReadOnly 属性并重试一次，其它错误继续 fail-closed；真实 testbed 同一路径连续两次清理均通过。证据归档至 [windows-swe-test-runner-readonly-worktree-cleanup-2026-08-27.md](../archived/windows-swe-test-runner-readonly-worktree-cleanup-2026-08-27.md)。
 
 2026-08-19 Graph artifact Evidence 异步登记竞态已修复：`write_file` / `edit_file` 现在返回前同步、幂等地写入路径与 sha256/bytes，artifact log 追加或 fsync 失败会 fail-closed 且保持可重试状态，不再接受 group-commit 的掉电窗口；`submit_task_result` 与自然完成的磁盘恢复项也会在终态前补登 ledger。异步 record-artifact Reactor 仅保留为兼容观察器。回归见 `internal/tools/local_write_test.go`、`internal/tools/submit_result_test.go`、`internal/agent/agent_test.go`、`internal/store/persistence_test.go`、`internal/store/persistence_groupcommit_test.go` 与 `internal/runner/submit_result_runner_test.go`。
 

@@ -3,13 +3,13 @@
 # 用途：以 Flask 真实仓库为对象的中等项目行为评测（SWE 式红→绿任务）。
 # 这是一个**模板**：__AGENTGO_ROOT__/__PROJECT_ROOT__/__PORT__/__TOKEN__/
 # __BASE_URL__/__MODEL__/__PROTOCOL__/__KEY_VAR__ 八个占位符由仓库内
-# `scripts/swe_harness/harness.py`
+# `scripts/swe_test_runner/runner.py`
 # 在每次运行时渲染；正式题目清单与 prompt 位于仓库 suite，外部 `SWE_TESTBED`
 # 只保存 Flask 源仓库、隔离 worktree 和运行产物。
 #
-# 换模型供应商需显式设置下列三个环境变量；协议默认使用 responses，完整 Harness
+# 换模型供应商需显式设置下列三个环境变量；协议默认使用 responses，完整 SWE Test Runner
 # 启动环境契约见
-# `scripts/swe_harness/README.md`：
+# `scripts/swe_test_runner/README.md`：
 #   SWE_BASE_URL   供应商的 OpenAI 兼容端点
 #   SWE_MODEL      模型名，全角色统一
 #   SWE_API_KEY    注入密钥的环境变量（固定读取该变量名）

@@ -64,7 +64,7 @@ tool-router/request-digest 的 `ContextBinding` 调用统一 `llm.Invoke`；源�
 ContextAdapter/Compiler 编码路径预检静态 Prompt；不兼容时拒绝装配，不能再把
 问题推迟到用户 Task。
 
-仓库验证已完成：full/race/vet/build、真实二进制、harness 单测与 provider 单题
+仓库验证已完成：full/race/vet/build、真实二进制、SWE Test Runner 单测与 provider 单题
 架构门通过。最新 Run 使用 Context v7，未复现 `fragment_limit_exceeded`；任务因
 Worker 零写入被 L4 blocked，属于任务正确率失败。仍开放真实 tokenizer、更多
 provider fixture、三平台 CI 与 Flask 8题 rollout；这些属于外部效果/发布证据，
