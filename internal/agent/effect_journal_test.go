@@ -183,6 +183,14 @@ func (m *closingMergeManager) Materialize(taskID string) (*workspace.View, error
 	return m.base.Materialize(taskID)
 }
 
+func (m *closingMergeManager) MaterializeOwned(workspaceID string, owner workspace.Owner) (*workspace.View, error) {
+	return m.base.MaterializeOwned(workspaceID, owner)
+}
+
+func (m *closingMergeManager) Acquire(workspaceID string) (func(), error) {
+	return m.base.Acquire(workspaceID)
+}
+
 func (m *closingMergeManager) MergeTask(ctx context.Context, taskID, agentID string) (*workspace.MergeResult, error) {
 	result, err := m.base.MergeTask(ctx, taskID, agentID)
 	if err == nil {

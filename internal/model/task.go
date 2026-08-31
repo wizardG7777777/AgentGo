@@ -117,6 +117,8 @@ type Task struct {
 	// 不是 Graph activation，故 GraphID/NodeID/ActivationID 必须保持空；这些
 	// 独立字段让 Scheduler 机械区分“非图请求重建 Draft”与“现有 Graph 变更裁决”，
 	// 禁止解析 Description marker 猜 lineage。
+	// graph-change wake 同样使用本组字段；EventSource 区分 L4 intervention
+	// 与 L5 graph-change，两者都不得通过 Description marker 猜测作用域。
 	InterventionGraphID      string `json:"intervention_graph_id,omitempty"`
 	InterventionNodeID       string `json:"intervention_node_id,omitempty"`
 	InterventionActivationID string `json:"intervention_activation_id,omitempty"`
@@ -150,11 +152,18 @@ type Task struct {
 	NodeID        string `json:"node_id,omitempty"`
 	ActivationID  string `json:"activation_id,omitempty"`
 	GraphNodeKind string `json:"graph_node_kind,omitempty"`
+	// DeliveryID 是 Graph v3 的 L5 交付事务身份。它不替代 activation：多个
+	// repair activation 可共享同一 DeliveryID，只有 acceptance pass 后才允许
+	// 由协调器提升其 workspace candidate。
+	DeliveryID string `json:"delivery_id,omitempty"`
 	// GraphControllerRole 是 controller activation 的冻结 L5 控制职责；空值为
 	// 普通 controller。RecoverySourceTaskID 只在 loop_recovery controller 上
 	// 非空，把恢复决策精确绑定到触发 intervention 的 Graph Task。
 	GraphControllerRole  string `json:"graph_controller_role,omitempty"`
 	RecoverySourceTaskID string `json:"recovery_source_task_id,omitempty"`
+	// GraphRecoveryDeltaSchema 是 loop_recovery 节点冻结的版本化 handoff
+	// 契约。执行层只按该字段收窄 submit schema，不从任务描述猜测。
+	GraphRecoveryDeltaSchema string `json:"graph_recovery_delta_schema,omitempty"`
 	// OutcomeRef 指向 L4 append-only TaskOutcome。新 authoring Graph 的终态
 	// 必须先 durable 提交该事实，再把引用与 Task 状态一起生效；legacy 为空。
 	OutcomeRef string `json:"outcome_ref,omitempty"`
@@ -272,7 +281,10 @@ type Task struct {
 }
 
 // Framework 拥有的 EventSource 稳定词表。跨层授权不得各自手写字符串。
-const TaskEventSourceLoopIntervention = "loop-intervention"
+const (
+	TaskEventSourceLoopIntervention = "loop-intervention"
+	TaskEventSourceGraphChange      = "graph-change-request"
+)
 
 // NodeCapability 是 DAG 节点级的能力声明，随 Task 携带。
 // 三方（model / store / agent）共用的统一契约，字段语义：

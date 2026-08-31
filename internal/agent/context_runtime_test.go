@@ -24,6 +24,7 @@ type contextRuntimeLLM struct {
 	messages []llm.Message
 	tools    []llm.ToolDef
 	binding  invocation.ContextBinding
+	response llm.Response
 }
 
 func newAgentTestContextRuntime(t *testing.T) ContextRuntime {
@@ -53,6 +54,9 @@ func (f *contextRuntimeLLM) Chat(ctx context.Context, messages []llm.Message, to
 	f.messages = append([]llm.Message(nil), messages...)
 	f.tools = append([]llm.ToolDef(nil), tools...)
 	f.binding, _ = invocation.ContextBindingFrom(ctx)
+	if len(f.response.ToolCalls) > 0 || f.response.Content != "" {
+		return f.response, nil
+	}
 	return llm.Response{Content: "完成", FinishReason: llm.FinishReasonStop}, nil
 }
 
@@ -145,6 +149,65 @@ func TestLLMExecutorUsesDurableContextCompilerAndParentChain(t *testing.T) {
 	if err != nil || !ok || stored2.Snapshot.ParentSnapshotRef != first.ContextSnapshotID {
 		t.Fatalf("Snapshot parent chain 错误: ok=%v err=%v parent=%q want=%q",
 			ok, err, stored2.Snapshot.ParentSnapshotRef, first.ContextSnapshotID)
+	}
+}
+
+func TestObservationControlInvocationUsesFrozenNarrowOutputBudget(t *testing.T) {
+	runtime := newAgentTestContextRuntime(t)
+	client := &contextRuntimeLLM{response: llm.Response{
+		ToolCalls:    []llm.ToolCall{{ID: "obs-1", Name: "record_observation_delta", Arguments: map[string]any{}}},
+		FinishReason: llm.FinishReasonToolCalls,
+	}}
+	registry := NewToolRegistry()
+	registry.Register("record_observation_delta", "冻结 Observation", map[string]any{"type": "object"},
+		func(context.Context, map[string]any) (string, error) {
+			return `{"observation_delta_ref":"observation:sha256:test"}`, nil
+		})
+	executor := NewSwappableLLMExecutor(client, registry, nil, nil, nil, "", "系统")
+	executor.SetContextRuntime(runtime)
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	progress, _ := catalog.ProgressContract(policycatalog.ProgressCodeChangeV6)
+	now := time.Now().UTC()
+	task := &model.Task{
+		ID: "task-observation-budget", RunID: "run-observation-budget",
+		RunContract: &runcontract.RunContract{
+			Schema: runcontract.SchemaV2, RunID: "run-observation-budget", CreatedAt: now.Add(-time.Minute),
+			DeadlineAt: now.Add(time.Hour), VerificationReserve: 10 * time.Minute,
+			RecoveryReserve: 10 * time.Minute, FinalizationReserve: 5 * time.Minute, BudgetProfile: "test/v2",
+		},
+		RunPhase: runcontract.PhaseExecution, ContextPolicyRef: policycatalog.ContextDefaultV10,
+		ProgressContract: &progress.Contract, Description: "冻结观察", AttemptID: "task-observation-budget/attempt-1",
+		ContextInputs: []model.TaskContextInput{{Kind: model.TaskContextUpstreamEvidence,
+			SourceRef: "graph:g/activation:work@1/evidence:default", Content: "upstream-ev-forbidden"}},
+		Lease: &model.ExecutionLease{TaskID: "task-observation-budget", Attempt: 1, FrozenAt: now,
+			ControlTools: []string{"record_observation_delta"}, Digest: "lease-observation"},
+	}
+	ctx := WithExecutionIdentity(context.Background(), string(task.RunID), task.AttemptID, task.AttemptID+"/turn-1")
+	_, err = executor.Execute(ctx, task, map[string]string{"upstream": "dependency-ev-forbidden"}, []HistoryEntry{{
+		SystemNotice: observationCheckpointNotice("periodic", "冻结当前状态"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget := client.binding.OutputBudget
+	if budget.MaxCompletionTokens != 2048 || budget.MaxToolArgumentsBytes != 16<<10 ||
+		budget.MaxToolArgumentsTotalBytes != 16<<10 || budget.MaxResponseBytes != 32<<10 ||
+		budget.MaxToolCalls != 1 {
+		t.Fatalf("Observation control OutputBudget 未收紧: %+v", budget)
+	}
+	if client.binding.ToolChoice.Mode != invocation.ToolChoiceFunction ||
+		client.binding.ToolChoice.Name != "record_observation_delta" || client.binding.ReasoningEffort != "none" {
+		t.Fatalf("Observation control wire contract 漂移: %+v", client.binding)
+	}
+	joined := ""
+	for _, message := range client.messages {
+		joined += message.Content
+	}
+	if strings.Contains(joined, "upstream-ev-forbidden") || strings.Contains(joined, "dependency-ev-forbidden") {
+		t.Fatalf("Observation control 暴露了非当前 Attempt authority 的上游证据: %q", joined)
 	}
 }
 

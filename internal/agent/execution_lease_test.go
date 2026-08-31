@@ -9,6 +9,7 @@ import (
 	"agentgo/internal/graph"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
+	"agentgo/internal/policycatalog"
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
 )
@@ -238,6 +239,33 @@ func TestComputeExecutionLease_ControlToolsByRole(t *testing.T) {
 				t.Fatalf("最小权限 Graph 角色 ControlTools = %v，want [submit_task_result]", got.ControlTools)
 			}
 		})
+	}
+}
+
+func TestComputeExecutionLease_CodeChangeObservationControlIsCanonical(t *testing.T) {
+	s, _, _ := setup()
+	ag, _, _ := newLeaseAgent("worker", "code", s, "read_content_ref", "read_file")
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := catalog.ProgressContract(policycatalog.ProgressCodeChangeCurrent)
+	if !ok {
+		t.Fatal("缺少 current code-change ProgressContract")
+	}
+	task := &model.Task{ID: "t-observation", EventType: "code", GraphID: "g1",
+		GraphNodeKind: "agent", ProgressContract: &profile.Contract}
+	lease, rejection := ag.computeExecutionLease(task)
+	if rejection != "" || lease == nil {
+		t.Fatalf("冻结租约失败: lease=%+v rejection=%q", lease, rejection)
+	}
+	want := []string{"record_observation_delta", "request_replan", "submit_task_result"}
+	if !slices.Equal(lease.ControlTools, want) ||
+		!slices.Equal(lease.ControlTools, model.SortedCopy(lease.ControlTools)) {
+		t.Fatalf("Observation 控制工具必须 canonical: got=%v want=%v", lease.ControlTools, want)
+	}
+	if lease.ComputeDigest() != lease.Digest {
+		t.Fatalf("canonical 租约 digest 失配: %+v", lease)
 	}
 }
 
@@ -656,6 +684,21 @@ func TestLoopRecoveryControllerLeaseUsesTransactionalGraphControlOnly(t *testing
 		if slices.Contains(got, forbidden) {
 			t.Fatalf("loop_recovery controller 不得获得 %s: %v", forbidden, got)
 		}
+	}
+}
+
+func TestRecoveryV4WorkLeaseIncludesChangeDecisionControl(t *testing.T) {
+	task := &model.Task{GraphID: "g-recovery", GraphNodeKind: string(graph.KindAgent),
+		GraphRecoveryDeltaSchema: graph.RecoveryDeltaSchemaV4}
+	got := deriveControlTools(task)
+	want := []string{"request_replan", "submit_change_decision", "submit_task_result"}
+	if !sameExactToolSet(got, want) {
+		t.Fatalf("Recovery v4 work 控制面=%v，want %v", got, want)
+	}
+	legacy := *task
+	legacy.GraphRecoveryDeltaSchema = graph.RecoveryDeltaSchemaV3
+	if slices.Contains(deriveControlTools(&legacy), "submit_change_decision") {
+		t.Fatal("v1-v3 work 不得看到 v4 change decision 工具")
 	}
 }
 

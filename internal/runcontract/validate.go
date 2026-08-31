@@ -10,7 +10,7 @@ const maxIdentityRunes = 160
 
 // Validate 校验无需读取当前时钟的结构不变量。
 func (c RunContract) Validate() error {
-	if c.Schema != SchemaV1 {
+	if c.Schema != SchemaV1 && c.Schema != SchemaV2 {
 		return fmt.Errorf("RunContract schema=%q，无效", c.Schema)
 	}
 	if err := validateIdentity("run_id", string(c.RunID)); err != nil {
@@ -34,8 +34,40 @@ func (c RunContract) Validate() error {
 	if err := validateDuration("recovery_reserve", c.RecoveryReserve); err != nil {
 		return err
 	}
+	if err := validateDuration("verification_reserve", c.VerificationReserve); err != nil {
+		return err
+	}
+	if c.Schema == SchemaV1 && c.VerificationReserve != 0 {
+		return fmt.Errorf("RunContract v1 不得携带 verification_reserve")
+	}
+	if c.Schema == SchemaV1 && len(c.CheckContracts) != 0 {
+		return fmt.Errorf("RunContract v1 不得携带 check_contracts")
+	}
+	if len(c.CheckContracts) > 16 {
+		return fmt.Errorf("RunContract check_contracts 超过 16 项上限")
+	}
+	seenChecks := make(map[string]struct{}, len(c.CheckContracts))
+	for index, check := range c.CheckContracts {
+		if err := validateIdentity(fmt.Sprintf("check_contracts[%d].check_id", index), check.CheckID); err != nil {
+			return err
+		}
+		if err := validateIdentity(fmt.Sprintf("check_contracts[%d].kind", index), check.Kind); err != nil {
+			return err
+		}
+		if _, duplicate := seenChecks[check.CheckID]; duplicate {
+			return fmt.Errorf("RunContract check_contracts.check_id=%q 重复", check.CheckID)
+		}
+		seenChecks[check.CheckID] = struct{}{}
+		if check.ExactCommand != strings.TrimSpace(check.ExactCommand) {
+			return fmt.Errorf("check_contracts[%d].exact_command 不得有首尾空白", index)
+		}
+		if len([]rune(check.ExactCommand)) > 4096 {
+			return fmt.Errorf("check_contracts[%d].exact_command 超过 4096 rune", index)
+		}
+	}
 	window := c.DeadlineAt.Sub(c.CreatedAt)
-	if c.RecoveryReserve >= window || c.FinalizationReserve >= window-c.RecoveryReserve {
+	if c.VerificationReserve >= window || c.RecoveryReserve >= window-c.VerificationReserve ||
+		c.FinalizationReserve >= window-c.VerificationReserve-c.RecoveryReserve {
 		return fmt.Errorf("RunContract reserve 总和必须小于运行窗口")
 	}
 	return c.Budget.Validate()
@@ -59,6 +91,9 @@ func (c RunContract) ValidatePhaseAt(now time.Time, phase Phase) error {
 	if !phase.Valid() {
 		return fmt.Errorf("Run phase=%q 无效", phase)
 	}
+	if phase == PhaseVerification && c.Schema != SchemaV2 {
+		return fmt.Errorf("RunContract v1 不支持 verification phase")
+	}
 	latestStart := c.PhaseStartDeadline(phase)
 	if !now.Before(latestStart) {
 		return fmt.Errorf("RunContract phase=%s 的剩余时间窗已耗尽", phase)
@@ -69,8 +104,10 @@ func (c RunContract) ValidatePhaseAt(now time.Time, phase Phase) error {
 // PhaseStartDeadline 返回某阶段允许创建新 Task/Activation 的最后时刻。
 // 它只投影冻结 RunContract，不读取当前时钟。
 func (c RunContract) PhaseStartDeadline(phase Phase) time.Time {
-	latestStart := c.DeadlineAt.Add(-(c.FinalizationReserve + c.RecoveryReserve))
+	latestStart := c.DeadlineAt.Add(-(c.FinalizationReserve + c.RecoveryReserve + c.VerificationReserve))
 	switch phase {
+	case PhaseVerification:
+		latestStart = c.DeadlineAt.Add(-(c.FinalizationReserve + c.RecoveryReserve))
 	case PhaseRecovery:
 		latestStart = c.DeadlineAt.Add(-c.FinalizationReserve)
 	case PhaseFinalization:
@@ -134,6 +171,9 @@ func (d DeadlineBudget) Validate() error {
 		return err
 	}
 	if err := validateDuration("recovery_reserve", d.RecoveryReserve); err != nil {
+		return err
+	}
+	if err := validateDuration("verification_reserve", d.VerificationReserve); err != nil {
 		return err
 	}
 	if !d.InterventionAt.IsZero() {

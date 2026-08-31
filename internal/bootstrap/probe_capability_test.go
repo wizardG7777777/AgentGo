@@ -184,7 +184,9 @@ func TestStartupToolProbeRetriesInconclusiveTruncationWithinFrozenDeadline(t *te
 }
 
 func TestStartupToolProbeRejectsTextOnlyProvider(t *testing.T) {
+	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id": "probe", "object": "chat.completion", "created": 1, "model": "test-model",
@@ -202,6 +204,9 @@ func TestStartupToolProbeRejectsTextOnlyProvider(t *testing.T) {
 	}
 	if err := startupProbe(&bytes.Buffer{}, cfg); err == nil || !strings.Contains(err.Error(), "function-call capability 不兼容") {
 		t.Fatalf("text-only provider 应被 capability gate 拒绝: %v", err)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("text-only provider 应连续三次失败后拒绝，calls=%d", calls.Load())
 	}
 }
 

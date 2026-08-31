@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -162,6 +163,86 @@ func TestAdapterBuildsSettledAssistantToolExchange(t *testing.T) {
 	group := atomicGroup(result.Snapshot, contextcontract.AtomicAssistantToolExchange)
 	if group == nil || len(group.FragmentIDs) != 3 || group.ReplayPolicy != contextcontract.ReplayOptional {
 		t.Fatalf("assistant/tool exchange 原子组错误: %+v", group)
+	}
+}
+
+func TestAdapterReplayV4KeepsReferencedToolExchangeAtomicAndAuditable(t *testing.T) {
+	input := adapterTestInput(t)
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	contextProfile, _ := catalog.ContextPolicy(policycatalog.ContextDefaultV10)
+	replayProfile, _ := catalog.ProviderReplayPolicy(contextProfile.ReplayPolicyRef)
+	input.BudgetPolicy = contextProfile.Policy
+	input.ReplayPolicy, input.ReplayPolicyRef = replayProfile.Policy, replayProfile.Ref
+	digest := contextcontract.DigestBytes([]byte("original"))
+	assistantRef := fmt.Sprintf(`{"schema":"agentgo.assistant-content-ref/v1","ref_id":"content-ref:a","sha256":%q,"reason":"observation_covered"}`, digest)
+	toolRef := fmt.Sprintf(`{"schema":"agentgo.tool-result-ref/v1","ref_id":"content-ref:b","sha256":%q,"reason":"observation_covered+duplicate_content"}`, digest)
+	call := llm.ToolCall{ID: "call-ref", Name: "read_file", Arguments: map[string]any{"path": "a.go"}}
+	input.History = []SettledTurn{{
+		TurnID: "turn-ref", Assistant: llm.Message{Role: "assistant", Content: assistantRef, ToolCalls: []llm.ToolCall{call}},
+		ToolResults: []llm.Message{{Role: "tool", ToolCallID: call.ID, Content: toolRef}},
+	}}
+	result, err := New().Compile(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := atomicGroup(result.Snapshot, contextcontract.AtomicAssistantToolExchange)
+	if group == nil || group.ReplayPolicy != contextcontract.ReplayRequiredTransformable ||
+		group.TransformID != "assistant_tool_exchange_ref/v1" || len(group.FragmentIDs) != 3 {
+		t.Fatalf("Replay v4 引用化后破坏 tool exchange 原子性: %+v", group)
+	}
+	foundAssistant, foundTool := false, false
+	for _, item := range result.Snapshot.Manifest.Items {
+		switch item.Kind {
+		case contextcontract.FragmentAssistantContent:
+			foundAssistant = item.Disposition == contextcontract.DispositionReferenced &&
+				item.ProjectionReason == "observation_covered" && item.ContentRef == "content-ref:a"
+		case contextcontract.FragmentToolResult:
+			foundTool = item.Disposition == contextcontract.DispositionTombstoned &&
+				item.ProjectionReason == "observation_covered+duplicate_content" && item.ContentRef == "content-ref:b"
+		}
+	}
+	if !foundAssistant || !foundTool {
+		t.Fatalf("Manifest 未记录 Replay v4 reason/digest/ContentRef: %+v", result.Snapshot.Manifest.Items)
+	}
+}
+
+func TestContextSnapshotDigestStableAcrossMapInsertionOrder(t *testing.T) {
+	compile := func(reverse bool) Result {
+		input := adapterTestInput(t)
+		arguments := make(map[string]any)
+		parameters := make(map[string]any)
+		properties := make(map[string]any)
+		if reverse {
+			arguments["limit"], arguments["path"] = 20, "a.go"
+			properties["limit"], properties["path"] = map[string]any{"type": "integer"}, map[string]any{"type": "string"}
+			parameters["properties"], parameters["type"] = properties, "object"
+		} else {
+			arguments["path"], arguments["limit"] = "a.go", 20
+			properties["path"], properties["limit"] = map[string]any{"type": "string"}, map[string]any{"type": "integer"}
+			parameters["type"], parameters["properties"] = "object", properties
+		}
+		call := llm.ToolCall{ID: "stable-call", Name: "read_file", Arguments: arguments}
+		input.ToolRouter.Definitions[0].Parameters = parameters
+		input.History = []SettledTurn{{
+			TurnID: "stable-turn", Assistant: llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{call}},
+			ToolResults: []llm.Message{{Role: "tool", ToolCallID: call.ID, Content: "package a"}},
+		}}
+		result, err := New().Compile(context.Background(), input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	left, right := compile(false), compile(true)
+	if left.Snapshot.SnapshotID != right.Snapshot.SnapshotID ||
+		left.Snapshot.EncodedRequestDigest != right.Snapshot.EncodedRequestDigest ||
+		!bytes.Equal(left.Runtime.EncodedRequest, right.Runtime.EncodedRequest) {
+		t.Fatalf("map 插入顺序改变 ContextSnapshot identity: left=%s/%s right=%s/%s",
+			left.Snapshot.SnapshotID, left.Snapshot.EncodedRequestDigest,
+			right.Snapshot.SnapshotID, right.Snapshot.EncodedRequestDigest)
 	}
 }
 

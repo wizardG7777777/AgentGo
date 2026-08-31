@@ -7,22 +7,118 @@ package watchdog
 
 import (
 	"errors"
+	"os"
 	"testing"
 
 	"agentgo/internal/model"
+	"agentgo/internal/workspace"
 )
 
 // fakeWorkspaceCleaner 记录 Cleanup 调用并按需注入 ListOrphans 错误。
 type fakeWorkspaceCleaner struct {
 	orphans []string
+	records []workspace.Record
+	inUse   map[string]bool
 	listErr error
 	cleaned []string
 }
 
-func (f *fakeWorkspaceCleaner) ListOrphans() ([]string, error) { return f.orphans, f.listErr }
+func (f *fakeWorkspaceCleaner) ListWorkspaces() ([]workspace.Record, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	if f.records != nil {
+		return f.records, nil
+	}
+	out := make([]workspace.Record, 0, len(f.orphans))
+	for _, id := range f.orphans {
+		out = append(out, workspace.Record{WorkspaceID: id, Owner: workspace.TaskOwner(id), Legacy: true})
+	}
+	return out, nil
+}
+func (f *fakeWorkspaceCleaner) InUse(workspaceID string) bool { return f.inUse[workspaceID] }
 func (f *fakeWorkspaceCleaner) Cleanup(taskID string) error {
 	f.cleaned = append(f.cleaned, taskID)
 	return nil
+}
+
+func TestCleanupWorkspaceOrphans_ActiveLeaseAlwaysKept(t *testing.T) {
+	w, _, _ := newTestWatchdog()
+	task := publishPending(t, w, "活动租约")
+	if err := w.Store.TransitionState(task.ID, model.TaskStatusPending, model.TaskStatusFailed); err != nil {
+		t.Fatalf("TransitionState: %v", err)
+	}
+	mgr := &fakeWorkspaceCleaner{orphans: []string{task.ID}, inUse: map[string]bool{task.ID: true}}
+	w.WorkspaceManager = mgr
+	w.RunOnce()
+	if len(mgr.cleaned) != 0 {
+		t.Fatalf("活动租约必须优先于终态清扫: %v", mgr.cleaned)
+	}
+}
+
+func TestCleanupWorkspaceOrphans_DeliveryUsesGraphRetention(t *testing.T) {
+	w, _, _ := newTestWatchdog()
+	owner := workspace.DeliveryOwner("task-1", "delivery:0123456789abcdef", "run-1", "graph-1")
+	id := workspace.DeliveryWorkspaceID(owner.DeliveryID)
+	record := workspace.Record{WorkspaceID: id, Owner: owner}
+	for _, tc := range []struct {
+		name    string
+		known   bool
+		retain  bool
+		cleaned bool
+	}{
+		{name: "运行中保留", known: true, retain: true},
+		{name: "未知保留", known: false, retain: false},
+		{name: "已提交清理", known: true, retain: false, cleaned: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr := &fakeWorkspaceCleaner{records: []workspace.Record{record}}
+			w.WorkspaceManager = mgr
+			w.WorkspaceRetention = WorkspaceRetentionResolverFunc(func(workspace.Record) (bool, bool) {
+				return tc.retain, tc.known
+			})
+			w.RunOnce()
+			if got := len(mgr.cleaned) == 1; got != tc.cleaned {
+				t.Fatalf("cleaned=%v want=%v records=%v", mgr.cleaned, tc.cleaned, record)
+			}
+		})
+	}
+}
+
+func TestRealDeliveryWorkspaceSurvivesActiveAndGraphRetentionSweeps(t *testing.T) {
+	w, _, _ := newTestWatchdog()
+	manager := workspace.NewManager(t.TempDir(), nil)
+	deliveryID := "delivery:0123456789abcdef"
+	workspaceID := workspace.DeliveryWorkspaceID(deliveryID)
+	owner := workspace.DeliveryOwner("task-1", deliveryID, "run-1", "graph-1")
+	view, err := manager.MaterializeOwned(workspaceID, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := manager.Acquire(workspaceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.WorkspaceManager = manager
+	w.WorkspaceRetention = WorkspaceRetentionResolverFunc(func(workspace.Record) (bool, bool) {
+		return true, true
+	})
+	w.RunOnce()
+	if _, err := os.Stat(view.Root()); err != nil {
+		t.Fatalf("活动租约 sweep 后 Delivery workspace 丢失: %v", err)
+	}
+	release()
+	w.RunOnce()
+	if _, err := os.Stat(view.Root()); err != nil {
+		t.Fatalf("Graph 运行期 retention sweep 后 Delivery workspace 丢失: %v", err)
+	}
+	w.WorkspaceRetention = WorkspaceRetentionResolverFunc(func(workspace.Record) (bool, bool) {
+		return false, true
+	})
+	w.RunOnce()
+	if _, err := os.Stat(view.Root()); !os.IsNotExist(err) {
+		t.Fatalf("已提交 Delivery 残留应被级联清理: %v", err)
+	}
 }
 func (f *fakeWorkspaceCleaner) ProjectRoot() string { return "/proj" }
 

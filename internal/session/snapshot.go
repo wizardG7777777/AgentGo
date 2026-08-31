@@ -101,8 +101,13 @@ type TaskSnapshot struct {
 	NodeID                       string `json:"node_id,omitempty"`
 	ActivationID                 string `json:"activation_id,omitempty"`
 	GraphNodeKind                string `json:"graph_node_kind,omitempty"`
+	DeliveryID                   string `json:"delivery_id,omitempty"`
 	GraphControllerRole          string `json:"graph_controller_role,omitempty"`
 	RecoverySourceTaskID         string `json:"recovery_source_task_id,omitempty"`
+	GraphRecoveryDeltaSchema     string `json:"graph_recovery_delta_schema,omitempty"`
+	InterventionGraphID          string `json:"intervention_graph_id,omitempty"`
+	InterventionNodeID           string `json:"intervention_node_id,omitempty"`
+	InterventionActivationID     string `json:"intervention_activation_id,omitempty"`
 	FinalReportGraphID           string `json:"final_report_graph_id,omitempty"`
 	OutcomeRef                   string `json:"outcome_ref,omitempty"`
 	GraphDefinitionDigestVersion string `json:"graph_definition_digest_version,omitempty"`

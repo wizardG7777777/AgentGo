@@ -99,6 +99,11 @@ type commitGraphChangeArgs struct {
 	ValidationReportID       string `json:"validation_report_id"`
 }
 
+type submitGraphChangeDecisionArgs struct {
+	Decision string `json:"decision"`
+	Summary  string `json:"summary"`
+}
+
 func (g GraphAuthoringGroup) Register(r *agent.ToolRegistry) {
 	r.Register("create_graph_draft",
 		"创建不可执行的空 GraphDraft。零参数调用；framework 生成稳定 proposal_id/graph_id 并绑定原始 request。简单任务下一步使用 configure_simple_graph_draft；复杂拓扑才使用通用 patch_graph_draft。",
@@ -155,12 +160,18 @@ func (g GraphAuthoringGroup) Register(r *agent.ToolRegistry) {
 			"expected_proposal_revision": nativeInteger("Proposal CAS revision"),
 		}, "change_id", "expected_proposal_revision"), g.validateGraphChange)
 	r.Register("commit_graph_change",
-		"消费 accepted change ValidationReport，原子提交新 Definition revision，并让其只供未来 Activation 使用。",
+		"消费 accepted change ValidationReport，原子提交新 Definition revision，并让其只供未来 Activation 使用；非图 graph-change coordination 成功后同时收口当前请求。",
 		nativeObject(map[string]any{
 			"change_id":                  nativeString("GraphChangeProposal ID"),
 			"expected_proposal_revision": nativeInteger("Proposal CAS revision"),
 			"validation_report_id":       nativeString("accepted report ID"),
 		}, "change_id", "expected_proposal_revision", "validation_report_id"), g.commitGraphChange)
+	r.Register("submit_graph_change_decision",
+		"在已读取冻结 Graph 后结构化提交“不修改 Definition”的 graph-change 裁决并收口当前 coordination task；仅 graph-change-request Scheduler task 可用。",
+		nativeObject(map[string]any{
+			"decision": map[string]any{"type": "string", "enum": []any{"no_change"}},
+			"summary":  nativeString("为何当前 Definition 无需或无法通过修改获得有效增量；不得包含自由 Graph JSON"),
+		}, "decision", "summary"), g.submitGraphChangeDecision)
 }
 
 func (g GraphAuthoringGroup) createDraft(_ context.Context, args map[string]any) (string, error) {
@@ -181,7 +192,7 @@ func (g GraphAuthoringGroup) createDraft(_ context.Context, args map[string]any)
 	}
 	requestDigest := schedulerRequestDigest(requestTask)
 	contract := graph.GraphContract{RequestRef: requestTask.ID, RequestDigest: requestDigest}
-	body := graph.GraphDefinitionBody{Schema: graph.SchemaV2, Nodes: map[string]graph.GraphDefinitionNode{}}
+	body := graph.GraphDefinitionBody{Schema: graph.SchemaV3, Nodes: map[string]graph.GraphDefinitionNode{}}
 	body.RunID = task.RunID
 	if task.RunContract != nil {
 		run := *task.RunContract
@@ -257,13 +268,17 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 	workBindings := graph.GraphContractBindings{Deliverables: []string{"primary-deliverable"}}
 	workProgress := policycatalog.ProgressInvestigationCurrent
 	workTools := []string{"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref"}
+	recoverySchema := graph.RecoveryDeltaSchemaV2
+	recoveryDescription := "读取 failure_context 中冻结的 TaskOutcome、reason_code、checkpoint、ObservationDelta、工作记录与证据，裁决当前 Graph 是否应创建新的 work Activation。若现有 Definition 需要改变，只能先走 GraphChangeProposal 的 propose→validate→commit 事务；不得修改已终态的旧 Activation，不得亲自执行业务工作。最终必须调用 submit_recovery_decision：retry 声明 changed_dimensions、strategy、类型化 first_action、expected_milestone，source 字段由 framework 自动绑定；blocked 必须说明 blocked_reason。没有可验证变化只能 blocked。"
 	if input.ExecutionClass == graph.ExecutionMutating {
 		contract.RequiredEffects = []string{"workspace-change"}
 		contract.RequiredChecks = []graph.ContractRequirement{{ID: "verification", Kind: "verification", Description: "最后一次代码改动后的 typed check 通过"}}
 		workBindings.Effects = []string{"workspace-change"}
 		workBindings.Checks = []string{"verification"}
 		workProgress = policycatalog.ProgressCodeChangeCurrent
-		workTools = append(workTools, "write_file", "edit_file", "run_shell", "run_check")
+		workTools = append(workTools, "write_file", "edit_file", "run_check")
+		recoverySchema = graph.RecoveryDeltaSchemaV4
+		recoveryDescription += " 本节点使用 RecoveryDelta v4：first_action 必须是 EvidenceContract 首个文件的 read_file；evidence_contract.files 冻结下一 Worker 在修改决策前必须完整覆盖的最小文件集合。L3 只强制证据覆盖与 typed edit/need_context/hypothesis_rejected/blocked 决策；只有 Worker 自选 edit 后才推进其声明的 edit steps 与冻结 CheckContract，禁止为制造进展而无条件改文件。"
 	}
 
 	completed := graph.EventCompleted
@@ -281,7 +296,7 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 				Title:       "执行原始请求",
 				Description: "完成下列原始请求。完成时提交非空 summary；若无法安全完成则提交 failed 或 blocked，不得伪报成功。\n\n" + objective,
 			},
-			Capability: &graph.Capability{Tools: workTools},
+			Capability: &graph.Capability{Tools: workTools, Isolation: map[bool]string{true: graph.IsolationWorkspace}[input.ExecutionClass == graph.ExecutionMutating]},
 			Next: []graph.Transition{
 				{To: "acceptance", TargetInput: "work_result", When: &graph.Condition{Event: completed}},
 				{To: "work-failed", When: &graph.Condition{Event: failed}},
@@ -296,7 +311,7 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 			Kind: graph.KindController,
 			Task: &graph.NodeTask{
 				Title:          "裁决停滞执行的恢复路径",
-				Description:    "读取 failure_context 中冻结的 TaskOutcome、reason_code、checkpoint、ObservationDelta、工作记录与证据，裁决当前 Graph 是否应创建新的 work Activation。若现有 Definition 需要改变，只能先走 GraphChangeProposal 的 propose→validate→commit 事务；不得修改已终态的旧 Activation，不得亲自执行业务代码。最终必须调用 submit_recovery_decision：retry 声明 changed_dimensions、strategy、first_required_action、expected_milestone，source 字段由 framework 自动绑定；blocked 必须说明 blocked_reason。没有可验证变化只能 blocked。",
+				Description:    recoveryDescription,
 				RequiredInputs: []string{"failure_context"},
 			},
 			Next: []graph.Transition{
@@ -307,14 +322,14 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 			},
 			OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Fields: []graph.OutputFieldContract{
 				{Path: "$.decision", Type: "string", Description: "retry|blocked", Required: true},
-				{Path: "$.recovery_delta", Type: "object", Description: graph.RecoveryDeltaSchemaV1},
+				{Path: "$.recovery_delta", Type: "object", Description: recoverySchema},
 			}},
 			ProgressContractRef: policycatalog.ProgressCoordinationCurrent,
 			ContextPolicyRef:    policycatalog.ContextDefaultCurrent,
 			Metadata: map[string]string{
 				graph.MetadataControllerRole:      string(graph.ControllerRoleLoopRecovery),
 				graph.MetadataRecoveryMaxRetries:  "2",
-				graph.MetadataRecoveryDeltaSchema: graph.RecoveryDeltaSchemaV1,
+				graph.MetadataRecoveryDeltaSchema: recoverySchema,
 				"authoring_template":              "simple-task/v1",
 			},
 		},
@@ -353,14 +368,14 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 			},
 			OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Fields: []graph.OutputFieldContract{
 				{Path: "$.decision", Type: "string", Description: "retry|blocked", Required: true},
-				{Path: "$.recovery_delta", Type: "object", Description: graph.RecoveryDeltaSchemaV1},
+				{Path: "$.recovery_delta", Type: "object", Description: graph.RecoveryDeltaSchemaV2},
 			}},
 			ProgressContractRef: policycatalog.ProgressCoordinationCurrent,
 			ContextPolicyRef:    policycatalog.ContextDefaultCurrent,
 			Metadata: map[string]string{
 				graph.MetadataControllerRole:      string(graph.ControllerRoleLoopRecovery),
 				graph.MetadataRecoveryMaxRetries:  "2",
-				graph.MetadataRecoveryDeltaSchema: graph.RecoveryDeltaSchemaV1,
+				graph.MetadataRecoveryDeltaSchema: graph.RecoveryDeltaSchemaV2,
 				"authoring_template":              "simple-task/v1",
 			},
 		},
@@ -697,6 +712,10 @@ func (g GraphAuthoringGroup) proposeGraphChange(_ context.Context, args map[stri
 		return "", fmt.Errorf("loop_recovery controller 只能修改当前 Graph %s，目标为 %s",
 			task.GraphID, input.GraphID)
 	}
+	if task.InterventionGraphID != "" && strings.TrimSpace(input.GraphID) != task.InterventionGraphID {
+		return "", fmt.Errorf("graph-change coordination 只能修改冻结 Graph %s，目标为 %s",
+			task.InterventionGraphID, input.GraphID)
+	}
 	definition, ok := g.Store.GetDefinition(strings.TrimSpace(input.GraphID), input.BaseDefinitionRevision)
 	if !ok {
 		return "", fmt.Errorf("%w: %s@%d", graph.ErrDefinitionNotFound, input.GraphID, input.BaseDefinitionRevision)
@@ -810,11 +829,48 @@ func (g GraphAuthoringGroup) commitGraphChange(_ context.Context, args map[strin
 	if g.Runtime == nil {
 		return "", fmt.Errorf("commit_graph_change 不可用：AuthoringRuntime 未注入")
 	}
+	externalCoordination := task.GraphID == "" && task.EventSource == model.TaskEventSourceGraphChange
+	if externalCoordination && g.Finalization == nil {
+		return "", fmt.Errorf("commit_graph_change 不可用：graph-change coordination 缺少 FinalizationNotifier")
+	}
 	definition, err := g.Runtime.CommitGraphChangeAndAdopt(strings.TrimSpace(input.ChangeID), input.ExpectedProposalRevision, strings.TrimSpace(input.ValidationReportID))
 	if err != nil {
 		return "", err
 	}
+	if externalCoordination {
+		g.Finalization.MarkTaskFinalized()
+	}
 	return marshalGraphAuthoringResult(graphDefinitionReceiptOf(definition))
+}
+
+func (g GraphAuthoringGroup) submitGraphChangeDecision(_ context.Context, args map[string]any) (string, error) {
+	task, err := g.currentRootSchedulerTask("submit_graph_change_decision")
+	if err != nil {
+		return "", err
+	}
+	var input submitGraphChangeDecisionArgs
+	if err := decodeNativeGraphArgs(args, &input); err != nil {
+		return "", err
+	}
+	if task.GraphID != "" || task.EventSource != model.TaskEventSourceGraphChange ||
+		strings.TrimSpace(task.InterventionGraphID) == "" {
+		return "", fmt.Errorf("submit_graph_change_decision 仅允许冻结 graph-change-request Scheduler task 使用")
+	}
+	if strings.TrimSpace(input.Decision) != "no_change" {
+		return "", fmt.Errorf("graph-change decision 必须是 no_change")
+	}
+	summary := strings.TrimSpace(input.Summary)
+	if summary == "" {
+		return "", fmt.Errorf("graph-change no_change 裁决必须提供非空 summary")
+	}
+	if g.Finalization == nil {
+		return "", fmt.Errorf("submit_graph_change_decision 不可用：FinalizationNotifier 未注入")
+	}
+	g.Finalization.MarkTaskFinalized()
+	return marshalGraphAuthoringResult(map[string]any{
+		"schema": "agentgo.graph-change-decision/v1", "graph_id": task.InterventionGraphID,
+		"decision": "no_change", "summary": summary,
+	})
 }
 
 func (g GraphAuthoringGroup) currentRootSchedulerTask(operation string) (*model.Task, error) {
@@ -838,12 +894,19 @@ func (g GraphAuthoringGroup) currentRootSchedulerTask(operation string) (*model.
 		return nil, fmt.Errorf("%s 仅允许 origin/root Scheduler 或 loop_recovery controller 使用；当前任务属于 Graph %s role=%s",
 			operation, task.GraphID, task.GraphControllerRole)
 	}
+	if task.InterventionGraphID != "" {
+		scope, scopeErr := model.ClassifyControlScope(task)
+		if scopeErr != nil || scope != model.ControlScopeGraphChange || !recoveryGraphChangeOperation(operation) {
+			return nil, fmt.Errorf("%s 的 graph-change scope 无效: scope=%s err=%v", operation, scope, scopeErr)
+		}
+	}
 	return task, nil
 }
 
 func recoveryGraphChangeOperation(operation string) bool {
 	switch operation {
-	case "propose_graph_change", "read_graph_change", "validate_graph_change", "commit_graph_change":
+	case "propose_graph_change", "read_graph_change", "validate_graph_change", "commit_graph_change",
+		"submit_graph_change_decision":
 		return true
 	default:
 		return false

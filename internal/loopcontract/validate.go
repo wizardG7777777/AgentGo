@@ -112,11 +112,20 @@ func (p ProgressPolicy) Validate() error {
 	if p.MaxExplorationTurns < 0 {
 		return fmt.Errorf("max_exploration_turns 不能为负")
 	}
+	if p.FirstDeliverableHandoffReserve < 0 {
+		return fmt.Errorf("first_deliverable_handoff_reserve 不能为负")
+	}
 	if p.KnowledgeCheckpointAfterTurns < 0 {
 		return fmt.Errorf("knowledge_checkpoint_after_turns 不能为负")
 	}
-	if p.KnowledgeCheckpointAfterTurns > 0 && p.MaxObservationStagnation <= 0 {
-		return fmt.Errorf("启用 knowledge checkpoint 时 max_observation_stagnation 必须 > 0")
+	if p.DecisionCheckpointAfterTurns < 0 {
+		return fmt.Errorf("decision_checkpoint_after_turns 不能为负")
+	}
+	if p.KnowledgeCheckpointAfterTurns > 0 && p.MaxObservationStagnation <= 0 && p.MaxDecisionStagnation <= 0 {
+		return fmt.Errorf("启用 knowledge checkpoint 时 observation/decision stagnation 上限至少一个必须 > 0")
+	}
+	if p.MaxDecisionStagnation < 0 || p.MaxControlContractFailures < 0 {
+		return fmt.Errorf("decision/control contract failure 上限不能为负")
 	}
 	if p.MaxAttemptRollovers < 0 {
 		return fmt.Errorf("max_attempt_rollovers 不能为负")
@@ -315,7 +324,9 @@ func (c ProgressCheckpoint) Validate() error {
 	}
 	if c.LastDeltaSequence < 0 || c.NoProgressTurns < 0 || c.NoProgressDuration < 0 ||
 		c.ExplorationTurnsSinceDeliverable < 0 || c.KnowledgeTurnsSinceObservation < 0 ||
-		c.ObservationStagnationCount < 0 || c.InterventionCount < 0 || c.AttemptRolloverCount < 0 {
+		c.TurnsSinceDecisionCheckpoint < 0 ||
+		c.ObservationStagnationCount < 0 || c.DecisionStagnationCount < 0 ||
+		c.ControlContractFailureCount < 0 || c.InterventionCount < 0 || c.AttemptRolloverCount < 0 {
 		return fmt.Errorf("ProgressCheckpoint 计数或 duration 不能为负")
 	}
 	if err := c.Contract.Validate(); err != nil {
@@ -420,7 +431,7 @@ func (s ActionSettlement) Validate() error {
 	if s.Kind == ActionModelInvocation && strings.TrimSpace(s.ToolName) != "" {
 		return fmt.Errorf("model ActionSettlement 不得携带 tool_name")
 	}
-	if s.Status != ActionSucceeded && s.Status != ActionFailed && s.Status != ActionUnknown {
+	if s.Status != ActionSucceeded && s.Status != ActionFailed && s.Status != ActionUnknown && s.Status != ActionCancelled {
 		return fmt.Errorf("ActionSettlement status=%q，无效", s.Status)
 	}
 	if s.SettledAt.IsZero() {
@@ -654,7 +665,8 @@ func validInterventionReason(value InterventionReason) bool {
 	switch value {
 	case InterventionNoProgressBudget, InterventionNoProgressStalled, InterventionAttemptDeadline, InterventionActivationDeadline,
 		InterventionOscillation, InterventionUnsafeUnknown, InterventionCheckpointFailure,
-		InterventionObservationStalled, InterventionAttemptBudget:
+		InterventionObservationStalled, InterventionDecisionStalled, InterventionControlUnstable,
+		InterventionAttemptBudget:
 		return true
 	default:
 		return false

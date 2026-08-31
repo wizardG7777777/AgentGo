@@ -273,6 +273,31 @@ func TestImportSnapshot_Basic(t *testing.T) {
 	}
 }
 
+func TestExportImportPreservesGraphRecoveryDeltaSchema(t *testing.T) {
+	source, _ := newTestStore(10, 100)
+	task := &model.Task{
+		ID: "recovery-schema-task", Description: "恢复控制器", EventType: "__scheduler__",
+		GraphID: "graph-1", NodeID: "recovery", ActivationID: "recovery@1",
+		GraphNodeKind: "controller", GraphControllerRole: "loop_recovery",
+		GraphRecoveryDeltaSchema: "agentgo.recovery-delta/v3",
+	}
+	if err := source.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	snapshots := source.ExportSnapshot()
+	if len(snapshots) != 1 || snapshots[0].GraphRecoveryDeltaSchema != "agentgo.recovery-delta/v3" {
+		t.Fatalf("导出丢失 recovery schema: %+v", snapshots)
+	}
+	restored, _ := newTestStore(10, 100)
+	if err := restored.ImportSnapshot(snapshots); err != nil {
+		t.Fatal(err)
+	}
+	got, err := restored.GetTask(task.ID)
+	if err != nil || got.GraphRecoveryDeltaSchema != "agentgo.recovery-delta/v3" {
+		t.Fatalf("恢复丢失 recovery schema: task=%+v err=%v", got, err)
+	}
+}
+
 func TestImportSnapshot_ClearsExistingTasks(t *testing.T) {
 	s, _ := newTestStore(10, 100)
 

@@ -150,6 +150,40 @@ func TestAcceptanceValidCitationInLineage(t *testing.T) {
 	}
 }
 
+// TestAcceptanceValidTypedCheckRefAlias 允许 verifier 复制同一条冻结
+// EvidenceEntry 中展示的 typed CheckRef。别名只有在 Result Store 可解引用的
+// 完整条目里才生效，不会把“猜中一个 check:* 字符串”升级为谱系权限。
+func TestAcceptanceValidTypedCheckRefAlias(t *testing.T) {
+	s, rt, b := newTestRuntime(t)
+	w := &fakeWaker{}
+	rt.SetChangeWaker(w)
+	mustSubmitRuntime(t, rt, acceptanceGraphJSON)
+	implTaskID := b.byActivation["g-acc\x00implement@1"]
+	checkRef := "check:sha256:upstream-verification"
+	mustTerminal(t, rt, TerminalFact{
+		GraphID: "g-acc", NodeID: "implement", ActivationID: "implement@1",
+		TaskID: implTaskID, Status: NodeCompleted,
+		Result: map[string]any{"note": "已验证"},
+		Evidence: []EvidenceEntry{{
+			Ref: "ev:" + implTaskID + ":check:verification", Kind: "check",
+			CheckRef: checkRef, CheckID: "verification", CheckKind: "test", CheckStatus: "pass",
+			WorkspaceRevisionRef: "workspace:sha256:candidate",
+		}},
+	})
+	verifyTaskID := b.byActivation["g-acc\x00verify@1"]
+	mustTerminal(t, rt, TerminalFact{
+		GraphID: "g-acc", NodeID: "verify", ActivationID: "verify@1", TaskID: verifyTaskID,
+		Status: NodeCompleted,
+		Result: map[string]any{"verdict": "pass", "cited_evidence": checkRef},
+	})
+	if st := graphStatusOf(t, s, "g-acc"); st != GraphCompleted {
+		t.Fatalf("冻结 Evidence 携带的 CheckRef 别名应 valid 收官，实际 %s", st)
+	}
+	if len(w.specs) != 0 {
+		t.Errorf("typed CheckRef 合法别名不应触发唤醒: %+v", w.specs)
+	}
+}
+
 // TestAcceptanceValidCitationOwnEvidence 引用 verifier 自己本次任务产生的
 // 证据（TerminalFact.Evidence）：属合法谱系，valid 放行。
 func TestAcceptanceValidCitationOwnEvidence(t *testing.T) {

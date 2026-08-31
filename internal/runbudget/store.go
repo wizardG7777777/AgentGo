@@ -35,13 +35,14 @@ type Phase string
 const (
 	PhaseCoordination Phase = "coordination"
 	PhaseExecution    Phase = "execution"
+	PhaseVerification Phase = "verification"
 	PhaseRecovery     Phase = "recovery"
 	PhaseFinalization Phase = "finalization"
 )
 
 func (p Phase) Valid() bool {
 	switch p {
-	case PhaseCoordination, PhaseExecution, PhaseRecovery, PhaseFinalization:
+	case PhaseCoordination, PhaseExecution, PhaseVerification, PhaseRecovery, PhaseFinalization:
 		return true
 	default:
 		return false
@@ -167,6 +168,7 @@ type runState struct {
 	phaseSettled   map[Phase]runcontract.BudgetUsage
 	active         map[string]Reservation
 	settlements    map[string]Settlement
+	permitClaims   map[string]PermitClaim
 	updatedAt      time.Time
 }
 
@@ -313,14 +315,45 @@ func (s *Store) ReserveExecutionPermit(runID runcontract.RunID, sourceTaskID, so
 	if strings.TrimSpace(sourceTaskID) == "" || strings.TrimSpace(sourceActivationID) == "" {
 		return "", fmt.Errorf("RecoveryStartPermit 缺少 source task/activation")
 	}
-	sum := sha256.Sum256([]byte(string(runID) + "\x00" + sourceTaskID + "\x00" + sourceActivationID))
-	ref := "run-permit:sha256:" + hex.EncodeToString(sum[:])
+	ref := executionPermitRef(runID, sourceTaskID, sourceActivationID)
 	actionID := "permit:" + ref
 	err := s.Reserve(Reservation{Schema: ReservationSchemaV1, ReservationID: ref,
 		ActionID: actionID, RunID: runID, TaskID: sourceTaskID,
 		AttemptID: sourceActivationID, Phase: PhaseExecution, StartPermit: true,
 		MaxCharge: runcontract.BudgetUsage{ModelCalls: 1}, ReservedAt: now.UTC(), ExpiresAt: expiresAt.UTC()})
 	return ref, err
+}
+
+func executionPermitRef(runID runcontract.RunID, sourceTaskID, sourceActivationID string) string {
+	sum := sha256.Sum256([]byte(string(runID) + "\x00" + sourceTaskID + "\x00" + sourceActivationID))
+	return "run-permit:sha256:" + hex.EncodeToString(sum[:])
+}
+
+// CancelExecutionPermit 在 recovery 未实际放行 retry 时回收预留。它按
+// Run/source task/source activation 的确定身份定位 permit；不存在或已结算视为幂等。
+func (s *Store) CancelExecutionPermit(runID runcontract.RunID, sourceTaskID, sourceActivationID string,
+	now time.Time) error {
+	ref := executionPermitRef(runID, sourceTaskID, sourceActivationID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return err
+	}
+	state := s.runs[runID]
+	if state == nil {
+		return fmt.Errorf("RunBudgetStore RunID=%s 尚未初始化", runID)
+	}
+	reservation, ok := state.active[ref]
+	if !ok {
+		return nil
+	}
+	if !reservation.StartPermit {
+		return fmt.Errorf("reservation %s 不是 RecoveryStartPermit", ref)
+	}
+	value := Settlement{Schema: SettlementSchemaV1, SettlementID: "cancel:" + ref,
+		ReservationID: ref, ActionID: reservation.ActionID, RunID: runID,
+		Status: SettlementCancelled, SettledAt: now.UTC()}
+	return s.appendSettlementLocked(runID, state, reservation, value)
 }
 
 // ClaimExecutionPermit 把 L5 预留的首个 model-call slot 原子转交给目标
@@ -360,8 +393,42 @@ func (s *Store) ClaimExecutionPermit(runID runcontract.RunID, permitRef, actionI
 	}
 	reservation.ActionID, reservation.TaskID, reservation.AttemptID = actionID, taskID, attemptID
 	state.active[permitRef] = reservation
+	state.permitClaims[permitRef] = claim
 	state.updatedAt = now.UTC()
 	return nil
+}
+
+// ExecutionPermitClosedForTask 判断 RecoveryStartPermit 是否已由同一个目标
+// Task 的更早 Attempt 认领并关闭。Activation 内部 retry 会创建新 Attempt，不能
+// 因进程内 bool 重置而重复认领已经结算的首调用许可；跨 Task 复用仍 fail-closed。
+func (s *Store) ExecutionPermitClosedForTask(runID runcontract.RunID, permitRef, taskID string) (bool, error) {
+	if strings.TrimSpace(permitRef) == "" || strings.TrimSpace(taskID) == "" {
+		return false, fmt.Errorf("查询 RecoveryStartPermit 缺少 permit/task")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return false, err
+	}
+	state := s.runs[runID]
+	if state == nil {
+		return false, fmt.Errorf("RunBudgetStore RunID=%s 尚未初始化", runID)
+	}
+	claim, claimed := state.permitClaims[permitRef]
+	if !claimed {
+		reservation, active := state.active[permitRef]
+		if !active || !reservation.StartPermit || !strings.HasPrefix(reservation.ActionID, "permit:") {
+			return false, fmt.Errorf("RecoveryStartPermit %s 不存在或已失效", permitRef)
+		}
+		return false, nil
+	}
+	if claim.TaskID != taskID {
+		return false, fmt.Errorf("RecoveryStartPermit %s 已由另一 Task 认领", permitRef)
+	}
+	if _, settled := state.settlements[permitRef]; settled {
+		return true, nil
+	}
+	return false, fmt.Errorf("RecoveryStartPermit %s 已认领但尚未结算", permitRef)
 }
 
 func (s *Store) ValidateExecutionPermit(runID runcontract.RunID, permitRef string, now time.Time) error {
@@ -507,7 +574,8 @@ func (s *Store) Close() error {
 
 func newRunState() *runState {
 	return &runState{phaseSettled: make(map[Phase]runcontract.BudgetUsage),
-		active: make(map[string]Reservation), settlements: make(map[string]Settlement)}
+		active: make(map[string]Reservation), settlements: make(map[string]Settlement),
+		permitClaims: make(map[string]PermitClaim)}
 }
 
 func (s *Store) appendSettlementLocked(runID runcontract.RunID, state *runState,
@@ -678,6 +746,7 @@ func applyRecoveredRecord(state *runState, rec record) error {
 		reservation.ActionID, reservation.TaskID, reservation.AttemptID =
 			rec.Claim.ActionID, rec.Claim.TaskID, rec.Claim.AttemptID
 		state.active[rec.Claim.ReservationID] = reservation
+		state.permitClaims[rec.Claim.ReservationID] = *rec.Claim
 	default:
 		return fmt.Errorf("RunBudget record kind=%q 无效", rec.Kind)
 	}

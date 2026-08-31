@@ -2,9 +2,16 @@ package bootstrap
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"agentgo/internal/agent"
+	"agentgo/internal/checkstore"
+	"agentgo/internal/delivery"
+	"agentgo/internal/fulfillment"
 	"agentgo/internal/graph"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/loopstore"
@@ -15,12 +22,119 @@ import (
 	"agentgo/internal/store"
 	"agentgo/internal/taskcontract"
 	"agentgo/internal/trace"
+	"agentgo/internal/workspace"
 )
 
 type settlingCheckpointFake struct {
 	calls         int
 	alwaysPending bool
 	unknownCalls  int
+}
+
+func TestTaskOutcomeV3FreezesCandidateAndPreparesDelivery(t *testing.T) {
+	root := t.TempDir()
+	graphID, taskID := "g-v3-candidate", "task-v3-candidate"
+	run := outcomeTestRun()
+	deliveryID := delivery.StableID("run-1", graphID, "work@1")
+	doc := &graph.GraphDocument{Schema: graph.SchemaV3, GraphID: graphID, RunID: "run-1",
+		RunContract: run, Status: graph.GraphRunning,
+		DefinitionDigestVersion: graph.GraphDefinitionDigestVersionV1, DefinitionDigest: "definition",
+		ContractDigest: "contract", SourceProposalID: "proposal",
+		Nodes: map[string]graph.Node{"work": {Kind: graph.KindAgent,
+			Execution: &graph.Execution{ActivationID: "work@1", TaskID: taskID}}}}
+	outcomes, err := outcomestore.New(filepath.Join(root, "outcomes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = outcomes.Close() })
+	deliveries, err := delivery.NewStore(filepath.Join(root, "deliveries"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = deliveries.EnsureOpen(delivery.Transaction{Schema: delivery.SchemaV1, ID: deliveryID,
+		RunID: "run-1", GraphID: graphID, ProducerActivationID: "work@1",
+		Status: delivery.StatusOpen, UpdatedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := workspace.NewManager(root, nil)
+	workspaceID := workspace.DeliveryWorkspaceID(deliveryID)
+	view, err := manager.MaterializeOwned(workspaceID,
+		workspace.DeliveryOwner(taskID, deliveryID, "run-1", graphID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	main := filepath.Join(root, "source.go")
+	if err := os.WriteFile(main, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	physical, err := view.WritePath(main)
+	if err != nil || os.WriteFile(physical, []byte("new\n"), 0o644) != nil {
+		t.Fatalf("写 candidate: path=%s err=%v", physical, err)
+	}
+	authority := newGraphTaskOutcomeAuthority(outcomeGraphReader{graphID: doc}, outcomes,
+		outcomeCheckpointReader{graphID: graphID})
+	authority.candidates, authority.deliveries = manager, deliveries
+	checks := checkstore.New(filepath.Join(root, "checks"))
+	authority.checks = checks
+	tasks := store.NewMemoryTaskStore(nil, 16, 1, 60)
+	if err := store.SetTerminalOutcomeCoordinator(tasks, authority); err != nil {
+		t.Fatal(err)
+	}
+	task := outcomeGraphTask(t, graphID, taskID)
+	task.DeliveryID = deliveryID
+	task.FulfillmentContract = &fulfillment.Contract{RequireWorkspaceChange: true, RequiredCheckIDs: []string{"verification"}}
+	if err := tasks.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks.ClaimTask("worker-1", taskID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks.AppendToolCall(taskID, store.ToolCallRecord{CallID: "edit-1", AttemptID: task.AttemptID,
+		ToolName: "edit_file", Args: map[string]any{"path": "source.go"}, Success: true}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := tasks.GetTask(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now().UTC()
+	checkRef, err := checks.Put(checkstore.Record{
+		Schema: checkstore.SchemaV1, RunID: string(claimed.RunID), GraphID: graphID,
+		TaskID: taskID, AttemptID: claimed.AttemptID, ActivationID: claimed.ActivationID,
+		CheckID: "verification", Kind: "test", CommandDigest: "sha256:test",
+		Status: checkstore.StatusPass, ExitCode: 0, ExitCodeScope: "whole_command",
+		WorkspaceRevisionRef: "workspace:sha256:test", StartedAt: started, SettledAt: started.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fulfillmentRecord := fulfillment.Record{Schema: fulfillment.SchemaV1,
+		WorkspaceRevisionRef: "workspace:sha256:test", CheckRefs: []string{checkRef},
+		SatisfiedRequirementIDs: []string{"verification"}}
+	raw, _ := json.Marshal(fulfillmentRecord)
+	if err := tasks.SubmitResultWithFields("worker-1", taskID, "候选完成",
+		map[string]string{agent.FulfillmentStorageKey: string(raw)}); err != nil {
+		t.Fatal(err)
+	}
+	record, ok, err := outcomes.GetByTask(taskID)
+	if err != nil || !ok || record.Outcome.Candidate == nil || record.Outcome.CandidateRef == "" {
+		t.Fatalf("TaskOutcome 未冻结 candidate: outcome=%+v ok=%t err=%v", record.Outcome, ok, err)
+	}
+	foundCheckEvidence := false
+	for _, evidence := range record.Outcome.EvidenceFacts {
+		if evidence.Kind == "check" && evidence.CheckRef == checkRef && evidence.CheckStatus == "pass" {
+			foundCheckEvidence = true
+		}
+	}
+	if !foundCheckEvidence {
+		t.Fatalf("fulfillment CheckRef 未冻结为 typed Evidence: %+v", record.Outcome.EvidenceFacts)
+	}
+	tx, ok, err := deliveries.Get(deliveryID)
+	if err != nil || !ok || tx.Status != delivery.StatusPrepared || tx.Candidate == nil ||
+		tx.Candidate.Ref != record.Outcome.CandidateRef || tx.ProducerOutcomeRef != record.OutcomeRef {
+		t.Fatalf("Delivery transaction 未进入 prepared: tx=%+v ok=%t err=%v", tx, ok, err)
+	}
 }
 
 func (f *settlingCheckpointFake) LoadCheckpoint(string) (*loopcontract.ProgressCheckpoint, bool, error) {

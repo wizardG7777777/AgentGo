@@ -69,6 +69,7 @@ func ToTerminalFact(ctx context.Context, record outcomestore.Record, deps Depend
 		"_observation_delta_ref", "_failure_fingerprint",
 		"_checkpoint_state",
 		"_fulfillment",
+		"_delivery_id", "_candidate_ref",
 	} {
 		delete(result, key)
 	}
@@ -104,6 +105,12 @@ func ToTerminalFact(ctx context.Context, record outcomestore.Record, deps Depend
 	if value.Fulfillment != nil {
 		result["_fulfillment"] = value.Fulfillment
 	}
+	if value.DeliveryID != "" {
+		result["_delivery_id"] = value.DeliveryID
+	}
+	if value.CandidateRef != "" {
+		result["_candidate_ref"] = value.CandidateRef
+	}
 
 	evidence := durableEvidence(value.EvidenceFacts)
 	if deps.Evidence != nil && len(value.EvidenceRefs) > 0 {
@@ -120,6 +127,7 @@ func ToTerminalFact(ctx context.Context, record outcomestore.Record, deps Depend
 		TaskID: value.TaskID, Status: status, Result: result,
 		Evidence:    append([]graph.EvidenceEntry(nil), evidence...),
 		Fulfillment: value.Fulfillment,
+		DeliveryRef: value.DeliveryID, CandidateRef: value.CandidateRef,
 	}, nil
 }
 
@@ -140,6 +148,10 @@ func durableEvidence(values []outcome.EvidenceFact) []graph.EvidenceEntry {
 			CallID: value.CallID, ToolName: value.ToolName,
 			Command: value.Command, CommandTruncated: value.CommandTruncated,
 			Path: value.Path, PathTruncated: value.PathTruncated,
+			ExitCodeScope: value.ExitCodeScope,
+			CheckRef:      value.CheckRef, CheckID: value.CheckID, CheckKind: value.CheckKind,
+			CheckStatus: value.CheckStatus, WorkspaceRevisionRef: value.WorkspaceRevisionRef,
+			OutputRef: value.OutputRef,
 		}
 		if value.Success != nil {
 			copy := *value.Success

@@ -66,6 +66,22 @@ func TestToTerminalFactUsesTypedOutcome(t *testing.T) {
 	}
 }
 
+func TestDurableEvidencePreservesTypedCheckFields(t *testing.T) {
+	exit := 0
+	passed := true
+	got := durableEvidence([]outcome.EvidenceFact{{
+		Ref: "ev:task:check:abc", Kind: "check", Summary: "verification pass",
+		Success: &passed, ExitCode: &exit, ExitCodeScope: "whole_command",
+		CheckRef: "check:sha256:abc", CheckID: "verification", CheckKind: "test",
+		CheckStatus: "pass", WorkspaceRevisionRef: "workspace:sha256:candidate",
+		OutputRef: "content:sha256:output",
+	}})
+	if len(got) != 1 || got[0].CheckRef != "check:sha256:abc" || got[0].CheckStatus != "pass" ||
+		got[0].WorkspaceRevisionRef != "workspace:sha256:candidate" || got[0].ExitCodeScope != "whole_command" {
+		t.Fatalf("TaskOutcome 转 Graph 时不得丢失 typed Check Evidence: %+v", got)
+	}
+}
+
 func TestToTerminalFactRejectsNonGraphOutcome(t *testing.T) {
 	record := commitAdapterOutcome(t, outcome.TaskOutcome{
 		Schema: outcome.SchemaV1, RunID: "run-1", TaskID: "task-1", AttemptID: "attempt-1",

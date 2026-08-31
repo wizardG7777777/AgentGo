@@ -7,7 +7,7 @@ package graph
 // 判定矩阵（仅 acceptance 节点 completed 终态时进入；failed/blocked 无
 // verdict 可采信，走统一结算）：
 //   - verifier 经 submit_task_result 的 cited_evidence 参数引用自己实际消费
-//     过的证据（EvidenceRef，逗号分隔）；服务端只做**谱系核验**：每个引用
+//     过的证据（EvidenceRef 或该 Evidence 携带的 typed CheckRef，逗号分隔）；服务端只做**谱系核验**：每个引用
 //     必须属于本 acceptance activation 的上游 Input 谱系（各 InputBinding.
 //     EvidenceRefs 的并集），或属于 verifier 自己本次任务产生的证据
 //     （Execution.Evidence）——越谱系引用即造假实锤；
@@ -29,6 +29,7 @@ package graph
 // __scheduler__ 唤醒任务）交 Scheduler 裁决。
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strings"
@@ -112,11 +113,12 @@ func (rt *Runtime) settleAcceptanceLocked(f TerminalFact, exec Execution) error 
 				Verdict: verdict, Status: AcceptInvalidVerdict, Checked: 0, Reason: reason,
 			},
 		})
-		rt.wakeGraphChange(f, "acceptance_invalid_verdict", reason)
-		return rt.settleNodeLocked(f.GraphID, f.NodeID, exec, NodeFailed, map[string]any{
+		err := rt.settleNodeLocked(f.GraphID, f.NodeID, exec, NodeFailed, map[string]any{
 			"error": reason, "invalid_verdict": verdict,
 			"verify_status": AcceptInvalidVerdict,
 		})
+		rt.wakeGraphChange(f, "acceptance_invalid_verdict", reason)
+		return err
 	}
 	doc, err := rt.graph(f.GraphID)
 	if err != nil {
@@ -142,12 +144,13 @@ func (rt *Runtime) settleAcceptanceLocked(f TerminalFact, exec Execution) error 
 				Verdict: verdict, Status: AcceptEvidenceMissing, Checked: 0, Reason: reason,
 			},
 		})
-		rt.wakeGraphChange(f, "acceptance_evidence_missing", reason)
-		return rt.settleNodeLocked(f.GraphID, f.NodeID, exec, NodeBlocked, map[string]any{
+		err := rt.settleNodeLocked(f.GraphID, f.NodeID, exec, NodeBlocked, map[string]any{
 			"error": reason, "blocked_reason": reason,
 			"missing_evidence": detail, "disputed_verdict": verdict,
 			"verify_status": AcceptEvidenceMissing,
 		})
+		rt.wakeGraphChange(f, "acceptance_evidence_missing", reason)
+		return err
 	}
 	cited := splitCitedEvidence(f.Result["cited_evidence"])
 	allowed := rt.acceptanceEvidenceLineage(f.GraphID, exec)
@@ -180,6 +183,31 @@ func (rt *Runtime) settleAcceptanceLocked(f TerminalFact, exec Execution) error 
 	})
 
 	if status == AcceptValid {
+		if doc.RequiresDelivery() && verdict == "pass" {
+			if strings.TrimSpace(f.DeliveryRef) == "" || rt.deliveryCommitter == nil {
+				reason := "Graph v3 acceptance pass 缺少 Delivery Transaction 或 L5 commit 协调器"
+				return rt.settleNodeLocked(f.GraphID, f.NodeID, exec, NodeBlocked, map[string]any{
+					"blocked_reason": reason, "reason_code": "delivery_commit_unavailable",
+				})
+			}
+			acceptanceOutcomeRef, _ := f.Result["_task_outcome_ref"].(string)
+			commitRef, commitErr := rt.deliveryCommitter.CommitDelivery(context.Background(), f.DeliveryRef, acceptanceOutcomeRef)
+			if commitErr != nil || strings.TrimSpace(commitRef) == "" {
+				reason := "Delivery candidate promotion 未确认："
+				if commitErr != nil {
+					reason += commitErr.Error()
+				} else {
+					reason += "commit ref 为空"
+				}
+				return rt.settleNodeLocked(f.GraphID, f.NodeID, exec, NodeBlocked, map[string]any{
+					"blocked_reason": reason, "reason_code": "delivery_commit_unknown",
+				})
+			}
+			exec.DeliveryRef = f.DeliveryRef
+			exec.DeliveryCommitRef = commitRef
+			f.Result = copyAcceptanceResult(f.Result)
+			f.Result["_delivery_commit_ref"] = commitRef
+		}
 		return rt.settleNodeLocked(f.GraphID, f.NodeID, exec, NodeCompleted, f.Result)
 	}
 
@@ -194,14 +222,23 @@ func (rt *Runtime) settleAcceptanceLocked(f TerminalFact, exec Execution) error 
 		"disputed_citations": strings.Join(outOfLineage, ","),
 		"verify_status":      AcceptDisputed,
 	}
+	err = rt.settleNodeLocked(f.GraphID, f.NodeID, exec, NodeFailed, result)
 	rt.wakeGraphChange(f, "acceptance_disputed", reason)
-	return rt.settleNodeLocked(f.GraphID, f.NodeID, exec, NodeFailed, result)
+	return err
 }
 
 // validateAcceptanceVerdictResult 校验 acceptance 的 completed 输出协议。
 // verdict 必须是 prompt 契约枚举 pass/fixable/failed。验收业务
 // 结论只能经 $.verdict 路由；completed 结果出现 event 一律视为
 // 协议错误，避免同一结论同时有两个权威字段。
+func copyAcceptanceResult(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in)+1)
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
 func validateAcceptanceVerdictResult(result map[string]any) (string, string) {
 	raw, exists := result["verdict"]
 	if !exists {
@@ -227,17 +264,24 @@ func isValidAcceptanceVerdict(verdict string) bool {
 }
 
 // acceptanceEvidenceLineage 计算 acceptance activation 的合法证据谱系：
-// 上游 Input 各绑定的 EvidenceRefs 并集（经数据流到达的上游证据），加上
-// 本 activation 自身任务产生的证据（verifier 获准执行的只读核验事实）。
+// 上游 Input 各绑定的 EvidenceRefs 及其 typed CheckRef 别名并集（经数据流
+// 到达的上游证据），加上本 activation 自身任务产生的同类证据。CheckRef
+// 只有在完整 EvidenceEntry 经 Result Store 解引用后才加入，不能靠猜中 ID 授权。
 func (rt *Runtime) acceptanceEvidenceLineage(graphID string, exec Execution) map[string]struct{} {
 	allowed := make(map[string]struct{})
 	for _, in := range exec.Input {
 		for _, evidence := range rt.resolvableInputEvidence(graphID, in) {
 			allowed[evidence.Ref] = struct{}{}
+			if evidence.CheckRef != "" {
+				allowed[evidence.CheckRef] = struct{}{}
+			}
 		}
 	}
 	for _, e := range exec.Evidence {
 		allowed[e.Ref] = struct{}{}
+		if e.CheckRef != "" {
+			allowed[e.CheckRef] = struct{}{}
+		}
 	}
 	return allowed
 }

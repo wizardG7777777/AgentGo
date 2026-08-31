@@ -43,6 +43,9 @@ func CompileDeadlines(input DeadlineCompileInput) (CompiledDeadlineSet, error) {
 	if !phase.Valid() {
 		return CompiledDeadlineSet{}, fmt.Errorf("Run phase=%q 无效", phase)
 	}
+	if phase == PhaseVerification && input.Contract.Schema != SchemaV2 {
+		return CompiledDeadlineSet{}, fmt.Errorf("RunContract v1 不支持 verification phase")
+	}
 	now := input.Now.UTC()
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -56,8 +59,10 @@ func CompileDeadlines(input DeadlineCompileInput) (CompiledDeadlineSet, error) {
 	}
 
 	run := input.Contract.Deadline()
-	phaseEnd := input.Contract.DeadlineAt.Add(-(input.Contract.FinalizationReserve + input.Contract.RecoveryReserve))
+	phaseEnd := input.Contract.DeadlineAt.Add(-(input.Contract.FinalizationReserve + input.Contract.RecoveryReserve + input.Contract.VerificationReserve))
 	switch phase {
+	case PhaseVerification:
+		phaseEnd = input.Contract.DeadlineAt.Add(-(input.Contract.FinalizationReserve + input.Contract.RecoveryReserve)).Add(-handoff)
 	case PhaseRecovery:
 		phaseEnd = input.Contract.DeadlineAt.Add(-input.Contract.FinalizationReserve).Add(-handoff)
 	case PhaseFinalization:
@@ -65,6 +70,8 @@ func CompileDeadlines(input DeadlineCompileInput) (CompiledDeadlineSet, error) {
 		// 当前阶段正消费 finalization window；保留原 reserve 会让任何 child
 		// 都被校验器再次排除在该窗口之外。
 		run.FinalizationReserve = 0
+		run.RecoveryReserve = 0
+		run.VerificationReserve = 0
 	}
 	if !now.Before(phaseEnd) {
 		return CompiledDeadlineSet{}, fmt.Errorf("Run phase=%s 已没有可执行窗口: now=%s end=%s",

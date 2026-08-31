@@ -38,6 +38,7 @@ var AllToolNames = []string{
 	"request_replan",
 	"record_observation_delta",
 	"submit_recovery_decision",
+	"submit_change_decision",
 
 	// SchedulerGroup（scheduler 专属，不走 profile 配置）
 	"cancel_task",
@@ -70,6 +71,7 @@ var AllToolNames = []string{
 	"read_graph_change",
 	"validate_graph_change",
 	"commit_graph_change",
+	"submit_graph_change_decision",
 }
 
 // ValidateToolNames 校验给定的工具名列表是否全部在 AllToolNames 中。

@@ -37,6 +37,28 @@ func TestStartPinsCurrentContextPolicyVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	if task.ContextPolicyRef != policycatalog.ContextDefaultCurrent {
-		t.Fatalf("新 Run 未冻结 current Context policy v2: %+v", task)
+		t.Fatalf("新 Run 未冻结 current Context policy: %+v", task)
+	}
+	if task.RunContract == nil || task.RunContract.Schema != runcontract.SchemaV2 ||
+		task.ProgressContract == nil || task.ProgressContract.Ref.ContractID != policycatalog.ProgressCodeChangeV6 {
+		t.Fatalf("新 Run 未冻结 RunContract v2 / Progress v6: %+v", task)
+	}
+}
+
+func TestStartAssignsV2VerificationAndFinalizationPhases(t *testing.T) {
+	for _, test := range []struct {
+		work loopcontract.WorkClass
+		want runcontract.Phase
+	}{
+		{loopcontract.WorkVerification, runcontract.PhaseVerification},
+		{loopcontract.WorkFinalization, runcontract.PhaseFinalization},
+	} {
+		task := &model.Task{ID: "phase-" + string(test.work)}
+		if err := Start(task, test.work, "test/v2", time.Hour, time.Minute, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		if task.RunPhase != test.want {
+			t.Fatalf("work=%s phase=%s want=%s", test.work, task.RunPhase, test.want)
+		}
 	}
 }

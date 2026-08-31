@@ -32,6 +32,10 @@ const SchemaV1 = "agentgo.graph/v1"
 // 数据字段 + path 条件（权威设计见 docs/design/graph-terminal-contract-v2.md）。
 const SchemaV2 = "agentgo.graph/v2"
 
+// SchemaV3 是统一 Delivery Transaction 契约。v1/v2 快照保持原语义；新
+// authoring 图的候选必须先经 acceptance，再由 L5 promotion 提交主根。
+const SchemaV3 = "agentgo.graph/v3"
+
 // GraphDocument 是整张图的类型化模型（JSON 对外契约 + 进程内读写对象）。
 //
 // 字段所有权（由 GraphStore 的角色分离变更 API + CAS 强制，见 store.go）：
@@ -41,7 +45,7 @@ const SchemaV2 = "agentgo.graph/v2"
 //   - 调度与认领系统：写节点的 Executor；
 //   - Agent Loop / Harness：写节点的 Execution（结果与证据引用）。
 type GraphDocument struct {
-	Schema      string                   `json:"schema"`   // 必须恰为 SchemaV1 或 SchemaV2
+	Schema      string                   `json:"schema"`   // 必须恰为 SchemaV1、SchemaV2 或 SchemaV3
 	GraphID     string                   `json:"graph_id"` // 图 ID，非空，字符集见校验链
 	RunID       runcontract.RunID        `json:"run_id,omitempty"`
 	RunContract *runcontract.RunContract `json:"run_contract,omitempty"`
@@ -63,6 +67,24 @@ type GraphDocument struct {
 	// 2026-08 起空归属图不再归并给当前 session，启动时按僵尸图停驻。
 	SessionID string          `json:"session_id,omitempty"`
 	Nodes     map[string]Node `json:"nodes"` // 节点表，键为节点 ID
+}
+
+// RequiresDelivery 报告 v3 图是否包含需要候选 promotion 的 mutating producer。
+// read-only v3 图仍可使用封闭终态契约，但不伪造空 Delivery Transaction。
+func (d *GraphDocument) RequiresDelivery() bool {
+	if d == nil || d.Schema != SchemaV3 {
+		return false
+	}
+	for _, node := range d.Nodes {
+		if strings.HasPrefix(node.ProgressContractRef, "progress:code-change/") {
+			return true
+		}
+		if node.Execution != nil && node.Execution.Definition != nil &&
+			strings.HasPrefix(node.Execution.Definition.ProgressContractRef, "progress:code-change/") {
+			return true
+		}
+	}
+	return false
 }
 
 // RequiresTypedTaskOutcome 区分 legacy Execution 与 authoring Definition。
@@ -220,8 +242,10 @@ type Execution struct {
 	// ResultRef 是 activation 级完整 Result 的稳定引用，可交给 Store.
 	// ResolveActivationResult 解引用；ResultSummary 仅供 UI/日志展示。两者严禁
 	// 混用，否则大结果、子图和重启恢复会把截断摘要误当数据引用。
-	ResultRef     string `json:"result_ref,omitempty"`
-	ResultSummary string `json:"result_summary,omitempty"`
+	ResultRef         string `json:"result_ref,omitempty"`
+	ResultSummary     string `json:"result_summary,omitempty"`
+	DeliveryRef       string `json:"delivery_ref,omitempty"`
+	DeliveryCommitRef string `json:"delivery_commit_ref,omitempty"`
 	// Input 是本 activation 的持久化输入绑定集（数据流图语义）：activation
 	// 创建时从指向本 activation 的已生效 TransitionRecord.Input 推导并随
 	// activation 事实落盘，恢复后绑定不变。普通节点由实际选中边传入；
@@ -311,7 +335,8 @@ type EdgeInput struct {
 	// 上游摘要）：转移结算时由 Runtime 经注入的 provider 一次性聚合渲染并
 	// 随本记录冻结——下游据此感知「上游实际做了什么」（机械事实，非上游
 	// 自述），空串表示无 provider 或来源无调用记录可述。
-	WorkLog string `json:"work_log,omitempty"`
+	WorkLog     string `json:"work_log,omitempty"`
+	DeliveryRef string `json:"delivery_ref,omitempty"`
 }
 
 // InputBinding 是目标 activation 的一份持久化输入绑定：activation 创建时
@@ -331,7 +356,8 @@ type InputBinding struct {
 	Truncated          bool            `json:"truncated,omitempty"`
 	// WorkLog 透传自 TransitionRecord.Input.WorkLog（来源 Task 的工具调用
 	// 工作记录，转移结算时冻结）。随本绑定落盘，恢复后不变。
-	WorkLog string `json:"work_log,omitempty"`
+	WorkLog     string `json:"work_log,omitempty"`
+	DeliveryRef string `json:"delivery_ref,omitempty"`
 }
 
 // ActivationResult 是按 activation 保存的完整、不可变 Result 与证据事实。
@@ -367,6 +393,16 @@ type EvidenceEntry struct {
 	// Path 对 file/read 工具表示其目标路径，对 kind=artifact 表示完整产物路径。
 	Path          string `json:"path,omitempty"`
 	PathTruncated bool   `json:"path_truncated,omitempty"`
+
+	// Check* 把 fulfillment 实际引用的 typed CheckRecord 冻结进
+	// Graph 证据谱系。Verifier 可复制 Ref 或同一结构化条目的 CheckRef；
+	// Runtime 只把可解引用 EvidenceEntry 中的 CheckRef 当作合法别名。
+	CheckRef             string `json:"check_ref,omitempty"`
+	CheckID              string `json:"check_id,omitempty"`
+	CheckKind            string `json:"check_kind,omitempty"`
+	CheckStatus          string `json:"check_status,omitempty"`
+	WorkspaceRevisionRef string `json:"workspace_revision_ref,omitempty"`
+	OutputRef            string `json:"output_ref,omitempty"`
 }
 
 // SettlementContinuation 声明节点终态落盘后仍须完成的 durable 动作。
@@ -491,7 +527,37 @@ const (
 	MetadataRecoveryMaxRetries                 = "recovery_max_retries"
 	MetadataRecoveryDeltaSchema                = "recovery_delta_schema"
 	RecoveryDeltaSchemaV1                      = "agentgo.recovery-delta/v1"
+	RecoveryDeltaSchemaV2                      = "agentgo.recovery-delta/v2"
+	RecoveryDeltaSchemaV3                      = "agentgo.recovery-delta/v3"
+	RecoveryDeltaSchemaV4                      = "agentgo.recovery-delta/v4"
+	ChangeDecisionSchemaV1                     = "agentgo.change-decision/v1"
+	MaxRecoveryEvidenceFiles                   = 8
+	MaxRecoveryEditSteps                       = 8
 )
+
+// RecoveryFirstAction 是 v2+ RecoveryDelta 冻结给下一 Activation 的首个
+// L3 action gate。Tool 是业务工具名；Path 只在工具存在路径参数时用于
+// 收紧 schema。它不携带任意 args，避免 Recovery controller 替 Worker
+// 编造 edit 内容或命令。
+type RecoveryFirstAction struct {
+	Tool string `json:"tool"`
+	Path string `json:"path,omitempty"`
+}
+
+// RecoveryEvidenceContract 是 v4 为下一 Activation 冻结的最小源码覆盖合同。
+// Files 使用完整文件覆盖语义；模型可在 work Activation 内通过 typed
+// need_context 增加文件，但不能把已声明文件降级为只读开头或跳过。
+type RecoveryEvidenceContract struct {
+	Files []string `json:"files"`
+}
+
+// RecoveryEditStep 是 v4 Worker 在证据覆盖完成后主动声明的有序 mutation。
+// Tool 与 Path 独立于 EvidenceContract：证据文件回答“判断依据是否读全”，
+// edit step 回答“准备改什么”，因此允许 write_file 指向尚不存在的新文件。
+type RecoveryEditStep struct {
+	Tool string `json:"tool"`
+	Path string `json:"path"`
+}
 
 // RecoveryDelta 是 loop_recovery decision=retry 的强制结构化增量。它由
 // Runtime 对照 failure_context 机械校验，并作为 recovery_directive 注入
@@ -503,8 +569,13 @@ type RecoveryDelta struct {
 	FailureFingerprint        string   `json:"failure_fingerprint"`
 	ChangedDimensions         []string `json:"changed_dimensions"`
 	Strategy                  string   `json:"strategy"`
-	FirstRequiredAction       string   `json:"first_required_action"`
-	ExpectedMilestone         string   `json:"expected_milestone"`
+	// FirstRequiredAction 是 v1 冻结字段，仅用于历史 Graph 恢复。
+	FirstRequiredAction string `json:"first_required_action,omitempty"`
+	// FirstAction 是 v2 的类型化首动作。新 Graph 不再写自由文本 action。
+	FirstAction *RecoveryFirstAction `json:"first_action,omitempty"`
+	// EvidenceContract 只属于 v4。v1-v3 恢复对象必须省略，避免原地改变旧版本。
+	EvidenceContract  *RecoveryEvidenceContract `json:"evidence_contract,omitempty"`
+	ExpectedMilestone string                    `json:"expected_milestone"`
 	// StartPermitRef 由 L5/RunBudget authority 预留并绑定，模型无权填写。
 	StartPermitRef string `json:"start_permit_ref,omitempty"`
 }
@@ -571,6 +642,7 @@ type GraphOutcomeRecord struct {
 	Reason             string     `json:"reason,omitempty"`
 	DefinitionRevision int64      `json:"definition_revision"`
 	CommittedAt        time.Time  `json:"committed_at"`
+	DeliveryCommitRef  string     `json:"delivery_commit_ref,omitempty"`
 }
 
 func (o GraphOutcomeRecord) Status() GraphStatus {

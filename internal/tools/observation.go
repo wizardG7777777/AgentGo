@@ -20,11 +20,12 @@ import (
 // ObservationGroup 提供 L2 ObservationDelta 的唯一模型写入口。它只接受
 // 当前 Task/Attempt 已 settled 的证据引用，不读取或保存模型 reasoning。
 type ObservationGroup struct {
-	Store   store.TaskStore
-	TaskMem *taskmem.Store
-	Holder  TaskHolder
-	AgentID string
-	Checks  *checkstore.Store
+	Store      store.TaskStore
+	TaskMem    *taskmem.Store
+	Holder     TaskHolder
+	AgentID    string
+	Checks     *checkstore.Store
+	Workspaces checkstore.WorkspaceRevisionResolver
 }
 
 func (g ObservationGroup) Register(r *agent.ToolRegistry) {
@@ -35,9 +36,10 @@ func (g ObservationGroup) Register(r *agent.ToolRegistry) {
 		"type":                 "object",
 		"additionalProperties": false,
 		"properties": map[string]any{
-			"text": map[string]any{"type": "string", "description": "有界的已确认工作事实，不得写 reasoning"},
+			"text": map[string]any{"type": "string", "maxLength": taskmem.MaxObservationTextRunes,
+				"description": "有界的工作 claim，不得写 reasoning；framework 仅核对 evidence 归属，按 inferred 保存"},
 			"evidence_refs": map[string]any{
-				"type": "array", "items": map[string]any{"type": "string"},
+				"type": "array", "minItems": 1, "maxItems": 8, "items": map[string]any{"type": "string"},
 				"description": "当前 Task/Attempt 的 tool-call:<call_id> 或 artifact:<path> 引用",
 			},
 		},
@@ -48,7 +50,7 @@ func (g ObservationGroup) Register(r *agent.ToolRegistry) {
 		"properties": map[string]any{
 			"candidate_ref": map[string]any{"type": "string", "description": "上一 Observation receipt 中仍开放的 candidate ref"},
 			"evidence_refs": map[string]any{
-				"type": "array", "items": map[string]any{"type": "string"},
+				"type": "array", "minItems": 1, "maxItems": 8, "items": map[string]any{"type": "string"},
 				"description": "证明该候选已经解决的 settled evidence refs",
 			},
 		},
@@ -64,15 +66,15 @@ func (g ObservationGroup) Register(r *agent.ToolRegistry) {
 				taskmem.ObservationPhaseBlocked,
 			}, "description": "当前状态阶段；只有阶段前进、关闭旧候选、workspace revision 或 typed check 前进才算语义进展"},
 			"facts": map[string]any{
-				"type": "array", "items": factSchema,
-				"description": "当前状态仍成立的 confirmed facts，最多 12 条；旧 Observation facts 会被整体替换",
+				"type": "array", "maxItems": taskmem.MaxObservationFacts, "items": factSchema,
+				"description": "当前状态仍成立的 evidence-bound inferred claims，最多 12 条；旧 Observation claims 会被整体替换",
 			},
 			"resolved_candidates": map[string]any{
-				"type": "array", "items": resolvedSchema,
+				"type": "array", "maxItems": taskmem.MaxObservationNext, "items": resolvedSchema,
 				"description": "本轮由 settled evidence 关闭的上一状态候选；不得用换措辞冒充进展",
 			},
 			"next_candidates": map[string]any{
-				"type": "array", "items": map[string]any{"type": "string"},
+				"type": "array", "maxItems": taskmem.MaxObservationNext, "items": map[string]any{"type": "string"},
 				"description": "下一步候选，最多 5 条；候选不是已确认事实",
 			},
 		},
@@ -129,7 +131,7 @@ func (g ObservationGroup) record(_ context.Context, args map[string]any) (string
 	if err != nil {
 		return "", err
 	}
-	workspaceRef, _, err := checkstore.WorkspaceRevision(task, g.Store)
+	workspaceRef, _, err := checkstore.WorkspaceRevision(task, g.Store, g.Workspaces)
 	if err != nil {
 		return "", fmt.Errorf("冻结 Observation workspace revision: %w", err)
 	}
@@ -138,7 +140,7 @@ func (g ObservationGroup) record(_ context.Context, args map[string]any) (string
 		candidates = append(candidates, taskmem.NewObservationCandidate(task.ID, task.AttemptID, text))
 	}
 	delta := taskmem.ObservationDelta{
-		Schema: taskmem.ObservationDeltaSchemaV2, TaskID: task.ID, AttemptID: task.AttemptID,
+		Schema: taskmem.ObservationDeltaSchemaCurrent, TaskID: task.ID, AttemptID: task.AttemptID,
 		PreviousRef: previousRef, Phase: strings.TrimSpace(phase), Facts: facts,
 		ResolvedCandidates: resolvedCandidates, NextCandidates: candidates,
 		WorkspaceRevisionRef: workspaceRef, LatestCheckRef: latestCheckRef, CreatedAt: time.Now().UTC(),
@@ -160,7 +162,7 @@ func (g ObservationGroup) record(_ context.Context, args map[string]any) (string
 		openRefs = append(openRefs, candidate.Ref)
 	}
 	payload, _ := json.Marshal(map[string]any{
-		"schema": taskmem.ObservationDeltaSchemaV2, "observation_delta_ref": ref,
+		"schema": taskmem.ObservationDeltaSchemaCurrent, "observation_delta_ref": ref,
 		"previous_ref": stored.PreviousRef, "phase": stored.Phase,
 		"facts": len(facts), "resolved_candidates": len(resolvedCandidates),
 		"open_candidate_refs": openRefs, "semantic_advance": stored.SemanticAdvance,
@@ -176,6 +178,7 @@ func (g ObservationGroup) evidenceAuthority(task *model.Task) (map[string]taskme
 	settledAt := make(map[string]time.Time)
 	currentArtifacts := make(map[string]struct{})
 	artifactSettledAt := make(map[string]time.Time)
+	successfulCheckIDs := make(map[string]struct{})
 	records, err := g.Store.QueryToolCalls(task.ID, "")
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("读取 Observation 工具证据: %w", err)
@@ -205,14 +208,30 @@ func (g ObservationGroup) evidenceAuthority(task *model.Task) (map[string]taskme
 				artifactSettledAt[path] = record.Timestamp
 			}
 		}
-		if record.Success && record.ToolName == "run_check" && g.Checks != nil {
+		if record.Success && record.ToolName == "run_check" {
 			checkID, _ := record.Args["check_id"].(string)
-			if check, ok, checkErr := g.Checks.Latest(task.ID, task.AttemptID, checkID); checkErr == nil && ok {
-				authority[check.CheckRef] = taskmem.EvidenceRef{Kind: taskmem.EvidenceCheck, Ref: check.CheckRef, Digest: check.CommandDigest}
-				settledAt[check.CheckRef] = check.SettledAt
-				if latestCheckAt.IsZero() || check.SettledAt.After(latestCheckAt) {
-					latestCheckAt, latestCheckRef = check.SettledAt, check.CheckRef
-				}
+			if strings.TrimSpace(checkID) != "" {
+				successfulCheckIDs[strings.TrimSpace(checkID)] = struct{}{}
+			}
+		}
+	}
+	if g.Checks != nil {
+		checks, checkErr := g.Checks.ListTask(task.ID)
+		if checkErr != nil {
+			return nil, nil, "", fmt.Errorf("读取 Observation CheckRecord: %w", checkErr)
+		}
+		for _, check := range checks {
+			if check.AttemptID != task.AttemptID {
+				continue
+			}
+			if _, settledToolCall := successfulCheckIDs[check.CheckID]; !settledToolCall {
+				continue
+			}
+			authority[check.CheckRef] = taskmem.EvidenceRef{Kind: taskmem.EvidenceCheck,
+				Ref: check.CheckRef, Digest: check.CommandDigest}
+			settledAt[check.CheckRef] = check.SettledAt
+			if latestCheckAt.IsZero() || check.SettledAt.After(latestCheckAt) {
+				latestCheckAt, latestCheckRef = check.SettledAt, check.CheckRef
 			}
 		}
 	}
@@ -286,7 +305,7 @@ func parseObservationFacts(raw any, authority map[string]taskmem.EvidenceRef) ([
 		if err != nil || len(refs) == 0 {
 			return nil, fmt.Errorf("facts[%d] 缺少合法 evidence_refs", i)
 		}
-		fact := taskmem.ObservationFact{Text: text}
+		fact := taskmem.ObservationFact{Text: text, Authority: taskmem.ObservationFactAuthorityInferred}
 		for _, ref := range refs {
 			resolved, ok := authority[ref]
 			if !ok {

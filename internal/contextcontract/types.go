@@ -15,44 +15,46 @@ const (
 // 编译事务内，默认不随 durable DTO 序列化；ContentRef 是不透明引用，不授予
 // 当前 ExecutionLease 额外读取权限。
 type ContextFragment struct {
-	FragmentID      string         `json:"fragment_id"`
-	Kind            FragmentKind   `json:"kind"`
-	Section         ContextSection `json:"section"`
-	SourceRef       string         `json:"source_ref"`
-	Scope           ContextScope   `json:"scope"`
-	Authority       Authority      `json:"authority"`
-	Freshness       Freshness      `json:"freshness"`
-	Digest          string         `json:"digest"`
-	SerializedBytes int64          `json:"serialized_bytes"`
-	EstimatedTokens int64          `json:"estimated_tokens"`
-	RetentionClass  RetentionClass `json:"retention_class"`
-	ReplayGroupID   string         `json:"replay_group_id,omitempty"`
-	Content         []byte         `json:"-"`
-	ContentRef      string         `json:"content_ref,omitempty"`
-	Disposition     Disposition    `json:"disposition"`
-	TransformRef    string         `json:"transform_ref,omitempty"`
+	FragmentID       string         `json:"fragment_id"`
+	Kind             FragmentKind   `json:"kind"`
+	Section          ContextSection `json:"section"`
+	SourceRef        string         `json:"source_ref"`
+	Scope            ContextScope   `json:"scope"`
+	Authority        Authority      `json:"authority"`
+	Freshness        Freshness      `json:"freshness"`
+	Digest           string         `json:"digest"`
+	SerializedBytes  int64          `json:"serialized_bytes"`
+	EstimatedTokens  int64          `json:"estimated_tokens"`
+	RetentionClass   RetentionClass `json:"retention_class"`
+	ReplayGroupID    string         `json:"replay_group_id,omitempty"`
+	Content          []byte         `json:"-"`
+	ContentRef       string         `json:"content_ref,omitempty"`
+	Disposition      Disposition    `json:"disposition"`
+	TransformRef     string         `json:"transform_ref,omitempty"`
+	ProjectionReason string         `json:"projection_reason,omitempty"`
 }
 
 // ContextFragmentRecord 是 Fragment 的有界 durable 投影，不保存正文。
 type ContextFragmentRecord struct {
-	FragmentID      string         `json:"fragment_id"`
-	Kind            FragmentKind   `json:"kind"`
-	Section         ContextSection `json:"section"`
-	SourceRef       string         `json:"source_ref"`
-	Scope           ContextScope   `json:"scope"`
-	Authority       Authority      `json:"authority"`
-	Freshness       Freshness      `json:"freshness"`
-	InputDigest     string         `json:"input_digest"`
-	OutputDigest    string         `json:"output_digest,omitempty"`
-	SerializedBytes int64          `json:"serialized_bytes"`
-	EstimatedTokens int64          `json:"estimated_tokens"`
-	BudgetLimit     Budget         `json:"budget_limit"`
-	RetentionClass  RetentionClass `json:"retention_class"`
-	Disposition     Disposition    `json:"disposition"`
-	TransformRef    string         `json:"transform_ref,omitempty"`
-	ContentRef      string         `json:"content_ref,omitempty"`
-	AtomicGroupID   string         `json:"atomic_group_id,omitempty"`
-	WireID          string         `json:"wire_id,omitempty"`
+	FragmentID       string         `json:"fragment_id"`
+	Kind             FragmentKind   `json:"kind"`
+	Section          ContextSection `json:"section"`
+	SourceRef        string         `json:"source_ref"`
+	Scope            ContextScope   `json:"scope"`
+	Authority        Authority      `json:"authority"`
+	Freshness        Freshness      `json:"freshness"`
+	InputDigest      string         `json:"input_digest"`
+	OutputDigest     string         `json:"output_digest,omitempty"`
+	SerializedBytes  int64          `json:"serialized_bytes"`
+	EstimatedTokens  int64          `json:"estimated_tokens"`
+	BudgetLimit      Budget         `json:"budget_limit"`
+	RetentionClass   RetentionClass `json:"retention_class"`
+	Disposition      Disposition    `json:"disposition"`
+	TransformRef     string         `json:"transform_ref,omitempty"`
+	ContentRef       string         `json:"content_ref,omitempty"`
+	ProjectionReason string         `json:"projection_reason,omitempty"`
+	AtomicGroupID    string         `json:"atomic_group_id,omitempty"`
+	WireID           string         `json:"wire_id,omitempty"`
 }
 
 // ProtocolAtomicGroup 把不可拆分的协议字段绑定在一起。FragmentIDs 的顺序是
@@ -112,23 +114,24 @@ type BudgetUsage struct {
 // ManifestItem 让每个 Fragment 能追溯到 policy、transform、原子组和 wire。
 // 不包含正文。
 type ManifestItem struct {
-	FragmentID      string         `json:"fragment_id"`
-	Kind            FragmentKind   `json:"kind"`
-	Section         ContextSection `json:"section"`
-	SourceRef       string         `json:"source_ref"`
-	Scope           ContextScope   `json:"scope"`
-	Authority       Authority      `json:"authority"`
-	Freshness       Freshness      `json:"freshness"`
-	InputDigest     string         `json:"input_digest"`
-	OutputDigest    string         `json:"output_digest,omitempty"`
-	SerializedBytes int64          `json:"serialized_bytes"`
-	EstimatedTokens int64          `json:"estimated_tokens"`
-	BudgetLimit     Budget         `json:"budget_limit"`
-	Disposition     Disposition    `json:"disposition"`
-	TransformRef    string         `json:"transform_ref,omitempty"`
-	ContentRef      string         `json:"content_ref,omitempty"`
-	AtomicGroupID   string         `json:"atomic_group_id,omitempty"`
-	WireID          string         `json:"wire_id,omitempty"`
+	FragmentID       string         `json:"fragment_id"`
+	Kind             FragmentKind   `json:"kind"`
+	Section          ContextSection `json:"section"`
+	SourceRef        string         `json:"source_ref"`
+	Scope            ContextScope   `json:"scope"`
+	Authority        Authority      `json:"authority"`
+	Freshness        Freshness      `json:"freshness"`
+	InputDigest      string         `json:"input_digest"`
+	OutputDigest     string         `json:"output_digest,omitempty"`
+	SerializedBytes  int64          `json:"serialized_bytes"`
+	EstimatedTokens  int64          `json:"estimated_tokens"`
+	BudgetLimit      Budget         `json:"budget_limit"`
+	Disposition      Disposition    `json:"disposition"`
+	TransformRef     string         `json:"transform_ref,omitempty"`
+	ContentRef       string         `json:"content_ref,omitempty"`
+	ProjectionReason string         `json:"projection_reason,omitempty"`
+	AtomicGroupID    string         `json:"atomic_group_id,omitempty"`
+	WireID           string         `json:"wire_id,omitempty"`
 }
 
 // ContextManifest 与真实 WireItem 同源生成，是 Snapshot 的审计投影而非第二条
@@ -178,7 +181,8 @@ func (f ContextFragment) Record(outputDigest string, budget Budget, groupID, wir
 		SerializedBytes: f.SerializedBytes, EstimatedTokens: f.EstimatedTokens,
 		BudgetLimit: budget, RetentionClass: f.RetentionClass,
 		Disposition: f.Disposition, TransformRef: f.TransformRef,
-		ContentRef: f.ContentRef, AtomicGroupID: groupID, WireID: wireID,
+		ContentRef: f.ContentRef, ProjectionReason: f.ProjectionReason,
+		AtomicGroupID: groupID, WireID: wireID,
 	}
 }
 
@@ -209,6 +213,7 @@ func ManifestItemFromRecord(r ContextFragmentRecord) ManifestItem {
 		OutputDigest: r.OutputDigest, SerializedBytes: r.SerializedBytes,
 		EstimatedTokens: r.EstimatedTokens, BudgetLimit: r.BudgetLimit,
 		Disposition: r.Disposition, TransformRef: r.TransformRef,
-		ContentRef: r.ContentRef, AtomicGroupID: r.AtomicGroupID, WireID: r.WireID,
+		ContentRef: r.ContentRef, ProjectionReason: r.ProjectionReason,
+		AtomicGroupID: r.AtomicGroupID, WireID: r.WireID,
 	}
 }

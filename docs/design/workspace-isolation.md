@@ -30,8 +30,8 @@ Scheduler 把一个目标拆成多个并行节点时，节点之间可能写同�
 
 1. **声明式触发**：隔离不是全局模式，而是 DAG 节点级声明——Scheduler 在 publish_task 时传 `isolation: "workspace"`，落在 `model.NodeCapability.Isolation`，与 tools/model 同一容器、同一守卫（仅 Scheduler 计划控制面可写）。不声明的节点零开销，行为与引入前完全一致。
 2. **自动合并优先，Scheduler 裁决兜底**：任务成功终态由控制面（不经 LLM）把 dirty set 合并回主根——fast-forward 与三路自动合并覆盖绝大多数情形；无法自动解决的冲突不落地、任务置 failed 并自动 RequestReplan，由 Scheduler 看到冲突证据后裁决（改派、串行化或人工上报）。LLM 不参与合并动作本身。
-3. **shell 尽力隔离**：`run_shell` 默认工作目录切到 workspace 根，显式 `working_dir` 也必须留在同一任务 workspace 内；但命令正文写主根绝对路径仍不可完全阻止——**工具写全隔离，shell cwd 强约束，命令副作用仍是宿主能力**。这是有意接受的残余风险（§7），不为它虚构沙箱保证。
-4. **workspace 在 projectRoot 内**：目录固定在 `<projectRoot>/.agentgo/workspaces/<taskID>/`。在根内则路径边界校验（pathutil）、trace、会话归档的天然覆盖范围内，无需第二套边界规则；`.agentgo/` 本就是系统运行目录，与 sessions/traces/state 同级。
+3. **shell 完整快照**：稀疏 COW 根不是可执行项目树，不能直接用作 `run_check`/Shell cwd。首次 Shell 调用物化排除 `.agentgo`/`.git` 的可丢弃完整快照，每次调用前把 manifest dirty set 覆盖进快照；命令 cwd 与显式 `working_dir` 均限定在该快照内。命令正文写主根绝对路径仍不可完全阻止，不为它虚构 OS 沙箱保证。
+4. **workspace 在 projectRoot 内**：普通任务目录为 `<projectRoot>/.agentgo/workspaces/<taskID>/`；Graph v3 mutating producer 使用由 DeliveryID 哈希得到的 `delivery-*`。每个目录持久化 `.workspace-owner.json`，Watchdog 不得从物理目录名猜 TaskID。`.agentgo/` 是 framework 控制面，业务 write/edit 明确禁止写入。
 
 ## 3. overlay 语义
 
@@ -40,6 +40,20 @@ Scheduler 把一个目标拆成多个并行节点时，节点之间可能写同�
 - **读穿透主根**：workspace 中已有副本（本任务先前写过）读副本；未命中读主根实时内容——主根在任务执行期的新写入对该任务可见，不存在"快照过期"。
 - **写落副本**：`write_file` 的新文件直接落 workspace；`edit_file` 对已有文件先 copy-on-write——从主根复制基线进 workspace，并在 manifest（`.workspace-manifest.json`）记录基线 SHA256，作为合并时的三方之一。
 - **路径边界不变**：启动期把项目根 canonicalize；`pathutil.ValidatePath` 解析目标的现存 symlink/路径别名后校验真实位置仍在根内，再交给 overlay——隔离不放宽任何边界。
+- **Shell 快照不是 dirty set**：完整快照只用于运行命令，不进 manifest/candidate/merge；候选真值仍只是 COW dirty set。Graph v3 Acceptance 复用同一 Delivery workspace，promotion 前重算 dirty content digest，防止验收期 TOCTOU。
+- **revision 按 Delivery 而非 Task 累积**：Graph v3 repair 换 TaskID 但不换
+  candidate。Check/Observation/fulfillment 统一从 Delivery manifest 与 dirty
+  content digest 取 revision，同时汇总各代 write refs。pre-mutation 空
+  manifest 是 `workspace:empty`；真正 Freeze/TaskOutcome 仍禁止空交付。
+- **editable 执行环境不得穿透**：Python 项目的复制 `.venv` 可能在
+  `.pth` 中固化主根绝对路径。Shell 启动时机械地把 snapshot
+  `src`/根置于 `PYTHONPATH` 前部，并在存在时绑定 snapshot
+  `.venv`；不解析 provider/model 名称，也不修改模型命令。
+- **控制命名空间不暴露**：业务读只命中 manifest 已登记的 dirty
+  文件，不以 workspace 中任意物理文件存在为依据。owner/manifest/
+  baseline/shell snapshot 名称为内部保留路径，业务写入
+  fail-closed。活动租约归零即删除 Shell snapshot，blocked/quarantined
+  candidate 只保留 dirty/baseline 审计所需数据。
 
 ## 4. 合并协议
 
@@ -55,7 +69,7 @@ Scheduler 把一个目标拆成多个并行节点时，节点之间可能写同�
 
 `conflict` 的语义是**可裁决的失败**，不是系统故障：`MergeResult.Conflicted=true` 时无冲突文件已落地、冲突文件保证未部分写入；执行面把任务终止为 failed 并自动 RequestReplan（冲突文件、区域、三方哈希随 `workspace_merge_conflict` trace 事件落盘），workspace 保留供排查；Scheduler 在 replan 决策中裁决——典型动作是把冲突节点串行化重派。重试复用既有 workspace（`Materialize` 幂等），不从头再来。
 
-生命周期事件全部落 trace：`workspace_materialized`（认领物化）→ `workspace_merged` / `workspace_merge_conflict`（终态合并）→ `workspace_cleaned`（清理，含 watchdog 孤儿清扫）。
+生命周期事件全部带 owner Run/Graph 身份落 trace：`workspace_materialized`（认领物化）→ `workspace_merged` / `workspace_merge_conflict`（终态合并）→ `workspace_cleaned`。活动清理拒绝为 `workspace_cleanup_rejected`，Watchdog 裁决为 `workspace_retention_decided`。Agent 使用期间持有租约；Graph v3 运行中与非成功终态 candidate 不属于孤儿，只有已 settled promotion 的 success 残留可清理。
 
 ## 5. 逐触点表
 
@@ -79,6 +93,6 @@ Scheduler 把一个目标拆成多个并行节点时，节点之间可能写同�
 
 ## 7. 残余风险与后续方向
 
-- **shell 写主根绝对路径**（有意接受）：`run_shell` 默认 cwd 与显式 `working_dir` 都被限制在 workspace 内，相对路径写自然落副本；但命令正文显式写主根绝对路径仍会穿透隔离。要彻底封堵需 OS 级沙箱（namespace/容器），当前不引入。
+- **shell 写主根绝对路径**（有意接受）：`run_shell` 默认 cwd 与显式 `working_dir` 都被限制在 shell snapshot 内，相对路径写不会穿透主根，也不会自动进入 candidate；但命令正文显式写主根绝对路径仍会穿透隔离。要彻底封堵需 OS 级沙箱（namespace/容器），当前不引入。
 - **读穿透的可见性不对称**：隔离任务读得到主根执行期新内容（含其他并行节点已合并的产出），但其他任务读不到它未合并的副本——这是隔离的本义，但意味着"先产出中间文件供同伴消费"的协作模式必须经合并点，不能靠执行期偷看。
 - **后续方向**：workspace 差分随任务结果上报（board snapshot 展示 dirty set 摘要）；冲突区域的 LLM 辅助裁决建议（作为 replan 证据的附件，仍由 Scheduler 决策）；`IsolationSpec` 预留扩展位（如 `Mode: "snapshot"` 只读快照），容器类型无需变更。

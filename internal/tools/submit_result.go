@@ -108,7 +108,7 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 	// verdict 仅限 acceptance、终态落盘前出路匹配检查）。图不存在 / v1 图 /
 	// 未注入 OutletChecker 时按 v1 语义处理（行为与引入前逐字节一致）。
 	v2Graph := task.GraphID != "" && g.OutletChecker != nil &&
-		g.OutletChecker.GraphSchema(task.GraphID) == graph.SchemaV2
+		(graph.OutletSchemaIsV2OrLater(g.OutletChecker.GraphSchema(task.GraphID)))
 
 	summary, _ := args["summary"].(string)
 	if strings.TrimSpace(summary) == "" {
@@ -143,7 +143,7 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 		}
 	}
 	// cited_evidence：Graph acceptance 节点验收任务引用的证据清单（逗号分隔
-	// 的不透明稳定 EvidenceRef），经 StructuredSubmission 写入
+	// 的不透明稳定 EvidenceRef 或 typed CheckRef），经 StructuredSubmission 写入
 	// Results["cited_evidence"]，由 Graph Runtime 做谱系核验（引用必须属于
 	// 该 activation 的上游 Input 谱系或本任务自身证据）。提交时做轻量形态
 	// 校验（逐项非空）——谱系核验在图侧进行。
@@ -151,7 +151,7 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 	if trimmed := strings.TrimSpace(citedEvidence); trimmed != "" {
 		for _, ref := range strings.Split(trimmed, ",") {
 			if strings.TrimSpace(ref) == "" {
-				return "", fmt.Errorf("cited_evidence 含空白引用项：应为逗号分隔的不透明稳定 EvidenceRef 清单")
+				return "", fmt.Errorf("cited_evidence 含空白引用项：应为逗号分隔的不透明稳定 EvidenceRef/CheckRef 清单")
 			}
 		}
 		citedEvidence = trimmed
@@ -309,7 +309,7 @@ func (g PlanControlGroup) buildFulfillment(task *model.Task) (fulfillment.Record
 	if g.Checks == nil {
 		return fulfillment.Record{}, fmt.Errorf("CheckStore 未装配")
 	}
-	workspaceRef, effectRefs, err := checkstore.WorkspaceRevision(task, g.Store)
+	workspaceRef, effectRefs, err := checkstore.WorkspaceRevision(task, g.Store, g.Workspaces)
 	if err != nil {
 		return fulfillment.Record{}, err
 	}

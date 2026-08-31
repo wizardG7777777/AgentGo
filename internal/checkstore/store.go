@@ -161,10 +161,79 @@ func (s *Store) Latest(taskID, attemptID, checkID string) (Record, bool, error) 
 	return latest, !latest.SettledAt.IsZero(), nil
 }
 
-// WorkspaceRevision 从当前 Attempt 的 settled write/edit ToolCall 构造稳定版本。
-func WorkspaceRevision(task *model.Task, taskStore store.TaskStore) (string, []string, error) {
+// ListTask 返回一个 Task 的全部 durable CheckRecord，按 settled_at/check_ref
+// 排序。Recovery/Acceptance 只能消费该类型化事实，不能从 run_check 调用次数
+// 猜测检查是否通过。
+func (s *Store) ListTask(taskID string) ([]Record, error) {
+	if s == nil || strings.TrimSpace(s.dir) == "" || strings.TrimSpace(taskID) == "" {
+		return nil, nil
+	}
+	root := filepath.Join(s.dir, safe(taskID))
+	attempts, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var records []Record
+	for _, attempt := range attempts {
+		if !attempt.IsDir() {
+			continue
+		}
+		entries, readErr := os.ReadDir(filepath.Join(root, attempt.Name()))
+		if readErr != nil {
+			return nil, readErr
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			data, readErr := os.ReadFile(filepath.Join(root, attempt.Name(), entry.Name()))
+			if readErr != nil {
+				return nil, readErr
+			}
+			var record Record
+			if err := json.Unmarshal(data, &record); err != nil {
+				return nil, err
+			}
+			if record.Schema != SchemaV1 || record.TaskID != taskID {
+				return nil, fmt.Errorf("CheckRecord identity 不一致: %s", entry.Name())
+			}
+			records = append(records, record)
+		}
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if !records[i].SettledAt.Equal(records[j].SettledAt) {
+			return records[i].SettledAt.Before(records[j].SettledAt)
+		}
+		return records[i].CheckRef < records[j].CheckRef
+	})
+	return records, nil
+}
+
+type WorkspaceRevisionResolver interface {
+	ResolveWorkspaceRevision(task *model.Task, taskStore store.TaskStore) (
+		ref string, effectRefs []string, handled bool, err error,
+	)
+}
+
+// WorkspaceRevision 优先从注入的 Delivery workspace authority 计算
+// 累积 candidate revision；普通 Task 仍从当前 Attempt 的 settled
+// write/edit ToolCall 构造稳定版本。
+func WorkspaceRevision(task *model.Task, taskStore store.TaskStore,
+	resolvers ...WorkspaceRevisionResolver) (string, []string, error) {
 	if task == nil || taskStore == nil || task.AttemptID == "" {
 		return "", nil, fmt.Errorf("workspace revision 缺少 Task/Store/Attempt")
+	}
+	for _, resolver := range resolvers {
+		if resolver == nil {
+			continue
+		}
+		ref, effectRefs, handled, err := resolver.ResolveWorkspaceRevision(task, taskStore)
+		if err != nil || handled {
+			return ref, effectRefs, err
+		}
 	}
 	records, err := taskStore.QueryToolCalls(task.ID, "")
 	if err != nil {

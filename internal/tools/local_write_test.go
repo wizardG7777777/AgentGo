@@ -175,6 +175,32 @@ func TestWriteFile_BasicSuccess(t *testing.T) {
 	}
 }
 
+func TestLocalWriteRejectsAgentGoControlPlane(t *testing.T) {
+	g, rr, root := newWriteGroup(t, nil)
+	for _, tc := range []struct {
+		name string
+		call func() error
+	}{
+		{name: "write", call: func() error {
+			_, err := callWriteFile(g, filepath.Join(root, ".agentgo", "probe.txt"), "x", "")
+			return err
+		}},
+		{name: "edit", call: func() error {
+			_, err := callEditFile(g, filepath.Join(root, ".agentgo", "state.json"), "a", "b", "")
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.call(); err == nil || !strings.Contains(err.Error(), "runtime_state_write_forbidden") {
+				t.Fatalf(".agentgo 写入必须 fail-closed: %v", err)
+			}
+		})
+	}
+	if events := rr.snapshot(); len(events) != 0 {
+		t.Fatalf("控制面路径拒绝必须发生在 roster/副作用之前: %v", events)
+	}
+}
+
 // C7 删除：TestWriteFile_HashMismatch
 // 等价覆盖在 internal/hook/builtin/validate_expected_hash_test.go 中。
 

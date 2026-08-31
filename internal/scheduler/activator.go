@@ -179,6 +179,7 @@ const SchedulerTaskTimeoutSec = 86400 // 24 小时
 const (
 	defaultRunFinalizationReserve = 5 * time.Minute
 	defaultRunRecoveryReserve     = 15 * time.Minute
+	defaultRunVerificationReserve = 15 * time.Minute
 )
 
 // Activator 是 EventCh 与 scheduler agent 之间的桥梁。
@@ -265,11 +266,12 @@ func (a *Activator) handleEvent(evt model.Event) {
 		run := evt.RunContract
 		if run == nil {
 			run = &runcontract.RunContract{
-				Schema:              runcontract.SchemaV1,
+				Schema:              runcontract.SchemaCurrent,
 				RunID:               runcontract.RunID("run-" + uuid.NewString()),
 				DeadlineAt:          now.Add(time.Duration(SchedulerTaskTimeoutSec) * time.Second),
 				FinalizationReserve: defaultRunFinalizationReserve,
 				RecoveryReserve:     defaultRunRecoveryReserve,
+				VerificationReserve: defaultRunVerificationReserve,
 				BudgetProfile:       "interactive/v3",
 				CreatedAt:           now,
 			}

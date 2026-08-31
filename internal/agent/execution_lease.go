@@ -224,7 +224,7 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 	}
 
 	// --- 节点角色派生控制通道 ---
-	lease.ControlTools = deriveControlTools(task)
+	lease.ControlTools = model.SortedCopy(deriveControlTools(task))
 
 	// --- 冻结模型 / 隔离 / 超时 ---
 	lease.Model = a.Model
@@ -236,6 +236,19 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 	}
 	if task.Capability != nil && task.Capability.Isolation != nil {
 		lease.Workspace = task.Capability.Isolation.Mode
+	}
+	// Delivery Transaction 的 mutating producer 只能写隔离 candidate。这里
+	// 是 Graph compiler/config doctor 之外的执行期兜底，覆盖旧快照被篡改或
+	// 直接构造 Task 的路径；不得通过 raw run_shell 绕过 workspace 边界。
+	if task.DeliveryID != "" && task.FulfillmentContract != nil && task.FulfillmentContract.RequireWorkspaceChange {
+		if lease.Workspace != model.IsolationModeWorkspace {
+			return nil, "Graph v3 mutating Delivery Task 必须使用 workspace isolation"
+		}
+		for _, tool := range lease.BusinessTools {
+			if tool == "run_shell" {
+				return nil, "Graph v3 mutating Delivery Task 禁止 raw run_shell；请使用 run_check"
+			}
+		}
 	}
 
 	lease.Digest = lease.ComputeDigest()
@@ -363,6 +376,13 @@ func deriveControlTools(task *model.Task) []string {
 				return []string{"patch_graph", "read_graph", "request_replan", "submit_task_result"}
 			}
 			tools := []string{"request_replan", "submit_task_result"}
+			v4ChangeDecision := task.GraphRecoveryDeltaSchema == graph.RecoveryDeltaSchemaV4
+			if directive, ok := frozenRecoveryDirective(task); ok && directive.Schema == graph.RecoveryDeltaSchemaV4 {
+				v4ChangeDecision = true
+			}
+			if v4ChangeDecision {
+				tools = append(tools, "submit_change_decision")
+			}
 			if task.ProgressContract != nil && (task.ProgressContract.Policy.KnowledgeCheckpointAfterTurns > 0 ||
 				task.ProgressContract.Ref.ContractID == policycatalog.ProgressCodeChangeV4) {
 				tools = append(tools, "record_observation_delta")

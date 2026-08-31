@@ -33,6 +33,7 @@ import (
 	"agentgo/internal/store"
 	"agentgo/internal/taskmem"
 	"agentgo/internal/trace"
+	"agentgo/internal/workspace"
 )
 
 // ErrRecoverable 是无 canonical InvocationFailure 的旧执行器/非 Invocation
@@ -627,6 +628,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// runtime_loop_fuse / handleFailure 等显式分支跑前会赋值；panic 路径在合并 defer 中覆盖。
 	terminatingCause := "react_loop_exit:natural"
 	taskSuccess := false
+	deactivateWorkspace := func() {}
 	enteredTerminating := false
 	enterTerminating := func(cause string) {
 		if enteredTerminating {
@@ -674,6 +676,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	//
 	// panic 路径不再生成交接备忘（TransferNote 机制已于 V6 CM4 删除）：
 	// 重试接手上下文由 Task Memory + LastHistory 承担（task_memory.go）。
+	var loopProgress *loopProgressRuntime
 	defer func() {
 		if rec := recover(); rec != nil {
 			terminatingCause = "react_loop_exit:panic"
@@ -683,6 +686,9 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			reason := fmt.Sprintf("agent panic: %v", rec)
 			if err := store.FailTaskWithCause(a.Store, a.ID, taskID, reason, "agent_panic"); err != nil {
 				log.Printf("[agent %s] panic 恢复后 FailTask error: %v", a.ID, err)
+			}
+			if loopProgress != nil {
+				loopProgress.finalize(a, taskID)
 			}
 			// §11.8 S11：panic-recovery 路径补 KindTaskFailed emit。
 			trace.Emit(trace.Event{
@@ -789,7 +795,15 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			a.terminateTask(task, taskID, reason, "capability_violation")
 			return
 		}
-		view, err := a.WorkspaceManager.Materialize(taskID)
+		workspaceID := taskID
+		owner := workspace.TaskOwner(taskID)
+		if task.DeliveryID != "" {
+			// Graph v3 repair activation 复用同一 Delivery workspace；TaskID 仍
+			// 是 L4 attempt 身份，不能再被当作候选生命周期 identity。
+			workspaceID = workspace.DeliveryWorkspaceID(task.DeliveryID)
+			owner = workspace.DeliveryOwner(taskID, task.DeliveryID, string(task.RunID), task.GraphID)
+		}
+		view, err := a.WorkspaceManager.MaterializeOwned(workspaceID, owner)
 		if err != nil {
 			reason := fmt.Sprintf("workspace 物化失败: %v，不降级执行", err)
 			log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
@@ -798,8 +812,21 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			a.terminateTask(task, taskID, reason, "capability_violation")
 			return
 		}
+		release, err := a.WorkspaceManager.Acquire(workspaceID)
+		if err != nil {
+			reason := fmt.Sprintf("workspace 活动租约取得失败: %v，不降级执行", err)
+			log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
+			terminatingCause = "react_loop_exit:error"
+			enterTerminating(terminatingCause)
+			a.terminateTask(task, taskID, reason, "capability_violation")
+			return
+		}
 		restore := a.WorkspaceActivator.Activate(view)
-		defer restore()
+		deactivateWorkspace = func() {
+			restore()
+			release()
+		}
+		defer deactivateWorkspace()
 		log.Printf("[agent %s] 任务 %s 执行租约生效：workspace 执行隔离（视图根 %s）", a.ID, taskID, view.Root())
 		// KindWorkspaceMaterialized 由 Manager 负责 emit（types.go 契约），这里不重复。
 	}
@@ -957,13 +984,20 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		current, getErr := a.Store.GetTask(taskID)
 		return getErr == nil && current != nil && current.Status == model.TaskStatusCancelled
 	}
-	loopProgress, loopProgressErr := a.initLoopProgress(task)
+	var loopProgressErr error
+	loopProgress, loopProgressErr = a.initLoopProgress(task)
 	if loopProgressErr != nil {
 		if ctx.Err() != nil && isAuthoritativeCancellation() {
 			emitCancellation(-1)
 			return
 		}
 		reason := "L4 ProgressCheckpoint 初始化/恢复失败: " + loopProgressErr.Error()
+		if a.tryFinalizationFallback(ctx, task, 0) {
+			terminatingCause = "react_loop_exit:finalization_deadline_fallback"
+			enterTerminating(terminatingCause)
+			taskSuccess = true
+			return
+		}
 		terminatingCause = "react_loop_exit:progress_authority_failure"
 		enterTerminating(terminatingCause)
 		a.blockForLoopControl(task, taskID, reason, "progress_authority_failure")
@@ -971,6 +1005,11 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	}
 	if loopProgress != nil {
 		defer loopProgress.finalize(a, taskID)
+		defer func() {
+			if err := loopProgress.closeOutstandingReservations(); err != nil {
+				log.Printf("[agent %s] 任务 %s 关闭遗留 action reservation 失败: %v", a.ID, taskID, err)
+			}
+		}()
 	}
 
 	// V6：ReAct 循环不再有固定轮数上限（docs/nextUpgrade-V6.md §5 升级思路
@@ -984,6 +1023,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// 若按自然完成收口，scheduler 会"什么都没做就结束"）。连续
 	// maxEmptyResponseStreak 轮仍空按可恢复错误收口（重试换上下文）。
 	emptyStreak := 0
+	sameSnapshotFailureStreak := 0
 	// unstructuredExitStreak：图节点任务纯文本自然退出（有文本、零工具
 	// 调用、未走 submit_task_result）的计数（2026-08-20 SWE-001 兜底 2）。
 	// 图节点契约要求结构化收口，文本退出 = 未提交：提醒
@@ -1001,30 +1041,6 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			return
 		default:
 		}
-		if hasAttemptDeadline && !time.Now().Before(attemptDeadline) {
-			cause := invocation.ErrAttemptDeadline
-			failure := invocation.NewFailure(invocation.FailureAttemptDeadline,
-				invocation.PhaseRequestSend, invocation.OriginRuntime, cause)
-			failure.TimeoutScope = invocation.TimeoutAttempt
-			terminatingCause = "react_loop_exit:attempt_deadline"
-			enterTerminating(terminatingCause)
-			taskMem.recordAttemptEnd(a, taskID, cause.Error())
-			taskMem.checkpoint(a, taskID, i, "attempt_end")
-			a.handleFailure(task, taskID, failure, history, manifestInfo)
-			return
-		}
-
-		// emergency fuse：循环计数越过兜底阈值，判定为程序缺陷造成的真死循环。
-		// 这不是正常终止条件（正常退出靠结构化终态 / 取消 / 错误处理），fuse
-		// 触发后任务进 blocked + 登记 replan，绝不自动重跑同一 Task。
-		// 放在 ctx 取消检查之后：外部取消是更高优先级的权威终止语义。
-		if i >= a.loopFuseLimit() {
-			terminatingCause = "react_loop_exit:runtime_loop_fuse"
-			enterTerminating(terminatingCause)
-			a.tripRuntimeLoopFuse(ctx, task, taskID, i, history)
-			return
-		}
-
 		// 排水信箱：将收到的代理间消息注入历史，作为 user 角色消息；同时向发信方自动发送回执
 		hasNewMail := false
 		if a.Mailbox != nil {
@@ -1110,7 +1126,10 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			}
 			// 写时复制隔离：合并必须在 SubmitResult（标记 completed）之前完成。
 			// 合并失败/冲突时 helper 已把任务转 failed 并发布 replan 唤醒任务，直接返回。
-			if !a.mergeWorkspaceBeforeComplete(ctx, task, taskID) {
+			if task.DeliveryID == "" {
+				deactivateWorkspace()
+			}
+			if task.DeliveryID == "" && !a.mergeWorkspaceBeforeComplete(ctx, task, taskID) {
 				terminatingCause = "react_loop_exit:error"
 				enterTerminating(terminatingCause)
 				return
@@ -1205,6 +1224,37 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			return
 		}
 
+		// finalizing 是已经接受的唯一终态提交，优先级高于 L4 deadline/fuse。
+		// 上一 Turn 接受提交后即使恰好跨过 Attempt deadline，也必须先完成已
+		// durable 的终态事务，不能改走 retry/blocked 产生第二个提交者。
+		if hasAttemptDeadline && !time.Now().Before(attemptDeadline) {
+			cause := invocation.ErrAttemptDeadline
+			failure := invocation.NewFailure(invocation.FailureAttemptDeadline,
+				invocation.PhaseRequestSend, invocation.OriginRuntime, cause)
+			failure.TimeoutScope = invocation.TimeoutAttempt
+			terminatingCause = "react_loop_exit:attempt_deadline"
+			enterTerminating(terminatingCause)
+			if a.tryFinalizationFallback(ctx, task, i) {
+				taskSuccess = true
+				return
+			}
+			taskMem.recordAttemptEnd(a, taskID, cause.Error())
+			taskMem.checkpoint(a, taskID, i, "attempt_end")
+			a.handleFailure(task, taskID, failure, history, manifestInfo)
+			return
+		}
+
+		// emergency fuse：循环计数越过兜底阈值，判定为程序缺陷造成的真死循环。
+		// 这不是正常终止条件（正常退出靠结构化终态 / 取消 / 错误处理），fuse
+		// 触发后任务进 blocked + 登记 replan，绝不自动重跑同一 Task。
+		// 放在 finalizing 后：已接受的终态提交不是程序性死循环。
+		if i >= a.loopFuseLimit() {
+			terminatingCause = "react_loop_exit:runtime_loop_fuse"
+			enterTerminating(terminatingCause)
+			a.tripRuntimeLoopFuse(ctx, task, taskID, i, history)
+			return
+		}
+
 		// 构建只读副本传入 executor
 		histCopy := make([]HistoryEntry, len(history))
 		copy(histCopy, history)
@@ -1275,6 +1325,20 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					return
 				}
 				reason := "L4 model action 预算预留失败: " + reserveErr.Error()
+				if a.tryFinalizationFallback(ctx, task, i) {
+					terminatingCause = "react_loop_exit:finalization_deadline_fallback"
+					enterTerminating(terminatingCause)
+					taskSuccess = true
+					return
+				}
+				if _, deadlineFailure := invocation.FromError(reserveErr); deadlineFailure {
+					terminatingCause = "react_loop_exit:attempt_deadline"
+					enterTerminating(terminatingCause)
+					taskMem.recordAttemptEnd(a, taskID, reserveErr.Error())
+					taskMem.checkpoint(a, taskID, i, "attempt_end")
+					a.handleFailure(task, taskID, reserveErr, history, manifestInfo)
+					return
+				}
 				terminatingCause = "react_loop_exit:progress_authority_failure"
 				enterTerminating(terminatingCause)
 				a.blockForLoopControl(task, taskID, reason, "progress_authority_failure")
@@ -1282,10 +1346,19 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			}
 			executeCtx, reserveErr = invocation.WithOutputBudget(executeCtx, actionOutputBudget)
 			if reserveErr != nil {
+				if cancelErr := loopProgress.cancelModelAction(turnID, reserveErr.Error()); cancelErr != nil {
+					reserveErr = errors.Join(reserveErr, cancelErr)
+				}
 				if cancelExecute != nil {
 					cancelExecute()
 				}
 				reason := "L4 model action OutputBudget 冻结失败: " + reserveErr.Error()
+				if a.tryFinalizationFallback(ctx, task, i) {
+					terminatingCause = "react_loop_exit:finalization_deadline_fallback"
+					enterTerminating(terminatingCause)
+					taskSuccess = true
+					return
+				}
 				enterTerminating("react_loop_exit:progress_authority_failure")
 				a.blockForLoopControl(task, taskID, reason, "progress_authority_failure")
 				return
@@ -1302,7 +1375,8 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		callerCancelled := ctx.Err() != nil && isAuthoritativeCancellation()
 		if loopProgress != nil {
 			policyDecision, progressErr = loopProgress.settleTurn(a, task, turnID,
-				actionStartedAt, result, execErr, !callerCancelled)
+				actionStartedAt, result, execErr, !callerCancelled,
+				pendingObservationCheckpointAction(history) != "")
 		}
 
 		// 取消可能发生在 Execute 内部。此时循环顶部的 select 已经过去，
@@ -1322,6 +1396,26 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			enterTerminating(terminatingCause)
 			a.blockForLoopControl(task, taskID, reason, "progress_authority_failure")
 			return
+		}
+		// submit_task_result / submit_recovery_decision 已进入 finalizing 后，
+		// 本 Turn 只允许结算账本、保存 replay 与 TaskMemory，然后回到循环顶部
+		// 完成唯一终态事务。L4 rollover/intervention 不得覆盖这个提交。
+		if a.FinalizationChecker != nil && a.FinalizationChecker.IsFinalized() {
+			lastOutput = result.Output
+			a.AddTokenStats(int64(result.PromptTokens), int64(result.CompletionTokens))
+			if result.ToolCalled {
+				history = append(history, historyEntryFromResult(result, a.Model, turnID))
+			}
+			taskMem.applySettledTurn(a, taskID, result, i)
+			a.saveHistory(task, history)
+			continue
+		}
+		// exact deliverable submit 若被契约门明确告知需要更多工作，
+		// 本轮不得再追加 deliverable-required marker。失败提交回执
+		// 会在 historyRequiresDeliverableSubmit 中清除旧 marker，下轮重新
+		// 暴露 run_check/read/edit，避免同一 gate error 无界重放。
+		if deliverableSubmissionNeedsMoreWork(historyEntryFromResult(result, a.Model, turnID)) {
+			policyDecision.Reminder = ""
 		}
 
 		// Observation checkpoint 是 L2/L4 的机械接缝。marker 已在上一轮
@@ -1352,30 +1446,42 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 						" 本次机械 checkpoint 未形成合法 ObservationDelta。"})
 				}
 				failures := observationCheckpointFailureCount(history)
-				if failures < 2 {
-					history = append(history, HistoryEntry{SystemNotice: "Observation 未通过机械校验；仍处于同一 checkpoint，请使用当前 evidence catalog 修正一次。"})
+				failureLimit := 2
+				usesDurableControlFailures := task.ProgressContract != nil &&
+					task.ProgressContract.Policy.MaxControlContractFailures > 0
+				if usesDurableControlFailures {
+					failures = loopProgress.checkpoint.ControlContractFailureCount
+					failureLimit = task.ProgressContract.Policy.MaxControlContractFailures
+				}
+				if failures < failureLimit {
+					notice := "Observation 未通过机械校验；仍处于同一 checkpoint，请按本轮 tool schema 的 evidence enum 修正一次。"
+					if detail := observationCheckpointFailureDetail(result); detail != "" {
+						notice += " 机械错误：" + detail
+					}
+					history = append(history, HistoryEntry{SystemNotice: notice})
 					a.saveHistory(task, history)
 					continue
 				}
-				if observationAction == "periodic" {
+				if !usesDurableControlFailures && observationAction == "periodic" {
 					history = append(history, HistoryEntry{SystemNotice: observationCheckpointAbandonedMarker +
 						" 周期性 Observation 两次失败；保留原始历史并恢复业务阶段，下一知识 turn 再尝试。"})
 					a.saveHistory(task, history)
 					continue
 				}
 				a.saveHistory(task, history)
-				reason := "Observation checkpoint 两次未形成 durable observation_delta_ref"
-				terminatingCause = "react_loop_exit:observation_checkpoint_failed"
+				reason := "control_contract_unstable: Observation control contract 连续失败"
+				terminatingCause = "react_loop_exit:control_contract_unstable"
 				enterTerminating(terminatingCause)
-				a.blockForLoopControl(task, taskID, reason, "observation_checkpoint_failed")
+				a.blockForLoopControl(task, taskID, reason, "control_contract_unstable")
 				return
 			}
 			a.saveHistory(task, history)
 			taskMem.checkpoint(a, taskID, i, "observation_checkpoint")
 			lastObservationProjectionCount = manifestInfo.historyProjectionCount
 			effectiveObservationAction := observationAction
-			if policyDecision.ObservationAction == "observation_stalled" {
-				effectiveObservationAction = "observation_stalled"
+			if policyDecision.ObservationAction == "observation_stalled" ||
+				policyDecision.ObservationAction == "decision_stalled" {
+				effectiveObservationAction = policyDecision.ObservationAction
 			}
 			switch effectiveObservationAction {
 			case "rollover":
@@ -1392,7 +1498,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 						NewStatus: string(model.TaskStatusPending), Cause: "l4_no_progress_attempt_rollover",
 						RetryCount: task.RetryCount + 1}})
 				return
-			case "intervention_budget", "intervention_stalled", "observation_stalled":
+			case "intervention_budget", "intervention_stalled", "observation_stalled", "decision_stalled":
 				reasonCode := loopcontract.InterventionNoProgressStalled
 				reasonPrefix := "no_progress_intervention_required"
 				cause := "loop_intervention_required"
@@ -1404,8 +1510,12 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					reasonCode = loopcontract.InterventionObservationStalled
 					reasonPrefix = "observation_state_stalled"
 					cause = "observation_state_stalled"
+				} else if effectiveObservationAction == "decision_stalled" {
+					reasonCode = loopcontract.InterventionDecisionStalled
+					reasonPrefix = "decision_progress_stalled"
+					cause = "decision_progress_stalled"
 				}
-				if effectiveObservationAction != "observation_stalled" {
+				if effectiveObservationAction != "observation_stalled" && effectiveObservationAction != "decision_stalled" {
 					if err := loopProgress.appendObservationIntervention(task, reasonCode); err != nil {
 						terminatingCause = "react_loop_exit:progress_authority_failure"
 						enterTerminating(terminatingCause)
@@ -1413,7 +1523,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 						return
 					}
 				}
-				reason := fmt.Sprintf("%s: turns=%d checkpoint=%s observation=%s", reasonPrefix,
+				reason := fmt.Sprintf("%s: no_progress_turns=%d checkpoint=%s observation=%s", reasonPrefix,
 					loopProgress.checkpoint.NoProgressTurns, loopProgress.checkpoint.CheckpointID,
 					loopProgress.checkpoint.ObservationDeltaRef)
 				terminatingCause = "react_loop_exit:" + cause
@@ -1439,7 +1549,11 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			continue
 		}
 
-		if policyDecision.ObservationAction != "" {
+		// ObservationAction 在 Intervention=true 时表示 typed reason，而不是
+		// “再请求一次 checkpoint”。Observation 已存在的 decision/time guard
+		// 会直接返回 Intervention+decision_stalled；若仍被本分支 continue，
+		// 每轮都会重复追加 intervention 却永远不终结当前 Activation。
+		if policyDecision.ObservationAction != "" && !policyDecision.Intervention {
 			if result.ToolCalled {
 				history = append(history, historyEntryFromResult(result, a.Model, turnID))
 			}
@@ -1487,11 +1601,18 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		if policyDecision.Intervention {
 			cause := "loop_intervention_required"
 			reasonPrefix := "no_progress_intervention_required"
-			if policyDecision.Blocked {
+			switch {
+			case policyDecision.Blocked:
 				cause = "no_progress_budget_exhausted"
 				reasonPrefix = "no_progress_budget_exhausted"
+			case policyDecision.ObservationAction == "decision_stalled":
+				cause = "decision_progress_stalled"
+				reasonPrefix = "decision_progress_stalled"
+			case policyDecision.ObservationAction == "observation_stalled":
+				cause = "observation_state_stalled"
+				reasonPrefix = "observation_state_stalled"
 			}
-			reason := fmt.Sprintf("%s: turns=%d duration=%s model_calls=%d exploration=%d checkpoint=%s", reasonPrefix,
+			reason := fmt.Sprintf("%s: no_progress_turns=%d no_progress_duration=%s no_progress_model_calls=%d exploration_turns_since_deliverable=%d checkpoint=%s", reasonPrefix,
 				loopProgress.checkpoint.NoProgressTurns, loopProgress.checkpoint.NoProgressDuration,
 				loopProgress.checkpoint.NoProgressUsage.ModelCalls,
 				loopProgress.checkpoint.ExplorationTurnsSinceDeliverable,
@@ -1516,6 +1637,18 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		}
 		var authorityErr *loopAuthorityError
 		if errors.As(execErr, &authorityErr) {
+			if _, deadlineFailure := invocation.FromError(authorityErr.Err); deadlineFailure {
+				if a.tryFinalizationFallback(ctx, task, i+1) {
+					taskSuccess = true
+					return
+				}
+				terminatingCause = "react_loop_exit:attempt_deadline"
+				enterTerminating(terminatingCause)
+				taskMem.recordAttemptEnd(a, taskID, authorityErr.Error())
+				taskMem.checkpoint(a, taskID, i, "attempt_end")
+				a.handleFailure(task, taskID, authorityErr.Err, history, manifestInfo)
+				return
+			}
 			reason := authorityErr.Error()
 			terminatingCause = "react_loop_exit:progress_authority_failure"
 			enterTerminating(terminatingCause)
@@ -1524,6 +1657,19 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		}
 
 		if execErr != nil {
+			if failure, ok := invocation.FromError(execErr); ok {
+				decision := loopcontrol.DecideInvocationFailure(failure)
+				if decision.Action == loopcontrol.RecoveryRetrySameSnapshot && sameSnapshotFailureStreak < 2 {
+					sameSnapshotFailureStreak++
+					history = append(history, HistoryEntry{SystemNotice: fmt.Sprintf(
+						"[same-snapshot-retry %d/2] 上一 Invocation 被机械拒绝：%s。保持当前 Attempt，严格使用本轮 ToolRouter/schema 修正后重试。",
+						sameSnapshotFailureStreak, failure.Error())})
+					a.saveHistory(task, history)
+					log.Printf("[agent %s] 任务 %s Invocation same-snapshot retry %d/2: %v",
+						a.ID, taskID, sameSnapshotFailureStreak, failure)
+					continue
+				}
+			}
 			if task.FinalReportGraphID != "" && a.FinalizationFallback != nil {
 				report, fallbackErr := a.FinalizationFallback(ctx, task)
 				if fallbackErr == nil && strings.TrimSpace(report) != "" {
@@ -1545,6 +1691,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			a.handleFailure(task, taskID, execErr, history, manifestInfo)
 			return
 		}
+		sameSnapshotFailureStreak = 0
 
 		lastOutput = result.Output
 
@@ -1738,7 +1885,10 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 
 			// 写时复制隔离：合并必须在 SubmitResult（标记 completed）之前完成。
 			// 合并失败/冲突时 helper 已把任务转 failed 并发布 replan 唤醒任务，直接返回。
-			if !a.mergeWorkspaceBeforeComplete(ctx, task, taskID) {
+			if task.DeliveryID == "" {
+				deactivateWorkspace()
+			}
+			if task.DeliveryID == "" && !a.mergeWorkspaceBeforeComplete(ctx, task, taskID) {
 				terminatingCause = "react_loop_exit:error"
 				enterTerminating(terminatingCause)
 				return
@@ -1846,6 +1996,22 @@ func (a *Agent) completeFinalizationFallback(task *model.Task, report string, lo
 		AgentID: a.ID, Transition: &trace.Transition{PrevStatus: string(model.TaskStatusProcessing),
 			NewStatus: string(model.TaskStatusCompleted), Cause: "finalization_fallback"}})
 	return true
+}
+
+func (a *Agent) tryFinalizationFallback(ctx context.Context, task *model.Task, loops int) bool {
+	if a == nil || task == nil || task.RunPhase != runcontract.PhaseFinalization ||
+		task.FinalReportGraphID == "" || a.FinalizationFallback == nil {
+		return false
+	}
+	report, err := a.FinalizationFallback(ctx, task)
+	if err != nil || strings.TrimSpace(report) == "" {
+		if err != nil {
+			trace.Emit(trace.Event{Kind: trace.KindError, TaskID: task.ID, RunID: string(task.RunID),
+				AgentID: a.ID, Error: "finalization fallback failed: " + err.Error()})
+		}
+		return false
+	}
+	return a.completeFinalizationFallback(task, report, loops)
 }
 
 // tripRuntimeLoopFuse 是 emergency loop fuse 触发时的统一收口（V6，见

@@ -2,6 +2,8 @@ package bootstrap
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,8 @@ import (
 	"time"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/checkstore"
+	"agentgo/internal/delivery"
 	"agentgo/internal/fulfillment"
 	"agentgo/internal/graph"
 	"agentgo/internal/loopcontract"
@@ -19,6 +23,7 @@ import (
 	"agentgo/internal/outcomestore"
 	"agentgo/internal/store"
 	"agentgo/internal/terminaladapter"
+	"agentgo/internal/workspace"
 )
 
 type graphDocumentReader interface {
@@ -44,6 +49,13 @@ type graphTaskOutcomeAuthority struct {
 	graphs      graphDocumentReader
 	outcomes    *outcomestore.Store
 	checkpoints taskCheckpointReader
+	candidates  interface {
+		FreezeCandidate(deliveryID, workspaceID, workspaceRevisionRef string) (delivery.Candidate, error)
+	}
+	deliveries *delivery.Store
+	checks     interface {
+		Resolve(taskID, attemptID, ref string) (checkstore.Record, error)
+	}
 }
 
 func newGraphTaskOutcomeAuthority(graphs graphDocumentReader, outcomes *outcomestore.Store,
@@ -115,7 +127,15 @@ func (a *graphTaskOutcomeAuthority) Commit(intent store.TerminalOutcomeIntent) (
 	if err != nil {
 		return "", fmt.Errorf("编码 TaskOutcome structured result: %w", err)
 	}
-	evidenceEntries := assembleTaskEvidenceFromCalls(task, intent.ToolCalls)
+	fulfillmentRecord, err := fulfillmentFromTask(task)
+	if err != nil {
+		return "", err
+	}
+	checkRecords, err := a.resolveFulfillmentChecks(task, fulfillmentRecord)
+	if err != nil {
+		return "", err
+	}
+	evidenceEntries := assembleTaskEvidenceFromCallsAndChecks(task, intent.ToolCalls, checkRecords)
 	evidenceFacts := make([]outcome.EvidenceFact, 0, len(evidenceEntries))
 	evidenceRefs := make([]string, 0, len(evidenceEntries))
 	artifactFacts := make([]outcome.ArtifactFact, 0)
@@ -160,17 +180,20 @@ func (a *graphTaskOutcomeAuthority) Commit(intent store.TerminalOutcomeIntent) (
 			reasonCode = "task_" + string(status)
 		}
 	}
-	fulfillmentRecord, err := fulfillmentFromTask(task)
+	schema := outcome.SchemaV1
+	if executionDoc != nil && executionDoc.Schema == graph.SchemaV3 {
+		schema = outcome.SchemaV3
+	} else if task.FulfillmentContract != nil {
+		schema = outcome.SchemaV2
+	}
+	candidateRef, candidate, err := a.freezeCandidate(task, schema, fulfillmentRecord)
 	if err != nil {
 		return "", err
-	}
-	schema := outcome.SchemaV1
-	if task.FulfillmentContract != nil {
-		schema = outcome.SchemaV2
 	}
 	value := outcome.TaskOutcome{
 		Schema: schema, RunID: task.RunID,
 		GraphID: task.GraphID, NodeID: task.NodeID, ActivationID: task.ActivationID,
+		DeliveryID: task.DeliveryID, CandidateRef: candidateRef, Candidate: candidate,
 		TaskID: task.ID, AttemptID: task.AttemptID, AttemptNo: task.AttemptNo,
 		Status: status, Summary: summary, Result: result,
 		TaskResults:  cloneTaskResults(task.Results),
@@ -183,6 +206,9 @@ func (a *graphTaskOutcomeAuthority) Commit(intent store.TerminalOutcomeIntent) (
 	}
 	record, err := a.outcomes.Commit(value)
 	if err != nil {
+		return "", err
+	}
+	if err := a.persistDeliveryCandidate(value, record.OutcomeRef); err != nil {
 		return "", err
 	}
 	return record.OutcomeRef, nil
@@ -270,6 +296,9 @@ func (a *graphTaskOutcomeAuthority) CommitTerminalOutcome(intentRef string, refr
 	if err != nil {
 		return "", err
 	}
+	if err := a.persistDeliveryCandidate(value, record.OutcomeRef); err != nil {
+		return "", err
+	}
 	return record.OutcomeRef, nil
 }
 
@@ -332,7 +361,15 @@ func (a *graphTaskOutcomeAuthority) buildOutcomeCandidate(intent store.TerminalO
 	if err != nil {
 		return outcome.TaskOutcome{}, true, err
 	}
-	evidenceEntries := assembleTaskEvidenceFromCalls(task, intent.ToolCalls)
+	fulfillmentRecord, fulfillmentErr := fulfillmentFromTask(task)
+	if fulfillmentErr != nil {
+		return outcome.TaskOutcome{}, true, fulfillmentErr
+	}
+	checkRecords, checkErr := a.resolveFulfillmentChecks(task, fulfillmentRecord)
+	if checkErr != nil {
+		return outcome.TaskOutcome{}, true, checkErr
+	}
+	evidenceEntries := assembleTaskEvidenceFromCallsAndChecks(task, intent.ToolCalls, checkRecords)
 	evidenceFacts := make([]outcome.EvidenceFact, 0, len(evidenceEntries))
 	evidenceRefs := make([]string, 0, len(evidenceEntries))
 	artifactFacts := make([]outcome.ArtifactFact, 0)
@@ -365,23 +402,61 @@ func (a *graphTaskOutcomeAuthority) buildOutcomeCandidate(intent store.TerminalO
 			reasonCode = "task_" + string(status)
 		}
 	}
-	fulfillmentRecord, fulfillmentErr := fulfillmentFromTask(task)
-	if fulfillmentErr != nil {
-		return outcome.TaskOutcome{}, true, fulfillmentErr
-	}
 	schema := outcome.SchemaV1
-	if task.FulfillmentContract != nil {
+	if executionDoc != nil && executionDoc.Schema == graph.SchemaV3 {
+		schema = outcome.SchemaV3
+	} else if task.FulfillmentContract != nil {
 		schema = outcome.SchemaV2
+	}
+	candidateRef, candidate, candidateErr := a.freezeCandidate(task, schema, fulfillmentRecord)
+	if candidateErr != nil {
+		return outcome.TaskOutcome{}, true, candidateErr
 	}
 	return outcome.TaskOutcome{
 		Schema: schema, RunID: task.RunID,
 		GraphID: task.GraphID, NodeID: task.NodeID, ActivationID: task.ActivationID,
+		DeliveryID: task.DeliveryID, CandidateRef: candidateRef, Candidate: candidate,
 		TaskID: task.ID, AttemptID: task.AttemptID, AttemptNo: task.AttemptNo,
 		Status: status, Summary: summary, Result: result, TaskResults: cloneTaskResults(task.Results),
 		EvidenceRefs: evidenceRefs, ArtifactRefs: artifactRefs, EvidenceFacts: evidenceFacts, ArtifactFacts: artifactFacts,
 		ReasonCode: reasonCode, Reason: reason,
 		Fulfillment: fulfillmentRecord,
 	}, true, nil
+}
+
+func (a *graphTaskOutcomeAuthority) freezeCandidate(task *model.Task, schema string,
+	record *fulfillment.Record,
+) (string, *delivery.Candidate, error) {
+	if schema != outcome.SchemaV3 || record == nil || record.WorkspaceRevisionRef == "" {
+		return "", nil, nil
+	}
+	if a == nil || a.candidates == nil || strings.TrimSpace(task.DeliveryID) == "" {
+		return "", nil, fmt.Errorf("Graph v3 candidate freezer 未装配或缺少 delivery_id")
+	}
+	candidate, err := a.candidates.FreezeCandidate(task.DeliveryID,
+		workspace.DeliveryWorkspaceID(task.DeliveryID), record.WorkspaceRevisionRef)
+	if err != nil {
+		return "", nil, err
+	}
+	return candidate.Ref, &candidate, nil
+}
+
+func (a *graphTaskOutcomeAuthority) persistDeliveryCandidate(value outcome.TaskOutcome, outcomeRef string) error {
+	if value.Schema != outcome.SchemaV3 || value.Candidate == nil {
+		return nil
+	}
+	if a == nil || a.deliveries == nil {
+		return fmt.Errorf("Graph v3 DeliveryStore 未装配")
+	}
+	fulfillmentRaw, _ := json.Marshal(value.Fulfillment)
+	fulfillmentSum := sha256.Sum256(fulfillmentRaw)
+	fulfillmentRef := "fulfillment:sha256:" + hex.EncodeToString(fulfillmentSum[:])
+	_, err := a.deliveries.PrepareCandidate(value.DeliveryID, *value.Candidate,
+		fulfillmentRef, value.EvidenceRefs, outcomeRef, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("冻结 Delivery Transaction candidate: %w", err)
+	}
+	return nil
 }
 
 func fulfillmentFromTask(task *model.Task) (*fulfillment.Record, error) {
@@ -761,6 +836,9 @@ func outcomeEvidenceFact(entry graph.EvidenceEntry) outcome.EvidenceFact {
 		CallID: entry.CallID, ToolName: entry.ToolName,
 		Command: entry.Command, CommandTruncated: entry.CommandTruncated,
 		Path: entry.Path, PathTruncated: entry.PathTruncated,
+		CheckRef: entry.CheckRef, CheckID: entry.CheckID, CheckKind: entry.CheckKind,
+		CheckStatus: entry.CheckStatus, WorkspaceRevisionRef: entry.WorkspaceRevisionRef,
+		OutputRef: entry.OutputRef,
 	}
 	if entry.Success != nil {
 		value := *entry.Success
@@ -772,6 +850,26 @@ func outcomeEvidenceFact(entry graph.EvidenceEntry) outcome.EvidenceFact {
 	}
 	fact.ExitCodeScope = entry.ExitCodeScope
 	return fact
+}
+
+func (a *graphTaskOutcomeAuthority) resolveFulfillmentChecks(task *model.Task,
+	record *fulfillment.Record,
+) ([]checkstore.Record, error) {
+	if record == nil || len(record.CheckRefs) == 0 {
+		return nil, nil
+	}
+	if a == nil || a.checks == nil {
+		return nil, fmt.Errorf("Task %s fulfillment 引用 CheckRef，但 TaskOutcome authority 未装配 CheckStore", task.ID)
+	}
+	checks := make([]checkstore.Record, 0, len(record.CheckRefs))
+	for _, ref := range record.CheckRefs {
+		resolved, err := a.checks.Resolve(task.ID, task.AttemptID, ref)
+		if err != nil {
+			return nil, fmt.Errorf("解引用 fulfillment CheckRef %s: %w", ref, err)
+		}
+		checks = append(checks, resolved)
+	}
+	return checks, nil
 }
 
 func cloneTaskResults(values map[string]string) map[string]string {
@@ -793,6 +891,8 @@ func replayPendingTaskOutcomes(sys *System) error {
 		return nil
 	}
 	authority := newGraphTaskOutcomeAuthority(sys.GraphStore, sys.TaskOutcomeStore, sys.LoopStore)
+	authority.candidates, authority.deliveries = sys.WorkspaceManager, sys.DeliveryStore
+	authority.checks = sys.CheckStore
 	feed := newGraphFeedReactor(sys.Store, sys.GraphRuntime, authority)
 	allowGraphReplay := currentSessionID(sys) == ""
 	for {

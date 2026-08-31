@@ -64,6 +64,7 @@ type PlanControlGroup struct {
 	// 出路检查与 event 废弃拦截（行为与引入前一致）。
 	OutletChecker     OutletChecker
 	Checks            *checkstore.Store
+	Workspaces        checkstore.WorkspaceRevisionResolver
 	RecoveryAuthority RecoveryDecisionAuthority
 	Checkpoints       ObservationCheckpointReader
 }
@@ -82,33 +83,96 @@ func (g PlanControlGroup) Register(r *agent.ToolRegistry) {
 			Bool("request_replan", "true 时随提交请求 Scheduler 重新评估当前任务图", false).
 			String("event", "本结果对应的事件名，供 Graph 边条件 {event: ...} 匹配（仅允许 ready/completed/fixable/failed/blocked/pass/approved/rejected/timeout/always）；任务不属于图或下游不按事件路由时省略", false).
 			String("verdict", "本结果的验收结论，仅允许 pass/fixable/failed；写入 Results[\"verdict\"] 供 Graph acceptance 节点的路径边条件 {$.verdict eq ...} 精确匹配。填写 verdict 时不得再填写 event；仅验收类任务需要填", false).
-			String("cited_evidence", "验收结论引用的证据清单（逗号分隔的不透明稳定 EvidenceRef）：只复制任务描述「上游输入」段已经展示且实际消费的引用，不得按展示序号构造，也不得把 CallID/ResultRef 当作 EvidenceRef；Graph acceptance 会做谱系核验，越谱系引用使 verdict 不被采信（disputed，节点判 failed 并唤醒 Scheduler）；可选，不引用不影响 verdict 采信；非验收任务省略", false).Build()
+			String("cited_evidence", "验收结论引用的证据清单（逗号分隔）：只复制任务描述「上游输入」中同一条结构化 Evidence 已展示的 ref（EvidenceRef）或 check_ref（typed CheckRef）；不得使用 output_ref、CallID、ResultRef 或展示序号。Runtime 把两种身份解析回输入证据并做谱系核验，越界引用使 verdict 不被采信（disputed）；可选，不引用不影响 verdict 采信；非验收任务省略", false).Build()
 		params["additionalProperties"] = false
 		properties := params["properties"].(map[string]any)
 		properties["result"] = map[string]any{
-			"type":                 "object",
-			"description":          "可选的自定义结构化结果字段；字段会类型保真地展开到 Graph Result 顶层，可由 $.coverage 或 $.metrics.score 等路径条件读取。顶层不得使用 status/event/verdict/cited_evidence 等系统保留键；大内容应走 artifact/evidence。",
-			"maxProperties":        structuredResultMaxKeys,
-			"propertyNames":        map[string]any{"pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"},
+			"type":          "object",
+			"description":   "可选的自定义结构化结果字段；字段会类型保真地展开到 Graph Result 顶层，可由 $.coverage 或 $.metrics.score 等路径条件读取。顶层不得使用 status/event/verdict/cited_evidence 等系统保留键；大内容应走 artifact/evidence。",
+			"maxProperties": structuredResultMaxKeys,
+			"propertyNames": map[string]any{
+				"pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$",
+				"not": map[string]any{"enum": []any{
+					"status", "event", "verdict", "cited_evidence",
+				}},
+			},
 			"additionalProperties": true,
 		}
 		r.Register("submit_task_result", "以结构化字段提交当前执行节点的最终结果并结束任务，Graph controller 节点也使用本工具；只有非图 scheduler 任务改用 report_done。summary 必填（一两句话概括结果，会随依赖结果传递给下游任务）；result 可选，必须是紧凑 JSON object，其字段类型保真地进入 Graph Result 顶层，供 $.coverage 等条件路由及下游数据流消费，status/event/verdict/cited_evidence 为系统保留键，必须使用各自专用参数；checks_performed/evidence/remaining_risks 为逗号分隔的可选清单；status 可选（缺省 completed）：status=blocked 表示任务无法完成、以 blocked 终态收尾并自动唤醒 Scheduler 重新规划（blocked 终态不会放行下游依赖任务），此时 blocked_reason 必填；无法完成但不算 blocked 时也可只填 blocked_reason（会随提交向 Scheduler 登记高优 ReplanRequest），request_replan=true 仅请求重规划；event 已废弃——agentgo.graph/v2 图任务禁止携带（业务路由一律把字段写入 result object，供 {path: ...} 边条件求值；仅 v1 存量图与 legacy publish_task 路径保留旧语义）；verdict 仅用于 acceptance，固定为 pass/fixable/failed。提交前系统会执行 expected_artifacts 校验与出路预求值，缺失产物或无匹配出路时返回错误且不结束任务（可修正后重交，同一 activation 两次无匹配将升级 Scheduler 裁决）。调用成功即进入收尾（finalizing）：同一响应中排在其后的工具调用会被系统跳过不执行，因此提交前必须先完成所有写操作；每个任务只能成功提交一次。",
 			params,
 			g.submitTaskResult)
+
+		changeDecision := map[string]any{
+			"type": "object", "additionalProperties": false,
+			"properties": map[string]any{
+				"decision": map[string]any{"type": "string", "enum": []any{
+					"edit", "need_context", "hypothesis_rejected", "blocked",
+				}},
+				"path": map[string]any{"type": "string", "description": "need_context 要新增完整覆盖的项目相对文件"},
+				"edit_steps": map[string]any{
+					"type": "array", "minItems": 1, "maxItems": graph.MaxRecoveryEditSteps,
+					"items": map[string]any{
+						"type": "object", "additionalProperties": false,
+						"properties": map[string]any{
+							"tool": map[string]any{"type": "string", "enum": []any{"edit_file", "write_file"}},
+							"path": map[string]any{"type": "string"},
+						},
+						"required": []any{"tool", "path"},
+					},
+					"description": "edit 决策的有序修改步骤；每步声明 edit_file/write_file 与项目相对路径，可包含尚不存在的新文件",
+				},
+				"reason":  map[string]any{"type": "string", "maxLength": 600},
+				"summary": map[string]any{"type": "string", "maxLength": 600},
+			},
+			"required": []any{"decision", "summary"},
+			"allOf": []any{
+				map[string]any{"if": map[string]any{"properties": map[string]any{"decision": map[string]any{"const": "edit"}}},
+					"then": map[string]any{"required": []any{"edit_steps"}}},
+				map[string]any{"if": map[string]any{"properties": map[string]any{"decision": map[string]any{"const": "need_context"}}},
+					"then": map[string]any{"required": []any{"path", "reason"}}},
+				map[string]any{"if": map[string]any{"properties": map[string]any{"decision": map[string]any{"enum": []any{"hypothesis_rejected", "blocked"}}}},
+					"then": map[string]any{"required": []any{"reason"}}},
+			},
+		}
+		r.Register("submit_change_decision", "RecoveryDelta v4 在完整 EvidenceContract 覆盖后提交修改决策。edit 声明与 EvidenceContract 相互独立的有序 edit_steps（tool+path）；need_context 增加一个必须完整读取的文件；hypothesis_rejected/blocked 会以结构化 blocked 终态安全交回 L5。该工具只在 v4 recovery work 的决策 phase 暴露，不能用于普通业务轮。",
+			changeDecision, g.submitChangeDecision)
 	}
 	if g.FinalizationNotifier != nil && g.SubmitState != nil && g.RecoveryAuthority != nil {
-		properties := map[string]any{
-			"decision":              map[string]any{"type": "string", "enum": []any{"retry", "blocked"}},
-			"changed_dimensions":    map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []any{"context", "definition", "model", "tools", "strategy", "input"}}},
-			"strategy":              map[string]any{"type": "string"},
-			"first_required_action": map[string]any{"type": "string"},
-			"expected_milestone":    map[string]any{"type": "string"},
-			"blocked_reason":        map[string]any{"type": "string"},
-			"summary":               map[string]any{"type": "string"},
+		firstAction := map[string]any{
+			"type": "object", "additionalProperties": false,
+			"properties": map[string]any{
+				"tool": map[string]any{"type": "string", "enum": []any{
+					"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref",
+					"write_file", "edit_file", "run_check",
+				}},
+				"path": map[string]any{"type": "string"},
+			},
+			"required": []any{"tool"},
 		}
-		r.Register("submit_recovery_decision", "提交当前 recovery controller 的强类型 retry/blocked 裁决；source checkpoint/observation/fingerprint 由 framework 自动绑定，模型不得复制。retry 在提交前机械验证下一 execution Activation 仍可启动；reason_code=recovery_retry_unstartable 时只允许改交 blocked", map[string]any{
+		properties := map[string]any{
+			"decision":           map[string]any{"type": "string", "enum": []any{"retry", "blocked"}},
+			"changed_dimensions": map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []any{"context", "definition", "model", "tools", "strategy", "input"}}},
+			"strategy":           map[string]any{"type": "string", "maxLength": 600},
+			"first_action":       firstAction,
+			"expected_milestone": map[string]any{"type": "string", "maxLength": 600},
+			"blocked_reason":     map[string]any{"type": "string"},
+			"summary":            map[string]any{"type": "string"},
+		}
+		r.Register("submit_recovery_decision", "提交当前 recovery controller 的强类型 retry/blocked 裁决；source checkpoint/observation/fingerprint 由 framework 自动绑定，模型不得复制。retry 必须同时填写 changed_dimensions、strategy、类型化 first_action、expected_milestone；first_action 会成为下一 Activation 的首轮 L3 action gate；blocked 必须填写 blocked_reason。retry 在提交前机械验证下一 execution Activation 仍可启动；reason_code=recovery_retry_unstartable 时只允许改交 blocked", map[string]any{
 			"type": "object", "additionalProperties": false, "properties": properties,
 			"required": []any{"decision", "summary"},
+			"allOf": []any{
+				map[string]any{
+					"if": map[string]any{"properties": map[string]any{"decision": map[string]any{"const": "retry"}}},
+					"then": map[string]any{"required": []any{
+						"changed_dimensions", "strategy", "first_action", "expected_milestone",
+					}},
+				},
+				map[string]any{
+					"if":   map[string]any{"properties": map[string]any{"decision": map[string]any{"const": "blocked"}}},
+					"then": map[string]any{"required": []any{"blocked_reason"}},
+				},
+			},
 		}, g.submitRecoveryDecision)
 	}
 	r.Register("request_replan", "请求重新唤醒 Scheduler 评估当前任务编排；不会直接修改 DAG。图（Graph）节点任务调用时登记 graph change 请求并以 __scheduler__ 唤醒任务交给 Scheduler 用 patch_graph 裁决（同一 activation 的重复请求幂等）；非图任务登记通用 replan 唤醒任务（同一任务的重复请求幂等），由 Scheduler 裁决后续编排。",
@@ -243,11 +307,12 @@ func (g PlanControlGroup) requestGraphChange(task *model.Task, args map[string]a
 		"%s\n图 %s 的节点 %s（activation %s）在执行中请求 graph change。\nreason_code=%s urgency=%s\n详情：%s\n请求者任务：%s（event_type=%s）\n处理指引：读取该图当前状态（当前 revision），用 patch_graph（base_revision CAS）裁决是否修改；冲突时重新读取最新 revision 再改；判断无需修改时直接结束本任务。",
 		marker, task.GraphID, task.NodeID, task.ActivationID, reason, urgency, detail, task.ID, task.EventType)
 	wake := &model.Task{
-		Description:    description,
-		EventType:      "__scheduler__",
-		EventSource:    "graph-change-request",
-		ParentTaskID:   task.ID,
-		MaxConcurrency: 1, // 与用户请求一致：同一时刻只允许一个 Scheduler 处理同一请求
+		Description:         description,
+		EventType:           "__scheduler__",
+		EventSource:         model.TaskEventSourceGraphChange,
+		ParentTaskID:        task.ID,
+		InterventionGraphID: task.GraphID,
+		MaxConcurrency:      1, // 与用户请求一致：同一时刻只允许一个 Scheduler 处理同一请求
 	}
 	if err := taskcontract.Inherit(task, wake, loopcontract.WorkCoordination); err != nil {
 		return "", fmt.Errorf("继承 graph change RunContract: %w", err)

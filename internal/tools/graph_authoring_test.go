@@ -9,10 +9,12 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/graph"
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
 	"agentgo/internal/policycatalog"
 	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
+	"agentgo/internal/taskcontract"
 )
 
 type simpleGraphAcceptancePass struct{}
@@ -48,6 +50,7 @@ func TestGraphAuthoringSchemasUseNativeObjectsAndArrays(t *testing.T) {
 		"validate_graph_draft", "validate_current_graph_draft", "commit_graph_draft", "commit_current_graph_draft",
 		"start_graph", "start_current_graph",
 		"propose_graph_change", "read_graph_change", "validate_graph_change", "commit_graph_change",
+		"submit_graph_change_decision",
 	}
 	for _, name := range want {
 		if !slicesContains(registry.Names(), name) {
@@ -122,6 +125,66 @@ func TestGraphAuthoringAllowsOnlyTypedRecoveryControllerInsideGraph(t *testing.T
 	}
 }
 
+func TestGraphAuthoringGraphChangeWakeIsBoundToFrozenGraph(t *testing.T) {
+	group, _ := newGraphAuthoringToolEnv(t)
+	wake := &model.Task{ID: "graph-change-wake", Description: "改图", EventType: "__scheduler__",
+		EventSource: model.TaskEventSourceGraphChange, InterventionGraphID: "g-1"}
+	if err := taskcontract.Start(wake, loopcontract.WorkCoordination, "test-graph-change/v1",
+		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	wake.RunPhase = runcontract.PhaseRecovery
+	if err := group.TaskStore.PublishTask(wake); err != nil {
+		t.Fatal(err)
+	}
+	group.Holder = &fakeHolder{id: wake.ID}
+	if _, err := group.currentRootSchedulerTask("propose_graph_change"); err != nil {
+		t.Fatalf("合法 graph-change wake 应获得事务化变更权限: %v", err)
+	}
+	args := map[string]any{
+		"graph_id": "g-other", "base_definition_revision": 1,
+		"base_definition_digest": "digest", "reason": "test",
+		"upsert_nodes": []any{map[string]any{"id": "x", "kind": "end"}},
+	}
+	if _, err := group.proposeGraphChange(context.Background(), args); err == nil ||
+		!strings.Contains(err.Error(), "只能修改冻结 Graph g-1") {
+		t.Fatalf("graph-change wake 不得跨 Graph 变更: %v", err)
+	}
+}
+
+func TestGraphAuthoringGraphChangeNoChangeDecisionFinalizes(t *testing.T) {
+	group, _ := newGraphAuthoringToolEnv(t)
+	wake := &model.Task{ID: "graph-change-no-change", Description: "核对后无需改图", EventType: "__scheduler__",
+		EventSource: model.TaskEventSourceGraphChange, InterventionGraphID: "g-1"}
+	if err := taskcontract.Start(wake, loopcontract.WorkCoordination, "test-graph-change/v1",
+		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	wake.RunPhase = runcontract.PhaseRecovery
+	if err := group.TaskStore.PublishTask(wake); err != nil {
+		t.Fatal(err)
+	}
+	notifier := &fakeFinalizationNotifier{}
+	group.Holder = &fakeHolder{id: wake.ID}
+	group.Finalization = notifier
+	out, err := group.submitGraphChangeDecision(context.Background(), map[string]any{
+		"decision": "no_change", "summary": "Graph 已终态，Definition 修改不能产生未来 Activation",
+	})
+	if err != nil {
+		t.Fatalf("submit_graph_change_decision: %v", err)
+	}
+	var receipt map[string]any
+	if json.Unmarshal([]byte(out), &receipt) != nil || !notifier.marked ||
+		receipt["decision"] != "no_change" || receipt["graph_id"] != "g-1" {
+		t.Fatalf("no_change 应结构化收口当前 coordination: marked=%t out=%s", notifier.marked, out)
+	}
+	if _, err := group.submitGraphChangeDecision(context.Background(), map[string]any{
+		"decision": "changed", "summary": "伪造",
+	}); err == nil {
+		t.Fatal("非 no_change decision 必须拒绝")
+	}
+}
+
 func TestConfigureSimpleGraphDraftBuildsFrameworkOwnedAcceptedShape(t *testing.T) {
 	group, authoring := newGraphAuthoringToolEnv(t)
 	if _, err := group.createDraft(context.Background(), map[string]any{}); err != nil {
@@ -148,10 +211,12 @@ func TestConfigureSimpleGraphDraftBuildsFrameworkOwnedAcceptedShape(t *testing.T
 		recovery.Kind != graph.KindController ||
 		recovery.Metadata[graph.MetadataControllerRole] != string(graph.ControllerRoleLoopRecovery) ||
 		recovery.Metadata[graph.MetadataRecoveryMaxRetries] != "2" ||
+		recovery.Metadata[graph.MetadataRecoveryDeltaSchema] != graph.RecoveryDeltaSchemaV4 ||
 		recovery.ProgressContractRef != policycatalog.ProgressCoordinationCurrent ||
 		acceptanceRecovery.Kind != graph.KindController ||
 		acceptanceRecovery.Metadata[graph.MetadataControllerRole] != string(graph.ControllerRoleLoopRecovery) ||
 		acceptanceRecovery.Metadata[graph.MetadataRecoveryMaxRetries] != "2" ||
+		acceptanceRecovery.Metadata[graph.MetadataRecoveryDeltaSchema] != graph.RecoveryDeltaSchemaV2 ||
 		len(draft.Candidate.Nodes) != 15 {
 		t.Fatalf("simple task graph 未由 framework 完整生成: %+v", draft)
 	}
@@ -181,6 +246,9 @@ func TestConfigureSimpleGraphDraftBuildsFrameworkOwnedAcceptedShape(t *testing.T
 	if err := json.Unmarshal([]byte(reconfiguredRaw), &reconfigured); err != nil ||
 		reconfigured.DraftRevision != 3 || reconfigured.Contract.ExecutionClass != graph.ExecutionReadOnly {
 		t.Fatalf("simple graph reconfigure 未形成新 revision: err=%v draft=%+v", err, reconfigured)
+	}
+	if schema := reconfigured.Candidate.Nodes["recovery"].Metadata[graph.MetadataRecoveryDeltaSchema]; schema != graph.RecoveryDeltaSchemaV2 {
+		t.Fatalf("read_only work recovery 不得进入 mutation handoff v3: schema=%s", schema)
 	}
 	if _, err := group.configureSimpleDraft(context.Background(), map[string]any{"execution_class": "mutating"}); err != nil {
 		t.Fatalf("恢复 mutating simple graph: %v", err)

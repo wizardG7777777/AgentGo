@@ -5,11 +5,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+
+	"agentgo/internal/checkstore"
+	"agentgo/internal/model"
+	"agentgo/internal/store"
 )
 
 // Windows 纪律：全部文件读写用 os.WriteFile / os.ReadFile（内部自行关闭
@@ -131,13 +136,44 @@ func TestWritePathCopyOnWrite(t *testing.T) {
 		t.Fatalf("未触碰文件应穿透主根：%q", got)
 	}
 
-	// manifest 未登记但 workspace 下文件存在时，ReadPath 同样命中副本。
+	// manifest 未登记的 workspace 物理文件不是业务副本：
+	// 它可能是 owner/manifest/shell cache 或崩溃残留，必须继续读穿透。
 	lonely := filepath.Join(root, DirName, "task-1", "lonely.txt")
 	if err := os.WriteFile(lonely, []byte("x\n"), 0o644); err != nil {
 		t.Fatalf("写文件失败：%v", err)
 	}
-	if got := v.ReadPath(filepath.Join(root, "lonely.txt")); got != lonely {
-		t.Fatalf("workspace 已有副本应优先返回：%q", got)
+	logicalLonely := filepath.Join(root, "lonely.txt")
+	if got := v.ReadPath(logicalLonely); got != logicalLonely {
+		t.Fatalf("未进 manifest 的物理文件不得泄漏进业务读路径：%q", got)
+	}
+}
+
+func TestFreezeCandidateIsStableAndDoesNotPromote(t *testing.T) {
+	m, root := newTestManager(t)
+	main := writeMain(t, root, filepath.Join("src", "delivery.txt"), "base\n")
+	deliveryID := "delivery:0123456789abcdef"
+	workspaceID := DeliveryWorkspaceID(deliveryID)
+	view, err := m.MaterializeOwned(workspaceID, DeliveryOwner("task-1", deliveryID, "run-1", "graph-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	physical, err := view.WritePath(main)
+	if err != nil || os.WriteFile(physical, []byte("candidate\n"), 0o644) != nil {
+		t.Fatalf("写 candidate: %v", err)
+	}
+	first, err := m.FreezeCandidate(deliveryID, workspaceID, "workspace:sha256:test")
+	if err != nil {
+		t.Fatalf("FreezeCandidate: %v", err)
+	}
+	second, err := m.FreezeCandidate(deliveryID, workspaceID, "workspace:sha256:test")
+	if err != nil {
+		t.Fatalf("第二次 FreezeCandidate: %v", err)
+	}
+	if first != second || first.Ref == "" || first.PatchDigest == "" {
+		t.Fatalf("candidate 应稳定且完整：first=%+v second=%+v", first, second)
+	}
+	if got := readFile(t, main); got != "base\n" {
+		t.Fatalf("FreezeCandidate 不得修改主根，实际=%q", got)
 	}
 }
 
@@ -362,6 +398,79 @@ func TestCleanup(t *testing.T) {
 	}
 }
 
+func TestDeliveryOwnerAndLeaseFenceCleanup(t *testing.T) {
+	root := t.TempDir()
+	m := NewManager(root, nil)
+	deliveryID := "delivery:0123456789abcdef"
+	workspaceID := DeliveryWorkspaceID(deliveryID)
+	owner := DeliveryOwner("task-1", deliveryID, "run-1", "graph-1")
+	if _, err := m.MaterializeOwned(workspaceID, owner); err != nil {
+		t.Fatalf("MaterializeOwned: %v", err)
+	}
+	release, err := m.Acquire(workspaceID)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if err := m.Cleanup(workspaceID); !errors.Is(err, ErrWorkspaceInUse) {
+		t.Fatalf("活动租约清理应被拒绝: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, DirName, workspaceID)); err != nil {
+		t.Fatalf("拒绝清理后 workspace 必须仍存在: %v", err)
+	}
+	release()
+	if err := m.Cleanup(workspaceID); err != nil {
+		t.Fatalf("释放后 Cleanup: %v", err)
+	}
+}
+
+func TestStaleViewCannotRecreateRemovedWorkspace(t *testing.T) {
+	root := t.TempDir()
+	m := NewManager(root, nil)
+	view, err := m.Materialize("task-stale")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(view.Root()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Acquire("task-stale"); !errors.Is(err, ErrWorkspaceUnavailable) {
+		t.Fatalf("缺失目录不得取得活动租约: %v", err)
+	}
+	if _, err := view.WritePath(filepath.Join(root, "x.txt")); !errors.Is(err, ErrWorkspaceUnavailable) {
+		t.Fatalf("stale View 不得静默重建目录: %v", err)
+	}
+}
+
+func TestListWorkspacesUsesPersistedDeliveryOwner(t *testing.T) {
+	root := t.TempDir()
+	m := NewManager(root, nil)
+	deliveryID := "delivery:fedcba9876543210"
+	workspaceID := DeliveryWorkspaceID(deliveryID)
+	owner := DeliveryOwner("task-2", deliveryID, "run-2", "graph-2")
+	if _, err := m.MaterializeOwned(workspaceID, owner); err != nil {
+		t.Fatalf("MaterializeOwned: %v", err)
+	}
+	records, err := m.ListWorkspaces()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("ListWorkspaces: records=%+v err=%v", records, err)
+	}
+	if records[0].WorkspaceID != workspaceID || !sameOwner(records[0].Owner, owner) || records[0].Legacy {
+		t.Fatalf("Delivery owner 未按原身份恢复: %+v", records[0])
+	}
+	restarted := NewManager(root, nil)
+	if _, err := restarted.MaterializeOwned(workspaceID, owner); err != nil {
+		t.Fatalf("重启后同 owner 应幂等恢复: %v", err)
+	}
+	if _, err := restarted.MaterializeOwned(workspaceID,
+		DeliveryOwner("task-repair", deliveryID, "run-2", "graph-2")); err != nil {
+		t.Fatalf("repair activation 的新 TaskID 必须复用同一 Delivery owner: %v", err)
+	}
+	conflict := DeliveryOwner("task-3", deliveryID, "run-2", "graph-other")
+	if _, err := restarted.MaterializeOwned(workspaceID, conflict); err == nil {
+		t.Fatal("同 Delivery workspace 的冲突 owner 应 fail-closed")
+	}
+}
+
 func TestCleanupGuard(t *testing.T) {
 	m, root := newTestManager(t)
 	// 在 workspace 根外预建目录，验证防卫逻辑不会误删。
@@ -575,5 +684,171 @@ func TestRelativeProjectRoot_EndToEnd(t *testing.T) {
 	data, err := os.ReadFile(mainPath)
 	if err != nil || string(data) != "old1\nnew2\n" {
 		t.Fatalf("合并后主根内容 = %q err=%v，want old1\nnew2\n", data, err)
+	}
+}
+
+func TestPrepareShellRootBuildsFullSnapshotAndOverlaysDirtyFiles(t *testing.T) {
+	root := t.TempDir()
+	for path, content := range map[string]string{
+		"src/main.go":               "package main\nconst value = \"main\"\n",
+		"tests/main_test.go":        "package tests\n",
+		".venv/marker.txt":          "prepared environment\n",
+		".agentgo/state/secret.txt": "control state\n",
+		".git/config":               "git metadata\n",
+	} {
+		absolute := filepath.Join(root, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(absolute), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(absolute, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := NewManager(root, nil)
+	view, err := m.Materialize("task-shell")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := m.Acquire("task-shell")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirty, err := view.WritePath(filepath.Join(root, "src", "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dirty, []byte("package main\nconst value = \"candidate\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	shellRoot, err := view.PrepareShellRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]string{
+		"src/main.go": "candidate", "tests/main_test.go": "package tests",
+		".venv/marker.txt": "prepared environment",
+	} {
+		data, readErr := os.ReadFile(filepath.Join(shellRoot, filepath.FromSlash(path)))
+		if readErr != nil || !strings.Contains(string(data), want) {
+			t.Fatalf("shell snapshot %s 未呈现完整项目/candidate: data=%q err=%v", path, data, readErr)
+		}
+	}
+	for _, forbidden := range []string{".agentgo", ".git"} {
+		if _, statErr := os.Stat(filepath.Join(shellRoot, forbidden)); !os.IsNotExist(statErr) {
+			t.Fatalf("shell snapshot 不得复制 %s 控制元数据: %v", forbidden, statErr)
+		}
+	}
+	if err := os.WriteFile(dirty, []byte("package main\nconst value = \"candidate-v2\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	again, err := view.PrepareShellRoot()
+	if err != nil || again != shellRoot {
+		t.Fatalf("shell snapshot 应复用并同步 dirty set: root=%q err=%v", again, err)
+	}
+	data, err := os.ReadFile(filepath.Join(shellRoot, "src", "main.go"))
+	if err != nil || !strings.Contains(string(data), "candidate-v2") {
+		t.Fatalf("后续 dirty 变更未同步进 shell snapshot: %q err=%v", data, err)
+	}
+	release()
+	if _, err := os.Stat(shellRoot); !os.IsNotExist(err) {
+		t.Fatalf("租约归零后应删除可丢弃 shell snapshot，保留 candidate: %v", err)
+	}
+	if data, err := os.ReadFile(dirty); err != nil || !strings.Contains(string(data), "candidate-v2") {
+		t.Fatalf("清理 shell snapshot 不得删除 dirty candidate: %q err=%v", data, err)
+	}
+}
+
+func TestWorkspaceControlFilesDoNotLeakIntoBusinessNamespace(t *testing.T) {
+	root := t.TempDir()
+	businessManifest := filepath.Join(root, ManifestFileName)
+	if err := os.WriteFile(businessManifest, []byte("business manifest\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(root, nil)
+	view, err := m.Materialize("task-control-boundary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := view.ReadPath(businessManifest); got != businessManifest {
+		t.Fatalf("逻辑同名业务文件必须读主根，不得泄漏 workspace manifest: %q", got)
+	}
+	roguePhysical := filepath.Join(view.Root(), "rogue.txt")
+	if err := os.WriteFile(roguePhysical, []byte("unregistered"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	logicalRogue := filepath.Join(root, "rogue.txt")
+	if got := view.ReadPath(logicalRogue); got != logicalRogue {
+		t.Fatalf("未进 manifest 的物理文件不得成为业务副本: %q", got)
+	}
+	for _, reserved := range []string{
+		ownerFileName, ManifestFileName, baselineDirName + string(filepath.Separator) + "x",
+		shellRootDirName + string(filepath.Separator) + "x",
+	} {
+		if _, err := view.WritePath(filepath.Join(root, reserved)); err == nil ||
+			!strings.Contains(err.Error(), "workspace_internal_path_forbidden") {
+			t.Fatalf("业务写入 workspace 保留路径 %q 必须 fail-closed: %v", reserved, err)
+		}
+	}
+}
+
+func TestDeliveryWorkspaceRevisionSpansRepairTasks(t *testing.T) {
+	root := t.TempDir()
+	main := writeMain(t, root, "source.go", "base\n")
+	deliveryID := "delivery:revision"
+	workspaceID := DeliveryWorkspaceID(deliveryID)
+	m := NewManager(root, nil)
+	view, err := m.MaterializeOwned(workspaceID,
+		DeliveryOwner("producer", deliveryID, "run-1", "graph-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks := store.NewMemoryTaskStore(nil, 16, 1, 60)
+	preMutation := &model.Task{ID: "pre", Description: "baseline", DeliveryID: deliveryID}
+	if err := tasks.PublishTask(preMutation); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks.ClaimTask("worker", preMutation.ID); err != nil {
+		t.Fatal(err)
+	}
+	claimedPre, _ := tasks.GetTask(preMutation.ID)
+	if ref, _, err := checkstore.WorkspaceRevision(claimedPre, tasks, m); err != nil || ref != "workspace:empty" {
+		t.Fatalf("pre-mutation Delivery revision 应为 workspace:empty: ref=%s err=%v", ref, err)
+	}
+	physical, err := view.WritePath(main)
+	if err != nil || os.WriteFile(physical, []byte("candidate-v1\n"), 0o644) != nil {
+		t.Fatalf("写 candidate: %v", err)
+	}
+	producer := &model.Task{ID: "producer", Description: "produce", DeliveryID: deliveryID}
+	if err := tasks.PublishTask(producer); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks.ClaimTask("worker", producer.ID); err != nil {
+		t.Fatal(err)
+	}
+	claimedProducer, _ := tasks.GetTask(producer.ID)
+	if err := tasks.AppendToolCall(producer.ID, store.ToolCallRecord{
+		AttemptID: claimedProducer.AttemptID, CallID: "edit-producer", ToolName: "edit_file",
+		Args: map[string]any{"path": "source.go"}, Success: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	repair := &model.Task{ID: "repair", Description: "verify inherited candidate", DeliveryID: deliveryID}
+	if err := tasks.PublishTask(repair); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks.ClaimTask("worker", repair.ID); err != nil {
+		t.Fatal(err)
+	}
+	claimedRepair, _ := tasks.GetTask(repair.ID)
+	first, refs, err := checkstore.WorkspaceRevision(claimedRepair, tasks, m)
+	if err != nil || first == "workspace:empty" || len(refs) != 1 || refs[0] != "tool-call:edit-producer" {
+		t.Fatalf("repair Task 必须继承 Delivery candidate revision/effect: ref=%s refs=%v err=%v", first, refs, err)
+	}
+	if err := os.WriteFile(physical, []byte("candidate-v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := checkstore.WorkspaceRevision(claimedRepair, tasks, m)
+	if err != nil || second == first {
+		t.Fatalf("Delivery dirty 内容变化必须使旧 check stale: first=%s second=%s err=%v", first, second, err)
 	}
 }

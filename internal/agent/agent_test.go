@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"agentgo/internal/invocation"
 	"agentgo/internal/model"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
@@ -60,6 +61,35 @@ func TestAgent_SuccessfulExecution(t *testing.T) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestActionContractRejectionRetriesWithinSameAttempt(t *testing.T) {
+	s, r, _ := setup()
+	task := &model.Task{Description: "same snapshot retry", EventType: "code"}
+	if err := s.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("agent-1", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	executor := func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+		calls++
+		if calls == 1 {
+			return ExecuteResult{}, invocation.NewFailure(invocation.FailureActionContractRejected,
+				invocation.PhaseToolCallValidate, invocation.OriginRuntime, errors.New("phase=default 未授权工具"))
+		}
+		return ExecuteResult{Output: "修正后完成"}, nil
+	}
+	agent := NewAgent("agent-1", "code", s, r, executor)
+	agent.processTask(context.Background(), task.ID)
+	got, err := s.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.TaskStatusCompleted || got.AttemptNo != 1 || got.RetryCount != 0 || calls != 2 {
+		t.Fatalf("same-snapshot retry 不得 rollover Attempt: task=%+v calls=%d", got, calls)
 	}
 }
 

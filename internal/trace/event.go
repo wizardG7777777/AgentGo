@@ -153,6 +153,13 @@ const (
 	// payload：Path=workspace 根路径。
 	KindWorkspaceCleaned EventKind = "workspace_cleaned"
 
+	// Watchdog 对 workspace owner/liveness 的机械裁决。payload：TaskID=物理
+	// workspace ID，RunID/GraphID=持久化 owner，Reason=retain/cleanup 原因。
+	KindWorkspaceRetentionDecided EventKind = "workspace_retention_decided"
+
+	// Cleanup 因活动租约被拒绝。它证明清扫防线生效，不等同于业务失败。
+	KindWorkspaceCleanupRejected EventKind = "workspace_cleanup_rejected"
+
 	// === v5 Phase 2 新增（TraceUpgrade.md §4） ===
 
 	// Agent 实例状态机变更（ReactiveSystem.md §7.2 引入的 4 状态机）。
@@ -197,6 +204,11 @@ const (
 	// control preflight 故障与 provider 返回后的结构化提交无效；周期性失败即使
 	// 恢复业务阶段也必须可观测，不能只靠终态 TaskOutcome 推断。
 	KindObservationCheckpointFailed EventKind = "observation_checkpoint_failed"
+	// KindRecoveryActionGated 证明 post-recovery Activation 的当前 L3
+	// ToolRouter stage 与唯一 recovery_directive 同源。payload 不含策略正文，
+	// 只记录 schema/stage/tool/path/check_id 与输入 directive 数量，供 SWE
+	// Test Runner 对账“最新 RecoveryDelta → 首动作 → mutation → check”。
+	KindRecoveryActionGated EventKind = "recovery_action_gated"
 
 	// === V6 §3 Session Memory（CM3，internal/memory/promotion.go +
 	// internal/bootstrap/session_promotion.go）生命周期事件 ===
@@ -479,6 +491,19 @@ type AcceptancePayload struct {
 	Reason  string `json:"reason,omitempty"`  // 原因摘要（disputed 时含哪条证据为何失败）
 }
 
+// RecoveryActionPayload 是 recovery_action_gated 的脱敏机械权威。
+type RecoveryActionPayload struct {
+	Schema         string `json:"schema"`
+	Stage          string `json:"stage"`
+	Tool           string `json:"tool"`
+	Path           string `json:"path,omitempty"`
+	CheckID        string `json:"check_id,omitempty"`
+	RefID          string `json:"ref_id,omitempty"`
+	Offset         int64  `json:"offset,omitempty"`
+	Limit          int64  `json:"limit,omitempty"`
+	DirectiveCount int    `json:"directive_count"`
+}
+
 // Event 是一条 trace 事件。所有字段除 Timestamp/Kind/TaskID 之外都是可选的，
 // 由具体的事件类型按需填充。omitempty 让 JSON 输出保持简洁。
 type Event struct {
@@ -559,8 +584,9 @@ type Event struct {
 	// ToolRouterSnapshotID 证明本次 advertise 与 dispatch 使用同一冻结工具视图。
 	ToolRouterSnapshotID string `json:"tool_router_snapshot_id,omitempty"`
 	// ContextSnapshotID/ContextPolicyRef 绑定本次真实发送内容的 L2 durable authority。
-	ContextSnapshotID string `json:"context_snapshot_id,omitempty"`
-	ContextPolicyRef  string `json:"context_policy_ref,omitempty"`
+	ContextSnapshotID string                 `json:"context_snapshot_id,omitempty"`
+	ContextPolicyRef  string                 `json:"context_policy_ref,omitempty"`
+	RecoveryGate      *RecoveryActionPayload `json:"recovery_action_gate,omitempty"`
 
 	// --- 工具调用字段 ---
 	Tool      string         `json:"tool,omitempty"`

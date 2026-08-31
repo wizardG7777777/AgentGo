@@ -12,10 +12,18 @@ import (
 )
 
 const (
-	ObservationDeltaSchemaV2 = "agentgo.observation-delta/v2"
-	MaxObservationFacts      = 12
-	MaxObservationNext       = 5
-	MaxObservationTextRunes  = 320
+	ObservationDeltaSchemaV2      = "agentgo.observation-delta/v2"
+	ObservationDeltaSchemaV3      = "agentgo.observation-delta/v3"
+	ObservationDeltaSchemaCurrent = ObservationDeltaSchemaV3
+	MaxObservationFacts           = 12
+	MaxObservationNext            = 5
+	MaxObservationTextRunes       = 320
+)
+
+const (
+	// ObservationFactAuthorityInferred 表示模型只证明了 evidence ref 的归属，
+	// framework 尚未机械证明自然语言 claim 与证据正文之间的语义蕴含关系。
+	ObservationFactAuthorityInferred = "inferred"
 )
 
 const (
@@ -26,11 +34,14 @@ const (
 	ObservationPhaseBlocked     = "blocked"
 )
 
-// ObservationFact 是模型显式提交、L3 已核对证据归属的工作事实。Evidence
-// 只保存稳定引用，不保存工具参数或原始正文。
+// ObservationFact 是模型显式提交、L3 已核对证据归属的工作 claim。Evidence
+// 只保存稳定引用，不保存工具参数或原始正文。v2 历史对象没有 Authority，按
+// 当时的 confirmed 语义恢复；v3 新对象必须是 inferred，不能把“执行过 edit”
+// 自动升级成“目标语义已实现”。
 type ObservationFact struct {
-	Text     string        `json:"text"`
-	Evidence []EvidenceRef `json:"evidence_refs"`
+	Text      string        `json:"text"`
+	Evidence  []EvidenceRef `json:"evidence_refs"`
+	Authority string        `json:"authority,omitempty"`
 }
 
 // ObservationCandidate 是可被后续 Observation 显式关闭的工作问题。Ref 由
@@ -69,7 +80,7 @@ type ObservationDelta struct {
 }
 
 func (d ObservationDelta) Validate() error {
-	if d.Schema != ObservationDeltaSchemaV2 || strings.TrimSpace(d.TaskID) == "" ||
+	if (d.Schema != ObservationDeltaSchemaV2 && d.Schema != ObservationDeltaSchemaV3) || strings.TrimSpace(d.TaskID) == "" ||
 		strings.TrimSpace(d.AttemptID) == "" || d.CreatedAt.IsZero() {
 		return fmt.Errorf("ObservationDelta schema/Task/Attempt/created_at 不完整")
 	}
@@ -86,6 +97,16 @@ func (d ObservationDelta) Validate() error {
 		for j, evidence := range fact.Evidence {
 			if strings.TrimSpace(evidence.Kind) == "" || strings.TrimSpace(evidence.Ref) == "" {
 				return fmt.Errorf("ObservationDelta facts[%d].evidence_refs[%d] 非法", i, j)
+			}
+		}
+		switch d.Schema {
+		case ObservationDeltaSchemaV2:
+			if strings.TrimSpace(fact.Authority) != "" {
+				return fmt.Errorf("ObservationDelta/v2 facts[%d] 不接受 authority", i)
+			}
+		case ObservationDeltaSchemaV3:
+			if fact.Authority != ObservationFactAuthorityInferred {
+				return fmt.Errorf("ObservationDelta/v3 facts[%d].authority 必须是 inferred", i)
 			}
 		}
 	}
@@ -258,19 +279,25 @@ func applyObservation(mem *TaskMemory, delta ObservationDelta) {
 	mem.Facts = kept
 	for _, observed := range delta.Facts {
 		text := strings.TrimSpace(observed.Text)
+		confirmed := delta.Schema == ObservationDeltaSchemaV2
 		found := false
 		for i := range mem.Facts {
 			if mem.Facts[i].Text != text {
 				continue
 			}
-			mem.Facts[i].Confirmed = true
+			// 用户决定等非 Observation 权威事实不得被模型 claim 降级或覆盖。
+			if !observationProjectedFact(mem.Facts[i]) {
+				found = true
+				break
+			}
+			mem.Facts[i].Confirmed = confirmed
 			mem.Facts[i].Evidence = append([]EvidenceRef(nil), observed.Evidence...)
 			mem.Facts[i].UpdatedAt = now
 			found = true
 			break
 		}
 		if !found {
-			mem.Facts = append(mem.Facts, Fact{Text: text, Confirmed: true,
+			mem.Facts = append(mem.Facts, Fact{Text: text, Confirmed: confirmed,
 				Evidence: append([]EvidenceRef(nil), observed.Evidence...), UpdatedAt: now})
 		}
 	}

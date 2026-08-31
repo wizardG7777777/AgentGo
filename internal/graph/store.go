@@ -250,7 +250,10 @@ func sameEvidenceEntry(a, b EvidenceEntry) bool {
 	if a.Ref != b.Ref || a.Kind != b.Kind || a.Summary != b.Summary ||
 		a.CallID != b.CallID || a.ToolName != b.ToolName ||
 		a.Command != b.Command || a.CommandTruncated != b.CommandTruncated ||
-		a.Path != b.Path || a.PathTruncated != b.PathTruncated {
+		a.Path != b.Path || a.PathTruncated != b.PathTruncated ||
+		a.CheckRef != b.CheckRef || a.CheckID != b.CheckID || a.CheckKind != b.CheckKind ||
+		a.CheckStatus != b.CheckStatus || a.WorkspaceRevisionRef != b.WorkspaceRevisionRef ||
+		a.OutputRef != b.OutputRef {
 		return false
 	}
 	if (a.Success == nil) != (b.Success == nil) || (a.ExitCode == nil) != (b.ExitCode == nil) {
@@ -810,6 +813,9 @@ func (s *Store) CommitGraphOutcome(graphID string, outcome GraphOutcomeRecord, s
 			}
 			return fmt.Errorf("graph: 图 %s 已提交不同 outcome=%s", graphID, c.Outcome.Outcome)
 		}
+		if c.RequiresDelivery() && outcome.Outcome == EndSuccess && strings.TrimSpace(outcome.DeliveryCommitRef) == "" {
+			return fmt.Errorf("graph: v3 success outcome 缺少 delivery_commit_ref")
+		}
 		if !IsValidGraphStatusTransition(c.Status, status) {
 			return fmt.Errorf("%w: graph %s %s -> %s", ErrInvalidTransition, graphID, c.Status, status)
 		}
@@ -942,10 +948,23 @@ func validateEvidenceEntryBounds(ev EvidenceEntry) error {
 		{"tool_name", ev.ToolName, EvidenceIdentityMaxRunes},
 		{"command", ev.Command, EvidenceCommandMaxRunes},
 		{"path", ev.Path, EvidencePathMaxRunes},
+		{"check_ref", ev.CheckRef, EvidenceIdentityMaxRunes},
+		{"check_id", ev.CheckID, MaxIDLength},
+		{"check_kind", ev.CheckKind, MaxIDLength},
+		{"check_status", ev.CheckStatus, MaxIDLength},
+		{"workspace_revision_ref", ev.WorkspaceRevisionRef, EvidenceIdentityMaxRunes},
+		{"output_ref", ev.OutputRef, EvidenceIdentityMaxRunes},
 	}
 	for _, check := range checks {
 		if utf8.RuneCountInString(check.value) > check.max {
 			return fmt.Errorf("%s 超过 %d rune 上限", check.name, check.max)
+		}
+	}
+	if ev.Kind == "check" {
+		if strings.TrimSpace(ev.CheckRef) == "" || strings.TrimSpace(ev.CheckID) == "" ||
+			strings.TrimSpace(ev.CheckKind) == "" || strings.TrimSpace(ev.WorkspaceRevisionRef) == "" ||
+			(ev.CheckStatus != "pass" && ev.CheckStatus != "failed") {
+			return fmt.Errorf("check evidence 结构化字段不完整")
 		}
 	}
 	return nil

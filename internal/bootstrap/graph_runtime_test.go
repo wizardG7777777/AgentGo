@@ -100,6 +100,47 @@ func TestGraphBoardPublishFields(t *testing.T) {
 	}
 }
 
+func TestGraphBoardV2AcceptanceUsesVerificationPhaseWithoutChangingRoute(t *testing.T) {
+	s := store.NewMemoryTaskStore(nil, 100, 1, 300)
+	b := newGraphBoard(s)
+	parent := &model.Task{ID: "acceptance-parent"}
+	if err := taskcontract.Start(parent, loopcontract.WorkVerification, "test-verification/v2",
+		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	spec := graph.TaskSpec{
+		GraphID: "g-v2-acceptance", NodeID: "verify", ActivationID: "verify@1",
+		NodeKind: graph.KindAcceptance, Title: "验收", Description: "逐项核验",
+		Route: "verify.custom", RunID: parent.RunID, RunContract: parent.RunContract,
+		ProgressContractRef: parent.ProgressContract.Ref.ContractID,
+		ContextPolicyRef:    parent.ContextPolicyRef,
+	}
+	id, err := b.PublishGraphTask(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := s.GetTask(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.RunPhase != runcontract.PhaseVerification || task.EventType != "verify.custom" ||
+		task.GraphNodeKind != string(graph.KindAcceptance) {
+		t.Fatalf("v2 acceptance 只应增加 verification phase 标记: %+v", task)
+	}
+
+	v1 := *parent.RunContract
+	v1.Schema, v1.VerificationReserve = runcontract.SchemaV1, 0
+	spec.GraphID, spec.ActivationID, spec.RunID, spec.RunContract = "g-v1-acceptance", "verify@1", v1.RunID, &v1
+	id, err = b.PublishGraphTask(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, _ := s.GetTask(id)
+	if legacy.RunPhase != runcontract.PhaseExecution {
+		t.Fatalf("v1 acceptance 快照不得静默升级 phase: %+v", legacy)
+	}
+}
+
 // TestGraphBoardPublishWithoutCapability 验证无能力声明时 Capability 为 nil、
 // 描述不含追加段。
 func TestGraphBoardPublishWithoutCapability(t *testing.T) {

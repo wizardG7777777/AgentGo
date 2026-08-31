@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +31,7 @@ type CheckGroup struct {
 	ContentStore *contentstore.Store
 	Holder       TaskHolder
 	SessionID    func() string
+	Workspaces   checkstore.WorkspaceRevisionResolver
 }
 
 func (g CheckGroup) Register(r *agent.ToolRegistry) {
@@ -43,8 +45,8 @@ func (g CheckGroup) Register(r *agent.ToolRegistry) {
 }
 
 func (g CheckGroup) run(ctx context.Context, args map[string]any) (string, error) {
-	if g.TaskStore == nil || g.Checks == nil || g.ContentStore == nil || g.Holder == nil {
-		return "", fmt.Errorf("run_check 依赖未完整装配")
+	if g.TaskStore == nil || g.Holder == nil {
+		return "", fmt.Errorf("run_check 缺少 TaskStore/Holder")
 	}
 	command, _ := args["command"].(string)
 	if strings.TrimSpace(command) == "" {
@@ -60,7 +62,54 @@ func (g CheckGroup) run(ctx context.Context, args map[string]any) (string, error
 	if err != nil || task == nil || task.Status != model.TaskStatusProcessing {
 		return "", fmt.Errorf("run_check 缺少 processing Task: %v", err)
 	}
-	workspaceRef, _, err := checkstore.WorkspaceRevision(task, g.TaskStore)
+	checkID := strings.TrimSpace(fmt.Sprint(args["check_id"]))
+	if (task.FulfillmentContract != nil && len(task.FulfillmentContract.RequiredCheckIDs) > 0) ||
+		(task.RunContract != nil && len(task.RunContract.CheckContracts) > 0) {
+		allowedSet := make(map[string]struct{})
+		allowed := make([]string, 0)
+		valid := false
+		if task.FulfillmentContract != nil {
+			for _, raw := range task.FulfillmentContract.RequiredCheckIDs {
+				id := strings.TrimSpace(raw)
+				if id == "" {
+					continue
+				}
+				allowedSet[id] = struct{}{}
+			}
+		}
+		if task.RunContract != nil {
+			for _, contract := range task.RunContract.CheckContracts {
+				allowedSet[strings.TrimSpace(contract.CheckID)] = struct{}{}
+			}
+		}
+		for id := range allowedSet {
+			allowed = append(allowed, id)
+			valid = valid || id == checkID
+		}
+		sort.Strings(allowed)
+		if !valid {
+			return "", fmt.Errorf("reason_code=check_id_not_declared：check_id=%q 不在当前 GraphContract 允许集 %v；请从 tool schema enum 逐字复制", checkID, allowed)
+		}
+	}
+	if task.RunContract != nil {
+		for _, contract := range task.RunContract.CheckContracts {
+			if strings.TrimSpace(contract.CheckID) != checkID {
+				continue
+			}
+			kind := strings.TrimSpace(fmt.Sprint(args["kind"]))
+			if kind != contract.Kind {
+				return "", fmt.Errorf("reason_code=check_kind_contract_mismatch：check_id=%q 要求 kind=%q，实际=%q", checkID, contract.Kind, kind)
+			}
+			if contract.ExactCommand != "" && command != contract.ExactCommand {
+				return "", fmt.Errorf("reason_code=check_command_contract_mismatch：check_id=%q 必须逐字执行冻结 exact_command=%q", checkID, contract.ExactCommand)
+			}
+			break
+		}
+	}
+	if g.Checks == nil || g.ContentStore == nil {
+		return "", fmt.Errorf("run_check 缺少 CheckStore/ContentStore")
+	}
+	workspaceRef, _, err := checkstore.WorkspaceRevision(task, g.TaskStore, g.Workspaces)
 	if err != nil {
 		return "", err
 	}
@@ -102,7 +151,7 @@ func (g CheckGroup) run(ctx context.Context, args map[string]any) (string, error
 	record := checkstore.Record{
 		Schema: checkstore.SchemaV1, RunID: string(task.RunID), GraphID: task.GraphID,
 		TaskID: task.ID, AttemptID: task.AttemptID, ActivationID: task.ActivationID,
-		CheckID: strings.TrimSpace(fmt.Sprint(args["check_id"])), Kind: strings.TrimSpace(fmt.Sprint(args["kind"])),
+		CheckID: checkID, Kind: strings.TrimSpace(fmt.Sprint(args["kind"])),
 		CommandDigest: checkstore.CommandDigest(command), Status: status, ExitCode: exitCode,
 		ExitCodeScope: scope, WorkspaceRevisionRef: workspaceRef, OutputRef: contentRef.RefID,
 		StartedAt: started, SettledAt: time.Now().UTC(),

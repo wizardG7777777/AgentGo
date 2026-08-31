@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/checkstore"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
@@ -39,7 +40,8 @@ func TestObservationGroupValidatesCurrentAttemptEvidence(t *testing.T) {
 		t.Fatalf("record_observation_delta: result=%q err=%v", result, err)
 	}
 	loaded, _ := mem.Load(task.ID)
-	if loaded == nil || len(loaded.Facts) != 1 || loaded.LatestObservationAttemptID != current.AttemptID {
+	if loaded == nil || len(loaded.Facts) != 1 || loaded.Facts[0].Confirmed ||
+		loaded.LatestObservationAttemptID != current.AttemptID {
 		t.Fatalf("Observation TaskMemory=%+v", loaded)
 	}
 	var receipt struct {
@@ -47,9 +49,9 @@ func TestObservationGroupValidatesCurrentAttemptEvidence(t *testing.T) {
 		OpenCandidates  []string `json:"open_candidate_refs"`
 		SemanticAdvance bool     `json:"semantic_advance"`
 	}
-	if json.Unmarshal([]byte(result), &receipt) != nil || receipt.Schema != taskmem.ObservationDeltaSchemaV2 ||
+	if json.Unmarshal([]byte(result), &receipt) != nil || receipt.Schema != taskmem.ObservationDeltaSchemaV3 ||
 		len(receipt.OpenCandidates) != 1 || !receipt.SemanticAdvance {
-		t.Fatalf("Observation v2 receipt 非法: %s", result)
+		t.Fatalf("Observation v3 receipt 非法: %s", result)
 	}
 	resolveArgs := map[string]any{
 		"phase": taskmem.ObservationPhaseImplement,
@@ -99,5 +101,46 @@ func TestObservationGroupValidatesCurrentAttemptEvidence(t *testing.T) {
 			"text": "旧产物事实", "evidence_refs": []any{"artifact:old.md"},
 		}}}}); err == nil {
 		t.Fatal("没有当前 Attempt settled write 的 Artifact 必须拒绝")
+	}
+}
+
+func TestObservationAuthorityAcceptsAllSettledCurrentAttemptChecks(t *testing.T) {
+	tasks := store.NewMemoryTaskStore(make(chan model.Event, 16), 8, 1, 60)
+	task := &model.Task{ID: "task-check-authority", EventType: "code"}
+	if err := tasks.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks.ClaimTask("worker-1", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := tasks.GetTask(task.ID)
+	if err := tasks.AppendToolCall(task.ID, store.ToolCallRecord{Timestamp: time.Now().UTC(),
+		AttemptID: current.AttemptID, CallID: "call-check", ToolName: "run_check",
+		Args: map[string]any{"check_id": "verification"}, Success: true}); err != nil {
+		t.Fatal(err)
+	}
+	checks := checkstore.New(t.TempDir())
+	now := time.Now().UTC()
+	refs := make([]string, 0, 2)
+	for index := 0; index < 2; index++ {
+		ref, err := checks.Put(checkstore.Record{Schema: checkstore.SchemaV1, RunID: "run-1",
+			TaskID: task.ID, AttemptID: current.AttemptID, CheckID: "verification", Kind: "test",
+			CommandDigest: "sha256:" + string(rune('a'+index)), Status: checkstore.StatusFailed,
+			ExitCode: 1, WorkspaceRevisionRef: "workspace:empty",
+			StartedAt: now.Add(time.Duration(index) * time.Second), SettledAt: now.Add(time.Duration(index+1) * time.Second)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		refs = append(refs, ref)
+	}
+	group := ObservationGroup{Store: tasks, Checks: checks}
+	authority, _, latest, err := group.evidenceAuthority(current)
+	if err != nil || latest != refs[1] {
+		t.Fatalf("Check authority/latest 错误: latest=%s refs=%v err=%v", latest, refs, err)
+	}
+	for _, ref := range refs {
+		if _, ok := authority[ref]; !ok {
+			t.Fatalf("schema 可见的 settled CheckRef 必须被 handler 接受: %s authority=%v", ref, authority)
+		}
 	}
 }

@@ -1,7 +1,9 @@
 package runcontract
 
 import (
+	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -19,6 +21,59 @@ func TestRunContractValidateAndWindow(t *testing.T) {
 	}
 	if err := contract.ValidateAt(now.Add(50 * time.Minute)); err == nil {
 		t.Fatal("剩余时间不足 reserve 时应拒绝启动")
+	}
+}
+
+func TestRunContractV1JSONRoundTripKeepsFrozenReserveSemantics(t *testing.T) {
+	raw := []byte(`{"schema":"agentgo.run-contract/v1","run_id":"run-old","deadline_at":"2026-08-28T02:00:00Z","finalization_reserve":60000000000,"recovery_reserve":120000000000,"budget_profile":"swe/v3","created_at":"2026-08-28T01:00:00Z"}`)
+	var contract RunContract
+	if err := json.Unmarshal(raw, &contract); err != nil {
+		t.Fatal(err)
+	}
+	if contract.Schema != SchemaV1 || contract.VerificationReserve != 0 || contract.Validate() != nil {
+		t.Fatalf("v1 恢复语义漂移: %+v", contract)
+	}
+	if got := contract.PhaseStartDeadline(PhaseExecution); !got.Equal(contract.DeadlineAt.Add(-3 * time.Minute)) {
+		t.Fatalf("v1 execution boundary=%s", got)
+	}
+	encoded, err := json.Marshal(contract)
+	if err != nil || strings.Contains(string(encoded), "verification_reserve") {
+		t.Fatalf("v1 round-trip 不得注入新字段: %s err=%v", encoded, err)
+	}
+}
+
+func TestRunContractV2CheckContractsAreFrozenAndValidated(t *testing.T) {
+	now := time.Date(2026, 8, 30, 2, 0, 0, 0, time.UTC)
+	contract := RunContract{
+		Schema: SchemaV2, RunID: "run-check-contract", CreatedAt: now,
+		DeadlineAt: now.Add(time.Hour), FinalizationReserve: time.Minute,
+		RecoveryReserve: time.Minute, VerificationReserve: time.Minute,
+		BudgetProfile: "swe/v3",
+		CheckContracts: []CheckContract{
+			{CheckID: "targeted", Kind: "test"},
+			{CheckID: "verification", Kind: "test", ExactCommand: "uv run --no-sync python -m pytest -q"},
+		},
+	}
+	if err := contract.Validate(); err != nil {
+		t.Fatalf("合法 check contracts 被拒绝: %v", err)
+	}
+	duplicate := contract
+	duplicate.CheckContracts = append(append([]CheckContract(nil), contract.CheckContracts...),
+		CheckContract{CheckID: "verification", Kind: "test"})
+	if err := duplicate.Validate(); err == nil || !strings.Contains(err.Error(), "重复") {
+		t.Fatalf("重复 check_id 必须拒绝: %v", err)
+	}
+	badCommand := contract
+	badCommand.CheckContracts = append([]CheckContract(nil), contract.CheckContracts...)
+	badCommand.CheckContracts[1].ExactCommand += " "
+	if err := badCommand.Validate(); err == nil || !strings.Contains(err.Error(), "首尾空白") {
+		t.Fatalf("非 canonical exact command 必须拒绝: %v", err)
+	}
+	legacy := contract
+	legacy.Schema = SchemaV1
+	legacy.VerificationReserve = 0
+	if err := legacy.Validate(); err == nil || !strings.Contains(err.Error(), "check_contracts") {
+		t.Fatalf("v1 不得静默接纳 check contracts: %v", err)
 	}
 }
 

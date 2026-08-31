@@ -4,8 +4,9 @@ package tools
 //
 // ContentRef 本身不授权。read_content_ref 每一页都从 agent context
 // 取当前 TaskID，重读 TaskStore 中的冻结 ExecutionLease，与当前
-// Session/Graph/Task scope 一起交给 ContentStore 机械校验。模型在
-// Prompt/History 中看到 ref_id 不能扩大权限。
+// Session/Graph/Task scope 一起交给 ContentStore 机械校验。Graph 下游
+// Task 只能解引用其冻结 ContextInputs 中逐字携带的上游 Ref；模型在
+// Prompt/History 中看到其他 ref_id 不能扩大权限。
 
 import (
 	"context"
@@ -60,7 +61,7 @@ func (g ContentRefGroup) Register(r *agent.ToolRegistry) {
 		"required": []any{"ref_id"},
 	}
 	r.Register("read_content_ref",
-		"按 byte range 读取当前任务有权访问的 ContentRef。Ref 不授权；每页都会重新校验冻结 ExecutionLease 与 Session/Graph/Task scope。",
+		"按 byte range 读取当前任务自身或冻结 Graph 上游输入明确授予的 ContentRef。Ref 不授权；每页都会重新校验冻结 ExecutionLease 与 Session/Graph/Task scope。",
 		params, g.readContentRef)
 }
 
@@ -117,11 +118,11 @@ func (g ContentRefGroup) readContentRef(ctx context.Context, args map[string]any
 		return "", fmt.Errorf("read_content_ref: 当前 Task 身份不一致")
 	}
 	sessionID := g.contentRefSessionScope(task)
-	requester := contentstore.Scope{
+	currentRequester := contentstore.Scope{
 		Kind: contentstore.ScopeTask, SessionID: sessionID,
 		GraphID: task.GraphID, TaskID: task.ID,
 	}
-	if err := requester.Validate(); err != nil {
+	if err := currentRequester.Validate(); err != nil {
 		return "", fmt.Errorf("read_content_ref: requester scope 无效: %w", err)
 	}
 	leaseRef, err := contentRefLeaseRef(task)
@@ -138,6 +139,7 @@ func (g ContentRefGroup) readContentRef(ctx context.Context, args map[string]any
 	if status.Availability != contentstore.AvailabilityAvailable {
 		return "", contentRefUnavailable(status)
 	}
+	requester, delegated := contentRefRequesterScope(task, currentRequester, status.Ref)
 	expectedGraphID := task.GraphID
 	expectedRunID := task.RunID
 	page, err := g.ContentStore.ResolveRange(ctx, contentstore.ResolveRangeRequest{
@@ -145,7 +147,7 @@ func (g ContentRefGroup) readContentRef(ctx context.Context, args map[string]any
 		Offset: offset, Limit: limit, MaxBytes: contentRefToolMaxLimit,
 	}, func(authCtx context.Context, request contentstore.AuthorizationRequest) error {
 		return g.authorizeContentRef(authCtx, request, taskID, expectedGraphID, expectedRunID,
-			sessionID, refID, offset, limit)
+			sessionID, refID, requester, delegated, offset, limit)
 	})
 	if err != nil {
 		return "", err
@@ -168,7 +170,8 @@ func (g ContentRefGroup) readContentRef(ctx context.Context, args map[string]any
 }
 
 func (g ContentRefGroup) authorizeContentRef(ctx context.Context, request contentstore.AuthorizationRequest,
-	taskID, graphID string, runID runcontract.RunID, sessionID, refID string, offset, limit int64,
+	taskID, graphID string, runID runcontract.RunID, sessionID, refID string,
+	expectedRequester contentstore.Scope, delegated bool, offset, limit int64,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -190,14 +193,90 @@ func (g ContentRefGroup) authorizeContentRef(ctx context.Context, request conten
 	if err != nil {
 		return err
 	}
-	wantScope := contentstore.Scope{
+	currentRequester := contentstore.Scope{
 		Kind: contentstore.ScopeTask, SessionID: sessionID, GraphID: graphID, TaskID: taskID,
 	}
-	if request.Ref.RefID != refID || request.LeaseRef != leaseRef || request.RequesterScope != wantScope ||
+	if delegated {
+		freshRequester, freshDelegated := contentRefRequesterScope(fresh, currentRequester, request.Ref)
+		if !freshDelegated || freshRequester != expectedRequester {
+			return fmt.Errorf("冻结 Graph 上游 ContentRef 授权已变更")
+		}
+	} else if expectedRequester != currentRequester {
+		return fmt.Errorf("ContentRef requester scope 已变更")
+	}
+	if request.Ref.RefID != refID || request.LeaseRef != leaseRef || request.RequesterScope != expectedRequester ||
 		request.Offset != offset || request.Limit != limit || request.MaxBytes != contentRefToolMaxLimit {
 		return fmt.Errorf("ContentRef 授权事实与当前 Task/Lease/range 不一致")
 	}
 	return nil
+}
+
+// contentRefRequesterScope 只为 Graph Runtime 已冻结到当前 Task ContextInputs
+// 的上游 task-scoped Ref 建立一次显式委托。委托不按“同 Graph”泛化：必须
+// 同 Session/Graph，且 ref_id 是合法 upstream Result/Evidence JSON 中的完整
+// string value。这样日志、Prompt 或模型猜出的 Ref 都不能获得读取权。
+func contentRefRequesterScope(task *model.Task, current contentstore.Scope, ref contentstore.ContentRef) (contentstore.Scope, bool) {
+	if ref.Scope.Allows(current) {
+		return current, false
+	}
+	if task == nil || task.GraphID == "" || ref.Scope.Kind != contentstore.ScopeTask ||
+		ref.Scope.SessionID != current.SessionID || ref.Scope.GraphID != task.GraphID ||
+		ref.Scope.TaskID == "" || ref.Scope.TaskID == task.ID ||
+		!taskDelegatesContentRef(task, ref.RefID) {
+		return current, false
+	}
+	return ref.Scope, true
+}
+
+func taskDelegatesContentRef(task *model.Task, refID string) bool {
+	if task == nil || task.GraphID == "" || refID == "" {
+		return false
+	}
+	prefix := "graph:" + task.GraphID + "/activation:"
+	for _, input := range task.ContextInputs {
+		if !input.Kind.Valid() || !strings.HasPrefix(input.SourceRef, prefix) {
+			continue
+		}
+		marker := "/result:"
+		if input.Kind == model.TaskContextUpstreamEvidence {
+			marker = "/evidence:"
+		}
+		if !strings.Contains(strings.TrimPrefix(input.SourceRef, prefix), marker) {
+			continue
+		}
+		start, end := strings.IndexByte(input.Content, '{'), strings.LastIndexByte(input.Content, '}')
+		if start < 0 || end < start {
+			continue
+		}
+		var payload any
+		if json.Unmarshal([]byte(input.Content[start:end+1]), &payload) != nil {
+			continue
+		}
+		if jsonValueContainsExactString(payload, refID) {
+			return true
+		}
+	}
+	return false
+}
+
+func jsonValueContainsExactString(value any, target string) bool {
+	switch typed := value.(type) {
+	case string:
+		return typed == target
+	case []any:
+		for _, item := range typed {
+			if jsonValueContainsExactString(item, target) {
+				return true
+			}
+		}
+	case map[string]any:
+		for _, item := range typed {
+			if jsonValueContainsExactString(item, target) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // contentRefSessionScope 与 agent.ContextRuntime.sessionScope 使用同一机械规则：

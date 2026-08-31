@@ -1,7 +1,7 @@
 # AgentGo 五层工程架构规范
 
-> 状态：Accepted Architecture，Five-layer repair implementation complete / external architecture 8/8 passed<br>
-> 日期：2026-08-21<br>
+> 状态：Accepted Architecture，L1-L4 weak-model adaptation implemented / external batch validation open<br>
+> 日期：2026-08-30<br>
 > 性质：长期目标架构与责任边界，不是当前实现已经完全满足的声明<br>
 > 历史母本：[`docs/nextUpgrade-V6.md`](../nextUpgrade-V6.md)
 
@@ -14,19 +14,39 @@
 |---|---|---|
 | Model Invocation 基础层 | typed failure、ContextBinding 唯一入口、L2/L4 动态 OutputBudget、SSE字段/Tool批次硬限、partial no-dispatch | 真实 provider/SWE 多 rollout |
 | L1 Prompt | 冻结 Scheduler core prompt + 每 Invocation phase task-control prompt；Graph-first 保持 | 固定模型长期 cohort 指标 |
-| L2 Context | Context v9/Replay v3、1M/64K 默认 ModelCapability、Raw History pressure projection | 真实 tokenizer 自动探测与更多模型档案 |
+| L2 Context | Context v10/Replay v4、普通 Fragment 稳定 cap、Observation 语义切点与 digest 去重 | 真实 tokenizer 自动探测与更多模型档案 |
 | L3 Harness | 仓库 SWE Test Runner、双层 function-call probe、真实 Lease、phase ToolRouter、typed terminal/snapshot | Effect unknown 仍需人工裁决；workspace 仍非 OS sandbox |
-| L4 Loop | 6 Attempts、统一 Deadline Compiler、Invocation-failure 中性进展、typed intervention scope、Progress/Terminal 主链 | 多题长时统计 |
+| L4 Loop | Progress v6 decision/knowledge 分离、RunContract v2 四阶段 Deadline、typed intervention/terminal 主链 | Qwen 完整批次长时统计 |
 | L5 Graph | framework simple Graph、current validate/commit/start、Change、typed Outcome/Result/Evidence | 复杂 OR/generation token 仍关闭；legacy submit/patch 未删 |
-| Validation / Trace | contract/full/race/vet/build、真实二进制、8题 `architecture_ok=8/8`、失败题定向 resolved | 三平台 CI 与更多 provider cohort |
+| Validation / Trace | contract/full/race/vet/build、真实二进制、最新 Qwen 8题 `architecture_ok=8/8` / `task_resolved=6/8`；Recovery v4 本地真实二进制链 | Recovery handoff v4 失败题复测、三平台 CI 与更多 provider cohort |
 
 `AGENTS.md` 只保留当前主链入口摘要；本文件仍是五层边界的完整权威。
+
+## 0.1a 2026-08-30 Recovery handoff v4
+
+- L5 将 `recovery_directive` 收敛为单值端口，retry 回放替换旧代；L2/L3 对历史
+  脏输入选择最后一代并显式记录 directive 数量。
+- 新 code-change recovery 使用 `agentgo.recovery-delta/v4`。L5 冻结最小
+  `EvidenceContract`；L3 逐段证明完整且新鲜的文件覆盖，随后由 Worker 通过
+  `submit_change_decision` 选择 edit / need_context / hypothesis_rejected / blocked。
+  只有 typed edit 才按有序 `{tool,path}` 开放 mutation 与 CheckContract，证据范围
+  不限制新增文件。v3 的 read → 强制同路径 edit 只供历史 Graph 恢复。
+- `recovery_action_gated` 把 schema/stage/tool/path/ref_id/offset/limit/check_id/directive_count 写入
+  Trace；SWE Test Runner 只对已 committed 的 Recovery Task 取最终 retry 决策，
+  Attempt 重放 receipt 不重复计数。acceptance/v2 与历史 v1/v2 不静默迁移。
+- Observation 新写入使用 v3：模型 claim 即使绑定 settled evidence 也只是
+  inferred，TaskMemory 独立标成“待验证观察”，v2 历史 confirmed 语义不变。
+- SWE Test Runner 从 suite manifest 冻结 exact targeted command；Recovery check
+  gate 同时冻结 ID/kind/command。单动作 provider fan-out 只校验并 dispatch 首调用，
+  尾部合法调用生成 skipped receipt。
+- finalizing 是 L4 唯一终态提交边界；成功提交后的 Turn settlement 不能再执行
+  rollover/intervention，循环顶部也必须先完成 finalization 再检查 deadline/fuse。
 
 ## 0.2 2026-08-24 Observation/Recovery/Finalization 实施快照
 
 - L1 已冻结 Worker 调查纪律、final-report 只读交付纪律与 RecoveryDelta retry
   纪律；这些 Prompt 仍只解释机械契约。
-- L2/L3 已落地 `agentgo.observation-delta/v2` predecessor/candidate 状态、immutable Observation Store、
+- L2/L3 已落地新写入 `agentgo.observation-delta/v3`（v2 历史恢复）predecessor/candidate 状态、immutable Observation Store、
   `record_observation_delta` exact checkpoint、literal/regex grep 与安全
   `agentgo.graph-terminal-summary/v2`。synthetic acceptance/未知角色 Lease 会先
   与只读正向闭集求交，不会因 framework 自动工具扩权或启动失败。
@@ -34,7 +54,8 @@
   `progress:final-report/v1`；rollover/首次历史投影/intervention 前冻结
   Observation，final-report 两个补读 turn 后 exact `report_done`。
 - L5 已落地统一 ControlScope、单 Run 单顶层 Graph、
-  `agentgo.recovery-delta/v1`/`recovery_directive` 与确定性 finalization fallback。
+  `agentgo.recovery-delta/v2`/`recovery_directive` 与确定性 finalization fallback；
+  v1 仅按历史冻结语义恢复。
 - full/race/vet/build、Python runner 单测、本地 Responses fake-provider 真实
   二进制链与 DeepSeek 8 题 cohort 共同构成 closure authority；SWE-041～045
   已关闭。
@@ -54,6 +75,15 @@
 - L4 TaskOutcome v2 与 L5 fulfillment 双门要求 mutating work 同时具备真实
   write/edit revision 和晚于最后改动的 verification check；零补丁 success
   fail-closed。
+
+Graph v3 将 L3 的候选 workspace 升格为 L5 Delivery Transaction 的输入：L3 只冻结 stable candidate，L4 只产生 `TaskOutcome v3`，Acceptance pass 后才由 L5 经 Effect Journal promotion 主根；prepared/unknown 不可自动重跑。
+- L3 workspace 以持久化 owner + Activation lease 防止级联误清；L5 Graph retention
+  只放行已 committed success 的残留清理。L2 work-log 必须保留工具 ok/fail 与
+  typed CheckRecord，Recovery 不得从调用次数猜测业务成功。
+- L3 稀疏 COW 与可执行 Shell 树分离：文件工具使用 dirty overlay，
+  `run_check` 使用每轮同步 dirty set 的完整可丢弃快照。L5 使
+  Acceptance 共享 Delivery workspace，并在 promotion 前重算 candidate
+  digest；冻结后变化不得提升。
 - recovery 改用 `submit_recovery_decision`，模型不再复制 source refs/fingerprint。
 - Observation 是非终态的独立 Control Invocation：L2 投影旧业务 tool intent，
   L3 使用 `reasoning=none + exact record_observation_delta`；control ToolCall 不进入
@@ -75,6 +105,25 @@
 - 真实 DeepSeek 最终 8 题 cohort 为 `architecture_ok=8/8` /
   `task_resolved=6/8`，两道普通模型失败定向复跑均 resolved；批次与
   定向证据分开记账。
+
+## 0.4 2026-08-28 统一弱模型 L1–L4 适应性
+
+- L1 Worker 采用“假设→mutation→typed check”，Verifier 在 verification reserve
+  内优先 frozen patch/artifact/check；提示词不按模型/provider 名称分支。
+- L2 新 Run 切到 Context v10/Replay v4，模型窗口不再放大普通 Fragment；最新
+  Observation 之前的探索 exchange 引用化，同路径/内容 digest 的旧读取去重。
+- L3 Observation control 冻结 2048 completion tokens、16 KiB arguments、32 KiB
+  response；pre-dispatch/failed/unknown reservation 均有 durable 结算，Store Close
+  不伪造结果。
+- Observation control 只投影当前 Task/Attempt authority，schema 与 system catalog
+  同源列出 literal evidence；Graph 上游 `ev:*`、前一 Attempt refs 与累计 artifact
+  不进入 control。RecoveryStartPermit 的 claim/取消同样 durable，bind 校验失败
+  必须立即回收。
+- L4 新 Run 使用 Progress v6 与 RunContract v2；knowledge/decision 分离，6-turn
+  checkpoint，两次 decision stagnation 或 control contract failure typed 收口；
+  acceptance 消费 verification phase，finalization deadline 使用确定性 fallback。
+- v1–v9 Context、Replay v1–v3、Progress v1–v5 与 RunContract v1 快照均按冻结语义
+  恢复。SWE-058～061 的机械门已关闭；业务校准开放项见 SWE-062。
 
 ## 1. 背景
 
@@ -379,7 +428,7 @@ Harness 能力快照、上游 Result/Evidence、Mailbox 和预算。<br>
    均稳定，不调用真实模型。
 7. hard cap 的任何放宽或收紧都创建新 PolicyVersion；历史 Task 使用已冻结的
    具体 ref，新 Run 才能使用 `ContextDefaultCurrent`。禁止就地改写旧 policy。
-8. `agentgo.observation-delta/v2` 物化 predecessor、封闭 phase、当前 confirmed
+8. `agentgo.observation-delta/v3` 物化 predecessor、封闭 phase、当前 inferred
    facts、可关闭 candidate、workspace/check authority 与 framework 计算的
    semantic advance；TaskMemory 用最新状态替换旧 Observation 投影，immutable
    delta 仍 append-only。`agentgo.graph-terminal-summary/v2` 额外物化
@@ -553,6 +602,13 @@ Harness Observation、取消和外部消息。<br>
 5. 统一时间层级：单次 Invocation < 单次 action < Attempt deadline < Graph/
    外部 Test Runner deadline，并保证控制面有真实介入窗口。
 6. Loop 收口只产生 TaskOutcome；L5 adapter 再把它转换为 Graph TerminalFact。
+7. 外部评测所需检查范围由 RunContract v2 `check_contracts` 冻结；L3
+   `run_check` 在执行前核对 check_id/kind/可选 exact command，L4/L5 仍只把
+   Graph required check 投影为 verification/fulfillment。具体命令由调用方注入，
+   不在 Runtime 按语言、项目、provider 或模型名硬编码。
+8. finalizing 信号一旦由终态工具成功置位，当前 Turn 只结算预算、History 与
+   TaskMemory；Attempt rollover、intervention、deadline 和 runtime fuse 都不得
+   创建第二个终态提交者。
 
 #### 9.6.1 Loop intervention 的正式跨层边界（2026-08-23）
 
@@ -564,6 +620,11 @@ Harness Observation、取消和外部消息。<br>
 - recovery Controller 可以先以 GraphChangeProposal 修改未来 Definition，再用
   `result.decision=retry|blocked` 裁决；retry 永远创建 `<node>@<N+1>`，不修改
   `<node>@<N>` 的冻结 Prompt/Lease/Next。
+- 非图 graph-change coordination 同样必须有封闭收口：成功 commit 后
+  finalizing；经权威 `read_graph` 判定无需修改时调用
+  `submit_graph_change_decision(decision=no_change)`。Acceptance 先结算节点与
+  出路再请求 change，若 Graph 已终态则只保留审计，不发布无未来 Activation
+  可修改的 Scheduler task。
 - 对带上游数据的 Acceptance retry，L5 以 durable `replay_inputs` 转移复制旧
   Activation 的冻结 InputBinding/ResultRef/Evidence 到新 Activation；L2 只消费
   新 TaskSpec 投影，不自行回忆旧输入。每个 recovery 节点有 framework 冻结的
@@ -572,8 +633,8 @@ Harness Observation、取消和外部消息。<br>
   控制闭集，BusinessTools 恒为空；L2 只投影 `failure_context`，L1 只解释决策。
 - recovery TaskOutcome delivery 完成后才 ACK 原 intervention；缺少 recovery
   Activation 是架构事故，不得因 Graph 最终 typed blocked 而判为正常。
-- business v2/v5 把新 Evidence digest 计为 knowledge progress，重复 digest
-  不计；不再按固定 exploration turn forced delivery。每 8 个新知识 turn 冻结
+- business v2/v6 把新 Evidence digest 计为 knowledge progress，重复 digest
+  不计；不再按固定 exploration turn forced delivery。每 6 个新知识 turn 冻结
   Observation 后继续；rollover、首次历史投影、blocked/intervention 前也必须
   checkpoint，失败时保留 Raw History。
 - final-report 使用 `WorkFinalization` 与 `progress:final-report/v1`：最多两个
@@ -669,10 +730,12 @@ L5 是 AgentGo 的主协调层，负责多个局部 Loop、确定性节点和 Ev
    marker 或排除控制面任务来假定成功。
 10. 统一 ControlScope 必须在任何通用 pump 前识别并吸收 FinalReport；同一 Run
     只能 commit/start 一个顶层业务 Graph，子图与同图 revision 不计入该限制。
-11. 新 recovery Graph 的 retry 必须提交 `agentgo.recovery-delta/v1` 并匹配冻结
-    failure fingerprint。Definition 不变时把 delta 绑定为下一 Activation 的
-    `recovery_directive`；Definition 变化时必须证明 revision 前进。旧未声明 schema
-    的 Graph 继续按冻结旧契约执行。
+11. 新 code-change recovery Graph 的 retry 必须提交 `agentgo.recovery-delta/v4`
+    并匹配冻结 failure fingerprint。单值 `recovery_directive` 只保留最新代；
+    类型化 `first_action=read_file(path)` 是最小 EvidenceContract 的第一项，L3
+    证明完整覆盖后由 Worker typed 决定是否修改、补充上下文或安全交回 L5；只有
+    edit 才推进声明 mutation 与 typed check。Definition 变化时必须证明 revision
+    前进；acceptance/v2、v1-v3 与旧未声明 schema 的 Graph 继续按各自冻结语义执行。
 
 ### 10.7 完成标准
 

@@ -216,6 +216,7 @@ Plan 时代的验收身份子结构已删除；V6 验收语义由 Graph acceptan
 | `task_memory_checkpointed` | 压缩、Attempt 或终态前 checkpoint | `task_id`, `loop`, `reason` |
 | `observation_delta_recorded` | 当前 Attempt 的 ObservationDelta 已 durable | `task_id`, `attempt_id`, `description`（只含 ref 与 facts/next 计数） |
 | `observation_checkpoint_failed` | Observation Control Invocation 未形成 durable delta | `task_id`, `attempt_id`, `turn_id`, `reason`（provider 前 preflight / provider 后提交无效） |
+| `recovery_action_gated` | post-recovery Activation 冻结当前 L3 handoff stage | `task_id`, `attempt_id`, `turn_id`, `recovery_action_gate`（schema/stage/tool/path/ref_id/offset/limit/check_id/directive_count；v4 覆盖 evidence/decision/mutation/check） |
 
 `llm_call_end.failure_kind=provider_quota_exhausted` 表示 provider 账户/项目的
 计费额度或余额已耗尽（HTTP 402 或结构化 billing code）。它不是瞬时 429

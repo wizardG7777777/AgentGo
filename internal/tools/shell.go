@@ -3,8 +3,11 @@ package tools
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"agentgo/internal/agent"
@@ -83,19 +86,26 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 	// allowedWorkDirRoot 是当前调用唯一允许的 cwd 根：隔离任务严格限定在
 	// workspace 视图内，普通任务限定在项目根内。它只约束进程 cwd；命令正文
 	// 仍可引用宿主绝对路径，因此 run_shell 依然是宿主机高权限能力而非沙箱。
-	allowedWorkDirRoot := func() string {
+	allowedWorkDirRoot := func() (string, error) {
 		if g.ActiveViewer != nil {
 			if view := g.ActiveViewer.ActiveView(); view != nil {
-				return view.Root()
+				root, err := view.PrepareShellRoot()
+				if err != nil {
+					return "", fmt.Errorf("准备 workspace shell snapshot: %w", err)
+				}
+				return root, nil
 			}
 		}
 		if workdir != nil {
-			return workdir.Get()
+			return workdir.Get(), nil
 		}
-		return ""
+		return "", nil
 	}
 	resolveWorkingDir := func(args map[string]any) (string, error) {
-		root := allowedWorkDirRoot()
+		root, rootErr := allowedWorkDirRoot()
+		if rootErr != nil {
+			return "", rootErr
+		}
 		if root == "" {
 			return "", fmt.Errorf("Shell 工作目录边界未配置，拒绝执行")
 		}
@@ -143,6 +153,15 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 		cmd := newShellExecCommand(execCtx, shellBin, shellArgs...)
 		if workingDir != "" {
 			cmd.Dir = workingDir
+		}
+		if g.ActiveViewer != nil {
+			if view := g.ActiveViewer.ActiveView(); view != nil {
+				snapshotRoot, snapshotErr := view.PrepareShellRoot()
+				if snapshotErr != nil {
+					return "", fmt.Errorf("准备 workspace shell environment: %w", snapshotErr)
+				}
+				cmd.Env = workspaceShellEnvironment(snapshotRoot)
+			}
 		}
 
 		// H2b Effect Journal：命令执行前先落账（prepared）。Target 只载命令
@@ -267,12 +286,51 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 
 	params := schema.Object().
 		String("command", "要执行的 shell 命令", true).
-		String("working_dir", "执行命令的工作目录；普通任务必须位于 project_root 内，workspace 隔离任务必须位于该任务 workspace 内；留空使用当前允许根", false).
+		String("working_dir", "执行命令的工作目录；普通任务必须位于 project_root 内，workspace 隔离任务必须位于该任务的完整 shell snapshot 内；留空使用项目快照根", false).
 		Int("timeout_sec", "本次执行的超时秒数，留空时使用配置默认值", false).
 		Bool("accept_last_pipeline_exit_code", "命令含 pipeline 时必须显式为 true 才执行；表示你接受 exit_code 仅属于最后一个管道段，且不会把它当成整条测试/构建命令的通过证据", false).
 		Build()
 
 	r.Register("run_shell", "[宿主机高权限能力，不是 OS 沙箱] 在受限工作目录下执行 shell 命令；命令正文仍可访问宿主绝对路径、网络和子进程。返回 stdout、stderr、exit_code 与 exit_code_scope；pipeline 默认拒绝，避免末段 exit=0 被误判为整条命令成功"+shellDialectNote(), params, wrappedFn)
+}
+
+func workspaceShellEnvironment(snapshotRoot string) []string {
+	env := os.Environ()
+	pythonPaths := make([]string, 0, 3)
+	if info, err := os.Stat(filepath.Join(snapshotRoot, "src")); err == nil && info.IsDir() {
+		pythonPaths = append(pythonPaths, filepath.Join(snapshotRoot, "src"))
+	}
+	pythonPaths = append(pythonPaths, snapshotRoot)
+	if existing := envValue(env, "PYTHONPATH"); strings.TrimSpace(existing) != "" {
+		pythonPaths = append(pythonPaths, existing)
+	}
+	env = replaceEnvValue(env, "PYTHONPATH", strings.Join(pythonPaths, string(os.PathListSeparator)))
+	if info, err := os.Stat(filepath.Join(snapshotRoot, ".venv")); err == nil && info.IsDir() {
+		env = replaceEnvValue(env, "UV_PROJECT_ENVIRONMENT", filepath.Join(snapshotRoot, ".venv"))
+	}
+	return env
+}
+
+func envValue(env []string, name string) string {
+	prefix := name + "="
+	for _, entry := range env {
+		if len(entry) >= len(prefix) && strings.EqualFold(entry[:len(prefix)], prefix) {
+			return entry[len(prefix):]
+		}
+	}
+	return ""
+}
+
+func replaceEnvValue(env []string, name, value string) []string {
+	prefix := name + "="
+	out := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if len(entry) >= len(prefix) && strings.EqualFold(entry[:len(prefix)], prefix) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return append(out, prefix+value)
 }
 
 // shellCommand 根据当前操作系统返回合适的 shell 执行器和参数。

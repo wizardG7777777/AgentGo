@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"agentgo/internal/delivery"
 	"agentgo/internal/fulfillment"
 	"agentgo/internal/runcontract"
 	"agentgo/internal/trace"
@@ -118,12 +119,16 @@ type TaskSpec struct {
 	ContextPolicyRef        string
 	NodeID                  string
 	ActivationID            string
+	DeliveryID              string
 	// NodeKind 随 activation 冻结并持久化到 model.Task，供执行租约按真实
 	// Graph 角色派生控制通道；不能从 route 猜测（acceptance 可自定义 route）。
 	NodeKind NodeKind
 	// ControllerRole 仅对 controller 有效，随 activation 定义冻结。loop_recovery
 	// controller 是 L5 的恢复裁决节点，不是普通 Scheduler/业务 Worker。
 	ControllerRole ControllerRole
+	// RecoveryDeltaSchema 是 loop_recovery activation 从冻结节点 metadata
+	// 取得的 wire/执行语义版本；发布桥必须原样持久化，L3 不得解析描述猜测。
+	RecoveryDeltaSchema string
 	// RecoverySourceTaskID 把恢复裁决 Task 精确绑定到触发它的终态 Graph Task；
 	// L4 intervention ACK 与 L3 结果读取授权不得解析文本反推该关系。
 	RecoverySourceTaskID string
@@ -190,8 +195,10 @@ type TerminalFact struct {
 	// Evidence 是该任务终态时由回填方（bootstrap feed）从其 ToolCallRecord
 	// 与 Artifacts 组装的可观察证据条目；结算时随 Execution 持久化，
 	// 并经 EdgeInput.EvidenceRefs 进入下游输入谱系。非任务型节点恒空。
-	Evidence    []EvidenceEntry
-	Fulfillment *fulfillment.Record
+	Evidence     []EvidenceEntry
+	Fulfillment  *fulfillment.Record
+	DeliveryRef  string
+	CandidateRef string
 }
 
 // ToolExecutor 是 Graph Runtime 对工具执行能力的最小依赖（与 TaskBoard
@@ -239,6 +246,9 @@ type Runtime struct {
 	//（acceptance.go 判定矩阵），changeWaker 是 disputed 时的 graph change
 	// 唤醒器：nil 时只发 graph_change_requested 审计事件，不发布唤醒任务。
 	changeWaker GraphChangeWaker
+	// deliveryCommitter 是 L5 唯一可提升 candidate 的边界。nil 时 v3 pass
+	// 必须 fail-closed，不能退化为 worker 提前合并主根。
+	deliveryCommitter DeliveryCommitter
 
 	// sessionIDProvider 提供当前活跃 session ID（Session 生命周期隔离）：
 	// 提交落图时给 doc.SessionID 盖章，恢复后归并无归属历史图。惰性求值，
@@ -282,6 +292,13 @@ type Runtime struct {
 	mu sync.Mutex
 }
 
+// DeliveryCommitter 承担 Effect Journal + candidate promotion 的宿主实现。
+// 它必须是幂等的：明确 settled 后恢复只能返回同一 ref，unknown 不得重放。
+type DeliveryCommitter interface {
+	CommitDelivery(ctx context.Context, deliveryID, acceptanceOutcomeRef string) (deliveryCommitRef string, err error)
+	QuarantineDelivery(ctx context.Context, deliveryID, reason string) error
+}
+
 // RunBudgetGate 是 L5 retry 可行性检查所需的最小 Run authority。
 type RunBudgetGate interface {
 	CanReserve(runcontract.RunID, runcontract.BudgetUsage, time.Time) error
@@ -289,6 +306,7 @@ type RunBudgetGate interface {
 
 type RunStartPermitAuthority interface {
 	ReserveExecutionPermit(runcontract.RunID, string, string, time.Time, time.Time) (string, error)
+	CancelExecutionPermit(runcontract.RunID, string, string, time.Time) error
 	ValidateExecutionPermit(runcontract.RunID, string, time.Time) error
 }
 
@@ -319,6 +337,13 @@ func (rt *Runtime) SetApprovalGateway(gw ApprovalGateway) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	rt.approval = gw
+}
+
+// SetDeliveryCommitter 注入 Graph v3 的 L5 promotion 协调器。
+func (rt *Runtime) SetDeliveryCommitter(committer DeliveryCommitter) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.deliveryCommitter = committer
 }
 
 // SetRunBudgetGate 注入跨 Scheduler/Activation 共享的 Run 预算权威。
@@ -489,12 +514,15 @@ func (rt *Runtime) OnTaskTerminal(f TerminalFact) error {
 	// 数据流证据：终态任务的可观察证据随 Execution 持久化（同一本
 	// execution 经 settle 落盘，证据与终态同条 journal 记录生效）。
 	exec := *ex
+	if f.DeliveryRef != "" {
+		exec.DeliveryRef = f.DeliveryRef
+	}
 	hydrateExecutionEvidence(&exec)
 	if len(f.Evidence) > 0 {
 		exec.Evidence = appendEvidenceUnique(exec.Evidence, f.Evidence...)
 		hydrateExecutionEvidence(&exec)
 	}
-	if f.Status == NodeCompleted && activeNode.ProgressContractRef == "progress:code-change/v5" {
+	if f.Status == NodeCompleted && requiresCodeChangeFulfillment(activeNode.ProgressContractRef) {
 		contract := &fulfillment.Contract{RequireWorkspaceChange: true, RequiredCheckIDs: []string{"verification"}}
 		if f.Fulfillment == nil || f.Fulfillment.Validate(contract) != nil {
 			reason := "contract_fulfillment_missing：mutating activation 缺少真实 workspace change 或晚于最后改动的 verification check"
@@ -800,17 +828,26 @@ func (rt *Runtime) evalTransitionsLocked(graphID, nodeID, activationID string, s
 	if node.Execution != nil && node.Execution.ActivationID == activationID {
 		node = nodeForExecution(node, *node.Execution)
 	}
+	retryDecision := status == NodeCompleted && result["decision"] == "retry"
+	if ControllerRoleOf(node) == ControllerRoleLoopRecovery && !retryDecision {
+		if cancelErr := rt.cancelUnusedRecoveryPermit(doc, node, activationID); cancelErr != nil {
+			return errors.Join(rt.failGraph(graphID, cancelErr.Error()), cancelErr)
+		}
+	}
 	if err := rt.validateRecoveryRetryContract(graphID, doc, node, activationID, status, result); err != nil {
-		return errors.Join(rt.failGraph(graphID, err.Error()), err)
+		cancelErr := rt.cancelUnusedRecoveryPermit(doc, node, activationID)
+		return errors.Join(rt.failGraph(graphID, err.Error()), err, cancelErr)
 	}
 	// 数据流绑定：本 activation 的完整证据与稳定 ResultRef 随每条生效边
 	// 进入 EdgeInput。老 journal/测试可能直接构造 Settlement 而未先写
 	// ActivationResult，此处在任何 transition 前做幂等补写。
 	var srcEvidence []EvidenceEntry
 	srcTaskID := ""
+	srcDeliveryRef := ""
 	if node.Execution != nil && node.Execution.ActivationID == activationID {
 		srcEvidence = node.Execution.Evidence
 		srcTaskID = node.Execution.TaskID
+		srcDeliveryRef = node.Execution.DeliveryRef
 	}
 	// 上游工作记录（2026-08-21）：按来源 Task 聚合渲染一次，随每条生效边
 	// 冻结进 EdgeInput——同一 activation 的多条边共享同一文本；无 provider
@@ -858,6 +895,7 @@ func (rt *Runtime) evalTransitionsLocked(graphID, nodeID, activationID string, s
 		}
 		rec.Input = newEdgeInputWithRef(result, resultRef, srcEvidence)
 		rec.Input.WorkLog = workLog
+		rec.Input.DeliveryRef = srcDeliveryRef
 		sv, err := rt.stateVersion(graphID)
 		if err != nil {
 			return err
@@ -906,6 +944,18 @@ func (rt *Runtime) evalTransitionsLocked(graphID, nodeID, activationID string, s
 		errs = append(errs, rt.evaluateAcceptancesLocked(graphID))
 	}
 	return errors.Join(errs...)
+}
+
+func (rt *Runtime) cancelUnusedRecoveryPermit(doc *GraphDocument, node Node, activationID string) error {
+	if rt.runStartPermits == nil || doc == nil || node.Execution == nil ||
+		node.Execution.ActivationID != activationID {
+		return nil
+	}
+	if err := rt.runStartPermits.CancelExecutionPermit(doc.RunID, node.Execution.TaskID,
+		activationID, time.Now().UTC()); err != nil {
+		return fmt.Errorf("graph: 取消未消费 RecoveryStartPermit: %w", err)
+	}
+	return nil
 }
 
 func validateRecoveryRetryBudget(node Node, activationID string, status NodeStatus, result map[string]any) error {
@@ -1131,27 +1181,48 @@ func (rt *Runtime) recoveryReplayInputs(graphID string, rec TransitionRecord, re
 	}
 	replayed := cloneInputBindings(source.Execution.Input)
 	activeRecovery := nodeForExecution(recovery, *recovery.Execution)
-	if strings.TrimSpace(activeRecovery.Metadata[MetadataRecoveryDeltaSchema]) == RecoveryDeltaSchemaV1 {
+	if schema := strings.TrimSpace(activeRecovery.Metadata[MetadataRecoveryDeltaSchema]); schema == RecoveryDeltaSchemaV1 || schema == RecoveryDeltaSchemaV2 || schema == RecoveryDeltaSchemaV3 || schema == RecoveryDeltaSchemaV4 {
 		delta, err := decodeRecoveryDelta(result)
 		if err != nil {
 			return nil, err
 		}
-		if _, definitionChanged := stringSet(delta.ChangedDimensions)["definition"]; definitionChanged {
-			return replayed, nil
+		if delta.Schema != schema {
+			return nil, fmt.Errorf("graph: recovery_delta schema=%q 与冻结 metadata=%q 不一致", delta.Schema, schema)
 		}
 		raw, err := json.Marshal(delta)
 		if err != nil {
 			return nil, fmt.Errorf("graph: 编码 recovery_directive: %w", err)
 		}
-		replayed = append(replayed, InputBinding{
+		firstAction := delta.FirstRequiredAction
+		if delta.FirstAction != nil {
+			firstAction = delta.FirstAction.Tool
+			if delta.FirstAction.Path != "" {
+				firstAction += " path=" + delta.FirstAction.Path
+			}
+		}
+		// replay_inputs 会复制 source Activation 的冻结输入。循环重试时其中可能
+		// 已含上一代 recovery_directive；该端口是单值权威，必须先替换旧值，
+		// 不能让 L2 同时看到多代互相冲突的恢复指令。
+		replayed = replaceRecoveryDirective(replayed, InputBinding{
 			SourceNodeID: rec.SourceNodeID, SourceActivationID: rec.SourceActivationID,
 			TargetInput: "recovery_directive",
 			Summary: fmt.Sprintf("strategy=%s first_action=%s milestone=%s",
-				delta.Strategy, delta.FirstRequiredAction, delta.ExpectedMilestone),
+				delta.Strategy, firstAction, delta.ExpectedMilestone),
 			Result: raw,
 		})
 	}
 	return replayed, nil
+}
+
+func replaceRecoveryDirective(inputs []InputBinding, current InputBinding) []InputBinding {
+	out := make([]InputBinding, 0, len(inputs)+1)
+	for _, input := range inputs {
+		if input.TargetInput == "recovery_directive" {
+			continue
+		}
+		out = append(out, input)
+	}
+	return append(out, current)
 }
 
 // ResumeGraph 在进程重启后恢复一张图的执行（Store.Recover 完成后调用）：
@@ -2635,6 +2706,9 @@ func (rt *Runtime) inEdgePorts(graphID string, doc *GraphDocument, targetID stri
 func (rt *Runtime) publishTask(graphID, nodeID string, node Node, exec Execution) error {
 	node = nodeForExecution(node, exec)
 	spec := rt.taskSpecFor(graphID, nodeID, node, exec)
+	if spec.DeliveryID != "" {
+		exec.DeliveryRef = spec.DeliveryID
+	}
 	if rt.board == nil {
 		reason := fmt.Sprintf("节点 %s（activation %s）需要发布任务但 TaskBoard 未配置", nodeID, exec.ActivationID)
 		return errors.Join(
@@ -2711,6 +2785,20 @@ func (rt *Runtime) taskSpecFor(graphID, nodeID string, node Node, exec Execution
 			spec.RunContract = &run
 		}
 	}
+	if doc, ok := rt.store.Get(graphID); ok && doc.Schema == SchemaV3 {
+		for _, input := range spec.Inputs {
+			if input.DeliveryRef != "" {
+				spec.DeliveryID = input.DeliveryRef
+				break
+			}
+		}
+		if spec.DeliveryID == "" && requiresCodeChangeFulfillment(nodeForExecution(node, exec).ProgressContractRef) {
+			spec.DeliveryID = delivery.StableID(string(doc.RunID), graphID, exec.ActivationID)
+		}
+		// Acceptance 必须在同一 Delivery workspace 中读取候选并
+		// 执行验证；若留在主根，它核验的是旧代码而非 candidate。
+		bindDeliveryWorkspace(node, &spec)
+	}
 	// TaskSpec 是一次性发布副本：大 Result 在 GraphDocument/TransitionRecord
 	// 中仍只保留有界内联 + ResultRef，此处按引用临时展开给任务桥，由桥的总
 	// 上下文上限决定实际注入量，不把全文重复写回 Graph journal。
@@ -2739,10 +2827,16 @@ func (rt *Runtime) taskSpecFor(graphID, nodeID string, node Node, exec Execution
 	// 无 path 条件出边时 RenderOutputContract 返回空串，任务桥自然跳过。
 	// 派生以冻结定义为准：patch_graph 只影响后续 activation，重进发布的新
 	// 任务按当时冻结定义重新派生。
-	if doc, ok := rt.store.Get(graphID); ok && doc.Schema == SchemaV2 {
+	if doc, ok := rt.store.Get(graphID); ok && (doc.Schema == SchemaV2 || doc.Schema == SchemaV3) {
 		spec.OutputContract = RenderOutputContract(nodeForExecution(node, exec).Next)
 	}
 	return spec
+}
+
+func bindDeliveryWorkspace(node Node, spec *TaskSpec) {
+	if spec != nil && node.Kind == KindAcceptance && spec.DeliveryID != "" {
+		spec.Isolation = IsolationWorkspace
+	}
 }
 
 func taskSpecFor(graphID, nodeID string, node Node, exec Execution) TaskSpec {
@@ -2753,6 +2847,7 @@ func taskSpecFor(graphID, nodeID string, node Node, exec Execution) TaskSpec {
 		ActivationID:        exec.ActivationID,
 		NodeKind:            effective.Kind,
 		ControllerRole:      ControllerRoleOf(effective),
+		RecoveryDeltaSchema: strings.TrimSpace(effective.Metadata[MetadataRecoveryDeltaSchema]),
 		Route:               resolveRoute(effective),
 		ProgressContractRef: effective.ProgressContractRef,
 		ContextPolicyRef:    effective.ContextPolicyRef,
@@ -2763,7 +2858,7 @@ func taskSpecFor(graphID, nodeID string, node Node, exec Execution) TaskSpec {
 		spec.Description = effective.Task.Description
 		spec.RequiredEvidence = append([]EvidenceRequirement(nil), effective.Task.RequiredEvidence...)
 	}
-	if effective.ProgressContractRef == "progress:code-change/v5" {
+	if requiresCodeChangeFulfillment(effective.ProgressContractRef) {
 		spec.FulfillmentContract = &fulfillment.Contract{
 			RequireWorkspaceChange: true, RequiredCheckIDs: []string{"verification"},
 		}
@@ -2775,6 +2870,15 @@ func taskSpecFor(graphID, nodeID string, node Node, exec Execution) TaskSpec {
 	}
 	spec.Inputs = append([]InputBinding(nil), exec.Input...)
 	return spec
+}
+
+func requiresCodeChangeFulfillment(ref string) bool {
+	switch ref {
+	case "progress:code-change/v5", "progress:code-change/v6":
+		return true
+	default:
+		return false
+	}
 }
 
 // reconcileRunningTaskLocked 对账 durable running activation 与 TaskBoard。
@@ -3181,6 +3285,7 @@ func (rt *Runtime) inputsFor(graphID, nodeID, activationID string) []InputBindin
 			}
 			b.Truncated = rec.Input.Truncated
 			b.WorkLog = rec.Input.WorkLog
+			b.DeliveryRef = rec.Input.DeliveryRef
 		}
 		out = append(out, b)
 	}
@@ -3443,6 +3548,9 @@ func (rt *Runtime) failGraph(graphID, reason string) error {
 	if err != nil {
 		return err
 	}
+	if err := rt.quarantineGraphDeliveries(doc, reason); err != nil {
+		return err
+	}
 	record := GraphOutcomeRecord{
 		Outcome: EndFailed, Source: "runtime_failure", Reason: reason,
 		DefinitionRevision: doc.Revision, CommittedAt: time.Now().UTC(),
@@ -3496,11 +3604,24 @@ func (rt *Runtime) commitEndOutcome(graphID, nodeID string, exec Execution, outc
 	// caller 手里的副本尚未携带刚落盘的 ResultRef/Settlement。outcome 必须
 	// 从 Store 当前 activation 快照取证，不能把空引用写进 durable record。
 	exec = *node.Execution
+	deliveryCommitRef := ""
+	if outcome == EndSuccess && doc.Schema == SchemaV3 {
+		var commitErr error
+		deliveryCommitRef, commitErr = deliveryCommitRefFor(doc)
+		if commitErr != nil {
+			return commitErr
+		}
+	} else if doc.Schema == SchemaV3 {
+		if err := rt.quarantineGraphDeliveries(doc, reason); err != nil {
+			return err
+		}
+	}
 	record := GraphOutcomeRecord{
 		Outcome: outcome, Source: "end", EndNodeID: nodeID,
 		EndActivationID: exec.ActivationID, ResultRef: exec.ResultRef,
 		Reason: reason, DefinitionRevision: exec.DefinitionRevision,
-		CommittedAt: time.Now().UTC(),
+		CommittedAt:       time.Now().UTC(),
+		DeliveryCommitRef: deliveryCommitRef,
 	}
 	if err := rt.store.CommitGraphOutcome(graphID, record, doc.StateVersion); err != nil {
 		return err
@@ -3512,6 +3633,74 @@ func (rt *Runtime) commitEndOutcome(graphID, nodeID string, exec Execution, outc
 	})
 	delete(rt.results, graphID)
 	return errors.Join(cleanupErr, rt.onChildGraphEnded(graphID, record.Status()))
+}
+
+func (rt *Runtime) quarantineGraphDeliveries(doc *GraphDocument, reason string) error {
+	refs := deliveryRefsFor(doc)
+	if len(refs) == 0 {
+		return nil
+	}
+	if rt.deliveryCommitter == nil {
+		return fmt.Errorf("graph: Graph v3 terminal 缺少 Delivery quarantine 协调器")
+	}
+	quarantineReason := strings.TrimSpace(reason)
+	if quarantineReason == "" {
+		quarantineReason = "Graph terminal without success"
+	}
+	for _, ref := range refs {
+		if err := rt.deliveryCommitter.QuarantineDelivery(context.Background(), ref, quarantineReason); err != nil {
+			return fmt.Errorf("graph: quarantine Delivery %s: %w", ref, err)
+		}
+	}
+	return nil
+}
+
+func deliveryRefsFor(doc *GraphDocument) []string {
+	refs := make(map[string]struct{})
+	if doc == nil {
+		return nil
+	}
+	for _, node := range doc.Nodes {
+		if node.Execution == nil {
+			continue
+		}
+		if node.Execution.DeliveryRef != "" {
+			refs[node.Execution.DeliveryRef] = struct{}{}
+		}
+		for _, input := range node.Execution.Input {
+			if input.DeliveryRef != "" {
+				refs[input.DeliveryRef] = struct{}{}
+			}
+		}
+	}
+	out := make([]string, 0, len(refs))
+	for ref := range refs {
+		out = append(out, ref)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// deliveryCommitRefFor 读取 durable execution，而不是 acceptance 自述。首版
+// 每张 v3 图的 success path 必须有且只有一个 promotion ref；多个 producer
+// 必须各自验收后由 join 汇合，不能伪装为一个原子 Delivery。
+func deliveryCommitRefFor(doc *GraphDocument) (string, error) {
+	if doc != nil && !doc.RequiresDelivery() {
+		return "", nil
+	}
+	refs := make(map[string]struct{})
+	for _, node := range doc.Nodes {
+		if node.Execution != nil && node.Execution.DeliveryCommitRef != "" {
+			refs[node.Execution.DeliveryCommitRef] = struct{}{}
+		}
+	}
+	if len(refs) != 1 {
+		return "", fmt.Errorf("Graph v3 success 必须恰有一个 delivery_commit_ref，实际=%d", len(refs))
+	}
+	for ref := range refs {
+		return ref, nil
+	}
+	return "", fmt.Errorf("Graph v3 success 缺少 delivery_commit_ref")
 }
 
 // completeGraph 把图置 completed 并发 graph_ended 事件。
@@ -3538,9 +3727,13 @@ func (rt *Runtime) completeGraph(graphID string) error {
 	}
 	// 只服务旧 settlement continuation 的恢复兼容；新旧 GraphDocument 的
 	// end 激活均走 commitEndOutcome（空 end_outcome 按 success）。
+	deliveryCommitRef, err := deliveryCommitRefFor(doc)
+	if err != nil {
+		return err
+	}
 	record := GraphOutcomeRecord{
 		Outcome: EndSuccess, Source: "legacy_end",
-		DefinitionRevision: doc.Revision, CommittedAt: time.Now().UTC(),
+		DefinitionRevision: doc.Revision, CommittedAt: time.Now().UTC(), DeliveryCommitRef: deliveryCommitRef,
 	}
 	if err := rt.store.CommitGraphOutcome(graphID, record, doc.StateVersion); err != nil {
 		return err
@@ -3656,6 +3849,9 @@ func (rt *Runtime) cancelGraphTreeLocked(graphID, reason string, notifyParent bo
 	if doc.Status.IsTerminal() {
 		cleanupErrs = append(cleanupErrs, rt.terminateGraphTasksLocked(graphID))
 		return false, errors.Join(cleanupErrs...), nil
+	}
+	if err := rt.quarantineGraphDeliveries(doc, reason); err != nil {
+		return false, errors.Join(cleanupErrs...), err
 	}
 	record := GraphOutcomeRecord{
 		Outcome: EndCancelled, Source: "control_plane", Reason: reason,

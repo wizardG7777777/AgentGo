@@ -53,6 +53,14 @@ func graphChangeWakeMarkerKind(graphID, activationID, kind string) string {
 // 带图身份会被 graph-terminal-feed 当作节点终态回填引擎。
 func (w graphChangeWaker) WakeGraphChange(spec graph.GraphChangeWakeSpec) error {
 	marker := graphChangeWakeMarkerKind(spec.GraphID, spec.ActivationID, spec.MarkerKind)
+	// Acceptance 先完成节点结算再调用 waker。若 failed/blocked 出路已让图
+	// 到达终态，Definition 已不可能产生未来 Activation；此时只保留 Runtime
+	// 的 graph_change_requested 审计，不再发布一个注定无法改图的 Scheduler task。
+	if w.graphs != nil {
+		if doc, ok := w.graphs.Get(spec.GraphID); ok && doc != nil && doc.Status.IsTerminal() {
+			return nil
+		}
+	}
 	// 幂等查重（MemoryTaskStore.ScanAll 永不返回错误；其它实现扫描失败时
 	// 退化为直接发布——多一个唤醒任务无害，Scheduler 裁决天然幂等）。
 	if tasks, err := w.store.ScanAll(); err == nil {
@@ -85,11 +93,12 @@ func (w graphChangeWaker) WakeGraphChange(spec graph.GraphChangeWakeSpec) error 
 			marker, spec.GraphID, spec.NodeID, spec.ActivationID, spec.Reason, spec.Detail, spec.TaskID)
 	}
 	wake := &model.Task{
-		Description:    description,
-		EventType:      "__scheduler__",
-		EventSource:    "graph-change-request",
-		ParentTaskID:   spec.TaskID,
-		MaxConcurrency: 1, // 同一时刻只允许一个 Scheduler 处理同一请求
+		Description:         description,
+		EventType:           "__scheduler__",
+		EventSource:         model.TaskEventSourceGraphChange,
+		ParentTaskID:        spec.TaskID,
+		InterventionGraphID: spec.GraphID,
+		MaxConcurrency:      1, // 同一时刻只允许一个 Scheduler 处理同一请求
 	}
 	var parent *model.Task
 	if spec.TaskID != "" {

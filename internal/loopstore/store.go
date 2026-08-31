@@ -1276,7 +1276,8 @@ func deadlineEqual(current, next runcontract.DeadlineBudget) bool {
 		current.InterventionAt.Equal(next.InterventionAt) &&
 		current.HardDeadlineAt.Equal(next.HardDeadlineAt) &&
 		current.FinalizationReserve == next.FinalizationReserve &&
-		current.RecoveryReserve == next.RecoveryReserve
+		current.RecoveryReserve == next.RecoveryReserve &&
+		current.VerificationReserve == next.VerificationReserve
 }
 
 func isCleanInitialCheckpoint(checkpoint loopcontract.ProgressCheckpoint) bool {
@@ -1285,6 +1286,8 @@ func isCleanInitialCheckpoint(checkpoint loopcontract.ProgressCheckpoint) bool {
 		checkpoint.CumulativeUsage == (runcontract.BudgetUsage{Attempts: 1}) &&
 		checkpoint.ExplorationTurnsSinceDeliverable == 0 &&
 		checkpoint.KnowledgeTurnsSinceObservation == 0 &&
+		checkpoint.TurnsSinceDecisionCheckpoint == 0 &&
+		checkpoint.DecisionStagnationCount == 0 && checkpoint.ControlContractFailureCount == 0 &&
 		checkpoint.InterventionStage == loopcontract.StageRunning &&
 		checkpoint.InterventionCount == 0 && checkpoint.AttemptRolloverCount == 0 &&
 		len(checkpoint.RecentFingerprints) == 0
@@ -1300,6 +1303,10 @@ func sameCheckpointFactsForSeal(current, next loopcontract.ProgressCheckpoint) b
 		current.CumulativeUsage == next.CumulativeUsage &&
 		current.ExplorationTurnsSinceDeliverable == next.ExplorationTurnsSinceDeliverable &&
 		current.KnowledgeTurnsSinceObservation == next.KnowledgeTurnsSinceObservation &&
+		current.TurnsSinceDecisionCheckpoint == next.TurnsSinceDecisionCheckpoint &&
+		current.ObservationStagnationCount == next.ObservationStagnationCount &&
+		current.DecisionStagnationCount == next.DecisionStagnationCount &&
+		current.ControlContractFailureCount == next.ControlContractFailureCount &&
 		current.AttemptRolloverCount == next.AttemptRolloverCount &&
 		current.InterventionStage == next.InterventionStage &&
 		current.InterventionCount == next.InterventionCount &&
@@ -1316,6 +1323,10 @@ func sameCheckpointFactsForIntervention(current, next loopcontract.ProgressCheck
 		current.CumulativeUsage == next.CumulativeUsage &&
 		current.ExplorationTurnsSinceDeliverable == next.ExplorationTurnsSinceDeliverable &&
 		current.KnowledgeTurnsSinceObservation == next.KnowledgeTurnsSinceObservation &&
+		current.TurnsSinceDecisionCheckpoint == next.TurnsSinceDecisionCheckpoint &&
+		current.ObservationStagnationCount == next.ObservationStagnationCount &&
+		current.DecisionStagnationCount == next.DecisionStagnationCount &&
+		current.ControlContractFailureCount == next.ControlContractFailureCount &&
 		current.AttemptRolloverCount == next.AttemptRolloverCount
 }
 
@@ -1329,6 +1340,10 @@ func sameCheckpointFactsForRollover(current, next loopcontract.ProgressCheckpoin
 		current.NoProgressUsage != next.NoProgressUsage ||
 		current.ExplorationTurnsSinceDeliverable != next.ExplorationTurnsSinceDeliverable ||
 		current.KnowledgeTurnsSinceObservation != next.KnowledgeTurnsSinceObservation ||
+		current.TurnsSinceDecisionCheckpoint != next.TurnsSinceDecisionCheckpoint ||
+		current.ObservationStagnationCount != next.ObservationStagnationCount ||
+		current.DecisionStagnationCount != next.DecisionStagnationCount ||
+		current.ControlContractFailureCount != next.ControlContractFailureCount ||
 		current.InterventionCount != next.InterventionCount ||
 		!current.LastInterventionAt.Equal(next.LastInterventionAt) ||
 		next.AttemptRolloverCount != current.AttemptRolloverCount+1 {

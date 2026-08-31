@@ -144,6 +144,9 @@ type contextCompileRequest struct {
 	ParentSnapshotRef string
 	PhasePrompt       string
 	PhasePromptRef    string
+	// SuppressUpstreamInputs 用于只允许当前 Task/Attempt evidence authority
+	// 的机械 Control Invocation。业务 Task 仍完整保留冻结上游输入。
+	SuppressUpstreamInputs bool
 }
 
 func (r ContextRuntime) compileAndPersist(ctx context.Context, request contextCompileRequest) (contextadapter.Result, error) {
@@ -172,11 +175,20 @@ func (r ContextRuntime) compileAndPersist(ctx context.Context, request contextCo
 	if !ok {
 		return contextadapter.Result{}, fmt.Errorf("ContextPolicy %q 引用未知 ReplayPolicy %q", policyRef, contextProfile.ReplayPolicyRef)
 	}
-	projectedHistory, projection := projectHistoryForContext(request.History, contextProfile.Policy)
+	contentScope := contentstore.Scope{
+		Kind: contentstore.ScopeTask, SessionID: r.sessionScope(request.Task),
+		GraphID: request.Task.GraphID, TaskID: request.Task.ID,
+	}
+	projectedHistory, projection, replayRefs, projectErr := projectHistoryForContextReplay(ctx, request.History,
+		contextProfile.Policy, replayProfile.Policy.Version, request.AttemptID, r.Content, contentScope)
+	if projectErr != nil {
+		return contextadapter.Result{}, projectErr
+	}
 	request.History = projectedHistory
-	if projection.Applied {
+	if projection.Applied || projection.ReferencedFragments > 0 {
 		if side := manifestSideInfoFromContext(ctx); side != nil {
-			side.l2Strategy = fmt.Sprintf("snapshot-pressure/v1:omitted=%d:retained=%d:aggressive=%t",
+			side.l2Strategy = fmt.Sprintf("replay/v%d:referenced=%d:deduplicated=%d:snapshot-pressure/v1:omitted=%d:retained=%d:aggressive=%t",
+				replayProfile.Policy.Version, projection.ReferencedFragments, projection.DeduplicatedFragments,
 				projection.OmittedEntries, projection.RetainedEntries, projection.Aggressive)
 			side.historyProjectionCount++
 		}
@@ -184,8 +196,9 @@ func (r ContextRuntime) compileAndPersist(ctx context.Context, request contextCo
 			Kind: trace.KindHistoryCompaction, TaskID: request.Task.ID,
 			Strategy:    fmt.Sprintf("snapshot-pressure/v1:aggressive=%t", projection.Aggressive),
 			KeptEntries: projection.RetainedEntries,
-			Description: fmt.Sprintf("raw_entries=%d omitted=%d；Raw History 未修改",
-				projection.OriginalEntries, projection.OmittedEntries),
+			Description: fmt.Sprintf("raw_entries=%d omitted=%d referenced=%d deduplicated=%d；Raw History 未修改",
+				projection.OriginalEntries, projection.OmittedEntries, projection.ReferencedFragments,
+				projection.DeduplicatedFragments),
 		})
 	}
 	conversation, err := contextConversation(request)
@@ -205,10 +218,7 @@ func (r ContextRuntime) compileAndPersist(ctx context.Context, request contextCo
 	}
 	if r.Content != nil {
 		compileInput.ContentRepository = r.Content
-		compileInput.ContentScope = contentstore.Scope{
-			Kind: contentstore.ScopeTask, SessionID: r.sessionScope(request.Task),
-			GraphID: request.Task.GraphID, TaskID: request.Task.ID,
-		}
+		compileInput.ContentScope = contentScope
 		if request.Task.RunContract != nil {
 			compileInput.EphemeralExpiresAt = request.Task.RunContract.DeadlineAt
 		}
@@ -220,6 +230,7 @@ func (r ContextRuntime) compileAndPersist(ctx context.Context, request contextCo
 	if compiled.Snapshot == nil {
 		return contextadapter.Result{}, fmt.Errorf("L2 ContextCompiler 返回空 Snapshot")
 	}
+	compiled.ExternalizedRefs = append(replayRefs, compiled.ExternalizedRefs...)
 	if _, err := r.Snapshots.Put(*compiled.Snapshot); err != nil {
 		return contextadapter.Result{}, fmt.Errorf("L2 ContextSnapshot 持久化失败: %w", err)
 	}
@@ -347,7 +358,7 @@ func contextConversation(request contextCompileRequest) ([]contextadapter.Conver
 			SourceRef: "task:" + request.Task.ID, Scope: contextcontract.ScopeTask,
 			Authority: contextcontract.AuthorityAuthoritative, Freshness: contextcontract.FreshnessLive,
 		})
-		if len(request.DependencyResult) > 0 {
+		if !request.SuppressUpstreamInputs && len(request.DependencyResult) > 0 {
 			appendMessage(contextadapter.MessageBinding{
 				Message: llm.Message{Role: "user", Content: renderDependencyResults(request.DependencyResult)},
 				Kind:    contextcontract.FragmentUpstreamResult, Section: contextcontract.SectionUpstreamInputs,
@@ -356,22 +367,24 @@ func contextConversation(request contextCompileRequest) ([]contextadapter.Conver
 			})
 		}
 	}
-	for _, input := range request.Task.ContextInputs {
-		kind := contextcontract.FragmentUpstreamResult
-		switch input.Kind {
-		case model.TaskContextUpstreamResult:
-			kind = contextcontract.FragmentUpstreamResult
-		case model.TaskContextUpstreamEvidence:
-			kind = contextcontract.FragmentUpstreamEvidence
-		default:
-			return nil, fmt.Errorf("Task context input kind=%q 无效", input.Kind)
+	if !request.SuppressUpstreamInputs {
+		for _, input := range request.Task.ContextInputs {
+			kind := contextcontract.FragmentUpstreamResult
+			switch input.Kind {
+			case model.TaskContextUpstreamResult:
+				kind = contextcontract.FragmentUpstreamResult
+			case model.TaskContextUpstreamEvidence:
+				kind = contextcontract.FragmentUpstreamEvidence
+			default:
+				return nil, fmt.Errorf("Task context input kind=%q 无效", input.Kind)
+			}
+			appendMessage(contextadapter.MessageBinding{
+				Message: llm.Message{Role: "user", Content: input.Content},
+				Kind:    kind, Section: contextcontract.SectionUpstreamInputs,
+				SourceRef: input.SourceRef, Scope: contextcontract.ScopeActivation,
+				Authority: contextcontract.AuthorityInformational, Freshness: contextcontract.FreshnessSnapshot,
+			})
 		}
-		appendMessage(contextadapter.MessageBinding{
-			Message: llm.Message{Role: "user", Content: input.Content},
-			Kind:    kind, Section: contextcontract.SectionUpstreamInputs,
-			SourceRef: input.SourceRef, Scope: contextcontract.ScopeActivation,
-			Authority: contextcontract.AuthorityInformational, Freshness: contextcontract.FreshnessSnapshot,
-		})
 	}
 	if strings.TrimSpace(request.PhasePrompt) != "" {
 		appendMessage(contextadapter.MessageBinding{

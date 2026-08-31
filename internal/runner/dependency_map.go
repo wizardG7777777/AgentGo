@@ -104,7 +104,7 @@ func resolveToolGroups(
 				EffectJournal: deps.EffectJournal,
 			},
 			TaskStore: deps.Store, Checks: deps.CheckStore, ContentStore: deps.ContentStore,
-			Holder: holder, SessionID: deps.SessionID,
+			Holder: holder, SessionID: deps.SessionID, Workspaces: deps.WorkspaceManager,
 		},
 		tools.MetaGroup{
 			Store:               deps.Store,
@@ -129,9 +129,11 @@ func resolveToolGroups(
 			Checks:               deps.CheckStore,
 			RecoveryAuthority:    recoveryAuthority,
 			Checkpoints:          deps.LoopStore,
+			Workspaces:           deps.WorkspaceManager,
 		},
 		tools.ObservationGroup{
-			Store: deps.Store, TaskMem: deps.TaskMemStore, Holder: holder, AgentID: instanceID, Checks: deps.CheckStore,
+			Store: deps.Store, TaskMem: deps.TaskMemStore, Holder: holder, AgentID: instanceID,
+			Checks: deps.CheckStore, Workspaces: deps.WorkspaceManager,
 		},
 	}
 }

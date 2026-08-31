@@ -1,14 +1,48 @@
 # Loop Progress Contract / Checkpoint / Deadline 架构
 
-> 状态：Accepted Design，SWE-016/017/023/026/028 implementation complete / Responses single-task verified<br>
-> 日期：2026-08-23<br>
+> 状态：Accepted Design，Progress v6 / RunContract v2 mechanical validation complete / business gate open<br>
+> 日期：2026-08-29<br>
 > 归属：L4 Loop Engineering<br>
 > 对应问题：SWE-011<br>
 > 上位规范：[`五层工程架构规范`](five-layer-engineering-architecture.md)<br>
 > 关联设计：[`Graph Draft / Commit / Start`](graph-draft-commit-start.md)<br>
 > 统一路线图：[`SWE 架构修复统一实施路线图`](swe-architecture-repair-roadmap.md)
 
-## 0.0 2026-08-24 Run 作用域与控制额度修订
+## 0.0 2026-08-28 Decision Progress 与四阶段 Deadline
+
+- 新 code-change 使用 `progress:code-change/v6`：每 6 个 knowledge turn 进入
+  Observation；新 read/grep 可以更新 knowledge，但不能重置 decision stagnation。
+  只有 workspace/file revision、artifact digest、typed check、Observation phase/
+  workspace/check 前进或 predecessor candidate closure 才算 decision advance。
+- `workspace:empty` 的 pre-mutation run_check 只形成 baseline knowledge；typed
+  verification 必须绑定非空 workspace revision 且 pass 晚于最后 mutation。
+  candidate closure 仍可推进 decision，但 24 个探索 turn 没有首次 deliverable
+  时必须 checkpoint 后交 recovery，不能靠换测试命令拖到 deadline。
+  turn 门与绝对时间门并行：Attempt 进入冻结的 5 分钟首次交付
+  handoff window 且仍无 deliverable 时，立即以 `decision_progress_stalled`
+  交 L5，不再启动可能直接撞 Attempt deadline 的普通模型调用。5 分钟来自
+  Windows Qwen Flask-8 的慢调用证据：2 分钟小于单次尾部 Invocation，三题在
+  guard 可观察前已跨过 Attempt deadline，Recovery 只剩零 execution 窗口。
+- `DecisionStagnationCount` 与 `ControlContractFailureCount` 随 Turn settlement 和
+  ProgressCheckpoint 原子持久化。连续两个 checkpoint 无决策前进形成
+  `decision_progress_stalled`；连续两次 Observation control contract 失败形成
+  `control_contract_unstable` blocked。
+- `agentgo.run-contract/v2` 新增 `VerificationReserve`；新 Run 的阶段严格为
+  execution → verification → recovery → finalization。v1 不识别 verification phase，
+  并按原两段 reserve 语义恢复，禁止静默升级。
+- Graph acceptance 在 v2 只冻结 `RunPhase=verification`，不改变 Graph 节点、边、
+  verdict 或路由。SWE 默认 reserve 为 180s/120s/90s。
+- Model action 在 pre-dispatch 失败时 cancel reservation；dispatch 后明确失败 settle
+  failed；取消/deadline 不确定 settle unknown。finalization 无法再启动 action 时先
+  关闭 reservation，再走确定性 fallback。
+- Observation exact Invocation 的 schema enum、system catalog 与 handler 共用当前
+  Task/Attempt settled authority；前一 Attempt、累计 artifact 与 Graph 上游输入不得
+  混入。首次失败只回显有界机械错误并 fresh retry 一次，不做正文/JSON 修补。
+- RecoveryStartPermit claim 身份按目标 Task durable；同一 Activation 新 Attempt 不
+  重认领。bind 后 delta 校验失败、非 retry terminal 或其它未放行分支都立即取消
+  permit，禁止让未 dispatch 的 permit 过期后按 unknown model call 伪结算。
+
+## 0.1 2026-08-24 Run 作用域与控制额度修订
 
 SWE-051 证明旧实现虽把 profile 称为“Run 总预算”，实际却从
 `LoopStore.LoadCheckpoint(task.ID)` 的 Task-local `CumulativeUsage` 计算余额；
@@ -29,12 +63,13 @@ Recovery 创建新 Activation/Task 后额度自动归零。正式边界修订为
 - 显式业务 limit 只约束 execution。coordination/recovery/finalization 使用独立
   control entitlement 与冻结 Lease/ProgressContract/time reserve，不能调用业务工具；
 - Recovery retry 先从 Ledger 预留首个 execution model call，冻结
-  `RecoveryStartPermit`；目标 Activation 首轮 claim 到真实 action_id 后结算。
+  `RecoveryStartPermit`；目标 Activation 首轮 claim 到真实 action_id 后结算；
+  claim/settlement 在进程重启和 Attempt rollover 后仍可查询。
 
 因此“Run 预算耗尽”只允许来自共享 Ledger；Task-local 护栏必须使用
 `Activation ... budget exhausted`，不得再混用作用域名称。
 
-## 0.1 2026-08-23 实施状态
+## 0.2 2026-08-23 实施状态
 
 ### SWE-016 / SWE-017 边界修订
 
@@ -638,6 +673,7 @@ type RunContract struct {
     DeadlineAt          time.Time
     FinalizationReserve time.Duration
     RecoveryReserve     time.Duration
+    VerificationReserve time.Duration // v2 only
     BudgetProfile       string
 }
 ```
@@ -676,8 +712,8 @@ GraphDeadlineAt
 min(
   operation policy 上限,
   Attempt 剩余预算,
-  Activation 剩余预算 - RecoveryReserve,
-  Run 剩余预算 - FinalizationReserve
+  当前 phase 剩余窗口,
+  Run 剩余预算 - 后续 phase reserves
 )
 ```
 
@@ -694,6 +730,7 @@ InterventionAt       # 应进入收敛/上报的绝对时间
 HardDeadlineAt       # L4 必须停止的绝对时间
 FinalizationReserve  # 终态提交保留
 RecoveryReserve      # steer/replan/change 保留
+VerificationReserve  # acceptance/verification 保留（v2）
 ```
 
 兼容期可读取旧 `TimeoutSeconds` 作为 `ExpectedDuration`，不得继续暗示它是硬

@@ -82,6 +82,17 @@ func TestRecoveryRetryRejectedBeforeOutcomeWhenExecutionWindowClosed(t *testing.
 	}
 }
 
+func TestRecoveryRetryRejectedWhenExecutionWindowIsTooShort(t *testing.T) {
+	runtime, store, _ := recoveryDeltaFixture(t)
+	doc, _ := store.Get("g-recovery-delta")
+	now := doc.RunContract.PhaseStartDeadline(runcontract.PhaseExecution).Add(-14 * time.Second)
+	err := runtime.ValidateRecoveryRetryStart("g-recovery-delta", "recovery", "recovery@1", now)
+	if err == nil || !strings.Contains(err.Error(), RecoveryRetryUnstartableReasonCode) ||
+		!strings.Contains(err.Error(), "最小可执行窗口") {
+		t.Fatalf("不足一次最小调用窗口的 retry 必须在提交前拒绝: %v", err)
+	}
+}
+
 func TestRecoveryRetryRejectedWhenRunExecutionGrantUnavailable(t *testing.T) {
 	runtime, _, _ := recoveryDeltaFixture(t)
 	runtime.SetRunBudgetGate(rejectingRunBudgetGate{})
@@ -195,6 +206,66 @@ func TestRecoveryStartPermitIsDurableInputForNextActivation(t *testing.T) {
 	}
 }
 
+func TestRecoveryTerminalWithoutRetryCancelsPreparedStartPermit(t *testing.T) {
+	runtime, store, _ := recoveryDeltaFixture(t)
+	doc, _ := store.Get("g-recovery-delta")
+	authority, err := runbudget.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = authority.Close() })
+	if err := authority.InitializeRun(*doc.RunContract, runcontract.BudgetLimit{ModelCalls: 1}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.SetRunBudgetGate(authority)
+	partial := RecoveryDelta{ChangedDimensions: []string{"strategy"},
+		Strategy: "准备后改交 blocked", FirstRequiredAction: "none", ExpectedMilestone: "blocked"}
+	if _, err := runtime.BindRecoveryDeltaAuthority(doc.GraphID, "recovery", "recovery@1", partial); err != nil {
+		t.Fatal(err)
+	}
+	recovery := nodeOf(t, store, doc.GraphID, "recovery")
+	mustTerminal(t, runtime, TerminalFact{GraphID: doc.GraphID, NodeID: "recovery",
+		ActivationID: "recovery@1", TaskID: recovery.Execution.TaskID,
+		Status: NodeBlocked, Result: map[string]any{"decision": "blocked", "blocked_reason": "无可验证变化"}})
+	snapshot, ok, err := authority.Snapshot(doc.RunID)
+	if err != nil || !ok || snapshot.Reserved != (runcontract.BudgetUsage{}) {
+		t.Fatalf("recovery 未 retry 后 permit 未回收: snapshot=%+v ok=%v err=%v", snapshot, ok, err)
+	}
+}
+
+func TestRecoveryBindValidationFailureDoesNotReserveStartPermit(t *testing.T) {
+	runtime, store, _ := recoveryDeltaFixture(t)
+	doc, _ := store.Get("g-recovery-delta")
+	authority, err := runbudget.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = authority.Close() })
+	if err = authority.InitializeRun(*doc.RunContract, runcontract.BudgetLimit{ModelCalls: 1}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.SetRunBudgetGate(authority)
+	partial := RecoveryDelta{ChangedDimensions: []string{"strategy"},
+		Strategy: strings.Repeat("长", 601), FirstRequiredAction: "读取现有差异", ExpectedMilestone: "目标检查通过"}
+	if _, err = runtime.BindRecoveryDeltaAuthority(doc.GraphID, "recovery", "recovery@1", partial); err == nil ||
+		!strings.Contains(err.Error(), "strategy 超过 600 rune") {
+		t.Fatalf("超长 RecoveryDelta 必须被拒: %v", err)
+	}
+	snapshot, ok, err := authority.Snapshot(doc.RunID)
+	if err != nil || !ok || snapshot.Reserved != (runcontract.BudgetUsage{}) || snapshot.Settled.ModelCalls != 0 {
+		t.Fatalf("bind 校验失败前不得预留/伪消费 permit: snapshot=%+v ok=%v err=%v", snapshot, ok, err)
+	}
+	valid := RecoveryDelta{ChangedDimensions: []string{"strategy"},
+		Strategy: "收敛重试", FirstRequiredAction: "run_check verification", ExpectedMilestone: "验证通过"}
+	bound, err := runtime.BindRecoveryDeltaAuthority(doc.GraphID, "recovery", "recovery@1", valid)
+	if err != nil || bound.StartPermitRef == "" {
+		t.Fatalf("前一次参数校验失败不得烧掉修正后的 permit: bound=%+v err=%v", bound, err)
+	}
+	if err := authority.ValidateExecutionPermit(doc.RunID, bound.StartPermitRef, time.Now().UTC()); err != nil {
+		t.Fatalf("修正后 permit 应保持 active: %v", err)
+	}
+}
+
 func TestRecoveryDeltaRejectsAuthorityMismatch(t *testing.T) {
 	runtime, _, result := recoveryDeltaFixture(t)
 	delta := result["recovery_delta"].(map[string]any)
@@ -230,9 +301,78 @@ func TestRecoveryDeltaDefinitionChangeRequiresCurrentRevisionAdvance(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	foundDirective := false
 	for _, input := range replayed {
 		if input.TargetInput == "recovery_directive" {
-			t.Fatalf("Definition 已变化时不应重复注入 recovery_directive: %+v", replayed)
+			foundDirective = true
 		}
+	}
+	if !foundDirective {
+		t.Fatalf("Definition 已变化时仍须注入 permit/first-action recovery_directive: %+v", replayed)
+	}
+}
+
+func TestReplaceRecoveryDirectiveKeepsOnlyCurrentGeneration(t *testing.T) {
+	inputs := []InputBinding{
+		{TargetInput: "original", Summary: "业务输入"},
+		{SourceActivationID: "recovery@1", TargetInput: "recovery_directive", Summary: "旧指令"},
+		{TargetInput: "other", Summary: "其它输入"},
+	}
+	current := InputBinding{SourceActivationID: "recovery@2", TargetInput: "recovery_directive", Summary: "新指令"}
+	got := replaceRecoveryDirective(inputs, current)
+	count := 0
+	for _, input := range got {
+		if input.TargetInput != "recovery_directive" {
+			continue
+		}
+		count++
+		if input.SourceActivationID != "recovery@2" || input.Summary != "新指令" {
+			t.Fatalf("保留了非当前代 recovery_directive: %+v", input)
+		}
+	}
+	if count != 1 || len(got) != 3 {
+		t.Fatalf("recovery_directive 必须保持单值，实际 inputs=%+v", got)
+	}
+}
+
+func TestRecoveryDeltaV3RequiresReadFileFirstAction(t *testing.T) {
+	base := map[string]any{
+		"schema": RecoveryDeltaSchemaV3, "source_checkpoint_ref": "checkpoint",
+		"failure_fingerprint": "failure", "changed_dimensions": []any{"strategy"},
+		"strategy": "从目标读集直接进入 mutation", "expected_milestone": "形成补丁并检查",
+	}
+	base["first_action"] = map[string]any{"tool": "edit_file", "path": "src/a.py"}
+	if _, err := decodeRecoveryDelta(map[string]any{"recovery_delta": base}); err == nil ||
+		!strings.Contains(err.Error(), "必须是带 path 的 read_file") {
+		t.Fatalf("v3 直接复用旧 Activation edit authority 必须拒绝: %v", err)
+	}
+	base["first_action"] = map[string]any{"tool": "read_file", "path": "src/a.py"}
+	if _, err := decodeRecoveryDelta(map[string]any{"recovery_delta": base}); err != nil {
+		t.Fatalf("v3 合法首读应通过: %v", err)
+	}
+}
+
+func TestRecoveryDeltaV4RequiresCanonicalEvidenceContract(t *testing.T) {
+	base := map[string]any{
+		"schema": RecoveryDeltaSchemaV4, "source_checkpoint_ref": "checkpoint",
+		"failure_fingerprint": "failure", "changed_dimensions": []any{"strategy"},
+		"strategy": "完整覆盖后再决定是否编辑", "expected_milestone": "形成 typed change decision",
+		"first_action": map[string]any{"tool": "read_file", "path": "src/a.py"},
+	}
+	base["evidence_contract"] = map[string]any{"files": []any{"src/a.py", "src/b.py"}}
+	delta, err := decodeRecoveryDelta(map[string]any{"recovery_delta": base})
+	if err != nil || delta.EvidenceContract == nil || len(delta.EvidenceContract.Files) != 2 {
+		t.Fatalf("v4 合法 EvidenceContract 被拒绝: delta=%+v err=%v", delta, err)
+	}
+	base["evidence_contract"] = map[string]any{"files": []any{"src/b.py", "src/a.py"}}
+	if _, err := decodeRecoveryDelta(map[string]any{"recovery_delta": base}); err == nil ||
+		!strings.Contains(err.Error(), "files[0]") {
+		t.Fatalf("v4 首动作必须绑定首个 evidence 文件: %v", err)
+	}
+	base["evidence_contract"] = map[string]any{"files": []any{"../escape.py"}}
+	base["first_action"] = map[string]any{"tool": "read_file", "path": "../escape.py"}
+	if _, err := decodeRecoveryDelta(map[string]any{"recovery_delta": base}); err == nil ||
+		!strings.Contains(err.Error(), "逃逸") {
+		t.Fatalf("v4 evidence path 必须限制在项目相对根: %v", err)
 	}
 }

@@ -105,6 +105,7 @@ func cloneRunContract(src *runcontract.RunContract) *runcontract.RunContract {
 		return nil
 	}
 	dst := *src
+	dst.CheckContracts = append([]runcontract.CheckContract(nil), src.CheckContracts...)
 	return &dst
 }
 

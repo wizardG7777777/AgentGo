@@ -1,10 +1,13 @@
 package graph
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -15,7 +18,19 @@ var recoveryDimensions = map[string]struct{}{
 	"context": {}, "definition": {}, "model": {}, "tools": {}, "strategy": {}, "input": {},
 }
 
+var recoveryFirstActionTools = map[string]struct{}{
+	"read_file": {}, "list_dir": {}, "grep_search": {}, "glob_search": {},
+	"read_content_ref": {}, "write_file": {}, "edit_file": {}, "run_check": {},
+}
+
+var recoveryFirstActionPathTools = map[string]struct{}{
+	"read_file": {}, "list_dir": {}, "grep_search": {}, "glob_search": {},
+	"write_file": {}, "edit_file": {},
+}
+
 const RecoveryRetryUnstartableReasonCode = "recovery_retry_unstartable"
+
+const recoveryRetryMinimumExecutionWindow = 15 * time.Second
 
 // ValidateRecoveryRetryStart 在 recovery decision 提交前证明下一业务
 // Activation 仍可进入 execution phase。Recovery reserve 只供控制器裁决，
@@ -53,6 +68,10 @@ func validateRecoveryRetryStartAt(doc *GraphDocument, now time.Time) error {
 		return fmt.Errorf("reason_code=%s: 下一 execution Activation 不可启动: %w; allowed_decisions=[blocked]",
 			RecoveryRetryUnstartableReasonCode, err)
 	}
+	if remaining := doc.RunContract.PhaseStartRemaining(now, runcontract.PhaseExecution); remaining < recoveryRetryMinimumExecutionWindow {
+		return fmt.Errorf("reason_code=%s: 下一 execution Activation 仅剩 %s，小于最小可执行窗口 %s; allowed_decisions=[blocked]",
+			RecoveryRetryUnstartableReasonCode, remaining.Round(time.Second), recoveryRetryMinimumExecutionWindow)
+	}
 	return nil
 }
 
@@ -78,10 +97,22 @@ func (rt *Runtime) BindRecoveryDeltaAuthority(graphID, nodeID, activationID stri
 	if err != nil {
 		return RecoveryDelta{}, err
 	}
-	partial.Schema = RecoveryDeltaSchemaV1
+	schema := strings.TrimSpace(node.Metadata[MetadataRecoveryDeltaSchema])
+	if schema == "" {
+		schema = RecoveryDeltaSchemaV1
+	}
+	partial.Schema = schema
 	partial.SourceCheckpointRef, _ = authority["_checkpoint_ref"].(string)
 	partial.SourceObservationDeltaRef, _ = authority["_observation_delta_ref"].(string)
 	partial.FailureFingerprint, _ = authority["_failure_fingerprint"].(string)
+	// 先对模型可写字段和 framework source 做完整机械校验，
+	// 再预留唯一 RecoveryStartPermit。否则一次参数 typo 会先
+	// 创建后取消确定 permit，第二次正确调用因“已结算幂等”
+	// 无法重新激活，把可修正的 schema 错误升级为 unstartable。
+	bound, decodeErr := decodeRecoveryDelta(map[string]any{"recovery_delta": partial})
+	if decodeErr != nil {
+		return RecoveryDelta{}, decodeErr
+	}
 	if rt.runStartPermits != nil {
 		permitRef, permitErr := rt.runStartPermits.ReserveExecutionPermit(doc.RunID,
 			node.Execution.TaskID, activationID, time.Now().UTC(),
@@ -90,9 +121,9 @@ func (rt *Runtime) BindRecoveryDeltaAuthority(graphID, nodeID, activationID stri
 			return RecoveryDelta{}, fmt.Errorf("reason_code=%s: 预留 RecoveryStartPermit: %w",
 				RecoveryRetryUnstartableReasonCode, permitErr)
 		}
-		partial.StartPermitRef = permitRef
+		bound.StartPermitRef = permitRef
 	}
-	return decodeRecoveryDelta(map[string]any{"recovery_delta": partial})
+	return bound, nil
 }
 
 func decodeRecoveryDelta(result map[string]any) (RecoveryDelta, error) {
@@ -105,17 +136,80 @@ func decodeRecoveryDelta(result map[string]any) (RecoveryDelta, error) {
 		return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta 无法编码: %w", err)
 	}
 	var delta RecoveryDelta
-	if err := json.Unmarshal(data, &delta); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&delta); err != nil {
 		return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta 类型非法: %w", err)
 	}
-	if delta.Schema != RecoveryDeltaSchemaV1 || strings.TrimSpace(delta.SourceCheckpointRef) == "" ||
+	delta.Strategy = strings.TrimSpace(delta.Strategy)
+	delta.ExpectedMilestone = strings.TrimSpace(delta.ExpectedMilestone)
+	if (delta.Schema != RecoveryDeltaSchemaV1 && delta.Schema != RecoveryDeltaSchemaV2 && delta.Schema != RecoveryDeltaSchemaV3 && delta.Schema != RecoveryDeltaSchemaV4) ||
+		strings.TrimSpace(delta.SourceCheckpointRef) == "" ||
 		strings.TrimSpace(delta.FailureFingerprint) == "" || len(delta.ChangedDimensions) == 0 ||
-		strings.TrimSpace(delta.Strategy) == "" || strings.TrimSpace(delta.FirstRequiredAction) == "" ||
-		strings.TrimSpace(delta.ExpectedMilestone) == "" {
-		return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta 缺少 schema/source/fingerprint/dimensions/strategy/action/milestone")
+		strings.TrimSpace(delta.Strategy) == "" || strings.TrimSpace(delta.ExpectedMilestone) == "" {
+		return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta 缺少 schema/source/fingerprint/dimensions/strategy/milestone")
+	}
+	switch delta.Schema {
+	case RecoveryDeltaSchemaV1:
+		delta.FirstRequiredAction = strings.TrimSpace(delta.FirstRequiredAction)
+		if strings.TrimSpace(delta.FirstRequiredAction) == "" || delta.FirstAction != nil || delta.EvidenceContract != nil {
+			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v1 必须且只能携带 first_required_action")
+		}
+	case RecoveryDeltaSchemaV2, RecoveryDeltaSchemaV3, RecoveryDeltaSchemaV4:
+		if strings.TrimSpace(delta.FirstRequiredAction) != "" || delta.FirstAction == nil {
+			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v2+ 必须且只能携带 first_action")
+		}
+		delta.FirstAction.Tool = strings.TrimSpace(delta.FirstAction.Tool)
+		delta.FirstAction.Path = strings.TrimSpace(delta.FirstAction.Path)
+		if _, ok := recoveryFirstActionTools[delta.FirstAction.Tool]; !ok {
+			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v2 first_action.tool=%q 非法", delta.FirstAction.Tool)
+		}
+		_, pathRequired := recoveryFirstActionPathTools[delta.FirstAction.Tool]
+		if pathRequired && delta.FirstAction.Path == "" {
+			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v2 first_action.tool=%q 必须携带 path", delta.FirstAction.Tool)
+		}
+		if !pathRequired && delta.FirstAction.Path != "" {
+			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v2 first_action.tool=%q 不接受 path", delta.FirstAction.Tool)
+		}
+		if len([]rune(delta.FirstAction.Path)) > 1024 {
+			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v2+ first_action.path 过长")
+		}
+		// v3 是 code-change recovery 的机械 handoff：先在当前 Task 建立目标
+		// 文件读集，再由 L3 强制 mutation 与 typed check。它故意不接受直接
+		// edit，避免把前一 Activation 的 read authority 错当成新 Task 的读集。
+		if (delta.Schema == RecoveryDeltaSchemaV3 || delta.Schema == RecoveryDeltaSchemaV4) && delta.FirstAction.Tool != "read_file" {
+			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v3+ first_action 必须是带 path 的 read_file")
+		}
+		if delta.Schema != RecoveryDeltaSchemaV4 {
+			if delta.EvidenceContract != nil {
+				return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v2-v3 不接受 evidence_contract")
+			}
+			break
+		}
+		if delta.EvidenceContract == nil || len(delta.EvidenceContract.Files) == 0 ||
+			len(delta.EvidenceContract.Files) > MaxRecoveryEvidenceFiles {
+			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v4 evidence_contract.files 必须有 1..%d 项", MaxRecoveryEvidenceFiles)
+		}
+		seenFiles := make(map[string]struct{}, len(delta.EvidenceContract.Files))
+		for index, rawPath := range delta.EvidenceContract.Files {
+			path, pathErr := CanonicalRecoveryEvidencePath(rawPath)
+			if pathErr != nil {
+				return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v4 evidence_contract.files[%d]: %w", index, pathErr)
+			}
+			if _, duplicate := seenFiles[path]; duplicate {
+				return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v4 evidence_contract.files 重复 %q", path)
+			}
+			seenFiles[path] = struct{}{}
+			delta.EvidenceContract.Files[index] = path
+		}
+		firstPath, pathErr := CanonicalRecoveryEvidencePath(delta.FirstAction.Path)
+		if pathErr != nil || firstPath != delta.EvidenceContract.Files[0] {
+			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v4 first_action.path 必须等于 evidence_contract.files[0]")
+		}
+		delta.FirstAction.Path = firstPath
 	}
 	seen := make(map[string]struct{}, len(delta.ChangedDimensions))
-	for _, dimension := range delta.ChangedDimensions {
+	for index, dimension := range delta.ChangedDimensions {
 		dimension = strings.TrimSpace(dimension)
 		if _, ok := recoveryDimensions[dimension]; !ok {
 			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta changed_dimensions 含非法值 %q", dimension)
@@ -124,11 +218,14 @@ func decodeRecoveryDelta(result map[string]any) (RecoveryDelta, error) {
 			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta changed_dimensions 重复 %q", dimension)
 		}
 		seen[dimension] = struct{}{}
+		delta.ChangedDimensions[index] = dimension
 	}
-	for name, value := range map[string]string{
-		"strategy": delta.Strategy, "first_required_action": delta.FirstRequiredAction,
-		"expected_milestone": delta.ExpectedMilestone,
-	} {
+	sort.Strings(delta.ChangedDimensions)
+	bounded := map[string]string{"strategy": delta.Strategy, "expected_milestone": delta.ExpectedMilestone}
+	if delta.Schema == RecoveryDeltaSchemaV1 {
+		bounded["first_required_action"] = delta.FirstRequiredAction
+	}
+	for name, value := range bounded {
 		if len([]rune(value)) > 600 {
 			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta %s 超过 600 rune", name)
 		}
@@ -148,12 +245,16 @@ func (rt *Runtime) validateRecoveryRetryContract(graphID string, doc *GraphDocum
 	if err := validateRecoveryRetryStartAt(doc, time.Now().UTC()); err != nil {
 		return err
 	}
-	if node.Metadata[MetadataRecoveryDeltaSchema] != RecoveryDeltaSchemaV1 {
+	if schema := node.Metadata[MetadataRecoveryDeltaSchema]; schema != RecoveryDeltaSchemaV1 && schema != RecoveryDeltaSchemaV2 && schema != RecoveryDeltaSchemaV3 && schema != RecoveryDeltaSchemaV4 {
 		return fmt.Errorf("graph: recovery_delta_schema=%q 不受支持", node.Metadata[MetadataRecoveryDeltaSchema])
 	}
 	delta, err := decodeRecoveryDelta(result)
 	if err != nil {
 		return err
+	}
+	if delta.Schema != node.Metadata[MetadataRecoveryDeltaSchema] {
+		return fmt.Errorf("graph: recovery_delta schema=%q 与冻结 metadata=%q 不一致",
+			delta.Schema, node.Metadata[MetadataRecoveryDeltaSchema])
 	}
 	if rt.runStartPermits != nil {
 		if strings.TrimSpace(delta.StartPermitRef) == "" {
@@ -200,6 +301,25 @@ func (rt *Runtime) validateRecoveryRetryContract(graphID string, doc *GraphDocum
 		return err
 	}
 	return nil
+}
+
+// CanonicalRecoveryEvidencePath 校验 v4 evidence/change decision 使用的项目内
+// 逻辑路径。Runtime 工具仍会在实际读取/写入时执行 pathutil 的物理根边界检查；
+// 这里负责冻结 wire 的跨平台相对路径语义。
+func CanonicalRecoveryEvidencePath(raw string) (string, error) {
+	value := strings.TrimSpace(strings.ReplaceAll(raw, "\\", "/"))
+	if value == "" || strings.ContainsAny(value, "\r\n") || strings.HasPrefix(value, "/") ||
+		filepath.IsAbs(value) || filepath.VolumeName(value) != "" {
+		return "", fmt.Errorf("path 必须是项目内相对路径")
+	}
+	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(value)))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", fmt.Errorf("path 不得逃逸项目根")
+	}
+	if len([]rune(clean)) > 1024 {
+		return "", fmt.Errorf("path 过长")
+	}
+	return clean, nil
 }
 
 func recoveryFailureInput(execution Execution) (InputBinding, error) {

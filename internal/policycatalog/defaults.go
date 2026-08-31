@@ -46,6 +46,7 @@ func defaultReplayProfiles() ([]ReplayProfile, error) {
 		makePolicy(ReplayOpenAICompatibleV1, 1, false),
 		makePolicy(ReplayOpenAICompatibleV2, 2, false),
 		makePolicy(ReplayOpenAICompatibleV3, 3, true),
+		makePolicy(ReplayOpenAICompatibleV4, 4, true),
 	}
 	profiles := make([]ReplayProfile, 0, len(policies))
 	for _, policy := range policies {
@@ -147,6 +148,15 @@ func defaultContextProfiles() ([]ContextProfile, error) {
 			systemSectionBytes: 4 << 20, systemSectionTokens: 966_656,
 			reasoningBytes: 512 << 10, reasoningTokens: 65_536,
 		},
+		{
+			ref: ContextDefaultV10, replayRef: ReplayOpenAICompatibleV4, version: 10,
+			// v10 恢复普通 Fragment 的稳定类型上限。模型能力只调整一次
+			// Snapshot 的绝对输入预算、completion reserve 与 RequiredExact
+			// provider replay 容器，不能再把一次普通 read/prompt 放大到完整窗口。
+			promptComponentBytes: 64 << 10, promptComponentTokens: 16 << 10,
+			systemSectionBytes: 96 << 10, systemSectionTokens: 24 << 10,
+			reasoningBytes: 512 << 10, reasoningTokens: 65_536,
+		},
 	}
 	profiles := make([]ContextProfile, 0, len(specs))
 	for _, spec := range specs {
@@ -220,7 +230,7 @@ func defaultContextProfile(spec contextPolicySpec) (ContextProfile, error) {
 	}, nil
 }
 
-// AdaptContextPolicyForModel 把 v9 的规则按冻结模型能力展开。旧 policy 的数值
+// AdaptContextPolicyForModel 把 v9+ 的规则按冻结模型能力展开。旧 policy 的数值
 // 属于历史 digest，必须原样返回。
 func AdaptContextPolicyForModel(policy contextcontract.ContextBudgetPolicy, windowTokens, completionTokens int64) contextcontract.ContextBudgetPolicy {
 	if policy.Version < 9 || windowTokens <= 0 || completionTokens <= 0 || windowTokens <= completionTokens+(16<<10) {
@@ -241,6 +251,26 @@ func adaptiveContextPolicy(policy contextcontract.ContextBudgetPolicy, windowTok
 	policy.ModelContextWindow = &contextcontract.Budget{SerializedBytes: windowBytes, EstimatedTokens: windowTokens}
 	policy.ProtocolOverheadReserve = &contextcontract.Budget{SerializedBytes: overheadBytes, EstimatedTokens: overheadTokens}
 	policy.AbsoluteWireByteLimit = windowBytes
+	if policy.Version >= 10 {
+		// v10 只扩展 RequiredExact provider 状态的可表示容器。普通 Fragment、
+		// tool exchange 与 section cap 保持 catalog 中的稳定类型上限。
+		for _, kind := range []contextcontract.FragmentKind{
+			contextcontract.FragmentAssistantReasoning,
+			contextcontract.FragmentAssistantResponseItems,
+		} {
+			if rule, ok := policy.FragmentRules[kind]; ok {
+				rule.MaxSerializedBytes = completionBytes
+				rule.MaxEstimatedTokens = completionTokens
+				policy.FragmentRules[kind] = rule
+			}
+		}
+		if rule, ok := policy.AtomicGroupRules[contextcontract.AtomicAssistantProviderReplay]; ok {
+			rule.MaxSerializedBytes = completionBytes
+			rule.MaxEstimatedTokens = completionTokens
+			policy.AtomicGroupRules[contextcontract.AtomicAssistantProviderReplay] = rule
+		}
+		return policy
+	}
 	for kind, rule := range policy.FragmentRules {
 		rule.MaxSerializedBytes = inputBytes
 		rule.MaxEstimatedTokens = inputTokens
@@ -388,10 +418,12 @@ func defaultProgressProfiles() ([]ProgressProfile, error) {
 		progressCodeChangeV3(),
 		progressCodeChangeV4(),
 		progressCodeChangeV5(),
+		progressCodeChangeV6(),
 		progressInvestigation(),
 		progressInvestigationV2(),
 		progressVerification(),
 		progressVerificationV2(),
+		progressVerificationV3(),
 		progressCoordination(),
 		progressCoordinationV2(),
 		progressFinalReport(),
@@ -489,6 +521,22 @@ func progressCodeChangeV5() loopcontract.CompiledProgressContract {
 	return contract
 }
 
+func progressCodeChangeV6() loopcontract.CompiledProgressContract {
+	contract := progressCodeChangeV5()
+	contract.Ref = loopcontract.ProgressContractRef{
+		ContractID: ProgressCodeChangeV6, PolicyRef: "bounded_code_change/v6",
+	}
+	contract.Policy.PolicyRef = "bounded_code_change/v6"
+	contract.Policy.KnowledgeCheckpointAfterTurns = 6
+	contract.Policy.DecisionCheckpointAfterTurns = 6
+	contract.Policy.MaxObservationStagnation = 0
+	contract.Policy.MaxDecisionStagnation = 2
+	contract.Policy.MaxControlContractFailures = 2
+	contract.Policy.MaxExplorationTurns = 24
+	contract.Policy.FirstDeliverableHandoffReserve = 5 * time.Minute
+	return contract
+}
+
 func progressInvestigation() loopcontract.CompiledProgressContract {
 	return loopcontract.CompiledProgressContract{
 		Schema: loopcontract.CompiledSchemaV1,
@@ -568,6 +616,20 @@ func progressVerificationV2() loopcontract.CompiledProgressContract {
 		loopcontract.ProgressSignalRule{Kind: loopcontract.SignalObservationStateAdvanced, IdentityScope: "**"})
 	contract.Policy.MaxNoProgressUsage.PromptTokens = 0
 	contract.Policy.MaxNoProgressUsage.CompletionTokens = 0
+	return contract
+}
+
+func progressVerificationV3() loopcontract.CompiledProgressContract {
+	contract := progressVerificationV2()
+	contract.Ref = loopcontract.ProgressContractRef{
+		ContractID: ProgressVerificationV3, PolicyRef: "bounded_verification/v3",
+	}
+	contract.Policy.PolicyRef = "bounded_verification/v3"
+	// Verifier 只消费 frozen patch/artifact/check；四个新知识 turn 后进入
+	// exact submit，不能把 verification reserve 用作第二次无界调查。
+	contract.Policy.MaxExplorationTurns = 4
+	contract.Policy.KnowledgeCheckpointAfterTurns = 0
+	contract.Policy.MaxObservationStagnation = 0
 	return contract
 }
 

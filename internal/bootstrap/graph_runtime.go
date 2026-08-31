@@ -24,7 +24,9 @@ import (
 	"time"
 
 	"agentgo/internal/agent"
+	"agentgo/internal/checkstore"
 	"agentgo/internal/config"
+	"agentgo/internal/delivery"
 	"agentgo/internal/effect"
 	"agentgo/internal/graph"
 	"agentgo/internal/loopcontract"
@@ -36,7 +38,111 @@ import (
 	"agentgo/internal/store"
 	"agentgo/internal/taskcontract"
 	"agentgo/internal/trace"
+	"agentgo/internal/workspace"
 )
+
+// workspaceDeliveryCommitter 是 Graph v3 的 L5 promotion 适配器。Effect
+// prepared 未 settled 时一律返回 unknown，绝不因为再次 pass 自动重跑。
+type workspaceDeliveryCommitter struct {
+	manager *workspace.Manager
+	journal *effect.Journal
+	store   *delivery.Store
+}
+
+func (c workspaceDeliveryCommitter) CommitDelivery(ctx context.Context, deliveryID, acceptanceOutcomeRef string) (string, error) {
+	if c.manager == nil || c.journal == nil || c.store == nil {
+		return "", fmt.Errorf("Delivery commit 缺少 workspace manager/effect journal/delivery store")
+	}
+	tx, ok, err := c.store.Get(deliveryID)
+	if err != nil || !ok || tx.Candidate == nil {
+		return "", fmt.Errorf("Delivery %s 缺少 frozen transaction/candidate: ok=%t err=%v", deliveryID, ok, err)
+	}
+	workspaceID := workspace.DeliveryWorkspaceID(deliveryID)
+	for _, existing := range c.journal.Query(deliveryID) {
+		if existing.Kind != effect.KindWorkspaceMerge || existing.Target != deliveryID {
+			continue
+		}
+		if existing.Status == effect.StatusSettled {
+			if tx.Status == delivery.StatusCommitPrepared {
+				commitRef := "delivery-commit:" + existing.ID
+				if _, err := c.store.Commit(deliveryID, existing.ID, commitRef, time.Now().UTC()); err != nil {
+					return "", fmt.Errorf("恢复 settled Delivery transaction: %w", err)
+				}
+			}
+			return "delivery-commit:" + existing.ID, nil
+		}
+		if tx.Status == delivery.StatusCommitPrepared {
+			_, _ = c.store.CommitUnknown(deliveryID, existing.ID, time.Now().UTC())
+		}
+		return "", fmt.Errorf("Delivery %s 存在未确认 promotion effect=%s status=%s，禁止自动重放", deliveryID, existing.ID, existing.Status)
+	}
+	currentCandidate, err := c.manager.FreezeCandidate(deliveryID, workspaceID, tx.Candidate.WorkspaceRevisionRef)
+	if err != nil {
+		return "", fmt.Errorf("Delivery %s promotion 前重算 candidate: %w", deliveryID, err)
+	}
+	if currentCandidate.Ref != tx.Candidate.Ref || currentCandidate.PatchDigest != tx.Candidate.PatchDigest ||
+		currentCandidate.ManifestDigest != tx.Candidate.ManifestDigest {
+		_, _ = c.store.Quarantine(deliveryID, "candidate_changed_after_freeze", time.Now().UTC())
+		return "", fmt.Errorf("Delivery %s candidate 在验收期发生变化，已隔离且禁止 promotion", deliveryID)
+	}
+	sum := sha256.Sum256([]byte(deliveryID))
+	e := effect.Effect{TaskID: deliveryID, AgentID: "graph-l5", Kind: effect.KindWorkspaceMerge,
+		Target: deliveryID, ArgsDigest: fmt.Sprintf("%x", sum[:])[:12], Policy: effect.PolicyNeverReplay}
+	if err := c.journal.Prepare(&e); err != nil {
+		return "", fmt.Errorf("记录 delivery_commit_intent: %w", err)
+	}
+	if _, err := c.store.PrepareCommit(deliveryID, acceptanceOutcomeRef, e.ID, time.Now().UTC()); err != nil {
+		_ = c.journal.MarkUnknown(e.ID, "Delivery transaction commit_prepared 落账失败: "+err.Error())
+		_, _ = c.store.Quarantine(deliveryID, "commit_prepared authority 失败", time.Now().UTC())
+		return "", fmt.Errorf("记录 Delivery commit_prepared: %w", err)
+	}
+	merged, err := c.manager.MergeTask(ctx, workspaceID, "graph-l5")
+	if err != nil || merged == nil || merged.Conflicted {
+		reason := ""
+		if err != nil {
+			reason = err.Error()
+		} else {
+			reason = "workspace merge conflict"
+		}
+		if markErr := c.journal.MarkUnknown(e.ID, reason); markErr != nil {
+			return "", fmt.Errorf("Delivery promotion 未确认且 unknown 落账失败: %w", markErr)
+		}
+		if _, txErr := c.store.CommitUnknown(deliveryID, e.ID, time.Now().UTC()); txErr != nil {
+			return "", fmt.Errorf("Delivery promotion unknown 落账失败: %w", txErr)
+		}
+		return "", fmt.Errorf("Delivery promotion 未提交: %s", reason)
+	}
+	if err := c.journal.Settle(e.ID, fmt.Sprintf("files=%d", len(merged.Reports))); err != nil {
+		_, _ = c.store.CommitUnknown(deliveryID, e.ID, time.Now().UTC())
+		return "", fmt.Errorf("Delivery promotion 可能已发生但 settle 落账失败: %w", err)
+	}
+	commitRef := "delivery-commit:" + e.ID
+	if _, err := c.store.Commit(deliveryID, e.ID, commitRef, time.Now().UTC()); err != nil {
+		return "", fmt.Errorf("Delivery promotion 已结算但 transaction commit 失败: %w", err)
+	}
+	if err := c.manager.Cleanup(workspaceID); err != nil {
+		log.Printf("[graph] Delivery %s 已提交但候选清理失败（交 retention 清扫）: %v", deliveryID, err)
+	}
+	return commitRef, nil
+}
+
+func (c workspaceDeliveryCommitter) QuarantineDelivery(_ context.Context, deliveryID, reason string) error {
+	if c.store == nil {
+		return fmt.Errorf("Delivery quarantine 缺少 DeliveryStore")
+	}
+	tx, ok, err := c.store.Get(deliveryID)
+	if err != nil || !ok {
+		return fmt.Errorf("Delivery %s 不存在: ok=%t err=%v", deliveryID, ok, err)
+	}
+	if tx.Status == delivery.StatusQuarantined {
+		return nil
+	}
+	if tx.Status == delivery.StatusCommitted || tx.Status == delivery.StatusCommitUnknown {
+		return fmt.Errorf("Delivery %s status=%s 不得改写为 quarantined", deliveryID, tx.Status)
+	}
+	_, err = c.store.Quarantine(deliveryID, reason, time.Now().UTC())
+	return err
+}
 
 // ============================================================
 // graphBoard —— graph.TaskBoard 的公告板实现
@@ -61,6 +167,7 @@ type graphBoard struct {
 	// 个任务当作“从未执行”重发；settled 只证明某个副作用发生，不证明任务完成。
 	effectJournal    *effect.Journal
 	outcomeAuthority *graphTaskOutcomeAuthority
+	deliveries       *delivery.Store
 
 	mu sync.Mutex
 	// byActivation 是 (graphID \x00 activationID) → taskID 的进程内索引，
@@ -175,9 +282,11 @@ func (b *graphBoard) PublishGraphTask(spec graph.TaskSpec) (string, error) {
 		GraphID:                      spec.GraphID,
 		NodeID:                       spec.NodeID,
 		ActivationID:                 spec.ActivationID,
+		DeliveryID:                   spec.DeliveryID,
 		GraphNodeKind:                string(spec.NodeKind),
 		GraphControllerRole:          string(spec.ControllerRole),
 		RecoverySourceTaskID:         spec.RecoverySourceTaskID,
+		GraphRecoveryDeltaSchema:     spec.RecoveryDeltaSchema,
 		GraphDefinitionDigestVersion: spec.DefinitionDigestVersion,
 		RouteScope:                   model.GraphRouteScope(spec.GraphID),
 	}
@@ -206,6 +315,9 @@ func (b *graphBoard) PublishGraphTask(spec graph.TaskSpec) (string, error) {
 	// 显式冻结 execution；此时缺失的其它字段仍由 Store fail-closed。
 	if task.RunID != "" || task.RunContract != nil || task.ProgressContract != nil || task.ContextPolicyRef != "" {
 		task.RunPhase = runcontract.PhaseExecution
+		if spec.NodeKind == graph.KindAcceptance && task.RunContract != nil && task.RunContract.Schema == runcontract.SchemaV2 {
+			task.RunPhase = runcontract.PhaseVerification
+		}
 		if spec.ControllerRole == graph.ControllerRoleLoopRecovery {
 			task.RunPhase = runcontract.PhaseRecovery
 		}
@@ -216,6 +328,9 @@ func (b *graphBoard) PublishGraphTask(spec graph.TaskSpec) (string, error) {
 			task.Capability.Isolation = &model.IsolationSpec{Mode: spec.Isolation}
 		}
 	}
+	if err := b.prepareDeliveryTask(spec); err != nil {
+		return "", err
+	}
 	if err := b.store.PublishTask(task); err != nil {
 		return "", fmt.Errorf("发布图任务（图 %s 节点 %s activation %s）失败: %w",
 			spec.GraphID, spec.NodeID, spec.ActivationID, err)
@@ -224,6 +339,46 @@ func (b *graphBoard) PublishGraphTask(spec graph.TaskSpec) (string, error) {
 	b.byActivation[key] = task.ID
 	b.mu.Unlock()
 	return task.ID, nil
+}
+
+func (b *graphBoard) prepareDeliveryTask(spec graph.TaskSpec) error {
+	if strings.TrimSpace(spec.DeliveryID) == "" {
+		return nil
+	}
+	if b.deliveries == nil {
+		return fmt.Errorf("发布 Graph v3 任务缺少 DeliveryStore")
+	}
+	tx, ok, err := b.deliveries.Get(spec.DeliveryID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		if spec.NodeKind != graph.KindAgent || spec.FulfillmentContract == nil ||
+			!spec.FulfillmentContract.RequireWorkspaceChange {
+			return fmt.Errorf("Delivery %s 尚未由 mutating producer 创建", spec.DeliveryID)
+		}
+		_, err = b.deliveries.EnsureOpen(delivery.Transaction{Schema: delivery.SchemaV1,
+			ID: spec.DeliveryID, RunID: string(spec.RunID), GraphID: spec.GraphID,
+			ProducerActivationID: spec.ActivationID, Status: delivery.StatusOpen, UpdatedAt: time.Now().UTC()})
+		return err
+	}
+	if tx.RunID != string(spec.RunID) || tx.GraphID != spec.GraphID {
+		return fmt.Errorf("Delivery %s 与 Graph Task 身份不一致", spec.DeliveryID)
+	}
+	switch spec.NodeKind {
+	case graph.KindAcceptance:
+		if tx.Status == delivery.StatusPrepared {
+			_, err = b.deliveries.BeginVerification(spec.DeliveryID, time.Now().UTC())
+		} else if tx.Status != delivery.StatusVerifying {
+			err = fmt.Errorf("Delivery %s status=%s 不能发布 acceptance", spec.DeliveryID, tx.Status)
+		}
+	case graph.KindAgent:
+		if spec.ActivationID != tx.ProducerActivationID &&
+			(tx.Status == delivery.StatusPrepared || tx.Status == delivery.StatusVerifying) {
+			_, err = b.deliveries.BeginRepair(spec.DeliveryID, time.Now().UTC())
+		}
+	}
+	return err
 }
 
 // validateExistingGraphTaskKind 校验同 activation 的已发布 Task 没有被另一种
@@ -249,6 +404,10 @@ func validateExistingGraphTaskKind(task *model.Task, spec graph.TaskSpec) error 
 		return fmt.Errorf("图任务 %s/%s 的已持久化 controller_role/source=(%s,%s)，与当前冻结定义=(%s,%s) 不一致",
 			spec.GraphID, spec.ActivationID, task.GraphControllerRole, task.RecoverySourceTaskID,
 			spec.ControllerRole, spec.RecoverySourceTaskID)
+	}
+	if task.GraphRecoveryDeltaSchema != "" && task.GraphRecoveryDeltaSchema != spec.RecoveryDeltaSchema {
+		return fmt.Errorf("图任务 %s/%s 的已持久化 recovery_delta_schema=%s，与当前冻结定义=%s 不一致",
+			spec.GraphID, spec.ActivationID, task.GraphRecoveryDeltaSchema, spec.RecoveryDeltaSchema)
 	}
 	return nil
 }
@@ -1191,8 +1350,10 @@ func (r *graphFeedReactor) failTerminalWriteback(task *model.Task, fact graph.Te
 // 终态证据组装（数据流 EvidenceEntry）
 // ============================================================
 
-// evidenceMaxEntries 是单次终态随 TerminalFact 携带的证据条目上限；
-// 超限时追加一条截断标记条目，不让超大调用历史无界进入图 journal。
+// evidenceMaxEntries 是单次终态随 TerminalFact 携带的 raw
+// ToolCall 证据条目上限；超限时追加截断标记。Artifact
+// 和 fulfillment 实际引用的 typed CheckRecord 是合同证据，
+// 必须全部进谱系，不与探索调用争抢该展示额度。
 const evidenceMaxEntries = 64
 
 // assembleTaskEvidence 把终态任务的可观察事实组装为数据流证据条目：
@@ -1213,6 +1374,12 @@ func assembleTaskEvidence(s store.TaskStore, task *model.Task) []graph.EvidenceE
 }
 
 func assembleTaskEvidenceFromCalls(task *model.Task, calls []store.ToolCallRecord) []graph.EvidenceEntry {
+	return assembleTaskEvidenceFromCallsAndChecks(task, calls, nil)
+}
+
+func assembleTaskEvidenceFromCallsAndChecks(task *model.Task, calls []store.ToolCallRecord,
+	checks []checkstore.Record,
+) []graph.EvidenceEntry {
 	if task == nil {
 		return nil
 	}
@@ -1240,15 +1407,19 @@ func assembleTaskEvidenceFromCalls(task *model.Task, calls []store.ToolCallRecor
 			continue
 		}
 		seen[ref] = struct{}{}
-		if len(out) >= evidenceMaxEntries {
-			truncatedTotal++
-			continue
-		}
 		path, pathTruncated := boundedEvidenceValue(artifact, graph.EvidencePathMaxRunes)
 		out = append(out, graph.EvidenceEntry{
 			Ref: ref, Kind: "artifact", Summary: evidenceArtifactSummary(task, artifact),
 			Path: path, PathTruncated: pathTruncated,
 		})
+	}
+	for _, check := range checks {
+		ref := evidenceCheckRef(task.ID, check)
+		if _, duplicate := seen[ref]; duplicate {
+			continue
+		}
+		seen[ref] = struct{}{}
+		out = append(out, evidenceCheckEntry(ref, check))
 	}
 	if truncatedTotal > 0 {
 		out = append(out, graph.EvidenceEntry{
@@ -1258,6 +1429,25 @@ func assembleTaskEvidenceFromCalls(task *model.Task, calls []store.ToolCallRecor
 		})
 	}
 	return out
+}
+
+func evidenceCheckRef(taskID string, record checkstore.Record) string {
+	return stableEvidenceRef(taskID, "check", record.CheckRef)
+}
+
+func evidenceCheckEntry(ref string, record checkstore.Record) graph.EvidenceEntry {
+	passed := record.Status == checkstore.StatusPass
+	exit := record.ExitCode
+	summary, _ := boundedEvidenceValue(fmt.Sprintf(
+		"CheckRecord: id=%s kind=%s status=%s exit=%d workspace=%s",
+		record.CheckID, record.Kind, record.Status, record.ExitCode, record.WorkspaceRevisionRef),
+		graph.EvidenceSummaryMaxRunes)
+	return graph.EvidenceEntry{
+		Ref: ref, Kind: "check", Summary: summary, Success: &passed, ExitCode: &exit,
+		ExitCodeScope: record.ExitCodeScope, CheckRef: record.CheckRef,
+		CheckID: record.CheckID, CheckKind: record.Kind, CheckStatus: string(record.Status),
+		WorkspaceRevisionRef: record.WorkspaceRevisionRef, OutputRef: record.OutputRef,
+	}
 }
 
 func evidenceCallEntry(ref string, call store.ToolCallRecord) graph.EvidenceEntry {
@@ -1520,12 +1710,18 @@ func wireGraphRuntimeWithPolicies(cfg *config.Config, taskStore store.TaskStore,
 	effectJournal *effect.Journal, policies *policycatalog.Catalog, sessionIDProvider func() string,
 	recoveryQuarantine ...map[string]string) (*graph.Store, *graph.Runtime, error) {
 	return wireGraphRuntimeWithOutcome(cfg, taskStore, reactorReg, effectJournal, policies,
-		sessionIDProvider, nil, nil, recoveryQuarantine...)
+		sessionIDProvider, nil, nil, nil, recoveryQuarantine...)
+}
+
+type graphRuntimeAuthorities struct {
+	workspaces *workspace.Manager
+	checks     *checkstore.Store
+	deliveries *delivery.Store
 }
 
 func wireGraphRuntimeWithOutcome(cfg *config.Config, taskStore store.TaskStore, reactorReg *reactor.Registry,
 	effectJournal *effect.Journal, policies *policycatalog.Catalog, sessionIDProvider func() string,
-	outcomes *outcomestore.Store, checkpoints taskCheckpointReader,
+	outcomes *outcomestore.Store, checkpoints taskCheckpointReader, authorities *graphRuntimeAuthorities,
 	recoveryQuarantine ...map[string]string) (*graph.Store, *graph.Runtime, error) {
 	dir := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "graphs")
 	gs, err := graph.NewStore(dir)
@@ -1547,9 +1743,17 @@ func wireGraphRuntimeWithOutcome(cfg *config.Config, taskStore store.TaskStore, 
 		})
 	}
 	board := newGraphBoardWithPolicies(taskStore, effectJournal, policies, recoveryQuarantine...)
+	if authorities != nil {
+		board.deliveries = authorities.deliveries
+	}
 	var outcomeAuthority *graphTaskOutcomeAuthority
 	if outcomes != nil {
 		outcomeAuthority = newGraphTaskOutcomeAuthority(gs, outcomes, checkpoints)
+		if authorities != nil {
+			outcomeAuthority.candidates = authorities.workspaces
+			outcomeAuthority.deliveries = authorities.deliveries
+			outcomeAuthority.checks = authorities.checks
+		}
 		board.outcomeAuthority = outcomeAuthority
 		if err := store.SetTerminalOutcomeCoordinator(taskStore, outcomeAuthority); err != nil {
 			_ = gs.Close()
@@ -1560,7 +1764,11 @@ func wireGraphRuntimeWithOutcome(cfg *config.Config, taskStore store.TaskStore, 
 	rt.SetSessionIDProvider(sessionIDProvider)
 	// 上游工作记录（2026-08-21 上游摘要）：转移结算时按来源 Task ID 聚合
 	// ToolCallRecord 并随 EdgeInput 冻结；下游任务发布只读冻结文本。
-	rt.SetWorkLogProvider(newGraphWorkLogProvider(taskStore))
+	if authorities != nil && authorities.checks != nil {
+		rt.SetWorkLogProvider(newGraphWorkLogProvider(taskStore, authorities.checks))
+	} else {
+		rt.SetWorkLogProvider(newGraphWorkLogProvider(taskStore))
+	}
 	// 上面的 gs.Recover 只负责把历史图从磁盘读回内存。2026-08 起启动永远是
 	// 全新 Session 且进入会话不自动续跑：会话模式下全部历史图（含无归属
 	// 图，以及 --resume 会话自己的图）一次性停驻——吞终态事件、停 wait

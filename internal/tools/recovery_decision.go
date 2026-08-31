@@ -37,7 +37,24 @@ func (g PlanControlGroup) submitRecoveryDecision(ctx context.Context, args map[s
 		}
 		partial := graph.RecoveryDelta{ChangedDimensions: dimensions}
 		partial.Strategy, _ = args["strategy"].(string)
-		partial.FirstRequiredAction, _ = args["first_required_action"].(string)
+		firstAction, ok := args["first_action"].(map[string]any)
+		if !ok {
+			return "", fmt.Errorf("decision=retry 必须填写 first_action object")
+		}
+		partial.FirstAction = &graph.RecoveryFirstAction{}
+		partial.FirstAction.Tool, _ = firstAction["tool"].(string)
+		partial.FirstAction.Path, _ = firstAction["path"].(string)
+		if task.GraphRecoveryDeltaSchema == graph.RecoveryDeltaSchemaV4 {
+			files := []string{partial.FirstAction.Path}
+			if rawContract, supplied := args["evidence_contract"].(map[string]any); supplied {
+				var ok bool
+				files, ok = stringSlice(rawContract["files"])
+				if !ok || len(files) == 0 {
+					return "", fmt.Errorf("evidence_contract.files 必须是非空 string 数组")
+				}
+			}
+			partial.EvidenceContract = &graph.RecoveryEvidenceContract{Files: files}
+		}
 		partial.ExpectedMilestone, _ = args["expected_milestone"].(string)
 		bound, bindErr := g.RecoveryAuthority.BindRecoveryDeltaAuthority(task.GraphID, task.NodeID, task.ActivationID, partial)
 		if bindErr != nil {

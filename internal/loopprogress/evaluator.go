@@ -108,11 +108,14 @@ func (Evaluator) Evaluate(contract loopcontract.CompiledProgressContract, checkp
 		ResetDeliverableClock: class == loopcontract.ProgressDeliverable || class == loopcontract.ProgressVerification,
 		BudgetCharge:          delta.UsageDelta, ReasonCode: reason,
 	}
+	if contract.Policy.MaxDecisionStagnation > 0 {
+		assessment.DecisionAdvance = acceptedDecisionSignal(accepted)
+	}
 	if err := assessment.Validate(); err != nil {
 		return loopcontract.ProgressAssessment{}, loopcontract.ProgressCheckpoint{}, fmt.Errorf("生成的 Assessment 无效: %w", err)
 	}
 
-	next, err := advanceCheckpoint(checkpoint, delta, assessment, recent)
+	next, err := advanceCheckpoint(contract, checkpoint, delta, assessment, recent)
 	if err != nil {
 		return loopcontract.ProgressAssessment{}, loopcontract.ProgressCheckpoint{}, err
 	}
@@ -363,7 +366,7 @@ func classifyAssessment(unsafe, regression, deliverable, verification, coordinat
 	}
 }
 
-func advanceCheckpoint(previous loopcontract.ProgressCheckpoint, delta loopcontract.TurnSettlementDelta,
+func advanceCheckpoint(contract loopcontract.CompiledProgressContract, previous loopcontract.ProgressCheckpoint, delta loopcontract.TurnSettlementDelta,
 	assessment loopcontract.ProgressAssessment, recent []loopcontract.ProgressFingerprint) (loopcontract.ProgressCheckpoint, error) {
 	next := previous
 	next.Version++
@@ -389,6 +392,20 @@ func advanceCheckpoint(previous loopcontract.ProgressCheckpoint, delta loopcontr
 			} else {
 				next.ObservationStagnationCount++
 			}
+		}
+	}
+	if contract.Policy.MaxDecisionStagnation > 0 {
+		if assessment.DecisionAdvance {
+			next.DecisionStagnationCount = 0
+		} else if delta.ObservationDeltaRef != "" {
+			next.DecisionStagnationCount++
+		}
+	}
+	if contract.Policy.MaxControlContractFailures > 0 {
+		if delta.ControlContractFailure {
+			next.ControlContractFailureCount++
+		} else if delta.ObservationDeltaRef != "" {
+			next.ControlContractFailureCount = 0
 		}
 	}
 
@@ -427,10 +444,33 @@ func advanceCheckpoint(previous loopcontract.ProgressCheckpoint, delta loopcontr
 	if delta.ObservationDeltaRef != "" {
 		next.KnowledgeTurnsSinceObservation = 0
 	}
+	if contract.Policy.DecisionCheckpointAfterTurns > 0 {
+		switch {
+		case delta.ObservationDeltaRef != "":
+			next.TurnsSinceDecisionCheckpoint = 0
+		case !delta.ControlContractFailure && assessment.Class != loopcontract.ProgressInvocationFailure:
+			next.TurnsSinceDecisionCheckpoint++
+		}
+	}
 	if err := next.Validate(); err != nil {
 		return loopcontract.ProgressCheckpoint{}, fmt.Errorf("生成的下一 Checkpoint 无效: %w", err)
 	}
 	return next, nil
+}
+
+func acceptedDecisionSignal(accepted []loopcontract.AcceptedSignal) bool {
+	for _, signal := range accepted {
+		switch signal.Fingerprint.Kind {
+		case loopcontract.SignalFileVersionChanged,
+			loopcontract.SignalArtifactRegistered,
+			loopcontract.SignalArtifactVersionChanged,
+			loopcontract.SignalEvaluationChanged,
+			loopcontract.SignalEvaluationPassed,
+			loopcontract.SignalObservationStateAdvanced:
+			return true
+		}
+	}
+	return false
 }
 
 func assessmentID(delta loopcontract.TurnSettlementDelta, class loopcontract.ProgressClass) string {

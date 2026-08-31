@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 
+	"agentgo/internal/checkstore"
 	"agentgo/internal/store"
 )
 
@@ -29,7 +30,15 @@ const workLogFileListCap = 10
 // Task ID 聚合 ToolCallRecord，渲染为压缩多行文本（首行工具统计，随后
 // 编辑/写入文件清单）。任务无调用记录时返回「（无调用记录）」——它本身
 // 就是强信号；查询失败返回空串（装配处跳过整行，不误报）。
-func newGraphWorkLogProvider(taskStore store.TaskStore) func(taskID string) string {
+type taskCheckReader interface {
+	ListTask(taskID string) ([]checkstore.Record, error)
+}
+
+func newGraphWorkLogProvider(taskStore store.TaskStore, checkReaders ...taskCheckReader) func(taskID string) string {
+	var checks taskCheckReader
+	if len(checkReaders) > 0 {
+		checks = checkReaders[0]
+	}
 	return func(taskID string) string {
 		if taskStore == nil || taskID == "" {
 			return ""
@@ -38,34 +47,54 @@ func newGraphWorkLogProvider(taskStore store.TaskStore) func(taskID string) stri
 		if err != nil {
 			return ""
 		}
-		return renderGraphWorkLog(recs)
+		var checkRecords []checkstore.Record
+		if checks != nil {
+			checkRecords, err = checks.ListTask(taskID)
+			if err != nil {
+				return ""
+			}
+		}
+		return renderGraphWorkLogWithChecks(recs, checkRecords)
 	}
 }
 
 // renderGraphWorkLog 把一组工具调用记录聚合渲染为压缩文本。纯函数，
 // 与 store 解耦以便单测。
 func renderGraphWorkLog(recs []store.ToolCallRecord) string {
+	return renderGraphWorkLogWithChecks(recs, nil)
+}
+
+func renderGraphWorkLogWithChecks(recs []store.ToolCallRecord, checks []checkstore.Record) string {
 	if len(recs) == 0 {
-		return "（无调用记录）"
+		if len(checks) == 0 {
+			return "（无调用记录）"
+		}
 	}
 
 	counts := make(map[string]int)
+	successes := make(map[string]int)
+	failures := make(map[string]int)
 	shellNonZero := 0
 	edited := make(map[string]struct{})
 	written := make(map[string]struct{})
 	for _, rec := range recs {
 		counts[rec.ToolName]++
+		if rec.Success {
+			successes[rec.ToolName]++
+		} else {
+			failures[rec.ToolName]++
+		}
 		switch rec.ToolName {
 		case "run_shell":
 			if rec.ExitCode != nil && *rec.ExitCode != 0 {
 				shellNonZero++
 			}
 		case "edit_file":
-			if p, _ := rec.Args["path"].(string); p != "" {
+			if p, _ := rec.Args["path"].(string); rec.Success && p != "" {
 				edited[p] = struct{}{}
 			}
 		case "write_file":
-			if p, _ := rec.Args["path"].(string); p != "" {
+			if p, _ := rec.Args["path"].(string); rec.Success && p != "" {
 				written[p] = struct{}{}
 			}
 		}
@@ -91,16 +120,40 @@ func renderGraphWorkLog(recs []store.ToolCallRecord) string {
 			parts = append(parts, fmt.Sprintf("(+%d 类工具)", len(stats)-workLogToolStatCap))
 			break
 		}
-		parts = append(parts, fmt.Sprintf("%s×%d", s.name, s.count))
+		parts = append(parts, fmt.Sprintf("%s×%d(ok=%d fail=%d)",
+			s.name, s.count, successes[s.name], failures[s.name]))
 	}
 	first := strings.Join(parts, ", ")
 	if counts["run_shell"] > 0 {
 		first += fmt.Sprintf(" (exit≠0: %d)", shellNonZero)
 	}
 
+	checkLine := "\n检查记录: （无）"
+	if len(checks) > 0 {
+		latestByID := make(map[string]checkstore.Record)
+		for _, record := range checks {
+			previous, exists := latestByID[record.CheckID]
+			if !exists || previous.SettledAt.IsZero() || !record.SettledAt.Before(previous.SettledAt) {
+				latestByID[record.CheckID] = record
+			}
+		}
+		ids := make([]string, 0, len(latestByID))
+		for id := range latestByID {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		latestParts := make([]string, 0, len(ids))
+		for _, id := range ids {
+			latest := latestByID[id]
+			latestParts = append(latestParts, fmt.Sprintf("%s/%s status=%s exit=%d workspace=%s",
+				latest.CheckID, latest.Kind, latest.Status, latest.ExitCode, latest.WorkspaceRevisionRef))
+		}
+		checkLine = fmt.Sprintf("\n检查记录: latest_by_check_id=[%s] superseded=%d",
+			strings.Join(latestParts, "; "), len(checks)-len(latestByID))
+	}
 	return first +
 		"\n编辑文件: " + renderWorkLogFileList(edited) +
-		"\n写入文件: " + renderWorkLogFileList(written)
+		"\n写入文件: " + renderWorkLogFileList(written) + checkLine
 }
 
 // renderWorkLogFileList 渲染去重排序后的文件清单（≤workLogFileListCap 条，

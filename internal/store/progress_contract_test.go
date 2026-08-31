@@ -28,6 +28,10 @@ func TestProgressContractCloneAndSnapshotRoundTrip(t *testing.T) {
 	}
 	// 保留调用方拥有的 contract 指针，验证 PublishTask 的深拷贝边界。
 	task.ProgressContract = contract
+	task.InterventionGraphID = "g-control"
+	task.InterventionNodeID = "work"
+	task.InterventionActivationID = "work@2"
+	task.DeliveryID = "delivery:round-trip"
 	if err := source.PublishTask(task); err != nil {
 		t.Fatal(err)
 	}
@@ -60,5 +64,13 @@ func TestProgressContractCloneAndSnapshotRoundTrip(t *testing.T) {
 	if restored.ProgressContract == nil || restored.ProgressContract.Ref != again.ProgressContract.Ref ||
 		len(restored.ProgressContract.AcceptedSignals) != len(again.ProgressContract.AcceptedSignals) {
 		t.Fatalf("ProgressContract 快照往返不完整: %+v", restored.ProgressContract)
+	}
+	if restored.InterventionGraphID != task.InterventionGraphID ||
+		restored.InterventionNodeID != task.InterventionNodeID ||
+		restored.InterventionActivationID != task.InterventionActivationID {
+		t.Fatalf("Graph coordination scope 快照往返不完整: %+v", restored)
+	}
+	if restored.DeliveryID != task.DeliveryID {
+		t.Fatalf("DeliveryID 快照往返丢失: got=%q want=%q", restored.DeliveryID, task.DeliveryID)
 	}
 }

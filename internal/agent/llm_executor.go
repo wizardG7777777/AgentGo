@@ -454,6 +454,19 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 			invocationBase = fmt.Sprintf("%s/legacy-loop-%d", shortTaskID, loopForTrace)
 		}
 		invocationID := fmt.Sprintf("%s/invocation-%d", invocationBase, e.invSeq.Add(1))
+		if toolPolicy.RecoveryGate != nil {
+			gate := toolPolicy.RecoveryGate
+			trace.Emit(trace.Event{
+				Kind: trace.KindRecoveryActionGated, TaskID: task.ID,
+				RunID: string(task.RunID), AttemptID: attemptIDForTrace, TurnID: turnIDForTrace,
+				InvocationID: invocationID, AgentID: agentIDForTrace,
+				RecoveryGate: &trace.RecoveryActionPayload{
+					Schema: gate.Schema, Stage: string(gate.Stage), Tool: gate.Tool,
+					Path: gate.Path, CheckID: gate.CheckID, RefID: gate.RefID,
+					Offset: gate.Offset, Limit: gate.Limit, DirectiveCount: gate.DirectiveCount,
+				},
+			})
+		}
 		activity := activityFromContext(ctx)
 		promptBuildRef := "prompt-build:legacy/unknown"
 		var frozenPromptBuild *prompt.Build
@@ -477,7 +490,9 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		if toolRouter.Phase == "agent:deliverable-submit" {
 			phasePrompt = agentDeliverablePhasePrompt
 		} else if toolRouter.Phase == "agent:observation-checkpoint" {
-			phasePrompt = observationCheckpointPhasePrompt
+			phasePrompt = observationCheckpointPhasePrompt + "\n" + observationCheckpointCatalogPrompt(toolRouter.Defs)
+		} else if toolPolicy.RecoveryGate != nil {
+			phasePrompt = recoveryActionPhasePrompt(*toolPolicy.RecoveryGate)
 		} else if toolRouter.Phase == "scheduler:final-report-submit" {
 			phasePrompt = finalReportSubmitPhasePrompt
 		}
@@ -499,7 +514,8 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				DependencyResult: depResults, History: modelHistory, TaskMemory: taskMemCarrierFromContext(ctx),
 				ToolRouter: toolRouter, AttemptID: attemptIDForTrace, InvocationID: invocationID,
 				PhasePrompt: phasePrompt, PhasePromptRef: toolRouter.Phase,
-				PromptBuildRef: promptBuildRef, PromptBuild: frozenPromptBuild, ExecutionLeaseRef: leaseRef,
+				SuppressUpstreamInputs: toolRouter.Phase == "agent:observation-checkpoint",
+				PromptBuildRef:         promptBuildRef, PromptBuild: frozenPromptBuild, ExecutionLeaseRef: leaseRef,
 				ParentSnapshotRef: parentSnapshotRef,
 			})
 			if compileErr != nil {
@@ -523,6 +539,29 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 			}
 			if int64(toolRouter.MaxCalls) < binding.OutputBudget.MaxToolCalls {
 				binding.OutputBudget.MaxToolCalls = int64(toolRouter.MaxCalls)
+				if bindErr = binding.Validate(); bindErr != nil {
+					return ExecuteResult{InvocationID: invocationID},
+						contextAssemblyFailure(ctx, invocationID, task.ContextPolicyRef, bindErr)
+				}
+			}
+			if toolRouter.Phase == "agent:observation-checkpoint" {
+				const (
+					observationCompletionTokens int64 = 2048
+					observationArgumentsBytes   int64 = 16 << 10
+					observationResponseBytes    int64 = 32 << 10
+				)
+				binding.OutputBudget.MaxCompletionTokens = minPositiveInt64(
+					binding.OutputBudget.MaxCompletionTokens, observationCompletionTokens)
+				binding.OutputBudget.MaxContentBytes = minPositiveInt64(binding.OutputBudget.MaxContentBytes, observationResponseBytes)
+				binding.OutputBudget.MaxReasoningBytes = minPositiveInt64(binding.OutputBudget.MaxReasoningBytes, observationResponseBytes)
+				binding.OutputBudget.MaxExtraFieldBytes = minPositiveInt64(binding.OutputBudget.MaxExtraFieldBytes, observationResponseBytes)
+				binding.OutputBudget.MaxToolArgumentsBytes = minPositiveInt64(binding.OutputBudget.MaxToolArgumentsBytes, observationArgumentsBytes)
+				binding.OutputBudget.MaxToolArgumentsTotalBytes = minPositiveInt64(binding.OutputBudget.MaxToolArgumentsTotalBytes, observationArgumentsBytes)
+				binding.OutputBudget.MaxResponseBytes = minPositiveInt64(binding.OutputBudget.MaxResponseBytes, observationResponseBytes)
+				binding.OutputBudget.MaxToolCalls = 1
+				for name, limit := range binding.OutputBudget.MaxExtraFieldBytesByName {
+					binding.OutputBudget.MaxExtraFieldBytesByName[name] = minPositiveInt64(limit, observationResponseBytes)
+				}
 				if bindErr = binding.Validate(); bindErr != nil {
 					return ExecuteResult{InvocationID: invocationID},
 						contextAssemblyFailure(ctx, invocationID, task.ContextPolicyRef, bindErr)

@@ -6,7 +6,9 @@ package bootstrap
 import (
 	"strings"
 	"testing"
+	"time"
 
+	"agentgo/internal/checkstore"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
 )
@@ -32,6 +34,9 @@ func TestRenderGraphWorkLogAggregates(t *testing.T) {
 	if !strings.Contains(got, "read_file×3") || !strings.Contains(got, "edit_file×2") {
 		t.Errorf("工具统计应聚合计数: %q", got)
 	}
+	if !strings.Contains(got, "run_shell×2(ok=1 fail=1)") {
+		t.Errorf("工作记录必须保留工具成功/失败计数: %q", got)
+	}
 	// 降序：read_file(3) 在 edit_file(2) 前
 	if strings.Index(got, "read_file×3") > strings.Index(got, "edit_file×2") {
 		t.Errorf("工具统计应按次数降序: %q", got)
@@ -44,6 +49,39 @@ func TestRenderGraphWorkLogAggregates(t *testing.T) {
 	}
 	if !strings.Contains(got, "写入文件: notes.md") {
 		t.Errorf("写入文件应列出: %q", got)
+	}
+}
+
+func TestRenderGraphWorkLogIncludesTypedChecksAndSkipsFailedWrites(t *testing.T) {
+	recs := []store.ToolCallRecord{
+		{ToolName: "edit_file", Success: false, Args: map[string]any{"path": "bad.go"}},
+		{ToolName: "write_file", Success: true, Args: map[string]any{"path": "good.go"}},
+		{ToolName: "run_check", Success: true},
+	}
+	checks := []checkstore.Record{{CheckRef: "check:1", CheckID: "verification", Kind: "test",
+		Status: checkstore.StatusFailed, ExitCode: 1, WorkspaceRevisionRef: "workspace:sha256:x"}}
+	got := renderGraphWorkLogWithChecks(recs, checks)
+	if strings.Contains(got, "编辑文件: bad.go") || !strings.Contains(got, "写入文件: good.go") {
+		t.Fatalf("失败写入不得冒充文件变更: %q", got)
+	}
+	if !strings.Contains(got, "检查记录: latest_by_check_id=[verification/test status=failed exit=1") ||
+		!strings.Contains(got, "superseded=0") {
+		t.Fatalf("typed CheckRecord 未进入工作记录: %q", got)
+	}
+}
+
+func TestRenderGraphWorkLogSupersededFailureDoesNotMasqueradeAsCurrent(t *testing.T) {
+	base := time.Now().UTC()
+	checks := []checkstore.Record{
+		{CheckID: "verification", Kind: "test", Status: checkstore.StatusFailed,
+			ExitCode: 1, WorkspaceRevisionRef: "workspace:empty", SettledAt: base},
+		{CheckID: "verification", Kind: "verification", Status: checkstore.StatusPass,
+			ExitCode: 0, WorkspaceRevisionRef: "workspace:sha256:candidate", SettledAt: base.Add(time.Second)},
+	}
+	got := renderGraphWorkLogWithChecks(nil, checks)
+	if !strings.Contains(got, "latest_by_check_id=[verification/verification status=pass exit=0 workspace=workspace:sha256:candidate]") ||
+		!strings.Contains(got, "superseded=1") || strings.Contains(got, "failed=1") {
+		t.Fatalf("被后续 pass 覆盖的历史失败不得冒充当前结论: %q", got)
 	}
 }
 

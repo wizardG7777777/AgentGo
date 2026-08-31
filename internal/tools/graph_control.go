@@ -389,6 +389,10 @@ func (g GraphControlGroup) authorizeGraphTarget(operation, graphID string) error
 		return fmt.Errorf("graph-ended final-report 禁止 %s 其他 Graph：final_report_graph_id=%s target_graph_id=%s",
 			operation, task.FinalReportGraphID, graphID)
 	}
+	if task != nil && task.InterventionGraphID != "" && task.InterventionGraphID != graphID {
+		return fmt.Errorf("Graph coordination 禁止 %s 其他 Graph：intervention_graph_id=%s target_graph_id=%s",
+			operation, task.InterventionGraphID, graphID)
+	}
 	return nil
 }
 

@@ -9,39 +9,43 @@ import (
 )
 
 const (
-	ContextDefaultV1 = "context:default/v1"
-	ContextDefaultV2 = "context:default/v2"
-	ContextDefaultV3 = "context:default/v3"
-	ContextDefaultV4 = "context:default/v4"
-	ContextDefaultV5 = "context:default/v5"
-	ContextDefaultV6 = "context:default/v6"
-	ContextDefaultV7 = "context:default/v7"
-	ContextDefaultV8 = "context:default/v8"
-	ContextDefaultV9 = "context:default/v9"
+	ContextDefaultV1  = "context:default/v1"
+	ContextDefaultV2  = "context:default/v2"
+	ContextDefaultV3  = "context:default/v3"
+	ContextDefaultV4  = "context:default/v4"
+	ContextDefaultV5  = "context:default/v5"
+	ContextDefaultV6  = "context:default/v6"
+	ContextDefaultV7  = "context:default/v7"
+	ContextDefaultV8  = "context:default/v8"
+	ContextDefaultV9  = "context:default/v9"
+	ContextDefaultV10 = "context:default/v10"
 	// ContextDefaultCurrent 是所有新 Run/Invocation 的 framework 默认引用。
 	// 历史任务必须继续使用其已冻结的具体版本，禁止在恢复时把 v1 偷换为该别名。
-	ContextDefaultCurrent    = ContextDefaultV9
+	ContextDefaultCurrent    = ContextDefaultV10
 	ReplayOpenAICompatibleV1 = "provider-replay:openai-compatible/v1"
 	ReplayOpenAICompatibleV2 = "provider-replay:openai-compatible/v2"
 	ReplayOpenAICompatibleV3 = "provider-replay:openai-compatible/v3"
+	ReplayOpenAICompatibleV4 = "provider-replay:openai-compatible/v4"
 
 	ProgressCodeChangeV1 = "progress:code-change/v1"
 	ProgressCodeChangeV2 = "progress:code-change/v2"
 	ProgressCodeChangeV3 = "progress:code-change/v3"
 	ProgressCodeChangeV4 = "progress:code-change/v4"
 	ProgressCodeChangeV5 = "progress:code-change/v5"
+	ProgressCodeChangeV6 = "progress:code-change/v6"
 	// ProgressCodeChangeCurrent 是所有新 Task/Graph authoring 的唯一选择。
-	ProgressCodeChangeCurrent = ProgressCodeChangeV5
+	ProgressCodeChangeCurrent = ProgressCodeChangeV6
 
 	ProgressInvestigationV1      = "progress:investigation/v1"
 	ProgressInvestigationV2      = "progress:investigation/v2"
 	ProgressVerificationV1       = "progress:verification/v1"
 	ProgressVerificationV2       = "progress:verification/v2"
+	ProgressVerificationV3       = "progress:verification/v3"
 	ProgressCoordinationV1       = "progress:coordination/v1"
 	ProgressCoordinationV2       = "progress:coordination/v2"
 	ProgressFinalReportV1        = "progress:final-report/v1"
 	ProgressInvestigationCurrent = ProgressInvestigationV2
-	ProgressVerificationCurrent  = ProgressVerificationV2
+	ProgressVerificationCurrent  = ProgressVerificationV3
 	ProgressCoordinationCurrent  = ProgressCoordinationV2
 )
 

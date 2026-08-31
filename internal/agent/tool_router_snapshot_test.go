@@ -2,9 +2,12 @@ package agent
 
 import (
 	"context"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
+	"agentgo/internal/fulfillment"
 	"agentgo/internal/graph"
 	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
@@ -51,7 +54,7 @@ func TestSchedulerInvocationToolPolicyMovesThroughAuthoringPhases(t *testing.T) 
 		"create_graph_draft", "configure_simple_graph_draft", "read_graph_draft", "patch_graph_draft", "validate_graph_draft",
 		"validate_current_graph_draft", "commit_graph_draft", "commit_current_graph_draft", "start_graph", "start_current_graph",
 		"read_graph", "get_task_result", "read_content_ref", "propose_graph_change", "read_graph_change",
-		"validate_graph_change", "commit_graph_change", "report_done",
+		"validate_graph_change", "commit_graph_change", "submit_graph_change_decision", "report_done",
 	} {
 		full.Register(name, name, map[string]any{"type": "object"}, func(context.Context, map[string]any) (string, error) { return "ok", nil })
 	}
@@ -136,6 +139,23 @@ func TestGraphDeliverablePhaseForcesSubmitTaskResult(t *testing.T) {
 	if choice.Mode != invocation.ToolChoiceFunction || choice.Name != "submit_task_result" {
 		t.Fatalf("deliverable phase 未冻结 exact submit: %+v", choice)
 	}
+	reopened := deriveInvocationToolPolicy(task, []HistoryEntry{
+		{SystemNotice: progressDeliverableRequiredMarker},
+		{ToolCalls: []llm.ToolCall{{ID: "submit", Name: "submit_task_result"}},
+			ToolResults: []ToolResult{{ToolCallID: "submit", Content: "错误: reason_code=contract_fulfillment_missing：缺少 required check verification"}}},
+	}, full)
+	if reopened.Phase == "agent:deliverable-submit" || !containsToolName(reopened.Registry.Names(), "read_file") {
+		t.Fatalf("可修复的 fulfillment 拒绝必须重新开放业务工具: phase=%s tools=%v",
+			reopened.Phase, reopened.Registry.Names())
+	}
+	forcedAgain := deriveInvocationToolPolicy(task, append([]HistoryEntry{
+		{SystemNotice: progressDeliverableRequiredMarker},
+		{ToolCalls: []llm.ToolCall{{ID: "submit", Name: "submit_task_result"}},
+			ToolResults: []ToolResult{{ToolCallID: "submit", Content: "错误: reason_code=contract_fulfillment_missing"}}},
+	}, HistoryEntry{SystemNotice: progressDeliverableRequiredMarker}), full)
+	if forcedAgain.Phase != "agent:deliverable-submit" {
+		t.Fatalf("后续新 verification progress 应可重新进入 exact submit: %+v", forcedAgain)
+	}
 }
 
 func TestMechanicalControlHistoryProjectionDropsHistoricalToolsButKeepsControlNotices(t *testing.T) {
@@ -151,6 +171,103 @@ func TestMechanicalControlHistoryProjectionDropsHistoricalToolsButKeepsControlNo
 		len(projected[0].ToolCalls) != 0 || len(projected[1].ToolCalls) != 0 ||
 		projected[0].AssistantContent != "" || projected[1].AssistantContent != "" {
 		t.Fatalf("强制交付投影不得携带历史工具偏好: %+v", projected)
+	}
+}
+
+func TestObservationCheckpointEvidenceEnumMatchesCurrentAttemptAuthority(t *testing.T) {
+	registry := NewToolRegistry()
+	registry.Register("record_observation_delta", "obs", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"facts": map[string]any{"type": "array", "items": map[string]any{
+				"type": "object", "properties": map[string]any{
+					"evidence_refs": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				},
+			}},
+			"resolved_candidates": map[string]any{"type": "array", "items": map[string]any{
+				"type": "object", "properties": map[string]any{
+					"candidate_ref": map[string]any{"type": "string"},
+					"evidence_refs": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				},
+			}},
+		},
+	}, func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	task := replayGateTask("task-observation-attempt", nil)
+	task.AttemptID = task.ID + "/attempt-2"
+	task.Artifacts = []string{"old-attempt.txt"}
+	history := []HistoryEntry{
+		{TurnID: task.ID + "/attempt-1/turn-6",
+			ToolCalls:   []llm.ToolCall{{ID: "old-call", Name: "read_file"}},
+			ToolResults: []ToolResult{{ToolCallID: "old-call", Content: "ok"}}},
+		{TurnID: task.AttemptID + "/turn-1",
+			ToolCalls:   []llm.ToolCall{{ID: "current-before", Name: "run_shell"}},
+			ToolResults: []ToolResult{{ToolCallID: "current-before", Content: "ok"}}},
+		{TurnID: task.AttemptID + "/turn-2",
+			ToolCalls: []llm.ToolCall{{ID: "observation", Name: "record_observation_delta"}},
+			ToolResults: []ToolResult{{ToolCallID: "observation",
+				Content: `{"open_candidate_refs":["candidate:open"]}`}}},
+		{TurnID: task.AttemptID + "/turn-3",
+			ToolCalls:   []llm.ToolCall{{ID: "current-after", Name: "grep_search"}},
+			ToolResults: []ToolResult{{ToolCallID: "current-after", Content: "ok"}}},
+	}
+	view := observationCheckpointRegistry(registry, task, history)
+	defs := view.Defs()
+	if len(defs) != 1 {
+		t.Fatalf("Observation registry 定义数=%d，期望 1", len(defs))
+	}
+	properties := defs[0].Parameters["properties"].(map[string]any)
+	facts := properties["facts"].(map[string]any)
+	items := facts["items"].(map[string]any)
+	factProperties := items["properties"].(map[string]any)
+	evidence := factProperties["evidence_refs"].(map[string]any)
+	values := evidence["items"].(map[string]any)["enum"].([]any)
+	if len(values) != 2 || values[0] != "tool-call:current-after" || values[1] != "tool-call:current-before" {
+		t.Fatalf("evidence enum 泄露前一 Attempt/累计 artifact: %v", values)
+	}
+	resolved := properties["resolved_candidates"].(map[string]any)
+	resolvedItems := resolved["items"].(map[string]any)
+	resolvedProperties := resolvedItems["properties"].(map[string]any)
+	resolvedEvidence := resolvedProperties["evidence_refs"].(map[string]any)
+	resolvedValues := resolvedEvidence["items"].(map[string]any)["enum"].([]any)
+	if len(resolvedValues) != 1 || resolvedValues[0] != "tool-call:current-after" {
+		t.Fatalf("resolved evidence enum 含 predecessor 之前的证据: %v", resolvedValues)
+	}
+	candidateValues := resolvedProperties["candidate_ref"].(map[string]any)["enum"].([]any)
+	if len(candidateValues) != 1 || candidateValues[0] != "candidate:open" {
+		t.Fatalf("predecessor open candidate 未冻结: %v", candidateValues)
+	}
+	catalog := observationCheckpointCatalogPrompt(defs)
+	for _, required := range []string{
+		`facts.evidence_refs literals: ["tool-call:current-after","tool-call:current-before"]`,
+		`resolved_candidates.candidate_ref literals: ["candidate:open"]`,
+		`post-predecessor literals: ["tool-call:current-after"]`,
+	} {
+		if !strings.Contains(catalog, required) {
+			t.Fatalf("Observation system catalog 缺少 %q: %s", required, catalog)
+		}
+	}
+	if strings.Contains(catalog, "old-call") || strings.Contains(catalog, "old-attempt.txt") {
+		t.Fatalf("Observation system catalog 泄露无效 authority: %s", catalog)
+	}
+}
+
+func TestObservationCheckpointFailureDetailOnlyReturnsBoundedControlError(t *testing.T) {
+	result := ExecuteResult{
+		ToolCalls: []llm.ToolCall{
+			{ID: "business", Name: "read_file"},
+			{ID: "observation", Name: "record_observation_delta"},
+		},
+		ToolResults: []ToolResult{
+			{ToolCallID: "business", Content: "错误: 不应回显业务错误"},
+			{ToolCallID: "observation", Content: "错误: facts[0] 缺少合法 evidence_refs"},
+		},
+	}
+	if got := observationCheckpointFailureDetail(result); got != "错误: facts[0] 缺少合法 evidence_refs" {
+		t.Fatalf("Observation retry 机械错误回执=%q", got)
+	}
+	result.ToolCalls = result.ToolCalls[:1]
+	if got := observationCheckpointFailureDetail(result); got != "" {
+		t.Fatalf("不得回显业务工具错误: %q", got)
 	}
 }
 
@@ -277,6 +394,43 @@ func TestGraphRecoveryControllerUsesDedicatedSingleActionPhase(t *testing.T) {
 	}
 }
 
+func TestGraphChangeNoChangeDecisionRequiresSuccessfulGraphRead(t *testing.T) {
+	full := NewToolRegistry()
+	for _, name := range []string{
+		"read_graph", "get_task_result", "read_content_ref", "propose_graph_change",
+		"read_graph_change", "validate_graph_change", "commit_graph_change",
+		"submit_graph_change_decision",
+	} {
+		full.Register(name, name, map[string]any{"type": "object"},
+			func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	}
+	task := replayGateTask("graph-change-no-change-policy", nil)
+	task.EventType = "__scheduler__"
+	task.EventSource = model.TaskEventSourceGraphChange
+	task.InterventionGraphID = "g-1"
+	task.RunPhase = runcontract.PhaseRecovery
+
+	initial := deriveInvocationToolPolicy(task, nil, full)
+	if initial.Phase != "scheduler:recovery" || containsToolName(initial.Registry.Names(), "submit_graph_change_decision") {
+		t.Fatalf("读取 Graph 前不得开放 no_change 收口: phase=%s tools=%v", initial.Phase, initial.Registry.Names())
+	}
+	read := []HistoryEntry{{
+		ToolCalls:   []llm.ToolCall{{ID: "read-1", Name: "read_graph", Arguments: map[string]any{"graph_id": "g-1"}}},
+		ToolResults: []ToolResult{{ToolCallID: "read-1", Content: `{"graph_id":"g-1","status":"failed"}`}},
+	}}
+	afterRead := deriveInvocationToolPolicy(task, read, full)
+	if !containsToolName(afterRead.Registry.Names(), "submit_graph_change_decision") {
+		t.Fatalf("成功 read_graph 后应开放结构化 no_change 收口: %v", afterRead.Registry.Names())
+	}
+	failedRead := []HistoryEntry{{
+		ToolCalls:   []llm.ToolCall{{ID: "read-2", Name: "read_graph"}},
+		ToolResults: []ToolResult{{ToolCallID: "read-2", Content: "错误: scope mismatch"}},
+	}}
+	if policy := deriveInvocationToolPolicy(task, failedRead, full); containsToolName(policy.Registry.Names(), "submit_graph_change_decision") {
+		t.Fatalf("失败 read_graph 不得开放 no_change 收口: %v", policy.Registry.Names())
+	}
+}
+
 func TestObservationCheckpointAndFinalReportUseClosedToolPhases(t *testing.T) {
 	full := NewToolRegistry()
 	for _, name := range []string{"record_observation_delta", "read_file", "submit_task_result", "read_graph", "get_task_result", "read_content_ref", "report_done"} {
@@ -386,6 +540,60 @@ func TestObservationCheckpointAndFinalReportUseClosedToolPhases(t *testing.T) {
 	}
 }
 
+func TestOrdinaryBusinessPhaseRemovesFrameworkObservationToolFromUnion(t *testing.T) {
+	registry := NewToolRegistry()
+	for _, name := range []string{"read_file", "write_file", "record_observation_delta", "submit_task_result"} {
+		registry.Register(name, name, map[string]any{"type": "object"},
+			func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	}
+	task := replayGateTask("worker-business", nil)
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	progress, _ := catalog.ProgressContract(policycatalog.ProgressCodeChangeV6)
+	task.ProgressContract = &progress.Contract
+	ordinary := deriveInvocationToolPolicyWithControl(task, nil, registry, registry)
+	if containsToolName(ordinary.Registry.Names(), "record_observation_delta") ||
+		!containsToolName(ordinary.Registry.Names(), "read_file") ||
+		!containsToolName(ordinary.Registry.Names(), "submit_task_result") {
+		t.Fatalf("普通业务 ToolRouter 未剔除 framework Observation control: %v", ordinary.Registry.Names())
+	}
+	checkpoint := deriveInvocationToolPolicyWithControl(task,
+		[]HistoryEntry{{SystemNotice: observationCheckpointNotice("periodic", "checkpoint")}}, registry, registry)
+	if !sameExactToolSet(checkpoint.Registry.Names(), []string{"record_observation_delta"}) {
+		t.Fatalf("checkpoint control lane 被 normal 过滤误伤: %v", checkpoint.Registry.Names())
+	}
+}
+
+func TestRunCheckSchemaFreezesCurrentTaskRequiredCheckIDs(t *testing.T) {
+	registry := NewToolRegistry()
+	registry.Register("run_check", "检查", map[string]any{
+		"type": "object", "properties": map[string]any{
+			"check_id": map[string]any{"type": "string"},
+		},
+	}, func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	task := replayGateTask("typed-check", nil)
+	task.FulfillmentContract = &fulfillment.Contract{
+		RequiredCheckIDs: []string{" verification ", "build", "verification"},
+	}
+	task.RunContract.CheckContracts = []runcontract.CheckContract{
+		{CheckID: "targeted", Kind: "test"},
+		{CheckID: "verification", Kind: "test", ExactCommand: "go test ./..."},
+	}
+	policy := deriveInvocationToolPolicyWithControl(task, nil, registry, registry)
+	defs := policy.Registry.Defs()
+	if len(defs) != 1 {
+		t.Fatalf("run_check 工具面异常: %+v", defs)
+	}
+	properties, _ := defs[0].Parameters["properties"].(map[string]any)
+	checkID, _ := properties["check_id"].(map[string]any)
+	if !reflect.DeepEqual(checkID["enum"], []string{"build", "targeted", "verification"}) ||
+		!strings.Contains(fmt.Sprint(checkID["description"]), `verification exact_command="go test ./..."`) {
+		t.Fatalf("check_id enum 必须与当前 GraphContract 同源: %#v", checkID)
+	}
+}
+
 func TestBusinessHistoryProjectionDropsObservationControlLane(t *testing.T) {
 	history := []HistoryEntry{
 		{TurnID: "business-1", AssistantContent: "调查", ToolCalls: []llm.ToolCall{{ID: "r", Name: "read_file"}}},
@@ -395,8 +603,10 @@ func TestBusinessHistoryProjectionDropsObservationControlLane(t *testing.T) {
 		{TurnID: "business-2", AssistantContent: "继续实现"},
 	}
 	projected := businessHistoryProjection(history)
-	if len(projected) != 2 || projected[0].TurnID != "business-1" || projected[1].TurnID != "business-2" {
-		t.Fatalf("业务 replay 不得混入 Observation Control lane: %+v", projected)
+	if len(projected) != 3 || projected[0].TurnID != "business-1" ||
+		projected[1].ContextProjection != observationProjectionPrefix+"observation:sha256:x" ||
+		projected[2].TurnID != "business-2" {
+		t.Fatalf("业务 replay 必须用不可见锚点替代 Observation Control lane: %+v", projected)
 	}
 }
 
@@ -424,6 +634,29 @@ func TestSchedulerAutoSingletonBatchDispatchesOnlyFirstCall(t *testing.T) {
 	if runs != 1 || len(result.ToolResults) != 2 ||
 		!strings.Contains(result.ToolResults[1].Content, "首个工具调用") {
 		t.Fatalf("应只 dispatch 首个并为重复 call_id 返回 skipped result: runs=%d result=%+v", runs, result)
+	}
+}
+
+func TestRecoverySingleActionAllowsAuthorizedFirstCallWithUnauthorizedTail(t *testing.T) {
+	registry := NewToolRegistry()
+	registry.Register("edit_file", "编辑", map[string]any{"type": "object"},
+		func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	router, err := FreezeToolRouterSnapshotWithPolicy(registry, "agent:recovery-mutation",
+		defaultToolCallsPerResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := []llm.ToolCall{
+		{ID: "edit", Name: "edit_file"},
+		{ID: "read", Name: "read_content_ref"},
+		{ID: "grep", Name: "grep_search"},
+	}
+	if err := validateToolCallBatch(router, calls); err != nil {
+		t.Fatalf("Recovery 单动作阶段应只校验首个待 dispatch 调用，尾部合法 fan-out 由 skipped receipt 收口: %v", err)
+	}
+	if err := validateToolCallBatch(router, []llm.ToolCall{{ID: "read", Name: "read_file"}}); err == nil ||
+		!isActionContractViolation(err) {
+		t.Fatalf("首个调用仍必须受 Recovery allowlist 约束: %v", err)
 	}
 }
 

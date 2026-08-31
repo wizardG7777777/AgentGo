@@ -49,6 +49,12 @@ func (rt *Runtime) GraphSchema(graphID string) string {
 	return doc.Schema
 }
 
+// OutletSchemaIsV2OrLater 把 v2 的闭合输出契约复用于 v3；保留单一判断
+// 点，避免工具层把未来 schema 误判成可携带 legacy event 的图。
+func OutletSchemaIsV2OrLater(schema string) bool {
+	return schema == SchemaV2 || schema == SchemaV3
+}
+
 // CheckActivationOutlet 对属于 schema v2 图的任务做提交期出路匹配检查：
 // 用该 activation 冻结定义的出边对 status（镜像系统事件）与 result（业务
 // 数据）预求值；任一匹配即放行（返回 nil）。无匹配时按两击协议处理：
@@ -64,7 +70,7 @@ func (rt *Runtime) CheckActivationOutlet(graphID, nodeID, activationID string, s
 	if !ok {
 		return fmt.Errorf("graph: 出路检查失败：图 %s 不存在", graphID)
 	}
-	if doc.Schema != SchemaV2 {
+	if doc.Schema != SchemaV2 && doc.Schema != SchemaV3 {
 		return nil // v1 图不介入：无匹配出路仍由终态回填时 fail-closed（语义不变）
 	}
 	if doc.Status.IsTerminal() {

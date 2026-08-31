@@ -1208,6 +1208,20 @@ func formatEventDetails(ev Event) string {
 		if ev.Description != "" {
 			parts = append(parts, fmt.Sprintf("sections=%q", truncate(ev.Description, 200)))
 		}
+	case KindRecoveryActionGated:
+		if gate := ev.RecoveryGate; gate != nil {
+			parts = append(parts, fmt.Sprintf("schema=%s stage=%s tool=%s directives=%d",
+				gate.Schema, gate.Stage, gate.Tool, gate.DirectiveCount))
+			if gate.Path != "" {
+				parts = append(parts, fmt.Sprintf("path=%s", gate.Path))
+			}
+			if gate.CheckID != "" {
+				parts = append(parts, fmt.Sprintf("check_id=%s", gate.CheckID))
+			}
+			if gate.RefID != "" {
+				parts = append(parts, fmt.Sprintf("ref_id=%s offset=%d limit=%d", gate.RefID, gate.Offset, gate.Limit))
+			}
+		}
 	case KindSessionMemoryPromotionProposed, KindSessionMemoryPromotionDecided,
 		KindMemoryRecalled, KindMemoryEntryStateChanged:
 		// CM3 Session Memory：Reason 载终态（晋升事件）；Description 是 JSON
@@ -1222,6 +1236,14 @@ func formatEventDetails(ev Event) string {
 		// workspace 物化 / 清理：Path 是 workspace 根路径。
 		if ev.Path != "" {
 			parts = append(parts, fmt.Sprintf("path=%s", ev.Path))
+		}
+	case KindWorkspaceRetentionDecided, KindWorkspaceCleanupRejected:
+		if ev.Path != "" {
+			parts = append(parts, fmt.Sprintf("path=%s", ev.Path))
+		}
+		parts = appendReason(parts, "reason", ev.Reason)
+		if ev.Description != "" {
+			parts = append(parts, fmt.Sprintf("desc=%q", truncate(ev.Description, 160)))
 		}
 	case KindWorkspaceMerged:
 		// 合并完成：Description 载逐文件结果摘要（fast-forward / auto-merged 计数）。
@@ -1484,7 +1506,7 @@ func eventCarriesLoop(kind EventKind) bool {
 		KindHistoryCompaction, KindProgressNotify,
 		KindTaskCancelled, KindContextManifestBuilt,
 		KindTaskMemoryUpdated, KindTaskMemoryCheckpointed, KindObservationDeltaRecorded,
-		KindObservationCheckpointFailed,
+		KindObservationCheckpointFailed, KindRecoveryActionGated,
 		KindToolCallSkipped:
 		return true
 	default:

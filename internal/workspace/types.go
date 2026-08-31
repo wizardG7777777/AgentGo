@@ -14,8 +14,8 @@
 //     不一致 → 行级三路合并（Myers diff），干净则写入合并结果；
 //     有冲突 → MergeResult.Conflicted=true，由执行面终止任务为 failed 并
 //     自动 RequestReplan，Scheduler 裁决兜底。
-//   - shell 残余风险（有意接受）：run_shell 默认工作目录切到 workspace 根，
-//     但命令写主根绝对路径不可完全阻止——工具写全隔离，shell 尽力隔离。
+//   - shell 残余风险（有意接受）：run_shell 在可丢弃完整项目快照中
+//     运行，dirty set 在每次调用前覆盖；但命令写主根绝对路径仍不可完全阻止。
 //
 // 本文件放类型契约与导出方法（导出签名已冻结，B/C 线针对其编码）；
 // 实现主体见 manager.go（生命周期与合并）、manifest.go（基线清单持久化）、
@@ -24,10 +24,13 @@ package workspace
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	"agentgo/internal/pathutil"
@@ -40,6 +43,14 @@ const DirName = ".agentgo/workspaces"
 
 // ManifestFileName 是 workspace 根下记录基线清单的文件名。
 const ManifestFileName = ".workspace-manifest.json"
+
+// DeliveryWorkspaceID 把逻辑 DeliveryID 映射为跨平台安全的目录名。Delivery
+// identity 含冒号（语义上有用），但 Windows NTFS 不允许它作为文件名；不能
+// 直接拿逻辑 ID 拼路径。
+func DeliveryWorkspaceID(deliveryID string) string {
+	sum := sha256.Sum256([]byte(deliveryID))
+	return "delivery-" + hex.EncodeToString(sum[:16])
+}
 
 // ---------------------------------------------------------------------------
 // 合并结果类型
@@ -115,13 +126,23 @@ type View struct {
 	mgr    *Manager
 	mf     *manifest  // dirty set 清单（基线 SHA256 + 新建标记），随 COW 即时持久化
 	mu     sync.Mutex // 串行化 copy-on-write 的检查-复制序列
+	// shellMu/shellReady 保护可丢弃的完整项目快照。稀疏 COW
+	// 只能服务文件工具；Shell 需要真实目录树才能运行构建/测试。
+	shellMu    sync.Mutex
+	shellReady bool
 }
 
 // TaskID 返回视图所属任务。
 func (v *View) TaskID() string { return v.taskID }
 
-// Root 返回 workspace 根绝对路径（run_shell 默认工作目录）。
+// Root 返回稀疏 workspace 根绝对路径；Shell 必须调用
+// PrepareShellRoot 获取完整项目快照，不得直接用本根作 cwd。
 func (v *View) Root() string { return v.root }
+
+// PrepareShellRoot 返回一个完整、可执行的项目快照，并在每次
+// Shell 调用前把 manifest dirty set 同步进去。该目录不进入
+// candidate/merge，进程崩溃后也可安全重建。
+func (v *View) PrepareShellRoot() (string, error) { return v.prepareShellRoot() }
 
 // ReadPath 把主根绝对路径解析为实际读取位置：
 // workspace 中已有副本（先前写过）则返回副本路径，否则原样返回主根路径。
@@ -221,8 +242,10 @@ type Manager struct {
 	projectRoot string
 	roster      roster.Roster
 
-	mu   sync.Mutex
-	view map[string]*View // taskID -> 活动视图
+	mu     sync.Mutex
+	view   map[string]*View // workspaceID -> 已物化视图
+	owners map[string]Owner
+	leases map[string]int // workspaceID -> 当前正在使用该视图的 Activation 数
 }
 
 // NewManager 构造 Manager。projectRoot 为主根路径——构造期归一为绝对路径
@@ -231,7 +254,8 @@ type Manager struct {
 // 相对根会让 filepath.Rel(相对, 绝对) 直接报错（2026-07-27 真实运行事故：
 // 隔离任务全部「路径不在主根内」失败，单测因 t.TempDir() 恒绝对而漏检）。
 func NewManager(projectRoot string, r roster.Roster) *Manager {
-	return &Manager{projectRoot: absRoot(projectRoot), roster: r, view: make(map[string]*View)}
+	return &Manager{projectRoot: absRoot(projectRoot), roster: r, view: make(map[string]*View),
+		owners: make(map[string]Owner), leases: make(map[string]int)}
 }
 
 // absRoot 把根路径归一为绝对路径；Abs 失败（极罕见）时退化为 Clean 后的原值。
@@ -252,13 +276,26 @@ func (m *Manager) ProjectRoot() string { return m.projectRoot }
 // Materialize 为任务创建（或复用，幂等——任务重试时复用既有 workspace）
 // workspace 目录与视图，并登记为活动视图。
 func (m *Manager) Materialize(taskID string) (*View, error) {
-	wsRoot, err := m.workspaceRoot(taskID)
+	return m.MaterializeOwned(taskID, TaskOwner(taskID))
+}
+
+// MaterializeOwned 以显式 owner 物化 workspace。Graph v3 必须使用
+// DeliveryOwner；物理目录名不再承担逻辑 TaskID 语义。
+func (m *Manager) MaterializeOwned(workspaceID string, owner Owner) (*View, error) {
+	wsRoot, err := m.workspaceRoot(workspaceID)
 	if err != nil {
+		return nil, err
+	}
+	if err := owner.validate(workspaceID); err != nil {
 		return nil, err
 	}
 	m.mu.Lock()
 	// 幂等：已有活动视图直接返回（任务重试复用既有 workspace 与 dirty set）。
-	if v, ok := m.view[taskID]; ok {
+	if v, ok := m.view[workspaceID]; ok {
+		if !sameOwner(m.owners[workspaceID], owner) {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("workspace %s owner 冲突", workspaceID)
+		}
 		m.mu.Unlock()
 		return v, nil
 	}
@@ -266,22 +303,99 @@ func (m *Manager) Materialize(taskID string) (*View, error) {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("创建 workspace 目录失败：%w", err)
 	}
+	if err := persistOwner(wsRoot, workspaceID, owner); err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
 	// 重试复用时从磁盘恢复既有 manifest（幂等加载）。
 	mf, err := loadManifest(filepath.Join(wsRoot, ManifestFileName))
 	if err != nil {
 		m.mu.Unlock()
 		return nil, err
 	}
-	v := &View{taskID: taskID, root: wsRoot, mgr: m, mf: mf}
-	m.view[taskID] = v
+	v := &View{taskID: workspaceID, root: wsRoot, mgr: m, mf: mf}
+	m.view[workspaceID] = v
+	m.owners[workspaceID] = owner
 	m.mu.Unlock()
 	// 锁外 Emit：避免同步 Reactor 回调 Manager 造成死锁。
 	trace.Emit(trace.Event{
-		Kind:   trace.KindWorkspaceMaterialized,
-		TaskID: taskID,
-		Path:   wsRoot,
+		Kind: trace.KindWorkspaceMaterialized, TaskID: workspaceID,
+		RunID: owner.RunID, GraphID: owner.GraphID, Path: wsRoot,
 	})
 	return v, nil
+}
+
+// Acquire 在视图换入 Runner 前取得活动租约。Cleanup 与 Acquire 使用同一把
+// 锁，因此任何清扫都不能越过正在执行的 Agent Activation。
+func (m *Manager) Acquire(workspaceID string) (func(), error) {
+	m.mu.Lock()
+	view, ok := m.view[workspaceID]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrViewNotFound, workspaceID)
+	}
+	if info, err := os.Stat(view.root); err != nil || !info.IsDir() {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrWorkspaceUnavailable, workspaceID)
+	}
+	m.leases[workspaceID]++
+	m.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.mu.Lock()
+			becameIdle := false
+			if m.leases[workspaceID] <= 1 {
+				delete(m.leases, workspaceID)
+				becameIdle = true
+			} else {
+				m.leases[workspaceID]--
+			}
+			m.mu.Unlock()
+			if becameIdle {
+				m.discardShellSnapshotIfIdle(workspaceID)
+			}
+		})
+	}, nil
+}
+
+// discardShellSnapshotIfIdle 只清理可丢弃的完整项目快照，
+// 保留 owner/manifest/dirty/baseline。重检 lease 关闭 release→新 Acquire
+// 窗口；Manager 锁与 View.shellMu 的顺序为唯一顺序。
+func (m *Manager) discardShellSnapshotIfIdle(workspaceID string) {
+	m.mu.Lock()
+	if m.leases[workspaceID] > 0 {
+		m.mu.Unlock()
+		return
+	}
+	view := m.view[workspaceID]
+	if view == nil {
+		m.mu.Unlock()
+		return
+	}
+	// 持有 Manager 锁阻止新 Acquire；discardShellRoot 内部串行化
+	// 可能尚在收尾的 PrepareShellRoot。
+	err := view.discardShellRoot()
+	m.mu.Unlock()
+	if err != nil {
+		owner, _ := m.Owner(workspaceID)
+		trace.Emit(trace.Event{Kind: trace.KindWorkspaceCleanupRejected, TaskID: workspaceID,
+			RunID: owner.RunID, GraphID: owner.GraphID, Path: filepath.Join(view.root, shellRootDirName),
+			Reason: "shell_snapshot_cleanup_failed", Description: err.Error()})
+	}
+}
+
+func (m *Manager) InUse(workspaceID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.leases[workspaceID] > 0
+}
+
+func (m *Manager) Owner(workspaceID string) (Owner, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	owner, ok := m.owners[workspaceID]
+	return owner, ok
 }
 
 // ActiveView 返回任务的活动视图（nil = 无）。
@@ -325,6 +439,7 @@ func (m *Manager) MergeTask(ctx context.Context, taskID, agentID string) (*Merge
 	sort.Strings(rels)
 
 	result := &MergeResult{}
+	owner, _ := m.Owner(taskID)
 	counts := make(map[FileOutcome]int)
 	for _, rel := range rels {
 		if err := ctx.Err(); err != nil {
@@ -338,6 +453,8 @@ func (m *Manager) MergeTask(ctx context.Context, taskID, agentID string) (*Merge
 			trace.Emit(trace.Event{
 				Kind:        trace.KindWorkspaceMergeConflict,
 				TaskID:      taskID,
+				RunID:       owner.RunID,
+				GraphID:     owner.GraphID,
 				AgentID:     agentID,
 				Path:        rep.Path,
 				Description: fmt.Sprintf("合并冲突（%d 个冲突区域）：%s", len(rep.Conflicts), rep.Detail),
@@ -347,6 +464,8 @@ func (m *Manager) MergeTask(ctx context.Context, taskID, agentID string) (*Merge
 	trace.Emit(trace.Event{
 		Kind:    trace.KindWorkspaceMerged,
 		TaskID:  taskID,
+		RunID:   owner.RunID,
+		GraphID: owner.GraphID,
 		AgentID: agentID,
 		Description: fmt.Sprintf(
 			"合并完成：fast_forward=%d auto_merged=%d new_file=%d identical=%d conflict=%d",
@@ -368,18 +487,68 @@ func (m *Manager) Cleanup(taskID string) error {
 	if filepath.Dir(wsRoot) != filepath.Join(m.projectRoot, DirName) {
 		return fmt.Errorf("拒绝删除 workspace 根外路径：%s", wsRoot)
 	}
+	m.mu.Lock()
+	owner := m.owners[taskID]
+	if active := m.leases[taskID]; active > 0 {
+		m.mu.Unlock()
+		trace.Emit(trace.Event{Kind: trace.KindWorkspaceCleanupRejected, TaskID: taskID,
+			RunID: owner.RunID, GraphID: owner.GraphID, Path: wsRoot,
+			Reason: "active_lease", Description: fmt.Sprintf("leases=%d", active)})
+		return fmt.Errorf("%w: %s leases=%d", ErrWorkspaceInUse, taskID, active)
+	}
 	if err := os.RemoveAll(wsRoot); err != nil {
+		m.mu.Unlock()
 		return fmt.Errorf("删除 workspace 目录失败：%w", err)
 	}
-	m.mu.Lock()
 	delete(m.view, taskID)
+	delete(m.owners, taskID)
+	delete(m.leases, taskID)
 	m.mu.Unlock()
 	trace.Emit(trace.Event{
-		Kind:   trace.KindWorkspaceCleaned,
-		TaskID: taskID,
-		Path:   wsRoot,
+		Kind: trace.KindWorkspaceCleaned, TaskID: taskID,
+		RunID: owner.RunID, GraphID: owner.GraphID, Path: wsRoot,
 	})
 	return nil
+}
+
+// ListWorkspaces 返回物理目录及其持久化 owner。旧目录没有 owner 文件时只
+// 能按 legacy Task workspace 解释；delivery-* 缺 owner 一律报错并保留现场。
+func (m *Manager) ListWorkspaces() ([]Record, error) {
+	entries, err := os.ReadDir(filepath.Join(m.projectRoot, DirName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("读取 workspace 根目录失败：%w", err)
+	}
+	out := make([]Record, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		workspaceID := entry.Name()
+		root, rootErr := m.workspaceRoot(workspaceID)
+		if rootErr != nil {
+			return nil, rootErr
+		}
+		owner, ownerErr := loadOwner(root)
+		if os.IsNotExist(ownerErr) {
+			if strings.HasPrefix(workspaceID, "delivery-") {
+				return nil, fmt.Errorf("delivery workspace %s 缺少 owner metadata，拒绝猜测清理", workspaceID)
+			}
+			out = append(out, Record{WorkspaceID: workspaceID, Owner: TaskOwner(workspaceID), Legacy: true})
+			continue
+		}
+		if ownerErr != nil {
+			return nil, ownerErr
+		}
+		if err := owner.validate(workspaceID); err != nil {
+			return nil, err
+		}
+		out = append(out, Record{WorkspaceID: workspaceID, Owner: owner})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].WorkspaceID < out[j].WorkspaceID })
+	return out, nil
 }
 
 // ListOrphans 返回 workspace 根下所有任务目录的 taskID（不做存活判断，
@@ -408,3 +577,7 @@ func (m *Manager) ListOrphans() ([]string, error) {
 
 // ErrViewNotFound 表示任务没有活动 workspace（如合并已完成）。
 var ErrViewNotFound = fmt.Errorf("任务无活动 workspace")
+
+var ErrWorkspaceInUse = fmt.Errorf("workspace 正在被活动 Activation 使用")
+
+var ErrWorkspaceUnavailable = fmt.Errorf("workspace 物理目录不存在或已失效")

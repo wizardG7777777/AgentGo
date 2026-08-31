@@ -220,6 +220,8 @@ func restoreOrReconcileRuntime(sys *System, snap *session.Snapshot) error {
 	}
 	if sys != nil && sys.TaskOutcomeStore != nil && sys.GraphStore != nil {
 		authority := newGraphTaskOutcomeAuthority(sys.GraphStore, sys.TaskOutcomeStore, sys.LoopStore)
+		authority.candidates, authority.deliveries = sys.WorkspaceManager, sys.DeliveryStore
+		authority.checks = sys.CheckStore
 		if err := authority.RecoverPendingIntents(sys.Store); err != nil {
 			return fmt.Errorf("恢复 pending TerminalIntent: %w", err)
 		}

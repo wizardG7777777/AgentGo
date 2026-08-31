@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"agentgo/internal/fulfillment"
 	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 	"agentgo/internal/loopcontract"
@@ -107,6 +108,48 @@ func TestProcessTaskBlocksWhenNoProgressBudgetExhausted(t *testing.T) {
 	}
 }
 
+func TestFinalizingDominatesL4AttemptRollover(t *testing.T) {
+	taskStore := store.NewMemoryTaskStore(nil, 32, 1, 60)
+	task := enforcementTask(t)
+	task.ProgressContract.Policy.ReminderAfterTurns = 1
+	task.ProgressContract.Policy.RolloverAfterTurns = 1
+	task.ProgressContract.Policy.InterventionAfterTurns = 10
+	task.ProgressContract.Policy.MaxNoProgressTurns = 12
+	task.ProgressContract.Policy.MaxAttemptRollovers = 1
+	if err := taskStore.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskStore.ClaimTask("worker-finalizing", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	progressStore, err := loopstore.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = progressStore.Close() })
+	holder := NewFinalizationHolder()
+	holder.Set(task.ID)
+	var calls atomic.Int32
+	agent := NewAgent("worker-finalizing", "code", taskStore, roster.NewMemoryRoster(),
+		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+			calls.Add(1)
+			holder.MarkTaskFinalized()
+			return ExecuteResult{InvocationID: "inv-finalizing", ProviderCallStarted: true,
+				Output: "终态提交已接受", ToolCalled: true}, nil
+		})
+	agent.FinalizationChecker = holder
+	agent.LoopStore = progressStore
+	agent.processTask(context.Background(), task.ID)
+
+	got, err := taskStore.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.TaskStatusCompleted || got.RetryCount != 0 || calls.Load() != 1 {
+		t.Fatalf("finalizing 必须压过同 Turn 的 L4 rollover: calls=%d task=%+v", calls.Load(), got)
+	}
+}
+
 func TestProjectExecuteResultDoesNotTreatPipelineTailExitAsEvaluationPass(t *testing.T) {
 	taskStore := store.NewMemoryTaskStore(nil, 8, 1, 60)
 	task := &model.Task{ID: "pipeline-task", Status: model.TaskStatusProcessing}
@@ -127,6 +170,42 @@ func TestProjectExecuteResultDoesNotTreatPipelineTailExitAsEvaluationPass(t *tes
 	}, &delta)
 	if len(delta.EvaluationChanges) != 1 || delta.EvaluationChanges[0].AfterVerdict != "ambiguous" {
 		t.Fatalf("pipeline 末段 exit=0 不得成为 evaluation pass: %+v", delta.EvaluationChanges)
+	}
+}
+
+func TestCodeChangeV6TreatsPreMutationCheckAsKnowledgeOnly(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, _ := catalog.ProgressContract(policycatalog.ProgressCodeChangeV6)
+	task := &model.Task{ID: "baseline-check", Status: model.TaskStatusProcessing,
+		ProgressContract:    &profile.Contract,
+		FulfillmentContract: &fulfillment.Contract{RequiredCheckIDs: []string{"verification"}}}
+	agent := &Agent{Store: store.NewMemoryTaskStore(nil, 8, 1, 60)}
+	project := func(checkID, workspaceRef string) loopcontract.TurnSettlementDelta {
+		delta := loopcontract.TurnSettlementDelta{}
+		receipt, _ := json.Marshal(map[string]any{"check_id": checkID, "check_ref": "check:1",
+			"status": "pass", "workspace_revision_ref": workspaceRef})
+		projectExecuteResult(agent, task, ExecuteResult{
+			ToolCalls:   []llm.ToolCall{{ID: "check-call", Name: "run_check"}},
+			ToolResults: []ToolResult{{ToolCallID: "check-call", Content: string(receipt)}},
+		}, &delta)
+		return delta
+	}
+	baseline := project("verification", "workspace:empty")
+	if len(baseline.EvaluationChanges) != 0 || len(baseline.EvidenceChanges) != 1 ||
+		baseline.EvidenceChanges[0].Kind != "run_check_baseline" {
+		t.Fatalf("pre-mutation check 只能推进 knowledge: %+v", baseline)
+	}
+	auxiliary := project("tests-green", "workspace:sha256:changed")
+	if len(auxiliary.EvaluationChanges) != 0 || len(auxiliary.EvidenceChanges) != 1 ||
+		auxiliary.EvidenceChanges[0].Kind != "run_check_auxiliary" {
+		t.Fatalf("非 GraphContract check_id 不得冒充 verification: %+v", auxiliary)
+	}
+	changed := project("verification", "workspace:sha256:changed")
+	if len(changed.EvaluationChanges) != 1 || changed.EvaluationChanges[0].AfterVerdict != "pass" {
+		t.Fatalf("post-mutation typed check 应为 verification progress: %+v", changed)
 	}
 }
 
@@ -179,6 +258,100 @@ func TestProcessTaskInterventionEndsOnlyCurrentGraphActivationWithTypedCommand(t
 		command.ActivationID != task.ActivationID ||
 		command.ReasonCode != loopcontract.InterventionNoProgressStalled {
 		t.Fatalf("typed intervention lineage/reason 错误: %+v", command)
+	}
+}
+
+func TestProcessTaskTimeHandoffWithExistingObservationStopsImmediately(t *testing.T) {
+	taskStore := store.NewMemoryTaskStore(nil, 32, 1, 60)
+	if err := store.SetTerminalOutcomeHook(taskStore, func(intent store.TerminalOutcomeIntent) (string, error) {
+		return "outcome:" + intent.Task.ID, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := catalog.ProgressContract(policycatalog.ProgressCodeChangeV6)
+	if !ok {
+		t.Fatal("缺少 code-change/v6")
+	}
+	now := time.Now().UTC()
+	run := &runcontract.RunContract{
+		Schema: runcontract.SchemaV2, RunID: "run-time-handoff", CreatedAt: now.Add(-time.Minute),
+		DeadlineAt: now.Add(7 * time.Minute), FinalizationReserve: time.Minute,
+		RecoveryReserve: time.Minute, VerificationReserve: time.Minute, BudgetProfile: "test/v2",
+	}
+	task := &model.Task{
+		RunID: run.RunID, RunContract: run, RunPhase: runcontract.PhaseExecution,
+		ProgressContract: &profile.Contract, ContextPolicyRef: policycatalog.ContextDefaultCurrent,
+		Description: "验证 handoff", EventType: "code", MaxConcurrency: 1,
+		GraphID: "g-handoff", NodeID: "work", ActivationID: "work@1", GraphNodeKind: "agent",
+	}
+	if err := taskStore.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskStore.ClaimTask("worker-handoff", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	task, err = taskStore.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	progressStore, err := loopstore.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = progressStore.Close() })
+	runAuthority, err := runbudget.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runAuthority.Close() })
+	deadlines, err := loopDeadlineSet(task, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining := deadlines.Attempt.HardDeadlineAt.Sub(now); remaining <= 0 || remaining >= 5*time.Minute {
+		t.Fatalf("测试必须进入 5 分钟 handoff window: remaining=%s", remaining)
+	}
+	checkpoint := loopcontract.ProgressCheckpoint{
+		Schema:       loopcontract.CheckpointSchemaV1,
+		CheckpointID: "checkpoint-existing-observation", Version: 1,
+		RunID: task.RunID, GraphID: task.GraphID, NodeID: task.NodeID,
+		ActivationID: task.ActivationID, TaskID: task.ID, AttemptID: task.AttemptID,
+		Contract: profile.Contract.Ref, LastAnyProgressAt: now.Add(-time.Minute),
+		LastDeliverableProgressAt: now.Add(-10 * time.Minute), ObservationDeltaRef: "observation:sha256:existing",
+		ObservationAttemptID: task.AttemptID, ObservationPhase: "investigate",
+		ObservationWorkspaceRevisionRef: "workspace:empty",
+		CumulativeUsage:                 runcontract.BudgetUsage{Attempts: 1},
+		InterventionStage:               loopcontract.StageRunning, Deadlines: deadlines, UpdatedAt: now,
+	}
+	if err := progressStore.Initialize(checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	agent := NewAgent("worker-handoff", "code", taskStore, roster.NewMemoryRoster(),
+		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+			calls.Add(1)
+			return ExecuteResult{InvocationID: "inv-handoff", ProviderCallStarted: true,
+				Output: "继续只读调查", ToolCalled: true}, nil
+		})
+	agent.LoopStore = progressStore
+	agent.RunBudgetStore = runAuthority
+	agent.processTask(context.Background(), task.ID)
+	got, err := taskStore.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 || got.Status != model.TaskStatusBlocked ||
+		!strings.Contains(got.Error, "decision_progress_stalled") {
+		t.Fatalf("已有 Observation 的时间 handoff 必须一次 settlement 后立即终结 Activation: calls=%d task=%+v",
+			calls.Load(), got)
+	}
+	commands, err := progressStore.PendingInterventions()
+	if err != nil || len(commands) != 1 || commands[0].ReasonCode != loopcontract.InterventionDecisionStalled {
+		t.Fatalf("时间 handoff 必须只写一条 durable decision intervention: %+v err=%v", commands, err)
 	}
 }
 
@@ -645,7 +818,7 @@ func TestL4PreflightFailureDoesNotConsumeProviderModelCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err = runtime.settleTurn(agent, task, turn1, time.Now().UTC(), ExecuteResult{},
-		errors.New("ToolRouter preflight failed"), false); err != nil {
+		errors.New("ToolRouter preflight failed"), false, false); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, ok, err := runAuthority.Snapshot(task.RunID)
@@ -663,7 +836,7 @@ func TestL4PreflightFailureDoesNotConsumeProviderModelCall(t *testing.T) {
 	}
 	if _, err = runtime.settleTurn(agent, task, turn2, time.Now().UTC(), ExecuteResult{
 		InvocationID: "inv-provider", ProviderCallStarted: true,
-	}, nil, false); err != nil {
+	}, nil, false, false); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, ok, err = runAuthority.Snapshot(task.RunID)
@@ -672,12 +845,131 @@ func TestL4PreflightFailureDoesNotConsumeProviderModelCall(t *testing.T) {
 	}
 }
 
+func TestRecoveryStartPermitIsNotReclaimedByNextAttemptOfSameActivation(t *testing.T) {
+	loopAuthority, err := loopstore.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = loopAuthority.Close() })
+	runAuthority, err := runbudget.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runAuthority.Close() })
+	agent := NewAgent("worker-recovery-permit", "code", store.NewMemoryTaskStore(nil, 8, 1, 60), roster.NewMemoryRoster(), nil)
+	agent.LoopStore, agent.RunBudgetStore = loopAuthority, runAuthority
+
+	first := enforcementTask(t)
+	first.ID, first.AttemptID, first.ActivationID = "work-retry-task", "work-retry-task/attempt-1", "work@2"
+	first.GraphID, first.NodeID, first.GraphNodeKind = "g-retry", "work", "agent"
+	first.RunContract.Budget = runcontract.BudgetLimit{ModelCalls: 2}
+	now := time.Now().UTC()
+	if err = runAuthority.InitializeRun(*first.RunContract, first.RunContract.Budget); err != nil {
+		t.Fatal(err)
+	}
+	permit, err := runAuthority.ReserveExecutionPermit(first.RunID, "recovery-task", "recovery@1",
+		now, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.RunBudgetPermitRef = permit
+	firstRuntime, err := agent.initLoopProgress(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn1 := first.AttemptID + "/turn-1"
+	if _, _, _, err = firstRuntime.reserveModelAction(turn1); err != nil {
+		t.Fatalf("首个 Attempt 未认领 RecoveryStartPermit: %v", err)
+	}
+	if _, err = firstRuntime.settleTurn(agent, first, turn1, now.Add(time.Second), ExecuteResult{
+		InvocationID: "inv-recovery-first", ProviderCallStarted: true,
+	}, errors.New("action contract rejected"), false, false); err != nil {
+		t.Fatal(err)
+	}
+
+	second := *first
+	second.AttemptID = second.ID + "/attempt-2"
+	secondRuntime, err := agent.initLoopProgress(&second)
+	if err != nil {
+		t.Fatalf("同一 Activation 的下一 Attempt 不应重复认领已结算 permit: %v", err)
+	}
+	if !secondRuntime.startPermitClaimed {
+		t.Fatal("下一 Attempt 未恢复 durable permit closed 状态")
+	}
+	turn2 := second.AttemptID + "/turn-1"
+	if _, _, _, err = secondRuntime.reserveModelAction(turn2); err != nil {
+		t.Fatalf("下一 Attempt 应改用普通 execution reservation: %v", err)
+	}
+	if _, err = secondRuntime.settleTurn(agent, &second, turn2, now.Add(2*time.Second), ExecuteResult{
+		InvocationID: "inv-recovery-second", ProviderCallStarted: true,
+	}, nil, false, false); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok, err := runAuthority.Snapshot(first.RunID)
+	if err != nil || !ok || snapshot.Settled.ModelCalls != 2 || snapshot.Reserved.ModelCalls != 0 {
+		t.Fatalf("permit 与 retry 普通调用未各结算一次: snapshot=%+v ok=%t err=%v", snapshot, ok, err)
+	}
+}
+
+func TestModelReservationCancelAndUnknownPathsLeaveNoActiveReservation(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		close       func(*loopProgressRuntime, string) error
+		wantSettled int64
+	}{
+		{name: "pre-dispatch cancel", close: func(runtime *loopProgressRuntime, turnID string) error {
+			return runtime.cancelModelAction(turnID, "binding failed")
+		}, wantSettled: 0},
+		{name: "uncertain close", close: func(runtime *loopProgressRuntime, _ string) error {
+			return runtime.closeOutstandingReservations()
+		}, wantSettled: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			loopAuthority, err := loopstore.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = loopAuthority.Close() })
+			runAuthority, err := runbudget.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = runAuthority.Close() })
+			agent := NewAgent("worker-reservation-close", "code", store.NewMemoryTaskStore(nil, 8, 1, 60), roster.NewMemoryRoster(), nil)
+			agent.LoopStore, agent.RunBudgetStore = loopAuthority, runAuthority
+			task := enforcementTask(t)
+			task.ID, task.AttemptID = "task-reservation-close", "task-reservation-close/attempt-1"
+			task.RunContract.Budget = runcontract.BudgetLimit{ModelCalls: 1}
+			runtime, err := agent.initLoopProgress(task)
+			if err != nil {
+				t.Fatal(err)
+			}
+			turnID := task.AttemptID + "/turn-1"
+			if _, _, _, err = runtime.reserveModelAction(turnID); err != nil {
+				t.Fatal(err)
+			}
+			if err = test.close(runtime, turnID); err != nil {
+				t.Fatal(err)
+			}
+			snapshot, ok, err := runAuthority.Snapshot(task.RunID)
+			if err != nil || !ok || snapshot.Reserved != (runcontract.BudgetUsage{}) ||
+				snapshot.Settled.ModelCalls != test.wantSettled {
+				t.Fatalf("Run reservation 未关闭: snapshot=%+v ok=%t err=%v", snapshot, ok, err)
+			}
+			pending, err := loopAuthority.PendingReservations(task.ID)
+			if err != nil || len(pending) != 0 {
+				t.Fatalf("Loop reservation 未关闭: pending=%+v err=%v", pending, err)
+			}
+		})
+	}
+}
+
 func TestGraphAuthoringToolsAreCoordinationProgressSignals(t *testing.T) {
 	for _, name := range []string{
 		"create_graph_draft", "configure_simple_graph_draft", "read_graph_draft", "patch_graph_draft",
 		"validate_graph_draft", "validate_current_graph_draft", "commit_graph_draft", "commit_current_graph_draft",
 		"start_graph", "start_current_graph", "propose_graph_change", "read_graph_change",
-		"validate_graph_change", "commit_graph_change",
+		"validate_graph_change", "commit_graph_change", "submit_graph_change_decision",
 	} {
 		if !isCoordinationTool(name) {
 			t.Errorf("Graph authoring/change tool %s 未映射为 coordination progress", name)
@@ -744,6 +1036,152 @@ func TestCodeChangeV5KnowledgeNeverForcesDeliveryAndEighthTurnCheckpoints(t *tes
 	if !decision.Intervention || decision.ObservationAction != "observation_stalled" || intervention == nil ||
 		intervention.ReasonCode != loopcontract.InterventionObservationStalled {
 		t.Fatalf("连续无语义前进的 Observation 必须转交 L5 recovery，不得继续刷新新证据: %+v %+v", decision, intervention)
+	}
+}
+
+func TestCodeChangeV6CheckpointsAtSixAndStopsOnSecondDecisionStagnation(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := catalog.ProgressContract(policycatalog.ProgressCodeChangeV6)
+	if !ok {
+		t.Fatal("缺少 code-change/v6")
+	}
+	task := replayGateTask("v6-decision-stall", nil)
+	task.ProgressContract = &profile.Contract
+	checkpoint := loopcontract.ProgressCheckpoint{KnowledgeTurnsSinceObservation: 5,
+		InterventionStage: loopcontract.StageRunning}
+	decision, intervention := decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if decision.ObservationAction != "" || intervention != nil {
+		t.Fatalf("前 5 个知识 turn 不应 checkpoint: %+v %+v", decision, intervention)
+	}
+	checkpoint.KnowledgeTurnsSinceObservation = 6
+	decision, intervention = decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if decision.ObservationAction != "periodic" || intervention != nil {
+		t.Fatalf("第 6 个知识 turn 必须 checkpoint: %+v %+v", decision, intervention)
+	}
+	checkpoint.KnowledgeTurnsSinceObservation = 0
+	checkpoint.DecisionStagnationCount = 2
+	checkpoint.ObservationDeltaRef = "observation:sha256:stale"
+	decision, intervention = decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if !decision.Intervention || decision.ObservationAction != "decision_stalled" || intervention == nil ||
+		intervention.ReasonCode != loopcontract.InterventionDecisionStalled {
+		t.Fatalf("第二个无决策前进 checkpoint 必须 typed intervention: %+v %+v", decision, intervention)
+	}
+}
+
+func TestCodeChangeV6ForcesExactSubmitAfterMutationAndPassingCheck(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, _ := catalog.ProgressContract(policycatalog.ProgressCodeChangeV6)
+	task := replayGateTask("v6-verified", nil)
+	task.ProgressContract = &profile.Contract
+	checkpoint := loopcontract.ProgressCheckpoint{
+		InterventionStage: loopcontract.StageRunning,
+		RecentFingerprints: []loopcontract.ProgressFingerprint{
+			{Kind: loopcontract.SignalFileVersionChanged, Identity: "a.go", Digest: "new"},
+			{Kind: loopcontract.SignalEvaluationPassed, Identity: "declared-evaluator", Digest: "pass"},
+		},
+	}
+	decision, intervention := decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if intervention != nil || !strings.Contains(decision.Reminder, progressDeliverableRequiredMarker) {
+		t.Fatalf("mutation + typed pass 后必须立即 exact submit: decision=%+v intervention=%+v", decision, intervention)
+	}
+}
+
+func TestCodeChangeV6RejectsPassingCheckThatPredatesMutation(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, _ := catalog.ProgressContract(policycatalog.ProgressCodeChangeV6)
+	task := replayGateTask("v6-stale-check", nil)
+	task.ProgressContract = &profile.Contract
+	checkpoint := loopcontract.ProgressCheckpoint{
+		InterventionStage: loopcontract.StageRunning,
+		RecentFingerprints: []loopcontract.ProgressFingerprint{
+			{Kind: loopcontract.SignalEvaluationPassed, Identity: "declared-evaluator", Digest: "stale-pass"},
+			{Kind: loopcontract.SignalFileVersionChanged, Identity: "a.go", Digest: "new"},
+		},
+	}
+	decision, intervention := decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if intervention != nil || strings.Contains(decision.Reminder, progressDeliverableRequiredMarker) {
+		t.Fatalf("mutation 前的 stale pass 不得触发 submit-only: decision=%+v intervention=%+v", decision, intervention)
+	}
+	checkpoint.RecentFingerprints = append(checkpoint.RecentFingerprints,
+		loopcontract.ProgressFingerprint{Kind: loopcontract.SignalEvaluationPassed,
+			Identity: "declared-evaluator", Digest: "fresh-pass"})
+	decision, intervention = decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if intervention != nil || !strings.Contains(decision.Reminder, progressDeliverableRequiredMarker) {
+		t.Fatalf("mutation 后 typed pass 应触发 submit-only: decision=%+v intervention=%+v", decision, intervention)
+	}
+}
+
+func TestCodeChangeV6PreMutationGuardRequestsRecovery(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, _ := catalog.ProgressContract(policycatalog.ProgressCodeChangeV6)
+	task := replayGateTask("v6-pre-mutation", nil)
+	task.ProgressContract = &profile.Contract
+	checkpoint := loopcontract.ProgressCheckpoint{ExplorationTurnsSinceDeliverable: 25,
+		ObservationDeltaRef: "observation:sha256:investigated", InterventionStage: loopcontract.StageRunning}
+	decision, intervention := decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if !decision.Intervention || decision.Blocked || intervention == nil ||
+		intervention.ReasonCode != loopcontract.InterventionDecisionStalled {
+		t.Fatalf("24 turn 仍无 mutation 必须交 L5 recovery: decision=%+v intervention=%+v", decision, intervention)
+	}
+	checkpoint.ObservationDeltaRef = ""
+	decision, intervention = decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if intervention != nil || decision.ObservationAction != "decision_stalled" ||
+		!strings.Contains(decision.Reminder, observationCheckpointRequiredMarker) {
+		t.Fatalf("无 Observation 时必须先冻结再 recovery: decision=%+v intervention=%+v", decision, intervention)
+	}
+
+	now := time.Now().UTC()
+	checkpoint = loopcontract.ProgressCheckpoint{
+		ExplorationTurnsSinceDeliverable: 10,
+		ObservationDeltaRef:              "observation:sha256:investigated",
+		UpdatedAt:                        now,
+		LastDeliverableProgressAt:        now.Add(-10 * time.Minute),
+		Deadlines: loopcontract.DeadlineSet{Attempt: runcontract.DeadlineBudget{
+			Scope: runcontract.ScopeAttempt, HardDeadlineAt: now.Add(90 * time.Second),
+		}},
+	}
+	decision, intervention = decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if !decision.Intervention || decision.ObservationAction != "decision_stalled" || intervention == nil ||
+		intervention.ReasonCode != loopcontract.InterventionDecisionStalled {
+		t.Fatalf("Attempt 剩余窗口不足且无 mutation 时必须提前交 L5: %+v %+v", decision, intervention)
+	}
+	checkpoint.LastDeliverableProgressAt = now
+	decision, intervention = decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if decision.Intervention || intervention != nil {
+		t.Fatalf("整个 Attempt 本就短于 handoff reserve 时不得开局即介入: %+v %+v", decision, intervention)
+	}
+}
+
+func TestCodeChangeV6DecisionCheckpointCountsNoProgressBusinessTurns(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, _ := catalog.ProgressContract(policycatalog.ProgressCodeChangeV6)
+	task := replayGateTask("v6-decision-cadence", nil)
+	task.ProgressContract = &profile.Contract
+	checkpoint := loopcontract.ProgressCheckpoint{TurnsSinceDecisionCheckpoint: 5,
+		InterventionStage: loopcontract.StageRunning}
+	decision, _ := decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if decision.ObservationAction != "" {
+		t.Fatalf("前 5 个业务 turn 不应 checkpoint: %+v", decision)
+	}
+	checkpoint.TurnsSinceDecisionCheckpoint = 6
+	decision, intervention := decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if decision.ObservationAction != "periodic" || intervention != nil {
+		t.Fatalf("第 6 个业务 turn 必须冻结 decision state: %+v %+v", decision, intervention)
 	}
 }
 

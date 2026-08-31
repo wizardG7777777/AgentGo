@@ -92,14 +92,31 @@ type progressObservationKey struct {
 // WorkspaceCleaner 是 Watchdog 清扫孤儿 workspace 所需的最小控制面接口。
 // *workspace.Manager 天然满足（见下方编译期断言）；测试可注入 fake。
 type WorkspaceCleaner interface {
-	// ListOrphans 返回 workspace 根下全部任务目录的 taskID（不做存活判断）。
-	ListOrphans() ([]string, error)
+	// ListWorkspaces 返回物理 workspace 与持久化 owner，不从目录名猜身份。
+	ListWorkspaces() ([]workspace.Record, error)
+	// InUse 报告是否仍有 Agent Activation 持有活动租约。
+	InUse(workspaceID string) bool
 	// Cleanup 删除任务 workspace 目录并注销活动视图。
-	Cleanup(taskID string) error
+	Cleanup(workspaceID string) error
 }
 
 // 编译期断言：*workspace.Manager 满足清扫接口。
 var _ WorkspaceCleaner = (*workspace.Manager)(nil)
+
+// WorkspaceRetentionResolver 裁决非 Task workspace 的持久化生命周期。
+// known=false 必须 fail-closed 保留现场；Watchdog 无权猜测 Delivery 终态。
+type WorkspaceRetentionResolver interface {
+	RetainWorkspace(record workspace.Record) (retain bool, known bool)
+}
+
+type WorkspaceRetentionResolverFunc func(record workspace.Record) (bool, bool)
+
+func (f WorkspaceRetentionResolverFunc) RetainWorkspace(record workspace.Record) (bool, bool) {
+	if f == nil {
+		return true, false
+	}
+	return f(record)
+}
 
 type Watchdog struct {
 	Store         store.TaskStore
@@ -111,7 +128,8 @@ type Watchdog struct {
 	RouteResolver RouteResolver
 	// ProgressReader 读取 L4 durable checkpoint。nil 时新任务仍不会回退到
 	// TimeoutSeconds；超过 heartbeat lease 后只报告 checkpoint missing。
-	ProgressReader ProgressReader
+	ProgressReader     ProgressReader
+	WorkspaceRetention WorkspaceRetentionResolver
 	// WorkspaceManager 是 workspace 控制面（nil-safe）：注入后每个巡检周期
 	// 顺带清扫孤儿 workspace（任务不存在或已达终态的任务目录）。
 	// nil 时跳过——保持既有测试与最小装配行为不变。
@@ -1031,16 +1049,56 @@ func (w *Watchdog) cleanupWorkspaceOrphans() {
 	if mgr == nil {
 		return
 	}
-	orphans, err := mgr.ListOrphans()
+	records, err := mgr.ListWorkspaces()
 	if err != nil {
 		log.Printf("[watchdog] workspace 孤儿扫描失败: %v", err)
 		return
 	}
-	for _, taskID := range orphans {
-		if w.IsWorkspaceExempt(taskID) {
-			log.Printf("[watchdog] workspace 命中冻结 session 豁免，跳过清理 (task=%s)", taskID)
+	for _, record := range records {
+		workspaceID := record.WorkspaceID
+		if w.IsWorkspaceExempt(workspaceID) {
+			log.Printf("[watchdog] workspace 命中冻结 session 豁免，跳过清理 (workspace=%s)", workspaceID)
 			continue
 		}
+		if mgr.InUse(workspaceID) {
+			trace.Emit(trace.Event{Kind: trace.KindWorkspaceRetentionDecided, TaskID: workspaceID,
+				RunID: record.Owner.RunID, GraphID: record.Owner.GraphID, Reason: "active_lease",
+				Description: "retain=true owner=" + string(record.Owner.Kind)})
+			log.Printf("[watchdog] workspace 仍有活动租约，跳过清理 (workspace=%s)", workspaceID)
+			continue
+		}
+		if record.Owner.Kind == workspace.OwnerDelivery {
+			if w.WorkspaceRetention == nil {
+				trace.Emit(trace.Event{Kind: trace.KindWorkspaceRetentionDecided, TaskID: workspaceID,
+					RunID: record.Owner.RunID, GraphID: record.Owner.GraphID, Reason: "resolver_missing",
+					Description: "retain=true owner=delivery known=false"})
+				log.Printf("[watchdog] Delivery workspace 缺少生命周期裁决器，保留现场 (workspace=%s graph=%s)",
+					workspaceID, record.Owner.GraphID)
+				continue
+			}
+			retain, known := w.WorkspaceRetention.RetainWorkspace(record)
+			reason := "delivery_retained"
+			if !known {
+				reason = "delivery_liveness_unknown"
+			} else if !retain {
+				reason = "delivery_committed_cleanup"
+			}
+			trace.Emit(trace.Event{Kind: trace.KindWorkspaceRetentionDecided, TaskID: workspaceID,
+				RunID: record.Owner.RunID, GraphID: record.Owner.GraphID, Reason: reason,
+				Description: fmt.Sprintf("retain=%t known=%t owner=delivery", retain, known)})
+			if !known || retain {
+				log.Printf("[watchdog] Delivery workspace 保留 (workspace=%s graph=%s known=%t)",
+					workspaceID, record.Owner.GraphID, known)
+				continue
+			}
+			if err := mgr.Cleanup(workspaceID); err != nil {
+				log.Printf("[watchdog] 清理已提交 Delivery workspace 失败 (workspace=%s): %v", workspaceID, err)
+				continue
+			}
+			log.Printf("[watchdog] 已清理完成提交的 Delivery workspace (workspace=%s)", workspaceID)
+			continue
+		}
+		taskID := record.Owner.TaskID
 		task, err := w.Store.GetTask(taskID)
 		switch {
 		case err != nil || task == nil:
@@ -1050,10 +1108,10 @@ func (w *Watchdog) cleanupWorkspaceOrphans() {
 		default:
 			continue // 任务仍活跃，保留 workspace
 		}
-		if err := mgr.Cleanup(taskID); err != nil {
-			log.Printf("[watchdog] 清理孤儿 workspace 失败 (task=%s): %v", taskID, err)
+		if err := mgr.Cleanup(workspaceID); err != nil {
+			log.Printf("[watchdog] 清理孤儿 workspace 失败 (task=%s workspace=%s): %v", taskID, workspaceID, err)
 			continue
 		}
-		log.Printf("[watchdog] 已清理孤儿 workspace (task=%s)", taskID)
+		log.Printf("[watchdog] 已清理孤儿 workspace (task=%s workspace=%s)", taskID, workspaceID)
 	}
 }

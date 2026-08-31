@@ -371,7 +371,7 @@ func TestWireGraphRuntimeRegistersInterventionAfterTerminalFeed(t *testing.T) {
 	t.Cleanup(func() { registry.Quiesce(0) })
 	graphs, _, err := wireGraphRuntimeWithOutcome(
 		&config.Config{ProjectRoot: root}, tasks, registry, nil, policies, func() string { return "" },
-		outcomes, loops,
+		outcomes, loops, nil,
 	)
 	if err != nil {
 		t.Fatal(err)

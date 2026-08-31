@@ -96,12 +96,15 @@ agents:
 | `request_user_input` | MetaGroup | 创建 2–8 选项的普通 `agent_question`，等待后只返回 `request_id`、稳定 `option_id` 与 `text` |
 | `request_replan` | PlanControlGroup | 提交事实，请 Scheduler 重新评估编排（非图任务发布通用 replan 唤醒任务） |
 | `submit_task_result` | PlanControlGroup | 普通执行节点的结构化提交（Graph acceptance runner 以 `verdict=pass|fixable|failed` 提交结论；completed 结果省略 `event`） |
-| `record_observation_delta` | ObservationGroup | 记录当前 Task/Attempt 的 confirmed facts、EvidenceRef 与下一步；framework 自动注入 business v2/v5 Graph agent Lease |
+| `record_observation_delta` | ObservationGroup | 记录当前 Task/Attempt 的 inferred claims、EvidenceRef 与下一步；framework 自动注入 Graph agent control phase |
 | `submit_recovery_decision` | PlanControlGroup | recovery controller 专用 typed retry/blocked；source authority 由 framework 自动绑定 |
+| `submit_change_decision` | PlanControlGroup | RecoveryDelta v4 work 专用 typed edit/need_context/hypothesis_rejected/blocked；仅证据完整覆盖后的 control phase 暴露 |
 
-`record_observation_delta` 是 framework control tool，不需要写入用户 profile。只有
-新冻结的 business v2/v5 Graph agent Lease 自动获得；历史 Lease 不扩大，
-acceptance、unknown role 与非 Graph task 也不会因此获得该能力。
+`record_observation_delta` 与 `submit_change_decision` 是 framework control tool，
+不需要写入用户 profile。前者只在冻结 ProgressContract 的 Graph agent
+Observation phase 获得；后者只在带 v4 `recovery_directive` 的 Graph work Lease
+获得。历史 Lease 不扩大，acceptance、unknown role 与非 Graph task 不会因此
+获得这些能力。
 
 以下 Plan 工具已随 V6（C6a/C6b）全部删除，不要再写入 profile：
 

@@ -155,4 +155,80 @@ func TestRecoveryStartPermitReservesAndTransfersFirstModelCall(t *testing.T) {
 	if err != nil || !ok || snapshot.Settled.ModelCalls != 1 || snapshot.Reserved.ModelCalls != 0 {
 		t.Fatalf("permit claim/settlement 未进入 Run ledger: %+v ok=%v err=%v", snapshot, ok, err)
 	}
+	closed, err := store.ExecutionPermitClosedForTask(contract.RunID, permit, "work-task")
+	if err != nil || !closed {
+		t.Fatalf("已结算 permit 未对同一 Task 暴露 durable closed 状态: closed=%t err=%v", closed, err)
+	}
+	if _, err = store.ExecutionPermitClosedForTask(contract.RunID, permit, "other-task"); err == nil {
+		t.Fatal("跨 Task 查询已认领 permit 必须 fail-closed")
+	}
+}
+
+func TestRecoveryStartPermitClosedStateSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	contract := testContract(now)
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.InitializeRun(contract, contract.Budget); err != nil {
+		t.Fatal(err)
+	}
+	permit, err := store.ReserveExecutionPermit(contract.RunID, "recovery-task", "recovery@1",
+		now, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ClaimExecutionPermit(contract.RunID, permit, "work-action", "work-task", "work/attempt-1", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Settle(Settlement{Schema: SettlementSchemaV1, SettlementID: "settlement-work",
+		ReservationID: permit, ActionID: "work-action", RunID: contract.RunID,
+		Status: SettlementFailed, SettledAt: now.Add(2 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = recovered.Close() })
+	closed, err := recovered.ExecutionPermitClosedForTask(contract.RunID, permit, "work-task")
+	if err != nil || !closed {
+		t.Fatalf("重启后 permit claim/settlement 身份丢失: closed=%t err=%v", closed, err)
+	}
+}
+
+func TestCancelExecutionPermitClosesUnclaimedReservation(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	now := time.Now().UTC()
+	contract := testContract(now)
+	contract.Budget.ModelCalls = 1
+	if err := store.InitializeRun(contract, contract.Budget); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReserveExecutionPermit(contract.RunID, "recovery-task", "recovery@1",
+		now, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CancelExecutionPermit(contract.RunID, "recovery-task", "recovery@1",
+		now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CancelExecutionPermit(contract.RunID, "recovery-task", "recovery@1",
+		now.Add(2*time.Second)); err != nil {
+		t.Fatalf("重复取消应幂等: %v", err)
+	}
+	snapshot, ok, err := store.Snapshot(contract.RunID)
+	if err != nil || !ok || snapshot.Reserved != (runcontract.BudgetUsage{}) ||
+		snapshot.Settled.ModelCalls != 0 {
+		t.Fatalf("取消 permit 后仍 active/伪消费: snapshot=%+v ok=%v err=%v", snapshot, ok, err)
+	}
 }

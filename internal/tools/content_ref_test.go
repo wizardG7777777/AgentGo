@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,13 +30,14 @@ type contentRefToolFixture struct {
 }
 
 type contentRefFixtureOptions struct {
-	taskGraphID  string
-	taskRunID    runcontract.RunID
-	ownerScope   *contentstore.Scope
-	leaseTools   []string
-	tamperDigest bool
-	session      string
-	sessionFn    func() string
+	taskGraphID   string
+	taskRunID     runcontract.RunID
+	contextInputs func(string) []model.TaskContextInput
+	ownerScope    *contentstore.Scope
+	leaseTools    []string
+	tamperDigest  bool
+	session       string
+	sessionFn     func() string
 }
 
 func newContentRefToolFixture(t *testing.T, options contentRefFixtureOptions) *contentRefToolFixture {
@@ -70,6 +72,28 @@ func newContentRefToolFixture(t *testing.T, options contentRefFixtureOptions) *c
 		task.ProgressContract = &progress.Contract
 		task.ContextPolicyRef = policycatalog.ContextDefaultCurrent
 	}
+	session := options.session
+	if session == "" {
+		session = "session-1"
+	}
+	owner := contentstore.Scope{
+		Kind: contentstore.ScopeTask, SessionID: session,
+		GraphID: task.GraphID, TaskID: task.ID,
+	}
+	if options.ownerScope != nil {
+		owner = *options.ownerScope
+	}
+	ref, err := content.Put(context.Background(), contentstore.PutRequest{
+		Content: []byte("abcdefghijklmnopqrstuvwxyz"), MediaType: "text/plain; charset=utf-8",
+		RetentionClass: contextcontract.RetentionTaskLifetime,
+		Authority:      contextcontract.AuthorityInformational, Scope: owner,
+	})
+	if err != nil {
+		t.Fatalf("Put ContentRef: %v", err)
+	}
+	if options.contextInputs != nil {
+		task.ContextInputs = options.contextInputs(ref.RefID)
+	}
 	if err := tasks.PublishTask(task); err != nil {
 		t.Fatalf("PublishTask: %v", err)
 	}
@@ -94,25 +118,6 @@ func newContentRefToolFixture(t *testing.T, options contentRefFixtureOptions) *c
 	fresh, err := tasks.GetTask(task.ID)
 	if err != nil {
 		t.Fatalf("GetTask: %v", err)
-	}
-	session := options.session
-	if session == "" {
-		session = "session-1"
-	}
-	owner := contentstore.Scope{
-		Kind: contentstore.ScopeTask, SessionID: session,
-		GraphID: task.GraphID, TaskID: task.ID,
-	}
-	if options.ownerScope != nil {
-		owner = *options.ownerScope
-	}
-	ref, err := content.Put(context.Background(), contentstore.PutRequest{
-		Content: []byte("abcdefghijklmnopqrstuvwxyz"), MediaType: "text/plain; charset=utf-8",
-		RetentionClass: contextcontract.RetentionTaskLifetime,
-		Authority:      contextcontract.AuthorityInformational, Scope: owner,
-	})
-	if err != nil {
-		t.Fatalf("Put ContentRef: %v", err)
 	}
 	sessionFn := options.sessionFn
 	if sessionFn == nil {
@@ -225,6 +230,78 @@ func TestContentRefGroupScopeAndFrozenLeaseSecurity(t *testing.T) {
 			_, err := fixture.dispatch(map[string]any{"ref_id": fixture.ref.RefID, "limit": 4})
 			if err == nil {
 				t.Fatal("跨 scope/无效 Lease 不得解引用")
+			}
+		})
+	}
+}
+
+func TestContentRefGroupAllowsOnlyFrozenUpstreamDelegation(t *testing.T) {
+	owner := contentstore.Scope{
+		Kind: contentstore.ScopeTask, SessionID: "session-1",
+		GraphID: "graph-1", TaskID: "task-producer",
+	}
+	fixture := newContentRefToolFixture(t, contentRefFixtureOptions{
+		taskGraphID: "graph-1", ownerScope: &owner,
+		contextInputs: func(refID string) []model.TaskContextInput {
+			return []model.TaskContextInput{{
+				Kind:      model.TaskContextUpstreamEvidence,
+				SourceRef: "graph:graph-1/activation:producer@1/evidence:implementation",
+				Content: `<upstream-evidence authority="graph-dataflow">
+{"evidence":[{"kind":"check","output_ref":"` + refID + `"}]}
+</upstream-evidence>`,
+			}}
+		},
+	})
+	if output, err := fixture.dispatch(map[string]any{"ref_id": fixture.ref.RefID, "limit": 4}); err != nil {
+		t.Fatalf("冻结上游 Evidence 明确携带的 ContentRef 应可读: %v", err)
+	} else if !strings.Contains(output, `"content":"abcd"`) {
+		t.Fatalf("委托读取输出不符: %s", output)
+	}
+}
+
+func TestContentRefGroupRejectsBroadOrTextualUpstreamDelegation(t *testing.T) {
+	owner := contentstore.Scope{
+		Kind: contentstore.ScopeTask, SessionID: "session-1",
+		GraphID: "graph-1", TaskID: "task-producer",
+	}
+	tests := []struct {
+		name  string
+		input func(string) model.TaskContextInput
+	}{
+		{
+			name: "同 Graph 但未冻结 Ref",
+			input: func(string) model.TaskContextInput {
+				return model.TaskContextInput{Kind: model.TaskContextUpstreamEvidence,
+					SourceRef: "graph:graph-1/activation:producer@1/evidence:default",
+					Content:   `<upstream-evidence>{"output_ref":"content:sha256:other"}</upstream-evidence>`}
+			},
+		},
+		{
+			name: "仅作为字符串子串",
+			input: func(refID string) model.TaskContextInput {
+				return model.TaskContextInput{Kind: model.TaskContextUpstreamEvidence,
+					SourceRef: "graph:graph-1/activation:producer@1/evidence:default",
+					Content:   `<upstream-evidence>{"note":"prefix-` + refID + `-suffix"}</upstream-evidence>`}
+			},
+		},
+		{
+			name: "伪造非 Graph source_ref",
+			input: func(refID string) model.TaskContextInput {
+				return model.TaskContextInput{Kind: model.TaskContextUpstreamEvidence,
+					SourceRef: "prompt:copied-ref", Content: `{"output_ref":"` + refID + `"}`}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newContentRefToolFixture(t, contentRefFixtureOptions{
+				taskGraphID: "graph-1", ownerScope: &owner,
+				contextInputs: func(refID string) []model.TaskContextInput {
+					return []model.TaskContextInput{tc.input(refID)}
+				},
+			})
+			if _, err := fixture.dispatch(map[string]any{"ref_id": fixture.ref.RefID, "limit": 4}); !errors.Is(err, contentstore.ErrAccessDenied) {
+				t.Fatalf("不得把同 Graph 或文本包含泛化为委托: %v", err)
 			}
 		})
 	}

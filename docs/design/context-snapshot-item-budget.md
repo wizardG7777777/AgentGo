@@ -1,12 +1,28 @@
 # Context Snapshot / Item Budget 架构
 
-> 状态：Accepted Design，Context v8 + Responses typed replay implementation complete / single-task verified<br>
-> 日期：2026-08-23<br>
+> 状态：Accepted Design，Context v10 + Replay v4 implementation complete / external batch validation open<br>
+> 日期：2026-08-28<br>
 > 归属：L2 Context Engineering<br>
 > 对应问题：SWE-013<br>
 > 上位规范：[`五层工程架构规范`](five-layer-engineering-architecture.md)<br>
 > 关联设计：[`Loop Progress Contract / Checkpoint / Deadline`](loop-progress-checkpoint-and-deadline.md)<br>
 > 统一路线图：[`SWE 架构修复统一实施路线图`](swe-architecture-repair-roadmap.md)
+
+## 0.0 2026-08-28 Context v10 / Replay v4
+
+- 新 Run 默认 `context:default/v10` 与
+  `provider-replay:openai-compatible/v4`；v1–v9 与 Replay v1–v3 的具体 policy
+  和 digest 不改写。
+- ModelCapability 只展开 snapshot 总输入预算、completion reserve、模型窗口和
+  RequiredExact provider replay 容器；普通 `prompt_component`、`tool_result`、
+  `task_memory`、`tool_definition` 等类型继续受稳定单项/section cap 约束。
+- Replay v4 以业务历史中的最新 durable Observation 锚点为语义切点：已被其覆盖
+  的 read/grep/list/glob tool result 与纯探索 assistant content 进入 task-scoped
+  ContentStore，wire 保持原 tool-call/tool-result 原子组但正文变为稳定 Ref。
+- 同 task/attempt/规范路径/content digest 的重复探索结果只让最新项保留 bounded
+  preview；旧项 tombstone。身份不依赖展示序号或 map 遍历顺序。
+- Manifest 为 referenced/tombstoned 项记录 `projection_reason`、原文 digest 和
+  ContentRef；Raw History 与 RequiredExact Responses items 始终保留。
 
 ## 0.1 2026-08-23 实施状态
 
@@ -419,9 +435,12 @@ priority
 | `context:default/v3` | 64 KiB / 16K estimated tokens | 96 KiB / 24K | 历史 Run；Replay v2 + model window/reserve + Raw History projection |
 | `context:default/v4–v5` | 64 KiB / 16K estimated tokens | 96 KiB / 24K | 历史 Run；mixed estimator 与 RequiredExact reasoning 修订 |
 | `context:default/v6` | 64 KiB / 16K estimated tokens | 96 KiB / 24K | 历史 Run；92K input + 32K completion + 4K overhead |
-| `context:default/v7` | 64 KiB / 16K estimated tokens | 96 KiB / 24K | 新 Run；v6窗口分配 + optional reasoning 字节容器修订 |
+| `context:default/v7` | 64 KiB / 16K estimated tokens | 96 KiB / 24K | 历史 Run；v6窗口分配 + optional reasoning 字节容器修订 |
+| `context:default/v8` | 64 KiB / 16K estimated tokens | 96 KiB / 24K | 历史 Run；Replay v3 Responses typed items |
+| `context:default/v9` | 由 ModelCapability 放大 | 由 ModelCapability 放大 | 历史 Run；adaptive 全项 cap 事故语义冻结 |
+| `context:default/v10` | 64 KiB / 16K estimated tokens | 96 KiB / 24K | 新 Run；Replay v4，只有 snapshot/RequiredExact 自适应 |
 
-`ContextDefaultCurrent` 只允许在创建新契约时解析为 v7；恢复已有 Task 时必须读取
+`ContextDefaultCurrent` 只允许在创建新契约时解析为 v10；恢复已有 Task 时必须读取
 持久化的具体 ref，禁止借别名静默升级。v2 的 system section 与
 `AtomicSystemInstructionSet` 同为 96 KiB，使一个最大 64 KiB 的 `agent_role` 与
 独立 output contract 能同时合法存在；这不是取消 hard cap。
@@ -601,6 +620,12 @@ L2 只决定是否使用 Ref/摘要，不直接实现文件格式或 fsync。
 Context 中出现 `content_ref:...` 只是信息和谱系，不代表模型可读取原文。需要读取
 时必须调用明确工具，经冻结 ExecutionLease、scope、path/content boundary 和
 预算再次校验。
+
+Graph 数据流是唯一的跨 Task 例外，但仍不是“同 Graph 可互读”：当 L5 把上游
+Result/Evidence 冻结为下游 `Task.ContextInputs` 后，L3 只允许解引用其中 JSON
+string value 与 `ref_id` 逐字相等、同 Session/Graph 的 task-scoped ContentRef。
+每页读取都重读当前 Task、ExecutionLease 和冻结 ContextInputs。仅在自由文本中
+出现、作为另一字符串子串、伪造 `source_ref`，或只满足同 Graph 的引用均拒绝。
 
 Graph ResultRef、EvidenceRef、ArtifactRef 应优先复用各自权威 Store，不把所有
 类型强行复制进通用 Content Store。
@@ -933,7 +958,8 @@ Snapshot 引用的 ContentRef 若已按 retention 合法过期：
 2. Secret/redacted fragment 的 digest 不能用于可逆展示；Trace 不打印正文。
 3. reasoning retention 默认最小化，provider replay 只在当前 Attempt 所需作用域内
    保留。
-4. Content Store 按 Session/Task/Graph scope 校验；跨 scope 引用 fail-closed。
+4. Content Store 按 Session/Task/Graph scope 校验；跨 Task 只接受 L5 已冻结到
+   当前 ContextInputs 的逐字上游引用委托，其余跨 scope 引用 fail-closed。
 5. 大内容 quarantine 与普通 Artifact 分离，不能被误当成用户交付物。
 6. summary transform 保留 authority，不把模型自述升级为 confirmed。
 7. 原文删除与 retention 到期需要明确 ledger；不能只删文件留下悬空“可用”Ref。

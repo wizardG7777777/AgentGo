@@ -87,7 +87,7 @@ func TestSchedulerCoreAndEveryPhasePassCurrentContextPolicy(t *testing.T) {
 }
 
 func TestSchedulerPromptVersionTracksPhaseArchitecture(t *testing.T) {
-	const want = "embedded:v10.7-observation-recovery-finalization"
+	const want = "embedded:v10.11-recovery-evidence-v4"
 	if schedulerPromptVersion != want {
 		t.Fatalf("schedulerPromptVersion=%q want=%q", schedulerPromptVersion, want)
 	}

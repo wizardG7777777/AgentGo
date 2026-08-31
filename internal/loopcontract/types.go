@@ -119,18 +119,24 @@ type ProgressSignalRule struct {
 
 // ProgressPolicy 是 framework policy catalog 解析后的有界策略。
 type ProgressPolicy struct {
-	PolicyRef                     string                  `json:"policy_ref"`
-	ReminderAfterTurns            int                     `json:"reminder_after_turns"`
-	RolloverAfterTurns            int                     `json:"rollover_after_turns"`
-	InterventionAfterTurns        int                     `json:"intervention_after_turns"`
-	MaxNoProgressTurns            int                     `json:"max_no_progress_turns"`
-	MaxNoProgressDuration         time.Duration           `json:"max_no_progress_duration"`
-	MaxNoProgressUsage            runcontract.BudgetLimit `json:"max_no_progress_usage"`
-	MaxExplorationTurns           int                     `json:"max_exploration_turns"`
-	KnowledgeCheckpointAfterTurns int                     `json:"knowledge_checkpoint_after_turns,omitempty"`
-	MaxObservationStagnation      int                     `json:"max_observation_stagnation,omitempty"`
-	MaxAttemptRollovers           int                     `json:"max_attempt_rollovers"`
-	RecentFingerprintWindow       int                     `json:"recent_fingerprint_window"`
+	PolicyRef              string                  `json:"policy_ref"`
+	ReminderAfterTurns     int                     `json:"reminder_after_turns"`
+	RolloverAfterTurns     int                     `json:"rollover_after_turns"`
+	InterventionAfterTurns int                     `json:"intervention_after_turns"`
+	MaxNoProgressTurns     int                     `json:"max_no_progress_turns"`
+	MaxNoProgressDuration  time.Duration           `json:"max_no_progress_duration"`
+	MaxNoProgressUsage     runcontract.BudgetLimit `json:"max_no_progress_usage"`
+	MaxExplorationTurns    int                     `json:"max_exploration_turns"`
+	// FirstDeliverableHandoffReserve 在 Attempt deadline 前为尚无首次
+	// deliverable 的 code-change 任务保留 L5 recovery 交接窗口。
+	FirstDeliverableHandoffReserve time.Duration `json:"first_deliverable_handoff_reserve,omitempty"`
+	KnowledgeCheckpointAfterTurns  int           `json:"knowledge_checkpoint_after_turns,omitempty"`
+	DecisionCheckpointAfterTurns   int           `json:"decision_checkpoint_after_turns,omitempty"`
+	MaxObservationStagnation       int           `json:"max_observation_stagnation,omitempty"`
+	MaxDecisionStagnation          int           `json:"max_decision_stagnation,omitempty"`
+	MaxControlContractFailures     int           `json:"max_control_contract_failures,omitempty"`
+	MaxAttemptRollovers            int           `json:"max_attempt_rollovers"`
+	RecentFingerprintWindow        int           `json:"recent_fingerprint_window"`
 }
 
 // ProgressContractRef 是 Graph/Task/Activation 保存的稳定引用。
@@ -256,8 +262,9 @@ type TurnSettlementDelta struct {
 	ResultChanges     []ResultFieldChange `json:"result_changes,omitempty"`
 	// ObservationDeltaRef 是本 Turn 通过 record_observation_delta 落下的
 	// durable 引用；正文不进入 L4 journal。
-	ObservationDeltaRef string             `json:"observation_delta_ref,omitempty"`
-	ObservationChange   *ObservationChange `json:"observation_change,omitempty"`
+	ObservationDeltaRef    string             `json:"observation_delta_ref,omitempty"`
+	ObservationChange      *ObservationChange `json:"observation_change,omitempty"`
+	ControlContractFailure bool               `json:"control_contract_failure,omitempty"`
 
 	UsageDelta runcontract.BudgetUsage `json:"usage_delta"`
 	Failure    *invocation.Failure     `json:"failure,omitempty"`
@@ -301,6 +308,7 @@ type ProgressAssessment struct {
 	RejectedSignals       []RejectedSignal        `json:"rejected_signals,omitempty"`
 	ResetAnyProgressClock bool                    `json:"reset_any_progress_clock"`
 	ResetDeliverableClock bool                    `json:"reset_deliverable_clock"`
+	DecisionAdvance       bool                    `json:"decision_advance,omitempty"`
 	BudgetCharge          runcontract.BudgetUsage `json:"budget_charge"`
 	ReasonCode            string                  `json:"reason_code"`
 }
@@ -347,12 +355,15 @@ type ProgressCheckpoint struct {
 	CumulativeUsage                  runcontract.BudgetUsage `json:"cumulative_usage"`
 	ExplorationTurnsSinceDeliverable int                     `json:"exploration_turns_since_deliverable"`
 	KnowledgeTurnsSinceObservation   int                     `json:"knowledge_turns_since_observation,omitempty"`
+	TurnsSinceDecisionCheckpoint     int                     `json:"turns_since_decision_checkpoint,omitempty"`
 	ObservationDeltaRef              string                  `json:"observation_delta_ref,omitempty"`
 	ObservationAttemptID             string                  `json:"observation_attempt_id,omitempty"`
 	ObservationPhase                 string                  `json:"observation_phase,omitempty"`
 	ObservationWorkspaceRevisionRef  string                  `json:"observation_workspace_revision_ref,omitempty"`
 	ObservationLatestCheckRef        string                  `json:"observation_latest_check_ref,omitempty"`
 	ObservationStagnationCount       int                     `json:"observation_stagnation_count,omitempty"`
+	DecisionStagnationCount          int                     `json:"decision_stagnation_count,omitempty"`
+	ControlContractFailureCount      int                     `json:"control_contract_failure_count,omitempty"`
 
 	InterventionStage    InterventionStage `json:"intervention_stage"`
 	LastInterventionAt   time.Time         `json:"last_intervention_at,omitempty"`
@@ -396,6 +407,7 @@ const (
 	ActionSucceeded ActionStatus = "succeeded"
 	ActionFailed    ActionStatus = "failed"
 	ActionUnknown   ActionStatus = "unknown"
+	ActionCancelled ActionStatus = "cancelled"
 )
 
 // ActionSettlement 是一次已实际 dispatch action 的 durable 结果摘要。大正文
@@ -427,6 +439,8 @@ const (
 	InterventionUnsafeUnknown      InterventionReason = "unsafe_unknown"
 	InterventionCheckpointFailure  InterventionReason = "checkpoint_unavailable"
 	InterventionObservationStalled InterventionReason = "observation_state_stalled"
+	InterventionDecisionStalled    InterventionReason = "decision_progress_stalled"
+	InterventionControlUnstable    InterventionReason = "control_contract_unstable"
 	InterventionAttemptBudget      InterventionReason = "attempt_budget_exhausted"
 )
 

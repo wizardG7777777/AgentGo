@@ -281,7 +281,8 @@ func TestWriteFile_NoOverlayClaimsRosterAsBefore(t *testing.T) {
 	}
 }
 
-// run_shell：ActiveViewer 有活动视图时默认工作目录切到视图根；
+// run_shell：ActiveViewer 有活动视图时默认工作目录切到完整
+// 项目 shell snapshot；
 // 无视图时回退主根（Swapper.Get）。
 func TestRunShell_DefaultWorkdirFollowsActiveView(t *testing.T) {
 	mainRoot := t.TempDir()
@@ -319,20 +320,36 @@ func TestRunShell_DefaultWorkdirFollowsActiveView(t *testing.T) {
 
 	// 有视图：默认目录为 workspace 视图根（真实 Manager 物化，
 	// root=<另一主根>/.agentgo/workspaces/<taskID>，与 Swapper 主根必然不同）。
-	mgr := workspace.NewManager(t.TempDir(), nil)
+	projectRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(projectRoot, "project-marker.txt"), []byte("full-project-visible"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mgr := workspace.NewManager(projectRoot, nil)
 	view, err := mgr.Materialize("task-shell")
 	if err != nil {
 		t.Fatalf("Materialize: %v", err)
 	}
 	restore := swapper.Activate(view)
 	defer restore()
+	shellRoot, err := view.PrepareShellRoot()
+	if err != nil {
+		t.Fatalf("PrepareShellRoot: %v", err)
+	}
 
 	out, err = dispatchRunShell(context.Background(), group, map[string]any{"command": cwdCmd})
 	if err != nil {
 		t.Fatalf("run_shell(有视图): %v", err)
 	}
-	if !containsFold(out, view.Root()) {
-		t.Fatalf("有视图时默认目录应为视图根 %s，实际输出:\n%s", view.Root(), out)
+	if !containsFold(out, shellRoot) {
+		t.Fatalf("有视图时默认目录应为完整 shell snapshot %s，实际输出:\n%s", shellRoot, out)
+	}
+	readCmd := "cat project-marker.txt"
+	if runtime.GOOS == "windows" {
+		readCmd = "Get-Content -Raw -LiteralPath project-marker.txt"
+	}
+	out, err = dispatchRunShell(context.Background(), group, map[string]any{"command": readCmd})
+	if err != nil || !strings.Contains(out, "full-project-visible") {
+		t.Fatalf("workspace Shell 必须看到完整项目树: out=%q err=%v", out, err)
 	}
 
 	// 隔离视图生效时，显式 working_dir 也只能位于该任务 workspace 内，
@@ -341,5 +358,30 @@ func TestRunShell_DefaultWorkdirFollowsActiveView(t *testing.T) {
 		map[string]any{"command": cwdCmd, "working_dir": mainRoot})
 	if err == nil || !strings.Contains(err.Error(), "working_dir 被拒绝") {
 		t.Fatalf("隔离任务显式切回主根必须拒绝，实际 err=%v", err)
+	}
+}
+
+func TestWorkspaceShellEnvironmentOverridesEditableInstallPaths(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"src", ".venv"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PYTHONPATH", "legacy-python-path")
+	t.Setenv("UV_PROJECT_ENVIRONMENT", "legacy-venv")
+	env := workspaceShellEnvironment(root)
+	paths := filepath.SplitList(envValue(env, "PYTHONPATH"))
+	want := []string{filepath.Join(root, "src"), root, "legacy-python-path"}
+	if len(paths) < len(want) {
+		t.Fatalf("workspace PYTHONPATH 缺失: %v", paths)
+	}
+	for index := range want {
+		if !strings.EqualFold(filepath.Clean(paths[index]), filepath.Clean(want[index])) {
+			t.Fatalf("PYTHONPATH[%d]=%q want=%q：candidate 必须先于 editable 主根", index, paths[index], want[index])
+		}
+	}
+	if got := envValue(env, "UV_PROJECT_ENVIRONMENT"); !strings.EqualFold(got, filepath.Join(root, ".venv")) {
+		t.Fatalf("UV_PROJECT_ENVIRONMENT=%q want snapshot venv", got)
 	}
 }

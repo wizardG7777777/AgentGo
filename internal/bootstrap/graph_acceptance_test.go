@@ -68,8 +68,12 @@ func TestGraphChangeWaker(t *testing.T) {
 		t.Errorf("唤醒任务应挂来源任务且 MaxConcurrency=1: %+v", wake)
 	}
 	if wake.RunID != source.RunID || wake.RunContract == nil || wake.ContextPolicyRef == "" ||
-		wake.ProgressContract == nil || wake.RunPhase != runcontract.PhaseRecovery {
+		wake.ProgressContract == nil || wake.ProgressContract.WorkClass != loopcontract.WorkCoordination ||
+		wake.RunPhase != runcontract.PhaseRecovery || wake.InterventionGraphID != spec.GraphID {
 		t.Fatalf("graph change 唤醒必须继承完整 recovery binding: %+v", wake)
+	}
+	if scope, scopeErr := model.ClassifyControlScope(wake); scopeErr != nil || scope != model.ControlScopeGraphChange {
+		t.Fatalf("graph change 唤醒必须冻结结构化 Graph scope: scope=%s err=%v", scope, scopeErr)
 	}
 
 	// 同一 activation 重复唤醒：幂等查重，不重复发布。

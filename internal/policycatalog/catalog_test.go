@@ -3,6 +3,7 @@ package policycatalog
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	"agentgo/internal/contextcontract"
 	"agentgo/internal/graph"
@@ -36,6 +37,7 @@ func TestDefaultCatalogValidAndResolvesGraphPolicies(t *testing.T) {
 		ProgressCodeChangeV3,
 		ProgressCodeChangeV4,
 		ProgressCodeChangeV5,
+		ProgressCodeChangeV6,
 		ProgressCoordinationV1,
 		ProgressCoordinationV2,
 		ProgressFinalReportV1,
@@ -43,14 +45,15 @@ func TestDefaultCatalogValidAndResolvesGraphPolicies(t *testing.T) {
 		ProgressInvestigationV2,
 		ProgressVerificationV1,
 		ProgressVerificationV2,
+		ProgressVerificationV3,
 	}
 	if got := catalog.ProgressRefs(); !reflect.DeepEqual(got, wantProgressRefs) {
 		t.Fatalf("ProgressRefs=%v，want=%v", got, wantProgressRefs)
 	}
-	if got := catalog.ContextRefs(); !reflect.DeepEqual(got, []string{ContextDefaultV1, ContextDefaultV2, ContextDefaultV3, ContextDefaultV4, ContextDefaultV5, ContextDefaultV6, ContextDefaultV7, ContextDefaultV8, ContextDefaultV9}) {
+	if got := catalog.ContextRefs(); !reflect.DeepEqual(got, []string{ContextDefaultV1, ContextDefaultV10, ContextDefaultV2, ContextDefaultV3, ContextDefaultV4, ContextDefaultV5, ContextDefaultV6, ContextDefaultV7, ContextDefaultV8, ContextDefaultV9}) {
 		t.Fatalf("ContextRefs=%v", got)
 	}
-	if got := catalog.ReplayRefs(); !reflect.DeepEqual(got, []string{ReplayOpenAICompatibleV1, ReplayOpenAICompatibleV2, ReplayOpenAICompatibleV3}) {
+	if got := catalog.ReplayRefs(); !reflect.DeepEqual(got, []string{ReplayOpenAICompatibleV1, ReplayOpenAICompatibleV2, ReplayOpenAICompatibleV3, ReplayOpenAICompatibleV4}) {
 		t.Fatalf("ReplayRefs=%v", got)
 	}
 }
@@ -138,9 +141,28 @@ func TestDefaultContextV2WidensStaticPromptWithoutMutatingV1(t *testing.T) {
 	if !ok {
 		t.Fatal("未找到当前 Context v9")
 	}
-	if ContextDefaultCurrent != ContextDefaultV9 || v9.Policy.ModelContextWindow.EstimatedTokens != 1_048_576 ||
+	v10, ok := catalog.ContextPolicy(ContextDefaultV10)
+	if !ok {
+		t.Fatal("未找到当前 Context v10")
+	}
+	if ContextDefaultCurrent != ContextDefaultV10 || v9.Policy.ModelContextWindow.EstimatedTokens != 1_048_576 ||
 		v9.Policy.CompletionReserve.EstimatedTokens != 65_536 || v9.Policy.SnapshotInputBudget.EstimatedTokens != 966_656 {
-		t.Fatalf("新运行默认 Context v9 档案错误: current=%q policy=%+v", ContextDefaultCurrent, v9.Policy)
+		t.Fatalf("历史 Context v9 档案或 current 别名错误: current=%q policy=%+v", ContextDefaultCurrent, v9.Policy)
+	}
+	if v10.Policy.Version != 10 || v10.ReplayPolicyRef != ReplayOpenAICompatibleV4 ||
+		v10.Policy.SnapshotInputBudget.EstimatedTokens != 966_656 ||
+		v10.Policy.FragmentRules[contextcontract.FragmentPromptComponent].MaxEstimatedTokens != 16<<10 ||
+		v10.Policy.FragmentRules[contextcontract.FragmentToolResult].MaxEstimatedTokens != 12<<10 ||
+		v10.Policy.FragmentRules[contextcontract.FragmentTaskMemory].MaxEstimatedTokens != 4<<10 ||
+		v10.Policy.FragmentRules[contextcontract.FragmentToolDefinition].MaxEstimatedTokens != 16<<10 {
+		t.Fatalf("v10 不得把普通 Fragment 扩张到模型窗口: %+v", v10)
+	}
+	adaptedV10 := AdaptContextPolicyForModel(v10.Policy, 128<<10, 16<<10)
+	if adaptedV10.SnapshotInputBudget.EstimatedTokens != 96<<10 ||
+		adaptedV10.FragmentRules[contextcontract.FragmentPromptComponent].MaxEstimatedTokens != 16<<10 ||
+		adaptedV10.FragmentRules[contextcontract.FragmentAssistantResponseItems].MaxEstimatedTokens != 16<<10 ||
+		adaptedV10.AtomicGroupRules[contextcontract.AtomicAssistantProviderReplay].MaxEstimatedTokens != 16<<10 {
+		t.Fatalf("v10 模型能力适配边界错误: %+v", adaptedV10)
 	}
 	v1Prompt := v1.Policy.FragmentRules[contextcontract.FragmentPromptComponent]
 	v2Prompt := v2.Policy.FragmentRules[contextcontract.FragmentPromptComponent]
@@ -294,9 +316,15 @@ func TestCodeChangeV3CoversObservedThinkingTailWithoutMutatingOlderProfiles(t *t
 		t.Fatal("code-change/v4 必须把 NovelEvidence 作为非 deliverable knowledge progress")
 	}
 	v5, ok := catalog.ProgressContract(ProgressCodeChangeV5)
-	if !ok || ProgressCodeChangeCurrent != ProgressCodeChangeV5 || v5.Contract.Policy.MaxExplorationTurns != 0 ||
+	if !ok || v5.Contract.Policy.MaxExplorationTurns != 0 ||
 		v5.Contract.Policy.KnowledgeCheckpointAfterTurns != 8 {
 		t.Fatalf("v5 必须删除 business exploration 强制交卷并启用 8-turn checkpoint: %+v", v5)
+	}
+	v6, ok := catalog.ProgressContract(ProgressCodeChangeV6)
+	if !ok || ProgressCodeChangeCurrent != ProgressCodeChangeV6 ||
+		v6.Contract.Policy.KnowledgeCheckpointAfterTurns != 6 ||
+		v6.Contract.Policy.FirstDeliverableHandoffReserve != 5*time.Minute || v6.Digest == v5.Digest {
+		t.Fatalf("v6 必须收紧为 6-turn checkpoint、冻结 5 分钟首次交付 handoff 且保持独立 digest: %+v", v6)
 	}
 }
 

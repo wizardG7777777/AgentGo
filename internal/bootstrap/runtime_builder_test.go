@@ -112,9 +112,9 @@ func TestBuildAgentRuntime_ToolsInlineBypassesProfileResolution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildAgentRuntime: %v", err)
 	}
-	if len(rt.AllowedTools) != 3 || rt.AllowedTools[0] != "read_file" || rt.AllowedTools[1] != "write_file" ||
-		rt.AllowedTools[2] != "record_observation_delta" {
-		t.Errorf("AllowedTools=%v, want 用户工具 + framework Observation control", rt.AllowedTools)
+	if len(rt.AllowedTools) != 4 || rt.AllowedTools[0] != "read_file" || rt.AllowedTools[1] != "write_file" ||
+		rt.AllowedTools[2] != "record_observation_delta" || rt.AllowedTools[3] != "submit_change_decision" {
+		t.Errorf("AllowedTools=%v, want 用户工具 + framework control", rt.AllowedTools)
 	}
 }
 

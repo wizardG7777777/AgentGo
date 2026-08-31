@@ -78,10 +78,11 @@ func validateMinimumDefinition(body GraphDefinitionBody) []ValidationIssue {
 					"loop_recovery controller 必须声明 required string 字段 $.decision（retry|blocked）"))
 			}
 			if schema := strings.TrimSpace(node.Metadata[MetadataRecoveryDeltaSchema]); schema != "" {
-				if schema != RecoveryDeltaSchemaV1 || !outputContractHasObject(node.OutputContract, "$.recovery_delta") {
+				if (schema != RecoveryDeltaSchemaV1 && schema != RecoveryDeltaSchemaV2 && schema != RecoveryDeltaSchemaV3 && schema != RecoveryDeltaSchemaV4) ||
+					!outputContractHasObject(node.OutputContract, "$.recovery_delta") {
 					issues = append(issues, validationIssue("RECOVERY_DELTA_CONTRACT_INVALID",
 						path+".output_contract.fields", true,
-						"recovery_delta_schema 必须是 agentgo.recovery-delta/v1，且声明 object 字段 $.recovery_delta"))
+						"recovery_delta_schema 必须是受支持的冻结版本，且声明 object 字段 $.recovery_delta"))
 				}
 			}
 			if ControllerRole(node.Metadata[MetadataControllerRole]) == ControllerRoleLoopRecovery &&

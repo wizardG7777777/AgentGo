@@ -236,7 +236,7 @@ func storeToolCall(command string, exit int) store.ToolCallRecord {
 // valid。
 func TestGraphBridgeAcceptanceLineageValidEndToEnd(t *testing.T) {
 	env := newGraphBridgeEnv(t)
-	wireGraphAcceptanceBridge(env.tasks, env.runtime) // 生产装配路径：disputed 唤醒器
+	wireGraphAcceptanceBridge(env.tasks, env.runtime, env.graphs) // 生产装配路径：disputed 唤醒器
 	doc, err := graph.ParseAndValidate([]byte(bridgeAcceptanceVerifyGraphJSON))
 	if err != nil {
 		t.Fatalf("解析图: %v", err)
@@ -286,11 +286,12 @@ func TestGraphBridgeAcceptanceLineageValidEndToEnd(t *testing.T) {
 
 // TestGraphBridgeAcceptanceOutOfLineageDisputedEndToEnd 越谱系引用路：验收
 // 任务自报 verdict=pass 但引用不属于其输入谱系的证据 → disputed 不采信：
-// verify 节点 failed、finish 永不激活、图 failed（无匹配出路）、graph
-// change 唤醒任务发布、acceptance_completed 载 disputed。
+// verify 节点 failed、finish 永不激活、图 failed（无匹配出路）。Runtime
+// 保留 graph_change_requested 审计；结算后图已终态，L5 不再发布无未来
+// Activation 可修改的 Scheduler 唤醒任务。
 func TestGraphBridgeAcceptanceOutOfLineageDisputedEndToEnd(t *testing.T) {
 	env := newGraphBridgeEnv(t)
-	wireGraphAcceptanceBridge(env.tasks, env.runtime) // 生产装配路径：disputed 唤醒器
+	wireGraphAcceptanceBridge(env.tasks, env.runtime, env.graphs) // 生产装配路径：disputed 唤醒器
 	doc, err := graph.ParseAndValidate([]byte(bridgeAcceptanceVerifyGraphJSON))
 	if err != nil {
 		t.Fatalf("解析图: %v", err)
@@ -307,9 +308,6 @@ func TestGraphBridgeAcceptanceOutOfLineageDisputedEndToEnd(t *testing.T) {
 		g, ok := env.graphs.Get("g-bridge-acc-g1b")
 		return ok && g.Status == graph.GraphFailed
 	})
-	eventually(t, "应发布 graph change 唤醒任务", func() bool {
-		return findSchedulerWake(env.tasks, "[graph-change-request: g-bridge-acc-g1b/verify@1/change]") != nil
-	})
 	eventually(t, "acceptance_completed 事件应载 disputed 与自报 verdict", func() bool {
 		return traceDirContains(env.traceDir, `"kind":"acceptance_completed"`) &&
 			traceDirContains(env.traceDir, `"status":"disputed"`) &&
@@ -325,9 +323,10 @@ func TestGraphBridgeAcceptanceOutOfLineageDisputedEndToEnd(t *testing.T) {
 	if n := g.Nodes["verify"]; n.Status != graph.NodeFailed {
 		t.Errorf("verify 节点应为 failed，实际 %s", n.Status)
 	}
-	// 唤醒任务不得携带图身份（防 feed 误回填），且挂来源任务。
-	wake := findSchedulerWake(env.tasks, "[graph-change-request: g-bridge-acc-g1b/verify@1/change]")
-	if wake != nil && (wake.GraphID != "" || wake.ParentTaskID != verifyTaskID) {
-		t.Errorf("唤醒任务形态不符: GraphID=%q ParentTaskID=%q", wake.GraphID, wake.ParentTaskID)
+	if wake := findSchedulerWake(env.tasks, "[graph-change-request: g-bridge-acc-g1b/verify@1/change]"); wake != nil {
+		t.Errorf("终态图不应再发布无效 graph-change coordination: %+v", wake)
 	}
+	eventually(t, "终态跳过 Scheduler wake 时仍应保留 graph_change_requested 审计", func() bool {
+		return traceDirContains(env.traceDir, `"kind":"graph_change_requested"`)
+	})
 }

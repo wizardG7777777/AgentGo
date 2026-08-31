@@ -41,6 +41,9 @@ SWE Test Runner 使用 fail-closed 的 provider 环境契约。以下 3 个环�
 Windows 重复运行同一考题时，SWE Test Runner 会在删除 disposable worktree 的
 `PermissionError` 回调中清除 Git object 的 ReadOnly 属性并重试一次。该补救不
 使用 `ignore_errors`；文件占用、非权限错误及重试失败仍会 fail-closed。
+每题从 `<SWE_TESTBED>/locks/<task>.lock` 取得跨平台非阻塞独占锁；
+锁冲突在任何 run 产物或 worktree 清理前以
+`task_already_running` fail-closed，禁止第二个 Runner 对活动目录做部分 rmtree。
 
 正式八题的 manifest 与 prompt 已随仓库提供，不需要从外部 testbed 复制。执行
 `task` / `batch` / `verify-candidates` 前仍须准备包含目标 fix commit 的完整 Flask
@@ -49,8 +52,10 @@ Git 仓库；仓库位于其他位置时设置 `SWE_FLASK_REPO` 即可。
 `AGENTGO_SWE_PYTEST_REPORT` 与 `PYTHONPATH` 是 SWE Test Runner 在 pytest 阶段自行注入的内部
 变量，不属于用户启动契约。除必填 provider 环境外，机器还必须提供 Git、uv、Python 3.13、
 可执行的 AgentGo 二进制、可读的题目/prompt/Flask 数据以及可访问的 provider。
+CLI 会在公开命令入口把可重配置的 stdout/stderr 固定为 UTF-8，Windows 不需要
+依赖活动代码页或额外设置 `PYTHONUTF8` / `-X utf8`。
 
-生成配置使用 Context v9 默认能力档案（1M context / 64K completion）与
+生成配置使用 Context v10 默认能力档案（1M context / 64K completion）与
 `swe/v3` Run profile；model/tool/token/cost 全量记账但不作为默认经验硬停止条件，
 用户显式业务预算由 RunID 级 Ledger 跨 Task 执法。小窗口模型应在
 `setting.swe-flask.yaml` 的 `llm.model_capabilities` 中按精确模型名覆盖。
@@ -59,6 +64,15 @@ ToolRouter/Context/Lease preflight 失败仅关闭 reservation。SWE Test Runner
 调用数与 `llm_call_end` 对账，并通过非终态
 `observation_checkpoint_failed(reason=control_invocation_preflight_failed)` trace
 识别周期性 Control Invocation 不可用，不能只从终态 TaskOutcome 反推。
+
+每题写入 `agentgo.run-contract/v2`：外部 hard kill 前固定留 60 秒，Run 内再冻结
+180 秒 verification、120 秒 recovery 与 90 秒 finalization reserve；`--timeout`
+因此必须至少为 480 秒。Graph acceptance 只消费 verification phase，不改变图路由。
+同一 RunContract 还冻结两条通用 Check Contract：`targeted/test` 的 exact command
+由当前 suite manifest 的 `test_files` 生成并用 POSIX sh / PowerShell 共通单引号冻结，`verification/test` 的 exact command 固定为
+`uv run --no-sync python -m pytest -q`。L3 在 Shell 前校验 ID/kind/command；
+只有 Graph required 的 `verification` 能满足 fulfillment，最终全量范围不依赖
+Prompt 遵从或 pytest 输出摘要猜测。
 
 当前 SWE 全局契约固定 `reasoning_effort=low`（thinking 仍开启），双层能力探针与
 Scheduler/Proposal 机械阶段使用 `tool_choice=auto` + singleton ToolRouter +
@@ -102,7 +116,7 @@ python3 scripts/swe_test_runner/runner.py task automatic-options --timeout 1200
 Windows PowerShell 使用 Python Launcher：
 
 ```powershell
-py -3.13 -X utf8 scripts/swe_test_runner/runner.py task automatic-options --timeout 1200
+py -3.13 scripts/swe_test_runner/runner.py task automatic-options --timeout 1200
 ```
 
 执行 `tasks.csv` 中的完整批次：
@@ -114,7 +128,7 @@ python3 scripts/swe_test_runner/runner.py batch --timeout 1200
 Windows PowerShell：
 
 ```powershell
-py -3.13 -X utf8 scripts/swe_test_runner/runner.py batch --timeout 1200
+py -3.13 scripts/swe_test_runner/runner.py batch --timeout 1200
 ```
 
 独立运行能力探针：
@@ -126,7 +140,7 @@ python3 scripts/swe_test_runner/runner.py probe
 Windows PowerShell：
 
 ```powershell
-py -3.13 -X utf8 scripts/swe_test_runner/runner.py probe
+py -3.13 scripts/swe_test_runner/runner.py probe
 ```
 
 `prepare`、`run`、`judge` 是 `task` / `batch` 内部的固定阶段，不提供独立 CLI
@@ -169,7 +183,7 @@ python3 scripts/swe_test_runner/runner.py verify-candidates
 Windows PowerShell：
 
 ```powershell
-py -3.13 -X utf8 scripts/swe_test_runner/runner.py verify-candidates
+py -3.13 scripts/swe_test_runner/runner.py verify-candidates
 ```
 
 运行 SWE Test Runner 单元测试：
@@ -191,6 +205,12 @@ py -3.13 -X utf8 -m unittest scripts/swe_test_runner/runner_test.py
 批次遇到架构门失败会立即停止，普通任务正确率失败则继续完成剩余题目并在汇总后
 返回 `3`。
 
+`summary.json` 是 `.batch_start` 绑定的增量事务产物：批次启动时立即
+写全部 `not_run/batch_in_progress`，每题结束后原子 checkpoint，正常、
+架构/基础设施失败或 `KeyboardInterrupt` 均在收尾时再写一次。这样
+Windows 终端中断即使绕过 Python `finally`，也不会丢失已完成题目或
+误复用旧批次结果。
+
 架构门按 source Task 核验 L4→L5 恢复：任何 Graph TaskOutcome 的
 `reason_code=loop_intervention_required|no_progress_budget_exhausted|observation_state_stalled`
 都必须存在一个已交付 Outcome 的
@@ -203,16 +223,40 @@ mutating Graph 还必须在 `.agentgo/state/checks/` 形成绑定最新 workspac
 的 `verification` CheckRecord。零改动 completed、stale/missing check、RecoveryDelta
 参数拒绝都会令架构门失败；普通 `run_shell` exit=0 不再证明新主链测试通过。
 
+Graph v3 的正式 Judge 只可在 success `GraphOutcome` 同时携带
+`delivery_commit_ref` 时检查主 workspace。未 committed 的 candidate 只能写入
+诊断元数据，不得计入 `judge_resolved` 或正式成绩；二者不一致记为
+`judge_delivery_commit_mismatch` 并令 `architecture_ok=false`。
+
 Recovery retry 还必须在 decision commit 前证明下一 execution Activation 可启动。
 若 Graph 已选择 retry、随后才因 execution window 关闭而发布失败，SWE Test Runner 记录
 `recovery_retry_activation_unstartable` 并令 `architecture_ok=false`。机械阶段
 返回错工具属于 L3 `action_contract_rejected`，不再混入 provider
 `malformed_response`。
 
-Graph terminal 后 SWE Test Runner 还会等待 graph-ended final-report Task，并核验其
-`final_report_graph_id`、completed 状态与 TaskOutcome commit。final-report 读取
+code-change recovery 使用 `agentgo.recovery-delta/v4`：下一 Activation 必须形成
+`recovery_action_gated` 的 EvidenceContract 分段读取（含外置结果的
+`read_content_ref`）、typed `submit_change_decision`、可选声明 mutation 与 typed
+check 阶段。`hypothesis_rejected`/`blocked` 可安全返回 L5，不能因没有 mutation
+被误报为 gate missing；Evidence 读取失败的 `evidence_unavailable` stage 也只允许
+这两个安全决策。SWE Test Runner 只对已 `task_result_committed` 的 Recovery
+Task 取最终一次成功裁决，再与下一 Task 的首动作 gate 按时间顺序对账；Attempt
+rollover 重放的 raw receipt 不重复计数。缺 gate、工具/路径/ref_id/offset/limit/
+check_id 不一致，或同一 Task 同时看到多条
+`recovery_directive`（`directive_count != 1`），分别记录
+`recovery_action_gate_missing`、`recovery_action_gate_mismatch`、
+`recovery_directive_ambiguous` 并令 `architecture_ok=false`。
+
+Graph terminal 后 SWE Test Runner 还会等待 graph-ended final-report Task 与当前
+Run 的全部 Task terminal，再核验其 `final_report_graph_id`、completed 状态与
+TaskOutcome commit；不得在 intervention/provider 调用仍 processing 时因 grace 到点
+主动 terminate。final-report 读取
 结果发生 scope 拒绝时记录 `final_report_result_scope_failure`，不得继续计为
 `architecture_ok=true`。
+graph-change Scheduler task 若以 `progress_authority_failure`、
+`decision_progress_stalled`、`no_progress_budget_exhausted` 或
+`invocation_deadline` 终结，记录 `graph_change_coordination_stalled`；这说明
+控制工具闭集/收口未形成稳定裁决，不能作为普通模型业务失败隐藏。
 
 批次 summary 只代表当前 `.batch_start`：启动时先清空旧 summary，结束或异常时
 都在 `finally` 原子重写。每个 tasks.csv 条目均有一行，`run_state` 为

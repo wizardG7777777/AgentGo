@@ -47,8 +47,9 @@ type EvidenceRef struct {
 	Digest string `json:"digest,omitempty"` // 可选内容摘要（如文件 hash）
 }
 
-// Fact 是一条事实记录。Confirmed=false 表示 inferred——没有结构化证据支撑的
-// 内容只能保持 inferred，不会渲染进注入文本，也不能晋升为 Session 权威结论。
+// Fact 是一条事实记录。Confirmed=false 表示 inferred——Observation v3 即使
+// 绑定了 settled evidence，也只证明模型看过该证据，不证明自然语言 claim 被
+// 证据语义蕴含。inferred 会在独立低权威段渲染，但不能晋升为 Session 权威结论。
 type Fact struct {
 	Text      string        `json:"text"`
 	Confirmed bool          `json:"confirmed"`
@@ -88,8 +89,8 @@ type TaskMemory struct {
 	Blockers       []string       `json:"blockers,omitempty"`        // 当前阻塞
 	NextCandidates []string       `json:"next_candidates,omitempty"` // 待解决问题与下一步候选
 	// LatestObservationDeltaRef 指向最近一次经证据校验并持久化的结构化观察。
-	// 正文保存在 Observation Store；Task Memory 只持引用并物化 confirmed
-	// facts/next candidates，避免把模型 reasoning 当作记忆事实。
+	// 正文保存在 Observation Store；Task Memory 只持引用并物化带 authority 的
+	// claims/next candidates，避免把模型 reasoning 当作已确认事实。
 	LatestObservationDeltaRef  string `json:"latest_observation_delta_ref,omitempty"`
 	LatestObservationAttemptID string `json:"latest_observation_attempt_id,omitempty"`
 

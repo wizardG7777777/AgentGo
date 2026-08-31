@@ -102,9 +102,13 @@ func prepareProviderExtra(input CompileInput, turnID string, messageIndex int, k
 	}
 	tokens := estimateTokens(input, payload)
 	disposition := contextcontract.DispositionInline
+	projectionReason := ""
 	if input.ReplayPolicy.Version >= 2 && exceedsRule(payload, tokens, rule) {
 		if requirement == contextcontract.ReplayOptional {
 			disposition = contextcontract.DispositionDropped
+			if input.BudgetPolicy.Version >= 10 {
+				projectionReason = "optional_replay_limit_dropped"
+			}
 		} else {
 			failure := adapterFailure(input, contextcontract.AssemblyFragmentLimitExceeded, fragmentID,
 				fmt.Errorf("provider field=%s requirement=%s 超出下一轮 replay hard cap", key, requirement))
@@ -124,7 +128,7 @@ func prepareProviderExtra(input CompileInput, turnID string, messageIndex int, k
 		Freshness: contextcontract.FreshnessSnapshot,
 		Digest:    contextcontract.DigestBytes(payload), SerializedBytes: int64(len(payload)),
 		EstimatedTokens: tokens, RetentionClass: rule.RetentionClass,
-		Disposition: disposition,
+		Disposition: disposition, ProjectionReason: projectionReason,
 	}
 	prepared := contextcompiler.PreparedFragment{Fragment: fragment, ProviderField: key}
 	if disposition.EmitsWire() {

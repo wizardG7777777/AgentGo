@@ -3,13 +3,18 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 
 	"agentgo/internal/agent"
 	"agentgo/internal/checkstore"
 	"agentgo/internal/contentstore"
+	"agentgo/internal/fulfillment"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
+	"agentgo/internal/policycatalog"
+	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
 )
 
@@ -80,5 +85,80 @@ func TestRunCheckRejectsPipelineAndRedirect(t *testing.T) {
 		}}); err == nil {
 			t.Fatalf("命令 %q 必须在依赖检查前被拒绝", command)
 		}
+	}
+}
+
+func TestRunCheckRejectsUndeclaredCheckIDBeforeExecution(t *testing.T) {
+	tasks := store.NewMemoryTaskStore(nil, 8, 1, 60)
+	task := &model.Task{ID: "check-contract", Description: "验证",
+		FulfillmentContract: &fulfillment.Contract{RequiredCheckIDs: []string{"verification"}}}
+	if err := tasks.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks.ClaimTask("worker", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	registry := agent.NewToolRegistry()
+	CheckGroup{TaskStore: tasks, Holder: &fakeHolder{id: task.ID}}.Register(registry)
+	_, err := registry.Dispatch(context.Background(), llm.ToolCall{Name: "run_check", Arguments: map[string]any{
+		"check_id": "tests-green", "kind": "test", "command": "must-not-run",
+	}})
+	if err == nil || !strings.Contains(err.Error(), "check_id_not_declared") ||
+		!strings.Contains(err.Error(), "verification") {
+		t.Fatalf("错误 check_id 必须在 Shell/CheckStore 依赖前拒绝并回显允许集: %v", err)
+	}
+}
+
+func TestRunCheckEnforcesFrozenKindAndExactCommandBeforeExecution(t *testing.T) {
+	now := time.Now().UTC()
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	progress, ok := catalog.ProgressContract(policycatalog.ProgressInvestigationV1)
+	if !ok {
+		t.Fatal("缺少 investigation progress contract")
+	}
+	tasks := store.NewMemoryTaskStore(nil, 8, 1, 60)
+	task := &model.Task{
+		ID: "check-exact-contract", Description: "验证", RunID: "run-check-exact",
+		RunPhase: runcontract.PhaseExecution, ProgressContract: &progress.Contract,
+		ContextPolicyRef: policycatalog.ContextDefaultCurrent,
+		RunContract: &runcontract.RunContract{
+			Schema: runcontract.SchemaV2, RunID: "run-check-exact", CreatedAt: now,
+			DeadlineAt: now.Add(time.Hour), FinalizationReserve: time.Minute,
+			RecoveryReserve: time.Minute, VerificationReserve: time.Minute,
+			BudgetProfile: "swe/v3",
+			CheckContracts: []runcontract.CheckContract{
+				{CheckID: "targeted", Kind: "test"},
+				{CheckID: "verification", Kind: "test", ExactCommand: "go test ./..."},
+			},
+		},
+		FulfillmentContract: &fulfillment.Contract{RequiredCheckIDs: []string{"verification"}},
+	}
+	if err := tasks.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks.ClaimTask("worker", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	registry := agent.NewToolRegistry()
+	CheckGroup{TaskStore: tasks, Holder: &fakeHolder{id: task.ID}}.Register(registry)
+	for _, tc := range []struct {
+		args   map[string]any
+		reason string
+	}{
+		{args: map[string]any{"check_id": "verification", "kind": "test", "command": "go test ./internal/..."}, reason: "check_command_contract_mismatch"},
+		{args: map[string]any{"check_id": "verification", "kind": "build", "command": "go test ./..."}, reason: "check_kind_contract_mismatch"},
+	} {
+		if _, err := registry.Dispatch(context.Background(), llm.ToolCall{Name: "run_check", Arguments: tc.args}); err == nil || !strings.Contains(err.Error(), tc.reason) {
+			t.Fatalf("冻结 check contract 必须在 Shell/Store 前拒绝: reason=%s err=%v", tc.reason, err)
+		}
+	}
+	_, err = registry.Dispatch(context.Background(), llm.ToolCall{Name: "run_check", Arguments: map[string]any{
+		"check_id": "targeted", "kind": "test", "command": "go test ./internal/...",
+	}})
+	if err == nil || strings.Contains(err.Error(), "contract_mismatch") || strings.Contains(err.Error(), "check_id_not_declared") {
+		t.Fatalf("targeted 应通过 ID/kind contract 后才因未装配依赖失败: %v", err)
 	}
 }

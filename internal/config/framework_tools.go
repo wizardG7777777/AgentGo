@@ -4,7 +4,7 @@ package config
 // 的真实注册全集。Doctor、capability registry 与 runner 必须使用同一结果。
 func EffectiveAgentTools(allowed []string) []string {
 	if allowed == nil {
-		return nil // nil 保持“兼容允许全部”语义；record_observation_delta 已在全集中。
+		return nil // nil 保持“兼容允许全部”语义；framework control tools 已在全集中。
 	}
 	out := append([]string(nil), allowed...)
 	hasRunShell := false
@@ -18,6 +18,9 @@ func EffectiveAgentTools(allowed []string) []string {
 	}
 	if !containsTool(out, "record_observation_delta") {
 		out = append(out, "record_observation_delta")
+	}
+	if !containsTool(out, "submit_change_decision") {
+		out = append(out, "submit_change_decision")
 	}
 	if hasRunShell && !containsTool(out, "run_check") {
 		out = append(out, "run_check")

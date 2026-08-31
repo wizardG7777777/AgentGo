@@ -226,8 +226,16 @@ func startupToolCapabilityProbe(w io.Writer, cfg *config.Config, timeout time.Du
 			}
 		}
 		if !compatible {
-			return fmt.Errorf("provider function-call capability 不兼容: calls=%d finish_reason=%s",
+			lastErr = fmt.Errorf("provider function-call capability 不兼容: calls=%d finish_reason=%s",
 				len(response.ToolCalls), response.FinishReason)
+			if attempt < maxAttempts && ctx.Err() == nil {
+				// tool_choice=auto 下单次 text-only/wrong-call 只证明该采样未遵守
+				// 契约，不能证明 endpoint 完全没有 function-call 能力。连续三次
+				// 都失败才 fail-closed；每次使用全新 name/nonce，禁止缓存命中。
+				fmt.Fprintf(w, "  [RETRY] function-call capability attempt=%d/%d: %v\n", attempt, maxAttempts, lastErr)
+				continue
+			}
+			return lastErr
 		}
 		fmt.Fprintf(w, "  [OK]   protocol=%s streaming=%t typed function-call/required-arguments attempts=%d (%v)\n",
 			protocol, cfg.LLM.Stream, attempt, time.Since(started).Round(time.Millisecond))

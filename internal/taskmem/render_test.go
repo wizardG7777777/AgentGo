@@ -78,8 +78,9 @@ func TestRender_ListSectionKeepsRecent(t *testing.T) {
 	}
 }
 
-// TestRender_InferredFactsNotRendered：inferred Facts 不进入注入文本。
-func TestRender_InferredFactsNotRendered(t *testing.T) {
+// TestRender_InferredFactsUseExplicitLowAuthoritySection：inferred Facts 只能
+// 进入显式低权威段，不能伪装成已确认事实。
+func TestRender_InferredFactsUseExplicitLowAuthoritySection(t *testing.T) {
 	m := New("task-1")
 	m.Goal = "g"
 	m.Facts = []Fact{
@@ -87,11 +88,14 @@ func TestRender_InferredFactsNotRendered(t *testing.T) {
 		{Text: "用户决定: 走方案 B", Confirmed: true, UpdatedAt: time.Now()},
 	}
 	out := Render(m, 1500)
-	if strings.Contains(out, "模型声称测试通过") {
-		t.Errorf("inferred 事实不得渲染: %q", out)
+	if !strings.Contains(out, "待验证观察:\n- 模型声称测试通过") {
+		t.Errorf("inferred 事实必须带低权威标题渲染: %q", out)
 	}
 	if !strings.Contains(out, "用户决定: 走方案 B") {
 		t.Errorf("confirmed 事实应渲染: %q", out)
+	}
+	if strings.Contains(out, "已确认事实:\n- 模型声称测试通过") {
+		t.Errorf("inferred 事实不得混入 confirmed 段: %q", out)
 	}
 }
 

@@ -41,6 +41,15 @@ func (c *countingManager) Materialize(taskID string) (*workspace.View, error) {
 	return c.real.Materialize(taskID)
 }
 
+func (c *countingManager) MaterializeOwned(workspaceID string, owner workspace.Owner) (*workspace.View, error) {
+	c.materializeCalls++
+	return c.real.MaterializeOwned(workspaceID, owner)
+}
+
+func (c *countingManager) Acquire(workspaceID string) (func(), error) {
+	return c.real.Acquire(workspaceID)
+}
+
 func (c *countingManager) MergeTask(ctx context.Context, taskID, agentID string) (*workspace.MergeResult, error) {
 	c.mergeCalls++
 	if c.mergeResult != nil || c.mergeErr != nil {

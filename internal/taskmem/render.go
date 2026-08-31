@@ -3,11 +3,11 @@
 // 段落优先级：当前 Observation 状态必须先于历史动作审计：
 //
 //	Goal/Constraints > Phase > Blockers > confirmed Facts > NextCandidates
-//	> Files > Failures（尾部）> Actions
+//	> inferred Observation claims > Files > Failures（尾部）> Actions
 //
 // 预算执法：按优先级依次装填；列表段放不进剩余预算时从**最旧**条目开始
-// 省略（保留最近），整段一条都放不下则跳过低优先级段。inferred Facts
-// 不渲染——没有证据的内容不得进入上下文伪装成事实。
+// 省略（保留最近），整段一条都放不下则跳过低优先级段。inferred Facts 使用
+// 独立“待验证观察”标题，不能混入“已确认事实”或晋升为 Session 权威结论。
 package taskmem
 
 import (
@@ -62,6 +62,7 @@ func Render(m *TaskMemory, budgetRunes int) string {
 		{"当前阻塞:", append([]string(nil), m.Blockers...)},
 		{"已确认事实:", confirmedFactLines(m)},
 		{"下一步候选:", append([]string(nil), m.NextCandidates...)},
+		{"待验证观察:", inferredFactLines(m)},
 		{"文件与产物版本:", fileLines(m)},
 		{"失败尝试:", append([]string(nil), m.Failures...)},
 		{"已完成动作:", actionLines(m)},
@@ -128,12 +129,24 @@ func actionLines(m *TaskMemory) []string {
 	return lines
 }
 
-// confirmedFactLines 只渲染 confirmed Facts（inferred 不进入上下文）。
+// confirmedFactLines 只渲染 confirmed Facts；inferred 由独立低权威段处理。
 func confirmedFactLines(m *TaskMemory) []string {
 	lines := make([]string, 0, len(m.Facts))
 	for _, f := range m.Facts {
 		if f.Confirmed {
 			lines = append(lines, f.Text)
+		}
+	}
+	return lines
+}
+
+// inferredFactLines 把 evidence-bound 但未经语义核验的模型 claim 放在独立
+// 低权威段；标题是 Context 契约的一部分，调用方不得去掉后与 confirmed 混合。
+func inferredFactLines(m *TaskMemory) []string {
+	lines := make([]string, 0, len(m.Facts))
+	for _, fact := range m.Facts {
+		if !fact.Confirmed {
+			lines = append(lines, fact.Text)
 		}
 	}
 	return lines

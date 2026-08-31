@@ -66,6 +66,7 @@ func TestSchedulerGraphToolsAssembled(t *testing.T) {
 		"create_graph_draft", "patch_graph_draft", "read_graph_draft",
 		"validate_graph_draft", "commit_graph_draft", "start_graph",
 		"propose_graph_change", "read_graph_change", "validate_graph_change", "commit_graph_change",
+		"submit_graph_change_decision",
 		"read_graph", "patch_graph", "submit_task_result",
 	} {
 		if !registered[name] {

@@ -103,6 +103,17 @@ func normalizeWrittenArtifactPath(absPath, projectRoot string) string {
 	return filepath.ToSlash(cleaned)
 }
 
+func rejectRuntimeStateWrite(absPath, projectRoot string) error {
+	if strings.TrimSpace(projectRoot) == "" {
+		return nil
+	}
+	rel := strings.TrimPrefix(normalizeWrittenArtifactPath(absPath, projectRoot), "./")
+	if rel == ".agentgo" || strings.HasPrefix(rel, ".agentgo/") {
+		return fmt.Errorf("reason_code=runtime_state_write_forbidden：业务文件工具禁止写入 .agentgo 控制面路径")
+	}
+	return nil
+}
+
 // Register 把 write_file / edit_file 注册到 r。
 func (g LocalWriteGroup) Register(r *agent.ToolRegistry) {
 	r.Register("write_file", "写入文件内容（覆盖式），支持可选的乐观并发 hash 校验",
@@ -237,6 +248,9 @@ func (g LocalWriteGroup) writeFile(ctx context.Context, args map[string]any) (st
 			return "", err
 		}
 		path = validPath
+		if err := rejectRuntimeStateWrite(path, projectRoot); err != nil {
+			return "", err
+		}
 	}
 
 	// 按任务写时复制隔离：logicalPath 始终是主根逻辑路径（trace 事件与返回
@@ -359,6 +373,9 @@ func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (str
 			return "", err
 		}
 		path = validPath
+		if err := rejectRuntimeStateWrite(path, projectRoot); err != nil {
+			return "", err
+		}
 	}
 
 	// 按任务写时复制隔离：logicalPath 始终是主根逻辑路径（trace 事件与返回

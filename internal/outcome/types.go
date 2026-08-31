@@ -10,12 +10,14 @@ import (
 	"strings"
 	"time"
 
+	"agentgo/internal/delivery"
 	"agentgo/internal/fulfillment"
 	"agentgo/internal/runcontract"
 )
 
 const SchemaV1 = "agentgo.task-outcome/v1"
 const SchemaV2 = "agentgo.task-outcome/v2"
+const SchemaV3 = "agentgo.task-outcome/v3"
 const TerminalIntentSchemaV1 = "agentgo.terminal-intent/v1"
 
 const (
@@ -69,6 +71,13 @@ type EvidenceFact struct {
 
 	Path          string `json:"path,omitempty"`
 	PathTruncated bool   `json:"path_truncated,omitempty"`
+
+	CheckRef             string `json:"check_ref,omitempty"`
+	CheckID              string `json:"check_id,omitempty"`
+	CheckKind            string `json:"check_kind,omitempty"`
+	CheckStatus          string `json:"check_status,omitempty"`
+	WorkspaceRevisionRef string `json:"workspace_revision_ref,omitempty"`
+	OutputRef            string `json:"output_ref,omitempty"`
 }
 
 // ArtifactFact 冻结 artifact 引用及登记时的内容身份；Ref 同时必须出现在
@@ -87,12 +96,18 @@ type TaskOutcome struct {
 	GraphID      string            `json:"graph_id,omitempty"`
 	NodeID       string            `json:"node_id,omitempty"`
 	ActivationID string            `json:"activation_id,omitempty"`
-	TaskID       string            `json:"task_id"`
-	AttemptID    string            `json:"attempt_id"`
-	AttemptNo    int               `json:"attempt_no,omitempty"`
-	Status       Status            `json:"status"`
-	Summary      string            `json:"summary"`
-	Result       json.RawMessage   `json:"result,omitempty"`
+	// DeliveryID/CandidateRef 是 Graph v3 的统一交付 envelope。非 mutating
+	// activation 只携带 DeliveryID；产生 workspace 修改的 activation 还必须
+	// 冻结 CandidateRef，禁止把候选自述成已经交付的主根结果。
+	DeliveryID   string              `json:"delivery_id,omitempty"`
+	CandidateRef string              `json:"candidate_ref,omitempty"`
+	Candidate    *delivery.Candidate `json:"candidate,omitempty"`
+	TaskID       string              `json:"task_id"`
+	AttemptID    string              `json:"attempt_id"`
+	AttemptNo    int                 `json:"attempt_no,omitempty"`
+	Status       Status              `json:"status"`
+	Summary      string              `json:"summary"`
+	Result       json.RawMessage     `json:"result,omitempty"`
 	// TaskResults 保留 MemoryTaskStore 的精确字符串投影，用于修复 outcome
 	// fsync 后、Session snapshot 前崩溃的窗口；Graph 只消费 typed Result。
 	TaskResults         map[string]string   `json:"task_results,omitempty"`
@@ -137,11 +152,14 @@ func (i TerminalIntent) Validate() error {
 }
 
 func (o TaskOutcome) Validate() error {
-	if o.Schema != SchemaV1 && o.Schema != SchemaV2 {
+	if o.Schema != SchemaV1 && o.Schema != SchemaV2 && o.Schema != SchemaV3 {
 		return fmt.Errorf("TaskOutcome schema=%q，无效", o.Schema)
 	}
 	if o.Schema == SchemaV1 && o.Fulfillment != nil {
 		return fmt.Errorf("TaskOutcome v1 不得携带 fulfillment")
+	}
+	if o.Schema != SchemaV3 && (o.DeliveryID != "" || o.CandidateRef != "" || o.Candidate != nil) {
+		return fmt.Errorf("TaskOutcome %s 不得携带 delivery envelope", o.Schema)
 	}
 	for name, value := range map[string]string{
 		"run_id": string(o.RunID), "task_id": o.TaskID,
@@ -179,6 +197,30 @@ func (o TaskOutcome) Validate() error {
 	}
 	if graphFields != 0 && graphFields != 3 {
 		return fmt.Errorf("Graph TaskOutcome 必须同时携带 graph_id/node_id/activation_id")
+	}
+	if o.Schema == SchemaV3 {
+		if graphFields != 3 {
+			return fmt.Errorf("TaskOutcome v3 必须携带 graph identity")
+		}
+		if o.CandidateRef != "" && strings.TrimSpace(o.CandidateRef) == "" {
+			return fmt.Errorf("TaskOutcome v3 candidate_ref 非法")
+		}
+		if o.Fulfillment != nil && o.Fulfillment.WorkspaceRevisionRef != "" && strings.TrimSpace(o.CandidateRef) == "" {
+			return fmt.Errorf("含 workspace fulfillment 的 TaskOutcome v3 必须携带 candidate_ref")
+		}
+		if o.CandidateRef != "" {
+			if o.Candidate == nil || o.Candidate.Ref != o.CandidateRef ||
+				strings.TrimSpace(o.Candidate.WorkspaceRevisionRef) == "" || strings.TrimSpace(o.Candidate.PatchDigest) == "" {
+				return fmt.Errorf("TaskOutcome v3 candidate 事实与 candidate_ref 不一致")
+			}
+		}
+		if o.DeliveryID != "" && !strings.HasPrefix(o.DeliveryID, "delivery:") {
+			return fmt.Errorf("TaskOutcome v3 delivery_id 格式非法")
+		}
+		if (o.CandidateRef != "" || o.Candidate != nil ||
+			o.Fulfillment != nil && o.Fulfillment.WorkspaceRevisionRef != "") && o.DeliveryID == "" {
+			return fmt.Errorf("含 candidate/workspace fulfillment 的 TaskOutcome v3 必须携带 delivery_id")
+		}
 	}
 	if o.Status != StatusCompleted {
 		if strings.TrimSpace(o.ReasonCode) == "" || strings.TrimSpace(o.Reason) == "" {
@@ -259,6 +301,12 @@ func validateFacts(o TaskOutcome) error {
 		if fact.ExitCodeScope != "" && fact.ExitCodeScope != "whole_command" &&
 			fact.ExitCodeScope != "last_pipeline_command" {
 			return fmt.Errorf("TaskOutcome evidence_facts exit_code_scope=%q 无效", fact.ExitCodeScope)
+		}
+		if fact.Kind == "check" && (strings.TrimSpace(fact.CheckRef) == "" ||
+			strings.TrimSpace(fact.CheckID) == "" || strings.TrimSpace(fact.CheckKind) == "" ||
+			strings.TrimSpace(fact.WorkspaceRevisionRef) == "" ||
+			(fact.CheckStatus != "pass" && fact.CheckStatus != "failed")) {
+			return fmt.Errorf("TaskOutcome check evidence 结构化字段不完整")
 		}
 	}
 	if !sameRefSet(o.EvidenceRefs, evidence) {

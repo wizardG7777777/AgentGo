@@ -63,8 +63,10 @@ func (c DefinitionCompiler) Compile(ctx context.Context, req DefinitionCompileRe
 	if draft.RequestDigest != "" && contract.RequestDigest != "" && draft.RequestDigest != contract.RequestDigest {
 		issues = append(issues, validationIssue("REQUEST_DIGEST_MISMATCH", "contract.request_digest", true, "Draft 与 GraphContract 的 request_digest 不一致"))
 	}
-	if body.Schema != SchemaV2 {
-		issues = append(issues, validationIssue("SCHEMA_V2_REQUIRED", "schema", true, fmt.Sprintf("新 Definition schema 必须为 %q", SchemaV2)))
+	// 新 authoring 默认写 v3；显式提交的 v2 Definition 只用于既有持久化
+	// authoring/recovery 兼容，不能被静默改写为 v3。
+	if body.Schema != SchemaV2 && body.Schema != SchemaV3 {
+		issues = append(issues, validationIssue("SCHEMA_VERSION_INVALID", "schema", true, fmt.Sprintf("Definition schema 必须为 %q 或 %q", SchemaV2, SchemaV3)))
 	}
 
 	doc := graphDocumentFromDefinition(draft.GraphID, req.DefinitionRevision, body)

@@ -16,6 +16,7 @@ const (
 	ControlScopeFinalReport   ControlScopeKind = "final_report"
 	ControlScopeRootAuthoring ControlScopeKind = "root_authoring"
 	ControlScopeIntervention  ControlScopeKind = "graph_intervention"
+	ControlScopeGraphChange   ControlScopeKind = "graph_change"
 )
 
 // ClassifyControlScope 是 L3 ToolRouter、L4 intervention 与 L5 bridge 共用的
@@ -40,10 +41,17 @@ func ClassifyControlScope(task *Task) (ControlScopeKind, error) {
 		return ControlScopeGraph, nil
 	}
 	if task.InterventionGraphID != "" {
-		if task.RunPhase != runcontract.PhaseRecovery || task.EventSource != TaskEventSourceLoopIntervention {
+		if task.RunPhase != runcontract.PhaseRecovery {
 			return ControlScopeLegacy, fmt.Errorf("Graph intervention scope binding 不完整")
 		}
-		return ControlScopeIntervention, nil
+		switch task.EventSource {
+		case TaskEventSourceLoopIntervention:
+			return ControlScopeIntervention, nil
+		case TaskEventSourceGraphChange:
+			return ControlScopeGraphChange, nil
+		default:
+			return ControlScopeLegacy, fmt.Errorf("Graph intervention scope binding 不完整")
+		}
 	}
 	if task.EventType == "__scheduler__" && task.RunContract != nil {
 		return ControlScopeRootAuthoring, nil

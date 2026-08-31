@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"agentgo/internal/policycatalog"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
+	"agentgo/internal/taskmem"
 )
 
 // scriptedLLM 是 integration_test 用的简化 LLM mock。
@@ -84,8 +86,10 @@ func TestSchedulerBundle_New_AgentEventTypeIsScheduler(t *testing.T) {
 	r := roster.NewMemoryRoster()
 	cfg := config.DefaultConfig()
 
+	taskMemory := taskmem.NewStore(t.TempDir())
 	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil,
-		nil, nil, nil, nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil, nil, nil,
+		GraphAuthoringDeps{TaskMemStore: taskMemory})
 	if bundle.Agent.EventType != "__scheduler__" {
 		t.Errorf("Agent.EventType = %q, want __scheduler__", bundle.Agent.EventType)
 	}
@@ -99,6 +103,12 @@ func TestSchedulerBundle_New_AgentEventTypeIsScheduler(t *testing.T) {
 	if bundle.Agent.MaxRetries <= 0 {
 		t.Errorf("Agent.MaxRetries = %d, must be >0 (finite retry prevents infinite loop on LLM outage)",
 			bundle.Agent.MaxRetries)
+	}
+	if bundle.Agent.TaskMemStore != taskMemory {
+		t.Fatal("Scheduler 必须与 Runner 共用 Task Memory authority")
+	}
+	if !slices.Contains(bundle.ToolReg.Names(), "record_observation_delta") {
+		t.Fatalf("Scheduler coordination/v2 承诺 Observation 时必须注册控制工具: %v", bundle.ToolReg.Names())
 	}
 }
 

@@ -1,12 +1,25 @@
 # KNOWN_ISSUES — 当前限制与验证缺口
 
-最后核对：2026-08-27。
+最后核对：2026-08-30。
 
 ## 2026-08-23 五层架构修复的当前开放项
 
 本轮已落地 Invocation/Context/Effect/Loop/Graph 的主要 canonical contract、
 durable Store 和生产接线，并通过 full/race/vet/build、SWE Test Runner 单测与真实二进制；但以下
 仍是当前发布判断中的真实开放项：
+
+- **SWE-107～110 的真实 Flask-8 行为验证待补**：SWE-096～106 修复后的用户批次已达到
+  `architecture_ok=8/8`、`task_resolved=6/8`，证明 Observation authority、targeted
+  CheckContract、fan-out 与 finalizing 接缝不再令架构门失败；剩余两题仍是零补丁业务失败。
+  进一步审计发现 RecoveryDelta v3 把“首个目标文件已读”错误等同于“必须立即修改同一
+  文件”，既不能证明上下文充分，也会压制弱模型补齐调用链。当前已发布 v4：L5 冻结
+  `EvidenceContract`，L3 逐段证明完整/新鲜覆盖后由 Worker typed 选择 edit、
+  need_context、hypothesis_rejected 或 blocked；只有 edit 才执行声明 mutation 与 check。
+  仓库回归与本地真实 Windows 二进制 fake-provider 链已通过，但尚未用相同小模型重跑
+  Flask-8，因此不能把本地机械闭环外推为剩余两题已解决。实施与证据见
+  [`Recovery EvidenceContract v4`](../test-issues/2026-08-30-2356-recovery-evidence-contract-v4.md)；
+  v3 历史见 [`Recovery handoff v3`](../test-issues/2026-08-30-1630-recovery-handoff-v3.md)
+  与 [`L2-L4 Recovery 收口`](../test-issues/2026-08-30-2002-l2-l4-recovery-closure.md)。
 
 - **L5 legacy 退出**：新图已走 Draft/Definition/commit/start、ChangeProposal、
   typed outcome/outbox；旧 `submit_graph`/direct `patch_graph` 仍保留受限兼容面，
@@ -77,15 +90,6 @@ durable Store 和生产接线，并通过 full/race/vet/build、SWE Test Runner 
   、[`DeepSeek Responses 精确重放事故`](../test-issues/2026-08-23-0500-deepseek-responses-exact-replay.md)、
   [`五层限制重组`](../test-issues/2026-08-24-0715-swe-layer-limit-recomposition.md)
   与 [`Observation thinking replay`](../test-issues/2026-08-24-0735-observation-thinking-replay.md)。
-- **SWE-057 实现完成、Windows 八题业务结果待回填**：八题 `tasks.csv` 与 prompt
-  曾只存在于 `/tmp` testbed，导致其他机器即使取得 SWE Test Runner 也无法运行同一回归
-  cohort。现 `flask-8` suite 已与 SWE Test Runner 一同版本化，冻结完整上游 SHA，并使用
-  跨平台测试命令与 testbed 默认路径；Windows Test Runner/suite 的 49 项契约测试已
-  通过，本地完整 Flask 克隆也能解析全部 8 个 fix SHA。首次单题暴露的 v4 路径
-  反斜杠启动失败也已关闭：生成配置通过真实 config doctor，并以 healthz 200 完成
-  无模型二进制启动。实际八题业务结果仍需回填，但这不属于 AgentGo L1–L5 主链事故。
-  详见 [`SWE-057 版本化回归套件`](../test-issues/2026-08-27-0109-versioned-swe-suite.md)。
-
 统一状态与后续顺序见
 [`SWE 架构修复统一实施路线图`](../design/swe-architecture-repair-roadmap.md)。
 
@@ -263,6 +267,13 @@ go test -race ./...
 - 处置：仓库不再内置行为评测框架；重要 prompt 变更后用 `trace stats` 抽查。若重新建设行为基准，应采用受版本控制的真实软件工程任务与外部基准，而不是本地玩具任务集。
 
 ## 维护规则
+
+### Graph v3 的联合提交尚未开放
+
+`agentgo.graph/v3` 当前每张图只允许一个 mutating producer。多个候选的原子联合 promotion、跨 candidate conflict 预检与多 `delivery_commit_ref` Graph success 尚未实现；编译期会拒绝该拓扑，避免把多个已独立提交的 workspace 伪装为一次原子交付。
+
+- 影响：需要并行写多个独立候选的请求必须拆为多个 v3 Graph，再由上层 Graph/用户协调汇合。
+- 处置：不要绕过 compiler 手工提交多 producer v3 JSON；等待联合 Delivery Transaction 设计落地。
 
 - 新的、可复现且尚未修复的问题在这里记录影响、复现/证据、临时处置和归属。
 - 修复后从本文件移除；若修复过程值得保留，迁移到 `docs/archived/` 并在提交中链接测试。

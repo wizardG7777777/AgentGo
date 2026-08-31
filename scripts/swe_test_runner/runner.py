@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import csv
 import datetime as dt
 import glob
@@ -34,7 +35,7 @@ import uuid
 import xml.etree.ElementTree as ET
 
 
-RUN_SCHEMA = "agentgo.run-contract/v1"
+RUN_SCHEMA = "agentgo.run-contract/v2"
 RESULT_SCHEMA = "agentgo.swe-result/v2"
 PYTEST_REPORT_SCHEMA = "agentgo.pytest-phase-report/v1"
 PYTEST_COUNT_SEMANTICS = "pytest-phase-overlap/v1"
@@ -56,6 +57,20 @@ REQUIRED_ENV_VARS = (
     "SWE_BASE_URL",
     "SWE_MODEL",
 )
+
+
+def configure_console_utf8() -> None:
+    """让 Windows 重定向/PTY 输出不依赖活动代码页。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (OSError, ValueError):
+            # 已关闭或不支持重配置的嵌入式流不应阻断结果落盘；调用方仍可
+            # 提供自己的 Unicode-safe stream。
+            continue
 
 
 def required_environment_values() -> dict[str, str]:
@@ -320,21 +335,45 @@ def iter_jsonl(pattern: str):
             continue
 
 
-def build_run_contract(task_id: str, timeout_sec: int, now: dt.datetime | None = None) -> dict:
-    if timeout_sec < 240:
-        raise ValueError("SWE 外部时限必须至少为 240 秒，才能保留 Run 收割窗口")
+def targeted_check_command(test_files: tuple[str, ...]) -> str:
+    """生成 POSIX sh 与 PowerShell 都能逐字解释的冻结目标测试命令。"""
+    if not test_files:
+        raise ValueError("SWE targeted CheckContract 缺少目标测试文件")
+    quoted = []
+    for raw in test_files:
+        normalized = str(raw).replace("\\", "/")
+        path = Path(normalized)
+        if (path.is_absolute() or ".." in path.parts or not normalized.startswith("tests/")
+                or "'" in normalized or "\n" in normalized or "\r" in normalized):
+            raise ValueError(f"SWE targeted CheckContract 路径非法: {raw!r}")
+        # 单引号对无内嵌单引号的路径在 POSIX sh / PowerShell 中语义一致。
+        quoted.append(f"'{normalized}'")
+    return "uv run --no-sync python -m pytest -q " + " ".join(quoted)
+
+
+def build_run_contract(task_id: str, timeout_sec: int, now: dt.datetime | None = None,
+                       test_files: tuple[str, ...] = ()) -> dict:
+    if timeout_sec < 480:
+        raise ValueError("SWE 外部时限必须至少为 480 秒，才能保留 Run 四阶段收割窗口")
     created = (now or utc_now()).astimezone(dt.timezone.utc)
-    # 外部 hard kill 前固定留 60 秒；Run 内再冻结 90 秒 recovery 与 30 秒 finalization。
+    # 外部 hard kill 前固定留 60 秒；Run 内冻结 verification/recovery/finalization。
     deadline = created + dt.timedelta(seconds=timeout_sec - 60)
     safe_task = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in task_id)[:48]
     return {
         "schema": RUN_SCHEMA,
         "run_id": f"run-swe-{safe_task}-{uuid.uuid4()}",
         "deadline_at": format_time(deadline),
-        "finalization_reserve": 30 * NANOSECOND,
-        "recovery_reserve": 90 * NANOSECOND,
+        "finalization_reserve": 90 * NANOSECOND,
+        "recovery_reserve": 120 * NANOSECOND,
+        "verification_reserve": 180 * NANOSECOND,
         "budget_profile": "swe/v3",
         "budget": {},
+        "check_contracts": [
+            {"check_id": "targeted", "kind": "test",
+             "exact_command": targeted_check_command(test_files)},
+            {"check_id": "verification", "kind": "test",
+             "exact_command": "uv run --no-sync python -m pytest -q"},
+        ],
         "created_at": format_time(created),
     }
 
@@ -537,8 +576,9 @@ def http_json(url: str, token: str, method: str = "GET", body: dict | None = Non
 
 
 def inject_request(base_url: str, token: str, prompt_path: str, task_id: str,
-                   timeout_sec: int, contract_path: str) -> dict:
-    contract = build_run_contract(task_id, timeout_sec)
+                   timeout_sec: int, contract_path: str,
+                   test_files: tuple[str, ...]) -> dict:
+    contract = build_run_contract(task_id, timeout_sec, test_files=test_files)
     prompt = Path(prompt_path).read_text(encoding="utf-8")
     status, response = http_json(base_url.rstrip("/") + "/api/input", token, "POST", {
         "text": prompt,
@@ -603,8 +643,13 @@ def monitor_run(base_url: str, token: str, process: subprocess.Popen, run_id: st
                 observed_activity = True
             next_candidate = ""
             if projection["graph_terminal"]:
-                next_candidate = "graph_terminal" if projection["final_reports_terminal"] \
-                    else "graph_terminal_incomplete_final_report"
+                # Graph terminal 不是进程收口：必须继续等待 final-report terminal。
+                # 旧版 30 秒后返回 incomplete 并 terminate_process，会在
+                # RunContract finalization reserve 内主动制造 processing Task 与
+                # active reservation。真正缺失只能由内部 fallback 或外部 hard
+                # deadline 裁决。
+                if projection["final_reports_terminal"] and projection["tasks_terminal"]:
+                    next_candidate = "graph_terminal"
             elif projection["graph_count"] == 0 and projection["tasks_terminal"]:
                 next_candidate = "no_graph_terminal"
             if next_candidate != candidate:
@@ -668,7 +713,15 @@ def safe_outcomes(state_dir: Path, run_id: str) -> tuple[list[dict], int]:
 def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str]) -> tuple[dict, list[dict]]:
     events = []
     for _, event in iter_jsonl(str(project_root / ".agentgo" / "sessions" / "*" / "logs" / "*.jsonl")):
-        if event.get("run_id") == run_id:
+        # 旧 workspace Manager 事件没有 run_id；SWE 每题使用全新 disposable
+        # worktree，因此其中的 delivery-* 生命周期事件仍属于当前唯一 Run。
+        # 新实现会从持久化 owner 写入 Run/Graph 身份，此兼容分支只用于事故回溯。
+        legacy_workspace_event = (
+            not event.get("run_id")
+            and event.get("kind") in {"workspace_materialized", "workspace_merged", "workspace_cleaned"}
+            and str(event.get("task_id") or "").startswith("delivery-")
+        )
+        if event.get("run_id") == run_id or legacy_workspace_event:
             events.append(event)
     events.sort(key=lambda event: event.get("ts", ""))
     llm_ends = [event for event in events if event.get("kind") == "llm_call_end"]
@@ -708,6 +761,71 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
         and event.get("tool") == "get_task_result"
         and "被拒绝" in str(event.get("error", ""))
     ]
+    # submit_recovery_decision 内部会先进入 finalizing，再由 Agent 唯一终态事务
+    # emit task_result_committed。按 raw tool_result 计数会把 Attempt rollover 后的
+    # 重放误认成多个 Graph retry；每个 Recovery Task 只取最终一次成功裁决，且
+    # 只有真正 committed 的裁决才有资格要求后继 work gate。
+    last_recovery_decision_by_task = {}
+    committed_recovery_tasks = set()
+    for event in events:
+        if (event.get("kind") == "tool_result"
+                and event.get("tool") == "submit_recovery_decision"
+                and not event.get("error")
+                and isinstance(event.get("args"), dict)):
+            last_recovery_decision_by_task[event.get("task_id", "")] = event
+        elif event.get("kind") == "task_result_committed":
+            committed_recovery_tasks.add(event.get("task_id", ""))
+    recovery_retry_receipts = sorted((
+        event for task_id, event in last_recovery_decision_by_task.items()
+        if task_id in committed_recovery_tasks and event["args"].get("decision") == "retry"
+    ), key=lambda event: event.get("ts", ""))
+    recovery_gate_events = [
+        event for event in events
+        if event.get("kind") == "recovery_action_gated"
+        and isinstance(event.get("recovery_action_gate"), dict)
+    ]
+    first_gate_by_task = {}
+    for event in recovery_gate_events:
+        payload = event["recovery_action_gate"]
+        if payload.get("stage") == "first_action" and event.get("task_id") not in first_gate_by_task:
+            first_gate_by_task[event.get("task_id")] = event
+    first_gates = sorted(first_gate_by_task.values(), key=lambda event: event.get("ts", ""))
+
+    def normalized_path(value) -> str:
+        return str(value or "").strip().replace("\\", "/")
+
+    recovery_gate_missing = len(first_gates) != len(recovery_retry_receipts)
+    recovery_gate_mismatch = False
+    for receipt, gate_event in zip(recovery_retry_receipts, first_gates):
+        expected = receipt["args"].get("first_action") or {}
+        actual = gate_event["recovery_action_gate"]
+        if (
+            expected.get("tool") != actual.get("tool")
+            or normalized_path(expected.get("path")) != normalized_path(actual.get("path"))
+        ):
+            recovery_gate_mismatch = True
+            break
+    calls_by_turn = collections.defaultdict(list)
+    for event in events:
+        if event.get("kind") == "tool_call":
+            calls_by_turn[event.get("turn_id", "")].append(event)
+    for gate_event in recovery_gate_events:
+        payload = gate_event["recovery_action_gate"]
+        for call in calls_by_turn.get(gate_event.get("turn_id", ""), []):
+            args = call.get("args") if isinstance(call.get("args"), dict) else {}
+            if (
+                call.get("tool") != payload.get("tool")
+                or (payload.get("path") and normalized_path(args.get("path")) != normalized_path(payload.get("path")))
+                or (payload.get("check_id") and args.get("check_id") != payload.get("check_id"))
+                or (payload.get("ref_id") and args.get("ref_id") != payload.get("ref_id"))
+                or ("offset" in payload and int(args.get("offset") or 0) != int(payload.get("offset") or 0))
+                or ("limit" in payload and int(args.get("limit") or 0) != int(payload.get("limit") or 0))
+            ):
+                recovery_gate_mismatch = True
+    recovery_directive_ambiguous = any(
+        int((event.get("recovery_action_gate") or {}).get("directive_count") or 0) != 1
+        for event in recovery_gate_events
+    )
     create_calls = [
         event for event in events
         if event.get("kind") == "tool_call" and event.get("task_id") in scheduler_task_ids
@@ -718,10 +836,21 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
         created_at = create_calls[0].get("ts", "")
         first_create_index = sum(event.get("ts", "") <= created_at for event in scheduler_ends)
     error_text = "\n".join(str(event.get("error", "")) for event in events if event.get("error"))
+    event_errors = [str(event.get("error", "")) for event in events if event.get("error")]
     observation_control_failures = [
         event for event in events
         if event.get("kind") == "observation_checkpoint_failed"
     ]
+    merged_deliveries = set()
+    delivery_cleanup_without_merge = []
+    for event in events:
+        workspace_id = str(event.get("task_id") or "")
+        if not workspace_id.startswith("delivery-"):
+            continue
+        if event.get("kind") == "workspace_merged":
+            merged_deliveries.add(workspace_id)
+        elif event.get("kind") == "workspace_cleaned" and workspace_id not in merged_deliveries:
+            delivery_cleanup_without_merge.append(event)
     max_observation_checkpoint_attempts = 0
     current_observation_checkpoint_attempts = 0
     max_observation_checkpoint_failures = 0
@@ -753,7 +882,12 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
             event.get("failure_kind") == "output_limit_exceeded" for event in llm_ends
         ),
         "premature_attempt_exhaustion": "attempt" in error_text.lower() and "exhaust" in error_text.lower(),
-        "invalid_recovery_deadline": "recovery" in error_text.lower() and "deadline" in error_text.lower() and "invalid" in error_text.lower(),
+        "invalid_recovery_deadline": any(
+            "recovery" in error.lower() and "deadline" in error.lower() and "invalid" in error.lower()
+            and "recovery_retry_unstartable" not in error
+            and "allowed_decisions=[blocked]" not in error
+            for error in event_errors
+        ),
         "scheduler_tool_batch_exceeded": bool(scheduler_batches),
         "request_timeout_rebuilt_context": any(
             event.get("failure_kind") == "request_timeout" and event.get("recovery_action") == "rebuild_context"
@@ -763,6 +897,9 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
         "recovery_contract_rejection": "recovery_delta" in error_text and any(
             marker in error_text for marker in ("非法", "不一致", "缺少", "cannot unmarshal")
         ),
+        "recovery_action_gate_missing": recovery_gate_missing,
+        "recovery_action_gate_mismatch": recovery_gate_mismatch,
+        "recovery_directive_ambiguous": recovery_directive_ambiguous,
         "observation_checkpoint_retry_storm": max_observation_checkpoint_failures > 2,
         "observation_checkpoint_attempt_limit_exceeded": max_observation_checkpoint_attempts > 2,
         # provider 前的 Control Invocation preflight 失败不会产生
@@ -772,6 +909,7 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
             event.get("reason") == "control_invocation_preflight_failed"
             for event in observation_control_failures
         ),
+        "delivery_workspace_cleaned_without_merge": bool(delivery_cleanup_without_merge),
         "reasoning_mode_replay_break": "reasoning_text" in error_text and "must be passed back" in error_text,
     }
     return {
@@ -785,6 +923,9 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
         "observation_checkpoint_failures": dict(sorted(collections.Counter(
             str(event.get("reason") or "unknown") for event in observation_control_failures
         ).items())),
+        "delivery_workspace_cleanup_without_merge_count": len(delivery_cleanup_without_merge),
+        "recovery_retry_count": len(recovery_retry_receipts),
+        "recovery_first_action_gate_count": len(first_gates),
         "known_incidents": known,
     }, events
 
@@ -931,6 +1072,23 @@ def missing_loop_recovery_sources(outcomes: list[dict], recovered_source_task_id
     return sorted(set(missing))
 
 
+def stalled_graph_change_coordinations(tasks: list[dict], outcomes: list[dict]) -> list[str]:
+    """识别 graph-change 控制任务因缺少可提交裁决而耗尽进展契约。"""
+    graph_change_ids = {
+        str(task.get("id") or "") for task in tasks
+        if task.get("event_source") == "graph-change-request" and task.get("id")
+    }
+    stalled_reasons = {
+        "progress_authority_failure", "decision_progress_stalled",
+        "no_progress_budget_exhausted", "invocation_deadline",
+    }
+    return sorted({
+        str(outcome.get("task_id") or "") for outcome in outcomes
+        if outcome.get("task_id") in graph_change_ids
+        and outcome.get("reason_code") in stalled_reasons
+    })
+
+
 def collect_result(snapshot_path: str, monitor_path: str, project_root: str, run_id: str,
                    startup_probe_passed: bool) -> dict:
     snapshot = read_json(snapshot_path, {})
@@ -963,6 +1121,8 @@ def collect_result(snapshot_path: str, monitor_path: str, project_root: str, run
         outcomes, recovered_source_task_ids, recovery_controller_task_ids,
     )
     known["loop_intervention_without_recovery"] = bool(missing_recovery)
+    graph_change_stalls = stalled_graph_change_coordinations(tasks, outcomes)
+    known["graph_change_coordination_stalled"] = bool(graph_change_stalls)
     requires_run_budget = any(
         str(((task.get("run_contract") or {}).get("budget_profile") or "")).endswith("/v3")
         for task in tasks
@@ -1085,6 +1245,7 @@ def collect_result(snapshot_path: str, monitor_path: str, project_root: str, run
             "effect_records": count_jsonl(state_dir / "effects.jsonl"),
             "artifact_records": count_jsonl(state_dir / "artifacts.jsonl"),
             "loop_recovery_missing_sources": missing_recovery,
+            "graph_change_stalled_task_ids": graph_change_stalls,
         },
         "known_incidents": known,
         "infrastructure_conditions": infrastructure_conditions,
@@ -1226,6 +1387,25 @@ def summarize_batch_runs(tasks: list[TaskSpec], runs_dir: str, batch_start: floa
             "infrastructure_error": None,
             "not_run_reason": stop_reason or "batch_stopped_before_task",
         })
+    return rows
+
+
+def persist_batch_summary(tasks: list[TaskSpec], runs_dir: str | Path, batch_start: float,
+                          infrastructure_error: dict | None = None, stop_reason: str = "",
+                          *, in_progress: bool = False) -> list[dict]:
+    """Atomically checkpoint the current batch transaction after every task.
+
+    A process-level interrupt may bypass Python finally on Windows terminals. The
+    incremental authority ensures completed current-batch rows remain distinguishable
+    from stale results even then.
+    """
+    effective_reason = stop_reason or ("batch_in_progress" if in_progress else "")
+    rows = summarize_batch_runs(
+        tasks, str(runs_dir), batch_start,
+        infrastructure_error=infrastructure_error,
+        stop_reason=effective_reason,
+    )
+    atomic_json(Path(runs_dir) / "summary.json", rows)
     return rows
 
 
@@ -1688,7 +1868,7 @@ def run_task(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> d
             wait_for_agentgo(process, base_url, log_path)
             contract = inject_request(
                 base_url, token, str(prompt), task.task_id, timeout_sec,
-                str(run_dir / "run_contract.json"),
+                str(run_dir / "run_contract.json"), task.test_files,
             )
             print("执行状态：RunContract 注入成功 " + json.dumps({
                 "inject": 200, "run_id": contract["run_id"],
@@ -1834,7 +2014,52 @@ def batch_exit_code(rows: list[dict], expected_count: int) -> int:
     return 0
 
 
+@contextlib.contextmanager
+def task_execution_lock(config: SWETestRunnerConfig, task_id: str):
+    """Hold a cross-platform non-blocking lock outside the disposable worktree."""
+    lock_dir = config.testbed / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id)
+    path = lock_dir / f"{safe_id}.lock"
+    handle = path.open("a+b")
+    if handle.seek(0, os.SEEK_END) == 0:
+        handle.write(b"0")
+        handle.flush()
+    handle.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        handle.close()
+        raise SWETestRunnerInfrastructureError(
+            "task_already_running", "task_lock",
+            f"task={task_id} 已有 SWE Test Runner 持有执行锁；拒绝清理活动 worktree",
+        ) from error
+    try:
+        yield
+    finally:
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 def execute_task(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> dict:
+    with task_execution_lock(config, task.task_id):
+        return execute_task_locked(config, task, timeout_sec)
+
+
+def execute_task_locked(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> dict:
     prepare_task(config, task)
     run_task(config, task, timeout_sec)
     judge_task(config, task)
@@ -1979,12 +2204,14 @@ def verify_candidates(config: SWETestRunnerConfig) -> dict[str, int]:
 
 
 def command_probe(args: argparse.Namespace) -> int:
+    configure_console_utf8()
     config = SWETestRunnerConfig.from_env()
     preflight_probe(config, args.timeout)
     return 0
 
 
 def command_task(args: argparse.Namespace) -> int:
+    configure_console_utf8()
     config = SWETestRunnerConfig.from_env()
     print(f"\n===== 启动单题任务：{args.task_id} =====")
     preflight_probe(config, args.probe_timeout)
@@ -1993,16 +2220,18 @@ def command_task(args: argparse.Namespace) -> int:
 
 
 def command_batch(args: argparse.Namespace) -> int:
+    configure_console_utf8()
     config = SWETestRunnerConfig.from_env()
     tasks = load_tasks(config.tasks_file)
     preflight_probe(config, args.probe_timeout)
     runs_dir = config.testbed / "runs"
     batch_start = record_batch_start(runs_dir)
-    # 新批次开始即清空旧 summary authority；逐题历史文件仍保留，但只有
-    # mtime >= batch_start 的 result/judge 才能进入本轮投影。
-    atomic_json(runs_dir / "summary.json", [])
+    # 新批次开始即用 not_run/batch_in_progress 覆盖旧 summary
+    # authority；即使 Windows Ctrl+C 绕过 Python finally，也不会留下
+    # 无法解释的 [] 或复用旧批次结果。
     infrastructure_error = None
     stop_reason = ""
+    rows = persist_batch_summary(tasks, runs_dir, batch_start, in_progress=True)
     try:
         for task in tasks:
             print(
@@ -2021,7 +2250,14 @@ def command_batch(args: argparse.Namespace) -> int:
                     "SWE_TEST_RUNNER_ERROR: " + safe_diagnostic(error),
                     file=os.sys.stderr,
                 )
+                rows = persist_batch_summary(
+                    tasks, runs_dir, batch_start, infrastructure_error, stop_reason,
+                )
                 break
+            rows = persist_batch_summary(
+                tasks, runs_dir, batch_start, infrastructure_error,
+                stop_reason or "batch_in_progress", in_progress=True,
+            )
             if result.get("infrastructure_ok") is False:
                 conditions = result.get("infrastructure_conditions") or {}
                 reason_code = next((name for name, count in sorted(conditions.items()) if count),
@@ -2040,23 +2276,30 @@ def command_batch(args: argparse.Namespace) -> int:
                     f"运行基础设施失败，停止批次: {task.task_id} reason={reason_code}",
                     file=os.sys.stderr,
                 )
+                rows = persist_batch_summary(
+                    tasks, runs_dir, batch_start, infrastructure_error, stop_reason,
+                )
                 break
             if not result.get("architecture_ok"):
                 stop_reason = "previous_architecture_gate"
                 print(f"架构门失败，停止批次: {task.task_id}", file=os.sys.stderr)
+                rows = persist_batch_summary(
+                    tasks, runs_dir, batch_start, infrastructure_error, stop_reason,
+                )
                 break
+    except KeyboardInterrupt:
+        stop_reason = "batch_interrupted"
+        print("批次收到中断：保留当前事务摘要，未运行题目标记 not_run", file=os.sys.stderr)
     finally:
-        rows = summarize_batch_runs(
-            tasks, str(runs_dir), batch_start,
-            infrastructure_error=infrastructure_error,
-            stop_reason=stop_reason,
+        rows = persist_batch_summary(
+            tasks, runs_dir, batch_start, infrastructure_error, stop_reason,
         )
-        atomic_json(runs_dir / "summary.json", rows)
         print_summary(rows)
     return batch_exit_code(rows, len(tasks))
 
 
 def command_verify_candidates(_args: argparse.Namespace) -> int:
+    configure_console_utf8()
     counts = verify_candidates(SWETestRunnerConfig.from_env())
     return 0 if counts.get("OK", 0) > 0 and sum(
         count for name, count in counts.items() if name != "OK"
@@ -2088,6 +2331,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    configure_console_utf8()
     args = parser().parse_args()
     try:
         return int(args.func(args) or 0)

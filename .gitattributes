@@ -1,0 +1,35 @@
+# 跨平台文本统一存储与检出为 LF；二进制由 Git 自动识别并保持原样。
+* text=auto eol=lf
+
+# 核心源码、配置、脚本与文档显式固定为 LF，避免本机 core.autocrlf 漂移。
+*.go text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.csv text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+*.ts text eol=lf
+
+# 常见二进制格式不得参与行尾转换。
+*.exe -text
+*.dll -text
+*.so -text
+*.dylib -text
+*.zip -text
+*.png -text
+*.jpg -text
+*.jpeg -text
+*.gif -text
+*.ico -text
+*.pdf -text

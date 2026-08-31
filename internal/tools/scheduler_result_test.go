@@ -365,6 +365,37 @@ func TestSchedulerGroup_GetTaskResultAllowsExactDetachedInterventionScope(t *tes
 	}
 }
 
+func TestSchedulerGroup_GetTaskResultAllowsFrozenGraphChangeScope(t *testing.T) {
+	s := store.NewMemoryTaskStore(make(chan model.Event, 32), 16, 1, 60)
+	controller := &model.Task{
+		ID: "graph-change-controller", Description: "change", EventType: "__scheduler__",
+		EventSource: model.TaskEventSourceGraphChange, InterventionGraphID: "g-1",
+	}
+	if err := s.PublishTask(controller); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimTask("scheduler", controller.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []*model.Task{
+		{ID: "graph-work", GraphID: "g-1", NodeID: "work", ActivationID: "work@1"},
+		{ID: "graph-acceptance", GraphID: "g-1", NodeID: "acceptance", ActivationID: "acceptance@1"},
+	} {
+		publishCompletedResultTask(t, s, target, map[string]string{"worker": target.ID})
+	}
+	foreign := &model.Task{ID: "foreign-work", GraphID: "g-2", NodeID: "work", ActivationID: "work@1"}
+	publishCompletedResultTask(t, s, foreign, map[string]string{"worker": "secret"})
+	registry := newResultToolRegistry(SchedulerGroup{Store: s, Holder: &fakeHolder{id: controller.ID}})
+	for _, taskID := range []string{"graph-work", "graph-acceptance"} {
+		if _, err := dispatchResultPage(t, registry, map[string]any{"task_id": taskID}); err != nil {
+			t.Fatalf("graph-change coordination 应能读取同图结果 %s: %v", taskID, err)
+		}
+	}
+	if _, err := registry.Dispatch(context.Background(), mkCall("get_task_result", map[string]any{"task_id": foreign.ID})); err == nil || !strings.Contains(err.Error(), "intervention scope") {
+		t.Fatalf("graph-change coordination 不得读取其它 Graph: %v", err)
+	}
+}
+
 func TestSchedulerGroup_GetTaskResultAllowsFrozenFinalReportGraphScope(t *testing.T) {
 	s := store.NewMemoryTaskStore(make(chan model.Event, 32), 16, 1, 60)
 	finalReport := newFinalReportTestTask(t, "final-report", "g-finished")

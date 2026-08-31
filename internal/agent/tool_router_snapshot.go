@@ -30,6 +30,9 @@ func FreezeToolRouterSnapshotWithPolicy(registry *ToolRegistry, phase string, ma
 	if registry == nil {
 		return ToolRouterSnapshot{}, fmt.Errorf("ToolRouterSnapshot 缺少 ToolRegistry")
 	}
+	if phaseRequiresToolCall(phase) && len(registry.Defs()) == 0 {
+		return ToolRouterSnapshot{}, fmt.Errorf("ToolRouterSnapshot phase=%s 要求工具调用，但冻结工具面为空", phase)
+	}
 	defs := registry.Defs()
 	if expected, singleton := mechanicalSingletonTool(phase); singleton {
 		if len(defs) != 1 || defs[0].Name != expected {

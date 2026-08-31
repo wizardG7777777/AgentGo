@@ -4,13 +4,132 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
+	"agentgo/internal/delivery"
+	"agentgo/internal/model"
 	"agentgo/internal/pathutil"
+	"agentgo/internal/store"
 )
+
+// FreezeCandidate 将 delivery workspace 的 dirty set 冻结为稳定只读身份。
+// 它不提升任何文件；manifest 条目按路径排序，并把候选文件内容摘要纳入
+// digest，因而 map 遍历顺序或展示文本都不会改变 CandidateRef。
+func (m *Manager) FreezeCandidate(deliveryID, workspaceID, workspaceRevisionRef string) (delivery.Candidate, error) {
+	if !strings.HasPrefix(deliveryID, "delivery:") || strings.TrimSpace(workspaceRevisionRef) == "" {
+		return delivery.Candidate{}, fmt.Errorf("冻结 candidate 缺少合法 delivery_id/workspace_revision_ref")
+	}
+	root, err := m.workspaceRoot(workspaceID)
+	if err != nil {
+		return delivery.Candidate{}, err
+	}
+	owner, err := loadOwner(root)
+	if err != nil {
+		return delivery.Candidate{}, fmt.Errorf("读取 candidate workspace owner: %w", err)
+	}
+	if owner.Kind != OwnerDelivery || owner.DeliveryID != deliveryID {
+		return delivery.Candidate{}, fmt.Errorf("冻结 candidate 的 workspace owner 与 delivery_id 不一致")
+	}
+	mf, err := loadManifest(filepath.Join(root, ManifestFileName))
+	if err != nil {
+		return delivery.Candidate{}, err
+	}
+	entries := mf.snapshot()
+	if len(entries) == 0 {
+		return delivery.Candidate{}, fmt.Errorf("冻结 candidate 拒绝空 dirty set")
+	}
+	paths := make([]string, 0, len(entries))
+	for path := range entries {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	type frozenFile struct {
+		Path string        `json:"path"`
+		Base manifestEntry `json:"base"`
+		SHA  string        `json:"sha256"`
+	}
+	files := make([]frozenFile, 0, len(paths))
+	for _, rel := range paths {
+		data, readErr := os.ReadFile(filepath.Join(root, rel))
+		if readErr != nil {
+			return delivery.Candidate{}, fmt.Errorf("冻结 candidate 读取 %s: %w", rel, readErr)
+		}
+		sum := sha256.Sum256(data)
+		files = append(files, frozenFile{Path: rel, Base: entries[rel], SHA: hex.EncodeToString(sum[:])})
+	}
+	raw, err := json.Marshal(files)
+	if err != nil {
+		return delivery.Candidate{}, fmt.Errorf("编码 candidate manifest: %w", err)
+	}
+	sum := sha256.Sum256(raw)
+	digest := "sha256:" + hex.EncodeToString(sum[:])
+	return delivery.Candidate{
+		Ref: deliveryID + "/candidate/" + digest[7:23], WorkspaceRevisionRef: workspaceRevisionRef,
+		PatchDigest: digest, ManifestDigest: digest,
+	}, nil
+}
+
+// ResolveWorkspaceRevision 实现 checkstore.WorkspaceRevisionResolver。Graph v3
+// repair/acceptance 换 TaskID 但共享 Delivery dirty set，版本必须由
+// candidate 实际内容而非当前 Task 的局部工具历史决定。
+func (m *Manager) ResolveWorkspaceRevision(task *model.Task, taskStore store.TaskStore) (
+	string, []string, bool, error,
+) {
+	if m == nil || task == nil || strings.TrimSpace(task.DeliveryID) == "" {
+		return "", nil, false, nil
+	}
+	workspaceID := DeliveryWorkspaceID(task.DeliveryID)
+	root, err := m.workspaceRoot(workspaceID)
+	if err != nil {
+		return "", nil, true, err
+	}
+	mf, err := loadManifest(filepath.Join(root, ManifestFileName))
+	if err != nil {
+		return "", nil, true, err
+	}
+	if len(mf.snapshot()) == 0 {
+		return "workspace:empty", nil, true, nil
+	}
+	candidate, err := m.FreezeCandidate(task.DeliveryID, workspaceID, "workspace:pending")
+	if err != nil {
+		return "", nil, true, err
+	}
+	ref := "workspace:" + candidate.PatchDigest
+	tasks, err := taskStore.ScanAll()
+	if err != nil {
+		return "", nil, true, err
+	}
+	seen := make(map[string]struct{})
+	var effectRefs []string
+	for _, related := range tasks {
+		if related == nil || related.DeliveryID != task.DeliveryID {
+			continue
+		}
+		records, queryErr := taskStore.QueryToolCalls(related.ID, "")
+		if queryErr != nil {
+			return "", nil, true, queryErr
+		}
+		for _, record := range records {
+			if !record.Success || (record.ToolName != "write_file" && record.ToolName != "edit_file") ||
+				strings.TrimSpace(record.CallID) == "" {
+				continue
+			}
+			value := "tool-call:" + record.CallID
+			if _, duplicate := seen[value]; duplicate {
+				continue
+			}
+			seen[value] = struct{}{}
+			effectRefs = append(effectRefs, value)
+		}
+	}
+	sort.Strings(effectRefs)
+	return ref, effectRefs, true, nil
+}
 
 // baselineDirName 是 workspace 根下保存基线原始副本的目录名。
 // 三路合并需要 base 原文，而 manifest 只记录基线哈希，因此 copy-on-write
@@ -44,8 +163,10 @@ func (m *Manager) relPath(absMainPath string) (string, bool) {
 	return rel, true
 }
 
-// resolveRead 实现 View.ReadPath：manifest 已登记或 workspace 下文件
-// 存在则返回 workspace 副本路径，否则原样返回主根路径（读穿透）。
+// resolveRead 实现 View.ReadPath：只有 manifest 已登记的 dirty
+// 业务文件才返回 workspace 副本，否则读穿透主根。不得以
+// “物理文件存在”为命中依据，否则 owner/manifest/shell snapshot
+// 会泄漏进业务路径命名空间。
 func (v *View) resolveRead(absMainPath string) string {
 	rel, ok := v.mgr.relPath(absMainPath)
 	if !ok {
@@ -53,10 +174,6 @@ func (v *View) resolveRead(absMainPath string) string {
 	}
 	if _, hit := v.mf.get(rel); hit {
 		return filepath.Join(v.root, rel)
-	}
-	wsPath := filepath.Join(v.root, rel)
-	if _, err := os.Stat(wsPath); err == nil {
-		return wsPath
 	}
 	return absMainPath
 }
@@ -66,9 +183,18 @@ func (v *View) resolveRead(absMainPath string) string {
 // MkdirAll）、同步落基线原始副本供三路合并，并在 manifest 记录基线
 // SHA256；主根不存在则 manifest 记为新建（baseline 为空串）。
 func (v *View) resolveWrite(absMainPath string) (string, error) {
+	if v.mgr.ActiveView(v.taskID) != v {
+		return "", fmt.Errorf("%w: %s", ErrViewNotFound, v.taskID)
+	}
+	if info, err := os.Stat(v.root); err != nil || !info.IsDir() {
+		return "", fmt.Errorf("%w: %s", ErrWorkspaceUnavailable, v.taskID)
+	}
 	rel, ok := v.mgr.relPath(absMainPath)
 	if !ok {
 		return "", fmt.Errorf("路径 %q 不在主根 %q 内，无法隔离写入", absMainPath, v.mgr.projectRoot)
+	}
+	if reservedWorkspaceRel(rel) {
+		return "", fmt.Errorf("workspace_internal_path_forbidden: 业务路径 %q 与 workspace 控制面保留名冲突", rel)
 	}
 	wsPath := filepath.Join(v.root, rel)
 
@@ -76,12 +202,10 @@ func (v *View) resolveWrite(absMainPath string) (string, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	// 已有副本（manifest 登记，或文件已存在——manifest 同步持久化，
-	// 后者仅覆盖持久化前崩溃的极窄窗口）→ 直接返回写入位置。
+	// 已有 manifest 副本直接返回写入位置。manifest.set 在
+	// 工具 handler 获得路径前同步持久化，未登记的物理文件
+	// 只能是控制元数据或崩溃留下的未执行基线副本，绝不得当业务文件复用。
 	if _, hit := v.mf.get(rel); hit {
-		return wsPath, nil
-	}
-	if _, err := os.Stat(wsPath); err == nil {
 		return wsPath, nil
 	}
 
@@ -116,6 +240,16 @@ func (v *View) resolveWrite(absMainPath string) (string, error) {
 	default:
 		return "", fmt.Errorf("读取主根文件失败：%w", err)
 	}
+}
+
+func reservedWorkspaceRel(rel string) bool {
+	rel = filepath.Clean(rel)
+	first := rel
+	if index := strings.IndexRune(rel, filepath.Separator); index >= 0 {
+		first = rel[:index]
+	}
+	return first == ownerFileName || first == ManifestFileName || first == baselineDirName ||
+		first == shellRootDirName || strings.HasPrefix(first, ".workspace-shell-build-")
 }
 
 // mergeOne 合并单个文件：roster 非 nil 时对主根绝对路径先 TryClaim、

@@ -82,7 +82,7 @@ func newErr(stage, path, format string, args ...any) *ValidationError {
 //  2. JSON 语法 + 类型化解码（DisallowUnknownFields，未知核心字段在此拒绝；
 //     extensions 内的 RawMessage 不受限）；
 //  3. 重复 object key 检测（encoding/json 不查重，独立流式走查并报出路径）；
-//  4. 基本字段：schema 恰为 "agentgo.graph/v1" 或 "agentgo.graph/v2"、
+//  4. 基本字段：schema 恰为 "agentgo.graph/v1"、"agentgo.graph/v2" 或 "agentgo.graph/v3"、
 //     graph_id 非空且字符集合法、
 //     revision/state_version 非负、节点数/单节点 next 数/ID 长度上限；
 //  5. root：唯一、非空、指向存在的节点；
@@ -333,11 +333,11 @@ func validateRuntimeState(doc *GraphDocument) error {
 }
 
 // validateBasics 实现阶段 4：schema、graph_id、版本号与数量/长度上限。
-// schema 只接受 SchemaV1 / SchemaV2 两个封闭值；v2 文档的追加约束（事件
+// schema 只接受 SchemaV1 / SchemaV2 / SchemaV3 三个封闭值；v2/v3 文档的追加约束（事件
 // 词表、输出契约声明）在 authoring 阶段按版本分流，见 validateAuthoringNodes。
 func validateBasics(doc *GraphDocument) error {
-	if doc.Schema != SchemaV1 && doc.Schema != SchemaV2 {
-		return newErr("基本字段", "schema", "schema 必须恰为 %q 或 %q，实际为 %q", SchemaV1, SchemaV2, doc.Schema)
+	if doc.Schema != SchemaV1 && doc.Schema != SchemaV2 && doc.Schema != SchemaV3 {
+		return newErr("基本字段", "schema", "schema 必须恰为 %q、%q 或 %q，实际为 %q", SchemaV1, SchemaV2, SchemaV3, doc.Schema)
 	}
 	if err := validateGraphID(doc.GraphID); err != nil {
 		return newErr("基本字段", "graph_id", "%s", err.Error())
@@ -419,7 +419,7 @@ func validateTransitions(doc *GraphDocument) error {
 // 历史 Graph 无法 Recover；旧图仍按其冻结契约恢复，新定义则 fail-closed。
 // schema v2 文档在此追加终态契约 v2 的边条件规则（v1 文档不受限）。
 func validateAuthoringSemantics(doc *GraphDocument) error {
-	return validateAuthoringNodes(doc.Nodes, "nodes", doc.Schema == SchemaV2)
+	return validateAuthoringNodes(doc.Nodes, "nodes", doc.Schema == SchemaV2 || doc.Schema == SchemaV3)
 }
 
 func validateAuthoringNodes(nodes map[string]Node, prefix string, v2 bool) error {
@@ -862,6 +862,7 @@ func validateNodesKindSpecs(nodes map[string]Node, depth int) error {
 
 // validateCapabilityShape 实现阶段 9：capability 与 executor 的结构形状。
 func validateCapabilityShape(doc *GraphDocument) error {
+	v3MutatingNodes := 0
 	for _, id := range sortedNodeIDs(doc) {
 		node := doc.Nodes[id]
 		path := "nodes." + id
@@ -897,6 +898,20 @@ func validateCapabilityShape(doc *GraphDocument) error {
 				return newErr("能力", path+".capability.tools", "controller 节点 %q 不得声明 capability.tools（纯控制面无业务工具），实际为 %v", id, cap.Tools)
 			}
 		}
+		// Graph v3 的 mutating producer 只能在隔离候选中写文件；raw
+		// run_shell 会绕过路径边界，故不得进入租约。run_check 是唯一受约束
+		// 的命令执行面，仍可用于 typed verification。
+		if doc.Schema == SchemaV3 && strings.HasPrefix(node.ProgressContractRef, "progress:code-change/") {
+			v3MutatingNodes++
+			if node.Kind != KindAgent || node.Capability == nil || node.Capability.Isolation != IsolationWorkspace {
+				return newErr("能力", path+".capability", "Graph v3 mutating 节点必须是 agent 且 capability.isolation=%q", IsolationWorkspace)
+			}
+			for _, tool := range node.Capability.Tools {
+				if tool == "run_shell" {
+					return newErr("能力", path+".capability.tools", "Graph v3 mutating 节点禁止 raw run_shell；请使用 run_check")
+				}
+			}
+		}
 		if ex := node.Executor; ex != nil {
 			if ex.Type != ExecutorTypeAgent {
 				return newErr("能力", path+".executor.type", "executor.type 仅允许 %q，实际为 %q", ExecutorTypeAgent, ex.Type)
@@ -905,6 +920,9 @@ func validateCapabilityShape(doc *GraphDocument) error {
 				return newErr("能力", path+".executor.agent_id", "executor.agent_id 不能为空")
 			}
 		}
+	}
+	if doc.Schema == SchemaV3 && v3MutatingNodes > 1 {
+		return newErr("能力", "nodes", "Graph v3 首版每张图只允许一个 mutating producer；请拆为独立 Delivery Graph 后再汇合")
 	}
 	return nil
 }

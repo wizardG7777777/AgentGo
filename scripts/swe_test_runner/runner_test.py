@@ -49,6 +49,43 @@ def pytest_payload(**overrides):
 
 
 class SWETestRunnerContractTest(unittest.TestCase):
+    def test_console_streams_are_reconfigured_to_utf8(self):
+        class ReconfigurableStream:
+            def __init__(self):
+                self.calls = []
+
+            def reconfigure(self, **kwargs):
+                self.calls.append(kwargs)
+
+        stdout = ReconfigurableStream()
+        stderr = ReconfigurableStream()
+        with mock.patch.object(swe_test_runner.sys, "stdout", stdout), \
+                mock.patch.object(swe_test_runner.sys, "stderr", stderr):
+            swe_test_runner.configure_console_utf8()
+        expected = [{"encoding": "utf-8", "errors": "backslashreplace"}]
+        self.assertEqual(stdout.calls, expected)
+        self.assertEqual(stderr.calls, expected)
+
+    def test_graph_change_progress_exhaustion_is_architecture_incident(self):
+        tasks = [
+            {"id": "change-1", "event_source": "graph-change-request"},
+            {"id": "worker-1", "event_source": ""},
+        ]
+        outcomes = [
+            {"task_id": "change-1", "reason_code": "progress_authority_failure"},
+            {"task_id": "worker-1", "reason_code": "invocation_deadline"},
+        ]
+        self.assertEqual(
+            swe_test_runner.stalled_graph_change_coordinations(tasks, outcomes),
+            ["change-1"],
+        )
+        self.assertEqual(
+            swe_test_runner.stalled_graph_change_coordinations(
+                tasks, [{"task_id": "change-1", "reason_code": "completed"}],
+            ),
+            [],
+        )
+
     def test_required_environment_reports_every_missing_or_blank_name_without_values(self):
         environment = {
             name: f"value-for-{name.lower()}"
@@ -650,17 +687,101 @@ class SWETestRunnerContractTest(unittest.TestCase):
             self.assertEqual(rows[0]["infrastructure_error"]["reason_code"],
                              "provider_quota_exhausted")
 
+    def test_command_batch_checkpoints_before_next_task_and_handles_interrupt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = swe_test_runner.SWETestRunnerConfig(
+                agentgo_root=root, agentgo_bin=root / "agentgo",
+                testbed=root / "testbed", tasks_file=root / "tasks.csv",
+                prompt_dir=root / "prompts", flask_repo=root / "flask",
+                base_url="https://provider.invalid/v1", model="model", protocol="responses",
+            )
+            tasks = [
+                swe_test_runner.TaskSpec("done", "a" * 40, (), "done"),
+                swe_test_runner.TaskSpec("interrupted", "b" * 40, (), "interrupted"),
+                swe_test_runner.TaskSpec("later", "c" * 40, (), "later"),
+            ]
+            observed_checkpoint = None
+
+            def fake_execute(_config, task, _timeout):
+                nonlocal observed_checkpoint
+                if task.task_id == "interrupted":
+                    observed_checkpoint = json.loads(
+                        (config.testbed / "runs" / "summary.json").read_text(encoding="utf-8")
+                    )
+                    raise KeyboardInterrupt()
+                run_dir = config.run_dir(task.task_id)
+                run_dir.mkdir(parents=True, exist_ok=True)
+                swe_test_runner.atomic_json(run_dir / "result.json", {
+                    "architecture_ok": True, "task_resolved": True,
+                    "process_terminal": "graph_terminal", "graph_outcomes": ["success"],
+                    "metrics": {"model_calls": 2},
+                })
+                swe_test_runner.atomic_json(run_dir / "judge.json", {
+                    "verdict": "resolved", "patch_lines": 1,
+                })
+                return {"architecture_ok": True, "task_resolved": True}
+
+            with mock.patch.object(swe_test_runner.SWETestRunnerConfig, "from_env", return_value=config), \
+                    mock.patch.object(swe_test_runner, "load_tasks", return_value=tasks), \
+                    mock.patch.object(swe_test_runner, "preflight_probe"), \
+                    mock.patch.object(swe_test_runner, "execute_task", side_effect=fake_execute):
+                code = swe_test_runner.command_batch(SimpleNamespace(timeout=1200, probe_timeout=45))
+            self.assertEqual(code, swe_test_runner.EXIT_SWE_TEST_RUNNER_FAILURE)
+            self.assertEqual(observed_checkpoint[0]["run_state"], "completed")
+            self.assertEqual(observed_checkpoint[1]["not_run_reason"], "batch_in_progress")
+            rows = json.loads((config.testbed / "runs" / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual([row["run_state"] for row in rows], ["completed", "not_run", "not_run"])
+            self.assertEqual(rows[1]["not_run_reason"], "batch_interrupted")
+
+    def test_task_execution_lock_rejects_overlapping_cleanup_and_releases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = swe_test_runner.SWETestRunnerConfig(
+                agentgo_root=root, agentgo_bin=root / "agentgo",
+                testbed=root / "testbed", tasks_file=root / "tasks.csv",
+                prompt_dir=root / "prompts", flask_repo=root / "flask",
+                base_url="https://provider.invalid/v1", model="model", protocol="responses",
+            )
+            worktree = config.worktree("same-task")
+            with swe_test_runner.task_execution_lock(config, "same-task"):
+                with self.assertRaises(swe_test_runner.SWETestRunnerInfrastructureError) as raised:
+                    with swe_test_runner.task_execution_lock(config, "same-task"):
+                        pass
+                self.assertEqual(raised.exception.reason_code, "task_already_running")
+                self.assertFalse(worktree.exists(), "锁冲突不得触碰 disposable worktree")
+            with swe_test_runner.task_execution_lock(config, "same-task"):
+                pass
+
     def test_run_contract_leaves_external_and_phase_reserves(self):
         now = dt.datetime(2026, 8, 22, 1, 2, 3, tzinfo=dt.timezone.utc)
-        contract = swe_test_runner.build_run_contract("automatic-options", 1200, now)
+        contract = swe_test_runner.build_run_contract(
+            "automatic-options", 1200, now,
+            ("tests/test_basic.py", "tests/test_subclassing.py"),
+        )
         self.assertEqual(contract["schema"], swe_test_runner.RUN_SCHEMA)
         self.assertEqual(contract["budget_profile"], "swe/v3")
-        self.assertEqual(contract["recovery_reserve"], 90 * swe_test_runner.NANOSECOND)
-        self.assertEqual(contract["finalization_reserve"], 30 * swe_test_runner.NANOSECOND)
+        self.assertEqual(contract["verification_reserve"], 180 * swe_test_runner.NANOSECOND)
+        self.assertEqual(contract["recovery_reserve"], 120 * swe_test_runner.NANOSECOND)
+        self.assertEqual(contract["finalization_reserve"], 90 * swe_test_runner.NANOSECOND)
+        self.assertEqual(contract["check_contracts"], [
+            {"check_id": "targeted", "kind": "test",
+             "exact_command": "uv run --no-sync python -m pytest -q 'tests/test_basic.py' 'tests/test_subclassing.py'"},
+            {"check_id": "verification", "kind": "test",
+             "exact_command": "uv run --no-sync python -m pytest -q"},
+        ])
         deadline = dt.datetime.fromisoformat(contract["deadline_at"].replace("Z", "+00:00"))
         self.assertEqual((deadline - now).total_seconds(), 1140)
         with self.assertRaises(ValueError):
-            swe_test_runner.build_run_contract("too-short", 239, now)
+            swe_test_runner.build_run_contract("too-short", 479, now, ("tests/test_basic.py",))
+
+    def test_targeted_check_command_is_cross_shell_and_rejects_unsafe_path(self):
+        self.assertEqual(
+            swe_test_runner.targeted_check_command(("tests/test_reqctx.py", "tests/test_subclassing.py")),
+            "uv run --no-sync python -m pytest -q 'tests/test_reqctx.py' 'tests/test_subclassing.py'",
+        )
+        with self.assertRaises(ValueError):
+            swe_test_runner.targeted_check_command(("tests/it's_bad.py",))
 
     def test_run_budget_metrics_keep_execution_and_control_usage_separate(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -681,13 +802,20 @@ class SWETestRunnerContractTest(unittest.TestCase):
                 {"kind": "settle", "run_id": "run-1", "settlement": {
                     "reservation_id": "recovery", "usage": {"model_calls": 1},
                 }},
+                {"kind": "reserve", "run_id": "run-1", "reservation": {
+                    "reservation_id": "verification", "phase": "verification", "max_charge": {"model_calls": 1},
+                }},
+                {"kind": "settle", "run_id": "run-1", "settlement": {
+                    "reservation_id": "verification", "usage": {"model_calls": 1},
+                }},
             ]
             path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
             metrics = swe_test_runner.run_budget_metrics(state, "run-1")
             self.assertTrue(metrics["present"])
-            self.assertEqual(metrics["settled"]["model_calls"], 2)
+            self.assertEqual(metrics["settled"]["model_calls"], 3)
             self.assertEqual(metrics["phase_settled"]["execution"]["model_calls"], 1)
             self.assertEqual(metrics["phase_settled"]["recovery"]["model_calls"], 1)
+            self.assertEqual(metrics["phase_settled"]["verification"]["model_calls"], 1)
             self.assertEqual(metrics["active_reservations"], 0)
 
     def test_probe_requires_typed_auto_singleton_call(self):
@@ -894,12 +1022,32 @@ class SWETestRunnerContractTest(unittest.TestCase):
             "graphs": [{"run_id": "run-1", "graph_id": "graph-1", "status": "completed", "outcome": "success"}],
             "pending_interactions": [],
         }
+        incomplete_process = SimpleNamespace(poll=mock.Mock(side_effect=[None, 0]))
         with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.object(swe_test_runner, "http_json", return_value=(200, missing_final_report)):
-            result = swe_test_runner.monitor_run("http://local", "token", running_process, "run-1", time.time(), 10,
+                mock.patch.object(swe_test_runner, "http_json", return_value=(200, missing_final_report)), \
+                mock.patch.object(swe_test_runner.time, "sleep", return_value=None):
+            result = swe_test_runner.monitor_run("http://local", "token", incomplete_process, "run-1", time.time(), 10,
                                          str(Path(directory) / "snapshot.json"), poll_sec=0,
                                          terminal_grace_sec=0)
-        self.assertEqual(result["process_terminal"], "graph_terminal_incomplete_final_report")
+        self.assertEqual(result["process_terminal"], "process_exited")
+
+        processing_intervention = {
+            "tasks": [
+                {"run_id": "run-1", "status": "completed", "graph_id": "graph-1"},
+                {"run_id": "run-1", "status": "completed", "final_report_graph_id": "graph-1"},
+                {"run_id": "run-1", "status": "processing", "event_type": "__scheduler__"},
+            ],
+            "graphs": [{"run_id": "run-1", "graph_id": "graph-1", "status": "failed", "outcome": "failed"}],
+            "pending_interactions": [],
+        }
+        intervention_process = SimpleNamespace(poll=mock.Mock(side_effect=[None, 0]))
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(swe_test_runner, "http_json", return_value=(200, processing_intervention)), \
+                mock.patch.object(swe_test_runner.time, "sleep", return_value=None):
+            result = swe_test_runner.monitor_run("http://local", "token", intervention_process, "run-1", time.time(), 10,
+                                         str(Path(directory) / "snapshot.json"), poll_sec=0,
+                                         terminal_grace_sec=0)
+        self.assertEqual(result["process_terminal"], "process_exited")
 
         no_graph_snapshot = {
             "tasks": [{"run_id": "run-1", "status": "blocked"}],
@@ -1079,6 +1227,25 @@ class SWETestRunnerContractTest(unittest.TestCase):
             self.assertEqual(metrics["invocation_failures"], {"invalid_request": 1})
             self.assertTrue(metrics["known_incidents"]["provider_invalid_request"])
 
+    def test_trace_metrics_marks_delivery_cleanup_without_merge_as_architecture_incident(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / ".agentgo" / "sessions" / "s1" / "logs" / "trace.jsonl"
+            log.parent.mkdir(parents=True)
+            events = [
+                # 历史 Manager 没有写 run_id；disposable worktree 仍必须可回溯。
+                {"ts": "1", "kind": "workspace_cleaned",
+                 "task_id": "delivery-broken", "path": "workspace"},
+                {"ts": "2", "kind": "workspace_merged", "run_id": "run-1",
+                 "task_id": "delivery-good", "path": "workspace"},
+                {"ts": "3", "kind": "workspace_cleaned", "run_id": "run-1",
+                 "task_id": "delivery-good", "path": "workspace"},
+            ]
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+            metrics, _ = swe_test_runner.trace_metrics(root, "run-1", {"scheduler"})
+            self.assertTrue(metrics["known_incidents"]["delivery_workspace_cleaned_without_merge"])
+            self.assertEqual(metrics["delivery_workspace_cleanup_without_merge_count"], 1)
+
     def test_trace_metrics_marks_output_limit_failure_as_architecture_incident(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1104,6 +1271,206 @@ class SWETestRunnerContractTest(unittest.TestCase):
             log.write_text(json.dumps(event) + "\n", encoding="utf-8")
             metrics, _ = swe_test_runner.trace_metrics(root, "run-1", {"scheduler"})
             self.assertTrue(metrics["known_incidents"]["recovery_contract_rejection"])
+
+    def test_trace_metrics_accepts_recovery_handoff_v3_sequence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / ".agentgo" / "sessions" / "s1" / "logs" / "trace.jsonl"
+            log.parent.mkdir(parents=True)
+            events = [
+                {"ts": "1", "kind": "tool_result", "run_id": "run-1",
+                 "task_id": "recovery", "tool": "submit_recovery_decision",
+                 "args": {"decision": "retry", "first_action": {
+                     "tool": "read_file", "path": "src/flask/ctx.py",
+                 }}},
+                {"ts": "1.5", "kind": "task_result_committed", "run_id": "run-1",
+                 "task_id": "recovery"},
+                {"ts": "2", "kind": "recovery_action_gated", "run_id": "run-1",
+                 "task_id": "work-2", "turn_id": "read", "recovery_action_gate": {
+                     "schema": "agentgo.recovery-delta/v3", "stage": "first_action",
+                     "tool": "read_file", "path": "src/flask/ctx.py", "directive_count": 1,
+                 }},
+                {"ts": "3", "kind": "tool_call", "run_id": "run-1",
+                 "task_id": "work-2", "turn_id": "read", "tool": "read_file",
+                 "args": {"path": "src/flask/ctx.py"}},
+                {"ts": "4", "kind": "recovery_action_gated", "run_id": "run-1",
+                 "task_id": "work-2", "turn_id": "edit", "recovery_action_gate": {
+                     "schema": "agentgo.recovery-delta/v3", "stage": "mutation",
+                     "tool": "edit_file", "path": "src/flask/ctx.py", "directive_count": 1,
+                 }},
+                {"ts": "5", "kind": "tool_call", "run_id": "run-1",
+                 "task_id": "work-2", "turn_id": "edit", "tool": "edit_file",
+                 "args": {"path": "src/flask/ctx.py"}},
+                {"ts": "6", "kind": "recovery_action_gated", "run_id": "run-1",
+                 "task_id": "work-2", "turn_id": "check", "recovery_action_gate": {
+                     "schema": "agentgo.recovery-delta/v3", "stage": "check",
+                     "tool": "run_check", "check_id": "targeted", "directive_count": 1,
+                 }},
+                {"ts": "7", "kind": "tool_call", "run_id": "run-1",
+                 "task_id": "work-2", "turn_id": "check", "tool": "run_check",
+                 "args": {"check_id": "targeted"}},
+            ]
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+            metrics, _ = swe_test_runner.trace_metrics(root, "run-1", {"scheduler"})
+            self.assertEqual(metrics["recovery_retry_count"], 1)
+            self.assertEqual(metrics["recovery_first_action_gate_count"], 1)
+            self.assertFalse(metrics["known_incidents"]["recovery_action_gate_missing"])
+            self.assertFalse(metrics["known_incidents"]["recovery_action_gate_mismatch"])
+            self.assertFalse(metrics["known_incidents"]["recovery_directive_ambiguous"])
+
+    def test_trace_metrics_accepts_recovery_handoff_v4_evidence_decision_sequence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / ".agentgo" / "sessions" / "s1" / "logs" / "trace.jsonl"
+            log.parent.mkdir(parents=True)
+            events = [
+                {"ts": "1", "kind": "tool_result", "run_id": "run-1",
+                 "task_id": "recovery", "tool": "submit_recovery_decision",
+                 "args": {"decision": "retry", "first_action": {
+                     "tool": "read_file", "path": "src/flask/app.py",
+                 }}},
+                {"ts": "1.1", "kind": "task_result_committed", "run_id": "run-1",
+                 "task_id": "recovery"},
+                {"ts": "2", "kind": "recovery_action_gated", "run_id": "run-1",
+                 "task_id": "work", "turn_id": "read", "recovery_action_gate": {
+                     "schema": "agentgo.recovery-delta/v4", "stage": "first_action",
+                     "tool": "read_file", "path": "src/flask/app.py",
+                     "offset": 1, "limit": 80, "directive_count": 1,
+                 }},
+                {"ts": "2.1", "kind": "tool_call", "run_id": "run-1",
+                 "task_id": "work", "turn_id": "read", "tool": "read_file",
+                 "args": {"path": "src/flask/app.py", "offset": 1, "limit": 80}},
+                {"ts": "3", "kind": "recovery_action_gated", "run_id": "run-1",
+                 "task_id": "work", "turn_id": "decision", "recovery_action_gate": {
+                     "schema": "agentgo.recovery-delta/v4", "stage": "decision",
+                     "tool": "submit_change_decision", "directive_count": 1,
+                 }},
+                {"ts": "3.1", "kind": "tool_call", "run_id": "run-1",
+                 "task_id": "work", "turn_id": "decision", "tool": "submit_change_decision",
+                 "args": {"decision": "edit", "edit_steps": [{
+                     "tool": "edit_file", "path": "src/flask/app.py",
+                 }]}},
+                {"ts": "4", "kind": "recovery_action_gated", "run_id": "run-1",
+                 "task_id": "work", "turn_id": "edit", "recovery_action_gate": {
+                     "schema": "agentgo.recovery-delta/v4", "stage": "mutation",
+                     "tool": "edit_file", "path": "src/flask/app.py", "directive_count": 1,
+                 }},
+                {"ts": "4.1", "kind": "tool_call", "run_id": "run-1",
+                 "task_id": "work", "turn_id": "edit", "tool": "edit_file",
+                 "args": {"path": "src/flask/app.py"}},
+                {"ts": "5", "kind": "recovery_action_gated", "run_id": "run-1",
+                 "task_id": "work", "turn_id": "check", "recovery_action_gate": {
+                     "schema": "agentgo.recovery-delta/v4", "stage": "check",
+                     "tool": "run_check", "check_id": "targeted", "directive_count": 1,
+                 }},
+                {"ts": "5.1", "kind": "tool_call", "run_id": "run-1",
+                 "task_id": "work", "turn_id": "check", "tool": "run_check",
+                 "args": {"check_id": "targeted"}},
+            ]
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+            metrics, _ = swe_test_runner.trace_metrics(root, "run-1", {"scheduler"})
+            self.assertEqual(metrics["recovery_retry_count"], 1)
+            self.assertEqual(metrics["recovery_first_action_gate_count"], 1)
+            self.assertFalse(metrics["known_incidents"]["recovery_action_gate_missing"])
+            self.assertFalse(metrics["known_incidents"]["recovery_action_gate_mismatch"])
+
+    def test_trace_metrics_rejects_stale_or_missing_recovery_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / ".agentgo" / "sessions" / "s1" / "logs" / "trace.jsonl"
+            log.parent.mkdir(parents=True)
+            events = [
+                {"ts": "1", "kind": "tool_result", "run_id": "run-1",
+                 "task_id": "recovery-1", "tool": "submit_recovery_decision",
+                 "args": {"decision": "retry", "first_action": {
+                     "tool": "edit_file", "path": "src/new.py",
+                 }}},
+                {"ts": "1.1", "kind": "task_result_committed", "run_id": "run-1",
+                 "task_id": "recovery-1"},
+                {"ts": "2", "kind": "recovery_action_gated", "run_id": "run-1",
+                 "task_id": "work-2", "turn_id": "stale", "recovery_action_gate": {
+                     "schema": "agentgo.recovery-delta/v2", "stage": "first_action",
+                     "tool": "read_file", "path": "src/old.py", "directive_count": 2,
+                 }},
+                {"ts": "3", "kind": "tool_call", "run_id": "run-1",
+                 "task_id": "work-2", "turn_id": "stale", "tool": "read_file",
+                 "args": {"path": "src/old.py"}},
+                {"ts": "4", "kind": "tool_result", "run_id": "run-1",
+                 "task_id": "recovery-2", "tool": "submit_recovery_decision",
+                 "args": {"decision": "retry", "first_action": {
+                     "tool": "read_file", "path": "src/missing.py",
+                 }}},
+                {"ts": "4.1", "kind": "task_result_committed", "run_id": "run-1",
+                 "task_id": "recovery-2"},
+            ]
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+            metrics, _ = swe_test_runner.trace_metrics(root, "run-1", {"scheduler"})
+            self.assertTrue(metrics["known_incidents"]["recovery_action_gate_missing"])
+            self.assertTrue(metrics["known_incidents"]["recovery_action_gate_mismatch"])
+            self.assertTrue(metrics["known_incidents"]["recovery_directive_ambiguous"])
+
+    def test_trace_metrics_deduplicates_recovery_receipt_replayed_by_attempt_rollover(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / ".agentgo" / "sessions" / "s1" / "logs" / "trace.jsonl"
+            log.parent.mkdir(parents=True)
+            decision = {"decision": "retry", "first_action": {
+                "tool": "read_file", "path": "src/flask/app.py",
+            }}
+            events = [
+                {"ts": "1", "kind": "tool_result", "run_id": "run-1",
+                 "task_id": "recovery-1", "attempt_id": "recovery-1/attempt-1",
+                 "tool": "submit_recovery_decision", "args": decision},
+                {"ts": "2", "kind": "task_retry", "run_id": "run-1",
+                 "task_id": "recovery-1", "reason": "l4_no_progress_attempt_rollover"},
+                {"ts": "3", "kind": "tool_result", "run_id": "run-1",
+                 "task_id": "recovery-1", "attempt_id": "recovery-1/attempt-2",
+                 "tool": "submit_recovery_decision", "args": decision},
+                {"ts": "4", "kind": "task_result_committed", "run_id": "run-1",
+                 "task_id": "recovery-1"},
+                {"ts": "5", "kind": "recovery_action_gated", "run_id": "run-1",
+                 "task_id": "work-2", "turn_id": "read", "recovery_action_gate": {
+                     "schema": "agentgo.recovery-delta/v3", "stage": "first_action",
+                     "tool": "read_file", "path": "src/flask/app.py", "directive_count": 1,
+                 }},
+                {"ts": "6", "kind": "tool_call", "run_id": "run-1",
+                 "task_id": "work-2", "turn_id": "read", "tool": "read_file",
+                 "args": {"path": "src/flask/app.py"}},
+            ]
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+            metrics, _ = swe_test_runner.trace_metrics(root, "run-1", {"scheduler"})
+            self.assertEqual(metrics["recovery_retry_count"], 1)
+            self.assertEqual(metrics["recovery_first_action_gate_count"], 1)
+            self.assertFalse(metrics["known_incidents"]["recovery_action_gate_missing"])
+
+    def test_trace_metrics_does_not_mislabel_retry_unstartable_as_invalid_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / ".agentgo" / "sessions" / "s1" / "logs" / "trace.jsonl"
+            log.parent.mkdir(parents=True)
+            event = {
+                "ts": "1", "kind": "tool_result", "run_id": "run-1",
+                "task_id": "recovery", "tool": "submit_recovery_decision",
+                "error": "invalid recovery deadline: reason_code=recovery_retry_unstartable; allowed_decisions=[blocked]",
+            }
+            log.write_text(json.dumps(event) + "\n", encoding="utf-8")
+            metrics, _ = swe_test_runner.trace_metrics(root, "run-1", {"scheduler"})
+            self.assertFalse(metrics["known_incidents"]["invalid_recovery_deadline"])
+
+    def test_trace_metrics_does_not_combine_recovery_invalid_and_deadline_across_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / ".agentgo" / "sessions" / "s1" / "logs" / "trace.jsonl"
+            log.parent.mkdir(parents=True)
+            events = [
+                {"ts": "1", "kind": "tool_result", "run_id": "run-1",
+                 "error": "recovery_delta invalid evidence"},
+                {"ts": "2", "kind": "llm_call_end", "run_id": "run-1",
+                 "failure_kind": "attempt_deadline", "error": "attempt deadline exceeded"},
+            ]
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+            metrics, _ = swe_test_runner.trace_metrics(root, "run-1", {"scheduler"})
+            self.assertFalse(metrics["known_incidents"]["invalid_recovery_deadline"])
 
     def test_trace_metrics_marks_observation_retry_storm_and_reasoning_replay_break(self):
         with tempfile.TemporaryDirectory() as directory:

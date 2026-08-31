@@ -70,6 +70,100 @@ func TestEvaluateObservationStateRequiresSemanticAdvance(t *testing.T) {
 	}
 }
 
+func TestEvaluateV6SeparatesKnowledgeFromDecisionAdvance(t *testing.T) {
+	base := time.Date(2026, 8, 28, 2, 0, 0, 0, time.UTC)
+	contract := testContract()
+	contract.Ref.ContractID = "progress:code-change/v6"
+	contract.Ref.PolicyRef = "bounded_code_change/v6"
+	contract.Policy.PolicyRef = "bounded_code_change/v6"
+	contract.Policy.MaxDecisionStagnation = 2
+	contract.Policy.MaxControlContractFailures = 2
+	checkpoint := testCheckpoint(base)
+	checkpoint.Contract = contract.Ref
+	checkpoint.DecisionStagnationCount = 1
+
+	knowledge := testDelta(base, 1)
+	knowledge.ContractDigest = contract.Ref.ContractDigest
+	knowledge.EvidenceChanges = []loopcontract.EvidenceChange{{
+		Kind: "grep_search", Ref: "grep:new", Digest: "digest:new", Novel: true,
+	}}
+	assessment, next, err := Evaluate(contract, checkpoint, knowledge)
+	if err != nil || assessment.Class != loopcontract.ProgressKnowledge || assessment.DecisionAdvance ||
+		next.DecisionStagnationCount != 1 {
+		t.Fatalf("新 grep 只能推进知识，不能重置决策停滞: assessment=%+v next=%+v err=%v", assessment, next, err)
+	}
+
+	mutation := testDelta(base, 2)
+	mutation.ContractDigest, mutation.PreviousRef = contract.Ref.ContractDigest, next.CheckpointID
+	mutation.FileChanges = []loopcontract.FileChange{{Path: "internal/a.go", BeforeHash: "a", AfterHash: "b"}}
+	assessment, next, err = Evaluate(contract, next, mutation)
+	if err != nil || !assessment.DecisionAdvance || next.DecisionStagnationCount != 0 {
+		t.Fatalf("workspace mutation 必须重置决策停滞: assessment=%+v next=%+v err=%v", assessment, next, err)
+	}
+
+	stale := testDelta(base, 3)
+	stale.ContractDigest, stale.PreviousRef = contract.Ref.ContractDigest, next.CheckpointID
+	stale.ObservationDeltaRef = "observation:sha256:stale"
+	stale.ObservationChange = &loopcontract.ObservationChange{
+		Ref: stale.ObservationDeltaRef, Phase: "investigate", WorkspaceRevisionRef: "workspace:same",
+		SemanticAdvance: false,
+	}
+	assessment, next, err = Evaluate(contract, next, stale)
+	if err != nil || assessment.DecisionAdvance || next.DecisionStagnationCount != 1 {
+		t.Fatalf("无决策前进的 checkpoint 必须累计停滞: assessment=%+v next=%+v err=%v", assessment, next, err)
+	}
+}
+
+func TestEvaluateV6PersistsControlContractFailureCount(t *testing.T) {
+	base := time.Date(2026, 8, 28, 3, 0, 0, 0, time.UTC)
+	contract := testContract()
+	contract.Ref.ContractID = "progress:code-change/v6"
+	contract.Ref.PolicyRef = "bounded_code_change/v6"
+	contract.Policy.PolicyRef = "bounded_code_change/v6"
+	contract.Policy.MaxDecisionStagnation = 2
+	contract.Policy.MaxControlContractFailures = 2
+	checkpoint := testCheckpoint(base)
+	checkpoint.Contract = contract.Ref
+	for sequence := int64(1); sequence <= 2; sequence++ {
+		delta := testDelta(base, sequence)
+		delta.ContractDigest = contract.Ref.ContractDigest
+		delta.PreviousRef = checkpoint.CheckpointID
+		delta.ControlContractFailure = true
+		_, next, err := Evaluate(contract, checkpoint, delta)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkpoint = next
+	}
+	if checkpoint.ControlContractFailureCount != 2 {
+		t.Fatalf("连续 control failure 未 durable 累计: %+v", checkpoint)
+	}
+}
+
+func TestEvaluateV6CountsNoProgressTowardDecisionCheckpointButNotControlFailure(t *testing.T) {
+	base := time.Date(2026, 8, 28, 4, 0, 0, 0, time.UTC)
+	contract := testContract()
+	contract.Ref.ContractID = "progress:code-change/v6"
+	contract.Ref.PolicyRef, contract.Policy.PolicyRef = "bounded_code_change/v6", "bounded_code_change/v6"
+	contract.Policy.MaxDecisionStagnation = 2
+	contract.Policy.DecisionCheckpointAfterTurns = 6
+	checkpoint := testCheckpoint(base)
+	checkpoint.Contract = contract.Ref
+	noProgress := testDelta(base, 1)
+	noProgress.ContractDigest = contract.Ref.ContractDigest
+	_, next, err := Evaluate(contract, checkpoint, noProgress)
+	if err != nil || next.TurnsSinceDecisionCheckpoint != 1 {
+		t.Fatalf("普通 no-progress turn 应累计 decision cadence: next=%+v err=%v", next, err)
+	}
+	control := testDelta(base, 2)
+	control.ContractDigest, control.PreviousRef = contract.Ref.ContractDigest, next.CheckpointID
+	control.ControlContractFailure = true
+	_, next, err = Evaluate(contract, next, control)
+	if err != nil || next.TurnsSinceDecisionCheckpoint != 1 {
+		t.Fatalf("control failure 不得冒充业务 turn: next=%+v err=%v", next, err)
+	}
+}
+
 func testCheckpoint(base time.Time) loopcontract.ProgressCheckpoint {
 	graphDeadline := runcontract.DeadlineBudget{
 		Scope: runcontract.ScopeGraph, HardDeadlineAt: base.Add(50 * time.Minute),

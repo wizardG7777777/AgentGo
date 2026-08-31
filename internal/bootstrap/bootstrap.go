@@ -20,6 +20,7 @@ import (
 	"agentgo/internal/contextadapter"
 	"agentgo/internal/contextstore"
 	"agentgo/internal/dashboard"
+	"agentgo/internal/delivery"
 	"agentgo/internal/effect"
 	"agentgo/internal/gate"
 	"agentgo/internal/graph"
@@ -111,8 +112,10 @@ type System struct {
 	TaskOutcomeStore *outcomestore.Store
 	// ContentStore 是 L3 大正文/ContentRef 的持久化与授权解引用权威。
 	// 新执行不允许在初始化失败时降级为无 Store 模式。
-	ContentStore *contentstore.Store
-	CheckStore   *checkstore.Store
+	ContentStore     *contentstore.Store
+	CheckStore       *checkstore.Store
+	DeliveryStore    *delivery.Store
+	WorkspaceManager *workspace.Manager
 	// ContextSnapshotStore 是 L2 已编译 Snapshot/Manifest metadata 的
 	// append-only 权威；模型请求正文不进入本 Store。
 	ContextSnapshotStore *contextstore.Store
@@ -449,6 +452,19 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	checkStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "checks")
 	checkStateStore := checkstore.New(checkStorePath)
 	log.Printf("[启动] L3 CheckStore 已启用 (dir=%s)", checkStorePath)
+	// Scheduler coordination/v2 与所有 Runner 共用同一 Task Memory
+	// authority；必须在 Scheduler 装配前创建，否则其 Observation
+	// 控制调用会出现“Prompt 承诺但 L3 工具面为空”。
+	taskMemStore := taskmem.NewStore(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "taskmem"))
+	deliveryStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "deliveries")
+	deliveryStateStore, deliveryStoreErr := delivery.NewStore(deliveryStorePath)
+	if deliveryStoreErr != nil {
+		return nil, fmt.Errorf("初始化 L5 DeliveryStore 失败（Graph v3 必须 fail-closed）: %w", deliveryStoreErr)
+	}
+	if _, deliveryStoreErr = deliveryStateStore.List(); deliveryStoreErr != nil {
+		return nil, fmt.Errorf("恢复 L5 DeliveryStore 失败（损坏 transaction 不得忽略）: %w", deliveryStoreErr)
+	}
+	log.Printf("[启动] L5 DeliveryStore 已启用 (dir=%s)", deliveryStorePath)
 	contextSnapshotPath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "context-snapshots")
 	contextSnapshotStore, contextSnapshotErr := contextstore.New(contextSnapshotPath)
 	if contextSnapshotErr != nil {
@@ -738,10 +754,12 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		cfg, taskStore, reactorReg, effectJournal, graphPolicies,
 		func() string { return currentSessionIDFromMgr(sessMgr) },
 		taskOutcomeStore, loopStateStore,
+		&graphRuntimeAuthorities{workspaces: wsMgr, checks: checkStateStore, deliveries: deliveryStateStore},
 		unresolvedEffectTaskReasons(effectRecoveryDecisions))
 	if err != nil {
 		return nil, err
 	}
+	graphRuntime.SetDeliveryCommitter(workspaceDeliveryCommitter{manager: wsMgr, journal: effectJournal, store: deliveryStateStore})
 	graphRuntime.SetRunBudgetGate(runBudgetStateStore)
 	graphAuthoringStore, err := graph.NewAuthoringStore(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "graph-authoring"))
 	if err != nil {
@@ -849,6 +867,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// workspace 孤儿清扫：终态 / 失踪任务的残留目录由 watchdog 周期兜底
 	// （合并成功的正常清理由执行面负责；nil-safe 字段注入，不改 New 签名）。
 	w.WorkspaceManager = wsMgr
+	w.WorkspaceRetention = newGraphWorkspaceRetentionResolver(graphStore)
 	// 冻结 session workspace 豁免重建：豁免表是 Watchdog 的纯进程内状态，
 	// 进程重启即丢失——此刻 SessionMgr（Step 1.3）与 Watchdog 均已就绪，
 	// 而公告板尚空、Watchdog 未启动（Start 才跑巡检），在此登记最安全：
@@ -1005,9 +1024,8 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		shellFilter = shell.NewCommandFilter(shell.DefaultBlacklist, shell.DefaultGreylist)
 		fmt.Printf("[启动] WARNING: shell 过滤器规则加载失败，使用默认规则: %v\n", fErr)
 	}
-	// Task Memory（CM2）与 Session 晋升器（CM3）共用同一 Store 实例：
-	// 晋升器从它读终态 Task Memory 并回写 PromotedAt 幂等标记。
-	taskMemStore := taskmem.NewStore(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "taskmem"))
+	// Task Memory（CM2）与 Session 晋升器（CM3）共用上方已为
+	// Scheduler Observation 装配的同一 Store 实例。
 	deps := runner.RunnerDeps{
 		Store:                   taskStore,
 		Roster:                  r,
@@ -1149,6 +1167,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		scheduler.GraphAuthoringDeps{
 			Store: graphAuthoringStore, Runtime: graphAuthoringRuntime, Compiler: graphDefinitionCompiler,
 			ContextRuntime: contextRuntime, DurableToolCallRecorder: durableToolCallRecorder,
+			TaskMemStore: taskMemStore, CheckStore: checkStateStore,
 		},
 	)
 	if sched.Agent != nil {
@@ -1281,6 +1300,8 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		TaskOutcomeStore:      taskOutcomeStore,
 		ContentStore:          contentStateStore,
 		CheckStore:            checkStateStore,
+		DeliveryStore:         deliveryStateStore,
+		WorkspaceManager:      wsMgr,
 		ContextSnapshotStore:  contextSnapshotStore,
 		artifactReplay:        artifactReplay,
 		SessionMgr:            sessMgr, // 可能为 nil（Session 初始化失败时），Shutdown 会判空

@@ -26,10 +26,19 @@ func Start(child *model.Task, workClass loopcontract.WorkClass, budgetProfile st
 		return fmt.Errorf("task contract start 缺少 budget profile/window")
 	}
 	now := time.Now().UTC()
+	remaining := window - finalizationReserve - recoveryReserve
+	if remaining <= 0 {
+		return fmt.Errorf("task contract start 的 phase reserve 已耗尽 window")
+	}
+	verificationReserve := 3 * time.Minute
+	if maximum := remaining / 4; verificationReserve > maximum {
+		verificationReserve = maximum
+	}
 	run := &runcontract.RunContract{
-		Schema: runcontract.SchemaV1, RunID: runcontract.RunID("run-" + uuid.NewString()),
+		Schema: runcontract.SchemaCurrent, RunID: runcontract.RunID("run-" + uuid.NewString()),
 		CreatedAt: now, DeadlineAt: now.Add(window), BudgetProfile: budgetProfile,
 		FinalizationReserve: finalizationReserve, RecoveryReserve: recoveryReserve,
+		VerificationReserve: verificationReserve,
 	}
 	if err := run.ValidateAt(now); err != nil {
 		return err
@@ -75,6 +84,14 @@ func Inherit(parent, child *model.Task, workClass loopcontract.WorkClass) error 
 	child.RunContract = &run
 	if child.RunPhase == "" {
 		child.RunPhase = runcontract.PhaseExecution
+		if run.Schema == runcontract.SchemaV2 {
+			switch workClass {
+			case loopcontract.WorkVerification:
+				child.RunPhase = runcontract.PhaseVerification
+			case loopcontract.WorkFinalization:
+				child.RunPhase = runcontract.PhaseFinalization
+			}
+		}
 	}
 	if !child.RunPhase.Valid() {
 		return fmt.Errorf("子任务 RunPhase=%q 无效", child.RunPhase)

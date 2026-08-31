@@ -188,6 +188,7 @@ func (b *fragmentBuild) addBoundMessage(ctx context.Context, binding MessageBind
 		return "", false, adapterFailure(b.input, contextcontract.AssemblyInvalidContract, "", err)
 	}
 	disposition, transform, contentRef := contextcontract.DispositionInline, "", ""
+	projectionReason := ""
 	inputDigest := contextcontract.DigestBytes(payload)
 	serializedBytes := int64(len(payload))
 	estimatedTokens := estimateTokens(b.input, payload)
@@ -206,6 +207,9 @@ func (b *fragmentBuild) addBoundMessage(ctx context.Context, binding MessageBind
 				return "", false, adapterFailure(b.input, contextcontract.AssemblyInvalidContract, "", err)
 			}
 			disposition, transform, contentRef = contextcontract.DispositionReferenced, rule.TransformID, ref.RefID
+			if b.input.BudgetPolicy.Version >= 10 {
+				projectionReason = "fragment_limit_externalized"
+			}
 			inputDigest = ref.ContentDigest
 			serializedBytes = int64(len(payload))
 			estimatedTokens = estimateTokens(b.input, payload)
@@ -215,6 +219,9 @@ func (b *fragmentBuild) addBoundMessage(ctx context.Context, binding MessageBind
 			// their original digest/size in the durable manifest, but do not let one
 			// oversized board/mail/memory item abort the entire Invocation.
 			disposition = contextcontract.DispositionDropped
+			if b.input.BudgetPolicy.Version >= 10 {
+				projectionReason = "fragment_limit_dropped"
+			}
 			payload = nil
 			sourceContent = nil
 		} else {
@@ -234,6 +241,7 @@ func (b *fragmentBuild) addBoundMessage(ctx context.Context, binding MessageBind
 		SerializedBytes: serializedBytes, EstimatedTokens: estimatedTokens,
 		RetentionClass: rule.RetentionClass, Content: sourceContent, ContentRef: contentRef,
 		Disposition: disposition, TransformRef: transform,
+		ProjectionReason: projectionReason,
 	}
 	prepared := contextcompiler.PreparedFragment{
 		Fragment: fragment, WireKind: messageWireKind(message.Role), Payload: payload,
@@ -284,7 +292,13 @@ func (b *fragmentBuild) addSettledTurn(ctx context.Context, turn SettledTurn) er
 	assistantInputDigest := contextcontract.DigestBytes(basePayload)
 	var assistantSourceContent []byte = basePayload
 	assistantTransformed := false
-	if exceedsRule(basePayload, estimateTokens(b.input, basePayload), assistantRule) && b.input.ContentRepository != nil {
+	assistantProjectionReason := ""
+	if refID, contentDigest, reason, ok := existingAssistantContentReference(assistant.Content); ok {
+		assistantDisposition, assistantTransform, assistantContentRef = contextcontract.DispositionReferenced,
+			assistantRule.TransformID, refID
+		assistantInputDigest, assistantSourceContent, assistantTransformed = contentDigest, nil, true
+		assistantProjectionReason = reason
+	} else if exceedsRule(basePayload, estimateTokens(b.input, basePayload), assistantRule) && b.input.ContentRepository != nil {
 		ref, putErr := b.externalize(ctx, contextcontract.FragmentAssistantContent,
 			contextcontract.AuthorityInformational, assistantRule, []byte(assistant.Content))
 		if putErr != nil {
@@ -303,6 +317,9 @@ func (b *fragmentBuild) addSettledTurn(ctx context.Context, turn SettledTurn) er
 		assistantDisposition = contextcontract.DispositionReferenced
 		assistantTransform, assistantContentRef = assistantRule.TransformID, ref.RefID
 		assistantInputDigest, assistantSourceContent, assistantTransformed = ref.ContentDigest, nil, true
+		if b.input.BudgetPolicy.Version >= 10 {
+			assistantProjectionReason = "fragment_limit_externalized"
+		}
 	}
 	if err := b.appendPrepared(contextcompiler.PreparedFragment{
 		Fragment: contextcontract.ContextFragment{
@@ -315,6 +332,7 @@ func (b *fragmentBuild) addSettledTurn(ctx context.Context, turn SettledTurn) er
 			EstimatedTokens: estimateTokens(b.input, basePayload), RetentionClass: assistantRule.RetentionClass,
 			Content: assistantSourceContent, ContentRef: assistantContentRef,
 			Disposition: assistantDisposition, TransformRef: assistantTransform,
+			ProjectionReason: assistantProjectionReason,
 		},
 		WireKind: contextcontract.WireAssistantMessage, Payload: basePayload,
 	}); err != nil {
@@ -404,11 +422,13 @@ func (b *fragmentBuild) addSettledTurn(ctx context.Context, turn SettledTurn) er
 				fmt.Errorf("policy 缺少 tool_result rule"))
 		}
 		disposition, transform, contentRef := contextcontract.DispositionInline, "", ""
+		projectionReason := ""
 		inputDigest := contextcontract.DigestBytes(payload)
 		var sourceContent []byte = payload
-		if refID, contentDigest, ok := existingToolResultReference(result.Content); ok {
+		if refID, contentDigest, reason, ok := existingToolResultReference(result.Content); ok {
 			disposition, transform, contentRef = contextcontract.DispositionTombstoned, rule.TransformID, refID
 			inputDigest, sourceContent, toolResultsTransformed = contentDigest, nil, true
+			projectionReason = reason
 		} else if exceedsRule(payload, estimateTokens(b.input, payload), rule) && b.input.ContentRepository != nil {
 			ref, putErr := b.externalize(ctx, contextcontract.FragmentToolResult,
 				contextcontract.AuthorityInformational, rule, []byte(result.Content))
@@ -425,6 +445,9 @@ func (b *fragmentBuild) addSettledTurn(ctx context.Context, turn SettledTurn) er
 			}
 			disposition, transform, contentRef = contextcontract.DispositionTombstoned, rule.TransformID, ref.RefID
 			inputDigest, sourceContent, toolResultsTransformed = ref.ContentDigest, nil, true
+			if b.input.BudgetPolicy.Version >= 10 {
+				projectionReason = "fragment_limit_externalized"
+			}
 		}
 		if err := b.appendPrepared(contextcompiler.PreparedFragment{
 			Fragment: contextcontract.ContextFragment{
@@ -436,6 +459,7 @@ func (b *fragmentBuild) addSettledTurn(ctx context.Context, turn SettledTurn) er
 				SerializedBytes: int64(len(payload)), EstimatedTokens: estimateTokens(b.input, payload),
 				RetentionClass: rule.RetentionClass, Content: sourceContent, ContentRef: contentRef,
 				Disposition: disposition, TransformRef: transform,
+				ProjectionReason: projectionReason,
 			},
 			WireKind: contextcontract.WireToolMessage, Payload: payload,
 		}); err != nil {
@@ -476,17 +500,32 @@ func (b *fragmentBuild) addSettledTurn(ctx context.Context, turn SettledTurn) er
 	return nil
 }
 
-func existingToolResultReference(content string) (string, string, bool) {
+func existingToolResultReference(content string) (string, string, string, bool) {
 	var envelope struct {
 		Schema string `json:"schema"`
 		RefID  string `json:"ref_id"`
 		SHA256 string `json:"sha256"`
+		Reason string `json:"reason,omitempty"`
 	}
 	if json.Unmarshal([]byte(content), &envelope) != nil || envelope.Schema != "agentgo.tool-result-ref/v1" ||
 		strings.TrimSpace(envelope.RefID) == "" || !contextcontract.ValidDigest(envelope.SHA256) {
-		return "", "", false
+		return "", "", "", false
 	}
-	return envelope.RefID, envelope.SHA256, true
+	return envelope.RefID, envelope.SHA256, envelope.Reason, true
+}
+
+func existingAssistantContentReference(content string) (string, string, string, bool) {
+	var envelope struct {
+		Schema string `json:"schema"`
+		RefID  string `json:"ref_id"`
+		SHA256 string `json:"sha256"`
+		Reason string `json:"reason,omitempty"`
+	}
+	if json.Unmarshal([]byte(content), &envelope) != nil || envelope.Schema != "agentgo.assistant-content-ref/v1" ||
+		strings.TrimSpace(envelope.RefID) == "" || !contextcontract.ValidDigest(envelope.SHA256) {
+		return "", "", "", false
+	}
+	return envelope.RefID, envelope.SHA256, envelope.Reason, true
 }
 
 func (b *fragmentBuild) addToolDefinitions(router ToolRouterBinding) error {

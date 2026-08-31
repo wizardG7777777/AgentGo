@@ -56,6 +56,8 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"workspace_merged", Event{Kind: KindWorkspaceMerged, Description: "fast_forward=2 auto_merged=1"}, []string{`desc="fast_forward=2 auto_merged=1"`}},
 		{"workspace_merge_conflict", Event{Kind: KindWorkspaceMergeConflict, Path: "/proj/a.go", Description: "regions=2"}, []string{"path=/proj/a.go", `desc="regions=2"`}},
 		{"workspace_cleaned", Event{Kind: KindWorkspaceCleaned, Path: "/proj/.agentgo/workspaces/t1"}, []string{"path=/proj/.agentgo/workspaces/t1"}},
+		{"workspace_retention_decided", Event{Kind: KindWorkspaceRetentionDecided, Path: "/proj/.agentgo/workspaces/d1", Reason: "active_lease"}, []string{"path=/proj/.agentgo/workspaces/d1", `reason="active_lease"`}},
+		{"workspace_cleanup_rejected", Event{Kind: KindWorkspaceCleanupRejected, Path: "/proj/.agentgo/workspaces/d1", Reason: "active_lease"}, []string{"path=/proj/.agentgo/workspaces/d1", `reason="active_lease"`}},
 		{"error", Event{Kind: KindError, Error: "boom", Reason: "reactor"}, []string{`error="boom"`, `reason="reactor"`}},
 		{"agent_state_changed", Event{Kind: KindAgentStateChanged, Transition: &Transition{PrevState: "idle", NewState: "processing", Cause: "claim"}}, []string{"prev=idle", "new=processing", "cause=claim"}},
 		{"shell_executed", Event{Kind: KindShellExecuted, Tool: "run_shell", Args: map[string]any{"command": "go test"}, ShellExec: &ShellExec{Command: "go test", ExitCode: 0, DurationMS: 9, Outcome: "success", StdoutExcerpt: "ok", StderrExcerpt: "warn"}}, []string{`cmd="go test"`, "exit=0", "outcome=success", `stdout="ok"`, `stderr="warn"`, "tool=run_shell"}},
@@ -87,6 +89,7 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"task_memory_checkpointed", Event{Kind: KindTaskMemoryCheckpointed, Loop: -1, Reason: "terminal:completed", Description: `{"version":5,"sealed":true}`}, []string{`reason="terminal:completed"`, `sections="{\"version\":5`}},
 		{"observation_delta_recorded", Event{Kind: KindObservationDeltaRecorded, TaskID: "t1", AttemptID: "t1/attempt-1", Description: `{"observation_delta_ref":"observation:sha256:abc","facts":1}`}, []string{`sections="{\"observation_delta_ref\"`}},
 		{"observation_checkpoint_failed", Event{Kind: KindObservationCheckpointFailed, TaskID: "t1", AttemptID: "t1/attempt-1", Reason: "control_invocation_preflight_failed", Description: "action=periodic"}, []string{`reason="control_invocation_preflight_failed"`, `sections="action=periodic"`}},
+		{"recovery_action_gated", Event{Kind: KindRecoveryActionGated, TaskID: "t1", AttemptID: "t1/attempt-1", RecoveryGate: &RecoveryActionPayload{Schema: "agentgo.recovery-delta/v3", Stage: "mutation", Tool: "edit_file", Path: "src/a.py", DirectiveCount: 1}}, []string{"schema=agentgo.recovery-delta/v3", "stage=mutation", "tool=edit_file", "directives=1", "path=src/a.py"}},
 		{"session_memory_promotion_proposed", Event{Kind: KindSessionMemoryPromotionProposed, TaskID: "t1", Reason: "completed", Description: `{"version":5,"sealed":true}`}, []string{`reason="completed"`, `summary="{\"version\":5`}},
 		{"session_memory_promotion_decided", Event{Kind: KindSessionMemoryPromotionDecided, TaskID: "t1", Reason: "completed", Description: `{"decided":"promoted","entries":2}`}, []string{`reason="completed"`, `summary="{\"decided\":\"promoted\"`}},
 		{"memory_recalled", Event{Kind: KindMemoryRecalled, TaskID: "t2", Description: `{"entries":2,"keys":["task_result:result:t1:confirmed"]}`}, []string{`summary="{\"entries\":2`}},
@@ -99,8 +102,8 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"effect_recovery_decided", Event{Kind: KindEffectRecoveryDecided, TaskID: "t1", Effect: &EffectPayload{EffectID: "t1-1", Kind: "file_write", Policy: "verify_first", Decision: "verified_settled", Reason: "文件 hash 与账载一致"}}, []string{"effect=t1-1", "decision=verified_settled", `reason="文件 hash 与账载一致"`}},
 		{"acceptance_completed", Event{Kind: KindAcceptanceCompleted, GraphID: "graph-1", NodeID: "verify", ActivationID: "verify@1", TaskID: "task-9", Acceptance: &AcceptancePayload{Verdict: "pass", Status: "disputed", Checked: 2, Reason: "命令未在该任务的 shell 账中找到"}}, []string{"graph=graph-1", "node=verify", "activation=verify@1", "verdict=pass", "verify=disputed", "checked=2", `reason="命令未在该任务的 shell 账中找到"`}},
 	}
-	if len(cases) != 70 {
-		t.Fatalf("test inventory has %d built-in EventKinds, want 70", len(cases))
+	if len(cases) != 73 {
+		t.Fatalf("test inventory has %d built-in EventKinds, want 73", len(cases))
 	}
 	seen := make(map[string]struct{}, len(cases))
 	for _, tc := range cases {
