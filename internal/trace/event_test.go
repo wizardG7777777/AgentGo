@@ -146,6 +146,60 @@ func TestV4JsonlBackwardCompat(t *testing.T) {
 	}
 }
 
+func TestLLMInvocationTimingRoundtripPreservesAbsentAndZero(t *testing.T) {
+	zero := int64(0)
+	reused := false
+	ev := Event{
+		Timestamp:        time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC),
+		Kind:             KindLLMCallEnd,
+		TaskID:           "task-timing",
+		ReasoningTokens:  7,
+		CompletionTokens: 11,
+		LLMTiming: &LLMInvocationTiming{
+			Schema:              LLMInvocationTimingSchemaV1,
+			FirstResponseByteMS: &zero,
+			StreamEventCount:    3,
+			ConnectionReused:    &reused,
+		},
+	}
+	data, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := string(data)
+	for _, want := range []string{
+		`"reasoning_tokens":7`,
+		`"schema":"agentgo.llm-invocation-timing/v1"`,
+		`"first_response_byte_ms":0`,
+		`"connection_reused":false`,
+	} {
+		if !strings.Contains(encoded, want) {
+			t.Fatalf("序列化缺少 %s: %s", want, encoded)
+		}
+	}
+	for _, absent := range []string{`"dns_ms"`, `"endpoint"`, `"ip"`, `"prompt"`} {
+		if strings.Contains(encoded, absent) {
+			t.Fatalf("序列化不应包含 %s: %s", absent, encoded)
+		}
+	}
+
+	var got Event
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.LLMTiming == nil || got.LLMTiming.FirstResponseByteMS == nil ||
+		*got.LLMTiming.FirstResponseByteMS != 0 || got.LLMTiming.DNSMS != nil ||
+		got.LLMTiming.ConnectionReused == nil || *got.LLMTiming.ConnectionReused {
+		t.Fatalf("时序 roundtrip 丢失 absent/zero 区分: %+v", got.LLMTiming)
+	}
+
+	legacy := `{"ts":"2026-09-03T00:00:00Z","kind":"llm_call_end","task_id":"task-old","duration_ms":12}`
+	var legacyGot Event
+	if err := json.Unmarshal([]byte(legacy), &legacyGot); err != nil || legacyGot.LLMTiming != nil {
+		t.Fatalf("旧 llm_call_end 应保持只读兼容: event=%+v err=%v", legacyGot, err)
+	}
+}
+
 // TestLegacyPlanJsonlTolerated 验证 V6 只读 legacy 姿态：含已删除的
 // plan/acceptance 子载荷与 plan_/replan_ kind 的旧 JSONL 行仍能解析，
 // 未知字段被忽略、kind 原样保留（渲染层按未知 kind 处理，见 cli_test）。

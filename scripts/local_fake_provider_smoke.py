@@ -78,6 +78,15 @@ class FakeState:
 
 def fake_handler(state: FakeState):
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def handle(self):
+            try:
+                super().handle()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # HTTP/1.1 keep-alive 在刻意 timeout/cancel 后会于下一次读取才看见断连。
+                return
+
         def log_message(self, _format, *_args):
             return
 
@@ -151,7 +160,7 @@ def fake_handler(state: FakeState):
                         "output_tokens": 5,
                         "total_tokens": 25,
                         "input_tokens_details": {"cached_tokens": 0},
-                        "output_tokens_details": {"reasoning_tokens": 0},
+                        "output_tokens_details": {"reasoning_tokens": 1},
                     },
                 }
                 encoded = json.dumps(payload, ensure_ascii=False).encode()
@@ -502,6 +511,12 @@ def main() -> int:
                         if event.get("run_id") == run_id:
                             trace_events.append(event)
                 trace_model_calls = sum(event.get("kind") == "llm_call_end" for event in trace_events)
+                llm_end_events = [event for event in trace_events if event.get("kind") == "llm_call_end"]
+                llm_timing = [event.get("llm_timing") or {} for event in llm_end_events]
+                completed_llm_timing = [
+                    event.get("llm_timing") or {} for event in llm_end_events
+                    if event.get("prompt_tokens")
+                ]
                 ledger_model_calls = sum(
                     int(((record.get("settlement") or {}).get("usage") or {}).get("model_calls") or 0)
                     for record in budget_records if record.get("kind") == "settle"
@@ -532,6 +547,17 @@ def main() -> int:
                 assert len(observations) >= 1, f"Worker Observation 未落盘: {observations}"
                 assert reservations and reservations == settlements, (reservations, settlements)
                 assert ledger_model_calls == trace_model_calls, (ledger_model_calls, trace_model_calls)
+                assert llm_timing and all(
+                    timing.get("schema") == "agentgo.llm-invocation-timing/v1"
+                    and timing.get("network_family") == "ipv4"
+                    for timing in llm_timing
+                ), llm_timing
+                assert completed_llm_timing and all(
+                    "first_response_byte_ms" in timing for timing in completed_llm_timing
+                ), completed_llm_timing
+                assert any(timing.get("connection_reused") is True for timing in llm_timing), llm_timing
+                assert any(event.get("reasoning_tokens") == 1 for event in llm_end_events), llm_end_events
+                assert all("endpoint" not in timing and "ip" not in timing for timing in llm_timing), llm_timing
                 assert not checkpoint_preflight_failures, checkpoint_preflight_failures
                 control_store = root / ".agentgo" / "state" / "control-capabilities" / "control-capabilities.jsonl"
                 assert control_store.is_file(), "ControlCapabilityStore 未完成生产装配"
@@ -636,6 +662,10 @@ def main() -> int:
                     "run_budget_records": len(budget_records),
                     "ledger_model_calls": ledger_model_calls,
                     "trace_model_calls": trace_model_calls,
+                    "llm_timing_records": len(llm_timing),
+                    "llm_timing_reused_connections": sum(
+                        1 for timing in llm_timing if timing.get("connection_reused") is True
+                    ),
                     "final_report_reads": state.final_reads,
                     "final_report_status": reports[0].get("status"),
                     "slow_final_fallback": state.slow_final_sent,

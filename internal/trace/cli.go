@@ -624,11 +624,40 @@ type statsAgg struct {
 	calls      int
 	prompt     int64
 	completion int64
+	reasoning  int64
 	retries    int
 	wasted     int64
 }
 
 func (a *statsAgg) total() int64 { return a.prompt + a.completion }
+
+// llmTimingStats 只聚合 llm_call_end 已实际提供的客户端里程碑。
+// 缺失字段不补零，避免把非流式调用或复用连接误算成 0ms。
+type llmTimingStats struct {
+	calls             int
+	firstResponseByte []int64
+	firstSSEEvent     []int64
+	firstModelDelta   []int64
+	completed         []int64
+	maxInterEventGap  []int64
+}
+
+func (s *llmTimingStats) add(timing *LLMInvocationTiming) {
+	if timing == nil {
+		return
+	}
+	s.calls++
+	appendTimingSample := func(samples *[]int64, value *int64) {
+		if value != nil {
+			*samples = append(*samples, *value)
+		}
+	}
+	appendTimingSample(&s.firstResponseByte, timing.FirstResponseByteMS)
+	appendTimingSample(&s.firstSSEEvent, timing.FirstSSEEventMS)
+	appendTimingSample(&s.firstModelDelta, timing.FirstModelDeltaMS)
+	appendTimingSample(&s.completed, timing.CompletedMS)
+	appendTimingSample(&s.maxInterEventGap, timing.MaxInterEventGapMS)
+}
 
 // readFileStat 记录单 path 的 read_file 调用结构：full 为无 offset/limit 的
 // 全文读取次数，pages 为分页读取（offset → 次数）。重读判定据此区分
@@ -679,6 +708,7 @@ func cmdStats(dir, groupBy string, out io.Writer) error {
 	groups := groupTraceFiles(loadTraceFiles(files))
 
 	// 第一层：per-task 聚合。
+	var sessionTiming llmTimingStats
 	taskStats := make([]*taskStat, 0, len(groups))
 	for _, g := range groups {
 		summary := summarizeTask(g)
@@ -689,6 +719,8 @@ func cmdStats(dir, groupBy string, out io.Writer) error {
 				ts.agg.calls++
 				ts.agg.prompt += int64(record.event.PromptTokens)
 				ts.agg.completion += int64(record.event.CompletionTokens)
+				ts.agg.reasoning += int64(record.event.ReasoningTokens)
+				sessionTiming.add(record.event.LLMTiming)
 			case KindTaskRetry:
 				ts.agg.retries++
 			case KindToolCall:
@@ -749,6 +781,7 @@ func cmdStats(dir, groupBy string, out io.Writer) error {
 		bucket.calls += ts.agg.calls
 		bucket.prompt += ts.agg.prompt
 		bucket.completion += ts.agg.completion
+		bucket.reasoning += ts.agg.reasoning
 		bucket.retries += ts.agg.retries
 		bucket.wasted += ts.agg.wasted
 	}
@@ -760,6 +793,7 @@ func cmdStats(dir, groupBy string, out io.Writer) error {
 		session.calls += row.agg.calls
 		session.prompt += row.agg.prompt
 		session.completion += row.agg.completion
+		session.reasoning += row.agg.reasoning
 		session.retries += row.agg.retries
 		session.wasted += row.agg.wasted
 	}
@@ -780,6 +814,28 @@ func cmdStats(dir, groupBy string, out io.Writer) error {
 		formatTokenCount(session.total()), session.retries,
 		formatTokenCount(session.wasted), wastedPct)
 	fmt.Fprintln(out, "  （浪费口径：终态 cancelled/failed 任务的全部 token；completed 任务的 retry 消耗无法切分，见 RETRIES 列）")
+	if session.reasoning > 0 {
+		fmt.Fprintf(out, "  provider usage: reasoning=%s tokens（已包含在 completion，不重复计入合计）\n",
+			formatTokenCount(session.reasoning))
+	}
+	if sessionTiming.calls > 0 {
+		fmt.Fprintf(out, "  客户端 LLM 时序: v1=%d/%d 次", sessionTiming.calls, session.calls)
+		for _, field := range []struct {
+			name    string
+			samples []int64
+		}{
+			{"ttfb", sessionTiming.firstResponseByte},
+			{"first_sse", sessionTiming.firstSSEEvent},
+			{"first_model_delta", sessionTiming.firstModelDelta},
+			{"completed", sessionTiming.completed},
+			{"max_event_gap", sessionTiming.maxInterEventGap},
+		} {
+			if summary := formatLatencyDistribution(field.samples); summary != "" {
+				fmt.Fprintf(out, "; %s[%s]", field.name, summary)
+			}
+		}
+		fmt.Fprintln(out)
+	}
 	if session.calls == 0 {
 		fmt.Fprintln(out, "\n（目录内没有 LLM 调用记录）")
 		return nil
@@ -879,6 +935,24 @@ func formatTokenCount(n int64) string {
 	default:
 		return fmt.Sprintf("%d", n)
 	}
+}
+
+func formatLatencyDistribution(samples []int64) string {
+	if len(samples) == 0 {
+		return ""
+	}
+	ordered := append([]int64(nil), samples...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	percentile := func(numerator int) int64 {
+		// nearest-rank percentile；至少取第一个样本。
+		index := (numerator*len(ordered)+99)/100 - 1
+		if index < 0 {
+			index = 0
+		}
+		return ordered[index]
+	}
+	return fmt.Sprintf("n=%d p50=%dms p95=%dms max=%dms",
+		len(ordered), percentile(50), percentile(95), ordered[len(ordered)-1])
 }
 
 // cmdShow 实现 agentgo trace show <task_id>。
@@ -1119,6 +1193,47 @@ func formatEventDetails(ev Event) string {
 		parts = append(parts, fmt.Sprintf("duration=%dms", ev.DurationMS))
 		parts = append(parts, fmt.Sprintf("prompt_tokens=%d completion_tokens=%d tool_calls=%d",
 			ev.PromptTokens, ev.CompletionTokens, ev.ToolCallsCount))
+		if ev.ReasoningTokens > 0 {
+			parts = append(parts, fmt.Sprintf("reasoning_tokens=%d", ev.ReasoningTokens))
+		}
+		if ev.LLMTiming != nil {
+			if ev.LLMTiming.Schema != "" {
+				parts = append(parts, fmt.Sprintf("timing_schema=%s", ev.LLMTiming.Schema))
+			}
+			for _, field := range []struct {
+				name  string
+				value *int64
+			}{
+				{"dns", ev.LLMTiming.DNSMS},
+				{"connect", ev.LLMTiming.ConnectMS},
+				{"tls", ev.LLMTiming.TLSMS},
+				{"ttfb", ev.LLMTiming.FirstResponseByteMS},
+				{"first_sse", ev.LLMTiming.FirstSSEEventMS},
+				{"first_reasoning_delta", ev.LLMTiming.FirstReasoningDeltaMS},
+				{"first_text_delta", ev.LLMTiming.FirstTextDeltaMS},
+				{"first_tool_delta", ev.LLMTiming.FirstToolDeltaMS},
+				{"first_model_delta", ev.LLMTiming.FirstModelDeltaMS},
+				{"completed", ev.LLMTiming.CompletedMS},
+				{"max_event_gap", ev.LLMTiming.MaxInterEventGapMS},
+			} {
+				if field.value != nil {
+					parts = append(parts, fmt.Sprintf("%s=%dms", field.name, *field.value))
+				}
+			}
+			if ev.LLMTiming.StreamEventCount > 0 {
+				parts = append(parts, fmt.Sprintf("stream_events=%d", ev.LLMTiming.StreamEventCount))
+			}
+			if ev.LLMTiming.ConnectAttempts > 0 || ev.LLMTiming.ConnectFailures > 0 {
+				parts = append(parts, fmt.Sprintf("connect_attempts=%d connect_failures=%d",
+					ev.LLMTiming.ConnectAttempts, ev.LLMTiming.ConnectFailures))
+			}
+			if ev.LLMTiming.NetworkFamily != "" {
+				parts = append(parts, fmt.Sprintf("network=%s", ev.LLMTiming.NetworkFamily))
+			}
+			if ev.LLMTiming.ConnectionReused != nil {
+				parts = append(parts, fmt.Sprintf("connection_reused=%t", *ev.LLMTiming.ConnectionReused))
+			}
+		}
 		if ev.FinishReason != "" {
 			parts = append(parts, fmt.Sprintf("finish_reason=%s", ev.FinishReason))
 		}

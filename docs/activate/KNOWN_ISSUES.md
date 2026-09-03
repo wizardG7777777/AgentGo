@@ -35,8 +35,12 @@ durable Store 和生产接线，并通过 full/race/vet/build、SWE Test Runner 
   47 calls，Observation failure=0、architecture/model-contract 均 true，Work 的
   DeliveryID 与 v5 recovery 正常绑定，但 Repair 两次 targeted check 失败后仍在下一
   修正前 deadline。investigation/v7 的额外 reserve 实验又证明单次 provider
-  correction 可运行近300秒并穿透 post-turn reserve，因此 v7 未切 current；继续解决
-  需要更低延迟/更强模型或新的 provider-call cancellation/SLA 契约。完整 batch 因
+  correction 从 Invocation 开始到完整返回接近300秒并穿透 post-turn reserve；旧
+  trace 只有总 `duration_ms`，不能据此断言首 token 等待了300秒。现已新增
+  `agentgo.llm-invocation-timing/v1`，后续运行可分别审计 transport、首 SSE、首个
+  reasoning/text/tool delta、完整输出与最大事件间隔；该采集是跨层 Trace，不进入
+  L1 或运行控制。v7 仍未切 current；继续解决需要先用新 trace 区分首包慢与长输出，
+  再判断是否需要更低延迟/更强模型或新的 provider-call cancellation/SLA 契约。完整 batch 因
   门槛题未过未启动。证据见
   [`SWE-120`](../test-issues/2026-09-03-0140-explorer-candidate-repair.md)。
 
@@ -55,7 +59,9 @@ durable Store 和生产接线，并通过 full/race/vet/build、SWE Test Runner 
   拒绝 exact/required，但 auto + tools 成功；因此常规机械阶段使用 auto +
   singleton + L3 required-action gate。Graph 最终交付对历史工具有粘滞重放，
   经 live test 收窄为“交付历史投影 + phase contract + 单次 `reasoning=none`
-  + exact submit”。当前只保留更多 provider-specific SSE/usage fixture 与三平台
+  + exact submit”。当前客户端通用时序已由 transport/SSE 事实点写入
+  `llm_call_end.llm_timing`；provider 内部 queue/prefill/inference 仍不属于通用
+  wire，缺失时不推断。只保留更多 provider-specific SSE/usage fixture 与三平台
   CI 作为发布级扩展证据；不把单个模型外推成所有后端能力。详见
   [`DeepSeek Responses 精确重放事故与单题回归`](../test-issues/2026-08-23-0500-deepseek-responses-exact-replay.md)。
 - **SWE-015…019 实现已关闭**：Response replay、Raw History projection、Attempt/

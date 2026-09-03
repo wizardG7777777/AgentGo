@@ -827,6 +827,17 @@ Validation / Trace 不作为第六层。它验证五层并解释运行事实，�
 3. 所有查询显示 complete/partial/degraded，不能把证据缺失解释为没有发生。
 4. 每层至少具备 contract test、恢复测试和一个跨层集成验证。
 
+Trace 与运行指标是跨层观测面，不属于 L1 Prompt。Model Invocation transport
+和协议解码器必须在事实发生处采集客户端毫秒里程碑，Invocation executor 只附加
+Run/Task/Attempt/Turn/Invocation 与 effective model 身份，`internal/trace` 独占稳定
+schema、JSONL、展示和聚合。`agentgo.llm-invocation-timing/v1` 不进入 Prompt、
+Context digest、Tool schema、L3 gate、L4 stop/retry 或 L5 Graph 路由；未来若用
+延迟驱动策略，必须另发版本化 policy，不能把观测字段反向变成隐式控制契约。
+
+客户端可统一采集 DNS/connect/TLS、首响应字节和已知 SSE/delta；provider 内部
+queue/prefill/inference 指标不是通用 OpenAI-compatible wire 能力，只能作为明确
+provider adapter 的可选扩展，缺失时不得填零或从总耗时猜测。
+
 ## 12. 跨层契约
 
 以下对象是层间交换的稳定契约。名称可在实现设计中调整，但责任不得重新混合。

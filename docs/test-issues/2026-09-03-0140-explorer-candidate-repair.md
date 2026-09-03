@@ -74,7 +74,10 @@ batch 仍不得启动，避免把已知门槛失败扩散为高成本批次。
 
 investigation/v7 的10分钟 reserve 实验 Run
 `run-swe-session-access-tracking-85318e6c-bee2-4dba-8428-a306a0e8d116`
-进一步证明：pre-dispatch 后单次 provider correction 可运行近300秒并穿透 reserve；
+进一步证明：pre-dispatch 后单次 provider correction 从 Invocation 开始到完整返回
+接近300秒并穿透 reserve；旧 trace 不含首 SSE/首 delta，不能把该数字解释为 TTFT。
+2026-09-03 后新增的 `agentgo.llm-invocation-timing/v1` 才能在未来运行中拆分
+transport、首 SSE、首个 model delta、完整输出与最大事件间隔；
 Work 最终 candidate handoff 时 Recovery 已无法再启动 Repair。v7 因此保持非 current，
 current 回到 v6。该瓶颈需要更低延迟/更强模型或新的 provider-call cancellation/SLA
 契约，不能继续靠缩短业务 turn 或放宽 L3 解决。

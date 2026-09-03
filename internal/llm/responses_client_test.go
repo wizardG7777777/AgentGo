@@ -147,7 +147,9 @@ func TestResponsesStreamingSeparatesReasoningAndFunctionCall(t *testing.T) {
 		Protocol: ProtocolResponses, Stream: true,
 	})
 	var streamed []StreamEvent
-	ctx := WithStreamHandler(context.Background(), func(event StreamEvent) { streamed = append(streamed, event) })
+	timing := NewInvocationTiming(time.Now())
+	ctx := WithInvocationTiming(context.Background(), timing)
+	ctx = WithStreamHandler(ctx, func(event StreamEvent) { streamed = append(streamed, event) })
 	response, err := client.Chat(ctx, []Message{{Role: "user", Content: "list"}}, []ToolDef{{Name: "list_dir"}})
 	if err != nil {
 		t.Fatal(err)
@@ -160,6 +162,18 @@ func TestResponsesStreamingSeparatesReasoningAndFunctionCall(t *testing.T) {
 	}
 	if len(streamed) != 2 || streamed[0].ReasoningDelta != "先检查" || !streamed[1].Done {
 		t.Fatalf("streamed=%+v", streamed)
+	}
+	if response.Usage.ReasoningTokens != 2 {
+		t.Fatalf("reasoning_tokens=%d, want 2", response.Usage.ReasoningTokens)
+	}
+	observed := timing.Snapshot()
+	if observed.FirstResponseByteMS == nil || observed.FirstSSEEventMS == nil ||
+		observed.FirstReasoningDeltaMS == nil || observed.FirstToolDeltaMS == nil ||
+		observed.FirstModelDeltaMS == nil || observed.CompletedMS == nil {
+		t.Fatalf("Responses stream 时序不完整: %+v", observed)
+	}
+	if observed.FirstTextDeltaMS != nil || observed.StreamEventCount != 7 {
+		t.Fatalf("Responses stream 不应伪造 text delta，事件数应为 7: %+v", observed)
 	}
 }
 

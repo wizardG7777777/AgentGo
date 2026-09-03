@@ -209,7 +209,7 @@ func TestSDKClient_StreamingAccumulatesContentUsageAndExtras(t *testing.T) {
 			`{"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[{"index":0,"delta":{"role":"assistant","content":"你","reasoning_content":"思"},"finish_reason":null}]}`,
 			`{"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[{"index":0,"delta":{"content":"好","reasoning_content":"考"},"finish_reason":null}]}`,
 			`{"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
-			`{"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}`,
+			`{"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9,"completion_tokens_details":{"reasoning_tokens":1}}}`,
 		}
 		for _, frame := range frames {
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", frame)
@@ -226,7 +226,9 @@ func TestSDKClient_StreamingAccumulatesContentUsageAndExtras(t *testing.T) {
 		Stream:          true,
 	})
 	var events []StreamEvent
-	ctx := WithStreamHandler(context.Background(), func(event StreamEvent) {
+	timing := NewInvocationTiming(time.Now())
+	ctx := WithInvocationTiming(context.Background(), timing)
+	ctx = WithStreamHandler(ctx, func(event StreamEvent) {
 		events = append(events, event)
 	})
 	resp, err := client.Chat(ctx, []Message{{Role: "user", Content: "hello"}}, nil)
@@ -235,6 +237,9 @@ func TestSDKClient_StreamingAccumulatesContentUsageAndExtras(t *testing.T) {
 	}
 	if resp.Content != "你好" || resp.Usage.PromptTokens != 7 || resp.Usage.CompletionTokens != 2 {
 		t.Fatalf("response = %+v", resp)
+	}
+	if resp.Usage.ReasoningTokens != 1 {
+		t.Fatalf("reasoning_tokens=%d, want 1", resp.Usage.ReasoningTokens)
 	}
 	if got := string(resp.ExtraFields["reasoning_content"]); got != `"思考"` {
 		t.Fatalf("reasoning_content = %s, want %q", got, "思考")
@@ -252,6 +257,15 @@ func TestSDKClient_StreamingAccumulatesContentUsageAndExtras(t *testing.T) {
 	streamOptions, ok := requestBody["stream_options"].(map[string]any)
 	if !ok || streamOptions["include_usage"] != true {
 		t.Fatalf("stream_options = %#v", requestBody["stream_options"])
+	}
+	observed := timing.Snapshot()
+	if observed.FirstResponseByteMS == nil || observed.FirstSSEEventMS == nil ||
+		observed.FirstReasoningDeltaMS == nil || observed.FirstTextDeltaMS == nil ||
+		observed.FirstModelDeltaMS == nil || observed.CompletedMS == nil {
+		t.Fatalf("Chat stream 时序不完整: %+v", observed)
+	}
+	if observed.FirstToolDeltaMS != nil || observed.StreamEventCount != 4 {
+		t.Fatalf("Chat stream 不应伪造 tool delta，事件数应为 4: %+v", observed)
 	}
 }
 

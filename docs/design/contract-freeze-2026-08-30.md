@@ -13,6 +13,7 @@
 | L3 Harness | ExecutionLease `agentgo.execution-lease/v2`、InvocationBinding `agentgo.invocation-context-binding/v2`、ControlCapability `agentgo.control-capability/v1`、RunContract `agentgo.run-contract/v2`、RecoveryDelta `agentgo.recovery-delta/v5` / ChangeDecision v2 | `internal/agent/execution_lease.go`、`internal/invocation`、`internal/controlcapability`、`internal/runcontract` |
 | L4 Loop | `progress:code-change/v12`、`progress:investigation/v6`、四阶段 Run deadline、TaskOutcome `agentgo.task-outcome/v3` | `internal/agent/loop_progress.go`、`internal/loopcontract`、`internal/outcome` |
 | L5 Graph | mutating simple `agentgo.graph/v4`、Delivery `agentgo.delivery/v1`、GraphChangeProposal 当前事务；v3 历史/非 mutating | `internal/graph`、`internal/delivery` |
+| 跨层 Trace | 客户端 Model Invocation 时序 `agentgo.llm-invocation-timing/v1`；旧 `llm_call_end` 无该对象时只读兼容 | `internal/llm`、`internal/agent/llm_executor.go`、`internal/trace` |
 | 外部评测 | SWE Test Runner result v3、pytest phase report v1 | `scripts/swe_test_runner/` |
 
 历史快照继续按自身版本恢复；不得把 v1/v2 数据静默补字段后当成当前版本。
@@ -65,6 +66,18 @@
   v11 只赋给首次 Worker；最终 candidate-repair 冻结为 v10，禁止产生无下游消费的
   二次 handoff。
   Observation v12 wire 继承 v11/v10 的 auto/low/4096。
+
+## 2026-09-03 Model Invocation 时序 Trace 修订
+
+- 新 `llm_call_end` 可附带 `agentgo.llm-invocation-timing/v1`；旧事件缺少该对象时
+  保持原解释，不补字段、不迁移。
+- transport 只采集 DNS/connect/TLS 阶段耗时、首响应字节、连接尝试/失败、
+  network family 与连接复用；Responses/Chat stream 只采集首 SSE、首个
+  reasoning/text/tool/model delta、完成里程碑、事件数与最大事件间隔。
+- 不可用字段省略而非填 0；对象不得包含 endpoint、IP、凭据、Prompt、reasoning
+  或响应正文。provider 内部 queue/prefill/inference 不在通用契约内。
+- 本契约是跨层 Trace 投影，不属于 L1，不进入 Prompt、Context digest、Tool schema、
+  L3 gate、L4 policy 或 L5 Graph。未来若用时序控制行为，必须另发版本化 policy。
 
 ## 原冻结验证边界（历史）
 

@@ -59,6 +59,12 @@ type ToolCall struct {
 }
 
 // Response 是解析后的 LLM 响应。
+type Usage struct {
+	PromptTokens     int
+	CompletionTokens int
+	ReasoningTokens  int
+}
+
 type Response struct {
 	Content string
 	// Reasoning is the provider's plaintext reasoning exactly as returned by the
@@ -70,10 +76,7 @@ type Response struct {
 	// Model Invocation 权威；Content/Reasoning/ToolCalls 是下游兼容投影。
 	Items        []OutputItem
 	FinishReason FinishReason
-	Usage        struct {
-		PromptTokens     int
-		CompletionTokens int
-	}
+	Usage        Usage
 	// ExtraFields 是 assistant 消息里的非标字段（如 DeepSeek V4 的 reasoning_content）。
 	// 调用方应把这份 map 挂到随后追加进历史的 Message 上，确保下一轮请求能原样回传。
 	ExtraFields map[string]json.RawMessage
@@ -400,6 +403,7 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 	}
 	result.Usage.PromptTokens = int(completion.Usage.PromptTokens)
 	result.Usage.CompletionTokens = int(completion.Usage.CompletionTokens)
+	result.Usage.ReasoningTokens = int(completion.Usage.CompletionTokensDetails.ReasoningTokens)
 
 	// 层 1：把响应里 openai-go 未识别的字段原样抽到 ExtraFields。
 	// DeepSeek V4 的 reasoning_content、其他 provider 的自定义元数据都走这条路。
@@ -446,6 +450,7 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 	extraArrays := make(map[string][]json.RawMessage)
 	extraRaw := make(map[string]json.RawMessage)
 	for stream.Next() {
+		observeStreamEvent(ctx, "chat.chunk")
 		chunk := stream.Current()
 		if field, ok := chunk.JSON.ExtraFields["error"]; ok && field.Raw() != "" {
 			return emitFailure(classifyStreamProviderError(field.Raw()))
@@ -466,6 +471,7 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 				}
 			}
 			for _, tc := range delta.ToolCalls {
+				observeStreamDelta(ctx, "tool", tc.Function.Name != "" || tc.Function.Arguments != "")
 				if err := budgetCounter.addTool(tc.Index, tc.Function.Name, tc.Function.Arguments); err != nil {
 					return emitFailure(err)
 				}
@@ -499,6 +505,8 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 				extraRaw[key] = json.RawMessage(raw)
 			}
 			reasoningDelta := ReasoningText(chunkExtras)
+			observeStreamDelta(ctx, "text", delta.Content != "")
+			observeStreamDelta(ctx, "reasoning", reasoningDelta != "")
 			accumulatedContent += delta.Content
 			accumulatedReasoning += reasoningDelta
 			if handler != nil && (delta.Content != "" || reasoningDelta != "") {
@@ -514,6 +522,7 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 	if err := stream.Err(); err != nil {
 		return emitFailure(classifySDKError(ctx, err))
 	}
+	markStreamCompleted(ctx)
 	if len(acc.Choices) == 0 {
 		err := errors.New("LLM 流式响应返回空 choices")
 		return emitFailure(&ErrBadResponse{Err: err, Failure: invocation.NewFailure(
@@ -563,6 +572,7 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 	}
 	result.Usage.PromptTokens = int(acc.Usage.PromptTokens)
 	result.Usage.CompletionTokens = int(acc.Usage.CompletionTokens)
+	result.Usage.ReasoningTokens = int(acc.Usage.CompletionTokensDetails.ReasoningTokens)
 	if len(extraStrings)+len(extraArrays)+len(extraRaw) > 0 {
 		result.ExtraFields = make(map[string]json.RawMessage, len(extraStrings)+len(extraArrays)+len(extraRaw))
 		for key, value := range extraRaw {

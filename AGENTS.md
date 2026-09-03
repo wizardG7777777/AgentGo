@@ -100,6 +100,11 @@ SWE Test Runner 的 `probe` / `task` / `batch` / `verify-candidates` 启动前�
 - YAML 配置键用 `snake_case`。
 - 不要假设常用库可用——先查 go.mod 与邻近代码（现有依赖含 `google/uuid`、`gopkg.in/yaml.v3`、`openai/openai-go/v3`、`charmbracelet/*`、`sahilm/fuzzy`）。
 - agent 与 store 测试使用 property-based 测试（`testing/quick`）。
+- LLM 毫秒级客户端时序使用 `agentgo.llm-invocation-timing/v1`，只在
+  `internal/llm` 事实点采集并由 `internal/trace` 持久化/展示；它是跨层观测面，
+  不得注入 L1 Prompt、Context digest 或控制流。不可用字段保持缺席，禁止补零；
+  不记录 endpoint、IP、凭据、Prompt、reasoning/response 正文，也不得按
+  provider/model 名称分支。
 - 修改了本文件提及的结构、约定或工作流时，同步更新本文件。
 
 ## 跨平台硬约束

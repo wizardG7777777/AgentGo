@@ -452,7 +452,7 @@ func TestLLMExecutor_UsagePassthrough(t *testing.T) {
 		responses: []llm.Response{
 			{
 				Content: "done",
-				Usage:   struct{ PromptTokens, CompletionTokens int }{PromptTokens: 100, CompletionTokens: 50},
+				Usage:   llm.Usage{PromptTokens: 100, CompletionTokens: 50},
 			},
 		},
 	}

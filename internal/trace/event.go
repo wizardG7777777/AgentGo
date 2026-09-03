@@ -505,6 +505,32 @@ type RecoveryActionPayload struct {
 	DirectiveCount int    `json:"directive_count"`
 }
 
+const LLMInvocationTimingSchemaV1 = "agentgo.llm-invocation-timing/v1"
+
+// LLMInvocationTiming 是 llm_call_end 的脱敏客户端时序。DNS/Connect/TLS
+// 表示各自阶段耗时，其余里程碑是相对 llm.Invoke 开始的 monotonic 毫秒；
+// nil 表示当前协议/复用连接没有提供该字段，不得当作 0ms。它不携带
+// endpoint、IP、请求或响应正文。
+type LLMInvocationTiming struct {
+	Schema                string `json:"schema"`
+	DNSMS                 *int64 `json:"dns_ms,omitempty"`
+	ConnectMS             *int64 `json:"connect_ms,omitempty"`
+	TLSMS                 *int64 `json:"tls_ms,omitempty"`
+	FirstResponseByteMS   *int64 `json:"first_response_byte_ms,omitempty"`
+	FirstSSEEventMS       *int64 `json:"first_sse_event_ms,omitempty"`
+	FirstReasoningDeltaMS *int64 `json:"first_reasoning_delta_ms,omitempty"`
+	FirstTextDeltaMS      *int64 `json:"first_text_delta_ms,omitempty"`
+	FirstToolDeltaMS      *int64 `json:"first_tool_delta_ms,omitempty"`
+	FirstModelDeltaMS     *int64 `json:"first_model_delta_ms,omitempty"`
+	CompletedMS           *int64 `json:"completed_ms,omitempty"`
+	MaxInterEventGapMS    *int64 `json:"max_inter_event_gap_ms,omitempty"`
+	StreamEventCount      int    `json:"stream_event_count,omitempty"`
+	ConnectAttempts       int    `json:"connect_attempts,omitempty"`
+	ConnectFailures       int    `json:"connect_failures,omitempty"`
+	NetworkFamily         string `json:"network_family,omitempty"`
+	ConnectionReused      *bool  `json:"connection_reused,omitempty"`
+}
+
 // Event 是一条 trace 事件。所有字段除 Timestamp/Kind/TaskID 之外都是可选的，
 // 由具体的事件类型按需填充。omitempty 让 JSON 输出保持简洁。
 type Event struct {
@@ -559,6 +585,7 @@ type Event struct {
 	// --- LLM 调用字段 ---
 	PromptTokens     int    `json:"prompt_tokens,omitempty"`
 	CompletionTokens int    `json:"completion_tokens,omitempty"`
+	ReasoningTokens  int    `json:"reasoning_tokens,omitempty"`
 	HistoryEntries   int    `json:"history_entries,omitempty"`
 	ToolCallsCount   int    `json:"tool_calls_count,omitempty"`
 	FinishReason     string `json:"finish_reason,omitempty"`
@@ -573,15 +600,16 @@ type Event struct {
 	ModelCapabilityDigest string `json:"model_capability_digest,omitempty"`
 	InvocationProfileRef  string `json:"invocation_profile_ref,omitempty"`
 	// Invocation failure 的稳定分类字段。Error 仅供展示，控制流不得解析它。
-	FailureKind    string `json:"failure_kind,omitempty"`
-	FailurePhase   string `json:"failure_phase,omitempty"`
-	FailureOrigin  string `json:"failure_origin,omitempty"`
-	TimeoutScope   string `json:"timeout_scope,omitempty"`
-	ProviderCode   string `json:"provider_code,omitempty"`
-	HTTPStatus     int    `json:"http_status,omitempty"`
-	UsageState     string `json:"usage_state,omitempty"`
-	Partial        bool   `json:"partial,omitempty"`
-	RecoveryAction string `json:"recovery_action,omitempty"`
+	FailureKind    string               `json:"failure_kind,omitempty"`
+	FailurePhase   string               `json:"failure_phase,omitempty"`
+	FailureOrigin  string               `json:"failure_origin,omitempty"`
+	TimeoutScope   string               `json:"timeout_scope,omitempty"`
+	ProviderCode   string               `json:"provider_code,omitempty"`
+	HTTPStatus     int                  `json:"http_status,omitempty"`
+	UsageState     string               `json:"usage_state,omitempty"`
+	Partial        bool                 `json:"partial,omitempty"`
+	RecoveryAction string               `json:"recovery_action,omitempty"`
+	LLMTiming      *LLMInvocationTiming `json:"llm_timing,omitempty"`
 	// PromptBuildID 是 V6 §2 P1a 的 prompt_build_id：prompt_compiled 事件
 	// 载 Build.ID；context_manifest_built 事件并入同 attempt 冻结的
 	// Build.ID（prompt_bound 不独立成事件，避免同频双账本）。

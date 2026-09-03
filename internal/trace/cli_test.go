@@ -40,7 +40,7 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"team_graph_bound", Event{Kind: KindTeamGraphBound, TaskID: "origin-task-1", GraphID: "graph-1", Description: "team_id=team-1 event_type=team:audit replicas=2 reused=false"}, []string{"graph=graph-1", "origin_task=origin-task-1", `desc="team_id=team-1 event_type=team:audit replicas=2 reused=false"`}},
 		{"team_stopped", Event{Kind: KindTeamStopped, GraphID: "graph-1", Reason: "graph_completed", Description: "team_id=team-1 event_type=team:audit"}, []string{"graph=graph-1", `desc="team_id=team-1 event_type=team:audit"`, `reason="graph_completed"`}},
 		{"llm_call_start", Event{Kind: KindLLMCallStart, HistoryEntries: 4, ToolCallsCount: 7}, []string{"history_entries=4", "tools=7"}},
-		{"llm_call_end", Event{Kind: KindLLMCallEnd, DurationMS: 12, PromptTokens: 13, CompletionTokens: 14, ToolCallsCount: 1, FinishReason: "tool_calls"}, []string{"duration=12ms", "prompt_tokens=13", "completion_tokens=14", "tool_calls=1", "finish_reason=tool_calls"}},
+		{"llm_call_end", Event{Kind: KindLLMCallEnd, DurationMS: 12, PromptTokens: 13, CompletionTokens: 14, ReasoningTokens: 4, ToolCallsCount: 1, FinishReason: "tool_calls", LLMTiming: &LLMInvocationTiming{Schema: LLMInvocationTimingSchemaV1, FirstResponseByteMS: traceInt64(2), FirstSSEEventMS: traceInt64(3), FirstModelDeltaMS: traceInt64(5), FirstToolDeltaMS: traceInt64(5), CompletedMS: traceInt64(11), MaxInterEventGapMS: traceInt64(4), StreamEventCount: 6, ConnectAttempts: 2, ConnectFailures: 1, NetworkFamily: "ipv4", ConnectionReused: traceBool(false)}}, []string{"duration=12ms", "prompt_tokens=13", "completion_tokens=14", "reasoning_tokens=4", "tool_calls=1", "timing_schema=agentgo.llm-invocation-timing/v1", "ttfb=2ms", "first_sse=3ms", "first_model_delta=5ms", "first_tool_delta=5ms", "completed=11ms", "max_event_gap=4ms", "stream_events=6", "connect_attempts=2", "connect_failures=1", "network=ipv4", "connection_reused=false", "finish_reason=tool_calls"}},
 		{"tool_call", Event{Kind: KindToolCall, Tool: "read_file", CallID: "call-1", Args: map[string]any{"path": "a.go"}}, []string{"tool=read_file", "call_id=call-1", `args={"path":"a.go"}`}},
 		{"tool_result", Event{Kind: KindToolResult, Tool: "read_file", CallID: "call-1", Args: map[string]any{"path": "a.go"}, DurationMS: 8, ResultLen: 99}, []string{"tool=read_file", "duration=8ms", "call_id=call-1", `args={"path":"a.go"}`, "result_len=99"}},
 		{"history_compaction", Event{Kind: KindHistoryCompaction, PromptTokensBefore: 100, PromptTokensAfter: 60, Strategy: "summary", KeptEntries: 4}, []string{"tokens_before=100", "tokens_after=60", "strategy=summary", "kept_entries=4"}},
@@ -698,16 +698,16 @@ func TestCmdStatsAggregatesTokens(t *testing.T) {
 	writeTraceFixture(t, dir, base, taskA, []Event{
 		{Timestamp: base, Kind: KindTaskPublished, TaskID: taskA, Description: "任务A"},
 		{Timestamp: base.Add(time.Second), Kind: KindTaskClaimed, TaskID: taskA, AgentID: "worker-1"},
-		{Timestamp: base.Add(2 * time.Second), Kind: KindLLMCallEnd, TaskID: taskA, AgentID: "worker-1", Loop: 0, PromptTokens: 1000, CompletionTokens: 150},
+		{Timestamp: base.Add(2 * time.Second), Kind: KindLLMCallEnd, TaskID: taskA, AgentID: "worker-1", Loop: 0, PromptTokens: 1000, CompletionTokens: 150, ReasoningTokens: 50, LLMTiming: &LLMInvocationTiming{Schema: LLMInvocationTimingSchemaV1, FirstResponseByteMS: traceInt64(10), FirstSSEEventMS: traceInt64(15), FirstModelDeltaMS: traceInt64(20), CompletedMS: traceInt64(100), MaxInterEventGapMS: traceInt64(30)}},
 		{Timestamp: base.Add(3 * time.Second), Kind: KindTaskRetry, TaskID: taskA, AgentID: "worker-1", AttemptNo: 1},
-		{Timestamp: base.Add(4 * time.Second), Kind: KindLLMCallEnd, TaskID: taskA, AgentID: "worker-1", Loop: 0, PromptTokens: 2000, CompletionTokens: 200},
+		{Timestamp: base.Add(4 * time.Second), Kind: KindLLMCallEnd, TaskID: taskA, AgentID: "worker-1", Loop: 0, PromptTokens: 2000, CompletionTokens: 200, ReasoningTokens: 75, LLMTiming: &LLMInvocationTiming{Schema: LLMInvocationTimingSchemaV1, FirstResponseByteMS: traceInt64(20), FirstSSEEventMS: traceInt64(25), FirstModelDeltaMS: traceInt64(40), CompletedMS: traceInt64(200), MaxInterEventGapMS: traceInt64(60)}},
 		{Timestamp: base.Add(6 * time.Second), Kind: KindTaskCompleted, TaskID: taskA, AgentID: "worker-1"},
 	})
 	taskB := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 	writeTraceFixture(t, dir, base.Add(10*time.Second), taskB, []Event{
 		{Timestamp: base.Add(10 * time.Second), Kind: KindTaskPublished, TaskID: taskB, Description: "任务B"},
 		{Timestamp: base.Add(11 * time.Second), Kind: KindTaskClaimed, TaskID: taskB, AgentID: "worker-2"},
-		{Timestamp: base.Add(12 * time.Second), Kind: KindLLMCallEnd, TaskID: taskB, AgentID: "worker-2", Loop: 0, PromptTokens: 500, CompletionTokens: 50},
+		{Timestamp: base.Add(12 * time.Second), Kind: KindLLMCallEnd, TaskID: taskB, AgentID: "worker-2", Loop: 0, PromptTokens: 500, CompletionTokens: 50, LLMTiming: &LLMInvocationTiming{Schema: LLMInvocationTimingSchemaV1, FirstResponseByteMS: traceInt64(30), FirstSSEEventMS: traceInt64(35), FirstModelDeltaMS: traceInt64(80), CompletedMS: traceInt64(400), MaxInterEventGapMS: traceInt64(120)}},
 		{Timestamp: base.Add(13 * time.Second), Kind: KindTaskCompleted, TaskID: taskB, AgentID: "worker-2"},
 	})
 	// 任务C 被级联取消：其全部 token 应计入浪费口径。
@@ -728,6 +728,11 @@ func TestCmdStatsAggregatesTokens(t *testing.T) {
 	got := taskOut.String()
 	for _, want := range []string{
 		"session 总计: 3 个任务, 4 次 LLM 调用, prompt=3.8k, completion=430, 合计=4.2k tokens, 重试=1 次, 浪费=330 tokens (8%)",
+		"provider usage: reasoning=125 tokens（已包含在 completion，不重复计入合计）",
+		"客户端 LLM 时序: v1=3/4 次",
+		"ttfb[n=3 p50=20ms p95=30ms max=30ms]",
+		"first_model_delta[n=3 p50=40ms p95=80ms max=80ms]",
+		"completed[n=3 p50=200ms p95=400ms max=400ms]",
 		"aaaaaaaa", "worker-1", "completed",
 		"bbbbbbbb", "worker-2",
 		"cccccccc", "worker-3", "cancelled", "330",
@@ -755,6 +760,10 @@ func TestCmdStatsAggregatesTokens(t *testing.T) {
 		t.Fatal("stats bogus groupBy should fail")
 	}
 }
+
+func traceInt64(value int64) *int64 { return &value }
+
+func traceBool(value bool) *bool { return &value }
 
 func TestCmdStatsEmptyDir(t *testing.T) {
 	dir := t.TempDir()

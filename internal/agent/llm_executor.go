@@ -725,7 +725,8 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		trace.DumpRequest(task.ID, loopForTrace, messages, len(toolDefs))
 
 		llmStart := time.Now()
-		invokeCtx := ctx
+		invocationTiming := llm.NewInvocationTiming(llmStart)
+		invokeCtx := llm.WithInvocationTiming(ctx, invocationTiming)
 		if invocationBinding != nil && invocationBinding.EffectiveModel != "" {
 			invokeCtx = llm.WithModelOverride(invokeCtx, invocationBinding.EffectiveModel)
 		} else if isAutoObservationPhase(toolRouter.Phase) && e.observationModel != "" {
@@ -740,6 +741,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 			resp, err = llm.InvokeLegacy(invokeCtx, e.client, messages, toolDefs)
 		}
 		llmDuration := time.Since(llmStart)
+		traceTiming := traceInvocationTiming(invocationTiming.Snapshot())
 
 		if err != nil {
 			if failure, ok := invocation.FromError(err); ok && controlCapabilityKey.RunID != "" {
@@ -768,6 +770,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				EffectiveModel:        effectiveModel,
 				ModelCapabilityDigest: modelCapabilityDigest,
 				InvocationProfileRef:  invocationProfileRef,
+				LLMTiming:             traceTiming,
 			}
 			if failure, ok := invocation.FromError(err); ok {
 				failure.InvocationID = invocationID
@@ -805,11 +808,13 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 					ToolRouterSnapshotID: toolRouter.ID, ContextSnapshotID: contextSnapshotID,
 					ContextPolicyRef: contextPolicyRef, DurationMS: llmDuration.Milliseconds(),
 					PromptTokens: resp.Usage.PromptTokens, CompletionTokens: resp.Usage.CompletionTokens,
-					ToolCallsCount: len(resp.ToolCalls), Error: failure.Error(),
+					ReasoningTokens: resp.Usage.ReasoningTokens,
+					ToolCallsCount:  len(resp.ToolCalls), Error: failure.Error(),
 					FailureKind: string(failure.Kind), FailurePhase: string(failure.Phase),
 					FailureOrigin: string(failure.Origin), UsageState: string(failure.UsageState),
 					EffectiveModel:        effectiveModel,
 					ModelCapabilityDigest: modelCapabilityDigest, InvocationProfileRef: invocationProfileRef,
+					LLMTiming: traceTiming,
 				})
 				return ExecuteResult{
 					InvocationID: invocationID, ContextSnapshotID: contextSnapshotID,
@@ -844,11 +849,13 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				ToolRouterSnapshotID: toolRouter.ID, ContextSnapshotID: contextSnapshotID,
 				ContextPolicyRef: contextPolicyRef, DurationMS: llmDuration.Milliseconds(),
 				PromptTokens: resp.Usage.PromptTokens, CompletionTokens: resp.Usage.CompletionTokens,
-				ToolCallsCount: len(resp.ToolCalls), Error: failure.Error(),
+				ReasoningTokens: resp.Usage.ReasoningTokens,
+				ToolCallsCount:  len(resp.ToolCalls), Error: failure.Error(),
 				FailureKind: string(failure.Kind), FailurePhase: string(failure.Phase),
 				FailureOrigin: string(failure.Origin), UsageState: string(failure.UsageState),
 				EffectiveModel:        effectiveModel,
 				ModelCapabilityDigest: modelCapabilityDigest, InvocationProfileRef: invocationProfileRef,
+				LLMTiming: traceTiming,
 			})
 			return ExecuteResult{
 				InvocationID: invocationID, ContextSnapshotID: contextSnapshotID,
@@ -874,10 +881,12 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 			DurationMS:            llmDuration.Milliseconds(),
 			PromptTokens:          resp.Usage.PromptTokens,
 			CompletionTokens:      resp.Usage.CompletionTokens,
+			ReasoningTokens:       resp.Usage.ReasoningTokens,
 			ToolCallsCount:        len(resp.ToolCalls),
 			EffectiveModel:        effectiveModel,
 			ModelCapabilityDigest: modelCapabilityDigest,
 			InvocationProfileRef:  invocationProfileRef,
+			LLMTiming:             traceTiming,
 		})
 		// CM1 对账：Manifest 估算 tokens 与实测值对照，只记录不告警
 		//（估算口径 rune/3，偏差供后续校准估算系数参考）。
@@ -1202,6 +1211,23 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 func isObservationCheckpointPhase(phase string) bool {
 	return phase == "agent:observation-checkpoint" ||
 		strings.HasPrefix(phase, "agent:observation-checkpoint-v")
+}
+
+func traceInvocationTiming(value llm.InvocationTimingSnapshot) *trace.LLMInvocationTiming {
+	if !value.HasAny() {
+		return nil
+	}
+	return &trace.LLMInvocationTiming{
+		Schema: trace.LLMInvocationTimingSchemaV1,
+		DNSMS:  value.DNSMS, ConnectMS: value.ConnectMS, TLSMS: value.TLSMS,
+		FirstResponseByteMS: value.FirstResponseByteMS, FirstSSEEventMS: value.FirstSSEEventMS,
+		FirstReasoningDeltaMS: value.FirstReasoningDeltaMS, FirstTextDeltaMS: value.FirstTextDeltaMS,
+		FirstToolDeltaMS: value.FirstToolDeltaMS, FirstModelDeltaMS: value.FirstModelDeltaMS,
+		CompletedMS: value.CompletedMS, MaxInterEventGapMS: value.MaxInterEventGapMS,
+		StreamEventCount: value.StreamEventCount, ConnectAttempts: value.ConnectAttempts,
+		ConnectFailures: value.ConnectFailures, NetworkFamily: value.NetworkFamily,
+		ConnectionReused: value.ConnectionReused,
+	}
 }
 
 func responseReplayFailure(cause error) *invocation.Failure {

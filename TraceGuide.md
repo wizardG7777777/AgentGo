@@ -1,6 +1,6 @@
 # TraceGuide：Trace 系统使用说明书（Agent 排错分析指南）
 
-> **状态**：📋 当前实现说明（2026-07-18）
+> **状态**：📋 当前实现说明（2026-09-03）
 > **面向读者**：AI Agent（进行排错分析时参考本文档）及人类开发者
 > **关联文档**：
 > - [TraceUpgrade.md](docs/archived/trace-upgrade-design-2026-05.md) — v5 升级规范（字段/EventKind 的设计决策）
@@ -77,7 +77,7 @@ grep '"kind":"error"' "$TRACE_DIR/<file>.jsonl" | jq .
 grep -oP '"kind":"[^"]+"' "$TRACE_DIR/<file>.jsonl" | sort | uniq -c | sort -rn
 
 # 查看所有 LLM 调用的耗时和 token 消耗
-grep '"kind":"llm_call_end"' "$TRACE_DIR/<file>.jsonl" | jq '{loop, duration_ms, prompt_tokens, completion_tokens}'
+grep '"kind":"llm_call_end"' "$TRACE_DIR/<file>.jsonl" | jq '{loop, duration_ms, prompt_tokens, completion_tokens, reasoning_tokens, llm_timing}'
 
 # 查看所有工具调用的错误
 grep '"kind":"tool_result"' "$TRACE_DIR/<file>.jsonl" | jq 'select(.error != null) | {tool, error, duration_ms}'
@@ -105,7 +105,7 @@ attempt_no  — 重试次数（task_retry 专用，1-based）
 
 任务生命周期字段：description, dependencies, output_len, loops_used, priority, depth, published_by, event_type
 
-LLM 调用字段：prompt_tokens, completion_tokens, history_entries, tool_calls_count, finish_reason, duration_ms
+LLM 调用字段：prompt_tokens, completion_tokens, reasoning_tokens, history_entries, tool_calls_count, finish_reason, duration_ms, llm_timing
 
 工具调用字段：tool, args, call_id, result_len
 
@@ -120,6 +120,45 @@ v5 子结构体（指针，nil 时不输出）：
   shell_exec    — Shell 执行结果（ShellExec struct）
   shell_timeout — Shell 超时信息（ShellTimeout struct）
 ```
+
+### 2.1.1 LLMInvocationTiming 子结构体
+
+新 `llm_call_end` 可携带 `agentgo.llm-invocation-timing/v1`。它是客户端观测，
+不依赖某个推理服务提供额外指标：Go transport 采集 DNS/TCP/TLS/首响应字节，
+Responses 或 Chat 流解码器采集 SSE 与 delta。provider 内部排队、调度、prefill
+与模型执行阶段若未由该 provider 单独暴露，不能从这些字段反推。
+
+```yaml
+schema: agentgo.llm-invocation-timing/v1
+dns_ms: DNS 阶段耗时
+connect_ms: 从第一次连接尝试到首次成功的耗时；Happy Eyeballs fallback 包含在内
+tls_ms: TLS 握手耗时
+first_response_byte_ms: 相对 Invocation 开始收到首个 HTTP 响应字节的时间
+first_sse_event_ms: 相对 Invocation 开始解码到第一个 SSE 事件的时间，不等于首 token
+first_reasoning_delta_ms: 第一个非空 reasoning delta
+first_text_delta_ms: 第一个非空用户可见文本 delta
+first_tool_delta_ms: 第一个非空工具名或参数 delta
+first_model_delta_ms: reasoning/text/tool 三者最早一个，最接近客户端可测 TTFT
+completed_ms: Responses 的 response.completed，或 Chat stream 正常 EOF
+max_inter_event_gap_ms: 相邻 SSE 事件的最大间隔
+stream_event_count: 已解码 SSE 事件数
+connect_attempts: TCP 连接尝试数
+connect_failures: TCP 连接失败数
+network_family: ipv4 或 ipv6
+connection_reused: 是否复用已有连接
+```
+
+`duration_ms` 仍表示从调用开始到 `llm.Invoke` 完整返回的总墙钟时间；它不是
+TTFT。所有首事件/delta/completed 字段都是相对调用开始的 monotonic 毫秒。
+字段缺席表示该协议或连接没有提供此里程碑，不能按 0ms 处理；例如复用连接时
+通常没有 DNS/connect/TLS，非流式响应没有 SSE/delta/completed 字段。
+`reasoning_tokens` 来自 provider usage，provider 未返回或值为 0 时缺席；它已
+包含在 `completion_tokens`，统计时不得重复相加。
+
+该对象刻意不记录 endpoint、IP、密钥、Prompt、reasoning 正文或响应正文。
+采集钩子位于 `internal/llm`，Invocation 身份绑定位于 `internal/agent`，schema、
+JSONL 与 CLI 展示聚合位于 `internal/trace`。它是跨层观测面，不属于 L1，也不进入
+Prompt、Context digest、Tool schema、控制门或 Graph 路由。
 
 ### 2.2 Transition 子结构体
 
@@ -197,7 +236,7 @@ Plan 时代的验收身份子结构已删除；V6 验收语义由 Graph acceptan
 | Kind | 含义 | 关键字段 |
 |---|---|---|
 | `llm_call_start` | LLM 调用开始 | `history_entries`, `tool_calls_count`, `effective_model`, `model_capability_digest`, `invocation_profile_ref` |
-| `llm_call_end` | LLM 调用结束（唯一 token 账本，每次调用一条） | `duration_ms`, `prompt_tokens`, `completion_tokens`, `tool_calls_count`, `finish_reason`, `effective_model`, `invocation_profile_ref`, `error` |
+| `llm_call_end` | LLM 调用结束（唯一 token 账本，每次调用一条） | `duration_ms`, `prompt_tokens`, `completion_tokens`, `reasoning_tokens`, `llm_timing`, `tool_calls_count`, `finish_reason`, `effective_model`, `invocation_profile_ref`, `error` |
 | `history_compaction` | 上下文压缩 | `prompt_tokens_before`, `strategy`, `kept_entries` |
 
 #### 工具调用（2 种）
@@ -379,6 +418,8 @@ agentgo trace node deploy-pipeline/implement
 ```
 session 总计: 51 个任务, 467 次 LLM 调用, prompt=7.7M, completion=360.6k, 合计=8.1M tokens, 重试=8 次, 浪费=0 tokens (0%)
   （浪费口径：终态 cancelled/failed 任务的全部 token；completed 任务的 retry 消耗无法切分，见 RETRIES 列）
+  provider usage: reasoning=120.4k tokens（已包含在 completion，不重复计入合计）
+  客户端 LLM 时序: v1=460/467 次; ttfb[n=460 p50=812ms p95=2400ms max=9100ms]; first_sse[n=450 p50=820ms p95=2420ms max=9120ms]; first_model_delta[n=450 p50=1100ms p95=3800ms max=12500ms]; completed[n=450 p50=8400ms p95=42000ms max=133263ms]; max_event_gap[n=450 p50=180ms p95=920ms max=4100ms]
 
 按 task 聚合（合计 token 降序）:
 TASK      AGENT            CALLS   RETRIES  PROMPT     COMPLETION  TOTAL      WASTED     STATUS
@@ -387,6 +428,8 @@ TASK      AGENT            CALLS   RETRIES  PROMPT     COMPLETION  TOTAL      WA
 ```
 
 - 分组维度：`task`（默认，每任务一行）/ `agent`（按执行者）。
+- `provider usage` 只在 provider 返回 reasoning token 明细时出现；reasoning 已包含在 completion。
+- `客户端 LLM 时序` 只统计字段实际存在的 v1 记录，括号内各自带样本数，使用 nearest-rank p50/p95；缺失字段不会补零。
 - **浪费口径**：终态为 `cancelled` / `failed` 的任务，其全部 LLM token 计入 `WASTED`——这些产出未被下游使用，是纯损失。`completed` 任务中间 retry 的消耗无法精确切分，经 `RETRIES` 列单列。
 - **异常提示**：表格后按 task 粒度输出高置信异常（规则刻意保守，与 `trace show` 的 9 条检测互不相关）：session 浪费占比 > 20%；单任务重试 >= 3 次；单任务消耗 > session 总量 40%（任务数 >= 3 时）；单任务 read_file 重读率 > 30%（总读取 >= 4 次；口径为重复全文读 + 相同 offset 重复分页，大文件顺序分页不计，Layer-1 snip 后的重读循环信号）。
 

@@ -216,8 +216,10 @@ func (c *SDKClient) responsesStreaming(ctx context.Context, params responses.Res
 
 	for stream.Next() {
 		event := stream.Current()
+		observeStreamEvent(ctx, event.Type)
 		switch event.Type {
 		case "response.output_text.delta":
+			observeStreamDelta(ctx, "text", event.Delta != "")
 			if err := budget.addContent(event.Delta); err != nil {
 				return emitFailure(err)
 			}
@@ -226,6 +228,7 @@ func (c *SDKClient) responsesStreaming(ctx context.Context, params responses.Res
 				handler(StreamEvent{ContentDelta: event.Delta, AccumulatedContent: content.String(), AccumulatedReasoning: reasoning.String()})
 			}
 		case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
+			observeStreamDelta(ctx, "reasoning", event.Delta != "")
 			if err := budget.addReasoning(event.Delta); err != nil {
 				return emitFailure(err)
 			}
@@ -234,6 +237,7 @@ func (c *SDKClient) responsesStreaming(ctx context.Context, params responses.Res
 				handler(StreamEvent{ReasoningDelta: event.Delta, AccumulatedContent: content.String(), AccumulatedReasoning: reasoning.String()})
 			}
 		case "response.function_call_arguments.delta":
+			observeStreamDelta(ctx, "tool", event.Delta != "")
 			argumentDeltas[event.OutputIndex] += event.Delta
 			if err := budget.addTool(event.OutputIndex, "", event.Delta); err != nil {
 				return emitFailure(err)
@@ -399,6 +403,7 @@ func responsesItemsResult(items []responses.ResponseOutputItemUnion, usage respo
 	result.ExtraFields = map[string]json.RawMessage{responsesOutputItemsExtraField: carrier}
 	result.Usage.PromptTokens = int(usage.InputTokens)
 	result.Usage.CompletionTokens = int(usage.OutputTokens)
+	result.Usage.ReasoningTokens = int(usage.OutputTokensDetails.ReasoningTokens)
 	if len(result.ToolCalls) > 0 {
 		result.FinishReason = FinishReasonToolCalls
 	} else {
