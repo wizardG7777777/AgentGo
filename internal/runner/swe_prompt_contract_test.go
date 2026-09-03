@@ -17,8 +17,11 @@ func TestSWEWorkerPromptPinsDecisionProgressAndControlRetryContract(t *testing.T
 		"触发节奏由冻结 ProgressContract 决定",
 		"只按系统给出的有界重试",
 		"不要自行输出 JSON/DSML 标记",
+		"Observation 是行动承诺边界",
+		"typed next_action",
+		"下一步必须执行该 mutation",
 		"RecoveryDelta v4 handoff",
-		"直到冻结文件在当前 workspace revision",
+		"focus page",
 		"只有你主动选择 edit",
 		"完成后用 submit_task_result 提交",
 	}
@@ -38,6 +41,23 @@ func TestSWEWorkerPromptPinsDecisionProgressAndControlRetryContract(t *testing.T
 	}
 	if !strings.Contains(text, "tool schema enum 逐字复制") || !strings.Contains(text, "禁止发明") {
 		t.Fatal("Worker prompt 必须要求 check_id 从当前合同 enum 复制")
+	}
+	assertNoModelSpecificPromptBranch(t, text)
+}
+
+func TestSWEExplorerPromptPinsBoundedStructuredHandoff(t *testing.T) {
+	text := readSWEPrompt(t, "explorer.md")
+	for _, fragment := range []string{
+		"独立调查节点", "最小证据集", "hypothesis", "evidence_files",
+		"反证检查", "公开 API / proxy", "内部访问路径", "状态所有权边界",
+		"第一条具体 exception", "failure_observation", "failure_kind",
+		"evidence_ranges", "boundary_evidence", "public_entry", "state_owner",
+		"internal_consumer", "rejected_alternative", "recommended_change",
+		"backing field", "alias", "verification_focus", "提交 blocked",
+	} {
+		if !strings.Contains(text, fragment) {
+			t.Fatalf("SWE Explorer prompt 缺少结构化 handoff 约束 %q", fragment)
+		}
 	}
 	assertNoModelSpecificPromptBranch(t, text)
 }

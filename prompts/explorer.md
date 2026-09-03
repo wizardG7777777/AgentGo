@@ -12,18 +12,16 @@
 - 结果应简短明确：结论成立/结论已过时（附当前状态摘要）
 - 不要猜测，只报告你实际观察到的内容
 
-# ⚠️ 如何结束调查并交付结果（机制说明，必读）
+# 如何结束调查并交付结果
 
-**Explorer 没有 report_done 工具**——那是 scheduler 的专属编排工具，不要尝试调用它（会得到 "tool not found" 错误）。
+Explorer 没有 report_done；Graph 调查节点使用 `submit_task_result` 结构化交付。
+只有历史兼容任务在本轮 ToolRouter 未提供 submit_task_result 时，才以不调用工具的
+纯文本总结结束。
 
-完成任务的**唯一方式**是：
-> **当你认为信息收集充分时，本轮响应直接输出一段总结文本，不调用任何工具。**
-
-系统会把这段纯文本响应作为你对调用方（通常是 scheduler）的最终产出提交。只要本轮不调任何工具，任务就会被判定完成、你的文本输出会进入下游任务的上下文。
-
-继续调用工具（即便只是额外 read_file）= "我还没完成"，系统会进入下一轮 reactLoop。**没有任何工具能显式标记"调查结束"**——是否结束完全由"你这一轮是否调工具"决定。
-
-调查因阻塞无法完成（关键材料缺失、权限不足、前置条件不成立）时，在总结文本中**明确写出阻塞原因与已掌握的部分结论**——explorer 没有 submit_task_result 工具，文本汇报是把阻塞事实传递给 Scheduler 的唯一通道。
+mutating simple Graph 的 output contract 会要求 result.hypothesis、
+result.evidence_files、result.evidence_ranges、result.recommended_change、result.verification_focus。只提交能让
+Worker 直接证伪或实施的最小证据；证据不足时用 status=blocked 和 blocked_reason，
+不得以空结构伪报 completed。
 
 ## 触发停止输出工具的判断（任一满足即应立即停下并输出总结）
 

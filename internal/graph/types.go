@@ -36,6 +36,11 @@ const SchemaV2 = "agentgo.graph/v2"
 // authoring 图的候选必须先经 acceptance，再由 L5 promotion 提交主根。
 const SchemaV3 = "agentgo.graph/v3"
 
+// SchemaV4 在 v3 Delivery Transaction 上增加 versioned candidate-repair
+// producer：同一图仍只有一个主 mutating producer，额外 producer 只能由
+// RecoveryDelta v5 replay 边进入并继续同一 Delivery。v1-v3 不迁移。
+const SchemaV4 = "agentgo.graph/v4"
+
 // GraphDocument 是整张图的类型化模型（JSON 对外契约 + 进程内读写对象）。
 //
 // 字段所有权（由 GraphStore 的角色分离变更 API + CAS 强制，见 store.go）：
@@ -45,7 +50,7 @@ const SchemaV3 = "agentgo.graph/v3"
 //   - 调度与认领系统：写节点的 Executor；
 //   - Agent Loop / Harness：写节点的 Execution（结果与证据引用）。
 type GraphDocument struct {
-	Schema      string                   `json:"schema"`   // 必须恰为 SchemaV1、SchemaV2 或 SchemaV3
+	Schema      string                   `json:"schema"`   // 必须恰为 SchemaV1、SchemaV2、SchemaV3 或 SchemaV4
 	GraphID     string                   `json:"graph_id"` // 图 ID，非空，字符集见校验链
 	RunID       runcontract.RunID        `json:"run_id,omitempty"`
 	RunContract *runcontract.RunContract `json:"run_contract,omitempty"`
@@ -72,7 +77,7 @@ type GraphDocument struct {
 // RequiresDelivery 报告 v3 图是否包含需要候选 promotion 的 mutating producer。
 // read-only v3 图仍可使用封闭终态契约，但不伪造空 Delivery Transaction。
 func (d *GraphDocument) RequiresDelivery() bool {
-	if d == nil || d.Schema != SchemaV3 {
+	if d == nil || !UsesDeliveryTransaction(d.Schema) {
 		return false
 	}
 	for _, node := range d.Nodes {
@@ -85,6 +90,16 @@ func (d *GraphDocument) RequiresDelivery() bool {
 		}
 	}
 	return false
+}
+
+// UsesDeliveryTransaction 报告 Graph schema 是否使用 Delivery v1 候选事务。
+func UsesDeliveryTransaction(schema string) bool {
+	return schema == SchemaV3 || schema == SchemaV4
+}
+
+// UsesTypedTerminalContract 报告 Graph schema 是否使用 v2+ 封闭终态契约。
+func UsesTypedTerminalContract(schema string) bool {
+	return schema == SchemaV2 || schema == SchemaV3 || schema == SchemaV4
 }
 
 // RequiresTypedTaskOutcome 区分 legacy Execution 与 authoring Definition。
@@ -521,18 +536,21 @@ type NodeKind string
 type ControllerRole string
 
 const (
-	ControllerRoleNone          ControllerRole = ""
-	ControllerRoleLoopRecovery  ControllerRole = "loop_recovery"
-	MetadataControllerRole                     = "controller_role"
-	MetadataRecoveryMaxRetries                 = "recovery_max_retries"
-	MetadataRecoveryDeltaSchema                = "recovery_delta_schema"
-	RecoveryDeltaSchemaV1                      = "agentgo.recovery-delta/v1"
-	RecoveryDeltaSchemaV2                      = "agentgo.recovery-delta/v2"
-	RecoveryDeltaSchemaV3                      = "agentgo.recovery-delta/v3"
-	RecoveryDeltaSchemaV4                      = "agentgo.recovery-delta/v4"
-	ChangeDecisionSchemaV1                     = "agentgo.change-decision/v1"
-	MaxRecoveryEvidenceFiles                   = 8
-	MaxRecoveryEditSteps                       = 8
+	ControllerRoleNone             ControllerRole = ""
+	ControllerRoleLoopRecovery     ControllerRole = "loop_recovery"
+	MetadataControllerRole                        = "controller_role"
+	MetadataRecoveryMaxRetries                    = "recovery_max_retries"
+	MetadataRecoveryDeltaSchema                   = "recovery_delta_schema"
+	RecoveryDeltaSchemaV1                         = "agentgo.recovery-delta/v1"
+	RecoveryDeltaSchemaV2                         = "agentgo.recovery-delta/v2"
+	RecoveryDeltaSchemaV3                         = "agentgo.recovery-delta/v3"
+	RecoveryDeltaSchemaV4                         = "agentgo.recovery-delta/v4"
+	RecoveryDeltaSchemaV5                         = "agentgo.recovery-delta/v5"
+	ChangeDecisionSchemaV1                        = "agentgo.change-decision/v1"
+	ChangeDecisionSchemaV2                        = "agentgo.change-decision/v2"
+	RecoveryCandidateStateSchemaV1                = "agentgo.recovery-candidate-state/v1"
+	MaxRecoveryEvidenceFiles                      = 8
+	MaxRecoveryEditSteps                          = 8
 )
 
 // RecoveryFirstAction 是 v2+ RecoveryDelta 冻结给下一 Activation 的首个
@@ -559,6 +577,28 @@ type RecoveryEditStep struct {
 	Path string `json:"path"`
 }
 
+// RecoveryCandidateCheck 是 v5 从失败 Activation 的 durable Evidence 机械
+// 投影出的最后一次 typed check。它只描述已发生事实；repair Activation 是否
+// 可以交付仍由当前 workspace revision 下的新 CheckRecord 决定。
+type RecoveryCandidateCheck struct {
+	Ref                  string `json:"ref"`
+	CheckRef             string `json:"check_ref"`
+	CheckID              string `json:"check_id"`
+	Status               string `json:"status"`
+	WorkspaceRevisionRef string `json:"workspace_revision_ref"`
+}
+
+// RecoveryCandidateState 是 v5 的 L2/L3 候选状态 handoff。该对象完全由
+// Runtime 从 failure_context 的 Delivery/Evidence authority 绑定，Recovery
+// 模型无权填写。DirtyPaths 只表示成功 mutation 事实，不授予修改或提交权限。
+type RecoveryCandidateState struct {
+	Schema             string                  `json:"schema"`
+	SourceActivationID string                  `json:"source_activation_id"`
+	DeliveryID         string                  `json:"delivery_id"`
+	DirtyPaths         []string                `json:"dirty_paths"`
+	LatestCheck        *RecoveryCandidateCheck `json:"latest_check,omitempty"`
+}
+
 // RecoveryDelta 是 loop_recovery decision=retry 的强制结构化增量。它由
 // Runtime 对照 failure_context 机械校验，并作为 recovery_directive 注入
 // 下一 Activation；不包含 reasoning 或原始工具正文。
@@ -573,9 +613,11 @@ type RecoveryDelta struct {
 	FirstRequiredAction string `json:"first_required_action,omitempty"`
 	// FirstAction 是 v2 的类型化首动作。新 Graph 不再写自由文本 action。
 	FirstAction *RecoveryFirstAction `json:"first_action,omitempty"`
-	// EvidenceContract 只属于 v4。v1-v3 恢复对象必须省略，避免原地改变旧版本。
-	EvidenceContract  *RecoveryEvidenceContract `json:"evidence_contract,omitempty"`
-	ExpectedMilestone string                    `json:"expected_milestone"`
+	// EvidenceContract 属于 v4/v5。v1-v3 恢复对象必须省略，避免原地改变旧版本。
+	EvidenceContract *RecoveryEvidenceContract `json:"evidence_contract,omitempty"`
+	// CandidateState 只属于 v5，并由 Runtime 绑定。v1-v4 必须省略。
+	CandidateState    *RecoveryCandidateState `json:"candidate_state,omitempty"`
+	ExpectedMilestone string                  `json:"expected_milestone"`
 	// StartPermitRef 由 L5/RunBudget authority 预留并绑定，模型无权填写。
 	StartPermitRef string `json:"start_permit_ref,omitempty"`
 }

@@ -35,7 +35,10 @@ func TestObservationGroupValidatesCurrentAttemptEvidence(t *testing.T) {
 	result, err := registry.Dispatch(context.Background(), llm.ToolCall{ID: "obs", Name: "record_observation_delta",
 		Arguments: map[string]any{"phase": taskmem.ObservationPhaseInvestigate, "facts": []any{map[string]any{
 			"text": "已读取目标文件", "evidence_refs": []any{"tool-call:call-read"},
-		}}, "resolved_candidates": []any{}, "next_candidates": []any{"执行编辑"}}})
+		}}, "resolved_candidates": []any{}, "next_candidates": []any{"执行编辑"},
+			"next_action": map[string]any{"decision": "mutate", "mutation": map[string]any{
+				"tool": "edit_file", "path": "src/a.py",
+			}}}})
 	if err != nil || result == "" {
 		t.Fatalf("record_observation_delta: result=%q err=%v", result, err)
 	}
@@ -45,13 +48,15 @@ func TestObservationGroupValidatesCurrentAttemptEvidence(t *testing.T) {
 		t.Fatalf("Observation TaskMemory=%+v", loaded)
 	}
 	var receipt struct {
-		Schema          string   `json:"schema"`
-		OpenCandidates  []string `json:"open_candidate_refs"`
-		SemanticAdvance bool     `json:"semantic_advance"`
+		Schema          string                         `json:"schema"`
+		OpenCandidates  []string                       `json:"open_candidate_refs"`
+		SemanticAdvance bool                           `json:"semantic_advance"`
+		NextAction      *taskmem.ObservationNextAction `json:"next_action"`
 	}
-	if json.Unmarshal([]byte(result), &receipt) != nil || receipt.Schema != taskmem.ObservationDeltaSchemaV3 ||
-		len(receipt.OpenCandidates) != 1 || !receipt.SemanticAdvance {
-		t.Fatalf("Observation v3 receipt 非法: %s", result)
+	if json.Unmarshal([]byte(result), &receipt) != nil || receipt.Schema != taskmem.ObservationDeltaSchemaV4 ||
+		len(receipt.OpenCandidates) != 1 || !receipt.SemanticAdvance || receipt.NextAction == nil ||
+		receipt.NextAction.Decision != taskmem.ObservationNextMutate {
+		t.Fatalf("Observation v4 receipt 非法: %s", result)
 	}
 	resolveArgs := map[string]any{
 		"phase": taskmem.ObservationPhaseImplement,
@@ -60,6 +65,7 @@ func TestObservationGroupValidatesCurrentAttemptEvidence(t *testing.T) {
 			"candidate_ref": receipt.OpenCandidates[0], "evidence_refs": []any{"tool-call:call-read"},
 		}},
 		"next_candidates": []any{"执行验证"},
+		"next_action":     map[string]any{"decision": "verify"},
 	}
 	if _, err := registry.Dispatch(context.Background(), llm.ToolCall{ID: "old-proof", Name: "record_observation_delta",
 		Arguments: resolveArgs}); err == nil || !strings.Contains(err.Error(), "不晚于 predecessor") {

@@ -40,8 +40,8 @@ func TestStartPinsCurrentContextPolicyVersion(t *testing.T) {
 		t.Fatalf("新 Run 未冻结 current Context policy: %+v", task)
 	}
 	if task.RunContract == nil || task.RunContract.Schema != runcontract.SchemaV2 ||
-		task.ProgressContract == nil || task.ProgressContract.Ref.ContractID != policycatalog.ProgressCodeChangeV6 {
-		t.Fatalf("新 Run 未冻结 RunContract v2 / Progress v6: %+v", task)
+		task.ProgressContract == nil || task.ProgressContract.Ref.ContractID != policycatalog.ProgressCodeChangeCurrent {
+		t.Fatalf("新 Run 未冻结 RunContract v2 / current Progress: %+v", task)
 	}
 }
 

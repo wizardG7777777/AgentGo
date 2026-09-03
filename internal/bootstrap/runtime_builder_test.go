@@ -44,6 +44,23 @@ func TestBuildAgentRuntime_IdleThresholdFromGlobalConfig(t *testing.T) {
 	}
 }
 
+func TestBuildAgentRuntimeObservationModelDefaultsAndOverride(t *testing.T) {
+	prompt := writeTempPromptFile(t)
+	llmCfg := config.LLMConfig{DefaultModel: "default", DefaultContextWindowTokens: 200000, DefaultMaxCompletionTokens: 20000,
+		ModelCapabilities: map[string]config.ModelCapabilityConfig{"control": {ContextWindowTokens: 300000, MaxCompletionTokens: 30000}}}
+	for _, tc := range []struct{ observation, want string }{{"", "business"}, {"control", "control"}} {
+		kind := config.AgentKind{Kind: "worker", Tools: []string{"read_file"}, Model: "business",
+			ObservationModel: tc.observation, SystemPromptFile: prompt}
+		rt, err := buildAgentRuntime(kind, llmCfg, nil, []config.AgentKind{kind}, 1, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rt.ObservationModel != tc.want || rt.ObservationModelCapabilityDigest == "" {
+			t.Fatalf("observation_model=%q runtime=%+v", tc.observation, rt)
+		}
+	}
+}
+
 // writeTempPromptFile 是测试辅助：写一个最小 system prompt 文件并返回路径。
 func writeTempPromptFile(t *testing.T) string {
 	t.Helper()

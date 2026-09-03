@@ -15,13 +15,32 @@ worktree 与原始运行产物，不保存密钥。
 
 ## 启动必要条件
 
-SWE Test Runner 使用 fail-closed 的 provider 环境契约。以下 3 个环境变量必填；任一变量
+SWE Test Runner 使用 fail-closed 的 provider 环境契约。以下 4 个环境变量必填；任一变量
 未设置或仅含空白时，CLI 会在网络请求、目录创建、worktree 清理和子进程启动前
 一次性报告全部缺项并退出：
 
 - `SWE_API_KEY`：外部 provider 密钥，仅从进程环境读取，诊断不得回显值；
 - `SWE_BASE_URL`：OpenAI-compatible provider 基础 URL；
-- `SWE_MODEL`：所有 SWE 角色统一使用的模型名。
+- `SWE_FAST_MODEL`：快速模型能力档位；
+- `SWE_FLAG_SHIP_MODEL`：旗舰模型能力档位。可与 `SWE_FAST_MODEL` 相同以复现
+  单模型基线，或设置为同一 provider 的另一模型以评估分层协作。
+
+两个变量只表示能力档位，Scheduler、Explorer、Worker、Verifier 与全局默认模型的
+具体分工以 `setting.swe-flask.yaml` 中各 `model` 字段为权威。旧 `SWE_MODEL`、
+`SWE_BASE_MODEL`、`SWE_WORKER_MODEL` 不再读取，也不作为新变量的 fallback；只设置
+旧变量时入口会一次性报告 `SWE_FAST_MODEL` 与 `SWE_FLAG_SHIP_MODEL` 缺失。能力探针
+对两个模型去重后逐一执行，任一模型不满足 typed function-call 契约都在启动 AgentGo
+前 fail-closed。
+
+当前冻结角色分工为：Scheduler / Verifier 使用快速档，Explorer / Worker 的业务
+推理使用旗舰档；Explorer 的机械 Observation 通过 `observation_model` 显式使用快速
+档。该分工来自真实日志中快速 Explorer 把公开 proxy / 内部生命周期边界误缩成叶子
+容器覆写的证据，不是 provider 或模型名称特判。
+
+`prepare` 完成目标红态后，Runner 会把 `targeted-baseline.pytest.log` 归一为一个
+最多6000字符、去 ANSI 的 `<swe-baseline-failure authority="swe-test-runner">`
+块，仅附加到本次 `/api/input`。受版本控制的 suite prompt 不被改写；该块用于让
+Explorer 冻结第一条具体 exception/assertion，不构成修改 tests/ 的授权。
 
 其余变量都是可选覆盖项；未设置或为空时使用跨平台派生值：
 
@@ -116,6 +135,8 @@ python3 scripts/swe_test_runner/runner.py task automatic-options --timeout 1200
 Windows PowerShell 使用 Python Launcher：
 
 ```powershell
+$env:SWE_FAST_MODEL = "qwen3.8-flash"
+$env:SWE_FLAG_SHIP_MODEL = "qwen3.8-max"
 py -3.13 scripts/swe_test_runner/runner.py task automatic-options --timeout 1200
 ```
 
@@ -128,6 +149,8 @@ python3 scripts/swe_test_runner/runner.py batch --timeout 1200
 Windows PowerShell：
 
 ```powershell
+$env:SWE_FAST_MODEL = "qwen3.8-flash"
+$env:SWE_FLAG_SHIP_MODEL = "qwen3.8-max"
 py -3.13 scripts/swe_test_runner/runner.py batch --timeout 1200
 ```
 
@@ -198,11 +221,12 @@ Windows PowerShell：
 py -3.13 -X utf8 -m unittest scripts/swe_test_runner/runner_test.py
 ```
 
-`result.json` 使用 `agentgo.swe-result/v2`，分别报告 `architecture_ok` 与
+`result.json` 使用 `agentgo.swe-result/v3`，分别报告 `architecture_ok`、
+`model_contract_compatible` 与
 `task_resolved`；禁止用 pytest 偶然通过覆盖架构事故，也禁止用模型业务失误伪造
 框架错误。CLI 退出码为：`0` 表示所选测试全部通过，`1` 表示 SWE Test Runner/环境故障，
-`2` 表示架构门失败，`3` 表示任务正确率门失败；批次不再在未达到目标时返回成功。
-批次遇到架构门失败会立即停止，普通任务正确率失败则继续完成剩余题目并在汇总后
+`2` 表示架构门失败，`3` 表示任务正确率门失败，`4` 表示模型契约不兼容；批次不再在未达到目标时返回成功。
+批次遇到模型契约门或架构门失败会立即停止，普通任务正确率失败则继续完成剩余题目并在汇总后
 返回 `3`。
 
 `summary.json` 是 `.batch_start` 绑定的增量事务产物：批次启动时立即
@@ -234,15 +258,14 @@ Recovery retry 还必须在 decision commit 前证明下一 execution Activation
 返回错工具属于 L3 `action_contract_rejected`，不再混入 provider
 `malformed_response`。
 
-code-change recovery 使用 `agentgo.recovery-delta/v4`：下一 Activation 必须形成
-`recovery_action_gated` 的 EvidenceContract 分段读取（含外置结果的
-`read_content_ref`）、typed `submit_change_decision`、可选声明 mutation 与 typed
-check 阶段。`hypothesis_rejected`/`blocked` 可安全返回 L5，不能因没有 mutation
-被误报为 gate missing；Evidence 读取失败的 `evidence_unavailable` stage 也只允许
-这两个安全决策。SWE Test Runner 只对已 `task_result_committed` 的 Recovery
+code-change recovery 使用 `agentgo.recovery-delta/v5`：下一 repair Activation 必须形成
+`recovery_action_gated` 的 bounded focus read（含外置结果的 `read_content_ref`）、
+ChangeDecision v2、可选 mutation/resume_candidate 与 typed check。need_context 以
+path/offset/limit 增加一页，重复页或未读 edit target fail-closed；v4 全文件语义只供
+历史恢复。`hypothesis_rejected`/`blocked` 可安全返回 L5。SWE Test Runner 只对已 `task_result_committed` 的 Recovery
 Task 取最终一次成功裁决，再与下一 Task 的首动作 gate 按时间顺序对账；Attempt
 rollover 重放的 raw receipt 不重复计数。缺 gate、工具/路径/ref_id/offset/limit/
-check_id 不一致，或同一 Task 同时看到多条
+force_full/check_id 不一致，或同一 Task 同时看到多条
 `recovery_directive`（`directive_count != 1`），分别记录
 `recovery_action_gate_missing`、`recovery_action_gate_mismatch`、
 `recovery_directive_ambiguous` 并令 `architecture_ok=false`。

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
+	"agentgo/internal/observationcontract"
+	"agentgo/internal/policycatalog"
 	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
 	"agentgo/internal/taskmem"
@@ -26,12 +29,16 @@ const observationCheckpointFailureMarker = "[observation-checkpoint-failure]"
 const agentDeliverablePhasePrompt = `<agent-phase name="deliverable-submit">
 This is a mechanical terminal handoff. The only legal action in this invocation is one typed submit_task_result call.
 All read, grep, list, shell, edit, web, messaging, and replan tools from earlier role instructions are unavailable now; do not emit their names even if they appeared earlier.
-Use the authoritative task objective, upstream input, output contract, and TaskMemory already present to submit completed, failed, or blocked. Do not answer with text.
+Use the authoritative task objective, upstream input, output contract, TaskMemory, and any settled investigation-evidence notices present to submit completed, failed, or blocked. Do not answer with text.
 </agent-phase>`
 
 const observationCheckpointPhasePrompt = `<agent-phase name="observation-checkpoint">
 This is a mechanical L2 checkpoint before Context projection, Attempt rollover, or intervention.
-The only legal action is record_observation_delta. Phase must be investigate, implement, verify, finalize, or blocked. Facts are evidence-bound model claims with text and evidence_refs, never bare strings; the framework stores them as inferred, not confirmed semantic truth. Use an empty facts array when the current evidence enum is empty. Every evidence_ref must be copied literally from the relevant enum in this invocation's tool schema and the system catalog below. Never use ev:, content:, file:, grep:, a bare call_id, a composed reference, upstream evidence, or a prior Task/Attempt reference. If you cannot copy a listed literal exactly, use empty facts and resolved_candidates arrays instead of inventing a reference. Facts are the complete currently valid claim projection, not an append-only recap. Close predecessor candidates only with the candidate_ref and post-predecessor evidence enums in this invocation; merely rewording or adding candidates is not progress. Keep next candidates within the schema-bounded list. Never include chain-of-thought or raw tool bodies. Do not edit, test, message, submit the task result, or answer with text.
+The only legal action is record_observation_delta. Phase must be investigate, implement, verify, finalize, or blocked. Facts are evidence-bound model claims with text and evidence_refs, never bare strings; the framework stores them as inferred, not confirmed semantic truth. Use an empty facts array when the current evidence enum is empty. Every evidence_ref must be copied literally from the relevant enum in this invocation's tool schema and the system catalog below. Never use ev:, content:, file:, grep:, a bare call_id, a composed reference, upstream evidence, or a prior Task/Attempt reference. If you cannot copy a listed literal exactly, use empty facts and resolved_candidates arrays instead of inventing a reference. Facts are the complete currently valid claim projection, not an append-only recap. Close predecessor candidates only with the candidate_ref and post-predecessor evidence enums in this invocation; merely rewording or adding candidates is not progress. Keep next candidates within the schema-bounded list. next_action is your typed commitment for the next ordinary business stage: choose mutate only when you are ready to perform the declared edit_file/write_file path; otherwise choose continue, need_context, verify, or blocked without mutation. Never include chain-of-thought or raw tool bodies. Do not edit, test, message, submit the task result, or answer with text.
+</agent-phase>`
+
+const observationCommitmentPhasePrompt = `<agent-phase name="observation-commitment">
+The latest durable Observation records a model-chosen mutation commitment. The only legal action is the mutation tool and frozen project-relative path exposed by this invocation's tool schema. Generate only the edit content arguments needed for that exact mutation. Do not read, grep, test, submit, or answer with text. A rejected argument keeps the commitment pending.
 </agent-phase>`
 
 func recoveryActionPhasePrompt(gate recoveryActionGate) string {
@@ -53,6 +60,9 @@ func recoveryActionPhasePrompt(gate recoveryActionGate) string {
 		guidance = "The frozen evidence read failed, so mutation and further context expansion are unsafe. Submit hypothesis_rejected or blocked with the concrete read failure as reason; do not edit or claim coverage."
 	case recoveryStageDecision:
 		guidance = "The current EvidenceContract is fully covered and fresh. Submit edit with explicit ordered {tool,path} edit_steps, need_context with one new project-relative evidence file and reason, or hypothesis_rejected/blocked. Evidence files justify the decision but do not restrict mutation targets; write_file may declare a new path. Do not edit in this invocation."
+		if gate.Schema == graph.RecoveryDeltaSchemaV5 {
+			guidance = "The current bounded focus context is available. Submit edit with ordered {tool,path} steps, resume_candidate for a valid dirty candidate, need_context for one additional focus page, or hypothesis_rejected/blocked. For the same file, need_context must provide a new 1-based offset and the schema-constant limit; use upstream symbol/line evidence to jump near the target instead of paging the whole file. Every edit_file target must first enter focus context; write_file may declare a new path. Do not edit in this invocation."
+		}
 	case recoveryStageMutation:
 		guidance = "You previously chose edit and declared this exact edit step. Apply that decision now; do not return to investigation or merely describe the patch."
 	case recoveryStageCheck:
@@ -147,7 +157,45 @@ type recoveryActionGate struct {
 	RefID          string
 	Offset         int64
 	Limit          int64
+	ForceFull      bool
 	DirectiveCount int
+}
+
+func isObservationPhase(phase string) bool {
+	return phase == "agent:observation-checkpoint" || isAutoObservationPhase(phase)
+}
+
+func isAutoObservationPhase(phase string) bool {
+	return phase == "agent:observation-checkpoint-v8" || phase == "agent:observation-checkpoint-v9" ||
+		phase == "agent:observation-checkpoint-v10" || phase == "agent:observation-checkpoint-v11" || phase == "agent:observation-checkpoint-v12"
+}
+
+// observationOutputLimits 按冻结 Progress 版本返回控制调用预算。v7/v8 的
+// 2048/32KiB 保持历史语义；v9 只扩大 completion/response 容器，不改变
+// Observation schema、业务 history 或 L3 required-action gate。
+func observationOutputLimits(phase string) (completionTokens, responseBytes int64) {
+	if phase == "agent:observation-checkpoint-v9" || phase == "agent:observation-checkpoint-v10" || phase == "agent:observation-checkpoint-v11" || phase == "agent:observation-checkpoint-v12" {
+		return 4096, 48 << 10
+	}
+	return 2048, 32 << 10
+}
+
+func recoveryV5CompletionLimit(stage recoveryActionStage, history []HistoryEntry) int64 {
+	escalated := len(history) > 0 && strings.Contains(history[len(history)-1].SystemNotice, "[same-snapshot-retry")
+	switch stage {
+	case recoveryStageDecision:
+		if escalated {
+			return 8192
+		}
+		return 4096
+	case recoveryStageMutation:
+		if escalated {
+			return 8192
+		}
+		return 4096
+	default:
+		return 2048
+	}
 }
 
 func invocationToolChoice(router ToolRouterSnapshot) invocation.ToolChoice {
@@ -169,6 +217,10 @@ func invocationToolChoice(router ToolRouterSnapshot) invocation.ToolChoice {
 		// 与终态交付一样使用 reasoning=none + exact typed action，而不关闭
 		// 下一业务轮的 thinking。
 		return invocation.ToolChoice{Mode: invocation.ToolChoiceFunction, Name: "record_observation_delta"}
+	case "agent:observation-checkpoint-v8", "agent:observation-checkpoint-v9", "agent:observation-checkpoint-v10", "agent:observation-checkpoint-v11", "agent:observation-checkpoint-v12":
+		// v8+ 改为 auto + singleton ToolRouter。required-action gate 仍在 L3
+		// 强制唯一合法调用；v9 只调整冻结输出预算。
+		return invocation.ToolChoice{Mode: invocation.ToolChoiceAuto}
 	case "scheduler:draft-edit", "scheduler:recovery":
 		// 多工具阶段同样使用 auto wire，由 L3 response gate 强制
 		// 至少一个授权工具调用，避免 thinking + required 被 provider 400。
@@ -182,6 +234,8 @@ func phaseReasoningEffortOverride(phase string) (string, bool) {
 	switch phase {
 	case "agent:deliverable-submit", "agent:observation-checkpoint", "scheduler:final-report-submit":
 		return "none", true
+	case "agent:observation-checkpoint-v8", "agent:observation-checkpoint-v9", "agent:observation-checkpoint-v10", "agent:observation-checkpoint-v11", "agent:observation-checkpoint-v12":
+		return "low", true
 	default:
 		return "", false
 	}
@@ -212,6 +266,8 @@ func mechanicalSingletonTool(phase string) (string, bool) {
 		return "submit_task_result", true
 	case "agent:observation-checkpoint":
 		return "record_observation_delta", true
+	case "agent:observation-checkpoint-v8", "agent:observation-checkpoint-v9", "agent:observation-checkpoint-v10", "agent:observation-checkpoint-v11", "agent:observation-checkpoint-v12":
+		return "record_observation_delta", true
 	case "scheduler:final-report-submit":
 		return "report_done", true
 	default:
@@ -222,13 +278,14 @@ func mechanicalSingletonTool(phase string) (string, bool) {
 func phaseRequiresToolCall(phase string) bool {
 	return mechanicalSingletonPhase(phase) || phase == "scheduler:draft-edit" ||
 		phase == "scheduler:recovery" || phase == "scheduler:graph-recovery" ||
-		phase == "scheduler:final-report" || strings.HasPrefix(phase, "agent:recovery-")
+		phase == "scheduler:final-report" || phase == "agent:observation-commitment" ||
+		strings.HasPrefix(phase, "agent:recovery-")
 }
 
 func phaseDispatchesOnlyFirstTool(phase string) bool {
 	return mechanicalSingletonPhase(phase) || phase == "scheduler:draft-edit" ||
 		phase == "scheduler:recovery" || phase == "scheduler:graph-recovery" ||
-		strings.HasPrefix(phase, "agent:recovery-")
+		phase == "agent:observation-commitment" || strings.HasPrefix(phase, "agent:recovery-")
 }
 
 func deriveInvocationToolPolicy(task *model.Task, history []HistoryEntry, full *ToolRegistry) invocationToolPolicy {
@@ -254,12 +311,30 @@ func deriveInvocationToolPolicyWithControl(task *model.Task, history []HistoryEn
 		if control != nil {
 			view = observationCheckpointRegistry(control.Filtered([]string{"record_observation_delta"}), task, history)
 		}
-		return invocationToolPolicy{Registry: view,
-			Phase: "agent:observation-checkpoint", MaxCalls: defaultToolCallsPerResponse}
+		phase := "agent:observation-checkpoint"
+		if task.ProgressContract != nil {
+			switch task.ProgressContract.Ref.ContractID {
+			case policycatalog.ProgressCodeChangeV8:
+				phase = "agent:observation-checkpoint-v8"
+			case policycatalog.ProgressCodeChangeV9:
+				phase = "agent:observation-checkpoint-v9"
+			case policycatalog.ProgressCodeChangeV10:
+				phase = "agent:observation-checkpoint-v10"
+			case policycatalog.ProgressCodeChangeV11:
+				phase = "agent:observation-checkpoint-v11"
+			case policycatalog.ProgressCodeChangeV12:
+				phase = "agent:observation-checkpoint-v12"
+			}
+		}
+		return invocationToolPolicy{Registry: view, Phase: phase, MaxCalls: defaultToolCallsPerResponse}
 	}
 	if view, gate, required := recoveryActionRegistry(full, frameworkControl, task, history); required {
 		return invocationToolPolicy{Registry: view, Phase: gate.Phase,
 			MaxCalls: defaultToolCallsPerResponse, RecoveryGate: &gate}
+	}
+	if view, required := observationCommitmentRegistry(full, task, history); required {
+		return invocationToolPolicy{Registry: view, Phase: "agent:observation-commitment",
+			MaxCalls: defaultToolCallsPerResponse}
 	}
 	if task != nil && full != nil && task.GraphID != "" &&
 		task.GraphNodeKind == string(graph.KindController) &&
@@ -343,7 +418,8 @@ func deriveInvocationToolPolicyWithControl(task *model.Task, history []HistoryEn
 
 func recoveryDecisionRegistry(registry *ToolRegistry, task *model.Task) *ToolRegistry {
 	if registry == nil || task == nil ||
-		(task.GraphRecoveryDeltaSchema != graph.RecoveryDeltaSchemaV3 && task.GraphRecoveryDeltaSchema != graph.RecoveryDeltaSchemaV4) {
+		(task.GraphRecoveryDeltaSchema != graph.RecoveryDeltaSchemaV3 && task.GraphRecoveryDeltaSchema != graph.RecoveryDeltaSchemaV4 &&
+			task.GraphRecoveryDeltaSchema != graph.RecoveryDeltaSchemaV5) {
 		return registry
 	}
 	return registry.WithDefinitionParameters("submit_recovery_decision", func(parameters map[string]any) {
@@ -359,7 +435,8 @@ func recoveryDecisionRegistry(registry *ToolRegistry, task *model.Task) *ToolReg
 			firstAction["required"] = []any{"tool", "path"}
 			firstAction["description"] = "handoff 首读；具体后续由冻结 recovery schema 决定"
 		}
-		if task.GraphRecoveryDeltaSchema != graph.RecoveryDeltaSchemaV4 {
+		if task.GraphRecoveryDeltaSchema != graph.RecoveryDeltaSchemaV4 &&
+			task.GraphRecoveryDeltaSchema != graph.RecoveryDeltaSchemaV5 {
 			return
 		}
 		properties["evidence_contract"] = map[string]any{
@@ -373,6 +450,14 @@ func recoveryDecisionRegistry(registry *ToolRegistry, task *model.Task) *ToolReg
 			},
 			"required":    []any{"files"},
 			"description": "RecoveryDelta v4 EvidenceContract；只声明最小必要文件，不替 Worker 编造修改内容",
+		}
+		if task.GraphRecoveryDeltaSchema == graph.RecoveryDeltaSchemaV5 {
+			contract := properties["evidence_contract"].(map[string]any)
+			contractProperties := contract["properties"].(map[string]any)
+			files := contractProperties["files"].(map[string]any)
+			files["maxItems"] = 1
+			files["description"] = "v5 单一 focus file；首项必须等于 first_action.path，后续上下文只能经 typed need_context 逐个增加"
+			contract["description"] = "RecoveryDelta v5 bounded focus handoff；Runtime 另行绑定 candidate_state"
 		}
 	})
 }
@@ -391,6 +476,9 @@ func recoveryActionRegistry(registry, frameworkControl *ToolRegistry, task *mode
 	}
 	if directive.Schema == graph.RecoveryDeltaSchemaV4 {
 		return recoveryV4ActionRegistry(registry, frameworkControl, task, directive, history)
+	}
+	if directive.Schema == graph.RecoveryDeltaSchemaV5 {
+		return recoveryV5ActionRegistry(registry, frameworkControl, task, directive, history)
 	}
 	firstSettled, firstSuccessful := recoveryToolSettlement(history,
 		directive.FirstAction.Tool, directive.FirstAction.Path)
@@ -490,7 +578,7 @@ func frozenRecoveryDirective(task *model.Task) (recoveryDirective, bool) {
 		}
 		result, _ := payload["result"].(map[string]any)
 		schema, _ := result["schema"].(string)
-		if result == nil || (schema != graph.RecoveryDeltaSchemaV2 && schema != graph.RecoveryDeltaSchemaV3 && schema != graph.RecoveryDeltaSchemaV4) {
+		if result == nil || (schema != graph.RecoveryDeltaSchemaV2 && schema != graph.RecoveryDeltaSchemaV3 && schema != graph.RecoveryDeltaSchemaV4 && schema != graph.RecoveryDeltaSchemaV5) {
 			continue
 		}
 		raw, _ := result["first_action"].(map[string]any)
@@ -686,6 +774,76 @@ func businessRegistryWithoutFrameworkControl(registry *ToolRegistry) *ToolRegist
 	return registry.Filtered(filtered)
 }
 
+type observationMutationCommitment struct {
+	Tool  string
+	Path  string
+	Entry int
+}
+
+func observationCommitmentRegistry(registry *ToolRegistry, task *model.Task,
+	history []HistoryEntry) (*ToolRegistry, bool) {
+	commitment, ok := pendingObservationMutation(task, history)
+	if !ok || registry == nil {
+		return registry, false
+	}
+	view := registry.Filtered([]string{commitment.Tool})
+	view = view.WithDefinitionParameters(commitment.Tool, func(parameters map[string]any) {
+		properties, _ := parameters["properties"].(map[string]any)
+		setRecoverySchemaConst(properties, "path", commitment.Path,
+			"Observation v4 冻结的模型自选 mutation 路径")
+		requireRecoverySchemaFields(parameters, "path")
+	})
+	if fn := view.tools[commitment.Tool]; fn != nil {
+		view.tools[commitment.Tool] = func(ctx context.Context, args map[string]any) (string, error) {
+			path, err := graph.CanonicalRecoveryEvidencePath(fmt.Sprint(args["path"]))
+			if err != nil || path != commitment.Path {
+				return "", fmt.Errorf("Observation mutation commitment 要求 path=%q", commitment.Path)
+			}
+			return fn(ctx, args)
+		}
+	}
+	return view, true
+}
+
+func pendingObservationMutation(task *model.Task, history []HistoryEntry) (observationMutationCommitment, bool) {
+	for entryIndex := len(history) - 1; entryIndex >= 0; entryIndex-- {
+		if task != nil && strings.TrimSpace(task.AttemptID) != "" &&
+			!strings.HasPrefix(history[entryIndex].TurnID, task.AttemptID+"/") {
+			continue
+		}
+		results := recoveryResultsByCall(history[entryIndex])
+		for callIndex := len(history[entryIndex].ToolCalls) - 1; callIndex >= 0; callIndex-- {
+			call := history[entryIndex].ToolCalls[callIndex]
+			if call.Name != "record_observation_delta" || unsuccessfulToolResult(results[call.ID]) {
+				continue
+			}
+			var receipt struct {
+				Schema     string                         `json:"schema"`
+				NextAction *taskmem.ObservationNextAction `json:"next_action"`
+			}
+			if json.Unmarshal([]byte(results[call.ID]), &receipt) != nil ||
+				receipt.Schema != taskmem.ObservationDeltaSchemaV4 || receipt.NextAction == nil ||
+				receipt.NextAction.Decision != taskmem.ObservationNextMutate ||
+				receipt.NextAction.Mutation == nil {
+				return observationMutationCommitment{}, false
+			}
+			commitment := observationMutationCommitment{Tool: receipt.NextAction.Mutation.Tool,
+				Path: receipt.NextAction.Mutation.Path, Entry: entryIndex}
+			for later := entryIndex + 1; later < len(history); later++ {
+				laterResults := recoveryResultsByCall(history[later])
+				for _, laterCall := range history[later].ToolCalls {
+					if laterCall.Name == commitment.Tool && canonicalCallPath(laterCall) == commitment.Path &&
+						!unsuccessfulToolResult(laterResults[laterCall.ID]) {
+						return observationMutationCommitment{}, false
+					}
+				}
+			}
+			return commitment, true
+		}
+	}
+	return observationMutationCommitment{}, false
+}
+
 func observationCheckpointRegistry(registry *ToolRegistry, task *model.Task, history []HistoryEntry) *ToolRegistry {
 	refs := make([]string, 0, 64)
 	resolvedRefs := make([]string, 0, 64)
@@ -770,72 +928,16 @@ func observationCheckpointRegistry(registry *ToolRegistry, task *model.Task, his
 	sort.Strings(refs)
 	sort.Strings(resolvedRefs)
 	return registry.WithDefinitionParameters("record_observation_delta", func(parameters map[string]any) {
-		properties, ok := parameters["properties"].(map[string]any)
-		if !ok {
-			return
+		fresh := observationcontract.Parameters(observationcontract.SchemaProfile{
+			EvidenceRefs: refs, OpenCandidateRefs: openCandidates,
+			PostPredecessorEvidence: resolvedRefs,
+		})
+		for key := range parameters {
+			delete(parameters, key)
 		}
-		facts, ok := properties["facts"].(map[string]any)
-		if !ok {
-			return
+		for key, value := range fresh {
+			parameters[key] = value
 		}
-		items, ok := facts["items"].(map[string]any)
-		if !ok {
-			return
-		}
-		factProperties, ok := items["properties"].(map[string]any)
-		if !ok {
-			return
-		}
-		evidence, ok := factProperties["evidence_refs"].(map[string]any)
-		if !ok {
-			return
-		}
-		evidenceItems, ok := evidence["items"].(map[string]any)
-		if !ok {
-			return
-		}
-		values := make([]any, len(refs))
-		for i, ref := range refs {
-			values[i] = ref
-		}
-		evidenceItems["enum"] = values
-		evidence["description"] = "只能从本 Invocation schema 提供的 settled evidence enum 中选择"
-		resolved, ok := properties["resolved_candidates"].(map[string]any)
-		if !ok {
-			return
-		}
-		resolvedItems, ok := resolved["items"].(map[string]any)
-		if !ok {
-			return
-		}
-		resolvedProperties, ok := resolvedItems["properties"].(map[string]any)
-		if !ok {
-			return
-		}
-		candidate, ok := resolvedProperties["candidate_ref"].(map[string]any)
-		if !ok {
-			return
-		}
-		candidateValues := make([]any, len(openCandidates))
-		for i, ref := range openCandidates {
-			candidateValues[i] = ref
-		}
-		candidate["enum"] = candidateValues
-		candidate["description"] = "只能关闭上一份 Observation receipt 给出的 open candidate ref；首份状态必须提交空数组"
-		resolvedEvidence, ok := resolvedProperties["evidence_refs"].(map[string]any)
-		if !ok {
-			return
-		}
-		resolvedEvidenceItems, ok := resolvedEvidence["items"].(map[string]any)
-		if !ok {
-			return
-		}
-		resolvedValues := make([]any, len(resolvedRefs))
-		for i, ref := range resolvedRefs {
-			resolvedValues[i] = ref
-		}
-		resolvedEvidenceItems["enum"] = resolvedValues
-		resolvedEvidence["description"] = "只能选择本 Invocation schema 提供、且晚于 predecessor 的 settled evidence；时间顺序由 L3 再校验"
 	})
 }
 
@@ -1035,6 +1137,116 @@ func mechanicalControlHistoryProjection(history []HistoryEntry) []HistoryEntry {
 	return projected
 }
 
+// investigationDeliverableHistoryProjection 为 investigation/v3 的 exact
+// submit 轮保留已结算源码证据，同时去掉 provider-visible 历史 ToolCall。直接用
+// mechanicalControlHistoryProjection 会让 Explorer 在交付时只记得“读过”，却
+// 看不到内容；直接保留 Raw exchange 又会诱发 singleton ToolRouter 粘滞重放。
+func investigationDeliverableHistoryProjection(history []HistoryEntry) []HistoryEntry {
+	const (
+		maxEvidenceBytes          = 8 << 10
+		maxEvidenceRunesPerResult = 1200
+	)
+	var evidence []map[string]any
+	for entryIndex := len(history) - 1; entryIndex >= 0; entryIndex-- {
+		entry := history[entryIndex]
+		results := make(map[string]string, len(entry.ToolResults))
+		for _, result := range entry.ToolResults {
+			results[result.ToolCallID] = result.Content
+		}
+		for callIndex := len(entry.ToolCalls) - 1; callIndex >= 0; callIndex-- {
+			call := entry.ToolCalls[callIndex]
+			content, settled := results[call.ID]
+			if !settled || call.Name == "record_observation_delta" || call.Name == "submit_task_result" {
+				continue
+			}
+			candidate := map[string]any{
+				"tool": call.Name, "arguments": call.Arguments,
+				"result": truncateTaskMemRunes(content, maxEvidenceRunesPerResult),
+			}
+			probe, _ := json.Marshal(append(append([]map[string]any(nil), evidence...), candidate))
+			if len(probe) > maxEvidenceBytes {
+				continue
+			}
+			evidence = append(evidence, candidate)
+		}
+	}
+	encoded, _ := json.Marshal(evidence)
+	projected := []HistoryEntry{{SystemNotice: "<investigation-evidence authority=\"settled-current-task\" order=\"newest-first\">\n" +
+		string(encoded) + "\n</investigation-evidence>"}}
+	projected = append(projected, HistoryEntry{SystemNotice: progressDeliverableRequiredMarker +
+		" 使用上述 settled evidence 填写结构化调查结果；不得继续调用读取工具。"})
+	return projected
+}
+
+// investigationDeliverableHistoryProjectionV4 在相同 8KiB 上限内优先保留源码
+// read/read_content_ref，再保留 grep，最后才是目录/其它结果；每一优先级内部仍按
+// newest-first。真实十轮 investigation 证明纯时间倒序会让尾部 grep 挤掉较早的
+// 失败测试和状态所有者正文。v3 继续使用上面的历史投影，禁止静默迁移。
+func investigationDeliverableHistoryProjectionV4(history []HistoryEntry) []HistoryEntry {
+	const (
+		maxEvidenceBytes          = 8 << 10
+		maxEvidenceRunesPerResult = 1200
+	)
+	type candidate struct {
+		priority int
+		recency  int
+		value    map[string]any
+	}
+	candidates := make([]candidate, 0, len(history))
+	recency := 0
+	for entryIndex := len(history) - 1; entryIndex >= 0; entryIndex-- {
+		entry := history[entryIndex]
+		results := make(map[string]string, len(entry.ToolResults))
+		for _, result := range entry.ToolResults {
+			results[result.ToolCallID] = result.Content
+		}
+		for callIndex := len(entry.ToolCalls) - 1; callIndex >= 0; callIndex-- {
+			call := entry.ToolCalls[callIndex]
+			content, settled := results[call.ID]
+			if !settled || call.Name == "record_observation_delta" || call.Name == "submit_task_result" {
+				continue
+			}
+			priority := 3
+			switch call.Name {
+			case "read_file", "read_content_ref":
+				priority = 0
+			case "grep_search":
+				priority = 1
+			case "glob_search", "list_dir":
+				priority = 2
+			}
+			candidates = append(candidates, candidate{
+				priority: priority, recency: recency,
+				value: map[string]any{
+					"tool": call.Name, "arguments": call.Arguments,
+					"result": truncateTaskMemRunes(content, maxEvidenceRunesPerResult),
+				},
+			})
+			recency++
+		}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].priority != candidates[j].priority {
+			return candidates[i].priority < candidates[j].priority
+		}
+		return candidates[i].recency < candidates[j].recency
+	})
+	evidence := make([]map[string]any, 0, len(candidates))
+	for _, item := range candidates {
+		probe, _ := json.Marshal(append(append([]map[string]any(nil), evidence...), item.value))
+		if len(probe) > maxEvidenceBytes {
+			continue
+		}
+		evidence = append(evidence, item.value)
+	}
+	encoded, _ := json.Marshal(evidence)
+	projected := []HistoryEntry{{SystemNotice: "<investigation-evidence authority=\"settled-current-task\" priority=\"read-before-search\" order=\"newest-first-within-priority\">\n" +
+		string(encoded) + "\n</investigation-evidence>"}}
+	projected = append(projected, HistoryEntry{SystemNotice: progressDeliverableRequiredMarker +
+		" 使用上述 settled evidence 填写结构化调查结果；不得继续调用读取工具。"})
+	return projected
+}
+
 // businessHistoryProjection 把 L3 Control Invocation 从正常业务 Responses
 // replay 中移除。Observation 已通过 durable TaskMemory/ObservationRef 注入；
 // 再重放 reasoning=none 的 exact tool item 会把业务 thinking 链与控制链混接。
@@ -1084,10 +1296,13 @@ func successfulObservationRef(entry HistoryEntry) string {
 
 // unsuccessfulToolResult 兼容历史已持久的半角/全角中文冒号。
 // skipped call 只是为 provider call_id 补齐 replay output，不得驱动阶段迁移。
+func skippedToolResult(content string) bool {
+	return strings.HasPrefix(content, "已跳过:") || strings.HasPrefix(content, "已跳过：")
+}
+
 func unsuccessfulToolResult(content string) bool {
 	return content == "" || strings.HasPrefix(content, "错误:") ||
-		strings.HasPrefix(content, "错误：") ||
-		strings.HasPrefix(content, "已跳过:") || strings.HasPrefix(content, "已跳过：")
+		strings.HasPrefix(content, "错误：") || skippedToolResult(content)
 }
 
 type graphAuthoringStage string
@@ -1189,6 +1404,47 @@ func validateToolCallBatch(router ToolRouterSnapshot, calls []llm.ToolCall) erro
 	}
 	if missing := router.Registry.Missing(names); len(missing) > 0 {
 		return &actionContractViolation{detail: fmt.Sprintf("tool call batch 含 phase=%s 未授权工具 %v", router.Phase, missing)}
+	}
+	return nil
+}
+
+// validateRecoveryActionCall 对 provider 顺序中的首个、实际待 dispatch 调用
+// 执行冻结参数校验。model-visible JSON schema 只用于引导，provider 可能忽略
+// const；L3 必须在工具产生读取/修改副作用前独立 fail-closed。
+func validateRecoveryActionCall(gate recoveryActionGate, calls []llm.ToolCall) error {
+	if len(calls) == 0 {
+		return nil
+	}
+	call := calls[0]
+	if call.Name != gate.Tool {
+		return &actionContractViolation{detail: fmt.Sprintf(
+			"Recovery gate stage=%s 要求 tool=%s，实际=%s", gate.Stage, gate.Tool, call.Name)}
+	}
+	if gate.Path != "" && canonicalCallPath(call) != gate.Path {
+		return &actionContractViolation{detail: fmt.Sprintf(
+			"Recovery gate stage=%s 要求 path=%q", gate.Stage, gate.Path)}
+	}
+	if gate.CheckID != "" && strings.TrimSpace(fmt.Sprint(call.Arguments["check_id"])) != gate.CheckID {
+		return &actionContractViolation{detail: fmt.Sprintf(
+			"Recovery gate stage=%s 要求 check_id=%q", gate.Stage, gate.CheckID)}
+	}
+	if gate.RefID != "" && strings.TrimSpace(fmt.Sprint(call.Arguments["ref_id"])) != gate.RefID {
+		return &actionContractViolation{detail: fmt.Sprintf(
+			"Recovery gate stage=%s 要求 ref_id=%q", gate.Stage, gate.RefID)}
+	}
+	if gate.Limit > 0 {
+		if int64(recoveryIntArgument(call.Arguments["offset"], -1)) != gate.Offset ||
+			int64(recoveryIntArgument(call.Arguments["limit"], -1)) != gate.Limit {
+			return &actionContractViolation{detail: fmt.Sprintf(
+				"Recovery gate stage=%s 要求 offset=%d limit=%d", gate.Stage, gate.Offset, gate.Limit)}
+		}
+	}
+	if gate.ForceFull {
+		value, ok := call.Arguments["force_full"].(bool)
+		if !ok || !value {
+			return &actionContractViolation{detail: fmt.Sprintf(
+				"Recovery gate stage=%s 要求 force_full=true", gate.Stage)}
+		}
 	}
 	return nil
 }

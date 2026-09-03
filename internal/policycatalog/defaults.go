@@ -419,8 +419,19 @@ func defaultProgressProfiles() ([]ProgressProfile, error) {
 		progressCodeChangeV4(),
 		progressCodeChangeV5(),
 		progressCodeChangeV6(),
+		progressCodeChangeV7(),
+		progressCodeChangeV8(),
+		progressCodeChangeV9(),
+		progressCodeChangeV10(),
+		progressCodeChangeV11(),
+		progressCodeChangeV12(),
 		progressInvestigation(),
 		progressInvestigationV2(),
+		progressInvestigationV3(),
+		progressInvestigationV4(),
+		progressInvestigationV5(),
+		progressInvestigationV6(),
+		progressInvestigationV7(),
 		progressVerification(),
 		progressVerificationV2(),
 		progressVerificationV3(),
@@ -537,6 +548,75 @@ func progressCodeChangeV6() loopcontract.CompiledProgressContract {
 	return contract
 }
 
+func progressCodeChangeV7() loopcontract.CompiledProgressContract {
+	contract := progressCodeChangeV6()
+	contract.Ref = loopcontract.ProgressContractRef{
+		ContractID: ProgressCodeChangeV7, PolicyRef: "bounded_code_change/v7",
+	}
+	contract.Policy.PolicyRef = "bounded_code_change/v7"
+	// 周期性 Observation 是压缩/进展辅助，不是副作用或终态 authority。
+	// 连续无效时沿既有 abandoned 路径保留 Raw History 并恢复业务；真正的
+	// rollover/intervention/terminal checkpoint 仍由 Agent 主循环 fail-closed。
+	contract.Policy.MaxControlContractFailures = 0
+	return contract
+}
+
+func progressCodeChangeV8() loopcontract.CompiledProgressContract {
+	contract := progressCodeChangeV7()
+	contract.Ref = loopcontract.ProgressContractRef{
+		ContractID: ProgressCodeChangeV8, PolicyRef: "bounded_code_change/v8",
+	}
+	contract.Policy.PolicyRef = "bounded_code_change/v8"
+	return contract
+}
+
+func progressCodeChangeV9() loopcontract.CompiledProgressContract {
+	contract := progressCodeChangeV8()
+	contract.Ref = loopcontract.ProgressContractRef{
+		ContractID: ProgressCodeChangeV9, PolicyRef: "bounded_code_change/v9",
+	}
+	contract.Policy.PolicyRef = "bounded_code_change/v9"
+	return contract
+}
+
+func progressCodeChangeV10() loopcontract.CompiledProgressContract {
+	contract := progressCodeChangeV9()
+	contract.Ref = loopcontract.ProgressContractRef{
+		ContractID: ProgressCodeChangeV10, PolicyRef: "bounded_code_change/v10",
+	}
+	contract.Policy.PolicyRef = "bounded_code_change/v10"
+	contract.Policy.DecisionCheckpointAfterTurns = 4
+	contract.Policy.MaxDecisionStagnation = 1
+	contract.Policy.MaxExplorationTurns = 6
+	for index := range contract.AcceptedSignals {
+		if contract.AcceptedSignals[index].Kind == loopcontract.SignalResultFieldSet {
+			contract.AcceptedSignals[index].IdentityScope = "**"
+		}
+	}
+	return contract
+}
+
+func progressCodeChangeV11() loopcontract.CompiledProgressContract {
+	contract := progressCodeChangeV10()
+	contract.Ref = loopcontract.ProgressContractRef{
+		ContractID: ProgressCodeChangeV11, PolicyRef: "bounded_code_change/v11",
+	}
+	contract.Policy.PolicyRef = "bounded_code_change/v11"
+	contract.Policy.DecisionCheckpointAfterTurns = 2
+	contract.Policy.CandidateRepairHandoffReserve = 3 * time.Minute
+	return contract
+}
+
+func progressCodeChangeV12() loopcontract.CompiledProgressContract {
+	contract := progressCodeChangeV11()
+	contract.Ref = loopcontract.ProgressContractRef{
+		ContractID: ProgressCodeChangeV12, PolicyRef: "bounded_code_change/v12",
+	}
+	contract.Policy.PolicyRef = "bounded_code_change/v12"
+	contract.Policy.DecisionCheckpointAfterTurns = 1
+	return contract
+}
+
 func progressInvestigation() loopcontract.CompiledProgressContract {
 	return loopcontract.CompiledProgressContract{
 		Schema: loopcontract.CompiledSchemaV1,
@@ -573,6 +653,74 @@ func progressInvestigationV2() loopcontract.CompiledProgressContract {
 		loopcontract.ProgressSignalRule{Kind: loopcontract.SignalObservationStateAdvanced, IdentityScope: "**"})
 	contract.Policy.MaxNoProgressUsage.PromptTokens = 0
 	contract.Policy.MaxNoProgressUsage.CompletionTokens = 0
+	return contract
+}
+
+func progressInvestigationV3() loopcontract.CompiledProgressContract {
+	contract := progressInvestigationV2()
+	contract.Ref = loopcontract.ProgressContractRef{
+		ContractID: ProgressInvestigationV3, PolicyRef: "bounded_investigation/v3",
+	}
+	contract.Policy.PolicyRef = "bounded_investigation/v3"
+	// Explorer 的唯一交付是结构化 investigation result。真实 mixed-model
+	// trace 证明 v2 的 unlimited novel evidence 可占满 execution window；v3
+	// 在有界探索后进入既有 exact submit phase，把实现预算留给 Worker。
+	contract.Policy.MaxExplorationTurns = 6
+	contract.Policy.KnowledgeCheckpointAfterTurns = 0
+	contract.Policy.MaxObservationStagnation = 0
+	for index := range contract.AcceptedSignals {
+		switch contract.AcceptedSignals[index].Kind {
+		case loopcontract.SignalNovelEvidence, loopcontract.SignalConfirmedFactAdded,
+			loopcontract.SignalObservationStateAdvanced:
+			contract.AcceptedSignals[index].Deliverable = false
+		case loopcontract.SignalResultFieldSet:
+			contract.AcceptedSignals[index].Deliverable = true
+		}
+	}
+	return contract
+}
+
+func progressInvestigationV4() loopcontract.CompiledProgressContract {
+	contract := progressInvestigationV3()
+	contract.Ref = loopcontract.ProgressContractRef{
+		ContractID: ProgressInvestigationV4, PolicyRef: "bounded_investigation/v4",
+	}
+	contract.Policy.PolicyRef = "bounded_investigation/v4"
+	// simple-task/v4 要求首失败、公开入口、状态所有者、内部 consumer 真实范围。
+	// 六轮实测只能完成叶子容器假设；十轮仍是机械硬上限，避免回到 v2 的无界浏览。
+	contract.Policy.MaxExplorationTurns = 10
+	return contract
+}
+
+func progressInvestigationV5() loopcontract.CompiledProgressContract {
+	contract := progressInvestigationV4()
+	contract.Ref = loopcontract.ProgressContractRef{
+		ContractID: ProgressInvestigationV5, PolicyRef: "bounded_investigation/v5",
+	}
+	contract.Policy.PolicyRef = "bounded_investigation/v5"
+	contract.Policy.MaxExplorationTurns = 8
+	contract.Policy.FirstDeliverableHandoffReserve = 4 * time.Minute
+	return contract
+}
+
+func progressInvestigationV6() loopcontract.CompiledProgressContract {
+	contract := progressInvestigationV5()
+	contract.Ref = loopcontract.ProgressContractRef{
+		ContractID: ProgressInvestigationV6, PolicyRef: "bounded_investigation/v6",
+	}
+	contract.Policy.PolicyRef = "bounded_investigation/v6"
+	contract.Policy.MaxExplorationTurns = 6
+	contract.Policy.FirstDeliverableHandoffReserve = 8 * time.Minute
+	return contract
+}
+
+func progressInvestigationV7() loopcontract.CompiledProgressContract {
+	contract := progressInvestigationV6()
+	contract.Ref = loopcontract.ProgressContractRef{
+		ContractID: ProgressInvestigationV7, PolicyRef: "bounded_investigation/v7",
+	}
+	contract.Policy.PolicyRef = "bounded_investigation/v7"
+	contract.Policy.FirstDeliverableHandoffReserve = 10 * time.Minute
 	return contract
 }
 

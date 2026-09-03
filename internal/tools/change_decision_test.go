@@ -97,6 +97,75 @@ func TestSubmitChangeDecisionHypothesisRejectedFinalizesBlocked(t *testing.T) {
 	}
 }
 
+func TestSubmitChangeDecisionV5ResumeCandidateRequiresDirtyAuthority(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		dirtyPaths []string
+		wantError  bool
+	}{
+		{name: "非空候选", dirtyPaths: []string{"src/a.py"}},
+		{name: "空候选", wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tasks := store.NewMemoryTaskStore(nil, 8, 1, 60)
+			task := &model.Task{ID: "resume-work", Description: "恢复", EventType: "code",
+				GraphNodeKind: string(graph.KindAgent), GraphRecoveryDeltaSchema: graph.RecoveryDeltaSchemaV5,
+				ContextInputs: []model.TaskContextInput{{Kind: model.TaskContextUpstreamResult,
+					SourceRef: "graph-result:recovery@1", Content: recoveryV5InputForToolTest([]string{"src/a.py"}, test.dirtyPaths)}},
+			}
+			if err := tasks.PublishTask(task); err != nil {
+				t.Fatal(err)
+			}
+			if err := tasks.ClaimTask("worker", task.ID); err != nil {
+				t.Fatal(err)
+			}
+			registry := agent.NewToolRegistry()
+			PlanControlGroup{Store: tasks, Holder: &fakeHolder{id: task.ID}, AgentID: "worker",
+				FinalizationNotifier: &fakeFinalizationNotifier{}, SubmitState: agent.NewSubmitState()}.Register(registry)
+			result, err := registry.Dispatch(context.Background(), llm.ToolCall{Name: "submit_change_decision", Arguments: map[string]any{
+				"decision": "resume_candidate", "summary": "继续验证已有候选",
+			}})
+			if test.wantError {
+				if err == nil || !strings.Contains(err.Error(), "非空 dirty candidate") {
+					t.Fatalf("空 candidate 必须拒绝 resume: result=%s err=%v", result, err)
+				}
+				return
+			}
+			if err != nil || !strings.Contains(result, `"schema":"agentgo.change-decision/v2"`) ||
+				!strings.Contains(result, `"decision":"resume_candidate"`) {
+				t.Fatalf("v5 resume receipt 非法: result=%s err=%v", result, err)
+			}
+		})
+	}
+}
+
+func TestSubmitChangeDecisionV5RejectsUnreadEditTarget(t *testing.T) {
+	tasks := store.NewMemoryTaskStore(nil, 8, 1, 60)
+	task := &model.Task{ID: "focus-work", Description: "恢复", EventType: "code",
+		GraphNodeKind: string(graph.KindAgent), GraphRecoveryDeltaSchema: graph.RecoveryDeltaSchemaV5,
+		ContextInputs: []model.TaskContextInput{{Kind: model.TaskContextUpstreamResult,
+			SourceRef: "graph-result:recovery@1", Content: recoveryV5InputForToolTest([]string{"src/a.py"}, nil)}},
+	}
+	if err := tasks.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks.ClaimTask("worker", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	registry := agent.NewToolRegistry()
+	PlanControlGroup{Store: tasks, Holder: &fakeHolder{id: task.ID}, AgentID: "worker",
+		FinalizationNotifier: &fakeFinalizationNotifier{}, SubmitState: agent.NewSubmitState()}.Register(registry)
+	_, err := registry.Dispatch(context.Background(), llm.ToolCall{Name: "submit_change_decision", Arguments: map[string]any{
+		"decision": "edit", "summary": "修改两个文件", "edit_steps": []any{
+			map[string]any{"tool": "edit_file", "path": "src/a.py"},
+			map[string]any{"tool": "edit_file", "path": "src/b.py"},
+		},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "decision=need_context") || !strings.Contains(err.Error(), "src/b.py") {
+		t.Fatalf("v5 未读 edit target 必须在冻结 plan 前拒绝: %v", err)
+	}
+}
+
 func recoveryV4InputForToolTest(files []string) string {
 	payload, _ := json.Marshal(map[string]any{
 		"target_input": "recovery_directive",
@@ -104,6 +173,22 @@ func recoveryV4InputForToolTest(files []string) string {
 			"schema":            graph.RecoveryDeltaSchemaV4,
 			"first_action":      map[string]any{"tool": "read_file", "path": files[0]},
 			"evidence_contract": map[string]any{"files": files},
+		},
+	})
+	return `<upstream-result authority="graph-dataflow">` + string(payload) + `</upstream-result>`
+}
+
+func recoveryV5InputForToolTest(files, dirtyPaths []string) string {
+	payload, _ := json.Marshal(map[string]any{
+		"target_input": "recovery_directive",
+		"result": map[string]any{
+			"schema":            graph.RecoveryDeltaSchemaV5,
+			"first_action":      map[string]any{"tool": "read_file", "path": files[0]},
+			"evidence_contract": map[string]any{"files": files},
+			"candidate_state": map[string]any{
+				"schema": graph.RecoveryCandidateStateSchemaV1, "source_activation_id": "work@1",
+				"delivery_id": "delivery:test", "dirty_paths": dirtyPaths,
+			},
 		},
 	})
 	return `<upstream-result authority="graph-dataflow">` + string(payload) + `</upstream-result>`

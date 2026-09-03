@@ -1218,6 +1218,9 @@ func formatEventDetails(ev Event) string {
 			if gate.CheckID != "" {
 				parts = append(parts, fmt.Sprintf("check_id=%s", gate.CheckID))
 			}
+			if gate.ForceFull {
+				parts = append(parts, "force_full=true")
+			}
 			if gate.RefID != "" {
 				parts = append(parts, fmt.Sprintf("ref_id=%s offset=%d limit=%d", gate.RefID, gate.Offset, gate.Limit))
 			}

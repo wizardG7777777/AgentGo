@@ -118,3 +118,24 @@ func TestObservationV3RejectsModelClaimWithoutInferredAuthority(t *testing.T) {
 		t.Fatalf("Observation v3 必须由 framework 标记 inferred: %v", err)
 	}
 }
+
+func TestObservationV4RequiresTypedNextAction(t *testing.T) {
+	delta := ObservationDelta{
+		Schema: ObservationDeltaSchemaV4, TaskID: "task-v4", AttemptID: "attempt-1",
+		Phase: ObservationPhaseInvestigate, WorkspaceRevisionRef: "workspace:empty",
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := delta.Validate(); err == nil || !strings.Contains(err.Error(), "next_action") {
+		t.Fatalf("Observation v4 缺少 typed next_action 必须拒绝: %v", err)
+	}
+	delta.NextAction = &ObservationNextAction{Decision: ObservationNextMutate,
+		Mutation: &ObservationMutation{Tool: "edit_file", Path: "src/flask/sessions.py"}}
+	if err := delta.Validate(); err != nil {
+		t.Fatalf("Observation v4 合法 mutation commitment 被拒绝: %v", err)
+	}
+	delta.NextAction = &ObservationNextAction{Decision: ObservationNextContinue,
+		Mutation: &ObservationMutation{Tool: "edit_file", Path: "src/flask/sessions.py"}}
+	if err := delta.Validate(); err == nil {
+		t.Fatal("Observation v4 非 mutate 决策不得携带 mutation")
+	}
+}

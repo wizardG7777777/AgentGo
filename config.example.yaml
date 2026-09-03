@@ -127,6 +127,7 @@ agents:
     profile: worker_standard       # 引用 tool_profiles 中的白名单
     # 或直接用 tools: [read_file, write_file, ...]  二选一
     model: gpt-4o                  # 覆盖 llm.default_model
+    # observation_model: gpt-4o-mini # 可选；省略继承 model，仅独立 Observation control 使用
     system_prompt_file: prompts/worker.md
     task_max_retries: 3
     # description 给 scheduler 看的一句话角色说明，影响任务派发选择

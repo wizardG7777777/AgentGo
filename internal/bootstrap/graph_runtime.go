@@ -1749,6 +1749,7 @@ func wireGraphRuntimeWithOutcome(cfg *config.Config, taskStore store.TaskStore, 
 	var outcomeAuthority *graphTaskOutcomeAuthority
 	if outcomes != nil {
 		outcomeAuthority = newGraphTaskOutcomeAuthority(gs, outcomes, checkpoints)
+		outcomeAuthority.projectRoot = cfg.ProjectRoot
 		if authorities != nil {
 			outcomeAuthority.candidates = authorities.workspaces
 			outcomeAuthority.deliveries = authorities.deliveries

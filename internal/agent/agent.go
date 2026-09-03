@@ -15,6 +15,7 @@ import (
 
 	"agentgo/internal/contentstore"
 	"agentgo/internal/contextcontract"
+	"agentgo/internal/controlcapability"
 	"agentgo/internal/effect"
 	"agentgo/internal/hook"
 	"agentgo/internal/invocation"
@@ -138,10 +139,14 @@ type Agent struct {
 	// Model 是该 Agent 当前生效的模型名，用于 HistoryEntry.Model 记录。
 	// nextUpgrade_v4.md §11.7.3：跨模型实测值不可比，压缩阈值估算
 	// 仅锚定当前模型一致的最近一条 PromptTokens > 0 条目。空串时退化为粗略估算。
-	Model                    string
-	ModelContextWindowTokens int64
-	ModelMaxCompletionTokens int64
-	ModelCapabilityDigest    string
+	Model                               string
+	ModelContextWindowTokens            int64
+	ModelMaxCompletionTokens            int64
+	ModelCapabilityDigest               string
+	ObservationModel                    string
+	ObservationModelContextWindowTokens int64
+	ObservationModelMaxCompletionTokens int64
+	ObservationModelCapabilityDigest    string
 	// TokenStats 是 Agent 级别的累计 Token 消耗（§11.7.3），仅作 UI 实时视图
 	// 数据源，不写入 trace 账本。
 	// 运行期读写必须经 AddTokenStats / TokenStatsSnapshot（tokenMu 保护）——
@@ -1428,6 +1433,20 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			}
 			taskMem.applySettledTurn(a, taskID, result, i)
 			if !observationCheckpointSucceeded(result) || taskMem.observationRef(task.AttemptID) == "" {
+				var incompatible *controlcapability.IncompatibleError
+				if errors.As(execErr, &incompatible) {
+					if observationAction == "periodic" {
+						history = append(history, HistoryEntry{SystemNotice: observationCheckpointAbandonedMarker +
+							" 当前 Run 已确认该 effective model/profile/schema 不兼容；保留 Raw History 并跳过 provider 调用。"})
+						a.saveHistory(task, history)
+						continue
+					}
+					a.saveHistory(task, history)
+					reason := "model_contract_incompatible: " + incompatible.Error()
+					enterTerminating("react_loop_exit:model_contract_incompatible")
+					a.blockForLoopControl(task, taskID, reason, "model_contract_incompatible")
+					return
+				}
 				checkpointFailureReason := "observation_submission_invalid"
 				if !result.ProviderCallStarted {
 					checkpointFailureReason = "control_invocation_preflight_failed"
@@ -1467,6 +1486,14 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 						" 周期性 Observation 两次失败；保留原始历史并恢复业务阶段，下一知识 turn 再尝试。"})
 					a.saveHistory(task, history)
 					continue
+				}
+				if !usesDurableControlFailures && observationAction == "decision_periodic" {
+					a.saveHistory(task, history)
+					reason := "decision_progress_stalled: decision checkpoint Observation 连续失败"
+					terminatingCause = "react_loop_exit:decision_checkpoint_unavailable"
+					enterTerminating(terminatingCause)
+					a.blockForLoopControl(task, taskID, reason, "decision_progress_stalled")
+					return
 				}
 				a.saveHistory(task, history)
 				reason := "control_contract_unstable: Observation control contract 连续失败"
@@ -1608,6 +1635,9 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			case policyDecision.ObservationAction == "decision_stalled":
 				cause = "decision_progress_stalled"
 				reasonPrefix = "decision_progress_stalled"
+			case policyDecision.ObservationAction == "candidate_handoff":
+				cause = "candidate_completion_handoff"
+				reasonPrefix = "candidate_completion_handoff"
 			case policyDecision.ObservationAction == "observation_stalled":
 				cause = "observation_state_stalled"
 				reasonPrefix = "observation_state_stalled"

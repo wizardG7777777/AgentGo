@@ -164,16 +164,24 @@ type CapabilitySnapshot struct {
 // 与 CapabilitySnapshot 同策略——session 不 import model/store，快照边界
 // 拥有自己的 DTO，由 store 在导出/导入时做显式转换。
 type LeaseSnapshot struct {
-	Attempt          int      `json:"attempt,omitempty"`
-	FrozenAt         string   `json:"frozen_at,omitempty"`
-	BusinessTools    []string `json:"business_tools,omitempty"`
-	ControlTools     []string `json:"control_tools,omitempty"`
-	Model            string   `json:"model,omitempty"`
-	Workspace        string   `json:"workspace,omitempty"`
-	Synthetic        bool     `json:"synthetic,omitempty"`
-	ApprovalRequired bool     `json:"approval_required,omitempty"`
-	Revoked          bool     `json:"revoked,omitempty"`
-	Digest           string   `json:"digest,omitempty"`
+	Schema                              string   `json:"schema,omitempty"`
+	Attempt                             int      `json:"attempt,omitempty"`
+	FrozenAt                            string   `json:"frozen_at,omitempty"`
+	BusinessTools                       []string `json:"business_tools,omitempty"`
+	ControlTools                        []string `json:"control_tools,omitempty"`
+	Model                               string   `json:"model,omitempty"`
+	ModelContextWindowTokens            int64    `json:"model_context_window_tokens,omitempty"`
+	ModelMaxCompletionTokens            int64    `json:"model_max_completion_tokens,omitempty"`
+	ModelCapabilityDigest               string   `json:"model_capability_digest,omitempty"`
+	ObservationModel                    string   `json:"observation_model,omitempty"`
+	ObservationModelContextWindowTokens int64    `json:"observation_model_context_window_tokens,omitempty"`
+	ObservationModelMaxCompletionTokens int64    `json:"observation_model_max_completion_tokens,omitempty"`
+	ObservationModelCapabilityDigest    string   `json:"observation_model_capability_digest,omitempty"`
+	Workspace                           string   `json:"workspace,omitempty"`
+	Synthetic                           bool     `json:"synthetic,omitempty"`
+	ApprovalRequired                    bool     `json:"approval_required,omitempty"`
+	Revoked                             bool     `json:"revoked,omitempty"`
+	Digest                              string   `json:"digest,omitempty"`
 }
 
 // ToolCallSnapshot is the serialization-only form of store.ToolCallRecord.

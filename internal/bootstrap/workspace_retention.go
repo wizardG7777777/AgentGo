@@ -20,7 +20,7 @@ func newGraphWorkspaceRetentionResolver(graphs graphDocumentStore) watchdog.Work
 			return true, false
 		}
 		doc, ok := graphs.Get(record.Owner.GraphID)
-		if !ok || doc == nil || doc.Schema != graph.SchemaV3 ||
+		if !ok || doc == nil || !graph.UsesDeliveryTransaction(doc.Schema) ||
 			string(doc.RunID) != record.Owner.RunID || doc.GraphID != record.Owner.GraphID {
 			return true, false
 		}

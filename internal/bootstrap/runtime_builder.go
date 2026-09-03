@@ -111,6 +111,14 @@ func buildAgentRuntime(
 	if err != nil {
 		return config.AgentRuntimeConfig{}, fmt.Errorf("kind=%q 模型能力档案无效: %w", kind.Kind, err)
 	}
+	observationModel := kind.ObservationModel
+	if observationModel == "" {
+		observationModel = model
+	}
+	observationCapability, err := llmCfg.ResolveModelCapability(observationModel)
+	if err != nil {
+		return config.AgentRuntimeConfig{}, fmt.Errorf("kind=%q observation_model 能力档案无效: %w", kind.Kind, err)
+	}
 
 	// 构建团队能力感知提示词：列出系统中所有 Agent 类型及其能力边界
 	teamAwareness, err := buildTeamAwareness(kind, allKinds, toolProfiles)
@@ -119,18 +127,22 @@ func buildAgentRuntime(
 	}
 
 	rt := config.AgentRuntimeConfig{
-		InstanceID:               fmt.Sprintf("%s-%d", kind.Kind, replicaIndex),
-		Kind:                     kind.Kind,
-		EventType:                kind.EventType,
-		AllowedTools:             allowed,
-		Model:                    model,
-		ModelContextWindowTokens: capability.ContextWindowTokens,
-		ModelMaxCompletionTokens: capability.MaxCompletionTokens,
-		ModelCapabilityDigest:    capability.Digest,
-		SystemPrompt:             string(promptBytes),
-		TaskMaxRetries:           kind.TaskMaxRetries,
-		TeamAwareness:            teamAwareness,
-		IdleThreshold:            idleThreshold,
+		InstanceID:                          fmt.Sprintf("%s-%d", kind.Kind, replicaIndex),
+		Kind:                                kind.Kind,
+		EventType:                           kind.EventType,
+		AllowedTools:                        allowed,
+		Model:                               model,
+		ObservationModel:                    observationModel,
+		ObservationModelContextWindowTokens: observationCapability.ContextWindowTokens,
+		ObservationModelMaxCompletionTokens: observationCapability.MaxCompletionTokens,
+		ObservationModelCapabilityDigest:    observationCapability.Digest,
+		ModelContextWindowTokens:            capability.ContextWindowTokens,
+		ModelMaxCompletionTokens:            capability.MaxCompletionTokens,
+		ModelCapabilityDigest:               capability.Digest,
+		SystemPrompt:                        string(promptBytes),
+		TaskMaxRetries:                      kind.TaskMaxRetries,
+		TeamAwareness:                       teamAwareness,
+		IdleThreshold:                       idleThreshold,
 	}
 	return rt, nil
 }
@@ -228,12 +240,16 @@ func buildSchedulerRuntime(sched config.SchedulerKind, llmCfg config.LLMConfig) 
 	}
 	capability, _ := llmCfg.ResolveModelCapability(model)
 	return config.AgentRuntimeConfig{
-		InstanceID:               "scheduler",
-		Kind:                     "scheduler",
-		Model:                    model,
-		ModelContextWindowTokens: capability.ContextWindowTokens,
-		ModelMaxCompletionTokens: capability.MaxCompletionTokens,
-		ModelCapabilityDigest:    capability.Digest,
+		InstanceID:                          "scheduler",
+		Kind:                                "scheduler",
+		Model:                               model,
+		ModelContextWindowTokens:            capability.ContextWindowTokens,
+		ModelMaxCompletionTokens:            capability.MaxCompletionTokens,
+		ModelCapabilityDigest:               capability.Digest,
+		ObservationModel:                    model,
+		ObservationModelContextWindowTokens: capability.ContextWindowTokens,
+		ObservationModelMaxCompletionTokens: capability.MaxCompletionTokens,
+		ObservationModelCapabilityDigest:    capability.Digest,
 		// AllowedTools / SystemPrompt 仍由 internal/scheduler 内部决定。
 	}
 }

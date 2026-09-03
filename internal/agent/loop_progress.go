@@ -882,7 +882,7 @@ func projectExecuteResult(a *Agent, task *model.Task, result ExecuteResult, delt
 				})
 				continue
 			}
-			if task.ProgressContract != nil && task.ProgressContract.Ref.ContractID == policycatalog.ProgressCodeChangeV6 &&
+			if task.ProgressContract != nil && usesDecisionAwareCodeChange(task.ProgressContract.Ref.ContractID) &&
 				(receipt.WorkspaceRevisionRef == "" || receipt.WorkspaceRevisionRef == "workspace:empty") {
 				// code-change 的 pre-mutation check 只建立红/绿基线。换命令、跑
 				// 无关通过用例不能代替 mutation，也不能重置 decision stagnation。
@@ -947,6 +947,16 @@ func taskAcceptsVerificationCheckID(task *model.Task, checkID string) bool {
 	return false
 }
 
+func usesDecisionAwareCodeChange(contractID string) bool {
+	return contractID == policycatalog.ProgressCodeChangeV6 ||
+		contractID == policycatalog.ProgressCodeChangeV7 ||
+		contractID == policycatalog.ProgressCodeChangeV8 ||
+		contractID == policycatalog.ProgressCodeChangeV9 ||
+		contractID == policycatalog.ProgressCodeChangeV10 ||
+		contractID == policycatalog.ProgressCodeChangeV11 ||
+		contractID == policycatalog.ProgressCodeChangeV12
+}
+
 func historyEntryFromResult(result ExecuteResult, modelName, turnID string) HistoryEntry {
 	return HistoryEntry{
 		TurnID: turnID, Output: result.Output, ToolCalled: result.ToolCalled,
@@ -965,13 +975,30 @@ func decideProgressPolicy(contract loopcontract.CompiledProgressContract, task *
 		usageAtLimit(checkpoint.NoProgressUsage, policy.MaxNoProgressUsage)
 	explorationLimitReached := policy.MaxExplorationTurns > 0 &&
 		checkpoint.ExplorationTurnsSinceDeliverable > policy.MaxExplorationTurns
-	firstDeliverableHandoffReached := contract.Ref.ContractID == policycatalog.ProgressCodeChangeV6 &&
+	if (contract.Ref.ContractID == policycatalog.ProgressInvestigationV5 ||
+		contract.Ref.ContractID == policycatalog.ProgressInvestigationV6 ||
+		contract.Ref.ContractID == policycatalog.ProgressInvestigationV7) && policy.MaxExplorationTurns > 0 {
+		explorationLimitReached = checkpoint.ExplorationTurnsSinceDeliverable >= policy.MaxExplorationTurns
+	}
+	firstDeliverableHandoffReached := usesDecisionAwareCodeChange(contract.Ref.ContractID) &&
 		policy.FirstDeliverableHandoffReserve > 0 && !checkpoint.Deadlines.Attempt.HardDeadlineAt.IsZero() &&
 		!checkpoint.UpdatedAt.IsZero() && !checkpoint.LastDeliverableProgressAt.IsZero() &&
 		checkpoint.Deadlines.Attempt.HardDeadlineAt.Sub(checkpoint.LastDeliverableProgressAt) >
 			policy.FirstDeliverableHandoffReserve &&
 		!checkpoint.UpdatedAt.Add(policy.FirstDeliverableHandoffReserve).Before(checkpoint.Deadlines.Attempt.HardDeadlineAt) &&
 		!hasRecentDeliverableProgress(contract, *checkpoint)
+	candidateRepairHandoffReached := (contract.Ref.ContractID == policycatalog.ProgressCodeChangeV11 ||
+		contract.Ref.ContractID == policycatalog.ProgressCodeChangeV12) &&
+		policy.CandidateRepairHandoffReserve > 0 && !checkpoint.Deadlines.Attempt.HardDeadlineAt.IsZero() &&
+		!checkpoint.UpdatedAt.IsZero() && hasWorkspaceMutationProgress(*checkpoint) &&
+		!hasVerificationPassAfterLatestDeliverable(contract, *checkpoint) &&
+		!checkpoint.UpdatedAt.Add(policy.CandidateRepairHandoffReserve).Before(checkpoint.Deadlines.Attempt.HardDeadlineAt)
+	investigationDeliverableHandoffReached := (contract.Ref.ContractID == policycatalog.ProgressInvestigationV5 ||
+		contract.Ref.ContractID == policycatalog.ProgressInvestigationV6 ||
+		contract.Ref.ContractID == policycatalog.ProgressInvestigationV7) &&
+		policy.FirstDeliverableHandoffReserve > 0 && !checkpoint.Deadlines.Attempt.HardDeadlineAt.IsZero() &&
+		!checkpoint.UpdatedAt.IsZero() &&
+		!checkpoint.UpdatedAt.Add(policy.FirstDeliverableHandoffReserve).Before(checkpoint.Deadlines.Attempt.HardDeadlineAt)
 	if contract.WorkClass == loopcontract.WorkFinalization && policy.MaxExplorationTurns > 0 {
 		// final-report 的“最多两个补读 turn”是硬上限：第二个新证据 settled
 		// 后，下一 Invocation 立即进入 exact report_done。code-change/v4 仍按
@@ -981,11 +1008,16 @@ func decideProgressPolicy(contract loopcontract.CompiledProgressContract, task *
 	decision := loopPolicyDecision{}
 	var reason loopcontract.InterventionReason
 	switch {
-	case contract.Ref.ContractID == policycatalog.ProgressCodeChangeV6 &&
+	case usesDecisionAwareCodeChange(contract.Ref.ContractID) &&
 		hasVerificationPassAfterLatestDeliverable(contract, *checkpoint):
 		checkpoint.InterventionStage = loopcontract.StageReminder
 		decision.Reminder = progressDeliverableRequiredMarker + " " +
 			renderProgressReminder(contract, *checkpoint, "deliverable_required_after_verification")
+	case candidateRepairHandoffReached:
+		checkpoint.InterventionStage = loopcontract.StageInterventionRequired
+		decision.Intervention = true
+		decision.ObservationAction = "candidate_handoff"
+		reason = loopcontract.InterventionCandidateHandoff
 	case policy.MaxDecisionStagnation > 0 &&
 		checkpoint.DecisionStagnationCount >= policy.MaxDecisionStagnation:
 		checkpoint.InterventionStage = loopcontract.StageInterventionRequired
@@ -1010,6 +1042,10 @@ func decideProgressPolicy(contract loopcontract.CompiledProgressContract, task *
 		decision.Intervention = true
 		decision.ObservationAction = "decision_stalled"
 		reason = loopcontract.InterventionDecisionStalled
+	case investigationDeliverableHandoffReached:
+		checkpoint.InterventionStage = loopcontract.StageReminder
+		decision.Reminder = progressDeliverableRequiredMarker + " " +
+			renderProgressReminder(contract, *checkpoint, "investigation_deadline_handoff")
 	case exhausted:
 		if taskUsesObservationCheckpoint(task) && checkpoint.ObservationDeltaRef == "" {
 			checkpoint.InterventionStage = loopcontract.StageReminder
@@ -1022,7 +1058,7 @@ func decideProgressPolicy(contract loopcontract.CompiledProgressContract, task *
 		decision.Blocked = true
 		decision.Intervention = true
 		reason = loopcontract.InterventionNoProgressBudget
-	case contract.Ref.ContractID == policycatalog.ProgressCodeChangeV6 && explorationLimitReached &&
+	case usesDecisionAwareCodeChange(contract.Ref.ContractID) && explorationLimitReached &&
 		!hasRecentDeliverableProgress(contract, *checkpoint):
 		if taskUsesObservationCheckpoint(task) && checkpoint.ObservationDeltaRef == "" {
 			checkpoint.InterventionStage = loopcontract.StageReminder
@@ -1039,7 +1075,11 @@ func decideProgressPolicy(contract loopcontract.CompiledProgressContract, task *
 		checkpoint.TurnsSinceDecisionCheckpoint >= policy.DecisionCheckpointAfterTurns:
 		checkpoint.InterventionStage = loopcontract.StageRunning
 		decision.ObservationAction = "periodic"
-		decision.Reminder = observationCheckpointNotice("periodic",
+		if contract.Ref.ContractID == policycatalog.ProgressCodeChangeV11 ||
+			contract.Ref.ContractID == policycatalog.ProgressCodeChangeV12 {
+			decision.ObservationAction = "decision_periodic"
+		}
+		decision.Reminder = observationCheckpointNotice(decision.ObservationAction,
 			fmt.Sprintf("已累计 %d 个可评价业务 turn；冻结 decision state 后继续或介入。",
 				checkpoint.TurnsSinceDecisionCheckpoint))
 	case policy.KnowledgeCheckpointAfterTurns > 0 &&
@@ -1141,6 +1181,17 @@ func hasRecentDeliverableProgress(contract loopcontract.CompiledProgressContract
 	}
 	for _, fingerprint := range checkpoint.RecentFingerprints {
 		if _, ok := deliverableKinds[fingerprint.Kind]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func hasWorkspaceMutationProgress(checkpoint loopcontract.ProgressCheckpoint) bool {
+	for _, fingerprint := range checkpoint.RecentFingerprints {
+		if fingerprint.Kind == loopcontract.SignalFileVersionChanged ||
+			fingerprint.Kind == loopcontract.SignalArtifactRegistered ||
+			fingerprint.Kind == loopcontract.SignalArtifactVersionChanged {
 			return true
 		}
 	}
@@ -1340,7 +1391,7 @@ func isCoordinationTool(name string) bool {
 		"start_graph", "start_current_graph",
 		"propose_graph_change", "read_graph_change", "validate_graph_change", "commit_graph_change",
 		"submit_graph_change_decision",
-		"publish_task", "send_message", "request_replan", "submit_task_result", "report_done":
+		"publish_task", "send_message", "request_replan", "submit_change_decision", "submit_task_result", "report_done":
 		return true
 	default:
 		return false

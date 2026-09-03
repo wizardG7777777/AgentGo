@@ -22,6 +22,7 @@ import (
 	"agentgo/internal/checkstore"
 	"agentgo/internal/config"
 	"agentgo/internal/contentstore"
+	"agentgo/internal/controlcapability"
 	"agentgo/internal/effect"
 	"agentgo/internal/gate"
 	"agentgo/internal/interaction"
@@ -74,8 +75,9 @@ type RunnerDeps struct {
 	RunBudgetStore *runbudget.Store
 	// ContentStore 是 L3 ContentRef 权威。生产 bootstrap 始终注入；nil 只供
 	// 不涉及 Context 外置的隔离单测/legacy 构造。
-	ContentStore *contentstore.Store
-	CheckStore   *checkstore.Store
+	ContentStore           *contentstore.Store
+	CheckStore             *checkstore.Store
+	ControlCapabilityStore *controlcapability.Store
 	// ContextRuntime 是 L2 唯一编译/快照 authority。生产必须注入。
 	ContextRuntime agent.ContextRuntime
 	// RouteValidator is the shared runtime route authority. It lets every
@@ -233,6 +235,8 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	// system_prompt_file 内容 sha256 前 12（文件在启动期一次性读入，
 	// 与 rt.SystemPrompt 同字节）。
 	llmExec.SetPromptVersion("file:" + prompt.DigestText(rt.SystemPrompt))
+	llmExec.SetObservationModel(rt.ObservationModel)
+	llmExec.SetControlCapabilityStore(deps.ControlCapabilityStore)
 	llmExec.SetContextRuntime(deps.ContextRuntime)
 	llmExec.SetDurableToolCallRecorder(deps.DurableToolCallRecorder)
 	// finalizing fence：submit_task_result 被接受后，同一响应中排在其后的
@@ -280,6 +284,10 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	a.ModelContextWindowTokens = rt.ModelContextWindowTokens
 	a.ModelMaxCompletionTokens = rt.ModelMaxCompletionTokens
 	a.ModelCapabilityDigest = rt.ModelCapabilityDigest
+	a.ObservationModel = rt.ObservationModel
+	a.ObservationModelContextWindowTokens = rt.ObservationModelContextWindowTokens
+	a.ObservationModelMaxCompletionTokens = rt.ObservationModelMaxCompletionTokens
+	a.ObservationModelCapabilityDigest = rt.ObservationModelCapabilityDigest
 	a.SessionID = deps.SessionID
 	a.OnTaskStart = func(taskID string) { holder.Set(taskID); finHolder.Set(taskID) }
 	a.FinalizationChecker = finHolder

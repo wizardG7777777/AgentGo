@@ -199,36 +199,58 @@ func TestConfigureSimpleGraphDraftBuildsFrameworkOwnedAcceptedShape(t *testing.T
 		t.Fatal(err)
 	}
 	work := draft.Candidate.Nodes["work"]
+	investigate := draft.Candidate.Nodes["investigate"]
+	repair := draft.Candidate.Nodes["repair"]
 	acceptance := draft.Candidate.Nodes["acceptance"]
+	acceptanceRepair := draft.Candidate.Nodes["acceptance-repair"]
 	recovery := draft.Candidate.Nodes["recovery"]
 	acceptanceRecovery := draft.Candidate.Nodes["acceptance-recovery"]
-	if draft.DraftRevision != 2 || draft.Candidate.Root != "work" || draft.Contract.ExecutionClass != graph.ExecutionMutating ||
+	if draft.DraftRevision != 2 || draft.Candidate.Root != "investigate" || draft.Contract.ExecutionClass != graph.ExecutionMutating ||
 		!draft.Contract.RequiresAcceptance || len(draft.Contract.RequiredEffects) != 1 ||
 		len(draft.Contract.RequiredChecks) != 1 || draft.Contract.RequiredEffects[0] != "workspace-change" ||
-		work.Kind != graph.KindAgent || work.Metadata["authoring_template"] != "simple-task/v1" ||
+		investigate.Kind != graph.KindAgent || investigate.Metadata["route"] != "explore" ||
+		investigate.Metadata["authoring_template"] != "simple-task/v4" ||
+		work.Kind != graph.KindAgent || work.Metadata["authoring_template"] != "simple-task/v4" ||
 		work.ProgressContractRef != policycatalog.ProgressCodeChangeCurrent ||
+		repair.Kind != graph.KindAgent || repair.Metadata["recovery_target"] != "candidate-repair/v1" ||
+		repair.ProgressContractRef != policycatalog.ProgressCodeChangeV10 ||
 		acceptance.Kind != graph.KindAcceptance || acceptance.ProgressContractRef != policycatalog.ProgressVerificationCurrent ||
+		acceptanceRepair.Kind != graph.KindAcceptance || acceptanceRepair.ProgressContractRef != policycatalog.ProgressVerificationCurrent ||
 		recovery.Kind != graph.KindController ||
 		recovery.Metadata[graph.MetadataControllerRole] != string(graph.ControllerRoleLoopRecovery) ||
-		recovery.Metadata[graph.MetadataRecoveryMaxRetries] != "2" ||
-		recovery.Metadata[graph.MetadataRecoveryDeltaSchema] != graph.RecoveryDeltaSchemaV4 ||
+		recovery.Metadata[graph.MetadataRecoveryMaxRetries] != "1" ||
+		recovery.Metadata[graph.MetadataRecoveryDeltaSchema] != graph.RecoveryDeltaSchemaV5 ||
 		recovery.ProgressContractRef != policycatalog.ProgressCoordinationCurrent ||
 		acceptanceRecovery.Kind != graph.KindController ||
 		acceptanceRecovery.Metadata[graph.MetadataControllerRole] != string(graph.ControllerRoleLoopRecovery) ||
 		acceptanceRecovery.Metadata[graph.MetadataRecoveryMaxRetries] != "2" ||
 		acceptanceRecovery.Metadata[graph.MetadataRecoveryDeltaSchema] != graph.RecoveryDeltaSchemaV2 ||
-		len(draft.Candidate.Nodes) != 15 {
+		len(draft.Candidate.Nodes) != 27 {
 		t.Fatalf("simple task graph 未由 framework 完整生成: %+v", draft)
+	}
+	if investigate.OutputContract == nil ||
+		investigate.OutputContract.Profile != graph.OutputContractProfileInvestigationBoundaryV2 ||
+		!outputContractTestHasField(investigate.OutputContract, "$.failure_observation") ||
+		!outputContractTestHasField(investigate.OutputContract, "$.failure_observation.failure_kind") ||
+		!outputContractTestHasField(investigate.OutputContract, "$.boundary_evidence.public_entry") ||
+		!outputContractTestHasField(investigate.OutputContract, "$.boundary_evidence.state_owner") ||
+		!outputContractTestHasField(investigate.OutputContract, "$.boundary_evidence.internal_consumer") ||
+		!outputContractTestHasField(investigate.OutputContract, "$.rejected_alternative") {
+		t.Fatalf("simple-task/v4 未冻结首失败与三段 investigation boundary contract: %+v", investigate.OutputContract)
 	}
 	if len(work.Next) != 3 || work.Next[2].To != "recovery" ||
 		work.Next[2].TargetInput != "failure_context" || work.Next[2].When.Event != graph.EventBlocked ||
-		len(recovery.Next) != 4 || recovery.Next[0].To != "work" ||
+		len(recovery.Next) != 4 || recovery.Next[0].To != "repair" ||
 		!recovery.Next[0].ReplayInputs || recovery.Next[0].TargetInput != "" ||
+		len(investigate.Next) != 3 || investigate.Next[0].To != "work" ||
+		investigate.Next[0].TargetInput != "" ||
+		len(repair.Next) != 3 || repair.Next[0].To != "acceptance-repair" ||
+		repair.Next[0].TargetInput != "repair_result" ||
 		len(acceptance.Next) != 5 || acceptance.Next[4].To != "acceptance-recovery" ||
 		acceptance.Next[4].TargetInput != "failure_context" ||
 		len(acceptanceRecovery.Next) != 4 || acceptanceRecovery.Next[0].To != "acceptance" ||
 		!acceptanceRecovery.Next[0].ReplayInputs {
-		t.Fatalf("simple task graph 未形成 blocked→recovery→work@new 正式路径: work=%+v recovery=%+v",
+		t.Fatalf("simple task graph 未形成 Explorer→work→RecoveryDelta v5→repair 正式路径: work=%+v recovery=%+v",
 			work.Next, recovery.Next)
 	}
 	if _, err := group.configureSimpleDraft(context.Background(), map[string]any{"execution_class": "mutating"}); err != nil {
@@ -276,6 +298,9 @@ func TestConfigureSimpleGraphDraftBuildsFrameworkOwnedAcceptedShape(t *testing.T
 		graph.RouteAcceptance: {
 			"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref", "submit_task_result",
 		},
+		"explore": {
+			"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref", "submit_task_result",
+		},
 	}}
 	validatedRaw, err := group.validateCurrentDraft(context.Background(), map[string]any{})
 	if err != nil {
@@ -293,6 +318,15 @@ func TestConfigureSimpleGraphDraftBuildsFrameworkOwnedAcceptedShape(t *testing.T
 	if err := json.Unmarshal([]byte(committedRaw), &receipt); err != nil || receipt.Revision != 1 || receipt.GraphID != draft.GraphID {
 		t.Fatalf("current transaction commit receipt 错误: err=%v receipt=%+v", err, receipt)
 	}
+}
+
+func outputContractTestHasField(contract *graph.NodeOutputContract, path string) bool {
+	for _, field := range contract.Fields {
+		if field.Path == path && field.Required {
+			return true
+		}
+	}
+	return false
 }
 
 func TestGraphAuthoringCreateAndPatchUseNativeArguments(t *testing.T) {

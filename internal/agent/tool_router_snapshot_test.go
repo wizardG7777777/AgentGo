@@ -11,6 +11,7 @@ import (
 	"agentgo/internal/graph"
 	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
 	"agentgo/internal/policycatalog"
 	"agentgo/internal/runcontract"
@@ -171,6 +172,81 @@ func TestMechanicalControlHistoryProjectionDropsHistoricalToolsButKeepsControlNo
 		len(projected[0].ToolCalls) != 0 || len(projected[1].ToolCalls) != 0 ||
 		projected[0].AssistantContent != "" || projected[1].AssistantContent != "" {
 		t.Fatalf("强制交付投影不得携带历史工具偏好: %+v", projected)
+	}
+}
+
+func TestObservationCheckpointPhaseRecognizesVersionedProfiles(t *testing.T) {
+	for _, phase := range []string{
+		"agent:observation-checkpoint", "agent:observation-checkpoint-v8",
+		"agent:observation-checkpoint-v11", "agent:observation-checkpoint-v12",
+	} {
+		if !isObservationCheckpointPhase(phase) {
+			t.Fatalf("版本化 Observation phase 未进入机械投影: %s", phase)
+		}
+	}
+	for _, phase := range []string{"agent:deliverable-submit", "agent:observation-commitment", "agent:observation-checkpoint-bad"} {
+		if isObservationCheckpointPhase(phase) {
+			t.Fatalf("非 Observation checkpoint phase 被误识别: %s", phase)
+		}
+	}
+}
+
+func TestInvestigationDeliverableProjectionKeepsSettledEvidenceWithoutToolReplay(t *testing.T) {
+	history := []HistoryEntry{{
+		AssistantContent: "不要依赖这段记忆",
+		ToolCalls: []llm.ToolCall{{ID: "read", Name: "read_file", Arguments: map[string]any{
+			"path": "src/flask/app.py", "offset": 820, "limit": 160,
+		}}},
+		ToolResults: []ToolResult{{ToolCallID: "read", Content: "def full_dispatch_request(self):\n    return self.dispatch_request()"}},
+	}}
+	projected := investigationDeliverableHistoryProjection(history)
+	if len(projected) != 2 || len(projected[0].ToolCalls) != 0 || len(projected[0].ToolResults) != 0 ||
+		!strings.Contains(projected[0].SystemNotice, "full_dispatch_request") ||
+		!strings.Contains(projected[0].SystemNotice, `"offset":820`) ||
+		!strings.Contains(projected[1].SystemNotice, progressDeliverableRequiredMarker) {
+		t.Fatalf("investigation exact submit 未保留 settled evidence 或泄露 ToolCall: %+v", projected)
+	}
+}
+
+func TestInvestigationDeliverableProjectionStaysBelowContextFragmentCap(t *testing.T) {
+	history := make([]HistoryEntry, 0, 20)
+	for index := 0; index < 20; index++ {
+		id := fmt.Sprintf("read-%d", index)
+		history = append(history, HistoryEntry{
+			ToolCalls: []llm.ToolCall{{ID: id, Name: "read_file", Arguments: map[string]any{
+				"path": fmt.Sprintf("src/file-%d.py", index), "offset": 1, "limit": 160,
+			}}},
+			ToolResults: []ToolResult{{ToolCallID: id, Content: strings.Repeat("源码证据", 2000)}},
+		})
+	}
+	projected := investigationDeliverableHistoryProjection(history)
+	if len(projected) != 2 || len(projected[0].SystemNotice) >= 10<<10 {
+		t.Fatalf("investigation evidence projection 超出单 Fragment 安全预算: entries=%d bytes=%d",
+			len(projected), len(projected[0].SystemNotice))
+	}
+}
+
+func TestInvestigationV4DeliverableProjectionPrioritizesReadsOverLateGreps(t *testing.T) {
+	history := []HistoryEntry{{
+		ToolCalls: []llm.ToolCall{{ID: "read-test", Name: "read_file", Arguments: map[string]any{
+			"path": "tests/test_basic.py", "offset": 230, "limit": 60,
+		}}},
+		ToolResults: []ToolResult{{ToolCallID: "read-test", Content: "assert not request_ctx._session.accessed"}},
+	}}
+	for index := 0; index < 16; index++ {
+		id := fmt.Sprintf("grep-%d", index)
+		history = append(history, HistoryEntry{
+			ToolCalls: []llm.ToolCall{{ID: id, Name: "grep_search", Arguments: map[string]any{
+				"path": "src/flask", "query": fmt.Sprintf("query-%d", index),
+			}}},
+			ToolResults: []ToolResult{{ToolCallID: id, Content: strings.Repeat("搜索噪声", 500)}},
+		})
+	}
+	projected := investigationDeliverableHistoryProjectionV4(history)
+	if len(projected) != 2 || !strings.Contains(projected[0].SystemNotice, "request_ctx._session.accessed") ||
+		!strings.Contains(projected[0].SystemNotice, `priority="read-before-search"`) ||
+		len(projected[0].SystemNotice) >= 10<<10 {
+		t.Fatalf("investigation/v4 evidence priority 未保留关键 read 或超预算: %+v", projected)
 	}
 }
 
@@ -660,11 +736,82 @@ func TestRecoverySingleActionAllowsAuthorizedFirstCallWithUnauthorizedTail(t *te
 	}
 }
 
+func TestObservationV4MutationCommitmentGatesNextBusinessAction(t *testing.T) {
+	registry := NewToolRegistry()
+	registry.Register("edit_file", "编辑", map[string]any{"type": "object", "properties": map[string]any{
+		"path": map[string]any{"type": "string"},
+	}}, func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	registry.Register("read_file", "读取", map[string]any{"type": "object"},
+		func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	registry.Register("record_observation_delta", "观察", map[string]any{"type": "object"},
+		func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	task := &model.Task{ID: "observation-commit", AttemptID: "observation-commit/attempt-1",
+		GraphID: "graph-1", GraphNodeKind: string(graph.KindAgent)}
+	history := []HistoryEntry{{TurnID: task.AttemptID + "/turn-1", ToolCalled: true,
+		ToolCalls:   []llm.ToolCall{{ID: "obs", Name: "record_observation_delta"}},
+		ToolResults: []ToolResult{{ToolCallID: "obs", Content: `{"schema":"agentgo.observation-delta/v4","next_action":{"decision":"mutate","mutation":{"tool":"edit_file","path":"src/a.py"}}}`}},
+	}}
+	policy := deriveInvocationToolPolicyWithControl(task, history, registry, registry)
+	if policy.Phase != "agent:observation-commitment" ||
+		!sameExactToolSet(policy.Registry.Names(), []string{"edit_file"}) {
+		t.Fatalf("v4 mutate commitment 必须收窄下一业务工具: phase=%s tools=%v", policy.Phase, policy.Registry.Names())
+	}
+	properties := policy.Registry.Defs()[0].Parameters["properties"].(map[string]any)
+	if properties["path"].(map[string]any)["const"] != "src/a.py" {
+		t.Fatalf("mutation commitment 未冻结 path: %#v", properties)
+	}
+	if _, err := policy.Registry.Dispatch(context.Background(), llm.ToolCall{Name: "edit_file",
+		Arguments: map[string]any{"path": "src/b.py"}}); err == nil {
+		t.Fatal("mutation commitment 必须在 dispatch 前拒绝其它路径")
+	}
+	history = append(history, HistoryEntry{TurnID: task.AttemptID + "/turn-2", ToolCalled: true,
+		ToolCalls:   []llm.ToolCall{{ID: "edit", Name: "edit_file", Arguments: map[string]any{"path": "src/a.py"}}},
+		ToolResults: []ToolResult{{ToolCallID: "edit", Content: "编辑成功"}}})
+	policy = deriveInvocationToolPolicyWithControl(task, history, registry, registry)
+	if policy.Phase == "agent:observation-commitment" || !containsToolName(policy.Registry.Names(), "read_file") {
+		t.Fatalf("commitment 完成后应恢复普通业务工具: phase=%s tools=%v", policy.Phase, policy.Registry.Names())
+	}
+}
+
 func TestSchedulerAutoSingletonRejectsTextOnlyPhaseResponse(t *testing.T) {
 	router := ToolRouterSnapshot{Phase: "scheduler:draft-create", MaxCalls: defaultToolCallsPerResponse}
 	if err := validateToolCallBatch(router, nil); err == nil || !strings.Contains(err.Error(), "未返回必需") ||
 		!isActionContractViolation(err) {
 		t.Fatalf("auto wire 不得让正文越过机械阶段: %v", err)
+	}
+}
+
+func TestObservationV8UsesAutoLowAndEmptyAuthoritySchemaIsLegal(t *testing.T) {
+	registry := NewToolRegistry()
+	registry.Register("record_observation_delta", "obs", map[string]any{
+		"type": "object", "properties": map[string]any{
+			"facts": map[string]any{"type": "array", "maxItems": 12, "items": map[string]any{"properties": map[string]any{
+				"evidence_refs": map[string]any{"type": "array", "items": map[string]any{}},
+			}}},
+			"resolved_candidates": map[string]any{"type": "array", "maxItems": 5, "items": map[string]any{"properties": map[string]any{
+				"candidate_ref": map[string]any{}, "evidence_refs": map[string]any{"items": map[string]any{}},
+			}}},
+		},
+	}, func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	task := &model.Task{ProgressContract: &loopcontract.CompiledProgressContract{Ref: loopcontract.ProgressContractRef{ContractID: policycatalog.ProgressCodeChangeV8}}}
+	view := observationCheckpointRegistry(registry, task, nil)
+	router, err := FreezeToolRouterSnapshotWithPolicy(view, "agent:observation-checkpoint-v8", defaultToolCallsPerResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if choice := invocationToolChoice(router); choice.Mode != invocation.ToolChoiceAuto {
+		t.Fatalf("v8 Observation 应使用 auto: %+v", choice)
+	}
+	if effort, ok := phaseReasoningEffortOverride(router.Phase); !ok || effort != "low" {
+		t.Fatalf("v8 Observation 应使用 low: %q/%t", effort, ok)
+	}
+	facts := router.Defs[0].Parameters["properties"].(map[string]any)["facts"].(map[string]any)
+	if facts["maxItems"] != 0 {
+		t.Fatalf("空 authority facts 必须强制为空: %#v", facts)
+	}
+	items := facts["items"].(map[string]any)["properties"].(map[string]any)["evidence_refs"].(map[string]any)["items"].(map[string]any)
+	if _, exists := items["enum"]; exists {
+		t.Fatalf("空 authority 不得产生 enum: []: %#v", items)
 	}
 }
 

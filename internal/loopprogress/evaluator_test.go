@@ -29,6 +29,7 @@ func testContract() loopcontract.CompiledProgressContract {
 			{Kind: loopcontract.SignalEvaluationChanged, IdentityScope: "focused_tests"},
 			{Kind: loopcontract.SignalEvaluationPassed, IdentityScope: "focused_tests"},
 			{Kind: loopcontract.SignalObservationStateAdvanced, IdentityScope: "**"},
+			{Kind: loopcontract.SignalResultFieldSet, IdentityScope: "**", Deliverable: true},
 		},
 		Policy: loopcontract.ProgressPolicy{
 			PolicyRef: "bounded_code_change/v1", ReminderAfterTurns: 3,
@@ -38,6 +39,28 @@ func testContract() loopcontract.CompiledProgressContract {
 			MaxExplorationTurns:   4, MaxAttemptRollovers: 1, RecentFingerprintWindow: 16,
 		},
 		RunBudgetRef: "run-budget-1",
+	}
+}
+
+func TestEvaluateStructuredResultFieldAdvancesDecision(t *testing.T) {
+	base := time.Date(2026, 8, 28, 1, 0, 0, 0, time.UTC)
+	contract := testContract()
+	contract.Ref.ContractID = "progress:code-change/v10"
+	contract.Policy.MaxDecisionStagnation = 1
+	contract.Policy.DecisionCheckpointAfterTurns = 4
+	checkpoint := testCheckpoint(base)
+	checkpoint.Contract = contract.Ref
+	checkpoint.DecisionStagnationCount = 1
+	checkpoint.TurnsSinceDecisionCheckpoint = 3
+	delta := testDelta(base, 1)
+	delta.ContractDigest = contract.Ref.ContractDigest
+	delta.ResultChanges = []loopcontract.ResultFieldChange{{
+		Field: "tool:submit_change_decision", AfterDigest: "sha256:decision",
+	}}
+	assessment, next, err := Evaluate(contract, checkpoint, delta)
+	if err != nil || !assessment.DecisionAdvance || next.DecisionStagnationCount != 0 || next.TurnsSinceDecisionCheckpoint != 0 ||
+		assessment.Class != loopcontract.ProgressDeliverable {
+		t.Fatalf("typed result field 必须推进决策并重置停滞: assessment=%+v next=%+v err=%v", assessment, next, err)
 	}
 }
 

@@ -144,6 +144,7 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 		attemptNo = task.RetryCount + 1
 	}
 	lease = &model.ExecutionLease{
+		Schema:   model.ExecutionLeaseSchemaV1,
 		TaskID:   task.ID,
 		Attempt:  attemptNo,
 		FrozenAt: time.Now().UTC(),
@@ -231,6 +232,20 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 	lease.ModelContextWindowTokens = a.ModelContextWindowTokens
 	lease.ModelMaxCompletionTokens = a.ModelMaxCompletionTokens
 	lease.ModelCapabilityDigest = a.ModelCapabilityDigest
+	lease.ObservationModel = a.ObservationModel
+	lease.ObservationModelContextWindowTokens = a.ObservationModelContextWindowTokens
+	lease.ObservationModelMaxCompletionTokens = a.ObservationModelMaxCompletionTokens
+	lease.ObservationModelCapabilityDigest = a.ObservationModelCapabilityDigest
+	if lease.ObservationModel == "" {
+		lease.ObservationModel = lease.Model
+		lease.ObservationModelContextWindowTokens = lease.ModelContextWindowTokens
+		lease.ObservationModelMaxCompletionTokens = lease.ModelMaxCompletionTokens
+		lease.ObservationModelCapabilityDigest = lease.ModelCapabilityDigest
+	}
+	if (task.RunContract != nil || task.RunID != "" || task.ContextPolicyRef != "") &&
+		lease.Model != "" && lease.ModelCapabilityDigest != "" && lease.ObservationModelCapabilityDigest != "" {
+		lease.Schema = model.ExecutionLeaseSchemaCurrent
+	}
 	if task.Capability != nil && task.Capability.Model != "" {
 		lease.Model = task.Capability.Model
 	}
@@ -266,6 +281,17 @@ func validateLeaseForTaskRole(task *model.Task, lease *model.ExecutionLease) str
 		return ""
 	}
 	strictIdentity := task.RunContract != nil || task.RunID != "" || task.ContextPolicyRef != ""
+	if lease.Schema != "" && lease.Schema != model.ExecutionLeaseSchemaV1 && lease.Schema != model.ExecutionLeaseSchemaV2 {
+		return fmt.Sprintf("冻结租约 schema=%q 未知", lease.Schema)
+	}
+	if strictIdentity && strings.TrimSpace(lease.Model) != "" && strings.TrimSpace(lease.ModelCapabilityDigest) != "" &&
+		lease.Schema != model.ExecutionLeaseSchemaV2 {
+		return fmt.Sprintf("新运行契约要求 ExecutionLease v2，实际 schema=%q", lease.Schema)
+	}
+	if lease.Schema == model.ExecutionLeaseSchemaV2 &&
+		(strings.TrimSpace(lease.ObservationModel) == "" || strings.TrimSpace(lease.ObservationModelCapabilityDigest) == "") {
+		return "ExecutionLease v2 缺少 Observation model/capability"
+	}
 	if lease.TaskID != "" && lease.TaskID != task.ID {
 		return fmt.Sprintf("冻结租约 task_id=%q 与当前任务=%q 不一致", lease.TaskID, task.ID)
 	}
@@ -376,11 +402,13 @@ func deriveControlTools(task *model.Task) []string {
 				return []string{"patch_graph", "read_graph", "request_replan", "submit_task_result"}
 			}
 			tools := []string{"request_replan", "submit_task_result"}
-			v4ChangeDecision := task.GraphRecoveryDeltaSchema == graph.RecoveryDeltaSchemaV4
-			if directive, ok := frozenRecoveryDirective(task); ok && directive.Schema == graph.RecoveryDeltaSchemaV4 {
-				v4ChangeDecision = true
+			changeDecision := task.GraphRecoveryDeltaSchema == graph.RecoveryDeltaSchemaV4 ||
+				task.GraphRecoveryDeltaSchema == graph.RecoveryDeltaSchemaV5
+			if directive, ok := frozenRecoveryDirective(task); ok &&
+				(directive.Schema == graph.RecoveryDeltaSchemaV4 || directive.Schema == graph.RecoveryDeltaSchemaV5) {
+				changeDecision = true
 			}
-			if v4ChangeDecision {
+			if changeDecision {
 				tools = append(tools, "submit_change_decision")
 			}
 			if task.ProgressContract != nil && (task.ProgressContract.Policy.KnowledgeCheckpointAfterTurns > 0 ||

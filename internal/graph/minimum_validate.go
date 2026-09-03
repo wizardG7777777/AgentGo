@@ -78,7 +78,7 @@ func validateMinimumDefinition(body GraphDefinitionBody) []ValidationIssue {
 					"loop_recovery controller 必须声明 required string 字段 $.decision（retry|blocked）"))
 			}
 			if schema := strings.TrimSpace(node.Metadata[MetadataRecoveryDeltaSchema]); schema != "" {
-				if (schema != RecoveryDeltaSchemaV1 && schema != RecoveryDeltaSchemaV2 && schema != RecoveryDeltaSchemaV3 && schema != RecoveryDeltaSchemaV4) ||
+				if (schema != RecoveryDeltaSchemaV1 && schema != RecoveryDeltaSchemaV2 && schema != RecoveryDeltaSchemaV3 && schema != RecoveryDeltaSchemaV4 && schema != RecoveryDeltaSchemaV5) ||
 					!outputContractHasObject(node.OutputContract, "$.recovery_delta") {
 					issues = append(issues, validationIssue("RECOVERY_DELTA_CONTRACT_INVALID",
 						path+".output_contract.fields", true,
@@ -152,6 +152,11 @@ func validateNodeOutputContract(path string, contract *NodeOutputContract) []Val
 		return []ValidationIssue{validationIssue("OUTPUT_CONTRACT_REQUIRED", path+".output_contract", true, "task-producing 节点必须声明 typed OutputContract")}
 	}
 	var issues []ValidationIssue
+	if contract.Profile != "" && contract.Profile != OutputContractProfileInvestigationBoundaryV1 &&
+		contract.Profile != OutputContractProfileInvestigationBoundaryV2 {
+		issues = append(issues, validationIssue("OUTPUT_CONTRACT_PROFILE_UNKNOWN", path+".output_contract.profile", true,
+			fmt.Sprintf("未知 OutputContract profile %q", contract.Profile)))
+	}
 	if !contract.SummaryRequired && len(contract.Fields) == 0 {
 		issues = append(issues, validationIssue("OUTPUT_CONTRACT_EMPTY", path+".output_contract", true, "OutputContract 必须要求 summary 或至少一个 result 字段"))
 	}

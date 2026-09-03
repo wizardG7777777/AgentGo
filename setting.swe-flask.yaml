@@ -2,7 +2,7 @@
 #
 # 用途：以 Flask 真实仓库为对象的中等项目行为评测（SWE 式红→绿任务）。
 # 这是一个**模板**：__AGENTGO_ROOT__/__PROJECT_ROOT__/__PORT__/__TOKEN__/
-# __BASE_URL__/__MODEL__/__PROTOCOL__/__KEY_VAR__ 八个占位符由仓库内
+# __BASE_URL__/__FAST_MODEL__/__FLAG_SHIP_MODEL__/__PROTOCOL__/__KEY_VAR__ 九个占位符由仓库内
 # `scripts/swe_test_runner/runner.py`
 # 在每次运行时渲染；正式题目清单与 prompt 位于仓库 suite，外部 `SWE_TESTBED`
 # 只保存 Flask 源仓库、隔离 worktree 和运行产物。
@@ -11,14 +11,15 @@
 # 启动环境契约见
 # `scripts/swe_test_runner/README.md`：
 #   SWE_BASE_URL   供应商的 OpenAI 兼容端点
-#   SWE_MODEL      模型名，全角色统一
+#   SWE_FAST_MODEL      快速模型能力档位
+#   SWE_FLAG_SHIP_MODEL 旗舰模型能力档位
 #   SWE_API_KEY    注入密钥的环境变量（固定读取该变量名）
 # 可选 SWE_PROTOCOL 覆盖为 chat_completions 时才进入显式兼容链。
 # 本文件不落任何明文密钥。
 #
 # 评测纪律：
-# - 全部 agent（explorer/worker/verifier + scheduler）统一使用同一模型，
-#   保证可比性。
+# - 环境变量只注入能力档位，具体角色分配由本 YAML 的 model 字段决定；两个变量
+#   填相同值可复现全同模型基线，填不同值可评估分层协作。
 # - 全程禁止联网搜索：所有 profile 均不含 web_search/web_fetch；
 #   跑后审计 trace 确认零 web 调用。
 # - agent_templates 动态组队机制默认关闭（2026-08-20 起搁置）：图节点只
@@ -27,7 +28,7 @@
 llm:
   base_url: "__BASE_URL__"
   api_key: ${__KEY_VAR__}
-  default_model: "__MODEL__"
+  default_model: "__FAST_MODEL__"
   protocol: "__PROTOCOL__"
   timeout_sec: 300
   default_context_window_tokens: 1048576
@@ -75,7 +76,11 @@ agents:
     event_type: "explore"
     profile: swe_explorer
     system_prompt_file: "__AGENTGO_ROOT__/prompts/swe/explorer.md"
-    model: "__MODEL__"
+    # Explorer 的根因/所有权边界判断属于业务推理，真实 Flask 日志证明快速模型会把
+    # 公开 proxy 语义误缩为叶子容器覆写；业务模型使用旗舰档，机械 Observation 仍
+    # 使用已通过显式 v7-v11 matrix 的快速档。
+    model: "__FLAG_SHIP_MODEL__"
+    observation_model: "__FAST_MODEL__"
     task_max_retries: 5
     description: 只读调查代理：定位缺陷、解释行为、梳理调用关系；无写/shell/网络。
   - kind: worker
@@ -83,7 +88,10 @@ agents:
     event_type: ""
     profile: swe_worker
     system_prompt_file: "__AGENTGO_ROOT__/prompts/swe/worker.md"
-    model: "__MODEL__"
+    model: "__FLAG_SHIP_MODEL__"
+    # Optional: only set to __FAST_MODEL__ after the explicit observation
+    # probe proves this business model rejects v8 while fast passes both fixtures.
+    # observation_model: "__FAST_MODEL__"
     task_max_retries: 5
     description: 通用执行代理：调查、修改代码、运行 pytest 验证；无网络工具。
   - kind: verifier
@@ -91,12 +99,12 @@ agents:
     event_type: "acceptance.verify"
     profile: swe_verifier
     system_prompt_file: "__AGENTGO_ROOT__/prompts/swe/verifier.md"
-    model: "__MODEL__"
+    model: "__FAST_MODEL__"
     task_max_retries: 5
     description: 验收代理：按节点验收标准核验上游证据与仓库状态；无 shell/网络。
 
 scheduler:
-  model: "__MODEL__"
+  model: "__FAST_MODEL__"
 
 project_root: "__PROJECT_ROOT__"
 startup_probe: "tool"

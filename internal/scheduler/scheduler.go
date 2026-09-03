@@ -71,7 +71,7 @@ func schedulerPromptForPhase(phase string) string {
 </scheduler-phase>`
 	case "scheduler:draft-configure":
 		return `<scheduler-phase name="draft-configure">
-本轮唯一动作：调用 configure_simple_graph_draft，只判断原始请求的 execution_class。answer=只需自然语言答复且无需仓库操作；read_only=只调查读取并明确不修改文件；凡要求修改文件/代码/配置、实现功能或修复测试，即使先要调查也必须是 mutating。若上一份 ValidationReport rejected，应根据其 typed issue 修正分类；相同分类幂等，不同分类生成新 Draft revision。framework 将原始请求冻结为 work agent → independent acceptance → typed ends，并机械生成节点 ID、policy refs、output contract、GraphContract bindings 与 CAS revision；不要自行填写底层 Graph AST。
+本轮唯一动作：调用 configure_simple_graph_draft，只判断原始请求的 execution_class。answer=只需自然语言答复且无需仓库操作；read_only=只调查读取并明确不修改文件；凡要求修改文件/代码/配置、实现功能或修复测试，即使先要调查也必须是 mutating。若上一份 ValidationReport rejected，应根据其 typed issue 修正分类；相同分类幂等，不同分类生成新 Draft revision。framework 对 answer/read_only 冻结 work → independent acceptance；对 mutating 冻结只读 Explorer → work → independent acceptance，并提供 RecoveryDelta v5 candidate repair 分支。节点 ID、policy refs、output contract、GraphContract bindings 与 CAS revision 均由 framework 机械生成；不要自行填写底层 Graph AST。
 </scheduler-phase>`
 	case "scheduler:draft-validate":
 		return `<scheduler-phase name="draft-validate">
@@ -101,7 +101,7 @@ board snapshot 的 topo_mode=solo 时，唯一执行资源是 Scheduler：工作
 </scheduler-phase>`
 	case "scheduler:graph-recovery":
 		return `<scheduler-phase name="graph-recovery">
-	本轮只执行当前 Graph 的恢复控制动作。failure_context、Graph Result/Evidence、ProgressCheckpoint、ObservationDelta 与 read_graph 是权威；不得亲自修改业务文件。若需要改变未来 work Activation 的定义，依次使用 propose_graph_change→validate_graph_change→commit_graph_change，已终态的旧 Activation 始终冻结。裁决完成后必须调用 submit_recovery_decision：retry 声明 changed_dimensions、strategy、类型化 first_action、expected_milestone，source checkpoint/observation/fingerprint 由 framework 自动绑定；blocked 必须说明 blocked_reason。code-change recovery 使用 v4 handoff：first_action 选择最小 EvidenceContract 的第一个 read_file；可显式给出最多八个因果相关文件，省略时 framework 以首路径建立最小合同。不得假设前一 Activation 的读集可跨 Task 继承，也不得替 Worker 决定必须编辑；框架完成证据覆盖后由 Worker typed 选择 edit、need_context、hypothesis_rejected 或 blocked，只有 edit 才进入声明 mutation 与冻结 CheckContract。acceptance 与 v1-v3 历史恢复继续服从节点冻结的 schema。retry 还受 framework 的 execution phase 可启动性预检；若返回 reason_code=recovery_retry_unstartable，必须立即改交 blocked，不得继续声称 retry。没有可验证增量只能 blocked；不得调用 submit_task_result 或只输出自然语言。
+	本轮只执行当前 Graph 的恢复控制动作。failure_context、Graph Result/Evidence、ProgressCheckpoint、ObservationDelta 与 read_graph 是权威；不得亲自修改业务文件。若需要改变未来 work Activation 的定义，依次使用 propose_graph_change→validate_graph_change→commit_graph_change，已终态的旧 Activation 始终冻结。裁决完成后必须调用 submit_recovery_decision：retry 声明 changed_dimensions、strategy、类型化 first_action、expected_milestone，source checkpoint/observation/fingerprint 由 framework 自动绑定；blocked 必须说明 blocked_reason。新 code-change recovery 使用 v5 handoff：evidence_contract 只声明一个 focus file，first_action 是该文件的首个 bounded read；下一 Worker 根据上游 evidence_ranges 用 typed need_context(path/offset/limit) 精确补页，禁止顺序完整覆盖文件。candidate_state 由 framework 绑定，Controller 不得伪造。Worker typed 选择 edit、resume_candidate、need_context、hypothesis_rejected 或 blocked，只有 edit/resume 后才进入 mutation/check。acceptance/v2 与 RecoveryDelta v1-v4 历史恢复继续服从各自冻结 schema。retry 还受 framework 的 execution phase 可启动性预检；若返回 reason_code=recovery_retry_unstartable，必须立即改交 blocked，不得继续声称 retry。没有可验证增量只能 blocked；不得调用 submit_task_result 或只输出自然语言。
 </scheduler-phase>`
 	case "scheduler:final-report":
 		return `<scheduler-phase name="final-report">
@@ -345,6 +345,7 @@ func New(
 			SubmitState:          submitState,
 			OutletChecker:        outletChecker,
 			RecoveryAuthority:    recoveryAuthority,
+			ProjectRoot:          cfg.ProjectRoot,
 		},
 		tools.ObservationGroup{
 			Store: s, TaskMem: authoring.TaskMemStore, Holder: holder,
@@ -446,6 +447,10 @@ func New(
 		a.ModelContextWindowTokens = capability.ContextWindowTokens
 		a.ModelMaxCompletionTokens = capability.MaxCompletionTokens
 		a.ModelCapabilityDigest = capability.Digest
+		a.ObservationModel = schedulerModel
+		a.ObservationModelContextWindowTokens = capability.ContextWindowTokens
+		a.ObservationModelMaxCompletionTokens = capability.MaxCompletionTokens
+		a.ObservationModelCapabilityDigest = capability.Digest
 	}
 	a.OnTaskStart = func(taskID string) { holder.Set(taskID) }
 	a.OnTaskEnd = func(taskID string, success bool) { holder.Set("") }

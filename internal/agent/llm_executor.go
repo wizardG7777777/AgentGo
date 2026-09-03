@@ -13,10 +13,14 @@ import (
 	"time"
 
 	"agentgo/internal/contextcontract"
+	"agentgo/internal/controlcapability"
 	"agentgo/internal/gate"
+	"agentgo/internal/graph"
 	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
+	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
+	"agentgo/internal/policycatalog"
 	"agentgo/internal/prompt"
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
@@ -180,6 +184,8 @@ type LLMExecutor struct {
 	durableToolCallRecorder func(string, store.ToolCallRecord) error
 	teamAwareness           string
 	sysPrompt               string
+	observationModel        string
+	controlCapabilities     *controlcapability.Store
 	toolsMu                 sync.RWMutex
 	tools                   *ToolRegistry
 	// frameworkTools 是启动装配期注册全集的只读 authority。任务级
@@ -339,6 +345,15 @@ func (e *LLMExecutor) ToolRegistry() *ToolRegistry {
 	return e.tools
 }
 
+// SetObservationModel freezes the optional control-lane model at runner setup.
+func (e *LLMExecutor) SetObservationModel(model string) {
+	e.observationModel = strings.TrimSpace(model)
+}
+
+func (e *LLMExecutor) SetControlCapabilityStore(store *controlcapability.Store) {
+	e.controlCapabilities = store
+}
+
 // invocationToolRegistries 原子取得当前任务业务视图与启动期 framework
 // authority。两者只供一次 Invocation 冻结 ToolRouter，返回后均按只读使用。
 func (e *LLMExecutor) invocationToolRegistries() (business, framework *ToolRegistry) {
@@ -463,7 +478,8 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				RecoveryGate: &trace.RecoveryActionPayload{
 					Schema: gate.Schema, Stage: string(gate.Stage), Tool: gate.Tool,
 					Path: gate.Path, CheckID: gate.CheckID, RefID: gate.RefID,
-					Offset: gate.Offset, Limit: gate.Limit, DirectiveCount: gate.DirectiveCount,
+					Offset: gate.Offset, Limit: gate.Limit, ForceFull: gate.ForceFull,
+					DirectiveCount: gate.DirectiveCount,
 				},
 			})
 		}
@@ -489,8 +505,10 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		}
 		if toolRouter.Phase == "agent:deliverable-submit" {
 			phasePrompt = agentDeliverablePhasePrompt
-		} else if toolRouter.Phase == "agent:observation-checkpoint" {
+		} else if isObservationCheckpointPhase(toolRouter.Phase) {
 			phasePrompt = observationCheckpointPhasePrompt + "\n" + observationCheckpointCatalogPrompt(toolRouter.Defs)
+		} else if toolRouter.Phase == "agent:observation-commitment" {
+			phasePrompt = observationCommitmentPhasePrompt
 		} else if toolPolicy.RecoveryGate != nil {
 			phasePrompt = recoveryActionPhasePrompt(*toolPolicy.RecoveryGate)
 		} else if toolRouter.Phase == "scheduler:final-report-submit" {
@@ -499,8 +517,18 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		// 正常业务链不重放 reasoning=none 的 Observation Control Invocation；
 		// 其 durable 结果由 TaskMemory 独立注入。
 		modelHistory := businessHistoryProjection(history)
-		if toolRouter.Phase == "agent:deliverable-submit" ||
-			toolRouter.Phase == "agent:observation-checkpoint" ||
+		if toolRouter.Phase == "agent:deliverable-submit" && task != nil && task.ProgressContract != nil &&
+			task.ProgressContract.WorkClass == loopcontract.WorkInvestigation {
+			if task.ProgressContract.Ref.ContractID == policycatalog.ProgressInvestigationV4 ||
+				task.ProgressContract.Ref.ContractID == policycatalog.ProgressInvestigationV5 ||
+				task.ProgressContract.Ref.ContractID == policycatalog.ProgressInvestigationV6 ||
+				task.ProgressContract.Ref.ContractID == policycatalog.ProgressInvestigationV7 {
+				modelHistory = investigationDeliverableHistoryProjectionV4(modelHistory)
+			} else {
+				modelHistory = investigationDeliverableHistoryProjection(modelHistory)
+			}
+		} else if toolRouter.Phase == "agent:deliverable-submit" ||
+			isObservationCheckpointPhase(toolRouter.Phase) ||
 			toolRouter.Phase == "scheduler:final-report-submit" {
 			modelHistory = mechanicalControlHistoryProjection(modelHistory)
 		}
@@ -514,7 +542,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				DependencyResult: depResults, History: modelHistory, TaskMemory: taskMemCarrierFromContext(ctx),
 				ToolRouter: toolRouter, AttemptID: attemptIDForTrace, InvocationID: invocationID,
 				PhasePrompt: phasePrompt, PhasePromptRef: toolRouter.Phase,
-				SuppressUpstreamInputs: toolRouter.Phase == "agent:observation-checkpoint",
+				SuppressUpstreamInputs: isObservationPhase(toolRouter.Phase),
 				PromptBuildRef:         promptBuildRef, PromptBuild: frozenPromptBuild, ExecutionLeaseRef: leaseRef,
 				ParentSnapshotRef: parentSnapshotRef,
 			})
@@ -544,12 +572,11 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 						contextAssemblyFailure(ctx, invocationID, task.ContextPolicyRef, bindErr)
 				}
 			}
-			if toolRouter.Phase == "agent:observation-checkpoint" {
+			if isObservationPhase(toolRouter.Phase) {
 				const (
-					observationCompletionTokens int64 = 2048
-					observationArgumentsBytes   int64 = 16 << 10
-					observationResponseBytes    int64 = 32 << 10
+					observationArgumentsBytes int64 = 16 << 10
 				)
+				observationCompletionTokens, observationResponseBytes := observationOutputLimits(toolRouter.Phase)
 				binding.OutputBudget.MaxCompletionTokens = minPositiveInt64(
 					binding.OutputBudget.MaxCompletionTokens, observationCompletionTokens)
 				binding.OutputBudget.MaxContentBytes = minPositiveInt64(binding.OutputBudget.MaxContentBytes, observationResponseBytes)
@@ -558,7 +585,12 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				binding.OutputBudget.MaxToolArgumentsBytes = minPositiveInt64(binding.OutputBudget.MaxToolArgumentsBytes, observationArgumentsBytes)
 				binding.OutputBudget.MaxToolArgumentsTotalBytes = minPositiveInt64(binding.OutputBudget.MaxToolArgumentsTotalBytes, observationArgumentsBytes)
 				binding.OutputBudget.MaxResponseBytes = minPositiveInt64(binding.OutputBudget.MaxResponseBytes, observationResponseBytes)
-				binding.OutputBudget.MaxToolCalls = 1
+				// v7 及更早 exact wire 只能产生一个调用；v8 auto-singleton
+				// 必须允许 provider 返回有界 fan-out，随后由 L3 仅 dispatch
+				// 首个并为尾部写 skipped receipt。不能在 stream 累积层先拒绝。
+				if toolRouter.Phase == "agent:observation-checkpoint" {
+					binding.OutputBudget.MaxToolCalls = 1
+				}
 				for name, limit := range binding.OutputBudget.MaxExtraFieldBytesByName {
 					binding.OutputBudget.MaxExtraFieldBytesByName[name] = minPositiveInt64(limit, observationResponseBytes)
 				}
@@ -567,9 +599,25 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 						contextAssemblyFailure(ctx, invocationID, task.ContextPolicyRef, bindErr)
 				}
 			}
+			if toolPolicy.RecoveryGate != nil && toolPolicy.RecoveryGate.Schema == graph.RecoveryDeltaSchemaV5 {
+				binding.OutputBudget.MaxCompletionTokens = minPositiveInt64(
+					binding.OutputBudget.MaxCompletionTokens, recoveryV5CompletionLimit(toolPolicy.RecoveryGate.Stage, history))
+				if bindErr = binding.Validate(); bindErr != nil {
+					return ExecuteResult{InvocationID: invocationID},
+						contextAssemblyFailure(ctx, invocationID, task.ContextPolicyRef, bindErr)
+				}
+			}
 			binding.ToolChoice = invocationToolChoice(toolRouter)
 			if reasoningEffort, override := phaseReasoningEffortOverride(toolRouter.Phase); override {
 				binding.ReasoningEffort = reasoningEffort
+			}
+			if task.Lease != nil && task.Lease.Schema == model.ExecutionLeaseSchemaV2 {
+				effectiveModel, capabilityDigest := task.Lease.Model, task.Lease.ModelCapabilityDigest
+				if isAutoObservationPhase(toolRouter.Phase) {
+					effectiveModel = task.Lease.ObservationModel
+					capabilityDigest = task.Lease.ObservationModelCapabilityDigest
+				}
+				binding = invocation.BindEffectiveProfile(binding, effectiveModel, capabilityDigest, toolRouter.Phase)
 			}
 			if bindErr = binding.Validate(); bindErr != nil {
 				return ExecuteResult{InvocationID: invocationID},
@@ -623,59 +671,103 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 
 		// Trace：LLM 调用开始
 		toolChoiceMode, toolChoiceName, reasoningEffort := "", "", ""
+		modelCapabilityDigest, invocationProfileRef := "", ""
+		effectiveModel := ""
+		if task.Lease != nil {
+			effectiveModel = task.Lease.Model
+		}
+		if isAutoObservationPhase(toolRouter.Phase) && e.observationModel != "" {
+			effectiveModel = e.observationModel
+		}
 		if invocationBinding != nil {
 			toolChoiceMode = string(invocationBinding.ToolChoice.Mode)
 			toolChoiceName = invocationBinding.ToolChoice.Name
 			reasoningEffort = invocationBinding.ReasoningEffort
+			if invocationBinding.EffectiveModel != "" {
+				effectiveModel = invocationBinding.EffectiveModel
+			}
+			modelCapabilityDigest = invocationBinding.ModelCapabilityDigest
+			invocationProfileRef = invocationBinding.InvocationProfileRef
+		}
+		var controlCapabilityKey controlcapability.Key
+		if isAutoObservationPhase(toolRouter.Phase) && invocationBinding != nil {
+			controlCapabilityKey = controlcapability.Key{
+				RunID: runIDForTrace, EffectiveModel: effectiveModel,
+				InvocationProfile: toolRouter.Phase, ToolSchemaDigest: toolRouter.ID,
+			}
+			if record, incompatible := e.controlCapabilities.Incompatible(controlCapabilityKey); incompatible {
+				return ExecuteResult{InvocationID: invocationID, ContextSnapshotID: contextSnapshotID},
+					&controlcapability.IncompatibleError{Record: record}
+			}
 		}
 		trace.Emit(trace.Event{
-			Kind:                 trace.KindLLMCallStart,
-			TaskID:               task.ID,
-			RunID:                runIDForTrace,
-			AttemptID:            attemptIDForTrace,
-			TurnID:               turnIDForTrace,
-			AgentID:              agentIDForTrace,
-			Loop:                 loopForTrace,
-			InvocationID:         invocationID,
-			ToolRouterSnapshotID: toolRouter.ID,
-			ContextSnapshotID:    contextSnapshotID,
-			ContextPolicyRef:     contextPolicyRef,
-			HistoryEntries:       len(modelHistory),
-			ToolCallsCount:       len(toolDefs),
-			ToolChoiceMode:       toolChoiceMode,
-			ToolChoiceName:       toolChoiceName,
-			ReasoningEffort:      reasoningEffort,
+			Kind:                  trace.KindLLMCallStart,
+			TaskID:                task.ID,
+			RunID:                 runIDForTrace,
+			AttemptID:             attemptIDForTrace,
+			TurnID:                turnIDForTrace,
+			AgentID:               agentIDForTrace,
+			Loop:                  loopForTrace,
+			InvocationID:          invocationID,
+			ToolRouterSnapshotID:  toolRouter.ID,
+			ContextSnapshotID:     contextSnapshotID,
+			ContextPolicyRef:      contextPolicyRef,
+			HistoryEntries:        len(modelHistory),
+			ToolCallsCount:        len(toolDefs),
+			ToolChoiceMode:        toolChoiceMode,
+			ToolChoiceName:        toolChoiceName,
+			ReasoningEffort:       reasoningEffort,
+			EffectiveModel:        effectiveModel,
+			ModelCapabilityDigest: modelCapabilityDigest,
+			InvocationProfileRef:  invocationProfileRef,
 		})
 		// Prompt dump（仅在 --dump-prompts 启用时写入）
 		trace.DumpRequest(task.ID, loopForTrace, messages, len(toolDefs))
 
 		llmStart := time.Now()
+		invokeCtx := ctx
+		if invocationBinding != nil && invocationBinding.EffectiveModel != "" {
+			invokeCtx = llm.WithModelOverride(invokeCtx, invocationBinding.EffectiveModel)
+		} else if isAutoObservationPhase(toolRouter.Phase) && e.observationModel != "" {
+			invokeCtx = llm.WithModelOverride(invokeCtx, e.observationModel)
+		}
 		var resp llm.Response
 		if invocationBinding != nil {
-			resp, err = llm.Invoke(ctx, e.client, llm.InvocationRequest{
+			resp, err = llm.Invoke(invokeCtx, e.client, llm.InvocationRequest{
 				Binding: *invocationBinding, Messages: messages, Tools: toolDefs,
 			})
 		} else {
-			resp, err = llm.InvokeLegacy(ctx, e.client, messages, toolDefs)
+			resp, err = llm.InvokeLegacy(invokeCtx, e.client, messages, toolDefs)
 		}
 		llmDuration := time.Since(llmStart)
 
 		if err != nil {
+			if failure, ok := invocation.FromError(err); ok && controlCapabilityKey.RunID != "" {
+				if _, storeErr := e.controlCapabilities.Mark(controlCapabilityKey, failure); storeErr != nil {
+					return ExecuteResult{InvocationID: invocationID, ContextSnapshotID: contextSnapshotID,
+							InvocationDuration: llmDuration, ProviderCallStarted: true},
+						contextAssemblyFailure(ctx, invocationID, contextPolicyRef,
+							fmt.Errorf("持久化 ControlCapability 失败: %w", storeErr))
+				}
+			}
 			activity.LLMEnd(agentIDForTrace, task.ID, loopForTrace, "", 0, err)
 			event := trace.Event{
-				Kind:                 trace.KindLLMCallEnd,
-				TaskID:               task.ID,
-				RunID:                runIDForTrace,
-				AttemptID:            attemptIDForTrace,
-				TurnID:               turnIDForTrace,
-				AgentID:              agentIDForTrace,
-				Loop:                 loopForTrace,
-				InvocationID:         invocationID,
-				ToolRouterSnapshotID: toolRouter.ID,
-				ContextSnapshotID:    contextSnapshotID,
-				ContextPolicyRef:     contextPolicyRef,
-				DurationMS:           llmDuration.Milliseconds(),
-				Error:                err.Error(),
+				Kind:                  trace.KindLLMCallEnd,
+				TaskID:                task.ID,
+				RunID:                 runIDForTrace,
+				AttemptID:             attemptIDForTrace,
+				TurnID:                turnIDForTrace,
+				AgentID:               agentIDForTrace,
+				Loop:                  loopForTrace,
+				InvocationID:          invocationID,
+				ToolRouterSnapshotID:  toolRouter.ID,
+				ContextSnapshotID:     contextSnapshotID,
+				ContextPolicyRef:      contextPolicyRef,
+				DurationMS:            llmDuration.Milliseconds(),
+				Error:                 err.Error(),
+				EffectiveModel:        effectiveModel,
+				ModelCapabilityDigest: modelCapabilityDigest,
+				InvocationProfileRef:  invocationProfileRef,
 			}
 			if failure, ok := invocation.FromError(err); ok {
 				failure.InvocationID = invocationID
@@ -716,6 +808,8 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 					ToolCallsCount: len(resp.ToolCalls), Error: failure.Error(),
 					FailureKind: string(failure.Kind), FailurePhase: string(failure.Phase),
 					FailureOrigin: string(failure.Origin), UsageState: string(failure.UsageState),
+					EffectiveModel:        effectiveModel,
+					ModelCapabilityDigest: modelCapabilityDigest, InvocationProfileRef: invocationProfileRef,
 				})
 				return ExecuteResult{
 					InvocationID: invocationID, ContextSnapshotID: contextSnapshotID,
@@ -725,7 +819,11 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				}, failure
 			}
 		}
-		if batchErr := validateToolCallBatch(toolRouter, resp.ToolCalls); batchErr != nil {
+		batchErr := validateToolCallBatch(toolRouter, resp.ToolCalls)
+		if batchErr == nil && toolPolicy.RecoveryGate != nil {
+			batchErr = validateRecoveryActionCall(*toolPolicy.RecoveryGate, resp.ToolCalls)
+		}
+		if batchErr != nil {
 			failureKind := invocation.FailureMalformedResponse
 			origin := invocation.OriginProtocol
 			if isActionContractViolation(batchErr) {
@@ -749,6 +847,8 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				ToolCallsCount: len(resp.ToolCalls), Error: failure.Error(),
 				FailureKind: string(failure.Kind), FailurePhase: string(failure.Phase),
 				FailureOrigin: string(failure.Origin), UsageState: string(failure.UsageState),
+				EffectiveModel:        effectiveModel,
+				ModelCapabilityDigest: modelCapabilityDigest, InvocationProfileRef: invocationProfileRef,
 			})
 			return ExecuteResult{
 				InvocationID: invocationID, ContextSnapshotID: contextSnapshotID,
@@ -760,21 +860,24 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 
 		// Trace：LLM 调用成功结束
 		trace.Emit(trace.Event{
-			Kind:                 trace.KindLLMCallEnd,
-			TaskID:               task.ID,
-			RunID:                runIDForTrace,
-			AttemptID:            attemptIDForTrace,
-			TurnID:               turnIDForTrace,
-			AgentID:              agentIDForTrace,
-			Loop:                 loopForTrace,
-			InvocationID:         invocationID,
-			ToolRouterSnapshotID: toolRouter.ID,
-			ContextSnapshotID:    contextSnapshotID,
-			ContextPolicyRef:     contextPolicyRef,
-			DurationMS:           llmDuration.Milliseconds(),
-			PromptTokens:         resp.Usage.PromptTokens,
-			CompletionTokens:     resp.Usage.CompletionTokens,
-			ToolCallsCount:       len(resp.ToolCalls),
+			Kind:                  trace.KindLLMCallEnd,
+			TaskID:                task.ID,
+			RunID:                 runIDForTrace,
+			AttemptID:             attemptIDForTrace,
+			TurnID:                turnIDForTrace,
+			AgentID:               agentIDForTrace,
+			Loop:                  loopForTrace,
+			InvocationID:          invocationID,
+			ToolRouterSnapshotID:  toolRouter.ID,
+			ContextSnapshotID:     contextSnapshotID,
+			ContextPolicyRef:      contextPolicyRef,
+			DurationMS:            llmDuration.Milliseconds(),
+			PromptTokens:          resp.Usage.PromptTokens,
+			CompletionTokens:      resp.Usage.CompletionTokens,
+			ToolCallsCount:        len(resp.ToolCalls),
+			EffectiveModel:        effectiveModel,
+			ModelCapabilityDigest: modelCapabilityDigest,
+			InvocationProfileRef:  invocationProfileRef,
 		})
 		// CM1 对账：Manifest 估算 tokens 与实测值对照，只记录不告警
 		//（估算口径 rune/3，偏差供后续校准估算系数参考）。
@@ -1094,6 +1197,11 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		}
 		return executeResult, controlErr
 	}
+}
+
+func isObservationCheckpointPhase(phase string) bool {
+	return phase == "agent:observation-checkpoint" ||
+		strings.HasPrefix(phase, "agent:observation-checkpoint-v")
 }
 
 func responseReplayFailure(cause error) *invocation.Failure {

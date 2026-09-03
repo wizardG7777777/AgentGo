@@ -501,6 +501,7 @@ type RecoveryActionPayload struct {
 	RefID          string `json:"ref_id,omitempty"`
 	Offset         int64  `json:"offset,omitempty"`
 	Limit          int64  `json:"limit,omitempty"`
+	ForceFull      bool   `json:"force_full,omitempty"`
 	DirectiveCount int    `json:"directive_count"`
 }
 
@@ -567,6 +568,10 @@ type Event struct {
 	ToolChoiceMode  string `json:"tool_choice_mode,omitempty"`
 	ToolChoiceName  string `json:"tool_choice_name,omitempty"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// EffectiveModel 是本次实际 request 的模型名；不记录凭据或请求正文。
+	EffectiveModel        string `json:"effective_model,omitempty"`
+	ModelCapabilityDigest string `json:"model_capability_digest,omitempty"`
+	InvocationProfileRef  string `json:"invocation_profile_ref,omitempty"`
 	// Invocation failure 的稳定分类字段。Error 仅供展示，控制流不得解析它。
 	FailureKind    string `json:"failure_kind,omitempty"`
 	FailurePhase   string `json:"failure_phase,omitempty"`

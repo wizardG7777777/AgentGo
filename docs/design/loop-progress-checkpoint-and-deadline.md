@@ -1,7 +1,7 @@
 # Loop Progress Contract / Checkpoint / Deadline 架构
 
-> 状态：Accepted Design，Progress v6 / RunContract v2 mechanical validation complete / business gate open<br>
-> 日期：2026-08-29<br>
+> 状态：Accepted Design，Progress v12 / investigation v6 / RunContract v2 implemented<br>
+> 日期：2026-09-03<br>
 > 归属：L4 Loop Engineering<br>
 > 对应问题：SWE-011<br>
 > 上位规范：[`五层工程架构规范`](five-layer-engineering-architecture.md)<br>
@@ -10,8 +10,35 @@
 
 ## 0.0 2026-08-28 Decision Progress 与四阶段 Deadline
 
-- 新 code-change 使用 `progress:code-change/v6`：每 6 个 knowledge turn 进入
-  Observation；新 read/grep 可以更新 knowledge，但不能重置 decision stagnation。
+> 2026-08-31 修订：新 code-change current 已发布 v7。v7 保留以下 v6 的
+> knowledge/decision 与 handoff 语义，只把 periodic Observation 连续失败改为
+> abandoned 后恢复业务；必须持久化的 checkpoint 仍 fail-closed，v6 快照不迁移。
+
+- 新 code-change 使用 `progress:code-change/v12`：Observation wire 继承 v11/v10 的
+  auto/low/4096；Explorer handoff 后每1个可评价 decision turn checkpoint，首次
+  无决策前进交 RecoveryDelta v5。v11 用 `decision_periodic` 区分 knowledge
+  periodic；两次无效即 typed handoff，不得 abandoned 后恢复业务。typed change decision会重置 decision cadence，
+  已有真实 file/artifact mutation 但尚无 verification pass 时，v11 在 execution
+  deadline 前预留3分钟，以 `candidate_completion_handoff` 交 L5；该时间来自原
+  execution window 内部重分配，不增加 Run 总时长。v11 只用于首次 Worker；最终
+  candidate-repair 固定使用 v10，避免在没有下一条恢复边时再次交接。
+  mutation/check 继续作为更强进展。v6-v9 按历史恢复。
+- v12 发布时同步加入 Graph fulfillment 正向闭集；缺该接线会让 Work 在 DeliveryID
+  形成前触发 RecoveryDelta v5。fake-provider 与真实 Run 均已证明 v12 能绑定同一
+  Delivery 并进入 Repair，v11 历史任务不迁移。
+- 新 simple-task/v4 Explorer 使用 `progress:investigation/v6`：novel read/grep 只推进
+  knowledge，6-turn 后进入 exact structured submit，并从原 execution window 为下游 Worker/Repair 预留8分钟；窗口用于形成公开入口、状态
+  所有者、内部 consumer 三段 boundary evidence。settled evidence 以单一 8KiB notice
+  保留；v6 在同一预算内按 read/read_content_ref → grep → list/glob 优先级选择，
+  同类内 newest-first，避免尾部搜索噪声挤掉早期失败断言。历史 investigation/v3-v5
+  保持各自冻结语义，不静默迁移。
+- investigation/v7 登记了10分钟 downstream reserve，但真实 provider 的单次
+  correction 可在阈值检查后继续运行近300秒并吃掉 reserve；因此 v7 不切 current，
+  新 authoring 继续使用实测能进入两轮 Repair check 的 v6。
+- 历史 code-change v8 继承 v7 的每 6 个 knowledge turn
+  Observation 与 knowledge/decision 语义；periodic Observation 在有界 control
+  contract 失败后保留 Raw History 并恢复业务，必须持久化的 checkpoint 仍
+  fail-closed。新 read/grep 可以更新 knowledge，但不能重置 decision stagnation。
   只有 workspace/file revision、artifact digest、typed check、Observation phase/
   workspace/check 前进或 predecessor candidate closure 才算 decision advance。
 - `workspace:empty` 的 pre-mutation run_check 只形成 baseline knowledge；typed

@@ -21,9 +21,10 @@ import (
 
 // fakeOutletChecker 是 OutletChecker 的脚本化离线实现。
 type fakeOutletChecker struct {
-	schema string
-	err    error
-	calls  []outletCheckCall
+	schema   string
+	err      error
+	calls    []outletCheckCall
+	contract *graph.NodeOutputContract
 }
 
 type outletCheckCall struct {
@@ -32,6 +33,10 @@ type outletCheckCall struct {
 }
 
 func (f *fakeOutletChecker) GraphSchema(string) string { return f.schema }
+
+func (f *fakeOutletChecker) ActivationOutputContract(string, string, string) (*graph.NodeOutputContract, error) {
+	return f.contract, nil
+}
 
 func (f *fakeOutletChecker) CheckActivationOutlet(graphID, nodeID, activationID, status string, result map[string]any) error {
 	f.calls = append(f.calls, outletCheckCall{graphID, nodeID, activationID, status, result})
@@ -60,6 +65,34 @@ func newV2SubmitGroup(t *testing.T, checker *fakeOutletChecker) (PlanControlGrou
 
 func baseSubmitArgs() map[string]any {
 	return map[string]any{"summary": "实现完成", "result": map[string]any{"coverage": "gap"}}
+}
+
+func TestSubmitOutputContractPreflightRejectsBeforeFinalizingAndAllowsRetry(t *testing.T) {
+	checker := &fakeOutletChecker{
+		schema: graph.SchemaV2,
+		contract: &graph.NodeOutputContract{SummaryRequired: true, Fields: []graph.OutputFieldContract{{
+			Path: "$.required_fact", Type: "string", Required: true,
+		}}},
+	}
+	g, notifier, state, _, task := newV2SubmitGroup(t, checker)
+	if _, err := g.submitTaskResult(context.Background(), baseSubmitArgs()); err == nil ||
+		!strings.Contains(err.Error(), "可修正后重交") {
+		t.Fatalf("缺字段必须在 finalizing 前返回可修正错误: %v", err)
+	}
+	if notifier.marked || len(checker.calls) != 0 {
+		t.Fatalf("输出预检失败不得 finalizing 或进入 outlet: marked=%t calls=%d", notifier.marked, len(checker.calls))
+	}
+	if _, ok := state.Take(task.ID); ok {
+		t.Fatal("输出预检失败不得暂存提交")
+	}
+	args := baseSubmitArgs()
+	args["result"] = map[string]any{"coverage": "gap", "required_fact": "已核验"}
+	if _, err := g.submitTaskResult(context.Background(), args); err != nil {
+		t.Fatalf("修正输出后必须允许重交: %v", err)
+	}
+	if !notifier.marked || len(checker.calls) != 1 {
+		t.Fatalf("修正提交未进入 finalizing/outlet: marked=%t calls=%d", notifier.marked, len(checker.calls))
+	}
 }
 
 // 首击拒绝：不 finalizing、不产生终态写入，agent 可修正后重新提交并成功。

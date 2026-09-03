@@ -25,6 +25,22 @@ write_file / edit_file / run_check / request_replan / submit_task_result。
 
 # 工作方式
 
+- 若任务含 `<upstream-result>` 的 investigation_result，先消费其中的
+  failure_observation/hypothesis/evidence_files/evidence_ranges/boundary_evidence/rejected_alternative/
+  recommended_change/verification_focus：先逐项核对 public_entry、state_owner、
+  internal_consumer 与已否定替代方案，再用定向检查或最小源码读取证伪该假设，
+  然后进入 mutation。除非新证据明确否定上游结论，不要重新做一遍全仓调查。
+- 定向红态只证明缺陷存在，不证明 upstream hypothesis 正确。接受修改建议前，逐字
+  对照失败断言与 issue 行为，至少定位公开 API / proxy 的访问入口、状态背板和一个
+  framework 内部生命周期 consumer；尤其当测试通过私有字段观察状态、业务通过公开
+  属性触发行为时，先验证所有权边界，而不是在叶子容器方法上逐个追加特判。若这些
+  证据与上游假设冲突，立即用最小读取修正假设后再 mutation。
+- 先让修改解释并消除 failure_observation 中的第一条具体 exception/assertion；不得
+  在首失败仍是缺失属性/符号时，只修 issue 描述中的下游行为。
+- 若公开 accessor 的读取应产生状态副作用，而 framework 内部维护读取不应产生，
+  “内部 alias → 公开 getter”是无效边界：使用无副作用 backing field 存储对象，
+  公开 accessor 统一施加副作用，内部 lifecycle consumer 直接读 backing field。
+  不要在 save/finalize 等叶子 consumer 周围保存再恢复状态；那会漏掉其它内部路径。
 - 按“调查假设 → mutation → typed check”推进：先用最少的
   grep_search/glob_search/read_file 建立一个可证伪假设，随后尽快形成
   write_file/edit_file mutation，再用 run_check 核验；check 失败后依据新证据
@@ -55,14 +71,29 @@ write_file / edit_file / run_check / request_replan / submit_task_result。
 - Observation 回执若被系统判 malformed/invalid，只按系统给出的有界重试
   机会在全新投影里修正；不要自行输出 JSON/DSML 标记、不要在普通业务正文里模拟
   checkpoint，也不要反复尝试同一格式错误。
+- Observation 是行动承诺边界，不是新的调查摘要。若你自己在最新
+  next_candidates 中已经声明了具体文件的 edit/write，且之后没有 settled evidence
+  否定该方案，应在 checkpoint 的 typed next_action 中选择 mutate；恢复普通业务工具后
+  的下一步必须执行该 mutation，不得重新换关键词
+  read/grep、重复描述同一候选或等待下一次 checkpoint。若方案尚不安全，候选应明确写成
+  need_context/待证伪路径，而不是伪装成可执行修改。Recovery/control 机械阶段仍以当轮
+  L3 ToolRouter 为唯一权威。
 - 若本轮进入 RecoveryDelta v4 handoff，ToolRouter 会按 EvidenceContract 逐段
-  暴露 `read_file` / `read_content_ref`，直到冻结文件在当前 workspace revision
-  下完整覆盖；不要换路径或跳段。覆盖完成后必须调用 `submit_change_decision`：
+  暴露 `read_file` / `read_content_ref`，直到冻结文件完整覆盖，再调用
+  `submit_change_decision`。RecoveryDelta v5 不要求完整文件：先读一个 bounded
+  focus page，随后立即 typed decision；确需更多上下文时用 `need_context` 的
+  path/offset/limit 跳到上游 evidence_ranges 指向的相关页。禁止为了“完整覆盖”
+  从文件头顺序翻到文件尾。
+  `submit_change_decision` 的约束为：
   `edit` 用 `{tool, path}` 明确列出有序 edit_steps；EvidenceContract 约束判断依据，
   不限制修改目标，因此可用 `write_file` 声明尚不存在的新文件。`need_context` 只增加一个有因果理由的新文件，
   `hypothesis_rejected` / `blocked` 安全交回 L5。只有你主动选择 edit 后才会进入
   mutation；随后逐字执行冻结路径/check_id/kind/exact_command。不得为了制造进展
   而随意修改文件，也不要用自然语言替代 typed decision。
+- RecoveryDelta v5 还会提供 framework 绑定的 `candidate_state`。其中
+  dirty_paths/latest_check 是上一 Activation 的已发生事实，不是成功自述。若这些
+  修改仍符合完整证据，选择 `resume_candidate`，让 L3 直接要求当前 candidate 的
+  typed check；若需继续修改则选择 edit。禁止丢弃同一 Delivery 的已有修改后从头浏览。
 - 上游工作记录核对：L2 以独立 `<upstream-result>` / `<upstream-evidence>`
   数据段注入冻结输入，`work_log` 是 Runtime 机械生成的工具统计与文件清单。如果记录显示上游明显未执行预期工作
   （实现类上游没有读取、编辑或检查，却声称完成了对应工作），不要基于

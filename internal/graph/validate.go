@@ -336,8 +336,8 @@ func validateRuntimeState(doc *GraphDocument) error {
 // schema 只接受 SchemaV1 / SchemaV2 / SchemaV3 三个封闭值；v2/v3 文档的追加约束（事件
 // 词表、输出契约声明）在 authoring 阶段按版本分流，见 validateAuthoringNodes。
 func validateBasics(doc *GraphDocument) error {
-	if doc.Schema != SchemaV1 && doc.Schema != SchemaV2 && doc.Schema != SchemaV3 {
-		return newErr("基本字段", "schema", "schema 必须恰为 %q、%q 或 %q，实际为 %q", SchemaV1, SchemaV2, SchemaV3, doc.Schema)
+	if doc.Schema != SchemaV1 && doc.Schema != SchemaV2 && doc.Schema != SchemaV3 && doc.Schema != SchemaV4 {
+		return newErr("基本字段", "schema", "schema 必须恰为 %q、%q、%q 或 %q，实际为 %q", SchemaV1, SchemaV2, SchemaV3, SchemaV4, doc.Schema)
 	}
 	if err := validateGraphID(doc.GraphID); err != nil {
 		return newErr("基本字段", "graph_id", "%s", err.Error())
@@ -419,7 +419,7 @@ func validateTransitions(doc *GraphDocument) error {
 // 历史 Graph 无法 Recover；旧图仍按其冻结契约恢复，新定义则 fail-closed。
 // schema v2 文档在此追加终态契约 v2 的边条件规则（v1 文档不受限）。
 func validateAuthoringSemantics(doc *GraphDocument) error {
-	return validateAuthoringNodes(doc.Nodes, "nodes", doc.Schema == SchemaV2 || doc.Schema == SchemaV3)
+	return validateAuthoringNodes(doc.Nodes, "nodes", UsesTypedTerminalContract(doc.Schema))
 }
 
 func validateAuthoringNodes(nodes map[string]Node, prefix string, v2 bool) error {
@@ -514,10 +514,23 @@ func validateAuthoringNodes(nodes map[string]Node, prefix string, v2 bool) error
 				if !tr.ReplayInputs {
 					continue
 				}
-				if len(edges) != 1 || edges[0].source != tr.To || edges[0].input != "failure_context" {
+				if len(edges) != 1 || edges[0].input != "failure_context" {
 					return newErr("转移", fmt.Sprintf("%s.next[%d].replay_inputs", path, i),
-						"loop_recovery replay 边必须返回唯一 failure_context 来源节点；target=%s inbound=%v",
+						"loop_recovery replay 边必须具有唯一 failure_context 来源节点；target=%s inbound=%v",
 						tr.To, edges)
+				}
+				schema := strings.TrimSpace(node.Metadata[MetadataRecoveryDeltaSchema])
+				if schema != RecoveryDeltaSchemaV5 && edges[0].source != tr.To {
+					return newErr("转移", fmt.Sprintf("%s.next[%d].replay_inputs", path, i),
+						"RecoveryDelta %s replay 边必须返回 failure_context 来源节点；target=%s source=%s",
+						schema, tr.To, edges[0].source)
+				}
+				if schema == RecoveryDeltaSchemaV5 {
+					target := nodes[tr.To]
+					if target.Kind != KindAgent || !strings.HasPrefix(target.ProgressContractRef, "progress:code-change/") {
+						return newErr("转移", fmt.Sprintf("%s.next[%d].replay_inputs", path, i),
+							"RecoveryDelta v5 replay 目标 %s 必须是 code-change agent", tr.To)
+					}
 				}
 			}
 		}
@@ -863,6 +876,8 @@ func validateNodesKindSpecs(nodes map[string]Node, depth int) error {
 // validateCapabilityShape 实现阶段 9：capability 与 executor 的结构形状。
 func validateCapabilityShape(doc *GraphDocument) error {
 	v3MutatingNodes := 0
+	v4PrimaryMutatingNodes := 0
+	var v4RepairNodes []string
 	for _, id := range sortedNodeIDs(doc) {
 		node := doc.Nodes[id]
 		path := "nodes." + id
@@ -898,17 +913,26 @@ func validateCapabilityShape(doc *GraphDocument) error {
 				return newErr("能力", path+".capability.tools", "controller 节点 %q 不得声明 capability.tools（纯控制面无业务工具），实际为 %v", id, cap.Tools)
 			}
 		}
-		// Graph v3 的 mutating producer 只能在隔离候选中写文件；raw
+		// Delivery Graph 的 mutating producer 只能在隔离候选中写文件；raw
 		// run_shell 会绕过路径边界，故不得进入租约。run_check 是唯一受约束
 		// 的命令执行面，仍可用于 typed verification。
-		if doc.Schema == SchemaV3 && strings.HasPrefix(node.ProgressContractRef, "progress:code-change/") {
+		if UsesDeliveryTransaction(doc.Schema) && strings.HasPrefix(node.ProgressContractRef, "progress:code-change/") {
 			v3MutatingNodes++
 			if node.Kind != KindAgent || node.Capability == nil || node.Capability.Isolation != IsolationWorkspace {
-				return newErr("能力", path+".capability", "Graph v3 mutating 节点必须是 agent 且 capability.isolation=%q", IsolationWorkspace)
+				return newErr("能力", path+".capability", "Delivery Graph mutating 节点必须是 agent 且 capability.isolation=%q", IsolationWorkspace)
 			}
 			for _, tool := range node.Capability.Tools {
 				if tool == "run_shell" {
-					return newErr("能力", path+".capability.tools", "Graph v3 mutating 节点禁止 raw run_shell；请使用 run_check")
+					return newErr("能力", path+".capability.tools", "Delivery Graph mutating 节点禁止 raw run_shell；请使用 run_check")
+				}
+			}
+			if doc.Schema == SchemaV4 {
+				if target := strings.TrimSpace(node.Metadata["recovery_target"]); target == "" {
+					v4PrimaryMutatingNodes++
+				} else if target == "candidate-repair/v1" {
+					v4RepairNodes = append(v4RepairNodes, id)
+				} else {
+					return newErr("能力", path+".metadata.recovery_target", "Graph v4 recovery_target=%q 无效", target)
 				}
 			}
 		}
@@ -923,6 +947,30 @@ func validateCapabilityShape(doc *GraphDocument) error {
 	}
 	if doc.Schema == SchemaV3 && v3MutatingNodes > 1 {
 		return newErr("能力", "nodes", "Graph v3 首版每张图只允许一个 mutating producer；请拆为独立 Delivery Graph 后再汇合")
+	}
+	if doc.Schema == SchemaV4 {
+		if v4PrimaryMutatingNodes != 1 {
+			return newErr("能力", "nodes", "Graph v4 必须且只能有一个主 mutating producer，实际=%d", v4PrimaryMutatingNodes)
+		}
+		for _, repairID := range v4RepairNodes {
+			validInbound := 0
+			for sourceID, source := range doc.Nodes {
+				for _, transition := range source.Next {
+					if transition.To != repairID {
+						continue
+					}
+					if transition.ReplayInputs && ControllerRoleOf(source) == ControllerRoleLoopRecovery &&
+						strings.TrimSpace(source.Metadata[MetadataRecoveryDeltaSchema]) == RecoveryDeltaSchemaV5 {
+						validInbound++
+						continue
+					}
+					return newErr("能力", "nodes."+sourceID+".next", "Graph v4 candidate repair %s 只允许 RecoveryDelta v5 replay 入边", repairID)
+				}
+			}
+			if validInbound != 1 {
+				return newErr("能力", "nodes."+repairID, "Graph v4 candidate repair 必须且只能有一条 RecoveryDelta v5 replay 入边")
+			}
+		}
 	}
 	return nil
 }

@@ -6,11 +6,16 @@ package invocation
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 )
 
-const ContextBindingSchemaV1 = "agentgo.invocation-context-binding/v1"
+const (
+	ContextBindingSchemaV1 = "agentgo.invocation-context-binding/v1"
+	ContextBindingSchemaV2 = "agentgo.invocation-context-binding/v2"
+)
 
 type ToolChoiceMode string
 
@@ -64,12 +69,26 @@ type ContextBinding struct {
 	// ReasoningEffort 是本次 Invocation 的显式 wire override。空值使用
 	// 全局模型配置；机械终态提交可冻结 none，避免 thinking provider
 	// 拒绝 exact tool choice，不影响前面业务轮次的 thinking。
-	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	ReasoningEffort       string `json:"reasoning_effort,omitempty"`
+	EffectiveModel        string `json:"effective_model,omitempty"`
+	ModelCapabilityDigest string `json:"model_capability_digest,omitempty"`
+	InvocationProfileRef  string `json:"invocation_profile_ref,omitempty"`
 }
 
 func (b ContextBinding) Validate() error {
-	if b.Schema != ContextBindingSchemaV1 {
+	if b.Schema != ContextBindingSchemaV1 && b.Schema != ContextBindingSchemaV2 {
 		return fmt.Errorf("Invocation ContextBinding schema=%q，无效", b.Schema)
+	}
+	if b.Schema == ContextBindingSchemaV2 {
+		for name, value := range map[string]string{
+			"effective_model":         b.EffectiveModel,
+			"model_capability_digest": b.ModelCapabilityDigest,
+			"invocation_profile_ref":  b.InvocationProfileRef,
+		} {
+			if strings.TrimSpace(value) == "" {
+				return fmt.Errorf("Invocation ContextBinding/v2 %s 不能为空", name)
+			}
+		}
 	}
 	for name, value := range map[string]string{
 		"invocation_id": b.InvocationID, "context_snapshot_id": b.ContextSnapshotID,
@@ -108,6 +127,20 @@ func (b ContextBinding) Validate() error {
 		}
 	}
 	return nil
+}
+
+// BindEffectiveProfile publishes v2 without mutating v1 restoration semantics.
+// The encoded request digest binds the already-compiled payload to the effective
+// model/capability/profile used by Model Invocation.
+func BindEffectiveProfile(b ContextBinding, model, capabilityDigest, profileRef string) ContextBinding {
+	b.Schema = ContextBindingSchemaV2
+	b.EffectiveModel = strings.TrimSpace(model)
+	b.ModelCapabilityDigest = strings.TrimSpace(capabilityDigest)
+	b.InvocationProfileRef = strings.TrimSpace(profileRef)
+	h := sha256.Sum256([]byte(b.EncodedRequestDigest + "\x00" + b.EffectiveModel + "\x00" +
+		b.ModelCapabilityDigest + "\x00" + b.InvocationProfileRef))
+	b.EncodedRequestDigest = "sha256:" + hex.EncodeToString(h[:])
+	return b
 }
 
 type contextBindingKey struct{}

@@ -1,6 +1,6 @@
 # KNOWN_ISSUES — 当前限制与验证缺口
 
-最后核对：2026-08-30。
+最后核对：2026-09-03。
 
 ## 2026-08-23 五层架构修复的当前开放项
 
@@ -8,18 +8,37 @@
 durable Store 和生产接线，并通过 full/race/vet/build、SWE Test Runner 单测与真实二进制；但以下
 仍是当前发布判断中的真实开放项：
 
-- **SWE-107～110 的真实 Flask-8 行为验证待补**：SWE-096～106 修复后的用户批次已达到
-  `architecture_ok=8/8`、`task_resolved=6/8`，证明 Observation authority、targeted
-  CheckContract、fan-out 与 finalizing 接缝不再令架构门失败；剩余两题仍是零补丁业务失败。
-  进一步审计发现 RecoveryDelta v3 把“首个目标文件已读”错误等同于“必须立即修改同一
-  文件”，既不能证明上下文充分，也会压制弱模型补齐调用链。当前已发布 v4：L5 冻结
-  `EvidenceContract`，L3 逐段证明完整/新鲜覆盖后由 Worker typed 选择 edit、
-  need_context、hypothesis_rejected 或 blocked；只有 edit 才执行声明 mutation 与 check。
-  仓库回归与本地真实 Windows 二进制 fake-provider 链已通过，但尚未用相同小模型重跑
-  Flask-8，因此不能把本地机械闭环外推为剩余两题已解决。实施与证据见
+- **弱模型业务能力边界（架构 closure 已完成）**：2026-09-01 同一
+  `qwen3.8-flash` 最终 Flask-8 批次为 complete `8/8`、`architecture_ok=8/8`、
+  `task_resolved=5/8`、infra/not-run 0。SWE-107～117 已修复并获真实批次证据：
+  Recovery skipped/force_full、Test Runner incident 关联、Progress v7 periodic
+  abandoned、Observation v4 typed next_action 与 mutation gate 均进入生产链。
+  剩余 pass-context-dispatch、session-access-tracking、teardown-callbacks 已获得真实
+  mutation/check 或明确选择 need_context 的机会，错误候选被安全隔离；当前制约是模型
+  的代码语义、上下文范围选择与失败反馈利用能力。Recovery 全文件覆盖仍有调用成本，
+  若未来改为 symbol/range EvidenceContract 必须发布新 schema，不能原地削弱“完整上下文
+  后才修改”的 v4 语义。证据见
   [`Recovery EvidenceContract v4`](../test-issues/2026-08-30-2356-recovery-evidence-contract-v4.md)；
+  [`Recovery skipped fan-out 事故`](../test-issues/2026-08-31-1858-recovery-skipped-fanout.md)；
   v3 历史见 [`Recovery handoff v3`](../test-issues/2026-08-30-1630-recovery-handoff-v3.md)
   与 [`L2-L4 Recovery 收口`](../test-issues/2026-08-30-2002-l2-l4-recovery-closure.md)。
+  2026-09-02 mixed-model v8 完整批次同样达到 `architecture_ok=8/8`、
+  `model_contract_compatible=8/8`、infra/not-run 0，但业务为 `task_resolved=4/8`；
+  四道失败统一表现为 work@1 decision stall、一次 Recovery retry、work@2 deadline，
+  SWE-119 已关闭。2026-09-03 已实现 Graph v4 simple-task/v4、code-change/v12、
+  investigation/v6、boundary/v2 与 RecoveryDelta v5
+  candidate/focus handoff：automatic-options
+  定向 resolved；pass-context-dispatch 和 session-access-tracking 已实际进入
+  mutation/targeted check，但仍在后续修正前耗尽 execution window，业务 closure
+  尚未达到，完整 Flask-8 因门槛题未过而未启动。当前开放项是模型在冻结时间内的
+  多点重构收敛，而不是放宽 L3 或增加窗口。最终 session-access v12 定向复测为
+  47 calls，Observation failure=0、architecture/model-contract 均 true，Work 的
+  DeliveryID 与 v5 recovery 正常绑定，但 Repair 两次 targeted check 失败后仍在下一
+  修正前 deadline。investigation/v7 的额外 reserve 实验又证明单次 provider
+  correction 可运行近300秒并穿透 post-turn reserve，因此 v7 未切 current；继续解决
+  需要更低延迟/更强模型或新的 provider-call cancellation/SLA 契约。完整 batch 因
+  门槛题未过未启动。证据见
+  [`SWE-120`](../test-issues/2026-09-03-0140-explorer-candidate-repair.md)。
 
 - **L5 legacy 退出**：新图已走 Draft/Definition/commit/start、ChangeProposal、
   typed outcome/outbox；旧 `submit_graph`/direct `patch_graph` 仍保留受限兼容面，
@@ -271,6 +290,9 @@ go test -race ./...
 ### Graph v3 的联合提交尚未开放
 
 `agentgo.graph/v3` 当前每张图只允许一个 mutating producer。多个候选的原子联合 promotion、跨 candidate conflict 预检与多 `delivery_commit_ref` Graph success 尚未实现；编译期会拒绝该拓扑，避免把多个已独立提交的 workspace 伪装为一次原子交付。
+
+`agentgo.graph/v4` 只增加一个由 RecoveryDelta v5 replay 进入、共享同一 Delivery
+的 candidate-repair producer；它不是一般多 producer 支持，不改变上述限制。
 
 - 影响：需要并行写多个独立候选的请求必须拆为多个 v3 Graph，再由上层 Graph/用户协调汇合。
 - 处置：不要绕过 compiler 手工提交多 producer v3 JSON；等待联合 Delivery Transaction 设计落地。

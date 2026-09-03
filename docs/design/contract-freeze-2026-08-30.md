@@ -9,11 +9,11 @@
 | 责任域 | 冻结契约 | 当前实现权威 |
 |---|---|---|
 | L1 Prompt | Scheduler `embedded:v10.11-recovery-evidence-v4`；SWE Worker/Verifier 当前受控文件 | `internal/scheduler/scheduler.go`、`prompts/swe/` |
-| L2 Context | `context:default/v10`、`provider-replay:openai-compatible/v4`、新写入 `agentgo.observation-delta/v3`（v2 历史恢复） | `internal/policycatalog`、`internal/contextadapter`、`internal/tools/observation.go` |
-| L3 Harness | ExecutionLease digest、RunContract `agentgo.run-contract/v2`、code-change RecoveryDelta `agentgo.recovery-delta/v4`、ChangeDecision `agentgo.change-decision/v1` | `internal/agent/execution_lease.go`、`internal/runcontract`、`internal/graph/recovery_delta.go` |
-| L4 Loop | `progress:code-change/v6`、四阶段 Run deadline、TaskOutcome `agentgo.task-outcome/v3` | `internal/agent/loop_progress.go`、`internal/loopcontract`、`internal/outcome` |
-| L5 Graph | `agentgo.graph/v3`、Delivery `agentgo.delivery/v1`、GraphChangeProposal 当前事务 | `internal/graph`、`internal/delivery` |
-| 外部评测 | SWE Test Runner result v2、pytest phase report v1 | `scripts/swe_test_runner/` |
+| L2 Context | `context:default/v10`、`provider-replay:openai-compatible/v4`、新写入 `agentgo.observation-delta/v4`（v2/v3 历史恢复） | `internal/policycatalog`、`internal/contextadapter`、`internal/tools/observation.go` |
+| L3 Harness | ExecutionLease `agentgo.execution-lease/v2`、InvocationBinding `agentgo.invocation-context-binding/v2`、ControlCapability `agentgo.control-capability/v1`、RunContract `agentgo.run-contract/v2`、RecoveryDelta `agentgo.recovery-delta/v5` / ChangeDecision v2 | `internal/agent/execution_lease.go`、`internal/invocation`、`internal/controlcapability`、`internal/runcontract` |
+| L4 Loop | `progress:code-change/v12`、`progress:investigation/v6`、四阶段 Run deadline、TaskOutcome `agentgo.task-outcome/v3` | `internal/agent/loop_progress.go`、`internal/loopcontract`、`internal/outcome` |
+| L5 Graph | mutating simple `agentgo.graph/v4`、Delivery `agentgo.delivery/v1`、GraphChangeProposal 当前事务；v3 历史/非 mutating | `internal/graph`、`internal/delivery` |
+| 外部评测 | SWE Test Runner result v3、pytest phase report v1 | `scripts/swe_test_runner/` |
 
 历史快照继续按自身版本恢复；不得把 v1/v2 数据静默补字段后当成当前版本。
 
@@ -25,9 +25,10 @@
 - L2：展示字段必须保留权威语义名称。`no_progress_turns`、
   `no_progress_model_calls` 不得缩写成容易被误读为累计总量的 `turns`、
   `model_calls`。
-- L2：Observation v2 保留历史 confirmed 投影；新写入 v3 把模型自然语言 facts
-  标成 inferred。settled evidence 只证明引用归属，不机械证明 claim 与正文之间的
-  语义蕴含，inferred 只能进入“待验证观察”，不得晋升 Session 权威。
+- L2：Observation v2 保留历史 confirmed 投影；v3 历史与新写入 v4 都把模型自然语言
+  facts 标成 inferred。v4 新增 typed next_action，只有模型自选 mutate 才由下一业务轮
+  L3 gate 强制 `{tool,path}`；其它决策不自动执行。settled evidence 只证明引用归属，
+  inferred 只能进入“待验证观察”，不得晋升 Session 权威。v2/v3 不静默迁移。
 - L3/L5：RecoveryDelta v2 的单首动作语义保持冻结，供历史/acceptance 恢复。
   新 code-change handoff 发布 v4：首动作只允许带 path 的 `read_file`，并作为最小
   `EvidenceContract` 第一项。L3 逐段证明完整且新鲜的证据覆盖后只开放
@@ -50,6 +51,20 @@
    等语义，不要求模型估算精确数字。
 4. 新版本先定义旧版本恢复/拒绝规则，再切换 current alias；禁止按 provider、
    模型名或考题名称分支。
+
+## 2026-09-03 Explorer / candidate repair 修订
+
+- mutating simple authoring 发布 `simple-task/v2` 与 `agentgo.graph/v4`：只读
+  Explorer 结构化输出 hypothesis/evidence files/ranges/change/check focus，Worker
+  与唯一 candidate-repair 共享 Delivery；v3 的单 mutating producer 规则不变。
+- `agentgo.recovery-delta/v5` 由 Runtime 绑定 candidate state。v5 focus page 与
+  typed need_context(path/offset/limit) 取代 v4 全文件覆盖；v4 继续只读恢复。
+- `progress:investigation/v6` 与 code-change/v12 把 knowledge、typed decision、
+  mutation/check 分开计数；v6 为 simple-task/v4 的首失败与三段 boundary evidence 冻结六轮，并为下游执行保留8分钟，v3-v5 历史不迁移；
+  上限，v3 六轮历史任务不迁移。dirty candidate 在 deadline 前预留3分钟交 L5。
+  v11 只赋给首次 Worker；最终 candidate-repair 冻结为 v10，禁止产生无下游消费的
+  二次 handoff。
+  Observation v12 wire 继承 v11/v10 的 auto/low/4096。
 
 ## 原冻结验证边界（历史）
 

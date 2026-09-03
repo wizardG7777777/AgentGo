@@ -130,13 +130,16 @@ type ProgressPolicy struct {
 	// FirstDeliverableHandoffReserve 在 Attempt deadline 前为尚无首次
 	// deliverable 的 code-change 任务保留 L5 recovery 交接窗口。
 	FirstDeliverableHandoffReserve time.Duration `json:"first_deliverable_handoff_reserve,omitempty"`
-	KnowledgeCheckpointAfterTurns  int           `json:"knowledge_checkpoint_after_turns,omitempty"`
-	DecisionCheckpointAfterTurns   int           `json:"decision_checkpoint_after_turns,omitempty"`
-	MaxObservationStagnation       int           `json:"max_observation_stagnation,omitempty"`
-	MaxDecisionStagnation          int           `json:"max_decision_stagnation,omitempty"`
-	MaxControlContractFailures     int           `json:"max_control_contract_failures,omitempty"`
-	MaxAttemptRollovers            int           `json:"max_attempt_rollovers"`
-	RecentFingerprintWindow        int           `json:"recent_fingerprint_window"`
+	// CandidateRepairHandoffReserve 在已有真实 workspace mutation、但尚无其后
+	// verification pass 时，为 L5 candidate repair 预留剩余 execution 窗口。
+	CandidateRepairHandoffReserve time.Duration `json:"candidate_repair_handoff_reserve,omitempty"`
+	KnowledgeCheckpointAfterTurns int           `json:"knowledge_checkpoint_after_turns,omitempty"`
+	DecisionCheckpointAfterTurns  int           `json:"decision_checkpoint_after_turns,omitempty"`
+	MaxObservationStagnation      int           `json:"max_observation_stagnation,omitempty"`
+	MaxDecisionStagnation         int           `json:"max_decision_stagnation,omitempty"`
+	MaxControlContractFailures    int           `json:"max_control_contract_failures,omitempty"`
+	MaxAttemptRollovers           int           `json:"max_attempt_rollovers"`
+	RecentFingerprintWindow       int           `json:"recent_fingerprint_window"`
 }
 
 // ProgressContractRef 是 Graph/Task/Activation 保存的稳定引用。
@@ -440,6 +443,7 @@ const (
 	InterventionCheckpointFailure  InterventionReason = "checkpoint_unavailable"
 	InterventionObservationStalled InterventionReason = "observation_state_stalled"
 	InterventionDecisionStalled    InterventionReason = "decision_progress_stalled"
+	InterventionCandidateHandoff   InterventionReason = "candidate_completion_handoff"
 	InterventionControlUnstable    InterventionReason = "control_contract_unstable"
 	InterventionAttemptBudget      InterventionReason = "attempt_budget_exhausted"
 )

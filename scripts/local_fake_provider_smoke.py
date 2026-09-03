@@ -48,6 +48,7 @@ class FakeState:
         self.lock = threading.Lock()
         self.call_no = 0
         self.worker_reads = 0
+        self.explorer_read = False
         self.last_worker_call_id = ""
         self.worker_wrote = False
         self.worker_blocked = False
@@ -63,6 +64,7 @@ class FakeState:
         self.actions: list[tuple[str, dict]] = []
         self.errors: list[str] = []
         self.observation_wire_verified = False
+        self.observation_max_output_tokens = 0
         self.observation_malformed_sent = False
         self.cancel_mode = False
         self.cancel_delay_started = threading.Event()
@@ -91,13 +93,14 @@ def fake_handler(state: FakeState):
                     time.sleep(10)
                 if names == ["record_observation_delta"]:
                     reasoning = body.get("reasoning") or {}
-                    choice = body.get("tool_choice") or {}
-                    if reasoning.get("effort") != "none" or choice.get("type") != "function" or choice.get("name") != "record_observation_delta":
+                    choice = body.get("tool_choice")
+                    if reasoning.get("effort") != "low" or choice != "auto":
                         raise RuntimeError(
-                            f"Observation Control lane 必须 reasoning=none + exact typed action: "
+                            f"Observation v9 Control lane 必须 reasoning=low + auto-singleton: "
                             f"reasoning={reasoning!r} tool_choice={body.get('tool_choice')!r}"
                         )
                     state.observation_wire_verified = True
+                    state.observation_max_output_tokens = int(body.get("max_output_tokens") or 0)
                     with state.lock:
                         malformed = not state.observation_malformed_sent
                         state.observation_malformed_sent = True
@@ -193,6 +196,33 @@ def choose_action(state: FakeState, body: dict, tools: list[dict], names: list[s
             return args, name
     if "submit_proposal_verdict" in names:
         return {"verdict": "pass"}, "submit_proposal_verdict"
+    if "SWE 评测环境里的调查代理" in text and "record_observation_delta" not in names:
+        if not state.explorer_read:
+            state.explorer_read = True
+            return {"path": "README.md"}, "read_file"
+        return {
+            "summary": "已定位本地 smoke 的最小修改面",
+            "result": {
+                "hypothesis": "README 标题后的恢复说明缺失",
+                "evidence_files": ["README.md"],
+                "evidence_ranges": [
+                    {"path": "README.md", "start_line": 1, "end_line": 1, "symbol": "Local smoke"},
+                    {"path": "README.md", "start_line": 3, "end_line": 3, "symbol": "Fixture body."},
+                ],
+                "failure_observation": {
+                    "path": "README.md", "start_line": 1, "end_line": 1,
+                    "symbol": "Local smoke", "failure_kind": "missing_delivery_text",
+                },
+                "boundary_evidence": {
+                    "public_entry": {"path": "README.md", "start_line": 1, "end_line": 1, "symbol": "Local smoke"},
+                    "state_owner": {"path": "README.md", "start_line": 3, "end_line": 3, "symbol": "Fixture body."},
+                    "internal_consumer": {"path": "README.md", "start_line": 3, "end_line": 3, "symbol": "Fixture body."},
+                },
+                "rejected_alternative": "只改 fixture body 不能建立标题后的交付说明",
+                "recommended_change": "在 README 标题后补充恢复说明，并新增 smoke artifact",
+                "verification_focus": "运行冻结 verification check",
+            },
+        }, "submit_task_result"
     if names == ["record_observation_delta"]:
         if not state.last_worker_call_id:
             raise RuntimeError("Observation checkpoint 缺少当前 Attempt tool call")
@@ -204,6 +234,7 @@ def choose_action(state: FakeState, body: dict, tools: list[dict], names: list[s
             }],
             "resolved_candidates": [],
             "next_candidates": ["新 Attempt 直接写入 smoke artifact 并提交"],
+            "next_action": {"decision": "continue"},
         }, "record_observation_delta"
     if "report_done" in names and "read_graph" in names:
         graph_match = re.search(r"graph-[0-9a-f-]{16,}", text)
@@ -221,11 +252,11 @@ def choose_action(state: FakeState, body: dict, tools: list[dict], names: list[s
     if "submit_recovery_decision" in names:
         return {
             "decision": "retry", "changed_dimensions": ["strategy"],
-            "strategy": "从已冻结 Observation 继续，完整覆盖 README 后提交修改决策",
+            "strategy": "从已冻结 Observation 继续，读取 README focus page 后提交修改决策",
             "first_action": {"tool": "read_file", "path": "README.md"},
             "evidence_contract": {"files": ["README.md"]},
             "expected_milestone": "verification CheckRecord pass",
-            "summary": "已形成可验证的新执行策略，创建 work@2",
+            "summary": "已形成可验证的新执行策略，创建独立 repair Activation",
         }, "submit_recovery_decision"
     if names == ["read_file"] and "recovery-evidence" in text:
         properties = ((tools[0].get("parameters") or {}).get("properties") or {})
@@ -246,9 +277,11 @@ def choose_action(state: FakeState, body: dict, tools: list[dict], names: list[s
     if names == ["edit_file"]:
         return {
             "path": "README.md", "old_str": "# Local smoke\n",
-            "new_str": "# Local smoke\n\nRecovery handoff v4 evidence decision mutation.\n",
+            "new_str": "# Local smoke\n\nRecovery handoff v5 candidate repair mutation.\n",
         }, "edit_file"
     if names == ["run_check"]:
+        if state.worker_wrote:
+            state.worker_checked = True
         properties = ((tools[0].get("parameters") or {}).get("properties") or {})
         return {
             "check_id": (properties.get("check_id") or {}).get("const", "verification"),
@@ -260,22 +293,24 @@ def choose_action(state: FakeState, body: dict, tools: list[dict], names: list[s
         return {"path": "local-smoke.txt", "content": "agentgo local fake provider smoke\n"}, "write_file"
     if "submit_task_result" in names:
         if "逐项核验" in text or "验收原始请求" in text:
-            if not all(marker in text for marker in (
-                '"kind":"check"', '"check_id":"verification"',
-                '"check_status":"pass"', '"workspace_revision_ref":"workspace:sha256:',
-            )):
-                raise RuntimeError("Acceptance 未收到 fulfillment 引用的 typed Check Evidence")
+            required_patterns = (
+                r'"kind"\s*:\s*"check"', r'"check_id"\s*:\s*"verification"',
+                r'"check_status"\s*:\s*"pass"', r'"workspace_revision_ref"\s*:\s*"workspace:sha256:',
+            )
+            missing_patterns = [pattern for pattern in required_patterns if not re.search(pattern, text)]
+            if missing_patterns:
+                raise RuntimeError(f"Acceptance 未收到 fulfillment 引用的 typed Check Evidence: missing={missing_patterns}")
             state.check_evidence_seen = True
             if not state.verifier_content_ref_requested:
-                check_match = re.search(r'"check_ref":"(check:[^"]+)"', text)
-                ref_match = re.search(r'"output_ref":"(content:[^"]+)"', text)
+                check_match = re.search(r'"check_ref"\s*:\s*"(check:[^"]+)"', text)
+                ref_match = re.search(r'"output_ref"\s*:\s*"(content:[^"]+)"', text)
                 if not check_match or not ref_match:
                     raise RuntimeError("Acceptance 未收到 typed CheckRef 或可解引用 output_ref")
                 state.acceptance_check_ref = check_match.group(1)
                 state.verifier_content_ref_requested = True
                 return {"ref_id": ref_match.group(1), "offset": 0, "limit": 4096}, "read_content_ref"
             if not state.verifier_content_ref_read:
-                if '"encoding":"utf-8"' not in text or "go version" not in text:
+                if not re.search(r'"encoding"\s*:\s*"utf-8"', text) or "go version" not in text:
                     raise RuntimeError("Acceptance 未读到上游 Check ContentRef 输出")
                 state.verifier_content_ref_read = True
             if state.verifier_reads < 4:
@@ -290,6 +325,12 @@ def choose_action(state: FakeState, body: dict, tools: list[dict], names: list[s
             return {
                 "summary": "本地验收通过", "verdict": "pass",
                 "cited_evidence": state.acceptance_check_ref,
+            }, "submit_task_result"
+        if state.worker_wrote and state.worker_checked:
+            return {
+                "summary": "已写入本地 smoke artifact",
+                "checks_performed": "本地 fake provider deterministic check",
+                "evidence": "local-smoke.txt",
             }, "submit_task_result"
         if state.worker_reads < 12:
             state.worker_reads += 1
@@ -352,7 +393,7 @@ def main() -> int:
     now = dt.datetime.now(dt.timezone.utc)
     with tempfile.TemporaryDirectory(prefix="agentgo-local-smoke-") as temp:
         root = Path(temp)
-        (root / "README.md").write_text("# Local smoke\n", encoding="utf-8")
+        (root / "README.md").write_text("# Local smoke\n\nFixture body.\n", encoding="utf-8")
         for index in range(1, 13):
             (root / f"evidence-{index}.txt").write_text(f"unique evidence {index}\n", encoding="utf-8")
         config = {
@@ -366,12 +407,17 @@ def main() -> int:
                 "stream": False,
             },
             "tool_profiles": {
+                "explorer": ["read_file", "list_dir", "grep_search", "glob_search", "read_content_ref",
+                             "submit_task_result"],
                 "worker": ["read_file", "list_dir", "grep_search", "glob_search", "read_content_ref",
                            "write_file", "edit_file", "run_shell", "run_check", "submit_task_result"],
                 "verifier": ["read_file", "list_dir", "grep_search", "glob_search", "read_content_ref",
                              "submit_task_result"],
             },
             "agents": [
+                {"kind": "explorer", "replicas": 1, "event_type": "explore", "profile": "explorer",
+                 "model": "fake-responses-model", "system_prompt_file": (repo / "prompts/swe/explorer.md").as_posix(),
+                 "task_max_retries": 2},
                 {"kind": "worker", "replicas": 1, "event_type": "", "profile": "worker",
                  "model": "fake-responses-model", "system_prompt_file": (repo / "prompts/swe/worker.md").as_posix(),
                  "task_max_retries": 3},
@@ -474,17 +520,25 @@ def main() -> int:
                 assert "record_observation_delta" in state.tools_seen, state.tools_seen
                 assert observations, "未找到 durable ObservationDelta"
                 assert all(json.loads(path.read_text(encoding="utf-8")).get("schema") ==
-                           "agentgo.observation-delta/v3" for path in observations), observations
-                assert state.observation_wire_verified, "Observation 未使用独立 exact Control lane"
+                           "agentgo.observation-delta/v4" for path in observations), observations
+                assert state.observation_wire_verified, "Observation 未使用 v9 auto/low Control lane"
+                assert state.observation_max_output_tokens == 4096, state.observation_max_output_tokens
+                assert state.explorer_read, "simple-task/v2 未实际路由 fast Explorer"
                 assert state.observation_malformed_sent and len(checkpoint_failures) == 1, checkpoint_failures
                 assert state.verifier_reads == 4, f"Acceptance 知识轮次数={state.verifier_reads}"
                 assert state.verifier_content_ref_requested and state.verifier_content_ref_read, \
                     "Acceptance 未完成冻结上游 ContentRef 委托读取"
                 assert state.acceptance_check_ref, "Acceptance 未引用 typed CheckRef 别名"
-                assert len(observations) >= 2, f"Worker/Acceptance Observation 未全部落盘: {observations}"
+                assert len(observations) >= 1, f"Worker Observation 未落盘: {observations}"
                 assert reservations and reservations == settlements, (reservations, settlements)
                 assert ledger_model_calls == trace_model_calls, (ledger_model_calls, trace_model_calls)
                 assert not checkpoint_preflight_failures, checkpoint_preflight_failures
+                control_store = root / ".agentgo" / "state" / "control-capabilities" / "control-capabilities.jsonl"
+                assert control_store.is_file(), "ControlCapabilityStore 未完成生产装配"
+                binding_events = [event for event in trace_events if event.get("kind") == "llm_call_start"]
+                assert binding_events and all(event.get("effective_model") and event.get("model_capability_digest")
+                                              and event.get("invocation_profile_ref") for event in binding_events), \
+                    "Invocation ContextBinding v2 trace 字段不完整"
                 assert checks, "未找到 durable CheckRecord"
                 assert len(delivery_files) == 1, f"Delivery Transaction 数量异常: {delivery_files}"
                 delivery_tx = json.loads(delivery_files[0].read_text(encoding="utf-8"))
@@ -496,6 +550,10 @@ def main() -> int:
                     "success promotion 后仍残留 Delivery workspace"
                 assert "submit_recovery_decision" in state.tools_seen, state.tools_seen
                 assert "submit_change_decision" in state.tools_seen, state.tools_seen
+                recovery_gates = [event.get("recovery_action_gate") or {} for event in trace_events
+                                  if event.get("kind") == "recovery_action_gated"]
+                assert recovery_gates and all(gate.get("schema") == "agentgo.recovery-delta/v5"
+                                              for gate in recovery_gates), recovery_gates
                 assert "run_check" in state.tools_seen, state.tools_seen
                 artifact_path = root / "local-smoke.txt"
                 artifact_candidates = [str(path.relative_to(root)) for path in root.rglob("local-smoke.txt")]

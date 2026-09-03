@@ -377,8 +377,8 @@ func TestRejectMalformedInputs(t *testing.T) {
 func TestRejectBasicFields(t *testing.T) {
 	t.Run("schema错误", func(t *testing.T) {
 		// 终态契约 v2 起 "agentgo.graph/v2" 成为合法值，本用例改为断言
-		// 第三值被拒；合法值清单随错误消息列出（含 v1）。
-		doc := mutate(t, tinyDocJSON, `"agentgo.graph/v1"`, `"agentgo.graph/v4"`)
+		// 未知版本被拒；合法值清单随错误消息列出（含 v1）。
+		doc := mutate(t, tinyDocJSON, `"agentgo.graph/v1"`, `"agentgo.graph/v5"`)
 		assertInvalid(t, "schema 错误", doc, "基本字段", "agentgo.graph/v1")
 	})
 	t.Run("schema缺失", func(t *testing.T) {
@@ -690,12 +690,12 @@ func TestV2MinimalDocumentParses(t *testing.T) {
 	}
 }
 
-// TestV2SchemaThirdValueRejected schema 只接受 v1/v2 两个封闭值，第三值拒绝
-// 且错误消息列出全部合法值。
-func TestV3SchemaFourthValueRejected(t *testing.T) {
+// TestSchemaFifthValueRejected schema 只接受冻结的 v1-v4，未知第五值拒绝且
+// 错误消息列出全部合法值。
+func TestSchemaFifthValueRejected(t *testing.T) {
 	doc := strings.Replace(buildV2WorkerDoc("agent", "实施修改并汇报结果", `{"to":"done"}`),
-		`"agentgo.graph/v2"`, `"agentgo.graph/v4"`, 1)
-	assertInvalid(t, "schema 第四值", doc, "基本字段", `"agentgo.graph/v1"`)
+		`"agentgo.graph/v2"`, `"agentgo.graph/v5"`, 1)
+	assertInvalid(t, "schema 第五值", doc, "基本字段", `"agentgo.graph/v1"`)
 }
 
 // TestV2WorkerEventVocabulary v2 废弃 agent/controller 的业务事件名：出边

@@ -243,8 +243,9 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 		return "", err
 	}
 	if len(draft.Candidate.Nodes) != 0 || strings.TrimSpace(draft.Candidate.Root) != "" {
-		if simple, ok := draft.Candidate.Nodes["work"]; ok &&
-			simple.Metadata["authoring_template"] == "simple-task/v1" {
+		simple, simpleOK := draft.Candidate.Nodes["work"]
+		template := simple.Metadata["authoring_template"]
+		if simpleOK && (template == "simple-task/v1" || template == "simple-task/v2" || template == "simple-task/v3" || template == "simple-task/v4") {
 			if draft.Contract.ExecutionClass == input.ExecutionClass {
 				return marshalGraphAuthoringResult(draft)
 			}
@@ -269,6 +270,7 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 	workProgress := policycatalog.ProgressInvestigationCurrent
 	workTools := []string{"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref"}
 	recoverySchema := graph.RecoveryDeltaSchemaV2
+	authoringTemplate := "simple-task/v1"
 	recoveryDescription := "读取 failure_context 中冻结的 TaskOutcome、reason_code、checkpoint、ObservationDelta、工作记录与证据，裁决当前 Graph 是否应创建新的 work Activation。若现有 Definition 需要改变，只能先走 GraphChangeProposal 的 propose→validate→commit 事务；不得修改已终态的旧 Activation，不得亲自执行业务工作。最终必须调用 submit_recovery_decision：retry 声明 changed_dimensions、strategy、类型化 first_action、expected_milestone，source 字段由 framework 自动绑定；blocked 必须说明 blocked_reason。没有可验证变化只能 blocked。"
 	if input.ExecutionClass == graph.ExecutionMutating {
 		contract.RequiredEffects = []string{"workspace-change"}
@@ -277,8 +279,9 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 		workBindings.Checks = []string{"verification"}
 		workProgress = policycatalog.ProgressCodeChangeCurrent
 		workTools = append(workTools, "write_file", "edit_file", "run_check")
-		recoverySchema = graph.RecoveryDeltaSchemaV4
-		recoveryDescription += " 本节点使用 RecoveryDelta v4：first_action 必须是 EvidenceContract 首个文件的 read_file；evidence_contract.files 冻结下一 Worker 在修改决策前必须完整覆盖的最小文件集合。L3 只强制证据覆盖与 typed edit/need_context/hypothesis_rejected/blocked 决策；只有 Worker 自选 edit 后才推进其声明的 edit steps 与冻结 CheckContract，禁止为制造进展而无条件改文件。"
+		recoverySchema = graph.RecoveryDeltaSchemaV5
+		authoringTemplate = "simple-task/v4"
+		recoveryDescription += " 本节点使用 RecoveryDelta v5：Runtime 把失败 Activation 的 Delivery、成功 mutation 路径与最新 typed check 冻结为 candidate_state；first_action 只建立一个 bounded focus page。Worker 随后必须 typed 选择 edit、resume_candidate、带 path/offset/limit 的 need_context、hypothesis_rejected 或 blocked；need_context 应跳到上游 evidence_ranges 指向的相关页，禁止为完整覆盖顺序翻遍文件。resume_candidate 只对非空 dirty candidate 开放，并仍须执行冻结 CheckContract。"
 	}
 
 	completed := graph.EventCompleted
@@ -305,7 +308,7 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 			OutputContract:      &graph.NodeOutputContract{SummaryRequired: true},
 			ProgressContractRef: workProgress, ContextPolicyRef: policycatalog.ContextDefaultCurrent,
 			ContractBindings: workBindings,
-			Metadata:         map[string]string{"authoring_template": "simple-task/v1"},
+			Metadata:         map[string]string{"authoring_template": authoringTemplate},
 		},
 		"recovery": {
 			Kind: graph.KindController,
@@ -330,7 +333,7 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 				graph.MetadataControllerRole:      string(graph.ControllerRoleLoopRecovery),
 				graph.MetadataRecoveryMaxRetries:  "2",
 				graph.MetadataRecoveryDeltaSchema: recoverySchema,
-				"authoring_template":              "simple-task/v1",
+				"authoring_template":              authoringTemplate,
 			},
 		},
 		"acceptance": {
@@ -376,7 +379,7 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 				graph.MetadataControllerRole:      string(graph.ControllerRoleLoopRecovery),
 				graph.MetadataRecoveryMaxRetries:  "2",
 				graph.MetadataRecoveryDeltaSchema: graph.RecoveryDeltaSchemaV2,
-				"authoring_template":              "simple-task/v1",
+				"authoring_template":              authoringTemplate,
 			},
 		},
 		"accepted":                    simpleEnd("验收通过", graph.DefinitionEndSuccess),
@@ -391,6 +394,12 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 		"acceptance-recovery-failed":  simpleEnd("验收恢复裁决运行失败", graph.DefinitionEndFailed),
 		"acceptance-recovery-blocked": simpleEnd("验收恢复裁决自身阻塞", graph.DefinitionEndBlocked),
 	}
+	candidate.Schema = graph.SchemaV3
+	if input.ExecutionClass == graph.ExecutionMutating {
+		candidate.Schema = graph.SchemaV4
+		configureMutatingSimpleGraphV3(candidate.Nodes, objective, workTools, workBindings, workProgress)
+		candidate.Root = "investigate"
+	}
 	updated, err := g.Store.PatchDraft(draft.ProposalID, draft.DraftRevision, graph.GraphDraftPatch{
 		Contract: &contract, Candidate: &candidate,
 	})
@@ -398,6 +407,123 @@ func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[st
 		return "", err
 	}
 	return marshalGraphAuthoringResult(updated)
+}
+
+func configureMutatingSimpleGraphV3(nodes map[string]graph.GraphDefinitionNode, objective string,
+	workTools []string, workBindings graph.GraphContractBindings, workProgress string) {
+	completed, failed, blocked := graph.EventCompleted, graph.EventFailed, graph.EventBlocked
+
+	work := nodes["work"]
+	work.Task = &graph.NodeTask{
+		Title:       "依据调查证据实现原始请求",
+		Description: "消费上游 investigation_result 中的 failure_observation/hypothesis/evidence_files/evidence_ranges/boundary_evidence/rejected_alternative/recommended_change/verification_focus，先解释第一条具体失败，再核对公开入口、状态所有者与 framework 内部 consumer 三段边界，随后用定向检查证伪并完成下列原始请求。公开 accessor 读取有副作用而内部维护不应触发时，必须使用 backing field + side-effecting accessor，并让内部 consumer 绕过 accessor；alias 到公开 getter 或在叶子 consumer 周围保存/恢复状态不构成所有权边界。上游结论是有界调查证据，不是修改授权；若源码已否定假设，应基于新证据修正，不得重新无界浏览。完成时提交非空 summary；无法安全完成则 blocked。\n\n" + objective,
+	}
+	work.Next = []graph.Transition{
+		{To: "acceptance", TargetInput: "work_result", When: &graph.Condition{Event: completed}},
+		{To: "work-failed", When: &graph.Condition{Event: failed}},
+		{To: "recovery", TargetInput: "failure_context", When: &graph.Condition{Event: blocked}},
+	}
+	work.Metadata = map[string]string{"authoring_template": "simple-task/v4"}
+	nodes["work"] = work
+
+	nodes["investigate"] = graph.GraphDefinitionNode{
+		Kind: graph.KindAgent,
+		Task: &graph.NodeTask{
+			Title:       "调查原始请求的最小修改面",
+			Description: "只读定位下列请求对应的失败测试、关键调用链与最小修改点。根因假设必须先解释第一条具体 exception/failed assertion；若是缺失属性或符号，必须先定位期望的状态所有权，不能跳到后续语义。必须区分公开 API/proxy 的用户访问与 framework 生命周期内部访问，并在提交前用状态所有权边界反证根因假设；定向红态本身不是根因证明。提交 completed 时 result 必须给出 failure_observation、hypothesis、evidence_files、evidence_ranges、boundary_evidence、rejected_alternative、recommended_change、verification_focus。failure_observation 逐字引用包含第一失败 symbol 的 evidence range，并给出 failure_kind。boundary_evidence.public_entry/state_owner/internal_consumer 各自逐字引用 evidence_ranges 中的 path/symbol/start_line/end_line，symbol 字面必须真实出现在声明行段；尚不存在、准备新增的方法只能写进 recommended_change，不能充当 evidence。三类角色至少覆盖两个不同 path/symbol；rejected_alternative 说明被证据否定的局部方案。evidence_ranges 只能列出实际读取的范围。证据不足则 blocked，不得猜测。\n\n" + objective,
+		},
+		Capability: &graph.Capability{Tools: []string{
+			"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref",
+		}},
+		Next: []graph.Transition{
+			{To: "work", When: &graph.Condition{Event: completed}},
+			{To: "investigation-failed", When: &graph.Condition{Event: failed}},
+			{To: "investigation-blocked", When: &graph.Condition{Event: blocked}},
+		},
+		OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Profile: graph.OutputContractProfileInvestigationBoundaryV2, Fields: []graph.OutputFieldContract{
+			{Path: "$.failure_observation", Type: "object", Description: "第一条具体 exception/failed assertion；逐字引用 evidence_ranges", Required: true},
+			{Path: "$.failure_observation.failure_kind", Type: "string", Description: "第一失败类型，例如 AttributeError 或 assertion_failed", Required: true},
+			{Path: "$.hypothesis", Type: "string", Description: "可证伪根因假设", Required: true},
+			{Path: "$.evidence_files", Type: "array", Description: "最小相关项目相对文件集合", Required: true},
+			{Path: "$.evidence_ranges", Type: "array", Description: "已实际读取的关键范围对象：path/start_line/end_line/symbol", Required: true},
+			{Path: "$.boundary_evidence", Type: "object", Description: "公开入口、状态所有者、内部 consumer 的三段证据", Required: true},
+			{Path: "$.boundary_evidence.public_entry", Type: "object", Description: "逐字引用 evidence_ranges；symbol 必须真实出现在范围内的公开 API/proxy 入口", Required: true},
+			{Path: "$.boundary_evidence.state_owner", Type: "object", Description: "逐字引用 evidence_ranges；symbol 必须真实出现在范围内的状态背板/所有者", Required: true},
+			{Path: "$.boundary_evidence.internal_consumer", Type: "object", Description: "逐字引用 evidence_ranges；symbol 必须真实出现在范围内的 framework 内部 consumer", Required: true},
+			{Path: "$.rejected_alternative", Type: "string", Description: "已由边界证据否定的局部替代假设", Required: true},
+			{Path: "$.recommended_change", Type: "string", Description: "建议的最小修改点", Required: true},
+			{Path: "$.verification_focus", Type: "string", Description: "定向验证重点", Required: true},
+		}},
+		ProgressContractRef: policycatalog.ProgressInvestigationCurrent,
+		ContextPolicyRef:    policycatalog.ContextDefaultCurrent,
+		Metadata: map[string]string{
+			"route": "explore", "authoring_template": "simple-task/v4",
+		},
+	}
+
+	recovery := nodes["recovery"]
+	recovery.Next = []graph.Transition{
+		{To: "repair", ReplayInputs: true, When: decisionEquals("retry")},
+		{To: "work-blocked", When: decisionEquals("blocked")},
+		{To: "recovery-failed", When: &graph.Condition{Event: failed}},
+		{To: "recovery-blocked", When: &graph.Condition{Event: blocked}},
+	}
+	recovery.Metadata[graph.MetadataRecoveryMaxRetries] = "1"
+	nodes["recovery"] = recovery
+
+	repair := graph.GraphDefinitionNode{
+		Kind: graph.KindAgent,
+		Task: &graph.NodeTask{
+			Title:       "恢复并完成已有候选",
+			Description: "消费原 investigation_result 与 RecoveryDelta v5 candidate_state。若 dirty candidate 仍符合证据，使用 resume_candidate 进入冻结检查；若需修改则声明最小 edit_steps。不得丢弃已有 Delivery 后从头调查。完成下列原始请求并运行 required checks。\n\n" + objective,
+		},
+		Capability: &graph.Capability{Tools: append([]string(nil), workTools...), Isolation: graph.IsolationWorkspace},
+		Next: []graph.Transition{
+			{To: "acceptance-repair", TargetInput: "repair_result", When: &graph.Condition{Event: completed}},
+			{To: "repair-failed", When: &graph.Condition{Event: failed}},
+			{To: "repair-blocked", When: &graph.Condition{Event: blocked}},
+		},
+		OutputContract: &graph.NodeOutputContract{SummaryRequired: true},
+		// v11 只负责给首次 Worker 冻结候选修复预留窗口；repair 已是同一
+		// Delivery 的最后一次有界执行，继续使用 v11 会在没有下一条 recovery
+		// 边时再次触发 candidate_completion_handoff。v10 保留同一 Observation
+		// wire 与 decision gate，但不会制造不可消费的二次交接。
+		ProgressContractRef: policycatalog.ProgressCodeChangeV10, ContextPolicyRef: policycatalog.ContextDefaultCurrent,
+		ContractBindings: workBindings,
+		Metadata:         map[string]string{"authoring_template": "simple-task/v4", "recovery_target": "candidate-repair/v1"},
+	}
+	nodes["repair"] = repair
+
+	nodes["acceptance-repair"] = graph.GraphDefinitionNode{
+		Kind: graph.KindAcceptance,
+		Task: &graph.NodeTask{
+			Title:          "独立验收恢复候选",
+			Description:    "逐项核验恢复后的同一 Delivery candidate 是否真实满足原始请求。completed 时 result.verdict 必须恰为 pass、fixable 或 failed；证据不足时 blocked。\n\n" + objective,
+			RequiredInputs: []string{"repair_result"},
+		},
+		Next: []graph.Transition{
+			{To: "accepted-repair", When: resultEquals("pass")},
+			{To: "fixable-repair", When: resultEquals("fixable")},
+			{To: "rejected-repair", When: resultEquals("failed")},
+			{To: "acceptance-repair-failed", When: &graph.Condition{Event: failed}},
+			{To: "acceptance-repair-blocked", When: &graph.Condition{Event: blocked}},
+		},
+		OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Fields: []graph.OutputFieldContract{{
+			Path: "$.verdict", Type: "string", Description: "pass|fixable|failed", Required: true,
+		}}},
+		ProgressContractRef: policycatalog.ProgressVerificationCurrent,
+		ContextPolicyRef:    policycatalog.ContextDefaultCurrent,
+	}
+
+	nodes["investigation-failed"] = simpleEnd("调查失败", graph.DefinitionEndFailed)
+	nodes["investigation-blocked"] = simpleEnd("调查证据不足", graph.DefinitionEndBlocked)
+	nodes["repair-failed"] = simpleEnd("恢复执行失败", graph.DefinitionEndFailed)
+	nodes["repair-blocked"] = simpleEnd("恢复执行阻塞", graph.DefinitionEndBlocked)
+	nodes["accepted-repair"] = simpleEnd("恢复候选验收通过", graph.DefinitionEndSuccess)
+	nodes["fixable-repair"] = simpleEnd("恢复候选仍有可修复缺口", graph.DefinitionEndFailed)
+	nodes["rejected-repair"] = simpleEnd("恢复候选验收失败", graph.DefinitionEndFailed)
+	nodes["acceptance-repair-failed"] = simpleEnd("恢复候选验收运行失败", graph.DefinitionEndFailed)
+	nodes["acceptance-repair-blocked"] = simpleEnd("恢复候选验收阻塞", graph.DefinitionEndBlocked)
 }
 
 func resultEquals(value string) *graph.Condition {

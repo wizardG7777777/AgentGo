@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"agentgo/internal/graph"
@@ -190,6 +191,69 @@ func TestRecoveryDeltaV4CompletesEvidenceBeforeTypedEditDecision(t *testing.T) {
 	assertRecoveryGate(t, policy, "agent:recovery-evidence", "read_file", "path", "src/a.py")
 }
 
+func TestRecoveryDeltaV5ResumeCandidateRequiresTypedCheck(t *testing.T) {
+	registry := NewToolRegistry()
+	registry.Register("read_file", "读取", map[string]any{"type": "object", "properties": map[string]any{
+		"path": map[string]any{"type": "string"}, "offset": map[string]any{"type": "integer"},
+		"limit": map[string]any{"type": "integer"}, "force_full": map[string]any{"type": "boolean"},
+	}}, func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	registry.Register("run_check", "检查", map[string]any{"type": "object", "properties": map[string]any{
+		"check_id": map[string]any{"type": "string"}, "kind": map[string]any{"type": "string"},
+		"command": map[string]any{"type": "string"},
+	}}, func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	registry.Register("submit_change_decision", "决策", map[string]any{"type": "object", "properties": map[string]any{
+		"decision": map[string]any{"type": "string"},
+	}}, func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	task := &model.Task{ContextInputs: []model.TaskContextInput{recoveryDirectiveContextInputV5(
+		"recovery@1", []string{"src/a.py"}, []string{"src/a.py"})},
+		RunContract: &runcontract.RunContract{CheckContracts: []runcontract.CheckContract{{
+			CheckID: "targeted", Kind: "test", ExactCommand: "pytest -q tests/test_a.py",
+		}}},
+	}
+	history := []HistoryEntry{toolHistory("read-a", "read_file", map[string]any{
+		"path": "src/a.py", "offset": 1, "limit": recoveryV5FocusLines, "force_full": true,
+	}, "[file] src/a.py (lines 1-240 of 1500)\n[hash] a\n---\na")}
+	policy := deriveInvocationToolPolicyWithControl(task, history, registry, registry)
+	if policy.Phase != "agent:recovery-change-decision" {
+		t.Fatalf("v5 完整覆盖后未进入 change decision: %+v", policy)
+	}
+	decisionSchema := policy.Registry.Defs()[0].Parameters["properties"].(map[string]any)["decision"].(map[string]any)
+	if !strings.Contains(fmt.Sprint(decisionSchema["enum"]), "resume_candidate") {
+		t.Fatalf("v5 decision schema 未开放 resume_candidate: %#v", decisionSchema)
+	}
+	history = append(history, toolHistory("need-a-2", "submit_change_decision", map[string]any{
+		"decision": "need_context", "path": "src/a.py", "offset": 241, "limit": recoveryV5FocusLines,
+	}, `{"schema":"agentgo.change-decision/v2","decision":"need_context","path":"src/a.py","offset":241,"limit":240,"summary":"补读 a 后页"}`))
+	policy = deriveInvocationToolPolicyWithControl(task, history, registry, registry)
+	assertRecoveryGate(t, policy, "agent:recovery-evidence", "read_file", "path", "src/a.py")
+	assertRecoveryGate(t, policy, "agent:recovery-evidence", "read_file", "offset", 241)
+	history = append(history, toolHistory("read-a-2", "read_file", map[string]any{
+		"path": "src/a.py", "offset": 241, "limit": recoveryV5FocusLines, "force_full": true,
+	}, "[file] src/a.py (lines 241-480 of 1500)\n[hash] a\n---\na2"))
+	history = append(history, toolHistory("resume", "submit_change_decision", map[string]any{
+		"decision": "resume_candidate",
+	}, `{"schema":"agentgo.change-decision/v2","decision":"resume_candidate","summary":"复用候选"}`))
+	policy = deriveInvocationToolPolicyWithControl(task, history, registry, registry)
+	assertRecoveryGate(t, policy, "agent:recovery-check", "run_check", "check_id", "targeted")
+	assertRecoveryGate(t, policy, "agent:recovery-check", "run_check", "command", "pytest -q tests/test_a.py")
+}
+
+func TestRecoveryDeltaV5CompletionBudgetIsStageBounded(t *testing.T) {
+	if got := recoveryV5CompletionLimit(recoveryStageEvidence, nil); got != 2048 {
+		t.Fatalf("v5 evidence completion=%d", got)
+	}
+	if got := recoveryV5CompletionLimit(recoveryStageDecision, nil); got != 4096 {
+		t.Fatalf("v5 decision completion=%d", got)
+	}
+	if got := recoveryV5CompletionLimit(recoveryStageMutation, nil); got != 4096 {
+		t.Fatalf("v5 mutation completion=%d", got)
+	}
+	retry := []HistoryEntry{{SystemNotice: "[same-snapshot-retry 1/2] output truncated"}}
+	if got := recoveryV5CompletionLimit(recoveryStageDecision, retry); got != 8192 {
+		t.Fatalf("v5 decision correction completion=%d", got)
+	}
+}
+
 func TestRecoveryDeltaV4FailedEvidenceReadCanOnlyExitSafely(t *testing.T) {
 	registry := NewToolRegistry()
 	registry.Register("read_file", "读取", map[string]any{"type": "object", "properties": map[string]any{
@@ -219,6 +283,9 @@ func TestRecoveryDeltaV4FailedEvidenceReadCanOnlyExitSafely(t *testing.T) {
 		!sameExactToolSet(policy.Registry.Names(), []string{"submit_change_decision"}) {
 		t.Fatalf("证据读取失败必须进入安全退出 phase: phase=%s tools=%v", policy.Phase, policy.Registry.Names())
 	}
+	if policy.RecoveryGate == nil || policy.RecoveryGate.Path != "" {
+		t.Fatalf("安全退出 decision gate 不得伪造工具 path 约束: %+v", policy.RecoveryGate)
+	}
 	properties := policy.Registry.Defs()[0].Parameters["properties"].(map[string]any)
 	decision := properties["decision"].(map[string]any)
 	if !sameExactToolSet(anyStrings(decision["enum"]), []string{"hypothesis_rejected", "blocked"}) {
@@ -238,6 +305,67 @@ func TestRecoveryDeltaV4FailedEvidenceReadCanOnlyExitSafely(t *testing.T) {
 	if policy.Phase != "agent:recovery-evidence-unavailable" ||
 		!sameExactToolSet(policy.Registry.Names(), []string{"submit_change_decision"}) {
 		t.Fatalf("ContentRef 读取失败也必须安全退出: phase=%s tools=%v", policy.Phase, policy.Registry.Names())
+	}
+}
+
+func TestRecoveryDeltaV4IgnoresSkippedFanoutWhenAdvancingEvidence(t *testing.T) {
+	registry := NewToolRegistry()
+	registry.Register("read_file", "读取", map[string]any{"type": "object", "properties": map[string]any{
+		"path": map[string]any{"type": "string"}, "offset": map[string]any{"type": "integer"},
+		"limit": map[string]any{"type": "integer"}, "force_full": map[string]any{"type": "boolean"},
+	}}, func(context.Context, map[string]any) (string, error) { return "ok", nil })
+	task := &model.Task{GraphRecoveryDeltaSchema: graph.RecoveryDeltaSchemaV4,
+		ContextInputs: []model.TaskContextInput{recoveryDirectiveContextInputV4(
+			"recovery@1", []string{"src/flask/app.py"})},
+	}
+	history := []HistoryEntry{
+		toolHistory("read-1", "read_file", map[string]any{
+			"path": "src/flask/app.py", "offset": 1, "limit": recoveryEvidenceReadLines,
+		}, "[file] src/flask/app.py (lines 1-160 of 500)\n[hash] file\n---\npage-1"),
+		{
+			ToolCalled: true,
+			ToolCalls: []llm.ToolCall{
+				{ID: "read-2", Name: "read_file", Arguments: map[string]any{
+					"path": "src/flask/app.py", "offset": 161, "limit": recoveryEvidenceReadLines,
+				}},
+				{ID: "skipped-3", Name: "read_file", Arguments: map[string]any{
+					"path": "src/flask/app.py", "offset": 321, "limit": recoveryEvidenceReadLines,
+				}},
+				{ID: "skipped-4", Name: "read_file", Arguments: map[string]any{
+					"path": "src/flask/app.py", "offset": 481, "limit": recoveryEvidenceReadLines,
+				}},
+			},
+			ToolResults: []ToolResult{
+				{ToolCallID: "read-2", Content: "[file] src/flask/app.py (lines 161-320 of 500)\n[hash] file\n---\npage-2"},
+				{ToolCallID: "skipped-3", Content: "已跳过：当前机械阶段只执行 provider 顺序中的首个工具调用"},
+				{ToolCallID: "skipped-4", Content: "已跳过：当前机械阶段只执行 provider 顺序中的首个工具调用"},
+			},
+		},
+	}
+	policy := deriveInvocationToolPolicyWithControl(task, history, registry, registry)
+	assertRecoveryGate(t, policy, "agent:recovery-evidence", "read_file", "offset", 321)
+	if policy.RecoveryGate.Stage != recoveryStageEvidence {
+		t.Fatalf("skipped fan-out 不得把证据阶段改为 unavailable: %+v", policy.RecoveryGate)
+	}
+}
+
+func TestRecoveryActionGateRejectsMismatchedFrozenArguments(t *testing.T) {
+	gate := recoveryActionGate{Stage: recoveryStageEvidence, Tool: "read_file",
+		Path: "src/flask/app.py", Offset: 1, Limit: recoveryEvidenceReadLines, ForceFull: true}
+	valid := llm.ToolCall{ID: "valid", Name: "read_file", Arguments: map[string]any{
+		"path": "src/flask/app.py", "offset": 1, "limit": recoveryEvidenceReadLines, "force_full": true,
+	}}
+	if err := validateRecoveryActionCall(gate, []llm.ToolCall{valid}); err != nil {
+		t.Fatalf("冻结参数完全一致应放行: %v", err)
+	}
+	invalid := valid
+	invalid.ID = "invalid"
+	invalid.Arguments = map[string]any{
+		"path": "src/flask/app.py", "offset": 1, "limit": recoveryEvidenceReadLines, "force_full": false,
+	}
+	if err := validateRecoveryActionCall(gate, []llm.ToolCall{invalid}); err == nil ||
+		!isActionContractViolation(err) || !strings.Contains(err.Error(), "force_full=true") {
+		t.Fatalf("force_full=false 必须在 dispatch 前被 L3 拒绝: %v", err)
 	}
 }
 
@@ -315,6 +443,23 @@ func recoveryDirectiveContextInputV4(sourceActivation string, files []string) mo
 			"schema":            graph.RecoveryDeltaSchemaV4,
 			"first_action":      map[string]any{"tool": "read_file", "path": files[0]},
 			"evidence_contract": map[string]any{"files": files},
+		},
+	})
+	return model.TaskContextInput{Kind: model.TaskContextUpstreamResult,
+		Content: `<upstream-result authority="graph-dataflow">` + string(encoded) + `</upstream-result>`}
+}
+
+func recoveryDirectiveContextInputV5(sourceActivation string, evidenceFiles, dirtyPaths []string) model.TaskContextInput {
+	encoded, _ := json.Marshal(map[string]any{
+		"source_activation_id": sourceActivation, "target_input": "recovery_directive",
+		"result": map[string]any{
+			"schema":            graph.RecoveryDeltaSchemaV5,
+			"first_action":      map[string]any{"tool": "read_file", "path": evidenceFiles[0]},
+			"evidence_contract": map[string]any{"files": evidenceFiles},
+			"candidate_state": map[string]any{
+				"schema": graph.RecoveryCandidateStateSchemaV1, "source_activation_id": "work@1",
+				"delivery_id": "delivery:test", "dirty_paths": dirtyPaths,
+			},
 		},
 	})
 	return model.TaskContextInput{Kind: model.TaskContextUpstreamResult,

@@ -19,6 +19,7 @@ import (
 	"agentgo/internal/contentstore"
 	"agentgo/internal/contextadapter"
 	"agentgo/internal/contextstore"
+	"agentgo/internal/controlcapability"
 	"agentgo/internal/dashboard"
 	"agentgo/internal/delivery"
 	"agentgo/internal/effect"
@@ -456,6 +457,11 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// authority；必须在 Scheduler 装配前创建，否则其 Observation
 	// 控制调用会出现“Prompt 承诺但 L3 工具面为空”。
 	taskMemStore := taskmem.NewStore(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "taskmem"))
+	controlCapabilityStore, controlCapabilityErr := controlcapability.Open(
+		filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "control-capabilities"))
+	if controlCapabilityErr != nil {
+		return nil, fmt.Errorf("初始化 ControlCapabilityStore 失败: %w", controlCapabilityErr)
+	}
 	deliveryStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "deliveries")
 	deliveryStateStore, deliveryStoreErr := delivery.NewStore(deliveryStorePath)
 	if deliveryStoreErr != nil {
@@ -1039,6 +1045,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		RunBudgetStore:          runBudgetStateStore,
 		ContentStore:            contentStateStore,
 		CheckStore:              checkStateStore,
+		ControlCapabilityStore:  controlCapabilityStore,
 		ContextRuntime:          contextRuntime,
 		RouteValidator:          agentRegistry,
 		Activity:                activity,

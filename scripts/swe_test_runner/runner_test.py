@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -49,6 +50,21 @@ def pytest_payload(**overrides):
 
 
 class SWETestRunnerContractTest(unittest.TestCase):
+    def test_baseline_failure_context_is_bounded_authoritative_and_normalized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "targeted-baseline.pytest.log"
+            path.write_text(
+                "\x1b[31mFAILED tests/test_basic.py::test_access\x1b[0m\r\n"
+                "AttributeError: RequestContext has no attribute _session\r\n",
+                encoding="utf-8",
+            )
+            rendered = swe_test_runner.render_baseline_failure_context(path)
+        self.assertIn('authority="swe-test-runner"', rendered)
+        self.assertIn("AttributeError", rendered)
+        self.assertIn("_session", rendered)
+        self.assertNotIn("\x1b", rendered)
+        self.assertLessEqual(len(rendered), 7000)
+
     def test_console_streams_are_reconfigured_to_utf8(self):
         class ReconfigurableStream:
             def __init__(self):
@@ -92,13 +108,15 @@ class SWETestRunnerContractTest(unittest.TestCase):
             for name in swe_test_runner.REQUIRED_ENV_VARS
         }
         environment["SWE_API_KEY"] = "secret-that-must-not-be-rendered"
-        environment["SWE_MODEL"] = " \t"
+        environment["SWE_FAST_MODEL"] = " \t"
+        environment["SWE_FLAG_SHIP_MODEL"] = "\t "
         del environment["SWE_BASE_URL"]
         with mock.patch.dict(os.environ, environment, clear=True):
             with self.assertRaises(RuntimeError) as raised:
                 swe_test_runner.required_environment_values()
         message = str(raised.exception)
-        self.assertIn("SWE_MODEL", message)
+        self.assertIn("SWE_FAST_MODEL", message)
+        self.assertIn("SWE_FLAG_SHIP_MODEL", message)
         self.assertIn("SWE_BASE_URL", message)
         self.assertNotIn("SWE_API_KEY", message)
         self.assertNotIn("secret-that-must-not-be-rendered", message)
@@ -111,13 +129,32 @@ class SWETestRunnerContractTest(unittest.TestCase):
         for name in swe_test_runner.REQUIRED_ENV_VARS:
             self.assertIn(f"- {name}", message)
 
+    def test_obsolete_single_model_environment_does_not_satisfy_split_contract(self):
+        environment = {
+            "SWE_API_KEY": "secret",
+            "SWE_BASE_URL": "https://provider.invalid/v1",
+            "SWE_MODEL": "obsolete-model",
+            "SWE_BASE_MODEL": "obsolete-base-model",
+            "SWE_WORKER_MODEL": "obsolete-worker-model",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(RuntimeError) as raised:
+                swe_test_runner.required_environment_values()
+        message = str(raised.exception)
+        self.assertIn("SWE_FAST_MODEL", message)
+        self.assertIn("SWE_FLAG_SHIP_MODEL", message)
+        self.assertNotIn("obsolete-model", message)
+        self.assertNotIn("obsolete-base-model", message)
+        self.assertNotIn("obsolete-worker-model", message)
+
     def test_config_requires_explicit_environment_and_trims_values(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             environment = {
                 "SWE_API_KEY": " secret ",
                 "SWE_BASE_URL": " https://provider.invalid/v1 ",
-                "SWE_MODEL": " model-name ",
+                "SWE_FAST_MODEL": " fast-model ",
+                "SWE_FLAG_SHIP_MODEL": " flag-ship-model ",
                 "SWE_PROTOCOL": " responses ",
                 "SWE_TESTBED": f" {root / 'testbed'} ",
                 "SWE_TASKS_FILE": f" {root / 'tasks.csv'} ",
@@ -129,7 +166,12 @@ class SWETestRunnerContractTest(unittest.TestCase):
             with mock.patch.dict(os.environ, environment, clear=True):
                 config = swe_test_runner.SWETestRunnerConfig.from_env()
             self.assertEqual(config.base_url, "https://provider.invalid/v1")
-            self.assertEqual(config.model, "model-name")
+            self.assertEqual(config.fast_model, "fast-model")
+            self.assertEqual(config.flag_ship_model, "flag-ship-model")
+            self.assertEqual(config.model_capabilities(), {
+                "fast": "fast-model",
+                "flag_ship": "flag-ship-model",
+            })
             self.assertEqual(config.protocol, "responses")
             self.assertEqual(config.testbed, (root / "testbed").resolve())
             self.assertEqual(config.flask_repo, (root / "flask").resolve())
@@ -174,7 +216,8 @@ class SWETestRunnerContractTest(unittest.TestCase):
         environment = {
             "SWE_API_KEY": "secret",
             "SWE_BASE_URL": "https://provider.invalid/v1",
-            "SWE_MODEL": "model-name",
+            "SWE_FAST_MODEL": "fast-model",
+            "SWE_FLAG_SHIP_MODEL": "flag-ship-model",
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -314,7 +357,8 @@ class SWETestRunnerContractTest(unittest.TestCase):
         environment = {
             "SWE_API_KEY": "secret",
             "SWE_BASE_URL": "https://provider.invalid/v1",
-            "SWE_MODEL": "model-name",
+            "SWE_FAST_MODEL": "fast-model",
+            "SWE_FLAG_SHIP_MODEL": "flag-ship-model",
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -465,7 +509,8 @@ class SWETestRunnerContractTest(unittest.TestCase):
             root = Path(directory)
             (root / "setting.swe-flask.yaml").write_text(
                 'root: "__PROJECT_ROOT__"\nport: __PORT__\ntoken: "__TOKEN__"\n'
-                'agentgo: "__AGENTGO_ROOT__"\nbase: "__BASE_URL__"\nmodel: "__MODEL__"\n'
+                'agentgo: "__AGENTGO_ROOT__"\nbase: "__BASE_URL__"\n'
+                'fast_model: "__FAST_MODEL__"\nflag_ship_model: "__FLAG_SHIP_MODEL__"\n'
                 'protocol: "__PROTOCOL__"\nkey: ${__KEY_VAR__}\n',
                 encoding="utf-8",
             )
@@ -477,7 +522,8 @@ class SWETestRunnerContractTest(unittest.TestCase):
                 prompt_dir=root / "prompts",
                 flask_repo=root / "flask",
                 base_url="https://provider.invalid/v1",
-                model='model-"quoted',
+                fast_model='fast-"quoted',
+                flag_ship_model='flag-ship-"quoted',
                 protocol="responses",
             )
             run_dir = root / "run"
@@ -485,7 +531,8 @@ class SWETestRunnerContractTest(unittest.TestCase):
             rendered = swe_test_runner.render_setting(config, root / "worktree", run_dir, 8123, "nonce")
             content = rendered.read_text(encoding="utf-8")
             self.assertNotRegex(content, r"__[A-Z0-9_]+__")
-            self.assertIn('model: "model-\\"quoted"', content)
+            self.assertIn('fast_model: "fast-\\"quoted"', content)
+            self.assertIn('flag_ship_model: "flag-ship-\\"quoted"', content)
             self.assertIn("port: 8123", content)
             root_value = str(root).replace("\\", "/")
             worktree_value = str(root / "worktree").replace("\\", "/")
@@ -507,6 +554,42 @@ class SWETestRunnerContractTest(unittest.TestCase):
             swe_test_runner.yaml_template_value(r"literal\value"),
             r"literal\\value",
         )
+
+    def test_versioned_setting_assigns_capability_models_by_role(self):
+        repo_root = Path(swe_test_runner.__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            config = swe_test_runner.SWETestRunnerConfig(
+                agentgo_root=repo_root, agentgo_bin=repo_root / "agentgo",
+                testbed=root / "testbed", tasks_file=root / "tasks.csv",
+                prompt_dir=root / "prompts", flask_repo=root / "flask",
+                base_url="https://provider.invalid/v1", fast_model="fast-model",
+                flag_ship_model="flag-ship-model", protocol="responses",
+            )
+            setting = swe_test_runner.render_setting(
+                config, root / "worktree", run_dir, 8123, "nonce",
+            )
+            content = setting.read_text(encoding="utf-8")
+
+        self.assertIn('default_model: "fast-model"', content)
+        for kind, expected in (
+            ("explorer", "flag-ship-model"),
+            ("worker", "flag-ship-model"),
+            ("verifier", "fast-model"),
+        ):
+            block = re.search(
+                rf"  - kind: {kind}\n(?P<body>.*?)(?=\n  - kind:|\nscheduler:)",
+                content,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(block, kind)
+            self.assertIn(f'model: "{expected}"', block.group("body"))
+            if kind == "explorer":
+                self.assertIn('observation_model: "fast-model"', block.group("body"))
+        scheduler = content.split("\nscheduler:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertIn('model: "fast-model"', scheduler)
 
     def test_batch_exit_code_fails_when_any_gate_is_not_satisfied(self):
         good = {"stale": False, "architecture_ok": True, "task_resolved": True}
@@ -603,7 +686,8 @@ class SWETestRunnerContractTest(unittest.TestCase):
                 agentgo_root=root, agentgo_bin=root / "agentgo",
                 testbed=root / "testbed", tasks_file=root / "tasks.csv",
                 prompt_dir=root / "prompts", flask_repo=root / "flask",
-                base_url="https://provider.invalid/v1", model="model", protocol="responses",
+                base_url="https://provider.invalid/v1", fast_model="fast-model",
+                flag_ship_model="flag-ship-model", protocol="responses",
             )
             tasks = [
                 swe_test_runner.TaskSpec("done", "a" * 40, (), "done"),
@@ -650,7 +734,8 @@ class SWETestRunnerContractTest(unittest.TestCase):
                 agentgo_root=root, agentgo_bin=root / "agentgo",
                 testbed=root / "testbed", tasks_file=root / "tasks.csv",
                 prompt_dir=root / "prompts", flask_repo=root / "flask",
-                base_url="https://provider.invalid/v1", model="model", protocol="responses",
+                base_url="https://provider.invalid/v1", fast_model="fast-model",
+                flag_ship_model="flag-ship-model", protocol="responses",
             )
             tasks = [
                 swe_test_runner.TaskSpec("quota", "a" * 40, (), "quota"),
@@ -694,7 +779,8 @@ class SWETestRunnerContractTest(unittest.TestCase):
                 agentgo_root=root, agentgo_bin=root / "agentgo",
                 testbed=root / "testbed", tasks_file=root / "tasks.csv",
                 prompt_dir=root / "prompts", flask_repo=root / "flask",
-                base_url="https://provider.invalid/v1", model="model", protocol="responses",
+                base_url="https://provider.invalid/v1", fast_model="fast-model",
+                flag_ship_model="flag-ship-model", protocol="responses",
             )
             tasks = [
                 swe_test_runner.TaskSpec("done", "a" * 40, (), "done"),
@@ -741,7 +827,8 @@ class SWETestRunnerContractTest(unittest.TestCase):
                 agentgo_root=root, agentgo_bin=root / "agentgo",
                 testbed=root / "testbed", tasks_file=root / "tasks.csv",
                 prompt_dir=root / "prompts", flask_repo=root / "flask",
-                base_url="https://provider.invalid/v1", model="model", protocol="responses",
+                base_url="https://provider.invalid/v1", fast_model="fast-model",
+                flag_ship_model="flag-ship-model", protocol="responses",
             )
             worktree = config.worktree("same-task")
             with swe_test_runner.task_execution_lock(config, "same-task"):
@@ -827,6 +914,37 @@ class SWETestRunnerContractTest(unittest.TestCase):
             probe_response(finish="stop"),
         ):
             self.assertFalse(swe_test_runner.validate_probe_response(payload)[0])
+
+    def test_preflight_probes_each_distinct_role_model_once(self):
+        config = SimpleNamespace(
+            base_url="https://provider.invalid/v1",
+            protocol="responses",
+            probe_models=lambda: [
+                ("fast-model", ("fast",)),
+                ("flag-ship-model", ("flag_ship",)),
+            ],
+        )
+        with mock.patch.dict(os.environ, {"SWE_API_KEY": "secret"}, clear=True), \
+                mock.patch.object(swe_test_runner, "run_provider_probe") as probe:
+            swe_test_runner.preflight_probe(config, 37)
+        self.assertEqual(
+            [(call.args[2], call.args[3], call.args[4]) for call in probe.call_args_list],
+            [("fast-model", "responses", 37), ("flag-ship-model", "responses", 37)],
+        )
+
+    def test_config_deduplicates_probe_when_capability_models_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = swe_test_runner.SWETestRunnerConfig(
+                agentgo_root=root, agentgo_bin=root / "agentgo",
+                testbed=root / "testbed", tasks_file=root / "tasks.csv",
+                prompt_dir=root / "prompts", flask_repo=root / "flask",
+                base_url="https://provider.invalid/v1", fast_model="same-model",
+                flag_ship_model="same-model", protocol="responses",
+            )
+        self.assertEqual(config.probe_models(), [(
+            "same-model", ("fast", "flag_ship"),
+        )])
 
     def test_provider_probe_rejects_text_and_transport_errors(self):
         text_only = {"choices": [{"finish_reason": "stop", "message": {"content": "pong"}}]}
@@ -1132,6 +1250,14 @@ class SWETestRunnerContractTest(unittest.TestCase):
         observation_stalled = {**source, "graph_id": "g-3", "reason_code": "observation_state_stalled"}
         self.assertEqual(swe_test_runner.missing_loop_recovery_sources([observation_stalled], set()),
                          ["g-3/work@1/work-task"])
+        candidate_handoff = {
+            **source, "graph_id": "g-4", "reason_code": "candidate_completion_handoff",
+        }
+        self.assertEqual(swe_test_runner.missing_loop_recovery_sources([candidate_handoff], set()),
+                         ["g-4/work@1/work-task"])
+        self.assertEqual(
+            swe_test_runner.missing_loop_recovery_sources([candidate_handoff], {"work-task"}), [],
+        )
         recovery_intervention = {
             **source, "task_id": "recovery-task", "node_id": "recovery",
             "activation_id": "recovery@2",
@@ -1227,6 +1353,35 @@ class SWETestRunnerContractTest(unittest.TestCase):
             self.assertEqual(metrics["invocation_failures"], {"invalid_request": 1})
             self.assertTrue(metrics["known_incidents"]["provider_invalid_request"])
 
+    def test_observation_invalid_request_is_independent_model_contract_incident(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / ".agentgo" / "sessions" / "s1" / "logs" / "trace.jsonl"
+            log.parent.mkdir(parents=True)
+            events = [
+                {"ts":"1", "kind":"context_manifest_built", "run_id":"run-1",
+                 "turn_id":"obs", "description":json.dumps([
+                     {"source_ref":"prompt-phase:agent:observation-checkpoint-v8"}])},
+                {"ts":"2", "kind":"llm_call_end", "run_id":"run-1", "turn_id":"obs",
+                 "failure_kind":"invalid_request", "provider_code":"InvalidParameter"},
+            ]
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+            metrics, _ = swe_test_runner.trace_metrics(root, "run-1", set())
+            self.assertFalse(metrics["known_incidents"]["provider_invalid_request"])
+            self.assertEqual(metrics["model_contract_incidents"], [{
+                "phase":"agent:observation-checkpoint-v8", "failure_kind":"invalid_request",
+                "provider_code":"InvalidParameter",
+            }])
+
+    def test_model_contract_gate_has_exit_code_four(self):
+        self.assertEqual(swe_test_runner.final_exit_code({
+            "model_contract_compatible":False, "architecture_ok":True, "task_resolved":True,
+        }), swe_test_runner.EXIT_MODEL_CONTRACT_FAILURE)
+        self.assertEqual(swe_test_runner.batch_exit_code([{
+            "run_state":"completed", "model_contract_compatible":False,
+            "architecture_ok":True, "task_resolved":True, "stale":False,
+        }], 1), swe_test_runner.EXIT_MODEL_CONTRACT_FAILURE)
+
     def test_trace_metrics_marks_delivery_cleanup_without_merge_as_architecture_incident(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1271,6 +1426,27 @@ class SWETestRunnerContractTest(unittest.TestCase):
             log.write_text(json.dumps(event) + "\n", encoding="utf-8")
             metrics, _ = swe_test_runner.trace_metrics(root, "run-1", {"scheduler"})
             self.assertTrue(metrics["known_incidents"]["recovery_contract_rejection"])
+
+    def test_trace_metrics_ignores_recovery_rejection_corrected_before_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / ".agentgo" / "sessions" / "s1" / "logs" / "trace.jsonl"
+            log.parent.mkdir(parents=True)
+            events = [
+                {"ts": "1", "kind": "tool_result", "run_id": "run-1",
+                 "task_id": "recovery", "tool": "submit_recovery_decision",
+                 "error": "graph: recovery_delta strategy 超过 600 rune"},
+                {"ts": "2", "kind": "tool_result", "run_id": "run-1",
+                 "task_id": "worker", "tool": "grep_search", "error": "缺少 pattern 或 path 参数"},
+                {"ts": "3", "kind": "tool_result", "run_id": "run-1",
+                 "task_id": "recovery", "tool": "submit_recovery_decision",
+                 "args": {"decision": "blocked"}},
+                {"ts": "4", "kind": "task_result_committed", "run_id": "run-1",
+                 "task_id": "recovery"},
+            ]
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+            metrics, _ = swe_test_runner.trace_metrics(root, "run-1", {"scheduler"})
+            self.assertFalse(metrics["known_incidents"]["recovery_contract_rejection"])
 
     def test_trace_metrics_accepts_recovery_handoff_v3_sequence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1335,11 +1511,12 @@ class SWETestRunnerContractTest(unittest.TestCase):
                  "task_id": "work", "turn_id": "read", "recovery_action_gate": {
                      "schema": "agentgo.recovery-delta/v4", "stage": "first_action",
                      "tool": "read_file", "path": "src/flask/app.py",
-                     "offset": 1, "limit": 80, "directive_count": 1,
+                     "offset": 1, "limit": 80, "force_full": True, "directive_count": 1,
                  }},
                 {"ts": "2.1", "kind": "tool_call", "run_id": "run-1",
                  "task_id": "work", "turn_id": "read", "tool": "read_file",
-                 "args": {"path": "src/flask/app.py", "offset": 1, "limit": 80}},
+                 "args": {"path": "src/flask/app.py", "offset": 1, "limit": 80,
+                          "force_full": True}},
                 {"ts": "3", "kind": "recovery_action_gated", "run_id": "run-1",
                  "task_id": "work", "turn_id": "decision", "recovery_action_gate": {
                      "schema": "agentgo.recovery-delta/v4", "stage": "decision",
@@ -1373,6 +1550,11 @@ class SWETestRunnerContractTest(unittest.TestCase):
             self.assertEqual(metrics["recovery_first_action_gate_count"], 1)
             self.assertFalse(metrics["known_incidents"]["recovery_action_gate_missing"])
             self.assertFalse(metrics["known_incidents"]["recovery_action_gate_mismatch"])
+
+            events[3]["args"]["force_full"] = False
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+            metrics, _ = swe_test_runner.trace_metrics(root, "run-1", {"scheduler"})
+            self.assertTrue(metrics["known_incidents"]["recovery_action_gate_mismatch"])
 
     def test_trace_metrics_rejects_stale_or_missing_recovery_gate(self):
         with tempfile.TemporaryDirectory() as directory:

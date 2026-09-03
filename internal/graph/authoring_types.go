@@ -172,11 +172,19 @@ type OutputFieldContract struct {
 	Required    bool   `json:"required,omitempty"`
 }
 
+const (
+	OutputContractProfileInvestigationBoundaryV1 = "agentgo.investigation-boundary/v1"
+	// v2 新增 first concrete failure observation；v1 三段边界保持历史语义。
+	OutputContractProfileInvestigationBoundaryV2 = "agentgo.investigation-boundary/v2"
+)
+
 // NodeOutputContract 是 task-producing 节点的有类型输出契约。summary 属于
 // TaskOutcome 顶层，不要求在 result object 重复；Fields 描述 result 字段。
 type NodeOutputContract struct {
 	SummaryRequired bool                  `json:"summary_required,omitempty"`
 	Fields          []OutputFieldContract `json:"fields,omitempty"`
+	// Profile 只在需要跨字段机械关系校验时设置；空值保留历史逐字段类型语义。
+	Profile string `json:"profile,omitempty"`
 }
 
 // GraphContractBindings 声明节点负责兑现的 GraphContract requirement。引用

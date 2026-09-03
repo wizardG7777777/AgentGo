@@ -1,7 +1,7 @@
 # AgentGo 五层工程架构规范
 
-> 状态：Accepted Architecture，L1-L4 weak-model adaptation implemented / external batch validation open<br>
-> 日期：2026-08-30<br>
+> 状态：Accepted Architecture，L1-L4 weak-model adaptation implemented / Flask-8 architecture closure verified<br>
+> 日期：2026-09-01<br>
 > 性质：长期目标架构与责任边界，不是当前实现已经完全满足的声明<br>
 > 历史母本：[`docs/nextUpgrade-V6.md`](../nextUpgrade-V6.md)
 
@@ -16,9 +16,9 @@
 | L1 Prompt | 冻结 Scheduler core prompt + 每 Invocation phase task-control prompt；Graph-first 保持 | 固定模型长期 cohort 指标 |
 | L2 Context | Context v10/Replay v4、普通 Fragment 稳定 cap、Observation 语义切点与 digest 去重 | 真实 tokenizer 自动探测与更多模型档案 |
 | L3 Harness | 仓库 SWE Test Runner、双层 function-call probe、真实 Lease、phase ToolRouter、typed terminal/snapshot | Effect unknown 仍需人工裁决；workspace 仍非 OS sandbox |
-| L4 Loop | Progress v6 decision/knowledge 分离、RunContract v2 四阶段 Deadline、typed intervention/terminal 主链 | Qwen 完整批次长时统计 |
+| L4 Loop | Progress v7 decision/knowledge 分离、periodic Observation 可放弃恢复、RunContract v2 四阶段 Deadline、typed intervention/terminal 主链 | 更多模型完整批次长时统计 |
 | L5 Graph | framework simple Graph、current validate/commit/start、Change、typed Outcome/Result/Evidence | 复杂 OR/generation token 仍关闭；legacy submit/patch 未删 |
-| Validation / Trace | contract/full/race/vet/build、真实二进制、最新 Qwen 8题 `architecture_ok=8/8` / `task_resolved=6/8`；Recovery v4 本地真实二进制链 | Recovery handoff v4 失败题复测、三平台 CI 与更多 provider cohort |
+| Validation / Trace | contract/full/race/vet/build、真实二进制、最新 Qwen 8题 `architecture_ok=8/8` / `task_resolved=5/8`；Recovery v4、Observation v4 真实批次链 | 三平台 CI 与更多 provider cohort |
 
 `AGENTS.md` 只保留当前主链入口摘要；本文件仍是五层边界的完整权威。
 
@@ -31,11 +31,11 @@
   `submit_change_decision` 选择 edit / need_context / hypothesis_rejected / blocked。
   只有 typed edit 才按有序 `{tool,path}` 开放 mutation 与 CheckContract，证据范围
   不限制新增文件。v3 的 read → 强制同路径 edit 只供历史 Graph 恢复。
-- `recovery_action_gated` 把 schema/stage/tool/path/ref_id/offset/limit/check_id/directive_count 写入
+- `recovery_action_gated` 把 schema/stage/tool/path/ref_id/offset/limit/force_full/check_id/directive_count 写入
   Trace；SWE Test Runner 只对已 committed 的 Recovery Task 取最终 retry 决策，
   Attempt 重放 receipt 不重复计数。acceptance/v2 与历史 v1/v2 不静默迁移。
-- Observation 新写入使用 v3：模型 claim 即使绑定 settled evidence 也只是
-  inferred，TaskMemory 独立标成“待验证观察”，v2 历史 confirmed 语义不变。
+- Observation 新写入使用 v4：模型 claim 延续 v3 的 inferred authority，并用 typed
+  next_action 把模型自选 mutate 冻结为下一业务轮 L3 gate；v2/v3 历史语义不变。
 - SWE Test Runner 从 suite manifest 冻结 exact targeted command；Recovery check
   gate 同时冻结 ID/kind/command。单动作 provider fan-out 只校验并 dispatch 首调用，
   尾部合法调用生成 skipped receipt。
@@ -86,7 +86,8 @@ Graph v3 将 L3 的候选 workspace 升格为 L5 Delivery Transaction 的输入�
   digest；冻结后变化不得提升。
 - recovery 改用 `submit_recovery_decision`，模型不再复制 source refs/fingerprint。
 - Observation 是非终态的独立 Control Invocation：L2 投影旧业务 tool intent，
-  L3 使用 `reasoning=none + exact record_observation_delta`；control ToolCall 不进入
+  L3 的 v8 使用 `reasoning=low + auto-singleton record_observation_delta`，v7 历史
+  保持 none+exact；control ToolCall 不进入
   后续业务 Responses replay，正常业务 thinking 保持不变。工具来自启动期
   framework control registry，不依赖角色普通业务 Lease；Acceptance/readonly
   普通轮仍看不到它。Provider 后的格式失败进入两次有界计数，provider 前的
@@ -124,6 +125,51 @@ Graph v3 将 L3 的候选 workspace 升格为 L5 Delivery Transaction 的输入�
   acceptance 消费 verification phase，finalization deadline 使用确定性 fallback。
 - v1–v9 Context、Replay v1–v3、Progress v1–v5 与 RunContract v1 快照均按冻结语义
   恢复。SWE-058～061 的机械门已关闭；业务校准开放项见 SWE-062。
+
+## 0.5 2026-09-01 弱模型行动承诺与完整批次 closure
+
+- 新 Run 使用 `progress:code-change/v8`：periodic Observation 在有界 control
+  contract 失败后保留 Raw History 并恢复业务，rollover/intervention/terminal
+  checkpoint 仍 fail-closed；v6 历史快照不迁移。
+- 新写入使用 `agentgo.observation-delta/v4`：模型必须声明 typed next_action；
+  自选 mutate 时由 L3 将 `{tool,path}` 冻结为下一普通业务动作，Recovery gate 仍优先，
+  v2/v3 历史对象保持冻结语义。
+- 同一 `qwen3.8-flash` 完整 Flask-8 批次已执行 8/8，`architecture_ok=8/8`、
+  `task_resolved=5/8`、infra/not-run 为 0。剩余三题获得实际 mutation/check 或明确
+  need_context 机会，错误候选均被隔离；当前边界归于模型代码语义、上下文范围选择
+  与失败反馈利用能力，而不是新的 L1-L5 架构事故。
+
+## 0.6 2026-09-03 Explorer / candidate repair 收敛
+
+- L1：SWE Explorer 必须提交 hypothesis、evidence_files、evidence_ranges、
+  recommended_change 与 verification_focus；Worker 明确消费 ranges。v5 Prompt 禁止
+  把 bounded focus 误读为 v4 全文件覆盖。
+- L2：investigation/v6 exact submit 不再清空已结算工具正文，也不重放历史 ToolCall；
+  evidence 按 newest-first 聚合为单一 8KiB notice，服从 Context v10 单 Fragment
+  byte/token 双 cap。
+- L3：RecoveryDelta v5 / ChangeDecision v2 绑定 candidate_state，并以
+  path/offset/limit 的 focus page、已读 edit target、resume_candidate、冻结 check
+  gate fail-closed。v4 全文件 EvidenceContract 不变。
+- L3：simple-task/v4 的 `agentgo.investigation-boundary/v2` 先冻结 first concrete
+  failure_observation，再把 public_entry、state_owner、internal_consumer 三段对象
+  逐字对账 evidence_ranges 与真实 ProjectRoot range，要求至少两个不同 path/symbol
+  与非空 rejected_alternative；boundary/v1 与旧逐字段 OutputContract 不变。
+- L4：code-change/v12 使用1-turn `decision_periodic` checkpoint；首次无效
+  无效直接 handoff，不再沿 v7 knowledge periodic abandoned 继续；dirty candidate
+  在 deadline 前预留3分钟，以 candidate_completion_handoff 交 L5；最终 repair
+  固定使用 v10，避免无后继 recovery 的二次交接；
+  investigation/v6 使用6-turn bounded exploration 与8分钟 downstream reserve；历史 v3-v5 保持冻结语义。typed change decision 同时推进
+  decision/cadence，v5 Model Invocation 首次按 evidence/check=2048、
+  decision/mutation=4096 冻结 completion；只有同 snapshot 的 output_truncated
+  修正机会提升到8192。
+- L5：mutating simple-task/v2 使用 Graph v4 的 Explorer → work → Acceptance，
+  blocked work 经 v5 recovery 进入唯一同 Delivery candidate-repair；v3 单 producer
+  规则与旧 snapshot 不迁移。
+- 真实验证：Observation v7-v9 两模型 empty/populated 全矩阵通过；配置中的 flagship
+  Observation v10/v11 empty/populated preflight 重复通过；automatic-options
+  resolved。pass-context-dispatch 与 session-access-tracking 已从零 mutation 推进到
+  精确 focus/mutation/targeted check，但仍因后续业务修正超过 execution window而
+  blocked；因此模型契约/架构门通过，不宣称业务 closure。
 
 ## 1. 背景
 
@@ -428,9 +474,10 @@ Harness 能力快照、上游 Result/Evidence、Mailbox 和预算。<br>
    均稳定，不调用真实模型。
 7. hard cap 的任何放宽或收紧都创建新 PolicyVersion；历史 Task 使用已冻结的
    具体 ref，新 Run 才能使用 `ContextDefaultCurrent`。禁止就地改写旧 policy。
-8. `agentgo.observation-delta/v3` 物化 predecessor、封闭 phase、当前 inferred
-   facts、可关闭 candidate、workspace/check authority 与 framework 计算的
-   semantic advance；TaskMemory 用最新状态替换旧 Observation 投影，immutable
+8. `agentgo.observation-delta/v4` 物化 predecessor、封闭 phase、当前 inferred
+   facts、可关闭 candidate、typed next_action、workspace/check authority 与 framework
+   计算的 semantic advance；只有模型自选 mutate 才形成下一业务轮 tool/path gate。
+   TaskMemory 用最新状态替换旧 Observation 投影，immutable
    delta 仍 append-only。`agentgo.graph-terminal-summary/v2` 额外物化
    task_published、settlement reason code 与累计 workspace/artifact 事实。
    reasoning、工具参数、原始大正文和完整 GraphDocument 不得借两种载体进入 Context。
@@ -730,12 +777,12 @@ L5 是 AgentGo 的主协调层，负责多个局部 Loop、确定性节点和 Ev
    marker 或排除控制面任务来假定成功。
 10. 统一 ControlScope 必须在任何通用 pump 前识别并吸收 FinalReport；同一 Run
     只能 commit/start 一个顶层业务 Graph，子图与同图 revision 不计入该限制。
-11. 新 code-change recovery Graph 的 retry 必须提交 `agentgo.recovery-delta/v4`
-    并匹配冻结 failure fingerprint。单值 `recovery_directive` 只保留最新代；
-    类型化 `first_action=read_file(path)` 是最小 EvidenceContract 的第一项，L3
-    证明完整覆盖后由 Worker typed 决定是否修改、补充上下文或安全交回 L5；只有
-    edit 才推进声明 mutation 与 typed check。Definition 变化时必须证明 revision
-    前进；acceptance/v2、v1-v3 与旧未声明 schema 的 Graph 继续按各自冻结语义执行。
+11. 新 mutating simple Graph 的 retry 必须提交 `agentgo.recovery-delta/v5`
+    并匹配冻结 failure fingerprint/candidate state。单值 `recovery_directive` 只保留
+    最新代；L3 以 bounded focus page 与 ChangeDecision v2 推进 edit/resume/context，
+    mutation 后执行 typed check。Definition 变化时仍须证明 revision 前进；
+    RecoveryDelta v4 全文件语义、acceptance/v2、v1-v3 与旧未声明 schema 的 Graph
+    继续按各自冻结语义执行。
 
 ### 10.7 完成标准
 

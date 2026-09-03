@@ -2473,16 +2473,24 @@ func exportLease(src *model.ExecutionLease) *session.LeaseSnapshot {
 		return nil
 	}
 	return &session.LeaseSnapshot{
-		Attempt:          src.Attempt,
-		FrozenAt:         formatTime(src.FrozenAt),
-		BusinessTools:    append([]string(nil), src.BusinessTools...),
-		ControlTools:     append([]string(nil), src.ControlTools...),
-		Model:            src.Model,
-		Workspace:        src.Workspace,
-		Synthetic:        src.Synthetic,
-		ApprovalRequired: src.ApprovalRequired,
-		Revoked:          src.Revoked,
-		Digest:           src.Digest,
+		Schema:                              src.Schema,
+		Attempt:                             src.Attempt,
+		FrozenAt:                            formatTime(src.FrozenAt),
+		BusinessTools:                       append([]string(nil), src.BusinessTools...),
+		ControlTools:                        append([]string(nil), src.ControlTools...),
+		Model:                               src.Model,
+		ModelContextWindowTokens:            src.ModelContextWindowTokens,
+		ModelMaxCompletionTokens:            src.ModelMaxCompletionTokens,
+		ModelCapabilityDigest:               src.ModelCapabilityDigest,
+		ObservationModel:                    src.ObservationModel,
+		ObservationModelContextWindowTokens: src.ObservationModelContextWindowTokens,
+		ObservationModelMaxCompletionTokens: src.ObservationModelMaxCompletionTokens,
+		ObservationModelCapabilityDigest:    src.ObservationModelCapabilityDigest,
+		Workspace:                           src.Workspace,
+		Synthetic:                           src.Synthetic,
+		ApprovalRequired:                    src.ApprovalRequired,
+		Revoked:                             src.Revoked,
+		Digest:                              src.Digest,
 	}
 }
 
@@ -2495,16 +2503,24 @@ func importLease(src *session.LeaseSnapshot) *model.ExecutionLease {
 	}
 	frozenAt, _ := parseTime(src.FrozenAt) // 空串/非法值 → 零值时间，向后兼容
 	return &model.ExecutionLease{
-		Attempt:          src.Attempt,
-		FrozenAt:         frozenAt,
-		BusinessTools:    append([]string(nil), src.BusinessTools...),
-		ControlTools:     append([]string(nil), src.ControlTools...),
-		Model:            src.Model,
-		Workspace:        src.Workspace,
-		Synthetic:        src.Synthetic,
-		ApprovalRequired: src.ApprovalRequired,
-		Revoked:          src.Revoked,
-		Digest:           src.Digest,
+		Schema:                              src.Schema,
+		Attempt:                             src.Attempt,
+		FrozenAt:                            frozenAt,
+		BusinessTools:                       append([]string(nil), src.BusinessTools...),
+		ControlTools:                        append([]string(nil), src.ControlTools...),
+		Model:                               src.Model,
+		ModelContextWindowTokens:            src.ModelContextWindowTokens,
+		ModelMaxCompletionTokens:            src.ModelMaxCompletionTokens,
+		ModelCapabilityDigest:               src.ModelCapabilityDigest,
+		ObservationModel:                    src.ObservationModel,
+		ObservationModelContextWindowTokens: src.ObservationModelContextWindowTokens,
+		ObservationModelMaxCompletionTokens: src.ObservationModelMaxCompletionTokens,
+		ObservationModelCapabilityDigest:    src.ObservationModelCapabilityDigest,
+		Workspace:                           src.Workspace,
+		Synthetic:                           src.Synthetic,
+		ApprovalRequired:                    src.ApprovalRequired,
+		Revoked:                             src.Revoked,
+		Digest:                              src.Digest,
 	}
 }
 

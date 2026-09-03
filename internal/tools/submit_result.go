@@ -185,6 +185,23 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 	default:
 		return "", fmt.Errorf("status 只接受 completed / blocked（failed、cancelled 由系统路径产生，不接受自报），实际值 %q", status)
 	}
+	// activation-frozen typed OutputContract 必须在 finalizing 前预检。这样结构/源码
+	// range 误差作为可修正工具错误返回；TaskOutcome durable commit 仍二次校验。
+	if status == agent.SubmitStatusCompleted && task.GraphID != "" {
+		if reader, ok := g.OutletChecker.(ActivationOutputContractReader); ok {
+			contract, contractErr := reader.ActivationOutputContract(task.GraphID, task.NodeID, task.ActivationID)
+			if contractErr != nil {
+				return "", fmt.Errorf("submit_task_result 输出契约预检失败: %w", contractErr)
+			}
+			structuredResult := buildOutletEvalResult(resultJSON, verdict, citedEvidence, status)
+			if contractErr := graph.ValidateNodeOutput(contract, summary, structuredResult); contractErr != nil {
+				return "", fmt.Errorf("submit_task_result 输出契约预检拒绝（可修正后重交）: %w", contractErr)
+			}
+			if contractErr := graph.ValidateNodeOutputEvidence(contract, g.ProjectRoot, structuredResult); contractErr != nil {
+				return "", fmt.Errorf("submit_task_result 输出证据预检拒绝（可修正后重交）: %w", contractErr)
+			}
+		}
+	}
 	if status == agent.SubmitStatusBlocked && g.Checkpoints != nil && task.ProgressContract != nil &&
 		task.ProgressContract.Policy.KnowledgeCheckpointAfterTurns > 0 {
 		checkpoint, ok, checkpointErr := g.Checkpoints.LoadCheckpoint(task.ID)

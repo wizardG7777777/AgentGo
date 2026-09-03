@@ -35,6 +35,24 @@ func TestContextBindingRejectsMissingSnapshot(t *testing.T) {
 	}
 }
 
+func TestContextBindingV2BindsEffectiveProfileIntoDigest(t *testing.T) {
+	base := ContextBinding{Schema: ContextBindingSchemaV1, InvocationID: "inv", ContextSnapshotID: "snap",
+		ContextPolicyID: "context", ToolRouterSnapshotID: "router", EncodedRequestDigest: "sha256:base",
+		OutputBudget: testBindingOutputBudget()}
+	left := BindEffectiveProfile(base, "model-a", "cap-a", "observation/v8")
+	right := BindEffectiveProfile(base, "model-b", "cap-a", "observation/v8")
+	if err := left.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if left.Schema != ContextBindingSchemaV2 || left.EncodedRequestDigest == base.EncodedRequestDigest ||
+		left.EncodedRequestDigest == right.EncodedRequestDigest {
+		t.Fatalf("v2 effective profile 未进入 binding digest: left=%+v right=%+v", left, right)
+	}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("v1 历史 binding 应保持合法: %v", err)
+	}
+}
+
 func TestToolChoiceValidationIsClosed(t *testing.T) {
 	for _, choice := range []ToolChoice{
 		{}, {Mode: ToolChoiceAuto}, {Mode: ToolChoiceRequired},

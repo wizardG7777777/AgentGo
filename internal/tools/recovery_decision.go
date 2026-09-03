@@ -44,7 +44,8 @@ func (g PlanControlGroup) submitRecoveryDecision(ctx context.Context, args map[s
 		partial.FirstAction = &graph.RecoveryFirstAction{}
 		partial.FirstAction.Tool, _ = firstAction["tool"].(string)
 		partial.FirstAction.Path, _ = firstAction["path"].(string)
-		if task.GraphRecoveryDeltaSchema == graph.RecoveryDeltaSchemaV4 {
+		if task.GraphRecoveryDeltaSchema == graph.RecoveryDeltaSchemaV4 ||
+			task.GraphRecoveryDeltaSchema == graph.RecoveryDeltaSchemaV5 {
 			files := []string{partial.FirstAction.Path}
 			if rawContract, supplied := args["evidence_contract"].(map[string]any); supplied {
 				var ok bool

@@ -7,7 +7,7 @@ import (
 )
 
 func TestCodeChangeCurrentVersionsMissingFulfillmentRouteBlocked(t *testing.T) {
-	for _, progressRef := range []string{"progress:code-change/v5", "progress:code-change/v6"} {
+	for _, progressRef := range []string{"progress:code-change/v5", "progress:code-change/v6", "progress:code-change/v7", "progress:code-change/v8", "progress:code-change/v9", "progress:code-change/v10", "progress:code-change/v11", "progress:code-change/v12"} {
 		t.Run(progressRef, func(t *testing.T) {
 			const template = `{
   "schema":"agentgo.graph/v2","graph_id":"g-fulfillment","revision":1,"state_version":0,

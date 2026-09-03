@@ -39,7 +39,7 @@ func printStartupBanner(w io.Writer, configPath string, cfg *config.Config) {
 		fmt.Fprintf(w, "LLM Endpoint:     %s\n", cfg.LLM.BaseURL)
 	}
 	if cfg.LLM.APIKey != "" {
-		fmt.Fprintf(w, "LLM API Key:      %s\n", maskAPIKey(cfg.LLM.APIKey))
+		fmt.Fprintln(w, "LLM API Key:      configured")
 	}
 	if cfg.LLM.DefaultModel != "" {
 		fmt.Fprintf(w, "Default Model:    %s\n", cfg.LLM.DefaultModel)
@@ -78,40 +78,6 @@ func printStartupBanner(w io.Writer, configPath string, cfg *config.Config) {
 		}
 	}
 	fmt.Fprintln(w, "")
-}
-
-// maskAPIKey 把 API key 脱敏为 "前 4 + *** + 后 4 (length=N)" 形式。
-// 长度 < 8 时整体替换为 *** 防止泄露。
-func maskAPIKey(key string) string {
-	n := len(key)
-	if n < 8 {
-		return "*** (length=" + intToStr(n) + ")"
-	}
-	return key[:4] + "***" + key[n-4:] + " (length=" + intToStr(n) + ")"
-}
-
-// intToStr 将 int 转为字符串。避免引入 strconv 增加 import。
-func intToStr(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := false
-	if n < 0 {
-		neg = true
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
 }
 
 // startupProbe 先检查 TCP；startup_probe=tool（空值的新默认）继续执行真实

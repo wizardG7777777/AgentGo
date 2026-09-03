@@ -448,6 +448,8 @@ func advanceCheckpoint(contract loopcontract.CompiledProgressContract, previous 
 		switch {
 		case delta.ObservationDeltaRef != "":
 			next.TurnsSinceDecisionCheckpoint = 0
+		case (contract.Ref.ContractID == "progress:code-change/v10" || contract.Ref.ContractID == "progress:code-change/v11") && assessment.DecisionAdvance:
+			next.TurnsSinceDecisionCheckpoint = 0
 		case !delta.ControlContractFailure && assessment.Class != loopcontract.ProgressInvocationFailure:
 			next.TurnsSinceDecisionCheckpoint++
 		}
@@ -466,7 +468,8 @@ func acceptedDecisionSignal(accepted []loopcontract.AcceptedSignal) bool {
 			loopcontract.SignalArtifactVersionChanged,
 			loopcontract.SignalEvaluationChanged,
 			loopcontract.SignalEvaluationPassed,
-			loopcontract.SignalObservationStateAdvanced:
+			loopcontract.SignalObservationStateAdvanced,
+			loopcontract.SignalResultFieldSet:
 			return true
 		}
 	}

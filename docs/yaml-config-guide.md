@@ -102,11 +102,16 @@ agents:
     profile: worker_standard             # 与 tools 二选一（不可同时给）
     # tools: [read_file, write_file]    # ↑↓二选一
     model: gpt-4o                        # 可选，覆盖 llm.default_model
+    # observation_model: gpt-4o-mini     # 可选；仅 Observation control invocation，省略则继承 model
     system_prompt_file: prompts/worker.md  # 必填，文件必须存在且可读
     task_max_retries: 3                  # 必填，> 0
     description: |                       # 可选，给 scheduler 看的一句话角色描述
       通用工作代理。能写文件、跑 shell。
 ```
+
+`observation_model` 不能按 provider 或模型名自动切换。先用 Observation probe 验证
+业务模型与候选控制模型的 empty/populated fixture；只有配置中显式填写时才覆盖该
+kind 的独立 control invocation，普通业务轮仍使用 `model`。
 
 **强约束（启动期校验，违反则启动失败）**：
 - `kind` 在 `agents:` 列表内唯一且非空

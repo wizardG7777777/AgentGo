@@ -168,8 +168,14 @@ func (r ContextRuntime) compileAndPersist(ctx context.Context, request contextCo
 		return contextadapter.Result{}, fmt.Errorf("未知 ContextPolicyRef %q", policyRef)
 	}
 	if request.Task.Lease != nil {
+		window := request.Task.Lease.ModelContextWindowTokens
+		completion := request.Task.Lease.ModelMaxCompletionTokens
+		if isAutoObservationPhase(request.ToolRouter.Phase) {
+			window = request.Task.Lease.ObservationModelContextWindowTokens
+			completion = request.Task.Lease.ObservationModelMaxCompletionTokens
+		}
 		contextProfile.Policy = policycatalog.AdaptContextPolicyForModel(contextProfile.Policy,
-			request.Task.Lease.ModelContextWindowTokens, request.Task.Lease.ModelMaxCompletionTokens)
+			window, completion)
 	}
 	replayProfile, ok := r.Policies.ProviderReplayPolicy(contextProfile.ReplayPolicyRef)
 	if !ok {

@@ -1171,17 +1171,24 @@ func (rt *Runtime) recoveryReplayInputs(graphID string, rec TransitionRecord, re
 		}
 		failure, found = input, true
 	}
-	if !found || failure.SourceNodeID != rec.TargetNodeID {
+	activeRecovery := nodeForExecution(recovery, *recovery.Execution)
+	recoverySchema := strings.TrimSpace(activeRecovery.Metadata[MetadataRecoveryDeltaSchema])
+	if !found || failure.SourceNodeID != rec.TargetNodeID && recoverySchema != RecoveryDeltaSchemaV5 {
 		return nil, fmt.Errorf("graph: loop_recovery retry 目标 %s 与 failure_context 来源 %s 不一致",
 			rec.TargetNodeID, failure.SourceNodeID)
+	}
+	if recoverySchema == RecoveryDeltaSchemaV5 {
+		target, targetOK := doc.Nodes[rec.TargetNodeID]
+		if !targetOK || target.Kind != KindAgent || !requiresCodeChangeFulfillment(target.ProgressContractRef) {
+			return nil, fmt.Errorf("graph: recovery_delta/v5 retry 目标 %s 必须是 code-change agent", rec.TargetNodeID)
+		}
 	}
 	source, ok := doc.Nodes[failure.SourceNodeID]
 	if !ok || source.Execution == nil || source.Execution.ActivationID != failure.SourceActivationID {
 		return nil, fmt.Errorf("graph: recovery source activation %s 不再可解引用", failure.SourceActivationID)
 	}
 	replayed := cloneInputBindings(source.Execution.Input)
-	activeRecovery := nodeForExecution(recovery, *recovery.Execution)
-	if schema := strings.TrimSpace(activeRecovery.Metadata[MetadataRecoveryDeltaSchema]); schema == RecoveryDeltaSchemaV1 || schema == RecoveryDeltaSchemaV2 || schema == RecoveryDeltaSchemaV3 || schema == RecoveryDeltaSchemaV4 {
+	if schema := strings.TrimSpace(activeRecovery.Metadata[MetadataRecoveryDeltaSchema]); schema == RecoveryDeltaSchemaV1 || schema == RecoveryDeltaSchemaV2 || schema == RecoveryDeltaSchemaV3 || schema == RecoveryDeltaSchemaV4 || schema == RecoveryDeltaSchemaV5 {
 		delta, err := decodeRecoveryDelta(result)
 		if err != nil {
 			return nil, err
@@ -2785,7 +2792,7 @@ func (rt *Runtime) taskSpecFor(graphID, nodeID string, node Node, exec Execution
 			spec.RunContract = &run
 		}
 	}
-	if doc, ok := rt.store.Get(graphID); ok && doc.Schema == SchemaV3 {
+	if doc, ok := rt.store.Get(graphID); ok && UsesDeliveryTransaction(doc.Schema) {
 		for _, input := range spec.Inputs {
 			if input.DeliveryRef != "" {
 				spec.DeliveryID = input.DeliveryRef
@@ -2827,7 +2834,7 @@ func (rt *Runtime) taskSpecFor(graphID, nodeID string, node Node, exec Execution
 	// 无 path 条件出边时 RenderOutputContract 返回空串，任务桥自然跳过。
 	// 派生以冻结定义为准：patch_graph 只影响后续 activation，重进发布的新
 	// 任务按当时冻结定义重新派生。
-	if doc, ok := rt.store.Get(graphID); ok && (doc.Schema == SchemaV2 || doc.Schema == SchemaV3) {
+	if doc, ok := rt.store.Get(graphID); ok && UsesTypedTerminalContract(doc.Schema) {
 		spec.OutputContract = RenderOutputContract(nodeForExecution(node, exec).Next)
 	}
 	return spec
@@ -2874,7 +2881,7 @@ func taskSpecFor(graphID, nodeID string, node Node, exec Execution) TaskSpec {
 
 func requiresCodeChangeFulfillment(ref string) bool {
 	switch ref {
-	case "progress:code-change/v5", "progress:code-change/v6":
+	case "progress:code-change/v5", "progress:code-change/v6", "progress:code-change/v7", "progress:code-change/v8", "progress:code-change/v9", "progress:code-change/v10", "progress:code-change/v11", "progress:code-change/v12":
 		return true
 	default:
 		return false
@@ -3605,13 +3612,13 @@ func (rt *Runtime) commitEndOutcome(graphID, nodeID string, exec Execution, outc
 	// 从 Store 当前 activation 快照取证，不能把空引用写进 durable record。
 	exec = *node.Execution
 	deliveryCommitRef := ""
-	if outcome == EndSuccess && doc.Schema == SchemaV3 {
+	if outcome == EndSuccess && UsesDeliveryTransaction(doc.Schema) {
 		var commitErr error
 		deliveryCommitRef, commitErr = deliveryCommitRefFor(doc)
 		if commitErr != nil {
 			return commitErr
 		}
-	} else if doc.Schema == SchemaV3 {
+	} else if UsesDeliveryTransaction(doc.Schema) {
 		if err := rt.quarantineGraphDeliveries(doc, reason); err != nil {
 			return err
 		}

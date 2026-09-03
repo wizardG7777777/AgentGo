@@ -28,6 +28,7 @@ import ssl
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -36,7 +37,7 @@ import xml.etree.ElementTree as ET
 
 
 RUN_SCHEMA = "agentgo.run-contract/v2"
-RESULT_SCHEMA = "agentgo.swe-result/v2"
+RESULT_SCHEMA = "agentgo.swe-result/v3"
 PYTEST_REPORT_SCHEMA = "agentgo.pytest-phase-report/v1"
 PYTEST_COUNT_SEMANTICS = "pytest-phase-overlap/v1"
 PYTEST_REPORT_ENV = "AGENTGO_SWE_PYTEST_REPORT"
@@ -51,11 +52,13 @@ TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 EXIT_SWE_TEST_RUNNER_FAILURE = 1
 EXIT_ARCHITECTURE_FAILURE = 2
 EXIT_TASK_FAILURE = 3
+EXIT_MODEL_CONTRACT_FAILURE = 4
 DEFAULT_SUITE_DIR = Path(__file__).resolve().parent / "suites" / "flask-8"
 REQUIRED_ENV_VARS = (
     "SWE_API_KEY",
     "SWE_BASE_URL",
-    "SWE_MODEL",
+    "SWE_FAST_MODEL",
+    "SWE_FLAG_SHIP_MODEL",
 )
 
 
@@ -112,7 +115,7 @@ class SWETestRunnerConfig:
 
     def __init__(self, agentgo_root: Path, agentgo_bin: Path, testbed: Path,
                  tasks_file: Path, prompt_dir: Path, flask_repo: Path,
-                 base_url: str, model: str, protocol: str):
+                 base_url: str, fast_model: str, flag_ship_model: str, protocol: str):
         self.agentgo_root = agentgo_root
         self.agentgo_bin = agentgo_bin
         self.testbed = testbed
@@ -120,8 +123,26 @@ class SWETestRunnerConfig:
         self.prompt_dir = prompt_dir
         self.flask_repo = flask_repo
         self.base_url = base_url
-        self.model = model
+        self.fast_model = fast_model
+        self.flag_ship_model = flag_ship_model
         self.protocol = protocol
+
+    def model_capabilities(self) -> dict[str, str]:
+        """返回环境冻结的能力档位；角色分配只由专用 YAML 决定。"""
+        return {
+            "fast": self.fast_model,
+            "flag_ship": self.flag_ship_model,
+        }
+
+    def probe_models(self) -> list[tuple[str, tuple[str, ...]]]:
+        """按模型去重 provider probe，同时保留其能力档位。"""
+        capabilities_by_model: dict[str, list[str]] = {}
+        for capability, model in self.model_capabilities().items():
+            capabilities_by_model.setdefault(model, []).append(capability)
+        return [
+            (model, tuple(capabilities))
+            for model, capabilities in capabilities_by_model.items()
+        ]
 
     @classmethod
     def from_env(cls) -> "SWETestRunnerConfig":
@@ -160,7 +181,8 @@ class SWETestRunnerConfig:
                 or testbed / "upstream" / "flask"
             ).resolve(),
             base_url=values["SWE_BASE_URL"],
-            model=values["SWE_MODEL"],
+            fast_model=values["SWE_FAST_MODEL"],
+            flag_ship_model=values["SWE_FLAG_SHIP_MODEL"],
             protocol=protocol,
         )
 
@@ -177,6 +199,10 @@ class TaskSpec:
         self.fix_sha = fix_sha
         self.test_files = test_files
         self.title = title
+
+
+class SWETestRunnerModelContractError(RuntimeError):
+    """Provider cannot execute the configured Observation control contract."""
 
 
 class SWETestRunnerInfrastructureError(RuntimeError):
@@ -577,9 +603,11 @@ def http_json(url: str, token: str, method: str = "GET", body: dict | None = Non
 
 def inject_request(base_url: str, token: str, prompt_path: str, task_id: str,
                    timeout_sec: int, contract_path: str,
-                   test_files: tuple[str, ...]) -> dict:
+                   test_files: tuple[str, ...], baseline_failure_path: str | None = None) -> dict:
     contract = build_run_contract(task_id, timeout_sec, test_files=test_files)
     prompt = Path(prompt_path).read_text(encoding="utf-8")
+    if baseline_failure_path:
+        prompt += "\n\n" + render_baseline_failure_context(Path(baseline_failure_path))
     status, response = http_json(base_url.rstrip("/") + "/api/input", token, "POST", {
         "text": prompt,
         "run_contract": contract,
@@ -588,6 +616,29 @@ def inject_request(base_url: str, token: str, prompt_path: str, task_id: str,
         raise RuntimeError(f"/api/input 拒绝 RunContract: HTTP {status}")
     atomic_json(contract_path, contract)
     return contract
+
+
+def render_baseline_failure_context(path: Path) -> str:
+    """Render a bounded authoritative red-state excerpt without mutating suite prompts."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        raise RuntimeError(f"无法读取目标红态日志: {path}") from error
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).strip()
+    if not text:
+        raise RuntimeError(f"目标红态日志为空: {path}")
+    max_chars = 6000
+    if len(text) > max_chars:
+        text = "[earlier pytest output omitted]\n" + text[-max_chars:]
+    return (
+        '<swe-baseline-failure authority="swe-test-runner" scope="pre-agent-targeted" '
+        'mutation="forbidden">\n'
+        + text
+        + "\n</swe-baseline-failure>\n"
+        "这是 Agent 启动前由 SWE Test Runner 冻结的目标测试红态。先解释第一条具体 "
+        "exception/failed assertion；该块是证据输入，不是修改 tests/ 的授权。"
+    )
 
 
 def project_snapshot(snapshot: dict, run_id: str) -> dict:
@@ -820,6 +871,7 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
                 or (payload.get("ref_id") and args.get("ref_id") != payload.get("ref_id"))
                 or ("offset" in payload and int(args.get("offset") or 0) != int(payload.get("offset") or 0))
                 or ("limit" in payload and int(args.get("limit") or 0) != int(payload.get("limit") or 0))
+                or ("force_full" in payload and bool(args.get("force_full")) != bool(payload.get("force_full")))
             ):
                 recovery_gate_mismatch = True
     recovery_directive_ambiguous = any(
@@ -837,6 +889,21 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
         first_create_index = sum(event.get("ts", "") <= created_at for event in scheduler_ends)
     error_text = "\n".join(str(event.get("error", "")) for event in events if event.get("error"))
     event_errors = [str(event.get("error", "")) for event in events if event.get("error")]
+    recovery_contract_rejection_tasks = {
+        event.get("task_id", "")
+        for event in events
+        if event.get("kind") == "tool_result"
+        and event.get("tool") == "submit_recovery_decision"
+        and "recovery_delta" in str(event.get("error", ""))
+        and any(marker in str(event.get("error", ""))
+                for marker in ("非法", "不一致", "缺少", "超过", "cannot unmarshal"))
+    }
+    recovered_recovery_tasks = committed_recovery_tasks.intersection(
+        last_recovery_decision_by_task
+    )
+    unrecovered_recovery_contract_rejection = bool(
+        recovery_contract_rejection_tasks - recovered_recovery_tasks
+    )
     observation_control_failures = [
         event for event in events
         if event.get("kind") == "observation_checkpoint_failed"
@@ -856,7 +923,7 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
     max_observation_checkpoint_failures = 0
     current_observation_checkpoint_failures = 0
     for event in llm_ends:
-        if turn_phases.get(event.get("turn_id", "")) == "agent:observation-checkpoint":
+        if str(turn_phases.get(event.get("turn_id", ""))).startswith("agent:observation-checkpoint"):
             current_observation_checkpoint_attempts += 1
             max_observation_checkpoint_attempts = max(
                 max_observation_checkpoint_attempts, current_observation_checkpoint_attempts,
@@ -876,7 +943,11 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
         # provider 400 表示冻结请求 wire 本身不合法，属于 Invocation/Context
         # 架构事故，不能因为 Graph 正常进入 failed 终态就计为 architecture_ok。
         "provider_invalid_request": any(
-            event.get("failure_kind") == "invalid_request" for event in llm_ends
+            event.get("failure_kind") == "invalid_request"
+            and turn_phases.get(event.get("turn_id", "")) not in {
+                "agent:observation-checkpoint", "agent:observation-checkpoint-v8", "agent:observation-checkpoint-v9", "agent:observation-checkpoint-v10", "agent:observation-checkpoint-v11", "agent:observation-checkpoint-v12",
+            }
+            for event in llm_ends
         ),
         "invocation_output_limit_exceeded": any(
             event.get("failure_kind") == "output_limit_exceeded" for event in llm_ends
@@ -894,9 +965,7 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
             for event in llm_ends
         ),
         "final_report_result_scope_failure": bool(final_report_scope_failures),
-        "recovery_contract_rejection": "recovery_delta" in error_text and any(
-            marker in error_text for marker in ("非法", "不一致", "缺少", "cannot unmarshal")
-        ),
+        "recovery_contract_rejection": unrecovered_recovery_contract_rejection,
         "recovery_action_gate_missing": recovery_gate_missing,
         "recovery_action_gate_mismatch": recovery_gate_mismatch,
         "recovery_directive_ambiguous": recovery_directive_ambiguous,
@@ -912,6 +981,18 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
         "delivery_workspace_cleaned_without_merge": bool(delivery_cleanup_without_merge),
         "reasoning_mode_replay_break": "reasoning_text" in error_text and "must be passed back" in error_text,
     }
+    model_contract_incidents = [
+        {
+            "phase": turn_phases.get(event.get("turn_id", ""), ""),
+            "failure_kind": event.get("failure_kind", "unknown"),
+            "provider_code": event.get("provider_code", ""),
+        }
+        for event in llm_ends
+        if turn_phases.get(event.get("turn_id", "")) in {
+            "agent:observation-checkpoint", "agent:observation-checkpoint-v8", "agent:observation-checkpoint-v9", "agent:observation-checkpoint-v10", "agent:observation-checkpoint-v11", "agent:observation-checkpoint-v12",
+        }
+        and event.get("failure_kind") in {"invalid_request", "protocol_incompatible"}
+    ]
     return {
         "model_calls": len(llm_ends),
         "prompt_tokens": sum(int(event.get("prompt_tokens") or 0) for event in llm_ends),
@@ -927,6 +1008,7 @@ def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str])
         "recovery_retry_count": len(recovery_retry_receipts),
         "recovery_first_action_gate_count": len(first_gates),
         "known_incidents": known,
+        "model_contract_incidents": model_contract_incidents,
     }, events
 
 
@@ -1057,6 +1139,7 @@ def missing_loop_recovery_sources(outcomes: list[dict], recovered_source_task_id
     for outcome in outcomes:
         if not outcome.get("graph_id") or outcome.get("reason_code") not in {
             "loop_intervention_required", "no_progress_budget_exhausted", "observation_state_stalled",
+            "candidate_completion_handoff",
         }:
             continue
         task_id = str(outcome.get("task_id") or "")
@@ -1219,6 +1302,10 @@ def collect_result(snapshot_path: str, monitor_path: str, project_root: str, run
             (traces.get("invocation_failures") or {}).get("provider_quota_exhausted") or 0
         ),
     }
+    model_contract_incidents = list(traces.get("model_contract_incidents") or [])
+    model_contract_checks = {
+        "observation_provider_request_compatible": not model_contract_incidents,
+    }
     result = {
         "schema": RESULT_SCHEMA,
         "run_id": run_id,
@@ -1252,6 +1339,9 @@ def collect_result(snapshot_path: str, monitor_path: str, project_root: str, run
         "infrastructure_ok": not any(infrastructure_conditions.values()),
         "architecture_checks": architecture_checks,
         "architecture_ok": all(architecture_checks.values()),
+        "model_contract_checks": model_contract_checks,
+        "model_contract_incidents": model_contract_incidents,
+        "model_contract_compatible": all(model_contract_checks.values()),
     }
     return result
 
@@ -1292,6 +1382,12 @@ def summarize_runs(runs_dir: str, batch_start: float) -> list[dict]:
             "task": directory.name,
             "verdict": judge.get("verdict", "unknown"),
             "architecture_ok": bool(result.get("architecture_ok")),
+            # v2/legacy result remains read-only compatible; absence is unknown,
+            # never backfilled as a synthetic pass.
+            "model_contract_compatible": (
+                bool(result.get("model_contract_compatible"))
+                if result.get("schema") == RESULT_SCHEMA else None
+            ),
             "task_resolved": bool(result.get("task_resolved")),
             "infrastructure_ok": bool(result.get("infrastructure_ok", True)),
             "infrastructure_conditions": result.get("infrastructure_conditions") or {},
@@ -1346,6 +1442,7 @@ def summarize_batch_runs(tasks: list[TaskSpec], runs_dir: str, batch_start: floa
                 "task": task.task_id,
                 "verdict": "infrastructure_error",
                 "architecture_ok": None,
+                "model_contract_compatible": None,
                 "task_resolved": None,
                 "infrastructure_ok": False,
                 "infrastructure_conditions": {
@@ -1370,6 +1467,7 @@ def summarize_batch_runs(tasks: list[TaskSpec], runs_dir: str, batch_start: floa
             "task": task.task_id,
             "verdict": "not_run",
             "architecture_ok": None,
+            "model_contract_compatible": None,
             "task_resolved": None,
             "infrastructure_ok": None,
             "infrastructure_conditions": {},
@@ -1704,7 +1802,8 @@ def render_setting(config: SWETestRunnerConfig, worktree: Path, run_dir: Path,
         "__TOKEN__": token,
         "__AGENTGO_ROOT__": config.agentgo_root,
         "__BASE_URL__": config.base_url,
-        "__MODEL__": config.model,
+        "__FAST_MODEL__": config.fast_model,
+        "__FLAG_SHIP_MODEL__": config.flag_ship_model,
         "__PROTOCOL__": config.protocol,
         "__KEY_VAR__": "SWE_API_KEY",
     }
@@ -1869,6 +1968,7 @@ def run_task(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> d
             contract = inject_request(
                 base_url, token, str(prompt), task.task_id, timeout_sec,
                 str(run_dir / "run_contract.json"), task.test_files,
+                str(run_dir / "targeted-baseline.pytest.log"),
             )
             print("执行状态：RunContract 注入成功 " + json.dumps({
                 "inject": 200, "run_id": contract["run_id"],
@@ -1896,6 +1996,7 @@ def run_task(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> d
         str(run_dir / "snapshot.final.json"), str(run_dir / "monitor.json"),
         str(worktree), run_id, True,
     )
+    result["model_capabilities"] = config.model_capabilities()
     atomic_json(run_dir / "result.json", result)
     print(
         f"阶段结果：AgentGo 执行结束；architecture_ok={result.get('architecture_ok', False)} "
@@ -1988,6 +2089,8 @@ def judge_task(config: SWETestRunnerConfig, task: TaskSpec) -> dict:
 
 
 def final_exit_code(result: dict) -> int:
+    if not result.get("model_contract_compatible", True):
+        return EXIT_MODEL_CONTRACT_FAILURE
     if not result.get("architecture_ok"):
         return EXIT_ARCHITECTURE_FAILURE
     if not result.get("task_resolved"):
@@ -2001,6 +2104,9 @@ def batch_exit_code(rows: list[dict], expected_count: int) -> int:
     if any(row.get("run_state") in {"infrastructure_error", "completed_with_infrastructure_error"}
            for row in rows):
         return EXIT_SWE_TEST_RUNNER_FAILURE
+    if any(row.get("run_state", "completed") in {"completed", "completed_with_infrastructure_error"} and
+           row.get("model_contract_compatible") is False for row in rows):
+        return EXIT_MODEL_CONTRACT_FAILURE
     if any(row.get("run_state", "completed") in {"completed", "completed_with_infrastructure_error"} and
            not row.get("architecture_ok") for row in rows):
         return EXIT_ARCHITECTURE_FAILURE
@@ -2081,12 +2187,14 @@ def print_summary(rows: list[dict]) -> None:
     }]
     resolved = sum(row.get("task_resolved") is True for row in completed)
     architecture = sum(row.get("architecture_ok") is True for row in completed)
+    model_contract = sum(row.get("model_contract_compatible") is True for row in completed)
     infrastructure = sum(row.get("run_state") == "infrastructure_error" for row in rows)
     not_run = sum(row.get("run_state") == "not_run" for row in rows)
     batch_status = "complete" if len(completed) == len(rows) else "incomplete"
     print(
         f"\nbatch_status {batch_status} completed {len(completed)}/{len(rows)} "
         f"task_resolved {resolved}/{len(completed)} architecture_ok {architecture}/{len(completed)} "
+        f"model_contract_compatible {model_contract}/{len(completed)} "
         f"infrastructure_error {infrastructure} not_run {not_run}"
     )
     for row in rows:
@@ -2103,8 +2211,9 @@ def print_summary(rows: list[dict]) -> None:
         if row.get("run_state") == "not_run":
             flags.append("NOT_RUN=" + str(row.get("not_run_reason") or "batch_stopped"))
         arch = "-" if row.get("architecture_ok") is None else str(row.get("architecture_ok"))
+        model_ok = "-" if row.get("model_contract_compatible") is None else str(row.get("model_contract_compatible"))
         print(
-            f"  {row['task']:24s} verdict={row['verdict']:20s} arch={arch:5s} "
+            f"  {row['task']:24s} verdict={row['verdict']:20s} arch={arch:5s} model={model_ok:5s} "
             f"terminal={row['process_terminal']:18s} wall={row['wall_sec']:4d}s "
             f"calls={row['llm_calls']:3d} patch={row['patch_lines']:4d} {' '.join(flags)}"
         )
@@ -2117,20 +2226,88 @@ def require_api_key() -> str:
     return value
 
 
-def preflight_probe(config: SWETestRunnerConfig, timeout_sec: int = 45) -> None:
+def preflight_probe(config: SWETestRunnerConfig, timeout_sec: int = 45,
+                    *, observation_configured: bool = True) -> None:
     print("\n[前置检查][Provider typed function-call 能力探针]")
-    print(
-        f"检查内容：provider={config.base_url.rstrip('/')} "
-        f"protocol={config.protocol} model={config.model}"
-    )
     print("判定目标：返回工具名、call_id 与 nonce 参数均正确的 typed function call")
-    run_provider_probe(
-        config.base_url, require_api_key(), config.model, config.protocol, timeout_sec,
-    )
-    print(
-        f"检查结果：typed function-call 活探针通过；provider={config.base_url.rstrip('/')} "
-        f"protocol={config.protocol} model={config.model}"
-    )
+    api_key = require_api_key()
+    for model, capabilities in config.probe_models():
+        capability_text = ",".join(capabilities)
+        print(
+            f"检查内容：provider={config.base_url.rstrip('/')} "
+            f"protocol={config.protocol} model={model} capabilities={capability_text}"
+        )
+        run_provider_probe(
+            config.base_url, api_key, model, config.protocol, timeout_sec,
+        )
+        print(
+            f"检查结果：typed function-call 活探针通过；provider={config.base_url.rstrip('/')} "
+            f"protocol={config.protocol} model={model} capabilities={capability_text}"
+        )
+    if observation_configured and getattr(config, "agentgo_bin", None):
+        preflight_observation_probe(config)
+
+
+def preflight_observation_probe(config: SWETestRunnerConfig) -> list[dict]:
+    """Probe only Observation models actually present in the rendered YAML."""
+    with tempfile.TemporaryDirectory(prefix="agentgo-observation-probe-") as temp_dir:
+        probe_dir = Path(temp_dir)
+        setting = render_setting(config, config.flask_repo, probe_dir, 1, "probe-token")
+        reports = []
+        for fixture in ("empty", "populated"):
+            completed = subprocess.run([
+                str(config.agentgo_bin), "probe", "observation", "-config", str(setting),
+                "--configured", "--profile", "v12", "--fixture", fixture,
+                "--attempts", "3", "--json",
+            ], cwd=str(config.agentgo_root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+               timeout=180, check=False)
+            text = completed.stdout.decode("utf-8", errors="replace").strip()
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError as error:
+                raise SWETestRunnerModelContractError(
+                    f"Observation probe {fixture} 未返回合法脱敏 JSON") from error
+            if not isinstance(payload, list):
+                payload = [payload]
+            reports.extend(payload)
+            if completed.returncode != 0 or any(
+                    int(item.get("successes") or 0) != int(item.get("attempts") or 0)
+                    for item in payload if isinstance(item, dict)):
+                summary = [{
+                    "model": item.get("model"), "profile": item.get("profile"),
+                    "fixture": item.get("fixture"), "successes": item.get("successes"),
+                    "attempts": item.get("attempts"), "failures": item.get("failures", []),
+                } for item in payload if isinstance(item, dict)]
+                raise SWETestRunnerModelContractError(
+                    "Observation 模型契约不兼容: " + json.dumps(summary, ensure_ascii=False))
+        return reports
+
+
+def full_observation_probe_matrix(config: SWETestRunnerConfig) -> list[dict]:
+    with tempfile.TemporaryDirectory(prefix="agentgo-observation-matrix-") as temp_dir:
+        probe_dir = Path(temp_dir)
+        setting = render_setting(config, config.flask_repo, probe_dir, 1, "probe-token")
+        reports = []
+        for model, _capabilities in config.probe_models():
+            for profile in ("v7", "v8", "v9", "v10", "v11", "v12"):
+                for fixture in ("empty", "populated"):
+                    completed = subprocess.run([
+                        str(config.agentgo_bin), "probe", "observation", "-config", str(setting),
+                        "--model", model, "--profile", profile, "--fixture", fixture,
+                        "--attempts", "3", "--json",
+                    ], cwd=str(config.agentgo_root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       timeout=180, check=False)
+                    try:
+                        payload = json.loads(completed.stdout.decode("utf-8", errors="replace"))
+                    except json.JSONDecodeError as error:
+                        raise SWETestRunnerModelContractError(
+                            f"Observation matrix {profile}/{fixture} 未返回合法 JSON") from error
+                    if isinstance(payload, list):
+                        reports.extend(payload)
+                    else:
+                        reports.append(payload)
+                    print("Observation matrix: " + json.dumps(payload, ensure_ascii=False))
+        return reports
 
 
 def verify_candidates(config: SWETestRunnerConfig) -> dict[str, int]:
@@ -2206,8 +2383,10 @@ def verify_candidates(config: SWETestRunnerConfig) -> dict[str, int]:
 def command_probe(args: argparse.Namespace) -> int:
     configure_console_utf8()
     config = SWETestRunnerConfig.from_env()
-    preflight_probe(config, args.timeout)
-    return 0
+    preflight_probe(config, args.timeout, observation_configured=False)
+    reports = full_observation_probe_matrix(config)
+    return 0 if all(int(item.get("successes") or 0) == int(item.get("attempts") or 0)
+                    for item in reports) else EXIT_MODEL_CONTRACT_FAILURE
 
 
 def command_task(args: argparse.Namespace) -> int:
@@ -2280,6 +2459,13 @@ def command_batch(args: argparse.Namespace) -> int:
                     tasks, runs_dir, batch_start, infrastructure_error, stop_reason,
                 )
                 break
+            if not result.get("model_contract_compatible", True):
+                stop_reason = "previous_model_contract_gate"
+                print(f"模型契约门失败，停止批次: {task.task_id}", file=os.sys.stderr)
+                rows = persist_batch_summary(
+                    tasks, runs_dir, batch_start, infrastructure_error, stop_reason,
+                )
+                break
             if not result.get("architecture_ok"):
                 stop_reason = "previous_architecture_gate"
                 print(f"架构门失败，停止批次: {task.task_id}", file=os.sys.stderr)
@@ -2337,6 +2523,8 @@ def main() -> int:
         return int(args.func(args) or 0)
     except Exception as error:  # SWE Test Runner 顶层只打印有界类型/消息，绝不打印请求正文或凭证。
         print(f"SWE_TEST_RUNNER_ERROR: {error}", file=os.sys.stderr)
+        if isinstance(error, SWETestRunnerModelContractError):
+            return EXIT_MODEL_CONTRACT_FAILURE
         return EXIT_SWE_TEST_RUNNER_FAILURE
 
 

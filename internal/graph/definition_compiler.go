@@ -65,8 +65,8 @@ func (c DefinitionCompiler) Compile(ctx context.Context, req DefinitionCompileRe
 	}
 	// 新 authoring 默认写 v3；显式提交的 v2 Definition 只用于既有持久化
 	// authoring/recovery 兼容，不能被静默改写为 v3。
-	if body.Schema != SchemaV2 && body.Schema != SchemaV3 {
-		issues = append(issues, validationIssue("SCHEMA_VERSION_INVALID", "schema", true, fmt.Sprintf("Definition schema 必须为 %q 或 %q", SchemaV2, SchemaV3)))
+	if body.Schema != SchemaV2 && body.Schema != SchemaV3 && body.Schema != SchemaV4 {
+		issues = append(issues, validationIssue("SCHEMA_VERSION_INVALID", "schema", true, fmt.Sprintf("Definition schema 必须为 %q、%q 或 %q", SchemaV2, SchemaV3, SchemaV4)))
 	}
 
 	doc := graphDocumentFromDefinition(draft.GraphID, req.DefinitionRevision, body)

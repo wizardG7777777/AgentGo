@@ -49,10 +49,33 @@ func (rt *Runtime) GraphSchema(graphID string) string {
 	return doc.Schema
 }
 
+// ActivationOutputContract 返回当前 activation 冻结定义中的 typed OutputContract。
+// submit_task_result 在 finalizing 前用它做可修正的结构/源码证据预检；TaskOutcome
+// authority 仍在 durable commit 时二次校验，避免绕过工具入口。
+func (rt *Runtime) ActivationOutputContract(graphID, nodeID, activationID string) (*NodeOutputContract, error) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	doc, ok := rt.store.Get(graphID)
+	if !ok {
+		return nil, fmt.Errorf("graph: 输出契约检查失败：图 %s 不存在", graphID)
+	}
+	node, ok := doc.Nodes[nodeID]
+	if !ok {
+		return nil, fmt.Errorf("%w: 图 %s 节点 %s", ErrNodeNotFound, graphID, nodeID)
+	}
+	ex := node.Execution
+	if ex == nil || ex.ActivationID != activationID {
+		return nil, fmt.Errorf("graph: 图 %s 节点 %s 当前 activation 为 %q，不接受 %s 的输出预检",
+			graphID, nodeID, activationOf(node), activationID)
+	}
+	active := nodeForExecution(node, *ex)
+	return normalizeNodeOutputContract(active.OutputContract), nil
+}
+
 // OutletSchemaIsV2OrLater 把 v2 的闭合输出契约复用于 v3；保留单一判断
 // 点，避免工具层把未来 schema 误判成可携带 legacy event 的图。
 func OutletSchemaIsV2OrLater(schema string) bool {
-	return schema == SchemaV2 || schema == SchemaV3
+	return UsesTypedTerminalContract(schema)
 }
 
 // CheckActivationOutlet 对属于 schema v2 图的任务做提交期出路匹配检查：
@@ -70,7 +93,7 @@ func (rt *Runtime) CheckActivationOutlet(graphID, nodeID, activationID string, s
 	if !ok {
 		return fmt.Errorf("graph: 出路检查失败：图 %s 不存在", graphID)
 	}
-	if doc.Schema != SchemaV2 && doc.Schema != SchemaV3 {
+	if !UsesTypedTerminalContract(doc.Schema) {
 		return nil // v1 图不介入：无匹配出路仍由终态回填时 fail-closed（语义不变）
 	}
 	if doc.Status.IsTerminal() {

@@ -14,10 +14,19 @@ import (
 const (
 	ObservationDeltaSchemaV2      = "agentgo.observation-delta/v2"
 	ObservationDeltaSchemaV3      = "agentgo.observation-delta/v3"
-	ObservationDeltaSchemaCurrent = ObservationDeltaSchemaV3
+	ObservationDeltaSchemaV4      = "agentgo.observation-delta/v4"
+	ObservationDeltaSchemaCurrent = ObservationDeltaSchemaV4
 	MaxObservationFacts           = 12
 	MaxObservationNext            = 5
 	MaxObservationTextRunes       = 320
+)
+
+const (
+	ObservationNextMutate      = "mutate"
+	ObservationNextContinue    = "continue"
+	ObservationNextNeedContext = "need_context"
+	ObservationNextVerify      = "verify"
+	ObservationNextBlocked     = "blocked"
 )
 
 const (
@@ -58,6 +67,20 @@ type ResolvedObservationCandidate struct {
 	Evidence []EvidenceRef `json:"evidence_refs"`
 }
 
+// ObservationMutation 是模型在 v4 checkpoint 主动选择 mutate 时冻结的下一
+// 业务动作。L3 只强制 tool/path，不替模型编造编辑内容。
+type ObservationMutation struct {
+	Tool string `json:"tool"`
+	Path string `json:"path"`
+}
+
+// ObservationNextAction 把自然语言 next candidate 与下一业务动作分离。
+// 非 mutate 决策不携带 Mutation，也不会触发任何自动执行。
+type ObservationNextAction struct {
+	Decision string               `json:"decision"`
+	Mutation *ObservationMutation `json:"mutation,omitempty"`
+}
+
 // ObservationDelta 是压缩、Attempt rollover 与 L5 recovery 共用的结构化
 // 工作状态。它不是 reasoning 摘要；任何 Fact 都必须带当前 Task/Attempt 的
 // settled evidence，NextCandidates 始终按候选而非已确认事实渲染。
@@ -71,6 +94,7 @@ type ObservationDelta struct {
 	Facts                []ObservationFact              `json:"facts,omitempty"`
 	ResolvedCandidates   []ResolvedObservationCandidate `json:"resolved_candidates,omitempty"`
 	NextCandidates       []ObservationCandidate         `json:"next_candidates,omitempty"`
+	NextAction           *ObservationNextAction         `json:"next_action,omitempty"`
 	WorkspaceRevisionRef string                         `json:"workspace_revision_ref"`
 	LatestCheckRef       string                         `json:"latest_check_ref,omitempty"`
 	// SemanticAdvance 由 Store 依据 predecessor、候选关闭、phase、workspace
@@ -80,7 +104,8 @@ type ObservationDelta struct {
 }
 
 func (d ObservationDelta) Validate() error {
-	if (d.Schema != ObservationDeltaSchemaV2 && d.Schema != ObservationDeltaSchemaV3) || strings.TrimSpace(d.TaskID) == "" ||
+	if (d.Schema != ObservationDeltaSchemaV2 && d.Schema != ObservationDeltaSchemaV3 &&
+		d.Schema != ObservationDeltaSchemaV4) || strings.TrimSpace(d.TaskID) == "" ||
 		strings.TrimSpace(d.AttemptID) == "" || d.CreatedAt.IsZero() {
 		return fmt.Errorf("ObservationDelta schema/Task/Attempt/created_at 不完整")
 	}
@@ -104,11 +129,18 @@ func (d ObservationDelta) Validate() error {
 			if strings.TrimSpace(fact.Authority) != "" {
 				return fmt.Errorf("ObservationDelta/v2 facts[%d] 不接受 authority", i)
 			}
-		case ObservationDeltaSchemaV3:
+		case ObservationDeltaSchemaV3, ObservationDeltaSchemaV4:
 			if fact.Authority != ObservationFactAuthorityInferred {
 				return fmt.Errorf("ObservationDelta/v3 facts[%d].authority 必须是 inferred", i)
 			}
 		}
+	}
+	if d.Schema != ObservationDeltaSchemaV4 {
+		if d.NextAction != nil {
+			return fmt.Errorf("ObservationDelta v2/v3 不接受 next_action")
+		}
+	} else if err := ValidateObservationNextAction(d.NextAction); err != nil {
+		return err
 	}
 	seenResolved := make(map[string]struct{}, len(d.ResolvedCandidates))
 	for i, resolved := range d.ResolvedCandidates {
@@ -138,6 +170,33 @@ func (d ObservationDelta) Validate() error {
 			return fmt.Errorf("ObservationDelta next_candidates[%d] 重复", i)
 		}
 		seenNext[next.Ref] = struct{}{}
+	}
+	return nil
+}
+
+// ValidateObservationNextAction 校验 v4 下一动作承诺，供 Store 与工具 handler 共用。
+func ValidateObservationNextAction(action *ObservationNextAction) error {
+	if action == nil {
+		return fmt.Errorf("ObservationDelta/v4 缺少 next_action")
+	}
+	action.Decision = strings.TrimSpace(action.Decision)
+	switch action.Decision {
+	case ObservationNextMutate:
+		if action.Mutation == nil {
+			return fmt.Errorf("ObservationDelta/v4 mutate 缺少 mutation")
+		}
+		action.Mutation.Tool = strings.TrimSpace(action.Mutation.Tool)
+		action.Mutation.Path = strings.TrimSpace(action.Mutation.Path)
+		if (action.Mutation.Tool != "edit_file" && action.Mutation.Tool != "write_file") ||
+			action.Mutation.Path == "" {
+			return fmt.Errorf("ObservationDelta/v4 mutation tool/path 非法")
+		}
+	case ObservationNextContinue, ObservationNextNeedContext, ObservationNextVerify, ObservationNextBlocked:
+		if action.Mutation != nil {
+			return fmt.Errorf("ObservationDelta/v4 非 mutate 决策不得携带 mutation")
+		}
+	default:
+		return fmt.Errorf("ObservationDelta/v4 next_action.decision 非法")
 	}
 	return nil
 }
@@ -177,14 +236,16 @@ func observationRef(d ObservationDelta) (string, []byte, error) {
 		Facts                []ObservationFact              `json:"facts,omitempty"`
 		ResolvedCandidates   []ResolvedObservationCandidate `json:"resolved_candidates,omitempty"`
 		NextCandidates       []ObservationCandidate         `json:"next_candidates,omitempty"`
+		NextAction           *ObservationNextAction         `json:"next_action,omitempty"`
 		WorkspaceRevisionRef string                         `json:"workspace_revision_ref"`
 		LatestCheckRef       string                         `json:"latest_check_ref,omitempty"`
 		SemanticAdvance      bool                           `json:"semantic_advance"`
 	}{
 		Schema: d.Schema, TaskID: d.TaskID, AttemptID: d.AttemptID, PreviousRef: d.PreviousRef,
 		Phase: d.Phase, Facts: d.Facts, ResolvedCandidates: d.ResolvedCandidates,
-		NextCandidates: d.NextCandidates, WorkspaceRevisionRef: d.WorkspaceRevisionRef,
-		LatestCheckRef: d.LatestCheckRef, SemanticAdvance: d.SemanticAdvance,
+		NextCandidates: d.NextCandidates, NextAction: d.NextAction,
+		WorkspaceRevisionRef: d.WorkspaceRevisionRef,
+		LatestCheckRef:       d.LatestCheckRef, SemanticAdvance: d.SemanticAdvance,
 	}
 	data, err := json.Marshal(identity)
 	if err != nil {

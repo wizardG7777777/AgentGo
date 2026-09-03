@@ -68,13 +68,16 @@ func isOpenAIReasoningEffort(value string) bool {
 // 同 kind 的多个实例（replicas 个）完全同质——同工具集、同提示词、同模型。
 // 异质化通过声明多个 kind 实现。
 type AgentKind struct {
-	Kind             string   `yaml:"kind" json:"kind"`
-	Replicas         int      `yaml:"replicas" json:"replicas"`
-	EventType        string   `yaml:"event_type,omitempty" json:"event_type,omitempty"`
-	Profile          string   `yaml:"profile,omitempty" json:"profile,omitempty"`
-	Tools            []string `yaml:"tools,omitempty" json:"tools,omitempty"`
-	Model            string   `yaml:"model,omitempty" json:"model,omitempty"`
-	SystemPromptFile string   `yaml:"system_prompt_file" json:"system_prompt_file"`
+	Kind      string   `yaml:"kind" json:"kind"`
+	Replicas  int      `yaml:"replicas" json:"replicas"`
+	EventType string   `yaml:"event_type,omitempty" json:"event_type,omitempty"`
+	Profile   string   `yaml:"profile,omitempty" json:"profile,omitempty"`
+	Tools     []string `yaml:"tools,omitempty" json:"tools,omitempty"`
+	Model     string   `yaml:"model,omitempty" json:"model,omitempty"`
+	// ObservationModel 仅用于独立 Observation control invocation；省略时
+	// 继承该 kind 的业务模型，不能由 provider/model 名称隐式路由。
+	ObservationModel string `yaml:"observation_model,omitempty" json:"observation_model,omitempty"`
+	SystemPromptFile string `yaml:"system_prompt_file" json:"system_prompt_file"`
 	// AgentMaxLoops 已于 V6 移除（固定循环上限不再是终止条件，见
 	// docs/nextUpgrade-V6.md §5 升级思路 5/6/8）。结构体保留该字段仅为让旧
 	// YAML 仍能解析，Validate() 会对非零值返回明确的迁移诊断错误。
@@ -241,16 +244,20 @@ func (c UIConfig) HasFrontend(name string) bool {
 // 本结构的 Model 字段仅作为运行时元数据使用——主要用途是 HistoryEntry.Model 记录
 // （详见 nextUpgrade_v4.md §11.7.3 模型切换基准重置）与运行时日志。
 type AgentRuntimeConfig struct {
-	InstanceID               string
-	Kind                     string
-	EventType                string
-	AllowedTools             []string
-	Model                    string
-	ModelContextWindowTokens int64
-	ModelMaxCompletionTokens int64
-	ModelCapabilityDigest    string
-	SystemPrompt             string
-	TaskMaxRetries           int
+	InstanceID                          string
+	Kind                                string
+	EventType                           string
+	AllowedTools                        []string
+	Model                               string
+	ObservationModel                    string
+	ObservationModelContextWindowTokens int64
+	ObservationModelMaxCompletionTokens int64
+	ObservationModelCapabilityDigest    string
+	ModelContextWindowTokens            int64
+	ModelMaxCompletionTokens            int64
+	ModelCapabilityDigest               string
+	SystemPrompt                        string
+	TaskMaxRetries                      int
 	// IdleThreshold 对应全局 agent_idle_threshold：agent 连续 N 次空闲轮询后
 	// 退出 goroutine；0 = 永不空闲退出（生产推荐，见 Config.AgentIdleThreshold）。
 	// AgentKind 没有 per-kind 覆盖字段，各 AgentRuntimeConfig 构造点统一填全局值；

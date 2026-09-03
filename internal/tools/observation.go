@@ -11,7 +11,9 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/checkstore"
+	"agentgo/internal/graph"
 	"agentgo/internal/model"
+	"agentgo/internal/observationcontract"
 	"agentgo/internal/store"
 	"agentgo/internal/taskmem"
 	"agentgo/internal/trace"
@@ -32,54 +34,7 @@ func (g ObservationGroup) Register(r *agent.ToolRegistry) {
 	if r == nil || g.Store == nil || g.TaskMem == nil || g.Holder == nil {
 		return
 	}
-	factSchema := map[string]any{
-		"type":                 "object",
-		"additionalProperties": false,
-		"properties": map[string]any{
-			"text": map[string]any{"type": "string", "maxLength": taskmem.MaxObservationTextRunes,
-				"description": "有界的工作 claim，不得写 reasoning；framework 仅核对 evidence 归属，按 inferred 保存"},
-			"evidence_refs": map[string]any{
-				"type": "array", "minItems": 1, "maxItems": 8, "items": map[string]any{"type": "string"},
-				"description": "当前 Task/Attempt 的 tool-call:<call_id> 或 artifact:<path> 引用",
-			},
-		},
-		"required": []any{"text", "evidence_refs"},
-	}
-	resolvedSchema := map[string]any{
-		"type": "object", "additionalProperties": false,
-		"properties": map[string]any{
-			"candidate_ref": map[string]any{"type": "string", "description": "上一 Observation receipt 中仍开放的 candidate ref"},
-			"evidence_refs": map[string]any{
-				"type": "array", "minItems": 1, "maxItems": 8, "items": map[string]any{"type": "string"},
-				"description": "证明该候选已经解决的 settled evidence refs",
-			},
-		},
-		"required": []any{"candidate_ref", "evidence_refs"},
-	}
-	params := map[string]any{
-		"type":                 "object",
-		"additionalProperties": false,
-		"properties": map[string]any{
-			"phase": map[string]any{"type": "string", "enum": []any{
-				taskmem.ObservationPhaseInvestigate, taskmem.ObservationPhaseImplement,
-				taskmem.ObservationPhaseVerify, taskmem.ObservationPhaseFinalize,
-				taskmem.ObservationPhaseBlocked,
-			}, "description": "当前状态阶段；只有阶段前进、关闭旧候选、workspace revision 或 typed check 前进才算语义进展"},
-			"facts": map[string]any{
-				"type": "array", "maxItems": taskmem.MaxObservationFacts, "items": factSchema,
-				"description": "当前状态仍成立的 evidence-bound inferred claims，最多 12 条；旧 Observation claims 会被整体替换",
-			},
-			"resolved_candidates": map[string]any{
-				"type": "array", "maxItems": taskmem.MaxObservationNext, "items": resolvedSchema,
-				"description": "本轮由 settled evidence 关闭的上一状态候选；不得用换措辞冒充进展",
-			},
-			"next_candidates": map[string]any{
-				"type": "array", "maxItems": taskmem.MaxObservationNext, "items": map[string]any{"type": "string"},
-				"description": "下一步候选，最多 5 条；候选不是已确认事实",
-			},
-		},
-		"required": []any{"phase", "facts", "resolved_candidates", "next_candidates"},
-	}
+	params := observationcontract.Parameters(observationcontract.SchemaProfile{})
 	r.Register("record_observation_delta",
 		"冻结一次有 predecessor 的当前工作状态，供 Context 投影、Attempt rollover 与 Graph recovery 使用；关闭旧候选必须引用 settled evidence，只新增不同措辞不算语义进展；不得提交 chain-of-thought、工具参数或原始大正文",
 		params, g.record)
@@ -126,6 +81,10 @@ func (g ObservationGroup) record(_ context.Context, args map[string]any) (string
 		return "", err
 	}
 	phase, _ := args["phase"].(string)
+	nextAction, err := parseObservationNextAction(args["next_action"])
+	if err != nil {
+		return "", err
+	}
 	resolvedCandidates, err := parseResolvedObservationCandidates(args["resolved_candidates"], evidence,
 		evidenceSettledAt, predecessorCreatedAt)
 	if err != nil {
@@ -142,7 +101,7 @@ func (g ObservationGroup) record(_ context.Context, args map[string]any) (string
 	delta := taskmem.ObservationDelta{
 		Schema: taskmem.ObservationDeltaSchemaCurrent, TaskID: task.ID, AttemptID: task.AttemptID,
 		PreviousRef: previousRef, Phase: strings.TrimSpace(phase), Facts: facts,
-		ResolvedCandidates: resolvedCandidates, NextCandidates: candidates,
+		ResolvedCandidates: resolvedCandidates, NextCandidates: candidates, NextAction: nextAction,
 		WorkspaceRevisionRef: workspaceRef, LatestCheckRef: latestCheckRef, CreatedAt: time.Now().UTC(),
 	}
 	ref, err := g.TaskMem.RecordObservation(delta)
@@ -166,9 +125,37 @@ func (g ObservationGroup) record(_ context.Context, args map[string]any) (string
 		"previous_ref": stored.PreviousRef, "phase": stored.Phase,
 		"facts": len(facts), "resolved_candidates": len(resolvedCandidates),
 		"open_candidate_refs": openRefs, "semantic_advance": stored.SemanticAdvance,
+		"next_action":            stored.NextAction,
 		"workspace_revision_ref": stored.WorkspaceRevisionRef, "latest_check_ref": stored.LatestCheckRef,
 	})
 	return string(payload), nil
+}
+
+func parseObservationNextAction(raw any) (*taskmem.ObservationNextAction, error) {
+	object, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("next_action 必须是 object")
+	}
+	decision := strings.TrimSpace(fmt.Sprint(object["decision"]))
+	action := &taskmem.ObservationNextAction{Decision: decision}
+	if decision == taskmem.ObservationNextMutate {
+		mutation, ok := object["mutation"].(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("next_action=mutate 必须携带 mutation")
+		}
+		tool := strings.TrimSpace(fmt.Sprint(mutation["tool"]))
+		path, err := graph.CanonicalRecoveryEvidencePath(fmt.Sprint(mutation["path"]))
+		if err != nil {
+			return nil, fmt.Errorf("next_action mutation.path: %w", err)
+		}
+		action.Mutation = &taskmem.ObservationMutation{Tool: tool, Path: path}
+	} else if _, exists := object["mutation"]; exists {
+		return nil, fmt.Errorf("next_action 非 mutate 决策不得携带 mutation")
+	}
+	if err := taskmem.ValidateObservationNextAction(action); err != nil {
+		return nil, err
+	}
+	return action, nil
 }
 
 func (g ObservationGroup) evidenceAuthority(task *model.Task) (map[string]taskmem.EvidenceRef,

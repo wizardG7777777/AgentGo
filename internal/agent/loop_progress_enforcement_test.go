@@ -529,6 +529,135 @@ func TestNovelVerificationEvidenceEntersForcedDeliverablePhaseInsteadOfBlocked(t
 	}
 }
 
+func TestInvestigationV3ForcesStructuredDeliveryAfterBoundedExploration(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := catalog.ProgressContract(policycatalog.ProgressInvestigationV3)
+	if !ok {
+		t.Fatal("缺少 investigation/v3")
+	}
+	now := time.Now().UTC()
+	task := &model.Task{ID: "explore-v3", GraphID: "graph-v4", ProgressContract: &profile.Contract}
+	checkpoint := loopcontract.ProgressCheckpoint{
+		Schema: loopcontract.CheckpointSchemaV1, CheckpointID: "checkpoint-explore-v3", Version: 1,
+		TaskID: task.ID, AttemptID: "attempt-1", Contract: profile.Contract.Ref,
+		LastAnyProgressAt: now, LastDeliverableProgressAt: now,
+		ExplorationTurnsSinceDeliverable: profile.Contract.Policy.MaxExplorationTurns + 1,
+		InterventionStage:                loopcontract.StageRunning, UpdatedAt: now,
+	}
+	decision, intervention := decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if intervention != nil || decision.Intervention || decision.Blocked ||
+		!strings.Contains(decision.Reminder, progressDeliverableRequiredMarker) {
+		t.Fatalf("investigation/v3 到界必须进入结构化交付而非 blocked: decision=%+v intervention=%+v", decision, intervention)
+	}
+}
+
+func TestInvestigationV4KeepsBoundaryEvidenceExplorationBounded(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := catalog.ProgressContract(policycatalog.ProgressInvestigationV4)
+	if !ok || profile.Contract.Policy.MaxExplorationTurns != 10 {
+		t.Fatalf("缺少 investigation/v4 十轮冻结策略: %+v", profile)
+	}
+	now := time.Now().UTC()
+	task := &model.Task{ID: "explore-v4", GraphID: "graph-v4", ProgressContract: &profile.Contract}
+	checkpoint := loopcontract.ProgressCheckpoint{
+		Schema: loopcontract.CheckpointSchemaV1, CheckpointID: "checkpoint-explore-v4", Version: 1,
+		TaskID: task.ID, AttemptID: "attempt-1", Contract: profile.Contract.Ref,
+		LastAnyProgressAt: now, LastDeliverableProgressAt: now,
+		ExplorationTurnsSinceDeliverable: profile.Contract.Policy.MaxExplorationTurns + 1,
+		InterventionStage:                loopcontract.StageRunning, UpdatedAt: now,
+	}
+	decision, intervention := decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if intervention != nil || decision.Intervention || decision.Blocked ||
+		!strings.Contains(decision.Reminder, progressDeliverableRequiredMarker) {
+		t.Fatalf("investigation/v4 到界必须进入结构化交付: decision=%+v intervention=%+v", decision, intervention)
+	}
+}
+
+func TestInvestigationV5ReservesExactHandoffBeforeAttemptDeadline(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := catalog.ProgressContract(policycatalog.ProgressInvestigationV5)
+	if !ok || profile.Contract.Policy.MaxExplorationTurns != 8 ||
+		profile.Contract.Policy.FirstDeliverableHandoffReserve != 4*time.Minute {
+		t.Fatalf("缺少 investigation/v5 冻结策略: %+v", profile)
+	}
+	now := time.Now().UTC()
+	task := &model.Task{ID: "explore-v5", GraphID: "graph-v4", ProgressContract: &profile.Contract}
+	checkpoint := loopcontract.ProgressCheckpoint{
+		UpdatedAt: now,
+		Deadlines: loopcontract.DeadlineSet{Attempt: runcontract.DeadlineBudget{
+			Scope: runcontract.ScopeAttempt, HardDeadlineAt: now.Add(3 * time.Minute),
+		}},
+	}
+	decision, intervention := decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if intervention != nil || decision.Intervention || decision.Blocked ||
+		!strings.Contains(decision.Reminder, progressDeliverableRequiredMarker) {
+		t.Fatalf("investigation/v5 未在 deadline 前预留 exact handoff: %+v %+v", decision, intervention)
+	}
+	checkpoint.Deadlines.Attempt.HardDeadlineAt = now.Add(10 * time.Minute)
+	checkpoint.ExplorationTurnsSinceDeliverable = 8
+	decision, intervention = decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if intervention != nil || !strings.Contains(decision.Reminder, progressDeliverableRequiredMarker) {
+		t.Fatalf("investigation/v5 第八轮未进入 exact submit: %+v %+v", decision, intervention)
+	}
+}
+
+func TestInvestigationV6LeavesEightMinutesForDownstreamExecution(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := catalog.ProgressContract(policycatalog.ProgressInvestigationV6)
+	if !ok || profile.Contract.Policy.MaxExplorationTurns != 6 ||
+		profile.Contract.Policy.FirstDeliverableHandoffReserve != 8*time.Minute {
+		t.Fatalf("缺少 investigation/v6 下游窗口: %+v", profile)
+	}
+	now := time.Now().UTC()
+	task := &model.Task{ID: "explore-v6", GraphID: "graph-v4", ProgressContract: &profile.Contract}
+	checkpoint := loopcontract.ProgressCheckpoint{
+		UpdatedAt: now,
+		Deadlines: loopcontract.DeadlineSet{Attempt: runcontract.DeadlineBudget{
+			Scope: runcontract.ScopeAttempt, HardDeadlineAt: now.Add(7 * time.Minute),
+		}},
+	}
+	decision, intervention := decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if intervention != nil || !strings.Contains(decision.Reminder, progressDeliverableRequiredMarker) {
+		t.Fatalf("investigation/v6 未给下游保留八分钟: %+v %+v", decision, intervention)
+	}
+}
+
+func TestInvestigationV7LeavesTenMinutesForDownstreamExecution(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := catalog.ProgressContract(policycatalog.ProgressInvestigationV7)
+	if !ok || profile.Contract.Policy.MaxExplorationTurns != 6 ||
+		profile.Contract.Policy.FirstDeliverableHandoffReserve != 10*time.Minute {
+		t.Fatalf("缺少 investigation/v7 下游窗口: %+v", profile)
+	}
+	now := time.Now().UTC()
+	task := &model.Task{ID: "explore-v7", GraphID: "graph-v4", ProgressContract: &profile.Contract}
+	checkpoint := loopcontract.ProgressCheckpoint{
+		UpdatedAt: now,
+		Deadlines: loopcontract.DeadlineSet{Attempt: runcontract.DeadlineBudget{
+			Scope: runcontract.ScopeAttempt, HardDeadlineAt: now.Add(9 * time.Minute),
+		}},
+	}
+	decision, intervention := decideProgressPolicy(profile.Contract, task, &checkpoint)
+	if intervention != nil || !strings.Contains(decision.Reminder, progressDeliverableRequiredMarker) {
+		t.Fatalf("investigation/v7 未给下游保留十分钟: %+v %+v", decision, intervention)
+	}
+}
+
 func TestCompletedFileDeliverableEntersSubmitPhaseInsteadOfIntervention(t *testing.T) {
 	task := enforcementTask(t)
 	task.GraphID = "graph-code-change"
@@ -1068,6 +1197,78 @@ func TestCodeChangeV6CheckpointsAtSixAndStopsOnSecondDecisionStagnation(t *testi
 	if !decision.Intervention || decision.ObservationAction != "decision_stalled" || intervention == nil ||
 		intervention.ReasonCode != loopcontract.InterventionDecisionStalled {
 		t.Fatalf("第二个无决策前进 checkpoint 必须 typed intervention: %+v %+v", decision, intervention)
+	}
+}
+
+func TestCodeChangeV10HandsOffAfterFirstDecisionStagnation(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := catalog.ProgressContract(policycatalog.ProgressCodeChangeV10)
+	if !ok {
+		t.Fatal("缺少 code-change/v10")
+	}
+	checkpoint := loopcontract.ProgressCheckpoint{
+		DecisionStagnationCount: 1, ObservationDeltaRef: "observation:sha256:stale",
+	}
+	decision, intervention := decideProgressPolicy(profile.Contract,
+		&model.Task{ID: "work-v10", GraphID: "graph-v4", ProgressContract: &profile.Contract}, &checkpoint)
+	if !decision.Intervention || decision.ObservationAction != "decision_stalled" || intervention == nil ||
+		intervention.ReasonCode != loopcontract.InterventionDecisionStalled {
+		t.Fatalf("v10 第一次无决策 checkpoint 必须交 v5 repair: decision=%+v intervention=%+v", decision, intervention)
+	}
+}
+
+func TestCodeChangeV11UsesTwoTurnDecisionCheckpoint(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := catalog.ProgressContract(policycatalog.ProgressCodeChangeV11)
+	if !ok || profile.Contract.Policy.DecisionCheckpointAfterTurns != 2 ||
+		profile.Contract.Policy.MaxDecisionStagnation != 1 {
+		t.Fatalf("code-change/v11 handoff policy 未冻结: %+v", profile)
+	}
+	checkpoint := loopcontract.ProgressCheckpoint{TurnsSinceDecisionCheckpoint: 2}
+	decision, intervention := decideProgressPolicy(profile.Contract,
+		&model.Task{ID: "work-v11", GraphID: "graph-v4", ProgressContract: &profile.Contract}, &checkpoint)
+	if intervention != nil || decision.Intervention || decision.ObservationAction != "decision_periodic" ||
+		!strings.Contains(decision.Reminder, "decision_periodic") {
+		t.Fatalf("v11 decision checkpoint 未与可放弃 knowledge periodic 分离: %+v %+v", decision, intervention)
+	}
+	now := time.Now().UTC()
+	candidate := loopcontract.ProgressCheckpoint{
+		UpdatedAt: now, LastDeliverableProgressAt: now.Add(-time.Minute),
+		Deadlines: loopcontract.DeadlineSet{Attempt: runcontract.DeadlineBudget{
+			Scope: runcontract.ScopeAttempt, HardDeadlineAt: now.Add(2 * time.Minute),
+		}},
+		RecentFingerprints: []loopcontract.ProgressFingerprint{{
+			Kind: loopcontract.SignalFileVersionChanged, Identity: "src/a.go", Digest: "sha256:changed",
+		}},
+	}
+	decision, intervention = decideProgressPolicy(profile.Contract,
+		&model.Task{ID: "candidate-v11", GraphID: "graph-v4", ProgressContract: &profile.Contract}, &candidate)
+	if !decision.Intervention || decision.ObservationAction != "candidate_handoff" || intervention == nil ||
+		intervention.ReasonCode != loopcontract.InterventionCandidateHandoff {
+		t.Fatalf("v11 dirty candidate 未在 deadline 前预留 repair 窗口: %+v %+v", decision, intervention)
+	}
+}
+
+func TestCodeChangeV12UsesOneTurnDecisionCheckpoint(t *testing.T) {
+	catalog, err := policycatalog.NewDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := catalog.ProgressContract(policycatalog.ProgressCodeChangeV12)
+	if !ok || profile.Contract.Policy.DecisionCheckpointAfterTurns != 1 {
+		t.Fatalf("code-change/v12 未冻结单 decision turn: %+v", profile)
+	}
+	checkpoint := loopcontract.ProgressCheckpoint{TurnsSinceDecisionCheckpoint: 1}
+	decision, intervention := decideProgressPolicy(profile.Contract,
+		&model.Task{ID: "work-v12", GraphID: "graph-v4", ProgressContract: &profile.Contract}, &checkpoint)
+	if intervention != nil || decision.Intervention || decision.ObservationAction != "decision_periodic" {
+		t.Fatalf("v12 单 decision turn 未进入 checkpoint: %+v %+v", decision, intervention)
 	}
 }
 

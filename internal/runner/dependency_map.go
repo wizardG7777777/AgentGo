@@ -130,6 +130,7 @@ func resolveToolGroups(
 			RecoveryAuthority:    recoveryAuthority,
 			Checkpoints:          deps.LoopStore,
 			Workspaces:           deps.WorkspaceManager,
+			ProjectRoot:          deps.ProjectRoot,
 		},
 		tools.ObservationGroup{
 			Store: deps.Store, TaskMem: deps.TaskMemStore, Holder: holder, AgentID: instanceID,

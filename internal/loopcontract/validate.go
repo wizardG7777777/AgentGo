@@ -115,6 +115,9 @@ func (p ProgressPolicy) Validate() error {
 	if p.FirstDeliverableHandoffReserve < 0 {
 		return fmt.Errorf("first_deliverable_handoff_reserve 不能为负")
 	}
+	if p.CandidateRepairHandoffReserve < 0 {
+		return fmt.Errorf("candidate_repair_handoff_reserve 不能为负")
+	}
 	if p.KnowledgeCheckpointAfterTurns < 0 {
 		return fmt.Errorf("knowledge_checkpoint_after_turns 不能为负")
 	}
@@ -665,7 +668,7 @@ func validInterventionReason(value InterventionReason) bool {
 	switch value {
 	case InterventionNoProgressBudget, InterventionNoProgressStalled, InterventionAttemptDeadline, InterventionActivationDeadline,
 		InterventionOscillation, InterventionUnsafeUnknown, InterventionCheckpointFailure,
-		InterventionObservationStalled, InterventionDecisionStalled, InterventionControlUnstable,
+		InterventionObservationStalled, InterventionDecisionStalled, InterventionCandidateHandoff, InterventionControlUnstable,
 		InterventionAttemptBudget:
 		return true
 	default:

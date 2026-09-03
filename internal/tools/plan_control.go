@@ -42,6 +42,10 @@ type RecoveryDecisionAuthority interface {
 	ValidateRecoveryRetryStart(graphID, nodeID, activationID string, now time.Time) error
 }
 
+type ActivationOutputContractReader interface {
+	ActivationOutputContract(graphID, nodeID, activationID string) (*graph.NodeOutputContract, error)
+}
+
 type ObservationCheckpointReader interface {
 	LoadCheckpoint(taskID string) (*loopcontract.ProgressCheckpoint, bool, error)
 }
@@ -67,6 +71,7 @@ type PlanControlGroup struct {
 	Workspaces        checkstore.WorkspaceRevisionResolver
 	RecoveryAuthority RecoveryDecisionAuthority
 	Checkpoints       ObservationCheckpointReader
+	ProjectRoot       string
 }
 
 func (g PlanControlGroup) Register(r *agent.ToolRegistry) {
@@ -106,9 +111,11 @@ func (g PlanControlGroup) Register(r *agent.ToolRegistry) {
 			"type": "object", "additionalProperties": false,
 			"properties": map[string]any{
 				"decision": map[string]any{"type": "string", "enum": []any{
-					"edit", "need_context", "hypothesis_rejected", "blocked",
+					"edit", "resume_candidate", "need_context", "hypothesis_rejected", "blocked",
 				}},
-				"path": map[string]any{"type": "string", "description": "need_context 要新增完整覆盖的项目相对文件"},
+				"path":   map[string]any{"type": "string", "description": "need_context 要新增完整覆盖的项目相对文件"},
+				"offset": map[string]any{"type": "integer", "minimum": 1, "description": "RecoveryDelta v5 need_context 的 focus page 起始行；新文件省略时为 1"},
+				"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": 240, "description": "RecoveryDelta v5 need_context 的 focus page 行数；省略时使用冻结页大小"},
 				"edit_steps": map[string]any{
 					"type": "array", "minItems": 1, "maxItems": graph.MaxRecoveryEditSteps,
 					"items": map[string]any{
@@ -134,7 +141,7 @@ func (g PlanControlGroup) Register(r *agent.ToolRegistry) {
 					"then": map[string]any{"required": []any{"reason"}}},
 			},
 		}
-		r.Register("submit_change_decision", "RecoveryDelta v4 在完整 EvidenceContract 覆盖后提交修改决策。edit 声明与 EvidenceContract 相互独立的有序 edit_steps（tool+path）；need_context 增加一个必须完整读取的文件；hypothesis_rejected/blocked 会以结构化 blocked 终态安全交回 L5。该工具只在 v4 recovery work 的决策 phase 暴露，不能用于普通业务轮。",
+		r.Register("submit_change_decision", "RecoveryDelta v4/v5 在完整 EvidenceContract 覆盖后提交修改决策。edit 声明与 EvidenceContract 相互独立的有序 edit_steps（tool+path）；v5 的 resume_candidate 复用 Runtime 绑定的非空 dirty candidate 并直接进入冻结 check；need_context 增加一个必须完整读取的文件；hypothesis_rejected/blocked 会以结构化 blocked 终态安全交回 L5。该工具只在 recovery work 的决策 phase 暴露，不能用于普通业务轮。",
 			changeDecision, g.submitChangeDecision)
 	}
 	if g.FinalizationNotifier != nil && g.SubmitState != nil && g.RecoveryAuthority != nil {

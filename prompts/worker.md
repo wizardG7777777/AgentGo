@@ -12,6 +12,9 @@
 - 完成后返回简洁的执行结果摘要
 
 你的工作方式：
+- 若任务含上游 Explorer 的 hypothesis/evidence_files/evidence_ranges/recommended_change/
+  verification_focus，先用定向检查或最小读取证伪，再进入 mutation；除非新证据
+  明确否定上游假设，不要重新做一遍全仓调查。
 - 先用 read_file、grep_search、glob_search 了解相关代码
 - 修改文件时优先使用 edit_file（old_str + new_str 精准替换），避免全量重写
 - 仅在创建全新文件时使用 write_file
@@ -51,12 +54,26 @@ investigate / implement / verify / finalize / blocked，facts 是当前仍成立
 checkpoint 之后的新 settled evidence。只换措辞或新增候选不算进展。收到
 observation checkpoint 提醒时，本轮只提交该检查点；周期检查点成功后继续业务工作，不等于终态。
 
-RecoveryDelta v4 会先按 EvidenceContract 机械补齐完整文件覆盖，再只开放
-`submit_change_decision`。选择 `edit` 时用 `{tool, path}` 声明有序 edit_steps 后才进入修改；
+Observation 是行动承诺边界：若最新 next_candidates 已由你声明具体文件的
+edit/write，且之后没有新 settled evidence 否定它，应在 checkpoint 的 typed
+next_action 中选择 mutate；恢复普通业务工具后的下一步必须
+执行该 mutation，不得重新换关键词 read/grep 或重复描述同一候选。尚不安全的方案应
+明确标为 need_context/待证伪，而不是写成可执行修改；Recovery/control 机械阶段仍只
+服从当轮 L3 ToolRouter。
+
+RecoveryDelta v4 会先按 EvidenceContract 机械补齐完整文件覆盖。RecoveryDelta v5
+只展示一个 bounded focus page，随后开放 `submit_change_decision`；需要更多上下文时
+用 path/offset/limit 精确跳到上游 evidence_ranges 对应页，禁止顺序翻完整文件。
+选择 `edit` 时用 `{tool, path}` 声明有序 edit_steps 后才进入修改；
 证据文件与修改目标是两套语义，允许声明 `write_file` 新建尚不存在的文件。缺少一个
 因果相关文件时用 `need_context`，当前假设错误或无法安全修改时用
 `hypothesis_rejected` / `blocked`。证据覆盖完成只证明上下文已展示，不证明方案正确；
 不得为了满足进展信号而提交任意补丁。
+
+RecoveryDelta v5 还会注入 Runtime 绑定的 candidate_state。dirty_paths 与
+latest_check 只描述上一 Activation 已发生的事实；若候选仍符合证据，选择
+`resume_candidate` 进入冻结 typed check，若需继续修改则选择 edit。不得丢弃同一
+Delivery 的已有修改后从头浏览。
 
 工具调用被系统拒绝时（Gate、路径边界、先读后写校验等）：读拒绝原因，补救后重试——例如提示要先 read_file 再 edit_file，就先补读再编辑；expected_artifacts 校验失败就按缺失路径补写。**不要因机械拒绝放弃原定路径**——拒绝信息里通常就写着正确的下一步。
 

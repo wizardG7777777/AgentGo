@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -263,7 +264,7 @@ func TestDeepSeekLiveResponsesReplayPreservesEmptyMessageContent(t *testing.T) {
 	if os.Getenv("AGENTGO_LIVE_DEEPSEEK") != "1" {
 		t.Skip("仅在显式外部 DeepSeek 协议回归中运行")
 	}
-	baseURL, apiKey, model := os.Getenv("SWE_BASE_URL"), os.Getenv("SWE_API_KEY"), os.Getenv("SWE_MODEL")
+	baseURL, apiKey, model := os.Getenv("SWE_BASE_URL"), os.Getenv("SWE_API_KEY"), os.Getenv("SWE_FAST_MODEL")
 	if baseURL == "" || apiKey == "" {
 		t.Fatal("SWE_BASE_URL/SWE_API_KEY 未设置")
 	}
@@ -324,9 +325,9 @@ func TestDeepSeekLiveDeliverableOverrideEscapesHistoricalTools(t *testing.T) {
 	if os.Getenv("AGENTGO_LIVE_DEEPSEEK") != "1" {
 		t.Skip("仅在显式外部 DeepSeek 协议回归中运行")
 	}
-	baseURL, apiKey, model := os.Getenv("SWE_BASE_URL"), os.Getenv("SWE_API_KEY"), os.Getenv("SWE_MODEL")
+	baseURL, apiKey, model := os.Getenv("SWE_BASE_URL"), os.Getenv("SWE_API_KEY"), os.Getenv("SWE_FAST_MODEL")
 	if baseURL == "" || apiKey == "" || model != "deepseek-v4-flash" {
-		t.Fatal("需要真实 deepseek-v4-flash 的 SWE_BASE_URL/SWE_API_KEY/SWE_MODEL")
+		t.Fatal("需要真实 deepseek-v4-flash 的 SWE_BASE_URL/SWE_API_KEY/SWE_FAST_MODEL")
 	}
 	readTool := ToolDef{
 		Name: "read_file", Description: "Read one file.",
@@ -383,6 +384,31 @@ func TestDeepSeekLiveDeliverableOverrideEscapesHistoricalTools(t *testing.T) {
 	for _, call := range response.ToolCalls {
 		if call.Name != submitTool.Name {
 			t.Fatalf("none+exact 未逃离历史工具偏好: %+v", response.ToolCalls)
+		}
+	}
+}
+
+func TestResponsesFailedErrorClassifiesProviderStatus(t *testing.T) {
+	for _, tc := range []struct {
+		code        string
+		want        invocation.FailureKind
+		recoverable bool
+	}{
+		{"InvalidParameter", invocation.FailureInvalidRequest, false},
+		{"invalid_request_error", invocation.FailureInvalidRequest, false},
+		{"insufficient_quota", invocation.FailureProviderQuotaExhausted, false},
+		{"model_not_found", invocation.FailureModelUnavailable, false},
+		{"invalid_api_key", invocation.FailureAuth, false},
+		{"internal_server_error", invocation.FailureProviderUnavailable, true},
+	} {
+		err := responsesFailedError(tc.code, "bounded")
+		failure, ok := invocation.FromError(err)
+		if !ok || failure.Kind != tc.want {
+			t.Fatalf("code=%s failure=%+v", tc.code, failure)
+		}
+		var recoverable *ErrRecoverable
+		if errors.As(err, &recoverable) != tc.recoverable {
+			t.Fatalf("code=%s recoverable 漂移: %T", tc.code, err)
 		}
 	}
 }

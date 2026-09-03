@@ -353,6 +353,31 @@ func TestComputeExecutionLease_FreezesModelAndWorkspace(t *testing.T) {
 	}
 }
 
+func TestComputeExecutionLeaseV2FreezesObservationModelCapability(t *testing.T) {
+	s, _, _ := setup()
+	ag, _, _ := newLeaseAgent("worker-v2", "code", s, "read_file")
+	ag.Model, ag.ModelCapabilityDigest = "business", "business-cap"
+	ag.ModelContextWindowTokens, ag.ModelMaxCompletionTokens = 100000, 10000
+	ag.ObservationModel, ag.ObservationModelCapabilityDigest = "control", "control-cap"
+	ag.ObservationModelContextWindowTokens, ag.ObservationModelMaxCompletionTokens = 200000, 20000
+	lease, rejection := ag.computeExecutionLease(&model.Task{ID: "v2", RunID: "run", ContextPolicyRef: "context:default/v10"})
+	if rejection != "" {
+		t.Fatal(rejection)
+	}
+	if lease.Schema != model.ExecutionLeaseSchemaV2 || lease.ObservationModel != "control" ||
+		lease.ObservationModelCapabilityDigest != "control-cap" || lease.Digest == "" {
+		t.Fatalf("ExecutionLease v2 未冻结 Observation 能力: %+v", lease)
+	}
+	legacy := *lease
+	legacy.Schema = model.ExecutionLeaseSchemaV1
+	legacy.ObservationModel = ""
+	legacy.ObservationModelCapabilityDigest = ""
+	legacy.Digest = legacy.ComputeDigest()
+	if legacy.Digest == lease.Digest {
+		t.Fatal("v1/v2 digest 不得混用")
+	}
+}
+
 // --- 计算：Digest 稳定（同输入同 digest；语义字段变化 digest 变化） ---
 
 func TestExecutionLease_DigestStable(t *testing.T) {

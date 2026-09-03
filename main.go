@@ -9,6 +9,7 @@ import (
 
 	"agentgo/internal/bootstrap"
 	"agentgo/internal/config"
+	"agentgo/internal/observationprobe"
 	"agentgo/internal/session"
 	"agentgo/internal/trace"
 )
@@ -33,6 +34,9 @@ func main() {
 	// 子命令路由：config 族（当前含 doctor）只做配置静态检查，不启动主系统
 	if len(os.Args) >= 2 && os.Args[1] == "config" {
 		os.Exit(config.CLI(os.Args[2:], os.Stdout, os.Stderr))
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "probe" {
+		os.Exit(observationprobe.CLI(os.Args[2:], os.Stdout, os.Stderr))
 	}
 
 	// eval 子命令及其独立开发工具均已删除。这里继续显式拒绝，避免 "eval"

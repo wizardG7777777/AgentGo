@@ -49,6 +49,7 @@ type graphTaskOutcomeAuthority struct {
 	graphs      graphDocumentReader
 	outcomes    *outcomestore.Store
 	checkpoints taskCheckpointReader
+	projectRoot string
 	candidates  interface {
 		FreezeCandidate(deliveryID, workspaceID, workspaceRevisionRef string) (delivery.Candidate, error)
 	}
@@ -122,6 +123,9 @@ func (a *graphTaskOutcomeAuthority) Commit(intent store.TerminalOutcomeIntent) (
 		if err := graph.ValidateNodeOutput(contract, summary, structuredResult); err != nil {
 			return "", err
 		}
+		if err := graph.ValidateNodeOutputEvidence(contract, a.projectRoot, structuredResult); err != nil {
+			return "", err
+		}
 	}
 	result, err := json.Marshal(structuredResult)
 	if err != nil {
@@ -181,7 +185,7 @@ func (a *graphTaskOutcomeAuthority) Commit(intent store.TerminalOutcomeIntent) (
 		}
 	}
 	schema := outcome.SchemaV1
-	if executionDoc != nil && executionDoc.Schema == graph.SchemaV3 {
+	if executionDoc != nil && graph.UsesDeliveryTransaction(executionDoc.Schema) {
 		schema = outcome.SchemaV3
 	} else if task.FulfillmentContract != nil {
 		schema = outcome.SchemaV2
@@ -356,6 +360,9 @@ func (a *graphTaskOutcomeAuthority) buildOutcomeCandidate(intent store.TerminalO
 		if err := graph.ValidateNodeOutput(contract, summary, structuredResult); err != nil {
 			return outcome.TaskOutcome{}, true, err
 		}
+		if err := graph.ValidateNodeOutputEvidence(contract, a.projectRoot, structuredResult); err != nil {
+			return outcome.TaskOutcome{}, true, err
+		}
 	}
 	result, err := json.Marshal(structuredResult)
 	if err != nil {
@@ -403,7 +410,7 @@ func (a *graphTaskOutcomeAuthority) buildOutcomeCandidate(intent store.TerminalO
 		}
 	}
 	schema := outcome.SchemaV1
-	if executionDoc != nil && executionDoc.Schema == graph.SchemaV3 {
+	if executionDoc != nil && graph.UsesDeliveryTransaction(executionDoc.Schema) {
 		schema = outcome.SchemaV3
 	} else if task.FulfillmentContract != nil {
 		schema = outcome.SchemaV2
@@ -891,6 +898,9 @@ func replayPendingTaskOutcomes(sys *System) error {
 		return nil
 	}
 	authority := newGraphTaskOutcomeAuthority(sys.GraphStore, sys.TaskOutcomeStore, sys.LoopStore)
+	if sys.Config != nil {
+		authority.projectRoot = sys.Config.ProjectRoot
+	}
 	authority.candidates, authority.deliveries = sys.WorkspaceManager, sys.DeliveryStore
 	authority.checks = sys.CheckStore
 	feed := newGraphFeedReactor(sys.Store, sys.GraphRuntime, authority)

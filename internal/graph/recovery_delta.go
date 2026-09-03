@@ -105,6 +105,13 @@ func (rt *Runtime) BindRecoveryDeltaAuthority(graphID, nodeID, activationID stri
 	partial.SourceCheckpointRef, _ = authority["_checkpoint_ref"].(string)
 	partial.SourceObservationDeltaRef, _ = authority["_observation_delta_ref"].(string)
 	partial.FailureFingerprint, _ = authority["_failure_fingerprint"].(string)
+	if schema == RecoveryDeltaSchemaV5 {
+		state, stateErr := recoveryCandidateState(failure)
+		if stateErr != nil {
+			return RecoveryDelta{}, stateErr
+		}
+		partial.CandidateState = state
+	}
 	// 先对模型可写字段和 framework source 做完整机械校验，
 	// 再预留唯一 RecoveryStartPermit。否则一次参数 typo 会先
 	// 创建后取消确定 permit，第二次正确调用因“已结算幂等”
@@ -143,7 +150,7 @@ func decodeRecoveryDelta(result map[string]any) (RecoveryDelta, error) {
 	}
 	delta.Strategy = strings.TrimSpace(delta.Strategy)
 	delta.ExpectedMilestone = strings.TrimSpace(delta.ExpectedMilestone)
-	if (delta.Schema != RecoveryDeltaSchemaV1 && delta.Schema != RecoveryDeltaSchemaV2 && delta.Schema != RecoveryDeltaSchemaV3 && delta.Schema != RecoveryDeltaSchemaV4) ||
+	if (delta.Schema != RecoveryDeltaSchemaV1 && delta.Schema != RecoveryDeltaSchemaV2 && delta.Schema != RecoveryDeltaSchemaV3 && delta.Schema != RecoveryDeltaSchemaV4 && delta.Schema != RecoveryDeltaSchemaV5) ||
 		strings.TrimSpace(delta.SourceCheckpointRef) == "" ||
 		strings.TrimSpace(delta.FailureFingerprint) == "" || len(delta.ChangedDimensions) == 0 ||
 		strings.TrimSpace(delta.Strategy) == "" || strings.TrimSpace(delta.ExpectedMilestone) == "" {
@@ -152,10 +159,10 @@ func decodeRecoveryDelta(result map[string]any) (RecoveryDelta, error) {
 	switch delta.Schema {
 	case RecoveryDeltaSchemaV1:
 		delta.FirstRequiredAction = strings.TrimSpace(delta.FirstRequiredAction)
-		if strings.TrimSpace(delta.FirstRequiredAction) == "" || delta.FirstAction != nil || delta.EvidenceContract != nil {
+		if strings.TrimSpace(delta.FirstRequiredAction) == "" || delta.FirstAction != nil || delta.EvidenceContract != nil || delta.CandidateState != nil {
 			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v1 必须且只能携带 first_required_action")
 		}
-	case RecoveryDeltaSchemaV2, RecoveryDeltaSchemaV3, RecoveryDeltaSchemaV4:
+	case RecoveryDeltaSchemaV2, RecoveryDeltaSchemaV3, RecoveryDeltaSchemaV4, RecoveryDeltaSchemaV5:
 		if strings.TrimSpace(delta.FirstRequiredAction) != "" || delta.FirstAction == nil {
 			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v2+ 必须且只能携带 first_action")
 		}
@@ -177,36 +184,51 @@ func decodeRecoveryDelta(result map[string]any) (RecoveryDelta, error) {
 		// v3 是 code-change recovery 的机械 handoff：先在当前 Task 建立目标
 		// 文件读集，再由 L3 强制 mutation 与 typed check。它故意不接受直接
 		// edit，避免把前一 Activation 的 read authority 错当成新 Task 的读集。
-		if (delta.Schema == RecoveryDeltaSchemaV3 || delta.Schema == RecoveryDeltaSchemaV4) && delta.FirstAction.Tool != "read_file" {
+		if (delta.Schema == RecoveryDeltaSchemaV3 || delta.Schema == RecoveryDeltaSchemaV4 || delta.Schema == RecoveryDeltaSchemaV5) && delta.FirstAction.Tool != "read_file" {
 			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v3+ first_action 必须是带 path 的 read_file")
 		}
-		if delta.Schema != RecoveryDeltaSchemaV4 {
+		if delta.Schema != RecoveryDeltaSchemaV4 && delta.Schema != RecoveryDeltaSchemaV5 {
 			if delta.EvidenceContract != nil {
 				return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v2-v3 不接受 evidence_contract")
+			}
+			if delta.CandidateState != nil {
+				return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v2-v4 不接受 candidate_state")
 			}
 			break
 		}
 		if delta.EvidenceContract == nil || len(delta.EvidenceContract.Files) == 0 ||
 			len(delta.EvidenceContract.Files) > MaxRecoveryEvidenceFiles {
-			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v4 evidence_contract.files 必须有 1..%d 项", MaxRecoveryEvidenceFiles)
+			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v4+ evidence_contract.files 必须有 1..%d 项", MaxRecoveryEvidenceFiles)
 		}
 		seenFiles := make(map[string]struct{}, len(delta.EvidenceContract.Files))
 		for index, rawPath := range delta.EvidenceContract.Files {
 			path, pathErr := CanonicalRecoveryEvidencePath(rawPath)
 			if pathErr != nil {
-				return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v4 evidence_contract.files[%d]: %w", index, pathErr)
+				return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v4+ evidence_contract.files[%d]: %w", index, pathErr)
 			}
 			if _, duplicate := seenFiles[path]; duplicate {
-				return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v4 evidence_contract.files 重复 %q", path)
+				return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v4+ evidence_contract.files 重复 %q", path)
 			}
 			seenFiles[path] = struct{}{}
 			delta.EvidenceContract.Files[index] = path
 		}
 		firstPath, pathErr := CanonicalRecoveryEvidencePath(delta.FirstAction.Path)
 		if pathErr != nil || firstPath != delta.EvidenceContract.Files[0] {
-			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v4 first_action.path 必须等于 evidence_contract.files[0]")
+			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v4+ first_action.path 必须等于 evidence_contract.files[0]")
 		}
 		delta.FirstAction.Path = firstPath
+		if delta.Schema == RecoveryDeltaSchemaV4 {
+			if delta.CandidateState != nil {
+				return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v4 不接受 candidate_state")
+			}
+			break
+		}
+		if len(delta.EvidenceContract.Files) != 1 {
+			return RecoveryDelta{}, fmt.Errorf("graph: recovery_delta/v5 evidence_contract.files 必须恰有一个 focus file")
+		}
+		if err := validateRecoveryCandidateState(delta.CandidateState); err != nil {
+			return RecoveryDelta{}, err
+		}
 	}
 	seen := make(map[string]struct{}, len(delta.ChangedDimensions))
 	for index, dimension := range delta.ChangedDimensions {
@@ -245,7 +267,7 @@ func (rt *Runtime) validateRecoveryRetryContract(graphID string, doc *GraphDocum
 	if err := validateRecoveryRetryStartAt(doc, time.Now().UTC()); err != nil {
 		return err
 	}
-	if schema := node.Metadata[MetadataRecoveryDeltaSchema]; schema != RecoveryDeltaSchemaV1 && schema != RecoveryDeltaSchemaV2 && schema != RecoveryDeltaSchemaV3 && schema != RecoveryDeltaSchemaV4 {
+	if schema := node.Metadata[MetadataRecoveryDeltaSchema]; schema != RecoveryDeltaSchemaV1 && schema != RecoveryDeltaSchemaV2 && schema != RecoveryDeltaSchemaV3 && schema != RecoveryDeltaSchemaV4 && schema != RecoveryDeltaSchemaV5 {
 		return fmt.Errorf("graph: recovery_delta_schema=%q 不受支持", node.Metadata[MetadataRecoveryDeltaSchema])
 	}
 	delta, err := decodeRecoveryDelta(result)
@@ -288,6 +310,17 @@ func (rt *Runtime) validateRecoveryRetryContract(graphID string, doc *GraphDocum
 		delta.FailureFingerprint != expectedFingerprint {
 		return fmt.Errorf("graph: recovery_delta source checkpoint/observation/fingerprint 与 failure_context 不一致")
 	}
+	if delta.Schema == RecoveryDeltaSchemaV5 {
+		expectedState, stateErr := recoveryCandidateState(failure)
+		if stateErr != nil {
+			return stateErr
+		}
+		left, _ := json.Marshal(expectedState)
+		right, _ := json.Marshal(delta.CandidateState)
+		if !bytes.Equal(left, right) {
+			return fmt.Errorf("graph: recovery_delta/v5 candidate_state 与 failure_context authority 不一致")
+		}
+	}
 	if _, definitionChanged := stringSet(delta.ChangedDimensions)["definition"]; definitionChanged {
 		source, ok := doc.Nodes[failure.SourceNodeID]
 		// recovery Activation 自身的 DefinitionRevision 在创建时已冻结；它在本轮
@@ -299,6 +332,74 @@ func (rt *Runtime) validateRecoveryRetryContract(graphID string, doc *GraphDocum
 	}
 	if err := rt.rejectRepeatedRecoveryDelta(graphID, node, activationID, delta); err != nil {
 		return err
+	}
+	return nil
+}
+
+func recoveryCandidateState(failure InputBinding) (*RecoveryCandidateState, error) {
+	deliveryID := strings.TrimSpace(failure.DeliveryRef)
+	if !strings.HasPrefix(deliveryID, "delivery:") {
+		return nil, fmt.Errorf("graph: recovery_delta/v5 failure_context 缺少合法 DeliveryID")
+	}
+	paths := make(map[string]struct{})
+	var latestCheck *RecoveryCandidateCheck
+	for _, evidence := range failure.Evidence {
+		success := evidence.Success != nil && *evidence.Success
+		if success && (evidence.ToolName == "edit_file" || evidence.ToolName == "write_file") {
+			path, err := CanonicalRecoveryEvidencePath(evidence.Path)
+			if err != nil {
+				return nil, fmt.Errorf("graph: recovery_delta/v5 mutation evidence path: %w", err)
+			}
+			paths[path] = struct{}{}
+		}
+		if evidence.Kind == "check" && strings.TrimSpace(evidence.CheckRef) != "" {
+			latestCheck = &RecoveryCandidateCheck{
+				Ref: evidence.Ref, CheckRef: evidence.CheckRef, CheckID: evidence.CheckID,
+				Status: evidence.CheckStatus, WorkspaceRevisionRef: evidence.WorkspaceRevisionRef,
+			}
+		}
+	}
+	dirtyPaths := make([]string, 0, len(paths))
+	for path := range paths {
+		dirtyPaths = append(dirtyPaths, path)
+	}
+	sort.Strings(dirtyPaths)
+	state := &RecoveryCandidateState{
+		Schema: RecoveryCandidateStateSchemaV1, SourceActivationID: failure.SourceActivationID,
+		DeliveryID: deliveryID, DirtyPaths: dirtyPaths, LatestCheck: latestCheck,
+	}
+	if err := validateRecoveryCandidateState(state); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+func validateRecoveryCandidateState(state *RecoveryCandidateState) error {
+	if state == nil || state.Schema != RecoveryCandidateStateSchemaV1 ||
+		strings.TrimSpace(state.SourceActivationID) == "" || !strings.HasPrefix(state.DeliveryID, "delivery:") {
+		return fmt.Errorf("graph: recovery_delta/v5 candidate_state schema/source/delivery 无效")
+	}
+	seen := make(map[string]struct{}, len(state.DirtyPaths))
+	for index, raw := range state.DirtyPaths {
+		path, err := CanonicalRecoveryEvidencePath(raw)
+		if err != nil || path != raw {
+			return fmt.Errorf("graph: recovery_delta/v5 candidate_state.dirty_paths[%d] 非规范路径", index)
+		}
+		if _, duplicate := seen[path]; duplicate {
+			return fmt.Errorf("graph: recovery_delta/v5 candidate_state.dirty_paths 重复 %q", path)
+		}
+		seen[path] = struct{}{}
+	}
+	if !sort.StringsAreSorted(state.DirtyPaths) {
+		return fmt.Errorf("graph: recovery_delta/v5 candidate_state.dirty_paths 必须排序")
+	}
+	if check := state.LatestCheck; check != nil {
+		if strings.TrimSpace(check.Ref) == "" || strings.TrimSpace(check.CheckRef) == "" ||
+			strings.TrimSpace(check.CheckID) == "" ||
+			(check.Status != "pass" && check.Status != "failed") ||
+			strings.TrimSpace(check.WorkspaceRevisionRef) == "" {
+			return fmt.Errorf("graph: recovery_delta/v5 candidate_state.latest_check 不完整")
+		}
 	}
 	return nil
 }

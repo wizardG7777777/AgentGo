@@ -211,6 +211,83 @@ func TestObservationControlInvocationUsesFrozenNarrowOutputBudget(t *testing.T) 
 	}
 }
 
+func TestObservationV8OutputBudgetAllowsBoundedProviderFanout(t *testing.T) {
+	runtime := newAgentTestContextRuntime(t)
+	client := &contextRuntimeLLM{response: llm.Response{ToolCalls: []llm.ToolCall{
+		{ID: "obs-1", Name: "record_observation_delta", Arguments: map[string]any{}},
+		{ID: "obs-2", Name: "record_observation_delta", Arguments: map[string]any{}},
+	}, FinishReason: llm.FinishReasonToolCalls}}
+	registry := NewToolRegistry()
+	registry.Register("record_observation_delta", "冻结 Observation", map[string]any{"type": "object"},
+		func(context.Context, map[string]any) (string, error) {
+			return `{"observation_delta_ref":"observation:sha256:test"}`, nil
+		})
+	executor := NewSwappableLLMExecutor(client, registry, nil, nil, nil, "", "系统")
+	executor.SetContextRuntime(runtime)
+	catalog, _ := policycatalog.NewDefault()
+	progress, _ := catalog.ProgressContract(policycatalog.ProgressCodeChangeV8)
+	now := time.Now().UTC()
+	task := &model.Task{ID: "task-observation-v8-fanout", RunID: "run-observation-v8-fanout",
+		RunContract: &runcontract.RunContract{Schema: runcontract.SchemaV2, RunID: "run-observation-v8-fanout",
+			CreatedAt: now.Add(-time.Minute), DeadlineAt: now.Add(time.Hour), VerificationReserve: 10 * time.Minute,
+			RecoveryReserve: 10 * time.Minute, FinalizationReserve: 5 * time.Minute, BudgetProfile: "test/v2"},
+		RunPhase: runcontract.PhaseExecution, ContextPolicyRef: policycatalog.ContextDefaultV10,
+		ProgressContract: &progress.Contract, Description: "冻结观察", AttemptID: "task-observation-v8-fanout/attempt-1",
+		Lease: &model.ExecutionLease{TaskID: "task-observation-v8-fanout", Attempt: 1, FrozenAt: now,
+			ControlTools: []string{"record_observation_delta"}, Digest: "lease-observation"}}
+	ctx := WithExecutionIdentity(context.Background(), string(task.RunID), task.AttemptID, task.AttemptID+"/turn-1")
+	result, err := executor.Execute(ctx, task, nil, []HistoryEntry{{SystemNotice: observationCheckpointNotice("periodic", "冻结当前状态")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.binding.OutputBudget.MaxToolCalls != defaultToolCallsPerResponse ||
+		client.binding.ToolChoice.Mode != invocation.ToolChoiceAuto || client.binding.ReasoningEffort != "low" {
+		t.Fatalf("v8 fan-out wire/budget 漂移: %+v", client.binding)
+	}
+	if len(result.ToolResults) != 2 || !strings.Contains(result.ToolResults[1].Content, "已跳过") {
+		t.Fatalf("v8 fan-out 尾部未形成 skipped receipt: %+v", result.ToolResults)
+	}
+}
+
+func TestObservationV9RaisesControlCompletionBudgetWithoutChangingGate(t *testing.T) {
+	runtime := newAgentTestContextRuntime(t)
+	client := &contextRuntimeLLM{response: llm.Response{ToolCalls: []llm.ToolCall{{
+		ID: "obs-v9", Name: "record_observation_delta", Arguments: map[string]any{},
+	}}, FinishReason: llm.FinishReasonToolCalls}}
+	registry := NewToolRegistry()
+	registry.Register("record_observation_delta", "冻结 Observation", map[string]any{"type": "object"},
+		func(context.Context, map[string]any) (string, error) {
+			return `{"observation_delta_ref":"observation:sha256:v9"}`, nil
+		})
+	executor := NewSwappableLLMExecutor(client, registry, nil, nil, nil, "", "系统")
+	executor.SetContextRuntime(runtime)
+	catalog, _ := policycatalog.NewDefault()
+	progress, _ := catalog.ProgressContract(policycatalog.ProgressCodeChangeV9)
+	now := time.Now().UTC()
+	task := &model.Task{ID: "task-observation-v9", RunID: "run-observation-v9",
+		RunContract: &runcontract.RunContract{Schema: runcontract.SchemaV2, RunID: "run-observation-v9",
+			CreatedAt: now.Add(-time.Minute), DeadlineAt: now.Add(time.Hour), VerificationReserve: 10 * time.Minute,
+			RecoveryReserve: 10 * time.Minute, FinalizationReserve: 5 * time.Minute, BudgetProfile: "test/v2"},
+		RunPhase: runcontract.PhaseExecution, ContextPolicyRef: policycatalog.ContextDefaultV10,
+		ProgressContract: &progress.Contract, Description: "冻结观察", AttemptID: "task-observation-v9/attempt-1",
+		Lease: &model.ExecutionLease{Schema: model.ExecutionLeaseSchemaV2, TaskID: "task-observation-v9", Attempt: 1, FrozenAt: now,
+			Model: "business", ModelCapabilityDigest: "business-cap", ModelContextWindowTokens: 131072, ModelMaxCompletionTokens: 16384,
+			ObservationModel: "control", ObservationModelCapabilityDigest: "control-cap",
+			ObservationModelContextWindowTokens: 131072, ObservationModelMaxCompletionTokens: 16384,
+			ControlTools: []string{"record_observation_delta"}, Digest: "lease-observation-v9"}}
+	ctx := WithExecutionIdentity(context.Background(), string(task.RunID), task.AttemptID, task.AttemptID+"/turn-1")
+	if _, err := executor.Execute(ctx, task, nil, []HistoryEntry{{SystemNotice: observationCheckpointNotice("periodic", "冻结当前状态")}}); err != nil {
+		t.Fatal(err)
+	}
+	if client.binding.InvocationProfileRef != "agent:observation-checkpoint-v9" ||
+		client.binding.OutputBudget.MaxCompletionTokens != 4096 ||
+		client.binding.OutputBudget.MaxResponseBytes != 48<<10 ||
+		client.binding.OutputBudget.MaxToolCalls != defaultToolCallsPerResponse ||
+		client.binding.ToolChoice.Mode != invocation.ToolChoiceAuto || client.binding.ReasoningEffort != "low" {
+		t.Fatalf("v9 Observation wire/budget 漂移: %+v", client.binding)
+	}
+}
+
 func TestLLMExecutorRejectsPartiallyConfiguredContextRuntime(t *testing.T) {
 	client := &contextRuntimeLLM{}
 	executor := NewSwappableLLMExecutor(client, NewToolRegistry(), nil, nil, nil, "")

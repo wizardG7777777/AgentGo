@@ -33,18 +33,49 @@ const (
 	ProgressCodeChangeV4 = "progress:code-change/v4"
 	ProgressCodeChangeV5 = "progress:code-change/v5"
 	ProgressCodeChangeV6 = "progress:code-change/v6"
+	ProgressCodeChangeV7 = "progress:code-change/v7"
+	// ProgressCodeChangeV8 只升级 Observation Control Invocation wire：业务
+	// Progress policy 与 v7 相同，历史 v7 仍按 exact/none 恢复。
+	ProgressCodeChangeV8 = "progress:code-change/v8"
+	// ProgressCodeChangeV9 扩大 Observation Control Invocation 的冻结输出预算，
+	// 解决兼容 provider 在 2048 completion tokens 内反复截断的问题。业务
+	// Progress policy、Observation schema 与 v8 相同；历史 v8 不静默迁移。
+	ProgressCodeChangeV9 = "progress:code-change/v9"
+	// ProgressCodeChangeV10 面向 simple-task/v2 的 Explorer handoff：已有上游
+	// 调查时缩短首次 decision checkpoint，并在第一次无决策前进后交 v5 repair。
+	// Observation wire 与 v9 相同；历史 v9 不迁移。
+	ProgressCodeChangeV10 = "progress:code-change/v10"
+	// ProgressCodeChangeV11 缩短已有 Explorer handoff 后的首次 decision
+	// checkpoint；真实 mutation/check 仍按原强信号继续，历史 v10 不迁移。
+	ProgressCodeChangeV11 = "progress:code-change/v11"
+	// ProgressCodeChangeV12 对已有 Explorer handoff 只给一个 decision turn；
+	// Observation wire 与 v11 相同，历史 v11 不迁移。
+	ProgressCodeChangeV12 = "progress:code-change/v12"
 	// ProgressCodeChangeCurrent 是所有新 Task/Graph authoring 的唯一选择。
-	ProgressCodeChangeCurrent = ProgressCodeChangeV6
+	ProgressCodeChangeCurrent = ProgressCodeChangeV12
 
-	ProgressInvestigationV1      = "progress:investigation/v1"
-	ProgressInvestigationV2      = "progress:investigation/v2"
+	ProgressInvestigationV1 = "progress:investigation/v1"
+	ProgressInvestigationV2 = "progress:investigation/v2"
+	ProgressInvestigationV3 = "progress:investigation/v3"
+	// ProgressInvestigationV4 为 simple-task/v4 的首失败与三段 boundary evidence 留出
+	// 额外有界读取；v3 六轮与旧 output contract 按历史定义恢复。
+	ProgressInvestigationV4 = "progress:investigation/v4"
+	// ProgressInvestigationV5 在不增加 Run 总时长的前提下，为 exact handoff
+	// 预留 execution 尾窗，并把完整调查 turn 上限收紧到 8。
+	ProgressInvestigationV5 = "progress:investigation/v5"
+	// ProgressInvestigationV6 把更多 execution window 留给 Worker/Repair；
+	// v5 八轮/四分钟语义按历史引用恢复。
+	ProgressInvestigationV6 = "progress:investigation/v6"
+	// ProgressInvestigationV7 保留 v6 六轮，只把 downstream reserve 提高到
+	// 十分钟，为失败 check 后的最小修正留出窗口。
+	ProgressInvestigationV7      = "progress:investigation/v7"
 	ProgressVerificationV1       = "progress:verification/v1"
 	ProgressVerificationV2       = "progress:verification/v2"
 	ProgressVerificationV3       = "progress:verification/v3"
 	ProgressCoordinationV1       = "progress:coordination/v1"
 	ProgressCoordinationV2       = "progress:coordination/v2"
 	ProgressFinalReportV1        = "progress:final-report/v1"
-	ProgressInvestigationCurrent = ProgressInvestigationV2
+	ProgressInvestigationCurrent = ProgressInvestigationV6
 	ProgressVerificationCurrent  = ProgressVerificationV3
 	ProgressCoordinationCurrent  = ProgressCoordinationV2
 )

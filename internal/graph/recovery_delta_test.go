@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -374,5 +375,52 @@ func TestRecoveryDeltaV4RequiresCanonicalEvidenceContract(t *testing.T) {
 	if _, err := decodeRecoveryDelta(map[string]any{"recovery_delta": base}); err == nil ||
 		!strings.Contains(err.Error(), "逃逸") {
 		t.Fatalf("v4 evidence path 必须限制在项目相对根: %v", err)
+	}
+}
+
+func TestRecoveryDeltaV5CandidateStateComesFromFailureAuthority(t *testing.T) {
+	success := true
+	failure := InputBinding{
+		SourceNodeID: "work", SourceActivationID: "work@1", DeliveryRef: "delivery:run-1",
+		Evidence: []EvidenceEntry{
+			{Ref: "ev:edit", Kind: "file_edit", ToolName: "edit_file", Success: &success, Path: "src/flask/ctx.py"},
+			{Ref: "ev:check", Kind: "check", ToolName: "run_check", Success: &success,
+				CheckRef: "check:targeted", CheckID: "targeted", CheckStatus: "pass",
+				WorkspaceRevisionRef: "workspace:sha256:candidate"},
+		},
+	}
+	state, err := recoveryCandidateState(failure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Schema != RecoveryCandidateStateSchemaV1 || state.SourceActivationID != "work@1" ||
+		state.DeliveryID != "delivery:run-1" || len(state.DirtyPaths) != 1 ||
+		state.DirtyPaths[0] != "src/flask/ctx.py" || state.LatestCheck == nil ||
+		state.LatestCheck.CheckRef != "check:targeted" {
+		t.Fatalf("v5 candidate state 未精确投影 failure authority: %+v", state)
+	}
+	result := map[string]any{"recovery_delta": map[string]any{
+		"schema": RecoveryDeltaSchemaV5, "source_checkpoint_ref": "checkpoint",
+		"failure_fingerprint": "failure", "changed_dimensions": []any{"strategy"},
+		"strategy": "复用已有候选", "expected_milestone": "检查候选后提交",
+		"first_action":      map[string]any{"tool": "read_file", "path": "src/flask/ctx.py"},
+		"evidence_contract": map[string]any{"files": []any{"src/flask/ctx.py"}},
+		"candidate_state":   state,
+	}}
+	delta, err := decodeRecoveryDelta(result)
+	if err != nil || delta.CandidateState == nil || delta.CandidateState.DeliveryID != failure.DeliveryRef {
+		t.Fatalf("合法 v5 candidate state 被拒绝: delta=%+v err=%v", delta, err)
+	}
+	forged := *state
+	forged.DeliveryID = "delivery:forged"
+	result["recovery_delta"].(map[string]any)["candidate_state"] = &forged
+	forgedDelta, err := decodeRecoveryDelta(result)
+	if err != nil {
+		t.Fatalf("结构合法的伪造 state 应留给 Runtime authority 对账: %v", err)
+	}
+	left, _ := json.Marshal(state)
+	right, _ := json.Marshal(forgedDelta.CandidateState)
+	if bytes.Equal(left, right) {
+		t.Fatal("伪造 candidate state 未改变 wire，测试无效")
 	}
 }

@@ -434,5 +434,28 @@ func responsesFailedError(code, message string) error {
 		invocation.PhaseResponseValidate, invocation.OriginProvider, cause)
 	failure.ProviderCode = strings.TrimSpace(code)
 	failure.UsageState = invocation.UsageSettled
+	normalized := strings.ToLower(strings.TrimSpace(code))
+	if normalized == "invalidparameter" || normalized == "invalid_parameter" ||
+		normalized == "invalid_request_error" || normalized == "invalid_request" {
+		failure.Kind = invocation.FailureInvalidRequest
+		return &ErrUnrecoverable{Err: cause, Code: code, Message: message, Failure: failure}
+	}
+	if normalized == "model_not_found" || normalized == "model_unavailable" {
+		failure.Kind = invocation.FailureModelUnavailable
+		return &ErrUnrecoverable{Err: cause, Code: code, Message: message, Failure: failure}
+	}
+	if normalized == "invalid_api_key" || normalized == "authentication_error" || normalized == "unauthorized" {
+		failure.Kind = invocation.FailureAuth
+		return &ErrUnrecoverable{Err: cause, Code: code, Message: message, Failure: failure}
+	}
+	if normalized == "permission_denied" || normalized == "forbidden" {
+		failure.Kind = invocation.FailurePermissionDenied
+		return &ErrUnrecoverable{Err: cause, Code: code, Message: message, Failure: failure}
+	}
+	if normalized == "insufficient_quota" || normalized == "insufficient_balance" ||
+		normalized == "billing_hard_limit_reached" {
+		failure.Kind = invocation.FailureProviderQuotaExhausted
+		return &ErrUnrecoverable{Err: cause, Code: code, Message: message, Failure: failure}
+	}
 	return &ErrRecoverable{Err: cause, Code: code, Message: message, Failure: failure}
 }

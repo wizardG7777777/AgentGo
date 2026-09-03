@@ -33,16 +33,27 @@ func TestDefaultCatalogValidAndResolvesGraphPolicies(t *testing.T) {
 
 	wantProgressRefs := []string{
 		ProgressCodeChangeV1,
+		ProgressCodeChangeV10,
+		ProgressCodeChangeV11,
+		ProgressCodeChangeV12,
 		ProgressCodeChangeV2,
 		ProgressCodeChangeV3,
 		ProgressCodeChangeV4,
 		ProgressCodeChangeV5,
 		ProgressCodeChangeV6,
+		ProgressCodeChangeV7,
+		ProgressCodeChangeV8,
+		ProgressCodeChangeV9,
 		ProgressCoordinationV1,
 		ProgressCoordinationV2,
 		ProgressFinalReportV1,
 		ProgressInvestigationV1,
 		ProgressInvestigationV2,
+		ProgressInvestigationV3,
+		ProgressInvestigationV4,
+		ProgressInvestigationV5,
+		ProgressInvestigationV6,
+		ProgressInvestigationV7,
 		ProgressVerificationV1,
 		ProgressVerificationV2,
 		ProgressVerificationV3,
@@ -321,10 +332,94 @@ func TestCodeChangeV3CoversObservedThinkingTailWithoutMutatingOlderProfiles(t *t
 		t.Fatalf("v5 必须删除 business exploration 强制交卷并启用 8-turn checkpoint: %+v", v5)
 	}
 	v6, ok := catalog.ProgressContract(ProgressCodeChangeV6)
-	if !ok || ProgressCodeChangeCurrent != ProgressCodeChangeV6 ||
+	if !ok || ProgressInvestigationCurrent != ProgressInvestigationV6 ||
 		v6.Contract.Policy.KnowledgeCheckpointAfterTurns != 6 ||
 		v6.Contract.Policy.FirstDeliverableHandoffReserve != 5*time.Minute || v6.Digest == v5.Digest {
 		t.Fatalf("v6 必须收紧为 6-turn checkpoint、冻结 5 分钟首次交付 handoff 且保持独立 digest: %+v", v6)
+	}
+	v7, ok := catalog.ProgressContract(ProgressCodeChangeV7)
+	if !ok ||
+		v7.Contract.Policy.MaxControlContractFailures != 0 || v7.Digest == v6.Digest {
+		t.Fatalf("v7 必须让周期性 Observation 失败走 abandoned 恢复业务: %+v", v7)
+	}
+	v8, ok := catalog.ProgressContract(ProgressCodeChangeV8)
+	if !ok || v8.Digest == v7.Digest ||
+		v8.Contract.Policy.PolicyRef != "bounded_code_change/v8" {
+		t.Fatalf("v8 Observation wire 版本语义漂移: %+v", v8)
+	}
+	v9, ok := catalog.ProgressContract(ProgressCodeChangeV9)
+	if !ok || v9.Digest == v8.Digest ||
+		v9.Contract.Policy.PolicyRef != "bounded_code_change/v9" {
+		t.Fatalf("v9 Observation 预算版本语义漂移: %+v", v9)
+	}
+	v10, ok := catalog.ProgressContract(ProgressCodeChangeV10)
+	if !ok || v10.Digest == v9.Digest ||
+		v10.Contract.Policy.DecisionCheckpointAfterTurns != 4 ||
+		v10.Contract.Policy.MaxDecisionStagnation != 1 || v10.Contract.Policy.MaxExplorationTurns != 6 {
+		t.Fatalf("v10 必须作为 Explorer handoff 后的 current 收敛策略: %+v", v10)
+	}
+	foundStructuredDecision := false
+	for _, signal := range v10.Contract.AcceptedSignals {
+		if signal.Kind == loopcontract.SignalResultFieldSet && signal.IdentityScope == "**" {
+			foundStructuredDecision = true
+		}
+	}
+	if !foundStructuredDecision {
+		t.Fatalf("v10 必须接受 typed change decision 的动态 result field identity: %+v", v10.Contract.AcceptedSignals)
+	}
+	v11, ok := catalog.ProgressContract(ProgressCodeChangeV11)
+	if !ok || v11.Digest == v10.Digest ||
+		v11.Contract.Policy.DecisionCheckpointAfterTurns != 2 ||
+		v11.Contract.Policy.MaxDecisionStagnation != 1 ||
+		v11.Contract.Policy.CandidateRepairHandoffReserve != 3*time.Minute {
+		t.Fatalf("v11 必须缩短 Explorer handoff 后的首次 decision checkpoint: %+v", v11)
+	}
+	v12, ok := catalog.ProgressContract(ProgressCodeChangeV12)
+	if !ok || ProgressCodeChangeCurrent != ProgressCodeChangeV12 || v12.Digest == v11.Digest ||
+		v12.Contract.Policy.DecisionCheckpointAfterTurns != 1 ||
+		v12.Contract.Policy.MaxDecisionStagnation != 1 ||
+		v12.Contract.Policy.CandidateRepairHandoffReserve != 3*time.Minute {
+		t.Fatalf("v12 必须冻结单 decision turn 并作为 current: %+v", v12)
+	}
+	investigationV3, ok := catalog.ProgressContract(ProgressInvestigationV3)
+	if !ok ||
+		investigationV3.Contract.Policy.MaxExplorationTurns != 6 ||
+		investigationV3.Contract.Policy.KnowledgeCheckpointAfterTurns != 0 {
+		t.Fatalf("investigation v3 必须保留六轮历史语义: %+v", investigationV3)
+	}
+	for _, signal := range investigationV3.Contract.AcceptedSignals {
+		if (signal.Kind == loopcontract.SignalNovelEvidence || signal.Kind == loopcontract.SignalConfirmedFactAdded ||
+			signal.Kind == loopcontract.SignalObservationStateAdvanced) && signal.Deliverable {
+			t.Fatalf("investigation v3 knowledge signal 不得伪装成 deliverable: %+v", signal)
+		}
+	}
+	investigationV4, ok := catalog.ProgressContract(ProgressInvestigationV4)
+	if !ok ||
+		investigationV4.Digest == investigationV3.Digest ||
+		investigationV4.Contract.Policy.MaxExplorationTurns != 10 ||
+		investigationV4.Contract.Policy.KnowledgeCheckpointAfterTurns != 0 {
+		t.Fatalf("investigation v4 必须保留 boundary evidence 十轮历史语义: %+v", investigationV4)
+	}
+	investigationV5, ok := catalog.ProgressContract(ProgressInvestigationV5)
+	if !ok ||
+		investigationV5.Digest == investigationV4.Digest ||
+		investigationV5.Contract.Policy.MaxExplorationTurns != 8 ||
+		investigationV5.Contract.Policy.FirstDeliverableHandoffReserve != 4*time.Minute {
+		t.Fatalf("investigation v5 必须冻结八轮与四分钟 exact handoff reserve: %+v", investigationV5)
+	}
+	investigationV6, ok := catalog.ProgressContract(ProgressInvestigationV6)
+	if !ok ||
+		investigationV6.Digest == investigationV5.Digest ||
+		investigationV6.Contract.Policy.MaxExplorationTurns != 6 ||
+		investigationV6.Contract.Policy.FirstDeliverableHandoffReserve != 8*time.Minute {
+		t.Fatalf("investigation v6 必须冻结六轮与八分钟下游 reserve: %+v", investigationV6)
+	}
+	investigationV7, ok := catalog.ProgressContract(ProgressInvestigationV7)
+	if !ok ||
+		investigationV7.Digest == investigationV6.Digest ||
+		investigationV7.Contract.Policy.MaxExplorationTurns != 6 ||
+		investigationV7.Contract.Policy.FirstDeliverableHandoffReserve != 10*time.Minute {
+		t.Fatalf("investigation v7 必须冻结六轮与十分钟下游 reserve，但真实长调用关闭前不得切 current: %+v", investigationV7)
 	}
 }
 
