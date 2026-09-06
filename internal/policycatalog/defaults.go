@@ -20,7 +20,7 @@ func defaultReplayProfiles() ([]ReplayProfile, error) {
 			"reasoning":         contextcontract.ReplayOptional,
 		}
 		if responsesItems {
-			fields[llm.ResponsesOutputItemsExtraField()] = contextcontract.ReplayRequiredExact
+			fields[llm.ReplayItemsBudgetKey] = contextcontract.ReplayRequiredExact
 		}
 		return contextcontract.ProviderReplayPolicy{
 			Schema: contextcontract.ProviderReplaySchemaV1, PolicyID: ref, Version: version,
@@ -42,12 +42,8 @@ func defaultReplayProfiles() ([]ReplayProfile, error) {
 			}},
 		}
 	}
-	policies := []contextcontract.ProviderReplayPolicy{
-		makePolicy(ReplayOpenAICompatibleV1, 1, false),
-		makePolicy(ReplayOpenAICompatibleV2, 2, false),
-		makePolicy(ReplayOpenAICompatibleV3, 3, true),
-		makePolicy(ReplayOpenAICompatibleV4, 4, true),
-	}
+	policies := []contextcontract.ProviderReplayPolicy{makePolicy(ReplayOpenAICompatibleCurrent, 5, true)}
+
 	profiles := make([]ReplayProfile, 0, len(policies))
 	for _, policy := range policies {
 		digest, err := policy.ComputeDigest()
@@ -72,92 +68,8 @@ type contextPolicySpec struct {
 }
 
 func defaultContextProfiles() ([]ContextProfile, error) {
-	specs := []contextPolicySpec{
-		{
-			ref: ContextDefaultV1, replayRef: ReplayOpenAICompatibleV1, version: 1,
-			promptComponentBytes: 48 << 10, promptComponentTokens: 12 << 10,
-			systemSectionBytes: 64 << 10, systemSectionTokens: 16 << 10,
-		},
-		{
-			ref: ContextDefaultV2, replayRef: ReplayOpenAICompatibleV1, version: 2,
-			// v2 根据生产 Scheduler 的冻结 agent_role（约 51 KiB）校准：
-			// 单 prompt component 允许 64 KiB；system section 与既有
-			// AtomicSystemInstructionSet 同为 96 KiB，使 agent_role 与独立
-			// output contract 可以同时合法存在。其它边界保持 v1 不变。
-			promptComponentBytes: 64 << 10, promptComponentTokens: 16 << 10,
-			systemSectionBytes: 96 << 10, systemSectionTokens: 24 << 10,
-		},
-		{
-			ref: ContextDefaultV3, replayRef: ReplayOpenAICompatibleV2, version: 3,
-			// v3 保持 v2 的静态 Prompt 数值，语义变化只来自 Replay v2：
-			// Optional reasoning 可从下一轮投影中确定性丢弃，RequiredExact
-			// 字段仍必须在 Response commit 前证明可表示。
-			promptComponentBytes: 64 << 10, promptComponentTokens: 16 << 10,
-			systemSectionBytes: 96 << 10, systemSectionTokens: 24 << 10,
-		},
-		{
-			ref: ContextDefaultV4, replayRef: ReplayOpenAICompatibleV2, version: 4,
-			// v4 保持 v3 所有 cap/replay/window 数值，只修正 tokenizer fallback：
-			// ASCII/code 使用 bytes/3，非 ASCII rune 至少按 1 token 计。v3 的
-			// max(bytes/3, all-runes) 事故语义冻结给历史 Run。
-			promptComponentBytes: 64 << 10, promptComponentTokens: 16 << 10,
-			systemSectionBytes: 96 << 10, systemSectionTokens: 24 << 10,
-		},
-		{
-			ref: ContextDefaultV5, replayRef: ReplayOpenAICompatibleV2, version: 5,
-			// v5 使用真实 provider 回归校准 RequiredExact reasoning：一个合法
-			// tool-call response 的 reasoning_content 可超过 v1-v4 的 32KiB，
-			// 但仍处于 16K completion reserve。64KiB/16K 为 content/tool 留出
-			// 另一半 response bytes，不改变 Optional/RequiredExact 语义。
-			promptComponentBytes: 64 << 10, promptComponentTokens: 16 << 10,
-			systemSectionBytes: 96 << 10, systemSectionTokens: 24 << 10,
-			reasoningBytes: 64 << 10, reasoningTokens: 16 << 10,
-		},
-		{
-			ref: ContextDefaultV6, replayRef: ReplayOpenAICompatibleV2, version: 6,
-			// v6 由真实 Worker 回归校准：16K completion reserve 会在模型已经
-			// 找到目标源码后截断 optional reasoning，造成 Attempt rollover。
-			// 在 128K model window 内把输入预算从 96K 调到 92K，换取 32K
-			// completion reserve；RequiredExact reasoning 同步扩到 128KiB/32K。
-			promptComponentBytes: 64 << 10, promptComponentTokens: 16 << 10,
-			systemSectionBytes: 96 << 10, systemSectionTokens: 24 << 10,
-			reasoningBytes: 128 << 10, reasoningTokens: 32 << 10,
-		},
-		{
-			ref: ContextDefaultV7, replayRef: ReplayOpenAICompatibleV2, version: 7,
-			// v7 保持 v6 的 128K 总窗口、92K input 与 32K completion 分配；
-			// 只修正 optional reasoning 的字节容器。真实响应 131078 bytes 仅比
-			// 128KiB 多 6 bytes，不应丢弃同一响应中的 typed verdict。
-			promptComponentBytes: 64 << 10, promptComponentTokens: 16 << 10,
-			systemSectionBytes: 96 << 10, systemSectionTokens: 24 << 10,
-			reasoningBytes: 192 << 10, reasoningTokens: 32 << 10,
-		},
-		{
-			ref: ContextDefaultV8, replayRef: ReplayOpenAICompatibleV3, version: 8,
-			// v8 只新增 Responses typed output-item RequiredExact carrier；v7 的
-			// window/fragment 数值和历史 digest 原样保留。
-			promptComponentBytes: 64 << 10, promptComponentTokens: 16 << 10,
-			systemSectionBytes: 96 << 10, systemSectionTokens: 24 << 10,
-			reasoningBytes: 192 << 10, reasoningTokens: 32 << 10,
-		},
-		{
-			ref: ContextDefaultV9, replayRef: ReplayOpenAICompatibleV3, version: 9,
-			// v9 的实际容量由冻结 ModelCapability 覆盖；这里保存默认 1M/64K
-			// 档案，使静态 Prompt preflight 与无 Lease 工具也使用同一默认值。
-			promptComponentBytes: 4 << 20, promptComponentTokens: 966_656,
-			systemSectionBytes: 4 << 20, systemSectionTokens: 966_656,
-			reasoningBytes: 512 << 10, reasoningTokens: 65_536,
-		},
-		{
-			ref: ContextDefaultV10, replayRef: ReplayOpenAICompatibleV4, version: 10,
-			// v10 恢复普通 Fragment 的稳定类型上限。模型能力只调整一次
-			// Snapshot 的绝对输入预算、completion reserve 与 RequiredExact
-			// provider replay 容器，不能再把一次普通 read/prompt 放大到完整窗口。
-			promptComponentBytes: 64 << 10, promptComponentTokens: 16 << 10,
-			systemSectionBytes: 96 << 10, systemSectionTokens: 24 << 10,
-			reasoningBytes: 512 << 10, reasoningTokens: 65_536,
-		},
-	}
+	specs := []contextPolicySpec{{ref: ContextDefaultCurrent, replayRef: ReplayOpenAICompatibleCurrent, version: 11, promptComponentBytes: 64 << 10, promptComponentTokens: 16 << 10, systemSectionBytes: 96 << 10, systemSectionTokens: 24 << 10, reasoningBytes: 512 << 10, reasoningTokens: 65536}}
+
 	profiles := make([]ContextProfile, 0, len(specs))
 	for _, spec := range specs {
 		profile, err := defaultContextProfile(spec)
@@ -174,7 +86,7 @@ func defaultContextProfile(spec contextPolicySpec) (ContextProfile, error) {
 	completionReserve := contextcontract.Budget{SerializedBytes: 128 << 10, EstimatedTokens: 16 << 10}
 	absoluteWireByteLimit := int64(512 << 10)
 	atomicGroupRules := defaultAtomicGroupRules()
-	if spec.version >= 6 {
+	{
 		snapshotBudget = contextcontract.Budget{SerializedBytes: 368 << 10, EstimatedTokens: 92 << 10}
 		completionReserve = contextcontract.Budget{SerializedBytes: 256 << 10, EstimatedTokens: 32 << 10}
 		absoluteWireByteLimit = 640 << 10
@@ -183,7 +95,7 @@ func defaultContextProfile(spec contextPolicySpec) (ContextProfile, error) {
 		providerReplay.MaxEstimatedTokens = 48 << 10
 		atomicGroupRules[contextcontract.AtomicAssistantProviderReplay] = providerReplay
 	}
-	if spec.version >= 8 {
+	{
 		providerReplay := atomicGroupRules[contextcontract.AtomicAssistantProviderReplay]
 		providerReplay.MaxSerializedBytes = 256 << 10
 		providerReplay.MaxEstimatedTokens = 64 << 10
@@ -191,7 +103,7 @@ func defaultContextProfile(spec contextPolicySpec) (ContextProfile, error) {
 	}
 	fragmentRules := defaultFragmentRules(spec.promptComponentBytes, spec.promptComponentTokens,
 		spec.reasoningBytes, spec.reasoningTokens)
-	if spec.version >= 8 {
+	{
 		fragmentRules[contextcontract.FragmentAssistantResponseItems] = contextcontract.FragmentBudgetRule{
 			MaxSerializedBytes: 256 << 10, MaxEstimatedTokens: 64 << 10,
 			AllowedDispositions: []contextcontract.Disposition{
@@ -213,11 +125,11 @@ func defaultContextProfile(spec contextPolicySpec) (ContextProfile, error) {
 		CompletionReserve:     completionReserve,
 		AbsoluteWireByteLimit: absoluteWireByteLimit,
 	}
-	if spec.version >= 3 {
+	{
 		policy.ModelContextWindow = &contextcontract.Budget{SerializedBytes: 640 << 10, EstimatedTokens: 128 << 10}
 		policy.ProtocolOverheadReserve = &contextcontract.Budget{SerializedBytes: 16 << 10, EstimatedTokens: 4 << 10}
 	}
-	if spec.version >= 9 {
+	{
 		policy = adaptiveContextPolicy(policy, 1_048_576, 65_536)
 	}
 	digest, err := policy.ComputeDigest()
@@ -233,7 +145,7 @@ func defaultContextProfile(spec contextPolicySpec) (ContextProfile, error) {
 // AdaptContextPolicyForModel 把 v9+ 的规则按冻结模型能力展开。旧 policy 的数值
 // 属于历史 digest，必须原样返回。
 func AdaptContextPolicyForModel(policy contextcontract.ContextBudgetPolicy, windowTokens, completionTokens int64) contextcontract.ContextBudgetPolicy {
-	if policy.Version < 9 || windowTokens <= 0 || completionTokens <= 0 || windowTokens <= completionTokens+(16<<10) {
+	if windowTokens <= 0 || completionTokens <= 0 || windowTokens <= completionTokens+(16<<10) {
 		return policy
 	}
 	return adaptiveContextPolicy(policy, windowTokens, completionTokens)
@@ -251,7 +163,7 @@ func adaptiveContextPolicy(policy contextcontract.ContextBudgetPolicy, windowTok
 	policy.ModelContextWindow = &contextcontract.Budget{SerializedBytes: windowBytes, EstimatedTokens: windowTokens}
 	policy.ProtocolOverheadReserve = &contextcontract.Budget{SerializedBytes: overheadBytes, EstimatedTokens: overheadTokens}
 	policy.AbsoluteWireByteLimit = windowBytes
-	if policy.Version >= 10 {
+	{
 		// v10 只扩展 RequiredExact provider 状态的可表示容器。普通 Fragment、
 		// tool exchange 与 section cap 保持 catalog 中的稳定类型上限。
 		for _, kind := range []contextcontract.FragmentKind{
@@ -271,20 +183,6 @@ func adaptiveContextPolicy(policy contextcontract.ContextBudgetPolicy, windowTok
 		}
 		return policy
 	}
-	for kind, rule := range policy.FragmentRules {
-		rule.MaxSerializedBytes = inputBytes
-		rule.MaxEstimatedTokens = inputTokens
-		policy.FragmentRules[kind] = rule
-	}
-	for kind, rule := range policy.AtomicGroupRules {
-		rule.MaxSerializedBytes = inputBytes
-		rule.MaxEstimatedTokens = inputTokens
-		policy.AtomicGroupRules[kind] = rule
-	}
-	for section := range policy.SectionBudgets {
-		policy.SectionBudgets[section] = contextcontract.Budget{SerializedBytes: inputBytes, EstimatedTokens: inputTokens}
-	}
-	return policy
 }
 
 func defaultFragmentRules(promptComponentBytes, promptComponentTokens, reasoningBytes, reasoningTokens int64) map[contextcontract.FragmentKind]contextcontract.FragmentBudgetRule {
@@ -304,6 +202,7 @@ func defaultFragmentRules(promptComponentBytes, promptComponentTokens, reasoning
 		}
 	}
 	return map[contextcontract.FragmentKind]contextcontract.FragmentBudgetRule{
+		contextcontract.FragmentUserMedia: rule(1, 1, contextcontract.RetentionEphemeralRequest, "", contextcontract.DispositionInline, contextcontract.DispositionRejected),
 		contextcontract.FragmentPromptComponent: rule(promptComponentBytes, promptComponentTokens,
 			contextcontract.RetentionTaskLifetime, "",
 			contextcontract.DispositionInline, contextcontract.DispositionRejected),
@@ -399,6 +298,7 @@ func defaultAtomicGroupRules() map[contextcontract.AtomicGroupKind]contextcontra
 
 func defaultSectionBudgets(systemBytes, systemTokens int64) map[contextcontract.ContextSection]contextcontract.Budget {
 	return map[contextcontract.ContextSection]contextcontract.Budget{
+		contextcontract.SectionInputMedia:          {SerializedBytes: 1, EstimatedTokens: 1},
 		contextcontract.SectionSystem:              {SerializedBytes: systemBytes, EstimatedTokens: systemTokens},
 		contextcontract.SectionTaskContract:        {SerializedBytes: 64 << 10, EstimatedTokens: 16 << 10},
 		contextcontract.SectionUpstreamInputs:      {SerializedBytes: 96 << 10, EstimatedTokens: 24 << 10},

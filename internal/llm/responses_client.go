@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"strings"
 
-	"agentgo/internal/invocation"
-
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
@@ -18,39 +16,32 @@ import (
 // responses 执行 OpenAI Responses typed-item 主链。工具身份只由
 // response.output_item.done.item.type=function_call 产生；正文中的任何标记
 // 都只保留为 message，不参与工具识别。
-func (c *SDKClient) responses(ctx context.Context, messages []Message, tools []ToolDef) (Response, error) {
+func (c *protocolCall) responses(ctx context.Context, messages []Message, tools []ToolDef) (responseData, error) {
 	params, err := c.responsesParams(ctx, messages, tools)
 	if err != nil {
-		return Response{}, err
+		return responseData{}, err
 	}
-	if c.request.Stream {
-		return c.responsesStreaming(ctx, params)
-	}
-	result, err := c.client.Responses.New(ctx, params)
-	if err != nil {
-		return Response{}, classifySDKError(ctx, err)
-	}
-	return responsesResult(result, outputBudgetFromContext(ctx, c.request.OutputBudget))
+	return c.responsesStreaming(ctx, params)
 }
 
-func (c *SDKClient) responsesParams(ctx context.Context, messages []Message, tools []ToolDef) (responses.ResponseNewParams, error) {
-	model := c.model
-	if override := modelOverrideFromContext(ctx); override != "" {
-		model = override
-	}
-	budget := outputBudgetFromContext(ctx, c.request.OutputBudget)
+func (c *protocolCall) responsesParams(ctx context.Context, messages []Message, tools []ToolDef) (responses.ResponseNewParams, error) {
+	return responsesParams(c.request, messages, tools)
+}
+func responsesParams(options Options, messages []Message, tools []ToolDef) (responses.ResponseNewParams, error) {
+	model := options.Model
+	budget := options.OutputBudget
 	params := responses.ResponseNewParams{
 		Model:             shared.ResponsesModel(model),
 		MaxOutputTokens:   openai.Int(budget.MaxCompletionTokens),
-		ParallelToolCalls: openai.Bool(false),
+		ParallelToolCalls: openai.Bool(options.ParallelToolCalls),
 		Store:             openai.Bool(false),
 		Include:           []responses.ResponseIncludable{responses.ResponseIncludableReasoningEncryptedContent},
 		Truncation:        responses.ResponseNewParamsTruncationDisabled,
 	}
-	if reasoningEffort := effectiveReasoningEffort(ctx, c.request.ReasoningEffort); reasoningEffort != "" {
+	if reasoningEffort := options.ReasoningEffort; reasoningEffort != "" {
 		params.Reasoning = shared.ReasoningParam{Effort: shared.ReasoningEffort(reasoningEffort)}
 	}
-	input, err := convertResponsesMessages(c.systemPrompt, messages)
+	input, err := convertResponsesMessages(messages)
 	if err != nil {
 		return responses.ResponseNewParams{}, err
 	}
@@ -63,7 +54,7 @@ func (c *SDKClient) responsesParams(ctx context.Context, messages []Message, too
 			Strict: openai.Bool(tool.Strict),
 		}})
 	}
-	choice, err := responseToolChoice(ctx, c.request.ToolChoice, tools)
+	choice, err := responseToolChoice(options.ToolChoice, tools)
 	if err != nil {
 		return responses.ResponseNewParams{}, err
 	}
@@ -71,21 +62,20 @@ func (c *SDKClient) responsesParams(ctx context.Context, messages []Message, too
 	return params, nil
 }
 
-func responseToolChoice(ctx context.Context, configured invocation.ToolChoice, tools []ToolDef) (responses.ResponseNewParamsToolChoiceUnion, error) {
-	choice := effectiveToolChoice(ctx, configured)
+func responseToolChoice(choice ToolChoice, tools []ToolDef) (responses.ResponseNewParamsToolChoiceUnion, error) {
 	if err := choice.Validate(); err != nil {
 		return responses.ResponseNewParamsToolChoiceUnion{}, fmt.Errorf("tool_choice 无效: %w", err)
 	}
-	if choice.Mode == invocation.ToolChoiceAuto {
+	if choice.Mode == ToolChoiceAuto {
 		return responses.ResponseNewParamsToolChoiceUnion{OfToolChoiceMode: openai.Opt(responses.ToolChoiceOptionsAuto)}, nil
 	}
 	if len(tools) == 0 {
 		return responses.ResponseNewParamsToolChoiceUnion{}, fmt.Errorf("tool_choice=%s 但本次 ToolRouter 为空", choice.Mode)
 	}
 	switch choice.Mode {
-	case invocation.ToolChoiceRequired:
+	case ToolChoiceRequired:
 		return responses.ResponseNewParamsToolChoiceUnion{OfToolChoiceMode: openai.Opt(responses.ToolChoiceOptionsRequired)}, nil
-	case invocation.ToolChoiceFunction:
+	case ToolChoiceFunction:
 		if !hasToolDefinition(tools, choice.Name) {
 			return responses.ResponseNewParamsToolChoiceUnion{}, fmt.Errorf("forced tool_choice=%q 不在本次 ToolRouter 定义中", choice.Name)
 		}
@@ -95,7 +85,7 @@ func responseToolChoice(ctx context.Context, configured invocation.ToolChoice, t
 	}
 }
 
-func convertResponsesMessages(systemPrompt string, messages []Message) (responses.ResponseInputParam, error) {
+func convertResponsesMessages(messages []Message) (responses.ResponseInputParam, error) {
 	input := make(responses.ResponseInputParam, 0, len(messages)+1)
 	appendText := func(role, content string) {
 		input = append(input, responses.ResponseInputItemUnionParam{OfMessage: &responses.EasyInputMessageParam{
@@ -103,19 +93,21 @@ func convertResponsesMessages(systemPrompt string, messages []Message) (response
 			Content: responses.EasyInputMessageContentUnionParam{OfString: openai.String(content)},
 		}})
 	}
-	if systemPrompt != "" {
-		appendText("system", systemPrompt)
-	}
 	for _, message := range messages {
+		if len(message.Parts) > 0 {
+			item, err := responseParts(message)
+			if err != nil {
+				return nil, err
+			}
+			input = append(input, item)
+			continue
+		}
 		switch message.Role {
-		case "system", "user":
+		case "system", "developer", "user":
 			appendText(message.Role, message.Content)
 		case "assistant":
-			if raw, ok := message.ExtraFields[responsesOutputItemsExtraField]; ok {
-				var rawItems []json.RawMessage
-				if err := json.Unmarshal(raw, &rawItems); err != nil || len(rawItems) == 0 {
-					return nil, responsesProtocolError("L2 replay 的 Responses output items 无效", err)
-				}
+			if message.Replay != nil && len(message.Replay.Items) > 0 {
+				rawItems := message.Replay.Items
 				for index, rawItem := range rawItems {
 					item, err := exactResponsesReplayItem(rawItem, index)
 					if err != nil {
@@ -125,7 +117,7 @@ func convertResponsesMessages(systemPrompt string, messages []Message) (response
 				}
 				continue
 			}
-			if len(message.ExtraFields) > 0 {
+			if message.Replay != nil && len(message.Replay.Fields) > 0 {
 				return nil, responsesProtocolError("Responses 请求遇到未类型化的 assistant extra fields", nil)
 			}
 			if message.Content != "" {
@@ -196,25 +188,23 @@ func exactResponsesReplayItem(rawItem json.RawMessage, index int) (responses.Res
 	return param.Override[responses.ResponseInputItemUnionParam](exact), nil
 }
 
-func (c *SDKClient) responsesStreaming(ctx context.Context, params responses.ResponseNewParams) (Response, error) {
-	stream := c.client.Responses.NewStreaming(ctx, params)
+func (c *protocolCall) responsesStreaming(ctx context.Context, params responses.ResponseNewParams) (responseData, error) {
+	_, streamOption := streamWitness(c.request.OutputBudget)
+	stream := c.client.Responses.NewStreaming(ctx, params, streamOption)
 	defer stream.Close()
-	handler := streamHandlerFromContext(ctx)
-	emitFailure := func(err error) (Response, error) {
-		if handler != nil {
-			handler(StreamEvent{Done: true, Error: err.Error()})
-		}
-		return Response{}, err
-	}
+	emitFailure := func(err error) (responseData, error) { return responseData{}, err }
 
-	budget := newOutputBudgetCounter(outputBudgetFromContext(ctx, c.request.OutputBudget), invocation.PhaseStreamAccumulate)
-	var items []responses.ResponseOutputItemUnion
+	budget := newOutputBudgetCounter(c.request.OutputBudget, PhaseStreamAccumulate)
+	itemsByIndex := make(map[int64]responses.ResponseOutputItemUnion)
 	var completed *responses.Response
 	argumentDeltas := make(map[int64]string)
 	seenDone := make(map[int64]struct{})
 	var content, reasoning strings.Builder
 
 	for stream.Next() {
+		if ctx.Err() != nil {
+			return emitFailure(classifySDKError(ctx, ctx.Err()))
+		}
 		event := stream.Current()
 		observeStreamEvent(ctx, event.Type)
 		switch event.Type {
@@ -224,21 +214,18 @@ func (c *SDKClient) responsesStreaming(ctx context.Context, params responses.Res
 				return emitFailure(err)
 			}
 			content.WriteString(event.Delta)
-			if handler != nil {
-				handler(StreamEvent{ContentDelta: event.Delta, AccumulatedContent: content.String(), AccumulatedReasoning: reasoning.String()})
-			}
+			c.emit(event.OutputIndex, event.ItemID, "text_delta", event.Delta)
 		case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
 			observeStreamDelta(ctx, "reasoning", event.Delta != "")
 			if err := budget.addReasoning(event.Delta); err != nil {
 				return emitFailure(err)
 			}
 			reasoning.WriteString(event.Delta)
-			if handler != nil {
-				handler(StreamEvent{ReasoningDelta: event.Delta, AccumulatedContent: content.String(), AccumulatedReasoning: reasoning.String()})
-			}
+			c.emit(event.OutputIndex, event.ItemID, "reasoning_delta", event.Delta)
 		case "response.function_call_arguments.delta":
 			observeStreamDelta(ctx, "tool", event.Delta != "")
 			argumentDeltas[event.OutputIndex] += event.Delta
+			c.emit(event.OutputIndex, event.ItemID, "tool_arguments_delta", event.Delta)
 			if err := budget.addTool(event.OutputIndex, "", event.Delta); err != nil {
 				return emitFailure(err)
 			}
@@ -261,7 +248,7 @@ func (c *SDKClient) responsesStreaming(ctx context.Context, params responses.Res
 					return emitFailure(err)
 				}
 			}
-			items = append(items, item)
+			itemsByIndex[event.OutputIndex] = item
 		case "response.completed":
 			value := event.AsResponseCompleted().Response
 			completed = &value
@@ -294,53 +281,41 @@ func (c *SDKClient) responsesStreaming(ctx context.Context, params responses.Res
 	if completed.Status != responses.ResponseStatusCompleted {
 		return emitFailure(responsesProtocolError(fmt.Sprintf("Responses 终态 status=%q", completed.Status), nil))
 	}
+	items := make([]responses.ResponseOutputItemUnion, len(itemsByIndex))
+	for index := range items {
+		item, ok := itemsByIndex[int64(index)]
+		if !ok {
+			return emitFailure(responsesProtocolError("Responses 输出项序号不连续", nil))
+		}
+		items[index] = item
+	}
 	if len(items) == 0 {
 		return emitFailure(responsesProtocolError("Responses SSE 没有完成的 output item", nil))
 	}
-	result, err := responsesItemsResult(items, completed.Usage, outputBudgetFromContext(ctx, c.request.OutputBudget))
+	result, err := responsesItemsResult(items, completed.Usage, c.request.OutputBudget)
 	if err != nil {
 		return emitFailure(err)
 	}
-	if handler != nil {
-		handler(StreamEvent{AccumulatedContent: result.Content, AccumulatedReasoning: result.Reasoning, Done: true})
-	}
+	markStreamCompleted(ctx)
 	return result, nil
 }
 
-func responsesResult(response *responses.Response, budget invocation.OutputBudget) (Response, error) {
-	if response == nil {
-		return Response{}, responsesProtocolError("Responses 返回 nil response", nil)
-	}
-	switch response.Status {
-	case responses.ResponseStatusCompleted:
-		return responsesItemsResult(response.Output, response.Usage, budget)
-	case responses.ResponseStatusIncomplete:
-		return Response{}, responsesIncompleteError(response.IncompleteDetails.Reason)
-	case responses.ResponseStatusFailed:
-		return Response{}, responsesFailedError(string(response.Error.Code), response.Error.Message)
-	default:
-		return Response{}, responsesProtocolError(fmt.Sprintf("Responses 非终态 status=%q", response.Status), nil)
-	}
-}
-
-func responsesItemsResult(items []responses.ResponseOutputItemUnion, usage responses.ResponseUsage, outputBudget invocation.OutputBudget) (Response, error) {
+func responsesItemsResult(items []responses.ResponseOutputItemUnion, usage responses.ResponseUsage, outputBudget OutputBudget) (responseData, error) {
 	if len(items) == 0 {
-		return Response{}, responsesProtocolError("Responses 返回空 output items", nil)
+		return responseData{}, responsesProtocolError("Responses 返回空 output items", nil)
 	}
-	counter := newOutputBudgetCounter(outputBudget, invocation.PhaseResponseValidate)
-	result := Response{Items: make([]OutputItem, 0, len(items))}
-	rawItems := make([]json.RawMessage, 0, len(items))
+	counter := newOutputBudgetCounter(outputBudget, PhaseResponseValidate)
+	result := responseData{Items: make([]OutputItem, 0, len(items))}
 	for index, item := range items {
 		raw := strings.TrimSpace(item.RawJSON())
 		if raw == "" {
-			return Response{}, responsesProtocolError(fmt.Sprintf("output item[%d] 缺少原始 JSON", index), nil)
+			return responseData{}, responsesProtocolError(fmt.Sprintf("output item[%d] 缺少原始 JSON", index), nil)
 		}
-		rawItems = append(rawItems, json.RawMessage(raw))
 		switch item.Type {
 		case "message":
 			message := item.AsMessage()
 			if message.Status == responses.ResponseOutputMessageStatusIncomplete {
-				return Response{}, responsesProtocolError(fmt.Sprintf("message item[%d] incomplete", index), nil)
+				return responseData{}, responsesProtocolError(fmt.Sprintf("message item[%d] incomplete", index), nil)
 			}
 			var text strings.Builder
 			for _, part := range message.Content {
@@ -350,12 +325,12 @@ func responsesItemsResult(items []responses.ResponseOutputItemUnion, usage respo
 				case "refusal":
 					text.WriteString(part.Refusal)
 				default:
-					return Response{}, responsesProtocolError(fmt.Sprintf("message item[%d] 未知 content type=%q", index, part.Type), nil)
+					return responseData{}, responsesProtocolError(fmt.Sprintf("message item[%d] 未知 content type=%q", index, part.Type), nil)
 				}
 			}
 			value := text.String()
 			if err := counter.addContent(value); err != nil {
-				return Response{}, err
+				return responseData{}, err
 			}
 			result.Content += value
 			result.Items = append(result.Items, OutputItem{Kind: OutputItemMessage, ID: message.ID, Text: value, Raw: json.RawMessage(raw)})
@@ -370,37 +345,32 @@ func responsesItemsResult(items []responses.ResponseOutputItemUnion, usage respo
 			}
 			value := text.String()
 			if err := counter.addReasoning(value); err != nil {
-				return Response{}, err
+				return responseData{}, err
 			}
 			result.Reasoning += value
 			result.Items = append(result.Items, OutputItem{Kind: OutputItemReasoning, ID: reasoningItem.ID, Reasoning: value, Raw: json.RawMessage(raw)})
 		case "function_call":
 			callItem := item.AsFunctionCall()
 			if strings.TrimSpace(callItem.CallID) == "" || strings.TrimSpace(callItem.Name) == "" {
-				return Response{}, responsesProtocolError(fmt.Sprintf("function_call item[%d] 缺少 call_id/name", index), nil)
+				return responseData{}, responsesProtocolError(fmt.Sprintf("function_call item[%d] 缺少 call_id/name", index), nil)
 			}
 			if callItem.Status == responses.ResponseFunctionToolCallStatusIncomplete {
-				return Response{}, responsesProtocolError(fmt.Sprintf("function_call item[%d] incomplete", index), nil)
+				return responseData{}, responsesProtocolError(fmt.Sprintf("function_call item[%d] incomplete", index), nil)
 			}
 			if err := counter.addTool(int64(index), callItem.Name, callItem.Arguments); err != nil {
-				return Response{}, err
+				return responseData{}, err
 			}
 			arguments := make(map[string]any)
 			if err := json.Unmarshal([]byte(callItem.Arguments), &arguments); err != nil || arguments == nil {
-				return Response{}, responsesProtocolError(fmt.Sprintf("function_call %q arguments 不是 JSON object", callItem.Name), err)
+				return responseData{}, responsesProtocolError(fmt.Sprintf("function_call %q arguments 不是 JSON object", callItem.Name), err)
 			}
 			call := ToolCall{ID: callItem.CallID, Name: callItem.Name, Arguments: arguments}
 			result.ToolCalls = append(result.ToolCalls, call)
 			result.Items = append(result.Items, OutputItem{Kind: OutputItemFunctionCall, ID: callItem.ID, ToolCall: &call, Raw: json.RawMessage(raw)})
 		default:
-			return Response{}, responsesProtocolError(fmt.Sprintf("Responses output item[%d] type=%q 不在 AgentGo profile", index, item.Type), nil)
+			return responseData{}, responsesProtocolError(fmt.Sprintf("Responses output item[%d] type=%q 不在 AgentGo profile", index, item.Type), nil)
 		}
 	}
-	carrier, err := json.Marshal(rawItems)
-	if err != nil {
-		return Response{}, responsesProtocolError("序列化 Responses output item carrier 失败", err)
-	}
-	result.ExtraFields = map[string]json.RawMessage{responsesOutputItemsExtraField: carrier}
 	result.Usage.PromptTokens = int(usage.InputTokens)
 	result.Usage.CompletionTokens = int(usage.OutputTokens)
 	result.Usage.ReasoningTokens = int(usage.OutputTokensDetails.ReasoningTokens)
@@ -418,48 +388,48 @@ func responsesProtocolError(message string, cause error) error {
 	} else {
 		cause = fmt.Errorf("%s: %w", message, cause)
 	}
-	failure := invocation.NewFailure(invocation.FailureMalformedResponse,
-		invocation.PhaseResponseValidate, invocation.OriginProtocol, cause)
-	failure.UsageState = invocation.UsageSettled
+	failure := NewFailure(FailureMalformedResponse,
+		PhaseResponseValidate, OriginProtocol, cause)
+	failure.UsageState = UsageSettled
 	return &ErrBadResponse{Err: cause, Failure: failure}
 }
 
 func responsesIncompleteError(reason string) error {
 	cause := fmt.Errorf("Responses 返回 incomplete: reason=%s", strings.TrimSpace(reason))
-	failure := invocation.NewFailure(invocation.FailureOutputTruncated,
-		invocation.PhaseResponseValidate, invocation.OriginProvider, cause)
+	failure := NewFailure(FailureOutputTruncated,
+		PhaseResponseValidate, OriginProvider, cause)
 	failure.FinishReason = strings.TrimSpace(reason)
-	failure.UsageState = invocation.UsageSettled
+	failure.UsageState = UsageSettled
 	return &ErrBadResponse{Err: cause, Failure: failure}
 }
 
 func responsesFailedError(code, message string) error {
 	cause := fmt.Errorf("Responses provider failure: code=%s message=%s", strings.TrimSpace(code), strings.TrimSpace(message))
-	failure := invocation.NewFailure(invocation.FailureProviderUnavailable,
-		invocation.PhaseResponseValidate, invocation.OriginProvider, cause)
+	failure := NewFailure(FailureProviderUnavailable,
+		PhaseResponseValidate, OriginProvider, cause)
 	failure.ProviderCode = strings.TrimSpace(code)
-	failure.UsageState = invocation.UsageSettled
+	failure.UsageState = UsageSettled
 	normalized := strings.ToLower(strings.TrimSpace(code))
 	if normalized == "invalidparameter" || normalized == "invalid_parameter" ||
 		normalized == "invalid_request_error" || normalized == "invalid_request" {
-		failure.Kind = invocation.FailureInvalidRequest
+		failure.Kind = FailureInvalidRequest
 		return &ErrUnrecoverable{Err: cause, Code: code, Message: message, Failure: failure}
 	}
 	if normalized == "model_not_found" || normalized == "model_unavailable" {
-		failure.Kind = invocation.FailureModelUnavailable
+		failure.Kind = FailureModelUnavailable
 		return &ErrUnrecoverable{Err: cause, Code: code, Message: message, Failure: failure}
 	}
 	if normalized == "invalid_api_key" || normalized == "authentication_error" || normalized == "unauthorized" {
-		failure.Kind = invocation.FailureAuth
+		failure.Kind = FailureAuth
 		return &ErrUnrecoverable{Err: cause, Code: code, Message: message, Failure: failure}
 	}
 	if normalized == "permission_denied" || normalized == "forbidden" {
-		failure.Kind = invocation.FailurePermissionDenied
+		failure.Kind = FailurePermissionDenied
 		return &ErrUnrecoverable{Err: cause, Code: code, Message: message, Failure: failure}
 	}
 	if normalized == "insufficient_quota" || normalized == "insufficient_balance" ||
 		normalized == "billing_hard_limit_reached" {
-		failure.Kind = invocation.FailureProviderQuotaExhausted
+		failure.Kind = FailureProviderQuotaExhausted
 		return &ErrUnrecoverable{Err: cause, Code: code, Message: message, Failure: failure}
 	}
 	return &ErrRecoverable{Err: cause, Code: code, Message: message, Failure: failure}

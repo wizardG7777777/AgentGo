@@ -1,15 +1,12 @@
 package llm
 
 import (
-	"context"
 	"fmt"
-
-	"agentgo/internal/invocation"
 )
 
 // defaultOutputBudget 是 Model Invocation 的第一版绝对安全上限。它不是 L2
 // Context 的最终分类型 policy；零配置也不得退化为无界累积。
-var defaultOutputBudget = invocation.OutputBudget{
+var defaultOutputBudget = OutputBudget{
 	MaxContentBytes:            512 << 10,
 	MaxReasoningBytes:          512 << 10,
 	MaxExtraFieldBytes:         512 << 10,
@@ -21,9 +18,9 @@ var defaultOutputBudget = invocation.OutputBudget{
 	MaxCompletionTokens:        64 << 10,
 }
 
-func DefaultOutputBudget() invocation.OutputBudget { return defaultOutputBudget.Clone() }
+func DefaultOutputBudget() OutputBudget { return defaultOutputBudget.Clone() }
 
-func normalizeOutputBudget(in invocation.OutputBudget) invocation.OutputBudget {
+func normalizeOutputBudget(in OutputBudget) OutputBudget {
 	out := in.Clone()
 	if out.MaxContentBytes <= 0 {
 		out.MaxContentBytes = defaultOutputBudget.MaxContentBytes
@@ -55,18 +52,7 @@ func normalizeOutputBudget(in invocation.OutputBudget) invocation.OutputBudget {
 	return out
 }
 
-func outputBudgetFromContext(ctx context.Context, configured invocation.OutputBudget) invocation.OutputBudget {
-	out := normalizeOutputBudget(configured)
-	if binding, ok := invocation.ContextBindingFrom(ctx); ok {
-		out = minOutputBudget(out, binding.OutputBudget)
-	}
-	if action, ok := invocation.OutputBudgetFrom(ctx); ok {
-		out = minOutputBudget(out, action)
-	}
-	return out
-}
-
-func minOutputBudget(left, right invocation.OutputBudget) invocation.OutputBudget {
+func IntersectOutputBudget(left, right OutputBudget) OutputBudget {
 	if right.Validate() != nil {
 		return left
 	}
@@ -94,12 +80,18 @@ func minOutputBudget(left, right invocation.OutputBudget) invocation.OutputBudge
 			out.MaxExtraFieldBytesByName[key] = value
 		}
 	}
+	// 总字段预算收紧后，每个命名字段也必须收紧，不能遗留较大的 L2 原始限额。
+	for key, value := range out.MaxExtraFieldBytesByName {
+		if value > out.MaxExtraFieldBytes {
+			out.MaxExtraFieldBytesByName[key] = out.MaxExtraFieldBytes
+		}
+	}
 	return out
 }
 
 type outputBudgetCounter struct {
-	budget             invocation.OutputBudget
-	phase              invocation.Phase
+	budget             OutputBudget
+	phase              Phase
 	contentBytes       int64
 	reasoningBytes     int64
 	extraBytes         map[string]int64
@@ -110,7 +102,7 @@ type outputBudgetCounter struct {
 	totalBytes         int64
 }
 
-func newOutputBudgetCounter(budget invocation.OutputBudget, phase invocation.Phase) *outputBudgetCounter {
+func newOutputBudgetCounter(budget OutputBudget, phase Phase) *outputBudgetCounter {
 	return &outputBudgetCounter{
 		budget:        normalizeOutputBudget(budget),
 		phase:         phase,
@@ -195,16 +187,16 @@ func (c *outputBudgetCounter) checkTotal() error {
 	return nil
 }
 
-func outputLimitError(field string, actual, limit int64, phase invocation.Phase) error {
+func outputLimitError(field string, actual, limit int64, phase Phase) error {
 	err := fmt.Errorf("模型响应字段 %s 超过硬上限：actual_bytes=%d limit_bytes=%d",
 		field, actual, limit)
-	failure := invocation.NewFailure(invocation.FailureOutputLimitExceeded,
-		phase, invocation.OriginRuntime, err)
-	if phase == invocation.PhaseStreamAccumulate || phase == invocation.PhaseStreamReceive {
+	failure := NewFailure(FailureOutputLimitExceeded,
+		phase, OriginRuntime, err)
+	if phase == PhaseStreamAccumulate || phase == PhaseStreamReceive {
 		failure.Partial = true
-		failure.UsageState = invocation.UsagePartial
+		failure.UsageState = UsagePartial
 	} else {
-		failure.UsageState = invocation.UsageSettled
+		failure.UsageState = UsageSettled
 	}
 	return &ErrRecoverable{Err: err, Failure: failure}
 }

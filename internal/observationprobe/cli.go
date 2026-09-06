@@ -1,6 +1,10 @@
 package observationprobe
 
 import (
+	"agentgo/internal/contextruntime"
+	"agentgo/internal/contextstore"
+	"agentgo/internal/policycatalog"
+	"agentgo/internal/session"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,12 +12,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"agentgo/internal/config"
-	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 	"agentgo/internal/observationcontract"
 )
@@ -128,29 +132,35 @@ func run(cfg *config.Config, modelName, profile, fixture string, attempts int) r
 	}
 	parameters := observationcontract.Parameters(profileData)
 	tool := llm.ToolDef{Name: "record_observation_delta", Description: "提交探针 fixture", Parameters: parameters}
-	choice := invocation.ToolChoice{Mode: invocation.ToolChoiceFunction, Name: tool.Name}
+	choice := llm.ToolChoice{Mode: llm.ToolChoiceFunction, Name: tool.Name}
 	reasoning := "none"
 	if profile == "v8" || profile == "v9" || profile == "v10" || profile == "v11" || profile == "v12" {
-		choice = invocation.ToolChoice{Mode: invocation.ToolChoiceAuto}
+		choice = llm.ToolChoice{Mode: llm.ToolChoiceAuto}
 		reasoning = "low"
 	}
-	capability, _ := cfg.LLM.ResolveModelCapability(modelName)
-	client := llm.NewSDKClientWithConfig(cfg.LLM.BaseURL, cfg.LLM.APIKey, modelName, "", timeout(cfg.LLM.TimeoutSec),
-		llm.ClientConfig{Protocol: llm.Protocol(cfg.LLM.Protocol), ReasoningEffort: cfg.LLM.ReasoningEffort, Stream: false})
+	client := llm.NewTransport(llm.TransportConfig{BaseURL: cfg.LLM.BaseURL, APIKey: cfg.LLM.APIKey, Timeout: timeout(cfg.LLM.TimeoutSec)})
 	rep := report{Model: modelName, Profile: profile, Fixture: fixture, Attempts: attempts}
+	snapshots, err := contextstore.New(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "observation-probes-v2"))
+	if err != nil {
+		rep.Failures = append(rep.Failures, attemptFailure{Kind: "context_store_failure"})
+		return rep
+	}
+	defer snapshots.Close()
+	policies, err := policycatalog.NewDefault()
+	if err != nil {
+		rep.Failures = append(rep.Failures, attemptFailure{Kind: "context_policy_failure"})
+		return rep
+	}
+	runtime := contextruntime.Runtime{Assembler: contextruntime.NewAssembler(), Policies: policies, Snapshots: snapshots}
+	runtime.Output = contextruntime.NewOutputService(func(record contextruntime.OutputRecord) error {
+		return session.AppendModelOutputFile(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "observation-probes-v2", "model-outputs.jsonl"), record)
+	})
+	options := cfg.LLM.InvocationOptions(modelName)
+	options.ToolChoice = choice
+	options.ReasoningEffort = reasoning
+	options.OutputBudget = probeBudget(profile)
 	for index := 0; index < attempts; index++ {
-		digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s\x00%d", modelName, profile, fixture, index)))
-		binding := invocation.ContextBinding{
-			Schema: invocation.ContextBindingSchemaV1, InvocationID: "observation-probe-" + hex.EncodeToString(digest[:6]),
-			ContextSnapshotID: "probe-snapshot", ContextPolicyID: "probe-observation/" + profile,
-			ToolRouterSnapshotID: "probe-schema-" + schemaDigest(parameters), EncodedRequestDigest: "probe-request",
-			OutputBudget: probeBudget(profile), ToolChoice: choice, ReasoningEffort: reasoning,
-		}
-		if profile == "v8" || profile == "v9" || profile == "v10" || profile == "v11" || profile == "v12" {
-			binding = invocation.BindEffectiveProfile(binding, modelName, capability.Digest, "agent:observation-checkpoint-"+profile)
-		}
-		response, err := llm.Invoke(context.Background(), client, llm.InvocationRequest{Binding: binding,
-			Messages: []llm.Message{{Role: "user", Content: fixturePrompt(fixture)}}, Tools: []llm.ToolDef{tool}})
+		response, err := runtime.InvokeOperation(context.Background(), contextruntime.Instructions{ProfileID: "observation:" + profile, Objective: fixturePrompt(fixture)}, nil, []llm.ToolDef{tool}, options, client)
 		if err == nil {
 			err = validateResponse(response, fixture)
 		}
@@ -159,7 +169,7 @@ func run(cfg *config.Config, modelName, profile, fixture string, attempts int) r
 			continue
 		}
 		failure := attemptFailure{Kind: "unknown"}
-		if typed, ok := invocation.FromError(err); ok {
+		if typed, ok := llm.FromError(err); ok {
 			failure.Kind = string(typed.Kind)
 			failure.ProviderCode = typed.ProviderCode
 		}
@@ -176,11 +186,11 @@ func fixturePrompt(fixture string) string {
 	return `Call record_observation_delta exactly once with phase="investigate", one fact citing tool-call:probe-read, one resolved candidate candidate:sha256:probe citing tool-call:probe-check, next_candidates=[], and next_action={"decision":"continue"}. Do not answer with text.`
 }
 
-func validateResponse(response llm.Response, fixture string) error {
-	if len(response.ToolCalls) == 0 || response.ToolCalls[0].Name != "record_observation_delta" {
+func validateResponse(response llm.Result, fixture string) error {
+	if len(response.ToolCalls()) == 0 || response.ToolCalls()[0].Name != "record_observation_delta" {
 		return fmt.Errorf("缺少必需 Observation tool call")
 	}
-	args := response.ToolCalls[0].Arguments
+	args := response.ToolCalls()[0].Arguments
 	if args["phase"] != "investigate" {
 		return fmt.Errorf("phase 非法")
 	}
@@ -235,7 +245,7 @@ func timeout(seconds int) time.Duration {
 	}
 	return time.Duration(seconds) * time.Second
 }
-func probeBudget(profile string) invocation.OutputBudget {
+func probeBudget(profile string) llm.OutputBudget {
 	completionTokens, responseBytes, maxToolCalls := int64(2048), int64(32<<10), int64(1)
 	if profile == "v8" {
 		maxToolCalls = 16
@@ -243,7 +253,7 @@ func probeBudget(profile string) invocation.OutputBudget {
 	if profile == "v9" || profile == "v10" || profile == "v11" || profile == "v12" {
 		completionTokens, responseBytes, maxToolCalls = 4096, 48<<10, 16
 	}
-	return invocation.OutputBudget{MaxContentBytes: responseBytes, MaxReasoningBytes: responseBytes,
+	return llm.OutputBudget{MaxContentBytes: responseBytes, MaxReasoningBytes: responseBytes,
 		MaxExtraFieldBytes: responseBytes, MaxToolNameBytes: 512, MaxToolArgumentsBytes: 16 << 10,
 		MaxToolCalls: maxToolCalls, MaxToolArgumentsTotalBytes: 16 << 10,
 		MaxResponseBytes: responseBytes, MaxCompletionTokens: completionTokens}

@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"agentgo/internal/contextcontract"
 	"context"
 	"fmt"
 	"log"
@@ -17,7 +18,7 @@ import (
 	"agentgo/internal/checkstore"
 	"agentgo/internal/config"
 	"agentgo/internal/contentstore"
-	"agentgo/internal/contextadapter"
+	"agentgo/internal/contextruntime"
 	"agentgo/internal/contextstore"
 	"agentgo/internal/controlcapability"
 	"agentgo/internal/dashboard"
@@ -39,7 +40,6 @@ import (
 	"agentgo/internal/pathutil"
 	"agentgo/internal/policycatalog"
 	"agentgo/internal/probe"
-	"agentgo/internal/prompt"
 	"agentgo/internal/proposalacceptance"
 	"agentgo/internal/reactor"
 	reactorbuiltin "agentgo/internal/reactor/builtin"
@@ -136,7 +136,8 @@ type System struct {
 	// UIHub 是输出、状态与 Interaction 投影的统一消费者与
 	// 前端控制/观测面（ui.Controller + ui.Observer）。TUI（RunCLI）只经它
 	// 与系统交互；无订阅者时 Hub 也常驻排干通道，生产者永不阻塞。
-	UIHub *ui.Hub
+	UIHub       *ui.Hub
+	ModelOutput *contextruntime.OutputService
 	// Dashboard 是经 UI Hub 接入的 Web Dashboard（ui.frontends 含 "web" 时在 Start 启动；
 	// 否则为 nil）。
 	Dashboard *dashboard.Server
@@ -471,7 +472,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		return nil, fmt.Errorf("恢复 L5 DeliveryStore 失败（损坏 transaction 不得忽略）: %w", deliveryStoreErr)
 	}
 	log.Printf("[启动] L5 DeliveryStore 已启用 (dir=%s)", deliveryStorePath)
-	contextSnapshotPath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "context-snapshots")
+	contextSnapshotPath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "context-snapshots-v2")
 	contextSnapshotStore, contextSnapshotErr := contextstore.New(contextSnapshotPath)
 	if contextSnapshotErr != nil {
 		return nil, fmt.Errorf("初始化 L2 ContextSnapshotStore 失败（新执行必须 fail-closed）: %w", contextSnapshotErr)
@@ -740,15 +741,34 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	if err != nil {
 		return nil, fmt.Errorf("创建 Graph policy catalog 失败: %w", err)
 	}
-	contextRuntime := agent.ContextRuntime{
-		Adapter: contextadapter.New(), Policies: graphPolicies,
+	contextRuntime := contextruntime.Runtime{
+		Assembler: contextruntime.NewAssembler(), Policies: graphPolicies,
 		Snapshots: contextSnapshotStore, Content: contentStateStore,
+		Options:             cfg.LLM.InvocationOptions(cfg.LLM.DefaultModel),
+		ResolveModelOptions: cfg.LLM.InvocationOptions,
+		Memory:              memoryStore, TaskMemory: taskMemStore,
 		SessionID: func() string { return currentSessionIDFromMgr(sessMgr) },
+	}
+	contextRuntime.InputReader = tools.ContentRefGroup{ContentStore: contentStateStore, TaskStore: taskStore, SessionID: contextRuntime.SessionID}
+	contextRuntime.Output = contextruntime.NewOutputService(func(record contextruntime.OutputRecord) error {
+		if record.Identity.SessionID == "" {
+			return fmt.Errorf("模型输出缺少 Session")
+		}
+		return sessMgr.AppendModelOutput(record)
+	})
+	if id := currentSessionIDFromMgr(sessMgr); id != "" {
+		records, loadErr := sessMgr.LoadModelOutputs(id)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		if restoreErr := contextRuntime.Output.Restore(records); restoreErr != nil {
+			return nil, restoreErr
+		}
 	}
 	// Scheduler Prompt 是内置静态 L1 产物，启动期已经完全可知。必须在
 	// Graph/Runner 运行时装配前用真实 L2 编码路径证明它符合 current policy；
 	// 不能等第一个用户 Task 认领后才暴露 deterministic contract failure。
-	if err := contextRuntime.ValidateStaticPrompt(context.Background(), agent.StaticPromptProfile{
+	if err := contextRuntime.ValidateStaticPrompt(context.Background(), contextruntime.StaticPromptProfile{
 		ProfileID: "scheduler", ContextPolicyRef: policycatalog.ContextDefaultCurrent,
 		SystemPrompt: scheduler.SystemPrompt(),
 	}); err != nil {
@@ -820,7 +840,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 			return task.Description, nil
 		}),
 		contextSnapshotStore,
-		proposalacceptance.Options{},
+		proposalacceptance.Options{Invocation: cfg.LLM.InvocationOptions(proposalModel), Output: contextRuntime.Output, SessionID: contextRuntime.SessionID},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("创建独立 Graph Proposal Verifier 失败: %w", err)
@@ -979,29 +999,6 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	}
 	var sys *System
 	outputDone := make(chan struct{})
-	var streamSessionMu sync.Mutex
-	streamSessions := make(map[string]string)
-	streamOutput := func(ev output.Event) {
-		if ev.StreamID != "" && (ev.Kind == output.KindStream || ev.Kind == output.KindTurn) {
-			streamSessionMu.Lock()
-			sessionID := streamSessions[ev.StreamID]
-			if sessionID == "" {
-				sessionID = currentSessionID()
-				streamSessions[ev.StreamID] = sessionID
-			}
-			ev.SessionID = sessionID
-			if ev.Kind == output.KindTurn {
-				delete(streamSessions, ev.StreamID)
-			}
-			streamSessionMu.Unlock()
-		} else if ev.SessionID == "" {
-			ev.SessionID = currentSessionID()
-		}
-		select {
-		case outputCh <- ev:
-		case <-outputDone:
-		}
-	}
 	// 文本输出 writer：每个 agent 一个（按 agentID 标记来源），共享同一 outputCh。
 	newTextWriter := func(agentID string) *eventWriter {
 		return &eventWriter{ch: outputCh, done: outputDone, kind: output.KindText, agentID: agentID}
@@ -1059,7 +1056,6 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		EffectJournal:           effectJournal,     // H2b 副作用 authority；生产 Bootstrap 已验证非 nil/healthy
 		OutletChecker:           graphRuntime,      // 终态契约 v2 提交期出路检查（Step 3.9.1 装配的 *graph.Runtime）
 		UserOutput:              newTextWriter(""), // 共享兜底（team/spawn ad-hoc runner）；静态 runner 在下方按实例标记
-		StreamOutput:            streamOutput,
 		TaskEndCallbacks:        taskEndReactor,
 		ProjectRoot:             cfg.ProjectRoot,
 		RosterWaitTimeoutSec:    cfg.Infra.Roster.WaitTimeoutSec,
@@ -1108,7 +1104,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 					Kind:          kind.Kind,
 					EventType:     kind.EventType,
 					Description:   auditDescriptionFallback(kind),
-					PromptDigest:  prompt.DigestText(rt.SystemPrompt),
+					PromptDigest:  contextcontract.ShortDigestText(rt.SystemPrompt),
 					PromptExcerpt: auditExcerpt(rt.SystemPrompt),
 					AllowedTools:  append([]string(nil), rt.AllowedTools...),
 					Replicas:      kind.Replicas,
@@ -1132,7 +1128,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// Step 8.2: 构造 AgentTemplate TeamManager。legacy Team 按 controller task
 	// 归属，Graph-first Team 按 durable GraphID 归属；两者与静态
 	// cfg.Agents 共用 RunnerDeps，但只在 System.Start 后恢复/启动动态 Team。
-	teamLLMFactory := team.LLMFactory(func(model string) llm.Client {
+	teamLLMFactory := team.LLMFactory(func(model string) llm.Invoker {
 		return buildKindLLMClient(cfg.LLM, model)
 	})
 	teamMgr := team.NewManager(
@@ -1180,7 +1176,6 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	if sched.Agent != nil {
 		capReg.schedulerAgentID = sched.Agent.ID
 		sched.Agent.Activity = activity
-		sched.Agent.StreamOutput = streamOutput
 		sched.Agent.LoopStore = loopStateStore
 		sched.Agent.RunBudgetStore = runBudgetStateStore
 		sched.Agent.ContentStore = contentStateStore
@@ -1200,7 +1195,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		Kind:          "scheduler",
 		EventType:     "__scheduler__",
 		Description:   "系统调度器：用户输入裁决、任务委派与图编排控制面",
-		PromptDigest:  prompt.DigestText(scheduler.SystemPrompt()),
+		PromptDigest:  contextcontract.ShortDigestText(scheduler.SystemPrompt()),
 		PromptExcerpt: auditExcerpt(scheduler.SystemPrompt()),
 		AllowedTools:  sched.ToolReg.Names(),
 		Replicas:      1,
@@ -1210,7 +1205,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	//
 	// Manager 同时是 reactor.Reactor（订阅 task 终态触发 one_shot 销毁）。
 	// RunnerDeps 此时已就绪，所以 ad-hoc runner 构造能复用与静态 kind 完全相同的 deps。
-	llmFactoryForSpawn := func(model string) llm.Client {
+	llmFactoryForSpawn := func(model string) llm.Invoker {
 		return buildKindLLMClient(cfg.LLM, model)
 	}
 	spawnMgr := spawn.NewManager(cfg, deps, llmFactoryForSpawn, taskStore)
@@ -1261,7 +1256,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 			LLMFactory: func(model string) userdef.LLMCompleter {
 				// 独立 reactor LLM client：不复用主 agent client，避免共享 history / system prompt 状态。
 				return userdef.NewLLMCompleter(buildKindLLMClient(cfg.LLM, model), userdef.LLMContextDeps{
-					Adapter: contextadapter.New(), Policies: graphPolicies, Snapshots: contextSnapshotStore,
+					Runtime: contextruntime.Runtime{Assembler: contextruntime.NewAssembler(), Policies: graphPolicies, Snapshots: contextSnapshotStore, Options: cfg.LLM.InvocationOptions(model), Output: contextRuntime.Output, SessionID: contextRuntime.SessionID},
 				})
 			},
 			Mailbox:        mbRegistry,
@@ -1398,6 +1393,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	// Step 11: 装配 UI Hub——Output/Status 与 Interaction 的统一投影。
 	// 此后 TUI（RunCLI）只经 ui.Controller / ui.Observer 与系统交互，不再
 	// 直持任何系统通道 / 组件。
+	sys.ModelOutput = contextRuntime.Output
 	sys.UIHub = sys.buildUIHub()
 
 	// Step 11.5: 注册 dashboard trace reactor——trace 事件流经 ReactorRegistry
@@ -1472,22 +1468,7 @@ func (s *System) buildUIHub() *ui.Hub {
 			}
 			return &ui.ResultItem{AgentID: "scheduler", Text: result.Text}
 		},
-		TurnLoad: func(sessionID string) ([]ui.AgentTurn, error) {
-			if s.SessionMgr == nil || sessionID == "" {
-				return nil, nil
-			}
-			records, err := s.SessionMgr.LoadTurns(sessionID)
-			if err != nil {
-				return nil, err
-			}
-			return uiTurnsFromSession(records), nil
-		},
-		TurnAppend: func(turn ui.AgentTurn) error {
-			if s.SessionMgr == nil || turn.SessionID == "" {
-				return nil
-			}
-			return s.SessionMgr.AppendTurn(turn.SessionID, sessionTurnFromUI(turn))
-		},
+		ModelOutput: s.ModelOutput,
 		RecordUserInput: func(text string) {
 			if s.SessionMgr == nil {
 				return
@@ -1825,6 +1806,16 @@ func (w *tuiLogWriter) Write(p []byte) (n int, err error) {
 func (s *System) onSessionSwitched(newSess *session.Session) {
 	if newSess == nil {
 		return
+	}
+	if s.ModelOutput != nil && s.SessionMgr != nil {
+		records, err := s.SessionMgr.LoadModelOutputs(newSess.ID)
+		if err == nil {
+			err = s.ModelOutput.Restore(records)
+		}
+		if err != nil {
+			s.recordSessionSwitchError(fmt.Errorf("模型输出历史恢复失败: %w", err))
+			return
+		}
 	}
 
 	// 1. team store 持久化位置迁移。某些配置下可为 nil（teams 禁用），判空跳过。

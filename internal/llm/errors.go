@@ -2,8 +2,6 @@ package llm
 
 import (
 	"fmt"
-
-	"agentgo/internal/invocation"
 )
 
 // ErrRecoverable 是外部兼容包装；internal L4 只消费 Failure.Kind 决定恢复，
@@ -12,12 +10,12 @@ type ErrRecoverable struct {
 	Err     error
 	Code    string // 厂商错误码（如 rate_limit_exceeded）
 	Message string // 厂商错误消息
-	Failure *invocation.Failure
+	Failure *Failure
 }
 
 func (e *ErrRecoverable) Error() string { return e.Err.Error() }
 func (e *ErrRecoverable) Unwrap() error { return e.Err }
-func (e *ErrRecoverable) InvocationFailure() *invocation.Failure {
+func (e *ErrRecoverable) InvocationFailure() *Failure {
 	if e == nil {
 		return nil
 	}
@@ -31,12 +29,12 @@ type ErrUnrecoverable struct {
 	Code       string // 厂商错误码（如 model_not_found）
 	Message    string // 厂商错误消息
 	Endpoint   string // LLM endpoint（如 https://api.deepseek.com/v1），用于诊断提示
-	Failure    *invocation.Failure
+	Failure    *Failure
 }
 
 func (e *ErrUnrecoverable) Error() string { return e.Err.Error() }
 func (e *ErrUnrecoverable) Unwrap() error { return e.Err }
-func (e *ErrUnrecoverable) InvocationFailure() *invocation.Failure {
+func (e *ErrUnrecoverable) InvocationFailure() *Failure {
 	if e == nil {
 		return nil
 	}
@@ -47,12 +45,12 @@ func (e *ErrUnrecoverable) InvocationFailure() *invocation.Failure {
 // 调用方应触发简单重试。
 type ErrBadResponse struct {
 	Err     error
-	Failure *invocation.Failure
+	Failure *Failure
 }
 
 func (e *ErrBadResponse) Error() string { return fmt.Sprintf("bad LLM response: %v", e.Err) }
 func (e *ErrBadResponse) Unwrap() error { return e.Err }
-func (e *ErrBadResponse) InvocationFailure() *invocation.Failure {
+func (e *ErrBadResponse) InvocationFailure() *Failure {
 	if e == nil {
 		return nil
 	}

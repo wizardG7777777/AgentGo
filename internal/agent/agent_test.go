@@ -1,8 +1,9 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
 	"context"
-	"encoding/json"
+
 	"errors"
 	"fmt"
 	"os"
@@ -11,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"agentgo/internal/invocation"
+	"agentgo/internal/llm"
 	"agentgo/internal/model"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
@@ -30,7 +31,7 @@ func TestAgent_SuccessfulExecution(t *testing.T) {
 	task := &model.Task{Description: "test task", EventType: "code"}
 	s.PublishTask(task)
 
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "executed successfully", ToolCalled: false}, nil
 	}
 
@@ -74,11 +75,11 @@ func TestActionContractRejectionRetriesWithinSameAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls := 0
-	executor := func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+	executor := func(context.Context, *model.Task, map[string]string, []contextcontract.HistoryEntry, llm.OutputBudget) (ExecuteResult, error) {
 		calls++
 		if calls == 1 {
-			return ExecuteResult{}, invocation.NewFailure(invocation.FailureActionContractRejected,
-				invocation.PhaseToolCallValidate, invocation.OriginRuntime, errors.New("phase=default 未授权工具"))
+			return ExecuteResult{}, llm.NewFailure(llm.FailureActionContractRejected,
+				llm.PhaseToolCallValidate, llm.OriginRuntime, errors.New("phase=default 未授权工具"))
 		}
 		return ExecuteResult{Output: "修正后完成"}, nil
 	}
@@ -118,7 +119,7 @@ func TestAgentNaturalCompletionPersistsDiskRecoveredArtifactBeforeTerminal(t *te
 	if err := s.ClaimTask("agent-1", task.ID); err != nil {
 		t.Fatal(err)
 	}
-	executor := func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+	executor := func(context.Context, *model.Task, map[string]string, []contextcontract.HistoryEntry, llm.OutputBudget) (ExecuteResult, error) {
 		// Finalized 模拟 submit_task_result 已被接受：2026-08-20 SWE-001 起
 		// 图节点任务纯文本退出被拒，本测试走 finalization 信号收口分支。
 		return ExecuteResult{Output: "自然文本收尾", ToolCalled: false, Finalized: true}, nil
@@ -153,7 +154,7 @@ func TestAgent_RecoverableError(t *testing.T) {
 	s.PublishTask(task)
 
 	callCount := 0
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		callCount++
 		if callCount == 1 {
 			return ExecuteResult{}, &ErrRecoverable{Err: errors.New("temporary failure")}
@@ -200,7 +201,7 @@ func TestAgent_RecoverableRetryPersistsToolHistoryInStoreAndSnapshot(t *testing.
 
 	const toolOutput = "durable tool evidence"
 	callCount := 0
-	executor := func(_ context.Context, _ *model.Task, _ map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(_ context.Context, _ *model.Task, _ map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		callCount++
 		switch callCount {
 		case 1:
@@ -209,7 +210,7 @@ func TestAgent_RecoverableRetryPersistsToolHistoryInStoreAndSnapshot(t *testing.
 			}
 			return ExecuteResult{
 				Output: toolOutput, ToolCalled: true,
-				ToolResults: []ToolResult{{ToolCallID: "tool-1", Content: toolOutput}},
+				ToolResults: []contextcontract.ToolResult{{ToolCallID: "tool-1", Content: toolOutput}},
 			}, nil
 		case 2:
 			if len(history) != 1 || history[0].Output != toolOutput {
@@ -241,8 +242,8 @@ func TestAgent_RecoverableRetryPersistsToolHistoryInStoreAndSnapshot(t *testing.
 	if stored.Status != model.TaskStatusPending || stored.RetryCount != 1 {
 		t.Fatalf("after recoverable failure task=%+v", stored)
 	}
-	var persisted []HistoryEntry
-	if err := json.Unmarshal(stored.LastHistory, &persisted); err != nil {
+	var persisted []contextcontract.HistoryEntry
+	if err := decodeTestHistory(stored.LastHistory, &persisted); err != nil {
 		t.Fatalf("stored LastHistory is not valid history JSON: %v", err)
 	}
 	if len(persisted) != 1 || persisted[0].Output != toolOutput {
@@ -279,7 +280,7 @@ func TestAgent_UnrecoverableError(t *testing.T) {
 	task := &model.Task{Description: "fail task", EventType: "code"}
 	s.PublishTask(task)
 
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{}, errors.New("permanent failure")
 	}
 
@@ -309,7 +310,7 @@ func TestAgent_UnrecoverableError(t *testing.T) {
 func TestAgent_ContextCancellation(t *testing.T) {
 	s, r, _ := setup()
 
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		<-ctx.Done()
 		return ExecuteResult{}, ctx.Err()
 	}
@@ -342,7 +343,7 @@ func TestAgent_SkipsWrongEventType(t *testing.T) {
 	s.PublishTask(task)
 
 	executed := false
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		executed = true
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
@@ -383,7 +384,7 @@ func TestAgent_ReadsDependencyResults(t *testing.T) {
 	s.PublishTask(task)
 
 	var receivedDeps map[string]string
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		receivedDeps = depResults
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
@@ -443,7 +444,7 @@ func TestBugCondition_MultiRoundTaskExecutorCallCount(t *testing.T) {
 	callCount := 0
 	totalRoundsNeeded := 3
 
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		callCount++
 		if callCount < totalRoundsNeeded {
 			// Rounds 1 and 2: simulate "tool was called, need to continue"
@@ -505,7 +506,7 @@ func TestPreservation_SingleRoundCompletion(t *testing.T) {
 				t.Fatalf("ClaimTask failed: %v", err)
 			}
 
-			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 				return ExecuteResult{Output: tc.result, ToolCalled: false}, nil
 			}
 
@@ -552,7 +553,7 @@ func TestPreservation_UnrecoverableError(t *testing.T) {
 				t.Fatalf("ClaimTask failed: %v", err)
 			}
 
-			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 				return ExecuteResult{}, errors.New(tc.errMsg)
 			}
 
@@ -597,7 +598,7 @@ func TestPreservation_RecoverableError(t *testing.T) {
 				t.Fatalf("ClaimTask failed: %v", err)
 			}
 
-			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 				return ExecuteResult{}, &ErrRecoverable{Err: errors.New(tc.errMsg)}
 			}
 
@@ -646,7 +647,7 @@ func TestPreservation_DependencyResults(t *testing.T) {
 		s.ClaimTask("agent-1", task.ID)
 
 		var receivedDeps map[string]string
-		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 			receivedDeps = depResults
 			return ExecuteResult{Output: "done", ToolCalled: false}, nil
 		}
@@ -684,7 +685,7 @@ func TestPreservation_DependencyResults(t *testing.T) {
 		s.ClaimTask("agent-1", task.ID)
 
 		var receivedDeps map[string]string
-		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 			receivedDeps = depResults
 			return ExecuteResult{Output: "done", ToolCalled: false}, nil
 		}
@@ -708,7 +709,7 @@ func TestPreservation_DependencyResults(t *testing.T) {
 		s.ClaimTask("agent-1", task.ID)
 
 		var receivedDeps map[string]string
-		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 			receivedDeps = depResults
 			return ExecuteResult{Output: "done", ToolCalled: false}, nil
 		}
@@ -730,7 +731,7 @@ func TestPreservation_ContextCancellation(t *testing.T) {
 	t.Run("idle agent exits on cancel", func(t *testing.T) {
 		s, r, _ := setup()
 
-		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 			return ExecuteResult{Output: "done", ToolCalled: false}, nil
 		}
 
@@ -767,7 +768,7 @@ func TestPreservation_ContextCancellation(t *testing.T) {
 	t.Run("cancel during poll with no tasks", func(t *testing.T) {
 		s, r, _ := setup()
 
-		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 			return ExecuteResult{Output: "done", ToolCalled: false}, nil
 		}
 
@@ -808,7 +809,7 @@ func TestPreservation_ExecutorReceivesCorrectTask(t *testing.T) {
 	s.ClaimTask("agent-1", task.ID)
 
 	var receivedTask *model.Task
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		receivedTask = tk
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
@@ -846,7 +847,7 @@ func TestPreservation_SingleRoundCompletion_Quick(t *testing.T) {
 		s.PublishTask(task)
 		s.ClaimTask("agent-1", task.ID)
 
-		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+		executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 			return ExecuteResult{Output: result, ToolCalled: false}, nil
 		}
 
@@ -892,7 +893,7 @@ func TestPreservation_ErrorHandling_Quick(t *testing.T) {
 			s.PublishTask(task)
 			s.ClaimTask("agent-1", task.ID)
 
-			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 				if ec.recoverable {
 					return ExecuteResult{}, &ErrRecoverable{Err: errors.New(ec.errMsg)}
 				}
@@ -924,7 +925,7 @@ func TestPreservation_ErrorHandling_Quick(t *testing.T) {
 // =============================================================================
 
 // TestProperty_RoundTripConsistency verifies Property 1: Round-trip consistency.
-// ExecuteResult → HistoryEntry → reading back yields values equal to the original.
+// ExecuteResult → contextcontract.HistoryEntry → reading back yields values equal to the original.
 // For each round k, the history[k].Output received by subsequent rounds must equal
 // the Output returned by round k's ExecuteResult.
 //
@@ -949,15 +950,15 @@ func TestProperty_RoundTripConsistency(t *testing.T) {
 			}
 
 			// Capture the history parameter received by each round
-			capturedHistories := make([][]HistoryEntry, 0, totalRounds)
+			capturedHistories := make([][]contextcontract.HistoryEntry, 0, totalRounds)
 			callCount := 0
 
-			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 				round := callCount
 				callCount++
 
 				// Capture a copy of the history slice received this round
-				hCopy := make([]HistoryEntry, len(history))
+				hCopy := make([]contextcontract.HistoryEntry, len(history))
 				copy(hCopy, history)
 				capturedHistories = append(capturedHistories, hCopy)
 
@@ -994,7 +995,7 @@ func TestProperty_RoundTripConsistency(t *testing.T) {
 
 // TestProperty_HistoryLengthInvariant verifies Property 2: History length invariant.
 // At round i (0-indexed), len(history) == i.
-// This ensures processTask correctly accumulates one HistoryEntry per completed round.
+// This ensures processTask correctly accumulates one contextcontract.HistoryEntry per completed round.
 //
 // **Validates: Requirements 3.5, 5.2**
 func TestProperty_HistoryLengthInvariant(t *testing.T) {
@@ -1014,7 +1015,7 @@ func TestProperty_HistoryLengthInvariant(t *testing.T) {
 			historyLengths := make([]int, 0, totalRounds)
 			callCount := 0
 
-			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 				round := callCount
 				callCount++
 
@@ -1067,7 +1068,7 @@ func TestProperty_HistoryToolCalledAlwaysTrue(t *testing.T) {
 			// Track any violation found across all rounds
 			var violation string
 
-			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 				round := callCount
 				callCount++
 
@@ -1127,15 +1128,15 @@ func TestProperty_ReadOnlySemantics(t *testing.T) {
 	}
 
 	// Capture the history received by each round (after copying, before mutation)
-	capturedHistories := make([][]HistoryEntry, 0, totalRounds)
+	capturedHistories := make([][]contextcontract.HistoryEntry, 0, totalRounds)
 	callCount := 0
 
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		round := callCount
 		callCount++
 
 		// Capture a pristine copy of the history we received BEFORE mutating
-		pristine := make([]HistoryEntry, len(history))
+		pristine := make([]contextcontract.HistoryEntry, len(history))
 		copy(pristine, history)
 		capturedHistories = append(capturedHistories, pristine)
 
@@ -1148,8 +1149,8 @@ func TestProperty_ReadOnlySemantics(t *testing.T) {
 		}
 
 		// Mutation 2: Append extra garbage elements
-		history = append(history, HistoryEntry{Output: "INJECTED-GARBAGE-1", ToolCalled: false})
-		history = append(history, HistoryEntry{Output: "INJECTED-GARBAGE-2", ToolCalled: true})
+		history = append(history, contextcontract.HistoryEntry{Output: "INJECTED-GARBAGE-1", ToolCalled: false})
+		history = append(history, contextcontract.HistoryEntry{Output: "INJECTED-GARBAGE-2", ToolCalled: true})
 
 		if round < totalRounds-1 {
 			return ExecuteResult{Output: expectedOutputs[round], ToolCalled: true}, nil
@@ -1219,10 +1220,10 @@ func TestBehavior_SingleRoundEmptyHistory(t *testing.T) {
 		t.Fatalf("ClaimTask failed: %v", err)
 	}
 
-	var receivedHistory []HistoryEntry
+	var receivedHistory []contextcontract.HistoryEntry
 	callCount := 0
 
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		callCount++
 		receivedHistory = history
 		return ExecuteResult{Output: "done-first-round", ToolCalled: false}, nil
@@ -1276,7 +1277,7 @@ func TestBehavior_ErrorDoesNotAppendHistory(t *testing.T) {
 	historyLengths := make([]int, 0, 3)
 	callCount := 0
 
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		round := callCount
 		callCount++
 		historyLengths = append(historyLengths, len(history))
@@ -1341,7 +1342,7 @@ func TestBehavior_ContextCancelExitsLoop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	executor := func(execCtx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(execCtx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		callCount++
 		if callCount == 1 {
 			// Cancel the context after the first round
@@ -1370,7 +1371,7 @@ func TestAgent_IdleRetire_ExitsAfterThreshold(t *testing.T) {
 	s, r, _ := setup()
 	// 不发布任何任务
 
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
 
@@ -1395,7 +1396,7 @@ func TestAgent_IdleRetire_ExitsAfterThreshold(t *testing.T) {
 func TestAgent_IdleRetire_ResetsOnClaim(t *testing.T) {
 	s, r, _ := setup()
 
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
 
@@ -1437,7 +1438,7 @@ func TestAgent_IdleRetire_ResetsOnClaim(t *testing.T) {
 func TestAgent_IdleRetire_DisabledByDefault(t *testing.T) {
 	s, r, _ := setup()
 
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
 
@@ -1474,7 +1475,7 @@ func TestAgent_PerTaskCancel_StopsExecution(t *testing.T) {
 	s.PublishTask(task)
 
 	executorStarted := make(chan struct{})
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		close(executorStarted)
 		// 模拟长时间执行，等待 context 取消
 		<-ctx.Done()
@@ -1526,7 +1527,7 @@ func TestAgent_PerTaskCancel_NilRegistryFallback(t *testing.T) {
 	task := &model.Task{Description: "test task", EventType: "code"}
 	s.PublishTask(task)
 
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
 
@@ -1561,7 +1562,7 @@ func TestAgent_AppendOutput_CalledDuringExecution(t *testing.T) {
 	s.PublishTask(task)
 
 	step := 0
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		step++
 		if step <= 2 {
 			return ExecuteResult{Output: fmt.Sprintf("step-%d output\n", step), ToolCalled: true}, nil
@@ -1626,7 +1627,7 @@ func TestAgent_OnTaskStart_Called(t *testing.T) {
 	s.PublishTask(task)
 
 	var capturedTaskID string
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
 
@@ -1670,7 +1671,7 @@ func TestAgent_FileCache_ClearedOnTaskStart(t *testing.T) {
 	cache := NewFileStateCache(50)
 	cache.Put("/tmp/stale.go", "old content", "old_hash")
 
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		// 验证缓存已被清空
 		if cache.Len() != 0 {
 			t.Errorf("FileCache should be cleared at task start, got Len()=%d", cache.Len())
@@ -1819,6 +1820,7 @@ func TestCheckExpectedArtifacts_BasenameDriftToleratedAsSuccess(t *testing.T) {
 		task: &model.Task{
 			ExpectedArtifacts: []string{"report.md"},
 			Artifacts:         []string{"docs/report.md"}, // 实际写到了 docs/ 下
+
 		},
 	}
 	res := checkExpectedArtifacts(r, "any-id")
@@ -1836,6 +1838,7 @@ func TestCheckExpectedArtifacts_DifferentBasenameStillMissing(t *testing.T) {
 		task: &model.Task{
 			ExpectedArtifacts: []string{"report.md"},
 			Artifacts:         []string{"docs/summary.md"}, // 完全不同的名字
+
 		},
 	}
 	res := checkExpectedArtifacts(r, "any-id")

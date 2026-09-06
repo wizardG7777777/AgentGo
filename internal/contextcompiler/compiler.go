@@ -277,9 +277,9 @@ func (c *Compiler) Compile(ctx context.Context, input CompileInput) (CompileResu
 		now = time.Now()
 	}
 	snapshot := &contextcontract.ContextSnapshot{
-		SnapshotID: snapshotID, Schema: contextcontract.SnapshotSchemaV1,
+		SnapshotID: snapshotID, Schema: contextcontract.SnapshotSchemaV2,
 		AttemptID: input.AttemptID, InvocationID: input.InvocationID,
-		PromptBuildRef:  input.PromptBuildRef,
+		InstructionRef:  input.InstructionRef,
 		ContextPolicyID: input.BudgetPolicy.PolicyID, ContextPolicyDigest: policyDigest,
 		ProviderReplayRef: replayRef, ExecutionLeaseRef: input.ExecutionLeaseRef,
 		ToolRouterSnapshotID: input.ToolRouterSnapshotID,
@@ -309,7 +309,7 @@ func validateCompileIdentity(input CompileInput) error {
 	}{
 		{label: "attempt_id", value: input.AttemptID},
 		{label: "invocation_id", value: input.InvocationID},
-		{label: "prompt_build_ref", value: input.PromptBuildRef},
+		{label: "instruction_ref", value: input.InstructionRef},
 		{label: "execution_lease_ref", value: input.ExecutionLeaseRef},
 		{label: "tool_router_snapshot_id", value: input.ToolRouterSnapshotID},
 	}
@@ -658,7 +658,7 @@ func snapshotIdentity(
 	digest, err := contextcontract.StableDigest("agentgo.context-snapshot-id/v1", struct {
 		AttemptID            string                                      `json:"attempt_id"`
 		InvocationID         string                                      `json:"invocation_id"`
-		PromptBuildRef       string                                      `json:"prompt_build_ref"`
+		InstructionRef       string                                      `json:"instruction_ref"`
 		ExecutionLeaseRef    string                                      `json:"execution_lease_ref"`
 		ToolRouterSnapshotID string                                      `json:"tool_router_snapshot_id"`
 		ParentSnapshotRef    string                                      `json:"parent_snapshot_ref,omitempty"`
@@ -672,7 +672,7 @@ func snapshotIdentity(
 		EncodedDigest        string                                      `json:"encoded_digest"`
 	}{
 		AttemptID: input.AttemptID, InvocationID: input.InvocationID,
-		PromptBuildRef: input.PromptBuildRef, ExecutionLeaseRef: input.ExecutionLeaseRef,
+		InstructionRef: input.InstructionRef, ExecutionLeaseRef: input.ExecutionLeaseRef,
 		ToolRouterSnapshotID: input.ToolRouterSnapshotID,
 		ParentSnapshotRef:    input.ParentSnapshotRef, RecoveryReason: input.RecoveryReason,
 		PolicyDigest: policyDigest, ReplayDigest: replayDigest,

@@ -1,3 +1,5 @@
+> **模型输出接缝更新（2026-09-07）**：模型输出统一订阅 L2 WatchModelOutput；Hub 不追加轮次账本。Web 模型流使用 `/api/model-output/events` 与 SSE id/Last-Event-ID；TUI 使用同一事件语义。eventCursor（流式事件游标 / SSE events cursor）由 L2 管理，重启恢复完整文本。普通状态与 Interaction 订阅不承担模型 delta 的交付。布局与 inline/全屏排放规则不变。
+
 # TUI 结构性重构：inline 视口 + scrollback 排放 + Graph 全屏层
 
 > 状态：已实施（2026-08）

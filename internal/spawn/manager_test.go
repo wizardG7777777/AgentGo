@@ -1,6 +1,7 @@
 package spawn
 
 import (
+	"agentgo/internal/testmodel"
 	"context"
 	"os"
 	"path/filepath"
@@ -9,9 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"agentgo/internal/agent"
 	"agentgo/internal/config"
-	"agentgo/internal/contextadapter"
+	"agentgo/internal/contextruntime"
 	"agentgo/internal/llm"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
@@ -37,7 +37,7 @@ func writeTempPrompt(t *testing.T) string {
 // 实现：构造一个假的 active spawn，发 KindTaskCompleted 事件，验证 cancel 被调用
 // 且 spawn 被从 map 中删除。
 func TestManager_Reactor_CleansUpOnTaskCompleted(t *testing.T) {
-	m := NewManager(&config.Config{}, runner.RunnerDeps{}, nil, nil)
+	m := NewManager(&config.Config{}, runner.RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, nil, nil)
 
 	cancelCalled := false
 	var mu sync.Mutex
@@ -81,14 +81,14 @@ func TestManager_Reactor_CleansUpOnTaskCompleted(t *testing.T) {
 
 func TestManager_Reactor_IgnoresUnknownTaskID(t *testing.T) {
 	// 普通 worker 任务的终态事件不应触发任何动作
-	m := NewManager(&config.Config{}, runner.RunnerDeps{}, nil, nil)
+	m := NewManager(&config.Config{}, runner.RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, nil, nil)
 	if err := m.Run(trace.Event{Kind: trace.KindTaskCompleted, TaskID: "not-tracked"}); err != nil {
 		t.Errorf("Run on unknown TaskID should not error: %v", err)
 	}
 }
 
 func TestManager_Reactor_SubscribesToTerminalEvents(t *testing.T) {
-	m := NewManager(&config.Config{}, runner.RunnerDeps{}, nil, nil)
+	m := NewManager(&config.Config{}, runner.RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, nil, nil)
 	subs := m.Subscribe()
 	if len(subs) != 4 {
 		t.Fatalf("expected 4 subscriptions, got %d", len(subs))
@@ -114,7 +114,7 @@ func TestManager_Reactor_SubscribesToTerminalEvents(t *testing.T) {
 
 func TestManager_Spawn_RejectsUnknownBaseKind(t *testing.T) {
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "explorer", Tools: []string{"a"}}}}
-	m := NewManager(cfg, runner.RunnerDeps{}, nilLLMFactory, nil)
+	m := NewManager(cfg, runner.RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, nilLLMFactory, nil)
 	_, _, err := m.Spawn(context.Background(), SpawnRequest{
 		BaseKind:               "ghost",
 		InitialTaskDescription: "do something",
@@ -126,7 +126,7 @@ func TestManager_Spawn_RejectsUnknownBaseKind(t *testing.T) {
 
 func TestManager_Spawn_RejectsBadLifecycle(t *testing.T) {
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "explorer"}}}
-	m := NewManager(cfg, runner.RunnerDeps{}, nilLLMFactory, nil)
+	m := NewManager(cfg, runner.RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, nilLLMFactory, nil)
 	_, _, err := m.Spawn(context.Background(), SpawnRequest{
 		BaseKind:               "explorer",
 		InitialTaskDescription: "x",
@@ -139,7 +139,7 @@ func TestManager_Spawn_RejectsBadLifecycle(t *testing.T) {
 
 func TestManager_Spawn_RejectsEmptyDescription(t *testing.T) {
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "explorer", Tools: []string{"a"}}}}
-	m := NewManager(cfg, runner.RunnerDeps{}, nilLLMFactory, nil)
+	m := NewManager(cfg, runner.RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, nilLLMFactory, nil)
 	_, _, err := m.Spawn(context.Background(), SpawnRequest{BaseKind: "explorer"})
 	if err == nil || !strings.Contains(err.Error(), "description is empty") {
 		t.Errorf("expected empty-description error, got %v", err)
@@ -148,7 +148,7 @@ func TestManager_Spawn_RejectsEmptyDescription(t *testing.T) {
 
 func TestManager_Spawn_RejectsDepthExceeded(t *testing.T) {
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "explorer", Tools: []string{"a"}}}}
-	m := NewManager(cfg, runner.RunnerDeps{}, nilLLMFactory, nil)
+	m := NewManager(cfg, runner.RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, nilLLMFactory, nil)
 	_, _, err := m.Spawn(context.Background(), SpawnRequest{
 		BaseKind:               "explorer",
 		InitialTaskDescription: "x",
@@ -165,7 +165,7 @@ func TestManager_Spawn_RejectsDepthExceeded(t *testing.T) {
 
 func TestManager_Spawn_RejectsNilDependencies(t *testing.T) {
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "explorer", Tools: []string{"a"}}}}
-	m := NewManager(cfg, runner.RunnerDeps{}, nil, nil)
+	m := NewManager(cfg, runner.RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, nil, nil)
 	_, _, err := m.Spawn(context.Background(), SpawnRequest{
 		BaseKind:               "explorer",
 		InitialTaskDescription: "x",
@@ -175,7 +175,7 @@ func TestManager_Spawn_RejectsNilDependencies(t *testing.T) {
 		t.Errorf("expected LLMFactory error, got %v", err)
 	}
 
-	m = NewManager(cfg, runner.RunnerDeps{}, nilLLMFactory, nil)
+	m = NewManager(cfg, runner.RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, nilLLMFactory, nil)
 	_, _, err = m.Spawn(context.Background(), SpawnRequest{
 		BaseKind:               "explorer",
 		InitialTaskDescription: "x",
@@ -193,11 +193,11 @@ func TestManagerSpawnRejectsOversizedPromptBeforeRunner(t *testing.T) {
 	}
 	tasks := store.NewMemoryTaskStore(nil, 8, 1, 60)
 	cfg := &config.Config{
-		LLM:    config.LLMConfig{DefaultModel: "fake-model"},
+		LLM:    config.LLMConfig{DefaultModel: "fake-model", RequestContract: "agentgo.model-request/v1"},
 		Agents: []config.AgentKind{{Kind: "explorer", Tools: []string{"read_file"}}},
 	}
-	m := NewManager(cfg, runner.RunnerDeps{ContextRuntime: agent.ContextRuntime{
-		Adapter: contextadapter.New(), Policies: catalog,
+	m := NewManager(cfg, runner.RunnerDeps{ContextRuntime: contextruntime.Runtime{
+		Assembler: contextruntime.NewAssembler(), Policies: catalog, Snapshots: testmodel.Runtime(t).Snapshots, Options: testmodel.Runtime(t).Options, Output: testmodel.Runtime(t).Output,
 	}}, fakeLLMFactory, tasks)
 	_, _, err = m.Spawn(context.Background(), SpawnRequest{
 		BaseKind: "explorer", InitialTaskDescription: "检查",
@@ -214,7 +214,7 @@ func TestManagerSpawnRejectsOversizedPromptBeforeRunner(t *testing.T) {
 
 func TestManager_Spawn_PublishesInitialTaskDepth(t *testing.T) {
 	cfg := &config.Config{
-		LLM: config.LLMConfig{DefaultModel: "fake-model"},
+		LLM: config.LLMConfig{DefaultModel: "fake-model", RequestContract: "agentgo.model-request/v1"},
 		Agents: []config.AgentKind{{
 			Kind:             "explorer",
 			Tools:            []string{"read_file"},
@@ -232,7 +232,7 @@ func TestManager_Spawn_PublishesInitialTaskDepth(t *testing.T) {
 	}
 	parent, cancelParent := context.WithCancel(context.Background())
 	cancelParent()
-	m := NewManager(cfg, runner.RunnerDeps{Store: taskStore}, fakeLLMFactory, taskStore)
+	m := NewManager(cfg, runner.RunnerDeps{Store: taskStore, ContextRuntime: testmodel.Runtime(t)}, fakeLLMFactory, taskStore)
 	m.SetParentContext(parent)
 
 	_, taskID, err := m.Spawn(context.Background(), SpawnRequest{
@@ -269,7 +269,7 @@ func TestManager_Spawn_PublishesInitialTaskDepth(t *testing.T) {
 
 func TestManager_KindOf_PersistsAfterSpawnCleanup(t *testing.T) {
 	cfg := &config.Config{
-		LLM: config.LLMConfig{DefaultModel: "fake-model"},
+		LLM: config.LLMConfig{DefaultModel: "fake-model", RequestContract: "agentgo.model-request/v1"},
 		Agents: []config.AgentKind{{
 			Kind:             "explorer",
 			Tools:            []string{"read_file"},
@@ -279,7 +279,7 @@ func TestManager_KindOf_PersistsAfterSpawnCleanup(t *testing.T) {
 	taskStore := store.NewMemoryTaskStore(nil, 0, 1, 60)
 	parent, cancelParent := context.WithCancel(context.Background())
 	cancelParent()
-	m := NewManager(cfg, runner.RunnerDeps{Store: taskStore}, fakeLLMFactory, taskStore)
+	m := NewManager(cfg, runner.RunnerDeps{Store: taskStore, ContextRuntime: testmodel.Runtime(t)}, fakeLLMFactory, taskStore)
 	m.SetParentContext(parent)
 	defer m.Shutdown()
 
@@ -319,7 +319,7 @@ func TestManager_KindOf_PersistsAfterSpawnCleanup(t *testing.T) {
 func TestManager_Shutdown_AfterRejectedSpawn(t *testing.T) {
 	// Spawn 失败不应留下半成品状态——Shutdown 仍能干净退出
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "explorer"}}}
-	m := NewManager(cfg, runner.RunnerDeps{}, nilLLMFactory, nil)
+	m := NewManager(cfg, runner.RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, nilLLMFactory, nil)
 	_, _, _ = m.Spawn(context.Background(), SpawnRequest{
 		BaseKind:               "ghost",
 		InitialTaskDescription: "x",
@@ -330,15 +330,27 @@ func TestManager_Shutdown_AfterRejectedSpawn(t *testing.T) {
 	m.Shutdown() // 不应阻塞
 }
 
-// nilLLMFactory 是测试用占位 factory——返回 nil llm.Client。
+// nilLLMFactory 是测试用占位 factory——返回 nil llm.Invoker。
 // 仅用于不实际触发 runner.Run 的单测路径（Spawn 在 buildAdhocRuntime 失败时立即返回，
 // 不走到 runner.New）。
-var nilLLMFactory LLMFactory = func(model string) llm.Client { return nil }
+var nilLLMFactory LLMFactory = func(model string) llm.Invoker { return nil }
 
-var fakeLLMFactory LLMFactory = func(model string) llm.Client { return fakeLLMClient{} }
+var fakeLLMFactory LLMFactory = func(model string) llm.Invoker { return fakeLLMClient{} }
 
 type fakeLLMClient struct{}
 
-func (fakeLLMClient) Chat(ctx context.Context, messages []llm.Message, tools []llm.ToolDef) (llm.Response, error) {
-	return llm.Response{Content: "ok"}, nil
+func (f fakeLLMClient) nextFixture(ctx context.Context, messages []llm.Message, tools []llm.ToolDef) (testmodel.Fixture, error) {
+	return testmodel.Fixture{Content: "ok"}, nil
+}
+
+func (f fakeLLMClient) Invoke(ctx context.Context, request llm.Request, sink llm.EventSink) (llm.Result, error) {
+	if err := request.Validate(); err != nil {
+		return llm.Result{}, err
+	}
+	spec := request.Spec()
+	fixture, err := f.nextFixture(ctx, spec.Messages, spec.Tools)
+	if err != nil {
+		return llm.Result{}, err
+	}
+	return fixture.Seal(spec.Options.Protocol)
 }

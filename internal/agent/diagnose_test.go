@@ -1,11 +1,11 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
 	"errors"
 	"strings"
 	"testing"
 
-	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 )
 
@@ -56,8 +56,8 @@ func TestDiagnoseLLMError_InsufficientQuota(t *testing.T) {
 }
 
 func TestDiagnoseLLMError_ContextLengthExceeded(t *testing.T) {
-	failure := invocation.NewFailure(invocation.FailureContextWindowExceeded,
-		invocation.PhaseResponseHeaders, invocation.OriginProvider, errors.New("context rejected"))
+	failure := llm.NewFailure(llm.FailureContextWindowExceeded,
+		llm.PhaseResponseHeaders, llm.OriginProvider, errors.New("context rejected"))
 	execErr := &llm.ErrUnrecoverable{
 		Err:        errors.New("413 request entity too large"),
 		StatusCode: 413,
@@ -65,7 +65,7 @@ func TestDiagnoseLLMError_ContextLengthExceeded(t *testing.T) {
 		Message:    "This model's maximum context length is 8192 tokens",
 		Failure:    failure,
 	}
-	history := []HistoryEntry{
+	history := []contextcontract.HistoryEntry{
 		{AssistantContent: strings.Repeat("a", 3000)},
 		{Output: strings.Repeat("b", 3000)},
 	}

@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"agentgo/internal/contextruntime"
 	"bufio"
 	"context"
 	"encoding/json"
@@ -581,4 +582,8 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("等待条件超时：%s", what)
+}
+
+func (f *fakeObserver) WatchModelOutput(o contextruntime.WatchOptions) (<-chan contextruntime.OutputEvent, func(), error) {
+	return contextruntime.NewOutputService(nil).WatchModelOutput(o)
 }

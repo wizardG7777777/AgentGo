@@ -201,7 +201,7 @@ function askToken() {
 // ---------- 本地状态 ----------
 const state = {
   agents: [], tasks: [], graphs: [], interactions: [], result: null,
-  turns: [],
+  turns: [], session: {},
   feed: { outputs: [], logs: [], traces: [] },
   activeAgent: "", agentOutputFollow: true, view: "overview",
 };
@@ -883,6 +883,7 @@ $("interactionList").addEventListener("click", async e => {
 function applySnapshot(snap) {
   if (!snap) return;
   state.agentOutputFollow = true;
+  state.session=snap.session||{};
   renderHeader(snap);
   state.agents = snap.agents || [];
   state.tasks = snap.tasks || [];
@@ -933,6 +934,30 @@ function applyUpdate(u) {
   }
 }
 
+let modelES = null;
+const modelRecords = new Map();
+function modelTurn(record) {
+ const id=record.identity||{};
+ return {id:id.invocation_id,session_id:id.session_id,agent_id:id.agent_id,task_id:id.task_id,loop:id.loop,text:record.text||"",reasoning:record.reasoning||"",status:record.status,error:record.error,tool_calls:record.tool_calls||[],started_at:record.started_at,completed_at:record.completed_at};
+}
+function connectModelOutput() {
+ if(modelES)modelES.close();
+ modelES=new EventSource(withToken("/api/model-output/events"));
+ modelES.onmessage=event=>{
+  const update=JSON.parse(event.data);
+  if(update.kind==="snapshot"||update.kind==="resync") {
+   modelRecords.clear();for(const record of update.snapshot||[])modelRecords.set(record.identity.invocation_id,record);
+  } else {
+   const id=(update.identity||{}).invocation_id;
+   if(update.record)modelRecords.set(id,update.record);
+   const record=modelRecords.get(id);
+   if(record&&update.delta){if(update.delta.kind==="text_delta")record.text=(record.text||"")+update.delta.delta;if(update.delta.kind==="reasoning_delta")record.reasoning=(record.reasoning||"")+update.delta.delta;}
+  }
+  state.turns=Array.from(modelRecords.values()).filter(record=>!state.session.id||record.identity.session_id===state.session.id).map(modelTurn);
+  renderAll();
+ };
+ // 浏览器原生重连保留 Last-Event-ID；L2 在游标过期时发 resync。
+}
 let es = null, backoff = 1000;
 function setConn(on, label) {
   const c = $("conn");
@@ -963,6 +988,7 @@ async function boot() {
     if (cmdResp.ok) COMMANDS = await cmdResp.json(); // 失败时命令体系退化为"未知命令"提示
     applySnapshot(await snapResp.json());
     connectSSE();
+    connectModelOutput();
   } catch (err) {
     setConn(false, "加载失败：" + err.message);
     setTimeout(boot, 3000);

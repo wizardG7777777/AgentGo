@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"context"
 	"errors"
 	"sync/atomic"
@@ -23,7 +25,7 @@ func (f *flipFinalizationChecker) IsFinalized() bool {
 // emit 路径，校验 PrevStatus / NewStatus 等于 model 常量的字符串形式。
 func TestTransitionPayloads_UseModelTaskStatusVocabulary(t *testing.T) {
 	staticExec := func(result ExecuteResult, err error) TaskExecutor {
-		return func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+		return func(context.Context, *model.Task, map[string]string, []contextcontract.HistoryEntry, llm.OutputBudget) (ExecuteResult, error) {
 			return result, err
 		}
 	}
@@ -99,7 +101,7 @@ func TestTransitionPayloads_UseModelTaskStatusVocabulary(t *testing.T) {
 		},
 		{
 			name: "failed_panic_recovery",
-			executor: func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+			executor: func(context.Context, *model.Task, map[string]string, []contextcontract.HistoryEntry, llm.OutputBudget) (ExecuteResult, error) {
 				panic("kaboom")
 			},
 			wantKind:  trace.KindTaskFailed,

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"agentgo/internal/testmodel"
 	"context"
 	"fmt"
 	"testing"
@@ -26,7 +27,7 @@ func TestProcessTask_InvocationIDCorrelatesTripleEvents(t *testing.T) {
 	}
 
 	// 两轮：第一轮调工具，第二轮纯文本完成
-	mock := &mockLLMClient{responses: []llm.Response{
+	mock := &mockLLMClient{responses: []testmodel.Fixture{
 		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "read_file", Arguments: map[string]any{"path": "a.go"}}}},
 		{Content: "完成"},
 	}}
@@ -34,7 +35,7 @@ func TestProcessTask_InvocationIDCorrelatesTripleEvents(t *testing.T) {
 	tools.Register("read_file", "读取文件", nil, func(ctx context.Context, args map[string]any) (string, error) {
 		return "ok", nil
 	})
-	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "", "系统提示")
+	executor := newTestLLMExecutor(t, mock, tools, nil, nil, nil, "", "系统提示")
 	ag := NewAgent("agent-1", "code", s, r, executor)
 	ag.processTask(context.Background(), task.ID)
 

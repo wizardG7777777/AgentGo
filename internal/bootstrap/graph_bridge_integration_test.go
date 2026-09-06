@@ -8,6 +8,8 @@ package bootstrap
 // 图收官 + graph_ended 事件落 graph_ 分片）。
 
 import (
+	"agentgo/internal/testagent"
+	"agentgo/internal/testmodel"
 	"context"
 	"io"
 	"os"
@@ -473,7 +475,7 @@ func TestGraphControllerSubmitTaskResultEventEndToEnd(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.ProjectRoot = t.TempDir()
 	cfg.Agents = []config.AgentKind{{Kind: "worker", Replicas: 1}}
-	fake := &planGateScriptedLLM{responses: []llm.Response{{
+	fake := &planGateScriptedLLM{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{{
 			ID:   "controller-submit-1",
 			Name: "submit_task_result",
@@ -486,9 +488,10 @@ func TestGraphControllerSubmitTaskResultEventEndToEnd(t *testing.T) {
 	bundle := scheduler.New(
 		env.tasks, roster.NewMemoryRoster(), fake, nil, cfg,
 		nil, mailbox.NewRegistry(8), nil, nil, nil, nil, nil, nil, nil, nil,
-		io.Discard, io.Discard, nil, env.runtime, env.graphs, nil,
+		io.Discard, io.Discard, nil, env.runtime, env.graphs, nil, scheduler.GraphAuthoringDeps{ContextRuntime: testmodel.Runtime(t)},
 	)
 
+	bundle.SchedulerExec.Inner = testagent.Wrap(bundle.SchedulerExec.Inner)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -576,7 +579,7 @@ func TestGraphControllerStructuredResultRoutesEndToEnd(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.ProjectRoot = t.TempDir()
 	cfg.Agents = []config.AgentKind{{Kind: "worker", Replicas: 1}}
-	fake := &planGateScriptedLLM{responses: []llm.Response{{
+	fake := &planGateScriptedLLM{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{{
 			ID:   "controller-structured-1",
 			Name: "submit_task_result",
@@ -594,9 +597,10 @@ func TestGraphControllerStructuredResultRoutesEndToEnd(t *testing.T) {
 	bundle := scheduler.New(
 		env.tasks, roster.NewMemoryRoster(), fake, nil, cfg,
 		nil, mailbox.NewRegistry(8), nil, nil, nil, nil, nil, nil, nil, nil,
-		io.Discard, io.Discard, nil, env.runtime, env.graphs, nil,
+		io.Discard, io.Discard, nil, env.runtime, env.graphs, nil, scheduler.GraphAuthoringDeps{ContextRuntime: testmodel.Runtime(t)},
 	)
 
+	bundle.SchedulerExec.Inner = testagent.Wrap(bundle.SchedulerExec.Inner)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {

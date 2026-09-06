@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/testmodel"
 	"context"
 	"errors"
 	"strings"
@@ -12,36 +14,36 @@ import (
 
 // mockLLMClient 用于测试的 LLM 客户端 mock。
 type mockLLMClient struct {
-	responses []llm.Response
+	responses []testmodel.Fixture
 	errors    []error
 	callIndex int
 	captured  [][]llm.Message // 记录每次调用收到的消息
 }
 
-func (m *mockLLMClient) Chat(ctx context.Context, messages []llm.Message, tools []llm.ToolDef) (llm.Response, error) {
+func (m *mockLLMClient) nextFixture(ctx context.Context, messages []llm.Message, tools []llm.ToolDef) (testmodel.Fixture, error) {
 	m.captured = append(m.captured, messages)
 	idx := m.callIndex
 	m.callIndex++
 	if idx < len(m.errors) && m.errors[idx] != nil {
-		return llm.Response{}, m.errors[idx]
+		return testmodel.Fixture{}, m.errors[idx]
 	}
 	if idx < len(m.responses) {
 		return m.responses[idx], nil
 	}
-	return llm.Response{Content: "done"}, nil
+	return testmodel.Fixture{Content: "done"}, nil
 }
 
 func TestLLMExecutor_NoToolCalls_Completes(t *testing.T) {
 	mock := &mockLLMClient{
-		responses: []llm.Response{
+		responses: []testmodel.Fixture{
 			{Content: "任务完成", ToolCalls: nil},
 		},
 	}
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "")
+	executor := newTestLLMExecutor(t, mock, tools, nil, nil, nil, "")
 
 	task := &model.Task{Description: "测试任务"}
-	result, err := executor(context.Background(), task, nil, nil)
+	result, err := executor(context.Background(), task, nil, nil, llm.DefaultOutputBudget())
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -56,7 +58,7 @@ func TestLLMExecutor_NoToolCalls_Completes(t *testing.T) {
 
 func TestLLMExecutor_WithToolCalls(t *testing.T) {
 	mock := &mockLLMClient{
-		responses: []llm.Response{
+		responses: []testmodel.Fixture{
 			{
 				Content: "",
 				ToolCalls: []llm.ToolCall{
@@ -71,9 +73,9 @@ func TestLLMExecutor_WithToolCalls(t *testing.T) {
 		return "file content: hello", nil
 	})
 
-	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "")
+	executor := newTestLLMExecutor(t, mock, tools, nil, nil, nil, "")
 	task := &model.Task{Description: "读取文件"}
-	result, err := executor(context.Background(), task, nil, nil)
+	result, err := executor(context.Background(), task, nil, nil, llm.DefaultOutputBudget())
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -99,7 +101,7 @@ func TestLLMExecutor_WithToolCalls(t *testing.T) {
 
 func TestLLMExecutor_ToolError_IncludedInOutput(t *testing.T) {
 	mock := &mockLLMClient{
-		responses: []llm.Response{
+		responses: []testmodel.Fixture{
 			{
 				ToolCalls: []llm.ToolCall{
 					{ID: "call_1", Name: "bad_tool", Arguments: nil},
@@ -113,9 +115,9 @@ func TestLLMExecutor_ToolError_IncludedInOutput(t *testing.T) {
 		return "", errors.New("读取失败")
 	})
 
-	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "")
+	executor := newTestLLMExecutor(t, mock, tools, nil, nil, nil, "")
 	task := &model.Task{Description: "测试"}
-	result, err := executor(context.Background(), task, nil, nil)
+	result, err := executor(context.Background(), task, nil, nil, llm.DefaultOutputBudget())
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -135,9 +137,9 @@ func TestLLMExecutor_RecoverableError(t *testing.T) {
 	}
 
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "")
+	executor := newTestLLMExecutor(t, mock, tools, nil, nil, nil, "")
 	task := &model.Task{Description: "测试"}
-	_, err := executor(context.Background(), task, nil, nil)
+	_, err := executor(context.Background(), task, nil, nil, llm.DefaultOutputBudget())
 
 	var recoverable *ErrRecoverable
 	if !errors.As(err, &recoverable) {
@@ -151,11 +153,13 @@ func TestLLMExecutor_UnrecoverableError(t *testing.T) {
 	}
 
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "")
+	executor := newTestLLMExecutor(t, mock, tools, nil, nil, nil, "")
 	task := &model.Task{Description: "测试"}
-	_, err := executor(context.Background(), task, nil, nil)
+	_, err := executor(context.Background(), task, nil, nil, llm.
 
-	// 不可恢复错误应该不被包装为 ErrRecoverable
+		// 不可恢复错误应该不被包装为 ErrRecoverable
+		DefaultOutputBudget())
+
 	var recoverable *ErrRecoverable
 	if errors.As(err, &recoverable) {
 		t.Error("unrecoverable error should not be wrapped as ErrRecoverable")
@@ -167,24 +171,26 @@ func TestLLMExecutor_UnrecoverableError(t *testing.T) {
 
 func TestLLMExecutor_DependencyResults(t *testing.T) {
 	mock := &mockLLMClient{
-		responses: []llm.Response{{Content: "done"}},
+		responses: []testmodel.Fixture{{Content: "done"}},
 	}
 
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "")
+	executor := newTestLLMExecutor(t, mock, tools, nil, nil, nil, "")
 	task := &model.Task{Description: "汇总任务"}
 	depResults := map[string]string{
 		"task-1": "结果A",
 		"task-2": "结果B",
 	}
 
-	executor(context.Background(), task, depResults, nil)
+	executor(context.Background(), task, depResults, nil, llm.
 
-	// 检查发送给 LLM 的消息中包含依赖结果
+		// 检查发送给 LLM 的消息中包含依赖结果
+		DefaultOutputBudget())
+
 	if len(mock.captured) != 1 {
 		t.Fatalf("captured calls = %d, want 1", len(mock.captured))
 	}
-	msgs := mock.captured[0]
+	msgs := businessTestMessages(mock.captured[0])
 	if len(msgs) == 0 {
 		t.Fatal("no messages sent to LLM")
 	}
@@ -200,13 +206,13 @@ func TestLLMExecutor_DependencyResults(t *testing.T) {
 
 func TestLLMExecutor_HistoryPassedToLLM(t *testing.T) {
 	mock := &mockLLMClient{
-		responses: []llm.Response{{Content: "final"}},
+		responses: []testmodel.Fixture{{Content: "final"}},
 	}
 
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "")
+	executor := newTestLLMExecutor(t, mock, tools, nil, nil, nil, "")
 	task := &model.Task{Description: "多轮任务"}
-	history := []HistoryEntry{
+	history := []contextcontract.HistoryEntry{
 		{
 			Output:           "[read_file] hello\n",
 			ToolCalled:       true,
@@ -214,7 +220,7 @@ func TestLLMExecutor_HistoryPassedToLLM(t *testing.T) {
 			ToolCalls: []llm.ToolCall{
 				{ID: "call_1", Name: "read_file", Arguments: map[string]any{"path": "/tmp/a.txt"}},
 			},
-			ToolResults: []ToolResult{
+			ToolResults: []contextcontract.ToolResult{
 				{ToolCallID: "call_1", Content: "hello"},
 			},
 		},
@@ -225,15 +231,15 @@ func TestLLMExecutor_HistoryPassedToLLM(t *testing.T) {
 			ToolCalls: []llm.ToolCall{
 				{ID: "call_2", Name: "write_file", Arguments: map[string]any{"path": "/tmp/b.txt"}},
 			},
-			ToolResults: []ToolResult{
+			ToolResults: []contextcontract.ToolResult{
 				{ToolCallID: "call_2", Content: "ok"},
 			},
 		},
 	}
 
-	executor(context.Background(), task, nil, history)
+	executor(context.Background(), task, nil, history, llm.DefaultOutputBudget())
 
-	msgs := mock.captured[0]
+	msgs := businessTestMessages(mock.captured[0])
 	// user(1) + [assistant+tool](2) + [assistant+tool](2) = 5 messages
 	if len(msgs) != 5 {
 		t.Errorf("messages count = %d, want 5 (1 user + 2*(assistant+tool))", len(msgs))
@@ -260,15 +266,15 @@ func TestLLMExecutor_HistoryPassedToLLM(t *testing.T) {
 
 func TestLLMExecutor_IncomingMailInjectedAsUserMessage(t *testing.T) {
 	mock := &mockLLMClient{
-		responses: []llm.Response{{Content: "final"}},
+		responses: []testmodel.Fixture{{Content: "final"}},
 	}
 
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "")
+	executor := newTestLLMExecutor(t, mock, tools, nil, nil, nil, "")
 	task := &model.Task{Description: "处理任务"}
-	history := []HistoryEntry{
+	history := []contextcontract.HistoryEntry{
 		{
-			IncomingMail: "<agent-mail>\n[from user @ 12:00:00] 请先补测试\n</agent-mail>",
+			IncomingContextKind: contextcontract.FragmentMailboxMessage, IncomingContextSection: contextcontract.SectionMailbox, IncomingContextAuthority: contextcontract.AuthorityUntrusted, IncomingMail: "<agent-mail>\n[from user @ 12:00:00] 请先补测试\n</agent-mail>",
 		},
 		{
 			Output:           "[read_file] ok\n",
@@ -277,18 +283,18 @@ func TestLLMExecutor_IncomingMailInjectedAsUserMessage(t *testing.T) {
 			ToolCalls: []llm.ToolCall{
 				{ID: "call_1", Name: "read_file", Arguments: map[string]any{"path": "a.go"}},
 			},
-			ToolResults: []ToolResult{
+			ToolResults: []contextcontract.ToolResult{
 				{ToolCallID: "call_1", Content: "ok"},
 			},
 		},
 	}
 
-	_, _ = executor(context.Background(), task, nil, history)
+	_, _ = executor(context.Background(), task, nil, history, llm.DefaultOutputBudget())
 
 	if len(mock.captured) != 1 {
 		t.Fatalf("captured calls = %d, want 1", len(mock.captured))
 	}
-	msgs := mock.captured[0]
+	msgs := businessTestMessages(mock.captured[0])
 
 	// user(task) + user(incoming_mail) + assistant(tool call) + tool(result)
 	if len(msgs) != 4 {
@@ -313,15 +319,15 @@ func TestLLMExecutor_IncomingMailInjectedAsUserMessage(t *testing.T) {
 
 func TestLLMExecutor_SystemPromptInjected(t *testing.T) {
 	mock := &mockLLMClient{
-		responses: []llm.Response{{Content: "done"}},
+		responses: []testmodel.Fixture{{Content: "done"}},
 	}
 
 	tools := NewToolRegistry()
 	sysPrompt := "你是一个执行代理"
-	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "", sysPrompt)
+	executor := newTestLLMExecutor(t, mock, tools, nil, nil, nil, "", sysPrompt)
 
 	task := &model.Task{Description: "测试任务"}
-	executor(context.Background(), task, nil, nil)
+	executor(context.Background(), task, nil, nil, llm.DefaultOutputBudget())
 
 	if len(mock.captured) != 1 {
 		t.Fatalf("captured calls = %d, want 1", len(mock.captured))
@@ -338,34 +344,38 @@ func TestLLMExecutor_SystemPromptInjected(t *testing.T) {
 	if msgs[0].Content != sysPrompt {
 		t.Errorf("msgs[0].Content = %q, want %q", msgs[0].Content, sysPrompt)
 	}
-	// 第二条消息应为 user
-	if msgs[1].Role != "user" {
-		t.Errorf("msgs[1].Role = %q, want %q", msgs[1].Role, "user")
+	found := false
+	for _, m := range msgs {
+		if m.Role == "user" && m.Content == task.Description {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("缺少当前用户任务消息")
 	}
 }
 
-func TestLLMExecutor_NoSystemPrompt_NoSystemMessage(t *testing.T) {
-	mock := &mockLLMClient{
-		responses: []llm.Response{{Content: "done"}},
+func TestLLMExecutor_NoRoleStillIncludesControlInstructions(t *testing.T) {
+	mock := &mockLLMClient{responses: []testmodel.Fixture{{Content: "完成"}}}
+	executor := newTestLLMExecutor(t, mock, NewToolRegistry(), nil, nil, nil, "")
+	_, err := executor(context.Background(), &model.Task{Description: "测试"}, nil, nil, llm.DefaultOutputBudget())
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	tools := NewToolRegistry()
-	// 不传 system prompt（向后兼容）
-	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "")
-
-	task := &model.Task{Description: "测试任务"}
-	executor(context.Background(), task, nil, nil)
-
-	msgs := mock.captured[0]
-	// 第一条消息应直接是 user，不应有 system 消息
-	if msgs[0].Role != "user" {
-		t.Errorf("msgs[0].Role = %q, want %q (no system prompt should be injected)", msgs[0].Role, "user")
+	found := false
+	for _, m := range mock.captured[0] {
+		if m.Role == "system" && strings.Contains(m.Content, "<task-context") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("缺少 L3 控制上下文")
 	}
 }
 
 func TestLLMExecutor_OrderedToolExecution(t *testing.T) {
 	mock := &mockLLMClient{
-		responses: []llm.Response{
+		responses: []testmodel.Fixture{
 			{
 				ToolCalls: []llm.ToolCall{
 					{ID: "call_1", Name: "tool_a", Arguments: map[string]any{"key": "1"}},
@@ -387,9 +397,9 @@ func TestLLMExecutor_OrderedToolExecution(t *testing.T) {
 		return "result_c", nil
 	})
 
-	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "")
+	executor := newTestLLMExecutor(t, mock, tools, nil, nil, nil, "")
 	task := &model.Task{Description: "并行测试"}
-	result, err := executor(context.Background(), task, nil, nil)
+	result, err := executor(context.Background(), task, nil, nil, llm.DefaultOutputBudget())
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -413,7 +423,7 @@ func TestLLMExecutor_OrderedToolExecution(t *testing.T) {
 }
 
 func TestLLMExecutor_RechecksGuardBetweenOrderedTools(t *testing.T) {
-	mock := &mockLLMClient{responses: []llm.Response{{ToolCalls: []llm.ToolCall{
+	mock := &mockLLMClient{responses: []testmodel.Fixture{{ToolCalls: []llm.ToolCall{
 		{ID: "first", Name: "first"},
 		{ID: "second", Name: "second"},
 	}}}}
@@ -428,14 +438,14 @@ func TestLLMExecutor_RechecksGuardBetweenOrderedTools(t *testing.T) {
 		secondExecuted = true
 		return "unexpected", nil
 	})
-	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "")
+	executor := newTestLLMExecutor(t, mock, tools, nil, nil, nil, "")
 	ctx := WithToolDispatchGuard(context.Background(), func(context.Context, *model.Task) error {
 		if !live {
 			return errors.New("任务已迁出 processing，中止本轮工具派发")
 		}
 		return nil
 	})
-	result, err := executor(ctx, &model.Task{ID: "guarded"}, nil, nil)
+	result, err := executor(ctx, &model.Task{ID: "guarded"}, nil, nil, llm.DefaultOutputBudget())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -449,7 +459,7 @@ func TestLLMExecutor_RechecksGuardBetweenOrderedTools(t *testing.T) {
 
 func TestLLMExecutor_UsagePassthrough(t *testing.T) {
 	mock := &mockLLMClient{
-		responses: []llm.Response{
+		responses: []testmodel.Fixture{
 			{
 				Content: "done",
 				Usage:   llm.Usage{PromptTokens: 100, CompletionTokens: 50},
@@ -458,9 +468,9 @@ func TestLLMExecutor_UsagePassthrough(t *testing.T) {
 	}
 
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "")
+	executor := newTestLLMExecutor(t, mock, tools, nil, nil, nil, "")
 	task := &model.Task{Description: "usage test"}
-	result, err := executor(context.Background(), task, nil, nil)
+	result, err := executor(context.Background(), task, nil, nil, llm.DefaultOutputBudget())
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -475,14 +485,14 @@ func TestLLMExecutor_UsagePassthrough(t *testing.T) {
 
 func TestLLMExecutor_TaskSystemPromptOverridesDefault(t *testing.T) {
 	mock := &mockLLMClient{
-		responses: []llm.Response{{Content: "done"}},
+		responses: []testmodel.Fixture{{Content: "done"}},
 	}
 
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "", "默认提示")
+	executor := newTestLLMExecutor(t, mock, tools, nil, nil, nil, "", "默认提示")
 
 	task := &model.Task{Description: "测试任务", SystemPrompt: "任务专用提示"}
-	executor(context.Background(), task, nil, nil)
+	executor(context.Background(), task, nil, nil, llm.DefaultOutputBudget())
 
 	msgs := mock.captured[0]
 	if len(msgs) < 2 {
@@ -498,14 +508,14 @@ func TestLLMExecutor_TaskSystemPromptOverridesDefault(t *testing.T) {
 
 func TestLLMExecutor_TaskEmptySystemPrompt_UsesDefault(t *testing.T) {
 	mock := &mockLLMClient{
-		responses: []llm.Response{{Content: "done"}},
+		responses: []testmodel.Fixture{{Content: "done"}},
 	}
 
 	tools := NewToolRegistry()
-	executor := NewLLMExecutor(mock, tools, nil, nil, nil, "", "默认提示")
+	executor := newTestLLMExecutor(t, mock, tools, nil, nil, nil, "", "默认提示")
 
 	task := &model.Task{Description: "测试任务"}
-	executor(context.Background(), task, nil, nil)
+	executor(context.Background(), task, nil, nil, llm.DefaultOutputBudget())
 
 	msgs := mock.captured[0]
 	if msgs[0].Role != "system" {
@@ -544,12 +554,10 @@ func TestBuildMessagesInjectsTrustedTaskContext(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			messages := buildLegacyMessages("task-specific system prompt", tt.task, nil, nil, "")
+			messages := compileTestMessages(t, "task-specific system prompt", tt.task, nil, nil, "")
 			var userContent string
 			for _, message := range messages {
-				if message.Role == "user" && userContent == "" {
-					userContent = message.Content
-				}
+				userContent += message.Content + "\n"
 				if message.Role == "system" && strings.Contains(message.Content, "动态 Plan 权限边界") {
 					t.Fatalf("不得再注入「动态 Plan 权限边界」system 消息: %+v", message)
 				}
@@ -569,4 +577,26 @@ func TestBuildMessagesInjectsTrustedTaskContext(t *testing.T) {
 			}
 		})
 	}
+}
+
+func (m *mockLLMClient) Invoke(ctx context.Context, request llm.Request, sink llm.EventSink) (llm.Result, error) {
+	if err := request.Validate(); err != nil {
+		return llm.Result{}, err
+	}
+	spec := request.Spec()
+	fixture, err := m.nextFixture(ctx, spec.Messages, spec.Tools)
+	if err != nil {
+		return llm.Result{}, err
+	}
+	return fixture.Seal(spec.Options.Protocol)
+}
+
+func businessTestMessages(in []llm.Message) []llm.Message {
+	var out []llm.Message
+	for _, m := range in {
+		if m.Role != "system" {
+			out = append(out, m)
+		}
+	}
+	return out
 }

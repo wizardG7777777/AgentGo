@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/testmodel"
 	"context"
 	"errors"
 	"testing"
@@ -13,9 +15,9 @@ import (
 	"agentgo/internal/runcontract"
 )
 
-type toolBoundaryLLM struct{ response llm.Response }
+type toolBoundaryLLM struct{ response testmodel.Fixture }
 
-func (f toolBoundaryLLM) Chat(context.Context, []llm.Message, []llm.ToolDef) (llm.Response, error) {
+func (f toolBoundaryLLM) nextFixture(context.Context, []llm.Message, []llm.ToolDef) (testmodel.Fixture, error) {
 	return f.response, nil
 }
 
@@ -56,14 +58,14 @@ func toolBoundaryExecutor(t *testing.T, boundary toolActionBoundary, dispatched 
 				return "ok-" + toolName, nil
 			})
 	}
-	response := llm.Response{ToolCalls: []llm.ToolCall{
+	response := testmodel.Fixture{ToolCalls: []llm.ToolCall{
 		{ID: "call-a", Name: "tool_a", Arguments: map[string]any{}},
 		{ID: "call-b", Name: "tool_b", Arguments: map[string]any{}},
 	}}
-	executor := NewLLMExecutor(toolBoundaryLLM{response: response}, registry, nil, nil, nil, "")
-	return func(ctx context.Context, task *model.Task, deps map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := newTestLLMExecutor(t, toolBoundaryLLM{response: response}, registry, nil, nil, nil, "")
+	return func(ctx context.Context, task *model.Task, deps map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		ctx = withToolActionBoundary(ctx, boundary)
-		return executor(ctx, task, deps, history)
+		return executor(ctx, task, deps, history, llm.DefaultOutputBudget())
 	}
 }
 
@@ -73,7 +75,7 @@ func TestToolActionBoundarySettlesEveryActualDispatch(t *testing.T) {
 	executor := toolBoundaryExecutor(t, boundary, &dispatched)
 	ctx := WithAgentContext(context.Background(), "worker", "task-1", 0)
 	ctx = WithExecutionIdentity(ctx, "run-1", "attempt-1", "attempt-1/turn-1")
-	result, err := executor(ctx, &model.Task{ID: "task-1"}, nil, nil)
+	result, err := executor(ctx, &model.Task{ID: "task-1"}, nil, nil, llm.DefaultOutputBudget())
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -98,7 +100,7 @@ func TestToolActionBoundaryFailureStopsFollowingDispatch(t *testing.T) {
 			executor := toolBoundaryExecutor(t, tc.boundary, &dispatched)
 			ctx := WithAgentContext(context.Background(), "worker", "task-1", 0)
 			ctx = WithExecutionIdentity(ctx, "run-1", "attempt-1", "attempt-1/turn-1")
-			result, err := executor(ctx, &model.Task{ID: "task-1"}, nil, nil)
+			result, err := executor(ctx, &model.Task{ID: "task-1"}, nil, nil, llm.DefaultOutputBudget())
 			var authorityErr *loopAuthorityError
 			if !errors.As(err, &authorityErr) {
 				t.Fatalf("应返回 loopAuthorityError，实际 %v", err)
@@ -176,14 +178,14 @@ func TestMayHaveHappenedEffectAuthorityStopsFollowingToolInSameResponse(t *testi
 			dispatched++
 			return "unexpected", nil
 		})
-	executor := NewLLMExecutor(toolBoundaryLLM{response: llm.Response{ToolCalls: []llm.ToolCall{
+	executor := newTestLLMExecutor(t, toolBoundaryLLM{response: testmodel.Fixture{ToolCalls: []llm.ToolCall{
 		{ID: "call-a", Name: "tool_a", Arguments: map[string]any{}},
 		{ID: "call-b", Name: "tool_b", Arguments: map[string]any{}},
 	}}}, registry, nil, nil, nil, "")
 	ctx := WithAgentContext(context.Background(), "worker", "task-1", 0)
 	ctx = WithExecutionIdentity(ctx, "run-1", "attempt-1", "attempt-1/turn-1")
 	ctx = withToolActionBoundary(ctx, boundary)
-	result, err := executor(ctx, &model.Task{ID: "task-1", AttemptID: "attempt-1"}, nil, nil)
+	result, err := executor(ctx, &model.Task{ID: "task-1", AttemptID: "attempt-1"}, nil, nil, llm.DefaultOutputBudget())
 	var loopErr *loopAuthorityError
 	if !errors.As(err, &loopErr) || !errors.Is(err, effect.ErrAuthorityUnavailable) {
 		t.Fatalf("应以 L4 controlErr 上抛 Effect authority error: %v", err)
@@ -196,4 +198,16 @@ func TestMayHaveHappenedEffectAuthorityStopsFollowingToolInSameResponse(t *testi
 		t.Fatalf("ActionUnknown 必须先 durable 再停止: reservations=%+v settlements=%+v",
 			store.reservations, store.settlements)
 	}
+}
+
+func (f toolBoundaryLLM) Invoke(ctx context.Context, request llm.Request, sink llm.EventSink) (llm.Result, error) {
+	if err := request.Validate(); err != nil {
+		return llm.Result{}, err
+	}
+	spec := request.Spec()
+	fixture, err := f.nextFixture(ctx, spec.Messages, spec.Tools)
+	if err != nil {
+		return llm.Result{}, err
+	}
+	return fixture.Seal(spec.Options.Protocol)
 }

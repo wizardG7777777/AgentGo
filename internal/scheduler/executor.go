@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"agentgo/internal/llm"
 	"context"
 	"fmt"
 	"log"
@@ -18,24 +19,7 @@ import (
 	"agentgo/internal/store"
 )
 
-// SchedulerExecutor 是包装 agent.NewLLMExecutor 的 TaskExecutor。
-//
-// 在调用底层 LLM Execute 之前，做两件 scheduler 专属的事：
-//
-//  1. **等待 batch 完成**：检查 task.SchedulerBatch 中是否还有非终态任务。
-//     有则进入 select 等待，直到所有 batch 任务进入终态（completed/failed/cancelled）
-//     或 BatchUpdateCh 信号到达或 WaitTimeout 兜底。这是 D1 决策的实现。
-//
-//  2. **注入 board snapshot**：往 history 末尾追加一个 IncomingMail 类型的
-//     HistoryEntry，内容是 BuildBoardJSON 生成的 JSON。LLM 在每轮 reactLoop
-//     都能看到当前任务板的最新状态，与 worker 通过 mailbox 收消息的机制对称。
-//
-// 之所以不在 agent.Agent 内部实现这些，是因为 worker / explorer 不需要等待
-// batch、也不需要 board snapshot。SchedulerExecutor 通过 wrapper 把这些
-// scheduler 专属逻辑隔离在 scheduler 包里，agent.Agent 保持通用。
 type SchedulerExecutor struct {
-	// Inner 是底层的 LLM TaskExecutor，通常由 agent.NewLLMExecutor 构造。
-	// SchedulerExecutor 在等待 batch + 注入 snapshot 后调用它。
 	Inner agent.TaskExecutor
 
 	// Store 用于读 task.SchedulerBatch + 检查每个子任务的状态。
@@ -116,7 +100,8 @@ func (e *SchedulerExecutor) Execute(
 	ctx context.Context,
 	task *model.Task,
 	depResults map[string]string,
-	history []agent.HistoryEntry,
+	history []contextcontract.HistoryEntry,
+ actionBudget llm.OutputBudget,
 ) (agent.ExecuteResult, error) {
 	// 按 task 隔离状态：新任务开始时重置 progressReported
 	if e.lastTaskID != task.ID {
@@ -220,9 +205,9 @@ func (e *SchedulerExecutor) Execute(
 	})
 
 	// 注入为 IncomingMail 风格的 history entry，与 mailbox 注入对称
-	historyWithSnap := make([]agent.HistoryEntry, 0, len(history)+1)
+	historyWithSnap := make([]contextcontract.HistoryEntry, 0, len(history)+1)
 	historyWithSnap = append(historyWithSnap, history...)
-	historyWithSnap = append(historyWithSnap, agent.HistoryEntry{
+	historyWithSnap = append(historyWithSnap, contextcontract.HistoryEntry{
 		IncomingMail:             snapshot,
 		IncomingContextKind:      contextcontract.FragmentRuntimeSnapshot,
 		IncomingContextSection:   contextcontract.SectionRuntimeControl,
@@ -237,7 +222,7 @@ func (e *SchedulerExecutor) Execute(
 	innerCtx := agent.WithToolDispatchGuard(ctx, func(dispatchCtx context.Context, guardedTask *model.Task) error {
 		return e.requireToolDispatch(dispatchCtx, guardedTask)
 	})
-	result, err := e.Inner(innerCtx, task, depResults, historyWithSnap)
+	result, err := e.Inner(innerCtx, task, depResults, historyWithSnap, actionBudget)
 	if err != nil {
 		return result, err
 	}

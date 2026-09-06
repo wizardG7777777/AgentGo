@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"context"
 	"sync"
 	"testing"
@@ -102,7 +104,7 @@ func TestProcessTask_NoTokenStatsTraceEvent(t *testing.T) {
 		t.Fatalf("ClaimTask: %v", err)
 	}
 
-	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "done", ToolCalled: false, PromptTokens: 100, CompletionTokens: 10}, nil
 	}
 	ag := NewAgent("agent-1", "code", s, r, executor)
@@ -137,7 +139,7 @@ func TestProcessTask_NoHistoryTruncatedTraceEvent(t *testing.T) {
 		t.Fatalf("ClaimTask: %v", err)
 	}
 
-	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "done", ToolCalled: false, PromptTokens: 100, CompletionTokens: 10}, nil
 	}
 	ag := NewAgent("agent-1", "code", s, r, executor)

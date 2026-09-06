@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -52,18 +53,18 @@ func TestRecoveryDeltaV3ForcesReadMutationAndCheckStages(t *testing.T) {
 	assertRecoveryGate(t, deriveInvocationToolPolicyWithControl(task, nil, registry, registry),
 		"agent:recovery-first-action", "read_file", "path", "src/flask/ctx.py")
 
-	history := []HistoryEntry{{
+	history := []contextcontract.HistoryEntry{{
 		ToolCalls:   []llm.ToolCall{{ID: "read", Name: "read_file", Arguments: map[string]any{"path": "src/flask/ctx.py"}}},
-		ToolResults: []ToolResult{{ToolCallID: "read", Content: "file content"}},
+		ToolResults: []contextcontract.ToolResult{{ToolCallID: "read", Content: "file content"}},
 	}}
 	assertRecoveryGate(t, deriveInvocationToolPolicyWithControl(task, history, registry, registry),
 		"agent:recovery-mutation", "edit_file", "path", "src/flask/ctx.py")
 
-	history = append(history, HistoryEntry{
+	history = append(history, contextcontract.HistoryEntry{
 		ToolCalls: []llm.ToolCall{{ID: "edit", Name: "edit_file", Arguments: map[string]any{
 			"path": "src/flask/ctx.py", "old_str": "old", "new_str": "new",
 		}}},
-		ToolResults: []ToolResult{{ToolCallID: "edit", Content: "编辑成功"}},
+		ToolResults: []contextcontract.ToolResult{{ToolCallID: "edit", Content: "编辑成功"}},
 	})
 	assertRecoveryGate(t, deriveInvocationToolPolicyWithControl(task, history, registry, registry),
 		"agent:recovery-check", "run_check", "check_id", "targeted")
@@ -72,11 +73,11 @@ func TestRecoveryDeltaV3ForcesReadMutationAndCheckStages(t *testing.T) {
 	assertRecoveryGate(t, checkPolicy, "agent:recovery-check", "run_check", "command",
 		"uv run --no-sync python -m pytest -q 'tests/test_reqctx.py' 'tests/test_subclassing.py'")
 
-	history = append(history, HistoryEntry{
+	history = append(history, contextcontract.HistoryEntry{
 		ToolCalls: []llm.ToolCall{{ID: "check", Name: "run_check", Arguments: map[string]any{
 			"check_id": "targeted", "kind": "test", "command": "uv run --no-sync python -m pytest -q 'tests/test_reqctx.py' 'tests/test_subclassing.py'",
 		}}},
-		ToolResults: []ToolResult{{ToolCallID: "check", Content: `{"check_id":"targeted","status":"failed"}`}},
+		ToolResults: []contextcontract.ToolResult{{ToolCallID: "check", Content: `{"check_id":"targeted","status":"failed"}`}},
 	})
 	policy := deriveInvocationToolPolicyWithControl(task, history, registry, registry)
 	if stringsHasRecoveryPhase(policy.Phase) || !containsToolName(policy.Registry.Names(), "grep_search") {
@@ -127,7 +128,7 @@ func TestRecoveryDeltaV4CompletesEvidenceBeforeTypedEditDecision(t *testing.T) {
 	assertRecoveryGate(t, policy, "agent:recovery-evidence", "read_file", "path", "src/a.py")
 	assertRecoveryGate(t, policy, "agent:recovery-evidence", "read_file", "offset", 1)
 
-	history := []HistoryEntry{toolHistory("read-a", "read_file", map[string]any{
+	history := []contextcontract.HistoryEntry{toolHistory("read-a", "read_file", map[string]any{
 		"path": "src/a.py", "offset": 1, "limit": recoveryEvidenceReadLines,
 	}, "[file] src/a.py (2 lines, full)\n[hash] a\n---\na\nb")}
 	policy = deriveInvocationToolPolicyWithControl(task, history, registry, registry)
@@ -210,7 +211,7 @@ func TestRecoveryDeltaV5ResumeCandidateRequiresTypedCheck(t *testing.T) {
 			CheckID: "targeted", Kind: "test", ExactCommand: "pytest -q tests/test_a.py",
 		}}},
 	}
-	history := []HistoryEntry{toolHistory("read-a", "read_file", map[string]any{
+	history := []contextcontract.HistoryEntry{toolHistory("read-a", "read_file", map[string]any{
 		"path": "src/a.py", "offset": 1, "limit": recoveryV5FocusLines, "force_full": true,
 	}, "[file] src/a.py (lines 1-240 of 1500)\n[hash] a\n---\na")}
 	policy := deriveInvocationToolPolicyWithControl(task, history, registry, registry)
@@ -248,7 +249,7 @@ func TestRecoveryDeltaV5CompletionBudgetIsStageBounded(t *testing.T) {
 	if got := recoveryV5CompletionLimit(recoveryStageMutation, nil); got != 4096 {
 		t.Fatalf("v5 mutation completion=%d", got)
 	}
-	retry := []HistoryEntry{{SystemNotice: "[same-snapshot-retry 1/2] output truncated"}}
+	retry := []contextcontract.HistoryEntry{{SystemNotice: "[same-snapshot-retry 1/2] output truncated"}}
 	if got := recoveryV5CompletionLimit(recoveryStageDecision, retry); got != 8192 {
 		t.Fatalf("v5 decision correction completion=%d", got)
 	}
@@ -275,7 +276,7 @@ func TestRecoveryDeltaV4FailedEvidenceReadCanOnlyExitSafely(t *testing.T) {
 		ContextInputs: []model.TaskContextInput{recoveryDirectiveContextInputV4(
 			"recovery@1", []string{"src/missing.py"})},
 	}
-	history := []HistoryEntry{toolHistory("read-missing", "read_file", map[string]any{
+	history := []contextcontract.HistoryEntry{toolHistory("read-missing", "read_file", map[string]any{
 		"path": "src/missing.py", "offset": 1, "limit": recoveryEvidenceReadLines,
 	}, "错误: 读取文件失败: file does not exist")}
 	policy := deriveInvocationToolPolicyWithControl(task, history, registry, registry)
@@ -293,7 +294,7 @@ func TestRecoveryDeltaV4FailedEvidenceReadCanOnlyExitSafely(t *testing.T) {
 	}
 
 	envelope := `{"schema":"agentgo.tool-result-ref/v1","ref_id":"content:missing","sha256":"digest-missing","preview_head":"[file] src/missing.py (lines 1-80 of 100)\n---\nhead","preview_tail":"tail"}`
-	contentHistory := []HistoryEntry{
+	contentHistory := []contextcontract.HistoryEntry{
 		toolHistory("read-ref", "read_file", map[string]any{
 			"path": "src/missing.py", "offset": 1, "limit": recoveryEvidenceReadLines,
 		}, envelope),
@@ -318,7 +319,7 @@ func TestRecoveryDeltaV4IgnoresSkippedFanoutWhenAdvancingEvidence(t *testing.T) 
 		ContextInputs: []model.TaskContextInput{recoveryDirectiveContextInputV4(
 			"recovery@1", []string{"src/flask/app.py"})},
 	}
-	history := []HistoryEntry{
+	history := []contextcontract.HistoryEntry{
 		toolHistory("read-1", "read_file", map[string]any{
 			"path": "src/flask/app.py", "offset": 1, "limit": recoveryEvidenceReadLines,
 		}, "[file] src/flask/app.py (lines 1-160 of 500)\n[hash] file\n---\npage-1"),
@@ -335,7 +336,7 @@ func TestRecoveryDeltaV4IgnoresSkippedFanoutWhenAdvancingEvidence(t *testing.T) 
 					"path": "src/flask/app.py", "offset": 481, "limit": recoveryEvidenceReadLines,
 				}},
 			},
-			ToolResults: []ToolResult{
+			ToolResults: []contextcontract.ToolResult{
 				{ToolCallID: "read-2", Content: "[file] src/flask/app.py (lines 161-320 of 500)\n[hash] file\n---\npage-2"},
 				{ToolCallID: "skipped-3", Content: "已跳过：当前机械阶段只执行 provider 顺序中的首个工具调用"},
 				{ToolCallID: "skipped-4", Content: "已跳过：当前机械阶段只执行 provider 顺序中的首个工具调用"},
@@ -466,10 +467,10 @@ func recoveryDirectiveContextInputV5(sourceActivation string, evidenceFiles, dir
 		Content: `<upstream-result authority="graph-dataflow">` + string(encoded) + `</upstream-result>`}
 }
 
-func toolHistory(id, name string, arguments map[string]any, result string) HistoryEntry {
-	return HistoryEntry{ToolCalled: true,
+func toolHistory(id, name string, arguments map[string]any, result string) contextcontract.HistoryEntry {
+	return contextcontract.HistoryEntry{ToolCalled: true,
 		ToolCalls:   []llm.ToolCall{{ID: id, Name: name, Arguments: arguments}},
-		ToolResults: []ToolResult{{ToolCallID: id, Content: result}},
+		ToolResults: []contextcontract.ToolResult{{ToolCallID: id, Content: result}},
 	}
 }
 

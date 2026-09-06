@@ -12,6 +12,8 @@ package agent
 //   - 无 Isolation 任务零影响；失败路径不 merge 不 Cleanup。
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"context"
 	"errors"
 	"os"
@@ -94,7 +96,7 @@ func TestProcessTask_IsolationNaturalCompletionMergesAndCleansUp(t *testing.T) {
 	target := filepath.Join(mainRoot, "out.txt")
 
 	var ag *Agent
-	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		// 执行期：视图已换入。
 		view := swapper.ActiveView()
 		if view == nil {
@@ -173,7 +175,7 @@ func TestProcessTask_IsolationShortCircuitMergesBeforeComplete(t *testing.T) {
 
 	holder := NewFinalizationHolder()
 	execCalls := 0
-	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		execCalls++
 		wsPath, err := swapper.WritePath(target)
 		if err != nil {
@@ -233,7 +235,7 @@ func TestProcessTask_IsolationMergeConflictFailsAndPublishesReplanWake(t *testin
 	const agentID = "agent-iso"
 	taskID := publishIsolationTask(t, s, agentID)
 
-	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "done"}, nil
 	}
 	ag := NewAgent(agentID, "code", s, r, exec)
@@ -309,7 +311,7 @@ func TestProcessTask_IsolationMergeConflictGraphTaskSkipsReplanWake(t *testing.T
 		t.Fatalf("ClaimTask: %v", err)
 	}
 
-	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		// Finalized 模拟 submit_task_result 已被接受（SWE-001 起图节点纯文本
 		// 退出被拒），使流程抵达合并点。
 		return ExecuteResult{Output: "done", Finalized: true}, nil
@@ -347,7 +349,7 @@ func TestProcessTask_IsolationMergeErrorFailsAndPublishesReplanWake(t *testing.T
 	const agentID = "agent-iso"
 	taskID := publishIsolationTask(t, s, agentID)
 
-	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "done"}, nil
 	}
 	ag := NewAgent(agentID, "code", s, r, exec)
@@ -395,7 +397,7 @@ func TestProcessTask_IsolationFailClosedUnknownMode(t *testing.T) {
 	}
 
 	execCalls := 0
-	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		execCalls++
 		return ExecuteResult{Output: "done"}, nil
 	}
@@ -430,7 +432,7 @@ func TestProcessTask_IsolationFailClosedUnassembled(t *testing.T) {
 	taskID := publishIsolationTask(t, s, agentID)
 
 	execCalls := 0
-	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		execCalls++
 		return ExecuteResult{Output: "done"}, nil
 	}
@@ -470,7 +472,7 @@ func TestProcessTask_NoIsolationZeroOverhead(t *testing.T) {
 		t.Fatalf("ClaimTask: %v", err)
 	}
 
-	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		if swapper.ActiveView() != nil {
 			t.Error("无 Isolation 任务执行期不应有活动视图")
 		}
@@ -507,7 +509,7 @@ func TestProcessTask_IsolationFailureSkipsMergeAndCleanup(t *testing.T) {
 	const agentID = "agent-iso"
 	taskID := publishIsolationTask(t, s, agentID)
 
-	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{}, errors.New("unrecoverable boom")
 	}
 	ag := NewAgent(agentID, "code", s, r, exec)

@@ -548,8 +548,7 @@ func graphTaskDescription(spec graph.TaskSpec) string {
 }
 
 // graphTaskContextInputs 把每个冻结 InputBinding 拆成独立 Result/Evidence 数据
-// 端口。每个端口都有稳定 source_ref；L2 可以分别外置、预算和审计，L1 Prompt
-// 不再承担数据搬运。
+// 端口。每个端口都有稳定 source_ref，交给 L2 分别进行外置、预算和审计。
 func graphTaskContextInputs(spec graph.TaskSpec) []model.TaskContextInput {
 	inputs := make([]model.TaskContextInput, 0, len(spec.Inputs)*2)
 	for _, input := range spec.Inputs {

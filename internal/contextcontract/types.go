@@ -3,8 +3,8 @@ package contextcontract
 import "time"
 
 const (
-	// SnapshotSchemaV1 是新 Context Snapshot 的唯一 live schema。
-	SnapshotSchemaV1 = "agentgo.context/v1"
+	// SnapshotSchemaV2 是新 Context Snapshot 的唯一 live schema。
+	SnapshotSchemaV2 = "agentgo.context/v2"
 	// PolicySchemaV1 标识 Context budget policy 的序列化版本。
 	PolicySchemaV1 = "agentgo.context-policy/v1"
 	// ProviderReplaySchemaV1 标识 provider replay policy 的序列化版本。
@@ -150,7 +150,7 @@ type ContextSnapshot struct {
 	Schema               string `json:"schema"`
 	AttemptID            string `json:"attempt_id"`
 	InvocationID         string `json:"invocation_id"`
-	PromptBuildRef       string `json:"prompt_build_ref"`
+	InstructionRef       string `json:"instruction_ref"`
 	ContextPolicyID      string `json:"context_policy_id"`
 	ContextPolicyDigest  string `json:"context_policy_digest"`
 	ProviderReplayRef    string `json:"provider_replay_ref"`

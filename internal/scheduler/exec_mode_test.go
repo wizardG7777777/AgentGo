@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"agentgo/internal/testmodel"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,7 +19,7 @@ import (
 // newExecModeTestBundle 与 newSoloTestBundle 同形态，但允许指定 ProjectRoot，
 // 供 exec 轴装配断言（strict 写工具审批 / run_shell 短路）使用。
 // interactions 为 nil：strict 下写工具与 run_shell 的审批路径应 fail-closed。
-func newExecModeTestBundle(t *testing.T, modeStore *modes.Store, projectRoot string, mockLLM llm.Client) (*Bundle, *store.MemoryTaskStore, *model.Task) {
+func newExecModeTestBundle(t *testing.T, modeStore *modes.Store, projectRoot string, mockLLM llm.Invoker) (*Bundle, *store.MemoryTaskStore, *model.Task) {
 	t.Helper()
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
@@ -28,7 +29,7 @@ func newExecModeTestBundle(t *testing.T, modeStore *modes.Store, projectRoot str
 	cfg.Agents = []config.AgentKind{{Kind: "worker", Replicas: 1}}
 	cfg.ProjectRoot = projectRoot
 
-	bundle := New(s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
+	bundle := newTestScheduler(t, s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
 		nil, nil, nil, nil, nil, modeStore, nil, nil, nil)
 
 	task := &model.Task{Description: "exec 模式装配测试任务", EventType: "__scheduler__"}
@@ -49,7 +50,7 @@ func newExecModeTestBundle(t *testing.T, modeStore *modes.Store, projectRoot str
 func TestSchedulerStrictWriteFileFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "a.txt")
-	mockLLM := &scriptedLLM{responses: []llm.Response{{
+	mockLLM := &scriptedLLM{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{{
 			ID:        "call_1",
 			Name:      "write_file",
@@ -71,7 +72,7 @@ func TestSchedulerStrictWriteFileFailsClosed(t *testing.T) {
 // 装配断言：exec=strict 时 scheduler 的 run_shell 对普通命令也进入审批链路
 // （ShellGroup.Modes 已接线）；Interaction 服务缺失时 fail-closed。
 func TestSchedulerStrictRunShellFailsClosed(t *testing.T) {
-	mockLLM := &scriptedLLM{responses: []llm.Response{{
+	mockLLM := &scriptedLLM{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{{
 			ID:        "call_1",
 			Name:      "run_shell",
@@ -91,7 +92,7 @@ func TestSchedulerStrictRunShellFailsClosed(t *testing.T) {
 func TestSchedulerNormalWriteFilePassthrough(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "ok.txt")
-	mockLLM := &scriptedLLM{responses: []llm.Response{{
+	mockLLM := &scriptedLLM{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{{
 			ID:        "call_1",
 			Name:      "write_file",
@@ -116,7 +117,7 @@ func TestSchedulerNormalWriteFilePassthrough(t *testing.T) {
 func TestSchedulerNilModesWriteFilePassthrough(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "nil-modes.txt")
-	mockLLM := &scriptedLLM{responses: []llm.Response{{
+	mockLLM := &scriptedLLM{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{{
 			ID:        "call_1",
 			Name:      "write_file",

@@ -9,23 +9,18 @@ import (
 )
 
 const (
-	ContextDefaultV1  = "context:default/v1"
-	ContextDefaultV2  = "context:default/v2"
-	ContextDefaultV3  = "context:default/v3"
-	ContextDefaultV4  = "context:default/v4"
-	ContextDefaultV5  = "context:default/v5"
-	ContextDefaultV6  = "context:default/v6"
-	ContextDefaultV7  = "context:default/v7"
-	ContextDefaultV8  = "context:default/v8"
-	ContextDefaultV9  = "context:default/v9"
-	ContextDefaultV10 = "context:default/v10"
-	// ContextDefaultCurrent 是所有新 Run/Invocation 的 framework 默认引用。
-	// 历史任务必须继续使用其已冻结的具体版本，禁止在恢复时把 v1 偷换为该别名。
-	ContextDefaultCurrent    = ContextDefaultV10
-	ReplayOpenAICompatibleV1 = "provider-replay:openai-compatible/v1"
-	ReplayOpenAICompatibleV2 = "provider-replay:openai-compatible/v2"
-	ReplayOpenAICompatibleV3 = "provider-replay:openai-compatible/v3"
-	ReplayOpenAICompatibleV4 = "provider-replay:openai-compatible/v4"
+	OutputReplayMaxEvents         = 4096
+	OutputReplayMaxBytes          = 8 << 20
+	OutputRecentRecords           = 128
+	OutputDefaultSubscriberBuffer = 256
+	DependencyMemoryPerTaskRunes  = 800
+	DependencyMemoryTotalRunes    = 2400
+	SessionMemoryRecallEntries    = 8
+	SessionMemoryRecallRunes      = 1200
+	HistoryProjectionKeepRecent   = 3
+	HistoryProjectionSummaryRunes = 8 << 10
+	ContextDefaultCurrent         = "context:default/v11"
+	ReplayOpenAICompatibleCurrent = "provider-replay:openai-compatible/v5"
 
 	ProgressCodeChangeV1 = "progress:code-change/v1"
 	ProgressCodeChangeV2 = "progress:code-change/v2"

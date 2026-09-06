@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/testmodel"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,7 +12,6 @@ import (
 	"time"
 
 	"agentgo/internal/fulfillment"
-	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/loopstore"
@@ -24,12 +25,12 @@ import (
 
 type sequenceLoopLLM struct{ calls int }
 
-func (s *sequenceLoopLLM) Chat(context.Context, []llm.Message, []llm.ToolDef) (llm.Response, error) {
+func (s *sequenceLoopLLM) nextFixture(context.Context, []llm.Message, []llm.ToolDef) (testmodel.Fixture, error) {
 	s.calls++
 	if s.calls == 1 {
-		return llm.Response{ToolCalls: []llm.ToolCall{{ID: "call-1", Name: "test_tool", Arguments: map[string]any{}}}}, nil
+		return testmodel.Fixture{ToolCalls: []llm.ToolCall{{ID: "call-1", Name: "test_tool", Arguments: map[string]any{}}}}, nil
 	}
-	return llm.Response{Content: "done"}, nil
+	return testmodel.Fixture{Content: "done"}, nil
 }
 
 func enforcementTask(t *testing.T) *model.Task {
@@ -56,7 +57,7 @@ func enforcementTask(t *testing.T) *model.Task {
 	}
 	return &model.Task{
 		RunID: run.RunID, RunContract: run, ProgressContract: &contract,
-		ContextPolicyRef: policycatalog.ContextDefaultV1,
+		ContextPolicyRef: policycatalog.ContextDefaultCurrent,
 		Description:      "测试 L4 enforcement", EventType: "code", MaxConcurrency: 1,
 	}
 }
@@ -77,7 +78,7 @@ func TestProcessTaskBlocksWhenNoProgressBudgetExhausted(t *testing.T) {
 	t.Cleanup(func() { _ = progressStore.Close() })
 	var calls atomic.Int32
 	agent := NewAgent("worker-l4", "code", taskStore, roster.NewMemoryRoster(),
-		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+		func(context.Context, *model.Task, map[string]string, []contextcontract.HistoryEntry, llm.OutputBudget) (ExecuteResult, error) {
 			calls.Add(1)
 			return ExecuteResult{InvocationID: "inv-1", ProviderCallStarted: true, Output: "仍在考虑", ToolCalled: true}, nil
 		})
@@ -131,7 +132,7 @@ func TestFinalizingDominatesL4AttemptRollover(t *testing.T) {
 	holder.Set(task.ID)
 	var calls atomic.Int32
 	agent := NewAgent("worker-finalizing", "code", taskStore, roster.NewMemoryRoster(),
-		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+		func(context.Context, *model.Task, map[string]string, []contextcontract.HistoryEntry, llm.OutputBudget) (ExecuteResult, error) {
 			calls.Add(1)
 			holder.MarkTaskFinalized()
 			return ExecuteResult{InvocationID: "inv-finalizing", ProviderCallStarted: true,
@@ -163,7 +164,7 @@ func TestProjectExecuteResultDoesNotTreatPipelineTailExitAsEvaluationPass(t *tes
 			ID: "pipeline-call", Name: "run_shell",
 			Arguments: map[string]any{"command": "pytest -q 2>&1 | tail -20", "accept_last_pipeline_exit_code": true},
 		}},
-		ToolResults: []ToolResult{{
+		ToolResults: []contextcontract.ToolResult{{
 			ToolCallID: "pipeline-call",
 			Content:    "exit_code: 0\nexit_code_scope: last_pipeline_command\nstdout+stderr:\n1 failed, 492 passed",
 		}},
@@ -189,7 +190,7 @@ func TestCodeChangeV6TreatsPreMutationCheckAsKnowledgeOnly(t *testing.T) {
 			"status": "pass", "workspace_revision_ref": workspaceRef})
 		projectExecuteResult(agent, task, ExecuteResult{
 			ToolCalls:   []llm.ToolCall{{ID: "check-call", Name: "run_check"}},
-			ToolResults: []ToolResult{{ToolCallID: "check-call", Content: string(receipt)}},
+			ToolResults: []contextcontract.ToolResult{{ToolCallID: "check-call", Content: string(receipt)}},
 		}, &delta)
 		return delta
 	}
@@ -235,7 +236,7 @@ func TestProcessTaskInterventionEndsOnlyCurrentGraphActivationWithTypedCommand(t
 	}
 	t.Cleanup(func() { _ = progressStore.Close() })
 	agent := NewAgent("worker-intervention", "code", taskStore, roster.NewMemoryRoster(),
-		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+		func(context.Context, *model.Task, map[string]string, []contextcontract.HistoryEntry, llm.OutputBudget) (ExecuteResult, error) {
 			return ExecuteResult{InvocationID: "inv-intervention", Output: "继续调查", ToolCalled: true}, nil
 		})
 	agent.LoopStore = progressStore
@@ -332,7 +333,7 @@ func TestProcessTaskTimeHandoffWithExistingObservationStopsImmediately(t *testin
 	}
 	var calls atomic.Int32
 	agent := NewAgent("worker-handoff", "code", taskStore, roster.NewMemoryRoster(),
-		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+		func(context.Context, *model.Task, map[string]string, []contextcontract.HistoryEntry, llm.OutputBudget) (ExecuteResult, error) {
 			calls.Add(1)
 			return ExecuteResult{InvocationID: "inv-handoff", ProviderCallStarted: true,
 				Output: "继续只读调查", ToolCalled: true}, nil
@@ -376,9 +377,9 @@ func TestUnknownInvocationRequestsTypedL5Intervention(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = progressStore.Close() })
 	agent := NewAgent("worker-unknown", "code", taskStore, roster.NewMemoryRoster(),
-		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
-			failure := invocation.NewFailure(invocation.FailureUnknown,
-				invocation.PhaseResponseHeaders, invocation.OriginProvider, errors.New("future provider failure"))
+		func(context.Context, *model.Task, map[string]string, []contextcontract.HistoryEntry, llm.OutputBudget) (ExecuteResult, error) {
+			failure := llm.NewFailure(llm.FailureUnknown,
+				llm.PhaseResponseHeaders, llm.OriginProvider, errors.New("future provider failure"))
 			return ExecuteResult{InvocationID: "inv-unknown", ProviderCallStarted: true}, failure
 		})
 	agent.LoopStore = progressStore
@@ -418,7 +419,7 @@ func TestCallerCancellationWinsOverNoProgressBlock(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = progressStore.Close() })
 	agent := NewAgent("worker-cancel", "code", taskStore, roster.NewMemoryRoster(),
-		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+		func(context.Context, *model.Task, map[string]string, []contextcontract.HistoryEntry, llm.OutputBudget) (ExecuteResult, error) {
 			if err := store.TransitionStateWithCancelSource(taskStore, task.ID,
 				model.TaskStatusProcessing, model.TaskStatusCancelled, "user"); err != nil {
 				t.Fatalf("取消 Task: %v", err)
@@ -444,11 +445,20 @@ func TestCallerCancellationWinsOverNoProgressBlock(t *testing.T) {
 func TestLoopReminderIsSystemContextNotUserMessage(t *testing.T) {
 	task := &model.Task{ID: "task-reminder", Description: "完成目标"}
 	notice := "<loop-reminder source=\"control-plane\">请停止重复读取</loop-reminder>"
-	messages := buildLegacyMessages("", task, nil, []HistoryEntry{{SystemNotice: notice}}, "")
-	if len(messages) != 2 || messages[0].Role != "user" || messages[1].Role != "system" ||
-		messages[1].Content != notice {
-		t.Fatalf("Loop reminder 角色错误，不得伪造 user message: %+v", messages)
+	messages := compileTestMessages(t, "", task, nil, []contextcontract.HistoryEntry{{SystemNotice: notice}}, "")
+	found := false
+	for _, m := range messages {
+		if m.Content == notice {
+			if m.Role != "system" {
+				t.Fatal("Loop reminder 被伪装为 user")
+			}
+			found = true
+		}
 	}
+	if !found {
+		t.Fatal("Loop reminder 丢失")
+	}
+
 }
 
 func TestProgressPolicyReminderRolloverThenTypedIntervention(t *testing.T) {
@@ -712,7 +722,7 @@ func TestFrameworkAttemptRolloverPersistsReminderAndProgressState(t *testing.T) 
 	t.Cleanup(func() { _ = progressStore.Close() })
 	var calls atomic.Int32
 	agent := NewAgent("worker-rollover", "code", taskStore, roster.NewMemoryRoster(),
-		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+		func(context.Context, *model.Task, map[string]string, []contextcontract.HistoryEntry, llm.OutputBudget) (ExecuteResult, error) {
 			calls.Add(1)
 			return ExecuteResult{InvocationID: "inv-rollover", Output: "继续调查", ToolCalled: true}, nil
 		})
@@ -726,8 +736,8 @@ func TestFrameworkAttemptRolloverPersistsReminderAndProgressState(t *testing.T) 
 	if rolled.Status != model.TaskStatusPending || rolled.RetryCount != 1 || calls.Load() != 2 {
 		t.Fatalf("框架未执行 RetryRollback rollover: task=%+v calls=%d", rolled, calls.Load())
 	}
-	var history []HistoryEntry
-	if err := json.Unmarshal(rolled.LastHistory, &history); err != nil {
+	var history []contextcontract.HistoryEntry
+	if err := decodeTestHistory(rolled.LastHistory, &history); err != nil {
 		t.Fatalf("解析 rollover history: %v", err)
 	}
 	foundReminder := false
@@ -834,8 +844,8 @@ func TestRecoverableFailureRejectsFutureAttemptBeforeRetryRollback(t *testing.T)
 		t.Fatalf("最后一个合法 Attempt 应能启动: %v", err)
 	}
 
-	failure := invocation.NewFailure(invocation.FailureOutputLimitExceeded,
-		invocation.PhaseResponseValidate, invocation.OriginRuntime, context.Canceled)
+	failure := llm.NewFailure(llm.FailureOutputLimitExceeded,
+		llm.PhaseResponseValidate, llm.OriginRuntime, context.Canceled)
 	agent.handleFailure(second, second.ID, failure, nil, nil)
 	stored, err := taskStore.GetTask(task.ID)
 	if err != nil {
@@ -1405,7 +1415,7 @@ func TestFinalReportForcesExactDeliveryAfterTwoEvidenceTurns(t *testing.T) {
 	delta := loopcontract.TurnSettlementDelta{}
 	projectExecuteResult(&Agent{Store: store.NewMemoryTaskStore(nil, 8, 1, 60)}, task, ExecuteResult{
 		ToolCalls:   []llm.ToolCall{{ID: "graph-read", Name: "read_graph", Arguments: map[string]any{"graph_id": "g"}}},
-		ToolResults: []ToolResult{{ToolCallID: "graph-read", Content: `{"graph_id":"g","status":"blocked"}`}},
+		ToolResults: []contextcontract.ToolResult{{ToolCallID: "graph-read", Content: `{"graph_id":"g","status":"blocked"}`}},
 	}, &delta)
 	if len(delta.EvidenceChanges) != 1 || delta.EvidenceChanges[0].Kind != "read_graph" {
 		t.Fatalf("final-report Graph 读取必须成为 knowledge evidence: %+v", delta.EvidenceChanges)
@@ -1434,11 +1444,10 @@ func TestProductionLoopSettlesActualToolActionIntoCheckpoint(t *testing.T) {
 	registry.Register("test_tool", "测试工具", map[string]any{"type": "object"},
 		func(context.Context, map[string]any) (string, error) { return "tool-ok", nil })
 	client := &sequenceLoopLLM{}
-	executor := NewSwappableLLMExecutor(client, registry, nil, nil, nil, "")
+	executor := newTestSwappableLLMExecutor(t, client, registry, nil, nil, nil, "")
 	executor.SetContextRuntime(newAgentTestContextRuntime(t))
-	agent := NewAgent("worker-tool", "code", taskStore, roster.NewMemoryRoster(), executor.Execute)
+	agent := NewAgent("worker-tool", "code", taskStore, roster.NewMemoryRoster(), testExecutor(t, executor.Execute))
 	agent.ToolSwapper = executor
-	agent.PromptSource = executor
 	agent.LoopStore = progressStore
 	agent.processTask(context.Background(), task.ID)
 
@@ -1460,4 +1469,16 @@ func TestProductionLoopSettlesActualToolActionIntoCheckpoint(t *testing.T) {
 	if pending, err := progressStore.UncommittedActionSettlements(task.ID); err != nil || len(pending) != 0 {
 		t.Fatalf("Turn 结算后不得遗留 Tool action: %+v err=%v", pending, err)
 	}
+}
+
+func (s *sequenceLoopLLM) Invoke(ctx context.Context, request llm.Request, sink llm.EventSink) (llm.Result, error) {
+	if err := request.Validate(); err != nil {
+		return llm.Result{}, err
+	}
+	spec := request.Spec()
+	fixture, err := s.nextFixture(ctx, spec.Messages, spec.Tools)
+	if err != nil {
+		return llm.Result{}, err
+	}
+	return fixture.Seal(spec.Options.Protocol)
 }

@@ -26,6 +26,7 @@
 #   路由本文件声明的静态 kind——agent 节点缺省走 worker（event_type ""
 #   默认队列），只读调查路由 explore，验收路由 acceptance.verify。
 llm:
+  request_contract: agentgo.model-request/v1
   base_url: "__BASE_URL__"
   api_key: ${__KEY_VAR__}
   default_model: "__FAST_MODEL__"
@@ -37,7 +38,6 @@ llm:
   # ToolRouter + L3 required-action gate；Graph 最终交付仅在该次 invocation 覆盖为
   # reasoning=none + exact submit_task_result，以逃离 provider 对历史工具的粘滞重放。
   reasoning_effort: low
-  stream: true
 
 tool_profiles:
   swe_explorer:                       # 只读调查：无写、无 shell、无网络

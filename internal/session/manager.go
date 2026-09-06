@@ -71,10 +71,10 @@ func NewSessionManagerWithResume(baseDir string, cfg SessionConfig, resumeID str
 }
 
 // NewSessionManager 创建并初始化 SessionManager。
-// 1. 创建 baseDir（如不存在）
-// 2. 永远创建全新 Session（不读 active-session 自动恢复；恢复旧会话走
-//    --resume 的 initSessionByID 或运行时 SwitchTo）
-// 3. 任何初始化错误 → 返回 nil current 的 SessionManager（降级模式），不返回 error
+//  1. 创建 baseDir（如不存在）
+//  2. 永远创建全新 Session（不读 active-session 自动恢复；恢复旧会话走
+//     --resume 的 initSessionByID 或运行时 SwitchTo）
+//  3. 任何初始化错误 → 返回 nil current 的 SessionManager（降级模式），不返回 error
 func NewSessionManager(baseDir string, cfg SessionConfig) (*SessionManager, error) {
 	return NewSessionManagerWithResume(baseDir, cfg, "")
 }
@@ -142,6 +142,14 @@ func (sm *SessionManager) loadSession(sessionID, sessDir string) (*Session, erro
 func (sm *SessionManager) activateLoadedSession(sess *Session) error {
 	if sess == nil {
 		return nil
+	}
+	snapshotPath := filepath.Join(sess.Dir, "snapshot.json")
+	if _, err := os.Stat(snapshotPath); err == nil {
+		if _, err := LoadSnapshot(snapshotPath); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
 	}
 	sess.Metadata.Status = "active"
 	sess.Metadata.EndedAt = ""
@@ -515,13 +523,14 @@ func (sm *SessionManager) SaveSnapshotFull(ts []TaskSnapshot, rs RosterSnapshot,
 	}
 
 	snap := &Snapshot{
-		Version:          currentSnapshotVersion,
-		SavedAt:          nowUTC(),
-		Tasks:            ts,
-		Roster:           rs,
-		Mailboxes:        ms,
-		SchedulerHistory: history,
-		Result:           result,
+		Version:              currentSnapshotVersion,
+		ModelHistoryContract: "agentgo.model-history/v1",
+		SavedAt:              nowUTC(),
+		Tasks:                ts,
+		Roster:               rs,
+		Mailboxes:            ms,
+		SchedulerHistory:     history,
+		Result:               result,
 	}
 
 	path := filepath.Join(sm.current.Dir, "snapshot.json")

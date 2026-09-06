@@ -17,9 +17,9 @@ import (
 	"agentgo/internal/runcontract"
 )
 
-// LLMFactory 用 model 名构造 llm.Client。bootstrap 通常用 buildKindLLMClient
+// LLMFactory 用 model 名构造 llm.Invoker。bootstrap 通常用 buildKindLLMClient
 // 的闭包；测试可注入 fake。
-type LLMFactory func(model string) llm.Client
+type LLMFactory func(model string) llm.Invoker
 
 // ReactorSpawnMaxDepth 是 spawn_agent reactor 级联硬上限。
 //

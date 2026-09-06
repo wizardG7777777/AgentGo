@@ -1,3 +1,5 @@
+> **L1/L2 重建（2026-09-07）**：L2 装配完整请求，L1 执行 SSE 与归一化响应；旧请求/配置/历史不转换。当前实现与验证边界以 [五层规范](docs/design/five-layer-engineering-architecture.md) 为准。
+
 # TraceGuide：Trace 系统使用说明书（Agent 排错分析指南）
 
 > **状态**：📋 当前实现说明（2026-09-03）
@@ -151,13 +153,13 @@ connection_reused: 是否复用已有连接
 `duration_ms` 仍表示从调用开始到 `llm.Invoke` 完整返回的总墙钟时间；它不是
 TTFT。所有首事件/delta/completed 字段都是相对调用开始的 monotonic 毫秒。
 字段缺席表示该协议或连接没有提供此里程碑，不能按 0ms 处理；例如复用连接时
-通常没有 DNS/connect/TLS，非流式响应没有 SSE/delta/completed 字段。
+通常没有 DNS/connect/TLS，历史非流式记录没有 SSE/delta/completed 字段；新执行只允许 SSE。
 `reasoning_tokens` 来自 provider usage，provider 未返回或值为 0 时缺席；它已
 包含在 `completion_tokens`，统计时不得重复相加。
 
 该对象刻意不记录 endpoint、IP、密钥、Prompt、reasoning 正文或响应正文。
 采集钩子位于 `internal/llm`，Invocation 身份绑定位于 `internal/agent`，schema、
-JSONL 与 CLI 展示聚合位于 `internal/trace`。它是跨层观测面，不属于 L1，也不进入
+JSONL 与 CLI 展示聚合位于 `internal/trace`。采集属于 L1，持久化与展示是跨层观测面，不进入
 Prompt、Context digest、Tool schema、控制门或 Graph 路由。
 
 ### 2.2 Transition 子结构体

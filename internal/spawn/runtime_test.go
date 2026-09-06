@@ -33,7 +33,7 @@ func defaultBase(t *testing.T) (config.AgentKind, map[string][]string) {
 
 func TestBuildAdhocRuntime_NoOverride_InheritsAll(t *testing.T) {
 	base, profiles := defaultBase(t)
-	rt, err := buildAdhocRuntime(base, config.LLMConfig{DefaultModel: "gpt-default"},
+	rt, err := buildAdhocRuntime(base, config.LLMConfig{DefaultModel: "gpt-default", RequestContract: "agentgo.model-request/v1"},
 		profiles, RuntimeOverride{}, "instance-id", "adhoc:abc", 0)
 	if err != nil {
 		t.Fatalf("buildAdhocRuntime: %v", err)
@@ -67,7 +67,7 @@ func TestBuildAdhocRuntime_Override_AppliesNonZero(t *testing.T) {
 		TaskMaxRetries:  9,
 		// 其他字段零值=不覆盖
 	}
-	rt, err := buildAdhocRuntime(base, config.LLMConfig{}, profiles, override, "id", "adhoc:x", 0)
+	rt, err := buildAdhocRuntime(base, config.LLMConfig{RequestContract: "agentgo.model-request/v1"}, profiles, override, "id", "adhoc:x", 0)
 	if err != nil {
 		t.Fatalf("buildAdhocRuntime: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestBuildAdhocRuntime_Override_AppliesNonZero(t *testing.T) {
 func TestBuildAdhocRuntime_ModelFallbackChain(t *testing.T) {
 	base, profiles := defaultBase(t)
 	base.Model = "" // 清空 base.Model 让回落 llmCfg.DefaultModel 生效
-	rt, err := buildAdhocRuntime(base, config.LLMConfig{DefaultModel: "gpt-default"},
+	rt, err := buildAdhocRuntime(base, config.LLMConfig{DefaultModel: "gpt-default", RequestContract: "agentgo.model-request/v1"},
 		profiles, RuntimeOverride{}, "id", "adhoc:x", 0)
 	if err != nil {
 		t.Fatalf("buildAdhocRuntime: %v", err)
@@ -99,7 +99,7 @@ func TestBuildAdhocRuntime_ModelFallbackChain(t *testing.T) {
 func TestBuildAdhocRuntime_SystemPromptSetButEmpty(t *testing.T) {
 	// SystemPromptSet=true 但内容空——也算覆盖（清空 system prompt 的合法用法）
 	base, profiles := defaultBase(t)
-	rt, err := buildAdhocRuntime(base, config.LLMConfig{}, profiles,
+	rt, err := buildAdhocRuntime(base, config.LLMConfig{RequestContract: "agentgo.model-request/v1"}, profiles,
 		RuntimeOverride{SystemPrompt: "", SystemPromptSet: true},
 		"id", "adhoc:x", 0)
 	if err != nil {
@@ -112,7 +112,7 @@ func TestBuildAdhocRuntime_SystemPromptSetButEmpty(t *testing.T) {
 
 func TestBuildAdhocRuntime_RejectsBaseWithoutToolsOrProfile(t *testing.T) {
 	base := config.AgentKind{Kind: "broken", SystemPromptFile: "/dev/null"}
-	_, err := buildAdhocRuntime(base, config.LLMConfig{}, nil, RuntimeOverride{}, "id", "adhoc:x", 0)
+	_, err := buildAdhocRuntime(base, config.LLMConfig{RequestContract: "agentgo.model-request/v1"}, nil, RuntimeOverride{}, "id", "adhoc:x", 0)
 	if err == nil || !strings.Contains(err.Error(), "无法派生") {
 		t.Errorf("expected derivation error, got %v", err)
 	}
@@ -120,7 +120,7 @@ func TestBuildAdhocRuntime_RejectsBaseWithoutToolsOrProfile(t *testing.T) {
 
 func TestBuildAdhocRuntime_RejectsUnknownProfile(t *testing.T) {
 	base := config.AgentKind{Kind: "x", Profile: "ghost", SystemPromptFile: "/dev/null"}
-	_, err := buildAdhocRuntime(base, config.LLMConfig{}, map[string][]string{"real": {"read_file"}},
+	_, err := buildAdhocRuntime(base, config.LLMConfig{RequestContract: "agentgo.model-request/v1"}, map[string][]string{"real": {"read_file"}},
 		RuntimeOverride{}, "id", "adhoc:x", 0)
 	if err == nil || !strings.Contains(err.Error(), "ghost") {
 		t.Errorf("expected unknown profile error, got %v", err)
@@ -132,7 +132,7 @@ func TestBuildAdhocRuntime_ProfileExpansion(t *testing.T) {
 	prompt := filepath.Join(dir, "sys.md")
 	writeFile(t, prompt, "x")
 	base := config.AgentKind{Kind: "x", Profile: "explore", SystemPromptFile: prompt}
-	rt, err := buildAdhocRuntime(base, config.LLMConfig{},
+	rt, err := buildAdhocRuntime(base, config.LLMConfig{RequestContract: "agentgo.model-request/v1"},
 		map[string][]string{"explore": {"a", "b", "c"}},
 		RuntimeOverride{}, "id", "adhoc:x", 0)
 	if err != nil {
@@ -148,7 +148,7 @@ func TestBuildAdhocRuntime_ProfileExpansion(t *testing.T) {
 // 不再被丢弃（此前运行时一律硬编码 0，配置是死旋钮）。
 func TestBuildAdhocRuntime_IdleThresholdFromGlobalConfig(t *testing.T) {
 	base, profiles := defaultBase(t)
-	rt, err := buildAdhocRuntime(base, config.LLMConfig{}, profiles,
+	rt, err := buildAdhocRuntime(base, config.LLMConfig{RequestContract: "agentgo.model-request/v1"}, profiles,
 		RuntimeOverride{}, "id", "adhoc:x", 3)
 	if err != nil {
 		t.Fatalf("buildAdhocRuntime: %v", err)
@@ -158,7 +158,7 @@ func TestBuildAdhocRuntime_IdleThresholdFromGlobalConfig(t *testing.T) {
 	}
 
 	// 全局 0（生产推荐默认）也原样透传，保持"永不空闲退出"。
-	rt, err = buildAdhocRuntime(base, config.LLMConfig{}, profiles,
+	rt, err = buildAdhocRuntime(base, config.LLMConfig{RequestContract: "agentgo.model-request/v1"}, profiles,
 		RuntimeOverride{}, "id", "adhoc:x", 0)
 	if err != nil {
 		t.Fatalf("buildAdhocRuntime: %v", err)

@@ -9,6 +9,8 @@
 package runner
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/contextruntime"
 	"context"
 	"fmt"
 	"io"
@@ -32,8 +34,6 @@ import (
 	"agentgo/internal/memory"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
-	"agentgo/internal/output"
-	"agentgo/internal/prompt"
 	reactorbuiltin "agentgo/internal/reactor/builtin"
 	"agentgo/internal/roster"
 	"agentgo/internal/runbudget"
@@ -56,7 +56,7 @@ import (
 type RunnerDeps struct {
 	Store     store.TaskStore
 	Roster    roster.Roster
-	LLMClient llm.Client
+	LLMClient llm.Invoker
 	// GateReg 是 v5 Phase 1 引入的统一 Gate 注册表（取代 v4 *hook.ToolHookRegistry）。
 	// 跨 Tool / Mailbox 域复用单一 Registry，详见 ReactiveSystem.md §4.4。
 	GateReg                 *gate.Registry
@@ -79,7 +79,7 @@ type RunnerDeps struct {
 	CheckStore             *checkstore.Store
 	ControlCapabilityStore *controlcapability.Store
 	// ContextRuntime 是 L2 唯一编译/快照 authority。生产必须注入。
-	ContextRuntime agent.ContextRuntime
+	ContextRuntime contextruntime.Runtime
 	// RouteValidator is the shared runtime route authority. It lets every
 	// publish_task caller enforce Plan-private Team ownership, not only the
 	// Scheduler. Nil preserves compatibility for isolated runner tests.
@@ -115,9 +115,6 @@ type RunnerDeps struct {
 	// UserOutput 是用户可见内容的输出目标。非 nil 时，agent 的 IsUserFacing 输出
 	// 和 scheduler 的 report_done 会写入此处，而不是直接 fmt.Printf。
 	UserOutput io.Writer
-	// StreamOutput publishes replace-in-place LLM stream snapshots. It is shared
-	// by static, template-team and one-shot runners through the same deps object.
-	StreamOutput func(output.Event)
 
 	// TaskEndCallbacks 是 v5 Phase 4 task-end-callback Sync Reactor。
 	// runner.New 在此注册"清空 holder（仅 ev.AgentID 匹配本 runner 时）"回调，
@@ -156,7 +153,7 @@ func ValidatePromptCompatibility(ctx context.Context, rt config.AgentRuntimeConf
 	if strings.TrimSpace(profileID) == "" {
 		profileID = rt.Kind
 	}
-	if err := deps.ContextRuntime.ValidateStaticPrompt(ctx, agent.StaticPromptProfile{
+	if err := deps.ContextRuntime.ValidateStaticPrompt(ctx, contextruntime.StaticPromptProfile{
 		ProfileID: profileID, SystemPrompt: rt.SystemPrompt, TeamAwareness: rt.TeamAwareness,
 	}); err != nil {
 		return fmt.Errorf("Runner %s Prompt/Context 契约预检失败: %w", profileID, err)
@@ -222,19 +219,12 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	// per-node 能力（model.NodeCapability）：拿 *LLMExecutor 结构句柄——
 	// Execute 方法值作为 TaskExecutor，句柄本身接到 Agent.ToolSwapper，
 	// 让 processTask 在节点声明工具子集时换入过滤视图、任务结束恢复。
-	llmExec := agent.NewSwappableLLMExecutor(
-		deps.LLMClient,
-		toolReg,
-		deps.GateReg,
-		deps.StoreView,
-		deps.RecordToolCall,
-		rt.TeamAwareness,
-		rt.SystemPrompt,
-	)
-	// V6 §2 P1a：prompt 编译身份——agent_role 组件的 Version 取
+	llmExec := agent.NewTurnExecutor(deps.LLMClient, toolReg, deps.GateReg, deps.RecordToolCall, deps.ContextRuntime, contextruntime.Instructions{System: rt.SystemPrompt, Team: rt.TeamAwareness})
+
+	// L2 角色指令来源身份使用
 	// system_prompt_file 内容 sha256 前 12（文件在启动期一次性读入，
 	// 与 rt.SystemPrompt 同字节）。
-	llmExec.SetPromptVersion("file:" + prompt.DigestText(rt.SystemPrompt))
+	llmExec.SetPromptVersion("file:" + contextcontract.ShortDigestText(rt.SystemPrompt))
 	llmExec.SetObservationModel(rt.ObservationModel)
 	llmExec.SetControlCapabilityStore(deps.ControlCapabilityStore)
 	llmExec.SetContextRuntime(deps.ContextRuntime)
@@ -248,11 +238,11 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	// 终态迁移；只在响应前检查一次会让后续调用在失效权限下继续产生副作用，
 	// 因此每次具体工具派发前都重查活性。
 	inner := executor
-	executor = func(ctx context.Context, task *model.Task, depResults map[string]string, history []agent.HistoryEntry) (agent.ExecuteResult, error) {
+	executor = func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (agent.ExecuteResult, error) {
 		guardedCtx := agent.WithToolDispatchGuard(ctx, func(dispatchCtx context.Context, guardedTask *model.Task) error {
 			return requireLiveToolDispatch(dispatchCtx, deps.Store, guardedTask)
 		})
-		return inner(guardedCtx, task, depResults, history)
+		return inner(guardedCtx, task, depResults, history, actionBudget)
 	}
 
 	a = agent.NewAgent(
@@ -263,8 +253,6 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 		executor,
 	)
 	a.ToolSwapper = llmExec // per-node 能力：按任务换入/恢复工具过滤视图
-	// V6 §2 P1a：prompt 编译的静态身份源（同一 executor 句柄）。
-	a.PromptSource = llmExec
 	a.CancelRegistry = deps.CancelRegistry
 	a.MaxRetries = rt.TaskMaxRetries
 	// E3：空闲退出阈值从配置链路接入（AgentRuntimeConfig.IdleThreshold，
@@ -341,7 +329,6 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	// V6 §4 H1：exec 轴模式源注入（ExecutionLease 的 Policy 交集输入）。
 	a.Modes = deps.Modes
 	a.UserOutput = deps.UserOutput
-	a.StreamOutput = deps.StreamOutput
 
 	return r
 }

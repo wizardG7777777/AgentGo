@@ -18,6 +18,7 @@ package bootstrap
 // 文本，只进任务结果，不进 trace（与正文不落账本同一纪律）。
 
 import (
+ "agentgo/internal/contextcontract"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -28,7 +29,6 @@ import (
 	"agentgo/internal/config"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
-	"agentgo/internal/prompt"
 	"agentgo/internal/taskcontract"
 	"agentgo/internal/trace"
 )
@@ -221,7 +221,7 @@ func (s *System) RequestAgentAudit() (string, error) {
 		ExecMode string            `json:"exec_mode"`
 		TopoMode string            `json:"topo_mode"`
 	}{entries, execMode, topoMode})
-	snapshotDigest := prompt.DigestText(string(digestPayload))
+	snapshotDigest := contextcontract.ShortDigestText(string(digestPayload))
 
 	description := renderAgentAuditDescription(entries, warnings, execMode, topoMode, snapshotDigest)
 	task := &model.Task{

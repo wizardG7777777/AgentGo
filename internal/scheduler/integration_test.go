@@ -1,16 +1,16 @@
 package scheduler
 
 import (
+	"agentgo/internal/testmodel"
 	"context"
 	"slices"
 	"sync"
 	"testing"
 	"time"
 
-	"agentgo/internal/agent"
 	"agentgo/internal/config"
 	"agentgo/internal/contentstore"
-	"agentgo/internal/contextadapter"
+	"agentgo/internal/contextruntime"
 	"agentgo/internal/contextstore"
 	"agentgo/internal/graph"
 	"agentgo/internal/llm"
@@ -27,11 +27,11 @@ import (
 // 它按 responses 顺序返回，超出后返回 "done" 文本响应。
 type scriptedLLM struct {
 	mu        sync.Mutex
-	responses []llm.Response
+	responses []testmodel.Fixture
 	calls     int
 }
 
-func (s *scriptedLLM) Chat(ctx context.Context, msgs []llm.Message, tools []llm.ToolDef) (llm.Response, error) {
+func (s *scriptedLLM) nextFixture(ctx context.Context, msgs []llm.Message, tools []llm.ToolDef) (testmodel.Fixture, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.calls < len(s.responses) {
@@ -40,7 +40,7 @@ func (s *scriptedLLM) Chat(ctx context.Context, msgs []llm.Message, tools []llm.
 		return r, nil
 	}
 	s.calls++
-	return llm.Response{Content: "done"}, nil
+	return testmodel.Fixture{Content: "done"}, nil
 }
 
 // TestSchedulerBundle_New_RegistersMailboxAlias 验证 Bundle 构造时 scheduler agent
@@ -53,7 +53,7 @@ func TestSchedulerBundle_New_RegistersMailboxAlias(t *testing.T) {
 	mb := mailbox.NewRegistry(8)
 	cfg := config.DefaultConfig()
 
-	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
+	bundle := newTestScheduler(t, s, r, &scriptedLLM{}, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
 		nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	if bundle == nil || bundle.Agent == nil {
 		t.Fatal("New returned nil Bundle")
@@ -87,7 +87,7 @@ func TestSchedulerBundle_New_AgentEventTypeIsScheduler(t *testing.T) {
 	cfg := config.DefaultConfig()
 
 	taskMemory := taskmem.NewStore(t.TempDir())
-	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil,
+	bundle := newTestScheduler(t, s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil,
 		nil, nil, nil, nil, nil, nil, nil, nil, nil,
 		GraphAuthoringDeps{TaskMemStore: taskMemory})
 	if bundle.Agent.EventType != "__scheduler__" {
@@ -120,7 +120,7 @@ func TestSchedulerBundle_New_ModesDefaultAxes(t *testing.T) {
 	r := roster.NewMemoryRoster()
 	cfg := config.DefaultConfig()
 
-	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil,
+	bundle := newTestScheduler(t, s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil,
 		nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	if bundle.Modes == nil {
 		t.Fatal("Bundle.Modes is nil")
@@ -159,7 +159,7 @@ func TestSchedulerBundle_EndToEnd_UserInputCreatesGraphDraft(t *testing.T) {
 	cfg.Agents = []config.AgentKind{{Kind: "worker", Replicas: 1}}
 
 	mockLLM := &scriptedLLM{
-		responses: []llm.Response{
+		responses: []testmodel.Fixture{
 			// 第一轮：按 auto-singleton 调用唯一构图工具。
 			{
 				ToolCalls: []llm.ToolCall{
@@ -186,9 +186,9 @@ func TestSchedulerBundle_EndToEnd_UserInputCreatesGraphDraft(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	contextRuntime := agent.ContextRuntime{
-		Adapter: contextadapter.New(), Policies: policies, Snapshots: snapshots, Content: contents,
-		SessionID: func() string { return "scheduler-integration" },
+	contextRuntime := contextruntime.Runtime{
+		Assembler: contextruntime.NewAssembler(), Policies: policies, Snapshots: snapshots, Content: contents,
+		SessionID: func() string { return "scheduler-integration" }, Options: testmodel.Runtime(t).Options, Output: testmodel.Runtime(t).Output,
 	}
 	authoringStore, err := graph.NewAuthoringStore(t.TempDir())
 	if err != nil {
@@ -196,7 +196,7 @@ func TestSchedulerBundle_EndToEnd_UserInputCreatesGraphDraft(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = authoringStore.Close() })
 
-	bundle := New(s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
+	bundle := newTestScheduler(t, s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
 		nil, nil, nil, nil, nil, nil, nil, nil, nil,
 		GraphAuthoringDeps{
 			Store: authoringStore, Compiler: graph.DefinitionCompiler{Policies: policies},
@@ -249,4 +249,16 @@ func TestSchedulerBundle_EndToEnd_UserInputCreatesGraphDraft(t *testing.T) {
 		draft.GraphID != "graph-"+schedTask.ID {
 		t.Fatalf("GraphDraft 归属/稳定身份错误: task=%s draft=%+v", schedTask.ID, draft)
 	}
+}
+
+func (s *scriptedLLM) Invoke(ctx context.Context, request llm.Request, sink llm.EventSink) (llm.Result, error) {
+	if err := request.Validate(); err != nil {
+		return llm.Result{}, err
+	}
+	spec := request.Spec()
+	fixture, err := s.nextFixture(ctx, spec.Messages, spec.Tools)
+	if err != nil {
+		return llm.Result{}, err
+	}
+	return fixture.Seal(spec.Options.Protocol)
 }

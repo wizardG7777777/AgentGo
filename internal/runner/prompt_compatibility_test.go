@@ -1,13 +1,14 @@
 package runner
 
+import "agentgo/internal/testmodel"
+
 import (
 	"context"
 	"strings"
 	"testing"
 
-	"agentgo/internal/agent"
 	"agentgo/internal/config"
-	"agentgo/internal/contextadapter"
+	"agentgo/internal/contextruntime"
 	"agentgo/internal/policycatalog"
 )
 
@@ -16,8 +17,8 @@ func TestValidatePromptCompatibilityGatesRunnerConstruction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deps := RunnerDeps{ContextRuntime: agent.ContextRuntime{
-		Adapter: contextadapter.New(), Policies: catalog,
+	deps := RunnerDeps{ContextRuntime: contextruntime.Runtime{
+		Assembler: contextruntime.NewAssembler(), Policies: catalog, Snapshots: testmodel.Runtime(t).Snapshots, Options: testmodel.Runtime(t).Options, Output: testmodel.Runtime(t).Output,
 	}}
 	runtime := config.AgentRuntimeConfig{
 		InstanceID: "worker-preflight", Kind: "worker",

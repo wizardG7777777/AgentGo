@@ -10,8 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"agentgo/internal/invocation"
-
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/shared"
@@ -30,15 +28,14 @@ const (
 
 // Message 是对话中的单条消息。
 type Message struct {
-	Role       string     // "system" | "user" | "assistant" | "tool"
-	Content    string     // 消息内容
-	Name       string     // 工具名称，仅 role="tool" 时使用
-	ToolCallID string     // 对应的 tool_call ID，仅 role="tool" 时使用
-	ToolCalls  []ToolCall // LLM 返回的工具调用，仅 role="assistant" 时使用
-	// ExtraFields 保存响应里 openai-go 未识别的 assistant 消息字段（如 DeepSeek V4 的
-	// reasoning_content）。下一轮请求时会通过 SetExtraFields 原样回写，避免
-	// 被 openai-go 强类型 struct 默默吞掉。
-	ExtraFields map[string]json.RawMessage `json:"extra_fields,omitempty"`
+	Parts      []ContentPart   `json:"parts,omitempty"`
+	Replay     *ProtocolReplay `json:"replay,omitempty"`
+	Role       string          // "system" | "user" | "assistant" | "tool"
+	Content    string          // 消息内容
+	Name       string          // 工具名称，仅 role="tool" 时使用
+	ToolCallID string          // 对应的 tool_call ID，仅 role="tool" 时使用
+	ToolCalls  []ToolCall      // LLM 返回的工具调用，仅 role="assistant" 时使用
+
 }
 
 // ToolDef 描述一个可供 LLM 调用的工具。
@@ -58,14 +55,14 @@ type ToolCall struct {
 	Arguments map[string]any `json:"arguments"`
 }
 
-// Response 是解析后的 LLM 响应。
+// responseData 是解析后的 LLM 响应。
 type Usage struct {
 	PromptTokens     int
 	CompletionTokens int
 	ReasoningTokens  int
 }
 
-type Response struct {
+type responseData struct {
 	Content string
 	// Reasoning is the provider's plaintext reasoning exactly as returned by the
 	// API. It is normalized from reasoning, reasoning_content, or readable
@@ -82,96 +79,6 @@ type Response struct {
 	ExtraFields map[string]json.RawMessage
 }
 
-// Client 是 LLM 调用接口。
-type Client interface {
-	Chat(ctx context.Context, messages []Message, tools []ToolDef) (Response, error)
-}
-
-// StreamEvent is a transport-level snapshot emitted while a streaming Chat
-// Completions response is being accumulated. Content and provider-supplied raw
-// reasoning are independent accumulated streams so UIs can label them clearly.
-type StreamEvent struct {
-	ContentDelta         string
-	AccumulatedContent   string
-	ReasoningDelta       string
-	AccumulatedReasoning string
-	Done                 bool
-	Error                string
-}
-
-type streamHandlerKey struct{}
-
-// modelOverrideKey 是 per-call 模型覆盖的 context 键。
-// 用于 per-node 能力（model.NodeCapability.Model）：Agent 在任务入口把节点
-// 指定的模型写入 ctx，SDKClient.Chat 读取后替换请求模型——wire 层模型不再
-// 绑定在客户端构造期。未设置时行为与之前完全一致（用 c.model）。
-type modelOverrideKey struct{}
-
-// WithModelOverride 把本次调用链的 LLM 请求模型覆盖为 model。
-// 空串时原样返回（不覆盖）。仅 SDKClient 生产路径消费该值；
-// 测试 fake Client 忽略 ctx 时自然退回各自构造期模型。
-func WithModelOverride(ctx context.Context, model string) context.Context {
-	if model == "" {
-		return ctx
-	}
-	return context.WithValue(ctx, modelOverrideKey{}, model)
-}
-
-// modelOverrideFromContext 读取 per-call 模型覆盖；未设置返回空串。
-func modelOverrideFromContext(ctx context.Context) string {
-	m, _ := ctx.Value(modelOverrideKey{}).(string)
-	return m
-}
-
-// WithStreamHandler installs an optional synchronous observer for streamed
-// reasoning and answer text. The handler must return quickly; callers that need
-// throttling or fan-out should coalesce snapshots before publishing them to a UI.
-func WithStreamHandler(ctx context.Context, handler func(StreamEvent)) context.Context {
-	if handler == nil {
-		return ctx
-	}
-	return context.WithValue(ctx, streamHandlerKey{}, handler)
-}
-
-func streamHandlerFromContext(ctx context.Context) func(StreamEvent) {
-	handler, _ := ctx.Value(streamHandlerKey{}).(func(StreamEvent))
-	return handler
-}
-
-// ClientConfig controls standard request behavior shared by every AgentGo LLM
-// client created from the global llm block.
-type ClientConfig struct {
-	Protocol        Protocol
-	ReasoningEffort string
-	Stream          bool
-	// ToolChoice 只用于启动能力探针等无 ContextBinding 的机械协议调用。
-	// 生产 Agent 由冻结 ContextBinding 覆盖它；探针使用 auto + 单工具，
-	// 避免 thinking provider 拒绝 exact/required tool_choice。
-	ToolChoice invocation.ToolChoice
-	// OutputBudget 是单次响应的冻结硬上限。零值使用 Model Invocation 的版本化
-	// 安全默认值，不能解释为无限。
-	OutputBudget invocation.OutputBudget
-}
-
-// effectiveToolChoice 把生产 ContextBinding 视为最高权威；ClientConfig
-// 只服务于启动探针等显式 legacy 入口。空值等价于 auto。
-func effectiveToolChoice(ctx context.Context, configured invocation.ToolChoice) invocation.ToolChoice {
-	if binding, ok := invocation.ContextBindingFrom(ctx); ok && binding.ToolChoice.Mode != "" {
-		return binding.ToolChoice
-	}
-	if configured.Mode != "" {
-		return configured
-	}
-	return invocation.ToolChoice{Mode: invocation.ToolChoiceAuto}
-}
-
-func effectiveReasoningEffort(ctx context.Context, configured string) string {
-	if binding, ok := invocation.ContextBindingFrom(ctx); ok && binding.ReasoningEffort != "" {
-		return binding.ReasoningEffort
-	}
-	return configured
-}
-
 func hasToolDefinition(tools []ToolDef, name string) bool {
 	for _, tool := range tools {
 		if tool.Name == name {
@@ -181,90 +88,102 @@ func hasToolDefinition(tools []ToolDef, name string) bool {
 	return false
 }
 
-// SDKClient 通过 openai-go 官方 SDK 实现 Client 接口。生产请求 protocol 在
-// 构造时冻结；Responses 为新主链，Chat Completions 只作显式兼容。
-type SDKClient struct {
-	client       openai.Client
-	model        string
-	systemPrompt string
-	request      ClientConfig
+// Transport 仅持有连接；每次调用的业务参数来自封存 Request。
+type Transport struct{ client openai.Client }
+type TransportConfig struct {
+	BaseURL string
+	APIKey  string
+	Timeout time.Duration
 }
 
-const defaultLLMTimeout = 120 * time.Second
-
-// NewSDKClient 创建基于 openai-go SDK 的客户端。
-// baseURL 为空时使用 OpenAI 官方端点。
-// HTTP 层重试由 SDK 内部处理（429/5xx），此处不再额外设置 MaxRetries，
-// 避免与调用方的业务重试语义重叠。
-func NewSDKClient(baseURL, apiKey, model, systemPrompt string, timeout time.Duration) *SDKClient {
-	return NewSDKClientWithConfig(baseURL, apiKey, model, systemPrompt, timeout, ClientConfig{})
-}
-
-// NewSDKClientWithConfig is the production constructor. NewSDKClient remains
-// as a compatibility wrapper for focused tests and external package users.
-func NewSDKClientWithConfig(baseURL, apiKey, model, systemPrompt string, timeout time.Duration, request ClientConfig) *SDKClient {
+func NewTransport(config TransportConfig) *Transport {
+	timeout := config.Timeout
 	if timeout <= 0 {
-		timeout = defaultLLMTimeout
-		log.Printf("[llm] 未指定超时，使用默认值 %v", timeout)
+		timeout = 120 * time.Second
 	}
+	opts := []option.RequestOption{option.WithRequestTimeout(timeout), option.WithMaxRetries(0)}
+	if config.BaseURL != "" {
+		opts = append(opts, option.WithBaseURL(config.BaseURL))
+	}
+	if config.APIKey != "" {
+		opts = append(opts, option.WithAPIKey(config.APIKey))
+	}
+	return &Transport{client: openai.NewClient(opts...)}
+}
 
-	opts := []option.RequestOption{
-		option.WithRequestTimeout(timeout),
+// protocolCall 的生命周期仅限一次请求，不共享或补充业务默认值。
+type protocolCall struct {
+	client   openai.Client
+	request  Options
+	sink     EventSink
+	identity Identity
+}
+
+func (t *Transport) Invoke(ctx context.Context, request Request, sink EventSink) (Result, error) {
+	if err := request.Validate(); err != nil {
+		return Result{}, NewFailure(FailureInvalidRequest, PhaseRequestBuild, OriginRuntime, err)
 	}
-	if apiKey != "" {
-		opts = append(opts, option.WithAPIKey(apiKey))
+	spec := request.Spec()
+	call := protocolCall{client: t.client, request: spec.Options, sink: sink, identity: spec.Identity}
+	var response responseData
+	var err error
+	switch spec.Options.Protocol {
+	case ProtocolResponses:
+		response, err = call.responses(ctx, spec.Messages, spec.Tools)
+	case ProtocolChatCompletions:
+		response, err = call.chat(ctx, spec.Messages, spec.Tools)
+	}
+	if err != nil {
+		if f, ok := FromError(err); ok {
+			f.InvocationID = spec.Identity.InvocationID
+			f.SnapshotID = spec.Identity.SnapshotID
+			f.ProviderPolicy = spec.Identity.ContextPolicyID
+		}
+		return Result{}, err
+	}
+	replay := ProtocolReplay{Protocol: spec.Options.Protocol}
+	if spec.Options.Protocol == ProtocolResponses {
+		for _, item := range response.Items {
+			if len(item.Raw) > 0 {
+				replay.Items = append(replay.Items, item.Raw)
+			}
+		}
 	} else {
-		log.Println("[llm] 警告: apiKey 为空，SDK 将尝试从环境变量 OPENAI_API_KEY 读取")
+		replay.Fields = response.ExtraFields
 	}
-	if baseURL != "" {
-		opts = append(opts, option.WithBaseURL(baseURL))
-	}
-
-	client := openai.NewClient(opts...)
-
-	return &SDKClient{
-		client:       client,
-		model:        model,
-		systemPrompt: systemPrompt,
-		request:      request,
+	return NewResult(ResultData{Schema: ResultSchema, Items: response.Items, FinishReason: response.FinishReason, Usage: response.Usage, Replay: replay})
+}
+func (c *protocolCall) emit(index int64, id, kind, delta string) {
+	if c.sink != nil && delta != "" {
+		c.sink(Event{InvocationID: c.identity.InvocationID, ItemIndex: index, ItemID: id, Kind: kind, Delta: delta})
 	}
 }
 
-func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDef) (Response, error) {
-	if c.request.Protocol == ProtocolResponses {
-		return c.responses(ctx, messages, tools)
+func (c *protocolCall) chat(ctx context.Context, messages []Message, tools []ToolDef) (responseData, error) {
+	params, err := chatParams(c.request, messages, tools)
+	if err != nil {
+		return responseData{}, err
 	}
-	// 空 protocol 只为直接构造客户端的旧测试/API 保留 Chat Completions
-	// 兼容；生产 Runtime 必须由配置传入已冻结 protocol。
-	if c.request.Protocol != "" && c.request.Protocol != ProtocolChatCompletions {
-		return Response{}, fmt.Errorf("SDKClient 未知 protocol=%q", c.request.Protocol)
-	}
+	return c.chatStreaming(ctx, params)
+}
+func chatParams(options Options, messages []Message, tools []ToolDef) (openai.ChatCompletionNewParams, error) {
 	params := openai.ChatCompletionNewParams{
-		Model: openai.ChatModel(c.model),
+		Model: openai.ChatModel(options.Model),
 	}
-	outputBudget := outputBudgetFromContext(ctx, c.request.OutputBudget)
+	outputBudget := options.OutputBudget
 	params.MaxCompletionTokens = openai.Int(outputBudget.MaxCompletionTokens)
-	// per-call 模型覆盖（per-node 能力）：ctx 携带时替换 wire 请求模型。
-	if m := modelOverrideFromContext(ctx); m != "" {
-		params.Model = openai.ChatModel(m)
-	}
-	if reasoningEffort := effectiveReasoningEffort(ctx, c.request.ReasoningEffort); reasoningEffort != "" {
+	if reasoningEffort := options.ReasoningEffort; reasoningEffort != "" {
 		// ReasoningEffort is a string-backed SDK type. Casting keeps AgentGo
 		// aligned with newly documented OpenAI values (for example "max") even
 		// when the generated SDK constants lag the API specification.
 		params.ReasoningEffort = shared.ReasoningEffort(reasoningEffort)
 	}
 
-	// 插入 system prompt（使用 system 角色以兼容 Dashscope 等非 OpenAI 后端）
-	if c.systemPrompt != "" {
-		params.Messages = append(params.Messages, openai.SystemMessage(c.systemPrompt))
-	}
-
 	// 转换消息
 	for _, m := range messages {
 		msg, err := convertMessage(m)
 		if err != nil {
-			return Response{}, err
+			return openai.ChatCompletionNewParams{}, err
 		}
 		params.Messages = append(params.Messages, msg)
 	}
@@ -282,167 +201,46 @@ func (c *SDKClient) Chat(ctx context.Context, messages []Message, tools []ToolDe
 			},
 		})
 	}
-	toolChoice := effectiveToolChoice(ctx, c.request.ToolChoice)
+	toolChoice := options.ToolChoice
+	params.ToolChoice = openai.ChatCompletionToolChoiceOptionUnionParam{OfAuto: openai.String("auto")}
 	if err := toolChoice.Validate(); err != nil {
-		return Response{}, fmt.Errorf("tool_choice 无效: %w", err)
+		return openai.ChatCompletionNewParams{}, fmt.Errorf("tool_choice 无效: %w", err)
 	}
-	if toolChoice.Mode != invocation.ToolChoiceAuto {
+	if toolChoice.Mode != ToolChoiceAuto {
 		if len(tools) == 0 {
-			return Response{}, fmt.Errorf("tool_choice=%s 但本次 ToolRouter 为空", toolChoice.Mode)
+			return openai.ChatCompletionNewParams{}, fmt.Errorf("tool_choice=%s 但本次 ToolRouter 为空", toolChoice.Mode)
 		}
 		switch toolChoice.Mode {
-		case invocation.ToolChoiceRequired:
+		case ToolChoiceRequired:
 			params.ToolChoice = openai.ChatCompletionToolChoiceOptionUnionParam{
 				OfAuto: openai.String(string(openai.ChatCompletionToolChoiceOptionAutoRequired)),
 			}
-		case invocation.ToolChoiceFunction:
+		case ToolChoiceFunction:
 			if !hasToolDefinition(tools, toolChoice.Name) {
-				return Response{}, fmt.Errorf("forced tool_choice=%q 不在本次 ToolRouter 定义中", toolChoice.Name)
+				return openai.ChatCompletionNewParams{}, fmt.Errorf("forced tool_choice=%q 不在本次 ToolRouter 定义中", toolChoice.Name)
 			}
 			params.ToolChoice = openai.ToolChoiceOptionFunctionToolChoice(
 				openai.ChatCompletionNamedToolChoiceFunctionParam{Name: toolChoice.Name})
 		}
 	}
 
-	if c.request.Stream {
-		params.StreamOptions = openai.ChatCompletionStreamOptionsParam{
-			IncludeUsage: openai.Bool(true),
-		}
-		return c.chatStreaming(ctx, params)
-	}
-
-	// 调用 SDK — HTTP 层错误（429/5xx）由 SDK 内部重试处理
-	completion, err := c.client.Chat.Completions.New(ctx, params)
-	if err != nil {
-		return Response{}, classifySDKError(ctx, err)
-	}
-
-	if len(completion.Choices) == 0 {
-		err := errors.New("LLM 返回空 choices")
-		return Response{}, &ErrBadResponse{Err: err, Failure: invocation.NewFailure(
-			invocation.FailureMalformedResponse, invocation.PhaseResponseValidate, invocation.OriginProtocol, err)}
-	}
-
-	choice := completion.Choices[0]
-	budgetCounter := newOutputBudgetCounter(outputBudget, invocation.PhaseResponseValidate)
-	if err := budgetCounter.addContent(choice.Message.Content); err != nil {
-		return Response{}, err
-	}
-	for key, field := range choice.Message.JSON.ExtraFields {
-		raw := field.Raw()
-		if raw == "" {
-			continue
-		}
-		extra := map[string]json.RawMessage{key: json.RawMessage(raw)}
-		if err := budgetCounter.addExtra(key, raw, ReasoningText(extra)); err != nil {
-			return Response{}, err
-		}
-	}
-	for i, tc := range choice.Message.ToolCalls {
-		if err := budgetCounter.addTool(int64(i), tc.Function.Name, tc.Function.Arguments); err != nil {
-			return Response{}, err
-		}
-	}
-
-	// 解析 FinishReason
-	finishReason := parseFinishReason(string(choice.FinishReason))
-
-	// 检查异常终止
-	switch finishReason {
-	case FinishReasonLength:
-		log.Printf("[llm] 警告: 响应因 token 上限被截断 (finish_reason=length)")
-		err := fmt.Errorf("响应被截断 (finish_reason=length)")
-		failure := invocation.NewFailure(invocation.FailureOutputTruncated,
-			invocation.PhaseResponseValidate, invocation.OriginProvider, err)
-		failure.FinishReason = string(finishReason)
-		return Response{FinishReason: finishReason}, &ErrBadResponse{
-			Err: err, Failure: failure,
-		}
-	case FinishReasonContentFilter:
-		log.Printf("[llm] 警告: 响应被内容过滤器拦截 (finish_reason=content_filter)")
-		err := fmt.Errorf("响应被内容过滤器拦截 (finish_reason=content_filter)")
-		failure := invocation.NewFailure(invocation.FailureContentFiltered,
-			invocation.PhaseResponseValidate, invocation.OriginProvider, err)
-		failure.FinishReason = string(finishReason)
-		return Response{FinishReason: finishReason}, &ErrUnrecoverable{
-			Err: err, Failure: failure,
-		}
-	case FinishReasonUnknown:
-		log.Printf("[llm] 警告: 未知的 finish_reason=%q", choice.FinishReason)
-	}
-
-	// 转换 tool calls
-	var toolCalls []ToolCall
-	for _, tc := range choice.Message.ToolCalls {
-		args := make(map[string]any)
-		if tc.Function.Arguments != "" {
-			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-				log.Printf("[llm] tool call %q 参数 JSON 解析失败: %v (raw: %s)",
-					tc.Function.Name, err, tc.Function.Arguments)
-				// 载荷尺寸入错（2026-08-20 SWE-001 预防 1）：长 JSON 是损坏
-				// 主因，重试交接时该事实帮助模型决定分批提交。
-				wrapped := fmt.Errorf("tool call %q 参数解析失败（载荷 %d 字符）: %w",
-					tc.Function.Name, len([]rune(tc.Function.Arguments)), err)
-				return Response{}, &ErrBadResponse{Err: wrapped, Failure: invocation.NewFailure(
-					invocation.FailureMalformedResponse, invocation.PhaseToolCallValidate,
-					invocation.OriginProtocol, wrapped)}
-			}
-		}
-		toolCalls = append(toolCalls, ToolCall{
-			ID:        tc.ID,
-			Name:      tc.Function.Name,
-			Arguments: args,
-		})
-	}
-
-	result := Response{
-		Content:      choice.Message.Content,
-		ToolCalls:    toolCalls,
-		Items:        chatCompletionOutputItems(choice.Message.Content, "", toolCalls),
-		FinishReason: finishReason,
-	}
-	result.Usage.PromptTokens = int(completion.Usage.PromptTokens)
-	result.Usage.CompletionTokens = int(completion.Usage.CompletionTokens)
-	result.Usage.ReasoningTokens = int(completion.Usage.CompletionTokensDetails.ReasoningTokens)
-
-	// 层 1：把响应里 openai-go 未识别的字段原样抽到 ExtraFields。
-	// DeepSeek V4 的 reasoning_content、其他 provider 的自定义元数据都走这条路。
-	if len(choice.Message.JSON.ExtraFields) > 0 {
-		result.ExtraFields = make(map[string]json.RawMessage, len(choice.Message.JSON.ExtraFields))
-		for k, f := range choice.Message.JSON.ExtraFields {
-			raw := f.Raw()
-			if raw == "" {
-				continue
-			}
-			result.ExtraFields[k] = json.RawMessage(raw)
-		}
-	}
-	result.Reasoning = ReasoningText(result.ExtraFields)
-	result.Items = chatCompletionOutputItems(result.Content, result.Reasoning, result.ToolCalls)
-
-	return result, nil
+	params.ParallelToolCalls = openai.Bool(options.ParallelToolCalls)
+	params.StreamOptions = openai.ChatCompletionStreamOptionsParam{IncludeUsage: openai.Bool(true)}
+	return params, nil
 }
 
-// chatStreaming executes the same Chat Completions request over SSE and
-// reconstructs the ordinary Response contract consumed by the ReAct loop.
-// Tool calls are never dispatched from partial chunks: only the fully
-// accumulated response is returned to the executor.
-func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatCompletionNewParams) (Response, error) {
-	stream := c.client.Chat.Completions.NewStreaming(ctx, params)
+// chatStreaming 通过 SSE 执行 Chat Completions 请求并聚合协议输出。
+// 增量仅供观察；完整结果交回 L2 检查与记录后，L3 才能执行工具。
+func (c *protocolCall) chatStreaming(ctx context.Context, params openai.ChatCompletionNewParams) (responseData, error) {
+	witness, streamOption := streamWitness(c.request.OutputBudget)
+	stream := c.client.Chat.Completions.NewStreaming(ctx, params, streamOption)
 	defer stream.Close()
 
-	handler := streamHandlerFromContext(ctx)
-	emitFailure := func(err error) (Response, error) {
-		if handler != nil {
-			handler(StreamEvent{Done: true, Error: err.Error()})
-		}
-		return Response{}, err
-	}
-
+	emitFailure := func(err error) (responseData, error) { return responseData{}, err }
 	var acc openai.ChatCompletionAccumulator
 	var accumulatedContent string
 	var accumulatedReasoning string
-	budgetCounter := newOutputBudgetCounter(outputBudgetFromContext(ctx, c.request.OutputBudget), invocation.PhaseStreamAccumulate)
+	budgetCounter := newOutputBudgetCounter(c.request.OutputBudget, PhaseStreamAccumulate)
 	// The SDK accumulator intentionally ignores JSON metadata. Keep string
 	// deltas by concatenation, append array-valued extension chunks in order,
 	// and retain the last raw value for other extension-field shapes.
@@ -450,12 +248,18 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 	extraArrays := make(map[string][]json.RawMessage)
 	extraRaw := make(map[string]json.RawMessage)
 	for stream.Next() {
+		if ctx.Err() != nil {
+			return emitFailure(classifySDKError(ctx, ctx.Err()))
+		}
 		observeStreamEvent(ctx, "chat.chunk")
 		chunk := stream.Current()
 		if field, ok := chunk.JSON.ExtraFields["error"]; ok && field.Raw() != "" {
 			return emitFailure(classifyStreamProviderError(field.Raw()))
 		}
 		for _, choice := range chunk.Choices {
+			if choice.Index != 0 {
+				return emitFailure(responsesProtocolError("Chat SSE 返回未请求的候选", nil))
+			}
 			delta := choice.Delta
 			if err := budgetCounter.addContent(delta.Content); err != nil {
 				return emitFailure(err)
@@ -472,6 +276,7 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 			}
 			for _, tc := range delta.ToolCalls {
 				observeStreamDelta(ctx, "tool", tc.Function.Name != "" || tc.Function.Arguments != "")
+				c.emit(tc.Index, tc.ID, "tool_arguments_delta", tc.Function.Arguments)
 				if err := budgetCounter.addTool(tc.Index, tc.Function.Name, tc.Function.Arguments); err != nil {
 					return emitFailure(err)
 				}
@@ -479,9 +284,9 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 		}
 		if !acc.AddChunk(chunk) {
 			err := errors.New("流式响应 chunk 无法按序聚合")
-			return emitFailure(&ErrBadResponse{Err: err, Failure: invocation.NewFailure(
-				invocation.FailureMalformedResponse, invocation.PhaseStreamAccumulate,
-				invocation.OriginProtocol, err)})
+			return emitFailure(&ErrBadResponse{Err: err, Failure: NewFailure(
+				FailureMalformedResponse, PhaseStreamAccumulate,
+				OriginProtocol, err)})
 		}
 		for _, choice := range chunk.Choices {
 			delta := choice.Delta
@@ -509,25 +314,21 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 			observeStreamDelta(ctx, "reasoning", reasoningDelta != "")
 			accumulatedContent += delta.Content
 			accumulatedReasoning += reasoningDelta
-			if handler != nil && (delta.Content != "" || reasoningDelta != "") {
-				handler(StreamEvent{
-					ContentDelta:         delta.Content,
-					AccumulatedContent:   accumulatedContent,
-					ReasoningDelta:       reasoningDelta,
-					AccumulatedReasoning: accumulatedReasoning,
-				})
-			}
+			c.emit(choice.Index, "", "text_delta", delta.Content)
+			c.emit(choice.Index, "", "reasoning_delta", reasoningDelta)
 		}
 	}
 	if err := stream.Err(); err != nil {
 		return emitFailure(classifySDKError(ctx, err))
 	}
-	markStreamCompleted(ctx)
+	if !witness.done {
+		return emitFailure(responsesProtocolError("Chat SSE 缺少 [DONE] 终止事件", nil))
+	}
 	if len(acc.Choices) == 0 {
 		err := errors.New("LLM 流式响应返回空 choices")
-		return emitFailure(&ErrBadResponse{Err: err, Failure: invocation.NewFailure(
-			invocation.FailureMalformedResponse, invocation.PhaseResponseValidate,
-			invocation.OriginProtocol, err)})
+		return emitFailure(&ErrBadResponse{Err: err, Failure: NewFailure(
+			FailureMalformedResponse, PhaseResponseValidate,
+			OriginProtocol, err)})
 	}
 
 	choice := acc.Choices[0]
@@ -535,18 +336,18 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 	switch finishReason {
 	case FinishReasonLength:
 		err := errors.New("响应被截断 (finish_reason=length)")
-		failure := invocation.NewFailure(invocation.FailureOutputTruncated,
-			invocation.PhaseResponseValidate, invocation.OriginProvider, err)
+		failure := NewFailure(FailureOutputTruncated,
+			PhaseResponseValidate, OriginProvider, err)
 		failure.FinishReason = string(finishReason)
 		return emitFailure(&ErrBadResponse{Err: err, Failure: failure})
 	case FinishReasonContentFilter:
 		err := errors.New("响应被内容过滤器拦截 (finish_reason=content_filter)")
-		failure := invocation.NewFailure(invocation.FailureContentFiltered,
-			invocation.PhaseResponseValidate, invocation.OriginProvider, err)
+		failure := NewFailure(FailureContentFiltered,
+			PhaseResponseValidate, OriginProvider, err)
 		failure.FinishReason = string(finishReason)
 		return emitFailure(&ErrUnrecoverable{Err: err, Failure: failure})
 	case FinishReasonUnknown:
-		log.Printf("[llm] 警告: 流式响应未知 finish_reason=%q", choice.FinishReason)
+		return emitFailure(responsesProtocolError("Chat SSE 缺少合法 finish_reason", nil))
 	}
 
 	var toolCalls []ToolCall
@@ -554,18 +355,18 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 		args := make(map[string]any)
 		if tc.Function.Arguments != "" {
 			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-				// 与非流式同口径：载荷尺寸入错（2026-08-20 SWE-001 预防 1）。
+				// 错误中仅记录参数载荷尺寸，便于诊断截断或非法 JSON。
 				wrapped := fmt.Errorf("流式 tool call %q 参数解析失败（载荷 %d 字符）: %w",
 					tc.Function.Name, len([]rune(tc.Function.Arguments)), err)
-				return emitFailure(&ErrBadResponse{Err: wrapped, Failure: invocation.NewFailure(
-					invocation.FailureMalformedResponse, invocation.PhaseToolCallValidate,
-					invocation.OriginProtocol, wrapped)})
+				return emitFailure(&ErrBadResponse{Err: wrapped, Failure: NewFailure(
+					FailureMalformedResponse, PhaseToolCallValidate,
+					OriginProtocol, wrapped)})
 			}
 		}
 		toolCalls = append(toolCalls, ToolCall{ID: tc.ID, Name: tc.Function.Name, Arguments: args})
 	}
 
-	result := Response{
+	result := responseData{
 		Content:      choice.Message.Content,
 		ToolCalls:    toolCalls,
 		FinishReason: finishReason,
@@ -582,9 +383,9 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 			encoded, err := json.Marshal(value)
 			if err != nil {
 				wrapped := fmt.Errorf("流式扩展数组字段 %q 聚合失败: %w", key, err)
-				return emitFailure(&ErrBadResponse{Err: wrapped, Failure: invocation.NewFailure(
-					invocation.FailureMalformedResponse, invocation.PhaseStreamAccumulate,
-					invocation.OriginProtocol, wrapped)})
+				return emitFailure(&ErrBadResponse{Err: wrapped, Failure: NewFailure(
+					FailureMalformedResponse, PhaseStreamAccumulate,
+					OriginProtocol, wrapped)})
 			}
 			result.ExtraFields[key] = encoded
 		}
@@ -592,9 +393,9 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 			encoded, err := json.Marshal(value)
 			if err != nil {
 				wrapped := fmt.Errorf("流式扩展字段 %q 聚合失败: %w", key, err)
-				return emitFailure(&ErrBadResponse{Err: wrapped, Failure: invocation.NewFailure(
-					invocation.FailureMalformedResponse, invocation.PhaseStreamAccumulate,
-					invocation.OriginProtocol, wrapped)})
+				return emitFailure(&ErrBadResponse{Err: wrapped, Failure: NewFailure(
+					FailureMalformedResponse, PhaseStreamAccumulate,
+					OriginProtocol, wrapped)})
 			}
 			result.ExtraFields[key] = encoded
 		}
@@ -604,20 +405,21 @@ func (c *SDKClient) chatStreaming(ctx context.Context, params openai.ChatComplet
 		result.Reasoning = accumulatedReasoning
 	}
 	result.Items = chatCompletionOutputItems(result.Content, result.Reasoning, result.ToolCalls)
-	if handler != nil {
-		handler(StreamEvent{
-			AccumulatedContent: result.Content, AccumulatedReasoning: result.Reasoning, Done: true,
-		})
-	}
+	markStreamCompleted(ctx)
 	return result, nil
 }
 
 // convertMessage 将内部 Message 转换为 SDK 的消息类型。
 // 遇到未知 role 时返回 ErrUnknownRole 而非静默降级。
 func convertMessage(m Message) (openai.ChatCompletionMessageParamUnion, error) {
+	if len(m.Parts) > 0 {
+		return chatParts(m)
+	}
 	switch m.Role {
 	case "system":
 		return openai.SystemMessage(m.Content), nil
+	case "developer":
+		return openai.DeveloperMessage(m.Content), nil
 	case "user":
 		return openai.UserMessage(m.Content), nil
 	case "assistant":
@@ -635,8 +437,8 @@ func convertMessage(m Message) (openai.ChatCompletionMessageParamUnion, error) {
 					wrapped := fmt.Errorf("序列化 tool call %q 参数失败: %w", tc.Name, err)
 					return openai.ChatCompletionMessageParamUnion{}, &ErrBadResponse{
 						Err: wrapped,
-						Failure: invocation.NewFailure(invocation.FailureInvalidRequest,
-							invocation.PhaseRequestEncode, invocation.OriginRuntime, wrapped),
+						Failure: NewFailure(FailureInvalidRequest,
+							PhaseRequestEncode, OriginRuntime, wrapped),
 					}
 				}
 				sdkCalls = append(sdkCalls, openai.ChatCompletionMessageToolCallUnionParam{
@@ -651,10 +453,10 @@ func convertMessage(m Message) (openai.ChatCompletionMessageParamUnion, error) {
 			}
 			assistantParam.ToolCalls = sdkCalls
 		}
-		if len(m.ExtraFields) > 0 {
-			extras := make(map[string]any, len(m.ExtraFields))
-			for k, v := range m.ExtraFields {
-				if k == responsesOutputItemsExtraField {
+		if m.Replay != nil && len(m.Replay.Fields) > 0 {
+			extras := make(map[string]any, len(m.Replay.Fields))
+			for k, v := range m.Replay.Fields {
+				if k == ReplayItemsBudgetKey {
 					continue
 				}
 				// json.RawMessage 实现了 json.Marshaler，openai-go 会原样写出
@@ -713,36 +515,39 @@ func classifySDKError(ctx context.Context, err error) error {
 			cause = ctx.Err()
 		}
 		if errors.Is(ctx.Err(), context.Canceled) {
-			failure := invocation.NewFailure(invocation.FailureCallerCancelled,
-				invocation.PhaseRequestSend, invocation.OriginCaller, cause)
-			failure.TimeoutScope = invocation.TimeoutCaller
+			failure := NewFailure(FailureCallerCancelled,
+				PhaseRequestSend, OriginCaller, cause)
+			failure.TimeoutScope = TimeoutCaller
 			failure.Partial = true
-			failure.UsageState = invocation.UsagePartial
+			failure.UsageState = UsagePartial
 			return &ErrUnrecoverable{Err: err, Failure: failure}
 		}
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			kind := invocation.FailureActivationDeadline
-			scope := invocation.TimeoutActivation
+			kind := FailureActivationDeadline
+			scope := TimeoutActivation
 			switch {
-			case errors.Is(cause, invocation.ErrAttemptDeadline):
-				kind = invocation.FailureAttemptDeadline
-				scope = invocation.TimeoutAttempt
-			case errors.Is(cause, invocation.ErrGraphDeadline):
-				scope = invocation.TimeoutGraph
-			case errors.Is(cause, invocation.ErrRunDeadline):
-				scope = invocation.TimeoutRun
-			case errors.Is(cause, invocation.ErrActivationDeadline):
-				scope = invocation.TimeoutActivation
+			case errors.Is(cause, ErrAttemptDeadline):
+				kind = FailureAttemptDeadline
+				scope = TimeoutAttempt
+			case errors.Is(cause, ErrGraphDeadline):
+				scope = TimeoutGraph
+			case errors.Is(cause, ErrRunDeadline):
+				scope = TimeoutRun
+			case errors.Is(cause, ErrActivationDeadline):
+				scope = TimeoutActivation
 			}
-			failure := invocation.NewFailure(kind,
-				invocation.PhaseRequestSend, invocation.OriginRuntime, cause)
+			failure := NewFailure(kind,
+				PhaseRequestSend, OriginRuntime, cause)
 			failure.TimeoutScope = scope
 			failure.Partial = true
-			failure.UsageState = invocation.UsagePartial
+			failure.UsageState = UsagePartial
 			return &ErrUnrecoverable{Err: err, Failure: failure}
 		}
 	}
 
+	if _, ok := FromError(err); ok {
+		return err
+	}
 	var apiErr *openai.Error
 	if errors.As(err, &apiErr) {
 		code := apiErr.Code
@@ -752,8 +557,8 @@ func classifySDKError(ctx context.Context, err error) error {
 		if apiErr.Request != nil && apiErr.Request.URL != nil {
 			endpoint = apiErr.Request.URL.String()
 		}
-		failure := invocation.NewFailure(invocation.FailureUnknown,
-			invocation.PhaseResponseHeaders, invocation.OriginProvider, err)
+		failure := NewFailure(FailureUnknown,
+			PhaseResponseHeaders, OriginProvider, err)
 		failure.ProviderCode = code
 		failure.HTTPStatus = statusCode
 
@@ -761,75 +566,75 @@ func classifySDKError(ctx context.Context, err error) error {
 		case normalized == "context_length_exceeded",
 			normalized == "maximum_context_length_exceeded",
 			normalized == "context_window_exceeded":
-			failure.Kind = invocation.FailureContextWindowExceeded
+			failure.Kind = FailureContextWindowExceeded
 			return &ErrUnrecoverable{Err: err, StatusCode: statusCode, Code: code,
 				Message: message, Endpoint: endpoint, Failure: failure}
 		case statusCode == 408:
-			failure.Kind = invocation.FailureRequestTimeout
-			failure.TimeoutScope = invocation.TimeoutInvocation
+			failure.Kind = FailureRequestTimeout
+			failure.TimeoutScope = TimeoutInvocation
 			return &ErrRecoverable{Err: err, Code: code, Message: message, Failure: failure}
 		case statusCode == 429:
-			failure.Kind = invocation.FailureRateLimited
+			failure.Kind = FailureRateLimited
 			return &ErrRecoverable{Err: err, Code: code, Message: message, Failure: failure}
 		case statusCode == 402,
 			normalized == "insufficient_quota",
 			normalized == "insufficient_balance",
 			normalized == "billing_hard_limit_reached",
 			normalized == "billing_not_active":
-			failure.Kind = invocation.FailureProviderQuotaExhausted
+			failure.Kind = FailureProviderQuotaExhausted
 		case statusCode == 502 || statusCode == 503 || statusCode == 504:
-			failure.Kind = invocation.FailureProviderUnavailable
+			failure.Kind = FailureProviderUnavailable
 			return &ErrRecoverable{Err: err, Code: code, Message: message, Failure: failure}
 		case statusCode == 500:
 			// 外壳类型只保留 API 兼容；internal L4 依据 canonical kind
 			// provider_unavailable 做唯一恢复决策。
-			failure.Kind = invocation.FailureProviderUnavailable
+			failure.Kind = FailureProviderUnavailable
 		case statusCode == 401:
-			failure.Kind = invocation.FailureAuth
+			failure.Kind = FailureAuth
 		case statusCode == 403:
-			failure.Kind = invocation.FailurePermissionDenied
+			failure.Kind = FailurePermissionDenied
 		case statusCode == 404:
 			if normalized == "model_not_found" {
-				failure.Kind = invocation.FailureModelUnavailable
+				failure.Kind = FailureModelUnavailable
 			} else {
-				failure.Kind = invocation.FailureInvalidRequest
+				failure.Kind = FailureInvalidRequest
 			}
 		case statusCode == 400 || statusCode == 405:
-			failure.Kind = invocation.FailureInvalidRequest
+			failure.Kind = FailureInvalidRequest
 		default:
-			failure.Kind = invocation.FailureUnknown
+			failure.Kind = FailureUnknown
 		}
 		return &ErrUnrecoverable{Err: err, StatusCode: statusCode, Code: code,
 			Message: message, Endpoint: endpoint, Failure: failure}
 	}
 
 	if errors.Is(err, context.Canceled) {
-		failure := invocation.NewFailure(invocation.FailureCallerCancelled,
-			invocation.PhaseRequestSend, invocation.OriginCaller, err)
-		failure.TimeoutScope = invocation.TimeoutCaller
+		failure := NewFailure(FailureCallerCancelled,
+			PhaseRequestSend, OriginCaller, err)
+		failure.TimeoutScope = TimeoutCaller
 		failure.Partial = true
-		failure.UsageState = invocation.UsagePartial
+		failure.UsageState = UsagePartial
 		return &ErrUnrecoverable{Err: err, Failure: failure}
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		failure := invocation.NewFailure(invocation.FailureRequestTimeout,
-			invocation.PhaseRequestSend, invocation.OriginTransport, err)
-		failure.TimeoutScope = invocation.TimeoutInvocation
+		failure := NewFailure(FailureRequestTimeout,
+			PhaseRequestSend, OriginTransport, err)
+		failure.TimeoutScope = TimeoutInvocation
 		failure.Partial = true
-		failure.UsageState = invocation.UsagePartial
+		failure.UsageState = UsagePartial
 		return &ErrRecoverable{Err: err, Failure: failure}
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
-		failure := invocation.NewFailure(invocation.FailureTransport,
-			invocation.PhaseConnect, invocation.OriginTransport, err)
+		failure := NewFailure(FailureTransport,
+			PhaseConnect, OriginTransport, err)
 		return &ErrRecoverable{Err: err, Failure: failure}
 	}
 
 	// SDK 未暴露足够结构化信息时保持 unknown。外壳保留兼容，但 internal
 	// L4 不得据此覆盖 canonical RecoveryRequestIntervene。
-	failure := invocation.NewFailure(invocation.FailureUnknown,
-		invocation.PhaseRequestSend, invocation.OriginRuntime, err)
+	failure := NewFailure(FailureUnknown,
+		PhaseRequestSend, OriginRuntime, err)
 	return &ErrRecoverable{Err: err, Failure: failure}
 }
 
@@ -862,29 +667,29 @@ func classifyStreamProviderError(raw string) error {
 		diagnostic += fmt.Sprintf("（载荷 %d 字节，正文已脱敏）", len([]byte(raw)))
 	}
 	err := errors.New(diagnostic)
-	failure := invocation.NewFailure(invocation.FailureUnknown,
-		invocation.PhaseStreamReceive, invocation.OriginProvider, err)
+	failure := NewFailure(FailureUnknown,
+		PhaseStreamReceive, OriginProvider, err)
 	failure.ProviderCode = code
 
 	switch strings.ToLower(code) {
 	case "context_length_exceeded", "maximum_context_length_exceeded", "context_window_exceeded":
-		failure.Kind = invocation.FailureContextWindowExceeded
+		failure.Kind = FailureContextWindowExceeded
 		return &ErrUnrecoverable{Err: err, Code: code, Message: message, Failure: failure}
 	case "rate_limit_exceeded":
-		failure.Kind = invocation.FailureRateLimited
+		failure.Kind = FailureRateLimited
 	case "insufficient_quota", "insufficient_balance", "billing_hard_limit_reached", "billing_not_active":
-		failure.Kind = invocation.FailureProviderQuotaExhausted
+		failure.Kind = FailureProviderQuotaExhausted
 		return &ErrUnrecoverable{Err: err, Code: code, Message: message, Failure: failure}
 	case "invalid_api_key", "authentication_error":
-		failure.Kind = invocation.FailureAuth
+		failure.Kind = FailureAuth
 		return &ErrUnrecoverable{Err: err, Code: code, Message: message, Failure: failure}
 	case "model_not_found":
-		failure.Kind = invocation.FailureModelUnavailable
+		failure.Kind = FailureModelUnavailable
 		return &ErrUnrecoverable{Err: err, Code: code, Message: message, Failure: failure}
 	case "server_error", "service_unavailable":
-		failure.Kind = invocation.FailureProviderUnavailable
+		failure.Kind = FailureProviderUnavailable
 	default:
-		failure.Kind = invocation.FailureUnknown
+		failure.Kind = FailureUnknown
 	}
 	// 外壳仅为兼容；internal L4 只看 FailureKind。
 	return &ErrRecoverable{Err: err, Code: code, Message: message, Failure: failure}

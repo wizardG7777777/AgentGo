@@ -5,8 +5,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"agentgo/internal/contextadapter"
 	"agentgo/internal/contextcontract"
+	"agentgo/internal/contextruntime"
 	"agentgo/internal/contextstore"
 	"agentgo/internal/llm"
 	"agentgo/internal/policycatalog"
@@ -35,13 +35,16 @@ var _ SnapshotRepository = (*contextstore.Store)(nil)
 
 // Options 只开放机械测试/预算参数，不允许覆盖 verifier system prompt。
 type Options struct {
+	Invocation     llm.Options
+	Output         *contextruntime.OutputService
+	SessionID      func() string
 	MaxOutputBytes int
 	Now            func() time.Time
 }
 
 // Verifier 是 graph.ProposalAcceptancePort 的生产实现。
 type Verifier struct {
-	client        llm.Client
+	client        llm.Invoker
 	requests      RequestTextResolver
 	snapshots     SnapshotRepository
 	maxOutput     int
@@ -49,5 +52,5 @@ type Verifier struct {
 	instanceID    string
 	invocationSeq atomic.Uint64
 	catalog       *policycatalog.Catalog
-	adapter       *contextadapter.Adapter
+	runtime       contextruntime.Runtime
 }

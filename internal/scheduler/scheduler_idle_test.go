@@ -20,7 +20,7 @@ func TestSchedulerBundle_New_IdleThresholdStaysZero(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.AgentIdleThreshold = 9 // 全局配置非 0：scheduler 也不应消费它
 
-	bundle := New(s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil,
+	bundle := newTestScheduler(t, s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil,
 		nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	if bundle == nil || bundle.Agent == nil {
 		t.Fatal("New returned nil Bundle")

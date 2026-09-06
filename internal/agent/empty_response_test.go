@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"agentgo/internal/testmodel"
 	"context"
 	"strings"
 	"testing"
@@ -17,21 +18,21 @@ type emptyThenDoneMock struct {
 	lastMessages []llm.Message
 }
 
-func (m *emptyThenDoneMock) Chat(_ context.Context, messages []llm.Message, _ []llm.ToolDef) (llm.Response, error) {
+func (m *emptyThenDoneMock) nextFixture(_ context.Context, messages []llm.Message, _ []llm.ToolDef) (testmodel.Fixture, error) {
 	m.calls++
 	m.lastMessages = messages
 	if m.calls <= m.emptyCalls {
-		return llm.Response{Content: "", Reasoning: "only reasoning, no content"}, nil
+		return testmodel.Fixture{Content: "", Reasoning: "only reasoning, no content"}, nil
 	}
-	return llm.Response{Content: "任务完成"}, nil
+	return testmodel.Fixture{Content: "任务完成"}, nil
 }
 
 // 空响应守卫：空响应轮次不收口，注入提醒后继续；恢复非空响应后任务正常完成。
 func TestProcessTask_EmptyResponseNudgedThenCompletes(t *testing.T) {
 	s, _, _ := setup()
 	mock := &emptyThenDoneMock{emptyCalls: 2}
-	exec := NewSwappableLLMExecutor(mock, newLeaseToolRegistry("read_file", "submit_task_result"), nil, nil, nil, "")
-	ag := NewAgent("worker-empty", "work", s, nil, exec.Execute)
+	exec := newTestSwappableLLMExecutor(t, mock, newLeaseToolRegistry("read_file", "submit_task_result"), nil, nil, nil, "")
+	ag := NewAgent("worker-empty", "work", s, nil, testExecutor(t, exec.Execute))
 	ag.ToolSwapper = exec
 
 	task := &model.Task{ID: "t-empty", Description: "空响应恢复测试", EventType: "work"}
@@ -71,8 +72,8 @@ func TestProcessTask_EmptyResponseNudgedThenCompletes(t *testing.T) {
 func TestProcessTask_EmptyResponseExhaustedFailsRecoverable(t *testing.T) {
 	s, _, _ := setup()
 	mock := &emptyThenDoneMock{emptyCalls: 99}
-	exec := NewSwappableLLMExecutor(mock, newLeaseToolRegistry("read_file", "submit_task_result"), nil, nil, nil, "")
-	ag := NewAgent("worker-empty2", "work", s, nil, exec.Execute)
+	exec := newTestSwappableLLMExecutor(t, mock, newLeaseToolRegistry("read_file", "submit_task_result"), nil, nil, nil, "")
+	ag := NewAgent("worker-empty2", "work", s, nil, testExecutor(t, exec.Execute))
 	ag.ToolSwapper = exec
 
 	task := &model.Task{ID: "t-empty-x", Description: "空响应耗尽测试", EventType: "work"}
@@ -98,4 +99,16 @@ func TestProcessTask_EmptyResponseExhaustedFailsRecoverable(t *testing.T) {
 	if got.Status != model.TaskStatusPending {
 		t.Fatalf("status = %s，want pending（ErrRecoverable 应触发重试回滚）", got.Status)
 	}
+}
+
+func (m *emptyThenDoneMock) Invoke(ctx context.Context, request llm.Request, sink llm.EventSink) (llm.Result, error) {
+	if err := request.Validate(); err != nil {
+		return llm.Result{}, err
+	}
+	spec := request.Spec()
+	fixture, err := m.nextFixture(ctx, spec.Messages, spec.Tools)
+	if err != nil {
+		return llm.Result{}, err
+	}
+	return fixture.Seal(spec.Options.Protocol)
 }

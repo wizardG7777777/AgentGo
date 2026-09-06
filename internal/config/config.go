@@ -29,10 +29,11 @@ import (
 // 推断请求变换；结构体保留该字段仅为让旧 YAML 仍能解析，Validate() 会对
 // 非空值返回明确的迁移诊断错误。
 type LLMConfig struct {
-	BaseURL      string `yaml:"base_url" json:"base_url"`
-	APIKey       string `yaml:"api_key" json:"api_key"`
-	DefaultModel string `yaml:"default_model" json:"default_model"`
-	TimeoutSec   int    `yaml:"timeout_sec" json:"timeout_sec"`
+	RequestContract string `yaml:"request_contract" json:"request_contract"`
+	BaseURL         string `yaml:"base_url" json:"base_url"`
+	APIKey          string `yaml:"api_key" json:"api_key"`
+	DefaultModel    string `yaml:"default_model" json:"default_model"`
+	TimeoutSec      int    `yaml:"timeout_sec" json:"timeout_sec"`
 	// Protocol 冻结 Model Invocation wire：responses 是新主链；
 	// chat_completions 只作显式兼容，不允许运行中自动回退。
 	Protocol string `yaml:"protocol,omitempty" json:"protocol,omitempty"`
@@ -42,7 +43,7 @@ type LLMConfig struct {
 	ReasoningEffort string `yaml:"reasoning_effort,omitempty" json:"reasoning_effort,omitempty"`
 	// Stream 启用所选 protocol 的 SSE。客户端只在完整 typed output item 完成后
 	// 返回 Response，partial 参数永不 dispatch；UI 可观察独立正文/reasoning delta。
-	Stream                     bool                             `yaml:"stream" json:"stream"`
+
 	DefaultContextWindowTokens int64                            `yaml:"default_context_window_tokens,omitempty" json:"default_context_window_tokens,omitempty"`
 	DefaultMaxCompletionTokens int64                            `yaml:"default_max_completion_tokens,omitempty" json:"default_max_completion_tokens,omitempty"`
 	ModelCapabilities          map[string]ModelCapabilityConfig `yaml:"model_capabilities,omitempty" json:"model_capabilities,omitempty"`
@@ -240,7 +241,7 @@ func (c UIConfig) HasFrontend(name string) bool {
 // AgentRuntimeConfig 内部使用，由 Bootstrap 从 AgentKind + LLMConfig 合成后注入到
 // agent runner（v4 §11.4 + §11.6.1）。不出现在 YAML 中。
 //
-// LLM 客户端不在此结构中——Bootstrap 单独构造 llm.Client 并通过 deps 注入。
+// LLM 客户端不在此结构中——Bootstrap 单独构造 llm.Invoker 并通过 deps 注入。
 // 本结构的 Model 字段仅作为运行时元数据使用——主要用途是 HistoryEntry.Model 记录
 // （详见 nextUpgrade_v4.md §11.7.3 模型切换基准重置）与运行时日志。
 type AgentRuntimeConfig struct {
@@ -393,7 +394,7 @@ func ptrTo[T any](v T) *T { return &v }
 
 func DefaultConfig() *Config {
 	return &Config{
-		LLM:                        LLMConfig{Protocol: "responses"},
+		LLM:                        LLMConfig{RequestContract: "agentgo.model-request/v1", Protocol: "responses"},
 		ProjectRoot:                ".",
 		Scheduler:                  SchedulerKind{},
 		ShellTimeoutSec:            30,
@@ -492,6 +493,17 @@ func LoadConfig(path string, explicit bool) (*Config, error) {
 	// 环境变量展开（v4 §11.3 末尾"环境变量替换"段）
 	expanded := []byte(os.ExpandEnv(string(data)))
 
+	var rawConfig map[string]any
+	if err := yaml.Unmarshal(expanded, &rawConfig); err != nil {
+		return nil, err
+	}
+	llmBlock, ok := rawConfig["llm"].(map[string]any)
+	if !ok || llmBlock["request_contract"] != "agentgo.model-request/v1" {
+		return nil, fmt.Errorf("配置必须显式声明 llm.request_contract: agentgo.model-request/v1")
+	}
+	if _, present := llmBlock["stream"]; present {
+		return nil, fmt.Errorf("llm.stream 已退役，所有协议必须使用 SSE")
+	}
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
 	case ".yaml", ".yml":
@@ -554,6 +566,9 @@ func LoadConfig(path string, explicit bool) (*Config, error) {
 // AgentTemplate provision Team。只要 agents 非空，原有静态 kind 的全部严格
 // 校验仍然执行，非法配置不会静默降级。
 func (c *Config) Validate() error {
+	if c.LLM.RequestContract != "agentgo.model-request/v1" {
+		return fmt.Errorf("llm.request_contract 不支持或缺失")
+	}
 	// llm.provider 已于 V6 移除：读到旧字段必须给出明确的迁移诊断，
 	// 不允许静默忽略或回退（V6 升级决议，见 docs/nextUpgrade-V6.md）。
 	if c.LLM.Provider != "" {

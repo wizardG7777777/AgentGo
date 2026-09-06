@@ -1,5 +1,7 @@
 package runner
 
+import "agentgo/internal/testmodel"
+
 import (
 	"fmt"
 	"strings"
@@ -17,7 +19,7 @@ func TestNewRejectsClaimedMailboxWithoutOwningRegistry(t *testing.T) {
 			t.Fatalf("New panic = %v, want claimed mailbox registry validation", got)
 		}
 	}()
-	New(config.AgentRuntimeConfig{InstanceID: "team-agent-1", EventType: "team:one"}, RunnerDeps{
-		ClaimedMailbox: mb,
+	newTestRunner(t, config.AgentRuntimeConfig{InstanceID: "team-agent-1", EventType: "team:one"}, RunnerDeps{
+		ClaimedMailbox: mb, ContextRuntime: testmodel.Runtime(t),
 	})
 }

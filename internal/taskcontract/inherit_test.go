@@ -13,7 +13,7 @@ import (
 func TestInheritCopiesRunAndRecompilesProgress(t *testing.T) {
 	now := time.Now().UTC()
 	parent := &model.Task{
-		ID: "parent", RunID: "run-1", ContextPolicyRef: "context:default/v1",
+		ID: "parent", RunID: "run-1", ContextPolicyRef: policycatalog.ContextDefaultCurrent,
 		RunContract: &runcontract.RunContract{
 			Schema: runcontract.SchemaV1, RunID: "run-1", CreatedAt: now,
 			DeadlineAt: now.Add(time.Hour), FinalizationReserve: time.Minute,

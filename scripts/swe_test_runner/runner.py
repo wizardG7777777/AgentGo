@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+from sse import decode_probe
+
 import argparse
 import collections
 import contextlib
@@ -427,7 +429,7 @@ def probe_request(model: str, probe_name: str, nonce: str, protocol: str) -> dic
             "tools": [tool],
             "tool_choice": "auto",
             "max_output_tokens": 256,
-            "stream": False,
+            "stream": True,
         }
     return {
         "model": model,
@@ -444,7 +446,7 @@ def probe_request(model: str, probe_name: str, nonce: str, protocol: str) -> dic
         "tool_choice": "auto",
         "reasoning_effort": "low",
         "max_tokens": 256,
-        "stream": False,
+        "stream": True,
     }
 
 
@@ -516,7 +518,7 @@ def urllib_probe_transport(endpoint: str, api_key: str, body: dict, timeout_sec:
         data=json.dumps(body).encode("utf-8"),
         method="POST",
         headers={
-            "Accept": "application/json",
+            "Accept": "text/event-stream",
             "Authorization": "Bearer " + api_key,
             "Content-Type": "application/json",
         },
@@ -524,8 +526,11 @@ def urllib_probe_transport(endpoint: str, api_key: str, body: dict, timeout_sec:
     try:
         with urllib.request.urlopen(
                 request, timeout=timeout_sec, context=verified_ssl_context()) as response:
-            payload = json.load(response)
-            return response.status, payload if isinstance(payload, dict) else {}
+            if response.headers.get_content_type() != "text/event-stream":
+                raise RuntimeError("provider capability probe 必须返回 SSE")
+            protocol = "responses" if endpoint.endswith("/responses") else "chat_completions"
+            payload = decode_probe(response, protocol)
+            return response.status, payload
     except urllib.error.HTTPError as error:
         try:
             payload = json.loads(error.read().decode("utf-8", errors="replace"))
@@ -593,7 +598,7 @@ def http_json(url: str, token: str, method: str = "GET", body: dict | None = Non
               timeout: int = 15) -> tuple[int, dict]:
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(url, data=data, method=method, headers={
-        "Accept": "application/json",
+        "Accept": "text/event-stream",
         "Authorization": "Bearer " + token,
         **({"Content-Type": "application/json"} if data is not None else {}),
     })

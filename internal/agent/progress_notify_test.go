@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -22,11 +23,11 @@ var toolNames = []string{"write_file", "edit_file", "read_file", "publish_subtas
 
 // randomExecuteResult generates a random ExecuteResult with 0-5 ToolCalls.
 // Each ToolCall has a random Name from toolNames, and the corresponding
-// ToolResult.Content is either normal content or prefixed with "错误:".
+// contextcontract.ToolResult.Content is either normal content or prefixed with "错误:".
 func randomExecuteResult(rng *rand.Rand) ExecuteResult {
 	n := rng.Intn(6) // 0-5 tool calls
 	calls := make([]llm.ToolCall, n)
-	results := make([]ToolResult, n)
+	results := make([]contextcontract.ToolResult, n)
 	for i := 0; i < n; i++ {
 		name := toolNames[rng.Intn(len(toolNames))]
 		args := map[string]any{}
@@ -41,12 +42,12 @@ func randomExecuteResult(rng *rand.Rand) ExecuteResult {
 		}
 		// Randomly choose normal content or error prefix
 		if rng.Intn(3) == 0 {
-			results[i] = ToolResult{
+			results[i] = contextcontract.ToolResult{
 				ToolCallID: calls[i].ID,
 				Content:    "错误:" + randomString(rng, 10),
 			}
 		} else {
-			results[i] = ToolResult{
+			results[i] = contextcontract.ToolResult{
 				ToolCallID: calls[i].ID,
 				Content:    "success: " + randomString(rng, 10),
 			}
@@ -80,7 +81,7 @@ func randomString(rng *rand.Rand, length int) string {
 
 // expectedFileWriteDetected is the oracle: returns true iff there exists at least
 // one ToolCall with Name "write_file" or "edit_file" whose corresponding
-// ToolResult.Content does NOT start with "错误:".
+// contextcontract.ToolResult.Content does NOT start with "错误:".
 func expectedFileWriteDetected(result ExecuteResult) bool {
 	for i, tc := range result.ToolCalls {
 		if tc.Name != "write_file" && tc.Name != "edit_file" {
@@ -313,7 +314,7 @@ func TestProperty8_ConfigDisabledSkipsAll(t *testing.T) {
 				{ID: "tc1", Name: "write_file", Arguments: map[string]any{"path": "src/foo.go"}},
 				{ID: "tc2", Name: "publish_subtask", Arguments: map[string]any{}},
 			},
-			ToolResults: []ToolResult{
+			ToolResults: []contextcontract.ToolResult{
 				{ToolCallID: "tc1", Content: "success: wrote file"},
 				{ToolCallID: "tc2", Content: "subtask published"},
 			},
@@ -399,7 +400,7 @@ func TestProperty4_AtMostOncePerTriggerType(t *testing.T) {
 				{ID: "tc1", Name: "write_file", Arguments: map[string]any{"path": "src/foo.go"}},
 				{ID: "tc2", Name: "publish_subtask", Arguments: map[string]any{}},
 			},
-			ToolResults: []ToolResult{
+			ToolResults: []contextcontract.ToolResult{
 				{ToolCallID: "tc1", Content: "success: wrote file"},
 				{ToolCallID: "tc2", Content: "subtask published"},
 			},
@@ -475,7 +476,7 @@ func TestProgressNotify_NilMailRegistry_NoPanic(t *testing.T) {
 			{ID: "tc1", Name: "write_file", Arguments: map[string]any{"path": "src/foo.go"}},
 			{ID: "tc2", Name: "publish_subtask", Arguments: map[string]any{}},
 		},
-		ToolResults: []ToolResult{
+		ToolResults: []contextcontract.ToolResult{
 			{ToolCallID: "tc1", Content: "success"},
 			{ToolCallID: "tc2", Content: "ok"},
 		},
@@ -522,7 +523,7 @@ func TestProgressNotify_SendError_NoInterrupt(t *testing.T) {
 			{ID: "tc1", Name: "write_file", Arguments: map[string]any{"path": "src/bar.go"}},
 			{ID: "tc2", Name: "publish_subtask", Arguments: map[string]any{}},
 		},
-		ToolResults: []ToolResult{
+		ToolResults: []contextcontract.ToolResult{
 			{ToolCallID: "tc1", Content: "success"},
 			{ToolCallID: "tc2", Content: "ok"},
 		},
@@ -569,7 +570,7 @@ func TestProgressNotify_PanicRecovery(t *testing.T) {
 		ToolCalls: []llm.ToolCall{
 			{ID: "tc1", Name: "write_file", Arguments: map[string]any{"path": "src/panic.go"}},
 		},
-		ToolResults: []ToolResult{
+		ToolResults: []contextcontract.ToolResult{
 			{ToolCallID: "tc1", Content: "success"},
 		},
 	}
@@ -624,7 +625,7 @@ func TestProgressNotify_TraceEventKind(t *testing.T) {
 		ToolCalls: []llm.ToolCall{
 			{ID: "tc1", Name: "write_file", Arguments: map[string]any{"path": "src/traced.go"}},
 		},
-		ToolResults: []ToolResult{
+		ToolResults: []contextcontract.ToolResult{
 			{ToolCallID: "tc1", Content: "success"},
 		},
 	}

@@ -9,16 +9,20 @@ package bootstrap
 // best-effort 局限（mTLS / L4 LB 后端不健康 / CDN / WAF 等）见 §9.5.2。
 
 import (
+	"agentgo/internal/contextruntime"
+	"agentgo/internal/contextstore"
+	"agentgo/internal/policycatalog"
+	"agentgo/internal/session"
 	"context"
 	"fmt"
 	"io"
 	"net"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"agentgo/internal/config"
-	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 
 	"github.com/google/uuid"
@@ -141,7 +145,7 @@ func startupToolCapabilityProbe(w io.Writer, cfg *config.Config, timeout time.Du
 	if model == "" {
 		model = cfg.LLM.DefaultModel
 	}
-	budget := invocation.OutputBudget{
+	budget := llm.OutputBudget{
 		MaxContentBytes: 4 << 10, MaxReasoningBytes: 8 << 10, MaxExtraFieldBytes: 8 << 10,
 		MaxToolNameBytes: 128, MaxToolArgumentsBytes: 4 << 10, MaxToolCalls: 16,
 		MaxToolArgumentsTotalBytes: 4 << 10, MaxResponseBytes: 16 << 10, MaxCompletionTokens: 256,
@@ -149,22 +153,28 @@ func startupToolCapabilityProbe(w io.Writer, cfg *config.Config, timeout time.Du
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	started := time.Now()
+	probeStore, storeErr := contextstore.New(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "model-probes-v2"))
+	if storeErr != nil {
+		return storeErr
+	}
+	defer probeStore.Close()
+	catalog, catalogErr := policycatalog.NewDefault()
+	if catalogErr != nil {
+		return catalogErr
+	}
+	runtime := contextruntime.Runtime{Assembler: contextruntime.NewAssembler(), Policies: catalog, Snapshots: probeStore}
+	runtime.Output = contextruntime.NewOutputService(func(record contextruntime.OutputRecord) error {
+		return session.AppendModelOutputFile(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "model-probes-v2", "model-outputs.jsonl"), record)
+	})
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		probeName := "agentgo_capability_probe_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
 		probeNonce := "nonce_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
-		protocol := llm.Protocol(cfg.LLM.Protocol)
-		if protocol == "" {
-			protocol = llm.ProtocolResponses
-		}
-		client := llm.NewSDKClientWithConfig(cfg.LLM.BaseURL, cfg.LLM.APIKey, model, "", timeout, llm.ClientConfig{
-			Protocol: protocol, Stream: cfg.LLM.Stream, ReasoningEffort: cfg.LLM.ReasoningEffort,
-			ToolChoice: invocation.ToolChoice{Mode: invocation.ToolChoiceAuto}, OutputBudget: budget,
-		})
-		response, err := llm.InvokeLegacy(ctx, client, []llm.Message{{
-			Role: "user", Content: "Call the provided function exactly once with nonce " + probeNonce + ". Do not answer with text.",
-		}}, []llm.ToolDef{{
+		client := llm.NewTransport(llm.TransportConfig{BaseURL: cfg.LLM.BaseURL, APIKey: cfg.LLM.APIKey, Timeout: timeout})
+		options := cfg.LLM.InvocationOptions(model)
+		options.OutputBudget = budget
+		response, err := runtime.InvokeOperation(ctx, contextruntime.Instructions{ProfileID: "startup-capability", Objective: "Call the provided function exactly once with nonce " + probeNonce + ". Do not answer with text."}, nil, []llm.ToolDef{{
 			Name: probeName, Description: "Prove function-calling compatibility with one required nonce argument.",
 			Strict: true,
 			Parameters: map[string]any{
@@ -174,7 +184,7 @@ func startupToolCapabilityProbe(w io.Writer, cfg *config.Config, timeout time.Du
 				},
 				"required": []any{"nonce"},
 			},
-		}})
+		}}, options, client)
 		if err != nil {
 			lastErr = err
 			if attempt < maxAttempts && retryableCapabilityProbeFailure(err) && ctx.Err() == nil {
@@ -184,8 +194,8 @@ func startupToolCapabilityProbe(w io.Writer, cfg *config.Config, timeout time.Du
 			fmt.Fprintf(w, "  [FAIL] function-call capability (%v): %v\n", time.Since(started).Round(time.Millisecond), err)
 			return fmt.Errorf("provider function-call capability probe 失败: %w", err)
 		}
-		compatible := len(response.ToolCalls) > 0 && response.FinishReason == "tool_calls"
-		for _, call := range response.ToolCalls {
+		compatible := len(response.ToolCalls()) > 0 && response.Data().FinishReason == "tool_calls"
+		for _, call := range response.ToolCalls() {
 			if call.Name != probeName || len(call.Arguments) != 1 || call.Arguments["nonce"] != probeNonce {
 				compatible = false
 				break
@@ -193,7 +203,7 @@ func startupToolCapabilityProbe(w io.Writer, cfg *config.Config, timeout time.Du
 		}
 		if !compatible {
 			lastErr = fmt.Errorf("provider function-call capability 不兼容: calls=%d finish_reason=%s",
-				len(response.ToolCalls), response.FinishReason)
+				len(response.ToolCalls()), response.Data().FinishReason)
 			if attempt < maxAttempts && ctx.Err() == nil {
 				// tool_choice=auto 下单次 text-only/wrong-call 只证明该采样未遵守
 				// 契约，不能证明 endpoint 完全没有 function-call 能力。连续三次
@@ -204,7 +214,7 @@ func startupToolCapabilityProbe(w io.Writer, cfg *config.Config, timeout time.Du
 			return lastErr
 		}
 		fmt.Fprintf(w, "  [OK]   protocol=%s streaming=%t typed function-call/required-arguments attempts=%d (%v)\n",
-			protocol, cfg.LLM.Stream, attempt, time.Since(started).Round(time.Millisecond))
+			options.Protocol, true, attempt, time.Since(started).Round(time.Millisecond))
 		return nil
 	}
 	return fmt.Errorf("provider function-call capability probe 失败: %w", lastErr)
@@ -214,14 +224,14 @@ func startupToolCapabilityProbe(w io.Writer, cfg *config.Config, timeout time.Du
 // 文本回复、错误工具名、错误参数和错误 finish reason 会走上面的协议校验并立即
 // fail-closed；因此重试不会把不兼容 provider 偶然包装成兼容。
 func retryableCapabilityProbeFailure(err error) bool {
-	failure, ok := invocation.FromError(err)
+	failure, ok := llm.FromError(err)
 	if !ok {
 		return false
 	}
 	switch failure.Kind {
-	case invocation.FailureOutputTruncated, invocation.FailureMalformedResponse,
-		invocation.FailureRequestTimeout, invocation.FailureTransport,
-		invocation.FailureRateLimited, invocation.FailureProviderUnavailable:
+	case llm.FailureOutputTruncated, llm.FailureMalformedResponse,
+		llm.FailureRequestTimeout, llm.FailureTransport,
+		llm.FailureRateLimited, llm.FailureProviderUnavailable:
 		return true
 	default:
 		return false

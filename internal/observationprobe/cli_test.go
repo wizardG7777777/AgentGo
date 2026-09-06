@@ -1,6 +1,7 @@
 package observationprobe
 
 import (
+	"agentgo/internal/testhttp"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -28,7 +29,7 @@ func TestRunV8UsesSharedSchemaAutoLow(t *testing.T) {
 			t.Errorf("probe 使用了非法/漂移 schema: %s", encoded)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		_ = testhttp.WriteSSE(w, r, map[string]any{
 			"id": "resp", "object": "response", "status": "completed",
 			"output": []any{map[string]any{"type": "function_call", "id": "fc", "call_id": "call",
 				"name": "record_observation_delta", "status": "completed",
@@ -39,7 +40,7 @@ func TestRunV8UsesSharedSchemaAutoLow(t *testing.T) {
 	}))
 	defer server.Close()
 	cfg := &config.Config{LLM: config.LLMConfig{BaseURL: server.URL, APIKey: "test", DefaultModel: "m",
-		Protocol: "responses", DefaultContextWindowTokens: 131072, DefaultMaxCompletionTokens: 16384}}
+		Protocol: "responses", DefaultContextWindowTokens: 131072, DefaultMaxCompletionTokens: 16384, RequestContract: "agentgo.model-request/v1"}}
 	report := run(cfg, "m", "v8", "empty", 1)
 	if report.Successes != 1 || len(report.Failures) != 0 {
 		t.Fatalf("report=%+v", report)

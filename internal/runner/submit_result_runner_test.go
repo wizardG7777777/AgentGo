@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"agentgo/internal/testmodel"
 	"context"
 	"os"
 	"path/filepath"
@@ -28,7 +29,7 @@ func TestRunnerSubmitTaskResultShortCircuitsWithStructuredPayload(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	client := &orderedToolClient{responses: []llm.Response{{
+	client := &orderedToolClient{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{{
 			ID: "submit-1", Name: "submit_task_result", Arguments: map[string]any{
 				"summary":          "报告已写入 report.md",
@@ -39,11 +40,11 @@ func TestRunnerSubmitTaskResultShortCircuitsWithStructuredPayload(t *testing.T) 
 		}},
 		FinishReason: llm.FinishReasonToolCalls,
 	}}}
-	rn := New(config.AgentRuntimeConfig{
+	rn := newTestRunner(t, config.AgentRuntimeConfig{
 		InstanceID: "worker-submit", Kind: "worker", EventType: "code",
 		AllowedTools: []string{"submit_task_result"}, TaskMaxRetries: 1,
 	}, RunnerDeps{
-		Store: taskStore, Roster: roster.NewMemoryRoster(), LLMClient: client, ProjectRoot: root,
+		Store: taskStore, Roster: roster.NewMemoryRoster(), LLMClient: client, ProjectRoot: root, ContextRuntime: testmodel.Runtime(t),
 	})
 	rn.Agent().TextOnlyReportsDir = filepath.Join(root, "reports")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -95,7 +96,7 @@ func TestRunnerSubmitTaskResultShortCircuitsWithStructuredPayload(t *testing.T) 
 // 否则 submit_task_result 根本不会被注册（nil 任一字段即跳过注册）。
 func TestResolveToolGroups_WiresSubmitChannelToPlanControlGroup(t *testing.T) {
 	submitState := agent.NewSubmitState()
-	groups := resolveToolGroups("w-1", nil, RunnerDeps{}, &CurrentTaskHolder{},
+	groups := resolveToolGroups("w-1", nil, RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, &CurrentTaskHolder{},
 		agent.NewFinalizationHolder(), submitState, agent.NewFileStateCache(1), &tools.DefaultWorkdir{}, nil)
 
 	var planGroup *tools.PlanControlGroup
@@ -131,7 +132,7 @@ func TestRunnerFinalizingFenceSkipsTrailingToolCalls(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	client := &orderedToolClient{responses: []llm.Response{{
+	client := &orderedToolClient{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{
 			{ID: "w1", Name: "write_file", Arguments: map[string]any{"path": "before.txt", "content": "提交前写入"}},
 			{ID: "s1", Name: "submit_task_result", Arguments: map[string]any{"summary": "已完成 before.txt"}},
@@ -139,11 +140,11 @@ func TestRunnerFinalizingFenceSkipsTrailingToolCalls(t *testing.T) {
 		},
 		FinishReason: llm.FinishReasonToolCalls,
 	}}}
-	rn := New(config.AgentRuntimeConfig{
+	rn := newTestRunner(t, config.AgentRuntimeConfig{
 		InstanceID: "worker-fence", Kind: "worker", EventType: "code",
 		AllowedTools: []string{"write_file", "submit_task_result"}, TaskMaxRetries: 1,
 	}, RunnerDeps{
-		Store: taskStore, Roster: roster.NewMemoryRoster(), LLMClient: client, ProjectRoot: root,
+		Store: taskStore, Roster: roster.NewMemoryRoster(), LLMClient: client, ProjectRoot: root, ContextRuntime: testmodel.Runtime(t),
 	})
 	rn.Agent().TextOnlyReportsDir = filepath.Join(root, "reports")
 	ctx, cancel := context.WithCancel(context.Background())

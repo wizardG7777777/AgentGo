@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"agentgo/internal/testmodel"
 	"context"
 	"os"
 	"path/filepath"
@@ -66,18 +67,18 @@ func TestFinalizingFence_SkipsTrailingToolCalls(t *testing.T) {
 	tools := fenceTestTools(t, holder, writeTarget, &shellRan)
 
 	var records []string
-	mock := &mockLLMClient{responses: []llm.Response{{
+	mock := &mockLLMClient{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{
 			{ID: "c1", Name: "submit_task_result", Arguments: map[string]any{"summary": "done"}},
 			{ID: "c2", Name: "write_file", Arguments: map[string]any{"path": writeTarget}},
 			{ID: "c3", Name: "run_shell", Arguments: map[string]any{"command": "echo hi"}},
 		},
 	}}}
-	exec := NewSwappableLLMExecutor(mock, tools, nil, nil,
+	exec := newTestSwappableLLMExecutor(t, mock, tools, nil, nil,
 		func(_ string, rec store.ToolCallRecord) { records = append(records, rec.ToolName) }, "")
 	exec.SetFinalizationChecker(holder)
 
-	result, err := exec.Execute(context.Background(), &model.Task{ID: "task-fence", Description: "fence"}, nil, nil)
+	result, err := executeTestStep(t, exec.Execute, context.Background(), &model.Task{ID: "task-fence", Description: "fence"}, nil, nil, llm.DefaultOutputBudget())
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -148,17 +149,17 @@ func TestFinalizingFence_CallsBeforeSubmitExecute(t *testing.T) {
 	shellRan := false
 	tools := fenceTestTools(t, holder, writeTarget, &shellRan)
 
-	mock := &mockLLMClient{responses: []llm.Response{{
+	mock := &mockLLMClient{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{
 			{ID: "c1", Name: "write_file", Arguments: map[string]any{"path": writeTarget}},
 			{ID: "c2", Name: "submit_task_result", Arguments: map[string]any{"summary": "done"}},
 			{ID: "c3", Name: "edit_file", Arguments: map[string]any{"path": filepath.Join(dir, "x.txt")}},
 		},
 	}}}
-	exec := NewSwappableLLMExecutor(mock, tools, nil, nil, nil, "")
+	exec := newTestSwappableLLMExecutor(t, mock, tools, nil, nil, nil, "")
 	exec.SetFinalizationChecker(holder)
 
-	result, err := exec.Execute(context.Background(), &model.Task{ID: "task-fence-2", Description: "fence"}, nil, nil)
+	result, err := executeTestStep(t, exec.Execute, context.Background(), &model.Task{ID: "task-fence-2", Description: "fence"}, nil, nil, llm.DefaultOutputBudget())
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -193,17 +194,17 @@ func TestFinalizingFence_DisabledWithoutChecker(t *testing.T) {
 	shellRan := false
 	tools := fenceTestTools(t, holder, writeTarget, &shellRan)
 
-	mock := &mockLLMClient{responses: []llm.Response{{
+	mock := &mockLLMClient{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{
 			{ID: "c1", Name: "submit_task_result", Arguments: map[string]any{"summary": "done"}},
 			{ID: "c2", Name: "write_file", Arguments: map[string]any{"path": writeTarget}},
 			{ID: "c3", Name: "run_shell", Arguments: map[string]any{"command": "echo hi"}},
 		},
 	}}}
-	exec := NewSwappableLLMExecutor(mock, tools, nil, nil, nil, "")
+	exec := newTestSwappableLLMExecutor(t, mock, tools, nil, nil, nil, "")
 	// 刻意不调用 SetFinalizationChecker。
 
-	if _, err := exec.Execute(context.Background(), &model.Task{ID: "task-nofence", Description: "no fence"}, nil, nil); err != nil {
+	if _, err := executeTestStep(t, exec.Execute, context.Background(), &model.Task{ID: "task-nofence", Description: "no fence"}, nil, nil, llm.DefaultOutputBudget()); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
 	if _, err := os.Stat(writeTarget); err != nil {

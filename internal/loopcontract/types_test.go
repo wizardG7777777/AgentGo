@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"agentgo/internal/invocation"
+	"agentgo/internal/llm"
 	"agentgo/internal/runcontract"
 )
 
@@ -80,8 +80,8 @@ func TestCompiledProgressContractValidate(t *testing.T) {
 
 func TestTurnSettlementDeltaRequiresFrozenInvocationFailure(t *testing.T) {
 	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
-	failure := invocation.NewFailure(invocation.FailureRequestTimeout,
-		invocation.PhaseStreamReceive, invocation.OriginRuntime, errors.New("deadline"))
+	failure := llm.NewFailure(llm.FailureRequestTimeout,
+		llm.PhaseStreamReceive, llm.OriginRuntime, errors.New("deadline"))
 	delta := TurnSettlementDelta{
 		Schema: DeltaSchemaV1, DeltaID: "delta-1", Sequence: 1, RunID: "run-1",
 		GraphID: "graph-1", NodeID: "node-1", ActivationID: "node-1@1",

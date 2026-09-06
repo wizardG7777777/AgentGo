@@ -114,6 +114,7 @@ func TestMain_ExplicitConfigValid_ShouldStartAndExitOnEOF(t *testing.T) {
 	// Scheduler 与内置模板需要全局模型；静态 Agent 仍要声明完整运行参数。
 	cfgPath := filepath.Join(tmpDir, "setting.yaml")
 	cfg := []byte(`llm:
+  request_contract: agentgo.model-request/v1
   default_model: gpt-test
 agents:
   - kind: worker
@@ -160,6 +161,7 @@ func TestMain_LLMOnlyConfigStartsSchedulerWithoutStaticAgents(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfgPath := filepath.Join(tmpDir, "setting.yaml")
 	cfg := []byte(`llm:
+  request_contract: agentgo.model-request/v1
   default_model: gpt-test
 startup_probe: "off"
 `)

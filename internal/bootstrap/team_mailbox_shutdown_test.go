@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"agentgo/internal/testmodel"
 	"context"
 	"errors"
 	"os"
@@ -25,8 +26,8 @@ import (
 
 type shutdownIdleLLM struct{}
 
-func (shutdownIdleLLM) Chat(context.Context, []llm.Message, []llm.ToolDef) (llm.Response, error) {
-	return llm.Response{}, errors.New("shutdown persistence test LLM must not be called")
+func (f shutdownIdleLLM) nextFixture(context.Context, []llm.Message, []llm.ToolDef) (testmodel.Fixture, error) {
+	return testmodel.Fixture{}, errors.New("shutdown persistence test LLM must not be called")
 }
 
 type shutdownMailboxTestEnv struct {
@@ -59,9 +60,9 @@ func newShutdownMailboxTestEnv(t *testing.T) *shutdownMailboxTestEnv {
 	manager := team.NewManager(
 		runner.RunnerDeps{
 			Store: taskStore, Roster: r, MBRegistry: mailboxes,
-			ProjectRoot: t.TempDir(),
+			ProjectRoot: t.TempDir(), ContextRuntime: testmodel.Runtime(t),
 		},
-		func(string) llm.Client { return shutdownIdleLLM{} },
+		func(string) llm.Invoker { return shutdownIdleLLM{} },
 		catalog, durable, scheduler.NewAgentRegistry(), 1,
 	)
 	if err := manager.Start(context.Background()); err != nil {
@@ -136,9 +137,9 @@ func TestSystemShutdownSnapshotsDynamicTeamUnreadMailboxBeforeCleanup(t *testing
 	restartedManager := team.NewManager(
 		runner.RunnerDeps{
 			Store: restoredTasks, Roster: roster.NewMemoryRoster(),
-			MBRegistry: restarted, ProjectRoot: t.TempDir(),
+			MBRegistry: restarted, ProjectRoot: t.TempDir(), ContextRuntime: testmodel.Runtime(t),
 		},
-		func(string) llm.Client { return shutdownIdleLLM{} },
+		func(string) llm.Invoker { return shutdownIdleLLM{} },
 		env.catalog, env.durable, scheduler.NewAgentRegistry(), 1,
 	)
 	if err := restartedManager.Start(context.Background()); err != nil {
@@ -220,4 +221,16 @@ func TestSystemShutdownConcurrentCallsRunOnce(t *testing.T) {
 	if got := releases.Load(); got != 1 {
 		t.Fatalf("full Shutdown executed %d times, want 1", got)
 	}
+}
+
+func (f shutdownIdleLLM) Invoke(ctx context.Context, request llm.Request, sink llm.EventSink) (llm.Result, error) {
+	if err := request.Validate(); err != nil {
+		return llm.Result{}, err
+	}
+	spec := request.Spec()
+	fixture, err := f.nextFixture(ctx, spec.Messages, spec.Tools)
+	if err != nil {
+		return llm.Result{}, err
+	}
+	return fixture.Seal(spec.Options.Protocol)
 }

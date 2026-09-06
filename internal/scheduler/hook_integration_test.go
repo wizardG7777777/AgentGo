@@ -1,6 +1,9 @@
 package scheduler
 
 import (
+	"agentgo/internal/contextruntime"
+	"agentgo/internal/testagent"
+	"agentgo/internal/testmodel"
 	"context"
 	"sync/atomic"
 	"testing"
@@ -57,7 +60,7 @@ func TestSchedulerExecutor_ToolCallsGoThroughHook(t *testing.T) {
 
 	// 构造一个会调 test_tool 的 mock LLM
 	mockLLM := &scriptedLLM{
-		responses: []llm.Response{
+		responses: []testmodel.Fixture{
 			{
 				ToolCalls: []llm.ToolCall{
 					{ID: "call_1", Name: "test_tool", Arguments: map[string]any{}},
@@ -68,7 +71,7 @@ func TestSchedulerExecutor_ToolCallsGoThroughHook(t *testing.T) {
 	}
 
 	// 构造标准 LLMExecutor（与 worker 一致的三件套）
-	innerExec := agent.NewLLMExecutor(mockLLM, toolReg, hookReg, s, recordFunc, "")
+	innerExec := testagent.Wrap(agent.NewTurnExecutor(mockLLM, toolReg, hookReg, recordFunc, testmodel.Runtime(t), contextruntime.Instructions{ProfileID: "test"}).Execute)
 
 	exec := &SchedulerExecutor{
 		Inner:         innerExec,
@@ -78,7 +81,7 @@ func TestSchedulerExecutor_ToolCallsGoThroughHook(t *testing.T) {
 		WaitTimeout:   100 * time.Millisecond,
 	}
 
-	_, err := exec.Execute(context.Background(), schedTask, nil, nil)
+	_, err := exec.Execute(context.Background(), schedTask, nil, nil, llm.DefaultOutputBudget())
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}

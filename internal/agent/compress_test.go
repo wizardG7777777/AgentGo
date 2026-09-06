@@ -5,15 +5,15 @@ import (
 	"errors"
 	"testing"
 
-	"agentgo/internal/invocation"
+	"agentgo/internal/llm"
 )
 
 func TestIsContextOverflow(t *testing.T) {
-	contextWindow := invocation.NewFailure(invocation.FailureContextWindowExceeded,
-		invocation.PhaseResponseHeaders, invocation.OriginProvider,
+	contextWindow := llm.NewFailure(llm.FailureContextWindowExceeded,
+		llm.PhaseResponseHeaders, llm.OriginProvider,
 		errors.New("context window exceeded"))
-	requestTimeout := invocation.NewFailure(invocation.FailureRequestTimeout,
-		invocation.PhaseRequestSend, invocation.OriginTransport,
+	requestTimeout := llm.NewFailure(llm.FailureRequestTimeout,
+		llm.PhaseRequestSend, llm.OriginTransport,
 		context.DeadlineExceeded)
 	tests := []struct {
 		name     string
@@ -32,7 +32,7 @@ func TestIsContextOverflow(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := invocation.IsContextWindowExceeded(tt.err)
+			got := llm.IsContextWindowExceeded(tt.err)
 			if got != tt.expected {
 				t.Errorf("IsContextWindowExceeded(%q) = %v, want %v", tt.err, got, tt.expected)
 			}

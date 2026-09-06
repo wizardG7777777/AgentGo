@@ -31,7 +31,7 @@ func TestBuildAgentRuntime_IdleThresholdFromGlobalConfig(t *testing.T) {
 		{name: "零值保持", idle: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rt, err := buildAgentRuntime(kind, config.LLMConfig{DefaultModel: "m"}, nil,
+			rt, err := buildAgentRuntime(kind, config.LLMConfig{DefaultModel: "m", RequestContract: "agentgo.model-request/v1"}, nil,
 				[]config.AgentKind{kind}, 1, tc.idle)
 			if err != nil {
 				t.Fatalf("buildAgentRuntime: %v", err)
@@ -47,7 +47,7 @@ func TestBuildAgentRuntime_IdleThresholdFromGlobalConfig(t *testing.T) {
 func TestBuildAgentRuntimeObservationModelDefaultsAndOverride(t *testing.T) {
 	prompt := writeTempPromptFile(t)
 	llmCfg := config.LLMConfig{DefaultModel: "default", DefaultContextWindowTokens: 200000, DefaultMaxCompletionTokens: 20000,
-		ModelCapabilities: map[string]config.ModelCapabilityConfig{"control": {ContextWindowTokens: 300000, MaxCompletionTokens: 30000}}}
+		ModelCapabilities: map[string]config.ModelCapabilityConfig{"control": {ContextWindowTokens: 300000, MaxCompletionTokens: 30000}}, RequestContract: "agentgo.model-request/v1"}
 	for _, tc := range []struct{ observation, want string }{{"", "business"}, {"control", "control"}} {
 		kind := config.AgentKind{Kind: "worker", Tools: []string{"read_file"}, Model: "business",
 			ObservationModel: tc.observation, SystemPromptFile: prompt}
@@ -80,7 +80,7 @@ func TestBuildAgentRuntime_MissingProfileIsError(t *testing.T) {
 		Profile:          "不存在",
 		SystemPromptFile: writeTempPromptFile(t),
 	}
-	_, err := buildAgentRuntime(kind, config.LLMConfig{DefaultModel: "m"},
+	_, err := buildAgentRuntime(kind, config.LLMConfig{DefaultModel: "m", RequestContract: "agentgo.model-request/v1"},
 		map[string][]string{"other": {"read_file"}},
 		[]config.AgentKind{kind}, 1, 0)
 	if err == nil {
@@ -104,7 +104,7 @@ func TestBuildAgentRuntime_TeamAwarenessMissingProfileIsError(t *testing.T) {
 		Kind:    "verifier",
 		Profile: "不存在",
 	}
-	_, err := buildAgentRuntime(self, config.LLMConfig{DefaultModel: "m"},
+	_, err := buildAgentRuntime(self, config.LLMConfig{DefaultModel: "m", RequestContract: "agentgo.model-request/v1"},
 		map[string][]string{"other": {"read_file"}},
 		[]config.AgentKind{self, teammate}, 1, 0)
 	if err == nil {
@@ -124,7 +124,7 @@ func TestBuildAgentRuntime_ToolsInlineBypassesProfileResolution(t *testing.T) {
 		Tools:            []string{"read_file", "write_file"},
 		SystemPromptFile: writeTempPromptFile(t),
 	}
-	rt, err := buildAgentRuntime(kind, config.LLMConfig{DefaultModel: "m"}, nil,
+	rt, err := buildAgentRuntime(kind, config.LLMConfig{DefaultModel: "m", RequestContract: "agentgo.model-request/v1"}, nil,
 		[]config.AgentKind{kind}, 1, 0)
 	if err != nil {
 		t.Fatalf("buildAgentRuntime: %v", err)

@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"agentgo/internal/testhttp"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -45,7 +46,7 @@ func TestStartupToolProbeExercisesRealFunctionCalling(t *testing.T) {
 		if !strings.HasPrefix(probeName, "agentgo_capability_probe_") {
 			t.Fatalf("probe singleton tool 名错误: %q", probeName)
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		_ = testhttp.WriteSSE(w, r, map[string]any{
 			"id": "probe", "object": "chat.completion", "created": 1, "model": "test-model",
 			"choices": []any{map[string]any{
 				"index": 0, "finish_reason": "tool_calls",
@@ -69,7 +70,7 @@ func TestStartupToolProbeExercisesRealFunctionCalling(t *testing.T) {
 	defer server.Close()
 	cfg := &config.Config{
 		StartupProbe: "tool", StartupProbeTimeoutSec: 5,
-		LLM: config.LLMConfig{BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions"},
+		LLM: config.LLMConfig{BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions", RequestContract: "agentgo.model-request/v1"},
 	}
 	var output bytes.Buffer
 	if err := startupProbe(&output, cfg); err != nil {
@@ -103,7 +104,7 @@ func TestStartupToolProbeUsesResponsesTypedItemMainline(t *testing.T) {
 		nonceDef, _ := properties["nonce"].(map[string]any)
 		nonce, _ := nonceDef["const"].(string)
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		_ = testhttp.WriteSSE(w, r, map[string]any{
 			"id": "resp-probe", "object": "response", "status": "completed",
 			"output": []any{map[string]any{
 				"type": "function_call", "id": "fc-1", "call_id": "call-1", "status": "completed",
@@ -120,7 +121,7 @@ func TestStartupToolProbeUsesResponsesTypedItemMainline(t *testing.T) {
 	cfg := &config.Config{
 		StartupProbe: "tool", StartupProbeTimeoutSec: 5,
 		LLM: config.LLMConfig{
-			BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "responses",
+			BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "responses", RequestContract: "agentgo.model-request/v1",
 		},
 	}
 	var output bytes.Buffer
@@ -160,7 +161,7 @@ func TestStartupToolProbeRetriesInconclusiveTruncationWithinFrozenDeadline(t *te
 			finishReason = "length"
 			message = map[string]any{"role": "assistant", "content": ""}
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		_ = testhttp.WriteSSE(w, r, map[string]any{
 			"id": "probe", "object": "chat.completion", "created": 1, "model": "test-model",
 			"choices": []any{map[string]any{
 				"index": 0, "finish_reason": finishReason, "message": message,
@@ -171,7 +172,7 @@ func TestStartupToolProbeRetriesInconclusiveTruncationWithinFrozenDeadline(t *te
 	defer server.Close()
 	cfg := &config.Config{
 		StartupProbe: "tool", StartupProbeTimeoutSec: 5,
-		LLM: config.LLMConfig{BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions"},
+		LLM: config.LLMConfig{BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions", RequestContract: "agentgo.model-request/v1"},
 	}
 	var output bytes.Buffer
 	if err := startupToolCapabilityProbe(&output, cfg, time.Second); err != nil {
@@ -185,10 +186,10 @@ func TestStartupToolProbeRetriesInconclusiveTruncationWithinFrozenDeadline(t *te
 
 func TestStartupToolProbeRejectsTextOnlyProvider(t *testing.T) {
 	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		_ = testhttp.WriteSSE(w, r, map[string]any{
 			"id": "probe", "object": "chat.completion", "created": 1, "model": "test-model",
 			"choices": []any{map[string]any{
 				"index": 0, "finish_reason": "stop",
@@ -200,7 +201,7 @@ func TestStartupToolProbeRejectsTextOnlyProvider(t *testing.T) {
 	defer server.Close()
 	cfg := &config.Config{
 		StartupProbe: "tool", StartupProbeTimeoutSec: 5,
-		LLM: config.LLMConfig{BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions"},
+		LLM: config.LLMConfig{BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions", RequestContract: "agentgo.model-request/v1"},
 	}
 	if err := startupProbe(&bytes.Buffer{}, cfg); err == nil || !strings.Contains(err.Error(), "function-call capability 不兼容") {
 		t.Fatalf("text-only provider 应被 capability gate 拒绝: %v", err)
@@ -234,7 +235,7 @@ func TestStartupToolProbeRejectsWrongFunctionIdentity(t *testing.T) {
 					toolName = requestedName
 				}
 				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(map[string]any{
+				_ = testhttp.WriteSSE(w, r, map[string]any{
 					"id": "probe", "object": "chat.completion", "created": 1, "model": "test-model",
 					"choices": []any{map[string]any{
 						"index": 0, "finish_reason": "tool_calls",
@@ -248,7 +249,7 @@ func TestStartupToolProbeRejectsWrongFunctionIdentity(t *testing.T) {
 			defer server.Close()
 			cfg := &config.Config{
 				StartupProbe: "tool", StartupProbeTimeoutSec: 5,
-				LLM: config.LLMConfig{BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions"},
+				LLM: config.LLMConfig{BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions", RequestContract: "agentgo.model-request/v1"},
 			}
 			if err := startupProbe(&bytes.Buffer{}, cfg); err == nil || !strings.Contains(err.Error(), "function-call capability 不兼容") {
 				t.Fatalf("错误 function identity 应被拒绝: %v", err)
@@ -259,13 +260,13 @@ func TestStartupToolProbeRejectsWrongFunctionIdentity(t *testing.T) {
 
 func TestStartupToolProbeRejectsProviderErrorAndTimeout(t *testing.T) {
 	t.Run("provider error", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":{"code":"unavailable"}}`, http.StatusServiceUnavailable)
 		}))
 		defer server.Close()
 		cfg := &config.Config{
 			StartupProbe: "tool", LLM: config.LLMConfig{
-				BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions",
+				BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions", RequestContract: "agentgo.model-request/v1",
 			},
 		}
 		if err := startupToolCapabilityProbe(&bytes.Buffer{}, cfg, time.Second); err == nil {
@@ -274,7 +275,7 @@ func TestStartupToolProbeRejectsProviderErrorAndTimeout(t *testing.T) {
 	})
 
 	t.Run("timeout", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			time.Sleep(100 * time.Millisecond)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"choices":[]}`))
@@ -282,7 +283,7 @@ func TestStartupToolProbeRejectsProviderErrorAndTimeout(t *testing.T) {
 		defer server.Close()
 		cfg := &config.Config{
 			StartupProbe: "tool", LLM: config.LLMConfig{
-				BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions",
+				BaseURL: server.URL, APIKey: "test-key", DefaultModel: "test-model", Protocol: "chat_completions", RequestContract: "agentgo.model-request/v1",
 			},
 		}
 		if err := startupToolCapabilityProbe(&bytes.Buffer{}, cfg, 20*time.Millisecond); err == nil {

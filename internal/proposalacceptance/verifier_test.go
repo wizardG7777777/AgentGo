@@ -1,6 +1,7 @@
 package proposalacceptance
 
 import (
+	"agentgo/internal/testmodel"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,7 +14,6 @@ import (
 	"agentgo/internal/contextcontract"
 	"agentgo/internal/contextstore"
 	"agentgo/internal/graph"
-	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 	"agentgo/internal/policycatalog"
 	"agentgo/internal/runcontract"
@@ -26,25 +26,25 @@ type fakeVerifierClient struct {
 	calls      int
 	messages   []llm.Message
 	tools      []llm.ToolDef
-	binding    invocation.ContextBinding
+	binding    llm.RequestSpec
 	started    chan struct{}
 	duplicates int
 }
 
-func (f *fakeVerifierClient) Chat(ctx context.Context, messages []llm.Message, tools []llm.ToolDef) (llm.Response, error) {
+func (f *fakeVerifierClient) nextFixture(ctx context.Context, messages []llm.Message, tools []llm.ToolDef) (testmodel.Fixture, error) {
 	f.calls++
 	f.messages = append([]llm.Message(nil), messages...)
 	f.tools = append([]llm.ToolDef(nil), tools...)
-	f.binding, _ = invocation.ContextBindingFrom(ctx)
+
 	if f.started != nil {
 		close(f.started)
 	}
 	if f.wait {
 		<-ctx.Done()
-		return llm.Response{}, ctx.Err()
+		return testmodel.Fixture{}, ctx.Err()
 	}
 	if f.err != nil {
-		return llm.Response{}, f.err
+		return testmodel.Fixture{}, f.err
 	}
 	if len(tools) == 1 && tools[0].Name == proposalVerdictToolName {
 		arguments := make(map[string]any)
@@ -61,9 +61,9 @@ func (f *fakeVerifierClient) Chat(ctx context.Context, messages []llm.Message, t
 				ID: fmt.Sprintf("proposal-verdict-%d", index), Name: proposalVerdictToolName, Arguments: arguments,
 			}
 		}
-		return llm.Response{FinishReason: llm.FinishReasonToolCalls, ToolCalls: calls}, nil
+		return testmodel.Fixture{FinishReason: llm.FinishReasonToolCalls, ToolCalls: calls}, nil
 	}
-	return llm.Response{Content: f.content, FinishReason: llm.FinishReasonStop}, nil
+	return testmodel.Fixture{Content: f.content, FinishReason: llm.FinishReasonStop}, nil
 }
 
 type capturingSnapshotStore struct {
@@ -106,6 +106,7 @@ func newTestVerifier(t *testing.T, client *fakeVerifierClient, rawRequest string
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	capturing := &capturingSnapshotStore{inner: store}
+	options.Output = testmodel.Runtime(t).Output
 	verifier, err := New(client, RequestTextResolverFunc(func(ctx context.Context, ref string) (string, error) {
 		if err := ctx.Err(); err != nil {
 			return "", err
@@ -124,7 +125,7 @@ func newTestVerifier(t *testing.T, client *fakeVerifierClient, rawRequest string
 func TestVerifierPassUsesCompiledContextEmptyToolsAndFrameworkRef(t *testing.T) {
 	rawRequest := "请调查并回答问题"
 	client := &fakeVerifierClient{content: `{"verdict":"pass"}`}
-	verifier, snapshots := newTestVerifier(t, client, rawRequest, Options{})
+	verifier, snapshots := newTestVerifier(t, client, rawRequest, Options{Invocation: testmodel.Options()})
 	input := proposalFixture(rawRequest)
 
 	first, err := verifier.EvaluateProposal(context.Background(), input)
@@ -150,8 +151,8 @@ func TestVerifierPassUsesCompiledContextEmptyToolsAndFrameworkRef(t *testing.T) 
 	if client.calls != 3 || len(client.tools) != 1 || client.tools[0].Name != proposalVerdictToolName {
 		t.Fatalf("Verifier 调用/工具面错误: calls=%d tools=%d", client.calls, len(client.tools))
 	}
-	if client.binding.ToolChoice.Mode != invocation.ToolChoiceAuto || client.binding.ToolChoice.Name != "" {
-		t.Fatalf("Verifier 未冻结 auto-singleton verdict ToolChoice: %+v", client.binding.ToolChoice)
+	if client.binding.Options.ToolChoice.Mode != llm.ToolChoiceAuto || client.binding.Options.ToolChoice.Name != "" {
+		t.Fatalf("Verifier 未冻结 auto-singleton verdict ToolChoice: %+v", client.binding.Options.ToolChoice)
 	}
 	if len(client.messages) != 4 || client.messages[0].Role != "system" ||
 		!strings.Contains(client.messages[0].Content, "独立 Graph Proposal Verifier") {
@@ -170,14 +171,14 @@ func TestVerifierPassUsesCompiledContextEmptyToolsAndFrameworkRef(t *testing.T) 
 		t.Fatalf("每次 LLM 调用前必须持久化 Snapshot: %d", len(snapshots.snapshots))
 	}
 	latest := snapshots.snapshots[len(snapshots.snapshots)-1]
-	if client.binding.ContextSnapshotID != latest.SnapshotID ||
-		client.binding.InvocationID != latest.InvocationID ||
-		client.binding.EncodedRequestDigest != latest.EncodedRequestDigest {
+	if client.binding.Identity.SnapshotID != latest.SnapshotID ||
+		client.binding.Identity.InvocationID != latest.InvocationID ||
+		client.binding.Schema != llm.RequestSchema {
 		t.Fatalf("Verifier provider request 未绑定 durable Snapshot: binding=%+v snapshot=%+v", client.binding, latest)
 	}
 	for _, snapshot := range snapshots.snapshots {
 		if snapshot.ContextPolicyID != policycatalog.ContextDefaultCurrent ||
-			!strings.Contains(snapshot.ToolRouterSnapshotID, "proposal-verifier-verdict") {
+			!strings.Contains(snapshot.ToolRouterSnapshotID, "operation-tools:") {
 			t.Fatalf("Snapshot policy/tool router 未冻结: %+v", snapshot)
 		}
 	}
@@ -186,7 +187,7 @@ func TestVerifierPassUsesCompiledContextEmptyToolsAndFrameworkRef(t *testing.T) 
 func TestVerifierAcceptsProviderDuplicateAutoSingletonVerdicts(t *testing.T) {
 	rawRequest := "请调查并回答问题"
 	client := &fakeVerifierClient{content: `{"verdict":"pass"}`, duplicates: 3}
-	verifier, _ := newTestVerifier(t, client, rawRequest, Options{})
+	verifier, _ := newTestVerifier(t, client, rawRequest, Options{Invocation: testmodel.Options()})
 	decision, err := verifier.EvaluateProposal(context.Background(), proposalFixture(rawRequest))
 	if err != nil {
 		t.Fatalf("provider auto-singleton fan-out 不应阻断 proposal acceptance: %v", err)
@@ -203,7 +204,7 @@ func TestVerifierFixableMapsBoundedIssuesAndWarnings(t *testing.T) {
   "issue_code":"MISSING_FAILURE_PATH",
   "message":"缺少失败出口"
 }`}
-	verifier, _ := newTestVerifier(t, client, rawRequest, Options{})
+	verifier, _ := newTestVerifier(t, client, rawRequest, Options{Invocation: testmodel.Options()})
 	decision, err := verifier.EvaluateProposal(context.Background(), proposalFixture(rawRequest))
 	if err != nil {
 		t.Fatal(err)
@@ -217,7 +218,7 @@ func TestVerifierFixableMapsBoundedIssuesAndWarnings(t *testing.T) {
 func TestVerifierMalformedJSONReturnsErrorAfterSingleCall(t *testing.T) {
 	rawRequest := "回答"
 	client := &fakeVerifierClient{content: "```json\n{\"verdict\":\"pass\"}\n```"}
-	verifier, _ := newTestVerifier(t, client, rawRequest, Options{})
+	verifier, _ := newTestVerifier(t, client, rawRequest, Options{Invocation: testmodel.Options()})
 	if _, err := verifier.EvaluateProposal(context.Background(), proposalFixture(rawRequest)); err == nil {
 		t.Fatal("Markdown/畸形输出必须返回 error，让 commit blocked")
 	}
@@ -229,7 +230,7 @@ func TestVerifierMalformedJSONReturnsErrorAfterSingleCall(t *testing.T) {
 func TestVerifierNonPassStillRequiresPrimaryIssue(t *testing.T) {
 	rawRequest := "实现并验证"
 	client := &fakeVerifierClient{content: `{"verdict":"fixable"}`}
-	verifier, _ := newTestVerifier(t, client, rawRequest, Options{})
+	verifier, _ := newTestVerifier(t, client, rawRequest, Options{Invocation: testmodel.Options()})
 	if _, err := verifier.EvaluateProposal(context.Background(), proposalFixture(rawRequest)); err == nil ||
 		!strings.Contains(err.Error(), "主 issue") {
 		t.Fatalf("非 pass 省略主诊断必须 fail-closed: %v", err)
@@ -240,7 +241,7 @@ func TestVerifierInvocationFailureReturnsErrorWithoutRetry(t *testing.T) {
 	rawRequest := "回答"
 	sentinel := errors.New("provider unavailable")
 	client := &fakeVerifierClient{err: sentinel}
-	verifier, _ := newTestVerifier(t, client, rawRequest, Options{})
+	verifier, _ := newTestVerifier(t, client, rawRequest, Options{Invocation: testmodel.Options()})
 	if _, err := verifier.EvaluateProposal(context.Background(), proposalFixture(rawRequest)); !errors.Is(err, sentinel) {
 		t.Fatalf("Invocation failure 未原样交 Graph compiler blocked: %v", err)
 	}
@@ -252,7 +253,7 @@ func TestVerifierInvocationFailureReturnsErrorWithoutRetry(t *testing.T) {
 func TestVerifierCancellationStopsOnlyInvocation(t *testing.T) {
 	rawRequest := "回答"
 	client := &fakeVerifierClient{wait: true, started: make(chan struct{})}
-	verifier, _ := newTestVerifier(t, client, rawRequest, Options{})
+	verifier, _ := newTestVerifier(t, client, rawRequest, Options{Invocation: testmodel.Options()})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -278,7 +279,7 @@ func TestVerifierHonorsRunDeadline(t *testing.T) {
 	rawRequest := "回答"
 	base := time.Now().UTC()
 	client := &fakeVerifierClient{wait: true}
-	verifier, _ := newTestVerifier(t, client, rawRequest, Options{Now: func() time.Time { return base }})
+	verifier, _ := newTestVerifier(t, client, rawRequest, Options{Invocation: testmodel.Options(), Now: func() time.Time { return base }})
 	input := proposalFixture(rawRequest)
 	input.Definition.RunID = "run-verifier"
 	input.Definition.RunContract = &runcontract.RunContract{
@@ -292,7 +293,7 @@ func TestVerifierHonorsRunDeadline(t *testing.T) {
 	input.DefinitionDigest = graph.ComputeGraphDefinitionDigest(input.GraphID, input.DefinitionRevision, input.Definition)
 
 	_, err := verifier.EvaluateProposal(context.Background(), input)
-	if !errors.Is(err, invocation.ErrRunDeadline) {
+	if !errors.Is(err, llm.ErrRunDeadline) {
 		t.Fatalf("Run deadline cause 未保留: %v", err)
 	}
 	if client.calls != 1 {
@@ -303,7 +304,7 @@ func TestVerifierHonorsRunDeadline(t *testing.T) {
 func TestVerifierOversizedOutputReturnsError(t *testing.T) {
 	rawRequest := "回答"
 	client := &fakeVerifierClient{content: strings.Repeat("x", 1025)}
-	verifier, _ := newTestVerifier(t, client, rawRequest, Options{MaxOutputBytes: 1024})
+	verifier, _ := newTestVerifier(t, client, rawRequest, Options{Invocation: testmodel.Options(), MaxOutputBytes: 1024})
 	if _, err := verifier.EvaluateProposal(context.Background(), proposalFixture(rawRequest)); err == nil ||
 		!strings.Contains(err.Error(), "超过") {
 		t.Fatalf("超大输出未被有界拒绝: %v", err)
@@ -316,12 +317,25 @@ func TestVerifierOversizedOutputReturnsError(t *testing.T) {
 func TestVerifierContextOversizeFailsBeforeLLM(t *testing.T) {
 	rawRequest := strings.Repeat("request", 600_000)
 	client := &fakeVerifierClient{content: `{"verdict":"pass"}`}
-	verifier, _ := newTestVerifier(t, client, rawRequest, Options{})
+	verifier, _ := newTestVerifier(t, client, rawRequest, Options{Invocation: testmodel.Options()})
 	if _, err := verifier.EvaluateProposal(context.Background(), proposalFixture(rawRequest)); err == nil ||
-		!strings.Contains(err.Error(), "Context 编译失败") {
+		!strings.Contains(err.Error(), "fragment_limit_exceeded") {
 		t.Fatalf("超大输入未在 L2 fail-closed: %v", err)
 	}
 	if client.calls != 0 {
 		t.Fatalf("Context 失败后不得调用模型: calls=%d", client.calls)
 	}
+}
+
+func (f *fakeVerifierClient) Invoke(ctx context.Context, request llm.Request, sink llm.EventSink) (llm.Result, error) {
+	if err := request.Validate(); err != nil {
+		return llm.Result{}, err
+	}
+	f.binding = request.Spec()
+	spec := request.Spec()
+	fixture, err := f.nextFixture(ctx, spec.Messages, spec.Tools)
+	if err != nil {
+		return llm.Result{}, err
+	}
+	return fixture.Seal(spec.Options.Protocol)
 }

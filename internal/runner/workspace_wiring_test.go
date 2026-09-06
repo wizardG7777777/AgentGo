@@ -1,12 +1,15 @@
 package runner
 
+import
+
 // workspace_wiring_test.go 验证「按任务写时复制执行隔离」的 runner 接线：
-//   - New() 为每个 Runner 构造独立 *workspace.Swapper，作为 Workdir 注入
+//   - newTestRunner(t,) 为每个 Runner 构造独立 *workspace.Swapper，作为 Workdir 注入
 //     LocalRead/LocalWrite 组、作为 ActiveViewer 注入 shell 组；
 //   - 共享 *workspace.Manager 与 per-runner Swapper 赋到 Agent 新字段
 //     （合并冲突的 replan 唤醒经 Store 直发，无独立接线字段）；
 //   - resolveToolGroups 对未实现 ActiveViewer 的 Workdir（如单测直构的
 //     DefaultWorkdir）保持旧行为（ShellGroup.ActiveViewer=nil）。
+"agentgo/internal/testmodel"
 
 import (
 	"testing"
@@ -23,7 +26,7 @@ import (
 // （shell 组）注入；DefaultWorkdir 不满足 ActiveViewer 时 shell 保持旧行为。
 func TestResolveToolGroups_InjectsSwapperAsWorkdirAndActiveViewer(t *testing.T) {
 	swapper := workspace.NewSwapper(t.TempDir())
-	groups := resolveToolGroups("w-1", nil, RunnerDeps{}, &CurrentTaskHolder{},
+	groups := resolveToolGroups("w-1", nil, RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, &CurrentTaskHolder{},
 		agent.NewFinalizationHolder(), agent.NewSubmitState(),
 		agent.NewFileStateCache(1), swapper, nil)
 
@@ -59,7 +62,7 @@ func TestResolveToolGroups_InjectsSwapperAsWorkdirAndActiveViewer(t *testing.T) 
 	}
 
 	// 旧行为回归：DefaultWorkdir 未实现 ActiveViewer 时 shell 不装配该字段。
-	plain := resolveToolGroups("w-1", nil, RunnerDeps{}, &CurrentTaskHolder{},
+	plain := resolveToolGroups("w-1", nil, RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, &CurrentTaskHolder{},
 		agent.NewFinalizationHolder(), agent.NewSubmitState(),
 		agent.NewFileStateCache(1), &tools.DefaultWorkdir{}, nil)
 	if sg := mustShellGroup(t, plain); sg.ActiveViewer != nil {
@@ -67,7 +70,7 @@ func TestResolveToolGroups_InjectsSwapperAsWorkdirAndActiveViewer(t *testing.T) 
 	}
 }
 
-// New() 末端接线：共享 Manager 与 per-runner Swapper 到达 Agent 字段。
+// newTestRunner(t,) 末端接线：共享 Manager 与 per-runner Swapper 到达 Agent 字段。
 // 合并冲突的 replan 走 agent 侧「通用 replan 唤醒任务」（经 Store 发布
 // __scheduler__ 任务，见 internal/agent/replan_wake.go），无独立装配字段。
 func TestNewWiresWorkspaceFieldsToAgent(t *testing.T) {
@@ -78,10 +81,10 @@ func TestNewWiresWorkspaceFieldsToAgent(t *testing.T) {
 		Roster:           roster.NewMemoryRoster(),
 		LLMClient:        idleTestLLM{},
 		ProjectRoot:      mainRoot,
-		WorkspaceManager: mgr,
+		WorkspaceManager: mgr, ContextRuntime: testmodel.Runtime(t),
 	}
 
-	rn := New(config.AgentRuntimeConfig{
+	rn := newTestRunner(t, config.AgentRuntimeConfig{
 		InstanceID: "worker-1", Kind: "worker", AllowedTools: []string{"read_file"},
 	}, deps)
 	a := rn.Agent()
@@ -98,7 +101,7 @@ func TestNewWiresWorkspaceFieldsToAgent(t *testing.T) {
 
 	// 第二个 Runner 同 deps 再构造一次：每个 Runner 拿到独立 Swapper 实例，
 	// 共享同一 Manager。
-	rn2 := New(config.AgentRuntimeConfig{
+	rn2 := newTestRunner(t, config.AgentRuntimeConfig{
 		InstanceID: "worker-2", Kind: "worker", AllowedTools: []string{"read_file"},
 	}, deps)
 	a2 := rn2.Agent()

@@ -1,5 +1,7 @@
 package runner
 
+import "agentgo/internal/testmodel"
+
 import (
 	"path/filepath"
 	"testing"
@@ -19,12 +21,12 @@ func TestNewWiresContentStoreToAgent(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = content.Close() })
 
-	rn := New(config.AgentRuntimeConfig{
+	rn := newTestRunner(t, config.AgentRuntimeConfig{
 		InstanceID: "worker-content", Kind: "worker", AllowedTools: []string{"read_file"},
 		TaskMaxRetries: 2,
 	}, RunnerDeps{
 		Store:  store.NewMemoryTaskStore(nil, 32, 1, 60),
-		Roster: roster.NewMemoryRoster(), LLMClient: idleTestLLM{}, ContentStore: content,
+		Roster: roster.NewMemoryRoster(), LLMClient: idleTestLLM{}, ContentStore: content, ContextRuntime: testmodel.Runtime(t),
 	})
 	if rn.Agent().ContentStore != content {
 		t.Fatal("RunnerDeps.ContentStore 未透传到 Agent")

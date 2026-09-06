@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"context"
 	"strings"
 	"sync/atomic"
@@ -57,7 +59,7 @@ func TestRuntimeLoopFuse_BlocksTaskAndPublishesReplanWake(t *testing.T) {
 	}
 
 	var callCount int32
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		atomic.AddInt32(&callCount, 1)
 		// 永远调用工具 = 永不自然完成的死循环，必须由 fuse 兜底
 		return ExecuteResult{Output: "looping", ToolCalled: true}, nil
@@ -162,7 +164,7 @@ func TestRuntimeLoopFuse_GraphTaskSkipsReplanWake(t *testing.T) {
 		t.Fatalf("ClaimTask: %v", err)
 	}
 
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "looping", ToolCalled: true}, nil
 	}
 	ag := NewAgent("agent-fuse-graph", "code", s, r, executor)
@@ -195,7 +197,7 @@ func TestPublishReplanWakeTask_Idempotent(t *testing.T) {
 		t.Fatalf("ClaimTask: %v", err)
 	}
 
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "done"}, nil
 	}
 	ag := NewAgent("agent-dup", "code", s, r, executor)
@@ -228,7 +230,7 @@ func TestReactLoop_NoFixedRoundCap(t *testing.T) {
 
 	const totalRounds = 60 // 越过旧默认上限 50
 	var callCount int32
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		n := atomic.AddInt32(&callCount, 1)
 		if int(n) < totalRounds {
 			return ExecuteResult{Output: "working", ToolCalled: true}, nil
@@ -267,7 +269,7 @@ func TestReactLoop_FuseDoesNotFireBelowThreshold(t *testing.T) {
 	}
 
 	var callCount int32
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		n := atomic.AddInt32(&callCount, 1)
 		if int(n) < 3 {
 			return ExecuteResult{Output: "working", ToolCalled: true}, nil

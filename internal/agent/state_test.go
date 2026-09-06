@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"bufio"
 	"context"
 	"encoding/json"
@@ -461,7 +463,7 @@ func TestE2E_AgentStateMachineLifecycle(t *testing.T) {
 	}
 
 	// 极简 executor：单轮自然完成
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "done", ToolCalled: false}, nil
 	}
 
@@ -574,7 +576,7 @@ func TestE2E_AgentStateMachine_PanicPath(t *testing.T) {
 	}
 
 	// executor 触发 panic，验证合并 defer 走 panic 分支后状态链路依然完整
-	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		panic(errors.New("intentional panic for test"))
 	}
 

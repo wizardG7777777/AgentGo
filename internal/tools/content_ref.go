@@ -20,6 +20,7 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/contentstore"
+	"agentgo/internal/llm"
 	"agentgo/internal/model"
 	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
@@ -38,6 +39,60 @@ type ContentRefGroup struct {
 	ContentStore *contentstore.Store
 	TaskStore    store.TaskStore
 	SessionID    func() string
+}
+
+// ReadModelInput 为 L2 装配提供相同的 L3 授权读，不新增路径逃生口。
+// 每页仍通过当前 Task/Lease/Scope 校验，整份数据受输入能力预算限制。
+func (g ContentRefGroup) ReadModelInput(ctx context.Context, id llm.Identity, refID string, maxBytes int64) ([]byte, error) {
+	if g.ContentStore == nil || g.TaskStore == nil || id.TaskID == "" || maxBytes <= 0 {
+		return nil, fmt.Errorf("模型输入引用缺少 L3 依赖或任务身份")
+	}
+	task, err := g.TaskStore.GetTask(id.TaskID)
+	if err != nil {
+		return nil, err
+	}
+	if task == nil || id.SessionID != g.contentRefSessionScope(task) || id.GraphID != task.GraphID {
+		return nil, fmt.Errorf("模型输入引用作用域与当前任务不一致")
+	}
+	status, err := g.ContentStore.Inspect(refID)
+	if err != nil {
+		return nil, err
+	}
+	if status.Ref.SizeBytes > maxBytes {
+		return nil, fmt.Errorf("模型输入引用超过冻结字节预算")
+	}
+	ctx = agent.WithAgentContext(ctx, id.AgentID, id.TaskID, id.Loop)
+	var content []byte
+	for offset := int64(0); offset < status.Ref.SizeBytes; {
+		limit := min(contentRefToolMaxLimit, status.Ref.SizeBytes-offset)
+		raw, err := g.readContentRef(ctx, map[string]any{"ref_id": refID, "offset": offset, "limit": limit})
+		if err != nil {
+			return nil, err
+		}
+		var page contentRefToolResult
+		if err = json.Unmarshal([]byte(raw), &page); err != nil {
+			return nil, err
+		}
+		part := []byte(page.Content)
+		if page.Encoding == "base64" {
+			part, err = base64.StdEncoding.DecodeString(page.Content)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if page.Digest != status.Ref.ContentDigest || page.NextOffset <= offset || int64(len(content)+len(part)) > maxBytes {
+			return nil, fmt.Errorf("模型输入引用读取期间发生变化或越界")
+		}
+		content = append(content, part...)
+		offset = page.NextOffset
+		if page.EOF {
+			break
+		}
+	}
+	if int64(len(content)) != status.Ref.SizeBytes {
+		return nil, fmt.Errorf("模型输入引用未完整读取")
+	}
+	return content, nil
 }
 
 func (g ContentRefGroup) Register(r *agent.ToolRegistry) {
@@ -279,7 +334,7 @@ func jsonValueContainsExactString(value any, target string) bool {
 	return false
 }
 
-// contentRefSessionScope 与 agent.ContextRuntime.sessionScope 使用同一机械规则：
+// contentRefSessionScope 与 contextruntime.Runtime.sessionScope 使用同一机械规则：
 // 真实 Session 优先；无 Session 的新 Run 使用 sessionless-run；legacy
 // Task 使用 task identity。初次 requester 和 authorizer 重读都调用本函数，
 // 避免空 Session provider 造成 L2 写入 scope 与 L3 解引用 scope 分叉。

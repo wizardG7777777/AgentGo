@@ -59,11 +59,13 @@ func genSnapshot(t *rapid.T) Snapshot {
 		SavedAt:   genTimestamp(t, "savedAt"),
 		Tasks:     tasks,
 		Roster:    RosterSnapshot{Claims: claims},
-		Mailboxes: mailboxes,
+		Mailboxes: mailboxes, ModelHistoryContract:
+
+		// genTaskSnapshot generates a random TaskSnapshot.
+		"agentgo.model-history/v1",
 	}
 }
 
-// genTaskSnapshot generates a random TaskSnapshot.
 func genTaskSnapshot(t *rapid.T, idx int) TaskSnapshot {
 	status := rapid.SampledFrom([]string{"pending", "processing"}).Draw(t, labelIdx("taskStatus", idx))
 

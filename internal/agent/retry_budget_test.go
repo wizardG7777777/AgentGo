@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"context"
 	"errors"
 	"testing"
@@ -37,7 +39,7 @@ func TestAgent_RecoverableError_BoundedByMaxRetries(t *testing.T) {
 			}
 
 			callCount := 0
-			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+			executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 				callCount++
 				return ExecuteResult{}, &ErrRecoverable{Err: errors.New("persistent llm outage")}
 			}
@@ -111,7 +113,7 @@ func TestAgent_RecoverableError_MaxRetriesZeroStillRetries(t *testing.T) {
 	// 让 executor 前 10 次都失败，第 11 次成功——验证 MaxRetries=0 不设上限。
 	// 选 10 是为了超过任何合理的 MaxRetries 默认（3/5），证明"无限"不是 "N 次"。
 	callCount := 0
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		callCount++
 		if callCount <= 10 {
 			return ExecuteResult{}, &ErrRecoverable{Err: errors.New("transient")}

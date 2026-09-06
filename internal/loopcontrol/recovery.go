@@ -4,7 +4,7 @@
 // failure facts 映射成恢复动作；具体预算和 checkpoint 在后续切片接入。
 package loopcontrol
 
-import "agentgo/internal/invocation"
+import "agentgo/internal/llm"
 
 // RecoveryAction 是 L4 对一次 Invocation failure 的封闭默认动作。
 type RecoveryAction string
@@ -22,7 +22,7 @@ const (
 // RecoveryDecision 只表达策略结果，不执行副作用。
 type RecoveryDecision struct {
 	Action        RecoveryAction
-	FailureKind   invocation.FailureKind
+	FailureKind   llm.FailureKind
 	ReuseSnapshot bool
 	NewAttempt    bool
 	ContextReason string
@@ -30,43 +30,43 @@ type RecoveryDecision struct {
 
 // DecideInvocationFailure 返回 framework v1 默认策略。未来 policy catalog 可以
 // 选择更严格的预算，但不得把 cancel/auth/permission 改成无限 retry。
-func DecideInvocationFailure(failure *invocation.Failure) RecoveryDecision {
+func DecideInvocationFailure(failure *llm.Failure) RecoveryDecision {
 	if failure == nil {
-		return RecoveryDecision{Action: RecoveryFail, FailureKind: invocation.FailureUnknown}
+		return RecoveryDecision{Action: RecoveryFail, FailureKind: llm.FailureUnknown}
 	}
 	decision := RecoveryDecision{FailureKind: failure.Kind}
 	switch failure.Kind {
-	case invocation.FailureActionContractRejected:
+	case llm.FailureActionContractRejected:
 		decision.Action = RecoveryRetrySameSnapshot
 		decision.ReuseSnapshot = true
-	case invocation.FailureRequestTimeout, invocation.FailureTransport,
-		invocation.FailureRateLimited, invocation.FailureProviderUnavailable:
+	case llm.FailureRequestTimeout, llm.FailureTransport,
+		llm.FailureRateLimited, llm.FailureProviderUnavailable:
 		decision.Action = RecoveryRetrySameSnapshot
 		decision.ReuseSnapshot = true
-	case invocation.FailureContextWindowExceeded:
+	case llm.FailureContextWindowExceeded:
 		decision.Action = RecoveryRebuildContext
 		decision.NewAttempt = true
-		decision.ContextReason = string(invocation.FailureContextWindowExceeded)
-	case invocation.FailureOutputTruncated, invocation.FailureOutputLimitExceeded,
-		invocation.FailureMalformedResponse:
+		decision.ContextReason = string(llm.FailureContextWindowExceeded)
+	case llm.FailureOutputTruncated, llm.FailureOutputLimitExceeded,
+		llm.FailureMalformedResponse:
 		decision.Action = RecoveryStartNewAttempt
 		decision.NewAttempt = true
-	case invocation.FailureCallerCancelled:
+	case llm.FailureCallerCancelled:
 		decision.Action = RecoveryCancel
-	case invocation.FailureAttemptDeadline, invocation.FailureActivationDeadline:
+	case llm.FailureAttemptDeadline, llm.FailureActivationDeadline:
 		decision.Action = RecoveryBlock
-	case invocation.FailureContextAssembly:
+	case llm.FailureContextAssembly:
 		decision.Action = RecoveryBlock
-	case invocation.FailureProviderQuotaExhausted:
+	case llm.FailureProviderQuotaExhausted:
 		// 余额/计费额度是 Run 外部资源。继续 retry、重建 Context 或让 Graph
 		// recovery 改策略都不会恢复；冻结为 blocked，等待操作者补充资源后
 		// 由新 Run 继续。
 		decision.Action = RecoveryBlock
-	case invocation.FailureAuth, invocation.FailurePermissionDenied,
-		invocation.FailureModelUnavailable, invocation.FailureInvalidRequest,
-		invocation.FailureContentFiltered, invocation.FailureProtocolIncompatible:
+	case llm.FailureAuth, llm.FailurePermissionDenied,
+		llm.FailureModelUnavailable, llm.FailureInvalidRequest,
+		llm.FailureContentFiltered, llm.FailureProtocolIncompatible:
 		decision.Action = RecoveryFail
-	case invocation.FailureUnknown:
+	case llm.FailureUnknown:
 		decision.Action = RecoveryRequestIntervene
 	default:
 		decision.Action = RecoveryFail

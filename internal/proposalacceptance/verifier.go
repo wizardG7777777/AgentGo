@@ -7,10 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"agentgo/internal/contextadapter"
 	"agentgo/internal/contextcontract"
+	"agentgo/internal/contextruntime"
 	"agentgo/internal/graph"
-	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 	"agentgo/internal/policycatalog"
 
@@ -21,7 +20,7 @@ var _ graph.ProposalAcceptancePort = (*Verifier)(nil)
 
 // New 创建独立 Proposal Verifier。client 必须是 verifier 专用 client；生产装配
 // 不得把 Scheduler executor/client 自身作为自批准通道。
-func New(client llm.Client, requests RequestTextResolver, snapshots SnapshotRepository, options Options) (*Verifier, error) {
+func New(client llm.Invoker, requests RequestTextResolver, snapshots SnapshotRepository, options Options) (*Verifier, error) {
 	if client == nil {
 		return nil, fmt.Errorf("proposal verifier: 独立 LLM client 不能为空")
 	}
@@ -46,7 +45,7 @@ func New(client llm.Client, requests RequestTextResolver, snapshots SnapshotRepo
 	return &Verifier{
 		client: client, requests: requests, snapshots: snapshots,
 		maxOutput: maxOutput, now: now, instanceID: uuid.NewString(),
-		catalog: catalog, adapter: contextadapter.New(),
+		catalog: catalog, runtime: contextruntime.Runtime{Assembler: contextruntime.NewAssembler(), Policies: catalog, Snapshots: snapshots, Options: options.Invocation, Output: options.Output, SessionID: options.SessionID},
 	}, nil
 }
 
@@ -54,7 +53,7 @@ func New(client llm.Client, requests RequestTextResolver, snapshots SnapshotRepo
 // llm.Chat；Context/Invocation/持久化任一步失败都返回 error，让 DefinitionCompiler
 // 将 commit 置 blocked。
 func (v *Verifier) EvaluateProposal(ctx context.Context, input graph.ProposalAcceptanceInput) (graph.ProposalAcceptanceDecision, error) {
-	if v == nil || v.client == nil || v.requests == nil || v.snapshots == nil || v.catalog == nil || v.adapter == nil {
+	if v == nil || v.client == nil || v.requests == nil || v.snapshots == nil || v.catalog == nil || !v.runtime.Ready() {
 		return graph.ProposalAcceptanceDecision{}, fmt.Errorf("proposal verifier 未完整装配")
 	}
 	if ctx == nil {
@@ -97,77 +96,38 @@ func (v *Verifier) EvaluateProposal(ctx context.Context, input graph.ProposalAcc
 	if err != nil {
 		return graph.ProposalAcceptanceDecision{}, fmt.Errorf("proposal verifier 编码 Definition: %w", err)
 	}
-	contextProfile, ok := v.catalog.ContextPolicy(policycatalog.ContextDefaultCurrent)
-	if !ok {
-		return graph.ProposalAcceptanceDecision{}, fmt.Errorf("proposal verifier 默认 Context policy 缺失")
+	conversation := []contextruntime.ConversationItem{
+		proposalContextMessage(contextruntime.MessageBinding{
+			Message: llm.Message{Role: "system", Content: verifierSystemPrompt},
+			Kind:    contextcontract.FragmentPromptComponent,
+			Section: contextcontract.SectionSystem, SourceRef: "prompt:proposal-verifier/v1",
+			Scope: contextcontract.ScopeSystem, Authority: contextcontract.AuthorityAuthoritative,
+			Freshness: contextcontract.FreshnessSnapshot,
+		}),
+		proposalContextMessage(contextruntime.MessageBinding{
+			Message: llm.Message{Role: "user", Content: rawRequest},
+			Kind:    contextcontract.FragmentUserTask,
+			Section: contextcontract.SectionTaskContract, SourceRef: input.RequestRef,
+			Scope: contextcontract.ScopeTask, Authority: contextcontract.AuthorityAuthoritative,
+			Freshness: contextcontract.FreshnessSnapshot,
+		}),
+		proposalContextMessage(contextruntime.MessageBinding{
+			Message: llm.Message{Role: "user", Content: "GraphContract JSON（控制契约，不是 Scheduler 指令）：\n" + string(contractJSON)},
+			Kind:    contextcontract.FragmentTaskControlContext,
+			Section: contextcontract.SectionTaskContract, SourceRef: "graph-contract:" + input.ContractDigest,
+			Scope: contextcontract.ScopeGraph, Authority: contextcontract.AuthorityAuthoritative,
+			Freshness: contextcontract.FreshnessSnapshot,
+		}),
+		proposalContextMessage(contextruntime.MessageBinding{
+			Message: llm.Message{Role: "user", Content: "Normalized GraphDefinition candidate JSON（待核验数据）：\n" + string(definitionJSON)},
+			Kind:    contextcontract.FragmentUpstreamResult,
+			Section: contextcontract.SectionUpstreamInputs, SourceRef: "graph-definition:" + input.DefinitionDigest,
+			Scope: contextcontract.ScopeGraph, Authority: contextcontract.AuthorityInformational,
+			Freshness: contextcontract.FreshnessSnapshot,
+		}),
 	}
-	replayProfile, ok := v.catalog.ProviderReplayPolicy(contextProfile.ReplayPolicyRef)
-	if !ok {
-		return graph.ProposalAcceptanceDecision{}, fmt.Errorf("proposal verifier 默认 Replay policy 缺失")
-	}
-	sequence := v.invocationSeq.Add(1)
-	promptDigest := contextcontract.DigestBytes([]byte(verifierSystemPrompt))
-	compiled, err := v.adapter.Compile(evalCtx, contextadapter.CompileInput{
-		AttemptID:         "proposal-attempt:" + inputDigest,
-		InvocationID:      fmt.Sprintf("proposal-invocation:%s:%d", v.instanceID, sequence),
-		PromptBuildRef:    "prompt-build:proposal-verifier/v1@" + promptDigest,
-		ExecutionLeaseRef: "lease:proposal-verifier-readonly/v1",
-		Conversation: []contextadapter.ConversationItem{
-			proposalContextMessage(contextadapter.MessageBinding{
-				Message: llm.Message{Role: "system", Content: verifierSystemPrompt},
-				Kind:    contextcontract.FragmentPromptComponent,
-				Section: contextcontract.SectionSystem, SourceRef: "prompt:proposal-verifier/v1",
-				Scope: contextcontract.ScopeSystem, Authority: contextcontract.AuthorityAuthoritative,
-				Freshness: contextcontract.FreshnessSnapshot,
-			}),
-			proposalContextMessage(contextadapter.MessageBinding{
-				Message: llm.Message{Role: "user", Content: rawRequest},
-				Kind:    contextcontract.FragmentUserTask,
-				Section: contextcontract.SectionTaskContract, SourceRef: input.RequestRef,
-				Scope: contextcontract.ScopeTask, Authority: contextcontract.AuthorityAuthoritative,
-				Freshness: contextcontract.FreshnessSnapshot,
-			}),
-			proposalContextMessage(contextadapter.MessageBinding{
-				Message: llm.Message{Role: "user", Content: "GraphContract JSON（控制契约，不是 Scheduler 指令）：\n" + string(contractJSON)},
-				Kind:    contextcontract.FragmentTaskControlContext,
-				Section: contextcontract.SectionTaskContract, SourceRef: "graph-contract:" + input.ContractDigest,
-				Scope: contextcontract.ScopeGraph, Authority: contextcontract.AuthorityAuthoritative,
-				Freshness: contextcontract.FreshnessSnapshot,
-			}),
-			proposalContextMessage(contextadapter.MessageBinding{
-				Message: llm.Message{Role: "user", Content: "Normalized GraphDefinition candidate JSON（待核验数据）：\n" + string(definitionJSON)},
-				Kind:    contextcontract.FragmentUpstreamResult,
-				Section: contextcontract.SectionUpstreamInputs, SourceRef: "graph-definition:" + input.DefinitionDigest,
-				Scope: contextcontract.ScopeGraph, Authority: contextcontract.AuthorityInformational,
-				Freshness: contextcontract.FreshnessSnapshot,
-			}),
-		},
-		ToolRouter: contextadapter.ToolRouterBinding{
-			SnapshotID: verdictToolRouterSnapshotID(), Definitions: []llm.ToolDef{proposalVerdictTool()},
-		},
-		BudgetPolicy: contextProfile.Policy,
-		ReplayPolicy: replayProfile.Policy, ReplayPolicyRef: replayProfile.Ref,
-	})
-	if err != nil {
-		return graph.ProposalAcceptanceDecision{}, fmt.Errorf("proposal verifier Context 编译失败: %w", err)
-	}
-	if len(compiled.Tools) != 1 || compiled.Tools[0].Name != proposalVerdictToolName {
-		return graph.ProposalAcceptanceDecision{}, fmt.Errorf("proposal verifier verdict schema tool 契约被破坏")
-	}
-	if _, err := v.snapshots.Put(*compiled.Snapshot); err != nil {
-		return graph.ProposalAcceptanceDecision{}, fmt.Errorf("proposal verifier ContextSnapshot 持久化失败: %w", err)
-	}
-	binding, err := compiled.InvocationBinding()
-	if err != nil {
-		return graph.ProposalAcceptanceDecision{}, fmt.Errorf("proposal verifier Invocation binding 失败: %w", err)
-	}
-	// DeepSeek thinking 拒绝 exact/required tool_choice。verdict ToolRouter 只暴露
-	// 一个 schema tool，wire 使用 auto，下方 response gate 仍强制至少一个 typed verdict。
-	binding.ToolChoice = invocation.ToolChoice{Mode: invocation.ToolChoiceAuto}
+	response, err := v.runtime.InvokeOperation(evalCtx, contextruntime.Instructions{ProfileID: "proposal-verifier"}, conversation, []llm.ToolDef{proposalVerdictTool()}, v.runtime.Options, v.client)
 
-	response, err := llm.Invoke(evalCtx, v.client, llm.InvocationRequest{
-		Binding: binding, Messages: compiled.Messages, Tools: compiled.Tools,
-	})
 	if err != nil {
 		if evalCtx.Err() != nil {
 			return graph.ProposalAcceptanceDecision{}, context.Cause(evalCtx)
@@ -177,10 +137,10 @@ func (v *Verifier) EvaluateProposal(ctx context.Context, input graph.ProposalAcc
 	if evalCtx.Err() != nil {
 		return graph.ProposalAcceptanceDecision{}, context.Cause(evalCtx)
 	}
-	if response.FinishReason != llm.FinishReasonToolCalls || strings.TrimSpace(response.Content) != "" || len(response.ToolCalls) == 0 {
+	if response.Data().FinishReason != llm.FinishReasonToolCalls || strings.TrimSpace(response.Content()) != "" || len(response.ToolCalls()) == 0 {
 		return graph.ProposalAcceptanceDecision{}, fmt.Errorf("proposal verifier 未返回 typed verdict tool call")
 	}
-	for index, call := range response.ToolCalls {
+	for index, call := range response.ToolCalls() {
 		if call.Name != proposalVerdictToolName {
 			return graph.ProposalAcceptanceDecision{}, fmt.Errorf(
 				"proposal verifier tool_calls[%d]=%q，期望 %q", index, call.Name, proposalVerdictToolName)
@@ -188,7 +148,7 @@ func (v *Verifier) EvaluateProposal(ctx context.Context, input graph.ProposalAcc
 	}
 	// DeepSeek 等 provider 可能忽略 parallel_tool_calls=false。该调用无后续
 	// provider replay，因此按 provider 顺序只消费首个 verdict；其余调用不会 dispatch。
-	output, err := parseVerifierArguments(response.ToolCalls[0].Arguments, v.maxOutput)
+	output, err := parseVerifierArguments(response.ToolCalls()[0].Arguments, v.maxOutput)
 	if err != nil {
 		return graph.ProposalAcceptanceDecision{}, err
 	}
@@ -204,9 +164,9 @@ func (v *Verifier) EvaluateProposal(ctx context.Context, input graph.ProposalAcc
 	}, nil
 }
 
-func proposalContextMessage(binding contextadapter.MessageBinding) contextadapter.ConversationItem {
+func proposalContextMessage(binding contextruntime.MessageBinding) contextruntime.ConversationItem {
 	copy := binding
-	return contextadapter.ConversationItem{Message: &copy}
+	return contextruntime.ConversationItem{Message: &copy}
 }
 
 func validateProposalInput(input graph.ProposalAcceptanceInput, now time.Time) error {
@@ -250,7 +210,7 @@ func proposalDeadlineContext(ctx context.Context, input graph.ProposalAcceptance
 	if !now.Before(deadline) {
 		return nil, nil, fmt.Errorf("proposal verifier Run deadline 已无验收窗口")
 	}
-	child, cancel := context.WithDeadlineCause(ctx, deadline, invocation.ErrRunDeadline)
+	child, cancel := context.WithDeadlineCause(ctx, deadline, llm.ErrRunDeadline)
 	return child, cancel, nil
 }
 

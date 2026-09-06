@@ -1,5 +1,7 @@
 package team
 
+import "agentgo/internal/testmodel"
+
 import (
 	"context"
 	"errors"
@@ -31,9 +33,9 @@ func TestManagerSuspendAllStopsRuntimePreservesReadySpecAndMailbox(t *testing.T)
 	activity := agent.NewActivityTracker()
 	deps := runner.RunnerDeps{
 		Store: taskStore, Roster: roster.NewMemoryRoster(), Activity: activity,
-		MBRegistry: mailboxes, ProjectRoot: t.TempDir(),
+		MBRegistry: mailboxes, ProjectRoot: t.TempDir(), ContextRuntime: testmodel.Runtime(t),
 	}
-	manager := NewManager(deps, func(string) llm.Client { return idleLLM{} },
+	manager := NewManager(deps, func(string) llm.Invoker { return idleLLM{} },
 		catalog, durable, routes, 2)
 	t.Cleanup(manager.Shutdown)
 	if err := manager.Start(context.Background()); err != nil {
@@ -259,9 +261,9 @@ func TestManagerSuspendAllAfterClosedKeepsShutdownSemantics(t *testing.T) {
 	mailboxes := mailbox.NewRegistry(8)
 	deps := runner.RunnerDeps{
 		Store: taskStore, Roster: roster.NewMemoryRoster(), MBRegistry: mailboxes,
-		ProjectRoot: t.TempDir(),
+		ProjectRoot: t.TempDir(), ContextRuntime: testmodel.Runtime(t),
 	}
-	manager := NewManager(deps, func(string) llm.Client { return idleLLM{} },
+	manager := NewManager(deps, func(string) llm.Invoker { return idleLLM{} },
 		catalog, durable, newFakeRoutes(), 2)
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -316,9 +318,9 @@ func TestManagerSuspendAllRecordsAndFinalizeSuspendedMailboxes(t *testing.T) {
 	mailboxes := mailbox.NewRegistry(8)
 	deps := runner.RunnerDeps{
 		Store: taskStore, Roster: roster.NewMemoryRoster(), MBRegistry: mailboxes,
-		ProjectRoot: t.TempDir(),
+		ProjectRoot: t.TempDir(), ContextRuntime: testmodel.Runtime(t),
 	}
-	manager := NewManager(deps, func(string) llm.Client { return idleLLM{} },
+	manager := NewManager(deps, func(string) llm.Invoker { return idleLLM{} },
 		catalog, durable, newFakeRoutes(), 2)
 	t.Cleanup(manager.Shutdown)
 
@@ -378,12 +380,14 @@ func TestManagerSuspendFinalizeRebindStartClaimsRecoveredMailbox(t *testing.T) {
 	routes := newFakeRoutes()
 	deps := runner.RunnerDeps{
 		Store: taskStore, Roster: roster.NewMemoryRoster(), MBRegistry: mailboxes,
-		ProjectRoot: t.TempDir(),
+		ProjectRoot: t.TempDir(), ContextRuntime:
+
+		// session A：provision 一个 team，并留一条未读邮件。
+		testmodel.Runtime(t),
 	}
 
-	// session A：provision 一个 team，并留一条未读邮件。
 	storeA := NewMemoryStore()
-	manager := NewManager(deps, func(string) llm.Client { return idleLLM{} },
+	manager := NewManager(deps, func(string) llm.Invoker { return idleLLM{} },
 		catalog, storeA, routes, 2)
 	t.Cleanup(manager.Shutdown)
 	if err := manager.Start(context.Background()); err != nil {

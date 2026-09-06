@@ -423,7 +423,7 @@ func publishTerminalInterventionSource(t *testing.T, tasks *store.MemoryTaskStor
 	}
 	source := &model.Task{
 		ID: id, Description: "source", RunID: run.RunID, RunContract: run,
-		ContextPolicyRef: policycatalog.ContextDefaultV1, ProgressContract: &profile.Contract,
+		ContextPolicyRef: policycatalog.ContextDefaultCurrent, ProgressContract: &profile.Contract,
 	}
 	if graphTask {
 		source.GraphID, source.NodeID, source.ActivationID, source.GraphNodeKind = "graph-1", "work", "work@1", "agent"

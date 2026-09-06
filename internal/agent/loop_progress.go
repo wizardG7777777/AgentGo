@@ -1,6 +1,7 @@
 package agent
 
 import (
+ "agentgo/internal/contextcontract"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -14,7 +15,6 @@ import (
 
 	"agentgo/internal/effect"
 	"agentgo/internal/graph"
-	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/loopprogress"
@@ -298,57 +298,57 @@ func loopDeadlineSet(task *model.Task, now time.Time) (loopcontract.DeadlineSet,
 	return set, nil
 }
 
-func (r *loopProgressRuntime) reserveModelAction(turnID string) (string, time.Time, invocation.OutputBudget, error) {
+func (r *loopProgressRuntime) reserveModelAction(turnID string) (string, time.Time, llm.OutputBudget, error) {
 	now := time.Now().UTC()
 	actionDeadline := r.checkpoint.Deadlines.Attempt.HardDeadlineAt.Add(-runcontract.DefaultDeadlineHandoffReserve)
 	if !now.Before(actionDeadline) {
-		return "", time.Time{}, invocation.OutputBudget{}, actionDeadlineFailure("没有足够时间预留下一次 model action")
+		return "", time.Time{}, llm.OutputBudget{}, actionDeadlineFailure("没有足够时间预留下一次 model action")
 	}
 	actionID := stableLoopID("action", r.checkpoint.TaskID, r.checkpoint.AttemptID, turnID, "model")
 	useStartPermit := r.runBudgets != nil && r.startPermitRef != "" && !r.startPermitClaimed
 	remaining := remainingBudget(r.activationBudget, r.checkpoint.CumulativeUsage)
 	if r.activationBudget.ModelCalls > 0 && remaining.ModelCalls <= 0 {
-		return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Activation model_calls 预算已耗尽")
+		return "", time.Time{}, llm.OutputBudget{}, fmt.Errorf("Activation model_calls 预算已耗尽")
 	}
 	if r.activationBudget.WallTime > 0 && remaining.WallTime <= 0 {
-		return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Activation wall_time 预算已耗尽")
+		return "", time.Time{}, llm.OutputBudget{}, fmt.Errorf("Activation wall_time 预算已耗尽")
 	}
 	promptLimit := remaining.PromptTokens
 	if promptLimit <= 0 && r.activationBudget.PromptTokens > 0 {
-		return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Activation prompt_tokens 预算已耗尽")
+		return "", time.Time{}, llm.OutputBudget{}, fmt.Errorf("Activation prompt_tokens 预算已耗尽")
 	} else if promptLimit <= 0 {
 		promptLimit = defaultModelPromptReservation
 	}
 	completionLimit := remaining.CompletionTokens
 	if completionLimit <= 0 && r.activationBudget.CompletionTokens > 0 {
-		return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Activation completion_tokens 预算已耗尽")
+		return "", time.Time{}, llm.OutputBudget{}, fmt.Errorf("Activation completion_tokens 预算已耗尽")
 	} else if completionLimit <= 0 {
 		completionLimit = defaultModelCompletionReservation
 	}
 	if r.runBudgets != nil && r.runPhase == runbudget.PhaseExecution {
 		global, ok, err := r.runBudgets.Snapshot(r.checkpoint.RunID)
 		if err != nil {
-			return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("读取 RunBudget ledger: %w", err)
+			return "", time.Time{}, llm.OutputBudget{}, fmt.Errorf("读取 RunBudget ledger: %w", err)
 		}
 		if !ok {
-			return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("读取 RunBudget ledger: RunID=%s 不存在", r.checkpoint.RunID)
+			return "", time.Time{}, llm.OutputBudget{}, fmt.Errorf("读取 RunBudget ledger: RunID=%s 不存在", r.checkpoint.RunID)
 		}
 		used := global.PhaseSettled[runbudget.PhaseExecution]
 		// Snapshot.Reserved 是总量；精确 execution reservation 由 Store.Reserve
 		// 的原子检查兜底。这里仅用于把显式 token 余额下传 OutputBudget。
 		globalRemaining := remainingBudget(global.Limit, used)
 		if !useStartPermit && global.Limit.ModelCalls > 0 && globalRemaining.ModelCalls <= 0 {
-			return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Run model_calls 预算已耗尽")
+			return "", time.Time{}, llm.OutputBudget{}, fmt.Errorf("Run model_calls 预算已耗尽")
 		}
 		if global.Limit.PromptTokens > 0 {
 			if globalRemaining.PromptTokens <= 0 {
-				return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Run prompt_tokens 预算已耗尽")
+				return "", time.Time{}, llm.OutputBudget{}, fmt.Errorf("Run prompt_tokens 预算已耗尽")
 			}
 			promptLimit = minPositiveInt64(promptLimit, globalRemaining.PromptTokens)
 		}
 		if global.Limit.CompletionTokens > 0 {
 			if globalRemaining.CompletionTokens <= 0 {
-				return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("Run completion_tokens 预算已耗尽")
+				return "", time.Time{}, llm.OutputBudget{}, fmt.Errorf("Run completion_tokens 预算已耗尽")
 			}
 			completionLimit = minPositiveInt64(completionLimit, globalRemaining.CompletionTokens)
 		}
@@ -362,7 +362,7 @@ func (r *loopProgressRuntime) reserveModelAction(turnID string) (string, time.Ti
 		if useStartPermit {
 			if err := r.runBudgets.ClaimExecutionPermit(r.checkpoint.RunID, r.startPermitRef,
 				actionID, r.checkpoint.TaskID, r.checkpoint.AttemptID, now); err != nil {
-				return "", time.Time{}, invocation.OutputBudget{}, fmt.Errorf("认领 RecoveryStartPermit: %w", err)
+				return "", time.Time{}, llm.OutputBudget{}, fmt.Errorf("认领 RecoveryStartPermit: %w", err)
 			}
 			r.startPermitClaimed = true
 		}
@@ -377,7 +377,7 @@ func (r *loopProgressRuntime) reserveModelAction(turnID string) (string, time.Ti
 			if useStartPermit {
 				_ = r.runBudgets.Cancel(r.checkpoint.RunID, r.startPermitRef, actionID, time.Now().UTC())
 			}
-			return "", time.Time{}, invocation.OutputBudget{}, err
+			return "", time.Time{}, llm.OutputBudget{}, err
 		}
 	}
 	reservation := loopcontract.ActionReservation{
@@ -400,7 +400,7 @@ func (r *loopProgressRuntime) reserveModelAction(turnID string) (string, time.Ti
 				_ = r.runBudgets.Cancel(r.checkpoint.RunID, r.startPermitRef, actionID, time.Now().UTC())
 			}
 		}
-		return "", time.Time{}, invocation.OutputBudget{}, err
+		return "", time.Time{}, llm.OutputBudget{}, err
 	}
 	r.turnActions[turnID] = append(r.turnActions[turnID], actionID)
 	r.turnReservations[turnID] = reservation.ReservationID
@@ -631,7 +631,7 @@ func (r *loopProgressRuntime) settleTurn(a *Agent, task *model.Task, turnID stri
 		ActionIDs: actionIDs, UsageDelta: usage,
 		SettledAt: settledAt,
 	}
-	if failure, ok := invocation.FromError(execErr); ok {
+	if failure, ok := llm.FromError(execErr); ok {
 		delta.Failure = loopcontract.FreezeInvocationFailure(failure)
 		if delta.InvocationID == "" {
 			delta.InvocationID = failure.InvocationID
@@ -671,10 +671,10 @@ func invocationResultUncertain(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
-	if failure, ok := invocation.FromError(err); ok {
+	if failure, ok := llm.FromError(err); ok {
 		switch failure.Kind {
-		case invocation.FailureCallerCancelled, invocation.FailureAttemptDeadline,
-			invocation.FailureActivationDeadline:
+		case llm.FailureCallerCancelled, llm.FailureAttemptDeadline,
+			llm.FailureActivationDeadline:
 			return true
 		}
 	}
@@ -682,10 +682,10 @@ func invocationResultUncertain(err error) bool {
 }
 
 func actionDeadlineFailure(message string) error {
-	failure := invocation.NewFailure(invocation.FailureAttemptDeadline,
-		invocation.PhaseRequestSend, invocation.OriginRuntime,
-		fmt.Errorf("%s: %w", message, invocation.ErrAttemptDeadline))
-	failure.TimeoutScope = invocation.TimeoutAttempt
+	failure := llm.NewFailure(llm.FailureAttemptDeadline,
+		llm.PhaseRequestSend, llm.OriginRuntime,
+		fmt.Errorf("%s: %w", message, llm.ErrAttemptDeadline))
+	failure.TimeoutScope = llm.TimeoutAttempt
 	return failure
 }
 
@@ -957,11 +957,11 @@ func usesDecisionAwareCodeChange(contractID string) bool {
 		contractID == policycatalog.ProgressCodeChangeV12
 }
 
-func historyEntryFromResult(result ExecuteResult, modelName, turnID string) HistoryEntry {
-	return HistoryEntry{
+func historyEntryFromResult(result ExecuteResult, modelName, turnID string) contextcontract.HistoryEntry {
+	return contextcontract.HistoryEntry{
 		TurnID: turnID, Output: result.Output, ToolCalled: result.ToolCalled,
 		AssistantContent: result.AssistantContent, ToolCalls: result.ToolCalls,
-		ToolResults: result.ToolResults, ExtraFields: result.ExtraFields,
+		ToolResults: result.ToolResults, Replay:result.Replay,
 		PromptTokens: result.PromptTokens, CompletionTokens: result.CompletionTokens,
 		Model: modelName,
 	}

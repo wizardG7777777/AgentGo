@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"agentgo/internal/invocation"
+	"agentgo/internal/llm"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/runcontract"
 )
@@ -283,9 +283,9 @@ func TestEvaluateInvocationFailureChargesRunButPausesNoProgressClock(t *testing.
 	checkpoint.NoProgressDuration = 20 * time.Second
 	checkpoint.NoProgressUsage = runcontract.BudgetUsage{ModelCalls: 2, PromptTokens: 200}
 	delta := testDelta(base, 1)
-	delta.Failure = loopcontract.FreezeInvocationFailure(invocation.NewFailure(
-		invocation.FailureOutputTruncated, invocation.PhaseResponseValidate,
-		invocation.OriginProvider, errors.New("length")))
+	delta.Failure = loopcontract.FreezeInvocationFailure(llm.NewFailure(
+		llm.FailureOutputTruncated, llm.PhaseResponseValidate,
+		llm.OriginProvider, errors.New("length")))
 
 	assessment, next, err := Evaluate(testContract(), checkpoint, delta)
 	if err != nil {

@@ -113,10 +113,10 @@ const (
 	KindHistoryCompaction EventKind = "history_compaction"
 
 	// KindContextManifestBuilt：每轮 LLM 调用前已 durable 的 L2
-	// ContextSnapshot/Manifest 投影；legacy 调用可能仍只有旧 Manifest 摘要。
+	// ContextSnapshot 投影；旧 Trace 中仅有 Manifest 的记录只供历史查看。
 	// 每轮 LLM 调用恰好一条，带 TaskID 落任务分片。payload：
-	//   - Loop：ReAct 循环轮次（transfer-note 压缩调用为 -1，与 llm_call_start 同口径）
-	//   - PromptTokens：Manifest 估算的总 prompt tokens（rune/3 口径）
+	//   - Loop：ReAct 循环轮次，与 llm_call_start 同口径
+	//   - PromptTokens：L2 当前策略估算的输入 token 总数
 	//   - HistoryEntries：本轮历史条数
 	//   - Description：逐段 JSON 摘要（id/source/authority/freshness/tokens/
 	//     disposition/count 列表，不含正文）
@@ -289,13 +289,8 @@ const (
 	// 摘要），不含证据正文。
 	KindAcceptanceCompleted EventKind = "acceptance_completed"
 
-	// === V6 §2 Prompt 有序编译（P1a，internal/prompt + internal/agent/prompt_build.go）===
-
-	// KindPromptCompiled：任务 attempt 开始时 Prompt 编译冻结（每个 attempt
-	// 恰好一条，含重试新 attempt；输入不变则 Build.ID 稳定，重试天然复用
-	// 同一 Build.ID）。payload：TaskID / AgentID，PromptBuildID=Build.ID，
-	// Description=逐组件身份 JSON 摘要（id/version/digest/in_message，
-	// 不含正文）。
+	// KindPromptCompiled 仅用于读取和展示旧 Trace 的 Prompt 编译记录。
+	// 新 L1/L2 链路不再产生该事件，也不据此恢复模型请求。
 	KindPromptCompiled EventKind = "prompt_compiled"
 
 	// === V6 §2 /doctor agents 审计（P1b，internal/bootstrap/agent_audit.go）===
@@ -610,9 +605,7 @@ type Event struct {
 	Partial        bool                 `json:"partial,omitempty"`
 	RecoveryAction string               `json:"recovery_action,omitempty"`
 	LLMTiming      *LLMInvocationTiming `json:"llm_timing,omitempty"`
-	// PromptBuildID 是 V6 §2 P1a 的 prompt_build_id：prompt_compiled 事件
-	// 载 Build.ID；context_manifest_built 事件并入同 attempt 冻结的
-	// Build.ID（prompt_bound 不独立成事件，避免同频双账本）。
+	// PromptBuildID 仅保留旧 Trace 的身份字段；新调用不写入或消费该字段。
 	PromptBuildID string `json:"prompt_build_id,omitempty"`
 	// ToolRouterSnapshotID 证明本次 advertise 与 dispatch 使用同一冻结工具视图。
 	ToolRouterSnapshotID string `json:"tool_router_snapshot_id,omitempty"`

@@ -838,7 +838,7 @@ func (m *Manager) validateDependencies() error {
 type runtimePreparation struct {
 	spec    TeamSpec
 	tmpl    *agenttemplate.Template
-	clients []llm.Client
+	clients []llm.Invoker
 }
 
 // runtimeActivation is a fully constructed process-local Team whose runners,
@@ -864,7 +864,7 @@ func (m *Manager) prepare(spec TeamSpec, tmpl *agenttemplate.Template) (runtimeP
 	if err := runner.ValidatePromptCompatibility(m.parentCtx, preflightRT, m.deps); err != nil {
 		return runtimePreparation{}, fmt.Errorf("team %s L1/L2 runtime contract: %w", spec.ID, err)
 	}
-	clients := make([]llm.Client, spec.Replicas)
+	clients := make([]llm.Invoker, spec.Replicas)
 	for i := range clients {
 		clients[i] = m.llmFactory(tmpl.Model)
 		if clients[i] == nil {

@@ -138,3 +138,9 @@ func canonicalStrings(values []string) []string {
 	sort.Strings(out)
 	return out
 }
+
+// ShortDigestText 为已有审计字段保留短摘要表示，不承担请求完整性校验。
+func ShortDigestText(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:])[:12]
+}

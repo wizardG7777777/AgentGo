@@ -44,7 +44,8 @@ def _all_strings(value):
 
 
 class FakeState:
-    def __init__(self):
+    def __init__(self, protocol="responses"):
+        self.protocol = protocol
         self.lock = threading.Lock()
         self.call_no = 0
         self.worker_reads = 0
@@ -90,10 +91,65 @@ def fake_handler(state: FakeState):
         def log_message(self, _format, *_args):
             return
 
+        def send_sse(self, payload):
+            if state.protocol == "chat_completions":
+                chunks = []
+                call_index = 0
+                for item in payload.get("output", []):
+                    if item.get("type") == "function_call":
+                        arguments = item["arguments"]
+                        cut = max(1, len(arguments)//2)
+                        for part_index, delta in enumerate((arguments[:cut], arguments[cut:])):
+                            call = {"index":call_index,"function":{"arguments":delta}}
+                            if part_index == 0:
+                                call.update({"id":item["call_id"],"type":"function"})
+                                call["function"]["name"]=item["name"]
+                            chunks.append({"id":payload["id"],"choices":[{"index":0,"delta":{"tool_calls":[call]},"finish_reason":None}]})
+                        call_index += 1
+                    elif item.get("type") == "message":
+                        for part in item.get("content", []):
+                            chunks.append({"id":payload["id"],"choices":[{"index":0,"delta":{"content":part.get("text", "")},"finish_reason":None}]})
+                usage = payload.get("usage", {})
+                chunks.append({"id":payload["id"],"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls" if call_index else "stop"}],"usage":{"prompt_tokens":usage.get("input_tokens",0),"completion_tokens":usage.get("output_tokens",0),"completion_tokens_details":usage.get("output_tokens_details",{})}})
+                encoded = b"".join(("data: "+json.dumps(chunk,ensure_ascii=False)+"\n\n").encode("utf-8") for chunk in chunks)+b"data: [DONE]\n\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+                self.wfile.flush()
+                return
+            events = []
+            for index, item in enumerate(payload.get("output", [])):
+                if item.get("type") == "function_call":
+                    args = item["arguments"]
+                    cut = max(1, len(args)//2)
+                    for delta in (args[:cut], args[cut:]):
+                        events.append({"type":"response.function_call_arguments.delta", "output_index":index, "item_id":item["id"], "delta":delta})
+                if item.get("type") == "message":
+                    for part in item.get("content", []):
+                        events.append({"type":"response.output_text.delta", "output_index":index, "item_id":item["id"], "delta":part.get("text", "")})
+                events.append({"type":"response.output_item.done", "output_index":index, "item":item})
+            events.append({"type":"response.completed", "response":payload})
+            encoded = b"".join(("data: "+json.dumps(event,ensure_ascii=False)+"\n\n").encode("utf-8") for event in events)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+            self.wfile.flush()
+
         def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 body = json.loads(self.rfile.read(length) or b"{}")
+                if body.get("stream") is not True:
+                    raise RuntimeError("仅接受 SSE 模型请求")
+                if state.protocol == "chat_completions":
+                    body["tools"] = [tool.get("function", {}) for tool in body.get("tools", [])]
+                    body["input"] = body.get("messages", [])
+                    body["reasoning"] = {"effort":body.get("reasoning_effort")}
+                    body["max_output_tokens"] = body.get("max_completion_tokens")
                 tools = body.get("tools") or []
                 names = [tool.get("name", "") for tool in tools if isinstance(tool, dict)]
                 if state.cancel_mode and not state.cancel_delay_started.is_set() and not any(
@@ -125,12 +181,7 @@ def fake_handler(state: FakeState):
                                       "input_tokens_details": {"cached_tokens": 0},
                                       "output_tokens_details": {"reasoning_tokens": 0}},
                         }
-                        encoded = json.dumps(payload, ensure_ascii=False).encode()
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/json")
-                        self.send_header("Content-Length", str(len(encoded)))
-                        self.end_headers()
-                        self.wfile.write(encoded)
+                        self.send_sse(payload)
                         return
                 if names == ["report_done"] and not state.slow_final_sent:
                     state.slow_final_sent = True
@@ -163,12 +214,7 @@ def fake_handler(state: FakeState):
                         "output_tokens_details": {"reasoning_tokens": 1},
                     },
                 }
-                encoded = json.dumps(payload, ensure_ascii=False).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(encoded)))
-                self.end_headers()
-                self.wfile.write(encoded)
+                self.send_sse(payload)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):  # intentional timeout/cancel scenarios
                 if not state.cancel_mode:
                     state.errors.append("provider connection closed unexpectedly")
@@ -387,12 +433,13 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     default_binary = ".\\agentgo.exe" if sys.platform == "win32" else "./agentgo"
     parser.add_argument("--binary", default=default_binary)
+    parser.add_argument("--protocol", choices=["responses", "chat_completions"], default="responses")
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
     binary = Path(args.binary).resolve()
     if not binary.is_file():
         raise SystemExit(f"未找到 AgentGo binary: {binary}")
-    state = FakeState()
+    state = FakeState(args.protocol)
     provider = ThreadingHTTPServer(("127.0.0.1", 0), fake_handler(state))
     provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
     provider_thread.start()
@@ -410,10 +457,10 @@ def main() -> int:
                 "base_url": f"http://127.0.0.1:{provider.server_port}",
                 "api_key": "local-test-only",
                 "default_model": "fake-responses-model",
-                "protocol": "responses",
+                "protocol": args.protocol,
                 "timeout_sec": 2,
                 "reasoning_effort": "high",
-                "stream": False,
+                "request_contract": "agentgo.model-request/v1",
             },
             "tool_profiles": {
                 "explorer": ["read_file", "list_dir", "grep_search", "glob_search", "read_content_ref",
@@ -527,6 +574,15 @@ def main() -> int:
                     and event.get("reason") == "control_invocation_preflight_failed"
                 ]
                 checkpoint_failures = [event for event in trace_events if event.get("kind") == "observation_checkpoint_failed"]
+                context_journal = root / ".agentgo" / "state" / "context-snapshots-v2" / "context-snapshots.jsonl"
+                context_records = [json.loads(line)["record"]["snapshot"] for line in context_journal.read_text(encoding="utf-8").splitlines() if line.strip()]
+                assert context_records and all(record["schema"] == "agentgo.context/v2" for record in context_records), "未使用新 ContextSnapshot"
+                assert all(record.get("instruction_ref") and record.get("provider_replay_ref") == "provider-replay:openai-compatible/v5" for record in context_records), "快照契约不完整"
+                outputs = [json.loads(line) for path in (root / ".agentgo" / "sessions").glob("sess-*/turns.jsonl") for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+                assert outputs and all(record["schema"] == "agentgo.model-output/v1" for record in outputs), "模型输出未独立落盘"
+                output_ids = {record["identity"]["invocation_id"] for record in outputs}
+                assert all(event["invocation_id"] in output_ids for event in llm_end_events), "有模型调用没有完整输出记录"
+                assert all(record.get("result", {}).get("schema") == "agentgo.model-result/v1" for record in outputs if record["status"] == "completed"), "完成轮次没有保存完整结果"
                 assert len(graphs) == 1, f"同 Run 顶层 Graph 数量={len(graphs)}"
                 assert graphs[0].get("status") == "completed" and graphs[0].get("outcome") == "success", graphs[0]
                 assert reports and reports[0].get("status") == "completed", reports
@@ -647,6 +703,7 @@ def main() -> int:
                 print(json.dumps({
                     "schema": "agentgo.local-fake-provider-smoke/v1",
                     "graph_id": graphs[0].get("graph_id"),
+                    "protocol": args.protocol, "model_output_records":len(outputs), "context_snapshot_records":len(context_records),
                     "graph_status": graphs[0].get("status"),
                     "graph_outcome": graphs[0].get("outcome"),
                     "top_level_graphs": len(graphs),

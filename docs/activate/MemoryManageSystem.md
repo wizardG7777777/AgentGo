@@ -1,3 +1,5 @@
+> **2026-09-07 接线更新**：召回、相关性选择、裁剪与渲染由 L2 contextruntime 负责；Process/Session/Task Memory 的存储仍属于 L3。Agent 只提交结算事实，不再把记忆文本拼入 history/context。ScopeProject 与向量召回不在本次实现范围。下方旧设计说明继续作为历史资料保留。
+
 > **状态说明（2026-07-19）**：本文是 Memory 后续路线图。当前仅 `ProcessStore` 可用；Session/Project 后端与向量检索尚未实现，详见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)。
 
 # MemoryManageSystem：v5 记忆管理系统

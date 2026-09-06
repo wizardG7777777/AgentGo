@@ -284,9 +284,8 @@ Task Memory 已具备结构化事实和重复读取去重，但它服务 L2 Cont
 
 | 边界 | 拥有 | 不拥有 |
 |---|---|---|
-| Model Invocation 基础层 | 单次模型请求 deadline、typed failure、usage | Loop 是否继续 |
-| L1 Prompt | 解释进展缺口和下一动作纪律 | 进展权威、预算和停止 |
-| L2 Context | 渲染有界 Progress 摘要和恢复提示 | Progress 判定、Checkpoint |
+| L1 Model Invocation | 按封存请求执行 SSE、返回 typed failure 与 usage | Loop 是否继续、提示词装配 |
+| L2 Context | 装配进展缺口、下一动作指令、有界 Progress 摘要和恢复提示 | Progress 判定、Checkpoint |
 | L3 Harness | Tool/Effect/Artifact/File/Evaluator 的 settled 事实和 Store | 是否构成目标进展 |
 | **L4 Loop** | Contract 执行、ProgressEvaluator、预算、deadline、干预、Checkpoint | Graph topology |
 | L5 Graph | 工作意图、Graph/Node 输出契约、介入后的 replan/change/路由 | 逐 Turn 进展判断 |

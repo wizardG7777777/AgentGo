@@ -9,7 +9,7 @@ import (
 	"encoding/json"
 	"time"
 
-	"agentgo/internal/invocation"
+	"agentgo/internal/llm"
 	"agentgo/internal/runcontract"
 )
 
@@ -235,7 +235,7 @@ type ObservationChange struct {
 }
 
 // TurnSettlementDelta 是一个 settled Turn 相对前一 durable cursor 的中性事实。
-// Failure 必须是 invocation.Failure 的值拷贝且 Cause 已清空；正文保留在各自
+// Failure 必须是 llm.Failure 的值拷贝且 Cause 已清空；正文保留在各自
 // 权威 Store，本 DTO 只携带稳定引用和 digest。
 type TurnSettlementDelta struct {
 	Schema            string            `json:"schema"`
@@ -270,7 +270,7 @@ type TurnSettlementDelta struct {
 	ControlContractFailure bool               `json:"control_contract_failure,omitempty"`
 
 	UsageDelta runcontract.BudgetUsage `json:"usage_delta"`
-	Failure    *invocation.Failure     `json:"failure,omitempty"`
+	Failure    *llm.Failure     `json:"failure,omitempty"`
 	SettledAt  time.Time               `json:"settled_at"`
 }
 
@@ -473,7 +473,7 @@ type LoopInterventionRequested struct {
 
 // FreezeInvocationFailure 复制一次 canonical InvocationFailure 并清空只供
 // 进程内诊断的 Cause，所得值可安全放入 TurnSettlementDelta 持久化。
-func FreezeInvocationFailure(src *invocation.Failure) *invocation.Failure {
+func FreezeInvocationFailure(src *llm.Failure) *llm.Failure {
 	if src == nil {
 		return nil
 	}

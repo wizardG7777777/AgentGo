@@ -1,5 +1,7 @@
 package spawn
 
+import "agentgo/internal/testmodel"
+
 import (
 	"context"
 	"strings"
@@ -54,7 +56,7 @@ func closedTestSpawnRequest() SpawnRequest {
 func TestManager_Spawn_AfterShutdown_PublishesNothing(t *testing.T) {
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "explorer", Tools: []string{"read_file"}}}}
 	pub := &countingPublisher{}
-	m := NewManager(cfg, runner.RunnerDeps{}, fakeLLMFactory, pub)
+	m := NewManager(cfg, runner.RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, fakeLLMFactory, pub)
 	m.Shutdown()
 
 	_, _, err := m.Spawn(context.Background(), closedTestSpawnRequest())
@@ -75,7 +77,7 @@ func TestManager_Spawn_AfterShutdown_PublishesNothing(t *testing.T) {
 func TestManager_Spawn_ConcurrentShutdown_NoOrphanTask(t *testing.T) {
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "explorer", Tools: []string{"read_file"}}}}
 	pub := &countingPublisher{}
-	m := NewManager(cfg, runner.RunnerDeps{}, fakeLLMFactory, pub)
+	m := NewManager(cfg, runner.RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, fakeLLMFactory, pub)
 	parent, cancelParent := context.WithCancel(context.Background())
 	cancelParent() // 预取消：spawn 出的 runner goroutine 立即退出，不触碰 nil Store
 	m.SetParentContext(parent)

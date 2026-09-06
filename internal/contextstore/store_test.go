@@ -62,8 +62,8 @@ func validSnapshot(t *testing.T) contextcontract.ContextSnapshot {
 		PayloadDigest: digest("payload"),
 	}
 	snapshot := contextcontract.ContextSnapshot{
-		SnapshotID: "snapshot-1", Schema: contextcontract.SnapshotSchemaV1,
-		AttemptID: "attempt-1", InvocationID: "invocation-1", PromptBuildRef: "prompt-1",
+		SnapshotID: "snapshot-1", Schema: contextcontract.SnapshotSchemaV2,
+		AttemptID: "attempt-1", InvocationID: "invocation-1", InstructionRef: "prompt-1",
 		ContextPolicyID: "context:default/v1", ContextPolicyDigest: digest("policy"),
 		ProviderReplayRef: "provider-replay:openai-compatible/v1",
 		ExecutionLeaseRef: "lease-1", ToolRouterSnapshotID: "tools-1",

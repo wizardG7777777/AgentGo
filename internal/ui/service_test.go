@@ -2,258 +2,14 @@ package ui
 
 import (
 	"context"
-	"errors"
+
 	"fmt"
-	"sync"
+
 	"testing"
 	"time"
 
 	"agentgo/internal/output"
 )
-
-func TestHubTurnHistoryUpsertsStreamsAndPersistsCompletedTurns(t *testing.T) {
-	outCh := make(chan output.Event, 8)
-	var mu sync.Mutex
-	var appended []AgentTurn
-	h := startHub(t, Deps{
-		OutputCh:     outCh,
-		PollInterval: 10 * time.Millisecond,
-		SessionGet:   func() SessionInfo { return SessionInfo{ID: "sess-1"} },
-		TurnLoad:     func(string) ([]AgentTurn, error) { return nil, nil },
-		TurnAppend: func(turn AgentTurn) error {
-			mu.Lock()
-			defer mu.Unlock()
-			appended = append(appended, turn)
-			return nil
-		},
-	})
-
-	outCh <- output.Event{
-		Kind: output.KindStream, StreamID: "turn-1", AgentID: "worker-1",
-		TaskID: "task-1", Loop: 1, Text: "第", Reasoning: "先",
-	}
-	outCh <- output.Event{
-		Kind: output.KindStream, StreamID: "turn-1", AgentID: "worker-1",
-		TaskID: "task-1", Loop: 1, Text: "第一轮完整正文", Reasoning: "先分析再执行",
-	}
-	outCh <- output.Event{
-		Kind: output.KindTurn, StreamID: "turn-1", AgentID: "worker-1",
-		TaskID: "task-1", Loop: 1, Text: "第一轮完整正文", Reasoning: "先分析再执行",
-		ToolCalls: []string{"read_file"}, Done: true,
-	}
-	outCh <- output.Event{
-		Kind: output.KindTurn, StreamID: "turn-2", AgentID: "scheduler-1",
-		TaskID: "task-2", Loop: 2, Text: "第二轮", Done: true,
-	}
-
-	waitFor(t, "两轮进入不可淘汰历史并完成持久化", func() bool {
-		snap := h.Snapshot()
-		mu.Lock()
-		defer mu.Unlock()
-		return len(snap.Turns) == 2 && len(appended) == 2
-	})
-	got := h.Snapshot().Turns
-	if got[0].ID != "turn-1" || got[0].Text != "第一轮完整正文" || got[0].Reasoning != "先分析再执行" ||
-		got[0].Status != "completed" || len(got[0].ToolCalls) != 1 {
-		t.Fatalf("同轮流式快照未原位合并并冻结: %+v", got[0])
-	}
-	if got[1].AgentID != "scheduler-1" || got[1].Loop != 2 {
-		t.Fatalf("Scheduler 轮次未走共享历史链路: %+v", got[1])
-	}
-	mu.Lock()
-	persistedReasoning := appended[0].Reasoning
-	mu.Unlock()
-	if persistedReasoning != "先分析再执行" {
-		t.Fatalf("完成轮次未持久化 reasoning: %q", persistedReasoning)
-	}
-
-	// 重复终态事件不得重复追加账本。
-	outCh <- output.Event{
-		Kind: output.KindTurn, StreamID: "turn-1", AgentID: "worker-1",
-		TaskID: "task-1", Loop: 1, Text: "不应覆盖", Done: true,
-	}
-	time.Sleep(30 * time.Millisecond)
-	mu.Lock()
-	appendCount := len(appended)
-	mu.Unlock()
-	if appendCount != 2 || h.Snapshot().Turns[0].Text != "第一轮完整正文" {
-		t.Fatalf("终态轮次应不可变且只落盘一次: append=%d turns=%+v", appendCount, h.Snapshot().Turns)
-	}
-}
-
-func TestHubTurnHistorySurvivesBoundedFeedChurnAndSessionSwitch(t *testing.T) {
-	outCh := make(chan output.Event, recentOutputLimit+50)
-	var mu sync.Mutex
-	sessionID := "sess-1"
-	h := startHub(t, Deps{
-		OutputCh:     outCh,
-		PollInterval: 10 * time.Millisecond,
-		SessionGet: func() SessionInfo {
-			mu.Lock()
-			defer mu.Unlock()
-			return SessionInfo{ID: sessionID}
-		},
-		TurnLoad: func(id string) ([]AgentTurn, error) {
-			if id == "sess-1" {
-				return []AgentTurn{{ID: "old-1", SessionID: id, AgentID: "worker-1", Loop: 1, Status: "completed"}}, nil
-			}
-			return []AgentTurn{{ID: "new-1", SessionID: id, AgentID: "scheduler-1", Loop: 7, Status: "completed"}}, nil
-		},
-	})
-	waitFor(t, "首个 Session 历史加载", func() bool {
-		turns := h.Snapshot().Turns
-		return len(turns) == 1 && turns[0].ID == "old-1"
-	})
-	for i := 0; i < recentOutputLimit+25; i++ {
-		outCh <- output.Event{Kind: output.KindText, AgentID: "worker-1", Text: fmt.Sprintf("noise-%d", i)}
-	}
-	waitFor(t, "实时 feed 完成淘汰", func() bool {
-		return len(h.Snapshot().Feed.Outputs) == recentOutputLimit
-	})
-	if got := h.Snapshot().Turns; len(got) != 1 || got[0].ID != "old-1" {
-		t.Fatalf("有界 feed 不应淘汰轮次账本: %+v", got)
-	}
-
-	mu.Lock()
-	sessionID = "sess-2"
-	mu.Unlock()
-	waitFor(t, "Session 切换后加载新边界历史", func() bool {
-		turns := h.Snapshot().Turns
-		return len(turns) == 1 && turns[0].ID == "new-1"
-	})
-}
-
-func TestHubRetriesFailedTurnPersistence(t *testing.T) {
-	outCh := make(chan output.Event, 2)
-	var mu sync.Mutex
-	attempts := 0
-	h := startHub(t, Deps{
-		OutputCh:     outCh,
-		PollInterval: 10 * time.Millisecond,
-		SessionGet:   func() SessionInfo { return SessionInfo{ID: "sess-1"} },
-		TurnLoad:     func(string) ([]AgentTurn, error) { return nil, nil },
-		TurnAppend: func(AgentTurn) error {
-			mu.Lock()
-			defer mu.Unlock()
-			attempts++
-			if attempts == 1 {
-				return errors.New("临时磁盘错误")
-			}
-			return nil
-		},
-	})
-	outCh <- output.Event{
-		Kind: output.KindTurn, StreamID: "retry-1", AgentID: "worker-1",
-		TaskID: "task-1", Loop: 1, Text: "正文", Done: true,
-	}
-	waitFor(t, "持久化失败后由轮询重试", func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return attempts >= 2
-	})
-	h.mu.RLock()
-	pending := len(h.pendingTurns)
-	persisted := h.persistedTurnIDs["retry-1"]
-	h.mu.RUnlock()
-	if pending != 0 || !persisted {
-		t.Fatalf("重试成功后应清空待写并标记持久化: pending=%d persisted=%v", pending, persisted)
-	}
-}
-
-func TestHubPersistsLateOldSessionTurnWithoutPollutingCurrentView(t *testing.T) {
-	outCh := make(chan output.Event, 2)
-	var mu sync.Mutex
-	var appended []AgentTurn
-	h := startHub(t, Deps{
-		OutputCh:     outCh,
-		PollInterval: 10 * time.Millisecond,
-		SessionGet:   func() SessionInfo { return SessionInfo{ID: "sess-new"} },
-		TurnLoad: func(id string) ([]AgentTurn, error) {
-			return []AgentTurn{{
-				ID: "new-turn", SessionID: id, AgentID: "scheduler-1",
-				Loop: 1, Text: "新 Session 历史", Status: "completed",
-			}}, nil
-		},
-		TurnAppend: func(turn AgentTurn) error {
-			mu.Lock()
-			defer mu.Unlock()
-			appended = append(appended, turn)
-			return nil
-		},
-	})
-	waitFor(t, "新 Session 视图加载", func() bool {
-		turns := h.Snapshot().Turns
-		return len(turns) == 1 && turns[0].ID == "new-turn"
-	})
-	outCh <- output.Event{
-		Kind: output.KindTurn, SessionID: "sess-old", StreamID: "late-old",
-		AgentID: "worker-1", TaskID: "task-old", Loop: 9, Text: "旧边界迟到轮次", Done: true,
-	}
-	waitFor(t, "旧边界迟到轮次按原 Session 落盘", func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(appended) == 1
-	})
-	mu.Lock()
-	persisted := appended[0]
-	mu.Unlock()
-	if persisted.SessionID != "sess-old" || persisted.ID != "late-old" {
-		t.Fatalf("迟到轮次归属错误: %+v", persisted)
-	}
-	if got := h.Snapshot().Turns; len(got) != 1 || got[0].ID != "new-turn" {
-		t.Fatalf("迟到旧轮次不应污染当前 Session 视图: %+v", got)
-	}
-}
-
-// testTimeout 是测试里所有"等待 hub 响应"的统一超时护栏。
-const testTimeout = 3 * time.Second
-
-// recvUpdate 在超时护栏内接收一条更新。
-func recvUpdate(t *testing.T, ch <-chan Update) Update {
-	t.Helper()
-	select {
-	case u := <-ch:
-		return u
-	case <-time.After(testTimeout):
-		t.Fatalf("等待更新超时（%s）", testTimeout)
-		return Update{}
-	}
-}
-
-// startHub 启动一个后台运行的 Hub，并注册清理逻辑：取消 ctx 后断言
-// Run 在超时内退出（goroutine 泄漏护栏）。
-func startHub(t *testing.T, deps Deps) *Hub {
-	t.Helper()
-	h := NewHub(deps)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		h.Run(ctx)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(testTimeout):
-			t.Fatal("hub Run 未在超时内退出（goroutine 泄漏）")
-		}
-	})
-	return h
-}
-
-// waitFor 轮询条件直到满足或超时（用于等 hub 的轮询循环刷新快照）。
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(testTimeout)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("等待条件超时：%s", what)
-}
 
 func TestHub_OutputEventFanout(t *testing.T) {
 	outCh := make(chan output.Event, 4)
@@ -302,33 +58,6 @@ func TestHub_OutputEventFanout(t *testing.T) {
 		t.Fatalf("Output = %+v，载荷未透传", u.Output)
 	}
 
-	outCh <- output.Event{
-		Kind: output.KindStream, AgentID: "a2", TaskID: "task-1",
-		StreamID: "stream-1", Text: "正在生成", Loop: 2,
-	}
-	u = recvUpdate(t, sub)
-	if u.Kind != KindOutputStream || u.Output.StreamID != "stream-1" || u.Output.Text != "正在生成" || u.Output.Loop != 2 {
-		t.Fatalf("stream update = %+v", u)
-	}
-	outCh <- output.Event{
-		Kind: output.KindStream, AgentID: "a2", TaskID: "task-1",
-		StreamID: "stream-1", Text: "正在生成完整内容", Loop: 2, Done: true,
-	}
-	recvUpdate(t, sub)
-	waitFor(t, "流式快照进入可恢复 feed", func() bool {
-		feed := h.Snapshot().Feed
-		if len(feed.Outputs) != 3 { // result + text + one upserted stream
-			return false
-		}
-		last := feed.Outputs[len(feed.Outputs)-1]
-		return last.StreamID == "stream-1" && last.Text == "正在生成完整内容" && last.Done
-	})
-	lateFeed, stopLateFeed := h.Subscribe(1)
-	defer stopLateFeed()
-	lateSnapshot := recvUpdate(t, lateFeed).Snapshot
-	if got := lateSnapshot.Feed.Outputs[len(lateSnapshot.Feed.Outputs)-1]; got.StreamID != "stream-1" || !got.Done {
-		t.Fatalf("晚订阅者未恢复最新流式快照: %+v", got)
-	}
 }
 
 func TestHub_StatusLineFanout(t *testing.T) {
@@ -510,3 +239,52 @@ func TestHub_CancelUnsubscribes(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+func startHub(t *testing.T, deps Deps) *Hub {
+	t.Helper()
+	h := NewHub(deps)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(testTimeout):
+			t.Fatal("hub Run 未在超时内退出（goroutine 泄漏）")
+		}
+	})
+	return h
+}
+
+// waitFor 轮询条件直到满足或超时（用于等 hub 的轮询循环刷新快照）。
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(testTimeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("等待条件超时：%s", what)
+}
+
+func recvUpdate(t *testing.T, ch <-chan Update) Update {
+	t.Helper()
+	select {
+	case u := <-ch:
+		return u
+	case <-time.After(testTimeout):
+		t.Fatalf("等待更新超时（%s）", testTimeout)
+		return Update{}
+	}
+}
+
+// startHub 启动一个后台运行的 Hub，并注册清理逻辑：取消 ctx 后断言
+// Run 在超时内退出（goroutine 泄漏护栏）。
+
+const testTimeout = 3 * time.Second

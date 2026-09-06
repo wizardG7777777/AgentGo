@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"agentgo/internal/contextruntime"
 	"context"
 	"errors"
 	"fmt"
@@ -2302,4 +2303,12 @@ func TestAppModel_SessionTokensDriveHeader(t *testing.T) {
 	if !strings.Contains(bar, "tokens: 1.0k") {
 		t.Errorf("累加器为零时状态栏应回退到 agent 求和 1.0k: %q", bar)
 	}
+}
+
+func (f *fakeUI) WatchModelOutput(o contextruntime.WatchOptions) (<-chan contextruntime.OutputEvent, func(), error) {
+	return contextruntime.NewOutputService(nil).WatchModelOutput(o)
+}
+
+func (f *cancelAwareObserver) WatchModelOutput(o contextruntime.WatchOptions) (<-chan contextruntime.OutputEvent, func(), error) {
+	return contextruntime.NewOutputService(nil).WatchModelOutput(o)
 }

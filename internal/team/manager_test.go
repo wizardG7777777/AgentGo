@@ -1,6 +1,7 @@
 package team
 
 import (
+	"agentgo/internal/testmodel"
 	"context"
 	"errors"
 	"fmt"
@@ -11,7 +12,7 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/agenttemplate"
-	"agentgo/internal/contextadapter"
+	"agentgo/internal/contextruntime"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
@@ -26,8 +27,8 @@ import (
 
 type idleLLM struct{}
 
-func (idleLLM) Chat(context.Context, []llm.Message, []llm.ToolDef) (llm.Response, error) {
-	return llm.Response{}, errors.New("idle test LLM must not be called")
+func (f idleLLM) nextFixture(context.Context, []llm.Message, []llm.ToolDef) (testmodel.Fixture, error) {
+	return testmodel.Fixture{}, errors.New("idle test LLM must not be called")
 }
 
 func TestManagerPrepareRejectsOversizedTemplatePromptBeforeClients(t *testing.T) {
@@ -37,10 +38,10 @@ func TestManagerPrepareRejectsOversizedTemplatePromptBeforeClients(t *testing.T)
 	}
 	clientCalls := 0
 	manager := &Manager{
-		deps: runner.RunnerDeps{ContextRuntime: agent.ContextRuntime{
-			Adapter: contextadapter.New(), Policies: catalog,
+		deps: runner.RunnerDeps{ContextRuntime: contextruntime.Runtime{
+			Assembler: contextruntime.NewAssembler(), Policies: catalog, Snapshots: testmodel.Runtime(t).Snapshots, Options: testmodel.Runtime(t).Options, Output: testmodel.Runtime(t).Output,
 		}},
-		llmFactory: func(string) llm.Client {
+		llmFactory: func(string) llm.Invoker {
 			clientCalls++
 			return idleLLM{}
 		},
@@ -297,9 +298,9 @@ func TestManagerRecoveryClaimsV4UnreadMailboxWithoutDuplicateRegistration(t *tes
 	deps := runner.RunnerDeps{
 		Store:  taskStore,
 		Roster: roster.NewMemoryRoster(), MBRegistry: mailboxes,
-		ProjectRoot: t.TempDir(),
+		ProjectRoot: t.TempDir(), ContextRuntime: testmodel.Runtime(t),
 	}
-	recovered := NewManager(deps, func(string) llm.Client { return idleLLM{} },
+	recovered := NewManager(deps, func(string) llm.Invoker { return idleLLM{} },
 		catalog, durable, newFakeRoutes(), 1)
 	t.Cleanup(recovered.Shutdown)
 	if err := recovered.Start(context.Background()); err != nil {
@@ -328,9 +329,9 @@ func TestManagerShutdownPreservesUnreadMailboxUntilFinalSnapshot(t *testing.T) {
 	deps := runner.RunnerDeps{
 		Store:  taskStore,
 		Roster: roster.NewMemoryRoster(), MBRegistry: mailboxes,
-		ProjectRoot: t.TempDir(),
+		ProjectRoot: t.TempDir(), ContextRuntime: testmodel.Runtime(t),
 	}
-	manager := NewManager(deps, func(string) llm.Client { return idleLLM{} },
+	manager := NewManager(deps, func(string) llm.Invoker { return idleLLM{} },
 		catalog, durable, newFakeRoutes(), 1)
 	t.Cleanup(manager.Shutdown)
 	if err := manager.Start(context.Background()); err != nil {
@@ -429,9 +430,9 @@ func TestManagerRecoveryStartFailureRollsBackMailboxClaim(t *testing.T) {
 	activity := agent.NewActivityTracker()
 	deps := runner.RunnerDeps{
 		Store: queryStore, Roster: roster.NewMemoryRoster(), Activity: activity,
-		MBRegistry: mailboxes, ProjectRoot: t.TempDir(),
+		MBRegistry: mailboxes, ProjectRoot: t.TempDir(), ContextRuntime: testmodel.Runtime(t),
 	}
-	recovered := NewManager(deps, func(string) llm.Client { return idleLLM{} },
+	recovered := NewManager(deps, func(string) llm.Invoker { return idleLLM{} },
 		catalog, durable, newFakeRoutes(), 1)
 	t.Cleanup(recovered.Shutdown)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -477,7 +478,7 @@ func TestManagerDiscardBeforeStartRollsBackRecoveredMailboxClaim(t *testing.T) {
 	}
 
 	_, cancel := context.WithCancel(context.Background())
-	manager := &Manager{deps: runner.RunnerDeps{MBRegistry: mailboxes}}
+	manager := &Manager{deps: runner.RunnerDeps{MBRegistry: mailboxes, ContextRuntime: testmodel.Runtime(t)}}
 	activation := runtimeActivation{team: &activeTeam{
 		spec:     TeamSpec{ID: "route-failure"},
 		agentIDs: []string{"explorer-team-route-failure-1"},
@@ -535,9 +536,9 @@ func TestManagerProvisionPublishesRouteAfterDurableRuntimeReady(t *testing.T) {
 	deps := runner.RunnerDeps{
 		Store:  taskStore,
 		Roster: roster.NewMemoryRoster(), Activity: activity, MBRegistry: mailboxes,
-		ProjectRoot: t.TempDir(),
+		ProjectRoot: t.TempDir(), ContextRuntime: testmodel.Runtime(t),
 	}
-	manager := NewManager(deps, func(string) llm.Client { return idleLLM{} },
+	manager := NewManager(deps, func(string) llm.Invoker { return idleLLM{} },
 		catalog, durable, routes, 2)
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatal(err)
@@ -569,9 +570,9 @@ func TestManagerProvisionRouteFailureStopsSpecAndCleansRuntime(t *testing.T) {
 	deps := runner.RunnerDeps{
 		Store:  taskStore,
 		Roster: roster.NewMemoryRoster(), Activity: activity, MBRegistry: mailboxes,
-		ProjectRoot: t.TempDir(),
+		ProjectRoot: t.TempDir(), ContextRuntime: testmodel.Runtime(t),
 	}
-	manager := NewManager(deps, func(string) llm.Client { return idleLLM{} },
+	manager := NewManager(deps, func(string) llm.Invoker { return idleLLM{} },
 		catalog, durable, routes, 2)
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatal(err)
@@ -634,9 +635,9 @@ func TestManagerProvisionPersistenceFailureNeverExposesRoute(t *testing.T) {
 	deps := runner.RunnerDeps{
 		Store:  taskStore,
 		Roster: roster.NewMemoryRoster(), Activity: activity, MBRegistry: mailboxes,
-		ProjectRoot: t.TempDir(),
+		ProjectRoot: t.TempDir(), ContextRuntime: testmodel.Runtime(t),
 	}
-	manager := NewManager(deps, func(string) llm.Client { return idleLLM{} },
+	manager := NewManager(deps, func(string) llm.Invoker { return idleLLM{} },
 		catalog, storeBackend, routes, 2)
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1092,9 +1093,9 @@ func TestManagerShutdownRemovesDynamicRuntimeSurfaces(t *testing.T) {
 	mailboxes := mailbox.NewRegistry(8)
 	deps := runner.RunnerDeps{
 		Store: taskStore, Roster: roster.NewMemoryRoster(), Activity: activity,
-		MBRegistry: mailboxes, ProjectRoot: t.TempDir(),
+		MBRegistry: mailboxes, ProjectRoot: t.TempDir(), ContextRuntime: testmodel.Runtime(t),
 	}
-	manager := NewManager(deps, func(string) llm.Client { return idleLLM{} },
+	manager := NewManager(deps, func(string) llm.Invoker { return idleLLM{} },
 		catalog, NewMemoryStore(), newFakeRoutes(), 2)
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -1129,9 +1130,9 @@ func TestManagerRepeatedTerminalTeamsReleaseTaskEndCallbacks(t *testing.T) {
 	taskStore := store.NewMemoryTaskStore(nil, 100, 1, 30)
 	deps := runner.RunnerDeps{
 		Store: taskStore, Roster: roster.NewMemoryRoster(),
-		TaskEndCallbacks: callbacks, ProjectRoot: t.TempDir(),
+		TaskEndCallbacks: callbacks, ProjectRoot: t.TempDir(), ContextRuntime: testmodel.Runtime(t),
 	}
-	manager := NewManager(deps, func(string) llm.Client { return idleLLM{} },
+	manager := NewManager(deps, func(string) llm.Invoker { return idleLLM{} },
 		catalog, NewMemoryStore(), newFakeRoutes(), 2)
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -1248,9 +1249,9 @@ func testManagerWithStore(
 ) *Manager {
 	t.Helper()
 	deps := runner.RunnerDeps{
-		Store: taskStore, Roster: roster.NewMemoryRoster(), ProjectRoot: t.TempDir(),
+		Store: taskStore, Roster: roster.NewMemoryRoster(), ProjectRoot: t.TempDir(), ContextRuntime: testmodel.Runtime(t),
 	}
-	return NewManager(deps, func(string) llm.Client { return idleLLM{} },
+	return NewManager(deps, func(string) llm.Invoker { return idleLLM{} },
 		catalog, durable, routes, maxInstances)
 }
 
@@ -1261,4 +1262,16 @@ func contains(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func (f idleLLM) Invoke(ctx context.Context, request llm.Request, sink llm.EventSink) (llm.Result, error) {
+	if err := request.Validate(); err != nil {
+		return llm.Result{}, err
+	}
+	spec := request.Spec()
+	fixture, err := f.nextFixture(ctx, spec.Messages, spec.Tools)
+	if err != nil {
+		return llm.Result{}, err
+	}
+	return fixture.Seal(spec.Options.Protocol)
 }

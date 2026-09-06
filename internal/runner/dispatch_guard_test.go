@@ -8,6 +8,7 @@ package runner
 //     任务消失均拒绝，nil store 退化为仅 ctx 检查。
 
 import (
+	"agentgo/internal/testmodel"
 	"context"
 	"os"
 	"path/filepath"
@@ -28,11 +29,11 @@ import (
 // 纯文本完成。submit_result_runner_test.go 与本文件共用。
 type orderedToolClient struct {
 	mu        sync.Mutex
-	responses []llm.Response
+	responses []testmodel.Fixture
 	calls     int
 }
 
-func (c *orderedToolClient) Chat(context.Context, []llm.Message, []llm.ToolDef) (llm.Response, error) {
+func (c *orderedToolClient) nextFixture(context.Context, []llm.Message, []llm.ToolDef) (testmodel.Fixture, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	idx := c.calls
@@ -40,7 +41,7 @@ func (c *orderedToolClient) Chat(context.Context, []llm.Message, []llm.ToolDef) 
 	if idx < len(c.responses) {
 		return c.responses[idx], nil
 	}
-	return llm.Response{Content: "done", FinishReason: llm.FinishReasonStop}, nil
+	return testmodel.Fixture{Content: "done", FinishReason: llm.FinishReasonStop}, nil
 }
 
 func (c *orderedToolClient) callCount() int {
@@ -91,7 +92,7 @@ func TestRunnerBlocksLaterToolWhenTaskCancelledInSameResponse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	client := &orderedToolClient{responses: []llm.Response{{
+	client := &orderedToolClient{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{
 			{ID: "write-first", Name: "write_file", Arguments: map[string]any{"path": "first.txt", "content": "first"}},
 			{ID: "write-second", Name: "write_file", Arguments: map[string]any{"path": "second.txt", "content": "second"}},
@@ -105,12 +106,12 @@ func TestRunnerBlocksLaterToolWhenTaskCancelledInSameResponse(t *testing.T) {
 	trace.SetDefaultDispatcher(dispatcher)
 	t.Cleanup(func() { trace.SetDefaultDispatcher(originalDispatcher) })
 
-	rn := New(config.AgentRuntimeConfig{
+	rn := newTestRunner(t, config.AgentRuntimeConfig{
 		InstanceID: "worker-dispatch-cancel", Kind: "worker", EventType: "code",
 		AllowedTools: []string{"write_file"}, TaskMaxRetries: 1,
 	}, RunnerDeps{
 		Store: taskStore, Roster: roster.NewMemoryRoster(), LLMClient: client,
-		CancelRegistry: cancelRegistry, ProjectRoot: root,
+		CancelRegistry: cancelRegistry, ProjectRoot: root, ContextRuntime: testmodel.Runtime(t),
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -242,4 +243,16 @@ func TestRequireLiveToolDispatch_RevokedLeaseRejected(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "执行租约已撤销") {
 		t.Fatalf("租约撤销后应拒绝 dispatch 并含中文原因，实际: %v", err)
 	}
+}
+
+func (c *orderedToolClient) Invoke(ctx context.Context, request llm.Request, sink llm.EventSink) (llm.Result, error) {
+	if err := request.Validate(); err != nil {
+		return llm.Result{}, err
+	}
+	spec := request.Spec()
+	fixture, err := c.nextFixture(ctx, spec.Messages, spec.Tools)
+	if err != nil {
+		return llm.Result{}, err
+	}
+	return fixture.Seal(spec.Options.Protocol)
 }

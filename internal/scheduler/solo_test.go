@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"agentgo/internal/testmodel"
 	"context"
 	"os"
 	"path/filepath"
@@ -24,7 +25,7 @@ import (
 // modeStore 由调用方给定（nil 时走 New 内部的 DefaultStore 回落，等价 team）。
 // 返回的 scheduler task 已发布并被认领，holder 已通过 OnTaskStart 设置，
 // 使 publish_task / report_done 等依赖当前任务上下文的工具可直接执行。
-func newSoloTestBundle(t *testing.T, modeStore *modes.Store, mockLLM llm.Client) (*Bundle, *store.MemoryTaskStore, *model.Task) {
+func newSoloTestBundle(t *testing.T, modeStore *modes.Store, mockLLM llm.Invoker) (*Bundle, *store.MemoryTaskStore, *model.Task) {
 	t.Helper()
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
@@ -33,7 +34,7 @@ func newSoloTestBundle(t *testing.T, modeStore *modes.Store, mockLLM llm.Client)
 	cfg := config.DefaultConfig()
 	cfg.Agents = []config.AgentKind{{Kind: "worker", Replicas: 1}}
 
-	bundle := New(s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
+	bundle := newTestScheduler(t, s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
 		nil, nil, nil, nil, nil, modeStore, nil, nil, nil)
 
 	task := &model.Task{Description: "solo 测试任务", EventType: "__scheduler__"}
@@ -51,7 +52,7 @@ func newSoloTestBundle(t *testing.T, modeStore *modes.Store, mockLLM llm.Client)
 // executeOneRound 用脚本化 LLM 跑一轮 Execute，返回唯一工具调用的 result content。
 func executeOneRound(t *testing.T, bundle *Bundle, task *model.Task) string {
 	t.Helper()
-	result, err := bundle.SchedulerExec.Execute(context.Background(), task, nil, nil)
+	result, err := bundle.SchedulerExec.Execute(context.Background(), task, nil, nil, llm.DefaultOutputBudget())
 	if err != nil {
 		t.Fatalf("Execute 失败: %v", err)
 	}
@@ -64,7 +65,7 @@ func executeOneRound(t *testing.T, bundle *Bundle, task *model.Task) string {
 // TestSoloPublishTaskBlocked_Solo 验证 topo=solo 时 scheduler 的 publish_task
 // 被硬拦截，且错误消息明确告知"solo 模式禁止派发子任务，请直接执行"。
 func TestSoloPublishTaskBlocked_Solo(t *testing.T) {
-	mockLLM := &scriptedLLM{responses: []llm.Response{{
+	mockLLM := &scriptedLLM{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{{
 			ID:   "call_1",
 			Name: "publish_task",
@@ -97,7 +98,7 @@ func TestSoloPublishTaskBlocked_Solo(t *testing.T) {
 
 // TestSoloPublishTaskBlocked_TeamAllows 验证 topo=team 时 publish_task 正常放行。
 func TestSoloPublishTaskBlocked_TeamAllows(t *testing.T) {
-	mockLLM := &scriptedLLM{responses: []llm.Response{{
+	mockLLM := &scriptedLLM{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{{
 			ID:   "call_1",
 			Name: "publish_task",
@@ -141,7 +142,7 @@ func TestSoloPublishTaskBlocked_NilStoreAllows(t *testing.T) {
 	}
 
 	// Bundle 级：nil modeStore 走 DefaultStore 回落（team），publish_task 正常成功
-	mockLLM := &scriptedLLM{responses: []llm.Response{{
+	mockLLM := &scriptedLLM{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{{
 			ID:        "call_1",
 			Name:      "publish_task",
@@ -192,7 +193,7 @@ func TestSoloPublishTaskBlocked_RunnerUnaffected(t *testing.T) {
 
 // TestSoloPublishTaskBlocked_SendMessageAllowed 验证 solo 下 send_message 不被误伤。
 func TestSoloPublishTaskBlocked_SendMessageAllowed(t *testing.T) {
-	mockLLM := &scriptedLLM{responses: []llm.Response{{
+	mockLLM := &scriptedLLM{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{{
 			ID:   "call_1",
 			Name: "send_message",
@@ -248,7 +249,7 @@ func TestSchedulerBundle_SoloMode_DirectExecutionCompletes(t *testing.T) {
 
 	modeStore := modes.NewStore(modes.ExecNormal, modes.TopoSolo)
 
-	mockLLM := &scriptedLLM{responses: []llm.Response{
+	mockLLM := &scriptedLLM{responses: []testmodel.Fixture{
 		// 第一轮：普通只读工具
 		{ToolCalls: []llm.ToolCall{{
 			ID:        "call_1",
@@ -264,7 +265,7 @@ func TestSchedulerBundle_SoloMode_DirectExecutionCompletes(t *testing.T) {
 		// 之后的回合（若有）返回纯文本
 	}}
 
-	bundle := New(s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
+	bundle := newTestScheduler(t, s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
 		nil, nil, nil, nil, nil, modeStore, nil, nil, nil)
 
 	root := &model.Task{Description: "读取 note.txt 并总结", EventType: "__scheduler__"}
@@ -333,7 +334,7 @@ func TestSchedulerBundle_SoloMode_DirectWriteCompletes(t *testing.T) {
 		_ = s.AppendToolCall(taskID, rec)
 	}
 
-	mockLLM := &scriptedLLM{responses: []llm.Response{
+	mockLLM := &scriptedLLM{responses: []testmodel.Fixture{
 		// 第一轮：controller 亲自写文件
 		{ToolCalls: []llm.ToolCall{{
 			ID:        "call_1",
@@ -349,7 +350,7 @@ func TestSchedulerBundle_SoloMode_DirectWriteCompletes(t *testing.T) {
 		// 之后的回合（若有）返回纯文本
 	}}
 
-	bundle := New(s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, recordToolCall,
+	bundle := newTestScheduler(t, s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, recordToolCall,
 		nil, nil, nil, nil, nil, nil, modeStore, nil, nil, nil)
 
 	root := &model.Task{Description: "写入 solo_write.txt", EventType: "__scheduler__"}

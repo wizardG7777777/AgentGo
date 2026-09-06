@@ -5,16 +5,16 @@ import (
 	"strings"
 	"testing"
 
-	"agentgo/internal/invocation"
+	"agentgo/internal/llm"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
 )
 
 func TestBlockedInvocationTerminalPreservesFailureAuthority(t *testing.T) {
-	contextFailure := invocation.NewFailure(
-		invocation.FailureContextAssembly,
-		invocation.PhaseRequestBuild,
-		invocation.OriginRuntime,
+	contextFailure := llm.NewFailure(
+		llm.FailureContextAssembly,
+		llm.PhaseRequestBuild,
+		llm.OriginRuntime,
 		errors.New("fragment_limit_exceeded"),
 	)
 	reason, code := blockedInvocationTerminal(contextFailure, contextFailure)
@@ -24,23 +24,23 @@ func TestBlockedInvocationTerminalPreservesFailureAuthority(t *testing.T) {
 		t.Fatalf("Context failure 被错误归因为 deadline: code=%q reason=%q", code, reason)
 	}
 
-	deadlineFailure := invocation.NewFailure(
-		invocation.FailureAttemptDeadline,
-		invocation.PhaseRequestSend,
-		invocation.OriginCaller,
-		invocation.ErrAttemptDeadline,
+	deadlineFailure := llm.NewFailure(
+		llm.FailureAttemptDeadline,
+		llm.PhaseRequestSend,
+		llm.OriginCaller,
+		llm.ErrAttemptDeadline,
 	)
-	deadlineFailure.TimeoutScope = invocation.TimeoutAttempt
+	deadlineFailure.TimeoutScope = llm.TimeoutAttempt
 	reason, code = blockedInvocationTerminal(deadlineFailure, deadlineFailure)
 	if code != "invocation_deadline" || !strings.Contains(reason, "deadline 阻断") ||
-		!strings.Contains(reason, string(invocation.TimeoutAttempt)) {
+		!strings.Contains(reason, string(llm.TimeoutAttempt)) {
 		t.Fatalf("真正 deadline 未保留作用域: code=%q reason=%q", code, reason)
 	}
 
-	quotaFailure := invocation.NewFailure(
-		invocation.FailureProviderQuotaExhausted,
-		invocation.PhaseResponseHeaders,
-		invocation.OriginProvider,
+	quotaFailure := llm.NewFailure(
+		llm.FailureProviderQuotaExhausted,
+		llm.PhaseResponseHeaders,
+		llm.OriginProvider,
 		errors.New("quota exhausted"),
 	)
 	quotaFailure.HTTPStatus = 402
@@ -69,10 +69,10 @@ func TestHandleFailurePersistsContextAssemblyWithoutDeadlineLabel(t *testing.T) 
 		t.Fatal(err)
 	}
 	agent := &Agent{ID: "worker-1", Store: tasks}
-	failure := invocation.NewFailure(
-		invocation.FailureContextAssembly,
-		invocation.PhaseRequestBuild,
-		invocation.OriginRuntime,
+	failure := llm.NewFailure(
+		llm.FailureContextAssembly,
+		llm.PhaseRequestBuild,
+		llm.OriginRuntime,
 		errors.New("fragment_limit_exceeded"),
 	)
 	agent.handleFailure(task, task.ID, failure, nil, nil)
@@ -97,8 +97,8 @@ func TestHandleFailureBlocksProviderQuotaWithoutRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	agent := &Agent{ID: "worker-1", Store: tasks}
-	failure := invocation.NewFailure(invocation.FailureProviderQuotaExhausted,
-		invocation.PhaseResponseHeaders, invocation.OriginProvider, errors.New("quota exhausted"))
+	failure := llm.NewFailure(llm.FailureProviderQuotaExhausted,
+		llm.PhaseResponseHeaders, llm.OriginProvider, errors.New("quota exhausted"))
 	failure.HTTPStatus, failure.ProviderCode = 402, "invalid_request_error"
 	agent.handleFailure(task, task.ID, failure, nil, nil)
 	stored, err := tasks.GetTask(task.ID)

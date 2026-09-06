@@ -1,6 +1,9 @@
 package bootstrap
 
 import (
+	"agentgo/internal/contextruntime"
+	"agentgo/internal/llm"
+	"agentgo/internal/testmodel"
 	"context"
 	"testing"
 	"time"
@@ -41,6 +44,7 @@ func TestSystem_UIHub_EndToEnd(t *testing.T) {
 		Interactions:    interactions,
 		SessionMgr:      sessionMgr,
 	}
+	s.ModelOutput = contextruntime.NewOutputService(sessionMgr.AppendModelOutput)
 	// 与 BootstrapWithOptions 同一装配路径（Step 11）。
 	s.UIHub = s.buildUIHub()
 
@@ -60,10 +64,14 @@ func TestSystem_UIHub_EndToEnd(t *testing.T) {
 		return s.UIHub.Snapshot().TopoMode == "team"
 	})
 	outputCh <- output.Event{Kind: output.KindResult, AgentID: "worker-1", Text: "任务完成"}
-	outputCh <- output.Event{
-		Kind: output.KindTurn, SessionID: sessionID, AgentID: "worker-1",
-		StreamID: "turn-e2e", TaskID: "task-e2e", Loop: 2,
-		Text: "第二轮完整输出", ToolCalls: []string{"read_file"}, Done: true,
+	id := llm.Identity{InvocationID: "turn-e2e", SessionID: sessionID, AgentID: "worker-1", TaskID: "task-e2e", Loop: 2}
+	s.ModelOutput.Start(id)
+	result, sealErr := (testmodel.Fixture{Content: "第二轮完整输出"}).Seal(llm.ProtocolResponses)
+	if sealErr != nil {
+		t.Fatal(sealErr)
+	}
+	if err := s.ModelOutput.Finish(id, result, nil); err != nil {
+		t.Fatal(err)
 	}
 	created, err := interactions.Create(context.Background(), interaction.CreateRequest{
 		ID: "ix_hub_e2e", Kind: interaction.KindAuthorization,
@@ -78,7 +86,6 @@ func TestSystem_UIHub_EndToEnd(t *testing.T) {
 
 	remaining := map[ui.UpdateKind]bool{
 		ui.KindOutputResult:        true,
-		ui.KindOutputTurn:          true,
 		ui.KindInteractionsChanged: true,
 		ui.KindLogLine:             true,
 	}
@@ -94,10 +101,10 @@ func TestSystem_UIHub_EndToEnd(t *testing.T) {
 		result := s.UIHub.Snapshot().LastResult
 		return result != nil && result.Text == "任务完成" && result.AgentID == "worker-1"
 	})
-	waitForUI(t, "完成轮次经 UI Hub 写入 Session 账本", func() bool {
-		turns, loadErr := sessionMgr.LoadTurns(sessionID)
+	waitForUI(t, "完成轮次经 L2 写入 Session 账本", func() bool {
+		turns, loadErr := sessionMgr.LoadModelOutputs(sessionID)
 		return loadErr == nil && len(turns) == 1 &&
-			turns[0].ID == "turn-e2e" && turns[0].Text == "第二轮完整输出"
+			turns[0].Identity.InvocationID == "turn-e2e" && turns[0].Text == "第二轮完整输出"
 	})
 
 	// 待交互进入快照；经 Controller 回复并应用后从快照消失。

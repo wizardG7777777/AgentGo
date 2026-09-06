@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"context"
 	"errors"
 	"strings"
@@ -38,7 +40,7 @@ func TestFinalReportInvocationFailureUsesDeterministicFallback(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = loops.Close() })
 	agent := NewAgent("scheduler-test", "__scheduler__", tasks, roster.NewMemoryRoster(),
-		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+		func(context.Context, *model.Task, map[string]string, []contextcontract.HistoryEntry, llm.OutputBudget) (ExecuteResult, error) {
 			return ExecuteResult{}, errors.New("provider unavailable")
 		})
 	agent.LoopStore = loops
@@ -94,7 +96,7 @@ func TestFinalReportExpiredPhaseUsesFallbackWithoutProviderOrActiveReservation(t
 	t.Cleanup(func() { _ = loops.Close() })
 	providerCalls := 0
 	agent := NewAgent("scheduler-expired", "__scheduler__", tasks, roster.NewMemoryRoster(),
-		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+		func(context.Context, *model.Task, map[string]string, []contextcontract.HistoryEntry, llm.OutputBudget) (ExecuteResult, error) {
 			providerCalls++
 			return ExecuteResult{}, errors.New("不应调用 provider")
 		})

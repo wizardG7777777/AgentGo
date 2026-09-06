@@ -1,12 +1,13 @@
 package scheduler
 
+import "agentgo/internal/testmodel"
+
 import (
 	"context"
 	"strings"
 	"testing"
 
-	"agentgo/internal/agent"
-	"agentgo/internal/contextadapter"
+	"agentgo/internal/contextruntime"
 	"agentgo/internal/policycatalog"
 )
 
@@ -65,8 +66,8 @@ func TestSchedulerCoreAndEveryPhasePassCurrentContextPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime := agent.ContextRuntime{Adapter: contextadapter.New(), Policies: catalog}
-	if err := runtime.ValidateStaticPrompt(context.Background(), agent.StaticPromptProfile{
+	runtime := contextruntime.Runtime{Assembler: contextruntime.NewAssembler(), Policies: catalog, Snapshots: testmodel.Runtime(t).Snapshots, Options: testmodel.Runtime(t).Options, Output: testmodel.Runtime(t).Output}
+	if err := runtime.ValidateStaticPrompt(context.Background(), contextruntime.StaticPromptProfile{
 		ProfileID: "scheduler-core", ContextPolicyRef: policycatalog.ContextDefaultCurrent,
 		SystemPrompt: schedulerCorePrompt,
 	}); err != nil {
@@ -77,7 +78,7 @@ func TestSchedulerCoreAndEveryPhasePassCurrentContextPolicy(t *testing.T) {
 		"scheduler:draft-edit", "scheduler:draft-commit",
 		"scheduler:start", "scheduler:recovery", "scheduler:graph-recovery", "scheduler:final-report",
 	} {
-		if err := runtime.ValidateStaticPrompt(context.Background(), agent.StaticPromptProfile{
+		if err := runtime.ValidateStaticPrompt(context.Background(), contextruntime.StaticPromptProfile{
 			ProfileID: "scheduler-phase-" + phase, ContextPolicyRef: policycatalog.ContextDefaultCurrent,
 			SystemPrompt: schedulerCorePrompt, TeamAwareness: schedulerPromptForPhase(phase),
 		}); err != nil {

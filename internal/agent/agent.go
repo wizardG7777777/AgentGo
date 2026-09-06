@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,7 +17,6 @@ import (
 	"agentgo/internal/controlcapability"
 	"agentgo/internal/effect"
 	"agentgo/internal/hook"
-	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/loopcontrol"
@@ -27,7 +25,6 @@ import (
 	"agentgo/internal/memory"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
-	"agentgo/internal/output"
 	"agentgo/internal/roster"
 	"agentgo/internal/runbudget"
 	"agentgo/internal/runcontract"
@@ -47,14 +44,12 @@ type ErrRecoverable struct {
 func (e *ErrRecoverable) Error() string { return e.Err.Error() }
 func (e *ErrRecoverable) Unwrap() error { return e.Err }
 
-// ToolResult 保存单个 tool call 的执行结果，用于重建 OpenAI tool calling 协议消息。
-type ToolResult struct {
-	ToolCallID string `json:"tool_call_id"` // 对应 tool call 的 ID
-	Content    string `json:"content"`      // 工具执行结果（含错误信息）
-}
+// contextcontract.ToolResult 保存单个 tool call 的执行结果，用于重建 OpenAI tool calling 协议消息。
 
-// ExecuteResult holds the result of a single TaskExecutor invocation.
+// ExecuteResult holds the result of a single TaskExecutor llm.
 type ExecuteResult struct {
+	ContextProjected   bool
+	Replay             *llm.ProtocolReplay
 	InvocationID       string
 	ContextSnapshotID  string
 	InvocationDuration time.Duration
@@ -64,20 +59,17 @@ type ExecuteResult struct {
 	ProviderCallStarted bool
 	Output              string
 	ToolCalled          bool
-	Finalized           bool           // 由 FinalizationChecker 设置，表示任务已完成
-	AssistantContent    string         // LLM 原始回复文本（assistant 消息的 content）
-	Reasoning           string         // provider 返回的原始明文思维链（若有）
-	ToolCalls           []llm.ToolCall // LLM 请求的工具调用列表
-	ToolResults         []ToolResult   // 每个 tool call 对应的执行结果
-	PromptTokens        int            // 本次 LLM 调用消耗的 prompt tokens
-	CompletionTokens    int            // 本次 LLM 调用消耗的 completion tokens
-	// ExtraFields 是 assistant 消息里 openai-go 未识别的字段（如 DeepSeek V4 的
-	// reasoning_content）。由 LLM 客户端透传上来，agent 应把它挂到 HistoryEntry
-	// 上，buildMessages 下一轮重建 assistant 消息时原样回写给 API。
-	ExtraFields map[string]json.RawMessage
+	Finalized           bool                         // 由 FinalizationChecker 设置，表示任务已完成
+	AssistantContent    string                       // LLM 原始回复文本（assistant 消息的 content）
+	Reasoning           string                       // provider 返回的原始明文思维链（若有）
+	ToolCalls           []llm.ToolCall               // LLM 请求的工具调用列表
+	ToolResults         []contextcontract.ToolResult // 每个 tool call 对应的执行结果
+	PromptTokens        int                          // 本次 LLM 调用消耗的 prompt tokens
+	CompletionTokens    int                          // 本次 LLM 调用消耗的 completion tokens
+
 }
 
-// HistoryEntry 记录 ReAct 循环中单轮 TaskExecutor 调用的结果。
+// contextcontract.HistoryEntry 记录 ReAct 循环中单轮 TaskExecutor 调用的结果。
 // 包含完整的 tool calling 信息，确保历史消息能正确重建为 OpenAI 协议格式。
 //
 // PromptTokens / CompletionTokens / Model 由 nextUpgrade_v4.md §11.7.3 引入，
@@ -85,30 +77,10 @@ type ExecuteResult struct {
 //   - PromptTokens：产生该条 assistant 回复时的实测 prompt token 数（来自 SDK Usage）
 //   - CompletionTokens：同上，本轮 completion 实测值
 //   - Model：产生该回复时使用的模型名（不同模型 tokenizer 不同，跨模型实测值不可比）
-type HistoryEntry struct {
-	TurnID            string                     `json:"turn_id,omitempty"`
-	Output            string                     `json:"output"`
-	ToolCalled        bool                       `json:"tool_called"`
-	AssistantContent  string                     `json:"assistant_content"`
-	ToolCalls         []llm.ToolCall             `json:"tool_calls"`
-	ToolResults       []ToolResult               `json:"tool_results"`
-	ExtraFields       map[string]json.RawMessage `json:"extra_fields,omitempty"`       // 层 1 通用透传：assistant 消息的非标字段
-	IncomingMail      string                     `json:"incoming_mail,omitempty"`      // 非空时为收到的代理间邮件，注入为 user 角色消息
-	SystemNotice      string                     `json:"system_notice,omitempty"`      // L4/L1 控制提醒，注入为 system，禁止伪装成 user
-	PromptTokens      int                        `json:"prompt_tokens,omitempty"`      // §11.7.3 实测锚定：本轮 LLM 调用的实测 prompt tokens
-	CompletionTokens  int                        `json:"completion_tokens,omitempty"`  // §11.7.3 实测锚定：本轮 completion tokens
-	Model             string                     `json:"model,omitempty"`              // §11.7.3 模型切换基准重置：产生该条回复时使用的模型名
-	ContextProjection string                     `json:"context_projection,omitempty"` // L2 replay projection control
-	// IncomingContext* 让 L3/L4 生成的控制面输入显式声明 L2 类型；空值只为
-	// 历史记录保留 marker-based 兼容分类。正文仍在 IncomingMail，避免复制。
-	IncomingContextKind      contextcontract.FragmentKind   `json:"incoming_context_kind,omitempty"`
-	IncomingContextSection   contextcontract.ContextSection `json:"incoming_context_section,omitempty"`
-	IncomingContextAuthority contextcontract.Authority      `json:"incoming_context_authority,omitempty"`
-}
 
 // TaskExecutor is a pluggable function that executes a task.
 // For MVP this is injected as a mock; in production it will call the LLM.
-type TaskExecutor func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error)
+type TaskExecutor func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error)
 
 // TokenStats 是 Agent 级别的累计 Token 消耗统计（nextUpgrade_v4.md §11.7.3）。
 // 每次 LLM 调用后累加，仅作 TUI/Web AgentCard 的实时视图数据源（经
@@ -136,7 +108,7 @@ type Agent struct {
 	PollInterval   time.Duration
 	IdleThreshold  int // 连续空轮询退出阈值，0 表示禁用
 	CancelRegistry *store.TaskCancelRegistry
-	// Model 是该 Agent 当前生效的模型名，用于 HistoryEntry.Model 记录。
+	// Model 是该 Agent 当前生效的模型名，用于 contextcontract.HistoryEntry.Model 记录。
 	// nextUpgrade_v4.md §11.7.3：跨模型实测值不可比，压缩阈值估算
 	// 仅锚定当前模型一致的最近一条 PromptTokens > 0 条目。空串时退化为粗略估算。
 	Model                               string
@@ -201,12 +173,6 @@ type Agent struct {
 	// （兼容单 Writer 的既有装配）。bootstrap 将其接到 output.KindResult 事件
 	// writer，让"这是最终结果"的分类在产生处完成，消费方不再做子串匹配。
 	ResultOutput io.Writer
-
-	// StreamOutput 同时接收合并后的在途快照（KindStream）和每次 LLM 调用
-	// 唯一的不可变完成事实（KindTurn）。它与 UserOutput/ResultOutput 分离：
-	// 流式快照原位替换一个 UI 项，完成轮次则追加到 Session 账本。nil 只
-	// 禁用 UI/轮次发布，不禁用 SDK streaming。
-	StreamOutput func(output.Event)
 
 	// IsUserFacing 标记此 agent 是否直接对话用户（典型为 scheduler）。
 	//
@@ -291,80 +257,12 @@ type Agent struct {
 	// 旧装配与单测直构）。runner / scheduler 装配注入与 Gate 相同的实例。
 	Modes *modes.Store
 
-	// PromptSource 是 V6 §2 P1a Prompt 有序编译的静态 prompt 身份源
-	// （*LLMExecutor 实现 PromptIdentityProvider；runner / scheduler 装配
-	// 注入，与 Execute/ToolSwapper 同一句柄）。processTask 在每个 attempt
-	// 开始编译并冻结 Prompt Build（组件含 agent_role 全文 digest、
-	// 当时工具清单、控制协议块），经 ctx 载体供 executor 把 Build.ID 并入
-	// 每轮 context_manifest_built 事件。nil 时 agent_role/base_contract
-	// 组件缺失（降级观测，不阻断任务）。
-	PromptSource PromptIdentityProvider
-
 	// loopFuse 是 emergency loop fuse 的测试覆盖口：>0 时替代包级常量
 	// emergencyLoopFuse 生效。生产装配不得设置——fuse 是不可经任何 YAML/配置
 	// 调低的程序缺陷防御兜底，不是正常终止条件（V6，见 processTask 循环顶部）。
 	loopFuse int
 }
 
-// publishCompletedTurn 为一次 TaskExecutor 调用发布恰好一个不可变的
-// UI/Session 轮次事实。优先使用公开 assistant 文本；仅填写 Output 的自然
-// 文本 executor 保持兼容。工具参数/结果排除，provider 返回的明文 reasoning
-// 作为独立字段保留。
-func (a *Agent) publishCompletedTurn(
-	turnID, taskID string,
-	loop int,
-	result ExecuteResult,
-	execErr error,
-	lastStreamText string,
-	lastStreamReasoning string,
-) {
-	if a == nil || a.StreamOutput == nil || turnID == "" {
-		return
-	}
-	// 被 Invocation hard cap/协议边界拒绝的 partial 只允许作为实时 stream 观察，
-	// 不得固化成 Session 的正式 assistant/reasoning 历史。失败轮仍以空正文和
-	// typed Error 结算，保留审计身份。
-	if failure, ok := invocation.FromError(execErr); ok && failure.Partial {
-		lastStreamText = ""
-		lastStreamReasoning = ""
-	}
-	text := result.AssistantContent
-	if text == "" && !result.ToolCalled {
-		text = result.Output
-	}
-	if text == "" {
-		text = lastStreamText
-	}
-	reasoning := result.Reasoning
-	if reasoning == "" {
-		reasoning = lastStreamReasoning
-	}
-	toolNames := make([]string, 0, len(result.ToolCalls))
-	for _, call := range result.ToolCalls {
-		if call.Name != "" {
-			toolNames = append(toolNames, call.Name)
-		}
-	}
-	errText := ""
-	if execErr != nil {
-		errText = execErr.Error()
-	}
-	a.StreamOutput(output.Event{
-		Kind:      output.KindTurn,
-		AgentID:   a.ID,
-		TaskID:    taskID,
-		StreamID:  turnID,
-		Loop:      loop,
-		Text:      text,
-		Reasoning: reasoning,
-		Done:      true,
-		Error:     errText,
-		ToolCalls: toolNames,
-	})
-}
-
-// AddTokenStats 线程安全地累加一次 LLM 调用的 token 消耗，并返回累加后的
-// 一致快照（供本 goroutine 后续使用，避免再次取锁）。
 func (a *Agent) AddTokenStats(prompt, completion int64) TokenStats {
 	a.tokenMu.Lock()
 	defer a.tokenMu.Unlock()
@@ -766,15 +664,9 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		log.Printf("[agent %s] 任务 %s 执行租约生效：%s（%d/%d 已注册）",
 			a.ID, taskID, describeLeaseTools(lease), filtered.RegisteredCount(), full.RegisteredCount())
 	}
-	// 模型覆盖：租约冻结值 ≠ 当前模型时换入（capability 覆盖的冻结产物）。
-	// a.Model 在 HistoryEntry.Model 记录处读取，替换后自动跟随；defer 恢复。
-	// wire 层请求模型经 llm.WithModelOverride 写入 ctx——processTask 的 ctx
-	// 派生出每轮 execCtx 直达 client.Chat，SDKClient 读取后替换请求模型
-	//（llm/client.go modelOverrideKey），因此覆盖对实际 API 请求同样生效。
 	if lease.Model != "" && lease.Model != a.Model {
 		origModel := a.Model
 		a.Model = lease.Model
-		ctx = llm.WithModelOverride(ctx, lease.Model)
 		defer func() { a.Model = origModel }()
 		log.Printf("[agent %s] 任务 %s 执行租约生效：模型覆盖 %s → %s", a.ID, taskID, origModel, lease.Model)
 	}
@@ -857,14 +749,13 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	}
 
 	var lastOutput string
-	history := make([]HistoryEntry, 0)
+	history := make([]contextcontract.HistoryEntry, 0)
 
 	// CM1（V6 §3）：Context Manifest 侧信息载体，每个 attempt 一份，经 ctx
 	// 传给 executor 只读——承载 Memory 段 UpdatedAt（新鲜度判定）与本 attempt
 	// 内的压缩处置（L2 strategy / L3 truncated）。taskStartedAt 取认领时刻，
 	// 是 Memory 段 live/stale 判定的比较基准。
-	manifestInfo := newManifestSideInfo(time.Now())
-	ctx = withManifestSideInfo(ctx, manifestInfo)
+	manifestInfo := newAttemptContextStats(time.Now())
 	lastObservationProjectionCount := manifestInfo.historyProjectionCount
 
 	// CM2（V6 §3）：Task Memory 加载或创建（attempt 恢复=加载既有，继续
@@ -873,7 +764,6 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// 任务最终状态收口：终态置 Sealed 封存，重试回滚只 checkpoint 不封存。
 	taskMem := a.initTaskMemory(task)
 	if taskMem != nil {
-		ctx = withTaskMemCarrier(ctx, taskMem.carrier)
 		defer taskMem.finalize(a, taskID)
 	}
 
@@ -882,55 +772,16 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// + Task Memory（滚动工作状态，task_memory.go）共同承担；V6 CM4 已删除
 	// TransferNote 精炼备忘机制。
 	if len(task.LastHistory) > 0 {
-		if err := json.Unmarshal(task.LastHistory, &history); err != nil {
-			log.Printf("[agent %s] 反序列化历史记录失败，从空历史开始: %v", a.ID, err)
-			history = make([]HistoryEntry, 0)
-		} else {
-			log.Printf("[agent %s] 任务 %s 恢复执行（retry=%d），载入 %d 条历史记录", a.ID, taskID, task.RetryCount, len(history))
+		loaded, err := contextcontract.DecodeHistory(task.LastHistory)
+		if err != nil {
+			a.blockForLoopControl(task, taskID, err.Error(), "model_history_incompatible")
+			return
 		}
+		history = loaded
 	}
 
-	// CM4：依赖任务的 Task Memory 交接注入（取代已删除的
-	// <upstream-transfer-notes> TransferNote 注入）。下游代理除「前置任务
-	// 结果 + Artifacts」外，还能看到上游终结时封存的滚动工作状态。
-	if block := a.buildDepTaskMemoryBlock(task, manifestInfo); block != "" {
-		history = append(history, HistoryEntry{IncomingMail: block})
-	}
-
-	// 任务级注入点：team_snapshot / file_awareness 走 Memory System
-	// （MemoryManageSystem.md MM6 取代 v4 TeamAwarenessHook）。
-	// MM7 之后 AgentHook 子系统整体删除——再无 PhaseTaskStart 注入路径。
-	if injected := a.injectMemoryContext(ctx, taskID, -1, false); injected != "" {
-		history = append(history, HistoryEntry{
-			IncomingMail: injected,
-		})
-	}
-
-	// CM3（V6 §3）：Session Memory 召回注入（任务入口一次）。重试 attempt
-	// 跳过——LastHistory 已含上次注入，重复注入会让 LLM 看到旧时间戳的
-	// 重复块（与 team_snapshot 的 RetryCount>0 短路同款理由）。
-	if task.RetryCount == 0 {
-		if recalled := a.recallSessionMemory(ctx, taskID); recalled != "" {
-			history = append(history, HistoryEntry{
-				IncomingMail: recalled,
-			})
-		}
-	}
-
-	// V6 §2 P1a：Prompt 有序编译——每个 attempt 在执行租约冻结、工具视图
-	// 换入之后编译一次并冻结（重试新 attempt 重新编译；输入不变则
-	// Build.ID 稳定，重试天然复用同 Build.ID）。组件含 agent_role（system
-	// prompt 全文，task.SystemPrompt 覆盖时是另一个 Build）、当时工具清单
-	//（来自冻结租约/注册全集）与控制协议块；Build.Text 与 buildMessages
-	// 的 system+user 首条逐字节一致——不改变任何消息字节，编译产物只
-	// 用于身份与观测。核心指令在任务执行中不改变（现状语义的钉住）。
-	// executor 每轮把 Build.ID 并入 context_manifest_built 事件
-	//（prompt_bound 不独立成事件，避免同频双账本）。
-	promptBuild := a.compilePromptBuild(task, depResults, lease)
-	ctx = withPromptBuild(ctx, promptBuild)
-	a.emitPromptCompiled(taskID, promptBuild)
-	log.Printf("[agent %s] 任务 %s prompt 已编译冻结：build=%s 组件=%d digest=%s",
-		a.ID, taskID, promptBuild.ID, len(promptBuild.Components), promptBuild.Digest)
+	// 刷新 L3 团队与运行事实；记忆召回和上下文投影由 L2 在每轮装配时完成。
+	a.refreshRuntimeFacts(ctx, taskID, -1, false)
 
 	// emitCancellation 统一处理两种取消观测窗口：循环顶部已经看到 ctx
 	// cancelled，以及 LLM/工具调用阻塞期间才发生取消、Execute 返回后才重新
@@ -1054,8 +905,11 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				mailSessionID = a.SessionID()
 			}
 			if msgs := a.Mailbox.DrainRunWithAck(a.MailRegistry, task.RunID, mailSessionID, task.ID); len(msgs) > 0 {
-				history = append(history, HistoryEntry{
-					IncomingMail: formatMailMessages(msgs),
+				history = append(history, contextcontract.HistoryEntry{
+					IncomingMail:             formatMailMessages(msgs),
+					IncomingContextKind:      contextcontract.FragmentMailboxMessage,
+					IncomingContextSection:   contextcontract.SectionMailbox,
+					IncomingContextAuthority: contextcontract.AuthorityUntrusted,
 				})
 				hasNewMail = true
 			}
@@ -1064,11 +918,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		// 每轮开头的上下文注入点。v5 Phase 1 把团队快照刷新移交
 		// injectMemoryContext（参考 TeamRefreshInterval 与 hasNewMail）；
 		// MM7 后 AgentHookRegistry 已删除。
-		if injected := a.injectMemoryContext(ctx, taskID, i, hasNewMail); injected != "" {
-			history = append(history, HistoryEntry{
-				IncomingMail: injected,
-			})
-		}
+		a.refreshRuntimeFacts(ctx, taskID, i, hasNewMail)
 
 		// 前置检查：如果设置了 FinalizationChecker 且已 finalized，
 		// 说明上一轮调用了 finalization tool，立即终止 reactLoop。
@@ -1233,10 +1083,10 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		// 上一 Turn 接受提交后即使恰好跨过 Attempt deadline，也必须先完成已
 		// durable 的终态事务，不能改走 retry/blocked 产生第二个提交者。
 		if hasAttemptDeadline && !time.Now().Before(attemptDeadline) {
-			cause := invocation.ErrAttemptDeadline
-			failure := invocation.NewFailure(invocation.FailureAttemptDeadline,
-				invocation.PhaseRequestSend, invocation.OriginRuntime, cause)
-			failure.TimeoutScope = invocation.TimeoutAttempt
+			cause := llm.ErrAttemptDeadline
+			failure := llm.NewFailure(llm.FailureAttemptDeadline,
+				llm.PhaseRequestSend, llm.OriginRuntime, cause)
+			failure.TimeoutScope = llm.TimeoutAttempt
 			terminatingCause = "react_loop_exit:attempt_deadline"
 			enterTerminating(terminatingCause)
 			if a.tryFinalizationFallback(ctx, task, i) {
@@ -1261,7 +1111,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		}
 
 		// 构建只读副本传入 executor
-		histCopy := make([]HistoryEntry, len(history))
+		histCopy := make([]contextcontract.HistoryEntry, len(history))
 		copy(histCopy, history)
 
 		// 注入 agent/task/loop 与稳定 Run/Attempt/Turn identity。legacy Task 缺
@@ -1281,45 +1131,15 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		if a.Activity != nil {
 			execCtx = WithActivityContext(execCtx, a.Activity)
 		}
-		lastStreamText := ""
-		lastStreamReasoning := ""
-		if a.Activity != nil || a.StreamOutput != nil {
-			lastPublished := time.Time{}
-			execCtx = llm.WithStreamHandler(execCtx, func(ev llm.StreamEvent) {
-				if ev.AccumulatedContent != "" {
-					lastStreamText = ev.AccumulatedContent
-					if a.Activity != nil {
-						a.Activity.LLMDelta(a.ID, taskID, i, ev.AccumulatedContent)
-					}
-				}
-				if ev.AccumulatedReasoning != "" {
-					lastStreamReasoning = ev.AccumulatedReasoning
-				}
-				if a.StreamOutput == nil || (ev.AccumulatedContent == "" && ev.AccumulatedReasoning == "" && ev.Error == "") {
-					return
-				}
-				now := time.Now()
-				if !ev.Done && !lastPublished.IsZero() && now.Sub(lastPublished) < 50*time.Millisecond {
-					return
-				}
-				lastPublished = now
-				a.StreamOutput(output.Event{
-					Kind: output.KindStream, AgentID: a.ID, TaskID: taskID,
-					StreamID: turnID, Loop: i, Text: ev.AccumulatedContent,
-					Reasoning: ev.AccumulatedReasoning,
-					Done:      ev.Done, Error: ev.Error,
-				})
-			})
-		}
 		executeCtx := execCtx
 		var cancelExecute context.CancelFunc
 		if hasAttemptDeadline {
-			executeCtx, cancelExecute = context.WithDeadlineCause(execCtx, attemptDeadline, invocation.ErrAttemptDeadline)
+			executeCtx, cancelExecute = context.WithDeadlineCause(execCtx, attemptDeadline, llm.ErrAttemptDeadline)
 		}
 		actionStartedAt := time.Now().UTC()
+		actionOutputBudget := llm.DefaultOutputBudget()
 		if loopProgress != nil {
 			var reserveErr error
-			var actionOutputBudget invocation.OutputBudget
 			_, actionStartedAt, actionOutputBudget, reserveErr = loopProgress.reserveModelAction(turnID)
 			if reserveErr != nil {
 				if cancelExecute != nil {
@@ -1336,7 +1156,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					taskSuccess = true
 					return
 				}
-				if _, deadlineFailure := invocation.FromError(reserveErr); deadlineFailure {
+				if _, deadlineFailure := llm.FromError(reserveErr); deadlineFailure {
 					terminatingCause = "react_loop_exit:attempt_deadline"
 					enterTerminating(terminatingCause)
 					taskMem.recordAttemptEnd(a, taskID, reserveErr.Error())
@@ -1349,7 +1169,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				a.blockForLoopControl(task, taskID, reason, "progress_authority_failure")
 				return
 			}
-			executeCtx, reserveErr = invocation.WithOutputBudget(executeCtx, actionOutputBudget)
+			reserveErr = actionOutputBudget.Validate()
 			if reserveErr != nil {
 				if cancelErr := loopProgress.cancelModelAction(turnID, reserveErr.Error()); cancelErr != nil {
 					reserveErr = errors.Join(reserveErr, cancelErr)
@@ -1370,11 +1190,13 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			}
 			executeCtx = withToolActionBoundary(executeCtx, loopProgress)
 		}
-		result, execErr := a.Execute(executeCtx, task, depResults, histCopy)
+		result, execErr := a.Execute(executeCtx, task, depResults, histCopy, actionOutputBudget)
+		if result.ContextProjected {
+			manifestInfo.historyProjectionCount++
+		}
 		if cancelExecute != nil {
 			cancelExecute()
 		}
-		a.publishCompletedTurn(turnID, taskID, i, result, execErr, lastStreamText, lastStreamReasoning)
 		policyDecision := loopPolicyDecision{}
 		var progressErr error
 		callerCancelled := ctx.Err() != nil && isAuthoritativeCancellation()
@@ -1436,7 +1258,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				var incompatible *controlcapability.IncompatibleError
 				if errors.As(execErr, &incompatible) {
 					if observationAction == "periodic" {
-						history = append(history, HistoryEntry{SystemNotice: observationCheckpointAbandonedMarker +
+						history = append(history, contextcontract.HistoryEntry{SystemNotice: observationCheckpointAbandonedMarker +
 							" 当前 Run 已确认该 effective model/profile/schema 不兼容；保留 Raw History 并跳过 provider 调用。"})
 						a.saveHistory(task, history)
 						continue
@@ -1461,7 +1283,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				// record_observation_delta ToolCall，仍必须纳入 checkpoint
 				// 自身的有界重试，不得落入普通 LLM retry 空转。
 				if observationCheckpointFailureCount(history) == failureCountBefore {
-					history = append(history, HistoryEntry{SystemNotice: observationCheckpointFailureMarker +
+					history = append(history, contextcontract.HistoryEntry{SystemNotice: observationCheckpointFailureMarker +
 						" 本次机械 checkpoint 未形成合法 ObservationDelta。"})
 				}
 				failures := observationCheckpointFailureCount(history)
@@ -1477,12 +1299,12 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					if detail := observationCheckpointFailureDetail(result); detail != "" {
 						notice += " 机械错误：" + detail
 					}
-					history = append(history, HistoryEntry{SystemNotice: notice})
+					history = append(history, contextcontract.HistoryEntry{SystemNotice: notice})
 					a.saveHistory(task, history)
 					continue
 				}
 				if !usesDurableControlFailures && observationAction == "periodic" {
-					history = append(history, HistoryEntry{SystemNotice: observationCheckpointAbandonedMarker +
+					history = append(history, contextcontract.HistoryEntry{SystemNotice: observationCheckpointAbandonedMarker +
 						" 周期性 Observation 两次失败；保留原始历史并恢复业务阶段，下一知识 turn 再尝试。"})
 					a.saveHistory(task, history)
 					continue
@@ -1570,7 +1392,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				history = append(history, historyEntryFromResult(result, a.Model, turnID))
 			}
 			taskMem.applySettledTurn(a, taskID, result, i)
-			history = append(history, HistoryEntry{SystemNotice: observationCheckpointNotice("continue",
+			history = append(history, contextcontract.HistoryEntry{SystemNotice: observationCheckpointNotice("continue",
 				"L2 已开始有界 history projection；在继续普通工作前冻结当前事实和下一步。")})
 			a.saveHistory(task, history)
 			continue
@@ -1585,7 +1407,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				history = append(history, historyEntryFromResult(result, a.Model, turnID))
 			}
 			taskMem.applySettledTurn(a, taskID, result, i)
-			history = append(history, HistoryEntry{SystemNotice: policyDecision.Reminder})
+			history = append(history, contextcontract.HistoryEntry{SystemNotice: policyDecision.Reminder})
 			a.saveHistory(task, history)
 			continue
 		}
@@ -1595,7 +1417,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					history = append(history, historyEntryFromResult(result, a.Model, turnID))
 				}
 				taskMem.applySettledTurn(a, taskID, result, i)
-				history = append(history, HistoryEntry{SystemNotice: observationCheckpointNotice("rollover",
+				history = append(history, contextcontract.HistoryEntry{SystemNotice: observationCheckpointNotice("rollover",
 					policyDecision.Reminder)})
 				a.saveHistory(task, history)
 				continue
@@ -1604,7 +1426,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				history = append(history, historyEntryFromResult(result, a.Model, turnID))
 			}
 			if policyDecision.Reminder != "" {
-				history = append(history, HistoryEntry{SystemNotice: policyDecision.Reminder})
+				history = append(history, contextcontract.HistoryEntry{SystemNotice: policyDecision.Reminder})
 			}
 			taskMem.applySettledTurn(a, taskID, result, i)
 			a.saveHistory(task, history)
@@ -1667,7 +1489,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		}
 		var authorityErr *loopAuthorityError
 		if errors.As(execErr, &authorityErr) {
-			if _, deadlineFailure := invocation.FromError(authorityErr.Err); deadlineFailure {
+			if _, deadlineFailure := llm.FromError(authorityErr.Err); deadlineFailure {
 				if a.tryFinalizationFallback(ctx, task, i+1) {
 					taskSuccess = true
 					return
@@ -1687,11 +1509,11 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		}
 
 		if execErr != nil {
-			if failure, ok := invocation.FromError(execErr); ok {
+			if failure, ok := llm.FromError(execErr); ok {
 				decision := loopcontrol.DecideInvocationFailure(failure)
 				if decision.Action == loopcontrol.RecoveryRetrySameSnapshot && sameSnapshotFailureStreak < 2 {
 					sameSnapshotFailureStreak++
-					history = append(history, HistoryEntry{SystemNotice: fmt.Sprintf(
+					history = append(history, contextcontract.HistoryEntry{SystemNotice: fmt.Sprintf(
 						"[same-snapshot-retry %d/2] 上一 Invocation 被机械拒绝：%s。保持当前 Attempt，严格使用本轮 ToolRouter/schema 修正后重试。",
 						sameSnapshotFailureStreak, failure.Error())})
 					a.saveHistory(task, history)
@@ -1754,8 +1576,8 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				}, history, manifestInfo)
 				return
 			}
-			history = append(history, HistoryEntry{
-				IncomingMail: "<system-reminder>你上一轮的回复为空（没有文本内容，也没有工具调用）。这是不允许的：请调用工具继续工作，或给出非空的最终答复。</system-reminder>",
+			history = append(history, contextcontract.HistoryEntry{
+				SystemNotice: "<system-reminder>你上一轮的回复为空（没有文本内容，也没有工具调用）。这是不允许的：请调用工具继续工作，或给出非空的最终答复。</system-reminder>",
 			})
 			continue
 		}
@@ -1787,8 +1609,8 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				}
 				log.Printf("[agent %s] 任务 %s 图节点纯文本退出被拒（第 %d/%d 次提醒），要求 submit_task_result 收口",
 					a.ID, taskID, unstructuredExitStreak, maxUnstructuredExitNudges)
-				history = append(history, HistoryEntry{
-					IncomingMail: fmt.Sprintf("<system-reminder>本任务是 Graph 节点任务，收尾必须调用 submit_task_result 提交结构化结果（status/summary，以及节点声明的 event 或 acceptance 的 verdict）；纯文本回复不会被接受（第 %d/%d 次提醒）。</system-reminder>",
+				history = append(history, contextcontract.HistoryEntry{
+					SystemNotice: fmt.Sprintf("<system-reminder>本任务是 Graph 节点任务，收尾必须调用 submit_task_result 提交结构化结果（status/summary，以及节点声明的 event 或 acceptance 的 verdict）；纯文本回复不会被接受（第 %d/%d 次提醒）。</system-reminder>",
 						unstructuredExitStreak, maxUnstructuredExitNudges),
 				})
 				continue
@@ -1823,7 +1645,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 					return
 				case !decision.Allow:
 					log.Printf("[agent %s] 任务 %s 纯文本收口被零证据审查拒绝，注入提醒继续", a.ID, taskID)
-					history = append(history, HistoryEntry{IncomingMail: decision.Nudge})
+					history = append(history, contextcontract.HistoryEntry{SystemNotice: decision.Nudge})
 					continue
 				}
 			}
@@ -1971,20 +1793,20 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		// PromptTokens / CompletionTokens / Model 用于 §11.7.3 实测锚定，供历史压缩
 		// 的 token 估算使用。Model 字段为空串时（Agent
 		// 未注入模型名）退化为 v3 行为——估算时不做模型一致性筛选。
-		history = append(history, HistoryEntry{
+		history = append(history, contextcontract.HistoryEntry{
 			TurnID:           turnID,
 			Output:           result.Output,
 			ToolCalled:       result.ToolCalled,
 			AssistantContent: result.AssistantContent,
 			ToolCalls:        result.ToolCalls,
 			ToolResults:      result.ToolResults,
-			ExtraFields:      result.ExtraFields, // 层 1：透传 reasoning_content 等非标字段
+			Replay:           result.Replay, // 层 1：透传 reasoning_content 等非标字段
 			PromptTokens:     result.PromptTokens,
 			CompletionTokens: result.CompletionTokens,
 			Model:            a.Model,
 		})
 		if policyDecision.Reminder != "" {
-			history = append(history, HistoryEntry{SystemNotice: policyDecision.Reminder})
+			history = append(history, contextcontract.HistoryEntry{SystemNotice: policyDecision.Reminder})
 		}
 
 		// 进度通知：在 history append 之后、PhaseLoopPost 之前发送
@@ -2060,7 +1882,7 @@ func (a *Agent) tryFinalizationFallback(ctx context.Context, task *model.Task, l
 // 设计上本路径不再调用 LLM——fuse 的存在就是为了阻断失控行为，失控路径上
 // 再发起 LLM 调用违背其目的。历史经 saveHistory 落盘仅作事后排查证据，
 // 不为重试服务（blocked 不重试）。
-func (a *Agent) tripRuntimeLoopFuse(ctx context.Context, task *model.Task, taskID string, loop int, history []HistoryEntry) {
+func (a *Agent) tripRuntimeLoopFuse(ctx context.Context, task *model.Task, taskID string, loop int, history []contextcontract.HistoryEntry) {
 	reason := fmt.Sprintf("emergency loop fuse 触发：ReAct 循环计数 %d 越过兜底阈值 %d，判定为程序缺陷造成的死循环；任务已转 blocked，不会自动重跑",
 		loop, a.loopFuseLimit())
 	log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
@@ -2192,8 +2014,8 @@ func (a *Agent) hasToolCallFailure(taskID string) bool {
 	return false
 }
 
-func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, history []HistoryEntry, manifestInfo *manifestSideInfo) {
-	canonicalFailure, hasCanonicalFailure := invocation.FromError(execErr)
+func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, history []contextcontract.HistoryEntry, manifestInfo *attemptContextStats) {
+	canonicalFailure, hasCanonicalFailure := llm.FromError(execErr)
 	legacyRecoverable := false
 	if !hasCanonicalFailure {
 		var recoverable *ErrRecoverable
@@ -2254,7 +2076,7 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 		overflow := recoveryDecision.Action == loopcontrol.RecoveryRebuildContext
 		if overflow {
 			log.Printf("[agent %s] 任务 %s 检测到上下文溢出，下一 Attempt 使用激进 replay 投影（Raw History 保持不变）", a.ID, taskID)
-			history = append(history, HistoryEntry{ContextProjection: "aggressive"})
+			history = append(history, contextcontract.HistoryEntry{ContextProjection: "aggressive"})
 			// CM1：回填 L3 处置——本 attempt 随后的 LLM 调用的 Manifest 中
 			// history 段 Disposition 记为 truncated。
 			if manifestInfo != nil {
@@ -2343,18 +2165,18 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 // blockedInvocationTerminal 把 canonical failure 与 L4 终态原因分开编码。
 // RecoveryBlock 不等于 deadline：ContextCompiler 的 deterministic rejection
 // 同样需要 blocked，但必须保留 L2 根因，不能伪造 timeout authority。
-func blockedInvocationTerminal(failure *invocation.Failure, execErr error) (string, string) {
+func blockedInvocationTerminal(failure *llm.Failure, execErr error) (string, string) {
 	if failure == nil {
 		return fmt.Sprintf("Invocation 被 L4 恢复策略阻断：%v", execErr), "invocation_blocked"
 	}
 	switch failure.Kind {
-	case invocation.FailureProviderQuotaExhausted:
+	case llm.FailureProviderQuotaExhausted:
 		return fmt.Sprintf("Provider 计费额度或余额已耗尽，当前 Run 无法继续：status=%d code=%s",
 			failure.HTTPStatus, failure.ProviderCode), "provider_quota_exhausted"
-	case invocation.FailureAttemptDeadline, invocation.FailureActivationDeadline:
+	case llm.FailureAttemptDeadline, llm.FailureActivationDeadline:
 		return fmt.Sprintf("Invocation 被 L4 deadline 阻断：kind=%s scope=%s: %v",
 			failure.Kind, failure.TimeoutScope, execErr), "invocation_deadline"
-	case invocation.FailureContextAssembly:
+	case llm.FailureContextAssembly:
 		return fmt.Sprintf("Context 装配被 L2 policy 拒绝：kind=%s scope=%s: %v",
 			failure.Kind, failure.TimeoutScope, execErr), "context_assembly_rejected"
 	default:
@@ -2478,12 +2300,12 @@ func (a *Agent) sendCrashReport(task *model.Task, taskID string, reason string) 
 // diagnoseLLMError 将不可恢复 LLM 错误映射为面向用户/scheduler 的诊断提示。
 // 基于 v4.md §9.4 的诊断映射规则，从 llm.ErrUnrecoverable 中提取 Code / StatusCode /
 // Message / Endpoint 生成可操作的错误描述。非 llm 错误原样返回。
-func diagnoseLLMError(execErr error, history []HistoryEntry, model string) string {
+func diagnoseLLMError(execErr error, history []contextcontract.HistoryEntry, model string) string {
 	var unrecov *llm.ErrUnrecoverable
 	if !errors.As(execErr, &unrecov) {
 		return execErr.Error()
 	}
-	canonicalFailure, hasCanonicalFailure := invocation.FromError(execErr)
+	canonicalFailure, hasCanonicalFailure := llm.FromError(execErr)
 
 	// 轻量估算当前历史 token 长度（用于 context_length_exceeded 提示）
 	estTokens := 0
@@ -2497,7 +2319,7 @@ func diagnoseLLMError(execErr error, history []HistoryEntry, model string) strin
 
 	msgLower := strings.ToLower(unrecov.Message)
 	switch {
-	case hasCanonicalFailure && canonicalFailure.Kind == invocation.FailureContextWindowExceeded:
+	case hasCanonicalFailure && canonicalFailure.Kind == llm.FailureContextWindowExceeded:
 		return fmt.Sprintf("请求超出模型上下文上限。当前历史长度约 %d tokens；下一 Attempt 将由 Context v3 使用更紧的 Snapshot-pressure replay 投影。", estTokens)
 	// Go 优先级 && > ||，下面两个分支等价；显式括号让"或"的两侧在视觉上对齐，
 	// 防止维护者误读为 (Code=="model_not_found" || strings.Contains(...,"model")) && strings.Contains(...,"not found")。
@@ -2535,7 +2357,7 @@ func buildArtifactFailureReason(check ArtifactCheckResult) string {
 
 // appendValidationFeedback 把校验失败的诊断信息追加为一条 IncomingMail 历史条目。
 // 重试时这条会作为 user 角色消息进入下一轮 LLM 上下文，让 LLM 看见自己上次为什么被打回。
-func appendValidationFeedback(history []HistoryEntry, check ArtifactCheckResult) []HistoryEntry {
+func appendValidationFeedback(history []contextcontract.HistoryEntry, check ArtifactCheckResult) []contextcontract.HistoryEntry {
 	var sb strings.Builder
 	sb.WriteString("<validation-feedback>\n")
 	sb.WriteString("  上一次 LLM 响应被系统拦截：你声称任务完成，但 expected_artifacts 校验未通过。\n")
@@ -2553,15 +2375,15 @@ func appendValidationFeedback(history []HistoryEntry, check ArtifactCheckResult)
 	sb.WriteString("  纠正策略：使用 write_file 工具，path 参数严格按 expected_artifacts 字面给出的相对路径。\n")
 	sb.WriteString("  不要把文件写到 docs/ 子目录除非 expected 路径就是 docs/xxx。\n")
 	sb.WriteString("</validation-feedback>")
-	return append(history, HistoryEntry{IncomingMail: sb.String()})
+	return append(history, contextcontract.HistoryEntry{SystemNotice: sb.String()})
 }
 
 // saveHistory 将当前历史序列化并保存到任务中，供重试时恢复。
-func (a *Agent) saveHistory(task *model.Task, history []HistoryEntry) {
+func (a *Agent) saveHistory(task *model.Task, history []contextcontract.HistoryEntry) {
 	if len(history) == 0 || task == nil || a.Store == nil {
 		return
 	}
-	data, err := json.Marshal(history)
+	data, err := contextcontract.EncodeHistory(history)
 	if err != nil {
 		log.Printf("[agent %s] 序列化历史记录失败: %v", a.ID, err)
 		return

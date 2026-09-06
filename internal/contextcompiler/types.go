@@ -35,7 +35,7 @@ func (f WireEncoderFunc) Encode(ctx context.Context, items []contextcontract.Wir
 type CompileInput struct {
 	AttemptID            string
 	InvocationID         string
-	PromptBuildRef       string
+	InstructionRef       string
 	ExecutionLeaseRef    string
 	ToolRouterSnapshotID string
 	ParentSnapshotRef    string

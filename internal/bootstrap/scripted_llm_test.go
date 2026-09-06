@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"agentgo/internal/testmodel"
 	"context"
 	"fmt"
 	"sync"
@@ -25,12 +26,12 @@ func (c *traceCaptureDispatcher) Dispatch(ev trace.Event) {
 // 返回 "done" 文本响应（与 scheduler 集成测试的 mock 同型）。
 type planGateScriptedLLM struct {
 	mu        sync.Mutex
-	responses []llm.Response
+	responses []testmodel.Fixture
 	calls     int
 	callLog   []string // 每次调用的诊断信息（消息数 / 工具数 / 末条消息摘要）
 }
 
-func (s *planGateScriptedLLM) Chat(_ context.Context, msgs []llm.Message, tools []llm.ToolDef) (llm.Response, error) {
+func (s *planGateScriptedLLM) nextFixture(_ context.Context, msgs []llm.Message, tools []llm.ToolDef) (testmodel.Fixture, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	last := ""
@@ -47,5 +48,17 @@ func (s *planGateScriptedLLM) Chat(_ context.Context, msgs []llm.Message, tools 
 		return r, nil
 	}
 	s.calls++
-	return llm.Response{Content: "done"}, nil
+	return testmodel.Fixture{Content: "done"}, nil
+}
+
+func (s *planGateScriptedLLM) Invoke(ctx context.Context, request llm.Request, sink llm.EventSink) (llm.Result, error) {
+	if err := request.Validate(); err != nil {
+		return llm.Result{}, err
+	}
+	spec := request.Spec()
+	fixture, err := s.nextFixture(ctx, spec.Messages, spec.Tools)
+	if err != nil {
+		return llm.Result{}, err
+	}
+	return fixture.Seal(spec.Options.Protocol)
 }

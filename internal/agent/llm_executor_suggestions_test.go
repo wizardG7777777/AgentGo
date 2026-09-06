@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"agentgo/internal/testmodel"
 	"context"
 	"strings"
 	"testing"
@@ -50,15 +51,15 @@ func newSuggestionExecutor(t *testing.T, h hook.ToolHook, toolNames ...string) (
 		})
 	}
 	mockLLM := &mockLLMForHookTest{}
-	return NewLLMExecutor(mockLLM, tools, hookReg, nil, nil, ""), mockLLM
+	return newTestLLMExecutor(t, mockLLM, tools, hookReg, nil, nil, ""), mockLLM
 }
 
 // runRound 执行一轮 ReAct 步：LLM 返回一个工具调用。
 func runRound(t *testing.T, executor TaskExecutor, mockLLM *mockLLMForHookTest, taskID string, call llm.ToolCall) ExecuteResult {
 	t.Helper()
-	mockLLM.responses = append(mockLLM.responses, llm.Response{ToolCalls: []llm.ToolCall{call}})
+	mockLLM.responses = append(mockLLM.responses, testmodel.Fixture{ToolCalls: []llm.ToolCall{call}})
 	ctx := WithAgentContext(context.Background(), "agent-1", taskID, mockLLM.callIndex)
-	res, err := executor(ctx, &model.Task{ID: taskID, Description: "test"}, nil, nil)
+	res, err := executor(ctx, &model.Task{ID: taskID, Description: "test"}, nil, nil, llm.DefaultOutputBudget())
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}

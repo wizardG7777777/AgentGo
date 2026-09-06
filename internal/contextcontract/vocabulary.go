@@ -8,6 +8,7 @@ const (
 	FragmentPromptComponent        FragmentKind = "prompt_component"
 	FragmentSystemOutputContract   FragmentKind = "system_output_contract"
 	FragmentUserTask               FragmentKind = "user_task"
+	FragmentUserMedia              FragmentKind = "user_media"
 	FragmentTaskControlContext     FragmentKind = "task_control_context"
 	FragmentUpstreamResult         FragmentKind = "upstream_result"
 	FragmentUpstreamEvidence       FragmentKind = "upstream_evidence"
@@ -30,7 +31,7 @@ func KnownFragmentKinds() []FragmentKind {
 	return []FragmentKind{
 		FragmentPromptComponent,
 		FragmentSystemOutputContract,
-		FragmentUserTask,
+		FragmentUserTask, FragmentUserMedia,
 		FragmentTaskControlContext,
 		FragmentUpstreamResult,
 		FragmentUpstreamEvidence,
@@ -52,7 +53,7 @@ func KnownFragmentKinds() []FragmentKind {
 // Valid 报告 FragmentKind 是否属于当前 schema 的封闭词表。
 func (k FragmentKind) Valid() bool {
 	switch k {
-	case FragmentPromptComponent, FragmentSystemOutputContract, FragmentUserTask,
+	case FragmentPromptComponent, FragmentSystemOutputContract, FragmentUserTask, FragmentUserMedia,
 		FragmentTaskControlContext, FragmentUpstreamResult, FragmentUpstreamEvidence,
 		FragmentAssistantContent, FragmentAssistantReasoning, FragmentAssistantResponseItems,
 		FragmentAssistantExtraField,
@@ -263,6 +264,7 @@ type ContextSection string
 const (
 	SectionSystem              ContextSection = "system"
 	SectionTaskContract        ContextSection = "task_contract"
+	SectionInputMedia          ContextSection = "input_media"
 	SectionUpstreamInputs      ContextSection = "upstream_inputs"
 	SectionMemory              ContextSection = "memory"
 	SectionConversationHistory ContextSection = "conversation_history"
@@ -275,7 +277,7 @@ const (
 func KnownContextSections() []ContextSection {
 	return []ContextSection{
 		SectionSystem,
-		SectionTaskContract,
+		SectionTaskContract, SectionInputMedia,
 		SectionUpstreamInputs,
 		SectionMemory,
 		SectionConversationHistory,
@@ -288,7 +290,7 @@ func KnownContextSections() []ContextSection {
 
 func (s ContextSection) Valid() bool {
 	switch s {
-	case SectionSystem, SectionTaskContract, SectionUpstreamInputs, SectionMemory,
+	case SectionSystem, SectionTaskContract, SectionInputMedia, SectionUpstreamInputs, SectionMemory,
 		SectionConversationHistory, SectionToolResults, SectionMailbox,
 		SectionRuntimeControl, SectionToolDefinitions:
 		return true

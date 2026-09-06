@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"agentgo/internal/testmodel"
 	"context"
 	"errors"
 	"fmt"
@@ -110,21 +111,21 @@ func (r *recordingStore) AppendToolCall(taskID string, rec store.ToolCallRecord)
 
 // mockLLMForHookTest 是用于 Hook 测试的 LLM 客户端 mock。
 type mockLLMForHookTest struct {
-	responses []llm.Response
+	responses []testmodel.Fixture
 	errors    []error
 	callIndex int
 }
 
-func (m *mockLLMForHookTest) Chat(ctx context.Context, messages []llm.Message, tools []llm.ToolDef) (llm.Response, error) {
+func (m *mockLLMForHookTest) nextFixture(ctx context.Context, messages []llm.Message, tools []llm.ToolDef) (testmodel.Fixture, error) {
 	idx := m.callIndex
 	m.callIndex++
 	if idx < len(m.errors) && m.errors[idx] != nil {
-		return llm.Response{}, m.errors[idx]
+		return testmodel.Fixture{}, m.errors[idx]
 	}
 	if idx < len(m.responses) {
 		return m.responses[idx], nil
 	}
-	return llm.Response{Content: "done"}, nil
+	return testmodel.Fixture{Content: "done"}, nil
 }
 
 // TestExecutor_CallsPreHooksBeforeTool 验证 Pre-hook 在工具执行前调用。
@@ -151,7 +152,7 @@ func TestExecutor_CallsPreHooksBeforeTool(t *testing.T) {
 	})
 
 	mockLLM := &mockLLMForHookTest{
-		responses: []llm.Response{
+		responses: []testmodel.Fixture{
 			{
 				ToolCalls: []llm.ToolCall{
 					{ID: "call_1", Name: "test_tool", Arguments: map[string]any{}},
@@ -160,11 +161,11 @@ func TestExecutor_CallsPreHooksBeforeTool(t *testing.T) {
 		},
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, nil, "")
+	executor := newTestLLMExecutor(t, mockLLM, tools, hookReg, nil, nil, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 	task := &model.Task{ID: "task-001", Description: "test"}
 
-	_, _ = executor(ctx, task, nil, nil)
+	_, _ = executor(ctx, task, nil, nil, llm.DefaultOutputBudget())
 
 	if !preHook.preCalled.Load() {
 		t.Error("Pre-hook was not called")
@@ -196,7 +197,7 @@ func TestExecutor_CallsPostHooksAfterTool(t *testing.T) {
 	})
 
 	mockLLM := &mockLLMForHookTest{
-		responses: []llm.Response{
+		responses: []testmodel.Fixture{
 			{
 				ToolCalls: []llm.ToolCall{
 					{ID: "call_1", Name: "test_tool", Arguments: map[string]any{}},
@@ -205,11 +206,11 @@ func TestExecutor_CallsPostHooksAfterTool(t *testing.T) {
 		},
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, nil, "")
+	executor := newTestLLMExecutor(t, mockLLM, tools, hookReg, nil, nil, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 	task := &model.Task{ID: "task-001", Description: "test"}
 
-	_, _ = executor(ctx, task, nil, nil)
+	_, _ = executor(ctx, task, nil, nil, llm.DefaultOutputBudget())
 
 	if !toolExecuted {
 		t.Error("Tool was not executed")
@@ -247,7 +248,7 @@ func TestExecutor_PreHookAbortSkipsTool(t *testing.T) {
 	})
 
 	mockLLM := &mockLLMForHookTest{
-		responses: []llm.Response{
+		responses: []testmodel.Fixture{
 			{
 				ToolCalls: []llm.ToolCall{
 					{ID: "call_1", Name: "test_tool", Arguments: map[string]any{}},
@@ -256,11 +257,11 @@ func TestExecutor_PreHookAbortSkipsTool(t *testing.T) {
 		},
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, nil, "")
+	executor := newTestLLMExecutor(t, mockLLM, tools, hookReg, nil, nil, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 	task := &model.Task{ID: "task-001", Description: "test"}
 
-	result, _ := executor(ctx, task, nil, nil)
+	result, _ := executor(ctx, task, nil, nil, llm.DefaultOutputBudget())
 
 	if toolCalled {
 		t.Error("Tool should not be called when pre-hook returns Abort")
@@ -289,7 +290,7 @@ func TestExecutor_PostHookSeesToolResult(t *testing.T) {
 	})
 
 	mockLLM := &mockLLMForHookTest{
-		responses: []llm.Response{
+		responses: []testmodel.Fixture{
 			{
 				ToolCalls: []llm.ToolCall{
 					{ID: "call_1", Name: "test_tool", Arguments: map[string]any{}},
@@ -298,11 +299,11 @@ func TestExecutor_PostHookSeesToolResult(t *testing.T) {
 		},
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, nil, "")
+	executor := newTestLLMExecutor(t, mockLLM, tools, hookReg, nil, nil, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 	task := &model.Task{ID: "task-001", Description: "test"}
 
-	_, _ = executor(ctx, task, nil, nil)
+	_, _ = executor(ctx, task, nil, nil, llm.DefaultOutputBudget())
 
 	if !postHook.postCalled.Load() {
 		t.Fatal("Post-hook was not called")
@@ -335,7 +336,7 @@ func TestExecutor_PostHookSeesToolError(t *testing.T) {
 	})
 
 	mockLLM := &mockLLMForHookTest{
-		responses: []llm.Response{
+		responses: []testmodel.Fixture{
 			{
 				ToolCalls: []llm.ToolCall{
 					{ID: "call_1", Name: "failing_tool", Arguments: map[string]any{}},
@@ -344,11 +345,11 @@ func TestExecutor_PostHookSeesToolError(t *testing.T) {
 		},
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, nil, "")
+	executor := newTestLLMExecutor(t, mockLLM, tools, hookReg, nil, nil, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 	task := &model.Task{ID: "task-001", Description: "test"}
 
-	_, _ = executor(ctx, task, nil, nil)
+	_, _ = executor(ctx, task, nil, nil, llm.DefaultOutputBudget())
 
 	if !postHook.postCalled.Load() {
 		t.Fatal("Post-hook was not called")
@@ -373,7 +374,7 @@ func TestExecutor_AppendsToolCallOnSuccess(t *testing.T) {
 	})
 
 	mockLLM := &mockLLMForHookTest{
-		responses: []llm.Response{
+		responses: []testmodel.Fixture{
 			{
 				ToolCalls: []llm.ToolCall{
 					{ID: "call_1", Name: "success_tool", Arguments: map[string]any{"arg1": "val1"}},
@@ -386,10 +387,10 @@ func TestExecutor_AppendsToolCallOnSuccess(t *testing.T) {
 		recStore.AppendToolCall(taskID, rec)
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, nil, nil, recordFunc, "")
+	executor := newTestLLMExecutor(t, mockLLM, tools, nil, nil, recordFunc, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 
-	_, _ = executor(ctx, task, nil, nil)
+	_, _ = executor(ctx, task, nil, nil, llm.DefaultOutputBudget())
 
 	history := recStore.GetToolCallHistory("task-001")
 	if len(history) != 1 {
@@ -421,7 +422,7 @@ func TestExecutor_AppendsToolCallOnFailure(t *testing.T) {
 	})
 
 	mockLLM := &mockLLMForHookTest{
-		responses: []llm.Response{
+		responses: []testmodel.Fixture{
 			{
 				ToolCalls: []llm.ToolCall{
 					{ID: "call_1", Name: "fail_tool", Arguments: map[string]any{}},
@@ -434,10 +435,10 @@ func TestExecutor_AppendsToolCallOnFailure(t *testing.T) {
 		recStore.AppendToolCall(taskID, rec)
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, nil, nil, recordFunc, "")
+	executor := newTestLLMExecutor(t, mockLLM, tools, nil, nil, recordFunc, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 
-	_, _ = executor(ctx, task, nil, nil)
+	_, _ = executor(ctx, task, nil, nil, llm.DefaultOutputBudget())
 
 	history := recStore.GetToolCallHistory("task-001")
 	if len(history) != 1 {
@@ -471,7 +472,7 @@ func TestExecutor_AppendsToolCallOnHookAbort(t *testing.T) {
 	})
 
 	mockLLM := &mockLLMForHookTest{
-		responses: []llm.Response{
+		responses: []testmodel.Fixture{
 			{
 				ToolCalls: []llm.ToolCall{
 					{ID: "call_1", Name: "blocked_tool", Arguments: map[string]any{}},
@@ -484,10 +485,10 @@ func TestExecutor_AppendsToolCallOnHookAbort(t *testing.T) {
 		recStore.AppendToolCall(taskID, rec)
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, hookReg, nil, recordFunc, "")
+	executor := newTestLLMExecutor(t, mockLLM, tools, hookReg, nil, recordFunc, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 
-	_, _ = executor(ctx, task, nil, nil)
+	_, _ = executor(ctx, task, nil, nil, llm.DefaultOutputBudget())
 
 	history := recStore.GetToolCallHistory("task-001")
 	if len(history) != 1 {
@@ -509,7 +510,7 @@ func TestExecutor_NilRecordFuncSkipsRecording(t *testing.T) {
 	})
 
 	mockLLM := &mockLLMForHookTest{
-		responses: []llm.Response{
+		responses: []testmodel.Fixture{
 			{
 				ToolCalls: []llm.ToolCall{
 					{ID: "call_1", Name: "test_tool", Arguments: map[string]any{}},
@@ -519,12 +520,11 @@ func TestExecutor_NilRecordFuncSkipsRecording(t *testing.T) {
 	}
 
 	// nil recordFunc
-	executor := NewLLMExecutor(mockLLM, tools, nil, nil, nil, "")
+	executor := newTestLLMExecutor(t, mockLLM, tools, nil, nil, nil, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
-	task := &model.Task{ID: "task-001", Description: "test"}
+	task := &model.Task{ID: "task-001", Description: "test"} // 不应该 panic
 
-	// 不应该 panic
-	result, err := executor(ctx, task, nil, nil)
+	result, err := executor(ctx, task, nil, nil, llm.DefaultOutputBudget())
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
@@ -550,7 +550,7 @@ func TestExecutor_MultipleToolCallsRecordAll(t *testing.T) {
 	}
 
 	mockLLM := &mockLLMForHookTest{
-		responses: []llm.Response{
+		responses: []testmodel.Fixture{
 			{
 				ToolCalls: []llm.ToolCall{
 					{ID: "call_1", Name: "tool_0", Arguments: map[string]any{}},
@@ -567,10 +567,10 @@ func TestExecutor_MultipleToolCallsRecordAll(t *testing.T) {
 		recStore.AppendToolCall(taskID, rec)
 	}
 
-	executor := NewLLMExecutor(mockLLM, tools, nil, nil, recordFunc, "")
+	executor := newTestLLMExecutor(t, mockLLM, tools, nil, nil, recordFunc, "")
 	ctx := WithAgentContext(context.Background(), "agent-1", "task-001", 0)
 
-	_, _ = executor(ctx, task, nil, nil)
+	_, _ = executor(ctx, task, nil, nil, llm.DefaultOutputBudget())
 
 	history := recStore.GetToolCallHistory("task-001")
 	if len(history) != 5 {
@@ -588,4 +588,16 @@ func TestExecutor_MultipleToolCallsRecordAll(t *testing.T) {
 			t.Errorf("Tool %s was not recorded", toolName)
 		}
 	}
+}
+
+func (m *mockLLMForHookTest) Invoke(ctx context.Context, request llm.Request, sink llm.EventSink) (llm.Result, error) {
+	if err := request.Validate(); err != nil {
+		return llm.Result{}, err
+	}
+	spec := request.Spec()
+	fixture, err := m.nextFixture(ctx, spec.Messages, spec.Tools)
+	if err != nil {
+		return llm.Result{}, err
+	}
+	return fixture.Seal(spec.Options.Protocol)
 }

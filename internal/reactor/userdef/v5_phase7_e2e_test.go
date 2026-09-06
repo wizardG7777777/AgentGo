@@ -9,6 +9,8 @@
 // 同时验证 spawn.Manager 作为 reactor 订阅 task 终态时不会与 user reactor 互相干扰。
 package userdef
 
+import "agentgo/internal/testmodel"
+
 import (
 	"sync/atomic"
 	"testing"
@@ -140,7 +142,7 @@ reactors:
 
 	// spawn.Manager 同时注册——它订阅 task 终态事件，但没有 active spawn 时不应触发
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Tools: []string{"read_file"}}}}
-	mgr := spawn.NewManager(cfg, runner.RunnerDeps{}, nil, taskStore)
+	mgr := spawn.NewManager(cfg, runner.RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, nil, taskStore)
 	if err := reg.Register(mgr); err != nil {
 		t.Fatalf("Register spawn.Manager: %v", err)
 	}

@@ -7,7 +7,7 @@ import (
 )
 
 // Protocol 冻结一次客户端使用的模型调用 wire 契约。Responses 是新主链；
-// Chat Completions 只作为显式兼容适配器保留，禁止在一次 Run 中静默切换。
+// Responses 与 Chat Completions 均为显式 SSE 协议，禁止自动切换。
 type Protocol string
 
 const (
@@ -50,8 +50,5 @@ type OutputItem struct {
 	Raw       json.RawMessage `json:"raw,omitempty"`
 }
 
-const responsesOutputItemsExtraField = "agentgo_responses_output_items"
-
-// ResponsesOutputItemsExtraField 返回 L2 provider replay 使用的保留字段名。
-// 调用方只应把它作为 opaque typed-item carrier，不把它发送成 assistant 扩展字段。
-func ResponsesOutputItemsExtraField() string { return responsesOutputItemsExtraField }
+// ReplayItemsBudgetKey 仅用于完整协议重放项的预算，不是模型消息字段。
+const ReplayItemsBudgetKey = "response_items"

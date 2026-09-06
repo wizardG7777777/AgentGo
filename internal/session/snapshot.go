@@ -23,19 +23,20 @@ import (
 // older versions and upgrades them in memory so existing sessions remain
 // resumable; pre-v4 mailbox messages are dropped because their read/unread
 // state cannot be distinguished safely.
-const currentSnapshotVersion = 5
+const currentSnapshotVersion = 6
 
-const oldestSupportedSnapshotVersion = 1
+const oldestSupportedSnapshotVersion = 6
 
 // Snapshot 是某一时刻的完整状态快照。
 type Snapshot struct {
-	Version          int                    `json:"version"`
-	SavedAt          string                 `json:"saved_at"`
-	Tasks            []TaskSnapshot         `json:"tasks"`
-	Roster           RosterSnapshot         `json:"roster"`
-	Mailboxes        []MailboxSnapshot      `json:"mailboxes"`
-	SchedulerHistory []SessionInputSnapshot `json:"scheduler_history,omitempty"`
-	Result           *ResultSnapshot        `json:"result,omitempty"`
+	ModelHistoryContract string                 `json:"model_history_contract"`
+	Version              int                    `json:"version"`
+	SavedAt              string                 `json:"saved_at"`
+	Tasks                []TaskSnapshot         `json:"tasks"`
+	Roster               RosterSnapshot         `json:"roster"`
+	Mailboxes            []MailboxSnapshot      `json:"mailboxes"`
+	SchedulerHistory     []SessionInputSnapshot `json:"scheduler_history,omitempty"`
+	Result               *ResultSnapshot        `json:"result,omitempty"`
 }
 
 // TaskSnapshot 是单个 Task 的可序列化表示。
@@ -288,21 +289,8 @@ func LoadSnapshot(path string) (*Snapshot, error) {
 			snap.Version, oldestSupportedSnapshotVersion, currentSnapshotVersion,
 		)
 	}
-	loadedVersion := snap.Version
-	// Older versions did not contain all current TaskSnapshot fields. Their Go
-	// zero values are the correct schema defaults; execution-aware migration
-	// (including establishing a fresh pending lease) happens in TaskStore import.
-	//
-	// Before v4 MailboxSnapshot.Messages came from the non-consuming recent
-	// observation ring, so it included mail that agents had already drained.
-	// Replaying it would manufacture unread mail and can trigger duplicate wake
-	// tasks. Preserve mailbox identity metadata, but fail closed by discarding
-	// those ambiguous historical messages during migration.
-	if loadedVersion < 4 {
-		for i := range snap.Mailboxes {
-			snap.Mailboxes[i].Messages = nil
-		}
+	if snap.ModelHistoryContract != "agentgo.model-history/v1" {
+		return nil, fmt.Errorf("拒绝旧 Session 模型历史契约；请新建会话")
 	}
-	snap.Version = currentSnapshotVersion
 	return &snap, nil
 }

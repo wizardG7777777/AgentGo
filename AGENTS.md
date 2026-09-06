@@ -10,13 +10,31 @@ AgentGo 是一个 Go 多智能体任务编排系统：Scheduler（LLM 驱动的 
 
 ## 五层工程架构
 
-1. Prompt Engineering：定义模型的角色、指令、规则与输出契约。
-2. Context Engineering：编译本次模型调用应看到的任务、记忆、历史、工具与上游信息。
+1. **Model Invocation Engineering**：接收 L2 封存的完整请求，执行协议编码、HTTP/SSE、响应归一化与调用失败分类；不补提示词或上下文。
+2. **Context Engineering**：装配角色指令、任务目标、记忆、历史、工具、上游与非文本输入，封存请求，检查响应重放并提供统一输出订阅。
 3. Harness Engineering：通过 Tool、Execution Lease、Store、Effect 与执行环境向模型提供受控行动能力。
 4. Loop Engineering：管理单个 Agent Activation 的 Turn、Attempt、进展、重试、收敛与停止。
 5. **Graph Engineering**：编排多个 Agent、Loop 与节点的职责、Activation、Result/Evidence 及数据流。
 
 五层是工程责任域，不要与 Go 包一一对应；完整边界见 [`docs/design/five-layer-engineering-architecture.md`](docs/design/five-layer-engineering-architecture.md)。
+
+## L1/L2 重建与实现索引
+
+核心重建已实施；平台与媒体验证缺口以 `docs/design/l1-l2-rebuild.md` 的验证证据为准。
+
+| 层级 | 核心程序文件 | 跨层接缝 |
+|---|---|---|
+| L1 | `internal/llm` 的请求、协议、SSE、错误、预算与 timing 实现 | 只消费完整 Request；不 import Agent/Graph/Memory/UI |
+| L2 | `internal/contextruntime`、`internal/contextcompiler`、`internal/contextcontract` | 记忆召回与历史投影；存储由 L3 注入；UI 订阅 L2 |
+| L3 | `internal/agent/execution_lease.go`、`tool_registry.go`、`tool_router_snapshot.go`、工具 dispatch；`internal/tools`、`store`、`effect`、`workspace`、`shell`、`gate` | 授权与执行规格交 L2，完整工具调用经 gate 执行 |
+| L4 | `internal/agent/agent.go::processTask`、`state.go`、`loop_progress.go`、`finalization.go`；`internal/runner` 运行外壳 | 决定调用时机与阶段，不组装 Prompt/Memory |
+| L5 | `internal/graph`、`internal/delivery`、`internal/bootstrap/graph_*.go`、`internal/scheduler` 图编排 | 结构化目标、输入、输出要求交给下层 |
+
+- 本次明确不保留 L1/L2 向后兼容：旧入口、builder、Prompt Build、context override、非流式 API 必须删除，不允许 wrapper/alias 或测试专用旁路。
+- `internal/invocation` 不再是独立责任域；有效契约归 L1。角色、规则、目标与输出指令装配归 L2。
+- L1/L2 新数据版本及明确拒绝旧数据优先于旧冻结条目的恢复要求；L3–L5 历史业务契约不受此例外影响。不得删除磁盘历史或静默转换旧历史。
+- SSE 输出游标代码名称固定 `eventCursor`，中文“流式事件游标”，英文“SSE events cursor”；由 L2 管理，UI 不自行生成。
+- 文件配置必须显式声明 `llm.request_contract: agentgo.model-request/v1`；`llm.stream` 退役。所有协议 SSE-only，不自动回退。
 
 ## 构建、测试与调试命令
 
@@ -52,13 +70,13 @@ SWE Test Runner 的 `probe` / `task` / `batch` / `verify-candidates` 启动前�
 - `submit_task_result` 提交即 finalizing（后续工具调用被 fence），同一任务唯一终态提交者；`status=blocked` 需同填 `blocked_reason`。自定义 Graph path 路由字段必须放在 `result` object（如 `result={"coverage":"gap"}`），不能只写 summary/event；结构化终态字段原子落盘失败时任务 fail-closed。新 mutating simple Graph 的 code-change Recovery 固定为 `agentgo.recovery-delta/v5`：Runtime 绑定同一 Delivery 的 `candidate_state`；L3 先展示一个 bounded focus page，再只开放 `submit_change_decision`。Worker 可 typed 选择 `edit` / `resume_candidate` / `need_context` / `hypothesis_rejected` / `blocked`；同文件补页使用 path/offset/limit，禁止为完整覆盖顺序翻遍文件。每个 `edit_file` 目标必须先进入 focus context，只有 edit/resume 才进入 mutation 与冻结 CheckContract。v4 全文件 EvidenceContract、acceptance/v2 与 v1-v3 历史保持原语义，不静默迁移。`recovery_directive` 是单值端口，retry 回放替换旧代。
 - Scheduler create/configure/validate/commit/start 与 Proposal Acceptance 的机械调用使用 **`tool_choice=auto` + 唯一 ToolRouter + L3 required-action gate**，因 DeepSeek thinking 会拒绝 exact/required choice。L3 冻结时必须校验 phase→tool 精确映射；零 tool call 不得自然退出；provider 忽略 `parallel_tool_calls=false` 返回 fan-out 时只 dispatch 首个，其余 call_id 写 skipped result 以保持 Responses 重放完整。Graph 最终交付是经 live matrix 验证的狭义例外：L3 投影掉旧工具历史并注入 phase contract，Model Invocation 仅对该次调用覆盖为 `reasoning_effort=none` + exact `submit_task_result`。两条路径都不得恢复为按 provider/model 名称特判。
 - Graph-change coordination 必须结构化收口：先成功 `read_graph`；需要修改走 propose→validate→commit，成功 commit 结束非图 coordination；无需修改调用 `submit_graph_change_decision(decision=no_change)`，不得用自然文本退出。Acceptance 在节点/出路结算后才请求 change，Graph 已终态时只留审计，不发布无未来 Activation 可修改的 Scheduler task。
-- 新 Run 默认使用 `context:default/v10` + `provider-replay:openai-compatible/v4`：ModelCapability 只调整 snapshot 总预算、completion reserve 与 RequiredExact replay，不得把普通 Fragment cap 放大到完整模型窗口。最新 Observation 覆盖的探索 history 转为稳定 ContentRef；同 task/attempt/path/content digest 的重复 read/grep/list 只保留最新 bounded preview，Raw History 与 Responses 原子组不得删除。
+- 新 Run 默认使用 `context:default/v11` + `provider-replay:openai-compatible/v5`：ModelCapability 只调整 snapshot 总预算、completion reserve 与 RequiredExact replay，不得把普通 Fragment cap 放大到完整模型窗口。最新 Observation 覆盖的探索 history 转为稳定 ContentRef；同 task/attempt/path/content digest 的重复 read/grep/list 只保留最新 bounded preview，Raw History 与 Responses 原子组不得删除。
 - 新建 code-change Task/Graph 的首次 Worker 使用 `progress:code-change/v12`（`ProgressCodeChangeCurrent`）：继承 v11/v10 Observation wire，以1-turn `decision_periodic` checkpoint提前交 v5 repair；首次无效直接 typed stalled。已有真实 workspace mutation但尚无verification pass时，冻结 policy 在 execution deadline 前预留3分钟并以 `candidate_completion_handoff` 交 L5；最终 candidate-repair 固定使用 v10，避免在没有下一条 recovery 边时产生二次交接。新增版本必须同步 Graph fulfillment 正向闭集，否则 DeliveryID 不成立。v7-v11按冻结版本恢复。新 `simple-task/v4` Explorer 使用 investigation/v6 六轮有界交付，并从原 execution window 为下游 Worker/Repair 预留8分钟；单一8KiB notice 优先 read/read_content_ref，再收 grep/list/glob，同类内 newest-first。历史 v3-v5 保留各自冻结语义。`agentgo.investigation-boundary/v2` 在 v1 三段范围与 rejected_alternative 上新增 first concrete failure_observation；L3 既逐字对账 evidence_ranges，也从 ProjectRoot 重读声明行段，symbol 不真实存在、路径越界/敏感或 range 越界均 fail-closed。相同校验在 `submit_task_result` finalizing 前先执行，错误可在 exact submit 轮修正重交；TaskOutcome durable commit 再次校验防绕过。历史 simple-task/v2/v3 + investigation-boundary/v1 不迁移。SWE 配置中 Explorer 业务推理使用旗舰档、Observation 明确使用已探测的快速档。
 - 新 Run 默认使用 `agentgo.run-contract/v2` 与 `interactive/v3`（SWE 为 `swe/v3`）：阶段严格为 execution → verification → recovery → finalization；SWE reserve 为 180/120/90 秒。v1 快照按旧语义恢复。默认 model/tool/token/cost 只记账；显式 `RunContract.Budget` 由 `.agentgo/state/run-budgets` 按 RunID 执法。pre-dispatch cancel、已 dispatch 明确失败 settle、取消/deadline 不确定 settle unknown；Store `Close` 不伪造结算。Recovery retry 仍须 `RecoveryStartPermit`；permit claim 按目标 Task durable，同一 Activation 的新 Attempt 不重复认领，bind/terminal 未放行 retry 时必须立即取消。
 - RunContract v2 可冻结 `check_contracts`（check_id/kind/可选 exact_command）。`run_check` 的可见 ID 是 Graph required checks 与 Run check contracts 的并集；kind 或 exact command 不符必须在 Shell 前拒绝。SWE Test Runner 必须从当前 manifest 的 `test_files` 生成跨 shell exact `targeted` 命令，`verification` 固定为 exact `uv run --no-sync python -m pytest -q`；Recovery check gate 同时 const 冻结 check_id/kind/exact_command。只有 Graph required 的 verification 进入 fulfillment，禁止用定向 pass 冒充全量验收。
 - SWE Test Runner 在 Agent 启动前把 `targeted-baseline.pytest.log` 归一、去 ANSI 并截为最多6000字符的 `<swe-baseline-failure authority="swe-test-runner">` 输入块；它只进入本次 `/api/input`，不修改版本控制 prompt。Explorer 的 failure_observation 必须先解释该权威块中的第一条具体失败；不得把红态块当成修改 tests/ 的授权。
 - Observation checkpoint 是独立 L3 Control Invocation：投影业务历史，只保留 TaskMemory 与当前 Task/Attempt settled evidence authority，前一 Attempt、累计 artifact、DependencyResult/Graph 上游 `ev:*` 不进入 control catalog。v8 wire 使用 `reasoning=low` + `tool_choice=auto` + singleton ToolRouter，L3 required-action gate 强制调用；v7 历史仍按 `none+exact` 恢复。工具注册、动态 authority 与 `agentgo probe observation` 共用单一 schema builder；空 authority 用数组 `maxItems=0`，禁止 `enum: []`。首次 malformed/invalid 用全新投影重试一次；确定性 provider invalid/protocol failure 写入 Run-scoped `agentgo.control-capability/v1`，相同 model/profile/schema 的后续 periodic checkpoint 保留 Raw History 并跳过调用，必须持久化边界 typed blocked；timeout/429/5xx 不得熔断。普通业务轮不得看到 control 工具，control ToolCall 不进入业务 Responses replay。不得按 provider/model 名称特判。
-- 新冻结租约使用 `agentgo.execution-lease/v2`，同时保存业务与 Observation 模型及各自 ModelCapability；旧无 schema/v1 租约按原 digest 恢复。新 Model Invocation binding 使用 `agentgo.invocation-context-binding/v2`，effective model、capability digest 与 invocation profile 进入 encoded request digest 和 `llm_call_start/end` trace；v1 历史 binding 不静默补字段。
+- 新冻结租约使用 `agentgo.execution-lease/v2`，同时保存业务与 Observation 模型及各自 ModelCapability；旧无 schema/v1 租约按原 digest 恢复。新 L1 请求使用 `agentgo.model-request/v1`；effective model、能力、profile、工具 schema 与完整选项由 L2 封存进请求与 Snapshot 摘要。旧 InvocationBinding 整体拒绝，不补字段或转换。
 - 发布新 code-change Progress 版本时必须同步 Graph `requiresCodeChangeFulfillment` 正向闭集与回归；否则新版本 work 会失去 FulfillmentContract，completed 结果无法携带 typed Check Evidence。auto-singleton Observation 的 OutputBudget 必须允许有界 provider fan-out，再由 L3 只 dispatch 首个并为尾部写 skipped receipt；不得在 stream 累积层把第二个调用误报为 output limit。
 - Provider HTTP 402/结构化 billing code 使用 `provider_quota_exhausted`，与可重试的 429 `rate_limited` 分开；quota 属于 Run 外部资源，当前 Activation blocked 等待新 Run，不得靠 retry、Context 重建或 Graph recovery 消耗更多调用。`RecoveryRequestIntervene` 必须形成 durable `LoopInterventionRequested`，不得落入 `non_recoverable_error`。
 - `submit_task_result` / `submit_recovery_decision` 一旦成功进入 finalizing，L4 只允许结算当轮账本并完成唯一终态事务；finalizing 必须优先于 Attempt deadline、runtime fuse、rollover 与 intervention，禁止先 `task_finalizing` 后 `task_retry`。
@@ -102,7 +120,7 @@ SWE Test Runner 的 `probe` / `task` / `batch` / `verify-candidates` 启动前�
 - agent 与 store 测试使用 property-based 测试（`testing/quick`）。
 - LLM 毫秒级客户端时序使用 `agentgo.llm-invocation-timing/v1`，只在
   `internal/llm` 事实点采集并由 `internal/trace` 持久化/展示；它是跨层观测面，
-  不得注入 L1 Prompt、Context digest 或控制流。不可用字段保持缺席，禁止补零；
+  不得注入 L2 指令、Context digest 或控制流。不可用字段保持缺席，禁止补零；
   不记录 endpoint、IP、凭据、Prompt、reasoning/response 正文，也不得按
   provider/model 名称分支。
 - 修改了本文件提及的结构、约定或工作流时，同步更新本文件。

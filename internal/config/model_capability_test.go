@@ -5,7 +5,7 @@ import "testing"
 func TestResolveModelCapabilityUsesLargeDefaultAndExactOverride(t *testing.T) {
 	cfg := LLMConfig{DefaultModel: "large", ModelCapabilities: map[string]ModelCapabilityConfig{
 		"small": {ContextWindowTokens: 131_072, MaxCompletionTokens: 16_384},
-	}}
+	}, RequestContract: "agentgo.model-request/v1"}
 	large, err := cfg.ResolveModelCapability("large")
 	if err != nil || large.ContextWindowTokens != 1_048_576 || large.MaxCompletionTokens != 65_536 || large.Digest == "" {
 		t.Fatalf("默认能力档案错误: %+v err=%v", large, err)
@@ -17,7 +17,7 @@ func TestResolveModelCapabilityUsesLargeDefaultAndExactOverride(t *testing.T) {
 }
 
 func TestResolveModelCapabilityRejectsImpossibleReserve(t *testing.T) {
-	cfg := LLMConfig{DefaultContextWindowTokens: 65_536, DefaultMaxCompletionTokens: 60_000}
+	cfg := LLMConfig{DefaultContextWindowTokens: 65_536, DefaultMaxCompletionTokens: 60_000, RequestContract: "agentgo.model-request/v1"}
 	if _, err := cfg.ResolveModelCapability("bad"); err == nil {
 		t.Fatal("completion+protocol reserve 超过窗口必须拒绝")
 	}

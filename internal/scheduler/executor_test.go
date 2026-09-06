@@ -1,6 +1,9 @@
 package scheduler
 
 import (
+	"agentgo/internal/contextruntime"
+	"agentgo/internal/testagent"
+	"agentgo/internal/testmodel"
 	"context"
 	"strings"
 	"sync/atomic"
@@ -19,11 +22,11 @@ import (
 
 // makeInnerExecutor 返回一个 mock TaskExecutor，记录每次调用的 history 长度
 // 并返回固定结果。
-func makeInnerExecutor(callCount *int32, capturedHistory *[]agent.HistoryEntry) agent.TaskExecutor {
-	return func(ctx context.Context, task *model.Task, deps map[string]string, history []agent.HistoryEntry) (agent.ExecuteResult, error) {
+func makeInnerExecutor(callCount *int32, capturedHistory *[]contextcontract.HistoryEntry) agent.TaskExecutor {
+	return func(ctx context.Context, task *model.Task, deps map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (agent.ExecuteResult, error) {
 		atomic.AddInt32(callCount, 1)
 		// 拷贝防止 caller 修改
-		hCopy := make([]agent.HistoryEntry, len(history))
+		hCopy := make([]contextcontract.HistoryEntry, len(history))
 		copy(hCopy, history)
 		*capturedHistory = hCopy
 		return agent.ExecuteResult{
@@ -58,7 +61,7 @@ func TestSchedulerExecutorBlocksLaterToolWhenControllerCancelledInSameResponse(t
 		atomic.AddInt32(&secondSideEffect, 1)
 		return "ran", nil
 	})
-	client := &scriptedLLM{responses: []llm.Response{{
+	client := &scriptedLLM{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{
 			{ID: "cancel-first", Name: "cancel_controller", Arguments: map[string]any{}},
 			{ID: "side-effect-second", Name: "second_side_effect", Arguments: map[string]any{}},
@@ -66,7 +69,7 @@ func TestSchedulerExecutorBlocksLaterToolWhenControllerCancelledInSameResponse(t
 		FinishReason: llm.FinishReasonToolCalls,
 	}}}
 	exec := &SchedulerExecutor{
-		Inner: agent.NewLLMExecutor(client, toolReg, nil, taskStore, nil, ""),
+		Inner: testagent.Wrap(agent.NewTurnExecutor(client, toolReg, nil, nil, testmodel.Runtime(t), contextruntime.Instructions{ProfileID: "test"}).Execute),
 		Store: taskStore, Cfg: config.DefaultConfig(),
 	}
 
@@ -77,7 +80,7 @@ func TestSchedulerExecutorBlocksLaterToolWhenControllerCancelledInSameResponse(t
 		t.Fatalf("cancelled dispatch context err=%v, want liveness rejection", err)
 	}
 
-	result, err := exec.Execute(context.Background(), root, nil, nil)
+	result, err := exec.Execute(context.Background(), root, nil, nil, llm.DefaultOutputBudget())
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -131,7 +134,7 @@ func TestSchedulerExecutor_LegacyDownstreamWaitUnblocksOnTerminal(t *testing.T) 
 		BatchUpdateCh:         batchCh,
 		WaitTimeout:           50 * time.Millisecond,
 		DownstreamWaitTimeout: 2 * time.Second,
-		Inner: func(context.Context, *model.Task, map[string]string, []agent.HistoryEntry) (agent.ExecuteResult, error) {
+		Inner: func(context.Context, *model.Task, map[string]string, []contextcontract.HistoryEntry, llm.OutputBudget) (agent.ExecuteResult, error) {
 			atomic.AddInt32(&innerCalls, 1)
 			return agent.ExecuteResult{Output: "downstream done", ToolCalled: true}, nil
 		},
@@ -141,11 +144,13 @@ func TestSchedulerExecutor_LegacyDownstreamWaitUnblocksOnTerminal(t *testing.T) 
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := exec.Execute(context.Background(), schedTask, nil, nil)
+		_, err := exec.Execute(context.Background(), schedTask, nil, nil, llm.DefaultOutputBudget(
+
+		// 下游任务未终态时 Execute 应阻塞在下游等待，Inner 不被调用
+		))
 		done <- err
 	}()
 
-	// 下游任务未终态时 Execute 应阻塞在下游等待，Inner 不被调用
 	time.Sleep(100 * time.Millisecond)
 	if got := atomic.LoadInt32(&innerCalls); got != 0 {
 		t.Fatalf("downstream pending 时 Inner 被调用 %d 次，want 0", got)
@@ -180,7 +185,7 @@ func TestSchedulerExecutor_NoBatch_DirectExecute(t *testing.T) {
 	s.ClaimTask("scheduler-1", schedTask.ID)
 
 	var calls int32
-	var capturedHistory []agent.HistoryEntry
+	var capturedHistory []contextcontract.HistoryEntry
 	exec := &SchedulerExecutor{
 		Inner:         makeInnerExecutor(&calls, &capturedHistory),
 		Store:         s,
@@ -189,7 +194,7 @@ func TestSchedulerExecutor_NoBatch_DirectExecute(t *testing.T) {
 		WaitTimeout:   100 * time.Millisecond,
 	}
 
-	result, err := exec.Execute(context.Background(), schedTask, nil, nil)
+	result, err := exec.Execute(context.Background(), schedTask, nil, nil, llm.DefaultOutputBudget())
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -211,7 +216,7 @@ func TestSchedulerExecutor_InjectsBoardSnapshotIntoHistory(t *testing.T) {
 	s.ClaimTask("scheduler-1", schedTask.ID)
 
 	var calls int32
-	var capturedHistory []agent.HistoryEntry
+	var capturedHistory []contextcontract.HistoryEntry
 	exec := &SchedulerExecutor{
 		Inner:         makeInnerExecutor(&calls, &capturedHistory),
 		Store:         s,
@@ -220,7 +225,7 @@ func TestSchedulerExecutor_InjectsBoardSnapshotIntoHistory(t *testing.T) {
 		WaitTimeout:   100 * time.Millisecond,
 	}
 
-	_, err := exec.Execute(context.Background(), schedTask, nil, nil)
+	_, err := exec.Execute(context.Background(), schedTask, nil, nil, llm.DefaultOutputBudget())
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -282,14 +287,14 @@ func TestSchedulerExecutor_GraphScopeDrivesSnapshotAndDynamicRoutes(t *testing.T
 	}
 
 	var calls int32
-	var capturedHistory []agent.HistoryEntry
+	var capturedHistory []contextcontract.HistoryEntry
 	exec := &SchedulerExecutor{
 		Inner:         makeInnerExecutor(&calls, &capturedHistory),
 		Store:         s,
 		Cfg:           &config.Config{},
 		AgentRegistry: registry,
 	}
-	if _, err := exec.Execute(context.Background(), controller, nil, nil); err != nil {
+	if _, err := exec.Execute(context.Background(), controller, nil, nil, llm.DefaultOutputBudget()); err != nil {
 		t.Fatal(err)
 	}
 	if len(capturedHistory) != 1 {
@@ -321,7 +326,7 @@ func TestSchedulerExecutor_ModesStoreLiveSwitch(t *testing.T) {
 
 	modeStore := modes.DefaultStore()
 	var calls int32
-	var capturedHistory []agent.HistoryEntry
+	var capturedHistory []contextcontract.HistoryEntry
 	exec := &SchedulerExecutor{
 		Inner:         makeInnerExecutor(&calls, &capturedHistory),
 		Store:         s,
@@ -335,7 +340,7 @@ func TestSchedulerExecutor_ModesStoreLiveSwitch(t *testing.T) {
 	modeStore.SetExec(modes.ExecStrict)
 	modeStore.SetTopo(modes.TopoSolo)
 
-	if _, err := exec.Execute(context.Background(), schedTask, nil, nil); err != nil {
+	if _, err := exec.Execute(context.Background(), schedTask, nil, nil, llm.DefaultOutputBudget()); err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
 	if len(capturedHistory) != 1 {
@@ -370,7 +375,7 @@ func TestSchedulerExecutor_BatchPending_WaitsUntilComplete(t *testing.T) {
 
 	batchCh := make(chan struct{}, 1)
 	var calls int32
-	var capturedHistory []agent.HistoryEntry
+	var capturedHistory []contextcontract.HistoryEntry
 	exec := &SchedulerExecutor{
 		Inner:         makeInnerExecutor(&calls, &capturedHistory),
 		Store:         s,
@@ -382,11 +387,13 @@ func TestSchedulerExecutor_BatchPending_WaitsUntilComplete(t *testing.T) {
 	// 开一个 goroutine 调 Execute；它应当阻塞在等待 batch
 	done := make(chan error, 1)
 	go func() {
-		_, err := exec.Execute(context.Background(), schedTask, nil, nil)
+		_, err := exec.Execute(context.Background(), schedTask, nil, nil, llm.DefaultOutputBudget(
+
+		// 50ms 后 Inner 不应被调用（仍在等）
+		))
 		done <- err
 	}()
 
-	// 50ms 后 Inner 不应被调用（仍在等）
 	time.Sleep(50 * time.Millisecond)
 	if atomic.LoadInt32(&calls) != 0 {
 		t.Errorf("Inner should not be called while batch pending, got %d calls", calls)
@@ -427,7 +434,7 @@ func TestSchedulerExecutor_BatchUpdateChannelWakesWait(t *testing.T) {
 
 	batchCh := make(chan struct{}, 1)
 	var calls int32
-	var capturedHistory []agent.HistoryEntry
+	var capturedHistory []contextcontract.HistoryEntry
 	exec := &SchedulerExecutor{
 		Inner:         makeInnerExecutor(&calls, &capturedHistory),
 		Store:         s,
@@ -438,11 +445,13 @@ func TestSchedulerExecutor_BatchUpdateChannelWakesWait(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := exec.Execute(context.Background(), schedTask, nil, nil)
+		_, err := exec.Execute(context.Background(), schedTask, nil, nil, llm.DefaultOutputBudget(
+
+		// 等一下让 goroutine 进入 wait
+		))
 		done <- err
 	}()
 
-	// 等一下让 goroutine 进入 wait
 	time.Sleep(50 * time.Millisecond)
 
 	// 完成 child 并通过 channel 唤醒
@@ -474,7 +483,7 @@ func TestSchedulerExecutor_TimeoutFallback(t *testing.T) {
 	// 不发 batchCh 信号，依靠 timeout 兜底
 	batchCh := make(chan struct{})
 	var calls int32
-	var capturedHistory []agent.HistoryEntry
+	var capturedHistory []contextcontract.HistoryEntry
 	exec := &SchedulerExecutor{
 		Inner:         makeInnerExecutor(&calls, &capturedHistory),
 		Store:         s,
@@ -485,11 +494,13 @@ func TestSchedulerExecutor_TimeoutFallback(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := exec.Execute(context.Background(), schedTask, nil, nil)
+		_, err := exec.Execute(context.Background(), schedTask, nil, nil, llm.DefaultOutputBudget(
+
+		// 200ms 时让 child 完成（依靠 timeout 触发的下一次 check 应当看到）
+		))
 		done <- err
 	}()
 
-	// 200ms 时让 child 完成（依靠 timeout 触发的下一次 check 应当看到）
 	time.Sleep(150 * time.Millisecond)
 	s.SubmitResult("worker-1", child.ID, "done")
 
@@ -519,7 +530,7 @@ func TestSchedulerExecutor_ContextCancellation(t *testing.T) {
 
 	batchCh := make(chan struct{})
 	var calls int32
-	var capturedHistory []agent.HistoryEntry
+	var capturedHistory []contextcontract.HistoryEntry
 	exec := &SchedulerExecutor{
 		Inner:         makeInnerExecutor(&calls, &capturedHistory),
 		Store:         s,
@@ -531,7 +542,7 @@ func TestSchedulerExecutor_ContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := exec.Execute(ctx, schedTask, nil, nil)
+		_, err := exec.Execute(ctx, schedTask, nil, nil, llm.DefaultOutputBudget())
 		done <- err
 	}()
 
@@ -565,7 +576,7 @@ func TestSchedulerExecutor_BatchAllTerminalSkipsWait(t *testing.T) {
 	s.AppendSchedulerBatch(schedTask.ID, c1.ID)
 
 	var calls int32
-	var capturedHistory []agent.HistoryEntry
+	var capturedHistory []contextcontract.HistoryEntry
 	exec := &SchedulerExecutor{
 		Inner:         makeInnerExecutor(&calls, &capturedHistory),
 		Store:         s,
@@ -575,7 +586,7 @@ func TestSchedulerExecutor_BatchAllTerminalSkipsWait(t *testing.T) {
 	}
 
 	start := time.Now()
-	_, err := exec.Execute(context.Background(), schedTask, nil, nil)
+	_, err := exec.Execute(context.Background(), schedTask, nil, nil, llm.DefaultOutputBudget())
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -644,7 +655,7 @@ func TestSchedulerExecutor_ToolHealth_PassedToSnapshot(t *testing.T) {
 	})
 
 	var calls int32
-	var capturedHistory []agent.HistoryEntry
+	var capturedHistory []contextcontract.HistoryEntry
 	exec := &SchedulerExecutor{
 		Inner:         makeInnerExecutor(&calls, &capturedHistory),
 		Store:         s,
@@ -654,7 +665,7 @@ func TestSchedulerExecutor_ToolHealth_PassedToSnapshot(t *testing.T) {
 		ToolHealth:    th,
 	}
 
-	_, err := exec.Execute(context.Background(), schedTask, nil, nil)
+	_, err := exec.Execute(context.Background(), schedTask, nil, nil, llm.DefaultOutputBudget())
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -690,7 +701,7 @@ func TestSchedulerExecutor_ToolHealth_Nil_NoUnavailableTools(t *testing.T) {
 	s.ClaimTask("scheduler-1", schedTask.ID)
 
 	var calls int32
-	var capturedHistory []agent.HistoryEntry
+	var capturedHistory []contextcontract.HistoryEntry
 	exec := &SchedulerExecutor{
 		Inner:         makeInnerExecutor(&calls, &capturedHistory),
 		Store:         s,
@@ -700,7 +711,7 @@ func TestSchedulerExecutor_ToolHealth_Nil_NoUnavailableTools(t *testing.T) {
 		// ToolHealth: nil — backward compatible
 	}
 
-	_, err := exec.Execute(context.Background(), schedTask, nil, nil)
+	_, err := exec.Execute(context.Background(), schedTask, nil, nil, llm.DefaultOutputBudget())
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}

@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"context"
 	"slices"
 	"strings"
@@ -39,7 +41,7 @@ func newLeaseToolRegistry(names ...string) *ToolRegistry {
 // submit_task_result 在工具清单中时注册为「标记 finalizing」的执行体并装配
 // checker：2026-08-20 SWE-001 起图节点任务纯文本退出被拒，图任务测试经
 // mock.submitResultFirstCall=true 走结构化收口（真实装配的镜像）。
-func newLeaseAgent(agentID, eventType string, s store.TaskStore, toolNames ...string) (*Agent, *LLMExecutor, *capMockClient) {
+func newLeaseAgent(t *testing.T, agentID, eventType string, s store.TaskStore, toolNames ...string) (*Agent, *LLMExecutor, *capMockClient) {
 	mock := &capMockClient{}
 	holder := NewFinalizationHolder()
 	reg := NewToolRegistry()
@@ -53,9 +55,9 @@ func newLeaseAgent(agentID, eventType string, s store.TaskStore, toolNames ...st
 		}
 		reg.Register(name, name+" 工具", nil, leaseNoop)
 	}
-	exec := NewSwappableLLMExecutor(mock, reg, nil, nil, nil, "")
+	exec := newTestSwappableLLMExecutor(t, mock, reg, nil, nil, nil, "")
 	exec.SetFinalizationChecker(holder)
-	ag := NewAgent(agentID, eventType, s, nil, exec.Execute)
+	ag := NewAgent(agentID, eventType, s, nil, testExecutor(t, exec.Execute))
 	ag.ToolSwapper = exec
 	// 与 runner 生产装配镜像：executor fence 与 agent 循环顶部短路共用同一 holder。
 	ag.FinalizationChecker = holder
@@ -77,7 +79,7 @@ func leaseEventsFromDir(t *testing.T, dir string, kind trace.EventKind) []trace.
 
 func TestComputeExecutionLease_ExplicitIntersection(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, _ := newLeaseAgent("agent-lease", "code", s, "read_file", "submit_task_result", "write_file")
+	ag, _, _ := newLeaseAgent(t, "agent-lease", "code", s, "read_file", "submit_task_result", "write_file")
 	task := &model.Task{
 		ID: "t-explicit", EventType: "code",
 		Capability: &model.NodeCapability{Tools: []string{"read_file"}},
@@ -105,7 +107,7 @@ func TestComputeExecutionLease_ExplicitIntersection(t *testing.T) {
 
 func TestComputeExecutionLease_ExplicitOutOfCeilingRejected(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, _ := newLeaseAgent("agent-lease", "code", s, "read_file", "write_file")
+	ag, _, _ := newLeaseAgent(t, "agent-lease", "code", s, "read_file", "write_file")
 	task := &model.Task{
 		ID: "t-out", EventType: "code",
 		Capability: &model.NodeCapability{Tools: []string{"read_file", "web_fetch"}},
@@ -123,8 +125,9 @@ func TestComputeExecutionLease_ExplicitOutOfCeilingRejected(t *testing.T) {
 
 func TestComputeExecutionLease_SyntheticGrant(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, _ := newLeaseAgent("agent-lease", "code", s, "read_file", "write_file", "submit_task_result")
+	ag, _, _ := newLeaseAgent(t, "agent-lease", "code", s, "read_file", "write_file", "submit_task_result")
 	task := &model.Task{ID: "t-syn", EventType: "code"} // 无 Capability
+
 	lease, rejection := ag.computeExecutionLease(task)
 	if rejection != "" {
 		t.Fatalf("合成规则不应被拒绝: %s", rejection)
@@ -141,7 +144,7 @@ func TestComputeExecutionLease_SyntheticGrant(t *testing.T) {
 // Graph 节点未声明时同走合成规则。
 func TestComputeExecutionLease_GraphNodeSyntheticGrant(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, _ := newLeaseAgent("agent-lease", "code", s, "read_file", "write_file")
+	ag, _, _ := newLeaseAgent(t, "agent-lease", "code", s, "read_file", "write_file")
 	task := &model.Task{ID: "t-graph-syn", EventType: "code", GraphID: "g1", NodeID: "n1", ActivationID: "n1@1", GraphNodeKind: "agent"}
 	lease, rejection := ag.computeExecutionLease(task)
 	if rejection != "" || !lease.Synthetic {
@@ -156,7 +159,7 @@ func TestComputeExecutionLease_GraphNodeSyntheticGrant(t *testing.T) {
 
 func TestComputeExecutionLease_ReadonlyStripsWriteTools(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, _ := newLeaseAgent("agent-lease", "code", s, "read_file", "write_file", "edit_file", "run_shell", "submit_task_result")
+	ag, _, _ := newLeaseAgent(t, "agent-lease", "code", s, "read_file", "write_file", "edit_file", "run_shell", "submit_task_result")
 	ag.Modes = modes.NewStore(modes.ExecReadonly, modes.TopoTeam)
 	task := &model.Task{ID: "t-ro", EventType: "code"}
 	lease, rejection := ag.computeExecutionLease(task)
@@ -178,7 +181,7 @@ func TestComputeExecutionLease_ReadonlyStripsWriteTools(t *testing.T) {
 
 func TestComputeExecutionLease_StrictKeepsToolsWithApproval(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, _ := newLeaseAgent("agent-lease", "code", s, "read_file", "write_file", "submit_task_result")
+	ag, _, _ := newLeaseAgent(t, "agent-lease", "code", s, "read_file", "write_file", "submit_task_result")
 	ag.Modes = modes.NewStore(modes.ExecStrict, modes.TopoTeam)
 	task := &model.Task{ID: "t-strict", EventType: "code"}
 	lease, rejection := ag.computeExecutionLease(task)
@@ -197,7 +200,7 @@ func TestComputeExecutionLease_StrictKeepsToolsWithApproval(t *testing.T) {
 
 func TestComputeExecutionLease_ControlToolsByRole(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, _ := newLeaseAgent("agent-lease", "code", s, "read_file")
+	ag, _, _ := newLeaseAgent(t, "agent-lease", "code", s, "read_file")
 
 	graphTask := &model.Task{ID: "t-g", EventType: "code", GraphID: "g1", GraphNodeKind: "agent"}
 	lease, _ := ag.computeExecutionLease(graphTask)
@@ -244,7 +247,7 @@ func TestComputeExecutionLease_ControlToolsByRole(t *testing.T) {
 
 func TestComputeExecutionLease_CodeChangeObservationControlIsCanonical(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, _ := newLeaseAgent("worker", "code", s, "read_content_ref", "read_file")
+	ag, _, _ := newLeaseAgent(t, "worker", "code", s, "read_content_ref", "read_file")
 	catalog, err := policycatalog.NewDefault()
 	if err != nil {
 		t.Fatal(err)
@@ -271,7 +274,7 @@ func TestComputeExecutionLease_CodeChangeObservationControlIsCanonical(t *testin
 
 func TestComputeExecutionLease_AcceptanceRejectsBusinessToolOutsideClosedSet(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, _ := newLeaseAgent("verifier", "verify.custom", s,
+	ag, _, _ := newLeaseAgent(t, "verifier", "verify.custom", s,
 		"read_file", "run_shell", "submit_task_result")
 	lease, rejection := ag.computeExecutionLease(&model.Task{
 		ID: "t-unsafe-acceptance", EventType: "verify.custom", GraphID: "g1", GraphNodeKind: "acceptance",
@@ -284,7 +287,7 @@ func TestComputeExecutionLease_AcceptanceRejectsBusinessToolOutsideClosedSet(t *
 
 func TestComputeExecutionLease_SyntheticAcceptanceIntersectsRoleClosedSet(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, _ := newLeaseAgent("verifier", "acceptance.verify", s,
+	ag, _, _ := newLeaseAgent(t, "verifier", "acceptance.verify", s,
 		"read_file", "run_shell", "record_observation_delta", "submit_task_result")
 	lease, rejection := ag.computeExecutionLease(&model.Task{
 		ID: "t-synthetic-acceptance", EventType: "acceptance.verify", GraphID: "g1", GraphNodeKind: "acceptance",
@@ -304,7 +307,7 @@ func TestComputeExecutionLease_SyntheticAcceptanceIntersectsRoleClosedSet(t *tes
 
 func TestAcquireExecutionLease_RejectsLegacyGraphControlEscalation(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, _ := newLeaseAgent("verifier", "verify.custom", s,
+	ag, _, _ := newLeaseAgent(t, "verifier", "verify.custom", s,
 		"read_file", "request_replan", "submit_task_result")
 	for _, tc := range []struct {
 		name string
@@ -336,7 +339,7 @@ func TestAcquireExecutionLease_RejectsLegacyGraphControlEscalation(t *testing.T)
 
 func TestComputeExecutionLease_FreezesModelAndWorkspace(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, _ := newLeaseAgent("agent-lease", "code", s, "read_file")
+	ag, _, _ := newLeaseAgent(t, "agent-lease", "code", s, "read_file")
 	ag.Model = "m-kind"
 	override := &model.Task{
 		ID: "t-m", EventType: "code",
@@ -355,7 +358,7 @@ func TestComputeExecutionLease_FreezesModelAndWorkspace(t *testing.T) {
 
 func TestComputeExecutionLeaseV2FreezesObservationModelCapability(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, _ := newLeaseAgent("worker-v2", "code", s, "read_file")
+	ag, _, _ := newLeaseAgent(t, "worker-v2", "code", s, "read_file")
 	ag.Model, ag.ModelCapabilityDigest = "business", "business-cap"
 	ag.ModelContextWindowTokens, ag.ModelMaxCompletionTokens = 100000, 10000
 	ag.ObservationModel, ag.ObservationModelCapabilityDigest = "control", "control-cap"
@@ -382,7 +385,7 @@ func TestComputeExecutionLeaseV2FreezesObservationModelCapability(t *testing.T) 
 
 func TestExecutionLease_DigestStable(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, _ := newLeaseAgent("agent-lease", "code", s, "read_file", "write_file")
+	ag, _, _ := newLeaseAgent(t, "agent-lease", "code", s, "read_file", "write_file")
 	mk := func(id string) *model.ExecutionLease {
 		lease, rejection := ag.computeExecutionLease(&model.Task{ID: id, EventType: "code",
 			Capability: &model.NodeCapability{Tools: []string{"read_file"}}})
@@ -395,7 +398,7 @@ func TestExecutionLease_DigestStable(t *testing.T) {
 	if a.Digest != b.Digest {
 		t.Fatalf("Digest 只覆盖执行语义字段，TaskID 变化不应改变 digest: %s vs %s", a.Digest, b.Digest)
 	}
-	ag2, _, _ := newLeaseAgent("agent-lease", "code", s, "read_file", "write_file")
+	ag2, _, _ := newLeaseAgent(t, "agent-lease", "code", s, "read_file", "write_file")
 	other, _ := ag2.computeExecutionLease(&model.Task{ID: "t-3", EventType: "code",
 		Capability: &model.NodeCapability{Tools: []string{"write_file"}}})
 	if other.Digest == a.Digest {
@@ -407,7 +410,7 @@ func TestExecutionLease_DigestStable(t *testing.T) {
 
 func TestComputeExecutionLease_NoSwapperControlPlane(t *testing.T) {
 	s, _, _ := setup()
-	plain := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	plain := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "done"}, nil
 	}
 	ag := NewAgent("scheduler", "__scheduler__", s, nil, plain) // 无 ToolSwapper
@@ -433,7 +436,7 @@ func TestComputeExecutionLease_NoSwapperControlPlane(t *testing.T) {
 func TestProcessTask_LeaseFrozenThenRevokedAtTerminal(t *testing.T) {
 	dir := captureTraceToDir(t)
 	s, _, _ := setup()
-	ag, _, mock := newLeaseAgent("agent-lease", "code", s, "read_file", "write_file", "run_shell")
+	ag, _, mock := newLeaseAgent(t, "agent-lease", "code", s, "read_file", "write_file", "run_shell")
 
 	task := &model.Task{Description: "租约任务", EventType: "code"}
 	if err := s.PublishTask(task); err != nil {
@@ -500,7 +503,7 @@ func TestProcessTask_LeaseFrozenThenRevokedAtTerminal(t *testing.T) {
 func TestProcessTask_LeaseReusedAfterRetryRollback(t *testing.T) {
 	dir := captureTraceToDir(t)
 	s, _, _ := setup()
-	ag, _, _ := newLeaseAgent("agent-lease", "code", s, "read_file", "write_file")
+	ag, _, _ := newLeaseAgent(t, "agent-lease", "code", s, "read_file", "write_file")
 
 	task := &model.Task{Description: "重试租约任务", EventType: "code"}
 	if err := s.PublishTask(task); err != nil {
@@ -510,7 +513,7 @@ func TestProcessTask_LeaseReusedAfterRetryRollback(t *testing.T) {
 		t.Fatalf("ClaimTask: %v", err)
 	}
 	// 第一次 attempt：executor 返回可恢复错误 → RetryRollback。
-	failOnce := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	failOnce := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{}, &ErrRecoverable{Err: context.DeadlineExceeded}
 	}
 	ag.Execute = failOnce
@@ -536,7 +539,7 @@ func TestProcessTask_LeaseReusedAfterRetryRollback(t *testing.T) {
 	if err := s.ClaimTask(ag.ID, task.ID); err != nil {
 		t.Fatalf("重认领: %v", err)
 	}
-	okExec := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	okExec := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "done"}, nil
 	}
 	ag.Execute = okExec
@@ -573,7 +576,7 @@ func TestProcessTask_LeaseReusedAfterRetryRollback(t *testing.T) {
 func TestProcessTask_LeaseRejectedFailClosed(t *testing.T) {
 	dir := captureTraceToDir(t)
 	s, _, _ := setup()
-	ag, _, mock := newLeaseAgent("agent-lease", "code", s, "read_file", "write_file")
+	ag, _, mock := newLeaseAgent(t, "agent-lease", "code", s, "read_file", "write_file")
 
 	taskID := publishAndClaim(t, s, ag.ID, &model.NodeCapability{Tools: []string{"read_file", "web_fetch"}})
 	ag.processTask(context.Background(), taskID)
@@ -612,7 +615,7 @@ func TestProcessTask_LeaseViewIsBusinessUnionControl(t *testing.T) {
 	s, _, _ := setup()
 	// 注册全集含控制工具（profile 天花板内）：显式声明只带业务工具时，
 	// 控制通道经并集补回视图——节点仍能调用 submit_task_result 收尾。
-	ag, _, mock := newLeaseAgent("agent-lease", "code", s, "read_file", "submit_task_result", "write_file")
+	ag, _, mock := newLeaseAgent(t, "agent-lease", "code", s, "read_file", "submit_task_result", "write_file")
 
 	taskID := publishAndClaim(t, s, ag.ID, &model.NodeCapability{Tools: []string{"read_file"}})
 	ag.processTask(context.Background(), taskID)
@@ -641,7 +644,7 @@ func TestProcessTask_LeaseViewIsBusinessUnionControl(t *testing.T) {
 // 控制通道，scheduler 认领也不例外。
 func TestProcessTask_GraphControllerExplicitLeaseFiltersSchedulerTools(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, mock := newLeaseAgent("scheduler", "__scheduler__", s,
+	ag, _, mock := newLeaseAgent(t, "scheduler", "__scheduler__", s,
 		"read_file", "read_graph", "request_replan", "submit_task_result", "report_done", "submit_graph", "patch_graph")
 	task := &model.Task{
 		ID: "t-graph-controller", Description: "完成简单图节点", EventType: "__scheduler__",
@@ -729,7 +732,7 @@ func TestRecoveryV4WorkLeaseIncludesChangeDecisionControl(t *testing.T) {
 
 func TestProcessTask_CustomRouteAcceptanceRejectsPreloadedUnsafeLeaseBeforeLLM(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, mock := newLeaseAgent("verifier", "verify.custom", s,
+	ag, _, mock := newLeaseAgent(t, "verifier", "verify.custom", s,
 		"read_file", "run_shell", "submit_task_result")
 	old := &model.ExecutionLease{
 		TaskID: "t-old-acceptance", Attempt: 1,
@@ -763,7 +766,7 @@ func TestProcessTask_CustomRouteAcceptanceRejectsPreloadedUnsafeLeaseBeforeLLM(t
 
 func TestProcessTask_LegacyGraphNilBusinessLeaseStillFiltersToControlUnion(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, mock := newLeaseAgent("legacy-worker", "legacy.custom", s,
+	ag, _, mock := newLeaseAgent(t, "legacy-worker", "legacy.custom", s,
 		"read_file", "run_shell", "submit_task_result")
 	old := &model.ExecutionLease{
 		TaskID: "t-legacy-graph", Attempt: 1,
@@ -801,7 +804,7 @@ func TestProcessTask_LegacyGraphNilBusinessLeaseStillFiltersToControlUnion(t *te
 func TestRevokeLeaseOnFinalizing(t *testing.T) {
 	dir := captureTraceToDir(t)
 	s, _, _ := setup()
-	ag, _, _ := newLeaseAgent("agent-lease", "code", s, "read_file")
+	ag, _, _ := newLeaseAgent(t, "agent-lease", "code", s, "read_file")
 
 	task := &model.Task{Description: "finalizing 租约", EventType: "code"}
 	if err := s.PublishTask(task); err != nil {
@@ -838,7 +841,7 @@ func TestRevokeLeaseOnFinalizing(t *testing.T) {
 
 func TestProcessTask_SyntheticLeaseKeepsFullView(t *testing.T) {
 	s, _, _ := setup()
-	ag, _, mock := newLeaseAgent("agent-lease", "code", s, "read_file", "write_file")
+	ag, _, mock := newLeaseAgent(t, "agent-lease", "code", s, "read_file", "write_file")
 
 	taskID := publishAndClaim(t, s, ag.ID, nil)
 	ag.processTask(context.Background(), taskID)

@@ -14,13 +14,11 @@
 package agent
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
-	"sort"
 	"strings"
 
 	"agentgo/internal/graph"
@@ -34,33 +32,11 @@ import (
 // taskMemGoalMaxRunes 是 Goal 段的存储上限（任务描述的截断长度）。
 const taskMemGoalMaxRunes = 500
 
-// taskMemCarrier 经 ctx 把当前 Task Memory 的有界渲染单向传给 executor
-// （注入 messages）与 Context Manifest 构建器（登记 task_memory 段）。
-// 写方（processTask 主循环）与读方（executor）同在 ReAct 循环 goroutine
-// 内串行执行，无需加锁（与 manifestSideInfo 同款约定）。
-type taskMemCarrier struct {
-	text    string // 当前有界渲染（空=不注入）
-	version int64  // 渲染对应的 Task Memory 版本（观测用）
-	dropped string // 非空=降级原因，Manifest 记 dropped:<原因>，不注入正文
-}
-
-// withTaskMemCarrier 把 Task Memory 载体挂到 ctx（processTask 任务入口
-// 装配后调用一次，之后每轮 loop 派生的 execCtx 共享同一指针）。
-func withTaskMemCarrier(ctx context.Context, c *taskMemCarrier) context.Context {
-	return context.WithValue(ctx, ctxTaskMemCarrier, c)
-}
-
-func taskMemCarrierFromContext(ctx context.Context) *taskMemCarrier {
-	c, _ := ctx.Value(ctxTaskMemCarrier).(*taskMemCarrier)
-	return c
-}
-
 // taskMemRuntime 是 processTask 一个 attempt 的 Task Memory 运行态：
 // 内存对象 + 持久化句柄 + 注入载体 + 增量收集游标。
 type taskMemRuntime struct {
-	store   *taskmem.Store
-	mem     *taskmem.TaskMemory
-	carrier *taskMemCarrier
+	store *taskmem.Store
+	mem   *taskmem.TaskMemory
 
 	// toolRecordsSeen 是已消费 ToolCallRecord 身份的多重集。QueryToolCalls
 	// 会从按工具分组的 map 合并历史；相同 Timestamp 的记录顺序不稳定，不能
@@ -78,7 +54,6 @@ func (a *Agent) initTaskMemory(task *model.Task) *taskMemRuntime {
 	}
 	rt := &taskMemRuntime{
 		store:           a.TaskMemStore,
-		carrier:         &taskMemCarrier{},
 		toolRecordsSeen: make(map[string]int),
 		artifactsSeen:   make(map[string]struct{}, len(task.Artifacts)),
 	}
@@ -89,7 +64,6 @@ func (a *Agent) initTaskMemory(task *model.Task) *taskMemRuntime {
 	if err != nil {
 		// IO 降级：记日志后继续，Manifest 经 carrier.dropped 标注。
 		log.Printf("[agent %s] 任务 %s Task Memory 加载失败，降级为不启用: %v", a.ID, task.ID, err)
-		rt.carrier.dropped = "store_unavailable"
 		return rt
 	}
 	rt.mem = mem
@@ -99,7 +73,6 @@ func (a *Agent) initTaskMemory(task *model.Task) *taskMemRuntime {
 		if err := a.TaskMemStore.Save(mem); err != nil {
 			log.Printf("[agent %s] 任务 %s Task Memory 创建落盘失败，降级为不启用: %v", a.ID, task.ID, err)
 			rt.mem = nil
-			rt.carrier.dropped = "store_unavailable"
 			return rt
 		}
 		trace.Emit(trace.Event{
@@ -115,7 +88,6 @@ func (a *Agent) initTaskMemory(task *model.Task) *taskMemRuntime {
 	if recs, qerr := a.Store.QueryToolCalls(task.ID, ""); qerr == nil {
 		rt.toolRecordsSeen = taskMemToolRecordMultiset(recs)
 	}
-	rt.refreshCarrier()
 	return rt
 }
 
@@ -169,17 +141,6 @@ func (rt *taskMemRuntime) recordAttemptEnd(a *Agent, taskID, cause string) {
 	if err := rt.store.Save(rt.mem); err != nil {
 		log.Printf("[agent %s] 任务 %s attempt 终止原因写入 Task Memory 失败（继续内存态）: %v", a.ID, taskID, err)
 	}
-	rt.refreshCarrier()
-}
-
-// refreshCarrier 重新渲染注入文本并刷新 ctx 载体（幂等——内容不变时
-// digest 稳定，Manifest 观测不受重复刷新影响）。
-func (rt *taskMemRuntime) refreshCarrier() {
-	if rt == nil || rt.mem == nil || rt.carrier == nil {
-		return
-	}
-	rt.carrier.text = taskmem.Render(rt.mem, 0)
-	rt.carrier.version = rt.mem.Version
 }
 
 // applySettledTurn 是一个 settled Turn 的收口：收集本轮结构化事实 →
@@ -194,7 +155,6 @@ func (rt *taskMemRuntime) applySettledTurn(a *Agent, taskID string, result Execu
 	if executeResultCalledTool(result, "record_observation_delta") {
 		if fresh, err := rt.store.Load(taskID); err == nil && fresh != nil {
 			rt.mem = fresh
-			rt.refreshCarrier()
 		}
 	}
 	facts := rt.collectTurnFacts(a, taskID, result)
@@ -205,7 +165,6 @@ func (rt *taskMemRuntime) applySettledTurn(a *Agent, taskID string, result Execu
 		// 落盘失败：降级为进程内继续（内存仍是最新的），记日志不阻断。
 		log.Printf("[agent %s] 任务 %s Task Memory 落盘失败（继续内存态）: %v", a.ID, taskID, err)
 	}
-	rt.refreshCarrier()
 	trace.Emit(trace.Event{
 		Kind:        trace.KindTaskMemoryUpdated,
 		TaskID:      taskID,
@@ -245,7 +204,6 @@ func (rt *taskMemRuntime) checkpoint(a *Agent, taskID string, loop int, reason s
 		log.Printf("[agent %s] 任务 %s Task Memory checkpoint 落盘失败: %v", a.ID, taskID, err)
 		return
 	}
-	rt.refreshCarrier()
 	trace.Emit(trace.Event{
 		Kind:        trace.KindTaskMemoryCheckpointed,
 		TaskID:      taskID,
@@ -267,7 +225,6 @@ func (rt *taskMemRuntime) recordBlockedReason(a *Agent, taskID, reason string) {
 		log.Printf("[agent %s] 任务 %s blocked_reason 写入 Task Memory 失败: %v", a.ID, taskID, err)
 		return
 	}
-	rt.refreshCarrier()
 	trace.Emit(trace.Event{
 		Kind:        trace.KindTaskMemoryUpdated,
 		TaskID:      taskID,
@@ -513,94 +470,3 @@ func truncateTaskMemRunes(s string, max int) string {
 // insertTaskMemMessage 把 Task Memory 渲染插入 messages：紧随 user 首条
 // （任务描述）之后——Task Memory 是「当前工作状态」，装配优先级仅次于
 // 任务契约，高于历史流（V6 §3「优先注入完整但有界的当前 Task Memory」）。
-func insertTaskMemMessage(messages []llm.Message, rendered string) []llm.Message {
-	injection := llm.Message{Role: "user", Content: rendered}
-	for i, m := range messages {
-		if m.Role != "user" {
-			continue
-		}
-		out := make([]llm.Message, 0, len(messages)+1)
-		out = append(out, messages[:i+1]...)
-		out = append(out, injection)
-		out = append(out, messages[i+1:]...)
-		return out
-	}
-	return append(messages, injection)
-}
-
-// taskMemManifestDisposition 供 Manifest 登记：载体降级时返回
-// dropped:<原因>，正常时返回 included（无载体/无正文返回空串=不登记）。
-func taskMemManifestDisposition(c *taskMemCarrier) string {
-	if c == nil {
-		return ""
-	}
-	if c.dropped != "" {
-		return DispositionDroppedPrefix + c.dropped
-	}
-	if c.text == "" {
-		return ""
-	}
-	return DispositionIncluded
-}
-
-// dep Task Memory 交接注入（V6 CM4）的渲染预算：单个 dep ≤800 runes，
-// 总量 ≤2400 runes——让下游看到上游的工作状态而不只是结果文本，
-// 但不至于挤占下游自己的上下文预算。
-const (
-	depTaskMemoryPerDepBudget = 800
-	depTaskMemoryTotalBudget  = 2400
-)
-
-// buildDepTaskMemoryBlock 构建「依赖任务 Task Memory」交接注入块
-// （<dep-task-memory>，取代已删除的 <upstream-transfer-notes> TransferNote
-// 注入）。逐个只读加载依赖任务的 Task Memory 并各有界渲染，按 dep ID 排序
-// 装填，总预算耗尽即停止（跳过剩余 dep）。
-//
-// nil-safe 降级：TaskMemStore 未装配 / 加载失败 / 依赖任务无 Task Memory
-// 时跳过——返回空串不注入；有依赖但 store 不可用或加载失败时在 side 记
-// depTaskMemDropped（Manifest 登记 dep_task_memory dropped:<原因>）。
-func (a *Agent) buildDepTaskMemoryBlock(task *model.Task, side *manifestSideInfo) string {
-	if task == nil || len(task.Dependencies) == 0 {
-		return ""
-	}
-	if a.TaskMemStore == nil {
-		if side != nil {
-			side.depTaskMemDropped = "store_unavailable"
-		}
-		return ""
-	}
-	depIDs := append([]string(nil), task.Dependencies...)
-	sort.Strings(depIDs)
-
-	var sb strings.Builder
-	sb.WriteString("<dep-task-memory>\n")
-	sb.WriteString("以下是各前置任务终结时封存的工作状态（Task Memory），供你了解上游的执行过程与结论依据。\n")
-	total := 0
-	included := 0
-	for _, depID := range depIDs {
-		mem, err := a.TaskMemStore.Load(depID)
-		if err != nil {
-			log.Printf("[agent %s] 任务 %s 依赖 %s 的 Task Memory 加载失败，跳过: %v", a.ID, task.ID, depID, err)
-			if side != nil {
-				side.depTaskMemDropped = "store_unavailable"
-			}
-			continue
-		}
-		if mem == nil {
-			continue // 依赖任务没有 Task Memory（特性未启用或已清理），正常跳过
-		}
-		rendered := taskmem.Render(mem, depTaskMemoryPerDepBudget)
-		if included > 0 && total+runeLenOf(rendered) > depTaskMemoryTotalBudget {
-			log.Printf("[agent %s] 任务 %s dep Task Memory 总预算耗尽，跳过依赖 %s", a.ID, task.ID, depID)
-			continue
-		}
-		fmt.Fprintf(&sb, "[from %s]\n%s\n", depID, rendered)
-		total += runeLenOf(rendered)
-		included++
-	}
-	sb.WriteString("</dep-task-memory>")
-	if included == 0 {
-		return ""
-	}
-	return sb.String()
-}

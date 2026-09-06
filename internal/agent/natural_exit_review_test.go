@@ -5,6 +5,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"context"
 	"strings"
 	"testing"
@@ -29,9 +31,9 @@ func TestProcessTask_GraphNodeTextExitNudgesThenRecoverable(t *testing.T) {
 	if err := s.ClaimTask("agent-1", task.ID); err != nil {
 		t.Fatal(err)
 	}
-	var histories [][]HistoryEntry
-	executor := func(_ context.Context, _ *model.Task, _ map[string]string, history []HistoryEntry) (ExecuteResult, error) {
-		histories = append(histories, append([]HistoryEntry(nil), history...))
+	var histories [][]contextcontract.HistoryEntry
+	executor := func(_ context.Context, _ *model.Task, _ map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
+		histories = append(histories, append([]contextcontract.HistoryEntry(nil), history...))
 		return ExecuteResult{Output: "中段分析，没有结构化提交", ToolCalled: false}, nil
 	}
 	ag := NewAgent("agent-1", "code", s, r, executor)
@@ -43,7 +45,7 @@ func TestProcessTask_GraphNodeTextExitNudgesThenRecoverable(t *testing.T) {
 	for i, h := range histories[1:] {
 		found := false
 		for _, e := range h {
-			if strings.Contains(e.IncomingMail, "system-reminder") && strings.Contains(e.IncomingMail, "submit_task_result") {
+			if strings.Contains(e.SystemNotice, "system-reminder") && strings.Contains(e.SystemNotice, "submit_task_result") {
 				found = true
 			}
 		}
@@ -94,9 +96,9 @@ func TestProcessTask_SchedulerRootTextExitReviewed(t *testing.T) {
 	if err := s.ClaimTask("scheduler-1", task.ID); err != nil {
 		t.Fatal(err)
 	}
-	var histories [][]HistoryEntry
-	executor := func(_ context.Context, _ *model.Task, _ map[string]string, history []HistoryEntry) (ExecuteResult, error) {
-		histories = append(histories, append([]HistoryEntry(nil), history...))
+	var histories [][]contextcontract.HistoryEntry
+	executor := func(_ context.Context, _ *model.Task, _ map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
+		histories = append(histories, append([]contextcontract.HistoryEntry(nil), history...))
 		return ExecuteResult{Output: "直接答复", ToolCalled: false}, nil
 	}
 	reviewer := &fakeExitReviewer{allowOn: 2}
@@ -112,7 +114,7 @@ func TestProcessTask_SchedulerRootTextExitReviewed(t *testing.T) {
 	}
 	found := false
 	for _, e := range histories[1] {
-		if strings.Contains(e.IncomingMail, "零证据") {
+		if strings.Contains(e.SystemNotice, "零证据") {
 			found = true
 		}
 	}
@@ -139,7 +141,7 @@ func TestProcessTask_NonGraphWorkerTextExitUnchanged(t *testing.T) {
 	if err := s.ClaimTask("agent-1", task.ID); err != nil {
 		t.Fatal(err)
 	}
-	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "完成", ToolCalled: false}, nil
 	}
 	ag := NewAgent("agent-1", "code", s, r, executor)
@@ -165,7 +167,7 @@ func TestProcessTask_SchedulerRootTextExitRetryOnFormatCollapse(t *testing.T) {
 	if err := s.ClaimTask("scheduler-1", task.ID); err != nil {
 		t.Fatal(err)
 	}
-	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "<｜DSML｜残片", ToolCalled: false}, nil
 	}
 	reviewer := &fakeExitReviewer{retryOn: 1}
@@ -206,7 +208,7 @@ func TestProcessTask_ToolFailedPassedToReviewer(t *testing.T) {
 			t.Fatal(err)
 		}
 		reviewer := &fakeExitReviewer{allowOn: 1}
-		executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+		executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 			return ExecuteResult{Output: "答复", ToolCalled: false}, nil
 		}
 		ag := NewAgent("scheduler-1", "__scheduler__", s, r, executor)
@@ -224,7 +226,7 @@ func TestProcessTask_ToolFailedPassedToReviewer(t *testing.T) {
 			t.Fatal(err)
 		}
 		reviewer := &fakeExitReviewer{allowOn: 1}
-		executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+		executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 			return ExecuteResult{Output: "答复", ToolCalled: false}, nil
 		}
 		ag := NewAgent("scheduler-1", "__scheduler__", s, r, executor)

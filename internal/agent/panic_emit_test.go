@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"context"
 	"strings"
 	"testing"
@@ -31,7 +33,7 @@ func TestPanicRecovery_EmitsKindTaskFailed(t *testing.T) {
 	}
 
 	// executor 直接 panic——触发 processTask 顶部的 defer recover() 兜底分支
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		panic("intentional test panic to drive recovery path")
 	}
 

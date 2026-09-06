@@ -1,5 +1,7 @@
 package runner
 
+import "agentgo/internal/testmodel"
+
 import (
 	"slices"
 	"testing"
@@ -19,7 +21,7 @@ func TestResolveToolGroups_WiresInteractionDependencies(t *testing.T) {
 	interactions := interaction.NewService(nil)
 	sessionID := func() string { return "session-test" }
 
-	groups := resolveToolGroups("w-1", nil, RunnerDeps{Interactions: interactions, SessionID: sessionID}, holder,
+	groups := resolveToolGroups("w-1", nil, RunnerDeps{Interactions: interactions, SessionID: sessionID, ContextRuntime: testmodel.Runtime(t)}, holder,
 		agent.NewFinalizationHolder(), agent.NewSubmitState(),
 		agent.NewFileStateCache(1), &tools.DefaultWorkdir{}, hook)
 
@@ -85,7 +87,7 @@ func mustShellGroup(t *testing.T, groups []tools.ToolGroup) *tools.ShellGroup {
 func TestResolveToolGroups_AcceptanceRoleGetsHardenedShell(t *testing.T) {
 	groups := resolveToolGroups("verifier-1",
 		[]string{"read_file", "run_shell", "submit_task_result", "request_replan"},
-		RunnerDeps{}, &CurrentTaskHolder{},
+		RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, &CurrentTaskHolder{},
 		agent.NewFinalizationHolder(), agent.NewSubmitState(),
 		agent.NewFileStateCache(1), &tools.DefaultWorkdir{}, nil)
 
@@ -104,7 +106,7 @@ func TestResolveToolGroups_NonAcceptanceRoleKeepsShellUnchanged(t *testing.T) {
 		{"read_file", "grep_search"}, // 无 run_shell：shell 非其通道，不加固
 		nil,                          // 单测直构场景：nil 白名单不加固（生产 kind 必有非空白名单）
 	} {
-		groups := resolveToolGroups("w-1", allowed, RunnerDeps{}, &CurrentTaskHolder{},
+		groups := resolveToolGroups("w-1", allowed, RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, &CurrentTaskHolder{},
 			agent.NewFinalizationHolder(), agent.NewSubmitState(),
 			agent.NewFileStateCache(1), &tools.DefaultWorkdir{}, nil)
 		if sg := mustShellGroup(t, groups); sg.ExtraGreylist != nil {

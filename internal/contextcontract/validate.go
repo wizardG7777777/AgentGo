@@ -101,6 +101,8 @@ func dispositionAllowedForKind(kind FragmentKind, disposition Disposition) bool 
 			disposition == DispositionRejected
 	case FragmentSystemOutputContract:
 		return disposition == DispositionInline || disposition == DispositionRejected
+	case FragmentUserMedia:
+		return disposition == DispositionInline || disposition == DispositionRejected
 	case FragmentUserTask:
 		return disposition == DispositionInline || disposition == DispositionReferenced ||
 			disposition == DispositionRejected
@@ -307,8 +309,8 @@ func (p ContextBudgetPolicy) Validate() error {
 	if err := validateOpaque("policy_id", p.PolicyID); err != nil {
 		return err
 	}
-	if p.Version <= 0 {
-		return fmt.Errorf("context policy %s version=%d 必须 > 0", p.PolicyID, p.Version)
+	if p.Version != 11 {
+		return fmt.Errorf("拒绝 Context policy version=%d，当前仅支持 11", p.Version)
 	}
 	if err := validateOpaque("model_class", p.ModelClass); err != nil {
 		return fmt.Errorf("context policy %s: %w", p.PolicyID, err)
@@ -324,9 +326,6 @@ func (p ContextBudgetPolicy) Validate() error {
 		return fmt.Errorf("context policy %s 含未知 fragment kind=%q", p.PolicyID, unknownFragmentKinds[0])
 	}
 	for _, kind := range KnownFragmentKinds() {
-		if kind == FragmentAssistantResponseItems && p.Version < 8 {
-			continue
-		}
 		rule, ok := p.FragmentRules[kind]
 		if !ok {
 			return fmt.Errorf("context policy %s 缺少 fragment rule=%s", p.PolicyID, kind)
@@ -388,7 +387,7 @@ func (p ContextBudgetPolicy) Validate() error {
 	if p.AbsoluteWireByteLimit < p.SnapshotInputBudget.SerializedBytes {
 		return fmt.Errorf("context policy %s absolute wire bytes 小于 snapshot input bytes", p.PolicyID)
 	}
-	if p.Version >= 3 {
+	{
 		if p.ModelContextWindow == nil || p.ProtocolOverheadReserve == nil {
 			return fmt.Errorf("context policy %s v%d 缺少 model window/protocol overhead reserve", p.PolicyID, p.Version)
 		}
@@ -403,8 +402,6 @@ func (p ContextBudgetPolicy) Validate() error {
 		if neededBytes > p.ModelContextWindow.SerializedBytes || neededTokens > p.ModelContextWindow.EstimatedTokens {
 			return fmt.Errorf("context policy %s 的 input+completion+protocol reserve 超过 model window", p.PolicyID)
 		}
-	} else if p.ModelContextWindow != nil || p.ProtocolOverheadReserve != nil {
-		return fmt.Errorf("历史 context policy %s v%d 不得携带 v3 model window 字段", p.PolicyID, p.Version)
 	}
 	return nil
 }
@@ -450,8 +447,8 @@ func (p ProviderReplayPolicy) Validate() error {
 	if err := validateOpaque("policy_id", p.PolicyID); err != nil {
 		return err
 	}
-	if p.Version <= 0 {
-		return fmt.Errorf("provider replay policy %s version=%d 必须 > 0", p.PolicyID, p.Version)
+	if p.Version != 5 {
+		return fmt.Errorf("拒绝 Replay policy version=%d，当前仅支持 5", p.Version)
 	}
 	fields := make([]string, 0, len(p.Fields))
 	for field := range p.Fields {
@@ -486,7 +483,7 @@ func (p ProviderReplayPolicy) Validate() error {
 
 // Validate 校验已封存 Snapshot 的身份、引用闭合和 Manifest/Wire 同源性。
 func (s ContextSnapshot) Validate() error {
-	if s.Schema != SnapshotSchemaV1 {
+	if s.Schema != SnapshotSchemaV2 {
 		return fmt.Errorf("context snapshot schema=%q，无效", s.Schema)
 	}
 	required := []struct {
@@ -496,7 +493,7 @@ func (s ContextSnapshot) Validate() error {
 		{label: "snapshot_id", value: s.SnapshotID},
 		{label: "attempt_id", value: s.AttemptID},
 		{label: "invocation_id", value: s.InvocationID},
-		{label: "prompt_build_ref", value: s.PromptBuildRef},
+		{label: "instruction_ref", value: s.InstructionRef},
 		{label: "context_policy_id", value: s.ContextPolicyID},
 		{label: "provider_replay_ref", value: s.ProviderReplayRef},
 		{label: "execution_lease_ref", value: s.ExecutionLeaseRef},

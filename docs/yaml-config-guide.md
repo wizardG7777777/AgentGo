@@ -1,3 +1,5 @@
+> **L1/L2 重建（2026-09-07）**：L2 装配完整请求，L1 执行 SSE 与归一化响应；旧请求/配置/历史不转换。当前实现与验证边界以 [五层规范](design/five-layer-engineering-architecture.md) 为准。
+
 # AgentGo YAML 配置撰写指南（v5）
 
 > 面向另一个 Agent / 新接手的人类作者。
@@ -22,7 +24,7 @@ AgentGo 有**三类** YAML 文件：
 
 写新配置时按这个顺序走，每步都能立即用 `Validate()` 反馈错误：
 
-1. **填 `llm:` 块**：通常只需 base_url / api_key / default_model；timeout_sec、reasoning_effort、stream 可选
+1. **填 `llm:` 块**：通常只需 base_url / api_key / default_model；timeout_sec、reasoning_effort 可选；request_contract 必填
 2. **可直接启动 Scheduler**：只做单 Agent 工作，或让 Scheduler 决定何时组建 Team
 3. **可选 `agent_templates:`**：加载个人/项目模板并设置运行期 Agent 上限
 4. **可选 `tool_profiles:` + `agents:`**：需要启动即常驻的预热 Agent 时再写
@@ -49,7 +51,7 @@ llm:
       context_window_tokens: 131072
       max_completion_tokens: 16384
   # reasoning_effort: medium            # 仅为支持该参数的模型启用；空值表示不发送
-  stream: true                          # 可选；启用所选 protocol 的 SSE
+  request_contract: agentgo.model-request/v1 # 必填；所有接口仅使用 SSE
 ```
 
 **关键点**：
@@ -61,7 +63,7 @@ llm:
 - `reasoning_effort` 接受 OpenAI 当前公开取值的并集：`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`；具体模型可能只支持其中一部分，不支持时由上游 API 返回模型级错误
 - Context v9 默认按 1M/64K 编译；`model_capabilities` 只按精确模型名覆盖，不按 provider 名称猜测。窗口必须大于 completion + 16384 protocol reserve。能力与 digest 冻结进 ExecutionLease，retry 不漂移。
 - 默认 Run profile 只统计 prompt/completion tokens，不以 token 数量停止任务；只有 RunContract 显式非零 token budget 才形成硬限制。时间、模型调用、工具动作和 Attempt 护栏仍生效。
-- `stream: true` 对所有经统一 LLM 工厂创建的调用生效，包括 Scheduler、预热 Agent、模板/Team Agent、one-shot spawn Agent 和用户 Reactor 的 `invoke_llm`
+- SSE-only 契约对所有经统一 L2/L1 创建的调用生效，包括 Scheduler、预热 Agent、模板/Team Agent、one-shot spawn Agent 和用户 Reactor 的 `invoke_llm`
 - 流式正文/reasoning 会以同一 `stream_id` 的独立累积快照推送到 TUI/Web；工具调用只有在完整 typed output item 完成后才交给 Agent，避免半截参数触发工具
 
 ### 1.2 `tool_profiles:` — 命名工具集（推荐）

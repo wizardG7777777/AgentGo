@@ -49,7 +49,7 @@ Store、桥接字符串和不同 deadline 口径。
 | 归属 | 当前遗留 | 下一实施/验证门 |
 |---|---|---|
 | 基础层 Model Invocation | Responses typed items 已 cutover；Chat compatibility 未删 | provider 对照 + SWE-014/027；compat 调用归零 |
-| L1 Prompt | 单体约 52.9KiB Prompt 已退出生产；core + phase task-control prompt，各阶段只见对应工具 | 外部 cohort 统计，不再是实现缺口 |
+| L2 指令装配 | 单体约 52.9KiB Prompt 已退出生产；core + phase task-control prompt，各阶段只见对应工具 | 外部 cohort 统计，不再是实现缺口 |
 | L2 Context | v7 Optional/RequiredExact、Raw History projection 与动态 reserve 已落地 | 真实 tokenizer、更多 provider replay fixture |
 | L3 Harness | repo SWE Test Runner、双层 tool probe、真实 Lease、phase Router、typed terminal 已落地 | 外部 provider fixture 扩展 |
 | L4 Loop | final Attempt 权利、deadline、failure-neutral progress 与 intervention scope 已钉住 | recovery controller 外部多题 rollout |
@@ -119,7 +119,7 @@ Observation Control Invocation 与 RecoveryStartPermit。再后续的 provider 4
 | SWE-015 | L2 Context（Invocation 协同） | Response→Replay representability、Optional/RequiredExact disposition |
 | SWE-016 | L4 Loop | Attempt budget 在 rollover/start 边界执法，保留最后 Attempt 执行权 |
 | SWE-017 | L4 Loop | 唯一 Deadline Compiler 与合法 Recovery wake Checkpoint |
-| SWE-018 | L1 Prompt | Scheduler phase Prompt/行动收敛，先做 cohort 因果对照 |
+| SWE-018 | L2 指令装配 | Scheduler phase Prompt/行动收敛，先做 cohort 因果对照 |
 | SWE-019 | L3 Harness | Provider tool capability、真实 Scheduler Lease、阶段化 ToolRouter 与 batch cap |
 | SWE-020 | 外部 SWE Test Runner / L3 观测 | 仓库内 versioned SWE Test Runner、RunContract、typed terminal 与双指标 |
 | SWE-021 | L2 Context | typed/bounded RuntimeSnapshot 与 optional drop |
@@ -248,7 +248,7 @@ SessionID
 | 类型 | 唯一权威建议 | 消费方 |
 |---|---|---|
 | RunContract/DeadlineBudget | `internal/runcontract` | L4、L5、SWE Test Runner |
-| InvocationContract/Failure/Usage | `internal/invocation` | llm adapter、L2、L4 |
+| Request/Result/Failure/Usage | `internal/llm` | L2、L4 |
 | ContextFragment/Snapshot/Policy | `internal/contextcontract` | compiler、agent、trace |
 | ProgressContract/Delta/Checkpoint | `internal/loopcontract` 或拆分小包 | L4、L3 adapters、L5 ref |
 | TaskOutcome | neutral outcome package | agent/store/Graph adapter |
@@ -262,7 +262,7 @@ SessionID
 ### 6.2 禁止依赖
 
 - `internal/graph` 不 import `agent`、具体 LLM SDK 或具体 Tool Registry；
-- `internal/invocation` 不 import L4/Graph；
+- `internal/llm` 不 import Agent/Graph/Memory/UI，`internal/contextruntime` 不 import Agent/Graph/UI；
 - `internal/contextcontract` 不执行 Store/Tool；
 - `ProgressEvaluator` 不读文件、不调模型、不改 Graph；
 - Trace types 不成为 Domain DTO 的唯一运行输入；

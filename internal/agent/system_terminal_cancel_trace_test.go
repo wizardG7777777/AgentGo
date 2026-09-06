@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"context"
 	"testing"
 	"time"
@@ -112,7 +114,7 @@ func TestProcessTask_CancellationDuringExecuteEmitsTerminalTrace(t *testing.T) {
 	}
 
 	started := make(chan struct{})
-	executor := func(ctx context.Context, _ *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, _ *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		close(started)
 		<-ctx.Done()
 		return ExecuteResult{}, ctx.Err()

@@ -97,4 +97,4 @@ type RouteRegistry interface {
 
 // LLMFactory creates one client per runtime agent. Keeping the factory here
 // avoids coupling the template lifecycle to static AgentKind bootstrap code.
-type LLMFactory func(model string) llm.Client
+type LLMFactory func(model string) llm.Invoker

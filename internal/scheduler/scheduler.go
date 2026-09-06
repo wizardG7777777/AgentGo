@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"agentgo/internal/contextruntime"
 	"io"
 	"strings"
 	"time"
@@ -40,8 +41,7 @@ import (
 // 该常量故意不暴露 yaml 配置——"重试几次"是角色属性，不是用户偏好。
 const schedulerMaxRetries = 5
 
-// schedulerPromptVersion 是 scheduler system prompt 的来源版本（V6 §2 P1a
-// prompt 编译 agent_role 组件的 Version 维度）。prompt 正文变更时递增。
+// schedulerPromptVersion 是交付 L2 的 Scheduler 角色指令来源版本，正文变更时递增。
 const schedulerPromptVersion = "embedded:v10.11-recovery-evidence-v4"
 
 // SystemPrompt 返回 scheduler agent 的内嵌 system prompt 全文（只读）。
@@ -174,7 +174,7 @@ type GraphAuthoringDeps struct {
 	Compiler graph.DefinitionCompiler
 	// ContextRuntime 与 authoring 同为生产必需的 Scheduler runtime authority；
 	// 放在可选尾依赖中保持精简测试构造兼容。
-	ContextRuntime          agent.ContextRuntime
+	ContextRuntime          contextruntime.Runtime
 	DurableToolCallRecorder func(string, store.ToolCallRecord) error
 	// Observation 是 Scheduler coordination/v2 的 framework control invocation，
 	// 与 Graph authoring 共用同一生产装配边界。
@@ -197,7 +197,7 @@ type GraphAuthoringDeps struct {
 func New(
 	s store.TaskStore,
 	r roster.Roster,
-	llmClient llm.Client,
+	llmClient llm.Invoker,
 	eventCh <-chan model.Event,
 	cfg *config.Config,
 	cancelReg *store.TaskCancelRegistry,
@@ -389,12 +389,7 @@ func New(
 	toolReg.WrapHandler("write_file", writeApprover.WrapHandler("write_file"))
 	toolReg.WrapHandler("edit_file", writeApprover.WrapHandler("edit_file"))
 
-	// 标准 LLM Executor（hook + storeView + recordToolCall 三件套与 worker 一致）。
-	// V6 §2 起改用 Swappable 结构句柄：Execute 语义不变，句柄本身接到
-	// Agent.ToolSwapper / PromptSource——__scheduler__ 任务保持记录型租约
-	//（execution_lease.go 按 EventType 钉住），swapper 仅供 prompt 编译与
-	// /doctor agents 审计读取真实工具面。
-	innerExec := agent.NewSwappableLLMExecutor(llmClient, toolReg, gateReg, storeView, recordToolCall, "", schedulerCorePrompt)
+	innerExec := agent.NewTurnExecutor(llmClient, toolReg, gateReg, recordToolCall, authoring.ContextRuntime, contextruntime.Instructions{System: schedulerCorePrompt})
 	innerExec.SetPromptVersion(schedulerPromptVersion)
 	innerExec.SetPhasePromptResolver(schedulerPromptForPhase)
 	innerExec.SetContextRuntime(authoring.ContextRuntime)
@@ -473,9 +468,8 @@ func New(
 	// V6 §4 H1：exec 轴模式源注入（ExecutionLease 的 Policy 交集输入）；
 	// scheduler 自身工具装配不变（它即控制面），但同样生成 Lease 记录。
 	a.Modes = modeStore
-	// V6 §2 P1a：prompt 编译身份源 + 观测用 swapper（__scheduler__ 任务
+	// 工具视图交换器（__scheduler__ 任务
 	// 保持记录型租约，见 execution_lease.go 的 EventType 分支）。
-	a.PromptSource = innerExec
 	a.ToolSwapper = innerExec
 	// V6 §4 H2b：scheduler 亲自执行（solo 拓扑）时的 workspace 合并埋点账本；
 	// 工具层账本已在上方 RegisterGroups 注入。

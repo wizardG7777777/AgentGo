@@ -21,7 +21,7 @@ func TestDefaultCatalogValidAndResolvesGraphPolicies(t *testing.T) {
 	if err := catalog.Validate(); err != nil {
 		t.Fatalf("Catalog.Validate: %v", err)
 	}
-	if !catalog.HasContextPolicy(ContextDefaultV1) ||
+	if !catalog.HasContextPolicy(ContextDefaultCurrent) ||
 		!catalog.HasProgressContract(ProgressCodeChangeV1) ||
 		!catalog.HasProgressContract(ProgressCodeChangeCurrent) {
 		t.Fatal("Graph PolicyResolver 未识别默认 Context/Progress ref")
@@ -61,10 +61,10 @@ func TestDefaultCatalogValidAndResolvesGraphPolicies(t *testing.T) {
 	if got := catalog.ProgressRefs(); !reflect.DeepEqual(got, wantProgressRefs) {
 		t.Fatalf("ProgressRefs=%v，want=%v", got, wantProgressRefs)
 	}
-	if got := catalog.ContextRefs(); !reflect.DeepEqual(got, []string{ContextDefaultV1, ContextDefaultV10, ContextDefaultV2, ContextDefaultV3, ContextDefaultV4, ContextDefaultV5, ContextDefaultV6, ContextDefaultV7, ContextDefaultV8, ContextDefaultV9}) {
+	if got := catalog.ContextRefs(); !reflect.DeepEqual(got, []string{ContextDefaultCurrent}) {
 		t.Fatalf("ContextRefs=%v", got)
 	}
-	if got := catalog.ReplayRefs(); !reflect.DeepEqual(got, []string{ReplayOpenAICompatibleV1, ReplayOpenAICompatibleV2, ReplayOpenAICompatibleV3, ReplayOpenAICompatibleV4}) {
+	if got := catalog.ReplayRefs(); !reflect.DeepEqual(got, []string{ReplayOpenAICompatibleCurrent}) {
 		t.Fatalf("ReplayRefs=%v", got)
 	}
 }
@@ -74,24 +74,24 @@ func TestDefaultContextAndReplayPoliciesAreVersionedAndClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	contextProfile, ok := catalog.ContextPolicy(ContextDefaultV1)
+	contextProfile, ok := catalog.ContextPolicy(ContextDefaultCurrent)
 	if !ok {
 		t.Fatal("未找到默认 Context policy")
 	}
 	if contextProfile.Policy.Schema != contextcontract.PolicySchemaV1 ||
-		contextProfile.Policy.Version != 1 || contextProfile.Digest == "" {
+		contextProfile.Policy.Version != 11 || contextProfile.Digest == "" {
 		t.Fatalf("Context profile 身份不完整: %+v", contextProfile)
 	}
-	if contextProfile.ReplayPolicyRef != ReplayOpenAICompatibleV1 {
+	if contextProfile.ReplayPolicyRef != ReplayOpenAICompatibleCurrent {
 		t.Fatalf("Context profile replay ref=%q", contextProfile.ReplayPolicyRef)
 	}
-	if len(contextProfile.Policy.FragmentRules) != len(contextcontract.KnownFragmentKinds())-1 ||
+	if len(contextProfile.Policy.FragmentRules) != len(contextcontract.KnownFragmentKinds()) ||
 		len(contextProfile.Policy.AtomicGroupRules) != len(contextcontract.KnownAtomicGroupKinds()) ||
 		len(contextProfile.Policy.SectionBudgets) != len(contextcontract.KnownContextSections()) {
 		t.Fatal("默认 Context policy 未完整覆盖封闭词表")
 	}
 
-	replay, ok := catalog.ProviderReplayPolicy(ReplayOpenAICompatibleV1)
+	replay, ok := catalog.ProviderReplayPolicy(ReplayOpenAICompatibleCurrent)
 	if !ok {
 		t.Fatal("未找到默认 ProviderReplayPolicy")
 	}
@@ -102,133 +102,9 @@ func TestDefaultContextAndReplayPoliciesAreVersionedAndClosed(t *testing.T) {
 	if _, guessed := replay.Policy.Fields["vendor_unknown_field"]; guessed {
 		t.Fatal("未知 provider field 不得在默认 policy 中猜测放行")
 	}
-	if _, leaked := replay.Policy.Fields[llm.ResponsesOutputItemsExtraField()]; leaked {
-		t.Fatal("Responses carrier 不得改写历史 replay v1 digest")
-	}
-	responsesReplay, ok := catalog.ProviderReplayPolicy(ReplayOpenAICompatibleV3)
-	if !ok || responsesReplay.Policy.Fields[llm.ResponsesOutputItemsExtraField()] != contextcontract.ReplayRequiredExact {
+	responsesReplay, ok := catalog.ProviderReplayPolicy(ReplayOpenAICompatibleCurrent)
+	if !ok || responsesReplay.Policy.Fields[llm.ReplayItemsBudgetKey] != contextcontract.ReplayRequiredExact {
 		t.Fatalf("Replay v3 缺少 Responses RequiredExact carrier: %+v", responsesReplay)
-	}
-}
-
-func TestDefaultContextV2WidensStaticPromptWithoutMutatingV1(t *testing.T) {
-	catalog, err := NewDefault()
-	if err != nil {
-		t.Fatal(err)
-	}
-	v1, ok := catalog.ContextPolicy(ContextDefaultV1)
-	if !ok {
-		t.Fatal("未找到历史 Context v1")
-	}
-	v2, ok := catalog.ContextPolicy(ContextDefaultV2)
-	if !ok {
-		t.Fatal("未找到当前 Context v2")
-	}
-	v3, ok := catalog.ContextPolicy(ContextDefaultV3)
-	if !ok {
-		t.Fatal("未找到当前 Context v3")
-	}
-	v4, ok := catalog.ContextPolicy(ContextDefaultV4)
-	if !ok {
-		t.Fatal("未找到当前 Context v4")
-	}
-	v5, ok := catalog.ContextPolicy(ContextDefaultV5)
-	if !ok {
-		t.Fatal("未找到当前 Context v5")
-	}
-	v6, ok := catalog.ContextPolicy(ContextDefaultV6)
-	if !ok {
-		t.Fatal("未找到当前 Context v6")
-	}
-	v7, ok := catalog.ContextPolicy(ContextDefaultV7)
-	if !ok {
-		t.Fatal("未找到当前 Context v7")
-	}
-	v8, ok := catalog.ContextPolicy(ContextDefaultV8)
-	if !ok {
-		t.Fatal("未找到当前 Context v8")
-	}
-	v9, ok := catalog.ContextPolicy(ContextDefaultV9)
-	if !ok {
-		t.Fatal("未找到当前 Context v9")
-	}
-	v10, ok := catalog.ContextPolicy(ContextDefaultV10)
-	if !ok {
-		t.Fatal("未找到当前 Context v10")
-	}
-	if ContextDefaultCurrent != ContextDefaultV10 || v9.Policy.ModelContextWindow.EstimatedTokens != 1_048_576 ||
-		v9.Policy.CompletionReserve.EstimatedTokens != 65_536 || v9.Policy.SnapshotInputBudget.EstimatedTokens != 966_656 {
-		t.Fatalf("历史 Context v9 档案或 current 别名错误: current=%q policy=%+v", ContextDefaultCurrent, v9.Policy)
-	}
-	if v10.Policy.Version != 10 || v10.ReplayPolicyRef != ReplayOpenAICompatibleV4 ||
-		v10.Policy.SnapshotInputBudget.EstimatedTokens != 966_656 ||
-		v10.Policy.FragmentRules[contextcontract.FragmentPromptComponent].MaxEstimatedTokens != 16<<10 ||
-		v10.Policy.FragmentRules[contextcontract.FragmentToolResult].MaxEstimatedTokens != 12<<10 ||
-		v10.Policy.FragmentRules[contextcontract.FragmentTaskMemory].MaxEstimatedTokens != 4<<10 ||
-		v10.Policy.FragmentRules[contextcontract.FragmentToolDefinition].MaxEstimatedTokens != 16<<10 {
-		t.Fatalf("v10 不得把普通 Fragment 扩张到模型窗口: %+v", v10)
-	}
-	adaptedV10 := AdaptContextPolicyForModel(v10.Policy, 128<<10, 16<<10)
-	if adaptedV10.SnapshotInputBudget.EstimatedTokens != 96<<10 ||
-		adaptedV10.FragmentRules[contextcontract.FragmentPromptComponent].MaxEstimatedTokens != 16<<10 ||
-		adaptedV10.FragmentRules[contextcontract.FragmentAssistantResponseItems].MaxEstimatedTokens != 16<<10 ||
-		adaptedV10.AtomicGroupRules[contextcontract.AtomicAssistantProviderReplay].MaxEstimatedTokens != 16<<10 {
-		t.Fatalf("v10 模型能力适配边界错误: %+v", adaptedV10)
-	}
-	v1Prompt := v1.Policy.FragmentRules[contextcontract.FragmentPromptComponent]
-	v2Prompt := v2.Policy.FragmentRules[contextcontract.FragmentPromptComponent]
-	if v1.Policy.Version != 1 || v1Prompt.MaxSerializedBytes != 48<<10 ||
-		v1.Policy.SectionBudgets[contextcontract.SectionSystem].SerializedBytes != 64<<10 {
-		t.Fatalf("v1 冻结预算被改写: prompt=%+v system=%+v",
-			v1Prompt, v1.Policy.SectionBudgets[contextcontract.SectionSystem])
-	}
-	if v2.Policy.Version != 2 || v2Prompt.MaxSerializedBytes != 64<<10 ||
-		v2.Policy.SectionBudgets[contextcontract.SectionSystem].SerializedBytes != 96<<10 {
-		t.Fatalf("v2 静态 Prompt 预算错误: prompt=%+v system=%+v",
-			v2Prompt, v2.Policy.SectionBudgets[contextcontract.SectionSystem])
-	}
-	if v1.Digest == v2.Digest {
-		t.Fatal("不同 Context policy version 不得共享 digest")
-	}
-	if v6.Policy.Version != 6 || v6.Policy.SnapshotInputBudget.EstimatedTokens != 92<<10 ||
-		v6.Policy.CompletionReserve.EstimatedTokens != 32<<10 ||
-		v6.Policy.FragmentRules[contextcontract.FragmentAssistantReasoning].MaxSerializedBytes != 128<<10 ||
-		v5.Digest == v6.Digest {
-		t.Fatalf("v6 32K completion/reasoning 预算错误: %+v", v6.Policy)
-	}
-	if v7.Policy.Version != 7 || v7.Policy.CompletionReserve != v6.Policy.CompletionReserve ||
-		v7.Policy.FragmentRules[contextcontract.FragmentAssistantReasoning].MaxSerializedBytes != 192<<10 ||
-		v7.Digest == v6.Digest {
-		t.Fatalf("v7 optional reasoning 字节容器错误: %+v", v7.Policy)
-	}
-	if v8.Policy.Version != 8 || v8.ReplayPolicyRef != ReplayOpenAICompatibleV3 ||
-		v8.Policy.CompletionReserve != v7.Policy.CompletionReserve ||
-		v8.Policy.FragmentRules[contextcontract.FragmentAssistantResponseItems].RetentionClass != contextcontract.RetentionTaskLifetime ||
-		v8.Digest == v7.Digest {
-		t.Fatalf("v8 Responses typed replay policy 错误: %+v", v8)
-	}
-	if _, leaked := v7.Policy.FragmentRules[contextcontract.FragmentAssistantResponseItems]; leaked {
-		t.Fatal("v8 Responses fragment rule 污染了历史 v7 digest")
-	}
-	if v3.Policy.Version != 3 || v3.ReplayPolicyRef != ReplayOpenAICompatibleV2 ||
-		v3.Policy.FragmentRules[contextcontract.FragmentPromptComponent].MaxSerializedBytes != 64<<10 {
-		t.Fatalf("v3 Replay/Context 身份错误: %+v", v3)
-	}
-	if v4.Policy.Version != 4 || v4.ReplayPolicyRef != ReplayOpenAICompatibleV2 ||
-		v4.Policy.FragmentRules[contextcontract.FragmentPromptComponent].MaxSerializedBytes != 64<<10 ||
-		v4.Digest == v3.Digest {
-		t.Fatalf("v4 estimator policy 身份错误: %+v", v4)
-	}
-	v4Reasoning := v4.Policy.FragmentRules[contextcontract.FragmentAssistantReasoning]
-	v5Reasoning := v5.Policy.FragmentRules[contextcontract.FragmentAssistantReasoning]
-	if v4Reasoning.MaxSerializedBytes != 32<<10 || v4Reasoning.MaxEstimatedTokens != 8<<10 ||
-		v5.Policy.Version != 5 || v5.ReplayPolicyRef != ReplayOpenAICompatibleV2 ||
-		v5Reasoning.MaxSerializedBytes != 64<<10 || v5Reasoning.MaxEstimatedTokens != 16<<10 ||
-		v5.Digest == v4.Digest {
-		t.Fatalf("v4/v5 RequiredExact reasoning 预算冻结错误: v4=%+v v5=%+v", v4Reasoning, v5Reasoning)
-	}
-	if v2.ReplayPolicyRef != ReplayOpenAICompatibleV1 {
-		t.Fatalf("历史 v2 replay ref 被改写: %q", v2.ReplayPolicyRef)
 	}
 }
 
@@ -429,21 +305,21 @@ func TestLookupsReturnDeepCopies(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	contextProfile, _ := catalog.ContextPolicy(ContextDefaultV1)
+	contextProfile, _ := catalog.ContextPolicy(ContextDefaultCurrent)
 	rule := contextProfile.Policy.FragmentRules[contextcontract.FragmentUserTask]
 	rule.MaxSerializedBytes = 1
 	rule.AllowedDispositions[0] = contextcontract.DispositionRejected
 	contextProfile.Policy.FragmentRules[contextcontract.FragmentUserTask] = rule
 	contextProfile.Policy.SectionBudgets[contextcontract.SectionSystem] = contextcontract.Budget{}
-	freshContext, _ := catalog.ContextPolicy(ContextDefaultV1)
+	freshContext, _ := catalog.ContextPolicy(ContextDefaultCurrent)
 	if freshContext.Policy.FragmentRules[contextcontract.FragmentUserTask].MaxSerializedBytes == 1 ||
 		freshContext.Policy.SectionBudgets[contextcontract.SectionSystem].SerializedBytes == 0 {
 		t.Fatal("调用方修改 Context lookup 污染 catalog")
 	}
 
-	replay, _ := catalog.ProviderReplayPolicy(ReplayOpenAICompatibleV1)
+	replay, _ := catalog.ProviderReplayPolicy(ReplayOpenAICompatibleCurrent)
 	replay.Policy.Fields["reasoning_content"] = contextcontract.ReplayForbidden
-	freshReplay, _ := catalog.ProviderReplayPolicy(ReplayOpenAICompatibleV1)
+	freshReplay, _ := catalog.ProviderReplayPolicy(ReplayOpenAICompatibleCurrent)
 	if freshReplay.Policy.Fields["reasoning_content"] != contextcontract.ReplayRequiredExact {
 		t.Fatal("调用方修改 Replay lookup 污染 catalog")
 	}
@@ -472,8 +348,8 @@ func TestCatalogDigestsStableAndSemanticChangesVisible(t *testing.T) {
 			t.Fatalf("相同默认 Progress profile digest 不稳定: ref=%s", ref)
 		}
 	}
-	leftContext, _ := first.ContextPolicy(ContextDefaultV1)
-	rightContext, _ := second.ContextPolicy(ContextDefaultV1)
+	leftContext, _ := first.ContextPolicy(ContextDefaultCurrent)
+	rightContext, _ := second.ContextPolicy(ContextDefaultCurrent)
 	if leftContext.Digest != rightContext.Digest {
 		t.Fatal("相同默认 Context policy digest 不稳定")
 	}
@@ -507,7 +383,7 @@ func TestNilCatalogFailsClosed(t *testing.T) {
 	if catalog.HasContextPolicy(ContextDefaultCurrent) || catalog.HasProgressContract(ProgressCodeChangeV1) {
 		t.Fatal("nil catalog 不得放行 policy ref")
 	}
-	if _, ok := catalog.ContextPolicy(ContextDefaultV1); ok {
+	if _, ok := catalog.ContextPolicy(ContextDefaultCurrent); ok {
 		t.Fatal("nil catalog lookup 不得成功")
 	}
 }

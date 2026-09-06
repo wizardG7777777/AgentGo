@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"context"
 	"encoding/json"
 	"errors"
@@ -76,7 +78,7 @@ func TestP1_TraceEmit_TaskRetry_OnRecoverableError(t *testing.T) {
 		t.Fatalf("ClaimTask: %v", err)
 	}
 
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{}, &ErrRecoverable{Err: errors.New("429 rate limit")}
 	}
 
@@ -115,7 +117,7 @@ func TestP1_TraceEmit_TaskFailed_OnTerminate(t *testing.T) {
 	}
 
 	// 不可恢复错误 → handleFailure 的 else 分支 → terminateTask
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{}, errors.New("unrecoverable boom")
 	}
 
@@ -153,7 +155,7 @@ func TestP1_TraceEmit_TaskCancelled_OnCtxDone(t *testing.T) {
 		t.Fatalf("ClaimTask: %v", err)
 	}
 
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		t.Errorf("executor 不该被调用 — ctx 应在 loop 顶部就被检测到取消")
 		return ExecuteResult{}, nil
 	}
@@ -198,7 +200,7 @@ func TestTraceUpgrade_TaskFailedCause_OnRecoverableRetriesExhausted(t *testing.T
 	task := &model.Task{Description: "recoverable exhausts retries", EventType: "code"}
 	s.PublishTask(task)
 
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{}, &ErrRecoverable{Err: errors.New("persistent 429")}
 	}
 

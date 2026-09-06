@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/term"
 
+	"agentgo/internal/contextruntime"
 	"agentgo/internal/interaction"
 	"agentgo/internal/output"
 	"agentgo/internal/trace"
@@ -55,16 +56,42 @@ type pasteBurstTickMsg struct {
 func forwardUpdates(ctx context.Context, obs ui.Observer, p *tea.Program) {
 	updates, cancel := obs.Subscribe(512)
 	defer cancel()
+	watchSessionID := obs.Snapshot().Session.ID
+	modelEvents, modelCancel, modelErr := obs.WatchModelOutput(contextruntime.WatchOptions{SessionID: watchSessionID, Buffer: 512})
+	if modelErr != nil {
+		return
+	}
+	defer func() { if modelCancel!=nil{modelCancel()} }()
+	view := ui.ModelOutputView{}
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case e, ok := <-modelEvents:
+			if !ok {
+				return
+			}
+			projected, changed := view.Apply(e)
+			if changed {
+				p.Send(outputMsg(projected))
+			} else {
+				p.Send(turnsChangedMsg(ui.ModelOutputTurns(view.Records)))
+			}
 		case u, ok := <-updates:
 			if !ok {
 				return
 			}
 			switch u.Kind {
 			case ui.KindSnapshotSync:
+				if watchSessionID != u.Snapshot.Session.ID {
+					modelCancel()
+					watchSessionID = u.Snapshot.Session.ID
+					modelEvents, modelCancel, modelErr = obs.WatchModelOutput(contextruntime.WatchOptions{SessionID: watchSessionID, Buffer: 512})
+					if modelErr != nil {
+						return
+					}
+					view = ui.ModelOutputView{}
+				}
 				p.Send(snapshotSyncMsg(u.Snapshot))
 			case ui.KindOutputResult, ui.KindOutputText, ui.KindOutputStream, ui.KindOutputTurn:
 				p.Send(outputMsg(u.Output))

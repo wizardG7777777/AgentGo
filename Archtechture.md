@@ -1,3 +1,5 @@
+> **L1/L2 重建（2026-09-07）**：L2 装配完整请求，L1 执行 SSE 与归一化响应；旧请求/配置/历史不转换。当前实现与验证边界以 [五层规范](docs/design/five-layer-engineering-architecture.md) 为准。
+
 # 现状速览（2026-07-28）
 
 > 本文档原本是设计稿，部分章节早于实现。本节为升级工作提供快速对齐入口，列出**当前实现事实**与**与原设计文档的关键差异**。后续章节如有冲突，以本节和源代码为准。
@@ -55,9 +57,9 @@
 - **任务数据流**：`Task.Artifacts`（`record-artifact` reactor 在 `KindFileWritten` 上自动追加，路径相对项目根）、`Task.ExpectedArtifacts`（发布者硬合约，由 `enforce-expected-artifacts` Gate 与 `agent.checkExpectedArtifacts` 双重把守）、`Task.LastResponse`（无条件持久化用于失败诊断）、`Task.MailChainDepth`（邮件链跳数）、`Task.SchedulerBatch`（scheduler 当前 reactLoop 跟踪的子任务 ID 列表）、`Task.ReadSet`（v5 Phase 6 新增，由 `read-set-write` reactor 在 `KindToolResult{tool=read_file}` 上写入；`require-read-before-write` Gate 改读 ReadSet 而不再反查 ToolCallHistory）。
 - **TaskCancelRegistry**：per-task cancel context，看门狗/调度器把任务转为 terminal 状态时自动取消正在执行的代理（通过 `ctx.Done()` 即时感知）。
 - **崩溃汇报**：任务最终失败时 agent 自动调用 `sendCrashReport`，向 `task.EventSource` 发送 `priority=high` 邮件，附 expected vs actual artifacts、最后一次 LLM 响应原文。
-- **Context v3 replay 投影**：Raw History 不可变；L2 按当前 Snapshot section 压力生成有界 replay，Optional reasoning 可 dropped，RequiredExact 在工具 dispatch 前完成 representability gate；context overflow 只请求 aggressive projection + 新 Attempt。Shell/Web 大结果先写 Task-scope ContentStore，再以预览 + ContentRef 回放。
+- **Context v11 replay 投影**：Raw History 不可变；L2 按当前 Snapshot section 压力生成有界 replay，Optional reasoning 可 dropped，RequiredExact 在工具 dispatch 前完成 representability gate；context overflow 只请求 aggressive projection + 新 Attempt。Shell/Web 大结果先写 Task-scope ContentStore，再以预览 + ContentRef 回放。
 - **Trace 系统 Schema B**：`internal/trace.Event` 是 fat struct，包含 `Transition` / `ShellExec` / `ShellTimeout` / `Lease` / `Suggestion` / `Effect` / `Acceptance` 可选指针载荷与 V6 Graph Runtime 顶层字段，旧字段保留不动。EventKind 覆盖任务/Agent 状态机、Graph 生命周期、验收核验、执行租约与副作用账目等审计事件。`SetDefaultDispatcher(reactorReg)` 让 `trace.Emit` 同时驱动 Reactor 链路。物理 JSONL 在 Session 活跃时落盘到 `.agentgo/sessions/sess-<id>/logs/`，否则写入 `.agentgo/traces/`，默认保留 100 个文件；Task 重试可能跨多个分片。`agentgo trace list/show/graph/node/stats` 会按完整 `task_id` 重组逻辑任务并自动定向到 active session 的 `logs/`，其中 `graph <graph_id>` 聚合单个 Graph 的生命周期时间线。可通过 `AGENTGO_DUMP_PROMPTS=1` 启用 prompt dump。
-- **LLM 请求策略与流式调用**：`internal/llm` 在统一工厂层应用冻结的 `protocol`、`reasoning_effort` 与 `stream`。Responses 为新主链：SSE 的 message/reasoning/function_call output item 分型是行动权威，只有完成的 typed function call 才能 dispatch；正文中的 DSML/XML 永远只是 message。完成 output items 作为 RequiredExact carrier 经 L2 replay；Chat Completions 仅由配置显式选择兼容，不按 provider 名称推断。UI 仍收到带稳定 `stream_id` 的正文/reasoning 独立累积快照。
+- **LLM 请求策略与流式调用**：`internal/llm` 执行 已由 L2 封存的协议、模型、推理选项与输出预算。Responses 为新主链：SSE 的 message/reasoning/function_call output item 分型是行动权威，只有完成的 typed function call 才能 dispatch；正文中的 DSML/XML 永远只是 message。完成 output items 作为 RequiredExact carrier 经 L2 replay；Chat Completions 仅由配置显式选择兼容，不按 provider 名称推断。UI 通过 L2 WatchModelOutput 获取 snapshot/delta/finished/resync；eventCursor 由 L2 生成。
 
 **未启动 / 待设计**：
 - ScopeSession / ScopeProject 持久化记忆（v5.x 排期）
@@ -367,7 +369,7 @@ Responses 服务端以 output item type 区分 message/reasoning/function_call�
 - `response.output_item.done.item.type` 是 message/reasoning/function_call 的唯一身份；
 - `response.function_call_arguments.delta` 只做流式预算与一致性检查，最终
   `output_item.done` 才可 dispatch；
-- completed output items 原样编码到 `agentgo_responses_output_items`，由 L2
+- completed output items 原样保存在独立的 ProtocolReplay.Items，由 L2
   RequiredExact gate 证明下一轮可表示，再还原为 reasoning/function_call/
   function_call_output item；
 - 未知 item、重复 done、delta/done 参数不一致、incomplete/failed 均在工具执行前
@@ -600,7 +602,7 @@ internal/
 
 ## Context v3 Raw History / Replay Projection
 
-**位置**：`internal/agent/history_projection.go`、`internal/contextadapter`、`internal/contentstore`。
+**位置**：`internal/contextruntime/history.go`、`internal/contextruntime`、`internal/contentstore`。
 
 系统不再按累计完整 Prompt Token 修改 History，也不再使用 `snipOldToolResults` / `compressHistory` / `keepRecent=1` 三层有损压缩：
 
@@ -611,7 +613,7 @@ internal/
 5. 大 ToolResult 先持久化到 Task-scope ContentStore，History 只保存 `ref_id`、原始尺寸/digest 与首尾预览，可用 `read_content_ref` 分页；
 6. provider `context_window_exceeded` 创建新 Attempt 并请求 aggressive replay projection，不改写 Raw History。
 
-Context v3 同时冻结 model window、completion reserve、protocol overhead 与 Invocation OutputBudget；SDK 实际上限取 L2 reserve、L4 剩余预算与模型安全上限的最小值。旧 `enforce_compact_token_threshold` 配置已删除，显式设置返回迁移诊断。
+Context v11 同时冻结 model window、completion reserve、protocol overhead 与 Invocation OutputBudget；L2 在请求封存前取 Context reserve、L4 剩余预算与模型安全上限的交集，L1 按封存预算执行。旧 `enforce_compact_token_threshold` 配置已删除，显式设置返回迁移诊断。
 
 # 公告板
 公告板是一个信息存储桶，主公告板在程序启动的时候就存在，并且存储调度器和执行代理，以及更多后续启动的所有的Agent传递的消息。
@@ -1258,7 +1260,7 @@ Session 恢复遵守以下安全边界（2026-08 二期「不自动续跑」）�
 | Agent 结构体 | `internal/agent/agent.go` | `type Agent struct` |
 | ReAct 主循环 | `internal/agent/agent.go` | `processTask()` |
 | Memory 注入入口（v5） | `internal/agent/memory_context.go` | `injectMemoryContext()` |
-| Context replay 投影 | `internal/agent/history_projection.go` + `internal/contextadapter` | Raw History → Snapshot-pressure replay / ContentRef |
+| Context replay 投影 | `internal/contextruntime/history.go` + `internal/contextruntime` | Raw History → Snapshot-pressure replay / ContentRef |
 | LLMExecutor | `internal/agent/llm_executor.go` | `NewLLMExecutor()` / `Execute()` |
 | ToolRegistry | `internal/agent/registry.go` | `type ToolRegistry struct` / `NewToolRegistryWithAllowlist()` |
 

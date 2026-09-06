@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
 	"context"
 	"testing"
 
@@ -29,9 +30,9 @@ func BenchmarkRecoveryFirstActionToolPolicy(b *testing.B) {
 
 func BenchmarkRecoveryFirstActionToolPolicyAttempted(b *testing.B) {
 	registry, task := recoveryFirstActionBenchmarkFixture()
-	history := []HistoryEntry{{
+	history := []contextcontract.HistoryEntry{{
 		ToolCalls:   []llm.ToolCall{{ID: "read", Name: "read_file"}},
-		ToolResults: []ToolResult{{ToolCallID: "read", Content: "ok"}},
+		ToolResults: []contextcontract.ToolResult{{ToolCallID: "read", Content: "ok"}},
 	}}
 	b.ReportAllocs()
 	for b.Loop() {
@@ -47,11 +48,11 @@ func BenchmarkRecoveryHandoffV3MutationPolicy(b *testing.B) {
 	task.ContextInputs = []model.TaskContextInput{
 		recoveryDirectiveContextInput("recovery@1", graph.RecoveryDeltaSchemaV3, "read_file", "src/flask/app.py"),
 	}
-	history := []HistoryEntry{{
+	history := []contextcontract.HistoryEntry{{
 		ToolCalls: []llm.ToolCall{{ID: "read", Name: "read_file", Arguments: map[string]any{
 			"path": "src/flask/app.py",
 		}}},
-		ToolResults: []ToolResult{{ToolCallID: "read", Content: "file content"}},
+		ToolResults: []contextcontract.ToolResult{{ToolCallID: "read", Content: "file content"}},
 	}}
 	b.ReportAllocs()
 	for b.Loop() {

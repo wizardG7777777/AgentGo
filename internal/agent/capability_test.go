@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/testmodel"
 	"context"
 	"strings"
 	"testing"
@@ -21,11 +23,11 @@ type capMockClient struct {
 	submitResultFirstCall bool
 }
 
-func (m *capMockClient) Chat(ctx context.Context, messages []llm.Message, tools []llm.ToolDef) (llm.Response, error) {
+func (m *capMockClient) nextFixture(ctx context.Context, messages []llm.Message, tools []llm.ToolDef) (testmodel.Fixture, error) {
 	m.calls++
 	m.toolDefs = append(m.toolDefs, append([]llm.ToolDef(nil), tools...))
 	if m.submitResultFirstCall && m.calls == 1 {
-		return llm.Response{
+		return testmodel.Fixture{
 			ToolCalls: []llm.ToolCall{{
 				ID: "call-submit-1", Name: "submit_task_result",
 				Arguments: map[string]any{"status": "completed", "summary": "done"},
@@ -33,7 +35,7 @@ func (m *capMockClient) Chat(ctx context.Context, messages []llm.Message, tools 
 			FinishReason: llm.FinishReasonToolCalls,
 		}, nil
 	}
-	return llm.Response{Content: "done"}, nil
+	return testmodel.Fixture{Content: "done"}, nil
 }
 
 func newCapToolRegistry() *ToolRegistry {
@@ -64,12 +66,12 @@ func TestProcessTask_CapabilityToolFilterNarrowsLLMView(t *testing.T) {
 	s, r, _ := setup()
 	mock := &capMockClient{}
 	full := newCapToolRegistry()
-	exec := NewSwappableLLMExecutor(mock, full, nil, nil, nil, "")
+	exec := newTestSwappableLLMExecutor(t, mock, full, nil, nil, nil, "")
 
 	const agentID = "agent-cap"
 	taskID := publishAndClaim(t, s, agentID, &model.NodeCapability{Tools: []string{"read_file"}})
 
-	ag := NewAgent(agentID, "code", s, r, exec.Execute)
+	ag := NewAgent(agentID, "code", s, r, testExecutor(t, exec.Execute))
 	ag.ToolSwapper = exec
 	ag.processTask(context.Background(), taskID)
 
@@ -106,13 +108,13 @@ func TestProcessTask_CapabilityToolFilterFailClosed(t *testing.T) {
 	s, r, _ := setup()
 	mock := &capMockClient{}
 	full := newCapToolRegistry()
-	exec := NewSwappableLLMExecutor(mock, full, nil, nil, nil, "")
+	exec := newTestSwappableLLMExecutor(t, mock, full, nil, nil, nil, "")
 
 	const agentID = "agent-cap"
 	taskID := publishAndClaim(t, s, agentID,
 		&model.NodeCapability{Tools: []string{"read_file", "nonexistent_tool"}})
 
-	ag := NewAgent(agentID, "code", s, r, exec.Execute)
+	ag := NewAgent(agentID, "code", s, r, testExecutor(t, exec.Execute))
 	ag.ToolSwapper = exec
 	ag.processTask(context.Background(), taskID)
 
@@ -138,7 +140,7 @@ func TestProcessTask_CapabilityToolFilterFailClosed(t *testing.T) {
 // 无法用超集工具集降级执行一个声明了子集的任务。
 func TestProcessTask_CapabilityNilSwapperFailClosed(t *testing.T) {
 	s, r, _ := setup()
-	plainExec := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	plainExec := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "done"}, nil
 	}
 
@@ -170,7 +172,7 @@ func TestProcessTask_CapabilityModelOverrideAndRestore(t *testing.T) {
 
 	var ag *Agent
 	var seenModel string
-	exec := func(ctx context.Context, task *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	exec := func(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		seenModel = ag.Model // 执行期间读到的模型
 		return ExecuteResult{Output: "done"}, nil
 	}
@@ -231,7 +233,7 @@ func TestToolRegistry_FilteredView(t *testing.T) {
 func TestLLMExecutor_SwapToolRegistry(t *testing.T) {
 	mock := &capMockClient{}
 	full := newCapToolRegistry()
-	exec := NewSwappableLLMExecutor(mock, full, nil, nil, nil, "")
+	exec := newTestSwappableLLMExecutor(t, mock, full, nil, nil, nil, "")
 
 	if exec.ToolRegistry() != full {
 		t.Fatal("初始 registry 应为构造入参")
@@ -255,4 +257,16 @@ func TestLLMExecutor_SwapToolRegistry(t *testing.T) {
 	if got := exec.SwapToolRegistry(nil); got != full || exec.ToolRegistry() != full {
 		t.Fatal("SwapToolRegistry(nil) 应保持原 registry")
 	}
+}
+
+func (m *capMockClient) Invoke(ctx context.Context, request llm.Request, sink llm.EventSink) (llm.Result, error) {
+	if err := request.Validate(); err != nil {
+		return llm.Result{}, err
+	}
+	spec := request.Spec()
+	fixture, err := m.nextFixture(ctx, spec.Messages, spec.Tools)
+	if err != nil {
+		return llm.Result{}, err
+	}
+	return fixture.Seal(spec.Options.Protocol)
 }

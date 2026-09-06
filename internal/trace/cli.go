@@ -632,7 +632,7 @@ type statsAgg struct {
 func (a *statsAgg) total() int64 { return a.prompt + a.completion }
 
 // llmTimingStats 只聚合 llm_call_end 已实际提供的客户端里程碑。
-// 缺失字段不补零，避免把非流式调用或复用连接误算成 0ms。
+// 缺失字段不补零，避免把历史非流式记录或复用连接误算成 0ms。
 type llmTimingStats struct {
 	calls             int
 	firstResponseByte []int64
@@ -1301,7 +1301,7 @@ func formatEventDetails(ev Event) string {
 			parts = append(parts, fmt.Sprintf("sections=%q", truncate(ev.Description, 200)))
 		}
 	case KindPromptCompiled:
-		// P1a Prompt 有序编译：Build.ID + 逐组件身份摘要（不含正文）。
+		// 展示旧 Trace 的 Prompt 编译身份；新链路不再产生该事件。
 		if ev.PromptBuildID != "" {
 			parts = append(parts, fmt.Sprintf("build=%s", ev.PromptBuildID))
 		}

@@ -1,5 +1,7 @@
 package runner
 
+import "agentgo/internal/testmodel"
+
 import (
 	"context"
 	"os"
@@ -44,7 +46,7 @@ func dispatchWriteFile(registry *agent.ToolRegistry, path, content string) (stri
 func TestWrapFileWriteApproval_StrictBlocksWithoutService(t *testing.T) {
 	dir := t.TempDir()
 	registry := newWriteToolRegistry(t, dir)
-	deps := RunnerDeps{Modes: modes.NewStore(modes.ExecStrict, modes.TopoTeam)}
+	deps := RunnerDeps{Modes: modes.NewStore(modes.ExecStrict, modes.TopoTeam), ContextRuntime: testmodel.Runtime(t)}
 	wrapFileWriteApproval(registry, deps, "worker-1", nil)
 
 	target := filepath.Join(dir, "a.txt")
@@ -61,7 +63,7 @@ func TestWrapFileWriteApproval_StrictBlocksWithoutService(t *testing.T) {
 func TestWrapFileWriteApproval_NormalPassthrough(t *testing.T) {
 	dir := t.TempDir()
 	registry := newWriteToolRegistry(t, dir)
-	wrapFileWriteApproval(registry, RunnerDeps{}, "worker-1", nil)
+	wrapFileWriteApproval(registry, RunnerDeps{ContextRuntime: testmodel.Runtime(t)}, "worker-1", nil)
 
 	target := filepath.Join(dir, "a.txt")
 	out, err := dispatchWriteFile(registry, target, "hello")
@@ -82,7 +84,7 @@ func TestWrapFileWriteApproval_StrictFullCycle(t *testing.T) {
 	deps := RunnerDeps{
 		Modes:        modes.NewStore(modes.ExecStrict, modes.TopoTeam),
 		Interactions: service,
-		SessionID:    func() string { return "session-test" },
+		SessionID:    func() string { return "session-test" }, ContextRuntime: testmodel.Runtime(t),
 	}
 	wrapFileWriteApproval(registry, deps, "worker-1", nil)
 
@@ -143,7 +145,7 @@ func TestWrapFileWriteApproval_StrictFullCycle(t *testing.T) {
 // 否则 strict/yolo 对 runner 的 run_shell 不生效。
 func TestResolveToolGroups_WiresModesToShellGroup(t *testing.T) {
 	modeStore := modes.NewStore(modes.ExecYolo, modes.TopoTeam)
-	groups := resolveToolGroups("w-1", nil, RunnerDeps{Modes: modeStore}, &CurrentTaskHolder{},
+	groups := resolveToolGroups("w-1", nil, RunnerDeps{Modes: modeStore, ContextRuntime: testmodel.Runtime(t)}, &CurrentTaskHolder{},
 		agent.NewFinalizationHolder(), agent.NewSubmitState(),
 		agent.NewFileStateCache(1), &tools.DefaultWorkdir{}, nil)
 

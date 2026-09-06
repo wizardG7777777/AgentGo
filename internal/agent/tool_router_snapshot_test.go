@@ -1,6 +1,9 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/contextruntime"
+	"agentgo/internal/testmodel"
 	"context"
 	"fmt"
 	"reflect"
@@ -9,7 +12,6 @@ import (
 
 	"agentgo/internal/fulfillment"
 	"agentgo/internal/graph"
-	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
@@ -70,12 +72,12 @@ func TestSchedulerInvocationToolPolicyMovesThroughAuthoringPhases(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if choice := invocationToolChoice(initialRouter); choice.Mode != invocation.ToolChoiceAuto || choice.Name != "" {
+	if choice := invocationToolChoice(initialRouter); choice.Mode != llm.ToolChoiceAuto || choice.Name != "" {
 		t.Fatalf("draft-create 未冻结 auto-singleton ToolChoice: %+v", choice)
 	}
-	edited := deriveInvocationToolPolicy(task, []HistoryEntry{{
+	edited := deriveInvocationToolPolicy(task, []contextcontract.HistoryEntry{{
 		ToolCalls:   []llm.ToolCall{{ID: "c1", Name: "create_graph_draft"}},
-		ToolResults: []ToolResult{{ToolCallID: "c1", Content: `{"proposal_id":"p1"}`}},
+		ToolResults: []contextcontract.ToolResult{{ToolCallID: "c1", Content: `{"proposal_id":"p1"}`}},
 	}}, full)
 	if edited.Phase != "scheduler:draft-configure" ||
 		!sameExactToolSet(edited.Registry.Names(), []string{"configure_simple_graph_draft"}) {
@@ -85,27 +87,27 @@ func TestSchedulerInvocationToolPolicyMovesThroughAuthoringPhases(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if choice := invocationToolChoice(editedRouter); choice.Mode != invocation.ToolChoiceAuto || choice.Name != "" {
+	if choice := invocationToolChoice(editedRouter); choice.Mode != llm.ToolChoiceAuto || choice.Name != "" {
 		t.Fatalf("draft-configure 未冻结 auto-singleton ToolChoice: %+v", choice)
 	}
-	validate := deriveInvocationToolPolicy(task, []HistoryEntry{
-		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "create_graph_draft"}}, ToolResults: []ToolResult{{ToolCallID: "c1", Content: `{"proposal_id":"p1"}`}}},
-		{ToolCalls: []llm.ToolCall{{ID: "c2", Name: "configure_simple_graph_draft"}}, ToolResults: []ToolResult{{ToolCallID: "c2", Content: `{"draft_revision":2}`}}},
+	validate := deriveInvocationToolPolicy(task, []contextcontract.HistoryEntry{
+		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "create_graph_draft"}}, ToolResults: []contextcontract.ToolResult{{ToolCallID: "c1", Content: `{"proposal_id":"p1"}`}}},
+		{ToolCalls: []llm.ToolCall{{ID: "c2", Name: "configure_simple_graph_draft"}}, ToolResults: []contextcontract.ToolResult{{ToolCallID: "c2", Content: `{"draft_revision":2}`}}},
 	}, full)
 	if validate.Phase != "scheduler:draft-validate" || !sameExactToolSet(validate.Registry.Names(), []string{"validate_current_graph_draft"}) {
 		t.Fatalf("Draft validate phase 工具面错误: phase=%s tools=%v", validate.Phase, validate.Registry.Names())
 	}
-	commit := deriveInvocationToolPolicy(task, append([]HistoryEntry{
-		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "create_graph_draft"}}, ToolResults: []ToolResult{{ToolCallID: "c1", Content: `{"proposal_id":"p1"}`}}},
-		{ToolCalls: []llm.ToolCall{{ID: "c2", Name: "configure_simple_graph_draft"}}, ToolResults: []ToolResult{{ToolCallID: "c2", Content: `{"draft_revision":2}`}}},
-	}, HistoryEntry{ToolCalls: []llm.ToolCall{{ID: "c3", Name: "validate_graph_draft"}}, ToolResults: []ToolResult{{ToolCallID: "c3", Content: `{"accepted":true}`}}}), full)
+	commit := deriveInvocationToolPolicy(task, append([]contextcontract.HistoryEntry{
+		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "create_graph_draft"}}, ToolResults: []contextcontract.ToolResult{{ToolCallID: "c1", Content: `{"proposal_id":"p1"}`}}},
+		{ToolCalls: []llm.ToolCall{{ID: "c2", Name: "configure_simple_graph_draft"}}, ToolResults: []contextcontract.ToolResult{{ToolCallID: "c2", Content: `{"draft_revision":2}`}}},
+	}, contextcontract.HistoryEntry{ToolCalls: []llm.ToolCall{{ID: "c3", Name: "validate_graph_draft"}}, ToolResults: []contextcontract.ToolResult{{ToolCallID: "c3", Content: `{"accepted":true}`}}}), full)
 	if commit.Phase != "scheduler:draft-commit" || !sameExactToolSet(commit.Registry.Names(), []string{"commit_current_graph_draft"}) {
 		t.Fatalf("Draft commit phase 工具面错误: phase=%s tools=%v", commit.Phase, commit.Registry.Names())
 	}
-	reconfigure := deriveInvocationToolPolicy(task, []HistoryEntry{
-		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "create_graph_draft"}}, ToolResults: []ToolResult{{ToolCallID: "c1", Content: `{"proposal_id":"p1"}`}}},
-		{ToolCalls: []llm.ToolCall{{ID: "c2", Name: "configure_simple_graph_draft"}}, ToolResults: []ToolResult{{ToolCallID: "c2", Content: `{"draft_revision":2}`}}},
-		{ToolCalls: []llm.ToolCall{{ID: "c3", Name: "validate_current_graph_draft"}}, ToolResults: []ToolResult{{ToolCallID: "c3", Content: `{"accepted":false,"errors":[{"code":"EXECUTION_CLASS_MISMATCH"}]}`}}},
+	reconfigure := deriveInvocationToolPolicy(task, []contextcontract.HistoryEntry{
+		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "create_graph_draft"}}, ToolResults: []contextcontract.ToolResult{{ToolCallID: "c1", Content: `{"proposal_id":"p1"}`}}},
+		{ToolCalls: []llm.ToolCall{{ID: "c2", Name: "configure_simple_graph_draft"}}, ToolResults: []contextcontract.ToolResult{{ToolCallID: "c2", Content: `{"draft_revision":2}`}}},
+		{ToolCalls: []llm.ToolCall{{ID: "c3", Name: "validate_current_graph_draft"}}, ToolResults: []contextcontract.ToolResult{{ToolCallID: "c3", Content: `{"accepted":false,"errors":[{"code":"EXECUTION_CLASS_MISMATCH"}]}`}}},
 	}, full)
 	if reconfigure.Phase != "scheduler:draft-configure" || !sameExactToolSet(reconfigure.Registry.Names(), []string{"configure_simple_graph_draft"}) {
 		t.Fatalf("simple Validation rejection 应回到高层 configure: phase=%s tools=%v", reconfigure.Phase, reconfigure.Registry.Names())
@@ -127,7 +129,7 @@ func TestGraphDeliverablePhaseForcesSubmitTaskResult(t *testing.T) {
 	}
 	task := replayGateTask("task-deliverable", nil)
 	task.GraphID = "graph-1"
-	policy := deriveInvocationToolPolicy(task, []HistoryEntry{{SystemNotice: progressDeliverableRequiredMarker}}, full)
+	policy := deriveInvocationToolPolicy(task, []contextcontract.HistoryEntry{{SystemNotice: progressDeliverableRequiredMarker}}, full)
 	if policy.Phase != "agent:deliverable-submit" || policy.MaxCalls != defaultToolCallsPerResponse ||
 		!sameExactToolSet(policy.Registry.Names(), []string{"submit_task_result"}) {
 		t.Fatalf("deliverable phase 工具面错误: phase=%s tools=%v", policy.Phase, policy.Registry.Names())
@@ -137,37 +139,37 @@ func TestGraphDeliverablePhaseForcesSubmitTaskResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	choice := invocationToolChoice(router)
-	if choice.Mode != invocation.ToolChoiceFunction || choice.Name != "submit_task_result" {
+	if choice.Mode != llm.ToolChoiceFunction || choice.Name != "submit_task_result" {
 		t.Fatalf("deliverable phase 未冻结 exact submit: %+v", choice)
 	}
-	reopened := deriveInvocationToolPolicy(task, []HistoryEntry{
+	reopened := deriveInvocationToolPolicy(task, []contextcontract.HistoryEntry{
 		{SystemNotice: progressDeliverableRequiredMarker},
 		{ToolCalls: []llm.ToolCall{{ID: "submit", Name: "submit_task_result"}},
-			ToolResults: []ToolResult{{ToolCallID: "submit", Content: "错误: reason_code=contract_fulfillment_missing：缺少 required check verification"}}},
+			ToolResults: []contextcontract.ToolResult{{ToolCallID: "submit", Content: "错误: reason_code=contract_fulfillment_missing：缺少 required check verification"}}},
 	}, full)
 	if reopened.Phase == "agent:deliverable-submit" || !containsToolName(reopened.Registry.Names(), "read_file") {
 		t.Fatalf("可修复的 fulfillment 拒绝必须重新开放业务工具: phase=%s tools=%v",
 			reopened.Phase, reopened.Registry.Names())
 	}
-	forcedAgain := deriveInvocationToolPolicy(task, append([]HistoryEntry{
+	forcedAgain := deriveInvocationToolPolicy(task, append([]contextcontract.HistoryEntry{
 		{SystemNotice: progressDeliverableRequiredMarker},
 		{ToolCalls: []llm.ToolCall{{ID: "submit", Name: "submit_task_result"}},
-			ToolResults: []ToolResult{{ToolCallID: "submit", Content: "错误: reason_code=contract_fulfillment_missing"}}},
-	}, HistoryEntry{SystemNotice: progressDeliverableRequiredMarker}), full)
+			ToolResults: []contextcontract.ToolResult{{ToolCallID: "submit", Content: "错误: reason_code=contract_fulfillment_missing"}}},
+	}, contextcontract.HistoryEntry{SystemNotice: progressDeliverableRequiredMarker}), full)
 	if forcedAgain.Phase != "agent:deliverable-submit" {
 		t.Fatalf("后续新 verification progress 应可重新进入 exact submit: %+v", forcedAgain)
 	}
 }
 
 func TestMechanicalControlHistoryProjectionDropsHistoricalToolsButKeepsControlNotices(t *testing.T) {
-	history := []HistoryEntry{
+	history := []contextcontract.HistoryEntry{
 		{AssistantContent: "调查", ToolCalls: []llm.ToolCall{{ID: "read", Name: "read_file"}},
-			ToolResults: []ToolResult{{ToolCallID: "read", Content: "source"}}},
+			ToolResults: []contextcontract.ToolResult{{ToolCallID: "read", Content: "source"}}},
 		{SystemNotice: progressDeliverableRequiredMarker + " 请提交"},
 		{SystemNotice: "<loop-reminder>stop exploring</loop-reminder>",
 			ToolCalls: []llm.ToolCall{{ID: "grep", Name: "grep_search"}}},
 	}
-	projected := mechanicalControlHistoryProjection(history)
+	projected := contextruntime.MechanicalControlHistory(history)
 	if len(projected) != 2 || !strings.Contains(projected[0].SystemNotice, progressDeliverableRequiredMarker) ||
 		len(projected[0].ToolCalls) != 0 || len(projected[1].ToolCalls) != 0 ||
 		projected[0].AssistantContent != "" || projected[1].AssistantContent != "" {
@@ -192,14 +194,14 @@ func TestObservationCheckpointPhaseRecognizesVersionedProfiles(t *testing.T) {
 }
 
 func TestInvestigationDeliverableProjectionKeepsSettledEvidenceWithoutToolReplay(t *testing.T) {
-	history := []HistoryEntry{{
+	history := []contextcontract.HistoryEntry{{
 		AssistantContent: "不要依赖这段记忆",
 		ToolCalls: []llm.ToolCall{{ID: "read", Name: "read_file", Arguments: map[string]any{
 			"path": "src/flask/app.py", "offset": 820, "limit": 160,
 		}}},
-		ToolResults: []ToolResult{{ToolCallID: "read", Content: "def full_dispatch_request(self):\n    return self.dispatch_request()"}},
+		ToolResults: []contextcontract.ToolResult{{ToolCallID: "read", Content: "def full_dispatch_request(self):\n    return self.dispatch_request()"}},
 	}}
-	projected := investigationDeliverableHistoryProjection(history)
+	projected := contextruntime.InvestigationChronologicalHistory(history)
 	if len(projected) != 2 || len(projected[0].ToolCalls) != 0 || len(projected[0].ToolResults) != 0 ||
 		!strings.Contains(projected[0].SystemNotice, "full_dispatch_request") ||
 		!strings.Contains(projected[0].SystemNotice, `"offset":820`) ||
@@ -209,17 +211,17 @@ func TestInvestigationDeliverableProjectionKeepsSettledEvidenceWithoutToolReplay
 }
 
 func TestInvestigationDeliverableProjectionStaysBelowContextFragmentCap(t *testing.T) {
-	history := make([]HistoryEntry, 0, 20)
+	history := make([]contextcontract.HistoryEntry, 0, 20)
 	for index := 0; index < 20; index++ {
 		id := fmt.Sprintf("read-%d", index)
-		history = append(history, HistoryEntry{
+		history = append(history, contextcontract.HistoryEntry{
 			ToolCalls: []llm.ToolCall{{ID: id, Name: "read_file", Arguments: map[string]any{
 				"path": fmt.Sprintf("src/file-%d.py", index), "offset": 1, "limit": 160,
 			}}},
-			ToolResults: []ToolResult{{ToolCallID: id, Content: strings.Repeat("源码证据", 2000)}},
+			ToolResults: []contextcontract.ToolResult{{ToolCallID: id, Content: strings.Repeat("源码证据", 2000)}},
 		})
 	}
-	projected := investigationDeliverableHistoryProjection(history)
+	projected := contextruntime.InvestigationChronologicalHistory(history)
 	if len(projected) != 2 || len(projected[0].SystemNotice) >= 10<<10 {
 		t.Fatalf("investigation evidence projection 超出单 Fragment 安全预算: entries=%d bytes=%d",
 			len(projected), len(projected[0].SystemNotice))
@@ -227,22 +229,22 @@ func TestInvestigationDeliverableProjectionStaysBelowContextFragmentCap(t *testi
 }
 
 func TestInvestigationV4DeliverableProjectionPrioritizesReadsOverLateGreps(t *testing.T) {
-	history := []HistoryEntry{{
+	history := []contextcontract.HistoryEntry{{
 		ToolCalls: []llm.ToolCall{{ID: "read-test", Name: "read_file", Arguments: map[string]any{
 			"path": "tests/test_basic.py", "offset": 230, "limit": 60,
 		}}},
-		ToolResults: []ToolResult{{ToolCallID: "read-test", Content: "assert not request_ctx._session.accessed"}},
+		ToolResults: []contextcontract.ToolResult{{ToolCallID: "read-test", Content: "assert not request_ctx._session.accessed"}},
 	}}
 	for index := 0; index < 16; index++ {
 		id := fmt.Sprintf("grep-%d", index)
-		history = append(history, HistoryEntry{
+		history = append(history, contextcontract.HistoryEntry{
 			ToolCalls: []llm.ToolCall{{ID: id, Name: "grep_search", Arguments: map[string]any{
 				"path": "src/flask", "query": fmt.Sprintf("query-%d", index),
 			}}},
-			ToolResults: []ToolResult{{ToolCallID: id, Content: strings.Repeat("搜索噪声", 500)}},
+			ToolResults: []contextcontract.ToolResult{{ToolCallID: id, Content: strings.Repeat("搜索噪声", 500)}},
 		})
 	}
-	projected := investigationDeliverableHistoryProjectionV4(history)
+	projected := contextruntime.InvestigationEvidenceHistory(history)
 	if len(projected) != 2 || !strings.Contains(projected[0].SystemNotice, "request_ctx._session.accessed") ||
 		!strings.Contains(projected[0].SystemNotice, `priority="read-before-search"`) ||
 		len(projected[0].SystemNotice) >= 10<<10 {
@@ -271,20 +273,20 @@ func TestObservationCheckpointEvidenceEnumMatchesCurrentAttemptAuthority(t *test
 	task := replayGateTask("task-observation-attempt", nil)
 	task.AttemptID = task.ID + "/attempt-2"
 	task.Artifacts = []string{"old-attempt.txt"}
-	history := []HistoryEntry{
+	history := []contextcontract.HistoryEntry{
 		{TurnID: task.ID + "/attempt-1/turn-6",
 			ToolCalls:   []llm.ToolCall{{ID: "old-call", Name: "read_file"}},
-			ToolResults: []ToolResult{{ToolCallID: "old-call", Content: "ok"}}},
+			ToolResults: []contextcontract.ToolResult{{ToolCallID: "old-call", Content: "ok"}}},
 		{TurnID: task.AttemptID + "/turn-1",
 			ToolCalls:   []llm.ToolCall{{ID: "current-before", Name: "run_shell"}},
-			ToolResults: []ToolResult{{ToolCallID: "current-before", Content: "ok"}}},
+			ToolResults: []contextcontract.ToolResult{{ToolCallID: "current-before", Content: "ok"}}},
 		{TurnID: task.AttemptID + "/turn-2",
 			ToolCalls: []llm.ToolCall{{ID: "observation", Name: "record_observation_delta"}},
-			ToolResults: []ToolResult{{ToolCallID: "observation",
+			ToolResults: []contextcontract.ToolResult{{ToolCallID: "observation",
 				Content: `{"open_candidate_refs":["candidate:open"]}`}}},
 		{TurnID: task.AttemptID + "/turn-3",
 			ToolCalls:   []llm.ToolCall{{ID: "current-after", Name: "grep_search"}},
-			ToolResults: []ToolResult{{ToolCallID: "current-after", Content: "ok"}}},
+			ToolResults: []contextcontract.ToolResult{{ToolCallID: "current-after", Content: "ok"}}},
 	}
 	view := observationCheckpointRegistry(registry, task, history)
 	defs := view.Defs()
@@ -333,7 +335,7 @@ func TestObservationCheckpointFailureDetailOnlyReturnsBoundedControlError(t *tes
 			{ID: "business", Name: "read_file"},
 			{ID: "observation", Name: "record_observation_delta"},
 		},
-		ToolResults: []ToolResult{
+		ToolResults: []contextcontract.ToolResult{
 			{ToolCallID: "business", Content: "错误: 不应回显业务错误"},
 			{ToolCallID: "observation", Content: "错误: facts[0] 缺少合法 evidence_refs"},
 		},
@@ -364,9 +366,9 @@ func TestSchedulerPhaseDoesNotAdvanceOnFailedAuthoringTool(t *testing.T) {
 	}
 	task := replayGateTask("task-failed-create-phase", nil)
 	task.EventType, task.EventSource = "__scheduler__", "user"
-	policy := deriveInvocationToolPolicy(task, []HistoryEntry{{
+	policy := deriveInvocationToolPolicy(task, []contextcontract.HistoryEntry{{
 		ToolCalls:   []llm.ToolCall{{ID: "failed-create", Name: "create_graph_draft"}},
-		ToolResults: []ToolResult{{ToolCallID: "failed-create", Content: "错误: execution_class 无效"}},
+		ToolResults: []contextcontract.ToolResult{{ToolCallID: "failed-create", Content: "错误: execution_class 无效"}},
 	}}, full)
 	if policy.Phase != "scheduler:draft-create" || !sameExactToolSet(policy.Registry.Names(), []string{"create_graph_draft"}) {
 		t.Fatalf("失败 create 错误推进了 phase: phase=%s tools=%v", policy.Phase, policy.Registry.Names())
@@ -374,24 +376,24 @@ func TestSchedulerPhaseDoesNotAdvanceOnFailedAuthoringTool(t *testing.T) {
 }
 
 func TestSchedulerPhaseIgnoresProviderDuplicateSkippedResult(t *testing.T) {
-	history := []HistoryEntry{
+	history := []contextcontract.HistoryEntry{
 		{
 			ToolCalls: []llm.ToolCall{{ID: "create-1", Name: "create_graph_draft"}, {ID: "create-2", Name: "create_graph_draft"}},
-			ToolResults: []ToolResult{
+			ToolResults: []contextcontract.ToolResult{
 				{ToolCallID: "create-1", Content: `{"proposal_id":"p1"}`},
 				{ToolCallID: "create-2", Content: "已跳过：auto-singleton 阶段只执行首个工具调用"},
 			},
 		},
 		{
 			ToolCalls: []llm.ToolCall{{ID: "configure-1", Name: "configure_simple_graph_draft"}, {ID: "configure-2", Name: "configure_simple_graph_draft"}},
-			ToolResults: []ToolResult{
+			ToolResults: []contextcontract.ToolResult{
 				{ToolCallID: "configure-1", Content: `{"draft_revision":2}`},
 				{ToolCallID: "configure-2", Content: "已跳过: auto-singleton duplicate"},
 			},
 		},
 		{
 			ToolCalls: []llm.ToolCall{{ID: "validate-1", Name: "validate_current_graph_draft"}, {ID: "validate-2", Name: "validate_current_graph_draft"}},
-			ToolResults: []ToolResult{
+			ToolResults: []contextcontract.ToolResult{
 				{ToolCallID: "validate-1", Content: `{"accepted":true}`},
 				{ToolCallID: "validate-2", Content: "已跳过：auto-singleton duplicate"},
 			},
@@ -423,9 +425,9 @@ func TestLoopInterventionWakeStartsFreshAuthoringTransaction(t *testing.T) {
 	if initial.Phase != "scheduler:draft-create" || !sameExactToolSet(initial.Registry.Names(), []string{"create_graph_draft"}) {
 		t.Fatalf("intervention wake 未从新 Draft transaction 开始: phase=%s tools=%v", initial.Phase, initial.Registry.Names())
 	}
-	edited := deriveInvocationToolPolicy(task, []HistoryEntry{{
+	edited := deriveInvocationToolPolicy(task, []contextcontract.HistoryEntry{{
 		ToolCalls:   []llm.ToolCall{{ID: "create", Name: "create_graph_draft"}},
-		ToolResults: []ToolResult{{ToolCallID: "create", Content: `{"proposal_id":"p1"}`}},
+		ToolResults: []contextcontract.ToolResult{{ToolCallID: "create", Content: `{"proposal_id":"p1"}`}},
 	}}, full)
 	if edited.Phase != "scheduler:draft-configure" || !sameExactToolSet(edited.Registry.Names(), []string{"configure_simple_graph_draft"}) {
 		t.Fatalf("intervention authoring phase 未按历史推进: phase=%s tools=%v", edited.Phase, edited.Registry.Names())
@@ -490,17 +492,17 @@ func TestGraphChangeNoChangeDecisionRequiresSuccessfulGraphRead(t *testing.T) {
 	if initial.Phase != "scheduler:recovery" || containsToolName(initial.Registry.Names(), "submit_graph_change_decision") {
 		t.Fatalf("读取 Graph 前不得开放 no_change 收口: phase=%s tools=%v", initial.Phase, initial.Registry.Names())
 	}
-	read := []HistoryEntry{{
+	read := []contextcontract.HistoryEntry{{
 		ToolCalls:   []llm.ToolCall{{ID: "read-1", Name: "read_graph", Arguments: map[string]any{"graph_id": "g-1"}}},
-		ToolResults: []ToolResult{{ToolCallID: "read-1", Content: `{"graph_id":"g-1","status":"failed"}`}},
+		ToolResults: []contextcontract.ToolResult{{ToolCallID: "read-1", Content: `{"graph_id":"g-1","status":"failed"}`}},
 	}}
 	afterRead := deriveInvocationToolPolicy(task, read, full)
 	if !containsToolName(afterRead.Registry.Names(), "submit_graph_change_decision") {
 		t.Fatalf("成功 read_graph 后应开放结构化 no_change 收口: %v", afterRead.Registry.Names())
 	}
-	failedRead := []HistoryEntry{{
+	failedRead := []contextcontract.HistoryEntry{{
 		ToolCalls:   []llm.ToolCall{{ID: "read-2", Name: "read_graph"}},
-		ToolResults: []ToolResult{{ToolCallID: "read-2", Content: "错误: scope mismatch"}},
+		ToolResults: []contextcontract.ToolResult{{ToolCallID: "read-2", Content: "错误: scope mismatch"}},
 	}}
 	if policy := deriveInvocationToolPolicy(task, failedRead, full); containsToolName(policy.Registry.Names(), "submit_graph_change_decision") {
 		t.Fatalf("失败 read_graph 不得开放 no_change 收口: %v", policy.Registry.Names())
@@ -523,7 +525,7 @@ func TestObservationCheckpointAndFinalReportUseClosedToolPhases(t *testing.T) {
 		t.Fatal("缺少 code-change/v4")
 	}
 	worker.ProgressContract = &v4.Contract
-	observation := deriveInvocationToolPolicy(worker, []HistoryEntry{{SystemNotice: observationCheckpointNotice("rollover", "冻结观察")}}, full)
+	observation := deriveInvocationToolPolicy(worker, []contextcontract.HistoryEntry{{SystemNotice: observationCheckpointNotice("rollover", "冻结观察")}}, full)
 	if observation.Phase != "agent:observation-checkpoint" ||
 		observation.MaxCalls != defaultToolCallsPerResponse ||
 		!sameExactToolSet(observation.Registry.Names(), []string{"record_observation_delta"}) {
@@ -533,7 +535,7 @@ func TestObservationCheckpointAndFinalReportUseClosedToolPhases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if choice := invocationToolChoice(router); choice.Mode != invocation.ToolChoiceFunction || choice.Name != "record_observation_delta" {
+	if choice := invocationToolChoice(router); choice.Mode != llm.ToolChoiceFunction || choice.Name != "record_observation_delta" {
 		t.Fatalf("Observation checkpoint Control lane 必须 exact typed action: %+v", choice)
 	}
 	if reasoningEffort, override := phaseReasoningEffortOverride(router.Phase); !override || reasoningEffort != "none" {
@@ -552,7 +554,7 @@ func TestObservationCheckpointAndFinalReportUseClosedToolPhases(t *testing.T) {
 	acceptance.GraphNodeKind = string(graph.KindAcceptance)
 	acceptance.ProgressContract = &verification.Contract
 	business := full.Filtered([]string{"read_file", "submit_task_result"})
-	executor := NewSwappableLLMExecutor(nil, full, nil, nil, nil, "")
+	executor := newTestSwappableLLMExecutor(t, nil, full, nil, nil, nil, "")
 	executor.SwapToolRegistry(business)
 	businessView, frameworkAuthority := executor.invocationToolRegistries()
 	normal := deriveInvocationToolPolicyWithControl(acceptance, nil, businessView, frameworkAuthority)
@@ -560,14 +562,14 @@ func TestObservationCheckpointAndFinalReportUseClosedToolPhases(t *testing.T) {
 		t.Fatalf("Acceptance 普通业务轮不得泄露 Observation control: phase=%s tools=%v", normal.Phase, normal.Registry.Names())
 	}
 	checkpoint := deriveInvocationToolPolicyWithControl(acceptance,
-		[]HistoryEntry{{SystemNotice: observationCheckpointNotice("periodic", "冻结观察")}}, businessView, frameworkAuthority)
+		[]contextcontract.HistoryEntry{{SystemNotice: observationCheckpointNotice("periodic", "冻结观察")}}, businessView, frameworkAuthority)
 	if checkpoint.Phase != "agent:observation-checkpoint" ||
 		!sameExactToolSet(checkpoint.Registry.Names(), []string{"record_observation_delta"}) {
 		t.Fatalf("Acceptance checkpoint 必须从 framework authority 取得 exact control tool: phase=%s tools=%v",
 			checkpoint.Phase, checkpoint.Registry.Names())
 	}
 
-	failures := []HistoryEntry{
+	failures := []contextcontract.HistoryEntry{
 		{SystemNotice: observationCheckpointNotice("periodic", "冻结观察")},
 		{SystemNotice: observationCheckpointFailureMarker + " provider response gate 失败"},
 		{SystemNotice: observationCheckpointFailureMarker + " 参数修正失败"},
@@ -593,21 +595,21 @@ func TestObservationCheckpointAndFinalReportUseClosedToolPhases(t *testing.T) {
 		t.Fatalf("final-report 普通工具面错误: phase=%s tools=%v", finalReportNormal.Phase, finalReportNormal.Registry.Names())
 	}
 	withForeignMarker := deriveInvocationToolPolicy(report,
-		[]HistoryEntry{{SystemNotice: observationCheckpointNotice("continue", "不应作用于 final-report")}}, full)
+		[]contextcontract.HistoryEntry{{SystemNotice: observationCheckpointNotice("continue", "不应作用于 final-report")}}, full)
 	if withForeignMarker.Phase != "scheduler:final-report" ||
 		!sameExactToolSet(withForeignMarker.Registry.Names(), wantNormal) {
 		t.Fatalf("final-report 结构化 scope 必须压过无关 Observation marker: phase=%s tools=%v",
 			withForeignMarker.Phase, withForeignMarker.Registry.Names())
 	}
-	forced := deriveInvocationToolPolicy(report, []HistoryEntry{{SystemNotice: progressDeliverableRequiredMarker}}, full)
+	forced := deriveInvocationToolPolicy(report, []contextcontract.HistoryEntry{{SystemNotice: progressDeliverableRequiredMarker}}, full)
 	if forced.Phase != "scheduler:final-report-submit" ||
 		!sameExactToolSet(forced.Registry.Names(), []string{"report_done"}) {
 		t.Fatalf("final-report 强制交付未收窄: phase=%s tools=%v", forced.Phase, forced.Registry.Names())
 	}
-	forcedAfterReads := deriveInvocationToolPolicy(report, []HistoryEntry{
+	forcedAfterReads := deriveInvocationToolPolicy(report, []contextcontract.HistoryEntry{
 		{ToolCalls: []llm.ToolCall{{ID: "read-1", Name: "read_graph"}}},
 		{ToolCalls: []llm.ToolCall{{ID: "read-2", Name: "get_task_result"}},
-			ToolResults: []ToolResult{{ToolCallID: "read-2", Content: "[工具错误] 缺少 agent_id"}}},
+			ToolResults: []contextcontract.ToolResult{{ToolCallID: "read-2", Content: "[工具错误] 缺少 agent_id"}}},
 	}, full)
 	if forcedAfterReads.Phase != "scheduler:final-report-submit" ||
 		!sameExactToolSet(forcedAfterReads.Registry.Names(), []string{"report_done"}) {
@@ -636,7 +638,7 @@ func TestOrdinaryBusinessPhaseRemovesFrameworkObservationToolFromUnion(t *testin
 		t.Fatalf("普通业务 ToolRouter 未剔除 framework Observation control: %v", ordinary.Registry.Names())
 	}
 	checkpoint := deriveInvocationToolPolicyWithControl(task,
-		[]HistoryEntry{{SystemNotice: observationCheckpointNotice("periodic", "checkpoint")}}, registry, registry)
+		[]contextcontract.HistoryEntry{{SystemNotice: observationCheckpointNotice("periodic", "checkpoint")}}, registry, registry)
 	if !sameExactToolSet(checkpoint.Registry.Names(), []string{"record_observation_delta"}) {
 		t.Fatalf("checkpoint control lane 被 normal 过滤误伤: %v", checkpoint.Registry.Names())
 	}
@@ -671,16 +673,16 @@ func TestRunCheckSchemaFreezesCurrentTaskRequiredCheckIDs(t *testing.T) {
 }
 
 func TestBusinessHistoryProjectionDropsObservationControlLane(t *testing.T) {
-	history := []HistoryEntry{
+	history := []contextcontract.HistoryEntry{
 		{TurnID: "business-1", AssistantContent: "调查", ToolCalls: []llm.ToolCall{{ID: "r", Name: "read_file"}}},
 		{TurnID: "control-1", ToolCalled: true,
 			ToolCalls:   []llm.ToolCall{{ID: "o", Name: "record_observation_delta"}},
-			ToolResults: []ToolResult{{ToolCallID: "o", Content: `{"observation_delta_ref":"observation:sha256:x"}`}}},
+			ToolResults: []contextcontract.ToolResult{{ToolCallID: "o", Content: `{"observation_delta_ref":"observation:sha256:x"}`}}},
 		{TurnID: "business-2", AssistantContent: "继续实现"},
 	}
-	projected := businessHistoryProjection(history)
+	projected := contextruntime.BusinessHistory(history)
 	if len(projected) != 3 || projected[0].TurnID != "business-1" ||
-		projected[1].ContextProjection != observationProjectionPrefix+"observation:sha256:x" ||
+		projected[1].ContextProjection != "observation:"+"observation:sha256:x" ||
 		projected[2].TurnID != "business-2" {
 		t.Fatalf("业务 replay 必须用不可见锚点替代 Observation Control lane: %+v", projected)
 	}
@@ -688,7 +690,7 @@ func TestBusinessHistoryProjectionDropsObservationControlLane(t *testing.T) {
 
 func TestSchedulerAutoSingletonBatchDispatchesOnlyFirstCall(t *testing.T) {
 	runtime := newAgentTestContextRuntime(t)
-	mock := &mockLLMClient{responses: []llm.Response{{ToolCalls: []llm.ToolCall{
+	mock := &mockLLMClient{responses: []testmodel.Fixture{{ToolCalls: []llm.ToolCall{
 		{ID: "c1", Name: "create_graph_draft", Arguments: map[string]any{}},
 		{ID: "c2", Name: "create_graph_draft", Arguments: map[string]any{}},
 	}}}}
@@ -698,12 +700,12 @@ func TestSchedulerAutoSingletonBatchDispatchesOnlyFirstCall(t *testing.T) {
 		runs++
 		return "created", nil
 	})
-	executor := NewSwappableLLMExecutor(mock, registry, nil, nil, nil, "", "Scheduler")
+	executor := newTestSwappableLLMExecutor(t, mock, registry, nil, nil, nil, "", "Scheduler")
 	executor.SetContextRuntime(runtime)
 	task := replayGateTask("task-scheduler-batch", []string{"create_graph_draft"})
 	task.EventType, task.EventSource = "__scheduler__", "user"
 	ctx := WithExecutionIdentity(context.Background(), string(task.RunID), task.AttemptID, task.AttemptID+"/turn-1")
-	result, err := executor.Execute(ctx, task, nil, nil)
+	result, err := executeTestStep(t, executor.Execute, ctx, task, nil, nil, llm.DefaultOutputBudget())
 	if err != nil {
 		t.Fatalf("auto-singleton provider fan-out 不应被拒绝: %v", err)
 	}
@@ -747,9 +749,9 @@ func TestObservationV4MutationCommitmentGatesNextBusinessAction(t *testing.T) {
 		func(context.Context, map[string]any) (string, error) { return "ok", nil })
 	task := &model.Task{ID: "observation-commit", AttemptID: "observation-commit/attempt-1",
 		GraphID: "graph-1", GraphNodeKind: string(graph.KindAgent)}
-	history := []HistoryEntry{{TurnID: task.AttemptID + "/turn-1", ToolCalled: true,
+	history := []contextcontract.HistoryEntry{{TurnID: task.AttemptID + "/turn-1", ToolCalled: true,
 		ToolCalls:   []llm.ToolCall{{ID: "obs", Name: "record_observation_delta"}},
-		ToolResults: []ToolResult{{ToolCallID: "obs", Content: `{"schema":"agentgo.observation-delta/v4","next_action":{"decision":"mutate","mutation":{"tool":"edit_file","path":"src/a.py"}}}`}},
+		ToolResults: []contextcontract.ToolResult{{ToolCallID: "obs", Content: `{"schema":"agentgo.observation-delta/v4","next_action":{"decision":"mutate","mutation":{"tool":"edit_file","path":"src/a.py"}}}`}},
 	}}
 	policy := deriveInvocationToolPolicyWithControl(task, history, registry, registry)
 	if policy.Phase != "agent:observation-commitment" ||
@@ -764,9 +766,9 @@ func TestObservationV4MutationCommitmentGatesNextBusinessAction(t *testing.T) {
 		Arguments: map[string]any{"path": "src/b.py"}}); err == nil {
 		t.Fatal("mutation commitment 必须在 dispatch 前拒绝其它路径")
 	}
-	history = append(history, HistoryEntry{TurnID: task.AttemptID + "/turn-2", ToolCalled: true,
+	history = append(history, contextcontract.HistoryEntry{TurnID: task.AttemptID + "/turn-2", ToolCalled: true,
 		ToolCalls:   []llm.ToolCall{{ID: "edit", Name: "edit_file", Arguments: map[string]any{"path": "src/a.py"}}},
-		ToolResults: []ToolResult{{ToolCallID: "edit", Content: "编辑成功"}}})
+		ToolResults: []contextcontract.ToolResult{{ToolCallID: "edit", Content: "编辑成功"}}})
 	policy = deriveInvocationToolPolicyWithControl(task, history, registry, registry)
 	if policy.Phase == "agent:observation-commitment" || !containsToolName(policy.Registry.Names(), "read_file") {
 		t.Fatalf("commitment 完成后应恢复普通业务工具: phase=%s tools=%v", policy.Phase, policy.Registry.Names())
@@ -799,7 +801,7 @@ func TestObservationV8UsesAutoLowAndEmptyAuthoritySchemaIsLegal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if choice := invocationToolChoice(router); choice.Mode != invocation.ToolChoiceAuto {
+	if choice := invocationToolChoice(router); choice.Mode != llm.ToolChoiceAuto {
 		t.Fatalf("v8 Observation 应使用 auto: %+v", choice)
 	}
 	if effort, ok := phaseReasoningEffortOverride(router.Phase); !ok || effort != "low" {

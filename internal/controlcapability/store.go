@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"agentgo/internal/invocation"
+	"agentgo/internal/llm"
 )
 
 const SchemaV1 = "agentgo.control-capability/v1"
@@ -102,11 +102,11 @@ func (s *Store) Incompatible(key Key) (Record, bool) {
 }
 
 // Mark records only deterministic request/protocol incompatibility.
-func (s *Store) Mark(key Key, failure *invocation.Failure) (bool, error) {
+func (s *Store) Mark(key Key, failure *llm.Failure) (bool, error) {
 	if s == nil || failure == nil {
 		return false, nil
 	}
-	if failure.Kind != invocation.FailureInvalidRequest && failure.Kind != invocation.FailureProtocolIncompatible {
+	if failure.Kind != llm.FailureInvalidRequest && failure.Kind != llm.FailureProtocolIncompatible {
 		return false, nil
 	}
 	if err := key.Validate(); err != nil {

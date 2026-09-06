@@ -3,7 +3,7 @@ package bootstrap
 // runtime_builder.go 实现 nextUpgrade_v4.md §11.6.1 中提到的几个合成函数：
 //   - buildAgentRuntime：从 AgentKind + LLMConfig 合成 AgentRuntimeConfig
 //   - buildSchedulerRuntime：scheduler 路径的同名函数
-//   - buildKindLLMClient：基于 LLMConfig 与 kind.Model 合并值构造 llm.Client
+//   - buildKindLLMClient：基于 LLMConfig 与 kind.Model 合并值构造 llm.Invoker
 //   - resolveDependencies：按 AllowedTools 决定该 runner 需要哪些 deps（当前简化版
 //     由 RunnerDeps 一并提供，未来可按工具收紧）
 //
@@ -22,37 +22,14 @@ import (
 	"agentgo/internal/workspace"
 )
 
-// buildKindLLMClient 基于 LLMConfig 与 per-kind model 覆盖值构造 llm.Client。
+// buildKindLLMClient 基于 LLMConfig 与 per-kind model 覆盖值构造 llm.Invoker。
 // kindModel 为空字符串时回落 LLMConfig.DefaultModel——这是 v4 §11.4 注释中
 // "Model 缺省回落 LLM.DefaultModel" 的实际落地点。
 //
 // 请求协议由 llm.protocol 冻结：Responses 为新主链，Chat Completions 为显式
 // 兼容；不再按 provider 名称分支。llm.provider 在 Validate 中拒绝。
-func buildKindLLMClient(llmCfg config.LLMConfig, kindModel string) llm.Client {
-	model := kindModel
-	if model == "" {
-		model = llmCfg.DefaultModel
-	}
-	timeout := time.Duration(llmCfg.TimeoutSec) * time.Second
-	if timeout <= 0 {
-		timeout = 60 * time.Second
-	}
-	protocol := llm.Protocol(llmCfg.Protocol)
-	if protocol == "" {
-		protocol = llm.ProtocolResponses
-	}
-	return llm.NewSDKClientWithConfig(
-		llmCfg.BaseURL,
-		llmCfg.APIKey,
-		model,
-		"", // system prompt 由 runner / scheduler 自管，不在 client 层注入
-		timeout,
-		llm.ClientConfig{
-			Protocol:        protocol,
-			ReasoningEffort: llmCfg.ReasoningEffort,
-			Stream:          llmCfg.Stream,
-		},
-	)
+func buildKindLLMClient(llmCfg config.LLMConfig, kindModel string) llm.Invoker {
+ return llm.NewTransport(llm.TransportConfig{BaseURL:llmCfg.BaseURL,APIKey:llmCfg.APIKey,Timeout:time.Duration(llmCfg.TimeoutSec)*time.Second})
 }
 
 // buildAgentRuntime 从 AgentKind 声明 + LLMConfig 默认值合成 AgentRuntimeConfig。

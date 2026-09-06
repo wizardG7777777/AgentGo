@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"context"
 	"strings"
 	"testing"
@@ -31,7 +33,7 @@ func runStructuredSubmission(t *testing.T, task *model.Task, sub *StructuredSubm
 	}
 
 	state := NewSubmitState()
-	executor := func(_ context.Context, tk *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+	executor := func(_ context.Context, tk *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		// 模拟 submit_task_result 工具：Put 结构化提交；finalized 标志由
 		// flipFinalizationChecker 在下一轮 loop 顶部提供。
 		sub.TaskID = tk.ID

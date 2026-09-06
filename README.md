@@ -1,3 +1,5 @@
+> **L1/L2 重建（2026-09-07）**：L2 装配完整请求，L1 执行 SSE 与归一化响应；旧请求/配置/历史不转换。当前实现与验证边界以 [五层规范](docs/design/five-layer-engineering-architecture.md) 为准。
+
 # AgentGo
 
 AgentGo 是一个 Go 1.25 编写的多 Agent 编排系统。Scheduler 接收用户输入，按需组建或使用预热的 Agent Team，以持久化 Graph 编排执行任务，验收结论由 Graph acceptance 节点给出。

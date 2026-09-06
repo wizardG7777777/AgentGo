@@ -1,6 +1,7 @@
 package config
 
 import (
+	"agentgo/internal/llm"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -17,8 +18,9 @@ const (
 // ModelCapabilityConfig 是按精确模型名声明的上下文能力。它只描述模型容量，
 // 不按 provider 名称推断 wire 行为。
 type ModelCapabilityConfig struct {
-	ContextWindowTokens int64 `yaml:"context_window_tokens" json:"context_window_tokens"`
-	MaxCompletionTokens int64 `yaml:"max_completion_tokens" json:"max_completion_tokens"`
+	Input               llm.InputCapability `yaml:"input" json:"input"`
+	ContextWindowTokens int64               `yaml:"context_window_tokens" json:"context_window_tokens"`
+	MaxCompletionTokens int64               `yaml:"max_completion_tokens" json:"max_completion_tokens"`
 }
 
 // ResolvedModelCapability 是启动期解析并冻结进 ExecutionLease 的能力事实。
@@ -73,6 +75,9 @@ func (c LLMConfig) validateModelCapabilities() error {
 			return fmt.Errorf("llm.model_capabilities 不得包含空模型名")
 		}
 		override := c.ModelCapabilities[model]
+		if err := override.Input.Validate(); err != nil {
+			return fmt.Errorf("模型输入能力无效: %w", err)
+		}
 		base := c
 		base.ModelCapabilities = map[string]ModelCapabilityConfig{model: override}
 		if _, err := base.ResolveModelCapability(model); err != nil {
@@ -91,4 +96,13 @@ func validateModelCapability(model string, window, completion int64) error {
 			model, window, completion, ProtocolOverheadTokens)
 	}
 	return nil
+}
+
+// InvocationOptions 将配置默认值解析成 L2 的显式执行规格。
+func (c LLMConfig) InvocationOptions(model string) llm.Options {
+	if model == "" {
+		model = c.DefaultModel
+	}
+	cap, _ := c.ResolveModelCapability(model)
+	return llm.Options{Protocol: llm.Protocol(c.Protocol), Model: model, CapabilityDigest: cap.Digest, ProfileRef: "business", ReasoningEffort: c.ReasoningEffort, ToolChoice: llm.ToolChoice{Mode: llm.ToolChoiceAuto}, OutputBudget: llm.DefaultOutputBudget(), InputCapability: c.ModelCapabilities[model].Input}
 }

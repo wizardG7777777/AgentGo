@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"context"
 	"errors"
 	"strings"
@@ -105,7 +107,7 @@ func TestFinalizationShortCircuitConsumesSubmitState(t *testing.T) {
 	}
 
 	state := NewSubmitState()
-	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		// 模拟 submit_task_result 工具：校验通过后 Put 结构化提交；
 		// finalized 标志由 flipFinalizationChecker 在下一轮 loop 顶部提供。
 		state.Put(&StructuredSubmission{
@@ -173,7 +175,7 @@ func TestFinalizationShortCircuitWritesGraphEventResult(t *testing.T) {
 	}
 
 	state := NewSubmitState()
-	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		state.Put(&StructuredSubmission{TaskID: task.ID, Summary: "材料已就绪", Event: "ready"})
 		return ExecuteResult{Output: "progress", ToolCalled: true}, nil
 	}
@@ -214,7 +216,7 @@ func TestFinalizationShortCircuitWritesStructuredResultCarrier(t *testing.T) {
 	}
 
 	state := NewSubmitState()
-	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		state.Put(&StructuredSubmission{
 			TaskID: task.ID, Summary: "覆盖度已裁决",
 			ResultJSON: `{"coverage":"gap","metrics":{"score":2,"ready":true}}`,
@@ -257,7 +259,7 @@ func TestFinalizationShortCircuitStructuredFieldsFailClosed(t *testing.T) {
 	}
 
 	state := NewSubmitState()
-	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		state.Put(&StructuredSubmission{
 			TaskID: task.ID, Summary: "覆盖度已裁决", Event: "ready",
 			ResultJSON: `{"coverage":"gap"}`,
@@ -307,7 +309,7 @@ func TestFinalizationShortCircuitStructuredBlockedCommitFailClosed(t *testing.T)
 	}
 
 	state := NewSubmitState()
-	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		state.Put(&StructuredSubmission{
 			TaskID: task.ID, Summary: "缺少目录", Status: SubmitStatusBlocked,
 			BlockedReason: "上游未提供目录", ResultJSON: `{"missing":"catalog"}`,
@@ -357,7 +359,7 @@ func TestFinalizationShortCircuitWritesVerdictResult(t *testing.T) {
 	}
 
 	state := NewSubmitState()
-	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		state.Put(&StructuredSubmission{TaskID: task.ID, Summary: "验收完成", Verdict: "pass"})
 		return ExecuteResult{Output: "progress", ToolCalled: true}, nil
 	}
@@ -400,7 +402,7 @@ func TestFinalizationShortCircuitWithoutSubmissionKeepsCompatBehavior(t *testing
 		t.Fatalf("ClaimTask: %v", err)
 	}
 
-	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "progress output", ToolCalled: true}, nil
 	}
 	ag := NewAgent(agentID, "code", s, r, executor)
@@ -454,7 +456,7 @@ func TestFinalizationShortCircuitWritesEvidenceResult(t *testing.T) {
 
 	const cited = "ev:task-impl:1, ev:task-impl:2"
 	state := NewSubmitState()
-	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+	executor := func(_ context.Context, task *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		state.Put(&StructuredSubmission{TaskID: task.ID, Summary: "验收完成", Verdict: "pass", CitedEvidence: cited})
 		return ExecuteResult{Output: "progress", ToolCalled: true}, nil
 	}

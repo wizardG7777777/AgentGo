@@ -6,6 +6,8 @@ package agent
 // 迁移，禁止自动重放，冲突走 replan）。
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"context"
 	"os"
 	"path/filepath"
@@ -42,7 +44,7 @@ func TestProcessTask_IsolationMergeEffectJournal(t *testing.T) {
 	taskID := publishIsolationTask(t, s, agentID)
 	target := filepath.Join(mainRoot, "out.txt")
 
-	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		wsPath, err := swapper.WritePath(target)
 		if err != nil {
 			t.Errorf("WritePath: %v", err)
@@ -109,7 +111,7 @@ func TestProcessTask_IsolationMergeConflictEffectJournal(t *testing.T) {
 	const agentID = "agent-iso"
 	taskID := publishIsolationTask(t, s, agentID)
 
-	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	exec := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "done"}, nil
 	}
 	ag := NewAgent(agentID, "code", s, r, exec)
@@ -152,7 +154,7 @@ func TestProcessTask_IsolationMergePrepareFailureStopsMerge(t *testing.T) {
 	taskID := publishIsolationTask(t, s, "agent-iso")
 
 	ag := NewAgent("agent-iso", "code", s, r,
-		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+		func(context.Context, *model.Task, map[string]string, []contextcontract.HistoryEntry, llm.OutputBudget) (ExecuteResult, error) {
 			return ExecuteResult{Output: "done"}, nil
 		})
 	ag.WorkspaceManager = mgr
@@ -214,7 +216,7 @@ func TestProcessTask_IsolationMergeSettleFailureIsAuthorityFailure(t *testing.T)
 	target := filepath.Join(mainRoot, "settle-failed.txt")
 
 	ag := NewAgent("agent-iso", "code", s, r,
-		func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+		func(context.Context, *model.Task, map[string]string, []contextcontract.HistoryEntry, llm.OutputBudget) (ExecuteResult, error) {
 			wsPath, err := swapper.WritePath(target)
 			if err != nil {
 				return ExecuteResult{}, err

@@ -1,6 +1,7 @@
 package agent
 
 import (
+ "agentgo/internal/contextcontract"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -54,7 +55,7 @@ type recoveryCheckState struct {
 }
 
 func recoveryV4ActionRegistry(business, frameworkControl *ToolRegistry, task *model.Task,
-	directive recoveryDirective, history []HistoryEntry) (*ToolRegistry, recoveryActionGate, bool) {
+	directive recoveryDirective, history []contextcontract.HistoryEntry) (*ToolRegistry, recoveryActionGate, bool) {
 	checkContract := recoveryRequiredCheckContract(task)
 	checkState := latestRecoveryCheckState(history, strings.TrimSpace(checkContract.CheckID))
 	if checkState.Status == "pass" {
@@ -118,7 +119,7 @@ func recoveryV4ActionRegistry(business, frameworkControl *ToolRegistry, task *mo
 // edit/resume_candidate/need_context/安全退出；need_context 再新增一个 focus
 // 文件。v4 的全文件语义保持不变。
 func recoveryV5ActionRegistry(business, frameworkControl *ToolRegistry, task *model.Task,
-	directive recoveryDirective, history []HistoryEntry) (*ToolRegistry, recoveryActionGate, bool) {
+	directive recoveryDirective, history []contextcontract.HistoryEntry) (*ToolRegistry, recoveryActionGate, bool) {
 	checkContract := recoveryRequiredCheckContract(task)
 	checkState := latestRecoveryCheckState(history, strings.TrimSpace(checkContract.CheckID))
 	if checkState.Status == "pass" {
@@ -172,7 +173,7 @@ func recoveryV5CheckGate(business *ToolRegistry, directive recoveryDirective,
 		checkContract.Kind, checkContract.ExactCommand)
 }
 
-func recoveryV5EvidenceRequirements(directive recoveryDirective, history []HistoryEntry) []recoveryEvidenceRequirement {
+func recoveryV5EvidenceRequirements(directive recoveryDirective, history []contextcontract.HistoryEntry) []recoveryEvidenceRequirement {
 	out := make([]recoveryEvidenceRequirement, 0, graph.MaxRecoveryEvidenceFiles)
 	seen := make(map[string]struct{}, graph.MaxRecoveryEvidenceFiles)
 	add := func(raw string, offset, limit, at int) {
@@ -210,7 +211,7 @@ func recoveryV5EvidenceRequirements(directive recoveryDirective, history []Histo
 	return out
 }
 
-func recoveryV5FocusPageProgress(history []HistoryEntry, requirement recoveryEvidenceRequirement) recoveryEvidenceProgress {
+func recoveryV5FocusPageProgress(history []contextcontract.HistoryEntry, requirement recoveryEvidenceRequirement) recoveryEvidenceProgress {
 	failed := false
 	for entryIndex, entry := range history {
 		if entryIndex <= requirement.AddedAt {
@@ -249,7 +250,7 @@ func recoveryV5FocusPageProgress(history []HistoryEntry, requirement recoveryEvi
 	return recoveryEvidenceProgress{Failed: failed}
 }
 
-func recoveryEvidenceRequirements(directive recoveryDirective, history []HistoryEntry) []recoveryEvidenceRequirement {
+func recoveryEvidenceRequirements(directive recoveryDirective, history []contextcontract.HistoryEntry) []recoveryEvidenceRequirement {
 	out := make([]recoveryEvidenceRequirement, 0, graph.MaxRecoveryEvidenceFiles)
 	seen := make(map[string]struct{}, graph.MaxRecoveryEvidenceFiles)
 	add := func(raw string, at int) {
@@ -287,7 +288,7 @@ func recoveryEvidenceRequirements(directive recoveryDirective, history []History
 	return out
 }
 
-func recoveryEvidenceFileProgress(history []HistoryEntry, requirement recoveryEvidenceRequirement) recoveryEvidenceProgress {
+func recoveryEvidenceFileProgress(history []contextcontract.HistoryEntry, requirement recoveryEvidenceRequirement) recoveryEvidenceProgress {
 	after := requirement.AddedAt
 	for entryIndex, entry := range history {
 		if entryIndex <= after {
@@ -393,7 +394,7 @@ func parseRecoveryReadSegment(result string) (recoveryReadSegment, bool) {
 	return segment, segment.Start > 0 && segment.CoveredEnd >= segment.Start && segment.Total >= segment.CoveredEnd
 }
 
-func recoveryContentRefProgress(history []HistoryEntry, after int, refID, digest string) (bool, int64, bool) {
+func recoveryContentRefProgress(history []contextcontract.HistoryEntry, after int, refID, digest string) (bool, int64, bool) {
 	nextOffset := int64(0)
 	failed := false
 	for entryIndex, entry := range history {
@@ -435,7 +436,7 @@ func recoveryContentRefProgress(history []HistoryEntry, after int, refID, digest
 	return false, nextOffset, failed
 }
 
-func latestRecoveryChangeDecision(history []HistoryEntry, after int, recoverySchema string) recoveryChangeDecision {
+func latestRecoveryChangeDecision(history []contextcontract.HistoryEntry, after int, recoverySchema string) recoveryChangeDecision {
 	var latest recoveryChangeDecision
 	latest.Entry = -1
 	for entryIndex, entry := range history {
@@ -467,7 +468,7 @@ func latestRecoveryChangeDecision(history []HistoryEntry, after int, recoverySch
 	return latest
 }
 
-func nextRecoveryEditStep(history []HistoryEntry, decision recoveryChangeDecision) (graph.RecoveryEditStep, bool) {
+func nextRecoveryEditStep(history []contextcontract.HistoryEntry, decision recoveryChangeDecision) (graph.RecoveryEditStep, bool) {
 	next := 0
 	for entryIndex, entry := range history {
 		if entryIndex <= decision.Entry || next >= len(decision.EditSteps) {
@@ -491,7 +492,7 @@ func nextRecoveryEditStep(history []HistoryEntry, decision recoveryChangeDecisio
 	return decision.EditSteps[next], true
 }
 
-func latestRecoveryCheckState(history []HistoryEntry, checkID string) recoveryCheckState {
+func latestRecoveryCheckState(history []contextcontract.HistoryEntry, checkID string) recoveryCheckState {
 	state := recoveryCheckState{Entry: -1}
 	if checkID == "" {
 		return state
@@ -548,7 +549,7 @@ func recoveryContentRefGate(registry *ToolRegistry, directive recoveryDirective,
 	view := registry.Filtered([]string{"read_content_ref"})
 	view = view.WithDefinitionParameters("read_content_ref", func(parameters map[string]any) {
 		properties, _ := parameters["properties"].(map[string]any)
-		setRecoverySchemaConst(properties, "ref_id", refID, "当前 read_file segment 的完整 ToolResult ContentRef")
+		setRecoverySchemaConst(properties, "ref_id", refID, "当前 read_file segment 的完整 contextcontract.ToolResult ContentRef")
 		setRecoverySchemaConst(properties, "offset", offset, "ContentRef 连续覆盖的下一 byte offset")
 		setRecoverySchemaConst(properties, "limit", recoveryEvidenceContentPageByte, "避免解引用结果再次外置的冻结页大小")
 		requireRecoverySchemaFields(parameters, "ref_id", "offset", "limit")
@@ -640,7 +641,7 @@ func requireRecoverySchemaFields(parameters map[string]any, fields ...string) {
 	parameters["required"] = required
 }
 
-func recoveryResultsByCall(entry HistoryEntry) map[string]string {
+func recoveryResultsByCall(entry contextcontract.HistoryEntry) map[string]string {
 	results := make(map[string]string, len(entry.ToolResults))
 	for _, result := range entry.ToolResults {
 		results[result.ToolCallID] = result.Content

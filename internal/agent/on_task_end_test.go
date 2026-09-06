@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"context"
 	"errors"
 	"testing"
@@ -19,7 +21,7 @@ func TestAgent_OnTaskEnd_ReportsSuccessOnSubmitResult(t *testing.T) {
 		t.Fatalf("ClaimTask failed: %v", err)
 	}
 
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "ok", ToolCalled: false}, nil
 	}
 
@@ -52,7 +54,7 @@ func TestAgent_OnTaskEnd_ReportsFailureOnExecutionError(t *testing.T) {
 		t.Fatalf("ClaimTask failed: %v", err)
 	}
 
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{}, errors.New("boom")
 	}
 

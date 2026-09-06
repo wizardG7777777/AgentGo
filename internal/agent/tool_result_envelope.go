@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"agentgo/internal/contextruntime"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -32,10 +33,10 @@ type toolResultReferenceEnvelope struct {
 	Instruction   string `json:"instruction"`
 }
 
-func (r ContextRuntime) externalizeToolResult(ctx context.Context, task *model.Task, call llm.ToolCall, result string) (string, error) {
+func externalizeToolResult(r contextruntime.Runtime, ctx context.Context, task *model.Task, call llm.ToolCall, result string) (string, error) {
 	// Context v9 由 L2 按本次模型容量与 snapshot pressure 决定 inline/ref；
 	// L3 不再以固定 16 KiB 抢先把结果变成引用。
-	if task != nil && task.ContextPolicyRef == policycatalog.ContextDefaultV9 {
+	if task != nil && task.ContextPolicyRef == policycatalog.ContextDefaultCurrent {
 		return result, nil
 	}
 	if len([]byte(result)) <= toolResultExternalizeThresholdBytes || r.Content == nil || task == nil {
@@ -50,13 +51,13 @@ func (r ContextRuntime) externalizeToolResult(ctx context.Context, task *model.T
 		RetentionClass: contextcontract.RetentionTaskLifetime,
 		Authority:      contextcontract.AuthorityInformational,
 		Scope: contentstore.Scope{
-			Kind: contentstore.ScopeTask, SessionID: r.sessionScope(task),
+			Kind: contentstore.ScopeTask, SessionID: contextSessionScope(r, task),
 			GraphID: task.GraphID, TaskID: task.ID,
 		},
 		ExpiresAt: expiresAt,
 	})
 	if err != nil {
-		return "", fmt.Errorf("持久化完整 ToolResult 失败 tool=%s: %w", call.Name, err)
+		return "", fmt.Errorf("持久化完整 contextcontract.ToolResult 失败 tool=%s: %w", call.Name, err)
 	}
 	bytes := []byte(result)
 	half := toolResultInlinePreviewBytes / 2
@@ -70,7 +71,7 @@ func (r ContextRuntime) externalizeToolResult(ctx context.Context, task *model.T
 	}
 	encoded, err := json.Marshal(envelope)
 	if err != nil {
-		return "", fmt.Errorf("编码 ToolResult reference envelope: %w", err)
+		return "", fmt.Errorf("编码 contextcontract.ToolResult reference envelope: %w", err)
 	}
 	return string(encoded), nil
 }

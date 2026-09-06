@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"agentgo/internal/contextruntime"
 	"agentgo/internal/interaction"
 	"agentgo/internal/runcontract"
 	"agentgo/internal/ui"
@@ -113,6 +114,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/api/snapshot", s.handleSnapshot)
 	mux.HandleFunc("/api/events", s.handleEvents)
+	mux.HandleFunc("/api/model-output/events", s.handleModelOutputEvents)
 	mux.HandleFunc("/api/commands", s.handleCommands)
 	mux.HandleFunc("/api/sessions", s.handleSessions)
 	mux.HandleFunc("/healthz", s.handleHealthz)
@@ -702,4 +704,51 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_, _ = w.Write(data)
+}
+
+// handleModelOutputEvents 只转接 L2；SSE id 来自流式事件游标。
+func (s *Server) handleModelOutputEvents(w http.ResponseWriter, r *http.Request) {
+	eventCursor := r.Header.Get("Last-Event-ID")
+	if eventCursor == "" {
+		eventCursor = r.URL.Query().Get("eventCursor")
+	}
+	events, cancel, err := s.observer.WatchModelOutput(contextruntime.WatchOptions{SessionID: r.URL.Query().Get("session_id"), AgentID: r.URL.Query().Get("agent_id"), EventCursor: eventCursor, Buffer: sseSubscriberBuf})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer cancel()
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "SSE 不可用", 500)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	flusher.Flush()
+	heartbeat := time.NewTicker(sseHeartbeat)
+	defer heartbeat.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-heartbeat.C:
+			if _, err := fmt.Fprint(w, ": heartbeat\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case e, ok := <-events:
+			if !ok {
+				return
+			}
+			raw, err := json.Marshal(e)
+			if err != nil {
+				return
+			}
+			if _, err = fmt.Fprintf(w, "id: %s\ndata: %s\n\n", e.EventCursor, raw); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
 }

@@ -31,12 +31,14 @@ func validPolicy() ContextBudgetPolicy {
 		sections[section] = Budget{SerializedBytes: 16 << 10, EstimatedTokens: 4096}
 	}
 	return ContextBudgetPolicy{
-		Schema: PolicySchemaV1, PolicyID: "bounded-default/v1", Version: 1,
+		Schema: PolicySchemaV1, PolicyID: "bounded-default/v1", Version: 11,
 		ModelClass: "openai-compatible/default", FragmentRules: fragmentRules,
 		AtomicGroupRules: groupRules, SectionBudgets: sections,
 		SnapshotInputBudget:   Budget{SerializedBytes: 64 << 10, EstimatedTokens: 16 << 10},
 		CompletionReserve:     Budget{SerializedBytes: 16 << 10, EstimatedTokens: 4096},
-		AbsoluteWireByteLimit: 96 << 10,
+		AbsoluteWireByteLimit: 96 << 10, ModelContextWindow: &Budget{SerializedBytes: 16 <<
+			20, EstimatedTokens: 4 << 20}, ProtocolOverheadReserve: &Budget{SerializedBytes: 4096,
+			EstimatedTokens: 1024},
 	}
 }
 
@@ -154,9 +156,9 @@ func validSnapshot(t *testing.T) ContextSnapshot {
 	}
 	usage := BudgetUsage{SerializedBytes: int64(len(payload)), EstimatedTokens: 8}
 	return ContextSnapshot{
-		SnapshotID: "snapshot-1", Schema: SnapshotSchemaV1,
+		SnapshotID: "snapshot-1", Schema: SnapshotSchemaV2,
 		AttemptID: "attempt-1", InvocationID: "invocation-1",
-		PromptBuildRef: "prompt-build:1", ContextPolicyID: policy.PolicyID,
+		InstructionRef: "prompt-build:1", ContextPolicyID: policy.PolicyID,
 		ContextPolicyDigest: policyDigest, ProviderReplayRef: "provider-replay:default/v1",
 		ExecutionLeaseRef: "lease:task-1", ToolRouterSnapshotID: "tool-router:task-1",
 		Fragments: []ContextFragmentRecord{record},

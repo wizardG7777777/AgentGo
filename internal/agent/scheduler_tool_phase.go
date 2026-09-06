@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,7 +10,6 @@ import (
 	"strings"
 
 	"agentgo/internal/graph"
-	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
 	"agentgo/internal/observationcontract"
@@ -59,9 +59,9 @@ func recoveryActionPhasePrompt(gate recoveryActionGate) string {
 	case recoveryStageEvidenceUnavailable:
 		guidance = "The frozen evidence read failed, so mutation and further context expansion are unsafe. Submit hypothesis_rejected or blocked with the concrete read failure as reason; do not edit or claim coverage."
 	case recoveryStageDecision:
-		guidance = "The current EvidenceContract is fully covered and fresh. Submit edit with explicit ordered {tool,path} edit_steps, need_context with one new project-relative evidence file and reason, or hypothesis_rejected/blocked. Evidence files justify the decision but do not restrict mutation targets; write_file may declare a new path. Do not edit in this invocation."
+		guidance = "The current EvidenceContract is fully covered and fresh. Submit edit with explicit ordered {tool,path} edit_steps, need_context with one new project-relative evidence file and reason, or hypothesis_rejected/blocked. Evidence files justify the decision but do not restrict mutation targets; write_file may declare a new path. Do not edit in this llm."
 		if gate.Schema == graph.RecoveryDeltaSchemaV5 {
-			guidance = "The current bounded focus context is available. Submit edit with ordered {tool,path} steps, resume_candidate for a valid dirty candidate, need_context for one additional focus page, or hypothesis_rejected/blocked. For the same file, need_context must provide a new 1-based offset and the schema-constant limit; use upstream symbol/line evidence to jump near the target instead of paging the whole file. Every edit_file target must first enter focus context; write_file may declare a new path. Do not edit in this invocation."
+			guidance = "The current bounded focus context is available. Submit edit with ordered {tool,path} steps, resume_candidate for a valid dirty candidate, need_context for one additional focus page, or hypothesis_rejected/blocked. For the same file, need_context must provide a new 1-based offset and the schema-constant limit; use upstream symbol/line evidence to jump near the target instead of paging the whole file. Every edit_file target must first enter focus context; write_file may declare a new path. Do not edit in this llm."
 		}
 	case recoveryStageMutation:
 		guidance = "You previously chose edit and declared this exact edit step. Apply that decision now; do not return to investigation or merely describe the patch."
@@ -180,7 +180,7 @@ func observationOutputLimits(phase string) (completionTokens, responseBytes int6
 	return 2048, 32 << 10
 }
 
-func recoveryV5CompletionLimit(stage recoveryActionStage, history []HistoryEntry) int64 {
+func recoveryV5CompletionLimit(stage recoveryActionStage, history []contextcontract.HistoryEntry) int64 {
 	escalated := len(history) > 0 && strings.Contains(history[len(history)-1].SystemNotice, "[same-snapshot-retry")
 	switch stage {
 	case recoveryStageDecision:
@@ -198,35 +198,35 @@ func recoveryV5CompletionLimit(stage recoveryActionStage, history []HistoryEntry
 	}
 }
 
-func invocationToolChoice(router ToolRouterSnapshot) invocation.ToolChoice {
+func invocationToolChoice(router ToolRouterSnapshot) llm.ToolChoice {
 	switch router.Phase {
 	case "scheduler:draft-create", "scheduler:draft-configure", "scheduler:draft-validate",
 		"scheduler:draft-commit", "scheduler:start":
 		// DeepSeek thinking 同时拒绝 exact/required，但支持 auto + tools。
 		// ToolRouter 已机械收窄为唯一工具，L3 response gate 另外
 		// 强制本轮必须至少返回一个该工具调用，不允许正文逃逸。
-		return invocation.ToolChoice{Mode: invocation.ToolChoiceAuto}
+		return llm.ToolChoice{Mode: llm.ToolChoiceAuto}
 	case "agent:deliverable-submit", "scheduler:final-report-submit":
 		// 终态交付后不会再回到 thinking 业务轮，因此可以使用
 		// reasoning=none + exact 的狭义例外。
 		name, _ := mechanicalSingletonTool(router.Phase)
-		return invocation.ToolChoice{Mode: invocation.ToolChoiceFunction, Name: name}
+		return llm.ToolChoice{Mode: llm.ToolChoiceFunction, Name: name}
 	case "agent:observation-checkpoint":
 		// Observation 使用独立 Control Invocation lane：本轮只消费冻结
 		// TaskMemory/evidence catalog，不进入业务 reasoning replay。因而可以
 		// 与终态交付一样使用 reasoning=none + exact typed action，而不关闭
 		// 下一业务轮的 thinking。
-		return invocation.ToolChoice{Mode: invocation.ToolChoiceFunction, Name: "record_observation_delta"}
+		return llm.ToolChoice{Mode: llm.ToolChoiceFunction, Name: "record_observation_delta"}
 	case "agent:observation-checkpoint-v8", "agent:observation-checkpoint-v9", "agent:observation-checkpoint-v10", "agent:observation-checkpoint-v11", "agent:observation-checkpoint-v12":
 		// v8+ 改为 auto + singleton ToolRouter。required-action gate 仍在 L3
 		// 强制唯一合法调用；v9 只调整冻结输出预算。
-		return invocation.ToolChoice{Mode: invocation.ToolChoiceAuto}
+		return llm.ToolChoice{Mode: llm.ToolChoiceAuto}
 	case "scheduler:draft-edit", "scheduler:recovery":
 		// 多工具阶段同样使用 auto wire，由 L3 response gate 强制
 		// 至少一个授权工具调用，避免 thinking + required 被 provider 400。
-		return invocation.ToolChoice{Mode: invocation.ToolChoiceAuto}
+		return llm.ToolChoice{Mode: llm.ToolChoiceAuto}
 	default:
-		return invocation.ToolChoice{Mode: invocation.ToolChoiceAuto}
+		return llm.ToolChoice{Mode: llm.ToolChoiceAuto}
 	}
 }
 
@@ -288,7 +288,7 @@ func phaseDispatchesOnlyFirstTool(phase string) bool {
 		phase == "agent:observation-commitment" || strings.HasPrefix(phase, "agent:recovery-")
 }
 
-func deriveInvocationToolPolicy(task *model.Task, history []HistoryEntry, full *ToolRegistry) invocationToolPolicy {
+func deriveInvocationToolPolicy(task *model.Task, history []contextcontract.HistoryEntry, full *ToolRegistry) invocationToolPolicy {
 	return deriveInvocationToolPolicyWithControl(task, history, full, full)
 }
 
@@ -297,7 +297,7 @@ func deriveInvocationToolPolicy(task *model.Task, history []HistoryEntry, full *
 // Invocation 只从 frameworkControl 取 record_observation_delta。这样
 // Acceptance/readonly 的普通 Lease 不会看到控制工具，同时周期性 checkpoint
 // 不会因角色闭集裁剪而变成不可达状态。
-func deriveInvocationToolPolicyWithControl(task *model.Task, history []HistoryEntry,
+func deriveInvocationToolPolicyWithControl(task *model.Task, history []contextcontract.HistoryEntry,
 	business, frameworkControl *ToolRegistry) invocationToolPolicy {
 	full := businessRegistryWithoutFrameworkControl(business)
 	full = registryWithTaskCheckContract(full, task)
@@ -466,7 +466,7 @@ func recoveryDecisionRegistry(registry *ToolRegistry, task *model.Task) *ToolReg
 // 开放 no_change 结构化收口。read_graph handler 已按 InterventionGraphID
 // fail-closed，因此这里无需从模型参数再次推断 scope。
 func recoveryActionRegistry(registry, frameworkControl *ToolRegistry, task *model.Task,
-	history []HistoryEntry) (*ToolRegistry, recoveryActionGate, bool) {
+	history []contextcontract.HistoryEntry) (*ToolRegistry, recoveryActionGate, bool) {
 	if registry == nil {
 		return nil, recoveryActionGate{}, false
 	}
@@ -617,7 +617,7 @@ func frozenRecoveryFirstAction(task *model.Task) (graph.RecoveryFirstAction, boo
 	return directive.FirstAction, ok
 }
 
-func recoveryToolSettlement(history []HistoryEntry, toolName, path string) (bool, bool) {
+func recoveryToolSettlement(history []contextcontract.HistoryEntry, toolName, path string) (bool, bool) {
 	settled, successful := false, false
 	for _, entry := range history {
 		results := make(map[string]string, len(entry.ToolResults))
@@ -662,7 +662,7 @@ func recoveryRequiredCheckContract(task *model.Task) runcontract.CheckContract {
 	return runcontract.CheckContract{}
 }
 
-func recoveryCheckRecorded(history []HistoryEntry, checkID string) bool {
+func recoveryCheckRecorded(history []contextcontract.HistoryEntry, checkID string) bool {
 	for _, entry := range history {
 		results := make(map[string]string, len(entry.ToolResults))
 		for _, result := range entry.ToolResults {
@@ -684,7 +684,7 @@ func recoveryCheckRecorded(history []HistoryEntry, checkID string) bool {
 	return false
 }
 
-func graphChangeReadObserved(history []HistoryEntry) bool {
+func graphChangeReadObserved(history []contextcontract.HistoryEntry) bool {
 	for _, entry := range history {
 		results := make(map[string]string, len(entry.ToolResults))
 		for _, result := range entry.ToolResults {
@@ -781,7 +781,7 @@ type observationMutationCommitment struct {
 }
 
 func observationCommitmentRegistry(registry *ToolRegistry, task *model.Task,
-	history []HistoryEntry) (*ToolRegistry, bool) {
+	history []contextcontract.HistoryEntry) (*ToolRegistry, bool) {
 	commitment, ok := pendingObservationMutation(task, history)
 	if !ok || registry == nil {
 		return registry, false
@@ -805,7 +805,7 @@ func observationCommitmentRegistry(registry *ToolRegistry, task *model.Task,
 	return view, true
 }
 
-func pendingObservationMutation(task *model.Task, history []HistoryEntry) (observationMutationCommitment, bool) {
+func pendingObservationMutation(task *model.Task, history []contextcontract.HistoryEntry) (observationMutationCommitment, bool) {
 	for entryIndex := len(history) - 1; entryIndex >= 0; entryIndex-- {
 		if task != nil && strings.TrimSpace(task.AttemptID) != "" &&
 			!strings.HasPrefix(history[entryIndex].TurnID, task.AttemptID+"/") {
@@ -844,7 +844,7 @@ func pendingObservationMutation(task *model.Task, history []HistoryEntry) (obser
 	return observationMutationCommitment{}, false
 }
 
-func observationCheckpointRegistry(registry *ToolRegistry, task *model.Task, history []HistoryEntry) *ToolRegistry {
+func observationCheckpointRegistry(registry *ToolRegistry, task *model.Task, history []contextcontract.HistoryEntry) *ToolRegistry {
 	refs := make([]string, 0, 64)
 	resolvedRefs := make([]string, 0, 64)
 	openCandidates := make([]string, 0, taskmem.MaxObservationNext)
@@ -941,7 +941,7 @@ func observationCheckpointRegistry(registry *ToolRegistry, task *model.Task, his
 	})
 }
 
-func finalReportReadTurns(history []HistoryEntry) int {
+func finalReportReadTurns(history []contextcontract.HistoryEntry) int {
 	turns := 0
 	for _, entry := range history {
 		read := false
@@ -958,7 +958,7 @@ func finalReportReadTurns(history []HistoryEntry) int {
 	return turns
 }
 
-func historyRequiresDeliverableSubmit(history []HistoryEntry) bool {
+func historyRequiresDeliverableSubmit(history []contextcontract.HistoryEntry) bool {
 	pending := false
 	for _, entry := range history {
 		if strings.Contains(entry.SystemNotice, progressDeliverableRequiredMarker) {
@@ -971,7 +971,7 @@ func historyRequiresDeliverableSubmit(history []HistoryEntry) bool {
 	return pending
 }
 
-func deliverableSubmissionNeedsMoreWork(entry HistoryEntry) bool {
+func deliverableSubmissionNeedsMoreWork(entry contextcontract.HistoryEntry) bool {
 	results := make(map[string]string, len(entry.ToolResults))
 	for _, result := range entry.ToolResults {
 		results[result.ToolCallID] = result.Content
@@ -989,11 +989,11 @@ func deliverableSubmissionNeedsMoreWork(entry HistoryEntry) bool {
 	return false
 }
 
-func historyRequiresObservationCheckpoint(history []HistoryEntry) bool {
+func historyRequiresObservationCheckpoint(history []contextcontract.HistoryEntry) bool {
 	return pendingObservationCheckpointAction(history) != ""
 }
 
-func pendingObservationCheckpointAction(history []HistoryEntry) string {
+func pendingObservationCheckpointAction(history []contextcontract.HistoryEntry) string {
 	pending := false
 	action := ""
 	for _, entry := range history {
@@ -1033,7 +1033,7 @@ func pendingObservationCheckpointAction(history []HistoryEntry) string {
 	return action
 }
 
-func observationCheckpointFailureCount(history []HistoryEntry) int {
+func observationCheckpointFailureCount(history []contextcontract.HistoryEntry) int {
 	count := 0
 	for _, entry := range history {
 		if strings.Contains(entry.SystemNotice, observationCheckpointRequiredMarker) {
@@ -1115,185 +1115,11 @@ func observationCheckpointFailureDetail(result ExecuteResult) string {
 	return ""
 }
 
-// mechanicalControlHistoryProjection 用于机械交付和 Observation
+// contextruntime.MechanicalControlHistory 用于机械交付和 Observation
 // checkpoint Invocation。Raw History 始终保持不变；本轮 L2 只投影控制
 // notice，避免 provider 在 singleton ToolRouter 下仍延续旧 read/grep/edit
 // tool call。TaskMemory、任务目标、上游输入、output contract 与 Observation
 // evidence enum 由独立 L2/L3 authority 注入，不依赖旧轮次正文。
-func mechanicalControlHistoryProjection(history []HistoryEntry) []HistoryEntry {
-	start := 0
-	for index := len(history) - 1; index >= 0; index-- {
-		if strings.Contains(history[index].SystemNotice, observationCheckpointRequiredMarker) {
-			start = index
-			break
-		}
-	}
-	projected := make([]HistoryEntry, 0, len(history)-start)
-	for _, entry := range history[start:] {
-		if notice := strings.TrimSpace(entry.SystemNotice); notice != "" {
-			projected = append(projected, HistoryEntry{SystemNotice: notice})
-		}
-	}
-	return projected
-}
-
-// investigationDeliverableHistoryProjection 为 investigation/v3 的 exact
-// submit 轮保留已结算源码证据，同时去掉 provider-visible 历史 ToolCall。直接用
-// mechanicalControlHistoryProjection 会让 Explorer 在交付时只记得“读过”，却
-// 看不到内容；直接保留 Raw exchange 又会诱发 singleton ToolRouter 粘滞重放。
-func investigationDeliverableHistoryProjection(history []HistoryEntry) []HistoryEntry {
-	const (
-		maxEvidenceBytes          = 8 << 10
-		maxEvidenceRunesPerResult = 1200
-	)
-	var evidence []map[string]any
-	for entryIndex := len(history) - 1; entryIndex >= 0; entryIndex-- {
-		entry := history[entryIndex]
-		results := make(map[string]string, len(entry.ToolResults))
-		for _, result := range entry.ToolResults {
-			results[result.ToolCallID] = result.Content
-		}
-		for callIndex := len(entry.ToolCalls) - 1; callIndex >= 0; callIndex-- {
-			call := entry.ToolCalls[callIndex]
-			content, settled := results[call.ID]
-			if !settled || call.Name == "record_observation_delta" || call.Name == "submit_task_result" {
-				continue
-			}
-			candidate := map[string]any{
-				"tool": call.Name, "arguments": call.Arguments,
-				"result": truncateTaskMemRunes(content, maxEvidenceRunesPerResult),
-			}
-			probe, _ := json.Marshal(append(append([]map[string]any(nil), evidence...), candidate))
-			if len(probe) > maxEvidenceBytes {
-				continue
-			}
-			evidence = append(evidence, candidate)
-		}
-	}
-	encoded, _ := json.Marshal(evidence)
-	projected := []HistoryEntry{{SystemNotice: "<investigation-evidence authority=\"settled-current-task\" order=\"newest-first\">\n" +
-		string(encoded) + "\n</investigation-evidence>"}}
-	projected = append(projected, HistoryEntry{SystemNotice: progressDeliverableRequiredMarker +
-		" 使用上述 settled evidence 填写结构化调查结果；不得继续调用读取工具。"})
-	return projected
-}
-
-// investigationDeliverableHistoryProjectionV4 在相同 8KiB 上限内优先保留源码
-// read/read_content_ref，再保留 grep，最后才是目录/其它结果；每一优先级内部仍按
-// newest-first。真实十轮 investigation 证明纯时间倒序会让尾部 grep 挤掉较早的
-// 失败测试和状态所有者正文。v3 继续使用上面的历史投影，禁止静默迁移。
-func investigationDeliverableHistoryProjectionV4(history []HistoryEntry) []HistoryEntry {
-	const (
-		maxEvidenceBytes          = 8 << 10
-		maxEvidenceRunesPerResult = 1200
-	)
-	type candidate struct {
-		priority int
-		recency  int
-		value    map[string]any
-	}
-	candidates := make([]candidate, 0, len(history))
-	recency := 0
-	for entryIndex := len(history) - 1; entryIndex >= 0; entryIndex-- {
-		entry := history[entryIndex]
-		results := make(map[string]string, len(entry.ToolResults))
-		for _, result := range entry.ToolResults {
-			results[result.ToolCallID] = result.Content
-		}
-		for callIndex := len(entry.ToolCalls) - 1; callIndex >= 0; callIndex-- {
-			call := entry.ToolCalls[callIndex]
-			content, settled := results[call.ID]
-			if !settled || call.Name == "record_observation_delta" || call.Name == "submit_task_result" {
-				continue
-			}
-			priority := 3
-			switch call.Name {
-			case "read_file", "read_content_ref":
-				priority = 0
-			case "grep_search":
-				priority = 1
-			case "glob_search", "list_dir":
-				priority = 2
-			}
-			candidates = append(candidates, candidate{
-				priority: priority, recency: recency,
-				value: map[string]any{
-					"tool": call.Name, "arguments": call.Arguments,
-					"result": truncateTaskMemRunes(content, maxEvidenceRunesPerResult),
-				},
-			})
-			recency++
-		}
-	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].priority != candidates[j].priority {
-			return candidates[i].priority < candidates[j].priority
-		}
-		return candidates[i].recency < candidates[j].recency
-	})
-	evidence := make([]map[string]any, 0, len(candidates))
-	for _, item := range candidates {
-		probe, _ := json.Marshal(append(append([]map[string]any(nil), evidence...), item.value))
-		if len(probe) > maxEvidenceBytes {
-			continue
-		}
-		evidence = append(evidence, item.value)
-	}
-	encoded, _ := json.Marshal(evidence)
-	projected := []HistoryEntry{{SystemNotice: "<investigation-evidence authority=\"settled-current-task\" priority=\"read-before-search\" order=\"newest-first-within-priority\">\n" +
-		string(encoded) + "\n</investigation-evidence>"}}
-	projected = append(projected, HistoryEntry{SystemNotice: progressDeliverableRequiredMarker +
-		" 使用上述 settled evidence 填写结构化调查结果；不得继续调用读取工具。"})
-	return projected
-}
-
-// businessHistoryProjection 把 L3 Control Invocation 从正常业务 Responses
-// replay 中移除。Observation 已通过 durable TaskMemory/ObservationRef 注入；
-// 再重放 reasoning=none 的 exact tool item 会把业务 thinking 链与控制链混接。
-func businessHistoryProjection(history []HistoryEntry) []HistoryEntry {
-	projected := make([]HistoryEntry, 0, len(history))
-	for _, entry := range history {
-		if len(entry.ToolCalls) > 0 {
-			controlOnly := true
-			for _, call := range entry.ToolCalls {
-				if call.Name != "record_observation_delta" {
-					controlOnly = false
-					break
-				}
-			}
-			if controlOnly {
-				if ref := successfulObservationRef(entry); ref != "" {
-					projected = append(projected, HistoryEntry{
-						TurnID: entry.TurnID, ContextProjection: observationProjectionPrefix + ref,
-					})
-				}
-				continue
-			}
-		}
-		projected = append(projected, entry)
-	}
-	return projected
-}
-
-func successfulObservationRef(entry HistoryEntry) string {
-	results := make(map[string]string, len(entry.ToolResults))
-	for _, result := range entry.ToolResults {
-		results[result.ToolCallID] = result.Content
-	}
-	for _, call := range entry.ToolCalls {
-		if call.Name != "record_observation_delta" || unsuccessfulToolResult(results[call.ID]) {
-			continue
-		}
-		var receipt struct {
-			Ref string `json:"observation_delta_ref"`
-		}
-		if json.Unmarshal([]byte(results[call.ID]), &receipt) == nil && strings.TrimSpace(receipt.Ref) != "" {
-			return strings.TrimSpace(receipt.Ref)
-		}
-	}
-	return ""
-}
-
 // unsuccessfulToolResult 兼容历史已持久的半角/全角中文冒号。
 // skipped call 只是为 provider call_id 补齐 replay output，不得驱动阶段迁移。
 func skippedToolResult(content string) bool {
@@ -1319,7 +1145,7 @@ const (
 // graphAuthoringPolicy 只按按序成功的 authoring receipt 推进状态机。read 不改变
 // 阶段；失败 tool result 不生效；validate 只有 accepted=true 才能进入 commit。
 // 这避免旧实现用“历史上调用过某工具”猜测当前 Draft authority。
-func graphAuthoringPolicy(history []HistoryEntry) (string, []string) {
+func graphAuthoringPolicy(history []contextcontract.HistoryEntry) (string, []string) {
 	stage := graphAuthoringCreate
 	simpleTemplate := false
 	for _, entry := range history {

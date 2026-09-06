@@ -39,12 +39,16 @@ func compilerPolicy() contextcontract.ContextBudgetPolicy {
 		sections[section] = contextcontract.Budget{SerializedBytes: 16 << 10, EstimatedTokens: 4096}
 	}
 	return contextcontract.ContextBudgetPolicy{
-		Schema: contextcontract.PolicySchemaV1, PolicyID: "compiler-test/v1", Version: 1,
+		Schema: contextcontract.PolicySchemaV1, PolicyID: "compiler-test/v1", Version: 11,
 		ModelClass: "test-model", FragmentRules: fragments,
 		AtomicGroupRules: groups, SectionBudgets: sections,
 		SnapshotInputBudget:   contextcontract.Budget{SerializedBytes: 64 << 10, EstimatedTokens: 16 << 10},
 		CompletionReserve:     contextcontract.Budget{SerializedBytes: 16 << 10, EstimatedTokens: 4096},
-		AbsoluteWireByteLimit: 96 << 10,
+		AbsoluteWireByteLimit: 96 << 10, ModelContextWindow: &contextcontract.Budget{
+			SerializedBytes: 16 <<
+				20, EstimatedTokens: 4 << 20}, ProtocolOverheadReserve: &contextcontract.Budget{
+			SerializedBytes: 4096,
+			EstimatedTokens: 1024},
 	}
 }
 
@@ -77,7 +81,7 @@ func baseCompileInput() CompileInput {
 	content := []byte(`{"task":"修复问题"}`)
 	return CompileInput{
 		AttemptID: "attempt-1", InvocationID: "invocation-1",
-		PromptBuildRef: "prompt-build:1", ExecutionLeaseRef: "lease:1",
+		InstructionRef: "prompt-build:1", ExecutionLeaseRef: "lease:1",
 		ToolRouterSnapshotID: "tool-router:1",
 		Fragments: []PreparedFragment{{
 			Fragment: contextcontract.ContextFragment{
@@ -94,7 +98,7 @@ func baseCompileInput() CompileInput {
 		BudgetPolicy: compilerPolicy(),
 		ReplayPolicy: contextcontract.ProviderReplayPolicy{
 			Schema:   contextcontract.ProviderReplaySchemaV1,
-			PolicyID: "replay-test/v1", Version: 1,
+			PolicyID: "replay-test/v1", Version: 5,
 			Fields: map[string]contextcontract.ReplayRequirement{},
 		},
 		Encoder: deterministicEncoder(nil),

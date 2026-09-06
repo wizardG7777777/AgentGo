@@ -1,12 +1,12 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
 	"context"
 	"errors"
 	"strings"
 	"testing"
 
-	"agentgo/internal/invocation"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
 	"agentgo/internal/trace"
@@ -56,7 +56,7 @@ func TestUnrecoverable_FailsFastWithoutRetry(t *testing.T) {
 	}
 
 	// 让 executor 返回 §9.3 列表里的不可恢复错误（401 invalid_api_key 是经典案例）。
-	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []HistoryEntry) (ExecuteResult, error) {
+	executor := func(ctx context.Context, tk *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{}, &llm.ErrUnrecoverable{
 			Err:        errors.New("401 unauthorized"),
 			StatusCode: 401,
@@ -137,9 +137,9 @@ func TestCanonicalFailureOverridesRecoverableWrappers(t *testing.T) {
 	if err := s.ClaimTask("agent-canonical", task.ID); err != nil {
 		t.Fatal(err)
 	}
-	failure := invocation.NewFailure(invocation.FailureAuth,
-		invocation.PhaseResponseHeaders, invocation.OriginProvider, errors.New("unauthorized"))
-	executor := func(context.Context, *model.Task, map[string]string, []HistoryEntry) (ExecuteResult, error) {
+	failure := llm.NewFailure(llm.FailureAuth,
+		llm.PhaseResponseHeaders, llm.OriginProvider, errors.New("unauthorized"))
+	executor := func(context.Context, *model.Task, map[string]string, []contextcontract.HistoryEntry, llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{}, &ErrRecoverable{Err: &llm.ErrRecoverable{
 			Err: errors.New("legacy says retry"), Failure: failure,
 		}}

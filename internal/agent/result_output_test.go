@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"agentgo/internal/contextcontract"
+	"agentgo/internal/llm"
 	"context"
 	"strings"
 	"testing"
@@ -21,7 +23,7 @@ func TestAgent_NaturalCompletion_WritesToResultOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "final answer", ToolCalled: false}, nil
 	}
 
@@ -51,7 +53,7 @@ func TestAgent_NaturalCompletion_FallsBackToUserOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		return ExecuteResult{Output: "final answer", ToolCalled: false}, nil
 	}
 
@@ -91,7 +93,7 @@ func TestAgent_GraphControllerFinalizedCompletion_DoesNotWriteUserResult(t *test
 		t.Fatal(err)
 	}
 
-	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []HistoryEntry) (ExecuteResult, error) {
+	executor := func(_ context.Context, _ *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 		// Finalized 模拟 submit_task_result 已被接受（图节点任务的结构化收口）。
 		return ExecuteResult{Output: "INTERNAL-GRAPH-CONTROLLER-RESULT", ToolCalled: false, Finalized: true}, nil
 	}

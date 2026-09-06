@@ -10,7 +10,7 @@ import (
 // validUIBase 返回一份最小合法 Config（Scheduler-only 模式），测试只改 ui 块。
 func validUIBase() *Config {
 	return &Config{
-		LLM:         LLMConfig{DefaultModel: "gpt-test"},
+		LLM:         LLMConfig{DefaultModel: "gpt-test", RequestContract: "agentgo.model-request/v1"},
 		ProjectRoot: ".",
 		UI: UIConfig{
 			Frontends: []string{"tui"},
@@ -26,7 +26,7 @@ func TestUIConfig_DefaultsApplied(t *testing.T) {
 
 	// 完全不写 ui 块
 	p1 := filepath.Join(dir, "a.yaml")
-	if err := os.WriteFile(p1, []byte("llm:\n  default_model: gpt-test\n"), 0o644); err != nil {
+	if err := os.WriteFile(p1, []byte("llm:\n  request_contract: agentgo.model-request/v1\n  default_model: gpt-test\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := LoadConfig(p1, true)
@@ -45,7 +45,7 @@ func TestUIConfig_DefaultsApplied(t *testing.T) {
 
 	// 只写 frontends，web.listen 保持默认
 	p2 := filepath.Join(dir, "b.yaml")
-	if err := os.WriteFile(p2, []byte("llm:\n  default_model: gpt-test\nui:\n  frontends: [tui, web]\n"), 0o644); err != nil {
+	if err := os.WriteFile(p2, []byte("llm:\n  request_contract: agentgo.model-request/v1\n  default_model: gpt-test\nui:\n  frontends: [tui, web]\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cfg2, err := LoadConfig(p2, true)
