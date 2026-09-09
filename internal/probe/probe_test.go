@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"pgregory.net/rapid"
@@ -217,7 +218,7 @@ func TestRunAll_ConcurrentExecution(t *testing.T) {
 }
 
 // Feature: tool-health-probe, Property 1: Timeout probe marked unavailable
-// *For any* timeout T > 0 and a probe that sleeps longer than T,
+// *For any* timeout T > 0 and a probe that only returns after cancellation,
 // the result SHALL have Available=false and error containing timeout-related text.
 // **Validates: Requirements 1.2**
 func TestProperty_TimeoutMarksUnavailable(t *testing.T) {
@@ -226,20 +227,12 @@ func TestProperty_TimeoutMarksUnavailable(t *testing.T) {
 		timeoutMs := rapid.IntRange(10, 100).Draw(t, "timeoutMs")
 		timeout := time.Duration(timeoutMs) * time.Millisecond
 
-		// Generate extra delay beyond the timeout in [10ms, 100ms].
-		extraMs := rapid.IntRange(10, 100).Draw(t, "extraMs")
-		sleepDuration := timeout + time.Duration(extraMs)*time.Millisecond
-
 		toolName := rapid.StringMatching(`[a-z_]{3,12}`).Draw(t, "toolName")
 
-		// Create a probe that sleeps longer than the timeout.
+		// 以取消事件同步，不假设两个毫秒级定时器的调度先后。
 		slowProbe := func(ctx context.Context) ProbeResult {
-			select {
-			case <-time.After(sleepDuration):
-				return ProbeResult{Tool: toolName, Available: true}
-			case <-ctx.Done():
-				return ProbeResult{Tool: toolName, Available: false, Error: ctx.Err().Error()}
-			}
+			<-ctx.Done()
+			return ProbeResult{Tool: toolName, Available: true}
 		}
 
 		status := RunAll(context.Background(), []Probe{slowProbe}, timeout)
@@ -268,6 +261,26 @@ func TestProperty_TimeoutMarksUnavailable(t *testing.T) {
 			t.Fatal("expected timed-out probe to be marked unavailable")
 		}
 	})
+}
+
+func TestResultWithinDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		input := ProbeResult{Tool: "test_tool", Available: true}
+		if got := resultWithinDeadline(ctx, input); !got.Available {
+			t.Fatalf("截止前的成功结果应保留: %+v", got)
+		}
+		time.Sleep(time.Second)
+		if got := resultWithinDeadline(ctx, input); got.Available || got.Tool != input.Tool || !strings.Contains(got.Error, "deadline exceeded") {
+			t.Fatalf("截止时间到达必须拒绝成功，保留工具身份: %+v", got)
+		}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := resultWithinDeadline(ctx, ProbeResult{Available: true}); got.Available || !strings.Contains(got.Error, "canceled") {
+		t.Fatalf("已取消的成功结果必须拒绝: %+v", got)
+	}
 }
 
 // Feature: tool-health-probe, Property 2: Concurrent execution total time bounded

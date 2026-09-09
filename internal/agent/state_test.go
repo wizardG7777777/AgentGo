@@ -473,7 +473,19 @@ func TestE2E_AgentStateMachineLifecycle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	go ag.Run(ctx)
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		ag.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(3 * time.Second):
+			t.Error("等待 Agent 退出超时")
+		}
+	})
 
 	// 等任务完成
 	deadline := time.After(3 * time.Second)
@@ -493,6 +505,13 @@ func TestE2E_AgentStateMachineLifecycle(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
+	// Task 终态早于 processTask 的收尾；等待 Run 返回后才能关闭 Trace。
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("等待 Agent 收尾超时")
+	}
 	if err := w.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

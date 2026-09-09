@@ -50,7 +50,8 @@ func RunAll(ctx context.Context, probes []Probe, timeout time.Duration) *ToolHea
 
 			select {
 			case result := <-ch:
-				status.Record(result)
+				// 结果和取消可同时就绪；接收时已到截止时间不能再记为可用。
+				status.Record(resultWithinDeadline(ctx, result))
 			case <-ctx.Done():
 				// Probe did not finish before timeout — mark unavailable.
 				status.Record(ProbeResult{
@@ -63,4 +64,16 @@ func RunAll(ctx context.Context, probes []Probe, timeout time.Duration) *ToolHea
 
 	wg.Wait()
 	return status
+}
+
+func resultWithinDeadline(ctx context.Context, result ProbeResult) ProbeResult {
+	err := ctx.Err()
+	if deadline, ok := ctx.Deadline(); err == nil && ok && !time.Now().Before(deadline) {
+		err = context.DeadlineExceeded
+	}
+	if err != nil {
+		result.Available = false
+		result.Error = fmt.Sprintf("探针超时: %v", err)
+	}
+	return result
 }

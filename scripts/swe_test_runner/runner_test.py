@@ -1068,6 +1068,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
         running_process = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=(os.name == "posix"),
         )
         try:
             killed = swe_test_runner.monitor_run(
@@ -1080,6 +1081,36 @@ class SWETestRunnerContractTest(unittest.TestCase):
         finally:
             swe_test_runner.terminate_process(running_process)
         self.assertIsNotNone(running_process.poll())
+
+    def test_terminate_process_escalates_and_waits(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("child", 2), 0]
+        with mock.patch.object(swe_test_runner.os, "killpg", create=True) as killpg:
+            swe_test_runner.terminate_process(process)
+        self.assertEqual(process.wait.call_count, 2, "强制结束后也必须等待进程回收")
+        if os.name == "posix":
+            self.assertEqual(killpg.call_count, 2)
+        else:
+            process.terminate.assert_called_once()
+            process.kill.assert_called_once()
+
+    def test_terminate_process_reports_cleanup_failure(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = subprocess.TimeoutExpired("child", 2)
+        with mock.patch.object(swe_test_runner.os, "killpg", create=True):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                swe_test_runner.terminate_process(process)
+
+    def test_terminate_process_accepts_concurrent_exit(self):
+        process = mock.Mock()
+        process.poll.side_effect = [None, 0]
+        process.terminate.side_effect = ProcessLookupError()
+        with mock.patch.object(swe_test_runner.os, "killpg", create=True,
+                               side_effect=ProcessLookupError()):
+            swe_test_runner.terminate_process(process)
+        process.kill.assert_not_called()
 
     def test_monitor_graph_and_no_graph_terminals_do_not_use_quiet(self):
         graph_snapshot = {

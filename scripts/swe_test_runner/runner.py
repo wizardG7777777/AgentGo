@@ -1352,6 +1352,7 @@ def wait_for_agentgo(process: subprocess.Popen, base_url: str, log_path: Path,
 
 
 def terminate_process(process: subprocess.Popen) -> None:
+    """结束并回收自有进程；POSIX 调用方必须以 start_new_session=True 启动。"""
     if process.poll() is not None:
         return
     try:
@@ -1362,7 +1363,8 @@ def terminate_process(process: subprocess.Popen) -> None:
         process.wait(timeout=2)
         return
     except (OSError, subprocess.TimeoutExpired):
-        pass
+        if process.poll() is not None:
+            return
     try:
         if os.name == "posix":
             os.killpg(process.pid, signal.SIGKILL)
@@ -1370,7 +1372,9 @@ def terminate_process(process: subprocess.Popen) -> None:
             process.kill()
         process.wait(timeout=2)
     except (OSError, subprocess.TimeoutExpired):
-        pass
+        # 信号发送期间进程可能自行退出；仍存活则必须暴露清理失败。
+        if process.poll() is None:
+            raise
 
 
 def clean_run_outputs(run_dir: Path) -> None:
