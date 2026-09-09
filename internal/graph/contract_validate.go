@@ -25,11 +25,10 @@ func validateGraphContractCoverage(contract GraphContract, body GraphDefinitionB
 	}
 
 	requirements := map[string]map[string]struct{}{
-		"deliverable": {}, "effect": {}, "artifact": {}, "check": {}, "evidence": {},
+		"deliverable": {}, "effect": {}, "artifact": {}, "evidence": {},
 	}
 	issues = append(issues, collectContractRequirementIDs("deliverable", "contract.deliverables", contract.Deliverables, requirements["deliverable"])...)
 	issues = append(issues, collectContractRequirementIDs("artifact", "contract.required_artifacts", contract.RequiredArtifacts, requirements["artifact"])...)
-	issues = append(issues, collectContractRequirementIDs("check", "contract.required_checks", contract.RequiredChecks, requirements["check"])...)
 	issues = append(issues, collectContractRequirementIDs("evidence", "contract.success_evidence", contract.SuccessEvidence, requirements["evidence"])...)
 	for i, effect := range contract.RequiredEffects {
 		path := fmt.Sprintf("contract.required_effects[%d]", i)
@@ -45,7 +44,7 @@ func validateGraphContractCoverage(contract GraphContract, body GraphDefinitionB
 	}
 
 	owners := map[string]map[string]map[string]struct{}{
-		"deliverable": {}, "effect": {}, "artifact": {}, "check": {}, "evidence": {},
+		"deliverable": {}, "effect": {}, "artifact": {}, "evidence": {},
 	}
 	for _, id := range sortedDefinitionNodeIDs(body) {
 		node := body.Nodes[id]
@@ -53,7 +52,6 @@ func validateGraphContractCoverage(contract GraphContract, body GraphDefinitionB
 		issues = append(issues, collectNodeBindings(path+".deliverables", id, "deliverable", node.ContractBindings.Deliverables, requirements, owners)...)
 		issues = append(issues, collectNodeBindings(path+".effects", id, "effect", node.ContractBindings.Effects, requirements, owners)...)
 		issues = append(issues, collectNodeBindings(path+".artifacts", id, "artifact", node.ContractBindings.Artifacts, requirements, owners)...)
-		issues = append(issues, collectNodeBindings(path+".checks", id, "check", node.ContractBindings.Checks, requirements, owners)...)
 		issues = append(issues, collectNodeBindings(path+".success_evidence", id, "evidence", node.ContractBindings.SuccessEvidence, requirements, owners)...)
 
 		if node.Kind == KindEnd && hasAnyContractBinding(node.ContractBindings) {
@@ -64,7 +62,7 @@ func validateGraphContractCoverage(contract GraphContract, body GraphDefinitionB
 		}
 	}
 
-	for _, category := range []string{"deliverable", "effect", "artifact", "check", "evidence"} {
+	for _, category := range []string{"deliverable", "effect", "artifact", "evidence"} {
 		keys := make([]string, 0, len(requirements[category]))
 		for key := range requirements[category] {
 			keys = append(keys, key)
@@ -177,7 +175,7 @@ func successReachableAvoiding(body GraphDefinitionBody, blocked map[string]struc
 }
 
 func hasAnyContractBinding(binding GraphContractBindings) bool {
-	return len(binding.Deliverables)+len(binding.Effects)+len(binding.Artifacts)+len(binding.Checks)+len(binding.SuccessEvidence) > 0
+	return len(binding.Deliverables)+len(binding.Effects)+len(binding.Artifacts)+len(binding.SuccessEvidence) > 0
 }
 
 func hasMutatingCapability(capability *Capability) bool {
@@ -185,7 +183,7 @@ func hasMutatingCapability(capability *Capability) bool {
 		return false
 	}
 	mutating := map[string]struct{}{
-		"write_file": {}, "edit_file": {}, "run_shell": {}, "send_message": {},
+		"apply_change": {},
 		"publish_task": {}, "request_user_input": {}, "request_replan": {},
 	}
 	for _, tool := range capability.Tools {

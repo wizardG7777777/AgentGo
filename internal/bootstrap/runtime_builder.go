@@ -29,7 +29,7 @@ import (
 // 请求协议由 llm.protocol 冻结：Responses 为新主链，Chat Completions 为显式
 // 兼容；不再按 provider 名称分支。llm.provider 在 Validate 中拒绝。
 func buildKindLLMClient(llmCfg config.LLMConfig, kindModel string) llm.Invoker {
- return llm.NewTransport(llm.TransportConfig{BaseURL:llmCfg.BaseURL,APIKey:llmCfg.APIKey,Timeout:time.Duration(llmCfg.TimeoutSec)*time.Second})
+	return llm.NewTransport(llm.TransportConfig{BaseURL: llmCfg.BaseURL, APIKey: llmCfg.APIKey, Timeout: time.Duration(llmCfg.TimeoutSec) * time.Second})
 }
 
 // buildAgentRuntime 从 AgentKind 声明 + LLMConfig 默认值合成 AgentRuntimeConfig。
@@ -88,15 +88,6 @@ func buildAgentRuntime(
 	if err != nil {
 		return config.AgentRuntimeConfig{}, fmt.Errorf("kind=%q 模型能力档案无效: %w", kind.Kind, err)
 	}
-	observationModel := kind.ObservationModel
-	if observationModel == "" {
-		observationModel = model
-	}
-	observationCapability, err := llmCfg.ResolveModelCapability(observationModel)
-	if err != nil {
-		return config.AgentRuntimeConfig{}, fmt.Errorf("kind=%q observation_model 能力档案无效: %w", kind.Kind, err)
-	}
-
 	// 构建团队能力感知提示词：列出系统中所有 Agent 类型及其能力边界
 	teamAwareness, err := buildTeamAwareness(kind, allKinds, toolProfiles)
 	if err != nil {
@@ -104,22 +95,18 @@ func buildAgentRuntime(
 	}
 
 	rt := config.AgentRuntimeConfig{
-		InstanceID:                          fmt.Sprintf("%s-%d", kind.Kind, replicaIndex),
-		Kind:                                kind.Kind,
-		EventType:                           kind.EventType,
-		AllowedTools:                        allowed,
-		Model:                               model,
-		ObservationModel:                    observationModel,
-		ObservationModelContextWindowTokens: observationCapability.ContextWindowTokens,
-		ObservationModelMaxCompletionTokens: observationCapability.MaxCompletionTokens,
-		ObservationModelCapabilityDigest:    observationCapability.Digest,
-		ModelContextWindowTokens:            capability.ContextWindowTokens,
-		ModelMaxCompletionTokens:            capability.MaxCompletionTokens,
-		ModelCapabilityDigest:               capability.Digest,
-		SystemPrompt:                        string(promptBytes),
-		TaskMaxRetries:                      kind.TaskMaxRetries,
-		TeamAwareness:                       teamAwareness,
-		IdleThreshold:                       idleThreshold,
+		InstanceID:               fmt.Sprintf("%s-%d", kind.Kind, replicaIndex),
+		Kind:                     kind.Kind,
+		EventType:                kind.EventType,
+		AllowedTools:             allowed,
+		Model:                    model,
+		ModelContextWindowTokens: capability.ContextWindowTokens,
+		ModelMaxCompletionTokens: capability.MaxCompletionTokens,
+		ModelCapabilityDigest:    capability.Digest,
+		SystemPrompt:             string(promptBytes),
+		TaskMaxRetries:           kind.TaskMaxRetries,
+		TeamAwareness:            teamAwareness,
+		IdleThreshold:            idleThreshold,
 	}
 	return rt, nil
 }
@@ -180,7 +167,7 @@ func buildTeamAwareness(
 	b.WriteString("  必须先确认对方 Agent 类型拥有对应工具（见上表）。\n")
 	b.WriteString("- **发布新任务前，务必确认对方是否拥有对应的工具**。\n")
 	b.WriteString("  如果对方没有执行任务所需的工具，**禁止**发布该 Agent 无能力执行的任务。\n")
-	b.WriteString("  例如：对方没有 write_file → 不应要求其写入文件；\n")
+	b.WriteString("  例如：对方没有 apply_change → 不应要求其写入文件；\n")
 	b.WriteString("  对方没有 run_shell → 不应要求其执行命令。\n")
 	b.WriteString("- 若目标 Agent 缺少所需工具，可尝试要求其以**其他方式**完成或交付任务：\n")
 	b.WriteString("  如没有写入能力时，要求其以直接文字回复的形式回报；\n")
@@ -217,16 +204,12 @@ func buildSchedulerRuntime(sched config.SchedulerKind, llmCfg config.LLMConfig) 
 	}
 	capability, _ := llmCfg.ResolveModelCapability(model)
 	return config.AgentRuntimeConfig{
-		InstanceID:                          "scheduler",
-		Kind:                                "scheduler",
-		Model:                               model,
-		ModelContextWindowTokens:            capability.ContextWindowTokens,
-		ModelMaxCompletionTokens:            capability.MaxCompletionTokens,
-		ModelCapabilityDigest:               capability.Digest,
-		ObservationModel:                    model,
-		ObservationModelContextWindowTokens: capability.ContextWindowTokens,
-		ObservationModelMaxCompletionTokens: capability.MaxCompletionTokens,
-		ObservationModelCapabilityDigest:    capability.Digest,
+		InstanceID:               "scheduler",
+		Kind:                     "scheduler",
+		Model:                    model,
+		ModelContextWindowTokens: capability.ContextWindowTokens,
+		ModelMaxCompletionTokens: capability.MaxCompletionTokens,
+		ModelCapabilityDigest:    capability.Digest,
 		// AllowedTools / SystemPrompt 仍由 internal/scheduler 内部决定。
 	}
 }

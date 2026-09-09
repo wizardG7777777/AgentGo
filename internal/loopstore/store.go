@@ -933,7 +933,7 @@ func validateTransition(state *taskState, record Record) error {
 			return fmt.Errorf("%w: task %s 已初始化", ErrCASConflict, record.TaskID)
 		}
 		checkpoint := *record.Checkpoint
-		if checkpoint.UpdatedAt.After(record.At) || !record.At.Before(checkpoint.Deadlines.Attempt.HardDeadlineAt) {
+		if checkpoint.UpdatedAt.After(record.At) || (!checkpoint.Deadlines.Attempt.HardDeadlineAt.IsZero() && !record.At.Before(checkpoint.Deadlines.Attempt.HardDeadlineAt)) {
 			return fmt.Errorf("初始 checkpoint 时间窗口无效")
 		}
 		if !isCleanInitialCheckpoint(checkpoint) {
@@ -951,11 +951,11 @@ func validateTransition(state *taskState, record Record) error {
 		if reservation.ReservedAt.Before(state.checkpoint.UpdatedAt) {
 			return fmt.Errorf("reservation reserved_at 早于当前 checkpoint")
 		}
-		if reservation.ReservedAt.After(record.At) || !reservation.ExpiresAt.After(record.At) {
+		if reservation.ReservedAt.After(record.At) || (!reservation.ExpiresAt.IsZero() && !reservation.ExpiresAt.After(record.At)) {
 			return fmt.Errorf("reservation 在 journal 提交时尚未生效或已经过期")
 		}
-		if !reservation.Intent.DeadlineAt.Before(state.checkpoint.Deadlines.Attempt.HardDeadlineAt) ||
-			reservation.ExpiresAt.After(reservation.Intent.DeadlineAt) {
+		if (!state.checkpoint.Deadlines.Attempt.HardDeadlineAt.IsZero() && (reservation.Intent.DeadlineAt.IsZero() || reservation.Intent.DeadlineAt.After(state.checkpoint.Deadlines.Attempt.HardDeadlineAt))) ||
+			(!reservation.Intent.DeadlineAt.IsZero() && (reservation.ExpiresAt.IsZero() || reservation.ExpiresAt.After(reservation.Intent.DeadlineAt))) {
 			return fmt.Errorf("reservation/action deadline 未严格落在 Attempt hard deadline 内")
 		}
 		if _, exists := state.seenReservationIDs[reservation.ReservationID]; exists {
@@ -1120,7 +1120,7 @@ func validateTransition(state *taskState, record Record) error {
 			return fmt.Errorf("checkpoint_id=%s 重复", next.CheckpointID)
 		}
 		if next.UpdatedAt.Before(state.checkpoint.UpdatedAt) || next.UpdatedAt.After(record.At) ||
-			!record.At.Before(next.Deadlines.Attempt.HardDeadlineAt) {
+			(!next.Deadlines.Attempt.HardDeadlineAt.IsZero() && !record.At.Before(next.Deadlines.Attempt.HardDeadlineAt)) {
 			return fmt.Errorf("Attempt rollover 时间窗口无效")
 		}
 		if !sameActivationLineage(*state.checkpoint, next) || !sameCheckpointFactsForRollover(*state.checkpoint, next) {
@@ -1231,7 +1231,7 @@ func validateTransition(state *taskState, record Record) error {
 }
 
 func usageWithin(actual, reserved runcontract.BudgetUsage) bool {
-	return actual.WallTime <= reserved.WallTime &&
+	return (reserved.WallTime == 0 || actual.WallTime <= reserved.WallTime) &&
 		actual.PromptTokens <= reserved.PromptTokens &&
 		actual.CompletionTokens <= reserved.CompletionTokens &&
 		actual.ModelCalls <= reserved.ModelCalls &&

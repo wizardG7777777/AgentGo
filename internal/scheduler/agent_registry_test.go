@@ -12,13 +12,13 @@ func TestAgentRegistryRuntimeRoutesAreExactAndRemovable(t *testing.T) {
 	if reg.CanRoute("") {
 		t.Fatal("empty registry must not invent a default route")
 	}
-	if err := reg.RegisterRoute("static:writer", "", "", 1, "writer", []string{"read_file", "write_file"}); err != nil {
+	if err := reg.RegisterRoute("static:writer", "", "", 1, "writer", []string{"read_file", "apply_change"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := reg.RegisterRoute("team:verify", "team:verify", "ctrl-a", 1, "verifier", []string{"read_file", "submit_task_result"}); err != nil {
 		t.Fatal(err)
 	}
-	if !reg.CanRoute("") || !reg.CanRoute("", "write_file") {
+	if !reg.CanRoute("") || !reg.CanRoute("", "apply_change") {
 		t.Fatal("default static route should be ready with its own capabilities")
 	}
 	if !reg.CanRoute("team:verify", "read_file", "submit_task_result") {
@@ -33,7 +33,7 @@ func TestAgentRegistryRuntimeRoutesAreExactAndRemovable(t *testing.T) {
 	if reg.CanRouteForPlan("ctrl-b", "team:verify") || reg.CanRouteForPlan("", "team:verify") {
 		t.Fatal("dynamic Team route must not be routable by another or unmanaged scope")
 	}
-	if !reg.CanRouteForPlan("ctrl-a", "", "write_file") || !reg.CanRouteForPlan("ctrl-b", "", "write_file") {
+	if !reg.CanRouteForPlan("ctrl-a", "", "apply_change") || !reg.CanRouteForPlan("ctrl-b", "", "apply_change") {
 		t.Fatal("static route should remain global across scopes")
 	}
 	if !reg.UnregisterRoute("team:verify") || reg.CanRoute("team:verify") {

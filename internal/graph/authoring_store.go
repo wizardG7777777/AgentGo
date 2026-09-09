@@ -3,6 +3,7 @@ package graph
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -99,8 +100,10 @@ type authoringDelta struct {
 // fsync → 更新内存索引。它与现有 Graph Store 物理分离，commit 不会创建或恢复
 // GraphExecution。
 type AuthoringStore struct {
-	dir  string
-	file *os.File
+	requestOnce sync.Once
+	requestSlot chan struct{} // 串行化校验/提交，并允许排队中的请求取消。
+	dir         string
+	file        *os.File
 
 	mu           sync.RWMutex
 	closed       bool
@@ -113,6 +116,22 @@ type AuthoringStore struct {
 	starts       map[string]StartIntent
 	startByGraph map[string]string
 	changes      map[string]GraphChangeProposal
+}
+
+// WithRequest 将同一进程中的完整图变更请求串行化，Store 的日志锁仍逐次持有。
+// 图运行可继续推进，最终提交还须在 Runtime 锁内重新核对执行状态。
+func (s *AuthoringStore) WithRequest(ctx context.Context, action func() error) error {
+	s.requestOnce.Do(func() { s.requestSlot = make(chan struct{}, 1) })
+	select {
+	case s.requestSlot <- struct{}{}:
+		defer func() { <-s.requestSlot }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return action()
 }
 
 // NewAuthoringStore 创建并恢复 AuthoringStore。任何坏行、断链或对象冲突都

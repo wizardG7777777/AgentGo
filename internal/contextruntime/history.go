@@ -19,7 +19,6 @@ const (
 	historyProjectionMarker      = "<history-projection"
 	historyProjectionSummaryRune = policycatalog.HistoryProjectionSummaryRunes
 	historyProjectionKeepRecent  = policycatalog.HistoryProjectionKeepRecent
-	observationProjectionPrefix  = "observation:"
 )
 
 type historyProjectionReport struct {
@@ -35,14 +34,15 @@ type historyProjectionReport struct {
 // projectHistoryForContext 从不可变 Raw History 派生本次 replay 视图。触发依据
 // 是当前历史对 L2 conversation/tool_results section 的边际压力，而不是每轮
 // 重复计费的完整 prompt tokens。返回切片及其元素均不修改 input。
-// ProjectHistory 是 Replay v4 的生产投影。Raw History 不修改；
-// Observation 锚点只参与选择语义切点，不进入 provider wire。已被最新
-// Observation 覆盖的探索结果和重复 read/grep/list 旧副本都转成稳定 ContentRef。
+// ProjectHistory 从 Raw History 生成有界视图；仅将重复的同文件读取投影为稳定 ContentRef。
 func ProjectHistory(ctx context.Context, input []contextcontract.HistoryEntry,
 	policy contextcontract.ContextBudgetPolicy, replayVersion int, attemptID string,
 	content *contentstore.Store, scope contentstore.Scope,
 ) ([]contextcontract.HistoryEntry, historyProjectionReport, []contentstore.ContentRef, error) {
 	report := historyProjectionReport{OriginalEntries: len(input)}
+	if replayVersion != 5 {
+		return nil, report, nil, fmt.Errorf("拒绝旧 Replay policy %d", replayVersion)
+	}
 	if len(input) == 0 {
 		return nil, report, nil, nil
 	}
@@ -54,13 +54,13 @@ func ProjectHistory(ctx context.Context, input []contextcontract.HistoryEntry,
 			aggressive = true
 			continue
 		}
+		if entry.ContextProjection != "" {
+			return nil, report, nil, fmt.Errorf("拒绝退役的历史控制投影 %q", entry.ContextProjection)
+		}
 		raw = append(raw, cloneHistoryProjectionEntry(entry))
 	}
-	if replayVersion != 5 {
-		return nil, report, nil, fmt.Errorf("拒绝旧 Replay policy %d", replayVersion)
-	}
 	var err error
-	raw, externalized, report.ReferencedFragments, report.DeduplicatedFragments, err = projectReplayV4(ctx, raw, attemptID, content, scope)
+	raw, externalized, report.ReferencedFragments, report.DeduplicatedFragments, err = projectDuplicateReads(ctx, raw, attemptID, content, scope)
 	if err != nil {
 		return nil, report, externalized, err
 	}
@@ -117,15 +117,9 @@ type replayProjectionTarget struct {
 	reason      string
 }
 
-func projectReplayV4(ctx context.Context, history []contextcontract.HistoryEntry, attemptID string,
+func projectDuplicateReads(ctx context.Context, history []contextcontract.HistoryEntry, attemptID string,
 	content *contentstore.Store, scope contentstore.Scope,
 ) ([]contextcontract.HistoryEntry, []contentstore.ContentRef, int, int, error) {
-	anchor := -1
-	for i, entry := range history {
-		if strings.HasPrefix(entry.ContextProjection, observationProjectionPrefix) {
-			anchor = i
-		}
-	}
 	latest := make(map[string]replayProjectionTarget)
 	for entryIndex := len(history) - 1; entryIndex >= 0; entryIndex-- {
 		entry := history[entryIndex]
@@ -163,9 +157,6 @@ func projectReplayV4(ctx context.Context, history []contextcontract.HistoryEntry
 				continue
 			}
 			reasons := make([]string, 0, 2)
-			if anchor >= 0 && entryIndex < anchor {
-				reasons = append(reasons, "observation_covered")
-			}
 			key := stableReplayDedupKey(attemptID, call, entry.ToolResults[resultIndex].Content)
 			if newest := latest[key]; newest.entryIndex != entryIndex || newest.resultIndex != resultIndex {
 				reasons = append(reasons, "duplicate_content")
@@ -176,40 +167,12 @@ func projectReplayV4(ctx context.Context, history []contextcontract.HistoryEntry
 		}
 	}
 
-	assistantTargets := make(map[int]string)
-	if anchor >= 0 {
-		for entryIndex := 0; entryIndex < anchor; entryIndex++ {
-			entry := history[entryIndex]
-			if entry.AssistantContent == "" || len(entry.ToolCalls) == 0 {
-				continue
-			}
-			allExploration := true
-			for _, call := range entry.ToolCalls {
-				if !deduplicatedExplorationTool(call.Name) {
-					allExploration = false
-					break
-				}
-			}
-			if allExploration {
-				assistantTargets[entryIndex] = "observation_covered"
-			}
-		}
+	if len(targets) > 0 && content == nil {
+		return nil, nil, 0, 0, fmt.Errorf("重复读取投影需要 Content Store")
 	}
-	if (len(targets) > 0 || len(assistantTargets) > 0) && content == nil {
-		return nil, nil, 0, 0, fmt.Errorf("Replay v4 需要 Content Store 才能引用化探索历史")
-	}
-	refs := make([]contentstore.ContentRef, 0, len(targets)+len(assistantTargets))
+	refs := make([]contentstore.ContentRef, 0, len(targets))
 	referenced, deduplicated := 0, 0
 	for entryIndex := range history {
-		if reason, ok := assistantTargets[entryIndex]; ok {
-			ref, err := putReplayProjection(ctx, content, scope, history[entryIndex].AssistantContent)
-			if err != nil {
-				return nil, refs, referenced, deduplicated, err
-			}
-			history[entryIndex].AssistantContent = renderReplayReference("agentgo.assistant-content-ref/v1", ref, reason)
-			refs = append(refs, ref)
-			referenced++
-		}
 		for resultIndex := range history[entryIndex].ToolResults {
 			reason, ok := targets[[2]int{entryIndex, resultIndex}]
 			if !ok {
@@ -228,7 +191,7 @@ func projectReplayV4(ctx context.Context, history []contextcontract.HistoryEntry
 			}
 		}
 	}
-	return removeObservationProjectionAnchors(history), refs, referenced, deduplicated, nil
+	return history, refs, referenced, deduplicated, nil
 }
 
 func cloneHistoryProjectionEntry(entry contextcontract.HistoryEntry) contextcontract.HistoryEntry {
@@ -247,20 +210,9 @@ func cloneHistoryProjectionEntry(entry contextcontract.HistoryEntry) contextcont
 	return out
 }
 
-func removeObservationProjectionAnchors(history []contextcontract.HistoryEntry) []contextcontract.HistoryEntry {
-	out := make([]contextcontract.HistoryEntry, 0, len(history))
-	for _, entry := range history {
-		if strings.HasPrefix(entry.ContextProjection, observationProjectionPrefix) {
-			continue
-		}
-		out = append(out, entry)
-	}
-	return out
-}
-
 func deduplicatedExplorationTool(name string) bool {
 	switch name {
-	case "read_file", "grep_search", "list_dir", "glob_search":
+	case "read_file":
 		return true
 	default:
 		return false
@@ -268,17 +220,7 @@ func deduplicatedExplorationTool(name string) bool {
 }
 
 func stableReplayDedupKey(attemptID string, call llm.ToolCall, content string) string {
-	target := "."
-	switch call.Name {
-	case "glob_search":
-		if value, _ := call.Arguments["root_dir"].(string); strings.TrimSpace(value) != "" {
-			target = value
-		}
-	default:
-		if value, _ := call.Arguments["path/filepath"].(string); strings.TrimSpace(value) != "" {
-			target = value
-		}
-	}
+	target, _ := call.Arguments["path"].(string)
 	target = filepath.ToSlash(filepath.Clean(strings.ReplaceAll(strings.TrimSpace(target), "\\", "/")))
 	payload, _ := json.Marshal(struct {
 		AttemptID string `json:"attempt_id"`

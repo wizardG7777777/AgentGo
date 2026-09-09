@@ -6,19 +6,17 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/agenttemplate"
-	"agentgo/internal/graph"
 	"agentgo/internal/interaction"
 	"agentgo/internal/mailbox"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
-	"agentgo/internal/taskmem"
 )
 
 // registerAllGroupsFully 用"能让每个 Group 注册其完整工具集"的最小依赖构造
 // 全部 ToolGroup 并注册到 r（F7）。各 Group 的 nil-skip 规则对应关系：
 //   - LocalReadGroup / LocalWriteGroup / ShellGroup：无 skip 规则，全量注册
 //   - WebGroup：Provider 非 nil 才注册（fakeSearchProvider）
-//   - MetaGroup：publish_task 需 Store、send_message 需 MBRegistry
+//   - CommunicationGroup：publish_task 需 Store、send_message 需 MBRegistry
 //   - PlanControlGroup：Store / Holder 非 nil 才注册（request_replan 恒注册）；
 //     submit_task_result 另需 FinalizationNotifier + SubmitState 提交通道注入
 //   - SchedulerGroup：Store 非 nil 注册 cancel_task/probe_directory，
@@ -39,7 +37,8 @@ func registerAllGroupsFully(t *testing.T, r *agent.ToolRegistry) {
 
 	RegisterGroups(r,
 		LocalReadGroup{Workdir: &DefaultWorkdir{ProjectRoot: t.TempDir()}},
-		ContentRefGroup{},
+		EvidenceGroup{},
+		InspectionGroup{},
 		LocalWriteGroup{
 			LocalReadGroup: LocalReadGroup{Workdir: &DefaultWorkdir{ProjectRoot: t.TempDir()}},
 			Roster:         &recordingRoster{},
@@ -47,8 +46,7 @@ func registerAllGroupsFully(t *testing.T, r *agent.ToolRegistry) {
 		},
 		WebGroup{Provider: &fakeSearchProvider{}},
 		ShellGroup{Workdir: &DefaultWorkdir{ProjectRoot: t.TempDir()}, AgentID: "agent-1"},
-		CheckGroup{},
-		MetaGroup{
+		CommunicationGroup{
 			Store: newFakeStore(), MBRegistry: mailbox.NewRegistry(8),
 			Interactions: interaction.NewService(nil), AgentID: "agent-1",
 		},
@@ -57,14 +55,6 @@ func registerAllGroupsFully(t *testing.T, r *agent.ToolRegistry) {
 			// submit_task_result 需提交通道注入才注册；全量并集守护按完整依赖装配。
 			FinalizationNotifier: &fakeFinalizationNotifier{},
 			SubmitState:          agent.NewSubmitState(),
-			RecoveryAuthority:    (*graph.Runtime)(nil),
-		},
-		ObservationGroup{
-			Store: taskStore, TaskMem: taskmem.NewStore(t.TempDir()),
-			Holder: &fakeHolder{id: "controller"}, AgentID: "agent-1",
-		},
-		SchedulerGroup{
-			Store: newFakeStore(), Holder: &fakeHolder{id: "sched"}, ProjectRoot: t.TempDir(),
 		},
 		AgentTemplateGroup{
 			Catalog: catalog, Provisioner: &recordingTemplateProvisioner{},
@@ -72,7 +62,6 @@ func registerAllGroupsFully(t *testing.T, r *agent.ToolRegistry) {
 		},
 		// GraphControlGroup 无条件注册两个工具（nil 依赖在调用时报明确中文
 		// 错误），全量并集守护按零依赖装配即可。
-		GraphControlGroup{},
 		GraphAuthoringGroup{},
 	)
 }

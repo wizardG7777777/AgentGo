@@ -2473,24 +2473,20 @@ func exportLease(src *model.ExecutionLease) *session.LeaseSnapshot {
 		return nil
 	}
 	return &session.LeaseSnapshot{
-		Schema:                              src.Schema,
-		Attempt:                             src.Attempt,
-		FrozenAt:                            formatTime(src.FrozenAt),
-		BusinessTools:                       append([]string(nil), src.BusinessTools...),
-		ControlTools:                        append([]string(nil), src.ControlTools...),
-		Model:                               src.Model,
-		ModelContextWindowTokens:            src.ModelContextWindowTokens,
-		ModelMaxCompletionTokens:            src.ModelMaxCompletionTokens,
-		ModelCapabilityDigest:               src.ModelCapabilityDigest,
-		ObservationModel:                    src.ObservationModel,
-		ObservationModelContextWindowTokens: src.ObservationModelContextWindowTokens,
-		ObservationModelMaxCompletionTokens: src.ObservationModelMaxCompletionTokens,
-		ObservationModelCapabilityDigest:    src.ObservationModelCapabilityDigest,
-		Workspace:                           src.Workspace,
-		Synthetic:                           src.Synthetic,
-		ApprovalRequired:                    src.ApprovalRequired,
-		Revoked:                             src.Revoked,
-		Digest:                              src.Digest,
+		Schema:                   src.Schema,
+		Attempt:                  src.Attempt,
+		FrozenAt:                 formatTime(src.FrozenAt),
+		BusinessTools:            append([]string(nil), src.BusinessTools...),
+		ControlTools:             append([]string(nil), src.ControlTools...),
+		Model:                    src.Model,
+		ModelContextWindowTokens: src.ModelContextWindowTokens,
+		ModelMaxCompletionTokens: src.ModelMaxCompletionTokens,
+		ModelCapabilityDigest:    src.ModelCapabilityDigest,
+		Workspace:                src.Workspace,
+		Synthetic:                src.Synthetic,
+		ApprovalRequired:         src.ApprovalRequired,
+		Revoked:                  src.Revoked,
+		Digest:                   src.Digest,
 	}
 }
 
@@ -2503,24 +2499,20 @@ func importLease(src *session.LeaseSnapshot) *model.ExecutionLease {
 	}
 	frozenAt, _ := parseTime(src.FrozenAt) // 空串/非法值 → 零值时间，向后兼容
 	return &model.ExecutionLease{
-		Schema:                              src.Schema,
-		Attempt:                             src.Attempt,
-		FrozenAt:                            frozenAt,
-		BusinessTools:                       append([]string(nil), src.BusinessTools...),
-		ControlTools:                        append([]string(nil), src.ControlTools...),
-		Model:                               src.Model,
-		ModelContextWindowTokens:            src.ModelContextWindowTokens,
-		ModelMaxCompletionTokens:            src.ModelMaxCompletionTokens,
-		ModelCapabilityDigest:               src.ModelCapabilityDigest,
-		ObservationModel:                    src.ObservationModel,
-		ObservationModelContextWindowTokens: src.ObservationModelContextWindowTokens,
-		ObservationModelMaxCompletionTokens: src.ObservationModelMaxCompletionTokens,
-		ObservationModelCapabilityDigest:    src.ObservationModelCapabilityDigest,
-		Workspace:                           src.Workspace,
-		Synthetic:                           src.Synthetic,
-		ApprovalRequired:                    src.ApprovalRequired,
-		Revoked:                             src.Revoked,
-		Digest:                              src.Digest,
+		Schema:                   src.Schema,
+		Attempt:                  src.Attempt,
+		FrozenAt:                 frozenAt,
+		BusinessTools:            append([]string(nil), src.BusinessTools...),
+		ControlTools:             append([]string(nil), src.ControlTools...),
+		Model:                    src.Model,
+		ModelContextWindowTokens: src.ModelContextWindowTokens,
+		ModelMaxCompletionTokens: src.ModelMaxCompletionTokens,
+		ModelCapabilityDigest:    src.ModelCapabilityDigest,
+		Workspace:                src.Workspace,
+		Synthetic:                src.Synthetic,
+		ApprovalRequired:         src.ApprovalRequired,
+		Revoked:                  src.Revoked,
+		Digest:                   src.Digest,
 	}
 }
 
@@ -2569,6 +2561,7 @@ func exportToolCallSnapshots(byTool map[string][]ToolCallRecord) []session.ToolC
 			timestamp = record.Timestamp.UTC().Format(time.RFC3339Nano)
 		}
 		out[i] = session.ToolCallSnapshot{
+			InvocationID: record.InvocationID, Dispatched: record.Dispatched, DurationMS: record.DurationMS, ResultContent: record.ResultContent,
 			Timestamp:     timestamp,
 			RunID:         record.RunID,
 			AttemptID:     record.AttemptID,
@@ -2610,6 +2603,7 @@ func importToolCallSnapshots(snapshots []session.ToolCallSnapshot) (map[string][
 			}
 		}
 		record := ToolCallRecord{
+			InvocationID: snapshot.InvocationID, Dispatched: snapshot.Dispatched, DurationMS: snapshot.DurationMS, ResultContent: snapshot.ResultContent,
 			Timestamp:     timestamp,
 			RunID:         snapshot.RunID,
 			AttemptID:     snapshot.AttemptID,

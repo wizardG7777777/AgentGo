@@ -108,9 +108,7 @@ func (Evaluator) Evaluate(contract loopcontract.CompiledProgressContract, checkp
 		ResetDeliverableClock: class == loopcontract.ProgressDeliverable || class == loopcontract.ProgressVerification,
 		BudgetCharge:          delta.UsageDelta, ReasonCode: reason,
 	}
-	if contract.Policy.MaxDecisionStagnation > 0 {
-		assessment.DecisionAdvance = acceptedDecisionSignal(accepted)
-	}
+	assessment.DecisionAdvance = acceptedDecisionSignal(accepted)
 	if err := assessment.Validate(); err != nil {
 		return loopcontract.ProgressAssessment{}, loopcontract.ProgressCheckpoint{}, fmt.Errorf("生成的 Assessment 无效: %w", err)
 	}
@@ -254,15 +252,7 @@ func projectCandidates(delta loopcontract.TurnSettlementDelta) []candidate {
 			rejectReason: rejectReason,
 		})
 	}
-	if change := delta.ObservationChange; change != nil && change.SemanticAdvance {
-		digest := stableID("observation-state", change.WorkspaceRevisionRef,
-			change.LatestCheckRef, strconv.Itoa(change.ResolvedCandidates))
-		out = append(out, candidate{
-			fingerprint: fingerprint(loopcontract.SignalObservationStateAdvanced,
-				change.Phase, digest),
-			class: loopcontract.ProgressCoordination,
-		})
-	}
+
 	for _, settlement := range delta.EffectSettlements {
 		identity := settlement.Kind + ":" + settlement.Target
 		digest := firstNonEmpty(settlement.OutcomeDigest, settlement.Status)
@@ -380,35 +370,6 @@ func advanceCheckpoint(contract loopcontract.CompiledProgressContract, previous 
 		return loopcontract.ProgressCheckpoint{}, fmt.Errorf("累计 usage 失败: %w", err)
 	}
 	next.CumulativeUsage = cumulative
-	if delta.ObservationDeltaRef != "" {
-		next.ObservationDeltaRef = delta.ObservationDeltaRef
-		next.ObservationAttemptID = delta.AttemptID
-		if delta.ObservationChange != nil {
-			next.ObservationPhase = delta.ObservationChange.Phase
-			next.ObservationWorkspaceRevisionRef = delta.ObservationChange.WorkspaceRevisionRef
-			next.ObservationLatestCheckRef = delta.ObservationChange.LatestCheckRef
-			if delta.ObservationChange.SemanticAdvance {
-				next.ObservationStagnationCount = 0
-			} else {
-				next.ObservationStagnationCount++
-			}
-		}
-	}
-	if contract.Policy.MaxDecisionStagnation > 0 {
-		if assessment.DecisionAdvance {
-			next.DecisionStagnationCount = 0
-		} else if delta.ObservationDeltaRef != "" {
-			next.DecisionStagnationCount++
-		}
-	}
-	if contract.Policy.MaxControlContractFailures > 0 {
-		if delta.ControlContractFailure {
-			next.ControlContractFailureCount++
-		} else if delta.ObservationDeltaRef != "" {
-			next.ControlContractFailureCount = 0
-		}
-	}
-
 	if assessment.ResetAnyProgressClock {
 		next.LastAnyProgressAt = delta.SettledAt
 		next.NoProgressTurns = 0
@@ -439,20 +400,6 @@ func advanceCheckpoint(contract loopcontract.CompiledProgressContract, previous 
 		next.ExplorationTurnsSinceDeliverable = 0
 	} else if assessment.Class == loopcontract.ProgressKnowledge {
 		next.ExplorationTurnsSinceDeliverable++
-		next.KnowledgeTurnsSinceObservation++
-	}
-	if delta.ObservationDeltaRef != "" {
-		next.KnowledgeTurnsSinceObservation = 0
-	}
-	if contract.Policy.DecisionCheckpointAfterTurns > 0 {
-		switch {
-		case delta.ObservationDeltaRef != "":
-			next.TurnsSinceDecisionCheckpoint = 0
-		case (contract.Ref.ContractID == "progress:code-change/v10" || contract.Ref.ContractID == "progress:code-change/v11") && assessment.DecisionAdvance:
-			next.TurnsSinceDecisionCheckpoint = 0
-		case !delta.ControlContractFailure && assessment.Class != loopcontract.ProgressInvocationFailure:
-			next.TurnsSinceDecisionCheckpoint++
-		}
 	}
 	if err := next.Validate(); err != nil {
 		return loopcontract.ProgressCheckpoint{}, fmt.Errorf("生成的下一 Checkpoint 无效: %w", err)

@@ -1,19 +1,8 @@
-// Package tools 提供基于 ToolGroup 的工具集合架构。
-//
-// 设计目的：
-//   - 消除 Worker 和 Explorer 中工具注册的零散重复实现
-//   - 通过 Group 封装依赖，减少 make*Tool 函数签名的混乱
-//   - 通过组合不同的 Group 即可为代理裁剪能力（Explorer 不组合 LocalWriteGroup → 编译期保证只读）
-//
-// 标准 Group：
-//   - LocalReadGroup：read_file / list_dir / grep_search / glob_search（Worker + Explorer 共享）
-//   - ContentRefGroup：read_content_ref（冻结 Lease + Session/Graph/Task scope 显式解引用）
-//   - LocalWriteGroup：write_file / edit_file（仅 Worker，嵌入 LocalReadGroup 复用依赖）
-//   - WebGroup：web_search / web_fetch（Worker + Explorer 共享）
-//   - ShellGroup：run_shell（仅 Worker，含审批拦截链）
-//   - MetaGroup：publish_task / send_message（Worker、Explorer 各有不同变体）
-//   - ObservationGroup：record_observation_delta（结构化工作状态检查点）
-//   - CheckGroup：run_check（带 workspace revision 的 durable 检查）
+// Package tools 按执行、编排、检视与通信职责注册工具，依赖由 L3 装配注入。
+// LocalReadGroup/LocalWriteGroup/ShellGroup 提供 read_file/apply_change/run_shell；
+// GraphAuthoringGroup 提供图定义事务；InspectionGroup/EvidenceGroup 提供运行事实；
+// CommunicationGroup 传递信息或用户交互。Web 与 Team 是可选能力。
+// 工具目录不是每个角色的授权集合，最终能力由 ExecutionLease/ToolRouter 冻结。
 package tools
 
 import (

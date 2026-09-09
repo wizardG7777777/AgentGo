@@ -17,8 +17,7 @@ import (
 func newMailboxRunTask(t *testing.T, id string) *model.Task {
 	t.Helper()
 	task := &model.Task{ID: id, Description: "mail source " + id, MaxConcurrency: 1}
-	if err := taskcontract.Start(task, loopcontract.WorkInvestigation, "test-mail/v1",
-		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+	if err := taskcontract.Start(task, loopcontract.WorkInvestigation, "test-mail/v1"); err != nil {
 		t.Fatal(err)
 	}
 	return task

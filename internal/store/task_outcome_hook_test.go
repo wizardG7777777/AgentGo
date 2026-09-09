@@ -131,8 +131,7 @@ func TestTerminalOutcomeHookFailureLeavesTaskUnchanged(t *testing.T) {
 func TestOutcomeRefSurvivesSnapshotAndRecoveredProjection(t *testing.T) {
 	s := NewMemoryTaskStore(nil, 16, 1, 60)
 	task := &model.Task{ID: "task-snapshot", Description: "任务", GraphDefinitionDigestVersion: "definition/v1"}
-	if err := taskcontract.Start(task, loopcontract.WorkVerification, "test-authoring/v1",
-		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+	if err := taskcontract.Start(task, loopcontract.WorkVerification, "test-authoring/v1"); err != nil {
 		t.Fatalf("建立 authoring Task 运行契约: %v", err)
 	}
 	if err := s.PublishTask(task); err != nil {

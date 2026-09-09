@@ -48,8 +48,7 @@ reactors:
 
 	tasks := store.NewMemoryTaskStore(nil, 8, 1, 60)
 	source := &model.Task{ID: "reactor-source", Description: "source"}
-	if err := taskcontract.Start(source, loopcontract.WorkInvestigation, "test-reactor-mail/v1",
-		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+	if err := taskcontract.Start(source, loopcontract.WorkInvestigation, "test-reactor-mail/v1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := tasks.PublishTask(source); err != nil {

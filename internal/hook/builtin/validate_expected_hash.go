@@ -9,7 +9,7 @@ import (
 	"agentgo/internal/hook"
 )
 
-// ValidateExpectedHashHook 在 write_file / edit_file 调用之前校验 args
+// ValidateExpectedHashHook 在 apply_change / apply_change 调用之前校验 args
 // 中的 expected_hash 是否与目标文件当前内容的 SHA256 一致。
 //
 // 这是 LocalWriteGroup.writeFile / editFile 中乐观并发控制段的 C7 迁移。
@@ -64,9 +64,9 @@ func (h *ValidateExpectedHashHook) Phase() hook.ToolHookPhase { return hook.Phas
 // Priority 返回 20。
 func (h *ValidateExpectedHashHook) Priority() int { return 20 }
 
-// Matches 仅匹配 write_file 和 edit_file。
+// Matches 仅匹配 apply_change 和 apply_change。
 func (h *ValidateExpectedHashHook) Matches(toolName string) bool {
-	return toolName == "write_file" || toolName == "edit_file"
+	return toolName == "apply_change"
 }
 
 // Run 执行 hash 校验逻辑。

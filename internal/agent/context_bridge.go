@@ -23,11 +23,8 @@ func contextSessionScope(r contextruntime.Runtime, t *model.Task) string {
 }
 func executionContextInput(r contextruntime.Runtime, t *model.Task, deps map[string]string, history []contextcontract.HistoryEntry, router ToolRouterSnapshot, limit llm.OutputBudget) contextruntime.Input {
 	opts := r.Options
-	opts.ToolChoice = invocationToolChoice(router)
+	opts.ToolChoice = llm.ToolChoice{Mode: llm.ToolChoiceAuto}
 	opts.ProfileRef = router.Phase
-	if effort, ok := phaseReasoningEffortOverride(router.Phase); ok {
-		opts.ReasoningEffort = effort
-	}
 	leaseRef := ""
 	var window, completion int64
 	if t.Lease != nil {
@@ -36,17 +33,11 @@ func executionContextInput(r contextruntime.Runtime, t *model.Task, deps map[str
 		opts.CapabilityDigest = t.Lease.ModelCapabilityDigest
 		window = t.Lease.ModelContextWindowTokens
 		completion = t.Lease.ModelMaxCompletionTokens
-		if isAutoObservationPhase(router.Phase) {
-			opts.Model = t.Lease.ObservationModel
-			opts.CapabilityDigest = t.Lease.ObservationModelCapabilityDigest
-			window = t.Lease.ObservationModelContextWindowTokens
-			completion = t.Lease.ObservationModelMaxCompletionTokens
-		}
 	}
 	if r.ResolveModelOptions != nil {
 		opts.InputCapability = r.ResolveModelOptions(opts.Model).InputCapability
 	}
-	in := contextruntime.Input{Identity: llm.Identity{TaskID: t.ID, GraphID: t.GraphID, NodeID: t.NodeID, ActivationID: t.ActivationID, RunID: string(t.RunID), SessionID: contextSessionScope(r, t), ContextPolicyID: t.ContextPolicyRef}, History: history, Dependencies: deps, ToolRouter: contextruntime.ToolRouterBinding{SnapshotID: router.ID, Definitions: router.Defs}, Options: opts, OutputLimit: &limit, ExecutionLeaseRef: leaseRef, WindowTokens: window, CompletionTokens: completion, SuppressUpstream: isObservationPhase(router.Phase)}
+	in := contextruntime.Input{Identity: llm.Identity{TaskID: t.ID, GraphID: t.GraphID, NodeID: t.NodeID, ActivationID: t.ActivationID, RunID: string(t.RunID), SessionID: contextSessionScope(r, t), ContextPolicyID: t.ContextPolicyRef}, History: history, Dependencies: deps, ToolRouter: contextruntime.ToolRouterBinding{SnapshotID: router.ID, Definitions: router.Defs}, Options: opts, OutputLimit: &limit, ExecutionLeaseRef: leaseRef, WindowTokens: window, CompletionTokens: completion}
 	if t.RunContract != nil {
 		in.Deadline = t.RunContract.DeadlineAt
 	}

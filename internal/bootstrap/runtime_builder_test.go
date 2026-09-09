@@ -44,22 +44,7 @@ func TestBuildAgentRuntime_IdleThresholdFromGlobalConfig(t *testing.T) {
 	}
 }
 
-func TestBuildAgentRuntimeObservationModelDefaultsAndOverride(t *testing.T) {
-	prompt := writeTempPromptFile(t)
-	llmCfg := config.LLMConfig{DefaultModel: "default", DefaultContextWindowTokens: 200000, DefaultMaxCompletionTokens: 20000,
-		ModelCapabilities: map[string]config.ModelCapabilityConfig{"control": {ContextWindowTokens: 300000, MaxCompletionTokens: 30000}}, RequestContract: "agentgo.model-request/v1"}
-	for _, tc := range []struct{ observation, want string }{{"", "business"}, {"control", "control"}} {
-		kind := config.AgentKind{Kind: "worker", Tools: []string{"read_file"}, Model: "business",
-			ObservationModel: tc.observation, SystemPromptFile: prompt}
-		rt, err := buildAgentRuntime(kind, llmCfg, nil, []config.AgentKind{kind}, 1, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if rt.ObservationModel != tc.want || rt.ObservationModelCapabilityDigest == "" {
-			t.Fatalf("observation_model=%q runtime=%+v", tc.observation, rt)
-		}
-	}
-}
+
 
 // writeTempPromptFile 是测试辅助：写一个最小 system prompt 文件并返回路径。
 func writeTempPromptFile(t *testing.T) string {
@@ -121,7 +106,7 @@ func TestBuildAgentRuntime_TeamAwarenessMissingProfileIsError(t *testing.T) {
 func TestBuildAgentRuntime_ToolsInlineBypassesProfileResolution(t *testing.T) {
 	kind := config.AgentKind{
 		Kind:             "worker",
-		Tools:            []string{"read_file", "write_file"},
+		Tools:            []string{"read_file", "apply_change"},
 		SystemPromptFile: writeTempPromptFile(t),
 	}
 	rt, err := buildAgentRuntime(kind, config.LLMConfig{DefaultModel: "m", RequestContract: "agentgo.model-request/v1"}, nil,
@@ -129,9 +114,8 @@ func TestBuildAgentRuntime_ToolsInlineBypassesProfileResolution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildAgentRuntime: %v", err)
 	}
-	if len(rt.AllowedTools) != 4 || rt.AllowedTools[0] != "read_file" || rt.AllowedTools[1] != "write_file" ||
-		rt.AllowedTools[2] != "record_observation_delta" || rt.AllowedTools[3] != "submit_change_decision" {
-		t.Errorf("AllowedTools=%v, want 用户工具 + framework control", rt.AllowedTools)
+	if len(rt.AllowedTools) != 2 || rt.AllowedTools[0] != "read_file" || rt.AllowedTools[1] != "apply_change" {
+		t.Errorf("AllowedTools=%v, 期望仅用户声明工具", rt.AllowedTools)
 	}
 }
 

@@ -19,7 +19,7 @@ import (
 )
 
 // toolNames is the set of tool names used for random generation.
-var toolNames = []string{"write_file", "edit_file", "read_file", "publish_subtask", "run_shell"}
+var toolNames = []string{"apply_change", "read_file", "publish_subtask", "run_shell"}
 
 // randomExecuteResult generates a random ExecuteResult with 0-5 ToolCalls.
 // Each ToolCall has a random Name from toolNames, and the corresponding
@@ -32,7 +32,7 @@ func randomExecuteResult(rng *rand.Rand) ExecuteResult {
 		name := toolNames[rng.Intn(len(toolNames))]
 		args := map[string]any{}
 		// Give write/edit tools a random path argument
-		if name == "write_file" || name == "edit_file" {
+		if name == "apply_change" {
 			args["path"] = randomPath(rng)
 		}
 		calls[i] = llm.ToolCall{
@@ -80,11 +80,11 @@ func randomString(rng *rand.Rand, length int) string {
 }
 
 // expectedFileWriteDetected is the oracle: returns true iff there exists at least
-// one ToolCall with Name "write_file" or "edit_file" whose corresponding
+// one ToolCall with Name "apply_change" or "apply_change" whose corresponding
 // contextcontract.ToolResult.Content does NOT start with "错误:".
 func expectedFileWriteDetected(result ExecuteResult) bool {
 	for i, tc := range result.ToolCalls {
-		if tc.Name != "write_file" && tc.Name != "edit_file" {
+		if tc.Name != "apply_change" {
 			continue
 		}
 		if i >= len(result.ToolResults) {
@@ -99,7 +99,7 @@ func expectedFileWriteDetected(result ExecuteResult) bool {
 }
 
 // TestProperty1_FileWriteDetection verifies that detectFileWrite returns a
-// non-empty list if and only if there exists a successful write_file/edit_file
+// non-empty list if and only if there exists a successful apply_change/apply_change
 // call in the ExecuteResult.
 //
 // **Validates: Requirements 1.1**
@@ -311,7 +311,7 @@ func TestProperty8_ConfigDisabledSkipsAll(t *testing.T) {
 		triggeringResult := ExecuteResult{
 			ToolCalled: true,
 			ToolCalls: []llm.ToolCall{
-				{ID: "tc1", Name: "write_file", Arguments: map[string]any{"path": "src/foo.go"}},
+				{ID: "tc1", Name: "apply_change", Arguments: map[string]any{"path": "src/foo.go"}},
 				{ID: "tc2", Name: "publish_subtask", Arguments: map[string]any{}},
 			},
 			ToolResults: []contextcontract.ToolResult{
@@ -392,12 +392,12 @@ func TestProperty4_AtMostOncePerTriggerType(t *testing.T) {
 		}
 
 		// Build an ExecuteResult that triggers ALL conditions:
-		// - write_file with successful result
+		// - apply_change with successful result
 		// - publish_subtask
 		triggeringResult := ExecuteResult{
 			ToolCalled: true,
 			ToolCalls: []llm.ToolCall{
-				{ID: "tc1", Name: "write_file", Arguments: map[string]any{"path": "src/foo.go"}},
+				{ID: "tc1", Name: "apply_change", Arguments: map[string]any{"path": "src/foo.go"}},
 				{ID: "tc2", Name: "publish_subtask", Arguments: map[string]any{}},
 			},
 			ToolResults: []contextcontract.ToolResult{
@@ -473,7 +473,7 @@ func TestProgressNotify_NilMailRegistry_NoPanic(t *testing.T) {
 	result := ExecuteResult{
 		ToolCalled: true,
 		ToolCalls: []llm.ToolCall{
-			{ID: "tc1", Name: "write_file", Arguments: map[string]any{"path": "src/foo.go"}},
+			{ID: "tc1", Name: "apply_change", Arguments: map[string]any{"path": "src/foo.go"}},
 			{ID: "tc2", Name: "publish_subtask", Arguments: map[string]any{}},
 		},
 		ToolResults: []contextcontract.ToolResult{
@@ -520,7 +520,7 @@ func TestProgressNotify_SendError_NoInterrupt(t *testing.T) {
 	result := ExecuteResult{
 		ToolCalled: true,
 		ToolCalls: []llm.ToolCall{
-			{ID: "tc1", Name: "write_file", Arguments: map[string]any{"path": "src/bar.go"}},
+			{ID: "tc1", Name: "apply_change", Arguments: map[string]any{"path": "src/bar.go"}},
 			{ID: "tc2", Name: "publish_subtask", Arguments: map[string]any{}},
 		},
 		ToolResults: []contextcontract.ToolResult{
@@ -568,7 +568,7 @@ func TestProgressNotify_PanicRecovery(t *testing.T) {
 	result := ExecuteResult{
 		ToolCalled: true,
 		ToolCalls: []llm.ToolCall{
-			{ID: "tc1", Name: "write_file", Arguments: map[string]any{"path": "src/panic.go"}},
+			{ID: "tc1", Name: "apply_change", Arguments: map[string]any{"path": "src/panic.go"}},
 		},
 		ToolResults: []contextcontract.ToolResult{
 			{ToolCallID: "tc1", Content: "success"},
@@ -623,7 +623,7 @@ func TestProgressNotify_TraceEventKind(t *testing.T) {
 	result := ExecuteResult{
 		ToolCalled: true,
 		ToolCalls: []llm.ToolCall{
-			{ID: "tc1", Name: "write_file", Arguments: map[string]any{"path": "src/traced.go"}},
+			{ID: "tc1", Name: "apply_change", Arguments: map[string]any{"path": "src/traced.go"}},
 		},
 		ToolResults: []contextcontract.ToolResult{
 			{ToolCallID: "tc1", Content: "success"},

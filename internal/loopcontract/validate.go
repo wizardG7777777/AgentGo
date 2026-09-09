@@ -53,7 +53,7 @@ func (r ProgressContractRef) Validate() error {
 }
 
 func (c CompiledProgressContract) Validate() error {
-	if c.Schema != CompiledSchemaV1 {
+	if c.Schema != CompiledSchemaCurrent {
 		return fmt.Errorf("CompiledProgressContract schema=%q，无效", c.Schema)
 	}
 	if err := c.Ref.Validate(); err != nil {
@@ -94,52 +94,17 @@ func (p ProgressPolicy) Validate() error {
 	if err := validateIdentity("policy_ref", p.PolicyRef); err != nil {
 		return err
 	}
-	if p.ReminderAfterTurns <= 0 {
-		return fmt.Errorf("reminder_after_turns 必须 > 0")
-	}
-	if p.RolloverAfterTurns < p.ReminderAfterTurns {
-		return fmt.Errorf("rollover_after_turns 必须 >= reminder_after_turns")
-	}
-	if p.InterventionAfterTurns < p.RolloverAfterTurns {
-		return fmt.Errorf("intervention_after_turns 必须 >= rollover_after_turns")
-	}
-	if p.MaxNoProgressTurns < p.InterventionAfterTurns {
-		return fmt.Errorf("max_no_progress_turns 必须 >= intervention_after_turns")
-	}
-	if p.MaxNoProgressDuration <= 0 {
-		return fmt.Errorf("max_no_progress_duration 必须 > 0")
-	}
-	if p.MaxExplorationTurns < 0 {
-		return fmt.Errorf("max_exploration_turns 不能为负")
-	}
-	if p.FirstDeliverableHandoffReserve < 0 {
-		return fmt.Errorf("first_deliverable_handoff_reserve 不能为负")
-	}
-	if p.CandidateRepairHandoffReserve < 0 {
-		return fmt.Errorf("candidate_repair_handoff_reserve 不能为负")
-	}
-	if p.KnowledgeCheckpointAfterTurns < 0 {
-		return fmt.Errorf("knowledge_checkpoint_after_turns 不能为负")
-	}
-	if p.DecisionCheckpointAfterTurns < 0 {
-		return fmt.Errorf("decision_checkpoint_after_turns 不能为负")
-	}
-	if p.KnowledgeCheckpointAfterTurns > 0 && p.MaxObservationStagnation <= 0 && p.MaxDecisionStagnation <= 0 {
-		return fmt.Errorf("启用 knowledge checkpoint 时 observation/decision stagnation 上限至少一个必须 > 0")
-	}
-	if p.MaxDecisionStagnation < 0 || p.MaxControlContractFailures < 0 {
-		return fmt.Errorf("decision/control contract failure 上限不能为负")
-	}
-	if p.MaxAttemptRollovers < 0 {
-		return fmt.Errorf("max_attempt_rollovers 不能为负")
-	}
 	if p.RecentFingerprintWindow <= 0 || p.RecentFingerprintWindow > maxRecentFingerprints {
-		return fmt.Errorf("recent_fingerprint_window 必须在 1..%d", maxRecentFingerprints)
+		return fmt.Errorf("事实缓存窗口必须在 1..%d", maxRecentFingerprints)
 	}
-	return p.MaxNoProgressUsage.Validate()
+	return nil
 }
 
 func (d TurnSettlementDelta) Validate() error {
+	if d.ObservationChange != nil || d.ObservationDeltaRef != "" || d.ControlContractFailure {
+		return fmt.Errorf("模型观察记录已退役，不接受 Observation 控制字段")
+	}
+
 	if d.Schema != DeltaSchemaV1 {
 		return fmt.Errorf("TurnSettlementDelta schema=%q，无效", d.Schema)
 	}
@@ -218,16 +183,7 @@ func (d TurnSettlementDelta) Validate() error {
 			return fmt.Errorf("result_changes[%d] 缺少 field/after_digest", i)
 		}
 	}
-	if d.ObservationChange != nil {
-		change := d.ObservationChange
-		if strings.TrimSpace(change.Ref) == "" || strings.TrimSpace(change.Phase) == "" ||
-			strings.TrimSpace(change.WorkspaceRevisionRef) == "" || change.ResolvedCandidates < 0 {
-			return fmt.Errorf("observation_change ref/phase/workspace/resolved 非法")
-		}
-		if d.ObservationDeltaRef != change.Ref {
-			return fmt.Errorf("observation_change.ref 与 observation_delta_ref 不一致")
-		}
-	}
+
 	return nil
 }
 
@@ -387,9 +343,6 @@ func (i ActionIntent) Validate() error {
 	if i.Kind == ActionModelInvocation && strings.TrimSpace(i.ToolName) != "" {
 		return fmt.Errorf("model invocation 不得携带 tool_name")
 	}
-	if i.DeadlineAt.IsZero() {
-		return fmt.Errorf("ActionIntent deadline_at 不能为空")
-	}
 	return i.MaxCharge.Validate()
 }
 
@@ -403,10 +356,10 @@ func (r ActionReservation) Validate() error {
 	if err := r.Intent.Validate(); err != nil {
 		return fmt.Errorf("ActionReservation intent 无效: %w", err)
 	}
-	if r.ReservedAt.IsZero() || r.ExpiresAt.IsZero() || !r.ReservedAt.Before(r.ExpiresAt) {
+	if r.ReservedAt.IsZero() || (!r.ExpiresAt.IsZero() && !r.ReservedAt.Before(r.ExpiresAt)) {
 		return fmt.Errorf("ActionReservation reserved_at/expires_at 无效")
 	}
-	if r.ExpiresAt.After(r.Intent.DeadlineAt) {
+	if !r.Intent.DeadlineAt.IsZero() && (r.ExpiresAt.IsZero() || r.ExpiresAt.After(r.Intent.DeadlineAt)) {
 		return fmt.Errorf("ActionReservation expires_at 不得晚于 action deadline")
 	}
 	return nil

@@ -18,11 +18,11 @@ import (
 //     旧快照无 Lease 字段时按「尚未冻结」降级。
 
 func newTestLease(taskID string) *model.ExecutionLease {
-	return &model.ExecutionLease{
+	return &model.ExecutionLease{Schema: model.ExecutionLeaseSchemaCurrent,
 		TaskID:        taskID,
 		Attempt:       1,
 		FrozenAt:      time.Date(2026, 8, 3, 1, 0, 0, 0, time.UTC),
-		BusinessTools: []string{"read_file", "write_file"},
+		BusinessTools: []string{"read_file", "apply_change"},
 		ControlTools:  []string{"submit_task_result"},
 		Model:         "m-kind",
 		Synthetic:     true,
@@ -235,7 +235,7 @@ func TestSnapshot_ProcessingRevokedLeaseIsQuarantined(t *testing.T) {
 		Status: string(model.TaskStatusProcessing), Agents: []string{"worker-1"},
 		MaxConcurrency: 1,
 		Lease: &session.LeaseSnapshot{
-			Attempt: 1, BusinessTools: []string{"write_file"},
+			Attempt: 1, BusinessTools: []string{"apply_change"},
 			ControlTools: []string{"submit_task_result"}, Revoked: true, Digest: "deadbeef1234",
 		},
 	}}

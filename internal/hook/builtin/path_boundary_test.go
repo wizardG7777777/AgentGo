@@ -32,12 +32,12 @@ func TestPathBoundaryHook_MatchesFileSystemTools(t *testing.T) {
 	h := NewPathBoundaryHook("/project")
 	cases := map[string]bool{
 		// 应当匹配 — 文件系工具
-		"read_file":   true,
-		"list_dir":    true,
-		"grep_search": true,
-		"glob_search": true,
-		"write_file":  true,
-		"edit_file":   true,
+		"read_file":    true,
+		"list_dir":     false,
+		"grep_search":  false,
+		"glob_search":  false,
+		"apply_change": true,
+
 		// 应当不匹配 — 决策：不包含 run_shell（无 path 参数）
 		"run_shell": false,
 		// 应当不匹配 — 网络/协作工具
@@ -74,7 +74,7 @@ func TestPathBoundaryHook_AbsolutePathInsideRootContinue(t *testing.T) {
 	root := t.TempDir()
 	h := NewPathBoundaryHook(root)
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": filepath.Join(root, "out.md")},
 	})
 	if d.Action != hook.Continue {
@@ -132,7 +132,7 @@ func TestPathBoundaryHook_AbsolutePathOutsideRootAbort(t *testing.T) {
 		t.Skip("test temp dirs nest unexpectedly, skip")
 	}
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": outside},
 	})
 	if d.Action != hook.Abort {
@@ -225,7 +225,7 @@ func TestPathBoundaryHook_ViaRegistryAbort(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 	d := reg.RunPre(hook.ToolHookContext{
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": "../etc/passwd"},
 	})
 	if d.Action != hook.Abort {
@@ -240,7 +240,7 @@ func TestPathBoundaryHook_ViaRegistryAbort(t *testing.T) {
 // 本节下列测试当前**故意失败**，用于锁定 P1-1 "Hook 错误消息不足以让 LLM 自愈" 缺陷：
 // 在修复完成前它们应保持红灯。如果 CI 报这两个测试失败，**不是回归**，这是提醒
 // bug 还没修。修复路径：让 PathBoundaryHook 按工具名分派参数字段（glob_search
-// 应检查 root_dir；write_file/read_file 等保持检查 path），并在缺参时把正确字段
+// 应检查 root_dir；apply_change/read_file 等保持检查 path），并在缺参时把正确字段
 // 名写进错误消息。
 //
 // ❌ 错误处理：删除断言 / 改 Skip / 弱化期望 —— 这样会抹掉 bug 信号
@@ -252,34 +252,3 @@ func TestPathBoundaryHook_ViaRegistryAbort(t *testing.T) {
 //
 // 该问题已修复；历史记录见 docs/archived/。
 // ================================================================
-
-// TestPathBoundaryHook_GlobSearch_AcceptsRootDir 断言 hook 尊重 glob_search 工具
-// schema 声明的参数名（root_dir）。修复前本测试失败（hook 硬编码 path）。
-func TestPathBoundaryHook_GlobSearch_AcceptsRootDir(t *testing.T) {
-	root := t.TempDir()
-	h := NewPathBoundaryHook(root)
-	d := h.Run(hook.ToolHookContext{
-		ToolName: "glob_search",
-		Args:     map[string]any{"root_dir": root, "pattern": "**/*.md"},
-	})
-	if d.Action == hook.Abort {
-		t.Errorf("glob_search with root_dir 应被接受（与 schema 一致），实际被拒: %s", d.AbortReason)
-	}
-}
-
-// TestPathBoundaryHook_GlobSearch_MissingAllPathArgs_ErrorHintsCorrectField 断言
-// 当 glob_search 完全缺少路径参数时，错误消息须提示正确字段名 root_dir，
-// 让 LLM 能自愈而不是陷入重复错误循环。
-func TestPathBoundaryHook_GlobSearch_MissingAllPathArgs_ErrorHintsCorrectField(t *testing.T) {
-	h := NewPathBoundaryHook(t.TempDir())
-	d := h.Run(hook.ToolHookContext{
-		ToolName: "glob_search",
-		Args:     map[string]any{"pattern": "**/*.md"},
-	})
-	if d.Action != hook.Abort {
-		t.Fatalf("glob_search 完全缺参时应 Abort, got %v", d.Action)
-	}
-	if !strings.Contains(d.AbortReason, "root_dir") {
-		t.Errorf("错误消息应提及正确字段名 root_dir 以便 LLM 自愈, 实际: %q", d.AbortReason)
-	}
-}

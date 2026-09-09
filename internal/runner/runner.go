@@ -21,12 +21,11 @@ import (
 	"time"
 
 	"agentgo/internal/agent"
-	"agentgo/internal/checkstore"
 	"agentgo/internal/config"
 	"agentgo/internal/contentstore"
-	"agentgo/internal/controlcapability"
 	"agentgo/internal/effect"
 	"agentgo/internal/gate"
+	"agentgo/internal/graph"
 	"agentgo/internal/interaction"
 	"agentgo/internal/llm"
 	"agentgo/internal/loopstore"
@@ -75,9 +74,10 @@ type RunnerDeps struct {
 	RunBudgetStore *runbudget.Store
 	// ContentStore 是 L3 ContentRef 权威。生产 bootstrap 始终注入；nil 只供
 	// 不涉及 Context 外置的隔离单测/legacy 构造。
-	ContentStore           *contentstore.Store
-	CheckStore             *checkstore.Store
-	ControlCapabilityStore *controlcapability.Store
+	ContentStore     *contentstore.Store
+	GraphStore       *graph.Store
+	GraphDefinitions *graph.AuthoringStore
+
 	// ContextRuntime 是 L2 唯一编译/快照 authority。生产必须注入。
 	ContextRuntime contextruntime.Runtime
 	// RouteValidator is the shared runtime route authority. It lets every
@@ -126,7 +126,6 @@ type RunnerDeps struct {
 	ProjectRoot           string
 	RosterWaitTimeoutSec  int
 	ShellTimeoutSec       int
-	MaxSubtaskDepth       int
 	ProgressNotifyEnabled bool
 	HashlineEnabled       bool // §7
 }
@@ -211,8 +210,8 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	groups := resolveToolGroups(rt.InstanceID, rt.AllowedTools, deps, holder, finHolder, submitState, fileCache, workdir, interactionWaitHook)
 	tools.RegisterGroups(toolReg, groups...)
 
-	// strict 执行权限强制层：exec=strict 时对 write_file /
-	// edit_file 逐次创建 file_write 审批 Interaction；其它档位透传（readonly
+	// strict 执行权限强制层：exec=strict 时对 apply_change /
+	// apply_change 逐次创建 file_write 审批 Interaction；其它档位透传（readonly
 	// 由 exec-mode-guard Gate 拦截）。与 scheduler.New 内同款装配对称。
 	wrapFileWriteApproval(toolReg, deps, rt.InstanceID, interactionWaitHook)
 
@@ -225,8 +224,6 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	// system_prompt_file 内容 sha256 前 12（文件在启动期一次性读入，
 	// 与 rt.SystemPrompt 同字节）。
 	llmExec.SetPromptVersion("file:" + contextcontract.ShortDigestText(rt.SystemPrompt))
-	llmExec.SetObservationModel(rt.ObservationModel)
-	llmExec.SetControlCapabilityStore(deps.ControlCapabilityStore)
 	llmExec.SetContextRuntime(deps.ContextRuntime)
 	llmExec.SetDurableToolCallRecorder(deps.DurableToolCallRecorder)
 	// finalizing fence：submit_task_result 被接受后，同一响应中排在其后的
@@ -272,10 +269,7 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	a.ModelContextWindowTokens = rt.ModelContextWindowTokens
 	a.ModelMaxCompletionTokens = rt.ModelMaxCompletionTokens
 	a.ModelCapabilityDigest = rt.ModelCapabilityDigest
-	a.ObservationModel = rt.ObservationModel
-	a.ObservationModelContextWindowTokens = rt.ObservationModelContextWindowTokens
-	a.ObservationModelMaxCompletionTokens = rt.ObservationModelMaxCompletionTokens
-	a.ObservationModelCapabilityDigest = rt.ObservationModelCapabilityDigest
+
 	a.SessionID = deps.SessionID
 	a.OnTaskStart = func(taskID string) { holder.Set(taskID); finHolder.Set(taskID) }
 	a.FinalizationChecker = finHolder
@@ -333,13 +327,12 @@ func New(rt config.AgentRuntimeConfig, deps RunnerDeps) *Runner {
 	return r
 }
 
-// wrapFileWriteApproval 对 registry 中的 write_file / edit_file 套 strict 审批包装。
+// wrapFileWriteApproval 对 registry 中的 apply_change / apply_change 套 strict 审批包装。
 // 独立成函数以便装配测试直接断言（New 构造的 ToolRegistry 不外露）。
 // 工具不在该 kind 的 allowlist 中时 WrapHandler 返回 false，静默跳过即可。
 func wrapFileWriteApproval(toolReg *agent.ToolRegistry, deps RunnerDeps, instanceID string, waitHook func(bool)) {
 	approver := tools.NewFileWriteApprover(deps.Modes, deps.Interactions, deps.SessionID, instanceID, waitHook)
-	toolReg.WrapHandler("write_file", approver.WrapHandler("write_file"))
-	toolReg.WrapHandler("edit_file", approver.WrapHandler("edit_file"))
+	toolReg.WrapHandler("apply_change", approver.WrapHandler("apply_change"))
 }
 
 // requireLiveToolDispatch 在每次具体工具调用前做活性检查（V6 C6b 起取代

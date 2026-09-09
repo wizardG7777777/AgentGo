@@ -54,7 +54,7 @@ func TestDigestChangesOnDefinitionChange(t *testing.T) {
 		},
 		"capability变化": func(doc *GraphDocument) {
 			n := doc.Nodes["implement"]
-			n.Capability = &Capability{Tools: []string{"read_file", "edit_file"}, Isolation: IsolationWorkspace}
+			n.Capability = &Capability{Tools: []string{"read_file", "apply_change"}, Isolation: IsolationWorkspace}
 			doc.Nodes["implement"] = n
 		},
 		"next变化": func(doc *GraphDocument) {

@@ -22,11 +22,16 @@ const (
 // Args 是工具调用的原始参数；Success=false 的记录包含 hook 拒绝和工具错误两种情况，
 // 由 hook 消费者自行决定是否计入统计。
 type ToolCallRecord struct {
-	Timestamp time.Time
-	RunID     string
-	AttemptID string
-	TurnID    string
-	ActionID  string
+	InvocationID string `json:"invocation_id,omitempty"`
+	Dispatched   bool   `json:"dispatched"`
+	DurationMS   int64  `json:"duration_ms"`
+	// ResultContent 保存有界执行输出或完整输出的引用，不解释测试语义。
+	ResultContent string `json:"result_content,omitempty"`
+	Timestamp     time.Time
+	RunID         string
+	AttemptID     string
+	TurnID        string
+	ActionID      string
 	// CallID is the protocol-level identity supplied by the model. It lets
 	// downstream consumers join the durable ledger to the matching tool result
 	// without relying on timestamp or map iteration order. Empty is accepted for

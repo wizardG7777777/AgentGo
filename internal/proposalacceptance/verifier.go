@@ -201,12 +201,12 @@ func validateProposalInput(input graph.ProposalAcceptanceInput, now time.Time) e
 }
 
 func proposalDeadlineContext(ctx context.Context, input graph.ProposalAcceptanceInput, now time.Time) (context.Context, context.CancelFunc, error) {
-	if input.Definition.RunContract == nil {
+	if input.Definition.RunContract == nil || input.Definition.RunContract.DeadlineAt.IsZero() {
 		child, cancel := context.WithCancel(ctx)
 		return child, cancel, nil
 	}
 	run := input.Definition.RunContract
-	deadline := run.DeadlineAt.Add(-(run.FinalizationReserve + run.RecoveryReserve))
+	deadline := run.DeadlineAt
 	if !now.Before(deadline) {
 		return nil, nil, fmt.Errorf("proposal verifier Run deadline 已无验收窗口")
 	}

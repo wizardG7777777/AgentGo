@@ -21,7 +21,7 @@ func TestResolveInteraction_FileWriteHandlerZeroEffect(t *testing.T) {
 	created, err := system.Interactions.Create(ctx, interaction.CreateRequest{
 		Kind:    interaction.KindAuthorization,
 		Purpose: tools.PurposeFileWrite,
-		Prompt:  "Agent worker-1 请求写入文件（strict 执行模式，需人工批准）：\n工具: write_file\n路径: /repo/a.go",
+		Prompt:  "Agent worker-1 请求写入文件（strict 执行模式，需人工批准）：\n工具: apply_change\n路径: /repo/a.go",
 		Options: []interaction.Option{
 			{ID: "allow_once", Label: "仅允许本次", ActionRef: "allow_once"},
 			{ID: "deny", Label: "拒绝", ActionRef: "deny"},

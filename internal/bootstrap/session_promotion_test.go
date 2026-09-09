@@ -394,8 +394,8 @@ func TestSessionPromotion_TerminalRulesApplied(t *testing.T) {
 	fx := newPromotionFixture(t)
 
 	blockedMem := taskmem.New("task-6b")
-	blockedMem.Blockers = []string{"write_file a.go — 文件被占用"}
-	blockedMem.Failures = []string{"write_file 调用失败: a.go"}
+	blockedMem.Blockers = []string{"apply_change a.go — 文件被占用"}
+	blockedMem.Failures = []string{"apply_change 调用失败: a.go"}
 	blockedMem.NextCandidates = []string{"解除占用后重写"}
 	blockedMem.Sealed = true
 	if err := fx.tmStore.Save(blockedMem); err != nil {

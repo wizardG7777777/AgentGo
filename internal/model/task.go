@@ -197,7 +197,7 @@ type Task struct {
 
 	// MailChainDepth 是该任务被第几层邮件唤醒。
 	// 用户 /steer 触发的初始任务为 0；被 chain_depth=N 的邮件唤醒的任务为 N。
-	// MetaGroup.sendMessage 在构造 outgoing message 时读取此值并 +1 写入 msg.ChainDepth；
+	// CommunicationGroup.sendMessage 在构造 outgoing message 时读取此值并 +1 写入 msg.ChainDepth；
 	// MailNotifier 在发布 wake task 时根据收件箱内未读邮件的最大 ChainDepth 设置该字段。
 	// Phase 2 引入；零值兼容现有任务。
 	MailChainDepth int

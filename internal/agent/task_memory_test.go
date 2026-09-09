@@ -165,7 +165,7 @@ func TestProcessTask_TaskMemoryReadFailureBlocksBeforeLLM(t *testing.T) {
 func TestTaskMemToolRecordDeltaIgnoresEqualTimestampReordering(t *testing.T) {
 	stamp := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
 	oldRecord := store.ToolCallRecord{
-		Timestamp: stamp, CallID: "call-old", ToolName: "write_file",
+		Timestamp: stamp, CallID: "call-old", ToolName: "apply_change",
 		Args: map[string]any{"path": "old.txt"}, Success: true,
 	}
 	newRecord := store.ToolCallRecord{
@@ -195,11 +195,11 @@ func TestMatchTaskMemToolRecordContentUsesCallIDNotRecordOrder(t *testing.T) {
 	stamp := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
 	records := []store.ToolCallRecord{
 		{Timestamp: stamp, CallID: "call-input", ToolName: "request_user_input", Success: true},
-		{Timestamp: stamp, CallID: "call-write", ToolName: "write_file", Success: true},
+		{Timestamp: stamp, CallID: "call-write", ToolName: "apply_change", Success: true},
 	}
 	result := ExecuteResult{
 		ToolCalls: []llm.ToolCall{
-			{ID: "call-write", Name: "write_file"},
+			{ID: "call-write", Name: "apply_change"},
 			{ID: "call-input", Name: "request_user_input"},
 		},
 		ToolResults: []contextcontract.ToolResult{

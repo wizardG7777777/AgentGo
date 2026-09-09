@@ -181,8 +181,7 @@ func TestActivator_EventWatchdogAlert_PublishesWakeTask(t *testing.T) {
 		ID: "task-overtime", Description: "修复 sessions.py 的 accessed 标记",
 		EventType: "", GraphID: "g-x", NodeID: "impl", TimeoutSeconds: 3600,
 	}
-	if err := taskcontract.Start(overtime, loopcontract.WorkCodeChange, "test-watchdog/v1",
-		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+	if err := taskcontract.Start(overtime, loopcontract.WorkCodeChange, "test-watchdog/v1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.PublishTask(overtime); err != nil {

@@ -17,7 +17,7 @@ func readonlyStore() *modes.Store {
 // 全部被 Abort，且中文错误消息含 "readonly" 与切换指引。
 func TestExecModeGuard_ReadonlyBlocksWriteTools(t *testing.T) {
 	h := NewExecModeGuardHook(readonlyStore())
-	for _, tool := range []string{"write_file", "edit_file", "run_shell"} {
+	for _, tool := range []string{"apply_change", "run_shell"} {
 		t.Run(tool, func(t *testing.T) {
 			if !h.Matches(tool) {
 				t.Fatalf("Matches(%s) = false，期望 true", tool)
@@ -62,7 +62,7 @@ func TestExecModeGuard_OtherModesContinue(t *testing.T) {
 	for _, mode := range []modes.ExecMode{modes.ExecNormal, modes.ExecStrict, modes.ExecYolo} {
 		t.Run(mode.String(), func(t *testing.T) {
 			h := NewExecModeGuardHook(modes.NewStore(mode, modes.TopoTeam))
-			for _, tool := range []string{"write_file", "edit_file", "run_shell"} {
+			for _, tool := range []string{"apply_change", "run_shell"} {
 				d := h.Run(hook.ToolHookContext{Phase: hook.PhasePreCall, ToolName: tool})
 				if d.Action != hook.Continue {
 					t.Errorf("%s 模式下 %s Action = %v，期望 Continue", mode, tool, d.Action)
@@ -75,7 +75,7 @@ func TestExecModeGuard_OtherModesContinue(t *testing.T) {
 // TestExecModeGuard_NilStoreSafe 未注入模式 store 时视为 normal，不拦截、不 panic。
 func TestExecModeGuard_NilStoreSafe(t *testing.T) {
 	h := NewExecModeGuardHook(nil)
-	d := h.Run(hook.ToolHookContext{Phase: hook.PhasePreCall, ToolName: "write_file"})
+	d := h.Run(hook.ToolHookContext{Phase: hook.PhasePreCall, ToolName: "apply_change"})
 	if d.Action != hook.Continue {
 		t.Fatalf("nil store 下 Action = %v，期望 Continue", d.Action)
 	}

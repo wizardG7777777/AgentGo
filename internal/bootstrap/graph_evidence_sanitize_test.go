@@ -27,7 +27,7 @@ func TestEvidenceKindOfNormalization(t *testing.T) {
 		want     string
 	}{
 		{"已知归并 shell", "run_shell", "shell"},
-		{"已知归并 file_write", "write_file", "file_write"},
+		{"已知归并 file_write", "apply_change", "file_change"},
 		{"已知归并 web", "web_fetch", "web"},
 		{"合法自定义名保留", "submit_task_result", "submit_task_result"},
 		{"合法自定义名含冒号点线", "mcp__x.y:z-w", "mcp__x.y:z-w"},
@@ -75,7 +75,7 @@ func TestEvidenceCallEntrySanitizesGarbage(t *testing.T) {
 	if again.ToolName != entry.ToolName {
 		t.Errorf("同一垃圾名应得同一占位: %q vs %q", again.ToolName, entry.ToolName)
 	}
-	other := evidenceCallEntry("ev:t:call:3", store.ToolCallRecord{ToolName: "edit_file>|<" + strings.Repeat("y", 150)})
+	other := evidenceCallEntry("ev:t:call:3", store.ToolCallRecord{ToolName: "apply_change>|<" + strings.Repeat("y", 150)})
 	if other.ToolName == entry.ToolName {
 		t.Errorf("不同垃圾名占位应可区分，均为 %q", entry.ToolName)
 	}

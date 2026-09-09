@@ -2,7 +2,6 @@ package bootstrap
 
 import (
 	"testing"
-	"time"
 
 	"agentgo/internal/graph"
 	"agentgo/internal/loopcontract"
@@ -15,8 +14,7 @@ import (
 func graphProgressBinding(t *testing.T) *model.Task {
 	t.Helper()
 	task := &model.Task{}
-	if err := taskcontract.Start(task, loopcontract.WorkCodeChange, "test-graph-progress/v1",
-		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+	if err := taskcontract.Start(task, loopcontract.WorkCodeChange, "test-graph-progress/v1"); err != nil {
 		t.Fatal(err)
 	}
 	return task
@@ -34,7 +32,7 @@ func TestGraphBoardResolvesFrozenProgressContractRef(t *testing.T) {
 		GraphID: "graph-progress", NodeID: "work", ActivationID: "work@1",
 		NodeKind: graph.KindAgent, Title: "实施修改",
 		RunID: binding.RunID, RunContract: binding.RunContract,
-		ProgressContractRef: policycatalog.ProgressCodeChangeV1,
+		ProgressContractRef: policycatalog.ProgressCodeChangeCurrent,
 		ContextPolicyRef:    binding.ContextPolicyRef,
 	})
 	if err != nil {
@@ -44,10 +42,10 @@ func TestGraphBoardResolvesFrozenProgressContractRef(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if task.ProgressContract == nil || task.ProgressContract.Ref.ContractID != policycatalog.ProgressCodeChangeV1 {
+	if task.ProgressContract == nil || task.ProgressContract.Ref.ContractID != policycatalog.ProgressCodeChangeCurrent {
 		t.Fatalf("Graph Task 未解引用冻结 ProgressContract: %+v", task.ProgressContract)
 	}
-	profile, _ := policies.ProgressContract(policycatalog.ProgressCodeChangeV1)
+	profile, _ := policies.ProgressContract(policycatalog.ProgressCodeChangeCurrent)
 	if task.ProgressContract.Ref.ContractDigest != profile.Contract.Ref.ContractDigest {
 		t.Fatal("Graph Task ProgressContract digest 与共享 catalog 不一致")
 	}

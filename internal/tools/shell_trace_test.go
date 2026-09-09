@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"agentgo/internal/agent"
@@ -66,8 +67,8 @@ func TestRunShell_EmitsShellExecuted_Success(t *testing.T) {
 	if ev.ShellExec.Command != "echo hello-trace" {
 		t.Errorf("Command=%q want 'echo hello-trace'", ev.ShellExec.Command)
 	}
-	if ev.ShellExec.ExitCode != 0 {
-		t.Errorf("ExitCode=%d want 0", ev.ShellExec.ExitCode)
+	if ev.ShellExec.ExitCode == nil || *ev.ShellExec.ExitCode != 0 {
+		t.Errorf("ExitCode=%v want 0", ev.ShellExec.ExitCode)
 	}
 	if ev.ShellExec.Outcome != "success" {
 		t.Errorf("Outcome=%q want success", ev.ShellExec.Outcome)
@@ -102,11 +103,30 @@ func TestRunShell_EmitsShellExecuted_NonZeroExit(t *testing.T) {
 	if exec == nil {
 		t.Fatal("ShellExec payload missing")
 	}
-	if exec.ExitCode != 3 {
-		t.Errorf("ExitCode=%d want 3", exec.ExitCode)
+	if exec.ExitCode == nil || *exec.ExitCode != 3 {
+		t.Errorf("ExitCode=%v want 3", exec.ExitCode)
 	}
 	if exec.Outcome != "failure" {
 		t.Errorf("Outcome=%q want failure", exec.Outcome)
+	}
+}
+
+func TestRunShellTimeoutPreservesPartialOutputWithoutInventingExitCode(t *testing.T) {
+	d := installShellTraceCapture(t)
+	g, _ := newTestShellGroup(t, t.TempDir(), emptyFilter())
+	out, err := dispatchRunShell(context.Background(), g, map[string]any{
+		"command": "echo partial-output; sleep 5", "timeout_sec": 1,
+	})
+	if err == nil || !strings.Contains(out, "partial-output") {
+		t.Fatalf("超时必须保留已产生输出：输出=%q 错误=%v", out, err)
+	}
+	events := shellExecutedEvents(d)
+	if len(events) != 1 || events[0].ShellExec == nil {
+		t.Fatalf("执行事实不完整：%+v", events)
+	}
+	fact := events[0].ShellExec
+	if fact.Schema != "agentgo.shell-execution/v2" || !fact.ProcessStarted || fact.Outcome != "timeout" || fact.ExitCode != nil {
+		t.Fatalf("超时不得伪造退出码或未启动状态：%+v", fact)
 	}
 }
 

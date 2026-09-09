@@ -9,7 +9,6 @@ import (
 
 	"agentgo/internal/bootstrap"
 	"agentgo/internal/config"
-	"agentgo/internal/observationprobe"
 	"agentgo/internal/session"
 	"agentgo/internal/trace"
 )
@@ -23,7 +22,7 @@ func main() {
 			os.Exit(1)
 		}
 		traceDir := resolveTraceDir(cwd)
-		graphStateDir := filepath.Join(cwd, ".agentgo", "state", "graphs")
+		graphStateDir := filepath.Join(cwd, ".agentgo", "state", "graphs-v5")
 		if err := trace.CLI(os.Args[2:], traceDir, graphStateDir, os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "[错误] %v\n", err)
 			os.Exit(1)
@@ -36,7 +35,8 @@ func main() {
 		os.Exit(config.CLI(os.Args[2:], os.Stdout, os.Stderr))
 	}
 	if len(os.Args) >= 2 && os.Args[1] == "probe" {
-		os.Exit(observationprobe.CLI(os.Args[2:], os.Stdout, os.Stderr))
+		fmt.Fprintln(os.Stderr, "[错误] 内置 Observation probe 已退役；通用协议验证由外部测试程序执行")
+		os.Exit(2)
 	}
 
 	// eval 子命令及其独立开发工具均已删除。这里继续显式拒绝，避免 "eval"

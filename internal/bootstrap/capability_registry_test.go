@@ -20,10 +20,10 @@ func capableTask(tools ...string) *model.Task {
 
 func TestCapabilityRegistry_StaticAgentSubset(t *testing.T) {
 	reg := newCapabilityRegistry()
-	reg.registerAgent("worker-1", []string{"read_file", "write_file", "run_shell"})
+	reg.registerAgent("worker-1", []string{"read_file", "apply_change", "run_shell"})
 	check := reg.checker()
 
-	if err := check("worker-1", capableTask("read_file", "write_file")); err != nil {
+	if err := check("worker-1", capableTask("read_file", "apply_change")); err != nil {
 		t.Fatalf("白名单子集应放行: %v", err)
 	}
 	err := check("worker-1", capableTask("read_file", "web_fetch"))
@@ -49,8 +49,8 @@ func TestCapabilityRegistry_SpawnAdhocInheritsBaseKind(t *testing.T) {
 	if err := check("explorer-adhoc-abc12345", capableTask("web_fetch")); err != nil {
 		t.Fatalf("ad-hoc 继承 base kind 白名单应放行: %v", err)
 	}
-	if err := check("explorer-adhoc-abc12345", capableTask("write_file")); err == nil {
-		t.Fatal("base kind 无 write_file，应拒绝")
+	if err := check("explorer-adhoc-abc12345", capableTask("apply_change")); err == nil {
+		t.Fatal("base kind 无 apply_change，应拒绝")
 	}
 }
 
@@ -187,7 +187,7 @@ func TestCapabilityRegistry_UnknownAgentFailsClosed(t *testing.T) {
 func TestCapabilityRegistry_SchedulerSkipped(t *testing.T) {
 	reg := newCapabilityRegistry()
 	reg.schedulerAgentID = "scheduler"
-	if err := reg.checker()("scheduler", capableTask("write_file", "run_shell")); err != nil {
+	if err := reg.checker()("scheduler", capableTask("apply_change", "run_shell")); err != nil {
 		t.Fatalf("scheduler 应跳过能力检查: %v", err)
 	}
 	controller := &model.Task{ID: "controller", GraphID: "g", RouteScope: model.GraphRouteScope("g"), EventType: "__scheduler__"}
@@ -256,7 +256,7 @@ func TestCapabilityChecker_ClaimTaskDoubleInsurance(t *testing.T) {
 	inScope := &model.Task{ID: "in-scope", EventType: "worker",
 		Capability: &model.NodeCapability{Tools: []string{"read_file"}}}
 	outOfScope := &model.Task{ID: "out-of-scope", EventType: "worker",
-		Capability: &model.NodeCapability{Tools: []string{"edit_file"}}}
+		Capability: &model.NodeCapability{Tools: []string{"apply_change"}}}
 	plain := &model.Task{ID: "plain", EventType: "worker"}
 	for _, task := range []*model.Task{inScope, outOfScope, plain} {
 		if err := s.PublishTask(task); err != nil {

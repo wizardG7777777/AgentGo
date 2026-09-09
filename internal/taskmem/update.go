@@ -47,9 +47,8 @@ type TurnFacts struct {
 // readClassTools 是读取类工具集合：重复读取同一目标不产生新 Action
 // （「重复读取或无新增证据的轮次不扩写」）。
 var readClassTools = map[string]bool{
-	"read_file": true, "list_dir": true, "grep_search": true, "glob_search": true,
-	"web_search": true, "web_fetch": true, "read_content_ref": true,
-	"probe_directory": true, "get_task_result": true,
+	"read_file": true, "read_evidence": true, "inspect_board": true, "inspect_node": true, "read_graph_definition": true,
+	"web_search": true, "web_fetch": true,
 }
 
 // ApplyTurn 把一个 settled Turn 的结构化事实滚动合并进 Task Memory，

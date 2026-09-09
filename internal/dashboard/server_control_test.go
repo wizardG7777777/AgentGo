@@ -196,9 +196,9 @@ func TestControlEndpoints_MapToController(t *testing.T) {
 		bodyJSON, err := json.Marshal(map[string]any{
 			"text": "SWE bounded task",
 			"run_contract": runcontract.RunContract{
-				Schema: runcontract.SchemaV1, RunID: "run-swe-1", CreatedAt: now,
-				DeadlineAt: now.Add(19 * time.Minute), RecoveryReserve: 90 * time.Second,
-				FinalizationReserve: 30 * time.Second, BudgetProfile: "swe/v1",
+				Schema: runcontract.SchemaCurrent, RunID: "run-swe-1", CreatedAt: now,
+				DeadlineAt:    now.Add(19 * time.Minute),
+				BudgetProfile: "swe/v1",
 			},
 		})
 		if err != nil {

@@ -67,7 +67,7 @@ func externalizeToolResult(r contextruntime.Runtime, ctx context.Context, task *
 		Schema: "agentgo.tool-result-ref/v1", Tool: call.Name,
 		RefID: ref.RefID, OriginalBytes: len(bytes), SHA256: ref.ContentDigest,
 		PreviewHead: string(head), PreviewTail: string(tail),
-		Instruction: "完整结果已持久化；需要中间区段时使用 read_content_ref(ref_id, offset, limit) 分页读取",
+		Instruction: "完整结果已持久化；需要中间区段时使用 read_evidence(ref_id, offset, limit) 分页读取",
 	}
 	encoded, err := json.Marshal(envelope)
 	if err != nil {

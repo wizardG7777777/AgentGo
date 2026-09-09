@@ -15,12 +15,10 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/agenttemplate"
-	"agentgo/internal/checkstore"
 	"agentgo/internal/config"
 	"agentgo/internal/contentstore"
 	"agentgo/internal/contextruntime"
 	"agentgo/internal/contextstore"
-	"agentgo/internal/controlcapability"
 	"agentgo/internal/dashboard"
 	"agentgo/internal/delivery"
 	"agentgo/internal/effect"
@@ -113,8 +111,8 @@ type System struct {
 	TaskOutcomeStore *outcomestore.Store
 	// ContentStore 是 L3 大正文/ContentRef 的持久化与授权解引用权威。
 	// 新执行不允许在初始化失败时降级为无 Store 模式。
-	ContentStore     *contentstore.Store
-	CheckStore       *checkstore.Store
+	ContentStore *contentstore.Store
+
 	DeliveryStore    *delivery.Store
 	WorkspaceManager *workspace.Manager
 	// ContextSnapshotStore 是 L2 已编译 Snapshot/Manifest metadata 的
@@ -406,7 +404,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	cancelRegistry := store.NewTaskCancelRegistry()
 	taskStore.SetCancelRegistry(cancelRegistry)
 	log.Println("[启动] 公告板初始化完成")
-	loopStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "loop")
+	loopStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "loop-facts-v2")
 	loopStateStore, loopStoreErr := loopstore.Open(loopStorePath)
 	if loopStoreErr != nil {
 		return nil, fmt.Errorf("初始化 L4 LoopStore 失败（新执行必须 fail-closed）: %w", loopStoreErr)
@@ -417,7 +415,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		}
 	}()
 	log.Printf("[启动] L4 LoopStore 已启用 (dir=%s)", loopStorePath)
-	runBudgetStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "run-budgets")
+	runBudgetStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "run-usage-v2")
 	runBudgetStateStore, runBudgetStoreErr := runbudget.Open(runBudgetStorePath)
 	if runBudgetStoreErr != nil {
 		return nil, fmt.Errorf("初始化 RunBudgetStore 失败（显式 Run 预算必须 fail-closed）: %w", runBudgetStoreErr)
@@ -428,7 +426,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		}
 	}()
 	log.Printf("[启动] RunBudgetStore 已启用 (dir=%s)", runBudgetStorePath)
-	outcomeStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "task-outcomes")
+	outcomeStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "task-outcomes-v2")
 	taskOutcomeStore, outcomeStoreErr := outcomestore.New(outcomeStorePath)
 	if outcomeStoreErr != nil {
 		return nil, fmt.Errorf("初始化 TaskOutcomeStore 失败（新执行必须 fail-closed）: %w", outcomeStoreErr)
@@ -451,19 +449,11 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		}
 	}()
 	log.Printf("[启动] L3 ContentStore 已启用 (dir=%s)", contentStorePath)
-	checkStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "checks")
-	checkStateStore := checkstore.New(checkStorePath)
-	log.Printf("[启动] L3 CheckStore 已启用 (dir=%s)", checkStorePath)
 	// Scheduler coordination/v2 与所有 Runner 共用同一 Task Memory
 	// authority；必须在 Scheduler 装配前创建，否则其 Observation
 	// 控制调用会出现“Prompt 承诺但 L3 工具面为空”。
-	taskMemStore := taskmem.NewStore(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "taskmem"))
-	controlCapabilityStore, controlCapabilityErr := controlcapability.Open(
-		filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "control-capabilities"))
-	if controlCapabilityErr != nil {
-		return nil, fmt.Errorf("初始化 ControlCapabilityStore 失败: %w", controlCapabilityErr)
-	}
-	deliveryStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "deliveries")
+	taskMemStore := taskmem.NewStore(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "taskmem-v2"))
+	deliveryStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "deliveries-v2")
 	deliveryStateStore, deliveryStoreErr := delivery.NewStore(deliveryStorePath)
 	if deliveryStoreErr != nil {
 		return nil, fmt.Errorf("初始化 L5 DeliveryStore 失败（Graph v3 必须 fail-closed）: %w", deliveryStoreErr)
@@ -749,7 +739,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		Memory:              memoryStore, TaskMemory: taskMemStore,
 		SessionID: func() string { return currentSessionIDFromMgr(sessMgr) },
 	}
-	contextRuntime.InputReader = tools.ContentRefGroup{ContentStore: contentStateStore, TaskStore: taskStore, SessionID: contextRuntime.SessionID}
+	contextRuntime.InputReader = tools.EvidenceGroup{ContentStore: contentStateStore, TaskStore: taskStore, SessionID: contextRuntime.SessionID}
 	contextRuntime.Output = contextruntime.NewOutputService(func(record contextruntime.OutputRecord) error {
 		if record.Identity.SessionID == "" {
 			return fmt.Errorf("模型输出缺少 Session")
@@ -780,14 +770,14 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		cfg, taskStore, reactorReg, effectJournal, graphPolicies,
 		func() string { return currentSessionIDFromMgr(sessMgr) },
 		taskOutcomeStore, loopStateStore,
-		&graphRuntimeAuthorities{workspaces: wsMgr, checks: checkStateStore, deliveries: deliveryStateStore},
+		&graphRuntimeAuthorities{workspaces: wsMgr, deliveries: deliveryStateStore},
 		unresolvedEffectTaskReasons(effectRecoveryDecisions))
 	if err != nil {
 		return nil, err
 	}
 	graphRuntime.SetDeliveryCommitter(workspaceDeliveryCommitter{manager: wsMgr, journal: effectJournal, store: deliveryStateStore})
 	graphRuntime.SetRunBudgetGate(runBudgetStateStore)
-	graphAuthoringStore, err := graph.NewAuthoringStore(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "graph-authoring"))
+	graphAuthoringStore, err := graph.NewAuthoringStore(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "graph-authoring-v2"))
 	if err != nil {
 		return nil, fmt.Errorf("创建 Graph AuthoringStore 失败: %w", err)
 	}
@@ -798,7 +788,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	graphDefinitionCompiler := graph.DefinitionCompiler{Policies: graphPolicies}
 	// Acceptance 在独立 client 创建后注入；在此之前尚无工具可触发 Compiler。
 	log.Printf("[启动] Graph Authoring 已装配（state=%s；等待独立 Proposal Acceptance 接线）",
-		filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "graph-authoring"))
+		filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "graph-authoring-v2"))
 	if migrated, migrateErr := migrateV1TeamGraphBindings(teamStore, graphStore); migrateErr != nil {
 		return nil, fmt.Errorf("迁移 Agent TeamStore v1 Graph 归属失败（按 fail-closed 拒绝启动）: %w", migrateErr)
 	} else if migrated {
@@ -1041,28 +1031,28 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		LoopStore:               loopStateStore,
 		RunBudgetStore:          runBudgetStateStore,
 		ContentStore:            contentStateStore,
-		CheckStore:              checkStateStore,
-		ControlCapabilityStore:  controlCapabilityStore,
-		ContextRuntime:          contextRuntime,
-		RouteValidator:          agentRegistry,
-		Activity:                activity,
-		MBRegistry:              mbRegistry,
-		CancelRegistry:          cancelRegistry,
-		SearchProvider:          searchProvider,
-		ShellFilter:             shellFilter,
-		Interactions:            interactionService,
-		SessionID:               currentSessionID,
-		Modes:                   modeStore,         // 与 scheduler / UI Hub 同一实例：exec 轴驱动 strict/yolo
-		EffectJournal:           effectJournal,     // H2b 副作用 authority；生产 Bootstrap 已验证非 nil/healthy
-		OutletChecker:           graphRuntime,      // 终态契约 v2 提交期出路检查（Step 3.9.1 装配的 *graph.Runtime）
-		UserOutput:              newTextWriter(""), // 共享兜底（team/spawn ad-hoc runner）；静态 runner 在下方按实例标记
-		TaskEndCallbacks:        taskEndReactor,
-		ProjectRoot:             cfg.ProjectRoot,
-		RosterWaitTimeoutSec:    cfg.Infra.Roster.WaitTimeoutSec,
-		ShellTimeoutSec:         cfg.ShellTimeoutSec,
-		MaxSubtaskDepth:         cfg.MaxSubtaskDepth,
-		ProgressNotifyEnabled:   cfg.ProgressNotifyEnabled,
-		HashlineEnabled:         *cfg.HashlineEnabled,
+
+		GraphStore:            graphStore,
+		GraphDefinitions:      graphAuthoringStore,
+		ContextRuntime:        contextRuntime,
+		RouteValidator:        agentRegistry,
+		Activity:              activity,
+		MBRegistry:            mbRegistry,
+		CancelRegistry:        cancelRegistry,
+		SearchProvider:        searchProvider,
+		ShellFilter:           shellFilter,
+		Interactions:          interactionService,
+		SessionID:             currentSessionID,
+		Modes:                 modeStore,         // 与 scheduler / UI Hub 同一实例：exec 轴驱动 strict/yolo
+		EffectJournal:         effectJournal,     // H2b 副作用 authority；生产 Bootstrap 已验证非 nil/healthy
+		OutletChecker:         graphRuntime,      // 终态契约 v2 提交期出路检查（Step 3.9.1 装配的 *graph.Runtime）
+		UserOutput:            newTextWriter(""), // 共享兜底（team/spawn ad-hoc runner）；静态 runner 在下方按实例标记
+		TaskEndCallbacks:      taskEndReactor,
+		ProjectRoot:           cfg.ProjectRoot,
+		RosterWaitTimeoutSec:  cfg.Infra.Roster.WaitTimeoutSec,
+		ShellTimeoutSec:       cfg.ShellTimeoutSec,
+		ProgressNotifyEnabled: cfg.ProgressNotifyEnabled,
+		HashlineEnabled:       *cfg.HashlineEnabled,
 	}
 	// workspace 控制面注入（B 线握手缝 runtime_builder.withWorkspaceManager）：
 	// 全部 kind × replica 的 Runner 共享进程级唯一 Manager；认领声明
@@ -1170,7 +1160,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		scheduler.GraphAuthoringDeps{
 			Store: graphAuthoringStore, Runtime: graphAuthoringRuntime, Compiler: graphDefinitionCompiler,
 			ContextRuntime: contextRuntime, DurableToolCallRecorder: durableToolCallRecorder,
-			TaskMemStore: taskMemStore, CheckStore: checkStateStore,
+			TaskMemStore: taskMemStore,
 		},
 	)
 	if sched.Agent != nil {
@@ -1287,21 +1277,21 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 	mailNotifier := mailbox.NewMailNotifier(mbRegistry, taskStore, notifierInterval)
 
 	sys = &System{
-		Config:                cfg,
-		Store:                 taskStore,
-		Roster:                r,
-		EventCh:               eventCh,
-		Watchdog:              w,
-		CancelRegistry:        cancelRegistry,
-		MailboxRegistry:       mbRegistry,
-		MailNotifier:          mailNotifier,
-		ArtifactLog:           artifactLog, // 可能为 nil（OpenArtifactLog 失败时），Shutdown 会判空
-		EffectJournal:         effectJournal,
-		LoopStore:             loopStateStore,
-		RunBudgetStore:        runBudgetStateStore,
-		TaskOutcomeStore:      taskOutcomeStore,
-		ContentStore:          contentStateStore,
-		CheckStore:            checkStateStore,
+		Config:           cfg,
+		Store:            taskStore,
+		Roster:           r,
+		EventCh:          eventCh,
+		Watchdog:         w,
+		CancelRegistry:   cancelRegistry,
+		MailboxRegistry:  mbRegistry,
+		MailNotifier:     mailNotifier,
+		ArtifactLog:      artifactLog, // 可能为 nil（OpenArtifactLog 失败时），Shutdown 会判空
+		EffectJournal:    effectJournal,
+		LoopStore:        loopStateStore,
+		RunBudgetStore:   runBudgetStateStore,
+		TaskOutcomeStore: taskOutcomeStore,
+		ContentStore:     contentStateStore,
+
 		DeliveryStore:         deliveryStateStore,
 		WorkspaceManager:      wsMgr,
 		ContextSnapshotStore:  contextSnapshotStore,

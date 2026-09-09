@@ -57,8 +57,8 @@ func TestEnforceExpectedArtifactsHook_Metadata(t *testing.T) {
 func TestEnforceExpectedArtifactsHook_MatchesWriteTools(t *testing.T) {
 	h := NewEnforceExpectedArtifactsHook(&mockExpectedStore{}, "/project")
 	cases := map[string]bool{
-		"write_file":   true,
-		"edit_file":    true,
+		"apply_change": true,
+
 		"read_file":    false,
 		"list_dir":     false,
 		"grep_search":  false,
@@ -85,7 +85,7 @@ func TestEnforceExpectedArtifactsHook_ExactMatch_Continues(t *testing.T) {
 	h := NewEnforceExpectedArtifactsHook(s, "/project")
 	hctx := hook.ToolHookContext{
 		Phase:    hook.PhasePreCall,
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		TaskID:   "t1",
 		Args: map[string]any{
 			"path": "config_group1_scheduler_agent_llm.md",
@@ -105,7 +105,7 @@ func TestEnforceExpectedArtifactsHook_NoExpectedArtifacts_Continues(t *testing.T
 	h := NewEnforceExpectedArtifactsHook(s, "/project")
 	hctx := hook.ToolHookContext{
 		Phase:    hook.PhasePreCall,
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		TaskID:   "t1",
 		Args: map[string]any{
 			"path": "anywhere.md",
@@ -125,7 +125,7 @@ func TestEnforceExpectedArtifactsHook_EmptyExpectedArtifacts_Continues(t *testin
 	h := NewEnforceExpectedArtifactsHook(s, "/project")
 	hctx := hook.ToolHookContext{
 		Phase:    hook.PhasePreCall,
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		TaskID:   "t1",
 		Args:     map[string]any{"path": "anything.md"},
 	}
@@ -143,7 +143,7 @@ func TestEnforceExpectedArtifactsHook_MultipleExpectedOneMatch_Continues(t *test
 	h := NewEnforceExpectedArtifactsHook(s, "/project")
 	hctx := hook.ToolHookContext{
 		Phase:    hook.PhasePreCall,
-		ToolName: "edit_file",
+		ToolName: "apply_change",
 		TaskID:   "t1",
 		Args:     map[string]any{"path": "b.md"},
 	}
@@ -161,7 +161,7 @@ func TestEnforceExpectedArtifactsHook_DotSlashNormalization_Continues(t *testing
 	h := NewEnforceExpectedArtifactsHook(s, "/project")
 	hctx := hook.ToolHookContext{
 		Phase:    hook.PhasePreCall,
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		TaskID:   "t1",
 		Args:     map[string]any{"path": "report.md"},
 	}
@@ -182,7 +182,7 @@ func TestEnforceExpectedArtifactsHook_DriftedFilename_Abort(t *testing.T) {
 	h := NewEnforceExpectedArtifactsHook(s, "/project")
 	hctx := hook.ToolHookContext{
 		Phase:    hook.PhasePreCall,
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		TaskID:   "t1",
 		Args:     map[string]any{"path": "config_fields_analysis.md"},
 	}
@@ -210,7 +210,7 @@ func TestEnforceExpectedArtifactsHook_DirectoryPrefixDrift_Abort(t *testing.T) {
 	h := NewEnforceExpectedArtifactsHook(s, "/project")
 	hctx := hook.ToolHookContext{
 		Phase:    hook.PhasePreCall,
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		TaskID:   "t1",
 		Args:     map[string]any{"path": "docs/report.md"},
 	}
@@ -231,7 +231,7 @@ func TestEnforceExpectedArtifactsHook_UnauthorizedWriteTestResult_Abort(t *testi
 	h := NewEnforceExpectedArtifactsHook(s, "/project")
 	hctx := hook.ToolHookContext{
 		Phase:    hook.PhasePreCall,
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		TaskID:   "t1",
 		Args:     map[string]any{"path": "test_result.md"},
 	}
@@ -251,7 +251,7 @@ func TestEnforceExpectedArtifactsHook_NilStore_Continues(t *testing.T) {
 	h := NewEnforceExpectedArtifactsHook(nil, "/project")
 	hctx := hook.ToolHookContext{
 		Phase:    hook.PhasePreCall,
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		TaskID:   "t1",
 		Args:     map[string]any{"path": "anywhere.md"},
 	}
@@ -268,7 +268,7 @@ func TestEnforceExpectedArtifactsHook_EmptyTaskID_Continues(t *testing.T) {
 	h := NewEnforceExpectedArtifactsHook(s, "/project")
 	hctx := hook.ToolHookContext{
 		Phase:    hook.PhasePreCall,
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		TaskID:   "", // 测试环境下可能缺失
 		Args:     map[string]any{"path": "whatever.md"},
 	}
@@ -284,7 +284,7 @@ func TestEnforceExpectedArtifactsHook_TaskNotFound_Continues(t *testing.T) {
 	h := NewEnforceExpectedArtifactsHook(s, "/project")
 	hctx := hook.ToolHookContext{
 		Phase:    hook.PhasePreCall,
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		TaskID:   "nonexistent",
 		Args:     map[string]any{"path": "whatever.md"},
 	}
@@ -302,7 +302,7 @@ func TestEnforceExpectedArtifactsHook_MissingPathArg_Continues(t *testing.T) {
 	h := NewEnforceExpectedArtifactsHook(s, "/project")
 	hctx := hook.ToolHookContext{
 		Phase:    hook.PhasePreCall,
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		TaskID:   "t1",
 		Args:     map[string]any{}, // 无 path
 	}

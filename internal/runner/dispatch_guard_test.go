@@ -50,7 +50,7 @@ func (c *orderedToolClient) callCount() int {
 	return c.calls
 }
 
-// cancelAfterFirstTool 是 trace Dispatcher：观察到首个 write_file 的工具结果后
+// cancelAfterFirstTool 是 trace Dispatcher：观察到首个 apply_change 的工具结果后
 // 同步把任务迁到 cancelled（模拟 Scheduler 在同一响应窗口内取消任务），
 // 并记录第二个工具的结果事件。
 type cancelAfterFirstTool struct {
@@ -80,7 +80,7 @@ func (d *cancelAfterFirstTool) Dispatch(ev trace.Event) {
 	}
 }
 
-// 同一响应内任务被取消后，后续工具调用必须被活性守卫拦截：第二个 write_file
+// 同一响应内任务被取消后，后续工具调用必须被活性守卫拦截：第二个 apply_change
 // 不得落盘，工具结果事件携带中文中止原因。
 func TestRunnerBlocksLaterToolWhenTaskCancelledInSameResponse(t *testing.T) {
 	root := t.TempDir()
@@ -94,8 +94,8 @@ func TestRunnerBlocksLaterToolWhenTaskCancelledInSameResponse(t *testing.T) {
 
 	client := &orderedToolClient{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{
-			{ID: "write-first", Name: "write_file", Arguments: map[string]any{"path": "first.txt", "content": "first"}},
-			{ID: "write-second", Name: "write_file", Arguments: map[string]any{"path": "second.txt", "content": "second"}},
+			{ID: "write-first", Name: "apply_change", Arguments: map[string]any{"path": "first.txt", "content": "first"}},
+			{ID: "write-second", Name: "apply_change", Arguments: map[string]any{"path": "second.txt", "content": "second"}},
 		},
 		FinishReason: llm.FinishReasonToolCalls,
 	}}}
@@ -108,7 +108,7 @@ func TestRunnerBlocksLaterToolWhenTaskCancelledInSameResponse(t *testing.T) {
 
 	rn := newTestRunner(t, config.AgentRuntimeConfig{
 		InstanceID: "worker-dispatch-cancel", Kind: "worker", EventType: "code",
-		AllowedTools: []string{"write_file"}, TaskMaxRetries: 1,
+		AllowedTools: []string{"apply_change"}, TaskMaxRetries: 1,
 	}, RunnerDeps{
 		Store: taskStore, Roster: roster.NewMemoryRoster(), LLMClient: client,
 		CancelRegistry: cancelRegistry, ProjectRoot: root, ContextRuntime: testmodel.Runtime(t),
@@ -220,7 +220,7 @@ func TestRequireLiveToolDispatch_RevokedLeaseRejected(t *testing.T) {
 	if err := taskStore.ClaimTask("worker-1", task.ID); err != nil {
 		t.Fatal(err)
 	}
-	lease := &model.ExecutionLease{
+	lease := &model.ExecutionLease{Schema: model.ExecutionLeaseSchemaCurrent,
 		TaskID:        task.ID,
 		Attempt:       1,
 		BusinessTools: []string{"read_file"},

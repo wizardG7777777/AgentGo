@@ -272,16 +272,12 @@ func (rt *Runtime) acceptanceEvidenceLineage(graphID string, exec Execution) map
 	for _, in := range exec.Input {
 		for _, evidence := range rt.resolvableInputEvidence(graphID, in) {
 			allowed[evidence.Ref] = struct{}{}
-			if evidence.CheckRef != "" {
-				allowed[evidence.CheckRef] = struct{}{}
-			}
+
 		}
 	}
 	for _, e := range exec.Evidence {
 		allowed[e.Ref] = struct{}{}
-		if e.CheckRef != "" {
-			allowed[e.CheckRef] = struct{}{}
-		}
+
 	}
 	return allowed
 }

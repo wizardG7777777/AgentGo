@@ -61,31 +61,19 @@ func TestGraphToolExecutorReadOnly(t *testing.T) {
 		t.Errorf("read_file 输出应含内容与自描述头部:\n%s", content)
 	}
 
-	// list_dir：目录枚举。
-	result = executeGraphTool(t, ex, "list_dir", map[string]any{"path": "."})
-	content = result["content"].(string)
-	if !strings.Contains(content, "main.go") || !strings.Contains(content, "docs") {
-		t.Errorf("list_dir 输出应含 main.go 与 docs:\n%s", content)
+	for _, name := range []string{"list_dir", "grep_search", "glob_search"} {
+		if _, err := ex.ExecuteNodeTool(context.Background(), name, map[string]any{}); err == nil {
+			t.Fatalf("已退役工具不得执行：%s", name)
+		}
 	}
 
-	// grep_search：字面子串命中。
-	result = executeGraphTool(t, ex, "grep_search", map[string]any{"pattern": "hello", "path": "docs"})
-	if !strings.Contains(result["content"].(string), "a.txt:1") {
-		t.Errorf("grep_search 输出应含 a.txt:1 命中行:\n%s", result["content"])
-	}
-
-	// glob_search：** 递归通配。
-	result = executeGraphTool(t, ex, "glob_search", map[string]any{"pattern": "**/*.txt", "root_dir": "."})
-	if !strings.Contains(result["content"].(string), "docs/a.txt") {
-		t.Errorf("glob_search 输出应含 docs/a.txt:\n%s", result["content"])
-	}
 }
 
 // TestGraphToolExecutorRejectsNonReadOnly 写/Shell/Meta 类工具一律中文错误拒绝
 // （tool 节点只做确定性只读执行；副作用是 agent 节点的职责）。
 func TestGraphToolExecutorRejectsNonReadOnly(t *testing.T) {
 	ex := newGraphToolExecutor(t.TempDir())
-	for _, name := range []string{"write_file", "edit_file", "run_shell", "send_message", "publish_task", "web_search", "nonexistent"} {
+	for _, name := range []string{"apply_change", "run_shell", "send_message", "publish_task", "web_search", "nonexistent"} {
 		_, err := ex.ExecuteNodeTool(context.Background(), name, map[string]any{})
 		if err == nil || !strings.Contains(err.Error(), "不允许执行工具") || !strings.Contains(err.Error(), name) {
 			t.Errorf("工具 %q 应被拒绝且错误载明工具名，实际: %v", name, err)

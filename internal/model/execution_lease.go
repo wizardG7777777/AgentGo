@@ -12,7 +12,8 @@ import (
 const (
 	ExecutionLeaseSchemaV1      = "agentgo.execution-lease/v1"
 	ExecutionLeaseSchemaV2      = "agentgo.execution-lease/v2"
-	ExecutionLeaseSchemaCurrent = ExecutionLeaseSchemaV2
+	ExecutionLeaseSchemaV3      = "agentgo.execution-lease/v3"
+	ExecutionLeaseSchemaCurrent = ExecutionLeaseSchemaV3
 )
 
 // ExecutionLease 是 V6 §4（H1）引入的「冻结执行租约」：任务首次被认领时，
@@ -51,15 +52,12 @@ type ExecutionLease struct {
 	// BusinessTools ∪ ControlTools——显式声明漏带控制工具时节点仍能收尾。
 	ControlTools []string `json:"control_tools,omitempty"`
 
-	Model                               string `json:"model,omitempty"` // 冻结模型（capability 覆盖或 kind 默认）
-	ModelContextWindowTokens            int64  `json:"model_context_window_tokens,omitempty"`
-	ModelMaxCompletionTokens            int64  `json:"model_max_completion_tokens,omitempty"`
-	ModelCapabilityDigest               string `json:"model_capability_digest,omitempty"`
-	ObservationModel                    string `json:"observation_model,omitempty"`
-	ObservationModelContextWindowTokens int64  `json:"observation_model_context_window_tokens,omitempty"`
-	ObservationModelMaxCompletionTokens int64  `json:"observation_model_max_completion_tokens,omitempty"`
-	ObservationModelCapabilityDigest    string `json:"observation_model_capability_digest,omitempty"`
-	Workspace                           string `json:"workspace,omitempty"` // "" | "workspace"（写时复制执行隔离）
+	Model                    string `json:"model,omitempty"` // 冻结模型（capability 覆盖或 kind 默认）
+	ModelContextWindowTokens int64  `json:"model_context_window_tokens,omitempty"`
+	ModelMaxCompletionTokens int64  `json:"model_max_completion_tokens,omitempty"`
+	ModelCapabilityDigest    string `json:"model_capability_digest,omitempty"`
+
+	Workspace string `json:"workspace,omitempty"` // "" | "workspace"（写时复制执行隔离）
 
 	Synthetic bool `json:"synthetic,omitempty"` // true = 需求为合成（未显式声明 tools）
 	// ApprovalRequired 为 true 表示冻结时 exec=strict：写工具/shell 保留在
@@ -78,28 +76,11 @@ type ExecutionLease struct {
 // 输入字段必须先排序去重（冻结路径由 compute 保证；手工构造时调用方负责）。
 func (l *ExecutionLease) ComputeDigest() string {
 	h := sha256.New()
-	if l.Schema == ExecutionLeaseSchemaV2 {
-		fmt.Fprintf(h, "schema=%s;biz=%s;ctl=%s;model=%s;window=%d;completion=%d;cap=%s;observation_model=%s;observation_window=%d;observation_completion=%d;observation_cap=%s;ws=%s;syn=%t;appr=%t",
-			l.Schema, strings.Join(l.BusinessTools, ","), strings.Join(l.ControlTools, ","),
-			l.Model, l.ModelContextWindowTokens, l.ModelMaxCompletionTokens, l.ModelCapabilityDigest,
-			l.ObservationModel, l.ObservationModelContextWindowTokens,
-			l.ObservationModelMaxCompletionTokens, l.ObservationModelCapabilityDigest,
-			l.Workspace, l.Synthetic, l.ApprovalRequired)
-		sum := h.Sum(nil)
-		return hex.EncodeToString(sum)[:12]
-	}
-	if l.ModelContextWindowTokens == 0 && l.ModelMaxCompletionTokens == 0 && l.ModelCapabilityDigest == "" {
-		fmt.Fprintf(h, "biz=%s;ctl=%s;model=%s;ws=%s;syn=%t;appr=%t",
-			strings.Join(l.BusinessTools, ","), strings.Join(l.ControlTools, ","),
-			l.Model, l.Workspace, l.Synthetic, l.ApprovalRequired)
-	} else {
-		fmt.Fprintf(h, "biz=%s;ctl=%s;model=%s;window=%d;completion=%d;cap=%s;ws=%s;syn=%t;appr=%t",
-			strings.Join(l.BusinessTools, ","), strings.Join(l.ControlTools, ","),
-			l.Model, l.ModelContextWindowTokens, l.ModelMaxCompletionTokens, l.ModelCapabilityDigest,
-			l.Workspace, l.Synthetic, l.ApprovalRequired)
-	}
-	sum := h.Sum(nil)
-	return hex.EncodeToString(sum)[:12]
+	fmt.Fprintf(h, "schema=%s;biz=%s;ctl=%s;model=%s;window=%d;completion=%d;cap=%s;ws=%s;syn=%t;appr=%t",
+		l.Schema, strings.Join(l.BusinessTools, ","), strings.Join(l.ControlTools, ","), l.Model,
+		l.ModelContextWindowTokens, l.ModelMaxCompletionTokens, l.ModelCapabilityDigest, l.Workspace, l.Synthetic, l.ApprovalRequired)
+	return hex.EncodeToString(h.Sum(nil))[:12]
+
 }
 
 // ToolUnion 返回生效工具视图（BusinessTools ∪ ControlTools，排序去重）。

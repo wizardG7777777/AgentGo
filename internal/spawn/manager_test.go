@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"agentgo/internal/config"
 	"agentgo/internal/contextruntime"
@@ -223,8 +222,7 @@ func TestManager_Spawn_PublishesInitialTaskDepth(t *testing.T) {
 	}
 	taskStore := store.NewMemoryTaskStore(nil, 0, 1, 60)
 	source := &model.Task{ID: "source-task-1", Description: "来源任务"}
-	if err := taskcontract.Start(source, loopcontract.WorkInvestigation, "test-spawn/v1",
-		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+	if err := taskcontract.Start(source, loopcontract.WorkInvestigation, "test-spawn/v1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := taskStore.PublishTask(source); err != nil {

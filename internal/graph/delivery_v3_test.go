@@ -2,16 +2,16 @@ package graph
 
 import "testing"
 
-func TestV3MutatingCapabilityRejectsRawShell(t *testing.T) {
+func TestV3MutatingCapabilityAllowsGenericShell(t *testing.T) {
 	doc := &GraphDocument{Schema: SchemaV3, Nodes: map[string]Node{
 		"work": {Kind: KindAgent, ProgressContractRef: "progress:code-change/v6",
-			Capability: &Capability{Isolation: IsolationWorkspace, Tools: []string{"write_file", "run_shell", "run_check"}}},
+			Capability: &Capability{Isolation: IsolationWorkspace, Tools: []string{"apply_change", "run_shell"}}},
 	}}
-	if err := validateCapabilityShape(doc); err == nil {
-		t.Fatal("Graph v3 mutating raw run_shell 应被拒绝")
+	if err := validateCapabilityShape(doc); err != nil {
+		t.Fatalf("隔离工作区中的通用 Shell 应允许：%v", err)
 	}
 	doc.Nodes["work"] = Node{Kind: KindAgent, ProgressContractRef: "progress:code-change/v6",
-		Capability: &Capability{Isolation: IsolationWorkspace, Tools: []string{"write_file", "run_check"}}}
+		Capability: &Capability{Isolation: IsolationWorkspace, Tools: []string{"apply_change"}}}
 	if err := validateCapabilityShape(doc); err != nil {
 		t.Fatalf("Graph v3 mutating 受约束工具集被拒绝: %v", err)
 	}

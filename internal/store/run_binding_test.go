@@ -16,9 +16,9 @@ func TestPublishTaskRejectsPartialRunBinding(t *testing.T) {
 	task := &model.Task{
 		RunID: "run-partial",
 		RunContract: &runcontract.RunContract{
-			Schema: runcontract.SchemaV1, RunID: "run-partial", CreatedAt: now,
-			DeadlineAt: now.Add(time.Hour), FinalizationReserve: time.Minute,
-			RecoveryReserve: time.Minute, BudgetProfile: "test/v1",
+			Schema: runcontract.SchemaCurrent, RunID: "run-partial", CreatedAt: now,
+			DeadlineAt:    now.Add(time.Hour),
+			BudgetProfile: "test/v1",
 		},
 		Description: "缺少 L2/L4 binding",
 	}
@@ -41,8 +41,7 @@ func TestPublishTaskRejectsPhaseWithoutRunBinding(t *testing.T) {
 func TestPublishTaskAcceptsCompleteRunBinding(t *testing.T) {
 	store := NewMemoryTaskStore(nil, 8, 1, 60)
 	task := &model.Task{Description: "完整运行契约"}
-	if err := taskcontract.Start(task, loopcontract.WorkCoordination, "test-complete/v1",
-		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+	if err := taskcontract.Start(task, loopcontract.WorkCoordination, "test-complete/v1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.PublishTask(task); err != nil {

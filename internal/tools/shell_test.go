@@ -341,7 +341,7 @@ func TestRunShell_DescriptionContainsDialect(t *testing.T) {
 	}
 	desc := defs[0].Description
 	if runtime.GOOS == "windows" {
-		if !strings.Contains(desc, "PowerShell") || !strings.Contains(desc, "write_file") ||
+		if !strings.Contains(desc, "PowerShell") || !strings.Contains(desc, "apply_change") ||
 			!strings.Contains(desc, "pipeline 默认拒绝") {
 			t.Errorf("Windows 描述缺 PowerShell 方言或写文件规则: %q", desc)
 		}

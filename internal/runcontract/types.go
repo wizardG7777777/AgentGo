@@ -6,6 +6,8 @@
 package runcontract
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"math"
 	"time"
@@ -14,7 +16,8 @@ import (
 const (
 	SchemaV1      = "agentgo.run-contract/v1"
 	SchemaV2      = "agentgo.run-contract/v2"
-	SchemaCurrent = SchemaV2
+	SchemaV3      = "agentgo.run-contract/v3"
+	SchemaCurrent = SchemaV3
 )
 
 // RunID 是一次用户请求的稳定身份。同一请求创建的 Graph、Activation 和 Task
@@ -63,16 +66,6 @@ type BudgetUsage struct {
 	ToolActions      int64         `json:"tool_actions,omitempty"`
 	Attempts         int64         `json:"attempts,omitempty"`
 	CostMicros       int64         `json:"cost_micros,omitempty"`
-}
-
-// CheckContract 是 request ingress 冻结的检查命令契约。ExactCommand 为空时
-// 只声明允许的 ID/kind（适合定向诊断）；非空时 run_check 必须逐字匹配，
-// 使最终验收范围不再依赖模型理解 Prompt。具体语言/项目命令由外部调用方
-// 注入，Runtime 不按 provider、模型或项目类型猜测。
-type CheckContract struct {
-	CheckID      string `json:"check_id"`
-	Kind         string `json:"kind"`
-	ExactCommand string `json:"exact_command,omitempty"`
 }
 
 // Add 返回两个 usage 的逐维和，不修改接收者。任一维度溢出时返回错误，
@@ -131,16 +124,29 @@ type DeadlineBudget struct {
 // RunContract 是 request ingress 创建并冻结的运行契约。DeadlineAt 是整个
 // 请求的绝对截止时间；任何 Graph/Activation/Attempt deadline 都必须早于它。
 type RunContract struct {
-	Schema              string          `json:"schema"`
-	RunID               RunID           `json:"run_id"`
-	DeadlineAt          time.Time       `json:"deadline_at"`
-	FinalizationReserve time.Duration   `json:"finalization_reserve"`
-	RecoveryReserve     time.Duration   `json:"recovery_reserve"`
-	VerificationReserve time.Duration   `json:"verification_reserve,omitempty"`
-	BudgetProfile       string          `json:"budget_profile"`
-	Budget              BudgetLimit     `json:"budget,omitempty"`
-	CheckContracts      []CheckContract `json:"check_contracts,omitempty"`
-	CreatedAt           time.Time       `json:"created_at"`
+	Schema              string        `json:"schema"`
+	RunID               RunID         `json:"run_id"`
+	DeadlineAt          time.Time     `json:"deadline_at,omitempty"`
+	FinalizationReserve time.Duration `json:"finalization_reserve,omitempty"`
+	RecoveryReserve     time.Duration `json:"recovery_reserve,omitempty"`
+	VerificationReserve time.Duration `json:"verification_reserve,omitempty"`
+	BudgetProfile       string        `json:"budget_profile"`
+	Budget              BudgetLimit   `json:"budget,omitempty"`
+
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// UnmarshalJSON 显式拒绝已退役的检查契约字段，不静默接受旧请求。
+func (c *RunContract) UnmarshalJSON(data []byte) error {
+	type value RunContract
+	var decoded value
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	*c = RunContract(decoded)
+	return nil
 }
 
 // Deadline 将 RunContract 投影为统一 DeadlineBudget。

@@ -22,7 +22,7 @@ func TestParseRef(t *testing.T) {
 	for _, value := range []string{
 		"", " generalist@1", "builtin/generalist", "builtin/generalist@0",
 		"builtin/Generalist@1", "company/generalist@1", "builtin/a/b@1",
-		"builtin/generalist@1@2", "builtin/generalist@01", "builtin/generalist@+1",
+		"builtin/generalist@2@2", "builtin/generalist@01", "builtin/generalist@+1",
 	} {
 		value := value
 		t.Run(value, func(t *testing.T) {
@@ -63,16 +63,16 @@ func TestLoadBuiltinsAndCatalogCopies(t *testing.T) {
 			t.Errorf("summary %s has invalid MaxReplicas %d", summary.Ref, summary.MaxReplicas)
 		}
 	}
-	wantRefs := []string{"builtin/explorer@1", "builtin/generalist@1", "builtin/verifier@1"}
+	wantRefs := []string{"builtin/explorer@2", "builtin/generalist@2", "builtin/verifier@2"}
 	if !reflect.DeepEqual(gotRefs, wantRefs) {
 		t.Fatalf("List refs = %v, want %v", gotRefs, wantRefs)
 	}
-	verifier, err := catalog.Resolve("builtin/verifier@1")
+	verifier, err := catalog.Resolve("builtin/verifier@2")
 	if err != nil {
 		t.Fatalf("Resolve verifier: %v", err)
 	}
 	wantVerifierTools := []string{
-		"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref",
+		"read_file", "read_evidence", "inspect_board", "inspect_node",
 		"web_search", "web_fetch", "submit_task_result",
 	}
 	if !reflect.DeepEqual(verifier.Tools, wantVerifierTools) {
@@ -83,17 +83,17 @@ func TestLoadBuiltinsAndCatalogCopies(t *testing.T) {
 			t.Errorf("builtin verifier prompt contains stale authority/freshness claim %q", stale)
 		}
 	}
-	for _, want := range []string{"Evidence 只证明这次调用发生过", "implement → checker → acceptance", "blocked 终态就是交回 Scheduler 的唯一通道"} {
+	for _, want := range []string{"证据不足", "不执行 Shell", "status=blocked"} {
 		if !strings.Contains(verifier.SystemPrompt, want) {
 			t.Errorf("builtin verifier prompt missing closed-tool/causality contract %q", want)
 		}
 	}
 
-	first, err := catalog.Resolve("builtin/generalist@1")
+	first, err := catalog.Resolve("builtin/generalist@2")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if !strings.Contains(first.SystemPrompt, "Scheduler") || first.SourceFile != "embed:prompts/generalist.md" {
+	if !strings.Contains(first.SystemPrompt, "request_replan") || first.SourceFile != "embed:prompts/generalist.md" {
 		t.Fatalf("builtin prompt/source were not resolved: %#v", first)
 	}
 	first.Tools[0] = "mutated"
@@ -102,7 +102,7 @@ func TestLoadBuiltinsAndCatalogCopies(t *testing.T) {
 	summaries[0].Capabilities[0] = "mutated"
 	summaries[0].Tools[0] = "mutated"
 
-	second, err := catalog.Resolve("builtin/generalist@1")
+	second, err := catalog.Resolve("builtin/generalist@2")
 	if err != nil {
 		t.Fatalf("Resolve after mutation: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestCatalogNilBehavior(t *testing.T) {
 	if got := catalog.List(); got != nil {
 		t.Fatalf("nil Catalog.List = %#v, want nil", got)
 	}
-	if _, err := catalog.Resolve("builtin/generalist@1"); err == nil {
+	if _, err := catalog.Resolve("builtin/generalist@2"); err == nil {
 		t.Fatal("nil Catalog.Resolve unexpectedly succeeded")
 	}
 }

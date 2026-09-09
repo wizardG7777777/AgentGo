@@ -283,9 +283,9 @@ func TestVerifierHonorsRunDeadline(t *testing.T) {
 	input := proposalFixture(rawRequest)
 	input.Definition.RunID = "run-verifier"
 	input.Definition.RunContract = &runcontract.RunContract{
-		Schema: runcontract.SchemaV1, RunID: "run-verifier", CreatedAt: base.Add(-time.Second),
-		DeadlineAt: base.Add(120 * time.Millisecond), FinalizationReserve: 10 * time.Millisecond,
-		RecoveryReserve: 10 * time.Millisecond, BudgetProfile: "test/v1",
+		Schema: runcontract.SchemaCurrent, RunID: "run-verifier", CreatedAt: base.Add(-time.Second),
+		DeadlineAt:    base.Add(120 * time.Millisecond),
+		BudgetProfile: "test/v1",
 	}
 	input.RequestDigest = schedulerRequestDigest("run-verifier", rawRequest)
 	input.Contract.RequestDigest = input.RequestDigest
@@ -338,4 +338,26 @@ func (f *fakeVerifierClient) Invoke(ctx context.Context, request llm.Request, si
 		return llm.Result{}, err
 	}
 	return fixture.Seal(spec.Options.Protocol)
+}
+
+// 未配置时限的 v3 Run 不得被旧阶段预留公式判为窗口耗尽。
+func TestProposalWithoutRunDeadlineUsesCallerCancellation(t *testing.T) {
+	parent, stop := context.WithCancel(context.Background())
+	input := graph.ProposalAcceptanceInput{Definition: graph.GraphDefinitionBody{RunContract: &runcontract.RunContract{
+		Schema: runcontract.SchemaCurrent, RunID: "run-no-deadline", CreatedAt: time.Now(), BudgetProfile: "test/v1",
+	}}}
+	child, cancel, err := proposalDeadlineContext(parent, input, time.Now())
+	if err != nil {
+		stop()
+		t.Fatal(err)
+	}
+	defer cancel()
+	if _, bounded := child.Deadline(); bounded {
+		stop()
+		t.Fatal("无时限 Run 不应被注入默认阶段窗口")
+	}
+	stop()
+	if child.Err() != context.Canceled {
+		t.Fatalf("调用方取消未透传：%v", child.Err())
+	}
 }

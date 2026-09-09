@@ -140,7 +140,7 @@ startup_probe: "off"
 	}
 	// V6 Graph 运行桥接（C5a）装配冒烟：图持久化目录（与 artifacts 同基
 	// .agentgo/state/graphs）应真实创建。
-	if fi, err := os.Stat(filepath.Join(tmpDir, ".agentgo", "state", "graphs")); err != nil || !fi.IsDir() {
+	if fi, err := os.Stat(filepath.Join(tmpDir, ".agentgo", "state", "graphs-v5")); err != nil || !fi.IsDir() {
 		t.Fatalf("graph 持久化目录应在 project_root 下创建: err=%v", err)
 	}
 	// 2026-08 二期空会话丢弃冒烟：本次运行未提交任何用户输入，Session 是空

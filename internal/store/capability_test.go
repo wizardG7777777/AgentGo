@@ -45,7 +45,7 @@ func capabilityTaskIDs(tasks []*model.Task) map[string]bool {
 func TestQueryAvailable_CapabilityFilter(t *testing.T) {
 	s, _ := newTestStore(10, 100)
 	s.SetCapabilityChecker(allowlistChecker(map[string][]string{
-		"agent-full": {"read_file", "write_file", "run_shell"},
+		"agent-full": {"read_file", "apply_change", "run_shell"},
 		"agent-lite": {"read_file"},
 	}))
 
@@ -224,7 +224,7 @@ func TestClaimTask_FailedDependencyRejected(t *testing.T) {
 func TestCloneTask_CapabilityDeepCopy(t *testing.T) {
 	s, _ := newTestStore(10, 100)
 	task := &model.Task{Description: "能力克隆", EventType: "code",
-		Capability: &model.NodeCapability{Tools: []string{"read_file", "write_file"}, Model: "m-1"}}
+		Capability: &model.NodeCapability{Tools: []string{"read_file", "apply_change"}, Model: "m-1"}}
 	if err := s.PublishTask(task); err != nil {
 		t.Fatalf("PublishTask: %v", err)
 	}
@@ -247,7 +247,7 @@ func TestCloneTask_CapabilityDeepCopy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTask: %v", err)
 	}
-	if again.Capability.Tools[1] != "write_file" || again.Capability.Model != "m-1" {
+	if again.Capability.Tools[1] != "apply_change" || again.Capability.Model != "m-1" {
 		t.Fatalf("读快照修改穿透了 store：%+v", again.Capability)
 	}
 }
@@ -362,7 +362,7 @@ func TestTaskClone_PreservesIsolation(t *testing.T) {
 // 导出/导入必须保留隔离声明，否则 resume 后隔离节点静默退化。
 func TestCapabilitySnapshotRoundTrip_PreservesIsolation(t *testing.T) {
 	src := &model.NodeCapability{
-		Tools:     []string{"write_file"},
+		Tools:     []string{"apply_change"},
 		Model:     "m-1",
 		Isolation: &model.IsolationSpec{Mode: model.IsolationModeWorkspace},
 	}
@@ -385,7 +385,7 @@ func TestPublishTask_EmitsIsolationOverride(t *testing.T) {
 	task := &model.Task{
 		Description: "隔离节点",
 		Capability: &model.NodeCapability{
-			Tools:     []string{"write_file"},
+			Tools:     []string{"apply_change"},
 			Isolation: &model.IsolationSpec{Mode: model.IsolationModeWorkspace},
 		},
 	}
@@ -401,7 +401,7 @@ func TestPublishTask_EmitsIsolationOverride(t *testing.T) {
 		if ev.IsolationOverride != model.IsolationModeWorkspace {
 			t.Fatalf("IsolationOverride = %q，期望 %q", ev.IsolationOverride, model.IsolationModeWorkspace)
 		}
-		if len(ev.ToolsOverride) != 1 || ev.ToolsOverride[0] != "write_file" {
+		if len(ev.ToolsOverride) != 1 || ev.ToolsOverride[0] != "apply_change" {
 			t.Fatalf("ToolsOverride 投影丢失: %v", ev.ToolsOverride)
 		}
 	}

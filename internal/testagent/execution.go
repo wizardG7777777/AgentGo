@@ -16,7 +16,7 @@ func Wrap(step agent.TaskExecutor) agent.TaskExecutor {
 	return func(ctx context.Context, task *model.Task, deps map[string]string, history []contextcontract.HistoryEntry, budget llm.OutputBudget) (agent.ExecuteResult, error) {
 		task.ContextPolicyRef = policycatalog.ContextDefaultCurrent
 		if task.Lease == nil {
-			task.Lease = &model.ExecutionLease{Digest: "test-lease", Model: "test-model", ModelCapabilityDigest: "test-capability"}
+			task.Lease = &model.ExecutionLease{Schema: model.ExecutionLeaseSchemaCurrent,Digest: "test-lease", Model: "test-model", ModelCapabilityDigest: "test-capability"}
 		}
 		if task.AttemptID == "" {
 			task.AttemptID = "test-attempt:" + task.ID

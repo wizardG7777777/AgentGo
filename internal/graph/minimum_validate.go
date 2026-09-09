@@ -34,6 +34,13 @@ func validateMinimumDefinition(body GraphDefinitionBody) []ValidationIssue {
 	inbound := make(map[string]int)
 	for _, id := range sortedDefinitionNodeIDs(body) {
 		node := body.Nodes[id]
+		if body.Schema == SchemaV5 {
+			for _, key := range []string{MetadataControllerRole, MetadataRecoveryDeltaSchema, MetadataRecoveryMaxRetries, "recovery_target"} {
+				if node.Metadata[key] != "" {
+					issues = append(issues, validationIssue("RETIRED_RECOVERY_METADATA", "nodes."+id+".metadata."+key, true, "旧自动恢复/决策协议已退役，请使用普通节点与显式图变更"))
+				}
+			}
+		}
 		path := "nodes." + id
 		for _, edge := range node.Next {
 			inbound[edge.To]++

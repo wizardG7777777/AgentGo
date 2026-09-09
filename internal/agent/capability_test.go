@@ -42,7 +42,7 @@ func newCapToolRegistry() *ToolRegistry {
 	tools := NewToolRegistry()
 	noop := func(ctx context.Context, args map[string]any) (string, error) { return "ok", nil }
 	tools.Register("read_file", "读取文件", nil, noop)
-	tools.Register("write_file", "写入文件", nil, noop)
+	tools.Register("apply_change", "写入文件", nil, noop)
 	tools.Register("run_shell", "执行命令", nil, noop)
 	return tools
 }
@@ -200,7 +200,7 @@ func TestProcessTask_CapabilityModelOverrideAndRestore(t *testing.T) {
 func TestToolRegistry_FilteredView(t *testing.T) {
 	full := newCapToolRegistry()
 
-	if missing := full.Missing([]string{"read_file", "no_such", "no_such", "write_file"}); len(missing) != 1 || missing[0] != "no_such" {
+	if missing := full.Missing([]string{"read_file", "no_such", "no_such", "apply_change"}); len(missing) != 1 || missing[0] != "no_such" {
 		t.Fatalf("Missing = %v，want [no_such]（去重、保序）", missing)
 	}
 	if missing := full.Missing([]string{"read_file"}); len(missing) != 0 {
@@ -215,7 +215,7 @@ func TestToolRegistry_FilteredView(t *testing.T) {
 		t.Fatalf("过滤视图注册数 = %d，want 1", view.RegisteredCount())
 	}
 	// 视图外工具名即使被 LLM 幻觉出来，Dispatch 也拒绝
-	if _, err := view.Dispatch(context.Background(), llm.ToolCall{Name: "write_file", Arguments: nil}); err == nil ||
+	if _, err := view.Dispatch(context.Background(), llm.ToolCall{Name: "apply_change", Arguments: nil}); err == nil ||
 		!strings.Contains(err.Error(), "未知工具") {
 		t.Fatalf("视图 Dispatch 视图外工具应报「未知工具」，实际: %v", err)
 	}

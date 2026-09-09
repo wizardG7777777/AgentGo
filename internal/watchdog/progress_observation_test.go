@@ -38,7 +38,7 @@ func publishLoopTask(t *testing.T, s interface {
 	if err != nil {
 		t.Fatal(err)
 	}
-	profile, ok := catalog.ProgressContract(policycatalog.ProgressInvestigationV1)
+	profile, ok := catalog.ProgressContract(policycatalog.ProgressInvestigationCurrent)
 	if !ok {
 		t.Fatal("缺少 investigation progress contract")
 	}

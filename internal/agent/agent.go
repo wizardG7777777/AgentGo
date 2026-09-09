@@ -14,11 +14,9 @@ import (
 
 	"agentgo/internal/contentstore"
 	"agentgo/internal/contextcontract"
-	"agentgo/internal/controlcapability"
 	"agentgo/internal/effect"
 	"agentgo/internal/hook"
 	"agentgo/internal/llm"
-	"agentgo/internal/loopcontract"
 	"agentgo/internal/loopcontrol"
 	"agentgo/internal/loopstore"
 	"agentgo/internal/mailbox"
@@ -111,14 +109,11 @@ type Agent struct {
 	// Model 是该 Agent 当前生效的模型名，用于 contextcontract.HistoryEntry.Model 记录。
 	// nextUpgrade_v4.md §11.7.3：跨模型实测值不可比，压缩阈值估算
 	// 仅锚定当前模型一致的最近一条 PromptTokens > 0 条目。空串时退化为粗略估算。
-	Model                               string
-	ModelContextWindowTokens            int64
-	ModelMaxCompletionTokens            int64
-	ModelCapabilityDigest               string
-	ObservationModel                    string
-	ObservationModelContextWindowTokens int64
-	ObservationModelMaxCompletionTokens int64
-	ObservationModelCapabilityDigest    string
+	Model                    string
+	ModelContextWindowTokens int64
+	ModelMaxCompletionTokens int64
+	ModelCapabilityDigest    string
+
 	// TokenStats 是 Agent 级别的累计 Token 消耗（§11.7.3），仅作 UI 实时视图
 	// 数据源，不写入 trace 账本。
 	// 运行期读写必须经 AddTokenStats / TokenStatsSnapshot（tokenMu 保护）——
@@ -503,7 +498,7 @@ func attemptHardDeadline(task *model.Task) (time.Time, bool) {
 	if err != nil {
 		return time.Time{}, false
 	}
-	return compiled.Attempt.HardDeadlineAt, true
+	return compiled.Attempt.HardDeadlineAt, !compiled.Attempt.HardDeadlineAt.IsZero()
 }
 
 func (a *Agent) processTask(ctx context.Context, taskID string) {
@@ -756,7 +751,6 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// 内的压缩处置（L2 strategy / L3 truncated）。taskStartedAt 取认领时刻，
 	// 是 Memory 段 live/stale 判定的比较基准。
 	manifestInfo := newAttemptContextStats(time.Now())
-	lastObservationProjectionCount := manifestInfo.historyProjectionCount
 
 	// CM2（V6 §3）：Task Memory 加载或创建（attempt 恢复=加载既有，继续
 	// 滚动；新建=初始化 Goal/Constraints 并落盘 + emit task_memory_created）。
@@ -888,7 +882,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	attemptDeadline, hasAttemptDeadline := attemptHardDeadline(task)
 	if loopProgress != nil {
 		attemptDeadline = loopProgress.checkpoint.Deadlines.Attempt.HardDeadlineAt
-		hasAttemptDeadline = true
+		hasAttemptDeadline = !attemptDeadline.IsZero()
 	}
 	for i := 0; ; i++ {
 		select {
@@ -1197,13 +1191,10 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		if cancelExecute != nil {
 			cancelExecute()
 		}
-		policyDecision := loopPolicyDecision{}
 		var progressErr error
 		callerCancelled := ctx.Err() != nil && isAuthoritativeCancellation()
 		if loopProgress != nil {
-			policyDecision, progressErr = loopProgress.settleTurn(a, task, turnID,
-				actionStartedAt, result, execErr, !callerCancelled,
-				pendingObservationCheckpointAction(history) != "")
+			progressErr = loopProgress.settleTurn(a, task, turnID, actionStartedAt, result, execErr)
 		}
 
 		// 取消可能发生在 Execute 内部。此时循环顶部的 select 已经过去，
@@ -1236,256 +1227,6 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			taskMem.applySettledTurn(a, taskID, result, i)
 			a.saveHistory(task, history)
 			continue
-		}
-		// exact deliverable submit 若被契约门明确告知需要更多工作，
-		// 本轮不得再追加 deliverable-required marker。失败提交回执
-		// 会在 historyRequiresDeliverableSubmit 中清除旧 marker，下轮重新
-		// 暴露 run_check/read/edit，避免同一 gate error 无界重放。
-		if deliverableSubmissionNeedsMoreWork(historyEntryFromResult(result, a.Model, turnID)) {
-			policyDecision.Reminder = ""
-		}
-
-		// Observation checkpoint 是 L2/L4 的机械接缝。marker 已在上一轮
-		// durable history 中冻结；本轮必须只调用 record_observation_delta，
-		// 成功后执行 marker 指定的 continue/rollover/intervention 动作。
-		if observationAction := pendingObservationCheckpointAction(history); observationAction != "" {
-			failureCountBefore := observationCheckpointFailureCount(history)
-			if result.ToolCalled {
-				history = append(history, historyEntryFromResult(result, a.Model, turnID))
-			}
-			taskMem.applySettledTurn(a, taskID, result, i)
-			if !observationCheckpointSucceeded(result) || taskMem.observationRef(task.AttemptID) == "" {
-				var incompatible *controlcapability.IncompatibleError
-				if errors.As(execErr, &incompatible) {
-					if observationAction == "periodic" {
-						history = append(history, contextcontract.HistoryEntry{SystemNotice: observationCheckpointAbandonedMarker +
-							" 当前 Run 已确认该 effective model/profile/schema 不兼容；保留 Raw History 并跳过 provider 调用。"})
-						a.saveHistory(task, history)
-						continue
-					}
-					a.saveHistory(task, history)
-					reason := "model_contract_incompatible: " + incompatible.Error()
-					enterTerminating("react_loop_exit:model_contract_incompatible")
-					a.blockForLoopControl(task, taskID, reason, "model_contract_incompatible")
-					return
-				}
-				checkpointFailureReason := "observation_submission_invalid"
-				if !result.ProviderCallStarted {
-					checkpointFailureReason = "control_invocation_preflight_failed"
-				}
-				trace.Emit(trace.Event{
-					Kind: trace.KindObservationCheckpointFailed, TaskID: taskID,
-					RunID: string(task.RunID), AttemptID: task.AttemptID, TurnID: turnID,
-					AgentID: a.ID, Loop: i, Reason: checkpointFailureReason,
-					Description: "action=" + observationAction,
-				})
-				// response/tool-call gate 前的 Invocation 失败不会产生
-				// record_observation_delta ToolCall，仍必须纳入 checkpoint
-				// 自身的有界重试，不得落入普通 LLM retry 空转。
-				if observationCheckpointFailureCount(history) == failureCountBefore {
-					history = append(history, contextcontract.HistoryEntry{SystemNotice: observationCheckpointFailureMarker +
-						" 本次机械 checkpoint 未形成合法 ObservationDelta。"})
-				}
-				failures := observationCheckpointFailureCount(history)
-				failureLimit := 2
-				usesDurableControlFailures := task.ProgressContract != nil &&
-					task.ProgressContract.Policy.MaxControlContractFailures > 0
-				if usesDurableControlFailures {
-					failures = loopProgress.checkpoint.ControlContractFailureCount
-					failureLimit = task.ProgressContract.Policy.MaxControlContractFailures
-				}
-				if failures < failureLimit {
-					notice := "Observation 未通过机械校验；仍处于同一 checkpoint，请按本轮 tool schema 的 evidence enum 修正一次。"
-					if detail := observationCheckpointFailureDetail(result); detail != "" {
-						notice += " 机械错误：" + detail
-					}
-					history = append(history, contextcontract.HistoryEntry{SystemNotice: notice})
-					a.saveHistory(task, history)
-					continue
-				}
-				if !usesDurableControlFailures && observationAction == "periodic" {
-					history = append(history, contextcontract.HistoryEntry{SystemNotice: observationCheckpointAbandonedMarker +
-						" 周期性 Observation 两次失败；保留原始历史并恢复业务阶段，下一知识 turn 再尝试。"})
-					a.saveHistory(task, history)
-					continue
-				}
-				if !usesDurableControlFailures && observationAction == "decision_periodic" {
-					a.saveHistory(task, history)
-					reason := "decision_progress_stalled: decision checkpoint Observation 连续失败"
-					terminatingCause = "react_loop_exit:decision_checkpoint_unavailable"
-					enterTerminating(terminatingCause)
-					a.blockForLoopControl(task, taskID, reason, "decision_progress_stalled")
-					return
-				}
-				a.saveHistory(task, history)
-				reason := "control_contract_unstable: Observation control contract 连续失败"
-				terminatingCause = "react_loop_exit:control_contract_unstable"
-				enterTerminating(terminatingCause)
-				a.blockForLoopControl(task, taskID, reason, "control_contract_unstable")
-				return
-			}
-			a.saveHistory(task, history)
-			taskMem.checkpoint(a, taskID, i, "observation_checkpoint")
-			lastObservationProjectionCount = manifestInfo.historyProjectionCount
-			effectiveObservationAction := observationAction
-			if policyDecision.ObservationAction == "observation_stalled" ||
-				policyDecision.ObservationAction == "decision_stalled" {
-				effectiveObservationAction = policyDecision.ObservationAction
-			}
-			switch effectiveObservationAction {
-			case "rollover":
-				if err := a.Store.RetryRollback(a.ID, taskID, "l4_no_progress_attempt_rollover"); err != nil {
-					reason := "L4 Observation 后 AttemptRollover 失败: " + err.Error()
-					terminatingCause = "react_loop_exit:progress_authority_failure"
-					enterTerminating(terminatingCause)
-					a.blockForLoopControl(task, taskID, reason, "progress_authority_failure")
-					return
-				}
-				trace.Emit(trace.Event{Kind: trace.KindTaskRetry, TaskID: taskID, RunID: string(task.RunID),
-					AgentID: a.ID, Reason: "l4_no_progress_attempt_rollover", AttemptNo: task.AttemptNo,
-					Transition: &trace.Transition{PrevStatus: string(model.TaskStatusProcessing),
-						NewStatus: string(model.TaskStatusPending), Cause: "l4_no_progress_attempt_rollover",
-						RetryCount: task.RetryCount + 1}})
-				return
-			case "intervention_budget", "intervention_stalled", "observation_stalled", "decision_stalled":
-				reasonCode := loopcontract.InterventionNoProgressStalled
-				reasonPrefix := "no_progress_intervention_required"
-				cause := "loop_intervention_required"
-				if effectiveObservationAction == "intervention_budget" {
-					reasonCode = loopcontract.InterventionNoProgressBudget
-					reasonPrefix = "no_progress_budget_exhausted"
-					cause = "no_progress_budget_exhausted"
-				} else if effectiveObservationAction == "observation_stalled" {
-					reasonCode = loopcontract.InterventionObservationStalled
-					reasonPrefix = "observation_state_stalled"
-					cause = "observation_state_stalled"
-				} else if effectiveObservationAction == "decision_stalled" {
-					reasonCode = loopcontract.InterventionDecisionStalled
-					reasonPrefix = "decision_progress_stalled"
-					cause = "decision_progress_stalled"
-				}
-				if effectiveObservationAction != "observation_stalled" && effectiveObservationAction != "decision_stalled" {
-					if err := loopProgress.appendObservationIntervention(task, reasonCode); err != nil {
-						terminatingCause = "react_loop_exit:progress_authority_failure"
-						enterTerminating(terminatingCause)
-						a.blockForLoopControl(task, taskID, "Observation intervention 落盘失败: "+err.Error(), "progress_authority_failure")
-						return
-					}
-				}
-				reason := fmt.Sprintf("%s: no_progress_turns=%d checkpoint=%s observation=%s", reasonPrefix,
-					loopProgress.checkpoint.NoProgressTurns, loopProgress.checkpoint.CheckpointID,
-					loopProgress.checkpoint.ObservationDeltaRef)
-				terminatingCause = "react_loop_exit:" + cause
-				enterTerminating(terminatingCause)
-				a.blockForLoopControl(task, taskID, reason, cause)
-				return
-			default:
-				continue
-			}
-		}
-
-		// 第一轮发生 L2 history projection 后，Raw History 仍保持不变；在任何
-		// 后续普通 Invocation 前先冻结一次 ObservationDelta。
-		if taskUsesObservationCheckpoint(task) && !result.Finalized &&
-			manifestInfo.historyProjectionCount > lastObservationProjectionCount && taskMem.observationRef(task.AttemptID) == "" {
-			if result.ToolCalled {
-				history = append(history, historyEntryFromResult(result, a.Model, turnID))
-			}
-			taskMem.applySettledTurn(a, taskID, result, i)
-			history = append(history, contextcontract.HistoryEntry{SystemNotice: observationCheckpointNotice("continue",
-				"L2 已开始有界 history projection；在继续普通工作前冻结当前事实和下一步。")})
-			a.saveHistory(task, history)
-			continue
-		}
-
-		// ObservationAction 在 Intervention=true 时表示 typed reason，而不是
-		// “再请求一次 checkpoint”。Observation 已存在的 decision/time guard
-		// 会直接返回 Intervention+decision_stalled；若仍被本分支 continue，
-		// 每轮都会重复追加 intervention 却永远不终结当前 Activation。
-		if policyDecision.ObservationAction != "" && !policyDecision.Intervention {
-			if result.ToolCalled {
-				history = append(history, historyEntryFromResult(result, a.Model, turnID))
-			}
-			taskMem.applySettledTurn(a, taskID, result, i)
-			history = append(history, contextcontract.HistoryEntry{SystemNotice: policyDecision.Reminder})
-			a.saveHistory(task, history)
-			continue
-		}
-		if policyDecision.Rollover {
-			if taskUsesObservationCheckpoint(task) && taskMem.observationRef(task.AttemptID) == "" {
-				if result.ToolCalled {
-					history = append(history, historyEntryFromResult(result, a.Model, turnID))
-				}
-				taskMem.applySettledTurn(a, taskID, result, i)
-				history = append(history, contextcontract.HistoryEntry{SystemNotice: observationCheckpointNotice("rollover",
-					policyDecision.Reminder)})
-				a.saveHistory(task, history)
-				continue
-			}
-			if result.ToolCalled {
-				history = append(history, historyEntryFromResult(result, a.Model, turnID))
-			}
-			if policyDecision.Reminder != "" {
-				history = append(history, contextcontract.HistoryEntry{SystemNotice: policyDecision.Reminder})
-			}
-			taskMem.applySettledTurn(a, taskID, result, i)
-			a.saveHistory(task, history)
-			if err := a.Store.RetryRollback(a.ID, taskID, "l4_no_progress_attempt_rollover"); err != nil {
-				reason := "L4 AttemptRollover 失败: " + err.Error()
-				terminatingCause = "react_loop_exit:progress_authority_failure"
-				enterTerminating(terminatingCause)
-				a.blockForLoopControl(task, taskID, reason, "progress_authority_failure")
-				return
-			}
-			trace.Emit(trace.Event{
-				Kind: trace.KindTaskRetry, TaskID: taskID, RunID: string(task.RunID), AgentID: a.ID,
-				Reason: "l4_no_progress_attempt_rollover", AttemptNo: task.AttemptNo,
-				Transition: &trace.Transition{
-					PrevStatus: string(model.TaskStatusProcessing), NewStatus: string(model.TaskStatusPending),
-					Cause: "l4_no_progress_attempt_rollover", RetryCount: task.RetryCount + 1,
-				},
-			})
-			return
-		}
-		if policyDecision.Intervention {
-			cause := "loop_intervention_required"
-			reasonPrefix := "no_progress_intervention_required"
-			switch {
-			case policyDecision.Blocked:
-				cause = "no_progress_budget_exhausted"
-				reasonPrefix = "no_progress_budget_exhausted"
-			case policyDecision.ObservationAction == "decision_stalled":
-				cause = "decision_progress_stalled"
-				reasonPrefix = "decision_progress_stalled"
-			case policyDecision.ObservationAction == "candidate_handoff":
-				cause = "candidate_completion_handoff"
-				reasonPrefix = "candidate_completion_handoff"
-			case policyDecision.ObservationAction == "observation_stalled":
-				cause = "observation_state_stalled"
-				reasonPrefix = "observation_state_stalled"
-			}
-			reason := fmt.Sprintf("%s: no_progress_turns=%d no_progress_duration=%s no_progress_model_calls=%d exploration_turns_since_deliverable=%d checkpoint=%s", reasonPrefix,
-				loopProgress.checkpoint.NoProgressTurns, loopProgress.checkpoint.NoProgressDuration,
-				loopProgress.checkpoint.NoProgressUsage.ModelCalls,
-				loopProgress.checkpoint.ExplorationTurnsSinceDeliverable,
-				loopProgress.checkpoint.CheckpointID)
-			if task.FinalReportGraphID != "" && a.FinalizationFallback != nil {
-				report, fallbackErr := a.FinalizationFallback(ctx, task)
-				if fallbackErr == nil && strings.TrimSpace(report) != "" {
-					terminatingCause = "react_loop_exit:finalization_fallback"
-					enterTerminating(terminatingCause)
-					if a.completeFinalizationFallback(task, report, i+1) {
-						taskSuccess = true
-						return
-					}
-				} else if fallbackErr != nil {
-					reason += "; finalization fallback 失败: " + fallbackErr.Error()
-				}
-			}
-			terminatingCause = "react_loop_exit:" + cause
-			enterTerminating(terminatingCause)
-			a.blockForLoopControl(task, taskID, reason, cause)
-			return
 		}
 		var authorityErr *loopAuthorityError
 		if errors.As(execErr, &authorityErr) {
@@ -1805,9 +1546,6 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			CompletionTokens: result.CompletionTokens,
 			Model:            a.Model,
 		})
-		if policyDecision.Reminder != "" {
-			history = append(history, contextcontract.HistoryEntry{SystemNotice: policyDecision.Reminder})
-		}
 
 		// 进度通知：在 history append 之后、PhaseLoopPost 之前发送
 		a.progressNotify(ctx, taskID, i, result, &pFlags)
@@ -2372,7 +2110,7 @@ func appendValidationFeedback(history []contextcontract.HistoryEntry, check Arti
 	} else {
 		sb.WriteString("  你实际没有写入任何文件。\n")
 	}
-	sb.WriteString("  纠正策略：使用 write_file 工具，path 参数严格按 expected_artifacts 字面给出的相对路径。\n")
+	sb.WriteString("  纠正策略：使用 apply_change 工具，path 参数严格按 expected_artifacts 字面给出的相对路径。\n")
 	sb.WriteString("  不要把文件写到 docs/ 子目录除非 expected 路径就是 docs/xxx。\n")
 	sb.WriteString("</validation-feedback>")
 	return append(history, contextcontract.HistoryEntry{SystemNotice: sb.String()})
@@ -2443,7 +2181,7 @@ type ArtifactCheckResult struct {
 // checkExpectedArtifacts 校验任务的 ExpectedArtifacts 是否全部出现在 Artifacts 中。
 //
 // 这是 Level 3 的硬性合约校验：如果发布者明确声明"任务必须产出文件 X.md"，
-// 但任务结束时 X.md 没有被任何 write_file/edit_file 调用记录到 Artifacts 中，
+// 但任务结束时 X.md 没有被任何 apply_change/apply_change 调用记录到 Artifacts 中，
 // 则认定任务"假完成"，触发失败重试。
 //
 // 匹配策略（按顺序尝试，命中即停）：
@@ -2584,7 +2322,8 @@ func formatMailMessages(msgs []mailbox.Message) string {
 		if priority == "" {
 			priority = mailbox.PriorityNormal
 		}
-		fmt.Fprintf(&sb, "<agent-mail type=%q priority=%q>\n", msgType, priority)
+		fmt.Fprintf(&sb, "<agent-mail type=%q priority=%q message_id=%q reply_to=%q delivery_only=%q>\n",
+			msgType, priority, m.ID, m.ReplyTo, fmt.Sprint(m.DeliveryOnly))
 		fmt.Fprintf(&sb, "  <from>%s @ %s</from>\n", m.From, m.SentAt.Format("15:04:05"))
 		if m.Summary != "" {
 			fmt.Fprintf(&sb, "  <summary>%s</summary>\n", m.Summary)

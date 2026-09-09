@@ -138,7 +138,7 @@ func NewCommandFilter(blacklist, greylist []string) *CommandFilter {
 // pattern 带 RedirectWritePatternPrefix 前缀；运行时白名单只短路灰名单匹配。
 func (f *CommandFilter) Check(command string) (action string, pattern string) {
 	// 重定向写文件硬规则（redirect.go）：与黑名单同通道 block，但优先级
-	// 最高——写文件必须走 write_file / edit_file，shell 重定向一律不放行。
+	// 最高——写文件必须走 apply_change / apply_change，shell 重定向一律不放行。
 	if detail := detectRedirectWrite(command); detail != "" {
 		return "block", RedirectWritePatternPrefix + detail
 	}
@@ -264,11 +264,11 @@ func WrapShellTool(inner agent.ToolFunc, filter *CommandFilter,
 		switch action {
 		case "block":
 			// 重定向写文件与黑名单同通道硬拒，但拒绝消息单独定制：
-			// 明确指引改用 write_file / edit_file 工具。
+			// 明确指引改用 apply_change / apply_change 工具。
 			if detail, ok := strings.CutPrefix(pattern, RedirectWritePatternPrefix); ok {
 				log.Printf("[shell-filter] 重定向写文件拦截: agent=%s, command=%q, redirect=%s", agentID, command, detail)
 				return "", fmt.Errorf(
-					"⚠ 命令被拒绝（禁止 shell 重定向写文件）：检测到 %s 会把输出写入文件。写文件请改用 write_file / edit_file 工具。", detail)
+					"⚠ 命令被拒绝（禁止 shell 重定向写文件）：检测到 %s 会把输出写入文件。写文件请改用 apply_change / apply_change 工具。", detail)
 			}
 			log.Printf("[shell-filter] 黑名单拦截: agent=%s, command=%q, pattern=%s", agentID, command, pattern)
 			return "", fmt.Errorf(

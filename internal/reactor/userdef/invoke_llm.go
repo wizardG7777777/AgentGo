@@ -92,7 +92,7 @@ type outputSink interface {
 	dispatch(ev trace.Event, llmOutput string) error
 }
 
-// ── write_file sink ───────────────────────────────────────────────────
+// ── apply_change sink ───────────────────────────────────────────────────
 
 type writeFileSinkImpl struct {
 	pathTpl     string // 含 ${event.x} 模板
@@ -103,14 +103,14 @@ type writeFileSinkImpl struct {
 func (s *writeFileSinkImpl) dispatch(ev trace.Event, llmOutput string) error {
 	rendered := renderTemplate(s.pathTpl, ev)
 	if rendered == "" {
-		return fmt.Errorf("write_file: rendered path is empty (template=%q)", s.pathTpl)
+		return fmt.Errorf("apply_change: rendered path is empty (template=%q)", s.pathTpl)
 	}
 	if !filepath.IsAbs(rendered) && s.baseDir != "" {
 		rendered = filepath.Join(s.baseDir, rendered)
 	}
 	abs, err := filepath.Abs(rendered)
 	if err != nil {
-		return fmt.Errorf("write_file: resolve path %q: %w", rendered, err)
+		return fmt.Errorf("apply_change: resolve path %q: %w", rendered, err)
 	}
 	if s.projectRoot != "" {
 		if err := ensurePathUnderRoot(abs, s.projectRoot); err != nil {
@@ -118,7 +118,7 @@ func (s *writeFileSinkImpl) dispatch(ev trace.Event, llmOutput string) error {
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
-		return fmt.Errorf("write_file: mkdir: %w", err)
+		return fmt.Errorf("apply_change: mkdir: %w", err)
 	}
 	if s.projectRoot != "" {
 		// 目录创建后再检查一次，覆盖 parent 中已有符号链接或并发替换的情况。
@@ -127,7 +127,7 @@ func (s *writeFileSinkImpl) dispatch(ev trace.Event, llmOutput string) error {
 		}
 	}
 	if err := os.WriteFile(abs, []byte(llmOutput), 0o644); err != nil {
-		return fmt.Errorf("write_file: %w", err)
+		return fmt.Errorf("apply_change: %w", err)
 	}
 	return nil
 }
@@ -135,7 +135,7 @@ func (s *writeFileSinkImpl) dispatch(ev trace.Event, llmOutput string) error {
 func ensurePathUnderRoot(absPath, projectRoot string) error {
 	canonRoot, err := filepath.EvalSymlinks(projectRoot)
 	if err != nil {
-		return fmt.Errorf("write_file: canonicalize project root: %w", err)
+		return fmt.Errorf("apply_change: canonicalize project root: %w", err)
 	}
 	existingParent, canonParent, err := canonicalExistingParent(filepath.Dir(absPath))
 	if err != nil {
@@ -143,15 +143,15 @@ func ensurePathUnderRoot(absPath, projectRoot string) error {
 	}
 	relParent, err := filepath.Rel(canonRoot, canonParent)
 	if err != nil || strings.HasPrefix(relParent, "..") || filepath.IsAbs(relParent) {
-		return fmt.Errorf("write_file: path %q is outside project root %q", absPath, projectRoot)
+		return fmt.Errorf("apply_change: path %q is outside project root %q", absPath, projectRoot)
 	}
 	remaining, err := filepath.Rel(existingParent, absPath)
 	if err != nil {
-		return fmt.Errorf("write_file: resolve relative path: %w", err)
+		return fmt.Errorf("apply_change: resolve relative path: %w", err)
 	}
 	relPath, err := filepath.Rel(canonRoot, filepath.Join(canonParent, remaining))
 	if err != nil || strings.HasPrefix(relPath, "..") || filepath.IsAbs(relPath) {
-		return fmt.Errorf("write_file: path %q is outside project root %q", absPath, projectRoot)
+		return fmt.Errorf("apply_change: path %q is outside project root %q", absPath, projectRoot)
 	}
 	return nil
 }
@@ -161,15 +161,15 @@ func canonicalExistingParent(parent string) (string, string, error) {
 		if _, err := os.Stat(parent); err == nil {
 			canon, err := filepath.EvalSymlinks(parent)
 			if err != nil {
-				return "", "", fmt.Errorf("write_file: canonicalize path: %w", err)
+				return "", "", fmt.Errorf("apply_change: canonicalize path: %w", err)
 			}
 			return parent, canon, nil
 		} else if !os.IsNotExist(err) {
-			return "", "", fmt.Errorf("write_file: stat path: %w", err)
+			return "", "", fmt.Errorf("apply_change: stat path: %w", err)
 		}
 		next := filepath.Dir(parent)
 		if next == parent {
-			return "", "", fmt.Errorf("write_file: no existing parent for %q", parent)
+			return "", "", fmt.Errorf("apply_change: no existing parent for %q", parent)
 		}
 		parent = next
 	}

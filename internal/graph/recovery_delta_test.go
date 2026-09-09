@@ -27,9 +27,9 @@ func recoveryDeltaFixture(t *testing.T) (*Runtime, *Store, map[string]any) {
 		"_failure_fingerprint": "failure:sha256:source",
 	}
 	now := time.Now().UTC()
-	run := &runcontract.RunContract{Schema: runcontract.SchemaV1, RunID: "run-recovery-delta",
+	run := &runcontract.RunContract{Schema: runcontract.SchemaCurrent, RunID: "run-recovery-delta",
 		CreatedAt: now.Add(-time.Minute), DeadlineAt: now.Add(time.Hour),
-		FinalizationReserve: time.Minute, RecoveryReserve: 5 * time.Minute, BudgetProfile: "test/v2"}
+		BudgetProfile: "test/v2"}
 	doc := &GraphDocument{Schema: SchemaV2, GraphID: "g-recovery-delta", RunID: run.RunID,
 		RunContract: run, Revision: 1,
 		Root: "work", Status: GraphPending, Nodes: map[string]Node{
@@ -67,7 +67,7 @@ func recoveryDeltaFixture(t *testing.T) (*Runtime, *Store, map[string]any) {
 		"schema": RecoveryDeltaSchemaV1, "source_checkpoint_ref": "checkpoint-source",
 		"source_observation_delta_ref": "observation:sha256:source",
 		"failure_fingerprint":          "failure:sha256:source", "changed_dimensions": []any{"strategy"},
-		"strategy": "先修改最小调用点", "first_required_action": "edit_file src/a.go",
+		"strategy": "先修改最小调用点", "first_required_action": "apply_change src/a.go",
 		"expected_milestone": "目标测试通过",
 	}}
 	return runtime, store, result
@@ -121,7 +121,7 @@ func TestRecoveryDeltaRequiredBeforeRetryAndInjectedIntoNextActivation(t *testin
 	}
 	found := false
 	for _, input := range replayed {
-		if input.TargetInput == "recovery_directive" && strings.Contains(input.Summary, "edit_file src/a.go") {
+		if input.TargetInput == "recovery_directive" && strings.Contains(input.Summary, "apply_change src/a.go") {
 			found = true
 		}
 	}
@@ -134,7 +134,7 @@ func TestBindRecoveryDeltaAuthorityFillsFrozenSourceFields(t *testing.T) {
 	runtime, _, _ := recoveryDeltaFixture(t)
 	bound, err := runtime.BindRecoveryDeltaAuthority("g-recovery-delta", "recovery", "recovery@1", RecoveryDelta{
 		ChangedDimensions: []string{"strategy"}, Strategy: "换用最小修改",
-		FirstRequiredAction: "edit_file src/a.go", ExpectedMilestone: "目标检查通过",
+		FirstRequiredAction: "apply_change src/a.go", ExpectedMilestone: "目标检查通过",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -158,7 +158,7 @@ func TestRecoveryDeltaRetryCreatesNextActivationWithFrozenDirective(t *testing.T
 	}
 	found := false
 	for _, input := range work.Execution.Input {
-		if input.TargetInput == "recovery_directive" && strings.Contains(input.Summary, "edit_file src/a.go") {
+		if input.TargetInput == "recovery_directive" && strings.Contains(input.Summary, "apply_change src/a.go") {
 			found = true
 		}
 	}
@@ -342,7 +342,7 @@ func TestRecoveryDeltaV3RequiresReadFileFirstAction(t *testing.T) {
 		"failure_fingerprint": "failure", "changed_dimensions": []any{"strategy"},
 		"strategy": "从目标读集直接进入 mutation", "expected_milestone": "形成补丁并检查",
 	}
-	base["first_action"] = map[string]any{"tool": "edit_file", "path": "src/a.py"}
+	base["first_action"] = map[string]any{"tool": "apply_change", "path": "src/a.py"}
 	if _, err := decodeRecoveryDelta(map[string]any{"recovery_delta": base}); err == nil ||
 		!strings.Contains(err.Error(), "必须是带 path 的 read_file") {
 		t.Fatalf("v3 直接复用旧 Activation edit authority 必须拒绝: %v", err)
@@ -383,9 +383,8 @@ func TestRecoveryDeltaV5CandidateStateComesFromFailureAuthority(t *testing.T) {
 	failure := InputBinding{
 		SourceNodeID: "work", SourceActivationID: "work@1", DeliveryRef: "delivery:run-1",
 		Evidence: []EvidenceEntry{
-			{Ref: "ev:edit", Kind: "file_edit", ToolName: "edit_file", Success: &success, Path: "src/flask/ctx.py"},
+			{Ref: "ev:edit", Kind: "file_edit", ToolName: "apply_change", Success: &success, Path: "src/flask/ctx.py"},
 			{Ref: "ev:check", Kind: "check", ToolName: "run_check", Success: &success,
-				CheckRef: "check:targeted", CheckID: "targeted", CheckStatus: "pass",
 				WorkspaceRevisionRef: "workspace:sha256:candidate"},
 		},
 	}
@@ -395,8 +394,7 @@ func TestRecoveryDeltaV5CandidateStateComesFromFailureAuthority(t *testing.T) {
 	}
 	if state.Schema != RecoveryCandidateStateSchemaV1 || state.SourceActivationID != "work@1" ||
 		state.DeliveryID != "delivery:run-1" || len(state.DirtyPaths) != 1 ||
-		state.DirtyPaths[0] != "src/flask/ctx.py" || state.LatestCheck == nil ||
-		state.LatestCheck.CheckRef != "check:targeted" {
+		state.DirtyPaths[0] != "src/flask/ctx.py" {
 		t.Fatalf("v5 candidate state 未精确投影 failure authority: %+v", state)
 	}
 	result := map[string]any{"recovery_delta": map[string]any{

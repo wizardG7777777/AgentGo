@@ -129,7 +129,7 @@ func TestRegistry_MatchesFiltersOut(t *testing.T) {
 		name: "g", phase: PhaseToolPreCall, priority: 100,
 		matches: func(c Context) bool {
 			tc, ok := c.(*ToolContext)
-			return ok && tc.ToolName == "write_file"
+			return ok && tc.ToolName == "apply_change"
 		},
 		run: func(c Context) Decision {
 			called = true
@@ -140,7 +140,7 @@ func TestRegistry_MatchesFiltersOut(t *testing.T) {
 	if called {
 		t.Error("Matches=false should skip Run")
 	}
-	r.Dispatch(newToolCtx(PhaseToolPreCall, "write_file"))
+	r.Dispatch(newToolCtx(PhaseToolPreCall, "apply_change"))
 	if !called {
 		t.Error("Matches=true should call Run")
 	}

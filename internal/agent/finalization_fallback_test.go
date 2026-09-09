@@ -23,8 +23,7 @@ func TestFinalReportInvocationFailureUsesDeterministicFallback(t *testing.T) {
 	tasks := store.NewMemoryTaskStore(make(chan model.Event, 16), 8, 1, 60)
 	task := &model.Task{ID: "final-report-fallback", EventType: "__scheduler__",
 		EventSource: "graph-ended", FinalReportGraphID: "g-finished"}
-	if err := taskcontract.Start(task, loopcontract.WorkFinalization, "test-finalization/v1",
-		10*time.Minute, 30*time.Second, 90*time.Second); err != nil {
+	if err := taskcontract.Start(task, loopcontract.WorkFinalization, "test-finalization/v1"); err != nil {
 		t.Fatal(err)
 	}
 	task.RunPhase = runcontract.PhaseFinalization
@@ -73,13 +72,12 @@ func TestFinalReportExpiredPhaseUsesFallbackWithoutProviderOrActiveReservation(t
 	now := time.Now().UTC()
 	task := &model.Task{ID: "final-report-expired", EventType: "__scheduler__",
 		EventSource: "graph-ended", FinalReportGraphID: "g-expired"}
-	if err := taskcontract.Start(task, loopcontract.WorkFinalization, "test-finalization/v1",
-		10*time.Minute, 30*time.Second, 90*time.Second); err != nil {
+	if err := taskcontract.Start(task, loopcontract.WorkFinalization, "test-finalization/v1"); err != nil {
 		t.Fatal(err)
 	}
 	task.RunPhase = runcontract.PhaseFinalization
 	task.RunContract.CreatedAt = now.Add(-time.Minute)
-	task.RunContract.DeadlineAt = now.Add(500 * time.Millisecond)
+	task.RunContract.DeadlineAt = now.Add(100 * time.Millisecond)
 	task.RunContract.FinalizationReserve = 0
 	task.RunContract.RecoveryReserve = 0
 	task.RunContract.VerificationReserve = 0
@@ -89,6 +87,7 @@ func TestFinalReportExpiredPhaseUsesFallbackWithoutProviderOrActiveReservation(t
 	if err := tasks.ClaimTask("scheduler-expired", task.ID); err != nil {
 		t.Fatal(err)
 	}
+	time.Sleep(time.Until(task.RunContract.DeadlineAt) + 10*time.Millisecond)
 	loops, err := loopstore.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)

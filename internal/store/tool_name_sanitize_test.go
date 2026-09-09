@@ -21,8 +21,8 @@ func dsmlGarbageToolName() string {
 
 func TestIsWellFormedToolNameMatrix(t *testing.T) {
 	cases := []struct {
-		name      string
-		toolName  string
+		name       string
+		toolName   string
 		wellFormed bool
 	}{
 		{"内置工具名", "run_shell", true},
@@ -56,7 +56,7 @@ func TestIsWellFormedToolNameMatrix(t *testing.T) {
 
 func TestMalformedToolNamePlaceholderDeterministic(t *testing.T) {
 	raw1 := dsmlGarbageToolName()
-	raw2 := "edit_file>\n<｜DSML｜" + strings.Repeat("y", 150)
+	raw2 := "apply_change>\n<｜DSML｜" + strings.Repeat("y", 150)
 	p1, p1Again, p2 := MalformedToolNamePlaceholder(raw1), MalformedToolNamePlaceholder(raw1), MalformedToolNamePlaceholder(raw2)
 	if p1 != p1Again {
 		t.Errorf("同一垃圾名应得同一占位: %q vs %q", p1, p1Again)

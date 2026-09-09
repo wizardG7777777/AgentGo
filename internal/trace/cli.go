@@ -1389,9 +1389,13 @@ func formatEventDetails(ev Event) string {
 		}
 	case KindShellExecuted:
 		if ev.ShellExec != nil {
-			parts = append(parts, fmt.Sprintf("cmd=%q exit=%d duration=%dms outcome=%s",
+			exit := "unknown"
+			if ev.ShellExec.ExitCode != nil {
+				exit = fmt.Sprint(*ev.ShellExec.ExitCode)
+			}
+			parts = append(parts, fmt.Sprintf("cmd=%q exit=%s duration=%dms outcome=%s",
 				truncate(ev.ShellExec.Command, 60),
-				ev.ShellExec.ExitCode,
+				exit,
 				ev.ShellExec.DurationMS,
 				ev.ShellExec.Outcome))
 			parts = appendExcerpt(parts, "stdout", ev.ShellExec.StdoutExcerpt)
@@ -1690,16 +1694,16 @@ func detectAnomalies(events []Event) []string {
 		anomalies = append(anomalies, "WARNING 任务已完成但无任何 file_written 事件（report-only 失败模式）")
 	}
 
-	// 3. 检测：write_file 出现但全程无 read_file（可能是凭空捏造）
+	// 3. 检测：apply_change 出现但全程无 read_file（可能是凭空捏造）
 	hasWriteFile := false
 	for _, ev := range events {
-		if ev.Kind == KindToolCall && ev.Tool == "write_file" {
+		if ev.Kind == KindToolCall && ev.Tool == "apply_change" {
 			hasWriteFile = true
 			break
 		}
 	}
 	if hasWriteFile && !hasReadFile {
-		anomalies = append(anomalies, "WARNING 任务调用 write_file 但全程未调用 read_file（疑似无源材料的捏造写入）")
+		anomalies = append(anomalies, "WARNING 任务调用 apply_change 但全程未调用 read_file（疑似无源材料的捏造写入）")
 	}
 
 	// 4. 检测：history_compaction 触发多次

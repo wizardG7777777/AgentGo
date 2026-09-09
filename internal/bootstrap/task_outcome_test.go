@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"agentgo/internal/agent"
-	"agentgo/internal/checkstore"
 	"agentgo/internal/delivery"
 	"agentgo/internal/fulfillment"
 	"agentgo/internal/graph"
@@ -75,15 +74,13 @@ func TestTaskOutcomeV3FreezesCandidateAndPreparesDelivery(t *testing.T) {
 	authority := newGraphTaskOutcomeAuthority(outcomeGraphReader{graphID: doc}, outcomes,
 		outcomeCheckpointReader{graphID: graphID})
 	authority.candidates, authority.deliveries = manager, deliveries
-	checks := checkstore.New(filepath.Join(root, "checks"))
-	authority.checks = checks
 	tasks := store.NewMemoryTaskStore(nil, 16, 1, 60)
 	if err := store.SetTerminalOutcomeCoordinator(tasks, authority); err != nil {
 		t.Fatal(err)
 	}
 	task := outcomeGraphTask(t, graphID, taskID)
 	task.DeliveryID = deliveryID
-	task.FulfillmentContract = &fulfillment.Contract{RequireWorkspaceChange: true, RequiredCheckIDs: []string{"verification"}}
+	task.FulfillmentContract = &fulfillment.Contract{RequireWorkspaceChange: true}
 	if err := tasks.PublishTask(task); err != nil {
 		t.Fatal(err)
 	}
@@ -91,26 +88,11 @@ func TestTaskOutcomeV3FreezesCandidateAndPreparesDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := tasks.AppendToolCall(taskID, store.ToolCallRecord{CallID: "edit-1", AttemptID: task.AttemptID,
-		ToolName: "edit_file", Args: map[string]any{"path": "source.go"}, Success: true}); err != nil {
+		ToolName: "apply_change", Args: map[string]any{"path": "source.go"}, Success: true}); err != nil {
 		t.Fatal(err)
 	}
-	claimed, err := tasks.GetTask(taskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	started := time.Now().UTC()
-	checkRef, err := checks.Put(checkstore.Record{
-		Schema: checkstore.SchemaV1, RunID: string(claimed.RunID), GraphID: graphID,
-		TaskID: taskID, AttemptID: claimed.AttemptID, ActivationID: claimed.ActivationID,
-		CheckID: "verification", Kind: "test", CommandDigest: "sha256:test",
-		Status: checkstore.StatusPass, ExitCode: 0, ExitCodeScope: "whole_command",
-		WorkspaceRevisionRef: "workspace:sha256:test", StartedAt: started, SettledAt: started.Add(time.Second),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	fulfillmentRecord := fulfillment.Record{Schema: fulfillment.SchemaV1,
-		WorkspaceRevisionRef: "workspace:sha256:test", CheckRefs: []string{checkRef},
+	fulfillmentRecord := fulfillment.Record{Schema: fulfillment.SchemaCurrent,
+		WorkspaceRevisionRef:    "workspace:sha256:test",
 		SatisfiedRequirementIDs: []string{"verification"}}
 	raw, _ := json.Marshal(fulfillmentRecord)
 	if err := tasks.SubmitResultWithFields("worker-1", taskID, "候选完成",
@@ -121,14 +103,10 @@ func TestTaskOutcomeV3FreezesCandidateAndPreparesDelivery(t *testing.T) {
 	if err != nil || !ok || record.Outcome.Candidate == nil || record.Outcome.CandidateRef == "" {
 		t.Fatalf("TaskOutcome 未冻结 candidate: outcome=%+v ok=%t err=%v", record.Outcome, ok, err)
 	}
-	foundCheckEvidence := false
 	for _, evidence := range record.Outcome.EvidenceFacts {
-		if evidence.Kind == "check" && evidence.CheckRef == checkRef && evidence.CheckStatus == "pass" {
-			foundCheckEvidence = true
+		if evidence.Kind == "check" {
+			t.Fatal("AgentGo 不应生成测试专用证据")
 		}
-	}
-	if !foundCheckEvidence {
-		t.Fatalf("fulfillment CheckRef 未冻结为 typed Evidence: %+v", record.Outcome.EvidenceFacts)
 	}
 	tx, ok, err := deliveries.Get(deliveryID)
 	if err != nil || !ok || tx.Status != delivery.StatusPrepared || tx.Candidate == nil ||
@@ -221,9 +199,9 @@ func outcomeGraphTask(t *testing.T, graphID, taskID string) *model.Task {
 func outcomeTestRun() *runcontract.RunContract {
 	now := time.Now().UTC()
 	return &runcontract.RunContract{
-		Schema: runcontract.SchemaV1, RunID: "run-1", CreatedAt: now,
-		DeadlineAt: now.Add(time.Hour), FinalizationReserve: time.Minute,
-		RecoveryReserve: time.Minute, BudgetProfile: "test/v1",
+		Schema: runcontract.SchemaCurrent, RunID: "run-1", CreatedAt: now,
+		DeadlineAt:    now.Add(time.Hour),
+		BudgetProfile: "test/v1",
 	}
 }
 

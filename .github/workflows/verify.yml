@@ -25,5 +25,6 @@ jobs:
       - run: python -m unittest discover -s scripts/swe_test_runner -p '*_test.py'
       - run: python scripts/local_fake_provider_smoke.py --binary ./agentgo.exe
       - run: python scripts/local_fake_provider_smoke.py --binary ./agentgo.exe --protocol chat_completions
+      - run: python scripts/local_fake_provider_smoke.py --binary ./agentgo.exe --team
       - if: runner.os == 'Linux'
         run: go test -race ./internal/llm ./internal/contextruntime ./internal/ui ./internal/session -timeout 180s

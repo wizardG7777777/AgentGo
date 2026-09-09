@@ -15,10 +15,8 @@ import (
 	"agentgo/internal/tools/schema"
 )
 
-// AgentTemplateGroup exposes Scheduler-only discovery and provisioning. It
-// creates runtime Team resources, never Graph nodes. Graph-first callers bind
-// the Team to their chosen graph_id before using the returned event_type in a
-// node metadata.route; omitting graph_id preserves the legacy task scope.
+// AgentTemplateGroup 供编排者发现模板并创建 Team；初建使用 graph_request_id
+// 与 apply_graph_change 的 request_id 绑定同一个未来图，不重新暴露草案工具。
 type AgentTemplateGroup struct {
 	Catalog     *agenttemplate.Catalog
 	Provisioner agenttemplate.Provisioner
@@ -35,11 +33,12 @@ func (g AgentTemplateGroup) Register(r *agent.ToolRegistry) {
 	if g.Provisioner == nil || g.Store == nil || g.Holder == nil {
 		return
 	}
-	r.Register("provision_agent_team", "从精确版本模板创建 Agent Team。Graph-first 路径必须预先选定 graph_id 并在本调用传入，Team 将存活到该 Graph 终态；省略 graph_id 仅保留 legacy task-scoped 语义。成功返回 ready event_type，必须等下一轮读到真实值后再写入节点 route，禁止猜测。",
+	r.Register("provision_agent_team", "从精确版本模板创建 Team。初建提供 graph_request_id，与后续 apply_graph_change(create) 的 request_id 完全一致；图内 controller 继承当前图。返回实际 graph_id 和 ready event_type，再用于节点 route；不创建图或脱图任务。",
 		schema.Object().
-			String("template_ref", "精确引用 namespace/name@version，例如 builtin/generalist@1", true).
+			String("template_ref", "精确引用 namespace/name@version，例如 builtin/generalist@2", true).
 			String("purpose", "该 Team 的职责", true).
-			String("graph_id", "Graph-first 路径的全局唯一 Graph ID；必须与随后 submit_graph 的 graph_id 完全一致。Graph controller 内可省略以自动继承当前 Graph", false).
+			String("graph_id", "图内扩展时显式核对当前图；省略则继承", false).
+			String("graph_request_id", "初建时与 apply_graph_change 的 request_id 使用同一稳定值，不能与 graph_id 混用", false).
 			Int("replicas", "同质副本数，默认 1，受模板和进程预算限制", false).
 			Build(), g.provision)
 }
@@ -57,26 +56,45 @@ func (g AgentTemplateGroup) provision(ctx context.Context, args map[string]any) 
 	if err != nil {
 		return "", err
 	}
+	for key, value := range args {
+		switch key {
+		case "template_ref", "purpose", "graph_id", "graph_request_id":
+			if _, ok := value.(string); !ok {
+				return "", fmt.Errorf("%s 必须是字符串", key)
+			}
+		case "replicas":
+		default:
+			return "", fmt.Errorf("provision_agent_team 不支持参数 %q", key)
+		}
+	}
 	ref, _ := args["template_ref"].(string)
 	purpose, _ := args["purpose"].(string)
 	graphID, _ := args["graph_id"].(string)
-	ref = strings.TrimSpace(ref)
-	purpose = strings.TrimSpace(purpose)
-	graphID = strings.TrimSpace(graphID)
+	graphRequestID, _ := args["graph_request_id"].(string)
+	ref, purpose, graphID = strings.TrimSpace(ref), strings.TrimSpace(purpose), strings.TrimSpace(graphID)
 	if ref == "" || purpose == "" {
 		return "", fmt.Errorf("template_ref and purpose are required")
 	}
-	if task.GraphID != "" {
-		if graphID == "" {
-			graphID = task.GraphID
-		} else if graphID != task.GraphID {
-			return "", fmt.Errorf("graph_id %q 与当前 Graph %q 不一致，拒绝跨 Graph provision", graphID, task.GraphID)
-		}
+	bound := task.GraphID
+	if bound == "" {
+		bound = task.InterventionGraphID
 	}
-	if graphID != "" {
-		if err := graph.ValidateGraphID(graphID); err != nil {
-			return "", fmt.Errorf("graph_id 非法: %w", err)
+	if bound != "" {
+		if graphRequestID != "" {
+			return "", fmt.Errorf("图内扩展不能声明新建 graph_request_id")
 		}
+		if graphID != "" && graphID != bound {
+			return "", fmt.Errorf("graph_id 与当前 Graph 不一致，拒绝跨 Graph provision")
+		}
+		graphID = bound
+	} else {
+		if graphID != "" || strings.TrimSpace(graphRequestID) == "" || len(graphRequestID) > 256 {
+			return "", fmt.Errorf("初建 Team 必须提供 graph_request_id，不能猜测 graph_id 或创建脱图 Team")
+		}
+		graphID = "graph-" + graphRequestKey(task.ID, graphRequestID)
+	}
+	if err := graph.ValidateGraphID(graphID); err != nil {
+		return "", fmt.Errorf("graph_id 非法: %w", err)
 	}
 	replicas := 1
 	if raw, exists := args["replicas"]; exists {
@@ -125,6 +143,9 @@ func (g AgentTemplateGroup) currentController() (*model.Task, error) {
 	}
 	if task.EventType != "__scheduler__" || task.Status != model.TaskStatusProcessing {
 		return nil, fmt.Errorf("agent team provisioning requires a running Scheduler task")
+	}
+	if task.FinalReportGraphID != "" || (task.GraphID != "" && task.GraphNodeKind != "controller") {
+		return nil, fmt.Errorf("只有图编排 controller 可以创建 Team")
 	}
 	return task, nil
 }

@@ -17,7 +17,7 @@ type mismatch struct {
 	actualHash   string
 }
 
-// ValidateLineAnchorsHook 在 write_file / edit_file 调用之前校验 args 中的
+// ValidateLineAnchorsHook 在 apply_change / apply_change 调用之前校验 args 中的
 // line_anchors 是否与目标文件当前行的内容哈希一致。
 //
 // 这是 §7 Hashline 行哈希增强的核心校验层。与 ValidateExpectedHashHook 互斥：
@@ -46,9 +46,9 @@ func (h *ValidateLineAnchorsHook) Phase() hook.ToolHookPhase { return hook.Phase
 // Priority 返回 25。
 func (h *ValidateLineAnchorsHook) Priority() int { return 25 }
 
-// Matches 仅匹配 write_file 和 edit_file。
+// Matches 仅匹配 apply_change 和 apply_change。
 func (h *ValidateLineAnchorsHook) Matches(toolName string) bool {
-	return toolName == "write_file" || toolName == "edit_file"
+	return toolName == "apply_change"
 }
 
 // Run 执行行哈希校验逻辑。
@@ -197,7 +197,7 @@ func buildMismatchReason(path string, lines []string, parseErrors []string, mism
 			}
 			prev = l
 		}
-		sb.WriteString("\n提示：复用最新 read_file / edit_file 输出里的 LINE#HASH 引用；不要凭记忆构造哈希。")
+		sb.WriteString("\n提示：复用最新 read_file / apply_change 输出里的 LINE#HASH 引用；不要凭记忆构造哈希。")
 	}
 
 	return sb.String()

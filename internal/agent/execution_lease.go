@@ -10,7 +10,6 @@ import (
 	"agentgo/internal/graph"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
-	"agentgo/internal/policycatalog"
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
 )
@@ -37,14 +36,21 @@ import (
 
 // leaseWriteTools 是 exec=readonly 时需从 BusinessTools 剔除的写类工具
 // （与 exec-mode-guard Gate 的拦截面一致）。
-var leaseWriteTools = []string{"write_file", "edit_file", "run_shell"}
+var leaseWriteTools = []string{"apply_change", "run_shell"}
 
 // acceptanceLeaseAllowedTools 是 acceptance 在执行租约层的最终正向闭集。
 // Graph 提交校验和 route 装配是前置防线；这里同时校验新计算与恢复复用的
 // durable Lease，防止旧快照或篡改租约把写入/Shell/协调工具带回 verifier。
 var acceptanceLeaseAllowedTools = map[string]struct{}{
-	"read_file": {}, "list_dir": {}, "grep_search": {}, "glob_search": {},
-	"web_search": {}, "web_fetch": {}, "read_content_ref": {}, "submit_task_result": {},
+	"inspect_board": {}, "inspect_node": {}, "read_graph_definition": {},
+	"read_file":  {},
+	"web_search": {}, "web_fetch": {}, "read_evidence": {}, "submit_task_result": {},
+}
+
+// IsAcceptanceToolAllowed 是验收角色只读工具闭集的唯一查询入口。
+func IsAcceptanceToolAllowed(name string) bool {
+	_, allowed := acceptanceLeaseAllowedTools[name]
+	return allowed
 }
 
 // acquireExecutionLease 是 processTask 的租约入口：任务已有冻结租约时复用
@@ -144,7 +150,7 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 		attemptNo = task.RetryCount + 1
 	}
 	lease = &model.ExecutionLease{
-		Schema:   model.ExecutionLeaseSchemaV1,
+		Schema:   model.ExecutionLeaseSchemaCurrent,
 		TaskID:   task.ID,
 		Attempt:  attemptNo,
 		FrozenAt: time.Now().UTC(),
@@ -183,6 +189,19 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 	// 图校验期 fail-closed，这里是旧快照/直接构造路径的兜底。
 	if task.GraphID != "" && task.GraphNodeKind == "controller" {
 		lease.BusinessTools = []string{}
+	}
+	if task.GraphID != "" && task.GraphNodeKind == "agent" {
+		filtered := lease.BusinessTools[:0]
+		for _, name := range lease.BusinessTools {
+			if name == "apply_graph_change" || name == "control_graph" || name == "list_agent_templates" || name == "provision_agent_team" {
+				if !lease.Synthetic {
+					return nil, "业务节点不得直接声明图编排工具；请使用 request_replan"
+				}
+				continue
+			}
+			filtered = append(filtered, name)
+		}
+		lease.BusinessTools = filtered
 	}
 	// acceptance、旧快照空 kind 与未知未来角色使用只读正向闭集。对未显式
 	// capability 的 synthetic Lease，这是 Node role policy 与 Route ceiling 的
@@ -226,26 +245,23 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 
 	// --- 节点角色派生控制通道 ---
 	lease.ControlTools = model.SortedCopy(deriveControlTools(task))
+	if task.GraphID != "" && task.GraphNodeKind == "controller" {
+		for _, name := range []string{"list_agent_templates", "provision_agent_team"} {
+			for _, registered := range ceiling {
+				if registered == name {
+					lease.ControlTools = append(lease.ControlTools, name)
+					break
+				}
+			}
+		}
+		lease.ControlTools = model.SortedCopy(lease.ControlTools)
+	}
 
 	// --- 冻结模型 / 隔离 / 超时 ---
 	lease.Model = a.Model
 	lease.ModelContextWindowTokens = a.ModelContextWindowTokens
 	lease.ModelMaxCompletionTokens = a.ModelMaxCompletionTokens
 	lease.ModelCapabilityDigest = a.ModelCapabilityDigest
-	lease.ObservationModel = a.ObservationModel
-	lease.ObservationModelContextWindowTokens = a.ObservationModelContextWindowTokens
-	lease.ObservationModelMaxCompletionTokens = a.ObservationModelMaxCompletionTokens
-	lease.ObservationModelCapabilityDigest = a.ObservationModelCapabilityDigest
-	if lease.ObservationModel == "" {
-		lease.ObservationModel = lease.Model
-		lease.ObservationModelContextWindowTokens = lease.ModelContextWindowTokens
-		lease.ObservationModelMaxCompletionTokens = lease.ModelMaxCompletionTokens
-		lease.ObservationModelCapabilityDigest = lease.ModelCapabilityDigest
-	}
-	if (task.RunContract != nil || task.RunID != "" || task.ContextPolicyRef != "") &&
-		lease.Model != "" && lease.ModelCapabilityDigest != "" && lease.ObservationModelCapabilityDigest != "" {
-		lease.Schema = model.ExecutionLeaseSchemaCurrent
-	}
 	if task.Capability != nil && task.Capability.Model != "" {
 		lease.Model = task.Capability.Model
 	}
@@ -259,11 +275,7 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 		if lease.Workspace != model.IsolationModeWorkspace {
 			return nil, "Graph v3 mutating Delivery Task 必须使用 workspace isolation"
 		}
-		for _, tool := range lease.BusinessTools {
-			if tool == "run_shell" {
-				return nil, "Graph v3 mutating Delivery Task 禁止 raw run_shell；请使用 run_check"
-			}
-		}
+
 	}
 
 	lease.Digest = lease.ComputeDigest()
@@ -281,17 +293,14 @@ func validateLeaseForTaskRole(task *model.Task, lease *model.ExecutionLease) str
 		return ""
 	}
 	strictIdentity := task.RunContract != nil || task.RunID != "" || task.ContextPolicyRef != ""
-	if lease.Schema != "" && lease.Schema != model.ExecutionLeaseSchemaV1 && lease.Schema != model.ExecutionLeaseSchemaV2 {
+	if lease.Schema != "" && lease.Schema != model.ExecutionLeaseSchemaCurrent {
 		return fmt.Sprintf("冻结租约 schema=%q 未知", lease.Schema)
 	}
 	if strictIdentity && strings.TrimSpace(lease.Model) != "" && strings.TrimSpace(lease.ModelCapabilityDigest) != "" &&
-		lease.Schema != model.ExecutionLeaseSchemaV2 {
-		return fmt.Sprintf("新运行契约要求 ExecutionLease v2，实际 schema=%q", lease.Schema)
+		lease.Schema != model.ExecutionLeaseSchemaCurrent {
+		return fmt.Sprintf("新运行契约要求 ExecutionLease v3，实际 schema=%q", lease.Schema)
 	}
-	if lease.Schema == model.ExecutionLeaseSchemaV2 &&
-		(strings.TrimSpace(lease.ObservationModel) == "" || strings.TrimSpace(lease.ObservationModelCapabilityDigest) == "") {
-		return "ExecutionLease v2 缺少 Observation model/capability"
-	}
+
 	if lease.TaskID != "" && lease.TaskID != task.ID {
 		return fmt.Sprintf("冻结租约 task_id=%q 与当前任务=%q 不一致", lease.TaskID, task.ID)
 	}
@@ -325,6 +334,15 @@ func validateLeaseForTaskRole(task *model.Task, lease *model.ExecutionLease) str
 		return fmt.Sprintf("非 recovery Graph Task 不得携带 recovery_source_task_id=%q", task.RecoverySourceTaskID)
 	}
 	expectedControl := deriveControlTools(task)
+	// 可选 Team 能力只有实际注册后才冻结；闭集允许该角色持有它们，
+	// 基础控制通道仍精确对账，不能借可选能力携带任意其它工具。
+	if task.GraphNodeKind == "controller" {
+		for _, name := range lease.ControlTools {
+			if name == "list_agent_templates" || name == "provision_agent_team" {
+				expectedControl = append(expectedControl, name)
+			}
+		}
+	}
 	if !sameExactToolSet(lease.ControlTools, expectedControl) {
 		return fmt.Sprintf("Graph 节点角色 %q 的冻结租约控制工具=%v，期望精确为 %v",
 			task.GraphNodeKind, lease.ControlTools, expectedControl)
@@ -389,33 +407,11 @@ func deriveControlTools(task *model.Task) []string {
 		switch task.GraphNodeKind {
 		case "controller", "agent":
 			if task.GraphNodeKind == "controller" {
-				if task.GraphControllerRole == string(graph.ControllerRoleLoopRecovery) {
-					return []string{
-						"commit_graph_change", "get_task_result", "propose_graph_change",
-						"read_content_ref", "read_graph", "read_graph_change",
-						"submit_recovery_decision", "validate_graph_change",
-					}
-				}
-				if task.GraphDefinitionDigestVersion != "" {
-					return []string{"read_graph", "request_replan", "submit_task_result"}
-				}
-				return []string{"patch_graph", "read_graph", "request_replan", "submit_task_result"}
+				return []string{"apply_graph_change", "control_graph", "inspect_board", "inspect_node", "read_evidence", "read_graph_definition", "request_replan", "submit_task_result"}
 			}
-			tools := []string{"request_replan", "submit_task_result"}
-			changeDecision := task.GraphRecoveryDeltaSchema == graph.RecoveryDeltaSchemaV4 ||
-				task.GraphRecoveryDeltaSchema == graph.RecoveryDeltaSchemaV5
-			if directive, ok := frozenRecoveryDirective(task); ok &&
-				(directive.Schema == graph.RecoveryDeltaSchemaV4 || directive.Schema == graph.RecoveryDeltaSchemaV5) {
-				changeDecision = true
-			}
-			if changeDecision {
-				tools = append(tools, "submit_change_decision")
-			}
-			if task.ProgressContract != nil && (task.ProgressContract.Policy.KnowledgeCheckpointAfterTurns > 0 ||
-				task.ProgressContract.Ref.ContractID == policycatalog.ProgressCodeChangeV4) {
-				tools = append(tools, "record_observation_delta")
-			}
-			return tools
+
+			return []string{"request_replan", "submit_task_result"}
+
 		case "acceptance", "":
 			return []string{"submit_task_result"}
 		default:
@@ -423,7 +419,7 @@ func deriveControlTools(task *model.Task) []string {
 		}
 	}
 	if task.EventType == "__scheduler__" {
-		return []string{"report_done"}
+		return []string{"read_graph_definition", "apply_graph_change", "control_graph", "request_replan", "submit_task_result"}
 	}
 	return []string{"submit_task_result"}
 }

@@ -42,7 +42,7 @@ func TestBootstrapSchedulerOnlyCanProvisionAndShutdownTemplateTeam(t *testing.T)
 	}
 	result, err := sys.TeamManager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: "template-runtime-controller",
-		TemplateRef:      "builtin/generalist@1", Purpose: "implementation", Replicas: 1,
+		TemplateRef:      "builtin/generalist@2", Purpose: "implementation", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -50,7 +50,7 @@ func TestBootstrapSchedulerOnlyCanProvisionAndShutdownTemplateTeam(t *testing.T)
 	if result.EventType == "" || len(result.AgentIDs) != 1 || len(result.Tools) == 0 {
 		t.Fatalf("provision result is not ready: %+v", result)
 	}
-	if !sys.Scheduler.SchedulerExec.AgentRegistry.CanRoute(result.EventType, "write_file") {
+	if !sys.Scheduler.SchedulerExec.AgentRegistry.CanRoute(result.EventType, "apply_change") {
 		t.Fatalf("provisioned route %q is not visible to Scheduler", result.EventType)
 	}
 

@@ -10,10 +10,10 @@ import (
 )
 
 func testContract(now time.Time) runcontract.RunContract {
-	return runcontract.RunContract{Schema: runcontract.SchemaV1, RunID: "run-budget-test",
-		CreatedAt: now, DeadlineAt: now.Add(time.Hour), RecoveryReserve: 10 * time.Minute,
-		FinalizationReserve: 5 * time.Minute, BudgetProfile: "test/v1",
-		Budget: runcontract.BudgetLimit{ModelCalls: 2, ToolActions: 3}}
+	return runcontract.RunContract{Schema: runcontract.SchemaCurrent, RunID: "run-budget-test",
+		CreatedAt: now, DeadlineAt: now.Add(time.Hour),
+		BudgetProfile: "test/v1",
+		Budget:        runcontract.BudgetLimit{ModelCalls: 2, ToolActions: 3}}
 }
 
 func TestStoreSharesExplicitRunBudgetAcrossTasksAndRecovery(t *testing.T) {

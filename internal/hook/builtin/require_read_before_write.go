@@ -9,8 +9,8 @@ import (
 	"agentgo/internal/store"
 )
 
-// RequireReadBeforeWriteHook 强制执行"先读后写"硬约束：在 write_file
-// 或 edit_file 调用之前，要求当前任务的 task.ReadSet 中存在对该路径的
+// RequireReadBeforeWriteHook 强制执行"先读后写"硬约束：在 apply_change
+// 或 apply_change 调用之前，要求当前任务的 task.ReadSet 中存在对该路径的
 // 成功 read_file 记录。
 //
 // **v5 Phase 6 重写**（ReactiveSystem.md §5.2.1）：
@@ -45,9 +45,9 @@ func (h *RequireReadBeforeWriteHook) Phase() hook.ToolHookPhase { return hook.Ph
 // Priority 返回 30。
 func (h *RequireReadBeforeWriteHook) Priority() int { return 30 }
 
-// Matches 仅匹配 write_file 和 edit_file。
+// Matches 仅匹配 apply_change 和 apply_change。
 func (h *RequireReadBeforeWriteHook) Matches(toolName string) bool {
-	return toolName == "write_file" || toolName == "edit_file"
+	return toolName == "apply_change"
 }
 
 // Run 执行"先读后写"校验。v5 Phase 6 起改读 task.ReadSet 取代反查工具历史。
@@ -82,7 +82,7 @@ func (h *RequireReadBeforeWriteHook) Run(hctx hook.ToolHookContext) hook.ToolHoo
 			return hook.ToolHookDecision{Action: hook.Continue}
 		}
 		// 兼容回退：read-set-write Reactor 是 Async，理论上有"刚 read_file 完
-		// 立即 write_file 但 ReadSet 还没写入"的窄竞争窗口。同时也兜底 Abs
+		// 立即 apply_change 但 ReadSet 还没写入"的窄竞争窗口。同时也兜底 Abs
 		// 失败导致的 key 不一致——对原始 path 也查一次。
 		if _, ok := readSet[target]; ok {
 			return hook.ToolHookDecision{Action: hook.Continue}
@@ -94,7 +94,7 @@ func (h *RequireReadBeforeWriteHook) Run(hctx hook.ToolHookContext) hook.ToolHoo
 		HookName: h.Name(),
 		AbortReason: fmt.Sprintf(
 			"先读后写约束：写入文件 %s 之前必须先成功调用 read_file 读取该文件。"+
-				"若任务真的需要在不读取的情况下修改，先 read_file 一次再 write_file。",
+				"若任务真的需要在不读取的情况下修改，先 read_file 一次再 apply_change。",
 			target,
 		),
 		ReasonCode: ReasonReadBeforeWrite,

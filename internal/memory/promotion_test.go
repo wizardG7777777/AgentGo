@@ -16,7 +16,7 @@ func newSealedTaskMem(taskID string) *taskmem.TaskMemory {
 	m.Goal = "写月度报告"
 	m.Constraints = []string{"预期产物: docs/report.md"}
 	m.Actions = []taskmem.ActionRecord{
-		{Caption: "write_file docs/report.md", Evidence: taskmem.EvidenceRef{Kind: taskmem.EvidenceToolResult, Ref: "write_file docs/report.md"}},
+		{Caption: "apply_change docs/report.md", Evidence: taskmem.EvidenceRef{Kind: taskmem.EvidenceToolResult, Ref: "apply_change docs/report.md"}},
 	}
 	m.Facts = []taskmem.Fact{
 		{
@@ -42,7 +42,7 @@ func newSealedTaskMem(taskID string) *taskmem.TaskMemory {
 		{Path: "docs/report.md", Hash: "abcdef0123456789", UpdatedAt: time.Now()},
 	}
 	m.Failures = []string{"run_shell 命令失败 (exit=1): go test — build failed"}
-	m.Blockers = []string{"write_file docs/report.md — 文件被占用"}
+	m.Blockers = []string{"apply_change docs/report.md — 文件被占用"}
 	m.NextCandidates = []string{"解除文件占用后重写"}
 	m.Sealed = true
 	return m

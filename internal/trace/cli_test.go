@@ -49,7 +49,7 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"agent_audit_started", Event{Kind: KindAgentAuditStarted, TaskID: "t1", Description: `{"agents":3,"snapshot_digest":"abc123def456","warnings":0}`}, []string{`summary="{\"agents\":3`}},
 		{"agent_audit_warning", Event{Kind: KindAgentAuditWarning, TaskID: "t1", Description: `{"agent":"explorer","type":"route_missing"}`}, []string{`summary="{\"agent\":\"explorer\"`}},
 		{"agent_audit_completed", Event{Kind: KindAgentAuditCompleted, TaskID: "t1", Reason: "completed", Description: `{"agents":3,"warnings":1}`}, []string{`reason="completed"`, `summary="{\"agents\":3`}},
-		{"file_written", Event{Kind: KindFileWritten, Tool: "write_file", Path: "a.go", Bytes: 42, Hash: "full-hash"}, []string{"path=a.go", "bytes=42", "hash=full-hash", "tool=write_file"}},
+		{"file_written", Event{Kind: KindFileWritten, Tool: "apply_change", Path: "a.go", Bytes: 42, Hash: "full-hash"}, []string{"path=a.go", "bytes=42", "hash=full-hash", "tool=apply_change"}},
 		{"file_write_queued", Event{Kind: KindFileWriteQueued, Path: "a.go", QueueLen: 2, WaitMS: 15, Description: "acquired"}, []string{"path=a.go", "queue_len=2", "wait_ms=15", `desc="acquired"`}},
 		{"progress_notify", Event{Kind: KindProgressNotify, NotifyType: "halfway"}, []string{"notify_type=halfway"}},
 		{"workspace_materialized", Event{Kind: KindWorkspaceMaterialized, Path: "/proj/.agentgo/workspaces/t1"}, []string{"path=/proj/.agentgo/workspaces/t1"}},
@@ -60,14 +60,14 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"workspace_cleanup_rejected", Event{Kind: KindWorkspaceCleanupRejected, Path: "/proj/.agentgo/workspaces/d1", Reason: "active_lease"}, []string{"path=/proj/.agentgo/workspaces/d1", `reason="active_lease"`}},
 		{"error", Event{Kind: KindError, Error: "boom", Reason: "reactor"}, []string{`error="boom"`, `reason="reactor"`}},
 		{"agent_state_changed", Event{Kind: KindAgentStateChanged, Transition: &Transition{PrevState: "idle", NewState: "processing", Cause: "claim"}}, []string{"prev=idle", "new=processing", "cause=claim"}},
-		{"shell_executed", Event{Kind: KindShellExecuted, Tool: "run_shell", Args: map[string]any{"command": "go test"}, ShellExec: &ShellExec{Command: "go test", ExitCode: 0, DurationMS: 9, Outcome: "success", StdoutExcerpt: "ok", StderrExcerpt: "warn"}}, []string{`cmd="go test"`, "exit=0", "outcome=success", `stdout="ok"`, `stderr="warn"`, "tool=run_shell"}},
+		{"shell_executed", Event{Kind: KindShellExecuted, Tool: "run_shell", Args: map[string]any{"command": "go test"}, ShellExec: &ShellExec{Command: "go test", ExitCode: func() *int { value := 0; return &value }(), DurationMS: 9, Outcome: "success", StdoutExcerpt: "ok", StderrExcerpt: "warn"}}, []string{`cmd="go test"`, "exit=0", "outcome=success", `stdout="ok"`, `stderr="warn"`, "tool=run_shell"}},
 		{"shell_timeout_pending", Event{Kind: KindShellTimeoutPending, ShellTimeout: &ShellTimeout{Command: "go test", ElapsedSec: 30, PreviousWaits: 1, StdoutExcerpt: "partial"}}, []string{"elapsed=30s", "waits=1", `stdout="partial"`}},
 		{"shell_timeout_resolved", Event{Kind: KindShellTimeoutResolved, ShellTimeout: &ShellTimeout{Command: "go test", ElapsedSec: 60, PreviousWaits: 2, Decision: "wait", ExtraSeconds: 20}}, []string{"elapsed=60s", "waits=2", "decision=wait", "extra=20s"}},
 		{"reactor_spawn_depth_exceeded", Event{Kind: KindReactorSpawnDepthExceeded, Depth: 6, Reason: "too deep"}, []string{"depth=6", `reason="too deep"`}},
 		{"runtime_loop_fuse_triggered", Event{Kind: KindRuntimeLoopFuseTriggered, Loop: 10000, Reason: "fuse"}, []string{"loop=10000", `reason="fuse"`}},
 		{"watchdog_observation", Event{Kind: KindWatchdogObservation, TaskID: "t1", RunID: "run-1", AttemptID: "attempt-1", Reason: "checkpoint_stale", Description: `{"age_seconds":30}`}, []string{`reason="checkpoint_stale"`, `desc="{\"age_seconds\":30}"`}},
 		{"task_finalizing", Event{Kind: KindTaskFinalizing, TaskID: "t1", Transition: &Transition{PrevStatus: "processing", NewStatus: "blocked"}}, []string{"status=blocked"}},
-		{"tool_call_skipped", Event{Kind: KindToolCallSkipped, TaskID: "t1", Tool: "write_file", CallID: "call-9", Reason: "task_finalizing"}, []string{"tool=write_file", "call_id=call-9", `reason="task_finalizing"`}},
+		{"tool_call_skipped", Event{Kind: KindToolCallSkipped, TaskID: "t1", Tool: "apply_change", CallID: "call-9", Reason: "task_finalizing"}, []string{"tool=apply_change", "call_id=call-9", `reason="task_finalizing"`}},
 		{"task_result_committed", Event{Kind: KindTaskResultCommitted, TaskID: "t1", Reason: "缺权限", Transition: &Transition{PrevStatus: "processing", NewStatus: "blocked", Cause: "agent_reported_blocked"}}, []string{"prev=processing", "new=blocked", "cause=agent_reported_blocked", `reason="缺权限"`}},
 		{"execution_lease_frozen", Event{Kind: KindExecutionLeaseFrozen, TaskID: "t1", Lease: &LeasePayload{Digest: "abc123def456", BusinessTools: 3, ControlTools: 1, Model: "deepseek-r1", Workspace: "workspace", Synthetic: true, Attempt: 1}}, []string{"digest=abc123def456", "biz=3 ctl=1", "model=deepseek-r1", "workspace=workspace", "synthetic=true"}},
 		{"execution_lease_rejected", Event{Kind: KindExecutionLeaseRejected, TaskID: "t1", Reason: "节点能力工具子集越界", Lease: &LeasePayload{Cause: "节点能力工具子集越界", Missing: []string{"web_fetch"}}}, []string{"missing=[web_fetch]", `cause="节点能力工具子集越界"`, `reason="节点能力工具子集越界"`}},
@@ -89,7 +89,7 @@ func TestFormatEventDetailsAllBuiltInKinds(t *testing.T) {
 		{"task_memory_checkpointed", Event{Kind: KindTaskMemoryCheckpointed, Loop: -1, Reason: "terminal:completed", Description: `{"version":5,"sealed":true}`}, []string{`reason="terminal:completed"`, `sections="{\"version\":5`}},
 		{"observation_delta_recorded", Event{Kind: KindObservationDeltaRecorded, TaskID: "t1", AttemptID: "t1/attempt-1", Description: `{"observation_delta_ref":"observation:sha256:abc","facts":1}`}, []string{`sections="{\"observation_delta_ref\"`}},
 		{"observation_checkpoint_failed", Event{Kind: KindObservationCheckpointFailed, TaskID: "t1", AttemptID: "t1/attempt-1", Reason: "control_invocation_preflight_failed", Description: "action=periodic"}, []string{`reason="control_invocation_preflight_failed"`, `sections="action=periodic"`}},
-		{"recovery_action_gated", Event{Kind: KindRecoveryActionGated, TaskID: "t1", AttemptID: "t1/attempt-1", RecoveryGate: &RecoveryActionPayload{Schema: "agentgo.recovery-delta/v3", Stage: "mutation", Tool: "edit_file", Path: "src/a.py", DirectiveCount: 1}}, []string{"schema=agentgo.recovery-delta/v3", "stage=mutation", "tool=edit_file", "directives=1", "path=src/a.py"}},
+		{"recovery_action_gated", Event{Kind: KindRecoveryActionGated, TaskID: "t1", AttemptID: "t1/attempt-1", RecoveryGate: &RecoveryActionPayload{Schema: "agentgo.recovery-delta/v3", Stage: "mutation", Tool: "apply_change", Path: "src/a.py", DirectiveCount: 1}}, []string{"schema=agentgo.recovery-delta/v3", "stage=mutation", "tool=apply_change", "directives=1", "path=src/a.py"}},
 		{"session_memory_promotion_proposed", Event{Kind: KindSessionMemoryPromotionProposed, TaskID: "t1", Reason: "completed", Description: `{"version":5,"sealed":true}`}, []string{`reason="completed"`, `summary="{\"version\":5`}},
 		{"session_memory_promotion_decided", Event{Kind: KindSessionMemoryPromotionDecided, TaskID: "t1", Reason: "completed", Description: `{"decided":"promoted","entries":2}`}, []string{`reason="completed"`, `summary="{\"decided\":\"promoted\"`}},
 		{"memory_recalled", Event{Kind: KindMemoryRecalled, TaskID: "t2", Description: `{"entries":2,"keys":["task_result:result:t1:confirmed"]}`}, []string{`summary="{\"entries\":2`}},
@@ -265,7 +265,7 @@ func TestTaskAggregationAcrossRetryFiles(t *testing.T) {
 		{Timestamp: base, Kind: KindTaskClaimed, TaskID: taskID},
 		{Timestamp: base, Kind: KindLLMCallStart, TaskID: taskID, Loop: 0},
 		{Timestamp: base, Kind: KindToolCall, TaskID: taskID, Tool: "read_file", CallID: "second-fragment"},
-		{Timestamp: base, Kind: KindFileWritten, TaskID: taskID, Tool: "write_file", Path: "out.txt"},
+		{Timestamp: base, Kind: KindFileWritten, TaskID: taskID, Tool: "apply_change", Path: "out.txt"},
 		{Timestamp: base, Kind: KindTaskCompleted, TaskID: taskID},
 	})
 
@@ -297,7 +297,7 @@ func TestTaskAggregationAcrossRetryFiles(t *testing.T) {
 	if err := CLI([]string{"show", taskID}, dir, "", &show); err != nil {
 		t.Fatalf("show: %v", err)
 	}
-	for _, want := range []string{"Trace Files: 2", "Events: 9", "first-fragment", "second-fragment", "loops=2", "tool=write_file"} {
+	for _, want := range []string{"Trace Files: 2", "Events: 9", "first-fragment", "second-fragment", "loops=2", "tool=apply_change"} {
 		if !strings.Contains(show.String(), want) {
 			t.Errorf("show missing %q:\n%s", want, show.String())
 		}

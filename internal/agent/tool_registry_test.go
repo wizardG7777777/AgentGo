@@ -193,7 +193,7 @@ func TestToolRegistry_Dispatch_DidYouMean(t *testing.T) {
 	r.Register("read_file", "读取文件", nil, func(ctx context.Context, args map[string]any) (string, error) {
 		return "", nil
 	})
-	r.Register("write_file", "写入文件", nil, func(ctx context.Context, args map[string]any) (string, error) {
+	r.Register("apply_change", "写入文件", nil, func(ctx context.Context, args map[string]any) (string, error) {
 		return "", nil
 	})
 	r.Register("run_shell", "执行 shell", nil, func(ctx context.Context, args map[string]any) (string, error) {

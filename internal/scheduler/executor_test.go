@@ -41,7 +41,7 @@ func makeInnerExecutor(callCount *int32, capturedHistory *[]contextcontract.Hist
 // 取消后，后一个工具的派发被 guard 拒绝（ctx 未取消 + 任务仍 processing 才放行）。
 func TestSchedulerExecutorBlocksLaterToolWhenControllerCancelledInSameResponse(t *testing.T) {
 	taskStore := store.NewMemoryTaskStore(nil, 32, 1, 60)
-	root := &model.Task{Description: "scheduler controller", EventType: "__scheduler__"}
+	root := &model.Task{Description: "scheduler controller", EventType: "__scheduler__", GraphID: "g-execution", GraphNodeKind: "agent"}
 	if err := taskStore.PublishTask(root); err != nil {
 		t.Fatal(err)
 	}

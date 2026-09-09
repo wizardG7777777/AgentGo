@@ -59,7 +59,7 @@ func TestWriteFile_EffectJournalVerifyFirst(t *testing.T) {
 	}
 	target := filepath.Join(canonicalRoot, "out.txt")
 	content := "effect journal 测试内容"
-	if _, err := g.writeFile(taskCtx("agent-1", "task-1"), map[string]any{
+	if _, err := g.applyChange(taskCtx("agent-1", "task-1"), map[string]any{
 		"path": target, "content": content,
 	}); err != nil {
 		t.Fatalf("writeFile: %v", err)
@@ -102,7 +102,7 @@ func TestEditFile_EffectJournalVerifyFirst(t *testing.T) {
 	if err := os.WriteFile(target, []byte("旧内容"), 0o644); err != nil {
 		t.Fatalf("写初始文件: %v", err)
 	}
-	if _, err := g.editFile(taskCtx("agent-1", "task-2"), map[string]any{
+	if _, err := g.applyChange(taskCtx("agent-1", "task-2"), map[string]any{
 		"path": target, "old_str": "旧内容", "new_str": "新内容",
 	}); err != nil {
 		t.Fatalf("editFile: %v", err)
@@ -172,7 +172,7 @@ func TestSendMessage_EffectJournalManualOnly(t *testing.T) {
 	mbReg.Register("sender", "")
 	receiverBox := mbReg.Register("receiver", "")
 
-	g := MetaGroup{MBRegistry: mbReg, AgentID: "sender", EffectJournal: j}
+	g := CommunicationGroup{MBRegistry: mbReg, AgentID: "sender", EffectJournal: j}
 	reg := agent.NewToolRegistry()
 	g.Register(reg)
 
@@ -221,7 +221,7 @@ func TestEffectJournalPrepareFailureStopsWrite(t *testing.T) {
 	g.EffectJournal = j
 	attachArtifactTask(t, &g, "task-5")
 	target := filepath.Join(tmp, "degrade.txt")
-	_, err = g.writeFile(taskCtx("agent-1", "task-5"), map[string]any{
+	_, err = g.applyChange(taskCtx("agent-1", "task-5"), map[string]any{
 		"path": target, "content": "账本挂了禁止写",
 	})
 	if !errors.Is(err, effect.ErrAuthorityUnavailable) {

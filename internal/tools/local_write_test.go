@@ -113,7 +113,7 @@ func callWriteFile(g LocalWriteGroup, path, content, expectedHash string) (strin
 	if expectedHash != "" {
 		args["expected_hash"] = expectedHash
 	}
-	return g.writeFile(context.Background(), args)
+	return g.applyChange(context.Background(), args)
 }
 
 func callEditFile(g LocalWriteGroup, path, oldStr, newStr, expectedHash string) (string, error) {
@@ -125,23 +125,20 @@ func callEditFile(g LocalWriteGroup, path, oldStr, newStr, expectedHash string) 
 	if expectedHash != "" {
 		args["expected_hash"] = expectedHash
 	}
-	return g.editFile(context.Background(), args)
+	return g.applyChange(context.Background(), args)
 }
 
 // --- tests ---
 
-func TestLocalWriteGroup_Register_TwoTools(t *testing.T) {
+func TestLocalWriteGroupRegistersOnlyApplyChange(t *testing.T) {
 	g, _, _ := newWriteGroup(t, nil)
 	reg := agent.NewToolRegistry()
 	g.Register(reg)
 	defs := reg.Defs()
-	if len(defs) != 2 {
-		t.Fatalf("expected 2 tools registered, got %d", len(defs))
+	if len(defs) != 1 || defs[0].Name != "apply_change" {
+		t.Fatalf("只应注册 apply_change，实际：%v", defs)
 	}
-	names := map[string]bool{defs[0].Name: true, defs[1].Name: true}
-	if !names["write_file"] || !names["edit_file"] {
-		t.Fatalf("expected write_file and edit_file, got %v", defs)
-	}
+
 }
 
 // C7 删除：TestWriteFile_LockAcquiredBeforeRead
@@ -159,7 +156,7 @@ func TestWriteFile_BasicSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(out, "文件已写入") {
+	if !strings.Contains(out, "文件变更已应用") {
 		t.Fatalf("unexpected output: %s", out)
 	}
 	data, err := os.ReadFile(path)
@@ -222,18 +219,16 @@ func TestWriteFile_HashMatch(t *testing.T) {
 	}
 }
 
-func TestWriteFile_NewFileNoHashCheck(t *testing.T) {
+func TestApplyChangeMissingExpectedVersionRejects(t *testing.T) {
 	g, _, tmp := newWriteGroup(t, nil)
 	path := filepath.Join(tmp, "brand-new.txt")
-	// 文件不存在时 expected_hash 应当被忽略
-	_, err := callWriteFile(g, path, "fresh", "irrelevant")
-	if err != nil {
-		t.Fatalf("expected success for new file, got %v", err)
+	if _, err := callWriteFile(g, path, "fresh", "irrelevant"); err == nil {
+		t.Fatal("指定旧版本但文件不存在时应拒绝，不能忽略并发前提")
 	}
-	data, _ := os.ReadFile(path)
-	if string(data) != "fresh" {
-		t.Fatalf("expected 'fresh', got %q", string(data))
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("被拒绝的写入不应创建文件")
 	}
+
 }
 
 func TestWriteFile_LockContention(t *testing.T) {
@@ -360,7 +355,7 @@ func TestWriteFileSynchronouslyRecordsArtifactWithMeta(t *testing.T) {
 	g.ArtifactStore = taskStore
 	ctx := agent.WithAgentContext(context.Background(), "agent-1", task.ID, 1)
 	content := "在返回前登记"
-	if _, err := g.writeFile(ctx, map[string]any{"path": "out/report.md", "content": content}); err != nil {
+	if _, err := g.applyChange(ctx, map[string]any{"path": "out/report.md", "content": content}); err != nil {
 		t.Fatalf("writeFile: %v", err)
 	}
 
@@ -393,7 +388,7 @@ func TestEditFileSynchronouslyUpdatesArtifactMeta(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := agent.WithAgentContext(context.Background(), "agent-1", task.ID, 1)
-	if _, err := g.editFile(ctx, map[string]any{"path": "out.md", "old_str": "旧", "new_str": "新"}); err != nil {
+	if _, err := g.applyChange(ctx, map[string]any{"path": "out.md", "old_str": "旧", "new_str": "新"}); err != nil {
 		t.Fatalf("editFile: %v", err)
 	}
 
@@ -412,7 +407,7 @@ func TestWriteFileArtifactLedgerFailureFailsClosed(t *testing.T) {
 	g, _, tmp := newWriteGroup(t, nil)
 	g.ArtifactStore = failingArtifactLedger{err: fmt.Errorf("模拟 ledger 写入失败")}
 	ctx := agent.WithAgentContext(context.Background(), "agent-1", "task-ledger-fail", 1)
-	_, err := g.writeFile(ctx, map[string]any{"path": "out.md", "content": "已落盘但不得报成功"})
+	_, err := g.applyChange(ctx, map[string]any{"path": "out.md", "content": "已落盘但不得报成功"})
 	if err == nil || !strings.Contains(err.Error(), "登记产物证据失败") {
 		t.Fatalf("artifact ledger 失败必须向工具调用者报错: %v", err)
 	}
@@ -424,7 +419,7 @@ func TestWriteFileArtifactLedgerFailureFailsClosed(t *testing.T) {
 func TestWriteFileTaskContextWithoutArtifactLedgerRejectsBeforeSideEffect(t *testing.T) {
 	g, _, tmp := newWriteGroup(t, nil)
 	ctx := agent.WithAgentContext(context.Background(), "agent-1", "task-no-ledger", 1)
-	_, err := g.writeFile(ctx, map[string]any{"path": "out.md", "content": "不应写入"})
+	_, err := g.applyChange(ctx, map[string]any{"path": "out.md", "content": "不应写入"})
 	if err == nil || !strings.Contains(err.Error(), "artifact ledger 未装配") {
 		t.Fatalf("任务写工具缺少 ledger 必须 fail-closed: %v", err)
 	}
@@ -491,7 +486,7 @@ func TestWriteFile_WaitAndRetrySuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected success after wait, got %v", err)
 	}
-	if !strings.Contains(out, "文件已写入") {
+	if !strings.Contains(out, "文件变更已应用") {
 		t.Fatalf("unexpected output: %s", out)
 	}
 
@@ -568,7 +563,7 @@ func TestEditFile_WaitAndRetrySuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected success after wait, got %v", err)
 	}
-	if !strings.Contains(out, "文件已编辑") {
+	if !strings.Contains(out, "文件变更已应用") {
 		t.Fatalf("unexpected output: %s", out)
 	}
 
@@ -604,9 +599,9 @@ func TestEditFile_StripHashPrefix(t *testing.T) {
 	oldStrWithHash := "1#VK|package main"
 	out, err := callEditFile(g, fp, oldStrWithHash, "package hashline", "")
 	if err != nil {
-		t.Fatalf("edit_file 失败: %v", err)
+		t.Fatalf("apply_change 失败: %v", err)
 	}
-	if !strings.Contains(out, "已编辑") {
+	if !strings.Contains(out, "变更已应用") {
 		t.Errorf("输出应包含'已编辑': %q", out)
 	}
 
@@ -629,9 +624,9 @@ func TestEditFile_StripHashPrefix_MultiLine(t *testing.T) {
 	oldStr := "1#VK|func a() {}\n2#QZ|func b() {}"
 	out, err := callEditFile(g, fp, oldStr, "func combined() {}", "")
 	if err != nil {
-		t.Fatalf("edit_file 失败: %v", err)
+		t.Fatalf("apply_change 失败: %v", err)
 	}
-	if !strings.Contains(out, "已编辑") {
+	if !strings.Contains(out, "变更已应用") {
 		t.Errorf("输出应包含'已编辑': %q", out)
 	}
 }
@@ -658,9 +653,9 @@ func TestEditFile_StripHashPrefix_NewStr(t *testing.T) {
 
 	out, err := callEditFile(g, fp, "func old() {}", newStrWithHash, "")
 	if err != nil {
-		t.Fatalf("edit_file 失败: %v", err)
+		t.Fatalf("apply_change 失败: %v", err)
 	}
-	if !strings.Contains(out, "已编辑") {
+	if !strings.Contains(out, "变更已应用") {
 		t.Errorf("输出应包含'已编辑': %q", out)
 	}
 
@@ -686,7 +681,7 @@ func TestEditFile_StripHashPrefix_NewStr(t *testing.T) {
 }
 
 // TestEditFile_AcceptsLineAnchorsArg 验证 §7 schema 改动：
-// edit_file 接受 line_anchors []string 参数而不报"未知参数"。
+// apply_change 接受 line_anchors []string 参数而不报"未知参数"。
 // 注意：本测试只验证 schema/参数透传，不验证哈希校验逻辑——后者在
 // ValidateLineAnchorsHook 里，并由 internal/hook/builtin 的测试覆盖。
 func TestEditFile_AcceptsLineAnchorsArg(t *testing.T) {
@@ -700,13 +695,13 @@ func TestEditFile_AcceptsLineAnchorsArg(t *testing.T) {
 		"path":         fp,
 		"old_str":      "hello",
 		"new_str":      "hi",
-		"line_anchors": []any{"1#VK"}, // 锚点不在工具层校验，只由 hook 校验
+		"line_anchors": []any{"1#" + hashline.ComputeLineHash(1, "hello")}, // 工具在写锁内校验锚点
 	}
-	out, err := g.editFile(context.Background(), args)
+	out, err := g.applyChange(context.Background(), args)
 	if err != nil {
-		t.Fatalf("edit_file 不应因 line_anchors 参数报错: %v", err)
+		t.Fatalf("apply_change 不应因 line_anchors 参数报错: %v", err)
 	}
-	if !strings.Contains(out, "已编辑") {
+	if !strings.Contains(out, "变更已应用") {
 		t.Errorf("输出应包含'已编辑': %q", out)
 	}
 }

@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"agentgo/internal/agent"
-	"agentgo/internal/checkstore"
 	"agentgo/internal/config"
 	"agentgo/internal/delivery"
 	"agentgo/internal/effect"
@@ -224,6 +223,9 @@ func graphTaskID(graphID, activationID string) string {
 //
 // 由 graph.Runtime 在 rt.mu 锁内同步调用，同一 Runtime 不存在并发补发。
 func (b *graphBoard) PublishGraphTask(spec graph.TaskSpec) (string, error) {
+	if spec.RunContract != nil && spec.RunContract.Schema != runcontract.SchemaCurrent {
+		return "", fmt.Errorf("旧 Run 契约不能发布新的图任务")
+	}
 	if spec.NodeKind == "" {
 		return "", fmt.Errorf("发布图任务 %s/%s 缺少冻结 node_kind", spec.GraphID, spec.ActivationID)
 	}
@@ -315,7 +317,7 @@ func (b *graphBoard) PublishGraphTask(spec graph.TaskSpec) (string, error) {
 	// 显式冻结 execution；此时缺失的其它字段仍由 Store fail-closed。
 	if task.RunID != "" || task.RunContract != nil || task.ProgressContract != nil || task.ContextPolicyRef != "" {
 		task.RunPhase = runcontract.PhaseExecution
-		if spec.NodeKind == graph.KindAcceptance && task.RunContract != nil && task.RunContract.Schema == runcontract.SchemaV2 {
+		if spec.NodeKind == graph.KindAcceptance && task.RunContract != nil && task.RunContract.Schema == runcontract.SchemaCurrent {
 			task.RunPhase = runcontract.PhaseVerification
 		}
 		if spec.ControllerRole == graph.ControllerRoleLoopRecovery {
@@ -1373,12 +1375,6 @@ func assembleTaskEvidence(s store.TaskStore, task *model.Task) []graph.EvidenceE
 }
 
 func assembleTaskEvidenceFromCalls(task *model.Task, calls []store.ToolCallRecord) []graph.EvidenceEntry {
-	return assembleTaskEvidenceFromCallsAndChecks(task, calls, nil)
-}
-
-func assembleTaskEvidenceFromCallsAndChecks(task *model.Task, calls []store.ToolCallRecord,
-	checks []checkstore.Record,
-) []graph.EvidenceEntry {
 	if task == nil {
 		return nil
 	}
@@ -1412,14 +1408,6 @@ func assembleTaskEvidenceFromCallsAndChecks(task *model.Task, calls []store.Tool
 			Path: path, PathTruncated: pathTruncated,
 		})
 	}
-	for _, check := range checks {
-		ref := evidenceCheckRef(task.ID, check)
-		if _, duplicate := seen[ref]; duplicate {
-			continue
-		}
-		seen[ref] = struct{}{}
-		out = append(out, evidenceCheckEntry(ref, check))
-	}
 	if truncatedTotal > 0 {
 		out = append(out, graph.EvidenceEntry{
 			Ref:     stableEvidenceRef(task.ID, "truncated", fmt.Sprintf("%d", truncatedTotal)),
@@ -1428,25 +1416,6 @@ func assembleTaskEvidenceFromCallsAndChecks(task *model.Task, calls []store.Tool
 		})
 	}
 	return out
-}
-
-func evidenceCheckRef(taskID string, record checkstore.Record) string {
-	return stableEvidenceRef(taskID, "check", record.CheckRef)
-}
-
-func evidenceCheckEntry(ref string, record checkstore.Record) graph.EvidenceEntry {
-	passed := record.Status == checkstore.StatusPass
-	exit := record.ExitCode
-	summary, _ := boundedEvidenceValue(fmt.Sprintf(
-		"CheckRecord: id=%s kind=%s status=%s exit=%d workspace=%s",
-		record.CheckID, record.Kind, record.Status, record.ExitCode, record.WorkspaceRevisionRef),
-		graph.EvidenceSummaryMaxRunes)
-	return graph.EvidenceEntry{
-		Ref: ref, Kind: "check", Summary: summary, Success: &passed, ExitCode: &exit,
-		ExitCodeScope: record.ExitCodeScope, CheckRef: record.CheckRef,
-		CheckID: record.CheckID, CheckKind: record.Kind, CheckStatus: string(record.Status),
-		WorkspaceRevisionRef: record.WorkspaceRevisionRef, OutputRef: record.OutputRef,
-	}
 }
 
 func evidenceCallEntry(ref string, call store.ToolCallRecord) graph.EvidenceEntry {
@@ -1467,7 +1436,7 @@ func evidenceCallEntry(ref string, call store.ToolCallRecord) graph.EvidenceEntr
 			entry.ExitCode = &exit
 		}
 		entry.ExitCodeScope = string(call.ExitCodeScope)
-	case "write_file", "edit_file", "read_file":
+	case "apply_change", "read_file":
 		entry.Path, entry.PathTruncated = boundedEvidenceValue(arg("path"), graph.EvidencePathMaxRunes)
 	}
 	return entry
@@ -1559,10 +1528,8 @@ func evidenceKindOf(toolName string) string {
 	switch toolName {
 	case "run_shell":
 		return "shell"
-	case "write_file":
-		return "file_write"
-	case "edit_file":
-		return "file_edit"
+	case "apply_change":
+		return "file_change"
 	case "read_file":
 		return "read"
 	case "web_search", "web_fetch":
@@ -1610,7 +1577,7 @@ func evidenceCallSummary(call store.ToolCallRecord) string {
 			scope = "?"
 		}
 		s = fmt.Sprintf("命令: %s（exit=%s scope=%s）", arg("command"), exit, scope)
-	case "write_file", "edit_file", "read_file":
+	case "apply_change", "read_file":
 		s = fmt.Sprintf("路径: %s", arg("path"))
 	default:
 		s = fmt.Sprintf("%s success=%v", call.ToolName, call.Success)
@@ -1714,7 +1681,7 @@ func wireGraphRuntimeWithPolicies(cfg *config.Config, taskStore store.TaskStore,
 
 type graphRuntimeAuthorities struct {
 	workspaces *workspace.Manager
-	checks     *checkstore.Store
+
 	deliveries *delivery.Store
 }
 
@@ -1722,7 +1689,7 @@ func wireGraphRuntimeWithOutcome(cfg *config.Config, taskStore store.TaskStore, 
 	effectJournal *effect.Journal, policies *policycatalog.Catalog, sessionIDProvider func() string,
 	outcomes *outcomestore.Store, checkpoints taskCheckpointReader, authorities *graphRuntimeAuthorities,
 	recoveryQuarantine ...map[string]string) (*graph.Store, *graph.Runtime, error) {
-	dir := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "graphs")
+	dir := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "graphs-v5")
 	gs, err := graph.NewStore(dir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("创建 Graph 持久化 Store 失败: %w", err)
@@ -1752,7 +1719,6 @@ func wireGraphRuntimeWithOutcome(cfg *config.Config, taskStore store.TaskStore, 
 		if authorities != nil {
 			outcomeAuthority.candidates = authorities.workspaces
 			outcomeAuthority.deliveries = authorities.deliveries
-			outcomeAuthority.checks = authorities.checks
 		}
 		board.outcomeAuthority = outcomeAuthority
 		if err := store.SetTerminalOutcomeCoordinator(taskStore, outcomeAuthority); err != nil {
@@ -1764,11 +1730,8 @@ func wireGraphRuntimeWithOutcome(cfg *config.Config, taskStore store.TaskStore, 
 	rt.SetSessionIDProvider(sessionIDProvider)
 	// 上游工作记录（2026-08-21 上游摘要）：转移结算时按来源 Task ID 聚合
 	// ToolCallRecord 并随 EdgeInput 冻结；下游任务发布只读冻结文本。
-	if authorities != nil && authorities.checks != nil {
-		rt.SetWorkLogProvider(newGraphWorkLogProvider(taskStore, authorities.checks))
-	} else {
-		rt.SetWorkLogProvider(newGraphWorkLogProvider(taskStore))
-	}
+	rt.SetWorkLogProvider(newGraphWorkLogProvider(taskStore))
+
 	// 上面的 gs.Recover 只负责把历史图从磁盘读回内存。2026-08 起启动永远是
 	// 全新 Session 且进入会话不自动续跑：会话模式下全部历史图（含无归属
 	// 图，以及 --resume 会话自己的图）一次性停驻——吞终态事件、停 wait

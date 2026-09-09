@@ -148,10 +148,9 @@ func durableEvidence(values []outcome.EvidenceFact) []graph.EvidenceEntry {
 			CallID: value.CallID, ToolName: value.ToolName,
 			Command: value.Command, CommandTruncated: value.CommandTruncated,
 			Path: value.Path, PathTruncated: value.PathTruncated,
-			ExitCodeScope: value.ExitCodeScope,
-			CheckRef:      value.CheckRef, CheckID: value.CheckID, CheckKind: value.CheckKind,
-			CheckStatus: value.CheckStatus, WorkspaceRevisionRef: value.WorkspaceRevisionRef,
-			OutputRef: value.OutputRef,
+			ExitCodeScope:        value.ExitCodeScope,
+			WorkspaceRevisionRef: value.WorkspaceRevisionRef,
+			OutputRef:            value.OutputRef,
 		}
 		if value.Success != nil {
 			copy := *value.Success

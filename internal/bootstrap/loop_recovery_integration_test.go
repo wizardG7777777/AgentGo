@@ -33,9 +33,9 @@ func TestLoopInterventionGraphRecoveryEndToEnd(t *testing.T) {
 	runtime := graph.NewRuntime(graphs, board)
 	now := time.Now().UTC()
 	run := &runcontract.RunContract{
-		Schema: runcontract.SchemaV1, RunID: "run-loop-recovery", CreatedAt: now,
-		DeadlineAt: now.Add(time.Hour), RecoveryReserve: time.Minute,
-		FinalizationReserve: time.Minute, BudgetProfile: "test/v1",
+		Schema: runcontract.SchemaCurrent, RunID: "run-loop-recovery", CreatedAt: now,
+		DeadlineAt:    now.Add(time.Hour),
+		BudgetProfile: "test/v1",
 	}
 	doc := &graph.GraphDocument{
 		Schema: graph.SchemaV2, GraphID: "g-loop-recovery-e2e", Revision: 1,
@@ -68,7 +68,7 @@ func TestLoopInterventionGraphRecoveryEndToEnd(t *testing.T) {
 				OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Fields: []graph.OutputFieldContract{{
 					Path: "$.decision", Type: "string", Description: "retry|blocked", Required: true,
 				}}},
-				ProgressContractRef: policycatalog.ProgressCoordinationV1,
+				ProgressContractRef: policycatalog.ProgressCoordinationCurrent,
 				ContextPolicyRef:    policycatalog.ContextDefaultCurrent,
 				Metadata: map[string]string{
 					graph.MetadataControllerRole:     string(graph.ControllerRoleLoopRecovery),

@@ -72,7 +72,7 @@ func TestReadSetWriteReactor_FilterByTool(t *testing.T) {
 	r := NewReadSetWriteReactor(s)
 
 	// 非 read_file 工具：过滤掉
-	r.Run(trace.Event{Kind: trace.KindToolResult, Tool: "write_file", Args: map[string]any{"path": "/p/a"}})
+	r.Run(trace.Event{Kind: trace.KindToolResult, Tool: "apply_change", Args: map[string]any{"path": "/p/a"}})
 	r.Run(trace.Event{Kind: trace.KindToolResult, Tool: "list_dir", Args: map[string]any{"path": "/p/b"}})
 
 	if calls := s.snapshot(); len(calls) != 0 {

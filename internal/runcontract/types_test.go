@@ -9,18 +9,17 @@ import (
 )
 
 func TestRunContractValidateAndWindow(t *testing.T) {
-	now := time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)
-	contract := RunContract{
-		Schema: SchemaV1, RunID: "run-1", CreatedAt: now,
-		DeadlineAt: now.Add(time.Hour), FinalizationReserve: 5 * time.Minute,
-		RecoveryReserve: 10 * time.Minute, BudgetProfile: "swe/v1",
-		Budget: BudgetLimit{ModelCalls: 20, ToolActions: 100},
+	now := time.Now().UTC()
+	c := RunContract{Schema: SchemaCurrent, RunID: "run", CreatedAt: now, BudgetProfile: "facts", DeadlineAt: now.Add(time.Hour)}
+	if err := c.ValidateAt(now.Add(59 * time.Minute)); err != nil {
+		t.Fatal(err)
 	}
-	if err := contract.ValidateAt(now.Add(time.Minute)); err != nil {
-		t.Fatalf("合法 RunContract 被拒绝: %v", err)
+	if err := c.ValidateAt(now.Add(time.Hour)); err == nil {
+		t.Fatal("显式截止时间应生效")
 	}
-	if err := contract.ValidateAt(now.Add(50 * time.Minute)); err == nil {
-		t.Fatal("剩余时间不足 reserve 时应拒绝启动")
+	c.DeadlineAt = time.Time{}
+	if err := c.ValidateAt(now.Add(100 * time.Hour)); err != nil {
+		t.Fatalf("无显式时限不得自动停止：%v", err)
 	}
 }
 
@@ -42,38 +41,10 @@ func TestRunContractV1JSONRoundTripKeepsFrozenReserveSemantics(t *testing.T) {
 	}
 }
 
-func TestRunContractV2CheckContractsAreFrozenAndValidated(t *testing.T) {
-	now := time.Date(2026, 8, 30, 2, 0, 0, 0, time.UTC)
-	contract := RunContract{
-		Schema: SchemaV2, RunID: "run-check-contract", CreatedAt: now,
-		DeadlineAt: now.Add(time.Hour), FinalizationReserve: time.Minute,
-		RecoveryReserve: time.Minute, VerificationReserve: time.Minute,
-		BudgetProfile: "swe/v3",
-		CheckContracts: []CheckContract{
-			{CheckID: "targeted", Kind: "test"},
-			{CheckID: "verification", Kind: "test", ExactCommand: "uv run --no-sync python -m pytest -q"},
-		},
-	}
-	if err := contract.Validate(); err != nil {
-		t.Fatalf("合法 check contracts 被拒绝: %v", err)
-	}
-	duplicate := contract
-	duplicate.CheckContracts = append(append([]CheckContract(nil), contract.CheckContracts...),
-		CheckContract{CheckID: "verification", Kind: "test"})
-	if err := duplicate.Validate(); err == nil || !strings.Contains(err.Error(), "重复") {
-		t.Fatalf("重复 check_id 必须拒绝: %v", err)
-	}
-	badCommand := contract
-	badCommand.CheckContracts = append([]CheckContract(nil), contract.CheckContracts...)
-	badCommand.CheckContracts[1].ExactCommand += " "
-	if err := badCommand.Validate(); err == nil || !strings.Contains(err.Error(), "首尾空白") {
-		t.Fatalf("非 canonical exact command 必须拒绝: %v", err)
-	}
-	legacy := contract
-	legacy.Schema = SchemaV1
-	legacy.VerificationReserve = 0
-	if err := legacy.Validate(); err == nil || !strings.Contains(err.Error(), "check_contracts") {
-		t.Fatalf("v1 不得静默接纳 check contracts: %v", err)
+func TestRunContractRejectsRetiredCheckContracts(t *testing.T) {
+	var contract RunContract
+	if err := json.Unmarshal([]byte(`{"schema":"agentgo.run-contract/v2","check_contracts":[]}`), &contract); err == nil || !strings.Contains(err.Error(), "check_contracts") {
+		t.Fatalf("退役字段必须明确拒绝：%v", err)
 	}
 }
 
@@ -84,36 +55,22 @@ func TestDeadlineHierarchy(t *testing.T) {
 	if err := ValidateChildDeadline(run, graph); err != nil {
 		t.Fatalf("合法 deadline 层级被拒绝: %v", err)
 	}
-	graph.HardDeadlineAt = run.HardDeadlineAt
+	graph.HardDeadlineAt = run.HardDeadlineAt.Add(time.Second)
 	if err := ValidateChildDeadline(run, graph); err == nil {
-		t.Fatal("子 deadline 未早于父 deadline 时应拒绝")
+		t.Fatal("子 deadline 超过父 deadline 时应拒绝")
 	}
 }
 
-func TestRunContractPhaseWindows(t *testing.T) {
-	created := time.Unix(1_700_000_000, 0).UTC()
-	contract := RunContract{
-		Schema: SchemaV1, RunID: "run-phase", CreatedAt: created,
-		DeadlineAt: created.Add(60 * time.Minute), FinalizationReserve: 5 * time.Minute,
-		RecoveryReserve: 10 * time.Minute, BudgetProfile: "test/v1",
-	}
-	if err := contract.ValidatePhaseAt(created.Add(50*time.Minute), PhaseExecution); err == nil {
-		t.Fatal("execution 不得侵占 recovery reserve")
-	}
-	if err := contract.ValidatePhaseAt(created.Add(50*time.Minute), PhaseRecovery); err != nil {
-		t.Fatalf("recovery 应可使用 recovery window: %v", err)
-	}
-	if err := contract.ValidatePhaseAt(created.Add(58*time.Minute), PhaseRecovery); err == nil {
-		t.Fatal("recovery 不得侵占 finalization reserve")
-	}
-	if err := contract.ValidatePhaseAt(created.Add(58*time.Minute), PhaseFinalization); err != nil {
-		t.Fatalf("finalization 应可使用最终 reserve: %v", err)
-	}
-	if got := contract.PhaseStartDeadline(PhaseExecution); !got.Equal(created.Add(45 * time.Minute)) {
-		t.Fatalf("execution start deadline=%s", got)
-	}
-	if got := contract.PhaseStartRemaining(created.Add(44*time.Minute), PhaseExecution); got != time.Minute {
-		t.Fatalf("execution start remaining=%s", got)
+func TestRunContractPhasesShareOnlyExplicitDeadline(t *testing.T) {
+	now := time.Now().UTC()
+	c := RunContract{Schema: SchemaCurrent, RunID: "run", CreatedAt: now, BudgetProfile: "facts", DeadlineAt: now.Add(time.Hour)}
+	for _, phase := range []Phase{PhaseExecution, PhaseVerification, PhaseRecovery, PhaseFinalization} {
+		if err := c.ValidatePhaseAt(now.Add(59*time.Minute), phase); err != nil {
+			t.Fatal(err)
+		}
+		if !c.PhaseStartDeadline(phase).Equal(c.DeadlineAt) {
+			t.Fatal("不应扣除阶段预留")
+		}
 	}
 }
 

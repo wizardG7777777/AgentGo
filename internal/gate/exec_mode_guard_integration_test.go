@@ -19,7 +19,7 @@ func TestExecModeGuard_ThroughRegistry(t *testing.T) {
 	}
 
 	// normal 模式：写类工具放行。
-	if d := reg.Dispatch(newToolCtx(PhaseToolPreCall, "write_file")); d.Action != Continue {
+	if d := reg.Dispatch(newToolCtx(PhaseToolPreCall, "apply_change")); d.Action != Continue {
 		t.Fatalf("normal 模式 Action = %v，期望 Continue", d.Action)
 	}
 

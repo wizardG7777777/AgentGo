@@ -102,8 +102,8 @@ func resolveField(ev trace.Event, path string) (string, bool) {
 		}
 		return "", true
 	case "event.shell.exit_code":
-		if ev.ShellExec != nil {
-			return strconv.Itoa(ev.ShellExec.ExitCode), true
+		if ev.ShellExec != nil && ev.ShellExec.ExitCode != nil {
+			return strconv.Itoa(*ev.ShellExec.ExitCode), true
 		}
 		return "", true
 	case "event.shell.outcome":

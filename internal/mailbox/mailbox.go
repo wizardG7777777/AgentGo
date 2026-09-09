@@ -31,13 +31,17 @@ const (
 
 // Message 代理间点对点消息。
 type Message struct {
-	From     string    // 发送者 agentID
-	To       string    // 收件人 agentID 或 "*"（广播）
-	Content  string    // 消息正文（详细内容）
-	Summary  string    // 一句话摘要（供接收方快速判断是否需要读 Content）
-	Type     string    // 消息类型：info / question / reply / steer / ack
-	Priority string    // 优先级：low / normal / high
-	SentAt   time.Time // 发送时间
+	// DeliveryOnly 是工具通信的固定语义，不能由模型覆盖为控制消息。
+	DeliveryOnly bool
+	ID           string
+	ReplyTo      string
+	From         string    // 发送者 agentID
+	To           string    // 收件人 agentID 或 "*"（广播）
+	Content      string    // 消息正文（详细内容）
+	Summary      string    // 一句话摘要（供接收方快速判断是否需要读 Content）
+	Type         string    // 消息类型：info / question / reply / steer / ack
+	Priority     string    // 优先级：low / normal / high
+	SentAt       time.Time // 发送时间
 
 	// SourceTaskID/RunID/SessionID 是消息的冻结来源 envelope。新 Run 消息
 	// 必须同时携带 SourceTaskID+RunID；SessionID 在有 Session 的装配中绑定
@@ -356,7 +360,7 @@ func (mb *Mailbox) sendQuestionAcks(registry *Registry, msgs []Message, sourceTa
 		return
 	}
 	for _, m := range msgs {
-		if m.Type != MsgTypeQuestion {
+		if m.DeliveryOnly || m.Type != MsgTypeQuestion {
 			continue // 只对 question 类回 ack，其余（info/reply/steer/ack）跳过
 		}
 		ack := Message{
@@ -455,6 +459,7 @@ type MailboxStatus struct {
 	SessionID     string
 	SourceTaskIDs []string
 	WakeWorthy    bool
+	ControlCount  int // 仅内部控制消息可参与唤醒；普通工具通信只展示数量。
 }
 
 // Register 为指定 agentID 创建并注册 Mailbox。eventType 为代理的任务类型（"" = worker, "explore" = explorer）。
@@ -715,10 +720,13 @@ func (mb *Mailbox) partitionStatuses() []MailboxStatus {
 			order = append(order, key)
 		}
 		part.status.Count++
+		if !msg.DeliveryOnly {
+			part.status.ControlCount++
+		}
 		if msg.ChainDepth > part.status.MaxChainDepth {
 			part.status.MaxChainDepth = msg.ChainDepth
 		}
-		if msg.Type == MsgTypeQuestion || msg.Type == MsgTypeSteer || msg.Priority == PriorityHigh {
+		if !msg.DeliveryOnly && (msg.Type == MsgTypeQuestion || msg.Type == MsgTypeSteer || msg.Priority == PriorityHigh) {
 			part.status.WakeWorthy = true
 		}
 		if source := strings.TrimSpace(msg.SourceTaskID); source != "" {
@@ -966,6 +974,9 @@ func (r *Registry) ExportSnapshot() []session.MailboxSnapshot {
 		for i, msg := range unreadMsgs {
 			// unreadMsgs 最旧在前；持久化 schema 约定最新在前。
 			msgSnaps[len(unreadMsgs)-1-i] = session.MessageSnapshot{
+				DeliveryOnly: msg.DeliveryOnly,
+				ID:           msg.ID,
+				ReplyTo:      msg.ReplyTo,
 				From:         msg.From,
 				To:           msg.To,
 				Content:      msg.Content,
@@ -1014,6 +1025,7 @@ func prepareSnapshotImport(snaps []session.MailboxSnapshot) ([]mailboxSnapshotIm
 				return nil, fmt.Errorf("parse sent_at for mailbox %s: %w", snap.OwnerID, err)
 			}
 			messages[len(snap.Messages)-1-i] = Message{
+				DeliveryOnly: ms.DeliveryOnly, ID: ms.ID, ReplyTo: ms.ReplyTo,
 				From: ms.From, To: ms.To, Content: ms.Content, Summary: ms.Summary,
 				Type: ms.Type, Priority: ms.Priority, SentAt: sentAt, ChainDepth: ms.ChainDepth,
 				SourceTaskID: ms.SourceTaskID, RunID: ms.RunID, SessionID: ms.SessionID,

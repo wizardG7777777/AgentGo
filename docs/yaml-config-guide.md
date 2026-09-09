@@ -1,3 +1,5 @@
+> **四类工具切换（2026-09-09）**：当前工具/profile 见 [工具清单](tool-profiles.md)，数据版本见 [冻结基线](design/contract-freeze-2026-08-30.md)。模型工具旧名称不兼容，observation_model/max_subtask_depth 已退役。本文 Reactor 动作名属于显式业务配置，不等于模型可用工具。
+
 > **L1/L2 重建（2026-09-07）**：L2 装配完整请求，L1 执行 SSE 与归一化响应；旧请求/配置/历史不转换。当前实现与验证边界以 [五层规范](design/five-layer-engineering-architecture.md) 为准。
 
 # AgentGo YAML 配置撰写指南（v5）
@@ -61,10 +63,10 @@ llm:
 - `protocol` 只允许 `responses` / `chat_completions`，运行中不自动回退。Responses
   只把 typed `function_call` item 当作工具行动，正文标记永不执行
 - `reasoning_effort` 接受 OpenAI 当前公开取值的并集：`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`；具体模型可能只支持其中一部分，不支持时由上游 API 返回模型级错误
-- Context v9 默认按 1M/64K 编译；`model_capabilities` 只按精确模型名覆盖，不按 provider 名称猜测。窗口必须大于 completion + 16384 protocol reserve。能力与 digest 冻结进 ExecutionLease，retry 不漂移。
-- 默认 Run profile 只统计 prompt/completion tokens，不以 token 数量停止任务；只有 RunContract 显式非零 token budget 才形成硬限制。时间、模型调用、工具动作和 Attempt 护栏仍生效。
+- Context v11 默认按 1M/64K 编译；`model_capabilities` 只按精确模型名覆盖，不按 provider 名称猜测。窗口必须大于 completion + 16384 protocol reserve。能力与 digest 冻结进 ExecutionLease，retry 不漂移。
+- 默认 Run profile 只统计 prompt/completion tokens，不以 token 数量停止任务；只有 RunContract 显式非零 token budget 才形成硬限制。不按默认调用或 Attempt 次数切换阶段；用户显式限制与真实执行错误分别处理。
 - SSE-only 契约对所有经统一 L2/L1 创建的调用生效，包括 Scheduler、预热 Agent、模板/Team Agent、one-shot spawn Agent 和用户 Reactor 的 `invoke_llm`
-- 流式正文/reasoning 会以同一 `stream_id` 的独立累积快照推送到 TUI/Web；工具调用只有在完整 typed output item 完成后才交给 Agent，避免半截参数触发工具
+- 流式正文/reasoning 经 L2 WatchModelOutput 的快照与增量推送到 TUI/Web，eventCursor 用于续接；工具调用只有在完整 typed output item 完成后才交给 Agent，避免半截参数触发工具
 
 ### 1.2 `tool_profiles:` — 命名工具集（推荐）
 
@@ -72,26 +74,26 @@ llm:
 tool_profiles:
   worker_standard:
     - read_file
-    - read_content_ref
-    - write_file
+    - read_evidence
+    - apply_change
     - run_shell
     - send_message
     - request_user_input
   explorer_full:
     - read_file
-    - read_content_ref
+    - read_evidence
     - web_search
     - send_message
     - request_user_input
 ```
 
 - key 是 profile 名，value 是工具名列表
-- 工具名必须在 [internal/tools](../internal/tools/) 注册（如 `read_file` / `write_file` / `run_shell` / `publish_task` / `send_message` / `request_user_input` / `request_replan` / `submit_task_result`；完整列表见 [tool-profiles.md](tool-profiles.md)）
+- 工具名必须在 [internal/tools](../internal/tools/) 注册（如 `read_file` / `apply_change` / `run_shell` / `send_message` / `request_user_input` / `request_replan` / `submit_task_result`；完整列表见 [tool-profiles.md](tool-profiles.md)）
 - 拼错或写不存在的工具名 → 启动期报错
 
 ### 1.3 `agents:` — 预热 Agent kind 列表（可选）
 
-省略 `agents:` 时进入 Scheduler-only 模式：启动快照中没有子 Agent，也不会伪造一个默认 worker。Graph 节点需要专门能力时，Scheduler 先决定 `graph_id`，带同一个 `graph_id` 从 AgentTemplate provision 实例，下一轮读取真实 route 后再提交 Graph。
+省略 `agents:` 时进入 Scheduler-only 模式：启动快照中没有子 Agent，也不会伪造一个默认 worker。启用可选 Team 后，Scheduler 先用 `provision_agent_team(graph_request_id=R)` 取得实际 graph_id/ready route，再以同一 `request_id=R` 调用 apply_graph_change(create)。模板功能关闭且没有 agents 时，没有可认领执行工作的 route。
 
 配置 `agents:` 则保持原有预热语义。每个 kind 的字段：
 
@@ -102,18 +104,13 @@ agents:
     replicas: 1                          # 必填，>= 1
     event_type: ""                       # 可选；空串=默认任务队列；非空=自定队列
     profile: worker_standard             # 与 tools 二选一（不可同时给）
-    # tools: [read_file, write_file]    # ↑↓二选一
+    # tools: [read_file, apply_change]    # ↑↓二选一
     model: gpt-4o                        # 可选，覆盖 llm.default_model
-    # observation_model: gpt-4o-mini     # 可选；仅 Observation control invocation，省略则继承 model
     system_prompt_file: prompts/worker.md  # 必填，文件必须存在且可读
     task_max_retries: 3                  # 必填，> 0
     description: |                       # 可选，给 scheduler 看的一句话角色描述
       通用工作代理。能写文件、跑 shell。
 ```
-
-`observation_model` 不能按 provider 或模型名自动切换。先用 Observation probe 验证
-业务模型与候选控制模型的 empty/populated fixture；只有配置中显式填写时才覆盖该
-kind 的独立 control invocation，普通业务轮仍使用 `model`。
 
 **强约束（启动期校验，违反则启动失败）**：
 - `kind` 在 `agents:` 列表内唯一且非空
@@ -167,10 +164,7 @@ description: 对实现做只读审查，并把缺陷事实提交给 Scheduler。
 capabilities: [code_read, shell]
 tools:
   - read_file
-  - list_dir
-  - grep_search
-  - glob_search
-  - read_content_ref
+  - read_evidence
   - run_shell
   - request_replan
 model: gpt-4o-mini
@@ -245,7 +239,6 @@ ui:
 | 字段 | 默认 | 含义 |
 |---|---|---|
 | `project_root` | `"."` | 项目根路径；启动时统一解析为存在的 canonical 绝对目录，空值/不可访问目录拒绝启动；文件工具会解析 symlink 后校验真实目标仍在根内 |
-| `max_subtask_depth` | `1` | 任务递归派发深度上限 |
 | `shell_timeout_sec` | `30` | run_shell 默认超时 |
 | `shell_blacklist` / `shell_greylist` | `[]` | 追加到默认 shell 拦截规则 |
 | `allow_project_shell_rule_removals` | `false` | 是否允许 `.agentgo/project_rules.yaml` 删除系统默认或主配置追加的黑/灰名单；这是受信任主配置的显式降级开关，默认项目规则只能追加 |

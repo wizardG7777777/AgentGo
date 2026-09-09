@@ -46,7 +46,7 @@ func executeTestStep(t *testing.T, executor TaskExecutor, ctx context.Context, t
 		task.ContextPolicyRef = policycatalog.ContextDefaultCurrent
 	}
 	if task.Lease == nil {
-		task.Lease = &model.ExecutionLease{Model: "test-model", ModelCapabilityDigest: "test-capability", Digest: "test-lease", ObservationModel: "test-model", ObservationModelCapabilityDigest: "test-capability"}
+		task.Lease = &model.ExecutionLease{Schema: model.ExecutionLeaseSchemaCurrent, Model: "test-model", ModelCapabilityDigest: "test-capability", Digest: "test-lease"}
 	}
 	_, attempt, turn := executionIdentityFromContext(ctx)
 	if attempt == "" {
@@ -74,11 +74,11 @@ func replayGateTask(id string, tools []string) *model.Task {
 		AttemptID: id + "/attempt-1", AttemptNo: 1,
 		ContextPolicyRef: policycatalog.ContextDefaultCurrent,
 		RunContract: &runcontract.RunContract{
-			Schema: runcontract.SchemaV1, RunID: runcontract.RunID("run-" + id), CreatedAt: now,
-			DeadlineAt: now.Add(time.Hour), FinalizationReserve: time.Minute,
-			RecoveryReserve: time.Minute, BudgetProfile: "test/v1",
+			Schema: runcontract.SchemaCurrent, RunID: runcontract.RunID("run-" + id), CreatedAt: now,
+			DeadlineAt:    now.Add(time.Hour),
+			BudgetProfile: "test/v1",
 		},
-		Lease: &model.ExecutionLease{
+		Lease: &model.ExecutionLease{Schema: model.ExecutionLeaseSchemaCurrent,
 			TaskID: id, Attempt: 1, FrozenAt: now, BusinessTools: tools, Digest: "lease-" + id,
 		},
 	}

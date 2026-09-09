@@ -224,7 +224,6 @@ func restoreOrReconcileRuntime(sys *System, snap *session.Snapshot) error {
 			authority.projectRoot = sys.Config.ProjectRoot
 		}
 		authority.candidates, authority.deliveries = sys.WorkspaceManager, sys.DeliveryStore
-		authority.checks = sys.CheckStore
 		if err := authority.RecoverPendingIntents(sys.Store); err != nil {
 			return fmt.Errorf("恢复 pending TerminalIntent: %w", err)
 		}

@@ -23,7 +23,7 @@ var _ anomalyStoreView = (store.StoreHookView)(nil)
 // 异常码。C6b 删除 Plan 控制面后仅作为告警事件里的机器可读归类码
 // （历史上同时用作 ReplanRequest.ReasonCode 与幂等键组成段）。
 const (
-	// anomalyCodeFabricatedWrite：任务成功 write_file 但全程未 read_file
+	// anomalyCodeFabricatedWrite：任务成功 apply_change 但全程未 read_file
 	// （疑似无源材料的捏造写入）。对应 cli.go detectAnomalies #3 的运行时口径。
 	anomalyCodeFabricatedWrite = "anomaly_fabricated_write"
 	// anomalyCodeToolErrorRate：工具调用错误率 >30%（样本 >=5）。
@@ -40,13 +40,13 @@ type taskAnomaly struct {
 // detectTaskAnomalies 在任务的 ToolCallRecord 序列上运行运行时异常启发式（纯函数）。
 //
 // 与 internal/trace/cli.go detectAnomalies 的口径对应关系（按 cli.go 内编号）：
-//   - fabricated_write 对应 cli.go #3「write_file 但全程无 read_file」
+//   - fabricated_write 对应 cli.go #3「apply_change 但全程无 read_file」
 //   - tool_error_rate  对应 cli.go #5「tool 错误率超过 30%」
 //
 // 刻意的口径分叉（运行时 Store 数据 vs 事后 trace 事件审计）：
 //  1. cli.go 统计 trace 事件（KindToolCall / KindToolResult），本函数统计 Store 的
 //     ToolCallRecord——两者记录同一批调用，但 record 显式携带 Success 标志。
-//  2. fabricated_write 只把 Success=true 的 write_file 记为"写入发生"：被 Gate
+//  2. fabricated_write 只把 Success=true 的 apply_change 记为"写入发生"：被 Gate
 //     Abort 的写（Success=false）没有落盘，不构成"捏造写入"事实。cli.go #3 从事后
 //     事件流不区分 Gate Abort 与真实写入，一律计入——运行时口径更严（更少误报）。
 //  3. read_file 只要调用过即算"有源材料尝试"（不强制 Success），与 cli.go #3 的
@@ -66,7 +66,7 @@ type taskAnomaly struct {
 //
 // workspace 隔离任务的适用性（2026-07-26 C 线核查）：本检测只消费
 // ToolCallRecord（工具名 + Success 标志），不做任何文件系统 stat——隔离任务
-// 的写入在合并前落在 workspace 副本而非主根，但这不影响记录流：write_file
+// 的写入在合并前落在 workspace 副本而非主根，但这不影响记录流：apply_change
 // 落副本同样记 Success=true，read_file 读穿透主根同样留记录，因此
 // fabricated_write / tool_error_rate 两条启发式对隔离与非隔离任务行为一致，
 // 无需经 workspace.Manager.ResolveForTask 做路径解析（record-artifact reactor
@@ -74,13 +74,13 @@ type taskAnomaly struct {
 func detectTaskAnomalies(history []store.ToolCallRecord) []taskAnomaly {
 	var anomalies []taskAnomaly
 
-	hasWrite := false // 至少一次 write_file 成功落盘
+	hasWrite := false // 至少一次 apply_change 成功落盘
 	hasRead := false  // 至少一次 read_file 调用（不限成败，口径见上）
 	total := len(history)
 	errs := 0
 	for _, rec := range history {
 		switch rec.ToolName {
-		case "write_file":
+		case "apply_change":
 			if rec.Success {
 				hasWrite = true
 			}
@@ -96,7 +96,7 @@ func detectTaskAnomalies(history []store.ToolCallRecord) []taskAnomaly {
 	if hasWrite && !hasRead {
 		anomalies = append(anomalies, taskAnomaly{
 			code:   anomalyCodeFabricatedWrite,
-			detail: "任务成功调用 write_file 写入文件，但全程未调用 read_file（疑似无源材料的捏造写入）",
+			detail: "任务成功调用 apply_change 写入文件，但全程未调用 read_file（疑似无源材料的捏造写入）",
 		})
 	}
 

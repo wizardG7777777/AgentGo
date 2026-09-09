@@ -20,12 +20,12 @@ var recoveryDimensions = map[string]struct{}{
 
 var recoveryFirstActionTools = map[string]struct{}{
 	"read_file": {}, "list_dir": {}, "grep_search": {}, "glob_search": {},
-	"read_content_ref": {}, "write_file": {}, "edit_file": {}, "run_check": {},
+	"read_evidence": {}, "apply_change": {}, "run_check": {},
 }
 
 var recoveryFirstActionPathTools = map[string]struct{}{
 	"read_file": {}, "list_dir": {}, "grep_search": {}, "glob_search": {},
-	"write_file": {}, "edit_file": {},
+	"apply_change": {},
 }
 
 const RecoveryRetryUnstartableReasonCode = "recovery_retry_unstartable"
@@ -342,22 +342,16 @@ func recoveryCandidateState(failure InputBinding) (*RecoveryCandidateState, erro
 		return nil, fmt.Errorf("graph: recovery_delta/v5 failure_context 缺少合法 DeliveryID")
 	}
 	paths := make(map[string]struct{})
-	var latestCheck *RecoveryCandidateCheck
 	for _, evidence := range failure.Evidence {
 		success := evidence.Success != nil && *evidence.Success
-		if success && (evidence.ToolName == "edit_file" || evidence.ToolName == "write_file") {
+		if success && (evidence.ToolName == "apply_change") {
 			path, err := CanonicalRecoveryEvidencePath(evidence.Path)
 			if err != nil {
 				return nil, fmt.Errorf("graph: recovery_delta/v5 mutation evidence path: %w", err)
 			}
 			paths[path] = struct{}{}
 		}
-		if evidence.Kind == "check" && strings.TrimSpace(evidence.CheckRef) != "" {
-			latestCheck = &RecoveryCandidateCheck{
-				Ref: evidence.Ref, CheckRef: evidence.CheckRef, CheckID: evidence.CheckID,
-				Status: evidence.CheckStatus, WorkspaceRevisionRef: evidence.WorkspaceRevisionRef,
-			}
-		}
+
 	}
 	dirtyPaths := make([]string, 0, len(paths))
 	for path := range paths {
@@ -366,7 +360,7 @@ func recoveryCandidateState(failure InputBinding) (*RecoveryCandidateState, erro
 	sort.Strings(dirtyPaths)
 	state := &RecoveryCandidateState{
 		Schema: RecoveryCandidateStateSchemaV1, SourceActivationID: failure.SourceActivationID,
-		DeliveryID: deliveryID, DirtyPaths: dirtyPaths, LatestCheck: latestCheck,
+		DeliveryID: deliveryID, DirtyPaths: dirtyPaths,
 	}
 	if err := validateRecoveryCandidateState(state); err != nil {
 		return nil, err
@@ -393,14 +387,7 @@ func validateRecoveryCandidateState(state *RecoveryCandidateState) error {
 	if !sort.StringsAreSorted(state.DirtyPaths) {
 		return fmt.Errorf("graph: recovery_delta/v5 candidate_state.dirty_paths 必须排序")
 	}
-	if check := state.LatestCheck; check != nil {
-		if strings.TrimSpace(check.Ref) == "" || strings.TrimSpace(check.CheckRef) == "" ||
-			strings.TrimSpace(check.CheckID) == "" ||
-			(check.Status != "pass" && check.Status != "failed") ||
-			strings.TrimSpace(check.WorkspaceRevisionRef) == "" {
-			return fmt.Errorf("graph: recovery_delta/v5 candidate_state.latest_check 不完整")
-		}
-	}
+
 	return nil
 }
 

@@ -43,7 +43,7 @@ func TestManagerSuspendAllStopsRuntimePreservesReadySpecAndMailbox(t *testing.T)
 	}
 	result, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/explorer@1", Purpose: "freeze session team", Replicas: 1,
+		TemplateRef:      "builtin/explorer@2", Purpose: "freeze session team", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -86,7 +86,7 @@ func TestManagerSuspendAllStopsRuntimePreservesReadySpecAndMailbox(t *testing.T)
 	// 挂起窗口 Provision fail-closed（同未 Start）。
 	if _, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/explorer@1", Purpose: "during suspend", Replicas: 1,
+		TemplateRef:      "builtin/explorer@2", Purpose: "during suspend", Replicas: 1,
 	}); !errors.Is(err, ErrNotStarted) {
 		t.Fatalf("挂起窗口 Provision err=%v, 应为 ErrNotStarted", err)
 	}
@@ -120,7 +120,7 @@ func TestManagerSuspendAllThenStartRematerializesReboundManifest(t *testing.T) {
 	}
 	teamA, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerA,
-		TemplateRef:      "builtin/explorer@1", Purpose: "session A team", Replicas: 1,
+		TemplateRef:      "builtin/explorer@2", Purpose: "session A team", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("Provision(A): %v", err)
@@ -131,7 +131,7 @@ func TestManagerSuspendAllThenStartRematerializesReboundManifest(t *testing.T) {
 	// onSessionSwitched 重绑；测试直接替换 Manager 持有的 store 实例）。
 	// B 的 team 属另一个 controller，用另一个模板与真实 digest 以通过恢复核对。
 	storeB := NewMemoryStore()
-	tmpl, err := catalog.Resolve("builtin/generalist@1")
+	tmpl, err := catalog.Resolve("builtin/generalist@2")
 	if err != nil {
 		t.Fatalf("resolve generalist: %v", err)
 	}
@@ -196,14 +196,14 @@ func TestManagerSuspendAllRunReactorTerminalEventDoesNotRecycle(t *testing.T) {
 	}
 	legacy, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/explorer@1", Purpose: "legacy team", Replicas: 1,
+		TemplateRef:      "builtin/explorer@2", Purpose: "legacy team", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("Provision legacy: %v", err)
 	}
 	graphTeam, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID, GraphID: "g-suspend",
-		TemplateRef: "builtin/generalist@1", Purpose: "graph team", Replicas: 1,
+		TemplateRef: "builtin/generalist@2", Purpose: "graph team", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("Provision graph: %v", err)
@@ -270,7 +270,7 @@ func TestManagerSuspendAllAfterClosedKeepsShutdownSemantics(t *testing.T) {
 	}
 	if _, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/explorer@1", Purpose: "closed then suspend", Replicas: 1,
+		TemplateRef:      "builtin/explorer@2", Purpose: "closed then suspend", Replicas: 1,
 	}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
@@ -332,7 +332,7 @@ func TestManagerSuspendAllRecordsAndFinalizeSuspendedMailboxes(t *testing.T) {
 	}
 	result, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/explorer@1", Purpose: "record suspended mailboxes", Replicas: 2,
+		TemplateRef:      "builtin/explorer@2", Purpose: "record suspended mailboxes", Replicas: 2,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -395,7 +395,7 @@ func TestManagerSuspendFinalizeRebindStartClaimsRecoveredMailbox(t *testing.T) {
 	}
 	teamA, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerA,
-		TemplateRef:      "builtin/explorer@1", Purpose: "session A team", Replicas: 1,
+		TemplateRef:      "builtin/explorer@2", Purpose: "session A team", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("Provision(A): %v", err)
@@ -422,7 +422,7 @@ func TestManagerSuspendFinalizeRebindStartClaimsRecoveredMailbox(t *testing.T) {
 	// 解冻 session B：重绑 store 换清单 + 清空消息域 + 导入 B 的快照（B 的
 	// team 邮箱成为 recoveredUnclaimed）。
 	storeB := NewMemoryStore()
-	tmplB, err := catalog.Resolve("builtin/generalist@1")
+	tmplB, err := catalog.Resolve("builtin/generalist@2")
 	if err != nil {
 		t.Fatalf("resolve generalist: %v", err)
 	}
@@ -506,7 +506,7 @@ func TestManagerStartClearsSuspendedMailboxRecordDefensively(t *testing.T) {
 	}
 	if _, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerA,
-		TemplateRef:      "builtin/explorer@1", Purpose: "session A team", Replicas: 1,
+		TemplateRef:      "builtin/explorer@2", Purpose: "session A team", Replicas: 1,
 	}); err != nil {
 		t.Fatalf("Provision(A): %v", err)
 	}
@@ -517,7 +517,7 @@ func TestManagerStartClearsSuspendedMailboxRecordDefensively(t *testing.T) {
 
 	// 模拟 session 层遗漏 Finalize，直接重绑换清单解冻（新清单 agentID 不同，
 	// 不触发邮箱冲突）。
-	tmplB, err := catalog.Resolve("builtin/generalist@1")
+	tmplB, err := catalog.Resolve("builtin/generalist@2")
 	if err != nil {
 		t.Fatalf("resolve generalist: %v", err)
 	}

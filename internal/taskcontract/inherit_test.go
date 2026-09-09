@@ -15,9 +15,9 @@ func TestInheritCopiesRunAndRecompilesProgress(t *testing.T) {
 	parent := &model.Task{
 		ID: "parent", RunID: "run-1", ContextPolicyRef: policycatalog.ContextDefaultCurrent,
 		RunContract: &runcontract.RunContract{
-			Schema: runcontract.SchemaV1, RunID: "run-1", CreatedAt: now,
-			DeadlineAt: now.Add(time.Hour), FinalizationReserve: time.Minute,
-			RecoveryReserve: time.Minute, BudgetProfile: "test/v1",
+			Schema: runcontract.SchemaCurrent, RunID: "run-1", CreatedAt: now,
+			DeadlineAt:    now.Add(time.Hour),
+			BudgetProfile: "test/v1",
 		},
 	}
 	child := &model.Task{ID: "child"}
@@ -32,14 +32,13 @@ func TestInheritCopiesRunAndRecompilesProgress(t *testing.T) {
 
 func TestStartPinsCurrentContextPolicyVersion(t *testing.T) {
 	task := &model.Task{ID: "new-root"}
-	if err := Start(task, loopcontract.WorkCodeChange, "test/v1",
-		time.Hour, time.Minute, time.Minute); err != nil {
+	if err := Start(task, loopcontract.WorkCodeChange, "test/v1"); err != nil {
 		t.Fatal(err)
 	}
 	if task.ContextPolicyRef != policycatalog.ContextDefaultCurrent {
 		t.Fatalf("新 Run 未冻结 current Context policy: %+v", task)
 	}
-	if task.RunContract == nil || task.RunContract.Schema != runcontract.SchemaV2 ||
+	if task.RunContract == nil || task.RunContract.Schema != runcontract.SchemaCurrent ||
 		task.ProgressContract == nil || task.ProgressContract.Ref.ContractID != policycatalog.ProgressCodeChangeCurrent {
 		t.Fatalf("新 Run 未冻结 RunContract v2 / current Progress: %+v", task)
 	}
@@ -54,7 +53,7 @@ func TestStartAssignsV2VerificationAndFinalizationPhases(t *testing.T) {
 		{loopcontract.WorkFinalization, runcontract.PhaseFinalization},
 	} {
 		task := &model.Task{ID: "phase-" + string(test.work)}
-		if err := Start(task, test.work, "test/v2", time.Hour, time.Minute, time.Minute); err != nil {
+		if err := Start(task, test.work, "test/v2"); err != nil {
 			t.Fatal(err)
 		}
 		if task.RunPhase != test.want {

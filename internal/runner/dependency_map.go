@@ -9,7 +9,7 @@ package runner
 //	| 工具 | 自动注入的依赖 |
 //	|---|---|
 //	| read_file / list_dir / grep_search / glob_search | Workdir + FileStateCache |
-//	| write_file / edit_file | + Roster（文件级写锁，附 RosterWaitTimeoutSec）+ StoreHookView（同步 artifact ledger）；strict 审批 WrapHandler 在 runner.New 装配；+ EffectJournal（H2b 副作用 authority；nil 仅 legacy test） |
+//	| apply_change / apply_change | + Roster（文件级写锁，附 RosterWaitTimeoutSec）+ StoreHookView（同步 artifact ledger）；strict 审批 WrapHandler 在 runner.New 装配；+ EffectJournal（H2b 副作用 authority；nil 仅 legacy test） |
 //	| run_shell | + interaction.Service + SessionID + shell.CommandFilter + ShellTimeoutSec + Modes（exec 轴短路）；验收角色（白名单含 run_shell 且不含写工具）再注入 shell.AcceptanceHardeningGreylist；workdir 实现 tools.ActiveViewer 时（*workspace.Swapper）注入 ActiveViewer；+ EffectJournal |
 //	| publish_task | + Store + TaskHolder + MaxSubtaskDepth |
 //	| request_user_input | + interaction.Service + SessionID + TaskHolder |
@@ -40,7 +40,7 @@ import (
 // *workspace.Swapper（同时实现 tools.ActiveViewer——run_shell 默认工作目录
 // 随隔离视图切换）；单测直构的 DefaultWorkdir 不满足该可选接口，shell 行为
 // 与旧版完全一致。
-// interactionWaitHook 同时透传给 ShellGroup 与 MetaGroup（交互等待 → agent 状态机
+// interactionWaitHook 同时透传给 ShellGroup 与 CommunicationGroup（交互等待 → agent 状态机
 // 接线，见 runner.New）。
 func resolveToolGroups(
 	instanceID string,
@@ -67,10 +67,10 @@ func resolveToolGroups(
 		// 让精简装配也不会遗漏写工具的同步 artifact ledger。
 		artifactStore, _ = deps.Store.(store.StoreHookView)
 	}
-	recoveryAuthority, _ := deps.OutletChecker.(tools.RecoveryDecisionAuthority)
 	return []tools.ToolGroup{
 		readGroup,
-		tools.ContentRefGroup{
+		tools.EvidenceGroup{
+			Graphs:       deps.GraphStore,
 			ContentStore: deps.ContentStore, TaskStore: deps.Store, SessionID: deps.SessionID,
 		},
 		tools.LocalWriteGroup{
@@ -95,27 +95,14 @@ func resolveToolGroups(
 			ActiveViewer:        activeViewer,
 			EffectJournal:       deps.EffectJournal,
 		},
-		tools.CheckGroup{
-			Shell: tools.ShellGroup{
-				Workdir: workdir, TimeoutSec: deps.ShellTimeoutSec, Interactions: deps.Interactions,
-				SessionID: deps.SessionID, AgentID: instanceID, Filter: deps.ShellFilter,
-				ExtraGreylist: acceptanceShellGreylist(allowedTools), Modes: deps.Modes,
-				InteractionWaitHook: interactionWaitHook, ActiveViewer: activeViewer,
-				EffectJournal: deps.EffectJournal,
-			},
-			TaskStore: deps.Store, Checks: deps.CheckStore, ContentStore: deps.ContentStore,
-			Holder: holder, SessionID: deps.SessionID, Workspaces: deps.WorkspaceManager,
-		},
-		tools.MetaGroup{
+		tools.CommunicationGroup{
 			Store:               deps.Store,
 			Holder:              holder,
-			MaxDepth:            deps.MaxSubtaskDepth,
 			MBRegistry:          deps.MBRegistry,
 			AgentID:             instanceID,
 			Interactions:        deps.Interactions,
 			SessionID:           deps.SessionID,
 			InteractionWaitHook: interactionWaitHook,
-			RouteValidator:      deps.RouteValidator,
 			EffectJournal:       deps.EffectJournal,
 		},
 		tools.PlanControlGroup{
@@ -126,16 +113,11 @@ func resolveToolGroups(
 			SubmitState:          submitState,
 			ArtifactResolver:     agent.NewArtifactPhysicalResolver(deps.ProjectRoot, deps.WorkspaceManager),
 			OutletChecker:        deps.OutletChecker,
-			Checks:               deps.CheckStore,
-			RecoveryAuthority:    recoveryAuthority,
-			Checkpoints:          deps.LoopStore,
-			Workspaces:           deps.WorkspaceManager,
-			ProjectRoot:          deps.ProjectRoot,
+
+			Workspaces:  deps.WorkspaceManager,
+			ProjectRoot: deps.ProjectRoot,
 		},
-		tools.ObservationGroup{
-			Store: deps.Store, TaskMem: deps.TaskMemStore, Holder: holder, AgentID: instanceID,
-			Checks: deps.CheckStore, Workspaces: deps.WorkspaceManager,
-		},
+		tools.InspectionGroup{Tasks: deps.Store, Graphs: deps.GraphStore, Definitions: deps.GraphDefinitions, Content: deps.ContentStore, History: deps.StoreView, Holder: holder, SessionID: deps.SessionID},
 	}
 }
 
@@ -143,7 +125,7 @@ func resolveToolGroups(
 // 验收加固灰名单（写倾向 shell 命令一律升级为灰名单 Interaction 审批），
 // 否则返回 nil——ShellGroup 行为与未注入时完全一致（非验收语境不变）。
 //
-// 判定依据（C6b 重键）：白名单含 run_shell 但不含 write_file/edit_file。
+// 判定依据（C6b 重键）：白名单含 run_shell 但不含 apply_change/apply_change。
 // 验收 runner（Graph acceptance 节点 / verifier 模板）的特征正是「有 shell
 // 却没有写工具」——shell 是其唯一可能污染被验收对象的通道；普通执行 kind
 // 持有写工具，不命中。原判定键 submit_acceptance_result 已随验收四工具删除。
@@ -165,7 +147,7 @@ func acceptanceShellGreylist(allowedTools []string) []string {
 		switch name {
 		case "run_shell":
 			hasShell = true
-		case "write_file", "edit_file":
+		case "apply_change":
 			hasWrite = true
 		}
 	}

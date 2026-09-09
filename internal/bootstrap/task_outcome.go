@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"agentgo/internal/agent"
-	"agentgo/internal/checkstore"
 	"agentgo/internal/delivery"
 	"agentgo/internal/fulfillment"
 	"agentgo/internal/graph"
@@ -54,9 +53,6 @@ type graphTaskOutcomeAuthority struct {
 		FreezeCandidate(deliveryID, workspaceID, workspaceRevisionRef string) (delivery.Candidate, error)
 	}
 	deliveries *delivery.Store
-	checks     interface {
-		Resolve(taskID, attemptID, ref string) (checkstore.Record, error)
-	}
 }
 
 func newGraphTaskOutcomeAuthority(graphs graphDocumentReader, outcomes *outcomestore.Store,
@@ -135,11 +131,7 @@ func (a *graphTaskOutcomeAuthority) Commit(intent store.TerminalOutcomeIntent) (
 	if err != nil {
 		return "", err
 	}
-	checkRecords, err := a.resolveFulfillmentChecks(task, fulfillmentRecord)
-	if err != nil {
-		return "", err
-	}
-	evidenceEntries := assembleTaskEvidenceFromCallsAndChecks(task, intent.ToolCalls, checkRecords)
+	evidenceEntries := assembleTaskEvidenceFromCalls(task, intent.ToolCalls)
 	evidenceFacts := make([]outcome.EvidenceFact, 0, len(evidenceEntries))
 	evidenceRefs := make([]string, 0, len(evidenceEntries))
 	artifactFacts := make([]outcome.ArtifactFact, 0)
@@ -372,11 +364,7 @@ func (a *graphTaskOutcomeAuthority) buildOutcomeCandidate(intent store.TerminalO
 	if fulfillmentErr != nil {
 		return outcome.TaskOutcome{}, true, fulfillmentErr
 	}
-	checkRecords, checkErr := a.resolveFulfillmentChecks(task, fulfillmentRecord)
-	if checkErr != nil {
-		return outcome.TaskOutcome{}, true, checkErr
-	}
-	evidenceEntries := assembleTaskEvidenceFromCallsAndChecks(task, intent.ToolCalls, checkRecords)
+	evidenceEntries := assembleTaskEvidenceFromCalls(task, intent.ToolCalls)
 	evidenceFacts := make([]outcome.EvidenceFact, 0, len(evidenceEntries))
 	evidenceRefs := make([]string, 0, len(evidenceEntries))
 	artifactFacts := make([]outcome.ArtifactFact, 0)
@@ -843,9 +831,8 @@ func outcomeEvidenceFact(entry graph.EvidenceEntry) outcome.EvidenceFact {
 		CallID: entry.CallID, ToolName: entry.ToolName,
 		Command: entry.Command, CommandTruncated: entry.CommandTruncated,
 		Path: entry.Path, PathTruncated: entry.PathTruncated,
-		CheckRef: entry.CheckRef, CheckID: entry.CheckID, CheckKind: entry.CheckKind,
-		CheckStatus: entry.CheckStatus, WorkspaceRevisionRef: entry.WorkspaceRevisionRef,
-		OutputRef: entry.OutputRef,
+		WorkspaceRevisionRef: entry.WorkspaceRevisionRef,
+		OutputRef:            entry.OutputRef,
 	}
 	if entry.Success != nil {
 		value := *entry.Success
@@ -857,26 +844,6 @@ func outcomeEvidenceFact(entry graph.EvidenceEntry) outcome.EvidenceFact {
 	}
 	fact.ExitCodeScope = entry.ExitCodeScope
 	return fact
-}
-
-func (a *graphTaskOutcomeAuthority) resolveFulfillmentChecks(task *model.Task,
-	record *fulfillment.Record,
-) ([]checkstore.Record, error) {
-	if record == nil || len(record.CheckRefs) == 0 {
-		return nil, nil
-	}
-	if a == nil || a.checks == nil {
-		return nil, fmt.Errorf("Task %s fulfillment 引用 CheckRef，但 TaskOutcome authority 未装配 CheckStore", task.ID)
-	}
-	checks := make([]checkstore.Record, 0, len(record.CheckRefs))
-	for _, ref := range record.CheckRefs {
-		resolved, err := a.checks.Resolve(task.ID, task.AttemptID, ref)
-		if err != nil {
-			return nil, fmt.Errorf("解引用 fulfillment CheckRef %s: %w", ref, err)
-		}
-		checks = append(checks, resolved)
-	}
-	return checks, nil
 }
 
 func cloneTaskResults(values map[string]string) map[string]string {
@@ -902,7 +869,6 @@ func replayPendingTaskOutcomes(sys *System) error {
 		authority.projectRoot = sys.Config.ProjectRoot
 	}
 	authority.candidates, authority.deliveries = sys.WorkspaceManager, sys.DeliveryStore
-	authority.checks = sys.CheckStore
 	feed := newGraphFeedReactor(sys.Store, sys.GraphRuntime, authority)
 	allowGraphReplay := currentSessionID(sys) == ""
 	for {

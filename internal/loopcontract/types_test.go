@@ -17,11 +17,9 @@ func validContractRef() ProgressContractRef {
 
 func validPolicy() ProgressPolicy {
 	return ProgressPolicy{
-		PolicyRef: "bounded_code_change/v1", ReminderAfterTurns: 3,
-		RolloverAfterTurns: 6, InterventionAfterTurns: 9, MaxNoProgressTurns: 12,
-		MaxNoProgressDuration: 10 * time.Minute,
-		MaxNoProgressUsage:    runcontract.BudgetLimit{ModelCalls: 12, ToolActions: 48},
-		MaxExplorationTurns:   4, MaxAttemptRollovers: 1, RecentFingerprintWindow: 16,
+		PolicyRef: "bounded_code_change/v1",
+
+		RecentFingerprintWindow: 16,
 	}
 }
 
@@ -64,7 +62,7 @@ func TestProgressContractDraftRejectsUnobservableCodeChange(t *testing.T) {
 
 func TestCompiledProgressContractValidate(t *testing.T) {
 	contract := CompiledProgressContract{
-		Schema: CompiledSchemaV1, Ref: validContractRef(), WorkClass: WorkCodeChange,
+		Schema: CompiledSchemaCurrent, Ref: validContractRef(), WorkClass: WorkCodeChange,
 		Deliverables:    []DeliverableRule{{ID: "source", Kind: DeliverableFileDelta, Scope: "internal/**", Required: true}},
 		AcceptedSignals: []ProgressSignalRule{{Kind: SignalFileVersionChanged, IdentityScope: "internal/**", Deliverable: true}},
 		Policy:          validPolicy(), RunBudgetRef: "run-budget-1",
@@ -72,9 +70,10 @@ func TestCompiledProgressContractValidate(t *testing.T) {
 	if err := contract.Validate(); err != nil {
 		t.Fatalf("合法 CompiledProgressContract 被拒绝: %v", err)
 	}
-	contract.Policy.MaxNoProgressTurns = 0
+
+	contract.Policy.RecentFingerprintWindow = 0
 	if err := contract.Validate(); err == nil {
-		t.Fatal("无界/倒置 policy 应被拒绝")
+		t.Fatal("非法事实缓存应被拒绝")
 	}
 }
 
@@ -128,9 +127,9 @@ func TestProgressCheckpointValidatesIdentityAndDeadlineHierarchy(t *testing.T) {
 	if err := checkpoint.Validate(); err != nil {
 		t.Fatalf("合法 ProgressCheckpoint 被拒绝: %v", err)
 	}
-	checkpoint.Deadlines.Attempt.HardDeadlineAt = checkpoint.Deadlines.Activation.HardDeadlineAt
+	checkpoint.Deadlines.Attempt.HardDeadlineAt = checkpoint.Deadlines.Activation.HardDeadlineAt.Add(time.Second)
 	if err := checkpoint.Validate(); err == nil {
-		t.Fatal("Attempt deadline 未早于 Activation 时应拒绝")
+		t.Fatal("Attempt deadline 超过 Activation 时应拒绝")
 	}
 }
 

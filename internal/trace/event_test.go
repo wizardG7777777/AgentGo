@@ -53,7 +53,7 @@ func TestShellExecRoundtrip(t *testing.T) {
 		TaskID:    "task-shell",
 		ShellExec: &ShellExec{
 			Command:       "ls -la /tmp",
-			ExitCode:      0,
+			ExitCode:      func() *int { value := 0; return &value }(),
 			DurationMS:    42,
 			Outcome:       "success",
 			StdoutExcerpt: "total 0",
@@ -281,7 +281,7 @@ func TestFormatEventDetailsTransitionRendering(t *testing.T) {
 			ev: Event{
 				Kind: KindShellExecuted,
 				ShellExec: &ShellExec{
-					Command: "ls", ExitCode: 0, DurationMS: 12, Outcome: "success",
+					Command: "ls", ExitCode: func() *int { value := 0; return &value }(), DurationMS: 12, Outcome: "success",
 				},
 			},
 			contains: []string{`cmd="ls"`, "exit=0", "duration=12ms", "outcome=success"},

@@ -12,9 +12,9 @@ import (
 func TestRender_BudgetRespected(t *testing.T) {
 	m := New("task-1")
 	m.Goal = "实现一个非常重要的功能，需要多步完成"
-	m.Constraints = []string{"工具子集: read_file,write_file"}
+	m.Constraints = []string{"工具子集: read_file,apply_change"}
 	for i := 0; i < 15; i++ {
-		m.Actions = append(m.Actions, ActionRecord{Caption: fmt.Sprintf("write_file 产出文件编号%02d.go", i)})
+		m.Actions = append(m.Actions, ActionRecord{Caption: fmt.Sprintf("apply_change 产出文件编号%02d.go", i)})
 	}
 	for i := 0; i < 8; i++ {
 		m.Failures = append(m.Failures, fmt.Sprintf("web_fetch 调用失败: 地址编号%02d — 超时", i))
@@ -67,7 +67,7 @@ func TestRender_ListSectionKeepsRecent(t *testing.T) {
 	m := New("task-1")
 	m.Goal = "g"
 	for i := 0; i < 20; i++ {
-		m.Actions = append(m.Actions, ActionRecord{Caption: fmt.Sprintf("write_file f%02d.go", i)})
+		m.Actions = append(m.Actions, ActionRecord{Caption: fmt.Sprintf("apply_change f%02d.go", i)})
 	}
 	out := Render(m, 300)
 	if !strings.Contains(out, "f19.go") {

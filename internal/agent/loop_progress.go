@@ -1,11 +1,10 @@
 package agent
 
 import (
- "agentgo/internal/contextcontract"
+	"agentgo/internal/contextcontract"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -14,15 +13,12 @@ import (
 	"time"
 
 	"agentgo/internal/effect"
-	"agentgo/internal/graph"
 	"agentgo/internal/llm"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/loopprogress"
 	"agentgo/internal/model"
-	"agentgo/internal/policycatalog"
 	"agentgo/internal/runbudget"
 	"agentgo/internal/runcontract"
-	"agentgo/internal/store"
 )
 
 const (
@@ -102,10 +98,7 @@ func (a *Agent) initLoopProgress(task *model.Task) (*loopProgressRuntime, error)
 		return nil, fmt.Errorf("RunBudgetRef=%s 但 RunBudgetStore 未装配", task.ProgressContract.RunBudgetRef)
 	}
 
-	profileBudget := task.ProgressContract.Policy.MaxNoProgressUsage
-	if frameworkBudget, ok := runcontract.FrameworkActivationBudgetProfile(task.RunContract.BudgetProfile); ok {
-		profileBudget = frameworkBudget
-	}
+	profileBudget := task.RunContract.Budget // 仅执行用户显式预算，不派生默认进展限额。
 	if a.RunBudgetStore != nil {
 		// RunContract.Budget 的可累加资源维度属于 Run 全局；wall_time 已由
 		// 绝对 deadline 执法，Attempts 属于当前 Activation 的 rollover。
@@ -207,10 +200,7 @@ func (a *Agent) futureAttemptBudgetAvailable(task *model.Task) (bool, int64, int
 	if a == nil || task == nil || task.RunContract == nil || task.ProgressContract == nil || a.LoopStore == nil {
 		return true, 0, 0, nil
 	}
-	profileBudget := task.ProgressContract.Policy.MaxNoProgressUsage
-	if frameworkBudget, ok := runcontract.FrameworkActivationBudgetProfile(task.RunContract.BudgetProfile); ok {
-		profileBudget = frameworkBudget
-	}
+	profileBudget := task.RunContract.Budget // 仅执行用户显式预算，不派生默认进展限额。
 	limit := effectiveRunBudget(task.RunContract.Budget, profileBudget).Attempts
 	if limit <= 0 {
 		return true, 0, limit, nil
@@ -300,8 +290,8 @@ func loopDeadlineSet(task *model.Task, now time.Time) (loopcontract.DeadlineSet,
 
 func (r *loopProgressRuntime) reserveModelAction(turnID string) (string, time.Time, llm.OutputBudget, error) {
 	now := time.Now().UTC()
-	actionDeadline := r.checkpoint.Deadlines.Attempt.HardDeadlineAt.Add(-runcontract.DefaultDeadlineHandoffReserve)
-	if !now.Before(actionDeadline) {
+	actionDeadline := r.checkpoint.Deadlines.Attempt.HardDeadlineAt
+	if !actionDeadline.IsZero() && !now.Before(actionDeadline) {
 		return "", time.Time{}, llm.OutputBudget{}, actionDeadlineFailure("没有足够时间预留下一次 model action")
 	}
 	actionID := stableLoopID("action", r.checkpoint.TaskID, r.checkpoint.AttemptID, turnID, "model")
@@ -426,8 +416,8 @@ func (r *loopProgressRuntime) ReserveTool(ctx context.Context, task *model.Task,
 		return toolActionHandle{}, fmt.Errorf("Tool action Task/Attempt lineage 不一致")
 	}
 	now := time.Now().UTC()
-	actionDeadline := r.checkpoint.Deadlines.Attempt.HardDeadlineAt.Add(-runcontract.DefaultDeadlineHandoffReserve)
-	if !now.Before(actionDeadline) {
+	actionDeadline := r.checkpoint.Deadlines.Attempt.HardDeadlineAt
+	if !actionDeadline.IsZero() && !now.Before(actionDeadline) {
 		return toolActionHandle{}, actionDeadlineFailure("没有足够时间预留 Tool action")
 	}
 	_, _, turnID := executionIdentityFromContext(ctx)
@@ -542,16 +532,8 @@ func (r *loopProgressRuntime) SettleTool(_ context.Context, task *model.Task, ca
 	return nil
 }
 
-type loopPolicyDecision struct {
-	Reminder          string
-	Rollover          bool
-	Intervention      bool
-	Blocked           bool
-	ObservationAction string
-}
-
 func (r *loopProgressRuntime) settleTurn(a *Agent, task *model.Task, turnID string,
-	startedAt time.Time, result ExecuteResult, execErr error, enforcePolicy, controlCheckpoint bool) (loopPolicyDecision, error) {
+	startedAt time.Time, result ExecuteResult, execErr error) error {
 	settledAt := time.Now().UTC()
 	actionIDs := append([]string(nil), r.turnActions[turnID]...)
 	toolUsage := r.turnToolUsage[turnID]
@@ -571,12 +553,12 @@ func (r *loopProgressRuntime) settleTurn(a *Agent, task *model.Task, turnID stri
 		CompletionTokens: int64(result.CompletionTokens), ModelCalls: modelCallsUsage,
 	}).Add(toolUsage)
 	if err != nil {
-		return loopPolicyDecision{}, err
+		return err
 	}
 	if r.runBudgets != nil {
 		reservationID := r.turnRunReservations[turnID]
 		if reservationID == "" {
-			return loopPolicyDecision{}, fmt.Errorf("Turn %s 缺少 Run model reservation", turnID)
+			return fmt.Errorf("Turn %s 缺少 Run model reservation", turnID)
 		}
 		status := runbudget.SettlementSucceeded
 		settlementUsage := runcontract.BudgetUsage{
@@ -604,7 +586,7 @@ func (r *loopProgressRuntime) settleTurn(a *Agent, task *model.Task, turnID stri
 			ReservationID: reservationID, ActionID: actionIDs[0], RunID: task.RunID,
 			Status: status, Usage: settlementUsage, SettledAt: settledAt,
 		}); err != nil {
-			return loopPolicyDecision{}, fmt.Errorf("结算 Run model budget: %w", err)
+			return fmt.Errorf("结算 Run model budget: %w", err)
 		}
 		delete(r.turnRunReservations, turnID)
 		delete(r.turnRunCharges, turnID)
@@ -615,7 +597,7 @@ func (r *loopProgressRuntime) settleTurn(a *Agent, task *model.Task, turnID stri
 				ReservationID: permitRef, ActionID: actionIDs[0], RunID: task.RunID,
 				Status: status, Usage: runcontract.BudgetUsage{ModelCalls: permitModelCallsUsage}, SettledAt: settledAt,
 			}); err != nil {
-				return loopPolicyDecision{}, fmt.Errorf("结算 RecoveryStartPermit: %w", err)
+				return fmt.Errorf("结算 RecoveryStartPermit: %w", err)
 			}
 			delete(r.turnRunCallPermits, turnID)
 		}
@@ -638,21 +620,12 @@ func (r *loopProgressRuntime) settleTurn(a *Agent, task *model.Task, turnID stri
 		}
 	}
 	projectExecuteResult(a, task, result, &delta)
-	if controlCheckpoint && task.ProgressContract != nil && task.ProgressContract.Policy.MaxControlContractFailures > 0 &&
-		(!observationCheckpointSucceeded(result) || delta.ObservationDeltaRef == "") {
-		delta.ControlContractFailure = true
-	}
 	assessment, next, err := loopprogress.Evaluate(r.contract, r.checkpoint, delta)
 	if err != nil {
-		return loopPolicyDecision{}, err
+		return err
 	}
-	decision := loopPolicyDecision{}
-	var intervention *loopcontract.LoopInterventionRequested
-	if enforcePolicy {
-		decision, intervention = decideProgressPolicy(r.contract, task, &next)
-	}
-	if err := r.store.AppendSettlementWithIntervention(delta, assessment, next, intervention); err != nil {
-		return loopPolicyDecision{}, err
+	if err := r.store.AppendSettlementWithIntervention(delta, assessment, next, nil); err != nil {
+		return err
 	}
 	r.checkpoint = next
 	delete(r.turnActions, turnID)
@@ -661,7 +634,7 @@ func (r *loopProgressRuntime) settleTurn(a *Agent, task *model.Task, turnID stri
 	delete(r.turnRunReservations, turnID)
 	delete(r.turnRunCharges, turnID)
 	delete(r.turnRunCallPermits, turnID)
-	return decision, nil
+	return nil
 }
 
 func invocationResultUncertain(err error) bool {
@@ -827,7 +800,7 @@ func projectExecuteResult(a *Agent, task *model.Task, result ExecuteResult, delt
 		content := results[call.ID]
 		success := !unsuccessfulToolResult(content)
 		switch call.Name {
-		case "write_file", "edit_file":
+		case "apply_change":
 			if !success {
 				continue
 			}
@@ -836,7 +809,7 @@ func projectExecuteResult(a *Agent, task *model.Task, result ExecuteResult, delt
 			if meta, ok := artifactMeta[path]; ok {
 				afterHash = meta.SHA256
 			}
-			if afterHash == "" && call.Name == "write_file" {
+			if afterHash == "" && call.Name == "apply_change" {
 				if body, _ := call.Arguments["content"].(string); body != "" {
 					afterHash = digestText(body)
 				}
@@ -847,82 +820,14 @@ func projectExecuteResult(a *Agent, task *model.Task, result ExecuteResult, delt
 				})
 			}
 		case "run_shell":
-			// 新业务 contract 只接受 run_check 的 typed CheckRecord；普通 Shell
-			// exit=0 不再被提升为 verification pass。旧冻结 contract 保持兼容。
-			if task.ProgressContract != nil && task.ProgressContract.Policy.KnowledgeCheckpointAfterTurns > 0 {
-				continue
-			}
-			command, _ := call.Arguments["command"].(string)
-			verdict := "failed"
-			scope := parseRunShellExitCodeScope(content)
-			if code := parseRunShellExitCode(content); success && code != nil && *code == 0 &&
-				scope != store.ShellExitCodeScopeLastPipelineCommand {
-				verdict = "pass"
-			} else if success && scope == store.ShellExitCodeScopeLastPipelineCommand {
-				verdict = "ambiguous"
-			}
-			delta.EvaluationChanges = append(delta.EvaluationChanges, loopcontract.EvaluationChange{
-				EvaluationID: "shell:" + digestText(command)[:16], AfterDigest: digestText(content),
-				AfterVerdict: verdict, Changed: true,
+			delta.EvidenceChanges = append(delta.EvidenceChanges, loopcontract.EvidenceChange{
+				Kind: "shell_execution", Ref: toolEvidenceRef(call), Digest: digestText(content), Novel: true,
 			})
-		case "run_check":
-			var receipt struct {
-				CheckID              string `json:"check_id"`
-				CheckRef             string `json:"check_ref"`
-				Status               string `json:"status"`
-				WorkspaceRevisionRef string `json:"workspace_revision_ref"`
-			}
-			if json.Unmarshal([]byte(content), &receipt) != nil || receipt.CheckID == "" {
-				continue
-			}
-			if !taskAcceptsVerificationCheckID(task, receipt.CheckID) {
-				delta.EvidenceChanges = append(delta.EvidenceChanges, loopcontract.EvidenceChange{
-					Kind: "run_check_auxiliary", Ref: receipt.CheckRef,
-					Digest: digestText(receipt.CheckRef + "\x00" + receipt.Status), Novel: true,
-				})
-				continue
-			}
-			if task.ProgressContract != nil && usesDecisionAwareCodeChange(task.ProgressContract.Ref.ContractID) &&
-				(receipt.WorkspaceRevisionRef == "" || receipt.WorkspaceRevisionRef == "workspace:empty") {
-				// code-change 的 pre-mutation check 只建立红/绿基线。换命令、跑
-				// 无关通过用例不能代替 mutation，也不能重置 decision stagnation。
-				delta.EvidenceChanges = append(delta.EvidenceChanges, loopcontract.EvidenceChange{
-					Kind: "run_check_baseline", Ref: receipt.CheckRef,
-					Digest: digestText(receipt.CheckRef + "\x00" + receipt.Status), Novel: true,
-				})
-				continue
-			}
-			delta.EvaluationChanges = append(delta.EvaluationChanges, loopcontract.EvaluationChange{
-				EvaluationID: "declared-evaluator", AfterDigest: digestText(receipt.CheckRef + "\x00" + receipt.Status),
-				AfterVerdict: receipt.Status, Changed: true,
-			})
-		case "read_file", "list_dir", "grep_search", "glob_search", "web_search", "web_fetch", "read_content_ref",
-			"read_graph", "get_task_result":
+		case "read_file", "web_search", "web_fetch", "read_evidence", "read_graph_definition", "inspect_board", "inspect_node":
 			if success {
 				delta.EvidenceChanges = append(delta.EvidenceChanges, loopcontract.EvidenceChange{
 					Kind: call.Name, Ref: toolEvidenceRef(call), Digest: digestText(content), Novel: true,
 				})
-			}
-		case "record_observation_delta":
-			if !success {
-				continue
-			}
-			var receipt struct {
-				Ref                  string `json:"observation_delta_ref"`
-				PreviousRef          string `json:"previous_ref"`
-				Phase                string `json:"phase"`
-				WorkspaceRevisionRef string `json:"workspace_revision_ref"`
-				LatestCheckRef       string `json:"latest_check_ref"`
-				ResolvedCandidates   int    `json:"resolved_candidates"`
-				SemanticAdvance      bool   `json:"semantic_advance"`
-			}
-			if json.Unmarshal([]byte(content), &receipt) == nil && strings.TrimSpace(receipt.Ref) != "" {
-				delta.ObservationDeltaRef = receipt.Ref
-				delta.ObservationChange = &loopcontract.ObservationChange{
-					Ref: receipt.Ref, PreviousRef: receipt.PreviousRef, Phase: receipt.Phase,
-					WorkspaceRevisionRef: receipt.WorkspaceRevisionRef, LatestCheckRef: receipt.LatestCheckRef,
-					ResolvedCandidates: receipt.ResolvedCandidates, SemanticAdvance: receipt.SemanticAdvance,
-				}
 			}
 		default:
 			if success && isCoordinationTool(call.Name) {
@@ -934,316 +839,14 @@ func projectExecuteResult(a *Agent, task *model.Task, result ExecuteResult, delt
 	}
 }
 
-func taskAcceptsVerificationCheckID(task *model.Task, checkID string) bool {
-	if task == nil || task.FulfillmentContract == nil || len(task.FulfillmentContract.RequiredCheckIDs) == 0 {
-		return true
-	}
-	checkID = strings.TrimSpace(checkID)
-	for _, required := range task.FulfillmentContract.RequiredCheckIDs {
-		if strings.TrimSpace(required) == checkID {
-			return true
-		}
-	}
-	return false
-}
-
-func usesDecisionAwareCodeChange(contractID string) bool {
-	return contractID == policycatalog.ProgressCodeChangeV6 ||
-		contractID == policycatalog.ProgressCodeChangeV7 ||
-		contractID == policycatalog.ProgressCodeChangeV8 ||
-		contractID == policycatalog.ProgressCodeChangeV9 ||
-		contractID == policycatalog.ProgressCodeChangeV10 ||
-		contractID == policycatalog.ProgressCodeChangeV11 ||
-		contractID == policycatalog.ProgressCodeChangeV12
-}
-
 func historyEntryFromResult(result ExecuteResult, modelName, turnID string) contextcontract.HistoryEntry {
 	return contextcontract.HistoryEntry{
 		TurnID: turnID, Output: result.Output, ToolCalled: result.ToolCalled,
 		AssistantContent: result.AssistantContent, ToolCalls: result.ToolCalls,
-		ToolResults: result.ToolResults, Replay:result.Replay,
+		ToolResults: result.ToolResults, Replay: result.Replay,
 		PromptTokens: result.PromptTokens, CompletionTokens: result.CompletionTokens,
 		Model: modelName,
 	}
-}
-
-func decideProgressPolicy(contract loopcontract.CompiledProgressContract, task *model.Task,
-	checkpoint *loopcontract.ProgressCheckpoint) (loopPolicyDecision, *loopcontract.LoopInterventionRequested) {
-	policy := contract.Policy
-	exhausted := checkpoint.NoProgressTurns >= policy.MaxNoProgressTurns ||
-		checkpoint.NoProgressDuration >= policy.MaxNoProgressDuration ||
-		usageAtLimit(checkpoint.NoProgressUsage, policy.MaxNoProgressUsage)
-	explorationLimitReached := policy.MaxExplorationTurns > 0 &&
-		checkpoint.ExplorationTurnsSinceDeliverable > policy.MaxExplorationTurns
-	if (contract.Ref.ContractID == policycatalog.ProgressInvestigationV5 ||
-		contract.Ref.ContractID == policycatalog.ProgressInvestigationV6 ||
-		contract.Ref.ContractID == policycatalog.ProgressInvestigationV7) && policy.MaxExplorationTurns > 0 {
-		explorationLimitReached = checkpoint.ExplorationTurnsSinceDeliverable >= policy.MaxExplorationTurns
-	}
-	firstDeliverableHandoffReached := usesDecisionAwareCodeChange(contract.Ref.ContractID) &&
-		policy.FirstDeliverableHandoffReserve > 0 && !checkpoint.Deadlines.Attempt.HardDeadlineAt.IsZero() &&
-		!checkpoint.UpdatedAt.IsZero() && !checkpoint.LastDeliverableProgressAt.IsZero() &&
-		checkpoint.Deadlines.Attempt.HardDeadlineAt.Sub(checkpoint.LastDeliverableProgressAt) >
-			policy.FirstDeliverableHandoffReserve &&
-		!checkpoint.UpdatedAt.Add(policy.FirstDeliverableHandoffReserve).Before(checkpoint.Deadlines.Attempt.HardDeadlineAt) &&
-		!hasRecentDeliverableProgress(contract, *checkpoint)
-	candidateRepairHandoffReached := (contract.Ref.ContractID == policycatalog.ProgressCodeChangeV11 ||
-		contract.Ref.ContractID == policycatalog.ProgressCodeChangeV12) &&
-		policy.CandidateRepairHandoffReserve > 0 && !checkpoint.Deadlines.Attempt.HardDeadlineAt.IsZero() &&
-		!checkpoint.UpdatedAt.IsZero() && hasWorkspaceMutationProgress(*checkpoint) &&
-		!hasVerificationPassAfterLatestDeliverable(contract, *checkpoint) &&
-		!checkpoint.UpdatedAt.Add(policy.CandidateRepairHandoffReserve).Before(checkpoint.Deadlines.Attempt.HardDeadlineAt)
-	investigationDeliverableHandoffReached := (contract.Ref.ContractID == policycatalog.ProgressInvestigationV5 ||
-		contract.Ref.ContractID == policycatalog.ProgressInvestigationV6 ||
-		contract.Ref.ContractID == policycatalog.ProgressInvestigationV7) &&
-		policy.FirstDeliverableHandoffReserve > 0 && !checkpoint.Deadlines.Attempt.HardDeadlineAt.IsZero() &&
-		!checkpoint.UpdatedAt.IsZero() &&
-		!checkpoint.UpdatedAt.Add(policy.FirstDeliverableHandoffReserve).Before(checkpoint.Deadlines.Attempt.HardDeadlineAt)
-	if contract.WorkClass == loopcontract.WorkFinalization && policy.MaxExplorationTurns > 0 {
-		// final-report 的“最多两个补读 turn”是硬上限：第二个新证据 settled
-		// 后，下一 Invocation 立即进入 exact report_done。code-change/v4 仍按
-		// “超过上限”语义给普通调查留出第 N 个完整 turn。
-		explorationLimitReached = checkpoint.ExplorationTurnsSinceDeliverable >= policy.MaxExplorationTurns
-	}
-	decision := loopPolicyDecision{}
-	var reason loopcontract.InterventionReason
-	switch {
-	case usesDecisionAwareCodeChange(contract.Ref.ContractID) &&
-		hasVerificationPassAfterLatestDeliverable(contract, *checkpoint):
-		checkpoint.InterventionStage = loopcontract.StageReminder
-		decision.Reminder = progressDeliverableRequiredMarker + " " +
-			renderProgressReminder(contract, *checkpoint, "deliverable_required_after_verification")
-	case candidateRepairHandoffReached:
-		checkpoint.InterventionStage = loopcontract.StageInterventionRequired
-		decision.Intervention = true
-		decision.ObservationAction = "candidate_handoff"
-		reason = loopcontract.InterventionCandidateHandoff
-	case policy.MaxDecisionStagnation > 0 &&
-		checkpoint.DecisionStagnationCount >= policy.MaxDecisionStagnation:
-		checkpoint.InterventionStage = loopcontract.StageInterventionRequired
-		decision.Intervention = true
-		decision.ObservationAction = "decision_stalled"
-		reason = loopcontract.InterventionDecisionStalled
-	case policy.MaxObservationStagnation > 0 &&
-		checkpoint.ObservationStagnationCount >= policy.MaxObservationStagnation:
-		checkpoint.InterventionStage = loopcontract.StageInterventionRequired
-		decision.Intervention = true
-		decision.ObservationAction = "observation_stalled"
-		reason = loopcontract.InterventionObservationStalled
-	case firstDeliverableHandoffReached:
-		if taskUsesObservationCheckpoint(task) && checkpoint.ObservationDeltaRef == "" {
-			checkpoint.InterventionStage = loopcontract.StageReminder
-			decision.ObservationAction = "decision_stalled"
-			decision.Reminder = observationCheckpointNotice(decision.ObservationAction,
-				"Attempt 已进入首次交付交接窗口；冻结当前假设后交 L5 recovery，不得再启动普通调查调用。")
-			return decision, nil
-		}
-		checkpoint.InterventionStage = loopcontract.StageInterventionRequired
-		decision.Intervention = true
-		decision.ObservationAction = "decision_stalled"
-		reason = loopcontract.InterventionDecisionStalled
-	case investigationDeliverableHandoffReached:
-		checkpoint.InterventionStage = loopcontract.StageReminder
-		decision.Reminder = progressDeliverableRequiredMarker + " " +
-			renderProgressReminder(contract, *checkpoint, "investigation_deadline_handoff")
-	case exhausted:
-		if taskUsesObservationCheckpoint(task) && checkpoint.ObservationDeltaRef == "" {
-			checkpoint.InterventionStage = loopcontract.StageReminder
-			decision.ObservationAction = "intervention_budget"
-			decision.Reminder = observationCheckpointNotice(decision.ObservationAction,
-				"提交有证据的 ObservationDelta 后按预算耗尽进入 intervention；不得继续普通工作。")
-			return decision, nil
-		}
-		checkpoint.InterventionStage = loopcontract.StageBlocked
-		decision.Blocked = true
-		decision.Intervention = true
-		reason = loopcontract.InterventionNoProgressBudget
-	case usesDecisionAwareCodeChange(contract.Ref.ContractID) && explorationLimitReached &&
-		!hasRecentDeliverableProgress(contract, *checkpoint):
-		if taskUsesObservationCheckpoint(task) && checkpoint.ObservationDeltaRef == "" {
-			checkpoint.InterventionStage = loopcontract.StageReminder
-			decision.ObservationAction = "decision_stalled"
-			decision.Reminder = observationCheckpointNotice(decision.ObservationAction,
-				"首次交付探索窗口已耗尽；冻结当前假设后交 L5 recovery，不得强制伪提交。")
-			return decision, nil
-		}
-		checkpoint.InterventionStage = loopcontract.StageInterventionRequired
-		decision.Intervention = true
-		decision.ObservationAction = "decision_stalled"
-		reason = loopcontract.InterventionDecisionStalled
-	case policy.DecisionCheckpointAfterTurns > 0 &&
-		checkpoint.TurnsSinceDecisionCheckpoint >= policy.DecisionCheckpointAfterTurns:
-		checkpoint.InterventionStage = loopcontract.StageRunning
-		decision.ObservationAction = "periodic"
-		if contract.Ref.ContractID == policycatalog.ProgressCodeChangeV11 ||
-			contract.Ref.ContractID == policycatalog.ProgressCodeChangeV12 {
-			decision.ObservationAction = "decision_periodic"
-		}
-		decision.Reminder = observationCheckpointNotice(decision.ObservationAction,
-			fmt.Sprintf("已累计 %d 个可评价业务 turn；冻结 decision state 后继续或介入。",
-				checkpoint.TurnsSinceDecisionCheckpoint))
-	case policy.KnowledgeCheckpointAfterTurns > 0 &&
-		checkpoint.KnowledgeTurnsSinceObservation >= policy.KnowledgeCheckpointAfterTurns:
-		checkpoint.InterventionStage = loopcontract.StageRunning
-		decision.ObservationAction = "periodic"
-		decision.Reminder = observationCheckpointNotice("periodic",
-			fmt.Sprintf("已累计 %d 个新知识 turn；冻结事实后继续业务工作，不得提交终态。",
-				checkpoint.KnowledgeTurnsSinceObservation))
-	case explorationLimitReached:
-		// Novel evidence is real progress and must never be mislabeled as exhausted.
-		// Crossing the exploration allowance enters a mechanically forced delivery
-		// phase: the next ToolRouter exposes only submit_task_result；L3 收窄
-		// model-visible history，Model Invocation 对该机械提交轮使用 none+exact，
-		// 所以 Agent 必须提交 pass/fixable/blocked，而不是
-		// continuing to browse indefinitely.
-		checkpoint.InterventionStage = loopcontract.StageReminder
-		decision.Reminder = progressDeliverableRequiredMarker + " " +
-			renderProgressReminder(contract, *checkpoint, "deliverable_required")
-	case checkpoint.NoProgressTurns >= policy.InterventionAfterTurns &&
-		task != nil && task.GraphID != "" && hasRecentDeliverableProgress(contract, *checkpoint):
-		// 已有文件/结构化结果等契约认可的交付时，阈值的意义是
-		// 停止继续调查并提交，而不是把已完成的工作标为 blocked。
-		checkpoint.InterventionStage = loopcontract.StageReminder
-		decision.Reminder = progressDeliverableRequiredMarker + " " +
-			renderProgressReminder(contract, *checkpoint, "deliverable_required_after_progress")
-	case checkpoint.NoProgressTurns >= policy.InterventionAfterTurns:
-		if taskUsesObservationCheckpoint(task) && checkpoint.ObservationDeltaRef == "" {
-			checkpoint.InterventionStage = loopcontract.StageReminder
-			decision.ObservationAction = "intervention_stalled"
-			decision.Reminder = observationCheckpointNotice(decision.ObservationAction,
-				"提交有证据的 ObservationDelta 后进入 intervention；不得继续普通工作。")
-			return decision, nil
-		}
-		checkpoint.InterventionStage = loopcontract.StageInterventionRequired
-		decision.Intervention = true
-		reason = loopcontract.InterventionNoProgressStalled
-	case checkpoint.NoProgressTurns >= policy.RolloverAfterTurns &&
-		checkpoint.AttemptRolloverCount < policy.MaxAttemptRollovers:
-		checkpoint.InterventionStage = loopcontract.StageAttemptRollover
-		decision.Rollover = true
-		decision.Reminder = renderProgressReminder(contract, *checkpoint, "attempt_rollover")
-	case checkpoint.NoProgressTurns >= policy.ReminderAfterTurns:
-		checkpoint.InterventionStage = loopcontract.StageReminder
-		decision.Reminder = renderProgressReminder(contract, *checkpoint, "reminder")
-	case checkpoint.NoProgressTurns == 0:
-		checkpoint.InterventionStage = loopcontract.StageRunning
-	}
-	if !decision.Intervention {
-		return decision, nil
-	}
-	checkpoint.InterventionCount++
-	checkpoint.LastInterventionAt = checkpoint.UpdatedAt
-	command := buildLoopIntervention(contract, task, *checkpoint, reason)
-	return decision, &command
-}
-
-func taskUsesObservationCheckpoint(task *model.Task) bool {
-	if task == nil || task.ProgressContract == nil {
-		return false
-	}
-	if task.GraphControllerRole == string(graph.ControllerRoleLoopRecovery) {
-		return false
-	}
-	return task.ProgressContract.Policy.KnowledgeCheckpointAfterTurns > 0 ||
-		task.ProgressContract.Ref.ContractID == policycatalog.ProgressCodeChangeV4
-}
-
-func (r *loopProgressRuntime) appendObservationIntervention(task *model.Task,
-	reason loopcontract.InterventionReason) error {
-	if r == nil || task == nil || r.store == nil {
-		return fmt.Errorf("Observation intervention 缺少 Loop authority")
-	}
-	now := time.Now().UTC()
-	next := r.checkpoint
-	next.Version++
-	next.CheckpointID = stableLoopID("checkpoint", task.ID, task.AttemptID,
-		fmt.Sprintf("%d-observation-intervention", next.Version))
-	next.InterventionStage = loopcontract.StageInterventionRequired
-	next.InterventionCount++
-	next.LastInterventionAt = now
-	next.UpdatedAt = now
-	command := buildLoopIntervention(*task.ProgressContract, task, next, reason)
-	if err := r.store.AppendIntervention(next, command); err != nil {
-		return err
-	}
-	r.checkpoint = next
-	return nil
-}
-
-func hasRecentDeliverableProgress(contract loopcontract.CompiledProgressContract,
-	checkpoint loopcontract.ProgressCheckpoint,
-) bool {
-	deliverableKinds := make(map[loopcontract.ProgressSignalKind]struct{})
-	for _, rule := range contract.AcceptedSignals {
-		if rule.Deliverable {
-			deliverableKinds[rule.Kind] = struct{}{}
-		}
-	}
-	for _, fingerprint := range checkpoint.RecentFingerprints {
-		if _, ok := deliverableKinds[fingerprint.Kind]; ok {
-			return true
-		}
-	}
-	return false
-}
-
-func hasWorkspaceMutationProgress(checkpoint loopcontract.ProgressCheckpoint) bool {
-	for _, fingerprint := range checkpoint.RecentFingerprints {
-		if fingerprint.Kind == loopcontract.SignalFileVersionChanged ||
-			fingerprint.Kind == loopcontract.SignalArtifactRegistered ||
-			fingerprint.Kind == loopcontract.SignalArtifactVersionChanged {
-			return true
-		}
-	}
-	return false
-}
-
-func hasVerificationPassAfterLatestDeliverable(contract loopcontract.CompiledProgressContract,
-	checkpoint loopcontract.ProgressCheckpoint,
-) bool {
-	deliverableKinds := make(map[loopcontract.ProgressSignalKind]struct{})
-	for _, rule := range contract.AcceptedSignals {
-		if rule.Deliverable {
-			deliverableKinds[rule.Kind] = struct{}{}
-		}
-	}
-	latestDeliverable := -1
-	for index, fingerprint := range checkpoint.RecentFingerprints {
-		if _, ok := deliverableKinds[fingerprint.Kind]; ok {
-			latestDeliverable = index
-		}
-	}
-	if latestDeliverable < 0 {
-		return false
-	}
-	for index := latestDeliverable + 1; index < len(checkpoint.RecentFingerprints); index++ {
-		if checkpoint.RecentFingerprints[index].Kind == loopcontract.SignalEvaluationPassed {
-			return true
-		}
-	}
-	return false
-}
-
-func renderProgressReminder(contract loopcontract.CompiledProgressContract,
-	checkpoint loopcontract.ProgressCheckpoint, stage string) string {
-	missing := make([]string, 0, len(contract.Deliverables)+len(contract.VerificationTargets))
-	for _, deliverable := range contract.Deliverables {
-		if deliverable.Required {
-			missing = append(missing, deliverable.ID)
-		}
-	}
-	for _, verification := range contract.VerificationTargets {
-		if verification.Required {
-			missing = append(missing, verification.ID)
-		}
-	}
-	return fmt.Sprintf("<loop-reminder source=\"control-plane\" stage=%q>\n"+
-		"当前 Attempt 已连续 %d 个 Turn 未形成契约认可的目标进展；缺失里程碑：%s。\n"+
-		"decision_stagnation=%d；重复 read/grep 只更新知识，不会重置该计数。\n"+
-		"不要重复相同 read/grep/shell；请选择能产生新交付、验证改善或结构化结果的下一动作。\n"+
-		"剩余动作必须遵守冻结 ProgressContract=%s。\n</loop-reminder>",
-		stage, checkpoint.NoProgressTurns, strings.Join(missing, ","), checkpoint.DecisionStagnationCount,
-		contract.Ref.ContractID)
 }
 
 func buildLoopIntervention(contract loopcontract.CompiledProgressContract, task *model.Task,
@@ -1259,8 +862,7 @@ func buildLoopIntervention(contract loopcontract.CompiledProgressContract, task 
 			missing = append(missing, verification.ID)
 		}
 	}
-	remaining := remainingBudget(contract.Policy.MaxNoProgressUsage, checkpoint.NoProgressUsage)
-	remaining.Attempts = positiveInt64(contract.Policy.MaxNoProgressUsage.Attempts - checkpoint.CumulativeUsage.Attempts)
+	remaining := runcontract.BudgetLimit{}
 	return loopcontract.LoopInterventionRequested{
 		Schema: loopcontract.InterventionSchemaV1,
 		CommandID: stableLoopID("intervention", task.ID, checkpoint.AttemptID,
@@ -1385,13 +987,7 @@ func (a *Agent) blockForLoopControl(task *model.Task, taskID, reason, cause stri
 
 func isCoordinationTool(name string) bool {
 	switch name {
-	case "submit_graph", "patch_graph",
-		"create_graph_draft", "configure_simple_graph_draft", "read_graph_draft", "patch_graph_draft",
-		"validate_graph_draft", "validate_current_graph_draft", "commit_graph_draft", "commit_current_graph_draft",
-		"start_graph", "start_current_graph",
-		"propose_graph_change", "read_graph_change", "validate_graph_change", "commit_graph_change",
-		"submit_graph_change_decision",
-		"publish_task", "send_message", "request_replan", "submit_change_decision", "submit_task_result", "report_done":
+	case "apply_graph_change", "control_graph", "send_message", "request_replan", "request_user_input", "submit_task_result":
 		return true
 	default:
 		return false

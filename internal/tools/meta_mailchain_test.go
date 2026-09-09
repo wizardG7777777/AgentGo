@@ -2,7 +2,6 @@ package tools
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"agentgo/internal/agent"
@@ -16,14 +15,14 @@ import (
 
 // TestSendMessage_ChainDepth_NilStore_DefaultsToZero 验证当 Store=nil 时，
 // send_message 仍能工作，但 ChainDepth 退化为 0。
-// 这是防御性编程的测试——虽然 MetaGroup 构造时 Store 不应为 nil，但代码有兜底。
+// 这是防御性编程的测试——虽然 CommunicationGroup 构造时 Store 不应为 nil，但代码有兜底。
 func TestSendMessage_ChainDepth_NilStore_DefaultsToZero(t *testing.T) {
 	mbReg := mailbox.NewRegistry(8)
 	mbReg.Register("sender", "")
 	recvBox := mbReg.Register("receiver", "")
 
 	// Holder 非 nil 但 Store 为 nil → 无法读取 parent.MailChainDepth → 退化为 0
-	g := MetaGroup{
+	g := CommunicationGroup{
 		MBRegistry: mbReg,
 		AgentID:    "sender",
 		Holder:     &fakeHolder{id: "current"},
@@ -57,7 +56,7 @@ func TestSendMessage_ChainDepth_LargeValue(t *testing.T) {
 	parent := &model.Task{ID: "current", MailChainDepth: 9998}
 	s.tasks[parent.ID] = parent
 
-	g := MetaGroup{
+	g := CommunicationGroup{
 		MBRegistry: mbReg,
 		AgentID:    "sender",
 		Holder:     &fakeHolder{id: "current"},
@@ -82,9 +81,9 @@ func TestSendMessage_ChainDepth_LargeValue(t *testing.T) {
 
 // ---- B3/B6 集成测试：sendMessage + ChainDepthLimitHook ----
 
-// TestSendMessage_WithChainDepthLimitHook_BlocksDeepMessage 验证 sendMessage 写入的
-// ChainDepth 能被 ChainDepthLimitHook 正确读取并截断。
-func TestSendMessage_WithChainDepthLimitHook_BlocksDeepMessage(t *testing.T) {
+// 信息消息保留链深度审计，但不再受自动唤醒链的深度上限约束。
+
+func TestSendMessage_WithChainDepthLimitHook_DeliversInformation(t *testing.T) {
 	// 准备 hook 系统（maxDepth=2）
 	hkReg := hook.NewMailboxHookRegistry()
 	if err := hkReg.Register(builtin.NewChainDepthLimitHook(2)); err != nil {
@@ -97,12 +96,12 @@ func TestSendMessage_WithChainDepthLimitHook_BlocksDeepMessage(t *testing.T) {
 	mbReg.Register("sender", "")
 	recvBox := mbReg.Register("receiver", "")
 
-	// 当前任务 MailChainDepth=2，期望 outgoing.ChainDepth=3 > max=2，应被截断
+	// 当前任务 MailChainDepth=2，outgoing.ChainDepth=3 仍只用于审计
 	s := newFakeStore()
 	parent := &model.Task{ID: "current", MailChainDepth: 2}
 	s.tasks[parent.ID] = parent
 
-	g := MetaGroup{
+	g := CommunicationGroup{
 		MBRegistry: mbReg,
 		AgentID:    "sender",
 		Holder:     &fakeHolder{id: "current"},
@@ -116,20 +115,14 @@ func TestSendMessage_WithChainDepthLimitHook_BlocksDeepMessage(t *testing.T) {
 		"content": "超深消息",
 	}))
 
-	// 应被 ChainDepthLimitHook 拒绝
-	if err == nil {
-		t.Fatal("期望消息被 ChainDepthLimitHook 拒绝，实际通过")
+	if err != nil {
+		t.Fatalf("信息投递不应被唤醒链深度拒绝：%v", err)
 	}
-	// 验证错误包含 hook 信息
-	if !strings.Contains(err.Error(), "chain-depth-limit") && !strings.Contains(err.Error(), "超过") {
-		t.Errorf("错误信息应说明被 depth limit 拒绝，实际: %v", err)
+	msgs := recvBox.Drain()
+	if len(msgs) != 1 || !msgs[0].DeliveryOnly || msgs[0].ChainDepth != 3 {
+		t.Fatalf("信息投递事实丢失：%v", msgs)
 	}
 
-	// 消息不应进入收件箱
-	msgs := recvBox.Drain()
-	if len(msgs) != 0 {
-		t.Errorf("被拒绝的消息不应进入收件箱，实际: %d", len(msgs))
-	}
 }
 
 // TestSendMessage_WithChainDepthLimitHook_AllowsShallowMessage 验证正常深度的
@@ -151,7 +144,7 @@ func TestSendMessage_WithChainDepthLimitHook_AllowsShallowMessage(t *testing.T) 
 	parent := &model.Task{ID: "current", MailChainDepth: 2}
 	s.tasks[parent.ID] = parent
 
-	g := MetaGroup{
+	g := CommunicationGroup{
 		MBRegistry: mbReg,
 		AgentID:    "sender",
 		Holder:     &fakeHolder{id: "current"},
@@ -175,7 +168,7 @@ func TestSendMessage_WithChainDepthLimitHook_AllowsShallowMessage(t *testing.T) 
 }
 
 // TestSendMessage_BroadcastWithChainDepthLimit 验证广播场景下 ChainDepthLimitHook
-// 能正确截断所有收件人的消息。
+// 不会截断仅传递信息的广播。
 func TestSendMessage_BroadcastWithChainDepthLimit(t *testing.T) {
 	hkReg := hook.NewMailboxHookRegistry()
 	if err := hkReg.Register(builtin.NewChainDepthLimitHook(2)); err != nil {
@@ -190,12 +183,12 @@ func TestSendMessage_BroadcastWithChainDepthLimit(t *testing.T) {
 	boxB := mbReg.Register("b", "")
 	boxC := mbReg.Register("c", "")
 
-	// parent.MailChainDepth=5 → outgoing=6 > max=2，广播应整体被拒绝
+	// parent.MailChainDepth=5 → outgoing=6 > max=2，广播仍应完整投递
 	s := newFakeStore()
 	parent := &model.Task{ID: "current", MailChainDepth: 5}
 	s.tasks[parent.ID] = parent
 
-	g := MetaGroup{
+	g := CommunicationGroup{
 		MBRegistry: mbReg,
 		AgentID:    "sender",
 		Holder:     &fakeHolder{id: "current"},
@@ -209,20 +202,16 @@ func TestSendMessage_BroadcastWithChainDepthLimit(t *testing.T) {
 		"content": "超深广播",
 	}))
 
-	if err == nil {
-		t.Fatal("超深广播应被 BeforeSend 拒绝")
+	if err != nil {
+		t.Fatalf("信息广播不应被唤醒链深度拒绝：%v", err)
+	}
+	for _, box := range []*mailbox.Mailbox{boxA, boxB, boxC} {
+		got := box.Drain()
+		if len(got) != 1 || !got[0].DeliveryOnly || got[0].ChainDepth != 6 {
+			t.Fatalf("广播未完整投递：%v", got)
+		}
 	}
 
-	// 所有收件箱都应为空
-	if got := boxA.Drain(); len(got) != 0 {
-		t.Errorf("a 不应收到消息，实际: %d", len(got))
-	}
-	if got := boxB.Drain(); len(got) != 0 {
-		t.Errorf("b 不应收到消息，实际: %d", len(got))
-	}
-	if got := boxC.Drain(); len(got) != 0 {
-		t.Errorf("c 不应收到消息，实际: %d", len(got))
-	}
 }
 
 // ---- 完整链路测试：sendMessage → mailbox → hook → 截断/放行 ----
@@ -249,7 +238,7 @@ func TestSendMessage_FullChain_DepthTracking(t *testing.T) {
 	s := newFakeStore()
 	s.tasks["scheduler-task"] = &model.Task{ID: "scheduler-task", MailChainDepth: 0}
 
-	gSched := MetaGroup{
+	gSched := CommunicationGroup{
 		MBRegistry: mbReg,
 		AgentID:    "scheduler",
 		Holder:     &fakeHolder{id: "scheduler-task"},
@@ -272,7 +261,7 @@ func TestSendMessage_FullChain_DepthTracking(t *testing.T) {
 
 	// Step 2: A 回复 B（ChainDepth 继承 1 → 2）
 	s.tasks["task-A"] = &model.Task{ID: "task-A", MailChainDepth: 1} // A 被 depth=1 的邮件唤醒
-	gA := MetaGroup{
+	gA := CommunicationGroup{
 		MBRegistry: mbReg,
 		AgentID:    "worker-A",
 		Holder:     &fakeHolder{id: "task-A"},
@@ -293,9 +282,9 @@ func TestSendMessage_FullChain_DepthTracking(t *testing.T) {
 		t.Fatalf("Step 2: B 应收到 depth=2，实际: %+v", msgs)
 	}
 
-	// Step 3: B 回复 A（ChainDepth 继承 2 → 3 > max=2，应被截断）
+	// Step 3: B 回复 A（ChainDepth 继承 2 → 3 > max=2，仍应投递）
 	s.tasks["task-B"] = &model.Task{ID: "task-B", MailChainDepth: 2}
-	gB := MetaGroup{
+	gB := CommunicationGroup{
 		MBRegistry: mbReg,
 		AgentID:    "worker-B",
 		Holder:     &fakeHolder{id: "task-B"},
@@ -308,11 +297,12 @@ func TestSendMessage_FullChain_DepthTracking(t *testing.T) {
 		"to":      "worker-A",
 		"content": "再回复 A",
 	}))
-	if err == nil {
-		t.Fatal("Step 3 (depth=3 > max=2) 应被截断")
+	if err != nil {
+		t.Fatalf("后续信息回复不应被旧阈值截断：%v", err)
 	}
 	msgs = boxA.Drain()
-	if len(msgs) != 0 {
-		t.Errorf("Step 3: A 不应收到超深消息，实际: %d", len(msgs))
+	if len(msgs) != 1 || !msgs[0].DeliveryOnly || msgs[0].ChainDepth != 3 {
+		t.Fatalf("回复事实丢失：%v", msgs)
 	}
+
 }

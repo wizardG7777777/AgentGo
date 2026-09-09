@@ -121,14 +121,14 @@ type ContractRequirement struct {
 // durable/CAS；effect、artifact、check、acceptance 路径覆盖由 C2 compiler
 // 机械校验。
 type GraphContract struct {
-	RequestRef         string                `json:"request_ref,omitempty"`
-	RequestDigest      string                `json:"request_digest"`
-	ExecutionClass     ExecutionClass        `json:"execution_class"`
-	Deliverables       []ContractRequirement `json:"deliverables"`
-	Constraints        []string              `json:"constraints,omitempty"`
-	RequiredEffects    []string              `json:"required_effects,omitempty"`
-	RequiredArtifacts  []ContractRequirement `json:"required_artifacts,omitempty"`
-	RequiredChecks     []ContractRequirement `json:"required_checks,omitempty"`
+	RequestRef        string                `json:"request_ref,omitempty"`
+	RequestDigest     string                `json:"request_digest"`
+	ExecutionClass    ExecutionClass        `json:"execution_class"`
+	Deliverables      []ContractRequirement `json:"deliverables"`
+	Constraints       []string              `json:"constraints,omitempty"`
+	RequiredEffects   []string              `json:"required_effects,omitempty"`
+	RequiredArtifacts []ContractRequirement `json:"required_artifacts,omitempty"`
+
 	RequiresAcceptance bool                  `json:"requires_acceptance,omitempty"`
 	SuccessEvidence    []ContractRequirement `json:"success_evidence,omitempty"`
 }
@@ -191,10 +191,10 @@ type NodeOutputContract struct {
 // 必须指向 Contract 中真实存在的 ID/kind，且 compiler 会检查所有 success path
 // 不得绕过 required binding。
 type GraphContractBindings struct {
-	Deliverables    []string `json:"deliverables,omitempty"`
-	Effects         []string `json:"effects,omitempty"`
-	Artifacts       []string `json:"artifacts,omitempty"`
-	Checks          []string `json:"checks,omitempty"`
+	Deliverables []string `json:"deliverables,omitempty"`
+	Effects      []string `json:"effects,omitempty"`
+	Artifacts    []string `json:"artifacts,omitempty"`
+
 	SuccessEvidence []string `json:"success_evidence,omitempty"`
 }
 
@@ -481,7 +481,7 @@ func normalizeGraphContract(in GraphContract) GraphContract {
 	out.Constraints = append([]string{}, in.Constraints...)
 	out.RequiredEffects = append([]string{}, in.RequiredEffects...)
 	out.RequiredArtifacts = append([]ContractRequirement{}, in.RequiredArtifacts...)
-	out.RequiredChecks = append([]ContractRequirement{}, in.RequiredChecks...)
+
 	out.SuccessEvidence = append([]ContractRequirement{}, in.SuccessEvidence...)
 	return out
 }
@@ -500,10 +500,9 @@ func normalizeContractBindings(in GraphContractBindings) GraphContractBindings {
 		Deliverables:    append([]string{}, in.Deliverables...),
 		Effects:         append([]string{}, in.Effects...),
 		Artifacts:       append([]string{}, in.Artifacts...),
-		Checks:          append([]string{}, in.Checks...),
 		SuccessEvidence: append([]string{}, in.SuccessEvidence...),
 	}
-	for _, values := range [][]string{out.Deliverables, out.Effects, out.Artifacts, out.Checks, out.SuccessEvidence} {
+	for _, values := range [][]string{out.Deliverables, out.Effects, out.Artifacts, out.SuccessEvidence} {
 		sort.Strings(values)
 	}
 	return out

@@ -45,8 +45,8 @@ func TestValidateExpectedHashHook_Metadata(t *testing.T) {
 func TestValidateExpectedHashHook_Matches(t *testing.T) {
 	h := NewValidateExpectedHashHook()
 	cases := map[string]bool{
-		"write_file":  true,
-		"edit_file":   true,
+		"apply_change": true,
+
 		"read_file":   false,
 		"list_dir":    false,
 		"grep_search": false,
@@ -67,7 +67,7 @@ func TestValidateExpectedHashHook_Matches(t *testing.T) {
 func TestValidateExpectedHashHook_NoHashContinues(t *testing.T) {
 	h := NewValidateExpectedHashHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": "/anywhere/x.md", "content": "x"},
 	})
 	if d.Action != hook.Continue {
@@ -78,7 +78,7 @@ func TestValidateExpectedHashHook_NoHashContinues(t *testing.T) {
 func TestValidateExpectedHashHook_EmptyHashContinues(t *testing.T) {
 	h := NewValidateExpectedHashHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": "/anywhere/x.md", "expected_hash": ""},
 	})
 	if d.Action != hook.Continue {
@@ -90,7 +90,7 @@ func TestValidateExpectedHashHook_MissingPathContinues(t *testing.T) {
 	// path 缺失 → 让其他 hook (PathBoundary) 或工具自报错
 	h := NewValidateExpectedHashHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"expected_hash": "deadbeef"},
 	})
 	if d.Action != hook.Continue {
@@ -104,7 +104,7 @@ func TestValidateExpectedHashHook_FileNotExistContinues(t *testing.T) {
 	h := NewValidateExpectedHashHook()
 	missing := filepath.Join(t.TempDir(), "never-existed.md")
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"path":          missing,
 			"expected_hash": "any-hash-the-llm-might-pass",
@@ -121,7 +121,7 @@ func TestValidateExpectedHashHook_HashMatchContinues(t *testing.T) {
 	path, hashHex := makeFileWithHash(t, "original content")
 	h := NewValidateExpectedHashHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"path":          path,
 			"expected_hash": hashHex,
@@ -134,11 +134,11 @@ func TestValidateExpectedHashHook_HashMatchContinues(t *testing.T) {
 }
 
 func TestValidateExpectedHashHook_EditFileHashMatchContinues(t *testing.T) {
-	// edit_file 也走完全相同的校验路径
+	// apply_change 也走完全相同的校验路径
 	path, hashHex := makeFileWithHash(t, "alpha beta")
 	h := NewValidateExpectedHashHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "edit_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"path":          path,
 			"expected_hash": hashHex,
@@ -147,7 +147,7 @@ func TestValidateExpectedHashHook_EditFileHashMatchContinues(t *testing.T) {
 		},
 	})
 	if d.Action != hook.Continue {
-		t.Errorf("edit_file with matching hash: Action = %v, want Continue", d.Action)
+		t.Errorf("apply_change with matching hash: Action = %v, want Continue", d.Action)
 	}
 }
 
@@ -157,7 +157,7 @@ func TestValidateExpectedHashHook_HashMismatchAborts(t *testing.T) {
 	path, _ := makeFileWithHash(t, "original content")
 	h := NewValidateExpectedHashHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"path":          path,
 			"expected_hash": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
@@ -182,7 +182,7 @@ func TestValidateExpectedHashHook_EditFileHashMismatchAborts(t *testing.T) {
 	path, _ := makeFileWithHash(t, "hello world")
 	h := NewValidateExpectedHashHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "edit_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"path":          path,
 			"expected_hash": "wrong-hash",
@@ -191,7 +191,7 @@ func TestValidateExpectedHashHook_EditFileHashMismatchAborts(t *testing.T) {
 		},
 	})
 	if d.Action != hook.Abort {
-		t.Errorf("edit_file Action = %v, want Abort on hash mismatch", d.Action)
+		t.Errorf("apply_change Action = %v, want Abort on hash mismatch", d.Action)
 	}
 }
 
@@ -203,7 +203,7 @@ func TestValidateExpectedHashHook_PermissionErrorAborts(t *testing.T) {
 	tmp := t.TempDir() // 路径是个目录，不是普通文件
 	h := NewValidateExpectedHashHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"path":          tmp,
 			"expected_hash": "any",
@@ -223,7 +223,7 @@ func TestValidateExpectedHashHook_NonStringHashContinues(t *testing.T) {
 	// 然后被 "expectedHash == ''" 分支跳过校验。
 	h := NewValidateExpectedHashHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"path":          "/anywhere/x.md",
 			"expected_hash": 123, // 不是字符串
@@ -243,7 +243,7 @@ func TestValidateExpectedHashHook_ViaRegistry(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 	d := reg.RunPre(hook.ToolHookContext{
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"path":          path,
 			"expected_hash": "wrong",
@@ -263,7 +263,7 @@ func TestValidateExpectedHashHook_LineAnchorsSkips(t *testing.T) {
 
 	// expected_hash 故意给错，但同时提供 line_anchors → 应放行
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"path":          path,
 			"expected_hash": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
@@ -294,7 +294,7 @@ func TestValidateExpectedHashHook_ResolvePhysicalPath(t *testing.T) {
 	// 用副本的 hash → Continue（若误读主根会 Abort）
 	d := h.Run(hook.ToolHookContext{
 		TaskID:   "t1",
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": mainPath, "expected_hash": wsHash},
 	})
 	if d.Action != hook.Continue {
@@ -305,7 +305,7 @@ func TestValidateExpectedHashHook_ResolvePhysicalPath(t *testing.T) {
 	h2 := NewValidateExpectedHashHook()
 	d2 := h2.Run(hook.ToolHookContext{
 		TaskID:   "t1",
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": mainPath, "expected_hash": wsHash},
 	})
 	if d2.Action != hook.Abort {

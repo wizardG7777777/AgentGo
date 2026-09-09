@@ -72,10 +72,6 @@ type EvidenceFact struct {
 	Path          string `json:"path,omitempty"`
 	PathTruncated bool   `json:"path_truncated,omitempty"`
 
-	CheckRef             string `json:"check_ref,omitempty"`
-	CheckID              string `json:"check_id,omitempty"`
-	CheckKind            string `json:"check_kind,omitempty"`
-	CheckStatus          string `json:"check_status,omitempty"`
 	WorkspaceRevisionRef string `json:"workspace_revision_ref,omitempty"`
 	OutputRef            string `json:"output_ref,omitempty"`
 }
@@ -302,12 +298,7 @@ func validateFacts(o TaskOutcome) error {
 			fact.ExitCodeScope != "last_pipeline_command" {
 			return fmt.Errorf("TaskOutcome evidence_facts exit_code_scope=%q 无效", fact.ExitCodeScope)
 		}
-		if fact.Kind == "check" && (strings.TrimSpace(fact.CheckRef) == "" ||
-			strings.TrimSpace(fact.CheckID) == "" || strings.TrimSpace(fact.CheckKind) == "" ||
-			strings.TrimSpace(fact.WorkspaceRevisionRef) == "" ||
-			(fact.CheckStatus != "pass" && fact.CheckStatus != "failed")) {
-			return fmt.Errorf("TaskOutcome check evidence 结构化字段不完整")
-		}
+
 	}
 	if !sameRefSet(o.EvidenceRefs, evidence) {
 		return fmt.Errorf("TaskOutcome evidence_refs 与 evidence_facts 必须 exact-set 匹配")

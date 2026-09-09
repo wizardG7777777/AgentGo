@@ -45,15 +45,15 @@ func publishNewRunSchedulerTask(t *testing.T, s store.TaskStore, id string) *mod
 	if err != nil {
 		t.Fatal(err)
 	}
-	progress, ok := catalog.ProgressContract(policycatalog.ProgressCoordinationV1)
+	progress, ok := catalog.ProgressContract(policycatalog.ProgressCoordinationCurrent)
 	if !ok {
 		t.Fatal("缺少 coordination ProgressContract")
 	}
 	now := time.Now().UTC()
 	run := &runcontract.RunContract{
-		Schema: runcontract.SchemaV1, RunID: runcontract.RunID("run-" + id), CreatedAt: now,
-		DeadlineAt: now.Add(time.Hour), FinalizationReserve: time.Minute,
-		RecoveryReserve: time.Minute, BudgetProfile: "test/v1",
+		Schema: runcontract.SchemaCurrent, RunID: runcontract.RunID("run-" + id), CreatedAt: now,
+		DeadlineAt:    now.Add(time.Hour),
+		BudgetProfile: "test/v1",
 	}
 	task := &model.Task{
 		ID: id, Description: "用户请求", EventType: "__scheduler__", EventSource: "user",

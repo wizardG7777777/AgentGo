@@ -15,18 +15,7 @@ func TestLoadExternalTemplatesNamespacesPromptAndDefaults(t *testing.T) {
 
 	userDir := t.TempDir()
 	projectDir := t.TempDir()
-	writeTestFile(t, filepath.Join(userDir, "writer.yaml"), `
-name: writer
-version: 2
-description: Project writer
-capabilities: [editing, testing]
-tools: [read_file, write_file]
-model: custom-model
-system_prompt: |
-  Work carefully.
-limits:
-  max_replicas: 2
-`)
+	writeTestFile(t, filepath.Join(userDir, "writer.yaml"), "\nname: writer\nversion: 2\ndescription: Project writer\ncapabilities: [editing, testing]\ntools: [read_file, apply_change]\nmodel: custom-model\nsystem_prompt: |\n  Work carefully.\nlimits:\n  max_replicas: 2\n")
 	writeTestFile(t, filepath.Join(projectDir, "prompt.md"), "Prompt loaded from a file.\n")
 	writeTestFile(t, filepath.Join(projectDir, "auditor.yml"), `
 name: auditor
@@ -80,7 +69,7 @@ limits:
 		refs = append(refs, item.Ref)
 	}
 	want := []string{
-		"builtin/explorer@1", "builtin/generalist@1", "builtin/verifier@1",
+		"builtin/explorer@2", "builtin/generalist@2", "builtin/verifier@2",
 		"project/auditor@1", "user/writer@2",
 	}
 	if !reflect.DeepEqual(refs, want) {
@@ -116,7 +105,7 @@ func TestLoadResolvesDefaultModelIntoDigest(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Load(%q): %v", model, err)
 		}
-		resolved, err := catalog.Resolve("builtin/generalist@1")
+		resolved, err := catalog.Resolve("builtin/generalist@2")
 		if err != nil {
 			t.Fatalf("Resolve(%q): %v", model, err)
 		}

@@ -19,19 +19,8 @@ import (
 	"agentgo/internal/trace"
 )
 
-// LocalWriteGroup 提供会修改本地文件系统的工具集合：
-//   - write_file：整文件写入，支持可选的乐观并发 hash 校验
-//   - edit_file ：精准 old_str -> new_str 单次替换
-//
-// 通过嵌入 LocalReadGroup 继承 Workdir 与 Cache 依赖，
-// 保持与只读工具共用的 workdir 解析和缓存失效语义一致。
-//
-// 两个工具都在调用 Roster.TryClaim 获取文件写入权之后才读取文件内容，
-// 严格遵循「先锁后读」的顺序，避免 TOCTOU 竞态。
-//
-// ArtifactStore 是写工具的正确性依赖：任务内 write/edit 在返回成功前
-// 必须把产物事实同步登记。record-artifact Async Reactor 仍作兼容观察器，
-// 但不再是 task.Artifacts / Graph artifact Evidence 的正确性权威。
+// LocalWriteGroup 提供统一文件变更入口，持有路径、并发、产物和副作用记录依赖。
+// 写入与替换共享一次加锁、版本验证、落盘和结算流程。
 type LocalWriteGroup struct {
 	LocalReadGroup               // embed: 继承 Workdir + Cache
 	Roster         roster.Roster // required
@@ -41,7 +30,7 @@ type LocalWriteGroup struct {
 	}
 	WaitTimeoutSec int // §8.3：文件冲突排队等待秒数，0 = 不排队（旧行为）
 	// EffectJournal 是 V6 §4 H2b 副作用账本（internal/effect）；
-	// nil 时 write_file/edit_file 不记账（行为与引入账本前完全一致）。
+	// nil 时不记录副作用，仅供无任务上下文的工具测试使用。
 	EffectJournal *effect.Journal
 }
 
@@ -114,28 +103,18 @@ func rejectRuntimeStateWrite(absPath, projectRoot string) error {
 	return nil
 }
 
-// Register 把 write_file / edit_file 注册到 r。
+// Register 只注册 apply_change，不保留旧写入工具别名。
 func (g LocalWriteGroup) Register(r *agent.ToolRegistry) {
-	r.Register("write_file", "写入文件内容（覆盖式），支持可选的乐观并发 hash 校验",
-		schema.Object().
-			String("path", "文件路径", true).
-			String("content", "要写入的内容", true).
-			String("expected_hash", "期望的当前文件 SHA256 哈希；若提供且与实际不符则拒绝写入（用于乐观并发控制）", false).
-			Build(),
-		g.writeFile,
-	)
-
-	r.Register("edit_file", "在文件中做精准的 old_str -> new_str 单次替换。可选提供 line_anchors 做行级哈希校验（比 expected_hash 更细粒度）；提供 line_anchors 时 expected_hash 会被忽略。",
-		schema.Object().
-			String("path", "文件路径", true).
-			String("old_str", "要替换的旧字符串（必须在文件中唯一匹配）", true).
-			String("new_str", "替换后的新字符串", true).
-			String("expected_hash", "期望的当前文件 SHA256 哈希", false).
-			StringArray("line_anchors",
-				"行哈希锚点列表，如 [\"12#VK\",\"13#QZ\"]。提供时 expected_hash 会被忽略；任一行哈希失配则拒绝并返回当前哈希。", false).
-			Build(),
-		g.editFile,
-	)
+	params := schema.Object().
+		String("path", "项目相对文件路径", true).
+		Enum("operation", "write=创建或覆盖，create=仅新建，replace=精确替换；省略时由 content 或 old_str 确定", []string{"write", "create", "replace"}, false).
+		String("content", "创建或覆盖后的完整文件内容，可以为空字符串", false).
+		String("old_str", "精确替换的原文，必须唯一匹配", false).
+		String("new_str", "替换后的内容，可以为空字符串", false).
+		String("expected_hash", "读取时获得的 SHA256，提供时必须与当前文件一致", false).
+		StringArray("line_anchors", "替换操作使用的行哈希锚点", false).Build()
+	params["additionalProperties"] = false
+	r.Register("apply_change", "创建、覆盖或精确修改项目文件。返回实际文件变更事实，不修改图定义。", params, g.applyChange)
 }
 
 // claimOrWait 尝试 TryClaim；失败时排队等待前任释放后重试一次。
@@ -225,283 +204,224 @@ func (g LocalWriteGroup) resolveWritePath(logicalPath string) (physicalPath stri
 	return logicalPath, false, nil
 }
 
-// writeFile 实现 write_file 工具。端口自 worker.makeWriteFileTool。
-// 严格顺序：validate → claimOrWait → (defer Release) → MkdirAll → WriteFile → 缓存失效。
-// 注：expected_hash 校验在 C7 后由 ValidateExpectedHashHook 接管，不再在工具内部读取。
-func (g LocalWriteGroup) writeFile(ctx context.Context, args map[string]any) (string, error) {
+// applyChange 在一个执行事务中完成输入校验、读取、变换、写入和事实记录。
+func (g LocalWriteGroup) applyChange(ctx context.Context, args map[string]any) (string, error) {
+	for _, key := range []string{"path", "operation", "content", "old_str", "new_str", "expected_hash"} {
+		if value, present := args[key]; present {
+			if _, valid := value.(string); !valid {
+				return "", fmt.Errorf("apply_change 参数 %s 必须是字符串", key)
+			}
+		}
+	}
 	path, _ := args["path"].(string)
-	content, _ := args["content"].(string)
 	if path == "" {
 		return "", fmt.Errorf("缺少 path 参数")
+	}
+	for key := range args {
+		switch key {
+		case "path", "operation", "content", "old_str", "new_str", "expected_hash", "line_anchors":
+		default:
+			return "", fmt.Errorf("apply_change 不支持参数 %q", key)
+		}
+	}
+	content, hasContent := args["content"].(string)
+	oldStr, hasOld := args["old_str"].(string)
+	newStr, hasNew := args["new_str"].(string)
+	operation, _ := args["operation"].(string)
+	if operation == "" {
+		if hasContent {
+			operation = "write"
+		} else {
+			operation = "replace"
+		}
+	}
+	switch operation {
+	case "write", "create":
+		if !hasContent || hasOld || hasNew {
+			return "", fmt.Errorf("创建或覆盖必须提供 content，不能混用替换参数")
+		}
+	case "replace":
+		if hasContent || !hasOld || oldStr == "" || !hasNew {
+			return "", fmt.Errorf("替换必须提供非空 old_str 和 new_str，不能混用 content")
+		}
+	default:
+		return "", fmt.Errorf("未知文件变更操作 %q", operation)
 	}
 	if err := g.requireArtifactLedger(ctx); err != nil {
 		return "", err
 	}
-
-	projectRoot := ""
+	root := ""
 	if g.Workdir != nil {
-		projectRoot = g.Workdir.Get()
+		root = g.Workdir.Get()
 	}
-	if projectRoot != "" {
-		validPath, err := pathutil.ValidatePath(path, projectRoot)
+	if root != "" {
+		resolved, err := pathutil.ValidatePath(path, root)
 		if err != nil {
 			return "", err
 		}
-		path = validPath
-		if err := rejectRuntimeStateWrite(path, projectRoot); err != nil {
+		path = resolved
+		if err := rejectRuntimeStateWrite(path, root); err != nil {
 			return "", err
 		}
 	}
-
-	// 按任务写时复制隔离：logicalPath 始终是主根逻辑路径（trace 事件与返回
-	// 消息的账目坐标恒为主根；物理定位由 workspace.Manager.ResolveForTask
-	// 负责），path 在此之后为实际落盘的物理路径。
 	logicalPath := path
+	// 先锁定逻辑路径，再准备写时复制副本；避免两个 Agent 同时复制旧基线。
+	if g.Roster == nil {
+		return "", fmt.Errorf("文件变更缺少并发锁")
+	}
+	if err := g.claimOrWait(ctx, logicalPath, "应用变更"); err != nil {
+		return "", err
+	}
+	defer g.Roster.Release(g.AgentID, logicalPath)
 	physicalPath, isolated, err := g.resolveWritePath(logicalPath)
 	if err != nil {
 		return "", err
 	}
 	path = physicalPath
-
-	// §8.3：通过 claimOrWait 声明文件写入权——冲突时排队等待前任释放。
-	// 隔离生效时跳过：workspace 内本任务独占，主根锁由合并时统一声明。
-	if !isolated {
-		if err := g.claimOrWait(ctx, path, "写入"); err != nil {
-			return "", err
-		}
-		defer g.Roster.Release(g.AgentID, path)
+	previous, readErr := os.ReadFile(path)
+	exists := readErr == nil
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return "", fmt.Errorf("读取目标文件失败: %w", readErr)
 	}
-
-	// C7 迁移：原 expected_hash 校验段已删除。
-	// 乐观并发控制由 ValidateExpectedHashHook（PreCall, prio=20）接管。
-	// 决策 B1：接受微小 TOCTOU 窗口（hook 校验在 Roster 锁外）。
-
-	// H2b Effect Journal：执行前先落账（prepared），ArgsDigest 取将落盘
-	// 内容的 sha256 前 12——恢复裁决据此与盘上事实比对（verify_first）。
-	effID, err := effectPrepare(g.EffectJournal, ctx, g.AgentID,
-		effect.KindFileWrite, logicalPath, digest12([]byte(content)), effect.PolicyVerifyFirst)
+	if operation == "create" && exists {
+		return "", fmt.Errorf("创建目标已存在: %s", logicalPath)
+	}
+	if operation == "replace" && !exists {
+		return "", fmt.Errorf("文件不存在: %s", logicalPath)
+	}
+	var anchors []string
+	switch values := args["line_anchors"].(type) {
+	case []string:
+		anchors = values
+	case []any:
+		for _, value := range values {
+			anchor, ok := value.(string)
+			if !ok {
+				return "", fmt.Errorf("line_anchors 必须是字符串数组")
+			}
+			anchors = append(anchors, anchor)
+		}
+	case nil:
+		if _, present := args["line_anchors"]; present {
+			return "", fmt.Errorf("line_anchors 必须是字符串数组")
+		}
+	default:
+		return "", fmt.Errorf("line_anchors 必须是字符串数组")
+	}
+	if len(anchors) > 0 {
+		if operation != "replace" {
+			return "", fmt.Errorf("行锚点只用于精确替换")
+		}
+		lines := strings.Split(string(previous), "\n")
+		for _, anchor := range anchors {
+			ref, err := hashline.ParseLineRef(anchor)
+			if err != nil {
+				return "", err
+			}
+			if ref.Line <= 0 || ref.Line > len(lines) || hashline.ComputeLineHash(ref.Line, lines[ref.Line-1]) != ref.Hash {
+				return "", fmt.Errorf("行锚点冲突：%s 与当前文件不一致", anchor)
+			}
+		}
+	}
+	expected, _ := args["expected_hash"].(string)
+	if expected != "" && (!exists || expected != computeSHA256(previous)) {
+		return "", fmt.Errorf("文件版本冲突：expected_hash 与当前内容不一致")
+	}
+	crlfRetried := false
+	if operation == "replace" {
+		oldStr, newStr = hashline.StripHashPrefix(oldStr), hashline.StripHashPrefix(newStr)
+		source := string(previous)
+		count := strings.Count(source, oldStr)
+		if count == 0 && isFullCRLF(source) {
+			source, _ = normalizeCRLF(source)
+			oldStr, _ = normalizeCRLF(oldStr)
+			newStr, _ = normalizeCRLF(newStr)
+			count = strings.Count(source, oldStr)
+			crlfRetried = true
+		}
+		if count == 0 {
+			return "", fmt.Errorf("未找到匹配内容，old_str 在文件中不存在")
+		}
+		if count != 1 {
+			return "", fmt.Errorf("匹配到 %d 处，请提供更精确的 old_str", count)
+		}
+		content = strings.Replace(source, oldStr, newStr, 1)
+		if crlfRetried {
+			content = strings.ReplaceAll(content, "\n", "\r\n")
+		}
+	}
+	kind := effect.KindFileWrite
+	eventKind := trace.KindFileWritten
+	if operation == "replace" {
+		kind = effect.KindFileEdit
+	}
+	effID, err := effectPrepare(g.EffectJournal, ctx, g.AgentID, kind,
+		logicalPath, digest12([]byte(content)), effect.PolicyVerifyFirst)
 	if err != nil {
 		return "", err
 	}
-
-	// 确保父目录存在
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		if journalErr := effectMarkUnknown(g.EffectJournal, effID, "创建目录失败: "+err.Error()); journalErr != nil {
+	fail := func(cause error) (string, error) {
+		if journalErr := effectMarkUnknown(g.EffectJournal, effID, cause.Error()); journalErr != nil {
 			return "", journalErr
 		}
-		return "", fmt.Errorf("创建目录失败: %w", err)
+		return "", cause
 	}
-
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		// 写入返回错误时盘上可能残留部分内容——结果不可知，标 unknown
-		// 交恢复裁决（核验盘上 hash 定论），不静默定论。
-		if journalErr := effectMarkUnknown(g.EffectJournal, effID, "写入返回错误: "+err.Error()); journalErr != nil {
-			return "", journalErr
-		}
-		return "", fmt.Errorf("写入文件失败: %w", err)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fail(fmt.Errorf("创建目录失败: %w", err))
 	}
-	contentHash := computeSHA256([]byte(content))
-
-	// 写入后使缓存失效（键为最终物理路径，与 read_file 的 Get/Put 键一致）
+	mode := os.FileMode(0644)
+	if stat, err := os.Stat(path); err == nil {
+		mode = stat.Mode().Perm()
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".agentgo-change-*")
+	if err != nil {
+		return fail(fmt.Errorf("创建变更临时文件失败: %w", err))
+	}
+	tempPath := temporary.Name()
+	defer os.Remove(tempPath)
+	if err = temporary.Chmod(mode); err == nil {
+		_, err = temporary.Write([]byte(content))
+	}
+	if err == nil {
+		err = temporary.Sync()
+	}
+	closeErr := temporary.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return fail(fmt.Errorf("写入临时文件失败: %w", err))
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return fail(fmt.Errorf("提交文件变更失败: %w", err))
+	}
 	if g.Cache != nil {
 		g.Cache.Invalidate(path)
 	}
-	if err := effectSettle(g.EffectJournal, effID,
-		fmt.Sprintf("bytes=%d sha256=%s", len(content), contentHash), true); err != nil {
+	digest := computeSHA256([]byte(content))
+	if err := effectSettle(g.EffectJournal, effID, fmt.Sprintf("bytes=%d sha256=%s", len(content), digest), true); err != nil {
 		return "", err
 	}
 	if err := g.recordArtifact(ctx, logicalPath, []byte(content)); err != nil {
 		return "", err
 	}
-
-	// Trace：file_written 事件（可审计的落盘记录）。
-	// Path 保持主根逻辑路径——record-artifact / 验收的账目坐标恒为主根。
-	writeEv := trace.Event{
-		Kind:    trace.KindFileWritten,
-		TaskID:  agent.TaskIDFromContext(ctx),
-		AgentID: g.AgentID,
-		Tool:    "write_file",
-		Path:    logicalPath,
-		Bytes:   len(content),
-		Hash:    contentHash,
-	}
+	description := ""
 	if isolated {
-		writeEv.Description = fmt.Sprintf("写时复制隔离：落点 %s，任务成功终态合并回主根", path)
+		description = fmt.Sprintf("写时复制隔离：落点 %s", path)
 	}
-	trace.Emit(writeEv)
-
-	result := fmt.Sprintf("文件已写入: %s (%d 字节)", logicalPath, len(content))
+	trace.Emit(trace.Event{Kind: eventKind, TaskID: agent.TaskIDFromContext(ctx), AgentID: g.AgentID,
+		Tool: "apply_change", Path: logicalPath, Bytes: len(content), Hash: digest, Description: description})
+	beforeHash := "absent"
+	if exists {
+		beforeHash = computeSHA256(previous)
+	}
+	result := fmt.Sprintf("文件变更已应用: %s (%d 字节，operation=%s，sha256=%s)", logicalPath, len(content), operation, digest)
+	result += " before_hash=" + beforeHash
 	if isolated {
-		result += "（写时复制隔离：已落入任务工作区，任务完成后合并回主根）"
+		result += "（已落入隔离工作区）"
 	}
-	return result, nil
-}
-
-// editFile 实现 edit_file 工具。端口自 worker.makeEditFileTool。
-// 读取、匹配计数、替换写入三步在同一个 Roster 锁持有期间完成。
-// 注：expected_hash 校验在 C7 后由 ValidateExpectedHashHook 接管。
-func (g LocalWriteGroup) editFile(ctx context.Context, args map[string]any) (string, error) {
-	path, _ := args["path"].(string)
-	oldStr, _ := args["old_str"].(string)
-	newStr, _ := args["new_str"].(string)
-
-	// §7：宽容解析——剥去可能的 hashline 前缀（LLM 经常把 read_file 输出直接粘回 old_str / new_str）。
-	// new_str 必须同样剥：否则 "12#VK|content" 这种字面前缀会被原样写入文件，把哈希前缀污染到产物里。
-	// StripHashPrefix 内置 50% 阈值，对非 hashline 内容是 no-op，HashlineEnabled=false 路径也安全。
-	// 该缺陷由首次评审发现，TestEditFile_StripHashPrefix_NewStr 是配套回归护栏。
-	oldStr = hashline.StripHashPrefix(oldStr)
-	newStr = hashline.StripHashPrefix(newStr)
-
-	if path == "" {
-		return "", fmt.Errorf("缺少 path 参数")
-	}
-	if err := g.requireArtifactLedger(ctx); err != nil {
-		return "", err
-	}
-	if oldStr == "" {
-		return "", fmt.Errorf("缺少 old_str 参数")
-	}
-
-	projectRoot := ""
-	if g.Workdir != nil {
-		projectRoot = g.Workdir.Get()
-	}
-	if projectRoot != "" {
-		validPath, err := pathutil.ValidatePath(path, projectRoot)
-		if err != nil {
-			return "", err
-		}
-		path = validPath
-		if err := rejectRuntimeStateWrite(path, projectRoot); err != nil {
-			return "", err
-		}
-	}
-
-	// 按任务写时复制隔离：logicalPath 始终是主根逻辑路径（trace 事件与返回
-	// 消息的账目坐标恒为主根）；WritePath 顺带完成 copy-on-write——主根已有
-	// 文件先复制基线进 workspace，下方读取/替换/写回都作用于副本。
-	logicalPath := path
-	physicalPath, isolated, err := g.resolveWritePath(logicalPath)
-	if err != nil {
-		return "", err
-	}
-	path = physicalPath
-
-	// §8.3：通过 claimOrWait 声明文件写入权——冲突时排队等待前任释放。
-	// 隔离生效时跳过：workspace 内本任务独占，主根锁由合并时统一声明。
-	if !isolated {
-		if err := g.claimOrWait(ctx, path, "编辑"); err != nil {
-			return "", err
-		}
-		defer g.Roster.Release(g.AgentID, path)
-	}
-
-	// 读取文件（锁持有期间；隔离时读 workspace 内的 copy-on-write 基线副本）
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("文件不存在: %s", path)
-	}
-
-	// C7 迁移：原 expected_hash 校验段已删除。
-	// 由 ValidateExpectedHashHook 在 PreCall 阶段接管（决策 B1：接受微小 TOCTOU）。
-
-	content := string(data)
-
-	// 计数匹配
-	count := strings.Count(content, oldStr)
-	if count > 1 {
-		return "", fmt.Errorf("匹配到 %d 处，请提供更精确的 old_str", count)
-	}
-
-	matched := false
-	crlfRetried := false
-	newContent := ""
-	if count == 1 {
-		newContent = strings.Replace(content, oldStr, newStr, 1)
-		matched = true
-	} else if isFullCRLF(content) {
-		// CRLF 重试：read_file 展示层已归一化为 LF，LLM 按展示构造的 old_str
-		// 与磁盘 CRLF 内容必然失配。仅在全量 CRLF 文件上重试，替换后逆变换
-		// 回 CRLF 保证无损往返；混合行尾文件不重试（2026-07-21 排查 M4）。
-		normContent, _ := normalizeCRLF(content)
-		normOld, _ := normalizeCRLF(oldStr)
-		switch strings.Count(normContent, normOld) {
-		case 1:
-			normNew, _ := normalizeCRLF(newStr)
-			newContent = strings.ReplaceAll(strings.Replace(normContent, normOld, normNew, 1), "\n", "\r\n")
-			matched = true
-			crlfRetried = true
-		case 0:
-			// 归一化后仍无匹配，落入下方统一错误
-		default:
-			return "", fmt.Errorf("匹配到多处（CRLF 归一化后），请提供更精确的 old_str")
-		}
-	}
-	if !matched {
-		return "", fmt.Errorf("未找到匹配内容，old_str 在文件中不存在")
-	}
-
-	// H2b Effect Journal：newContent 已确定、写盘前先落账（prepared），
-	// ArgsDigest 取替换后全文的 sha256 前 12——恢复裁决据此与盘上事实比对。
-	effID, err := effectPrepare(g.EffectJournal, ctx, g.AgentID,
-		effect.KindFileEdit, logicalPath, digest12([]byte(newContent)), effect.PolicyVerifyFirst)
-	if err != nil {
-		return "", err
-	}
-
-	if err := os.WriteFile(path, []byte(newContent), 0644); err != nil {
-		if journalErr := effectMarkUnknown(g.EffectJournal, effID, "写入返回错误: "+err.Error()); journalErr != nil {
-			return "", journalErr
-		}
-		return "", fmt.Errorf("写入文件失败: %w", err)
-	}
-	newHash := computeSHA256([]byte(newContent))
-
-	// 写入后使缓存失效（键为最终物理路径，与 read_file 的 Get/Put 键一致）
-	if g.Cache != nil {
-		g.Cache.Invalidate(path)
-	}
-	if err := effectSettle(g.EffectJournal, effID,
-		fmt.Sprintf("bytes=%d sha256=%s", len(newContent), newHash), true); err != nil {
-		return "", err
-	}
-	if err := g.recordArtifact(ctx, logicalPath, []byte(newContent)); err != nil {
-		return "", err
-	}
-
-	// Trace：file_written 事件（edit 也算一次落盘）。
-	// Path 保持主根逻辑路径——record-artifact / 验收的账目坐标恒为主根。
-	writeEv := trace.Event{
-		Kind:    trace.KindFileWritten,
-		TaskID:  agent.TaskIDFromContext(ctx),
-		AgentID: g.AgentID,
-		Tool:    "edit_file",
-		Path:    logicalPath,
-		Bytes:   len(newContent),
-		Hash:    newHash,
-	}
-	if isolated {
-		writeEv.Description = fmt.Sprintf("写时复制隔离：落点 %s，任务成功终态合并回主根", path)
-	}
-	trace.Emit(writeEv)
-
-	oldLen := len(content)
-	newLen := len(newContent)
-	added := 0
-	removed := 0
-	if newLen > oldLen {
-		added = newLen - oldLen
-	} else {
-		removed = oldLen - newLen
-	}
-
-	result := fmt.Sprintf("文件已编辑: %s (字节变化: +%d/-%d)", logicalPath, added, removed)
 	if crlfRetried {
-		result += "（提示：该文件为 CRLF 行尾，已按 CRLF 兼容模式完成替换，行尾保持 CRLF 不变）"
-	}
-	if isolated {
-		result += "（写时复制隔离：已落入任务工作区，任务完成后合并回主根）"
+		result += "（保留 CRLF 行尾）"
 	}
 	return result, nil
 }

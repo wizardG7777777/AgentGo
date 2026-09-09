@@ -59,14 +59,14 @@ func newContentRefToolFixture(t *testing.T, options contentRefFixtureOptions) *c
 		if catalogErr != nil {
 			t.Fatal(catalogErr)
 		}
-		progress, ok := catalog.ProgressContract(policycatalog.ProgressInvestigationV1)
+		progress, ok := catalog.ProgressContract(policycatalog.ProgressInvestigationCurrent)
 		if !ok {
 			t.Fatal("缺少 investigation progress contract")
 		}
 		task.RunContract = &runcontract.RunContract{
-			Schema: runcontract.SchemaV1, RunID: options.taskRunID, CreatedAt: now,
-			DeadlineAt: now.Add(time.Hour), FinalizationReserve: time.Minute,
-			RecoveryReserve: time.Minute, BudgetProfile: "test/v1",
+			Schema: runcontract.SchemaCurrent, RunID: options.taskRunID, CreatedAt: now,
+			DeadlineAt:    now.Add(time.Hour),
+			BudgetProfile: "test/v1",
 		}
 		task.RunPhase = runcontract.PhaseExecution
 		task.ProgressContract = &progress.Contract
@@ -102,9 +102,9 @@ func newContentRefToolFixture(t *testing.T, options contentRefFixtureOptions) *c
 	}
 	leaseTools := options.leaseTools
 	if leaseTools == nil {
-		leaseTools = []string{"read_content_ref"}
+		leaseTools = []string{"read_evidence"}
 	}
-	lease := &model.ExecutionLease{
+	lease := &model.ExecutionLease{Schema: model.ExecutionLeaseSchemaCurrent,
 		TaskID: task.ID, Attempt: 1, FrozenAt: time.Now().UTC(),
 		BusinessTools: model.SortedCopy(leaseTools),
 	}
@@ -124,7 +124,7 @@ func newContentRefToolFixture(t *testing.T, options contentRefFixtureOptions) *c
 		sessionFn = func() string { return session }
 	}
 	registry := agent.NewToolRegistry()
-	ContentRefGroup{ContentStore: content, TaskStore: tasks, SessionID: sessionFn}.Register(registry)
+	EvidenceGroup{ContentStore: content, TaskStore: tasks, SessionID: sessionFn}.Register(registry)
 	return &contentRefToolFixture{
 		content: content, tasks: tasks, registry: registry,
 		task: fresh, ref: ref, session: session, root: root,
@@ -133,24 +133,24 @@ func newContentRefToolFixture(t *testing.T, options contentRefFixtureOptions) *c
 
 func (f *contentRefToolFixture) dispatch(args map[string]any) (string, error) {
 	ctx := agent.WithAgentContext(context.Background(), "agent-reader", f.task.ID, 0)
-	return f.registry.Dispatch(ctx, llm.ToolCall{Name: "read_content_ref", Arguments: args})
+	return f.registry.Dispatch(ctx, llm.ToolCall{Name: "read_evidence", Arguments: args})
 }
 
-func TestContentRefGroupSchemaAndBoundedOutput(t *testing.T) {
+func TestEvidenceGroupSchemaAndBoundedOutput(t *testing.T) {
 	fixture := newContentRefToolFixture(t, contentRefFixtureOptions{taskGraphID: "graph-1"})
 	defs := fixture.registry.Defs()
-	if len(defs) != 1 || defs[0].Name != "read_content_ref" {
-		t.Fatalf("应只注册 read_content_ref: %+v", defs)
+	if len(defs) != 1 || defs[0].Name != "read_evidence" {
+		t.Fatalf("应只注册 read_evidence: %+v", defs)
 	}
 	params := defs[0].Parameters
 	if params["additionalProperties"] != false {
 		t.Fatalf("schema 必须拒绝额外字段: %+v", params)
 	}
 	properties, ok := params["properties"].(map[string]any)
-	if !ok || len(properties) != 3 {
-		t.Fatalf("schema 只允许 ref_id/offset/limit: %+v", params)
+	if !ok || len(properties) != 4 {
+		t.Fatalf("schema 只允许 ref_id/graph_id/offset/limit: %+v", params)
 	}
-	for _, name := range []string{"ref_id", "offset", "limit"} {
+	for _, name := range []string{"ref_id", "graph_id", "offset", "limit"} {
 		if _, ok := properties[name]; !ok {
 			t.Fatalf("schema 缺少 %s", name)
 		}
@@ -164,7 +164,7 @@ func TestContentRefGroupSchemaAndBoundedOutput(t *testing.T) {
 		"ref_id": fixture.ref.RefID, "offset": float64(4), "limit": float64(5),
 	})
 	if err != nil {
-		t.Fatalf("read_content_ref: %v", err)
+		t.Fatalf("read_evidence: %v", err)
 	}
 	var result contentRefToolResult
 	if err := json.Unmarshal([]byte(output), &result); err != nil {
@@ -176,7 +176,7 @@ func TestContentRefGroupSchemaAndBoundedOutput(t *testing.T) {
 	}
 }
 
-func TestContentRefGroupRejectsUnexpectedOrUnsafeArguments(t *testing.T) {
+func TestEvidenceGroupRejectsUnexpectedOrUnsafeArguments(t *testing.T) {
 	fixture := newContentRefToolFixture(t, contentRefFixtureOptions{})
 	tests := []map[string]any{
 		{"ref_id": fixture.ref.RefID, "path": "/tmp/bypass"},
@@ -191,7 +191,7 @@ func TestContentRefGroupRejectsUnexpectedOrUnsafeArguments(t *testing.T) {
 	}
 }
 
-func TestContentRefGroupScopeAndFrozenLeaseSecurity(t *testing.T) {
+func TestEvidenceGroupScopeAndFrozenLeaseSecurity(t *testing.T) {
 	tests := []struct {
 		name    string
 		options contentRefFixtureOptions
@@ -235,7 +235,7 @@ func TestContentRefGroupScopeAndFrozenLeaseSecurity(t *testing.T) {
 	}
 }
 
-func TestContentRefGroupAllowsOnlyFrozenUpstreamDelegation(t *testing.T) {
+func TestEvidenceGroupAllowsOnlyFrozenUpstreamDelegation(t *testing.T) {
 	owner := contentstore.Scope{
 		Kind: contentstore.ScopeTask, SessionID: "session-1",
 		GraphID: "graph-1", TaskID: "task-producer",
@@ -259,7 +259,7 @@ func TestContentRefGroupAllowsOnlyFrozenUpstreamDelegation(t *testing.T) {
 	}
 }
 
-func TestContentRefGroupRejectsBroadOrTextualUpstreamDelegation(t *testing.T) {
+func TestEvidenceGroupRejectsBroadOrTextualUpstreamDelegation(t *testing.T) {
 	owner := contentstore.Scope{
 		Kind: contentstore.ScopeTask, SessionID: "session-1",
 		GraphID: "graph-1", TaskID: "task-producer",
@@ -307,7 +307,7 @@ func TestContentRefGroupRejectsBroadOrTextualUpstreamDelegation(t *testing.T) {
 	}
 }
 
-func TestContentRefGroupRechecksSessionDuringAuthorization(t *testing.T) {
+func TestEvidenceGroupRechecksSessionDuringAuthorization(t *testing.T) {
 	calls := 0
 	fixture := newContentRefToolFixture(t, contentRefFixtureOptions{
 		session: "session-1",
@@ -325,7 +325,7 @@ func TestContentRefGroupRechecksSessionDuringAuthorization(t *testing.T) {
 	}
 }
 
-func TestContentRefGroupRechecksFrozenLeaseDuringAuthorization(t *testing.T) {
+func TestEvidenceGroupRechecksFrozenLeaseDuringAuthorization(t *testing.T) {
 	var tasks *taskstore.MemoryTaskStore
 	var revokeErr error
 	calls := 0
@@ -349,7 +349,7 @@ func TestContentRefGroupRechecksFrozenLeaseDuringAuthorization(t *testing.T) {
 	}
 }
 
-func TestContentRefGroupUsesSessionlessRunScopeLikeL2(t *testing.T) {
+func TestEvidenceGroupUsesSessionlessRunScopeLikeL2(t *testing.T) {
 	runID := runcontract.RunID("run-content-1")
 	owner := contentstore.Scope{
 		Kind: contentstore.ScopeTask, SessionID: "sessionless-run:" + string(runID),
@@ -363,7 +363,7 @@ func TestContentRefGroupUsesSessionlessRunScopeLikeL2(t *testing.T) {
 	}
 }
 
-func TestContentRefGroupReadsRecoveredStore(t *testing.T) {
+func TestEvidenceGroupReadsRecoveredStore(t *testing.T) {
 	fixture := newContentRefToolFixture(t, contentRefFixtureOptions{})
 	if err := fixture.content.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -374,16 +374,16 @@ func TestContentRefGroupReadsRecoveredStore(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
 	registry := agent.NewToolRegistry()
-	ContentRefGroup{
+	EvidenceGroup{
 		ContentStore: reopened, TaskStore: fixture.tasks,
 		SessionID: func() string { return fixture.session },
 	}.Register(registry)
 	ctx := agent.WithAgentContext(context.Background(), "agent-reader", fixture.task.ID, 0)
-	output, err := registry.Dispatch(ctx, llm.ToolCall{Name: "read_content_ref", Arguments: map[string]any{
+	output, err := registry.Dispatch(ctx, llm.ToolCall{Name: "read_evidence", Arguments: map[string]any{
 		"ref_id": fixture.ref.RefID, "offset": 20, "limit": 16,
 	}})
 	if err != nil {
-		t.Fatalf("重启后 read_content_ref: %v", err)
+		t.Fatalf("重启后 read_evidence: %v", err)
 	}
 	var result contentRefToolResult
 	if err := json.Unmarshal([]byte(output), &result); err != nil || result.Content != "uvwxyz" || !result.EOF {

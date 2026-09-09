@@ -47,7 +47,7 @@ const (
 	// Observation wire 与 v11 相同，历史 v11 不迁移。
 	ProgressCodeChangeV12 = "progress:code-change/v12"
 	// ProgressCodeChangeCurrent 是所有新 Task/Graph authoring 的唯一选择。
-	ProgressCodeChangeCurrent = ProgressCodeChangeV12
+	ProgressCodeChangeCurrent = "progress:code-change/v13"
 
 	ProgressInvestigationV1 = "progress:investigation/v1"
 	ProgressInvestigationV2 = "progress:investigation/v2"
@@ -69,10 +69,11 @@ const (
 	ProgressVerificationV3       = "progress:verification/v3"
 	ProgressCoordinationV1       = "progress:coordination/v1"
 	ProgressCoordinationV2       = "progress:coordination/v2"
+	ProgressFinalReportCurrent   = "progress:final-report/v2"
 	ProgressFinalReportV1        = "progress:final-report/v1"
-	ProgressInvestigationCurrent = ProgressInvestigationV6
-	ProgressVerificationCurrent  = ProgressVerificationV3
-	ProgressCoordinationCurrent  = ProgressCoordinationV2
+	ProgressInvestigationCurrent = "progress:investigation/v8"
+	ProgressVerificationCurrent  = "progress:verification/v4"
+	ProgressCoordinationCurrent  = "progress:coordination/v3"
 )
 
 // ContextProfile 把 L2 budget policy 与默认 provider replay policy 引用绑定。

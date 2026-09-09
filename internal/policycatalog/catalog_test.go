@@ -1,9 +1,10 @@
 package policycatalog
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
-	"time"
 
 	"agentgo/internal/contextcontract"
 	"agentgo/internal/graph"
@@ -22,7 +23,7 @@ func TestDefaultCatalogValidAndResolvesGraphPolicies(t *testing.T) {
 		t.Fatalf("Catalog.Validate: %v", err)
 	}
 	if !catalog.HasContextPolicy(ContextDefaultCurrent) ||
-		!catalog.HasProgressContract(ProgressCodeChangeV1) ||
+		!catalog.HasProgressContract(ProgressCodeChangeCurrent) ||
 		!catalog.HasProgressContract(ProgressCodeChangeCurrent) {
 		t.Fatal("Graph PolicyResolver 未识别默认 Context/Progress ref")
 	}
@@ -31,33 +32,7 @@ func TestDefaultCatalogValidAndResolvesGraphPolicies(t *testing.T) {
 		t.Fatal("未知 policy ref 不得 fail-open")
 	}
 
-	wantProgressRefs := []string{
-		ProgressCodeChangeV1,
-		ProgressCodeChangeV10,
-		ProgressCodeChangeV11,
-		ProgressCodeChangeV12,
-		ProgressCodeChangeV2,
-		ProgressCodeChangeV3,
-		ProgressCodeChangeV4,
-		ProgressCodeChangeV5,
-		ProgressCodeChangeV6,
-		ProgressCodeChangeV7,
-		ProgressCodeChangeV8,
-		ProgressCodeChangeV9,
-		ProgressCoordinationV1,
-		ProgressCoordinationV2,
-		ProgressFinalReportV1,
-		ProgressInvestigationV1,
-		ProgressInvestigationV2,
-		ProgressInvestigationV3,
-		ProgressInvestigationV4,
-		ProgressInvestigationV5,
-		ProgressInvestigationV6,
-		ProgressInvestigationV7,
-		ProgressVerificationV1,
-		ProgressVerificationV2,
-		ProgressVerificationV3,
-	}
+	wantProgressRefs := []string{ProgressCodeChangeCurrent, ProgressCoordinationCurrent, ProgressFinalReportCurrent, ProgressInvestigationCurrent, ProgressVerificationCurrent}
 	if got := catalog.ProgressRefs(); !reflect.DeepEqual(got, wantProgressRefs) {
 		t.Fatalf("ProgressRefs=%v，want=%v", got, wantProgressRefs)
 	}
@@ -114,14 +89,11 @@ func TestProgressProfilesCoverFourWorkClasses(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]loopcontract.WorkClass{
-		ProgressCodeChangeV1:    loopcontract.WorkCodeChange,
-		ProgressCodeChangeV2:    loopcontract.WorkCodeChange,
-		ProgressCodeChangeV3:    loopcontract.WorkCodeChange,
-		ProgressCodeChangeV4:    loopcontract.WorkCodeChange,
-		ProgressInvestigationV1: loopcontract.WorkInvestigation,
-		ProgressVerificationV1:  loopcontract.WorkVerification,
-		ProgressCoordinationV1:  loopcontract.WorkCoordination,
-		ProgressFinalReportV1:   loopcontract.WorkFinalization,
+		ProgressCodeChangeCurrent:    loopcontract.WorkCodeChange,
+		ProgressInvestigationCurrent: loopcontract.WorkInvestigation,
+		ProgressVerificationCurrent:  loopcontract.WorkVerification,
+		ProgressCoordinationCurrent:  loopcontract.WorkCoordination,
+		ProgressFinalReportCurrent:   loopcontract.WorkFinalization,
 	}
 	for ref, workClass := range want {
 		profile, ok := catalog.ProgressContract(ref)
@@ -138,164 +110,23 @@ func TestProgressProfilesCoverFourWorkClasses(t *testing.T) {
 		if err != nil || digest != profile.Digest || profile.Contract.Ref.ContractDigest != "sha256:"+digest {
 			t.Fatalf("profile=%s digest 不一致: digest=%s err=%v", ref, digest, err)
 		}
-		if profile.Contract.Policy.MaxNoProgressTurns <= 0 ||
-			profile.Contract.Policy.MaxNoProgressUsage.ModelCalls <= 0 {
-			t.Fatalf("profile=%s 含无界 no-progress policy", ref)
+		raw, _ := json.Marshal(profile.Contract.Policy)
+		if strings.Contains(string(raw), "turns") || strings.Contains(string(raw), "budget") || len(profile.Contract.VerificationTargets) != 0 {
+			t.Fatalf("默认策略不应含执行阈值或测试目标：%s", raw)
 		}
+
 	}
 }
 
-func TestCodeChangeV2ExpandsThinkingModelInvestigationWithoutMutatingV1(t *testing.T) {
+func TestRetiredProgressProfilesAreNotExecutable(t *testing.T) {
 	catalog, err := NewDefault()
 	if err != nil {
 		t.Fatal(err)
 	}
-	v1, ok := catalog.ProgressContract(ProgressCodeChangeV1)
-	if !ok {
-		t.Fatal("缺少历史 code-change/v1")
-	}
-	v2, ok := catalog.ProgressContract(ProgressCodeChangeV2)
-	if !ok {
-		t.Fatal("缺少当前 code-change/v2")
-	}
-	if v1.Contract.Policy.ReminderAfterTurns != 3 || v1.Contract.Policy.RolloverAfterTurns != 6 ||
-		v1.Contract.Policy.InterventionAfterTurns != 9 || v1.Contract.Policy.MaxNoProgressTurns != 12 ||
-		v1.Contract.Policy.MaxNoProgressUsage.ModelCalls != 12 {
-		t.Fatalf("历史 v1 被就地改写: %+v", v1.Contract.Policy)
-	}
-	if v2.Contract.Policy.ReminderAfterTurns != 4 || v2.Contract.Policy.RolloverAfterTurns != 8 ||
-		v2.Contract.Policy.InterventionAfterTurns != 12 || v2.Contract.Policy.MaxNoProgressTurns != 16 ||
-		v2.Contract.Policy.MaxNoProgressUsage.ModelCalls != 16 || v2.Digest == v1.Digest {
-		t.Fatalf("v2 预算/身份未独立冻结: v1=%+v v2=%+v", v1, v2)
-	}
-}
-
-func TestCodeChangeV3CoversObservedThinkingTailWithoutMutatingOlderProfiles(t *testing.T) {
-	catalog, err := NewDefault()
-	if err != nil {
-		t.Fatal(err)
-	}
-	v2, _ := catalog.ProgressContract(ProgressCodeChangeV2)
-	v3, ok := catalog.ProgressContract(ProgressCodeChangeV3)
-	if !ok {
-		t.Fatal("缺少当前 code-change/v3")
-	}
-	if v2.Contract.Policy.InterventionAfterTurns != 12 || v2.Contract.Policy.MaxNoProgressTurns != 16 ||
-		v2.Contract.Policy.MaxNoProgressUsage.ModelCalls != 16 {
-		t.Fatalf("v2 被就地改写: %+v", v2.Contract.Policy)
-	}
-	if v3.Contract.Policy.ReminderAfterTurns != 4 || v3.Contract.Policy.RolloverAfterTurns != 10 ||
-		v3.Contract.Policy.InterventionAfterTurns != 18 || v3.Contract.Policy.MaxNoProgressTurns != 24 ||
-		v3.Contract.Policy.MaxNoProgressUsage.ModelCalls != 24 || v3.Digest == v2.Digest {
-		t.Fatalf("v3 预算/当前别名错误: v2=%+v v3=%+v current=%s", v2, v3, ProgressCodeChangeCurrent)
-	}
-	v4, ok := catalog.ProgressContract(ProgressCodeChangeV4)
-	if !ok || v4.Digest == v3.Digest {
-		t.Fatalf("v4/当前别名错误: v3=%+v v4=%+v current=%s", v3, v4, ProgressCodeChangeCurrent)
-	}
-	foundEvidence := false
-	for _, signal := range v4.Contract.AcceptedSignals {
-		if signal.Kind == loopcontract.SignalNovelEvidence && !signal.Deliverable {
-			foundEvidence = true
+	for _, ref := range []string{"progress:code-change/v12", "progress:investigation/v6", "progress:coordination/v2"} {
+		if catalog.HasProgressContract(ref) {
+			t.Fatalf("旧阈值策略不应可执行：%s", ref)
 		}
-	}
-	if !foundEvidence {
-		t.Fatal("code-change/v4 必须把 NovelEvidence 作为非 deliverable knowledge progress")
-	}
-	v5, ok := catalog.ProgressContract(ProgressCodeChangeV5)
-	if !ok || v5.Contract.Policy.MaxExplorationTurns != 0 ||
-		v5.Contract.Policy.KnowledgeCheckpointAfterTurns != 8 {
-		t.Fatalf("v5 必须删除 business exploration 强制交卷并启用 8-turn checkpoint: %+v", v5)
-	}
-	v6, ok := catalog.ProgressContract(ProgressCodeChangeV6)
-	if !ok || ProgressInvestigationCurrent != ProgressInvestigationV6 ||
-		v6.Contract.Policy.KnowledgeCheckpointAfterTurns != 6 ||
-		v6.Contract.Policy.FirstDeliverableHandoffReserve != 5*time.Minute || v6.Digest == v5.Digest {
-		t.Fatalf("v6 必须收紧为 6-turn checkpoint、冻结 5 分钟首次交付 handoff 且保持独立 digest: %+v", v6)
-	}
-	v7, ok := catalog.ProgressContract(ProgressCodeChangeV7)
-	if !ok ||
-		v7.Contract.Policy.MaxControlContractFailures != 0 || v7.Digest == v6.Digest {
-		t.Fatalf("v7 必须让周期性 Observation 失败走 abandoned 恢复业务: %+v", v7)
-	}
-	v8, ok := catalog.ProgressContract(ProgressCodeChangeV8)
-	if !ok || v8.Digest == v7.Digest ||
-		v8.Contract.Policy.PolicyRef != "bounded_code_change/v8" {
-		t.Fatalf("v8 Observation wire 版本语义漂移: %+v", v8)
-	}
-	v9, ok := catalog.ProgressContract(ProgressCodeChangeV9)
-	if !ok || v9.Digest == v8.Digest ||
-		v9.Contract.Policy.PolicyRef != "bounded_code_change/v9" {
-		t.Fatalf("v9 Observation 预算版本语义漂移: %+v", v9)
-	}
-	v10, ok := catalog.ProgressContract(ProgressCodeChangeV10)
-	if !ok || v10.Digest == v9.Digest ||
-		v10.Contract.Policy.DecisionCheckpointAfterTurns != 4 ||
-		v10.Contract.Policy.MaxDecisionStagnation != 1 || v10.Contract.Policy.MaxExplorationTurns != 6 {
-		t.Fatalf("v10 必须作为 Explorer handoff 后的 current 收敛策略: %+v", v10)
-	}
-	foundStructuredDecision := false
-	for _, signal := range v10.Contract.AcceptedSignals {
-		if signal.Kind == loopcontract.SignalResultFieldSet && signal.IdentityScope == "**" {
-			foundStructuredDecision = true
-		}
-	}
-	if !foundStructuredDecision {
-		t.Fatalf("v10 必须接受 typed change decision 的动态 result field identity: %+v", v10.Contract.AcceptedSignals)
-	}
-	v11, ok := catalog.ProgressContract(ProgressCodeChangeV11)
-	if !ok || v11.Digest == v10.Digest ||
-		v11.Contract.Policy.DecisionCheckpointAfterTurns != 2 ||
-		v11.Contract.Policy.MaxDecisionStagnation != 1 ||
-		v11.Contract.Policy.CandidateRepairHandoffReserve != 3*time.Minute {
-		t.Fatalf("v11 必须缩短 Explorer handoff 后的首次 decision checkpoint: %+v", v11)
-	}
-	v12, ok := catalog.ProgressContract(ProgressCodeChangeV12)
-	if !ok || ProgressCodeChangeCurrent != ProgressCodeChangeV12 || v12.Digest == v11.Digest ||
-		v12.Contract.Policy.DecisionCheckpointAfterTurns != 1 ||
-		v12.Contract.Policy.MaxDecisionStagnation != 1 ||
-		v12.Contract.Policy.CandidateRepairHandoffReserve != 3*time.Minute {
-		t.Fatalf("v12 必须冻结单 decision turn 并作为 current: %+v", v12)
-	}
-	investigationV3, ok := catalog.ProgressContract(ProgressInvestigationV3)
-	if !ok ||
-		investigationV3.Contract.Policy.MaxExplorationTurns != 6 ||
-		investigationV3.Contract.Policy.KnowledgeCheckpointAfterTurns != 0 {
-		t.Fatalf("investigation v3 必须保留六轮历史语义: %+v", investigationV3)
-	}
-	for _, signal := range investigationV3.Contract.AcceptedSignals {
-		if (signal.Kind == loopcontract.SignalNovelEvidence || signal.Kind == loopcontract.SignalConfirmedFactAdded ||
-			signal.Kind == loopcontract.SignalObservationStateAdvanced) && signal.Deliverable {
-			t.Fatalf("investigation v3 knowledge signal 不得伪装成 deliverable: %+v", signal)
-		}
-	}
-	investigationV4, ok := catalog.ProgressContract(ProgressInvestigationV4)
-	if !ok ||
-		investigationV4.Digest == investigationV3.Digest ||
-		investigationV4.Contract.Policy.MaxExplorationTurns != 10 ||
-		investigationV4.Contract.Policy.KnowledgeCheckpointAfterTurns != 0 {
-		t.Fatalf("investigation v4 必须保留 boundary evidence 十轮历史语义: %+v", investigationV4)
-	}
-	investigationV5, ok := catalog.ProgressContract(ProgressInvestigationV5)
-	if !ok ||
-		investigationV5.Digest == investigationV4.Digest ||
-		investigationV5.Contract.Policy.MaxExplorationTurns != 8 ||
-		investigationV5.Contract.Policy.FirstDeliverableHandoffReserve != 4*time.Minute {
-		t.Fatalf("investigation v5 必须冻结八轮与四分钟 exact handoff reserve: %+v", investigationV5)
-	}
-	investigationV6, ok := catalog.ProgressContract(ProgressInvestigationV6)
-	if !ok ||
-		investigationV6.Digest == investigationV5.Digest ||
-		investigationV6.Contract.Policy.MaxExplorationTurns != 6 ||
-		investigationV6.Contract.Policy.FirstDeliverableHandoffReserve != 8*time.Minute {
-		t.Fatalf("investigation v6 必须冻结六轮与八分钟下游 reserve: %+v", investigationV6)
-	}
-	investigationV7, ok := catalog.ProgressContract(ProgressInvestigationV7)
-	if !ok ||
-		investigationV7.Digest == investigationV6.Digest ||
-		investigationV7.Contract.Policy.MaxExplorationTurns != 6 ||
-		investigationV7.Contract.Policy.FirstDeliverableHandoffReserve != 10*time.Minute {
-		t.Fatalf("investigation v7 必须冻结六轮与十分钟下游 reserve，但真实长调用关闭前不得切 current: %+v", investigationV7)
 	}
 }
 
@@ -324,9 +155,9 @@ func TestLookupsReturnDeepCopies(t *testing.T) {
 		t.Fatal("调用方修改 Replay lookup 污染 catalog")
 	}
 
-	progress, _ := catalog.ProgressContract(ProgressCodeChangeV1)
+	progress, _ := catalog.ProgressContract(ProgressCodeChangeCurrent)
 	progress.Contract.AcceptedSignals[0].Deliverable = false
-	freshProgress, _ := catalog.ProgressContract(ProgressCodeChangeV1)
+	freshProgress, _ := catalog.ProgressContract(ProgressCodeChangeCurrent)
 	if !freshProgress.Contract.AcceptedSignals[0].Deliverable {
 		t.Fatal("调用方修改 Progress lookup 污染 catalog")
 	}
@@ -354,7 +185,7 @@ func TestCatalogDigestsStableAndSemanticChangesVisible(t *testing.T) {
 		t.Fatal("相同默认 Context policy digest 不稳定")
 	}
 
-	progress, _ := first.ProgressContract(ProgressCodeChangeV1)
+	progress, _ := first.ProgressContract(ProgressCodeChangeCurrent)
 	before := progress.Digest
 	progress.Contract.AcceptedSignals[0].Deliverable = !progress.Contract.AcceptedSignals[0].Deliverable
 	after, err := ProgressContractDigest(progress.Contract)
@@ -380,7 +211,7 @@ func TestCatalogDigestsStableAndSemanticChangesVisible(t *testing.T) {
 
 func TestNilCatalogFailsClosed(t *testing.T) {
 	var catalog *Catalog
-	if catalog.HasContextPolicy(ContextDefaultCurrent) || catalog.HasProgressContract(ProgressCodeChangeV1) {
+	if catalog.HasContextPolicy(ContextDefaultCurrent) || catalog.HasProgressContract(ProgressCodeChangeCurrent) {
 		t.Fatal("nil catalog 不得放行 policy ref")
 	}
 	if _, ok := catalog.ContextPolicy(ContextDefaultCurrent); ok {

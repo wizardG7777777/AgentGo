@@ -12,7 +12,7 @@ func TestRedactArgs_WriteFile(t *testing.T) {
 		"path":    "docs/a.md",
 		"content": "机密正文内容",
 	}
-	out := RedactArgs("write_file", args)
+	out := RedactArgs("apply_change", args)
 
 	if out["path"] != "docs/a.md" {
 		t.Errorf("path 应原样保留，实际 %v", out["path"])
@@ -28,10 +28,10 @@ func TestRedactArgs_WriteFile(t *testing.T) {
 }
 
 func TestRedactArgs_EditFile(t *testing.T) {
-	out := RedactArgs("edit_file", map[string]any{
-		"path":     "a.go",
-		"old_str":  "old code",
-		"new_str":  "new code",
+	out := RedactArgs("apply_change", map[string]any{
+		"path":          "a.go",
+		"old_str":       "old code",
+		"new_str":       "new code",
 		"expected_hash": "abc123",
 	})
 	if out["path"] != "a.go" {
@@ -50,9 +50,9 @@ func TestRedactArgs_EditFile(t *testing.T) {
 
 func TestRedactArgs_PublishTask(t *testing.T) {
 	out := RedactArgs("publish_task", map[string]any{
-		"description": "实现一个巨大的功能，细节略三千字",
-		"event_type":  "code",
-		"priority":    "high",
+		"description":        "实现一个巨大的功能，细节略三千字",
+		"event_type":         "code",
+		"priority":           "high",
 		"expected_artifacts": "a.go,b.go",
 	})
 	if s, _ := out["description"].(string); !strings.HasPrefix(s, "<redacted len=") {
@@ -120,12 +120,12 @@ func TestRedactArgs_LongTextDefaultRule(t *testing.T) {
 
 func TestRedactArgs_DigestStable(t *testing.T) {
 	content := "同一份正文"
-	a := RedactArgs("write_file", map[string]any{"content": content})
-	b := RedactArgs("write_file", map[string]any{"content": content})
+	a := RedactArgs("apply_change", map[string]any{"content": content})
+	b := RedactArgs("apply_change", map[string]any{"content": content})
 	if a["content"] != b["content"] {
 		t.Errorf("digest 不稳定：%v vs %v", a["content"], b["content"])
 	}
-	c := RedactArgs("write_file", map[string]any{"content": "另一份正文"})
+	c := RedactArgs("apply_change", map[string]any{"content": "另一份正文"})
 	if a["content"] == c["content"] {
 		t.Errorf("不同原文不应同占位：%v", a["content"])
 	}
@@ -150,7 +150,7 @@ func TestRedactArgs_FullArgsBypass(t *testing.T) {
 	t.Cleanup(func() { SetFullArgsEnabled(false) })
 
 	args := map[string]any{"content": "完整保留", "path": "a.go"}
-	out := RedactArgs("write_file", args)
+	out := RedactArgs("apply_change", args)
 	if out["content"] != "完整保留" {
 		t.Errorf("FULL_ARGS 开关下 content 应完整保留，实际 %v", out["content"])
 	}

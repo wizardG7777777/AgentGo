@@ -401,15 +401,17 @@ type Transition struct {
 }
 
 // ShellExec 是 KindShellExecuted 事件的 sub-payload（ToolUpgradePlan.md §2.9）。
-// 命令执行完才 emit；Command / ExitCode / DurationMS / Outcome 总是有值，excerpt 可选。
+// 命令执行尝试结束后记录；未启动、取消和超时不伪造退出码。
 type ShellExec struct {
-	Command       string `json:"command"`
-	ExitCode      int    `json:"exit_code"`
-	ExitCodeScope string `json:"exit_code_scope,omitempty"`
-	DurationMS    int64  `json:"duration_ms"`
-	Outcome       string `json:"outcome"`                  // success / failure / timeout
-	StdoutExcerpt string `json:"stdout_excerpt,omitempty"` // 截断（前后各 N 字节），完整内容仍在 trace 文件
-	StderrExcerpt string `json:"stderr_excerpt,omitempty"`
+	Schema         string `json:"schema,omitempty"`
+	ProcessStarted bool   `json:"process_started"`
+	Command        string `json:"command"`
+	ExitCode       *int   `json:"exit_code,omitempty"`
+	ExitCodeScope  string `json:"exit_code_scope,omitempty"`
+	DurationMS     int64  `json:"duration_ms"`
+	Outcome        string `json:"outcome"`                  // success / failure / timeout / cancelled / start_failed
+	StdoutExcerpt  string `json:"stdout_excerpt,omitempty"` // 截断（前后各 N 字节），完整内容仍在 trace 文件
+	StderrExcerpt  string `json:"stderr_excerpt,omitempty"`
 }
 
 // ShellTimeout 是 KindShellTimeoutPending / Resolved 共用的 sub-payload。
@@ -615,10 +617,13 @@ type Event struct {
 	RecoveryGate      *RecoveryActionPayload `json:"recovery_action_gate,omitempty"`
 
 	// --- 工具调用字段 ---
-	Tool      string         `json:"tool,omitempty"`
-	Args      map[string]any `json:"args,omitempty"`
-	CallID    string         `json:"call_id,omitempty"`
-	ResultLen int            `json:"result_len,omitempty"`
+	Tool   string         `json:"tool,omitempty"`
+	Args   map[string]any `json:"args,omitempty"`
+	CallID string         `json:"call_id,omitempty"`
+	// ToolDispatched 与 ToolResultContent 仅用于通用工具执行事实；后者为有界输出或内容引用。
+	ToolDispatched    *bool  `json:"tool_dispatched,omitempty"`
+	ToolResultContent string `json:"tool_result_content,omitempty"`
+	ResultLen         int    `json:"result_len,omitempty"`
 
 	// --- 文件操作字段 ---
 	Path  string `json:"path,omitempty"`

@@ -141,20 +141,7 @@ func graphStatusOf(t *testing.T, s *Store, graphID string) GraphStatus {
 }
 
 // linearGraphJSON 线性图：root(controller) → implement(agent) → finish(end)。
-const linearGraphJSON = `{
-  "schema": "agentgo.graph/v1",
-  "graph_id": "g-linear",
-  "revision": 1, "state_version": 0,
-  "root": "root", "status": "pending",
-  "nodes": {
-    "root": {"kind":"controller","task":{"title":"完成请求"},"status":"inactive","executor":null,"execution":null,
-      "next":[{"to":"implement"}]},
-    "implement": {"kind":"agent","task":{"title":"实施修改","description":"写代码"},"status":"inactive","executor":null,"execution":null,
-      "capability":{"tools":["read_file","write_file"],"model":"m-1"},
-      "next":[{"to":"finish"}]},
-    "finish": {"kind":"end","task":{"title":"形成结果"},"status":"inactive","executor":null,"execution":null,"next":[]}
-  }
-}`
+const linearGraphJSON = "{\n  \"schema\": \"agentgo.graph/v1\",\n  \"graph_id\": \"g-linear\",\n  \"revision\": 1, \"state_version\": 0,\n  \"root\": \"root\", \"status\": \"pending\",\n  \"nodes\": {\n    \"root\": {\"kind\":\"controller\",\"task\":{\"title\":\"完成请求\"},\"status\":\"inactive\",\"executor\":null,\"execution\":null,\n      \"next\":[{\"to\":\"implement\"}]},\n    \"implement\": {\"kind\":\"agent\",\"task\":{\"title\":\"实施修改\",\"description\":\"写代码\"},\"status\":\"inactive\",\"executor\":null,\"execution\":null,\n      \"capability\":{\"tools\":[\"read_file\",\"apply_change\"],\"model\":\"m-1\"},\n      \"next\":[{\"to\":\"finish\"}]},\n    \"finish\": {\"kind\":\"end\",\"task\":{\"title\":\"形成结果\"},\"status\":\"inactive\",\"executor\":null,\"execution\":null,\"next\":[]}\n  }\n}"
 
 // backEdgeGraphJSON 回边图（V6 §6 示例简版）：
 // root(controller) → implement(agent) → verify(agent)

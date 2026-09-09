@@ -9,7 +9,6 @@ package bootstrap
 import (
 	"strings"
 	"testing"
-	"time"
 
 	"agentgo/internal/graph"
 	"agentgo/internal/loopcontract"
@@ -24,8 +23,7 @@ import (
 func TestGraphChangeWaker(t *testing.T) {
 	s := store.NewMemoryTaskStore(nil, 100, 1, 300)
 	source := &model.Task{ID: "task-v", Description: "验收来源任务"}
-	if err := taskcontract.Start(source, loopcontract.WorkVerification, "test-graph-recovery/v1",
-		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+	if err := taskcontract.Start(source, loopcontract.WorkVerification, "test-graph-recovery/v1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.PublishTask(source); err != nil {

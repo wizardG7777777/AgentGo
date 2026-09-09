@@ -55,7 +55,6 @@ type Instructions struct {
 
 type Input struct {
 	References        []InputReference
-	HistoryMode       string
 	Identity          llm.Identity
 	Instructions      Instructions
 	Conversation      []ConversationItem
@@ -114,19 +113,8 @@ func (r Runtime) Compile(ctx context.Context, input Input) (Compiled, error) {
 		scope.TaskID = input.Identity.TaskID
 		scope.GraphID = input.Identity.GraphID
 	}
-	projected := BusinessHistory(input.History)
-	switch input.HistoryMode {
-	case "control":
-		projected = MechanicalControlHistory(projected)
-	case "investigation-evidence":
-		projected = InvestigationEvidenceHistory(projected)
-	case "investigation-chronological":
-		projected = InvestigationChronologicalHistory(projected)
-	case "", "business":
-	default:
-		return Compiled{}, fmt.Errorf("未知历史投影模式 %q", input.HistoryMode)
-	}
-	history, projection, _, err := ProjectHistory(ctx, projected, profile.Policy, replay.Policy.Version, input.Identity.AttemptID, r.Content, scope)
+
+	history, projection, _, err := ProjectHistory(ctx, input.History, profile.Policy, replay.Policy.Version, input.Identity.AttemptID, r.Content, scope)
 	if err != nil {
 		return Compiled{}, err
 	}

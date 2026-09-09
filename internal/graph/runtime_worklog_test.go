@@ -17,7 +17,7 @@ func TestEdgeInputWorkLogFrozen(t *testing.T) {
 	var gotTaskID string
 	rt.SetWorkLogProvider(func(taskID string) string {
 		gotTaskID = taskID
-		return "read_file×3, edit_file×1 (exit≠0: 0)\n编辑文件: a.py"
+		return "read_file×3, apply_change×1 (exit≠0: 0)\n编辑文件: a.py"
 	})
 	mustSubmitRuntime(t, rt, inputGraphJSON)
 	mustTerminal(t, rt, TerminalFact{

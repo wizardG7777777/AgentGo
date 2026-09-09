@@ -41,6 +41,9 @@ const SchemaV3 = "agentgo.graph/v3"
 // RecoveryDelta v5 replay 边进入并继续同一 Delivery。v1-v3 不迁移。
 const SchemaV4 = "agentgo.graph/v4"
 
+// SchemaV5 使用统一图工具与通用执行事实，不含测试或强制观察协议。
+const SchemaV5 = "agentgo.graph/v5"
+
 // GraphDocument 是整张图的类型化模型（JSON 对外契约 + 进程内读写对象）。
 //
 // 字段所有权（由 GraphStore 的角色分离变更 API + CAS 强制，见 store.go）：
@@ -94,12 +97,12 @@ func (d *GraphDocument) RequiresDelivery() bool {
 
 // UsesDeliveryTransaction 报告 Graph schema 是否使用 Delivery v1 候选事务。
 func UsesDeliveryTransaction(schema string) bool {
-	return schema == SchemaV3 || schema == SchemaV4
+	return schema == SchemaV3 || schema == SchemaV4 || schema == SchemaV5
 }
 
 // UsesTypedTerminalContract 报告 Graph schema 是否使用 v2+ 封闭终态契约。
 func UsesTypedTerminalContract(schema string) bool {
-	return schema == SchemaV2 || schema == SchemaV3 || schema == SchemaV4
+	return schema == SchemaV2 || schema == SchemaV3 || schema == SchemaV4 || schema == SchemaV5
 }
 
 // RequiresTypedTaskOutcome 区分 legacy Execution 与 authoring Definition。
@@ -412,10 +415,7 @@ type EvidenceEntry struct {
 	// Check* 把 fulfillment 实际引用的 typed CheckRecord 冻结进
 	// Graph 证据谱系。Verifier 可复制 Ref 或同一结构化条目的 CheckRef；
 	// Runtime 只把可解引用 EvidenceEntry 中的 CheckRef 当作合法别名。
-	CheckRef             string `json:"check_ref,omitempty"`
-	CheckID              string `json:"check_id,omitempty"`
-	CheckKind            string `json:"check_kind,omitempty"`
-	CheckStatus          string `json:"check_status,omitempty"`
+
 	WorkspaceRevisionRef string `json:"workspace_revision_ref,omitempty"`
 	OutputRef            string `json:"output_ref,omitempty"`
 }
@@ -577,26 +577,14 @@ type RecoveryEditStep struct {
 	Path string `json:"path"`
 }
 
-// RecoveryCandidateCheck 是 v5 从失败 Activation 的 durable Evidence 机械
-// 投影出的最后一次 typed check。它只描述已发生事实；repair Activation 是否
-// 可以交付仍由当前 workspace revision 下的新 CheckRecord 决定。
-type RecoveryCandidateCheck struct {
-	Ref                  string `json:"ref"`
-	CheckRef             string `json:"check_ref"`
-	CheckID              string `json:"check_id"`
-	Status               string `json:"status"`
-	WorkspaceRevisionRef string `json:"workspace_revision_ref"`
-}
-
 // RecoveryCandidateState 是 v5 的 L2/L3 候选状态 handoff。该对象完全由
 // Runtime 从 failure_context 的 Delivery/Evidence authority 绑定，Recovery
 // 模型无权填写。DirtyPaths 只表示成功 mutation 事实，不授予修改或提交权限。
 type RecoveryCandidateState struct {
-	Schema             string                  `json:"schema"`
-	SourceActivationID string                  `json:"source_activation_id"`
-	DeliveryID         string                  `json:"delivery_id"`
-	DirtyPaths         []string                `json:"dirty_paths"`
-	LatestCheck        *RecoveryCandidateCheck `json:"latest_check,omitempty"`
+	Schema             string   `json:"schema"`
+	SourceActivationID string   `json:"source_activation_id"`
+	DeliveryID         string   `json:"delivery_id"`
+	DirtyPaths         []string `json:"dirty_paths"`
 }
 
 // RecoveryDelta 是 loop_recovery decision=retry 的强制结构化增量。它由

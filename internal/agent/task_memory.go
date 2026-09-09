@@ -150,13 +150,6 @@ func (rt *taskMemRuntime) applySettledTurn(a *Agent, taskID string, result Execu
 	if rt == nil || rt.mem == nil {
 		return
 	}
-	// record_observation_delta 在工具 handler 内直接更新共享 Store；先刷新
-	// 本地副本，避免随后用旧 TaskMemory 覆盖刚落盘的 Observation 投影。
-	if executeResultCalledTool(result, "record_observation_delta") {
-		if fresh, err := rt.store.Load(taskID); err == nil && fresh != nil {
-			rt.mem = fresh
-		}
-	}
 	facts := rt.collectTurnFacts(a, taskID, result)
 	if !taskmem.ApplyTurn(rt.mem, facts) {
 		return
@@ -172,16 +165,6 @@ func (rt *taskMemRuntime) applySettledTurn(a *Agent, taskID string, result Execu
 		Loop:        loop,
 		Description: rt.mem.SummaryJSON(),
 	})
-}
-
-func (rt *taskMemRuntime) observationRef(attemptID string) string {
-	if rt == nil || rt.mem == nil {
-		return ""
-	}
-	if attemptID != "" && rt.mem.LatestObservationAttemptID != attemptID {
-		return ""
-	}
-	return rt.mem.LatestObservationDeltaRef
 }
 
 func executeResultCalledTool(result ExecuteResult, name string) bool {
@@ -260,7 +243,7 @@ func (rt *taskMemRuntime) finalize(a *Agent, taskID string) {
 }
 
 // collectTurnFacts 从结构化账本收集一个 settled Turn 的 TurnFacts：
-// ToolCallRecord 增量（成功否/exit code/参数目标）、write_file 的 content
+// ToolCallRecord 增量（成功否/exit code/参数目标）、apply_change 的 content
 // hash 重算、task.Artifacts 增量、request_user_input 的用户决定正文。
 // 错误串经 callID 与本轮 ToolResults 精确连接。旧账目没有 callID 时，只在
 // tool name + args 对本轮调用形成唯一一对一匹配时保守回退。
@@ -287,12 +270,12 @@ func (rt *taskMemRuntime) collectTurnFacts(a *Agent, taskID string, result Execu
 			}
 			facts.ToolCalls = append(facts.ToolCalls, tf)
 
-			// file_written 证据：write_file 的 hash 对 content 参数重算
-			//（与 local_write 的 computeSHA256 同口径）；edit_file 只记路径。
-			if rec.Success && (rec.ToolName == "write_file" || rec.ToolName == "edit_file") {
+			// file_written 证据：apply_change 的 hash 对 content 参数重算
+			//（与 local_write 的 computeSHA256 同口径）；apply_change 只记路径。
+			if rec.Success && (rec.ToolName == "apply_change") {
 				if p, _ := rec.Args["path"].(string); p != "" {
 					fw := taskmem.FileWrittenFact{Path: p}
-					if rec.ToolName == "write_file" {
+					if rec.ToolName == "apply_change" {
 						if c, _ := rec.Args["content"].(string); c != "" {
 							sum := sha256.Sum256([]byte(c))
 							fw.Hash = hex.EncodeToString(sum[:])

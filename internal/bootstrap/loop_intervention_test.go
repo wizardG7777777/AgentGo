@@ -157,8 +157,7 @@ func TestFinalReportInterventionIsAckedWithoutCreatingBusinessGraphWake(t *testi
 	tasks := newLoopInterventionTaskStore(t)
 	source := &model.Task{ID: "final-report-source", EventType: "__scheduler__", EventSource: "graph-ended",
 		FinalReportGraphID: "g-finished", MaxConcurrency: 1}
-	if err := taskcontract.Start(source, loopcontract.WorkFinalization, "test-finalization/v1",
-		10*time.Minute, 30*time.Second, 90*time.Second); err != nil {
+	if err := taskcontract.Start(source, loopcontract.WorkFinalization, "test-finalization/v1"); err != nil {
 		t.Fatal(err)
 	}
 	source.RunPhase = runcontract.PhaseFinalization
@@ -234,7 +233,7 @@ func TestLoopInterventionBridgeUsesGraphRecoveryControllerAndAcksItsOutcome(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	coordination, ok := catalog.ProgressContract(policycatalog.ProgressCoordinationV1)
+	coordination, ok := catalog.ProgressContract(policycatalog.ProgressCoordinationCurrent)
 	if !ok {
 		t.Fatal("缺少 coordination ProgressContract")
 	}
@@ -411,15 +410,15 @@ func publishTerminalInterventionSource(t *testing.T, tasks *store.MemoryTaskStor
 	if err != nil {
 		t.Fatal(err)
 	}
-	profile, ok := catalog.ProgressContract(policycatalog.ProgressInvestigationV1)
+	profile, ok := catalog.ProgressContract(policycatalog.ProgressInvestigationCurrent)
 	if !ok {
 		t.Fatal("缺少 investigation ProgressContract")
 	}
 	now := time.Now().UTC()
 	run := &runcontract.RunContract{
-		Schema: runcontract.SchemaV1, RunID: runcontract.RunID("run-" + id), CreatedAt: now,
-		DeadlineAt: now.Add(time.Hour), FinalizationReserve: time.Minute,
-		RecoveryReserve: time.Minute, BudgetProfile: "test/v1",
+		Schema: runcontract.SchemaCurrent, RunID: runcontract.RunID("run-" + id), CreatedAt: now,
+		DeadlineAt:    now.Add(time.Hour),
+		BudgetProfile: "test/v1",
 	}
 	source := &model.Task{
 		ID: id, Description: "source", RunID: run.RunID, RunContract: run,

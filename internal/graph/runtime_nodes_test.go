@@ -1467,7 +1467,7 @@ func TestDigestCoversKindSpecs(t *testing.T) {
 		},
 		"tool.name变化": func(doc *GraphDocument) {
 			n := doc.Nodes["t"]
-			n.Tool.Name = "write_file"
+			n.Tool.Name = "apply_change"
 			doc.Nodes["t"] = n
 		},
 		"tool.args变化": func(doc *GraphDocument) {

@@ -1,3 +1,14 @@
+> **当前工具契约（2026-09-09）**：新运行使用四类工具。下文保留历史事件的读取说明；Observation/check/旧草案阶段事件仅用于旧 Trace 展示，不表示当前仍会生成。当前行为与版本以 [工具契约](docs/design/tool-taxonomy-and-contracts.md) 为准。
+
+## 当前工具执行事实
+
+- tool_call 是调用处理开始，发生在 gate 之前；不能按它计真实进程执行次数。
+- tool_result 带 invocation_id、call_id、tool_dispatched、有界 tool_result_content 或内容引用。不同 Invocation 内相同 call_id 是不同调用；预留/授权拒绝保留未派发回执。
+- shell_executed 的 shell_exec 使用 agentgo.shell-execution/v2：process_started 说明进程是否创建；exit_code 缺席表示无法报告退出码，不能补 0；exit_code_scope 区分 whole_command/last_pipeline_command。Outcome 区分 success/failure/start_failed/timeout/cancelled。
+- Shell 取消/超时保留部分输出；工具结果持久化失败不能放行后续动作。命令非零退出不是 pytest 判题或架构事故的同义词。
+- 新 Graph apply 回执包含实际 added/changed/removed 节点摘要、revision、definition_digest 与 source_request；运行事实经 inspect_board/inspect_node/read_evidence 查询。
+- 同一调用按 Run/Task/Attempt/Turn/Invocation/CallID/ActionID 关联。模型完整输出与工具执行结果分别保存，UI 文本不替代执行账本。
+
 > **L1/L2 重建（2026-09-07）**：L2 装配完整请求，L1 执行 SSE 与归一化响应；旧请求/配置/历史不转换。当前实现与验证边界以 [五层规范](docs/design/five-layer-engineering-architecture.md) 为准。
 
 # TraceGuide：Trace 系统使用说明书（Agent 排错分析指南）

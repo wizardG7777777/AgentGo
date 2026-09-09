@@ -96,8 +96,7 @@ func TestWatchdogReportCarriesRunAndSessionEnvelope(t *testing.T) {
 	w, _, _, schedBox := newWatchdogWithMailbox(t)
 	w.SessionID = func() string { return "session-watchdog" }
 	task := &model.Task{ID: "watchdog-run-source", Description: "new Run", ReplyToAgentID: "scheduler"}
-	if err := taskcontract.Start(task, loopcontract.WorkInvestigation, "test-watchdog-mail/v1",
-		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+	if err := taskcontract.Start(task, loopcontract.WorkInvestigation, "test-watchdog-mail/v1"); err != nil {
 		t.Fatal(err)
 	}
 	w.sendCrashReport(task, "结构化故障", time.Second)

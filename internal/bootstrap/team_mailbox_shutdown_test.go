@@ -70,7 +70,7 @@ func newShutdownMailboxTestEnv(t *testing.T) *shutdownMailboxTestEnv {
 	}
 	provisioned, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: "controller-shutdown-mailbox",
-		TemplateRef:      "builtin/explorer@1", Purpose: "persist shutdown unread mail", Replicas: 1,
+		TemplateRef:      "builtin/explorer@2", Purpose: "persist shutdown unread mail", Replicas: 1,
 	})
 	if err != nil {
 		manager.Shutdown()

@@ -1112,7 +1112,7 @@ func TestQueryToolCalls_FilterByToolName(t *testing.T) {
 
 	// 插入 3 种工具各 2 次
 	base := time.Now()
-	for i, tool := range []string{"read_file", "write_file", "grep_search"} {
+	for i, tool := range []string{"read_file", "apply_change", "grep_search"} {
 		for j := 0; j < 2; j++ {
 			s.AppendToolCall(task.ID, ToolCallRecord{
 				Timestamp: base.Add(time.Duration(i*2+j) * time.Millisecond),
@@ -1152,7 +1152,7 @@ func TestQueryToolCallsEqualTimestampHasDeterministicTieBreak(t *testing.T) {
 	// 故意逆序写入不同 toolName（底层按 toolName 分 map 存放）；全量查询不能
 	// 依赖 map 遍历顺序，也不能只比较相等 Timestamp。
 	for _, rec := range []ToolCallRecord{
-		{Timestamp: stamp, CallID: "call-z", AgentID: "b", ToolName: "write_file", Args: map[string]any{"path": "z"}},
+		{Timestamp: stamp, CallID: "call-z", AgentID: "b", ToolName: "apply_change", Args: map[string]any{"path": "z"}},
 		{Timestamp: stamp, CallID: "call-a", AgentID: "a", ToolName: "read_file", Args: map[string]any{"path": "a"}},
 	} {
 		if err := s.AppendToolCall(task.ID, rec); err != nil {

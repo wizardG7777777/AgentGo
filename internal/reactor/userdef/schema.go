@@ -2,7 +2,7 @@
 //
 // 已实现动词（互斥，每个 reactor 恰好一个）：
 //   - publish_task — 投递任务到公告板
-//   - invoke_llm — 一次性 LLM 调用 + 三 sink 输出（write_file / send_message / emit_trace）
+//   - invoke_llm — 一次性 LLM 调用 + 三 sink 输出（apply_change / send_message / emit_trace）
 //   - spawn_agent — 启动 ad-hoc agent（可含 via_translator 二次加工）
 //   - call — §6.1 B 选项：直接调用内置工具（v1 仅支持 send_message）
 //   - request_replan — 发布通用 replan 唤醒任务给 Scheduler（C6b 起 Plan 控制面已删除）
@@ -104,7 +104,7 @@ type InvokeLLMAction struct {
 //
 // 启动期校验：恰好一个字段非 nil。运行时把 LLM 文本输出投递到该 sink。
 type OutputSpec struct {
-	WriteFile   *WriteFileSink   `yaml:"write_file,omitempty" json:"write_file,omitempty"`
+	WriteFile   *WriteFileSink   "yaml:\"apply_change,omitempty\" json:\"apply_change,omitempty\""
 	SendMessage *SendMessageSink `yaml:"send_message,omitempty" json:"send_message,omitempty"`
 	EmitTrace   *EmitTraceSink   `yaml:"emit_trace,omitempty" json:"emit_trace,omitempty"`
 }
@@ -117,7 +117,7 @@ type WriteFileSink struct {
 	Path string `yaml:"path" json:"path"`
 }
 
-// UnmarshalYAML 同时接受字符串短形式 (write_file: ./logs/x.md) 和结构形式 (write_file: {path: ...})。
+// UnmarshalYAML 同时接受字符串短形式 (apply_change: ./logs/x.md) 和结构形式 (apply_change: {path: ...})。
 // 短形式与 §6.1.4 spec 的 YAML 例子一致。
 func (s *WriteFileSink) UnmarshalYAML(unmarshal func(any) error) error {
 	var asStr string

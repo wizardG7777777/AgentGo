@@ -22,7 +22,7 @@ func TestApplyTurn_FileWrittenConfirmed(t *testing.T) {
 		t.Fatalf("Files = %+v, want a.go/hash-1", m.Files)
 	}
 
-	// edit_file 后续写入：空 hash 保留旧 hash，UpdatedAt 刷新。
+	// apply_change 后续写入：空 hash 保留旧 hash，UpdatedAt 刷新。
 	before := m.Files[0].UpdatedAt
 	time.Sleep(time.Millisecond)
 	if !ApplyTurn(m, TurnFacts{FilesWritten: []FileWrittenFact{{Path: "a.go"}}}) {
@@ -162,17 +162,17 @@ func TestApplyTurn_NoChangeNoVersionNoSave(t *testing.T) {
 func TestApplyTurn_BlockerSupersede(t *testing.T) {
 	m := New("task-1")
 	ApplyTurn(m, TurnFacts{ToolCalls: []ToolCallFact{
-		{Name: "write_file", Target: "x.go", Success: false, Err: "[拒绝] 原因码=exec_mode_readonly retryable=false 说明=readonly 模式"},
+		{Name: "apply_change", Target: "x.go", Success: false, Err: "[拒绝] 原因码=exec_mode_readonly retryable=false 说明=readonly 模式"},
 	}})
-	if len(m.Blockers) != 1 || !strings.Contains(m.Blockers[0], "write_file x.go") {
-		t.Fatalf("Blockers = %+v, want 一条 write_file x.go", m.Blockers)
+	if len(m.Blockers) != 1 || !strings.Contains(m.Blockers[0], "apply_change x.go") {
+		t.Fatalf("Blockers = %+v, want 一条 apply_change x.go", m.Blockers)
 	}
 	if len(m.Failures) != 1 {
 		t.Fatalf("失败同时应进 Failures, got %+v", m.Failures)
 	}
 
 	ApplyTurn(m, TurnFacts{ToolCalls: []ToolCallFact{
-		{Name: "write_file", Target: "x.go", Success: true},
+		{Name: "apply_change", Target: "x.go", Success: true},
 	}})
 	if len(m.Blockers) != 0 {
 		t.Errorf("同目标成功后阻塞应被清除, Blockers = %+v", m.Blockers)
@@ -252,7 +252,7 @@ func TestEnforceBudgets_SectionsBounded(t *testing.T) {
 	// 通过工具调用灌入 Actions 与 Failures（走公开入口）。
 	facts := TurnFacts{}
 	for i := 0; i < MaxActions+10; i++ {
-		facts.ToolCalls = append(facts.ToolCalls, ToolCallFact{Name: "write_file", Target: fmt.Sprintf("w%02d.go", i), Success: true})
+		facts.ToolCalls = append(facts.ToolCalls, ToolCallFact{Name: "apply_change", Target: fmt.Sprintf("w%02d.go", i), Success: true})
 	}
 	for i := 0; i < MaxFailures+5; i++ {
 		facts.ToolCalls = append(facts.ToolCalls, ToolCallFact{Name: "web_fetch", Target: fmt.Sprintf("u%02d", i), Success: false, Err: "e"})
@@ -275,7 +275,7 @@ func TestEnforceBudgets_SectionsBounded(t *testing.T) {
 		t.Errorf("NextCandidates = %d, want %d", len(m.NextCandidates), MaxNextCandidates)
 	}
 	// Actions 滚动保留最近：最早的 w00 应已淘汰，最新的 w29 应在。
-	if m.Actions[0].Caption == "write_file w00.go" {
+	if m.Actions[0].Caption == "apply_change w00.go" {
 		t.Error("Actions 应淘汰最旧条目")
 	}
 	last := m.Actions[len(m.Actions)-1].Caption

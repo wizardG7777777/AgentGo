@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"agentgo/internal/agent"
-	"agentgo/internal/graph"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
@@ -29,42 +28,16 @@ func findReplanWake(t *testing.T, s store.TaskStore, marker string) []*model.Tas
 	return wakes
 }
 
-func TestRecoveryDecisionSchemaConditionallyRequiresBranchFields(t *testing.T) {
+func TestControlToolsDoNotRegisterRetiredProtocols(t *testing.T) {
 	registry := agent.NewToolRegistry()
-	PlanControlGroup{
-		Store: store.NewMemoryTaskStore(nil, 8, 1, 60), Holder: &fakeHolder{id: "recovery"},
-		FinalizationNotifier: &fakeFinalizationNotifier{}, SubmitState: agent.NewSubmitState(),
-		RecoveryAuthority: (*graph.Runtime)(nil),
-	}.Register(registry)
-	var parameters map[string]any
-	for _, definition := range registry.Defs() {
-		if definition.Name == "submit_recovery_decision" {
-			parameters = definition.Parameters
-			break
+	PlanControlGroup{Store: store.NewMemoryTaskStore(nil, 8, 1, 60), Holder: &fakeHolder{id: "work"}, FinalizationNotifier: &fakeFinalizationNotifier{}, SubmitState: agent.NewSubmitState()}.Register(registry)
+	if len(registry.Names()) != 2 {
+		t.Fatalf("仅应注册结果提交和重规划请求：%v", registry.Names())
+	}
+	for _, name := range registry.Names() {
+		if name != "submit_task_result" && name != "request_replan" {
+			t.Fatalf("出现旧控制工具：%s", name)
 		}
-	}
-	allOf, ok := parameters["allOf"].([]any)
-	if !ok || len(allOf) != 2 {
-		t.Fatalf("recovery decision 缺少 retry/blocked 条件必填 schema: %#v", parameters)
-	}
-	encoded := fmt.Sprintf("%#v", allOf)
-	for _, want := range []string{"changed_dimensions", "first_action", "expected_milestone", "blocked_reason"} {
-		if !strings.Contains(encoded, want) {
-			t.Fatalf("conditional schema 缺少 %s: %s", want, encoded)
-		}
-	}
-	properties := parameters["properties"].(map[string]any)
-	for _, field := range []string{"strategy", "expected_milestone"} {
-		property := properties[field].(map[string]any)
-		if property["maxLength"] != 600 {
-			t.Fatalf("recovery 字段 %s 未与 Runtime 600 rune 上限对齐: %#v", field, property)
-		}
-	}
-	firstAction := properties["first_action"].(map[string]any)
-	firstActionProperties := firstAction["properties"].(map[string]any)
-	tool := firstActionProperties["tool"].(map[string]any)
-	if tool["type"] != "string" || len(tool["enum"].([]any)) == 0 {
-		t.Fatalf("first_action.tool 未冻结受支持工具枚举: %#v", firstAction)
 	}
 }
 

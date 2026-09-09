@@ -3,7 +3,7 @@ package runner
 import "sync"
 
 // CurrentTaskHolder 线程安全地保存 Runner 当前正在执行的任务 ID。
-// 实现 tools.TaskHolder 接口（Get），供 MetaGroup.publish_task 工具
+// 实现 tools.TaskHolder 接口（Get），供 CommunicationGroup.publish_task 工具
 // 在发布子任务时定位父任务、检查深度限制。
 //
 // 取自 internal/worker.currentTaskHolder + internal/explorer.currentTaskHolder

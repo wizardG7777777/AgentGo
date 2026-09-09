@@ -26,12 +26,12 @@ func TestResolveToolGroups_WiresInteractionDependencies(t *testing.T) {
 		agent.NewFileStateCache(1), &tools.DefaultWorkdir{}, hook)
 
 	var shellGroup *tools.ShellGroup
-	var metaGroup *tools.MetaGroup
+	var metaGroup *tools.CommunicationGroup
 	for i := range groups {
 		if sg, ok := groups[i].(tools.ShellGroup); ok {
 			shellGroup = &sg
 		}
-		if mg, ok := groups[i].(tools.MetaGroup); ok {
+		if mg, ok := groups[i].(tools.CommunicationGroup); ok {
 			metaGroup = &mg
 		}
 	}
@@ -48,16 +48,16 @@ func TestResolveToolGroups_WiresInteractionDependencies(t *testing.T) {
 		t.Fatal("ShellGroup.InteractionWaitHook 未接线")
 	}
 	if metaGroup == nil {
-		t.Fatal("resolveToolGroups 应包含 MetaGroup")
+		t.Fatal("resolveToolGroups 应包含 CommunicationGroup")
 	}
 	if metaGroup.Interactions != interactions {
-		t.Fatal("MetaGroup.Interactions 未接线")
+		t.Fatal("CommunicationGroup.Interactions 未接线")
 	}
 	if metaGroup.SessionID == nil || metaGroup.SessionID() != "session-test" {
-		t.Fatal("MetaGroup.SessionID 未接线")
+		t.Fatal("CommunicationGroup.SessionID 未接线")
 	}
 	if metaGroup.InteractionWaitHook == nil {
-		t.Fatal("MetaGroup.InteractionWaitHook 未接线")
+		t.Fatal("CommunicationGroup.InteractionWaitHook 未接线")
 	}
 
 	shellGroup.InteractionWaitHook(true)
@@ -101,8 +101,8 @@ func TestResolveToolGroups_AcceptanceRoleGetsHardenedShell(t *testing.T) {
 // runtime 不注入加固灰名单。
 func TestResolveToolGroups_NonAcceptanceRoleKeepsShellUnchanged(t *testing.T) {
 	for _, allowed := range [][]string{
-		{"read_file", "run_shell", "write_file", "submit_task_result"},
-		{"read_file", "run_shell", "edit_file"},
+		{"read_file", "run_shell", "apply_change", "submit_task_result"},
+		{"read_file", "run_shell", "apply_change"},
 		{"read_file", "grep_search"}, // 无 run_shell：shell 非其通道，不加固
 		nil,                          // 单测直构场景：nil 白名单不加固（生产 kind 必有非空白名单）
 	} {

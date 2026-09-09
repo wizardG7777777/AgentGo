@@ -1,218 +1,69 @@
-# 工具集与 Agent Profile（v5）
+# 工具与 Agent Profile
 
-> 状态：已实现（2026-07）
->
-> 配置权威源：[`internal/config/config.go`](../internal/config/config.go)
->
-> 完整示例：[`config.example.yaml`](../config.example.yaml)
+当前工具目录与实施进度见 [工具契约](design/tool-taxonomy-and-contracts.md)。旧 profile 说明已归档至 [历史版本](archived/tool-profiles-before-four-categories.md)。当前已注册新入口，旧名称没有兼容别名。
 
-## 1. 当前配置模型
+## 核心目录
 
-`tool_profiles` 只负责把一组真实工具名绑定到一个可复用名称；每个预热 Agent kind 在 `agents:` 中通过 `profile` 引用它，或直接用 `tools` 内联工具名。省略 `agents:` 时 AgentGo 仍可启动 Scheduler，并从 AgentTemplate 按需创建执行 Agent。
+| 类别 | 工具 |
+|---|---|
+| 执行 | run_shell、read_file、apply_change、submit_task_result |
+| 编排 | read_graph_definition、apply_graph_change、control_graph、request_replan |
+| 检视 | inspect_board、inspect_node、read_evidence |
+| 通信 | send_message、request_user_input |
+
+web_search/web_fetch、list_agent_templates/provision_agent_team 是可选能力，不属于核心 13 项。目录权威在 [known_tools.go](../internal/tools/known_tools.go)；不能以目录数量代替实际注册与授权检查。
+
+## 配置
+
+每个 agents 项必须在 profile 引用和 tools 内联列表中二选一。profile 只是工具名集合，不会使工具获得越过路径、任务或图作用域的权限。
 
 ```yaml
 tool_profiles:
-  worker_standard:
+  executor:
     - read_file
-    - list_dir
-    - grep_search
-    - glob_search
-    - read_content_ref
-    - write_file
-    - edit_file
+    - apply_change
     - run_shell
-    - run_check
-    - web_search
-    - web_fetch
+    - inspect_node
+    - read_evidence
     - send_message
-    - request_user_input
     - request_replan
-
-  acceptance_verifier:
-    - read_file
-    - list_dir
-    - grep_search
-    - glob_search
-    - read_content_ref
-    - web_search
-    - web_fetch
     - submit_task_result
-
 agents:
   - kind: worker
-    replicas: 2
+    replicas: 1
     event_type: ""
-    profile: worker_standard
-    model: gpt-4o
+    profile: executor
+    model: ${SWE_FLAG_SHIP_MODEL}
     system_prompt_file: prompts/worker.md
     task_max_retries: 3
-    context_limit: 16000
-    description: 通用执行代理，能修改代码和运行命令。
-
-  - kind: verifier
-    replicas: 1
-    event_type: acceptance.verify
-    profile: acceptance_verifier
-    model: gpt-4o-mini
-    system_prompt_file: prompts/program_verifier.md
-    task_max_retries: 2
-    context_limit: 12000
-    description: 正式验收代理，读取交付物与上游证据并提交结构化结论。
 ```
 
-如果声明了 `agents:`，每个 `agents[*]` 必须在 `profile` 和 `tools` 中恰选一个：
+完整可加载示例见 [config.example.yaml](../config.example.yaml)。测试配置为 [setting.v4.yaml](../setting.v4.yaml)、[setting.test-concurrent.yaml](../setting.test-concurrent.yaml)、[setting.swe-flask.yaml](../setting.swe-flask.yaml)；最后一个由 Python 渲染占位符，不直接启动模板。
 
-```yaml
-agents:
-  - kind: readonly-reviewer
-    replicas: 1
-    event_type: review.readonly
-    tools: [read_file, list_dir, grep_search, glob_search, request_replan]
-    model: gpt-4o-mini
-    system_prompt_file: prompts/explorer.md
-    task_max_retries: 2
-    context_limit: 8000
-```
+文件配置必须显式包含 llm.request_contract=agentgo.model-request/v1。协议只接受 responses/chat_completions，均为 SSE。llm.stream、observation_model 和 max_subtask_depth 退役；旧文件须删除这些字段后使用新工具名，不能靠设零或隐藏 fallback 继续旧行为。
 
-同一个 kind 的 `replicas` 完全同质。若需要不同权限、模型或提示词，应声明多个 kind；不存在 `workers:`、`worker_profile`、`explorer_profile` 或 `agent_declarations` 这类当前配置字段。旧 v3 顶层字段会被解析器忽略，不会产生运行时效果。
+## 角色权限
 
-## 2. 可用工具
+- Scheduler 原始请求使用图工具和检视/通信；图中的 controller 处理编排。solo 模式执行工作也通过显式 agent 节点，不恢复脱图执行旁路。
+- Worker 可声明文件读写和 Shell。Explorer 可用 Shell 搜索，但不给 apply_change 不代表 Shell 在操作系统层面只读；环境隔离与角色指令分别负责各自边界。
+- Verifier/acceptance 的只读闭集由 agent.IsAcceptanceToolAllowed 统一提供给 Graph 路由和 ExecutionLease 校验，包含 read_file、inspect_board、inspect_node、read_graph_definition、read_evidence、可选 web 工具及 submit_task_result。授权通过后仍必须实际注册该工具。
+- 普通 Graph agent 不能通过自选 capability 获得 apply_graph_change/control_graph；修改图要 request_replan，由有编排权限的主体应用。节点 kind 是角色权威，不根据自定义 route 字符串猜权限。
+- per-node capability 是 route 能力与运行策略内的子集，越界明确拒绝。新的 ExecutionLease v3 冻结本次能力，ToolRouter 同时约束模型看到的 schema 和实际 dispatch。
 
-| 工具 | 分组 | 用途 |
-|---|---|---|
-| `read_file` | LocalReadGroup | 读取文件 |
-| `list_dir` | LocalReadGroup | 列出目录，可递归 |
-| `grep_search` | LocalReadGroup | 搜索文本；`pattern_mode=literal|regex`，默认 literal，`|` 只有 regex 模式才表示 alternation |
-| `glob_search` | LocalReadGroup | 按 glob 查找文件 |
-| `read_content_ref` | ContentRefGroup | 在冻结 ExecutionLease 与 scope 下分页读取 L2 外置正文 |
-| `write_file` | LocalWriteGroup | 创建或覆盖文件 |
-| `edit_file` | LocalWriteGroup | 精确编辑文件 |
-| `run_shell` | ShellGroup | 执行命令 |
-| `run_check` | CheckGroup | 运行无 pipeline/重定向的 typed 检查，生成绑定 workspace revision 的 durable CheckRecord；仅从已有 run_shell 权限派生 |
-| `web_search` | WebGroup | 网络搜索 |
-| `web_fetch` | WebGroup | 获取网页内容 |
-| `publish_task` | MetaGroup | 发布 legacy/恢复兼容子任务；Graph 节点普通 Agent 不可用它改图 |
-| `send_message` | MetaGroup | 发送 Agent 消息 |
-| `request_user_input` | MetaGroup | 创建 2–8 选项的普通 `agent_question`，等待后只返回 `request_id`、稳定 `option_id` 与 `text` |
-| `request_replan` | PlanControlGroup | 提交事实，请 Scheduler 重新评估编排（非图任务发布通用 replan 唤醒任务） |
-| `submit_task_result` | PlanControlGroup | 普通执行节点的结构化提交（Graph acceptance runner 以 `verdict=pass|fixable|failed` 提交结论；completed 结果省略 `event`） |
-| `record_observation_delta` | ObservationGroup | 记录当前 Task/Attempt 的 inferred claims、EvidenceRef 与下一步；framework 自动注入 Graph agent control phase |
-| `submit_recovery_decision` | PlanControlGroup | recovery controller 专用 typed retry/blocked；source authority 由 framework 自动绑定 |
-| `submit_change_decision` | PlanControlGroup | RecoveryDelta v4 work 专用 typed edit/need_context/hypothesis_rejected/blocked；仅证据完整覆盖后的 control phase 暴露 |
+内置模板为 builtin/generalist@2、builtin/explorer@2、builtin/verifier@2。可选 Team 必须先注册到实际图作用域且达到 ready，再提供路由；模板声明不代表活跃 Agent 状态。
 
-`record_observation_delta` 与 `submit_change_decision` 是 framework control tool，
-不需要写入用户 profile。前者只在冻结 ProgressContract 的 Graph agent
-Observation phase 获得；后者只在带 v4 `recovery_directive` 的 Graph work Lease
-获得。历史 Lease 不扩大，acceptance、unknown role 与非 Graph task 不会因此
-获得这些能力。
+## 执行与检视
 
-以下 Plan 工具已随 V6（C6a/C6b）全部删除，不要再写入 profile：
+apply_change 统一创建、覆盖与替换；旧 write_file/edit_file 已删除。所有 run_shell 调用经统一通道记录关联身份、实际派发、进程状态、退出码作用域、耗时与输出。取消和超时不伪造成功退出，命令结果不等于 Python 判题结论。
 
-- `continue_waiting` / `define_acceptance_spec` / `ensure_acceptance_run` / `supersede_tasks` / `finalize_plan` / `mark_plan_blocked` / `submit_plan_for_review` / `get_retired_node` / `get_acceptance_evidence` / `submit_acceptance_result`
+inspect_board/inspect_node 是读取运行事实，不创建工作、不推进状态。read_evidence 按调用方的 Session/Run/Task/Graph 作用域解引用，不能拿 provider call_id 或任意路径冒充 EvidenceRef。
 
-以下工具由 Scheduler 内置装配，不通过 profile 配置：
+send_message 仅投递信息，返回投递回执；不承诺已读，不唤醒、不打断、不创建 Task/Activation。用户交互使用 request_user_input；未回答不等于批准。
 
-- `cancel_task`
-- `list_agent_templates`：查询内置、user 和 project Catalog；不代表这些 Agent 已经运行。**2026-08-20 起 `agent_templates.enabled` 缺省 `false`，默认不注册本工具**
-- `provision_agent_team`：从模板创建一个或多个真实运行实例并注册 ready route；Graph-first 时先决定并显式传 `graph_id`，下一轮把返回的真实 route 写入该 Graph 节点。**同上，默认搁置不注册**
-- `report_done`：legacy `publish_task` batch 的显式收尾；Graph 由节点转移到 `end` 收尾
-- `report_progress`
-- `probe_directory`
+## 删除与验证
 
-系统支持的工具名以 [`internal/tools/known_tools.go`](../internal/tools/known_tools.go) 为准。启动时会校验 profile 和内联 `tools` 中的拼写。
+run_check、record_observation_delta、submit_change_decision、旧模型草案步骤、旧消息发布任务与旧结果查询入口退役。依赖这些工具的提示词、模板、测试和配置必须同步迁移，不能只改 schema 名称。
 
-Interaction Service 本身不是可由 profile 授予的特权 effect 通道，但 MetaGroup 的 `request_user_input` 是可授权 Agent tool。它只接受 `prompt` 与 `options_json`：后者必须是 2–8 项 JSON 数组，每项仅允许 `{id,label,description?,requires_text?}`；未知字段（尤其 ActionRef/Resolution/Metadata）拒绝。该适配器固定创建 `Kind=choice` / `Purpose=agent_question`，只把 `request_id`、稳定 `option_id` 与 `text` 返回 Agent。Scheduler 使用无 allowlist registry，Interaction Service 可用时自动获得它；普通 runner 必须在 profile 或内联 `tools` 中列出。
+配置检查使用 `agentgo config doctor`；Go 与本地二进制验证见工具契约第 13 章。真正的 SWE 评测仍由外部 Python 程序承担，本次不执行真实 SWE。
 
-Graph approval 与 Shell authorization 是两条独立边界：Graph 执行前审阅用 `approval` 节点及 `graph_approval` Interaction；灰名单命令使用精确绑定的 `shell_command` Interaction。前端只能提交稳定 Option ID，不得接触服务端 `ActionRef`，Agent 也不得通过普通聊天、`request_user_input` 或任何其他 tool 推断、代替或制造这些特权选择。
-
-## 3. Graph 权限边界
-
-一个 Graph activation 对应一个 Task，但 Agent profile 只决定“这个 Task 可以调用哪些工具”，不决定 Graph 修改权限或 Scheduler 唤醒权限。
-
-- Scheduler 通过 `submit_graph` / `patch_graph` 决定拓扑；普通节点不能直接修改 GraphDocument。
-- 普通 Graph 节点需要增加、替换或拆分任务时调用 `request_replan`，由 graph change 唤醒 Scheduler 裁决。
-- Task 终态由 `graph-terminal-feed` 回填 Runtime 并推进转移，与 Agent kind、`event_type` 和 profile 无关。
-- 普通 Agent 即使 profile 中错误地包含 `publish_task`，也不能把新 Task 伪装成当前 Graph 的节点 activation。
-- 未纳入 Graph 的 legacy/恢复兼容工作流仍可显式授予 `publish_task`。
-- 用户 Reactor 只能发布任务或消息让主循环自然推进，不得直接写 Graph 状态或驱动节点状态迁移。
-
-默认 Worker profile 因此不需要 `publish_task`。详细不变量见 [`archived/DynamicDAG.md`](archived/DynamicDAG.md)（V6 前历史文档）。
-
-### 3.1 AgentTemplate 与 profile 的边界
-
-AgentTemplate 和 `tool_profiles` 不是同一层复用机制：
-
-- `tool_profiles` 只给主配置中的预热 `agents:` 复用工具名列表；
-- AgentTemplate 是完整且可版本化的实例化定义，包含能力标签、真实 tools、模型、提示词、运行边界与容量；
-- 外部模板必须直接列 `tools`，v1 不允许引用主配置 profile，避免模板从 user/project 目录移动后权限含义发生隐式变化；
-- 模板的 `capabilities` 只是 Scheduler 选型提示，不会授予任何权限；runtime allowlist 仍以 `tools` 为准；
-- 模板不能包含 Scheduler 独占的拓扑控制工具。普通模板需要增删节点时只能 `request_replan`；verifier 模板适合持有 `submit_task_result`（经 `verdict=pass|fixable|failed` 提交验收结论，completed 结果省略 `event`）。
-
-内置模板提供三组保守能力：`builtin/generalist@1` 用于实现，`builtin/explorer@1` 用于只读调查，`builtin/verifier@1` 用于正式验收。项目可以在 `agent-templates/` 中添加更专业的 `project/*` 模板，但不能覆盖内置 ref。
-
-Scheduler-only 启动时，Catalog 中存在模板不代表已经存在 route。Graph-first 时 Scheduler 必须先决定合法 `graph_id`，带同一 ID provision 实例，下一轮取得真实 route 后再提交引用它的 Graph；不能把模板名、capability 或预期 kind 当作 `event_type` 猜测。Team 绑定 `graph:<id>` 并存活到 `graph_ended`，origin Scheduler task 终态不会撤销该 route；省略 `graph_id` 仅是 legacy task-owned 路径。`submit_graph` / `patch_graph` 会对 route owner scope 与 capability fail-closed 校验。详见 [`activate/AgentTemplate.md`](activate/AgentTemplate.md)。
-
-## 4. 验收 Profile（Graph acceptance 节点 runner）
-
-验收 Agent 的工具面必须落在以下闭集：
-
-1. `submit_task_result`（用 `verdict` 字段提交 `pass` / `fixable` / `failed` 结论，写 `Results["verdict"]` 供 `$.verdict` 精确边条件；completed 结果必须省略 `event`，无法判定时用 `status=blocked`）；
-2. 验收判据实际需要的 read/list/grep/glob/web 工具。除此之外的工具（包括写入、Shell、消息、发任务、用户交互、`request_replan` 和当前未实现的 MCP）一律拒绝；CLI/Shell 检查由实现节点下游、无文件写工具的普通 checker agent 执行后经 Graph 数据流传入。
-
-自定义的是验收 runner 与判据；验收结论驱动图边路由由 Graph Runtime 统一完成。验收 agent 可经 `submit_task_result.cited_evidence` 复制任务描述中已展示且实际消费的稳定 EvidenceRef；不得按展示顺序构造或把 CallID/ResultRef 当作 EvidenceRef。服务端做谱系核验，越谱系引用（disputed）会使 verdict 不被采信、节点 failed 并唤醒 Graph change；不引用不影响采信。
-
-Graph compiler 会对 acceptance 的**实际工具面**做正向闭集校验：route 必须含 `submit_task_result`，且 route 保证工具或 per-node 明确收窄后的工具集合只能包含 `read_file`、`list_dir`、`grep_search`、`glob_search`、`web_search`、`web_fetch`、`read_content_ref`、`submit_task_result`；acceptance 也不得路由给 Scheduler。该约束是工具面隔离，不是 OS sandbox；`read_content_ref` 仍需当前 Task 的冻结 Lease 与 Session/Graph/Task scope，其他只读工具仍受各自网络与文件边界约束。
-
-Evidence 只证明调用及其结果，不证明同一节点内“最后一次写入之后”的时序。判据要求可证明的新鲜测试/构建时，必须使用 `implement → checker → acceptance`，由 Graph 因果边证明 checker 晚于实现，不能让 verifier 从 Evidence 展示顺序、CallID 或时间戳猜测。
-
-## 5. 能力感知路由
-
-Board Snapshot 的 `resources.agent_capabilities` 只列出**已经运行**的 Agent 及其实际注册工具，`resources.specialized_agents` 则提供真实 `event_type`、实例数量、忙闲状态和自然语言 role；模板 Catalog 是尚未 provision 的候选能力，两者不能混为一张资源表。Scheduler 路由时应同时检查：
-
-- 写入任务：目标包含 `write_file` 或 `edit_file`；
-- 命令任务：目标包含 `run_shell`；
-- Graph 验收：目标路由 `acceptance.verify`（或包含 `submit_task_result` 与所需检查工具的验收 Agent）；
-- 纯调查：优先选择只有读取/搜索能力的 Agent；
-- `event_type` 必须对应已声明、可认领的 Agent。
-
-没有合适的运行 route 时，Scheduler 应先从 Catalog 选择模板并 provision；没有合适模板时应向用户说明缺失能力或挂起，而不是发布无人消费的 Task。
-
-不要使用 `code_edit`、`shell_exec` 等未注册的抽象标签代替真实工具名。
-
-## 6. 校验规则与常见错误
-
-- `agents` 可以省略；一旦声明，每个 `kind` 仍须唯一且 `replicas >= 1`。
-- `profile` 必须存在于 `tool_profiles`；`profile` 与 `tools` 不能并存，也不能都缺失。
-- `system_prompt_file` 必须存在且可读。
-- `task_max_retries` 必须为正数；`agent_max_loops`、`context_limit`、`enforce_compact_token_threshold` 均已移除并提供显式迁移诊断。
-- Scheduler 的工具集由真实 ExecutionLease 冻结，再按 Invocation phase 收窄 ToolRouter；`scheduler:` 只覆盖模型。
-- 空 profile 会在配置校验阶段被拒绝；ToolRegistry 的非 nil 空 allowlist 语义是“拒绝全部”，不会再 fail-open。要做最小权限 Agent，请至少列出它确实需要的工具。
-- 外部 AgentTemplate 一文件一个模板，直接列 tools；`system_prompt` / `system_prompt_file` 恰选一个，ref、版本、digest 和容量在加载期校验。
-
-典型错误：
-
-```yaml
-agents:
-  - kind: worker
-    profile: worker_standard
-    tools: [read_file]   # 错误：二者只能选一个
-```
-
-```yaml
-agents:
-  - kind: worker
-    profile: missing_profile   # 错误：tool_profiles 中不存在
-```
-
-## 7. 实现与测试位置
-
-- 配置结构和校验：`internal/config/config.go`
-- Runtime 合成：`internal/bootstrap/runtime_builder.go`
-- AgentTemplate Catalog 与 Team 生命周期：`internal/agenttemplate/`、`internal/team/`
-- allowlist 注册：`internal/agent/tool_registry.go`
-- 工具名权威清单：`internal/tools/known_tools.go`
-- 控制面工具（`submit_task_result` / `request_replan`）：`internal/tools/plan_control.go`
-- 用户决定协议：[`design/interaction.md`](design/interaction.md)；其中只有受限的 `request_user_input` 提问适配器属于 tool allowlist
-- 配置测试：`internal/config/config_v4_test.go`
-
-撰写完整 YAML 时同时参考 [`yaml-config-guide.md`](yaml-config-guide.md) 与 [`config.example.yaml`](../config.example.yaml)。
+可选 Team 初建使用 `provision_agent_team(graph_request_id=R)`，随后 `apply_graph_change(create, request_id=R)` 使用同一个稳定值；图 ID 由运行时按调用者和请求身份派生，返回的 ready route 才能写入节点。图内 controller 扩展时继承当前图，不提供旧 task-scoped 模型入口。

@@ -53,7 +53,7 @@ func TestRequireReadBeforeWrite_Suggestion(t *testing.T) {
 	target := makeRealFile(t)
 	h := NewRequireReadBeforeWriteHook(&mockHistoryStore{})
 	d := h.Run(hook.ToolHookContext{
-		Phase: hook.PhasePreCall, TaskID: "t1", ToolName: "write_file",
+		Phase: hook.PhasePreCall, TaskID: "t1", ToolName: "apply_change",
 		Args: map[string]any{"path": target},
 	})
 	if d.Action != hook.Abort {
@@ -72,7 +72,7 @@ func TestRequireReadBeforeWrite_Suggestion(t *testing.T) {
 	}
 	// 同因同目标 ID 稳定
 	d2 := h.Run(hook.ToolHookContext{
-		Phase: hook.PhasePreCall, TaskID: "t1", ToolName: "write_file",
+		Phase: hook.PhasePreCall, TaskID: "t1", ToolName: "apply_change",
 		Args: map[string]any{"path": target},
 	})
 	if d2.Suggestions[0].ID != s.ID {
@@ -84,7 +84,7 @@ func TestValidateExpectedHash_Suggestion(t *testing.T) {
 	path, _ := makeFileWithHash(t, "v1 内容")
 	h := NewValidateExpectedHashHook()
 	d := h.Run(hook.ToolHookContext{
-		Phase: hook.PhasePreCall, TaskID: "t1", ToolName: "write_file",
+		Phase: hook.PhasePreCall, TaskID: "t1", ToolName: "apply_change",
 		Args: map[string]any{"path": path, "expected_hash": "deadbeef"},
 	})
 	if d.Action != hook.Abort {
@@ -103,7 +103,7 @@ func TestEnforceExpectedArtifacts_Suggestion(t *testing.T) {
 	}}
 	h := NewEnforceExpectedArtifactsHook(store, "/project")
 	d := h.Run(hook.ToolHookContext{
-		Phase: hook.PhasePreCall, TaskID: "t1", ToolName: "write_file",
+		Phase: hook.PhasePreCall, TaskID: "t1", ToolName: "apply_change",
 		Args: map[string]any{"path": "docs/b.md"},
 	})
 	if d.Action != hook.Abort {
@@ -111,8 +111,8 @@ func TestEnforceExpectedArtifacts_Suggestion(t *testing.T) {
 	}
 	s := assertSingleSuggestion(t, d, ReasonMissingExpectedArtifacts, true)
 	a := findAction(s, hook.SuggestKindToolCall)
-	if a == nil || a.Tool != "write_file" {
-		t.Fatalf("应建议 write_file 缺失产物路径，实际 = %+v", a)
+	if a == nil || a.Tool != "apply_change" {
+		t.Fatalf("应建议 apply_change 缺失产物路径，实际 = %+v", a)
 	}
 	if a.Args["path"] != "docs/a.md" {
 		t.Fatalf("建议的缺失产物路径 = %v，期望 docs/a.md", a.Args["path"])
@@ -122,7 +122,7 @@ func TestEnforceExpectedArtifacts_Suggestion(t *testing.T) {
 func TestPathBoundary_Suggestion(t *testing.T) {
 	h := NewPathBoundaryHook(t.TempDir())
 	d := h.Run(hook.ToolHookContext{
-		Phase: hook.PhasePreCall, TaskID: "t1", ToolName: "write_file",
+		Phase: hook.PhasePreCall, TaskID: "t1", ToolName: "apply_change",
 		Args: map[string]any{"path": "../etc/passwd"},
 	})
 	if d.Action != hook.Abort {
@@ -151,7 +151,7 @@ func TestPathBoundaryInvalidArgumentsSuggestionIsRetryable(t *testing.T) {
 
 func TestExecModeGuard_Suggestion(t *testing.T) {
 	h := NewExecModeGuardHook(readonlyStore())
-	d := h.Run(hook.ToolHookContext{Phase: hook.PhasePreCall, TaskID: "t1", ToolName: "write_file"})
+	d := h.Run(hook.ToolHookContext{Phase: hook.PhasePreCall, TaskID: "t1", ToolName: "apply_change"})
 	if d.Action != hook.Abort {
 		t.Fatalf("Action = %v，期望 Abort", d.Action)
 	}
@@ -197,7 +197,7 @@ func TestValidateLineAnchors_Suggestion(t *testing.T) {
 	}
 	h := NewValidateLineAnchorsHook()
 	d := h.Run(hook.ToolHookContext{
-		Phase: hook.PhasePreCall, TaskID: "t1", ToolName: "edit_file",
+		Phase: hook.PhasePreCall, TaskID: "t1", ToolName: "apply_change",
 		Args: map[string]any{"path": path, "line_anchors": []any{"1#ZZ"}},
 	})
 	if d.Action != hook.Abort {

@@ -66,17 +66,16 @@ func TestToTerminalFactUsesTypedOutcome(t *testing.T) {
 	}
 }
 
-func TestDurableEvidencePreservesTypedCheckFields(t *testing.T) {
+func TestDurableEvidencePreservesOutputIdentity(t *testing.T) {
 	exit := 0
 	passed := true
 	got := durableEvidence([]outcome.EvidenceFact{{
-		Ref: "ev:task:check:abc", Kind: "check", Summary: "verification pass",
+		Ref: "ev:task:check:abc", Kind: "shell", Summary: "命令执行结束",
 		Success: &passed, ExitCode: &exit, ExitCodeScope: "whole_command",
-		CheckRef: "check:sha256:abc", CheckID: "verification", CheckKind: "test",
-		CheckStatus: "pass", WorkspaceRevisionRef: "workspace:sha256:candidate",
-		OutputRef: "content:sha256:output",
+		WorkspaceRevisionRef: "workspace:sha256:candidate",
+		OutputRef:            "content:sha256:output",
 	}})
-	if len(got) != 1 || got[0].CheckRef != "check:sha256:abc" || got[0].CheckStatus != "pass" ||
+	if len(got) != 1 || got[0].OutputRef != "content:sha256:output" ||
 		got[0].WorkspaceRevisionRef != "workspace:sha256:candidate" || got[0].ExitCodeScope != "whole_command" {
 		t.Fatalf("TaskOutcome 转 Graph 时不得丢失 typed Check Evidence: %+v", got)
 	}

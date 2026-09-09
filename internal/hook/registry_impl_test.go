@@ -198,7 +198,7 @@ func TestRunPre_MatchesFiltering(t *testing.T) {
 	r := NewToolHookRegistry()
 	var writeCalled, readCalled bool
 	r.Register(&mockHook{
-		name: "w", phase: PhasePreCall, matchStr: "write_file", priority: 10,
+		name: "w", phase: PhasePreCall, matchStr: "apply_change", priority: 10,
 		runFn: func(ToolHookContext) ToolHookDecision {
 			writeCalled = true
 			return ToolHookDecision{Action: Continue}
@@ -212,9 +212,9 @@ func TestRunPre_MatchesFiltering(t *testing.T) {
 		},
 	})
 
-	r.RunPre(ToolHookContext{ToolName: "write_file"})
+	r.RunPre(ToolHookContext{ToolName: "apply_change"})
 	if !writeCalled || readCalled {
-		t.Errorf("write_file path: writeCalled=%v readCalled=%v", writeCalled, readCalled)
+		t.Errorf("apply_change path: writeCalled=%v readCalled=%v", writeCalled, readCalled)
 	}
 }
 
@@ -226,7 +226,7 @@ func TestRunPre_WildcardMatchesAnyTool(t *testing.T) {
 		callN:    &calls,
 		decision: ToolHookDecision{Action: Continue},
 	})
-	for _, tool := range []string{"read_file", "write_file", "list_dir", "unknown_tool"} {
+	for _, tool := range []string{"read_file", "apply_change", "list_dir", "unknown_tool"} {
 		r.RunPre(ToolHookContext{ToolName: tool})
 	}
 	if calls.Load() != 4 {

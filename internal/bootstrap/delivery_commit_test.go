@@ -37,7 +37,7 @@ func TestWorkspaceDeliveryCommitterPromotesOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FreezeCandidate: %v", err)
 	}
-	deliveryStore, err := delivery.NewStore(filepath.Join(root, ".agentgo", "state", "deliveries"))
+	deliveryStore, err := delivery.NewStore(filepath.Join(root, ".agentgo", "state", "deliveries-v2"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestWorkspaceDeliveryCommitterRejectsCandidateChangedAfterFreeze(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	deliveryStore, err := delivery.NewStore(filepath.Join(root, ".agentgo", "state", "deliveries"))
+	deliveryStore, err := delivery.NewStore(filepath.Join(root, ".agentgo", "state", "deliveries-v2"))
 	if err != nil {
 		t.Fatal(err)
 	}

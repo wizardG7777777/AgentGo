@@ -92,7 +92,7 @@ func TestGuardRecoveredSnapshotNoAutoResume(t *testing.T) {
 		Tasks: []session.TaskSnapshot{
 			{
 				ID: "pending", Status: string(model.TaskStatusPending), PendingSince: now.Add(-2 * time.Hour).Format(time.RFC3339Nano),
-				Lease: &session.LeaseSnapshot{BusinessTools: []string{"write_file"}, Digest: "pending-lease"},
+				Lease: &session.LeaseSnapshot{BusinessTools: []string{"apply_change"}, Digest: "pending-lease"},
 			},
 			{
 				ID: "processing", Status: string(model.TaskStatusProcessing), Agents: []string{"worker-1"},

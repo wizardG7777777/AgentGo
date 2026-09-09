@@ -20,9 +20,9 @@ func (p *recordingTemplateProvisioner) Provision(_ context.Context, req agenttem
 	p.calls++
 	p.last = req
 	return agenttemplate.ProvisionResult{
-		TeamID: "team-1", EventType: "team:team-1",
+		TeamID: "team-1", EventType: "team:team-1", GraphID: req.GraphID,
 		TemplateRef: req.TemplateRef, TemplateDigest: "sha256:test",
-		AgentIDs: []string{"generalist-team-1-1"}, Tools: []string{"read_file", "write_file"},
+		AgentIDs: []string{"generalist-team-1-1"}, Tools: []string{"read_file", "apply_change"},
 		Replicas: req.Replicas,
 	}, nil
 }
@@ -76,15 +76,16 @@ func TestAgentTemplateGroupListsAndProvisionsWithoutCreatingDAGTask(t *testing.T
 	}
 
 	out, err := group.provision(context.Background(), map[string]any{
-		"template_ref": "builtin/generalist@1",
-		"purpose":      "implementation",
-		"replicas":     1,
+		"template_ref":     "builtin/generalist@2",
+		"purpose":          "implementation",
+		"graph_request_id": "initial",
+		"replicas":         1,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if provisioner.calls != 1 || provisioner.last.ControllerTaskID != controller.ID ||
-		provisioner.last.TemplateRef != "builtin/generalist@1" ||
+		provisioner.last.TemplateRef != "builtin/generalist@2" ||
 		provisioner.last.Purpose != "implementation" || provisioner.last.Replicas != 1 {
 		t.Fatalf("provision authority was not injected correctly: calls=%d request=%+v", provisioner.calls, provisioner.last)
 	}
@@ -134,7 +135,7 @@ func TestAgentTemplateGroupProvisionRequiresRunningSchedulerTask(t *testing.T) {
 		Store: taskStore, Holder: &fakeHolder{id: pending.ID},
 	}
 	_, err = group.provision(context.Background(), map[string]any{
-		"template_ref": "builtin/explorer@1", "purpose": "investigation",
+		"template_ref": "builtin/explorer@2", "purpose": "investigation",
 	})
 	if err == nil || !strings.Contains(err.Error(), "requires a running Scheduler task") {
 		t.Fatalf("pending scheduler task provision err=%v", err)
@@ -150,7 +151,7 @@ func TestAgentTemplateGroupProvisionRequiresRunningSchedulerTask(t *testing.T) {
 	}
 	group.Holder = &fakeHolder{id: worker.ID}
 	_, err = group.provision(context.Background(), map[string]any{
-		"template_ref": "builtin/explorer@1", "purpose": "investigation",
+		"template_ref": "builtin/explorer@2", "purpose": "investigation",
 	})
 	if err == nil || !strings.Contains(err.Error(), "requires a running Scheduler task") {
 		t.Fatalf("non-scheduler task provision err=%v", err)
@@ -176,7 +177,7 @@ func TestAgentTemplateGroupRejectsMalformedReplicaCount(t *testing.T) {
 	}
 	for _, replicas := range []any{"2", 1.5, 0, 33} {
 		if _, err := group.provision(context.Background(), map[string]any{
-			"template_ref": "builtin/generalist@1", "purpose": "implementation", "replicas": replicas,
+			"template_ref": "builtin/generalist@2", "purpose": "implementation", "replicas": replicas, "graph_request_id": "initial",
 		}); err == nil || !strings.Contains(err.Error(), "replicas") {
 			t.Fatalf("replicas=%v should fail strict integer validation, got %v", replicas, err)
 		}
@@ -201,16 +202,16 @@ func TestAgentTemplateGroupBindsGraphOwnershipAndInheritsCurrentGraph(t *testing
 		Holder: &fakeHolder{id: root.ID},
 	}
 	if _, err := group.provision(context.Background(), map[string]any{
-		"template_ref": "builtin/generalist@1", "purpose": "graph work", "graph_id": "g-owned",
+		"template_ref": "builtin/generalist@2", "purpose": "graph work", "graph_request_id": "owned",
 	}); err != nil {
 		t.Fatalf("root Graph provision: %v", err)
 	}
-	if provisioner.last.GraphID != "g-owned" {
+	if provisioner.last.GraphID != "graph-"+graphRequestKey(root.ID, "owned") {
 		t.Fatalf("GraphID not forwarded: %+v", provisioner.last)
 	}
 
 	graphController := &model.Task{
-		Description: "graph controller", EventType: "__scheduler__", GraphID: "g-active",
+		Description: "graph controller", EventType: "__scheduler__", GraphID: "g-active", GraphNodeKind: "controller",
 	}
 	if err := taskStore.PublishTask(graphController); err != nil {
 		t.Fatal(err)
@@ -220,7 +221,7 @@ func TestAgentTemplateGroupBindsGraphOwnershipAndInheritsCurrentGraph(t *testing
 	}
 	group.Holder = &fakeHolder{id: graphController.ID}
 	if _, err := group.provision(context.Background(), map[string]any{
-		"template_ref": "builtin/explorer@1", "purpose": "expand graph",
+		"template_ref": "builtin/explorer@2", "purpose": "expand graph",
 	}); err != nil {
 		t.Fatalf("inherit current Graph: %v", err)
 	}
@@ -228,12 +229,12 @@ func TestAgentTemplateGroupBindsGraphOwnershipAndInheritsCurrentGraph(t *testing
 		t.Fatalf("current Graph not inherited: %+v", provisioner.last)
 	}
 	if _, err := group.provision(context.Background(), map[string]any{
-		"template_ref": "builtin/explorer@1", "purpose": "wrong graph", "graph_id": "g-other",
+		"template_ref": "builtin/explorer@2", "purpose": "wrong graph", "graph_id": "g-other",
 	}); err == nil || !strings.Contains(err.Error(), "拒绝跨 Graph") {
 		t.Fatalf("cross-Graph provision err=%v", err)
 	}
 	if _, err := group.provision(context.Background(), map[string]any{
-		"template_ref": "builtin/explorer@1", "purpose": "bad graph", "graph_id": "bad graph!",
+		"template_ref": "builtin/explorer@2", "purpose": "bad graph", "graph_id": "bad graph!",
 	}); err == nil || !strings.Contains(err.Error(), "graph_id") {
 		t.Fatalf("invalid GraphID err=%v", err)
 	}

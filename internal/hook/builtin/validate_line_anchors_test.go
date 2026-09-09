@@ -21,7 +21,7 @@ func TestValidateLineAnchorsHook_Metadata(t *testing.T) {
 	if h.Priority() != 25 {
 		t.Errorf("Priority = %d, want 25", h.Priority())
 	}
-	for _, tool := range []string{"write_file", "edit_file"} {
+	for _, tool := range []string{"apply_change"} {
 		if !h.Matches(tool) {
 			t.Errorf("Matches(%q) = false, want true", tool)
 		}
@@ -36,7 +36,7 @@ func TestValidateLineAnchorsHook_Metadata(t *testing.T) {
 func TestValidateLineAnchorsHook_NoAnchorsContinues(t *testing.T) {
 	h := NewValidateLineAnchorsHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "edit_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": "/any/foo.go", "old_str": "x", "new_str": "y"},
 	})
 	if d.Action != hook.Continue {
@@ -47,7 +47,7 @@ func TestValidateLineAnchorsHook_NoAnchorsContinues(t *testing.T) {
 func TestValidateLineAnchorsHook_EmptyAnchorsContinues(t *testing.T) {
 	h := NewValidateLineAnchorsHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "edit_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"path":         "/any/foo.go",
 			"old_str":      "x",
@@ -64,7 +64,7 @@ func TestValidateLineAnchorsHook_MissingPathContinues(t *testing.T) {
 	// path 缺失 → 让 PathBoundary 报错
 	h := NewValidateLineAnchorsHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "edit_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"line_anchors": []any{"1#VK"},
 		},
@@ -80,7 +80,7 @@ func TestValidateLineAnchorsHook_FileNotExistContinues(t *testing.T) {
 	missing := filepath.Join(tmp, "never-existed.go")
 	h := NewValidateLineAnchorsHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"path":         missing,
 			"content":      "x",
@@ -107,7 +107,7 @@ func TestValidateLineAnchorsHook_MatchSuccess(t *testing.T) {
 
 	h := NewValidateLineAnchorsHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "edit_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"path":         fp,
 			"old_str":      "package main",
@@ -133,7 +133,7 @@ func TestValidateLineAnchorsHook_HashMismatch(t *testing.T) {
 
 	h := NewValidateLineAnchorsHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "edit_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"path":         fp,
 			"old_str":      "x",
@@ -166,7 +166,7 @@ func TestValidateLineAnchorsHook_LineOutOfRange(t *testing.T) {
 	anchors := []any{"99#VK"}
 	h := NewValidateLineAnchorsHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "edit_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"path":         fp,
 			"line_anchors": anchors,
@@ -187,7 +187,7 @@ func TestValidateLineAnchorsHook_ParseError(t *testing.T) {
 	anchors := []any{"not-a-valid-ref"}
 	h := NewValidateLineAnchorsHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "edit_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"path":         fp,
 			"line_anchors": anchors,
@@ -212,7 +212,7 @@ func TestValidateLineAnchorsHook_ContextLines(t *testing.T) {
 	anchors := []any{"3#ZZ"}
 	h := NewValidateLineAnchorsHook()
 	d := h.Run(hook.ToolHookContext{
-		ToolName: "edit_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"path":         fp,
 			"line_anchors": anchors,
@@ -242,7 +242,7 @@ func TestValidateLineAnchorsHook_ViaRegistry(t *testing.T) {
 	}
 	// 错误的锚点
 	d := reg.RunPre(hook.ToolHookContext{
-		ToolName: "edit_file",
+		ToolName: "apply_change",
 		Args: map[string]any{
 			"path":         fp,
 			"line_anchors": []any{"1#ZZ"},
@@ -283,7 +283,7 @@ func TestValidateLineAnchorsHook_ChainOverridesExpectedHash(t *testing.T) {
 	t.Run("LineAnchorsCorrect_ExpectedHashWrong_ChainContinues", func(t *testing.T) {
 		correctAnchor := hashline.FormatHashLine(1, "alpha")
 		d := reg.RunPre(hook.ToolHookContext{
-			ToolName: "edit_file",
+			ToolName: "apply_change",
 			Args: map[string]any{
 				"path":          fp,
 				"old_str":       "alpha",
@@ -303,7 +303,7 @@ func TestValidateLineAnchorsHook_ChainOverridesExpectedHash(t *testing.T) {
 	// 后者必须仍然让位，否则就还原成"双校验都跑"的 stale 状态。
 	t.Run("LineAnchorsWrong_ChainAbortsViaLineAnchorsHook", func(t *testing.T) {
 		d := reg.RunPre(hook.ToolHookContext{
-			ToolName: "edit_file",
+			ToolName: "apply_change",
 			Args: map[string]any{
 				"path":          fp,
 				"old_str":       "alpha",
@@ -348,7 +348,7 @@ func TestValidateLineAnchorsHook_ResolvePhysicalPath(t *testing.T) {
 
 	d := h.Run(hook.ToolHookContext{
 		TaskID:   "t1",
-		ToolName: "edit_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": mainPath, "line_anchors": []any{wsAnchor}},
 	})
 	if d.Action != hook.Continue {
@@ -358,7 +358,7 @@ func TestValidateLineAnchorsHook_ResolvePhysicalPath(t *testing.T) {
 	// 主根内容的锚点在副本上失配 → Abort（证明读的确是副本）
 	d2 := h.Run(hook.ToolHookContext{
 		TaskID:   "t1",
-		ToolName: "edit_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": mainPath, "line_anchors": []any{mainAnchor}},
 	})
 	if d2.Action != hook.Abort {

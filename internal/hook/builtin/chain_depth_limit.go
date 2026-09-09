@@ -11,7 +11,7 @@ import (
 // （根因 #2：邮件链无环路检测 / 跳数限制）。
 //
 // 工作流程：
-//  1. MetaGroup.sendMessage 在构造 outgoing message 时读取当前任务的
+//  1. CommunicationGroup.sendMessage 在构造 outgoing message 时读取当前任务的
 //     MailChainDepth 并 +1 写入 message.ChainDepth（B5）
 //  2. mailbox.Registry.Send 在入口调用 BeforeSend hook，本 hook 校验
 //     ChainDepth 是否超过 MaxDepth
@@ -52,6 +52,10 @@ func (h *ChainDepthLimitHook) Priority() int { return 10 }
 //   - ChainDepth <= MaxDepth → Continue
 //   - ChainDepth > MaxDepth → Abort，AbortReason 包含当前深度和上限以便诊断
 func (h *ChainDepthLimitHook) Run(hctx hook.MailboxHookContext) hook.MailboxHookDecision {
+	// 信息投递不会触发级联执行，链深度仅作审计，不能阻断普通问答。
+	if hctx.Message.DeliveryOnly {
+		return hook.MailboxHookDecision{Action: hook.Continue}
+	}
 	depth := hctx.Message.ChainDepth
 	if depth <= h.MaxDepth {
 		return hook.MailboxHookDecision{Action: hook.Continue}

@@ -59,9 +59,9 @@ func TestDependencyValidatorHook_MatchesPublishTaskOnly(t *testing.T) {
 		"publish_task": true,
 		"send_message": false,
 		"read_file":    false,
-		"write_file":   false,
-		"edit_file":    false,
-		"run_shell":    false,
+		"apply_change": false,
+
+		"run_shell": false,
 	}
 	for tool, want := range cases {
 		t.Run(tool, func(t *testing.T) {

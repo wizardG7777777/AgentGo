@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"agentgo/internal/agent"
 	"agentgo/internal/config"
 	"agentgo/internal/llm"
 	"agentgo/internal/mailbox"
@@ -18,7 +17,6 @@ import (
 	"agentgo/internal/modes"
 	"agentgo/internal/roster"
 	"agentgo/internal/store"
-	"agentgo/internal/tools"
 )
 
 // newSoloTestBundle 构造一个 scheduler Bundle 用于 solo 单测：
@@ -37,7 +35,7 @@ func newSoloTestBundle(t *testing.T, modeStore *modes.Store, mockLLM llm.Invoker
 	bundle := newTestScheduler(t, s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
 		nil, nil, nil, nil, nil, modeStore, nil, nil, nil)
 
-	task := &model.Task{Description: "solo 测试任务", EventType: "__scheduler__"}
+	task := &model.Task{Description: "solo 测试任务", EventType: "__scheduler__", GraphID: "g-solo", GraphNodeKind: "agent", NodeID: "work", ActivationID: "work@1"}
 	if err := s.PublishTask(task); err != nil {
 		t.Fatalf("发布 scheduler 任务失败: %v", err)
 	}
@@ -64,59 +62,8 @@ func executeOneRound(t *testing.T, bundle *Bundle, task *model.Task) string {
 
 // TestSoloPublishTaskBlocked_Solo 验证 topo=solo 时 scheduler 的 publish_task
 // 被硬拦截，且错误消息明确告知"solo 模式禁止派发子任务，请直接执行"。
-func TestSoloPublishTaskBlocked_Solo(t *testing.T) {
-	mockLLM := &scriptedLLM{responses: []testmodel.Fixture{{
-		ToolCalls: []llm.ToolCall{{
-			ID:   "call_1",
-			Name: "publish_task",
-			Arguments: map[string]any{
-				"description": "应该被 solo 拦截的子任务",
-			},
-		}},
-	}}}
-	bundle, s, task := newSoloTestBundle(t, modes.NewStore(modes.ExecNormal, modes.TopoSolo), mockLLM)
-
-	content := executeOneRound(t, bundle, task)
-	if !strings.Contains(content, "solo 编排模式禁止派发子任务") {
-		t.Errorf("solo 下 publish_task 应被拦截并返回中文指引，实际: %s", content)
-	}
-	if !strings.Contains(content, "请直接使用") {
-		t.Errorf("错误消息应给出直接执行的替代路径，实际: %s", content)
-	}
-
-	// 公告板上不应出现被拦截任务产生的子任务
-	tasks, err := s.ScanAll()
-	if err != nil {
-		t.Fatalf("ScanAll 失败: %v", err)
-	}
-	for _, other := range tasks {
-		if other.ID != task.ID {
-			t.Errorf("solo 拦截后不应产生新任务，发现: id=%s desc=%s", other.ID, other.Description)
-		}
-	}
-}
 
 // TestSoloPublishTaskBlocked_TeamAllows 验证 topo=team 时 publish_task 正常放行。
-func TestSoloPublishTaskBlocked_TeamAllows(t *testing.T) {
-	mockLLM := &scriptedLLM{responses: []testmodel.Fixture{{
-		ToolCalls: []llm.ToolCall{{
-			ID:   "call_1",
-			Name: "publish_task",
-			Arguments: map[string]any{
-				"description": "team 模式下允许派发的子任务",
-			},
-		}},
-	}}}
-	bundle, s, _ := newSoloTestBundle(t, modes.NewStore(modes.ExecNormal, modes.TopoTeam), mockLLM)
-
-	content := executeOneRound(t, bundle, mustTask(t, s))
-	if !strings.Contains(content, "已创建任务") {
-		t.Errorf("team 下 publish_task 应成功，实际: %s", content)
-	}
-	if strings.Contains(content, "solo 编排模式禁止") {
-		t.Errorf("team 下不应出现 solo 拦截消息，实际: %s", content)
-	}
-}
 
 func mustTask(t *testing.T, s *store.MemoryTaskStore) *model.Task {
 	t.Helper()
@@ -129,69 +76,11 @@ func mustTask(t *testing.T, s *store.MemoryTaskStore) *model.Task {
 
 // TestSoloPublishTaskBlocked_NilStoreAllows 验证 modeStore 为 nil 时
 // （New 内部回落 DefaultStore=team，包装器本身也 nil 安全）publish_task 不受拦截。
-func TestSoloPublishTaskBlocked_NilStoreAllows(t *testing.T) {
-	// 包装器自身 nil 安全：nil store 等价 team，直接透传 inner
-	innerCalled := false
-	inner := agent.ToolFunc(func(context.Context, map[string]any) (string, error) {
-		innerCalled = true
-		return "ok", nil
-	})
-	wrapped := wrapPublishTaskForSolo(nil)(inner)
-	if _, err := wrapped(context.Background(), nil); err != nil || !innerCalled {
-		t.Errorf("nil modeStore 应透传 inner: called=%v err=%v", innerCalled, err)
-	}
-
-	// Bundle 级：nil modeStore 走 DefaultStore 回落（team），publish_task 正常成功
-	mockLLM := &scriptedLLM{responses: []testmodel.Fixture{{
-		ToolCalls: []llm.ToolCall{{
-			ID:        "call_1",
-			Name:      "publish_task",
-			Arguments: map[string]any{"description": "nil store 下允许派发的子任务"},
-		}},
-	}}}
-	bundle, s, _ := newSoloTestBundle(t, nil, mockLLM)
-	content := executeOneRound(t, bundle, mustTask(t, s))
-	if !strings.Contains(content, "已创建任务") {
-		t.Errorf("nil modeStore（回落 team）下 publish_task 应成功，实际: %s", content)
-	}
-}
 
 // TestSoloPublishTaskBlocked_RunnerUnaffected 验证拦截只作用于 scheduler 自己的
 // ToolRegistry：按 runner 方式装配的 registry（不经 scheduler.New 的包装）即使在
 // solo 模式存在的环境下，publish_task 也不受影响。
-func TestSoloPublishTaskBlocked_RunnerUnaffected(t *testing.T) {
-	ch := make(chan model.Event, 64)
-	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 
-	parent := &model.Task{Description: "runner 父任务", EventType: ""}
-	if err := s.PublishTask(parent); err != nil {
-		t.Fatalf("发布父任务失败: %v", err)
-	}
-	holder := agent.NewFinalizationHolder()
-	holder.Set(parent.ID)
-
-	// runner 装配路径：MetaGroup 直接注册，没有任何 solo 包装
-	reg := agent.NewToolRegistry()
-	tools.RegisterGroups(reg, tools.MetaGroup{
-		Store:   s,
-		Holder:  holder,
-		AgentID: "worker-1",
-	})
-
-	out, err := reg.Dispatch(context.Background(), llm.ToolCall{
-		ID:        "call_1",
-		Name:      "publish_task",
-		Arguments: map[string]any{"description": "runner 派发的子任务"},
-	})
-	if err != nil {
-		t.Fatalf("runner 的 publish_task 不应被 solo 拦截: %v", err)
-	}
-	if !strings.Contains(out, "已创建任务") {
-		t.Errorf("runner 的 publish_task 应成功，实际: %s", out)
-	}
-}
-
-// TestSoloPublishTaskBlocked_SendMessageAllowed 验证 solo 下 send_message 不被误伤。
 func TestSoloPublishTaskBlocked_SendMessageAllowed(t *testing.T) {
 	mockLLM := &scriptedLLM{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{{
@@ -216,7 +105,7 @@ func TestSoloPublishTaskBlocked_SendMessageAllowed(t *testing.T) {
 
 // TestSchedulerSystemPrompt_ContainsSoloGuidance 验证 draft-edit phase 含 solo 指引。
 func TestSchedulerSystemPrompt_ContainsSoloGuidance(t *testing.T) {
-	prompt := schedulerPromptForPhase("scheduler:draft-edit")
+	prompt := SystemPrompt()
 	for _, want := range []string{
 		"topo_mode=solo", "唯一执行资源", "controller", "不得调用 legacy publish_task",
 	} {
@@ -226,13 +115,13 @@ func TestSchedulerSystemPrompt_ContainsSoloGuidance(t *testing.T) {
 	}
 }
 
-// TestSchedulerBundle_SoloMode_DirectExecutionCompletes 是 solo 不卡死集成测试。
+// TestSoloGraphNodeExecutionCompletes 是 solo 不卡死集成测试。
 //
 // 场景：topo=solo。LLM 全程不派发子任务，只调用普通工具（read_file）后
 // report_done 收尾。断言：
 //   - scheduler 任务到达 completed（不会在任何等待处挂死）；
 //   - 公告板没有产生任何子任务。
-func TestSchedulerBundle_SoloMode_DirectExecutionCompletes(t *testing.T) {
+func TestSoloGraphNodeExecutionCompletes(t *testing.T) {
 	// 独立项目根，read_file 读取其中的真实文件
 	projectRoot := t.TempDir()
 	if err := os.WriteFile(filepath.Join(projectRoot, "note.txt"), []byte("solo 集成测试内容"), 0644); err != nil {
@@ -259,7 +148,7 @@ func TestSchedulerBundle_SoloMode_DirectExecutionCompletes(t *testing.T) {
 		// 第二轮：report_done 收尾
 		{ToolCalls: []llm.ToolCall{{
 			ID:        "call_2",
-			Name:      "report_done",
+			Name:      "submit_task_result",
 			Arguments: map[string]any{"summary": "已读取 note.txt 并总结"},
 		}}},
 		// 之后的回合（若有）返回纯文本
@@ -268,7 +157,7 @@ func TestSchedulerBundle_SoloMode_DirectExecutionCompletes(t *testing.T) {
 	bundle := newTestScheduler(t, s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
 		nil, nil, nil, nil, nil, modeStore, nil, nil, nil)
 
-	root := &model.Task{Description: "读取 note.txt 并总结", EventType: "__scheduler__"}
+	root := &model.Task{Description: "读取 note.txt 并总结", EventType: "__scheduler__", GraphID: "g-solo", GraphNodeKind: "agent", NodeID: "work", ActivationID: "work@1"}
 	if err := s.PublishTask(root); err != nil {
 		t.Fatalf("发布 scheduler 任务失败: %v", err)
 	}
@@ -309,14 +198,14 @@ func TestSchedulerBundle_SoloMode_DirectExecutionCompletes(t *testing.T) {
 	}
 }
 
-// TestSchedulerBundle_SoloMode_DirectWriteCompletes 是 solo 写操作收尾集成测试。
+// TestSoloGraphNodeWriteCompletes 是 solo 写操作收尾集成测试。
 //
 // 场景：topo=solo，recordToolCall 按生产方式接线（bootstrap 同款闭包）。
-// LLM 第一轮亲自 write_file，第二轮 report_done 收尾。断言：
+// LLM 第一轮亲自 apply_change，第二轮 report_done 收尾。断言：
 //   - scheduler 任务到达 completed；
 //   - 写操作事实被记录，文件真实落盘；
 //   - 公告板没有产生任何子任务。
-func TestSchedulerBundle_SoloMode_DirectWriteCompletes(t *testing.T) {
+func TestSoloGraphNodeWriteCompletes(t *testing.T) {
 	projectRoot := t.TempDir()
 
 	ch := make(chan model.Event, 64)
@@ -338,13 +227,13 @@ func TestSchedulerBundle_SoloMode_DirectWriteCompletes(t *testing.T) {
 		// 第一轮：controller 亲自写文件
 		{ToolCalls: []llm.ToolCall{{
 			ID:        "call_1",
-			Name:      "write_file",
+			Name:      "apply_change",
 			Arguments: map[string]any{"path": "solo_write.txt", "content": "solo 写入内容"},
 		}}},
 		// 第二轮：report_done 收尾
 		{ToolCalls: []llm.ToolCall{{
 			ID:        "call_2",
-			Name:      "report_done",
+			Name:      "submit_task_result",
 			Arguments: map[string]any{"summary": "已写入 solo_write.txt"},
 		}}},
 		// 之后的回合（若有）返回纯文本
@@ -353,7 +242,7 @@ func TestSchedulerBundle_SoloMode_DirectWriteCompletes(t *testing.T) {
 	bundle := newTestScheduler(t, s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, recordToolCall,
 		nil, nil, nil, nil, nil, nil, modeStore, nil, nil, nil)
 
-	root := &model.Task{Description: "写入 solo_write.txt", EventType: "__scheduler__"}
+	root := &model.Task{Description: "写入 solo_write.txt", EventType: "__scheduler__", GraphID: "g-solo", GraphNodeKind: "agent", NodeID: "work", ActivationID: "work@1"}
 	if err := s.PublishTask(root); err != nil {
 		t.Fatalf("发布 scheduler 任务失败: %v", err)
 	}
@@ -383,9 +272,9 @@ func TestSchedulerBundle_SoloMode_DirectWriteCompletes(t *testing.T) {
 	}
 
 	// 写操作事实确实被记录
-	records, err := s.QueryToolCalls(root.ID, "write_file")
+	records, err := s.QueryToolCalls(root.ID, "apply_change")
 	if err != nil || len(records) == 0 || !records[0].Success {
-		t.Fatalf("write_file 成功记录缺失: records=%+v err=%v", records, err)
+		t.Fatalf("apply_change 成功记录缺失: records=%+v err=%v", records, err)
 	}
 
 	// 文件真实落盘

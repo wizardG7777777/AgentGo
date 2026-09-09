@@ -4,31 +4,35 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
-	"time"
 
 	"agentgo/internal/agent"
 	"agentgo/internal/graph"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
 	"agentgo/internal/policycatalog"
-	"agentgo/internal/runcontract"
 	"agentgo/internal/store"
 	"agentgo/internal/taskcontract"
 )
 
 type simpleGraphAcceptancePass struct{}
 
-func (simpleGraphAcceptancePass) EvaluateProposal(_ context.Context, _ graph.ProposalAcceptanceInput) (graph.ProposalAcceptanceDecision, error) {
-	return graph.ProposalAcceptanceDecision{
-		Verdict: graph.ProposalAcceptancePass, Ref: "proposal-acceptance:simple-test",
-	}, nil
+func (simpleGraphAcceptancePass) EvaluateProposal(context.Context, graph.ProposalAcceptanceInput) (graph.ProposalAcceptanceDecision, error) {
+	return graph.ProposalAcceptanceDecision{Verdict: graph.ProposalAcceptancePass, Ref: "proposal:test"}, nil
 }
 
-func newGraphAuthoringToolEnv(t *testing.T) (GraphAuthoringGroup, *graph.AuthoringStore) {
+func newUnifiedGraphEnv(t *testing.T) (GraphAuthoringGroup, *graph.Store, *fakeGraphBoard) {
 	t.Helper()
-	tasks := store.NewMemoryTaskStore(make(chan model.Event, 8), 32, 1, 60)
-	if err := tasks.PublishTask(&model.Task{ID: "scheduler-root", EventType: "__scheduler__", Description: "实现用户请求"}); err != nil {
+	tasks := store.NewMemoryTaskStore(nil, 32, 1, 60)
+	task := &model.Task{ID: "scheduler-root", EventType: "__scheduler__", Description: "调查项目并报告结果"}
+	if err := taskcontract.Start(task, loopcontract.WorkCoordination, "test/v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks.PublishTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks.ClaimTask("scheduler", task.ID); err != nil {
 		t.Fatal(err)
 	}
 	authoring, err := graph.NewAuthoringStore(t.TempDir())
@@ -36,448 +40,177 @@ func newGraphAuthoringToolEnv(t *testing.T) (GraphAuthoringGroup, *graph.Authori
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = authoring.Close() })
-	return GraphAuthoringGroup{
-		Store: authoring, TaskStore: tasks, Holder: &fakeHolder{id: "scheduler-root"},
-		SessionID: func() string { return "session-1" },
-	}, authoring
-}
-
-func TestGraphAuthoringSchemasUseNativeObjectsAndArrays(t *testing.T) {
-	registry := agent.NewToolRegistry()
-	GraphAuthoringGroup{}.Register(registry)
-	want := []string{
-		"create_graph_draft", "configure_simple_graph_draft", "patch_graph_draft", "read_graph_draft",
-		"validate_graph_draft", "validate_current_graph_draft", "commit_graph_draft", "commit_current_graph_draft",
-		"start_graph", "start_current_graph",
-		"propose_graph_change", "read_graph_change", "validate_graph_change", "commit_graph_change",
-		"submit_graph_change_decision",
-	}
-	for _, name := range want {
-		if !slicesContains(registry.Names(), name) {
-			t.Fatalf("缺少 authoring tool %s，实际=%v", name, registry.Names())
-		}
-	}
-	for _, def := range registry.Defs() {
-		if def.Name != "create_graph_draft" && def.Name != "configure_simple_graph_draft" && def.Name != "patch_graph_draft" && def.Name != "propose_graph_change" {
-			continue
-		}
-		properties, _ := def.Parameters["properties"].(map[string]any)
-		if graphField, exists := properties["graph"]; exists || graphField != nil {
-			t.Fatalf("%s 不得暴露完整 Graph JSON string: %#v", def.Name, properties)
-		}
-		if def.Name == "create_graph_draft" {
-			if len(properties) != 0 {
-				t.Fatalf("create_graph_draft 必须保持最小空 Draft schema: %#v", properties)
-			}
-			continue
-		}
-		if def.Name == "configure_simple_graph_draft" {
-			if len(properties) != 1 || properties["execution_class"] == nil {
-				t.Fatalf("configure_simple_graph_draft 只应暴露 execution_class: %#v", properties)
-			}
-			continue
-		}
-		if nodes, ok := properties["upsert_nodes"].(map[string]any); !ok || nodes["type"] != "array" {
-			t.Fatalf("%s 节点参数必须是原生 array: %#v", def.Name, properties)
-		}
-	}
-}
-
-func TestGraphAuthoringAllowsOnlyTypedRecoveryControllerInsideGraph(t *testing.T) {
-	group, _ := newGraphAuthoringToolEnv(t)
-	recovery := &model.Task{
-		ID: "recovery-controller", Description: "恢复", EventType: "__scheduler__",
-		GraphID: "g-1", NodeID: "recovery", ActivationID: "recovery@1",
-		GraphNodeKind:        string(graph.KindController),
-		GraphControllerRole:  string(graph.ControllerRoleLoopRecovery),
-		RecoverySourceTaskID: "work-task",
-	}
-	if err := group.TaskStore.PublishTask(recovery); err != nil {
-		t.Fatal(err)
-	}
-	group.Holder = &fakeHolder{id: recovery.ID}
-	if _, err := group.currentRootSchedulerTask("propose_graph_change"); err != nil {
-		t.Fatalf("typed loop_recovery controller 应获得 GraphChange authority: %v", err)
-	}
-	if _, err := group.currentRootSchedulerTask("create_graph_draft"); err == nil {
-		t.Fatal("loop_recovery controller 不得借同一 authoring group 新建 GraphDraft")
-	}
-	if _, err := group.proposeGraphChange(context.Background(), map[string]any{
-		"graph_id": "g-other", "base_definition_revision": 1,
-		"base_definition_digest": "digest", "reason": "test",
-		"upsert_nodes": []any{map[string]any{"id": "x", "kind": "end"}},
-	}); err == nil || !strings.Contains(err.Error(), "只能修改当前 Graph") {
-		t.Fatalf("loop_recovery controller 不得跨 Graph: %v", err)
-	}
-
-	normal := &model.Task{
-		ID: "normal-controller", Description: "普通 controller", EventType: "__scheduler__",
-		GraphID: "g-1", NodeID: "controller", ActivationID: "controller@1",
-		GraphNodeKind: string(graph.KindController),
-	}
-	if err := group.TaskStore.PublishTask(normal); err != nil {
-		t.Fatal(err)
-	}
-	group.Holder = &fakeHolder{id: normal.ID}
-	if _, err := group.currentRootSchedulerTask("propose_graph_change"); err == nil ||
-		!strings.Contains(err.Error(), "loop_recovery controller") {
-		t.Fatalf("普通 Graph controller 不得获得 transactional GraphChange authority: %v", err)
-	}
-}
-
-func TestGraphAuthoringGraphChangeWakeIsBoundToFrozenGraph(t *testing.T) {
-	group, _ := newGraphAuthoringToolEnv(t)
-	wake := &model.Task{ID: "graph-change-wake", Description: "改图", EventType: "__scheduler__",
-		EventSource: model.TaskEventSourceGraphChange, InterventionGraphID: "g-1"}
-	if err := taskcontract.Start(wake, loopcontract.WorkCoordination, "test-graph-change/v1",
-		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
-		t.Fatal(err)
-	}
-	wake.RunPhase = runcontract.PhaseRecovery
-	if err := group.TaskStore.PublishTask(wake); err != nil {
-		t.Fatal(err)
-	}
-	group.Holder = &fakeHolder{id: wake.ID}
-	if _, err := group.currentRootSchedulerTask("propose_graph_change"); err != nil {
-		t.Fatalf("合法 graph-change wake 应获得事务化变更权限: %v", err)
-	}
-	args := map[string]any{
-		"graph_id": "g-other", "base_definition_revision": 1,
-		"base_definition_digest": "digest", "reason": "test",
-		"upsert_nodes": []any{map[string]any{"id": "x", "kind": "end"}},
-	}
-	if _, err := group.proposeGraphChange(context.Background(), args); err == nil ||
-		!strings.Contains(err.Error(), "只能修改冻结 Graph g-1") {
-		t.Fatalf("graph-change wake 不得跨 Graph 变更: %v", err)
-	}
-}
-
-func TestGraphAuthoringGraphChangeNoChangeDecisionFinalizes(t *testing.T) {
-	group, _ := newGraphAuthoringToolEnv(t)
-	wake := &model.Task{ID: "graph-change-no-change", Description: "核对后无需改图", EventType: "__scheduler__",
-		EventSource: model.TaskEventSourceGraphChange, InterventionGraphID: "g-1"}
-	if err := taskcontract.Start(wake, loopcontract.WorkCoordination, "test-graph-change/v1",
-		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
-		t.Fatal(err)
-	}
-	wake.RunPhase = runcontract.PhaseRecovery
-	if err := group.TaskStore.PublishTask(wake); err != nil {
-		t.Fatal(err)
-	}
-	notifier := &fakeFinalizationNotifier{}
-	group.Holder = &fakeHolder{id: wake.ID}
-	group.Finalization = notifier
-	out, err := group.submitGraphChangeDecision(context.Background(), map[string]any{
-		"decision": "no_change", "summary": "Graph 已终态，Definition 修改不能产生未来 Activation",
-	})
-	if err != nil {
-		t.Fatalf("submit_graph_change_decision: %v", err)
-	}
-	var receipt map[string]any
-	if json.Unmarshal([]byte(out), &receipt) != nil || !notifier.marked ||
-		receipt["decision"] != "no_change" || receipt["graph_id"] != "g-1" {
-		t.Fatalf("no_change 应结构化收口当前 coordination: marked=%t out=%s", notifier.marked, out)
-	}
-	if _, err := group.submitGraphChangeDecision(context.Background(), map[string]any{
-		"decision": "changed", "summary": "伪造",
-	}); err == nil {
-		t.Fatal("非 no_change decision 必须拒绝")
-	}
-}
-
-func TestConfigureSimpleGraphDraftBuildsFrameworkOwnedAcceptedShape(t *testing.T) {
-	group, authoring := newGraphAuthoringToolEnv(t)
-	if _, err := group.createDraft(context.Background(), map[string]any{}); err != nil {
-		t.Fatal(err)
-	}
-	raw, err := group.configureSimpleDraft(context.Background(), map[string]any{"execution_class": " mutating "})
+	executions, err := graph.NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	var draft graph.GraphDraft
-	if err := json.Unmarshal([]byte(raw), &draft); err != nil {
-		t.Fatal(err)
-	}
-	work := draft.Candidate.Nodes["work"]
-	investigate := draft.Candidate.Nodes["investigate"]
-	repair := draft.Candidate.Nodes["repair"]
-	acceptance := draft.Candidate.Nodes["acceptance"]
-	acceptanceRepair := draft.Candidate.Nodes["acceptance-repair"]
-	recovery := draft.Candidate.Nodes["recovery"]
-	acceptanceRecovery := draft.Candidate.Nodes["acceptance-recovery"]
-	if draft.DraftRevision != 2 || draft.Candidate.Root != "investigate" || draft.Contract.ExecutionClass != graph.ExecutionMutating ||
-		!draft.Contract.RequiresAcceptance || len(draft.Contract.RequiredEffects) != 1 ||
-		len(draft.Contract.RequiredChecks) != 1 || draft.Contract.RequiredEffects[0] != "workspace-change" ||
-		investigate.Kind != graph.KindAgent || investigate.Metadata["route"] != "explore" ||
-		investigate.Metadata["authoring_template"] != "simple-task/v4" ||
-		work.Kind != graph.KindAgent || work.Metadata["authoring_template"] != "simple-task/v4" ||
-		work.ProgressContractRef != policycatalog.ProgressCodeChangeCurrent ||
-		repair.Kind != graph.KindAgent || repair.Metadata["recovery_target"] != "candidate-repair/v1" ||
-		repair.ProgressContractRef != policycatalog.ProgressCodeChangeV10 ||
-		acceptance.Kind != graph.KindAcceptance || acceptance.ProgressContractRef != policycatalog.ProgressVerificationCurrent ||
-		acceptanceRepair.Kind != graph.KindAcceptance || acceptanceRepair.ProgressContractRef != policycatalog.ProgressVerificationCurrent ||
-		recovery.Kind != graph.KindController ||
-		recovery.Metadata[graph.MetadataControllerRole] != string(graph.ControllerRoleLoopRecovery) ||
-		recovery.Metadata[graph.MetadataRecoveryMaxRetries] != "1" ||
-		recovery.Metadata[graph.MetadataRecoveryDeltaSchema] != graph.RecoveryDeltaSchemaV5 ||
-		recovery.ProgressContractRef != policycatalog.ProgressCoordinationCurrent ||
-		acceptanceRecovery.Kind != graph.KindController ||
-		acceptanceRecovery.Metadata[graph.MetadataControllerRole] != string(graph.ControllerRoleLoopRecovery) ||
-		acceptanceRecovery.Metadata[graph.MetadataRecoveryMaxRetries] != "2" ||
-		acceptanceRecovery.Metadata[graph.MetadataRecoveryDeltaSchema] != graph.RecoveryDeltaSchemaV2 ||
-		len(draft.Candidate.Nodes) != 27 {
-		t.Fatalf("simple task graph 未由 framework 完整生成: %+v", draft)
-	}
-	if investigate.OutputContract == nil ||
-		investigate.OutputContract.Profile != graph.OutputContractProfileInvestigationBoundaryV2 ||
-		!outputContractTestHasField(investigate.OutputContract, "$.failure_observation") ||
-		!outputContractTestHasField(investigate.OutputContract, "$.failure_observation.failure_kind") ||
-		!outputContractTestHasField(investigate.OutputContract, "$.boundary_evidence.public_entry") ||
-		!outputContractTestHasField(investigate.OutputContract, "$.boundary_evidence.state_owner") ||
-		!outputContractTestHasField(investigate.OutputContract, "$.boundary_evidence.internal_consumer") ||
-		!outputContractTestHasField(investigate.OutputContract, "$.rejected_alternative") {
-		t.Fatalf("simple-task/v4 未冻结首失败与三段 investigation boundary contract: %+v", investigate.OutputContract)
-	}
-	if len(work.Next) != 3 || work.Next[2].To != "recovery" ||
-		work.Next[2].TargetInput != "failure_context" || work.Next[2].When.Event != graph.EventBlocked ||
-		len(recovery.Next) != 4 || recovery.Next[0].To != "repair" ||
-		!recovery.Next[0].ReplayInputs || recovery.Next[0].TargetInput != "" ||
-		len(investigate.Next) != 3 || investigate.Next[0].To != "work" ||
-		investigate.Next[0].TargetInput != "" ||
-		len(repair.Next) != 3 || repair.Next[0].To != "acceptance-repair" ||
-		repair.Next[0].TargetInput != "repair_result" ||
-		len(acceptance.Next) != 5 || acceptance.Next[4].To != "acceptance-recovery" ||
-		acceptance.Next[4].TargetInput != "failure_context" ||
-		len(acceptanceRecovery.Next) != 4 || acceptanceRecovery.Next[0].To != "acceptance" ||
-		!acceptanceRecovery.Next[0].ReplayInputs {
-		t.Fatalf("simple task graph 未形成 Explorer→work→RecoveryDelta v5→repair 正式路径: work=%+v recovery=%+v",
-			work.Next, recovery.Next)
-	}
-	if _, err := group.configureSimpleDraft(context.Background(), map[string]any{"execution_class": "mutating"}); err != nil {
-		t.Fatalf("同 execution_class 重放应幂等: %v", err)
-	}
-	persisted, ok := authoring.GetDraft(draft.ProposalID)
-	if !ok || persisted.DraftRevision != 2 {
-		t.Fatalf("幂等 configure 不得重复增加 revision: %+v", persisted)
-	}
-	reconfiguredRaw, err := group.configureSimpleDraft(context.Background(), map[string]any{"execution_class": "read_only"})
-	if err != nil {
-		t.Fatalf("被 Proposal Acceptance 拒绝后应能用高层契约修正 execution_class: %v", err)
-	}
-	var reconfigured graph.GraphDraft
-	if err := json.Unmarshal([]byte(reconfiguredRaw), &reconfigured); err != nil ||
-		reconfigured.DraftRevision != 3 || reconfigured.Contract.ExecutionClass != graph.ExecutionReadOnly {
-		t.Fatalf("simple graph reconfigure 未形成新 revision: err=%v draft=%+v", err, reconfigured)
-	}
-	if schema := reconfigured.Candidate.Nodes["recovery"].Metadata[graph.MetadataRecoveryDeltaSchema]; schema != graph.RecoveryDeltaSchemaV2 {
-		t.Fatalf("read_only work recovery 不得进入 mutation handoff v3: schema=%s", schema)
-	}
-	if _, err := group.configureSimpleDraft(context.Background(), map[string]any{"execution_class": "mutating"}); err != nil {
-		t.Fatalf("恢复 mutating simple graph: %v", err)
-	}
+	t.Cleanup(func() { _ = executions.Close() })
+	board := &fakeGraphBoard{}
+	runtime := graph.NewRuntime(executions, board)
 	catalog, err := policycatalog.NewDefault()
 	if err != nil {
 		t.Fatal(err)
 	}
-	compiled, err := (graph.DefinitionCompiler{Policies: catalog, Acceptance: simpleGraphAcceptancePass{}}).Compile(
-		context.Background(), graph.DefinitionCompileRequest{
-			ReportID: "simple-graph-report", Draft: draft, DefinitionRevision: 1,
-		})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !compiled.Report.Accepted || len(compiled.Report.Errors) != 0 {
-		t.Fatalf("framework-owned simple graph 应直接通过确定性 compiler: %+v", compiled.Report.Errors)
-	}
-	group.Compiler = graph.DefinitionCompiler{Policies: catalog, Acceptance: simpleGraphAcceptancePass{}}
-	group.RouteValidator = fakeRouteValidator{routes: map[string][]string{
-		"": {
-			"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref",
-			"write_file", "edit_file", "run_shell", "run_check", "submit_task_result",
-		},
-		graph.RouteAcceptance: {
-			"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref", "submit_task_result",
-		},
-		"explore": {
-			"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref", "submit_task_result",
-		},
-	}}
-	validatedRaw, err := group.validateCurrentDraft(context.Background(), map[string]any{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var report graph.ValidationReport
-	if err := json.Unmarshal([]byte(validatedRaw), &report); err != nil || !report.Accepted {
-		t.Fatalf("current transaction validate 未通过: err=%v report=%+v", err, report)
-	}
-	committedRaw, err := group.commitCurrentDraft(context.Background(), map[string]any{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var receipt graphDefinitionReceipt
-	if err := json.Unmarshal([]byte(committedRaw), &receipt); err != nil || receipt.Revision != 1 || receipt.GraphID != draft.GraphID {
-		t.Fatalf("current transaction commit receipt 错误: err=%v receipt=%+v", err, receipt)
-	}
+	return GraphAuthoringGroup{Store: authoring, TaskStore: tasks, Holder: &fakeHolder{id: task.ID}, SessionID: func() string { return "s1" }, Compiler: graph.DefinitionCompiler{Policies: catalog, Acceptance: simpleGraphAcceptancePass{}}, Runtime: &graph.AuthoringRuntime{Authoring: authoring, Runtime: runtime}, RouteValidator: fakeRouteValidator{routes: map[string][]string{"": {"read_file", "submit_task_result"}}}, Finalization: &fakeFinalizationNotifier{}}, executions, board
 }
 
-func outputContractTestHasField(contract *graph.NodeOutputContract, path string) bool {
-	for _, field := range contract.Fields {
-		if field.Path == path && field.Required {
-			return true
+func graphCreateArgs() map[string]any {
+	return map[string]any{"operation": "create", "request_id": "initial", "contract": map[string]any{"execution_class": "read_only", "deliverables": []any{map[string]any{"id": "report", "kind": "report"}}}, "definition": map[string]any{"root": "work", "nodes": map[string]any{
+		"work": map[string]any{"kind": "agent", "task": map[string]any{"title": "调查", "description": "调查并提供结果"}, "contract_bindings": map[string]any{"deliverables": []string{"report"}}, "next": []any{
+			map[string]any{"to": "done", "when": map[string]any{"event": "completed"}}, map[string]any{"to": "failed", "when": map[string]any{"event": "failed"}}, map[string]any{"to": "blocked", "when": map[string]any{"event": "blocked"}},
+		}},
+		"done":    map[string]any{"kind": "end", "end_outcome": "success", "next": []any{}},
+		"failed":  map[string]any{"kind": "end", "end_outcome": "failed", "next": []any{}},
+		"blocked": map[string]any{"kind": "end", "end_outcome": "blocked", "next": []any{}},
+	}}}
+}
+
+func appliedGraphID(t *testing.T, g GraphAuthoringGroup, args map[string]any) string {
+	t.Helper()
+	out, err := g.applyGraphChange(context.Background(), args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt struct {
+		GraphID string `json:"graph_id"`
+		Status  string `json:"status"`
+	}
+	if err = json.Unmarshal([]byte(out), &receipt); err != nil || receipt.Status != "applied" || receipt.GraphID == "" {
+		t.Fatalf("回执非法：%s %v", out, err)
+	}
+	return receipt.GraphID
+}
+
+func TestGraphToolsCreateValidateCommitInOneCall(t *testing.T) {
+	g, executions, board := newUnifiedGraphEnv(t)
+	id := appliedGraphID(t, g, graphCreateArgs())
+	if _, exists := executions.Get(id); exists || board.count() != 0 {
+		t.Fatal("创建不得自动启动")
+	}
+	if again := appliedGraphID(t, g, graphCreateArgs()); again != id {
+		t.Fatal("重复请求创建了新图")
+	}
+	args := graphCreateArgs()
+	args["definition"].(map[string]any)["root"] = "wrong"
+	if _, err := g.applyGraphChange(context.Background(), args); err == nil {
+		t.Fatal("同一请求标识不能换内容")
+	}
+	args["request_id"] = "invalid"
+	if _, err := g.applyGraphChange(context.Background(), args); err == nil || !strings.Contains(err.Error(), "拒绝") {
+		t.Fatalf("非法图应返回原因：%v", err)
+	}
+	if len(g.Store.ListLatestDefinitions()) != 1 {
+		t.Fatal("非法请求污染正式定义")
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := g.controlGraph(context.Background(), map[string]any{"graph_id": id, "action": "start", "expected_revision": 1}); err != nil {
+			t.Fatal(err)
 		}
 	}
-	return false
-}
-
-func TestGraphAuthoringCreateAndPatchUseNativeArguments(t *testing.T) {
-	group, authoring := newGraphAuthoringToolEnv(t)
-	createArgs := map[string]any{}
-	createdRaw, err := group.createDraft(context.Background(), createArgs)
-	if err != nil {
-		t.Fatalf("createDraft: %v", err)
-	}
-	var created graph.GraphDraft
-	if err := json.Unmarshal([]byte(createdRaw), &created); err != nil {
-		t.Fatal(err)
-	}
-	if created.DraftRevision != 1 || created.RequestDigest == "" || created.Contract.RequestDigest != created.RequestDigest ||
-		created.Contract.ExecutionClass != "" || len(created.Candidate.Nodes) != 0 ||
-		created.ProposalID != "graph-proposal-scheduler-root" || created.GraphID != "graph-scheduler-root" {
-		t.Fatalf("create 未由框架绑定 request: %+v", created)
-	}
-
-	patchArgs := map[string]any{
-		"proposal_id": created.ProposalID, "base_draft_revision": float64(1), "root": "work",
-		"contract": map[string]any{
-			"execution_class":  "mutating",
-			"deliverables":     []any{map[string]any{"id": "source", "kind": "artifact"}},
-			"required_effects": []any{"file_write"},
-		},
-		"upsert_nodes": []any{
-			map[string]any{
-				"id": "work", "kind": "agent",
-				"task": map[string]any{"title": "实施", "description": "实施并提交结果"},
-				"next": []any{
-					map[string]any{"to": "done", "when": map[string]any{"event": "completed"}},
-					map[string]any{"to": "failed", "when": map[string]any{"event": "failed"}},
-					map[string]any{"to": "blocked", "when": map[string]any{"event": "blocked"}},
-				},
-				"output_contract":       map[string]any{"summary_required": true},
-				"progress_contract_ref": "progress:code-change/v1", "context_policy_ref": "context:default/v1",
-				"contract_bindings": map[string]any{"deliverables": []any{"source"}, "effects": []any{"file_write"}},
-			},
-			map[string]any{"id": "done", "kind": "end", "end_outcome": "success", "next": []any{}},
-			map[string]any{"id": "failed", "kind": "end", "end_outcome": "failed", "next": []any{}},
-			map[string]any{"id": "blocked", "kind": "end", "end_outcome": "blocked", "next": []any{}},
-		},
-	}
-	patchedRaw, err := group.patchDraft(context.Background(), patchArgs)
-	if err != nil {
-		t.Fatalf("patchDraft: %v", err)
-	}
-	var patched graph.GraphDraft
-	if err := json.Unmarshal([]byte(patchedRaw), &patched); err != nil {
-		t.Fatal(err)
-	}
-	if patched.DraftRevision != 2 || patched.Candidate.Root != "work" || len(patched.Candidate.Nodes) != 4 {
-		t.Fatalf("native patch 未生效: %+v", patched)
-	}
-	stored, _ := authoring.GetDraft(created.ProposalID)
-	if stored.DraftRevision != 2 {
-		t.Fatalf("Store revision=%d", stored.DraftRevision)
-	}
-
-	if _, err := group.createDraft(context.Background(), map[string]any{"graph": `{"root":"done"}`}); err == nil {
-		t.Fatal("完整 Graph JSON string 参数必须被 strict native decoder 拒绝")
+	if board.count() != 1 {
+		t.Fatalf("重复启动产生了多个任务：%d", board.count())
 	}
 }
 
-func TestGraphAuthoringCreateIsIdempotentAndRejectsArguments(t *testing.T) {
-	group, _ := newGraphAuthoringToolEnv(t)
-	raw, err := group.createDraft(context.Background(), map[string]any{})
-	if err != nil {
-		t.Fatal(err)
+func TestGraphToolsConcurrentCreateIsIdempotent(t *testing.T) {
+	g, _, _ := newUnifiedGraphEnv(t)
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := g.applyGraphChange(context.Background(), graphCreateArgs()); err != nil {
+				t.Error(err)
+			}
+		}()
 	}
-	var draft graph.GraphDraft
-	if err := json.Unmarshal([]byte(raw), &draft); err != nil {
-		t.Fatal(err)
-	}
-	repeated, err := group.createDraft(context.Background(), map[string]any{})
-	if err != nil || repeated != raw {
-		t.Fatalf("deterministic create 重试不幂等: err=%v\nfirst=%s\nsecond=%s", err, raw, repeated)
-	}
-	if _, err := group.createDraft(context.Background(), map[string]any{"graph_id": "forbidden"}); err == nil {
-		t.Fatal("零参数 create 不得接受模型自造 identity")
-	}
-}
-
-func TestInterventionAuthoringBindsOriginalRequestWithoutTransferringDraftOwnership(t *testing.T) {
-	tasks := store.NewMemoryTaskStore(make(chan model.Event, 8), 32, 1, 60)
-	now := time.Now().UTC()
-	run := &runcontract.RunContract{
-		Schema: runcontract.SchemaV1, RunID: "run-intervention-authoring", CreatedAt: now,
-		DeadlineAt: now.Add(time.Hour), FinalizationReserve: time.Minute,
-		RecoveryReserve: time.Minute, BudgetProfile: "test/v1",
-	}
-	catalog, err := policycatalog.NewDefault()
-	if err != nil {
-		t.Fatal(err)
-	}
-	progress, ok := catalog.ProgressContract(policycatalog.ProgressCoordinationV1)
-	if !ok {
-		t.Fatal("缺少 coordination ProgressContract")
-	}
-	source := &model.Task{
-		ID: "source-root", EventType: "__scheduler__", EventSource: "user",
-		Description: "原始用户请求", RunID: run.RunID, RunContract: run,
-		ContextPolicyRef: policycatalog.ContextDefaultCurrent, ProgressContract: &progress.Contract,
-	}
-	if err := tasks.PublishTask(source); err != nil {
-		t.Fatal(err)
-	}
-	if err := tasks.ClaimTask("scheduler", source.ID); err != nil {
-		t.Fatal(err)
-	}
-	if err := tasks.BlockProcessingTaskBySystem(source.ID, "需要介入", "loop_intervention_required"); err != nil {
-		t.Fatal(err)
-	}
-	wake := &model.Task{
-		ID: "wake-root", EventType: "__scheduler__", EventSource: model.TaskEventSourceLoopIntervention,
-		ParentTaskID: source.ID, Description: "介入恢复", RunID: run.RunID, RunContract: run,
-		ContextPolicyRef: policycatalog.ContextDefaultCurrent, ProgressContract: &progress.Contract,
-		RunPhase: runcontract.PhaseRecovery,
-	}
-	if err := tasks.PublishTask(wake); err != nil {
-		t.Fatal(err)
-	}
-	authoring, err := graph.NewAuthoringStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = authoring.Close() })
-	group := GraphAuthoringGroup{
-		Store: authoring, TaskStore: tasks, Holder: &fakeHolder{id: wake.ID},
-		SessionID: func() string { return "session-1" },
-	}
-	raw, err := group.createDraft(context.Background(), map[string]any{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var draft graph.GraphDraft
-	if err := json.Unmarshal([]byte(raw), &draft); err != nil {
-		t.Fatal(err)
-	}
-	if draft.OwnerTaskID != wake.ID || draft.RequestRef != source.ID ||
-		draft.Contract.RequestRef != source.ID || draft.RequestDigest != schedulerRequestDigest(source) {
-		t.Fatalf("intervention authoring provenance/ownership 错误: %+v", draft)
+	wg.Wait()
+	if len(g.Store.ListLatestDefinitions()) != 1 {
+		t.Fatal("并发重试产生重复图")
 	}
 }
 
-func slicesContains(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
+func TestGraphToolsDynamicChangePreservesActiveExecution(t *testing.T) {
+	g, executions, board := newUnifiedGraphEnv(t)
+	id := appliedGraphID(t, g, graphCreateArgs())
+	if _, err := g.controlGraph(context.Background(), map[string]any{"graph_id": id, "action": "start", "expected_revision": 1}); err != nil {
+		t.Fatal(err)
+	}
+	before := board.last()
+	node := graphCreateArgs()["definition"].(map[string]any)["nodes"].(map[string]any)["work"].(map[string]any)
+	node["id"] = "work"
+	node["task"].(map[string]any)["description"] = "未来执行使用新的调查范围"
+	args := map[string]any{"operation": "update", "request_id": "update1", "graph_id": id, "expected_revision": 1, "reason": "新增反馈", "in_flight": "preserve", "changes": map[string]any{"upsert_nodes": []any{node}}}
+	appliedGraphID(t, g, args)
+	current, ok := executions.Get(id)
+	if !ok || current.Revision != 2 {
+		t.Fatalf("执行图未更新：%+v", current)
+	}
+	if board.count() != 1 || before.Description == current.Nodes["work"].Task.Description {
+		t.Fatal("变更不得重新发布或改写在途任务")
+	}
+	appliedGraphID(t, g, args)
+	args["request_id"] = "conflict"
+	if _, err := g.applyGraphChange(context.Background(), args); err == nil {
+		t.Fatal("过期 revision 应拒绝")
+	}
+	if latest, _ := g.Store.LatestDefinition(id); latest.Revision != 2 {
+		t.Fatal("冲突请求污染正式版本")
+	}
+	if _, err := g.controlGraph(context.Background(), map[string]any{"graph_id": id, "action": "cancel", "expected_revision": 2, "reason": "用户取消"}); err != nil {
+		t.Fatal(err)
+	}
+	args["expected_revision"] = 2
+	args["request_id"] = "after-cancel"
+	if _, err := g.applyGraphChange(context.Background(), args); err == nil {
+		t.Fatal("终态图不得复活")
+	}
+}
+
+func TestGraphToolsReadScopeAndPagination(t *testing.T) {
+	g, _, _ := newUnifiedGraphEnv(t)
+	id := appliedGraphID(t, g, graphCreateArgs())
+	if _, err := g.readGraphDefinition(context.Background(), map[string]any{"graph_id": id, "offset": 1}); err == nil {
+		t.Fatal("后续页必须绑定版本")
+	}
+	out, err := g.readGraphDefinition(context.Background(), map[string]any{"graph_id": id, "revision": 1, "limit": 1})
+	if err != nil || !strings.Contains(out, `"has_more": true`) {
+		t.Fatalf("分页返回错误：%s %v", out, err)
+	}
+	g.SessionID = func() string { return "other" }
+	if _, err := g.readGraphDefinition(context.Background(), map[string]any{"graph_id": id}); err == nil {
+		t.Fatal("不得跨会话读取")
+	}
+}
+
+func TestGraphToolSchemasExposeOnlyUnifiedEntries(t *testing.T) {
+	r := agent.NewToolRegistry()
+	GraphAuthoringGroup{}.Register(r)
+	if len(r.Names()) != 3 {
+		t.Fatalf("编排组只应注册三个入口（request_replan 独立装配）：%v", r.Names())
+	}
+	for _, d := range r.Defs() {
+		if strings.Contains(d.Name, "draft") {
+			t.Fatal("模型不应管理内部草案")
 		}
 	}
-	return false
+}
+
+func TestGraphRouteAndLeaseShareAcceptanceInspectionAuthority(t *testing.T) {
+	allowed := []string{"read_file", "inspect_board", "inspect_node", "read_graph_definition", "read_evidence", "submit_task_result"}
+	validator := graphRouteValidator{RouteValidator: fakeRouteValidator{routes: map[string][]string{"acceptance.verify": allowed}}}
+	node := graph.Node{Kind: graph.KindAcceptance, Capability: &graph.Capability{Tools: allowed}}
+	if err := validator.validateRoutes("g-inspection", map[string]graph.Node{"verify": node}, "nodes"); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range allowed {
+		if !agent.IsAcceptanceToolAllowed(name) {
+			t.Fatalf("路由与租约工具权威漂移：%s", name)
+		}
+	}
+	for _, name := range []string{"apply_change", "run_shell", "send_message", "request_replan"} {
+		if agent.IsAcceptanceToolAllowed(name) {
+			t.Fatalf("验收角色泄露行动工具：%s", name)
+		}
+	}
 }

@@ -361,7 +361,7 @@ func shellExecEvent(taskID, outcome string) trace.Event {
 		TaskID:    taskID,
 		AgentID:   "agent-x",
 		Tool:      "run_shell",
-		ShellExec: &trace.ShellExec{Command: "Set-Content out.txt x", Outcome: outcome, ExitCode: 0},
+		ShellExec: &trace.ShellExec{Command: "Set-Content out.txt x", Outcome: outcome, ExitCode: func() *int { value := 0; return &value }()},
 	}
 }
 

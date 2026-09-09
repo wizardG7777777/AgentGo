@@ -146,6 +146,9 @@ func (h *WakeWorthyFilterHook) Run(hctx hook.MailboxHookContext) hook.MailboxHoo
 // 这是 MVP 固定策略；未来若出现"某类 info 也需要立即唤醒"的场景，
 // 发送方应主动标注 priority=high 而不是放宽本规则。
 func isWakeWorthy(m mailbox.Message) bool {
+	if m.DeliveryOnly {
+		return false
+	}
 	switch m.Type {
 	case mailbox.MsgTypeQuestion, mailbox.MsgTypeSteer:
 		return true
@@ -169,6 +172,9 @@ func isWakeWorthy(m mailbox.Message) bool {
 //   - 任何 priority=high 或 type=question/steer：根本不会进入本函数
 //     （isWakeWorthy 已经在上游 return Continue）
 func isSafelyDroppable(m mailbox.Message) bool {
+	if m.DeliveryOnly {
+		return false
+	}
 	if m.Type == mailbox.MsgTypeAck {
 		return true
 	}

@@ -76,8 +76,8 @@ func TestRequireReadBeforeWriteHook_Metadata(t *testing.T) {
 func TestRequireReadBeforeWriteHook_Matches(t *testing.T) {
 	h := NewRequireReadBeforeWriteHook(&mockHistoryStore{})
 	cases := map[string]bool{
-		"write_file":  true,
-		"edit_file":   true,
+		"apply_change": true,
+
 		"read_file":   false,
 		"list_dir":    false,
 		"grep_search": false,
@@ -101,7 +101,7 @@ func TestRequireReadBeforeWriteHook_NewFileExempt(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "brand-new.md")
 	d := h.Run(hook.ToolHookContext{
 		TaskID:   "task-1",
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": missing},
 	})
 	if d.Action != hook.Continue {
@@ -110,7 +110,7 @@ func TestRequireReadBeforeWriteHook_NewFileExempt(t *testing.T) {
 }
 
 func TestRequireReadBeforeWriteHook_PriorReadContinues(t *testing.T) {
-	// v5 Phase 6：先 read_file 写入 ReadSet → write_file 通过
+	// v5 Phase 6：先 read_file 写入 ReadSet → apply_change 通过
 	target := makeRealFile(t)
 	st := &mockHistoryStore{
 		readset: map[string]model.ReadInfo{
@@ -120,7 +120,7 @@ func TestRequireReadBeforeWriteHook_PriorReadContinues(t *testing.T) {
 	h := NewRequireReadBeforeWriteHook(st)
 	d := h.Run(hook.ToolHookContext{
 		TaskID:   "task-1",
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": target},
 	})
 	if d.Action != hook.Continue {
@@ -140,7 +140,7 @@ func TestRequireReadBeforeWriteHook_MultiplePriorReads(t *testing.T) {
 	h := NewRequireReadBeforeWriteHook(st)
 	d := h.Run(hook.ToolHookContext{
 		TaskID:   "task-1",
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": target},
 	})
 	if d.Action != hook.Continue {
@@ -149,7 +149,7 @@ func TestRequireReadBeforeWriteHook_MultiplePriorReads(t *testing.T) {
 }
 
 func TestRequireReadBeforeWriteHook_EditFilePriorReadContinues(t *testing.T) {
-	// edit_file 也走相同 ReadSet 检查
+	// apply_change 也走相同 ReadSet 检查
 	target := makeRealFile(t)
 	st := &mockHistoryStore{
 		readset: map[string]model.ReadInfo{
@@ -159,11 +159,11 @@ func TestRequireReadBeforeWriteHook_EditFilePriorReadContinues(t *testing.T) {
 	h := NewRequireReadBeforeWriteHook(st)
 	d := h.Run(hook.ToolHookContext{
 		TaskID:   "task-1",
-		ToolName: "edit_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": target},
 	})
 	if d.Action != hook.Continue {
-		t.Errorf("edit_file Action = %v, want Continue", d.Action)
+		t.Errorf("apply_change Action = %v, want Continue", d.Action)
 	}
 }
 
@@ -175,7 +175,7 @@ func TestRequireReadBeforeWriteHook_NoHistoryAborts(t *testing.T) {
 	h := NewRequireReadBeforeWriteHook(&mockHistoryStore{})
 	d := h.Run(hook.ToolHookContext{
 		TaskID:   "task-1",
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": target},
 	})
 	if d.Action != hook.Abort {
@@ -201,7 +201,7 @@ func TestRequireReadBeforeWriteHook_DifferentPathReadAborts(t *testing.T) {
 	h := NewRequireReadBeforeWriteHook(st)
 	d := h.Run(hook.ToolHookContext{
 		TaskID:   "task-1",
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": target},
 	})
 	if d.Action != hook.Abort {
@@ -220,7 +220,7 @@ func TestRequireReadBeforeWriteHook_FailedReadDoesNotCount(t *testing.T) {
 	h := NewRequireReadBeforeWriteHook(st)
 	d := h.Run(hook.ToolHookContext{
 		TaskID:   "task-1",
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": target},
 	})
 	if d.Action != hook.Abort {
@@ -238,7 +238,7 @@ func TestRequireReadBeforeWriteHook_ListDirDoesNotCount(t *testing.T) {
 	h := NewRequireReadBeforeWriteHook(st)
 	d := h.Run(hook.ToolHookContext{
 		TaskID:   "task-1",
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": target},
 	})
 	if d.Action != hook.Abort {
@@ -258,7 +258,7 @@ func TestRequireReadBeforeWriteHook_NilStoreContinues(t *testing.T) {
 	h := NewRequireReadBeforeWriteHook(nil)
 	d := h.Run(hook.ToolHookContext{
 		TaskID:   "task-1",
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": makeRealFile(t)},
 	})
 	if d.Action != hook.Continue {
@@ -271,7 +271,7 @@ func TestRequireReadBeforeWriteHook_MissingPathContinues(t *testing.T) {
 	h := NewRequireReadBeforeWriteHook(&mockHistoryStore{})
 	d := h.Run(hook.ToolHookContext{
 		TaskID:   "task-1",
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{},
 	})
 	if d.Action != hook.Continue {
@@ -283,7 +283,7 @@ func TestRequireReadBeforeWriteHook_NonStringPathContinues(t *testing.T) {
 	h := NewRequireReadBeforeWriteHook(&mockHistoryStore{})
 	d := h.Run(hook.ToolHookContext{
 		TaskID:   "task-1",
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": 123},
 	})
 	if d.Action != hook.Continue {
@@ -312,12 +312,12 @@ func TestRequireReadBeforeWriteHook_EndToEndWithRealStore(t *testing.T) {
 		t.Fatalf("UpsertReadSet: %v", err)
 	}
 
-	// 通过 hook 验证 write_file 应该被允许
+	// 通过 hook 验证 apply_change 应该被允许
 	var view store.StoreHookView = taskStore
 	h := NewRequireReadBeforeWriteHook(view)
 	d := h.Run(hook.ToolHookContext{
 		TaskID:   task.ID,
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": target},
 	})
 	if d.Action != hook.Continue {
@@ -337,7 +337,7 @@ func TestRequireReadBeforeWriteHook_EndToEndAbortWithoutRead(t *testing.T) {
 	h := NewRequireReadBeforeWriteHook(view)
 	d := h.Run(hook.ToolHookContext{
 		TaskID:   task.ID,
-		ToolName: "write_file",
+		ToolName: "apply_change",
 		Args:     map[string]any{"path": target},
 	})
 	if d.Action != hook.Abort {

@@ -336,7 +336,7 @@ func validateRuntimeState(doc *GraphDocument) error {
 // schema 只接受 SchemaV1 / SchemaV2 / SchemaV3 三个封闭值；v2/v3 文档的追加约束（事件
 // 词表、输出契约声明）在 authoring 阶段按版本分流，见 validateAuthoringNodes。
 func validateBasics(doc *GraphDocument) error {
-	if doc.Schema != SchemaV1 && doc.Schema != SchemaV2 && doc.Schema != SchemaV3 && doc.Schema != SchemaV4 {
+	if doc.Schema != SchemaV1 && doc.Schema != SchemaV2 && doc.Schema != SchemaV3 && doc.Schema != SchemaV4 && doc.Schema != SchemaV5 {
 		return newErr("基本字段", "schema", "schema 必须恰为 %q、%q、%q 或 %q，实际为 %q", SchemaV1, SchemaV2, SchemaV3, SchemaV4, doc.Schema)
 	}
 	if err := validateGraphID(doc.GraphID); err != nil {
@@ -913,19 +913,13 @@ func validateCapabilityShape(doc *GraphDocument) error {
 				return newErr("能力", path+".capability.tools", "controller 节点 %q 不得声明 capability.tools（纯控制面无业务工具），实际为 %v", id, cap.Tools)
 			}
 		}
-		// Delivery Graph 的 mutating producer 只能在隔离候选中写文件；raw
-		// run_shell 会绕过路径边界，故不得进入租约。run_check 是唯一受约束
-		// 的命令执行面，仍可用于 typed verification。
+		// 文件修改节点绑定隔离工作区；命令统一通过 run_shell 执行。
 		if UsesDeliveryTransaction(doc.Schema) && strings.HasPrefix(node.ProgressContractRef, "progress:code-change/") {
 			v3MutatingNodes++
 			if node.Kind != KindAgent || node.Capability == nil || node.Capability.Isolation != IsolationWorkspace {
 				return newErr("能力", path+".capability", "Delivery Graph mutating 节点必须是 agent 且 capability.isolation=%q", IsolationWorkspace)
 			}
-			for _, tool := range node.Capability.Tools {
-				if tool == "run_shell" {
-					return newErr("能力", path+".capability.tools", "Delivery Graph mutating 节点禁止 raw run_shell；请使用 run_check")
-				}
-			}
+
 			if doc.Schema == SchemaV4 {
 				if target := strings.TrimSpace(node.Metadata["recovery_target"]); target == "" {
 					v4PrimaryMutatingNodes++
@@ -945,7 +939,7 @@ func validateCapabilityShape(doc *GraphDocument) error {
 			}
 		}
 	}
-	if doc.Schema == SchemaV3 && v3MutatingNodes > 1 {
+	if (doc.Schema == SchemaV3 || doc.Schema == SchemaV5) && v3MutatingNodes > 1 {
 		return newErr("能力", "nodes", "Graph v3 首版每张图只允许一个 mutating producer；请拆为独立 Delivery Graph 后再汇合")
 	}
 	if doc.Schema == SchemaV4 {

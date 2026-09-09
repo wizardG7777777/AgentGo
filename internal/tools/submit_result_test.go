@@ -240,8 +240,8 @@ func TestSubmitTaskResultRejectsSchedulerTask(t *testing.T) {
 	task := publishPlainTask(t, s, &model.Task{Description: "sched", EventType: "__scheduler__"})
 	g, notifier, state := newSubmitGroup(s, &fakeHolder{id: task.ID})
 	_, err := g.submitTaskResult(context.Background(), map[string]any{"summary": "done"})
-	if err == nil || !strings.Contains(err.Error(), "report_done") {
-		t.Fatalf("scheduler 任务应被拒绝并指引 report_done，实际 err=%v", err)
+	if err == nil || !strings.Contains(err.Error(), "创建并启动图") {
+		t.Fatalf("新请求不能通过结果提交绕过建图，实际 err=%v", err)
 	}
 	if notifier.marked {
 		t.Error("拒绝时不应 MarkTaskFinalized")
@@ -521,8 +521,8 @@ func TestArtifactLedgerFailurePreventsSubmitFinalization(t *testing.T) {
 		Roster:         &recordingRoster{}, AgentID: "worker-1", ArtifactStore: s,
 	}
 	ctx := agent.WithAgentContext(context.Background(), "worker-1", task.ID, 1)
-	if _, err := writeGroup.writeFile(ctx, map[string]any{"path": "out.md", "content": "文件写成但 ledger 失败"}); err == nil {
-		t.Fatal("artifact ledger 失败时 write_file 必须报错")
+	if _, err := writeGroup.applyChange(ctx, map[string]any{"path": "out.md", "content": "文件写成但 ledger 失败"}); err == nil {
+		t.Fatal("artifact ledger 失败时 apply_change 必须报错")
 	}
 
 	g, notifier, state := newSubmitGroup(s, &fakeHolder{id: task.ID})

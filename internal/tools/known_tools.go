@@ -9,16 +9,14 @@ package tools
 var AllToolNames = []string{
 	// LocalReadGroup
 	"read_file",
-	"list_dir",
-	"grep_search",
-	"glob_search",
 
-	// ContentRefGroup
-	"read_content_ref",
+	// EvidenceGroup
+	"read_evidence",
+	"inspect_board",
+	"inspect_node",
 
 	// LocalWriteGroup
-	"write_file",
-	"edit_file",
+	"apply_change",
 
 	// WebGroup
 	"web_search",
@@ -26,52 +24,23 @@ var AllToolNames = []string{
 
 	// ShellGroup
 	"run_shell",
-	"run_check",
 
-	// MetaGroup
-	"publish_task",
+	// CommunicationGroup
 	"send_message",
 	"request_user_input",
 
 	// PlanControlGroup（是否可见由 profile/内置 Scheduler 装配决定）
 	"submit_task_result",
 	"request_replan",
-	"record_observation_delta",
-	"submit_recovery_decision",
-	"submit_change_decision",
-
-	// SchedulerGroup（scheduler 专属，不走 profile 配置）
-	"cancel_task",
-	"get_task_result",
-	"report_done",
-	"report_progress",
-	"probe_directory",
 
 	// AgentTemplateGroup（scheduler 专属，不走 profile 配置）
 	"list_agent_templates",
 	"provision_agent_team",
 
-	// GraphControlGroup（scheduler 专属，不走 profile 配置）
-	"submit_graph",
-	"read_graph",
-	"patch_graph",
-
-	// GraphAuthoringGroup（新 root Scheduler 的事务化 L5 控制面）
-	"create_graph_draft",
-	"configure_simple_graph_draft",
-	"patch_graph_draft",
-	"read_graph_draft",
-	"validate_graph_draft",
-	"validate_current_graph_draft",
-	"commit_graph_draft",
-	"commit_current_graph_draft",
-	"start_graph",
-	"start_current_graph",
-	"propose_graph_change",
-	"read_graph_change",
-	"validate_graph_change",
-	"commit_graph_change",
-	"submit_graph_change_decision",
+	// 图编排：request_replan 在节点提交通道注册。
+	"read_graph_definition",
+	"apply_graph_change",
+	"control_graph",
 }
 
 // ValidateToolNames 校验给定的工具名列表是否全部在 AllToolNames 中。

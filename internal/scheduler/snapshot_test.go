@@ -92,8 +92,8 @@ func TestMarshalBoundedBoardSnapshotProjectsOversizedHotState(t *testing.T) {
 	large.Resources.AgentCapabilities = []agentCapabilitySnapshot{{
 		AgentType: "worker", Description: strings.Repeat("能力", 400),
 		Capabilities: []string{
-			"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref",
-			"write_file", "edit_file", "run_shell", "send_message", "request_replan",
+			"read_file", "list_dir", "grep_search", "glob_search", "read_evidence",
+			"apply_change", "run_shell", "send_message", "request_replan",
 			"submit_task_result", "extra-1", "extra-2", "extra-3", "extra-4", "extra-5",
 			"extra-6", "extra-7", "extra-8", "extra-9",
 		},

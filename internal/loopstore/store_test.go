@@ -20,7 +20,7 @@ func storeTestContract() loopcontract.CompiledProgressContract {
 		ContractID: "contract-1", ContractDigest: "sha256:contract", PolicyRef: "bounded_code_change/v1",
 	}
 	return loopcontract.CompiledProgressContract{
-		Schema: loopcontract.CompiledSchemaV1, Ref: ref, WorkClass: loopcontract.WorkCodeChange,
+		Schema: loopcontract.CompiledSchemaCurrent, Ref: ref, WorkClass: loopcontract.WorkCodeChange,
 		Deliverables: []loopcontract.DeliverableRule{{
 			ID: "source", Kind: loopcontract.DeliverableFileDelta, Scope: "internal/**", Required: true,
 		}},
@@ -28,11 +28,9 @@ func storeTestContract() loopcontract.CompiledProgressContract {
 			Kind: loopcontract.SignalFileVersionChanged, IdentityScope: "internal/**", Deliverable: true,
 		}},
 		Policy: loopcontract.ProgressPolicy{
-			PolicyRef: "bounded_code_change/v1", ReminderAfterTurns: 3,
-			RolloverAfterTurns: 6, InterventionAfterTurns: 9, MaxNoProgressTurns: 12,
-			MaxNoProgressDuration: 10 * time.Minute,
-			MaxNoProgressUsage:    runcontract.BudgetLimit{ModelCalls: 12, ToolActions: 48},
-			MaxExplorationTurns:   4, MaxAttemptRollovers: 1, RecentFingerprintWindow: 16,
+			PolicyRef: "bounded_code_change/v1",
+
+			RecentFingerprintWindow: 16,
 		},
 		RunBudgetRef: "run-budget-1",
 	}

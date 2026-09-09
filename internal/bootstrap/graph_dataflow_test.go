@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"agentgo/internal/checkstore"
 	"agentgo/internal/graph"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
@@ -108,34 +107,7 @@ func TestGraphTaskContextInputsCarriesEvidenceWithoutSideChannelTool(t *testing.
 	}
 }
 
-func TestGraphTaskContextInputsCarriesFulfillmentCheckEvidence(t *testing.T) {
-	task := &model.Task{ID: "task-check", Description: "实现"}
-	record := checkstore.Record{
-		CheckRef: "check:sha256:abc", CheckID: "verification", Kind: "test",
-		Status: checkstore.StatusPass, ExitCode: 0, ExitCodeScope: "whole_command",
-		WorkspaceRevisionRef: "workspace:sha256:candidate", OutputRef: "content:sha256:output",
-	}
-	evidence := assembleTaskEvidenceFromCallsAndChecks(task, nil, []checkstore.Record{record})
-	if len(evidence) != 1 || evidence[0].Kind != "check" || evidence[0].CheckRef != record.CheckRef {
-		t.Fatalf("typed Check Evidence 组装失败: %+v", evidence)
-	}
-	inputs := graphTaskContextInputs(graph.TaskSpec{Title: "验收", Inputs: []graph.InputBinding{{
-		SourceNodeID: "work", SourceActivationID: "work@1",
-		Evidence: evidence, EvidenceRefs: []string{evidence[0].Ref},
-	}}})
-	content := inputs[0].Content + inputs[1].Content
-	for _, want := range []string{
-		evidence[0].Ref, `"kind":"check"`, `"check_ref":"check:sha256:abc"`,
-		`"check_id":"verification"`, `"check_status":"pass"`,
-		`"workspace_revision_ref":"workspace:sha256:candidate"`, `"exit_code":0`,
-	} {
-		if !strings.Contains(content, want) {
-			t.Errorf("冻结 Check Evidence 缺少 %q: %s", want, content)
-		}
-	}
-}
-
-func TestFulfillmentCheckEvidenceSurvivesRawEvidenceTruncation(t *testing.T) {
+func TestArtifactEvidenceSurvivesRawEvidenceTruncation(t *testing.T) {
 	task := &model.Task{ID: "task-many-calls", Description: "实现", Artifacts: []string{"out.txt"}}
 	calls := make([]store.ToolCallRecord, 0, evidenceMaxEntries+5)
 	for index := 0; index < evidenceMaxEntries+5; index++ {
@@ -144,19 +116,14 @@ func TestFulfillmentCheckEvidenceSurvivesRawEvidenceTruncation(t *testing.T) {
 			Args: map[string]any{"path": fmt.Sprintf("file-%03d", index)}, Success: true,
 		})
 	}
-	check := checkstore.Record{
-		CheckRef: "check:sha256:required", CheckID: "verification", Kind: "test",
-		Status: checkstore.StatusPass, ExitCode: 0, ExitCodeScope: "whole_command",
-		WorkspaceRevisionRef: "workspace:sha256:candidate",
-	}
-	evidence := assembleTaskEvidenceFromCallsAndChecks(task, calls, []checkstore.Record{check})
-	foundCheck, foundArtifact, foundTruncated := false, false, false
+	evidence := assembleTaskEvidenceFromCalls(task, calls)
+	foundArtifact, foundTruncated := false, false
 	for _, entry := range evidence {
-		foundCheck = foundCheck || entry.Kind == "check" && entry.CheckRef == check.CheckRef
+
 		foundArtifact = foundArtifact || entry.Kind == "artifact" && entry.Path == "out.txt"
 		foundTruncated = foundTruncated || entry.Kind == "truncated"
 	}
-	if !foundCheck || !foundArtifact || !foundTruncated {
+	if !foundArtifact || !foundTruncated {
 		t.Fatalf("必需 Artifact/Check Evidence 不得被 raw 调用上限截掉: %+v", evidence)
 	}
 }
@@ -326,7 +293,7 @@ func TestAssembleTaskEvidence(t *testing.T) {
 	calls := []store.ToolCallRecord{
 		{Timestamp: base, CallID: "call-test", AgentID: "a1", ToolName: "run_shell",
 			Args: map[string]any{"command": "go test ./..."}, Success: true, ExitCode: &exit1},
-		{Timestamp: base.Add(time.Millisecond), CallID: "call-write", AgentID: "a1", ToolName: "write_file",
+		{Timestamp: base.Add(time.Millisecond), CallID: "call-write", AgentID: "a1", ToolName: "apply_change",
 			Args: map[string]any{"path": "out/report.md"}, Success: true},
 		{Timestamp: base.Add(2 * time.Millisecond), CallID: "call-build", AgentID: "a1", ToolName: "run_shell",
 			Args: map[string]any{"command": "go build ./..."}, Success: true, ExitCode: &exit0},
@@ -349,7 +316,7 @@ func TestAssembleTaskEvidence(t *testing.T) {
 		ev[0].Command != "go test ./..." || ev[0].CommandTruncated || ev[0].ExitCode == nil || *ev[0].ExitCode != 1 {
 		t.Errorf("shell 证据结构化字段不完整: %+v", ev[0])
 	}
-	if !strings.HasPrefix(ev[1].Ref, "ev:"+task.ID+":call:") || ev[1].Kind != "file_write" || !strings.Contains(ev[1].Summary, "out/report.md") {
+	if !strings.HasPrefix(ev[1].Ref, "ev:"+task.ID+":call:") || ev[1].Kind != "file_change" || !strings.Contains(ev[1].Summary, "out/report.md") {
 		t.Errorf("file_write 证据应含路径: %+v", ev[1])
 	}
 	if ev[1].Path != "out/report.md" || ev[1].PathTruncated {

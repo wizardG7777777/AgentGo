@@ -2,11 +2,7 @@
 # 将此文件复制为 config.yaml（或任意路径，通过 -config 指定）并按需修改。
 #
 # v5 沿用 v4 的嵌套 schema，并新增 agent_templates: 按需团队配置。
-# 只有有效 llm: 也能 Scheduler-only 启动；tool_profiles: / agents: 是可选的预热配置，
-# reactors_file: 仍可指向用户 reactor YAML（见文末与 docs/yaml-config-guide.md）。
-# v3 顶层旧字段（worker_count / llm_base_url / agent_max_loops 等）会被解析层静默忽略，
-# 不报错也不生效。撰写规范详见 docs/yaml-config-guide.md。
-
+# 只有有效 llm: 也能启动；tool_profiles 与 agents 用于声明执行角色。
 # ============================================================
 # LLM 默认基础设施（per-kind 可通过 agents[*].model 覆盖）
 # ============================================================
@@ -15,7 +11,7 @@ llm:
   base_url: https://api.openai.com/v1
   api_key: ${OPENAI_API_KEY}       # 支持 ${ENV_VAR} 环境变量替换（os.ExpandEnv）
   default_model: gpt-4o
-  protocol: responses              # 新主链；旧 provider 才显式写 chat_completions
+  protocol: responses              # 新主链；另一个显式协议为 chat_completions；两者均只支持 SSE
   timeout_sec: 120
   # 默认按 1M context / 64K completion 冻结；按精确模型名覆盖小窗口模型。
   default_context_window_tokens: 1048576
@@ -34,47 +30,45 @@ llm:
 # ============================================================
 tool_profiles:
   worker_standard:
-    - read_file
-    - list_dir
-    - grep_search
-    - glob_search
-    - read_content_ref
-    - write_file
-    - edit_file
     - run_shell
+    - read_file
+    - apply_change
+    - submit_task_result
+    - inspect_board
+    - inspect_node
+    - read_evidence
+    - send_message
+    - request_user_input
+    - request_replan
     - web_search
     - web_fetch
-    - send_message
-    - request_user_input          # 结构化询问用户；只返回回答，不授予 Shell 权限或替代 Plan 控制
-    - publish_task                # 仅 plan_id 为空的兼容任务可发布一层子任务（受 MaxSubtaskDepth 约束）；计划内改图走 request_replan
-    - request_replan              # 需要新增节点或遇到阻塞时请求 Scheduler 决策；普通 Agent 不直接改图
-    - submit_task_result          # 结构化提交最终结果（summary/检查/证据/风险）；带 expected_artifacts 校验
 
   explorer_full:
+    - run_shell
     - read_file
-    - list_dir
-    - grep_search
-    - glob_search
-    - read_content_ref
+    - submit_task_result
+    - inspect_board
+    - inspect_node
+    - read_evidence
+    - send_message
+    - request_user_input
+    - request_replan
     - web_search
     - web_fetch
-    - send_message
-    - request_user_input          # 调研需要用户澄清时提出 2-8 项结构化选择
-    - request_replan
 
   acceptance_verifier:
     - read_file
-    - list_dir
-    - grep_search
-    - glob_search
-    - read_content_ref
+    - inspect_board
+    - inspect_node
+    - read_evidence
     - web_search
     - web_fetch
-    - submit_task_result             # acceptance runner 经 verdict=pass|fixable|failed 提交结论
+    - submit_task_result
+
 
 # ============================================================
 # Scheduler 配置（独立块）
-# 工具集 / system prompt / replicas 仍硬编码在 internal/scheduler；以下行为预算可覆盖。
+# 工具集 / system prompt / replicas 仍硬编码在 internal/scheduler；模型可在此覆盖。
 # ============================================================
 scheduler:
   model: gpt-4o                              # 可选，缺省回落 llm.default_model
@@ -100,7 +94,7 @@ scheduler:
 # 可重新开放工具注册（提示词组队教程尚未恢复，仅供机制实验）。
 #
 # 开启后不配置目录也始终提供：
-#   builtin/generalist@1 / builtin/explorer@1 / builtin/verifier@1
+#   builtin/generalist@2 / builtin/explorer@2 / builtin/verifier@2
 # user_dirs 中模板获得 user/ namespace，project_dirs 获得 project/ namespace。
 # 项目模板推荐放在可 git 评审的 agent-templates/，不要放进通常被忽略的 .agentgo/。
 # 每个 YAML 文件只定义一个模板；schema 见 docs/activate/AgentTemplate.md。
@@ -125,9 +119,8 @@ agents:
     replicas: 1
     event_type: ""                 # 默认任务队列（空字符串）
     profile: worker_standard       # 引用 tool_profiles 中的白名单
-    # 或直接用 tools: [read_file, write_file, ...]  二选一
+    # 或直接用 tools: [read_file, apply_change, ...]  二选一
     model: gpt-4o                  # 覆盖 llm.default_model
-    # observation_model: gpt-4o-mini # 可选；省略继承 model，仅独立 Observation control 使用
     system_prompt_file: prompts/worker.md
     task_max_retries: 3
     # description 给 scheduler 看的一句话角色说明，影响任务派发选择
@@ -143,7 +136,7 @@ agents:
     system_prompt_file: prompts/explorer.md
     task_max_retries: 3
     description: |
-      广度优先调研代理。不写文件，仅返回 Markdown 文字回复。
+      调查代理。使用读取、检视和 Shell 调查，以 submit_task_result 提交结果；不承担文件修改。Shell 本身并不保证只读。
 
   - kind: verifier
     replicas: 1
@@ -209,7 +202,6 @@ startup_probe_failure_action: "warn"  # "warn"=仅警告继续; "exit"=失败硬
 # ============================================================
 # 杂项 / 行为开关
 # ============================================================
-max_subtask_depth: 3
 shell_timeout_sec: 60
 shell_blacklist: []
 shell_greylist: []

@@ -145,7 +145,7 @@ func TestReadFile_OverlayPassthroughWhenNoCopy(t *testing.T) {
 
 // write_file：隔离生效时——写入落 overlay、主根不动、跳过 roster 全流程，
 // 且 file_written 事件的 Path 保持主根逻辑路径。
-func TestWriteFile_OverlaySkipsRosterAndKeepsLogicalTracePath(t *testing.T) {
+func TestApplyChangeOverlayLocksAndKeepsLogicalTracePath(t *testing.T) {
 	d := &captureGraphTraceDispatcher{}
 	original := trace.DefaultDispatcher()
 	trace.SetDefaultDispatcher(d)
@@ -168,9 +168,9 @@ func TestWriteFile_OverlaySkipsRosterAndKeepsLogicalTracePath(t *testing.T) {
 	if _, err := os.Stat(mainPath); !os.IsNotExist(err) {
 		t.Fatalf("隔离写入不应落主根: stat err=%v", err)
 	}
-	// 跳过 roster：无任何 TryClaim/Release/WaitForRelease。
-	if events := rr.snapshot(); len(events) != 0 {
-		t.Fatalf("隔离生效时不应触碰 roster，实际事件: %v", events)
+	// 隔离变更也要协调同一 Delivery 的并发写入。
+	if events := rr.snapshot(); len(events) != 2 {
+		t.Fatalf("隔离变更应获取并释放逻辑文件锁，实际事件: %v", events)
 	}
 	if ov.writeCalls != 1 {
 		t.Fatalf("WritePath 调用次数 = %d，want 1", ov.writeCalls)
@@ -225,8 +225,8 @@ func TestEditFile_OverlayEditsCopyNotMain(t *testing.T) {
 	if err != nil || string(mainData) != "hello world" {
 		t.Fatalf("主根文件不应被改动: data=%q err=%v", mainData, err)
 	}
-	if events := rr.snapshot(); len(events) != 0 {
-		t.Fatalf("隔离生效时不应触碰 roster，实际事件: %v", events)
+	if events := rr.snapshot(); len(events) != 2 {
+		t.Fatalf("隔离变更应获取并释放逻辑文件锁，实际事件: %v", events)
 	}
 	if !strings.Contains(out, mainPath) {
 		t.Fatalf("返回消息应含主根逻辑路径，实际: %s", out)
@@ -252,7 +252,7 @@ func TestWriteFile_OverlayWritePathError(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "解析隔离写入位置失败") {
 		t.Fatalf("应返回「解析隔离写入位置失败」错误，实际: %v", err)
 	}
-	if events := rr.snapshot(); len(events) != 0 {
+	if events := rr.snapshot(); len(events) != 2 {
 		t.Fatalf("WritePath 失败不应触碰 roster，实际事件: %v", events)
 	}
 	if _, serr := os.Stat(mainPath); !os.IsNotExist(serr) {

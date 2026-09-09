@@ -465,7 +465,7 @@ func buildOutputSink(spec OutputSpec, descBaseDir, projectRoot string, deps Deps
 		count++
 	}
 	if count == 0 {
-		return nil, fmt.Errorf("must specify exactly one of: write_file / send_message / emit_trace")
+		return nil, fmt.Errorf("must specify exactly one of: apply_change / send_message / emit_trace")
 	}
 	if count > 1 {
 		return nil, fmt.Errorf("must specify exactly one output sink, found %d", count)
@@ -474,10 +474,10 @@ func buildOutputSink(spec OutputSpec, descBaseDir, projectRoot string, deps Deps
 	switch {
 	case spec.WriteFile != nil:
 		if spec.WriteFile.Path == "" {
-			return nil, fmt.Errorf("write_file: 'path' is required")
+			return nil, fmt.Errorf("apply_change: 'path' is required")
 		}
 		if err := validatePaths(spec.WriteFile.Path); err != nil {
-			return nil, fmt.Errorf("write_file.path: %w", err)
+			return nil, fmt.Errorf("apply_change.path: %w", err)
 		}
 		baseDir := projectRoot
 		if baseDir == "" {

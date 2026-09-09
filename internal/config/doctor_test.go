@@ -37,24 +37,24 @@ func TestScanPromptToolNames(t *testing.T) {
 		text string
 		want []string
 	}{
-		{"基本命中", "使用 read_file 和 write_file 完成修改", []string{"read_file", "write_file"}},
+		{"基本命中", "使用 read_file 和 apply_change 完成修改", []string{"read_file", "apply_change"}},
 		{"词边界防误报-前缀", "my_read_file 不是工具名", nil},
-		{"词边界防误报-后缀", "read_files 与 write_file_v2 都不是工具名", nil},
-		{"中文紧邻命中", "先用read_file读取，再用edit_file修改", []string{"read_file", "edit_file"}},
+		{"词边界防误报-后缀", "read_files 与 apply_change_v2 都不是工具名", nil},
+		{"中文紧邻命中", "先用read_file读取，再用apply_change修改", []string{"read_file", "apply_change"}},
 		{"多次提及去重", "read_file 之后再次 read_file", []string{"read_file"}},
-		{"独立词区分", "read_file 与 write_file 是独立词，edit_file 也是", []string{"read_file", "write_file", "edit_file"}},
-		{"scheduler 专属工具也算已知名", "report_done 是 scheduler 专属工具", []string{"report_done"}},
+		{"独立词区分", "read_file 与 apply_change 是独立词，apply_change 也是", []string{"read_file", "apply_change"}},
+		{"scheduler 专属工具也算已知名", "apply_graph_change 是编排工具", []string{"apply_graph_change"}},
 		{"空文本", "", nil},
 		{"无命中", "这段文字不包含任何工具名", nil},
 		// 否定语境启发式：含否定标记的行整行不计入 mentioned
 		{"否定行排除-不要", "不要尝试调用 report_done", nil},
 		{"否定行排除-没有", "Worker 没有 report_done 工具", nil},
 		{"否定行排除-严禁", "严禁主动 send_message 广播", nil},
-		{"否定行排除-禁止", "禁止在没有读取的情况下直接 write_file", nil},
-		{"条件句不算否定", "只有 plan_id 为空且工具实际可用的兼容任务才能使用 publish_task", []string{"publish_task"}},
-		{"同行否定整行排除", "使用 read_file，不要用 write_file", nil},
-		{"否定行与正常行并存", "禁止使用 write_file\n但 read_file 和 write_file 都可用", []string{"read_file", "write_file"}},
-		{"CRLF 归一化", "使用 read_file\r\n不要调用 write_file", []string{"read_file"}},
+		{"否定行排除-禁止", "禁止在没有读取的情况下直接 apply_change", nil},
+		{"条件句不算否定", "只有 plan_id 为空且工具实际可用的兼容任务才能使用 apply_graph_change", []string{"apply_graph_change"}},
+		{"同行否定整行排除", "使用 read_file，不要用 apply_change", nil},
+		{"否定行与正常行并存", "禁止使用 apply_change\n但 read_file 和 apply_change 都可用", []string{"read_file", "apply_change"}},
+		{"CRLF 归一化", "使用 read_file\r\n不要调用 apply_change", []string{"read_file"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -75,7 +75,7 @@ func TestScanPromptToolNames(t *testing.T) {
 // TestDoctor_PromptMentionsUnauthorizedTool 验证 prompt 提及未授权工具时报 error。
 func TestDoctor_PromptMentionsUnauthorizedTool(t *testing.T) {
 	dir := t.TempDir()
-	promptPath := writePromptFile(t, dir, "worker.md", "使用 read_file 读取，然后 write_file 写入")
+	promptPath := writePromptFile(t, dir, "worker.md", "使用 read_file 读取，然后 apply_change 写入")
 	cfg := DefaultConfig()
 	cfg.ToolProfiles = map[string][]string{"ro": {"read_file"}}
 	cfg.Agents = []AgentKind{{Kind: "worker", Profile: "ro", SystemPromptFile: promptPath}}
@@ -84,8 +84,8 @@ func TestDoctor_PromptMentionsUnauthorizedTool(t *testing.T) {
 	if !rep.HasError() {
 		t.Fatalf("应检出 error 级诊断: %+v", rep.Diags)
 	}
-	if !findDiag(rep, DiagError, "worker", "write_file") {
-		t.Fatalf("error 诊断应提及 write_file: %+v", rep.Diags)
+	if !findDiag(rep, DiagError, "worker", "apply_change") {
+		t.Fatalf("error 诊断应提及 apply_change: %+v", rep.Diags)
 	}
 	if rep.Count(DiagWarning) != 0 || rep.Count(DiagInfo) != 0 {
 		t.Fatalf("不应产生 warning/info（profile 已引用且白名单工具均被提及）: %+v", rep.Diags)
@@ -96,7 +96,7 @@ func TestDoctor_PromptMentionsUnauthorizedTool(t *testing.T) {
 // 既不报 error 也不报 info（零诊断）。
 func TestDoctor_NegationOnlyMentionNoDiag(t *testing.T) {
 	dir := t.TempDir()
-	promptPath := writePromptFile(t, dir, "worker.md", "使用 read_file 读取\n禁止使用 write_file 凭空生成报告")
+	promptPath := writePromptFile(t, dir, "worker.md", "使用 read_file 读取\n禁止使用 apply_change 凭空生成报告")
 	cfg := DefaultConfig()
 	cfg.Agents = []AgentKind{{
 		Kind:             "worker",
@@ -111,11 +111,11 @@ func TestDoctor_NegationOnlyMentionNoDiag(t *testing.T) {
 }
 
 // TestDoctor_ConditionalSentenceStillCounts 验证"只有……才能使用 X"类条件授权句
-// 不被否定启发式吞掉：publish_task 未授权仍报 error。
+// 不被否定启发式吞掉：apply_graph_change 未授权仍报 error。
 func TestDoctor_ConditionalSentenceStillCounts(t *testing.T) {
 	dir := t.TempDir()
 	promptPath := writePromptFile(t, dir, "worker.md",
-		"使用 read_file 读取\n只有 plan_id 为空且工具实际可用的兼容任务才能使用 publish_task")
+		"使用 read_file 读取\n只有 plan_id 为空且工具实际可用的兼容任务才能使用 apply_graph_change")
 	cfg := DefaultConfig()
 	cfg.Agents = []AgentKind{{
 		Kind:             "worker",
@@ -127,8 +127,8 @@ func TestDoctor_ConditionalSentenceStillCounts(t *testing.T) {
 	if !rep.HasError() {
 		t.Fatalf("条件句中的未授权工具仍应报 error: %+v", rep.Diags)
 	}
-	if !findDiag(rep, DiagError, "worker", "publish_task") {
-		t.Fatalf("error 诊断应提及 publish_task: %+v", rep.Diags)
+	if !findDiag(rep, DiagError, "worker", "apply_graph_change") {
+		t.Fatalf("error 诊断应提及 apply_graph_change: %+v", rep.Diags)
 	}
 }
 
@@ -139,7 +139,7 @@ func TestDoctor_AllowlistedToolNotMentioned(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Agents = []AgentKind{{
 		Kind:             "worker",
-		Tools:            []string{"read_file", "grep_search"},
+		Tools:            []string{"read_file", "run_shell"},
 		SystemPromptFile: promptPath,
 	}}
 
@@ -147,8 +147,8 @@ func TestDoctor_AllowlistedToolNotMentioned(t *testing.T) {
 	if rep.HasError() {
 		t.Fatalf("不应有 error（prompt 只提及已授权工具）: %+v", rep.Diags)
 	}
-	if !findDiag(rep, DiagInfo, "worker", "grep_search") {
-		t.Fatalf("info 诊断应提及 grep_search: %+v", rep.Diags)
+	if !findDiag(rep, DiagInfo, "worker", "run_shell") {
+		t.Fatalf("info 诊断应提及 run_shell: %+v", rep.Diags)
 	}
 	if findDiag(rep, DiagInfo, "worker", "read_file") {
 		t.Fatalf("read_file 已被 prompt 提及，不应报 info: %+v", rep.Diags)
@@ -197,9 +197,9 @@ func TestDoctor_UnreadablePromptFile(t *testing.T) {
 // TestDoctor_CleanConfig 验证完全一致时零诊断。
 func TestDoctor_CleanConfig(t *testing.T) {
 	dir := t.TempDir()
-	promptPath := writePromptFile(t, dir, "worker.md", "使用 read_file 与 grep_search")
+	promptPath := writePromptFile(t, dir, "worker.md", "使用 read_file 与 run_shell")
 	cfg := DefaultConfig()
-	cfg.ToolProfiles = map[string][]string{"ro": {"read_file", "grep_search"}}
+	cfg.ToolProfiles = map[string][]string{"ro": {"read_file", "run_shell"}}
 	cfg.Agents = []AgentKind{{Kind: "worker", Profile: "ro", SystemPromptFile: promptPath}}
 
 	rep := cfg.Doctor()
@@ -213,7 +213,7 @@ func TestDoctor_CleanConfig(t *testing.T) {
 // （Validate 的路径风格红线拒绝反斜杠；Windows 上 filepath.ToSlash 转换）。
 func TestDoctor_LoadValidateDoctorEndToEnd(t *testing.T) {
 	dir := t.TempDir()
-	promptPath := writePromptFile(t, dir, "worker.md", "使用 read_file 和 write_file")
+	promptPath := writePromptFile(t, dir, "worker.md", "使用 read_file 和 apply_change")
 	yamlPath := filepath.Join(dir, "setting.yaml")
 	yamlContent := `
 llm:
@@ -222,7 +222,7 @@ llm:
 tool_profiles:
   worker_ro:
     - read_file
-    - grep_search
+    - run_shell
   orphan_profile:
     - list_dir
 agents:
@@ -245,8 +245,8 @@ agents:
 	}
 
 	rep := cfg.Doctor()
-	// prompt 提及 write_file 未授权 → 1 error
-	// 白名单 grep_search 未提及 → 1 info
+	// prompt 提及 apply_change 未授权 → 1 error
+	// 白名单 run_shell 未提及 → 1 info
 	// orphan_profile 未引用 → 1 warning
 	if rep.Count(DiagError) != 1 || rep.Count(DiagWarning) != 1 || rep.Count(DiagInfo) != 1 {
 		t.Fatalf("诊断计数 = 错误%d/警告%d/提示%d，期望 1/1/1: %+v",
@@ -288,8 +288,8 @@ agents:
 		t.Fatalf("输出应含汇总行: %q", out.String())
 	}
 
-	// 含 error 的配置：prompt 提及 write_file 但未授权
-	badPrompt := writePromptFile(t, dir, "bad.md", "使用 write_file 落盘")
+	// 含 error 的配置：prompt 提及 apply_change 但未授权
+	badPrompt := writePromptFile(t, dir, "bad.md", "使用 apply_change 落盘")
 	badYAML := filepath.Join(dir, "bad.yaml")
 	writeYAML(badYAML, filepath.ToSlash(badPrompt))
 	out.Reset()

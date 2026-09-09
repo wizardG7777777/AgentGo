@@ -255,62 +255,14 @@ reactors:
 	}
 }
 
-func TestProgramVerifyReactors_RequestPlanReevaluation(t *testing.T) {
+func TestProgramVerifyReactorsDoNotImposeRetryThreshold(t *testing.T) {
 	repoRoot := testRepoRoot(t)
-	st := newReplanWakeStore()
-	rs, err := LoadFromFile(filepath.Join(repoRoot, "reactors.program-verify.yaml"), repoRoot, Deps{
-		Store: st,
-		KindEventTypes: map[string]string{
-			"worker":   "",
-			"verifier": "verify",
-		},
-		AgentKindOf: func(agentID string) string {
-			if agentID == "worker-1" {
-				return "worker"
-			}
-			if agentID == "verifier-1" {
-				return "verifier"
-			}
-			return ""
-		},
-	})
+	rs, err := LoadFromFile(filepath.Join(repoRoot, "reactors.program-verify.yaml"), repoRoot, Deps{})
 	if err != nil {
-		t.Fatalf("LoadFromFile: %v", err)
+		t.Fatal(err)
 	}
-	if len(rs) != 1 {
-		t.Fatalf("len=%d want 1", len(rs))
-	}
-
-	if err := rs[0].Run(trace.Event{
-		Kind:       trace.KindTaskRetry,
-		TaskID:     "worker-task-1",
-		AgentID:    "worker-1",
-		Transition: &trace.Transition{RetryCount: 2},
-	}); err != nil {
-		t.Fatalf("Run worker event: %v", err)
-	}
-	wakes := wakeTasks(t, st)
-	if len(wakes) != 1 {
-		t.Fatalf("worker 重试压力应发布 1 个 replan 唤醒任务，got %d", len(wakes))
-	}
-	if !strings.Contains(wakes[0].Description, "reason_code=worker_retry_pressure") ||
-		!strings.Contains(wakes[0].Description, "urgency=high") {
-		t.Fatalf("唤醒任务描述应含 reason_code/urgency: %q", wakes[0].Description)
-	}
-	if wakes[0].ParentTaskID != "worker-task-1" {
-		t.Fatalf("ParentTaskID = %q, want worker-task-1", wakes[0].ParentTaskID)
-	}
-
-	if err := rs[0].Run(trace.Event{
-		Kind:       trace.KindTaskRetry,
-		TaskID:     "verifier-task-1",
-		AgentID:    "verifier-1",
-		Transition: &trace.Transition{RetryCount: 2},
-	}); err != nil {
-		t.Fatalf("Run verifier event: %v", err)
-	}
-	if got := len(wakeTasks(t, st)); got != 1 {
-		t.Fatalf("verifier retry 不应触发 per-kind 过滤外的发布，got %d 个唤醒任务", got)
+	if len(rs) != 0 {
+		t.Fatalf("测试配置不得按累计重试次数触发自动重规划：%d", len(rs))
 	}
 }
 

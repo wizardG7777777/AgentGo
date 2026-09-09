@@ -1,8 +1,8 @@
 package bootstrap
 
 // 本文件是 V6 Graph tool 桥（C5c）：把 internal/graph 的 ToolExecutor 接到
-// internal/tools 的 LocalReadGroup。tool 节点只放开只读四工具
-// （read_file/list_dir/grep_search/glob_search——确定性、无副作用），
+// internal/tools 的 LocalReadGroup。tool 节点只放开只读文件工具
+// （read_file——确定性、无副作用），
 // handler 原样复用（pathutil 项目根边界照常生效）；写/Shell/Meta 类操作
 // 是 agent 节点的职责，一律中文错误拒绝。
 
@@ -18,7 +18,7 @@ import (
 )
 
 // graphToolAllowed 是 tool 节点允许执行的工具名（只读、确定性、无副作用）。
-var graphToolAllowed = []string{"read_file", "list_dir", "grep_search", "glob_search"}
+var graphToolAllowed = []string{"read_file"}
 
 // graphToolExecutor 实现 graph.ToolExecutor：构造期把 LocalReadGroup 注册进
 // 一个独立 ToolRegistry，执行期按名分发。工具实现与普通 Runner 完全同源

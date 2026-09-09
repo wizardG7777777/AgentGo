@@ -1,0 +1,75 @@
+# 当前配置 schema v4 的最小多角色测试样例。
+# 需要 SWE_BASE_URL、SWE_API_KEY、SWE_FAST_MODEL、SWE_FLAG_SHIP_MODEL；不包含凭据。
+llm:
+  request_contract: agentgo.model-request/v1
+  base_url: ${SWE_BASE_URL}
+  api_key: ${SWE_API_KEY}
+  default_model: ${SWE_FAST_MODEL}
+  protocol: responses
+  timeout_sec: 120
+
+tool_profiles:
+  worker:
+    - run_shell
+    - read_file
+    - apply_change
+    - inspect_board
+    - inspect_node
+    - read_evidence
+    - send_message
+    - request_user_input
+    - request_replan
+    - submit_task_result
+  explorer:
+    - run_shell
+    - read_file
+    - inspect_board
+    - inspect_node
+    - read_evidence
+    - send_message
+    - request_replan
+    - submit_task_result
+  verifier:
+    - read_file
+    - inspect_board
+    - inspect_node
+    - read_evidence
+    - submit_task_result
+
+agents:
+  - kind: worker
+    replicas: 1
+    event_type: ""
+    profile: worker
+    model: ${SWE_FLAG_SHIP_MODEL}
+    system_prompt_file: prompts/worker.md
+    task_max_retries: 3
+  - kind: explorer
+    replicas: 1
+    event_type: explore
+    profile: explorer
+    model: ${SWE_FLAG_SHIP_MODEL}
+    system_prompt_file: prompts/explorer.md
+    task_max_retries: 3
+  - kind: verifier
+    replicas: 1
+    event_type: acceptance.verify
+    profile: verifier
+    model: ${SWE_FAST_MODEL}
+    system_prompt_file: prompts/verifier.md
+    task_max_retries: 3
+
+scheduler:
+  model: ${SWE_FAST_MODEL}
+project_root: .
+startup_probe: tool
+startup_probe_timeout_sec: 30
+startup_probe_failure_action: exit
+shell:
+  timeout_sec: 120
+infra:
+  watchdog:
+    enabled: true
+    interval_sec: 30
+ui:
+  frontends: [tui]

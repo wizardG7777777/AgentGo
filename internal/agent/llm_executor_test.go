@@ -225,11 +225,11 @@ func TestLLMExecutor_HistoryPassedToLLM(t *testing.T) {
 			},
 		},
 		{
-			Output:           "[write_file] ok\n",
+			Output:           "[apply_change] ok\n",
 			ToolCalled:       true,
 			AssistantContent: "我来写入文件",
 			ToolCalls: []llm.ToolCall{
-				{ID: "call_2", Name: "write_file", Arguments: map[string]any{"path": "/tmp/b.txt"}},
+				{ID: "call_2", Name: "apply_change", Arguments: map[string]any{"path": "/tmp/b.txt"}},
 			},
 			ToolResults: []contextcontract.ToolResult{
 				{ToolCallID: "call_2", Content: "ok"},

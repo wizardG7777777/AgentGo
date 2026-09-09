@@ -117,8 +117,8 @@ func TestResolveToolGroups_WiresSubmitChannelToPlanControlGroup(t *testing.T) {
 }
 
 // 装配验证（finalizing fence，V6 §5）：runner.New 把 finHolder 接入 executor
-// 的 fence——同一响应中排在 submit_task_result 之前的 write_file 正常落盘，
-// 排在其后的 write_file 被跳过（磁盘无产物、收到「已跳过」提示），任务仍以
+// 的 fence——同一响应中排在 submit_task_result 之前的 apply_change 正常落盘，
+// 排在其后的 apply_change 被跳过（磁盘无产物、收到「已跳过」提示），任务仍以
 // completed 收尾。该测试防「装配漏接」：fence 逻辑单测全绿但 runner 未接线
 // 时，after.txt 会被真实写出。
 func TestRunnerFinalizingFenceSkipsTrailingToolCalls(t *testing.T) {
@@ -134,15 +134,15 @@ func TestRunnerFinalizingFenceSkipsTrailingToolCalls(t *testing.T) {
 
 	client := &orderedToolClient{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{
-			{ID: "w1", Name: "write_file", Arguments: map[string]any{"path": "before.txt", "content": "提交前写入"}},
+			{ID: "w1", Name: "apply_change", Arguments: map[string]any{"path": "before.txt", "content": "提交前写入"}},
 			{ID: "s1", Name: "submit_task_result", Arguments: map[string]any{"summary": "已完成 before.txt"}},
-			{ID: "w2", Name: "write_file", Arguments: map[string]any{"path": "after.txt", "content": "提交后不应写入"}},
+			{ID: "w2", Name: "apply_change", Arguments: map[string]any{"path": "after.txt", "content": "提交后不应写入"}},
 		},
 		FinishReason: llm.FinishReasonToolCalls,
 	}}}
 	rn := newTestRunner(t, config.AgentRuntimeConfig{
 		InstanceID: "worker-fence", Kind: "worker", EventType: "code",
-		AllowedTools: []string{"write_file", "submit_task_result"}, TaskMaxRetries: 1,
+		AllowedTools: []string{"apply_change", "submit_task_result"}, TaskMaxRetries: 1,
 	}, RunnerDeps{
 		Store: taskStore, Roster: roster.NewMemoryRoster(), LLMClient: client, ProjectRoot: root, ContextRuntime: testmodel.Runtime(t),
 	})
@@ -182,18 +182,18 @@ func TestRunnerFinalizingFenceSkipsTrailingToolCalls(t *testing.T) {
 		t.Fatalf("任务应以 completed 收尾，实际 %s（error: %s）", got.Status, got.Error)
 	}
 	if len(got.Artifacts) != 1 || got.Artifacts[0] != "before.txt" {
-		t.Fatalf("write_file 与 submit_task_result 在同一 LLM 响应时，终态前必须已同步登记 artifact：%v", got.Artifacts)
+		t.Fatalf("apply_change 与 submit_task_result 在同一 LLM 响应时，终态前必须已同步登记 artifact：%v", got.Artifacts)
 	}
 	meta := got.ArtifactMeta["before.txt"]
 	if meta.SHA256 == "" || meta.Bytes != int64(len("提交前写入")) {
 		t.Fatalf("同步 artifact Evidence 元数据缺失: %+v", meta)
 	}
-	// 提交前的 write_file 真实落盘。
+	// 提交前的 apply_change 真实落盘。
 	if data, err := os.ReadFile(filepath.Join(root, "before.txt")); err != nil || string(data) != "提交前写入" {
-		t.Errorf("submit 之前的 write_file 应落盘: data=%q err=%v", data, err)
+		t.Errorf("submit 之前的 apply_change 应落盘: data=%q err=%v", data, err)
 	}
-	// 提交后的 write_file 被 fence 跳过：磁盘无产物。
+	// 提交后的 apply_change 被 fence 跳过：磁盘无产物。
 	if _, err := os.Stat(filepath.Join(root, "after.txt")); !os.IsNotExist(err) {
-		t.Errorf("submit 之后的 write_file 应被 fence 跳过（after.txt 不应存在），stat err=%v", err)
+		t.Errorf("submit 之后的 apply_change 应被 fence 跳过（after.txt 不应存在），stat err=%v", err)
 	}
 }

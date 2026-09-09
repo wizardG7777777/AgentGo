@@ -17,34 +17,19 @@ import (
 )
 
 // Start 为没有父 Task 的显式入口建立完整 Run/Context/Progress binding。
-func Start(child *model.Task, workClass loopcontract.WorkClass, budgetProfile string,
-	window, finalizationReserve, recoveryReserve time.Duration) error {
-	if child == nil {
-		return fmt.Errorf("task contract start 的 child 不能为空")
-	}
-	if strings.TrimSpace(budgetProfile) == "" || window <= 0 {
-		return fmt.Errorf("task contract start 缺少 budget profile/window")
+func Start(child *model.Task, workClass loopcontract.WorkClass, budgetProfile string, deadline ...time.Time) error {
+	if child == nil || strings.TrimSpace(budgetProfile) == "" || len(deadline) > 1 {
+		return fmt.Errorf("新任务需要目标、profile 与至多一个显式截止时间")
 	}
 	now := time.Now().UTC()
-	remaining := window - finalizationReserve - recoveryReserve
-	if remaining <= 0 {
-		return fmt.Errorf("task contract start 的 phase reserve 已耗尽 window")
-	}
-	verificationReserve := 3 * time.Minute
-	if maximum := remaining / 4; verificationReserve > maximum {
-		verificationReserve = maximum
-	}
-	run := &runcontract.RunContract{
-		Schema: runcontract.SchemaCurrent, RunID: runcontract.RunID("run-" + uuid.NewString()),
-		CreatedAt: now, DeadlineAt: now.Add(window), BudgetProfile: budgetProfile,
-		FinalizationReserve: finalizationReserve, RecoveryReserve: recoveryReserve,
-		VerificationReserve: verificationReserve,
+	run := &runcontract.RunContract{Schema: runcontract.SchemaCurrent, RunID: runcontract.RunID("run-" + uuid.NewString()), CreatedAt: now, BudgetProfile: budgetProfile}
+	if len(deadline) == 1 {
+		run.DeadlineAt = deadline[0]
 	}
 	if err := run.ValidateAt(now); err != nil {
 		return err
 	}
-	parent := &model.Task{ID: "request-ingress", RunID: run.RunID, RunContract: run,
-		ContextPolicyRef: policycatalog.ContextDefaultCurrent}
+	parent := &model.Task{ID: "request-ingress", RunID: run.RunID, RunContract: run, ContextPolicyRef: policycatalog.ContextDefaultCurrent}
 	return Inherit(parent, child, workClass)
 }
 
@@ -84,7 +69,7 @@ func Inherit(parent, child *model.Task, workClass loopcontract.WorkClass) error 
 	child.RunContract = &run
 	if child.RunPhase == "" {
 		child.RunPhase = runcontract.PhaseExecution
-		if run.Schema == runcontract.SchemaV2 {
+		if run.Schema == runcontract.SchemaCurrent {
 			switch workClass {
 			case loopcontract.WorkVerification:
 				child.RunPhase = runcontract.PhaseVerification
@@ -112,7 +97,7 @@ func progressRefFor(workClass loopcontract.WorkClass) (string, error) {
 	case loopcontract.WorkCoordination:
 		return policycatalog.ProgressCoordinationCurrent, nil
 	case loopcontract.WorkFinalization:
-		return policycatalog.ProgressFinalReportV1, nil
+		return policycatalog.ProgressFinalReportCurrent, nil
 	default:
 		return "", fmt.Errorf("未知 Task work_class=%q", workClass)
 	}

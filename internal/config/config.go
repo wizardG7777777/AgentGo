@@ -77,7 +77,7 @@ type AgentKind struct {
 	Model     string   `yaml:"model,omitempty" json:"model,omitempty"`
 	// ObservationModel 仅用于独立 Observation control invocation；省略时
 	// 继承该 kind 的业务模型，不能由 provider/model 名称隐式路由。
-	ObservationModel string `yaml:"observation_model,omitempty" json:"observation_model,omitempty"`
+
 	SystemPromptFile string `yaml:"system_prompt_file" json:"system_prompt_file"`
 	// AgentMaxLoops 已于 V6 移除（固定循环上限不再是终止条件，见
 	// docs/nextUpgrade-V6.md §5 升级思路 5/6/8）。结构体保留该字段仅为让旧
@@ -245,20 +245,17 @@ func (c UIConfig) HasFrontend(name string) bool {
 // 本结构的 Model 字段仅作为运行时元数据使用——主要用途是 HistoryEntry.Model 记录
 // （详见 nextUpgrade_v4.md §11.7.3 模型切换基准重置）与运行时日志。
 type AgentRuntimeConfig struct {
-	InstanceID                          string
-	Kind                                string
-	EventType                           string
-	AllowedTools                        []string
-	Model                               string
-	ObservationModel                    string
-	ObservationModelContextWindowTokens int64
-	ObservationModelMaxCompletionTokens int64
-	ObservationModelCapabilityDigest    string
-	ModelContextWindowTokens            int64
-	ModelMaxCompletionTokens            int64
-	ModelCapabilityDigest               string
-	SystemPrompt                        string
-	TaskMaxRetries                      int
+	InstanceID   string
+	Kind         string
+	EventType    string
+	AllowedTools []string
+	Model        string
+
+	ModelContextWindowTokens int64
+	ModelMaxCompletionTokens int64
+	ModelCapabilityDigest    string
+	SystemPrompt             string
+	TaskMaxRetries           int
 	// IdleThreshold 对应全局 agent_idle_threshold：agent 连续 N 次空闲轮询后
 	// 退出 goroutine；0 = 永不空闲退出（生产推荐，见 Config.AgentIdleThreshold）。
 	// AgentKind 没有 per-kind 覆盖字段，各 AgentRuntimeConfig 构造点统一填全局值；
@@ -295,7 +292,6 @@ type Config struct {
 	// ============================================================
 	HashlineEnabled *bool  `yaml:"hashline_enabled,omitempty" json:"hashline_enabled,omitempty"`
 	ProjectRoot     string `yaml:"project_root" json:"project_root"`
-	MaxSubtaskDepth int    `yaml:"max_subtask_depth" json:"max_subtask_depth"`
 	ShellTimeoutSec int    `yaml:"shell_timeout_sec" json:"shell_timeout_sec"`
 
 	// ProgressNotifyEnabled 控制进度通知功能是否启用。启用后，agent 在完成
@@ -398,7 +394,6 @@ func DefaultConfig() *Config {
 		ProjectRoot:                ".",
 		Scheduler:                  SchedulerKind{},
 		ShellTimeoutSec:            30,
-		MaxSubtaskDepth:            1,
 		ProgressNotifyEnabled:      true, // §8.6 进度通知默认启用
 		AgentIdleThreshold:         0,
 		SearchAPIProvider:          "duckduckgo_html",
@@ -497,12 +492,24 @@ func LoadConfig(path string, explicit bool) (*Config, error) {
 	if err := yaml.Unmarshal(expanded, &rawConfig); err != nil {
 		return nil, err
 	}
+	if _, present := rawConfig["max_subtask_depth"]; present {
+		return nil, fmt.Errorf("max_subtask_depth 已退役；新工作必须通过图编排定义")
+	}
 	llmBlock, ok := rawConfig["llm"].(map[string]any)
 	if !ok || llmBlock["request_contract"] != "agentgo.model-request/v1" {
 		return nil, fmt.Errorf("配置必须显式声明 llm.request_contract: agentgo.model-request/v1")
 	}
 	if _, present := llmBlock["stream"]; present {
 		return nil, fmt.Errorf("llm.stream 已退役，所有协议必须使用 SSE")
+	}
+	if agents, ok := rawConfig["agents"].([]any); ok {
+		for index, value := range agents {
+			if fields, ok := value.(map[string]any); ok {
+				if _, present := fields["observation_model"]; present {
+					return nil, fmt.Errorf("agents[%d].observation_model 已退役，不再进行模型观察调用", index)
+				}
+			}
+		}
 	}
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {

@@ -45,7 +45,6 @@ func validCompilerContract() GraphContract {
 		RequestRef: "request:1", RequestDigest: "request-digest-1", ExecutionClass: ExecutionMutating,
 		Deliverables:    []ContractRequirement{{ID: "source", Kind: "artifact", Description: "源码修改"}},
 		RequiredEffects: []string{"file_write"},
-		RequiredChecks:  []ContractRequirement{{ID: "tests", Kind: "test", Description: "测试通过"}},
 	}
 }
 
@@ -56,7 +55,7 @@ func validCompilerBody() GraphDefinitionBody {
 			"work": {
 				Kind:       KindAgent,
 				Task:       &NodeTask{Title: "实施修改", Description: "修改源码，result 必须描述完成事实"},
-				Capability: &Capability{Tools: []string{"write_file"}},
+				Capability: &Capability{Tools: []string{"apply_change"}},
 				Next: []Transition{
 					{To: "success", When: &Condition{Event: EventCompleted}},
 					{To: "failed", When: &Condition{Event: EventFailed}},
@@ -65,7 +64,7 @@ func validCompilerBody() GraphDefinitionBody {
 				OutputContract:      &NodeOutputContract{SummaryRequired: true, Fields: []OutputFieldContract{{Path: "$.changed", Type: "boolean", Required: true}}},
 				ProgressContractRef: "progress:code-change/v1", ContextPolicyRef: "context:default/v1",
 				ContractBindings: GraphContractBindings{
-					Deliverables: []string{"source"}, Effects: []string{"file_write"}, Checks: []string{"tests"},
+					Deliverables: []string{"source"}, Effects: []string{"file_write"},
 				},
 			},
 			"success": {Kind: KindEnd, Task: &NodeTask{Title: "成功收官"}, Next: []Transition{}, EndOutcome: DefinitionEndSuccess},
@@ -307,7 +306,7 @@ func TestDefinitionCompilerContractCoverageAndBypass(t *testing.T) {
 		{To: "producer-failed", When: &Condition{Event: EventFailed}},
 		{To: "producer-blocked", When: &Condition{Event: EventBlocked}},
 	}
-	producer.ContractBindings = GraphContractBindings{Deliverables: []string{"source"}, Effects: []string{"file_write"}, Checks: []string{"tests"}}
+	producer.ContractBindings = GraphContractBindings{Deliverables: []string{"source"}, Effects: []string{"file_write"}}
 	draft.Candidate.Nodes["producer"] = producer
 	work = draft.Candidate.Nodes["work"]
 	work.Next[0].To = "producer"
@@ -358,7 +357,7 @@ func TestGraphDefinitionDigestCoversAuthoringSemantics(t *testing.T) {
 		}},
 		{name: "contract-binding", edit: func(body *GraphDefinitionBody) {
 			n := body.Nodes["work"]
-			n.ContractBindings.Checks = append(n.ContractBindings.Checks, "extra")
+			n.ContractBindings.Artifacts = append(n.ContractBindings.Artifacts, "extra")
 			body.Nodes["work"] = n
 		}},
 	}

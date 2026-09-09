@@ -92,7 +92,7 @@ func TestToolActionBoundaryFailureStopsFollowingDispatch(t *testing.T) {
 		wantCalls  int
 		wantResult int
 	}{
-		{name: "dispatch 前 reservation 失败", boundary: &recordingToolBoundary{reserveErr: errors.New("reserve failed")}, wantCalls: 0, wantResult: 0},
+		{name: "dispatch 前 reservation 失败", boundary: &recordingToolBoundary{reserveErr: errors.New("reserve failed")}, wantCalls: 0, wantResult: 1},
 		{name: "dispatch 后 settlement 失败", boundary: &recordingToolBoundary{settleErr: errors.New("settle failed")}, wantCalls: 1, wantResult: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -106,7 +106,7 @@ func TestToolActionBoundaryFailureStopsFollowingDispatch(t *testing.T) {
 				t.Fatalf("应返回 loopAuthorityError，实际 %v", err)
 			}
 			if dispatched != tc.wantCalls || len(result.ToolCalls) != tc.wantResult {
-				t.Fatalf("失败后仍继续 dispatch: dispatched=%d result_calls=%d", dispatched, len(result.ToolCalls))
+				t.Fatalf("派发数量或失败回执不符: dispatched=%d result_calls=%d", dispatched, len(result.ToolCalls))
 			}
 		})
 	}

@@ -145,7 +145,7 @@ func TestCommandFilter_RedirectWriteNotBypassedByWhitelist(t *testing.T) {
 }
 
 // WrapShellTool 集成：重定向写文件与黑名单同通道硬拒——不执行、不创建
-// Interaction，拒绝消息指引改用 write_file / edit_file。
+// Interaction，拒绝消息指引改用 apply_change / apply_change。
 func TestWrapShellTool_RedirectWriteBlocked(t *testing.T) {
 	service := interaction.NewService(nil)
 	var executed atomic.Bool
@@ -156,8 +156,8 @@ func TestWrapShellTool_RedirectWriteBlocked(t *testing.T) {
 		}, nil)
 	_, err := wrapper(context.Background(), map[string]any{"command": "echo hello > out.txt"})
 	if err == nil || !strings.Contains(err.Error(), "重定向") ||
-		!strings.Contains(err.Error(), "write_file") || !strings.Contains(err.Error(), "edit_file") {
-		t.Fatalf("拒绝消息应说明重定向并指引 write_file / edit_file: %v", err)
+		!strings.Contains(err.Error(), "apply_change") || !strings.Contains(err.Error(), "apply_change") {
+		t.Fatalf("拒绝消息应说明重定向并指引 apply_change / apply_change: %v", err)
 	}
 	if executed.Load() {
 		t.Fatal("重定向写文件命令不应执行")
@@ -186,8 +186,8 @@ func TestWrapShellTool_RedirectWriteBlockedInStrictAndYolo(t *testing.T) {
 			}, NewCommandFilter(nil, nil), service,
 				func() string { return "session-test" }, "worker-1", nil, modeStore)
 			_, err := wrapper(context.Background(), map[string]any{"command": "echo x > out.txt"})
-			if err == nil || !strings.Contains(err.Error(), "write_file") {
-				t.Fatalf("%s 下重定向应硬拒并指引 write_file: %v", entry.name, err)
+			if err == nil || !strings.Contains(err.Error(), "apply_change") {
+				t.Fatalf("%s 下重定向应硬拒并指引 apply_change: %v", entry.name, err)
 			}
 			if executed.Load() {
 				t.Fatalf("%s 下重定向命令不得执行", entry.name)

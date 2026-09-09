@@ -10,7 +10,7 @@ const maxIdentityRunes = 160
 
 // Validate 校验无需读取当前时钟的结构不变量。
 func (c RunContract) Validate() error {
-	if c.Schema != SchemaV1 && c.Schema != SchemaV2 {
+	if c.Schema != SchemaV1 && c.Schema != SchemaV2 && c.Schema != SchemaV3 {
 		return fmt.Errorf("RunContract schema=%q，无效", c.Schema)
 	}
 	if err := validateIdentity("run_id", string(c.RunID)); err != nil {
@@ -19,10 +19,10 @@ func (c RunContract) Validate() error {
 	if c.CreatedAt.IsZero() {
 		return fmt.Errorf("RunContract created_at 不能为空")
 	}
-	if c.DeadlineAt.IsZero() {
+	if c.DeadlineAt.IsZero() && c.Schema != SchemaCurrent {
 		return fmt.Errorf("RunContract deadline_at 不能为空")
 	}
-	if !c.CreatedAt.Before(c.DeadlineAt) {
+	if !c.DeadlineAt.IsZero() && !c.CreatedAt.Before(c.DeadlineAt) {
 		return fmt.Errorf("RunContract deadline_at 必须晚于 created_at")
 	}
 	if strings.TrimSpace(c.BudgetProfile) == "" {
@@ -37,38 +37,11 @@ func (c RunContract) Validate() error {
 	if err := validateDuration("verification_reserve", c.VerificationReserve); err != nil {
 		return err
 	}
+	if c.Schema == SchemaCurrent && (c.FinalizationReserve != 0 || c.RecoveryReserve != 0 || c.VerificationReserve != 0) {
+		return fmt.Errorf("新 Run 不接受阶段时间预留")
+	}
 	if c.Schema == SchemaV1 && c.VerificationReserve != 0 {
 		return fmt.Errorf("RunContract v1 不得携带 verification_reserve")
-	}
-	if c.Schema == SchemaV1 && len(c.CheckContracts) != 0 {
-		return fmt.Errorf("RunContract v1 不得携带 check_contracts")
-	}
-	if len(c.CheckContracts) > 16 {
-		return fmt.Errorf("RunContract check_contracts 超过 16 项上限")
-	}
-	seenChecks := make(map[string]struct{}, len(c.CheckContracts))
-	for index, check := range c.CheckContracts {
-		if err := validateIdentity(fmt.Sprintf("check_contracts[%d].check_id", index), check.CheckID); err != nil {
-			return err
-		}
-		if err := validateIdentity(fmt.Sprintf("check_contracts[%d].kind", index), check.Kind); err != nil {
-			return err
-		}
-		if _, duplicate := seenChecks[check.CheckID]; duplicate {
-			return fmt.Errorf("RunContract check_contracts.check_id=%q 重复", check.CheckID)
-		}
-		seenChecks[check.CheckID] = struct{}{}
-		if check.ExactCommand != strings.TrimSpace(check.ExactCommand) {
-			return fmt.Errorf("check_contracts[%d].exact_command 不得有首尾空白", index)
-		}
-		if len([]rune(check.ExactCommand)) > 4096 {
-			return fmt.Errorf("check_contracts[%d].exact_command 超过 4096 rune", index)
-		}
-	}
-	window := c.DeadlineAt.Sub(c.CreatedAt)
-	if c.VerificationReserve >= window || c.RecoveryReserve >= window-c.VerificationReserve ||
-		c.FinalizationReserve >= window-c.VerificationReserve-c.RecoveryReserve {
-		return fmt.Errorf("RunContract reserve 总和必须小于运行窗口")
 	}
 	return c.Budget.Validate()
 }
@@ -91,11 +64,11 @@ func (c RunContract) ValidatePhaseAt(now time.Time, phase Phase) error {
 	if !phase.Valid() {
 		return fmt.Errorf("Run phase=%q 无效", phase)
 	}
-	if phase == PhaseVerification && c.Schema != SchemaV2 {
+	if phase == PhaseVerification && c.Schema == SchemaV1 {
 		return fmt.Errorf("RunContract v1 不支持 verification phase")
 	}
 	latestStart := c.PhaseStartDeadline(phase)
-	if !now.Before(latestStart) {
+	if !latestStart.IsZero() && !now.Before(latestStart) {
 		return fmt.Errorf("RunContract phase=%s 的剩余时间窗已耗尽", phase)
 	}
 	return nil
@@ -104,6 +77,9 @@ func (c RunContract) ValidatePhaseAt(now time.Time, phase Phase) error {
 // PhaseStartDeadline 返回某阶段允许创建新 Task/Activation 的最后时刻。
 // 它只投影冻结 RunContract，不读取当前时钟。
 func (c RunContract) PhaseStartDeadline(phase Phase) time.Time {
+	if c.Schema == SchemaCurrent {
+		return c.DeadlineAt
+	}
 	latestStart := c.DeadlineAt.Add(-(c.FinalizationReserve + c.RecoveryReserve + c.VerificationReserve))
 	switch phase {
 	case PhaseVerification:
@@ -161,9 +137,6 @@ func (d DeadlineBudget) Validate() error {
 	if !validDeadlineScope(d.Scope) {
 		return fmt.Errorf("DeadlineBudget scope=%q，无效", d.Scope)
 	}
-	if d.HardDeadlineAt.IsZero() {
-		return fmt.Errorf("DeadlineBudget hard_deadline_at 不能为空")
-	}
 	if err := validateDuration("expected_duration", d.ExpectedDuration); err != nil {
 		return err
 	}
@@ -196,9 +169,8 @@ func ValidateChildDeadline(parent, child DeadlineBudget) error {
 	if scopeRank(child.Scope) >= scopeRank(parent.Scope) {
 		return fmt.Errorf("deadline 作用域层级无效: child=%s parent=%s", child.Scope, parent.Scope)
 	}
-	latestChild := parent.HardDeadlineAt.Add(-parent.FinalizationReserve)
-	if !child.HardDeadlineAt.Before(latestChild) {
-		return fmt.Errorf("%s deadline 必须早于 %s deadline-finalization_reserve", child.Scope, parent.Scope)
+	if !parent.HardDeadlineAt.IsZero() && (child.HardDeadlineAt.IsZero() || child.HardDeadlineAt.After(parent.HardDeadlineAt)) {
+		return fmt.Errorf("子作用域不得超过显式父截止时间")
 	}
 	return nil
 }

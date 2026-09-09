@@ -28,10 +28,10 @@ func authoringTestBody(title string) GraphDefinitionBody {
 func authoringTestContract() GraphContract {
 	return GraphContract{
 		RequestRef: "request-1", RequestDigest: "request-digest-1",
-		ExecutionClass:     ExecutionMutating,
-		Deliverables:       []ContractRequirement{{ID: "source", Kind: "artifact", Description: "源码修改"}},
-		RequiredEffects:    []string{"file_write"},
-		RequiredChecks:     []ContractRequirement{{ID: "tests", Kind: "test", Description: "运行测试"}},
+		ExecutionClass:  ExecutionMutating,
+		Deliverables:    []ContractRequirement{{ID: "source", Kind: "artifact", Description: "源码修改"}},
+		RequiredEffects: []string{"file_write"},
+
 		RequiresAcceptance: true,
 	}
 }
@@ -338,7 +338,7 @@ func TestAuthoringStoreReadCopiesAndContractNormalization(t *testing.T) {
 	b.Constraints = []string{}
 	b.RequiredEffects = []string{}
 	b.RequiredArtifacts = []ContractRequirement{}
-	b.RequiredChecks = []ContractRequirement{}
+
 	b.SuccessEvidence = []ContractRequirement{}
 	if ComputeGraphContractDigest(a) != ComputeGraphContractDigest(b) {
 		t.Fatal("Contract nil/empty slice 应归一为同一 digest")

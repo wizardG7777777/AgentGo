@@ -36,7 +36,7 @@ type agentQuestionResult struct {
 	Text      string `json:"text"`
 }
 
-func (g MetaGroup) requestUserInput(ctx context.Context, args map[string]any) (string, error) {
+func (g CommunicationGroup) requestUserInput(ctx context.Context, args map[string]any) (string, error) {
 	if g.Interactions == nil {
 		return "", fmt.Errorf("request_user_input: Interaction 服务不可用")
 	}

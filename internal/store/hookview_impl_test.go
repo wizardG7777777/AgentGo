@@ -58,7 +58,7 @@ func TestStoreHookView_GetToolCallHistory_PopulatedTask(t *testing.T) {
 	task := publishTestTask(t, s, "history test")
 
 	base := time.Now()
-	for i, tool := range []string{"read_file", "write_file", "read_file"} {
+	for i, tool := range []string{"read_file", "apply_change", "read_file"} {
 		s.AppendToolCall(task.ID, ToolCallRecord{
 			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
 			ToolName:  tool,

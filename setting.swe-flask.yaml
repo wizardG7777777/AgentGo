@@ -24,7 +24,7 @@
 #   跑后审计 trace 确认零 web 调用。
 # - agent_templates 动态组队机制默认关闭（2026-08-20 起搁置）：图节点只
 #   路由本文件声明的静态 kind——agent 节点缺省走 worker（event_type ""
-#   默认队列），只读调查路由 explore，验收路由 acceptance.verify。
+#   默认队列），调查路由 explore，验收路由 acceptance.verify。
 llm:
   request_contract: agentgo.model-request/v1
   base_url: "__BASE_URL__"
@@ -34,40 +34,44 @@ llm:
   timeout_sec: 300
   default_context_window_tokens: 1048576
   default_max_completion_tokens: 65536
-  # SWE 主链显式开启 reasoning。大多数机械阶段使用 auto + singleton
-  # ToolRouter + L3 required-action gate；Graph 最终交付仅在该次 invocation 覆盖为
-  # reasoning=none + exact submit_task_result，以逃离 provider 对历史工具的粘滞重放。
   reasoning_effort: low
 
 tool_profiles:
-  swe_explorer:                       # 只读调查：无写、无 shell、无网络
-    - read_file
-    - list_dir
-    - grep_search
-    - glob_search
-    - read_content_ref
-    - send_message
-    - request_replan
-    - submit_task_result
-  swe_worker:                         # 执行：文件读写 + shell，无网络
-    - read_file
-    - list_dir
-    - grep_search
-    - glob_search
-    - read_content_ref
-    - write_file
-    - edit_file
+  swe_explorer:                       # 调查：通过 Shell 搜索，通过检视获取节点事实
     - run_shell
-    - run_check
+    - read_file
+
+
+
+    - read_evidence
+    - inspect_board
+    - inspect_node
     - send_message
     - request_replan
     - submit_task_result
-  swe_verifier:                       # 验收：只读 + 提交判定（无 shell/网络）
+  swe_worker:                         # 执行：文件读写 + Shell；未配置独立 Web 工具
     - read_file
-    - list_dir
-    - grep_search
-    - glob_search
-    - read_content_ref
+
+
+
+    - read_evidence
+    - inspect_board
+    - inspect_node
+    - apply_change
+
+    - run_shell
+
+    - send_message
+    - request_replan
+    - submit_task_result
+  swe_verifier:                       # 验收：只读 + 提交判定（无 Shell/独立 Web 工具）
+    - read_file
+
+
+
+    - read_evidence
+    - inspect_board
+    - inspect_node
     - submit_task_result
 
 agents:
@@ -77,23 +81,20 @@ agents:
     profile: swe_explorer
     system_prompt_file: "__AGENTGO_ROOT__/prompts/swe/explorer.md"
     # Explorer 的根因/所有权边界判断属于业务推理，真实 Flask 日志证明快速模型会把
-    # 公开 proxy 语义误缩为叶子容器覆写；业务模型使用旗舰档，机械 Observation 仍
     # 使用已通过显式 v7-v11 matrix 的快速档。
     model: "__FLAG_SHIP_MODEL__"
-    observation_model: "__FAST_MODEL__"
+
     task_max_retries: 5
-    description: 只读调查代理：定位缺陷、解释行为、梳理调用关系；无写/shell/网络。
+    description: 调查代理：定位缺陷、读取项目与运行事实，使用 Shell 完成命令行调查。
   - kind: worker
     replicas: 2
     event_type: ""
     profile: swe_worker
     system_prompt_file: "__AGENTGO_ROOT__/prompts/swe/worker.md"
     model: "__FLAG_SHIP_MODEL__"
-    # Optional: only set to __FAST_MODEL__ after the explicit observation
     # probe proves this business model rejects v8 while fast passes both fixtures.
-    # observation_model: "__FAST_MODEL__"
     task_max_retries: 5
-    description: 通用执行代理：调查、修改代码、运行 pytest 验证；无网络工具。
+    description: 通用执行代理：调查、修改代码、运行 pytest 验证；未配置独立 Web 工具；Shell 网络能力由执行环境决定。
   - kind: verifier
     replicas: 1
     event_type: "acceptance.verify"
@@ -101,7 +102,7 @@ agents:
     system_prompt_file: "__AGENTGO_ROOT__/prompts/swe/verifier.md"
     model: "__FAST_MODEL__"
     task_max_retries: 5
-    description: 验收代理：按节点验收标准核验上游证据与仓库状态；无 shell/网络。
+    description: 验收代理：按节点验收标准核验上游证据与仓库状态；无 Shell/独立 Web 工具。
 
 scheduler:
   model: "__FAST_MODEL__"

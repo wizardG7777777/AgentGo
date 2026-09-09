@@ -71,7 +71,7 @@ func newSwitchTestEnv(t *testing.T, sm *session.SessionManager) *switchTestEnv {
 		t.Fatalf("team.OpenStore: %v", err)
 	}
 	if _, _, err := teamStore.Ensure(team.TeamSpec{
-		ID: "team-a", TemplateRef: "builtin/explorer@1", TemplateDigest: "sha256:test",
+		ID: "team-a", TemplateRef: "builtin/explorer@2", TemplateDigest: "sha256:test",
 		ControllerTaskID: "ctrl-1", Purpose: "investigate",
 		EventType: "team:team-a", Replicas: 1, Status: team.StatusReady,
 	}); err != nil {
@@ -792,7 +792,7 @@ func TestRebuildFrozenWorkspaceExemptions(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		snap := &session.Snapshot{ModelHistoryContract: "agentgo.model-history/v1", Version: 6, Tasks: tasks}
+		snap := &session.Snapshot{ModelHistoryContract: "agentgo.model-history/v1", Version: 7, Tasks: tasks}
 		if err := session.SaveSnapshot(filepath.Join(dir, "snapshot.json"), snap); err != nil {
 			t.Fatal(err)
 		}

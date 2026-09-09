@@ -8,7 +8,7 @@ import (
 	"agentgo/internal/store"
 )
 
-// EnforceExpectedArtifactsHook 在 write_file / edit_file 调用之前校验 path 参数
+// EnforceExpectedArtifactsHook 在 apply_change / apply_change 调用之前校验 path 参数
 // 必须严格等于当前任务的 expected_artifacts 中声明的某一条。
 //
 // # 背景（2026-04-14 多 Worker 系统测试发现）
@@ -17,14 +17,14 @@ import (
 // `agent.checkExpectedArtifacts` 做 PostCall 校验（层 B）。但这是"事后校验"：
 // 漂移已经发生、token 和 wall-clock 时间已经浪费，只能靠任务重试来修正。
 //
-// 本 hook 把校验前置到 PreCall 阶段，直接在 write_file 调用之前判断：
+// 本 hook 把校验前置到 PreCall 阶段，直接在 apply_change 调用之前判断：
 //   - path == expected_artifacts 中的任一字符串 → Continue
 //   - path 是任务声明之外的路径 → Abort，指导 LLM 使用字面路径或联系 scheduler
 //
 // # 覆盖的两个问题
 //
 //   - **Expected_artifacts 路径漂移**：LLM 把 "config_group1_scheduler_agent_llm.md"
-//     自由联想为 "config_fields_analysis.md"，本 hook 在第一次 write_file 就拦下，
+//     自由联想为 "config_fields_analysis.md"，本 hook 在第一次 apply_change 就拦下，
 //     避免 "漂移→PostCall 失败→重试→require-read-before-write 拦→read 再写" 的浪费循环
 //
 //   - **Worker 越权写用户最终产物**：worker-1 的 expected_artifacts 是
@@ -45,7 +45,7 @@ import (
 //
 // # 不匹配的工具
 //
-// 仅匹配 write_file / edit_file。read_file / list_dir / grep_search / glob_search
+// 仅匹配 apply_change / apply_change。read_file / list_dir / grep_search / glob_search
 // 都是只读工具，不涉及产出。
 //
 // Phase: PreCall, Priority: 35（晚于 PathBoundary=10、ValidateExpectedHash=20、
@@ -72,9 +72,9 @@ func (h *EnforceExpectedArtifactsHook) Phase() hook.ToolHookPhase { return hook.
 // Priority 返回 35（任务级产出约束，排在所有安全和格式校验之后）。
 func (h *EnforceExpectedArtifactsHook) Priority() int { return 35 }
 
-// Matches 仅匹配 write_file / edit_file。
+// Matches 仅匹配 apply_change / apply_change。
 func (h *EnforceExpectedArtifactsHook) Matches(toolName string) bool {
-	return toolName == "write_file" || toolName == "edit_file"
+	return toolName == "apply_change"
 }
 
 // Run 执行 expected_artifacts 精确匹配校验。
@@ -102,7 +102,7 @@ func (h *EnforceExpectedArtifactsHook) Run(hctx hook.ToolHookContext) hook.ToolH
 
 	// 规范化为相对项目根的相对路径（normalizeArtifactPath，与 record-artifact
 	// Reactor 的同名函数行为一致），确保 expected_artifacts 的声明路径（通常是
-	// 相对路径）能与 write_file 的实际 path（可能是绝对或相对）做可比较的字符串匹配。
+	// 相对路径）能与 apply_change 的实际 path（可能是绝对或相对）做可比较的字符串匹配。
 	normalized := normalizeArtifactPath(rawPath, h.ProjectRoot)
 
 	for _, expected := range task.ExpectedArtifacts {
@@ -128,7 +128,7 @@ func (h *EnforceExpectedArtifactsHook) Run(hctx hook.ToolHookContext) hook.ToolH
 				"向 scheduler 发送 question 类型消息，请求补充 expected_artifacts 声明，"+
 				"等 scheduler 更新后再写；\n"+
 				"  (3) 如果当前文件确实不该写（例如你错把用户最终产物理解成自己该写的产物），"+
-				"直接停止 write_file，改为在文本响应中总结你的发现。",
+				"直接停止 apply_change，改为在文本响应中总结你的发现。",
 			hctx.ToolName, normalized, task.ExpectedArtifacts,
 		),
 		ReasonCode:  ReasonMissingExpectedArtifacts,
@@ -137,8 +137,8 @@ func (h *EnforceExpectedArtifactsHook) Run(hctx hook.ToolHookContext) hook.ToolH
 }
 
 // missingArtifactSuggestion 为"写入路径不在 expected_artifacts"的拒绝构造
-// 候选建议：把声明中尚未产出的缺失产物路径作为 write_file 的合法目标
-//（每条一个动作，有界 ≤3）；全部已产出时退化为第一个声明路径。
+// 候选建议：把声明中尚未产出的缺失产物路径作为 apply_change 的合法目标
+// （每条一个动作，有界 ≤3）；全部已产出时退化为第一个声明路径。
 func (h *EnforceExpectedArtifactsHook) missingArtifactSuggestion(task *model.Task, target string) hook.Suggestion {
 	recorded := make(map[string]bool, len(task.Artifacts))
 	for _, a := range task.Artifacts {
@@ -156,7 +156,7 @@ func (h *EnforceExpectedArtifactsHook) missingArtifactSuggestion(task *model.Tas
 	}
 	actions := make([]hook.SuggestedAction, 0, len(missing))
 	for _, m := range missing {
-		actions = append(actions, hook.ToolCallAction("write_file", map[string]any{"path": m},
+		actions = append(actions, hook.ToolCallAction("apply_change", map[string]any{"path": m},
 			"改为写入任务声明的缺失产物路径"))
 	}
 	return hook.NewSuggestion(h.Name(), ReasonMissingExpectedArtifacts, target, true, actions...)

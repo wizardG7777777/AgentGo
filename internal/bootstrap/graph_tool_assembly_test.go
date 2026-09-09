@@ -62,13 +62,7 @@ func TestSchedulerGraphToolsAssembled(t *testing.T) {
 	for _, d := range bundle.ToolReg.Defs() {
 		registered[d.Name] = true
 	}
-	for _, name := range []string{
-		"create_graph_draft", "patch_graph_draft", "read_graph_draft",
-		"validate_graph_draft", "commit_graph_draft", "start_graph",
-		"propose_graph_change", "read_graph_change", "validate_graph_change", "commit_graph_change",
-		"submit_graph_change_decision",
-		"read_graph", "patch_graph", "submit_task_result",
-	} {
+	for _, name := range []string{"read_graph_definition", "apply_graph_change", "control_graph", "inspect_board", "inspect_node", "read_evidence"} {
 		if !registered[name] {
 			t.Errorf("Scheduler 工具注册表应含 %s（C4 Graph 控制面）", name)
 		}

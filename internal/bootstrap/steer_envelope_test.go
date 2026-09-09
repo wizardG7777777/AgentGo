@@ -3,7 +3,6 @@ package bootstrap
 import (
 	"strings"
 	"testing"
-	"time"
 
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/mailbox"
@@ -19,8 +18,7 @@ func TestSendSteerBindsUniqueProcessingTaskRun(t *testing.T) {
 	box := registry.Register("worker-1", "")
 	registry.RegisterAlias("worker-alias", "worker-1")
 	source := &model.Task{ID: "steer-source", Description: "正在执行"}
-	if err := taskcontract.Start(source, loopcontract.WorkCodeChange, "test-steer/v1",
-		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+	if err := taskcontract.Start(source, loopcontract.WorkCodeChange, "test-steer/v1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := tasks.PublishTask(source); err != nil {
@@ -52,8 +50,7 @@ func TestSendSteerFailsWhenTargetTaskIsNotUnique(t *testing.T) {
 	registry.Register("worker-1", "")
 	for _, id := range []string{"steer-a", "steer-b"} {
 		task := &model.Task{ID: id, Description: id}
-		if err := taskcontract.Start(task, loopcontract.WorkCoordination, "test-steer/v1",
-			time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+		if err := taskcontract.Start(task, loopcontract.WorkCoordination, "test-steer/v1"); err != nil {
 			t.Fatal(err)
 		}
 		if err := tasks.PublishTask(task); err != nil {

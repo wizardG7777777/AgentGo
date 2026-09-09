@@ -9,13 +9,14 @@
 from __future__ import annotations
 
 from sse import decode_probe
+from runtime_audit import RESULT_SCHEMA, EvidenceReader, collect_runtime
+from test_identity import input_identity, validate_import_origin, compare_failures
 
 import argparse
 import collections
 import contextlib
 import csv
 import datetime as dt
-import glob
 import hashlib
 import json
 import os
@@ -38,9 +39,8 @@ import uuid
 import xml.etree.ElementTree as ET
 
 
-RUN_SCHEMA = "agentgo.run-contract/v2"
-RESULT_SCHEMA = "agentgo.swe-result/v3"
-PYTEST_REPORT_SCHEMA = "agentgo.pytest-phase-report/v1"
+RUN_SCHEMA = "agentgo.run-contract/v3"
+PYTEST_REPORT_SCHEMA = "agentgo.pytest-phase-report/v2"
 PYTEST_COUNT_SEMANTICS = "pytest-phase-overlap/v1"
 PYTEST_REPORT_ENV = "AGENTGO_SWE_PYTEST_REPORT"
 PYTEST_REPORTER_MODULE = "agentgo_swe_pytest_reporter"
@@ -49,7 +49,6 @@ PROBE_NONCE = "nonce_test_7f3a"
 TERMINAL_TASK = {"completed", "failed", "blocked", "cancelled"}
 TERMINAL_GRAPH = {"completed", "failed", "blocked", "cancelled"}
 TERMINAL_OUTCOME = {"success", "failed", "blocked", "cancelled"}
-NANOSECOND = 1_000_000_000
 TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 EXIT_SWE_TEST_RUNNER_FAILURE = 1
 EXIT_ARCHITECTURE_FAILURE = 2
@@ -314,99 +313,88 @@ def read_json(path: str | Path, default: object | None = None):
 
 
 def build_test_baseline_manifest(worktree: Path, test_files: tuple[str, ...]) -> dict:
+    identity = input_identity(worktree)
+    protected_config = {"conftest.py", "pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg"}
+    names = set(test_path_arguments(test_files)) | protected_config
+    names.update(name for name in identity["files"] if name.startswith("tests/"))
     files = {}
-    for name in test_files:
-        path = worktree / name
-        if path.is_file():
-            files[name] = {"exists": True, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-        else:
-            files[name] = {"exists": False}
-    return {"schema": "agentgo.swe-test-baseline/v1", "files": files}
+    for name in sorted(names):
+        digest = identity["files"].get(name)
+        files[name] = {"exists": False} if digest is None else {"exists": True, "sha256": digest}
+    return {"schema": "agentgo.swe-test-baseline/v2",
+            "declared_test_files": sorted(test_path_arguments(test_files)), "files": files}
 
 
 def compare_test_baseline_manifest(worktree: Path, test_files: tuple[str, ...], manifest: object) -> list[str]:
-    if not isinstance(manifest, dict) or manifest.get("schema") != "agentgo.swe-test-baseline/v1":
+    if not isinstance(manifest, dict) or manifest.get("schema") != "agentgo.swe-test-baseline/v2":
         raise ValueError("受保护测试基线 schema 无效")
+    if manifest.get("declared_test_files") != sorted(test_path_arguments(test_files)):
+        raise ValueError("受保护测试基线题目范围不匹配")
     files = manifest.get("files")
-    if not isinstance(files, dict) or set(files) != set(test_files):
+    if not isinstance(files, dict) or not set(test_files).issubset(files):
         raise ValueError("受保护测试基线文件集合不匹配")
-    changed = []
-    for name in test_files:
-        entry = files[name]
+    config_files = {"conftest.py", "pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg"}
+    if not config_files.issubset(files):
+        raise ValueError("受保护测试基线缺少配置身份")
+    for name, entry in files.items():
+        if name not in config_files:
+            if test_path_arguments((name,)) != [name]:
+                raise ValueError("受保护测试基线路径未归一")
         if not isinstance(entry, dict) or not isinstance(entry.get("exists"), bool):
-            raise ValueError(f"受保护测试基线条目无效: {name}")
+            raise ValueError("受保护测试基线条目无效")
         if entry["exists"]:
             digest = entry.get("sha256")
             if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
-                raise ValueError(f"受保护测试基线 sha256 无效: {name}")
+                raise ValueError("受保护测试基线 sha256 无效")
         elif "sha256" in entry:
-            raise ValueError(f"不存在文件不应携带 sha256: {name}")
-        path = worktree / name
-        exists = path.exists()
-        if exists != entry["exists"]:
-            changed.append(name + ("(被删除)" if entry["exists"] else "(应已删除)"))
-        elif exists and (not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != entry["sha256"]):
+            raise ValueError("不存在文件不应携带 sha256")
+    current = build_test_baseline_manifest(worktree, test_files)["files"]
+    changed = []
+    for name in sorted(set(files) | set(current)):
+        old, new = files.get(name, {"exists": False}), current.get(name, {"exists": False})
+        actual_path = worktree / name
+        if actual_path.exists() and not actual_path.is_file():
+            changed.append(name + ("(非文件)" if old["exists"] else "(应已删除)"))
+            continue
+        if old == new:
+            continue
+        if old["exists"] and not new["exists"]:
+            changed.append(name + "(被删除)")
+        elif not old["exists"] and new["exists"]:
+            changed.append(name + "(应已删除)" if name in files else name + "(新增)")
+        else:
             changed.append(name)
     return changed
 
 
-def iter_jsonl(pattern: str):
-    for path in sorted(glob.glob(pattern, recursive=True)):
-        try:
-            with open(path, encoding="utf-8") as handle:
-                for line in handle:
-                    try:
-                        yield path, json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-        except OSError:
-            continue
-
-
-def targeted_check_command(test_files: tuple[str, ...]) -> str:
-    """生成 POSIX sh 与 PowerShell 都能逐字解释的冻结目标测试命令。"""
-    if not test_files:
-        raise ValueError("SWE targeted CheckContract 缺少目标测试文件")
-    quoted = []
+def test_path_arguments(test_files: tuple[str, ...]) -> list[str]:
+    """正式测试使用 argv 传路径，不把测试范围编译成产品工具合同。"""
+    result = []
     for raw in test_files:
-        normalized = str(raw).replace("\\", "/")
+        normalized = str(raw).replace(chr(92), "/")
         path = Path(normalized)
         if (path.is_absolute() or ".." in path.parts or not normalized.startswith("tests/")
-                or "'" in normalized or "\n" in normalized or "\r" in normalized):
-            raise ValueError(f"SWE targeted CheckContract 路径非法: {raw!r}")
-        # 单引号对无内嵌单引号的路径在 POSIX sh / PowerShell 中语义一致。
-        quoted.append(f"'{normalized}'")
-    return "uv run --no-sync python -m pytest -q " + " ".join(quoted)
+                or any(char in normalized for char in ("\n", "\r", "\0"))):
+            raise ValueError("SWE 测试路径非法")
+        result.append(normalized)
+    return result
 
 
-def build_run_contract(task_id: str, timeout_sec: int, now: dt.datetime | None = None,
-                       test_files: tuple[str, ...] = ()) -> dict:
-    if timeout_sec < 480:
-        raise ValueError("SWE 外部时限必须至少为 480 秒，才能保留 Run 四阶段收割窗口")
+def build_run_contract(task_id: str, now: dt.datetime | None = None) -> dict:
+    """创建通用运行身份；评测时限与测试命令仅由 Python 管理。"""
+    validate_task_id(task_id)
     created = (now or utc_now()).astimezone(dt.timezone.utc)
-    # 外部 hard kill 前固定留 60 秒；Run 内冻结 verification/recovery/finalization。
-    deadline = created + dt.timedelta(seconds=timeout_sec - 60)
-    safe_task = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in task_id)[:48]
     return {
         "schema": RUN_SCHEMA,
-        "run_id": f"run-swe-{safe_task}-{uuid.uuid4()}",
-        "deadline_at": format_time(deadline),
-        "finalization_reserve": 90 * NANOSECOND,
-        "recovery_reserve": 120 * NANOSECOND,
-        "verification_reserve": 180 * NANOSECOND,
-        "budget_profile": "swe/v3",
-        "budget": {},
-        "check_contracts": [
-            {"check_id": "targeted", "kind": "test",
-             "exact_command": targeted_check_command(test_files)},
-            {"check_id": "verification", "kind": "test",
-             "exact_command": "uv run --no-sync python -m pytest -q"},
-        ],
+        "run_id": f"run-swe-{task_id}-{uuid.uuid4()}",
+        "budget_profile": "swe/v4",
         "created_at": format_time(created),
     }
 
 
 def probe_request(model: str, probe_name: str, nonce: str, protocol: str) -> dict:
+    if protocol not in {"responses", "chat_completions"}:
+        raise ValueError("未知模型协议")
     tool = {
         "type": "function",
         "name": probe_name,
@@ -460,8 +448,13 @@ def validate_probe_response(payload: dict, probe_name: str = PROBE_NAME,
             if isinstance(output, list) else []
         if not calls:
             return False, "function_call item 数量=0，期望至少 1"
+        call_ids = set()
         for call in calls:
-            if call.get("name") != probe_name or not call.get("call_id"):
+            identity = call.get("call_id")
+            if not isinstance(identity, str) or not identity.strip() or identity in call_ids:
+                return False, "function_call 身份缺失或重复"
+            call_ids.add(identity)
+            if call.get("name") != probe_name:
                 return False, "function_call name/call_id 不匹配"
             raw_args = call.get("arguments")
             try:
@@ -481,8 +474,13 @@ def validate_probe_response(payload: dict, probe_name: str = PROBE_NAME,
     calls = message.get("tool_calls")
     if not isinstance(calls, list) or not calls:
         return False, "tool_calls 数量=0，期望至少 1"
+    call_ids = set()
     for call in calls:
         call = call if isinstance(call, dict) else {}
+        identity = call.get("id")
+        if not isinstance(identity, str) or not identity.strip() or identity in call_ids:
+            return False, "tool_call 身份缺失或重复"
+        call_ids.add(identity)
         function = call.get("function") if isinstance(call.get("function"), dict) else {}
         if function.get("name") != probe_name:
             return False, f"工具名={function.get('name')!r}，期望 {probe_name}"
@@ -607,9 +605,8 @@ def http_json(url: str, token: str, method: str = "GET", body: dict | None = Non
 
 
 def inject_request(base_url: str, token: str, prompt_path: str, task_id: str,
-                   timeout_sec: int, contract_path: str,
-                   test_files: tuple[str, ...], baseline_failure_path: str | None = None) -> dict:
-    contract = build_run_contract(task_id, timeout_sec, test_files=test_files)
+                   contract_path: str, baseline_failure_path: str | None = None) -> dict:
+    contract = build_run_contract(task_id)
     prompt = Path(prompt_path).read_text(encoding="utf-8")
     if baseline_failure_path:
         prompt += "\n\n" + render_baseline_failure_context(Path(baseline_failure_path))
@@ -731,636 +728,22 @@ def monitor_run(base_url: str, token: str, process: subprocess.Popen, run_id: st
     }
 
 
-def safe_outcomes(state_dir: Path, run_id: str) -> tuple[list[dict], int]:
-    journal = state_dir / "task-outcomes" / "task-outcomes.jsonl"
-    commits: dict[str, dict] = {}
-    acknowledgements: set[str] = set()
-    for _, entry in iter_jsonl(str(journal)):
-        if entry.get("kind") == "delivery_ack" and entry.get("ack_ref"):
-            acknowledgements.add(entry["ack_ref"])
-        record = entry.get("record") if isinstance(entry.get("record"), dict) else {}
-        outcome = record.get("outcome") if isinstance(record.get("outcome"), dict) else {}
-        ref = record.get("outcome_ref", "")
-        if outcome.get("run_id") != run_id or not ref:
-            continue
-        commits[ref] = {
-            "outcome_ref": ref,
-            "task_id": outcome.get("task_id", ""),
-            "graph_id": outcome.get("graph_id", ""),
-            "node_id": outcome.get("node_id", ""),
-            "activation_id": outcome.get("activation_id", ""),
-            "attempt_id": outcome.get("attempt_id", ""),
-            "attempt_no": outcome.get("attempt_no", 0),
-            "status": outcome.get("status", ""),
-            "reason_code": outcome.get("reason_code", ""),
-            "checkpoint_state": outcome.get("checkpoint_state", ""),
-            "fulfillment_present": isinstance(outcome.get("fulfillment"), dict),
-            "fulfillment_check_count": len((outcome.get("fulfillment") or {}).get("check_refs") or [])
-            if isinstance(outcome.get("fulfillment"), dict) else 0,
-        }
-    values = []
-    for ref in sorted(commits):
-        projected = commits[ref]
-        projected["delivery_acked"] = ref in acknowledgements
-        values.append(projected)
-    return values, sum(not value["delivery_acked"] for value in values)
-
-
-def trace_metrics(project_root: Path, run_id: str, scheduler_task_ids: set[str]) -> tuple[dict, list[dict]]:
-    events = []
-    for _, event in iter_jsonl(str(project_root / ".agentgo" / "sessions" / "*" / "logs" / "*.jsonl")):
-        # 旧 workspace Manager 事件没有 run_id；SWE 每题使用全新 disposable
-        # worktree，因此其中的 delivery-* 生命周期事件仍属于当前唯一 Run。
-        # 新实现会从持久化 owner 写入 Run/Graph 身份，此兼容分支只用于事故回溯。
-        legacy_workspace_event = (
-            not event.get("run_id")
-            and event.get("kind") in {"workspace_materialized", "workspace_merged", "workspace_cleaned"}
-            and str(event.get("task_id") or "").startswith("delivery-")
-        )
-        if event.get("run_id") == run_id or legacy_workspace_event:
-            events.append(event)
-    events.sort(key=lambda event: event.get("ts", ""))
-    llm_ends = [event for event in events if event.get("kind") == "llm_call_end"]
-    scheduler_ends = [event for event in llm_ends if event.get("task_id") in scheduler_task_ids]
-    failures = collections.Counter(
-        event.get("failure_kind") for event in llm_ends if event.get("failure_kind")
-    )
-    # Provider 返回多个 tool calls 本身不再是事故：机械阶段会只 dispatch
-    # 首个并为其余 call_id 写 skipped result，final-report 则允许串行执行多个
-    # 只读调用。真正的回归是“非 final-report 的 Scheduler 单动作阶段实际
-    # dispatch 了多个工具”。phase 来自冻结 Context manifest，而不是正文猜测。
-    turn_phases = {}
-    for event in events:
-        if event.get("kind") != "context_manifest_built":
-            continue
-        try:
-            manifest = json.loads(event.get("description") or "[]")
-        except (TypeError, json.JSONDecodeError):
-            manifest = []
-        for fragment in manifest if isinstance(manifest, list) else []:
-            source_ref = fragment.get("source_ref", "") if isinstance(fragment, dict) else ""
-            if source_ref.startswith("prompt-phase:"):
-                turn_phases[event.get("turn_id", "")] = source_ref.removeprefix("prompt-phase:")
-                break
-    dispatched_by_turn = collections.Counter(
-        event.get("turn_id", "") for event in events
-        if event.get("kind") == "tool_call" and event.get("task_id") in scheduler_task_ids
-    )
-    scheduler_batches = [
-        turn_id for turn_id, count in dispatched_by_turn.items()
-        if count > 1 and turn_phases.get(turn_id) != "scheduler:final-report"
-    ]
-    final_report_scope_failures = [
-        event for event in events
-        if event.get("kind") == "tool_result"
-        and turn_phases.get(event.get("turn_id", "")) == "scheduler:final-report"
-        and event.get("tool") == "get_task_result"
-        and "被拒绝" in str(event.get("error", ""))
-    ]
-    # submit_recovery_decision 内部会先进入 finalizing，再由 Agent 唯一终态事务
-    # emit task_result_committed。按 raw tool_result 计数会把 Attempt rollover 后的
-    # 重放误认成多个 Graph retry；每个 Recovery Task 只取最终一次成功裁决，且
-    # 只有真正 committed 的裁决才有资格要求后继 work gate。
-    last_recovery_decision_by_task = {}
-    committed_recovery_tasks = set()
-    for event in events:
-        if (event.get("kind") == "tool_result"
-                and event.get("tool") == "submit_recovery_decision"
-                and not event.get("error")
-                and isinstance(event.get("args"), dict)):
-            last_recovery_decision_by_task[event.get("task_id", "")] = event
-        elif event.get("kind") == "task_result_committed":
-            committed_recovery_tasks.add(event.get("task_id", ""))
-    recovery_retry_receipts = sorted((
-        event for task_id, event in last_recovery_decision_by_task.items()
-        if task_id in committed_recovery_tasks and event["args"].get("decision") == "retry"
-    ), key=lambda event: event.get("ts", ""))
-    recovery_gate_events = [
-        event for event in events
-        if event.get("kind") == "recovery_action_gated"
-        and isinstance(event.get("recovery_action_gate"), dict)
-    ]
-    first_gate_by_task = {}
-    for event in recovery_gate_events:
-        payload = event["recovery_action_gate"]
-        if payload.get("stage") == "first_action" and event.get("task_id") not in first_gate_by_task:
-            first_gate_by_task[event.get("task_id")] = event
-    first_gates = sorted(first_gate_by_task.values(), key=lambda event: event.get("ts", ""))
-
-    def normalized_path(value) -> str:
-        return str(value or "").strip().replace("\\", "/")
-
-    recovery_gate_missing = len(first_gates) != len(recovery_retry_receipts)
-    recovery_gate_mismatch = False
-    for receipt, gate_event in zip(recovery_retry_receipts, first_gates):
-        expected = receipt["args"].get("first_action") or {}
-        actual = gate_event["recovery_action_gate"]
-        if (
-            expected.get("tool") != actual.get("tool")
-            or normalized_path(expected.get("path")) != normalized_path(actual.get("path"))
-        ):
-            recovery_gate_mismatch = True
-            break
-    calls_by_turn = collections.defaultdict(list)
-    for event in events:
-        if event.get("kind") == "tool_call":
-            calls_by_turn[event.get("turn_id", "")].append(event)
-    for gate_event in recovery_gate_events:
-        payload = gate_event["recovery_action_gate"]
-        for call in calls_by_turn.get(gate_event.get("turn_id", ""), []):
-            args = call.get("args") if isinstance(call.get("args"), dict) else {}
-            if (
-                call.get("tool") != payload.get("tool")
-                or (payload.get("path") and normalized_path(args.get("path")) != normalized_path(payload.get("path")))
-                or (payload.get("check_id") and args.get("check_id") != payload.get("check_id"))
-                or (payload.get("ref_id") and args.get("ref_id") != payload.get("ref_id"))
-                or ("offset" in payload and int(args.get("offset") or 0) != int(payload.get("offset") or 0))
-                or ("limit" in payload and int(args.get("limit") or 0) != int(payload.get("limit") or 0))
-                or ("force_full" in payload and bool(args.get("force_full")) != bool(payload.get("force_full")))
-            ):
-                recovery_gate_mismatch = True
-    recovery_directive_ambiguous = any(
-        int((event.get("recovery_action_gate") or {}).get("directive_count") or 0) != 1
-        for event in recovery_gate_events
-    )
-    create_calls = [
-        event for event in events
-        if event.get("kind") == "tool_call" and event.get("task_id") in scheduler_task_ids
-        and event.get("tool") == "create_graph_draft"
-    ]
-    first_create_index = 0
-    if create_calls:
-        created_at = create_calls[0].get("ts", "")
-        first_create_index = sum(event.get("ts", "") <= created_at for event in scheduler_ends)
-    error_text = "\n".join(str(event.get("error", "")) for event in events if event.get("error"))
-    event_errors = [str(event.get("error", "")) for event in events if event.get("error")]
-    recovery_contract_rejection_tasks = {
-        event.get("task_id", "")
-        for event in events
-        if event.get("kind") == "tool_result"
-        and event.get("tool") == "submit_recovery_decision"
-        and "recovery_delta" in str(event.get("error", ""))
-        and any(marker in str(event.get("error", ""))
-                for marker in ("非法", "不一致", "缺少", "超过", "cannot unmarshal"))
-    }
-    recovered_recovery_tasks = committed_recovery_tasks.intersection(
-        last_recovery_decision_by_task
-    )
-    unrecovered_recovery_contract_rejection = bool(
-        recovery_contract_rejection_tasks - recovered_recovery_tasks
-    )
-    observation_control_failures = [
-        event for event in events
-        if event.get("kind") == "observation_checkpoint_failed"
-    ]
-    merged_deliveries = set()
-    delivery_cleanup_without_merge = []
-    for event in events:
-        workspace_id = str(event.get("task_id") or "")
-        if not workspace_id.startswith("delivery-"):
-            continue
-        if event.get("kind") == "workspace_merged":
-            merged_deliveries.add(workspace_id)
-        elif event.get("kind") == "workspace_cleaned" and workspace_id not in merged_deliveries:
-            delivery_cleanup_without_merge.append(event)
-    max_observation_checkpoint_attempts = 0
-    current_observation_checkpoint_attempts = 0
-    max_observation_checkpoint_failures = 0
-    current_observation_checkpoint_failures = 0
-    for event in llm_ends:
-        if str(turn_phases.get(event.get("turn_id", ""))).startswith("agent:observation-checkpoint"):
-            current_observation_checkpoint_attempts += 1
-            max_observation_checkpoint_attempts = max(
-                max_observation_checkpoint_attempts, current_observation_checkpoint_attempts,
-            )
-            if event.get("error"):
-                current_observation_checkpoint_failures += 1
-                max_observation_checkpoint_failures = max(
-                    max_observation_checkpoint_failures, current_observation_checkpoint_failures,
-                )
-            else:
-                current_observation_checkpoint_failures = 0
-        else:
-            current_observation_checkpoint_attempts = 0
-            current_observation_checkpoint_failures = 0
-    known = {
-        "fragment_limit_exceeded": "fragment_limit_exceeded" in error_text,
-        # provider 400 表示冻结请求 wire 本身不合法，属于 Invocation/Context
-        # 架构事故，不能因为 Graph 正常进入 failed 终态就计为 architecture_ok。
-        "provider_invalid_request": any(
-            event.get("failure_kind") == "invalid_request"
-            and turn_phases.get(event.get("turn_id", "")) not in {
-                "agent:observation-checkpoint", "agent:observation-checkpoint-v8", "agent:observation-checkpoint-v9", "agent:observation-checkpoint-v10", "agent:observation-checkpoint-v11", "agent:observation-checkpoint-v12",
-            }
-            for event in llm_ends
-        ),
-        "invocation_output_limit_exceeded": any(
-            event.get("failure_kind") == "output_limit_exceeded" for event in llm_ends
-        ),
-        "premature_attempt_exhaustion": "attempt" in error_text.lower() and "exhaust" in error_text.lower(),
-        "invalid_recovery_deadline": any(
-            "recovery" in error.lower() and "deadline" in error.lower() and "invalid" in error.lower()
-            and "recovery_retry_unstartable" not in error
-            and "allowed_decisions=[blocked]" not in error
-            for error in event_errors
-        ),
-        "scheduler_tool_batch_exceeded": bool(scheduler_batches),
-        "request_timeout_rebuilt_context": any(
-            event.get("failure_kind") == "request_timeout" and event.get("recovery_action") == "rebuild_context"
-            for event in llm_ends
-        ),
-        "final_report_result_scope_failure": bool(final_report_scope_failures),
-        "recovery_contract_rejection": unrecovered_recovery_contract_rejection,
-        "recovery_action_gate_missing": recovery_gate_missing,
-        "recovery_action_gate_mismatch": recovery_gate_mismatch,
-        "recovery_directive_ambiguous": recovery_directive_ambiguous,
-        "observation_checkpoint_retry_storm": max_observation_checkpoint_failures > 2,
-        "observation_checkpoint_attempt_limit_exceeded": max_observation_checkpoint_attempts > 2,
-        # provider 前的 Control Invocation preflight 失败不会产生
-        # context_manifest/llm_call_end，也不一定把 Task 置为终态。必须消费
-        # AgentGo 的 durable trace 事实，不能只从终态 Outcome 反推。
-        "control_checkpoint_unavailable": any(
-            event.get("reason") == "control_invocation_preflight_failed"
-            for event in observation_control_failures
-        ),
-        "delivery_workspace_cleaned_without_merge": bool(delivery_cleanup_without_merge),
-        "reasoning_mode_replay_break": "reasoning_text" in error_text and "must be passed back" in error_text,
-    }
-    model_contract_incidents = [
-        {
-            "phase": turn_phases.get(event.get("turn_id", ""), ""),
-            "failure_kind": event.get("failure_kind", "unknown"),
-            "provider_code": event.get("provider_code", ""),
-        }
-        for event in llm_ends
-        if turn_phases.get(event.get("turn_id", "")) in {
-            "agent:observation-checkpoint", "agent:observation-checkpoint-v8", "agent:observation-checkpoint-v9", "agent:observation-checkpoint-v10", "agent:observation-checkpoint-v11", "agent:observation-checkpoint-v12",
-        }
-        and event.get("failure_kind") in {"invalid_request", "protocol_incompatible"}
-    ]
-    return {
-        "model_calls": len(llm_ends),
-        "prompt_tokens": sum(int(event.get("prompt_tokens") or 0) for event in llm_ends),
-        "completion_tokens": sum(int(event.get("completion_tokens") or 0) for event in llm_ends),
-        "first_scheduler_prompt_tokens": int(scheduler_ends[0].get("prompt_tokens") or 0) if scheduler_ends else 0,
-        "scheduler_model_calls": len(scheduler_ends),
-        "first_graph_draft_call_index": first_create_index,
-        "invocation_failures": dict(sorted(failures.items())),
-        "observation_checkpoint_failures": dict(sorted(collections.Counter(
-            str(event.get("reason") or "unknown") for event in observation_control_failures
-        ).items())),
-        "delivery_workspace_cleanup_without_merge_count": len(delivery_cleanup_without_merge),
-        "recovery_retry_count": len(recovery_retry_receipts),
-        "recovery_first_action_gate_count": len(first_gates),
-        "known_incidents": known,
-        "model_contract_incidents": model_contract_incidents,
-    }, events
-
-
-def context_metrics(state_dir: Path) -> dict:
-    dispositions = collections.Counter()
-    policies = set()
-    snapshots = 0
-    for _, entry in iter_jsonl(str(state_dir / "context-snapshots" / "context-snapshots.jsonl")):
-        snapshot = (((entry.get("record") or {}).get("snapshot")) or {})
-        if not isinstance(snapshot, dict):
-            continue
-        snapshots += 1
-        if snapshot.get("context_policy_id"):
-            policies.add(snapshot["context_policy_id"])
-        for fragment in snapshot.get("fragments") or []:
-            if isinstance(fragment, dict):
-                dispositions[fragment.get("disposition", "unknown")] += 1
-    return {
-        "snapshots": snapshots,
-        "policies": sorted(policies),
-        "dispositions": dict(sorted(dispositions.items())),
-    }
-
-
-def run_budget_metrics(state_dir: Path, run_id: str) -> dict:
-    reservations = {}
-    settled_ids = set()
-    limit = {}
-    settled = collections.Counter()
-    phases = collections.defaultdict(collections.Counter)
-    present = False
-    for _, entry in iter_jsonl(str(state_dir / "run-budgets" / "run-budgets.jsonl")):
-        if entry.get("run_id") != run_id:
-            continue
-        present = True
-        kind = entry.get("kind")
-        if kind == "initialize":
-            limit = entry.get("limit") or {}
-        elif kind == "reserve" and isinstance(entry.get("reservation"), dict):
-            reservation = entry["reservation"]
-            reservations[str(reservation.get("reservation_id") or "")] = reservation
-        elif kind == "settle" and isinstance(entry.get("settlement"), dict):
-            value = entry["settlement"]
-            reservation_id = str(value.get("reservation_id") or "")
-            if reservation_id in settled_ids:
-                continue
-            settled_ids.add(reservation_id)
-            usage = value.get("usage") or {}
-            phase = str((reservations.get(reservation_id) or {}).get("phase") or "unknown")
-            for field in ("prompt_tokens", "completion_tokens", "model_calls", "tool_actions", "attempts", "cost_micros"):
-                amount = int(usage.get(field) or 0)
-                settled[field] += amount
-                phases[phase][field] += amount
-    active = {
-        reservation_id: value for reservation_id, value in reservations.items()
-        if reservation_id and reservation_id not in settled_ids
-    }
-    reserved = collections.Counter()
-    for reservation in active.values():
-        for field in ("prompt_tokens", "completion_tokens", "model_calls", "tool_actions", "attempts", "cost_micros"):
-            reserved[field] += int((reservation.get("max_charge") or {}).get(field) or 0)
-    return {
-        "present": present,
-        "limit": limit,
-        "settled": dict(settled),
-        "reserved": dict(reserved),
-        "active_reservations": len(active),
-        "phase_settled": {phase: dict(values) for phase, values in sorted(phases.items())},
-    }
-
-
-def loop_metrics(state_dir: Path, run_id: str) -> dict:
-    attempts = set()
-    interventions = 0
-    max_no_progress = 0
-    max_observation_stagnation = 0
-    sealed = 0
-    records = 0
-    for _, entry in iter_jsonl(str(state_dir / "loop" / "*.jsonl")):
-        candidates = [entry.get("checkpoint"), (entry.get("settlement") or {}).get("checkpoint")]
-        matched = False
-        for checkpoint in candidates:
-            if not isinstance(checkpoint, dict) or checkpoint.get("run_id") != run_id:
-                continue
-            matched = True
-            if checkpoint.get("attempt_id"):
-                attempts.add(checkpoint["attempt_id"])
-            max_no_progress = max(max_no_progress, int(checkpoint.get("no_progress_turns") or 0))
-            max_observation_stagnation = max(
-                max_observation_stagnation,
-                int(checkpoint.get("observation_stagnation_count") or 0),
-            )
-            interventions = max(interventions, int(checkpoint.get("intervention_count") or 0))
-            sealed += int(checkpoint.get("sealed") is True)
-        if matched:
-            records += 1
-    return {
-        "records": records,
-        "attempt_count": len(attempts),
-        "max_no_progress_turns": max_no_progress,
-        "max_observation_stagnation_count": max_observation_stagnation,
-        "max_intervention_count": interventions,
-        "sealed_checkpoint_records": sealed,
-    }
-
-
-def count_jsonl(path: Path) -> int:
-    try:
-        with path.open(encoding="utf-8") as handle:
-            return sum(1 for line in handle if line.strip())
-    except OSError:
-        return 0
-
-
-def terminal_task_scope(tasks: list[dict], graphs: list[dict]) -> list[dict]:
-    # Graph terminal 后，origin/final-report/intervention Scheduler 都是控制面
-    # 任务，不属于 Graph execution 的 TaskOutcome delivery barrier。只要求
-    # Graph activation tasks 终态；无 Graph 事故路径仍要求当前 Run 全部任务终态。
-    if graphs:
-        return [task for task in tasks if task.get("graph_id")]
-    return tasks
-
-
-def missing_loop_recovery_sources(outcomes: list[dict], recovered_source_task_ids: set[str],
-                                  recovery_controller_task_ids: set[str] | None = None) -> list[str]:
-    recovery_controller_task_ids = recovery_controller_task_ids or set()
-    missing = []
-    for outcome in outcomes:
-        if not outcome.get("graph_id") or outcome.get("reason_code") not in {
-            "loop_intervention_required", "no_progress_budget_exhausted", "observation_state_stalled",
-            "candidate_completion_handoff",
-        }:
-            continue
-        task_id = str(outcome.get("task_id") or "")
-        # loop_recovery controller 自身就是 L5 的有界裁决边界；它 no-progress
-        # 时沿 recovery-blocked end 收口并吸收 nested command，不递归创建恢复链。
-        if task_id in recovery_controller_task_ids:
-            continue
-        if task_id and task_id in recovered_source_task_ids:
-            continue
-        missing.append(
-            f"{outcome.get('graph_id')}/{outcome.get('activation_id') or 'unknown'}/{task_id or 'unknown'}"
-        )
-    return sorted(set(missing))
-
-
-def stalled_graph_change_coordinations(tasks: list[dict], outcomes: list[dict]) -> list[str]:
-    """识别 graph-change 控制任务因缺少可提交裁决而耗尽进展契约。"""
-    graph_change_ids = {
-        str(task.get("id") or "") for task in tasks
-        if task.get("event_source") == "graph-change-request" and task.get("id")
-    }
-    stalled_reasons = {
-        "progress_authority_failure", "decision_progress_stalled",
-        "no_progress_budget_exhausted", "invocation_deadline",
-    }
-    return sorted({
-        str(outcome.get("task_id") or "") for outcome in outcomes
-        if outcome.get("task_id") in graph_change_ids
-        and outcome.get("reason_code") in stalled_reasons
-    })
-
-
-def collect_result(snapshot_path: str, monitor_path: str, project_root: str, run_id: str,
-                   startup_probe_passed: bool) -> dict:
-    snapshot = read_json(snapshot_path, {})
-    monitor = read_json(monitor_path, {})
-    root = Path(project_root)
-    state_dir = root / ".agentgo" / "state"
-    tasks = [task for task in snapshot.get("tasks", []) if task.get("run_id") == run_id]
-    graphs = [graph for graph in snapshot.get("graphs", []) if graph.get("run_id") == run_id]
-    terminal_tasks = terminal_task_scope(tasks, graphs)
-    final_report_tasks = [task for task in tasks if task.get("final_report_graph_id")]
-    scheduler_ids = {task.get("id", "") for task in tasks if task.get("event_type") == "__scheduler__"}
-    outcomes, pending_ack = safe_outcomes(state_dir, run_id)
-    committed_refs = {outcome["outcome_ref"] for outcome in outcomes}
-    traces, _ = trace_metrics(root, run_id, scheduler_ids)
-    contexts = context_metrics(state_dir)
-    loops = loop_metrics(state_dir, run_id)
-    run_budget = run_budget_metrics(state_dir, run_id)
-    known = dict(traces["known_incidents"])
-    outcome_task_ids = {str(outcome.get("task_id")) for outcome in outcomes if outcome.get("task_id")}
-    recovery_controller_task_ids = {
-        str(task.get("id")) for task in tasks
-        if task.get("graph_controller_role") == "loop_recovery" and task.get("id")
-    }
-    recovered_source_task_ids = {
-        str(task.get("recovery_source_task_id")) for task in tasks
-        if task.get("graph_controller_role") == "loop_recovery"
-        and task.get("id") in outcome_task_ids and task.get("recovery_source_task_id")
-    }
-    missing_recovery = missing_loop_recovery_sources(
-        outcomes, recovered_source_task_ids, recovery_controller_task_ids,
-    )
-    known["loop_intervention_without_recovery"] = bool(missing_recovery)
-    graph_change_stalls = stalled_graph_change_coordinations(tasks, outcomes)
-    known["graph_change_coordination_stalled"] = bool(graph_change_stalls)
-    requires_run_budget = any(
-        str(((task.get("run_contract") or {}).get("budget_profile") or "")).endswith("/v3")
-        for task in tasks
-    )
-    known["run_budget_ledger_missing"] = requires_run_budget and not run_budget["present"]
-    known["run_budget_usage_mismatch"] = run_budget["present"] and (
-        int(run_budget["settled"].get("model_calls") or 0) != int(traces["model_calls"])
-    )
-    known["run_budget_reservation_leak"] = run_budget["present"] and int(run_budget["active_reservations"]) > 0
-    execution_usage = (run_budget.get("phase_settled") or {}).get("execution") or {}
-    known["run_budget_scope_reset"] = run_budget["present"] and any(
-        int((run_budget["limit"] or {}).get(field) or 0) > 0
-        and int(execution_usage.get(field) or 0) > int((run_budget["limit"] or {}).get(field) or 0)
-        for field in ("prompt_tokens", "completion_tokens", "model_calls", "tool_actions", "cost_micros")
-    )
-    known["control_checkpoint_unavailable"] = bool(known.get("control_checkpoint_unavailable")) or any(
-        value.get("reason_code") == "observation_checkpoint_failed" for value in outcomes
-    )
-    graph_outcomes = [graph.get("outcome", "") for graph in graphs]
-    graph_ids = {str(graph.get("graph_id") or "") for graph in graphs if graph.get("graph_id")}
-    authoring_events = count_jsonl(state_dir / "graph-authoring" / "authoring.jsonl")
-    if any(
-        value.get("task_id") in scheduler_ids and value.get("reason_code") == "progress_authority_failure"
-        and int(value.get("attempt_no") or 0) >= 3
-        for value in outcomes
-    ):
-        known["premature_attempt_exhaustion"] = True
-    if not graph_outcomes and any(
-        value.get("task_id") in scheduler_ids and value.get("status") == "completed"
-        for value in outcomes
-    ):
-        known["new_run_direct_answer"] = True
-    else:
-        known["new_run_direct_answer"] = False
-    # Authoring intervention 本身不是事故：成功 create/patch/validate 会形成
-    # accepted coordination fingerprint；只有后续重复/失败动作才累计 no-progress。
-    # 映射正确性由 durable assessment 与 Go contract test 钉住，不再用
-    # “有 authoring journal + 有 intervention”这一粗糙条件制造假阳性。
-    known["authoring_false_no_progress"] = False
-    known["mutating_completed_without_fulfillment"] = any(
-        value.get("graph_id") and value.get("node_id") == "work"
-        and value.get("status") == "completed" and not value.get("fulfillment_present")
-        for value in outcomes
-    )
-    # Recovery Controller 已选择 retry 后，下一业务 Activation 才发现 execution
-    # window 关闭，说明 L5 没有在 decision commit 前消费 L4 phase feasibility。
-    # 新实现应在 submit_recovery_decision 当场拒绝 retry 并允许改交 blocked；
-    # 若事故仍进入 Graph settlement，architecture gate 必须失败。
-    known["recovery_retry_activation_unstartable"] = any(
-        graph.get("status") == "failed" and any(
-            "RunContract phase=execution 的剩余时间窗已耗尽" in str(node.get("reason") or "")
-            or "recovery_retry_unstartable" in str(node.get("reason") or "")
-            for node in graph.get("nodes", []) if isinstance(node, dict)
-        )
-        for graph in graphs
-    )
-    architecture_checks = {
-        "startup_function_probe": startup_probe_passed,
-        "run_identity_visible": bool(monitor.get("run_identity_visible")),
-        "first_prompt_at_most_8000": 0 < traces["first_scheduler_prompt_tokens"] <= 8000,
-        "graph_draft_within_5_calls": 0 < traces["first_graph_draft_call_index"] <= 5,
-        "known_incidents_absent": not any(known.values()),
-        "external_hard_kill_absent": not bool(monitor.get("external_hard_kill")),
-        "graph_terminal": bool(monitor.get("graph_lifecycle_terminal")),
-        "graph_outcome_typed": bool(graph_outcomes) and all(
-            value in TERMINAL_OUTCOME for value in graph_outcomes
-        ),
-        "all_graph_tasks_terminal": bool(terminal_tasks) and all(
-            task.get("status") in TERMINAL_TASK for task in terminal_tasks
-        ),
-        "graph_task_outcomes_complete": bool(terminal_tasks) and all(
-            task.get("outcome_ref") in committed_refs for task in terminal_tasks
-        ),
-        "mutating_fulfillment_complete": not known["mutating_completed_without_fulfillment"],
-        "task_outcome_delivery_acked": bool(outcomes) and pending_ack == 0 and all(
-            outcome["delivery_acked"] for outcome in outcomes
-        ),
-        "final_report_present": bool(final_report_tasks),
-        "final_report_scope_bound": bool(final_report_tasks) and all(
-            task.get("final_report_graph_id") in graph_ids for task in final_report_tasks
-        ),
-        "final_report_terminal": bool(final_report_tasks) and all(
-            task.get("status") in TERMINAL_TASK for task in final_report_tasks
-        ),
-        "final_report_completed": bool(final_report_tasks) and all(
-            task.get("status") == "completed" for task in final_report_tasks
-        ),
-        "final_report_outcome_complete": bool(final_report_tasks) and all(
-            task.get("outcome_ref") in committed_refs for task in final_report_tasks
-        ),
-    }
-    infrastructure_conditions = {
-        "provider_quota_exhausted": int(
-            (traces.get("invocation_failures") or {}).get("provider_quota_exhausted") or 0
-        ),
-    }
-    model_contract_incidents = list(traces.get("model_contract_incidents") or [])
-    model_contract_checks = {
-        "observation_provider_request_compatible": not model_contract_incidents,
-    }
-    result = {
-        "schema": RESULT_SCHEMA,
-        "run_id": run_id,
-        "process_terminal": monitor.get("process_terminal", "unknown"),
-        "external_hard_kill": bool(monitor.get("external_hard_kill")),
-        "wall_sec": int(monitor.get("wall_sec") or 0),
-        "graph_lifecycle_terminal": bool(monitor.get("graph_lifecycle_terminal")),
-        "graph_statuses": [graph.get("status", "") for graph in graphs],
-        "graph_outcomes": graph_outcomes,
-        "task_statuses": [task.get("status", "") for task in tasks],
-        "final_report_statuses": [task.get("status", "") for task in final_report_tasks],
-        "task_outcomes": outcomes,
-        "pending_outcome_delivery_count": pending_ack,
-        "metrics": {
-            **traces,
-            "context": contexts,
-            "loop": loops,
-            "run_budget": run_budget,
-            "graph_authoring_events": authoring_events,
-            "graph_revisions": [int(graph.get("revision") or 0) for graph in graphs],
-            "graph_activations": sum(
-                1 for graph in graphs for node in graph.get("nodes", []) if node.get("activation_id")
-            ),
-            "effect_records": count_jsonl(state_dir / "effects.jsonl"),
-            "artifact_records": count_jsonl(state_dir / "artifacts.jsonl"),
-            "loop_recovery_missing_sources": missing_recovery,
-            "graph_change_stalled_task_ids": graph_change_stalls,
-        },
-        "known_incidents": known,
-        "infrastructure_conditions": infrastructure_conditions,
-        "infrastructure_ok": not any(infrastructure_conditions.values()),
-        "architecture_checks": architecture_checks,
-        "architecture_ok": all(architecture_checks.values()),
-        "model_contract_checks": model_contract_checks,
-        "model_contract_incidents": model_contract_incidents,
-        "model_contract_compatible": all(model_contract_checks.values()),
-    }
-    return result
-
-
 def finalize_result(result_path: str, judge_path: str) -> dict:
-    result = read_json(result_path, {})
-    judge = read_json(judge_path, {})
+    result = json.loads(Path(result_path).read_text(encoding="utf-8"))
+    judge = json.loads(Path(judge_path).read_text(encoding="utf-8"))
+    if (not isinstance(result, dict) or result.get("schema") != RESULT_SCHEMA
+            or not isinstance(judge, dict) or judge.get("schema") != "agentgo.swe-judge/v2"):
+        raise ValueError("最终结果拒绝旧版或缺失 schema")
+    if not result.get("run_id") or judge.get("run_id") != result["run_id"]:
+        raise ValueError("Judge 与 AgentGo 运行身份不一致")
     task_checks = {
         "judge_resolved": judge.get("verdict") == "resolved",
         "patch_present": int(judge.get("patch_lines") or 0) > 0,
         "tests_not_tampered": judge.get("tampered") is False,
-        "graph_success": bool(result.get("graph_outcomes")) and all(
-            value == "success" for value in result.get("graph_outcomes", [])
-        ),
+        "test_identity_recorded": bool(judge.get("test_execution_ref")) and bool(judge.get("test_input_digest")),
+        "graph_success": bool(result.get("graph_outcomes")) and all(value == "success" for value in result["graph_outcomes"]),
+        "execution_complete": result.get("execution_complete") is True,
+        "final_report_completed": bool(result.get("final_report_statuses")) and all(value == "completed" for value in result["final_report_statuses"]),
     }
     result["judge_verdict"] = judge.get("verdict", "unknown")
     result["patch_lines"] = int(judge.get("patch_lines") or 0)
@@ -1379,22 +762,32 @@ def summarize_runs(runs_dir: str, batch_start: float) -> list[dict]:
         judge_path = directory / "judge.json"
         if not result_path.exists() and not judge_path.exists():
             continue
-        result = read_json(result_path, {})
-        judge = read_json(judge_path, {})
-        stale = any(not path.exists() or path.stat().st_mtime < batch_start for path in (result_path, judge_path))
+        stale = any(path.exists() and path.stat().st_mtime < batch_start for path in (result_path, judge_path))
+        if stale:
+            continue
+        reader = EvidenceReader()
+        result, judge = reader.object(result_path), reader.object(judge_path)
+        if result.get("schema") != RESULT_SCHEMA:
+            reader.issue("result_schema_rejected", result_path)
+        if judge.get("schema") != "agentgo.swe-judge/v2":
+            reader.issue("judge_schema_rejected", judge_path)
+        if not result.get("run_id") or judge.get("run_id") != result.get("run_id"):
+            reader.issue("result_judge_identity_mismatch", directory)
+        evidence_issues = list(result.get("evidence_issues") or []) + reader.issues
         metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
         rows.append({
             "task": directory.name,
             "verdict": judge.get("verdict", "unknown"),
-            "architecture_ok": bool(result.get("architecture_ok")),
-            # v2/legacy result remains read-only compatible; absence is unknown,
-            # never backfilled as a synthetic pass.
+            "architecture_ok": result.get("architecture_ok"),
+            # 当前批次只消费新版结果，历史数据不补默认值。
             "model_contract_compatible": (
-                bool(result.get("model_contract_compatible"))
+                result.get("model_contract_compatible")
                 if result.get("schema") == RESULT_SCHEMA else None
             ),
             "task_resolved": bool(result.get("task_resolved")),
-            "infrastructure_ok": bool(result.get("infrastructure_ok", True)),
+            "infrastructure_ok": result.get("infrastructure_ok"),
+            "execution_complete": result.get("execution_complete"),
+            "evidence_issues": evidence_issues,
             "infrastructure_conditions": result.get("infrastructure_conditions") or {},
             "process_terminal": result.get("process_terminal", "unknown"),
             "graph_outcomes": result.get("graph_outcomes", []),
@@ -1636,7 +1029,26 @@ def load_pytest_report(path: Path) -> dict:
             raise RuntimeError(f"pytest 机器计数报告 phase_errors.{key} 非法: {path}")
     if sum(phase_errors.values()) != payload["errors"]:
         raise RuntimeError(f"pytest 机器计数报告 errors 与 phase_errors 不一致: {path}")
+    collected = payload.get("collected_nodeids")
+    failures = payload.get("failure_events")
+    if (not isinstance(collected, list) or len(collected) != payload["collected"]
+            or any(not isinstance(node, str) or not node for node in collected)):
+        raise RuntimeError("pytest 收集集合与计数不一致")
+    if not isinstance(failures, list):
+        raise RuntimeError("pytest 缺少失败集合")
+    by_phase = collections.Counter()
+    for event in failures:
+        if (not isinstance(event, dict) or set(event) != {"nodeid", "phase"}
+                or not isinstance(event["nodeid"], str) or not event["nodeid"]
+                or event["phase"] not in {"call", "collection", "setup", "teardown"}):
+            raise RuntimeError("pytest 失败集合条目非法")
+        by_phase[event["phase"]] += 1
+    if by_phase["call"] != payload["failed"] or any(by_phase[p] != n for p, n in phase_errors.items()):
+        raise RuntimeError("pytest 失败集合与阶段计数不一致")
     return {
+        "failure_events": failures,
+        "collected_nodeids": collected,
+        "execution_environment": payload.get("execution_environment"),
         "tests": payload["collected"],
         "collected": payload["collected"],
         "passed": payload["passed"],
@@ -1675,34 +1087,72 @@ def validate_junit(path: Path, report: dict) -> None:
 
 
 def run_pytest(worktree: Path, junit_path: Path, log_path: Path,
-               test_files: tuple[str, ...] = ()) -> dict:
+               test_files: tuple[str, ...] = (), *, task_id: str, run_id: str = "") -> dict:
+    validate_task_id(task_id)
+    worktree = worktree.resolve(strict=True)
     junit_path.parent.mkdir(parents=True, exist_ok=True)
     junit_path.unlink(missing_ok=True)
     report_path = pytest_sidecar_path(junit_path)
     report_path.unlink(missing_ok=True)
+    execution_path = report_path.with_suffix(".execution.json")
     environment = os.environ.copy()
     reporter_dir = str(Path(__file__).resolve().parent)
-    current_pythonpath = environment.get("PYTHONPATH", "")
-    environment["PYTHONPATH"] = reporter_dir + (os.pathsep + current_pythonpath if current_pythonpath else "")
+    environment["PYTHONPATH"] = os.pathsep.join((reporter_dir, str(worktree / "src"), str(worktree)))
     environment[PYTEST_REPORT_ENV] = str(report_path)
-    command = [
-        str(venv_python(worktree)), "-m", "pytest", *test_files, "-q",
-        "-p", PYTEST_REPORTER_MODULE, f"--junitxml={junit_path}",
-    ]
-    completed = run_command(command, cwd=worktree, check=False, env=environment)
-    output = completed.stdout + completed.stderr
-    log_path.write_bytes(output)
-    result = load_pytest_report(report_path)
-    validate_junit(junit_path, result)
-    if completed.returncode in {2, 3, 4}:
-        raise RuntimeError(f"pytest 基础设施失败 exit={completed.returncode}: {log_path}")
-    if completed.returncode == 0 and (result["failed"] or result["errors"]):
-        raise RuntimeError("pytest exit=0 与机器计数中的 failed/errors 冲突")
-    if completed.returncode == 1 and not (result["failed"] or result["errors"]):
-        raise RuntimeError("pytest exit=1 但机器计数没有 failed/errors")
-    result["exit_code"] = completed.returncode
-    result["summary_tail"] = output.decode("utf-8", errors="replace").splitlines()[-3:]
-    return result
+    # 正式测试范围不能被调用者进程中的 pytest 参数悄悄收窄。
+    environment.pop("PYTEST_ADDOPTS", None)
+    python = venv_python(worktree)
+    command = [str(python), "-m", "pytest", *test_path_arguments(test_files), "-q",
+               "-p", PYTEST_REPORTER_MODULE, f"--junitxml={junit_path}"]
+    head = run_command(["git", "rev-parse", "HEAD"], cwd=worktree).stdout.decode("ascii").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+        raise RuntimeError("被测工作树缺少合法 Git 基线身份")
+    record = {
+        "baseline_commit": head,
+        "schema": "agentgo.swe-test-execution/v1", "test_execution_id": str(uuid.uuid4()),
+        "task_id": task_id, "run_id": run_id, "stage": junit_path.name.removesuffix(".junit.xml"),
+        "argv": command, "cwd": str(worktree), "python": str(python),
+        "test_files": list(test_files), "started_at": format_time(utc_now()),
+        "input_before": input_identity(worktree), "status": "running",
+    }
+    atomic_json(execution_path, record)
+    try:
+        completed = run_command(command, cwd=worktree, check=False, env=environment)
+        output = completed.stdout + completed.stderr
+        log_path.write_bytes(output)
+        record["exit_code"] = completed.returncode
+        record["input_after"] = input_identity(worktree)
+        if record["input_before"] != record["input_after"]:
+            raise RuntimeError("正式测试期间被测源码、测试或配置发生变化，结果不能归属冻结输入")
+        result = load_pytest_report(report_path)
+        record["execution_environment"] = result["execution_environment"]
+        record["collected_nodeids"] = result["collected_nodeids"]
+        validate_import_origin(result["execution_environment"], worktree, python)
+        if result["execution_environment"].get("exit_code") != completed.returncode:
+            raise RuntimeError("pytest 进程与插件退出状态冲突")
+        validate_junit(junit_path, result)
+        if completed.returncode not in {0, 1} or result["collected"] == 0:
+            raise RuntimeError(f"pytest 未完成有效测试 exit={completed.returncode}: {log_path}")
+        if completed.returncode == 0 and (result["failed"] or result["errors"]):
+            raise RuntimeError("pytest exit=0 与机器计数中的 failed/errors 冲突")
+        if completed.returncode == 1 and not (result["failed"] or result["errors"]):
+            raise RuntimeError("pytest exit=1 但机器计数没有 failed/errors")
+        result["exit_code"] = completed.returncode
+        result["summary_tail"] = output.decode("utf-8", errors="replace").splitlines()[-3:]
+        result["test_execution_ref"] = str(execution_path)
+        result["test_input_digest"] = record["input_before"]["digest"]
+        record["status"] = "completed"
+        return result
+    except KeyboardInterrupt:
+        record["status"] = "interrupted"
+        raise
+    except Exception as error:
+        record["status"] = "invalid"
+        record["error"] = safe_diagnostic(error)
+        raise
+    finally:
+        record["finished_at"] = format_time(utc_now())
+        atomic_json(execution_path, record)
 
 
 def print_stage_header(task_id: str, index: int, total: int, title: str,
@@ -1758,6 +1208,7 @@ def prepare_task(config: SWETestRunnerConfig, task: TaskSpec) -> dict:
     red = run_pytest(
         worktree, run_dir / "targeted-baseline.junit.xml",
         run_dir / "targeted-baseline.pytest.log", task.test_files,
+          task_id=task.task_id,
     )
     if not print_pytest_stage_result(red, "red"):
         raise RuntimeError(f"未确认红状态，考题 {task.task_id} 准备失败")
@@ -1768,13 +1219,15 @@ def prepare_task(config: SWETestRunnerConfig, task: TaskSpec) -> dict:
     )
     baseline = run_pytest(
         worktree, run_dir / "baseline.junit.xml", run_dir / "baseline.pytest.log",
+               task_id=task.task_id,
     )
     if not print_pytest_stage_result(baseline, "red"):
         raise RuntimeError(f"全量基线未保持红态，考题 {task.task_id} 准备失败")
     report = {
         key: baseline[key] for key in (
             "tests", "collected", "passed", "failed", "errors", "skipped", "xfailed", "xpassed",
-            "phase_errors", "count_semantics", "exit_code",
+            "phase_errors", "count_semantics", "exit_code", "failure_events", "collected_nodeids",
+            "test_execution_ref", "test_input_digest",
         )
     }
     report["note"] = "base 红态基线（agent 运行前全量 pytest）"
@@ -1931,8 +1384,8 @@ def clean_run_outputs(run_dir: Path) -> None:
 
 
 def run_task(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> dict:
-    if timeout_sec < 240:
-        raise ValueError("timeout 必须至少 240 秒")
+    if timeout_sec <= 0:
+        raise ValueError("外部评测 timeout 必须为正数")
     if not os.environ.get("SWE_API_KEY"):
         raise RuntimeError("密钥环境变量 SWE_API_KEY 未设置")
     worktree = config.worktree(task.task_id)
@@ -1971,8 +1424,8 @@ def run_task(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> d
         try:
             wait_for_agentgo(process, base_url, log_path)
             contract = inject_request(
-                base_url, token, str(prompt), task.task_id, timeout_sec,
-                str(run_dir / "run_contract.json"), task.test_files,
+                base_url, token, str(prompt), task.task_id,
+                str(run_dir / "run_contract.json"),
                 str(run_dir / "targeted-baseline.pytest.log"),
             )
             print("执行状态：RunContract 注入成功 " + json.dumps({
@@ -1997,7 +1450,7 @@ def run_task(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> d
     run_id = contract.get("run_id")
     if not run_id:
         raise RuntimeError("AgentGo 运行未产生 run_id")
-    result = collect_result(
+    result = collect_runtime(
         str(run_dir / "snapshot.final.json"), str(run_dir / "monitor.json"),
         str(worktree), run_id, True,
     )
@@ -2036,6 +1489,8 @@ def judge_task(config: SWETestRunnerConfig, task: TaskSpec) -> dict:
     )
     pytest = run_pytest(
         worktree, run_dir / "judge.junit.xml", run_dir / "judge.pytest.log",
+        run_id=str(read_json(run_dir / "run_contract.json", {}).get("run_id") or ""),
+             task_id=task.task_id,
     )
     pytest_green = print_pytest_stage_result(pytest, "green")
     verdict = "resolved" if pytest_green else "failed"
@@ -2058,7 +1513,14 @@ def judge_task(config: SWETestRunnerConfig, task: TaskSpec) -> dict:
     (run_dir / "model.patch").write_bytes(patch)
     patch_lines = len(patch.splitlines())
     report = {
+        "schema": "agentgo.swe-judge/v2",
+        "task_id": task.task_id,
+        "run_id": str(read_json(run_dir / "run_contract.json", {}).get("run_id") or ""),
         "verdict": verdict,
+        "failure_events": pytest["failure_events"],
+        "collected_nodeids": pytest["collected_nodeids"],
+        "test_execution_ref": pytest["test_execution_ref"],
+        "test_input_digest": pytest["test_input_digest"],
         "tests": pytest["tests"],
         "collected": pytest["collected"],
         "passed": pytest["passed"],
@@ -2073,17 +1535,17 @@ def judge_task(config: SWETestRunnerConfig, task: TaskSpec) -> dict:
         "tampered": tampered,
     }
     baseline = read_json(run_dir / "baseline.json", {})
-    comparison_keys = ("tests", "passed", "failed", "errors", "skipped", "xfailed", "xpassed")
-    if all(key in baseline for key in comparison_keys):
-        report["baseline"] = {key: baseline[key] for key in comparison_keys}
-        if verdict == "failed":
-            if all(report[key] == baseline[key] for key in comparison_keys):
-                report["red_note"] = "红态与基线完全一致：补丁未造成新增破坏（但也未修复）"
-            elif report["tests"] < baseline["tests"] or (
-                    report["failed"] + report["errors"] > baseline["failed"] + baseline["errors"]):
-                report["red_note"] = "红态重于基线：补丁引入了新增破坏"
-            else:
-                report["red_note"] = "红态轻于基线：部分修复但未全绿"
+    comparison = compare_failures(baseline, pytest)
+    report["baseline_comparison"] = comparison
+    if verdict == "failed":
+        if not comparison["same_collection"]:
+            report["red_note"] = "测试收集集合发生变化，需要核对范围，不能按总数判断新增破坏"
+        elif comparison["added_failures"]:
+            report["red_note"] = "发现基线中没有的失败测试项或失败阶段"
+        elif comparison["removed_failures"]:
+            report["red_note"] = "部分原有失败消失，仍未全绿"
+        else:
+            report["red_note"] = "本次收集集合与已记录失败项相同；不证明不存在其它破坏"
     atomic_json(run_dir / "judge.json", report)
     print(
         f"阶段结论：最终 Judge verdict={report['verdict']} patch_lines={report['patch_lines']} "
@@ -2094,12 +1556,16 @@ def judge_task(config: SWETestRunnerConfig, task: TaskSpec) -> dict:
 
 
 def final_exit_code(result: dict) -> int:
-    if not result.get("model_contract_compatible", True):
+    if result.get("schema") != RESULT_SCHEMA or result.get("infrastructure_ok") is not True or result.get("evidence_issues"):
+        return EXIT_SWE_TEST_RUNNER_FAILURE
+    if result.get("model_contract_compatible") is not True:
         return EXIT_MODEL_CONTRACT_FAILURE
-    if not result.get("architecture_ok"):
+    if result.get("architecture_ok") is False:
         return EXIT_ARCHITECTURE_FAILURE
-    if not result.get("task_resolved"):
+    if result.get("execution_complete") is not True or result.get("task_resolved") is not True:
         return EXIT_TASK_FAILURE
+    if result.get("architecture_ok") is not True:
+        return EXIT_SWE_TEST_RUNNER_FAILURE
     return 0
 
 
@@ -2112,16 +1578,24 @@ def batch_exit_code(rows: list[dict], expected_count: int) -> int:
     if any(row.get("run_state", "completed") in {"completed", "completed_with_infrastructure_error"} and
            row.get("model_contract_compatible") is False for row in rows):
         return EXIT_MODEL_CONTRACT_FAILURE
+    if any(row.get("run_state", "completed") in {"completed", "completed_with_infrastructure_error"}
+           and (row.get("model_contract_compatible") is None or row.get("infrastructure_ok") is not True)
+           for row in rows):
+        return EXIT_SWE_TEST_RUNNER_FAILURE
+    if any(row.get("evidence_issues") for row in rows):
+        return EXIT_SWE_TEST_RUNNER_FAILURE
     if any(row.get("run_state", "completed") in {"completed", "completed_with_infrastructure_error"} and
-           not row.get("architecture_ok") for row in rows):
+           row.get("architecture_ok") is False for row in rows):
         return EXIT_ARCHITECTURE_FAILURE
     if any(row.get("run_state") == "not_run" for row in rows):
         return EXIT_SWE_TEST_RUNNER_FAILURE
     if any(row.get("stale") for row in rows):
         return EXIT_SWE_TEST_RUNNER_FAILURE
     if any(row.get("run_state", "completed") in {"completed", "completed_with_infrastructure_error"} and
-           not row.get("task_resolved") for row in rows):
+           (row.get("task_resolved") is not True or row.get("execution_complete") is not True) for row in rows):
         return EXIT_TASK_FAILURE
+    if any(row.get("architecture_ok") is not True for row in rows):
+        return EXIT_SWE_TEST_RUNNER_FAILURE
     return 0
 
 
@@ -2231,8 +1705,7 @@ def require_api_key() -> str:
     return value
 
 
-def preflight_probe(config: SWETestRunnerConfig, timeout_sec: int = 45,
-                    *, observation_configured: bool = True) -> None:
+def preflight_probe(config: SWETestRunnerConfig, timeout_sec: int = 45) -> None:
     print("\n[前置检查][Provider typed function-call 能力探针]")
     print("判定目标：返回工具名、call_id 与 nonce 参数均正确的 typed function call")
     api_key = require_api_key()
@@ -2249,70 +1722,6 @@ def preflight_probe(config: SWETestRunnerConfig, timeout_sec: int = 45,
             f"检查结果：typed function-call 活探针通过；provider={config.base_url.rstrip('/')} "
             f"protocol={config.protocol} model={model} capabilities={capability_text}"
         )
-    if observation_configured and getattr(config, "agentgo_bin", None):
-        preflight_observation_probe(config)
-
-
-def preflight_observation_probe(config: SWETestRunnerConfig) -> list[dict]:
-    """Probe only Observation models actually present in the rendered YAML."""
-    with tempfile.TemporaryDirectory(prefix="agentgo-observation-probe-") as temp_dir:
-        probe_dir = Path(temp_dir)
-        setting = render_setting(config, config.flask_repo, probe_dir, 1, "probe-token")
-        reports = []
-        for fixture in ("empty", "populated"):
-            completed = subprocess.run([
-                str(config.agentgo_bin), "probe", "observation", "-config", str(setting),
-                "--configured", "--profile", "v12", "--fixture", fixture,
-                "--attempts", "3", "--json",
-            ], cwd=str(config.agentgo_root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-               timeout=180, check=False)
-            text = completed.stdout.decode("utf-8", errors="replace").strip()
-            try:
-                payload = json.loads(text)
-            except json.JSONDecodeError as error:
-                raise SWETestRunnerModelContractError(
-                    f"Observation probe {fixture} 未返回合法脱敏 JSON") from error
-            if not isinstance(payload, list):
-                payload = [payload]
-            reports.extend(payload)
-            if completed.returncode != 0 or any(
-                    int(item.get("successes") or 0) != int(item.get("attempts") or 0)
-                    for item in payload if isinstance(item, dict)):
-                summary = [{
-                    "model": item.get("model"), "profile": item.get("profile"),
-                    "fixture": item.get("fixture"), "successes": item.get("successes"),
-                    "attempts": item.get("attempts"), "failures": item.get("failures", []),
-                } for item in payload if isinstance(item, dict)]
-                raise SWETestRunnerModelContractError(
-                    "Observation 模型契约不兼容: " + json.dumps(summary, ensure_ascii=False))
-        return reports
-
-
-def full_observation_probe_matrix(config: SWETestRunnerConfig) -> list[dict]:
-    with tempfile.TemporaryDirectory(prefix="agentgo-observation-matrix-") as temp_dir:
-        probe_dir = Path(temp_dir)
-        setting = render_setting(config, config.flask_repo, probe_dir, 1, "probe-token")
-        reports = []
-        for model, _capabilities in config.probe_models():
-            for profile in ("v7", "v8", "v9", "v10", "v11", "v12"):
-                for fixture in ("empty", "populated"):
-                    completed = subprocess.run([
-                        str(config.agentgo_bin), "probe", "observation", "-config", str(setting),
-                        "--model", model, "--profile", profile, "--fixture", fixture,
-                        "--attempts", "3", "--json",
-                    ], cwd=str(config.agentgo_root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                       timeout=180, check=False)
-                    try:
-                        payload = json.loads(completed.stdout.decode("utf-8", errors="replace"))
-                    except json.JSONDecodeError as error:
-                        raise SWETestRunnerModelContractError(
-                            f"Observation matrix {profile}/{fixture} 未返回合法 JSON") from error
-                    if isinstance(payload, list):
-                        reports.extend(payload)
-                    else:
-                        reports.append(payload)
-                    print("Observation matrix: " + json.dumps(payload, ensure_ascii=False))
-        return reports
 
 
 def verify_candidates(config: SWETestRunnerConfig) -> dict[str, int]:
@@ -2335,6 +1744,7 @@ def verify_candidates(config: SWETestRunnerConfig) -> dict[str, int]:
             )
             clean = run_pytest(
                 worktree, run_dir / "clean.junit.xml", run_dir / "clean.pytest.log",
+                        task_id=task.task_id,
             )
             clean_ok = print_pytest_stage_result(clean, "green")
             if not clean_ok:
@@ -2349,6 +1759,7 @@ def verify_candidates(config: SWETestRunnerConfig) -> dict[str, int]:
                 )
                 red = run_pytest(
                     worktree, run_dir / "red.junit.xml", run_dir / "red.pytest.log", task.test_files,
+                          task_id=task.task_id,
                 )
                 red_ok = print_pytest_stage_result(red, "red")
                 if not red_ok:
@@ -2363,6 +1774,7 @@ def verify_candidates(config: SWETestRunnerConfig) -> dict[str, int]:
                     )
                     green = run_pytest(
                         worktree, run_dir / "green.junit.xml", run_dir / "green.pytest.log",
+                                task_id=task.task_id,
                     )
                     green_ok = print_pytest_stage_result(green, "green")
                     if not green_ok:
@@ -2388,10 +1800,8 @@ def verify_candidates(config: SWETestRunnerConfig) -> dict[str, int]:
 def command_probe(args: argparse.Namespace) -> int:
     configure_console_utf8()
     config = SWETestRunnerConfig.from_env()
-    preflight_probe(config, args.timeout, observation_configured=False)
-    reports = full_observation_probe_matrix(config)
-    return 0 if all(int(item.get("successes") or 0) == int(item.get("attempts") or 0)
-                    for item in reports) else EXIT_MODEL_CONTRACT_FAILURE
+    preflight_probe(config, args.timeout)
+    return 0
 
 
 def command_task(args: argparse.Namespace) -> int:
@@ -2464,14 +1874,18 @@ def command_batch(args: argparse.Namespace) -> int:
                     tasks, runs_dir, batch_start, infrastructure_error, stop_reason,
                 )
                 break
-            if not result.get("model_contract_compatible", True):
+            if result.get("evidence_issues"):
+                stop_reason = "previous_execution_evidence_incomplete"
+                rows = persist_batch_summary(tasks, runs_dir, batch_start, infrastructure_error, stop_reason)
+                break
+            if result.get("model_contract_compatible") is False:
                 stop_reason = "previous_model_contract_gate"
                 print(f"模型契约门失败，停止批次: {task.task_id}", file=os.sys.stderr)
                 rows = persist_batch_summary(
                     tasks, runs_dir, batch_start, infrastructure_error, stop_reason,
                 )
                 break
-            if not result.get("architecture_ok"):
+            if result.get("architecture_ok") is False:
                 stop_reason = "previous_architecture_gate"
                 print(f"架构门失败，停止批次: {task.task_id}", file=os.sys.stderr)
                 rows = persist_batch_summary(

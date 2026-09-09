@@ -1,14 +1,12 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
+	"sort"
 	"strings"
 
 	"agentgo/internal/agent"
@@ -16,12 +14,10 @@ import (
 	"agentgo/internal/model"
 	"agentgo/internal/policycatalog"
 	"agentgo/internal/store"
-
-	"github.com/google/uuid"
 )
 
-// GraphAuthoringGroup 是新 root Scheduler 的事务化 L5 工具面。所有结构参数
-// 都是原生 object/array；handler 禁止接受 graph/patch JSON string。
+// GraphAuthoringGroup 提供图定义读取、原子应用和生命周期三个入口。
+// request_replan 属于节点结果/请求通道；草案仅存在于内部持久化事务。
 type GraphAuthoringGroup struct {
 	Store          *graph.AuthoringStore
 	Compiler       graph.DefinitionCompiler
@@ -33,1259 +29,459 @@ type GraphAuthoringGroup struct {
 	Finalization   FinalizationNotifier
 }
 
-type graphDraftNodeInput struct {
-	ID string `json:"id"`
-	graph.GraphDefinitionNode
+type graphDefinitionInput struct {
+	Root  string                               `json:"root"`
+	Nodes map[string]graph.GraphDefinitionNode `json:"nodes"`
 }
 
-type createGraphDraftArgs struct{}
-
-type configureSimpleGraphDraftArgs struct {
-	ExecutionClass graph.ExecutionClass `json:"execution_class"`
-}
-
-type patchGraphDraftArgs struct {
-	ProposalID        string                `json:"proposal_id"`
-	BaseDraftRevision int64                 `json:"base_draft_revision"`
-	UpsertNodes       []graphDraftNodeInput `json:"upsert_nodes,omitempty"`
-	RemoveNodes       []string              `json:"remove_nodes,omitempty"`
-	Root              *string               `json:"root,omitempty"`
-	Contract          *graph.GraphContract  `json:"contract,omitempty"`
-}
-
-type readGraphDraftArgs struct {
-	ProposalID string `json:"proposal_id"`
-}
-
-type validateGraphDraftArgs struct {
-	ProposalID            string `json:"proposal_id"`
-	ExpectedDraftRevision int64  `json:"expected_draft_revision"`
-}
-
-type commitGraphDraftArgs struct {
-	ProposalID            string `json:"proposal_id"`
-	ExpectedDraftRevision int64  `json:"expected_draft_revision"`
-	ValidationReportID    string `json:"validation_report_id"`
-}
-
-type startGraphArgs struct {
-	GraphID                    string `json:"graph_id"`
-	ExpectedDefinitionRevision int64  `json:"expected_definition_revision"`
-	ExpectedDefinitionDigest   string `json:"expected_definition_digest"`
-	ExpectedContractDigest     string `json:"expected_contract_digest"`
-}
-
-type proposeGraphChangeArgs struct {
-	GraphID                string                `json:"graph_id"`
-	BaseDefinitionRevision int64                 `json:"base_definition_revision"`
-	BaseDefinitionDigest   string                `json:"base_definition_digest"`
-	Reason                 string                `json:"reason"`
-	UpsertNodes            []graphDraftNodeInput `json:"upsert_nodes,omitempty"`
-	RemoveNodes            []string              `json:"remove_nodes,omitempty"`
-}
-
-type graphChangeArgs struct {
-	ChangeID string `json:"change_id"`
-}
-
-type validateGraphChangeArgs struct {
-	ChangeID                 string `json:"change_id"`
-	ExpectedProposalRevision int64  `json:"expected_proposal_revision"`
-}
-
-type commitGraphChangeArgs struct {
-	ChangeID                 string `json:"change_id"`
-	ExpectedProposalRevision int64  `json:"expected_proposal_revision"`
-	ValidationReportID       string `json:"validation_report_id"`
-}
-
-type submitGraphChangeDecisionArgs struct {
-	Decision string `json:"decision"`
-	Summary  string `json:"summary"`
+type applyGraphArgs struct {
+	Operation        string                      `json:"operation"`
+	RequestID        string                      `json:"request_id"`
+	GraphID          string                      `json:"graph_id,omitempty"`
+	ExpectedRevision int64                       `json:"expected_revision,omitempty"`
+	Definition       *graphDefinitionInput       `json:"definition,omitempty"`
+	Contract         *graph.GraphContract        `json:"contract,omitempty"`
+	Changes          *graph.GraphDefinitionPatch `json:"changes,omitempty"`
+	Reason           string                      `json:"reason,omitempty"`
+	InFlight         string                      `json:"in_flight,omitempty"`
 }
 
 func (g GraphAuthoringGroup) Register(r *agent.ToolRegistry) {
-	r.Register("create_graph_draft",
-		"创建不可执行的空 GraphDraft。零参数调用；framework 生成稳定 proposal_id/graph_id 并绑定原始 request。简单任务下一步使用 configure_simple_graph_draft；复杂拓扑才使用通用 patch_graph_draft。",
-		graphDraftCreateSchema(), g.createDraft)
-	r.Register("configure_simple_graph_draft",
-		"把当前空 Draft 原子配置为 framework-owned 的单任务+独立 acceptance+typed ends 合法图。模型只声明 answer/read_only/mutating execution_class；节点身份、请求正文、policy refs、输出/终态/contract bindings 均由 framework 机械生成。",
-		simpleGraphDraftSchema(), g.configureSimpleDraft)
-	r.Register("patch_graph_draft",
-		"以 base_draft_revision CAS 对 Draft 做小型原生 patch；可 upsert/remove 节点、修改 root/contract，永不启动半成品。",
-		graphDraftPatchSchema(), g.patchDraft)
-	r.Register("read_graph_draft",
-		"读取当前 GraphDraft 权威快照与 draft_revision。validate/commit/patch 前必须重新读取，禁止猜 revision。",
-		nativeObject(map[string]any{"proposal_id": nativeString("Draft proposal ID")}, "proposal_id"), g.readDraft)
-	r.Register("validate_graph_draft",
-		"由框架 DefinitionCompiler 校验最小合法图、GraphContract、policy refs 与独立 Proposal Acceptance；只产生 ValidationReport，不执行。",
+	r.Register("read_graph_definition", "读取正式图定义及实际 revision；运行事实使用检视工具。分页绑定同一 revision。",
+		nativeObject(map[string]any{"graph_id": nativeString("图 ID"), "revision": nativeInteger("指定版本；省略读取最新"), "node_id": nativeString("只读取指定节点"), "offset": nativeInteger("节点分页起点，默认0"), "limit": nativeInteger("每页节点数，默认32，最多128")}, "graph_id"), g.readGraphDefinition)
+	r.Register("apply_graph_change", "创建图或对现有图应用结构变更，内部完成校验和提交。create 输入 definition 与 contract；update 输入 graph_id、expected_revision、changes、reason 和 in_flight=preserve。preserve 保留在途执行的冻结定义，变更影响未来执行。非法变更返回原因，不修改正式图。相同 request_id 只能对应同一内容。创建后通过 control_graph 启动；运行图更新后继续调度。",
 		nativeObject(map[string]any{
-			"proposal_id":             nativeString("Draft proposal ID"),
-			"expected_draft_revision": nativeInteger("当前 Draft revision"),
-		}, "proposal_id", "expected_draft_revision"), g.validateDraft)
-	r.Register("validate_current_graph_draft",
-		"校验当前 task/session 绑定的 GraphDraft。零参数调用；framework 从 durable transaction cursor 解析 proposal_id 与 revision，模型不得搬运或猜测事务身份。",
-		graphDraftCreateSchema(), g.validateCurrentDraft)
-	r.Register("commit_graph_draft",
-		"消费当前 revision 的 accepted ValidationReport，原子提交 immutable GraphDefinition；commit 不启动 Graph、不 finalizing。",
-		nativeObject(map[string]any{
-			"proposal_id":             nativeString("Draft proposal ID"),
-			"expected_draft_revision": nativeInteger("当前 Draft revision"),
-			"validation_report_id":    nativeString("validate_graph_draft 返回的 report_id"),
-		}, "proposal_id", "expected_draft_revision", "validation_report_id"), g.commitDraft)
-	r.Register("commit_current_graph_draft",
-		"提交当前 task/session GraphDraft 最近的 accepted ValidationReport。零参数调用；framework 机械核对 proposal/revision/report/digest，commit 不启动 Graph。",
-		graphDraftCreateSchema(), g.commitCurrentDraft)
-	r.Register("start_graph",
-		"显式启动已 commit 的 immutable GraphDefinition。必须同时核对 revision、definition digest 与 contract digest；只有启动成功后 origin Scheduler 才 finalizing。",
-		nativeObject(map[string]any{
-			"graph_id":                     nativeString("Graph ID"),
-			"expected_definition_revision": nativeInteger("Definition revision"),
-			"expected_definition_digest":   nativeString("Definition digest"),
-			"expected_contract_digest":     nativeString("GraphContract digest"),
-		}, "graph_id", "expected_definition_revision", "expected_definition_digest", "expected_contract_digest"), g.startGraph)
-	r.Register("start_current_graph",
-		"显式启动当前 task/session 刚提交的 immutable GraphDefinition。零参数调用；framework 解析 revision/digests 并使用稳定 StartIntent，启动成功后才 finalizing。",
-		graphDraftCreateSchema(), g.startCurrentGraph)
-	r.Register("propose_graph_change",
-		"为运行中 Graph 创建原生结构 GraphChangeProposal；proposal 本身不修改 Runtime，root 变更禁止。",
-		graphChangeProposalSchema(), g.proposeGraphChange)
-	r.Register("read_graph_change",
-		"读取 GraphChangeProposal 权威 proposal_revision、patch 与校验状态。",
-		nativeObject(map[string]any{"change_id": nativeString("GraphChangeProposal ID")}, "change_id"), g.readGraphChange)
-	r.Register("validate_graph_change",
-		"把 patch 应用于 immutable base Definition 后执行完整 Compiler/route/Proposal Acceptance，不修改 Runtime。",
-		nativeObject(map[string]any{
-			"change_id":                  nativeString("GraphChangeProposal ID"),
-			"expected_proposal_revision": nativeInteger("Proposal CAS revision"),
-		}, "change_id", "expected_proposal_revision"), g.validateGraphChange)
-	r.Register("commit_graph_change",
-		"消费 accepted change ValidationReport，原子提交新 Definition revision，并让其只供未来 Activation 使用；非图 graph-change coordination 成功后同时收口当前请求。",
-		nativeObject(map[string]any{
-			"change_id":                  nativeString("GraphChangeProposal ID"),
-			"expected_proposal_revision": nativeInteger("Proposal CAS revision"),
-			"validation_report_id":       nativeString("accepted report ID"),
-		}, "change_id", "expected_proposal_revision", "validation_report_id"), g.commitGraphChange)
-	r.Register("submit_graph_change_decision",
-		"在已读取冻结 Graph 后结构化提交“不修改 Definition”的 graph-change 裁决并收口当前 coordination task；仅 graph-change-request Scheduler task 可用。",
-		nativeObject(map[string]any{
-			"decision": map[string]any{"type": "string", "enum": []any{"no_change"}},
-			"summary":  nativeString("为何当前 Definition 无需或无法通过修改获得有效增量；不得包含自由 Graph JSON"),
-		}, "decision", "summary"), g.submitGraphChangeDecision)
+			"operation":  map[string]any{"type": "string", "enum": []string{"create", "update"}},
+			"request_id": nativeString("本次逻辑请求的稳定标识，重试复用，改变内容则使用新标识"),
+			"graph_id":   nativeString("update 的目标图"), "expected_revision": nativeInteger("修改依据的图版本"),
+			"definition": nativeObject(map[string]any{"root": nativeString("起始节点"), "nodes": map[string]any{"type": "object", "additionalProperties": graphNodeNativeSchema(false)}}, "root", "nodes"),
+			"contract":   graphContractNativeSchema(),
+			"changes":    nativeObject(map[string]any{"upsert_nodes": nativeArray(graphNodeNativeSchema(true)), "remove_nodes": nativeArray(nativeString("删除未执行节点")), "root": nativeString("新起点；运行图不允许更换")}),
+			"reason":     nativeString("变更原因"), "in_flight": map[string]any{"type": "string", "enum": []string{"preserve"}},
+		}, "operation", "request_id"), g.applyGraphChange)
+	r.Register("control_graph", "启动或取消已提交图；取消回执与所有在途任务的结算分别通过检视核对。重复启动不产生第二次执行。",
+		nativeObject(map[string]any{"graph_id": nativeString("图 ID"), "action": map[string]any{"type": "string", "enum": []string{"start", "cancel"}}, "expected_revision": nativeInteger("所依据的图版本"), "reason": nativeString("取消原因")}, "graph_id", "action", "expected_revision"), g.controlGraph)
 }
 
-func (g GraphAuthoringGroup) createDraft(_ context.Context, args map[string]any) (string, error) {
-	task, err := g.currentRootSchedulerTask("create_graph_draft")
-	if err != nil {
-		return "", err
+func (g GraphAuthoringGroup) actor(write bool) (*model.Task, error) {
+	if g.TaskStore == nil || g.Holder == nil {
+		return nil, fmt.Errorf("图工具缺少任务身份")
+	}
+	t, err := g.TaskStore.GetTask(g.Holder.Get())
+	if err != nil || t == nil {
+		return nil, fmt.Errorf("无法读取调用任务: %v", err)
+	}
+	if t.Status != model.TaskStatusProcessing {
+		return nil, fmt.Errorf("图工具只能由 processing 任务调用")
+	}
+	if write && (t.EventType != "__scheduler__" || t.FinalReportGraphID != "") {
+		return nil, fmt.Errorf("当前任务没有图编排权限")
+	}
+	if write && t.GraphID != "" && t.GraphNodeKind != string(graph.KindController) {
+		return nil, fmt.Errorf("图内只有 controller 可以直接编排，业务 Agent 使用 request_replan")
 	}
 	if g.Store == nil {
-		return "", fmt.Errorf("create_graph_draft 不可用：AuthoringStore 未注入")
+		return nil, fmt.Errorf("图定义存储未注入")
 	}
-	var input createGraphDraftArgs
-	if err := decodeNativeGraphArgs(args, &input); err != nil {
-		return "", fmt.Errorf("create_graph_draft 参数非法: %w", err)
-	}
-	requestTask, err := g.authoringRequestTask(task)
-	if err != nil {
-		return "", err
-	}
-	requestDigest := schedulerRequestDigest(requestTask)
-	contract := graph.GraphContract{RequestRef: requestTask.ID, RequestDigest: requestDigest}
-	body := graph.GraphDefinitionBody{Schema: graph.SchemaV3, Nodes: map[string]graph.GraphDefinitionNode{}}
-	body.RunID = task.RunID
-	if task.RunContract != nil {
-		run := *task.RunContract
-		body.RunContract = &run
-	}
-	proposalID := "graph-proposal-" + task.ID
-	graphID := "graph-" + task.ID
-	if existing, ok := g.Store.GetDraft(proposalID); ok {
-		if existing.OwnerTaskID != task.ID || existing.GraphID != graphID ||
-			existing.RequestRef != requestTask.ID || existing.RequestDigest != requestDigest ||
-			existing.SessionID != g.currentSessionID() {
-			return "", fmt.Errorf("deterministic Draft %s 已被不一致事实占用", proposalID)
-		}
-		return marshalGraphAuthoringResult(existing)
-	}
-	draft, err := g.Store.CreateDraft(graph.GraphDraft{
-		ProposalID: proposalID, GraphID: graphID,
-		SessionID: g.currentSessionID(), OwnerTaskID: task.ID,
-		RequestRef: requestTask.ID, RequestDigest: requestDigest,
-		Contract: contract, Candidate: body,
-	})
-	if err != nil {
-		return "", err
-	}
-	return marshalGraphAuthoringResult(draft)
+	return t, nil
 }
 
-func (g GraphAuthoringGroup) configureSimpleDraft(_ context.Context, args map[string]any) (string, error) {
-	task, err := g.currentRootSchedulerTask("configure_simple_graph_draft")
-	if err != nil {
-		return "", err
+func (g GraphAuthoringGroup) sessionID() string {
+	if g.SessionID != nil {
+		return g.SessionID()
 	}
-	var input configureSimpleGraphDraftArgs
-	if err := decodeNativeGraphArgs(args, &input); err != nil {
-		return "", fmt.Errorf("configure_simple_graph_draft 参数非法: %w", err)
+	return ""
+}
+
+func (g GraphAuthoringGroup) authorize(t *model.Task, d *graph.GraphDefinition) error {
+	if d.SessionID != g.sessionID() {
+		return fmt.Errorf("目标图不属于当前 Session")
 	}
-	input.ExecutionClass = graph.ExecutionClass(strings.TrimSpace(string(input.ExecutionClass)))
-	if input.ExecutionClass != graph.ExecutionAnswer && input.ExecutionClass != graph.ExecutionReadOnly &&
-		input.ExecutionClass != graph.ExecutionMutating {
-		return "", fmt.Errorf("execution_class=%q 不适用于 simple task graph（仅允许 answer/read_only/mutating）", input.ExecutionClass)
-	}
-	requestTask, err := g.authoringRequestTask(task)
-	if err != nil {
-		return "", err
-	}
-	draft, err := g.ownedDraft(task, "graph-proposal-"+task.ID)
-	if err != nil {
-		return "", err
-	}
-	if len(draft.Candidate.Nodes) != 0 || strings.TrimSpace(draft.Candidate.Root) != "" {
-		simple, simpleOK := draft.Candidate.Nodes["work"]
-		template := simple.Metadata["authoring_template"]
-		if simpleOK && (template == "simple-task/v1" || template == "simple-task/v2" || template == "simple-task/v3" || template == "simple-task/v4") {
-			if draft.Contract.ExecutionClass == input.ExecutionClass {
-				return marshalGraphAuthoringResult(draft)
-			}
-		} else {
-			return "", fmt.Errorf("Draft %s 已含自定义拓扑，configure_simple_graph_draft 不得覆盖", draft.ProposalID)
+	for _, bound := range []string{t.GraphID, t.InterventionGraphID, t.FinalReportGraphID} {
+		if bound != "" && bound != d.GraphID {
+			return fmt.Errorf("目标图超出当前任务作用域")
 		}
 	}
-	objective := strings.TrimSpace(requestTask.Description)
-	if objective == "" {
-		return "", fmt.Errorf("原始 request objective 为空，无法生成 simple task graph")
-	}
-
-	contract := graph.GraphContract{
-		RequestRef: draft.RequestRef, RequestDigest: draft.RequestDigest,
-		ExecutionClass: input.ExecutionClass,
-		Deliverables: []graph.ContractRequirement{{
-			ID: "primary-deliverable", Kind: "request-result", Description: "完成原始用户请求",
-		}},
-		RequiresAcceptance: true,
-	}
-	workBindings := graph.GraphContractBindings{Deliverables: []string{"primary-deliverable"}}
-	workProgress := policycatalog.ProgressInvestigationCurrent
-	workTools := []string{"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref"}
-	recoverySchema := graph.RecoveryDeltaSchemaV2
-	authoringTemplate := "simple-task/v1"
-	recoveryDescription := "读取 failure_context 中冻结的 TaskOutcome、reason_code、checkpoint、ObservationDelta、工作记录与证据，裁决当前 Graph 是否应创建新的 work Activation。若现有 Definition 需要改变，只能先走 GraphChangeProposal 的 propose→validate→commit 事务；不得修改已终态的旧 Activation，不得亲自执行业务工作。最终必须调用 submit_recovery_decision：retry 声明 changed_dimensions、strategy、类型化 first_action、expected_milestone，source 字段由 framework 自动绑定；blocked 必须说明 blocked_reason。没有可验证变化只能 blocked。"
-	if input.ExecutionClass == graph.ExecutionMutating {
-		contract.RequiredEffects = []string{"workspace-change"}
-		contract.RequiredChecks = []graph.ContractRequirement{{ID: "verification", Kind: "verification", Description: "最后一次代码改动后的 typed check 通过"}}
-		workBindings.Effects = []string{"workspace-change"}
-		workBindings.Checks = []string{"verification"}
-		workProgress = policycatalog.ProgressCodeChangeCurrent
-		workTools = append(workTools, "write_file", "edit_file", "run_check")
-		recoverySchema = graph.RecoveryDeltaSchemaV5
-		authoringTemplate = "simple-task/v4"
-		recoveryDescription += " 本节点使用 RecoveryDelta v5：Runtime 把失败 Activation 的 Delivery、成功 mutation 路径与最新 typed check 冻结为 candidate_state；first_action 只建立一个 bounded focus page。Worker 随后必须 typed 选择 edit、resume_candidate、带 path/offset/limit 的 need_context、hypothesis_rejected 或 blocked；need_context 应跳到上游 evidence_ranges 指向的相关页，禁止为完整覆盖顺序翻遍文件。resume_candidate 只对非空 dirty candidate 开放，并仍须执行冻结 CheckContract。"
-	}
-
-	completed := graph.EventCompleted
-	failed := graph.EventFailed
-	blocked := graph.EventBlocked
-	candidate, err := cloneDefinitionBody(draft.Candidate)
-	if err != nil {
-		return "", err
-	}
-	candidate.Root = "work"
-	candidate.Nodes = map[string]graph.GraphDefinitionNode{
-		"work": {
-			Kind: graph.KindAgent,
-			Task: &graph.NodeTask{
-				Title:       "执行原始请求",
-				Description: "完成下列原始请求。完成时提交非空 summary；若无法安全完成则提交 failed 或 blocked，不得伪报成功。\n\n" + objective,
-			},
-			Capability: &graph.Capability{Tools: workTools, Isolation: map[bool]string{true: graph.IsolationWorkspace}[input.ExecutionClass == graph.ExecutionMutating]},
-			Next: []graph.Transition{
-				{To: "acceptance", TargetInput: "work_result", When: &graph.Condition{Event: completed}},
-				{To: "work-failed", When: &graph.Condition{Event: failed}},
-				{To: "recovery", TargetInput: "failure_context", When: &graph.Condition{Event: blocked}},
-			},
-			OutputContract:      &graph.NodeOutputContract{SummaryRequired: true},
-			ProgressContractRef: workProgress, ContextPolicyRef: policycatalog.ContextDefaultCurrent,
-			ContractBindings: workBindings,
-			Metadata:         map[string]string{"authoring_template": authoringTemplate},
-		},
-		"recovery": {
-			Kind: graph.KindController,
-			Task: &graph.NodeTask{
-				Title:          "裁决停滞执行的恢复路径",
-				Description:    recoveryDescription,
-				RequiredInputs: []string{"failure_context"},
-			},
-			Next: []graph.Transition{
-				{To: "work", ReplayInputs: true, When: decisionEquals("retry")},
-				{To: "work-blocked", When: decisionEquals("blocked")},
-				{To: "recovery-failed", When: &graph.Condition{Event: failed}},
-				{To: "recovery-blocked", When: &graph.Condition{Event: blocked}},
-			},
-			OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Fields: []graph.OutputFieldContract{
-				{Path: "$.decision", Type: "string", Description: "retry|blocked", Required: true},
-				{Path: "$.recovery_delta", Type: "object", Description: recoverySchema},
-			}},
-			ProgressContractRef: policycatalog.ProgressCoordinationCurrent,
-			ContextPolicyRef:    policycatalog.ContextDefaultCurrent,
-			Metadata: map[string]string{
-				graph.MetadataControllerRole:      string(graph.ControllerRoleLoopRecovery),
-				graph.MetadataRecoveryMaxRetries:  "2",
-				graph.MetadataRecoveryDeltaSchema: recoverySchema,
-				"authoring_template":              authoringTemplate,
-			},
-		},
-		"acceptance": {
-			Kind: graph.KindAcceptance,
-			Task: &graph.NodeTask{
-				Title:          "独立验收原始请求",
-				Description:    "逐项核验上游结果是否真实满足下列原始请求。completed 时 result.verdict 必须恰为 pass、fixable 或 failed；证据不足时提交 blocked。\n\n" + objective,
-				RequiredInputs: []string{"work_result"},
-			},
-			Next: []graph.Transition{
-				{To: "accepted", When: resultEquals("pass")},
-				{To: "fixable", When: resultEquals("fixable")},
-				{To: "rejected", When: resultEquals("failed")},
-				{To: "acceptance-failed", When: &graph.Condition{Event: failed}},
-				{To: "acceptance-recovery", TargetInput: "failure_context", When: &graph.Condition{Event: blocked}},
-			},
-			OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Fields: []graph.OutputFieldContract{{
-				Path: "$.verdict", Type: "string", Description: "pass|fixable|failed", Required: true,
-			}}},
-			ProgressContractRef: policycatalog.ProgressVerificationCurrent,
-			ContextPolicyRef:    policycatalog.ContextDefaultCurrent,
-		},
-		"acceptance-recovery": {
-			Kind: graph.KindController,
-			Task: &graph.NodeTask{
-				Title:          "裁决验收停滞的恢复路径",
-				Description:    "读取 failure_context、ObservationDelta 与原 acceptance 的冻结输入，裁决是否用新 Activation 重试验收。必要时先通过 GraphChangeProposal 修改未来 acceptance 的模型或定义；不得亲自验收或修改业务文件。最终调用 submit_recovery_decision；source 字段由 framework 自动绑定。",
-				RequiredInputs: []string{"failure_context"},
-			},
-			Next: []graph.Transition{
-				{To: "acceptance", ReplayInputs: true, When: decisionEquals("retry")},
-				{To: "acceptance-blocked", When: decisionEquals("blocked")},
-				{To: "acceptance-recovery-failed", When: &graph.Condition{Event: failed}},
-				{To: "acceptance-recovery-blocked", When: &graph.Condition{Event: blocked}},
-			},
-			OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Fields: []graph.OutputFieldContract{
-				{Path: "$.decision", Type: "string", Description: "retry|blocked", Required: true},
-				{Path: "$.recovery_delta", Type: "object", Description: graph.RecoveryDeltaSchemaV2},
-			}},
-			ProgressContractRef: policycatalog.ProgressCoordinationCurrent,
-			ContextPolicyRef:    policycatalog.ContextDefaultCurrent,
-			Metadata: map[string]string{
-				graph.MetadataControllerRole:      string(graph.ControllerRoleLoopRecovery),
-				graph.MetadataRecoveryMaxRetries:  "2",
-				graph.MetadataRecoveryDeltaSchema: graph.RecoveryDeltaSchemaV2,
-				"authoring_template":              authoringTemplate,
-			},
-		},
-		"accepted":                    simpleEnd("验收通过", graph.DefinitionEndSuccess),
-		"fixable":                     simpleEnd("验收发现可修复缺口", graph.DefinitionEndFailed),
-		"rejected":                    simpleEnd("验收失败", graph.DefinitionEndFailed),
-		"work-failed":                 simpleEnd("执行失败", graph.DefinitionEndFailed),
-		"work-blocked":                simpleEnd("执行阻塞", graph.DefinitionEndBlocked),
-		"recovery-failed":             simpleEnd("恢复裁决运行失败", graph.DefinitionEndFailed),
-		"recovery-blocked":            simpleEnd("恢复裁决自身阻塞", graph.DefinitionEndBlocked),
-		"acceptance-failed":           simpleEnd("验收运行失败", graph.DefinitionEndFailed),
-		"acceptance-blocked":          simpleEnd("验收运行阻塞", graph.DefinitionEndBlocked),
-		"acceptance-recovery-failed":  simpleEnd("验收恢复裁决运行失败", graph.DefinitionEndFailed),
-		"acceptance-recovery-blocked": simpleEnd("验收恢复裁决自身阻塞", graph.DefinitionEndBlocked),
-	}
-	candidate.Schema = graph.SchemaV3
-	if input.ExecutionClass == graph.ExecutionMutating {
-		candidate.Schema = graph.SchemaV4
-		configureMutatingSimpleGraphV3(candidate.Nodes, objective, workTools, workBindings, workProgress)
-		candidate.Root = "investigate"
-	}
-	updated, err := g.Store.PatchDraft(draft.ProposalID, draft.DraftRevision, graph.GraphDraftPatch{
-		Contract: &contract, Candidate: &candidate,
-	})
-	if err != nil {
-		return "", err
-	}
-	return marshalGraphAuthoringResult(updated)
-}
-
-func configureMutatingSimpleGraphV3(nodes map[string]graph.GraphDefinitionNode, objective string,
-	workTools []string, workBindings graph.GraphContractBindings, workProgress string) {
-	completed, failed, blocked := graph.EventCompleted, graph.EventFailed, graph.EventBlocked
-
-	work := nodes["work"]
-	work.Task = &graph.NodeTask{
-		Title:       "依据调查证据实现原始请求",
-		Description: "消费上游 investigation_result 中的 failure_observation/hypothesis/evidence_files/evidence_ranges/boundary_evidence/rejected_alternative/recommended_change/verification_focus，先解释第一条具体失败，再核对公开入口、状态所有者与 framework 内部 consumer 三段边界，随后用定向检查证伪并完成下列原始请求。公开 accessor 读取有副作用而内部维护不应触发时，必须使用 backing field + side-effecting accessor，并让内部 consumer 绕过 accessor；alias 到公开 getter 或在叶子 consumer 周围保存/恢复状态不构成所有权边界。上游结论是有界调查证据，不是修改授权；若源码已否定假设，应基于新证据修正，不得重新无界浏览。完成时提交非空 summary；无法安全完成则 blocked。\n\n" + objective,
-	}
-	work.Next = []graph.Transition{
-		{To: "acceptance", TargetInput: "work_result", When: &graph.Condition{Event: completed}},
-		{To: "work-failed", When: &graph.Condition{Event: failed}},
-		{To: "recovery", TargetInput: "failure_context", When: &graph.Condition{Event: blocked}},
-	}
-	work.Metadata = map[string]string{"authoring_template": "simple-task/v4"}
-	nodes["work"] = work
-
-	nodes["investigate"] = graph.GraphDefinitionNode{
-		Kind: graph.KindAgent,
-		Task: &graph.NodeTask{
-			Title:       "调查原始请求的最小修改面",
-			Description: "只读定位下列请求对应的失败测试、关键调用链与最小修改点。根因假设必须先解释第一条具体 exception/failed assertion；若是缺失属性或符号，必须先定位期望的状态所有权，不能跳到后续语义。必须区分公开 API/proxy 的用户访问与 framework 生命周期内部访问，并在提交前用状态所有权边界反证根因假设；定向红态本身不是根因证明。提交 completed 时 result 必须给出 failure_observation、hypothesis、evidence_files、evidence_ranges、boundary_evidence、rejected_alternative、recommended_change、verification_focus。failure_observation 逐字引用包含第一失败 symbol 的 evidence range，并给出 failure_kind。boundary_evidence.public_entry/state_owner/internal_consumer 各自逐字引用 evidence_ranges 中的 path/symbol/start_line/end_line，symbol 字面必须真实出现在声明行段；尚不存在、准备新增的方法只能写进 recommended_change，不能充当 evidence。三类角色至少覆盖两个不同 path/symbol；rejected_alternative 说明被证据否定的局部方案。evidence_ranges 只能列出实际读取的范围。证据不足则 blocked，不得猜测。\n\n" + objective,
-		},
-		Capability: &graph.Capability{Tools: []string{
-			"read_file", "list_dir", "grep_search", "glob_search", "read_content_ref",
-		}},
-		Next: []graph.Transition{
-			{To: "work", When: &graph.Condition{Event: completed}},
-			{To: "investigation-failed", When: &graph.Condition{Event: failed}},
-			{To: "investigation-blocked", When: &graph.Condition{Event: blocked}},
-		},
-		OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Profile: graph.OutputContractProfileInvestigationBoundaryV2, Fields: []graph.OutputFieldContract{
-			{Path: "$.failure_observation", Type: "object", Description: "第一条具体 exception/failed assertion；逐字引用 evidence_ranges", Required: true},
-			{Path: "$.failure_observation.failure_kind", Type: "string", Description: "第一失败类型，例如 AttributeError 或 assertion_failed", Required: true},
-			{Path: "$.hypothesis", Type: "string", Description: "可证伪根因假设", Required: true},
-			{Path: "$.evidence_files", Type: "array", Description: "最小相关项目相对文件集合", Required: true},
-			{Path: "$.evidence_ranges", Type: "array", Description: "已实际读取的关键范围对象：path/start_line/end_line/symbol", Required: true},
-			{Path: "$.boundary_evidence", Type: "object", Description: "公开入口、状态所有者、内部 consumer 的三段证据", Required: true},
-			{Path: "$.boundary_evidence.public_entry", Type: "object", Description: "逐字引用 evidence_ranges；symbol 必须真实出现在范围内的公开 API/proxy 入口", Required: true},
-			{Path: "$.boundary_evidence.state_owner", Type: "object", Description: "逐字引用 evidence_ranges；symbol 必须真实出现在范围内的状态背板/所有者", Required: true},
-			{Path: "$.boundary_evidence.internal_consumer", Type: "object", Description: "逐字引用 evidence_ranges；symbol 必须真实出现在范围内的 framework 内部 consumer", Required: true},
-			{Path: "$.rejected_alternative", Type: "string", Description: "已由边界证据否定的局部替代假设", Required: true},
-			{Path: "$.recommended_change", Type: "string", Description: "建议的最小修改点", Required: true},
-			{Path: "$.verification_focus", Type: "string", Description: "定向验证重点", Required: true},
-		}},
-		ProgressContractRef: policycatalog.ProgressInvestigationCurrent,
-		ContextPolicyRef:    policycatalog.ContextDefaultCurrent,
-		Metadata: map[string]string{
-			"route": "explore", "authoring_template": "simple-task/v4",
-		},
-	}
-
-	recovery := nodes["recovery"]
-	recovery.Next = []graph.Transition{
-		{To: "repair", ReplayInputs: true, When: decisionEquals("retry")},
-		{To: "work-blocked", When: decisionEquals("blocked")},
-		{To: "recovery-failed", When: &graph.Condition{Event: failed}},
-		{To: "recovery-blocked", When: &graph.Condition{Event: blocked}},
-	}
-	recovery.Metadata[graph.MetadataRecoveryMaxRetries] = "1"
-	nodes["recovery"] = recovery
-
-	repair := graph.GraphDefinitionNode{
-		Kind: graph.KindAgent,
-		Task: &graph.NodeTask{
-			Title:       "恢复并完成已有候选",
-			Description: "消费原 investigation_result 与 RecoveryDelta v5 candidate_state。若 dirty candidate 仍符合证据，使用 resume_candidate 进入冻结检查；若需修改则声明最小 edit_steps。不得丢弃已有 Delivery 后从头调查。完成下列原始请求并运行 required checks。\n\n" + objective,
-		},
-		Capability: &graph.Capability{Tools: append([]string(nil), workTools...), Isolation: graph.IsolationWorkspace},
-		Next: []graph.Transition{
-			{To: "acceptance-repair", TargetInput: "repair_result", When: &graph.Condition{Event: completed}},
-			{To: "repair-failed", When: &graph.Condition{Event: failed}},
-			{To: "repair-blocked", When: &graph.Condition{Event: blocked}},
-		},
-		OutputContract: &graph.NodeOutputContract{SummaryRequired: true},
-		// v11 只负责给首次 Worker 冻结候选修复预留窗口；repair 已是同一
-		// Delivery 的最后一次有界执行，继续使用 v11 会在没有下一条 recovery
-		// 边时再次触发 candidate_completion_handoff。v10 保留同一 Observation
-		// wire 与 decision gate，但不会制造不可消费的二次交接。
-		ProgressContractRef: policycatalog.ProgressCodeChangeV10, ContextPolicyRef: policycatalog.ContextDefaultCurrent,
-		ContractBindings: workBindings,
-		Metadata:         map[string]string{"authoring_template": "simple-task/v4", "recovery_target": "candidate-repair/v1"},
-	}
-	nodes["repair"] = repair
-
-	nodes["acceptance-repair"] = graph.GraphDefinitionNode{
-		Kind: graph.KindAcceptance,
-		Task: &graph.NodeTask{
-			Title:          "独立验收恢复候选",
-			Description:    "逐项核验恢复后的同一 Delivery candidate 是否真实满足原始请求。completed 时 result.verdict 必须恰为 pass、fixable 或 failed；证据不足时 blocked。\n\n" + objective,
-			RequiredInputs: []string{"repair_result"},
-		},
-		Next: []graph.Transition{
-			{To: "accepted-repair", When: resultEquals("pass")},
-			{To: "fixable-repair", When: resultEquals("fixable")},
-			{To: "rejected-repair", When: resultEquals("failed")},
-			{To: "acceptance-repair-failed", When: &graph.Condition{Event: failed}},
-			{To: "acceptance-repair-blocked", When: &graph.Condition{Event: blocked}},
-		},
-		OutputContract: &graph.NodeOutputContract{SummaryRequired: true, Fields: []graph.OutputFieldContract{{
-			Path: "$.verdict", Type: "string", Description: "pass|fixable|failed", Required: true,
-		}}},
-		ProgressContractRef: policycatalog.ProgressVerificationCurrent,
-		ContextPolicyRef:    policycatalog.ContextDefaultCurrent,
-	}
-
-	nodes["investigation-failed"] = simpleEnd("调查失败", graph.DefinitionEndFailed)
-	nodes["investigation-blocked"] = simpleEnd("调查证据不足", graph.DefinitionEndBlocked)
-	nodes["repair-failed"] = simpleEnd("恢复执行失败", graph.DefinitionEndFailed)
-	nodes["repair-blocked"] = simpleEnd("恢复执行阻塞", graph.DefinitionEndBlocked)
-	nodes["accepted-repair"] = simpleEnd("恢复候选验收通过", graph.DefinitionEndSuccess)
-	nodes["fixable-repair"] = simpleEnd("恢复候选仍有可修复缺口", graph.DefinitionEndFailed)
-	nodes["rejected-repair"] = simpleEnd("恢复候选验收失败", graph.DefinitionEndFailed)
-	nodes["acceptance-repair-failed"] = simpleEnd("恢复候选验收运行失败", graph.DefinitionEndFailed)
-	nodes["acceptance-repair-blocked"] = simpleEnd("恢复候选验收阻塞", graph.DefinitionEndBlocked)
-}
-
-func resultEquals(value string) *graph.Condition {
-	return &graph.Condition{Path: "$.verdict", Operator: graph.OpEq, Value: json.RawMessage(fmt.Sprintf("%q", value))}
-}
-
-func decisionEquals(value string) *graph.Condition {
-	return &graph.Condition{Path: "$.decision", Operator: graph.OpEq, Value: json.RawMessage(fmt.Sprintf("%q", value))}
-}
-
-func simpleEnd(title string, outcome graph.DefinitionEndOutcome) graph.GraphDefinitionNode {
-	return graph.GraphDefinitionNode{
-		Kind: graph.KindEnd, Task: &graph.NodeTask{Title: title},
-		Next: []graph.Transition{}, EndOutcome: outcome,
-	}
-}
-
-func (g GraphAuthoringGroup) patchDraft(_ context.Context, args map[string]any) (string, error) {
-	task, err := g.currentRootSchedulerTask("patch_graph_draft")
-	if err != nil {
-		return "", err
-	}
-	if g.Store == nil {
-		return "", fmt.Errorf("patch_graph_draft 不可用：AuthoringStore 未注入")
-	}
-	var input patchGraphDraftArgs
-	if err := decodeNativeGraphArgs(args, &input); err != nil {
-		return "", fmt.Errorf("patch_graph_draft 参数非法: %w", err)
-	}
-	draft, err := g.ownedDraft(task, input.ProposalID)
-	if err != nil {
-		return "", err
-	}
-	if input.BaseDraftRevision <= 0 {
-		return "", fmt.Errorf("base_draft_revision 必须为正整数")
-	}
-	candidate, err := cloneDefinitionBody(draft.Candidate)
-	if err != nil {
-		return "", err
-	}
-	changed := false
-	for _, id := range input.RemoveNodes {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			return "", fmt.Errorf("remove_nodes 不得含空 ID")
-		}
-		if _, exists := candidate.Nodes[id]; !exists {
-			return "", fmt.Errorf("Draft 不存在待删除节点 %q", id)
-		}
-		delete(candidate.Nodes, id)
-		changed = true
-	}
-	upserts, err := nativeDefinitionNodes(input.UpsertNodes)
-	if err != nil {
-		return "", err
-	}
-	for id, node := range upserts {
-		candidate.Nodes[id] = node
-		changed = true
-	}
-	if input.Root != nil {
-		candidate.Root = strings.TrimSpace(*input.Root)
-		changed = true
-	}
-	patch := graph.GraphDraftPatch{}
-	if changed {
-		patch.Candidate = &candidate
-	}
-	if input.Contract != nil {
-		contract := *input.Contract
-		contract.RequestRef, contract.RequestDigest = draft.RequestRef, draft.RequestDigest
-		patch.Contract = &contract
-		changed = true
-	}
-	if !changed {
-		return "", fmt.Errorf("Draft patch 不能为空")
-	}
-	updated, err := g.Store.PatchDraft(draft.ProposalID, input.BaseDraftRevision, patch)
-	if err != nil {
-		return "", err
-	}
-	return marshalGraphAuthoringResult(updated)
-}
-
-func (g GraphAuthoringGroup) authoringRequestTask(task *model.Task) (*model.Task, error) {
-	if task == nil || task.EventSource != model.TaskEventSourceLoopIntervention {
-		return task, nil
-	}
-	if g.TaskStore == nil || strings.TrimSpace(task.ParentTaskID) == "" {
-		return nil, fmt.Errorf("intervention authoring 缺少 source Task authority")
-	}
-	source, err := g.TaskStore.GetTask(task.ParentTaskID)
-	if err != nil {
-		return nil, fmt.Errorf("读取 intervention authoring source %s: %w", task.ParentTaskID, err)
-	}
-	if source == nil || source.ID != task.ParentTaskID || source.RunID != task.RunID ||
-		source.EventType != "__scheduler__" || source.GraphID != "" || !model.IsTerminal(source.Status) {
-		return nil, fmt.Errorf("intervention authoring source lineage/terminal authority 不一致")
-	}
-	return source, nil
-}
-
-func (g GraphAuthoringGroup) readDraft(_ context.Context, args map[string]any) (string, error) {
-	task, err := g.currentRootSchedulerTask("read_graph_draft")
-	if err != nil {
-		return "", err
-	}
-	var input readGraphDraftArgs
-	if err := decodeNativeGraphArgs(args, &input); err != nil {
-		return "", err
-	}
-	draft, err := g.ownedDraft(task, input.ProposalID)
-	if err != nil {
-		return "", err
-	}
-	return marshalGraphAuthoringResult(draft)
-}
-
-func (g GraphAuthoringGroup) validateDraft(ctx context.Context, args map[string]any) (string, error) {
-	task, err := g.currentRootSchedulerTask("validate_graph_draft")
-	if err != nil {
-		return "", err
-	}
-	if g.Store == nil {
-		return "", fmt.Errorf("validate_graph_draft 不可用：AuthoringStore 未注入")
-	}
-	var input validateGraphDraftArgs
-	if err := decodeNativeGraphArgs(args, &input); err != nil {
-		return "", err
-	}
-	draft, err := g.ownedDraft(task, input.ProposalID)
-	if err != nil {
-		return "", err
-	}
-	if draft.DraftRevision != input.ExpectedDraftRevision {
-		return "", &graph.AuthoringRevisionConflictError{Kind: "draft", ID: draft.ProposalID, Expected: input.ExpectedDraftRevision, Current: draft.DraftRevision}
-	}
-	return g.validateOwnedDraft(ctx, draft)
-}
-
-func (g GraphAuthoringGroup) validateCurrentDraft(ctx context.Context, args map[string]any) (string, error) {
-	task, err := g.currentRootSchedulerTask("validate_current_graph_draft")
-	if err != nil {
-		return "", err
-	}
-	var input struct{}
-	if err := decodeNativeGraphArgs(args, &input); err != nil {
-		return "", fmt.Errorf("validate_current_graph_draft 参数非法: %w", err)
-	}
-	draft, err := g.ownedDraft(task, "graph-proposal-"+task.ID)
-	if err != nil {
-		return "", err
-	}
-	return g.validateOwnedDraft(ctx, draft)
-}
-
-func (g GraphAuthoringGroup) validateOwnedDraft(ctx context.Context, draft *graph.GraphDraft) (string, error) {
-	result, err := g.Compiler.Compile(ctx, graph.DefinitionCompileRequest{
-		ReportID: "graph-validation-" + uuid.NewString(), Draft: *draft,
-		DefinitionRevision: draft.BaseDefinitionRevision + 1,
-	})
-	if err != nil {
-		return "", err
-	}
-	if routeErr := g.validateDefinitionRoutes(draft.GraphID, result.Definition); routeErr != nil {
-		result.Report.Accepted = false
-		result.Report.Errors = append(result.Report.Errors, graph.ValidationIssue{
-			Code: "GRAPH_ROUTE_INVALID", Path: "nodes", Retryable: true, Message: routeErr.Error(),
-		})
-	}
-	report, err := g.Store.RecordValidation(result.Report)
-	if err != nil {
-		return "", err
-	}
-	visible := *report
-	visible.NormalizedDefinition = nil
-	return marshalGraphAuthoringResult(visible)
-}
-
-func (g GraphAuthoringGroup) commitDraft(_ context.Context, args map[string]any) (string, error) {
-	task, err := g.currentRootSchedulerTask("commit_graph_draft")
-	if err != nil {
-		return "", err
-	}
-	if g.Store == nil {
-		return "", fmt.Errorf("commit_graph_draft 不可用：AuthoringStore 未注入")
-	}
-	var input commitGraphDraftArgs
-	if err := decodeNativeGraphArgs(args, &input); err != nil {
-		return "", err
-	}
-	draft, err := g.ownedDraft(task, input.ProposalID)
-	if err != nil {
-		return "", err
-	}
-	report, ok := g.Store.GetValidationReport(strings.TrimSpace(input.ValidationReportID))
-	if !ok || report.NormalizedDefinition == nil {
-		return "", fmt.Errorf("ValidationReport %s 不存在或缺少 normalized Definition", input.ValidationReportID)
-	}
-	return g.commitOwnedDraft(draft, input.ExpectedDraftRevision, report)
-}
-
-func (g GraphAuthoringGroup) commitCurrentDraft(_ context.Context, args map[string]any) (string, error) {
-	task, err := g.currentRootSchedulerTask("commit_current_graph_draft")
-	if err != nil {
-		return "", err
-	}
-	var input struct{}
-	if err := decodeNativeGraphArgs(args, &input); err != nil {
-		return "", fmt.Errorf("commit_current_graph_draft 参数非法: %w", err)
-	}
-	draft, err := g.ownedDraft(task, "graph-proposal-"+task.ID)
-	if err != nil {
-		return "", err
-	}
-	report, ok := g.Store.GetValidationReport(draft.LastValidationReportRef)
-	if !ok || report.NormalizedDefinition == nil || !report.Accepted ||
-		report.SubjectRevision != draft.DraftRevision || report.ProposalAcceptance != graph.ProposalAcceptancePass {
-		return "", fmt.Errorf("当前 Draft %s 没有与 revision=%d 匹配的 accepted ValidationReport", draft.ProposalID, draft.DraftRevision)
-	}
-	return g.commitOwnedDraft(draft, draft.DraftRevision, report)
-}
-
-func (g GraphAuthoringGroup) commitOwnedDraft(draft *graph.GraphDraft, expectedRevision int64, report *graph.ValidationReport) (string, error) {
-	definition, err := g.Store.CommitDraft(draft.ProposalID, expectedRevision, report.ReportID, *report.NormalizedDefinition)
-	if err != nil {
-		return "", err
-	}
-	return marshalGraphAuthoringResult(graphDefinitionReceiptOf(definition))
-}
-
-func (g GraphAuthoringGroup) startGraph(ctx context.Context, args map[string]any) (string, error) {
-	task, err := g.currentRootSchedulerTask("start_graph")
-	if err != nil {
-		return "", err
-	}
-	if g.Runtime == nil {
-		return "", fmt.Errorf("start_graph 不可用：AuthoringRuntime 未注入")
-	}
-	if g.Finalization == nil {
-		return "", fmt.Errorf("start_graph 不可用：FinalizationNotifier 未注入，拒绝在无法交棒时启动")
-	}
-	var input startGraphArgs
-	if err := decodeNativeGraphArgs(args, &input); err != nil {
-		return "", err
-	}
-	return g.startOwnedDefinition(ctx, task, strings.TrimSpace(input.GraphID), input.ExpectedDefinitionRevision,
-		strings.TrimSpace(input.ExpectedDefinitionDigest), strings.TrimSpace(input.ExpectedContractDigest))
-}
-
-func (g GraphAuthoringGroup) startCurrentGraph(ctx context.Context, args map[string]any) (string, error) {
-	task, err := g.currentRootSchedulerTask("start_current_graph")
-	if err != nil {
-		return "", err
-	}
-	var input struct{}
-	if err := decodeNativeGraphArgs(args, &input); err != nil {
-		return "", fmt.Errorf("start_current_graph 参数非法: %w", err)
-	}
-	draft, err := g.ownedDraft(task, "graph-proposal-"+task.ID)
-	if err != nil {
-		return "", err
-	}
-	if draft.Status != graph.DraftCommitted || draft.CommittedDefinitionRevision <= 0 {
-		return "", fmt.Errorf("当前 Draft %s 尚未 commit immutable Definition", draft.ProposalID)
-	}
-	definition, ok := g.Store.GetDefinition(draft.GraphID, draft.CommittedDefinitionRevision)
-	if !ok {
-		return "", fmt.Errorf("%w: %s@%d", graph.ErrDefinitionNotFound, draft.GraphID, draft.CommittedDefinitionRevision)
-	}
-	return g.startOwnedDefinition(ctx, task, definition.GraphID, definition.Revision,
-		definition.DefinitionDigest, definition.ContractDigest)
-}
-
-func (g GraphAuthoringGroup) startOwnedDefinition(ctx context.Context, task *model.Task, graphID string,
-	revision int64, definitionDigest, contractDigest string) (string, error) {
-	if g.Runtime == nil {
-		return "", fmt.Errorf("start_graph 不可用：AuthoringRuntime 未注入")
-	}
-	if g.Finalization == nil {
-		return "", fmt.Errorf("start_graph 不可用：FinalizationNotifier 未注入，拒绝在无法交棒时启动")
-	}
-	result, err := g.Runtime.StartDefinition(ctx, graph.StartDefinitionRequest{
-		StartID: "graph-start-" + graphID + fmt.Sprintf("-r%d", revision), GraphID: graphID,
-		ExpectedDefinitionRevision: revision,
-		ExpectedDefinitionDigest:   definitionDigest,
-		ExpectedContractDigest:     contractDigest,
-		SessionID:                  g.currentSessionID(), OwnerTaskID: task.ID,
-	})
-	if err != nil {
-		return "", err
-	}
-	if g.Finalization != nil {
-		g.Finalization.MarkTaskFinalized()
-	}
-	return marshalGraphAuthoringResult(result)
-}
-
-func (g GraphAuthoringGroup) proposeGraphChange(_ context.Context, args map[string]any) (string, error) {
-	task, err := g.currentRootSchedulerTask("propose_graph_change")
-	if err != nil {
-		return "", err
-	}
-	if g.Store == nil {
-		return "", fmt.Errorf("propose_graph_change 不可用：AuthoringStore 未注入")
-	}
-	var input proposeGraphChangeArgs
-	if err := decodeNativeGraphArgs(args, &input); err != nil {
-		return "", err
-	}
-	if task.GraphID != "" && strings.TrimSpace(input.GraphID) != task.GraphID {
-		return "", fmt.Errorf("loop_recovery controller 只能修改当前 Graph %s，目标为 %s",
-			task.GraphID, input.GraphID)
-	}
-	if task.InterventionGraphID != "" && strings.TrimSpace(input.GraphID) != task.InterventionGraphID {
-		return "", fmt.Errorf("graph-change coordination 只能修改冻结 Graph %s，目标为 %s",
-			task.InterventionGraphID, input.GraphID)
-	}
-	definition, ok := g.Store.GetDefinition(strings.TrimSpace(input.GraphID), input.BaseDefinitionRevision)
-	if !ok {
-		return "", fmt.Errorf("%w: %s@%d", graph.ErrDefinitionNotFound, input.GraphID, input.BaseDefinitionRevision)
-	}
-	if definition.SessionID != g.currentSessionID() || definition.DefinitionDigest != strings.TrimSpace(input.BaseDefinitionDigest) {
-		return "", fmt.Errorf("GraphChange base Definition digest/session 不一致")
-	}
-	upserts, err := nativeDefinitionNodeUpserts(input.UpsertNodes)
-	if err != nil {
-		return "", err
-	}
-	patch := graph.GraphDefinitionPatch{UpsertNodes: upserts, RemoveNodes: input.RemoveNodes}
-	if patch.Empty() {
-		return "", fmt.Errorf("GraphChange patch 不能为空")
-	}
-	change, err := g.Store.CreateGraphChangeProposal(graph.GraphChangeProposal{
-		ChangeID: "graph-change-" + uuid.NewString(), GraphID: definition.GraphID,
-		BaseDefinitionRevision: definition.Revision, BaseDefinitionDigest: definition.DefinitionDigest,
-		SessionID: definition.SessionID, OwnerTaskID: task.ID, Reason: strings.TrimSpace(input.Reason), Patch: patch,
-	})
-	if err != nil {
-		return "", err
-	}
-	return marshalGraphAuthoringResult(change)
-}
-
-func (g GraphAuthoringGroup) readGraphChange(_ context.Context, args map[string]any) (string, error) {
-	task, err := g.currentRootSchedulerTask("read_graph_change")
-	if err != nil {
-		return "", err
-	}
-	var input graphChangeArgs
-	if err := decodeNativeGraphArgs(args, &input); err != nil {
-		return "", err
-	}
-	change, err := g.ownedChange(task, input.ChangeID)
-	if err != nil {
-		return "", err
-	}
-	return marshalGraphAuthoringResult(change)
-}
-
-func (g GraphAuthoringGroup) validateGraphChange(ctx context.Context, args map[string]any) (string, error) {
-	task, err := g.currentRootSchedulerTask("validate_graph_change")
-	if err != nil {
-		return "", err
-	}
-	var input validateGraphChangeArgs
-	if err := decodeNativeGraphArgs(args, &input); err != nil {
-		return "", err
-	}
-	change, err := g.ownedChange(task, input.ChangeID)
-	if err != nil {
-		return "", err
-	}
-	if change.ProposalRevision != input.ExpectedProposalRevision {
-		return "", &graph.AuthoringRevisionConflictError{Kind: "change", ID: change.ChangeID, Expected: input.ExpectedProposalRevision, Current: change.ProposalRevision}
-	}
-	base, ok := g.Store.GetDefinition(change.GraphID, change.BaseDefinitionRevision)
-	if !ok || base.DefinitionDigest != change.BaseDefinitionDigest {
-		return "", fmt.Errorf("GraphChange base Definition 已变化或缺失")
-	}
-	candidate, err := graph.ApplyGraphDefinitionPatch(base.Body, change.Patch)
-	if err != nil {
-		return "", err
-	}
-	compiled, err := g.Compiler.Compile(ctx, graph.DefinitionCompileRequest{
-		ReportID: "graph-change-validation-" + uuid.NewString(),
-		Draft: graph.GraphDraft{
-			ProposalID: change.ChangeID, GraphID: change.GraphID, SessionID: change.SessionID,
-			OwnerTaskID: base.OwnerTaskID, BaseDefinitionRevision: base.Revision,
-			DraftRevision: change.ProposalRevision, Status: graph.DraftEditing,
-			RequestRef: base.Contract.RequestRef, RequestDigest: base.Contract.RequestDigest,
-			Contract: base.Contract, Candidate: candidate,
-		},
-		DefinitionRevision: base.Revision + 1,
-	})
-	if err != nil {
-		return "", err
-	}
-	compiled.Report.SubjectKind = "change"
-	compiled.Report.SubjectID = change.ChangeID
-	compiled.Report.SubjectRevision = change.ProposalRevision
-	if routeErr := g.validateDefinitionRoutes(change.GraphID, compiled.Definition); routeErr != nil {
-		compiled.Report.Accepted = false
-		compiled.Report.Errors = append(compiled.Report.Errors, graph.ValidationIssue{
-			Code: "GRAPH_ROUTE_INVALID", Path: "nodes", Retryable: true, Message: routeErr.Error(),
-		})
-	}
-	report, err := g.Store.RecordValidation(compiled.Report)
-	if err != nil {
-		return "", err
-	}
-	visible := *report
-	visible.NormalizedDefinition = nil
-	return marshalGraphAuthoringResult(visible)
-}
-
-func (g GraphAuthoringGroup) commitGraphChange(_ context.Context, args map[string]any) (string, error) {
-	task, err := g.currentRootSchedulerTask("commit_graph_change")
-	if err != nil {
-		return "", err
-	}
-	var input commitGraphChangeArgs
-	if err := decodeNativeGraphArgs(args, &input); err != nil {
-		return "", err
-	}
-	if _, err := g.ownedChange(task, input.ChangeID); err != nil {
-		return "", err
-	}
-	if g.Runtime == nil {
-		return "", fmt.Errorf("commit_graph_change 不可用：AuthoringRuntime 未注入")
-	}
-	externalCoordination := task.GraphID == "" && task.EventSource == model.TaskEventSourceGraphChange
-	if externalCoordination && g.Finalization == nil {
-		return "", fmt.Errorf("commit_graph_change 不可用：graph-change coordination 缺少 FinalizationNotifier")
-	}
-	definition, err := g.Runtime.CommitGraphChangeAndAdopt(strings.TrimSpace(input.ChangeID), input.ExpectedProposalRevision, strings.TrimSpace(input.ValidationReportID))
-	if err != nil {
-		return "", err
-	}
-	if externalCoordination {
-		g.Finalization.MarkTaskFinalized()
-	}
-	return marshalGraphAuthoringResult(graphDefinitionReceiptOf(definition))
-}
-
-func (g GraphAuthoringGroup) submitGraphChangeDecision(_ context.Context, args map[string]any) (string, error) {
-	task, err := g.currentRootSchedulerTask("submit_graph_change_decision")
-	if err != nil {
-		return "", err
-	}
-	var input submitGraphChangeDecisionArgs
-	if err := decodeNativeGraphArgs(args, &input); err != nil {
-		return "", err
-	}
-	if task.GraphID != "" || task.EventSource != model.TaskEventSourceGraphChange ||
-		strings.TrimSpace(task.InterventionGraphID) == "" {
-		return "", fmt.Errorf("submit_graph_change_decision 仅允许冻结 graph-change-request Scheduler task 使用")
-	}
-	if strings.TrimSpace(input.Decision) != "no_change" {
-		return "", fmt.Errorf("graph-change decision 必须是 no_change")
-	}
-	summary := strings.TrimSpace(input.Summary)
-	if summary == "" {
-		return "", fmt.Errorf("graph-change no_change 裁决必须提供非空 summary")
-	}
-	if g.Finalization == nil {
-		return "", fmt.Errorf("submit_graph_change_decision 不可用：FinalizationNotifier 未注入")
-	}
-	g.Finalization.MarkTaskFinalized()
-	return marshalGraphAuthoringResult(map[string]any{
-		"schema": "agentgo.graph-change-decision/v1", "graph_id": task.InterventionGraphID,
-		"decision": "no_change", "summary": summary,
-	})
-}
-
-func (g GraphAuthoringGroup) currentRootSchedulerTask(operation string) (*model.Task, error) {
-	if g.Holder == nil || g.TaskStore == nil {
-		return nil, fmt.Errorf("%s 无法确定当前 Scheduler task，按 fail-closed 拒绝", operation)
-	}
-	taskID := strings.TrimSpace(g.Holder.Get())
-	if taskID == "" {
-		return nil, fmt.Errorf("%s 当前 Scheduler task 为空", operation)
-	}
-	task, err := g.TaskStore.GetTask(taskID)
-	if err != nil || task == nil {
-		return nil, fmt.Errorf("%s 读取当前 Scheduler task %s 失败: %w", operation, taskID, err)
-	}
-	if task.GraphID != "" {
-		if task.GraphNodeKind == string(graph.KindController) &&
-			task.GraphControllerRole == string(graph.ControllerRoleLoopRecovery) &&
-			strings.TrimSpace(task.RecoverySourceTaskID) != "" && recoveryGraphChangeOperation(operation) {
-			return task, nil
-		}
-		return nil, fmt.Errorf("%s 仅允许 origin/root Scheduler 或 loop_recovery controller 使用；当前任务属于 Graph %s role=%s",
-			operation, task.GraphID, task.GraphControllerRole)
-	}
-	if task.InterventionGraphID != "" {
-		scope, scopeErr := model.ClassifyControlScope(task)
-		if scopeErr != nil || scope != model.ControlScopeGraphChange || !recoveryGraphChangeOperation(operation) {
-			return nil, fmt.Errorf("%s 的 graph-change scope 无效: scope=%s err=%v", operation, scope, scopeErr)
-		}
-	}
-	return task, nil
-}
-
-func recoveryGraphChangeOperation(operation string) bool {
-	switch operation {
-	case "propose_graph_change", "read_graph_change", "validate_graph_change", "commit_graph_change",
-		"submit_graph_change_decision":
-		return true
-	default:
-		return false
-	}
-}
-
-func (g GraphAuthoringGroup) ownedDraft(task *model.Task, proposalID string) (*graph.GraphDraft, error) {
-	if g.Store == nil {
-		return nil, fmt.Errorf("AuthoringStore 未注入")
-	}
-	proposalID = strings.TrimSpace(proposalID)
-	draft, ok := g.Store.GetDraft(proposalID)
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", graph.ErrDraftNotFound, proposalID)
-	}
-	if draft.OwnerTaskID != task.ID || draft.SessionID != g.currentSessionID() {
-		return nil, fmt.Errorf("Draft %s 不属于当前 task/session，按 fail-closed 拒绝", proposalID)
-	}
-	return draft, nil
-}
-
-func (g GraphAuthoringGroup) ownedChange(task *model.Task, changeID string) (*graph.GraphChangeProposal, error) {
-	if g.Store == nil {
-		return nil, fmt.Errorf("AuthoringStore 未注入")
-	}
-	change, ok := g.Store.GetGraphChangeProposal(strings.TrimSpace(changeID))
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", graph.ErrGraphChangeNotFound, changeID)
-	}
-	if change.OwnerTaskID != task.ID || change.SessionID != g.currentSessionID() {
-		return nil, fmt.Errorf("GraphChange %s 不属于当前 task/session", changeID)
-	}
-	return change, nil
-}
-
-func (g GraphAuthoringGroup) currentSessionID() string {
-	if g.SessionID == nil {
-		return ""
-	}
-	return g.SessionID()
-}
-
-func (g GraphAuthoringGroup) validateDefinitionRoutes(graphID string, body graph.GraphDefinitionBody) error {
-	nodes := make(map[string]graph.Node, len(body.Nodes))
-	for id, definition := range body.Nodes {
-		nodes[id] = graph.Node{
-			Kind: definition.Kind, Task: definition.Task, Capability: definition.Capability,
-			Next: definition.Next, Wait: definition.Wait, Tool: definition.Tool,
-			Subgraph: definition.Subgraph, Metadata: definition.Metadata, Extensions: definition.Extensions,
-		}
-	}
-	return (GraphControlGroup{RouteValidator: g.RouteValidator}).validateRoutes(graphID, nodes, "nodes")
-}
-
-func nativeDefinitionNodes(inputs []graphDraftNodeInput) (map[string]graph.GraphDefinitionNode, error) {
-	nodes := make(map[string]graph.GraphDefinitionNode, len(inputs))
-	for _, input := range inputs {
-		id := strings.TrimSpace(input.ID)
-		if id == "" {
-			return nil, fmt.Errorf("node.id 不能为空")
-		}
-		if _, duplicate := nodes[id]; duplicate {
-			return nil, fmt.Errorf("node.id=%q 重复", id)
-		}
-		nodes[id] = input.GraphDefinitionNode
-	}
-	return nodes, nil
-}
-
-func nativeDefinitionNodeUpserts(inputs []graphDraftNodeInput) ([]graph.GraphDefinitionNodeUpsert, error) {
-	nodes, err := nativeDefinitionNodes(inputs)
-	if err != nil {
-		return nil, err
-	}
-	upserts := make([]graph.GraphDefinitionNodeUpsert, 0, len(nodes))
-	for _, input := range inputs {
-		id := strings.TrimSpace(input.ID)
-		upserts = append(upserts, graph.GraphDefinitionNodeUpsert{ID: id, GraphDefinitionNode: nodes[id]})
-	}
-	return upserts, nil
-}
-
-func cloneDefinitionBody(body graph.GraphDefinitionBody) (graph.GraphDefinitionBody, error) {
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return graph.GraphDefinitionBody{}, err
-	}
-	var clone graph.GraphDefinitionBody
-	if err := json.Unmarshal(raw, &clone); err != nil {
-		return graph.GraphDefinitionBody{}, err
-	}
-	return clone, nil
-}
-
-func decodeNativeGraphArgs(args map[string]any, target any) error {
-	raw, err := json.Marshal(args)
-	if err != nil {
-		return err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		return err
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("参数含多余 JSON 内容")
+	if t.RunID != "" && d.Body.RunID != "" && t.RunID != d.Body.RunID {
+		return fmt.Errorf("目标图不属于当前 Run")
 	}
 	return nil
 }
 
-func schedulerRequestDigest(task *model.Task) string {
-	runID := ""
-	if task != nil {
-		runID = string(task.RunID)
-	}
-	payload := "agentgo.scheduler-request/v1\x00" + runID + "\x00" + task.Description
-	sum := sha256.Sum256([]byte(payload))
-	return "sha256:" + hex.EncodeToString(sum[:])
+func graphRequestKey(taskID, requestID string) string {
+	digest := sha256.Sum256([]byte(taskID + "\x00" + requestID))
+	return hex.EncodeToString(digest[:16])
 }
 
-func marshalGraphAuthoringResult(value any) (string, error) {
-	raw, err := json.MarshalIndent(value, "", "  ")
+func (g GraphAuthoringGroup) applyGraphChange(ctx context.Context, args map[string]any) (string, error) {
+	task, err := g.actor(true)
 	if err != nil {
 		return "", err
 	}
-	return string(raw), nil
-}
-
-type graphDefinitionReceipt struct {
-	GraphID                 string                 `json:"graph_id"`
-	Revision                int64                  `json:"definition_revision"`
-	DefinitionDigestVersion string                 `json:"definition_digest_version"`
-	DefinitionDigest        string                 `json:"definition_digest"`
-	ContractDigest          string                 `json:"contract_digest"`
-	SourceProposalID        string                 `json:"source_proposal_id"`
-	Status                  graph.DefinitionStatus `json:"status"`
-}
-
-func graphDefinitionReceiptOf(definition *graph.GraphDefinition) graphDefinitionReceipt {
-	return graphDefinitionReceipt{
-		GraphID: definition.GraphID, Revision: definition.Revision,
-		DefinitionDigestVersion: definition.DefinitionDigestVersion,
-		DefinitionDigest:        definition.DefinitionDigest, ContractDigest: definition.ContractDigest,
-		SourceProposalID: definition.SourceProposalID, Status: definition.Status,
+	var in applyGraphArgs
+	if err = decodeNativeGraphArgs(args, &in); err != nil {
+		return "", fmt.Errorf("图变更参数非法: %w", err)
 	}
-}
-
-func graphDraftCreateSchema() map[string]any {
-	return nativeObject(map[string]any{})
-}
-
-func simpleGraphDraftSchema() map[string]any {
-	return nativeObject(map[string]any{
-		"execution_class": map[string]any{
-			"type": "string", "enum": []string{"answer", "read_only", "mutating"},
-			"description": "answer=只需自然语言答复且无需仓库操作；read_only=只调查读取、明确不修改任何文件；mutating=请求要求修改文件/代码/配置、实现功能或修复测试（即使先要调查也属于 mutating）",
-		},
-	}, "execution_class")
-}
-
-func graphDraftPatchSchema() map[string]any {
-	return nativeObject(map[string]any{
-		"proposal_id":         nativeString("Draft proposal ID"),
-		"base_draft_revision": nativeInteger("CAS revision"),
-		"upsert_nodes":        nativeArray(graphNodeNativeSchema(true)),
-		"remove_nodes":        nativeArray(nativeString("待删除节点 ID")),
-		"root":                nativeString("新的 root"),
-		"contract":            graphContractNativeSchema(),
-	}, "proposal_id", "base_draft_revision")
-}
-
-func graphChangeProposalSchema() map[string]any {
-	return nativeObject(map[string]any{
-		"graph_id":                 nativeString("运行中 Graph ID"),
-		"base_definition_revision": nativeInteger("当前 immutable Definition revision"),
-		"base_definition_digest":   nativeString("当前 Definition digest"),
-		"reason":                   nativeString("为什么需要修改未来 Activation 定义"),
-		"upsert_nodes":             nativeArray(graphNodeNativeSchema(true)),
-		"remove_nodes":             nativeArray(nativeString("待删除、且未被 activation 引用的节点 ID")),
-	}, "graph_id", "base_definition_revision", "base_definition_digest", "reason")
-}
-
-func graphNodeNativeSchema(withID bool) map[string]any {
-	properties := map[string]any{
-		"kind": map[string]any{"type": "string", "enum": []string{"controller", "agent", "tool", "router", "join", "approval", "wait_event", "acceptance", "end"}},
-		"task": nativeObject(map[string]any{
-			"title": nativeString("任务标题"), "description": nativeString("任务与验收/输出说明"),
-			"required_inputs": nativeArray(nativeString("输入端口")),
-		}, "title"),
-		"capability": nativeObject(map[string]any{
-			"tools": nativeArray(nativeString("工具名")), "model": nativeString("模型覆盖"), "isolation": nativeString("workspace"),
-		}),
-		"next": nativeArray(nativeObject(map[string]any{
-			"to": nativeString("目标节点"), "activation": nativeString("new"), "target_input": nativeString("目标输入端口"),
-			"when": nativeObject(map[string]any{
-				"event": nativeString("completed/failed/blocked/always"), "path": nativeString("$.field"),
-				"operator": nativeString("eq/ne/in/exists"), "value": map[string]any{},
-			}),
-		}, "to")),
-		"wait":        nativeObject(map[string]any{"event": nativeString("外部事件"), "timeout_sec": nativeInteger("超时秒")}, "event"),
-		"tool":        nativeObject(map[string]any{"name": nativeString("工具名"), "args": map[string]any{"type": "object"}}, "name"),
-		"metadata":    map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
-		"end_outcome": map[string]any{"type": "string", "enum": []string{"success", "failed", "blocked", "cancelled"}},
-		"output_contract": nativeObject(map[string]any{
-			"summary_required": map[string]any{"type": "boolean"},
-			"fields": nativeArray(nativeObject(map[string]any{
-				"path": nativeString("$.field"), "type": nativeString("字段类型"),
-				"description": nativeString("说明"), "required": map[string]any{"type": "boolean"},
-			}, "path", "type")),
-		}),
-		"progress_contract_ref": nativeString("framework ProgressContract ref"),
-		"context_policy_ref":    nativeString("framework ContextPolicy ref"),
-		"contract_bindings": nativeObject(map[string]any{
-			"deliverables": nativeArray(nativeString("deliverable ID")), "effects": nativeArray(nativeString("effect kind")),
-			"artifacts": nativeArray(nativeString("artifact ID")), "checks": nativeArray(nativeString("check ID")),
-			"success_evidence": nativeArray(nativeString("evidence ID")),
-		}),
+	if strings.TrimSpace(in.RequestID) == "" {
+		return "", fmt.Errorf("缺少 request_id")
 	}
-	required := []string{"kind", "next"}
-	if withID {
-		properties["id"] = nativeString("节点 ID")
-		required = append([]string{"id"}, required...)
+	if len(in.RequestID) > 256 {
+		return "", fmt.Errorf("request_id 超过256字节")
 	}
-	return nativeObject(properties, required...)
+	var result string
+	err = g.Store.WithRequest(ctx, func() error {
+		var e error
+		switch in.Operation {
+		case "create":
+			result, e = g.createDefinition(ctx, task, in)
+		case "update":
+			result, e = g.updateDefinition(ctx, task, in)
+		default:
+			e = fmt.Errorf("operation 必须为 create 或 update")
+		}
+		return e
+	})
+	return result, err
 }
 
-func graphContractNativeSchema() map[string]any {
-	requirement := nativeObject(map[string]any{
-		"id": nativeString("稳定 requirement ID"), "kind": nativeString("framework kind"), "description": nativeString("说明"),
-	}, "id", "kind")
-	return nativeObject(map[string]any{
-		"execution_class": map[string]any{"type": "string", "enum": []string{"answer", "read_only", "mutating", "interactive", "waiting"}},
-		"deliverables":    nativeArray(requirement), "constraints": nativeArray(nativeString("约束")),
-		"required_effects": nativeArray(nativeString("effect kind")), "required_artifacts": nativeArray(requirement),
-		"required_checks": nativeArray(requirement), "requires_acceptance": map[string]any{"type": "boolean"},
-		"success_evidence": nativeArray(requirement),
-	}, "execution_class", "deliverables")
-}
-
-func nativeObject(properties map[string]any, required ...string) map[string]any {
-	out := map[string]any{"type": "object", "properties": properties, "additionalProperties": false}
-	if len(required) > 0 {
-		out["required"] = required
+func prepareGraphBody(t *model.Task, in graphDefinitionInput, class graph.ExecutionClass) graph.GraphDefinitionBody {
+	body := graph.GraphDefinitionBody{Schema: graph.SchemaV5, Root: in.Root, Nodes: in.Nodes, RunID: t.RunID, RunContract: t.RunContract}
+	for id, n := range body.Nodes {
+		if n.Kind == graph.KindAgent || n.Kind == graph.KindController || n.Kind == graph.KindAcceptance {
+			if n.ContextPolicyRef == "" {
+				n.ContextPolicyRef = policycatalog.ContextDefaultCurrent
+			}
+			if n.ProgressContractRef == "" {
+				n.ProgressContractRef = policycatalog.ProgressInvestigationCurrent
+				if class == graph.ExecutionMutating && graphNodeWrites(n) {
+					n.ProgressContractRef = policycatalog.ProgressCodeChangeCurrent
+				}
+				if n.Kind == graph.KindController {
+					n.ProgressContractRef = policycatalog.ProgressCoordinationCurrent
+				}
+				if n.Kind == graph.KindAcceptance {
+					n.ProgressContractRef = policycatalog.ProgressVerificationCurrent
+				}
+			}
+			if n.OutputContract == nil {
+				n.OutputContract = &graph.NodeOutputContract{SummaryRequired: true}
+			}
+			body.Nodes[id] = n
+		}
 	}
-	return out
+	return body
 }
 
-func nativeArray(items map[string]any) map[string]any {
-	return map[string]any{"type": "array", "items": items}
+func graphNodeWrites(node graph.GraphDefinitionNode) bool {
+	if node.Kind != graph.KindAgent {
+		return false
+	}
+	if node.Capability == nil {
+		return true
+	}
+	for _, name := range node.Capability.Tools {
+		if name == "apply_change" {
+			return true
+		}
+	}
+	return false
 }
-func nativeString(description string) map[string]any {
-	return map[string]any{"type": "string", "description": description}
+
+func (g GraphAuthoringGroup) createDefinition(ctx context.Context, t *model.Task, in applyGraphArgs) (string, error) {
+	if t.GraphID != "" || t.InterventionGraphID != "" {
+		return "", fmt.Errorf("图内协调任务不能创建无关的新图")
+	}
+	if in.Definition == nil || in.Contract == nil || in.Changes != nil || in.GraphID != "" || in.ExpectedRevision != 0 || in.InFlight != "" {
+		return "", fmt.Errorf("create 仅接受 definition 与 contract，不接受 update 参数")
+	}
+	key := graphRequestKey(t.ID, in.RequestID)
+	body := prepareGraphBody(t, *in.Definition, in.Contract.ExecutionClass)
+	contract := *in.Contract
+	contract.RequestRef, contract.RequestDigest = t.ID, schedulerRequestDigest(t)
+	draft, exists := g.Store.GetDraft("apply-" + key)
+	if exists {
+		if draft.SessionID != g.sessionID() || draft.OwnerTaskID != t.ID || !sameGraphValue(draft.Candidate, body) || !sameGraphValue(draft.Contract, contract) {
+			return "", fmt.Errorf("request_id 已用于不同建图内容")
+		}
+		if draft.Status == graph.DraftCommitted {
+			d, ok := g.Store.GetDefinition(draft.GraphID, draft.CommittedDefinitionRevision)
+			if !ok {
+				return "", fmt.Errorf("已提交请求缺少正式图")
+			}
+			return graphApplyReceipt(in.RequestID, d, nil)
+		}
+	} else {
+		var err error
+		draft, err = g.Store.CreateDraft(graph.GraphDraft{ProposalID: "apply-" + key, GraphID: "graph-" + key, SessionID: g.sessionID(), OwnerTaskID: t.ID, RequestRef: t.ID, RequestDigest: contract.RequestDigest, Contract: contract, Candidate: body})
+		if err != nil {
+			return "", err
+		}
+	}
+	compiled, err := g.compile(ctx, *draft, "draft")
+	if err != nil {
+		return "", err
+	}
+	d, err := g.Store.CommitDraft(draft.ProposalID, draft.DraftRevision, compiled.Report.ReportID, compiled.Definition)
+	if err != nil {
+		return "", err
+	}
+	return graphApplyReceipt(in.RequestID, d, nil)
 }
-func nativeInteger(description string) map[string]any {
-	return map[string]any{"type": "integer", "description": description}
+
+func (g GraphAuthoringGroup) updateDefinition(ctx context.Context, t *model.Task, in applyGraphArgs) (string, error) {
+	if in.Definition != nil || in.Contract != nil || in.Changes == nil || in.Changes.Empty() || in.GraphID == "" || in.ExpectedRevision <= 0 || strings.TrimSpace(in.Reason) == "" || in.InFlight != "preserve" {
+		return "", fmt.Errorf("update 需要 graph_id、expected_revision、非空 changes、reason 和 in_flight=preserve，不接受 definition/contract")
+	}
+	base, ok := g.Store.GetDefinition(in.GraphID, in.ExpectedRevision)
+	if !ok {
+		return "", fmt.Errorf("目标图版本不存在")
+	}
+	if err := g.authorize(t, base); err != nil {
+		return "", err
+	}
+	if g.Runtime == nil || g.Runtime.Runtime == nil {
+		return "", fmt.Errorf("图变更运行时未注入")
+	}
+	key := "apply-" + graphRequestKey(t.ID, in.RequestID)
+	change, exists := g.Store.GetGraphChangeProposal(key)
+	if exists {
+		if change.GraphID != in.GraphID || change.OwnerTaskID != t.ID || change.SessionID != g.sessionID() || change.BaseDefinitionRevision != in.ExpectedRevision || change.Reason != in.Reason || !sameGraphValue(change.Patch, *in.Changes) {
+			return "", fmt.Errorf("request_id 已用于不同变更内容")
+		}
+		if change.Status == graph.GraphChangeCommitted {
+			d, ok := g.Store.GetDefinition(change.GraphID, change.CommittedDefinitionRevision)
+			if !ok {
+				return "", fmt.Errorf("变更回执缺少正式图")
+			}
+			if err := g.Runtime.ReconcileCommittedDefinitions(); err != nil {
+				return "", err
+			}
+			return graphApplyReceipt(in.RequestID, d, base)
+		}
+	} else {
+		latest, _ := g.Store.LatestDefinition(in.GraphID)
+		if latest.Revision != in.ExpectedRevision {
+			return "", &graph.AuthoringRevisionConflictError{Kind: "definition", ID: in.GraphID, Expected: in.ExpectedRevision, Current: latest.Revision}
+		}
+		var err error
+		change, err = g.Store.CreateGraphChangeProposal(graph.GraphChangeProposal{ChangeID: key, GraphID: in.GraphID, BaseDefinitionRevision: base.Revision, BaseDefinitionDigest: base.DefinitionDigest, SessionID: g.sessionID(), OwnerTaskID: t.ID, Reason: in.Reason, Patch: *in.Changes})
+		if err != nil {
+			return "", err
+		}
+	}
+	candidate, err := graph.ApplyGraphDefinitionPatch(base.Body, *in.Changes)
+	if err != nil {
+		return "", err
+	}
+	candidate = prepareGraphBody(t, graphDefinitionInput{Root: candidate.Root, Nodes: candidate.Nodes}, base.Contract.ExecutionClass)
+	// 图的运行身份与创建时冻结值保持一致，不由协调任务替换。
+	candidate.RunID, candidate.RunContract = base.Body.RunID, base.Body.RunContract
+	compiled, err := g.compile(ctx, graph.GraphDraft{ProposalID: key, GraphID: in.GraphID, SessionID: g.sessionID(), OwnerTaskID: base.OwnerTaskID, BaseDefinitionRevision: base.Revision, DraftRevision: change.ProposalRevision, Status: graph.DraftEditing, RequestRef: base.Contract.RequestRef, RequestDigest: base.Contract.RequestDigest, Contract: base.Contract, Candidate: candidate}, "change")
+	if err != nil {
+		return "", err
+	}
+	d, err := g.Runtime.CommitGraphChangeAndAdopt(key, change.ProposalRevision, compiled.Report.ReportID)
+	if err != nil {
+		return "", err
+	}
+	if t.GraphID == "" && t.InterventionGraphID != "" && g.Finalization != nil {
+		g.Finalization.MarkTaskFinalized()
+	}
+	return graphApplyReceipt(in.RequestID, d, base)
+}
+
+func (g GraphAuthoringGroup) compile(ctx context.Context, d graph.GraphDraft, kind string) (graph.DefinitionCompileResult, error) {
+	if err := ctx.Err(); err != nil {
+		return graph.DefinitionCompileResult{}, err
+	}
+	reportID := "validation-" + graphRequestKey(d.ProposalID, fmt.Sprint(d.DraftRevision))
+	if saved, ok := g.Store.GetValidationReport(reportID); ok {
+		if saved.SubjectKind != kind || saved.SubjectID != d.ProposalID || saved.SubjectRevision != d.DraftRevision || saved.NormalizedDefinition == nil {
+			return graph.DefinitionCompileResult{}, fmt.Errorf("验证请求身份冲突")
+		}
+		cached := graph.DefinitionCompileResult{Definition: *saved.NormalizedDefinition, Report: *saved}
+		if !saved.Accepted {
+			raw, _ := json.Marshal(saved.Errors)
+			return cached, fmt.Errorf("图变更被拒绝: %s", raw)
+		}
+		return cached, nil
+	}
+	result, err := g.Compiler.Compile(ctx, graph.DefinitionCompileRequest{ReportID: "validation-" + graphRequestKey(d.ProposalID, fmt.Sprint(d.DraftRevision)), Draft: d, DefinitionRevision: d.BaseDefinitionRevision + 1})
+	if err != nil {
+		return result, err
+	}
+	result.Report.SubjectKind = kind
+	if err = g.validateDefinitionRoutes(d.GraphID, result.Definition); err != nil {
+		result.Report.Accepted = false
+		result.Report.Errors = append(result.Report.Errors, graph.ValidationIssue{Code: "GRAPH_ROUTE_INVALID", Path: "nodes", Message: err.Error(), Retryable: true})
+	}
+	if _, err = g.Store.RecordValidation(result.Report); err != nil {
+		return result, err
+	}
+	if !result.Report.Accepted {
+		raw, _ := json.Marshal(result.Report.Errors)
+		return result, fmt.Errorf("图变更被拒绝: %s", raw)
+	}
+	return result, nil
+}
+
+func sameGraphValue(a, b any) bool {
+	left, _ := json.Marshal(a)
+	right, _ := json.Marshal(b)
+	return string(left) == string(right)
+}
+
+// graphApplyReceipt 给出实际提交定义的差异摘要，完整内容可按 revision 读取。
+func graphApplyReceipt(requestID string, d, base *graph.GraphDefinition) (string, error) {
+	added, changed, removed := []string{}, []string{}, []string{}
+	for id, node := range d.Body.Nodes {
+		if base == nil {
+			added = append(added, id)
+			continue
+		}
+		old, exists := base.Body.Nodes[id]
+		if !exists {
+			added = append(added, id)
+		} else if !sameGraphValue(old, node) {
+			changed = append(changed, id)
+		}
+	}
+	if base != nil {
+		for id := range base.Body.Nodes {
+			if _, exists := d.Body.Nodes[id]; !exists {
+				removed = append(removed, id)
+			}
+		}
+	}
+	sort.Strings(added)
+	sort.Strings(changed)
+	sort.Strings(removed)
+	return marshalGraphAuthoringResult(map[string]any{
+		"schema": "agentgo.graph-apply-receipt/v1", "status": "applied", "request_id": requestID,
+		"graph_id": d.GraphID, "revision": d.Revision, "definition_digest": d.DefinitionDigest, "source_request": d.SourceProposalID,
+		"diff": map[string]any{"added_nodes": added, "changed_nodes": changed, "removed_nodes": removed,
+			"root_changed": base == nil || base.Body.Root != d.Body.Root},
+	})
+}
+
+func (g GraphAuthoringGroup) readGraphDefinition(_ context.Context, args map[string]any) (string, error) {
+	t, err := g.actor(false)
+	if err != nil {
+		return "", err
+	}
+	var in struct {
+		GraphID  string `json:"graph_id"`
+		Revision int64  `json:"revision"`
+		NodeID   string `json:"node_id"`
+		Offset   int    `json:"offset"`
+		Limit    int    `json:"limit"`
+	}
+	if err = decodeNativeGraphArgs(args, &in); err != nil {
+		return "", err
+	}
+	if in.Offset < 0 || in.Limit < 0 || in.Limit > 128 || (in.Offset > 0 && in.Revision <= 0) {
+		return "", fmt.Errorf("分页范围非法，后续页必须指定 revision")
+	}
+	var d *graph.GraphDefinition
+	var ok bool
+	if in.Revision == 0 {
+		d, ok = g.Store.LatestDefinition(in.GraphID)
+	} else {
+		d, ok = g.Store.GetDefinition(in.GraphID, in.Revision)
+	}
+	if !ok {
+		return "", fmt.Errorf("图定义未找到")
+	}
+	if err = g.authorize(t, d); err != nil {
+		return "", err
+	}
+	ids := make([]string, 0, len(d.Body.Nodes))
+	for id := range d.Body.Nodes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if in.NodeID != "" {
+		if _, ok = d.Body.Nodes[in.NodeID]; !ok {
+			return "", fmt.Errorf("节点未找到")
+		}
+		ids = []string{in.NodeID}
+	}
+	if in.Offset > len(ids) {
+		return "", fmt.Errorf("分页起点越界")
+	}
+	if in.Limit == 0 {
+		in.Limit = 32
+	}
+	end := min(len(ids), in.Offset+in.Limit)
+	nodes := map[string]graph.GraphDefinitionNode{}
+	for _, id := range ids[in.Offset:end] {
+		nodes[id] = d.Body.Nodes[id]
+	}
+	return marshalGraphAuthoringResult(map[string]any{"graph_id": d.GraphID, "revision": d.Revision, "definition_digest": d.DefinitionDigest, "root": d.Body.Root, "contract": d.Contract, "nodes": nodes, "next_offset": end, "has_more": end < len(ids)})
+}
+
+func (g GraphAuthoringGroup) controlGraph(ctx context.Context, args map[string]any) (string, error) {
+	if g.Store == nil {
+		return "", fmt.Errorf("图定义存储未注入")
+	}
+	var out string
+	err := g.Store.WithRequest(ctx, func() error { var e error; out, e = g.executeGraphControl(ctx, args); return e })
+	return out, err
+}
+
+func (g GraphAuthoringGroup) executeGraphControl(ctx context.Context, args map[string]any) (string, error) {
+	t, err := g.actor(true)
+	if err != nil {
+		return "", err
+	}
+	var in struct {
+		GraphID          string `json:"graph_id"`
+		Action           string `json:"action"`
+		ExpectedRevision int64  `json:"expected_revision"`
+		Reason           string `json:"reason"`
+	}
+	if err = decodeNativeGraphArgs(args, &in); err != nil {
+		return "", err
+	}
+	d, ok := g.Store.LatestDefinition(in.GraphID)
+	if !ok {
+		return "", fmt.Errorf("图定义未找到")
+	}
+	if err = g.authorize(t, d); err != nil {
+		return "", err
+	}
+	if d.Revision != in.ExpectedRevision {
+		return "", fmt.Errorf("图版本冲突：当前=%d 预期=%d", d.Revision, in.ExpectedRevision)
+	}
+	if g.Runtime == nil || g.Runtime.Runtime == nil {
+		return "", fmt.Errorf("图运行时未注入")
+	}
+	if err = ctx.Err(); err != nil {
+		return "", err
+	}
+	switch in.Action {
+	case "start":
+		if g.Finalization == nil {
+			return "", fmt.Errorf("缺少启动后的任务交棒通道")
+		}
+		if t.ID != d.OwnerTaskID {
+			return "", fmt.Errorf("只有创建任务能启动当前定义")
+		}
+		result, err := g.Runtime.StartDefinition(ctx, graph.StartDefinitionRequest{StartID: "start-" + d.GraphID, GraphID: d.GraphID, ExpectedDefinitionRevision: d.Revision, ExpectedDefinitionDigest: d.DefinitionDigest, ExpectedContractDigest: d.ContractDigest, SessionID: g.sessionID(), OwnerTaskID: t.ID})
+		if err != nil {
+			return "", err
+		}
+		g.Finalization.MarkTaskFinalized()
+		return marshalGraphAuthoringResult(result)
+	case "cancel":
+		if strings.TrimSpace(in.Reason) == "" {
+			return "", fmt.Errorf("取消需要 reason")
+		}
+		if err = g.Runtime.CancelDefinition(in.GraphID, in.ExpectedRevision, in.Reason); err != nil {
+			return "", err
+		}
+		return marshalGraphAuthoringResult(map[string]any{"graph_id": in.GraphID, "status": "cancel_requested", "revision": in.ExpectedRevision})
+	default:
+		return "", fmt.Errorf("action 仅允许 start 或 cancel")
+	}
 }

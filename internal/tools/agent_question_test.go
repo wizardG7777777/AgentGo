@@ -19,7 +19,7 @@ const validAgentQuestionOptions = `[
   {"id":"change_scope","label":"调整范围","description":"请说明需要如何调整","requires_text":true}
 ]`
 
-func dispatchAgentQuestion(ctx context.Context, group MetaGroup, args map[string]any) (string, error) {
+func dispatchAgentQuestion(ctx context.Context, group CommunicationGroup, args map[string]any) (string, error) {
 	registry := agent.NewToolRegistry()
 	group.Register(registry)
 	return registry.Dispatch(ctx, llm.ToolCall{Name: "request_user_input", Arguments: args})
@@ -43,9 +43,9 @@ func waitAgentQuestion(t *testing.T, service *interaction.Service, sessionID str
 	}
 }
 
-func TestMetaGroup_RequestUserInputSchemaAndConditionalRegistration(t *testing.T) {
+func TestCommunicationGroup_RequestUserInputSchemaAndConditionalRegistration(t *testing.T) {
 	withoutService := agent.NewToolRegistry()
-	MetaGroup{AgentID: "worker-1"}.Register(withoutService)
+	CommunicationGroup{AgentID: "worker-1"}.Register(withoutService)
 	for _, def := range withoutService.Defs() {
 		if def.Name == "request_user_input" {
 			t.Fatal("Interaction Service 为 nil 时不应注册 request_user_input")
@@ -53,7 +53,7 @@ func TestMetaGroup_RequestUserInputSchemaAndConditionalRegistration(t *testing.T
 	}
 
 	registry := agent.NewToolRegistry()
-	MetaGroup{Interactions: interaction.NewService(nil), AgentID: "worker-1"}.Register(registry)
+	CommunicationGroup{Interactions: interaction.NewService(nil), AgentID: "worker-1"}.Register(registry)
 	if len(registry.Defs()) != 1 || registry.Defs()[0].Name != "request_user_input" {
 		t.Fatalf("Defs = %+v", registry.Defs())
 	}
@@ -75,7 +75,7 @@ func TestRequestUserInputResponseAndTrustedBinding(t *testing.T) {
 	service := interaction.NewService(nil)
 	var mu sync.Mutex
 	var hookCalls []bool
-	group := MetaGroup{
+	group := CommunicationGroup{
 		Interactions: service,
 		SessionID:    func() string { return "session-question" },
 		AgentID:      "worker-1",
@@ -161,7 +161,7 @@ func TestRequestUserInputResponseAndTrustedBinding(t *testing.T) {
 
 func TestRequestUserInputRequiresText(t *testing.T) {
 	service := interaction.NewService(nil)
-	group := MetaGroup{
+	group := CommunicationGroup{
 		Interactions: service, SessionID: func() string { return "session-text" }, AgentID: "worker-2",
 	}
 	ctx := agent.WithAgentContext(context.Background(), "worker-2", "task-text", 1)
@@ -209,7 +209,7 @@ func TestRequestUserInputRequiresText(t *testing.T) {
 
 func TestRequestUserInputStrictValidation(t *testing.T) {
 	service := interaction.NewService(nil)
-	group := MetaGroup{Interactions: service, AgentID: "worker-1"}
+	group := CommunicationGroup{Interactions: service, AgentID: "worker-1"}
 	ctx := agent.WithAgentContext(context.Background(), "worker-1", "task-validation", 1)
 	tests := []struct {
 		name string
@@ -249,7 +249,7 @@ func TestRequestUserInputCancellationInterruptsAndFailsClosed(t *testing.T) {
 	service := interaction.NewService(nil)
 	var mu sync.Mutex
 	var calls []bool
-	group := MetaGroup{
+	group := CommunicationGroup{
 		Interactions: service, SessionID: func() string { return "session-cancel" }, AgentID: "worker-3",
 		InteractionWaitHook: func(waiting bool) {
 			mu.Lock()
@@ -291,7 +291,7 @@ func TestRequestUserInputCancellationInterruptsAndFailsClosed(t *testing.T) {
 }
 
 func TestRequestUserInputNilServiceFailsClosed(t *testing.T) {
-	group := MetaGroup{AgentID: "worker-1"}
+	group := CommunicationGroup{AgentID: "worker-1"}
 	ctx := agent.WithAgentContext(context.Background(), "worker-1", "task-1", 1)
 	_, err := group.requestUserInput(ctx, map[string]any{
 		"prompt": "p", "options_json": validAgentQuestionOptions,

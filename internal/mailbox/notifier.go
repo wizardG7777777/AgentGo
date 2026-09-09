@@ -117,6 +117,10 @@ func (n *MailNotifier) scan() {
 	runner := n.registry.HookRunner()
 
 	for _, status := range nonEmpty {
+		// 工具消息不产生任务，即使未安装 hook 或没有 Run 绑定也不能唤醒。
+		if status.ControlCount == 0 {
+			continue
+		}
 		// 跳过 scheduler（它有自己的 ticker 驱动 drain）
 		if strings.HasPrefix(status.AgentID, "scheduler") || status.EventType == "__scheduler__" {
 			continue

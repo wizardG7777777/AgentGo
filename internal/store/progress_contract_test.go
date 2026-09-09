@@ -2,7 +2,6 @@ package store
 
 import (
 	"testing"
-	"time"
 
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
@@ -15,15 +14,14 @@ func TestProgressContractCloneAndSnapshotRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	profile, ok := catalog.ProgressContract(policycatalog.ProgressCodeChangeV1)
+	profile, ok := catalog.ProgressContract(policycatalog.ProgressCodeChangeCurrent)
 	if !ok {
 		t.Fatal("缺少 code-change contract")
 	}
 	contract := &profile.Contract
 	source := NewMemoryTaskStore(nil, 100, 1, 60)
 	task := &model.Task{Description: "修改代码", MaxConcurrency: 1}
-	if err := taskcontract.Start(task, loopcontract.WorkCodeChange, "test-progress/v1",
-		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+	if err := taskcontract.Start(task, loopcontract.WorkCodeChange, "test-progress/v1"); err != nil {
 		t.Fatal(err)
 	}
 	// 保留调用方拥有的 contract 指针，验证 PublishTask 的深拷贝边界。

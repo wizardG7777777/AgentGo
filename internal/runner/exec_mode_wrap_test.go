@@ -37,12 +37,12 @@ func newWriteToolRegistry(t *testing.T, projectRoot string) *agent.ToolRegistry 
 
 func dispatchWriteFile(registry *agent.ToolRegistry, path, content string) (string, error) {
 	return registry.Dispatch(context.Background(), llm.ToolCall{
-		Name:      "write_file",
+		Name:      "apply_change",
 		Arguments: map[string]any{"path": path, "content": content},
 	})
 }
 
-// 装配断言：strict + Interaction 服务缺失时，runner 的 write_file 被 fail-closed 拦截。
+// 装配断言：strict + Interaction 服务缺失时，runner 的 apply_change 被 fail-closed 拦截。
 func TestWrapFileWriteApproval_StrictBlocksWithoutService(t *testing.T) {
 	dir := t.TempDir()
 	registry := newWriteToolRegistry(t, dir)
@@ -59,7 +59,7 @@ func TestWrapFileWriteApproval_StrictBlocksWithoutService(t *testing.T) {
 	}
 }
 
-// 装配断言：nil Modes（等价 normal）时 write_file 透传执行。
+// 装配断言：nil Modes（等价 normal）时 apply_change 透传执行。
 func TestWrapFileWriteApproval_NormalPassthrough(t *testing.T) {
 	dir := t.TempDir()
 	registry := newWriteToolRegistry(t, dir)
@@ -67,7 +67,7 @@ func TestWrapFileWriteApproval_NormalPassthrough(t *testing.T) {
 
 	target := filepath.Join(dir, "a.txt")
 	out, err := dispatchWriteFile(registry, target, "hello")
-	if err != nil || !strings.Contains(out, "文件已写入") {
+	if err != nil || !strings.Contains(out, "文件变更已应用") {
 		t.Fatalf("normal 下写入应成功: out=%q err=%v", out, err)
 	}
 	data, _ := os.ReadFile(target)
@@ -76,7 +76,7 @@ func TestWrapFileWriteApproval_NormalPassthrough(t *testing.T) {
 	}
 }
 
-// 装配闭环：strict 下 write_file 创建 file_write 审批请求，用户 allow_once 后落盘。
+// 装配闭环：strict 下 apply_change 创建 file_write 审批请求，用户 allow_once 后落盘。
 func TestWrapFileWriteApproval_StrictFullCycle(t *testing.T) {
 	dir := t.TempDir()
 	registry := newWriteToolRegistry(t, dir)
@@ -133,7 +133,7 @@ func TestWrapFileWriteApproval_StrictFullCycle(t *testing.T) {
 			t.Fatalf("allow_once 后写入应成功: %v", res.err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("授权后 write_file 未返回")
+		t.Fatal("授权后 apply_change 未返回")
 	}
 	data, _ := os.ReadFile(target)
 	if string(data) != "approved" {

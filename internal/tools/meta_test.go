@@ -133,21 +133,21 @@ func (f fakeRouteValidator) RouteCapabilityEnvelopeForPlan(ownerScopeID, eventTy
 
 // ---- Register counting tests ----
 
-func TestMetaGroup_Register_BothTools(t *testing.T) {
+func TestCommunicationGroup_Register_BothTools(t *testing.T) {
 	reg := agent.NewToolRegistry()
-	MetaGroup{
+	CommunicationGroup{
 		Store:      newFakeStore(),
 		MBRegistry: mailbox.NewRegistry(4),
 		AgentID:    "a1",
 	}.Register(reg)
-	if got := len(reg.Defs()); got != 2 {
-		t.Fatalf("expected 2 tools, got %d", got)
+	if got := len(reg.Defs()); got != 1 {
+		t.Fatalf("只应注册信息工具, got %d", got)
 	}
 }
 
-func TestMetaGroup_Register_OnlyMailbox(t *testing.T) {
+func TestCommunicationGroup_Register_OnlyMailbox(t *testing.T) {
 	reg := agent.NewToolRegistry()
-	MetaGroup{
+	CommunicationGroup{
 		MBRegistry: mailbox.NewRegistry(4),
 		AgentID:    "a1",
 	}.Register(reg)
@@ -159,20 +159,9 @@ func TestMetaGroup_Register_OnlyMailbox(t *testing.T) {
 	}
 }
 
-func TestMetaGroup_Register_OnlyStore(t *testing.T) {
+func TestCommunicationGroup_Register_NeitherDep(t *testing.T) {
 	reg := agent.NewToolRegistry()
-	MetaGroup{Store: newFakeStore()}.Register(reg)
-	if got := len(reg.Defs()); got != 1 {
-		t.Fatalf("expected 1 tool, got %d", got)
-	}
-	if reg.Defs()[0].Name != "publish_task" {
-		t.Fatalf("expected publish_task, got %s", reg.Defs()[0].Name)
-	}
-}
-
-func TestMetaGroup_Register_NeitherDep(t *testing.T) {
-	reg := agent.NewToolRegistry()
-	MetaGroup{}.Register(reg)
+	CommunicationGroup{}.Register(reg)
 	if got := len(reg.Defs()); got != 0 {
 		t.Fatalf("expected 0 tools, got %d", got)
 	}
@@ -180,316 +169,8 @@ func TestMetaGroup_Register_NeitherDep(t *testing.T) {
 
 // ---- publish_task behavior ----
 
-func TestPublishTask_SchedulerMode_NoDepthLimit(t *testing.T) {
-	s := newFakeStore()
-	g := MetaGroup{Store: s, Holder: nil, MaxDepth: 3}
-	reg := agent.NewToolRegistry()
-	g.Register(reg)
-
-	for i := 0; i < 100; i++ {
-		out, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-			"description": fmt.Sprintf("t%d", i),
-		}))
-		if err != nil {
-			t.Fatalf("publish #%d failed: %v", i, err)
-		}
-		if !strings.Contains(out, "depth=0") {
-			t.Fatalf("expected depth=0, got %q", out)
-		}
-	}
-	for _, task := range s.createCalls {
-		if task.Depth != 0 {
-			t.Fatalf("scheduler mode should always produce depth=0, got %d", task.Depth)
-		}
-	}
-}
-
-func TestPublishTask_SchedulerRejectsMissingRuntimeRoute(t *testing.T) {
-	s := newFakeStore()
-	g := MetaGroup{Store: s, RouteValidator: fakeRouteValidator{routes: map[string][]string{"team:ready": {"read_file"}}}}
-	reg := agent.NewToolRegistry()
-	g.Register(reg)
-
-	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "will hang", "event_type": "team:missing",
-	})); err == nil || !strings.Contains(err.Error(), "没有 ready Agent route") {
-		t.Fatalf("expected deterministic missing-route rejection, got %v", err)
-	}
-	if len(s.createCalls) != 0 {
-		t.Fatalf("missing route must not publish a task: %+v", s.createCalls)
-	}
-	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "routable", "event_type": "team:ready",
-	})); err != nil {
-		t.Fatalf("ready route should publish: %v", err)
-	}
-}
-
 // 动态 Team 路由按命名空间化归属 scope 绑定：别的 scope 拥有的 team 路由
 // 对当前请求不可见；本 scope 拥有的路由与全局静态路由照常可用。
-func TestPublishTask_DynamicRouteIsBoundToCurrentScopeWhileStaticRouteRemainsGlobal(t *testing.T) {
-	s := newFakeStore()
-	controller := &model.Task{ID: "controller-b", Depth: 0, Status: model.TaskStatusProcessing}
-	s.tasks[controller.ID] = controller
-	routes := fakeRouteValidator{
-		routes: map[string][]string{
-			"team:owned-by-a": {"read_file"},
-			"team:owned-by-b": {"read_file"},
-			"static:global":   {"read_file"},
-		},
-		ownerScopes: map[string]string{
-			"team:owned-by-a": model.TaskRouteScope("controller-a"),
-			"team:owned-by-b": model.TaskRouteScope("controller-b"),
-		},
-	}
-	g := MetaGroup{
-		Store: s, LineageHolder: &fakeHolder{id: controller.ID}, RouteValidator: routes,
-	}
-	reg := agent.NewToolRegistry()
-	g.Register(reg)
-
-	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "must not escape request scope", "event_type": "team:owned-by-a",
-	})); err == nil || !strings.Contains(err.Error(), "没有 ready Agent route") {
-		t.Fatalf("cross-scope dynamic route should be rejected, got %v", err)
-	}
-	if len(s.createCalls) != 0 {
-		t.Fatalf("cross-scope rejection must happen before publishing: %+v", s.createCalls)
-	}
-
-	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "own team work", "event_type": "team:owned-by-b",
-	})); err != nil {
-		t.Fatalf("own-scope dynamic route should publish: %v", err)
-	}
-	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "global static work", "event_type": "static:global",
-	})); err != nil {
-		t.Fatalf("static route should remain usable from any scope: %v", err)
-	}
-	if len(s.createCalls) != 2 {
-		t.Fatalf("expected 2 published tasks, got %+v", s.createCalls)
-	}
-	for _, created := range s.createCalls {
-		if created.EventSource != controller.ID || created.ParentTaskID != controller.ID {
-			t.Fatalf("published task lost controller lineage: %+v", created)
-		}
-		if created.RouteScope != model.TaskRouteScope(controller.ID) {
-			t.Fatalf("published task lost durable route scope: %+v", created)
-		}
-	}
-}
-
-func TestPublishTask_GraphControllerCannotCreateOffGraphTask(t *testing.T) {
-	s := newFakeStore()
-	controller := &model.Task{
-		ID: "same-raw-id", GraphID: "same-raw-id",
-		EventType: "__scheduler__", Status: model.TaskStatusProcessing,
-	}
-	s.tasks[controller.ID] = controller
-	registry := agent.NewToolRegistry()
-	MetaGroup{
-		Store: s, LineageHolder: &fakeHolder{id: controller.ID},
-	}.Register(registry)
-
-	_, err := registry.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "same Graph work", "event_type": "team:graph-owned",
-	}))
-	if err == nil || !strings.Contains(err.Error(), "Graph controller 禁止") || !strings.Contains(err.Error(), "patch_graph") {
-		t.Fatalf("Graph controller off-graph publish err=%v", err)
-	}
-	if len(s.createCalls) != 0 {
-		t.Fatalf("Graph controller published off-graph tasks: %+v", s.createCalls)
-	}
-}
-
-func TestPublishTask_GraphWorkerCannotCreateOffGraphTask(t *testing.T) {
-	s := newFakeStore()
-	parent := &model.Task{
-		ID: "graph-work", GraphID: "g-owned", NodeID: "work", ActivationID: "work@1",
-		Depth: 1, Status: model.TaskStatusProcessing,
-	}
-	s.tasks[parent.ID] = parent
-	registry := agent.NewToolRegistry()
-	MetaGroup{
-		Store: s, Holder: &fakeHolder{id: parent.ID}, MaxDepth: 3, AgentID: "worker-1",
-	}.Register(registry)
-
-	_, err := registry.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "hidden child",
-	}))
-	if err == nil || !strings.Contains(err.Error(), "Graph 节点禁止") || !strings.Contains(err.Error(), "request_replan") {
-		t.Fatalf("Graph worker off-graph publish err=%v", err)
-	}
-	if len(s.createCalls) != 0 {
-		t.Fatalf("Graph worker published off-graph tasks: %+v", s.createCalls)
-	}
-}
-
-func TestPublishTask_ExploreNameUsesRuntimeCapabilitiesWhenRegistryIsAvailable(t *testing.T) {
-	s := newFakeStore()
-	controller := &model.Task{ID: "controller", Status: model.TaskStatusProcessing}
-	s.tasks[controller.ID] = controller
-	g := MetaGroup{
-		Store: s, LineageHolder: &fakeHolder{id: controller.ID},
-		RouteValidator: fakeRouteValidator{routes: map[string][]string{
-			"explore": {"read_file", "write_file"},
-		}},
-	}
-	reg := agent.NewToolRegistry()
-	g.Register(reg)
-
-	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "custom writable investigation", "event_type": "explore",
-		"expected_artifacts": "report.md",
-	})); err != nil {
-		t.Fatalf("capability-backed writable explore route should be accepted: %v", err)
-	}
-	if len(s.createCalls) != 1 || len(s.createCalls[0].ExpectedArtifacts) != 1 {
-		t.Fatalf("writable explore task was not published: %+v", s.createCalls)
-	}
-}
-
-func TestPublishTask_LegacyExploreFallbackRemainsReadOnlyWithoutRegistry(t *testing.T) {
-	s := newFakeStore()
-	g := MetaGroup{Store: s}
-	reg := agent.NewToolRegistry()
-	g.Register(reg)
-
-	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "legacy investigation", "event_type": "explore",
-		"expected_artifacts": "report.md",
-	})); err == nil || !strings.Contains(err.Error(), "只读 Explorer") {
-		t.Fatalf("legacy explore route should retain read-only fallback, got %v", err)
-	}
-	if len(s.createCalls) != 0 {
-		t.Fatalf("legacy read-only route published an artifact task: %+v", s.createCalls)
-	}
-}
-
-func TestPublishTask_WorkerMode_DepthIncrement(t *testing.T) {
-	s := newFakeStore()
-	parent := &model.Task{ID: "parent", Depth: 1, Status: model.TaskStatusProcessing}
-	s.tasks[parent.ID] = parent
-
-	g := MetaGroup{Store: s, Holder: &fakeHolder{id: "parent"}, MaxDepth: 3, AgentID: "worker-7"}
-	reg := agent.NewToolRegistry()
-	g.Register(reg)
-
-	_, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "child",
-	}))
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if len(s.createCalls) != 1 || s.createCalls[0].Depth != 2 {
-		t.Fatalf("expected child depth=2, got %+v", s.createCalls)
-	}
-	child := s.createCalls[0]
-	if child.ParentTaskID != parent.ID || child.ReplyToAgentID != "worker-7" || child.BatchID != parent.ID {
-		t.Fatalf("child routing metadata = %+v", child)
-	}
-}
-
-func TestPublishTask_WorkerMode_DepthLimitExceeded(t *testing.T) {
-	s := newFakeStore()
-	parent := &model.Task{ID: "p", Depth: 3}
-	s.tasks[parent.ID] = parent
-
-	g := MetaGroup{Store: s, Holder: &fakeHolder{id: "p"}, MaxDepth: 3}
-	reg := agent.NewToolRegistry()
-	g.Register(reg)
-
-	_, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "too-deep",
-	}))
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !strings.Contains(err.Error(), "已达到最大子任务深度") {
-		t.Fatalf("error text mismatch: %v", err)
-	}
-}
-
-func TestPublishTask_WorkerMode_AtBoundary(t *testing.T) {
-	// parent depth=2, MaxDepth=3 → child depth=3. worker.go uses `childDepth > maxDepth`,
-	// so depth=3 must be ALLOWED.
-	s := newFakeStore()
-	parent := &model.Task{ID: "p", Depth: 2}
-	s.tasks[parent.ID] = parent
-
-	g := MetaGroup{Store: s, Holder: &fakeHolder{id: "p"}, MaxDepth: 3}
-	reg := agent.NewToolRegistry()
-	g.Register(reg)
-
-	_, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "edge",
-	}))
-	if err != nil {
-		t.Fatalf("boundary depth should be allowed, got err: %v", err)
-	}
-	if len(s.createCalls) != 1 || s.createCalls[0].Depth != 3 {
-		t.Fatalf("expected child depth=3, got %+v", s.createCalls)
-	}
-}
-
-func TestPublishTask_MissingDescription(t *testing.T) {
-	s := newFakeStore()
-	g := MetaGroup{Store: s}
-	reg := agent.NewToolRegistry()
-	g.Register(reg)
-
-	_, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{}))
-	if err == nil || !strings.Contains(err.Error(), "description") {
-		t.Fatalf("expected missing description error, got %v", err)
-	}
-}
-
-func TestPublishTask_InvalidDependency_Rejected(t *testing.T) {
-	s := newFakeStore()
-	g := MetaGroup{Store: s}
-	reg := agent.NewToolRegistry()
-	g.Register(reg)
-
-	_, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description":  "task with bad dep",
-		"dependencies": "nonexistent-task-id",
-	}))
-	if err == nil {
-		t.Fatal("expected error for nonexistent dependency, got nil")
-	}
-	if !strings.Contains(err.Error(), "依赖任务 nonexistent-task-id 不存在") {
-		t.Fatalf("unexpected error text: %v", err)
-	}
-	if len(s.createCalls) != 0 {
-		t.Fatalf("expected no task created, got %d", len(s.createCalls))
-	}
-}
-
-func TestPublishTask_ValidDependency_Accepted(t *testing.T) {
-	s := newFakeStore()
-	existing := &model.Task{ID: "real-dep", Depth: 0, Status: model.TaskStatusCompleted}
-	s.tasks[existing.ID] = existing
-
-	g := MetaGroup{Store: s}
-	reg := agent.NewToolRegistry()
-	g.Register(reg)
-
-	_, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description":  "task with valid dep",
-		"dependencies": "real-dep",
-	}))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(s.createCalls) != 1 {
-		t.Fatalf("expected 1 task created, got %d", len(s.createCalls))
-	}
-	created := s.createCalls[0]
-	if len(created.Dependencies) != 1 || created.Dependencies[0] != "real-dep" {
-		t.Fatalf("expected dependencies=[real-dep], got %v", created.Dependencies)
-	}
-}
 
 // ---- S1: BatchTracker integration ----
 
@@ -510,95 +191,6 @@ func (r *recordingBatchTracker) AppendBatch(childTaskID string) error {
 	return nil
 }
 
-func TestMetaGroup_PublishTask_AppendsBatchWhenTrackerSet(t *testing.T) {
-	s := newFakeStore()
-	tracker := &recordingBatchTracker{}
-	g := MetaGroup{
-		Store:        s,
-		Holder:       nil, // scheduler mode
-		BatchTracker: tracker,
-	}
-	reg := agent.NewToolRegistry()
-	g.Register(reg)
-
-	for i := 0; i < 3; i++ {
-		_, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-			"description": fmt.Sprintf("task-%d", i),
-		}))
-		if err != nil {
-			t.Fatalf("publish #%d failed: %v", i, err)
-		}
-	}
-
-	if len(tracker.calls) != 3 {
-		t.Fatalf("expected 3 AppendBatch calls, got %d", len(tracker.calls))
-	}
-	// 顺序应当与 publish 顺序一致，且 ID 由 fakeStore 自动生成
-	for i, id := range tracker.calls {
-		expected := fmt.Sprintf("task-%d", i+1)
-		if id != expected {
-			t.Errorf("call[%d] tracker got %q, want %q", i, id, expected)
-		}
-	}
-}
-
-func TestMetaGroup_PublishTask_NoTrackerNoEffect(t *testing.T) {
-	// 既有 worker 模式：BatchTracker=nil，publish_task 行为不变
-	s := newFakeStore()
-	g := MetaGroup{Store: s, Holder: nil}
-	reg := agent.NewToolRegistry()
-	g.Register(reg)
-
-	out, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "no tracker",
-	}))
-	if err != nil {
-		t.Fatalf("publish failed: %v", err)
-	}
-	if !strings.Contains(out, "已创建任务") {
-		t.Errorf("expected success message, got %q", out)
-	}
-}
-
-func TestMetaGroup_PublishTask_TrackerErrorDoesNotBlock(t *testing.T) {
-	s := newFakeStore()
-	tracker := &recordingBatchTracker{failNth: 1}
-	g := MetaGroup{
-		Store:        s,
-		BatchTracker: tracker,
-	}
-	reg := agent.NewToolRegistry()
-	g.Register(reg)
-
-	out, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "tracker fails",
-	}))
-	if err != nil {
-		t.Fatalf("publish should not fail when tracker errors: %v", err)
-	}
-	if !strings.Contains(out, "已创建任务") {
-		t.Errorf("publish should still succeed, got %q", out)
-	}
-	// task 应当已经被 publish
-	if len(s.createCalls) != 1 {
-		t.Errorf("expected 1 published task, got %d", len(s.createCalls))
-	}
-}
-
-func TestPublishTask_NoCurrentTask_WorkerMode(t *testing.T) {
-	s := newFakeStore()
-	g := MetaGroup{Store: s, Holder: &fakeHolder{id: ""}, MaxDepth: 3}
-	reg := agent.NewToolRegistry()
-	g.Register(reg)
-
-	_, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "x",
-	}))
-	if err == nil || !strings.Contains(err.Error(), "无法获取当前任务上下文") {
-		t.Fatalf("expected 'no current task' error, got %v", err)
-	}
-}
-
 // ---- send_message behavior ----
 
 func TestSendMessage_Basic(t *testing.T) {
@@ -607,7 +199,7 @@ func TestSendMessage_Basic(t *testing.T) {
 	receiverBox := mbReg.Register("receiver", "")
 	_ = senderBox
 
-	g := MetaGroup{MBRegistry: mbReg, AgentID: "sender"}
+	g := CommunicationGroup{MBRegistry: mbReg, AgentID: "sender"}
 	reg := agent.NewToolRegistry()
 	g.Register(reg)
 
@@ -635,7 +227,7 @@ func TestSendMessage_Broadcast(t *testing.T) {
 	boxA := mbReg.Register("a", "")
 	boxB := mbReg.Register("b", "")
 
-	g := MetaGroup{MBRegistry: mbReg, AgentID: "sender"}
+	g := CommunicationGroup{MBRegistry: mbReg, AgentID: "sender"}
 	reg := agent.NewToolRegistry()
 	g.Register(reg)
 
@@ -669,7 +261,7 @@ func TestSendMessage_PropagatesChainDepth(t *testing.T) {
 	parent := &model.Task{ID: "current", MailChainDepth: 2, Status: model.TaskStatusProcessing}
 	s.tasks[parent.ID] = parent
 
-	g := MetaGroup{
+	g := CommunicationGroup{
 		MBRegistry: mbReg,
 		AgentID:    "sender",
 		Holder:     &fakeHolder{id: "current"},
@@ -705,7 +297,7 @@ func TestSendMessage_ChainDepth_ZeroParent(t *testing.T) {
 	parent := &model.Task{ID: "current", MailChainDepth: 0}
 	s.tasks[parent.ID] = parent
 
-	g := MetaGroup{
+	g := CommunicationGroup{
 		MBRegistry: mbReg,
 		AgentID:    "sender",
 		Holder:     &fakeHolder{id: "current"},
@@ -730,7 +322,7 @@ func TestSendMessage_ChainDepth_NilHolder_DefaultsToZero(t *testing.T) {
 	recvBox := mbReg.Register("receiver", "")
 
 	// Holder=nil → Scheduler 模式 → ChainDepth=0
-	g := MetaGroup{
+	g := CommunicationGroup{
 		MBRegistry: mbReg,
 		AgentID:    "sender",
 		// Holder 故意留 nil
@@ -757,7 +349,7 @@ func TestSendMessage_ChainDepth_EmptyTaskID_DefaultsToZero(t *testing.T) {
 	recvBox := mbReg.Register("receiver", "")
 
 	// Holder.Get() 返回空字符串 → ChainDepth=0
-	g := MetaGroup{
+	g := CommunicationGroup{
 		MBRegistry: mbReg,
 		AgentID:    "sender",
 		Holder:     &fakeHolder{id: ""},
@@ -785,7 +377,7 @@ func TestSendMessage_ChainDepth_TaskNotFound_DefaultsToZero(t *testing.T) {
 	recvBox := mbReg.Register("receiver", "")
 
 	// Holder 指向不存在的 task → GetTask 返回 error → ChainDepth=0
-	g := MetaGroup{
+	g := CommunicationGroup{
 		MBRegistry: mbReg,
 		AgentID:    "sender",
 		Holder:     &fakeHolder{id: "nonexistent"},
@@ -817,7 +409,7 @@ func TestSendMessage_ChainDepth_BroadcastInherits(t *testing.T) {
 	parent := &model.Task{ID: "current", MailChainDepth: 5}
 	s.tasks[parent.ID] = parent
 
-	g := MetaGroup{
+	g := CommunicationGroup{
 		MBRegistry: mbReg,
 		AgentID:    "sender",
 		Holder:     &fakeHolder{id: "current"},
@@ -849,7 +441,7 @@ func TestSendMessage_DefaultMsgType(t *testing.T) {
 	mbReg.Register("sender", "")
 	recvBox := mbReg.Register("r", "")
 
-	g := MetaGroup{MBRegistry: mbReg, AgentID: "sender"}
+	g := CommunicationGroup{MBRegistry: mbReg, AgentID: "sender"}
 	reg := agent.NewToolRegistry()
 	g.Register(reg)
 
@@ -874,30 +466,3 @@ func TestSendMessage_DefaultMsgType(t *testing.T) {
 
 // publish_task 的并发语义：未指定时显式置 1（单交付物任务默认执行一次，
 // 不落进 store default_concurrency 兜底，2026-07-22 排查）；显式指定时透传。
-func TestPublishTask_MaxConcurrencyDefaultOneAndExplicitOverride(t *testing.T) {
-	s := newFakeStore()
-	g := MetaGroup{Store: s, Holder: nil, MaxDepth: 3}
-	reg := agent.NewToolRegistry()
-	g.Register(reg)
-
-	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "default concurrency",
-	})); err != nil {
-		t.Fatalf("publish default failed: %v", err)
-	}
-	if _, err := reg.Dispatch(context.Background(), mkCall("publish_task", map[string]any{
-		"description": "explicit concurrency", "max_concurrency": float64(3),
-	})); err != nil {
-		t.Fatalf("publish explicit failed: %v", err)
-	}
-
-	if len(s.createCalls) != 2 {
-		t.Fatalf("expected 2 created tasks, got %d", len(s.createCalls))
-	}
-	if got := s.createCalls[0].MaxConcurrency; got != 1 {
-		t.Errorf("default MaxConcurrency = %d, want 1", got)
-	}
-	if got := s.createCalls[1].MaxConcurrency; got != 3 {
-		t.Errorf("explicit MaxConcurrency = %d, want 3", got)
-	}
-}

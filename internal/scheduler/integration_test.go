@@ -107,8 +107,8 @@ func TestSchedulerBundle_New_AgentEventTypeIsScheduler(t *testing.T) {
 	if bundle.Agent.TaskMemStore != taskMemory {
 		t.Fatal("Scheduler 必须与 Runner 共用 Task Memory authority")
 	}
-	if !slices.Contains(bundle.ToolReg.Names(), "record_observation_delta") {
-		t.Fatalf("Scheduler coordination/v2 承诺 Observation 时必须注册控制工具: %v", bundle.ToolReg.Names())
+	if slices.Contains(bundle.ToolReg.Names(), "record_observation_delta") {
+		t.Fatalf("Scheduler 不得注册退役的 Observation 工具: %v", bundle.ToolReg.Names())
 	}
 }
 
@@ -133,7 +133,7 @@ func TestSchedulerBundle_New_ModesDefaultAxes(t *testing.T) {
 	}
 }
 
-// TestSchedulerBundle_EndToEnd_UserInputCreatesGraphDraft 是一个端到端集成测试。
+// TestSchedulerBundleEndToEndUserInputAppliesGraph 是一个端到端集成测试。
 //
 // 它模拟一个完整的请求循环：
 //  1. CLI 发送 EventUserInput（"hello"）到 eventCh
@@ -148,7 +148,7 @@ func TestSchedulerBundle_New_ModesDefaultAxes(t *testing.T) {
 //   - scheduler agent 能 poll 到并处理 scheduler-only task
 //   - auto-singleton + L3 required-action 不会放松 ToolRouter 权威
 //   - Graph authoring 生产装配确实连到 durable Store
-func TestSchedulerBundle_EndToEnd_UserInputCreatesGraphDraft(t *testing.T) {
+func TestSchedulerBundleEndToEndUserInputAppliesGraph(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	r := roster.NewMemoryRoster()
@@ -165,8 +165,8 @@ func TestSchedulerBundle_EndToEnd_UserInputCreatesGraphDraft(t *testing.T) {
 				ToolCalls: []llm.ToolCall{
 					{
 						ID:        "call_1",
-						Name:      "create_graph_draft",
-						Arguments: map[string]any{},
+						Name:      "apply_graph_change",
+						Arguments: schedulerGraphCreateArgs(),
 					},
 				},
 			},
@@ -199,7 +199,7 @@ func TestSchedulerBundle_EndToEnd_UserInputCreatesGraphDraft(t *testing.T) {
 	bundle := newTestScheduler(t, s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
 		nil, nil, nil, nil, nil, nil, nil, nil, nil,
 		GraphAuthoringDeps{
-			Store: authoringStore, Compiler: graph.DefinitionCompiler{Policies: policies},
+			Store: authoringStore, Compiler: graph.DefinitionCompiler{Policies: policies, Acceptance: schedulerAcceptancePass{}},
 			ContextRuntime: contextRuntime,
 		})
 
@@ -221,17 +221,23 @@ func TestSchedulerBundle_EndToEnd_UserInputCreatesGraphDraft(t *testing.T) {
 	// 等待 Scheduler 首个构图动作真实落盘。
 	deadline := time.Now().Add(5 * time.Second)
 	var schedTask *model.Task
-	var draft *graph.GraphDraft
+	var definition *graph.GraphDefinition
 	for time.Now().Before(deadline) {
 		tasks, _ := s.ScanAll()
 		for _, task := range tasks {
 			if task.EventType == "__scheduler__" {
 				schedTask = task
-				draft, _ = authoringStore.GetDraft("graph-proposal-" + task.ID)
+				for _, d := range authoringStore.ListLatestDefinitions() {
+					if d.OwnerTaskID == task.ID {
+						copy := d
+						definition = &copy
+						break
+					}
+				}
 				break
 			}
 		}
-		if schedTask != nil && draft != nil {
+		if schedTask != nil && definition != nil {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -240,15 +246,15 @@ func TestSchedulerBundle_EndToEnd_UserInputCreatesGraphDraft(t *testing.T) {
 	cancel()
 	wg.Wait()
 
-	if schedTask == nil || draft == nil {
+	if schedTask == nil || definition == nil {
 		// 打印当前 store 状态便于诊断
 		tasks, _ := s.ScanAll()
 		t.Fatalf("scheduler task did not persist GraphDraft within 5s. Current tasks: %+v", tasks)
 	}
-	if draft.OwnerTaskID != schedTask.ID || draft.ProposalID != "graph-proposal-"+schedTask.ID ||
-		draft.GraphID != "graph-"+schedTask.ID {
-		t.Fatalf("GraphDraft 归属/稳定身份错误: task=%s draft=%+v", schedTask.ID, draft)
+	if definition.OwnerTaskID != schedTask.ID || definition.Revision != 1 || definition.Body.Root != "work" {
+		t.Fatalf("正式图归属/版本错误：%+v", definition)
 	}
+
 }
 
 func (s *scriptedLLM) Invoke(ctx context.Context, request llm.Request, sink llm.EventSink) (llm.Result, error) {
@@ -261,4 +267,21 @@ func (s *scriptedLLM) Invoke(ctx context.Context, request llm.Request, sink llm.
 		return llm.Result{}, err
 	}
 	return fixture.Seal(spec.Options.Protocol)
+}
+
+// 本测试隔离 provider 审批，仍真实执行图编译、持久化与 L1/L2 工具调用。
+type schedulerAcceptancePass struct{}
+
+func (schedulerAcceptancePass) EvaluateProposal(context.Context, graph.ProposalAcceptanceInput) (graph.ProposalAcceptanceDecision, error) {
+	return graph.ProposalAcceptanceDecision{Verdict: graph.ProposalAcceptancePass, Ref: "test:accepted"}, nil
+}
+func schedulerGraphCreateArgs() map[string]any {
+	return map[string]any{"operation": "create", "request_id": "first", "contract": map[string]any{"execution_class": "answer", "deliverables": []any{map[string]any{"id": "answer", "kind": "report"}}}, "definition": map[string]any{"root": "work", "nodes": map[string]any{
+		"work": map[string]any{"kind": "controller", "task": map[string]any{"title": "回答", "description": "回答用户问题"}, "contract_bindings": map[string]any{"deliverables": []string{"answer"}}, "next": []any{
+			map[string]any{"to": "done", "when": map[string]any{"event": "completed"}}, map[string]any{"to": "failed", "when": map[string]any{"event": "failed"}}, map[string]any{"to": "blocked", "when": map[string]any{"event": "blocked"}},
+		}},
+		"done":    map[string]any{"kind": "end", "end_outcome": "success", "next": []any{}},
+		"failed":  map[string]any{"kind": "end", "end_outcome": "failed", "next": []any{}},
+		"blocked": map[string]any{"kind": "end", "end_outcome": "blocked", "next": []any{}},
+	}}}
 }

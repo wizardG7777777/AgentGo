@@ -32,7 +32,7 @@ func newExecModeTestBundle(t *testing.T, modeStore *modes.Store, projectRoot str
 	bundle := newTestScheduler(t, s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
 		nil, nil, nil, nil, nil, modeStore, nil, nil, nil)
 
-	task := &model.Task{Description: "exec 模式装配测试任务", EventType: "__scheduler__"}
+	task := &model.Task{Description: "exec 模式装配测试任务", EventType: "__scheduler__", GraphID: "g-execution", GraphNodeKind: "agent"}
 	if err := s.PublishTask(task); err != nil {
 		t.Fatalf("发布 scheduler 任务失败: %v", err)
 	}
@@ -44,7 +44,7 @@ func newExecModeTestBundle(t *testing.T, modeStore *modes.Store, projectRoot str
 	return bundle, s, task
 }
 
-// 装配断言：exec=strict 时 scheduler 的 write_file 进入审批链路——
+// 装配断言：exec=strict 时 scheduler 的 apply_change 进入审批链路——
 // Interaction 服务缺失时 fail-closed（证明 WrapHandler 已在 scheduler.New 生效，
 // solo 拓扑下 scheduler 亲自写文件的路径同样被覆盖）。
 func TestSchedulerStrictWriteFileFailsClosed(t *testing.T) {
@@ -53,7 +53,7 @@ func TestSchedulerStrictWriteFileFailsClosed(t *testing.T) {
 	mockLLM := &scriptedLLM{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{{
 			ID:        "call_1",
-			Name:      "write_file",
+			Name:      "apply_change",
 			Arguments: map[string]any{"path": target, "content": "x"},
 		}},
 	}}}
@@ -62,7 +62,7 @@ func TestSchedulerStrictWriteFileFailsClosed(t *testing.T) {
 
 	content := executeOneRound(t, bundle, task)
 	if !strings.Contains(content, "Interaction 服务不可用") {
-		t.Fatalf("strict 下 scheduler 的 write_file 应 fail-closed，实际: %s", content)
+		t.Fatalf("strict 下 scheduler 的 apply_change 应 fail-closed，实际: %s", content)
 	}
 	if _, err := os.Stat(target); !os.IsNotExist(err) {
 		t.Fatalf("被拦截的写入不应落盘: %v", err)
@@ -88,14 +88,14 @@ func TestSchedulerStrictRunShellFailsClosed(t *testing.T) {
 	}
 }
 
-// 对照组：exec=normal 时 scheduler 的 write_file 透传执行（包装器不影响正常档位）。
+// 对照组：exec=normal 时 scheduler 的 apply_change 透传执行（包装器不影响正常档位）。
 func TestSchedulerNormalWriteFilePassthrough(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "ok.txt")
 	mockLLM := &scriptedLLM{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{{
 			ID:        "call_1",
-			Name:      "write_file",
+			Name:      "apply_change",
 			Arguments: map[string]any{"path": target, "content": "hello"},
 		}},
 	}}}
@@ -103,8 +103,8 @@ func TestSchedulerNormalWriteFilePassthrough(t *testing.T) {
 		modes.NewStore(modes.ExecNormal, modes.TopoTeam), dir, mockLLM)
 
 	content := executeOneRound(t, bundle, task)
-	if !strings.Contains(content, "文件已写入") {
-		t.Fatalf("normal 下 write_file 应成功，实际: %s", content)
+	if !strings.Contains(content, "文件变更已应用") {
+		t.Fatalf("normal 下 apply_change 应成功，实际: %s", content)
 	}
 	data, err := os.ReadFile(target)
 	if err != nil || string(data) != "hello" {
@@ -120,14 +120,14 @@ func TestSchedulerNilModesWriteFilePassthrough(t *testing.T) {
 	mockLLM := &scriptedLLM{responses: []testmodel.Fixture{{
 		ToolCalls: []llm.ToolCall{{
 			ID:        "call_1",
-			Name:      "write_file",
+			Name:      "apply_change",
 			Arguments: map[string]any{"path": target, "content": "z"},
 		}},
 	}}}
 	bundle, _, task := newExecModeTestBundle(t, nil, dir, mockLLM)
 
 	content := executeOneRound(t, bundle, task)
-	if !strings.Contains(content, "文件已写入") {
+	if !strings.Contains(content, "文件变更已应用") {
 		t.Fatalf("nil modeStore 应等价 normal，实际: %s", content)
 	}
 }

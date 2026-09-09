@@ -16,6 +16,8 @@ import (
 const (
 	DraftSchemaV1            = "agentgo.progress-contract-draft/v1"
 	CompiledSchemaV1         = "agentgo.progress-contract/v1"
+	CompiledSchemaV2         = "agentgo.progress-contract/v2"
+	CompiledSchemaCurrent    = CompiledSchemaV2
 	DeltaSchemaV1            = "agentgo.turn-settlement-delta/v1"
 	AssessmentSchemaV1       = "agentgo.progress-assessment/v1"
 	CheckpointSchemaV1       = "agentgo.progress-checkpoint/v1"
@@ -118,28 +120,10 @@ type ProgressSignalRule struct {
 }
 
 // ProgressPolicy 是 framework policy catalog 解析后的有界策略。
+// ProgressPolicy 只规定事实缓存大小，不再规定轮数、停滞或默认执行预算。
 type ProgressPolicy struct {
-	PolicyRef              string                  `json:"policy_ref"`
-	ReminderAfterTurns     int                     `json:"reminder_after_turns"`
-	RolloverAfterTurns     int                     `json:"rollover_after_turns"`
-	InterventionAfterTurns int                     `json:"intervention_after_turns"`
-	MaxNoProgressTurns     int                     `json:"max_no_progress_turns"`
-	MaxNoProgressDuration  time.Duration           `json:"max_no_progress_duration"`
-	MaxNoProgressUsage     runcontract.BudgetLimit `json:"max_no_progress_usage"`
-	MaxExplorationTurns    int                     `json:"max_exploration_turns"`
-	// FirstDeliverableHandoffReserve 在 Attempt deadline 前为尚无首次
-	// deliverable 的 code-change 任务保留 L5 recovery 交接窗口。
-	FirstDeliverableHandoffReserve time.Duration `json:"first_deliverable_handoff_reserve,omitempty"`
-	// CandidateRepairHandoffReserve 在已有真实 workspace mutation、但尚无其后
-	// verification pass 时，为 L5 candidate repair 预留剩余 execution 窗口。
-	CandidateRepairHandoffReserve time.Duration `json:"candidate_repair_handoff_reserve,omitempty"`
-	KnowledgeCheckpointAfterTurns int           `json:"knowledge_checkpoint_after_turns,omitempty"`
-	DecisionCheckpointAfterTurns  int           `json:"decision_checkpoint_after_turns,omitempty"`
-	MaxObservationStagnation      int           `json:"max_observation_stagnation,omitempty"`
-	MaxDecisionStagnation         int           `json:"max_decision_stagnation,omitempty"`
-	MaxControlContractFailures    int           `json:"max_control_contract_failures,omitempty"`
-	MaxAttemptRollovers           int           `json:"max_attempt_rollovers"`
-	RecentFingerprintWindow       int           `json:"recent_fingerprint_window"`
+	PolicyRef               string `json:"policy_ref"`
+	RecentFingerprintWindow int    `json:"recent_fingerprint_window"`
 }
 
 // ProgressContractRef 是 Graph/Task/Activation 保存的稳定引用。
@@ -263,14 +247,13 @@ type TurnSettlementDelta struct {
 	BlockerChanges    []BlockerChange     `json:"blocker_changes,omitempty"`
 	InputChanges      []InputChange       `json:"input_changes,omitempty"`
 	ResultChanges     []ResultFieldChange `json:"result_changes,omitempty"`
-	// ObservationDeltaRef 是本 Turn 通过 record_observation_delta 落下的
-	// durable 引用；正文不进入 L4 journal。
+	// 以下字段仅用于识别退役数据，新结算入口拒绝非空值；不再生成控制报告。
 	ObservationDeltaRef    string             `json:"observation_delta_ref,omitempty"`
 	ObservationChange      *ObservationChange `json:"observation_change,omitempty"`
 	ControlContractFailure bool               `json:"control_contract_failure,omitempty"`
 
 	UsageDelta runcontract.BudgetUsage `json:"usage_delta"`
-	Failure    *llm.Failure     `json:"failure,omitempty"`
+	Failure    *llm.Failure            `json:"failure,omitempty"`
 	SettledAt  time.Time               `json:"settled_at"`
 }
 

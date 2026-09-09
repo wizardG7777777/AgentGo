@@ -56,12 +56,8 @@ func (h *PathBoundaryHook) Priority() int { return 10 }
 // 却被 hook 以"缺少 path 参数"拒绝，连续 8 轮无法自愈。修复方式是让 hook
 // 按工具名查询正确字段名，错误消息也据此生成。
 var pathFieldByTool = map[string]string{
-	"read_file":   "path",
-	"list_dir":    "path",
-	"grep_search": "path",
-	"glob_search": "root_dir",
-	"write_file":  "path",
-	"edit_file":   "path",
+	"read_file":    "path",
+	"apply_change": "path",
 }
 
 // Matches 返回是否匹配本 hook 的工具集合。
@@ -145,7 +141,7 @@ func (h *PathBoundaryHook) missingFieldReason(hctx hook.ToolHookContext, field s
 	for k := range hctx.Args {
 		keys = append(keys, k)
 	}
-	aliasHint := "注意：read_file/list_dir/grep_search/write_file/edit_file 用 'path'；glob_search 用 'root_dir'。常见误传：dir / cwd / base_dir 均非合法字段"
+	aliasHint := "read_file/apply_change 使用 'path'；dir / cwd / base_dir 不是合法字段"
 	example := fmt.Sprintf(`{"%s": ".", ...}`, field)
 	return fmt.Sprintf(
 		"工具 %s 缺少必需参数 '%s'。当前收到的参数 keys=%v。%s。示例：%s",

@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"agentgo/internal/executionfacts"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,7 +13,6 @@ import (
 	"strings"
 	"testing"
 
-	"agentgo/internal/checkstore"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
 )
@@ -811,7 +811,7 @@ func TestDeliveryWorkspaceRevisionSpansRepairTasks(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimedPre, _ := tasks.GetTask(preMutation.ID)
-	if ref, _, err := checkstore.WorkspaceRevision(claimedPre, tasks, m); err != nil || ref != "workspace:empty" {
+	if ref, _, err := executionfacts.WorkspaceRevision(claimedPre, tasks, m); err != nil || ref != "workspace:empty" {
 		t.Fatalf("pre-mutation Delivery revision 应为 workspace:empty: ref=%s err=%v", ref, err)
 	}
 	physical, err := view.WritePath(main)
@@ -827,7 +827,7 @@ func TestDeliveryWorkspaceRevisionSpansRepairTasks(t *testing.T) {
 	}
 	claimedProducer, _ := tasks.GetTask(producer.ID)
 	if err := tasks.AppendToolCall(producer.ID, store.ToolCallRecord{
-		AttemptID: claimedProducer.AttemptID, CallID: "edit-producer", ToolName: "edit_file",
+		AttemptID: claimedProducer.AttemptID, CallID: "edit-producer", ToolName: "apply_change",
 		Args: map[string]any{"path": "source.go"}, Success: true,
 	}); err != nil {
 		t.Fatal(err)
@@ -840,14 +840,14 @@ func TestDeliveryWorkspaceRevisionSpansRepairTasks(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimedRepair, _ := tasks.GetTask(repair.ID)
-	first, refs, err := checkstore.WorkspaceRevision(claimedRepair, tasks, m)
+	first, refs, err := executionfacts.WorkspaceRevision(claimedRepair, tasks, m)
 	if err != nil || first == "workspace:empty" || len(refs) != 1 || refs[0] != "tool-call:edit-producer" {
 		t.Fatalf("repair Task 必须继承 Delivery candidate revision/effect: ref=%s refs=%v err=%v", first, refs, err)
 	}
 	if err := os.WriteFile(physical, []byte("candidate-v2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	second, _, err := checkstore.WorkspaceRevision(claimedRepair, tasks, m)
+	second, _, err := executionfacts.WorkspaceRevision(claimedRepair, tasks, m)
 	if err != nil || second == first {
 		t.Fatalf("Delivery dirty 内容变化必须使旧 check stale: first=%s second=%s err=%v", first, second, err)
 	}

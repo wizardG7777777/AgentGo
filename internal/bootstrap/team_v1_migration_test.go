@@ -194,7 +194,7 @@ func writeTeamStateV1(t *testing.T, path string, spec team.TeamSpec) {
 
 func testMigrationTeam(id string) team.TeamSpec {
 	return team.TeamSpec{
-		ID: id, TemplateRef: "builtin/explorer@1", TemplateDigest: "sha256:test",
+		ID: id, TemplateRef: "builtin/explorer@2", TemplateDigest: "sha256:test",
 		ControllerTaskID: "controller-before-crash", Purpose: "recover",
 		EventType: "team:" + id, Replicas: 1, Status: team.StatusReady,
 	}

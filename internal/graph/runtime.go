@@ -523,7 +523,7 @@ func (rt *Runtime) OnTaskTerminal(f TerminalFact) error {
 		hydrateExecutionEvidence(&exec)
 	}
 	if f.Status == NodeCompleted && requiresCodeChangeFulfillment(activeNode.ProgressContractRef) {
-		contract := &fulfillment.Contract{RequireWorkspaceChange: true, RequiredCheckIDs: []string{"verification"}}
+		contract := &fulfillment.Contract{RequireWorkspaceChange: true}
 		if f.Fulfillment == nil || f.Fulfillment.Validate(contract) != nil {
 			reason := "contract_fulfillment_missing：mutating activation 缺少真实 workspace change 或晚于最后改动的 verification check"
 			result := make(map[string]any, len(f.Result)+3)
@@ -2867,7 +2867,7 @@ func taskSpecFor(graphID, nodeID string, node Node, exec Execution) TaskSpec {
 	}
 	if requiresCodeChangeFulfillment(effective.ProgressContractRef) {
 		spec.FulfillmentContract = &fulfillment.Contract{
-			RequireWorkspaceChange: true, RequiredCheckIDs: []string{"verification"},
+			RequireWorkspaceChange: true,
 		}
 	}
 	if c := effective.Capability; c != nil {
@@ -2881,7 +2881,7 @@ func taskSpecFor(graphID, nodeID string, node Node, exec Execution) TaskSpec {
 
 func requiresCodeChangeFulfillment(ref string) bool {
 	switch ref {
-	case "progress:code-change/v5", "progress:code-change/v6", "progress:code-change/v7", "progress:code-change/v8", "progress:code-change/v9", "progress:code-change/v10", "progress:code-change/v11", "progress:code-change/v12":
+	case "progress:code-change/v5", "progress:code-change/v6", "progress:code-change/v7", "progress:code-change/v8", "progress:code-change/v9", "progress:code-change/v10", "progress:code-change/v11", "progress:code-change/v12", "progress:code-change/v13":
 		return true
 	default:
 		return false

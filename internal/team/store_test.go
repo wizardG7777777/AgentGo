@@ -298,7 +298,7 @@ func TestStoreRejectsUnsupportedStateVersion(t *testing.T) {
 
 func testSpec(id, controller, purpose string) TeamSpec {
 	return TeamSpec{
-		ID: id, TemplateRef: "builtin/explorer@1", TemplateDigest: "sha256:test",
+		ID: id, TemplateRef: "builtin/explorer@2", TemplateDigest: "sha256:test",
 		ControllerTaskID: controller, Purpose: purpose,
 		EventType: "team:" + id, Replicas: 2, Status: StatusReady,
 	}

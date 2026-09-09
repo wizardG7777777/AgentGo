@@ -22,14 +22,14 @@ type progressFlags struct {
 }
 
 // detectFileWrite 检测本轮 ExecuteResult 中是否有成功的文件写入。
-// 遍历 ToolCalls，匹配 Name 为 "write_file" 或 "edit_file" 的条目，
+// 遍历 ToolCalls，匹配 Name 为 "apply_change" 或 "apply_change" 的条目，
 // 检查对应 ToolResults[i].Content 不以 "错误:" 开头，
 // 从 ToolCall.Arguments["path"] 提取文件路径。
 // 返回成功写入的文件路径列表。
 func detectFileWrite(result ExecuteResult) []string {
 	var paths []string
 	for i, tc := range result.ToolCalls {
-		if tc.Name != "write_file" && tc.Name != "edit_file" {
+		if tc.Name != "apply_change" {
 			continue
 		}
 		// 检查对应的 ToolResult 是否存在且不是错误

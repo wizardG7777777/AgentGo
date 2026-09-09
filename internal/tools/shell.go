@@ -186,12 +186,16 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 		// 白名单但零发射点）。黑名单拦截或用户未授权的命令到不了这里，不产生事件。
 		// V6 §7.4：Command 过默认脱敏（截 200 字符；AGENTGO_TRACE_FULL_ARGS=1
 		// 旁路）——record-artifact 只消费 Outcome，不受影响。
+		identity := agent.ToolCallIdentityFromContext(ctx)
 		execEv := trace.Event{
+			RunID: identity.RunID, AttemptID: identity.AttemptID, TurnID: identity.TurnID,
+			InvocationID: identity.InvocationID, CallID: identity.CallID, ActionID: identity.ActionID,
 			Kind:    trace.KindShellExecuted,
 			TaskID:  agent.TaskIDFromContext(ctx),
 			AgentID: g.AgentID,
 			Tool:    "run_shell",
 			ShellExec: &trace.ShellExec{
+				Schema: "agentgo.shell-execution/v2", ProcessStarted: cmd.Process != nil,
 				Command:    trace.RedactShellCommand(command),
 				DurationMS: durationMS,
 			},
@@ -199,21 +203,31 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 
 		exitCode := 0
 		if err != nil {
-			if execCtx.Err() == context.DeadlineExceeded {
-				execEv.ShellExec.Outcome = "timeout"
-				execEv.Error = fmt.Sprintf("命令执行超时（%d 秒）", effectiveTimeoutSec)
-				trace.Emit(execEv)
-				// 超时时进程已被杀，但已执行部分产生的副作用不可知 → unknown。
-				if journalErr := effectMarkUnknown(g.EffectJournal, effID,
-					fmt.Sprintf("命令超时（%d 秒），已执行部分的副作用不可知", effectiveTimeoutSec)); journalErr != nil {
-					return "", journalErr
+			if execCtx.Err() != nil {
+				execEv.ShellExec.Outcome = "cancelled"
+				if execCtx.Err() == context.DeadlineExceeded {
+					execEv.ShellExec.Outcome = "timeout"
 				}
-				return "", fmt.Errorf("命令执行超时（%d 秒）: %s", effectiveTimeoutSec, command)
+				execEv.Error = execCtx.Err().Error()
+				trace.Emit(execEv)
+				// 已启动的命令可能产生了部分副作用；未启动时明确结算为未执行。
+				if cmd.Process != nil {
+					if journalErr := effectMarkUnknown(g.EffectJournal, effID, "命令被取消或超时，部分副作用未知"); journalErr != nil {
+						return outStr, journalErr
+					}
+				} else if journalErr := effectSettle(g.EffectJournal, effID, "命令在启动前被取消", false); journalErr != nil {
+					return outStr, journalErr
+				}
+				if execCtx.Err() == context.DeadlineExceeded {
+					return outStr, fmt.Errorf("命令执行超时: %w", execCtx.Err())
+				}
+				return outStr, fmt.Errorf("命令执行已取消: %w", execCtx.Err())
 			}
+
 			if exitErr, ok := err.(*exec.ExitError); ok {
 				exitCode = exitErr.ExitCode()
 			} else {
-				execEv.ShellExec.Outcome = "failure"
+				execEv.ShellExec.Outcome = "start_failed"
 				execEv.Error = err.Error()
 				trace.Emit(execEv)
 				// 启动失败（进程未运行）——结果已知：未产生进程副作用。
@@ -229,7 +243,7 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 		if hasPipeline {
 			exitScope = store.ShellExitCodeScopeLastPipelineCommand
 		}
-		execEv.ShellExec.ExitCode = exitCode
+		execEv.ShellExec.ExitCode = &exitCode
 		execEv.ShellExec.ExitCodeScope = string(exitScope)
 		if exitCode == 0 {
 			execEv.ShellExec.Outcome = "success"
@@ -353,9 +367,9 @@ func shellDialectNote() string {
 			"\n- 使用 PowerShell 语法；ls/cat/cp/mv/rm/echo/pwd 等常见 Unix 别名可用，但不要假设 bash/sed/awk/grep 存在" +
 			"\n- 常用对照：test -s <f> → Test-Path <f>；ls -la → Get-ChildItem；cat <f> → Get-Content <f>；" +
 			"mkdir -p <d> → New-Item -ItemType Directory -Force <d>；grep <pat> <f> → Select-String <pat> <f>" +
-			"\n- 系统会硬拒绝写文件的重定向（>、>>、Out-File、tee 等）：这类命令不会执行，直接报错；写文件一律使用 write_file / edit_file 工具（PowerShell 5.1 重定向还会产生 UTF-16 编码文件）"
+			"\n- 系统会硬拒绝写文件的重定向（>、>>、Out-File、tee 等）：这类命令不会执行，直接报错；写文件一律使用 apply_change 工具（PowerShell 5.1 重定向还会产生 UTF-16 编码文件）"
 	}
 	return "\n\n当前环境：" + runtime.GOOS + "，命令由 POSIX sh（sh -c）解释。" +
 		"\n- 使用 POSIX sh 语法，不要假设 bash 专有特性（[[ ]]、数组等）可用" +
-		"\n- 系统会硬拒绝写文件的重定向（>、>> 等）：这类命令不会执行，直接报错；写文件一律使用 write_file / edit_file 工具"
+		"\n- 系统会硬拒绝写文件的重定向（>、>> 等）：这类命令不会执行，直接报错；写文件一律使用 apply_change 工具"
 }

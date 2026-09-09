@@ -26,7 +26,7 @@ func TestSchedulerExecutor_ToolCallsGoThroughHook(t *testing.T) {
 	cfg := &config.Config{Agents: []config.AgentKind{{Kind: "worker", Replicas: 1}}}
 
 	// 发布并认领一个 scheduler task
-	schedTask := &model.Task{Description: "test", EventType: "__scheduler__"}
+	schedTask := &model.Task{Description: "test", EventType: "__scheduler__", GraphID: "g-hook", GraphNodeKind: "agent"}
 	s.PublishTask(schedTask)
 	s.ClaimTask("scheduler-1", schedTask.ID)
 

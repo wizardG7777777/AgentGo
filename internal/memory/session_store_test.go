@@ -31,7 +31,7 @@ func TestSessionStore_PutQueryRoundTrip(t *testing.T) {
 		Scope:   ScopeSession,
 		Kind:    KindLearning,
 		Key:     "lesson:edit-conflict",
-		Content: "edit_file 前必须先 read_file 拿 expected_hash",
+		Content: "apply_change 前必须先 read_file 拿 expected_hash",
 		Source:  "worker-1",
 	}); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -46,7 +46,7 @@ func TestSessionStore_PutQueryRoundTrip(t *testing.T) {
 		t.Fatalf("expect 1 entry, got %d", len(entries))
 	}
 	e := entries[0]
-	if e.Content != "edit_file 前必须先 read_file 拿 expected_hash" {
+	if e.Content != "apply_change 前必须先 read_file 拿 expected_hash" {
 		t.Errorf("Content mismatch: %q", e.Content)
 	}
 	if e.Source != "worker-1" {

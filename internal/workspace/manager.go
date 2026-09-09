@@ -74,7 +74,7 @@ func (m *Manager) FreezeCandidate(deliveryID, workspaceID, workspaceRevisionRef 
 	}, nil
 }
 
-// ResolveWorkspaceRevision 实现 checkstore.WorkspaceRevisionResolver。Graph v3
+// ResolveWorkspaceRevision 实现 executionfacts.WorkspaceRevisionResolver。Graph v3
 // repair/acceptance 换 TaskID 但共享 Delivery dirty set，版本必须由
 // candidate 实际内容而非当前 Task 的局部工具历史决定。
 func (m *Manager) ResolveWorkspaceRevision(task *model.Task, taskStore store.TaskStore) (
@@ -115,7 +115,7 @@ func (m *Manager) ResolveWorkspaceRevision(task *model.Task, taskStore store.Tas
 			return "", nil, true, queryErr
 		}
 		for _, record := range records {
-			if !record.Success || (record.ToolName != "write_file" && record.ToolName != "edit_file") ||
+			if !record.Success || (record.ToolName != "apply_change") ||
 				strings.TrimSpace(record.CallID) == "" {
 				continue
 			}

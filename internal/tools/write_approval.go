@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -39,7 +40,7 @@ const (
 	fileWritePreviewMaxRunes = 300
 )
 
-// FileWriteApprover 是 strict 执行模式下 write_file / edit_file 的 Interaction
+// FileWriteApprover 是 strict 执行模式下 apply_change / apply_change 的 Interaction
 // 审批包装器，集成形态复刻 shell.WrapShellTool（internal/shell/intercept.go）：
 // 装配期经 ToolRegistry.WrapHandler 包装，defs 不变，LLM 侧无感知。
 //
@@ -82,7 +83,7 @@ func NewFileWriteApprover(modeStore *modes.Store, interactions *interaction.Serv
 }
 
 // WrapHandler 返回 agent.ToolRegistry.WrapHandler 所需的包装函数。
-// toolName 写入提示与 digest 绑定（"write_file" / "edit_file"），必须与
+// toolName 写入提示与 digest 绑定（"apply_change" / "apply_change"），必须与
 // ToolRegistry 中的注册名一致。
 func (a *FileWriteApprover) WrapHandler(toolName string) func(agent.ToolFunc) agent.ToolFunc {
 	return func(inner agent.ToolFunc) agent.ToolFunc {
@@ -215,15 +216,11 @@ func (a *FileWriteApprover) rememberSessionAllowed(path string) {
 }
 
 // fileWritePayload 提取与本次写入副作用绑定的载荷：
-// write_file = content；edit_file = old_str + NUL + new_str。
-func fileWritePayload(toolName string, args map[string]any) string {
-	if toolName == "edit_file" {
-		oldStr, _ := args["old_str"].(string)
-		newStr, _ := args["new_str"].(string)
-		return oldStr + "\x00" + newStr
-	}
-	content, _ := args["content"].(string)
-	return content
+// apply_change = content；apply_change = old_str + NUL + new_str。
+func fileWritePayload(_ string, args map[string]any) string {
+	// 摘要覆盖全部写入参数，创建、覆盖和替换不能共享不完整载荷摘要。
+	payload, _ := json.Marshal(args)
+	return string(payload)
 }
 
 func sha256Hex(b []byte) string {
@@ -270,7 +267,7 @@ func buildFileWritePrompt(agentID, toolName, path string, args map[string]any) s
 	var b strings.Builder
 	fmt.Fprintf(&b, "Agent %s 请求写入文件（strict 执行模式，需人工批准）：\n", agentID)
 	fmt.Fprintf(&b, "工具: %s\n路径: %s\n", toolName, path)
-	if toolName == "edit_file" {
+	if _, replacing := args["old_str"]; replacing {
 		oldStr, _ := args["old_str"].(string)
 		newStr, _ := args["new_str"].(string)
 		fmt.Fprintf(&b, "摘要: 单次替换，旧文本 %d 字节 → 新文本 %d 字节\n", len(oldStr), len(newStr))

@@ -14,11 +14,15 @@ import (
 // 未设置 env var 时，${DEEPSEEK_API_KEY} 等被 os.ExpandEnv 替换为空串——
 // 不影响结构校验通过。
 func TestLoadConfig_V4Sample(t *testing.T) {
+	t.Setenv("SWE_BASE_URL", "https://provider.invalid")
+	t.Setenv("SWE_API_KEY", "test-only")
+	t.Setenv("SWE_FAST_MODEL", "test-fast")
+	t.Setenv("SWE_FLAG_SHIP_MODEL", "test-flagship")
 	// 测试运行时的 cwd 是包目录 internal/config，需要回到仓库根
 	repoRoot := filepath.Join("..", "..")
 	yamlPath := filepath.Join(repoRoot, "setting.v4.yaml")
 	if _, err := os.Stat(yamlPath); err != nil {
-		t.Skipf("setting.v4.yaml 不存在: %v", err)
+		t.Fatalf("版本控制中的测试配置缺失: %v", err)
 	}
 
 	// LoadConfig 内部用相对路径读 system_prompt_file，需要切换到 repoRoot

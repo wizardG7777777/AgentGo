@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import platform
+import importlib.metadata
 from pathlib import Path
 from typing import Any
 
 
-REPORT_SCHEMA = "agentgo.pytest-phase-report/v1"
+REPORT_SCHEMA = "agentgo.pytest-phase-report/v2"
 COUNT_SEMANTICS = "pytest-phase-overlap/v1"
 REPORT_PATH_ENV = "AGENTGO_SWE_PYTEST_REPORT"
 
@@ -22,6 +25,8 @@ class PhaseCounter:
     """按逻辑 nodeid 统计 call 结果，并按事件统计阶段错误。"""
 
     def __init__(self) -> None:
+        self.collected_nodeids: list[str] = []
+        self.failure_events: list[dict[str, str]] = []
         self.passed: set[str] = set()
         self.failed: set[str] = set()
         self.skipped: set[str] = set()
@@ -47,15 +52,19 @@ class PhaseCounter:
                 (self.xpassed if wasxfail else self.passed).add(nodeid)
             elif bool(getattr(report, "failed", False)):
                 # strict xpass 由 pytest 作为 call failure 处理，保持 failed 权威。
+                if nodeid not in self.failed:
+                    self.failure_events.append({"nodeid": nodeid, "phase": "call"})
                 self.failed.add(nodeid)
             return
 
         if when in {"setup", "teardown"} and bool(getattr(report, "failed", False)):
             self.phase_errors[when] += 1
+            self.failure_events.append({"nodeid": nodeid, "phase": when})
 
     def record_collect(self, report: Any) -> None:
         if bool(getattr(report, "failed", False)):
             self.phase_errors["collection"] += 1
+            self.failure_events.append({"nodeid": self._nodeid(report), "phase": "collection"})
         elif bool(getattr(report, "skipped", False)):
             self.skipped.add(self._nodeid(report))
 
@@ -72,10 +81,16 @@ class PhaseCounter:
             "xfailed": len(self.xfailed),
             "xpassed": len(self.xpassed),
             "phase_errors": dict(self.phase_errors),
+            "failure_events": list(self.failure_events),
+            "collected_nodeids": list(self.collected_nodeids),
         }
 
 
 _COUNTER = PhaseCounter()
+
+
+def pytest_collection_finish(session: Any) -> None:
+    _COUNTER.collected_nodeids = [str(item.nodeid) for item in session.items]
 
 
 def pytest_runtest_logreport(report: Any) -> None:
@@ -94,8 +109,17 @@ def _atomic_json(path: Path, value: object) -> None:
 
 
 def pytest_sessionfinish(session: Any, exitstatus: Any) -> None:
-    del exitstatus
     raw_path = os.environ.get(REPORT_PATH_ENV, "").strip()
     if not raw_path:
         return
-    _atomic_json(Path(raw_path), _COUNTER.result(int(getattr(session, "testscollected", 0))))
+    result = _COUNTER.result(int(getattr(session, "testscollected", 0)))
+    flask = sys.modules.get("flask")
+    result["execution_environment"] = {
+        "python": sys.executable,
+        "python_version": platform.python_version(),
+        "flask_file": getattr(flask, "__file__", None),
+        "exit_code": int(exitstatus),
+        "packages": sorted({(str(dist.metadata.get("Name") or ""), dist.version)
+                            for dist in importlib.metadata.distributions()}),
+    }
+    _atomic_json(Path(raw_path), result)

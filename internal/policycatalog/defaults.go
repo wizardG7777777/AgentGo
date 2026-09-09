@@ -2,12 +2,10 @@ package policycatalog
 
 import (
 	"fmt"
-	"time"
 
 	"agentgo/internal/contextcontract"
 	"agentgo/internal/llm"
 	"agentgo/internal/loopcontract"
-	"agentgo/internal/runcontract"
 )
 
 func defaultReplayProfiles() ([]ReplayProfile, error) {
@@ -312,35 +310,35 @@ func defaultSectionBudgets(systemBytes, systemTokens int64) map[contextcontract.
 }
 
 func defaultProgressProfiles() ([]ProgressProfile, error) {
-	profiles := []loopcontract.CompiledProgressContract{
-		progressCodeChangeV1(),
-		progressCodeChangeV2(),
-		progressCodeChangeV3(),
-		progressCodeChangeV4(),
-		progressCodeChangeV5(),
-		progressCodeChangeV6(),
-		progressCodeChangeV7(),
-		progressCodeChangeV8(),
-		progressCodeChangeV9(),
-		progressCodeChangeV10(),
-		progressCodeChangeV11(),
-		progressCodeChangeV12(),
-		progressInvestigation(),
-		progressInvestigationV2(),
-		progressInvestigationV3(),
-		progressInvestigationV4(),
-		progressInvestigationV5(),
-		progressInvestigationV6(),
-		progressInvestigationV7(),
-		progressVerification(),
-		progressVerificationV2(),
-		progressVerificationV3(),
-		progressCoordination(),
-		progressCoordinationV2(),
-		progressFinalReport(),
+	classes := []struct {
+		ref  string
+		kind loopcontract.WorkClass
+	}{
+		{ProgressCodeChangeCurrent, loopcontract.WorkCodeChange},
+		{ProgressInvestigationCurrent, loopcontract.WorkInvestigation},
+		{ProgressVerificationCurrent, loopcontract.WorkVerification},
+		{ProgressCoordinationCurrent, loopcontract.WorkCoordination},
+		{ProgressFinalReportCurrent, loopcontract.WorkFinalization},
 	}
-	out := make([]ProgressProfile, 0, len(profiles))
-	for _, contract := range profiles {
+	out := make([]ProgressProfile, 0, len(classes))
+	for _, entry := range classes {
+		contract := loopcontract.CompiledProgressContract{
+			Schema:    loopcontract.CompiledSchemaCurrent,
+			Ref:       loopcontract.ProgressContractRef{ContractID: entry.ref, PolicyRef: "execution-facts/v1"},
+			WorkClass: entry.kind,
+			AcceptedSignals: []loopcontract.ProgressSignalRule{
+				{Kind: loopcontract.SignalFileVersionChanged, IdentityScope: "**", Deliverable: true},
+				{Kind: loopcontract.SignalArtifactRegistered, IdentityScope: "**", Deliverable: true},
+				{Kind: loopcontract.SignalNovelEvidence, IdentityScope: "**"},
+				{Kind: loopcontract.SignalResultFieldSet, IdentityScope: "**", Deliverable: true},
+				{Kind: loopcontract.SignalExternalEffectSettled, IdentityScope: "**", Deliverable: true},
+			},
+			Policy:       loopcontract.ProgressPolicy{PolicyRef: "execution-facts/v1", RecentFingerprintWindow: 16},
+			RunBudgetRef: "usage:execution-facts/v1",
+		}
+		if entry.kind == loopcontract.WorkCodeChange {
+			contract.Deliverables = []loopcontract.DeliverableRule{{ID: "workspace-change", Kind: loopcontract.DeliverableFileDelta, Scope: "**", Required: true}}
+		}
 		profile, err := sealProgressProfile(contract)
 		if err != nil {
 			return nil, err
@@ -348,409 +346,6 @@ func defaultProgressProfiles() ([]ProgressProfile, error) {
 		out = append(out, profile)
 	}
 	return out, nil
-}
-
-func progressCodeChangeV1() loopcontract.CompiledProgressContract {
-	return loopcontract.CompiledProgressContract{
-		Schema: loopcontract.CompiledSchemaV1,
-		Ref: loopcontract.ProgressContractRef{
-			ContractID: ProgressCodeChangeV1, PolicyRef: "bounded_code_change/v1",
-		},
-		WorkClass: loopcontract.WorkCodeChange,
-		Deliverables: []loopcontract.DeliverableRule{{
-			ID: "workspace-change", Kind: loopcontract.DeliverableFileDelta,
-			Scope: "**", Required: true,
-		}},
-		VerificationTargets: []loopcontract.VerificationRule{{
-			ID: "verification", Kind: loopcontract.VerificationEvaluation,
-			Target: "declared-evaluator", Required: true,
-		}},
-		AcceptedSignals: []loopcontract.ProgressSignalRule{
-			{Kind: loopcontract.SignalFileVersionChanged, IdentityScope: "**", Deliverable: true},
-			{Kind: loopcontract.SignalArtifactRegistered, IdentityScope: "**", Deliverable: true},
-			{Kind: loopcontract.SignalArtifactVersionChanged, IdentityScope: "**", Deliverable: true},
-			{Kind: loopcontract.SignalEvaluationChanged, IdentityScope: "declared-evaluator"},
-			{Kind: loopcontract.SignalEvaluationPassed, IdentityScope: "declared-evaluator"},
-			{Kind: loopcontract.SignalBlockerCleared},
-			{Kind: loopcontract.SignalResultFieldSet, Deliverable: true},
-		},
-		Policy: progressPolicy("bounded_code_change/v1", 3, 6, 9, 12, 20*time.Minute, 4, 1,
-			runcontract.BudgetLimit{WallTime: 20 * time.Minute, PromptTokens: 800_000,
-				CompletionTokens: 160_000, ModelCalls: 12, ToolActions: 48, Attempts: 2}),
-		RunBudgetRef: "run-budget:framework/v1",
-	}
-}
-
-func progressCodeChangeV2() loopcontract.CompiledProgressContract {
-	contract := progressCodeChangeV1()
-	contract.Ref = loopcontract.ProgressContractRef{
-		ContractID: ProgressCodeChangeV2, PolicyRef: "bounded_code_change/v2",
-	}
-	contract.Policy = progressPolicy("bounded_code_change/v2", 4, 8, 12, 16, 20*time.Minute, 4, 1,
-		runcontract.BudgetLimit{WallTime: 20 * time.Minute, PromptTokens: 1_000_000,
-			CompletionTokens: 200_000, ModelCalls: 16, ToolActions: 64, Attempts: 2})
-	return contract
-}
-
-func progressCodeChangeV3() loopcontract.CompiledProgressContract {
-	contract := progressCodeChangeV2()
-	contract.Ref = loopcontract.ProgressContractRef{
-		ContractID: ProgressCodeChangeV3, PolicyRef: "bounded_code_change/v3",
-	}
-	contract.Policy = progressPolicy("bounded_code_change/v3", 4, 10, 18, 24, 25*time.Minute, 4, 1,
-		runcontract.BudgetLimit{WallTime: 25 * time.Minute, PromptTokens: 1_500_000,
-			CompletionTokens: 300_000, ModelCalls: 24, ToolActions: 96, Attempts: 2})
-	return contract
-}
-
-func progressCodeChangeV4() loopcontract.CompiledProgressContract {
-	contract := progressCodeChangeV3()
-	contract.Ref = loopcontract.ProgressContractRef{
-		ContractID: ProgressCodeChangeV4, PolicyRef: "bounded_code_change/v4",
-	}
-	contract.AcceptedSignals = append(contract.AcceptedSignals,
-		loopcontract.ProgressSignalRule{Kind: loopcontract.SignalNovelEvidence, IdentityScope: "**"},
-		loopcontract.ProgressSignalRule{Kind: loopcontract.SignalConfirmedFactAdded, IdentityScope: "**"})
-	contract.Policy.PolicyRef = "bounded_code_change/v4"
-	return contract
-}
-
-func progressCodeChangeV5() loopcontract.CompiledProgressContract {
-	contract := progressCodeChangeV4()
-	contract.Ref = loopcontract.ProgressContractRef{
-		ContractID: ProgressCodeChangeV5, PolicyRef: "bounded_code_change/v5",
-	}
-	contract.Policy.PolicyRef = "bounded_code_change/v5"
-	contract.Policy.MaxExplorationTurns = 0
-	contract.Policy.KnowledgeCheckpointAfterTurns = 8
-	contract.Policy.MaxObservationStagnation = 2
-	contract.RunBudgetRef = loopcontract.RunBudgetRefRunIDV1
-	contract.AcceptedSignals = append(contract.AcceptedSignals,
-		loopcontract.ProgressSignalRule{Kind: loopcontract.SignalObservationStateAdvanced, IdentityScope: "**"})
-	contract.Policy.MaxNoProgressUsage.PromptTokens = 0
-	contract.Policy.MaxNoProgressUsage.CompletionTokens = 0
-	return contract
-}
-
-func progressCodeChangeV6() loopcontract.CompiledProgressContract {
-	contract := progressCodeChangeV5()
-	contract.Ref = loopcontract.ProgressContractRef{
-		ContractID: ProgressCodeChangeV6, PolicyRef: "bounded_code_change/v6",
-	}
-	contract.Policy.PolicyRef = "bounded_code_change/v6"
-	contract.Policy.KnowledgeCheckpointAfterTurns = 6
-	contract.Policy.DecisionCheckpointAfterTurns = 6
-	contract.Policy.MaxObservationStagnation = 0
-	contract.Policy.MaxDecisionStagnation = 2
-	contract.Policy.MaxControlContractFailures = 2
-	contract.Policy.MaxExplorationTurns = 24
-	contract.Policy.FirstDeliverableHandoffReserve = 5 * time.Minute
-	return contract
-}
-
-func progressCodeChangeV7() loopcontract.CompiledProgressContract {
-	contract := progressCodeChangeV6()
-	contract.Ref = loopcontract.ProgressContractRef{
-		ContractID: ProgressCodeChangeV7, PolicyRef: "bounded_code_change/v7",
-	}
-	contract.Policy.PolicyRef = "bounded_code_change/v7"
-	// 周期性 Observation 是压缩/进展辅助，不是副作用或终态 authority。
-	// 连续无效时沿既有 abandoned 路径保留 Raw History 并恢复业务；真正的
-	// rollover/intervention/terminal checkpoint 仍由 Agent 主循环 fail-closed。
-	contract.Policy.MaxControlContractFailures = 0
-	return contract
-}
-
-func progressCodeChangeV8() loopcontract.CompiledProgressContract {
-	contract := progressCodeChangeV7()
-	contract.Ref = loopcontract.ProgressContractRef{
-		ContractID: ProgressCodeChangeV8, PolicyRef: "bounded_code_change/v8",
-	}
-	contract.Policy.PolicyRef = "bounded_code_change/v8"
-	return contract
-}
-
-func progressCodeChangeV9() loopcontract.CompiledProgressContract {
-	contract := progressCodeChangeV8()
-	contract.Ref = loopcontract.ProgressContractRef{
-		ContractID: ProgressCodeChangeV9, PolicyRef: "bounded_code_change/v9",
-	}
-	contract.Policy.PolicyRef = "bounded_code_change/v9"
-	return contract
-}
-
-func progressCodeChangeV10() loopcontract.CompiledProgressContract {
-	contract := progressCodeChangeV9()
-	contract.Ref = loopcontract.ProgressContractRef{
-		ContractID: ProgressCodeChangeV10, PolicyRef: "bounded_code_change/v10",
-	}
-	contract.Policy.PolicyRef = "bounded_code_change/v10"
-	contract.Policy.DecisionCheckpointAfterTurns = 4
-	contract.Policy.MaxDecisionStagnation = 1
-	contract.Policy.MaxExplorationTurns = 6
-	for index := range contract.AcceptedSignals {
-		if contract.AcceptedSignals[index].Kind == loopcontract.SignalResultFieldSet {
-			contract.AcceptedSignals[index].IdentityScope = "**"
-		}
-	}
-	return contract
-}
-
-func progressCodeChangeV11() loopcontract.CompiledProgressContract {
-	contract := progressCodeChangeV10()
-	contract.Ref = loopcontract.ProgressContractRef{
-		ContractID: ProgressCodeChangeV11, PolicyRef: "bounded_code_change/v11",
-	}
-	contract.Policy.PolicyRef = "bounded_code_change/v11"
-	contract.Policy.DecisionCheckpointAfterTurns = 2
-	contract.Policy.CandidateRepairHandoffReserve = 3 * time.Minute
-	return contract
-}
-
-func progressCodeChangeV12() loopcontract.CompiledProgressContract {
-	contract := progressCodeChangeV11()
-	contract.Ref = loopcontract.ProgressContractRef{
-		ContractID: ProgressCodeChangeV12, PolicyRef: "bounded_code_change/v12",
-	}
-	contract.Policy.PolicyRef = "bounded_code_change/v12"
-	contract.Policy.DecisionCheckpointAfterTurns = 1
-	return contract
-}
-
-func progressInvestigation() loopcontract.CompiledProgressContract {
-	return loopcontract.CompiledProgressContract{
-		Schema: loopcontract.CompiledSchemaV1,
-		Ref: loopcontract.ProgressContractRef{
-			ContractID: ProgressInvestigationV1, PolicyRef: "bounded_investigation/v1",
-		},
-		WorkClass: loopcontract.WorkInvestigation,
-		Deliverables: []loopcontract.DeliverableRule{{
-			ID: "investigation-report", Kind: loopcontract.DeliverableReport, Required: true,
-		}},
-		AcceptedSignals: []loopcontract.ProgressSignalRule{
-			{Kind: loopcontract.SignalNovelEvidence, IdentityScope: "**", Deliverable: true},
-			{Kind: loopcontract.SignalConfirmedFactAdded, IdentityScope: "**", Deliverable: true},
-			{Kind: loopcontract.SignalInputRevisionAdvanced},
-			{Kind: loopcontract.SignalBlockerCleared},
-			{Kind: loopcontract.SignalResultFieldSet, Deliverable: true},
-		},
-		Policy: progressPolicy("bounded_investigation/v1", 4, 8, 12, 16, 25*time.Minute, 8, 1,
-			runcontract.BudgetLimit{WallTime: 25 * time.Minute, PromptTokens: 1_000_000,
-				CompletionTokens: 200_000, ModelCalls: 16, ToolActions: 64, Attempts: 2}),
-		RunBudgetRef: "run-budget:framework/v1",
-	}
-}
-
-func progressInvestigationV2() loopcontract.CompiledProgressContract {
-	contract := progressInvestigation()
-	contract.Ref = loopcontract.ProgressContractRef{ContractID: ProgressInvestigationV2, PolicyRef: "bounded_investigation/v2"}
-	contract.Policy.PolicyRef = "bounded_investigation/v2"
-	contract.Policy.MaxExplorationTurns = 0
-	contract.Policy.KnowledgeCheckpointAfterTurns = 8
-	contract.Policy.MaxObservationStagnation = 2
-	contract.RunBudgetRef = loopcontract.RunBudgetRefRunIDV1
-	contract.AcceptedSignals = append(contract.AcceptedSignals,
-		loopcontract.ProgressSignalRule{Kind: loopcontract.SignalObservationStateAdvanced, IdentityScope: "**"})
-	contract.Policy.MaxNoProgressUsage.PromptTokens = 0
-	contract.Policy.MaxNoProgressUsage.CompletionTokens = 0
-	return contract
-}
-
-func progressInvestigationV3() loopcontract.CompiledProgressContract {
-	contract := progressInvestigationV2()
-	contract.Ref = loopcontract.ProgressContractRef{
-		ContractID: ProgressInvestigationV3, PolicyRef: "bounded_investigation/v3",
-	}
-	contract.Policy.PolicyRef = "bounded_investigation/v3"
-	// Explorer 的唯一交付是结构化 investigation result。真实 mixed-model
-	// trace 证明 v2 的 unlimited novel evidence 可占满 execution window；v3
-	// 在有界探索后进入既有 exact submit phase，把实现预算留给 Worker。
-	contract.Policy.MaxExplorationTurns = 6
-	contract.Policy.KnowledgeCheckpointAfterTurns = 0
-	contract.Policy.MaxObservationStagnation = 0
-	for index := range contract.AcceptedSignals {
-		switch contract.AcceptedSignals[index].Kind {
-		case loopcontract.SignalNovelEvidence, loopcontract.SignalConfirmedFactAdded,
-			loopcontract.SignalObservationStateAdvanced:
-			contract.AcceptedSignals[index].Deliverable = false
-		case loopcontract.SignalResultFieldSet:
-			contract.AcceptedSignals[index].Deliverable = true
-		}
-	}
-	return contract
-}
-
-func progressInvestigationV4() loopcontract.CompiledProgressContract {
-	contract := progressInvestigationV3()
-	contract.Ref = loopcontract.ProgressContractRef{
-		ContractID: ProgressInvestigationV4, PolicyRef: "bounded_investigation/v4",
-	}
-	contract.Policy.PolicyRef = "bounded_investigation/v4"
-	// simple-task/v4 要求首失败、公开入口、状态所有者、内部 consumer 真实范围。
-	// 六轮实测只能完成叶子容器假设；十轮仍是机械硬上限，避免回到 v2 的无界浏览。
-	contract.Policy.MaxExplorationTurns = 10
-	return contract
-}
-
-func progressInvestigationV5() loopcontract.CompiledProgressContract {
-	contract := progressInvestigationV4()
-	contract.Ref = loopcontract.ProgressContractRef{
-		ContractID: ProgressInvestigationV5, PolicyRef: "bounded_investigation/v5",
-	}
-	contract.Policy.PolicyRef = "bounded_investigation/v5"
-	contract.Policy.MaxExplorationTurns = 8
-	contract.Policy.FirstDeliverableHandoffReserve = 4 * time.Minute
-	return contract
-}
-
-func progressInvestigationV6() loopcontract.CompiledProgressContract {
-	contract := progressInvestigationV5()
-	contract.Ref = loopcontract.ProgressContractRef{
-		ContractID: ProgressInvestigationV6, PolicyRef: "bounded_investigation/v6",
-	}
-	contract.Policy.PolicyRef = "bounded_investigation/v6"
-	contract.Policy.MaxExplorationTurns = 6
-	contract.Policy.FirstDeliverableHandoffReserve = 8 * time.Minute
-	return contract
-}
-
-func progressInvestigationV7() loopcontract.CompiledProgressContract {
-	contract := progressInvestigationV6()
-	contract.Ref = loopcontract.ProgressContractRef{
-		ContractID: ProgressInvestigationV7, PolicyRef: "bounded_investigation/v7",
-	}
-	contract.Policy.PolicyRef = "bounded_investigation/v7"
-	contract.Policy.FirstDeliverableHandoffReserve = 10 * time.Minute
-	return contract
-}
-
-func progressVerification() loopcontract.CompiledProgressContract {
-	return loopcontract.CompiledProgressContract{
-		Schema: loopcontract.CompiledSchemaV1,
-		Ref: loopcontract.ProgressContractRef{
-			ContractID: ProgressVerificationV1, PolicyRef: "bounded_verification/v1",
-		},
-		WorkClass: loopcontract.WorkVerification,
-		Deliverables: []loopcontract.DeliverableRule{{
-			ID: "verification-result", Kind: loopcontract.DeliverableStructuredResult, Required: true,
-		}},
-		VerificationTargets: []loopcontract.VerificationRule{{
-			ID: "evaluation", Kind: loopcontract.VerificationEvaluation,
-			Target: "declared-evaluator", Required: true,
-		}},
-		AcceptedSignals: []loopcontract.ProgressSignalRule{
-			{Kind: loopcontract.SignalEvaluationChanged, IdentityScope: "declared-evaluator"},
-			{Kind: loopcontract.SignalEvaluationPassed, IdentityScope: "declared-evaluator", Deliverable: true},
-			{Kind: loopcontract.SignalNovelEvidence, IdentityScope: "**"},
-			{Kind: loopcontract.SignalResultFieldSet, Deliverable: true},
-			{Kind: loopcontract.SignalBlockerCleared},
-		},
-		Policy: progressPolicy("bounded_verification/v1", 2, 4, 6, 8, 15*time.Minute, 2, 1,
-			runcontract.BudgetLimit{WallTime: 15 * time.Minute, PromptTokens: 500_000,
-				CompletionTokens: 100_000, ModelCalls: 8, ToolActions: 32, Attempts: 2}),
-		RunBudgetRef: "run-budget:framework/v1",
-	}
-}
-
-func progressVerificationV2() loopcontract.CompiledProgressContract {
-	contract := progressVerification()
-	contract.Ref = loopcontract.ProgressContractRef{ContractID: ProgressVerificationV2, PolicyRef: "bounded_verification/v2"}
-	contract.Policy.PolicyRef = "bounded_verification/v2"
-	contract.Policy.MaxExplorationTurns = 0
-	contract.Policy.KnowledgeCheckpointAfterTurns = 8
-	contract.Policy.MaxObservationStagnation = 2
-	contract.RunBudgetRef = loopcontract.RunBudgetRefRunIDV1
-	contract.AcceptedSignals = append(contract.AcceptedSignals,
-		loopcontract.ProgressSignalRule{Kind: loopcontract.SignalObservationStateAdvanced, IdentityScope: "**"})
-	contract.Policy.MaxNoProgressUsage.PromptTokens = 0
-	contract.Policy.MaxNoProgressUsage.CompletionTokens = 0
-	return contract
-}
-
-func progressVerificationV3() loopcontract.CompiledProgressContract {
-	contract := progressVerificationV2()
-	contract.Ref = loopcontract.ProgressContractRef{
-		ContractID: ProgressVerificationV3, PolicyRef: "bounded_verification/v3",
-	}
-	contract.Policy.PolicyRef = "bounded_verification/v3"
-	// Verifier 只消费 frozen patch/artifact/check；四个新知识 turn 后进入
-	// exact submit，不能把 verification reserve 用作第二次无界调查。
-	contract.Policy.MaxExplorationTurns = 4
-	contract.Policy.KnowledgeCheckpointAfterTurns = 0
-	contract.Policy.MaxObservationStagnation = 0
-	return contract
-}
-
-func progressCoordination() loopcontract.CompiledProgressContract {
-	return loopcontract.CompiledProgressContract{
-		Schema: loopcontract.CompiledSchemaV1,
-		Ref: loopcontract.ProgressContractRef{
-			ContractID: ProgressCoordinationV1, PolicyRef: "bounded_coordination/v1",
-		},
-		WorkClass: loopcontract.WorkCoordination,
-		Deliverables: []loopcontract.DeliverableRule{{
-			ID: "coordination-result", Kind: loopcontract.DeliverableStructuredResult, Required: true,
-		}},
-		AcceptedSignals: []loopcontract.ProgressSignalRule{
-			{Kind: loopcontract.SignalInputRevisionAdvanced, Deliverable: true},
-			{Kind: loopcontract.SignalBlockerCleared, Deliverable: true},
-			{Kind: loopcontract.SignalResultFieldSet, Deliverable: true},
-			{Kind: loopcontract.SignalExternalEffectSettled},
-		},
-		Policy: progressPolicy("bounded_coordination/v1", 2, 4, 6, 8, 10*time.Minute, 2, 1,
-			runcontract.BudgetLimit{WallTime: 10 * time.Minute, PromptTokens: 400_000,
-				CompletionTokens: 80_000, ModelCalls: 8, ToolActions: 24, Attempts: 2}),
-		RunBudgetRef: "run-budget:framework/v1",
-	}
-}
-
-func progressCoordinationV2() loopcontract.CompiledProgressContract {
-	contract := progressCoordination()
-	contract.Ref = loopcontract.ProgressContractRef{ContractID: ProgressCoordinationV2, PolicyRef: "bounded_coordination/v2"}
-	contract.Policy.PolicyRef = "bounded_coordination/v2"
-	contract.Policy.MaxExplorationTurns = 0
-	contract.Policy.KnowledgeCheckpointAfterTurns = 8
-	contract.Policy.MaxObservationStagnation = 2
-	contract.RunBudgetRef = loopcontract.RunBudgetRefRunIDV1
-	contract.AcceptedSignals = append(contract.AcceptedSignals,
-		loopcontract.ProgressSignalRule{Kind: loopcontract.SignalObservationStateAdvanced, IdentityScope: "**"})
-	contract.Policy.MaxNoProgressUsage.PromptTokens = 0
-	contract.Policy.MaxNoProgressUsage.CompletionTokens = 0
-	return contract
-}
-
-func progressFinalReport() loopcontract.CompiledProgressContract {
-	return loopcontract.CompiledProgressContract{
-		Schema: loopcontract.CompiledSchemaV1,
-		Ref: loopcontract.ProgressContractRef{
-			ContractID: ProgressFinalReportV1, PolicyRef: "bounded_final_report/v1",
-		},
-		WorkClass: loopcontract.WorkFinalization,
-		Deliverables: []loopcontract.DeliverableRule{{
-			ID: "final-report", Kind: loopcontract.DeliverableStructuredResult, Required: true,
-		}},
-		AcceptedSignals: []loopcontract.ProgressSignalRule{
-			{Kind: loopcontract.SignalNovelEvidence, IdentityScope: "**"},
-			{Kind: loopcontract.SignalConfirmedFactAdded, IdentityScope: "**"},
-			{Kind: loopcontract.SignalResultFieldSet, Deliverable: true},
-		},
-		Policy: progressPolicy("bounded_final_report/v1", 1, 2, 4, 5, 5*time.Minute, 2, 0,
-			runcontract.BudgetLimit{WallTime: 5 * time.Minute, PromptTokens: 250_000,
-				CompletionTokens: 50_000, ModelCalls: 5, ToolActions: 12, Attempts: 1}),
-		RunBudgetRef: loopcontract.RunBudgetRefRunIDV1,
-	}
-}
-
-func progressPolicy(ref string, reminder, rollover, intervention, maximum int,
-	duration time.Duration, exploration, attemptRollovers int, usage runcontract.BudgetLimit,
-) loopcontract.ProgressPolicy {
-	return loopcontract.ProgressPolicy{
-		PolicyRef: ref, ReminderAfterTurns: reminder, RolloverAfterTurns: rollover,
-		InterventionAfterTurns: intervention, MaxNoProgressTurns: maximum,
-		MaxNoProgressDuration: duration, MaxNoProgressUsage: usage,
-		MaxExplorationTurns: exploration, MaxAttemptRollovers: attemptRollovers,
-		RecentFingerprintWindow: 16,
-	}
 }
 
 func sealProgressProfile(contract loopcontract.CompiledProgressContract) (ProgressProfile, error) {

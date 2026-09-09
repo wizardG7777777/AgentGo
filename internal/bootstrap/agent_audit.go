@@ -18,13 +18,12 @@ package bootstrap
 // 文本，只进任务结果，不进 trace（与正文不落账本同一纪律）。
 
 import (
- "agentgo/internal/contextcontract"
+	"agentgo/internal/contextcontract"
 	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
 	"sync"
-	"time"
 
 	"agentgo/internal/config"
 	"agentgo/internal/loopcontract"
@@ -230,8 +229,7 @@ func (s *System) RequestAgentAudit() (string, error) {
 		EventSource:    "agent-audit",
 		MaxConcurrency: 1, // 同一时刻只跑一个审计
 	}
-	if err := taskcontract.Start(task, loopcontract.WorkVerification, "agent-audit/v1",
-		30*time.Minute, 3*time.Minute, 5*time.Minute); err != nil {
+	if err := taskcontract.Start(task, loopcontract.WorkVerification, "agent-audit/v1"); err != nil {
 		return "", fmt.Errorf("创建代理审计 RunContract: %w", err)
 	}
 	if err := s.Store.PublishTask(task); err != nil {

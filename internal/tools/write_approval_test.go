@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,7 +60,7 @@ func answerFileWrite(t *testing.T, service *interaction.Service, request interac
 	}
 }
 
-// strict 下 write_file：Create 的协议字段逐项断言（Kind/Purpose/Subject/Digest/
+// strict 下 apply_change：Create 的协议字段逐项断言（Kind/Purpose/Subject/Digest/
 // Prompt 含路径），allow_once 放行且 inner 恰好执行一次；第二次调用重新询问。
 func TestFileWriteApprover_StrictCreateProtocolAndAllowOnce(t *testing.T) {
 	service := interaction.NewService(nil)
@@ -74,7 +75,7 @@ func TestFileWriteApprover_StrictCreateProtocolAndAllowOnce(t *testing.T) {
 		}
 		return "written", nil
 	})
-	wrapped := approver.WrapHandler("write_file")(inner)
+	wrapped := approver.WrapHandler("apply_change")(inner)
 
 	content := "第一行\n第二行\n第三行"
 	ctx := agent.WithAgentContext(context.Background(), "worker-1", "task-9", 0)
@@ -89,15 +90,16 @@ func TestFileWriteApprover_StrictCreateProtocolAndAllowOnce(t *testing.T) {
 	}()
 
 	request := waitFileWritePending(t, service, 1)[0]
-	payloadDigest := sha256Hex([]byte(content))
-	digest := fileWriteDigest("write_file", "/repo/a.go", payloadDigest)
+	payload, _ := json.Marshal(map[string]any{"path": "/repo/a.go", "content": content})
+	payloadDigest := sha256Hex(payload)
+	digest := fileWriteDigest("apply_change", "/repo/a.go", payloadDigest)
 	if request.Kind != interaction.KindAuthorization || request.Purpose != PurposeFileWrite {
 		t.Fatalf("Kind/Purpose = %s/%s", request.Kind, request.Purpose)
 	}
 	if request.SessionID != "session-test" {
 		t.Fatalf("SessionID = %q", request.SessionID)
 	}
-	if !strings.Contains(request.Prompt, "write_file") || !strings.Contains(request.Prompt, "/repo/a.go") {
+	if !strings.Contains(request.Prompt, "apply_change") || !strings.Contains(request.Prompt, "/repo/a.go") {
 		t.Fatalf("Prompt 必须含工具名与路径: %q", request.Prompt)
 	}
 	if !strings.Contains(request.Prompt, "覆盖写入") || !strings.Contains(request.Prompt, "第一行") {
@@ -116,7 +118,7 @@ func TestFileWriteApprover_StrictCreateProtocolAndAllowOnce(t *testing.T) {
 		request.Origin.TaskID != "task-9" {
 		t.Fatalf("Origin = %+v", request.Origin)
 	}
-	if request.Metadata[metadataFileTool] != "write_file" ||
+	if request.Metadata[metadataFileTool] != "apply_change" ||
 		request.Metadata[metadataFilePath] != "/repo/a.go" ||
 		request.Metadata[metadataFilePayloadDigest] != payloadDigest ||
 		request.Metadata[metadataFileDigest] != digest {
@@ -173,7 +175,7 @@ func TestFileWriteApprover_DenyAndGuidanceDoNotWrite(t *testing.T) {
 			service := interaction.NewService(nil)
 			var executed atomic.Bool
 			approver := NewFileWriteApprover(strictStore(), service, nil, "worker-1", nil)
-			wrapped := approver.WrapHandler("write_file")(
+			wrapped := approver.WrapHandler("apply_change")(
 				func(context.Context, map[string]any) (string, error) {
 					executed.Store(true)
 					return "", nil
@@ -206,7 +208,7 @@ func TestFileWriteApprover_AllowSessionExactPath(t *testing.T) {
 		calls.Add(1)
 		return "written", nil
 	})
-	wrapped := approver.WrapHandler("write_file")(inner)
+	wrapped := approver.WrapHandler("apply_change")(inner)
 
 	done := make(chan error, 1)
 	go func() {
@@ -224,7 +226,7 @@ func TestFileWriteApprover_AllowSessionExactPath(t *testing.T) {
 		t.Fatalf("allow_session 后同路径应直接放行: %v", err)
 	}
 	// 路径经 filepath.Clean 归一："./a.go" 与 "a.go" 视为同一路径。
-	wrappedRel := approver.WrapHandler("edit_file")(inner)
+	wrappedRel := approver.WrapHandler("apply_change")(inner)
 	if _, err := wrappedRel(context.Background(),
 		map[string]any{"path": "/repo/./a.go", "old_str": "x", "new_str": "y"}); err != nil {
 		t.Fatalf("归一后的同一路径应直接放行: %v", err)
@@ -246,7 +248,7 @@ func TestFileWriteApprover_AllowSessionExactPath(t *testing.T) {
 
 	// 另一个 wrapper 实例不共享放行记忆：同路径对它仍询问。
 	other := NewFileWriteApprover(strictStore(), service, nil, "worker-2", nil)
-	wrappedOther := other.WrapHandler("write_file")(inner)
+	wrappedOther := other.WrapHandler("apply_change")(inner)
 	go func() {
 		_, err := wrappedOther(context.Background(), map[string]any{"path": "/repo/a.go", "content": "w"})
 		done <- err
@@ -271,7 +273,7 @@ func TestFileWriteApprover_NonStrictPassthrough(t *testing.T) {
 			service := interaction.NewService(nil)
 			var calls atomic.Int32
 			approver := NewFileWriteApprover(store, service, nil, "worker-1", nil)
-			wrapped := approver.WrapHandler("write_file")(
+			wrapped := approver.WrapHandler("apply_change")(
 				func(context.Context, map[string]any) (string, error) {
 					calls.Add(1)
 					return "written", nil
@@ -291,7 +293,7 @@ func TestFileWriteApprover_NonStrictPassthrough(t *testing.T) {
 func TestFileWriteApprover_NilServiceFailsClosed(t *testing.T) {
 	var executed atomic.Bool
 	approver := NewFileWriteApprover(strictStore(), nil, nil, "worker-1", nil)
-	wrapped := approver.WrapHandler("write_file")(
+	wrapped := approver.WrapHandler("apply_change")(
 		func(context.Context, map[string]any) (string, error) {
 			executed.Store(true)
 			return "", nil
@@ -313,7 +315,7 @@ func TestFileWriteApprover_NilServiceFailsClosed(t *testing.T) {
 // 因此这里直接对复核函数做逐项篡改断言——wrapper 在执行 inner 前调用它。
 func TestFileWriteApprover_BindingRecheck(t *testing.T) {
 	payloadDigest := sha256Hex([]byte("content"))
-	digest := fileWriteDigest("write_file", "/repo/a.go", payloadDigest)
+	digest := fileWriteDigest("apply_change", "/repo/a.go", payloadDigest)
 	base := interaction.Request{
 		State:   interaction.StateResolved,
 		Purpose: PurposeFileWrite,
@@ -323,11 +325,11 @@ func TestFileWriteApprover_BindingRecheck(t *testing.T) {
 			Handler: ResolutionHandlerFileWrite, TargetID: digest, AgentID: "worker-1", TaskID: "task-9",
 		},
 		Metadata: map[string]string{
-			metadataFileTool: "write_file", metadataFilePath: "/repo/a.go",
+			metadataFileTool: "apply_change", metadataFilePath: "/repo/a.go",
 			metadataFilePayloadDigest: payloadDigest, metadataFileDigest: digest,
 		},
 	}
-	if !matchesFileWriteRequest(base, "write_file", "/repo/a.go", payloadDigest, digest, "worker-1", "task-9") {
+	if !matchesFileWriteRequest(base, "apply_change", "/repo/a.go", payloadDigest, digest, "worker-1", "task-9") {
 		t.Fatal("合法绑定应通过复核")
 	}
 
@@ -335,7 +337,7 @@ func TestFileWriteApprover_BindingRecheck(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			mutated := interaction.CloneRequest(base)
 			mutate(&mutated)
-			if matchesFileWriteRequest(mutated, "write_file", "/repo/a.go", payloadDigest, digest, "worker-1", "task-9") {
+			if matchesFileWriteRequest(mutated, "apply_change", "/repo/a.go", payloadDigest, digest, "worker-1", "task-9") {
 				t.Fatalf("%s 被篡改后仍通过复核", name)
 			}
 		})
@@ -363,7 +365,7 @@ func TestFileWriteApprover_ContextCancelFailsClosed(t *testing.T) {
 		hookCalls = append(hookCalls, waiting)
 		hookMu.Unlock()
 	})
-	wrapped := approver.WrapHandler("write_file")(
+	wrapped := approver.WrapHandler("apply_change")(
 		func(context.Context, map[string]any) (string, error) {
 			executed.Store(true)
 			return "", nil
@@ -401,12 +403,12 @@ func TestFileWriteApprover_ContextCancelFailsClosed(t *testing.T) {
 	}
 }
 
-// edit_file：Prompt 含 old→new 摘要，digest 绑定 old_str+NUL+new_str。
+// apply_change：Prompt 含 old→new 摘要，digest 绑定 old_str+NUL+new_str。
 func TestFileWriteApprover_EditFilePromptAndDigest(t *testing.T) {
 	service := interaction.NewService(nil)
 	approver := NewFileWriteApprover(strictStore(), service, nil, "worker-1", nil)
 	var executed atomic.Bool
-	wrapped := approver.WrapHandler("edit_file")(
+	wrapped := approver.WrapHandler("apply_change")(
 		func(context.Context, map[string]any) (string, error) {
 			executed.Store(true)
 			return "", nil
@@ -420,11 +422,11 @@ func TestFileWriteApprover_EditFilePromptAndDigest(t *testing.T) {
 	request := waitFileWritePending(t, service, 1)[0]
 	if !strings.Contains(request.Prompt, "单次替换") || !strings.Contains(request.Prompt, "- 旧: foo") ||
 		!strings.Contains(request.Prompt, "+ 新: foobar") {
-		t.Fatalf("edit_file Prompt = %q", request.Prompt)
+		t.Fatalf("apply_change Prompt = %q", request.Prompt)
 	}
-	wantDigest := fileWriteDigest("edit_file", "/repo/a.go", sha256Hex([]byte("foo\x00foobar")))
+	wantDigest := fileWriteDigest("apply_change", "/repo/a.go", sha256Hex([]byte(`{"new_str":"foobar","old_str":"foo","path":"/repo/a.go"}`)))
 	if request.Subject.Digest != wantDigest {
-		t.Fatalf("edit_file digest = %s, want %s", request.Subject.Digest, wantDigest)
+		t.Fatalf("apply_change digest = %s, want %s", request.Subject.Digest, wantDigest)
 	}
 	answerFileWrite(t, service, request, shell.ActionDeny, "")
 	if err := <-done; err == nil {

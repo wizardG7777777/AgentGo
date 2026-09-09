@@ -49,7 +49,7 @@ func TestManagerTerminalEventEmitReturnsPromptlyWithSlowStore(t *testing.T) {
 
 	result, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/explorer@1", Purpose: "inspect", Replicas: 1,
+		TemplateRef:      "builtin/explorer@2", Purpose: "inspect", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -109,7 +109,7 @@ func TestManagerConcurrentTerminalEventsSettleOnce(t *testing.T) {
 
 	if _, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/explorer@1", Purpose: "inspect", Replicas: 2,
+		TemplateRef:      "builtin/explorer@2", Purpose: "inspect", Replicas: 2,
 	}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}

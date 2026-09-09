@@ -330,12 +330,31 @@ func (a *AuthoringRuntime) CommitGraphChangeAndAdopt(changeID string, expectedPr
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrGraphChangeNotFound, changeID)
 	}
-	current, err := a.Runtime.graph(change.GraphID)
-	if err != nil {
-		return nil, err
+	current, exists := a.Runtime.store.Get(change.GraphID)
+	if !exists {
+		// 尚未启动的正式图也允许更新；工具层把启动与变更串行化。
+		return a.Authoring.CommitGraphChange(changeID, expectedProposalRevision, reportID)
 	}
 	if current.Status.IsTerminal() {
 		return nil, fmt.Errorf("graph: 终态 Execution %s 不接受 GraphChange commit", change.GraphID)
+	}
+	// 在正式定义落盘前校验运行态约束。否则删除活动节点等请求会先 commit
+	// 再在 adoption 时失败，使“拒绝变更”实际上污染正式 revision。
+	if current.Revision != change.BaseDefinitionRevision || current.DefinitionDigest != change.BaseDefinitionDigest {
+		return nil, &RevisionConflictError{GraphID: change.GraphID, Base: change.BaseDefinitionRevision, Current: current.Revision}
+	}
+	report, ok := a.Authoring.GetValidationReport(reportID)
+	if !ok || !report.Accepted || report.NormalizedDefinition == nil {
+		return nil, fmt.Errorf("变更缺少通过的验证报告")
+	}
+	body := report.NormalizedDefinition
+	if body.Root != current.Root || body.RunID != current.RunID || !reflect.DeepEqual(body.RunContract, current.RunContract) {
+		return nil, fmt.Errorf("运行图变更不得更换 root 或 Run 身份")
+	}
+	for id, old := range current.Nodes {
+		if _, exists := body.Nodes[id]; !exists && old.Execution != nil {
+			return nil, fmt.Errorf("不能删除已有执行事实的节点 %q", id)
+		}
 	}
 	definition, err := a.Authoring.CommitGraphChange(changeID, expectedProposalRevision, reportID)
 	if err != nil {
@@ -349,6 +368,28 @@ func (a *AuthoringRuntime) CommitGraphChangeAndAdopt(changeID string, expectedPr
 		return nil, fmt.Errorf("GraphChange Definition 已 commit，Runtime adoption 待恢复: %w", err)
 	}
 	return definition, nil
+}
+
+// CancelDefinition 区分尚未启动的定义和实际运行图，在同一 Runtime 锁内执行。
+func (a *AuthoringRuntime) CancelDefinition(graphID string, expectedRevision int64, reason string) error {
+	if a == nil || a.Runtime == nil || a.Authoring == nil {
+		return fmt.Errorf("取消图缺少运行时依赖")
+	}
+	a.Runtime.mu.Lock()
+	defer a.Runtime.mu.Unlock()
+	d, ok := a.Authoring.LatestDefinition(graphID)
+	if !ok || d.Revision != expectedRevision {
+		return fmt.Errorf("取消图的定义版本不一致")
+	}
+	if current, ok := a.Runtime.store.Get(graphID); ok {
+		if current.Revision != expectedRevision {
+			return fmt.Errorf("取消图的执行版本不一致")
+		}
+		_, cleanupErr, err := a.Runtime.cancelGraphTreeLocked(graphID, reason, true, map[string]struct{}{})
+		return errors.Join(err, cleanupErr)
+	}
+	_, err := a.Authoring.AbandonDefinition(graphID, expectedRevision)
+	return err
 }
 
 // ReconcileCommittedDefinitions 修复「Authoring change commit 已 durable、Runtime

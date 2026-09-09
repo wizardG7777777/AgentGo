@@ -1,0 +1,61 @@
+# 四类工具并发测试配置。连接和模型通过进程环境注入，不在文件保存密钥。
+llm:
+  request_contract: agentgo.model-request/v1
+  base_url: ${SWE_BASE_URL}
+  api_key: ${SWE_API_KEY}
+  default_model: ${SWE_FAST_MODEL}
+  protocol: responses
+  timeout_sec: 120
+
+tool_profiles:
+  worker_standard:
+    - run_shell
+    - read_file
+    - apply_change
+    - inspect_board
+    - inspect_node
+    - read_evidence
+    - send_message
+    - request_replan
+    - submit_task_result
+  explorer_full:
+    - run_shell
+    - read_file
+    - inspect_board
+    - inspect_node
+    - read_evidence
+    - send_message
+    - request_replan
+    - submit_task_result
+  verifier:
+    - read_file
+    - inspect_board
+    - inspect_node
+    - read_evidence
+    - submit_task_result
+
+agents:
+  - kind: worker
+    replicas: 3
+    event_type: ""
+    profile: worker_standard
+    model: ${SWE_FAST_MODEL}
+    system_prompt_file: prompts/worker.md
+  - kind: explorer
+    replicas: 3
+    event_type: explore
+    profile: explorer_full
+    model: ${SWE_FAST_MODEL}
+    system_prompt_file: prompts/explorer.md
+  - kind: verifier
+    replicas: 1
+    event_type: acceptance.verify
+    profile: verifier
+    model: ${SWE_FAST_MODEL}
+    system_prompt_file: prompts/verifier.md
+
+scheduler:
+  model: ${SWE_FAST_MODEL}
+project_root: "."
+startup_probe: tool
+shell_timeout_sec: 120

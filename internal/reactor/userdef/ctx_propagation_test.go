@@ -71,17 +71,7 @@ func loadInvokeLLMForCtxTest(t *testing.T, llm LLMCompleter) []reactor.Reactor {
 	t.Helper()
 	dir := t.TempDir()
 	writePrompt(t, dir, "p.md", "Summarize ${event.task.id}")
-	yamlData := []byte(`
-reactors:
-  - name: ctx-probe
-    on: task_failed
-    invoke_llm:
-      prompt:
-        file: ./p.md
-      output:
-        write_file:
-          path: ./out.txt
-`)
+	yamlData := []byte("\nreactors:\n  - name: ctx-probe\n    on: task_failed\n    invoke_llm:\n      prompt:\n        file: ./p.md\n      output:\n        apply_change:\n          path: ./out.txt\n")
 	rs, err := Load(yamlData, dir, dir, Deps{LLM: llm})
 	if err != nil {
 		t.Fatalf("Load: %v", err)

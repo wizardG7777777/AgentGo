@@ -67,7 +67,7 @@ func (r Reservation) Validate() error {
 	if r.Schema != ReservationSchemaV1 || strings.TrimSpace(r.ReservationID) == "" ||
 		strings.TrimSpace(r.ActionID) == "" || strings.TrimSpace(string(r.RunID)) == "" ||
 		strings.TrimSpace(r.TaskID) == "" || strings.TrimSpace(r.AttemptID) == "" || !r.Phase.Valid() ||
-		r.ReservedAt.IsZero() || r.ExpiresAt.IsZero() || !r.ReservedAt.Before(r.ExpiresAt) {
+		r.ReservedAt.IsZero() || (!r.ExpiresAt.IsZero() && !r.ReservedAt.Before(r.ExpiresAt)) {
 		return fmt.Errorf("RunBudget Reservation 字段无效")
 	}
 	return r.MaxCharge.Validate()
@@ -603,7 +603,7 @@ func (s *Store) appendSettlementLocked(runID runcontract.RunID, state *runState,
 func (s *Store) settleExpiredLocked(runID runcontract.RunID, state *runState, now time.Time) error {
 	ids := make([]string, 0)
 	for id, reservation := range state.active {
-		if !now.Before(reservation.ExpiresAt) {
+		if !reservation.ExpiresAt.IsZero() && !now.Before(reservation.ExpiresAt) {
 			ids = append(ids, id)
 		}
 	}

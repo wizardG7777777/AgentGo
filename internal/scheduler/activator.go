@@ -266,18 +266,19 @@ func (a *Activator) handleEvent(evt model.Event) {
 		run := evt.RunContract
 		if run == nil {
 			run = &runcontract.RunContract{
-				Schema:              runcontract.SchemaCurrent,
-				RunID:               runcontract.RunID("run-" + uuid.NewString()),
-				DeadlineAt:          now.Add(time.Duration(SchedulerTaskTimeoutSec) * time.Second),
-				FinalizationReserve: defaultRunFinalizationReserve,
-				RecoveryReserve:     defaultRunRecoveryReserve,
-				VerificationReserve: defaultRunVerificationReserve,
-				BudgetProfile:       "interactive/v3",
-				CreatedAt:           now,
+				Schema: runcontract.SchemaCurrent,
+				RunID:  runcontract.RunID("run-" + uuid.NewString()),
+
+				BudgetProfile: "interactive/v4",
+				CreatedAt:     now,
 			}
 		} else {
 			copy := *run
 			run = &copy
+		}
+		if run.Schema != runcontract.SchemaCurrent {
+			log.Printf("[scheduler-activator] 拒绝旧 RunContract schema=%s", run.Schema)
+			return
 		}
 		if err := run.ValidateAt(now); err != nil {
 			log.Printf("[scheduler-activator] 创建 RunContract 失败: %v", err)

@@ -182,7 +182,7 @@ func TestManagerProvisionIdempotenceLimitsShutdownAndRecovery(t *testing.T) {
 	manager := testManagerWithStore(t, catalog, taskStore, durable, routes, 2)
 	req := agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/explorer@1", Purpose: "map the codebase", Replicas: 2,
+		TemplateRef:      "builtin/explorer@2", Purpose: "map the codebase", Replicas: 2,
 	}
 	if _, err := manager.Provision(context.Background(), req); !errors.Is(err, ErrNotStarted) {
 		t.Fatalf("Provision before Start err=%v, want ErrNotStarted", err)
@@ -223,14 +223,14 @@ func TestManagerProvisionIdempotenceLimitsShutdownAndRecovery(t *testing.T) {
 
 	_, err = manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/generalist@1", Purpose: "implement", Replicas: 1,
+		TemplateRef:      "builtin/generalist@2", Purpose: "implement", Replicas: 1,
 	})
 	if !errors.Is(err, ErrProcessLimitExceeded) {
 		t.Fatalf("process limit err=%v, want ErrProcessLimitExceeded", err)
 	}
 	_, err = manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/verifier@1", Purpose: "accept", Replicas: 2,
+		TemplateRef:      "builtin/verifier@2", Purpose: "accept", Replicas: 2,
 	})
 	if err == nil {
 		t.Fatal("verifier template accepted replicas above template max")
@@ -275,7 +275,7 @@ func TestManagerRecoveryClaimsV4UnreadMailboxWithoutDuplicateRegistration(t *tes
 	}
 	result, err := first.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/explorer@1", Purpose: "recover unread mail", Replicas: 1,
+		TemplateRef:      "builtin/explorer@2", Purpose: "recover unread mail", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -339,7 +339,7 @@ func TestManagerShutdownPreservesUnreadMailboxUntilFinalSnapshot(t *testing.T) {
 	}
 	result, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/explorer@1", Purpose: "persist unread shutdown mail", Replicas: 1,
+		TemplateRef:      "builtin/explorer@2", Purpose: "persist unread shutdown mail", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -404,7 +404,7 @@ func TestManagerRecoveryStartFailureRollsBackMailboxClaim(t *testing.T) {
 	}
 	result, err := first.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/explorer@1", Purpose: "rollback unread mail", Replicas: 1,
+		TemplateRef:      "builtin/explorer@2", Purpose: "rollback unread mail", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -547,7 +547,7 @@ func TestManagerProvisionPublishesRouteAfterDurableRuntimeReady(t *testing.T) {
 
 	result, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/explorer@1", Purpose: "inspect", Replicas: 2,
+		TemplateRef:      "builtin/explorer@2", Purpose: "inspect", Replicas: 2,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -580,7 +580,7 @@ func TestManagerProvisionRouteFailureStopsSpecAndCleansRuntime(t *testing.T) {
 
 	_, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/explorer@1", Purpose: "inspect", Replicas: 1,
+		TemplateRef:      "builtin/explorer@2", Purpose: "inspect", Replicas: 1,
 	})
 	if !errors.Is(err, routeErr) {
 		t.Fatalf("Provision err=%v, want route registration failure", err)
@@ -651,7 +651,7 @@ func TestManagerProvisionPersistenceFailureNeverExposesRoute(t *testing.T) {
 	go func() {
 		_, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 			ControllerTaskID: controllerID,
-			TemplateRef:      "builtin/explorer@1", Purpose: "inspect", Replicas: 1,
+			TemplateRef:      "builtin/explorer@2", Purpose: "inspect", Replicas: 1,
 		})
 		done <- err
 	}()
@@ -786,7 +786,7 @@ func TestManagerRecoveryStopsTeamWithTerminalController(t *testing.T) {
 	manager := testManager(t, catalog, durable, routes, 4)
 	controllerID := newControllerTask(t, manager.deps.Store, "controller-terminal-recovery")
 	spec := testSpec("terminal-controller-team", controllerID, "investigate")
-	tmpl, err := catalog.Resolve("builtin/explorer@1")
+	tmpl, err := catalog.Resolve("builtin/explorer@2")
 	if err != nil {
 		t.Fatalf("resolve explorer template: %v", err)
 	}
@@ -830,7 +830,7 @@ func TestManagerProvisionRejectsDurableDigestDrift(t *testing.T) {
 	}
 	_, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/explorer@1", Purpose: "investigate", Replicas: 2,
+		TemplateRef:      "builtin/explorer@2", Purpose: "investigate", Replicas: 2,
 	})
 	if !errors.Is(err, ErrTemplateDigestMismatch) {
 		t.Fatalf("Provision err=%v, want ErrTemplateDigestMismatch", err)
@@ -860,7 +860,7 @@ func TestManagerTerminalControllerReactorStopsTeamAndRecoverySkipsIt(t *testing.
 	}
 	result, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/explorer@1", Purpose: "inspect", Replicas: 1,
+		TemplateRef:      "builtin/explorer@2", Purpose: "inspect", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -919,7 +919,7 @@ func TestManagerGraphTeamSurvivesControllerAndStopsAtGraphTerminal(t *testing.T)
 	defer manager.Shutdown()
 	result, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID, GraphID: "g-team-lifecycle",
-		TemplateRef: "builtin/explorer@1", Purpose: "inspect", Replicas: 1,
+		TemplateRef: "builtin/explorer@2", Purpose: "inspect", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("Provision graph Team: %v", err)
@@ -972,7 +972,7 @@ func TestManagerStopsGraphBindingOrphanWhenSubmissionNeverBecameDurable(t *testi
 	defer manager.Shutdown()
 	result, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID, GraphID: "g-never-submitted",
-		TemplateRef: "builtin/explorer@1", Purpose: "inspect", Replicas: 1,
+		TemplateRef: "builtin/explorer@2", Purpose: "inspect", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1020,7 +1020,7 @@ func TestManagerRejectsProvisionForTerminalGraph(t *testing.T) {
 
 	_, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID, GraphID: "g-already-ended",
-		TemplateRef: "builtin/explorer@1", Purpose: "must not leak", Replicas: 1,
+		TemplateRef: "builtin/explorer@2", Purpose: "must not leak", Replicas: 1,
 	})
 	if err == nil || !strings.Contains(err.Error(), "terminal graph") {
 		t.Fatalf("terminal Graph provision err=%v, want fail-closed rejection", err)
@@ -1102,7 +1102,7 @@ func TestManagerShutdownRemovesDynamicRuntimeSurfaces(t *testing.T) {
 	}
 	result, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 		ControllerTaskID: controllerID,
-		TemplateRef:      "builtin/explorer@1", Purpose: "inspect", Replicas: 1,
+		TemplateRef:      "builtin/explorer@2", Purpose: "inspect", Replicas: 1,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -1143,7 +1143,7 @@ func TestManagerRepeatedTerminalTeamsReleaseTaskEndCallbacks(t *testing.T) {
 		controllerID := newControllerTask(t, taskStore, fmt.Sprintf("controller-callback-%d", round))
 		if _, err := manager.Provision(context.Background(), agenttemplate.ProvisionRequest{
 			ControllerTaskID: controllerID,
-			TemplateRef:      "builtin/explorer@1", Purpose: fmt.Sprintf("round-%d", round), Replicas: 2,
+			TemplateRef:      "builtin/explorer@2", Purpose: fmt.Sprintf("round-%d", round), Replicas: 2,
 		}); err != nil {
 			t.Fatalf("round %d Provision: %v", round, err)
 		}

@@ -7,7 +7,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"agentgo/internal/agent"
 	"agentgo/internal/config"
@@ -41,7 +40,7 @@ func TestGraphBoardPublishFields(t *testing.T) {
 		Title:        "实施修改",
 		Description:  "写代码",
 		Route:        "agent",
-		Tools:        []string{"read_file", "write_file"},
+		Tools:        []string{"read_file", "apply_change"},
 		Model:        "m-1",
 		Isolation:    "workspace",
 	}
@@ -104,8 +103,7 @@ func TestGraphBoardV2AcceptanceUsesVerificationPhaseWithoutChangingRoute(t *test
 	s := store.NewMemoryTaskStore(nil, 100, 1, 300)
 	b := newGraphBoard(s)
 	parent := &model.Task{ID: "acceptance-parent"}
-	if err := taskcontract.Start(parent, loopcontract.WorkVerification, "test-verification/v2",
-		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+	if err := taskcontract.Start(parent, loopcontract.WorkVerification, "test-verification/v2"); err != nil {
 		t.Fatal(err)
 	}
 	spec := graph.TaskSpec{
@@ -131,14 +129,10 @@ func TestGraphBoardV2AcceptanceUsesVerificationPhaseWithoutChangingRoute(t *test
 	v1 := *parent.RunContract
 	v1.Schema, v1.VerificationReserve = runcontract.SchemaV1, 0
 	spec.GraphID, spec.ActivationID, spec.RunID, spec.RunContract = "g-v1-acceptance", "verify@1", v1.RunID, &v1
-	id, err = b.PublishGraphTask(spec)
-	if err != nil {
-		t.Fatal(err)
+	if _, err = b.PublishGraphTask(spec); err == nil {
+		t.Fatal("旧 Run 契约不能静默升级执行")
 	}
-	legacy, _ := s.GetTask(id)
-	if legacy.RunPhase != runcontract.PhaseExecution {
-		t.Fatalf("v1 acceptance 快照不得静默升级 phase: %+v", legacy)
-	}
+
 }
 
 // TestGraphBoardPublishWithoutCapability 验证无能力声明时 Capability 为 nil、
@@ -1040,8 +1034,7 @@ func TestGraphEndWakeReactorPublishesExplicitSchedulerReply(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = gs.Close() })
 	binding := &model.Task{}
-	if err := taskcontract.Start(binding, loopcontract.WorkCoordination, "test-graph-finalization/v1",
-		time.Hour, 5*time.Minute, 10*time.Minute); err != nil {
+	if err := taskcontract.Start(binding, loopcontract.WorkCoordination, "test-graph-finalization/v1"); err != nil {
 		t.Fatal(err)
 	}
 	doc := &graph.GraphDocument{
@@ -1368,7 +1361,7 @@ func TestWireGraphRuntime(t *testing.T) {
 		t.Fatal("wireGraphRuntime 应返回非空 Store/Runtime")
 	}
 	// 持久化目录与 artifacts 同基：<project_root>/.agentgo/state/graphs。
-	wantDir := filepath.Join(root, ".agentgo", "state", "graphs")
+	wantDir := filepath.Join(root, ".agentgo", "state", "graphs-v5")
 	if !dirExists(wantDir) {
 		t.Errorf("持久化目录 %s 应已创建", wantDir)
 	}
@@ -1514,7 +1507,7 @@ func TestResumeNonTerminalGraphsSessionFilter(t *testing.T) {
 // 停驻（ResumeGraph 空操作、不补发任务）。
 func TestWireGraphRuntimeComplementSuspension(t *testing.T) {
 	root := t.TempDir()
-	graphsDir := filepath.Join(root, ".agentgo", "state", "graphs")
+	graphsDir := filepath.Join(root, ".agentgo", "state", "graphs-v5")
 	gs0, err := graph.NewStore(graphsDir)
 	if err != nil {
 		t.Fatalf("NewStore 应成功: %v", err)
@@ -1559,7 +1552,7 @@ func TestWireGraphRuntimeComplementSuspension(t *testing.T) {
 // 补集停驻空操作，任何归属的历史图都正常恢复（行为同今）。
 func TestWireGraphRuntimeNoSessionMode(t *testing.T) {
 	root := t.TempDir()
-	graphsDir := filepath.Join(root, ".agentgo", "state", "graphs")
+	graphsDir := filepath.Join(root, ".agentgo", "state", "graphs-v5")
 	gs0, err := graph.NewStore(graphsDir)
 	if err != nil {
 		t.Fatalf("NewStore 应成功: %v", err)

@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"agentgo/internal/executionfacts"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,7 +16,6 @@ import (
 	"strings"
 
 	"agentgo/internal/agent"
-	"agentgo/internal/checkstore"
 	"agentgo/internal/fulfillment"
 	"agentgo/internal/graph"
 	"agentgo/internal/model"
@@ -92,7 +92,27 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 	// 非图 scheduler 才有 report_done 专用汇报通道。Graph controller 必须
 	// 使用本通道，否则 Results["event"] 无法进入 Runtime 的边条件求值。
 	if task.EventType == "__scheduler__" && task.GraphID == "" {
-		return "", fmt.Errorf("submit_task_result 仅面向执行节点（含 Graph controller）；非图 scheduler 任务请使用 report_done")
+		if task.FinalReportGraphID != "" {
+			if err := validateFinalReportScope(task); err != nil {
+				return "", err
+			}
+			all, err := g.Store.ScanAll()
+			if err != nil {
+				return "", err
+			}
+			for _, other := range all {
+				if other.GraphID == task.FinalReportGraphID && !model.IsTerminal(other.Status) {
+					return "", fmt.Errorf("图仍有未结束任务 %s，不能提交最终答复", other.ID)
+				}
+			}
+		} else if task.InterventionGraphID != "" {
+			result, _ := args["result"].(map[string]any)
+			if result["decision"] != "no_change" {
+				return "", fmt.Errorf("无需改图时提交 result.decision=no_change；需要改图则调用 apply_graph_change")
+			}
+		} else {
+			return "", fmt.Errorf("新请求必须先创建并启动图，不能直接提交答复")
+		}
 	}
 	// 唯一终态提交者：已 finalized（本任务已成功提交过一次）后拒绝重复提交，
 	// 不改变任何既有状态。经窄接口探测——旧装配的 notifier 不实现 IsFinalized
@@ -143,7 +163,7 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 		}
 	}
 	// cited_evidence：Graph acceptance 节点验收任务引用的证据清单（逗号分隔
-	// 的不透明稳定 EvidenceRef 或 typed CheckRef），经 StructuredSubmission 写入
+	// 的不透明稳定 EvidenceRef ），经 StructuredSubmission 写入
 	// Results["cited_evidence"]，由 Graph Runtime 做谱系核验（引用必须属于
 	// 该 activation 的上游 Input 谱系或本任务自身证据）。提交时做轻量形态
 	// 校验（逐项非空）——谱系核验在图侧进行。
@@ -151,7 +171,7 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 	if trimmed := strings.TrimSpace(citedEvidence); trimmed != "" {
 		for _, ref := range strings.Split(trimmed, ",") {
 			if strings.TrimSpace(ref) == "" {
-				return "", fmt.Errorf("cited_evidence 含空白引用项：应为逗号分隔的不透明稳定 EvidenceRef/CheckRef 清单")
+				return "", fmt.Errorf("cited_evidence 含空白引用项：应为逗号分隔的不透明稳定 EvidenceRef 清单")
 			}
 		}
 		citedEvidence = trimmed
@@ -202,17 +222,6 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 			}
 		}
 	}
-	if status == agent.SubmitStatusBlocked && g.Checkpoints != nil && task.ProgressContract != nil &&
-		task.ProgressContract.Policy.KnowledgeCheckpointAfterTurns > 0 {
-		checkpoint, ok, checkpointErr := g.Checkpoints.LoadCheckpoint(task.ID)
-		if checkpointErr != nil {
-			return "", fmt.Errorf("读取 blocked Observation checkpoint: %w", checkpointErr)
-		}
-		if ok && checkpoint != nil && checkpoint.AttemptID == task.AttemptID &&
-			checkpoint.KnowledgeTurnsSinceObservation > 0 && checkpoint.ObservationAttemptID != task.AttemptID {
-			return "", fmt.Errorf("reason_code=observation_checkpoint_required [observation-checkpoint-required action=blocked_submit] blocked 前必须先冻结当前 Attempt 的 ObservationDelta")
-		}
-	}
 
 	// ExpectedArtifacts 合约校验（与自然完成路径同源，含磁盘兜底）。缺失时
 	// 返回错误并保持未 finalized——本轮 ReAct 循环继续，LLM 补写后可再次调用。
@@ -227,7 +236,7 @@ func (g PlanControlGroup) submitTaskResult(ctx context.Context, args map[string]
 	if status == agent.SubmitStatusCompleted && task.FulfillmentContract != nil {
 		record, fulfillmentErr := g.buildFulfillment(task)
 		if fulfillmentErr != nil {
-			return "", fmt.Errorf("reason_code=contract_fulfillment_missing：submit_task_result 被拒绝：%w；请先完成真实文件修改并在最后一次修改后调用 run_check", fulfillmentErr)
+			return "", fmt.Errorf("reason_code=contract_fulfillment_missing：submit_task_result 被拒绝：%w；请先完成真实文件修改并登记产物事实", fulfillmentErr)
 		}
 		encoded, _ := json.Marshal(record)
 		fulfillmentJSON = string(encoded)
@@ -323,34 +332,13 @@ func (g PlanControlGroup) buildFulfillment(task *model.Task) (fulfillment.Record
 	if task == nil || task.FulfillmentContract == nil {
 		return fulfillment.Record{}, nil
 	}
-	if g.Checks == nil {
-		return fulfillment.Record{}, fmt.Errorf("CheckStore 未装配")
-	}
-	workspaceRef, effectRefs, err := checkstore.WorkspaceRevision(task, g.Store, g.Workspaces)
+	workspaceRef, effectRefs, err := executionfacts.WorkspaceRevision(task, g.Store, g.Workspaces)
 	if err != nil {
 		return fulfillment.Record{}, err
 	}
 	record := fulfillment.Record{
-		Schema: fulfillment.SchemaV1, WorkspaceRevisionRef: workspaceRef,
+		Schema: fulfillment.SchemaCurrent, WorkspaceRevisionRef: workspaceRef,
 		EffectRefs: append([]string(nil), effectRefs...),
-	}
-	for _, checkID := range task.FulfillmentContract.RequiredCheckIDs {
-		check, ok, checkErr := g.Checks.Latest(task.ID, task.AttemptID, checkID)
-		if checkErr != nil {
-			return fulfillment.Record{}, checkErr
-		}
-		if !ok {
-			return fulfillment.Record{}, fmt.Errorf("缺少 required check %q", checkID)
-		}
-		if check.Status != checkstore.StatusPass {
-			return fulfillment.Record{}, fmt.Errorf("required check %q 未通过", checkID)
-		}
-		if check.WorkspaceRevisionRef != workspaceRef {
-			return fulfillment.Record{}, fmt.Errorf("required check %q 已 stale：check=%s current=%s",
-				checkID, check.WorkspaceRevisionRef, workspaceRef)
-		}
-		record.CheckRefs = append(record.CheckRefs, check.CheckRef)
-		record.SatisfiedRequirementIDs = append(record.SatisfiedRequirementIDs, checkID)
 	}
 	if task.FulfillmentContract.RequireWorkspaceChange {
 		record.SatisfiedRequirementIDs = append(record.SatisfiedRequirementIDs, "workspace-change")

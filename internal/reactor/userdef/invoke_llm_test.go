@@ -100,23 +100,13 @@ func (e *fakeEmitter) snapshot() []trace.Event {
 	return append([]trace.Event(nil), e.events...)
 }
 
-// ── write_file sink ───────────────────────────────────────────────────
+// ── apply_change sink ───────────────────────────────────────────────────
 
 func TestInvokeLLM_WriteFile_HappyPath(t *testing.T) {
 	dir := t.TempDir()
 	writePrompt(t, dir, "summarize.md", "Summarize task ${event.task.id}")
 
-	yamlData := []byte(`
-reactors:
-  - name: write-summary
-    on: task_failed
-    invoke_llm:
-      prompt:
-        file: ./summarize.md
-      output:
-        write_file:
-          path: ./logs/summary-${event.task.id}.md
-`)
+	yamlData := []byte("\nreactors:\n  - name: write-summary\n    on: task_failed\n    invoke_llm:\n      prompt:\n        file: ./summarize.md\n      output:\n        apply_change:\n          path: ./logs/summary-${event.task.id}.md\n")
 	llm := &fakeLLM{response: "the summary text"}
 	rs, err := Load(yamlData, dir, dir, Deps{LLM: llm})
 	if err != nil {
@@ -140,18 +130,11 @@ reactors:
 }
 
 func TestInvokeLLM_WriteFile_ShortFormString(t *testing.T) {
-	// 验证 write_file 短形式字符串：write_file: ./logs/x.md
+	// 验证 apply_change 短形式字符串：apply_change: ./logs/x.md
 	dir := t.TempDir()
 	writePrompt(t, dir, "p.md", "x")
 
-	yamlData := []byte(`
-reactors:
-  - on: task_failed
-    invoke_llm:
-      prompt: { file: ./p.md }
-      output:
-        write_file: ./out.md
-`)
+	yamlData := []byte("\nreactors:\n  - on: task_failed\n    invoke_llm:\n      prompt: { file: ./p.md }\n      output:\n        apply_change: ./out.md\n")
 	llm := &fakeLLM{response: "y"}
 	rs, err := Load(yamlData, dir, dir, Deps{LLM: llm})
 	if err != nil {
@@ -175,13 +158,8 @@ func TestInvokeLLM_WriteFile_RejectsOutsideRoot(t *testing.T) {
 	outside := t.TempDir()
 	evilPath := filepath.Join(outside, "agentgo-evil-${event.task.id}.md")
 
-	yamlData := []byte(`
-reactors:
-  - on: task_failed
-    invoke_llm:
-      prompt: { file: ./p.md }
-      output:
-        write_file: ` + evilPath + `
+	yamlData := []byte("\nreactors:\n  - on: task_failed\n    invoke_llm:\n      prompt: { file: ./p.md }\n      output:\n        apply_change: " +
+		evilPath + `
 `)
 	llm := &fakeLLM{response: "y"}
 	rs, err := Load(yamlData, dir, dir, Deps{LLM: llm})
@@ -199,14 +177,7 @@ func TestInvokeLLM_WriteFile_RelativePathUsesProjectRoot(t *testing.T) {
 	otherCWD := t.TempDir()
 	writePrompt(t, dir, "p.md", "x")
 
-	yamlData := []byte(`
-reactors:
-  - on: task_failed
-    invoke_llm:
-      prompt: { file: ./p.md }
-      output:
-        write_file: ./logs/out.md
-`)
+	yamlData := []byte("\nreactors:\n  - on: task_failed\n    invoke_llm:\n      prompt: { file: ./p.md }\n      output:\n        apply_change: ./logs/out.md\n")
 	rs, err := Load(yamlData, dir, dir, Deps{LLM: &fakeLLM{response: "content"}})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -223,7 +194,7 @@ reactors:
 		t.Fatalf("expected file under project root: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(otherCWD, "logs", "out.md")); !os.IsNotExist(err) {
-		t.Fatalf("relative write_file should not use cwd, stat err=%v", err)
+		t.Fatalf("relative apply_change should not use cwd, stat err=%v", err)
 	}
 }
 
@@ -233,13 +204,8 @@ func TestInvokeLLM_WriteFile_RejectsOutsideRootBeforeMkdir(t *testing.T) {
 	writePrompt(t, root, "p.md", "x")
 	outsideChild := filepath.Join(outside, "should-not-exist", "out.md")
 
-	yamlData := []byte(`
-reactors:
-  - on: task_failed
-    invoke_llm:
-      prompt: { file: ./p.md }
-      output:
-        write_file: ` + outsideChild + `
+	yamlData := []byte("\nreactors:\n  - on: task_failed\n    invoke_llm:\n      prompt: { file: ./p.md }\n      output:\n        apply_change: " +
+		outsideChild + `
 `)
 	rs, err := Load(yamlData, root, root, Deps{LLM: &fakeLLM{response: "y"}})
 	if err != nil {
@@ -541,15 +507,7 @@ reactors:
 func TestInvokeLLM_RejectsMultipleSinks(t *testing.T) {
 	dir := t.TempDir()
 	writePrompt(t, dir, "p.md", "x")
-	yamlData := []byte(`
-reactors:
-  - on: task_failed
-    invoke_llm:
-      prompt: { file: ./p.md }
-      output:
-        write_file: ./out.md
-        emit_trace: { kind: user.x }
-`)
+	yamlData := []byte("\nreactors:\n  - on: task_failed\n    invoke_llm:\n      prompt: { file: ./p.md }\n      output:\n        apply_change: ./out.md\n        emit_trace: { kind: user.x }\n")
 	_, err := Load(yamlData, dir, dir, Deps{LLM: &fakeLLM{response: "x"}})
 	if err == nil || !strings.Contains(err.Error(), "exactly one") {
 		t.Errorf("expected exactly-one-sink error, got %v", err)

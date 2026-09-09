@@ -8,7 +8,7 @@ import (
 )
 
 // ExecModeGuardHook 在 exec 轴为 readonly（只读）模式时拦截写类工具
-// （write_file / edit_file / run_shell），让 LLM 立即收到可自愈的中文错误，
+// （apply_change / apply_change / run_shell），让 LLM 立即收到可自愈的中文错误，
 // 而不是在工具执行后才发现副作用未发生。
 //
 // 设计决策：
@@ -47,12 +47,11 @@ func (h *ExecModeGuardHook) Priority() int { return 5 }
 
 // readonlyBlockedTools 声明 readonly 模式下被禁用的写类工具集合。
 var readonlyBlockedTools = map[string]bool{
-	"write_file": true,
-	"edit_file":  true,
-	"run_shell":  true,
+	"apply_change": true,
+	"run_shell":    true,
 }
 
-// Matches 只匹配写类工具（write_file / edit_file / run_shell）。
+// Matches 只匹配写类工具（apply_change / apply_change / run_shell）。
 func (h *ExecModeGuardHook) Matches(toolName string) bool {
 	return readonlyBlockedTools[toolName]
 }
@@ -60,7 +59,7 @@ func (h *ExecModeGuardHook) Matches(toolName string) bool {
 // Run 在 readonly 模式下 Abort 写类工具；其它模式（normal / strict / yolo）
 // 与 nil store 一律 Continue。原因码按模式派生（exec_mode_<mode>）：
 // 模式拒绝不是 agent 能自愈的——不给工具动作建议，只建议 switch_mode
-//（由用户执行 /mode 切换，agent 无权自切）。
+// （由用户执行 /mode 切换，agent 无权自切）。
 func (h *ExecModeGuardHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecision {
 	if h.Modes == nil || h.Modes.GetExec() != modes.ExecReadonly {
 		return hook.ToolHookDecision{Action: hook.Continue}
@@ -70,7 +69,7 @@ func (h *ExecModeGuardHook) Run(hctx hook.ToolHookContext) hook.ToolHookDecision
 		Action:   hook.Abort,
 		HookName: h.Name(),
 		AbortReason: fmt.Sprintf(
-			"当前处于 readonly 只读模式，工具 %s 已被禁用（readonly 模式下 write_file / edit_file / run_shell 均不可用）。"+
+			"当前处于 readonly 只读模式，工具 %s 已被禁用（readonly 模式下 apply_change / apply_change / run_shell 均不可用）。"+
 				"如需执行写操作，请先用 /mode exec normal 切换执行权限模式，或在配置文件 modes.exec 中调整",
 			hctx.ToolName,
 		),

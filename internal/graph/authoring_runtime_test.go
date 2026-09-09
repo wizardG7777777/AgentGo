@@ -18,9 +18,9 @@ func commitRuntimeDefinition(t *testing.T, authoring *AuthoringStore, graphID, p
 	draftInput.BaseDefinitionRevision = baseRevision
 	draftInput.Candidate.RunID = runcontract.RunID("run-runtime")
 	draftInput.Candidate.RunContract = &runcontract.RunContract{
-		Schema: runcontract.SchemaV1, RunID: runcontract.RunID("run-runtime"),
-		DeadlineAt: time.Now().UTC().Add(time.Hour), FinalizationReserve: time.Minute,
-		RecoveryReserve: time.Minute, BudgetProfile: "test", CreatedAt: time.Now().UTC(),
+		Schema: runcontract.SchemaCurrent, RunID: runcontract.RunID("run-runtime"),
+		DeadlineAt:    time.Now().UTC().Add(time.Hour),
+		BudgetProfile: "test", CreatedAt: time.Now().UTC(),
 	}
 	if baseRevision > 0 {
 		base, ok := authoring.GetDefinition(graphID, baseRevision)

@@ -90,10 +90,6 @@ func HasPipeline(command string) bool {
 	return false
 }
 
-// HasFileRedirect 报告命令是否含写文件重定向。run_check 使用它保证检查工具
-// 只产生验证事实，不借检查通道改写业务文件。
-func HasFileRedirect(command string) bool { return detectRedirectWrite(command) != "" }
-
 // scanRedirects 第一阶段扫描：识别 > / >> / >| 等重定向操作符并判定目标；
 // 同时返回剥离引号内容与 here-doc 正文后的命令文本（供第二阶段正则匹配）。
 // detail 非空表示命中重定向写文件，此时 cleaned 是截断的部分结果（不再使用）。

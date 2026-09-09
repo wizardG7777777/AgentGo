@@ -81,12 +81,12 @@ func traceEventsOfKind(events []trace.Event, kind trace.EventKind) []trace.Event
 // retryable、建议动作与免责句，并发出 suggestions_returned 事件。
 func TestExecutor_StructuredRejectionText(t *testing.T) {
 	traceDir := setupTraceWriter(t)
-	h := rejectingHook("write_file", "read_before_write", true,
+	h := rejectingHook("apply_change", "read_before_write", true,
 		hook.ToolCallAction("read_file", map[string]any{"path": "x.md"}, "先读取目标文件"))
-	executor, mockLLM := newSuggestionExecutor(t, h, "write_file", "read_file")
+	executor, mockLLM := newSuggestionExecutor(t, h, "apply_change", "read_file")
 
 	res := runRound(t, executor, mockLLM, "task-s1", llm.ToolCall{
-		ID: "c1", Name: "write_file", Arguments: map[string]any{"path": "x.md"},
+		ID: "c1", Name: "apply_change", Arguments: map[string]any{"path": "x.md"},
 	})
 
 	for _, want := range []string{
@@ -121,7 +121,7 @@ func TestExecutor_LegacyRejectionTextPreserved(t *testing.T) {
 	legacy := &mockExecutorHook{
 		name:     "legacy-gate",
 		phase:    hook.PhasePreCall,
-		matchStr: "write_file",
+		matchStr: "apply_change",
 		priority: 10,
 		decision: hook.ToolHookDecision{
 			Action:      hook.Abort,
@@ -129,9 +129,9 @@ func TestExecutor_LegacyRejectionTextPreserved(t *testing.T) {
 			HookName:    "legacy-gate",
 		},
 	}
-	executor, mockLLM := newSuggestionExecutor(t, legacy, "write_file")
+	executor, mockLLM := newSuggestionExecutor(t, legacy, "apply_change")
 	res := runRound(t, executor, mockLLM, "task-s2", llm.ToolCall{
-		ID: "c1", Name: "write_file", Arguments: map[string]any{"path": "x.md"},
+		ID: "c1", Name: "apply_change", Arguments: map[string]any{"path": "x.md"},
 	})
 	if !strings.Contains(res.Output, "[hook 拒绝] legacy-gate: 旧式拒绝") {
 		t.Fatalf("旧文本路径应保持 [hook 拒绝] 形态，实际：\n%s", res.Output)
@@ -145,11 +145,11 @@ func TestExecutor_LegacyRejectionTextPreserved(t *testing.T) {
 // （switch_mode / request_replan / blocked），不给工具动作建议。
 func TestExecutor_EscalationOnlyRejection(t *testing.T) {
 	setupTraceWriter(t)
-	h := rejectingHook("write_file", "exec_mode_readonly", false,
+	h := rejectingHook("apply_change", "exec_mode_readonly", false,
 		hook.EscalationAction(hook.SuggestKindSwitchMode, "请求用户用 /mode exec normal 切换执行权限模式后再写"))
-	executor, mockLLM := newSuggestionExecutor(t, h, "write_file")
+	executor, mockLLM := newSuggestionExecutor(t, h, "apply_change")
 	res := runRound(t, executor, mockLLM, "task-s3", llm.ToolCall{
-		ID: "c1", Name: "write_file", Arguments: map[string]any{"path": "x.md"},
+		ID: "c1", Name: "apply_change", Arguments: map[string]any{"path": "x.md"},
 	})
 	if !strings.Contains(res.Output, "原因码=exec_mode_readonly retryable=false") {
 		t.Fatalf("应带原因码与 retryable=false：\n%s", res.Output)
@@ -166,11 +166,11 @@ func TestExecutor_EscalationOnlyRejection(t *testing.T) {
 // 不再给动作建议，转为指引 blocked / replan。
 func TestExecutor_RepeatFuse(t *testing.T) {
 	traceDir := setupTraceWriter(t)
-	h := rejectingHook("write_file", "read_before_write", true,
+	h := rejectingHook("apply_change", "read_before_write", true,
 		hook.ToolCallAction("read_file", map[string]any{"path": "x.md"}, "先读取目标文件"))
-	executor, mockLLM := newSuggestionExecutor(t, h, "write_file", "read_file")
+	executor, mockLLM := newSuggestionExecutor(t, h, "apply_change", "read_file")
 
-	call := llm.ToolCall{ID: "c1", Name: "write_file", Arguments: map[string]any{"path": "x.md"}}
+	call := llm.ToolCall{ID: "c1", Name: "apply_change", Arguments: map[string]any{"path": "x.md"}}
 	for round := 1; round <= 3; round++ {
 		res := runRound(t, executor, mockLLM, "task-s4", call)
 		if round < 3 {
@@ -202,11 +202,11 @@ func TestExecutor_RepeatFuse(t *testing.T) {
 // （工具名 + 最小参数集逐项相等）且通过 Gate → adopted。
 func TestExecutor_DispositionAdopted(t *testing.T) {
 	traceDir := setupTraceWriter(t)
-	h := rejectingHook("write_file", "read_before_write", true,
+	h := rejectingHook("apply_change", "read_before_write", true,
 		hook.ToolCallAction("read_file", map[string]any{"path": "x.md"}, "先读取目标文件"))
-	executor, mockLLM := newSuggestionExecutor(t, h, "write_file", "read_file")
+	executor, mockLLM := newSuggestionExecutor(t, h, "apply_change", "read_file")
 
-	runRound(t, executor, mockLLM, "task-s5", llm.ToolCall{ID: "c1", Name: "write_file", Arguments: map[string]any{"path": "x.md"}})
+	runRound(t, executor, mockLLM, "task-s5", llm.ToolCall{ID: "c1", Name: "apply_change", Arguments: map[string]any{"path": "x.md"}})
 	runRound(t, executor, mockLLM, "task-s5", llm.ToolCall{ID: "c2", Name: "read_file", Arguments: map[string]any{"path": "x.md"}})
 
 	disps := traceEventsOfKind(p1fixesReadTraceEvents(t, traceDir), trace.KindSuggestionDisposition)
@@ -221,11 +221,11 @@ func TestExecutor_DispositionAdopted(t *testing.T) {
 // TestExecutor_DispositionAbandoned 下一轮调用了与建议不符的工具 → abandoned。
 func TestExecutor_DispositionAbandoned(t *testing.T) {
 	traceDir := setupTraceWriter(t)
-	h := rejectingHook("write_file", "read_before_write", true,
+	h := rejectingHook("apply_change", "read_before_write", true,
 		hook.ToolCallAction("read_file", map[string]any{"path": "x.md"}, "先读取目标文件"))
-	executor, mockLLM := newSuggestionExecutor(t, h, "write_file", "read_file", "list_dir")
+	executor, mockLLM := newSuggestionExecutor(t, h, "apply_change", "read_file", "list_dir")
 
-	runRound(t, executor, mockLLM, "task-s6", llm.ToolCall{ID: "c1", Name: "write_file", Arguments: map[string]any{"path": "x.md"}})
+	runRound(t, executor, mockLLM, "task-s6", llm.ToolCall{ID: "c1", Name: "apply_change", Arguments: map[string]any{"path": "x.md"}})
 	runRound(t, executor, mockLLM, "task-s6", llm.ToolCall{ID: "c2", Name: "list_dir", Arguments: map[string]any{"path": "."}})
 
 	disps := traceEventsOfKind(p1fixesReadTraceEvents(t, traceDir), trace.KindSuggestionDisposition)
@@ -238,11 +238,11 @@ func TestExecutor_DispositionAbandoned(t *testing.T) {
 // → repeated。
 func TestExecutor_DispositionRepeated(t *testing.T) {
 	traceDir := setupTraceWriter(t)
-	h := rejectingHook("write_file", "read_before_write", true,
+	h := rejectingHook("apply_change", "read_before_write", true,
 		hook.ToolCallAction("read_file", map[string]any{"path": "x.md"}, "先读取目标文件"))
-	executor, mockLLM := newSuggestionExecutor(t, h, "write_file", "read_file")
+	executor, mockLLM := newSuggestionExecutor(t, h, "apply_change", "read_file")
 
-	call := llm.ToolCall{ID: "c1", Name: "write_file", Arguments: map[string]any{"path": "x.md"}}
+	call := llm.ToolCall{ID: "c1", Name: "apply_change", Arguments: map[string]any{"path": "x.md"}}
 	runRound(t, executor, mockLLM, "task-s7", call)
 	runRound(t, executor, mockLLM, "task-s7", call)
 
@@ -295,7 +295,7 @@ func TestActionMatchesCall(t *testing.T) {
 	if !actionMatchesCall(a, llm.ToolCall{Name: "read_file", Arguments: map[string]any{"path": "x.md"}}) {
 		t.Fatalf("工具名与参数一致应匹配")
 	}
-	if actionMatchesCall(a, llm.ToolCall{Name: "write_file", Arguments: map[string]any{"path": "x.md"}}) {
+	if actionMatchesCall(a, llm.ToolCall{Name: "apply_change", Arguments: map[string]any{"path": "x.md"}}) {
 		t.Fatalf("工具名不同不应匹配")
 	}
 	if actionMatchesCall(a, llm.ToolCall{Name: "read_file", Arguments: map[string]any{"path": "y.md"}}) {

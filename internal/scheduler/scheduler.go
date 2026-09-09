@@ -8,7 +8,6 @@ import (
 
 	"agentgo/internal/agent"
 	"agentgo/internal/agenttemplate"
-	"agentgo/internal/checkstore"
 	"agentgo/internal/config"
 	"agentgo/internal/effect"
 	"agentgo/internal/gate"
@@ -42,7 +41,7 @@ import (
 const schedulerMaxRetries = 5
 
 // schedulerPromptVersion 是交付 L2 的 Scheduler 角色指令来源版本，正文变更时递增。
-const schedulerPromptVersion = "embedded:v10.11-recovery-evidence-v4"
+const schedulerPromptVersion = "embedded:v11-unified-graph-tools"
 
 // SystemPrompt 返回 scheduler agent 的内嵌 system prompt 全文（只读）。
 // 供 /doctor agents 审计（V6 §2 P1b）构造 prompt 摘要/digest，以及任何
@@ -51,84 +50,29 @@ const schedulerPromptVersion = "embedded:v10.11-recovery-evidence-v4"
 func SystemPrompt() string { return schedulerCorePrompt }
 
 const schedulerCorePrompt = `
-你是 AgentGo 的 Scheduler。每个用户请求都必须形成持久化 Graph；没有与 Graph 并列的 direct-answer 路径。
-
-你的职责是：
-- 对新请求构造、校验、提交并启动 Graph；不在建图前亲自调查仓库或执行主体工作。
-- 对 recovery/change 唤醒读取权威 Graph/Proposal 后作结构化裁决。
-- 仅在 graph-ended 终态唤醒后消费 GraphTerminalSummary，并通过 report_done 向用户提交最终答复。
-
-每轮只执行当前 <scheduler-phase> 允许的一个工具动作。工具 schema、ValidationReport、Graph Store、ResultRef/Evidence 与 board snapshot 是权威；自然语言计划、reasoning 和“已经完成”的自述都不是状态事实。工具返回后重新观察，再进入下一阶段。不得输出 DSML/XML 工具标记，不得发明工具名或参数。
-
-Graph 节点执行实际工作；Scheduler 不把自己变成隐藏 Worker。简单请求也使用最小 work/controller → typed end Graph。start_graph 成功只表示执行已交棒，不表示请求已完成；等待 graph-ended。
+你是 AgentGo 的 Scheduler，负责组织图中的工作和向用户交付结果。
+新请求使用 apply_graph_change(operation=create) 提交完整图定义与交付契约；工具内部校验并提交，失败时根据拒绝理由修改请求。创建成功后使用 control_graph(action=start) 启动。
+运行中收到反馈，先检视实际节点状态并读取图定义，再用 apply_graph_change(operation=update) 修改。expected_revision 来自读取结果；in_flight=preserve 表示当前执行保留原定义，修改只作用于未来执行。不得改写已完成事实。
+读取定义使用 read_graph_definition；运行概览、节点记录和证据分别使用 inspect_board、inspect_node、read_evidence。发送消息仅传递信息，不派发任务、不唤醒代理。
+模型无需创建草案、单独验证或单独提交，也无需填写 Observation 报告。先说明决策，再执行工具；工具返回后根据事实决定下一步。不存在按轮数强制切换工具的流程。
+图节点承担实际工作。节点定义要写明任务目标、输入输出、验收标准及成功/失败/阻塞路径；正常节点结果由运行时沿边交付。工具 schema 和实际回执是权威，不编造图 ID、版本、任务或证据。
+topo_mode=solo 时 Scheduler 是唯一执行资源：业务节点使用 kind=agent、metadata.route=__scheduler__，明确声明所需业务工具；controller 仍只负责编排。不得调用 legacy publish_task 绕过图。
+图启动不等于请求完成。图结束后依据实际交付和节点结果形成最终答复，使用当前结果提交工具完成收口。
 `
 
 func schedulerPromptForPhase(phase string) string {
 	switch phase {
-	case "scheduler:draft-create":
-		return `<scheduler-phase name="draft-create">
-本轮唯一动作：以空参数调用 create_graph_draft。proposal_id、graph_id、request_ref/digest 由 framework 生成；不要输出任何参数，不要在本轮生成 execution_class、contract requirements、nodes、root，也不要 patch、validate、commit、start 或读取仓库。简单请求下一轮进入 framework simple-task authoring。
-</scheduler-phase>`
-	case "scheduler:draft-configure":
-		return `<scheduler-phase name="draft-configure">
-本轮唯一动作：调用 configure_simple_graph_draft，只判断原始请求的 execution_class。answer=只需自然语言答复且无需仓库操作；read_only=只调查读取并明确不修改文件；凡要求修改文件/代码/配置、实现功能或修复测试，即使先要调查也必须是 mutating。若上一份 ValidationReport rejected，应根据其 typed issue 修正分类；相同分类幂等，不同分类生成新 Draft revision。framework 对 answer/read_only 冻结 work → independent acceptance；对 mutating 冻结只读 Explorer → work → independent acceptance，并提供 RecoveryDelta v5 candidate repair 分支。节点 ID、policy refs、output contract、GraphContract bindings 与 CAS revision 均由 framework 机械生成；不要自行填写底层 Graph AST。
-</scheduler-phase>`
-	case "scheduler:draft-validate":
-		return `<scheduler-phase name="draft-validate">
-本轮唯一动作：以空参数调用 validate_current_graph_draft。proposal_id 与 draft_revision 由 framework 从当前 task/session 的 durable transaction cursor 解析，禁止搬运或猜测。校验和独立 Proposal Acceptance 由 framework 执行；不得自我批准，不得在同轮 commit/start。
-</scheduler-phase>`
-	case "scheduler:draft-edit":
-		return `<scheduler-phase name="draft-edit">
-simple-task ValidationReport 被拒绝或任务确需复杂拓扑时才进入本阶段。本轮只调用 read_graph_draft、patch_graph_draft 或 validate_graph_draft 之一。以结构化错误为依据使用小型 CAS patch，禁止提交完整 Graph JSON 字符串。
-
-最小合法图：root 是真实 work/controller 节点；分别为 completed/failed/blocked 提供 typed end 出口，end.next 为空并声明 success/failed/blocked outcome。所有 task-producing 节点必须声明非空 title/description、output_contract；progress/context policy 由 framework current catalog 注入或由工具 schema 枚举，禁止在 Prompt 中猜版本号或显式选择历史 policy。
-
-当前单赋值基线：普通节点最多一条静态入边；fan-in 必须经 join/acceptance 且每个 target_input 只有一个生产者；join 成功下游只用 completed。条件分支必须互斥穷举，不与 always 混作兜底。agent/controller 的业务路由字段放 result object 并在 task.description 声明字段和值域，禁止 event。acceptance 必须逐项写验收标准，completed 只提交 verdict=pass|fixable|failed 并按 $.verdict 精确路由，另保留 Runtime failed/blocked 兜底。失败路径默认回到可修复节点或 repair；只有不可修复才 failed end。
-
-board snapshot 的 topo_mode=solo 时，唯一执行资源是 Scheduler：工作节点使用 controller（缺省路由 __scheduler__），不得使用无人认领的 agent/acceptance，也不得调用 legacy publish_task；仍完整走 Draft→Validate→Commit→Start。
-</scheduler-phase>`
-	case "scheduler:draft-commit":
-		return `<scheduler-phase name="draft-commit">
-本轮唯一动作：以空参数调用 commit_current_graph_draft。framework 从 durable transaction cursor 解析并核对 accepted report、proposal、revision 与 digest；commit 只产生 immutable Definition，不启动执行。
-</scheduler-phase>`
-	case "scheduler:start":
-		return `<scheduler-phase name="start">
-本轮唯一动作：以空参数调用 start_current_graph。framework 从当前已提交 Definition 解析 revision/digests 并使用稳定 StartIntent；成功后停止构图并等待 graph-ended，不得把“已启动”作为最终答复。
-</scheduler-phase>`
-	case "scheduler:recovery":
-		return `<scheduler-phase name="recovery">
-本轮只执行一个 recovery/change 动作。先 read_graph/read_graph_change 获取当前 revision 与失败事实；需要修改 immutable Definition 时走 propose_graph_change→validate_graph_change→commit_graph_change，每轮一个动作。成功 commit 会收口非图 graph-change coordination；确认无需修改时必须调用 submit_graph_change_decision(decision=no_change)，不得用自然文本退出。不得重放未知副作用，不得绕过 Graph 直发主体任务。
-</scheduler-phase>`
-	case "scheduler:graph-recovery":
-		return `<scheduler-phase name="graph-recovery">
-	本轮只执行当前 Graph 的恢复控制动作。failure_context、Graph Result/Evidence、ProgressCheckpoint、ObservationDelta 与 read_graph 是权威；不得亲自修改业务文件。若需要改变未来 work Activation 的定义，依次使用 propose_graph_change→validate_graph_change→commit_graph_change，已终态的旧 Activation 始终冻结。裁决完成后必须调用 submit_recovery_decision：retry 声明 changed_dimensions、strategy、类型化 first_action、expected_milestone，source checkpoint/observation/fingerprint 由 framework 自动绑定；blocked 必须说明 blocked_reason。新 code-change recovery 使用 v5 handoff：evidence_contract 只声明一个 focus file，first_action 是该文件的首个 bounded read；下一 Worker 根据上游 evidence_ranges 用 typed need_context(path/offset/limit) 精确补页，禁止顺序完整覆盖文件。candidate_state 由 framework 绑定，Controller 不得伪造。Worker typed 选择 edit、resume_candidate、need_context、hypothesis_rejected 或 blocked，只有 edit/resume 后才进入 mutation/check。acceptance/v2 与 RecoveryDelta v1-v4 历史恢复继续服从各自冻结 schema。retry 还受 framework 的 execution phase 可启动性预检；若返回 reason_code=recovery_retry_unstartable，必须立即改交 blocked，不得继续声称 retry。没有可验证增量只能 blocked；不得调用 submit_task_result 或只输出自然语言。
-</scheduler-phase>`
+	case "agent:execution":
+		return "当前执行的是图中的业务节点，不是用户请求入口。按照本节点任务目标使用执行工具完成工作，再调用 submit_task_result。需要调整图时用 request_replan；不要自行建图。"
+	case "scheduler:authoring":
+		return "本次负责创建并启动图。apply_graph_change 内部完成校验和提交，不直接执行节点业务。"
+	case "scheduler:coordination":
+		return "本次处理已存在图的反馈。先检视事实与定义，必要时应用变更；无需变更时明确提交当前协调任务的结论。"
 	case "scheduler:final-report":
-		return `<scheduler-phase name="final-report">
-	GraphTerminalSummary 是本轮默认权威输入。task_published、settlement_reason_code、workspace_changed 与 artifact_count 是报告执行/修改事实的唯一依据；不得把不存在的 TaskOutcome 推断为“已执行”，也不得在 workspace_changed=true 时声称零修改。只在摘要缺少用户报告所需事实时，在冻结 ProgressContract 的有界补读窗口内定向调用 read_graph/get_task_result/read_content_ref。最终必须调用 report_done，禁止自然文本退出、构图、改图或重新执行任何业务工作。
-</scheduler-phase>`
+		return "图已结束。本次只检视必要事实并提交最终答复，不重启或修改图。"
 	default:
 		return ""
 	}
-}
-
-// storeBatchTracker 实现 tools.BatchTracker，把 publish_task 工具新发布的子任务 ID
-// 追加到当前 scheduler task 的 SchedulerBatch 字段。
-//
-// 通过 holder 拿到 scheduler task ID，然后调 store.AppendSchedulerBatch。
-// holder 为空时（不应发生）静默跳过。
-type storeBatchTracker struct {
-	store  store.TaskStore
-	holder *agent.FinalizationHolder
-}
-
-// AppendBatch 实现 tools.BatchTracker 接口。
-func (t *storeBatchTracker) AppendBatch(childTaskID string) error {
-	schedID := t.holder.Get()
-	if schedID == "" {
-		return nil // 防御性：不应发生（OnTaskStart 已经设置）
-	}
-	return t.store.AppendSchedulerBatch(schedID, childTaskID)
 }
 
 // Bundle 是 New 返回的复合结果。包含 scheduler 一等代理需要的所有运行时部件。
@@ -161,7 +105,7 @@ type Bundle struct {
 	SchedulerExec *SchedulerExecutor
 
 	// ToolReg 是 scheduler 装配完成的工具注册表（RegisterGroups 全量 +
-	// publish_task/write_file/edit_file 的 mode 包装）。暴露供 bootstrap 级
+	// publish_task/apply_change/apply_change 的 mode 包装）。暴露供 bootstrap 级
 	// 装配断言与诊断读取；运行期变更（WrapHandler）同样作用于它。
 	ToolReg *agent.ToolRegistry
 }
@@ -179,7 +123,6 @@ type GraphAuthoringDeps struct {
 	// Observation 是 Scheduler coordination/v2 的 framework control invocation，
 	// 与 Graph authoring 共用同一生产装配边界。
 	TaskMemStore *taskmem.Store
-	CheckStore   *checkstore.Store
 }
 
 // New 构造 scheduler 一等代理及其配套部件。
@@ -233,7 +176,6 @@ func New(
 	// 收尾事务；非图 scheduler 任务仍以 report_done 作为对用户的汇报通道。
 	holder := agent.NewFinalizationHolder()
 	submitState := agent.NewSubmitState()
-	batchTracker := &storeBatchTracker{store: s, holder: holder}
 
 	// FileStateCache（与 worker 同样容量）
 	fileCache := agent.NewFileStateCache(50)
@@ -253,10 +195,6 @@ func New(
 	}
 	readGroup := tools.LocalReadGroup{Workdir: workdir, Cache: fileCache, HashlineEnabled: hlEnabled}
 	toolReg := agent.NewToolRegistry()
-	var routeValidator tools.RouteValidator
-	if agentRegistry != nil {
-		routeValidator = agentRegistry
-	}
 	// Interaction 等待钩子：把 shell 人工决策的阻塞窗口映射到 scheduler 状态机
 	// （processing ↔ waiting_interaction）。agent 在工具注册之后才构造，
 	// 闭包延迟解引用——钩子只在工具执行期触发，届时 a 必定已赋值。
@@ -264,7 +202,7 @@ func New(
 	interactionWaitHook := func(waiting bool) {
 		agent.SetInteractionWaitState(a, holder.Get(), waiting)
 	}
-	// 当前 Session 归属闭包：ShellGroup / MetaGroup / 写工具审批包装共用一份。
+	// 当前 Session 归属闭包：ShellGroup / CommunicationGroup / 写工具审批包装共用一份。
 	interactionSessionID := func() string {
 		if interactions == nil {
 			return ""
@@ -280,18 +218,19 @@ func New(
 	// 终态契约 v2 提交期出路检查器：graphRuntime 为 nil（单测直构）时不注入，
 	// 避免把类型化 nil 包进接口后判空失效。
 	var outletChecker tools.OutletChecker
-	var recoveryAuthority tools.RecoveryDecisionAuthority
-	if graphRuntime != nil {
-		outletChecker = graphRuntime
-		recoveryAuthority = graphRuntime
-	}
+
 	var authoring GraphAuthoringDeps
 	if len(graphAuthoring) > 0 {
 		authoring = graphAuthoring[0]
 	}
+	historyView, _ := s.(interface {
+		GetToolCallHistory(string) []store.ToolCallRecord
+	})
 	groups := []tools.ToolGroup{
+		tools.InspectionGroup{Tasks: s, Graphs: graphStore, Definitions: authoring.Store, Content: authoring.ContextRuntime.Content, History: historyView, Holder: holder, SessionID: interactionSessionID},
 		readGroup,
-		tools.ContentRefGroup{
+		tools.EvidenceGroup{
+			Graphs:       graphStore,
 			ContentStore: authoring.ContextRuntime.Content, TaskStore: s,
 			SessionID: interactionSessionID,
 		},
@@ -314,29 +253,17 @@ func New(
 			InteractionWaitHook: interactionWaitHook,
 			EffectJournal:       effectJournal,
 		},
-		tools.MetaGroup{
+		tools.CommunicationGroup{
 			Store:               s,
 			Holder:              nil, // scheduler 模式：无 depth 限制
-			LineageHolder:       holder,
 			MBRegistry:          mbRegistry,
 			AgentID:             schedID,
 			Interactions:        interactions,
 			SessionID:           interactionSessionID,
 			InteractionWaitHook: interactionWaitHook,
-			BatchTracker:        batchTracker,
-			AllowNodeCapability: true,
-			RouteValidator:      routeValidator,
 			EffectJournal:       effectJournal,
 		},
-		tools.SchedulerGroup{
-			Store:                s,
-			Holder:               holder,
-			MBRegistry:           mbRegistry,
-			FinalizationNotifier: holder, // 同一个 holder 也实现 FinalizationNotifier
-			ProjectRoot:          cfg.ProjectRoot,
-			UserOutput:           userOutput,
-			ResultOutput:         resultOutput,
-		},
+
 		tools.PlanControlGroup{
 			Store:                s,
 			Holder:               holder,
@@ -344,50 +271,32 @@ func New(
 			FinalizationNotifier: holder,
 			SubmitState:          submitState,
 			OutletChecker:        outletChecker,
-			RecoveryAuthority:    recoveryAuthority,
-			ProjectRoot:          cfg.ProjectRoot,
-		},
-		tools.ObservationGroup{
-			Store: s, TaskMem: authoring.TaskMemStore, Holder: holder,
-			AgentID: schedID, Checks: authoring.CheckStore,
+
+			ProjectRoot: cfg.ProjectRoot,
 		},
 		tools.AgentTemplateGroup{
 			Catalog: templateCatalog, Provisioner: templateProvisioner,
 			Store: s, Holder: holder,
 		},
-		// Graph Runtime compatibility：新 root 隐藏 submit_graph；read_graph 保留，
-		// patch_graph 仅 legacy controller 可用。新图与变更走下方 AuthoringGroup。
-		// graphStore 来自 bootstrap 的 System.GraphRuntime/GraphStore；
-		// 为 nil（单测直构）时工具仍注册、调用返回明确中文错误。
-		tools.GraphControlGroup{
-			Runtime: graphRuntime, Store: graphStore, RouteValidator: agentRegistry,
-			TaskStore: s, Holder: holder, FinalizationNotifier: holder,
-			DisableSubmitGraph:  authoring.Store != nil,
-			PatchControllerOnly: authoring.Store != nil,
-		},
 	}
-	if authoring.Store != nil {
-		groups = append(groups, tools.GraphAuthoringGroup{
-			Store: authoring.Store, Compiler: authoring.Compiler, Runtime: authoring.Runtime,
-			TaskStore: s, Holder: holder, SessionID: interactionSessionID,
-			RouteValidator: agentRegistry, Finalization: holder,
-		})
-	}
+	groups = append(groups, tools.GraphAuthoringGroup{
+		Store: authoring.Store, Compiler: authoring.Compiler, Runtime: authoring.Runtime,
+		TaskStore: s, Holder: holder, SessionID: interactionSessionID, RouteValidator: agentRegistry, Finalization: holder,
+	})
+
 	tools.RegisterGroups(toolReg, groups...)
 
 	// solo 编排强制层：topo=solo 时拦截 scheduler 的 publish_task，
 	// 这是 prompt 指引之外的硬约束。包装只作用于 scheduler 自己的 registry——
 	// runner 的 publish_task 与所有 send_message 均不受影响。
 	// modeStore 已在上方 nil 回落为 DefaultStore，此处直接可用。
-	toolReg.WrapHandler("publish_task", wrapPublishTaskForSolo(modeStore))
 
 	// strict 执行权限强制层：exec=strict 时 scheduler 的
-	// write_file / edit_file 逐次创建 file_write 审批 Interaction——solo 拓扑下
+	// apply_change / apply_change 逐次创建 file_write 审批 Interaction——solo 拓扑下
 	// scheduler 会亲自写文件，strict 必须覆盖这条路径；其它档位透传。
 	// 与 runner.New 内同款装配对称（同一 modeStore 实例由 bootstrap 注入）。
 	writeApprover := tools.NewFileWriteApprover(modeStore, interactions, interactionSessionID, schedID, interactionWaitHook)
-	toolReg.WrapHandler("write_file", writeApprover.WrapHandler("write_file"))
-	toolReg.WrapHandler("edit_file", writeApprover.WrapHandler("edit_file"))
+	toolReg.WrapHandler("apply_change", writeApprover.WrapHandler("apply_change"))
 
 	innerExec := agent.NewTurnExecutor(llmClient, toolReg, gateReg, recordToolCall, authoring.ContextRuntime, contextruntime.Instructions{System: schedulerCorePrompt})
 	innerExec.SetPromptVersion(schedulerPromptVersion)
@@ -442,10 +351,7 @@ func New(
 		a.ModelContextWindowTokens = capability.ContextWindowTokens
 		a.ModelMaxCompletionTokens = capability.MaxCompletionTokens
 		a.ModelCapabilityDigest = capability.Digest
-		a.ObservationModel = schedulerModel
-		a.ObservationModelContextWindowTokens = capability.ContextWindowTokens
-		a.ObservationModelMaxCompletionTokens = capability.MaxCompletionTokens
-		a.ObservationModelCapabilityDigest = capability.Digest
+
 	}
 	a.OnTaskStart = func(taskID string) { holder.Set(taskID) }
 	a.OnTaskEnd = func(taskID string, success bool) { holder.Set("") }

@@ -180,20 +180,7 @@ func graphShardContains(t *testing.T, traceDir, graphID, want string) {
 }
 
 // bridgeLinearGraphJSON 线性图：root(agent) → implement(agent) → finish(end)。
-const bridgeLinearGraphJSON = `{
-  "schema": "agentgo.graph/v1",
-  "graph_id": "g-bridge-linear",
-  "revision": 1, "state_version": 0,
-  "root": "root", "status": "pending",
-  "nodes": {
-    "root": {"kind":"agent","task":{"title":"理解需求","description":"分解目标"},"status":"inactive","executor":null,"execution":null,
-      "next":[{"to":"implement"}]},
-    "implement": {"kind":"agent","task":{"title":"实施修改"},"status":"inactive","executor":null,"execution":null,
-      "capability":{"tools":["read_file","write_file"],"model":"m-1"},
-      "next":[{"to":"finish"}]},
-    "finish": {"kind":"end","task":{"title":"形成结果"},"status":"inactive","executor":null,"execution":null,"next":[]}
-  }
-}`
+const bridgeLinearGraphJSON = "{\n  \"schema\": \"agentgo.graph/v1\",\n  \"graph_id\": \"g-bridge-linear\",\n  \"revision\": 1, \"state_version\": 0,\n  \"root\": \"root\", \"status\": \"pending\",\n  \"nodes\": {\n    \"root\": {\"kind\":\"agent\",\"task\":{\"title\":\"理解需求\",\"description\":\"分解目标\"},\"status\":\"inactive\",\"executor\":null,\"execution\":null,\n      \"next\":[{\"to\":\"implement\"}]},\n    \"implement\": {\"kind\":\"agent\",\"task\":{\"title\":\"实施修改\"},\"status\":\"inactive\",\"executor\":null,\"execution\":null,\n      \"capability\":{\"tools\":[\"read_file\",\"apply_change\"],\"model\":\"m-1\"},\n      \"next\":[{\"to\":\"finish\"}]},\n    \"finish\": {\"kind\":\"end\",\"task\":{\"title\":\"形成结果\"},\"status\":\"inactive\",\"executor\":null,\"execution\":null,\"next\":[]}\n  }\n}"
 
 // TestGraphBridgeLinearGraphEndToEnd 线性图全链路：
 // SubmitGraph → root 任务自动发布（带图身份）→ runner 完成 root → feed

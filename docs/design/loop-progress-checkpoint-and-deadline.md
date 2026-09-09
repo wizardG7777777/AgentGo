@@ -1,3 +1,5 @@
+> **版本边界（2026-09-09）**：本页保留旧版本机制与验证事实。新运行采用 [四类工具契约](tool-taxonomy-and-contracts.md) 和 [当前冻结基线](contract-freeze-2026-08-30.md)；旧工具、强制 Observation、CheckContract 与默认阶段/进展交接条目已退役，不能据本页重新引入。仍沿用的 Delivery/Effect 不变量由当前实现与测试约束。
+
 # Loop Progress Contract / Checkpoint / Deadline 架构
 
 > 状态：Accepted Design，Progress v12 / investigation v6 / RunContract v2 implemented<br>

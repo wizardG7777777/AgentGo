@@ -105,7 +105,7 @@ func TestAnomalyReactor_NilDepsNoPanic(t *testing.T) {
 
 func TestAnomalyReactor_EmptyTaskIDNoPanic(t *testing.T) {
 	cap := installCapture(t)
-	r := NewAnomalyReactor(&fakeAnomalyStore{history: []store.ToolCallRecord{okCall("write_file")}})
+	r := NewAnomalyReactor(&fakeAnomalyStore{history: []store.ToolCallRecord{okCall("apply_change")}})
 	if err := r.Run(trace.Event{Kind: trace.KindTaskCompleted}); err != nil {
 		t.Errorf("空 TaskID 应静默 no-op，got err=%v", err)
 	}
@@ -130,7 +130,7 @@ func TestAnomalyReactor_NoHistoryNoAnomaly(t *testing.T) {
 func TestAnomalyReactor_FabricatedWriteHit(t *testing.T) {
 	cap := installCapture(t)
 	st := &fakeAnomalyStore{
-		history: []store.ToolCallRecord{okCall("write_file"), okCall("write_file")},
+		history: []store.ToolCallRecord{okCall("apply_change"), okCall("apply_change")},
 	}
 	r := NewAnomalyReactor(st)
 	if err := r.Run(completedEv("t-1")); err != nil {
@@ -155,11 +155,10 @@ func TestAnomalyReactor_FabricatedWriteHit(t *testing.T) {
 
 func TestAnomalyReactor_FabricatedWriteMiss(t *testing.T) {
 	cases := map[string][]store.ToolCallRecord{
-		"有 read_file 即不构成凭空写入":  {okCall("read_file"), okCall("write_file")},
-		"失败的 read_file 也算有读取尝试": {errCall("read_file"), okCall("write_file")},
-		"write_file 全部失败不算写入发生": {errCall("write_file")},
-		"edit_file 不在本启发式写入集合内": {okCall("edit_file")},
-		"list_dir 等其他工具不触发":     {okCall("list_dir"), okCall("grep_search")},
+		"有 read_file 即不构成凭空写入":    {okCall("read_file"), okCall("apply_change")},
+		"失败的 read_file 也算有读取尝试":   {errCall("read_file"), okCall("apply_change")},
+		"apply_change 全部失败不算写入发生": {errCall("apply_change")},
+		"list_dir 等其他工具不触发":       {okCall("list_dir"), okCall("grep_search")},
 	}
 	for name, history := range cases {
 		cap := installCapture(t)
@@ -238,9 +237,9 @@ func TestAnomalyReactor_ToolErrorRateDetail(t *testing.T) {
 
 func TestAnomalyReactor_BothAnomaliesReportSeparately(t *testing.T) {
 	cap := installCapture(t)
-	// 5 次调用：write_file 全成功 + 2 次其他工具失败 → 同时命中 ②③
+	// 5 次调用：apply_change 全成功 + 2 次其他工具失败 → 同时命中 ②③
 	history := []store.ToolCallRecord{
-		okCall("write_file"), errCall("run_shell"), errCall("run_shell"), okCall("write_file"), okCall("write_file"),
+		okCall("apply_change"), errCall("run_shell"), errCall("run_shell"), okCall("apply_change"), okCall("apply_change"),
 	}
 	r := NewAnomalyReactor(&fakeAnomalyStore{history: history})
 	if err := r.Run(completedEv("t-1")); err != nil {
@@ -269,7 +268,7 @@ func TestAnomalyReactor_BothAnomaliesReportSeparately(t *testing.T) {
 func TestAnomalyReactor_SameTaskSameCodeReportedOnce(t *testing.T) {
 	cap := installCapture(t)
 	st := &fakeAnomalyStore{
-		history: []store.ToolCallRecord{okCall("write_file")},
+		history: []store.ToolCallRecord{okCall("apply_change")},
 	}
 	r := NewAnomalyReactor(st)
 	// 模拟任务重试后再次 completed：同一 (taskID, code) 只报一次
@@ -286,7 +285,7 @@ func TestAnomalyReactor_SameTaskSameCodeReportedOnce(t *testing.T) {
 func TestAnomalyReactor_DifferentTasksReportIndependently(t *testing.T) {
 	cap := installCapture(t)
 	st := &fakeAnomalyStore{
-		history: []store.ToolCallRecord{okCall("write_file")},
+		history: []store.ToolCallRecord{okCall("apply_change")},
 	}
 	r := NewAnomalyReactor(st)
 	_ = r.Run(completedEv("t-1"))
@@ -316,7 +315,7 @@ func TestAnomalyReactor_DoesNotMutateTaskState(t *testing.T) {
 	if err := taskStore.PublishTask(task); err != nil {
 		t.Fatalf("PublishTask: %v", err)
 	}
-	if err := taskStore.AppendToolCall(task.ID, store.ToolCallRecord{ToolName: "write_file", Success: true}); err != nil {
+	if err := taskStore.AppendToolCall(task.ID, store.ToolCallRecord{ToolName: "apply_change", Success: true}); err != nil {
 		t.Fatalf("AppendToolCall: %v", err)
 	}
 
@@ -357,7 +356,7 @@ func TestAnomalyReactor_E2E_DispatchToWarning(t *testing.T) {
 	if err := taskStore.PublishTask(task); err != nil {
 		t.Fatalf("PublishTask: %v", err)
 	}
-	if err := taskStore.AppendToolCall(task.ID, store.ToolCallRecord{ToolName: "write_file", Success: true}); err != nil {
+	if err := taskStore.AppendToolCall(task.ID, store.ToolCallRecord{ToolName: "apply_change", Success: true}); err != nil {
 		t.Fatalf("AppendToolCall: %v", err)
 	}
 

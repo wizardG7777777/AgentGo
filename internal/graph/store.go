@@ -251,8 +251,8 @@ func sameEvidenceEntry(a, b EvidenceEntry) bool {
 		a.CallID != b.CallID || a.ToolName != b.ToolName ||
 		a.Command != b.Command || a.CommandTruncated != b.CommandTruncated ||
 		a.Path != b.Path || a.PathTruncated != b.PathTruncated ||
-		a.CheckRef != b.CheckRef || a.CheckID != b.CheckID || a.CheckKind != b.CheckKind ||
-		a.CheckStatus != b.CheckStatus || a.WorkspaceRevisionRef != b.WorkspaceRevisionRef ||
+
+		a.WorkspaceRevisionRef != b.WorkspaceRevisionRef ||
 		a.OutputRef != b.OutputRef {
 		return false
 	}
@@ -948,10 +948,7 @@ func validateEvidenceEntryBounds(ev EvidenceEntry) error {
 		{"tool_name", ev.ToolName, EvidenceIdentityMaxRunes},
 		{"command", ev.Command, EvidenceCommandMaxRunes},
 		{"path", ev.Path, EvidencePathMaxRunes},
-		{"check_ref", ev.CheckRef, EvidenceIdentityMaxRunes},
-		{"check_id", ev.CheckID, MaxIDLength},
-		{"check_kind", ev.CheckKind, MaxIDLength},
-		{"check_status", ev.CheckStatus, MaxIDLength},
+
 		{"workspace_revision_ref", ev.WorkspaceRevisionRef, EvidenceIdentityMaxRunes},
 		{"output_ref", ev.OutputRef, EvidenceIdentityMaxRunes},
 	}
@@ -960,13 +957,7 @@ func validateEvidenceEntryBounds(ev EvidenceEntry) error {
 			return fmt.Errorf("%s 超过 %d rune 上限", check.name, check.max)
 		}
 	}
-	if ev.Kind == "check" {
-		if strings.TrimSpace(ev.CheckRef) == "" || strings.TrimSpace(ev.CheckID) == "" ||
-			strings.TrimSpace(ev.CheckKind) == "" || strings.TrimSpace(ev.WorkspaceRevisionRef) == "" ||
-			(ev.CheckStatus != "pass" && ev.CheckStatus != "failed") {
-			return fmt.Errorf("check evidence 结构化字段不完整")
-		}
-	}
+
 	return nil
 }
 
@@ -1213,6 +1204,24 @@ func (s *Store) ResolveActivationResult(graphID, ref string) (ActivationResult, 
 		return ActivationResult{}, false
 	}
 	return cloneActivationResult(rec), true
+}
+
+// ResolveEvidence 读取某条已持久化证据及其所属执行实例，不修改图状态。
+func (s *Store) ResolveEvidence(graphID, ref string) (EvidenceEntry, string, string, bool) {
+	e, ok := s.lookup(graphID)
+	if !ok {
+		return EvidenceEntry{}, "", "", false
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	for _, result := range e.activationResults {
+		for _, evidence := range result.Evidence {
+			if evidence.Ref == ref {
+				return cloneEvidenceEntry(evidence), result.NodeID, result.ActivationID, true
+			}
+		}
+	}
+	return EvidenceEntry{}, "", "", false
 }
 
 // NextActivationID 返回节点下一个 activation_id（<nodeID>@<n>，n 为该节点

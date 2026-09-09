@@ -14,11 +14,8 @@ import (
 	"time"
 
 	"agentgo/internal/contextcontract"
-	"agentgo/internal/controlcapability"
 	"agentgo/internal/gate"
-	"agentgo/internal/graph"
 	"agentgo/internal/llm"
-	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
 	"agentgo/internal/trace"
@@ -171,10 +168,9 @@ type LLMExecutor struct {
 	// callback，任何写失败都会终止剩余工具。旧 callback 仅供 legacy 测试。
 	durableToolCallRecorder func(string, store.ToolCallRecord) error
 	instructions            contextruntime.Instructions
-	observationModel        string
-	controlCapabilities     *controlcapability.Store
-	toolsMu                 sync.RWMutex
-	tools                   *ToolRegistry
+
+	toolsMu sync.RWMutex
+	tools   *ToolRegistry
 	// frameworkTools 是启动装配期注册全集的只读 authority。任务级
 	// ExecutionLease 只替换 tools 业务视图；Observation 等 framework-owned
 	// Control Invocation 必须从这里按 exact phase 重新派生，不能依赖角色业务
@@ -317,17 +313,6 @@ func (e *LLMExecutor) ToolRegistry() *ToolRegistry {
 	return e.tools
 }
 
-// SetObservationModel freezes the optional control-lane model at runner setup.
-func (e *LLMExecutor) SetObservationModel(model string) {
-	e.observationModel = strings.TrimSpace(model)
-}
-
-func (e *LLMExecutor) SetControlCapabilityStore(store *controlcapability.Store) {
-	e.controlCapabilities = store
-}
-
-// invocationToolRegistries 原子取得当前任务业务视图与启动期 framework
-// authority。两者只供一次 Invocation 冻结 ToolRouter，返回后均按只读使用。
 func (e *LLMExecutor) invocationToolRegistries() (business, framework *ToolRegistry) {
 	e.toolsMu.RLock()
 	defer e.toolsMu.RUnlock()
@@ -343,8 +328,8 @@ func NewTurnExecutor(client llm.Invoker, tools *ToolRegistry, gates *gate.Regist
 func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
 	// 整个 Execute 使用同一份 registry 快照——任务边界换入的过滤视图对本次
 	// 调用自洽，不会在模型调用与工具分发之间被换走。
-	tools, frameworkTools := e.invocationToolRegistries()
-	toolPolicy := deriveInvocationToolPolicyWithControl(task, history, tools, frameworkTools)
+	tools := e.ToolRegistry()
+	toolPolicy := deriveInvocationToolPolicy(task, history, tools)
 	toolRouter, err := FreezeToolRouterSnapshotWithPolicy(toolPolicy.Registry, toolPolicy.Phase, toolPolicy.MaxCalls)
 	if err != nil {
 		return ExecuteResult{}, err
@@ -361,44 +346,12 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		}
 		invocationBase := turnIDForTrace
 		invocationID := fmt.Sprintf("%s/invocation-%d", invocationBase, e.invSeq.Add(1))
-		if toolPolicy.RecoveryGate != nil {
-			gate := toolPolicy.RecoveryGate
-			trace.Emit(trace.Event{
-				Kind: trace.KindRecoveryActionGated, TaskID: task.ID,
-				RunID: string(task.RunID), AttemptID: attemptIDForTrace, TurnID: turnIDForTrace,
-				InvocationID: invocationID, AgentID: agentIDForTrace,
-				RecoveryGate: &trace.RecoveryActionPayload{
-					Schema: gate.Schema, Stage: string(gate.Stage), Tool: gate.Tool,
-					Path: gate.Path, CheckID: gate.CheckID, RefID: gate.RefID,
-					Offset: gate.Offset, Limit: gate.Limit, ForceFull: gate.ForceFull,
-					DirectiveCount: gate.DirectiveCount,
-				},
-			})
-		}
+
 		activity := activityFromContext(ctx)
 		contextRuntime, parentSnapshotRef := e.contextRuntimeForAttempt(attemptIDForTrace)
 		phasePrompt := ""
 		if e.phasePromptResolver != nil {
 			phasePrompt = e.phasePromptResolver(toolRouter.Phase)
-		}
-		if toolRouter.Phase == "agent:deliverable-submit" {
-			phasePrompt = agentDeliverablePhasePrompt
-		} else if isObservationCheckpointPhase(toolRouter.Phase) {
-			phasePrompt = observationCheckpointPhasePrompt + "\n" + observationCheckpointCatalogPrompt(toolRouter.Defs)
-		} else if toolRouter.Phase == "agent:observation-commitment" {
-			phasePrompt = observationCommitmentPhasePrompt
-		} else if toolPolicy.RecoveryGate != nil {
-			phasePrompt = recoveryActionPhasePrompt(*toolPolicy.RecoveryGate)
-		} else if toolRouter.Phase == "scheduler:final-report-submit" {
-			phasePrompt = finalReportSubmitPhasePrompt
-		}
-		// 正常业务链不重放 reasoning=none 的 Observation Control Invocation；
-		// 其 durable 结果由 TaskMemory 独立注入。
-		historyMode := "business"
-		if toolRouter.Phase == "agent:deliverable-submit" && task.ProgressContract != nil && task.ProgressContract.WorkClass == loopcontract.WorkInvestigation {
-			historyMode = "investigation-evidence"
-		} else if toolRouter.Phase == "agent:deliverable-submit" || isObservationCheckpointPhase(toolRouter.Phase) || toolRouter.Phase == "scheduler:final-report-submit" {
-			historyMode = "control"
 		}
 		if err := actionBudget.Validate(); err != nil {
 			return ExecuteResult{}, err
@@ -407,25 +360,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		if int64(toolRouter.MaxCalls) < limit.MaxToolCalls {
 			limit.MaxToolCalls = int64(toolRouter.MaxCalls)
 		}
-		if isObservationPhase(toolRouter.Phase) {
-			completion, responseBytes := observationOutputLimits(toolRouter.Phase)
-			limit.MaxCompletionTokens = minPositiveInt64(limit.MaxCompletionTokens, completion)
-			limit.MaxContentBytes = minPositiveInt64(limit.MaxContentBytes, responseBytes)
-			limit.MaxReasoningBytes = minPositiveInt64(limit.MaxReasoningBytes, responseBytes)
-			limit.MaxExtraFieldBytes = minPositiveInt64(limit.MaxExtraFieldBytes, responseBytes)
-			limit.MaxToolArgumentsBytes = minPositiveInt64(limit.MaxToolArgumentsBytes, 16<<10)
-			limit.MaxToolArgumentsTotalBytes = minPositiveInt64(limit.MaxToolArgumentsTotalBytes, 16<<10)
-			limit.MaxResponseBytes = minPositiveInt64(limit.MaxResponseBytes, responseBytes)
-			if toolRouter.Phase == "agent:observation-checkpoint" {
-				limit.MaxToolCalls = 1
-			}
-			for name, n := range limit.MaxExtraFieldBytesByName {
-				limit.MaxExtraFieldBytesByName[name] = minPositiveInt64(n, responseBytes)
-			}
-		}
-		if toolPolicy.RecoveryGate != nil && toolPolicy.RecoveryGate.Schema == graph.RecoveryDeltaSchemaV5 {
-			limit.MaxCompletionTokens = minPositiveInt64(limit.MaxCompletionTokens, recoveryV5CompletionLimit(toolPolicy.RecoveryGate.Stage, history))
-		}
+
 		input := executionContextInput(contextRuntime, task, depResults, history, toolRouter, limit)
 		input.Identity.InvocationID = invocationID
 		input.Identity.AttemptID = attemptIDForTrace
@@ -433,7 +368,6 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		input.Identity.AgentID = agentIDForTrace
 		input.Identity.Loop = loopForTrace
 		input.ParentSnapshotRef = parentSnapshotRef
-		input.HistoryMode = historyMode
 		input.Instructions = contextruntime.Instructions{ProfileID: e.promptVersion, System: e.instructions.System, Override: task.SystemPrompt, Team: e.instructions.Team, Objective: task.Description, Control: renderTaskContextBlock(task), Output: renderOutputContract(task, taskControlTools(task)), Phase: phasePrompt}
 		compiled, compileErr := contextRuntime.Compile(ctx, input)
 		if compileErr != nil {
@@ -475,9 +409,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		if task.Lease != nil {
 			effectiveModel = task.Lease.Model
 		}
-		if isAutoObservationPhase(toolRouter.Phase) && e.observationModel != "" {
-			effectiveModel = e.observationModel
-		}
+
 		if invocationBinding != nil {
 			toolChoiceMode = string(invocationBinding.ToolChoice.Mode)
 			toolChoiceName = invocationBinding.ToolChoice.Name
@@ -488,17 +420,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 			modelCapabilityDigest = invocationBinding.CapabilityDigest
 			invocationProfileRef = invocationBinding.ProfileRef
 		}
-		var controlCapabilityKey controlcapability.Key
-		if isAutoObservationPhase(toolRouter.Phase) && invocationBinding != nil {
-			controlCapabilityKey = controlcapability.Key{
-				RunID: runIDForTrace, EffectiveModel: effectiveModel,
-				InvocationProfile: toolRouter.Phase, ToolSchemaDigest: toolRouter.ID,
-			}
-			if record, incompatible := e.controlCapabilities.Incompatible(controlCapabilityKey); incompatible {
-				return ExecuteResult{InvocationID: invocationID, ContextSnapshotID: contextSnapshotID},
-					&controlcapability.IncompatibleError{Record: record}
-			}
-		}
+
 		trace.Emit(trace.Event{
 			Kind:                  trace.KindLLMCallStart,
 			TaskID:                task.ID,
@@ -531,14 +453,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		traceTiming := traceInvocationTiming(invocationTiming.Snapshot())
 
 		if err != nil {
-			if failure, ok := llm.FromError(err); ok && controlCapabilityKey.RunID != "" {
-				if _, storeErr := e.controlCapabilities.Mark(controlCapabilityKey, failure); storeErr != nil {
-					return ExecuteResult{InvocationID: invocationID, ContextSnapshotID: contextSnapshotID, ContextProjected: compiled.Projected(),
-							InvocationDuration: llmDuration, ProviderCallStarted: true},
-						contextAssemblyFailure(ctx, invocationID, contextPolicyRef,
-							fmt.Errorf("持久化 ControlCapability 失败: %w", storeErr))
-				}
-			}
+
 			activity.LLMEnd(agentIDForTrace, task.ID, loopForTrace, "", 0, err)
 			event := trace.Event{
 				Kind:                  trace.KindLLMCallEnd,
@@ -579,9 +494,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		}
 
 		batchErr := validateToolCallBatch(toolRouter, resp.ToolCalls())
-		if batchErr == nil && toolPolicy.RecoveryGate != nil {
-			batchErr = validateRecoveryActionCall(*toolPolicy.RecoveryGate, resp.ToolCalls())
-		}
+
 		if batchErr != nil {
 			failureKind := llm.FailureMalformedResponse
 			origin := llm.OriginProtocol
@@ -692,24 +605,10 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				if turnIDForTrace == "" {
 					actionID = task.ID + "/legacy-tool-" + c.ID
 				}
-				// auto + singleton 是 DeepSeek thinking 可消费的 provider wire
-				// 表达。某些 thinking provider 会忽略 parallel_tool_calls=false
-				// 并返回重复调用。阶段权威仍只允许一个动作：执行首个，
-				// 为后续 call_id 生成 skipped result 以保持 Responses 无状态重放完整。
-				if idx > 0 && phaseDispatchesOnlyFirstTool(toolRouter.Phase) {
-					content := "已跳过：当前机械阶段只执行 provider 顺序中的首个工具调用"
-					trace.Emit(trace.Event{
-						Kind: trace.KindToolCallSkipped, TaskID: task.ID, RunID: runIDForTrace,
-						AttemptID: attemptIDForTrace, TurnID: turnIDForTrace, ActionID: actionID,
-						AgentID: agentID, Loop: loopNum, Tool: c.Name, CallID: c.ID,
-						Reason: "phase_single_action_fanout",
-					})
-					results[idx] = indexedResult{toolResult: contextcontract.ToolResult{
-						ToolCallID: c.ID, Content: content,
-					}, output: fmt.Sprintf("[%s] %s\n", c.Name, content)}
-					completedResults = idx + 1
-					return
-				}
+				ctx := context.WithValue(ctx, toolCallIdentityKey{}, ToolCallIdentity{
+					RunID: runIDForTrace, TaskID: task.ID, AttemptID: attemptIDForTrace,
+					TurnID: turnIDForTrace, InvocationID: invocationID, CallID: c.ID, ActionID: actionID,
+				})
 				// finalizing fence：submit_task_result 被接受（MarkTaskFinalized）
 				// 后，同一响应中排在其后的工具调用一律跳过——不 dispatch、不产生
 				// 副作用、不写 ToolCallRecord（调用从未发生），只返回结构化提示
@@ -719,17 +618,18 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 					content := "已跳过：任务已进入收尾（finalizing），本次调用未执行"
 					log.Printf("[agent %s] task=%s loop=%d tool=%s 被 finalizing fence 跳过（call_id=%s）", agentID, task.ID, loopNum, c.Name, c.ID)
 					trace.Emit(trace.Event{
-						Kind:      trace.KindToolCallSkipped,
-						TaskID:    task.ID,
-						RunID:     runIDForTrace,
-						AttemptID: attemptIDForTrace,
-						TurnID:    turnIDForTrace,
-						ActionID:  actionID,
-						AgentID:   agentID,
-						Loop:      loopNum,
-						Tool:      c.Name,
-						CallID:    c.ID,
-						Reason:    "task_finalizing",
+						Kind:         trace.KindToolCallSkipped,
+						InvocationID: invocationID,
+						TaskID:       task.ID,
+						RunID:        runIDForTrace,
+						AttemptID:    attemptIDForTrace,
+						TurnID:       turnIDForTrace,
+						ActionID:     actionID,
+						AgentID:      agentID,
+						Loop:         loopNum,
+						Tool:         c.Name,
+						CallID:       c.ID,
+						Reason:       "task_finalizing",
 					})
 					results[idx] = indexedResult{
 						toolResult: contextcontract.ToolResult{
@@ -753,17 +653,18 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				// 自由内容替换为 <redacted> 占位；AGENTGO_TRACE_FULL_ARGS=1 可旁路），
 				// 原 c.Arguments 不受影响，继续参与 Gate / dispatch / ToolCallRecord。
 				trace.Emit(trace.Event{
-					Kind:      trace.KindToolCall,
-					TaskID:    task.ID,
-					RunID:     runIDForTrace,
-					AttemptID: attemptIDForTrace,
-					TurnID:    turnIDForTrace,
-					ActionID:  actionID,
-					AgentID:   agentID,
-					Loop:      loopNum,
-					Tool:      c.Name,
-					Args:      trace.RedactArgs(c.Name, c.Arguments),
-					CallID:    c.ID,
+					Kind:         trace.KindToolCall,
+					InvocationID: invocationID,
+					TaskID:       task.ID,
+					RunID:        runIDForTrace,
+					AttemptID:    attemptIDForTrace,
+					TurnID:       turnIDForTrace,
+					ActionID:     actionID,
+					AgentID:      agentID,
+					Loop:         loopNum,
+					Tool:         c.Name,
+					Args:         trace.RedactArgs(c.Name, c.Arguments),
+					CallID:       c.ID,
 				})
 
 				// Gate pre-call：允许注册的 Gate 拒绝本次调用。
@@ -804,11 +705,12 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 								actionHandle, toolErr = actionBoundary.ReserveTool(ctx, task, c)
 								if toolErr != nil {
 									controlErr = &loopAuthorityError{Err: toolErr}
-									return
 								}
 							}
-							result, toolErr = toolRouter.Registry.Dispatch(ctx, c)
-							dispatched = true
+							if toolErr == nil {
+								result, toolErr = toolRouter.Registry.Dispatch(ctx, c)
+								dispatched = true
+							}
 						}
 					} else {
 						actionBoundary = toolActionBoundaryFromContext(ctx)
@@ -816,11 +718,12 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 							actionHandle, toolErr = actionBoundary.ReserveTool(ctx, task, c)
 							if toolErr != nil {
 								controlErr = &loopAuthorityError{Err: toolErr}
-								return
 							}
 						}
-						result, toolErr = toolRouter.Registry.Dispatch(ctx, c)
-						dispatched = true
+						if toolErr == nil {
+							result, toolErr = toolRouter.Registry.Dispatch(ctx, c)
+							dispatched = true
+						}
 					}
 				}
 				if dispatched && actionBoundary != nil {
@@ -829,21 +732,27 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 					}
 				}
 				dur := time.Since(start)
-				if toolErr == nil {
+				if result != "" {
 					boundedResult, persistErr := externalizeToolResult(contextRuntime, ctx, task, c, result)
 					if persistErr != nil {
 						controlErr = &loopAuthorityError{Err: persistErr}
-						return
+						toolErr = persistErr
+						result = ""
+					} else {
+						result = boundedResult
 					}
-					result = boundedResult
 				}
 
 				var content string
 				if toolErr != nil {
 					content = fmt.Sprintf("错误: %v", toolErr)
+					if result != "" {
+						content += "\n" + result
+					}
 					log.Printf("[agent %s] task=%s loop=%d tool=%s duration=%s error=%v", agentID, task.ID, loopNum, c.Name, dur.Round(time.Millisecond), toolErr)
 					trace.Emit(trace.Event{
-						Kind:       trace.KindToolResult,
+						Kind:         trace.KindToolResult,
+						InvocationID: invocationID, ToolDispatched: &dispatched, ToolResultContent: content,
 						TaskID:     task.ID,
 						RunID:      runIDForTrace,
 						AttemptID:  attemptIDForTrace,
@@ -861,7 +770,8 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 					content = result
 					log.Printf("[agent %s] task=%s loop=%d tool=%s duration=%s result_len=%d", agentID, task.ID, loopNum, c.Name, dur.Round(time.Millisecond), len(content))
 					trace.Emit(trace.Event{
-						Kind:       trace.KindToolResult,
+						Kind:         trace.KindToolResult,
+						InvocationID: invocationID, ToolDispatched: &dispatched, ToolResultContent: content,
 						TaskID:     task.ID,
 						RunID:      runIDForTrace,
 						AttemptID:  attemptIDForTrace,
@@ -892,6 +802,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 					exitCodeScope = parseRunShellExitCodeScope(result)
 				}
 				if recordErr := e.recordToolCallFact(task.ID, store.ToolCallRecord{
+					InvocationID: invocationID, Dispatched: dispatched, DurationMS: dur.Milliseconds(), ResultContent: content,
 					Timestamp:     time.Now(),
 					RunID:         runIDForTrace,
 					AttemptID:     attemptIDForTrace,
@@ -960,11 +871,6 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		}
 		return executeResult, controlErr
 	}
-}
-
-func isObservationCheckpointPhase(phase string) bool {
-	return phase == "agent:observation-checkpoint" ||
-		strings.HasPrefix(phase, "agent:observation-checkpoint-v")
 }
 
 func traceInvocationTiming(value llm.InvocationTimingSnapshot) *trace.LLMInvocationTiming {
