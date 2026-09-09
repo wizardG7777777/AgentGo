@@ -21,8 +21,9 @@ func newTestShellGroup(t *testing.T, fallbackDir string, filter *shell.CommandFi
 	t.Helper()
 	interactions := interaction.NewService(nil)
 	return ShellGroup{
-		Workdir:      &DefaultWorkdir{ProjectRoot: fallbackDir},
-		TimeoutSec:   10,
+		Workdir: &DefaultWorkdir{ProjectRoot: fallbackDir},
+		// 普通功能测试沿用产品上限；超时用例通过 timeout_sec 显式设置。
+		TimeoutSec:   defaultShellTimeoutSec,
 		Interactions: interactions,
 		SessionID:    func() string { return "session-tools-test" },
 		AgentID:      "test-agent",

@@ -13,3 +13,5 @@
 本地 Python 66 项离线测试通过。三平台完整验证由修复提交的 GitHub Actions 执行；以其实际结果为准。未运行真实 SWE 或真实模型。
 
 全量本地回归还暴露 `TestE2E_AgentStateMachineLifecycle` 的日志关闭竞争：Task 已终态不等于 Agent 收尾已完成。测试现在等待 Run 返回后关闭 Trace，避免漏掉最后一条状态事件；定向连续 30 次通过。未更改 Agent 生产状态机。
+
+修复提交 1b95fb8 的 [CI](https://github.com/wizardG7777777/AgentGo/actions/runs/34350816627) 中，Ubuntu 全部通过；Windows 原探针问题通过，另在 `TestRunShell_EffectJournalManualOnly` 的 echo 命令触发测试专用 10 秒超时。该用例验证记账而非启动性能，普通 Shell 功能测试现沿用产品默认 30 秒，显式 1 秒超时回归保持不变。日志不足以区分 PowerShell 启动和执行阶段耗时，未据此修改生产超时或 Shell 实现。
