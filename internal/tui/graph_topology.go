@@ -181,10 +181,7 @@ func buildGraphTopologyLayout(graph GraphInfo, w, selectedNode int) graphTopolog
 	for _, node := range graph.Nodes {
 		nodes[node.NodeID] = node
 	}
-	root := graph.Root
-	if _, ok := nodes[root]; !ok {
-		root = graph.Nodes[0].NodeID
-	}
+	root := graph.Nodes[0].NodeID
 
 	adjacency := make(map[string][]int, len(graph.Nodes))
 	for index, edge := range graph.Edges {
@@ -392,10 +389,15 @@ func renderGraphTopologyNode(t Theme, graph GraphInfo, node GraphNodeInfo, width
 
 	icon, statusStyle := nodeStatusVisual(t, node.Status)
 	role := ""
-	if node.NodeID == graph.Root || node.Root {
-		role = "START "
-	} else if node.Kind == "end" {
-		role = "END "
+	inputNode := true
+	for _, edge := range graph.Edges {
+		if edge.To == node.NodeID {
+			inputNode = false
+			break
+		}
+	}
+	if inputNode {
+		role = "INPUT "
 	}
 	selection := ""
 	if selected {
@@ -411,15 +413,6 @@ func renderGraphTopologyNode(t Theme, graph GraphInfo, node GraphNodeInfo, width
 	execution := node.AgentID
 	if execution == "" {
 		execution = node.ActivationID
-	}
-	if execution == "" && node.WaitEvent != "" {
-		execution = "waits " + node.WaitEvent
-	}
-	if execution == "" && node.RequestID != "" {
-		execution = "approval"
-	}
-	if execution == "" && node.ChildGraphID != "" {
-		execution = "subgraph " + node.ChildGraphID
 	}
 	state := statusStyle.Render(node.Status)
 	if execution != "" {
@@ -689,13 +682,8 @@ func graphCurrentEdgeProgress(graph GraphInfo) (traversed, total int) {
 	return traversed, total
 }
 
-func graphEndNodeSummary(graph GraphInfo) string {
+func graphLeafSummary(graph GraphInfo) string {
 	var ends []string
-	for _, node := range graph.Nodes {
-		if node.Kind == "end" {
-			ends = append(ends, node.NodeID)
-		}
-	}
 	if len(ends) == 0 {
 		outgoing := make(map[string]bool, len(graph.Edges))
 		for _, edge := range graph.Edges {

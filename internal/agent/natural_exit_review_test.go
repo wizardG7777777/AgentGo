@@ -23,7 +23,7 @@ func TestProcessTask_GraphNodeTextExitNudgesThenRecoverable(t *testing.T) {
 	s, r, _ := setup()
 	task := &model.Task{
 		Description: "图节点实现", EventType: "code",
-		GraphID: "g-text-exit", NodeID: "impl", ActivationID: "impl@1", GraphNodeKind: "agent",
+		GraphID: "g-text-exit", NodeID: "impl", ActivationID: "impl@1",
 	}
 	if err := s.PublishTask(task); err != nil {
 		t.Fatal(err)

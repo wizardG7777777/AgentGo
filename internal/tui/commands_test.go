@@ -136,7 +136,7 @@ func TestEventCommand_DispatchAndValidation(t *testing.T) {
 	f := fakeOf(deps)
 	m := newAppModel(deps)
 
-	m.handleCommand("/event g-1 deploy.done {\"ok\":true}")
+	m.handleCommand(`/graph-input {"graph_id":"g-1","port":"deploy.done","version":1,"expected_revision":1,"request_id":"input-1","value":{"ok":true}}`)
 	if len(f.graphEvents) != 1 {
 		t.Fatalf("应投递 1 次事件，实际 %d", len(f.graphEvents))
 	}
@@ -145,12 +145,12 @@ func TestEventCommand_DispatchAndValidation(t *testing.T) {
 		t.Fatalf("投递入参错误: %+v", call)
 	}
 
-	m.handleCommand("/event g-1")
-	if got := lastMessageText(&m); !strings.Contains(got, "用法") {
+	m.handleCommand("/graph-input")
+	if got := lastMessageText(&m); !strings.Contains(got, "参数必须") {
 		t.Fatalf("缺参应提示用法: %q", got)
 	}
-	m.handleCommand("/event g-1 deploy.done {bad json")
-	if got := lastMessageText(&m); !strings.Contains(got, "不是合法 JSON") {
+	m.handleCommand("/graph-input {bad json")
+	if got := lastMessageText(&m); !strings.Contains(got, "参数必须") {
 		t.Fatalf("非法 JSON 应本地拦截: %q", got)
 	}
 	if len(f.graphEvents) != 1 {

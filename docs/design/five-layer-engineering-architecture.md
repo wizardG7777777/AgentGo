@@ -1,6 +1,6 @@
 # AgentGo 五层工程架构规范
 
-状态：L1/L2 核心重建已实施；已执行验证与未执行项见实施记录。旧实施记录见 [历史规范](../archived/five-layer-engineering-architecture-before-l1-l2-rebuild.md)。
+状态：L1/L2 核心重建与 agentTask 数据流图切换已实施；验证范围见实施记录。旧实施记录见 [历史规范](../archived/five-layer-engineering-architecture-before-l1-l2-rebuild.md)。
 
 ## 职责与依赖
 
@@ -10,7 +10,7 @@
 | L2 Context Engineering | 指令、目标、记忆、历史、工具与非文本装配；请求封存；响应重放检查与输出订阅 | internal/contextruntime、internal/contextcontract、internal/contextcompiler；存储由 L3 端口注入 |
 | L3 Harness Engineering | 工具权限、Lease、ToolRouter、工具执行、Store、Effect 与工作环境 | internal/agent/execution_lease.go、tool_registry.go、tool_router_snapshot.go；internal/tools、store、effect、workspace、shell、gate |
 | L4 Loop Engineering | Activation/Attempt/Turn、进展、重试、停止与 finalizing | internal/agent/agent.go::processTask、state.go、loop_progress.go、finalization.go；internal/runner 的认领与运行外壳 |
-| L5 Graph Engineering | 图定义与 Activation 编排、输入输出、验收、交付 | internal/graph、internal/delivery；internal/bootstrap/graph_*.go；internal/scheduler 的图编排逻辑 |
+| L5 Graph Engineering | 唯一 agentTask、输入就绪、增量图与图级交付 | internal/graph/dataflow_*.go、internal/delivery/store.go；internal/bootstrap/dataflow_runtime.go；internal/scheduler |
 
 五层是责任域，不与包一一对应。Memory 的召回、投影和语义更新属于 L2；memory/taskmem/session 的持久化属于 L3。LLMExecutor 的工具 gate/dispatch 属于 L3，其调用 L2 的接缝不拥有上下文组装权。Trace/UI 是横切面，不构成第六层。
 
@@ -90,5 +90,25 @@ L2 提供 WatchModelOutput。eventCursor 中文为“流式事件游标”，英
 - L3：`internal/agent/context_bridge.go` 交付执行规格；`llm_executor.go::Execute` 负责工具 gate/dispatch；`execution_lease.go`、`tool_router_snapshot.go`、`tool_registry.go` 负责权限，`tool_call_identity.go` 绑定执行事实。`runtime_facts.go` 提供运行事实，`task_memory.go` 从结算账本收集事实并调用记忆语义更新。
 - L3 存储/环境：`internal/contextstore/store.go`、`internal/contentstore/store.go`、`internal/taskmem/store.go`、`internal/memory/*store.go`、`internal/session/turns.go`；`internal/store`、`effect`、`workspace`、`shell`、`gate`、`tools`。Task Memory 的 render/update 语义属于 L2；不再生成模型 Observation。
 - L4：`internal/agent/agent.go::processTask`、`state.go`、`loop_progress.go`、`finalization.go`、`submit_state.go`；`internal/runner/runner.go` 的认领与运行外壳；`internal/loopcontract`、`loopcontrol`、`loopprogress`、`loopstore`。
-- L5：`internal/graph`、`internal/delivery`；`internal/bootstrap/graph_runtime.go` 及其它 graph bridge；`internal/scheduler/activator.go`、`scheduler.go` 的图编排入口；`internal/tools/graph_authoring.go`、`graph_schema.go`、`graph_routes.go` 的受控图接口。
+- L5：`internal/graph`、`internal/delivery`；`internal/bootstrap/dataflow_runtime.go`、`dataflow_evidence.go`、`task_outcome.go`；`internal/scheduler/activator.go`、`scheduler.go` 的图编排入口；`internal/tools/graph_authoring.go`、`graph_schema.go` 的受控图接口。
 - 组装与观察：`internal/bootstrap/bootstrap.go`、`runtime_builder.go` 注入依赖；`internal/ui/model_output.go`、`internal/dashboard/server.go`、`internal/tui/app.go` 只消费 L2 输出；`internal/trace` 保持跨层审计。
+
+## agentTask 数据流图（当前 L5）
+
+只有 agentTask；调查、修改、检查都是普通任务。GraphDefinition.nodes 是实例列表，inputs 声明数据依赖，无 root/next/when/end。多输入齐备才创建一次 Activation/Task；完成结果冻结为 ResultRef。更新只能修改未激活节点，返工追加新实例；同一 revision 无环，图可持续增长。
+
+Scheduler 在图外处理持久化规划事件。无新事实时不重复调用模型；尚未规划的后续不是失败，也不假成功。图级 complete 在确定结果、在途结算及必要交付后才写终态。Proposal Acceptance、控制节点和旧控制命令 outbox 已删除。
+
+候选通过输入引用决定工作区，不由节点名称或角色决定。workspace/dataflow.go 提供完整输入视图、Shell 差异回收、不可变候选与主根冲突检查；delivery/store.go 记录图级提交，Effect 保留副作用是否确认的事实。
+
+| 责任 | 实际实现 |
+|---|---|
+| 定义、结果 schema、DAG 与旧字段拒绝 | graph/dataflow_contract.go、dataflow_schema.go |
+| 输入解析、候选选择、冻结副本 | graph/dataflow_inputs.go |
+| 创建、增量 CAS、就绪和唯一派发 | graph/dataflow_runtime.go |
+| 终态事实、图完成、取消、规划回执 | graph/dataflow_terminal.go |
+| 摘要链持久化和恢复 | graph/dataflow_store.go |
+| 公告板接线、图外规划、交付调用 | bootstrap/dataflow_runtime.go |
+| TaskOutcome、恢复与 UI 投影 | bootstrap/task_outcome.go、dataflow_recovery.go、ui_graph.go |
+
+定义、执行、输入、请求回执和完成意图共用新图日志，不增加独立影子 authoring/completion 账本。历史控制图不迁移为可执行数据流图。

@@ -58,10 +58,7 @@ func TestProcessTaskContinuesWithoutObservationOrDefaultProgressLimit(t *testing
 	if calls != 12 || got.Status != model.TaskStatusCompleted || got.RetryCount != 0 {
 		t.Fatalf("旧阈值仍中止调查：calls=%d status=%s error=%s", calls, got.Status, got.Error)
 	}
-	commands, err := ledger.PendingInterventions()
-	if err != nil || len(commands) != 0 {
-		t.Fatalf("不应产生机械恢复请求：%v %v", commands, err)
-	}
+
 	checkpoint, ok, err := ledger.LoadCheckpoint(task.ID)
 	if err != nil || !ok || checkpoint.CumulativeUsage.ModelCalls != 12 {
 		t.Fatalf("必须保留逐轮真实调用记账：%+v %v", checkpoint, err)

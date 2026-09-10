@@ -1,3 +1,4 @@
+// Package delivery 记录图级文件提交，不参与任务种类或验收决策。
 package delivery
 
 import (
@@ -13,228 +14,176 @@ import (
 	"time"
 )
 
-// Store 以每个 Delivery 一份原子 JSON 文件持久化 Transaction。它不重放
-// workspace 副作用；只记录候选、验收与 promotion 的确定状态。
-type Store struct {
-	dir string
-	mu  sync.Mutex
+const SchemaCurrent = "agentgo.delivery/v2"
+
+type CommitRecord struct {
+	Schema        string    `json:"schema"`
+	ID            string    `json:"delivery_id"`
+	RunID         string    `json:"run_id"`
+	GraphID       string    `json:"graph_id"`
+	CompletionRef string    `json:"completion_ref"`
+	CandidateRef  string    `json:"candidate_ref"`
+	EffectRef     string    `json:"effect_ref"`
+	Status        string    `json:"status"`
+	Error         string    `json:"error,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
-func NewStore(dir string) (*Store, error) {
-	if strings.TrimSpace(dir) == "" {
-		return nil, fmt.Errorf("DeliveryStore 目录不能为空")
+func (c CommitRecord) Validate() error {
+	if c.Schema != SchemaCurrent {
+		return fmt.Errorf("旧 Delivery 契约不受支持")
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
-	}
-	return &Store{dir: dir}, nil
-}
-
-func (s *Store) EnsureOpen(tx Transaction) (Transaction, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if existing, ok, err := s.getLocked(tx.ID); err != nil {
-		return Transaction{}, err
-	} else if ok {
-		if existing.RunID != tx.RunID || existing.GraphID != tx.GraphID ||
-			existing.ProducerActivationID != tx.ProducerActivationID {
-			return Transaction{}, fmt.Errorf("Delivery %s identity 冲突", tx.ID)
+	for _, s := range []string{c.ID, c.RunID, c.GraphID, c.CompletionRef, c.CandidateRef, c.EffectRef} {
+		if strings.TrimSpace(s) == "" {
+			return fmt.Errorf("交付身份缺失")
 		}
-		return existing, nil
 	}
-	if tx.Schema == "" {
-		tx.Schema = SchemaV1
+	if c.Status != "prepared" && c.Status != "committed" && c.Status != "unknown" {
+		return fmt.Errorf("非法交付状态")
 	}
-	if tx.Status == "" {
-		tx.Status = StatusOpen
-	}
-	if tx.UpdatedAt.IsZero() {
-		tx.UpdatedAt = time.Now().UTC()
-	}
-	if err := tx.Validate(); err != nil {
-		return Transaction{}, err
-	}
-	return tx, s.writeLocked(tx)
-}
-
-func (s *Store) Get(id string) (Transaction, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.getLocked(id)
-}
-
-func (s *Store) PrepareCandidate(id string, candidate Candidate, fulfillmentRef string,
-	evidenceRefs []string, producerOutcomeRef string, now time.Time,
-) (Transaction, error) {
-	return s.update(id, func(tx Transaction) (Transaction, error) {
-		if tx.Status == StatusPrepared && tx.Candidate != nil && tx.Candidate.Ref == candidate.Ref {
-			return tx, nil
-		}
-		var err error
-		switch tx.Status {
-		case StatusOpen, StatusRepairing:
-			tx.Candidate = &candidate
-			tx.FulfillmentRef = fulfillmentRef
-			tx.EvidenceRefs = append([]string(nil), evidenceRefs...)
-			tx.ProducerOutcomeRef = producerOutcomeRef
-			tx, err = tx.Transition(StatusPrepared, now)
-		default:
-			return Transaction{}, fmt.Errorf("Delivery %s status=%s 不能冻结 candidate", id, tx.Status)
-		}
-		return tx, err
-	})
-}
-
-func (s *Store) BeginVerification(id string, now time.Time) (Transaction, error) {
-	return s.transition(id, StatusVerifying, now, nil)
-}
-
-func (s *Store) BeginRepair(id string, now time.Time) (Transaction, error) {
-	return s.transition(id, StatusRepairing, now, nil)
-}
-
-func (s *Store) PrepareCommit(id, acceptanceOutcomeRef, intentRef string, now time.Time) (Transaction, error) {
-	return s.transition(id, StatusCommitPrepared, now, func(tx *Transaction) {
-		tx.AcceptanceOutcomeRef = acceptanceOutcomeRef
-		tx.CommitIntentRef = intentRef
-	})
-}
-
-func (s *Store) Commit(id, effectRef, revisionRef string, now time.Time) (Transaction, error) {
-	return s.transition(id, StatusCommitted, now, func(tx *Transaction) {
-		tx.CommitEffectRef = effectRef
-		tx.CommittedRevisionRef = revisionRef
-	})
-}
-
-func (s *Store) CommitUnknown(id, effectRef string, now time.Time) (Transaction, error) {
-	return s.transition(id, StatusCommitUnknown, now, func(tx *Transaction) {
-		tx.CommitEffectRef = effectRef
-	})
-}
-
-func (s *Store) Quarantine(id, reason string, now time.Time) (Transaction, error) {
-	return s.transition(id, StatusQuarantined, now, func(tx *Transaction) {
-		tx.QuarantineReason = strings.TrimSpace(reason)
-	})
-}
-
-func (s *Store) transition(id string, to Status, now time.Time, mutate func(*Transaction)) (Transaction, error) {
-	return s.update(id, func(tx Transaction) (Transaction, error) {
-		if tx.Status == to {
-			return tx, nil
-		}
-		if mutate != nil {
-			mutate(&tx)
-		}
-		return tx.Transition(to, now)
-	})
-}
-
-func (s *Store) update(id string, fn func(Transaction) (Transaction, error)) (Transaction, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	tx, ok, err := s.getLocked(id)
-	if err != nil {
-		return Transaction{}, err
-	}
-	if !ok {
-		return Transaction{}, fmt.Errorf("Delivery %s 不存在", id)
-	}
-	next, err := fn(tx)
-	if err != nil {
-		return Transaction{}, err
-	}
-	if err := next.Validate(); err != nil {
-		return Transaction{}, err
-	}
-	return next, s.writeLocked(next)
-}
-
-func (s *Store) List() ([]Transaction, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	entries, err := os.ReadDir(s.dir)
-	if err != nil {
-		return nil, err
-	}
-	var out []Transaction
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(s.dir, entry.Name()))
-		if err != nil {
-			return nil, err
-		}
-		var tx Transaction
-		if err := json.Unmarshal(data, &tx); err != nil {
-			return nil, err
-		}
-		if err := tx.Validate(); err != nil {
-			return nil, err
-		}
-		out = append(out, tx)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out, nil
-}
-
-func (s *Store) getLocked(id string) (Transaction, bool, error) {
-	if strings.TrimSpace(id) == "" {
-		return Transaction{}, false, fmt.Errorf("Delivery ID 不能为空")
-	}
-	data, err := os.ReadFile(s.path(id))
-	if os.IsNotExist(err) {
-		return Transaction{}, false, nil
-	}
-	if err != nil {
-		return Transaction{}, false, err
-	}
-	var tx Transaction
-	if err := json.Unmarshal(data, &tx); err != nil {
-		return Transaction{}, false, err
-	}
-	if tx.ID != id {
-		return Transaction{}, false, fmt.Errorf("Delivery 文件 identity 不一致")
-	}
-	if err := tx.Validate(); err != nil {
-		return Transaction{}, false, err
-	}
-	return tx, true, nil
-}
-
-func (s *Store) writeLocked(tx Transaction) error {
-	encoded, err := json.MarshalIndent(tx, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(s.dir, ".delivery-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	cleanup := func() { _ = tmp.Close(); _ = os.Remove(tmpPath) }
-	if _, err = tmp.Write(encoded); err == nil {
-		err = tmp.Sync()
-	}
-	closeErr := tmp.Close()
-	if err != nil {
-		cleanup()
-		return err
-	}
-	if closeErr != nil {
-		_ = os.Remove(tmpPath)
-		return closeErr
-	}
-	if err := os.Rename(tmpPath, s.path(tx.ID)); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
+	if c.UpdatedAt.IsZero() {
+		return fmt.Errorf("交付时间缺失")
 	}
 	return nil
 }
 
+type Store struct {
+	mu  sync.Mutex
+	dir string
+}
+
+func NewStore(dir string) (*Store, error) {
+	if dir == "" {
+		return nil, fmt.Errorf("交付目录为空")
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, err
+	}
+	s := &Store{dir: dir}
+	if _, err := s.List(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
 func (s *Store) path(id string) string {
 	sum := sha256.Sum256([]byte(id))
 	return filepath.Join(s.dir, hex.EncodeToString(sum[:])+".json")
+}
+func (s *Store) get(id string) (CommitRecord, bool, error) {
+	var value CommitRecord
+	data, err := os.ReadFile(s.path(id))
+	if os.IsNotExist(err) {
+		return value, false, nil
+	}
+	if err != nil {
+		return value, false, err
+	}
+	if err = json.Unmarshal(data, &value); err != nil {
+		return value, false, err
+	}
+	if err = value.Validate(); err != nil {
+		return value, false, err
+	}
+	if value.ID != id {
+		return value, false, fmt.Errorf("交付文件身份不符")
+	}
+	return value, true, nil
+}
+func (s *Store) Get(id string) (CommitRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.get(id)
+}
+func (s *Store) Prepare(value CommitRecord) (CommitRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if old, ok, err := s.get(value.ID); err != nil {
+		return old, err
+	} else if ok {
+		if old.CandidateRef != value.CandidateRef || old.CompletionRef != value.CompletionRef || old.GraphID != value.GraphID || old.RunID != value.RunID || old.EffectRef != value.EffectRef {
+			return old, fmt.Errorf("交付身份冲突")
+		}
+		return old, nil
+	}
+	value.Schema = SchemaCurrent
+	value.Status = "prepared"
+	value.UpdatedAt = time.Now().UTC()
+	return value, s.write(value)
+}
+func (s *Store) Finish(id string, success bool, reason string) (CommitRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok, err := s.get(id)
+	if err != nil || !ok {
+		return value, fmt.Errorf("没有交付意图: %v", err)
+	}
+	status := "unknown"
+	if success {
+		status = "committed"
+	}
+	if value.Status == status {
+		return value, nil
+	}
+	if value.Status != "prepared" {
+		return value, fmt.Errorf("已结算交付不可改写")
+	}
+	value.Status = status
+	value.Error = reason
+	value.UpdatedAt = time.Now().UTC()
+	return value, s.write(value)
+}
+func (s *Store) write(value CommitRecord) error {
+	if err := value.Validate(); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(s.dir, ".delivery-")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	_, err = f.Write(raw)
+	if err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(tmp, s.path(value.ID))
+}
+func (s *Store) List() ([]CommitRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	paths, err := filepath.Glob(filepath.Join(s.dir, "*.json"))
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(paths)
+	var out []CommitRecord
+	for _, p := range paths {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			return nil, err
+		}
+		var value CommitRecord
+		if err = json.Unmarshal(raw, &value); err != nil {
+			return nil, err
+		}
+		if err = value.Validate(); err != nil {
+			return nil, err
+		}
+		if s.path(value.ID) != p {
+			return nil, fmt.Errorf("交付文件身份不符")
+		}
+		out = append(out, value)
+	}
+	return out, nil
 }

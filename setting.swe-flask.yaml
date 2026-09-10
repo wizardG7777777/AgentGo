@@ -1,3 +1,6 @@
+graph:
+  request_contract: agentgo.graph/v6
+
 # AgentGo SWE 评测专用配置（v4 schema）
 #
 # 用途：以 Flask 真实仓库为对象的中等项目行为评测（SWE 式红→绿任务）。

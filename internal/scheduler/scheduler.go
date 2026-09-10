@@ -50,14 +50,14 @@ const schedulerPromptVersion = "embedded:v11-unified-graph-tools"
 func SystemPrompt() string { return schedulerCorePrompt }
 
 const schedulerCorePrompt = `
-你是 AgentGo 的 Scheduler，负责组织图中的工作和向用户交付结果。
-新请求使用 apply_graph_change(operation=create) 提交完整图定义与交付契约；工具内部校验并提交，失败时根据拒绝理由修改请求。创建成功后使用 control_graph(action=start) 启动。
-运行中收到反馈，先检视实际节点状态并读取图定义，再用 apply_graph_change(operation=update) 修改。expected_revision 来自读取结果；in_flight=preserve 表示当前执行保留原定义，修改只作用于未来执行。不得改写已完成事实。
-读取定义使用 read_graph_definition；运行概览、节点记录和证据分别使用 inspect_board、inspect_node、read_evidence。发送消息仅传递信息，不派发任务、不唤醒代理。
-模型无需创建草案、单独验证或单独提交，也无需填写 Observation 报告。先说明决策，再执行工具；工具返回后根据事实决定下一步。不存在按轮数强制切换工具的流程。
-图节点承担实际工作。节点定义要写明任务目标、输入输出、验收标准及成功/失败/阻塞路径；正常节点结果由运行时沿边交付。工具 schema 和实际回执是权威，不编造图 ID、版本、任务或证据。
-topo_mode=solo 时 Scheduler 是唯一执行资源：业务节点使用 kind=agent、metadata.route=__scheduler__，明确声明所需业务工具；controller 仍只负责编排。不得调用 legacy publish_task 绕过图。
-图启动不等于请求完成。图结束后依据实际交付和节点结果形成最终答复，使用当前结果提交工具完成收口。
+你是图外 Scheduler，依据用户目标维护一张不断完善的数据流图。唯一节点类型是 agentTask：执行确定任务，交付确定结果。没有 controller/router/join/acceptance/end，没有 root、next、when 或回边。
+先 read_graph_definition() 获取真实 route_ref 与工具目录，不要把 worker-1 等 Agent 名称当路由。默认工作队列为 default。无需模型审批或 Observation 报告。
+新请求 apply_graph_change(operation=create,request_id,definition={objective,nodes:[...]})，可以只有一个调查节点。节点含 node_id,kind=agentTask,title,objective,execution={route_ref,tools},result_schema={type:object,properties:{summary:{type:string}},required:[summary]}。不要捏造未来步骤或填写旧 contract。
+create 返回 graph_id/revision 后 control_graph(action=start,request_id,graph_id,expected_revision)。启动后让 Agent 执行，当前规划任务结束。
+收到 dataflow-state 事实时，在同一 graph_id 上 update/add 新实例。输入写为 inputs={槽名:{kind:node_result,node_id:来源实例}}；多个上游用不同槽。检查或返工必须引用原候选来源，不要检查旧主根。多个候选时 workspace_input 指定基线槽。
+迭代通过新增 node_id，不重开或改写已执行任务。没有可执行后续时可以等待新信息；追加工作后 submit_task_result 结束本次规划，不在自己的调用中等待子任务。
+任务结果和候选是真实引用。用户目标完成后读取图结果，control_graph(action=complete,request_id,graph_id,expected_revision,outcome=success,summary,result_refs:[真实引用])；此步骤才提交代码并结束图，不需要特殊验收节点。失败历史如已被新实例替代，dispositions 写明处置。不能忽略在途工作。
+需要业务复核时添加普通 agentTask；复核结论是普通结果。图已终态时仅根据完成回执向用户提交最终答复，不再扩图。send_message 只传信息，不调度。
 `
 
 func schedulerPromptForPhase(phase string) string {
@@ -113,9 +113,8 @@ type Bundle struct {
 // GraphAuthoringDeps 是新 root Scheduler 的事务化 Graph authoring 装配。
 // 采用可选尾参数保持 legacy/精简测试构造兼容；生产 Bootstrap 必须注入。
 type GraphAuthoringDeps struct {
-	Store    *graph.AuthoringStore
-	Runtime  *graph.AuthoringRuntime
-	Compiler graph.DefinitionCompiler
+	Store   *graph.DataflowStore
+	Runtime *graph.DataflowRuntime
 	// ContextRuntime 与 authoring 同为生产必需的 Scheduler runtime authority；
 	// 放在可选尾依赖中保持精简测试构造兼容。
 	ContextRuntime          contextruntime.Runtime
@@ -156,13 +155,13 @@ func New(
 	userOutput io.Writer,
 	resultOutput io.Writer,
 	modeStore *modes.Store,
-	graphRuntime *graph.Runtime,
-	graphStore *graph.Store,
+	graphRuntime *graph.DataflowRuntime,
+	graphStore *graph.DataflowStore,
 	// effectJournal 是 V6 §4 H2b 共享副作用账本（internal/effect）：
 	// scheduler 的写工具 / run_shell / send_message 经它记录
 	// prepared/settled。nil 时不记账（单测直构场景）。
 	effectJournal *effect.Journal,
-	graphAuthoring ...GraphAuthoringDeps,
+	authoring GraphAuthoringDeps,
 ) *Bundle {
 	schedID := "scheduler-" + uuid.New().String()[:8]
 	// modeStore 为 nil 时回落两轴默认值（normal/team）——
@@ -217,17 +216,16 @@ func New(
 	}
 	// 终态契约 v2 提交期出路检查器：graphRuntime 为 nil（单测直构）时不注入，
 	// 避免把类型化 nil 包进接口后判空失效。
-	var outletChecker tools.OutletChecker
-
-	var authoring GraphAuthoringDeps
-	if len(graphAuthoring) > 0 {
-		authoring = graphAuthoring[0]
+	var resultValidator tools.ResultValidator
+	if graphRuntime != nil {
+		resultValidator = graphRuntime
 	}
+
 	historyView, _ := s.(interface {
 		GetToolCallHistory(string) []store.ToolCallRecord
 	})
 	groups := []tools.ToolGroup{
-		tools.InspectionGroup{Tasks: s, Graphs: graphStore, Definitions: authoring.Store, Content: authoring.ContextRuntime.Content, History: historyView, Holder: holder, SessionID: interactionSessionID},
+		tools.InspectionGroup{Tasks: s, Graphs: graphStore, Content: authoring.ContextRuntime.Content, History: historyView, Holder: holder, SessionID: interactionSessionID},
 		readGroup,
 		tools.EvidenceGroup{
 			Graphs:       graphStore,
@@ -270,7 +268,8 @@ func New(
 			AgentID:              schedID,
 			FinalizationNotifier: holder,
 			SubmitState:          submitState,
-			OutletChecker:        outletChecker,
+			ResultValidator:      resultValidator,
+			Planning:             graphRuntime,
 
 			ProjectRoot: cfg.ProjectRoot,
 		},
@@ -280,8 +279,8 @@ func New(
 		},
 	}
 	groups = append(groups, tools.GraphAuthoringGroup{
-		Store: authoring.Store, Compiler: authoring.Compiler, Runtime: authoring.Runtime,
-		TaskStore: s, Holder: holder, SessionID: interactionSessionID, RouteValidator: agentRegistry, Finalization: holder,
+		Store: authoring.Store, Runtime: authoring.Runtime,
+		TaskStore: s, Holder: holder, SessionID: interactionSessionID, ExecutionCatalog: agentRegistry.ExecutionCatalog, Finalization: holder,
 	})
 
 	tools.RegisterGroups(toolReg, groups...)

@@ -28,23 +28,37 @@ func (g EvidenceGroup) readGraphEvidence(task *model.Task, graphID, ref string, 
 	if bound != "" && graphID != bound {
 		return "", fmt.Errorf("证据图超出当前任务范围")
 	}
-	doc, ok := g.Graphs.Get(graphID)
+	doc, ok, getErr := g.Graphs.Get(graphID)
+	if getErr != nil {
+		return "", getErr
+	}
 	if !ok {
 		return "", fmt.Errorf("证据所属图不存在")
 	}
-	if task.RunID == "" || doc.RunID != task.RunID {
+	if task.RunID == "" || doc.Definition.RunID != string(task.RunID) {
 		return "", fmt.Errorf("证据不属于当前 Run")
 	}
-	if g.SessionID != nil && doc.SessionID != g.SessionID() {
+	if g.SessionID != nil && doc.Definition.SessionID != g.SessionID() {
 		return "", fmt.Errorf("证据不属于当前 Session")
 	}
 	var value any
-	if result, ok := g.Graphs.ResolveActivationResult(graphID, ref); ok {
-		value = map[string]any{"graph_id": graphID, "kind": "activation_result", "value": result}
-	} else if evidence, node, activation, ok := g.Graphs.ResolveEvidence(graphID, ref); ok {
-		value = map[string]any{"graph_id": graphID, "node_id": node, "activation_id": activation, "kind": "execution_evidence", "value": evidence}
-	} else {
-		return "", fmt.Errorf("未找到该图中的 ResultRef 或 EvidenceRef")
+	for _, result := range doc.Results {
+		if result.Ref == ref {
+			value = result
+			break
+		}
+		for _, e := range result.Evidence {
+			if e.Ref == ref {
+				value = e
+				break
+			}
+		}
+		if value != nil {
+			break
+		}
+	}
+	if value == nil {
+		return "", fmt.Errorf("当前图没有该结果或证据引用")
 	}
 	raw, err := json.Marshal(value)
 	if err != nil {

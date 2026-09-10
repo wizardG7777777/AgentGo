@@ -7,7 +7,7 @@ import (
 )
 
 func TestClassifyControlScopeFinalReportIsStructural(t *testing.T) {
-	task := &Task{EventType: "__scheduler__", EventSource: "graph-ended",
+	task := &Task{EventType: "__scheduler__", EventSource: "dataflow-planning",
 		RunPhase: runcontract.PhaseFinalization, FinalReportGraphID: "g-1"}
 	if scope, err := ClassifyControlScope(task); err != nil || scope != ControlScopeFinalReport {
 		t.Fatalf("final-report scope=%s err=%v", scope, err)
@@ -18,10 +18,10 @@ func TestClassifyControlScopeFinalReportIsStructural(t *testing.T) {
 	}
 }
 
-func TestClassifyControlScopeGraphChangeIsStructural(t *testing.T) {
-	task := &Task{EventType: "__scheduler__", EventSource: TaskEventSourceGraphChange,
+func TestClassifyControlScopePlanningIsStructural(t *testing.T) {
+	task := &Task{EventType: "__scheduler__", EventSource: "dataflow-planning",
 		RunPhase: runcontract.PhaseRecovery, InterventionGraphID: "g-1"}
-	if scope, err := ClassifyControlScope(task); err != nil || scope != ControlScopeGraphChange {
+	if scope, err := ClassifyControlScope(task); err != nil || scope != ControlScopePlanning {
 		t.Fatalf("graph-change scope=%s err=%v", scope, err)
 	}
 	task.EventSource = "user-text"

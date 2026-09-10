@@ -31,7 +31,11 @@ func (v *View) prepareShellRoot() (string, error) {
 			return "", fmt.Errorf("创建 shell snapshot 临时目录: %w", err)
 		}
 		cleanup := func() { _ = removeTree(tmp) }
-		if err := copyProjectTree(v.mgr.projectRoot, tmp); err != nil {
+		baseRoot := v.mgr.projectRoot
+		if v.baseRoot != "" {
+			baseRoot = v.baseRoot
+		}
+		if err := copyProjectTree(baseRoot, tmp); err != nil {
 			cleanup()
 			return "", fmt.Errorf("物化 shell 项目快照: %w", err)
 		}

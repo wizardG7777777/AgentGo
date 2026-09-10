@@ -331,18 +331,7 @@ func nodeWorkbenchParts(
 // 全部为空时返回空串（调用方不渲染空行）。
 func waitLine(node GraphNodeInfo) string {
 	parts := make([]string, 0, 4)
-	if node.WaitEvent != "" {
-		parts = append(parts, "waiting for "+node.WaitEvent)
-	}
-	if node.RequestID != "" {
-		parts = append(parts, "approval "+node.RequestID)
-	}
-	if node.ChildGraphID != "" {
-		parts = append(parts, "subgraph "+node.ChildGraphID)
-	}
-	if node.WaitDeadline != nil {
-		parts = append(parts, "deadline "+node.WaitDeadline.Format("15:04:05"))
-	}
+
 	return strings.Join(parts, " · ")
 }
 
@@ -354,18 +343,7 @@ func nodeContextLine(node GraphNodeInfo) string {
 	if node.TaskID != "" {
 		parts = append(parts, "task "+shortID(node.TaskID))
 	}
-	if node.WaitEvent != "" {
-		parts = append(parts, "waiting for "+node.WaitEvent)
-	}
-	if node.RequestID != "" {
-		parts = append(parts, "approval "+node.RequestID)
-	}
-	if node.ChildGraphID != "" {
-		parts = append(parts, "subgraph "+node.ChildGraphID)
-	}
-	if node.WaitDeadline != nil {
-		parts = append(parts, "deadline "+node.WaitDeadline.Format("15:04:05"))
-	}
+
 	if len(parts) == 0 {
 		parts = append(parts, "no executor assigned")
 	}

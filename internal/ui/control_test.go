@@ -310,21 +310,17 @@ func TestController_RequestQuit(t *testing.T) {
 	NewHub(Deps{}).RequestQuit()
 }
 
-func TestController_EmitGraphEvent(t *testing.T) {
-	var gotGraph, gotEvent string
-	var gotData map[string]any
-	h := NewHub(Deps{EmitGraphEvent: func(graphID, event string, data map[string]any) error {
-		gotGraph, gotEvent, gotData = graphID, event, data
-		return nil
-	}})
-	if err := h.EmitGraphEvent("g-1", "deploy.done", map[string]any{"ok": true}); err != nil {
-		t.Fatalf("err = %v", err)
+func TestController_ProvideGraphInput(t *testing.T) {
+	var got GraphInputRequest
+	h := NewHub(Deps{ProvideGraphInput: func(_ context.Context, input GraphInputRequest) error { got = input; return nil }})
+	input := GraphInputRequest{GraphID: "g-1", Port: "answer", Version: 1, ExpectedRevision: 1, RequestID: "req-1", Value: map[string]any{"ok": true}}
+	if err := h.ProvideGraphInput(context.Background(), input); err != nil {
+		t.Fatal(err)
 	}
-	if gotGraph != "g-1" || gotEvent != "deploy.done" || gotData["ok"] != true {
-		t.Fatalf("委托入参错误: %q %q %v", gotGraph, gotEvent, gotData)
+	if got.GraphID != "g-1" || got.Version != 1 || got.RequestID != "req-1" {
+		t.Fatal("版本化输入委托丢失")
 	}
-	// 未装配返回 ErrNotAssembled。
-	if err := NewHub(Deps{}).EmitGraphEvent("g-1", "e", nil); !errors.Is(err, ErrNotAssembled) {
-		t.Fatalf("err = %v，期望 ErrNotAssembled", err)
+	if err := NewHub(Deps{}).ProvideGraphInput(context.Background(), input); !errors.Is(err, ErrNotAssembled) {
+		t.Fatal(err)
 	}
 }

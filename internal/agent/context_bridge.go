@@ -72,15 +72,10 @@ func renderOutputContract(task *model.Task, controlTools []string) string {
 	}
 	switch {
 	case has("submit_task_result"):
-		if task != nil && task.GraphNodeKind == "acceptance" {
-			return "任务收尾须经 submit_task_result 提交结构化结果；completed 验收结论仅用 verdict=pass|fixable|failed 与 cited_evidence，证据不足用 status=blocked；禁止 event"
-		}
 		if task != nil && task.GraphID != "" {
-			return "任务收尾须经 submit_task_result 提交结构化结果（status/summary）；业务路由字段只放入 result JSON object，禁止 event；阻塞必须给 blocked_reason"
+			return "任务收尾须经 submit_task_result 提交结构化结果（status/summary）；唯一业务结果放入 result JSON object；阻塞必须给 blocked_reason"
 		}
 		return "任务收尾须经 submit_task_result 提交结构化结果（status/summary/result；阻塞必须给 blocked_reason）"
-	case has("report_done"):
-		return "任务收尾可经 report_done 显式汇报；自然文本回复即最终答案"
 	default:
 		return "自然文本回复即最终答案"
 	}

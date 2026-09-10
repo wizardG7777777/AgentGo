@@ -113,7 +113,9 @@ func TestMain_ExplicitConfigValid_ShouldStartAndExitOnEOF(t *testing.T) {
 	}
 	// Scheduler 与内置模板需要全局模型；静态 Agent 仍要声明完整运行参数。
 	cfgPath := filepath.Join(tmpDir, "setting.yaml")
-	cfg := []byte(`llm:
+	cfg := []byte(`graph:
+  request_contract: agentgo.graph/v6
+llm:
   request_contract: agentgo.model-request/v1
   default_model: gpt-test
 agents:
@@ -140,7 +142,7 @@ startup_probe: "off"
 	}
 	// V6 Graph 运行桥接（C5a）装配冒烟：图持久化目录（与 artifacts 同基
 	// .agentgo/state/graphs）应真实创建。
-	if fi, err := os.Stat(filepath.Join(tmpDir, ".agentgo", "state", "graphs-v5")); err != nil || !fi.IsDir() {
+	if fi, err := os.Stat(filepath.Join(tmpDir, ".agentgo", "state", "graphs-v6")); err != nil || !fi.IsDir() {
 		t.Fatalf("graph 持久化目录应在 project_root 下创建: err=%v", err)
 	}
 	// 2026-08 二期空会话丢弃冒烟：本次运行未提交任何用户输入，Session 是空
@@ -160,7 +162,9 @@ startup_probe: "off"
 func TestMain_LLMOnlyConfigStartsSchedulerWithoutStaticAgents(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfgPath := filepath.Join(tmpDir, "setting.yaml")
-	cfg := []byte(`llm:
+	cfg := []byte(`graph:
+  request_contract: agentgo.graph/v6
+llm:
   request_contract: agentgo.model-request/v1
   default_model: gpt-test
 startup_probe: "off"

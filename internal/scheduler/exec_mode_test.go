@@ -32,7 +32,7 @@ func newExecModeTestBundle(t *testing.T, modeStore *modes.Store, projectRoot str
 	bundle := newTestScheduler(t, s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
 		nil, nil, nil, nil, nil, modeStore, nil, nil, nil)
 
-	task := &model.Task{Description: "exec 模式装配测试任务", EventType: "__scheduler__", GraphID: "g-execution", GraphNodeKind: "agent"}
+	task := &model.Task{Description: "exec 模式装配测试任务", EventType: "__scheduler__", GraphID: "g-execution", }
 	if err := s.PublishTask(task); err != nil {
 		t.Fatalf("发布 scheduler 任务失败: %v", err)
 	}

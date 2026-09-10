@@ -23,7 +23,6 @@ const (
 	CheckpointSchemaV1       = "agentgo.progress-checkpoint/v1"
 	ReservationSchemaV1      = "agentgo.action-reservation/v1"
 	ActionSettlementSchemaV1 = "agentgo.action-settlement/v1"
-	InterventionSchemaV1     = "agentgo.loop-intervention/v1"
 )
 
 // RunBudgetRefRunIDV1 表示执行时必须用 Task.RunID 解引用共享 RunBudgetStore。
@@ -412,46 +411,6 @@ type ActionSettlement struct {
 	ResultDigest  string                  `json:"result_digest"`
 	Usage         runcontract.BudgetUsage `json:"usage"`
 	SettledAt     time.Time               `json:"settled_at"`
-}
-
-type InterventionReason string
-
-const (
-	InterventionNoProgressBudget   InterventionReason = "no_progress_budget_exhausted"
-	InterventionNoProgressStalled  InterventionReason = "no_progress_intervention_required"
-	InterventionAttemptDeadline    InterventionReason = "attempt_deadline_reached"
-	InterventionActivationDeadline InterventionReason = "activation_deadline_imminent"
-	InterventionOscillation        InterventionReason = "oscillation_detected"
-	InterventionUnsafeUnknown      InterventionReason = "unsafe_unknown"
-	InterventionCheckpointFailure  InterventionReason = "checkpoint_unavailable"
-	InterventionObservationStalled InterventionReason = "observation_state_stalled"
-	InterventionDecisionStalled    InterventionReason = "decision_progress_stalled"
-	InterventionCandidateHandoff   InterventionReason = "candidate_completion_handoff"
-	InterventionControlUnstable    InterventionReason = "control_contract_unstable"
-	InterventionAttemptBudget      InterventionReason = "attempt_budget_exhausted"
-)
-
-// LoopInterventionRequested 是 L4 交给 L5 的 durable、有类型控制命令。
-type LoopInterventionRequested struct {
-	Schema              string                  `json:"schema"`
-	CommandID           string                  `json:"command_id"`
-	SessionID           string                  `json:"session_id,omitempty"`
-	RunID               runcontract.RunID       `json:"run_id"`
-	GraphID             string                  `json:"graph_id,omitempty"`
-	FinalReportGraphID  string                  `json:"final_report_graph_id,omitempty"`
-	NodeID              string                  `json:"node_id,omitempty"`
-	ActivationID        string                  `json:"activation_id,omitempty"`
-	TaskID              string                  `json:"task_id"`
-	AttemptID           string                  `json:"attempt_id"`
-	Contract            ProgressContractRef     `json:"contract"`
-	ReasonCode          InterventionReason      `json:"reason_code"`
-	MissingMilestones   []string                `json:"missing_milestones,omitempty"`
-	RepeatedSignals     []ProgressFingerprint   `json:"repeated_signals,omitempty"`
-	BudgetUsed          runcontract.BudgetUsage `json:"budget_used"`
-	BudgetRemaining     runcontract.BudgetLimit `json:"budget_remaining"`
-	CheckpointRef       string                  `json:"checkpoint_ref"`
-	ObservationDeltaRef string                  `json:"observation_delta_ref,omitempty"`
-	RequestedAt         time.Time               `json:"requested_at"`
 }
 
 // FreezeInvocationFailure 复制一次 canonical InvocationFailure 并清空只供

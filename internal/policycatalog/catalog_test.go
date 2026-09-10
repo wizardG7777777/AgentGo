@@ -7,12 +7,10 @@ import (
 	"testing"
 
 	"agentgo/internal/contextcontract"
-	"agentgo/internal/graph"
 	"agentgo/internal/llm"
 	"agentgo/internal/loopcontract"
 )
 
-var _ graph.DefinitionPolicyResolver = (*Catalog)(nil)
 
 func TestDefaultCatalogValidAndResolvesGraphPolicies(t *testing.T) {
 	catalog, err := NewDefault()

@@ -216,6 +216,8 @@ func TestDoctor_LoadValidateDoctorEndToEnd(t *testing.T) {
 	promptPath := writePromptFile(t, dir, "worker.md", "使用 read_file 和 apply_change")
 	yamlPath := filepath.Join(dir, "setting.yaml")
 	yamlContent := `
+graph:
+  request_contract: agentgo.graph/v6
 llm:
   request_contract: agentgo.model-request/v1
   default_model: test-model
@@ -264,6 +266,8 @@ func TestDoctorCLI_ExitCodes(t *testing.T) {
 	writeYAML := func(path, promptRef string) {
 		t.Helper()
 		content := `
+graph:
+  request_contract: agentgo.graph/v6
 llm:
   request_contract: agentgo.model-request/v1
   default_model: test-model

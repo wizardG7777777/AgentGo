@@ -1,3 +1,6 @@
+graph:
+  request_contract: agentgo.graph/v6
+
 # AgentGo v5 配置文件示例
 # 将此文件复制为 config.yaml（或任意路径，通过 -config 指定）并按需修改。
 #
@@ -146,8 +149,8 @@ agents:
     system_prompt_file: prompts/program_verifier.md
     task_max_retries: 2
     description: |
-      正式验收代理（Graph acceptance 节点 runner）。读取交付物、消费上游
-      Result/Evidence，并通过 submit_task_result.verdict 提交 pass/fixable/failed；
+      普通检查代理（agentTask）。读取交付物、消费上游
+      Result/Evidence，并通过 submit_task_result 的 result 对象提交检查结论；
       completed 结果省略 event，证据不足时提交 status=blocked；
       需要 CLI/Shell 的检查由普通 checker agent 执行后经图数据流传入。
 
@@ -243,7 +246,7 @@ session_snapshot_interval_sec: 30 # 运行期完整快照间隔，限制崩溃�
 # 动态 DAG 的 Reactor 示例见 reactors.program-verify.yaml：Task 终态已有内置唤醒，
 # 示例用非终态的重试压力提交 request_replan，由 Scheduler 决定是否调整图。
 # 本示例预热了 acceptance.verify；省略它时 Scheduler 可按需 provision builtin/verifier@1。
-# 自定义验收 Agent 或模板必须显式加入 submit_task_result（经 verdict 提交结论）。
+# 自定义验收 Agent 或模板必须显式加入 submit_task_result（提交普通结构化结果）。
 # ============================================================
 # reactors_file: reactors.yaml
 

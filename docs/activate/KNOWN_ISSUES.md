@@ -1,18 +1,24 @@
 # KNOWN_ISSUES — 当前限制与验证缺口
 
-最后核对：2026-09-09。工具重建的删除对账见 [清单](../design/tool-taxonomy-deletion-ledger.md)，阶段验证见 [工具契约第 13 章](../design/tool-taxonomy-and-contracts.md)。旧问题清单和原验证事实已 [归档](../archived/known-issues-before-four-categories.md)，不作为新版本通过的证据。
+最后核对：2026-09-11。工具重建的删除对账见 [清单](../design/tool-taxonomy-deletion-ledger.md)，阶段验证见 [工具契约第 13 章](../design/tool-taxonomy-and-contracts.md)。旧问题清单和原验证事实已 [归档](../archived/known-issues-before-four-categories.md)，不作为新版本通过的证据。
 
 ## 尚未完成的外部验证
 
-- **新版真实 SWE 暂缓**：按用户要求未运行真实 probe/task/batch/verify-candidates。新工具已通过本地双协议二进制与 Python 离线回归，但不能据此报告 Flask-8 成功率或真实模型行动能力。
+- **完整 Flask-8 尚未复测**：新版 agentTask 已完成真实 automatic-options 单题并通过；其它七题不在当前成绩范围。
 - **macOS 原生启动/交互未在本地验证**：CI 保留 macOS/Windows/Linux，当前主机为 Windows。不能以交叉构建代替 macOS 实际启动或 TTY 验证。
 - **真实 provider 图片/文件能力未验证**：类型化输入的本地编码、授权与预算检查不代表当前外部模型已支持这些能力；默认仍只声明文本。
 - **TTY 专属交互仍有人工验证缺口**：TUI inline/alt-screen 切换、Windows ConPTY 粘贴和终端滚动有单测，实际终端差异仍需对应设备复测。
 
+## 本次修复与剩余验证
+
+- 旧图缺少特殊验收节点导致候选未交付的问题，已由唯一 agentTask、普通检查任务的候选绑定和图级 complete 替代；真实 automatic-options 已从2失败变为494通过。
+- 多行 Shell 的文本不再作为事实身份，改用 CallID；执行前核对实际路由与工作区组件。
+- 原六题失败材料保留在 [旧运行调查](../test-issues/2026-09-11-swe-candidate-delivery-audit.md)，当前验证见 [agentTask 记录](../test-issues/2026-09-11-agenttask-validation.md)。尚未对整套 Flask-8 复测，不能把一题通过推广到其它题。
+
 ## 当前功能边界
 
-- **Graph 联合交付未开放**：Graph v5 仍采用单 mutable producer 的 Delivery 基线，没有多候选的原子联合 promotion；不能通过手工构造 JSON 绕过编译期约束。
-- **OR 汇合需要额外关联语义**：当前静态端口单赋值规则不支持多个互斥来源共享普通节点/同一 barrier 端口。并行 AND 使用不同端口；复杂 OR 必须先设计 flow generation/correlation 契约。
+- **Graph 联合交付未开放**：当前一次完成选择一个最终候选，没有多候选的原子联合提交；不能通过手工构造 JSON 绕过编译期约束。
+- **OR 汇合需要额外关联语义**：输入槽单赋值，多个上游使用不同槽；没有自动条件路由或多个来源抢同一槽的隐含 OR。
 - **Effect unknown 不自动重跑**：发生崩溃/取消且副作用无法确认时，保留 unknown 及候选证据，需按明确恢复/人工处理流程收口，不能为追求完成率自动重放。
 - **Session 不自动续跑**：进入可接受版本的历史只恢复上下文，非终态 Task 阻断、图停驻；新的用户请求才驱动新运行。旧 Session 不转换到当前版本。
 - **同一 ProjectRoot 不并发启动多个运行时**：进程内锁不替代跨进程状态存储互斥。外部 SWE Test Runner 的逐题锁只保护其自身工作目录，不能作为产品多实例支持的证明。

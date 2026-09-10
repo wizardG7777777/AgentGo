@@ -128,7 +128,8 @@ func (f *fakeController) RequestAgentAudit() (string, error) {
 	return f.auditTaskID, f.auditErr
 }
 
-func (f *fakeController) EmitGraphEvent(graphID, event string, data map[string]any) error {
+func (f *fakeController) ProvideGraphInput(_ context.Context, input ui.GraphInputRequest) error {
+	graphID, event, data := input.GraphID, input.Port, input.Value.(map[string]any)
 	f.graphEventGraphID, f.graphEventName, f.graphEventData = graphID, event, data
 	return f.graphEventErr
 }
@@ -212,7 +213,7 @@ func TestControlEndpoints_MapToController(t *testing.T) {
 	})
 
 	t.Run("graphs/event", func(t *testing.T) {
-		status, body := post(t, ts, "/api/graphs/event", "", `{"graph_id":"g-1","event":"deploy.done","data":{"ok":true}}`)
+		status, body := post(t, ts, "/api/graphs/input", "", `{"graph_id":"g-1","port":"deploy.done","version":1,"expected_revision":1,"request_id":"input-1","value":{"ok":true}}`)
 		if status != http.StatusOK {
 			t.Fatalf("status=%d body=%v", status, body)
 		}
@@ -220,7 +221,7 @@ func TestControlEndpoints_MapToController(t *testing.T) {
 			t.Fatalf("映射入参错误: %+v", fc)
 		}
 		// graph_id / event 为空应 400。
-		if status, _ := post(t, ts, "/api/graphs/event", "", `{"graph_id":"","event":""}`); status != http.StatusBadRequest {
+		if status, _ := post(t, ts, "/api/graphs/input", "", `{"graph_id":"","event":""}`); status != http.StatusBadRequest {
 			t.Fatalf("空参数应 400，实际 %d", status)
 		}
 	})

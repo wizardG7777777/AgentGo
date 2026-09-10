@@ -4,7 +4,6 @@ import (
 	"agentgo/internal/llm"
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	"agentgo/internal/agent"
@@ -101,39 +100,8 @@ func (e *SchedulerExecutor) Execute(
 	task *model.Task,
 	depResults map[string]string,
 	history []contextcontract.HistoryEntry,
- actionBudget llm.OutputBudget,
+	actionBudget llm.OutputBudget,
 ) (agent.ExecuteResult, error) {
-	// 按 task 隔离状态：新任务开始时重置 progressReported
-	if e.lastTaskID != task.ID {
-		e.lastTaskID = task.ID
-		e.progressReported = false
-	}
-
-	// 1. 等待 legacy batch：SchedulerBatch 中所有子任务到达终态
-	// （BatchUpdateCh 信号或 WaitTimeout 兜底时重新检查）。
-	if err := e.waitForBatchTerminal(ctx, task.ID); err != nil {
-		return agent.ExecuteResult{}, err
-	}
-
-	// 2. 兼容路径的 downstream 全量等待：reactor 触发的 verifier 等依赖
-	// SchedulerBatch 的任务，仅在已汇报过进度后才阻塞等待，避免拖慢首轮决策。
-	downstream := e.detectDownstreamTasks(task.ID)
-
-	// 3. 如果之前已汇报过进度且还有下游任务，阻塞等待下游完成
-	if e.progressReported && len(downstream) > 0 {
-		log.Printf("[scheduler-exec] 检测到 %d 个下游任务仍在运行，等待完成 (sched_task=%s)",
-			len(downstream), task.ID)
-		if err := e.waitForDownstreamTasks(ctx, downstream); err != nil {
-			log.Printf("[scheduler-exec] 等待下游任务失败: %v (sched_task=%s)", err, task.ID)
-			// 等待失败不阻塞，继续执行让 LLM 决定
-		}
-		// 等待后重新检测（可能有新任务产生）
-		downstream = e.detectDownstreamTasks(task.ID)
-		if len(downstream) == 0 {
-			log.Printf("[scheduler-exec] 所有下游任务已完成 (sched_task=%s)", task.ID)
-		}
-	}
-
 	// 4. 注入 board snapshot 到 history 末尾
 	// 两轴快照：Modes == nil（单测直构）时 exec/topo 取默认。
 	modeSnap := modes.Snapshot{
@@ -199,7 +167,6 @@ func (e *SchedulerExecutor) Execute(
 		WorkerProfiles:              e.WorkerProfiles,
 		WorkerCapabilitiesByProfile: e.WorkerCapabilitiesByProfile,
 		ToolHealth:                  e.ToolHealth,
-		PendingDownstreamTasks:      e.buildPendingDownstreamInfo(downstream),
 		CurrentControllerTaskID:     task.ID,
 		CurrentGraphID:              task.GraphID,
 	})
@@ -225,12 +192,6 @@ func (e *SchedulerExecutor) Execute(
 	result, err := e.Inner(innerCtx, task, depResults, historyWithSnap, actionBudget)
 	if err != nil {
 		return result, err
-	}
-
-	// 6. 检查本轮是否调用了 report_progress，记录状态供下次迭代使用
-	if e.isProgressToolCalled(result) {
-		e.progressReported = true
-		log.Printf("[scheduler-exec] LLM 已调用 report_progress，下次迭代将等待下游任务 (sched_task=%s)", task.ID)
 	}
 
 	return result, nil
@@ -260,168 +221,4 @@ func (e *SchedulerExecutor) requireToolDispatch(ctx context.Context, task *model
 		return fmt.Errorf("controller task %s is %s, not processing", latest.ID, latest.Status)
 	}
 	return nil
-}
-
-// waitForBatchTerminal 阻塞直到当前 scheduler task 的 SchedulerBatch 中所有
-// 子任务都到达终态。在 BatchUpdateCh 收到信号或 WaitTimeout 超时时重新检查。
-//
-// 返回：
-//   - nil：所有 batch 任务都已终态（或 batch 为空）
-//   - ctx.Err()：context 被取消
-func (e *SchedulerExecutor) waitForBatchTerminal(ctx context.Context, schedTaskID string) error {
-	timeout := e.WaitTimeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-
-	for {
-		// 重新拉取最新的 task（每轮迭代），因为 SchedulerBatch 可能在等待期间被更新
-		task, err := e.Store.GetTask(schedTaskID)
-		if err != nil {
-			// task 被淘汰或不存在 —— 提前返回，让上层处理
-			return nil
-		}
-
-		pending := filterNonTerminalChildren(e.Store, task.SchedulerBatch)
-		if len(pending) == 0 {
-			return nil
-		}
-
-		log.Printf("[scheduler-exec] 等待 batch 完成: %d/%d 仍在执行 (sched_task=%s)",
-			len(pending), len(task.SchedulerBatch), schedTaskID)
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-e.BatchUpdateCh:
-			// 收到信号，重新检查
-		case <-time.After(timeout):
-			// 兜底超时，重新检查（防止信号丢失）
-		}
-	}
-}
-
-// filterNonTerminalChildren 返回 batch 中尚未到达终态的子任务 ID 列表。
-// 终态 = completed / failed / cancelled。读取失败的任务被视为"已消失"，不计入 pending。
-func filterNonTerminalChildren(s store.TaskStore, batch []string) []string {
-	var pending []string
-	for _, id := range batch {
-		task, err := s.GetTask(id)
-		if err != nil || task == nil {
-			continue
-		}
-		if !model.IsTerminal(task.Status) {
-			pending = append(pending, id)
-		}
-	}
-	return pending
-}
-
-// detectDownstreamTasks 扫描所有任务，找出依赖于 SchedulerBatch 中任务
-// 但尚未到达终态的下游任务（如 reactor 触发的 verifier）。
-func (e *SchedulerExecutor) detectDownstreamTasks(schedTaskID string) []string {
-	task, err := e.Store.GetTask(schedTaskID)
-	if err != nil || task == nil {
-		return nil
-	}
-
-	batchIDs := make(map[string]bool, len(task.SchedulerBatch))
-	for _, id := range task.SchedulerBatch {
-		batchIDs[id] = true
-	}
-
-	allTasks, err := e.Store.ScanAll()
-	if err != nil {
-		return nil
-	}
-
-	var downstream []string
-	for _, t := range allTasks {
-		if model.IsTerminal(t.Status) {
-			continue
-		}
-		for _, dep := range t.Dependencies {
-			if batchIDs[dep] {
-				downstream = append(downstream, t.ID)
-				break
-			}
-		}
-	}
-	return downstream
-}
-
-// waitForDownstreamTasks 阻塞等待指定下游任务列表全部到达终态。
-// 复用 BatchUpdateCh 接收任务状态变更信号。
-func (e *SchedulerExecutor) waitForDownstreamTasks(ctx context.Context, taskIDs []string) error {
-	timeout := e.WaitTimeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-	maxWait := e.DownstreamWaitTimeout
-	if maxWait <= 0 {
-		maxWait = 5 * time.Minute
-	}
-	deadline := time.Now().Add(maxWait)
-
-	for time.Now().Before(deadline) {
-		allDone := true
-		for _, id := range taskIDs {
-			task, err := e.Store.GetTask(id)
-			if err != nil || task == nil {
-				continue // 任务不存在视为已完成（被淘汰）
-			}
-			if !model.IsTerminal(task.Status) {
-				allDone = false
-				break
-			}
-		}
-		if allDone {
-			return nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-e.BatchUpdateCh:
-			// 收到信号，重新检查
-		case <-time.After(timeout):
-			// 兜底超时，重新检查
-		}
-	}
-
-	return fmt.Errorf("等待下游任务超时（已超过 %v）", maxWait)
-}
-
-// isProgressToolCalled 检查 ExecuteResult 中是否包含 report_progress 工具调用。
-func (e *SchedulerExecutor) isProgressToolCalled(result agent.ExecuteResult) bool {
-	for _, tc := range result.ToolCalls {
-		if tc.Name == "report_progress" {
-			return true
-		}
-	}
-	return false
-}
-
-// buildPendingDownstreamInfo 把下游任务 ID 列表转换为 PendingDownstreamTask 描述信息。
-func (e *SchedulerExecutor) buildPendingDownstreamInfo(taskIDs []string) []PendingDownstreamTask {
-	if len(taskIDs) == 0 {
-		return nil
-	}
-	var infos []PendingDownstreamTask
-	for _, id := range taskIDs {
-		task, err := e.Store.GetTask(id)
-		if err != nil || task == nil {
-			continue
-		}
-		info := PendingDownstreamTask{
-			TaskID:      id,
-			Description: task.Description,
-			Status:      string(task.Status),
-		}
-		if len(task.Agents) > 0 {
-			info.AgentID = task.Agents[0]
-		}
-		infos = append(infos, info)
-	}
-	return infos
 }

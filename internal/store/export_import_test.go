@@ -1,46 +1,49 @@
 package store
 
 import (
+	"agentgo/internal/model"
+	"agentgo/internal/session"
 	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
-
-	"agentgo/internal/model"
-	"agentgo/internal/session"
 )
 
 func TestExportSnapshot_IncludesTerminalTasksForDependencyClosure(t *testing.T) {
 	s, _ := newTestStore(10, 100)
-
-	// Create a completed task
 	completed := publishTestTask(t, s, "completed task")
 	s.ClaimTask("agent-2", completed.ID)
 	s.SubmitResult("agent-2", completed.ID, "done")
-
+	pending := &model.Task{Description: "pending task", Dependencies: []string{// Create a completed task
 	// Create a pending task that depends on the completed task. The completed
 	// node must survive the snapshot or this task cannot be claimed after resume.
-	pending := &model.Task{Description: "pending task", Dependencies: []string{completed.ID}}
+	// Create a processing task
+	// Create a failed task
+	// Imported and exported maps must not alias the restored Store.
+	// Add a task first
+	// Import empty snapshot
+	// Create tasks with various states
+	// Export
+	// Import into a new store
+	// Verify round-trip
+	// Exported mutable data must not alias the live Store.
+	// Exercise the real JSON boundary too: []byte is base64 encoded and nested
+	// JSON args are decoded into fresh map/slice values before Store import.
+	// Import must own its own deep copy too.
+	completed.ID}}
 	if err := s.PublishTask(pending); err != nil {
 		t.Fatalf("PublishTask pending: %v", err)
 	}
-
-	// Create a processing task
 	processing := publishTestTask(t, s, "processing task")
 	s.ClaimTask("agent-1", processing.ID)
-
-	// Create a failed task
 	failed := publishTestTask(t, s, "failed task")
 	s.ClaimTask("agent-3", failed.ID)
 	s.FailTask("agent-3", failed.ID, "error")
-
 	snaps := s.ExportSnapshot()
-
 	if len(snaps) != 4 {
 		t.Fatalf("expected all 4 tasks, got %d", len(snaps))
 	}
-
 	ids := map[string]bool{}
 	completedAt := map[string]string{}
 	for _, snap := range snaps {
@@ -63,13 +66,9 @@ func TestExportSnapshot_IncludesTerminalTasksForDependencyClosure(t *testing.T) 
 		t.Error("failed task should be exported while it remains in the store")
 	}
 }
-
 func TestExportImport_PreservesFullMultiAgentResults(t *testing.T) {
 	s1, _ := newTestStore(10, 100)
-	want := map[string]string{
-		"worker-a": "HEAD-完整结果🙂-" + strings.Repeat("甲🚀", 6000) + "-MIDDLE-SECRET-TAIL",
-		"worker-b": "full evidence 🚀-" + strings.Repeat("b", 12000) + "-end",
-	}
+	want := map[string]string{"worker-a": "HEAD-完整结果🙂-" + strings.Repeat("甲🚀", 6000) + "-MIDDLE-SECRET-TAIL", "worker-b": "full evidence 🚀-" + strings.Repeat("b", 12000) + "-end"}
 	task := &model.Task{Description: "multi-agent result", MaxConcurrency: len(want)}
 	if err := s1.PublishTask(task); err != nil {
 		t.Fatal(err)
@@ -84,7 +83,6 @@ func TestExportImport_PreservesFullMultiAgentResults(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-
 	payload, err := json.Marshal(s1.ExportSnapshot())
 	if err != nil {
 		t.Fatal(err)
@@ -104,8 +102,6 @@ func TestExportImport_PreservesFullMultiAgentResults(t *testing.T) {
 	if got.Status != model.TaskStatusCompleted || !reflect.DeepEqual(got.Results, want) {
 		t.Fatalf("restored terminal Results mismatch: status=%s results=%#v", got.Status, got.Results)
 	}
-
-	// Imported and exported maps must not alias the restored Store.
 	for i := range snapshots {
 		if snapshots[i].ID == task.ID {
 			snapshots[i].Results["worker-a"] = "mutated"
@@ -116,32 +112,15 @@ func TestExportImport_PreservesFullMultiAgentResults(t *testing.T) {
 		t.Fatalf("snapshot mutation changed restored Results: task=%+v err=%v", again, err)
 	}
 }
-
 func TestExportSnapshot_FieldMapping(t *testing.T) {
 	s, _ := newTestStore(10, 100)
-
-	task := &model.Task{
-		Description:       "test desc",
-		Priority:          5,
-		Dependencies:      []string{},
-		EventSource:       "user",
-		EventType:         "code",
-		SystemPrompt:      "custom prompt",
-		Depth:             2,
-		ExpectedArtifacts: []string{"out.txt"},
-		MailChainDepth:    3,
-		SchedulerBatch:    []string{"child-1", "child-2"},
-		LastResponse:      "last response",
-		PartialOutput:     "partial output",
-	}
+	task := &model.Task{Description: "test desc", Priority: 5, Dependencies: []string{}, EventSource: "user", EventType: "code", SystemPrompt: "custom prompt", Depth: 2, ExpectedArtifacts: []string{"out.txt"}, MailChainDepth: 3, SchedulerBatch: []string{"child-1", "child-2"}, LastResponse: "last response", PartialOutput: "partial output"}
 	s.PublishTask(task)
 	s.ClaimTask("agent-1", task.ID)
-
 	snaps := s.ExportSnapshot()
 	if len(snaps) != 1 {
 		t.Fatalf("expected 1 snapshot, got %d", len(snaps))
 	}
-
 	snap := snaps[0]
 	if snap.ID != task.ID {
 		t.Errorf("ID = %s, want %s", snap.ID, task.ID)
@@ -189,7 +168,6 @@ func TestExportSnapshot_FieldMapping(t *testing.T) {
 		t.Errorf("PendingSince = %q, want empty for processing task", snap.PendingSince)
 	}
 }
-
 func TestExportImport_PreservesCurrentPendingLease(t *testing.T) {
 	s1, _ := newTestStore(10, 100)
 	task := publishTestTask(t, s1, "pending lease")
@@ -214,7 +192,6 @@ func TestExportImport_PreservesCurrentPendingLease(t *testing.T) {
 		t.Fatalf("restored times: CreatedAt=%v PendingSince=%v", got.CreatedAt, got.PendingSince)
 	}
 }
-
 func TestExportSnapshot_EmptyStore(t *testing.T) {
 	s, _ := newTestStore(10, 100)
 	snaps := s.ExportSnapshot()
@@ -222,36 +199,15 @@ func TestExportSnapshot_EmptyStore(t *testing.T) {
 		t.Errorf("expected nil for empty store, got %v", snaps)
 	}
 }
-
 func TestImportSnapshot_Basic(t *testing.T) {
 	s, _ := newTestStore(10, 100)
-
 	now := time.Now().UTC().Format(time.RFC3339)
-	tasks := []session.TaskSnapshot{
-		{
-			ID:             "task-1",
-			Description:    "imported task",
-			Priority:       10,
-			Dependencies:   []string{},
-			Status:         "pending",
-			Agents:         []string{"dead-agent"},
-			MaxConcurrency: 2,
-			Results:        map[string]string{},
-			RetryCount:     0,
-			RetryReasons:   []string{},
-			TimeoutSeconds: 300,
-			Depth:          0,
-			CreatedAt:      now,
-			StartedAt:      now,
-		},
-	}
-
+	tasks := []session.TaskSnapshot{{ID: "task-1", Description: "imported task", Priority: 10, Dependencies: []string{}, Status: "pending", Agents: []string{"dead-agent"}, MaxConcurrency: 2, Results: map[string]string{}, RetryCount: 0, RetryReasons: []string{}, TimeoutSeconds: 300, Depth: 0, CreatedAt: now, StartedAt: now}}
 	beforeRestore := time.Now().UTC()
 	if err := s.ImportSnapshot(tasks); err != nil {
 		t.Fatalf("ImportSnapshot failed: %v", err)
 	}
 	afterRestore := time.Now().UTC()
-
 	got, err := s.GetTask("task-1")
 	if err != nil {
 		t.Fatalf("GetTask after import: %v", err)
@@ -272,111 +228,50 @@ func TestImportSnapshot_Basic(t *testing.T) {
 		t.Errorf("legacy pending task retained stale execution lease: %+v", got)
 	}
 }
-
-func TestExportImportPreservesGraphRecoveryDeltaSchema(t *testing.T) {
-	source, _ := newTestStore(10, 100)
-	task := &model.Task{
-		ID: "recovery-schema-task", Description: "恢复控制器", EventType: "__scheduler__",
-		GraphID: "graph-1", NodeID: "recovery", ActivationID: "recovery@1",
-		GraphNodeKind: "controller", GraphControllerRole: "loop_recovery",
-		GraphRecoveryDeltaSchema: "agentgo.recovery-delta/v3",
-	}
-	if err := source.PublishTask(task); err != nil {
-		t.Fatal(err)
-	}
-	snapshots := source.ExportSnapshot()
-	if len(snapshots) != 1 || snapshots[0].GraphRecoveryDeltaSchema != "agentgo.recovery-delta/v3" {
-		t.Fatalf("导出丢失 recovery schema: %+v", snapshots)
-	}
-	restored, _ := newTestStore(10, 100)
-	if err := restored.ImportSnapshot(snapshots); err != nil {
-		t.Fatal(err)
-	}
-	got, err := restored.GetTask(task.ID)
-	if err != nil || got.GraphRecoveryDeltaSchema != "agentgo.recovery-delta/v3" {
-		t.Fatalf("恢复丢失 recovery schema: task=%+v err=%v", got, err)
-	}
-}
-
 func TestImportSnapshot_ClearsExistingTasks(t *testing.T) {
 	s, _ := newTestStore(10, 100)
-
-	// Add a task first
 	publishTestTask(t, s, "existing task")
-
-	// Import empty snapshot
 	if err := s.ImportSnapshot(nil); err != nil {
 		t.Fatalf("ImportSnapshot failed: %v", err)
 	}
-
 	all, _ := s.ScanAll()
 	if len(all) != 0 {
 		t.Errorf("expected 0 tasks after importing empty snapshot, got %d", len(all))
 	}
 }
-
 func TestImportSnapshot_InvalidTime(t *testing.T) {
 	s, _ := newTestStore(10, 100)
-
-	tasks := []session.TaskSnapshot{
-		{
-			ID:        "task-bad",
-			CreatedAt: "not-a-time",
-		},
-	}
-
+	tasks := []session.TaskSnapshot{{ID: "task-bad", CreatedAt: "not-a-time"}}
 	err := s.ImportSnapshot(tasks)
 	if err == nil {
 		t.Fatal("expected error for invalid time format")
 	}
 }
-
 func TestImportSnapshot_InvalidPendingSince(t *testing.T) {
 	s, _ := newTestStore(10, 100)
-	err := s.ImportSnapshot([]session.TaskSnapshot{{
-		ID: "task-bad-pending", Status: "pending",
-		CreatedAt: "2026-07-19T00:00:00Z", PendingSince: "not-a-time",
-	}})
+	err := s.ImportSnapshot([]session.TaskSnapshot{{ID: "task-bad-pending", Status: "pending", CreatedAt: "2026-07-19T00:00:00Z", PendingSince: "not-a-time"}})
 	if err == nil {
 		t.Fatal("expected error for invalid pending_since")
 	}
 }
-
 func TestExportImport_RoundTrip(t *testing.T) {
 	s1, _ := newTestStore(10, 100)
-
-	// Create tasks with various states
-	t1 := &model.Task{
-		Description:       "task one",
-		Priority:          5,
-		EventType:         "code",
-		ExpectedArtifacts: []string{"a.txt"},
-	}
+	t1 := &model.Task{Description: "task one", Priority: 5, EventType: "code", ExpectedArtifacts: []string{"a.txt"}}
 	s1.PublishTask(t1)
 	s1.AppendArtifact(t1.ID, "docs/out.md")
-
-	t2 := &model.Task{
-		Description: "task two",
-		Priority:    3,
-	}
+	t2 := &model.Task{Description: "task two", Priority: 3}
 	s1.PublishTask(t2)
 	s1.ClaimTask("agent-1", t2.ID)
-
-	// Export
 	snaps := s1.ExportSnapshot()
 	if len(snaps) != 2 {
 		t.Fatalf("expected 2 snapshots, got %d", len(snaps))
 	}
-
-	// Import into a new store
 	s2, _ := newTestStore(10, 100)
 	beforeRestore := time.Now().UTC()
 	if err := s2.ImportSnapshot(snaps); err != nil {
 		t.Fatalf("ImportSnapshot failed: %v", err)
 	}
 	afterRestore := time.Now().UTC()
-
-	// Verify round-trip
 	got1, err := s2.GetTask(t1.ID)
 	if err != nil {
 		t.Fatalf("GetTask t1: %v", err)
@@ -390,7 +285,6 @@ func TestExportImport_RoundTrip(t *testing.T) {
 	if len(got1.Artifacts) != 1 || got1.Artifacts[0] != "docs/out.md" {
 		t.Errorf("t1 Artifacts = %v, want [docs/out.md]", got1.Artifacts)
 	}
-
 	got2, err := s2.GetTask(t2.ID)
 	if err != nil {
 		t.Fatalf("GetTask t2: %v", err)
@@ -408,43 +302,18 @@ func TestExportImport_RoundTrip(t *testing.T) {
 		t.Errorf("t2 PendingSince=%v, want fresh recovery lease in [%v,%v]", got2.PendingSince, beforeRestore, afterRestore)
 	}
 }
-
 func TestExportImport_RoundTripV3RuntimeFields(t *testing.T) {
 	s1, _ := newTestStore(10, 100)
-
 	history := []byte(`[{"output":"command completed","tool_called":true,"tool_calls":[{"id":"call-1","name":"run_shell"}]}]`)
-	task := &model.Task{
-		Description:        "formal final-report task",
-		EventSource:        "graph-ended",
-		EventType:          "__scheduler__",
-		SchedulerBatch:     []string{"child-a", "child-b"},
-		LastHistory:        history,
-		LastResponse:       "latest acceptance response",
-		PartialOutput:      "streamed so far",
-		FinalReportGraphID: "g-finished",
-	}
+	task := &model.Task{Description: "formal final-report task", EventSource: "graph-ended", EventType: "__scheduler__", SchedulerBatch: []string{"child-a", "child-b"}, LastHistory: history, LastResponse: "latest acceptance response", PartialOutput: "streamed so far", FinalReportGraphID: "g-finished"}
 	if err := s1.PublishTask(task); err != nil {
 		t.Fatalf("PublishTask: %v", err)
 	}
 	exitCode := 0
 	callTime := time.Date(2026, 7, 13, 10, 11, 12, 345678901, time.UTC)
-	if err := s1.AppendToolCall(task.ID, ToolCallRecord{
-		Timestamp: callTime,
-		CallID:    "call-1",
-		AgentID:   "verifier-1",
-		ToolName:  "run_shell",
-		Args: map[string]any{
-			"command": "go test ./...",
-			"options": map[string]any{"env": []any{"CI=1", "COLOR=0"}},
-		},
-		Success:       true,
-		ExitCode:      &exitCode,
-		ExitCodeScope: ShellExitCodeScopeWholeCommand,
-	}); err != nil {
+	if err := s1.AppendToolCall(task.ID, ToolCallRecord{Timestamp: callTime, CallID: "call-1", AgentID: "verifier-1", ToolName: "run_shell", Args: map[string]any{"command": "go test ./...", "options": map[string]any{"env": []any{"CI=1", "COLOR=0"}}}, Success: true, ExitCode: &exitCode, ExitCodeScope: ShellExitCodeScopeWholeCommand}); err != nil {
 		t.Fatalf("AppendToolCall: %v", err)
 	}
-
-	// Exported mutable data must not alias the live Store.
 	exported := s1.ExportSnapshot()
 	exported[0].LastHistory[0] = 'X'
 	exportedOptions := exported[0].ToolCalls[0].Args["options"].(map[string]any)
@@ -464,9 +333,6 @@ func TestExportImport_RoundTripV3RuntimeFields(t *testing.T) {
 	if sourceCalls[0].Args["options"].(map[string]any)["env"].([]any)[0] != "CI=1" || *sourceCalls[0].ExitCode != 0 {
 		t.Fatal("mutating exported ToolCalls changed the source Store")
 	}
-
-	// Exercise the real JSON boundary too: []byte is base64 encoded and nested
-	// JSON args are decoded into fresh map/slice values before Store import.
 	payload, err := json.Marshal(s1.ExportSnapshot())
 	if err != nil {
 		t.Fatalf("marshal TaskSnapshot: %v", err)
@@ -479,11 +345,9 @@ func TestExportImport_RoundTripV3RuntimeFields(t *testing.T) {
 	if err := s2.ImportSnapshot(snaps); err != nil {
 		t.Fatalf("ImportSnapshot: %v", err)
 	}
-	// Import must own its own deep copy too.
 	snaps[0].LastHistory[0] = 'Y'
 	snaps[0].ToolCalls[0].Args["options"].(map[string]any)["env"].([]any)[0] = "MUTATED=2"
 	*snaps[0].ToolCalls[0].ExitCode = 98
-
 	got, err := s2.GetTask(task.ID)
 	if err != nil {
 		t.Fatalf("GetTask: %v", err)
@@ -508,9 +372,7 @@ func TestExportImport_RoundTripV3RuntimeFields(t *testing.T) {
 		t.Fatalf("restored ToolCalls = %v, err=%v", calls, err)
 	}
 	call := calls[0]
-	if !call.Timestamp.Equal(callTime) || call.CallID != "call-1" || call.AgentID != "verifier-1" || !call.Success ||
-		call.Args["command"] != "go test ./..." || call.ExitCode == nil || *call.ExitCode != 0 ||
-		call.ExitCodeScope != ShellExitCodeScopeWholeCommand {
+	if !call.Timestamp.Equal(callTime) || call.CallID != "call-1" || call.AgentID != "verifier-1" || !call.Success || call.Args["command"] != "go test ./..." || call.ExitCode == nil || *call.ExitCode != 0 || call.ExitCodeScope != ShellExitCodeScopeWholeCommand {
 		t.Fatalf("restored ToolCall mismatch: %+v", call)
 	}
 	env := call.Args["options"].(map[string]any)["env"].([]any)
@@ -518,40 +380,25 @@ func TestExportImport_RoundTripV3RuntimeFields(t *testing.T) {
 		t.Fatalf("restored nested args = %#v", call.Args)
 	}
 }
-
 func TestImportSnapshotRejectsInvalidToolCallFacts(t *testing.T) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	for _, tc := range []struct {
 		name string
 		call session.ToolCallSnapshot
-	}{
-		{name: "empty tool name", call: session.ToolCallSnapshot{Timestamp: now}},
-		{name: "invalid timestamp", call: session.ToolCallSnapshot{ToolName: "run_shell", Timestamp: "not-a-time"}},
-		{name: "invalid exit scope", call: session.ToolCallSnapshot{ToolName: "run_shell", Timestamp: now, ExitCodeScope: "all-pipes"}},
-	} {
+	}{{name: "empty tool name", call: session.ToolCallSnapshot{Timestamp: now}}, {name: "invalid timestamp", call: session.ToolCallSnapshot{ToolName: "run_shell", Timestamp: "not-a-time"}}, {name: "invalid exit scope", call: session.ToolCallSnapshot{ToolName: "run_shell", Timestamp: now, ExitCodeScope: "all-pipes"}}} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _ := newTestStore(10, 100)
-			err := s.ImportSnapshot([]session.TaskSnapshot{{
-				ID: "task-1", Status: "pending", CreatedAt: now,
-				ToolCalls: []session.ToolCallSnapshot{tc.call},
-			}})
+			err := s.ImportSnapshot([]session.TaskSnapshot{{ID: "task-1", Status: "pending", CreatedAt: now, ToolCalls: []session.ToolCallSnapshot{tc.call}}})
 			if err == nil || !strings.Contains(err.Error(), "tool call") {
 				t.Fatalf("ImportSnapshot error = %v", err)
 			}
 		})
 	}
 }
-
 func TestImportSnapshotAcceptsLegacyToolCallWithoutCallID(t *testing.T) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	s, _ := newTestStore(10, 100)
-	if err := s.ImportSnapshot([]session.TaskSnapshot{{
-		ID: "legacy-task", Status: "pending", CreatedAt: now,
-		ToolCalls: []session.ToolCallSnapshot{{
-			Timestamp: now, ToolName: "read_file",
-			Args: map[string]any{"path": "README.md"}, Success: true,
-		}},
-	}}); err != nil {
+	if err := s.ImportSnapshot([]session.TaskSnapshot{{ID: "legacy-task", Status: "pending", CreatedAt: now, ToolCalls: []session.ToolCallSnapshot{{Timestamp: now, ToolName: "read_file", Args: map[string]any{"path": "README.md"}, Success: true}}}}); err != nil {
 		t.Fatalf("legacy snapshot without call_id must remain readable: %v", err)
 	}
 	calls, err := s.QueryToolCalls("legacy-task", "read_file")
@@ -559,27 +406,9 @@ func TestImportSnapshotAcceptsLegacyToolCallWithoutCallID(t *testing.T) {
 		t.Fatalf("legacy tool call = %+v, err=%v", calls, err)
 	}
 }
-
 func TestImportSnapshot_RebuildsCompletedFIFO(t *testing.T) {
 	s, _ := newTestStore(10, 100)
-
-	tasks := []session.TaskSnapshot{
-		{
-			ID:          "terminal-newer",
-			Description: "newer",
-			Status:      "failed",
-			CreatedAt:   "2026-07-13T09:00:00Z",
-			CompletedAt: "2026-07-13T10:02:00Z",
-		},
-		{
-			ID:          "terminal-older",
-			Description: "older",
-			Status:      "completed",
-			CreatedAt:   "2026-07-13T09:00:00Z",
-			CompletedAt: "2026-07-13T10:01:00Z",
-		},
-	}
-
+	tasks := []session.TaskSnapshot{{ID: "terminal-newer", Description: "newer", Status: "failed", CreatedAt: "2026-07-13T09:00:00Z", CompletedAt: "2026-07-13T10:02:00Z"}, {ID: "terminal-older", Description: "older", Status: "completed", CreatedAt: "2026-07-13T09:00:00Z", CompletedAt: "2026-07-13T10:01:00Z"}}
 	if err := s.ImportSnapshot(tasks); err != nil {
 		t.Fatalf("ImportSnapshot: %v", err)
 	}
@@ -594,28 +423,9 @@ func TestImportSnapshot_RebuildsCompletedFIFO(t *testing.T) {
 		t.Fatal("CompletedAt should be restored")
 	}
 }
-
 func TestImportSnapshot_PreservesTerminalDependencyBeyondFIFO(t *testing.T) {
 	s, _ := newTestStore(10, 0)
-
-	tasks := []session.TaskSnapshot{
-		{
-			ID:          "completed-dependency",
-			Description: "dependency",
-			Status:      "completed",
-			CreatedAt:   "2026-07-13T09:00:00Z",
-			CompletedAt: "2026-07-13T10:00:00Z",
-		},
-		{
-			ID:             "pending-dependent",
-			Description:    "dependent",
-			Status:         "pending",
-			Dependencies:   []string{"completed-dependency"},
-			MaxConcurrency: 1,
-			CreatedAt:      "2026-07-13T10:01:00Z",
-		},
-	}
-
+	tasks := []session.TaskSnapshot{{ID: "completed-dependency", Description: "dependency", Status: "completed", CreatedAt: "2026-07-13T09:00:00Z", CompletedAt: "2026-07-13T10:00:00Z"}, {ID: "pending-dependent", Description: "dependent", Status: "pending", Dependencies: []string{"completed-dependency"}, MaxConcurrency: 1, CreatedAt: "2026-07-13T10:01:00Z"}}
 	if err := s.ImportSnapshot(tasks); err != nil {
 		t.Fatalf("ImportSnapshot: %v", err)
 	}

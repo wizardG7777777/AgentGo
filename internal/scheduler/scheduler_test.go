@@ -13,8 +13,7 @@ import (
 
 func TestSchedulerCorePromptKeepsOnlyCrossPhaseAuthority(t *testing.T) {
 	for _, want := range []string{
-		"apply_graph_change(operation=create)", "control_graph(action=start)",
-		"apply_graph_change(operation=update)", "消息仅传递信息", "图启动不等于请求完成",
+		"agentTask", "operation=create", "action=start", "update/add", "result_refs", "send_message 只传信息", "候选",
 	} {
 		if !strings.Contains(schedulerCorePrompt, want) {
 			t.Errorf("Scheduler core prompt 缺少跨阶段不变量 %q", want)

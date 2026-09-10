@@ -37,7 +37,7 @@ const (
 // Register 始终注册 schema，未装配时调用 fail-closed，便于
 // known-tools 并集和 config doctor 对账。
 type EvidenceGroup struct {
-	Graphs       *graph.Store
+	Graphs       *graph.DataflowStore
 	ContentStore *contentstore.Store
 	TaskStore    store.TaskStore
 	SessionID    func() string

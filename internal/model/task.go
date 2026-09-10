@@ -65,7 +65,8 @@ func IsTerminal(status TaskStatus) bool {
 }
 
 type Task struct {
-	ID string
+	InputCandidateRef string `json:"input_candidate_ref,omitempty"`
+	ID                string
 	// RunID/RunContract 是一次用户请求的冻结运行身份和预算契约。Graph/子任务
 	// 必须沿父链传递；旧任务为空时按 legacy/degraded 处理，不能伪造历史身份。
 	RunID       runcontract.RunID
@@ -142,28 +143,18 @@ type Task struct {
 	PartialOutput string // 执行中的部分输出，用于流式进度展示
 	Depth         int    // 子任务嵌套深度，根任务为 0
 
-	// GraphID / NodeID / ActivationID / GraphNodeKind 是 V6 Graph 归属身份：本任务由 Graph
 	// Runtime 为图 graph_id 的节点 node_id 的某次 activation（<nodeID>@<n>）
 	// 发布时写入，终态后由 graph-terminal-feed Reactor 凭它回填引擎
-	// （OnTaskTerminal 的幂等身份）。GraphNodeKind 还供 ExecutionLease 按
 	// 真实节点角色派生控制通道，不能由可覆盖的 EventType/route 猜测。普通任务
-	// 四字段皆空；旧 Graph 快照缺少 GraphNodeKind 时执行层按最小权限处理。
-	GraphID       string `json:"graph_id,omitempty"`
-	NodeID        string `json:"node_id,omitempty"`
-	ActivationID  string `json:"activation_id,omitempty"`
-	GraphNodeKind string `json:"graph_node_kind,omitempty"`
+	GraphID      string `json:"graph_id,omitempty"`
+	NodeID       string `json:"node_id,omitempty"`
+	ActivationID string `json:"activation_id,omitempty"`
 	// DeliveryID 是 Graph v3 的 L5 交付事务身份。它不替代 activation：多个
 	// repair activation 可共享同一 DeliveryID，只有 acceptance pass 后才允许
 	// 由协调器提升其 workspace candidate。
 	DeliveryID string `json:"delivery_id,omitempty"`
-	// GraphControllerRole 是 controller activation 的冻结 L5 控制职责；空值为
-	// 普通 controller。RecoverySourceTaskID 只在 loop_recovery controller 上
 	// 非空，把恢复决策精确绑定到触发 intervention 的 Graph Task。
-	GraphControllerRole  string `json:"graph_controller_role,omitempty"`
-	RecoverySourceTaskID string `json:"recovery_source_task_id,omitempty"`
-	// GraphRecoveryDeltaSchema 是 loop_recovery 节点冻结的版本化 handoff
 	// 契约。执行层只按该字段收窄 submit schema，不从任务描述猜测。
-	GraphRecoveryDeltaSchema string `json:"graph_recovery_delta_schema,omitempty"`
 	// OutcomeRef 指向 L4 append-only TaskOutcome。新 authoring Graph 的终态
 	// 必须先 durable 提交该事实，再把引用与 Task 状态一起生效；legacy 为空。
 	OutcomeRef string `json:"outcome_ref,omitempty"`

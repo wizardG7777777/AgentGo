@@ -120,7 +120,17 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 		return resolved, nil
 	}
 
-	rawFn := func(ctx context.Context, args map[string]any) (string, error) {
+	rawFn := func(ctx context.Context, args map[string]any) (result string, runErr error) {
+		defer func() {
+			if g.ActiveViewer != nil {
+				if v := g.ActiveViewer.ActiveView(); v != nil {
+					if err := v.CaptureShellChanges(); err != nil {
+						runErr = fmt.Errorf("Shell 文件差异记录失败: %w", err)
+					}
+				}
+			}
+		}()
+
 		command, _ := args["command"].(string)
 		if command == "" {
 			return "", fmt.Errorf("缺少 command 参数")

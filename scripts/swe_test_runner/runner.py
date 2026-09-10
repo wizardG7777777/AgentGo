@@ -668,15 +668,35 @@ def project_snapshot(snapshot: dict, run_id: str) -> dict:
     }
 
 
+def fail_on_provider_http_error(project_root: Path, run_id: str) -> None:
+    for path in (project_root / ".agentgo" / "sessions").glob("*/logs/*.jsonl"):
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue  # 在途尾行由下一次读取确认；最终审计仍严格检查。
+                if event.get("run_id") != run_id or event.get("kind") != "llm_call_end":
+                    continue
+                status = event.get("http_status")
+                if isinstance(status, int) and status >= 400:
+                    raise SWETestRunnerInfrastructureError(
+                        "provider_http_error", "run",
+                        f"推理服务 HTTP {status}，按要求停止；invocation={event.get('invocation_id', '')}",
+                        log_path=path)
+
+
 def monitor_run(base_url: str, token: str, process: subprocess.Popen, run_id: str, started_at: float,
                 timeout_sec: int, snapshot_path: str, poll_sec: int = 3,
-                terminal_grace_sec: int = 30) -> dict:
+                terminal_grace_sec: int = 30, provider_trace_root: Path | None = None) -> dict:
     candidate = ""
     candidate_since = 0.0
     last_projection = {}
     observed_activity = False
     identity_projection_seen = False
     while True:
+        if provider_trace_root is not None:
+            fail_on_provider_http_error(provider_trace_root, run_id)
         elapsed = max(0, int(time.time() - started_at))
         # Popen.poll 是跨平台的进程句柄查询；Windows 上不得用 os.kill(pid, 0)
         # 模拟 POSIX signal 0，否则可能终止被监控进程或抛出 WinError 87。
@@ -1404,7 +1424,7 @@ def run_task(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> d
     print_stage_header(
         task.task_id, 3, 4, "AgentGo 修复执行",
         f"worktree={worktree}",
-        "完成 Graph commit/start、代码修改、Acceptance 与 typed Graph outcome，并安全收口进程",
+        "通过 agentTask 增量图调查、修改和检查，完成图级交付并安全收口进程",
     )
     run_dir = config.run_dir(task.task_id)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1437,7 +1457,7 @@ def run_task(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> d
             }, ensure_ascii=False))
             monitor = monitor_run(
                 base_url, token, process, contract["run_id"], started_at, timeout_sec,
-                str(run_dir / "snapshot.final.json"), poll_sec=3, terminal_grace_sec=30,
+                str(run_dir / "snapshot.final.json"), poll_sec=3, terminal_grace_sec=30, provider_trace_root=worktree,
             )
             atomic_json(run_dir / "monitor.json", monitor)
             print("执行状态：Graph/进程监控终态 " + json.dumps(monitor, ensure_ascii=False))
@@ -1465,7 +1485,7 @@ def run_task(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> d
         f"graph_outcomes={result.get('graph_outcomes', [])} "
         f"external_hard_kill={result.get('external_hard_kill', False)}"
     )
-    print("运行结果明细：" + json.dumps(result, ensure_ascii=False))
+    print(f"运行结果明细：{run_dir / 'result.json'}")
     return result
 
 
@@ -1555,7 +1575,8 @@ def judge_task(config: SWETestRunnerConfig, task: TaskSpec) -> dict:
         f"阶段结论：最终 Judge verdict={report['verdict']} patch_lines={report['patch_lines']} "
         f"tampered={report['tampered']}"
     )
-    print("Judge 结构化结果：" + json.dumps(report, ensure_ascii=False))
+    print(f"详细判题记录：{run_dir / 'judge.json'}")
+    print(f"测试日志：{run_dir / 'judge.pytest.log'}；补丁：{run_dir / 'model.patch'}")
     return report
 
 

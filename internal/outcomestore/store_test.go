@@ -178,7 +178,7 @@ func TestTerminalIntentRecoveryAndEvidenceEnrichment(t *testing.T) {
 	candidate.CommittedAt = time.Time{}
 	candidate.CheckpointRef, candidate.CheckpointState = "", ""
 	intent, err := store.PrepareIntent(outcome.TerminalIntent{
-		Schema: outcome.TerminalIntentSchemaV1, Candidate: candidate,
+		Schema: outcome.TerminalIntentSchemaCurrent, Candidate: candidate,
 		PreparedAt: time.Unix(1_700_000_100, 0).UTC(),
 	})
 	if err != nil {
@@ -249,7 +249,7 @@ func TestStoreRecoveryRejectsTruncatedTail(t *testing.T) {
 
 func validOutcome() outcome.TaskOutcome {
 	return outcome.TaskOutcome{
-		Schema: outcome.SchemaV1, RunID: "run-1", GraphID: "graph-1", NodeID: "work",
+		Schema: outcome.SchemaCurrent, RunID: "run-1", GraphID: "graph-1", NodeID: "work",
 		ActivationID: "work@1", TaskID: "task-1", AttemptID: "task-1/attempt-1",
 		Status: outcome.StatusCompleted, Summary: "完成", Result: []byte(`{"ok":true}`),
 		CheckpointRef: "checkpoint-1", CheckpointState: outcome.CheckpointStateCurrentUnsealed,

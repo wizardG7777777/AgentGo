@@ -44,9 +44,9 @@ agents:
 
 ## 角色权限
 
-- Scheduler 原始请求使用图工具和检视/通信；图中的 controller 处理编排。solo 模式执行工作也通过显式 agent 节点，不恢复脱图执行旁路。
+- Scheduler 原始请求使用图工具和检视/通信；编排属于图外 Scheduler；业务工作使用 agentTask。
 - Worker 可声明文件读写和 Shell。Explorer 可用 Shell 搜索，但不给 apply_change 不代表 Shell 在操作系统层面只读；环境隔离与角色指令分别负责各自边界。
-- Verifier/acceptance 的只读闭集由 agent.IsAcceptanceToolAllowed 统一提供给 Graph 路由和 ExecutionLease 校验，包含 read_file、inspect_board、inspect_node、read_graph_definition、read_evidence、可选 web 工具及 submit_task_result。授权通过后仍必须实际注册该工具。
+- 普通检查 Agent 的工具由配置与 Lease 冻结，常用只读配置包含 read_file、inspect_board、inspect_node、read_graph_definition、read_evidence、可选 web 工具及 submit_task_result。授权通过后仍必须实际注册该工具。
 - 普通 Graph agent 不能通过自选 capability 获得 apply_graph_change/control_graph；修改图要 request_replan，由有编排权限的主体应用。节点 kind 是角色权威，不根据自定义 route 字符串猜权限。
 - per-node capability 是 route 能力与运行策略内的子集，越界明确拒绝。新的 ExecutionLease v3 冻结本次能力，ToolRouter 同时约束模型看到的 schema 和实际 dispatch。
 
@@ -66,4 +66,4 @@ run_check、record_observation_delta、submit_change_decision、旧模型草案�
 
 配置检查使用 `agentgo config doctor`；Go 与本地二进制验证见工具契约第 13 章。真正的 SWE 评测仍由外部 Python 程序承担，本次不执行真实 SWE。
 
-可选 Team 初建使用 `provision_agent_team(graph_request_id=R)`，随后 `apply_graph_change(create, request_id=R)` 使用同一个稳定值；图 ID 由运行时按调用者和请求身份派生，返回的 ready route 才能写入节点。图内 controller 扩展时继承当前图，不提供旧 task-scoped 模型入口。
+可选 Team 初建使用 `provision_agent_team(graph_request_id=R)`，随后 `apply_graph_change(create, request_id=R)` 使用同一个稳定值；图 ID 由运行时按调用者和请求身份派生，返回的 ready route 才能写入节点。图外规划任务扩展时继承目标图，不提供旧 task-scoped 模型入口。

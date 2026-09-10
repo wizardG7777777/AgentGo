@@ -10,15 +10,12 @@ import (
 	"strings"
 	"time"
 
-	"agentgo/internal/delivery"
 	"agentgo/internal/fulfillment"
 	"agentgo/internal/runcontract"
 )
 
-const SchemaV1 = "agentgo.task-outcome/v1"
-const SchemaV2 = "agentgo.task-outcome/v2"
-const SchemaV3 = "agentgo.task-outcome/v3"
-const TerminalIntentSchemaV1 = "agentgo.terminal-intent/v1"
+const SchemaCurrent = "agentgo.task-outcome/v4"
+const TerminalIntentSchemaCurrent = "agentgo.terminal-intent/v2"
 
 const (
 	SummaryMaxBytes      = 32 << 10
@@ -95,15 +92,14 @@ type TaskOutcome struct {
 	// DeliveryID/CandidateRef 是 Graph v3 的统一交付 envelope。非 mutating
 	// activation 只携带 DeliveryID；产生 workspace 修改的 activation 还必须
 	// 冻结 CandidateRef，禁止把候选自述成已经交付的主根结果。
-	DeliveryID   string              `json:"delivery_id,omitempty"`
-	CandidateRef string              `json:"candidate_ref,omitempty"`
-	Candidate    *delivery.Candidate `json:"candidate,omitempty"`
-	TaskID       string              `json:"task_id"`
-	AttemptID    string              `json:"attempt_id"`
-	AttemptNo    int                 `json:"attempt_no,omitempty"`
-	Status       Status              `json:"status"`
-	Summary      string              `json:"summary"`
-	Result       json.RawMessage     `json:"result,omitempty"`
+	DeliveryID   string          `json:"delivery_id,omitempty"`
+	CandidateRef string          `json:"candidate_ref,omitempty"`
+	TaskID       string          `json:"task_id"`
+	AttemptID    string          `json:"attempt_id"`
+	AttemptNo    int             `json:"attempt_no,omitempty"`
+	Status       Status          `json:"status"`
+	Summary      string          `json:"summary"`
+	Result       json.RawMessage `json:"result,omitempty"`
 	// TaskResults 保留 MemoryTaskStore 的精确字符串投影，用于修复 outcome
 	// fsync 后、Session snapshot 前崩溃的窗口；Graph 只消费 typed Result。
 	TaskResults         map[string]string   `json:"task_results,omitempty"`
@@ -130,7 +126,7 @@ type TerminalIntent struct {
 }
 
 func (i TerminalIntent) Validate() error {
-	if i.Schema != TerminalIntentSchemaV1 || i.PreparedAt.IsZero() {
+	if i.Schema != TerminalIntentSchemaCurrent || i.PreparedAt.IsZero() {
 		return fmt.Errorf("TerminalIntent schema/prepared_at 无效")
 	}
 	if !i.Candidate.CommittedAt.IsZero() || i.Candidate.CheckpointRef != "" ||
@@ -148,18 +144,10 @@ func (i TerminalIntent) Validate() error {
 }
 
 func (o TaskOutcome) Validate() error {
-	if o.Schema != SchemaV1 && o.Schema != SchemaV2 && o.Schema != SchemaV3 {
-		return fmt.Errorf("TaskOutcome schema=%q，无效", o.Schema)
+	if o.Schema != SchemaCurrent {
+		return fmt.Errorf("拒绝旧 TaskOutcome schema=%q", o.Schema)
 	}
-	if o.Schema == SchemaV1 && o.Fulfillment != nil {
-		return fmt.Errorf("TaskOutcome v1 不得携带 fulfillment")
-	}
-	if o.Schema != SchemaV3 && (o.DeliveryID != "" || o.CandidateRef != "" || o.Candidate != nil) {
-		return fmt.Errorf("TaskOutcome %s 不得携带 delivery envelope", o.Schema)
-	}
-	for name, value := range map[string]string{
-		"run_id": string(o.RunID), "task_id": o.TaskID,
-	} {
+	for name, value := range map[string]string{"run_id": string(o.RunID), "task_id": o.TaskID} {
 		if strings.TrimSpace(value) == "" {
 			return fmt.Errorf("TaskOutcome %s 不能为空", name)
 		}
@@ -194,29 +182,8 @@ func (o TaskOutcome) Validate() error {
 	if graphFields != 0 && graphFields != 3 {
 		return fmt.Errorf("Graph TaskOutcome 必须同时携带 graph_id/node_id/activation_id")
 	}
-	if o.Schema == SchemaV3 {
-		if graphFields != 3 {
-			return fmt.Errorf("TaskOutcome v3 必须携带 graph identity")
-		}
-		if o.CandidateRef != "" && strings.TrimSpace(o.CandidateRef) == "" {
-			return fmt.Errorf("TaskOutcome v3 candidate_ref 非法")
-		}
-		if o.Fulfillment != nil && o.Fulfillment.WorkspaceRevisionRef != "" && strings.TrimSpace(o.CandidateRef) == "" {
-			return fmt.Errorf("含 workspace fulfillment 的 TaskOutcome v3 必须携带 candidate_ref")
-		}
-		if o.CandidateRef != "" {
-			if o.Candidate == nil || o.Candidate.Ref != o.CandidateRef ||
-				strings.TrimSpace(o.Candidate.WorkspaceRevisionRef) == "" || strings.TrimSpace(o.Candidate.PatchDigest) == "" {
-				return fmt.Errorf("TaskOutcome v3 candidate 事实与 candidate_ref 不一致")
-			}
-		}
-		if o.DeliveryID != "" && !strings.HasPrefix(o.DeliveryID, "delivery:") {
-			return fmt.Errorf("TaskOutcome v3 delivery_id 格式非法")
-		}
-		if (o.CandidateRef != "" || o.Candidate != nil ||
-			o.Fulfillment != nil && o.Fulfillment.WorkspaceRevisionRef != "") && o.DeliveryID == "" {
-			return fmt.Errorf("含 candidate/workspace fulfillment 的 TaskOutcome v3 必须携带 delivery_id")
-		}
+	if o.CandidateRef != "" && graphFields != 3 {
+		return fmt.Errorf("候选结果必须绑定 Graph")
 	}
 	if o.Status != StatusCompleted {
 		if strings.TrimSpace(o.ReasonCode) == "" || strings.TrimSpace(o.Reason) == "" {

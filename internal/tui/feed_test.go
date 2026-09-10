@@ -201,26 +201,11 @@ func TestRecentDecisionLinesPreserveGraphTerminalOutcome(t *testing.T) {
 	}
 }
 
-func TestRenderNodeWorkbenchExplainsWaitingAndFailureContext(t *testing.T) {
-	deadline := time.Date(2026, 8, 6, 15, 4, 5, 0, time.UTC)
-	view := renderNodeWorkbench(DefaultTheme(), 90, 20,
-		GraphInfo{GraphID: "g-wait", Status: "running"},
-		GraphNodeInfo{
-			NodeID: "approval", Title: "Approve release", Kind: "approval", Status: "waiting",
-			ActivationID: "approval@1", RequestID: "request-1", WaitEvent: "release.approved",
-			WaitDeadline: &deadline, Reason: "等待用户确认发布范围",
-		}, nil, nil, nil,
-		[]ui.TraceEvent{{
-			Kind: "graph_wait_started", GraphID: "g-wait", NodeID: "approval",
-			ActivationID: "approval@1", Message: "event=release.approved",
-		}}, 0, 1, 0)
-
-	for _, want := range []string{
-		"waiting", "release.approved", "request-1", "15:04:05",
-		"等待用户确认发布范围", "graph_wait_started",
-	} {
+func TestRenderNodeWorkbenchExplainsWaitingInput(t *testing.T) {
+	view := renderNodeWorkbench(DefaultTheme(), 90, 20, GraphInfo{GraphID: "g-wait", Status: "open"}, GraphNodeInfo{NodeID: "work", Title: "读取用户材料", Kind: "agentTask", Status: "waiting", Reason: "waiting_inputs:answer"}, nil, nil, nil, nil, 0, 1, 0)
+	for _, want := range []string{"waiting", "waiting_inputs:answer"} {
 		if !strings.Contains(view, want) {
-			t.Fatalf("waiting node detail missing %q: %q", want, view)
+			t.Fatalf("缺少等待原因 %s: %s", want, view)
 		}
 	}
 }

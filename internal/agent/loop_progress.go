@@ -51,9 +51,6 @@ type loopProgressStore interface {
 	AppendReservation(loopcontract.ActionReservation) error
 	AppendActionSettlement(loopcontract.ActionSettlement) error
 	AppendSettlement(loopcontract.TurnSettlementDelta, loopcontract.ProgressAssessment, loopcontract.ProgressCheckpoint) error
-	AppendSettlementWithIntervention(loopcontract.TurnSettlementDelta, loopcontract.ProgressAssessment,
-		loopcontract.ProgressCheckpoint, *loopcontract.LoopInterventionRequested) error
-	AppendIntervention(loopcontract.ProgressCheckpoint, loopcontract.LoopInterventionRequested) error
 	LoadCheckpoint(string) (*loopcontract.ProgressCheckpoint, bool, error)
 	Seal(loopcontract.ProgressCheckpoint) error
 }
@@ -218,58 +215,6 @@ func (a *Agent) futureAttemptBudgetAvailable(task *model.Task) (bool, int64, int
 	}
 	used := checkpoint.CumulativeUsage.Attempts
 	return used < limit, used, limit, nil
-}
-
-func (a *Agent) requestAttemptBudgetIntervention(task *model.Task) error {
-	if a == nil || task == nil || task.ProgressContract == nil || a.LoopStore == nil {
-		return fmt.Errorf("Attempt budget intervention 缺少 ProgressContract/LoopStore")
-	}
-	checkpoint, ok, err := a.LoopStore.LoadCheckpoint(task.ID)
-	if err != nil {
-		return err
-	}
-	if !ok || checkpoint == nil || checkpoint.AttemptID != task.AttemptID || checkpoint.Sealed {
-		return fmt.Errorf("Attempt budget intervention checkpoint 不可用或 lineage 不一致")
-	}
-	now := time.Now().UTC()
-	next := *checkpoint
-	next.Version++
-	next.CheckpointID = stableLoopID("checkpoint", task.ID, task.AttemptID,
-		fmt.Sprintf("%d-attempt-budget-intervention", next.Version))
-	next.InterventionStage = loopcontract.StageInterventionRequired
-	next.InterventionCount++
-	next.LastInterventionAt = now
-	next.UpdatedAt = now
-	command := buildLoopIntervention(*task.ProgressContract, task, next, loopcontract.InterventionAttemptBudget)
-	return a.LoopStore.AppendIntervention(next, command)
-}
-
-// requestInvocationIntervention 把 Invocation policy 的
-// RecoveryRequestIntervene 落成与 no-progress 同一条 durable L4→L5 命令。
-// canonical failure 已随刚结算的 TurnSettlementDelta 冻结；command 通过
-// CheckpointRef 关联该失败事实，不复制 provider 原文。
-func (a *Agent) requestInvocationIntervention(task *model.Task) error {
-	if a == nil || task == nil || task.ProgressContract == nil || a.LoopStore == nil {
-		return fmt.Errorf("Invocation intervention 缺少 ProgressContract/LoopStore")
-	}
-	checkpoint, ok, err := a.LoopStore.LoadCheckpoint(task.ID)
-	if err != nil {
-		return err
-	}
-	if !ok || checkpoint == nil || checkpoint.AttemptID != task.AttemptID || checkpoint.Sealed {
-		return fmt.Errorf("Invocation intervention checkpoint 不可用或 lineage 不一致")
-	}
-	now := time.Now().UTC()
-	next := *checkpoint
-	next.Version++
-	next.CheckpointID = stableLoopID("checkpoint", task.ID, task.AttemptID,
-		fmt.Sprintf("%d-invocation-intervention", next.Version))
-	next.InterventionStage = loopcontract.StageInterventionRequired
-	next.InterventionCount++
-	next.LastInterventionAt = now
-	next.UpdatedAt = now
-	command := buildLoopIntervention(*task.ProgressContract, task, next, loopcontract.InterventionUnsafeUnknown)
-	return a.LoopStore.AppendIntervention(next, command)
 }
 
 func loopDeadlineSet(task *model.Task, now time.Time) (loopcontract.DeadlineSet, error) {
@@ -624,7 +569,7 @@ func (r *loopProgressRuntime) settleTurn(a *Agent, task *model.Task, turnID stri
 	if err != nil {
 		return err
 	}
-	if err := r.store.AppendSettlementWithIntervention(delta, assessment, next, nil); err != nil {
+	if err := r.store.AppendSettlement(delta, assessment, next); err != nil {
 		return err
 	}
 	r.checkpoint = next
@@ -849,36 +794,6 @@ func historyEntryFromResult(result ExecuteResult, modelName, turnID string) cont
 	}
 }
 
-func buildLoopIntervention(contract loopcontract.CompiledProgressContract, task *model.Task,
-	checkpoint loopcontract.ProgressCheckpoint, reason loopcontract.InterventionReason) loopcontract.LoopInterventionRequested {
-	missing := make([]string, 0, len(contract.Deliverables)+len(contract.VerificationTargets))
-	for _, deliverable := range contract.Deliverables {
-		if deliverable.Required {
-			missing = append(missing, deliverable.ID)
-		}
-	}
-	for _, verification := range contract.VerificationTargets {
-		if verification.Required {
-			missing = append(missing, verification.ID)
-		}
-	}
-	remaining := runcontract.BudgetLimit{}
-	return loopcontract.LoopInterventionRequested{
-		Schema: loopcontract.InterventionSchemaV1,
-		CommandID: stableLoopID("intervention", task.ID, checkpoint.AttemptID,
-			fmt.Sprintf("%d", checkpoint.InterventionCount), string(reason)),
-		RunID: task.RunID, GraphID: task.GraphID, FinalReportGraphID: task.FinalReportGraphID,
-		NodeID: task.NodeID, ActivationID: task.ActivationID,
-		TaskID: task.ID, AttemptID: checkpoint.AttemptID, Contract: contract.Ref,
-		ReasonCode: reason, MissingMilestones: missing,
-		RepeatedSignals: append([]loopcontract.ProgressFingerprint(nil), checkpoint.RecentFingerprints...),
-		BudgetUsed:      checkpoint.CumulativeUsage,
-		BudgetRemaining: remaining,
-		CheckpointRef:   checkpoint.CheckpointID, ObservationDeltaRef: checkpoint.ObservationDeltaRef,
-		RequestedAt: checkpoint.UpdatedAt,
-	}
-}
-
 func remainingBudget(limit runcontract.BudgetLimit, used runcontract.BudgetUsage) runcontract.BudgetLimit {
 	return runcontract.BudgetLimit{
 		WallTime:         positiveDuration(limit.WallTime - used.WallTime),
@@ -995,12 +910,10 @@ func isCoordinationTool(name string) bool {
 }
 
 func toolEvidenceRef(call llm.ToolCall) string {
-	for _, key := range []string{"path", "query", "pattern", "url", "command"} {
-		if value, _ := call.Arguments[key].(string); value != "" {
-			return boundedLoopIdentity(call.Name + ":" + value)
-		}
+	if call.ID != "" {
+		return "tool-call:" + call.ID
 	}
-	return call.Name + ":" + digestText(fmt.Sprintf("%v", call.Arguments))[:16]
+	return "tool-call-digest:" + digestText(fmt.Sprintf("%s:%v", call.Name, call.Arguments))
 }
 
 func boundedLoopIdentity(value string) string {

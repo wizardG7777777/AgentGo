@@ -27,6 +27,7 @@ import (
 // *workspace.Manager；定义为接口是项目「接口驱动」惯例，也让合并冲突路径
 // 在测试中可用 fake 覆盖（A 线落地前的桩实现 passthrough，无法产生真冲突）。
 type WorkspaceLifecycleManager interface {
+	MaterializeAgentTask(taskID, graphID, runID, parentRef string) (*workspace.View, error)
 	Materialize(taskID string) (*workspace.View, error)
 	MaterializeOwned(workspaceID string, owner workspace.Owner) (*workspace.View, error)
 	Acquire(workspaceID string) (release func(), err error)

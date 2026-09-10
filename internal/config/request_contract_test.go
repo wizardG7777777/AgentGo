@@ -8,7 +8,7 @@ import (
 )
 
 func TestModelRequestContractIsExplicitAndStreamFieldRetired(t *testing.T) {
-	for _, input := range []string{"llm:\n  default_model: test\n", "llm:\n  request_contract: old\n", "llm:\n  request_contract: agentgo.model-request/v1\n  stream: true\n", "llm:\n  request_contract: agentgo.model-request/v1\n  stream: false\n"} {
+	for _, input := range []string{"graph:\n  request_contract: agentgo.graph/v6\nllm:\n  default_model: test\n", "graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: old\n", "graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\n  stream: true\n", "graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\n  stream: false\n"} {
 		path := filepath.Join(t.TempDir(), "setting.yaml")
 		if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
 			t.Fatal(err)
@@ -18,7 +18,7 @@ func TestModelRequestContractIsExplicitAndStreamFieldRetired(t *testing.T) {
 		}
 	}
 	path := filepath.Join(t.TempDir(), "setting.yaml")
-	if err := os.WriteFile(path, []byte("llm:\n  request_contract: agentgo.model-request/v1\n  default_model: test\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: test\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := LoadConfig(path, true)

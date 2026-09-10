@@ -61,7 +61,11 @@ func forwardUpdates(ctx context.Context, obs ui.Observer, p *tea.Program) {
 	if modelErr != nil {
 		return
 	}
-	defer func() { if modelCancel!=nil{modelCancel()} }()
+	defer func() {
+		if modelCancel != nil {
+			modelCancel()
+		}
+	}()
 	view := ui.ModelOutputView{}
 	for {
 		select {
@@ -1079,12 +1083,7 @@ func cloneGraphViews(graphs []GraphInfo) []GraphInfo {
 		cloned[index] = graph
 		cloned[index].Nodes = append([]ui.GraphNodeView(nil), graph.Nodes...)
 		cloned[index].Edges = append([]ui.GraphEdgeView(nil), graph.Edges...)
-		for nodeIndex := range cloned[index].Nodes {
-			if graph.Nodes[nodeIndex].WaitDeadline != nil {
-				deadline := *graph.Nodes[nodeIndex].WaitDeadline
-				cloned[index].Nodes[nodeIndex].WaitDeadline = &deadline
-			}
-		}
+
 	}
 	return cloned
 }

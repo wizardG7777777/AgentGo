@@ -245,3 +245,5 @@ func TestProcessTask_IsolationMergeSettleFailureIsAuthorityFailure(t *testing.T)
 		t.Fatalf("Settle 失败应以 authority failure 阻断 completed: status=%s error=%q", task.Status, task.Error)
 	}
 }
+
+func(m *closingMergeManager)MaterializeAgentTask(taskID,graphID,runID,parentRef string)(*workspace.View,error){return m.base.MaterializeAgentTask(taskID,graphID,runID,parentRef)}

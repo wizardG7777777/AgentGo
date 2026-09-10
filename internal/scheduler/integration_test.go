@@ -1,34 +1,41 @@
 package scheduler
 
 import (
+	"agentgo/internal/config"
+	"agentgo/internal/llm"
+	"agentgo/internal/mailbox"
+	"agentgo/internal/model"
+	"agentgo/internal/modes"
+	"agentgo/internal/roster"
+	"agentgo/internal/store"
+	"agentgo/internal/taskmem"
 	"agentgo/internal/testmodel"
 	"context"
 	"slices"
 	"sync"
 	"testing"
-	"time"
-
-	"agentgo/internal/config"
-	"agentgo/internal/contentstore"
-	"agentgo/internal/contextruntime"
-	"agentgo/internal/contextstore"
-	"agentgo/internal/graph"
-	"agentgo/internal/llm"
-	"agentgo/internal/mailbox"
-	"agentgo/internal/model"
-	"agentgo/internal/modes"
-	"agentgo/internal/policycatalog"
-	"agentgo/internal/roster"
-	"agentgo/internal/store"
-	"agentgo/internal/taskmem"
 )
 
-// scriptedLLM 是 integration_test 用的简化 LLM mock。
-// 它按 responses 顺序返回，超出后返回 "done" 文本响应。
 type scriptedLLM struct {
 	mu        sync.Mutex
-	responses []testmodel.Fixture
-	calls     int
+	responses []testmodel.// scriptedLLM 是 integration_test 用的简化 LLM mock。
+	// 它按 responses 顺序返回，超出后返回 "done" 文本响应。
+	// TestSchedulerBundle_New_RegistersMailboxAlias 验证 Bundle 构造时 scheduler agent
+	// 在 mailbox 中注册了 "scheduler" 别名（这是 worker / explorer 给 scheduler 发邮件
+	// 时使用的稳定地址）。
+	// 通过别名向 scheduler 发邮件，应当能成功路由
+	// 别名
+	// scheduler agent 的私有 Mailbox 应当收到这条消息
+	// TestSchedulerBundle_New_AgentEventTypeIsScheduler 验证 scheduler agent 的
+	// EventType 是 "__scheduler__"，确保它不会与 worker (EventType="") 抢任务。
+	// 2026-04-25 修改：schedulerMaxRetries 从历史上的 0（无限）改为 5（有限）。
+	// Phase 3 引入 waitForBatchTerminal 后"等 worker 无限重试"语义不再依赖 MaxRetries=0。
+	// 该断言锁定 scheduler 必须拥有有限重试，防止未来回退到无限空转（2026-04-20 根因）。
+	// TestSchedulerBundle_New_ModesDefaultAxes 验证 Bundle.Modes 两轴默认值
+	// 为 normal / team（nil modeStore 回落 DefaultStore）。
+	// 本测试隔离 provider 审批，仍真实执行图编译、持久化与 L1/L2 工具调用。
+	Fixture
+	calls int
 }
 
 func (s *scriptedLLM) nextFixture(ctx context.Context, msgs []llm.Message, tools []llm.ToolDef) (testmodel.Fixture, error) {
@@ -43,32 +50,19 @@ func (s *scriptedLLM) nextFixture(ctx context.Context, msgs []llm.Message, tools
 	return testmodel.Fixture{Content: "done"}, nil
 }
 
-// TestSchedulerBundle_New_RegistersMailboxAlias 验证 Bundle 构造时 scheduler agent
-// 在 mailbox 中注册了 "scheduler" 别名（这是 worker / explorer 给 scheduler 发邮件
-// 时使用的稳定地址）。
 func TestSchedulerBundle_New_RegistersMailboxAlias(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	r := roster.NewMemoryRoster()
 	mb := mailbox.NewRegistry(8)
 	cfg := config.DefaultConfig()
-
-	bundle := newTestScheduler(t, s, r, &scriptedLLM{}, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
-		nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	bundle := newTestScheduler(t, s, r, &scriptedLLM{}, ch, cfg, nil, mb, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	if bundle == nil || bundle.Agent == nil {
 		t.Fatal("New returned nil Bundle")
 	}
-
-	// 通过别名向 scheduler 发邮件，应当能成功路由
-	if err := mb.Send(mailbox.Message{
-		From:    "worker-1",
-		To:      "scheduler", // 别名
-		Content: "test",
-	}); err != nil {
+	if err := mb.Send(mailbox.Message{From: "worker-1", To: "scheduler", Content: "test"}); err != nil {
 		t.Fatalf("send via scheduler alias failed: %v", err)
 	}
-
-	// scheduler agent 的私有 Mailbox 应当收到这条消息
 	if bundle.Agent.Mailbox == nil {
 		t.Fatal("scheduler agent should have a Mailbox after New")
 	}
@@ -78,31 +72,21 @@ func TestSchedulerBundle_New_RegistersMailboxAlias(t *testing.T) {
 	}
 }
 
-// TestSchedulerBundle_New_AgentEventTypeIsScheduler 验证 scheduler agent 的
-// EventType 是 "__scheduler__"，确保它不会与 worker (EventType="") 抢任务。
 func TestSchedulerBundle_New_AgentEventTypeIsScheduler(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	r := roster.NewMemoryRoster()
 	cfg := config.DefaultConfig()
-
 	taskMemory := taskmem.NewStore(t.TempDir())
-	bundle := newTestScheduler(t, s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil,
-		nil, nil, nil, nil, nil, nil, nil, nil, nil,
-		GraphAuthoringDeps{TaskMemStore: taskMemory})
+	bundle := newTestScheduler(t, s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, GraphAuthoringDeps{TaskMemStore: taskMemory})
 	if bundle.Agent.EventType != "__scheduler__" {
 		t.Errorf("Agent.EventType = %q, want __scheduler__", bundle.Agent.EventType)
 	}
-	// 2026-04-25 修改：schedulerMaxRetries 从历史上的 0（无限）改为 5（有限）。
-	// Phase 3 引入 waitForBatchTerminal 后"等 worker 无限重试"语义不再依赖 MaxRetries=0。
-	// 该断言锁定 scheduler 必须拥有有限重试，防止未来回退到无限空转（2026-04-20 根因）。
 	if bundle.Agent.MaxRetries != schedulerMaxRetries {
-		t.Errorf("Agent.MaxRetries = %d, want %d (schedulerMaxRetries constant)",
-			bundle.Agent.MaxRetries, schedulerMaxRetries)
+		t.Errorf("Agent.MaxRetries = %d, want %d (schedulerMaxRetries constant)", bundle.Agent.MaxRetries, schedulerMaxRetries)
 	}
 	if bundle.Agent.MaxRetries <= 0 {
-		t.Errorf("Agent.MaxRetries = %d, must be >0 (finite retry prevents infinite loop on LLM outage)",
-			bundle.Agent.MaxRetries)
+		t.Errorf("Agent.MaxRetries = %d, must be >0 (finite retry prevents infinite loop on LLM outage)", bundle.Agent.MaxRetries)
 	}
 	if bundle.Agent.TaskMemStore != taskMemory {
 		t.Fatal("Scheduler 必须与 Runner 共用 Task Memory authority")
@@ -112,16 +96,12 @@ func TestSchedulerBundle_New_AgentEventTypeIsScheduler(t *testing.T) {
 	}
 }
 
-// TestSchedulerBundle_New_ModesDefaultAxes 验证 Bundle.Modes 两轴默认值
-// 为 normal / team（nil modeStore 回落 DefaultStore）。
 func TestSchedulerBundle_New_ModesDefaultAxes(t *testing.T) {
 	ch := make(chan model.Event, 64)
 	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
 	r := roster.NewMemoryRoster()
 	cfg := config.DefaultConfig()
-
-	bundle := newTestScheduler(t, s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil,
-		nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	bundle := newTestScheduler(t, s, r, &scriptedLLM{}, ch, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	if bundle.Modes == nil {
 		t.Fatal("Bundle.Modes is nil")
 	}
@@ -132,131 +112,6 @@ func TestSchedulerBundle_New_ModesDefaultAxes(t *testing.T) {
 		t.Errorf("default topo = %v, want TopoTeam", bundle.Modes.GetTopo())
 	}
 }
-
-// TestSchedulerBundleEndToEndUserInputAppliesGraph 是一个端到端集成测试。
-//
-// 它模拟一个完整的请求循环：
-//  1. CLI 发送 EventUserInput（"hello"）到 eventCh
-//  2. Activator 接收事件，PublishTask 一个 EventType="__scheduler__" 的 task
-//  3. Scheduler agent poll 到该 task，进入 processTask
-//  4. phase ToolRouter 只暴露 create_graph_draft 并冻结 required choice
-//  5. mock LLM 返回 create_graph_draft 工具调用
-//  6. GraphAuthoringStore 持久化归属当前 Scheduler task 的 Draft
-//
-// 这是 Graph-first scheduler-as-agent 架构的最小验证，证明：
-//   - Activator 桥能把 EventCh 翻译成 task
-//   - scheduler agent 能 poll 到并处理 scheduler-only task
-//   - auto-singleton + L3 required-action 不会放松 ToolRouter 权威
-//   - Graph authoring 生产装配确实连到 durable Store
-func TestSchedulerBundleEndToEndUserInputAppliesGraph(t *testing.T) {
-	ch := make(chan model.Event, 64)
-	s := store.NewMemoryTaskStore(ch, 100, 2, 300)
-	r := roster.NewMemoryRoster()
-	mb := mailbox.NewRegistry(8)
-	cfg := config.DefaultConfig()
-	// 本测试用脚本化 LLM 在 1-2 步完成；Scheduler 的 YAML 循环预算由
-	// TestSchedulerBundle_New_AppliesConfiguredBehaviorBudgets 单独覆盖。
-	cfg.Agents = []config.AgentKind{{Kind: "worker", Replicas: 1}}
-
-	mockLLM := &scriptedLLM{
-		responses: []testmodel.Fixture{
-			// 第一轮：按 auto-singleton 调用唯一构图工具。
-			{
-				ToolCalls: []llm.ToolCall{
-					{
-						ID:        "call_1",
-						Name:      "apply_graph_change",
-						Arguments: schedulerGraphCreateArgs(),
-					},
-				},
-			},
-		},
-	}
-	snapshots, err := contextstore.New(t.TempDir() + "/snapshots")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = snapshots.Close() })
-	contents, err := contentstore.Open(t.TempDir()+"/content", contentstore.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = contents.Close() })
-	policies, err := policycatalog.NewDefault()
-	if err != nil {
-		t.Fatal(err)
-	}
-	contextRuntime := contextruntime.Runtime{
-		Assembler: contextruntime.NewAssembler(), Policies: policies, Snapshots: snapshots, Content: contents,
-		SessionID: func() string { return "scheduler-integration" }, Options: testmodel.Runtime(t).Options, Output: testmodel.Runtime(t).Output,
-	}
-	authoringStore, err := graph.NewAuthoringStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = authoringStore.Close() })
-
-	bundle := newTestScheduler(t, s, r, mockLLM, ch, cfg, nil, mb, nil, nil, nil, nil, nil,
-		nil, nil, nil, nil, nil, nil, nil, nil, nil,
-		GraphAuthoringDeps{
-			Store: authoringStore, Compiler: graph.DefinitionCompiler{Policies: policies, Acceptance: schedulerAcceptancePass{}},
-			ContextRuntime: contextRuntime,
-		})
-
-	// 启动 Activator + Agent
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); bundle.Activator.Run(ctx) }()
-	go func() { defer wg.Done(); bundle.Agent.Run(ctx) }()
-
-	// 发送用户输入
-	ch <- model.Event{
-		Type:    model.EventUserInput,
-		Payload: map[string]string{"text": "hello"},
-	}
-
-	// 等待 Scheduler 首个构图动作真实落盘。
-	deadline := time.Now().Add(5 * time.Second)
-	var schedTask *model.Task
-	var definition *graph.GraphDefinition
-	for time.Now().Before(deadline) {
-		tasks, _ := s.ScanAll()
-		for _, task := range tasks {
-			if task.EventType == "__scheduler__" {
-				schedTask = task
-				for _, d := range authoringStore.ListLatestDefinitions() {
-					if d.OwnerTaskID == task.ID {
-						copy := d
-						definition = &copy
-						break
-					}
-				}
-				break
-			}
-		}
-		if schedTask != nil && definition != nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	cancel()
-	wg.Wait()
-
-	if schedTask == nil || definition == nil {
-		// 打印当前 store 状态便于诊断
-		tasks, _ := s.ScanAll()
-		t.Fatalf("scheduler task did not persist GraphDraft within 5s. Current tasks: %+v", tasks)
-	}
-	if definition.OwnerTaskID != schedTask.ID || definition.Revision != 1 || definition.Body.Root != "work" {
-		t.Fatalf("正式图归属/版本错误：%+v", definition)
-	}
-
-}
-
 func (s *scriptedLLM) Invoke(ctx context.Context, request llm.Request, sink llm.EventSink) (llm.Result, error) {
 	if err := request.Validate(); err != nil {
 		return llm.Result{}, err
@@ -269,19 +124,8 @@ func (s *scriptedLLM) Invoke(ctx context.Context, request llm.Request, sink llm.
 	return fixture.Seal(spec.Options.Protocol)
 }
 
-// 本测试隔离 provider 审批，仍真实执行图编译、持久化与 L1/L2 工具调用。
 type schedulerAcceptancePass struct{}
 
-func (schedulerAcceptancePass) EvaluateProposal(context.Context, graph.ProposalAcceptanceInput) (graph.ProposalAcceptanceDecision, error) {
-	return graph.ProposalAcceptanceDecision{Verdict: graph.ProposalAcceptancePass, Ref: "test:accepted"}, nil
-}
 func schedulerGraphCreateArgs() map[string]any {
-	return map[string]any{"operation": "create", "request_id": "first", "contract": map[string]any{"execution_class": "answer", "deliverables": []any{map[string]any{"id": "answer", "kind": "report"}}}, "definition": map[string]any{"root": "work", "nodes": map[string]any{
-		"work": map[string]any{"kind": "controller", "task": map[string]any{"title": "回答", "description": "回答用户问题"}, "contract_bindings": map[string]any{"deliverables": []string{"answer"}}, "next": []any{
-			map[string]any{"to": "done", "when": map[string]any{"event": "completed"}}, map[string]any{"to": "failed", "when": map[string]any{"event": "failed"}}, map[string]any{"to": "blocked", "when": map[string]any{"event": "blocked"}},
-		}},
-		"done":    map[string]any{"kind": "end", "end_outcome": "success", "next": []any{}},
-		"failed":  map[string]any{"kind": "end", "end_outcome": "failed", "next": []any{}},
-		"blocked": map[string]any{"kind": "end", "end_outcome": "blocked", "next": []any{}},
-	}}}
+	return map[string]any{"operation": "create", "request_id": "first", "contract": map[string]any{"execution_class": "answer", "deliverables": []any{map[string]any{"id": "answer", "kind": "report"}}}, "definition": map[string]any{"root": "work", "nodes": map[string]any{"work": map[string]any{"kind": "controller", "task": map[string]any{"title": "回答", "description": "回答用户问题"}, "contract_bindings": map[string]any{"deliverables": []string{"answer"}}, "next": []any{map[string]any{"to": "done", "when": map[string]any{"event": "completed"}}, map[string]any{"to": "failed", "when": map[string]any{"event": "failed"}}, map[string]any{"to": "blocked", "when": map[string]any{"event": "blocked"}}}}, "done": map[string]any{"kind": "end", "end_outcome": "success", "next": []any{}}, "failed": map[string]any{"kind": "end", "end_outcome": "failed", "next": []any{}}, "blocked": map[string]any{"kind": "end", "end_outcome": "blocked", "next": []any{}}}}}
 }

@@ -79,12 +79,11 @@ func TestAgent_NaturalCompletion_FallsBackToUserOutput(t *testing.T) {
 func TestAgent_GraphControllerFinalizedCompletion_DoesNotWriteUserResult(t *testing.T) {
 	s, r, _ := setup()
 	task := &model.Task{
-		Description:   "graph controller node",
-		EventType:     "__scheduler__",
-		GraphID:       "g-controller-output",
-		NodeID:        "root",
-		ActivationID:  "root@1",
-		GraphNodeKind: "controller",
+		Description:  "graph controller node",
+		EventType:    "__scheduler__",
+		GraphID:      "g-controller-output",
+		NodeID:       "root",
+		ActivationID: "root@1",
 	}
 	if err := s.PublishTask(task); err != nil {
 		t.Fatal(err)

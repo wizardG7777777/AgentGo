@@ -128,7 +128,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/session/new", s.handlePostSessionNew)
 	mux.HandleFunc("/api/session/switch", s.handlePostSessionSwitch)
 	mux.HandleFunc("/api/doctor/agents", s.handlePostDoctorAgents)
-	mux.HandleFunc("/api/graphs/event", s.handlePostGraphEvent)
+	mux.HandleFunc("/api/graphs/input", s.handlePostGraphInput)
 	return s.authMiddleware(mux)
 }
 
@@ -255,26 +255,19 @@ func writeControlError(w http.ResponseWriter, err error) {
 	writeJSONError(w, http.StatusBadRequest, err.Error())
 }
 
-// handlePostGraphEvent 投递图外部事件：{graph_id, event, data?} →
-// Controller.EmitGraphEvent。时点信号语义：未命中 waiting 的 wait_event
-// 节点（未等待 / 图终态 / 会话冻结）时静默忽略，仍返回 ok。
-func (s *Server) handlePostGraphEvent(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handlePostGraphInput(w http.ResponseWriter, r *http.Request) {
 	if !requirePost(w, r) || !s.controlAvailable(w) {
 		return
 	}
-	var body struct {
-		GraphID string         `json:"graph_id"`
-		Event   string         `json:"event"`
-		Data    map[string]any `json:"data"`
-	}
-	if !decodeControlBody(w, r, &body) {
+	var input ui.GraphInputRequest
+	if !decodeControlBody(w, r, &input) {
 		return
 	}
-	if strings.TrimSpace(body.GraphID) == "" || strings.TrimSpace(body.Event) == "" {
-		writeJSONError(w, http.StatusBadRequest, "graph_id 与 event 不能为空")
+	if input.GraphID == "" || input.Port == "" || input.Version < 1 || input.ExpectedRevision < 1 || input.RequestID == "" {
+		writeJSONError(w, http.StatusBadRequest, "graph_id/port/version/expected_revision/request_id 必填")
 		return
 	}
-	if err := s.controller.EmitGraphEvent(body.GraphID, body.Event, body.Data); err != nil {
+	if err := s.controller.ProvideGraphInput(r.Context(), input); err != nil {
 		writeControlError(w, err)
 		return
 	}
@@ -384,7 +377,7 @@ func (s *Server) handlePostMode(w http.ResponseWriter, r *http.Request) {
 	value := strings.ToLower(strings.TrimSpace(body.Value))
 	legacyMode := strings.ToLower(strings.TrimSpace(body.Mode))
 	if axis == "" && value == "" && legacyMode != "" {
-		writeJSONError(w, http.StatusBadRequest, "gate 轴已于 V6 移除：请使用 axis=exec|topo；执行前审阅改由 Graph approval 节点承担")
+		writeJSONError(w, http.StatusBadRequest, "gate 轴已于 V6 移除：请使用 axis=exec|topo；用户交互通过 Interaction 服务处理")
 		return
 	} else if legacyMode != "" {
 		writeJSONError(w, http.StatusBadRequest, "mode 不能与 axis/value 同时使用")
@@ -393,7 +386,7 @@ func (s *Server) handlePostMode(w http.ResponseWriter, r *http.Request) {
 
 	switch axis {
 	case "gate":
-		writeJSONError(w, http.StatusBadRequest, "gate 轴已于 V6 移除：执行前审阅改由 Graph approval 节点承担")
+		writeJSONError(w, http.StatusBadRequest, "gate 轴已于 V6 移除：用户交互通过 Interaction 服务处理")
 		return
 	case "exec":
 		if err := s.controller.SetExecMode(value); err != nil {

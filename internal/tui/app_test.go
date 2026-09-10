@@ -167,7 +167,8 @@ func (f *fakeUI) SteerAgent(agentID, message string) error {
 	return f.steerErr
 }
 
-func (f *fakeUI) EmitGraphEvent(graphID, event string, data map[string]any) error {
+func (f *fakeUI) ProvideGraphInput(_ context.Context, input ui.GraphInputRequest) error {
+	graphID, event, data := input.GraphID, input.Port, input.Value.(map[string]any)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.graphEvents = append(f.graphEvents, graphEventCall{graphID: graphID, event: event, data: data})
@@ -286,11 +287,11 @@ func graphFixture(id, status string, nodeStatuses ...string) GraphInfo {
 		nodeID := fmt.Sprintf("node-%d", index+1)
 		nodes = append(nodes, ui.GraphNodeView{
 			NodeID: nodeID, Title: "Node " + strconv.Itoa(index+1), Kind: "agent",
-			Status: nodeStatus, Root: index == 0,
+			Status: nodeStatus,
 			TaskID: "task-" + strconv.Itoa(index+1), ActivationID: nodeID + "@1",
 		})
 	}
-	return ui.GraphView{GraphID: id, Status: status, Root: "node-1", Nodes: nodes}
+	return ui.GraphView{GraphID: id, Status: status, Nodes: nodes}
 }
 
 func TestNewAppModel_Defaults(t *testing.T) {

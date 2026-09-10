@@ -49,11 +49,6 @@ func (s *System) resolveInteraction(ctx context.Context, input interaction.Resol
 		// waiting tool receives the validated answer after Complete. Shell
 		// authorization keeps its dedicated trusted handler.
 		effectErr = nil
-	case graphApprovalHandler:
-		// 与 shell_command 相同：服务端零 effect。图审批的批准/拒绝事实由
-		// graph approval 桥（graph_approval.go）经 Service 终态回调异步回填
-		// Runtime.OnApprovalDecided；控制面只锁定回答并 Complete。
-		effectErr = nil
 	default:
 		effectErr = fmt.Errorf("unknown interaction handler %q", locked.Resolution.Handler)
 	}

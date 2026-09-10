@@ -69,10 +69,7 @@ type Controller interface {
 	// 运行模式/路由状态）的任务，返回审计任务 ID；审计报告作为普通任务
 	// 结果回显。无 Scheduler 或装配缺失时返回中文错误。
 	RequestAgentAudit() (taskID string, err error)
-	// EmitGraphEvent 向指定图的 wait_event 节点投递外部事件
-	// （/event 与 Web POST /api/graphs/event 的后端）。时点信号语义：
-	// 未命中等待中节点时静默忽略，不视为错误。
-	EmitGraphEvent(graphID, event string, data map[string]any) error
+	ProvideGraphInput(context.Context, GraphInputRequest) error
 	// RequestQuit 请求退出系统。
 	RequestQuit()
 }
@@ -249,14 +246,4 @@ func (h *Hub) RequestQuit() {
 		return
 	}
 	h.deps.QuitFn()
-}
-
-// EmitGraphEvent 委托注入的图外部事件入口（graph.Runtime.OnExternalEvent）。
-// 命中与否的判定（waiting 匹配 / 终态忽略 / 冻结吞掉）全部在 Runtime
-// 内部闸门完成，Hub 与调用方不感知。
-func (h *Hub) EmitGraphEvent(graphID, event string, data map[string]any) error {
-	if h.deps.EmitGraphEvent == nil {
-		return notAssembled("EmitGraphEvent")
-	}
-	return h.deps.EmitGraphEvent(graphID, event, data)
 }

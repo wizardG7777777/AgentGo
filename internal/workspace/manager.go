@@ -11,124 +11,45 @@ import (
 	"sort"
 	"strings"
 
-	"agentgo/internal/delivery"
 	"agentgo/internal/model"
 	"agentgo/internal/pathutil"
 	"agentgo/internal/store"
 )
 
-// FreezeCandidate 将 delivery workspace 的 dirty set 冻结为稳定只读身份。
-// 它不提升任何文件；manifest 条目按路径排序，并把候选文件内容摘要纳入
-// digest，因而 map 遍历顺序或展示文本都不会改变 CandidateRef。
-func (m *Manager) FreezeCandidate(deliveryID, workspaceID, workspaceRevisionRef string) (delivery.Candidate, error) {
-	if !strings.HasPrefix(deliveryID, "delivery:") || strings.TrimSpace(workspaceRevisionRef) == "" {
-		return delivery.Candidate{}, fmt.Errorf("冻结 candidate 缺少合法 delivery_id/workspace_revision_ref")
-	}
-	root, err := m.workspaceRoot(workspaceID)
-	if err != nil {
-		return delivery.Candidate{}, err
-	}
-	owner, err := loadOwner(root)
-	if err != nil {
-		return delivery.Candidate{}, fmt.Errorf("读取 candidate workspace owner: %w", err)
-	}
-	if owner.Kind != OwnerDelivery || owner.DeliveryID != deliveryID {
-		return delivery.Candidate{}, fmt.Errorf("冻结 candidate 的 workspace owner 与 delivery_id 不一致")
-	}
-	mf, err := loadManifest(filepath.Join(root, ManifestFileName))
-	if err != nil {
-		return delivery.Candidate{}, err
-	}
-	entries := mf.snapshot()
-	if len(entries) == 0 {
-		return delivery.Candidate{}, fmt.Errorf("冻结 candidate 拒绝空 dirty set")
-	}
-	paths := make([]string, 0, len(entries))
-	for path := range entries {
-		paths = append(paths, path)
-	}
-	sort.Strings(paths)
-	type frozenFile struct {
-		Path string        `json:"path"`
-		Base manifestEntry `json:"base"`
-		SHA  string        `json:"sha256"`
-	}
-	files := make([]frozenFile, 0, len(paths))
-	for _, rel := range paths {
-		data, readErr := os.ReadFile(filepath.Join(root, rel))
-		if readErr != nil {
-			return delivery.Candidate{}, fmt.Errorf("冻结 candidate 读取 %s: %w", rel, readErr)
-		}
-		sum := sha256.Sum256(data)
-		files = append(files, frozenFile{Path: rel, Base: entries[rel], SHA: hex.EncodeToString(sum[:])})
-	}
-	raw, err := json.Marshal(files)
-	if err != nil {
-		return delivery.Candidate{}, fmt.Errorf("编码 candidate manifest: %w", err)
-	}
-	sum := sha256.Sum256(raw)
-	digest := "sha256:" + hex.EncodeToString(sum[:])
-	return delivery.Candidate{
-		Ref: deliveryID + "/candidate/" + digest[7:23], WorkspaceRevisionRef: workspaceRevisionRef,
-		PatchDigest: digest, ManifestDigest: digest,
-	}, nil
-}
-
-// ResolveWorkspaceRevision 实现 executionfacts.WorkspaceRevisionResolver。Graph v3
-// repair/acceptance 换 TaskID 但共享 Delivery dirty set，版本必须由
-// candidate 实际内容而非当前 Task 的局部工具历史决定。
-func (m *Manager) ResolveWorkspaceRevision(task *model.Task, taskStore store.TaskStore) (
-	string, []string, bool, error,
-) {
-	if m == nil || task == nil || strings.TrimSpace(task.DeliveryID) == "" {
+// ResolveWorkspaceRevision 使用实际 agentTask 视图计算版本，不共享旧 Delivery workspace。
+func (m *Manager) ResolveWorkspaceRevision(task *model.Task, taskStore store.TaskStore) (string, []string, bool, error) {
+	if task == nil || task.GraphID == "" {
 		return "", nil, false, nil
 	}
-	workspaceID := DeliveryWorkspaceID(task.DeliveryID)
-	root, err := m.workspaceRoot(workspaceID)
+	v := m.ActiveView(task.ID)
+	if v == nil {
+		return "", nil, true, fmt.Errorf("任务视图未装配")
+	}
+	root, err := v.PrepareShellRoot()
 	if err != nil {
 		return "", nil, true, err
 	}
-	mf, err := loadManifest(filepath.Join(root, ManifestFileName))
+	hashes, err := snapshotHashes(root)
 	if err != nil {
 		return "", nil, true, err
 	}
-	if len(mf.snapshot()) == 0 {
-		return "workspace:empty", nil, true, nil
-	}
-	candidate, err := m.FreezeCandidate(task.DeliveryID, workspaceID, "workspace:pending")
+	raw, err := json.Marshal(hashes)
 	if err != nil {
 		return "", nil, true, err
 	}
-	ref := "workspace:" + candidate.PatchDigest
-	tasks, err := taskStore.ScanAll()
+	sum := sha256.Sum256(raw)
+	records, err := taskStore.QueryToolCalls(task.ID, "")
 	if err != nil {
 		return "", nil, true, err
 	}
-	seen := make(map[string]struct{})
-	var effectRefs []string
-	for _, related := range tasks {
-		if related == nil || related.DeliveryID != task.DeliveryID {
-			continue
-		}
-		records, queryErr := taskStore.QueryToolCalls(related.ID, "")
-		if queryErr != nil {
-			return "", nil, true, queryErr
-		}
-		for _, record := range records {
-			if !record.Success || (record.ToolName != "apply_change") ||
-				strings.TrimSpace(record.CallID) == "" {
-				continue
-			}
-			value := "tool-call:" + record.CallID
-			if _, duplicate := seen[value]; duplicate {
-				continue
-			}
-			seen[value] = struct{}{}
-			effectRefs = append(effectRefs, value)
+	var refs []string
+	for _, call := range records {
+		if call.Success && call.CallID != "" {
+			refs = append(refs, "tool-call:"+call.CallID)
 		}
 	}
-	sort.Strings(effectRefs)
-	return ref, effectRefs, true, nil
+	sort.Strings(refs)
+	return "workspace:sha256:" + hex.EncodeToString(sum[:]), refs, true, nil
 }
 
 // baselineDirName 是 workspace 根下保存基线原始副本的目录名。
@@ -175,6 +96,9 @@ func (v *View) resolveRead(absMainPath string) string {
 	if _, hit := v.mf.get(rel); hit {
 		return filepath.Join(v.root, rel)
 	}
+	if v.baseRoot != "" {
+		return filepath.Join(v.baseRoot, rel)
+	}
 	return absMainPath
 }
 
@@ -212,7 +136,11 @@ func (v *View) resolveWrite(absMainPath string) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(wsPath), 0o755); err != nil {
 		return "", fmt.Errorf("创建 workspace 目录失败：%w", err)
 	}
-	data, err := os.ReadFile(absMainPath)
+	basePath := absMainPath
+	if v.baseRoot != "" {
+		basePath = filepath.Join(v.baseRoot, rel)
+	}
+	data, err := os.ReadFile(basePath)
 	switch {
 	case err == nil:
 		// 主根存在 → 复制基线进 workspace，并落基线原始副本。

@@ -121,11 +121,12 @@ func (r *MergeResult) ConflictedPaths() []string {
 // 接口（ReadPath/WritePath），由工具在 pathutil.ValidatePath 之后调用。
 // 生命周期：Materialize 创建 → 任务执行期使用 → MergeTask 后 Cleanup。
 type View struct {
-	taskID string
-	root   string // workspace 根绝对路径
-	mgr    *Manager
-	mf     *manifest  // dirty set 清单（基线 SHA256 + 新建标记），随 COW 即时持久化
-	mu     sync.Mutex // 串行化 copy-on-write 的检查-复制序列
+	baseRoot string // agentTask 冻结输入的完整代码基线；不是可变主根别名。
+	taskID   string
+	root     string // workspace 根绝对路径
+	mgr      *Manager
+	mf       *manifest  // dirty set 清单（基线 SHA256 + 新建标记），随 COW 即时持久化
+	mu       sync.Mutex // 串行化 copy-on-write 的检查-复制序列
 	// shellMu/shellReady 保护可丢弃的完整项目快照。稀疏 COW
 	// 只能服务文件工具；Shell 需要真实目录树才能运行构建/测试。
 	shellMu    sync.Mutex
@@ -239,6 +240,7 @@ func (s *Swapper) ActiveView() *View {
 // 合并回主根的写入经 roster 逐文件 TryClaim（roster 可为 nil = 跳过声明，
 // 仅测试用）。
 type Manager struct {
+	commitMu    sync.Mutex // 同一项目的多个图提交必须串行核对基线与写回。
 	projectRoot string
 	roster      roster.Roster
 

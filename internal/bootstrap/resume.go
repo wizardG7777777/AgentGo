@@ -218,19 +218,12 @@ func restoreOrReconcileRuntime(sys *System, snap *session.Snapshot) error {
 			return err
 		}
 	}
-	if sys != nil && sys.TaskOutcomeStore != nil && sys.GraphStore != nil {
-		authority := newGraphTaskOutcomeAuthority(sys.GraphStore, sys.TaskOutcomeStore, sys.LoopStore)
-		if sys.Config != nil {
-			authority.projectRoot = sys.Config.ProjectRoot
-		}
-		authority.candidates, authority.deliveries = sys.WorkspaceManager, sys.DeliveryStore
-		if err := authority.RecoverPendingIntents(sys.Store); err != nil {
-			return fmt.Errorf("恢复 pending TerminalIntent: %w", err)
-		}
-		if err := authority.ReconcileTasks(sys.Store); err != nil {
-			return fmt.Errorf("恢复 TaskOutcome 投影: %w", err)
+	if sys != nil && sys.graphDriver != nil {
+		if err := sys.graphDriver.recoverOutcomes(sys.Store); err != nil {
+			return err
 		}
 	}
+
 	return nil
 }
 
@@ -246,7 +239,7 @@ func restoreRuntimeBeforeReactorActivation(sys *System, snap *session.Snapshot, 
 	if err := restoreOrReconcileRuntime(sys, snap); err != nil {
 		return err
 	}
-	if err := replayPendingTaskOutcomes(sys); err != nil {
+	if err := reconcileDataflowOutcomeRecords(sys); err != nil {
 		return fmt.Errorf("重放 TaskOutcome delivery outbox: %w", err)
 	}
 	emitResumeBlocks(blocks)

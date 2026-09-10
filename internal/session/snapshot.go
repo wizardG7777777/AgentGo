@@ -23,9 +23,9 @@ import (
 // older versions and upgrades them in memory so existing sessions remain
 // resumable; pre-v4 mailbox messages are dropped because their read/unread
 // state cannot be distinguished safely.
-const currentSnapshotVersion = 7
+const currentSnapshotVersion = 8
 
-const oldestSupportedSnapshotVersion = 7
+const oldestSupportedSnapshotVersion = 8
 
 // Snapshot 是某一时刻的完整状态快照。
 type Snapshot struct {
@@ -91,21 +91,15 @@ type TaskSnapshot struct {
 	PendingSince         string                          `json:"pending_since,omitempty"`
 	StartedAt            string                          `json:"started_at,omitempty"`
 	CompletedAt          string                          `json:"completed_at,omitempty"`
-	// GraphID / NodeID / ActivationID / GraphNodeKind 是 V6 Graph 归属身份（见 model.Task
 	// 同名字段）。纯增量字段：旧版本快照没有它们，Unmarshal 得空串，按
 	// 「未知旧节点角色」降级，因此不提升 currentSnapshotVersion。
 	// 必须随快照走：恢复后 graph-terminal-feed 凭 GraphID 回填引擎、
 	// graphBoard 凭 (GraphID, ActivationID) 幂等去重；丢失会让在途图
-	// 节点永久等不到终态事实。旧 GraphNodeKind 为空时租约只授予
 	// submit_task_result，绝不按 route 猜测并注入 request_replan。
 	GraphID                      string `json:"graph_id,omitempty"`
 	NodeID                       string `json:"node_id,omitempty"`
 	ActivationID                 string `json:"activation_id,omitempty"`
-	GraphNodeKind                string `json:"graph_node_kind,omitempty"`
 	DeliveryID                   string `json:"delivery_id,omitempty"`
-	GraphControllerRole          string `json:"graph_controller_role,omitempty"`
-	RecoverySourceTaskID         string `json:"recovery_source_task_id,omitempty"`
-	GraphRecoveryDeltaSchema     string `json:"graph_recovery_delta_schema,omitempty"`
 	InterventionGraphID          string `json:"intervention_graph_id,omitempty"`
 	InterventionNodeID           string `json:"intervention_node_id,omitempty"`
 	InterventionActivationID     string `json:"intervention_activation_id,omitempty"`

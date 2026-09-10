@@ -1,7 +1,6 @@
 package workspace
 
 import (
-	"agentgo/internal/executionfacts"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,34 +11,70 @@ import (
 	"sort"
 	"strings"
 	"testing"
-
-	"agentgo/internal/model"
-	"agentgo/internal/store"
 )
-
-// Windows 纪律：全部文件读写用 os.WriteFile / os.ReadFile（内部自行关闭
-// 句柄），无长生命周期句柄，t.TempDir() 可安全清理。
 
 func newTestManager(t *testing.T) (*Manager, string) {
 	t.Helper()
 	root := t.TempDir()
-	// nil roster：跳过声明（仅测试用，见 Manager 注释）。
 	m := NewManager(root, nil)
 	return m, m.ProjectRoot()
 }
-
 func writeMain(t *testing.T, root, rel, content string) string {
 	t.Helper()
 	p := filepath.Join(root, rel)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		t.Fatalf("创建目录失败：%v", err)
 	}
-	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(p, []byte(// Windows 纪律：全部文件读写用 os.WriteFile / os.ReadFile（内部自行关闭
+	// 句柄），无长生命周期句柄，t.TempDir() 可安全清理。
+	// nil roster：跳过声明（仅测试用，见 Manager 注释）。
+	// cowAndEdit 走一遍完整 copy-on-write：Materialize → WritePath → 在
+	// workspace 副本上写入新内容。返回 workspace 副本路径。
+	// 首次 WritePath 触发 copy-on-write。
+	// manifest 记录基线 SHA256 且已持久化到磁盘。
+	// 主根未被改动；重复 WritePath 幂等返回同一路径。
+	// ReadPath：命中副本返回 workspace 路径，未触碰文件穿透主根。
+	// manifest 未登记的 workspace 物理文件不是业务副本：
+	// 它可能是 owner/manifest/shell cache 或崩溃残留，必须继续读穿透。
+	// 父目录已创建，文件尚未写入。
+	// workspace 改第 5 行；随后主根被他人改第 1 行（模拟并发变更）。
+	// 主根同位置并发修改 → 行区间相交。
+	// 冲突文件不落地：主根保留合并前内容。
+	// 登记一次 COW 后，换一个新 Manager（模拟重试/重启）重新 Materialize，
+	// manifest 应从磁盘恢复。
+	// 换一个 Manager 实例（无内存状态）也应看到同样的目录。
+	// 在 workspace 根外预建目录，验证防卫逻辑不会误删。
+	// --- 双任务并发写同一主根文件（fan-out 写集相交，本特性的存在理由） ---
+	// TestMergeTask_TwoIsolatedTasksDisjointEditsAutoMerge 菱形场景：两个隔离任务
+	// 同时对同一文件做 COW（基线同为原版），各自修改不相交的行。先合并者
+	// fast-forward；后合并者面对「主根自基线已变」走三路自动合并——最终主根
+	// 必须同时携带两处修改，且两份报告分别为 fast_forward / auto_merged。
+	// 两个任务先后物化（基线都是原版），各自改不相交的行。
+	// task-A 先合并：主根未变 → fast-forward。
+	// task-B 后合并：主根已被 A 改过（hash ≠ 基线），三路合并区间不相交 → auto_merged。
+	// 终态：主根同时携带 A、B 两处修改，其余行保持原版。
+	// TestMergeTask_TwoIsolatedTasksSameLineConflict 双任务改同一行：先合并者胜，
+	// 后合并者冲突——冲突文件不落盘（主根保留先者内容），ConflictedPaths 正确，
+	// 且后合并任务的 workspace 现场保留（交 Scheduler 裁决/排查）。
+	// 冲突不落盘：主根保留先合并者内容。
+	// 冲突区域报告可用（裁决依据）：含双方文本。
+	// editLines 把文件的第 n 行（1-based）替换为 content（保持其余行不变）。
+	// TestRelativeProjectRoot_EndToEnd 回归（2026-07-27 真实运行事故）：
+	// 真实配置允许 project_root: "."，Manager/Swapper 构造期必须把根归一为
+	// 绝对路径——否则工具层经 ValidatePath 归一后的绝对目标路径会让
+	// filepath.Rel(相对, 绝对) 报错，隔离任务全部「路径不在主根内」失败。
+	// 单测此前全用 t.TempDir()（恒绝对），漏检该环境差异。
+	// 切进主根并以 "." 构造（模拟真实配置的相对根）；测试结束恢复 CWD。
+	// 主根已存在的文件，用绝对路径（工具层 ValidatePath 之后的形态）写入。
+	// 认领时换入视图（agent 认领隔离任务的真实动作；无视图时 Swapper passthrough）。
+	// 经 Swapper（工具实际走的路径）解析写入位置：必须解析到 workspace 副本
+	// 而不是报「路径不在主根内」。
+	// View 根与 Manager 根应为绝对路径。
+	content), 0o644); err != nil {
 		t.Fatalf("写主根文件失败：%v", err)
 	}
 	return p
 }
-
 func readFile(t *testing.T, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -48,9 +83,6 @@ func readFile(t *testing.T, path string) string {
 	}
 	return string(data)
 }
-
-// cowAndEdit 走一遍完整 copy-on-write：Materialize → WritePath → 在
-// workspace 副本上写入新内容。返回 workspace 副本路径。
 func cowAndEdit(t *testing.T, m *Manager, taskID, mainPath, newContent string) string {
 	t.Helper()
 	v, err := m.Materialize(taskID)
@@ -66,7 +98,6 @@ func cowAndEdit(t *testing.T, m *Manager, taskID, mainPath, newContent string) s
 	}
 	return wsPath
 }
-
 func merge(t *testing.T, m *Manager, taskID string) *MergeResult {
 	t.Helper()
 	res, err := m.MergeTask(context.Background(), taskID, "agent-1")
@@ -75,7 +106,6 @@ func merge(t *testing.T, m *Manager, taskID string) *MergeResult {
 	}
 	return res
 }
-
 func TestWritePathCopyOnWrite(t *testing.T) {
 	m, root := newTestManager(t)
 	mainPath := writeMain(t, root, filepath.Join("src", "a.txt"), "hello\n")
@@ -83,8 +113,6 @@ func TestWritePathCopyOnWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Materialize 失败：%v", err)
 	}
-
-	// 首次 WritePath 触发 copy-on-write。
 	wsPath, err := v.WritePath(mainPath)
 	if err != nil {
 		t.Fatalf("WritePath 失败：%v", err)
@@ -96,8 +124,6 @@ func TestWritePathCopyOnWrite(t *testing.T) {
 	if got := readFile(t, wsPath); got != "hello\n" {
 		t.Fatalf("workspace 副本内容错误：%q", got)
 	}
-
-	// manifest 记录基线 SHA256 且已持久化到磁盘。
 	sum := sha256.Sum256([]byte("hello\n"))
 	data, err := os.ReadFile(filepath.Join(root, DirName, "task-1", ManifestFileName))
 	if err != nil {
@@ -117,8 +143,6 @@ func TestWritePathCopyOnWrite(t *testing.T) {
 	if e.BaselineSHA256 != hex.EncodeToString(sum[:]) {
 		t.Fatalf("基线哈希错误：%s", e.BaselineSHA256)
 	}
-
-	// 主根未被改动；重复 WritePath 幂等返回同一路径。
 	if got := readFile(t, mainPath); got != "hello\n" {
 		t.Fatalf("主根不应被改动：%q", got)
 	}
@@ -126,8 +150,6 @@ func TestWritePathCopyOnWrite(t *testing.T) {
 	if err != nil || wsPath2 != wsPath {
 		t.Fatalf("重复 WritePath 应幂等返回同一路径：%s %v", wsPath2, err)
 	}
-
-	// ReadPath：命中副本返回 workspace 路径，未触碰文件穿透主根。
 	if got := v.ReadPath(mainPath); got != wsPath {
 		t.Fatalf("ReadPath 应返回 workspace 副本：%q", got)
 	}
@@ -135,9 +157,6 @@ func TestWritePathCopyOnWrite(t *testing.T) {
 	if got := v.ReadPath(other); got != other {
 		t.Fatalf("未触碰文件应穿透主根：%q", got)
 	}
-
-	// manifest 未登记的 workspace 物理文件不是业务副本：
-	// 它可能是 owner/manifest/shell cache 或崩溃残留，必须继续读穿透。
 	lonely := filepath.Join(root, DirName, "task-1", "lonely.txt")
 	if err := os.WriteFile(lonely, []byte("x\n"), 0o644); err != nil {
 		t.Fatalf("写文件失败：%v", err)
@@ -147,36 +166,6 @@ func TestWritePathCopyOnWrite(t *testing.T) {
 		t.Fatalf("未进 manifest 的物理文件不得泄漏进业务读路径：%q", got)
 	}
 }
-
-func TestFreezeCandidateIsStableAndDoesNotPromote(t *testing.T) {
-	m, root := newTestManager(t)
-	main := writeMain(t, root, filepath.Join("src", "delivery.txt"), "base\n")
-	deliveryID := "delivery:0123456789abcdef"
-	workspaceID := DeliveryWorkspaceID(deliveryID)
-	view, err := m.MaterializeOwned(workspaceID, DeliveryOwner("task-1", deliveryID, "run-1", "graph-1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	physical, err := view.WritePath(main)
-	if err != nil || os.WriteFile(physical, []byte("candidate\n"), 0o644) != nil {
-		t.Fatalf("写 candidate: %v", err)
-	}
-	first, err := m.FreezeCandidate(deliveryID, workspaceID, "workspace:sha256:test")
-	if err != nil {
-		t.Fatalf("FreezeCandidate: %v", err)
-	}
-	second, err := m.FreezeCandidate(deliveryID, workspaceID, "workspace:sha256:test")
-	if err != nil {
-		t.Fatalf("第二次 FreezeCandidate: %v", err)
-	}
-	if first != second || first.Ref == "" || first.PatchDigest == "" {
-		t.Fatalf("candidate 应稳定且完整：first=%+v second=%+v", first, second)
-	}
-	if got := readFile(t, main); got != "base\n" {
-		t.Fatalf("FreezeCandidate 不得修改主根，实际=%q", got)
-	}
-}
-
 func TestWritePathNewFile(t *testing.T) {
 	m, root := newTestManager(t)
 	v, err := m.Materialize("task-nf")
@@ -195,7 +184,6 @@ func TestWritePathNewFile(t *testing.T) {
 	if !e.New || e.BaselineSHA256 != "" {
 		t.Fatalf("新建文件应 New=true 且基线为空串：%+v", e)
 	}
-	// 父目录已创建，文件尚未写入。
 	if _, err := os.Stat(filepath.Dir(wsPath)); err != nil {
 		t.Fatalf("workspace 父目录应已创建：%v", err)
 	}
@@ -203,12 +191,10 @@ func TestWritePathNewFile(t *testing.T) {
 		t.Fatalf("WritePath 不应代写文件内容")
 	}
 }
-
 func TestMergeNewFile(t *testing.T) {
 	m, root := newTestManager(t)
 	mainPath := filepath.Join(root, "docs", "new.md")
 	cowAndEdit(t, m, "task-new", mainPath, "brand new\n")
-
 	res := merge(t, m, "task-new")
 	if res.Conflicted {
 		t.Fatalf("新建文件不应冲突：%+v", res.Reports)
@@ -220,12 +206,10 @@ func TestMergeNewFile(t *testing.T) {
 		t.Fatalf("新建文件未落盘主根：%q", got)
 	}
 }
-
 func TestMergeFastForward(t *testing.T) {
 	m, root := newTestManager(t)
 	mainPath := writeMain(t, root, "a.txt", "v1\n")
 	cowAndEdit(t, m, "task-ff", mainPath, "v2\n")
-
 	res := merge(t, m, "task-ff")
 	if res.Conflicted {
 		t.Fatalf("fast-forward 不应冲突：%+v", res.Reports)
@@ -237,16 +221,13 @@ func TestMergeFastForward(t *testing.T) {
 		t.Fatalf("fast-forward 后主根内容错误：%q", got)
 	}
 }
-
 func TestMergeAutoMerged(t *testing.T) {
 	m, root := newTestManager(t)
 	mainPath := writeMain(t, root, "a.txt", "l1\nl2\nl3\nl4\nl5\n")
-	// workspace 改第 5 行；随后主根被他人改第 1 行（模拟并发变更）。
 	cowAndEdit(t, m, "task-am", mainPath, "l1\nl2\nl3\nl4\nL5\n")
 	if err := os.WriteFile(mainPath, []byte("L1\nl2\nl3\nl4\nl5\n"), 0o644); err != nil {
 		t.Fatalf("写主根文件失败：%v", err)
 	}
-
 	res := merge(t, m, "task-am")
 	if res.Conflicted {
 		t.Fatalf("不相交变更不应冲突：%+v", res.Reports)
@@ -258,16 +239,13 @@ func TestMergeAutoMerged(t *testing.T) {
 		t.Fatalf("自动合并结果错误：%q", got)
 	}
 }
-
 func TestMergeConflictNotWritten(t *testing.T) {
 	m, root := newTestManager(t)
 	mainPath := writeMain(t, root, "a.txt", "a\nb\nc\n")
 	cowAndEdit(t, m, "task-cf", mainPath, "a\nOURS\nc\n")
-	// 主根同位置并发修改 → 行区间相交。
 	if err := os.WriteFile(mainPath, []byte("a\nMAIN\nc\n"), 0o644); err != nil {
 		t.Fatalf("写主根文件失败：%v", err)
 	}
-
 	res := merge(t, m, "task-cf")
 	if !res.Conflicted {
 		t.Fatalf("相交变更应报冲突：%+v", res.Reports)
@@ -283,12 +261,10 @@ func TestMergeConflictNotWritten(t *testing.T) {
 	if rep.Conflicts[0].Main != "MAIN" || rep.Conflicts[0].Workspace != "OURS" {
 		t.Fatalf("冲突文本错误：%+v", rep.Conflicts[0])
 	}
-	// 冲突文件不落地：主根保留合并前内容。
 	if got := readFile(t, mainPath); got != "a\nMAIN\nc\n" {
 		t.Fatalf("冲突文件不应落盘，主根内容被改：%q", got)
 	}
 }
-
 func TestMergeDeleteVsModify(t *testing.T) {
 	m, root := newTestManager(t)
 	mainPath := writeMain(t, root, "a.txt", "a\nb\n")
@@ -296,7 +272,6 @@ func TestMergeDeleteVsModify(t *testing.T) {
 	if err := os.Remove(mainPath); err != nil {
 		t.Fatalf("删除主根文件失败：%v", err)
 	}
-
 	res := merge(t, m, "task-del")
 	if !res.Conflicted {
 		t.Fatalf("删除-vs-修改应报冲突：%+v", res.Reports)
@@ -309,7 +284,6 @@ func TestMergeDeleteVsModify(t *testing.T) {
 		t.Fatalf("Detail 应注明删除-vs-修改：%q", rep.Detail)
 	}
 }
-
 func TestMaterializeIdempotentAndReload(t *testing.T) {
 	m, root := newTestManager(t)
 	v1, err := m.Materialize("task-x")
@@ -323,9 +297,6 @@ func TestMaterializeIdempotentAndReload(t *testing.T) {
 	if v1 != v2 {
 		t.Fatalf("Materialize 应幂等返回同一活动视图")
 	}
-
-	// 登记一次 COW 后，换一个新 Manager（模拟重试/重启）重新 Materialize，
-	// manifest 应从磁盘恢复。
 	mainPath := writeMain(t, root, "k.txt", "base\n")
 	if _, err := v1.WritePath(mainPath); err != nil {
 		t.Fatalf("WritePath 失败：%v", err)
@@ -342,14 +313,12 @@ func TestMaterializeIdempotentAndReload(t *testing.T) {
 		t.Fatalf("重载后 ReadPath 未命中 workspace 副本：%q", got)
 	}
 }
-
 func TestListOrphans(t *testing.T) {
 	m, root := newTestManager(t)
 	orphans, err := m.ListOrphans()
 	if err != nil || orphans != nil {
 		t.Fatalf("workspace 根不存在应返回 nil, nil：%v %v", orphans, err)
 	}
-
 	for _, id := range []string{"task-a", "task-b"} {
 		if _, err := m.Materialize(id); err != nil {
 			t.Fatalf("Materialize 失败：%v", err)
@@ -363,21 +332,18 @@ func TestListOrphans(t *testing.T) {
 	if len(orphans) != 2 || orphans[0] != "task-a" || orphans[1] != "task-b" {
 		t.Fatalf("孤儿列表错误：%v", orphans)
 	}
-	// 换一个 Manager 实例（无内存状态）也应看到同样的目录。
 	m2 := NewManager(root, nil)
 	orphans2, err := m2.ListOrphans()
 	if err != nil || len(orphans2) != 2 {
 		t.Fatalf("跨实例 ListOrphans 错误：%v %v", orphans2, err)
 	}
 }
-
 func TestCleanup(t *testing.T) {
 	m, root := newTestManager(t)
 	if _, err := m.Materialize("task-c"); err != nil {
 		t.Fatalf("Materialize 失败：%v", err)
 	}
 	wsRoot := filepath.Join(root, DirName, "task-c")
-
 	if err := m.Cleanup("task-c"); err != nil {
 		t.Fatalf("Cleanup 失败：%v", err)
 	}
@@ -397,7 +363,6 @@ func TestCleanup(t *testing.T) {
 		}
 	}
 }
-
 func TestDeliveryOwnerAndLeaseFenceCleanup(t *testing.T) {
 	root := t.TempDir()
 	m := NewManager(root, nil)
@@ -422,7 +387,6 @@ func TestDeliveryOwnerAndLeaseFenceCleanup(t *testing.T) {
 		t.Fatalf("释放后 Cleanup: %v", err)
 	}
 }
-
 func TestStaleViewCannotRecreateRemovedWorkspace(t *testing.T) {
 	root := t.TempDir()
 	m := NewManager(root, nil)
@@ -440,7 +404,6 @@ func TestStaleViewCannotRecreateRemovedWorkspace(t *testing.T) {
 		t.Fatalf("stale View 不得静默重建目录: %v", err)
 	}
 }
-
 func TestListWorkspacesUsesPersistedDeliveryOwner(t *testing.T) {
 	root := t.TempDir()
 	m := NewManager(root, nil)
@@ -461,8 +424,7 @@ func TestListWorkspacesUsesPersistedDeliveryOwner(t *testing.T) {
 	if _, err := restarted.MaterializeOwned(workspaceID, owner); err != nil {
 		t.Fatalf("重启后同 owner 应幂等恢复: %v", err)
 	}
-	if _, err := restarted.MaterializeOwned(workspaceID,
-		DeliveryOwner("task-repair", deliveryID, "run-2", "graph-2")); err != nil {
+	if _, err := restarted.MaterializeOwned(workspaceID, DeliveryOwner("task-repair", deliveryID, "run-2", "graph-2")); err != nil {
 		t.Fatalf("repair activation 的新 TaskID 必须复用同一 Delivery owner: %v", err)
 	}
 	conflict := DeliveryOwner("task-3", deliveryID, "run-2", "graph-other")
@@ -470,15 +432,12 @@ func TestListWorkspacesUsesPersistedDeliveryOwner(t *testing.T) {
 		t.Fatal("同 Delivery workspace 的冲突 owner 应 fail-closed")
 	}
 }
-
 func TestCleanupGuard(t *testing.T) {
 	m, root := newTestManager(t)
-	// 在 workspace 根外预建目录，验证防卫逻辑不会误删。
 	outside := filepath.Join(root, "outside")
 	if err := os.MkdirAll(outside, 0o755); err != nil {
 		t.Fatalf("创建目录失败：%v", err)
 	}
-
 	for _, bad := range []string{"../outside", `..\outside`, "a/b", "", "."} {
 		if err := m.Cleanup(bad); err == nil {
 			t.Fatalf("越界 taskID %q 应被拒绝", bad)
@@ -488,19 +447,10 @@ func TestCleanupGuard(t *testing.T) {
 		t.Fatalf("workspace 根外目录不应被删除：%v", err)
 	}
 }
-
-// --- 双任务并发写同一主根文件（fan-out 写集相交，本特性的存在理由） ---
-
-// TestMergeTask_TwoIsolatedTasksDisjointEditsAutoMerge 菱形场景：两个隔离任务
-// 同时对同一文件做 COW（基线同为原版），各自修改不相交的行。先合并者
-// fast-forward；后合并者面对「主根自基线已变」走三路自动合并——最终主根
-// 必须同时携带两处修改，且两份报告分别为 fast_forward / auto_merged。
 func TestMergeTask_TwoIsolatedTasksDisjointEditsAutoMerge(t *testing.T) {
 	m, root := newTestManager(t)
 	rel := "shared.go"
 	mainPath := writeMain(t, root, rel, "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n")
-
-	// 两个任务先后物化（基线都是原版），各自改不相交的行。
 	v1, err := m.Materialize("task-A")
 	if err != nil {
 		t.Fatalf("Materialize A: %v", err)
@@ -522,8 +472,6 @@ func TestMergeTask_TwoIsolatedTasksDisjointEditsAutoMerge(t *testing.T) {
 	}
 	editLines(t, wsA, 2, "line2-taskA")
 	editLines(t, wsB, 8, "line8-taskB")
-
-	// task-A 先合并：主根未变 → fast-forward。
 	resA, err := m.MergeTask(context.Background(), "task-A", "agent-A")
 	if err != nil {
 		t.Fatalf("MergeTask A: %v", err)
@@ -534,8 +482,6 @@ func TestMergeTask_TwoIsolatedTasksDisjointEditsAutoMerge(t *testing.T) {
 	if got := resA.Reports[0].Outcome; got != OutcomeFastForward {
 		t.Fatalf("A 的 outcome = %s，want fast_forward", got)
 	}
-
-	// task-B 后合并：主根已被 A 改过（hash ≠ 基线），三路合并区间不相交 → auto_merged。
 	resB, err := m.MergeTask(context.Background(), "task-B", "agent-B")
 	if err != nil {
 		t.Fatalf("MergeTask B: %v", err)
@@ -546,8 +492,6 @@ func TestMergeTask_TwoIsolatedTasksDisjointEditsAutoMerge(t *testing.T) {
 	if got := resB.Reports[0].Outcome; got != OutcomeAutoMerged {
 		t.Fatalf("B 的 outcome = %s，want auto_merged", got)
 	}
-
-	// 终态：主根同时携带 A、B 两处修改，其余行保持原版。
 	data, err := os.ReadFile(mainPath)
 	if err != nil {
 		t.Fatalf("读主根: %v", err)
@@ -559,15 +503,10 @@ func TestMergeTask_TwoIsolatedTasksDisjointEditsAutoMerge(t *testing.T) {
 		}
 	}
 }
-
-// TestMergeTask_TwoIsolatedTasksSameLineConflict 双任务改同一行：先合并者胜，
-// 后合并者冲突——冲突文件不落盘（主根保留先者内容），ConflictedPaths 正确，
-// 且后合并任务的 workspace 现场保留（交 Scheduler 裁决/排查）。
 func TestMergeTask_TwoIsolatedTasksSameLineConflict(t *testing.T) {
 	m, root := newTestManager(t)
 	rel := "hot.go"
 	mainPath := writeMain(t, root, rel, "a\nb\nc\n")
-
 	v1, _ := m.Materialize("task-hot-1")
 	v2, _ := m.Materialize("task-hot-2")
 	ws1, err := v1.WritePath(mainPath)
@@ -580,7 +519,6 @@ func TestMergeTask_TwoIsolatedTasksSameLineConflict(t *testing.T) {
 	}
 	editLines(t, ws1, 2, "b-first")
 	editLines(t, ws2, 2, "b-second")
-
 	res1, err := m.MergeTask(context.Background(), "task-hot-1", "agent-1")
 	if err != nil || res1.Conflicted {
 		t.Fatalf("先合并者应成功: res=%+v err=%v", res1, err)
@@ -596,18 +534,14 @@ func TestMergeTask_TwoIsolatedTasksSameLineConflict(t *testing.T) {
 	if len(paths) != 1 || paths[0] != mainPath {
 		t.Fatalf("ConflictedPaths = %v，want [%s]", paths, mainPath)
 	}
-	// 冲突不落盘：主根保留先合并者内容。
 	data, _ := os.ReadFile(mainPath)
 	if !strings.Contains(string(data), "b-first") || strings.Contains(string(data), "b-second") {
 		t.Fatalf("冲突后主根应保留先者内容，实际:\n%s", data)
 	}
-	// 冲突区域报告可用（裁决依据）：含双方文本。
 	if len(res2.Reports[0].Conflicts) == 0 {
 		t.Fatal("冲突报告应含冲突区域")
 	}
 }
-
-// editLines 把文件的第 n 行（1-based）替换为 content（保持其余行不变）。
 func editLines(t *testing.T, path string, n int, content string) {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -623,15 +557,8 @@ func editLines(t *testing.T, path string, n int, content string) {
 		t.Fatalf("editLines 写 %s: %v", path, err)
 	}
 }
-
-// TestRelativeProjectRoot_EndToEnd 回归（2026-07-27 真实运行事故）：
-// 真实配置允许 project_root: "."，Manager/Swapper 构造期必须把根归一为
-// 绝对路径——否则工具层经 ValidatePath 归一后的绝对目标路径会让
-// filepath.Rel(相对, 绝对) 报错，隔离任务全部「路径不在主根内」失败。
-// 单测此前全用 t.TempDir()（恒绝对），漏检该环境差异。
 func TestRelativeProjectRoot_EndToEnd(t *testing.T) {
 	root := t.TempDir()
-	// 切进主根并以 "." 构造（模拟真实配置的相对根）；测试结束恢复 CWD。
 	prev, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Getwd: %v", err)
@@ -639,26 +566,21 @@ func TestRelativeProjectRoot_EndToEnd(t *testing.T) {
 	if err := os.Chdir(root); err != nil {
 		t.Fatalf("Chdir: %v", err)
 	}
-	t.Cleanup(func() { _ = os.Chdir(prev) })
-
+	t.Cleanup(func() {
+		_ = os.Chdir(prev)
+	})
 	m := NewManager(".", nil)
 	sw := NewSwapper(".")
-
-	// 主根已存在的文件，用绝对路径（工具层 ValidatePath 之后的形态）写入。
 	mainPath := filepath.Join(root, "rel.txt")
 	if err := os.WriteFile(mainPath, []byte("old1\nold2\n"), 0o644); err != nil {
 		t.Fatalf("写主根文件: %v", err)
 	}
-
 	v, err := m.Materialize("task-rel")
 	if err != nil {
 		t.Fatalf("Materialize: %v", err)
 	}
-	// 认领时换入视图（agent 认领隔离任务的真实动作；无视图时 Swapper passthrough）。
 	restore := sw.Activate(v)
 	defer restore()
-	// 经 Swapper（工具实际走的路径）解析写入位置：必须解析到 workspace 副本
-	// 而不是报「路径不在主根内」。
 	wsPath, err := sw.WritePath(mainPath)
 	if err != nil {
 		t.Fatalf("相对根下 WritePath 报错（事故复现）: %v", err)
@@ -669,11 +591,9 @@ func TestRelativeProjectRoot_EndToEnd(t *testing.T) {
 	if err := os.WriteFile(wsPath, []byte("old1\nnew2\n"), 0o644); err != nil {
 		t.Fatalf("写 workspace 副本: %v", err)
 	}
-	// View 根与 Manager 根应为绝对路径。
 	if !filepath.IsAbs(v.Root()) || !filepath.IsAbs(m.ProjectRoot()) {
 		t.Fatalf("根应为绝对路径: view=%q mgr=%q", v.Root(), m.ProjectRoot())
 	}
-
 	res, err := m.MergeTask(context.Background(), "task-rel", "agent-rel")
 	if err != nil {
 		t.Fatalf("MergeTask: %v", err)
@@ -686,16 +606,9 @@ func TestRelativeProjectRoot_EndToEnd(t *testing.T) {
 		t.Fatalf("合并后主根内容 = %q err=%v，want old1\nnew2\n", data, err)
 	}
 }
-
 func TestPrepareShellRootBuildsFullSnapshotAndOverlaysDirtyFiles(t *testing.T) {
 	root := t.TempDir()
-	for path, content := range map[string]string{
-		"src/main.go":               "package main\nconst value = \"main\"\n",
-		"tests/main_test.go":        "package tests\n",
-		".venv/marker.txt":          "prepared environment\n",
-		".agentgo/state/secret.txt": "control state\n",
-		".git/config":               "git metadata\n",
-	} {
+	for path, content := range map[string]string{"src/main.go": "package main\nconst value = \"main\"\n", "tests/main_test.go": "package tests\n", ".venv/marker.txt": "prepared environment\n", ".agentgo/state/secret.txt": "control state\n", ".git/config": "git metadata\n"} {
 		absolute := filepath.Join(root, filepath.FromSlash(path))
 		if err := os.MkdirAll(filepath.Dir(absolute), 0o755); err != nil {
 			t.Fatal(err)
@@ -724,10 +637,7 @@ func TestPrepareShellRootBuildsFullSnapshotAndOverlaysDirtyFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for path, want := range map[string]string{
-		"src/main.go": "candidate", "tests/main_test.go": "package tests",
-		".venv/marker.txt": "prepared environment",
-	} {
+	for path, want := range map[string]string{"src/main.go": "candidate", "tests/main_test.go": "package tests", ".venv/marker.txt": "prepared environment"} {
 		data, readErr := os.ReadFile(filepath.Join(shellRoot, filepath.FromSlash(path)))
 		if readErr != nil || !strings.Contains(string(data), want) {
 			t.Fatalf("shell snapshot %s 未呈现完整项目/candidate: data=%q err=%v", path, data, readErr)
@@ -757,7 +667,6 @@ func TestPrepareShellRootBuildsFullSnapshotAndOverlaysDirtyFiles(t *testing.T) {
 		t.Fatalf("清理 shell snapshot 不得删除 dirty candidate: %q err=%v", data, err)
 	}
 }
-
 func TestWorkspaceControlFilesDoNotLeakIntoBusinessNamespace(t *testing.T) {
 	root := t.TempDir()
 	businessManifest := filepath.Join(root, ManifestFileName)
@@ -780,75 +689,9 @@ func TestWorkspaceControlFilesDoNotLeakIntoBusinessNamespace(t *testing.T) {
 	if got := view.ReadPath(logicalRogue); got != logicalRogue {
 		t.Fatalf("未进 manifest 的物理文件不得成为业务副本: %q", got)
 	}
-	for _, reserved := range []string{
-		ownerFileName, ManifestFileName, baselineDirName + string(filepath.Separator) + "x",
-		shellRootDirName + string(filepath.Separator) + "x",
-	} {
-		if _, err := view.WritePath(filepath.Join(root, reserved)); err == nil ||
-			!strings.Contains(err.Error(), "workspace_internal_path_forbidden") {
+	for _, reserved := range []string{ownerFileName, ManifestFileName, baselineDirName + string(filepath.Separator) + "x", shellRootDirName + string(filepath.Separator) + "x"} {
+		if _, err := view.WritePath(filepath.Join(root, reserved)); err == nil || !strings.Contains(err.Error(), "workspace_internal_path_forbidden") {
 			t.Fatalf("业务写入 workspace 保留路径 %q 必须 fail-closed: %v", reserved, err)
 		}
-	}
-}
-
-func TestDeliveryWorkspaceRevisionSpansRepairTasks(t *testing.T) {
-	root := t.TempDir()
-	main := writeMain(t, root, "source.go", "base\n")
-	deliveryID := "delivery:revision"
-	workspaceID := DeliveryWorkspaceID(deliveryID)
-	m := NewManager(root, nil)
-	view, err := m.MaterializeOwned(workspaceID,
-		DeliveryOwner("producer", deliveryID, "run-1", "graph-1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	tasks := store.NewMemoryTaskStore(nil, 16, 1, 60)
-	preMutation := &model.Task{ID: "pre", Description: "baseline", DeliveryID: deliveryID}
-	if err := tasks.PublishTask(preMutation); err != nil {
-		t.Fatal(err)
-	}
-	if err := tasks.ClaimTask("worker", preMutation.ID); err != nil {
-		t.Fatal(err)
-	}
-	claimedPre, _ := tasks.GetTask(preMutation.ID)
-	if ref, _, err := executionfacts.WorkspaceRevision(claimedPre, tasks, m); err != nil || ref != "workspace:empty" {
-		t.Fatalf("pre-mutation Delivery revision 应为 workspace:empty: ref=%s err=%v", ref, err)
-	}
-	physical, err := view.WritePath(main)
-	if err != nil || os.WriteFile(physical, []byte("candidate-v1\n"), 0o644) != nil {
-		t.Fatalf("写 candidate: %v", err)
-	}
-	producer := &model.Task{ID: "producer", Description: "produce", DeliveryID: deliveryID}
-	if err := tasks.PublishTask(producer); err != nil {
-		t.Fatal(err)
-	}
-	if err := tasks.ClaimTask("worker", producer.ID); err != nil {
-		t.Fatal(err)
-	}
-	claimedProducer, _ := tasks.GetTask(producer.ID)
-	if err := tasks.AppendToolCall(producer.ID, store.ToolCallRecord{
-		AttemptID: claimedProducer.AttemptID, CallID: "edit-producer", ToolName: "apply_change",
-		Args: map[string]any{"path": "source.go"}, Success: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	repair := &model.Task{ID: "repair", Description: "verify inherited candidate", DeliveryID: deliveryID}
-	if err := tasks.PublishTask(repair); err != nil {
-		t.Fatal(err)
-	}
-	if err := tasks.ClaimTask("worker", repair.ID); err != nil {
-		t.Fatal(err)
-	}
-	claimedRepair, _ := tasks.GetTask(repair.ID)
-	first, refs, err := executionfacts.WorkspaceRevision(claimedRepair, tasks, m)
-	if err != nil || first == "workspace:empty" || len(refs) != 1 || refs[0] != "tool-call:edit-producer" {
-		t.Fatalf("repair Task 必须继承 Delivery candidate revision/effect: ref=%s refs=%v err=%v", first, refs, err)
-	}
-	if err := os.WriteFile(physical, []byte("candidate-v2\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	second, _, err := executionfacts.WorkspaceRevision(claimedRepair, tasks, m)
-	if err != nil || second == first {
-		t.Fatalf("Delivery dirty 内容变化必须使旧 check stale: first=%s second=%s err=%v", first, second, err)
 	}
 }

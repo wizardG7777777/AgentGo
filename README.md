@@ -2,7 +2,7 @@
 
 # AgentGo
 
-AgentGo 是一个 Go 1.25 编写的多 Agent 编排系统。Scheduler 接收用户输入，按需组建或使用预热的 Agent Team，以持久化 Graph 编排执行任务，验收结论由 Graph acceptance 节点给出。
+AgentGo 是一个 Go 1.25 编写的多 Agent 编排系统。Scheduler 接收用户输入，按需组建或使用预热的 Agent Team，以持久化 agentTask 数据流图增量安排工作，结果和候选经图级完成事务交付。
 
 它提供两种可同时启用的前端：Bubble Tea TUI 与 Web Dashboard。前端通过 UI Hub 订阅同一套运行时状态；Web Dashboard 还提供提交输入、取消任务、回答结构化 Interaction、切换模式和 Session 的受控操作接口。
 
@@ -162,13 +162,13 @@ Scheduler Agent --> submit_graph / publish_task --> Task-backed DAG / Graph Runt
                                                      |
                       +------------------------------+------------------+
                       v                              v                  v
-                   Runner Team                Reactor replan     Acceptance runner (acceptance.verify)
+                   Runner Team                Reactor replan     普通检查 agentTask
                       |
                       v
               Gate -> Tool execution -> Trace / Session persistence
 ```
 
-- `internal/graph` 维护 JSON 图契约、activation 模型与 durable 恢复；验收经 acceptance 节点 + `submit_task_result.verdict`（`pass` / `fixable` / `failed`）驱动精确路径路由，completed 结果省略 `event`。
+- `internal/graph` 维护唯一 agentTask、输入就绪、增量调度与持久化；完成通过 `control_graph complete` 选择结果并实际交付，没有特殊验收节点或条件控制边。
 - `internal/runner` 承载预热或按需创建的 Agent；`internal/agenttemplate` 与 `internal/team` 负责模板及运行时 Team。
 - `internal/gate` 在工具/邮箱动作前做决策；`internal/reactor` 订阅状态变化，计划内只可请求 Scheduler 重规划。
 - `internal/session`、`internal/trace` 保存 Session、快照和 JSONL 事件；重试可能产生多个 trace 分片，CLI 会按完整 TaskID 重组。

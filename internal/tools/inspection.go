@@ -19,11 +19,10 @@ import (
 
 // InspectionGroup 只投影运行事实，不发布任务、修改图或触发执行。
 type InspectionGroup struct {
-	Tasks       store.TaskStore
-	Graphs      *graph.Store
-	Definitions *graph.AuthoringStore
-	Content     *contentstore.Store
-	History     interface {
+	Tasks   store.TaskStore
+	Graphs  *graph.DataflowStore
+	Content *contentstore.Store
+	History interface {
 		GetToolCallHistory(string) []store.ToolCallRecord
 	}
 	Holder    TaskHolder
@@ -120,8 +119,10 @@ func (g InspectionGroup) inspectBoard(_ context.Context, args map[string]any) (s
 	sort.Strings(ids)
 	if g.Graphs != nil {
 		for _, id := range ids {
-			if d, ok := g.Graphs.Get(id); ok {
-				graphs = append(graphs, map[string]any{"graph_id": id, "revision": d.Revision, "state_version": d.StateVersion, "status": d.Status, "outcome": d.Outcome})
+			if d, ok, err := g.Graphs.Get(id); err != nil {
+				return "", err
+			} else if ok {
+				graphs = append(graphs, map[string]any{"graph_id": id, "revision": d.Definition.Revision, "state_version": d.StateVersion, "status": d.Status, "completion": d.Completion})
 			}
 		}
 	}
@@ -142,24 +143,26 @@ func (g InspectionGroup) inspectBoard(_ context.Context, args map[string]any) (s
 }
 
 func (g InspectionGroup) inspectRequest(c *model.Task, ref string) (string, error) {
-	if g.Definitions == nil {
-		return "", fmt.Errorf("图请求存储未注入")
+	if g.Graphs == nil {
+		return "", fmt.Errorf("图存储未注入")
 	}
-	if d, ok := g.Definitions.GetDraft(ref); ok {
-		owner, err := g.Tasks.GetTask(d.OwnerTaskID)
-		if err != nil || owner == nil || !inspectionAllowed(c, owner) {
-			return "", fmt.Errorf("图请求超出检视范围")
+	session := ""
+	if g.SessionID != nil {
+		session = g.SessionID()
+	}
+	states, err := g.Graphs.List(session)
+	if err != nil {
+		return "", err
+	}
+	for _, s := range states {
+		if s.Definition.RunID != string(c.RunID) {
+			continue
 		}
-		return marshalGraphAuthoringResult(map[string]any{"request_ref": ref, "status": d.Status, "graph_id": d.GraphID, "committed_revision": d.CommittedDefinitionRevision, "validation_report_ref": d.LastValidationReportRef})
-	}
-	if d, ok := g.Definitions.GetGraphChangeProposal(ref); ok {
-		owner, err := g.Tasks.GetTask(d.OwnerTaskID)
-		if err != nil || owner == nil || !inspectionAllowed(c, owner) {
-			return "", fmt.Errorf("图请求超出检视范围")
+		if receipt, ok := s.Requests[ref]; ok {
+			return marshalGraphAuthoringResult(map[string]any{"request_ref": ref, "receipt": receipt, "graph_id": s.Definition.GraphID})
 		}
-		return marshalGraphAuthoringResult(map[string]any{"request_ref": ref, "status": d.Status, "graph_id": d.GraphID, "committed_revision": d.CommittedDefinitionRevision, "validation_report_ref": d.LastValidationReportRef})
 	}
-	return "", fmt.Errorf("图请求未找到")
+	return "", fmt.Errorf("当前范围没有该图请求")
 }
 
 func (g InspectionGroup) inspectNode(ctx context.Context, args map[string]any) (string, error) {

@@ -31,7 +31,7 @@ func encodeUTF16(s string, bigEndian bool) []byte {
 func TestLoadConfig_UTF16LE_ExpandsEnv(t *testing.T) {
 	t.Setenv("E1_TEST_KEY", "sk-expanded-secret")
 
-	content := "llm:\n  request_contract: agentgo.model-request/v1\n  api_key: ${E1_TEST_KEY}\n  default_model: test-model\n"
+	content := "graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\n  api_key: ${E1_TEST_KEY}\n  default_model: test-model\n"
 	path := filepath.Join(t.TempDir(), "setting.yaml")
 	if err := os.WriteFile(path, encodeUTF16(content, false), 0o644); err != nil {
 		t.Fatal(err)
@@ -53,7 +53,7 @@ func TestLoadConfig_UTF16LE_ExpandsEnv(t *testing.T) {
 func TestLoadConfig_UTF16BE_ExpandsEnv(t *testing.T) {
 	t.Setenv("E1_TEST_KEY_BE", "be-secret")
 
-	content := "llm:\n  request_contract: agentgo.model-request/v1\n  api_key: ${E1_TEST_KEY_BE}\n"
+	content := "graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\n  api_key: ${E1_TEST_KEY_BE}\n"
 	path := filepath.Join(t.TempDir(), "setting.yaml")
 	if err := os.WriteFile(path, encodeUTF16(content, true), 0o644); err != nil {
 		t.Fatal(err)
@@ -70,7 +70,7 @@ func TestLoadConfig_UTF16BE_ExpandsEnv(t *testing.T) {
 
 // TestDecodeIfUTF16_Passthrough 无 BOM 输入原样返回；过短输入安全。
 func TestDecodeIfUTF16_Passthrough(t *testing.T) {
-	plain := []byte("llm:\n  request_contract: agentgo.model-request/v1\n  api_key: plain\n")
+	plain := []byte("graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\n  api_key: plain\n")
 	if got := decodeIfUTF16(plain); string(got) != string(plain) {
 		t.Fatalf("UTF-8 输入被改写: %q", got)
 	}

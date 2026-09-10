@@ -21,7 +21,6 @@ import (
 	"log"
 	"strings"
 
-	"agentgo/internal/graph"
 	"agentgo/internal/llm"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
@@ -102,13 +101,7 @@ func (a *Agent) initTaskMemory(task *model.Task) *taskMemRuntime {
 func taskMemInitialConstraints(task *model.Task) []string {
 	var out []string
 	if task.GraphID != "" {
-		out = append(out, "收口契约: 本任务是 Graph 节点任务，收尾必须经 submit_task_result 提交结构化结果（status/summary/event/verdict），纯文本回复不会被接受")
-		if task.GraphNodeKind == "acceptance" {
-			out = append(out, "验收契约: verdict 只填 pass/fixable/failed；completed 结果必须省略 event；证据或能力不足时提交 status=blocked 与 blocked_reason")
-		}
-		for _, line := range graph.ExtractOutputContract(task.Description) {
-			out = append(out, "输出契约: "+line)
-		}
+		out = append(out, "本任务是 agentTask：通过 submit_task_result 提交本任务的唯一结构化结果；输入中的候选版本是本次工作基线。")
 	}
 	if task.Capability != nil {
 		if len(task.Capability.Tools) > 0 {

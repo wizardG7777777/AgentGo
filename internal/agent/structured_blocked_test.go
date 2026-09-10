@@ -160,8 +160,6 @@ func TestFinalizationShortCircuitStructuredBlockedGraphTask(t *testing.T) {
 		Summary:       "上游产物未就绪",
 		BlockedReason: "依赖缺失",
 		Status:        SubmitStatusBlocked,
-		Event:         "ready",
-		Verdict:       "pass",
 		ResultJSON:    `{"missing_dependency":"catalog","retryable":true}`,
 	})
 

@@ -29,7 +29,6 @@ import (
 	"agentgo/internal/store"
 	"agentgo/internal/taskmem"
 	"agentgo/internal/trace"
-	"agentgo/internal/workspace"
 )
 
 // ErrRecoverable 是无 canonical InvocationFailure 的旧执行器/非 Invocation
@@ -688,14 +687,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			return
 		}
 		workspaceID := taskID
-		owner := workspace.TaskOwner(taskID)
-		if task.DeliveryID != "" {
-			// Graph v3 repair activation 复用同一 Delivery workspace；TaskID 仍
-			// 是 L4 attempt 身份，不能再被当作候选生命周期 identity。
-			workspaceID = workspace.DeliveryWorkspaceID(task.DeliveryID)
-			owner = workspace.DeliveryOwner(taskID, task.DeliveryID, string(task.RunID), task.GraphID)
-		}
-		view, err := a.WorkspaceManager.MaterializeOwned(workspaceID, owner)
+		view, err := a.WorkspaceManager.MaterializeAgentTask(taskID, task.GraphID, string(task.RunID), task.InputCandidateRef)
 		if err != nil {
 			reason := fmt.Sprintf("workspace 物化失败: %v，不降级执行", err)
 			log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
@@ -927,9 +919,6 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			// Transition.Cause 记为 submit_task_result 以区别于 report_done 兼容路径。
 			resultText := lastOutput
 			cause := "finalization_short_circuit"
-			submitEvent := ""
-			submitVerdict := ""
-			submitCitedEvidence := ""
 			submitResultJSON := ""
 			submitFulfillmentJSON := ""
 			submitStatus := ""
@@ -939,9 +928,6 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				if sub, ok := a.SubmitState.Take(taskID); ok {
 					resultText = sub.Format()
 					cause = "submit_task_result"
-					submitEvent = sub.Event
-					submitVerdict = sub.Verdict
-					submitCitedEvidence = sub.CitedEvidence
 					submitResultJSON = sub.ResultJSON
 					submitFulfillmentJSON = sub.FulfillmentJSON
 					submitStatus = sub.Status
@@ -975,10 +961,10 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			}
 			// 写时复制隔离：合并必须在 SubmitResult（标记 completed）之前完成。
 			// 合并失败/冲突时 helper 已把任务转 failed 并发布 replan 唤醒任务，直接返回。
-			if task.DeliveryID == "" {
+			if task.GraphID == "" {
 				deactivateWorkspace()
 			}
-			if task.DeliveryID == "" && !a.mergeWorkspaceBeforeComplete(ctx, task, taskID) {
+			if task.GraphID == "" && !a.mergeWorkspaceBeforeComplete(ctx, task, taskID) {
 				terminatingCause = "react_loop_exit:error"
 				enterTerminating(terminatingCause)
 				return
@@ -992,24 +978,6 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			}
 			if submitFulfillmentJSON != "" {
 				structuredFields[FulfillmentStorageKey] = submitFulfillmentJSON
-			}
-			// Graph 事件键（C5b）：submit_task_result 携带的 event 随 completed
-			// 快照一次性写入 Results["event"]，graph-terminal-feed 随后用它驱动
-			// 事件形态转移。Store 不支持原子提交或提交失败时任务 fail-closed。
-			if submitEvent != "" {
-				structuredFields["event"] = submitEvent
-			}
-			// Graph 验收键（C6b）：与 event 同理，submit_task_result 携带的
-			// verdict 与 completed 同时写入 Results["verdict"]，驱动 acceptance
-			// 节点的 $.verdict 路径形态转移条件。
-			if submitVerdict != "" {
-				structuredFields["verdict"] = submitVerdict
-			}
-			// Graph 验收证据引用键：cited_evidence 的逗号分隔引用清单写入
-			// Results["cited_evidence"]，由 Graph Runtime 的 acceptance 谱系
-			// 核验（越谱系引用时 verdict 不被采信）。
-			if submitCitedEvidence != "" {
-				structuredFields["cited_evidence"] = submitCitedEvidence
 			}
 			enterTerminating(terminatingCause)
 			var submitErr error
@@ -1351,7 +1319,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 				log.Printf("[agent %s] 任务 %s 图节点纯文本退出被拒（第 %d/%d 次提醒），要求 submit_task_result 收口",
 					a.ID, taskID, unstructuredExitStreak, maxUnstructuredExitNudges)
 				history = append(history, contextcontract.HistoryEntry{
-					SystemNotice: fmt.Sprintf("<system-reminder>本任务是 Graph 节点任务，收尾必须调用 submit_task_result 提交结构化结果（status/summary，以及节点声明的 event 或 acceptance 的 verdict）；纯文本回复不会被接受（第 %d/%d 次提醒）。</system-reminder>",
+					SystemNotice: fmt.Sprintf("<system-reminder>本任务是 Graph 节点任务，收尾必须调用 submit_task_result 提交结构化结果（summary/result；无法完成时说明 blocked_reason）；纯文本回复不会被接受（第 %d/%d 次提醒）。</system-reminder>",
 						unstructuredExitStreak, maxUnstructuredExitNudges),
 				})
 				continue
@@ -1478,10 +1446,10 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 
 			// 写时复制隔离：合并必须在 SubmitResult（标记 completed）之前完成。
 			// 合并失败/冲突时 helper 已把任务转 failed 并发布 replan 唤醒任务，直接返回。
-			if task.DeliveryID == "" {
+			if task.GraphID == "" {
 				deactivateWorkspace()
 			}
-			if task.DeliveryID == "" && !a.mergeWorkspaceBeforeComplete(ctx, task, taskID) {
+			if task.GraphID == "" && !a.mergeWorkspaceBeforeComplete(ctx, task, taskID) {
 				terminatingCause = "react_loop_exit:error"
 				enterTerminating(terminatingCause)
 				return
@@ -1779,17 +1747,12 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 	}
 	if recoveryDecision.Action == loopcontrol.RecoveryRequestIntervene {
 		// unknown 不是 non-recoverable 的同义词。L4 policy 已要求交 L5
-		// 裁决时，必须先 durable 写入 LoopInterventionRequested，再把当前
+		// 无法安全继续时，先记录当前任务终态，再由数据流规划处理；当前
 		// Activation blocked；不得静默落入通用 failed。
 		a.saveHistory(task, history)
-		if err := a.requestInvocationIntervention(task); err != nil {
-			a.blockForLoopControl(task, taskID,
-				"Invocation intervention 落盘失败: "+err.Error(), "progress_authority_failure")
-			return
-		}
-		reason := fmt.Sprintf("Invocation 需要 L5 recovery 裁决：kind=%s phase=%s scope=%s",
+		reason := fmt.Sprintf("调用未能安全继续，等待图外规划：kind=%s phase=%s scope=%s",
 			canonicalFailure.Kind, canonicalFailure.Phase, canonicalFailure.TimeoutScope)
-		a.blockForLoopControl(task, taskID, reason, "loop_intervention_required")
+		a.blockForLoopControl(task, taskID, reason, "execution_requires_planning")
 		return
 	}
 	if recoveryDecision.Action == loopcontrol.RecoveryCancel {
@@ -1836,11 +1799,7 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 			reason := fmt.Sprintf("Activation attempts 预算已耗尽，当前 Attempt 保留完整执行权但不能再创建新 Attempt: used=%d limit=%d",
 				usedAttempts, attemptLimit)
 			a.saveHistory(task, history)
-			if err := a.requestAttemptBudgetIntervention(task); err != nil {
-				a.blockForLoopControl(task, taskID, reason+"；typed intervention 写入失败: "+err.Error(), "progress_authority_failure")
-				return
-			}
-			a.blockForLoopControl(task, taskID, reason, "loop_intervention_required")
+			a.blockForLoopControl(task, taskID, reason, "execution_requires_planning")
 			return
 		}
 

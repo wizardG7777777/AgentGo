@@ -21,10 +21,6 @@ type invocationToolPolicy struct {
 
 func deriveInvocationToolPolicy(task *model.Task, _ []contextcontract.HistoryEntry, full *ToolRegistry) invocationToolPolicy {
 	policy := invocationToolPolicy{Registry: full, Phase: "default", MaxCalls: defaultToolCallsPerResponse}
-	if task != nil && task.EventType == "__scheduler__" && task.GraphID != "" && task.GraphNodeKind == "agent" {
-		policy.Phase = "agent:execution"
-		return policy
-	}
 	if task == nil || task.EventType != "__scheduler__" || task.GraphID != "" {
 		return policy
 	}

@@ -4,3 +4,5 @@ package tools
 type fakeFinalizationNotifier struct{ marked bool }
 
 func (f *fakeFinalizationNotifier) MarkTaskFinalized() { f.marked = true }
+
+func (f *fakeFinalizationNotifier) IsFinalized() bool { return f.marked }

@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"agentgo/internal/graph"
 	"agentgo/internal/model"
 	"bytes"
 	"crypto/sha256"
@@ -11,18 +10,6 @@ import (
 	"fmt"
 	"io"
 )
-
-func (g GraphAuthoringGroup) validateDefinitionRoutes(graphID string, body graph.GraphDefinitionBody) error {
-	nodes := make(map[string]graph.Node, len(body.Nodes))
-	for id, definition := range body.Nodes {
-		nodes[id] = graph.Node{
-			Kind: definition.Kind, Task: definition.Task, Capability: definition.Capability,
-			Next: definition.Next, Wait: definition.Wait, Tool: definition.Tool,
-			Subgraph: definition.Subgraph, Metadata: definition.Metadata, Extensions: definition.Extensions,
-		}
-	}
-	return (graphRouteValidator{RouteValidator: g.RouteValidator}).validateRoutes(graphID, nodes, "nodes")
-}
 
 func decodeNativeGraphArgs(args map[string]any, target any) error {
 	raw, err := json.Marshal(args)
@@ -58,79 +45,32 @@ func marshalGraphAuthoringResult(value any) (string, error) {
 	return string(raw), nil
 }
 
-func graphNodeNativeSchema(withID bool) map[string]any {
-	properties := map[string]any{
-		"kind": map[string]any{"type": "string", "enum": []string{"controller", "agent", "tool", "router", "join", "approval", "wait_event", "acceptance", "end"}},
-		"task": nativeObject(map[string]any{
-			"title": nativeString("任务标题"), "description": nativeString("任务与验收/输出说明"),
-			"required_inputs": nativeArray(nativeString("输入端口")),
-		}, "title"),
-		"capability": nativeObject(map[string]any{
-			"tools": nativeArray(nativeString("工具名")), "model": nativeString("模型覆盖"), "isolation": nativeString("workspace"),
-		}),
-		"next": nativeArray(nativeObject(map[string]any{
-			"to": nativeString("目标节点"), "activation": nativeString("new"), "target_input": nativeString("目标输入端口"),
-			"when": nativeObject(map[string]any{
-				"event": nativeString("completed/failed/blocked/always"), "path": nativeString("$.field"),
-				"operator": nativeString("eq/ne/in/exists"), "value": map[string]any{},
-			}),
-		}, "to")),
-		"wait":        nativeObject(map[string]any{"event": nativeString("外部事件"), "timeout_sec": nativeInteger("超时秒")}, "event"),
-		"tool":        nativeObject(map[string]any{"name": nativeString("工具名"), "args": map[string]any{"type": "object"}}, "name"),
-		"metadata":    map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
-		"end_outcome": map[string]any{"type": "string", "enum": []string{"success", "failed", "blocked", "cancelled"}},
-		"output_contract": nativeObject(map[string]any{
-			"summary_required": map[string]any{"type": "boolean"},
-			"fields": nativeArray(nativeObject(map[string]any{
-				"path": nativeString("$.field"), "type": nativeString("字段类型"),
-				"description": nativeString("说明"), "required": map[string]any{"type": "boolean"},
-			}, "path", "type")),
-		}),
-		"progress_contract_ref": nativeString("framework ProgressContract ref"),
-		"context_policy_ref":    nativeString("framework ContextPolicy ref"),
-		"contract_bindings": nativeObject(map[string]any{
-			"deliverables": nativeArray(nativeString("deliverable ID")), "effects": nativeArray(nativeString("effect kind")),
-			"artifacts":        nativeArray(nativeString("artifact ID")),
-			"success_evidence": nativeArray(nativeString("evidence ID")),
-		}),
-	}
-	required := []string{"kind", "next"}
-	if withID {
-		properties["id"] = nativeString("节点 ID")
-		required = append([]string{"id"}, required...)
-	}
-	return nativeObject(properties, required...)
-}
-
-func graphContractNativeSchema() map[string]any {
-	requirement := nativeObject(map[string]any{
-		"id": nativeString("稳定 requirement ID"), "kind": nativeString("framework kind"), "description": nativeString("说明"),
-	}, "id", "kind")
+func graphNodeNativeSchema() map[string]any {
+	source := nativeObject(map[string]any{"kind": map[string]any{"type": "string", "enum": []string{"node_result", "node_outcome", "graph_input"}}, "node_id": nativeString("node_result 来源实例"), "port": nativeString("graph_input 输入端口"), "version": nativeInteger("图输入的明确版本"), "pointer": nativeString("可选 JSON Pointer，例如 /summary")}, "kind")
 	return nativeObject(map[string]any{
-		"execution_class": map[string]any{"type": "string", "enum": []string{"answer", "read_only", "mutating", "interactive", "waiting"}},
-		"deliverables":    nativeArray(requirement), "constraints": nativeArray(nativeString("约束")),
-		"required_effects": nativeArray(nativeString("effect kind")), "required_artifacts": nativeArray(requirement),
-		"requires_acceptance": map[string]any{"type": "boolean"},
-		"success_evidence":    nativeArray(requirement),
-	}, "execution_class", "deliverables")
+		"node_id": nativeString("新的任务实例 ID；返工追加新 ID"), "kind": map[string]any{"type": "string", "enum": []string{"agentTask"}},
+		"title": nativeString("简短任务标题"), "objective": nativeString("确定任务和应交付的结果"),
+		"inputs":          map[string]any{"type": "object", "additionalProperties": source},
+		"result_schema":   map[string]any{"type": "object", "description": "JSON Schema 子集(type/properties/required/additionalProperties/items/enum)，根类型必须 object；通常要求 summary string"},
+		"execution":       nativeObject(map[string]any{"route_ref": nativeString("能力目录中的 route_ref，例如 default；不要填写 Agent 名称"), "tools": nativeArray(nativeString("目录明确授予的工具")), "model": nativeString("可选显式模型")}, "route_ref", "tools"),
+		"workspace_input": nativeString("提供工作候选基线的输入槽；多候选时必须指定"),
+		"labels":          map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
+	}, "node_id", "kind", "title", "objective", "result_schema", "execution")
 }
 
 func nativeObject(properties map[string]any, required ...string) map[string]any {
-	out := map[string]any{"type": "object", "properties": properties, "additionalProperties": false}
+	result := map[string]any{"type": "object", "properties": properties, "additionalProperties": false}
 	if len(required) > 0 {
-		out["required"] = required
+		result["required"] = required
 	}
-	return out
+	return result
 }
-
-func nativeArray(items map[string]any) map[string]any {
-	return map[string]any{"type": "array", "items": items}
-}
-
 func nativeString(description string) map[string]any {
 	return map[string]any{"type": "string", "description": description}
 }
-
 func nativeInteger(description string) map[string]any {
 	return map[string]any{"type": "integer", "description": description}
+}
+func nativeArray(items map[string]any) map[string]any {
+	return map[string]any{"type": "array", "items": items}
 }

@@ -1,6 +1,6 @@
 # AgentGo 实施参考
 
-本页描述当前四类工具链。历史机制参考已存入 [旧手册](archived/agents-reference-before-four-categories.md)，其中的 Observation、Check 和默认进展关卡不用于当前实现。约束入口为 [AGENTS.md](../AGENTS.md)。
+本页描述当前四类工具与 agentTask 数据流链。历史机制参考已存入 [旧手册](archived/agents-reference-before-four-categories.md)，其中的 Observation、Check 和默认进展关卡不用于当前实现。约束入口为 [AGENTS.md](../AGENTS.md)。
 
 ## 启动与装配
 
@@ -10,7 +10,7 @@
 4. Scheduler 接收新用户请求并绑定 Run，使用图工具安排节点；Runner 根据静态或可选 Team 路由认领 Activation 对应的 Task。
 5. Agent Loop 经 L3 冻结的工具/Lease 调用 L2；L2 持久化完整请求快照后调用 L1。完整响应与工具结算进入运行事实，最终 TaskOutcome 回填图。
 
-未配置 deadline 的新 Run 不派生旧 verification/recovery/finalization 预留窗口，Proposal Acceptance 也必须遵守这一规则。传输超时、单条命令超时和用户显式限制独立处理。
+未配置 deadline 的新 Run 不派生旧 verification/recovery/finalization 预留窗口，不再存在独立 Proposal Acceptance。传输超时、单条命令超时和用户显式限制独立处理。
 
 ## 主要实现入口
 
@@ -23,9 +23,9 @@
 | Loop | internal/agent/agent.go、loop_progress.go、finalization.go | 每轮事实、错误/取消、唯一终态；无强制观察阶段 |
 | 工具组 | internal/tools/known_tools.go、group.go | 核心 13 项及可选 Web/Team 能力 |
 | 文件/Shell | internal/tools/local_read.go、local_write.go、shell.go；internal/shell | 文件边界、版本/锁、命令执行与结果事实 |
-| 运行权限 | internal/agent/execution_lease.go、internal/gate | role/route/策略交集；验收闭集单一权威 |
-| 图工具 | internal/tools/graph_authoring.go、graph_schema.go、graph_routes.go | 初建/更新的原子校验提交与生命周期控制 |
-| Graph/Delivery | internal/graph、internal/delivery；internal/bootstrap/graph_runtime.go、task_outcome.go | Activation、结果/证据、验收与 promotion |
+| 运行权限 | internal/agent/execution_lease.go、internal/gate | route/工具/策略交集；agentTask 没有验收类型特权 |
+| 图工具 | internal/tools/graph_authoring.go、graph_schema.go | 初建/更新的原子校验提交与生命周期控制 |
+| Graph/Delivery | internal/graph、internal/delivery；internal/bootstrap/dataflow_runtime.go、task_outcome.go | 输入就绪、唯一 Task、候选/结果与图级交付 |
 | 检视 | internal/tools/inspection.go、content_ref.go、graph_evidence.go | 范围内读取事实与完整内容引用 |
 | 通信 | internal/tools/meta.go、agent_question.go；internal/mailbox | 仅信息投递与独立用户交互 |
 | 存储 | internal/store、loopstore、outcomestore、contextstore、contentstore、taskmem、session | 对应责任域事实持久化与恢复边界 |
@@ -35,9 +35,9 @@
 
 ## 图创建与变更
 
-read_graph_definition 读取正式定义；apply_graph_change(create) 校验并提交新定义；control_graph(start) 启动。动态调整使用 apply_graph_change(update)，提供 expected_revision、稳定 request_id、changes、reason、in_flight=preserve。冲突或非法修改返回原因，正式图不变；模型不再依次调用草案创建/配置/校验/提交工具。
+read_graph_definition 读取正式定义；apply_graph_change(create) 校验并提交新定义；control_graph(start) 启动。动态调整使用 apply_graph_change(update)，提供 expected_revision、稳定 request_id、changes（add/update/remove）。冲突或非法修改返回原因，正式图不变；模型不再依次调用草案创建/配置/校验/提交工具。
 
-图内 controller 可处理编排，普通 Agent 使用 request_replan 请求调整。无变更协调与 final-report 经 submit_task_result 按各自作用域收口；这不是旧 report_done/decision 工具的别名。消息不能代替图事务。
+编排由图外 Scheduler 处理，agentTask 使用 request_replan 请求调整。无变更协调与 final-report 经 submit_task_result 按各自作用域收口；这不是旧 report_done/decision 工具的别名。消息不能代替图事务。
 
 Graph 维持单赋值端口、角色能力与单 mutable producer 的 Delivery 基线。Tool 节点的机械执行桥仅开放 read_file；带 Shell/文件副作用的工作由有完整 L3 权限与执行事实的 Agent 节点执行。
 
@@ -59,7 +59,7 @@ go build -o agentgo.exe .
 ./agentgo trace show <task-id>
 ```
 
---resume 和 /session 只进入可接受版本的历史，启动不自动读取 active-session 续跑。新的 Session 7、Lease v3、Run v3 与 Graph v5 使用当前目录；旧会话不静默转换，不删除旧磁盘数据。完整版本表见 [冻结基线](design/contract-freeze-2026-08-30.md)。
+--resume 和 /session 只进入可接受版本的历史，启动不自动读取 active-session 续跑。新的 Session 8、Lease v4、Run v3 与 Graph v6 使用当前目录；旧会话不静默转换，不删除旧磁盘数据。完整版本表见 [冻结基线](design/contract-freeze-2026-08-30.md)。
 
 UI 的模型输出入口为 WatchModelOutput，eventCursor 由 L2 产生。TUI 默认 Chat inline，图/结果详情进入 alt screen；全屏期间定稿输出先排队，回 Chat 后写入 scrollback。模型轮次持久化不依赖 UI。
 
@@ -69,4 +69,4 @@ Go 全量测试、vet、构建与真实二进制产物是跨层变更基本证�
 
 SWE Test Runner 的环境、进程/批次和独立判题见 [README](../scripts/swe_test_runner/README.md)。当前用户暂缓真实 SWE；离线测试和本地 fixture 不能作为真实成功率。阶段验证与删除对账见 [工具契约第 13 章](design/tool-taxonomy-and-contracts.md)，仍未验证的事项记入 [KNOWN_ISSUES](activate/KNOWN_ISSUES.md)。
 
-可选 Team 初建使用 `provision_agent_team(graph_request_id=R)`，随后 `apply_graph_change(create, request_id=R)` 使用同一个稳定值；图 ID 由运行时按调用者和请求身份派生，返回的 ready route 才能写入节点。图内 controller 扩展时继承当前图，不提供旧 task-scoped 模型入口。
+可选 Team 初建使用 `provision_agent_team(graph_request_id=R)`，随后 `apply_graph_change(create, request_id=R)` 使用同一个稳定值；图 ID 由运行时按调用者和请求身份派生，返回的 ready route 才能写入节点。图外规划任务扩展时继承目标图，不提供旧 task-scoped 模型入口。

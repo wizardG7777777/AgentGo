@@ -211,7 +211,7 @@ func TestAgentTemplateGroupBindsGraphOwnershipAndInheritsCurrentGraph(t *testing
 	}
 
 	graphController := &model.Task{
-		Description: "graph controller", EventType: "__scheduler__", GraphID: "g-active", GraphNodeKind: "controller",
+		Description: "graph planning", EventType: "__scheduler__", InterventionGraphID: "g-active",
 	}
 	if err := taskStore.PublishTask(graphController); err != nil {
 		t.Fatal(err)

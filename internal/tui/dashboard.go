@@ -51,8 +51,8 @@ func renderGraphDashboard(
 	}
 
 	routeMeta := truncateDisplay(t.SidebarDim.Render(fmt.Sprintf(
-		"  START %s · END %s · path %d/%d edges",
-		graph.Root, graphEndNodeSummary(*graph), pathTraversed, pathTotal)), w)
+		"  INPUTS → %s · data %d/%d edges",
+		graphLeafSummary(*graph), pathTraversed, pathTotal)), w)
 	topology := renderGraphTopology(t, w, *graph, selectedNode)
 	body := cropGraphTopology(t, w, topology.lines, topology.selectedLine, maxInt(0, h-4))
 	lines := []string{title, meta, routeMeta, ""}

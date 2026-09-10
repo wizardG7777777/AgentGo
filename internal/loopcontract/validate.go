@@ -396,50 +396,6 @@ func (s ActionSettlement) Validate() error {
 	return s.Usage.Validate()
 }
 
-func (c LoopInterventionRequested) Validate() error {
-	if c.Schema != InterventionSchemaV1 {
-		return fmt.Errorf("LoopInterventionRequested schema=%q，无效", c.Schema)
-	}
-	for name, value := range map[string]string{
-		"command_id": c.CommandID, "run_id": string(c.RunID), "task_id": c.TaskID,
-		"attempt_id": c.AttemptID, "checkpoint_ref": c.CheckpointRef,
-	} {
-		if err := validateIdentity(name, value); err != nil {
-			return err
-		}
-	}
-	if err := validateGraphIdentity(c.GraphID, c.NodeID, c.ActivationID); err != nil {
-		return err
-	}
-	if err := c.Contract.Validate(); err != nil {
-		return fmt.Errorf("LoopInterventionRequested contract 无效: %w", err)
-	}
-	if !validInterventionReason(c.ReasonCode) {
-		return fmt.Errorf("LoopInterventionRequested reason_code=%q，无效", c.ReasonCode)
-	}
-	if c.RequestedAt.IsZero() {
-		return fmt.Errorf("LoopInterventionRequested requested_at 不能为空")
-	}
-	if err := c.BudgetUsed.Validate(); err != nil {
-		return fmt.Errorf("LoopInterventionRequested budget_used 无效: %w", err)
-	}
-	if err := c.BudgetRemaining.Validate(); err != nil {
-		return fmt.Errorf("LoopInterventionRequested budget_remaining 无效: %w", err)
-	}
-	if err := validateUniqueStrings("missing_milestones", c.MissingMilestones); err != nil {
-		return err
-	}
-	if len(c.RepeatedSignals) > maxRecentFingerprints {
-		return fmt.Errorf("LoopInterventionRequested repeated_signals 超过 %d", maxRecentFingerprints)
-	}
-	for i, fingerprint := range c.RepeatedSignals {
-		if err := fingerprint.Validate(); err != nil {
-			return fmt.Errorf("repeated_signals[%d] 无效: %w", i, err)
-		}
-	}
-	return nil
-}
-
 func validateDraftRules(deliverables []DeliverableRule, verifications []VerificationRule, milestones []MilestoneRule) error {
 	seen := make(map[string]struct{}, len(deliverables)+len(verifications)+len(milestones))
 	claimID := func(kind, id string) error {
@@ -611,18 +567,6 @@ func validProgressClass(value ProgressClass) bool {
 func validInterventionStage(value InterventionStage) bool {
 	switch value {
 	case StageRunning, StageReminder, StageAttemptRollover, StageInterventionRequired, StageBlocked:
-		return true
-	default:
-		return false
-	}
-}
-
-func validInterventionReason(value InterventionReason) bool {
-	switch value {
-	case InterventionNoProgressBudget, InterventionNoProgressStalled, InterventionAttemptDeadline, InterventionActivationDeadline,
-		InterventionOscillation, InterventionUnsafeUnknown, InterventionCheckpointFailure,
-		InterventionObservationStalled, InterventionDecisionStalled, InterventionCandidateHandoff, InterventionControlUnstable,
-		InterventionAttemptBudget:
 		return true
 	default:
 		return false

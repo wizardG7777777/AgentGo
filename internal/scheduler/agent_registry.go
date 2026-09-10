@@ -40,6 +40,25 @@ func NewAgentRegistry() *AgentRegistry {
 	return &AgentRegistry{routes: make(map[string]routeRegistration)}
 }
 
+// ExecutionCatalog 包含默认队列和作用域内真实路由，模型不必猜测 Agent 名称。
+func (r *AgentRegistry) ExecutionCatalog(scope string) any {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var result []map[string]any
+	for _, key := range r.order {
+		entry, ok := r.routes[key]
+		if !ok || !routeVisibleToOwner(entry, scope, true) {
+			continue
+		}
+		ref := entry.EventType
+		if ref == "" {
+			ref = "default"
+		}
+		result = append(result, map[string]any{"route_ref": ref, "description": entry.Role, "tools": cloneStrings(entry.Capabilities), "count": entry.Count})
+	}
+	return result
+}
+
 // Register preserves the historical append/merge API used by bootstrap and
 // tests. Repeated registrations of one event type share a stable legacy key:
 // Count accumulates while non-empty Role and non-nil Capabilities use the

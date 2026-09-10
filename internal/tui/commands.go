@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -69,19 +70,21 @@ func (m *AppModel) handleCommand(line string) bool {
 		}
 		m.requestAgentAudit()
 
-	case "/event":
-		if len(parts) < 3 {
-			m.appendMsg("[event] 用法: /event <graph-id> <事件名> [数据JSON] — 向图的 wait_event 节点投递外部事件", MsgWarn)
+	case "/graph-input":
+		var input ui.GraphInputRequest
+		if len(parts) < 2 || json.Unmarshal([]byte(strings.Join(parts[1:], " ")), &input) != nil {
+			m.appendMsg("graph-input 参数必须是包含 graph_id、port、version、expected_revision、request_id、value 的 JSON", MsgError)
 			return false
 		}
-		var data map[string]any
-		if len(parts) > 3 {
-			if err := json.Unmarshal([]byte(strings.Join(parts[3:], " ")), &data); err != nil {
-				m.appendMsg(fmt.Sprintf("[event] 数据不是合法 JSON 对象: %v", err), MsgError)
-				return false
-			}
+		if m.deps.Controller == nil {
+			m.appendMsg("控制面未初始化", MsgError)
+			return false
 		}
-		m.emitGraphEvent(parts[1], parts[2], data)
+		if err := m.deps.Controller.ProvideGraphInput(context.Background(), input); err != nil {
+			m.appendMsg(err.Error(), MsgError)
+		} else {
+			m.appendMsg("图输入版本已保存", MsgInfo)
+		}
 
 	case "/session":
 		if len(parts) < 2 {
@@ -298,21 +301,6 @@ func (m *AppModel) steerAgent(agentID, msg string) {
 		return
 	}
 	m.appendMsg(fmt.Sprintf("[steer] 已发送指导给 %s", agentID), MsgInfo)
-}
-
-// emitGraphEvent 经控制面向指定图的 wait_event 节点投递外部事件（/event）。
-// 事件是时点信号：节点未在等待或所属 Session 冻结时到达视为未发生，
-// 由 Runtime 内部闸门静默忽略（这里回报的是"已投递"，不保证命中）。
-func (m *AppModel) emitGraphEvent(graphID, event string, data map[string]any) {
-	if m.deps.Controller == nil {
-		m.appendMsg("[event] 控制面未初始化", MsgError)
-		return
-	}
-	if err := m.deps.Controller.EmitGraphEvent(graphID, event, data); err != nil {
-		m.appendMsg(fmt.Sprintf("[event] %v", err), MsgError)
-		return
-	}
-	m.appendMsg(fmt.Sprintf("[event] 已投递事件 %q → 图 %s（节点未在等待时事件被忽略）", event, graphID), MsgInfo)
 }
 
 func (m *AppModel) newSession() {

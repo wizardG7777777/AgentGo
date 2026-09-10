@@ -144,7 +144,7 @@ func (g AgentTemplateGroup) currentController() (*model.Task, error) {
 	if task.EventType != "__scheduler__" || task.Status != model.TaskStatusProcessing {
 		return nil, fmt.Errorf("agent team provisioning requires a running Scheduler task")
 	}
-	if task.FinalReportGraphID != "" || (task.GraphID != "" && task.GraphNodeKind != "controller") {
+	if task.FinalReportGraphID != "" || task.GraphID != "" {
 		return nil, fmt.Errorf("只有图编排 controller 可以创建 Team")
 	}
 	return task, nil

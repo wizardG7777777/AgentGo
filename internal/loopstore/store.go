@@ -23,9 +23,8 @@ import (
 )
 
 const (
-	RecordSchemaV1          = "agentgo.loop-store-record/v1"
-	InterventionAckSchemaV1 = "agentgo.loop-intervention-ack/v1"
-	maxRecordBytes          = 4 << 20
+	RecordSchemaV1 = "agentgo.loop-store-record/v1"
+	maxRecordBytes = 4 << 20
 )
 
 var (
@@ -45,8 +44,6 @@ const (
 	RecordSettlement       RecordKind = "settlement"
 	RecordActionSettlement RecordKind = "action_settlement"
 	RecordAttemptRollover  RecordKind = "attempt_rollover"
-	RecordIntervention     RecordKind = "intervention_requested"
-	RecordInterventionAck  RecordKind = "intervention_ack"
 	RecordSeal             RecordKind = "seal"
 	RecordTerminalSeal     RecordKind = "terminal_seal"
 )
@@ -54,39 +51,19 @@ const (
 // Record 是单任务 journal 的一条原子事实。Settlement 必须在同一条记录中携带
 // Delta、Assessment 和 next Checkpoint，禁止跨多个文件假装事务。
 type Record struct {
-	Schema              string                                  `json:"schema"`
-	Sequence            int64                                   `json:"sequence"`
-	Kind                RecordKind                              `json:"kind"`
-	TaskID              string                                  `json:"task_id"`
-	At                  time.Time                               `json:"at"`
-	PreviousDigest      string                                  `json:"previous_digest,omitempty"`
-	EntryDigest         string                                  `json:"entry_digest"`
-	Reservation         *loopcontract.ActionReservation         `json:"reservation,omitempty"`
-	Delta               *loopcontract.TurnSettlementDelta       `json:"delta,omitempty"`
-	Assessment          *loopcontract.ProgressAssessment        `json:"assessment,omitempty"`
-	Checkpoint          *loopcontract.ProgressCheckpoint        `json:"checkpoint,omitempty"`
-	ActionSettlement    *loopcontract.ActionSettlement          `json:"action_settlement,omitempty"`
-	Intervention        *loopcontract.LoopInterventionRequested `json:"intervention,omitempty"`
-	InterventionAck     *InterventionAck                        `json:"intervention_ack,omitempty"`
-	TerminalSettlements []loopcontract.ActionSettlement         `json:"terminal_settlements,omitempty"`
-}
-
-// InterventionAck 是 L5 消费 typed intervention 后的 durable 确认。Ack 只确认
-// 已接收/已形成决策引用，不直接修改 Graph 或 Checkpoint。
-type InterventionAck struct {
-	Schema      string    `json:"schema"`
-	CommandID   string    `json:"command_id"`
-	Consumer    string    `json:"consumer"`
-	DecisionRef string    `json:"decision_ref"`
-	AckedAt     time.Time `json:"acked_at"`
-}
-
-func (a InterventionAck) Validate() error {
-	if a.Schema != InterventionAckSchemaV1 || strings.TrimSpace(a.CommandID) == "" ||
-		strings.TrimSpace(a.Consumer) == "" || strings.TrimSpace(a.DecisionRef) == "" || a.AckedAt.IsZero() {
-		return fmt.Errorf("InterventionAck 字段无效")
-	}
-	return nil
+	Schema              string                            `json:"schema"`
+	Sequence            int64                             `json:"sequence"`
+	Kind                RecordKind                        `json:"kind"`
+	TaskID              string                            `json:"task_id"`
+	At                  time.Time                         `json:"at"`
+	PreviousDigest      string                            `json:"previous_digest,omitempty"`
+	EntryDigest         string                            `json:"entry_digest"`
+	Reservation         *loopcontract.ActionReservation   `json:"reservation,omitempty"`
+	Delta               *loopcontract.TurnSettlementDelta `json:"delta,omitempty"`
+	Assessment          *loopcontract.ProgressAssessment  `json:"assessment,omitempty"`
+	Checkpoint          *loopcontract.ProgressCheckpoint  `json:"checkpoint,omitempty"`
+	ActionSettlement    *loopcontract.ActionSettlement    `json:"action_settlement,omitempty"`
+	TerminalSettlements []loopcontract.ActionSettlement   `json:"terminal_settlements,omitempty"`
 }
 
 type journalFile interface {
@@ -102,7 +79,6 @@ type taskState struct {
 	checkpoint              *loopcontract.ProgressCheckpoint
 	pendingByAction         map[string]loopcontract.ActionReservation
 	settledByAction         map[string]loopcontract.ActionSettlement
-	pendingInterventions    map[string]loopcontract.LoopInterventionRequested
 	seenReservationIDs      map[string]struct{}
 	seenActionIDs           map[string]struct{}
 	seenTurnIDs             map[string]struct{}
@@ -111,7 +87,6 @@ type taskState struct {
 	seenCheckpointIDs       map[string]struct{}
 	seenAttemptIDs          map[string]struct{}
 	seenActionSettlementIDs map[string]struct{}
-	seenInterventionIDs     map[string]struct{}
 	poisoned                error
 }
 
@@ -120,7 +95,6 @@ func newTaskState(file journalFile) *taskState {
 		file:                    file,
 		pendingByAction:         make(map[string]loopcontract.ActionReservation),
 		settledByAction:         make(map[string]loopcontract.ActionSettlement),
-		pendingInterventions:    make(map[string]loopcontract.LoopInterventionRequested),
 		seenReservationIDs:      make(map[string]struct{}),
 		seenActionIDs:           make(map[string]struct{}),
 		seenTurnIDs:             make(map[string]struct{}),
@@ -129,7 +103,6 @@ func newTaskState(file journalFile) *taskState {
 		seenCheckpointIDs:       make(map[string]struct{}),
 		seenAttemptIDs:          make(map[string]struct{}),
 		seenActionSettlementIDs: make(map[string]struct{}),
-		seenInterventionIDs:     make(map[string]struct{}),
 	}
 }
 
@@ -223,19 +196,8 @@ func (s *Store) AppendActionSettlement(settlement loopcontract.ActionSettlement)
 	return s.append(settlement.TaskID, Record{Kind: RecordActionSettlement, ActionSettlement: &cloned})
 }
 
-// AppendSettlement 原子提交 settled Turn 的事实、进展判断和 next Checkpoint，
-// 并结清 Delta.ActionIDs 指向的全部 reservation。
-func (s *Store) AppendSettlement(delta loopcontract.TurnSettlementDelta,
-	assessment loopcontract.ProgressAssessment, checkpoint loopcontract.ProgressCheckpoint) error {
-	return s.AppendSettlementWithIntervention(delta, assessment, checkpoint, nil)
-}
-
-// AppendSettlementWithIntervention 把 Delta、Assessment、next Checkpoint 与可选
-// typed intervention outbox 放入同一条 journal record，关闭 checkpoint 已进入
-// intervention_required、但命令尚未 durable 的崩溃窗口。
-func (s *Store) AppendSettlementWithIntervention(delta loopcontract.TurnSettlementDelta,
-	assessment loopcontract.ProgressAssessment, checkpoint loopcontract.ProgressCheckpoint,
-	intervention *loopcontract.LoopInterventionRequested) error {
+// AppendSettlement 仅原子提交工具结算和 checkpoint，不生成控制命令。
+func (s *Store) AppendSettlement(delta loopcontract.TurnSettlementDelta, assessment loopcontract.ProgressAssessment, checkpoint loopcontract.ProgressCheckpoint) error {
 	if err := validateSettlementBinding(delta, assessment, checkpoint); err != nil {
 		return err
 	}
@@ -251,127 +213,12 @@ func (s *Store) AppendSettlementWithIntervention(delta loopcontract.TurnSettleme
 	if err != nil {
 		return err
 	}
-	var interventionClone *loopcontract.LoopInterventionRequested
-	if intervention != nil {
-		cloned, cloneErr := cloneValue(*intervention)
-		if cloneErr != nil {
-			return cloneErr
-		}
-		interventionClone = &cloned
-	}
 	return s.append(delta.TaskID, Record{
 		Kind: RecordSettlement, Delta: &deltaClone,
-		Assessment: &assessmentClone, Checkpoint: &checkpointClone, Intervention: interventionClone,
+		Assessment: &assessmentClone, Checkpoint: &checkpointClone,
 	})
 }
 
-// AppendIntervention 在 Turn 已经结算后原子推进 checkpoint + typed outbox。
-// 用于 future Attempt/deadline 等“结束当前 Attempt 后才可判断”的控制边界；
-// 不得伪造第二条 TurnSettlementDelta。
-func (s *Store) AppendIntervention(checkpoint loopcontract.ProgressCheckpoint,
-	intervention loopcontract.LoopInterventionRequested) error {
-	if err := checkpoint.Validate(); err != nil {
-		return fmt.Errorf("Intervention checkpoint 无效: %w", err)
-	}
-	if err := intervention.Validate(); err != nil {
-		return fmt.Errorf("LoopInterventionRequested 无效: %w", err)
-	}
-	checkpointClone, err := cloneValue(checkpoint)
-	if err != nil {
-		return err
-	}
-	interventionClone, err := cloneValue(intervention)
-	if err != nil {
-		return err
-	}
-	return s.append(checkpoint.TaskID, Record{
-		Kind: RecordIntervention, Checkpoint: &checkpointClone, Intervention: &interventionClone,
-	})
-}
-
-// PendingInterventions 返回全 Store 未 ack 的 typed commands，按 RequestedAt、
-// CommandID 稳定排序，供未来 L5 adapter 消费。
-func (s *Store) PendingInterventions() ([]loopcontract.LoopInterventionRequested, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil, ErrStoreClosed
-	}
-	var commands []loopcontract.LoopInterventionRequested
-	for taskID, state := range s.tasks {
-		if state.poisoned != nil {
-			return nil, fmt.Errorf("%w: task=%s: %v", ErrTaskPoisoned, taskID, state.poisoned)
-		}
-		for _, command := range state.pendingInterventions {
-			cloned, err := cloneValue(command)
-			if err != nil {
-				return nil, err
-			}
-			commands = append(commands, cloned)
-		}
-	}
-	sort.Slice(commands, func(i, j int) bool {
-		if !commands[i].RequestedAt.Equal(commands[j].RequestedAt) {
-			return commands[i].RequestedAt.Before(commands[j].RequestedAt)
-		}
-		return commands[i].CommandID < commands[j].CommandID
-	})
-	return commands, nil
-}
-
-// PendingInterventionsForTask 只返回一个 source Task 的未确认 commands。
-// terminal adapter 必须使用本窄查询，避免一条任务终态事件触发全 Store
-// Drain，抢在其它 TaskOutcome/Graph settlement 之前发布协调任务。
-func (s *Store) PendingInterventionsForTask(taskID string) ([]loopcontract.LoopInterventionRequested, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil, ErrStoreClosed
-	}
-	taskID = strings.TrimSpace(taskID)
-	if taskID == "" {
-		return nil, fmt.Errorf("loopstore task_id 不能为空")
-	}
-	state := s.tasks[taskID]
-	if state == nil {
-		return nil, nil
-	}
-	if state.poisoned != nil {
-		return nil, fmt.Errorf("%w: task=%s: %v", ErrTaskPoisoned, taskID, state.poisoned)
-	}
-	commands := make([]loopcontract.LoopInterventionRequested, 0, len(state.pendingInterventions))
-	for _, command := range state.pendingInterventions {
-		cloned, err := cloneValue(command)
-		if err != nil {
-			return nil, err
-		}
-		commands = append(commands, cloned)
-	}
-	sort.Slice(commands, func(i, j int) bool {
-		if !commands[i].RequestedAt.Equal(commands[j].RequestedAt) {
-			return commands[i].RequestedAt.Before(commands[j].RequestedAt)
-		}
-		return commands[i].CommandID < commands[j].CommandID
-	})
-	return commands, nil
-}
-
-// AckIntervention durable 确认一条 pending command。已 ack/未知 command 拒绝，
-// 防止消费者凭空确认未接收的介入请求。
-func (s *Store) AckIntervention(taskID string, ack InterventionAck) error {
-	if err := ack.Validate(); err != nil {
-		return err
-	}
-	cloned, err := cloneValue(ack)
-	if err != nil {
-		return err
-	}
-	return s.append(taskID, Record{Kind: RecordInterventionAck, InterventionAck: &cloned})
-}
-
-// RolloverAttempt 原子冻结一个新的 AttemptID/Attempt deadline，同时保留同一
-// Task/Activation 的累计 usage、no-progress 状态和事实 cursor。仍有 pending
-// reservation 时拒绝 rollover，避免把未知 action 遗留给新 Attempt。
 func (s *Store) RolloverAttempt(checkpoint loopcontract.ProgressCheckpoint) error {
 	if checkpoint.Sealed {
 		return fmt.Errorf("Attempt rollover 的 ProgressCheckpoint 不得 sealed")
@@ -632,7 +479,7 @@ func (s *Store) append(taskID string, record Record) error {
 	if state.poisoned != nil {
 		return fmt.Errorf("%w: task=%s: %v", ErrTaskPoisoned, taskID, state.poisoned)
 	}
-	if state.checkpoint != nil && state.checkpoint.Sealed && record.Kind != RecordInterventionAck {
+	if state.checkpoint != nil && state.checkpoint.Sealed {
 		return fmt.Errorf("task %s 的 ProgressCheckpoint 已 sealed", taskID)
 	}
 
@@ -796,7 +643,7 @@ func (r Record) Validate() error {
 	switch r.Kind {
 	case RecordInitialize:
 		if r.Reservation != nil || r.Delta != nil || r.Assessment != nil || r.Checkpoint == nil ||
-			r.ActionSettlement != nil || r.Intervention != nil || r.InterventionAck != nil {
+			r.ActionSettlement != nil {
 			return fmt.Errorf("initialize record 形状无效")
 		}
 		if r.Checkpoint.TaskID != r.TaskID || r.Checkpoint.Sealed ||
@@ -806,7 +653,7 @@ func (r Record) Validate() error {
 		return r.Checkpoint.Validate()
 	case RecordReservation:
 		if r.Reservation == nil || r.Delta != nil || r.Assessment != nil || r.Checkpoint != nil ||
-			r.ActionSettlement != nil || r.Intervention != nil || r.InterventionAck != nil {
+			r.ActionSettlement != nil {
 			return fmt.Errorf("reservation record 形状无效")
 		}
 		if r.Reservation.Intent.TaskID != r.TaskID {
@@ -815,7 +662,7 @@ func (r Record) Validate() error {
 		return r.Reservation.Validate()
 	case RecordActionSettlement:
 		if r.ActionSettlement == nil || r.Reservation != nil || r.Delta != nil || r.Assessment != nil ||
-			r.Checkpoint != nil || r.Intervention != nil || r.InterventionAck != nil {
+			r.Checkpoint != nil {
 			return fmt.Errorf("action_settlement record 形状无效")
 		}
 		if r.ActionSettlement.TaskID != r.TaskID {
@@ -824,41 +671,27 @@ func (r Record) Validate() error {
 		return r.ActionSettlement.Validate()
 	case RecordSettlement:
 		if r.Reservation != nil || r.Delta == nil || r.Assessment == nil || r.Checkpoint == nil ||
-			r.ActionSettlement != nil || r.InterventionAck != nil {
+			r.ActionSettlement != nil {
 			return fmt.Errorf("settlement record 形状无效")
 		}
 		if err := validateSettlementBinding(*r.Delta, *r.Assessment, *r.Checkpoint); err != nil {
 			return err
 		}
-		if r.Intervention != nil {
-			return r.Intervention.Validate()
-		}
+
 		return nil
 	case RecordAttemptRollover:
 		if r.Reservation != nil || r.Delta != nil || r.Assessment != nil || r.Checkpoint == nil || r.Checkpoint.Sealed ||
-			r.ActionSettlement != nil || r.Intervention != nil || r.InterventionAck != nil {
+			r.ActionSettlement != nil {
 			return fmt.Errorf("attempt_rollover record 形状无效")
 		}
 		if r.Checkpoint.TaskID != r.TaskID {
 			return fmt.Errorf("attempt_rollover task_id 与 record 不一致")
 		}
 		return r.Checkpoint.Validate()
-	case RecordIntervention:
-		if r.Reservation != nil || r.Delta != nil || r.Assessment != nil || r.Checkpoint == nil ||
-			r.Checkpoint.Sealed || r.ActionSettlement != nil || r.Intervention == nil || r.InterventionAck != nil {
-			return fmt.Errorf("intervention_requested record 形状无效")
-		}
-		if r.Checkpoint.TaskID != r.TaskID || r.Intervention.TaskID != r.TaskID ||
-			r.Intervention.CheckpointRef != r.Checkpoint.CheckpointID {
-			return fmt.Errorf("intervention_requested checkpoint/command binding 无效")
-		}
-		if err := r.Checkpoint.Validate(); err != nil {
-			return err
-		}
-		return r.Intervention.Validate()
+
 	case RecordSeal:
 		if r.Reservation != nil || r.Delta != nil || r.Assessment != nil || r.Checkpoint == nil || !r.Checkpoint.Sealed ||
-			r.ActionSettlement != nil || r.Intervention != nil || r.InterventionAck != nil {
+			r.ActionSettlement != nil {
 			return fmt.Errorf("seal record 形状无效")
 		}
 		if r.Checkpoint.TaskID != r.TaskID {
@@ -867,7 +700,7 @@ func (r Record) Validate() error {
 		return r.Checkpoint.Validate()
 	case RecordTerminalSeal:
 		if r.Reservation != nil || r.Delta != nil || r.Assessment != nil || r.Checkpoint == nil || !r.Checkpoint.Sealed ||
-			r.ActionSettlement != nil || r.Intervention != nil || r.InterventionAck != nil {
+			r.ActionSettlement != nil {
 			return fmt.Errorf("terminal_seal record 形状无效")
 		}
 		if r.Checkpoint.TaskID != r.TaskID {
@@ -882,12 +715,7 @@ func (r Record) Validate() error {
 			}
 		}
 		return r.Checkpoint.Validate()
-	case RecordInterventionAck:
-		if r.InterventionAck == nil || r.Reservation != nil || r.Delta != nil || r.Assessment != nil ||
-			r.Checkpoint != nil || r.ActionSettlement != nil || r.Intervention != nil {
-			return fmt.Errorf("intervention_ack record 形状无效")
-		}
-		return r.InterventionAck.Validate()
+
 	default:
 		return fmt.Errorf("loopstore record kind=%q，无效", r.Kind)
 	}
@@ -1067,33 +895,7 @@ func validateTransition(state *taskState, record Record) error {
 		if next.CumulativeUsage != expectedUsage || assessment.BudgetCharge != delta.UsageDelta {
 			return fmt.Errorf("settlement cumulative/budget usage 不连续")
 		}
-		if record.Intervention != nil {
-			command := *record.Intervention
-			if command.TaskID != delta.TaskID || command.AttemptID != delta.AttemptID ||
-				command.RunID != delta.RunID || command.GraphID != delta.GraphID ||
-				command.NodeID != delta.NodeID || command.ActivationID != delta.ActivationID ||
-				command.Contract != next.Contract || command.CheckpointRef != next.CheckpointID {
-				return fmt.Errorf("LoopInterventionRequested 未绑定 settlement checkpoint")
-			}
-			if _, exists := state.seenInterventionIDs[command.CommandID]; exists {
-				return fmt.Errorf("intervention command_id=%s 重复", command.CommandID)
-			}
-			if command.ReasonCode == loopcontract.InterventionNoProgressBudget &&
-				next.InterventionStage != loopcontract.StageBlocked {
-				return fmt.Errorf("预算耗尽 intervention 必须绑定 blocked checkpoint")
-			}
-			if command.ReasonCode != loopcontract.InterventionNoProgressBudget &&
-				next.InterventionStage != loopcontract.StageInterventionRequired {
-				return fmt.Errorf("非终态 intervention 必须绑定 intervention_required checkpoint")
-			}
-			if next.InterventionCount != state.checkpoint.InterventionCount+1 ||
-				!next.LastInterventionAt.Equal(next.UpdatedAt) {
-				return fmt.Errorf("intervention checkpoint 计数/时间未原子推进")
-			}
-		} else if next.InterventionCount != state.checkpoint.InterventionCount ||
-			!next.LastInterventionAt.Equal(state.checkpoint.LastInterventionAt) {
-			return fmt.Errorf("无 intervention command 时不得改写 intervention 计数")
-		}
+
 		return nil
 	case RecordAttemptRollover:
 		if state.checkpoint == nil {
@@ -1127,39 +929,7 @@ func validateTransition(state *taskState, record Record) error {
 			return fmt.Errorf("Attempt rollover 改写了累计进展或 Activation 冻结事实")
 		}
 		return nil
-	case RecordIntervention:
-		if state.checkpoint == nil {
-			return ErrNotInitialized
-		}
-		if len(state.pendingByAction) != 0 {
-			return fmt.Errorf("仍有 %d 条 pending reservation，拒绝 intervention", len(state.pendingByAction))
-		}
-		next, command := *record.Checkpoint, *record.Intervention
-		if next.Version != state.checkpoint.Version+1 || next.CheckpointID == state.checkpoint.CheckpointID ||
-			next.LastDeltaSequence != state.checkpoint.LastDeltaSequence ||
-			!sameCheckpointLineage(*state.checkpoint, next) ||
-			!sameCheckpointFactsForIntervention(*state.checkpoint, next) {
-			return fmt.Errorf("intervention_requested 不得改写已结算进展/预算事实")
-		}
-		if next.UpdatedAt.Before(state.checkpoint.UpdatedAt) || next.UpdatedAt.After(record.At) ||
-			next.InterventionStage != loopcontract.StageInterventionRequired ||
-			next.InterventionCount != state.checkpoint.InterventionCount+1 ||
-			!next.LastInterventionAt.Equal(next.UpdatedAt) {
-			return fmt.Errorf("intervention_requested checkpoint 控制状态未单调推进")
-		}
-		if command.TaskID != next.TaskID || command.AttemptID != next.AttemptID ||
-			command.RunID != next.RunID || command.GraphID != next.GraphID ||
-			command.NodeID != next.NodeID || command.ActivationID != next.ActivationID ||
-			command.Contract != next.Contract || command.CheckpointRef != next.CheckpointID {
-			return fmt.Errorf("intervention_requested command lineage 与 checkpoint 不一致")
-		}
-		if _, exists := state.seenInterventionIDs[command.CommandID]; exists {
-			return fmt.Errorf("intervention command_id=%s 重复", command.CommandID)
-		}
-		if _, exists := state.seenCheckpointIDs[next.CheckpointID]; exists {
-			return fmt.Errorf("checkpoint_id=%s 重复", next.CheckpointID)
-		}
-		return nil
+
 	case RecordSeal:
 		if state.checkpoint == nil {
 			return ErrNotInitialized
@@ -1215,16 +985,7 @@ func validateTransition(state *taskState, record Record) error {
 			return fmt.Errorf("checkpoint_id=%s 重复", next.CheckpointID)
 		}
 		return nil
-	case RecordInterventionAck:
-		ack := *record.InterventionAck
-		command, ok := state.pendingInterventions[ack.CommandID]
-		if !ok {
-			return fmt.Errorf("未找到 pending intervention command_id=%s", ack.CommandID)
-		}
-		if ack.AckedAt.Before(command.RequestedAt) || ack.AckedAt.After(record.At) {
-			return fmt.Errorf("InterventionAck 时间无效")
-		}
-		return nil
+
 	default:
 		return fmt.Errorf("record kind=%q 无状态迁移", record.Kind)
 	}
@@ -1313,23 +1074,6 @@ func sameCheckpointFactsForSeal(current, next loopcontract.ProgressCheckpoint) b
 		current.LastInterventionAt.Equal(next.LastInterventionAt)
 }
 
-func sameCheckpointFactsForIntervention(current, next loopcontract.ProgressCheckpoint) bool {
-	return current.LastAnyProgressAt.Equal(next.LastAnyProgressAt) &&
-		current.LastDeliverableProgressAt.Equal(next.LastDeliverableProgressAt) &&
-		reflect.DeepEqual(current.RecentFingerprints, next.RecentFingerprints) &&
-		current.NoProgressTurns == next.NoProgressTurns &&
-		current.NoProgressDuration == next.NoProgressDuration &&
-		current.NoProgressUsage == next.NoProgressUsage &&
-		current.CumulativeUsage == next.CumulativeUsage &&
-		current.ExplorationTurnsSinceDeliverable == next.ExplorationTurnsSinceDeliverable &&
-		current.KnowledgeTurnsSinceObservation == next.KnowledgeTurnsSinceObservation &&
-		current.TurnsSinceDecisionCheckpoint == next.TurnsSinceDecisionCheckpoint &&
-		current.ObservationStagnationCount == next.ObservationStagnationCount &&
-		current.DecisionStagnationCount == next.DecisionStagnationCount &&
-		current.ControlContractFailureCount == next.ControlContractFailureCount &&
-		current.AttemptRolloverCount == next.AttemptRolloverCount
-}
-
 func sameCheckpointFactsForRollover(current, next loopcontract.ProgressCheckpoint) bool {
 	if current.LastDeltaSequence != next.LastDeltaSequence ||
 		current.LastAnyProgressAt != next.LastAnyProgressAt ||
@@ -1385,23 +1129,13 @@ func applyRecord(state *taskState, record Record) {
 		state.seenDeltaIDs[record.Delta.DeltaID] = struct{}{}
 		state.seenAssessmentIDs[record.Assessment.AssessmentID] = struct{}{}
 		state.seenCheckpointIDs[checkpoint.CheckpointID] = struct{}{}
-		if record.Intervention != nil {
-			command := *record.Intervention
-			state.pendingInterventions[command.CommandID] = command
-			state.seenInterventionIDs[command.CommandID] = struct{}{}
-		}
+
 	case RecordAttemptRollover:
 		checkpoint := *record.Checkpoint
 		state.checkpoint = &checkpoint
 		state.seenAttemptIDs[checkpoint.AttemptID] = struct{}{}
 		state.seenCheckpointIDs[checkpoint.CheckpointID] = struct{}{}
-	case RecordIntervention:
-		checkpoint := *record.Checkpoint
-		command := *record.Intervention
-		state.checkpoint = &checkpoint
-		state.seenCheckpointIDs[checkpoint.CheckpointID] = struct{}{}
-		state.pendingInterventions[command.CommandID] = command
-		state.seenInterventionIDs[command.CommandID] = struct{}{}
+
 	case RecordSeal:
 		checkpoint := *record.Checkpoint
 		state.checkpoint = &checkpoint
@@ -1415,8 +1149,7 @@ func applyRecord(state *taskState, record Record) {
 		checkpoint := *record.Checkpoint
 		state.checkpoint = &checkpoint
 		state.seenCheckpointIDs[checkpoint.CheckpointID] = struct{}{}
-	case RecordInterventionAck:
-		delete(state.pendingInterventions, record.InterventionAck.CommandID)
+
 	}
 }
 

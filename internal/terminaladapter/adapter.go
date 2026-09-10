@@ -1,143 +1,52 @@
-// Package terminaladapter 是 L4 TaskOutcome → L5 Graph TerminalFact 的唯一转换边界。
-// 自由文本 Task.Error/Results 不能绕过本包直接推进新 Graph。
+// Package terminaladapter 把已持久化 TaskOutcome 转为 agentTask 终态事实。
 package terminaladapter
 
 import (
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"strings"
-
 	"agentgo/internal/graph"
 	"agentgo/internal/outcome"
 	"agentgo/internal/outcomestore"
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
 )
 
-// ResultResolver 解引用 TaskOutcome.ResultRef。实现必须返回 JSON object bytes。
 type ResultResolver interface {
-	ResolveTaskResult(ctx context.Context, resultRef string) (json.RawMessage, error)
+	ResolveTaskResult(context.Context, string) (json.RawMessage, error)
 }
-
-// EvidenceResolver 把稳定 EvidenceRef 转为 Graph Runtime 可验证的结构化证据。
 type EvidenceResolver interface {
-	ResolveTaskEvidence(ctx context.Context, taskID string, refs []string) ([]graph.EvidenceEntry, error)
+	ResolveTaskEvidence(context.Context, string, []string) ([]graph.EvidenceEntry, error)
 }
-
 type Dependencies struct {
 	Results  ResultResolver
 	Evidence EvidenceResolver
 }
 
-// ToTerminalFact 校验并转换 durable Record。OutcomeRef 会写入 Result 的保留字段
-// `_task_outcome_ref`，让 Graph Result/Trace 可追溯原始终态事实；业务字段不能覆盖。
-func ToTerminalFact(ctx context.Context, record outcomestore.Record, deps Dependencies) (graph.TerminalFact, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+func ToAgentTaskTerminal(ctx context.Context, record outcomestore.Record, deps Dependencies) (graph.AgentTaskTerminal, error) {
 	if err := ctx.Err(); err != nil {
-		return graph.TerminalFact{}, err
-	}
-	if strings.TrimSpace(record.OutcomeRef) == "" {
-		return graph.TerminalFact{}, fmt.Errorf("Terminal adapter 缺少 outcome_ref")
+		return graph.AgentTaskTerminal{}, err
 	}
 	if err := outcomestore.ValidateRecord(record); err != nil {
-		return graph.TerminalFact{}, fmt.Errorf("Terminal adapter 收到伪造或损坏的 outcome record: %w", err)
+		return graph.AgentTaskTerminal{}, err
 	}
-	value := record.Outcome
-	if err := value.Validate(); err != nil {
-		return graph.TerminalFact{}, fmt.Errorf("Terminal adapter 收到无效 TaskOutcome: %w", err)
+	v := record.Outcome
+	if v.GraphID == "" || v.NodeID == "" || v.ActivationID == "" {
+		return graph.AgentTaskTerminal{}, fmt.Errorf("非图结果不能提交 agentTask 终态")
 	}
-	if value.GraphID == "" || value.NodeID == "" || value.ActivationID == "" {
-		return graph.TerminalFact{}, fmt.Errorf("非 Graph TaskOutcome 不能转换为 TerminalFact")
-	}
-	status, err := graphStatus(value.Status)
+	result, err := resolveResult(ctx, v, deps.Results)
 	if err != nil {
-		return graph.TerminalFact{}, err
+		return graph.AgentTaskTerminal{}, err
 	}
-	result, err := resolveResult(ctx, value, deps.Results)
-	if err != nil {
-		return graph.TerminalFact{}, err
-	}
-	// 保留键先无条件删除，再按权威值写回；真实字段为空时也不能允许业务
-	// Result 伪造 reason/ref/identity。
-	for _, key := range []string{
-		"status", "summary", "reason_code", "reason", "_task_outcome_ref",
-		"_run_id", "_attempt_id", "_attempt_no", "_result_ref",
-		"_checkpoint_ref", "_artifact_refs",
-		"_observation_delta_ref", "_failure_fingerprint",
-		"_checkpoint_state",
-		"_fulfillment",
-		"_delivery_id", "_candidate_ref",
-	} {
-		delete(result, key)
-	}
-	// 这些键是 L4→L5 边界的权威终态镜像，必须覆盖业务 result 同名字段。
-	result["status"] = string(value.Status)
-	result["summary"] = value.Summary
-	result["_task_outcome_ref"] = record.OutcomeRef
-	result["_run_id"] = string(value.RunID)
-	result["_attempt_id"] = value.AttemptID
-	result["_attempt_no"] = value.AttemptNo
-	if value.ReasonCode != "" {
-		result["reason_code"] = value.ReasonCode
-	}
-	if value.Reason != "" {
-		result["reason"] = value.Reason
-	}
-	if value.ResultRef != "" {
-		result["_result_ref"] = value.ResultRef
-	}
-	if value.CheckpointRef != "" {
-		result["_checkpoint_ref"] = value.CheckpointRef
-	}
-	if value.ObservationDeltaRef != "" {
-		result["_observation_delta_ref"] = value.ObservationDeltaRef
-	}
-	result["_failure_fingerprint"] = terminalFailureFingerprint(value)
-	if value.CheckpointState != "" {
-		result["_checkpoint_state"] = value.CheckpointState
-	}
-	if len(value.ArtifactRefs) > 0 {
-		result["_artifact_refs"] = append([]string(nil), value.ArtifactRefs...)
-	}
-	if value.Fulfillment != nil {
-		result["_fulfillment"] = value.Fulfillment
-	}
-	if value.DeliveryID != "" {
-		result["_delivery_id"] = value.DeliveryID
-	}
-	if value.CandidateRef != "" {
-		result["_candidate_ref"] = value.CandidateRef
-	}
-
-	evidence := durableEvidence(value.EvidenceFacts)
-	if deps.Evidence != nil && len(value.EvidenceRefs) > 0 {
-		resolved, resolveErr := deps.Evidence.ResolveTaskEvidence(ctx, value.TaskID, append([]string(nil), value.EvidenceRefs...))
-		if resolveErr != nil {
-			return graph.TerminalFact{}, fmt.Errorf("核验 TaskOutcome evidence: %w", resolveErr)
+	if deps.Evidence != nil && len(v.EvidenceRefs) > 0 {
+		e, err := deps.Evidence.ResolveTaskEvidence(ctx, v.TaskID, v.EvidenceRefs)
+		if err != nil {
+			return graph.AgentTaskTerminal{}, err
 		}
-		if !evidenceExact(resolved, evidence) {
-			return graph.TerminalFact{}, fmt.Errorf("EvidenceResolver 返回事实与 durable evidence_facts 不一致")
+		if !evidenceExact(e, durableEvidence(v.EvidenceFacts)) {
+			return graph.AgentTaskTerminal{}, fmt.Errorf("证据与终态权威不符")
 		}
 	}
-	return graph.TerminalFact{
-		GraphID: value.GraphID, NodeID: value.NodeID, ActivationID: value.ActivationID,
-		TaskID: value.TaskID, Status: status, Result: result,
-		Evidence:    append([]graph.EvidenceEntry(nil), evidence...),
-		Fulfillment: value.Fulfillment,
-		DeliveryRef: value.DeliveryID, CandidateRef: value.CandidateRef,
-	}, nil
-}
-
-func terminalFailureFingerprint(value outcome.TaskOutcome) string {
-	payload := strings.Join([]string{
-		value.GraphID, value.NodeID, value.ActivationID, value.CheckpointRef,
-		value.ObservationDeltaRef, value.ReasonCode,
-	}, "\x00")
-	sum := sha256.Sum256([]byte(payload))
-	return "failure:sha256:" + hex.EncodeToString(sum[:])
+	return graph.AgentTaskTerminal{TaskID: v.TaskID, AttemptID: v.AttemptID, OutcomeRef: record.OutcomeRef, Status: string(v.Status), Value: result, CandidateRef: v.CandidateRef, Evidence: durableEvidence(v.EvidenceFacts), EvidenceRefs: append([]string(nil), v.EvidenceRefs...), Error: strings.TrimSpace(v.Reason)}, nil
 }
 
 func durableEvidence(values []outcome.EvidenceFact) []graph.EvidenceEntry {
@@ -193,17 +102,4 @@ func resolveResult(ctx context.Context, value outcome.TaskOutcome, resolver Resu
 		return nil, fmt.Errorf("TaskOutcome result 不是 JSON object: %v", err)
 	}
 	return result, nil
-}
-
-func graphStatus(status outcome.Status) (graph.NodeStatus, error) {
-	switch status {
-	case outcome.StatusCompleted:
-		return graph.NodeCompleted, nil
-	case outcome.StatusFailed, outcome.StatusCancelled:
-		return graph.NodeFailed, nil
-	case outcome.StatusBlocked:
-		return graph.NodeBlocked, nil
-	default:
-		return "", fmt.Errorf("TaskOutcome status=%q 无法转换为 Graph status", status)
-	}
 }

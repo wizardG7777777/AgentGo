@@ -41,22 +41,6 @@ type StructuredSubmission struct {
 	// 唤醒任务）。Status=blocked 时 BlockedReason 必填（工具层校验）。
 	// 不参与 Format 渲染——终态是路由事实，不是结果正文。
 	Status string
-	// Event 是本结果对应的事件名（可选）：非空时由 agent 在 SubmitResult 前写入
-	// task.Results["event"]，驱动 V6 Graph 事件形态转移条件（when.event）。
-	// 它不参与 Format 渲染——事件是图路由事实，不是结果正文。
-	Event string
-	// Verdict 是本结果对应的验收结论（可选，如 pass/fail/fixable）：非空时由
-	// agent 在 SubmitResult 前写入 task.Results["verdict"]，驱动 V6 Graph
-	// acceptance 节点的路径形态转移条件（$.verdict eq ...）。
-	// 与 Event 一样不参与 Format 渲染。
-	Verdict string
-	// CitedEvidence 是验收结论引用的证据清单（可选，逗号分隔的不透明稳定
-	// EvidenceRef）：非空时由 agent 在 SubmitResult 前写入
-	// task.Results["cited_evidence"]，由 V6 Graph acceptance 节点做谱系核验
-	// ——引用必须属于该 acceptance activation 的上游 Input 谱系或本任务自身
-	// 证据，越谱系引用会使 verdict 不被采信（disputed）。与 Verdict 一样
-	// 不参与 Format 渲染（核验通道，不是结果正文）。
-	CitedEvidence string
 	// ResultJSON 是 result 参数经边界校验和 JSON 规范化后的 object 文本。
 	// 空串表示调用方没有提交自定义结构化字段；"{}" 表示显式提交空 object。
 	// 它不参与 Format 渲染，而是在 finalization 时写入

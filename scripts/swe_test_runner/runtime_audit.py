@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections import Counter
 import json
+import hashlib
 from pathlib import Path
 
 
-RESULT_SCHEMA = "agentgo.swe-result/v4"
+RESULT_SCHEMA = "agentgo.swe-result/v5"
 TERMINAL_TASK = {"completed", "failed", "blocked", "cancelled"}
 TERMINAL_GRAPH = {"completed", "failed", "blocked", "cancelled"}
 TERMINAL_OUTCOME = {"success", "failed", "blocked", "cancelled"}
@@ -97,6 +98,12 @@ def _nonnegative(value, reader, source):
         reader.issue("usage_value_invalid", source)
         return 0
     return value
+
+
+def go_json_digest(value):
+    raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    raw = raw.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def collect_runtime(snapshot_path, monitor_path, project_root, run_id, startup_probe_passed):
@@ -194,7 +201,7 @@ def collect_runtime(snapshot_path, monitor_path, project_root, run_id, startup_p
 
     # TaskOutcome 提交与投递回执分别读取，禁止把 UI 文本当作完成历史。
     outcomes, acknowledgements = {}, set()
-    for entry in reader.journal([state / "task-outcomes-v2" / "task-outcomes.jsonl"], version=1):
+    for entry in reader.journal([state / "task-outcomes-v3" / "task-outcomes.jsonl"], version=1):
         if entry.get("kind") == "delivery_ack":
             acknowledgements.add(entry.get("ack_ref"))
         record = reader.mapping(entry.get("record", {}), "outcome.record")
@@ -202,11 +209,7 @@ def collect_runtime(snapshot_path, monitor_path, project_root, run_id, startup_p
         if value.get("run_id") != run_id:
             continue
         ref = record.get("outcome_ref")
-        schemas = {"agentgo.task-outcome/v2", "agentgo.task-outcome/v3"}
-        # 当前非 Graph 节点（入口、final-report）仍原生写 TaskOutcome v1；
-        # 数据目录代次与业务 DTO 版本独立，不把它误当旧会话恢复。
-        if not value.get("graph_id"):
-            schemas.add("agentgo.task-outcome/v1")
+        schemas = {"agentgo.task-outcome/v4"}
         if not ref or value.get("schema") not in schemas:
             reader.issue("outcome_schema_or_identity_invalid", run_id)
             continue
@@ -250,7 +253,7 @@ def collect_runtime(snapshot_path, monitor_path, project_root, run_id, startup_p
     if not usage_present:
         reader.issue("run_usage_missing", run_id)
     attempts, loop_records = set(), 0
-    for entry in reader.journal((state / "loop-facts-v2").glob("*.jsonl"), schema="agentgo.loop-store-record/v1"):
+    for entry in reader.journal((state / "loop-facts-v3").glob("*.jsonl"), schema="agentgo.loop-store-record/v1"):
         checkpoint = entry.get("checkpoint") or reader.mapping(entry.get("settlement", {}), "loop.settlement").get("checkpoint") or {}
         checkpoint = reader.mapping(checkpoint, "loop.checkpoint")
         if checkpoint.get("run_id") == run_id:
@@ -258,46 +261,84 @@ def collect_runtime(snapshot_path, monitor_path, project_root, run_id, startup_p
             if checkpoint.get("attempt_id"):
                 attempts.add(checkpoint["attempt_id"])
 
-    definitions, start_intents = {}, {}
-    for entry in reader.journal([state / "graph-authoring-v2" / "authoring.jsonl"], version=1):
-        payload = reader.mapping(entry.get("payload"), "authoring.payload")
-        definition = reader.mapping(payload.get("definition", {}), "authoring.definition")
-        if reader.mapping(definition.get("body", {}), "authoring.body").get("run_id") == run_id:
-            key = (definition.get("graph_id"), definition.get("revision"))
-            if definition.get("schema") != "agentgo.graph/v5" or not all(key):
-                reader.issue("graph_definition_schema_or_identity_invalid", run_id)
-            if key in definitions and definitions[key].get("definition_digest") != definition.get("definition_digest"):
-                reader.issue("graph_definition_identity_conflict", str(key))
-            definitions[key] = definition
-        intent = reader.mapping(payload.get("start", {}), "authoring.start")
-        if intent.get("graph_id") in graph_ids:
-            start_intents[intent.get("start_id")] = intent
+    definitions, latest, graph_digests = {}, {}, {}
+    for entry in reader.journal((state / "graphs-v6").glob("*.jsonl")):
+        current = reader.mapping(entry.get("snapshot"), "dataflow.snapshot")
+        definition = reader.mapping(current.get("definition"), "dataflow.definition")
+        if definition.get("run_id") != run_id:
+            continue
+        graph_id, revision = definition.get("graph_id"), definition.get("revision")
+        if current.get("schema") != "agentgo.graph/v6" or definition.get("schema") != "agentgo.graph/v6" or not graph_id or not isinstance(revision, int):
+            reader.issue("dataflow_schema_or_identity_invalid", run_id)
+            continue
+        if not isinstance(definition.get("nodes"), list) or any(n.get("kind") != "agentTask" for n in _objects(definition.get("nodes"))):
+            reader.issue("retired_graph_kind", graph_id)
+        if any(k in definition for k in ("root", "next", "requires_acceptance")):
+            reader.issue("retired_control_definition", graph_id)
+        signed = dict(entry)
+        signed["digest"] = ""
+        if entry.get("digest") != go_json_digest(signed) or entry.get("previous_digest", "") != graph_digests.get(graph_id, ""):
+            reader.issue("dataflow_digest_invalid", graph_id)
+            continue
+        graph_digests[graph_id] = entry["digest"]
+        previous = latest.get(graph_id)
+        if entry.get("sequence") != current.get("state_version") or (previous and current.get("state_version", 0) != previous.get("state_version", 0) + 1):
+            reader.issue("dataflow_sequence_invalid", graph_id)
+        key = (graph_id, revision)
+        if key in definitions and definitions[key] != definition:
+            reader.issue("graph_definition_identity_conflict", graph_id)
+        definitions[key] = definition
+        latest[graph_id] = current
     deliveries = []
-    for path in sorted((state / "deliveries-v2").glob("*.json")):
+    for path in sorted((state / "deliveries-v3").glob("*.json")):
         delivery = reader.object(path)
-        if delivery.get("run_id") == run_id:
-            if delivery.get("schema") != "agentgo.delivery/v1":
-                reader.issue("delivery_schema_rejected", path)
-            deliveries.append(delivery)
-    delivery_incomplete = any(d.get("status") == "committed" and (not all(d.get(f) for f in (
-        "commit_effect_ref", "committed_revision_ref", "producer_outcome_ref", "acceptance_outcome_ref"))
-        or not (d.get("candidate") or {}).get("ref")) for d in deliveries)
-    mutating_graphs = {key[0] for key, definition in definitions.items()
-                       if (definition.get("contract") or {}).get("execution_class") == "mutating"}
+        if delivery.get("run_id") != run_id:
+            continue
+        if delivery.get("schema") != "agentgo.delivery/v2":
+            reader.issue("delivery_schema_rejected", path)
+        deliveries.append(delivery)
+    delivery_incomplete = any(d.get("status") == "committed" and not all(d.get(f) for f in (
+        "delivery_id", "completion_ref", "candidate_ref", "effect_ref", "graph_id")) for d in deliveries)
     applied_receipts = []
     for event in tool_results.values():
         if event.get("tool") != "apply_graph_change" or event.get("error"):
             continue
         try:
             receipt = json.loads(event.get("tool_result_content") or "")
-            if not isinstance(receipt, dict) or receipt.get("schema") != "agentgo.graph-apply-receipt/v1" or receipt.get("status") != "applied":
+            if not isinstance(receipt, dict) or receipt.get("schema") != "agentgo.graph-apply-receipt/v2" or receipt.get("status") != "applied":
                 raise ValueError()
-            definition = definitions.get((receipt.get("graph_id"), receipt.get("revision")))
-            if not definition or not receipt.get("definition_digest") or receipt["definition_digest"] != definition.get("definition_digest"):
+            key = (receipt.get("graph_id"), receipt.get("revision"))
+            if key not in definitions or receipt.get("source_request") not in (latest.get(key[0], {}).get("requests") or {}):
                 raise ValueError()
             applied_receipts.append(receipt)
         except (TypeError, ValueError):
             reader.issue("graph_apply_receipt_not_committed", event.get("call_id"))
+    completions_valid = True
+    missing_delivery = False
+    for graph_id in graph_ids:
+        current = latest.get(graph_id, {})
+        if current.get("status") not in TERMINAL_GRAPH:
+            completions_valid = False
+            continue
+        completion = reader.mapping(current.get("completion"), "dataflow.completion")
+        if completion.get("schema") != "agentgo.graph-completion/v1" or completion.get("status") != "committed":
+            completions_valid = False
+        refs = {r.get("ref"): r for r in (current.get("results") or {}).values() if isinstance(r, dict)}
+        if any(ref not in refs for ref in completion.get("result_refs", [])):
+            reader.issue("completion_result_ref_invalid", graph_id)
+        candidate = completion.get("candidate_ref")
+        if completion.get("outcome") == "success" and candidate:
+            if not any(d.get("delivery_id") == completion.get("delivery_ref") and d.get("candidate_ref") == candidate
+                       and d.get("graph_id") == graph_id and d.get("status") == "committed" for d in deliveries):
+                missing_delivery = True
+        for node_id, execution in (current.get("executions") or {}).items():
+            ref = execution.get("outcome_ref")
+            if execution.get("status") in TERMINAL_TASK and ref not in outcomes:
+                reader.issue("agent_task_outcome_missing", node_id)
+            for slot, value in ((execution.get("inputs") or {}).get("values") or {}).items():
+                source_ref = value.get("ref")
+                if str(source_ref).startswith("result:") and source_ref not in refs:
+                    reader.issue("agent_task_input_ref_invalid", node_id + ":" + slot)
     failures = Counter(e.get("failure_kind") for e in ends.values() if e.get("failure_kind"))
     model_incidents = [{"invocation_id": e["invocation_id"], "failure_kind": e.get("failure_kind"),
                         "provider_code": e.get("provider_code"), "failure_phase": e.get("failure_phase")}
@@ -306,18 +347,16 @@ def collect_runtime(snapshot_path, monitor_path, project_root, run_id, startup_p
     settled = not unresolved_invocations and not unresolved_tools and not active_reservations
     known = {"retired_tool_called": bool(retired_calls),
              "model_usage_mismatch": settled and usage_present and usage["model_calls"] != len(ends),
-             "success_without_delivery": any(g.get("outcome") == "success" and g.get("graph_id") in mutating_graphs
-                 and not any(d.get("graph_id") == g["graph_id"] and d.get("status") == "committed" for d in deliveries)
-                 for g in graphs),
-             "committed_delivery_incomplete": any(d.get("status") == "committed" for d in deliveries) and delivery_incomplete}
+             "success_without_delivery": missing_delivery,
+             "committed_delivery_incomplete": delivery_incomplete}
     checks = {
         "run_identity_visible": bool(tasks) and bool(monitor.get("run_identity_visible")),
         "graph_definitions_committed": bool(graphs) and all((g.get("graph_id"), g.get("revision")) in definitions for g in graphs),
         "graph_apply_receipts_present": bool(graphs) and all(any(r.get("graph_id") == g.get("graph_id") for r in applied_receipts) for g in graphs),
-        "graph_started": bool(graphs) and all(any(i.get("graph_id") == g.get("graph_id") and i.get("status") == "started"
-                                                 for i in start_intents.values()) for g in graphs),
+        "graph_started": bool(graphs) and all(any(r.get("action") == "start" for r in (latest.get(g.get("graph_id"), {}).get("requests") or {}).values()) for g in graphs),
         "graph_terminal": bool(graphs) and all(g.get("status") in TERMINAL_GRAPH for g in graphs),
-        "graph_outcome_typed": bool(graphs) and all(outcome in TERMINAL_OUTCOME for outcome in graph_outcomes),
+        "graph_outcome_typed": bool(graphs) and all(value in TERMINAL_OUTCOME for value in graph_outcomes),
+        "graph_completion_committed": bool(graphs) and completions_valid,
         "all_tasks_terminal": bool(tasks) and all(t.get("status") in TERMINAL_TASK for t in tasks),
         "task_outcomes_complete": bool(graph_tasks) and all(t.get("outcome_ref") in outcomes for t in graph_tasks + final_reports),
         "task_outcomes_delivered": bool(outcomes) and all(ref in acknowledgements for ref in outcomes),

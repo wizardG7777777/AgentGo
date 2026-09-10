@@ -118,7 +118,7 @@ func TestProjectExecuteResultDoesNotTreatPipelineTailExitAsEvaluationPass(t *tes
 	}
 }
 
-func TestUnknownInvocationRequestsTypedL5Intervention(t *testing.T) {
+func TestUnknownInvocationRecordsBlockedTaskForDataflowPlanning(t *testing.T) {
 	taskStore := store.NewMemoryTaskStore(nil, 32, 1, 60)
 	if err := store.SetTerminalOutcomeHook(taskStore, func(intent store.TerminalOutcomeIntent) (string, error) {
 		return "outcome:" + intent.Task.ID, nil
@@ -126,7 +126,7 @@ func TestUnknownInvocationRequestsTypedL5Intervention(t *testing.T) {
 		t.Fatal(err)
 	}
 	task := enforcementTask(t)
-	task.GraphID, task.NodeID, task.ActivationID, task.GraphNodeKind = "g-unknown", "work", "work@1", "agent"
+	task.GraphID, task.NodeID, task.ActivationID = "g-unknown", "work", "work@1"
 	if err := taskStore.PublishTask(task); err != nil {
 		t.Fatal(err)
 	}
@@ -152,15 +152,10 @@ func TestUnknownInvocationRequestsTypedL5Intervention(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.Status != model.TaskStatusBlocked || got.OutcomeRef == "" ||
-		!strings.Contains(got.Error, "需要 L5 recovery 裁决") {
+		!strings.Contains(got.Error, "等待图外规划") {
 		t.Fatalf("unknown Invocation 不得落入 non_recoverable failed: %+v", got)
 	}
-	commands, err := progressStore.PendingInterventionsForTask(task.ID)
-	if err != nil || len(commands) != 1 ||
-		commands[0].ReasonCode != loopcontract.InterventionUnsafeUnknown ||
-		commands[0].CheckpointRef == "" {
-		t.Fatalf("unknown Invocation 未形成 durable L4→L5 command: %+v err=%v", commands, err)
-	}
+
 }
 
 func TestCallerCancellationWinsOverNoProgressBlock(t *testing.T) {
@@ -199,9 +194,7 @@ func TestCallerCancellationWinsOverNoProgressBlock(t *testing.T) {
 	if got.Status != model.TaskStatusCancelled {
 		t.Fatalf("caller cancellation 应优先，实际 status=%s error=%q", got.Status, got.Error)
 	}
-	if commands, err := progressStore.PendingInterventions(); err != nil || len(commands) != 0 {
-		t.Fatalf("caller cancellation 不应遗留 policy intervention: %+v err=%v", commands, err)
-	}
+
 }
 
 func TestRecoverableFailureRejectsFutureAttemptBeforeRetryRollback(t *testing.T) {
@@ -252,11 +245,7 @@ func TestRecoverableFailureRejectsFutureAttemptBeforeRetryRollback(t *testing.T)
 	if err != nil || !ok || checkpoint.AttemptID != second.AttemptID || checkpoint.CumulativeUsage.Attempts != 2 {
 		t.Fatalf("future Attempt 门禁污染 checkpoint: %+v ok=%v err=%v", checkpoint, ok, err)
 	}
-	commands, err := progressStore.PendingInterventionsForTask(task.ID)
-	if err != nil || len(commands) != 1 || commands[0].ReasonCode != loopcontract.InterventionAttemptBudget ||
-		commands[0].CheckpointRef != checkpoint.CheckpointID {
-		t.Fatalf("future Attempt 耗尽未形成 typed intervention: %+v err=%v", commands, err)
-	}
+
 }
 
 func TestExplicitBudgetClampsPerCallCompletionBudget(t *testing.T) {
@@ -300,7 +289,7 @@ func TestL4ExplicitRunBudgetIsSharedAcrossActivationTasks(t *testing.T) {
 
 	first := enforcementTask(t)
 	first.ID, first.AttemptID, first.ActivationID = "work-task-1", "work-task-1/attempt-1", "work@1"
-	first.GraphID, first.NodeID, first.GraphNodeKind = "g-budget", "work", "agent"
+	first.GraphID, first.NodeID = "g-budget", "work"
 	first.RunContract.BudgetProfile = "swe/v3"
 	first.RunContract.Budget = runcontract.BudgetLimit{ModelCalls: 1}
 	firstRuntime, err := agent.initLoopProgress(first)
@@ -314,7 +303,7 @@ func TestL4ExplicitRunBudgetIsSharedAcrossActivationTasks(t *testing.T) {
 	second := enforcementTask(t)
 	second.RunID, second.RunContract = first.RunID, first.RunContract
 	second.ID, second.AttemptID, second.ActivationID = "work-task-2", "work-task-2/attempt-1", "work@2"
-	second.GraphID, second.NodeID, second.GraphNodeKind = first.GraphID, first.NodeID, first.GraphNodeKind
+	second.GraphID, second.NodeID = first.GraphID, first.NodeID
 	secondRuntime, err := agent.initLoopProgress(second)
 	if err != nil {
 		t.Fatal(err)
@@ -393,7 +382,7 @@ func TestRecoveryStartPermitIsNotReclaimedByNextAttemptOfSameActivation(t *testi
 
 	first := enforcementTask(t)
 	first.ID, first.AttemptID, first.ActivationID = "work-retry-task", "work-retry-task/attempt-1", "work@2"
-	first.GraphID, first.NodeID, first.GraphNodeKind = "g-retry", "work", "agent"
+	first.GraphID, first.NodeID = "g-retry", "work"
 	first.RunContract.Budget = runcontract.BudgetLimit{ModelCalls: 2}
 	now := time.Now().UTC()
 	if err = runAuthority.InitializeRun(*first.RunContract, first.RunContract.Budget); err != nil {

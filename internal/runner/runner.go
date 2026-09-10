@@ -74,9 +74,9 @@ type RunnerDeps struct {
 	RunBudgetStore *runbudget.Store
 	// ContentStore 是 L3 ContentRef 权威。生产 bootstrap 始终注入；nil 只供
 	// 不涉及 Context 外置的隔离单测/legacy 构造。
-	ContentStore     *contentstore.Store
-	GraphStore       *graph.Store
-	GraphDefinitions *graph.AuthoringStore
+	ContentStore *contentstore.Store
+	GraphStore   *graph.DataflowStore
+	GraphRuntime *graph.DataflowRuntime
 
 	// ContextRuntime 是 L2 唯一编译/快照 authority。生产必须注入。
 	ContextRuntime contextruntime.Runtime
@@ -108,10 +108,10 @@ type RunnerDeps struct {
 	// 装配注入）：写工具 / run_shell / send_message / workspace 合并经它记录
 	// prepared/settled。生产恒非 nil；nil 只保留给无副作用 legacy/隔离测试。
 	EffectJournal *effect.Journal
-	// OutletChecker 是终态契约 v2 的提交期出路检查器（*graph.Runtime，
+	// ResultValidator 是终态契约 v2 的提交期出路检查器（*graph.Runtime，
 	// bootstrap 装配注入）：schema v2 图任务的 submit_task_result 在终态
 	// 落盘前做出路匹配检查（两击协议）。nil 时不检查（行为与引入前一致）。
-	OutletChecker tools.OutletChecker
+	ResultValidator tools.ResultValidator
 	// UserOutput 是用户可见内容的输出目标。非 nil 时，agent 的 IsUserFacing 输出
 	// 和 scheduler 的 report_done 会写入此处，而不是直接 fmt.Printf。
 	UserOutput io.Writer

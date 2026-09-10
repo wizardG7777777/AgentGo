@@ -16,7 +16,7 @@ package runner
 //	| send_message | + mailbox.Registry + MailChainMaxDepth（常量）+ EffectJournal |
 //	| web_search / web_fetch | + webtool.SearchProvider |
 //	| request_replan | + Store + TaskHolder |
-//	| submit_task_result | + Store + TaskHolder + FinalizationNotifier + SubmitState（runner.New 注入）+ OutletChecker（v2 图提交期出路检查，nil 不检查） |
+//	| submit_task_result | + Store + TaskHolder + FinalizationNotifier + SubmitState（runner.New 注入）+ ResultValidator（v2 图提交期出路检查，nil 不检查） |
 //
 // 实际注册由 resolveToolGroups 完成——它按 RunnerDeps 构造全部 ToolGroup，
 // 再由 ToolRegistry 的 allowlist 自动剪枝。 unauthorized 工具根本不进 ToolRegistry。
@@ -112,12 +112,13 @@ func resolveToolGroups(
 			FinalizationNotifier: finHolder,
 			SubmitState:          submitState,
 			ArtifactResolver:     agent.NewArtifactPhysicalResolver(deps.ProjectRoot, deps.WorkspaceManager),
-			OutletChecker:        deps.OutletChecker,
+			ResultValidator:      deps.ResultValidator,
+			Planning:             deps.GraphRuntime,
 
 			Workspaces:  deps.WorkspaceManager,
 			ProjectRoot: deps.ProjectRoot,
 		},
-		tools.InspectionGroup{Tasks: deps.Store, Graphs: deps.GraphStore, Definitions: deps.GraphDefinitions, Content: deps.ContentStore, History: deps.StoreView, Holder: holder, SessionID: deps.SessionID},
+		tools.InspectionGroup{Tasks: deps.Store, Graphs: deps.GraphStore, Content: deps.ContentStore, History: deps.StoreView, Holder: holder, SessionID: deps.SessionID},
 	}
 }
 

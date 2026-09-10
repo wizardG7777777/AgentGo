@@ -178,7 +178,7 @@ func (s *System) freezeCurrentSessionLocked(oldID string, terminate bool) error 
 		// 破坏动作必须在静默之前：批量取消会发出任务终态事件（静默期被拒绝），
 		// Graph 先终结使 graph-terminal-feed 对这些事件的回填命中已终态图空转。
 		if s.GraphRuntime != nil {
-			s.GraphRuntime.TerminateAll("session_force")
+			s.GraphRuntime.CancelSession(context.Background(), oldID, "session_force")
 		}
 		if _, err := store.CancelAllNonTerminal(s.Store, "session_force"); err != nil {
 			log.Printf("[WARNING] session 终止：批量终止任务失败: %v", err)
@@ -186,13 +186,13 @@ func (s *System) freezeCurrentSessionLocked(oldID string, terminate bool) error 
 	} else if s.GraphRuntime != nil {
 		// 停驻必须先于静默与快照：吞掉迟到的终态事件、取消 wait timer，
 		// 防止冻结窗口内图继续推进/发布任务（会被静默拒绝而把图误判 failed）。
-		s.GraphRuntime.SuspendGraphsForSession(oldID)
+		s.GraphRuntime.SuspendSession(oldID)
 	}
 
 	if err := store.EnterQuiesce(s.Store); err != nil {
 		// 静默是隔离正确性的硬前提，拿不到就放弃切换并把图停驻复原。
 		if !terminate && s.GraphRuntime != nil {
-			s.GraphRuntime.ResumeGraphsForSession(oldID)
+			s.GraphRuntime.ResumeSession(oldID)
 		}
 		return fmt.Errorf("session 冻结：公告板进入静默失败: %w", err)
 	}
@@ -388,7 +388,7 @@ func (s *System) thawInPlaceLocked(oldID string) {
 		}
 	}
 	if s.GraphRuntime != nil {
-		s.GraphRuntime.ResumeGraphsForSession(oldID)
+		s.GraphRuntime.ResumeSession(oldID)
 	}
 	log.Printf("[session] 冻结中止，旧 session %s 已原地恢复（执行中任务已重排回 pending）", oldID)
 }

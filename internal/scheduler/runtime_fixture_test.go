@@ -42,8 +42,8 @@ func newTestScheduler(t *testing.T,
 	userOutput io.Writer,
 	resultOutput io.Writer,
 	modeStore *modes.Store,
-	graphRuntime *graph.Runtime,
-	graphStore *graph.Store,
+	graphRuntime *graph.DataflowRuntime,
+	graphStore *graph.DataflowStore,
 	// effectJournal 是 V6 §4 H2b 共享副作用账本（internal/effect）：
 	// scheduler 的写工具 / run_shell / send_message 经它记录
 	// prepared/settled。nil 时不记账（单测直构场景）。
@@ -56,7 +56,7 @@ func newTestScheduler(t *testing.T,
 	} else if !graphAuthoring[0].ContextRuntime.Ready() {
 		graphAuthoring[0].ContextRuntime = testmodel.Runtime(t)
 	}
-	b := New(s, r, llmClient, eventCh, cfg, cancelReg, mbRegistry, interactions, gateReg, storeView, recordToolCall, agentRegistry, templateCatalog, templateProvisioner, memoryStore, userOutput, resultOutput, modeStore, graphRuntime, graphStore, effectJournal, graphAuthoring...)
+	b := New(s, r, llmClient, eventCh, cfg, cancelReg, mbRegistry, interactions, gateReg, storeView, recordToolCall, agentRegistry, templateCatalog, templateProvisioner, memoryStore, userOutput, resultOutput, modeStore, graphRuntime, graphStore, effectJournal, graphAuthoring[0])
 	b.SchedulerExec.Inner = testagent.Wrap(b.SchedulerExec.Inner)
 	return b
 }

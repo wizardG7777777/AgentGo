@@ -13,7 +13,7 @@ const (
 	ExecutionLeaseSchemaV1      = "agentgo.execution-lease/v1"
 	ExecutionLeaseSchemaV2      = "agentgo.execution-lease/v2"
 	ExecutionLeaseSchemaV3      = "agentgo.execution-lease/v3"
-	ExecutionLeaseSchemaCurrent = ExecutionLeaseSchemaV3
+	ExecutionLeaseSchemaCurrent = "agentgo.execution-lease/v4"
 )
 
 // ExecutionLease 是 V6 §4（H1）引入的「冻结执行租约」：任务首次被认领时，
@@ -38,7 +38,7 @@ const (
 // finalizing 被接受）撤销（execution_lease_revoked，Revoked=true，此后任何
 // 工具 dispatch 拒绝——与 finalizing fence 互补的防御层）。
 type ExecutionLease struct {
-	// Schema 为空或 v1 表示历史 digest 语义；新冻结租约必须写 v2。
+	// 新租约使用 v4；旧版本不能恢复执行。
 	Schema   string    `json:"schema,omitempty"`
 	TaskID   string    `json:"task_id"`
 	Attempt  int       `json:"attempt"`   // 冻结时的执行尝试序号（1-based，= 冻结时 RetryCount+1）

@@ -243,53 +243,46 @@ type AgentToolActivity struct {
 
 // BoardTask 是任务看板 / 侧边栏需要的一行任务信息，由 model.Task 映射而来。
 type BoardTask struct {
-	ID            string    `json:"id"`
-	Desc          string    `json:"desc"`
-	Status        string    `json:"status"`
-	EventType     string    `json:"event_type"`
-	Agents        []string  `json:"agents"`
-	Priority      int       `json:"priority"`
-	CreatedAt     time.Time `json:"created_at"`
-	RunID         string    `json:"run_id,omitempty"`
-	RunPhase      string    `json:"run_phase,omitempty"`
-	AttemptID     string    `json:"attempt_id,omitempty"`
-	AttemptNo     int       `json:"attempt_no,omitempty"`
-	OutcomeRef    string    `json:"outcome_ref,omitempty"`
-	GraphID       string    `json:"graph_id,omitempty"`
-	NodeID        string    `json:"node_id,omitempty"`
-	ActivationID  string    `json:"activation_id,omitempty"`
-	GraphNodeKind string    `json:"graph_node_kind,omitempty"`
-	// GraphControllerRole/RecoverySourceTaskID/FinalReportGraphID 是安全的控制
+	ID           string    `json:"id"`
+	Desc         string    `json:"desc"`
+	Status       string    `json:"status"`
+	EventType    string    `json:"event_type"`
+	Agents       []string  `json:"agents"`
+	Priority     int       `json:"priority"`
+	CreatedAt    time.Time `json:"created_at"`
+	RunID        string    `json:"run_id,omitempty"`
+	RunPhase     string    `json:"run_phase,omitempty"`
+	AttemptID    string    `json:"attempt_id,omitempty"`
+	AttemptNo    int       `json:"attempt_no,omitempty"`
+	OutcomeRef   string    `json:"outcome_ref,omitempty"`
+	GraphID      string    `json:"graph_id,omitempty"`
+	NodeID       string    `json:"node_id,omitempty"`
+	ActivationID string    `json:"activation_id,omitempty"`
 	// 身份，不含结果正文、reasoning 或工具参数；外部系统测试据此核验
 	// recovery 与 final-report scope 是否真实物化/交付。
-	GraphControllerRole  string `json:"graph_controller_role,omitempty"`
-	RecoverySourceTaskID string `json:"recovery_source_task_id,omitempty"`
-	FinalReportGraphID   string `json:"final_report_graph_id,omitempty"`
+	FinalReportGraphID string `json:"final_report_graph_id,omitempty"`
 }
 
 // BoardTaskFromModel 把 model.Task 映射为 BoardTask，供 bootstrap 装配
 // PollBoard 时使用（也便于测试直接构造）。
 func BoardTaskFromModel(t model.Task) BoardTask {
 	return BoardTask{
-		ID:                   t.ID,
-		Desc:                 t.Description,
-		Status:               string(t.Status),
-		EventType:            t.EventType,
-		Agents:               t.Agents,
-		Priority:             t.Priority,
-		CreatedAt:            t.CreatedAt,
-		RunID:                string(t.RunID),
-		RunPhase:             string(t.RunPhase),
-		AttemptID:            t.AttemptID,
-		AttemptNo:            t.AttemptNo,
-		OutcomeRef:           t.OutcomeRef,
-		GraphID:              t.GraphID,
-		NodeID:               t.NodeID,
-		ActivationID:         t.ActivationID,
-		GraphNodeKind:        t.GraphNodeKind,
-		GraphControllerRole:  t.GraphControllerRole,
-		RecoverySourceTaskID: t.RecoverySourceTaskID,
-		FinalReportGraphID:   t.FinalReportGraphID,
+		ID:                 t.ID,
+		Desc:               t.Description,
+		Status:             string(t.Status),
+		EventType:          t.EventType,
+		Agents:             t.Agents,
+		Priority:           t.Priority,
+		CreatedAt:          t.CreatedAt,
+		RunID:              string(t.RunID),
+		RunPhase:           string(t.RunPhase),
+		AttemptID:          t.AttemptID,
+		AttemptNo:          t.AttemptNo,
+		OutcomeRef:         t.OutcomeRef,
+		GraphID:            t.GraphID,
+		NodeID:             t.NodeID,
+		ActivationID:       t.ActivationID,
+		FinalReportGraphID: t.FinalReportGraphID,
 	}
 }
 
@@ -297,13 +290,13 @@ func BoardTaskFromModel(t model.Task) BoardTask {
 // 选择节点和关联执行活动所需的信息；完整 GraphDocument 仍由 GraphStore
 // 持有，前端不能通过该投影修改图定义或运行状态。
 type GraphView struct {
+	Activity     string          `json:"activity,omitempty"`
 	GraphID      string          `json:"graph_id"`
 	RunID        string          `json:"run_id,omitempty"`
 	Revision     int64           `json:"revision"`
 	StateVersion int64           `json:"state_version"`
 	Status       string          `json:"status"`
 	Outcome      string          `json:"outcome,omitempty"` // success|failed|blocked|cancelled；legacy/运行中为空
-	Root         string          `json:"root"`
 	Digest       string          `json:"digest,omitempty"`
 	Degraded     bool            `json:"degraded,omitempty"`
 	SessionID    string          `json:"session_id,omitempty"` // 图的 session 归属（空串 = 尚未归并的历史图）
@@ -315,24 +308,20 @@ type GraphView struct {
 // ActivationID 会变化，因此前端选择身份必须使用 graph_id + node_id +
 // activation_id，而不能只按 AgentID 绑定。
 type GraphNodeView struct {
-	NodeID             string     `json:"node_id"`
-	Kind               string     `json:"kind"`
-	Title              string     `json:"title"`
-	Description        string     `json:"description,omitempty"`
-	Status             string     `json:"status"`
-	Root               bool       `json:"root,omitempty"`
-	AgentID            string     `json:"agent_id,omitempty"`
-	TaskID             string     `json:"task_id,omitempty"`
-	ActivationID       string     `json:"activation_id,omitempty"`
-	DefinitionRevision int64      `json:"definition_revision,omitempty"`
-	Phase              string     `json:"phase,omitempty"`
-	ResultRef          string     `json:"result_ref,omitempty"`
-	ResultSummary      string     `json:"result_summary,omitempty"`
-	Reason             string     `json:"reason,omitempty"`
-	WaitEvent          string     `json:"wait_event,omitempty"`
-	WaitDeadline       *time.Time `json:"wait_deadline,omitempty"`
-	RequestID          string     `json:"request_id,omitempty"`
-	ChildGraphID       string     `json:"child_graph_id,omitempty"`
+	CandidateRef       string `json:"candidate_ref,omitempty"`
+	NodeID             string `json:"node_id"`
+	Kind               string `json:"kind"`
+	Title              string `json:"title"`
+	Description        string `json:"description,omitempty"`
+	Status             string `json:"status"`
+	AgentID            string `json:"agent_id,omitempty"`
+	TaskID             string `json:"task_id,omitempty"`
+	ActivationID       string `json:"activation_id,omitempty"`
+	DefinitionRevision int64  `json:"definition_revision,omitempty"`
+	Phase              string `json:"phase,omitempty"`
+	ResultRef          string `json:"result_ref,omitempty"`
+	ResultSummary      string `json:"result_summary,omitempty"`
+	Reason             string `json:"reason,omitempty"`
 }
 
 // GraphEdgeView 同时表示当前定义中的边和 GraphStore 已持久化的选择事实。

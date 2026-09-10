@@ -1,114 +1,90 @@
 # AGENTS.md
 
-本文件是仓库实施约束入口。当前职责与接口以 [五层规范](docs/design/five-layer-engineering-architecture.md)、[工具契约](docs/design/tool-taxonomy-and-contracts.md) 和 [当前冻结基线](docs/design/contract-freeze-2026-08-30.md) 为准。历史设计不能用来恢复已退役的运行路径。
+本文件是仓库实施约束入口。当前 Graph 使用唯一 `agentTask` 节点，按输入就绪执行，迭代向同一图追加新实例，图级完成与交付。职责权威为 [五层规范](docs/design/five-layer-engineering-architecture.md)、[工具契约](docs/design/tool-taxonomy-and-contracts.md)、[冻结基线](docs/design/contract-freeze-2026-08-30.md)。实施来源和文件清单见 [agentTask 计划](docs/design/dataflow-graph-simplification-proposal.md)。旧控制图文档不得用于恢复已删除的执行路径。
 
-## 项目与调用链
+## 项目与五层接缝
 
-AgentGo 是 Go 多智能体图编排系统。Scheduler 通过图工具创建或更改持久化图；Graph Runtime 发布 Activation 对应的 Task，Runner 按 route 认领并运行 Agent Loop，结果经唯一终态事务回填图并完成 Delivery。工具请求、工具实际执行、节点结果、图结果与 Python 测试判题是不同事实。
+AgentGo 是 Go 1.25 多 Agent 数据流图系统，模块 agentgo。Scheduler 在业务图外创建或更新图；Runtime 冻结就绪输入，发布唯一 Task；Runner 按真实 route 认领，L4 Loop 使用 L3 工具完成工作，TaskOutcome 回填为不可变结果。模型调用完成、工具执行、节点完成、图完成和 Python 判题是不同事实。
 
-Go 1.25，模块 agentgo。YAML/JSON 配置使用 v4 嵌套 schema。Responses 与 Chat Completions 是两个显式协议，两者均只使用 SSE，不自动降级或切换。
+| 层级 | 职责 | 实际实现与接缝 |
+|---|---|---|
+| L1 Model Invocation Engineering | 完整请求校验、协议编码、HTTP/SSE、归一化与时序 | internal/llm；不装配角色/记忆/Graph/UI |
+| L2 Context Engineering | 指令、目标、记忆、历史、工具及附件装配；封存与重放；输出订阅 | internal/contextruntime、contextcontract、contextcompiler；taskmem render/update；存储经 L3 端口 |
+| L3 Harness Engineering | 权限、Lease、ToolRouter、工具、工作区、Store 与 Effect | agent/execution_lease.go、tool_registry.go、tool_router_snapshot.go、tool_call_identity.go；llm_executor.go 的 gate/dispatch；tools/store/workspace/effect/shell/gate |
+| L4 Loop Engineering | Task 的 Attempt/Turn、错误重试、取消和唯一终态 | agent/agent.go、state.go、loop_progress.go、finalization.go；runner/runner.go 认领外壳；loopstore；bootstrap/task_outcome.go 终态持久化接缝 |
+| L5 Graph Engineering | agentTask 定义、输入就绪、增量调度与图级交付 | graph/dataflow_contract.go、dataflow_inputs.go、dataflow_store.go、dataflow_runtime.go、dataflow_terminal.go；bootstrap/dataflow_runtime.go；delivery/store.go |
 
-## 五层职责、文件与接缝
+混合包按函数职责划分，不把整个 agent/runner 包归为一层。Bootstrap 是依赖装配入口；Trace/UI 是横切面，不是第六层。
 
-| 层级 | 职责 | 实际实现 | 跨层接缝 |
-|---|---|---|---|
-| L1 Model Invocation Engineering | 完整请求校验、协议编码、HTTP/SSE、响应归一化、失败与时序事实 | internal/llm | 仅消费 L2 封存 Request；不读取角色文件、记忆、Graph 或 UI |
-| L2 Context Engineering | 指令/目标/记忆/历史/工具/非文本装配，预算投影、封存、重放检查、模型输出订阅 | internal/contextruntime、contextcontract、contextcompiler；taskmem 的 render/update | 通过窄接口使用 L3 存储；不 import Agent/Graph/UI；不强制模型提交观察报告 |
-| L3 Harness Engineering | 工具授权与分发、执行环境、Lease、Store、Effect | internal/agent/execution_lease.go、tool_registry.go、tool_router_snapshot.go、tool_call_identity.go；llm_executor.go::Execute 的 gate/dispatch；internal/tools、store、effect、workspace、shell、gate | 冻结能力与选项交 L2；完整工具调用经 gate 执行并结算事实 |
-| L4 Loop Engineering | Task/Activation 的 Attempt、Turn、错误重试、取消与唯一终态 | internal/agent/agent.go::processTask、state.go、loop_progress.go、finalization.go；internal/runner/runner.go 的认领外壳；loopcontract/loopprogress/loopstore | 决定何时调用与终止，不装配 Prompt，不按经验轮数强制报告或交接 |
-| L5 Graph Engineering | 定义、版本、Activation、路由、验收与交付 | internal/graph、delivery；internal/bootstrap/graph_runtime.go 等图桥；internal/scheduler/activator.go；internal/tools/graph_authoring.go | 图事实驱动调度；不能把 API 完成或普通消息当作节点成功 |
+## 数据流图不变量
 
-混合包按函数职责划分，不能将整个 agent/runner 包归为单一层。Bootstrap 是依赖装配入口；Trace 和 UI 是横切面，不是第六层。完整文件索引见五层规范。
+- `kind` 只接受 `agentTask`。旧 controller/agent/router/tool/approval/acceptance/subgraph/join/wait_event/end 已退役，无别名、wrapper 或自动转换。
+- 图没有 root、next、when、end_outcome。边由 inputs 推导；同一输入槽单赋值，多上游使用不同槽。每个 revision 无环，迭代用新 node_id，不能重开旧节点或覆写结果。
+- 初图可以只有调查任务，不要求完整成功路径或预先分配所有交付物。输入齐备且实际执行能力可用才派发；缺输入/执行者必须显示原因，不猜测或绕过授权。
+- Activation 冻结定义与输入。未激活节点可以修改/移除；已激活/已结束节点的变化用新实例。应用变更必须 CAS，request_id 不得换内容；同一 Run 只创建一张顶层图。
+- Scheduler 依据持久化图事件规划，业务节点仅提交结果/请求规划。没有进展轮数、新知识、强制 record 或独立 Proposal Acceptance 模型关卡。send_message 仍只传递信息。
+- ResultRef、候选和证据带完整来源。下游检查/修改必须使用输入候选，不能读取旧主根冒充候选。多候选显式 workspace_input，禁止取第一项或自动合并。
+- complete 是图级动作：校验选定结果、在途结算和处置说明，冻结完成意图，提交必要文件，持久化回执后才成功。普通复核任务没有提交特权。
+- 候选版本不可变，新修改建立新版本。Shell 实际差异进入同一工作视图。主根基线冲突拒绝覆盖，Effect unknown 不自动重放；多文件提交不假称 OS 原子事务。
+- 不自动续跑历史 Session。新目录不读取旧图日志执行；历史磁盘保留，不编写迁移器，不重新解释旧 Trace。
 
-## 当前工具契约
+## 工具与具体实现
 
-四类核心目录共 13 个入口；这不代表每个角色都获得全部工具。
+核心四类 13 个入口，不代表每个 Agent 都拥有全部工具：
 
-| 分类 | 工具 | 实现 |
+| 类别 | 工具 | 文件 |
 |---|---|---|
 | 执行 | run_shell、read_file、apply_change、submit_task_result | tools/shell.go、local_read.go、local_write.go、submit_result.go |
 | 编排 | read_graph_definition、apply_graph_change、control_graph、request_replan | tools/graph_authoring.go、graph_schema.go、plan_control.go |
 | 检视 | inspect_board、inspect_node、read_evidence | tools/inspection.go、content_ref.go、graph_evidence.go |
 | 通信 | send_message、request_user_input | tools/meta.go、agent_question.go |
 
-工具名权威为 internal/tools/known_tools.go。web_search/web_fetch 及可选 Team 工具是目录之外的显式能力；注册和角色授权分别核对。新工具必须更新目录与配置/模板，不允许未知工具靠 fallback 混入 ToolRouter。
+- known_tools.go 是名称权威。可选 Web/Team 工具仍须注册与授权；未知名称不能经 fallback 混入。
+- apply_change 创建、覆盖和精确替换共用写入链；路径、锁、版本与实际产物记录不能分叉。run_shell 覆盖搜索、构建、测试，保留启动、退出码、输出、取消/超时和关联身份。
+- 旧 write_file/edit_file/run_check/record_observation_delta/submit_change_decision 等模型工具不恢复。
+- read_graph_definition 不带 graph_id 时提供能力目录；route_ref=default 表示默认队列，不是 Agent 名称。其他 route_ref 必须来自目录。
+- apply_graph_change(create/update) 只做机械校验和原子应用。运行图追加后自动调度，无需重新 start。control_graph 支持 start/cancel/complete。
+- submit_task_result 交付唯一 JSON 结果，进入 finalizing 后后续工具被 fence；无 event/verdict/cited_evidence 专属参数。业务复核结论可放普通 result 字段，不触发控制跳转。
+- request_replan 登记图规划事件；普通消息不唤醒、不创建 Task/Activation、不授予权限。
+- graph_input 是已声明输入的版本，不是旧瞬时事件。UI 的 ProvideGraphInput / Web /api/graphs/input 共用作用域与版本校验，旧 /event 入口退役。
 
-- apply_change 统一文件创建、覆盖与精确替换；路径、版本/行锚点、逻辑路径锁、写入、Effect 与产物登记共用一条实现。不得重建 write_file/edit_file 别名。先说明决策只是提示词要求，没有 submit_change_decision 前置关卡。
-- run_shell 是通用命令执行工具，所有角色走同一事实记录链。ShellExec v2 区分 process_started、实际退出码/作用域、超时与取消，失败保留部分输出。tool_call 在 gate 前发生，tool_dispatched 也不等于进程已经启动。命令非零退出与工具框架异常分开，不能由 exit=0 推导任务或测试通过。
-- 已删除 run_check、CheckStore/CheckContract、强制 Observation 工具/模型/探针、机械单工具阶段、周期轮数/新知识/无进展等默认停止或恢复触发。不得把这些机制迁入 Prompt 解析、L2、其它工具或 watchdog。
-- apply_graph_change 的 create/update 共用入口，内部校验并提交；草案仅用于事务暂存，不由模型调用多套创建/校验/提交工具。update 显式提供 expected_revision 和 in_flight=preserve；保留在途执行定义，改变未来执行，不能覆写已结算结果。非法/冲突请求不改变正式图，相同 request_id 不能换内容。
-- control_graph 仅 start/cancel；接受取消不意味着副作用已结算。没有暂停/恢复/单节点跳过等隐含能力。request_replan 是请求，不能直接改图；无变更协调通过 submit_task_result 记录 no_change 结论。
-- send_message 只传递信息；info/question/reply、回复关联和投递回执不授予权限，不唤醒、不打断、不创建 Task/Activation、不复活终态图。内部用户控制消息与 watchdog 信号另有契约。
-- 检视保持 Session/Run/Graph/Task/Attempt/Invocation/CallID 来源身份，分页检测版本变化。大内容经 read_evidence 解引用，不能以任意磁盘路径绕过作用域。
-- 验收角色只读闭集统一由 agent.IsAcceptanceToolAllowed 提供给路由和租约校验；允许检视，不允许 Shell、文件写入、普通消息、用户交互或重规划。工具配置仍受实际 registry 与 route 能力约束。
+## 版本和配置
 
-## 数据版本与恢复
-
-| 数据 | 当前新运行版本 |
+| 域 | 当前版本 |
 |---|---|
-| L1 请求/结果 | agentgo.model-request/v1、agentgo.model-result/v1 |
-| L2 | agentgo.context/v2、context:default/v11、provider-replay:openai-compatible/v5 |
-| 模型历史/输出 | agentgo.model-history/v1、agentgo.model-output/v1 |
-| Session / ExecutionLease | Session 7、agentgo.execution-lease/v3 |
-| Run / ProgressContract | agentgo.run-contract/v3、agentgo.progress-contract/v2 |
-| Progress 标签 | code-change/v13、investigation/v8、verification/v4、coordination/v3、final-report/v2 |
-| Graph / fulfillment / Delivery | agentgo.graph/v5、agentgo.fulfillment/v2、agentgo.delivery/v1 |
-| Shell 事实 | agentgo.shell-execution/v2 |
+| L1 / L2 | model-request/v1、model-result/v1；context/v2、context:default/v11、provider-replay:openai-compatible/v5 |
+| 模型历史/输出 | model-history/v1、model-output/v1 |
+| Graph / Result / Completion | graph/v6、agent-task-result/v1、graph-completion/v1 |
+| TaskOutcome / TerminalIntent | task-outcome/v4、terminal-intent/v2 |
+| Candidate / Delivery | candidate/v1、delivery/v2 |
+| Session / Lease | Session 8、execution-lease/v4 |
+| Run / Progress / Shell | run-contract/v3、progress-contract/v2、shell-execution/v2 |
+| SWE | swe-result/v5、swe-judge/v2；pytest-phase-report/v2、swe-test-execution/v1 |
 
-- 新目录：.agentgo/state 下 graphs-v5、graph-authoring-v2、loop-facts-v2、run-usage-v2、task-outcomes-v2、taskmem-v2、deliveries-v2、context-snapshots-v2。旧目录保留，不编写自动迁移器、不删除历史、不回退旧数据继续执行。目录代次与内部 JSON schema 分开：当前非 Graph TaskOutcome 仍原生使用 v1，图节点使用 v2/v3。
-- 文件配置必须显式声明 llm.request_contract: agentgo.model-request/v1。llm.stream、agents[*].observation_model、max_subtask_depth 已退役，明确拒绝，不由默认配置补齐。
-- L1/L2 旧入口、Prompt Build、Binding、context override、非流式分支和控制历史投影已退役；不增加 wrapper/alias 或测试专用生产旁路。旧观察锚点不得转换为新的可执行历史。
-- 没有 Run deadline 表示没有默认阶段窗口；用户明确设置的 deadline/预算、HTTP/进程超时与真实 provider 配额仍有各自语义。使用量可以记账，不成为默认经验轮数关卡。
-- 启动总是新 Session；--resume 或 /session 只恢复可接受版本的历史，不自动续跑。历史非终态任务阻断，图停驻；新提示词才能驱动新运行。空会话按既有策略丢弃。
+schema 带 agentgo. 前缀。文件必须显式声明 llm.request_contract=agentgo.model-request/v1 和 graph.request_contract=agentgo.graph/v6。llm.stream、observation_model、max_subtask_depth 等退役字段拒绝；不由默认配置填补必需的文件标识。两个协议 Responses/Chat Completions 都只使用 SSE，不自动切换或降级。
 
-## 必须保持的业务不变量
+Graph 定义、运行、请求回执、输入及完成意图共用 `.agentgo/state/graphs-v6` 的摘要链日志，不另建影子 authoring/completion 账本。TaskOutcome、Loop、TaskMemory、Delivery 分别使用 task-outcomes-v3、loop-facts-v3、taskmem-v3、deliveries-v3。不可变候选在 `.agentgo/candidates-v1`。L2 和 run-usage 的未变目录保持原定义。
 
-- 状态权威是 internal/model/task.go：pending → processing → completed/failed/cancelled/blocked；仅授权的重试可 processing → pending。
-- submit_task_result 一旦进入 finalizing，后续工具被 fence，只结算当轮事实并完成唯一终态；优先于 deadline、取消后的重试或介入。blocked 必须带 blocked_reason。自定义路由字段写入 result object，不能只写自然语言 summary。
-- Graph 的单赋值端口基线不变：非 barrier 节点最多一条静态入边；join/acceptance 每个 target_input 最多一个生产者。并行 AND 使用不同端口；不支持共享端口 OR。合法回边没有 Activation 总次数上限，同步机械级联 fuse 不得变成 Agent 轮次上限。
-- acceptance 必须有明确任务标题和验收条件。completed 只按 $.verdict 精确 eq 路由 pass/fixable/failed；Runtime failed/blocked 单独兜底。证据不足提交 blocked。cited_evidence 只接受可解引用的真实 EvidenceRef，不能编造引用或使用已退役 CheckRef 别名。
-- Graph v5 继续单 mutable producer 的 Delivery 基线；未实现多候选联合原子 promotion。mutating producer 使用 workspace，成功必须有已提交 Delivery。验收进入同一 Delivery 候选，不能在主根检查旧版本；冻结后变更必须隔离。
-- Candidate 由实际 manifest、dirty content digest 和产物构成，不从路径字符串拼接身份。Shell 使用完整可丢弃快照；稀疏 COW 目录不是可执行项目树。Python 环境必须优先 snapshot/src 与 snapshot，UV_PROJECT_ENVIRONMENT 指向 snapshot/.venv，避免 editable 安装穿透主根。
-- workspace 内部 owner/manifest/baseline/shell 目录不对业务开放，不能写 .agentgo/**。活动租约保护 Delivery workspace。watchdog 生产代码本次不修改：只清理已结算交付的 success 残留，运行中及失败/阻塞候选保留。
-- Effect prepared 未 settled 的恢复结果为 unknown，不静默重跑。取消发生在派发前与派发后分别记录；关闭 Store 不能伪造结算。
-- provider_quota_exhausted 与 429 rate_limited 分开，余额不足不能靠重试、重建上下文或重规划消耗更多调用。错误归因保留具体调用身份，不按 provider/model 名称特判。
-- 依赖经 RunnerDeps/Scheduler/Bootstrap 注入。Reactor 不直接 SetState；用户 YAML Reactor 异步。Gate Abort 的建议仅作为材料，不自动执行；Gate panic 沿用既有恢复行为。
+## 必须保留的执行与输出纪律
 
-## L2 输出与 UI
+- Task 状态权威仍为 model/task.go；只有授权错误重试可以 processing→pending。图迭代不能借此重开已结算节点。
+- 依赖经 Bootstrap/Runner 注入。派发前核对实际工具和 workspace 组件，不能只核对名字。Reactor 不直接 SetState，用户 YAML Reactor 异步。
+- 真实 provider 配额、用户显式 deadline/预算、HTTP/进程超时分别处理；不用默认经验轮数强制结束调查。
+- L2 完成全部上下文装配和 Request 封存；Snapshot 必需持久化成功后调用 L1。原始历史不变，工具交换原子；部分 SSE 参数不得执行。
+- WatchModelOutput 是 UI 模型输出统一入口，eventCursor 为“流式事件游标 / SSE events cursor”；慢消费者/过期游标显式重同步，UI 不承担轮次持久化。
+- TUI 默认 /chat inline；/graph、/result 与详情才进入 alt screen，scrollback 继续走 pendingEmit/flushEmitCmd，不恢复旧页面。
+- LLM 时序只由 L1 采集，经 Trace 展示，不进入 Prompt 或控制逻辑；不可用值保持缺席，不记录凭据。
+- watchdog 生产代码不改为规划/复核器。活动工作区和未确认副作用保留；成功候选的回收由已保存交付事实决定。
 
-WatchModelOutput 是模型输出统一入口。游标代码字段 eventCursor，中文“流式事件游标”，英文“SSE events cursor”，由 L2 生成和解释。快照与增量原子衔接，缓存有界，慢消费者和过期游标明确重同步；重启恢复完整输出，不承诺逐 chunk 持久化。UI Hub 仅转接，不承担轮次持久化。
+## 测试与交付
 
-TUI 默认 /chat inline，定稿内容经 pendingEmit/flushEmitCmd 和 tea.Println 排入 scrollback。/graph、/result、节点详情才进入 alt screen；全屏期不能直接 tea.Println，回 Chat 后补排。旧 dashboard/activity/logs/trace 视图不恢复，诊断使用 trace CLI。
+使用 go test ./...、go vet ./...、go build；跨子系统须实际运行二进制并核对产物。scripts/local_fake_provider_smoke.py 覆盖两协议、增量图、普通检查任务、候选一致性与图级交付；不能冒充真实 SWE。
 
-## 构建、测试与交付
+SWE Test Runner 唯一入口为 scripts/swe_test_runner/runner.py。四变量 SWE_API_KEY、SWE_BASE_URL、SWE_FAST_MODEL、SWE_FLAG_SHIP_MODEL 在副作用前检查，只列缺项。角色模型来自 setting.swe-flask.yaml；模型探针去重。真实命令、测试/源码/依赖身份、Flask 导入位置和 pytest 判题由 Python 负责，AgentGo 不恢复 CheckRecord。
 
-```text
-go test ./...
-go vet ./...
-go build -o agentgo.exe .
-./agentgo -config setting.yaml
-./agentgo config doctor
-./agentgo trace list
-```
+当前用户验收要求新编译程序至少完成一次完整真实 SWE。已验证 automatic-options：基线2失败，最终494通过、最终复核23行补丁、task_resolved=true；详细证据另存，不代表其余七题或所有模型已通过。当前执行目标遇推理服务429/500等HTTP错误或环境变量导致无法调用时停止并报告；不暴露凭据。
 
-跨子系统改动必须实际启动二进制并断言产物，不能只靠包单测。本地双协议 fixture 是 scripts/local_fake_provider_smoke.py，使用本地 HTTP SSE，不访问真实模型，也不执行 Flask。修 bug 同步更新 docs/activate/KNOWN_ISSUES.md；已解决事项移出当前问题列表，保留历史证据。
-
-本次用户授权完成全部工具改造后一次提交并推送；验收 Go 测试与构建。SWE 真实 probe/task/batch/verify-candidates 暂不运行；离线测试与本地 fixture 不能冒充真实 SWE 成绩。阶段证据与剩余项见工具契约第 13 章。
-
-## SWE Test Runner
-
-- 外部测试程序唯一名称 SWE Test Runner，路径 scripts/swe_test_runner/runner.py。不得将外部评测代码命名 Harness；Harness Engineering 只指 L3。
-- 公开入口在网络、文件副作用和子进程前一次性校验 SWE_API_KEY、SWE_BASE_URL、SWE_FAST_MODEL、SWE_FLAG_SHIP_MODEL；只列缺项，不输出值。两个模型可相同，探针去重；旧 SWE_MODEL/SWE_BASE_MODEL/SWE_WORKER_MODEL 不回退。
-- 角色模型由 setting.swe-flask.yaml 决定。manifest/题目在 scripts/swe_test_runner/suites/flask-8；testbed 使用当前用户的跨平台数据目录，不硬编码用户名。
-- 正式测试的命令、范围、被测源码/测试/依赖身份、实际 Flask 导入位置和 pytest verdict 由 Python 负责。AgentGo 不生成测试 CheckRecord，也不把 run_shell 成功当判题通过。
-- Python 结果为 swe-result/v4、swe-judge/v2；pytest-phase-report/v2 保留 nodeid/阶段失败集合，swe-test-execution/v1 保存实际执行与输入身份。相同失败数不等于没有新增破坏。
-- 批次绑定 .batch_start，每题后及 finally 原子重写；区分完成、基础设施失败、证据不完整和 not_run。Graph terminal 后仍等待在途 Task/final-report/结算，不能到 grace 就杀掉工作。
-
-## 编码约定
-
-中文日志、注释及新测试诊断；YAML 键使用 snake_case，文件 LF。先查 go.mod 与邻近实现再添加依赖。agent/store 的状态与集合不变量优先使用 testing/quick。
-
-LLM 时序只在 L1 事实点采集，通过 trace 展示；不进入 L2 Prompt、Context 摘要或控制流程。不可用字段保持缺席，禁止补零；时序数据不记录 endpoint、IP、凭据或模型正文。不能按模型名分支。
+新测试与状态机边界优先用确定性测试及 testing/quick。并发域跑 race，CI 同时覆盖 Windows/Linux/macOS。修复同步更新 KNOWN_ISSUES；完成前提交删除/迁移/重写/新增对账。
 
 ## 跨平台硬约束
 
@@ -135,12 +111,11 @@ read_file/apply_change 的路径受 ProjectRoot/当前 workspace 和 pathutil �
 
 ## 文档入口
 
-- docs/design/tool-taxonomy-and-contracts.md：工具权责、删除清单、SWE 适配、阶段证据。
-- docs/design/five-layer-engineering-architecture.md：五层职责及文件索引。
-- docs/design/contract-freeze-2026-08-30.md：当前数据版本与拒绝边界。
-- docs/tool-profiles.md、config.example.yaml：工具授权与配置示例。
-- docs/agents-reference.md、Archtechture.md：启动与组件参考。
-- TraceGuide.md：运行事实及诊断。
-- docs/activate/KNOWN_ISSUES.md：当前开放项；docs/test-issues 与 docs/archived 仅保留历史事实，不用旧机制指导新实现。
+- docs/design/dataflow-graph-simplification-proposal.md：实施计划及当前实现对账。
+- docs/design/five-layer-engineering-architecture.md：职责及实际文件索引。
+- docs/design/contract-freeze-2026-08-30.md：当前版本与拒绝边界。
+- docs/design/tool-taxonomy-and-contracts.md：四类工具；config.example.yaml：配置。
+- docs/agents-reference.md、Archtechture.md、TraceGuide.md：运行与诊断。
+- docs/activate/KNOWN_ISSUES.md：真实未完成项；docs/test-issues、docs/archived 保留历史证据。
 
-可选 Team 初建使用 `provision_agent_team(graph_request_id=R)`，随后 `apply_graph_change(create, request_id=R)` 使用同一个稳定值；图 ID 由运行时按调用者和请求身份派生，返回的 ready route 才能写入节点。图内 controller 扩展时继承当前图，不提供旧 task-scoped 模型入口。
+可选 Team 初建使用 provision_agent_team(graph_request_id=R)，再 apply_graph_change(create,request_id=R)。图外规划任务继承其目标图作用域；图内 agentTask 不因名称获得 Team/编排权限。

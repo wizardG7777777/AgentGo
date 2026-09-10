@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"agentgo/internal/graph"
 	"agentgo/internal/model"
 	"agentgo/internal/modes"
 	"agentgo/internal/store"
@@ -37,21 +36,6 @@ import (
 // leaseWriteTools 是 exec=readonly 时需从 BusinessTools 剔除的写类工具
 // （与 exec-mode-guard Gate 的拦截面一致）。
 var leaseWriteTools = []string{"apply_change", "run_shell"}
-
-// acceptanceLeaseAllowedTools 是 acceptance 在执行租约层的最终正向闭集。
-// Graph 提交校验和 route 装配是前置防线；这里同时校验新计算与恢复复用的
-// durable Lease，防止旧快照或篡改租约把写入/Shell/协调工具带回 verifier。
-var acceptanceLeaseAllowedTools = map[string]struct{}{
-	"inspect_board": {}, "inspect_node": {}, "read_graph_definition": {},
-	"read_file":  {},
-	"web_search": {}, "web_fetch": {}, "read_evidence": {}, "submit_task_result": {},
-}
-
-// IsAcceptanceToolAllowed 是验收角色只读工具闭集的唯一查询入口。
-func IsAcceptanceToolAllowed(name string) bool {
-	_, allowed := acceptanceLeaseAllowedTools[name]
-	return allowed
-}
 
 // acquireExecutionLease 是 processTask 的租约入口：任务已有冻结租约时复用
 // （emit reused）；否则按计算规则构造候选、经 store 原子冻结（emit frozen）。
@@ -180,41 +164,19 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 		lease.BusinessTools = model.SortedCopy(ceiling)
 	}
 
-	// Graph controller 是纯控制面（读上游结果、裁决、路由），不得持有任何
-	// 业务工具——无论认领方是谁、节点有无显式 capability 声明。置空切片
-	// （非 nil——nil 是「无裁剪面」语义）使 ToolUnion 只剩控制通道，避免
-	// scheduler 认领时经合成授予把其注册全集（含写工具）泄露给节点
-	// （2026-08-19 SWE 实测：scheduler 借 controller 节点自行修改业务代码，
-	// 架空验收链与节点纪律）。新图的 controller+capability.tools 声明在
-	// 图校验期 fail-closed，这里是旧快照/直接构造路径的兜底。
-	if task.GraphID != "" && task.GraphNodeKind == "controller" {
-		lease.BusinessTools = []string{}
-	}
-	if task.GraphID != "" && task.GraphNodeKind == "agent" {
+	// 图内工作只使用显式业务能力；编排由图外 Scheduler 承担。
+	if task.GraphID != "" {
 		filtered := lease.BusinessTools[:0]
 		for _, name := range lease.BusinessTools {
-			if name == "apply_graph_change" || name == "control_graph" || name == "list_agent_templates" || name == "provision_agent_team" {
+			if name == "apply_graph_change" || name == "control_graph" || name == "provision_agent_team" {
 				if !lease.Synthetic {
-					return nil, "业务节点不得直接声明图编排工具；请使用 request_replan"
+					return nil, "agentTask 不得声明图修改工具；请提交结果或 request_replan"
 				}
 				continue
 			}
 			filtered = append(filtered, name)
 		}
 		lease.BusinessTools = filtered
-	}
-	// acceptance、旧快照空 kind 与未知未来角色使用只读正向闭集。对未显式
-	// capability 的 synthetic Lease，这是 Node role policy 与 Route ceiling 的
-	// 正式交集：framework 自动注册的 Observation 等控制能力不能因此让 verifier
-	// 启动失败或泄露给模型。显式声明不在此静默裁剪，继续由下方校验 fail-closed。
-	if task.GraphID != "" && task.GraphNodeKind != "agent" && task.GraphNodeKind != "controller" && !explicit {
-		kept := make([]string, 0, len(lease.BusinessTools))
-		for _, name := range lease.BusinessTools {
-			if _, ok := acceptanceLeaseAllowedTools[name]; ok {
-				kept = append(kept, name)
-			}
-		}
-		lease.BusinessTools = kept
 	}
 
 	// --- Policy ∩ ---
@@ -245,18 +207,6 @@ func (a *Agent) computeExecutionLease(task *model.Task) (lease *model.ExecutionL
 
 	// --- 节点角色派生控制通道 ---
 	lease.ControlTools = model.SortedCopy(deriveControlTools(task))
-	if task.GraphID != "" && task.GraphNodeKind == "controller" {
-		for _, name := range []string{"list_agent_templates", "provision_agent_team"} {
-			for _, registered := range ceiling {
-				if registered == name {
-					lease.ControlTools = append(lease.ControlTools, name)
-					break
-				}
-			}
-		}
-		lease.ControlTools = model.SortedCopy(lease.ControlTools)
-	}
-
 	// --- 冻结模型 / 隔离 / 超时 ---
 	lease.Model = a.Model
 	lease.ModelContextWindowTokens = a.ModelContextWindowTokens
@@ -298,7 +248,7 @@ func validateLeaseForTaskRole(task *model.Task, lease *model.ExecutionLease) str
 	}
 	if strictIdentity && strings.TrimSpace(lease.Model) != "" && strings.TrimSpace(lease.ModelCapabilityDigest) != "" &&
 		lease.Schema != model.ExecutionLeaseSchemaCurrent {
-		return fmt.Sprintf("新运行契约要求 ExecutionLease v3，实际 schema=%q", lease.Schema)
+		return fmt.Sprintf("新运行契约要求 ExecutionLease v4，实际 schema=%q", lease.Schema)
 	}
 
 	if lease.TaskID != "" && lease.TaskID != task.ID {
@@ -323,44 +273,8 @@ func validateLeaseForTaskRole(task *model.Task, lease *model.ExecutionLease) str
 	if task.GraphID == "" {
 		return ""
 	}
-	role := graph.ControllerRole(strings.TrimSpace(task.GraphControllerRole))
-	if !role.IsValid() || (role != graph.ControllerRoleNone && task.GraphNodeKind != string(graph.KindController)) {
-		return fmt.Sprintf("Graph controller_role=%q 与 node_kind=%q 不一致", role, task.GraphNodeKind)
-	}
-	if role == graph.ControllerRoleLoopRecovery && strings.TrimSpace(task.RecoverySourceTaskID) == "" {
-		return "loop_recovery controller 缺少 recovery_source_task_id"
-	}
-	if role != graph.ControllerRoleLoopRecovery && strings.TrimSpace(task.RecoverySourceTaskID) != "" {
-		return fmt.Sprintf("非 recovery Graph Task 不得携带 recovery_source_task_id=%q", task.RecoverySourceTaskID)
-	}
-	expectedControl := deriveControlTools(task)
-	// 可选 Team 能力只有实际注册后才冻结；闭集允许该角色持有它们，
-	// 基础控制通道仍精确对账，不能借可选能力携带任意其它工具。
-	if task.GraphNodeKind == "controller" {
-		for _, name := range lease.ControlTools {
-			if name == "list_agent_templates" || name == "provision_agent_team" {
-				expectedControl = append(expectedControl, name)
-			}
-		}
-	}
-	if !sameExactToolSet(lease.ControlTools, expectedControl) {
-		return fmt.Sprintf("Graph 节点角色 %q 的冻结租约控制工具=%v，期望精确为 %v",
-			task.GraphNodeKind, lease.ControlTools, expectedControl)
-	}
-	if task.GraphNodeKind == "controller" || task.GraphNodeKind == "agent" {
-		// controller 是纯控制面：除控制通道外不得持有任何业务工具
-		// （新算路径在 computeExecutionLease 已强制置空，这里拦旧快照/篡改租约）。
-		if task.GraphNodeKind == "controller" && len(lease.BusinessTools) > 0 {
-			return fmt.Sprintf("Graph 节点角色 %q 的冻结租约不得持有业务工具，实际=%v",
-				task.GraphNodeKind, lease.BusinessTools)
-		}
-		return ""
-	}
-	for _, name := range lease.ToolUnion() {
-		if _, ok := acceptanceLeaseAllowedTools[name]; !ok {
-			return fmt.Sprintf("Graph 节点角色 %q 的冻结租约包含只读闭集外工具 %q",
-				task.GraphNodeKind, name)
-		}
+	if !sameExactToolSet(lease.ControlTools, deriveControlTools(task)) {
+		return "agentTask 冻结控制通道与任务授权不符"
 	}
 	return ""
 }
@@ -397,26 +311,10 @@ func (a *Agent) emitExecutionLeaseRejected(task *model.Task, lease *model.Execut
 	})
 }
 
-// deriveControlTools 按持久化 Graph 节点角色派生控制通道：controller/agent
-// 需要 submit_task_result + request_replan；acceptance 只能提交终态，不得
-// 请求改图。GraphNodeKind 为空的旧快照或未知未来类型按最小权限只给
-// submit_task_result，绝不从可自定义的 EventType/route 猜测角色。非图
-// scheduler 控制面才使用 report_done。
+// deriveControlTools 仅区分图外规划与普通任务，不按节点种类赋权。
 func deriveControlTools(task *model.Task) []string {
 	if task.GraphID != "" {
-		switch task.GraphNodeKind {
-		case "controller", "agent":
-			if task.GraphNodeKind == "controller" {
-				return []string{"apply_graph_change", "control_graph", "inspect_board", "inspect_node", "read_evidence", "read_graph_definition", "request_replan", "submit_task_result"}
-			}
-
-			return []string{"request_replan", "submit_task_result"}
-
-		case "acceptance", "":
-			return []string{"submit_task_result"}
-		default:
-			return []string{"submit_task_result"}
-		}
+		return []string{"request_replan", "submit_task_result"}
 	}
 	if task.EventType == "__scheduler__" {
 		return []string{"read_graph_definition", "apply_graph_change", "control_graph", "request_replan", "submit_task_result"}

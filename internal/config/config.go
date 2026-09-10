@@ -269,6 +269,9 @@ type AgentRuntimeConfig struct {
 }
 
 type Config struct {
+	Graph struct {
+		RequestContract string `yaml:"request_contract" json:"request_contract"`
+	} `yaml:"graph" json:"graph"`
 	// ============================================================
 	// v4 配置块（nextUpgrade_v4.md §11.4）—— 唯一受支持的格式。
 	// v3 顶层字段（worker_count / agent_max_loops / llm_base_url / mirrorV4ToV3 等）
@@ -389,7 +392,7 @@ func profileKeys(m map[string][]string) []string {
 func ptrTo[T any](v T) *T { return &v }
 
 func DefaultConfig() *Config {
-	return &Config{
+	cfg := &Config{
 		LLM:                        LLMConfig{RequestContract: "agentgo.model-request/v1", Protocol: "responses"},
 		ProjectRoot:                ".",
 		Scheduler:                  SchedulerKind{},
@@ -425,6 +428,8 @@ func DefaultConfig() *Config {
 			Web:       WebUIConfig{Listen: "127.0.0.1:8399", Token: ""},
 		},
 	}
+	cfg.Graph.RequestContract = "agentgo.graph/v6"
+	return cfg
 }
 
 // LoadConfig 加载配置文件。
@@ -494,6 +499,10 @@ func LoadConfig(path string, explicit bool) (*Config, error) {
 	}
 	if _, present := rawConfig["max_subtask_depth"]; present {
 		return nil, fmt.Errorf("max_subtask_depth 已退役；新工作必须通过图编排定义")
+	}
+	graphBlock, graphOK := rawConfig["graph"].(map[string]any)
+	if !graphOK || graphBlock["request_contract"] != "agentgo.graph/v6" {
+		return nil, fmt.Errorf("配置必须显式声明 graph.request_contract: agentgo.graph/v6")
 	}
 	llmBlock, ok := rawConfig["llm"].(map[string]any)
 	if !ok || llmBlock["request_contract"] != "agentgo.model-request/v1" {
@@ -573,6 +582,9 @@ func LoadConfig(path string, explicit bool) (*Config, error) {
 // AgentTemplate provision Team。只要 agents 非空，原有静态 kind 的全部严格
 // 校验仍然执行，非法配置不会静默降级。
 func (c *Config) Validate() error {
+	if c.Graph.RequestContract != "agentgo.graph/v6" {
+		return fmt.Errorf("graph.request_contract 缺失或为旧版本")
+	}
 	if c.LLM.RequestContract != "agentgo.model-request/v1" {
 		return fmt.Errorf("llm.request_contract 不支持或缺失")
 	}

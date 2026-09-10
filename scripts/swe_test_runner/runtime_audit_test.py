@@ -5,7 +5,7 @@ import json
 import tempfile
 import unittest
 
-from runtime_audit import EvidenceReader, collect_runtime
+from runtime_audit import EvidenceReader, collect_runtime, go_json_digest
 
 
 def write_json(path, value):
@@ -34,8 +34,8 @@ class RuntimeFixture:
         write_json(self.snapshot, {"tasks": tasks, "graphs": [self.graph]})
         write_json(self.monitor, {"run_identity_visible": True, "process_terminal": "graph_terminal", "wall_sec": 1})
         self.identity = {"run_id": "run-1", "task_id": "task-1", "attempt_id": "attempt-1", "invocation_id": "invocation-1"}
-        receipt = {"schema": "agentgo.graph-apply-receipt/v1", "status": "applied", "graph_id": "graph-1",
-                   "revision": 1, "definition_digest": "definition-digest", "request_id": "request-1"}
+        receipt = {"schema": "agentgo.graph-apply-receipt/v2", "status": "applied", "graph_id": "graph-1",
+                   "revision": 1, "source_request": "request-1"}
         self.events = [
             {**self.identity, "kind": "llm_call_start"},
             {**self.identity, "kind": "llm_call_end", "prompt_tokens": 9000, "completion_tokens": 20},
@@ -59,25 +59,29 @@ class RuntimeFixture:
         for task in tasks:
             outcomes.extend([
                 {"version": 1, "kind": "commit", "record": {"outcome_ref": task["outcome_ref"], "outcome": {
-                    "schema": "agentgo.task-outcome/v2", "run_id": "run-1", "task_id": task["id"], "status": "completed"}}},
+                    "schema": "agentgo.task-outcome/v4", "run_id": "run-1", "task_id": task["id"], "status": "completed"}}},
                 {"version": 1, "kind": "delivery_ack", "ack_ref": task["outcome_ref"]},
             ])
-        write_journal(self.state / "task-outcomes-v2" / "task-outcomes.jsonl", outcomes)
+        write_journal(self.state / "task-outcomes-v3" / "task-outcomes.jsonl", outcomes)
         self.usage = self.state / "run-usage-v2" / "run-budgets.jsonl"
         write_journal(self.usage, [
             {"schema": "agentgo.run-budget-record/v1", "run_id": "run-1", "kind": "reserve", "reservation": {"reservation_id": "reserve-1"}},
             {"schema": "agentgo.run-budget-record/v1", "run_id": "run-1", "kind": "settle", "settlement": {
                 "reservation_id": "reserve-1", "usage": {"model_calls": 1, "tool_actions": 2}}},
         ])
-        write_journal(self.state / "loop-facts-v2" / "task.jsonl", [{"schema": "agentgo.loop-store-record/v1",
+        write_journal(self.state / "loop-facts-v3" / "task.jsonl", [{"schema": "agentgo.loop-store-record/v1",
             "checkpoint": {"run_id": "run-1", "attempt_id": "attempt-1"}}])
-        write_journal(self.state / "graph-authoring-v2" / "authoring.jsonl", [
-            {"version": 1, "kind": "draft_committed", "payload": {"definition": {
-                "schema": "agentgo.graph/v5", "graph_id": "graph-1", "revision": 1, "definition_digest": "definition-digest",
-                "body": {"run_id": "run-1"}, "contract": {"execution_class": "read_only"}}}},
-            {"version": 1, "kind": "start_updated", "payload": {"start": {
-                "start_id": "start-1", "graph_id": "graph-1", "status": "started"}}},
-        ])
+        current = {"schema": "agentgo.graph/v6", "state_version": 1, "status": "completed",
+                   "definition": {"schema": "agentgo.graph/v6", "graph_id": "graph-1", "run_id": "run-1", "revision": 1,
+                                  "nodes": [{"kind": "agentTask", "node_id": "work"}]},
+                   "executions": {"work": {"status": "completed", "outcome_ref": "outcome:task", "inputs": {"values": {}}}},
+                   "results": {"work": {"ref": "result:work"}},
+                   "requests": {"request-1": {"action": "create"}, "start": {"action": "start"}},
+                   "completion": {"schema": "agentgo.graph-completion/v1", "status": "committed", "outcome": "success", "result_refs": ["result:work"]}}
+        entry = {"sequence": 1, "previous_digest": "", "digest": "", "snapshot": current}
+        entry["digest"] = go_json_digest(entry)
+        self.graph_journal = self.state / "graphs-v6" / "graph.jsonl"
+        write_journal(self.graph_journal, [entry])
 
     def save_events(self):
         write_journal(self.trace, self.events)
@@ -87,6 +91,16 @@ class RuntimeFixture:
 
 
 class RuntimeAuditTest(unittest.TestCase):
+    def test_graph_digest_tampering_cannot_pass_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RuntimeFixture(Path(directory))
+            entry = json.loads(fixture.graph_journal.read_text(encoding="utf-8"))
+            entry["snapshot"]["completion"]["result_refs"] = ["forged"]
+            write_journal(fixture.graph_journal, [entry])
+            result = fixture.collect()
+            self.assertIsNone(result["architecture_ok"])
+            self.assertIn("dataflow_digest_invalid", {i["code"] for i in result["evidence_issues"]})
+
     def test_nonzero_shell_exit_and_large_prompt_do_not_mean_architecture_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = RuntimeFixture(Path(directory))

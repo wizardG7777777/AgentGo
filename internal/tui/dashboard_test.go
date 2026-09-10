@@ -24,9 +24,8 @@ func TestRenderGraphDashboard_PlanningState(t *testing.T) {
 
 func TestRenderGraphDashboard_ShowsNodesStatusesAndEdges(t *testing.T) {
 	graph := GraphInfo{
-		GraphID: "research", Status: "running", Revision: 2, StateVersion: 9, Root: "collect",
-		Nodes: []ui.GraphNodeView{
-			{NodeID: "collect", Title: "Collect sources", Kind: "agent", Status: "completed", Root: true, ActivationID: "collect@1"},
+		GraphID: "research", Status: "running", Revision: 2, StateVersion: 9, Nodes: []ui.GraphNodeView{
+			{NodeID: "collect", Title: "Collect sources", Kind: "agent", Status: "completed", ActivationID: "collect@1"},
 			{NodeID: "verify", Title: "Verify claims", Kind: "acceptance", Status: "running", ActivationID: "verify@1", AgentID: "verifier-1"},
 			{NodeID: "finish", Title: "Finish", Kind: "end", Status: "inactive"},
 		},
@@ -38,7 +37,7 @@ func TestRenderGraphDashboard_ShowsNodesStatusesAndEdges(t *testing.T) {
 	result := renderGraphDashboard(DefaultTheme(), 120, 34, &graph, 1, 0, 1, "", nil)
 	for _, want := range []string{
 		"Graph · research", "revision 2", "Collect sources", "completed",
-		"START collect", "END finish", "Verify claims", "running", "verifier-1",
+		"INPUTS", "finish", "Verify claims", "running", "verifier-1",
 		"verify [pass] → finish",
 	} {
 		if !strings.Contains(result, want) {
@@ -52,9 +51,8 @@ func TestRenderGraphDashboard_ShowsNodesStatusesAndEdges(t *testing.T) {
 
 func TestRenderGraphDashboard_DrawsBranchAndJoinTopology(t *testing.T) {
 	graph := GraphInfo{
-		GraphID: "branching", Status: "running", Root: "start",
-		Nodes: []ui.GraphNodeView{
-			{NodeID: "start", Title: "Start", Kind: "controller", Status: "completed", Root: true},
+		GraphID: "branching", Status: "running", Nodes: []ui.GraphNodeView{
+			{NodeID: "start", Title: "Start", Kind: "controller", Status: "completed"},
 			{NodeID: "source_a", Title: "Source A", Kind: "agent", Status: "completed"},
 			{NodeID: "source_b", Title: "Source B", Kind: "agent", Status: "running"},
 			{NodeID: "source_c", Title: "Source C", Kind: "agent", Status: "ready"},
@@ -74,10 +72,10 @@ func TestRenderGraphDashboard_DrawsBranchAndJoinTopology(t *testing.T) {
 
 	result := renderGraphDashboard(DefaultTheme(), 150, 55, &graph, 2, 0, 1, "", nil)
 	lines := strings.Split(result, "\n")
-	startLine := lineContaining(lines, "START ✓ Start")
+	startLine := lineContaining(lines, "INPUT ✓ Start")
 	branchLine := lineContaining(lines, "Source A")
 	mergeLine := lineContaining(lines, "Merge")
-	endLine := lineContaining(lines, "END ○ Done")
+	endLine := lineContaining(lines, "○ Done")
 	if startLine < 0 || branchLine < 0 || mergeLine < 0 || endLine < 0 {
 		t.Fatalf("topology is missing an endpoint or layer: %q", result)
 	}
@@ -104,9 +102,8 @@ func TestRenderGraphDashboard_DrawsBranchAndJoinTopology(t *testing.T) {
 
 func TestRenderGraphDashboard_LabelsBackEdge(t *testing.T) {
 	graph := GraphInfo{
-		GraphID: "retry-loop", Status: "running", Root: "start",
-		Nodes: []ui.GraphNodeView{
-			{NodeID: "start", Title: "Start", Kind: "controller", Status: "completed", Root: true},
+		GraphID: "retry-loop", Status: "running", Nodes: []ui.GraphNodeView{
+			{NodeID: "start", Title: "Start", Kind: "controller", Status: "completed"},
 			{NodeID: "work", Title: "Work", Kind: "agent", Status: "running"},
 			{NodeID: "done", Title: "Done", Kind: "end", Status: "inactive"},
 		},
@@ -120,7 +117,7 @@ func TestRenderGraphDashboard_LabelsBackEdge(t *testing.T) {
 
 	result := renderGraphDashboard(DefaultTheme(), 110, 40, &graph, 1, 0, 1, "", nil)
 	for _, want := range []string{
-		"START", "END", "work [retry] ↩ start", "work [pass] → done",
+		"INPUT", "work [retry] ↩ start", "work [pass] → done",
 		"history work → removed_node",
 	} {
 		if !strings.Contains(result, want) {
@@ -159,7 +156,7 @@ func TestRenderGraphDashboardPreservesTypedTerminalOutcome(t *testing.T) {
 		{status: "blocked", outcome: "blocked"},
 		{status: "cancelled", outcome: "cancelled"},
 	} {
-		graph := GraphInfo{GraphID: "g-" + test.outcome, Status: test.status, Outcome: test.outcome, Root: "end"}
+		graph := GraphInfo{GraphID: "g-" + test.outcome, Status: test.status, Outcome: test.outcome}
 		view := renderGraphDashboard(DefaultTheme(), 90, 12, &graph, -1, 0, 1, "", nil)
 		if !strings.Contains(view, test.status) || !strings.Contains(view, "outcome="+test.outcome) {
 			t.Errorf("Graph %s/%s 图卡投影不完整: %q", test.status, test.outcome, view)
@@ -212,9 +209,8 @@ func TestRenderGraphDashboard_TooSmall(t *testing.T) {
 
 func TestRenderGraphDashboard_MinimumWidthStaysBounded(t *testing.T) {
 	graph := GraphInfo{
-		GraphID: "narrow", Status: "running", Root: "start",
-		Nodes: []ui.GraphNodeView{
-			{NodeID: "start", Title: "Very long root title", Kind: "controller", Status: "running", Root: true},
+		GraphID: "narrow", Status: "running", Nodes: []ui.GraphNodeView{
+			{NodeID: "start", Title: "Very long root title", Kind: "controller", Status: "running"},
 			{NodeID: "done", Title: "Done", Kind: "end", Status: "inactive"},
 		},
 		Edges: []ui.GraphEdgeView{{From: "start", To: "done", Current: true, Traversed: true}},
