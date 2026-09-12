@@ -8,8 +8,7 @@ import (
 )
 
 type attemptContextStats struct {
-	historyProjectionCount int
-	l3Truncated            bool
+	l3Truncated bool
 }
 
 func newAttemptContextStats(_ time.Time) *attemptContextStats { return &attemptContextStats{} }

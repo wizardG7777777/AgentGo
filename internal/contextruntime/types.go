@@ -1,11 +1,8 @@
 package contextruntime
 
 import (
-	"context"
 	"encoding/json"
-	"time"
 
-	"agentgo/internal/contentstore"
 	"agentgo/internal/contextcompiler"
 	"agentgo/internal/contextcontract"
 	"agentgo/internal/llm"
@@ -46,13 +43,6 @@ type ToolRouterBinding struct {
 	Definitions []llm.ToolDef
 }
 
-// ContentRepository 是 L3 外置端口；*contentstore.Store 直接实现。
-type ContentRepository interface {
-	Put(context.Context, contentstore.PutRequest) (contentstore.ContentRef, error)
-}
-
-var _ ContentRepository = (*contentstore.Store)(nil)
-
 // TokenEstimator 返回 payload 的保守 token 估算。nil 使用 rune/3 向上取整。
 type TokenEstimator func([]byte) int64
 
@@ -72,22 +62,17 @@ type CompileInput struct {
 	BudgetPolicy    contextcontract.ContextBudgetPolicy
 	ReplayPolicy    contextcontract.ProviderReplayPolicy
 	ReplayPolicyRef string
-
-	ContentRepository  ContentRepository
-	ContentScope       contentstore.Scope
-	EphemeralExpiresAt time.Time
-	EstimateTokens     TokenEstimator
+	EstimateTokens  TokenEstimator
 }
 
 // Result 的 Messages/Tools 与 Snapshot 均从 compiler 返回的同一 WireItem 重新
 // 解码，禁止调用方再走第二条 buildMessages/buildToolDefs 路径。
 type Result struct {
-	Snapshot         *contextcontract.ContextSnapshot
-	Messages         []llm.Message
-	Tools            []llm.ToolDef
-	Runtime          contextcompiler.RuntimePayloadResult
-	ExternalizedRefs []contentstore.ContentRef
-	OutputBudget     llm.OutputBudget
+	Snapshot     *contextcontract.ContextSnapshot
+	Messages     []llm.Message
+	Tools        []llm.ToolDef
+	Runtime      contextcompiler.RuntimePayloadResult
+	OutputBudget llm.OutputBudget
 }
 
 // Assembler 只持有纯 Compiler；nil Compiler 时 New 自动补齐。

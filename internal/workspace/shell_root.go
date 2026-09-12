@@ -35,9 +35,17 @@ func (v *View) prepareShellRoot() (string, error) {
 		if v.baseRoot != "" {
 			baseRoot = v.baseRoot
 		}
+		if err := prepareSnapshotGit(v.mgr.projectRoot, tmp); err != nil {
+			cleanup()
+			return "", err
+		}
 		if err := copyProjectTree(baseRoot, tmp); err != nil {
 			cleanup()
 			return "", fmt.Errorf("物化 shell 项目快照: %w", err)
+		}
+		if err := sealSnapshotGit(tmp); err != nil {
+			cleanup()
+			return "", err
 		}
 		if err := v.syncDirtyInto(tmp); err != nil {
 			cleanup()
@@ -69,6 +77,9 @@ func (v *View) discardShellRoot() error {
 }
 
 func copyProjectTree(sourceRoot, targetRoot string) error {
+	if err := os.MkdirAll(targetRoot, 0o755); err != nil {
+		return err
+	}
 	return filepath.WalkDir(sourceRoot, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -81,7 +92,7 @@ func copyProjectTree(sourceRoot, targetRoot string) error {
 		if index := strings.IndexRune(rel, filepath.Separator); index >= 0 {
 			first = rel[:index]
 		}
-		if first == ".agentgo" || first == ".git" {
+		if first == ".agentgo" || entry.Name() == ".git" {
 			if entry.IsDir() {
 				return filepath.SkipDir
 			}

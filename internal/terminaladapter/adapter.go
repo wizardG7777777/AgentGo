@@ -46,7 +46,7 @@ func ToAgentTaskTerminal(ctx context.Context, record outcomestore.Record, deps D
 			return graph.AgentTaskTerminal{}, fmt.Errorf("证据与终态权威不符")
 		}
 	}
-	return graph.AgentTaskTerminal{TaskID: v.TaskID, AttemptID: v.AttemptID, OutcomeRef: record.OutcomeRef, Status: string(v.Status), Value: result, CandidateRef: v.CandidateRef, Evidence: durableEvidence(v.EvidenceFacts), EvidenceRefs: append([]string(nil), v.EvidenceRefs...), Error: strings.TrimSpace(v.Reason)}, nil
+	return graph.AgentTaskTerminal{PlainText: v.PlainText, TaskID: v.TaskID, AttemptID: v.AttemptID, OutcomeRef: record.OutcomeRef, Status: string(v.Status), Value: result, CandidateRef: v.CandidateRef, Evidence: durableEvidence(v.EvidenceFacts), EvidenceRefs: append([]string(nil), v.EvidenceRefs...), Error: strings.TrimSpace(v.Reason)}, nil
 }
 
 func durableEvidence(values []outcome.EvidenceFact) []graph.EvidenceEntry {

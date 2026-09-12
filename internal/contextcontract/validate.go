@@ -158,9 +158,6 @@ func (r ContextFragmentRecord) Validate() error {
 	if r.SerializedBytes < 0 || r.EstimatedTokens < 0 {
 		return fmt.Errorf("fragment record %s 尺寸不能为负", r.FragmentID)
 	}
-	if err := r.BudgetLimit.validatePositive("fragment budget_limit"); err != nil {
-		return fmt.Errorf("fragment record %s: %w", r.FragmentID, err)
-	}
 	if err := validateOptionalOpaque("transform_ref", r.TransformRef); err != nil {
 		return fmt.Errorf("fragment record %s: %w", r.FragmentID, err)
 	}
@@ -303,14 +300,14 @@ func (u BudgetUsage) Fits(b Budget) bool {
 // Validate 校验 policy 完整覆盖封闭词表。遗漏规则不是“使用默认值”，而是非法
 // policy；这保证 Scheduler/Prompt 无法借缺项扩大预算。
 func (p ContextBudgetPolicy) Validate() error {
-	if p.Schema != PolicySchemaV1 {
+	if p.Schema != PolicySchemaV2 {
 		return fmt.Errorf("context policy schema=%q，无效", p.Schema)
 	}
 	if err := validateOpaque("policy_id", p.PolicyID); err != nil {
 		return err
 	}
-	if p.Version != 11 {
-		return fmt.Errorf("拒绝 Context policy version=%d，当前仅支持 11", p.Version)
+	if p.Version != 12 {
+		return fmt.Errorf("拒绝 Context policy version=%d，当前仅支持 12", p.Version)
 	}
 	if err := validateOpaque("model_class", p.ModelClass); err != nil {
 		return fmt.Errorf("context policy %s: %w", p.PolicyID, err)
@@ -349,30 +346,8 @@ func (p ContextBudgetPolicy) Validate() error {
 		if !ok {
 			return fmt.Errorf("context policy %s 缺少 atomic group rule=%s", p.PolicyID, kind)
 		}
-		if rule.MaxSerializedBytes <= 0 || rule.MaxEstimatedTokens <= 0 {
-			return fmt.Errorf("atomic group rule %s 必须具有正 hard cap", kind)
-		}
 		if err := validateUniqueRefs("transform_id", rule.TransformIDs); err != nil && len(rule.TransformIDs) > 0 {
 			return fmt.Errorf("atomic group rule %s: %w", kind, err)
-		}
-	}
-	var unknownSections []string
-	for section := range p.SectionBudgets {
-		if !section.Valid() {
-			unknownSections = append(unknownSections, string(section))
-		}
-	}
-	if len(unknownSections) > 0 {
-		sort.Strings(unknownSections)
-		return fmt.Errorf("context policy %s 含未知 section=%q", p.PolicyID, unknownSections[0])
-	}
-	for _, section := range KnownContextSections() {
-		budget, ok := p.SectionBudgets[section]
-		if !ok {
-			return fmt.Errorf("context policy %s 缺少 section budget=%s", p.PolicyID, section)
-		}
-		if err := budget.validatePositive("section budget " + string(section)); err != nil {
-			return err
 		}
 	}
 	if err := p.SnapshotInputBudget.validatePositive("snapshot_input_budget"); err != nil {
@@ -406,10 +381,7 @@ func (p ContextBudgetPolicy) Validate() error {
 	return nil
 }
 
-func validateFragmentRule(kind FragmentKind, rule FragmentBudgetRule) error {
-	if rule.MaxSerializedBytes <= 0 || rule.MaxEstimatedTokens <= 0 {
-		return fmt.Errorf("fragment rule %s 必须具有正 hard cap", kind)
-	}
+func validateFragmentRule(kind FragmentKind, rule FragmentRuleSpec) error {
 	if !rule.RetentionClass.Valid() {
 		return fmt.Errorf("fragment rule %s retention_class=%q 无效", kind, rule.RetentionClass)
 	}
@@ -447,8 +419,8 @@ func (p ProviderReplayPolicy) Validate() error {
 	if err := validateOpaque("policy_id", p.PolicyID); err != nil {
 		return err
 	}
-	if p.Version != 5 {
-		return fmt.Errorf("拒绝 Replay policy version=%d，当前仅支持 5", p.Version)
+	if p.Version != 6 {
+		return fmt.Errorf("拒绝 Replay policy version=%d，当前仅支持 6", p.Version)
 	}
 	fields := make([]string, 0, len(p.Fields))
 	for field := range p.Fields {
@@ -483,7 +455,7 @@ func (p ProviderReplayPolicy) Validate() error {
 
 // Validate 校验已封存 Snapshot 的身份、引用闭合和 Manifest/Wire 同源性。
 func (s ContextSnapshot) Validate() error {
-	if s.Schema != SnapshotSchemaV2 {
+	if s.Schema != SnapshotSchemaV3 {
 		return fmt.Errorf("context snapshot schema=%q，无效", s.Schema)
 	}
 	required := []struct {
@@ -614,7 +586,7 @@ func validateManifest(s ContextSnapshot, fragments map[string]ContextFragmentRec
 			item.Authority != record.Authority || item.Freshness != record.Freshness ||
 			item.InputDigest != record.InputDigest || item.OutputDigest != record.OutputDigest ||
 			item.SerializedBytes != record.SerializedBytes || item.EstimatedTokens != record.EstimatedTokens ||
-			item.BudgetLimit != record.BudgetLimit || item.Disposition != record.Disposition ||
+			item.Disposition != record.Disposition ||
 			item.TransformRef != record.TransformRef || item.ContentRef != record.ContentRef ||
 			item.AtomicGroupID != record.AtomicGroupID || item.WireID != record.WireID {
 			return fmt.Errorf("context snapshot %s manifest fragment=%s 与记录不一致", s.SnapshotID, item.FragmentID)

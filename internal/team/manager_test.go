@@ -53,7 +53,7 @@ func TestManagerPrepareRejectsOversizedTemplatePromptBeforeClients(t *testing.T)
 		Ref: "builtin/oversized@1", Name: "oversized", SystemPrompt: strings.Repeat("策", 1_100_000),
 	})
 	if err == nil || !strings.Contains(err.Error(), "L1/L2 runtime contract") ||
-		!strings.Contains(err.Error(), "fragment_limit_exceeded") {
+		!strings.Contains(err.Error(), "snapshot_budget_exceeded") {
 		t.Fatalf("Team 必须在创建 client/Runner 前拒绝超限 Prompt: %v", err)
 	}
 	if clientCalls != 0 {

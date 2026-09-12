@@ -57,7 +57,7 @@ func TestRuntimeAssemblesAndSealsCompleteRequest(t *testing.T) {
 	if !strings.Contains(string(raw), "任务角色") || strings.Contains(string(raw), "默认角色") || !spec.Tools[0].Strict {
 		t.Fatalf("角色覆盖或 schema 不完整: %s", raw)
 	}
-	if spec.Identity.SnapshotID == "" || c.Snapshot().Schema != contextcontract.SnapshotSchemaV2 {
+	if spec.Identity.SnapshotID == "" || c.Snapshot().Schema != contextcontract.SnapshotSchemaV3 {
 		t.Fatal("缺少新版本快照")
 	}
 	in.Identity.InvocationID = "invocation-2"
@@ -161,8 +161,8 @@ func TestRequiredReplayFailureAndPersistenceFailureRejectResult(t *testing.T) {
 
 func TestStaticInstructionsBudgetAndOperationUseSameCompiler(t *testing.T) {
 	r := testmodel.Runtime(t)
-	if err := r.ValidateStaticPrompt(context.Background(), contextruntime.StaticPromptProfile{ProfileID: "role", SystemPrompt: strings.Repeat("长指令", 65536)}); err == nil {
-		t.Fatal("超限角色指令未在预检拒绝")
+	if err := r.ValidateStaticPrompt(context.Background(), contextruntime.StaticPromptProfile{ProfileID: "role", SystemPrompt: strings.Repeat("长指令", 65536)}); err != nil {
+		t.Fatalf("模型整体容量内的角色原文不应被局部限额拒绝: %v", err)
 	}
 	client := &capturingInvoker{fixture: testmodel.Fixture{Content: "验证成功"}}
 	_, err := r.InvokeOperation(context.Background(), contextruntime.Instructions{ProfileID: "probe", Objective: "验证"}, nil, nil, testmodel.Options(), client)

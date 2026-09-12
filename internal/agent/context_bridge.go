@@ -73,7 +73,7 @@ func renderOutputContract(task *model.Task, controlTools []string) string {
 	switch {
 	case has("submit_task_result"):
 		if task != nil && task.GraphID != "" {
-			return "任务收尾须经 submit_task_result 提交结构化结果（status/summary）；唯一业务结果放入 result JSON object；阻塞必须给 blocked_reason"
+			return "直接给出最终纯文本即可正常结束本节点，正文由运行时原样登记；需要结构化结果时可用 submit_task_result 的 result JSON object；明确阻塞时说明 blocked_reason"
 		}
 		return "任务收尾须经 submit_task_result 提交结构化结果（status/summary/result；阻塞必须给 blocked_reason）"
 	default:

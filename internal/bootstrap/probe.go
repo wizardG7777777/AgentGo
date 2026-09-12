@@ -153,7 +153,7 @@ func startupToolCapabilityProbe(w io.Writer, cfg *config.Config, timeout time.Du
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	started := time.Now()
-	probeStore, storeErr := contextstore.New(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "model-probes-v2"))
+	probeStore, storeErr := contextstore.New(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "model-probes-v3"))
 	if storeErr != nil {
 		return storeErr
 	}
@@ -164,7 +164,7 @@ func startupToolCapabilityProbe(w io.Writer, cfg *config.Config, timeout time.Du
 	}
 	runtime := contextruntime.Runtime{Assembler: contextruntime.NewAssembler(), Policies: catalog, Snapshots: probeStore}
 	runtime.Output = contextruntime.NewOutputService(func(record contextruntime.OutputRecord) error {
-		return session.AppendModelOutputFile(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "model-probes-v2", "model-outputs.jsonl"), record)
+		return session.AppendModelOutputFile(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "model-probes-v3", "model-outputs.jsonl"), record)
 	})
 	const maxAttempts = 3
 	var lastErr error

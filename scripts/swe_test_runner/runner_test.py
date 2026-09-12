@@ -563,6 +563,13 @@ class SWETestRunnerContractTest(unittest.TestCase):
                 line for line in content.splitlines() if line.startswith("agentgo:")
             ))
 
+    def test_swe_all_roles_share_880k_context_capacity(self):
+        template = (Path(__file__).resolve().parents[2] / "setting.swe-flask.yaml").read_text(encoding="utf-8")
+        capacities = re.findall(r"(?m)^\s*(?:default_)?context_window_tokens:\s*(\d+)\s*$", template)
+        self.assertEqual(capacities, ["880000"])
+        self.assertIn('model: "__FAST_MODEL__"', template)
+        self.assertIn('model: "__FLAG_SHIP_MODEL__"', template)
+
     def test_yaml_template_value_normalizes_only_path_values(self):
         self.assertEqual(
             swe_test_runner.yaml_template_value(Path(r"C:\Users\tester\AgentGo")),
@@ -1061,7 +1068,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
         exited_process.wait(timeout=10)
         exited = swe_test_runner.monitor_run(
             "http://127.0.0.1:1", "token", exited_process, "run-1",
-            time.time(), 10, os.devnull, poll_sec=0, terminal_grace_sec=0,
+            time.time(), 10, os.devnull, poll_sec=0,
         )
         self.assertEqual(exited["process_terminal"], "process_exited")
 
@@ -1073,7 +1080,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
         try:
             killed = swe_test_runner.monitor_run(
                 "http://127.0.0.1:1", "token", running_process, "run-1",
-                time.time() - 2, 1, os.devnull, poll_sec=0, terminal_grace_sec=0,
+                time.time() - 2, 1, os.devnull, poll_sec=0,
             )
             self.assertEqual(killed["process_terminal"], "external_hard_kill")
             self.assertTrue(killed["external_hard_kill"])
@@ -1081,6 +1088,36 @@ class SWETestRunnerContractTest(unittest.TestCase):
         finally:
             swe_test_runner.terminate_process(running_process)
         self.assertIsNotNone(running_process.poll())
+
+    def test_deadline_checks_fresh_snapshot_and_durable_settlement(self):
+        snapshot = {"tasks": [{"run_id": "run-1", "status": "completed", "graph_id": "g"},
+                              {"run_id": "run-1", "status": "completed", "final_report_graph_id": "g"}],
+                    "graphs": [{"run_id": "run-1", "graph_id": "g", "status": "completed", "outcome": "success"}]}
+        for missing in (None, "execution_settled", "evidence_complete", "task_outcomes_delivered", "graph_completion_committed", "success_without_delivery"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                checks = {key: key != missing for key in ("execution_settled", "evidence_complete", "task_outcomes_delivered", "graph_completion_committed")}
+                audit = {"architecture_checks": checks, "known_incidents": {"success_without_delivery": missing == "success_without_delivery"}}
+                with mock.patch.object(swe_test_runner, "http_json", return_value=(200, snapshot)) as read_snapshot, \
+                        mock.patch.object(swe_test_runner, "audit_runtime", return_value=audit):
+                    result = swe_test_runner.monitor_run("http://local", "token", SimpleNamespace(poll=lambda: None),
+                        "run-1", time.time() - 2, 1, str(Path(directory) / "snapshot.json"), poll_sec=0, provider_trace_root=Path(directory))
+                read_snapshot.assert_called_once()
+                self.assertTrue(result["deadline_reached"])
+                self.assertTrue(result["completion_observed"])
+                self.assertEqual(result["settlement_verified"], missing is None)
+                self.assertEqual(result["external_hard_kill"], missing is not None)
+                self.assertEqual(result["process_terminal"], "graph_terminal" if missing is None else "external_hard_kill")
+
+    def test_deadline_does_not_reuse_old_terminal_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "snapshot.json"
+            path.write_text(json.dumps({"graphs": [{"status": "completed"}]}), encoding="utf-8")
+            with mock.patch.object(swe_test_runner, "http_json", side_effect=OSError("连接不可用")):
+                result = swe_test_runner.monitor_run("http://local", "token", SimpleNamespace(poll=lambda: None),
+                    "run-1", time.time() - 2, 1, str(path), poll_sec=0, provider_trace_root=Path(directory))
+            self.assertTrue(result["external_hard_kill"])
+            self.assertFalse(result["completion_observed"])
+            self.assertFalse(result["settlement_verified"])
 
     def test_terminate_process_escalates_and_waits(self):
         process = mock.Mock()
@@ -1112,7 +1149,11 @@ class SWETestRunnerContractTest(unittest.TestCase):
             swe_test_runner.terminate_process(process)
         process.kill.assert_not_called()
 
-    def test_monitor_graph_and_no_graph_terminals_do_not_use_quiet(self):
+    @mock.patch.object(swe_test_runner, "audit_runtime", return_value={
+        "architecture_checks": {"execution_settled": True, "evidence_complete": True,
+                                "task_outcomes_delivered": True, "graph_completion_committed": True},
+        "known_incidents": {}})
+    def test_monitor_graph_and_no_graph_terminals_do_not_use_quiet(self, audit):
         graph_snapshot = {
             "tasks": [
                 {"run_id": "run-1", "status": "completed", "graph_id": "graph-1"},
@@ -1126,7 +1167,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
                 mock.patch.object(swe_test_runner, "http_json", return_value=(200, graph_snapshot)):
             result = swe_test_runner.monitor_run("http://local", "token", running_process, "run-1", time.time(), 10,
                                          str(Path(directory) / "snapshot.json"), poll_sec=0,
-                                         terminal_grace_sec=0)
+                                         provider_trace_root=Path(directory))
         self.assertEqual(result["process_terminal"], "graph_terminal")
         self.assertTrue(result["graph_lifecycle_terminal"])
         self.assertEqual(result["final_report_statuses"], ["completed"])
@@ -1142,7 +1183,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
                 mock.patch.object(swe_test_runner.time, "sleep", return_value=None):
             result = swe_test_runner.monitor_run("http://local", "token", incomplete_process, "run-1", time.time(), 10,
                                          str(Path(directory) / "snapshot.json"), poll_sec=0,
-                                         terminal_grace_sec=0)
+                                         provider_trace_root=Path(directory))
         self.assertEqual(result["process_terminal"], "process_exited")
 
         processing_intervention = {
@@ -1160,7 +1201,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
                 mock.patch.object(swe_test_runner.time, "sleep", return_value=None):
             result = swe_test_runner.monitor_run("http://local", "token", intervention_process, "run-1", time.time(), 10,
                                          str(Path(directory) / "snapshot.json"), poll_sec=0,
-                                         terminal_grace_sec=0)
+                                         provider_trace_root=Path(directory))
         self.assertEqual(result["process_terminal"], "process_exited")
 
         no_graph_snapshot = {
@@ -1171,7 +1212,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
                 mock.patch.object(swe_test_runner, "http_json", return_value=(200, no_graph_snapshot)):
             result = swe_test_runner.monitor_run("http://local", "token", running_process, "run-1", time.time(), 10,
                                          str(Path(directory) / "snapshot.json"), poll_sec=0,
-                                         terminal_grace_sec=0)
+                                         provider_trace_root=Path(directory))
         self.assertEqual(result["process_terminal"], "no_graph_terminal")
         self.assertFalse(result["graph_lifecycle_terminal"])
 
@@ -1189,7 +1230,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
                 mock.patch.object(swe_test_runner.time, "sleep", return_value=None):
             result = swe_test_runner.monitor_run("http://local", "token", exiting_process, "run-1", time.time(), 10,
                                          str(Path(directory) / "snapshot.json"), poll_sec=0,
-                                         terminal_grace_sec=0)
+                                         provider_trace_root=Path(directory))
         self.assertEqual(result["process_terminal"], "process_exited")
 
     def test_model_contract_gate_has_exit_code_four(self):

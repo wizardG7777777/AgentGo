@@ -5,22 +5,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 	"unicode/utf8"
 
-	"agentgo/internal/contentstore"
 	"agentgo/internal/contextcompiler"
 	"agentgo/internal/contextcontract"
 	"agentgo/internal/llm"
 )
 
 type fragmentBuild struct {
-	prepared     []contextcompiler.PreparedFragment
-	groups       []contextcontract.ProtocolAtomicGroup
-	byID         map[string]int
-	externalized []contentstore.ContentRef
-	nextMessage  int
-	input        CompileInput
+	prepared    []contextcompiler.PreparedFragment
+	groups      []contextcontract.ProtocolAtomicGroup
+	byID        map[string]int
+	nextMessage int
+	input       CompileInput
 }
 
 // Compile 把冻结的现有 message/history/tool 视图转换为唯一 ContextCompiler 路径。
@@ -117,9 +114,8 @@ func (a *Assembler) Compile(ctx context.Context, input CompileInput) (Result, er
 	messages, tools := runtimeView(request)
 	return Result{
 		Snapshot: compiled.Snapshot, Messages: messages, Tools: tools,
-		Runtime:          compiled.Runtime,
-		ExternalizedRefs: append([]contentstore.ContentRef(nil), builder.externalized...),
-		OutputBudget:     deriveInvocationOutputBudget(input.BudgetPolicy, input.ReplayPolicy),
+		Runtime:      compiled.Runtime,
+		OutputBudget: deriveInvocationOutputBudget(input.BudgetPolicy, input.ReplayPolicy),
 	}, nil
 }
 
@@ -135,11 +131,6 @@ func validateAdapterInput(input CompileInput) error {
 	}
 	if err := input.ReplayPolicy.Validate(); err != nil {
 		return err
-	}
-	if input.ContentRepository != nil {
-		if err := input.ContentScope.Validate(); err != nil {
-			return fmt.Errorf("ContentStore scope 无效: %w", err)
-		}
 	}
 	return nil
 }
@@ -174,8 +165,6 @@ func (b *fragmentBuild) addBoundMessage(ctx context.Context, binding MessageBind
 	if err != nil {
 		return "", false, adapterFailure(b.input, contextcontract.AssemblyInvalidContract, "", err)
 	}
-	disposition, transform, contentRef := contextcontract.DispositionInline, "", ""
-	projectionReason := ""
 	inputDigest := contextcontract.DigestBytes(payload)
 	serializedBytes := int64(len(payload))
 	estimatedTokens := estimateTokens(b.input, payload)
@@ -192,44 +181,6 @@ func (b *fragmentBuild) addBoundMessage(ctx context.Context, binding MessageBind
 			}
 		}
 	}
-	var sourceContent []byte
-	if exceedsRule(payload, estimatedTokens, rule) {
-		if externalizableKind(binding.Kind) && b.input.ContentRepository != nil {
-			ref, putErr := b.externalize(ctx, binding.Kind, binding.Authority, rule, []byte(message.Content))
-			if putErr != nil {
-				return "", false, putErr
-			}
-			message.Content = renderReference(binding.Kind, ref, false)
-			base = canonicalFromMessage(message)
-			envelope.Message = &base
-			payload, err = encodeEnvelope(envelope)
-			if err != nil {
-				return "", false, adapterFailure(b.input, contextcontract.AssemblyInvalidContract, "", err)
-			}
-			disposition, transform, contentRef = contextcontract.DispositionReferenced, rule.TransformID, ref.RefID
-			{
-				projectionReason = "fragment_limit_externalized"
-			}
-			inputDigest = ref.ContentDigest
-			serializedBytes = int64(len(payload))
-			estimatedTokens = estimateTokens(b.input, payload)
-			sourceContent = nil
-		} else if droppableBoundMessageKind(binding.Kind) && dispositionAllowed(rule, contextcontract.DispositionDropped) {
-			// Informational hot-state inputs are optional replay projections. Preserve
-			// their original digest/size in the durable manifest, but do not let one
-			// oversized board/mail/memory item abort the entire Invocation.
-			disposition = contextcontract.DispositionDropped
-			{
-				projectionReason = "fragment_limit_dropped"
-			}
-			payload = nil
-			sourceContent = nil
-		} else {
-			sourceContent = payload
-		}
-	} else {
-		sourceContent = payload
-	}
 	fragmentID, err := stableID("fragment", binding.SourceRef, fmt.Sprintf("message:%d", index), string(binding.Kind))
 	if err != nil {
 		return "", false, err
@@ -239,9 +190,8 @@ func (b *fragmentBuild) addBoundMessage(ctx context.Context, binding MessageBind
 		SourceRef: binding.SourceRef, Scope: binding.Scope, Authority: binding.Authority,
 		Freshness: binding.Freshness, Digest: inputDigest,
 		SerializedBytes: serializedBytes, EstimatedTokens: estimatedTokens,
-		RetentionClass: rule.RetentionClass, Content: sourceContent, ContentRef: contentRef,
-		Disposition: disposition, TransformRef: transform,
-		ProjectionReason: projectionReason,
+		RetentionClass: rule.RetentionClass, Content: payload,
+		Disposition: contextcontract.DispositionInline,
 	}
 	prepared := contextcompiler.PreparedFragment{
 		Fragment: fragment, WireKind: messageWireKind(message.Role), Payload: payload,
@@ -249,7 +199,7 @@ func (b *fragmentBuild) addBoundMessage(ctx context.Context, binding MessageBind
 	if err := b.appendPrepared(prepared); err != nil {
 		return "", false, err
 	}
-	return fragmentID, disposition != contextcontract.DispositionInline, nil
+	return fragmentID, false, nil
 }
 
 func (b *fragmentBuild) addSettledTurn(ctx context.Context, turn SettledTurn) error {
@@ -288,39 +238,6 @@ func (b *fragmentBuild) addSettledTurn(ctx context.Context, turn SettledTurn) er
 	if err != nil {
 		return adapterFailure(b.input, contextcontract.AssemblyInvalidContract, "", err)
 	}
-	assistantDisposition, assistantTransform, assistantContentRef := contextcontract.DispositionInline, "", ""
-	assistantInputDigest := contextcontract.DigestBytes(basePayload)
-	var assistantSourceContent []byte = basePayload
-	assistantTransformed := false
-	assistantProjectionReason := ""
-	if refID, contentDigest, reason, ok := existingAssistantContentReference(assistant.Content); ok {
-		assistantDisposition, assistantTransform, assistantContentRef = contextcontract.DispositionReferenced,
-			assistantRule.TransformID, refID
-		assistantInputDigest, assistantSourceContent, assistantTransformed = contentDigest, nil, true
-		assistantProjectionReason = reason
-	} else if exceedsRule(basePayload, estimateTokens(b.input, basePayload), assistantRule) && b.input.ContentRepository != nil {
-		ref, putErr := b.externalize(ctx, contextcontract.FragmentAssistantContent,
-			contextcontract.AuthorityInformational, assistantRule, []byte(assistant.Content))
-		if putErr != nil {
-			return putErr
-		}
-		assistant.Content = renderReference(contextcontract.FragmentAssistantContent, ref, false)
-		base = canonicalFromMessage(assistant)
-		base.ToolCalls = nil
-		base.ReplayFields = nil
-		basePayload, err = encodeEnvelope(wireEnvelope{
-			Type: envelopeMessageBase, MessageIndex: messageIndex, Message: &base,
-		})
-		if err != nil {
-			return adapterFailure(b.input, contextcontract.AssemblyInvalidContract, assistantID, err)
-		}
-		assistantDisposition = contextcontract.DispositionReferenced
-		assistantTransform, assistantContentRef = assistantRule.TransformID, ref.RefID
-		assistantInputDigest, assistantSourceContent, assistantTransformed = ref.ContentDigest, nil, true
-		{
-			assistantProjectionReason = "fragment_limit_externalized"
-		}
-	}
 	if err := b.appendPrepared(contextcompiler.PreparedFragment{
 		Fragment: contextcontract.ContextFragment{
 			FragmentID: assistantID, Kind: contextcontract.FragmentAssistantContent,
@@ -328,11 +245,10 @@ func (b *fragmentBuild) addSettledTurn(ctx context.Context, turn SettledTurn) er
 			SourceRef: "turn:" + turn.TurnID + "/assistant", Scope: contextcontract.ScopeTurn,
 			Authority: contextcontract.AuthorityInformational,
 			Freshness: contextcontract.FreshnessSnapshot,
-			Digest:    assistantInputDigest, SerializedBytes: int64(len(basePayload)),
+			Digest:    contextcontract.DigestBytes(basePayload), SerializedBytes: int64(len(basePayload)),
 			EstimatedTokens: estimateTokens(b.input, basePayload), RetentionClass: assistantRule.RetentionClass,
-			Content: assistantSourceContent, ContentRef: assistantContentRef,
-			Disposition: assistantDisposition, TransformRef: assistantTransform,
-			ProjectionReason: assistantProjectionReason,
+			Content:     basePayload,
+			Disposition: contextcontract.DispositionInline,
 		},
 		WireKind: contextcontract.WireAssistantMessage, Payload: basePayload,
 	}); err != nil {
@@ -396,7 +312,6 @@ func (b *fragmentBuild) addSettledTurn(ctx context.Context, turn SettledTurn) er
 		}
 	}
 
-	toolResultsTransformed := false
 	for resultIndex, result := range turn.ToolResults {
 		result, cloneErr = cloneMessage(result)
 		if cloneErr != nil {
@@ -421,34 +336,7 @@ func (b *fragmentBuild) addSettledTurn(ctx context.Context, turn SettledTurn) er
 			return adapterFailure(b.input, contextcontract.AssemblyInvalidContract, fragmentID,
 				fmt.Errorf("policy 缺少 tool_result rule"))
 		}
-		disposition, transform, contentRef := contextcontract.DispositionInline, "", ""
-		projectionReason := ""
 		inputDigest := contextcontract.DigestBytes(payload)
-		var sourceContent []byte = payload
-		if refID, contentDigest, reason, ok := existingToolResultReference(result.Content); ok {
-			disposition, transform, contentRef = contextcontract.DispositionTombstoned, rule.TransformID, refID
-			inputDigest, sourceContent, toolResultsTransformed = contentDigest, nil, true
-			projectionReason = reason
-		} else if exceedsRule(payload, estimateTokens(b.input, payload), rule) && b.input.ContentRepository != nil {
-			ref, putErr := b.externalize(ctx, contextcontract.FragmentToolResult,
-				contextcontract.AuthorityInformational, rule, []byte(result.Content))
-			if putErr != nil {
-				return putErr
-			}
-			result.Content = renderReference(contextcontract.FragmentToolResult, ref, true)
-			base = canonicalFromMessage(result)
-			payload, encodeErr = encodeEnvelope(wireEnvelope{
-				Type: envelopeMessageBase, MessageIndex: messageIndex, Message: &base,
-			})
-			if encodeErr != nil {
-				return adapterFailure(b.input, contextcontract.AssemblyInvalidContract, fragmentID, encodeErr)
-			}
-			disposition, transform, contentRef = contextcontract.DispositionTombstoned, rule.TransformID, ref.RefID
-			inputDigest, sourceContent, toolResultsTransformed = ref.ContentDigest, nil, true
-			{
-				projectionReason = "fragment_limit_externalized"
-			}
-		}
 		if err := b.appendPrepared(contextcompiler.PreparedFragment{
 			Fragment: contextcontract.ContextFragment{
 				FragmentID: fragmentID, Kind: contextcontract.FragmentToolResult,
@@ -457,9 +345,8 @@ func (b *fragmentBuild) addSettledTurn(ctx context.Context, turn SettledTurn) er
 				Scope:     contextcontract.ScopeTurn, Authority: contextcontract.AuthorityInformational,
 				Freshness: contextcontract.FreshnessSnapshot, Digest: inputDigest,
 				SerializedBytes: int64(len(payload)), EstimatedTokens: estimateTokens(b.input, payload),
-				RetentionClass: rule.RetentionClass, Content: sourceContent, ContentRef: contentRef,
-				Disposition: disposition, TransformRef: transform,
-				ProjectionReason: projectionReason,
+				RetentionClass: rule.RetentionClass, Content: payload,
+				Disposition: contextcontract.DispositionInline,
 			},
 			WireKind: contextcontract.WireToolMessage, Payload: payload,
 		}); err != nil {
@@ -469,17 +356,8 @@ func (b *fragmentBuild) addSettledTurn(ctx context.Context, turn SettledTurn) er
 	}
 
 	if len(assistant.ToolCalls) > 0 {
-		replay, transform := contextcontract.ReplayOptional, ""
-		switch {
-		case assistantTransformed && toolResultsTransformed:
-			replay, transform = contextcontract.ReplayRequiredTransformable, "assistant_tool_exchange_ref/v1"
-		case assistantTransformed:
-			replay, transform = contextcontract.ReplayRequiredTransformable, "assistant_content_ref/v1"
-		case toolResultsTransformed:
-			replay, transform = contextcontract.ReplayRequiredTransformable, "tool_result_ref/v1"
-		}
 		if err := b.addGroup("turn:"+turn.TurnID+":tool-exchange",
-			contextcontract.AtomicAssistantToolExchange, exchangeIDs, replay, transform); err != nil {
+			contextcontract.AtomicAssistantToolExchange, exchangeIDs, contextcontract.ReplayRequiredExact, ""); err != nil {
 			return err
 		}
 	}
@@ -498,34 +376,6 @@ func (b *fragmentBuild) addSettledTurn(ctx context.Context, turn SettledTurn) er
 		}
 	}
 	return nil
-}
-
-func existingToolResultReference(content string) (string, string, string, bool) {
-	var envelope struct {
-		Schema string `json:"schema"`
-		RefID  string `json:"ref_id"`
-		SHA256 string `json:"sha256"`
-		Reason string `json:"reason,omitempty"`
-	}
-	if json.Unmarshal([]byte(content), &envelope) != nil || envelope.Schema != "agentgo.tool-result-ref/v1" ||
-		strings.TrimSpace(envelope.RefID) == "" || !contextcontract.ValidDigest(envelope.SHA256) {
-		return "", "", "", false
-	}
-	return envelope.RefID, envelope.SHA256, envelope.Reason, true
-}
-
-func existingAssistantContentReference(content string) (string, string, string, bool) {
-	var envelope struct {
-		Schema string `json:"schema"`
-		RefID  string `json:"ref_id"`
-		SHA256 string `json:"sha256"`
-		Reason string `json:"reason,omitempty"`
-	}
-	if json.Unmarshal([]byte(content), &envelope) != nil || envelope.Schema != "agentgo.assistant-content-ref/v1" ||
-		strings.TrimSpace(envelope.RefID) == "" || !contextcontract.ValidDigest(envelope.SHA256) {
-		return "", "", "", false
-	}
-	return envelope.RefID, envelope.SHA256, envelope.Reason, true
 }
 
 func (b *fragmentBuild) addToolDefinitions(router ToolRouterBinding) error {
@@ -621,30 +471,6 @@ func (b *fragmentBuild) addGroup(seed string, kind contextcontract.AtomicGroupKi
 	return nil
 }
 
-func (b *fragmentBuild) externalize(ctx context.Context, kind contextcontract.FragmentKind,
-	authority contextcontract.Authority, rule contextcontract.FragmentBudgetRule, content []byte,
-) (contentstore.ContentRef, error) {
-	if b.input.ContentRepository == nil {
-		return contentstore.ContentRef{}, adapterFailure(b.input,
-			contextcontract.AssemblyContentRefUnavailable, "", fmt.Errorf("ContentRepository 未配置"))
-	}
-	expiresAt := b.input.EphemeralExpiresAt
-	if rule.RetentionClass != contextcontract.RetentionEphemeralRequest {
-		expiresAt = time.Time{}
-	}
-	ref, err := b.input.ContentRepository.Put(ctx, contentstore.PutRequest{
-		Content: append([]byte(nil), content...), MediaType: "text/plain; charset=utf-8",
-		RetentionClass: rule.RetentionClass, Authority: authority,
-		Scope: b.input.ContentScope, ExpiresAt: expiresAt,
-	})
-	if err != nil {
-		return contentstore.ContentRef{}, adapterFailure(b.input,
-			contextcontract.AssemblyContentRefUnavailable, "", err)
-	}
-	b.externalized = append(b.externalized, ref)
-	return ref, nil
-}
-
 func validateToolExchange(turn SettledTurn) error {
 	seenCalls := make(map[string]struct{}, len(turn.Assistant.ToolCalls))
 	for index, call := range turn.Assistant.ToolCalls {
@@ -704,38 +530,13 @@ func messageWireKind(role string) contextcontract.WireItemKind {
 	return contextcontract.WireUserMessage
 }
 
-func externalizableKind(kind contextcontract.FragmentKind) bool {
-	switch kind {
-	case contextcontract.FragmentUserTask, contextcontract.FragmentUpstreamResult,
-		contextcontract.FragmentUpstreamEvidence:
-		return true
-	default:
-		return false
-	}
-}
-
-func droppableBoundMessageKind(kind contextcontract.FragmentKind) bool {
-	switch kind {
-	case contextcontract.FragmentUpstreamResult, contextcontract.FragmentUpstreamEvidence,
-		contextcontract.FragmentTaskMemory, contextcontract.FragmentSessionMemory,
-		contextcontract.FragmentMailboxMessage, contextcontract.FragmentRuntimeSnapshot:
-		return true
-	default:
-		return false
-	}
-}
-
-func dispositionAllowed(rule contextcontract.FragmentBudgetRule, want contextcontract.Disposition) bool {
+func dispositionAllowed(rule contextcontract.FragmentRuleSpec, want contextcontract.Disposition) bool {
 	for _, disposition := range rule.AllowedDispositions {
 		if disposition == want {
 			return true
 		}
 	}
 	return false
-}
-
-func exceedsRule(payload []byte, tokens int64, rule contextcontract.FragmentBudgetRule) bool {
-	return int64(len(payload)) > rule.MaxSerializedBytes || tokens > rule.MaxEstimatedTokens
 }
 
 func estimateTokens(input CompileInput, payload []byte) int64 {
@@ -764,21 +565,6 @@ func estimateTokens(input CompileInput, payload []byte) int64 {
 		return int64(mixed)
 	}
 	return int64(byBytes)
-}
-
-func renderReference(kind contextcontract.FragmentKind, ref contentstore.ContentRef, tombstone bool) string {
-	type reference struct {
-		Kind       contextcontract.FragmentKind `json:"kind"`
-		ContentRef string                       `json:"content_ref"`
-		SHA256     string                       `json:"sha256"`
-		SizeBytes  int64                        `json:"size_bytes"`
-		Tombstone  bool                         `json:"tombstone,omitempty"`
-	}
-	payload, _ := json.Marshal(reference{
-		Kind: kind, ContentRef: ref.RefID, SHA256: ref.ContentDigest,
-		SizeBytes: ref.SizeBytes, Tombstone: tombstone,
-	})
-	return string(payload)
 }
 
 func stableID(prefix string, parts ...string) (string, error) {

@@ -13,7 +13,7 @@ import (
 func TestBootstrapSchedulerOnlyCanProvisionAndShutdownTemplateTeam(t *testing.T) {
 	projectRoot := t.TempDir()
 	configPath := filepath.Join(projectRoot, "setting.yaml")
-	config := []byte("graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: test-model\n" +
+	config := []byte("graph:\n  request_contract: agentgo.graph/v7\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: test-model\n" +
 		"project_root: " + filepath.ToSlash(projectRoot) + "\n" +
 		"startup_probe: off\n")
 	if err := os.WriteFile(configPath, config, 0o600); err != nil {
@@ -74,7 +74,7 @@ func TestBootstrapTemplateToolsGatedByEnabledFlag(t *testing.T) {
 		t.Helper()
 		projectRoot := t.TempDir()
 		configPath := filepath.Join(projectRoot, "setting.yaml")
-		config := []byte("graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: test-model\n" +
+		config := []byte("graph:\n  request_contract: agentgo.graph/v7\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: test-model\n" +
 			"project_root: " + filepath.ToSlash(projectRoot) + "\n" +
 			"startup_probe: off\n" + extraYAML)
 		if err := os.WriteFile(configPath, config, 0o600); err != nil {

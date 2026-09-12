@@ -19,6 +19,7 @@ import (
 	"agentgo/internal/store"
 	"agentgo/internal/tools/schema"
 	"agentgo/internal/trace"
+	"agentgo/internal/workspace"
 )
 
 // defaultShellTimeoutSec 当未显式配置 TimeoutSec 时的默认超时（秒）。
@@ -56,7 +57,7 @@ func shellPipelineScope(args map[string]any) (bool, error) {
 //     （true/false），供调用方接线 agent 状态机（waiting_interaction）；nil 为 no-op
 //   - ActiveViewer：按任务写时复制隔离的活动视图提供者（runner 装配的
 //     workspace.Swapper）；非 nil 且 ActiveView() 非 nil 时，默认 cwd 与显式
-//     working_dir 都限制在 workspace 根内。命令正文写主根绝对路径仍不可完全
+//     逻辑 working_dir 都映射到当前任务副本。命令正文写主根绝对路径仍不可完全
 //     阻止，属设计上有意接受的宿主 Shell 残余风险（见 workspace/types.go）
 type ShellGroup struct {
 	Workdir             WorkdirProvider
@@ -83,19 +84,8 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 
 	workdir := g.Workdir
 
-	// allowedWorkDirRoot 是当前调用唯一允许的 cwd 根：隔离任务严格限定在
-	// workspace 视图内，普通任务限定在项目根内。它只约束进程 cwd；命令正文
-	// 仍可引用宿主绝对路径，因此 run_shell 依然是宿主机高权限能力而非沙箱。
+	// 工具输入、授权与文件工具共用逻辑项目路径；执行前才映射到任务副本。
 	allowedWorkDirRoot := func() (string, error) {
-		if g.ActiveViewer != nil {
-			if view := g.ActiveViewer.ActiveView(); view != nil {
-				root, err := view.PrepareShellRoot()
-				if err != nil {
-					return "", fmt.Errorf("准备 workspace shell snapshot: %w", err)
-				}
-				return root, nil
-			}
-		}
 		if workdir != nil {
 			return workdir.Get(), nil
 		}
@@ -115,6 +105,9 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 		}
 		resolved, err := pathutil.ValidatePath(raw, root)
 		if err != nil {
+			return "", fmt.Errorf("Shell working_dir 被拒绝: %w", err)
+		}
+		if err := rejectRuntimeStateWrite(resolved, root); err != nil {
 			return "", fmt.Errorf("Shell working_dir 被拒绝: %w", err)
 		}
 		return resolved, nil
@@ -170,6 +163,15 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 				if snapshotErr != nil {
 					return "", fmt.Errorf("准备 workspace shell environment: %w", snapshotErr)
 				}
+				rel, relErr := filepath.Rel(workdir.Get(), workingDir)
+				if relErr != nil {
+					return "", relErr
+				}
+				physicalDir, pathErr := pathutil.ValidatePath(rel, snapshotRoot)
+				if pathErr != nil {
+					return "", fmt.Errorf("Shell 任务副本目录被拒绝: %w", pathErr)
+				}
+				cmd.Dir = physicalDir
 				cmd.Env = workspaceShellEnvironment(snapshotRoot)
 			}
 		}
@@ -187,8 +189,7 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 		start := time.Now()
 		output, err := cmd.CombinedOutput()
 		durationMS := time.Since(start).Milliseconds()
-		// 完整 stdout/stderr 交给 L3 ToolResult envelope 持久化；本工具不在
-		// ContentStore 之前做不可恢复截断。
+		// 完整 stdout/stderr 交给运行时工具事实记录，本工具不截断正文。
 		outStr := string(output)
 
 		// 每次真实执行（成功/非零退出/超时/启动失败）都恰好 emit 一条
@@ -290,8 +291,7 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 
 	authorizedFn := shell.WrapShellTool(rawFn, filter, g.Interactions, g.SessionID,
 		g.AgentID, g.InteractionWaitHook, g.Modes)
-	// Interaction 必须绑定 canonical 实际执行目录，而不是用户原始字符串。
-	// 在进入拦截器前统一解析显式/默认目录，避免授权目录与真实 cwd 分叉。
+	// Interaction 绑定 canonical 逻辑目录，执行时按同一任务视图映射实际 cwd。
 	wrappedFn := func(ctx context.Context, args map[string]any) (string, error) {
 		dir, err := resolveWorkingDir(args)
 		if err != nil {
@@ -310,7 +310,7 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 
 	params := schema.Object().
 		String("command", "要执行的 shell 命令", true).
-		String("working_dir", "执行命令的工作目录；普通任务必须位于 project_root 内，workspace 隔离任务必须位于该任务的完整 shell snapshot 内；留空使用项目快照根", false).
+		String("working_dir", "与 read_file/apply_change 共用的逻辑目录：相对 project_root 的目录或其内部绝对路径，留空为项目根。运行时自动映射到当前任务副本，不填写 .agentgo 或内部 workspace 路径", false).
 		Int("timeout_sec", "本次执行的超时秒数，留空时使用配置默认值", false).
 		Bool("accept_last_pipeline_exit_code", "命令含 pipeline 时必须显式为 true 才执行；表示你接受 exit_code 仅属于最后一个管道段，且不会把它当成整条测试/构建命令的通过证据", false).
 		Build()
@@ -319,7 +319,7 @@ func (g ShellGroup) Register(r *agent.ToolRegistry) {
 }
 
 func workspaceShellEnvironment(snapshotRoot string) []string {
-	env := os.Environ()
+	env := workspace.SnapshotGitEnvironment(os.Environ(), snapshotRoot)
 	pythonPaths := make([]string, 0, 3)
 	if info, err := os.Stat(filepath.Join(snapshotRoot, "src")); err == nil && info.IsDir() {
 		pythonPaths = append(pythonPaths, filepath.Join(snapshotRoot, "src"))

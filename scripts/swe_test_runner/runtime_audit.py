@@ -108,8 +108,14 @@ def go_json_digest(value):
 
 def collect_runtime(snapshot_path, monitor_path, project_root, run_id, startup_probe_passed):
     reader = EvidenceReader()
-    root, state = Path(project_root), Path(project_root) / ".agentgo" / "state"
     snapshot, monitor = reader.object(Path(snapshot_path)), reader.object(Path(monitor_path))
+    return audit_runtime(snapshot, monitor, project_root, run_id, startup_probe_passed, reader)
+
+
+def audit_runtime(snapshot, monitor, project_root, run_id, startup_probe_passed, reader=None):
+    """终态监控与最终判读使用同一份持久化事实审计，不建立第二套结算判据。"""
+    reader = reader if reader is not None else EvidenceReader()
+    root, state = Path(project_root), Path(project_root) / ".agentgo" / "state"
     for key in ("tasks", "graphs"):
         if not isinstance(snapshot.get(key), list):
             reader.issue("snapshot_collection_missing", key)
@@ -162,7 +168,7 @@ def collect_runtime(snapshot_path, monitor_path, project_root, run_id, startup_p
     retired_calls = sorted({e.get("tool") for e in events if e.get("tool") in RETIRED_TOOLS})
 
     # Context 本体没有 RunID；只关联本 Run 的实际 Invocation 集合。
-    context_entries = reader.journal([state / "context-snapshots-v2" / "context-snapshots.jsonl"], version=1)
+    context_entries = reader.journal([state / "context-snapshots-v3" / "context-snapshots.jsonl"], version=1)
     contexts = {}
     dispositions, policies = Counter(), set()
     for entry in context_entries:
@@ -171,7 +177,7 @@ def collect_runtime(snapshot_path, monitor_path, project_root, run_id, startup_p
         invocation = context.get("invocation_id")
         if (invocation,) not in starts:
             continue
-        if context.get("schema") != "agentgo.context/v2":
+        if context.get("schema") != "agentgo.context/v3":
             reader.issue("context_schema_rejected", invocation)
             continue
         if invocation in contexts and contexts[invocation] != context:
@@ -201,7 +207,7 @@ def collect_runtime(snapshot_path, monitor_path, project_root, run_id, startup_p
 
     # TaskOutcome 提交与投递回执分别读取，禁止把 UI 文本当作完成历史。
     outcomes, acknowledgements = {}, set()
-    for entry in reader.journal([state / "task-outcomes-v3" / "task-outcomes.jsonl"], version=1):
+    for entry in reader.journal([state / "task-outcomes-v4" / "task-outcomes.jsonl"], version=1):
         if entry.get("kind") == "delivery_ack":
             acknowledgements.add(entry.get("ack_ref"))
         record = reader.mapping(entry.get("record", {}), "outcome.record")
@@ -209,7 +215,7 @@ def collect_runtime(snapshot_path, monitor_path, project_root, run_id, startup_p
         if value.get("run_id") != run_id:
             continue
         ref = record.get("outcome_ref")
-        schemas = {"agentgo.task-outcome/v4"}
+        schemas = {"agentgo.task-outcome/v5"}
         if not ref or value.get("schema") not in schemas:
             reader.issue("outcome_schema_or_identity_invalid", run_id)
             continue
@@ -262,13 +268,13 @@ def collect_runtime(snapshot_path, monitor_path, project_root, run_id, startup_p
                 attempts.add(checkpoint["attempt_id"])
 
     definitions, latest, graph_digests = {}, {}, {}
-    for entry in reader.journal((state / "graphs-v6").glob("*.jsonl")):
+    for entry in reader.journal((state / "graphs-v8").glob("*.jsonl")):
         current = reader.mapping(entry.get("snapshot"), "dataflow.snapshot")
         definition = reader.mapping(current.get("definition"), "dataflow.definition")
         if definition.get("run_id") != run_id:
             continue
         graph_id, revision = definition.get("graph_id"), definition.get("revision")
-        if current.get("schema") != "agentgo.graph/v6" or definition.get("schema") != "agentgo.graph/v6" or not graph_id or not isinstance(revision, int):
+        if current.get("schema") != "agentgo.graph/v7" or definition.get("schema") != "agentgo.graph/v7" or not graph_id or not isinstance(revision, int):
             reader.issue("dataflow_schema_or_identity_invalid", run_id)
             continue
         if not isinstance(definition.get("nodes"), list) or any(n.get("kind") != "agentTask" for n in _objects(definition.get("nodes"))):
@@ -371,6 +377,9 @@ def collect_runtime(snapshot_path, monitor_path, project_root, run_id, startup_p
         "schema": RESULT_SCHEMA, "run_id": run_id,
         "process_terminal": monitor.get("process_terminal", "unknown"),
         "external_hard_kill": bool(monitor.get("external_hard_kill")), "wall_sec": monitor.get("wall_sec", 0),
+        "deadline_reached": bool(monitor.get("deadline_reached")),
+        "completion_observed": bool(monitor.get("completion_observed")),
+        "settlement_verified": bool(monitor.get("settlement_verified")),
         "graph_lifecycle_terminal": checks["graph_terminal"], "graph_outcomes": graph_outcomes,
         "graph_statuses": [g.get("status") for g in graphs], "task_statuses": [t.get("status") for t in tasks],
         "final_report_statuses": [t.get("status") for t in final_reports], "task_outcomes": outcome_projection,

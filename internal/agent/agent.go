@@ -45,7 +45,6 @@ func (e *ErrRecoverable) Unwrap() error { return e.Err }
 
 // ExecuteResult holds the result of a single TaskExecutor llm.
 type ExecuteResult struct {
-	ContextProjected   bool
 	Replay             *llm.ProtocolReplay
 	InvocationID       string
 	ContextSnapshotID  string
@@ -469,13 +468,6 @@ const emergencyLoopFuse = 10000
 // 按可恢复错误收口重试。阈值 3：容忍偶发的模型/provider 抖动，同时有界。
 const maxEmptyResponseStreak = 3
 
-// maxUnstructuredExitNudges 是图节点任务纯文本自然退出的提醒次数上限：
-// 每次文本退出注入「必须用 submit_task_result 收口」提醒，超过次数仍文本
-// 退出按可恢复错误收口重试（2026-08-20 SWE-001 兜底 2）。
-const maxUnstructuredExitNudges = 2
-
-// loopFuseLimit 返回本 Agent 生效的 fuse 值：未设置测试覆盖时恒为
-// emergencyLoopFuse。
 func (a *Agent) loopFuseLimit() int {
 	if a.loopFuse > 0 {
 		return a.loopFuse
@@ -866,11 +858,6 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 	// maxEmptyResponseStreak 轮仍空按可恢复错误收口（重试换上下文）。
 	emptyStreak := 0
 	sameSnapshotFailureStreak := 0
-	// unstructuredExitStreak：图节点任务纯文本自然退出（有文本、零工具
-	// 调用、未走 submit_task_result）的计数（2026-08-20 SWE-001 兜底 2）。
-	// 图节点契约要求结构化收口，文本退出 = 未提交：提醒
-	// maxUnstructuredExitNudges 次后仍文本退出按可恢复错误收口。
-	unstructuredExitStreak := 0
 	attemptDeadline, hasAttemptDeadline := attemptHardDeadline(task)
 	if loopProgress != nil {
 		attemptDeadline = loopProgress.checkpoint.Deadlines.Attempt.HardDeadlineAt
@@ -1153,9 +1140,6 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			executeCtx = withToolActionBoundary(executeCtx, loopProgress)
 		}
 		result, execErr := a.Execute(executeCtx, task, depResults, histCopy, actionOutputBudget)
-		if result.ContextProjected {
-			manifestInfo.historyProjectionCount++
-		}
 		if cancelExecute != nil {
 			cancelExecute()
 		}
@@ -1297,33 +1281,6 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 		// submit_task_result/report_done 的结构化收口，不经此审查；空响应已被
 		// 上方守卫拦截。
 		if !result.ToolCalled && !result.Finalized {
-			// 兜底 2（图节点任务）：契约要求 submit_task_result 结构化收口，
-			// 纯文本退出 = 未提交。提醒后继续；提醒 maxUnstructuredExitNudges
-			// 次仍文本退出按可恢复错误收口（重试换上下文，耗尽即 failed）。
-			if task.GraphID != "" {
-				unstructuredExitStreak++
-				if unstructuredExitStreak > maxUnstructuredExitNudges {
-					reason := fmt.Sprintf("图节点任务连续 %d 次纯文本退出，未使用 submit_task_result 结构化收口", unstructuredExitStreak)
-					log.Printf("[agent %s] 任务 %s %s", a.ID, taskID, reason)
-					trace.Emit(trace.Event{
-						Kind: trace.KindError, TaskID: taskID, AgentID: a.ID,
-						Error: "unstructured_exit: " + reason,
-					})
-					terminatingCause = "react_loop_exit:unstructured_exit"
-					enterTerminating(terminatingCause)
-					taskMem.recordAttemptEnd(a, taskID, reason)
-					taskMem.checkpoint(a, taskID, i, "attempt_end")
-					a.handleFailure(task, taskID, &ErrRecoverable{Err: fmt.Errorf("%s", reason)}, history, manifestInfo)
-					return
-				}
-				log.Printf("[agent %s] 任务 %s 图节点纯文本退出被拒（第 %d/%d 次提醒），要求 submit_task_result 收口",
-					a.ID, taskID, unstructuredExitStreak, maxUnstructuredExitNudges)
-				history = append(history, contextcontract.HistoryEntry{
-					SystemNotice: fmt.Sprintf("<system-reminder>本任务是 Graph 节点任务，收尾必须调用 submit_task_result 提交结构化结果（summary/result；无法完成时说明 blocked_reason）；纯文本回复不会被接受（第 %d/%d 次提醒）。</system-reminder>",
-						unstructuredExitStreak, maxUnstructuredExitNudges),
-				})
-				continue
-			}
 			// 兜底 1（scheduler 根任务）：零证据收口审查——与 report_done 的
 			// scheduler-closure-review Gate 同语义（零图/零 delegated 任务/
 			// 零 pending 交互时第一次拒绝要求确认，第二次放行记
@@ -1335,7 +1292,7 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			// 记录时第二次拒绝改格式提醒，第三次 Retry 换上下文——四轮取证：
 			// 三起「直答」全是长 JSON 损坏后的工具调用格式崩盘，放行即把
 			// DSML 残片落盘为正式答复。
-			if a.NaturalExitReviewer != nil {
+			if task.GraphID == "" && a.NaturalExitReviewer != nil {
 				toolFailed := a.hasToolCallFailure(taskID)
 				decision := a.NaturalExitReviewer.ReviewNaturalExit(ctx, task, lastOutput, toolFailed)
 				switch {
@@ -1389,6 +1346,8 @@ func (a *Agent) processTask(ctx context.Context, taskID string) {
 			if lastOutput != "" {
 				if err := a.Store.RecordLastResponse(taskID, lastOutput); err != nil {
 					log.Printf("[agent %s] RecordLastResponse error: %v", a.ID, err)
+					a.blockForLoopControl(task, taskID, "最终正文保存失败: "+err.Error(), "result_persistence_failed")
+					return
 				}
 			}
 
@@ -1777,7 +1736,6 @@ func (a *Agent) handleFailure(task *model.Task, taskID string, execErr error, hi
 		overflow := recoveryDecision.Action == loopcontrol.RecoveryRebuildContext
 		if overflow {
 			log.Printf("[agent %s] 任务 %s 检测到上下文溢出，下一 Attempt 使用激进 replay 投影（Raw History 保持不变）", a.ID, taskID)
-			history = append(history, contextcontract.HistoryEntry{ContextProjection: "aggressive"})
 			// CM1：回填 L3 处置——本 attempt 随后的 LLM 调用的 Manifest 中
 			// history 段 Disposition 记为 truncated。
 			if manifestInfo != nil {

@@ -31,7 +31,7 @@ func TestWebUIConfig_AutoOpenExplicitFalse(t *testing.T) {
 // TestLoadConfig_AutoOpenParsed 验证 YAML 中 auto_open: false 被正确解析。
 func TestLoadConfig_AutoOpenParsed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "setting.yaml")
-	content := "graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\nui:\n  frontends: [web]\n  web:\n    listen: \"127.0.0.1:8399\"\n    auto_open: false\n"
+	content := "graph:\n  request_contract: agentgo.graph/v7\nllm:\n  request_contract: agentgo.model-request/v1\nui:\n  frontends: [web]\n  web:\n    listen: \"127.0.0.1:8399\"\n    auto_open: false\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}

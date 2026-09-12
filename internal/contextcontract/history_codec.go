@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-const HistorySchema = "agentgo.model-history/v1"
+const HistorySchema = "agentgo.model-history/v2"
 
 type History struct {
 	Schema  string         `json:"schema"`

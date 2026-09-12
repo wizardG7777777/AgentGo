@@ -50,11 +50,10 @@ func graphNodeNativeSchema() map[string]any {
 	return nativeObject(map[string]any{
 		"node_id": nativeString("新的任务实例 ID；返工追加新 ID"), "kind": map[string]any{"type": "string", "enum": []string{"agentTask"}},
 		"title": nativeString("简短任务标题"), "objective": nativeString("确定任务和应交付的结果"),
-		"inputs":          map[string]any{"type": "object", "additionalProperties": source},
-		"result_schema":   map[string]any{"type": "object", "description": "JSON Schema 子集(type/properties/required/additionalProperties/items/enum)，根类型必须 object；通常要求 summary string"},
-		"execution":       nativeObject(map[string]any{"route_ref": nativeString("能力目录中的 route_ref，例如 default；不要填写 Agent 名称"), "tools": nativeArray(nativeString("目录明确授予的工具")), "model": nativeString("可选显式模型")}, "route_ref", "tools"),
-		"workspace_input": nativeString("提供工作候选基线的输入槽；多候选时必须指定"),
-		"labels":          map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
+		"inputs":        map[string]any{"type": "object", "additionalProperties": source},
+		"result_schema": map[string]any{"type": "object", "description": "JSON Schema 子集(type/properties/required/additionalProperties/items/enum)，根类型必须 object；通常要求 summary string"},
+		"execution":     nativeObject(map[string]any{"route_ref": nativeString("能力目录中的 route_ref，例如 default；不要填写 Agent 名称"), "tools": nativeArray(nativeString("目录明确授予的工具")), "model": nativeString("可选显式模型")}, "route_ref", "tools"),
+		"labels":        map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
 	}, "node_id", "kind", "title", "objective", "result_schema", "execution")
 }
 

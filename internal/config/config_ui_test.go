@@ -26,7 +26,7 @@ func TestUIConfig_DefaultsApplied(t *testing.T) {
 
 	// 完全不写 ui 块
 	p1 := filepath.Join(dir, "a.yaml")
-	if err := os.WriteFile(p1, []byte("graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: gpt-test\n"), 0o644); err != nil {
+	if err := os.WriteFile(p1, []byte("graph:\n  request_contract: agentgo.graph/v7\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: gpt-test\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := LoadConfig(p1, true)
@@ -45,7 +45,7 @@ func TestUIConfig_DefaultsApplied(t *testing.T) {
 
 	// 只写 frontends，web.listen 保持默认
 	p2 := filepath.Join(dir, "b.yaml")
-	if err := os.WriteFile(p2, []byte("graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: gpt-test\nui:\n  frontends: [tui, web]\n"), 0o644); err != nil {
+	if err := os.WriteFile(p2, []byte("graph:\n  request_contract: agentgo.graph/v7\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: gpt-test\nui:\n  frontends: [tui, web]\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cfg2, err := LoadConfig(p2, true)

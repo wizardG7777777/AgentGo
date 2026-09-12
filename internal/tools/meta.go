@@ -18,8 +18,7 @@ import (
 )
 
 // TaskHolder 提供“当前正在执行的任务 ID”。
-// 用于 publish_task 在 Worker 模式下定位父任务、检查深度限制。
-// nil 时表示 Scheduler 语义（无父任务、无深度限制）。
+// 通信、检视与图工具用它取得当前调用的来源身份。
 type TaskHolder interface {
 	Get() string
 }
@@ -27,20 +26,13 @@ type TaskHolder interface {
 // RouteValidator is the runtime authority for task routing. Production
 // Scheduler and runners inject it so a catalog entry, stale event_type, or a
 // Team route owned by another request scope cannot create an invalid Task.
-// Isolated compatibility paths may leave it nil.
-//
-// CanRouteForPlan 的第一参数是命名空间化的路由归属 scope ID（legacy
-// controller 使用 task:<id>，Graph controller 使用 graph:<id>）；
-// 空串 = 全局。
+// CanRouteForPlan 第一参数是路由归属 scope ID；图使用 graph:<id>，空串为全局。
 type RouteValidator interface {
 	CanRouteForPlan(ownerScopeID, eventType string, requiredTools ...string) bool
 }
 
 // RouteCapabilityResolver 返回某个 owner scope 下，指定 route 的每个可认领
-// listener 都保证具备的工具集合。Graph acceptance 提交校验用它计算节点
-// capability 收窄后的实际工具面，结构性拒绝带写能力或 Shell 的 verifier。
-// AgentRegistry 实现本接口；只实现 RouteValidator 的旧测试替身仍可服务于
-// 非 acceptance 路由。
+// listener 都保证具备的工具集合，供节点 route 能力校验使用。
 type RouteCapabilityResolver interface {
 	RouteCapabilitiesForPlan(ownerScopeID, eventType string) ([]string, bool)
 }
@@ -48,37 +40,16 @@ type RouteCapabilityResolver interface {
 // RouteCapabilityEnvelopeResolver 返回某个 owner scope 下，指定 route 的任一
 // 可认领 listener **可能拥有**的工具并集。必需能力用上面的交集证明；禁止能力
 // / 正向闭集必须用并集证明，否则一个低权限 listener 会把另一个高权限
-// listener 的额外工具从交集中隐藏。Graph acceptance 在没有 per-node 精确收窄
-// 时要求本接口；AgentRegistry 实现它。
+// listener 的额外工具从交集中隐藏。AgentRegistry 实现此接口。
 type RouteCapabilityEnvelopeResolver interface {
 	RouteCapabilityEnvelopeForPlan(ownerScopeID, eventType string) ([]string, bool)
 }
 
-// CommunicationGroup 注册任务发布与代理间通信工具。
-//
-// 字段说明：
-//   - Store：任务存储；nil 时不注册 publish_task
-//   - Holder：当前任务持有器；nil = Scheduler 语义（无深度限制）；非 nil = Worker 语义
-//   - MaxDepth：仅 Holder != nil 时生效；publish_task 创建的子任务深度超过该值时拒绝
-//   - MBRegistry：邮箱注册表；nil 时不注册 send_message
-//   - AgentID：当前代理 ID（send_message 的发件人）
-//   - Interactions：通用结构化人机交互服务；nil 时不注册 request_user_input
-//   - SessionID：创建 Interaction 时读取当前 Session；切换 Session 不会重标旧请求
-//   - InteractionWaitHook：等待回答期间映射 waiting_interaction 状态
-//   - BatchTracker：（可选，Phase 3）publish_task 成功后追加子任务 ID 到此 tracker；
-//     scheduler 注入时把 ID 写入 scheduler task.SchedulerBatch；worker 不注入则无副作用
-//
-// 注：早期曾有 `DisablePublishTask bool` capability 位，用于让 Explorer 注入 Store/Holder
-// 的同时仍然不暴露 publish_task。Phase D（2026-04-26）删除 internal/explorer 后该字段
-// 失去全部调用方；v4 的 publish_task 准入完全由 runner 的 AllowedTools allowlist 过滤
-// 控制（`tool_profiles` / `agents[].tools`），故于 2026-04-26 一并移除——见 runner.go
-// 中 ToolRegistry 的 Filter 路径。
+// CommunicationGroup 注册信息传递及用户提问。Store/Holder 提供来源任务身份；
+// MBRegistry/Interactions 分别决定通信、用户提问入口是否可注册。
 type CommunicationGroup struct {
 	Store  store.TaskStore
 	Holder TaskHolder
-	// LineageHolder 只提供父任务身份，不启用 Worker 的深度限制。
-	// Scheduler 使用它把自己发布的 Task 关联到当前 controller 任务
-	// （ParentTaskID 谱系关联 + 路由归属 scope）。
 
 	MBRegistry          *mailbox.Registry
 	AgentID             string
@@ -86,16 +57,12 @@ type CommunicationGroup struct {
 	SessionID           func() string
 	InteractionWaitHook func(waiting bool)
 
-	// AllowNodeCapability 仅由内置装配注入（Scheduler 装配置 true）。
-	// 普通 Worker/Reactor 留零值，publish_task 据此拒绝它们经
-	// tools/model/isolation 参数改变节点的执行边界。
-
 	// EffectJournal 是 V6 §4 H2b 副作用账本（internal/effect）；
 	// nil 时 send_message 不记账（行为与引入账本前完全一致）。
 	EffectJournal *effect.Journal
 }
 
-// Register 把 publish_task / send_message / request_user_input 注册到 r。
+// Register 把 send_message / request_user_input 注册到 r。
 // 各自的依赖缺失时自动跳过对应工具。
 func (g CommunicationGroup) Register(r *agent.ToolRegistry) {
 	if g.MBRegistry != nil {
@@ -116,22 +83,12 @@ func (g CommunicationGroup) Register(r *agent.ToolRegistry) {
 		params["additionalProperties"] = false
 		r.Register(
 			"request_user_input",
-			"向用户提出一个结构化选择题并等待回答。该工具只返回用户选择，不替代 run_shell 的授权 Interaction，也不替代图审批（approval）节点。",
+			"向用户提出一个结构化选择题并等待回答。只返回用户选择，不授予 run_shell 执行权限，不创建或改变图节点。",
 			params,
 			g.requestUserInput,
 		)
 	}
 }
-
-// publishTask 统一实现 Worker / Scheduler 的任务发布逻辑。
-//
-//   - Holder == nil：Scheduler 模式，新任务 Depth=0，无深度限制
-//   - Holder != nil：Worker 模式，从当前任务读取 Depth，子任务 Depth=parent+1，
-//     超过 MaxDepth 时拒绝（childDepth > MaxDepth）
-
-// nodeCapabilityWarnings 对节点工具子集做伴生关系检查，返回软警告列表。
-// 只提示明显不自洽的组合，不拒绝——合法极简节点（纯 web_fetch 调查等）
-// 不应被误伤；执行类工具集是否够用的最终判定在认领侧（子集 ⊆ 白名单）。
 
 // sendMessage 是 worker.MakeSendMessageTool 的内联端口，避免循环依赖。
 //

@@ -62,7 +62,7 @@ func genSnapshot(t *rapid.T) Snapshot {
 		Mailboxes: mailboxes, ModelHistoryContract:
 
 		// genTaskSnapshot generates a random TaskSnapshot.
-		"agentgo.model-history/v1",
+		"agentgo.model-history/v2",
 	}
 }
 

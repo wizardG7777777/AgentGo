@@ -79,7 +79,7 @@ func TestWatchdogPendingGraceDefaultsAndYAMLDecode(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "watchdog.yaml")
-	data := []byte("graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\ninfra:\n  watchdog:\n    progress_heartbeat_grace_sec: 41\n    pending_alert_grace_sec: 17\n    unroutable_grace_sec: 29\n")
+	data := []byte("graph:\n  request_contract: agentgo.graph/v7\nllm:\n  request_contract: agentgo.model-request/v1\ninfra:\n  watchdog:\n    progress_heartbeat_grace_sec: 41\n    pending_alert_grace_sec: 17\n    unroutable_grace_sec: 29\n")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestValidateReasoningEffortRejectsUnknownValue(t *testing.T) {
 
 func TestLoadConfigDecodesStreamingRequestPolicy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "llm.yaml")
-	data := []byte("graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: gpt-test\n  protocol: chat_completions\n  reasoning_effort: high\n")
+	data := []byte("graph:\n  request_contract: agentgo.graph/v7\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: gpt-test\n  protocol: chat_completions\n  reasoning_effort: high\n")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestSessionRecoverySafetyDefaultsAndYAMLDecode(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "session.yaml")
-	data := []byte("graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\nsession_resume_max_idle_sec: 7200\nsession_snapshot_interval_sec: 15\n")
+	data := []byte("graph:\n  request_contract: agentgo.graph/v7\nllm:\n  request_contract: agentgo.model-request/v1\nsession_resume_max_idle_sec: 7200\nsession_snapshot_interval_sec: 15\n")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +373,7 @@ func TestSchedulerCompactThresholdRemovedWithMigrationDiagnostic(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "scheduler.yaml")
-	data := []byte("graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: test-model\nscheduler:\n  enforce_compact_token_threshold: 160000\n")
+	data := []byte("graph:\n  request_contract: agentgo.graph/v7\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: test-model\nscheduler:\n  enforce_compact_token_threshold: 160000\n")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -386,7 +386,7 @@ func TestSchedulerCompactThresholdRemovedWithMigrationDiagnostic(t *testing.T) {
 	}
 
 	modelOnlyPath := filepath.Join(t.TempDir(), "scheduler-model-only.yaml")
-	if err := os.WriteFile(modelOnlyPath, []byte("graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: test-model\nscheduler:\n  model: scheduler-model\n"), 0o600); err != nil {
+	if err := os.WriteFile(modelOnlyPath, []byte("graph:\n  request_contract: agentgo.graph/v7\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: test-model\nscheduler:\n  model: scheduler-model\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	modelOnly, err := LoadConfig(modelOnlyPath, true)
@@ -436,7 +436,7 @@ func TestValidate_AgentMaxLoopsMigrationDiagnostic(t *testing.T) {
 
 	t.Run("YAML 显式设置报错", func(t *testing.T) {
 		yamlPath := filepath.Join(t.TempDir(), "legacy.yaml")
-		data := []byte("graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: test-model\nscheduler:\n  agent_max_loops: 47\n")
+		data := []byte("graph:\n  request_contract: agentgo.graph/v7\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: test-model\nscheduler:\n  agent_max_loops: 47\n")
 		if err := os.WriteFile(yamlPath, data, 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -499,7 +499,7 @@ func TestValidate_ContextLimitMigrationDiagnostic(t *testing.T) {
 
 	t.Run("YAML 显式设置报错", func(t *testing.T) {
 		yamlPath := filepath.Join(t.TempDir(), "legacy.yaml")
-		data := []byte("graph:\n  request_contract: agentgo.graph/v6\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: test-model\nscheduler:\n  context_limit: 240000\n")
+		data := []byte("graph:\n  request_contract: agentgo.graph/v7\nllm:\n  request_contract: agentgo.model-request/v1\n  default_model: test-model\nscheduler:\n  context_limit: 240000\n")
 		if err := os.WriteFile(yamlPath, data, 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -606,7 +606,7 @@ func TestLoadConfig_HashlineEnabled_DefaultTrue(t *testing.T) {
 	path := filepath.Join(tmp, "cfg.yaml")
 	content := `
 graph:
-  request_contract: agentgo.graph/v6
+  request_contract: agentgo.graph/v7
 llm:
   request_contract: agentgo.model-request/v1
   base_url: http://example.com
@@ -649,7 +649,7 @@ func TestLoadConfig_HashlineEnabled_ExplicitFalse(t *testing.T) {
 	content := `
 hashline_enabled: false
 graph:
-  request_contract: agentgo.graph/v6
+  request_contract: agentgo.graph/v7
 llm:
   request_contract: agentgo.model-request/v1
   base_url: http://example.com
@@ -692,7 +692,7 @@ func TestLoadConfig_HashlineEnabled_ExplicitTrue(t *testing.T) {
 	content := `
 hashline_enabled: true
 graph:
-  request_contract: agentgo.graph/v6
+  request_contract: agentgo.graph/v7
 llm:
   request_contract: agentgo.model-request/v1
   base_url: http://example.com

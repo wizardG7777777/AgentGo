@@ -7,11 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strings"
 
 	"agentgo/internal/agent"
-	"agentgo/internal/contentstore"
-	"agentgo/internal/contextcontract"
 	"agentgo/internal/graph"
 	"agentgo/internal/model"
 	"agentgo/internal/store"
@@ -21,7 +18,6 @@ import (
 type InspectionGroup struct {
 	Tasks   store.TaskStore
 	Graphs  *graph.DataflowStore
-	Content *contentstore.Store
 	History interface {
 		GetToolCallHistory(string) []store.ToolCallRecord
 	}
@@ -32,7 +28,7 @@ type InspectionGroup struct {
 func (g InspectionGroup) Register(r *agent.ToolRegistry) {
 	r.Register("inspect_board", "查询当前 Run 的节点和任务运行概览，按 Agent/Graph 过滤。后续页携带 snapshot_digest；状态已变化时返回冲突。也可按 request_ref 检视图变更处理事实。",
 		nativeObject(map[string]any{"graph_id": nativeString("图过滤"), "agent_id": nativeString("执行者过滤"), "status": nativeString("任务状态过滤"), "offset": nativeInteger("分页起点"), "limit": nativeInteger("每页最多128项，默认32"), "snapshot_digest": nativeString("后续页必须提供前一页的快照摘要"), "request_ref": nativeString("图变更回执的 source_request")}), g.inspectBoard)
-	r.Register("inspect_node", "检视自己或当前 Run 中节点的状态、执行记录和结果。指定 task_id，或 graph_id/node_id 与可选 activation_id；多次执行需明确选择。完整事实保存为只读引用，由 read_evidence 分页读取。",
+	r.Register("inspect_node", "检视自己或当前 Run 中节点的状态、执行记录和结果。指定 task_id，或 graph_id/node_id 与可选 activation_id。尚未发布任务的节点也可检视其图定义、运行状态和等待原因。直接返回完整执行记录与最后回复，读取不创建正文引用。",
 		nativeObject(map[string]any{"task_id": nativeString("明确任务 ID；未提供选择条件时自查"), "graph_id": nativeString("图 ID"), "node_id": nativeString("节点 ID"), "activation_id": nativeString("指定执行实例"), "attempt_id": nativeString("指定当前 Attempt；旧 Attempt 不冒充当前结果")}), g.inspectNode)
 }
 
@@ -90,7 +86,6 @@ func (g InspectionGroup) inspectBoard(_ context.Context, args map[string]any) (s
 	}
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].ID < tasks[j].ID })
 	rows := []map[string]any{}
-	graphIDs := map[string]bool{}
 	for _, t := range tasks {
 		if !inspectionAllowed(c, t) || in.GraphID != "" && t.GraphID != in.GraphID || in.Status != "" && string(t.Status) != in.Status {
 			continue
@@ -107,23 +102,40 @@ func (g InspectionGroup) inspectBoard(_ context.Context, args map[string]any) (s
 			}
 		}
 		rows = append(rows, taskInspectionSummary(t))
-		if t.GraphID != "" {
-			graphIDs[t.GraphID] = true
-		}
 	}
 	graphs := []map[string]any{}
-	ids := make([]string, 0, len(graphIDs))
-	for id := range graphIDs {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
 	if g.Graphs != nil {
-		for _, id := range ids {
-			if d, ok, err := g.Graphs.Get(id); err != nil {
-				return "", err
-			} else if ok {
-				graphs = append(graphs, map[string]any{"graph_id": id, "revision": d.Definition.Revision, "state_version": d.StateVersion, "status": d.Status, "completion": d.Completion})
+		session := ""
+		if g.SessionID != nil {
+			session = g.SessionID()
+		}
+		states, err := g.Graphs.List(session)
+		if err != nil {
+			return "", err
+		}
+		for _, d := range states {
+			if c.RunID == "" || d.Definition.RunID != string(c.RunID) || in.GraphID != "" && d.Definition.GraphID != in.GraphID {
+				continue
 			}
+			if in.AgentID != "" {
+				matched := false
+				for _, row := range rows {
+					if row["graph_id"] == d.Definition.GraphID {
+						matched = true
+					}
+				}
+				if !matched {
+					continue
+				}
+			}
+			nodes := []map[string]any{}
+			for _, node := range d.Definition.Nodes {
+				row := graphNodeInspection(d, node)
+				if in.Status == "" || row["status"] == in.Status {
+					nodes = append(nodes, row)
+				}
+			}
+			graphs = append(graphs, map[string]any{"graph_id": d.Definition.GraphID, "revision": d.Definition.Revision, "state_version": d.StateVersion, "status": d.Status, "completion": d.Completion, "nodes": nodes})
 		}
 	}
 	raw, _ := json.Marshal(map[string]any{"tasks": rows, "graphs": graphs})
@@ -165,7 +177,7 @@ func (g InspectionGroup) inspectRequest(c *model.Task, ref string) (string, erro
 	return "", fmt.Errorf("当前范围没有该图请求")
 }
 
-func (g InspectionGroup) inspectNode(ctx context.Context, args map[string]any) (string, error) {
+func (g InspectionGroup) inspectNode(_ context.Context, args map[string]any) (string, error) {
 	c, err := g.actor()
 	if err != nil {
 		return "", err
@@ -198,6 +210,28 @@ func (g InspectionGroup) inspectNode(ctx context.Context, args map[string]any) (
 		matches = append(matches, t)
 	}
 	if len(matches) == 0 {
+		if in.TaskID == "" && g.Graphs != nil {
+			state, ok, err := g.Graphs.Get(in.GraphID)
+			if err != nil {
+				return "", err
+			}
+			if ok && c.RunID != "" && state.Definition.RunID == string(c.RunID) && (g.SessionID == nil || state.Definition.SessionID == g.SessionID()) {
+				for _, node := range state.Definition.Nodes {
+					if node.NodeID != in.NodeID {
+						continue
+					}
+					execution := state.Executions[node.NodeID]
+					if in.ActivationID != "" && execution.ActivationID != in.ActivationID || in.AttemptID != "" && execution.AttemptID != in.AttemptID {
+						return "", fmt.Errorf("指定执行身份与节点运行事实不一致")
+					}
+					detail := graphNodeInspection(state, node)
+					detail["task_available"] = false
+					detail["definition"] = node
+					detail["execution_records"] = []any{}
+					return marshalGraphAuthoringResult(detail)
+				}
+			}
+		}
 		return "", fmt.Errorf("未找到当前范围内的节点任务")
 	}
 	if len(matches) > 1 {
@@ -212,32 +246,50 @@ func (g InspectionGroup) inspectNode(ctx context.Context, args map[string]any) (
 	if in.AttemptID != "" && in.AttemptID != t.AttemptID {
 		return "", fmt.Errorf("指定 Attempt 非当前任务状态版本，不能用当前结果替代历史")
 	}
-	if g.Content == nil {
-		return "", fmt.Errorf("完整检视事实的内容存储未注入")
-	}
 	detail := taskInspectionSummary(t)
 	detail["results"], detail["artifacts"], detail["artifact_meta"] = t.Results, t.Artifacts, t.ArtifactMeta
 	detail["records_available"] = g.History != nil
+
+	detail["last_response"] = t.LastResponse
+	records := []map[string]any{}
 	if g.History != nil {
-		detail["tool_calls"] = g.History.GetToolCallHistory(t.ID)
+		for _, call := range g.History.GetToolCallHistory(t.ID) {
+			records = append(records, map[string]any{"kind": "tool_execution", "record": call})
+		}
 	}
-	raw, err := json.Marshal(detail)
-	if err != nil {
-		return "", err
+	if t.LastResponse != "" {
+		records = append(records, map[string]any{"kind": "final_response", "text": t.LastResponse})
 	}
-	sessionID := (EvidenceGroup{SessionID: g.SessionID}).contentRefSessionScope(c)
-	ref, err := g.Content.Put(ctx, contentstore.PutRequest{Content: raw, MediaType: "application/json", RetentionClass: contextcontract.RetentionTaskLifetime, Authority: contextcontract.AuthorityInformational, Scope: contentstore.Scope{Kind: contentstore.ScopeTask, SessionID: sessionID, GraphID: c.GraphID, TaskID: c.ID}})
-	if err != nil {
-		return "", err
+	detail["execution_records"] = records
+	if g.Graphs != nil && t.GraphID != "" {
+		state, ok, err := g.Graphs.Get(t.GraphID)
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			if value, exists := state.Results[t.NodeID]; exists {
+				detail["result_ref"] = value.Ref
+				detail["candidate_ref"] = value.CandidateRef
+				detail["node_result"] = value.Value
+				detail["plain_text"] = value.PlainText
+			}
+		}
 	}
-	result := taskInspectionSummary(t)
-	result["details_ref"] = ref.RefID
-	result["digest"] = ref.ContentDigest
-	result["result_available"] = len(t.Results) > 0
-	result["records_available"] = g.History != nil
-	result["summary"] = strings.TrimSpace(t.Description)
-	if text := []rune(result["summary"].(string)); len(text) > 600 {
-		result["summary"] = string(text[:600])
+	return marshalGraphAuthoringResult(detail)
+
+}
+
+// Graph 是尚未派发节点的事实权威；不为检视伪造 Task、Attempt 或节点结果。
+func graphNodeInspection(state graph.DataflowSnapshot, node graph.AgentTaskNode) map[string]any {
+	row := map[string]any{"graph_id": state.Definition.GraphID, "node_id": node.NodeID, "run_id": state.Definition.RunID, "session_id": state.Definition.SessionID, "revision": state.Definition.Revision, "state_version": state.StateVersion, "status": "not_dispatched"}
+	if execution, ok := state.Executions[node.NodeID]; ok {
+		row["status"] = execution.Status
+		row["waiting_reason"] = execution.WaitingReason
+		for key, value := range map[string]string{"task_id": execution.TaskID, "activation_id": execution.ActivationID, "attempt_id": execution.AttemptID, "outcome_ref": execution.OutcomeRef, "error": execution.Error} {
+			if value != "" {
+				row[key] = value
+			}
+		}
 	}
-	return marshalGraphAuthoringResult(result)
+	return row
 }

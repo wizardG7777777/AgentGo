@@ -52,7 +52,6 @@ func validSnapshot(t *testing.T) contextcontract.ContextSnapshot {
 		Scope: contextcontract.ScopeTask, Authority: contextcontract.AuthorityAuthoritative,
 		Freshness: contextcontract.FreshnessLive, InputDigest: digest("input"),
 		OutputDigest: digest("payload"), SerializedBytes: 7, EstimatedTokens: 2,
-		BudgetLimit:    contextcontract.Budget{SerializedBytes: 1024, EstimatedTokens: 256},
 		RetentionClass: contextcontract.RetentionTaskLifetime,
 		Disposition:    contextcontract.DispositionInline, WireID: "wire-1",
 	}
@@ -62,7 +61,7 @@ func validSnapshot(t *testing.T) contextcontract.ContextSnapshot {
 		PayloadDigest: digest("payload"),
 	}
 	snapshot := contextcontract.ContextSnapshot{
-		SnapshotID: "snapshot-1", Schema: contextcontract.SnapshotSchemaV2,
+		SnapshotID: "snapshot-1", Schema: contextcontract.SnapshotSchemaV3,
 		AttemptID: "attempt-1", InvocationID: "invocation-1", InstructionRef: "prompt-1",
 		ContextPolicyID: "context:default/v1", ContextPolicyDigest: digest("policy"),
 		ProviderReplayRef: "provider-replay:openai-compatible/v1",

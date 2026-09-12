@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"agentgo/internal/agent"
 	"agentgo/internal/graph"
 	"agentgo/internal/loopcontract"
 	"agentgo/internal/model"
@@ -38,6 +39,7 @@ func (a *dataflowOutcomeAuthority) build(intent store.TerminalOutcomeIntent) (ou
 		return outcome.TaskOutcome{}, err
 	}
 	value := graphTaskResult(t)
+	plainText := t.Results[agent.StructuredResultStorageKey] == ""
 	if t.GraphID != "" {
 		s, ok, err := a.graphs.Get(t.GraphID)
 		if err != nil {
@@ -50,7 +52,7 @@ func (a *dataflowOutcomeAuthority) build(intent store.TerminalOutcomeIntent) (ou
 		if !ok || exec.TaskID != t.ID || exec.ActivationID != t.ActivationID {
 			return outcome.TaskOutcome{}, fmt.Errorf("任务不属于已冻结的 agentTask 执行")
 		}
-		if status == outcome.StatusCompleted {
+		if status == outcome.StatusCompleted && !plainText {
 			if err := a.runtime.ValidateAgentTaskResult(t.GraphID, t.NodeID, value); err != nil {
 				return outcome.TaskOutcome{}, err
 			}
@@ -64,6 +66,10 @@ func (a *dataflowOutcomeAuthority) build(intent store.TerminalOutcomeIntent) (ou
 	if summary == "" {
 		summary = taskOutcomeSummary(t)
 	}
+	// 索引摘要有存储边界；普通结果的完整原文仍在 Result/TaskResults/LastResponse。
+	if len(summary) > outcome.SummaryMaxBytes {
+		summary, _ = boundedEvidenceValue(summary, outcome.SummaryMaxBytes/4)
+	}
 	candidate := ""
 	if t.GraphID != "" && status == outcome.StatusCompleted && a.freezeCandidate != nil {
 		candidate, err = a.freezeCandidate(t)
@@ -71,7 +77,7 @@ func (a *dataflowOutcomeAuthority) build(intent store.TerminalOutcomeIntent) (ou
 			return outcome.TaskOutcome{}, err
 		}
 	}
-	result := outcome.TaskOutcome{Schema: outcome.SchemaCurrent, RunID: t.RunID, GraphID: t.GraphID, NodeID: t.NodeID, ActivationID: t.ActivationID, TaskID: t.ID, AttemptID: t.AttemptID, AttemptNo: t.AttemptNo, Status: status, Summary: summary, Result: raw, TaskResults: cloneTaskResults(t.Results), CandidateRef: candidate, CommittedAt: t.CompletedAt}
+	result := outcome.TaskOutcome{PlainText: plainText, Schema: outcome.SchemaCurrent, RunID: t.RunID, GraphID: t.GraphID, NodeID: t.NodeID, ActivationID: t.ActivationID, TaskID: t.ID, AttemptID: t.AttemptID, AttemptNo: t.AttemptNo, Status: status, Summary: summary, Result: raw, TaskResults: cloneTaskResults(t.Results), CandidateRef: candidate, CommittedAt: t.CompletedAt}
 	if result.CommittedAt.IsZero() {
 		result.CommittedAt = time.Now().UTC()
 	}

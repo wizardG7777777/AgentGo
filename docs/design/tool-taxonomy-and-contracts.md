@@ -11,13 +11,13 @@
 | run_shell | 当前任务工作视图中的通用命令执行 | 接收 command/working_dir/timeout_sec 等执行参数，返回启动、退出状态和输出；记录 ShellExec 和文件差异，不生成 pytest 判题 |
 | read_file | 读取授权工作视图文件 | 路径及行范围，返回内容与版本信息；不能越过工作区/框架状态边界 |
 | apply_change | 文件创建、覆盖、精确替换 | operation=create/write/replace；路径、内容或替换参数，经同一版本、逻辑路径锁、写入和产物记录链 |
-| submit_task_result | 提交本 agentTask 的唯一结果 | summary、result、可选 blocked/blocked_reason；结果满足声明 schema 后进入 finalizing，后续工具被 fence |
+| submit_task_result | 提交本 agentTask 的唯一结果 | 可选结构化提交：summary、result、blocked/blocked_reason；结构化结果校验 schema；普通最终文本可直接结束并由运行时登记 |
 | read_graph_definition | 读取图结构、状态及能力目录 | 无 graph_id 读 route_ref/工具目录；指定图读取当前定义和版本，节点分页必须固定 revision |
 | apply_graph_change | 初建或增量修改同一图 | create 输入 objective/nodes；update 输入 graph_id/expected_revision/changes；内部机械校验和提交，无独立模型审批 |
 | control_graph | 图生命周期与图级交付 | start/cancel/complete；complete 选择真实 ResultRef/候选、核对结算并实际交付后写终态 |
 | request_replan | 向图外 Scheduler 登记规划请求 | request_id/reason；持久化请求事实，不直接修改图，不重开当前任务 |
 | inspect_board | 检视当前 Run 工作与图事实 | 按 Graph/Agent/状态过滤，分页核对 snapshot_digest；也可检查请求回执 |
-| inspect_node | 检视任务实例及其执行 | Task 或 Graph/Node 身份，返回状态、结果和完整事实引用 |
+| inspect_node | 检视任务实例及其执行 | Task 或 Graph/Node 身份，直接返回完整记录、最后回复和结果；尚无 Task 的节点返回 Graph 状态与等待原因 |
 | read_evidence | 解引用已授权的大内容和证据 | Ref 与字节范围；持续核对 Session/Run/Graph/Task 和 Lease，不把任意路径当 Ref |
 | send_message | Agent 间仅信息传递 | info/question/reply 和回复关联；不唤醒、不发布任务、不授予权限或修改图 |
 | request_user_input | 当前任务请求用户输入 | 经统一 Interaction 服务等待回答；不生成 approval 节点 |
@@ -56,7 +56,7 @@ control_graph(action=complete, graph_id, expected_revision, request_id,
 
 ## 4. 候选版本与交付
 
-文件修改首先进入当前任务视图，冻结成不可变候选。下游的工作基线由输入引用决定，多候选显式 workspace_input。普通检查任务不会因名称或角色得到特殊提交能力。
+文件修改首先进入当前任务视图，冻结成不可变候选。下游的工作基线由输入引用决定，同一谱系的多个候选由运行时选择唯一后继，独立分支明确拒绝隐式合并；模型不指定 workspace_input。普通检查任务不会因名称或角色得到特殊提交能力。
 
 complete 在图级串行提交选定候选：主根基线冲突拒绝覆盖，Effect unknown 不自动重放。Runtime 校验实际文件与回执，不替 Python 断言测试通过。
 
@@ -72,6 +72,6 @@ Team 初建使用 provision_agent_team(graph_request_id=R)，随后 apply_graph_
 
 删除覆盖旧 Graph 节点与分派、控制边、验收/审批/子图桥、强制 Proposal Acceptance、L4 intervention 投递链、旧结果字段和旧 /event 接口。保留并迁移的是工具/结果/证据身份、工作区、Effect 和唯一终态，不能用新 wrapper 保留旧入口。
 
-本地两协议二进制和 Team 场景已完成实际文件交付；真实 SWE automatic-options 完整通过：494 passed、28 行补丁、task_resolved=true。其它七题未据此宣称通过。Python 仍是测试输入身份、失败集合比较和正式判题的唯一权威。
+本地两协议二进制和 Team 场景已完成实际文件交付；2026-09-12 独立真实 Responses SSE Flask-8 完整复测为 8/8 成功，见 [本轮报告](../test-issues/2026-09-12-flask8-after-context-and-l3-fixes.md)。早期单题成绩保留在对应历史记录中。Python 仍是测试输入身份、失败集合比较和正式判题的唯一权威。
 
 失败反馈使用显式 node_outcome 输入引用已持久化终态事实；它与 node_result 成功业务结果分开。追加的诊断/修复仍为 agentTask，不是恢复控制节点。

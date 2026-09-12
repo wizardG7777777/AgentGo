@@ -13,16 +13,17 @@ import (
 )
 
 type AgentTaskExecution struct {
-	NodeID        string               `json:"node_id"`
-	ActivationID  string               `json:"activation_id"`
-	TaskID        string               `json:"task_id"`
-	Status        string               `json:"status"`
-	WaitingReason string               `json:"waiting_reason,omitempty"`
-	Definition    AgentTaskNode        `json:"definition"`
-	Inputs        FrozenDataflowInputs `json:"inputs"`
-	AttemptID     string               `json:"attempt_id,omitempty"`
-	OutcomeRef    string               `json:"outcome_ref,omitempty"`
-	Error         string               `json:"error,omitempty"`
+	NodeID             string               `json:"node_id"`
+	ActivationID       string               `json:"activation_id"`
+	TaskID             string               `json:"task_id"`
+	Status             string               `json:"status"`
+	WaitingReason      string               `json:"waiting_reason,omitempty"`
+	WaitingFingerprint string               `json:"waiting_fingerprint,omitempty"`
+	Definition         AgentTaskNode        `json:"definition"`
+	Inputs             FrozenDataflowInputs `json:"inputs"`
+	AttemptID          string               `json:"attempt_id,omitempty"`
+	OutcomeRef         string               `json:"outcome_ref,omitempty"`
+	Error              string               `json:"error,omitempty"`
 }
 
 type DataflowRequestReceipt struct {

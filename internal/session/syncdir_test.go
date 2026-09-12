@@ -44,7 +44,7 @@ func TestSyncDir_WritePathsStillCorrect(t *testing.T) {
 
 	// 2. SaveSnapshot
 	snapPath := filepath.Join(dir, "snapshot.json")
-	snap := &Snapshot{Version: currentSnapshotVersion, SavedAt: nowUTC(), ModelHistoryContract: "agentgo.model-history/v1"}
+	snap := &Snapshot{Version: currentSnapshotVersion, SavedAt: nowUTC(), ModelHistoryContract: "agentgo.model-history/v2"}
 	if err := SaveSnapshot(snapPath, snap); err != nil {
 		t.Fatalf("SaveSnapshot: %v", err)
 	}

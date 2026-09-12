@@ -14,8 +14,8 @@ import (
 	"agentgo/internal/runcontract"
 )
 
-const SchemaCurrent = "agentgo.task-outcome/v4"
-const TerminalIntentSchemaCurrent = "agentgo.terminal-intent/v2"
+const SchemaCurrent = "agentgo.task-outcome/v5"
+const TerminalIntentSchemaCurrent = "agentgo.terminal-intent/v3"
 
 const (
 	SummaryMaxBytes      = 32 << 10
@@ -84,6 +84,7 @@ type ArtifactFact struct {
 
 // TaskOutcome 是一次 Task/Activation 的唯一结构化终态。
 type TaskOutcome struct {
+	PlainText    bool              `json:"plain_text,omitempty"`
 	Schema       string            `json:"schema"`
 	RunID        runcontract.RunID `json:"run_id"`
 	GraphID      string            `json:"graph_id,omitempty"`

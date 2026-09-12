@@ -54,7 +54,7 @@ const schedulerCorePrompt = `
 先 read_graph_definition() 获取真实 route_ref 与工具目录，不要把 worker-1 等 Agent 名称当路由。默认工作队列为 default。无需模型审批或 Observation 报告。
 新请求 apply_graph_change(operation=create,request_id,definition={objective,nodes:[...]})，可以只有一个调查节点。节点含 node_id,kind=agentTask,title,objective,execution={route_ref,tools},result_schema={type:object,properties:{summary:{type:string}},required:[summary]}。不要捏造未来步骤或填写旧 contract。
 create 返回 graph_id/revision 后 control_graph(action=start,request_id,graph_id,expected_revision)。启动后让 Agent 执行，当前规划任务结束。
-收到 dataflow-state 事实时，在同一 graph_id 上 update/add 新实例。输入写为 inputs={槽名:{kind:node_result,node_id:来源实例}}；多个上游用不同槽。检查或返工必须引用原候选来源，不要检查旧主根。多个候选时 workspace_input 指定基线槽。
+收到 dataflow-state 事实时，在同一 graph_id 上 update/add 新实例。输入写为 inputs={槽名:{kind:node_result,node_id:来源实例}}；多个上游用不同槽。检查或返工必须引用原候选来源，不要检查旧主根。运行时自动从输入候选确定代码基线：同一谱系取后继版本，纯文本输入不作为代码版本；独立候选分支需要先整合，不能填写工作目录或基线槽。
 迭代通过新增 node_id，不重开或改写已执行任务。没有可执行后续时可以等待新信息；追加工作后 submit_task_result 结束本次规划，不在自己的调用中等待子任务。
 任务结果和候选是真实引用。用户目标完成后读取图结果，control_graph(action=complete,request_id,graph_id,expected_revision,outcome=success,summary,result_refs:[真实引用])；此步骤才提交代码并结束图，不需要特殊验收节点。失败历史如已被新实例替代，dispositions 写明处置。不能忽略在途工作。
 需要业务复核时添加普通 agentTask；复核结论是普通结果。图已终态时仅根据完成回执向用户提交最终答复，不再扩图。send_message 只传信息，不调度。
@@ -63,7 +63,7 @@ create 返回 graph_id/revision 后 control_graph(action=start,request_id,graph_
 func schedulerPromptForPhase(phase string) string {
 	switch phase {
 	case "agent:execution":
-		return "当前执行的是图中的业务节点，不是用户请求入口。按照本节点任务目标使用执行工具完成工作，再调用 submit_task_result。需要调整图时用 request_replan；不要自行建图。"
+		return "当前执行的是图中的业务节点，不是用户请求入口。按照本节点任务目标使用执行工具完成工作，最终纯文本即可结束，也可用 submit_task_result 交付结构化结果。需要调整图时用 request_replan；不要自行建图。"
 	case "scheduler:authoring":
 		return "本次负责创建并启动图。apply_graph_change 内部完成校验和提交，不直接执行节点业务。"
 	case "scheduler:coordination":
@@ -225,7 +225,7 @@ func New(
 		GetToolCallHistory(string) []store.ToolCallRecord
 	})
 	groups := []tools.ToolGroup{
-		tools.InspectionGroup{Tasks: s, Graphs: graphStore, Content: authoring.ContextRuntime.Content, History: historyView, Holder: holder, SessionID: interactionSessionID},
+		tools.InspectionGroup{Tasks: s, Graphs: graphStore, History: historyView, Holder: holder, SessionID: interactionSessionID},
 		readGroup,
 		tools.EvidenceGroup{
 			Graphs:       graphStore,

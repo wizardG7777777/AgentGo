@@ -18,7 +18,7 @@ func TestSaveSnapshot_CreatesFile(t *testing.T) {
 		SavedAt:   "2026-04-15T11:00:00Z",
 		Tasks:     []TaskSnapshot{},
 		Roster:    RosterSnapshot{Claims: []ClaimSnapshot{}},
-		Mailboxes: []MailboxSnapshot{}, ModelHistoryContract: "agentgo.model-history/v1",
+		Mailboxes: []MailboxSnapshot{}, ModelHistoryContract: "agentgo.model-history/v2",
 	}
 
 	if err := SaveSnapshot(path, snap); err != nil {
@@ -39,7 +39,7 @@ func TestSaveSnapshot_AtomicWrite_NoTmpLeftover(t *testing.T) {
 		SavedAt:   "2026-04-15T11:00:00Z",
 		Tasks:     []TaskSnapshot{},
 		Roster:    RosterSnapshot{Claims: []ClaimSnapshot{}},
-		Mailboxes: []MailboxSnapshot{}, ModelHistoryContract: "agentgo.model-history/v1",
+		Mailboxes: []MailboxSnapshot{}, ModelHistoryContract: "agentgo.model-history/v2",
 	}
 
 	if err := SaveSnapshot(path, snap); err != nil {
@@ -73,7 +73,7 @@ func TestSaveSnapshot_UTF8_TwoSpaceIndent(t *testing.T) {
 				{AgentID: "worker-1", FilePath: "config.go", ClaimedAt: "2026-04-15T10:31:00Z"},
 			},
 		},
-		Mailboxes: []MailboxSnapshot{}, ModelHistoryContract: "agentgo.model-history/v1",
+		Mailboxes: []MailboxSnapshot{}, ModelHistoryContract: "agentgo.model-history/v2",
 	}
 
 	if err := SaveSnapshot(path, snap); err != nil {
@@ -92,7 +92,7 @@ func TestSaveSnapshot_UTF8_TwoSpaceIndent(t *testing.T) {
 }
 
 func TestSaveSnapshot_InvalidPath(t *testing.T) {
-	snap := &Snapshot{Version: currentSnapshotVersion, SavedAt: "2026-04-15T11:00:00Z", ModelHistoryContract: "agentgo.model-history/v1"}
+	snap := &Snapshot{Version: currentSnapshotVersion, SavedAt: "2026-04-15T11:00:00Z", ModelHistoryContract: "agentgo.model-history/v2"}
 	err := SaveSnapshot("/nonexistent/dir/snapshot.json", snap)
 	if err == nil {
 		t.Fatal("expected error for invalid path")
@@ -155,7 +155,7 @@ func TestLoadSnapshot_Success(t *testing.T) {
 					},
 				},
 			},
-		}, ModelHistoryContract: "agentgo.model-history/v1",
+		}, ModelHistoryContract: "agentgo.model-history/v2",
 	}
 
 	if err := SaveSnapshot(path, original); err != nil {
@@ -306,7 +306,7 @@ func TestSaveLoadSnapshot_RoundTrip(t *testing.T) {
 			},
 		},
 		Roster:    RosterSnapshot{Claims: []ClaimSnapshot{}},
-		Mailboxes: []MailboxSnapshot{}, ModelHistoryContract: "agentgo.model-history/v1",
+		Mailboxes: []MailboxSnapshot{}, ModelHistoryContract: "agentgo.model-history/v2",
 	}
 
 	if err := SaveSnapshot(path, original); err != nil {
@@ -337,7 +337,7 @@ func TestSaveLoadSnapshot_EmptySnapshot(t *testing.T) {
 		SavedAt:   "2026-04-15T11:00:00Z",
 		Tasks:     []TaskSnapshot{},
 		Roster:    RosterSnapshot{Claims: []ClaimSnapshot{}},
-		Mailboxes: []MailboxSnapshot{}, ModelHistoryContract: "agentgo.model-history/v1",
+		Mailboxes: []MailboxSnapshot{}, ModelHistoryContract: "agentgo.model-history/v2",
 	}
 
 	if err := SaveSnapshot(path, original); err != nil {

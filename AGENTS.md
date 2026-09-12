@@ -23,7 +23,7 @@ AgentGo 是 Go 1.25 多 Agent 数据流图系统，模块 agentgo。Scheduler �
 - 初图可以只有调查任务，不要求完整成功路径或预先分配所有交付物。输入齐备且实际执行能力可用才派发；缺输入/执行者必须显示原因，不猜测或绕过授权。
 - Activation 冻结定义与输入。未激活节点可以修改/移除；已激活/已结束节点的变化用新实例。应用变更必须 CAS，request_id 不得换内容；同一 Run 只创建一张顶层图。
 - Scheduler 依据持久化图事件规划，业务节点仅提交结果/请求规划。没有进展轮数、新知识、强制 record 或独立 Proposal Acceptance 模型关卡。send_message 仍只传递信息。
-- ResultRef、候选和证据带完整来源。下游检查/修改必须使用输入候选，不能读取旧主根冒充候选。多候选显式 workspace_input，禁止取第一项或自动合并。
+- ResultRef、候选和证据带完整来源。下游检查/修改必须使用输入候选，不能读取旧主根冒充候选。工作基线由输入候选的实际谱系自动解析：同谱系取后继版本，独立分支明确拒绝任取或隐式合并；workspace_input 已退役。
 - complete 是图级动作：校验选定结果、在途结算和处置说明，冻结完成意图，提交必要文件，持久化回执后才成功。普通复核任务没有提交特权。
 - 候选版本不可变，新修改建立新版本。Shell 实际差异进入同一工作视图。主根基线冲突拒绝覆盖，Effect unknown 不自动重放；多文件提交不假称 OS 原子事务。
 - 不自动续跑历史 Session。新目录不读取旧图日志执行；历史磁盘保留，不编写迁移器，不重新解释旧 Trace。
@@ -44,7 +44,7 @@ AgentGo 是 Go 1.25 多 Agent 数据流图系统，模块 agentgo。Scheduler �
 - 旧 write_file/edit_file/run_check/record_observation_delta/submit_change_decision 等模型工具不恢复。
 - read_graph_definition 不带 graph_id 时提供能力目录；route_ref=default 表示默认队列，不是 Agent 名称。其他 route_ref 必须来自目录。
 - apply_graph_change(create/update) 只做机械校验和原子应用。运行图追加后自动调度，无需重新 start。control_graph 支持 start/cancel/complete。
-- submit_task_result 交付唯一 JSON 结果，进入 finalizing 后后续工具被 fence；无 event/verdict/cited_evidence 专属参数。业务复核结论可放普通 result 字段，不触发控制跳转。
+- agentTask 最终纯文本可正常结束并原样登记；可选 submit_task_result 交付结构化 JSON，进入 finalizing 后后续工具被 fence；无 event/verdict/cited_evidence 专属参数。业务复核结论可放普通 result 字段，不触发控制跳转。
 - request_replan 登记图规划事件；普通消息不唤醒、不创建 Task/Activation、不授予权限。
 - graph_input 是已声明输入的版本，不是旧瞬时事件。UI 的 ProvideGraphInput / Web /api/graphs/input 共用作用域与版本校验，旧 /event 入口退役。
 
@@ -52,18 +52,22 @@ AgentGo 是 Go 1.25 多 Agent 数据流图系统，模块 agentgo。Scheduler �
 
 | 域 | 当前版本 |
 |---|---|
-| L1 / L2 | model-request/v1、model-result/v1；context/v2、context:default/v11、provider-replay:openai-compatible/v5 |
-| 模型历史/输出 | model-history/v1、model-output/v1 |
-| Graph / Result / Completion | graph/v6、agent-task-result/v1、graph-completion/v1 |
-| TaskOutcome / TerminalIntent | task-outcome/v4、terminal-intent/v2 |
+| L1 / L2 | model-request/v1、model-result/v1；context/v3、context:default/v12、provider-replay:openai-compatible/v6 |
+| 模型历史/输出 | model-history/v2、model-output/v1 |
+| Graph / Result / Completion | graph/v7、agent-task-result/v2、graph-completion/v1 |
+| TaskOutcome / TerminalIntent | task-outcome/v5、terminal-intent/v3 |
 | Candidate / Delivery | candidate/v1、delivery/v2 |
 | Session / Lease | Session 8、execution-lease/v4 |
 | Run / Progress / Shell | run-contract/v3、progress-contract/v2、shell-execution/v2 |
 | SWE | swe-result/v5、swe-judge/v2；pytest-phase-report/v2、swe-test-execution/v1 |
 
-schema 带 agentgo. 前缀。文件必须显式声明 llm.request_contract=agentgo.model-request/v1 和 graph.request_contract=agentgo.graph/v6。llm.stream、observation_model、max_subtask_depth 等退役字段拒绝；不由默认配置填补必需的文件标识。两个协议 Responses/Chat Completions 都只使用 SSE，不自动切换或降级。
+schema 带 agentgo. 前缀。文件必须显式声明 llm.request_contract=agentgo.model-request/v1 和 graph.request_contract=agentgo.graph/v7。llm.stream、observation_model、max_subtask_depth 等退役字段拒绝；不由默认配置填补必需的文件标识。两个协议 Responses/Chat Completions 都只使用 SSE，不自动切换或降级。
 
-Graph 定义、运行、请求回执、输入及完成意图共用 `.agentgo/state/graphs-v6` 的摘要链日志，不另建影子 authoring/completion 账本。TaskOutcome、Loop、TaskMemory、Delivery 分别使用 task-outcomes-v3、loop-facts-v3、taskmem-v3、deliveries-v3。不可变候选在 `.agentgo/candidates-v1`。L2 和 run-usage 的未变目录保持原定义。
+Graph 定义、运行、请求回执、输入及完成意图共用 `.agentgo/state/graphs-v8` 的摘要链日志，不另建影子 authoring/completion 账本。TaskOutcome、Loop、TaskMemory、Delivery 分别使用 task-outcomes-v4、loop-facts-v3、taskmem-v3、deliveries-v3。不可变候选在 `.agentgo/candidates-v1`。L2 使用 context-snapshots-v3，启动探针使用 model-probes-v3；run-usage 目录不变。
+
+## 原文请求与普通文本结束
+
+按用户要求暂时停用模型正文引用替换：全部已有对话/工具历史原文装配，不做最少保留轮数、重复读摘要或片段/分区/原子组大小裁剪。read_file 重读仍返回正文，force_full 已退役；inspect_node 直接返回执行记录和最后回复。保留模型整体窗口、输出规格和协议原子完整性。SWE 模型上下文统一配置为 880000 tokens。见 [原文模式记录](docs/design/raw-context-and-plain-results.md) 与 [L3 接缝修复](docs/design/l3-workspace-seams.md)。
 
 ## 必须保留的执行与输出纪律
 
@@ -82,7 +86,7 @@ Graph 定义、运行、请求回执、输入及完成意图共用 `.agentgo/sta
 
 SWE Test Runner 唯一入口为 scripts/swe_test_runner/runner.py。四变量 SWE_API_KEY、SWE_BASE_URL、SWE_FAST_MODEL、SWE_FLAG_SHIP_MODEL 在副作用前检查，只列缺项。角色模型来自 setting.swe-flask.yaml；模型探针去重。真实命令、测试/源码/依赖身份、Flask 导入位置和 pytest 判题由 Python 负责，AgentGo 不恢复 CheckRecord。
 
-当前用户验收要求新编译程序至少完成一次完整真实 SWE。已验证 automatic-options：基线2失败，最终494通过、最终复核23行补丁、task_resolved=true；详细证据另存，不代表其余七题或所有模型已通过。当前执行目标遇推理服务429/500等HTTP错误或环境变量导致无法调用时停止并报告；不暴露凭据。
+2026-09-12 已用当前 Graph v7 / Context v12 二进制完成真实 Responses SSE Flask-8：8/8 修复成功，无新增测试失败、无未结算调用或超时强杀；业务模型调用 335 次。上一轮 Context v11 为 6/8。版本、完整日志和残余工具可用性问题见 [本轮报告](docs/test-issues/2026-09-12-flask8-after-context-and-l3-fixes.md) 与 KNOWN_ISSUES；通过不等于模型不会误调用工具。真实测试遇推理服务429/500等HTTP错误或必需变量问题仍须停止并报告，不暴露凭据。
 
 新测试与状态机边界优先用确定性测试及 testing/quick。并发域跑 race，CI 同时覆盖 Windows/Linux/macOS。修复同步更新 KNOWN_ISSUES；完成前提交删除/迁移/重写/新增对账。
 
@@ -106,6 +110,8 @@ AgentGo 同等支持 Windows / macOS / Linux。以下每一条都曾在生产坏
 ## 文件访问边界
 
 read_file/apply_change 的路径受 ProjectRoot/当前 workspace 和 pathutil 双重边界约束；框架内部状态不能通过业务路径读写。run_shell 的工作目录受同一边界约束，但命令正文仍有宿主 Shell 的能力，不能把“没有 Web 工具”当作没有网络或把“没有 apply_change”当作 Shell 只读。
+
+文件工具参数、read_file 文件头和 run_shell.working_dir 共用逻辑项目路径；执行时映射到任务副本。Git 项目的 Shell 副本必须拥有独立 index/refs/objects 和冻结输入基线，禁止共享宿主 .git 或向父目录发现仓库；副本 Git 提交不等于 Delivery。Shell 恢复/删除文件必须同步撤销旧 overlay 条目。实现为 workspace/snapshot_git.go、shell_root.go、dataflow.go 和 tools/shell.go、local_read.go。inspect_node/inspect_board 也必须从 Graph 权威展示未派发节点，不以“没有 Task”隐藏等待原因。
 
 启动期 YAML 的 system_prompt_file 允许绝对路径，以用户权限加载；这与运行时工具的授权边界不同。不要为单个运行时工具增加临时越界入口。
 

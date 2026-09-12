@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -14,11 +13,9 @@ import (
 )
 
 func compilerPolicy() contextcontract.ContextBudgetPolicy {
-	fragments := make(map[contextcontract.FragmentKind]contextcontract.FragmentBudgetRule)
+	fragments := make(map[contextcontract.FragmentKind]contextcontract.FragmentRuleSpec)
 	for _, kind := range contextcontract.KnownFragmentKinds() {
-		fragments[kind] = contextcontract.FragmentBudgetRule{
-			MaxSerializedBytes: 4096,
-			MaxEstimatedTokens: 1024,
+		fragments[kind] = contextcontract.FragmentRuleSpec{
 			AllowedDispositions: []contextcontract.Disposition{
 				contextcontract.DispositionInline,
 				contextcontract.DispositionRejected,
@@ -27,21 +24,14 @@ func compilerPolicy() contextcontract.ContextBudgetPolicy {
 			Priority:       10,
 		}
 	}
-	groups := make(map[contextcontract.AtomicGroupKind]contextcontract.AtomicGroupBudgetRule)
+	groups := make(map[contextcontract.AtomicGroupKind]contextcontract.AtomicGroupRuleSpec)
 	for _, kind := range contextcontract.KnownAtomicGroupKinds() {
-		groups[kind] = contextcontract.AtomicGroupBudgetRule{
-			MaxSerializedBytes: 8192,
-			MaxEstimatedTokens: 2048,
-		}
-	}
-	sections := make(map[contextcontract.ContextSection]contextcontract.Budget)
-	for _, section := range contextcontract.KnownContextSections() {
-		sections[section] = contextcontract.Budget{SerializedBytes: 16 << 10, EstimatedTokens: 4096}
+		groups[kind] = contextcontract.AtomicGroupRuleSpec{}
 	}
 	return contextcontract.ContextBudgetPolicy{
-		Schema: contextcontract.PolicySchemaV1, PolicyID: "compiler-test/v1", Version: 11,
+		Schema: contextcontract.PolicySchemaV2, PolicyID: "compiler-test/v1", Version: 12,
 		ModelClass: "test-model", FragmentRules: fragments,
-		AtomicGroupRules: groups, SectionBudgets: sections,
+		AtomicGroupRules:      groups,
 		SnapshotInputBudget:   contextcontract.Budget{SerializedBytes: 64 << 10, EstimatedTokens: 16 << 10},
 		CompletionReserve:     contextcontract.Budget{SerializedBytes: 16 << 10, EstimatedTokens: 4096},
 		AbsoluteWireByteLimit: 96 << 10, ModelContextWindow: &contextcontract.Budget{
@@ -98,7 +88,7 @@ func baseCompileInput() CompileInput {
 		BudgetPolicy: compilerPolicy(),
 		ReplayPolicy: contextcontract.ProviderReplayPolicy{
 			Schema:   contextcontract.ProviderReplaySchemaV1,
-			PolicyID: "replay-test/v1", Version: 5,
+			PolicyID: "replay-test/v1", Version: 6,
 			Fields: map[string]contextcontract.ReplayRequirement{},
 		},
 		Encoder: deterministicEncoder(nil),
@@ -159,196 +149,10 @@ func TestCompileInlineProducesSealedSnapshotAndRuntimePayload(t *testing.T) {
 	}
 }
 
-func TestCompilePreparedReferenceAndTombstone(t *testing.T) {
-	input := baseCompileInput()
-	refPayload := []byte(`{"result_ref":"graph-result:g1:a@1","summary":"有界摘要"}`)
-	refRule := input.BudgetPolicy.FragmentRules[contextcontract.FragmentUpstreamResult]
-	refRule.AllowedDispositions = []contextcontract.Disposition{
-		contextcontract.DispositionReferenced,
-		contextcontract.DispositionRejected,
-	}
-	refRule.TransformID = "upstream_result_ref/v1"
-	input.BudgetPolicy.FragmentRules[contextcontract.FragmentUpstreamResult] = refRule
-	input.Fragments = append(input.Fragments, PreparedFragment{
-		Fragment: contextcontract.ContextFragment{
-			FragmentID: "upstream", Kind: contextcontract.FragmentUpstreamResult,
-			Section: contextcontract.SectionUpstreamInputs, SourceRef: "graph-result:g1:a@1",
-			Scope: contextcontract.ScopeActivation, Authority: contextcontract.AuthorityInformational,
-			Freshness:       contextcontract.FreshnessSnapshot,
-			Digest:          contextcontract.DigestBytes([]byte(`{"large":"raw"}`)),
-			SerializedBytes: int64(len(refPayload)), EstimatedTokens: 20,
-			RetentionClass: contextcontract.RetentionTaskLifetime,
-			ContentRef:     "graph-result:g1:a@1", Disposition: contextcontract.DispositionReferenced,
-			TransformRef: "upstream_result_ref/v1",
-		},
-		WireKind: contextcontract.WireUserMessage, Payload: refPayload,
-	})
-
-	tombstonePayload := []byte(`{"tool_call_id":"call-1","content_ref":"content:tool-1","tombstone":true}`)
-	toolRule := input.BudgetPolicy.FragmentRules[contextcontract.FragmentToolResult]
-	toolRule.AllowedDispositions = []contextcontract.Disposition{
-		contextcontract.DispositionTombstoned,
-		contextcontract.DispositionRejected,
-	}
-	toolRule.TransformID = "tool_result_ref/v1"
-	input.BudgetPolicy.FragmentRules[contextcontract.FragmentToolResult] = toolRule
-	groupRule := input.BudgetPolicy.AtomicGroupRules[contextcontract.AtomicAssistantToolExchange]
-	groupRule.TransformIDs = []string{"tool_result_ref/v1"}
-	input.BudgetPolicy.AtomicGroupRules[contextcontract.AtomicAssistantToolExchange] = groupRule
-	input.ReplayPolicy.GroupTransforms = []contextcontract.ReplayTransform{{
-		GroupKind: contextcontract.AtomicAssistantToolExchange, TransformID: "tool_result_ref/v1",
-	}}
-	input.Fragments = append(input.Fragments, PreparedFragment{
-		Fragment: contextcontract.ContextFragment{
-			FragmentID: "tool-result", Kind: contextcontract.FragmentToolResult,
-			Section: contextcontract.SectionToolResults, SourceRef: "tool-result:call-1",
-			Scope: contextcontract.ScopeTurn, Authority: contextcontract.AuthorityInformational,
-			Freshness:       contextcontract.FreshnessLive,
-			Digest:          contextcontract.DigestBytes([]byte("原始工具结果")),
-			SerializedBytes: int64(len(tombstonePayload)), EstimatedTokens: 24,
-			RetentionClass: contextcontract.RetentionTaskLifetime,
-			ReplayGroupID:  "tool-exchange-1", ContentRef: "content:tool-1",
-			Disposition:  contextcontract.DispositionTombstoned,
-			TransformRef: "tool_result_ref/v1",
-		},
-		WireKind: contextcontract.WireToolMessage, Payload: tombstonePayload,
-	})
-	input.AtomicGroups = []contextcontract.ProtocolAtomicGroup{{
-		GroupID: "tool-exchange-1", GroupKind: contextcontract.AtomicAssistantToolExchange,
-		FragmentIDs: []string{"tool-result"}, ReplayPolicy: contextcontract.ReplayOptional,
-		TransformID: "tool_result_ref/v1",
-	}}
-
-	result, err := New().Compile(context.Background(), input)
-	if err != nil {
-		t.Fatalf("Compile reference/tombstone: %v", err)
-	}
-	if len(result.Snapshot.Fragments) != 3 || len(result.Snapshot.AtomicGroups) != 1 {
-		t.Fatalf("Snapshot records 不完整: %+v", result.Snapshot)
-	}
-	if result.Snapshot.Fragments[1].ContentRef != "graph-result:g1:a@1" ||
-		result.Snapshot.Fragments[2].Disposition != contextcontract.DispositionTombstoned {
-		t.Fatalf("ref/tombstone 元数据不正确: %+v", result.Snapshot.Fragments)
-	}
-}
-
-func TestCompileRecordsDroppedOptionalProviderFieldWithoutWireUsage(t *testing.T) {
-	input := baseCompileInput()
-	rule := input.BudgetPolicy.FragmentRules[contextcontract.FragmentAssistantReasoning]
-	rule.AllowedDispositions = append(rule.AllowedDispositions, contextcontract.DispositionDropped)
-	rule.RetentionClass = contextcontract.RetentionEphemeralRequest
-	input.BudgetPolicy.FragmentRules[contextcontract.FragmentAssistantReasoning] = rule
-	input.ReplayPolicy.Fields["reasoning"] = contextcontract.ReplayOptional
-	raw := bytes.Repeat([]byte("x"), int(rule.MaxSerializedBytes)+1)
-	input.Fragments = append(input.Fragments, PreparedFragment{
-		Fragment: contextcontract.ContextFragment{
-			FragmentID: "reasoning-dropped", Kind: contextcontract.FragmentAssistantReasoning,
-			Section: contextcontract.SectionConversationHistory, SourceRef: "turn:1/provider-extra:reasoning",
-			Scope: contextcontract.ScopeTurn, Authority: contextcontract.AuthorityInformational,
-			Freshness: contextcontract.FreshnessSnapshot, Digest: contextcontract.DigestBytes(raw),
-			SerializedBytes: int64(len(raw)), EstimatedTokens: rule.MaxEstimatedTokens + 1,
-			RetentionClass: contextcontract.RetentionEphemeralRequest,
-			Disposition:    contextcontract.DispositionDropped,
-		},
-		ProviderField: "reasoning",
-	})
-
-	result, err := New().Compile(context.Background(), input)
-	if err != nil {
-		t.Fatalf("Compile dropped optional provider field: %v", err)
-	}
-	if len(result.Snapshot.Fragments) != 2 || len(result.Snapshot.WireItems) != 1 {
-		t.Fatalf("dropped fragment 不应生成 wire: fragments=%d wires=%d",
-			len(result.Snapshot.Fragments), len(result.Snapshot.WireItems))
-	}
-	dropped := result.Snapshot.Fragments[1]
-	if dropped.Disposition != contextcontract.DispositionDropped || dropped.WireID != "" ||
-		dropped.OutputDigest != "" || dropped.SerializedBytes != int64(len(raw)) {
-		t.Fatalf("dropped provider record 错误: %+v", dropped)
-	}
-	if result.Snapshot.InputBudgetUsed != baseCompileInputUsage(t, input.Fragments[0]) {
-		t.Fatalf("dropped fragment 不得计入 wire usage: %+v", result.Snapshot.InputBudgetUsed)
-	}
-}
-
 func baseCompileInputUsage(t *testing.T, prepared PreparedFragment) contextcontract.BudgetUsage {
 	t.Helper()
 	return contextcontract.BudgetUsage{
 		SerializedBytes: int64(len(prepared.Payload)), EstimatedTokens: prepared.Fragment.EstimatedTokens,
-	}
-}
-
-func TestCompileBudgetFailuresAreLayered(t *testing.T) {
-	tests := []struct {
-		name   string
-		mutate func(*CompileInput)
-		want   contextcontract.AssemblyFailureReason
-	}{
-		{
-			name: "单项 hard cap",
-			mutate: func(input *CompileInput) {
-				rule := input.BudgetPolicy.FragmentRules[contextcontract.FragmentUserTask]
-				rule.MaxSerializedBytes = 1
-				input.BudgetPolicy.FragmentRules[contextcontract.FragmentUserTask] = rule
-			},
-			want: contextcontract.AssemblyFragmentLimitExceeded,
-		},
-		{
-			name: "原子组 hard cap",
-			mutate: func(input *CompileInput) {
-				input.Fragments[0].Fragment.ReplayGroupID = "group-1"
-				input.AtomicGroups = []contextcontract.ProtocolAtomicGroup{{
-					GroupID: "group-1", GroupKind: contextcontract.AtomicUserTaskContract,
-					FragmentIDs: []string{"task"}, ReplayPolicy: contextcontract.ReplayRequiredExact,
-				}}
-				rule := input.BudgetPolicy.AtomicGroupRules[contextcontract.AtomicUserTaskContract]
-				rule.MaxSerializedBytes = 1
-				input.BudgetPolicy.AtomicGroupRules[contextcontract.AtomicUserTaskContract] = rule
-			},
-			want: contextcontract.AssemblyAtomicGroupLimitExceeded,
-		},
-		{
-			name: "section budget",
-			mutate: func(input *CompileInput) {
-				input.BudgetPolicy.SectionBudgets[contextcontract.SectionTaskContract] =
-					contextcontract.Budget{SerializedBytes: 1, EstimatedTokens: 4096}
-			},
-			want: contextcontract.AssemblySectionBudgetExceeded,
-		},
-		{
-			name: "snapshot total budget",
-			mutate: func(input *CompileInput) {
-				input.BudgetPolicy.SnapshotInputBudget =
-					contextcontract.Budget{SerializedBytes: 1, EstimatedTokens: 4096}
-			},
-			want: contextcontract.AssemblySnapshotBudgetExceeded,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			input := baseCompileInput()
-			test.mutate(&input)
-			failure := compileFailure(t, New(), input)
-			if failure.Reason != test.want {
-				t.Fatalf("failure reason=%s，want=%s，detail=%s", failure.Reason, test.want, failure.Detail)
-			}
-		})
-	}
-}
-
-func TestCompileFragmentLimitFailureNamesSafeKindSectionAndBudgets(t *testing.T) {
-	input := baseCompileInput()
-	rule := input.BudgetPolicy.FragmentRules[contextcontract.FragmentUserTask]
-	rule.MaxSerializedBytes = 1
-	input.BudgetPolicy.FragmentRules[contextcontract.FragmentUserTask] = rule
-	failure := compileFailure(t, New(), input)
-	if failure.Reason != contextcontract.AssemblyFragmentLimitExceeded ||
-		failure.Section != contextcontract.SectionTaskContract ||
-		!strings.Contains(failure.Detail, "kind=user_task") ||
-		!strings.Contains(failure.Detail, "section=task_contract") ||
-		!strings.Contains(failure.Detail, "actual=") || !strings.Contains(failure.Detail, "limit=") {
-		t.Fatalf("fragment limit 诊断缺少安全定位事实: %+v", failure)
 	}
 }
 

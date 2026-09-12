@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from sse import decode_probe
-from runtime_audit import RESULT_SCHEMA, EvidenceReader, collect_runtime
+from runtime_audit import RESULT_SCHEMA, EvidenceReader, collect_runtime, audit_runtime
 from test_identity import input_identity, validate_import_origin, compare_failures
 
 import argparse
@@ -688,12 +688,13 @@ def fail_on_provider_http_error(project_root: Path, run_id: str) -> None:
 
 def monitor_run(base_url: str, token: str, process: subprocess.Popen, run_id: str, started_at: float,
                 timeout_sec: int, snapshot_path: str, poll_sec: int = 3,
-                terminal_grace_sec: int = 30, provider_trace_root: Path | None = None) -> dict:
-    candidate = ""
-    candidate_since = 0.0
+                provider_trace_root: Path | None = None) -> dict:
     last_projection = {}
     observed_activity = False
     identity_projection_seen = False
+    deadline_reached = False
+    completion_observed = False
+    settlement_verified = False
     while True:
         if provider_trace_root is not None:
             fail_on_provider_http_error(provider_trace_root, run_id)
@@ -703,10 +704,11 @@ def monitor_run(base_url: str, token: str, process: subprocess.Popen, run_id: st
         if process.poll() is not None:
             terminal = "process_exited"
             break
-        if elapsed >= timeout_sec:
-            terminal = "external_hard_kill"
-            break
+        deadline_reached = elapsed >= timeout_sec
+        completion_observed = False
+        settlement_verified = False
         try:
+            # 到达 deadline 也读取一次新快照；不能用上次观察或静默窗口决定失败。
             _, snapshot = http_json(base_url.rstrip("/") + "/api/snapshot", token, timeout=10)
             atomic_json(snapshot_path, snapshot)
             projection = project_snapshot(snapshot, run_id)
@@ -716,27 +718,36 @@ def monitor_run(base_url: str, token: str, process: subprocess.Popen, run_id: st
                 observed_activity = True
             next_candidate = ""
             if projection["graph_terminal"]:
-                # Graph terminal 不是进程收口：必须继续等待 final-report terminal。
-                # 旧版 30 秒后返回 incomplete 并 terminate_process，会在
-                # RunContract finalization reserve 内主动制造 processing Task 与
-                # active reservation。真正缺失只能由内部 fallback 或外部 hard
-                # deadline 裁决。
                 if projection["final_reports_terminal"] and projection["tasks_terminal"]:
                     next_candidate = "graph_terminal"
             elif projection["graph_count"] == 0 and projection["tasks_terminal"]:
                 next_candidate = "no_graph_terminal"
-            if next_candidate != candidate:
-                candidate = next_candidate
-                candidate_since = time.monotonic() if candidate else 0.0
-            if candidate and time.monotonic() - candidate_since >= terminal_grace_sec:
-                terminal = candidate
-                break
+            completion_observed = bool(next_candidate)
+            if next_candidate and provider_trace_root is not None:
+                audit = audit_runtime(snapshot, {"run_identity_visible": identity_projection_seen},
+                                      provider_trace_root, run_id, True)
+                checks = audit["architecture_checks"]
+                settlement_verified = (checks["execution_settled"] and checks["evidence_complete"]
+                                       and checks["task_outcomes_delivered"]
+                                       and (not projection["graph_count"] or checks["graph_completion_committed"])
+                                       and not audit["known_incidents"].get("success_without_delivery")
+                                       and not audit["known_incidents"].get("committed_delivery_incomplete"))
+                if settlement_verified:
+                    deadline_reached = max(0, int(time.time() - started_at)) >= timeout_sec
+                    terminal = next_candidate
+                    break
         except (OSError, urllib.error.URLError, json.JSONDecodeError):
             pass
+        if deadline_reached:
+            terminal = "external_hard_kill"
+            break
         time.sleep(poll_sec)
     return {
         "process_terminal": terminal,
         "external_hard_kill": terminal == "external_hard_kill",
+        "deadline_reached": deadline_reached,
+        "completion_observed": completion_observed,
+        "settlement_verified": settlement_verified,
         "wall_sec": max(0, int(time.time() - started_at)),
         "run_identity_visible": identity_projection_seen,
         "observed_activity": observed_activity,
@@ -817,6 +828,8 @@ def summarize_runs(runs_dir: str, batch_start: float) -> list[dict]:
             "llm_calls": int(metrics.get("model_calls") or 0),
             "patch_lines": int(judge.get("patch_lines") or 0),
             "external_hard_kill": bool(result.get("external_hard_kill")),
+            "deadline_reached": bool(result.get("deadline_reached")),
+            "settlement_verified": bool(result.get("settlement_verified")),
             "known_incidents": [name for name, value in (result.get("known_incidents") or {}).items() if value],
             "stale": stale,
         })
@@ -1457,10 +1470,11 @@ def run_task(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> d
             }, ensure_ascii=False))
             monitor = monitor_run(
                 base_url, token, process, contract["run_id"], started_at, timeout_sec,
-                str(run_dir / "snapshot.final.json"), poll_sec=3, terminal_grace_sec=30, provider_trace_root=worktree,
+                str(run_dir / "snapshot.final.json"), poll_sec=3, provider_trace_root=worktree,
             )
             atomic_json(run_dir / "monitor.json", monitor)
-            print("执行状态：Graph/进程监控终态 " + json.dumps(monitor, ensure_ascii=False))
+            print(f"执行状态：{monitor['process_terminal']}；deadline={monitor['deadline_reached']}；"
+                  f"任务终态已观察={monitor['completion_observed']}；持久化结算已核对={monitor['settlement_verified']}")
             try:
                 status, snapshot = http_json(base_url + "/api/snapshot", token)
                 if status == 200:
@@ -1706,7 +1720,9 @@ def print_summary(rows: list[dict]) -> None:
         if row["stale"]:
             flags.append("STALE")
         if row["external_hard_kill"]:
-            flags.append("HARD_KILL")
+            flags.append("TIMEOUT_UNSETTLED" if not row.get("settlement_verified") else "TIMEOUT_AFTER_SETTLEMENT")
+        elif row.get("deadline_reached"):
+            flags.append("SETTLED_AT_DEADLINE")
         if row["known_incidents"]:
             flags.append("INCIDENT=" + ",".join(row["known_incidents"]))
         if row.get("run_state") in {"infrastructure_error", "completed_with_infrastructure_error"}:

@@ -44,8 +44,6 @@ func TestBuildAgentRuntime_IdleThresholdFromGlobalConfig(t *testing.T) {
 	}
 }
 
-
-
 // writeTempPromptFile 是测试辅助：写一个最小 system prompt 文件并返回路径。
 func writeTempPromptFile(t *testing.T) string {
 	t.Helper()

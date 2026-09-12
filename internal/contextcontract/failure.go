@@ -9,14 +9,10 @@ type AssemblyFailureReason string
 
 const (
 	AssemblyInvalidContract                 AssemblyFailureReason = "invalid_contract"
-	AssemblyFragmentLimitExceeded           AssemblyFailureReason = "fragment_limit_exceeded"
-	AssemblyAtomicGroupLimitExceeded        AssemblyFailureReason = "atomic_group_limit_exceeded"
-	AssemblySectionBudgetExceeded           AssemblyFailureReason = "section_budget_exceeded"
 	AssemblySnapshotBudgetExceeded          AssemblyFailureReason = "snapshot_budget_exceeded"
 	AssemblyCompletionReserveUnavailable    AssemblyFailureReason = "completion_reserve_unavailable"
 	AssemblyUntransformableRequiredFragment AssemblyFailureReason = "untransformable_required_fragment"
 	AssemblyProviderReplayUnknown           AssemblyFailureReason = "provider_replay_unknown"
-	AssemblyToolSchemaTooLarge              AssemblyFailureReason = "tool_schema_too_large"
 	AssemblyContentRefUnavailable           AssemblyFailureReason = "content_ref_unavailable"
 	AssemblyWireEncodingFailed              AssemblyFailureReason = "wire_encoding_failed"
 	AssemblyNonDeterministicEncoding        AssemblyFailureReason = "non_deterministic_encoding"
@@ -24,11 +20,10 @@ const (
 
 func (r AssemblyFailureReason) Valid() bool {
 	switch r {
-	case AssemblyInvalidContract, AssemblyFragmentLimitExceeded,
-		AssemblyAtomicGroupLimitExceeded, AssemblySectionBudgetExceeded,
+	case AssemblyInvalidContract,
 		AssemblySnapshotBudgetExceeded, AssemblyCompletionReserveUnavailable,
 		AssemblyUntransformableRequiredFragment, AssemblyProviderReplayUnknown,
-		AssemblyToolSchemaTooLarge, AssemblyContentRefUnavailable,
+		AssemblyContentRefUnavailable,
 		AssemblyWireEncodingFailed, AssemblyNonDeterministicEncoding:
 		return true
 	default:

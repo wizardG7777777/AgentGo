@@ -64,6 +64,22 @@ func (mf *manifest) set(rel string, e manifestEntry) error {
 	return mf.persistLocked()
 }
 
+// remove 撤销已恢复到输入基线的 dirty entry，避免下一次同步复活旧写入。
+func (mf *manifest) remove(rel string) error {
+	mf.mu.Lock()
+	defer mf.mu.Unlock()
+	old, ok := mf.entries[rel]
+	if !ok {
+		return nil
+	}
+	delete(mf.entries, rel)
+	if err := mf.persistLocked(); err != nil {
+		mf.entries[rel] = old
+		return err
+	}
+	return nil
+}
+
 // snapshot 返回条目拷贝，调用方修改不影响内部状态。
 func (mf *manifest) snapshot() map[string]manifestEntry {
 	mf.mu.Lock()

@@ -198,11 +198,22 @@ func (v *View) CaptureShellChanges() error {
 	for path := range after {
 		paths[path] = true
 	}
+	for rel := range v.mf.snapshot() {
+		paths[filepath.ToSlash(rel)] = true
+	}
 	for path := range paths {
+		rel := filepath.FromSlash(path)
 		if before[path] == after[path] {
+			if _, dirty := v.mf.get(rel); dirty {
+				if err := os.Remove(filepath.Join(v.root, rel)); err != nil && !os.IsNotExist(err) {
+					return err
+				}
+				if err := v.mf.remove(rel); err != nil {
+					return err
+				}
+			}
 			continue
 		}
-		rel := filepath.FromSlash(path)
 		entry := manifestEntry{BaselineSHA256: before[path], New: before[path] == ""}
 		if old, ok := v.mf.get(rel); ok {
 			entry = old

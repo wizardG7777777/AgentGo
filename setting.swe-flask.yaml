@@ -1,5 +1,5 @@
 graph:
-  request_contract: agentgo.graph/v6
+  request_contract: agentgo.graph/v7
 
 # AgentGo SWE 评测专用配置（v4 schema）
 #
@@ -35,7 +35,7 @@ llm:
   default_model: "__FAST_MODEL__"
   protocol: "__PROTOCOL__"
   timeout_sec: 300
-  default_context_window_tokens: 1048576
+  default_context_window_tokens: 880000
   default_max_completion_tokens: 65536
   reasoning_effort: low
 

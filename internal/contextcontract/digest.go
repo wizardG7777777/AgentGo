@@ -54,21 +54,17 @@ func (p ContextBudgetPolicy) ComputeDigest() (string, error) {
 		return "", err
 	}
 	canonical := p
-	canonical.FragmentRules = make(map[FragmentKind]FragmentBudgetRule, len(p.FragmentRules))
+	canonical.FragmentRules = make(map[FragmentKind]FragmentRuleSpec, len(p.FragmentRules))
 	for kind, rule := range p.FragmentRules {
 		rule.AllowedDispositions = canonicalDispositions(rule.AllowedDispositions)
 		canonical.FragmentRules[kind] = rule
 	}
-	canonical.AtomicGroupRules = make(map[AtomicGroupKind]AtomicGroupBudgetRule, len(p.AtomicGroupRules))
+	canonical.AtomicGroupRules = make(map[AtomicGroupKind]AtomicGroupRuleSpec, len(p.AtomicGroupRules))
 	for kind, rule := range p.AtomicGroupRules {
 		rule.TransformIDs = canonicalStrings(rule.TransformIDs)
 		canonical.AtomicGroupRules[kind] = rule
 	}
-	canonical.SectionBudgets = make(map[ContextSection]Budget, len(p.SectionBudgets))
-	for section, budget := range p.SectionBudgets {
-		canonical.SectionBudgets[section] = budget
-	}
-	return StableDigest("agentgo.context-policy/v1", canonical)
+	return StableDigest("agentgo.context-policy/v2", canonical)
 }
 
 // ComputeDigest 返回 ProviderReplayPolicy 的稳定身份。

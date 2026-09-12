@@ -13,14 +13,8 @@ const (
 	OutputReplayMaxBytes          = 8 << 20
 	OutputRecentRecords           = 128
 	OutputDefaultSubscriberBuffer = 256
-	DependencyMemoryPerTaskRunes  = 800
-	DependencyMemoryTotalRunes    = 2400
-	SessionMemoryRecallEntries    = 8
-	SessionMemoryRecallRunes      = 1200
-	HistoryProjectionKeepRecent   = 3
-	HistoryProjectionSummaryRunes = 8 << 10
-	ContextDefaultCurrent         = "context:default/v11"
-	ReplayOpenAICompatibleCurrent = "provider-replay:openai-compatible/v5"
+	ContextDefaultCurrent         = "context:default/v12"
+	ReplayOpenAICompatibleCurrent = "provider-replay:openai-compatible/v6"
 
 	ProgressCodeChangeV1 = "progress:code-change/v1"
 	ProgressCodeChangeV2 = "progress:code-change/v2"
@@ -293,19 +287,15 @@ func cloneContextProfile(input ContextProfile) ContextProfile {
 		value := *input.Policy.ProtocolOverheadReserve
 		output.Policy.ProtocolOverheadReserve = &value
 	}
-	output.Policy.FragmentRules = make(map[contextcontract.FragmentKind]contextcontract.FragmentBudgetRule, len(input.Policy.FragmentRules))
+	output.Policy.FragmentRules = make(map[contextcontract.FragmentKind]contextcontract.FragmentRuleSpec, len(input.Policy.FragmentRules))
 	for kind, rule := range input.Policy.FragmentRules {
 		rule.AllowedDispositions = append([]contextcontract.Disposition(nil), rule.AllowedDispositions...)
 		output.Policy.FragmentRules[kind] = rule
 	}
-	output.Policy.AtomicGroupRules = make(map[contextcontract.AtomicGroupKind]contextcontract.AtomicGroupBudgetRule, len(input.Policy.AtomicGroupRules))
+	output.Policy.AtomicGroupRules = make(map[contextcontract.AtomicGroupKind]contextcontract.AtomicGroupRuleSpec, len(input.Policy.AtomicGroupRules))
 	for kind, rule := range input.Policy.AtomicGroupRules {
 		rule.TransformIDs = append([]string(nil), rule.TransformIDs...)
 		output.Policy.AtomicGroupRules[kind] = rule
-	}
-	output.Policy.SectionBudgets = make(map[contextcontract.ContextSection]contextcontract.Budget, len(input.Policy.SectionBudgets))
-	for section, budget := range input.Policy.SectionBudgets {
-		output.Policy.SectionBudgets[section] = budget
 	}
 	return output
 }

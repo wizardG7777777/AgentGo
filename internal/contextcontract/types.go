@@ -3,10 +3,10 @@ package contextcontract
 import "time"
 
 const (
-	// SnapshotSchemaV2 是新 Context Snapshot 的唯一 live schema。
-	SnapshotSchemaV2 = "agentgo.context/v2"
-	// PolicySchemaV1 标识 Context budget policy 的序列化版本。
-	PolicySchemaV1 = "agentgo.context-policy/v1"
+	// SnapshotSchemaV3 是新 Context Snapshot 的唯一 live schema。
+	SnapshotSchemaV3 = "agentgo.context/v3"
+	// PolicySchemaV2 标识 Context budget policy 的序列化版本。
+	PolicySchemaV2 = "agentgo.context-policy/v2"
 	// ProviderReplaySchemaV1 标识 provider replay policy 的序列化版本。
 	ProviderReplaySchemaV1 = "agentgo.provider-replay/v1"
 )
@@ -47,7 +47,6 @@ type ContextFragmentRecord struct {
 	OutputDigest     string         `json:"output_digest,omitempty"`
 	SerializedBytes  int64          `json:"serialized_bytes"`
 	EstimatedTokens  int64          `json:"estimated_tokens"`
-	BudgetLimit      Budget         `json:"budget_limit"`
 	RetentionClass   RetentionClass `json:"retention_class"`
 	Disposition      Disposition    `json:"disposition"`
 	TransformRef     string         `json:"transform_ref,omitempty"`
@@ -125,7 +124,6 @@ type ManifestItem struct {
 	OutputDigest     string         `json:"output_digest,omitempty"`
 	SerializedBytes  int64          `json:"serialized_bytes"`
 	EstimatedTokens  int64          `json:"estimated_tokens"`
-	BudgetLimit      Budget         `json:"budget_limit"`
 	Disposition      Disposition    `json:"disposition"`
 	TransformRef     string         `json:"transform_ref,omitempty"`
 	ContentRef       string         `json:"content_ref,omitempty"`
@@ -173,14 +171,14 @@ type ContextSnapshot struct {
 
 // Record 生成 ContextFragment 的正文无关投影。outputDigest、budget、groupID 和
 // wireID 来自编译结果，调用方不能从 Content 文本再次猜测。
-func (f ContextFragment) Record(outputDigest string, budget Budget, groupID, wireID string) ContextFragmentRecord {
+func (f ContextFragment) Record(outputDigest string, groupID, wireID string) ContextFragmentRecord {
 	return ContextFragmentRecord{
 		FragmentID: f.FragmentID, Kind: f.Kind, Section: f.Section,
 		SourceRef: f.SourceRef, Scope: f.Scope, Authority: f.Authority,
 		Freshness: f.Freshness, InputDigest: f.Digest, OutputDigest: outputDigest,
 		SerializedBytes: f.SerializedBytes, EstimatedTokens: f.EstimatedTokens,
-		BudgetLimit: budget, RetentionClass: f.RetentionClass,
-		Disposition: f.Disposition, TransformRef: f.TransformRef,
+		RetentionClass: f.RetentionClass,
+		Disposition:    f.Disposition, TransformRef: f.TransformRef,
 		ContentRef: f.ContentRef, ProjectionReason: f.ProjectionReason,
 		AtomicGroupID: groupID, WireID: wireID,
 	}
@@ -211,8 +209,8 @@ func ManifestItemFromRecord(r ContextFragmentRecord) ManifestItem {
 		SourceRef: r.SourceRef, Scope: r.Scope, Authority: r.Authority,
 		Freshness: r.Freshness, InputDigest: r.InputDigest,
 		OutputDigest: r.OutputDigest, SerializedBytes: r.SerializedBytes,
-		EstimatedTokens: r.EstimatedTokens, BudgetLimit: r.BudgetLimit,
-		Disposition: r.Disposition, TransformRef: r.TransformRef,
+		EstimatedTokens: r.EstimatedTokens,
+		Disposition:     r.Disposition, TransformRef: r.TransformRef,
 		ContentRef: r.ContentRef, ProjectionReason: r.ProjectionReason,
 		AtomicGroupID: r.AtomicGroupID, WireID: r.WireID,
 	}

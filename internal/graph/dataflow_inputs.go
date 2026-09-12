@@ -15,7 +15,7 @@ type FrozenDataflowInputs struct {
 
 // ResolveDataflowInputs 只解析数据，不执行模型/工具，也不修改结果来源。
 // 缺输入返回明确 waiting reason；坏引用/跨图结果返回错误。
-func ResolveDataflowInputs(def DataflowDefinition, nodeID string, results map[string]AgentTaskResult, external map[string]map[int64]DataflowInputValue, executions map[string]AgentTaskExecution) (FrozenDataflowInputs, string, error) {
+func ResolveDataflowInputs(def DataflowDefinition, nodeID string, results map[string]AgentTaskResult, external map[string]map[int64]DataflowInputValue, executions map[string]AgentTaskExecution, resolveCandidates func([]string) (string, error)) (FrozenDataflowInputs, string, error) {
 	var node *AgentTaskNode
 	for i := range def.Nodes {
 		if def.Nodes[i].NodeID == nodeID {
@@ -77,14 +77,18 @@ func ResolveDataflowInputs(def DataflowDefinition, nodeID string, results map[st
 			candidates[input.CandidateRef] = true
 		}
 	}
-	if node.WorkspaceInput != "" {
-		input := out.Values[node.WorkspaceInput]
-		if input.CandidateRef == "" {
-			return out, "", fmt.Errorf("workspace_input=%s 未提供候选版本", node.WorkspaceInput)
+	if len(candidates) > 1 {
+		if resolveCandidates == nil {
+			return out, "", fmt.Errorf("多候选的版本谱系解析组件未装配")
 		}
-		out.WorkspaceCandidateRef = input.CandidateRef
-	} else if len(candidates) > 1 {
-		return out, "", fmt.Errorf("多个候选版本必须显式声明 workspace_input")
+		ref, err := resolveCandidates(sortedDataflowKeys(candidates))
+		if err != nil {
+			return out, "", err
+		}
+		if !candidates[ref] {
+			return out, "", fmt.Errorf("工作基线必须是已绑定输入的候选")
+		}
+		out.WorkspaceCandidateRef = ref
 	} else {
 		for ref := range candidates {
 			out.WorkspaceCandidateRef = ref

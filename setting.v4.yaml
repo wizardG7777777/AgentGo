@@ -1,5 +1,5 @@
 graph:
-  request_contract: agentgo.graph/v6
+  request_contract: agentgo.graph/v7
 
 # 当前配置 schema v4 的最小多角色测试样例。
 # 需要 SWE_BASE_URL、SWE_API_KEY、SWE_FAST_MODEL、SWE_FLAG_SHIP_MODEL；不包含凭据。

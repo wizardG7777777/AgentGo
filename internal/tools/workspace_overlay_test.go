@@ -120,9 +120,47 @@ func TestReadFile_OverlayReadsCopy(t *testing.T) {
 	if ov.readCalls == 0 {
 		t.Fatal("read_file 未经 PathOverlayer.ReadPath 解析")
 	}
+	if !strings.Contains(out, "[file] "+mainPath) || strings.Contains(out, overlayDir) {
+		t.Fatalf("文件头必须回显可复用的逻辑路径: %s", out)
+	}
 	// 缓存键 = 解析后的物理路径：以副本路径 Get 必须命中。
 	if _, _, ok := g.Cache.Get(copyPath); !ok {
 		t.Fatal("FileStateCache 应以物理副本路径为键（Get 未命中）")
+	}
+}
+
+func TestShellLogicalSubdirectoryMapsToCandidate(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "sub"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	mgr := workspace.NewManager(root, nil)
+	view, err := mgr.MaterializeAgentTask("task-cwd", "graph-cwd", "run-cwd", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	swapper := workspace.NewSwapper(root)
+	restore := swapper.Activate(view)
+	defer restore()
+	group := ShellGroup{Workdir: swapper, ActiveViewer: swapper, Filter: shell.NewCommandFilter(nil, nil)}
+	command := "pwd"
+	if runtime.GOOS == "windows" {
+		command = "echo $PWD.Path"
+	}
+	snapshot, err := view.PrepareShellRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cwd := range []string{"sub", filepath.Join(root, "sub")} {
+		out, err := dispatchRunShell(context.Background(), group, map[string]any{"command": command, "working_dir": cwd})
+		if err != nil || !strings.Contains(strings.ToLower(out), strings.ToLower(filepath.Join(snapshot, "sub"))) {
+			t.Fatalf("逻辑 cwd 没有映射: %s %v", out, err)
+		}
+	}
+	for _, cwd := range []string{t.TempDir(), snapshot} {
+		if _, err := dispatchRunShell(context.Background(), group, map[string]any{"command": command, "working_dir": cwd}); err == nil {
+			t.Fatalf("非法 cwd 被接受: %s", cwd)
+		}
 	}
 }
 
@@ -352,12 +390,11 @@ func TestRunShell_DefaultWorkdirFollowsActiveView(t *testing.T) {
 		t.Fatalf("workspace Shell 必须看到完整项目树: out=%q err=%v", out, err)
 	}
 
-	// 隔离视图生效时，显式 working_dir 也只能位于该任务 workspace 内，
-	// 不能切回主根绕过隔离。
-	_, err = dispatchRunShell(context.Background(), group,
+	// 显式逻辑主根映射到同一副本，不会切回物理主根。
+	out, err = dispatchRunShell(context.Background(), group,
 		map[string]any{"command": cwdCmd, "working_dir": mainRoot})
-	if err == nil || !strings.Contains(err.Error(), "working_dir 被拒绝") {
-		t.Fatalf("隔离任务显式切回主根必须拒绝，实际 err=%v", err)
+	if err != nil || !containsFold(out, shellRoot) {
+		t.Fatalf("显式逻辑根没有映射到任务副本: %q %v", out, err)
 	}
 }
 

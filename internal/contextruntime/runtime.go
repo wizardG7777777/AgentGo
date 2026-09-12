@@ -74,11 +74,10 @@ type Input struct {
 
 // Compiled 只能由成功持久化的编译事务产生，不允许调用方绕过落盘门。
 type Compiled struct {
-	projected bool
-	request   llm.Request
-	snapshot  contextcontract.ContextSnapshot
-	policy    contextcontract.ContextBudgetPolicy
-	replay    contextcontract.ProviderReplayPolicy
+	request  llm.Request
+	snapshot contextcontract.ContextSnapshot
+	policy   contextcontract.ContextBudgetPolicy
+	replay   contextcontract.ProviderReplayPolicy
 }
 
 func (c Compiled) Request() llm.Request { return c.request }
@@ -107,18 +106,6 @@ func (r Runtime) Compile(ctx context.Context, input Input) (Compiled, error) {
 	if !ok {
 		return Compiled{}, fmt.Errorf("拒绝未知或退役 Replay policy")
 	}
-	scope := contentstore.Scope{Kind: contentstore.ScopeSession, SessionID: input.Identity.SessionID}
-	if input.Identity.TaskID != "" {
-		scope.Kind = contentstore.ScopeTask
-		scope.TaskID = input.Identity.TaskID
-		scope.GraphID = input.Identity.GraphID
-	}
-
-	history, projection, _, err := ProjectHistory(ctx, input.History, profile.Policy, replay.Policy.Version, input.Identity.AttemptID, r.Content, scope)
-	if err != nil {
-		return Compiled{}, err
-	}
-	input.History = history
 	if err := r.materializeInputs(ctx, &input); err != nil {
 		return Compiled{}, err
 	}
@@ -148,15 +135,10 @@ func (r Runtime) Compile(ctx context.Context, input Input) (Compiled, error) {
 		return Compiled{}, err
 	}
 	instructionRaw, _ := json.Marshal(input.Instructions)
-	var repository ContentRepository
-	if r.Content != nil {
-		repository = r.Content
-	}
 	parts, err := r.Assembler.Compile(ctx, CompileInput{Options: options, AttemptID: input.Identity.AttemptID, InvocationID: input.Identity.InvocationID,
 		InstructionRef: "instructions:" + contextcontract.DigestBytes(instructionRaw), ExecutionLeaseRef: input.ExecutionLeaseRef,
 		ParentSnapshotRef: input.ParentSnapshotRef, Conversation: conversation, ToolRouter: input.ToolRouter,
-		BudgetPolicy: profile.Policy, ReplayPolicy: replay.Policy, ReplayPolicyRef: replay.Ref,
-		ContentRepository: repository, ContentScope: scope, EphemeralExpiresAt: input.Deadline})
+		BudgetPolicy: profile.Policy, ReplayPolicy: replay.Policy, ReplayPolicyRef: replay.Ref})
 	if err != nil {
 		return Compiled{}, err
 	}
@@ -178,7 +160,7 @@ func (r Runtime) Compile(ctx context.Context, input Input) (Compiled, error) {
 	if _, err = r.Snapshots.Put(*parts.Snapshot); err != nil {
 		return Compiled{}, fmt.Errorf("保存 ContextSnapshot 失败: %w", err)
 	}
-	return Compiled{request: request, snapshot: *parts.Snapshot, policy: profile.Policy, replay: replay.Policy, projected: projection.Applied || projection.ReferencedFragments > 0}, nil
+	return Compiled{request: request, snapshot: *parts.Snapshot, policy: profile.Policy, replay: replay.Policy}, nil
 }
 
 func (r Runtime) InvokeCompiled(ctx context.Context, compiled Compiled, invoker llm.Invoker) (llm.Result, error) {
@@ -235,11 +217,7 @@ func (r Runtime) assemble(ctx context.Context, in Input) ([]ConversationItem, er
 			add(fmt.Sprintf("[%s] %s", k, in.Dependencies[k]), "user", "dependency:"+k, contextcontract.FragmentUpstreamResult, contextcontract.SectionUpstreamInputs, contextcontract.AuthorityInformational)
 		}
 		if r.TaskMemory != nil {
-			remaining := policycatalog.DependencyMemoryTotalRunes
 			for _, id := range keys {
-				if remaining <= 0 {
-					break
-				}
 				mem, err := r.TaskMemory.Load(id)
 				if err != nil {
 					return nil, err
@@ -247,8 +225,7 @@ func (r Runtime) assemble(ctx context.Context, in Input) ([]ConversationItem, er
 				if mem == nil {
 					continue
 				}
-				text := taskmem.Render(mem, min(remaining, policycatalog.DependencyMemoryPerTaskRunes))
-				remaining -= len([]rune(text))
+				text := taskmem.Render(mem, 0)
 				add(text, "user", "dependency-memory:"+id, contextcontract.FragmentUpstreamResult, contextcontract.SectionUpstreamInputs, contextcontract.AuthorityInformational)
 			}
 		}
@@ -277,7 +254,7 @@ func (r Runtime) assemble(ctx context.Context, in Input) ([]ConversationItem, er
 	}
 	for index, entry := range in.History {
 		if entry.ContextProjection != "" {
-			continue
+			return nil, fmt.Errorf("拒绝退役的历史投影标记")
 		}
 		source := fmt.Sprintf("history:%s:%d", in.Identity.AttemptID, index)
 		if entry.SystemNotice != "" {
@@ -318,5 +295,3 @@ func replayFields(replay *llm.ProtocolReplay) map[string]json.RawMessage {
 	}
 	return fields
 }
-
-func (c Compiled) Projected() bool { return c.projected }

@@ -12,7 +12,7 @@ import (
 )
 
 func requestFixture(protocol Protocol) RequestSpec {
-	return RequestSpec{Schema: RequestSchema, Identity: Identity{InvocationID: "调用一", SnapshotID: "快照一", ContextPolicyID: "context:default/v11", ToolRouterID: "工具一", OperationID: "操作一"}, Options: Options{Protocol: protocol, Model: "模型一", CapabilityDigest: "能力一", ProfileRef: "测试", ToolChoice: ToolChoice{Mode: ToolChoiceAuto}, OutputBudget: DefaultOutputBudget()}, Messages: []Message{{Role: "user", Content: "测试输入"}}}
+	return RequestSpec{Schema: RequestSchema, Identity: Identity{InvocationID: "调用一", SnapshotID: "快照一", ContextPolicyID: "context:default/v12", ToolRouterID: "工具一", OperationID: "操作一"}, Options: Options{Protocol: protocol, Model: "模型一", CapabilityDigest: "能力一", ProfileRef: "测试", ToolChoice: ToolChoice{Mode: ToolChoiceAuto}, OutputBudget: DefaultOutputBudget()}, Messages: []Message{{Role: "user", Content: "测试输入"}}}
 }
 
 func TestRequestSealsAllSemanticFields(t *testing.T) {

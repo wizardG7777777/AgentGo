@@ -177,7 +177,7 @@ func reservedWorkspaceRel(rel string) bool {
 		first = rel[:index]
 	}
 	return first == ownerFileName || first == ManifestFileName || first == baselineDirName ||
-		first == shellRootDirName || strings.HasPrefix(first, ".workspace-shell-build-")
+		first == shellRootDirName || first == dataflowBaseName || first == ".git" || strings.HasPrefix(first, ".workspace-shell-build-")
 }
 
 // mergeOne 合并单个文件：roster 非 nil 时对主根绝对路径先 TryClaim、

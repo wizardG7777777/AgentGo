@@ -35,8 +35,7 @@ func (g LocalReadGroup) Register(r *agent.ToolRegistry) {
 		schema.Object().
 			String("path", "文件路径", true).
 			Int("offset", "起始行号（1-based），可选；不传则从文件开头读", false).
-			Int("limit", "读取行数上限，可选；大文件建议分页。单次输出上限 64 Ki 字符，完整结果再由 L2 按 Context 压力决定 inline/ref", false).
-			Bool("force_full", "缓存命中时仍强制返回全文。默认 false：同一文件重复读取且内容未变时仅返回摘要+hash（请先回顾你的笔记），防止为相同内容重复支付 prompt", false).
+			Int("limit", "读取行数上限，可选；大文件建议分页。单次输出上限 64 Ki 字符，结果正文直接交付模型，不替换为引用", false).
 			Build(),
 		g.readFile,
 	)
@@ -78,6 +77,9 @@ func toInt(v any) (int, bool) {
 //
 // 这样可以减少 LLM 重复翻页和误判文件内容的情况。
 func (g LocalReadGroup) readFile(ctx context.Context, args map[string]any) (string, error) {
+	if _, retired := args["force_full"]; retired {
+		return "", fmt.Errorf("force_full 已退役；read_file 始终返回所选范围的正文")
+	}
 	path, _ := args["path"].(string)
 	if path == "" {
 		return "", fmt.Errorf("缺少 path 参数")
@@ -93,9 +95,10 @@ func (g LocalReadGroup) readFile(ctx context.Context, args map[string]any) (stri
 		}
 		path = validPath
 	}
+	logicalPath := path
 	// 按任务写时复制隔离：Workdir 同时实现 PathOverlayer 时（runner 装配的
 	// workspace.Swapper），把主根逻辑路径解析为物理读取位置——workspace 中
-	// 已有本任务写过的副本则读副本，否则穿透主根实时内容；无隔离时 passthrough
+	// 已有本任务写过的副本则读副本，否则读该视图的输入基线；无隔离时 passthrough
 	// （零开销）。path 在此之后即为物理路径，FileStateCache 的 Get/Put 统一以
 	// 它为键，保证读侧缓存键与写侧 Invalidate 键一致。
 	if ov, ok := g.Workdir.(PathOverlayer); ok {
@@ -105,29 +108,12 @@ func (g LocalReadGroup) readFile(ctx context.Context, args map[string]any) (stri
 	offset, hasOffset := toInt(args["offset"])
 	limit, hasLimit := toInt(args["limit"])
 
-	// 缓存命中检查（缓存的是完整格式化内容 + hash；切片参数不参与缓存键）
-	if g.Cache != nil && !hasOffset && !hasLimit {
-		if content, hash, ok := g.Cache.Get(path); ok {
-			// 闸 1（2026-07-22 分层记忆 v2）：命中即"文件未变"（Get 已做
-			// mtime+size 校验）。重复读取默认只回摘要+hash，引导模型回顾
-			// 自己的笔记/前次结果，防止为相同内容重复支付 prompt（实测
-			// explorer 重读率 72–87%）；确需全文用 force_full=true。
-			forceFull, _ := args["force_full"].(bool)
-			if !forceFull {
-				return formatReadCacheStub(path, hash), nil
-			}
-			// 缓存中存的是已经包含 content_hash 后缀的旧格式内容；
-			// 为了头部信息一致，从缓存读出后重新构造头部。
-			// 简化处理：缓存命中直接返回旧格式 + 简单头
-			if g.HashlineEnabled {
-				content = hashline.FormatHashLines(1, content)
-			}
-			return formatReadFileResult(path, content, hash, 1, -1, -1, false, ""), nil
-		}
-	}
-
 	data, err := os.ReadFile(path)
 	if err != nil {
+		// 物理位置只用于 I/O；模型必须能够把回显路径直接交给后续文件工具。
+		if pathErr, ok := err.(*os.PathError); ok {
+			err = &os.PathError{Op: pathErr.Op, Path: logicalPath, Err: pathErr.Err}
+		}
 		// §10 Did-You-Mean：路径不存在时，列父目录的 basename 作为候选。
 		// 不跨目录提示——避免 internal/foo/x.go 不存在时建议 cmd/bar/x.go 误导
 		// （详见 nextUpgrade_v4.md §10.4 read_file 候选构造范围）。
@@ -202,7 +188,7 @@ func (g LocalReadGroup) readFile(ctx context.Context, args map[string]any) (stri
 	if g.HashlineEnabled {
 		content = hashline.FormatHashLines(startLine, content)
 	}
-	return formatReadFileResult(path, content, hash, startLine, endLine, totalLines, truncated, crlfNote), nil
+	return formatReadFileResult(logicalPath, content, hash, startLine, endLine, totalLines, truncated, crlfNote), nil
 }
 
 // formatReadFileResult 构造 read_file 工具的标准输出格式。
@@ -233,22 +219,6 @@ func formatReadFileResult(path, content, hash string, startLine, endLine, totalL
 	sb.WriteString(hash)
 	sb.WriteString("\n---\n")
 	sb.WriteString(content)
-	return sb.String()
-}
-
-// formatReadCacheStub 构造缓存命中（文件未变）时的摘要响应（闸 1，
-// 2026-07-22 分层记忆 v2）。保持 [file]/[hash] 头部与正常响应同构，
-// 使下游按格式解析的逻辑（artifact 记录、ReadSet 等）不受影响；
-// 正文用取回指引替代全文，把"是否需要再付全文的 prompt"的决定权交给模型。
-func formatReadCacheStub(path, hash string) string {
-	var sb strings.Builder
-	sb.WriteString("[file] ")
-	sb.WriteString(path)
-	sb.WriteString(" (already read, unchanged)\n[hash] ")
-	sb.WriteString(hash)
-	sb.WriteString("\n---\n")
-	sb.WriteString("该文件此前已读取且内容未变（hash 一致）。请先回顾你在前文写的笔记或本次任务早些时候的 read_file 结果；")
-	sb.WriteString("若内容已被历史压缩清理且笔记不足，传 force_full=true 重新获取全文，或用 offset/limit 只读需要的区段。")
 	return sb.String()
 }
 

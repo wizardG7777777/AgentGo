@@ -29,12 +29,17 @@ type CandidateCommitter interface {
 	CommitCandidate(ctx context.Context, completionID, graphID, candidateRef string) (string, error)
 }
 
+type CandidateBaselineResolver interface {
+	ResolveCandidateBaseline(context.Context, string, string, []string) (string, error)
+}
+
 type DataflowRuntime struct {
-	suspended map[string]bool
-	Store     *DataflowStore
-	Board     AgentTaskBoard
-	Delivery  CandidateCommitter
-	mu        sync.Mutex
+	suspended  map[string]bool
+	Store      *DataflowStore
+	Board      AgentTaskBoard
+	Delivery   CandidateCommitter
+	Candidates CandidateBaselineResolver
+	mu         sync.Mutex
 	// 泵锁只串行派发，不阻止其它 goroutine 持久化任务终态。
 	steps map[string]*sync.Mutex
 }
@@ -316,7 +321,7 @@ func (r *DataflowRuntime) Start(ctx context.Context, id, requestID string, revis
 		}
 		ready := false
 		for _, node := range s.Definition.Nodes {
-			inputs, waiting, err := ResolveDataflowInputs(s.Definition, node.NodeID, s.Results, s.ExternalInputs, s.Executions)
+			inputs, waiting, err := r.resolveInputs(ctx, *s, node.NodeID)
 			if err != nil {
 				return err
 			}
@@ -397,7 +402,7 @@ func (r *DataflowRuntime) Step(ctx context.Context, id string) error {
 		if exec.ActivationID != "" && exec.Status != "dispatching" {
 			continue
 		}
-		inputs, waiting, inputErr := ResolveDataflowInputs(current.Definition, node.NodeID, current.Results, current.ExternalInputs, current.Executions)
+		inputs, waiting, inputErr := r.resolveInputs(ctx, current, node.NodeID)
 		if inputErr != nil {
 			waiting = "invalid_input:" + inputErr.Error()
 		}
@@ -408,6 +413,11 @@ func (r *DataflowRuntime) Step(ctx context.Context, id string) error {
 			}
 		}
 		if waiting != "" {
+			// 相同节点事实只登记一次，与其它节点事件及规划确认顺序无关。
+			fingerprint, err := waitingFingerprint(current, node, waiting)
+			if err != nil {
+				return err
+			}
 			_, err = r.Store.transact(id, func(s *DataflowSnapshot, _ bool) error {
 				if s.Status != "open" {
 					return nil
@@ -419,7 +429,10 @@ func (r *DataflowRuntime) Step(ctx context.Context, id string) error {
 				if old.ActivationID != "" {
 					return nil
 				}
-				s.Executions[node.NodeID] = AgentTaskExecution{NodeID: node.NodeID, Status: "waiting", WaitingReason: waiting}
+				if old.Status == "waiting" && old.WaitingFingerprint == fingerprint {
+					return nil
+				}
+				s.Executions[node.NodeID] = AgentTaskExecution{NodeID: node.NodeID, Status: "waiting", WaitingReason: waiting, WaitingFingerprint: fingerprint}
 				if inputErr != nil || strings.HasPrefix(waiting, "waiting_executor:") {
 					s.enqueuePlanning("execution_blocked", node.NodeID, waiting)
 				}
@@ -460,6 +473,9 @@ func (r *DataflowRuntime) Step(ctx context.Context, id string) error {
 		if err := r.Board.PublishAgentTask(ctx, dispatch); err != nil {
 			_, saveErr := r.Store.transact(id, func(s *DataflowSnapshot, _ bool) error {
 				old := s.Executions[node.NodeID]
+				if old.Error == err.Error() {
+					return nil
+				}
 				old.Error = err.Error()
 				s.Executions[node.NodeID] = old
 				s.enqueuePlanning("dispatch_failed", node.NodeID, err.Error())
@@ -507,4 +523,39 @@ func (r *DataflowRuntime) Step(ctx context.Context, id string) error {
 		return nil
 	})
 	return err
+}
+
+func (r *DataflowRuntime) resolveInputs(ctx context.Context, s DataflowSnapshot, nodeID string) (FrozenDataflowInputs, string, error) {
+	return ResolveDataflowInputs(s.Definition, nodeID, s.Results, s.ExternalInputs, s.Executions, func(refs []string) (string, error) {
+		if r.Candidates == nil {
+			return "", fmt.Errorf("多候选的版本谱系解析组件未装配")
+		}
+		return r.Candidates.ResolveCandidateBaseline(ctx, s.Definition.GraphID, s.Definition.RunID, refs)
+	})
+}
+
+func waitingFingerprint(s DataflowSnapshot, node AgentTaskNode, reason string) (string, error) {
+	// 只覆盖本节点的定义和直接输入事实；无关图 revision/事件不改变等待事实。
+	sources := map[string]any{}
+	for slot, input := range node.Inputs {
+		switch input.Kind {
+		case "node_result":
+			if value, ok := s.Results[input.NodeID]; ok {
+				sources[slot] = value.Ref
+			}
+		case "node_outcome":
+			if value, ok := s.Executions[input.NodeID]; ok {
+				sources[slot] = value.OutcomeRef
+			}
+		case "graph_input":
+			if value, ok := s.ExternalInputs[input.Port][input.Version]; ok {
+				sources[slot] = []string{value.Ref, value.CandidateRef}
+			}
+		}
+	}
+	return dataflowDigest(struct {
+		Node    AgentTaskNode
+		Reason  string
+		Sources map[string]any
+	}{node, reason, sources})
 }

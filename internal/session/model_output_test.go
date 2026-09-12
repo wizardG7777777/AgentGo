@@ -40,7 +40,7 @@ func TestModelOutputPersistsCurrentResultAndRejectsOldLedger(t *testing.T) {
 
 func TestOldSessionSnapshotIsRejectedWithoutMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "snapshot.json")
-	raw := []byte(`{"version":5,"model_history_contract":"agentgo.model-history/v1","tasks":[]}`)
+	raw := []byte(`{"version":5,"model_history_contract":"agentgo.model-history/v2","tasks":[]}`)
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}

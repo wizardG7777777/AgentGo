@@ -106,7 +106,7 @@ func rejectRuntimeStateWrite(absPath, projectRoot string) error {
 // Register 只注册 apply_change，不保留旧写入工具别名。
 func (g LocalWriteGroup) Register(r *agent.ToolRegistry) {
 	params := schema.Object().
-		String("path", "项目相对文件路径", true).
+		String("path", "相对 project_root 的文件路径或其内部绝对路径，与 read_file 和 run_shell 的逻辑路径一致；不填写内部 workspace 路径", true).
 		Enum("operation", "write=创建或覆盖，create=仅新建，replace=精确替换；省略时由 content 或 old_str 确定", []string{"write", "create", "replace"}, false).
 		String("content", "创建或覆盖后的完整文件内容，可以为空字符串", false).
 		String("old_str", "精确替换的原文，必须唯一匹配", false).

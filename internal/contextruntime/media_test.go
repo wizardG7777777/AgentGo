@@ -55,9 +55,6 @@ func TestMediaUsesSeparateBudgetAndPreservesWholeContent(t *testing.T) {
 						t.Fatal("二进制被误当普通文本估算")
 					}
 				}
-				if fragment.Kind == contextcontract.FragmentPromptComponent && fragment.BudgetLimit.SerializedBytes != 64<<10 {
-					t.Fatal("媒体扩大了普通 Prompt cap")
-				}
 			}
 			if !found {
 				t.Fatal("缺少独立媒体预算分区")

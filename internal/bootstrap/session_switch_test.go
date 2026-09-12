@@ -792,7 +792,7 @@ func TestRebuildFrozenWorkspaceExemptions(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		snap := &session.Snapshot{ModelHistoryContract: "agentgo.model-history/v1", Version: 8, Tasks: tasks}
+		snap := &session.Snapshot{ModelHistoryContract: "agentgo.model-history/v2", Version: 8, Tasks: tasks}
 		if err := session.SaveSnapshot(filepath.Join(dir, "snapshot.json"), snap); err != nil {
 			t.Fatal(err)
 		}

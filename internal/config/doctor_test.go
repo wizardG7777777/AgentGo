@@ -217,7 +217,7 @@ func TestDoctor_LoadValidateDoctorEndToEnd(t *testing.T) {
 	yamlPath := filepath.Join(dir, "setting.yaml")
 	yamlContent := `
 graph:
-  request_contract: agentgo.graph/v6
+  request_contract: agentgo.graph/v7
 llm:
   request_contract: agentgo.model-request/v1
   default_model: test-model
@@ -267,7 +267,7 @@ func TestDoctorCLI_ExitCodes(t *testing.T) {
 		t.Helper()
 		content := `
 graph:
-  request_contract: agentgo.graph/v6
+  request_contract: agentgo.graph/v7
 llm:
   request_contract: agentgo.model-request/v1
   default_model: test-model

@@ -7,6 +7,7 @@ import (
 )
 
 type AgentTaskTerminal struct {
+	PlainText    bool            `json:"plain_text,omitempty"`
 	Evidence     []EvidenceEntry `json:"evidence,omitempty"`
 	TaskID       string          `json:"task_id"`
 	AttemptID    string          `json:"attempt_id"`
@@ -89,10 +90,10 @@ func (r *DataflowRuntime) RecordTerminal(ctx context.Context, graphID, nodeID st
 			return fmt.Errorf("图已终结，不可追加节点终态")
 		}
 		if fact.Status == "completed" {
-			if err := validateDataflowValue(exec.Definition.ResultSchema, fact.Value); err != nil {
+			if err := validateTerminalValue(exec.Definition.ResultSchema, fact); err != nil {
 				return fmt.Errorf("节点 %s 结果不满足契约: %w", nodeID, err)
 			}
-			value := AgentTaskResult{Schema: AgentTaskResultSchema, RunID: s.Definition.RunID, GraphID: graphID, NodeID: nodeID, TaskID: exec.TaskID, ActivationID: exec.ActivationID, AttemptID: fact.AttemptID, Value: fact.Value, CandidateRef: fact.CandidateRef, Evidence: fact.Evidence, EvidenceRefs: fact.EvidenceRefs}
+			value := AgentTaskResult{PlainText: fact.PlainText, Schema: AgentTaskResultSchema, RunID: s.Definition.RunID, GraphID: graphID, NodeID: nodeID, TaskID: exec.TaskID, ActivationID: exec.ActivationID, AttemptID: fact.AttemptID, Value: fact.Value, CandidateRef: fact.CandidateRef, Evidence: fact.Evidence, EvidenceRefs: fact.EvidenceRefs}
 			digest, err := dataflowDigest(value)
 			if err != nil {
 				return err
@@ -383,4 +384,16 @@ func settleDataflowCancellation(s *DataflowSnapshot) {
 	s.Status = "cancelled"
 	s.Completion.Status = "committed"
 	s.enqueuePlanning("graph_terminal", "", "cancelled")
+}
+
+// 普通文本只要求完整正文；结构化提交仍校验节点声明的 schema。
+func validateTerminalValue(schema map[string]any, fact AgentTaskTerminal) error {
+	if fact.PlainText {
+		text, ok := fact.Value["summary"].(string)
+		if !ok || strings.TrimSpace(text) == "" || len(fact.Value) != 1 {
+			return fmt.Errorf("普通文本结果缺少唯一 summary 正文")
+		}
+		return nil
+	}
+	return validateDataflowValue(schema, fact.Value)
 }

@@ -524,7 +524,7 @@ func (sm *SessionManager) SaveSnapshotFull(ts []TaskSnapshot, rs RosterSnapshot,
 
 	snap := &Snapshot{
 		Version:              currentSnapshotVersion,
-		ModelHistoryContract: "agentgo.model-history/v1",
+		ModelHistoryContract: "agentgo.model-history/v2",
 		SavedAt:              nowUTC(),
 		Tasks:                ts,
 		Roster:               rs,

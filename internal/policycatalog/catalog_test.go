@@ -11,7 +11,6 @@ import (
 	"agentgo/internal/loopcontract"
 )
 
-
 func TestDefaultCatalogValidAndResolvesGraphPolicies(t *testing.T) {
 	catalog, err := NewDefault()
 	if err != nil {
@@ -51,16 +50,15 @@ func TestDefaultContextAndReplayPoliciesAreVersionedAndClosed(t *testing.T) {
 	if !ok {
 		t.Fatal("未找到默认 Context policy")
 	}
-	if contextProfile.Policy.Schema != contextcontract.PolicySchemaV1 ||
-		contextProfile.Policy.Version != 11 || contextProfile.Digest == "" {
+	if contextProfile.Policy.Schema != contextcontract.PolicySchemaV2 ||
+		contextProfile.Policy.Version != 12 || contextProfile.Digest == "" {
 		t.Fatalf("Context profile 身份不完整: %+v", contextProfile)
 	}
 	if contextProfile.ReplayPolicyRef != ReplayOpenAICompatibleCurrent {
 		t.Fatalf("Context profile replay ref=%q", contextProfile.ReplayPolicyRef)
 	}
 	if len(contextProfile.Policy.FragmentRules) != len(contextcontract.KnownFragmentKinds()) ||
-		len(contextProfile.Policy.AtomicGroupRules) != len(contextcontract.KnownAtomicGroupKinds()) ||
-		len(contextProfile.Policy.SectionBudgets) != len(contextcontract.KnownContextSections()) {
+		len(contextProfile.Policy.AtomicGroupRules) != len(contextcontract.KnownAtomicGroupKinds()) {
 		t.Fatal("默认 Context policy 未完整覆盖封闭词表")
 	}
 
@@ -136,13 +134,12 @@ func TestLookupsReturnDeepCopies(t *testing.T) {
 
 	contextProfile, _ := catalog.ContextPolicy(ContextDefaultCurrent)
 	rule := contextProfile.Policy.FragmentRules[contextcontract.FragmentUserTask]
-	rule.MaxSerializedBytes = 1
+	rule.Priority = 1
 	rule.AllowedDispositions[0] = contextcontract.DispositionRejected
 	contextProfile.Policy.FragmentRules[contextcontract.FragmentUserTask] = rule
-	contextProfile.Policy.SectionBudgets[contextcontract.SectionSystem] = contextcontract.Budget{}
 	freshContext, _ := catalog.ContextPolicy(ContextDefaultCurrent)
-	if freshContext.Policy.FragmentRules[contextcontract.FragmentUserTask].MaxSerializedBytes == 1 ||
-		freshContext.Policy.SectionBudgets[contextcontract.SectionSystem].SerializedBytes == 0 {
+	if freshContext.Policy.FragmentRules[contextcontract.FragmentUserTask].Priority == 1 ||
+		freshContext.Policy.FragmentRules[contextcontract.FragmentUserTask].AllowedDispositions[0] != contextcontract.DispositionInline {
 		t.Fatal("调用方修改 Context lookup 污染 catalog")
 	}
 
@@ -196,14 +193,14 @@ func TestCatalogDigestsStableAndSemanticChangesVisible(t *testing.T) {
 
 	policy := leftContext.Policy
 	rule := policy.FragmentRules[contextcontract.FragmentToolResult]
-	rule.MaxSerializedBytes++
+	rule.Priority++
 	policy.FragmentRules[contextcontract.FragmentToolResult] = rule
 	changed, err := policy.ComputeDigest()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if changed == leftContext.Digest {
-		t.Fatal("Context hard cap 变化必须改变 digest")
+		t.Fatal("Context 语义变化必须改变 digest")
 	}
 }
 

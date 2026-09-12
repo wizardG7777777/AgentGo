@@ -1,5 +1,5 @@
 graph:
-  request_contract: agentgo.graph/v6
+  request_contract: agentgo.graph/v7
 
 # 四类工具并发测试配置。连接和模型通过进程环境注入，不在文件保存密钥。
 llm:

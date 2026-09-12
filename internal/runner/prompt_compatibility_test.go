@@ -25,12 +25,12 @@ func TestValidatePromptCompatibilityGatesRunnerConstruction(t *testing.T) {
 		SystemPrompt: strings.Repeat("策", 15<<10),
 	}
 	if err := ValidatePromptCompatibility(context.Background(), runtime, deps); err != nil {
-		t.Fatalf("合法 v10 bounded Prompt 不应阻断 Runner: %v", err)
+		t.Fatalf("模型整体容量内的 Prompt 不应阻断 Runner: %v", err)
 	}
-	runtime.SystemPrompt = strings.Repeat("策", 18<<10)
+	runtime.SystemPrompt = strings.Repeat("策", 1_100_000)
 	err = ValidatePromptCompatibility(context.Background(), runtime, deps)
 	if err == nil || !strings.Contains(err.Error(), "Prompt/Context 契约预检失败") ||
-		!strings.Contains(err.Error(), "fragment_limit_exceeded") {
+		!strings.Contains(err.Error(), "snapshot_budget_exceeded") {
 		t.Fatalf("超限 Prompt 必须在 Runner 构造前失败并保留 L2 原因: %v", err)
 	}
 }

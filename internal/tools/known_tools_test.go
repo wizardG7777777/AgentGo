@@ -1,7 +1,9 @@
 package tools
 
 import (
+	"encoding/json"
 	"sort"
+	"strings"
 	"testing"
 
 	"agentgo/internal/agent"
@@ -16,11 +18,9 @@ import (
 // 全部 ToolGroup 并注册到 r（F7）。各 Group 的 nil-skip 规则对应关系：
 //   - LocalReadGroup / LocalWriteGroup / ShellGroup：无 skip 规则，全量注册
 //   - WebGroup：Provider 非 nil 才注册（fakeSearchProvider）
-//   - CommunicationGroup：publish_task 需 Store、send_message 需 MBRegistry
+//   - CommunicationGroup：send_message 需 MBRegistry，用户提问需 Interactions
 //   - PlanControlGroup：Store / Holder 非 nil 才注册（request_replan 恒注册）；
 //     submit_task_result 另需 FinalizationNotifier + SubmitState 提交通道注入
-//   - SchedulerGroup：Store 非 nil 注册 cancel_task/probe_directory，
-//     Holder 非 nil 才补 get_task_result/report_done/report_progress
 //   - AgentTemplateGroup：list 需 Catalog，provision 另需
 //     Provisioner / Store / Holder
 //   - GraphControlGroup：无 skip 规则，无条件注册（nil 依赖调用时报错）
@@ -64,6 +64,22 @@ func registerAllGroupsFully(t *testing.T, r *agent.ToolRegistry) {
 		// 错误），全量并集守护按零依赖装配即可。
 		GraphAuthoringGroup{},
 	)
+}
+
+func TestRegisteredSchemasDoNotAdvertiseRetiredTools(t *testing.T) {
+	r := agent.NewToolRegistry()
+	registerAllGroupsFully(t, r)
+	for _, def := range r.Defs() {
+		raw, err := json.Marshal(def)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, retired := range []string{"write_file", "edit_file", "list_dir", "grep_search", "glob_search", "publish_task", "run_check", "submit_change_decision", "record_observation", "submit_proposal_verdict", "report_done", "图内 controller", "approval）节点", "force_full", "workspace_input"} {
+			if strings.Contains(string(raw), retired) {
+				t.Errorf("工具 %s 的实际 schema 仍宣传退役能力 %s", def.Name, retired)
+			}
+		}
+	}
 }
 
 // TestAllToolNames_UnionMatchesAllGroups 是 F7 的全量守护：AllToolNames 是手工

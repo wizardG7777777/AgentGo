@@ -49,7 +49,7 @@ func (r Runtime) materializeInputs(ctx context.Context, in *Input) error {
 	return nil
 }
 
-// mediaBudget 在独立媒体分区计费，不扩大普通 Prompt/历史片段上限。
+// mediaBudget 识别媒体并检查声明的模型能力，不创建局部分区限额。
 func mediaBudget(conversation []ConversationItem, options llm.Options, policy *contextcontract.ContextBudgetPolicy) ([]ConversationItem, error) {
 	out := append([]ConversationItem(nil), conversation...)
 	var tokens int64
@@ -87,8 +87,5 @@ func mediaBudget(conversation []ConversationItem, options llm.Options, policy *c
 	if tokens > policy.SnapshotInputBudget.EstimatedTokens {
 		return nil, fmt.Errorf("媒体 token 预算超过当前 Context")
 	}
-	bytes := cap.MaxTotalBytes*4/3 + 4096
-	policy.FragmentRules[contextcontract.FragmentUserMedia] = contextcontract.FragmentBudgetRule{MaxSerializedBytes: bytes, MaxEstimatedTokens: tokens, AllowedDispositions: []contextcontract.Disposition{contextcontract.DispositionInline, contextcontract.DispositionRejected}, RetentionClass: contextcontract.RetentionEphemeralRequest, Priority: 100}
-	policy.SectionBudgets[contextcontract.SectionInputMedia] = contextcontract.Budget{SerializedBytes: bytes, EstimatedTokens: tokens}
 	return out, nil
 }

@@ -1,5 +1,5 @@
 graph:
-  request_contract: agentgo.graph/v6
+  request_contract: agentgo.graph/v7
 
 # AgentGo v5 配置文件示例
 # 将此文件复制为 config.yaml（或任意路径，通过 -config 指定）并按需修改。

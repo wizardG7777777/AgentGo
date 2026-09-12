@@ -100,25 +100,6 @@ func prepareProviderExtra(input CompileInput, turnID string, messageIndex int, k
 				fmt.Errorf("policy 缺少 %s rule", kind))
 	}
 	tokens := estimateTokens(input, payload)
-	disposition := contextcontract.DispositionInline
-	projectionReason := ""
-	if exceedsRule(payload, tokens, rule) {
-		if requirement == contextcontract.ReplayOptional {
-			disposition = contextcontract.DispositionDropped
-			{
-				projectionReason = "optional_replay_limit_dropped"
-			}
-		} else {
-			failure := adapterFailure(input, contextcontract.AssemblyFragmentLimitExceeded, fragmentID,
-				fmt.Errorf("provider field=%s requirement=%s 超出下一轮 replay hard cap", key, requirement))
-			failure.Actual = contextcontract.BudgetUsage{SerializedBytes: int64(len(payload)), EstimatedTokens: tokens}
-			failure.Limit = contextcontract.Budget{SerializedBytes: rule.MaxSerializedBytes, EstimatedTokens: rule.MaxEstimatedTokens}
-			failure.Detail = fmt.Sprintf(
-				"provider field=%s requirement=%s actual=%dB/%dt limit=%dB/%dt 超出下一轮 replay hard cap",
-				key, requirement, len(payload), tokens, rule.MaxSerializedBytes, rule.MaxEstimatedTokens)
-			return contextcompiler.PreparedFragment{}, requirement, failure
-		}
-	}
 	fragment := contextcontract.ContextFragment{
 		FragmentID: fragmentID, Kind: kind,
 		Section:   contextcontract.SectionConversationHistory,
@@ -127,10 +108,10 @@ func prepareProviderExtra(input CompileInput, turnID string, messageIndex int, k
 		Freshness: contextcontract.FreshnessSnapshot,
 		Digest:    contextcontract.DigestBytes(payload), SerializedBytes: int64(len(payload)),
 		EstimatedTokens: tokens, RetentionClass: rule.RetentionClass,
-		Disposition: disposition, ProjectionReason: projectionReason,
+		Disposition: contextcontract.DispositionInline,
 	}
 	prepared := contextcompiler.PreparedFragment{Fragment: fragment, ProviderField: key}
-	if disposition.EmitsWire() {
+	if fragment.Disposition.EmitsWire() {
 		prepared.Fragment.Content = payload
 		prepared.WireKind = contextcontract.WireProviderExtra
 		prepared.Payload = payload
@@ -169,30 +150,6 @@ func deriveInvocationOutputBudget(policy contextcontract.ContextBudgetPolicy,
 	}
 	if reserve := policy.CompletionReserve; reserve.EstimatedTokens > 0 && reserve.EstimatedTokens < budget.MaxCompletionTokens {
 		budget.MaxCompletionTokens = reserve.EstimatedTokens
-	}
-	budget.MaxExtraFieldBytesByName = make(map[string]int64)
-	for field, requirement := range replay.Fields {
-		if requirement != contextcontract.ReplayRequiredExact {
-			continue
-		}
-		kind := providerFieldFragmentKind(replay.Version, field)
-		if kind == "" {
-			kind = contextcontract.FragmentAssistantExtraField
-		}
-		rule, ok := policy.FragmentRule(kind)
-		if !ok || rule.MaxSerializedBytes <= 0 {
-			continue
-		}
-		// 为 envelope 字段名、message index 与 JSON 结构保留 1 KiB；最终
-		// Response commit gate 仍用真实编码做精确证明。
-		limit := rule.MaxSerializedBytes - (1 << 10)
-		if limit <= 0 {
-			limit = rule.MaxSerializedBytes
-		}
-		if limit > budget.MaxExtraFieldBytes {
-			limit = budget.MaxExtraFieldBytes
-		}
-		budget.MaxExtraFieldBytesByName[field] = limit
 	}
 	return budget
 }

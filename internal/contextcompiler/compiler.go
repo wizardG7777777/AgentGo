@@ -94,7 +94,6 @@ func (c *Compiler) Compile(ctx context.Context, input CompileInput) (CompileResu
 
 	wires := make([]contextcontract.WireItem, 0, len(input.Fragments))
 	records := make([]contextcontract.ContextFragmentRecord, 0, len(input.Fragments))
-	sectionUsage := make(map[contextcontract.ContextSection]contextcontract.BudgetUsage)
 	totalUsage := contextcontract.BudgetUsage{}
 
 	for index, prepared := range input.Fragments {
@@ -115,20 +114,12 @@ func (c *Compiler) Compile(ctx context.Context, input CompileInput) (CompileResu
 			return CompileResult{}, failure
 		}
 		if reason, err := validatePreparedFragment(prepared, rule); err != nil {
-			if reason == contextcontract.AssemblyFragmentLimitExceeded &&
-				fragment.Kind == contextcontract.FragmentToolDefinition {
-				reason = contextcontract.AssemblyToolSchemaTooLarge
-			}
 			failure := assemblyFailure(input, reason, err, err.Error())
 			failure.FragmentID = fragment.FragmentID
 			failure.Section = fragment.Section
 			failure.Actual = contextcontract.BudgetUsage{
 				SerializedBytes: int64(len(prepared.Payload)),
 				EstimatedTokens: fragment.EstimatedTokens,
-			}
-			failure.Limit = contextcontract.Budget{
-				SerializedBytes: rule.MaxSerializedBytes,
-				EstimatedTokens: rule.MaxEstimatedTokens,
 			}
 			return CompileResult{}, failure
 		}
@@ -142,10 +133,7 @@ func (c *Compiler) Compile(ctx context.Context, input CompileInput) (CompileResu
 			return CompileResult{}, failure
 		}
 		if !fragment.Disposition.EmitsWire() {
-			records = append(records, fragment.Record("", contextcontract.Budget{
-				SerializedBytes: rule.MaxSerializedBytes,
-				EstimatedTokens: rule.MaxEstimatedTokens,
-			}, "", ""))
+			records = append(records, fragment.Record("", "", ""))
 			continue
 		}
 		if !wireKindCompatible(fragment.Kind, prepared.WireKind) {
@@ -179,23 +167,13 @@ func (c *Compiler) Compile(ctx context.Context, input CompileInput) (CompileResu
 		if group != nil {
 			groupID = group.GroupID
 		}
-		records = append(records, fragment.Record(outputDigest, contextcontract.Budget{
-			SerializedBytes: rule.MaxSerializedBytes,
-			EstimatedTokens: rule.MaxEstimatedTokens,
-		}, groupID, wireID))
+		records = append(records, fragment.Record(outputDigest, groupID, wireID))
 
 		usage := contextcontract.BudgetUsage{
 			SerializedBytes: wire.SerializedBytes,
 			EstimatedTokens: wire.EstimatedTokens,
 		}
-		updated, addErr := addUsage(sectionUsage[fragment.Section], usage)
-		if addErr != nil {
-			failure := assemblyFailure(input, contextcontract.AssemblySectionBudgetExceeded, addErr, addErr.Error())
-			failure.FragmentID = fragment.FragmentID
-			failure.Section = fragment.Section
-			return CompileResult{}, failure
-		}
-		sectionUsage[fragment.Section] = updated
+		var addErr error
 		totalUsage, addErr = addUsage(totalUsage, usage)
 		if addErr != nil {
 			failure := assemblyFailure(input, contextcontract.AssemblySnapshotBudgetExceeded, addErr, addErr.Error())
@@ -204,10 +182,7 @@ func (c *Compiler) Compile(ctx context.Context, input CompileInput) (CompileResu
 		}
 	}
 
-	if err := enforceAtomicGroupBudgets(input, groups, preparedByID); err != nil {
-		return CompileResult{}, err
-	}
-	if err := enforceSectionBudgets(input, sectionUsage); err != nil {
+	if err := validateAtomicGroupRules(input, groups); err != nil {
 		return CompileResult{}, err
 	}
 	if !totalUsage.Fits(input.BudgetPolicy.SnapshotInputBudget) {
@@ -277,7 +252,7 @@ func (c *Compiler) Compile(ctx context.Context, input CompileInput) (CompileResu
 		now = time.Now()
 	}
 	snapshot := &contextcontract.ContextSnapshot{
-		SnapshotID: snapshotID, Schema: contextcontract.SnapshotSchemaV2,
+		SnapshotID: snapshotID, Schema: contextcontract.SnapshotSchemaV3,
 		AttemptID: input.AttemptID, InvocationID: input.InvocationID,
 		InstructionRef:  input.InstructionRef,
 		ContextPolicyID: input.BudgetPolicy.PolicyID, ContextPolicyDigest: policyDigest,
@@ -354,7 +329,7 @@ func validatePreparedDisposition(fragment contextcontract.ContextFragment) error
 	}
 }
 
-func validatePreparedFragment(prepared PreparedFragment, rule contextcontract.FragmentBudgetRule) (contextcontract.AssemblyFailureReason, error) {
+func validatePreparedFragment(prepared PreparedFragment, rule contextcontract.FragmentRuleSpec) (contextcontract.AssemblyFailureReason, error) {
 	fragment := prepared.Fragment
 	if !containsDisposition(rule.AllowedDispositions, fragment.Disposition) {
 		return contextcontract.AssemblyInvalidContract, fmt.Errorf("fragment %s disposition=%s 不在 policy allowlist", fragment.FragmentID, fragment.Disposition)
@@ -376,13 +351,6 @@ func validatePreparedFragment(prepared PreparedFragment, rule contextcontract.Fr
 	if int64(len(prepared.Payload)) != fragment.SerializedBytes {
 		return contextcontract.AssemblyInvalidContract, fmt.Errorf("fragment %s payload bytes=%d 与 serialized_bytes=%d 不一致",
 			fragment.FragmentID, len(prepared.Payload), fragment.SerializedBytes)
-	}
-	if fragment.SerializedBytes > rule.MaxSerializedBytes || fragment.EstimatedTokens > rule.MaxEstimatedTokens {
-		return contextcontract.AssemblyFragmentLimitExceeded, fmt.Errorf(
-			"fragment %s kind=%s section=%s actual=%dB/%dt limit=%dB/%dt 超出单项 hard cap",
-			fragment.FragmentID, fragment.Kind, fragment.Section,
-			fragment.SerializedBytes, fragment.EstimatedTokens,
-			rule.MaxSerializedBytes, rule.MaxEstimatedTokens)
 	}
 	switch fragment.Disposition {
 	case contextcontract.DispositionInline:
@@ -535,69 +503,14 @@ func validateGroupReplay(input CompileInput, group *contextcontract.ProtocolAtom
 	return nil
 }
 
-func enforceAtomicGroupBudgets(input CompileInput, groups []contextcontract.ProtocolAtomicGroup, prepared map[string]PreparedFragment) error {
+func validateAtomicGroupRules(input CompileInput, groups []contextcontract.ProtocolAtomicGroup) error {
 	for _, group := range groups {
 		rule, ok := input.BudgetPolicy.AtomicGroupRule(group.GroupKind)
 		if !ok {
-			err := fmt.Errorf("policy 缺少 atomic group rule=%s", group.GroupKind)
-			failure := assemblyFailure(input, contextcontract.AssemblyInvalidContract, err, err.Error())
-			failure.AtomicGroupID = group.GroupID
-			return failure
-		}
-		usage := contextcontract.BudgetUsage{}
-		for _, fragmentID := range group.FragmentIDs {
-			fragment := prepared[fragmentID]
-			var err error
-			usage, err = addUsage(usage, contextcontract.BudgetUsage{
-				SerializedBytes: int64(len(fragment.Payload)),
-				EstimatedTokens: fragment.Fragment.EstimatedTokens,
-			})
-			if err != nil {
-				failure := assemblyFailure(input, contextcontract.AssemblyAtomicGroupLimitExceeded, err, err.Error())
-				failure.AtomicGroupID = group.GroupID
-				return failure
-			}
-		}
-		limit := contextcontract.Budget{
-			SerializedBytes: rule.MaxSerializedBytes,
-			EstimatedTokens: rule.MaxEstimatedTokens,
-		}
-		if !usage.Fits(limit) {
-			failure := assemblyFailure(input, contextcontract.AssemblyAtomicGroupLimitExceeded, nil,
-				"protocol atomic group 超出冻结预算")
-			failure.AtomicGroupID = group.GroupID
-			failure.Actual = usage
-			failure.Limit = limit
-			return failure
+			return assemblyFailure(input, contextcontract.AssemblyInvalidContract, nil, "缺少原子组规则")
 		}
 		if group.TransformID != "" && !containsString(rule.TransformIDs, group.TransformID) {
-			err := fmt.Errorf("atomic group=%s transform=%s 不在 Context policy allowlist",
-				group.GroupID, group.TransformID)
-			failure := assemblyFailure(input, contextcontract.AssemblyUntransformableRequiredFragment, err, err.Error())
-			failure.AtomicGroupID = group.GroupID
-			return failure
-		}
-	}
-	return nil
-}
-
-func enforceSectionBudgets(input CompileInput, usage map[contextcontract.ContextSection]contextcontract.BudgetUsage) error {
-	for _, section := range contextcontract.KnownContextSections() {
-		actual := usage[section]
-		limit, ok := input.BudgetPolicy.SectionBudget(section)
-		if !ok {
-			err := fmt.Errorf("policy 缺少 section budget=%s", section)
-			failure := assemblyFailure(input, contextcontract.AssemblyInvalidContract, err, err.Error())
-			failure.Section = section
-			return failure
-		}
-		if !actual.Fits(limit) {
-			failure := assemblyFailure(input, contextcontract.AssemblySectionBudgetExceeded, nil,
-				"context section 超出冻结预算")
-			failure.Section = section
-			failure.Actual = actual
-			failure.Limit = limit
-			return failure
+			return assemblyFailure(input, contextcontract.AssemblyUntransformableRequiredFragment, nil, "不允许原子组变换")
 		}
 	}
 	return nil

@@ -91,17 +91,10 @@ func (a *Agent) initTaskMemory(task *model.Task) *taskMemRuntime {
 }
 
 // taskMemInitialConstraints 从任务契约提取约束（capability 覆盖与预期产物）。
-// 2026-08-20 SWE-001：补收口契约约束——图节点任务必须经 submit_task_result
-// 结构化收口（纯文本退出不被接受），acceptance 另有 verdict 契约。约束由
-// 系统从持久化任务事实（GraphID/GraphNodeKind）派生写入，模型不可改写；
-// 渲染时每轮随 Task Memory 注入，压缩碰不到它。
-// 终态契约 v2 §5：图节点任务描述尾部的 <output-contract> 定界块逐行钉入
-// Constraints（与收口/验收契约并存）；严格按定界标记解析，v1 图与非图
-// 节点任务无此块自然跳过。
 func taskMemInitialConstraints(task *model.Task) []string {
 	var out []string
 	if task.GraphID != "" {
-		out = append(out, "本任务是 agentTask：通过 submit_task_result 提交本任务的唯一结构化结果；输入中的候选版本是本次工作基线。")
+		out = append(out, "本任务是 agentTask：最终纯文本可以正常结束；也可用 submit_task_result 提交结构化结果；输入中的候选版本是本次工作基线。")
 	}
 	if task.Capability != nil {
 		if len(task.Capability.Tools) > 0 {

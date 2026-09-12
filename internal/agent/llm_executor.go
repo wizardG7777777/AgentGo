@@ -489,7 +489,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				event.FinishReason = failure.FinishReason
 			}
 			trace.Emit(event)
-			return ExecuteResult{InvocationID: invocationID, ContextSnapshotID: contextSnapshotID, ContextProjected: compiled.Projected(),
+			return ExecuteResult{InvocationID: invocationID, ContextSnapshotID: contextSnapshotID,
 				InvocationDuration: llmDuration, ProviderCallStarted: true}, classifyError(err)
 		}
 
@@ -525,7 +525,7 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 				LLMTiming: traceTiming,
 			})
 			return ExecuteResult{
-				InvocationID: invocationID, ContextSnapshotID: contextSnapshotID, ContextProjected: compiled.Projected(),
+				InvocationID: invocationID, ContextSnapshotID: contextSnapshotID,
 				InvocationDuration: llmDuration, ProviderCallStarted: true,
 				PromptTokens:     resp.Data().Usage.PromptTokens,
 				CompletionTokens: resp.Data().Usage.CompletionTokens,
@@ -566,8 +566,8 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 		// 无 tool calls → 任务完成
 		if len(resp.ToolCalls()) == 0 {
 			return ExecuteResult{
-				InvocationID:      invocationID,
-				ContextSnapshotID: contextSnapshotID, ContextProjected: compiled.Projected(),
+				InvocationID:        invocationID,
+				ContextSnapshotID:   contextSnapshotID,
 				InvocationDuration:  llmDuration,
 				ProviderCallStarted: true,
 				Output:              resp.Content(),
@@ -732,16 +732,6 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 					}
 				}
 				dur := time.Since(start)
-				if result != "" {
-					boundedResult, persistErr := externalizeToolResult(contextRuntime, ctx, task, c, result)
-					if persistErr != nil {
-						controlErr = &loopAuthorityError{Err: persistErr}
-						toolErr = persistErr
-						result = ""
-					} else {
-						result = boundedResult
-					}
-				}
 
 				var content string
 				if toolErr != nil {
@@ -855,8 +845,8 @@ func (e *LLMExecutor) Execute(ctx context.Context, task *model.Task, depResults 
 
 		completedCalls := append([]llm.ToolCall(nil), resp.ToolCalls()[:completedResults]...)
 		executeResult := ExecuteResult{
-			InvocationID:      invocationID,
-			ContextSnapshotID: contextSnapshotID, ContextProjected: compiled.Projected(),
+			InvocationID:        invocationID,
+			ContextSnapshotID:   contextSnapshotID,
 			InvocationDuration:  llmDuration,
 			ProviderCallStarted: true,
 			Output:              output.String(),

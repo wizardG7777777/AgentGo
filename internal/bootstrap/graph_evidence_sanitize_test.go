@@ -10,7 +10,7 @@ func dsmlGarbageToolName() string {
 	return "run_shell>\n<｜DSML｜parameter name=\"command\" string=\"true\">" + strings.Repeat("x", 200)
 }
 func TestEvidenceKindOfNormalization(t *testing.T) {
-	cases := []struct// SWE-002 第一层防线（evidence 装配归一）的单测与事故形状端到端回归：
+	cases := []struct // SWE-002 第一层防线（evidence 装配归一）的单测与事故形状端到端回归：
 	//   - evidenceKindOf：垃圾名归一 unknown、合法自定义名保留、超长合法名截断；
 	//   - evidenceCallEntry：DSML 垃圾名 → kind=unknown + tool_name=malformed 占位
 	//     （确定性），装配产物过 store 的 validateEvidenceEntryBounds 权威校验；

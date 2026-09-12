@@ -287,7 +287,7 @@ func LoadSnapshot(path string) (*Snapshot, error) {
 			snap.Version, oldestSupportedSnapshotVersion, currentSnapshotVersion,
 		)
 	}
-	if snap.ModelHistoryContract != "agentgo.model-history/v1" {
+	if snap.ModelHistoryContract != "agentgo.model-history/v2" {
 		return nil, fmt.Errorf("拒绝旧 Session 模型历史契约；请新建会话")
 	}
 	return &snap, nil

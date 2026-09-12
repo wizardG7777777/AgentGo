@@ -55,10 +55,10 @@ func TestDataflowMultiInputAndNewIteration(t *testing.T) {
 		results[id] = AgentTaskResult{Schema: AgentTaskResultSchema, GraphID: def.GraphID, RunID: def.RunID, NodeID: id, Ref: "result:" + id, Value: map[string]any{"summary": id}}
 	}
 	partial := map[string]AgentTaskResult{"investigate": results["investigate"]}
-	if _, wait, err := ResolveDataflowInputs(def, "fix", partial, nil, nil); err != nil || wait != "waiting_inputs:second" {
+	if _, wait, err := ResolveDataflowInputs(def, "fix", partial, nil, nil, nil); err != nil || wait != "waiting_inputs:second" {
 		t.Fatalf("缺少第二输入应等待: %s %v", wait, err)
 	}
-	frozen, wait, err := ResolveDataflowInputs(def, "fix", results, nil, nil)
+	frozen, wait, err := ResolveDataflowInputs(def, "fix", results, nil, nil, nil)
 	if err != nil || wait != "" {
 		t.Fatalf("齐备输入应就绪: %s %v", wait, err)
 	}
@@ -90,18 +90,20 @@ func TestDataflowCandidateSelectionAndScope(t *testing.T) {
 	for _, id := range []string{"investigate", "other"} {
 		results[id] = AgentTaskResult{Schema: AgentTaskResultSchema, GraphID: def.GraphID, RunID: def.RunID, NodeID: id, Ref: "result:" + id, CandidateRef: "candidate:" + id, Value: map[string]any{"summary": id}}
 	}
-	if _, _, err := ResolveDataflowInputs(def, "verify", results, nil, nil); err == nil {
+	if _, _, err := ResolveDataflowInputs(def, "verify", results, nil, nil, nil); err == nil {
 		t.Fatal("不可任取第一个候选")
 	}
-	def.Nodes[2].WorkspaceInput = "b"
-	inputs, _, err := ResolveDataflowInputs(def, "verify", results, nil, nil)
-	if err != nil || inputs.WorkspaceCandidateRef != "candidate:other" {
+	other := results["other"]
+	other.CandidateRef = results["investigate"].CandidateRef
+	results["other"] = other
+	inputs, _, err := ResolveDataflowInputs(def, "verify", results, nil, nil, nil)
+	if err != nil || inputs.WorkspaceCandidateRef != "candidate:investigate" {
 		t.Fatalf("普通检查任务应绑定明确候选: %+v %v", inputs, err)
 	}
 	foreign := results["other"]
 	foreign.GraphID = "other-graph"
 	results["other"] = foreign
-	if _, _, err := ResolveDataflowInputs(def, "verify", results, nil, nil); err == nil {
+	if _, _, err := ResolveDataflowInputs(def, "verify", results, nil, nil, nil); err == nil {
 		t.Fatal("不得读其它图的结果")
 	}
 }
@@ -113,16 +115,16 @@ func TestDataflowExternalInputAndStrictResultSchema(t *testing.T) {
 	if err := ValidateDataflowDefinition(def); err != nil {
 		t.Fatal(err)
 	}
-	if _, wait, err := ResolveDataflowInputs(def, "investigate", nil, nil, nil); err != nil || wait == "" {
+	if _, wait, err := ResolveDataflowInputs(def, "investigate", nil, nil, nil, nil); err != nil || wait == "" {
 		t.Fatal("已声明未到达外部输入应等待")
 	}
 	ext := map[string]map[int64]DataflowInputValue{"question": {1: {Ref: "input:question/1", Value: map[string]any{"text": "调查多行\n输入"}}}}
-	input, _, err := ResolveDataflowInputs(def, "investigate", nil, ext, nil)
+	input, _, err := ResolveDataflowInputs(def, "investigate", nil, ext, nil, nil)
 	if err != nil || !strings.Contains(input.Values["question"].Value.(string), "\n") {
 		t.Fatalf("内容可含换行，身份与内容分开: %v", err)
 	}
 	ext["question"][1] = DataflowInputValue{Ref: "input:question/1", Value: map[string]any{"text": 42}}
-	if _, _, err := ResolveDataflowInputs(def, "investigate", nil, ext, nil); err == nil {
+	if _, _, err := ResolveDataflowInputs(def, "investigate", nil, ext, nil, nil); err == nil {
 		t.Fatal("坏数据类型应拒绝")
 	}
 	def.Nodes[0].ResultSchema["magicIgnoreValidation"] = true

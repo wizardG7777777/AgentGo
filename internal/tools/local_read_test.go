@@ -244,28 +244,15 @@ func TestReadFile_CacheHit(t *testing.T) {
 		t.Fatalf("首次读取内容错: %q", out1)
 	}
 
-	// 第二次同参数 read_file 命中缓存：文件未变时返回摘要 stub 而非全文
-	// （闸 1，2026-07-22），并给出 force_full / offset 取回指引。
 	out2, err := g.readFile(context.Background(), map[string]any{"path": fp})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(out2, "original") {
-		t.Errorf("缓存命中不应再返回全文: %q", out2)
+	if out2 != out1 {
+		t.Fatalf("重复读取必须得到相同正文: first=%q second=%q", out1, out2)
 	}
-	for _, want := range []string{"already read, unchanged", "force_full=true", "[hash]"} {
-		if !strings.Contains(out2, want) {
-			t.Errorf("缓存命中 stub 缺少 %q: %q", want, out2)
-		}
-	}
-
-	// force_full=true 时仍返回全文。
-	out2f, err := g.readFile(context.Background(), map[string]any{"path": fp, "force_full": true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out2f, "original") {
-		t.Errorf("force_full=true 应返回全文: %q", out2f)
+	if _, err := g.readFile(context.Background(), map[string]any{"path": fp, "force_full": true}); err == nil {
+		t.Fatal("退役 force_full 参数未拒绝")
 	}
 
 	// 外部/他人改写文件后，stat 校验应使缓存失效并重新读盘

@@ -428,7 +428,7 @@ func DefaultConfig() *Config {
 			Web:       WebUIConfig{Listen: "127.0.0.1:8399", Token: ""},
 		},
 	}
-	cfg.Graph.RequestContract = "agentgo.graph/v6"
+	cfg.Graph.RequestContract = "agentgo.graph/v7"
 	return cfg
 }
 
@@ -501,8 +501,8 @@ func LoadConfig(path string, explicit bool) (*Config, error) {
 		return nil, fmt.Errorf("max_subtask_depth 已退役；新工作必须通过图编排定义")
 	}
 	graphBlock, graphOK := rawConfig["graph"].(map[string]any)
-	if !graphOK || graphBlock["request_contract"] != "agentgo.graph/v6" {
-		return nil, fmt.Errorf("配置必须显式声明 graph.request_contract: agentgo.graph/v6")
+	if !graphOK || graphBlock["request_contract"] != "agentgo.graph/v7" {
+		return nil, fmt.Errorf("配置必须显式声明 graph.request_contract: agentgo.graph/v7")
 	}
 	llmBlock, ok := rawConfig["llm"].(map[string]any)
 	if !ok || llmBlock["request_contract"] != "agentgo.model-request/v1" {
@@ -582,7 +582,7 @@ func LoadConfig(path string, explicit bool) (*Config, error) {
 // AgentTemplate provision Team。只要 agents 非空，原有静态 kind 的全部严格
 // 校验仍然执行，非法配置不会静默降级。
 func (c *Config) Validate() error {
-	if c.Graph.RequestContract != "agentgo.graph/v6" {
+	if c.Graph.RequestContract != "agentgo.graph/v7" {
 		return fmt.Errorf("graph.request_contract 缺失或为旧版本")
 	}
 	if c.LLM.RequestContract != "agentgo.model-request/v1" {

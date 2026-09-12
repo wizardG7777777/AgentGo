@@ -608,7 +608,7 @@ func TestRelativeProjectRoot_EndToEnd(t *testing.T) {
 }
 func TestPrepareShellRootBuildsFullSnapshotAndOverlaysDirtyFiles(t *testing.T) {
 	root := t.TempDir()
-	for path, content := range map[string]string{"src/main.go": "package main\nconst value = \"main\"\n", "tests/main_test.go": "package tests\n", ".venv/marker.txt": "prepared environment\n", ".agentgo/state/secret.txt": "control state\n", ".git/config": "git metadata\n"} {
+	for path, content := range map[string]string{"src/main.go": "package main\nconst value = \"main\"\n", "tests/main_test.go": "package tests\n", ".venv/marker.txt": "prepared environment\n", ".agentgo/state/secret.txt": "control state\n"} {
 		absolute := filepath.Join(root, filepath.FromSlash(path))
 		if err := os.MkdirAll(filepath.Dir(absolute), 0o755); err != nil {
 			t.Fatal(err)

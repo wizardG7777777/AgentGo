@@ -6,11 +6,9 @@ import (
 )
 
 func validPolicy() ContextBudgetPolicy {
-	fragmentRules := make(map[FragmentKind]FragmentBudgetRule)
+	fragmentRules := make(map[FragmentKind]FragmentRuleSpec)
 	for _, kind := range KnownFragmentKinds() {
-		fragmentRules[kind] = FragmentBudgetRule{
-			MaxSerializedBytes: 4096,
-			MaxEstimatedTokens: 1024,
+		fragmentRules[kind] = FragmentRuleSpec{
 			AllowedDispositions: []Disposition{
 				DispositionInline,
 				DispositionRejected,
@@ -19,21 +17,14 @@ func validPolicy() ContextBudgetPolicy {
 			Priority:       10,
 		}
 	}
-	groupRules := make(map[AtomicGroupKind]AtomicGroupBudgetRule)
+	groupRules := make(map[AtomicGroupKind]AtomicGroupRuleSpec)
 	for _, kind := range KnownAtomicGroupKinds() {
-		groupRules[kind] = AtomicGroupBudgetRule{
-			MaxSerializedBytes: 8192,
-			MaxEstimatedTokens: 2048,
-		}
-	}
-	sections := make(map[ContextSection]Budget)
-	for _, section := range KnownContextSections() {
-		sections[section] = Budget{SerializedBytes: 16 << 10, EstimatedTokens: 4096}
+		groupRules[kind] = AtomicGroupRuleSpec{}
 	}
 	return ContextBudgetPolicy{
-		Schema: PolicySchemaV1, PolicyID: "bounded-default/v1", Version: 11,
+		Schema: PolicySchemaV2, PolicyID: "bounded-default/v1", Version: 12,
 		ModelClass: "openai-compatible/default", FragmentRules: fragmentRules,
-		AtomicGroupRules: groupRules, SectionBudgets: sections,
+		AtomicGroupRules:      groupRules,
 		SnapshotInputBudget:   Budget{SerializedBytes: 64 << 10, EstimatedTokens: 16 << 10},
 		CompletionReserve:     Budget{SerializedBytes: 16 << 10, EstimatedTokens: 4096},
 		AbsoluteWireByteLimit: 96 << 10, ModelContextWindow: &Budget{SerializedBytes: 16 <<
@@ -63,7 +54,7 @@ func TestContextBudgetPolicyDigestStable(t *testing.T) {
 
 	changed := validPolicy()
 	changedRule := changed.FragmentRules[FragmentTaskMemory]
-	changedRule.MaxSerializedBytes++
+	changedRule.Priority++
 	changed.FragmentRules[FragmentTaskMemory] = changedRule
 	changedDigest, err := changed.ComputeDigest()
 	if err != nil {
@@ -150,13 +141,12 @@ func validSnapshot(t *testing.T) ContextSnapshot {
 		Scope: ScopeTask, Authority: AuthorityAuthoritative,
 		Freshness: FreshnessSnapshot, InputDigest: DigestBytes([]byte("任务")),
 		OutputDigest: digest, SerializedBytes: int64(len(payload)), EstimatedTokens: 8,
-		BudgetLimit:    Budget{SerializedBytes: 4096, EstimatedTokens: 1024},
 		RetentionClass: RetentionTaskLifetime, Disposition: DispositionInline,
 		WireID: "wire-user-1",
 	}
 	usage := BudgetUsage{SerializedBytes: int64(len(payload)), EstimatedTokens: 8}
 	return ContextSnapshot{
-		SnapshotID: "snapshot-1", Schema: SnapshotSchemaV2,
+		SnapshotID: "snapshot-1", Schema: SnapshotSchemaV3,
 		AttemptID: "attempt-1", InvocationID: "invocation-1",
 		InstructionRef: "prompt-build:1", ContextPolicyID: policy.PolicyID,
 		ContextPolicyDigest: policyDigest, ProviderReplayRef: "provider-replay:default/v1",

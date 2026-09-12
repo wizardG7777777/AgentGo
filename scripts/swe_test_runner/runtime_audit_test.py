@@ -52,17 +52,17 @@ class RuntimeFixture:
         self.save_events()
         write_journal(self.session / "turns.jsonl", [{"schema": "agentgo.model-output/v1", "identity": self.identity,
             "status": "completed", "result": {"schema": "agentgo.model-result/v1"}}])
-        write_journal(self.state / "context-snapshots-v2" / "context-snapshots.jsonl", [{"version": 1,
-            "record": {"snapshot": {"schema": "agentgo.context/v2", "invocation_id": "invocation-1",
-                                    "context_policy_id": "context:default/v11", "fragments": []}}}])
+        write_journal(self.state / "context-snapshots-v3" / "context-snapshots.jsonl", [{"version": 1,
+            "record": {"snapshot": {"schema": "agentgo.context/v3", "invocation_id": "invocation-1",
+                                    "context_policy_id": "context:default/v12", "fragments": []}}}])
         outcomes = []
         for task in tasks:
             outcomes.extend([
                 {"version": 1, "kind": "commit", "record": {"outcome_ref": task["outcome_ref"], "outcome": {
-                    "schema": "agentgo.task-outcome/v4", "run_id": "run-1", "task_id": task["id"], "status": "completed"}}},
+                    "schema": "agentgo.task-outcome/v5", "run_id": "run-1", "task_id": task["id"], "status": "completed"}}},
                 {"version": 1, "kind": "delivery_ack", "ack_ref": task["outcome_ref"]},
             ])
-        write_journal(self.state / "task-outcomes-v3" / "task-outcomes.jsonl", outcomes)
+        write_journal(self.state / "task-outcomes-v4" / "task-outcomes.jsonl", outcomes)
         self.usage = self.state / "run-usage-v2" / "run-budgets.jsonl"
         write_journal(self.usage, [
             {"schema": "agentgo.run-budget-record/v1", "run_id": "run-1", "kind": "reserve", "reservation": {"reservation_id": "reserve-1"}},
@@ -71,8 +71,8 @@ class RuntimeFixture:
         ])
         write_journal(self.state / "loop-facts-v3" / "task.jsonl", [{"schema": "agentgo.loop-store-record/v1",
             "checkpoint": {"run_id": "run-1", "attempt_id": "attempt-1"}}])
-        current = {"schema": "agentgo.graph/v6", "state_version": 1, "status": "completed",
-                   "definition": {"schema": "agentgo.graph/v6", "graph_id": "graph-1", "run_id": "run-1", "revision": 1,
+        current = {"schema": "agentgo.graph/v7", "state_version": 1, "status": "completed",
+                   "definition": {"schema": "agentgo.graph/v7", "graph_id": "graph-1", "run_id": "run-1", "revision": 1,
                                   "nodes": [{"kind": "agentTask", "node_id": "work"}]},
                    "executions": {"work": {"status": "completed", "outcome_ref": "outcome:task", "inputs": {"values": {}}}},
                    "results": {"work": {"ref": "result:work"}},
@@ -80,7 +80,7 @@ class RuntimeFixture:
                    "completion": {"schema": "agentgo.graph-completion/v1", "status": "committed", "outcome": "success", "result_refs": ["result:work"]}}
         entry = {"sequence": 1, "previous_digest": "", "digest": "", "snapshot": current}
         entry["digest"] = go_json_digest(entry)
-        self.graph_journal = self.state / "graphs-v6" / "graph.jsonl"
+        self.graph_journal = self.state / "graphs-v8" / "graph.jsonl"
         write_journal(self.graph_journal, [entry])
 
     def save_events(self):

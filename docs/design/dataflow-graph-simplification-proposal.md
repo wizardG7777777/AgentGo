@@ -165,7 +165,6 @@
 | inputs | 命名输入槽到 graph_input 或 node_result 引用的映射；同时新增的节点可相互引用，但整次变更必须无环 |
 | result_schema | 本任务唯一业务结果对象的类型契约；允许只要求简短 summary，不强迫模型填写框架观察报告 |
 | execution | 已注册 route 引用、所需工具与执行环境；默认项由运行时解析成显式有效规格 |
-| workspace_input | 若有多个数据输入，明确哪一个输入提供本次工作的候选代码基线；单一候选可无歧义解析 |
 | labels | 可选展示标签；不得通过 labels/metadata 决定控制权限或执行算法 |
 
 依赖边从 inputs 推导并显示，不同时维护可单独修改的 edges 和 next，避免两个结构权威。一个 node_result 既可引用整份业务结果，也可选取其声明字段；缺字段或类型不符时不派发下游。
@@ -248,7 +247,7 @@ complete 输入包含 outcome（success/failed/blocked）、expected_revision、
 
 | 数据域 | 目标 |
 |---|---|
-| Graph 定义与执行 | agentgo.graph/v6，唯一 kind=agentTask |
+| Graph 定义与执行 | agentgo.graph/v7，唯一 kind=agentTask |
 | Authoring 摘要 | agentgo.graph-authoring-definition-digest/v3 |
 | 图结果与完成事务 | agentgo.graph-result/v1、agentgo.graph-completion/v1 |
 | agentTask 结果信封 | agentgo.agent-task-result/v1 |
@@ -261,7 +260,7 @@ complete 输入包含 outcome（success/failed/blocked）、expected_revision、
 
 Session 7 及以前不能恢复执行；历史目录不删除、不迁移，不把 agent/acceptance 自动翻译成 agentTask。旧图字段和节点名显式报退役错误，不能靠忽略未知字段继续执行。
 
-配置新增 graph 配置块，显式声明 `graph.request_contract: agentgo.graph/v6`；文件缺失不由默认配置补齐。这是新建的配置域，不假称当前已有 runtime.graph_contract。旧图创建 schema、旧特殊节点配置、Proposal Acceptance 专属模型/提示词配置全部拒绝。原 verifier 名称可以继续作为普通 Agent 的显示身份，但移除保留 route 和节点类型授权语义；任何保留 route 都必须出现在能力目录中。
+配置新增 graph 配置块，显式声明 `graph.request_contract: agentgo.graph/v7`；文件缺失不由默认配置补齐。这是新建的配置域，不假称当前已有 runtime.graph_contract。旧图创建 schema、旧特殊节点配置、Proposal Acceptance 专属模型/提示词配置全部拒绝。原 verifier 名称可以继续作为普通 Agent 的显示身份，但移除保留 route 和节点类型授权语义；任何保留 route 都必须出现在能力目录中。
 
 ## 13. 实际文件与清理任务
 
@@ -317,3 +316,5 @@ SWE Test Runner 同步更换 runtime_audit 对新图、agentTask、候选和完�
 数据版本：Session 8、Lease v4、TaskOutcome v4/TerminalIntent v2、Candidate v1/Delivery v2、SWE result v5。其余未变 L1/L2/Run 契约保持原版本。所有旧图和旧控制字段拒绝执行，历史目录原样保留。
 
 验证记录见 [agentTask 验证](../test-issues/2026-09-11-agenttask-validation.md)，文件删除清单见 [删除对账](agenttask-deletion-ledger.md)。真实 SWE 单题成功不代表整个 Flask-8 已通过；CI 和剩余限制分别列明。
+
+2026-09-12 后续修复：模型工作基线字段已删除，Graph v7 / graphs-v8 使用运行时候选谱系解析；等待事实按节点持久化去重。此前 v6 实施验证仍为历史记录。见 [剩余问题修复与复测](swe-remaining-repairs.md)。

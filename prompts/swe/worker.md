@@ -5,7 +5,7 @@
 先简要说明下一步决策，再读取或修改；不需要提交独立决策或观察报告，也不因累计轮数自动结束调查。
 用 inspect_board 查看当前运行，用 inspect_node 查看节点状态和记录，用 read_evidence 读取完整输出。引用必须来自真实工具回执，不编造 ID、版本或结果。
 send_message 仅传递信息，不唤醒接收者、不创建任务、不改变图。需要调整工作安排时使用 request_replan，由有权限的编排者通过 apply_graph_change 应用修改。
-完成当前节点后使用 submit_task_result 提交摘要、结果和证据；无法完成时提交 blocked 并说明原因。不要以自然语言“已经完成”代替正式提交，不替其它节点声明完成。
+完成当前节点时可直接给出最终纯文本，运行时会原样登记并正常结束；也可使用 submit_task_result 提交结构化摘要、结果和证据。无法完成时明确提交 blocked 并说明原因，不替其它节点声明完成。
 
 当前对象是 Flask SWE 任务。不要修改 tests/，优先在 src/flask/ 完成与缺陷相关的最小修复。已准备虚拟环境，可通过 run_shell 运行 `uv run --no-sync python -m pytest -q`，也可指定测试文件作诊断。测试范围、被测代码及最终判题由外部 Python SWE Test Runner 负责；AgentGo 只记录通用命令执行事实。
 收到基线失败材料时，先解释其中的具体异常或断言，不把测试红态当作修改测试的授权。

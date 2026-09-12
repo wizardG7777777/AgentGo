@@ -16,52 +16,28 @@ import (
 	"agentgo/internal/store"
 )
 
-// TestProcessTask_GraphNodeTextExitNudgesThenRecoverable 图节点任务连续纯文本
-// 退出：每次注入 submit_task_result 提醒，第 maxUnstructuredExitNudges+1 次
-// 按可恢复错误回滚（pending 待重试），不得记 completed。
-func TestProcessTask_GraphNodeTextExitNudgesThenRecoverable(t *testing.T) {
+// 最终纯文本是正常节点结果，不注入额外提交提醒或重复调用模型。
+func TestProcessTaskGraphPlainTextCompletesOnce(t *testing.T) {
 	s, r, _ := setup()
-	task := &model.Task{
-		Description: "图节点实现", EventType: "code",
-		GraphID: "g-text-exit", NodeID: "impl", ActivationID: "impl@1",
-	}
+	task := &model.Task{Description: "调查节点", EventType: "code", GraphID: "g-text-exit", NodeID: "investigate", ActivationID: "investigate@1"}
 	if err := s.PublishTask(task); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.ClaimTask("agent-1", task.ID); err != nil {
 		t.Fatal(err)
 	}
-	var histories [][]contextcontract.HistoryEntry
-	executor := func(_ context.Context, _ *model.Task, _ map[string]string, history []contextcontract.HistoryEntry, actionBudget llm.OutputBudget) (ExecuteResult, error) {
-		histories = append(histories, append([]contextcontract.HistoryEntry(nil), history...))
-		return ExecuteResult{Output: "中段分析，没有结构化提交", ToolCalled: false}, nil
-	}
-	ag := NewAgent("agent-1", "code", s, r, executor)
+	calls := 0
+	ag := NewAgent("agent-1", "code", s, r, func(_ context.Context, _ *model.Task, _ map[string]string, _ []contextcontract.HistoryEntry, _ llm.OutputBudget) (ExecuteResult, error) {
+		calls++
+		return ExecuteResult{Output: "调查结论：根因已定位。", AssistantContent: "调查结论：根因已定位。"}, nil
+	})
 	ag.processTask(context.Background(), task.ID)
-
-	if len(histories) != maxUnstructuredExitNudges+1 {
-		t.Fatalf("文本退出应提醒 %d 次后收口，实际 LLM 调用 %d 次", maxUnstructuredExitNudges, len(histories))
-	}
-	for i, h := range histories[1:] {
-		found := false
-		for _, e := range h {
-			if strings.Contains(e.SystemNotice, "system-reminder") && strings.Contains(e.SystemNotice, "submit_task_result") {
-				found = true
-			}
-		}
-		if !found {
-			t.Errorf("第 %d 次提醒未注入 system-reminder: %+v", i+1, h)
-		}
-	}
 	got, err := s.GetTask(task.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status == model.TaskStatusCompleted {
-		t.Fatal("图节点纯文本退出不得记 completed")
-	}
-	if got.Status != model.TaskStatusPending {
-		t.Fatalf("可恢复错误应回滚 pending 重试: status=%s error=%s", got.Status, got.Error)
+	if calls != 1 || got.Status != model.TaskStatusCompleted || got.LastResponse != "调查结论：根因已定位。" {
+		t.Fatalf("普通文本没有正常登记并结束: calls=%d task=%+v", calls, got)
 	}
 }
 

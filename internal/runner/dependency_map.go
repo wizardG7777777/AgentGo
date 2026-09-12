@@ -118,7 +118,7 @@ func resolveToolGroups(
 			Workspaces:  deps.WorkspaceManager,
 			ProjectRoot: deps.ProjectRoot,
 		},
-		tools.InspectionGroup{Tasks: deps.Store, Graphs: deps.GraphStore, Content: deps.ContentStore, History: deps.StoreView, Holder: holder, SessionID: deps.SessionID},
+		tools.InspectionGroup{Tasks: deps.Store, Graphs: deps.GraphStore, History: deps.StoreView, Holder: holder, SessionID: deps.SessionID},
 	}
 }
 

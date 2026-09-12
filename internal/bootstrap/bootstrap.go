@@ -418,7 +418,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		}
 	}()
 	log.Printf("[启动] RunBudgetStore 已启用 (dir=%s)", runBudgetStorePath)
-	outcomeStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "task-outcomes-v3")
+	outcomeStorePath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "task-outcomes-v4")
 	taskOutcomeStore, outcomeStoreErr := outcomestore.New(outcomeStorePath)
 	if outcomeStoreErr != nil {
 		return nil, fmt.Errorf("初始化 TaskOutcomeStore 失败（新执行必须 fail-closed）: %w", outcomeStoreErr)
@@ -454,7 +454,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		return nil, fmt.Errorf("恢复 L5 DeliveryStore 失败（损坏 transaction 不得忽略）: %w", deliveryStoreErr)
 	}
 	log.Printf("[启动] L5 DeliveryStore 已启用 (dir=%s)", deliveryStorePath)
-	contextSnapshotPath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "context-snapshots-v2")
+	contextSnapshotPath := filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "context-snapshots-v3")
 	contextSnapshotStore, contextSnapshotErr := contextstore.New(contextSnapshotPath)
 	if contextSnapshotErr != nil {
 		return nil, fmt.Errorf("初始化 L2 ContextSnapshotStore 失败（新执行必须 fail-closed）: %w", contextSnapshotErr)

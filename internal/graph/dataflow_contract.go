@@ -13,9 +13,9 @@ import (
 )
 
 const (
-	DataflowSchema        = "agentgo.graph/v6"
+	DataflowSchema        = "agentgo.graph/v7"
 	AgentTaskKind         = "agentTask"
-	AgentTaskResultSchema = "agentgo.agent-task-result/v1"
+	AgentTaskResultSchema = "agentgo.agent-task-result/v2"
 	CompletionSchema      = "agentgo.graph-completion/v1"
 )
 
@@ -38,15 +38,14 @@ type DataflowInputSpec struct {
 
 // AgentTaskNode 是一次工作实例；执行重试使用 Attempt，返工须建立新的 NodeID。
 type AgentTaskNode struct {
-	NodeID         string                         `json:"node_id"`
-	Kind           string                         `json:"kind"`
-	Title          string                         `json:"title"`
-	Objective      string                         `json:"objective"`
-	Inputs         map[string]DataflowInputSource `json:"inputs,omitempty"`
-	ResultSchema   map[string]any                 `json:"result_schema"`
-	Execution      AgentTaskExecutionSpec         `json:"execution"`
-	WorkspaceInput string                         `json:"workspace_input,omitempty"`
-	Labels         map[string]string              `json:"labels,omitempty"`
+	NodeID       string                         `json:"node_id"`
+	Kind         string                         `json:"kind"`
+	Title        string                         `json:"title"`
+	Objective    string                         `json:"objective"`
+	Inputs       map[string]DataflowInputSource `json:"inputs,omitempty"`
+	ResultSchema map[string]any                 `json:"result_schema"`
+	Execution    AgentTaskExecutionSpec         `json:"execution"`
+	Labels       map[string]string              `json:"labels,omitempty"`
 }
 
 type AgentTaskExecutionSpec struct {
@@ -66,6 +65,7 @@ type DataflowInputSource struct {
 
 // AgentTaskResult 是完整结果权威。框架身份及候选不得取自模型结果字段。
 type AgentTaskResult struct {
+	PlainText    bool            `json:"plain_text,omitempty"`
 	Evidence     []EvidenceEntry `json:"evidence,omitempty"`
 	Schema       string          `json:"schema"`
 	Ref          string          `json:"ref"`
@@ -165,11 +165,6 @@ func ValidateDataflowDefinition(def DataflowDefinition) error {
 		}
 		if node.ResultSchema["type"] != "object" {
 			return fmt.Errorf("节点 %s 的结果必须是 object", node.NodeID)
-		}
-		if node.WorkspaceInput != "" {
-			if _, ok := node.Inputs[node.WorkspaceInput]; !ok {
-				return fmt.Errorf("节点 %s workspace_input 未绑定输入", node.NodeID)
-			}
 		}
 		nodes[node.NodeID] = node
 	}

@@ -19,10 +19,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "swe_test_runner"))
 from runtime_audit import collect_runtime, RETIRED_TOOLS
+from runner import monitor_run
 
 
 TERMINAL = {"completed", "failed", "blocked", "cancelled"}
 ARTIFACT_TEXT = "agentgo local 测试交付\n"
+PLAIN_FINAL_TEXT = "普通最终回复：候选内容正确\n" + "完整结论原文。" * 5000
 
 
 def strings(value):
@@ -48,7 +50,7 @@ def state_from_text(text):
     for match in re.finditer(r"\{", text):
         try:
             value, _ = decoder.raw_decode(text[match.start():])
-            if isinstance(value, dict) and value.get("schema") == "agentgo.graph/v6" and "executions" in value:
+            if isinstance(value, dict) and value.get("schema") == "agentgo.graph/v7" and "executions" in value:
                 return value
         except ValueError:
             continue
@@ -56,12 +58,13 @@ def state_from_text(text):
 
 
 class Scenario:
-    def __init__(self, protocol, team=False):
-        self.protocol, self.team = protocol, team
+    def __init__(self, protocol, team=False, plain_final=False):
+        self.protocol, self.team, self.plain_final = protocol, team, plain_final
         self.calls, self.team_step, self.worker_step, self.verifier_step, self.research_step = 0, 0, 0, 0, 0
         self.team_route, self.graph_id, self.observer_id = "", "", ""
         self.created = self.started = self.updated = self.completed = False
         self.names_seen, self.actions, self.errors = set(), [], []
+        self.project_root = None
 
     def choose(self, body):
         tools = [t.get("function", t) for t in body.get("tools", [])]
@@ -102,6 +105,8 @@ class Scenario:
                 self.updated = True
                 work = task_node("work", "LOCAL_WORK：创建 local-smoke.txt", ["read_file", "run_shell", "apply_change", "send_message", "inspect_node", "read_evidence", "submit_task_result"], self.team_route or "default", {"research": {"kind": "node_result", "node_id": "research"}})
                 check = task_node("check", "LOCAL_CHECK：读取 local-smoke.txt 并报告结果", ["read_file", "submit_task_result"], "acceptance.verify", {"candidate": {"kind": "node_result", "node_id": "work"}})
+                if self.plain_final:
+                    check["result_schema"] = {"type": "object", "properties": {"structured_only": {"type": "string"}}, "required": ["structured_only"]}
                 return "apply_graph_change", {"operation": "update", "request_id": "add-work", "graph_id": self.graph_id, "expected_revision": 1, "changes": {"add": [work, check]}}
             if not self.completed and "check" in state["results"]:
                 self.completed = True
@@ -116,10 +121,18 @@ class Scenario:
             if self.worker_step == 10:
                 return "apply_change", {"operation": "create", "path": "local-smoke.txt", "content": ARTIFACT_TEXT}
             if self.worker_step == 11:
-                return "run_shell", {"command": "echo local-shell-output"}
+                return "apply_change", {"operation": "write", "path": "README.md", "content": "snapshot-git-proof\n"}
             if self.worker_step == 12:
-                return "inspect_node", {}
+                return "run_shell", {"command": "git diff -- README.md", "working_dir": self.project_root.as_posix()}
             if self.worker_step == 13:
+                if "+snapshot-git-proof" not in text:
+                    raise RuntimeError("git diff 没有观察到任务副本的文件修改")
+                if self.project_root.joinpath("README.md").read_text(encoding="utf-8") != "本地调查样本\n":
+                    raise RuntimeError("任务完成前文件写入穿透了主根")
+                if f"[file] {self.project_root / 'README.md'}" not in text:
+                    raise RuntimeError("read_file 没有回显可复用的逻辑路径")
+                return "inspect_node", {}
+            if self.worker_step == 14:
                 return "submit_task_result", {"summary": "文件已写入候选", "result": {"summary": "文件已写入候选", "artifact": "local-smoke.txt"}}
             raise RuntimeError("Worker 未收口")
         if "read_file" in names:
@@ -129,7 +142,7 @@ class Scenario:
                     return "read_file", {"path": "local-smoke.txt"}
                 if ARTIFACT_TEXT.strip() not in text:
                     raise RuntimeError("检查节点没有读取候选文件")
-                return "submit_task_result", {"summary": "候选内容正确"}
+                return (None, {"text": PLAIN_FINAL_TEXT}) if self.plain_final else ("submit_task_result", {"summary": "候选内容正确"})
             self.research_step += 1
             if self.research_step == 1:
                 return "read_file", {"path": "README.md"}
@@ -182,18 +195,15 @@ def handler_for(scenario):
                               chunk({"tool_calls": [{"index": 0, "id": call_id, "type": "function", "function": {"name": name, "arguments": raw_args[:cut]}}]}),
                               chunk({"tool_calls": [{"index": 0, "function": {"arguments": raw_args[cut:]}}]}), chunk({}, "tool_calls"),
                               {"id": f"chat-{scenario.calls}", "object": "chat.completion.chunk", "choices": [], "usage": {"prompt_tokens": 30, "completion_tokens": 10, "total_tokens": 40}}]
-                if name == "submit_proposal_verdict":
-                    # 独立机械校验只接收 typed verdict；正文回显在业务调用验证。
+                if name is None:
+                    final_text = args["text"]
                     if scenario.protocol == "responses":
-                        events = [e for e in events if e.get("type") != "response.output_text.delta"
-                                  and not (e.get("type") == "response.output_item.done" and e["item"]["type"] == "message")]
-                        for event in events:
-                            if "output_index" in event:
-                                event["output_index"] = 0
-                            if event.get("type") == "response.completed":
-                                event["response"]["output"] = [item]
+                        message["content"][0]["text"] = final_text
+                        events = [{"type": "response.output_text.delta", "output_index": 0, "item_id": message["id"], "delta": final_text},
+                                  {"type": "response.output_item.done", "output_index": 0, "item": message},
+                                  {"type": "response.completed", "response": {"id": f"response-{scenario.calls}", "object": "response", "status": "completed", "output": [message], "usage": {"input_tokens": 30, "output_tokens": 10, "total_tokens": 40}}}]
                     else:
-                        events = [e for e in events if not any((c.get("delta") or {}).get("content") for c in e.get("choices", []))]
+                        events = [chunk({"role": "assistant", "content": final_text}), chunk({}, "stop"), {"id": f"chat-{scenario.calls}", "object": "chat.completion.chunk", "choices": [], "usage": {"prompt_tokens": 30, "completion_tokens": 10, "total_tokens": 40}}]
                 encoded = b"".join(("data: " + json.dumps(e, ensure_ascii=False) + "\n\n").encode("utf-8") for e in events)
                 if scenario.protocol == "chat_completions":
                     encoded += b"data: [DONE]\n\n"
@@ -237,17 +247,23 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--protocol", choices=("responses", "chat_completions"), default="responses")
     parser.add_argument("--team", action="store_true", help="用动态 Team 承担 Worker，验证无静态 Worker 的初建接缝")
+    parser.add_argument("--plain-final", action="store_true", help="普通纯文本结束检查节点，运行时自动登记")
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     repo = Path(__file__).resolve().parents[1]
-    scenario = Scenario(args.protocol, args.team)
+    scenario = Scenario(args.protocol, args.team, args.plain_final)
     provider = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(scenario))
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
     try:
         with tempfile.TemporaryDirectory(prefix="agentgo-native-smoke-") as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
+            scenario.project_root = root
             (root / "README.md").write_text("本地调查样本\n", encoding="utf-8")
+            for command in (["init", "--initial-branch=main"], ["add", "README.md"],
+                            ["-c", "user.name=Local Fixture", "-c", "user.email=fixture@agentgo.invalid", "-c", "commit.gpgsign=false", "commit", "-m", "fixture input"]):
+                subprocess.run(["git", "-C", str(root), *command], check=True, capture_output=True)
+            initial_head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"])
             token, port = "local-smoke-only", free_port()
             base = f"http://127.0.0.1:{port}"
             profiles = {
@@ -255,7 +271,7 @@ def main():
                 "verifier": ["read_file", "inspect_node", "read_evidence", "submit_task_result"],
                 "observer": ["read_file", "submit_task_result"],
             }
-            config = {"graph": {"request_contract": "agentgo.graph/v6"}, "llm": {"request_contract": "agentgo.model-request/v1", "base_url": f"http://127.0.0.1:{provider.server_port}",
+            config = {"graph": {"request_contract": "agentgo.graph/v7"}, "llm": {"request_contract": "agentgo.model-request/v1", "base_url": f"http://127.0.0.1:{provider.server_port}",
                 "api_key": "local-test-only", "default_model": "local-fixture", "protocol": args.protocol, "timeout_sec": 10},
                 "project_root": root.as_posix(), "startup_probe": "tool", "startup_probe_timeout_sec": 10,
                 "startup_probe_failure_action": "exit", "tool_profiles": profiles,
@@ -307,15 +323,24 @@ def main():
                         raise RuntimeError("本地场景未完成终态收口")
                     snapshot_path, monitor_path = root / "snapshot.final.json", root / "monitor.json"
                     snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
-                    monitor_path.write_text(json.dumps({"run_identity_visible": True, "process_terminal": "graph_terminal"}), encoding="utf-8")
+                    monitored = monitor_run(base, token, process, run_id, time.time(), 10, str(snapshot_path), poll_sec=0.05, provider_trace_root=root)
+                    assert monitored["settlement_verified"] is True, monitored
+                    at_deadline = monitor_run(base, token, process, run_id, time.time(), 0, str(snapshot_path), poll_sec=0, provider_trace_root=root)
+                    assert at_deadline["deadline_reached"] is True and at_deadline["external_hard_kill"] is False, at_deadline
+                    monitor_path.write_text(json.dumps(at_deadline), encoding="utf-8")
                     assert graphs[0].get("outcome") == "success", graphs
                     assert scenario.updated and scenario.completed and graphs[0]["revision"] == 2
                     assert (root / "local-smoke.txt").read_text(encoding="utf-8") == ARTIFACT_TEXT
-                    assert scenario.worker_step == 13 and scenario.verifier_step == 2
+                    assert scenario.worker_step == 14 and scenario.verifier_step == 2
+                    assert (root / "README.md").read_text(encoding="utf-8") == "snapshot-git-proof\n"
+                    assert subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"]) == initial_head
                     assert not any(scenario.observer_id in (t.get("agents") or []) for t in tasks), "信息投递创建了接收者任务"
-                    journals = list((root / ".agentgo/state/graphs-v6").glob("*.jsonl"))
+                    journals = list((root / ".agentgo/state/graphs-v8").glob("*.jsonl"))
                     assert len(journals) == 1
                     current = json.loads(journals[0].read_text(encoding="utf-8").splitlines()[-1])["snapshot"]
+                    if args.plain_final:
+                        assert current["results"]["check"]["plain_text"] is True
+                        assert current["results"]["check"]["value"]["summary"] == PLAIN_FINAL_TEXT
                     assert current["completion"]["status"] == "committed"
                     assert current["completion"].get("delivery_ref")
                     assert all(n["kind"] == "agentTask" for n in current["definition"]["nodes"])
@@ -324,9 +349,9 @@ def main():
                     assert audit["architecture_ok"] is True, audit
                     outputs = [json.loads(line) for path in (root / ".agentgo" / "sessions").glob("*/turns.jsonl") for line in path.read_text(encoding="utf-8").splitlines() if line]
                     assert any("逐段回显" in output.get("text", "") for output in outputs)
-                    print(json.dumps({"protocol": args.protocol, "dynamic_team": args.team, "graph_outcome": "success", "revision": 2,
+                    print(json.dumps({"protocol": args.protocol, "dynamic_team": args.team, "plain_text_final": args.plain_final, "graph_outcome": "success", "revision": 2,
                         "artifact": "local-smoke.txt", "continuous_reads": 8, "information_did_not_activate_receiver": True,
-                        "dataflow_checks": True, "model_calls": scenario.calls}, ensure_ascii=False))
+                        "dataflow_checks": True, "isolated_git_diff": True, "logical_file_paths": True, "model_calls": scenario.calls}, ensure_ascii=False))
                 except Exception:
                     log.flush()
                     print(log_path.read_text(encoding="utf-8", errors="replace")[-4000:], file=sys.stderr)

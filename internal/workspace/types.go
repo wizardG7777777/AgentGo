@@ -1,25 +1,11 @@
 // Package workspace 实现按任务的写时复制（copy-on-write）执行隔离。
 //
-// 设计（2026-07-26 架构讨论定稿，取代 2026-04-08 删除的 git worktree 方案）：
-//
-//   - 隔离触发：节点声明式。Scheduler 在 publish_task 时设置
-//     model.NodeCapability.Isolation.Mode = "workspace"。
-//   - 执行语义：认领隔离任务的 Runner 运行在 overlay 视图中——
-//     读穿透主根（workspace 未命中则读主根实时内容），写落任务专属
-//     workspace（<projectRoot>/.agentgo/workspaces/<taskID>/）。
-//     edit_file 对已有文件先 copy-on-write（从主根复制基线并记录基线
-//     SHA256），write_file 的新文件直接落 workspace。
-//   - 合并语义：任务成功终态由控制面（不经 LLM）把 dirty set 合并回主根：
-//     基线 hash == 主根当前 hash → fast-forward 直接覆盖；
-//     不一致 → 行级三路合并（Myers diff），干净则写入合并结果；
-//     有冲突 → MergeResult.Conflicted=true，由执行面终止任务为 failed 并
-//     自动 RequestReplan，Scheduler 裁决兜底。
-//   - shell 残余风险（有意接受）：run_shell 在可丢弃完整项目快照中
-//     运行，dirty set 在每次调用前覆盖；但命令写主根绝对路径仍不可完全阻止。
-//
-// 本文件放类型契约与导出方法（导出签名已冻结，B/C 线针对其编码）；
-// 实现主体见 manager.go（生命周期与合并）、manifest.go（基线清单持久化）、
-// merge3.go（行级三路合并，纯函数 Merge3）。
+// agentTask 读取冻结输入，apply_change 写入任务 overlay；Shell 运行完整副本，
+// 结束后同步文件事实。Git 项目拥有副本专属的索引、对象和输入基线。
+// 文件工具与 Shell 参数共用逻辑项目路径，物理目录不作为工具间的路径契约。
+// 候选由 dataflow.go 冻结，选定候选只经图级 Delivery 提交；Git 提交不代表交付。
+// Shell 命令仍有宿主能力，显式引用主根绝对路径不属于此处的 OS 隔离保证。
+// manager.go 保留通用 workspace 生命周期，manifest.go 保存文件基线与 dirty set。
 package workspace
 
 import (

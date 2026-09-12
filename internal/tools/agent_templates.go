@@ -33,11 +33,11 @@ func (g AgentTemplateGroup) Register(r *agent.ToolRegistry) {
 	if g.Provisioner == nil || g.Store == nil || g.Holder == nil {
 		return
 	}
-	r.Register("provision_agent_team", "从精确版本模板创建 Team。初建提供 graph_request_id，与后续 apply_graph_change(create) 的 request_id 完全一致；图内 controller 继承当前图。返回实际 graph_id 和 ready event_type，再用于节点 route；不创建图或脱图任务。",
+	r.Register("provision_agent_team", "图外 Scheduler 从精确版本模板创建 Team。初建提供 graph_request_id，与后续 apply_graph_change(create) 的 request_id 完全一致；重规划任务继承其关联图。返回实际 graph_id 和 ready event_type，作为 agentTask.execution.route_ref；不创建图或脱图任务。",
 		schema.Object().
 			String("template_ref", "精确引用 namespace/name@version，例如 builtin/generalist@2", true).
 			String("purpose", "该 Team 的职责", true).
-			String("graph_id", "图内扩展时显式核对当前图；省略则继承", false).
+			String("graph_id", "重规划时核对任务关联图；省略则继承。首次建图不填写此字段", false).
 			String("graph_request_id", "初建时与 apply_graph_change 的 request_id 使用同一稳定值，不能与 graph_id 混用", false).
 			Int("replicas", "同质副本数，默认 1，受模板和进程预算限制", false).
 			Build(), g.provision)
@@ -81,7 +81,7 @@ func (g AgentTemplateGroup) provision(ctx context.Context, args map[string]any) 
 	}
 	if bound != "" {
 		if graphRequestID != "" {
-			return "", fmt.Errorf("图内扩展不能声明新建 graph_request_id")
+			return "", fmt.Errorf("重规划已有图不能声明新建 graph_request_id")
 		}
 		if graphID != "" && graphID != bound {
 			return "", fmt.Errorf("graph_id 与当前 Graph 不一致，拒绝跨 Graph provision")
@@ -145,7 +145,7 @@ func (g AgentTemplateGroup) currentController() (*model.Task, error) {
 		return nil, fmt.Errorf("agent team provisioning requires a running Scheduler task")
 	}
 	if task.FinalReportGraphID != "" || task.GraphID != "" {
-		return nil, fmt.Errorf("只有图编排 controller 可以创建 Team")
+		return nil, fmt.Errorf("只有图外 Scheduler 可以创建 Team")
 	}
 	return task, nil
 }

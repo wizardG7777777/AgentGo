@@ -85,7 +85,7 @@ func (b *agentTaskBoard) PublishAgentTask(ctx context.Context, d graph.AgentTask
 	if err != nil {
 		return err
 	}
-	task := &model.Task{ID: d.TaskID, Description: d.Node.Title + "\n" + d.Node.Objective + "\n结果必须满足 result_schema=" + string(schema), GraphID: d.GraphID, NodeID: d.Node.NodeID, ActivationID: d.ActivationID, MaxConcurrency: 1, EventType: dataflowRoute(d.Node.Execution.RouteRef), RouteScope: model.GraphRouteScope(d.GraphID), InputCandidateRef: d.Inputs.WorkspaceCandidateRef, Capability: &model.NodeCapability{Tools: d.Node.Execution.Tools, Model: d.Node.Execution.Model, Isolation: &model.IsolationSpec{Mode: model.IsolationModeWorkspace}}}
+	task := &model.Task{ID: d.TaskID, Description: d.Node.Title + "\n" + d.Node.Objective + "\n最终纯文本可正常结束并由运行时原样登记；如果提交结构化 result，其 schema=" + string(schema), GraphID: d.GraphID, NodeID: d.Node.NodeID, ActivationID: d.ActivationID, MaxConcurrency: 1, EventType: dataflowRoute(d.Node.Execution.RouteRef), RouteScope: model.GraphRouteScope(d.GraphID), InputCandidateRef: d.Inputs.WorkspaceCandidateRef, Capability: &model.NodeCapability{Tools: d.Node.Execution.Tools, Model: d.Node.Execution.Model, Isolation: &model.IsolationSpec{Mode: model.IsolationModeWorkspace}}}
 	if err = taskcontract.Inherit(parent, task, loopcontract.WorkInvestigation); err != nil {
 		return err
 	}
@@ -116,12 +116,13 @@ type dataflowBridge struct {
 }
 
 func wireDataflowRuntime(cfg *config.Config, tasks store.TaskStore, outcomes *outcomestore.Store, checkpoints taskCheckpointReader, manager *workspace.Manager, journal *effect.Journal, deliveries *delivery.Store, sessionID func() string) (*graph.DataflowStore, *graph.DataflowRuntime, *dataflowBridge, error) {
-	gs, err := graph.NewDataflowStore(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "graphs-v6"))
+	gs, err := graph.NewDataflowStore(filepath.Join(cfg.ProjectRoot, ".agentgo", "state", "graphs-v8"))
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	b := &agentTaskBoard{tasks: tasks, workspaces: manager}
 	rt := graph.NewDataflowRuntime(gs, b)
+	rt.Candidates = manager
 	bridge := &dataflowBridge{runtime: rt, board: b, outcomes: outcomes, sessionID: sessionID, restored: map[string]bool{}}
 	states, err := gs.List("")
 	if err != nil {

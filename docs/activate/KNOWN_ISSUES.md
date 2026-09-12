@@ -1,19 +1,33 @@
 # KNOWN_ISSUES — 当前限制与验证缺口
 
-最后核对：2026-09-11。工具重建的删除对账见 [清单](../design/tool-taxonomy-deletion-ledger.md)，阶段验证见 [工具契约第 13 章](../design/tool-taxonomy-and-contracts.md)。旧问题清单和原验证事实已 [归档](../archived/known-issues-before-four-categories.md)，不作为新版本通过的证据。
+最后核对：2026-09-12。工具重建的删除对账见 [清单](../design/tool-taxonomy-deletion-ledger.md)，阶段验证见 [工具契约第 13 章](../design/tool-taxonomy-and-contracts.md)。旧问题清单和原验证事实已 [归档](../archived/known-issues-before-four-categories.md)，不作为新版本通过的证据。
 
 ## 尚未完成的外部验证
 
-- **完整 Flask-8 尚未复测**：新版 agentTask 已完成真实 automatic-options 单题并通过；其它七题不在当前成绩范围。
 - **macOS 原生启动/交互未在本地验证**：CI 保留 macOS/Windows/Linux，当前主机为 Windows。不能以交叉构建代替 macOS 实际启动或 TTY 验证。
 - **真实 provider 图片/文件能力未验证**：类型化输入的本地编码、授权与预算检查不代表当前外部模型已支持这些能力；默认仍只声明文本。
 - **TTY 专属交互仍有人工验证缺口**：TUI inline/alt-screen 切换、Windows ConPTY 粘贴和终端滚动有单测，实际终端差异仍需对应设备复测。
+
+## 最新真实测试与残余可用性问题
+
+2026-09-12 完整 Flask-8 已 8/8 修复成功；此前重复阻塞事件、正文二次外置、局部分区限额、Git 工作视图与长路径、终态静默窗口问题均已修复并记录验证。实际成绩和判读边界见 [本轮报告](../test-issues/2026-09-12-flask8-after-context-and-l3-fixes.md)，原 6/8 报告保留历史事实。
+
+- **Shell 物理依赖路径不能直接用于逻辑文件接口**：本轮第二题有 4 次把 .workspace-shell/.venv 物理路径传入 read_file 后读取失败。模型后来完成任务，但跨工具路径提示仍可改进，不能将这些调用视为已被自动映射。
+- **结构化结果与引用提示仍可改进**：本轮仍出现 13 次未知参数字段、3 次结果字段缺失、2 次把 CandidateRef/OutcomeRef 误作 ResultRef。框架拒绝后模型纠正，未阻止本轮交付；不通过兼容别名或放松校验掩盖问题。
+- **真实 Chat Completions 完整批测仍缺少证据**：本轮正式 SWE 使用 Responses；双协议本地 SSE 用例不能替代另一真实协议的完整测试。
+
+## 原文模式已删除的故障路径
+
+- 已删除 L2 正文引用替换、历史裁剪与自定义片段/分区/原子组大小限额；原两个失败历史以全部 23/20 轮原文回放通过，不再生成递归 ContentRef。
+- 已删除 Graph 纯文本结束的重复提交提醒；普通文本可自动登记并交付，结构化提交仍可选。
+- 已删除 read_file 缓存摘要 stub/force_full，以及 inspect_node 的 details_ref 正文间接访问。L3 文件路径回显与 Shell cwd 坐标已统一。
+- 新契约、删除清单及验证边界见 [实施记录](../design/raw-context-and-plain-results.md)。这些离线结果不替代新版本真实 SWE。
 
 ## 本次修复与剩余验证
 
 - 旧图缺少特殊验收节点导致候选未交付的问题，已由唯一 agentTask、普通检查任务的候选绑定和图级 complete 替代；真实 automatic-options 已从2失败变为494通过。
 - 多行 Shell 的文本不再作为事实身份，改用 CallID；执行前核对实际路由与工作区组件。
-- 原六题失败材料保留在 [旧运行调查](../test-issues/2026-09-11-swe-candidate-delivery-audit.md)，当前验证见 [agentTask 记录](../test-issues/2026-09-11-agenttask-validation.md)。尚未对整套 Flask-8 复测，不能把一题通过推广到其它题。
+- 原六题失败材料保留在 [旧运行调查](../test-issues/2026-09-11-swe-candidate-delivery-audit.md)，早期单题验证见 [agentTask 记录](../test-issues/2026-09-11-agenttask-validation.md)。最新独立完整复测为 8/8 成功；残余调用可用性问题如上，不能以绿色审计隐藏它们。
 
 ## 当前功能边界
 

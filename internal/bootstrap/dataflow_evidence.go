@@ -249,6 +249,9 @@ func graphTaskResult(task *model.Task) map[string]any {
 			return value
 		}
 	}
+	if task.LastResponse != "" {
+		return map[string]any{"summary": task.LastResponse}
+	}
 	summary := task.Results["summary"]
 	if summary == "" {
 		for _, key := range task.Agents {

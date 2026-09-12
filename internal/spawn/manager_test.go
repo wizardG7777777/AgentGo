@@ -203,7 +203,7 @@ func TestManagerSpawnRejectsOversizedPromptBeforeRunner(t *testing.T) {
 		Override: RuntimeOverride{SystemPromptSet: true, SystemPrompt: strings.Repeat("策", 1_100_000)},
 	})
 	if err == nil || !strings.Contains(err.Error(), "L1/L2 runtime contract") ||
-		!strings.Contains(err.Error(), "fragment_limit_exceeded") {
+		!strings.Contains(err.Error(), "snapshot_budget_exceeded") {
 		t.Fatalf("ad-hoc Spawn 必须在 Runner/Task 副作用前拒绝超限 Prompt: %v", err)
 	}
 	if all, _ := tasks.ScanAll(); len(all) != 0 {
