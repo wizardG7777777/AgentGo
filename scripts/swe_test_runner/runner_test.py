@@ -385,8 +385,9 @@ class SWETestRunnerContractTest(unittest.TestCase):
             prompt = config.prompt_dir / f"{task.task_id}.md"
             self.assertTrue(prompt.is_file(), task.task_id)
             content = prompt.read_text(encoding="utf-8")
-            self.assertIn("uv run --no-sync python -m pytest -q", content)
-            self.assertNotIn(".venv/bin/python", content)
+            self.assertIn(".venv/bin/python -m pytest -q", content)
+            self.assertIn(".venv/Scripts/python.exe -m pytest -q", content)
+            self.assertNotIn("uv run", content)
 
     def test_phase_counter_keeps_call_outcomes_and_phase_errors_separate(self):
         counter = pytest_reporter.PhaseCounter()

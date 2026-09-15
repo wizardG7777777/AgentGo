@@ -1,6 +1,13 @@
 # AgentGo SWE Test Runner
 
-本目录是外部 Flask SWE 测试程序的唯一入口，负责考题准备、AgentGo 进程管理、正式 pytest 判题和批次汇总。它不属于 L3 Harness Engineering。工具重建的适配计划与阶段证据见 [工具契约第 12–13 章](../../docs/design/tool-taxonomy-and-contracts.md)。本地迁移与验证已完成，真实批测按用户要求暂缓。
+本目录是外部 Flask SWE 测试程序的唯一入口，负责考题准备、AgentGo 进程管理、正式 pytest 判题和批次汇总。它不属于 L3 Harness Engineering。工具重建的适配计划与阶段证据见 [工具契约第 12–13 章](../../docs/design/tool-taxonomy-and-contracts.md)。最新 Windows 真实批次见 [2026-09-12 报告](../../docs/test-issues/2026-09-12-flask8-after-context-and-l3-fixes.md)。
+
+Ubuntu 24.04 Flask 系列镜像见 [SWE_LinuxContainers](../../SWE_LinuxContainers/README.md)：镜像内置脚本/题库及 pip 预装环境，
+启动时必须显式提供匹配 CPU 架构的 AgentGo Linux 二进制，目标容器不构建、不执行 pip install；
+个人明文 `config.json` 只做文件存在性门禁。默认导出报告/行为日志后销毁本批容器与数据卷；
+`--persist` 保留容器及包含完整配置的内部现场。
+`SWE_PREBUILT_ENVS` 指定按题目预制的 Python 环境，`SWE_PROBE_ARCHIVE` 启用 Python 前置探针原文归档；
+未设置时保留原有环境准备和探针行为。容器配置门禁不替代本 Runner 的四变量/协议契约。
 
 ## 启动条件
 
@@ -13,7 +20,9 @@
 
 两个模型可以相同，通用能力探针按实际模型去重。旧 `SWE_MODEL`、`SWE_BASE_MODEL`、`SWE_WORKER_MODEL` 不作为 fallback。角色模型由 [setting.swe-flask.yaml](../../setting.swe-flask.yaml) 决定：Scheduler/Verifier 使用快速档，Explorer/Worker 使用旗舰档。已删除独立 Observation 模型配置及多版本 Observation 探针。
 
-需要 Git、uv、Python 3.13、已构建的 AgentGo，以及包含目标 fix commit 的完整 Flask Git 仓库。公开入口自行将 stdout/stderr 配置为 UTF-8；Windows 不依赖调用者设置代码页或 PYTHONUTF8。
+原生启动需要 Git、uv、Python 3.13、已构建的 AgentGo，以及包含目标 fix commit 的完整 Flask Git 仓库。
+容器路径使用镜像预制的 Python/pip 环境，跳过原生 uv sync 准备步骤，容器不安装 uv。
+公开入口自行将 stdout/stderr 配置为 UTF-8；Windows 不依赖调用者设置代码页或 PYTHONUTF8。
 
 可选变量：
 
@@ -32,7 +41,7 @@ testbed 默认目录：Windows `%LOCALAPPDATA%/AgentGo/swe`（缺失时使用 US
 
 ## 完整事务命令
 
-在仓库根运行。以下是后续使用命令，本次改造期间尚未执行 SWE 探针、任务或批次。
+在仓库根运行，实际成绩以具体批次报告和归档为准。
 
 ```powershell
 go build -o .\agentgo.exe .
@@ -77,11 +86,11 @@ run_pytest 使用实际虚拟环境 Python 和 argv 测试路径，保留 pytest
 
 `runtime_audit.py` 读取新版运行记录，不根据旧轮次阈值或固定工具序列判分。工具请求、Registry 派发、Shell 实际执行、模型输出和 Python pytest 是不同事实。非零 Shell 退出本身不等于架构错误；取消、超时和启动失败不伪造 exit=0。
 
-新目录位于 `.agentgo/state`：`context-snapshots-v2`、`task-outcomes-v2`、`run-usage-v2`、`loop-facts-v2`、`graph-authoring-v2`、`graphs-v5`、`deliveries-v2`。Session 模型完整输出仍在各会话 turns.jsonl。目录版本与内部记录 schema 分别校验，不向旧目录 fallback。
+当前目录位于 `.agentgo/state`：`context-snapshots-v3`、`task-outcomes-v4`、`run-usage-v2`、`loop-facts-v3`、`graphs-v8`、`deliveries-v3`、`model-probes-v3`。图 authoring/completion 共用 graphs-v8 日志。Session 模型完整输出仍在各会话 turns.jsonl，候选在 `.agentgo/candidates-v1`。目录版本与内部记录 schema 分别校验，不向旧目录 fallback。
 
 Context 本体没有 RunID，通过本 Run 的 InvocationID 关联。工具按 Run/Task/Attempt/Invocation/CallID 对账；重复相同记录不增加计数，冲突、缺失及损坏记录报告为证据问题。未知值不当作有效的零值，截断日志保留可读前缀且不修改原文件。
 
-`result.json` 使用 `agentgo.swe-result/v4`；`judge.json` 使用 `agentgo.swe-judge/v2`。分别保留 Graph/Delivery 结果、执行是否收口、架构检查、provider 兼容性、基础设施状态和 pytest verdict。`architecture_ok=null` 表示当前证据或执行状态不足以完成审计，不能显示为架构通过。最终 resolved 还要求真实测试身份、有补丁、无测试篡改、Graph success 和执行收口。
+`result.json` 使用 `agentgo.swe-result/v5`；`judge.json` 使用 `agentgo.swe-judge/v2`。分别保留 Graph/Delivery 结果、执行是否收口、架构检查、provider 兼容性、基础设施状态和 pytest verdict。`architecture_ok=null` 表示当前证据或执行状态不足以完成审计，不能显示为架构通过。最终 resolved 还要求真实测试身份、有补丁、无测试篡改、Graph success 和执行收口。
 
 退出码：0 表示通过；1 为基础设施/结果证据问题或批次未完整执行；2 为已判定的运行契约失败；3 为未修复或执行未完成；4 为 provider 工具/协议兼容性失败。保留具体 reason code 和各项结果，不能只展示一个总分。
 

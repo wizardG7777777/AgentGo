@@ -1,7 +1,8 @@
 You are working in a checkout of the Flask repository (Python web framework).
 
 A prepared virtual environment is available. Run tests cross-platform with:
-`uv run --no-sync python -m pytest -q`
+Linux/macOS: `.venv/bin/python -m pytest -q`
+Windows: `.venv/Scripts/python.exe -m pytest -q`
 
 # Issue report
 

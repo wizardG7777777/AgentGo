@@ -90,6 +90,15 @@ SWE Test Runner 唯一入口为 scripts/swe_test_runner/runner.py。四变量 SW
 
 新测试与状态机边界优先用确定性测试及 testing/quick。并发域跑 race，CI 同时覆盖 Windows/Linux/macOS。修复同步更新 KNOWN_ISSUES；完成前提交删除/迁移/重写/新增对账。
 
+## SWE 容器与 Git 提交边界
+
+- 容器工具目录为 `SWE_LinuxContainers/`；CI、脚本和当前使用文档必须引用实际目录。容器验证仅覆盖 Linux，Windows/macOS 仍需原生验证。
+- 允许提交容器构建/运行脚本、必要的 Runner 与 Prompt 适配、测试、文档和仅含占位符的配置示例。AgentGo Linux 二进制由运行者通过 `--agentgo-binary` 提供，不随源码提交。
+- 真实 `config.json`、`.env`、密钥/令牌/认证文件、`.build/`、`artifacts/`、完整探针/行为日志、测试工作区和镜像归档只保留在本地。`.gitignore` 与 `.dockerignore` 分别保护 Git 暂存和 Docker 构建上下文；文档中的真实配置、凭据或个人路径也必须移除或替换为占位符。
+- 隐私检查只输出文件名、规则名及是否命中，不打印、截断或哈希凭据真值。配置示例不得从真实配置直接复制；使用明确的无效占位符。
+- 提交前按明确文件清单暂存，核对 `git diff --cached`、新增文件及忽略规则；不使用 `git add .`、`git add -A` 或强制加入被忽略文件。保留与本次任务无关的改动和历史 stash。
+- 推送前运行相关检查，提交后核对目标远程地址与分支；推送后直接查询远程提交，确认与本地提交一致。真实 SWE 成绩只引用已有对应批次证据，离线测试和冒烟不作为新的真实 SWE 成绩。
+
 ## 跨平台硬约束
 
 AgentGo 同等支持 Windows / macOS / Linux。以下每一条都曾在生产坏过一次，视为硬性要求：

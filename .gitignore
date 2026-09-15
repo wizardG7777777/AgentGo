@@ -82,3 +82,31 @@ __pycache__/
 
 # rapid property test 失败用例的本地生成物
 internal/probe/testdata/rapid/
+
+# SWE container private inputs, frozen build contexts and full evidence
+# Keep exclusions for the former local directory too; do not migrate its data.
+/SWE_Linux/config.json
+/SWE_Linux/.build/
+/SWE_Linux/artifacts/
+/SWE_Linux/agentgo-linux
+/SWE_LinuxContainers/config.json
+/SWE_LinuxContainers/config.*.json
+/SWE_LinuxContainers/.env*
+/SWE_LinuxContainers/*.pem
+/SWE_LinuxContainers/*.key
+/SWE_LinuxContainers/credentials*
+/SWE_LinuxContainers/secrets/
+/SWE_LinuxContainers/.build/
+/SWE_LinuxContainers/artifacts/
+/SWE_LinuxContainers/worktrees/
+/SWE_LinuxContainers/testbed/
+/SWE_LinuxContainers/provider-probes/
+/SWE_LinuxContainers/*.log
+/SWE_LinuxContainers/*.jsonl
+/SWE_LinuxContainers/*.tar
+/SWE_LinuxContainers/*.tar.gz
+/SWE_LinuxContainers/*.tgz
+/SWE_LinuxContainers/*.zip
+/SWE_LinuxContainers/agentgo-linux*
+/agentgo-linux-amd64
+/agentgo-linux-arm64

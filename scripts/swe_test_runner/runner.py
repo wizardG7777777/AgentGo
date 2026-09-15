@@ -11,6 +11,8 @@ from __future__ import annotations
 from sse import decode_probe
 from runtime_audit import RESULT_SCHEMA, EvidenceReader, collect_runtime, audit_runtime
 from test_identity import input_identity, validate_import_origin, compare_failures
+from prebuilt_environment import install_prebuilt
+from probe_archive import record_probe
 
 import argparse
 import collections
@@ -521,20 +523,26 @@ def urllib_probe_transport(endpoint: str, api_key: str, body: dict, timeout_sec:
             "Content-Type": "application/json",
         },
     )
-    try:
-        with urllib.request.urlopen(
-                request, timeout=timeout_sec, context=verified_ssl_context()) as response:
-            if response.headers.get_content_type() != "text/event-stream":
-                raise RuntimeError("provider capability probe 必须返回 SSE")
-            protocol = "responses" if endpoint.endswith("/responses") else "chat_completions"
-            payload = decode_probe(response, protocol)
-            return response.status, payload
-    except urllib.error.HTTPError as error:
+    with record_probe(endpoint, body) as archive:
         try:
-            payload = json.loads(error.read().decode("utf-8", errors="replace"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            payload = {}
-        return error.code, payload if isinstance(payload, dict) else {}
+            with urllib.request.urlopen(
+                    request, timeout=timeout_sec, context=verified_ssl_context()) as response:
+                archive.headers(response)
+                if response.headers.get_content_type() != "text/event-stream":
+                    raise RuntimeError("provider capability probe 必须返回 SSE")
+                protocol = "responses" if endpoint.endswith("/responses") else "chat_completions"
+                payload = decode_probe(archive.lines(response), protocol)
+                archive.write("response.json", payload)
+                return response.status, payload
+        except urllib.error.HTTPError as error:
+            archive.headers(error)
+            try:
+                raw = error.read()
+                archive.record_bytes(raw)
+                payload = json.loads(raw.decode("utf-8", errors="replace"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                payload = {}
+            return error.code, payload if isinstance(payload, dict) else {}
 
 
 def provider_probe_infrastructure_error(status: int, payload: dict) -> SWETestRunnerInfrastructureError | None:
@@ -1005,10 +1013,14 @@ def setup_task(config: SWETestRunnerConfig, task: TaskSpec, target: Path | None 
     run_command(["git", "reflog", "expire", "--expire=now", "--all"], cwd=worktree)
     run_command(["git", "gc", "--prune=now", "--quiet"], cwd=worktree)
     run_command(["git", "remote", "remove", "origin"], cwd=worktree, check=False)
-    run_command(
-        ["uv", "sync", "--frozen", "--no-default-groups", "--group", "tests", "--python", "3.13"],
-        cwd=worktree,
-    )
+    prebuilt = os.environ.get("SWE_PREBUILT_ENVS")
+    if prebuilt:
+        install_prebuilt(Path(prebuilt), task.task_id, task.fix_sha, worktree)
+    else:
+        run_command(
+            ["uv", "sync", "--frozen", "--no-default-groups", "--group", "tests", "--python", "3.13"],
+            cwd=worktree,
+        )
     python = venv_python(worktree)
     info = run_command([
         str(python), "-c",

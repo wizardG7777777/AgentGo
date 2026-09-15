@@ -1,0 +1,10 @@
+{
+  "environment": {
+    "SWE_API_KEY": "",
+    "SWE_BASE_URL": "",
+    "SWE_FAST_MODEL": "",
+    "SWE_FLAG_SHIP_MODEL": "",
+    "SWE_PROTOCOL": "responses"
+  },
+  "runner_args": ["batch", "--timeout", "1200"]
+}

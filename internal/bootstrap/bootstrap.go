@@ -361,7 +361,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 		traceDir = sessMgr.LogDir()
 	}
 
-	traceWriter, traceErr := trace.NewWriter(traceDir, 100)
+	traceWriter, traceErr := trace.NewWriter(traceDir, traceFileLimit())
 	if traceErr != nil {
 		fmt.Printf("[启动] WARNING: trace 系统初始化失败 (dir=%s): %v\n", traceDir, traceErr)
 	} else {
@@ -370,7 +370,7 @@ func BootstrapWithOptions(configPath string, explicit bool, opts BootstrapOption
 			traceWriter.SetSessionID(sessMgr.Current().ID)
 		}
 		trace.SetDefault(traceWriter)
-		log.Printf("[启动] Trace 系统已启动 (dir=%s, 保留最近 100 个任务)", traceDir)
+		log.Printf("[启动] Trace 系统已启动 (dir=%s, 文件保留上限=%d；0 表示全部保留)", traceDir, traceFileLimit())
 	}
 
 	// Step 1.6: 初始化 prompt dumper（仅在 AGENTGO_DUMP_PROMPTS=1 时启用）
@@ -1753,8 +1753,8 @@ func (s *System) onSessionSwitched(newSess *session.Session) {
 		return
 	}
 
-	// 2.1 trace writer：与 bootstrap Step 1.5 相同的 maxTasks=100 语义
-	newWriter, err := trace.NewWriter(logsDir, 100)
+	// 2.1 trace writer：沿用 bootstrap Step 1.5 的文件保留策略。
+	newWriter, err := trace.NewWriter(logsDir, traceFileLimit())
 	if err != nil {
 		log.Printf("[session] WARNING: 新 Session trace writer 创建失败 (%s): %v —— trace 保持旧绑定", logsDir, err)
 	} else {

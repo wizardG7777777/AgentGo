@@ -10,5 +10,6 @@
     "repository": "https://github.com/pallets/flask.git"
   },
   "python_version": "3.13",
-  "test_command": "uv run --no-sync python -m pytest -q"
+  "test_command": ".venv/bin/python -m pytest -q",
+  "test_command_windows": ".venv/Scripts/python.exe -m pytest -q"
 }

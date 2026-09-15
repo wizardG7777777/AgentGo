@@ -1,0 +1,28 @@
+services:
+  swe:
+    # Explicit manual persistence/debug path. Normal tests use run.py, which
+    # verifies exports and removes the batch container + volume by default.
+    profiles: [persist]
+    image: agentgo-swe-flask:ubuntu24.04-py3.13-v1
+    init: true
+    restart: "no"
+    stop_grace_period: 60s
+    volumes:
+      - type: bind
+        source: ./config.json
+        target: /run/swe/config.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - swe-debug-data:/data
+      - type: bind
+        source: ./agentgo-linux
+        target: /run/swe/agentgo
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./artifacts
+        target: /exports
+volumes:
+  swe-debug-data:

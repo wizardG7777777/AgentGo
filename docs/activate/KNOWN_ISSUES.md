@@ -1,14 +1,22 @@
 # KNOWN_ISSUES — 当前限制与验证缺口
 
-最后核对：2026-09-12。工具重建的删除对账见 [清单](../design/tool-taxonomy-deletion-ledger.md)，阶段验证见 [工具契约第 13 章](../design/tool-taxonomy-and-contracts.md)。旧问题清单和原验证事实已 [归档](../archived/known-issues-before-four-categories.md)，不作为新版本通过的证据。
+最后核对：2026-09-15。工具重建的删除对账见 [清单](../design/tool-taxonomy-deletion-ledger.md)，阶段验证见 [工具契约第 13 章](../design/tool-taxonomy-and-contracts.md)。旧问题清单和原验证事实已 [归档](../archived/known-issues-before-four-categories.md)，不作为新版本通过的证据。
 
 ## 尚未完成的外部验证
+
+- **Linux arm64 真实 provider / M3 Max 原生仍待验证**：[容器工具](../../SWE_LinuxContainers/README.md) 的 amd64 Docker 真实 Responses Flask-8 已 8/8 修复成功，见 [本轮报告](../test-issues/2026-09-13-docker-flask8-real.md)。arm64 目前仍是仿真环境红绿自检和二进制冒烟，不能扩展为 M3 Max 原生或 arm64 真实模型成绩。公共 amd64/arm64 镜像索引已于 2026-09-15 核对，使用方式见容器说明；不代表 arm64 真实模型验证完成。
 
 - **macOS 原生启动/交互未在本地验证**：CI 保留 macOS/Windows/Linux，当前主机为 Windows。不能以交叉构建代替 macOS 实际启动或 TTY 验证。
 - **真实 provider 图片/文件能力未验证**：类型化输入的本地编码、授权与预算检查不代表当前外部模型已支持这些能力；默认仍只声明文本。
 - **TTY 专属交互仍有人工验证缺口**：TUI inline/alt-screen 切换、Windows ConPTY 粘贴和终端滚动有单测，实际终端差异仍需对应设备复测。
 
 ## 最新真实测试与残余可用性问题
+
+2026-09-15 容器源码与隐私边界交付验证见 [本次记录](../test-issues/2026-09-15-swe-container-source-delivery.md)；仅离线回归与二进制冒烟，不计为新的真实 SWE 成绩。
+
+2026-09-13 Ubuntu 24.04 / linux/amd64 Docker 完整真实批次 8/8 成功，285 次业务模型调用，
+无新增测试失败、篡改、未结算调用或超时强杀；报告/行为日志校验后已删除本批容器和卷。
+仍有 41 条工具级错误/拒绝被模型纠正，且最后一题输入量偏高，详见 [Docker 对照报告](../test-issues/2026-09-13-docker-flask8-real.md)。
 
 2026-09-12 完整 Flask-8 已 8/8 修复成功；此前重复阻塞事件、正文二次外置、局部分区限额、Git 工作视图与长路径、终态静默窗口问题均已修复并记录验证。实际成绩和判读边界见 [本轮报告](../test-issues/2026-09-12-flask8-after-context-and-l3-fixes.md)，原 6/8 报告保留历史事实。
 

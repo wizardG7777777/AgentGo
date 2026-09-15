@@ -27,7 +27,7 @@ func TestSWEPromptsUseExecutionFactsAndRoleBoundaries(t *testing.T) {
 				}
 			}
 			if role == "worker" {
-				for _, name := range []string{"apply_change", "run_shell", "uv run --no-sync python -m pytest -q"} {
+				for _, name := range []string{"apply_change", "run_shell", ".venv/bin/python -m pytest -q", ".venv/Scripts/python.exe -m pytest -q"} {
 					if !strings.Contains(text, name) {
 						t.Errorf("执行角色缺少 %s", name)
 					}

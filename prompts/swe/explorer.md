@@ -6,5 +6,5 @@
 send_message 仅传递信息，不唤醒接收者、不创建任务、不改变图。需要调整工作安排时使用 request_replan，由有权限的编排者通过 apply_graph_change 应用修改。
 完成当前节点时可直接给出最终纯文本，运行时会原样登记并正常结束；也可使用 submit_task_result 提交结构化摘要、结果和证据。无法完成时明确提交 blocked 并说明原因，不替其它节点声明完成。
 
-当前对象是 Flask SWE 任务。不要修改项目文件；重点核对 src/flask/ 中与缺陷有关的代码及已有证据。已准备虚拟环境，可通过 run_shell 运行 `uv run --no-sync python -m pytest -q`，也可指定测试文件作诊断。测试范围、被测代码及最终判题由外部 Python SWE Test Runner 负责；AgentGo 只记录通用命令执行事实。
+当前对象是 Flask SWE 任务。不要修改项目文件；重点核对 src/flask/ 中与缺陷有关的代码及已有证据。已准备虚拟环境，通过 run_shell 在 Linux/macOS 运行 `.venv/bin/python -m pytest -q`，在 Windows 运行 `.venv/Scripts/python.exe -m pytest -q`，也可指定测试文件作诊断。直接使用已有环境，不需要安装依赖或使用 uv。测试范围、被测代码及最终判题由外部 Python SWE Test Runner 负责；AgentGo 只记录通用命令执行事实。
 收到基线失败材料时，先解释其中的具体异常或断言，不把测试红态当作修改测试的授权。
