@@ -33,7 +33,7 @@ type FrozenCandidate struct {
 func snapshotIgnored(rel string, dir bool) bool {
 	parts := strings.Split(filepath.ToSlash(rel), "/")
 	for _, part := range parts {
-		if part == ".git" || part == ".agentgo" || part == ".venv" || part == "__pycache__" || part == ".pytest_cache" {
+		if part == ".git" || part == ".agentgo" || part == ".venv" || part == "node_modules" || part == ".swe-build" || part == "__pycache__" || part == ".pytest_cache" {
 			return true
 		}
 	}
@@ -161,7 +161,7 @@ func (m *Manager) MaterializeAgentTask(taskID, graphID, runID, parentRef string)
 			_ = removeTree(tmp)
 			return nil, err
 		}
-		if err = os.Rename(tmp, base); err != nil {
+		if err = publishDirectory(tmp, base); err != nil {
 			_ = removeTree(tmp)
 			return nil, err
 		}
@@ -316,7 +316,7 @@ func (m *Manager) FreezeAgentTaskCandidate(taskID, graphID, runID, parentRef str
 		}
 	}
 	if err == nil {
-		err = os.Rename(tmp, dest)
+		err = publishDirectory(tmp, dest)
 	}
 	if err != nil {
 		_ = removeTree(tmp)

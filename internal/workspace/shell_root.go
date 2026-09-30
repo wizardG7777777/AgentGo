@@ -51,7 +51,7 @@ func (v *View) prepareShellRoot() (string, error) {
 			cleanup()
 			return "", err
 		}
-		if err := os.Rename(tmp, root); err != nil {
+		if err := publishDirectory(tmp, root); err != nil {
 			cleanup()
 			return "", fmt.Errorf("发布 shell 项目快照: %w", err)
 		}
@@ -92,7 +92,9 @@ func copyProjectTree(sourceRoot, targetRoot string) error {
 		if index := strings.IndexRune(rel, filepath.Separator); index >= 0 {
 			first = rel[:index]
 		}
-		if first == ".agentgo" || entry.Name() == ".git" {
+		// Native SWE build caches embed their source directory. Recreate them in
+		// the task view; copying a CMake cache would test the previous checkout.
+		if first == ".agentgo" || first == ".swe-build" || entry.Name() == ".git" {
 			if entry.IsDir() {
 				return filepath.SkipDir
 			}
@@ -114,7 +116,7 @@ func copyProjectTree(sourceRoot, targetRoot string) error {
 			if mkErr := os.MkdirAll(filepath.Dir(target), 0o755); mkErr != nil {
 				return mkErr
 			}
-			return os.Symlink(link, target)
+			return copySnapshotSymlink(info, link, target)
 		case info.Mode().IsRegular():
 			return copySnapshotFile(path, target, info.Mode().Perm())
 		default:
