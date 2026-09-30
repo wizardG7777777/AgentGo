@@ -1,0 +1,192 @@
+{
+  "schema": "agentgo.native-swe-tasks/v1",
+  "tasks": [
+    {
+      "task_id": "fmt-6aa4a5f6f8c2",
+      "title": "Fix debug string formatting for range formatters (#4936)",
+      "base_sha": "1da57c78d431f6907fbf3329c44fb3b98abe1b84",
+      "fix_sha": "6aa4a5f6f8c25eec5879b360b95c814dd5c37991",
+      "test_files": [
+        "test/ranges-test.cc"
+      ],
+      "source_files": [
+        "include/fmt/ranges.h"
+      ],
+      "source_url": "https://github.com/fmtlib/fmt/commit/6aa4a5f6f8c25eec5879b360b95c814dd5c37991",
+      "test_selectors": [],
+      "ctest_targets": [
+        "ranges-test"
+      ],
+      "regression_scope": {
+        "kind": "ctest-project",
+        "paths": [
+          "test"
+        ]
+      }
+    },
+    {
+      "task_id": "fmt-2012961e3ec6",
+      "title": "Fix width and alignment for calendar types (#4935)",
+      "base_sha": "56fcd0b945999d4c4b57ccf415c3649992303e45",
+      "fix_sha": "2012961e3ec62e0f6133e7ea95d55db7aca57ccc",
+      "test_files": [
+        "test/chrono-test.cc"
+      ],
+      "source_files": [
+        "include/fmt/chrono.h"
+      ],
+      "source_url": "https://github.com/fmtlib/fmt/commit/2012961e3ec62e0f6133e7ea95d55db7aca57ccc",
+      "test_selectors": [],
+      "ctest_targets": [
+        "chrono-test"
+      ],
+      "regression_scope": {
+        "kind": "ctest-project",
+        "paths": [
+          "test"
+        ]
+      }
+    },
+    {
+      "task_id": "fmt-854fc9567a2c",
+      "title": "Fix argument count in dynamic stores with named arguments (#4933)",
+      "base_sha": "8dc5d3f69f15417d13c60a4a21f7298ed24db41c",
+      "fix_sha": "854fc9567a2cbea01b0f413565705ccbaf5bde5c",
+      "test_files": [
+        "test/args-test.cc"
+      ],
+      "source_files": [
+        "include/fmt/args.h"
+      ],
+      "source_url": "https://github.com/fmtlib/fmt/commit/854fc9567a2cbea01b0f413565705ccbaf5bde5c",
+      "test_selectors": [],
+      "ctest_targets": [
+        "args-test"
+      ],
+      "regression_scope": {
+        "kind": "ctest-project",
+        "paths": [
+          "test"
+        ]
+      }
+    },
+    {
+      "task_id": "fmt-8a7aea04222d",
+      "title": "Fix out-of-bounds read in error code format parsing (#4934)",
+      "environment": {
+        "sanitizer": "address"
+      },
+      "base_sha": "7071103ceadf5791d3edc47149969b42e8abc883",
+      "fix_sha": "8a7aea04222d6680aae2c69fe8d514ffc2f9808d",
+      "test_files": [
+        "test/std-test.cc"
+      ],
+      "source_files": [
+        "include/fmt/std.h"
+      ],
+      "source_url": "https://github.com/fmtlib/fmt/commit/8a7aea04222d6680aae2c69fe8d514ffc2f9808d",
+      "test_selectors": [],
+      "ctest_targets": [
+        "std-test"
+      ],
+      "regression_scope": {
+        "kind": "ctest-project",
+        "paths": [
+          "test"
+        ]
+      }
+    },
+    {
+      "task_id": "fmt-b4b1657c2aa4",
+      "title": "Fix debug format width calculation (#4902)",
+      "base_sha": "ff4a0fdfb9d626c457916ce4988f35fe04e2259c",
+      "fix_sha": "b4b1657c2aa45cf08dcd7a76e2302bef60314148",
+      "test_files": [
+        "test/format-test.cc"
+      ],
+      "source_files": [
+        "include/fmt/format.h"
+      ],
+      "source_url": "https://github.com/fmtlib/fmt/commit/b4b1657c2aa45cf08dcd7a76e2302bef60314148",
+      "test_selectors": [],
+      "ctest_targets": [
+        "format-test"
+      ],
+      "regression_scope": {
+        "kind": "ctest-project",
+        "paths": [
+          "test"
+        ]
+      }
+    },
+    {
+      "task_id": "fmt-7852fc384ce4",
+      "title": "Fix out-of-range integers with the 'c' presentation type (#4839)",
+      "base_sha": "d45179c1e7092c6b0d46e4f400fa537377623398",
+      "fix_sha": "7852fc384ce4232284fc685f66f70ed99b0c2cd4",
+      "test_files": [
+        "test/format-test.cc"
+      ],
+      "source_files": [
+        "include/fmt/format.h"
+      ],
+      "source_url": "https://github.com/fmtlib/fmt/commit/7852fc384ce4232284fc685f66f70ed99b0c2cd4",
+      "test_selectors": [],
+      "ctest_targets": [
+        "format-test"
+      ],
+      "regression_scope": {
+        "kind": "ctest-project",
+        "paths": [
+          "test"
+        ]
+      }
+    },
+    {
+      "task_id": "fmt-af2d9f2b78d6",
+      "title": "Fix FMT_COMPILE failure with format_as mapped types  (Issue #4794) (#4836)",
+      "base_sha": "1a99c2630cdf07f4e18924adc5e10650aaf67bc6",
+      "fix_sha": "af2d9f2b78d68e2fa8f7d5f120da3127e954ec05",
+      "test_files": [
+        "test/compile-test.cc"
+      ],
+      "source_files": [
+        "include/fmt/compile.h"
+      ],
+      "source_url": "https://github.com/fmtlib/fmt/commit/af2d9f2b78d68e2fa8f7d5f120da3127e954ec05",
+      "test_selectors": [],
+      "ctest_targets": [
+        "compile-test"
+      ],
+      "regression_scope": {
+        "kind": "ctest-project",
+        "paths": [
+          "test"
+        ]
+      }
+    },
+    {
+      "task_id": "fmt-128ba144ab85",
+      "title": "fix out-of-bounds read in basic_format_args::get (#4800)",
+      "base_sha": "e60274b29c0a748df2c6280d0a374e6eef3b6c73",
+      "fix_sha": "128ba144ab85ddd0ad9ea39f2febdfb51802cb1b",
+      "test_files": [
+        "test/printf-test.cc"
+      ],
+      "source_files": [
+        "include/fmt/base.h"
+      ],
+      "source_url": "https://github.com/fmtlib/fmt/commit/128ba144ab85ddd0ad9ea39f2febdfb51802cb1b",
+      "test_selectors": [],
+      "ctest_targets": [
+        "printf-test"
+      ],
+      "regression_scope": {
+        "kind": "ctest-project",
+        "paths": [
+          "test"
+        ]
+      }
+    }
+  ]
+}

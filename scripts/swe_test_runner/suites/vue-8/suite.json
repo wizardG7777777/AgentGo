@@ -1,0 +1,19 @@
+{
+  "schema": "agentgo.swe-suite/v3",
+  "suite_id": "vue-8",
+  "project": "vue",
+  "title": "vue native eight-task SWE suite",
+  "task_count": 8,
+  "upstream": {
+    "vcs": "git",
+    "repository": "https://github.com/vuejs/core.git"
+  },
+  "driver": "vitest",
+  "environment": {
+    "test_args": [
+      "--maxWorkers=2",
+      "--minWorkers=1"
+    ]
+  },
+  "qualification_status": "pending"
+}

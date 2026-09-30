@@ -1,0 +1,213 @@
+{
+  "schema": "agentgo.native-swe-tasks/v1",
+  "tasks": [
+    {
+      "task_id": "cobra-746ef0715872",
+      "title": "fix: prevent completions from mutating os.Args via append side effect (#2356)",
+      "base_sha": "f2878bab8c96afd6e36968af96343b35dbb82a82",
+      "fix_sha": "746ef07158728502482cea9f880a6f4b21ef29a9",
+      "test_files": [
+        "completions_test.go"
+      ],
+      "source_files": [
+        "completions.go"
+      ],
+      "source_url": "https://github.com/spf13/cobra/commit/746ef07158728502482cea9f880a6f4b21ef29a9",
+      "test_selectors": [
+        "TestCompletionDoesNotMutateOsArgs",
+        "TestCustomDefaultShellCompDirective"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          "."
+        ]
+      }
+    },
+    {
+      "task_id": "cobra-1995054b0030",
+      "title": "Flow context to command in SetHelpFunc (#2241)",
+      "base_sha": "f98cf4216d3cb5235e6e0cd00ee00959deb1dc65",
+      "fix_sha": "1995054b003053cc1e404bccfbf6d168e8731509",
+      "test_files": [
+        "command_test.go"
+      ],
+      "source_files": [
+        "command.go"
+      ],
+      "source_url": "https://github.com/spf13/cobra/commit/1995054b003053cc1e404bccfbf6d168e8731509",
+      "test_selectors": [
+        "TestHelpFuncExecuted",
+        "TestUnknownFlagShouldReturnSameErrorRegardlessOfArgPosition"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          "."
+        ]
+      }
+    },
+    {
+      "task_id": "cobra-a97f9fd47b29",
+      "title": "fix CompletionFunc implementation (#2234)",
+      "base_sha": "5f9c40898e795a9fb0fd5ca83b6e05c3720523d1",
+      "fix_sha": "a97f9fd47b290016526c8af2dac0531fea5cd773",
+      "test_files": [
+        "completions_test.go"
+      ],
+      "source_files": [
+        "completions.go"
+      ],
+      "source_url": "https://github.com/spf13/cobra/commit/a97f9fd47b290016526c8af2dac0531fea5cd773",
+      "test_selectors": [
+        "TestCompleteWithRootAndLegacyArgs",
+        "TestCompletionFuncCompatibility"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          "."
+        ]
+      }
+    },
+    {
+      "task_id": "cobra-0745e5576205",
+      "title": "completion: improve detection for flags that accept multiple values (#2210)",
+      "base_sha": "d1e9d85fcf592461f3bc2f4b6d5e140c4c0aabf8",
+      "fix_sha": "0745e5576205cd05fada5bb2e01500d97e1a04be",
+      "test_files": [
+        "completions_test.go"
+      ],
+      "source_files": [
+        "completions.go"
+      ],
+      "source_url": "https://github.com/spf13/cobra/commit/0745e5576205cd05fada5bb2e01500d97e1a04be",
+      "test_selectors": [
+        "TestFlagNameCompletionInGoWithDesc",
+        "TestFlagNameCompletionRepeat"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          "."
+        ]
+      }
+    },
+    {
+      "task_id": "cobra-5bef9d8d87ad",
+      "title": "Fix --version help and output for plugins (#2180)",
+      "base_sha": "ff7c561cf741ac36ab319f528d93e738ae284835",
+      "fix_sha": "5bef9d8d87ad1a1c73e74361bad9e38b3469a58e",
+      "test_files": [
+        "command_test.go"
+      ],
+      "source_files": [
+        "command.go"
+      ],
+      "source_url": "https://github.com/spf13/cobra/commit/5bef9d8d87ad1a1c73e74361bad9e38b3469a58e",
+      "test_selectors": [
+        "TestPlugin",
+        "TestPluginWithSubCommands",
+        "TestVersionFlagExecutedDiplayName"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          "."
+        ]
+      }
+    },
+    {
+      "task_id": "cobra-b711e8760b73",
+      "title": "Don't complete --help flag when flag parsing disabled (#2061)",
+      "base_sha": "8b1eba47616566fc4d258a93da48d5d8741865f0",
+      "fix_sha": "b711e8760b73c6aa1b4aa1bef3a26da5926f175d",
+      "test_files": [
+        "completions_test.go"
+      ],
+      "source_files": [
+        "completions.go"
+      ],
+      "source_url": "https://github.com/spf13/cobra/commit/b711e8760b73c6aa1b4aa1bef3a26da5926f175d",
+      "test_selectors": [
+        "TestCompleteWithDisableFlagParsing",
+        "TestCompletionCobraFlags"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          "."
+        ]
+      }
+    },
+    {
+      "task_id": "cobra-fdee73b4a0d0",
+      "title": "powershell: escape variable with curly brackets (#1960)",
+      "base_sha": "988bd76139210bc1d686c7112b4eb5e784365f1f",
+      "fix_sha": "fdee73b4a0d0be3e233b968ab038866b7cd99772",
+      "test_files": [
+        "powershell_completions_test.go"
+      ],
+      "source_files": [
+        "powershell_completions.go"
+      ],
+      "source_url": "https://github.com/spf13/cobra/commit/fdee73b4a0d0be3e233b968ab038866b7cd99772",
+      "test_selectors": [
+        "TestPwshCompletionNoActiveHelp"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          "."
+        ]
+      }
+    },
+    {
+      "task_id": "cobra-b4f979ae3528",
+      "title": "completions: do not detect arguments with dash as 2nd char as flag (#1817)",
+      "base_sha": "bf11ab6321f2831be5390fdd71ab0bb2edbd9ed5",
+      "fix_sha": "b4f979ae352828a0153281b590771ce9588d67f8",
+      "test_files": [
+        "completions_test.go"
+      ],
+      "source_files": [
+        "command.go"
+      ],
+      "source_url": "https://github.com/spf13/cobra/commit/b4f979ae352828a0153281b590771ce9588d67f8",
+      "test_selectors": [
+        "TestArgsNotDetectedAsFlagsCompletionInGo",
+        "TestCompletionCobraFlags"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          "."
+        ]
+      }
+    }
+  ]
+}

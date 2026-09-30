@@ -1,0 +1,27 @@
+{
+  "schema": "agentgo.swe-suite/v3",
+  "suite_id": "bbolt-8",
+  "project": "bbolt",
+  "title": "bbolt native eight-task SWE suite",
+  "task_count": 8,
+  "upstream": {
+    "vcs": "git",
+    "repository": "https://github.com/etcd-io/bbolt.git"
+  },
+  "driver": "go",
+  "environment": {
+    "toolchain": "go1.25.0",
+    "cgo": 0,
+    "roots": [
+      "."
+    ],
+    "timeout": 600,
+    "short": true,
+    "packages": [
+      ".",
+      "./internal/...",
+      "./cmd/bbolt/..."
+    ]
+  },
+  "qualification_status": "pending"
+}

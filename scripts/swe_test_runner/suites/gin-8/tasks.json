@@ -1,0 +1,219 @@
+{
+  "schema": "agentgo.native-swe-tasks/v1",
+  "tasks": [
+    {
+      "task_id": "gin-293ad7edebb3",
+      "title": "fix(context): Copy() copies Errors and Accepted fields (#4695)",
+      "base_sha": "2e4d4f38962a6f15ae496d59b294f307eef95429",
+      "fix_sha": "293ad7edebb3ae30369288bd6416ca0d78474727",
+      "test_files": [
+        "context_test.go"
+      ],
+      "source_files": [
+        "context.go"
+      ],
+      "source_url": "https://github.com/gin-gonic/gin/commit/293ad7edebb3ae30369288bd6416ca0d78474727",
+      "test_selectors": [
+        "TestContextCopyCopiesAccepted",
+        "TestContextCopyCopiesErrors",
+        "TestContextCopyNilErrorsAndAccepted"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          "."
+        ]
+      }
+    },
+    {
+      "task_id": "gin-4a3eb31fb15b",
+      "title": "fix(recovery): record recovered panics in c.Errors (#4698)",
+      "base_sha": "293ad7edebb3ae30369288bd6416ca0d78474727",
+      "fix_sha": "4a3eb31fb15b2a2d78b4bdbe0c31a2c564b1977a",
+      "test_files": [
+        "recovery_test.go"
+      ],
+      "source_files": [
+        "recovery.go"
+      ],
+      "source_url": "https://github.com/gin-gonic/gin/commit/4a3eb31fb15b2a2d78b4bdbe0c31a2c564b1977a",
+      "test_selectors": [
+        "TestPanicInHandlerRecordsError"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          "."
+        ]
+      }
+    },
+    {
+      "task_id": "gin-472d086af2ac",
+      "title": "fix(tree): panic in findCaseInsensitivePathRec with RedirectFixedPath (#4535)",
+      "base_sha": "fb2583442c4d9bccb75e6d26f1aa6e7c01950db6",
+      "fix_sha": "472d086af2acd924cb4b9d7be0525f7d790f69bc",
+      "test_files": [
+        "tree_test.go"
+      ],
+      "source_files": [
+        "tree.go"
+      ],
+      "source_url": "https://github.com/gin-gonic/gin/commit/472d086af2acd924cb4b9d7be0525f7d790f69bc",
+      "test_selectors": [
+        "TestTreeFindCaseInsensitivePathWildcardParamAndStaticChild",
+        "TestTreeFindCaseInsensitivePathWithMultipleChildrenAndWildcard",
+        "TestWildcardInvalidSlash"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          "."
+        ]
+      }
+    },
+    {
+      "task_id": "gin-5c00df8afadd",
+      "title": "fix(render): write content length in Data.Render (#4206)",
+      "base_sha": "db309081bc5c137b2aa15701ef53f7f19788da25",
+      "fix_sha": "5c00df8afadd06cc5be530dde00fe6d9fa4a2e4a",
+      "test_files": [
+        "render/render_test.go"
+      ],
+      "source_files": [
+        "render/data.go"
+      ],
+      "source_url": "https://github.com/gin-gonic/gin/commit/5c00df8afadd06cc5be530dde00fe6d9fa4a2e4a",
+      "test_selectors": [
+        "TestRenderData",
+        "TestRenderDataContentLength"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          "."
+        ]
+      }
+    },
+    {
+      "task_id": "gin-9914178584e4",
+      "title": "fix(context): ClientIP handling for multiple X-Forwarded-For header values (#4472)",
+      "base_sha": "915e4c90d28ec4cffc6eb146e208ab5a65eac772",
+      "fix_sha": "9914178584e42458ff7d23891463a880f58c9d86",
+      "test_files": [
+        "context_test.go"
+      ],
+      "source_files": [
+        "context.go"
+      ],
+      "source_url": "https://github.com/gin-gonic/gin/commit/9914178584e42458ff7d23891463a880f58c9d86",
+      "test_selectors": [
+        "TestContextClientIPWithMultipleHeaders",
+        "TestContextClientIPWithSingleHeader"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          "."
+        ]
+      }
+    },
+    {
+      "task_id": "gin-b917b14ff9d1",
+      "title": "fix(binding): empty value error (#2169)",
+      "base_sha": "fad706f1216e6d12bdd51d28d5a40ec27e6c6453",
+      "fix_sha": "b917b14ff9d189f16a7492be79d123a47806ee19",
+      "test_files": [
+        "binding/form_mapping_test.go"
+      ],
+      "source_files": [
+        "binding/form_mapping.go"
+      ],
+      "source_url": "https://github.com/gin-gonic/gin/commit/b917b14ff9d189f16a7492be79d123a47806ee19",
+      "test_selectors": [
+        "TestMappingTime",
+        "TestMappingTimeDuration",
+        "TestMappingTimeUnixNano"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          "."
+        ]
+      }
+    },
+    {
+      "task_id": "gin-63dd3e60cab8",
+      "title": "fix(recover): suppress http.ErrAbortHandler in recover (#4336)",
+      "base_sha": "c358d5656d0feb8b310d4ec379bccde46ccc8cc7",
+      "fix_sha": "63dd3e60cab89c27fb66bce1423bd268d52abad1",
+      "test_files": [
+        "recovery_test.go"
+      ],
+      "source_files": [
+        "recovery.go"
+      ],
+      "source_url": "https://github.com/gin-gonic/gin/commit/63dd3e60cab89c27fb66bce1423bd268d52abad1",
+      "test_selectors": [
+        "TestPanicWithAbortHandler",
+        "TestPanicWithBrokenPipe"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          "."
+        ]
+      }
+    },
+    {
+      "task_id": "gin-5fad976b372e",
+      "title": "fix(gin): literal colon routes not working with engine.Handler() (#4415)",
+      "base_sha": "93ff771e6dbf10e432864b30f3719ac5c84a4d4a",
+      "fix_sha": "5fad976b372e381312f8de69f0969f1284d229d3",
+      "test_files": [
+        "gin_test.go"
+      ],
+      "source_files": [
+        "gin.go"
+      ],
+      "source_url": "https://github.com/gin-gonic/gin/commit/5fad976b372e381312f8de69f0969f1284d229d3",
+      "test_selectors": [
+        "TestLiteralColonWithDirectServeHTTP",
+        "TestLiteralColonWithHTTPServer",
+        "TestLiteralColonWithHandler",
+        "TestLiteralColonWithRun",
+        "TestMethodNotAllowedNoRoute",
+        "TestUpdateRouteTreesCalledOnce"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          "."
+        ]
+      }
+    }
+  ]
+}

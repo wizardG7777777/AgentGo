@@ -1,0 +1,19 @@
+{
+  "schema": "agentgo.swe-suite/v2",
+  "suite_id": "gin-1",
+  "project": "gin",
+  "title": "Gin context-copy native SWE regression",
+  "task_count": 1,
+  "task_manifest": "tasks.csv",
+  "prompt_directory": "prompts",
+  "upstream": {"vcs": "git", "repository": "https://github.com/gin-gonic/gin.git"},
+  "test_engine": "go",
+  "role_prompt_directory": "prompts/swe/gin",
+  "go": {
+    "module": "github.com/gin-gonic/gin",
+    "toolchain": "go1.25.0",
+    "test_timeout_sec": 180
+  },
+  "evaluation": "target_failures_fixed_and_full_baseline_preserved",
+  "source_issue": "https://github.com/gin-gonic/gin/pull/4695"
+}

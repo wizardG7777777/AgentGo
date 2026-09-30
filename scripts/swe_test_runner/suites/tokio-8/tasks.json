@@ -1,0 +1,190 @@
+{
+  "schema": "agentgo.native-swe-tasks/v1",
+  "tasks": [
+    {
+      "task_id": "tokio-eb99e476e674",
+      "title": "Prevent join and try_join macro internals from shadowing caller constants",
+      "base_sha": "b9b532485bbb879042a1bd2ef40a50e6c1d15bb6",
+      "fix_sha": "eb99e476e674f81095e2f8f15cbc92f8650f5364",
+      "test_files": [
+        "tokio/tests/macros_join.rs",
+        "tokio/tests/macros_try_join.rs"
+      ],
+      "source_files": [
+        "tokio/src/macros/join.rs",
+        "tokio/src/macros/support.rs",
+        "tokio/src/macros/try_join.rs"
+      ],
+      "source_url": "https://github.com/tokio-rs/tokio/commit/eb99e476e674f81095e2f8f15cbc92f8650f5364",
+      "test_selectors": [],
+      "cargo_package": "tokio",
+      "cargo_tests": [
+        "macros_join",
+        "macros_try_join"
+      ],
+      "regression_scope": {
+        "kind": "cargo-package-tests",
+        "package": "tokio"
+      }
+    },
+    {
+      "task_id": "tokio-89f4d133ba37",
+      "title": "io: read lines as bytes so a partial line survives an I/O error (#8400)",
+      "base_sha": "231a8faf20d2c24d01d36bd15ed7c3aed24b06a9",
+      "fix_sha": "89f4d133ba376834bba9dce016b4414dc8aaaf43",
+      "test_files": [
+        "tokio/tests/io_lines.rs",
+        "tokio/tests/io_read_line.rs",
+        "tokio/tests/io_read_to_string.rs"
+      ],
+      "source_files": [
+        "tokio/src/io/util/lines.rs",
+        "tokio/src/io/util/read_line.rs"
+      ],
+      "source_url": "https://github.com/tokio-rs/tokio/commit/89f4d133ba376834bba9dce016b4414dc8aaaf43",
+      "test_selectors": [],
+      "cargo_package": "tokio",
+      "cargo_tests": [
+        "io_lines",
+        "io_read_line",
+        "io_read_to_string"
+      ],
+      "regression_scope": {
+        "kind": "cargo-package-tests",
+        "package": "tokio"
+      }
+    },
+    {
+      "task_id": "tokio-e06f16259df3",
+      "title": "sync: reset Chan::rx_waker in chan::Rx's Drop impl (#8095)",
+      "base_sha": "962420a4f3561ebcd818f7594879e1d4c870d0a4",
+      "fix_sha": "e06f16259df3c72b00b6d176e86c7d4a150c6e99",
+      "test_files": [
+        "tokio/tests/sync_mpsc.rs"
+      ],
+      "source_files": [
+        "tokio/src/sync/mpsc/chan.rs"
+      ],
+      "source_url": "https://github.com/tokio-rs/tokio/commit/e06f16259df3c72b00b6d176e86c7d4a150c6e99",
+      "test_selectors": [],
+      "cargo_package": "tokio",
+      "cargo_tests": [
+        "sync_mpsc"
+      ],
+      "regression_scope": {
+        "kind": "cargo-package-tests",
+        "package": "tokio"
+      }
+    },
+    {
+      "task_id": "tokio-f59aae423eaf",
+      "title": "stream: fix overflow in `StreamMap::size_hint` (#8216)",
+      "base_sha": "dc3a883b99f8255cad5409458be95a0bcec2320c",
+      "fix_sha": "f59aae423eaf7131d6923085c1c66b50a49bb4e2",
+      "test_files": [
+        "tokio-stream/tests/stream_stream_map.rs"
+      ],
+      "source_files": [
+        "tokio-stream/src/stream_map.rs"
+      ],
+      "source_url": "https://github.com/tokio-rs/tokio/commit/f59aae423eaf7131d6923085c1c66b50a49bb4e2",
+      "test_selectors": [],
+      "cargo_package": "tokio-stream",
+      "cargo_tests": [
+        "stream_stream_map"
+      ],
+      "regression_scope": {
+        "kind": "cargo-package-tests",
+        "package": "tokio-stream"
+      }
+    },
+    {
+      "task_id": "tokio-3ea11e2a5fb4",
+      "title": "sync: fix semaphore reopens after forget (#8021)",
+      "base_sha": "c79121391db8f8d36d4213feeb25381caee110c7",
+      "fix_sha": "3ea11e2a5fb4139ca21b441044d98994a2b126c5",
+      "test_files": [
+        "tokio/tests/sync_semaphore.rs"
+      ],
+      "source_files": [
+        "tokio/src/sync/batch_semaphore.rs"
+      ],
+      "source_url": "https://github.com/tokio-rs/tokio/commit/3ea11e2a5fb4139ca21b441044d98994a2b126c5",
+      "test_selectors": [],
+      "cargo_package": "tokio",
+      "cargo_tests": [
+        "sync_semaphore"
+      ],
+      "regression_scope": {
+        "kind": "cargo-package-tests",
+        "package": "tokio"
+      }
+    },
+    {
+      "task_id": "tokio-9f132172dbb0",
+      "title": "sync: fix `notify_waiters` priority in `Notify` (#7996)",
+      "base_sha": "6752f50154025a1aa2c231b643cdb78bb4c3892f",
+      "fix_sha": "9f132172dbb00b1f6b6bda64bb9b194382079499",
+      "test_files": [
+        "tokio/tests/sync_notify.rs"
+      ],
+      "source_files": [
+        "tokio/src/sync/notify.rs"
+      ],
+      "source_url": "https://github.com/tokio-rs/tokio/commit/9f132172dbb00b1f6b6bda64bb9b194382079499",
+      "test_selectors": [],
+      "cargo_package": "tokio",
+      "cargo_tests": [
+        "sync_notify"
+      ],
+      "regression_scope": {
+        "kind": "cargo-package-tests",
+        "package": "tokio"
+      }
+    },
+    {
+      "task_id": "tokio-96f64f4ee2af",
+      "title": "codec: fix is_readable should be buffer empty or not (#7912)",
+      "base_sha": "00d10c22f831f7d4508444f17a84e19319eaf36b",
+      "fix_sha": "96f64f4ee2afc0a6db76390134dd183d59ca5351",
+      "test_files": [
+        "tokio-util/tests/framed.rs"
+      ],
+      "source_files": [
+        "tokio-util/src/codec/framed_impl.rs"
+      ],
+      "source_url": "https://github.com/tokio-rs/tokio/commit/96f64f4ee2afc0a6db76390134dd183d59ca5351",
+      "test_selectors": [],
+      "cargo_package": "tokio-util",
+      "cargo_tests": [
+        "framed"
+      ],
+      "regression_scope": {
+        "kind": "cargo-package-tests",
+        "package": "tokio-util"
+      }
+    },
+    {
+      "task_id": "tokio-6d868d96ce9d",
+      "title": "sync: fix `CancellationToken` failing to cancel the ready futures (#7462)",
+      "base_sha": "0a3fe460862720d005b8fa39cdde30575a063785",
+      "fix_sha": "6d868d96ce9df27c5ec1be3bba960ebe80ee4793",
+      "test_files": [
+        "tokio-util/tests/sync_cancellation_token.rs"
+      ],
+      "source_files": [
+        "tokio-util/src/sync/cancellation_token.rs"
+      ],
+      "source_url": "https://github.com/tokio-rs/tokio/commit/6d868d96ce9df27c5ec1be3bba960ebe80ee4793",
+      "test_selectors": [],
+      "cargo_package": "tokio-util",
+      "cargo_tests": [
+        "sync_cancellation_token"
+      ],
+      "regression_scope": {
+        "kind": "cargo-package-tests",
+        "package": "tokio-util"
+      }
+    }
+  ]
+}

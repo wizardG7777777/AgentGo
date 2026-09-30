@@ -1,0 +1,263 @@
+{
+  "schema": "agentgo.native-swe-tasks/v1",
+  "tasks": [
+    {
+      "task_id": "excalidraw-2b1c2a9fbf62",
+      "title": "fix(editor): dismiss dropdown menus on outside clicks (#12053)",
+      "base_sha": "f1a79b73df5b9883f940417861a4f5fb879a3f02",
+      "fix_sha": "2b1c2a9fbf62417168cdae041d00f38cc403f0a5",
+      "test_files": [
+        "packages/excalidraw/components/dropdownMenu/DropdownMenu.test.tsx"
+      ],
+      "source_files": [
+        "packages/excalidraw/components/dropdownMenu/DropdownMenuContent.tsx"
+      ],
+      "source_url": "https://github.com/excalidraw/excalidraw/commit/2b1c2a9fbf62417168cdae041d00f38cc403f0a5",
+      "test_selectors": [],
+      "target_args": [
+        "packages/excalidraw/components/dropdownMenu/DropdownMenu.test.tsx"
+      ],
+      "regression_args": [
+        "packages/excalidraw/components/dropdownMenu/DropdownMenu.test.tsx"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/excalidraw/components/dropdownMenu/DropdownMenu.test.tsx"
+        ]
+      },
+      "environment": {
+        "manager": "yarn@1.22.22"
+      }
+    },
+    {
+      "task_id": "excalidraw-c5a50d223feb",
+      "title": "fix(editor): respect boxSelectionMode ('contain' vs 'overlap') in lasso tool (#11862)",
+      "base_sha": "cf212b2f3354c09bd6f960b53a9cfb0a3ecbfa58",
+      "fix_sha": "c5a50d223feb5fceaebc916ad75f2dcecb399467",
+      "test_files": [
+        "packages/excalidraw/tests/lasso.test.tsx",
+        "packages/excalidraw/tests/selection.test.tsx"
+      ],
+      "source_files": [
+        "packages/excalidraw/lasso/index.ts",
+        "packages/excalidraw/lasso/utils.ts"
+      ],
+      "source_url": "https://github.com/excalidraw/excalidraw/commit/c5a50d223feb5fceaebc916ad75f2dcecb399467",
+      "test_selectors": [],
+      "target_args": [
+        "packages/excalidraw/tests/lasso.test.tsx",
+        "packages/excalidraw/tests/selection.test.tsx"
+      ],
+      "regression_args": [
+        "packages/excalidraw/tests/lasso.test.tsx",
+        "packages/excalidraw/tests/selection.test.tsx"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/excalidraw/tests/lasso.test.tsx",
+          "packages/excalidraw/tests/selection.test.tsx"
+        ]
+      },
+      "environment": {
+        "manager": "yarn@1.22.22"
+      }
+    },
+    {
+      "task_id": "excalidraw-5e375b4331fe",
+      "title": "fix(editor): do not flicker bbox when drag-creating line midpoint (#11834)",
+      "base_sha": "85270fcc8db26f98d119e2d2752b0c0139e86e16",
+      "fix_sha": "5e375b4331febad8dd7d1adf4e3d78df0fbeeb17",
+      "test_files": [
+        "packages/element/tests/linearElementEditor.test.tsx"
+      ],
+      "source_files": [
+        "packages/excalidraw/components/App.tsx"
+      ],
+      "source_url": "https://github.com/excalidraw/excalidraw/commit/5e375b4331febad8dd7d1adf4e3d78df0fbeeb17",
+      "test_selectors": [],
+      "target_args": [
+        "packages/element/tests/linearElementEditor.test.tsx"
+      ],
+      "regression_args": [
+        "packages/element/tests/linearElementEditor.test.tsx"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/element/tests/linearElementEditor.test.tsx"
+        ]
+      },
+      "environment": {
+        "manager": "yarn@1.22.22"
+      }
+    },
+    {
+      "task_id": "excalidraw-c9c96f619cbc",
+      "title": "fix(editor): normalize container + bound text order on restore (#11827)",
+      "base_sha": "1da120e914e87ae2f308ff6eb41c365401e8f583",
+      "fix_sha": "c9c96f619cbceb335c5b5bf112be78465d8ab60e",
+      "test_files": [
+        "packages/excalidraw/tests/data/restore.test.ts"
+      ],
+      "source_files": [
+        "packages/element/src/sortElements.ts",
+        "packages/excalidraw/actions/actionGroup.tsx",
+        "packages/excalidraw/data/restore.ts"
+      ],
+      "source_url": "https://github.com/excalidraw/excalidraw/commit/c9c96f619cbceb335c5b5bf112be78465d8ab60e",
+      "test_selectors": [],
+      "target_args": [
+        "packages/excalidraw/tests/data/restore.test.ts"
+      ],
+      "regression_args": [
+        "packages/excalidraw/tests/data/restore.test.ts"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/excalidraw/tests/data/restore.test.ts"
+        ]
+      },
+      "environment": {
+        "manager": "yarn@1.22.22"
+      }
+    },
+    {
+      "task_id": "excalidraw-1da120e914e8",
+      "title": "fix(editor): include custom tools in pointer capture (#11826)",
+      "base_sha": "ab0255f21eb40b5408f3e9ed9725474108eda9e6",
+      "fix_sha": "1da120e914e87ae2f308ff6eb41c365401e8f583",
+      "test_files": [
+        "packages/excalidraw/tests/viewMode.test.tsx"
+      ],
+      "source_files": [
+        "packages/excalidraw/components/App.tsx"
+      ],
+      "source_url": "https://github.com/excalidraw/excalidraw/commit/1da120e914e87ae2f308ff6eb41c365401e8f583",
+      "test_selectors": [],
+      "target_args": [
+        "packages/excalidraw/tests/viewMode.test.tsx"
+      ],
+      "regression_args": [
+        "packages/excalidraw/tests/viewMode.test.tsx"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/excalidraw/tests/viewMode.test.tsx"
+        ]
+      },
+      "environment": {
+        "manager": "yarn@1.22.22"
+      }
+    },
+    {
+      "task_id": "excalidraw-ab0255f21eb4",
+      "title": "fix(editor): prevent crash when editing arrow with bound text (#11814)",
+      "base_sha": "792ea3a06c60079229f36819d8695af7d563832a",
+      "fix_sha": "ab0255f21eb40b5408f3e9ed9725474108eda9e6",
+      "test_files": [
+        "packages/element/tests/linearElementEditor.test.tsx"
+      ],
+      "source_files": [
+        "packages/excalidraw/actions/actionLinearEditor.tsx"
+      ],
+      "source_url": "https://github.com/excalidraw/excalidraw/commit/ab0255f21eb40b5408f3e9ed9725474108eda9e6",
+      "test_selectors": [],
+      "target_args": [
+        "packages/element/tests/linearElementEditor.test.tsx"
+      ],
+      "regression_args": [
+        "packages/element/tests/linearElementEditor.test.tsx"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/element/tests/linearElementEditor.test.tsx"
+        ]
+      },
+      "environment": {
+        "manager": "yarn@1.22.22"
+      }
+    },
+    {
+      "task_id": "excalidraw-53732f08f430",
+      "title": "fix(editor): prevent eyedropper preview from overflowing viewport  (#11722)",
+      "base_sha": "5cf547650b700b35507e83773695098150b810d2",
+      "fix_sha": "53732f08f430ded353121c64c230b448282be37a",
+      "test_files": [
+        "packages/excalidraw/components/Popover.test.tsx",
+        "packages/excalidraw/components/positionElementBesideCursor.test.ts",
+        "packages/excalidraw/tests/cursorHint.test.tsx",
+        "packages/excalidraw/tests/eyeDropper.test.tsx"
+      ],
+      "source_files": [
+        "packages/excalidraw/components/ContextMenu.scss",
+        "packages/excalidraw/components/ContextMenu.tsx",
+        "packages/excalidraw/components/CursorHint.tsx",
+        "packages/excalidraw/components/EyeDropper.scss",
+        "packages/excalidraw/components/EyeDropper.tsx",
+        "packages/excalidraw/components/Popover.scss",
+        "packages/excalidraw/components/Popover.tsx",
+        "packages/excalidraw/components/positionElementBesideCursor.ts"
+      ],
+      "source_url": "https://github.com/excalidraw/excalidraw/commit/53732f08f430ded353121c64c230b448282be37a",
+      "test_selectors": [],
+      "target_args": [
+        "packages/excalidraw/components/Popover.test.tsx",
+        "packages/excalidraw/components/positionElementBesideCursor.test.ts",
+        "packages/excalidraw/tests/cursorHint.test.tsx",
+        "packages/excalidraw/tests/eyeDropper.test.tsx"
+      ],
+      "regression_args": [
+        "packages/excalidraw/components/Popover.test.tsx",
+        "packages/excalidraw/components/positionElementBesideCursor.test.ts",
+        "packages/excalidraw/tests/cursorHint.test.tsx",
+        "packages/excalidraw/tests/eyeDropper.test.tsx"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/excalidraw/components/Popover.test.tsx",
+          "packages/excalidraw/components/positionElementBesideCursor.test.ts",
+          "packages/excalidraw/tests/cursorHint.test.tsx",
+          "packages/excalidraw/tests/eyeDropper.test.tsx"
+        ]
+      },
+      "environment": {
+        "manager": "yarn@1.22.22"
+      }
+    },
+    {
+      "task_id": "excalidraw-65aa577e39a1",
+      "title": "fix(editor): fix AnimationController scheduling race conds (#11678)",
+      "base_sha": "93dd51060a305108450b18b87b39f1b3b2125995",
+      "fix_sha": "65aa577e39a1ae6315322eae010b69961b99b418",
+      "test_files": [
+        "packages/excalidraw/tests/animation.test.ts"
+      ],
+      "source_files": [
+        "packages/excalidraw/renderer/animation.ts"
+      ],
+      "source_url": "https://github.com/excalidraw/excalidraw/commit/65aa577e39a1ae6315322eae010b69961b99b418",
+      "test_selectors": [],
+      "target_args": [
+        "packages/excalidraw/tests/animation.test.ts"
+      ],
+      "regression_args": [
+        "packages/excalidraw/tests/animation.test.ts"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/excalidraw/tests/animation.test.ts"
+        ]
+      },
+      "environment": {
+        "manager": "yarn@1.22.22"
+      }
+    }
+  ]
+}

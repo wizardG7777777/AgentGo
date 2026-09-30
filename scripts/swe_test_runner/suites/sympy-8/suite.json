@@ -1,0 +1,23 @@
+{
+  "schema": "agentgo.swe-suite/v3",
+  "suite_id": "sympy-8",
+  "project": "sympy",
+  "title": "sympy native eight-task SWE suite",
+  "task_count": 8,
+  "upstream": {
+    "vcs": "git",
+    "repository": "https://github.com/sympy/sympy.git"
+  },
+  "driver": "pytest",
+  "environment": {
+    "subject": "sympy",
+    "packages": [
+      "pytest==8.4.2",
+      "mpmath==1.3.0",
+      "hypothesis==6.140.2",
+      "pytest-doctestplus==1.4.0",
+      "pytest-timeout==2.4.0"
+    ]
+  },
+  "qualification_status": "pending"
+}

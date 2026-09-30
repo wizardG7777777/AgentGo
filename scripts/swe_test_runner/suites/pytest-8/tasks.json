@@ -1,0 +1,324 @@
+{
+  "schema": "agentgo.native-swe-tasks/v1",
+  "tasks": [
+    {
+      "task_id": "pytest-aceb21ab2fa1",
+      "title": "fixtures: use a better data structure for storing FixtureDefs",
+      "base_sha": "efc38328c97040702f6c71a57516a009c438435f",
+      "fix_sha": "aceb21ab2fa19f91282adfdb978a6ae252b3b020",
+      "test_files": [
+        "testing/deprecated_test.py",
+        "testing/python/fixtures.py"
+      ],
+      "source_files": [
+        "src/_pytest/fixtures.py"
+      ],
+      "source_url": "https://github.com/pytest-dev/pytest/commit/aceb21ab2fa19f91282adfdb978a6ae252b3b020",
+      "test_selectors": [
+        "testing/deprecated_test.py::TestFixtureNodeidDeprecations::test_matchfactories_string_fallback",
+        "testing/python/fixtures.py::TestFillFixtures::test_fixture_not_found_nodeid_fallback",
+        "testing/python/fixtures.py::TestShowFixtures::test_show_fixtures_deprecated_nodeid_fixture"
+      ],
+      "target_args": [
+        "testing/deprecated_test.py::TestFixtureNodeidDeprecations::test_matchfactories_string_fallback",
+        "testing/python/fixtures.py::TestFillFixtures::test_fixture_not_found_nodeid_fallback",
+        "testing/python/fixtures.py::TestShowFixtures::test_show_fixtures_deprecated_nodeid_fixture"
+      ],
+      "regression_args": [
+        "testing/deprecated_test.py",
+        "testing/python/fixtures.py"
+      ],
+      "regression_scope": {
+        "kind": "test-modules",
+        "paths": [
+          "testing/deprecated_test.py",
+          "testing/python/fixtures.py"
+        ]
+      }
+    },
+    {
+      "task_id": "pytest-86c6c354e19d",
+      "title": "approx: Decimal and numpy cleanup",
+      "base_sha": "ff42276a55b99a315c304db882edf0e69de9fae3",
+      "fix_sha": "86c6c354e19d0c8713bb47d6cb1c4aaebea7cb6a",
+      "test_files": [
+        "testing/python/approx.py"
+      ],
+      "source_files": [
+        "src/_pytest/approx.py",
+        "src/_pytest/warning_types.py",
+        "src/pytest/__init__.py"
+      ],
+      "source_url": "https://github.com/pytest-dev/pytest/commit/86c6c354e19d0c8713bb47d6cb1c4aaebea7cb6a",
+      "test_selectors": [
+        "testing/python/approx.py::TestApprox::test_decimal_approx_float_abs",
+        "testing/python/approx.py::TestApprox::test_decimal_approx_float_rel",
+        "testing/python/approx.py::TestApprox::test_decimal_approx_repr",
+        "testing/python/approx.py::TestApprox::test_decimal_nan_tolerance_raises_value_error",
+        "testing/python/approx.py::TestApprox::test_decimal_outside_float_range",
+        "testing/python/approx.py::TestApprox::test_decimal_repr_compare_is_float_free",
+        "testing/python/approx.py::TestApprox::test_decimal_repr_nan_and_infinity",
+        "testing/python/approx.py::TestApprox::test_decimal_repr_outside_float_range",
+        "testing/python/approx.py::TestApprox::test_decimal_repr_shows_effective_tolerance",
+        "testing/python/approx.py::TestApprox::test_exact_tolerance_does_not_warn",
+        "testing/python/approx.py::TestApprox::test_inexact_float_tolerance_warns",
+        "testing/python/approx.py::TestApprox::test_inexact_float_tolerance_warns_once_at_the_call_site",
+        "testing/python/approx.py::TestApprox::test_mapping_relative_diff_undefined",
+        "testing/python/approx.py::TestApprox::test_mixed_decimal_and_float_sequence_does_not_hide_float_operation",
+        "testing/python/approx.py::TestApprox::test_numpy_actual_not_convertible",
+        "testing/python/approx.py::TestApprox::test_numpy_object_dtype"
+      ],
+      "target_args": [
+        "testing/python/approx.py::TestApprox::test_decimal_approx_float_abs",
+        "testing/python/approx.py::TestApprox::test_decimal_approx_float_rel",
+        "testing/python/approx.py::TestApprox::test_decimal_approx_repr",
+        "testing/python/approx.py::TestApprox::test_decimal_nan_tolerance_raises_value_error",
+        "testing/python/approx.py::TestApprox::test_decimal_outside_float_range",
+        "testing/python/approx.py::TestApprox::test_decimal_repr_compare_is_float_free",
+        "testing/python/approx.py::TestApprox::test_decimal_repr_nan_and_infinity",
+        "testing/python/approx.py::TestApprox::test_decimal_repr_outside_float_range",
+        "testing/python/approx.py::TestApprox::test_decimal_repr_shows_effective_tolerance",
+        "testing/python/approx.py::TestApprox::test_exact_tolerance_does_not_warn",
+        "testing/python/approx.py::TestApprox::test_inexact_float_tolerance_warns",
+        "testing/python/approx.py::TestApprox::test_inexact_float_tolerance_warns_once_at_the_call_site",
+        "testing/python/approx.py::TestApprox::test_mapping_relative_diff_undefined",
+        "testing/python/approx.py::TestApprox::test_mixed_decimal_and_float_sequence_does_not_hide_float_operation",
+        "testing/python/approx.py::TestApprox::test_numpy_actual_not_convertible",
+        "testing/python/approx.py::TestApprox::test_numpy_object_dtype"
+      ],
+      "regression_args": [
+        "testing/python/approx.py"
+      ],
+      "regression_scope": {
+        "kind": "test-modules",
+        "paths": [
+          "testing/python/approx.py"
+        ]
+      }
+    },
+    {
+      "task_id": "pytest-472b4de93d83",
+      "title": "fix(monkeypatch): don't leave inherited attributes in the instance dict",
+      "base_sha": "ae777851d8b324de5eb3d0e860c28b219ce3fcd8",
+      "fix_sha": "472b4de93d83c118e0d089a34918fd1210d9ebc8",
+      "test_files": [
+        "testing/test_monkeypatch.py"
+      ],
+      "source_files": [
+        "src/_pytest/monkeypatch.py"
+      ],
+      "source_url": "https://github.com/pytest-dev/pytest/commit/472b4de93d83c118e0d089a34918fd1210d9ebc8",
+      "test_selectors": [
+        "testing/test_monkeypatch.py::test_undo_data_descriptor_on_instance",
+        "testing/test_monkeypatch.py::test_undo_inherited_attribute_on_instance",
+        "testing/test_monkeypatch.py::test_undo_inherited_method_on_instance",
+        "testing/test_monkeypatch.py::test_undo_inherited_non_data_descriptor_on_instance",
+        "testing/test_monkeypatch.py::test_undo_own_attribute_on_instance",
+        "testing/test_monkeypatch.py::test_undo_slot_attribute_on_instance"
+      ],
+      "target_args": [
+        "testing/test_monkeypatch.py::test_undo_data_descriptor_on_instance",
+        "testing/test_monkeypatch.py::test_undo_inherited_attribute_on_instance",
+        "testing/test_monkeypatch.py::test_undo_inherited_method_on_instance",
+        "testing/test_monkeypatch.py::test_undo_inherited_non_data_descriptor_on_instance",
+        "testing/test_monkeypatch.py::test_undo_own_attribute_on_instance",
+        "testing/test_monkeypatch.py::test_undo_slot_attribute_on_instance"
+      ],
+      "regression_args": [
+        "testing/test_monkeypatch.py"
+      ],
+      "regression_scope": {
+        "kind": "test-modules",
+        "paths": [
+          "testing/test_monkeypatch.py"
+        ]
+      }
+    },
+    {
+      "task_id": "pytest-ae777851d8b3",
+      "title": "fix(MonkeyPatch): register undo entry only after a successful mutation (delattr/setitem/delitem) (#14909)",
+      "base_sha": "431f3e1f5fd70b9b0f8afa2d20a10421542e5c6a",
+      "fix_sha": "ae777851d8b324de5eb3d0e860c28b219ce3fcd8",
+      "test_files": [
+        "testing/test_monkeypatch.py"
+      ],
+      "source_files": [
+        "src/_pytest/monkeypatch.py"
+      ],
+      "source_url": "https://github.com/pytest-dev/pytest/commit/ae777851d8b324de5eb3d0e860c28b219ce3fcd8",
+      "test_selectors": [
+        "testing/test_monkeypatch.py::test_failed_delattr",
+        "testing/test_monkeypatch.py::test_failed_delitem",
+        "testing/test_monkeypatch.py::test_failed_setitem",
+        "testing/test_monkeypatch.py::test_setitem_delitem_oldval_captured_before_mutation"
+      ],
+      "target_args": [
+        "testing/test_monkeypatch.py::test_failed_delattr",
+        "testing/test_monkeypatch.py::test_failed_delitem",
+        "testing/test_monkeypatch.py::test_failed_setitem",
+        "testing/test_monkeypatch.py::test_setitem_delitem_oldval_captured_before_mutation"
+      ],
+      "regression_args": [
+        "testing/test_monkeypatch.py"
+      ],
+      "regression_scope": {
+        "kind": "test-modules",
+        "paths": [
+          "testing/test_monkeypatch.py"
+        ]
+      }
+    },
+    {
+      "task_id": "pytest-51e9a9f148cd",
+      "title": "fix(rewrite): prevent walrus operator double evaluation in assertions",
+      "base_sha": "e984a9b94740697411f5a05fcdfc3299dd20f13a",
+      "fix_sha": "51e9a9f148cd2509a31e3fa0d2b1b3204c2b0dd7",
+      "test_files": [
+        "testing/test_assertrewrite.py",
+        "testing/test_assertrewrite_coverage.py"
+      ],
+      "source_files": [
+        "src/_pytest/assertion/rewrite.py"
+      ],
+      "source_url": "https://github.com/pytest-dev/pytest/commit/51e9a9f148cd2509a31e3fa0d2b1b3204c2b0dd7",
+      "test_selectors": [
+        "testing/test_assertrewrite.py::TestIssue14445::test_walrus_no_double_eval_basic",
+        "testing/test_assertrewrite.py::TestIssue14445::test_walrus_no_double_eval_running_counter",
+        "testing/test_assertrewrite.py::test_walrus_rebinding_does_not_outlive_its_statement",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_binop_left_operand_precedes_walrus",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_boolop_chain_rebinds_in_order",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_call_earlier_argument_precedes_walrus",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_call_later_argument_sees_walrus_value",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_chained_compare_operands_in_order",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_compare_left_operand_precedes_walrus",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_compare_reports_left_operand",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_double_star_argument_precedes_walrus",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_keyword_argument_precedes_walrus",
+        "testing/test_assertrewrite_coverage.py::TestIntrospectionWalrus::test_walrus_in_boolop_reports_assigned_value",
+        "testing/test_assertrewrite_coverage.py::TestIntrospectionWalrus::test_walrus_in_boolop_reports_each_operand",
+        "testing/test_assertrewrite_coverage.py::TestIntrospectionWalrus::test_walrus_in_boolop_reports_left_operand",
+        "testing/test_assertrewrite_coverage.py::TestSingleEvaluation::test_walrus_in_boolean_evaluated_once",
+        "testing/test_assertrewrite_coverage.py::TestSingleEvaluation::test_walrus_in_chained_compare_evaluated_once",
+        "testing/test_assertrewrite_coverage.py::TestSingleEvaluation::test_walrus_in_compare_evaluated_once"
+      ],
+      "target_args": [
+        "testing/test_assertrewrite.py::TestIssue14445::test_walrus_no_double_eval_basic",
+        "testing/test_assertrewrite.py::TestIssue14445::test_walrus_no_double_eval_running_counter",
+        "testing/test_assertrewrite.py::test_walrus_rebinding_does_not_outlive_its_statement",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_binop_left_operand_precedes_walrus",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_boolop_chain_rebinds_in_order",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_call_earlier_argument_precedes_walrus",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_call_later_argument_sees_walrus_value",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_chained_compare_operands_in_order",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_compare_left_operand_precedes_walrus",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_compare_reports_left_operand",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_double_star_argument_precedes_walrus",
+        "testing/test_assertrewrite_coverage.py::TestEvaluationOrder::test_keyword_argument_precedes_walrus",
+        "testing/test_assertrewrite_coverage.py::TestIntrospectionWalrus::test_walrus_in_boolop_reports_assigned_value",
+        "testing/test_assertrewrite_coverage.py::TestIntrospectionWalrus::test_walrus_in_boolop_reports_each_operand",
+        "testing/test_assertrewrite_coverage.py::TestIntrospectionWalrus::test_walrus_in_boolop_reports_left_operand",
+        "testing/test_assertrewrite_coverage.py::TestSingleEvaluation::test_walrus_in_boolean_evaluated_once",
+        "testing/test_assertrewrite_coverage.py::TestSingleEvaluation::test_walrus_in_chained_compare_evaluated_once",
+        "testing/test_assertrewrite_coverage.py::TestSingleEvaluation::test_walrus_in_compare_evaluated_once"
+      ],
+      "regression_args": [
+        "testing/test_assertrewrite.py",
+        "testing/test_assertrewrite_coverage.py"
+      ],
+      "regression_scope": {
+        "kind": "test-modules",
+        "paths": [
+          "testing/test_assertrewrite.py",
+          "testing/test_assertrewrite_coverage.py"
+        ]
+      }
+    },
+    {
+      "task_id": "pytest-c7f9e75c5d3b",
+      "title": "Fix nested caplog.filtering early removal",
+      "base_sha": "6a30f9e5764d106ce5a37e5bb706e797d46e318f",
+      "fix_sha": "c7f9e75c5d3b04bf96e8389a9eac6d98da2be8f4",
+      "test_files": [
+        "testing/logging/test_fixture.py"
+      ],
+      "source_files": [
+        "src/_pytest/logging.py"
+      ],
+      "source_url": "https://github.com/pytest-dev/pytest/commit/c7f9e75c5d3b04bf96e8389a9eac6d98da2be8f4",
+      "test_selectors": [
+        "testing/logging/test_fixture.py::test_with_statement_filtering_already_present",
+        "testing/logging/test_fixture.py::test_with_statement_nested_filtering"
+      ],
+      "target_args": [
+        "testing/logging/test_fixture.py::test_with_statement_filtering_already_present",
+        "testing/logging/test_fixture.py::test_with_statement_nested_filtering"
+      ],
+      "regression_args": [
+        "testing/logging/test_fixture.py"
+      ],
+      "regression_scope": {
+        "kind": "test-modules",
+        "paths": [
+          "testing/logging/test_fixture.py"
+        ]
+      }
+    },
+    {
+      "task_id": "pytest-75e6815c55ac",
+      "title": "Fix __tracebackhide__ not respected in ExceptionGroup sub-exception tracebacks",
+      "base_sha": "d7f61905d625e8e621d8c0157d0a4f23f0b78290",
+      "fix_sha": "75e6815c55ac66dacf033ababa40c2a91b82e99c",
+      "test_files": [
+        "testing/code/test_excinfo.py"
+      ],
+      "source_files": [
+        "src/_pytest/_code/code.py"
+      ],
+      "source_url": "https://github.com/pytest-dev/pytest/commit/75e6815c55ac66dacf033ababa40c2a91b82e99c",
+      "test_selectors": [
+        "testing/code/test_excinfo.py::test_tracebackhide_in_exceptiongroup_is_respected"
+      ],
+      "target_args": [
+        "testing/code/test_excinfo.py::test_tracebackhide_in_exceptiongroup_is_respected"
+      ],
+      "regression_args": [
+        "testing/code/test_excinfo.py"
+      ],
+      "regression_scope": {
+        "kind": "test-modules",
+        "paths": [
+          "testing/code/test_excinfo.py"
+        ]
+      }
+    },
+    {
+      "task_id": "pytest-977575388358",
+      "title": "fix config: add deprecation warning for non-string value in string-typed ini option",
+      "base_sha": "c99f595a896eb84c1dda4f4b85a0929c52011e27",
+      "fix_sha": "977575388358e8c00b77a397546304c91dc5794b",
+      "test_files": [
+        "testing/test_config.py"
+      ],
+      "source_files": [
+        "src/_pytest/config/__init__.py",
+        "src/_pytest/deprecated.py"
+      ],
+      "source_url": "https://github.com/pytest-dev/pytest/commit/977575388358e8c00b77a397546304c91dc5794b",
+      "test_selectors": [
+        "testing/test_config.py::TestConfigAPI::test_addini_string_non_str_deprecated"
+      ],
+      "target_args": [
+        "testing/test_config.py::TestConfigAPI::test_addini_string_non_str_deprecated"
+      ],
+      "regression_args": [
+        "testing/test_config.py"
+      ],
+      "regression_scope": {
+        "kind": "test-modules",
+        "paths": [
+          "testing/test_config.py"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,222 @@
+{
+  "schema": "agentgo.native-swe-tasks/v1",
+  "tasks": [
+    {
+      "task_id": "gorm-9af6d510b58c",
+      "title": "Handle table-qualified column names in map query conditions",
+      "base_sha": "c63374f5d154709f99de902cb4d90a1aa8279103",
+      "fix_sha": "9af6d510b58c7691fa33694004c404032208f84f",
+      "test_files": [
+        "tests/query_test.go"
+      ],
+      "source_files": [
+        "statement.go"
+      ],
+      "source_url": "https://github.com/go-gorm/gorm/commit/9af6d510b58c7691fa33694004c404032208f84f",
+      "test_selectors": [
+        "TestSearchWithMap"
+      ],
+      "target_roots": [
+        "tests"
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          ".",
+          "tests"
+        ]
+      }
+    },
+    {
+      "task_id": "gorm-2a22022d4147",
+      "title": "fix: panic when using clause.Returning with CreateInBatches (#7768)",
+      "base_sha": "33229296228898b311e868090f30eed169f1ae7a",
+      "fix_sha": "2a22022d4147f01763bd4804fdfe322b43ca3b55",
+      "test_files": [
+        "tests/create_test.go"
+      ],
+      "source_files": [
+        "finisher_api.go"
+      ],
+      "source_url": "https://github.com/go-gorm/gorm/commit/2a22022d4147f01763bd4804fdfe322b43ca3b55",
+      "test_selectors": [
+        "TestCreateFromMapWithTable",
+        "TestCreateInBatchesWithReturning"
+      ],
+      "target_roots": [
+        "tests"
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          ".",
+          "tests"
+        ]
+      }
+    },
+    {
+      "task_id": "gorm-61520d7476a5",
+      "title": "fix(utils): restore FileWithLineNum caller depth and add regression test (#7717)",
+      "base_sha": "01916e711737392edf158b1df4ceb48c8d24ddfd",
+      "fix_sha": "61520d7476a5b08cf09439da7bb2628f86d2cd25",
+      "test_files": [
+        "utils/utils_test.go"
+      ],
+      "source_files": [
+        "utils/utils.go"
+      ],
+      "source_url": "https://github.com/go-gorm/gorm/commit/61520d7476a5b08cf09439da7bb2628f86d2cd25",
+      "test_selectors": [
+        "TestFileWithLineNumWrappedCallRegression",
+        "TestRTrimSlice"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          ".",
+          "tests"
+        ]
+      }
+    },
+    {
+      "task_id": "gorm-e98dccce2fbb",
+      "title": "Fix nil pointer panic in serializer for nil any-type fields (#7634)",
+      "base_sha": "6e7eb0a07326fd20533a79022ea9a08237356d65",
+      "fix_sha": "e98dccce2fbbf5b860007f2b1f868a678c4fccb0",
+      "test_files": [
+        "tests/serializer_test.go"
+      ],
+      "source_files": [
+        "schema/field.go"
+      ],
+      "source_url": "https://github.com/go-gorm/gorm/commit/e98dccce2fbbf5b860007f2b1f868a678c4fccb0",
+      "test_selectors": [
+        "TestSerializerAssignFirstOrCreate",
+        "TestSerializerWithAnyType"
+      ],
+      "target_roots": [
+        "tests"
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          ".",
+          "tests"
+        ]
+      }
+    },
+    {
+      "task_id": "gorm-8503287ca442",
+      "title": "Preserve wildcard semantics when merging empty RETURNING clauses",
+      "base_sha": "4ef3af10ed7478255f7fade8c27ccf7af149439d",
+      "fix_sha": "8503287ca442ff46c6d0b1204232fc4809012737",
+      "test_files": [
+        "clause/returning_test.go"
+      ],
+      "source_files": [
+        "clause/returning.go"
+      ],
+      "source_url": "https://github.com/go-gorm/gorm/commit/8503287ca442ff46c6d0b1204232fc4809012737",
+      "test_selectors": [
+        "TestReturning"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          ".",
+          "tests"
+        ]
+      }
+    },
+    {
+      "task_id": "gorm-d9372f551000",
+      "title": "fix(UnixSecondSerializer.Value): Avoid panic when handling unsigned integer values (#7608)",
+      "base_sha": "d8cdb399566b65270d5a3b651eca0195694f35d5",
+      "fix_sha": "d9372f551000bef6535f5679c38255ca0be327bc",
+      "test_files": [
+        "schema/serializer_test.go"
+      ],
+      "source_files": [
+        "schema/serializer.go"
+      ],
+      "source_url": "https://github.com/go-gorm/gorm/commit/d9372f551000bef6535f5679c38255ca0be327bc",
+      "test_selectors": [
+        "TestUnixSecondSerializer_Value"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          ".",
+          "tests"
+        ]
+      }
+    },
+    {
+      "task_id": "gorm-faee391f05f3",
+      "title": "fix: add missing Count method to CreateInterface (closes #7580)",
+      "base_sha": "688e8ea00a232bd661c08d3d3ba22750c3b3d95e",
+      "fix_sha": "faee391f05f3426660598d22f03881f115d3aa39",
+      "test_files": [
+        "tests/generics_test.go"
+      ],
+      "source_files": [
+        "clause/set.go",
+        "generics.go"
+      ],
+      "source_url": "https://github.com/go-gorm/gorm/commit/faee391f05f3426660598d22f03881f115d3aa39",
+      "test_selectors": [
+        "TestGenericsCount",
+        "TestGenericsDeleteAPI",
+        "TestGenericsScanUUID",
+        "TestGenericsUpdate",
+        "TestGenericsUpdates"
+      ],
+      "target_roots": [
+        "tests"
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          ".",
+          "tests"
+        ]
+      }
+    },
+    {
+      "task_id": "gorm-7b1fb0bd7324",
+      "title": "fix(scan): array element is set to a zero value (#6890)",
+      "base_sha": "e4e23d26d2d16cbfb575da0bfa9a400e2ad29b92",
+      "fix_sha": "7b1fb0bd732448adad0ea097983fc663700c1978",
+      "test_files": [
+        "tests/query_test.go"
+      ],
+      "source_files": [
+        "scan.go"
+      ],
+      "source_url": "https://github.com/go-gorm/gorm/commit/7b1fb0bd732448adad0ea097983fc663700c1978",
+      "test_selectors": [
+        "TestQueryError",
+        "TestQueryScanToArray"
+      ],
+      "target_roots": [
+        "tests"
+      ],
+      "regression_scope": {
+        "kind": "module",
+        "paths": [
+          ".",
+          "tests"
+        ]
+      }
+    }
+  ]
+}

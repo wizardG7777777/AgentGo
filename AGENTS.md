@@ -59,7 +59,8 @@ AgentGo 是 Go 1.25 多 Agent 数据流图系统，模块 agentgo。Scheduler �
 | Candidate / Delivery | candidate/v1、delivery/v2 |
 | Session / Lease | Session 8、execution-lease/v4 |
 | Run / Progress / Shell | run-contract/v3、progress-contract/v2、shell-execution/v2 |
-| SWE | swe-result/v5、swe-judge/v2；pytest-phase-report/v2、swe-test-execution/v1 |
+| SWE | swe-result/v5、swe-judge/v2；pytest-phase-report/v2、swe-test-execution/v1；suite/v1（Flask）、suite/v2（Gin）、go-test-report/v1 |
+| SWE 资源归档 | swe-artifact-manifest/v2；旧 v1 只读校验，不改写 |
 
 schema 带 agentgo. 前缀。文件必须显式声明 llm.request_contract=agentgo.model-request/v1 和 graph.request_contract=agentgo.graph/v7。llm.stream、observation_model、max_subtask_depth 等退役字段拒绝；不由默认配置填补必需的文件标识。两个协议 Responses/Chat Completions 都只使用 SSE，不自动切换或降级。
 
@@ -84,7 +85,37 @@ Graph 定义、运行、请求回执、输入及完成意图共用 `.agentgo/sta
 
 使用 go test ./...、go vet ./...、go build；跨子系统须实际运行二进制并核对产物。scripts/local_fake_provider_smoke.py 覆盖两协议、增量图、普通检查任务、候选一致性与图级交付；不能冒充真实 SWE。
 
-SWE Test Runner 唯一入口为 scripts/swe_test_runner/runner.py。四变量 SWE_API_KEY、SWE_BASE_URL、SWE_FAST_MODEL、SWE_FLAG_SHIP_MODEL 在副作用前检查，只列缺项。角色模型来自 setting.swe-flask.yaml；模型探针去重。真实命令、测试/源码/依赖身份、Flask 导入位置和 pytest 判题由 Python 负责，AgentGo 不恢复 CheckRecord。
+SWE Test Runner 唯一入口为 scripts/swe_test_runner/runner.py。执行类入口 probe/task/batch/verify-candidates 在副作用前检查 SWE_API_KEY、SWE_BASE_URL、SWE_FAST_MODEL、SWE_FLAG_SHIP_MODEL，只列缺项；离线 storage report、cleanup plan/apply、archive verify 不读取模型配置、不要求这些变量、不调用 provider。原生入口由外部 Python 管理独立尝试、scratch、进程、预算、归档和清理回执；容器显式设置 SWE_RESOURCE_OWNER=container，由既有容器外层管理资源，禁止内外双重清理。角色模型来自 setting.swe-flask.yaml；模型探针去重。真实命令、测试/源码/依赖身份及 pytest/Go 正式判题由外部 Python Runner 负责，AgentGo 不恢复 CheckRecord。
+
+Gin 通过同一入口的 `--suite gin-1` 选择，角色模型/工具配置仍来自 setting.swe-flask.yaml，角色正文来自 prompts/swe/gin。Go 判题固定工具链、核对实际模块和依赖，目标测试全部通过且无跳过，完整回归不能新增失败、漏跑或丢失原先通过的测试。Windows 既有平台失败单列，不能删除测试换取全绿。Gin 当前仅纳入原生 PowerShell 与 Linux zsh 验证；不要扩展容器流程或把 WSL zsh 成绩当作 macOS 原生成绩。
+
+Windows `firewall-check` 不调用模型、不读取模型配置，验证临时测试 EXE 的执行前规则、普通权限和回收；其系统规则操作需要一次 UAC。执行入口启用 `--windows-firewall` 时必须先通过该检查。禁止关闭全局防火墙或通知来掩盖授权问题；新增可见防火墙提示、助手失联或清理未知时停止批次。管理员助手只处理本用户、本测试范围的规则，测试与模型进程不得整体提权。
+
+受管命令的防火墙 lease 绑定命令进程树：启动前记录全部所需程序（包括 Python venv 的基础解释器和 CTest 选中的子程序），确认进程树退出后归还；启动失败回收已申请部分，状态未知时保留并报错。相同 EXE 的并发使用者持有独立 lease，最后一个归还后才撤销规则；命令内重复程序去重。整题 release_run 仅作兜底，不能把每条已结束命令的 lease 都积到整题结束。保留助手 256 个活动 lease 的限制，须验证超过 256 次顺序执行不会耗尽它。
+
+`rejudge` 不读取模型配置、不调用 provider：只对已停止、已结算且归档核验通过的原生模型尝试，在同平台新建受管尝试应用原补丁；旧判题未保存补丁时可从归档重建原交付源码，但必须有失败回执，且受保护输入与原、新基线完全一致。题目定义、资格清单和源码产物必须一致，拒绝篡改。新旧报告分别保留，记录来源和新增调用数 0，不续跑历史 Session、不重复计算覆盖。Vitest 3/4 在执行前按声明真实路径选择上游测试规格，不依赖 CLI 子串过滤和 exclude 继承；报告若仍含主根 `.agentgo` 候选副本或范围外测试则拒绝，禁止事后过滤失败结果。
+
+Vitest 新增测试文件只能在测试补丁应用前缺席，须以固定 base/fix 的 Git 新增记录及题目 test_files 共同证明。空基线明确记为未执行测试、零通过；红态、绿态与正式判题仍检查全部声明文件，不把删除或拼写错误当作可忽略项。
+
+Cargo 测试清单查询与执行必须使用 artifact 所属 package 根目录，与 Cargo 原生语义一致；package_id、manifest 和工作树边界必须一致，保存执行目录证据。原源码复判保持目标和测试清单不变，允许新资格通过集合严格增强，禁止丢失旧通过项或增加未知测试；差异必须留证，不能重写历史成绩。
+
+原生题目显式声明的 required_regression_tests 在应用测试补丁后必须被收集和实际执行，红态须为这些回归的真实失败。平台夹具适配只能修改声明的测试文件，必须固定输入/输出摘要、平台和精确替换，进入题目身份及执行证据；源码补丁保持独立，模型和 Judge 使用同一冻结测试输入。不得把平台条件排除、跳过或无关测试失败当成资格通过。
+
+更换 SWE 题目须同步题目清单与对应题面文件，启动前核对当前清单的全部题面存在、非空且已纳入冻结摘要。红绿资格通过不等于模型输入已完整，不能以资格验证替代题面入口检查。旧题成绩保留为历史，不得移植给新题。
+
+CTest 内存安全题须显式声明 `environment.sanitizer=address`，基线、红绿验证和最终判题使用同一检测环境并记录编译器及参数身份。Windows 使用具备 AddressSanitizer 的原生 MSVC 开发环境，Linux 使用原生 C++ 编译器；缺少工具或编译失败不得降级普通构建或放宽红态条件。
+
+SWE 补丁导出的大路径集合使用 NUL 分隔的 literal pathspec 经 stdin 交给 Git；不能拼接超长 argv，也不能扩大为整棵工作树暂存。重置独立 index 后核对 staged 集合仍在选定生产文件范围内，再导出补丁。CMake 产物须以源/构建目录元数据、Git 已跟踪/原始输入归属和已知产物类型共同识别；保留输入摘要及归档，真实测试、声明测试和原有配置仍受保护，禁止按 `build*` 名称一律放行。生成产物可以未跟踪但未被 ignore，不得把这两种状态混同。原归档误判的纠正必须证明原受保护输入未变，并保留旧 judge。
+
+SWE 权限测试使用命令独立 scratch；POSIX Cargo 子执行也纳入进程和目录归属。只在相应进程树确认退出后恢复 owned scratch 的必要收尾权限，并记录原模式与身份；不得为盘点而修改运行中的测试权限、跟随外部链接或提权测试。权限拒绝造成的不完整盘点仍受新鲜度和最终完整盘点约束，未知状态继续保留并停止。
+
+SWE 运行中盘点可以使用逻辑字节上界，未计算的 unique_file_bytes / allocated_bytes 必须为 null，不能伪装成精确值。缓存逻辑量可能超限时先精确去重再判定，收尾仍完整精确盘点；所有依赖副本继续计量。目录枚举句柄须在逐文件元数据处理前关闭，避免 Windows 子目录句柄阻止上级目录发布。每次盘点结果写入 inventory-samples.jsonl，后来的成功样本不得覆盖历史超时原因。临时扫描/新鲜度预算为 450/600 秒，监控线程收尾独立限额 30 秒，不随扫描预算倍增。
+
+SWE 盘点须保留具体读取操作、errno/winerror、相对路径及复核状态。仅对受管盘点中的 Windows 5/32/33 进行只读有界重试：每次故障最多追加 4 次读取，全样本共用 1 秒等待额度并服从扫描截止时间；等待前后均不跟随链接地复核父路径。消失的条目按动态目录处理，链接不遍历，枚举中途失败必须先关闭句柄并丢弃局部结果；持续/未知拒绝访问仍停止，不能提权、改 ACL 或重放模型/业务命令。scratch 权限测试的新鲜度宽限仅用于既有 POSIX 场景。修改工作区源码不热更新已冻结的评测运行副本。
+
+Windows 命令收尾读取本 Attempt 元数据时须与其 persist 共用互斥边界；运行期盘点 worker 从父进程接收脱离共享状态的最小所有权/布局/策略快照，仍核对实际根标记、目录身份和路径，不重读正在替换的 attempt.json。进程树退出事实与 scratch/文件恢复结果分开记录；已证明进程退出后发生文件恢复错误，不得将 quiescent 倒改为 false。真实进程未知仍停止并保留授权；记录具体操作、原异常类型、errno/winerror 及原因链，缺失字段保持缺失。
+
+原生归档必须保留合法的文件系统名称，包括 POSIX 非 UTF-8 字节名。v2 清单保留原路径并校验 ZIP 安全成员名的对应关系；不得替换字符、跳过文件或删除测试换取归档成功。链接仅作数据保存，不跟随；旧 v1 归档按原布局只读校验，未知格式拒绝。
 
 2026-09-12 已用当前 Graph v7 / Context v12 二进制完成真实 Responses SSE Flask-8：8/8 修复成功，无新增测试失败、无未结算调用或超时强杀；业务模型调用 335 次。上一轮 Context v11 为 6/8。版本、完整日志和残余工具可用性问题见 [本轮报告](docs/test-issues/2026-09-12-flask8-after-context-and-l3-fixes.md) 与 KNOWN_ISSUES；通过不等于模型不会误调用工具。真实测试遇推理服务429/500等HTTP错误或必需变量问题仍须停止并报告，不暴露凭据。
 
@@ -113,6 +144,8 @@ AgentGo 同等支持 Windows / macOS / Linux。以下每一条都曾在生产坏
 - **SWE Test Runner 进程监控必须持有 `subprocess.Popen` 并用 `poll()` 查询生命周期**。禁止用 `os.kill(pid, 0)` 模拟 POSIX 存活探测；当前 Windows Python 会对不存在 PID 抛 `WinError 87`，并可能破坏仍在运行的被监控进程。批次 result/judge 新鲜度必须与 `.batch_start` marker 使用同一文件系统 mtime 权威，禁止拿独立 `time.time()` 与 NTFS mtime 做零容差边界比较。
 - **SWE Test Runner 渲染 v4 YAML 时，`Path` 占位符必须先归一为 forward slash**。Windows `project_root` 与 `agents[*].system_prompt_file` 同受配置红线约束；只转换 `Path` 类型，禁止顺手改写 URL、model、token 等普通字符串。
 - **SWE Test Runner 自行固定 stdout/stderr UTF-8**。公开命令入口必须调用统一 console 配置，不能依赖 Windows 活动代码页、`PYTHONUTF8` 或调用者额外传 `-X utf8`；不支持 `reconfigure` 的嵌入式流保持调用方语义，持久化结果仍显式使用 UTF-8。
+- **Windows Node 依赖联接必须能随工作副本迁移**。SWE Vitest 准备阶段仅把自有 node_modules 内、目标仍在工作树内的 NTFS junction 转换为相对符号链接，保留依赖图而不递归展开复制。先核对全部边界与普通用户符号链接权限，失败则停止准备；测试进程不整体提权。转换回执纳入环境身份，不能保留指回旧基线的绝对目录链接。
+- **Windows 工作副本复制必须保留源符号链接的目录/文件类型**。目标目录可能尚未复制，不能通过目的地是否存在推断链接类型；统一使用 `workspace/copySnapshotSymlink`，保留相对目标和长路径行为，不跟随链接复制依赖数据。POSIX 继续使用原生 `os.Symlink`。
 - **SWE Test Runner 清理 disposable worktree 时必须处理 Windows Git object 的 ReadOnly 属性**：`shutil.rmtree` 使用 `onexc`，只对 Windows `PermissionError` 清除 ReadOnly 后重试原操作一次；非 Windows、非权限错误和重试失败全部原样 fail-closed，禁止 `ignore_errors` 或吞掉文件占用/真实 I/O 故障。回归必须包含同一路径连续两次清理。
 - **新增 CI 时应同时跑 `ubuntu-latest` 与 `windows-latest`**——上述故障在 POSIX 上几乎全是静默的。
 

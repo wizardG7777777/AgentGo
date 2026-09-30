@@ -1,0 +1,21 @@
+{
+  "schema": "agentgo.swe-suite/v3",
+  "suite_id": "gin-8",
+  "project": "gin",
+  "title": "gin native eight-task SWE suite",
+  "task_count": 8,
+  "upstream": {
+    "vcs": "git",
+    "repository": "https://github.com/gin-gonic/gin.git"
+  },
+  "driver": "go",
+  "environment": {
+    "toolchain": "go1.25.0",
+    "cgo": 0,
+    "roots": [
+      "."
+    ],
+    "timeout": 600
+  },
+  "qualification_status": "pending"
+}

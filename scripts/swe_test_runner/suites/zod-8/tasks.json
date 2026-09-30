@@ -1,0 +1,253 @@
+{
+  "schema": "agentgo.native-swe-tasks/v1",
+  "tasks": [
+    {
+      "task_id": "zod-7a00236683c7",
+      "title": "fix(v4): don't let format checks overwrite tighter min/max bounds (#6553)",
+      "base_sha": "5489a532e65ee3f5ab0959ff8a5da346ced96f2a",
+      "fix_sha": "7a00236683c79000dbab0d92f6faf0b7fba39f59",
+      "test_files": [
+        "packages/zod/src/v4/classic/tests/bigint.test.ts",
+        "packages/zod/src/v4/classic/tests/to-json-schema.test.ts"
+      ],
+      "source_files": [
+        "packages/zod/src/v4/core/checks.ts"
+      ],
+      "source_url": "https://github.com/colinhacks/zod/commit/7a00236683c79000dbab0d92f6faf0b7fba39f59",
+      "test_selectors": [],
+      "target_args": [
+        "packages/zod/src/v4/classic/tests/bigint.test.ts",
+        "packages/zod/src/v4/classic/tests/to-json-schema.test.ts"
+      ],
+      "regression_args": [
+        "packages/zod/src/v4/classic/tests"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/zod/src/v4/classic/tests"
+        ]
+      },
+      "environment": {
+        "manager": "pnpm@10.12.1"
+      }
+    },
+    {
+      "task_id": "zod-cafbee4772ef",
+      "title": "fix(v4): parse recursive schemas built by a factory (#6530)",
+      "base_sha": "4d7308828b1a56768741d7cfd6cf476eaead45af",
+      "fix_sha": "cafbee4772ef481611fef6f5fb9ed9a1b9597069",
+      "test_files": [
+        "packages/zod/src/v4/classic/tests/cyclic-data.test.ts",
+        "packages/zod/src/v4/classic/tests/object.test.ts"
+      ],
+      "source_files": [
+        "packages/zod/src/v4/classic/schemas.ts",
+        "packages/zod/src/v4/core/memoizer.ts",
+        "packages/zod/src/v4/core/schemas.ts",
+        "packages/zod/src/v4/core/util.ts",
+        "packages/zod/src/v4/mini/schemas.ts"
+      ],
+      "source_url": "https://github.com/colinhacks/zod/commit/cafbee4772ef481611fef6f5fb9ed9a1b9597069",
+      "test_selectors": [],
+      "target_args": [
+        "packages/zod/src/v4/classic/tests/cyclic-data.test.ts",
+        "packages/zod/src/v4/classic/tests/object.test.ts"
+      ],
+      "regression_args": [
+        "packages/zod/src/v4/classic/tests"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/zod/src/v4/classic/tests"
+        ]
+      },
+      "environment": {
+        "manager": "pnpm@10.12.1"
+      }
+    },
+    {
+      "task_id": "zod-eca968715366",
+      "title": "fix(v4): enforce the six JSON Schema keywords fromJSONSchema silently dropped (#6535)",
+      "base_sha": "81ded9918fe39d51b232be72f23ba0d5fb6a837e",
+      "fix_sha": "eca96871536603076bdd00b8779b947144133aa4",
+      "test_files": [
+        "packages/zod/src/v4/classic/tests/from-json-schema.test.ts"
+      ],
+      "source_files": [
+        "packages/zod/src/v4/classic/from-json-schema.ts"
+      ],
+      "source_url": "https://github.com/colinhacks/zod/commit/eca96871536603076bdd00b8779b947144133aa4",
+      "test_selectors": [],
+      "target_args": [
+        "packages/zod/src/v4/classic/tests/from-json-schema.test.ts"
+      ],
+      "regression_args": [
+        "packages/zod/src/v4/classic/tests"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/zod/src/v4/classic/tests"
+        ]
+      },
+      "environment": {
+        "manager": "pnpm@10.12.1"
+      }
+    },
+    {
+      "task_id": "zod-2125d30ce58f",
+      "title": "fix(v4): accept exact decimal multiples in multipleOf (#6223)",
+      "base_sha": "168122fca54452aa30d7261c83df79b703b258d7",
+      "fix_sha": "2125d30ce58f66170682d5a50ee4a3e2eac568e3",
+      "test_files": [
+        "packages/zod/src/v4/classic/tests/number.test.ts"
+      ],
+      "source_files": [
+        "packages/zod/src/v4/core/util.ts"
+      ],
+      "source_url": "https://github.com/colinhacks/zod/commit/2125d30ce58f66170682d5a50ee4a3e2eac568e3",
+      "test_selectors": [],
+      "target_args": [
+        "packages/zod/src/v4/classic/tests/number.test.ts"
+      ],
+      "regression_args": [
+        "packages/zod/src/v4/classic/tests"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/zod/src/v4/classic/tests"
+        ]
+      },
+      "environment": {
+        "manager": "pnpm@10.12.1"
+      }
+    },
+    {
+      "task_id": "zod-84e416fbf474",
+      "title": "fix(v4): stop the cycle walk from firing a default factory (#6500)",
+      "base_sha": "1a16102a494b03ce1df7b80b663ae2df465f419e",
+      "fix_sha": "84e416fbf4740527bbc8f319634f4e1b065bb42c",
+      "test_files": [
+        "packages/zod/src/v4/classic/tests/cyclic-data.test.ts",
+        "packages/zod/src/v4/classic/tests/default.test.ts"
+      ],
+      "source_files": [
+        "packages/zod/src/v4/core/memoizer.ts"
+      ],
+      "source_url": "https://github.com/colinhacks/zod/commit/84e416fbf4740527bbc8f319634f4e1b065bb42c",
+      "test_selectors": [],
+      "target_args": [
+        "packages/zod/src/v4/classic/tests/cyclic-data.test.ts",
+        "packages/zod/src/v4/classic/tests/default.test.ts"
+      ],
+      "regression_args": [
+        "packages/zod/src/v4/classic/tests"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/zod/src/v4/classic/tests"
+        ]
+      },
+      "environment": {
+        "manager": "pnpm@10.12.1"
+      }
+    },
+    {
+      "task_id": "zod-eab51ff3592b",
+      "title": "fix(v4): emit record numeric keys as strings in toJSONSchema (#6497)",
+      "base_sha": "7e24a24288183ce02554f1ded7775d0650a7b7e6",
+      "fix_sha": "eab51ff3592b2d11d863f4ee4d5452f31a3de1b6",
+      "test_files": [
+        "packages/zod/src/v4/classic/tests/to-json-schema.test.ts"
+      ],
+      "source_files": [
+        "packages/zod/src/v4/core/json-schema-processors.ts",
+        "packages/zod/src/v4/core/to-json-schema.ts"
+      ],
+      "source_url": "https://github.com/colinhacks/zod/commit/eab51ff3592b2d11d863f4ee4d5452f31a3de1b6",
+      "test_selectors": [],
+      "target_args": [
+        "packages/zod/src/v4/classic/tests/to-json-schema.test.ts"
+      ],
+      "regression_args": [
+        "packages/zod/src/v4/classic/tests"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/zod/src/v4/classic/tests"
+        ]
+      },
+      "environment": {
+        "manager": "pnpm@10.12.1"
+      }
+    },
+    {
+      "task_id": "zod-97edaf7dc405",
+      "title": "fix(v4): don't throw from safeParse on bigint multipleOf(0n) (#6466)",
+      "base_sha": "21a6f0cbd3bef24d47e488a48cc9cb4d0bf97743",
+      "fix_sha": "97edaf7dc4055935514de69dbd646c2fbe78b0f6",
+      "test_files": [
+        "packages/zod/src/v4/classic/tests/bigint.test.ts",
+        "packages/zod/src/v4/core/tests/compile.test.ts"
+      ],
+      "source_files": [
+        "packages/zod/src/v4/core/checks.ts",
+        "packages/zod/src/v4/core/compile.ts"
+      ],
+      "source_url": "https://github.com/colinhacks/zod/commit/97edaf7dc4055935514de69dbd646c2fbe78b0f6",
+      "test_selectors": [],
+      "target_args": [
+        "packages/zod/src/v4/classic/tests/bigint.test.ts",
+        "packages/zod/src/v4/core/tests/compile.test.ts"
+      ],
+      "regression_args": [
+        "packages/zod/src/v4/classic/tests",
+        "packages/zod/src/v4/core/tests"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/zod/src/v4/classic/tests",
+          "packages/zod/src/v4/core/tests"
+        ]
+      },
+      "environment": {
+        "manager": "pnpm@10.12.1"
+      }
+    },
+    {
+      "task_id": "zod-badf0b7894a4",
+      "title": "fix(v4): build the catch context from the input that failed (#6192)",
+      "base_sha": "a82593c19b27a637fcde21e50c53cb51cc4e27f8",
+      "fix_sha": "badf0b7894a4f777d41fcd7ed2433e5f8c9c23ea",
+      "test_files": [
+        "packages/zod/src/v4/classic/tests/catch.test.ts"
+      ],
+      "source_files": [
+        "packages/zod/src/v4/core/schemas.ts"
+      ],
+      "source_url": "https://github.com/colinhacks/zod/commit/badf0b7894a4f777d41fcd7ed2433e5f8c9c23ea",
+      "test_selectors": [],
+      "target_args": [
+        "packages/zod/src/v4/classic/tests/catch.test.ts"
+      ],
+      "regression_args": [
+        "packages/zod/src/v4/classic/tests"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/zod/src/v4/classic/tests"
+        ]
+      },
+      "environment": {
+        "manager": "pnpm@10.12.1"
+      }
+    }
+  ]
+}

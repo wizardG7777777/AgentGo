@@ -1,0 +1,22 @@
+{
+  "schema": "agentgo.swe-storage-policy/v1",
+  "min_free_bytes": 53687091200,
+  "max_attempt_bytes": 25769803776,
+  "max_live_bytes": 85899345920,
+  "cache_max_bytes": 34359738368,
+  "archive_max_bytes": 34359738368,
+  "archive_reserve_bytes": 8589934592,
+  "shutdown_reserve_bytes": 1073741824,
+  "max_command_output_bytes": 268435456,
+  "max_attempt_log_bytes": 4294967296,
+  "max_active_attempts": 1,
+  "max_build_jobs": 2,
+  "sample_interval_ms": 2000,
+  "inventory_interval_ms": 15000,
+  "max_scan_seconds": 450,
+  "max_inventory_age_seconds": 600,
+  "max_monitor_stop_seconds": 30,
+  "max_scratch_prefix_bytes": 80,
+  "preserve_failed_worktree": true,
+  "require_wsl_host_space": true
+}

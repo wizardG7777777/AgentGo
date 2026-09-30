@@ -8,10 +8,15 @@ import os
 from pathlib import Path
 import uuid
 
+# The standalone container transport also imports this module. Runner injects
+# its context accessor; importing probe recording alone needs no native runtime.
+attempt_resolver = lambda: None
+
 
 class ProbeArchive:
     def __init__(self, endpoint, body):
-        root = os.environ.get("SWE_PROBE_ARCHIVE")
+        self.attempt = attempt_resolver()
+        root = self.attempt.reports / "provider-probes" if self.attempt else os.environ.get("SWE_PROBE_ARCHIVE")
         self.path = Path(root) / uuid.uuid4().hex if root else None
         self.body = None
         self.state = {"endpoint": endpoint, "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -28,6 +33,12 @@ class ProbeArchive:
 
     def record_bytes(self, data):
         if self.body:
+            if self.attempt:
+                allowed = self.attempt.charge_output(len(data))
+                self.body.write(data[:allowed])
+                self.body.flush()
+                self.attempt.check()
+                return
             self.body.write(data)
             self.body.flush()
 

@@ -1,0 +1,2 @@
+task_id,fix_sha,test_files,title,test_selectors
+context-copy-state,293ad7edebb3ae30369288bd6416ca0d78474727,context_test.go,Preserve context errors and accepted formats when copying,TestContextCopyCopiesErrors TestContextCopyCopiesAccepted TestContextCopyNilErrorsAndAccepted

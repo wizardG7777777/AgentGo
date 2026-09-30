@@ -1,0 +1,22 @@
+{
+  "schema": "agentgo.swe-suite/v3",
+  "suite_id": "gorm-8",
+  "project": "gorm",
+  "title": "gorm native eight-task SWE suite",
+  "task_count": 8,
+  "upstream": {
+    "vcs": "git",
+    "repository": "https://github.com/go-gorm/gorm.git"
+  },
+  "driver": "go",
+  "environment": {
+    "toolchain": "go1.25.0",
+    "cgo": 1,
+    "roots": [
+      ".",
+      "tests"
+    ],
+    "timeout": 600
+  },
+  "qualification_status": "pending"
+}

@@ -1,41 +1,21 @@
 # KNOWN_ISSUES — 当前限制与验证缺口
 
-最后核对：2026-09-15。工具重建的删除对账见 [清单](../design/tool-taxonomy-deletion-ledger.md)，阶段验证见 [工具契约第 13 章](../design/tool-taxonomy-and-contracts.md)。旧问题清单和原验证事实已 [归档](../archived/known-issues-before-four-categories.md)，不作为新版本通过的证据。
+最后核对：2026-09-30。本文只保留当前仍有效的限制、失败基线和验证缺口；逐次 SWE 报告、原始日志与归档保存在本地 testbed，不纳入 Git。
 
 ## 尚未完成的外部验证
 
-- **Linux arm64 真实 provider / M3 Max 原生仍待验证**：[容器工具](../../SWE_LinuxContainers/README.md) 的 amd64 Docker 真实 Responses Flask-8 已 8/8 修复成功，见 [本轮报告](../test-issues/2026-09-13-docker-flask8-real.md)。arm64 目前仍是仿真环境红绿自检和二进制冒烟，不能扩展为 M3 Max 原生或 arm64 真实模型成绩。公共 amd64/arm64 镜像索引已于 2026-09-15 核对，使用方式见容器说明；不代表 arm64 真实模型验证完成。
+- **Core-96 已完成结算，但并非全题修复成功**：2026-09-24 的双平台评测覆盖 192/192 项，177 项 resolved、15 项失败（Windows 87/96、Linux/WSL zsh 90/96）。结果累计自多个冻结批次及不同 Runner/AgentGo 二进制，不能当作单一版本从零统一重跑。失败复核中 12/15 个最终快照存在 AgentGo `shell_command` Interaction 等待；这与 Windows UAC 或防火墙授权不同。macOS 不在本轮覆盖范围内。
+- **无人值守 SWE 尚不能自动处理 AgentGo 内部授权请求**：Runner 可以识别运行状态，但没有用户回应的 `shell_command` Interaction 会阻断任务。不得通过整体提权或自动批准所有命令掩盖此限制；需要单独设计受限、可审计的授权策略。
+- **Linux arm64 真实 Provider 与 macOS 原生验证仍缺少证据**：Docker arm64 仿真、交叉编译及 Linux/WSL zsh 结果不能代替 arm64 真机或 macOS 原生运行。
+- **真实 Provider 的图片/文件能力尚未完整验证**：本地编码、权限和预算检查不代表当前外部模型具备对应能力；默认仍只声明文本输入。
+- **TTY 专属交互仍需设备验证**：inline/alt-screen 切换、Windows ConPTY 粘贴和终端滚动已有自动化覆盖，但不同终端的实际行为仍需复测。
+- **真实 Chat Completions 完整 SWE 批测仍缺少证据**：Responses 实测与双协议本地 SSE 用例不能代替 Chat Completions 的完整真实批次。
 
-- **macOS 原生启动/交互未在本地验证**：CI 保留 macOS/Windows/Linux，当前主机为 Windows。不能以交叉构建代替 macOS 实际启动或 TTY 验证。
-- **真实 provider 图片/文件能力未验证**：类型化输入的本地编码、授权与预算检查不代表当前外部模型已支持这些能力；默认仍只声明文本。
-- **TTY 专属交互仍有人工验证缺口**：TUI inline/alt-screen 切换、Windows ConPTY 粘贴和终端滚动有单测，实际终端差异仍需对应设备复测。
+## SWE 运行中观察到的失败边界
 
-## 最新真实测试与残余可用性问题
-
-2026-09-15 容器源码与隐私边界交付验证见 [本次记录](../test-issues/2026-09-15-swe-container-source-delivery.md)；仅离线回归与二进制冒烟，不计为新的真实 SWE 成绩。
-
-2026-09-13 Ubuntu 24.04 / linux/amd64 Docker 完整真实批次 8/8 成功，285 次业务模型调用，
-无新增测试失败、篡改、未结算调用或超时强杀；报告/行为日志校验后已删除本批容器和卷。
-仍有 41 条工具级错误/拒绝被模型纠正，且最后一题输入量偏高，详见 [Docker 对照报告](../test-issues/2026-09-13-docker-flask8-real.md)。
-
-2026-09-12 完整 Flask-8 已 8/8 修复成功；此前重复阻塞事件、正文二次外置、局部分区限额、Git 工作视图与长路径、终态静默窗口问题均已修复并记录验证。实际成绩和判读边界见 [本轮报告](../test-issues/2026-09-12-flask8-after-context-and-l3-fixes.md)，原 6/8 报告保留历史事实。
-
-- **Shell 物理依赖路径不能直接用于逻辑文件接口**：本轮第二题有 4 次把 .workspace-shell/.venv 物理路径传入 read_file 后读取失败。模型后来完成任务，但跨工具路径提示仍可改进，不能将这些调用视为已被自动映射。
-- **结构化结果与引用提示仍可改进**：本轮仍出现 13 次未知参数字段、3 次结果字段缺失、2 次把 CandidateRef/OutcomeRef 误作 ResultRef。框架拒绝后模型纠正，未阻止本轮交付；不通过兼容别名或放松校验掩盖问题。
-- **真实 Chat Completions 完整批测仍缺少证据**：本轮正式 SWE 使用 Responses；双协议本地 SSE 用例不能替代另一真实协议的完整测试。
-
-## 原文模式已删除的故障路径
-
-- 已删除 L2 正文引用替换、历史裁剪与自定义片段/分区/原子组大小限额；原两个失败历史以全部 23/20 轮原文回放通过，不再生成递归 ContentRef。
-- 已删除 Graph 纯文本结束的重复提交提醒；普通文本可自动登记并交付，结构化提交仍可选。
-- 已删除 read_file 缓存摘要 stub/force_full，以及 inspect_node 的 details_ref 正文间接访问。L3 文件路径回显与 Shell cwd 坐标已统一。
-- 新契约、删除清单及验证边界见 [实施记录](../design/raw-context-and-plain-results.md)。这些离线结果不替代新版本真实 SWE。
-
-## 本次修复与剩余验证
-
-- 旧图缺少特殊验收节点导致候选未交付的问题，已由唯一 agentTask、普通检查任务的候选绑定和图级 complete 替代；真实 automatic-options 已从2失败变为494通过。
-- 多行 Shell 的文本不再作为事实身份，改用 CallID；执行前核对实际路由与工作区组件。
-- 原六题失败材料保留在 [旧运行调查](../test-issues/2026-09-11-swe-candidate-delivery-audit.md)，早期单题验证见 [agentTask 记录](../test-issues/2026-09-11-agenttask-validation.md)。最新独立完整复测为 8/8 成功；残余调用可用性问题如上，不能以绿色审计隐藏它们。
+- **大范围命令输出可能使上下文装配失败**：测试曾因递归列举依赖目录产生超大输出而触发 `snapshot_budget_exceeded`。调查应限制目录范围和输出量，不能依靠扩大上下文窗口掩盖无界输出。
+- **Graph 完成可能偏离原始修复目标**：曾出现模型把“实现修复”缩成“只调查”，随后按缩小后的目标结束 Graph、未交付源码补丁。评估原始用户目标与最终交付时必须分开核验。
+- **编辑操作可能反复失败而未形成交付**：测试观察到精确替换字符串不匹配及非唯一匹配；模型自述、自测通过或候选区已有改动均不能代替最终源码补丁和 Judge 结果。
 
 ## 当前功能边界
 
@@ -50,6 +30,4 @@
 
 ## 维护规则
 
-2026-09-09 CI 暴露的进程组测试契约与探针超时竞争已修复；原始失败及修复范围见 [CI 修复记录](../test-issues/2026-09-09-ci-process-and-probe.md)。跨平台验证以修复提交的 Actions 结果为准。
-
-只记录当前可复现的未解决问题、明确功能边界或真实验证缺口。修复后移除条目并保留原始证据；不要把历史已关闭的问题、设计愿望或未经复现的推测当作当前 bug。SWE-121/122/123 的旧日志继续保存在 2026-09-07 审计文档中，新工具不再使用其退役判据。
+只记录当前可复现的未解决问题、明确功能边界或真实验证缺口。修复后移除对应条目并保留必要的原始证据；不要把历史已关闭问题、设计愿望或未经复现的推测写成当前 bug。逐次报告和原始运行材料由 SWE Test Runner 保存在本地 testbed，不提交到仓库。

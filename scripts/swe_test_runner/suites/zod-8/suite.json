@@ -1,0 +1,25 @@
+{
+  "schema": "agentgo.swe-suite/v3",
+  "suite_id": "zod-8",
+  "project": "zod",
+  "title": "zod native eight-task SWE suite",
+  "task_count": 8,
+  "upstream": {
+    "vcs": "git",
+    "repository": "https://github.com/colinhacks/zod.git"
+  },
+  "driver": "vitest",
+  "environment": {
+    "test_args": [
+      "--maxWorkers=2",
+      "--minWorkers=1"
+    ]
+  },
+  "qualification_status": "pending",
+  "materialize_links": [
+    ".codex/skills",
+    ".cursorrules",
+    "CLAUDE.md",
+    "README.md"
+  ]
+}

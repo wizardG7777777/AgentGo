@@ -1,0 +1,14 @@
+{
+  "schema": "agentgo.swe-suite/v3",
+  "suite_id": "fmt-8",
+  "project": "fmt",
+  "title": "fmt native eight-task SWE suite",
+  "task_count": 8,
+  "upstream": {
+    "vcs": "git",
+    "repository": "https://github.com/fmtlib/fmt.git"
+  },
+  "driver": "ctest",
+  "environment": {},
+  "qualification_status": "pending"
+}

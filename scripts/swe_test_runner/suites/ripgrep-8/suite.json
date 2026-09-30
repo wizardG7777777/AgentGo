@@ -1,0 +1,22 @@
+{
+  "schema": "agentgo.swe-suite/v3",
+  "suite_id": "ripgrep-8",
+  "project": "ripgrep",
+  "title": "ripgrep native eight-task SWE suite",
+  "task_count": 8,
+  "upstream": {
+    "vcs": "git",
+    "repository": "https://github.com/BurntSushi/ripgrep.git"
+  },
+  "driver": "cargo",
+  "environment": {
+    "toolchain": "1.90.0",
+    "features": [
+      "pcre2"
+    ]
+  },
+  "qualification_status": "pending",
+  "materialize_links": [
+    "HomebrewFormula"
+  ]
+}

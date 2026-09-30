@@ -1,0 +1,19 @@
+{
+  "schema": "agentgo.swe-suite/v3",
+  "suite_id": "tokio-8",
+  "project": "tokio",
+  "title": "tokio native eight-task SWE suite",
+  "task_count": 8,
+  "upstream": {
+    "vcs": "git",
+    "repository": "https://github.com/tokio-rs/tokio.git"
+  },
+  "driver": "cargo",
+  "environment": {
+    "toolchain": "1.90.0",
+    "features": [
+      "full"
+    ]
+  },
+  "qualification_status": "pending"
+}

@@ -1,0 +1,2 @@
+# Native resource supervision; installed in the Runner environment, never the SUT.
+psutil==7.2.2

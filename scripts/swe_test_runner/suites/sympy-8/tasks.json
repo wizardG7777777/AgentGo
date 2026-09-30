@@ -1,0 +1,244 @@
+{
+  "schema": "agentgo.native-swe-tasks/v1",
+  "tasks": [
+    {
+      "task_id": "sympy-ca0a14d19acf",
+      "title": "Fix asech derivative for x < -1",
+      "base_sha": "2c037307929f917235dd30a8e456b0e47dc5d793",
+      "fix_sha": "ca0a14d19acf1fee4d7725fd318d18674599a94f",
+      "test_files": [
+        "sympy/functions/elementary/tests/test_hyperbolic.py"
+      ],
+      "source_files": [
+        "sympy/functions/elementary/hyperbolic.py"
+      ],
+      "source_url": "https://github.com/sympy/sympy/commit/ca0a14d19acf1fee4d7725fd318d18674599a94f",
+      "test_selectors": [
+        "sympy/functions/elementary/tests/test_hyperbolic.py::test_asech_nseries",
+        "sympy/functions/elementary/tests/test_hyperbolic.py::test_derivs"
+      ],
+      "target_args": [
+        "sympy/functions/elementary/tests/test_hyperbolic.py::test_asech_nseries",
+        "sympy/functions/elementary/tests/test_hyperbolic.py::test_derivs"
+      ],
+      "regression_args": [
+        "sympy/functions/elementary/tests/test_hyperbolic.py"
+      ],
+      "regression_scope": {
+        "kind": "test-modules",
+        "paths": [
+          "sympy/functions/elementary/tests/test_hyperbolic.py"
+        ]
+      }
+    },
+    {
+      "task_id": "sympy-de9a0e4f913f",
+      "title": "Fix invalid merging of KroneckerProduct sums in combine_kronecker",
+      "base_sha": "ad0a3c0917b4358679174d2ee9f8ea9d395fa70b",
+      "fix_sha": "de9a0e4f913f80623cac12c8e5563732b7545046",
+      "test_files": [
+        "sympy/matrices/expressions/tests/test_kronecker.py"
+      ],
+      "source_files": [
+        "sympy/matrices/expressions/kronecker.py"
+      ],
+      "source_url": "https://github.com/sympy/sympy/commit/de9a0e4f913f80623cac12c8e5563732b7545046",
+      "test_selectors": [
+        "sympy/matrices/expressions/tests/test_kronecker.py::test_KroneckerProduct_combine_add_numeric",
+        "sympy/matrices/expressions/tests/test_kronecker.py::test_KroneckerProduct_combine_mul"
+      ],
+      "target_args": [
+        "sympy/matrices/expressions/tests/test_kronecker.py::test_KroneckerProduct_combine_add_numeric",
+        "sympy/matrices/expressions/tests/test_kronecker.py::test_KroneckerProduct_combine_mul"
+      ],
+      "regression_args": [
+        "sympy/matrices/expressions/tests/test_kronecker.py"
+      ],
+      "regression_scope": {
+        "kind": "test-modules",
+        "paths": [
+          "sympy/matrices/expressions/tests/test_kronecker.py"
+        ]
+      }
+    },
+    {
+      "task_id": "sympy-bc9a0f2e6e39",
+      "title": "ArrayTensorProduct: normalize scalar factors and fix Mul argument shapes",
+      "base_sha": "48b80f446e32c88b60a79f0fce01b90e9cdd5703",
+      "fix_sha": "bc9a0f2e6e39b7b6ba32528417992cfdfc62e076",
+      "test_files": [
+        "sympy/tensor/array/expressions/tests/test_array_expressions.py"
+      ],
+      "source_files": [
+        "sympy/tensor/array/expressions/array_expressions.py"
+      ],
+      "source_url": "https://github.com/sympy/sympy/commit/bc9a0f2e6e39b7b6ba32528417992cfdfc62e076",
+      "test_selectors": [
+        "sympy/tensor/array/expressions/tests/test_array_expressions.py::test_arrayexpr_tensor_product_scalar_coefficients"
+      ],
+      "target_args": [
+        "sympy/tensor/array/expressions/tests/test_array_expressions.py::test_arrayexpr_tensor_product_scalar_coefficients"
+      ],
+      "regression_args": [
+        "sympy/tensor/array/expressions/tests/test_array_expressions.py"
+      ],
+      "regression_scope": {
+        "kind": "test-modules",
+        "paths": [
+          "sympy/tensor/array/expressions/tests/test_array_expressions.py"
+        ]
+      }
+    },
+    {
+      "task_id": "sympy-48b80f446e32",
+      "title": "calculus: use intermediate value theorem in `function_range`",
+      "base_sha": "57f89985b6d2d99599ff637f143e1a77359cce15",
+      "fix_sha": "48b80f446e32c88b60a79f0fce01b90e9cdd5703",
+      "test_files": [
+        "sympy/calculus/tests/test_util.py"
+      ],
+      "source_files": [
+        "sympy/calculus/util.py"
+      ],
+      "source_url": "https://github.com/sympy/sympy/commit/48b80f446e32c88b60a79f0fce01b90e9cdd5703",
+      "test_selectors": [
+        "sympy/calculus/tests/test_util.py::test_function_range"
+      ],
+      "target_args": [
+        "sympy/calculus/tests/test_util.py::test_function_range"
+      ],
+      "regression_args": [
+        "sympy/calculus/tests/test_util.py"
+      ],
+      "regression_scope": {
+        "kind": "test-modules",
+        "paths": [
+          "sympy/calculus/tests/test_util.py"
+        ]
+      }
+    },
+    {
+      "task_id": "sympy-5e60418896b6",
+      "title": "Fix sign errors in li(z).rewrite(Shi)/Chi and erfi(z).rewrite(expint)",
+      "base_sha": "9a81962576b5db67cc1a172cd52a1fd2dd454881",
+      "fix_sha": "5e60418896b65530acea5061c55cb31bcb97719f",
+      "test_files": [
+        "sympy/functions/special/tests/test_error_functions.py"
+      ],
+      "source_files": [
+        "sympy/functions/special/error_functions.py"
+      ],
+      "source_url": "https://github.com/sympy/sympy/commit/5e60418896b65530acea5061c55cb31bcb97719f",
+      "test_selectors": [
+        "sympy/functions/special/tests/test_error_functions.py::test_erfi",
+        "sympy/functions/special/tests/test_error_functions.py::test_li"
+      ],
+      "target_args": [
+        "sympy/functions/special/tests/test_error_functions.py::test_erfi",
+        "sympy/functions/special/tests/test_error_functions.py::test_li"
+      ],
+      "regression_args": [
+        "sympy/functions/special/tests/test_error_functions.py"
+      ],
+      "regression_scope": {
+        "kind": "test-modules",
+        "paths": [
+          "sympy/functions/special/tests/test_error_functions.py"
+        ]
+      }
+    },
+    {
+      "task_id": "sympy-201c131eb98d",
+      "title": "Set sort_key on NaN",
+      "base_sha": "8a992f3c8782c49100232f530dc6353f1ee2217f",
+      "fix_sha": "201c131eb98d815ccebad46a0b790a79a6210c84",
+      "test_files": [
+        "sympy/core/tests/test_expr.py",
+        "sympy/printing/tests/test_str.py"
+      ],
+      "source_files": [
+        "sympy/core/numbers.py"
+      ],
+      "source_url": "https://github.com/sympy/sympy/commit/201c131eb98d815ccebad46a0b790a79a6210c84",
+      "test_selectors": [
+        "sympy/core/tests/test_expr.py::test_expr_sorting",
+        "sympy/printing/tests/test_str.py::test_issue_30343"
+      ],
+      "target_args": [
+        "sympy/core/tests/test_expr.py::test_expr_sorting",
+        "sympy/printing/tests/test_str.py::test_issue_30343"
+      ],
+      "regression_args": [
+        "sympy/core/tests/test_expr.py",
+        "sympy/printing/tests/test_str.py"
+      ],
+      "regression_scope": {
+        "kind": "test-modules",
+        "paths": [
+          "sympy/core/tests/test_expr.py",
+          "sympy/printing/tests/test_str.py"
+        ]
+      }
+    },
+    {
+      "task_id": "sympy-a514258969de",
+      "title": "parse_expr: minus sign on unevaluated subtraction",
+      "base_sha": "ce7bec2d86cd9ba8e2d684f7c91fe88ffd00d297",
+      "fix_sha": "a514258969dea37053bbc84b0560bc13f3ce3a0b",
+      "test_files": [
+        "sympy/core/tests/test_sympify.py"
+      ],
+      "source_files": [
+        "sympy/parsing/sympy_parser.py"
+      ],
+      "source_url": "https://github.com/sympy/sympy/commit/a514258969dea37053bbc84b0560bc13f3ce3a0b",
+      "test_selectors": [
+        "sympy/core/tests/test_sympify.py::test_evaluate_false"
+      ],
+      "target_args": [
+        "sympy/core/tests/test_sympify.py::test_evaluate_false"
+      ],
+      "regression_args": [
+        "sympy/core/tests/test_sympify.py"
+      ],
+      "regression_scope": {
+        "kind": "test-modules",
+        "paths": [
+          "sympy/core/tests/test_sympify.py"
+        ]
+      }
+    },
+    {
+      "task_id": "sympy-cc2ec9fb4d9f",
+      "title": "Correct combined hyperbolic ring-series results at zero",
+      "base_sha": "71777ea1027e2774c91c1c2f93945a68662b38cf",
+      "fix_sha": "cc2ec9fb4d9f764d97e2c30b37df61848af0c5c3",
+      "test_files": [
+        "sympy/polys/tests/test_ring_series.py"
+      ],
+      "source_files": [
+        "sympy/polys/ring_series.py"
+      ],
+      "source_url": "https://github.com/sympy/sympy/commit/cc2ec9fb4d9f764d97e2c30b37df61848af0c5c3",
+      "test_selectors": [
+        "sympy/polys/tests/test_ring_series.py::test_sinh",
+        "sympy/polys/tests/test_ring_series.py::test_cosh",
+        "sympy/polys/tests/test_ring_series.py::test_cosh_sinh"
+      ],
+      "target_args": [
+        "sympy/polys/tests/test_ring_series.py::test_sinh",
+        "sympy/polys/tests/test_ring_series.py::test_cosh",
+        "sympy/polys/tests/test_ring_series.py::test_cosh_sinh"
+      ],
+      "regression_args": [
+        "sympy/polys/tests/test_ring_series.py"
+      ],
+      "regression_scope": {
+        "kind": "test-modules",
+        "paths": [
+          "sympy/polys/tests/test_ring_series.py"
+        ]
+      }
+    }
+  ]
+}

@@ -19,6 +19,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - run: python -m pip install -r scripts/swe_test_runner/requirements-runner.txt
       - run: go test ./... -timeout 180s
       - run: go vet ./...
       - run: go build -o agentgo.exe

@@ -1,0 +1,228 @@
+{
+  "schema": "agentgo.native-swe-tasks/v1",
+  "tasks": [
+    {
+      "task_id": "ripgrep-241b87b33771",
+      "title": "ignore: support `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` for `core.excludesFile`",
+      "base_sha": "b6849daee84a67b42b0844b2f6a91e47c24705b1",
+      "fix_sha": "241b87b3377136659ef0f57948b8e0739e9a691b",
+      "test_files": [
+        "tests/regression.rs",
+        "tests/util.rs"
+      ],
+      "source_files": [
+        "crates/ignore/src/gitignore.rs"
+      ],
+      "source_url": "https://github.com/BurntSushi/ripgrep/commit/241b87b3377136659ef0f57948b8e0739e9a691b",
+      "test_selectors": [],
+      "cargo_package": "ripgrep",
+      "cargo_tests": [
+        "integration"
+      ],
+      "regression_scope": {
+        "kind": "cargo-package-tests",
+        "package": "ripgrep"
+      },
+      "required_regression_tests": [
+        "integration::regression::r3275_git_global_config_env"
+      ],
+      "test_adaptations": [
+        {
+          "platform": "win32",
+          "path": "tests/regression.rs",
+          "upstream_sha256": "77e84eb6c056a968e160c841681d471089ad62c924094fe4c0d769df271c9a78",
+          "adapted_sha256": "08715620ea92fb4458b6da645b3e8a7e7573d3ac79817a51ce529853a9b2ba8e",
+          "replacements": [
+            {
+              "old": "// This test doesn't seem to work on Windows for whatever reason. I haven't\n// investigated it yet, but I'm pretty sure it's just the test. I'm guessing\n// it's related to path separators. ---AG\n#[cfg(not(windows))]\n",
+              "new": "// SWE Windows fixture: use a cwd-relative excludes file, preserving the upstream assertion.\n"
+            },
+            {
+              "old": "        &format!(\n            \"[core]\\n\\texcludesFile = {path}\",\n            path = dir.path().join(\"global-excludes-nonstandard\").display()\n        ),",
+              "new": "        \"[core]\\n\\texcludesFile = global-excludes-nonstandard\","
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "ripgrep-b610d1cb1506",
+      "title": "ignore: fix global gitignore bug that arises with absolute paths",
+      "base_sha": "9ec08522bee566c8fbf03c340acd7a1ff1789a9f",
+      "fix_sha": "b610d1cb1506feab33459c5853e4c0d0cb16a6e2",
+      "test_files": [
+        "tests/regression.rs"
+      ],
+      "source_files": [
+        "crates/core/flags/hiargs.rs",
+        "crates/ignore/src/dir.rs",
+        "crates/ignore/src/gitignore.rs",
+        "crates/ignore/src/walk.rs"
+      ],
+      "source_url": "https://github.com/BurntSushi/ripgrep/commit/b610d1cb1506feab33459c5853e4c0d0cb16a6e2",
+      "test_selectors": [],
+      "cargo_package": "ripgrep",
+      "cargo_tests": [
+        "integration"
+      ],
+      "regression_scope": {
+        "kind": "cargo-package-tests",
+        "package": "ripgrep"
+      }
+    },
+    {
+      "task_id": "ripgrep-de2567a4c76f",
+      "title": "printer: fix panic in replacements in look-around corner case",
+      "base_sha": "916415857f084e63efda03cf25a67fe7f6d24244",
+      "fix_sha": "de2567a4c76fa671005538d6cd841abc44932b9a",
+      "test_files": [
+        "tests/regression.rs"
+      ],
+      "source_files": [
+        "crates/printer/src/util.rs"
+      ],
+      "source_url": "https://github.com/BurntSushi/ripgrep/commit/de2567a4c76fa671005538d6cd841abc44932b9a",
+      "test_selectors": [],
+      "cargo_package": "ripgrep",
+      "cargo_tests": [
+        "integration"
+      ],
+      "regression_scope": {
+        "kind": "cargo-package-tests",
+        "package": "ripgrep"
+      }
+    },
+    {
+      "task_id": "ripgrep-d199058e77cb",
+      "title": "cli: invert an empty pattern file correctly with default and PCRE2 engines",
+      "base_sha": "bb0cbae3121f19e5319b28519b4c287dd49cb941",
+      "fix_sha": "d199058e77cbea419f072015373ab1beb0e508ee",
+      "test_files": [
+        "tests/regression.rs"
+      ],
+      "source_files": [
+        "crates/core/flags/hiargs.rs",
+        "crates/pcre2/src/matcher.rs"
+      ],
+      "source_url": "https://github.com/BurntSushi/ripgrep/commit/d199058e77cbea419f072015373ab1beb0e508ee",
+      "test_selectors": [],
+      "cargo_package": "ripgrep",
+      "cargo_tests": [
+        "integration"
+      ],
+      "regression_scope": {
+        "kind": "cargo-package-tests",
+        "package": "ripgrep"
+      },
+      "required_regression_tests": [
+        "integration::regression::r1334_invert_empty_patterns"
+      ]
+    },
+    {
+      "task_id": "ripgrep-8b5d3d1c1e3b",
+      "title": "printer: hack in a fix for `-l/--files-with-matches` when using `--pcre2 --multiline` with look-around",
+      "base_sha": "491bf3f6d5bc1a621754440e291960f460a9c003",
+      "fix_sha": "8b5d3d1c1e3b0e32f22aa634d000b314f6d4d465",
+      "test_files": [
+        "tests/regression.rs"
+      ],
+      "source_files": [
+        "crates/printer/src/summary.rs"
+      ],
+      "source_url": "https://github.com/BurntSushi/ripgrep/commit/8b5d3d1c1e3b0e32f22aa634d000b314f6d4d465",
+      "test_selectors": [],
+      "cargo_package": "ripgrep",
+      "cargo_tests": [
+        "integration"
+      ],
+      "regression_scope": {
+        "kind": "cargo-package-tests",
+        "package": "ripgrep"
+      }
+    },
+    {
+      "task_id": "ripgrep-126bbeab8c1c",
+      "title": "printer: fix handling of `has_match` for summary printer",
+      "base_sha": "859d54270ec19f8ffc98343d9af886c10728d680",
+      "fix_sha": "126bbeab8c1cbbc1d6cb36b4c2d560574233856d",
+      "test_files": [
+        "tests/regression.rs"
+      ],
+      "source_files": [
+        "crates/core/flags/hiargs.rs",
+        "crates/printer/src/summary.rs"
+      ],
+      "source_url": "https://github.com/BurntSushi/ripgrep/commit/126bbeab8c1cbbc1d6cb36b4c2d560574233856d",
+      "test_selectors": [],
+      "cargo_package": "ripgrep",
+      "cargo_tests": [
+        "integration"
+      ],
+      "regression_scope": {
+        "kind": "cargo-package-tests",
+        "package": "ripgrep"
+      }
+    },
+    {
+      "task_id": "ripgrep-4df129812769",
+      "title": "globset: fix bug where trailing `.` in file name was incorrectly handled",
+      "base_sha": "ba23ced8178496263af013117b70c09ce39c18e5",
+      "fix_sha": "4df1298127695ed1e76937f16de1a0135677ccf5",
+      "test_files": [
+        "tests/regression.rs"
+      ],
+      "source_files": [
+        "crates/globset/src/pathutil.rs"
+      ],
+      "source_url": "https://github.com/BurntSushi/ripgrep/commit/4df1298127695ed1e76937f16de1a0135677ccf5",
+      "test_selectors": [],
+      "cargo_package": "ripgrep",
+      "cargo_tests": [
+        "integration"
+      ],
+      "regression_scope": {
+        "kind": "cargo-package-tests",
+        "package": "ripgrep"
+      },
+      "required_regression_tests": [
+        "integration::regression::r2990_trip_over_trailing_dot"
+      ],
+      "test_adaptations": [
+        {
+          "platform": "win32",
+          "path": "tests/regression.rs",
+          "upstream_sha256": "48708bd6aa3534e703a11b101de09a66794206ffc043be966abba3cfde07801e",
+          "adapted_sha256": "5af7651c1b41e9f16ef45b4ca2bb523287b956d75ba480337111d0c40958edf0",
+          "replacements": [
+            {
+              "old": "// See: https://github.com/BurntSushi/ripgrep/issues/2990\n#[cfg(unix)]\nrgtest!(r2990_trip_over_trailing_dot, |dir: Dir, _cmd: TestCommand| {\n    dir.create_dir(\"asdf\");\n    dir.create_dir(\"asdf.\");\n    dir.create(\"asdf/foo\", \"\");\n    dir.create(\"asdf./foo\", \"\");\n\n    let got = dir.command().args(&[\"--files\", \"-g\", \"!asdf/\"]).stdout();\n    eqnice!(\"asdf./foo\\n\", got);\n\n    // This used to ignore the glob given and included `asdf./foo` in output.\n    let got = dir.command().args(&[\"--files\", \"-g\", \"!asdf./\"]).stdout();\n    eqnice!(\"asdf/foo\\n\", got);\n});\n",
+              "new": "// See: https://github.com/BurntSushi/ripgrep/issues/2990\n// SWE Windows fixture: exercise the same override matcher without creating\n// trailing-dot directory names that Win32 normalizes on filesystem access.\nrgtest!(r2990_trip_over_trailing_dot, |dir: Dir, _cmd: TestCommand| {\n    let mut plain = ignore::overrides::OverrideBuilder::new(dir.path());\n    plain.add(\"!asdf/\").unwrap();\n    let plain = plain.build().unwrap();\n    assert!(plain.matched(dir.path().join(\"asdf\"), true).is_ignore());\n    assert!(!plain.matched(dir.path().join(\"asdf.\"), true).is_ignore());\n\n    let mut dotted = ignore::overrides::OverrideBuilder::new(dir.path());\n    dotted.add(\"!asdf./\").unwrap();\n    let dotted = dotted.build().unwrap();\n    assert!(dotted.matched(dir.path().join(\"asdf.\"), true).is_ignore());\n    assert!(!dotted.matched(dir.path().join(\"asdf\"), true).is_ignore());\n});\n"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "task_id": "ripgrep-4ab1862dc047",
+      "title": "stats: fix case where \"bytes searched\" could be wrong",
+      "base_sha": "6244e635a1a5aa4d401826b1e970d59a3f6cbf7c",
+      "fix_sha": "4ab1862dc04783b6615807d4b4511388c6b30364",
+      "test_files": [
+        "tests/regression.rs"
+      ],
+      "source_files": [
+        "crates/searcher/src/searcher/glue.rs"
+      ],
+      "source_url": "https://github.com/BurntSushi/ripgrep/commit/4ab1862dc04783b6615807d4b4511388c6b30364",
+      "test_selectors": [],
+      "cargo_package": "ripgrep",
+      "cargo_tests": [
+        "integration"
+      ],
+      "regression_scope": {
+        "kind": "cargo-package-tests",
+        "package": "ripgrep"
+      }
+    }
+  ]
+}

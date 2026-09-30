@@ -1,0 +1,242 @@
+{
+  "schema": "agentgo.native-swe-tasks/v1",
+  "tasks": [
+    {
+      "task_id": "vue-54097087a091",
+      "title": "fix(compiler-sfc): restore await scope when leaving nested blocks",
+      "base_sha": "5dda192082afa4985951d90e229324d522e25c22",
+      "fix_sha": "54097087a0918b98f16c84599b1a6d654e952ca7",
+      "test_files": [
+        "packages/compiler-sfc/__tests__/compileScript.spec.ts"
+      ],
+      "source_files": [
+        "packages/compiler-sfc/src/compileScript.ts"
+      ],
+      "source_url": "https://github.com/vuejs/core/commit/54097087a0918b98f16c84599b1a6d654e952ca7",
+      "test_selectors": [],
+      "target_args": [
+        "packages/compiler-sfc/__tests__/compileScript.spec.ts"
+      ],
+      "regression_args": [
+        "packages/compiler-sfc/__tests__"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/compiler-sfc/__tests__"
+        ]
+      },
+      "environment": {
+        "manager": "pnpm@11.19.0"
+      }
+    },
+    {
+      "task_id": "vue-31da934fcbe7",
+      "title": "fix(runtime-dom): support !important on CSS custom properties in style binding (#15348)",
+      "base_sha": "f8d42e1cf2a0ccb43c50fad6e972cb130c53824e",
+      "fix_sha": "31da934fcbe73ab8ed187bf820c80b24ced474be",
+      "test_files": [
+        "packages/runtime-dom/__tests__/patchStyle.spec.ts"
+      ],
+      "source_files": [
+        "packages/runtime-dom/src/modules/style.ts"
+      ],
+      "source_url": "https://github.com/vuejs/core/commit/31da934fcbe73ab8ed187bf820c80b24ced474be",
+      "test_selectors": [],
+      "target_args": [
+        "packages/runtime-dom/__tests__/patchStyle.spec.ts"
+      ],
+      "regression_args": [
+        "packages/runtime-dom/__tests__"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/runtime-dom/__tests__"
+        ]
+      },
+      "environment": {
+        "manager": "pnpm@11.19.0"
+      }
+    },
+    {
+      "task_id": "vue-f8d42e1cf2a0",
+      "title": "fix(runtime-core): keep .trim result when combined with .number v-model modifier (#15346)",
+      "base_sha": "cd1974562357dd73101d048f207a694a4e5310ec",
+      "fix_sha": "f8d42e1cf2a0ccb43c50fad6e972cb130c53824e",
+      "test_files": [
+        "packages/runtime-core/__tests__/componentEmits.spec.ts"
+      ],
+      "source_files": [
+        "packages/runtime-core/src/componentEmits.ts"
+      ],
+      "source_url": "https://github.com/vuejs/core/commit/f8d42e1cf2a0ccb43c50fad6e972cb130c53824e",
+      "test_selectors": [],
+      "target_args": [
+        "packages/runtime-core/__tests__/componentEmits.spec.ts"
+      ],
+      "regression_args": [
+        "packages/runtime-core/__tests__"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/runtime-core/__tests__"
+        ]
+      },
+      "environment": {
+        "manager": "pnpm@11.19.0"
+      }
+    },
+    {
+      "task_id": "vue-8654f35118a1",
+      "title": "fix(runtime-core): resolve $el for dev root comment fragment (#15313)",
+      "base_sha": "ef82a26775952a665545d3771788bd23b2efec91",
+      "fix_sha": "8654f35118a1165ac30fd398ceaff8849c44d9d5",
+      "test_files": [
+        "packages/runtime-core/__tests__/componentPublicInstance.spec.ts"
+      ],
+      "source_files": [
+        "packages/runtime-core/src/componentPublicInstance.ts"
+      ],
+      "source_url": "https://github.com/vuejs/core/commit/8654f35118a1165ac30fd398ceaff8849c44d9d5",
+      "test_selectors": [],
+      "target_args": [
+        "packages/runtime-core/__tests__/componentPublicInstance.spec.ts"
+      ],
+      "regression_args": [
+        "packages/runtime-core/__tests__"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/runtime-core/__tests__"
+        ]
+      },
+      "environment": {
+        "manager": "pnpm@11.19.0"
+      }
+    },
+    {
+      "task_id": "vue-ef82a2677595",
+      "title": "fix(shared): correctly compare Map and Set values (#15328)",
+      "base_sha": "6eaecc14d8151a7d258b80ce0519e5ecc17a2bef",
+      "fix_sha": "ef82a26775952a665545d3771788bd23b2efec91",
+      "test_files": [
+        "packages/runtime-dom/__tests__/directives/vModel.spec.ts",
+        "packages/shared/__tests__/looseEqual.spec.ts"
+      ],
+      "source_files": [
+        "packages/shared/src/looseEqual.ts"
+      ],
+      "source_url": "https://github.com/vuejs/core/commit/ef82a26775952a665545d3771788bd23b2efec91",
+      "test_selectors": [],
+      "target_args": [
+        "packages/runtime-dom/__tests__/directives/vModel.spec.ts",
+        "packages/shared/__tests__/looseEqual.spec.ts"
+      ],
+      "regression_args": [
+        "packages/runtime-dom/__tests__",
+        "packages/shared/__tests__"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/runtime-dom/__tests__",
+          "packages/shared/__tests__"
+        ]
+      },
+      "environment": {
+        "manager": "pnpm@11.19.0"
+      }
+    },
+    {
+      "task_id": "vue-6eaecc14d815",
+      "title": "fix(v-model): re-sync select when model is overridden in change handler (#15298)",
+      "base_sha": "b535917d46d5c6e28c1d3b9185bfa1665127c73a",
+      "fix_sha": "6eaecc14d8151a7d258b80ce0519e5ecc17a2bef",
+      "test_files": [
+        "packages/runtime-dom/__tests__/directives/vModel.spec.ts"
+      ],
+      "source_files": [
+        "packages/runtime-dom/src/directives/vModel.ts"
+      ],
+      "source_url": "https://github.com/vuejs/core/commit/6eaecc14d8151a7d258b80ce0519e5ecc17a2bef",
+      "test_selectors": [],
+      "target_args": [
+        "packages/runtime-dom/__tests__/directives/vModel.spec.ts"
+      ],
+      "regression_args": [
+        "packages/runtime-dom/__tests__"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/runtime-dom/__tests__"
+        ]
+      },
+      "environment": {
+        "manager": "pnpm@11.19.0"
+      }
+    },
+    {
+      "task_id": "vue-c04a45d15498",
+      "title": "fix(scheduler): avoid stack overflow when flushing very large post cb arrays (#15143)",
+      "base_sha": "71f9ff58a2a8748b2c1ec26c55c89f7343b86110",
+      "fix_sha": "c04a45d15498ebba0de3ceae674b88ac43cb9e76",
+      "test_files": [
+        "packages/runtime-core/__tests__/scheduler.spec.ts"
+      ],
+      "source_files": [
+        "packages/runtime-core/src/components/Suspense.ts",
+        "packages/runtime-core/src/scheduler.ts"
+      ],
+      "source_url": "https://github.com/vuejs/core/commit/c04a45d15498ebba0de3ceae674b88ac43cb9e76",
+      "test_selectors": [],
+      "target_args": [
+        "packages/runtime-core/__tests__/scheduler.spec.ts"
+      ],
+      "regression_args": [
+        "packages/runtime-core/__tests__"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/runtime-core/__tests__"
+        ]
+      },
+      "environment": {
+        "manager": "pnpm@11.13.0"
+      }
+    },
+    {
+      "task_id": "vue-378f9783248a",
+      "title": "fix(reactivity): handle effect removal during scope stop (#15084)",
+      "base_sha": "e0d27234ddd2061383cb5dcc475d6b9558ed8e4f",
+      "fix_sha": "378f9783248a4a4f20781d665d4f7089f39cae6e",
+      "test_files": [
+        "packages/reactivity/__tests__/effectScope.spec.ts"
+      ],
+      "source_files": [
+        "packages/reactivity/src/effectScope.ts"
+      ],
+      "source_url": "https://github.com/vuejs/core/commit/378f9783248a4a4f20781d665d4f7089f39cae6e",
+      "test_selectors": [],
+      "target_args": [
+        "packages/reactivity/__tests__/effectScope.spec.ts"
+      ],
+      "regression_args": [
+        "packages/reactivity/__tests__"
+      ],
+      "regression_scope": {
+        "kind": "component-test-modules",
+        "paths": [
+          "packages/reactivity/__tests__"
+        ]
+      },
+      "environment": {
+        "manager": "pnpm@11.9.0"
+      }
+    }
+  ]
+}

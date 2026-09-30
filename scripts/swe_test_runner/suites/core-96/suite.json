@@ -1,0 +1,19 @@
+{
+  "schema": "agentgo.swe-suite-group/v1",
+  "suite_id": "core-96",
+  "members": [
+    "gin-8",
+    "cobra-8",
+    "bbolt-8",
+    "gorm-8",
+    "sympy-8",
+    "zod-8",
+    "vue-8",
+    "excalidraw-8",
+    "tokio-8",
+    "ripgrep-8",
+    "fmt-8",
+    "pytest-8"
+  ],
+  "task_count": 96
+}

@@ -1,0 +1,288 @@
+{
+  "schema": "agentgo.native-swe-tasks/v1",
+  "tasks": [
+    {
+      "task_id": "bbolt-2a0e6e8a7470",
+      "title": "Continue to enhance check functionality and add one more case to cover the nested bucket case",
+      "base_sha": "da5975b3567270a1329f871309430c8d92e518a8",
+      "fix_sha": "2a0e6e8a74703b880c043ff2734a0df9c5f66e54",
+      "test_files": [
+        "tx_check_test.go"
+      ],
+      "source_files": [
+        "tx_check.go"
+      ],
+      "source_url": "https://github.com/etcd-io/bbolt/commit/2a0e6e8a74703b880c043ff2734a0df9c5f66e54",
+      "test_selectors": [
+        "TestTx_Check_CorruptPage",
+        "TestTx_Check_WithNestBucket"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "upstream-unit-short",
+        "packages": [
+          ".",
+          "./internal/...",
+          "./cmd/bbolt/..."
+        ],
+        "excluded_modes": [
+          "separate failpoint instrumentation",
+          "power-failure robustness",
+          "tests skipped by upstream short mode"
+        ]
+      }
+    },
+    {
+      "task_id": "bbolt-2ca36937c3fa",
+      "title": "Fix `bbolt keys` and `bbolt get` to prevent them from panicking when no parameter provided",
+      "base_sha": "638301127da80d3093db3f22cb024181943d5301",
+      "fix_sha": "2ca36937c3fa666eec96cb2c3aac8e0d0d181a54",
+      "test_files": [
+        "cmd/bbolt/main_test.go"
+      ],
+      "source_files": [
+        "cmd/bbolt/main.go"
+      ],
+      "source_url": "https://github.com/etcd-io/bbolt/commit/2ca36937c3fa666eec96cb2c3aac8e0d0d181a54",
+      "test_selectors": [
+        "TestCommands_Run_NoArgs"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "upstream-unit-short",
+        "packages": [
+          ".",
+          "./internal/...",
+          "./cmd/bbolt/..."
+        ],
+        "excluded_modes": [
+          "separate failpoint instrumentation",
+          "power-failure robustness",
+          "tests skipped by upstream short mode"
+        ]
+      }
+    },
+    {
+      "task_id": "bbolt-76ae8f2133f3",
+      "title": "fix:change keysCommand default format auto",
+      "base_sha": "a6406955fce07d9b2fe1f4c8807379836e153598",
+      "fix_sha": "76ae8f2133f339ae08ca7b8a9203efedfeea9082",
+      "test_files": [
+        "cmd/bbolt/main_test.go"
+      ],
+      "source_files": [
+        "cmd/bbolt/main.go"
+      ],
+      "source_url": "https://github.com/etcd-io/bbolt/commit/76ae8f2133f339ae08ca7b8a9203efedfeea9082",
+      "test_selectors": [
+        "TestCompactCommand_Run",
+        "TestKeysCommand_Run"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "upstream-unit-short",
+        "packages": [
+          ".",
+          "./internal/...",
+          "./cmd/bbolt/..."
+        ],
+        "excluded_modes": [
+          "separate failpoint instrumentation",
+          "power-failure robustness",
+          "tests skipped by upstream short mode"
+        ]
+      }
+    },
+    {
+      "task_id": "bbolt-a6406955fce0",
+      "title": "fix: change getCommand default format auto",
+      "base_sha": "959ab0ac88e4f465e5819e5e42a9bac660d38b20",
+      "fix_sha": "a6406955fce07d9b2fe1f4c8807379836e153598",
+      "test_files": [
+        "cmd/bbolt/main_test.go"
+      ],
+      "source_files": [
+        "cmd/bbolt/main.go"
+      ],
+      "source_url": "https://github.com/etcd-io/bbolt/commit/a6406955fce07d9b2fe1f4c8807379836e153598",
+      "test_selectors": [
+        "TestGetCommand_Run"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "upstream-unit-short",
+        "packages": [
+          ".",
+          "./internal/...",
+          "./cmd/bbolt/..."
+        ],
+        "excluded_modes": [
+          "separate failpoint instrumentation",
+          "power-failure robustness",
+          "tests skipped by upstream short mode"
+        ]
+      }
+    },
+    {
+      "task_id": "bbolt-e6b4ed7812d2",
+      "title": "Rollback leaves transaction allocation bookkeeping behind",
+      "base_sha": "6791db650b9be029798aefa064c285fe5ad4ca50",
+      "fix_sha": "e6b4ed7812d2e366e69e52980f809644af84196b",
+      "test_files": [
+        "internal/freelist/array_test.go",
+        "internal/freelist/hashmap_test.go"
+      ],
+      "source_files": [
+        "internal/freelist/shared.go"
+      ],
+      "source_url": "https://github.com/etcd-io/bbolt/commit/e6b4ed7812d2e366e69e52980f809644af84196b",
+      "test_selectors": [
+        "Test_Freelist_Array_Rollback",
+        "Test_Freelist_Hashmap_Rollback"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "upstream-unit-short",
+        "packages": [
+          ".",
+          "./internal/...",
+          "./cmd/bbolt/..."
+        ],
+        "excluded_modes": [
+          "separate failpoint instrumentation",
+          "power-failure robustness",
+          "tests skipped by upstream short mode"
+        ]
+      },
+      "environment": {}
+    },
+    {
+      "task_id": "bbolt-49c76973447c",
+      "title": "Reinitializing the hashmap freelist retains stale free-page state",
+      "base_sha": "4a77dd9481a8a23f13137e59c18dcdb26f4d43d8",
+      "fix_sha": "49c76973447c9d75eb91bf4c874179b1a41b015c",
+      "test_files": [
+        "internal/freelist/freelist_test.go"
+      ],
+      "source_files": [
+        "internal/freelist/array.go",
+        "internal/freelist/hashmap.go",
+        "internal/freelist/shared.go"
+      ],
+      "source_url": "https://github.com/etcd-io/bbolt/commit/49c76973447c9d75eb91bf4c874179b1a41b015c",
+      "test_selectors": [
+        "TestFreeList_init",
+        "TestFreeList_reload"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "upstream-unit-short",
+        "packages": [
+          ".",
+          "./internal/...",
+          "./cmd/bbolt/..."
+        ],
+        "excluded_modes": [
+          "separate failpoint instrumentation",
+          "power-failure robustness",
+          "tests skipped by upstream short mode"
+        ]
+      },
+      "environment": {
+        "env": {
+          "TEST_FREELIST_TYPE": "hashmap"
+        }
+      }
+    },
+    {
+      "task_id": "bbolt-7030e30d1974",
+      "title": "Cursor traversal cannot reverse direction after reaching an endpoint",
+      "base_sha": "6291f7a1d7692214ab170c29c9b11a3f03a22024",
+      "fix_sha": "7030e30d19749e3bc47549972ba9c2adb9eec608",
+      "test_files": [
+        "cursor_test.go"
+      ],
+      "source_files": [
+        "cursor.go"
+      ],
+      "source_url": "https://github.com/etcd-io/bbolt/commit/7030e30d19749e3bc47549972ba9c2adb9eec608",
+      "test_selectors": [
+        "TestCursor_RepeatOperations"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "upstream-unit-short",
+        "packages": [
+          ".",
+          "./internal/...",
+          "./cmd/bbolt/..."
+        ],
+        "excluded_modes": [
+          "separate failpoint instrumentation",
+          "power-failure robustness",
+          "tests skipped by upstream short mode"
+        ]
+      },
+      "environment": {}
+    },
+    {
+      "task_id": "bbolt-a938f006091f",
+      "title": "fix data race on tx.Stats",
+      "base_sha": "501d460addf1c2e4600eaa1feb879c5b12281e8c",
+      "fix_sha": "a938f006091f66dbcd3f2b02cf8ee4230044ec94",
+      "test_files": [
+        "allocate_test.go",
+        "db_test.go",
+        "tx_stats_test.go",
+        "tx_test.go"
+      ],
+      "source_files": [
+        "bucket.go",
+        "internal/btesting/btesting.go",
+        "node.go",
+        "tx.go"
+      ],
+      "source_url": "https://github.com/etcd-io/bbolt/commit/a938f006091f66dbcd3f2b02cf8ee4230044ec94",
+      "test_selectors": [
+        "TestDBStats_Sub",
+        "TestDB_Concurrent_WriteTo",
+        "TestDB_Stats",
+        "TestTxStats_GetAndIncAtomically",
+        "TestTxStats_Sub",
+        "TestTxStats_add",
+        "TestTx_allocatePageStats",
+        "TestTx_releaseRange"
+      ],
+      "target_roots": [
+        "."
+      ],
+      "regression_scope": {
+        "kind": "upstream-unit-short",
+        "packages": [
+          ".",
+          "./internal/...",
+          "./cmd/bbolt/..."
+        ],
+        "excluded_modes": [
+          "separate failpoint instrumentation",
+          "power-failure robustness",
+          "tests skipped by upstream short mode"
+        ]
+      }
+    }
+  ]
+}

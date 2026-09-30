@@ -1,0 +1,19 @@
+{
+  "schema": "agentgo.swe-suite/v3",
+  "suite_id": "excalidraw-8",
+  "project": "excalidraw",
+  "title": "excalidraw native eight-task SWE suite",
+  "task_count": 8,
+  "upstream": {
+    "vcs": "git",
+    "repository": "https://github.com/excalidraw/excalidraw.git"
+  },
+  "driver": "vitest",
+  "environment": {
+    "test_args": [
+      "--maxWorkers=2",
+      "--minWorkers=1"
+    ]
+  },
+  "qualification_status": "pending"
+}

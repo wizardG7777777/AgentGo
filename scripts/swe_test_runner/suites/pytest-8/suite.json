@@ -1,0 +1,28 @@
+{
+  "schema": "agentgo.swe-suite/v3",
+  "suite_id": "pytest-8",
+  "project": "pytest",
+  "title": "pytest native eight-task SWE suite",
+  "task_count": 8,
+  "upstream": {
+    "vcs": "git",
+    "repository": "https://github.com/pytest-dev/pytest.git"
+  },
+  "driver": "pytest",
+  "environment": {
+    "subject": "_pytest",
+    "version": "9.1.0.dev0",
+    "packages": [
+      "setuptools>=77",
+      "setuptools-scm>=10.1",
+      "hypothesis==6.140.2",
+      "attrs==25.3.0",
+      "coverage==7.10.6",
+      "xmlschema==4.1.0",
+      "pygments==2.19.2",
+      "requests==2.32.5",
+      "pytest-xdist==3.8.0"
+    ]
+  },
+  "qualification_status": "pending"
+}

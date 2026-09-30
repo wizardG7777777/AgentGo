@@ -37,6 +37,7 @@ def load_environment(raw, batch, app=APP):
         "SWE_TESTBED": str(batch / "testbed"), "SWE_FLASK_REPO": "/opt/swe/upstream/flask",
         "SWE_PREBUILT_ENVS": "/opt/swe/environments",
         "SWE_PROBE_ARCHIVE": str(batch / "provider-probes"),
+        "SWE_RESOURCE_OWNER": "container",
         "AGENTGO_DUMP_PROMPTS": "1", "AGENTGO_TRACE_FULL_ARGS": "1",
         "AGENTGO_TRACE_KEEP_ALL": "1", "PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1",
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",

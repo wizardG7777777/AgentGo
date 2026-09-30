@@ -175,7 +175,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
             })
             self.assertEqual(config.protocol, "responses")
             self.assertEqual(config.testbed, (root / "testbed").resolve())
-            self.assertEqual(config.flask_repo, (root / "flask").resolve())
+            self.assertEqual(config.repo, (root / "flask").resolve())
             self.assertEqual(config.agentgo_bin, (root / "agentgo.exe").resolve())
 
     def test_default_testbed_uses_platform_user_data_locations(self):
@@ -242,7 +242,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
         self.assertEqual(config.testbed, testbed)
         self.assertEqual(config.tasks_file, swe_test_runner.DEFAULT_SUITE_DIR / "tasks.csv")
         self.assertEqual(config.prompt_dir, swe_test_runner.DEFAULT_SUITE_DIR / "prompts")
-        self.assertEqual(config.flask_repo, testbed / "upstream" / "flask")
+        self.assertEqual(config.repo, testbed / "upstream" / "flask")
 
     def test_readonly_removal_retry_is_windows_permission_only(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -276,7 +276,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
     def test_safe_remove_worktree_repeatedly_deletes_readonly_git_objects_on_windows(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            config = SimpleNamespace(testbed=root, flask_repo=root / "upstream")
+            config = SimpleNamespace(testbed=root, repo=root / "upstream")
             target = root / "worktrees" / "task"
             with mock.patch.object(swe_test_runner, "run_command"):
                 for attempt in range(2):
@@ -290,7 +290,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
     def test_safe_remove_worktree_rejects_outside_testbed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            config = SimpleNamespace(testbed=root / "testbed", flask_repo=root / "upstream")
+            config = SimpleNamespace(testbed=root / "testbed", repo=root / "upstream")
             with self.assertRaisesRegex(ValueError, "拒绝清理非考题 worktree"):
                 swe_test_runner.safe_remove_worktree(config, root / "outside")
 
@@ -321,7 +321,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
         ):
             self.assertIn(expected, rendered)
 
-    def test_cli_exposes_only_complete_transactions(self):
+    def test_cli_exposes_transactions_and_explicit_offline_maintenance(self):
         root = swe_test_runner.parser()
         subparsers = next(
             action for action in root._actions
@@ -329,7 +329,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
         )
         self.assertEqual(
             set(subparsers.choices),
-            {"probe", "task", "batch", "verify-candidates"},
+            {"probe", "task", "batch", "verify-candidates", "storage", "cleanup", "archive", "firewall-check", "rejudge"},
         )
         for removed in ("prepare", "run", "judge", "inject", "monitor", "collect", "finalize", "summarize"):
             self.assertNotIn(removed, subparsers.choices)
@@ -373,7 +373,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
         suite = Path(swe_test_runner.__file__).resolve().parent / "suites" / "flask-8"
         self.assertEqual(config.tasks_file, (suite / "tasks.csv").resolve())
         self.assertEqual(config.prompt_dir, (suite / "prompts").resolve())
-        self.assertEqual(config.flask_repo, (config.testbed / "upstream" / "flask").resolve())
+        self.assertEqual(config.repo, (config.testbed / "upstream" / "flask").resolve())
 
         metadata = json.loads((suite / "suite.json").read_text(encoding="utf-8"))
         tasks = swe_test_runner.load_tasks(config.tasks_file)
@@ -539,7 +539,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
                 testbed=root / "testbed",
                 tasks_file=root / "tasks.csv",
                 prompt_dir=root / "prompts",
-                flask_repo=root / "flask",
+                repo=root / "flask",
                 base_url="https://provider.invalid/v1",
                 fast_model='fast-"quoted',
                 flag_ship_model='flag-ship-"quoted',
@@ -590,7 +590,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
             config = swe_test_runner.SWETestRunnerConfig(
                 agentgo_root=repo_root, agentgo_bin=repo_root / "agentgo",
                 testbed=root / "testbed", tasks_file=root / "tasks.csv",
-                prompt_dir=root / "prompts", flask_repo=root / "flask",
+                prompt_dir=root / "prompts", repo=root / "flask",
                 base_url="https://provider.invalid/v1", fast_model="fast-model",
                 flag_ship_model="flag-ship-model", protocol="responses",
             )
@@ -710,7 +710,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
             config = swe_test_runner.SWETestRunnerConfig(
                 agentgo_root=root, agentgo_bin=root / "agentgo",
                 testbed=root / "testbed", tasks_file=root / "tasks.csv",
-                prompt_dir=root / "prompts", flask_repo=root / "flask",
+                prompt_dir=root / "prompts", repo=root / "flask",
                 base_url="https://provider.invalid/v1", fast_model="fast-model",
                 flag_ship_model="flag-ship-model", protocol="responses",
             )
@@ -758,7 +758,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
             config = swe_test_runner.SWETestRunnerConfig(
                 agentgo_root=root, agentgo_bin=root / "agentgo",
                 testbed=root / "testbed", tasks_file=root / "tasks.csv",
-                prompt_dir=root / "prompts", flask_repo=root / "flask",
+                prompt_dir=root / "prompts", repo=root / "flask",
                 base_url="https://provider.invalid/v1", fast_model="fast-model",
                 flag_ship_model="flag-ship-model", protocol="responses",
             )
@@ -803,7 +803,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
             config = swe_test_runner.SWETestRunnerConfig(
                 agentgo_root=root, agentgo_bin=root / "agentgo",
                 testbed=root / "testbed", tasks_file=root / "tasks.csv",
-                prompt_dir=root / "prompts", flask_repo=root / "flask",
+                prompt_dir=root / "prompts", repo=root / "flask",
                 base_url="https://provider.invalid/v1", fast_model="fast-model",
                 flag_ship_model="flag-ship-model", protocol="responses",
             )
@@ -851,7 +851,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
             config = swe_test_runner.SWETestRunnerConfig(
                 agentgo_root=root, agentgo_bin=root / "agentgo",
                 testbed=root / "testbed", tasks_file=root / "tasks.csv",
-                prompt_dir=root / "prompts", flask_repo=root / "flask",
+                prompt_dir=root / "prompts", repo=root / "flask",
                 base_url="https://provider.invalid/v1", fast_model="fast-model",
                 flag_ship_model="flag-ship-model", protocol="responses",
             )
@@ -921,7 +921,7 @@ class SWETestRunnerContractTest(unittest.TestCase):
             config = swe_test_runner.SWETestRunnerConfig(
                 agentgo_root=root, agentgo_bin=root / "agentgo",
                 testbed=root / "testbed", tasks_file=root / "tasks.csv",
-                prompt_dir=root / "prompts", flask_repo=root / "flask",
+                prompt_dir=root / "prompts", repo=root / "flask",
                 base_url="https://provider.invalid/v1", fast_model="same-model",
                 flag_ship_model="same-model", protocol="responses",
             )

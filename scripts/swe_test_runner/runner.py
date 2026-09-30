@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""AgentGo SWE Test Runner 的无第三方依赖 Python 权威入口。
+"""AgentGo SWE Test Runner 与原生资源管控的 Python 权威入口。
 
 本文件统一处理考题准备、进程编排、运行契约、能力探针、终态判定、Judge 和脱敏
-指标。受版本控制的 Flask 题目清单与 prompt 位于仓库 suite；Flask 源仓库、worktree、
+指标。受版本控制的 Flask/Gin 题目清单与 prompt 位于仓库 suite；上游源仓库、worktree、
 原始日志和凭证始终留在外部 testbed。输出不得包含 prompt、reasoning 或工具参数。
 """
 
@@ -13,6 +13,7 @@ from runtime_audit import RESULT_SCHEMA, EvidenceReader, collect_runtime, audit_
 from test_identity import input_identity, validate_import_origin, compare_failures
 from prebuilt_environment import install_prebuilt
 from probe_archive import record_probe
+from suite_config import Suite, project_path
 
 import argparse
 import collections
@@ -39,6 +40,12 @@ import urllib.error
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
+
+import storage as resource_storage
+import processes as managed_processes
+import probe_archive
+
+probe_archive.attempt_resolver = resource_storage.active
 
 
 RUN_SCHEMA = "agentgo.run-contract/v3"
@@ -117,18 +124,21 @@ class SWETestRunnerConfig:
     """从统一 SWE_* 环境变量解析的运行配置。"""
 
     def __init__(self, agentgo_root: Path, agentgo_bin: Path, testbed: Path,
-                 tasks_file: Path, prompt_dir: Path, flask_repo: Path,
-                 base_url: str, fast_model: str, flag_ship_model: str, protocol: str):
+                 tasks_file: Path, prompt_dir: Path, repo: Path,
+                 base_url: str, fast_model: str, flag_ship_model: str, protocol: str,
+                 suite: Suite | None = None):
         self.agentgo_root = agentgo_root
         self.agentgo_bin = agentgo_bin
         self.testbed = testbed
         self.tasks_file = tasks_file
         self.prompt_dir = prompt_dir
-        self.flask_repo = flask_repo
+        self.repo = repo
+        self.suite = suite or Suite("flask-8", "flask", "https://github.com/pallets/flask.git", "pytest")
         self.base_url = base_url
         self.fast_model = fast_model
         self.flag_ship_model = flag_ship_model
         self.protocol = protocol
+        self.managed_storage = False
 
     def model_capabilities(self) -> dict[str, str]:
         """返回环境冻结的能力档位；角色分配只由专用 YAML 决定。"""
@@ -148,7 +158,7 @@ class SWETestRunnerConfig:
         ]
 
     @classmethod
-    def from_env(cls) -> "SWETestRunnerConfig":
+    def from_env(cls, suite_name: str | None = None) -> "SWETestRunnerConfig":
         values = required_environment_values()
         repo_root = Path(__file__).resolve().parents[2]
         agentgo_root = Path(
@@ -158,14 +168,20 @@ class SWETestRunnerConfig:
             (os.environ.get("SWE_TESTBED") or "").strip()
             or default_swe_testbed()
         ).resolve()
-        suite_dir = Path(
-            (os.environ.get("SWE_SUITE_DIR") or "").strip() or DEFAULT_SUITE_DIR
-        ).resolve()
+        if suite_name:
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", suite_name):
+                raise ValueError("非法 SWE suite 名称")
+            suite_dir = DEFAULT_SUITE_DIR.parent / suite_name
+        else:
+            suite_dir = Path((os.environ.get("SWE_SUITE_DIR") or "").strip() or DEFAULT_SUITE_DIR).resolve()
+        suite = Suite.load(suite_dir)
+        if suite.engine != "pytest" and not (os.environ.get("SWE_TESTBED") or "").strip():
+            testbed = testbed / suite.suite_id
         binary_default = agentgo_root / ("agentgo.exe" if os.name == "nt" else "agentgo")
         protocol = (os.environ.get("SWE_PROTOCOL") or "").strip() or "responses"
         if protocol not in {"responses", "chat_completions"}:
             raise ValueError(f"未知 SWE_PROTOCOL={protocol!r}")
-        return cls(
+        config = cls(
             agentgo_root=agentgo_root,
             agentgo_bin=Path(
                 (os.environ.get("SWE_AGENTGO_BIN") or "").strip() or binary_default
@@ -173,35 +189,55 @@ class SWETestRunnerConfig:
             testbed=testbed,
             tasks_file=Path(
                 (os.environ.get("SWE_TASKS_FILE") or "").strip()
-                or suite_dir / "tasks.csv"
+                or suite_dir / ("tasks.json" if suite.engine == "native" else "tasks.csv")
             ).resolve(),
             prompt_dir=Path(
                 (os.environ.get("SWE_PROMPT_DIR") or "").strip()
                 or suite_dir / "prompts"
             ).resolve(),
-            flask_repo=Path(
-                (os.environ.get("SWE_FLASK_REPO") or "").strip()
-                or testbed / "upstream" / "flask"
+            repo=Path(
+                (os.environ.get("SWE_UPSTREAM_REPO") or "").strip()
+                or ((os.environ.get("SWE_FLASK_REPO") or "").strip() if suite.project == "flask" else "")
+                or testbed / "upstream" / suite.project
             ).resolve(),
             base_url=values["SWE_BASE_URL"],
             fast_model=values["SWE_FAST_MODEL"],
             flag_ship_model=values["SWE_FLAG_SHIP_MODEL"],
             protocol=protocol,
+            suite=suite,
         )
+        owner = (os.environ.get("SWE_RESOURCE_OWNER") or "runner").strip()
+        if owner not in {"runner", "container"}:
+            raise ValueError("未知 SWE_RESOURCE_OWNER")
+        config.managed_storage = owner == "runner"
+        return config
 
     def worktree(self, task_id: str) -> Path:
+        current = resource_storage.active()
+        if current is not None and current.suite == self.suite.suite_id and current.task == task_id:
+            return current.worktree
+        if task_id in getattr(self, "_managed_worktrees", {}):
+            return self._managed_worktrees[task_id]
         return self.testbed / "worktrees" / validate_task_id(task_id)
 
     def run_dir(self, task_id: str) -> Path:
+        current = resource_storage.active()
+        if current is not None and current.suite == self.suite.suite_id and current.task == task_id:
+            return current.reports
+        if task_id in getattr(self, "_managed_reports", {}):
+            return self._managed_reports[task_id]
         return self.testbed / "runs" / validate_task_id(task_id)
 
 
 class TaskSpec:
-    def __init__(self, task_id: str, fix_sha: str, test_files: tuple[str, ...], title: str):
+    def __init__(self, task_id: str, fix_sha: str, test_files: tuple[str, ...], title: str,
+                 test_selectors: tuple[str, ...] = (), metadata: dict | None = None):
         self.task_id = validate_task_id(task_id)
         self.fix_sha = fix_sha
         self.test_files = test_files
         self.title = title
+        self.test_selectors = test_selectors
+        self.metadata = metadata or {}
 
 
 class SWETestRunnerModelContractError(RuntimeError):
@@ -248,7 +284,10 @@ def validate_task_id(task_id: str) -> str:
     return task_id
 
 
-def load_tasks(path: str | Path) -> list[TaskSpec]:
+def load_tasks(path: str | Path, engine: str = "pytest") -> list[TaskSpec]:
+    if engine == "native":
+        from native_harness import load_native_tasks
+        return load_native_tasks(Path(path), TaskSpec)
     tasks: list[TaskSpec] = []
     seen: set[str] = set()
     with Path(path).open(newline="", encoding="utf-8") as handle:
@@ -265,18 +304,23 @@ def load_tasks(path: str | Path) -> list[TaskSpec]:
             if not re.fullmatch(r"[0-9a-fA-F]{7,64}", fix_sha):
                 raise ValueError(f"考题 {task_id} 的 fix_sha 非法")
             test_files = tuple(shlex.split(row.get("test_files") or ""))
+            if engine not in {"pytest", "go"}:
+                raise ValueError("未知测试引擎")
             if not test_files or any(
-                    Path(item).is_absolute() or ".." in Path(item).parts
-                    or not item.replace("\\", "/").startswith("tests/")
+                    project_path(item) != item or
+                    (not item.startswith("tests/") if engine == "pytest" else not item.endswith("_test.go"))
                     for item in test_files):
                 raise ValueError(f"考题 {task_id} 的 test_files 非法")
-            tasks.append(TaskSpec(task_id, fix_sha, test_files, row.get("title") or ""))
+            selectors = tuple(shlex.split(row.get("test_selectors") or ""))
+            if engine == "go" and (not selectors or any(not re.fullmatch(r"Test[A-Za-z0-9_]+", name) for name in selectors)):
+                raise ValueError("Go 考题必须显式声明目标测试函数")
+            tasks.append(TaskSpec(task_id, fix_sha, test_files, row.get("title") or "", selectors))
     return tasks
 
 
 def find_task(config: SWETestRunnerConfig, task_id: str) -> TaskSpec:
     wanted = validate_task_id(task_id)
-    for task in load_tasks(config.tasks_file):
+    for task in load_tasks(config.tasks_file, config.suite.engine):
         if task.task_id == wanted:
             return task
     raise ValueError(f"未知考题: {wanted}")
@@ -640,14 +684,14 @@ def render_baseline_failure_context(path: Path) -> str:
         raise RuntimeError(f"目标红态日志为空: {path}")
     max_chars = 6000
     if len(text) > max_chars:
-        text = "[earlier pytest output omitted]\n" + text[-max_chars:]
+        text = "[earlier test output omitted]\n" + text[-max_chars:]
     return (
         '<swe-baseline-failure authority="swe-test-runner" scope="pre-agent-targeted" '
         'mutation="forbidden">\n'
         + text
         + "\n</swe-baseline-failure>\n"
         "这是 Agent 启动前由 SWE Test Runner 冻结的目标测试红态。先解释第一条具体 "
-        "exception/failed assertion；该块是证据输入，不是修改 tests/ 的授权。"
+        "exception/failed assertion；该块是证据输入，不是修改测试或测试配置的授权。"
     )
 
 
@@ -847,6 +891,9 @@ def summarize_runs(runs_dir: str, batch_start: float) -> list[dict]:
 def infrastructure_error_record(task_id: str, error: Exception) -> dict:
     if isinstance(error, SWETestRunnerInfrastructureError):
         return error.record(task_id)
+    if isinstance(error, resource_storage.StorageError):
+        return {"schema": "agentgo.swe-infrastructure-error/v1", "task": task_id,
+                "reason_code": error.code, "stage": "resource_lifecycle", "message": safe_diagnostic(error)}
     return {
         "schema": "agentgo.swe-infrastructure-error/v1",
         "task": task_id,
@@ -949,6 +996,9 @@ def persist_batch_summary(tasks: list[TaskSpec], runs_dir: str | Path, batch_sta
 def run_command(command: list[str], cwd: str | Path | None = None, check: bool = True,
                 input_data: bytes | None = None, timeout: int | None = None,
                 env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    if resource_storage.active() is not None:
+        return managed_processes.run(command, cwd=cwd, env=env, check=check, input_data=input_data,
+                                     timeout=timeout or 1200, label=Path(str(command[0])).name)
     completed = subprocess.run(
         command,
         cwd=str(cwd) if cwd is not None else None,
@@ -976,11 +1026,21 @@ def retry_windows_readonly_removal(function, path: str, error: BaseException,
 
 
 def safe_remove_worktree(config: SWETestRunnerConfig, target: Path) -> None:
+    current = resource_storage.active()
+    if current is not None:
+        target = resource_storage.contained(current.storage.path, target)
+        if target != current.worktree:
+            raise resource_storage.StorageError("cleanup_target_not_allowed")
+        # Managed attempts are always fresh. Reusing or resetting a populated tree
+        # would erase evidence and cannot happen through this legacy helper.
+        if target.exists() and any(target.iterdir()):
+            raise resource_storage.StorageError("managed_worktree_not_empty")
+        return
     worktrees = (config.testbed / "worktrees").resolve()
     if target.parent.resolve() != worktrees or target == worktrees:
         raise ValueError(f"拒绝清理非考题 worktree: {target}")
     run_command(
-        ["git", "-C", str(config.flask_repo), "worktree", "remove", "--force", str(target)],
+        ["git", "-C", str(config.repo), "worktree", "remove", "--force", str(target)],
         check=False,
     )
     if target.is_symlink():
@@ -1001,10 +1061,14 @@ def venv_python(worktree: Path) -> Path:
 
 
 def setup_task(config: SWETestRunnerConfig, task: TaskSpec, target: Path | None = None) -> Path:
+    if config.suite.engine == "go" and not config.repo.exists():
+        config.repo.parent.mkdir(parents=True, exist_ok=True)
+        run_command(["git", "clone", "--quiet", config.suite.repository, str(config.repo)])
     worktree = target or config.worktree(task.task_id)
     worktree.parent.mkdir(parents=True, exist_ok=True)
     safe_remove_worktree(config, worktree)
-    run_command(["git", "clone", "--no-local", "--quiet", str(config.flask_repo), str(worktree)])
+    run_command(["git", "clone", "--no-local", "--quiet", str(config.repo), str(worktree)])
+    run_command(["git", "config", "core.longpaths", "true"], cwd=worktree)
     run_command(["git", "checkout", "--quiet", "--detach", task.fix_sha + "^"], cwd=worktree)
     refs = run_command(["git", "for-each-ref", "--format=%(refname)"], cwd=worktree)
     for ref in refs.stdout.decode("utf-8", errors="replace").splitlines():
@@ -1013,10 +1077,17 @@ def setup_task(config: SWETestRunnerConfig, task: TaskSpec, target: Path | None 
     run_command(["git", "reflog", "expire", "--expire=now", "--all"], cwd=worktree)
     run_command(["git", "gc", "--prune=now", "--quiet"], cwd=worktree)
     run_command(["git", "remote", "remove", "origin"], cwd=worktree, check=False)
+    if config.suite.engine == "go":
+        import native_go
+        native_go.prepare_environment(config, worktree)
+        return worktree
     prebuilt = os.environ.get("SWE_PREBUILT_ENVS")
     if prebuilt:
         install_prebuilt(Path(prebuilt), task.task_id, task.fix_sha, worktree)
     else:
+        current = resource_storage.active()
+        if current:
+            current.register(worktree / ".venv", "owned", "rebuildable_environment", archive=False)
         run_command(
             ["uv", "sync", "--frozen", "--no-default-groups", "--group", "tests", "--python", "3.13"],
             cwd=worktree,
@@ -1034,7 +1105,7 @@ def setup_task(config: SWETestRunnerConfig, task: TaskSpec, target: Path | None 
 
 def patch_from_fix(config: SWETestRunnerConfig, task: TaskSpec, pathspec: str) -> bytes:
     completed = run_command([
-        "git", "-C", str(config.flask_repo), "show", task.fix_sha, "--", pathspec,
+        "git", "-C", str(config.repo), "show", task.fix_sha, "--", pathspec,
     ])
     if not completed.stdout:
         raise RuntimeError(f"考题 {task.task_id} 的 {pathspec} patch 为空")
@@ -1133,6 +1204,14 @@ def validate_junit(path: Path, report: dict) -> None:
 
 def run_pytest(worktree: Path, junit_path: Path, log_path: Path,
                test_files: tuple[str, ...] = (), *, task_id: str, run_id: str = "") -> dict:
+    current = resource_storage.active()
+    phase = junit_path.name.removesuffix(".junit.xml")
+    with current.phase(phase) if current else contextlib.nullcontext():
+        return _run_pytest(worktree, junit_path, log_path, test_files, task_id=task_id, run_id=run_id)
+
+
+def _run_pytest(worktree: Path, junit_path: Path, log_path: Path,
+                test_files: tuple[str, ...] = (), *, task_id: str, run_id: str = "") -> dict:
     validate_task_id(task_id)
     worktree = worktree.resolve(strict=True)
     junit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1163,8 +1242,10 @@ def run_pytest(worktree: Path, junit_path: Path, log_path: Path,
     atomic_json(execution_path, record)
     try:
         completed = run_command(command, cwd=worktree, check=False, env=environment)
-        output = completed.stdout + completed.stderr
+        output = managed_processes.output_summary(completed) if resource_storage.active() else completed.stdout + completed.stderr
         log_path.write_bytes(output)
+        if isinstance(completed, managed_processes.CommandResult):
+            record["command_ref"] = completed.command_ref
         record["exit_code"] = completed.returncode
         record["input_after"] = input_identity(worktree)
         if record["input_before"] != record["input_after"]:
@@ -1235,6 +1316,12 @@ def print_pytest_stage_result(result: dict, expectation: str) -> bool:
 
 
 def prepare_task(config: SWETestRunnerConfig, task: TaskSpec) -> dict:
+    if config.suite.engine == "native":
+        import native_harness
+        return native_harness.prepare_task(config, task, sys.modules[__name__])
+    if config.suite.engine == "go":
+        import native_go
+        return native_go.prepare_task(config, task, sys.modules[__name__])
     worktree = setup_task(config, task)
     run_dir = config.run_dir(task.task_id)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1299,6 +1386,13 @@ def render_setting(config: SWETestRunnerConfig, worktree: Path, run_dir: Path,
                    port: int, token: str) -> Path:
     template_path = config.agentgo_root / "setting.swe-flask.yaml"
     rendered = template_path.read_text(encoding="utf-8")
+    if config.suite.role_prompt_directory != "prompts/swe":
+        for role in ("explorer", "worker", "verifier"):
+            original = f"__AGENTGO_ROOT__/prompts/swe/{role}.md"
+            replacement = f"__AGENTGO_ROOT__/{config.suite.role_prompt_directory}/{role}.md"
+            if original not in rendered or not (config.agentgo_root / config.suite.role_prompt_directory / f"{role}.md").is_file():
+                raise RuntimeError("SWE suite 角色 Prompt 不完整")
+            rendered = rendered.replace(original, replacement)
     replacements = {
         "__PROJECT_ROOT__": worktree,
         "__PORT__": str(port),
@@ -1398,6 +1492,9 @@ def wait_for_agentgo(process: subprocess.Popen, base_url: str, log_path: Path,
 
 def terminate_process(process: subprocess.Popen) -> None:
     """结束并回收自有进程；POSIX 调用方必须以 start_new_session=True 启动。"""
+    if isinstance(process, managed_processes.ManagedProcess):
+        process.stop()
+        return
     if process.poll() is not None:
         return
     try:
@@ -1461,21 +1558,33 @@ def run_task(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> d
     started_at = time.time()
     log_path = run_dir / "agentgo.log"
     popen_options = {"start_new_session": True} if os.name == "posix" else {}
-    with log_path.open("wb") as log_handle:
-        process = subprocess.Popen(
-            [str(config.agentgo_bin), "-config", str(setting)],
-            cwd=worktree,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            **popen_options,
-        )
+    if config.suite.engine == "go":
+        import native_go
+        popen_options["env"] = native_go.go_environment(config)
+    elif config.suite.engine == "native":
+        import native_harness
+        popen_options["env"] = native_harness.agent_environment(config, task, worktree)
+    current_attempt = resource_storage.active()
+    log_context = contextlib.nullcontext(None) if current_attempt else log_path.open("wb")
+    if current_attempt:
+        current_attempt.mark_rebuildable_resources()
+    with log_context as log_handle:
+        if current_attempt:
+            process = managed_processes.ManagedProcess(current_attempt,
+                [str(config.agentgo_bin), "-config", str(setting)], cwd=worktree,
+                env=popen_options.get("env"), credentials=True, label="agentgo", log_path=log_path)
+        else:
+            process = subprocess.Popen(
+                [str(config.agentgo_bin), "-config", str(setting)],
+                cwd=worktree, stdout=log_handle, stderr=subprocess.STDOUT, **popen_options)
         print(f"执行状态：AgentGo 已启动 pid={process.pid} port={port}")
         try:
             wait_for_agentgo(process, base_url, log_path)
             contract = inject_request(
                 base_url, token, str(prompt), task.task_id,
                 str(run_dir / "run_contract.json"),
-                str(run_dir / "targeted-baseline.pytest.log"),
+                str(run_dir / ("targeted-baseline.native.log" if config.suite.engine == "native" else
+                               "targeted-baseline.go-test.log" if config.suite.engine == "go" else "targeted-baseline.pytest.log")),
             )
             print("执行状态：RunContract 注入成功 " + json.dumps({
                 "inject": 200, "run_id": contract["run_id"],
@@ -1496,6 +1605,9 @@ def run_task(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> d
         finally:
             terminate_process(process)
 
+    if isinstance(process, managed_processes.ManagedProcess):
+        process.raise_if_failed()
+
     contract = read_json(run_dir / "run_contract.json", {})
     run_id = contract.get("run_id")
     if not run_id:
@@ -1505,6 +1617,8 @@ def run_task(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> d
         str(worktree), run_id, True,
     )
     result["model_capabilities"] = config.model_capabilities()
+    result["suite_id"] = config.suite.suite_id
+    result["test_engine"] = config.suite.engine
     atomic_json(run_dir / "result.json", result)
     print(
         f"阶段结果：AgentGo 执行结束；architecture_ok={result.get('architecture_ok', False)} "
@@ -1517,7 +1631,7 @@ def run_task(config: SWETestRunnerConfig, task: TaskSpec, timeout_sec: int) -> d
 
 def test_files_at_fix(config: SWETestRunnerConfig, task: TaskSpec) -> list[str]:
     completed = run_command([
-        "git", "-C", str(config.flask_repo), "show", task.fix_sha,
+        "git", "-C", str(config.repo), "show", task.fix_sha,
         "--name-only", "--format=", "--", "tests/",
     ])
     files = [line for line in completed.stdout.decode("utf-8", errors="replace").splitlines() if line]
@@ -1529,6 +1643,12 @@ def test_files_at_fix(config: SWETestRunnerConfig, task: TaskSpec) -> list[str]:
 
 
 def judge_task(config: SWETestRunnerConfig, task: TaskSpec) -> dict:
+    if config.suite.engine == "native":
+        import native_harness
+        return native_harness.judge_task(config, task, sys.modules[__name__])
+    if config.suite.engine == "go":
+        import native_go
+        return native_go.judge_task(config, task, sys.modules[__name__])
     worktree = config.worktree(task.task_id)
     run_dir = config.run_dir(task.task_id)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1778,6 +1898,12 @@ def preflight_probe(config: SWETestRunnerConfig, timeout_sec: int = 45) -> None:
 
 
 def verify_candidates(config: SWETestRunnerConfig) -> dict[str, int]:
+    if config.suite.engine == "native":
+        import native_harness
+        return native_harness.verify_candidates(config, sys.modules[__name__])
+    if config.suite.engine == "go":
+        import native_go
+        return native_go.verify_candidates(config, sys.modules[__name__])
     report_path = config.testbed / "test-runner" / "candidates_report.txt"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
@@ -1852,14 +1978,20 @@ def verify_candidates(config: SWETestRunnerConfig) -> dict[str, int]:
 
 def command_probe(args: argparse.Namespace) -> int:
     configure_console_utf8()
-    config = SWETestRunnerConfig.from_env()
+    config = SWETestRunnerConfig.from_env(getattr(args, "suite", None))
+    if getattr(config, "managed_storage", False):
+        import managed_runner
+        return managed_runner.command(config, args, sys.modules[__name__], "probe")
     preflight_probe(config, args.timeout)
     return 0
 
 
 def command_task(args: argparse.Namespace) -> int:
     configure_console_utf8()
-    config = SWETestRunnerConfig.from_env()
+    config = SWETestRunnerConfig.from_env(getattr(args, "suite", None))
+    if getattr(config, "managed_storage", False):
+        import managed_runner
+        return managed_runner.command(config, args, sys.modules[__name__], "task")
     print(f"\n===== 启动单题任务：{args.task_id} =====")
     preflight_probe(config, args.probe_timeout)
     result = execute_task(config, find_task(config, args.task_id), args.timeout)
@@ -1868,8 +2000,14 @@ def command_task(args: argparse.Namespace) -> int:
 
 def command_batch(args: argparse.Namespace) -> int:
     configure_console_utf8()
-    config = SWETestRunnerConfig.from_env()
-    tasks = load_tasks(config.tasks_file)
+    config = SWETestRunnerConfig.from_env(getattr(args, "suite", None))
+    if getattr(config, "managed_storage", False):
+        import managed_runner
+        return managed_runner.command(config, args, sys.modules[__name__], "batch")
+    if config.suite.engine == "group":
+        import native_harness
+        return native_harness.group_batch(config, args, sys.modules[__name__])
+    tasks = load_tasks(config.tasks_file, config.suite.engine)
     preflight_probe(config, args.probe_timeout)
     runs_dir = config.testbed / "runs"
     batch_start = record_batch_start(runs_dir)
@@ -1958,7 +2096,18 @@ def command_batch(args: argparse.Namespace) -> int:
 
 def command_verify_candidates(_args: argparse.Namespace) -> int:
     configure_console_utf8()
-    counts = verify_candidates(SWETestRunnerConfig.from_env())
+    config = SWETestRunnerConfig.from_env(getattr(_args, "suite", None))
+    if getattr(config, "managed_storage", False):
+        import managed_runner
+        return managed_runner.command(config, _args, sys.modules[__name__], "verify-candidates")
+    config.task_filter = getattr(_args, "task_id", None)
+    if config.task_filter and config.suite.engine != "native":
+        raise ValueError("--task-id 资格筛选目前用于 native suite/v3")
+    if config.suite.engine == "group":
+        import native_harness
+        counts = native_harness.group_verify(config, sys.modules[__name__])
+    else:
+        counts = verify_candidates(config)
     return 0 if counts.get("OK", 0) > 0 and sum(
         count for name, count in counts.items() if name != "OK"
     ) == 0 else EXIT_TASK_FAILURE
@@ -1966,26 +2115,94 @@ def command_verify_candidates(_args: argparse.Namespace) -> int:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
+    root.add_argument("--suite", help="选择内置套件，例如 flask-8 或 gin-1；默认 Flask-8")
+    root.add_argument("--storage-policy", help="原生 SWE 存储策略 JSON；Core-96 必须显式提供")
     commands = root.add_subparsers(required=True)
 
     probe = commands.add_parser("probe", help="运行批次级真实 function-call 能力探针")
     probe.add_argument("--timeout", type=int, default=45)
+    probe.add_argument("--suite", default=argparse.SUPPRESS, help="选择内置 SWE 套件")
     probe.set_defaults(func=command_probe)
 
     task = commands.add_parser("task", help="探针后完整执行 prepare -> run -> judge")
     task.add_argument("task_id")
     task.add_argument("--timeout", type=int, default=1200)
     task.add_argument("--probe-timeout", type=int, default=45)
+    task.add_argument("--suite", default=argparse.SUPPRESS, help="选择内置 SWE 套件")
     task.set_defaults(func=command_task)
 
     batch = commands.add_parser("batch", help="探针后串行执行 tasks.csv 全部考题")
     batch.add_argument("--timeout", type=int, default=1200)
     batch.add_argument("--probe-timeout", type=int, default=45)
+    batch.add_argument("--suite", default=argparse.SUPPRESS, help="选择内置 SWE 套件")
     batch.set_defaults(func=command_batch)
 
     verify = commands.add_parser("verify-candidates", help="验证候选题目的红到绿语义")
+    verify.add_argument("--task-id", help="仅验证 native suite/v3 中的一道题")
+    verify.add_argument("--suite", default=argparse.SUPPRESS, help="选择内置 SWE 套件")
     verify.set_defaults(func=command_verify_candidates)
+    rejudge = commands.add_parser("rejudge", help="用归档中的原模型补丁在新尝试中复判，不调用模型")
+    rejudge.add_argument("--attempt", required=True, help="原始受管模型尝试目录")
+    rejudge.add_argument("--testbed", help="新复判尝试的受管根；默认使用原受管根")
+    rejudge.add_argument("--upstream-repo", help="原上游仓库已移动时显式指定替代路径")
+    rejudge.add_argument("--storage-policy", default=argparse.SUPPRESS, help="复判存储策略 JSON")
+    rejudge.set_defaults(func=command_rejudge)
+    for command_parser in (probe, task, batch, verify):
+        command_parser.add_argument("--storage-policy", default=argparse.SUPPRESS, help="原生 SWE 存储策略 JSON")
+        command_parser.add_argument("--windows-firewall", action="store_true", help="Windows：一次 UAC 启动仅管理测试网络规则的辅助进程")
+    maintenance = commands.add_parser("storage", help="离线存储盘点，不调用模型")
+    maintenance_commands = maintenance.add_subparsers(required=True)
+    report = maintenance_commands.add_parser("report")
+    report.add_argument("--testbed", required=True)
+    report.set_defaults(func=command_maintenance, operation="storage-report")
+    cleaner = commands.add_parser("cleanup", help="离线清理计划与执行")
+    cleaner_commands = cleaner.add_subparsers(required=True)
+    plan = cleaner_commands.add_parser("plan")
+    plan.add_argument("--attempt", required=True)
+    plan.add_argument("--release-retained", action="store_true", help="归档已核对后明确释放失败现场")
+    plan.set_defaults(func=command_maintenance, operation="cleanup-plan")
+    apply = cleaner_commands.add_parser("apply")
+    apply.add_argument("--plan", required=True)
+    apply.set_defaults(func=command_maintenance, operation="cleanup-apply")
+    archive = commands.add_parser("archive", help="离线归档校验")
+    archive_commands = archive.add_subparsers(required=True)
+    archive_verify = archive_commands.add_parser("verify")
+    archive_verify.add_argument("--manifest", required=True)
+    archive_verify.set_defaults(func=command_maintenance, operation="archive-verify")
+    archive_seal = archive_commands.add_parser("seal", help="自有进程已退出后，离线封存中断现场，不恢复执行")
+    archive_seal.add_argument("--attempt", required=True)
+    archive_seal.set_defaults(func=command_maintenance, operation="archive-seal")
+    firewall_check = commands.add_parser("firewall-check", help="Windows 本地网络权限与回收检查，不调用模型")
+    firewall_check.add_argument("--testbed", required=True)
+    firewall_check.set_defaults(func=command_firewall_check)
     return root
+
+
+def command_maintenance(args):
+    configure_console_utf8()
+    import managed_runner
+    return managed_runner.maintenance(args)
+
+
+def command_rejudge(args):
+    configure_console_utf8()
+    import rejudge
+    return rejudge.run(args, sys.modules[__name__])
+
+
+def command_firewall_check(args):
+    configure_console_utf8()
+    import firewall_windows
+    import firewall_smoke
+    if os.name != "nt":
+        raise resource_storage.StorageError("windows_firewall_wrong_platform")
+    firewall = firewall_windows.start(Path(args.testbed))
+    try:
+        result = firewall_smoke.run(Path(args.testbed), firewall)
+    finally:
+        firewall.close()
+    print(json.dumps(result, ensure_ascii=True))
+    return 0
 
 
 def main() -> int:
