@@ -21,7 +21,7 @@
 | [DynamicDAG.md](../archived/DynamicDAG.md) | 已于 V6 归档（Plan 控制面已删除，Graph 见 `internal/graph`） | 仅历史参考 |
 | [AgentTemplate.md](AgentTemplate.md) | 已实现，仍是按需 Team 契约 | 修改模板 catalog、provision 或 runtime route 前阅读 |
 | [ReactiveSystem.md](ReactiveSystem.md) | 已实现，保留 Gate/Reactor 决策背景 | 修改 Gate、Reactor、状态事件或用户 Reactor schema 前阅读 |
-| [MemoryManageSystem.md](MemoryManageSystem.md) | 部分实现 | 仅用于 Memory 后续工作；现状见架构文档和 [KNOWN_ISSUES.md](KNOWN_ISSUES.md) |
+| [MemoryManageSystem.md](MemoryManageSystem.md) | 已完成（MM1-MM8；仅 MM9 ScopeProject 持久化后端待实现） | 正文仍是历史设计草案；现状见文档头部状态说明、架构文档和 [KNOWN_ISSUES.md](KNOWN_ISSUES.md) |
 | [ToolUpgradePlan.md](ToolUpgradePlan.md) | 未实施的 Shell 路线图 | 不是当前 Shell 行为说明；当前配置以 YAML 指南为准 |
 
 ## 已归档的完成或历史记录

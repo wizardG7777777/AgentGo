@@ -1,10 +1,10 @@
 > **2026-09-07 接线更新**：召回、相关性选择、裁剪与渲染由 L2 contextruntime 负责；Process/Session/Task Memory 的存储仍属于 L3。Agent 只提交结算事实，不再把记忆文本拼入 history/context。ScopeProject 与向量召回不在本次实现范围。下方旧设计说明继续作为历史资料保留。
 
-> **状态说明（2026-07-19）**：本文是 Memory 后续路线图。当前仅 `ProcessStore` 可用；Session/Project 后端与向量检索尚未实现，详见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)。
+> **状态说明（2026-09-03 更新，原 2026-07-19 记录已过期）**：本文档以下正文仍是 2026-04-30 的原始设计草案文字，**记录已过期，不代表当前实现**。实际进度：MM1-MM8 均已完成（`ProcessStore` + `ScopeSession` 文件存储后端均可用，并被 V6 CM3 扩展出 Task 终态自动晋升 Session 记忆的 `promotion.go` 机制，详见 `internal/memory/session_store.go`、`internal/memory/promotion.go`）；仅 MM9（`ScopeProject` 持久化后端）与向量检索仍未实现。当前限制以 [KNOWN_ISSUES.md](KNOWN_ISSUES.md) 为准。
 
 # MemoryManageSystem：v5 记忆管理系统
 
-> **状态**：📋 起草中（2026-04-30 从 nextUpgrade_v5.md §13 提升至 v5 主线）
+> **状态**：✅ 已完成（MM1-MM8；MM9 ScopeProject 待实现）——原"📋 起草中"标注（2026-04-30 从 nextUpgrade_v5.md §13 提升至 v5 主线）已过期，以下正文为历史设计草案，保留供追溯
 > **优先级**：P0（v5 关键架构升级，废止 team-awareness 临时方案 + 取代 ReactiveSystem 原 Provider 抽象）
 > **关联文档**：
 > - [ReactiveSystem.md](ReactiveSystem.md)（原 Provider 抽象已被本模块替代；后续配套讨论中 Aggregator 也下放为 Mailbox 子系统内部固定机制——4 类角色最终缩为 **2 类核心：Reactor / Gate**）
